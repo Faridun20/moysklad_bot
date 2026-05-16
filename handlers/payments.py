@@ -3,7 +3,6 @@
 """
 
 import logging
-import re
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Router, F
@@ -71,14 +70,28 @@ def pay_report_keyboard():
     return kb.as_markup()
 
 
-# ─── Команды сотрудника ───────────────────────────────────────────────────────
+# ─── Команды и callback для запуска платежа ──────────────────────────────────
 
 @router.message(Command("pay"))
 async def cmd_pay(message: Message, state: FSMContext):
-    """Начать процесс отправки платежа."""
+    """Начать процесс отправки платежа через команду."""
     await state.clear()
     await state.set_state(PaymentState.waiting_for_amount)
     await message.answer(
+        "💵 <b>Отправка платежа</b>\n\n"
+        "Введите сумму платежа (только цифры):\n"
+        "Например: <code>1500</code>",
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "pay_start")
+async def cb_pay_start(call: CallbackQuery, state: FSMContext):
+    """Начать процесс отправки платежа через кнопку меню."""
+    await call.answer()
+    await state.clear()
+    await state.set_state(PaymentState.waiting_for_amount)
+    await call.message.answer(
         "💵 <b>Отправка платежа</b>\n\n"
         "Введите сумму платежа (только цифры):\n"
         "Например: <code>1500</code>",
@@ -94,7 +107,10 @@ async def process_amount(message: Message, state: FSMContext):
         if amount <= 0:
             raise ValueError
     except ValueError:
-        return await message.answer("❌ Введите корректную сумму, например: <code>1500</code>", parse_mode="HTML")
+        return await message.answer(
+            "❌ Введите корректную сумму, например: <code>1500</code>",
+            parse_mode="HTML"
+        )
 
     await state.update_data(amount=amount)
     await state.set_state(PaymentState.waiting_for_currency)
@@ -140,7 +156,6 @@ async def process_comment(message: Message, state: FSMContext, bot: Bot):
     full_name = user.full_name or user.username or str(user.id)
     username = f"@{user.username}" if user.username else "—"
 
-    # Сохраняем в базу
     payment_id = add_payment(
         user_id=user.id,
         username=username,
@@ -150,7 +165,6 @@ async def process_comment(message: Message, state: FSMContext, bot: Bot):
         comment=comment,
     )
 
-    # Подтверждение сотруднику
     await message.answer(
         f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
         f"✅ <b>Платёж отправлен на подтверждение</b>\n\n"
@@ -160,7 +174,6 @@ async def process_comment(message: Message, state: FSMContext, bot: Bot):
         parse_mode="HTML"
     )
 
-    # Уведомление руководителям
     notify_text = (
         f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
         f"💵 <b>Новый платёж #{payment_id}</b>\n\n"
@@ -194,20 +207,17 @@ async def confirm_pay(call: CallbackQuery, bot: Bot):
 
     if not payment:
         return await call.answer("❌ Платёж не найден", show_alert=True)
-
     if payment["status"] != "pending":
         return await call.answer("⚠️ Платёж уже обработан", show_alert=True)
 
     confirm_payment(payment_id)
     await call.answer("✅ Платёж принят")
 
-    # Обновляем сообщение у админа
     await call.message.edit_text(
         call.message.text + f"\n\n✅ <b>Принято</b> — {datetime.now().strftime('%d.%m.%Y %H:%M')}",
         parse_mode="HTML"
     )
 
-    # Уведомляем сотрудника
     try:
         await bot.send_message(
             payment["user_id"],
@@ -230,7 +240,6 @@ async def reject_pay(call: CallbackQuery, bot: Bot):
 
     if not payment:
         return await call.answer("❌ Платёж не найден", show_alert=True)
-
     if payment["status"] != "pending":
         return await call.answer("⚠️ Платёж уже обработан", show_alert=True)
 
@@ -300,8 +309,6 @@ async def cb_payreport(call: CallbackQuery):
     lines.append("<code>━━━━━━━━━━━━━━━━━━━━</code>")
     lines.append(f"📊 <b>Отчёт по платежам · {label}</b>")
     lines.append("")
-
-    # Итог по сотрудникам
     lines.append("<b>По сотрудникам:</b>")
     for s in summary:
         lines.append(
@@ -309,7 +316,6 @@ async def cb_payreport(call: CallbackQuery):
             f"    {s['total']:,.0f} {s['currency']} · {s['count']} платежей"
         )
 
-    # Общий итог
     lines.append("")
     total_by_currency: dict[str, float] = {}
     for p in payments:
@@ -318,7 +324,6 @@ async def cb_payreport(call: CallbackQuery):
     for cur, total in total_by_currency.items():
         lines.append(f"  💰 {total:,.0f} {cur}")
 
-    # Список всех платежей
     lines.append("")
     lines.append(f"<b>Все платежи ({len(payments)}):</b>")
     for p in payments:
@@ -330,13 +335,10 @@ async def cb_payreport(call: CallbackQuery):
             f"🕐 {format_date(p['created_at'])}"
         )
 
-    # Отправляем по частям если длинно
     text = "\n".join(lines)
     if len(text) > 4000:
-        # Отправляем сводку отдельно
-        summary_text = "\n".join(lines[:lines.index("") + 1 if "" in lines else len(lines)])
-        await call.message.answer(summary_text, parse_mode="HTML")
-        # Потом детали
+        summary_lines = lines[:lines.index("") + 1] if "" in lines else lines
+        await call.message.answer("\n".join(summary_lines), parse_mode="HTML")
         for p in payments:
             detail = (
                 f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
