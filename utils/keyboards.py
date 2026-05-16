@@ -13,6 +13,8 @@ def main_keyboard():
     kb.button(text="🗂 По категориям",      callback_data="cats:0")
     kb.button(text="🚚 Отгрузки",          callback_data="sh_period")
     kb.button(text="📊 Аналитика продаж",  callback_data="analytics")
+    kb.button(text="💵 Отправить платёж",  callback_data="pay_start")
+    kb.button(text="📋 Отчёт по платежам", callback_data="pr:menu")
     kb.adjust(1)
     return kb.as_markup()
 

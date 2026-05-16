@@ -28,7 +28,9 @@ async def cmd_start(message: Message):
         "/stock — остатки на складе\n"
         "/categories — категории товаров\n"
         "/shipments — отгрузки\n"
-        "/analytics — аналитика продаж",
+        "/analytics — аналитика продаж\n"
+        "/pay — отправить платёж\n"
+        "/payreport — отчёт по платежам",
         reply_markup=main_keyboard(),
     )
 
