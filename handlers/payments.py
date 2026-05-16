@@ -13,7 +13,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from config import ADMIN_IDS
+from utils.roles import can_manage_payments
 from services.database import (
     add_payment, confirm_payment, reject_payment,
     get_payment, get_payments_report, get_summary_by_employee
@@ -32,7 +32,7 @@ class PaymentState(StatesGroup):
 
 
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    return can_manage_payments(user_id)
 
 
 def format_date(dt_str: str) -> str:
@@ -359,15 +359,3 @@ async def cb_payreport(call: CallbackQuery):
 async def cb_pr_menu(call: CallbackQuery):
     await call.answer()
     await call.message.answer("📊 За какой период показать отчёт?", reply_markup=pay_report_keyboard())
-
-@router.callback_query(F.data == "pay_start")
-async def cb_pay_start(call: CallbackQuery, state: FSMContext):
-    await call.answer()
-    await state.clear()
-    await state.set_state(PaymentState.waiting_for_amount)
-    await call.message.answer(
-        "💵 <b>Отправка платежа</b>\n\n"
-        "Введите сумму платежа (только цифры):\n"
-        "Например: <code>1500</code>",
-        parse_mode="HTML"
-    )

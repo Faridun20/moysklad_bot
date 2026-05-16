@@ -7,7 +7,7 @@ from aiogram import Bot, Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 
-from config import ALLOWED_USERS
+from utils.roles import can_view_stock, can_view_analytics, can_manage_payments, is_admin
 from services.moysklad import get_all_stock, get_categories
 from utils.helpers import extract_id_from_href
 from utils.formatters import format_stock_page
@@ -26,9 +26,7 @@ stock_cache: dict[int, dict] = {}
 
 
 def is_allowed(user_id: int) -> bool:
-    if not ALLOWED_USERS:
-        return True
-    return user_id in ALLOWED_USERS
+    return can_view_stock(user_id)
 
 
 # ─── Команды ─────────────────────────────────────────────────────────────────

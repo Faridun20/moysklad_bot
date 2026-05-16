@@ -1,48 +1,122 @@
 """
-База данных SQLite для хранения платежей сотрудников
+База данных SQLite — платежи и роли пользователей
 """
-
+import os
 import sqlite3
 import logging
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = "payments.db"
+DB_PATH = os.environ.get("DB_PATH", "payments.db")
 
 
 def init_db():
-    """Создать таблицы если не существуют."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+
+    # Таблица платежей
     cur.execute("""
         CREATE TABLE IF NOT EXISTS payments (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     INTEGER NOT NULL,
-            username    TEXT,
-            full_name   TEXT,
-            amount      REAL NOT NULL,
-            currency    TEXT NOT NULL DEFAULT 'USD',
-            comment     TEXT,
-            status      TEXT NOT NULL DEFAULT 'pending',
-            created_at  TEXT NOT NULL,
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id      INTEGER NOT NULL,
+            username     TEXT,
+            full_name    TEXT,
+            amount       REAL NOT NULL,
+            currency     TEXT NOT NULL DEFAULT 'USD',
+            comment      TEXT,
+            status       TEXT NOT NULL DEFAULT 'pending',
+            created_at   TEXT NOT NULL,
             confirmed_at TEXT
         )
     """)
+
+    # Таблица ролей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_roles (
+            user_id   INTEGER PRIMARY KEY,
+            username  TEXT,
+            full_name TEXT,
+            role      TEXT NOT NULL DEFAULT 'employee'
+        )
+    """)
+
     conn.commit()
     conn.close()
     logger.info("База данных инициализирована")
 
 
+# ─── Роли ────────────────────────────────────────────────────────────────────
+
+def get_role(user_id: int) -> str:
+    """Получить роль пользователя. По умолчанию — employee."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT role FROM user_roles WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else "employee"
+
+
+def set_role(user_id: int, username: str, full_name: str, role: str) -> bool:
+    """Установить роль пользователя."""
+    if role not in ("admin", "manager", "employee"):
+        return False
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO user_roles (user_id, username, full_name, role)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username = excluded.username,
+            full_name = excluded.full_name,
+            role = excluded.role
+    """, (user_id, username, full_name, role))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def get_all_users() -> list[dict]:
+    """Получить всех пользователей с ролями."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM user_roles ORDER BY role, full_name")
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def ensure_user(user_id: int, username: str, full_name: str, admin_ids: list[int]):
+    """Зарегистрировать пользователя если его нет. Админам — роль admin."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT role FROM user_roles WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+
+    if not row:
+        role = "admin" if user_id in admin_ids else "employee"
+        cur.execute("""
+            INSERT INTO user_roles (user_id, username, full_name, role)
+            VALUES (?, ?, ?, ?)
+        """, (user_id, username, full_name, role))
+        conn.commit()
+
+    conn.close()
+
+
+# ─── Платежи ─────────────────────────────────────────────────────────────────
+
 def add_payment(user_id: int, username: str, full_name: str,
                 amount: float, currency: str, comment: str) -> int:
-    """Добавить новый платёж. Возвращает ID платежа."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO payments (user_id, username, full_name, amount, currency, comment, status, created_at)
         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-    """, (user_id, username, full_name, amount, currency, comment, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    """, (user_id, username, full_name, amount, currency, comment,
+          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     payment_id = cur.lastrowid
     conn.commit()
     conn.close()
@@ -50,12 +124,10 @@ def add_payment(user_id: int, username: str, full_name: str,
 
 
 def confirm_payment(payment_id: int) -> bool:
-    """Подтвердить платёж. Возвращает True если успешно."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
-        UPDATE payments
-        SET status = 'confirmed', confirmed_at = ?
+        UPDATE payments SET status = 'confirmed', confirmed_at = ?
         WHERE id = ? AND status = 'pending'
     """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), payment_id))
     updated = cur.rowcount > 0
@@ -65,12 +137,10 @@ def confirm_payment(payment_id: int) -> bool:
 
 
 def reject_payment(payment_id: int) -> bool:
-    """Отклонить платёж. Возвращает True если успешно."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
-        UPDATE payments
-        SET status = 'rejected'
+        UPDATE payments SET status = 'rejected'
         WHERE id = ? AND status = 'pending'
     """, (payment_id,))
     updated = cur.rowcount > 0
@@ -80,7 +150,6 @@ def reject_payment(payment_id: int) -> bool:
 
 
 def get_payment(payment_id: int) -> dict | None:
-    """Получить платёж по ID."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -91,21 +160,17 @@ def get_payment(payment_id: int) -> dict | None:
 
 
 def get_payments_report(since: str = None, until: str = None) -> list[dict]:
-    """Получить все подтверждённые платежи за период."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-
     query = "SELECT * FROM payments WHERE status = 'confirmed'"
     params = []
-
     if since:
         query += " AND created_at >= ?"
         params.append(since)
     if until:
         query += " AND created_at <= ?"
         params.append(until)
-
     query += " ORDER BY created_at DESC"
     cur.execute(query, params)
     rows = cur.fetchall()
@@ -114,17 +179,12 @@ def get_payments_report(since: str = None, until: str = None) -> list[dict]:
 
 
 def get_summary_by_employee(since: str = None, until: str = None) -> list[dict]:
-    """Итог по каждому сотруднику."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-
     query = """
-        SELECT full_name, currency,
-               SUM(amount) as total,
-               COUNT(*) as count
-        FROM payments
-        WHERE status = 'confirmed'
+        SELECT full_name, currency, SUM(amount) as total, COUNT(*) as count
+        FROM payments WHERE status = 'confirmed'
     """
     params = []
     if since:
@@ -133,7 +193,6 @@ def get_summary_by_employee(since: str = None, until: str = None) -> list[dict]:
     if until:
         query += " AND created_at <= ?"
         params.append(until)
-
     query += " GROUP BY full_name, currency ORDER BY total DESC"
     cur.execute(query, params)
     rows = cur.fetchall()
