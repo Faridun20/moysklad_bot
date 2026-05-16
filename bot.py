@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 
 
 async def main():
+    logger.info("TELEGRAM_TOKEN = '%s'", TELEGRAM_TOKEN[:10] if TELEGRAM_TOKEN else "ПУСТОЙ")
     bot = Bot(token=TELEGRAM_TOKEN)
-    dp = Dispatcher()
-
+    
     # Подключаем все роутеры
     dp.include_router(common.router)
     dp.include_router(stock.router)
