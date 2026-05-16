@@ -1,16 +1,7 @@
 # config.py — настройки бота
+import os
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = "Токен"
-
-# ── МойСклад ─────────────────────────────────────────────────────────────────
-MS_TOKEN = "Мойсклад_токен"
-
-# ── Доступ ───────────────────────────────────────────────────────────────────
-# Узнать свой Telegram ID можно у @userinfobot
-ALLOWED_USERS: list[int] = [
-    # 123456789,
-]
-
-# ── Мониторинг отгрузок ───────────────────────────────────────────────────────
-CHECK_INTERVAL_SEC = 300  # 5 минут
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+MS_TOKEN = os.environ.get("MS_TOKEN", "")
+ALLOWED_USERS = [int(x) for x in os.environ.get("ALLOWED_USERS", "").split(",") if x]
+CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "300"))
