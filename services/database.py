@@ -89,22 +89,21 @@ def get_all_users() -> list[dict]:
 
 
 def ensure_user(user_id: int, username: str, full_name: str, admin_ids: list[int]):
-    """Зарегистрировать пользователя если его нет. Админам — роль admin."""
+    from config import MANAGER_IDS
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT role FROM user_roles WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
 
-    if not row:
-        role = "admin" if user_id in admin_ids else "employee"
-        cur.execute("""
-            INSERT INTO user_roles (user_id, username, full_name, role)
-            VALUES (?, ?, ?, ?)
-        """, (user_id, username, full_name, role))
-        conn.commit()
-
-    conn.close()
-
+from config import MANAGER_IDS, BOSS_IDS
+if user_id in admin_ids:
+    role = "admin"
+elif user_id in BOSS_IDS:
+    role = "boss"
+elif user_id in MANAGER_IDS:
+    role = "manager"
+else:
+    role = "employee"
 
 # ─── Платежи ─────────────────────────────────────────────────────────────────
 
@@ -198,3 +197,77 @@ def get_summary_by_employee(since: str = None, until: str = None) -> list[dict]:
     rows = cur.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def add_user(user_id: int, username: str, full_name: str, role: str) -> bool:
+    """Добавить пользователя вручную."""
+    if role not in ("admin", "boss", "manager", "employee"):
+        return False
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO user_roles (user_id, username, full_name, role)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username = excluded.username,
+            full_name = excluded.full_name,
+            role = excluded.role
+    """, (user_id, username, full_name, role))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def remove_user(user_id: int) -> bool:
+    """Удалить пользователя из базы."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM user_roles WHERE user_id = ?", (user_id,))
+    deleted = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def _load_predefined_users():
+    """Загрузить предопределённых пользователей из config при запуске."""
+    try:
+        from config import PREDEFINED_USERS, ADMIN_IDS, BOSS_IDS, MANAGER_IDS
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+
+        # Добавляем из PREDEFINED_USERS
+        for u in PREDEFINED_USERS:
+            cur.execute("""
+                INSERT INTO user_roles (user_id, username, full_name, role)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO NOTHING
+            """, (u["user_id"], "", u.get("full_name", ""), u["role"]))
+
+        # Добавляем из ADMIN_IDS, BOSS_IDS, MANAGER_IDS
+        for uid in ADMIN_IDS:
+            cur.execute("""
+                INSERT INTO user_roles (user_id, username, full_name, role)
+                VALUES (?, ?, ?, 'admin')
+                ON CONFLICT(user_id) DO NOTHING
+            """, (uid, "", "Admin"))
+
+        for uid in BOSS_IDS:
+            cur.execute("""
+                INSERT INTO user_roles (user_id, username, full_name, role)
+                VALUES (?, ?, ?, 'boss')
+                ON CONFLICT(user_id) DO NOTHING
+            """, (uid, "", "Boss"))
+
+        for uid in MANAGER_IDS:
+            cur.execute("""
+                INSERT INTO user_roles (user_id, username, full_name, role)
+                VALUES (?, ?, ?, 'manager')
+                ON CONFLICT(user_id) DO NOTHING
+            """, (uid, "", "Manager"))
+
+        conn.commit()
+        conn.close()
+        logger.info("Предопределённые пользователи загружены")
+    except Exception as e:
+        logger.warning("Ошибка загрузки пользователей: %s", e)

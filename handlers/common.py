@@ -16,27 +16,29 @@ router = Router()
 
 ROLE_NAMES = {
     "admin":    "👑 Администратор",
+    "boss":     "🏆 Руководитель",
     "manager":  "💼 Менеджер",
     "employee": "👤 Сотрудник",
 }
 
 
 def get_keyboard_for_role(role: str):
-    """Клавиатура главного меню в зависимости от роли."""
     kb = InlineKeyboardBuilder()
 
-    if role in ("admin", "manager"):
+    if role in ("admin", "boss", "manager"):
         kb.button(text="📦 Все остатки",       callback_data="sp:0")
         kb.button(text="🗂 По категориям",     callback_data="cats:0")
         kb.button(text="🚚 Отгрузки",         callback_data="sh_period")
         kb.button(text="📊 Аналитика продаж", callback_data="analytics")
 
-    if role in ("admin", "employee"):
+    if role in ("admin", "boss", "employee"):
         kb.button(text="💵 Отправить платёж", callback_data="pay_start")
 
-    if role == "admin":
+    if role in ("admin", "boss"):
         kb.button(text="📋 Отчёт по платежам", callback_data="pr:menu")
-        kb.button(text="👥 Пользователи",      callback_data="users_list")
+
+    if role == "admin":
+        kb.button(text="👥 Пользователи", callback_data="users_list")
 
     kb.adjust(1)
     return kb.as_markup()
@@ -57,6 +59,16 @@ def get_welcome_text(role: str) -> str:
             "/payreport — отчёт по платежам\n"
             "/users — список пользователей\n"
             "/addrole [id] [роль] — назначить роль"
+        )
+    elif role == "boss":
+        return base + (
+            "Доступные команды:\n"
+            "/stock — остатки на складе\n"
+            "/categories — категории товаров\n"
+            "/shipments — отгрузки\n"
+            "/analytics — аналитика продаж\n"
+            "/pay — отправить платёж\n"
+            "/payreport — отчёт по платежам"
         )
     elif role == "manager":
         return base + (
@@ -120,8 +132,8 @@ async def cmd_addrole(message: Message):
         return await message.answer("❌ User ID должен быть числом.")
 
     role = parts[2].lower()
-    if role not in ("admin", "manager", "employee"):
-        return await message.answer("❌ Роль должна быть: admin, manager или employee")
+    if role not in ("admin", "boss", "manager", "employee"):
+        return await message.answer("❌ Роль должна быть: admin, boss, manager или employee")
 
     set_role(target_id, "", "", role)
     role_name = ROLE_NAMES.get(role, role)
