@@ -280,20 +280,23 @@ async def api_payments_send(request: Request):
         ]]
     }
 
+    from services.notifier import get_notify_recipients
+    recipients = get_notify_recipients()
+
     async with aiohttp.ClientSession() as session:
-        for admin_id in ADMIN_IDS:
+        for uid in recipients:
             try:
                 await session.post(
                     f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                     json={
-                        "chat_id": admin_id,
+                        "chat_id": uid,
                         "text": notify_text,
                         "parse_mode": "HTML",
                         "reply_markup": keyboard,
                     },
                 )
             except Exception as e:
-                logger.warning("Не удалось уведомить %d: %s", admin_id, e)
+                logger.warning("Не удалось уведомить %d: %s", uid, e)
 
     return JSONResponse({"payment_id": payment_id, "status": "pending"})
 

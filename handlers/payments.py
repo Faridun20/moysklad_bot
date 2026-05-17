@@ -193,16 +193,18 @@ async def process_comment(message: Message, state: FSMContext, bot: Bot):
     notify = format_payment_notify(
         payment_id, full_name, username, amount, currency, comment
     )
-    for admin_id in ADMIN_IDS:
+    from services.notifier import get_notify_recipients
+    recipients = get_notify_recipients()
+    for uid in recipients:
         try:
             await bot.send_message(
-                admin_id,
+                uid,
                 notify,
                 parse_mode="HTML",
                 reply_markup=confirm_keyboard(payment_id),
             )
         except Exception as e:
-            logger.warning("Не удалось уведомить %d: %s", admin_id, e)
+            logger.warning("Не удалось уведомить %d: %s", uid, e)
 
 
 # ─── Подтверждение / Отклонение ───────────────────────────────────────────────
