@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>МойСклад</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="app">
+
+  <header class="topbar">
+    <div>
+      <div class="title">МойСклад</div>
+      <div class="subtitle" id="greeting">Загрузка…</div>
+    </div>
+    <div class="role-badge" id="role-badge"></div>
+  </header>
+
+  <main class="content" id="content">
+    <div class="loader">⏳ Подключение…</div>
+  </main>
+
+  <nav class="bottom-nav">
+    <button class="nav-item active" data-screen="home">
+      <span class="nav-icon">🏠</span>
+      <span class="nav-label">Главная</span>
+    </button>
+    <button class="nav-item" data-screen="stock">
+      <span class="nav-icon">📦</span>
+      <span class="nav-label">Склад</span>
+    </button>
+    <button class="nav-item" data-screen="analytics">
+      <span class="nav-icon">📊</span>
+      <span class="nav-label">Аналитика</span>
+    </button>
+    <button class="nav-item" data-screen="payments">
+      <span class="nav-icon">💵</span>
+      <span class="nav-label">Платежи</span>
+    </button>
+  </nav>
+
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -10,21 +10,13 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from utils.roles import can_manage_users
+from services.roles import can_manage_users
 from services.database import get_audit_log, get_all_users
 
 logger = logging.getLogger(__name__)
 router = Router()
 
-ACTION_EMOJI = {
-    "user_added": "🟢",
-    "user_removed": "🔴",
-    "role_changed": "🔄",
-    "payment_sent": "💵",
-    "payment_confirmed": "✅",
-    "payment_rejected": "❌",
-    "login": "👤",
-}
+from utils.formatters import format_audit_entry
 
 PERIOD_LABELS = {
     "today": "сегодня",
@@ -34,22 +26,8 @@ PERIOD_LABELS = {
 }
 
 
-def audit_keyboard():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📅 Сегодня", callback_data="al:today")
-    kb.button(text="📅 Неделя", callback_data="al:week")
-    kb.button(text="📅 Месяц", callback_data="al:month")
-    kb.button(text="📋 Всё время", callback_data="al:all")
-    kb.button(text="👤 По сотруднику", callback_data="al:by_user")
-    kb.button(text="🏠 Меню", callback_data="menu")
-    kb.adjust(2, 2, 1, 1)
-    return kb.as_markup()
-
-
 def format_audit_log(records: list[dict], label: str) -> list[str]:
-    """
-    Возвращает список сообщений (разбитых по 4096 символов).
-    """
+    """Возвращает список сообщений (разбитых по 4000 символов)."""
     if not records:
         return [f"📋 Нет действий за {label}."]
 
@@ -61,22 +39,21 @@ def format_audit_log(records: list[dict], label: str) -> list[str]:
 
     lines = [header]
     for r in records:
-        emoji = ACTION_EMOJI.get(r["action"], "▪️")
-        dt = r["created_at"][:16]
-        try:
-            dt = datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M:%S").strftime(
-                "%d.%m %H:%M"
-            )
-        except Exception:
-            pass
+        lines.append(format_audit_entry(r))
 
-        role_str = f" [{r['role']}]" if r.get("role") else ""
-        details_str = f"\n     <i>{r['details']}</i>" if r.get("details") else ""
+    # Разбиваем на части по 4000 символов
+    messages = []
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 1 > 4000:
+            messages.append(current)
+            current = line
+        else:
+            current += "\n" + line if current else line
+    if current:
+        messages.append(current)
 
-        lines.append(
-            f"{emoji} <code>{dt}</code>  <b>{r['full_name']}</b>{role_str}"
-            f"{details_str}"
-        )
+    return messages
 
     # Разбиваем на части по 4000 символов
     messages = []

@@ -7,7 +7,7 @@ from aiogram import Bot, Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 
-from utils.roles import (
+from services.roles import (
     can_view_stock,
     can_view_analytics,
     can_manage_payments,

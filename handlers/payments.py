@@ -13,7 +13,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from config import ADMIN_IDS
-from utils.roles import can_manage_payments
+from services.roles import can_manage_payments
 from utils.formatters import (
     format_payment_notify,
     format_payment_confirmed,

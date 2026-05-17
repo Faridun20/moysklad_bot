@@ -1,5 +1,5 @@
 """
-Точка запуска бота
+Telegram-бот МойСклад — точка запуска
 """
 
 import asyncio
@@ -9,16 +9,61 @@ from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from config import TELEGRAM_TOKEN
-from handlers import common, stock, shipments, analytics, payments, audit
-from handlers import reports
-from services.notifier import shipment_notifier
+
+# Хэндлеры
+from handlers import (
+    start,
+    users,
+    stock,
+    shipments,
+    analytics,
+    payments,
+    reports,
+    audit,
+)
+
+# Сервисы и задачи
 from services.database import init_db
-from handlers.reports import daily_report_task, weekly_report_task, monthly_report_task
+from services.notifier import shipment_notifier
+from tasks.scheduled import (
+    daily_report_task,
+    weekly_report_task,
+    monthly_report_task,
+)
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def register_routers(dp: Dispatcher):
+    """Подключить все роутеры."""
+    routers = [
+        start.router,
+        users.router,
+        stock.router,
+        shipments.router,
+        analytics.router,
+        payments.router,
+        reports.router,
+        audit.router,
+    ]
+    for r in routers:
+        dp.include_router(r)
+
+
+def start_background_tasks(bot: Bot):
+    """Запустить фоновые задачи."""
+    tasks = [
+        shipment_notifier(bot),
+        daily_report_task(bot),
+        weekly_report_task(bot),
+        monthly_report_task(bot),
+    ]
+    for task in tasks:
+        asyncio.create_task(task)
 
 
 async def main():
@@ -27,19 +72,12 @@ async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
 
-    dp.include_router(common.router)
-    dp.include_router(stock.router)
-    dp.include_router(shipments.router)
-    dp.include_router(analytics.router)
-    dp.include_router(payments.router)
-    dp.include_router(audit.router)
-    dp.include_router(reports.router)
+    register_routers(dp)
+    start_background_tasks(bot)
 
-    # Фоновые задачи
-    asyncio.create_task(shipment_notifier(bot))
-    asyncio.create_task(daily_report_task(bot))
-    asyncio.create_task(weekly_report_task(bot))
-    asyncio.create_task(monthly_report_task(bot))
+    # Запускаем WebApp параллельно с ботом
+    from webapp.server import start_webapp
+    asyncio.create_task(start_webapp())
 
     logger.info("Бот запущен")
     await dp.start_polling(bot)

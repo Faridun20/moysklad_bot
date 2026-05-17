@@ -9,7 +9,7 @@ from aiogram import Bot, Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 
-from utils.roles import can_view_stock
+from services.roles import can_view_stock
 from services.moysklad import get_shipments, get_shipment_positions
 from utils.helpers import extract_id_from_href
 from utils.formatters import format_shipment

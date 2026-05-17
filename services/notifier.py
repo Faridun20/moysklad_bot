@@ -10,6 +10,7 @@ from datetime import datetime
 from aiogram import Bot
 
 from config import CHECK_INTERVAL_SEC as _CHECK_INTERVAL_SEC
+
 CHECK_INTERVAL_SEC = int(_CHECK_INTERVAL_SEC)
 from services.moysklad import get_shipments, get_shipment_positions
 from services.database import get_all_users
@@ -18,7 +19,7 @@ from utils.formatters import format_shipment, DIV
 
 logger = logging.getLogger(__name__)
 
-
+# ─── Получатели уведомлений ───
 def get_notify_recipients() -> list[int]:
     """
     Получить список получателей уведомлений об отгрузках:

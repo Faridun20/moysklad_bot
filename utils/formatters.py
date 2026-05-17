@@ -253,6 +253,7 @@ def format_payments_report(
 
 # ─── Аудит лог ────────────────────────────────────────────────────────────────
 
+
 def format_audit_entry(r: dict) -> str:
     ACTION_EMOJI = {
         "user_added": "🟢",
@@ -268,3 +269,46 @@ def format_audit_entry(r: dict) -> str:
     role_str = f" [{r['role']}]" if r.get("role") else ""
     detail_str = f"\n    <i>{r['details']}</i>" if r.get("details") else ""
     return f"{emoji} <code>{dt}</code>  <b>{r['full_name']}</b>{role_str}{detail_str}"
+
+# ─── Отчёт по остаткам склада ─────────────────────────────────────────────────
+
+
+def format_stock_report(data: dict) -> str:
+    slow = data["slow"]
+    fast = data["fast"]
+    critical = data["critical"]
+
+    lines = [DIV, "📦 <b>Отчёт по остаткам склада</b>", ""]
+
+    if slow:
+        lines.append("🐢 <b>Залежались (≥30 дней):</b>")
+        for r, days in slow[:5]:
+            name = r.get("name", "—")
+            stock = r.get("stock", 0)
+            unit = r.get("uom", {}).get("name", "шт")
+            lines.append(f"  • <b>{name}</b>")
+            lines.append(f"    <code>{stock} {unit} · {days} дней</code>")
+        lines.append("")
+
+    if fast:
+        lines.append("🚀 <b>Быстро уходят (&lt;7 дней):</b>")
+        for r, days in fast[:5]:
+            name = r.get("name", "—")
+            stock = r.get("stock", 0)
+            unit = r.get("uom", {}).get("name", "шт")
+            lines.append(f"  • <b>{name}</b>")
+            lines.append(f"    <code>{stock} {unit} · {days} дней</code>")
+        lines.append("")
+
+    if critical:
+        lines.append("🔴 <b>Критический остаток (&lt;20):</b>")
+        for r in critical[:5]:
+            name = r.get("name", "—")
+            stock = r.get("stock", 0)
+            unit = r.get("uom", {}).get("name", "шт")
+            lines.append(f"  • <b>{name}</b>: <code>{stock} {unit}</code>")
+
+    if not slow and not fast and not critical:
+        lines.append("✅ <i>Всё в норме — проблем не обнаружено</i>")
+
+    return "\n".join(lines)

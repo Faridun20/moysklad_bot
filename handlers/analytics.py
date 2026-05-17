@@ -10,7 +10,7 @@ from aiogram import Bot, Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 
-from utils.roles import can_view_analytics
+from services.roles import can_view_analytics
 from services.moysklad import get_sales_stats
 from utils.formatters import format_sales_report
 from utils.keyboards import analytics_keyboard, analytics_back_keyboard
