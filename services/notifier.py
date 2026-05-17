@@ -9,7 +9,8 @@ from datetime import datetime
 
 from aiogram import Bot
 
-from config import CHECK_INTERVAL_SEC
+from config import CHECK_INTERVAL_SEC as _CHECK_INTERVAL_SEC
+CHECK_INTERVAL_SEC = int(_CHECK_INTERVAL_SEC)
 from services.moysklad import get_shipments, get_shipment_positions
 from services.database import get_all_users
 from utils.helpers import extract_id_from_href
@@ -52,7 +53,7 @@ async def send_to_recipients(bot: Bot, text: str, recipients: list[int]):
 async def shipment_notifier(bot: Bot):
     """Раз в CHECK_INTERVAL_SEC проверяет новые отгрузки и рассылает уведомления."""
     last_check: datetime = datetime.now()
-    logger.info("Мониторинг отгрузок запущен (интервал %d с)", CHECK_INTERVAL_SEC)
+    logger.info("Мониторинг отгрузок запущен (интервал %s с)", CHECK_INTERVAL_SEC)
 
     while True:
         await asyncio.sleep(CHECK_INTERVAL_SEC)
