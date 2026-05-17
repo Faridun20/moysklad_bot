@@ -223,16 +223,8 @@ async def confirm_pay(call: CallbackQuery, bot: Bot):
     if payment["status"] != "pending":
         return await call.answer("⚠️ Уже обработан", show_alert=True)
 
-    confirm_payment(payment_id)
-
     admin_name = call.from_user.full_name or str(call.from_user.id)
-    add_audit_log(
-        call.from_user.id,
-        admin_name,
-        get_role(call.from_user.id),
-        "payment_confirmed",
-        f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']}",
-    )
+    confirm_payment(payment_id, call.from_user.id, admin_name)
 
     await call.answer("✅ Принято")
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
@@ -267,16 +259,8 @@ async def reject_pay(call: CallbackQuery, bot: Bot):
     if payment["status"] != "pending":
         return await call.answer("⚠️ Уже обработан", show_alert=True)
 
-    reject_payment(payment_id)
-
     admin_name = call.from_user.full_name or str(call.from_user.id)
-    add_audit_log(
-        call.from_user.id,
-        admin_name,
-        get_role(call.from_user.id),
-        "payment_rejected",
-        f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']}",
-    )
+    reject_payment(payment_id, call.from_user.id, admin_name)
 
     await call.answer("❌ Отклонено")
     now = datetime.now().strftime("%d.%m.%Y %H:%M")

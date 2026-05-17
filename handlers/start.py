@@ -32,6 +32,7 @@ def get_keyboard_for_role(role: str):
     webapp_url = os.environ.get("WEBAPP_URL", "")
     if webapp_url:
         kb.button(text="🌐 Открыть WebApp", web_app=WebAppInfo(url=webapp_url))
+    
 
     if role in ("admin", "boss", "manager"):
         kb.button(text="📦 Все остатки", callback_data="sp:0")
@@ -49,8 +50,9 @@ def get_keyboard_for_role(role: str):
         kb.button(text="📊 Отчёты", callback_data="reports_menu")
 
     if role == "admin":
-        kb.button(text="👥 Пользователи", callback_data="users_list")
-        kb.button(text="📋 Аудит лог", callback_data="al:today")
+        kb.button(text="👥 Пользователи",  callback_data="users_list")
+        kb.button(text="📋 Аудит лог",     callback_data="al:today")
+        kb.button(text="🔍 Быстрый лог",   callback_data="log:20")
 
     kb.adjust(1)
     return kb.as_markup()

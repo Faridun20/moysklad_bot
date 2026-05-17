@@ -12,14 +12,8 @@ from config import TELEGRAM_TOKEN
 
 # Хэндлеры
 from handlers import (
-    start,
-    users,
-    stock,
-    shipments,
-    analytics,
-    payments,
-    reports,
-    audit,
+    start, users, stock, shipments,
+    analytics, payments, reports, audit, log,
 )
 
 # Сервисы и задачи
@@ -49,6 +43,7 @@ def register_routers(dp: Dispatcher):
         payments.router,
         reports.router,
         audit.router,
+        log.router,
     ]
     for r in routers:
         dp.include_router(r)

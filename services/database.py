@@ -207,12 +207,23 @@ def add_user(user_id: int, username: str, full_name: str, role: str) -> bool:
     return set_role(user_id, username, full_name, role)
 
 
-def remove_user(user_id: int) -> bool:
+def remove_user(user_id: int, removed_by: int = None, removed_name: str = "") -> bool:
+    # Перед удалением сохраняем данные для лога
+    users = get_all_users()
+    target = next((u for u in users if u["user_id"] == user_id), None)
+
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(q("DELETE FROM user_roles WHERE user_id = ?"), (user_id,))
         deleted = cur.rowcount > 0
         conn.commit()
+
+    if deleted and removed_by and target:
+        add_audit_log(
+            removed_by, removed_name, get_role(removed_by),
+            "user_removed",
+            f"Удалён пользователь {target['full_name']} (ID: {user_id}, роль: {target['role']})",
+        )
     return deleted
 
 
@@ -239,7 +250,7 @@ def add_payment(user_id, username, full_name, amount, currency, comment) -> int:
     return payment_id
 
 
-def confirm_payment(payment_id: int) -> bool:
+def confirm_payment(payment_id: int, confirmed_by: int = None, confirmed_name: str = "") -> bool:
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
@@ -248,10 +259,35 @@ def confirm_payment(payment_id: int) -> bool:
         )
         updated = cur.rowcount > 0
         conn.commit()
+    if updated and confirmed_by:
+        payment = get_payment(payment_id)
+        add_audit_log(
+            confirmed_by, confirmed_name, get_role(confirmed_by),
+            "payment_confirmed",
+            f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
+        )
     return updated
 
+def archive_payment(payment_id: int, archived_by: int, archived_name: str) -> bool:
+    """Архивировать платёж — данные сохраняются, но помечаются как archived."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE payments SET status = 'archived' WHERE id = ?"),
+            (payment_id,),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    if updated:
+        payment = get_payment(payment_id)
+        add_audit_log(
+            archived_by, archived_name, get_role(archived_by),
+            "payment_archived",
+            f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
+        )
+    return updated
 
-def reject_payment(payment_id: int) -> bool:
+def reject_payment(payment_id: int, rejected_by: int = None, rejected_name: str = "") -> bool:
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
@@ -260,6 +296,13 @@ def reject_payment(payment_id: int) -> bool:
         )
         updated = cur.rowcount > 0
         conn.commit()
+    if updated and rejected_by:
+        payment = get_payment(payment_id)
+        add_audit_log(
+            rejected_by, rejected_name, get_role(rejected_by),
+            "payment_rejected",
+            f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
+        )
     return updated
 
 
