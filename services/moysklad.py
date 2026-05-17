@@ -31,8 +31,7 @@ async def get_all_stock() -> list[dict]:
     async with aiohttp.ClientSession() as session:
         while True:
             data = await ms_get(
-                session, "report/stock/all",
-                params={"limit": limit, "offset": offset}
+                session, "report/stock/all", params={"limit": limit, "offset": offset}
             )
             rows = data if isinstance(data, list) else data.get("rows", [])
             all_rows.extend(rows)
@@ -58,7 +57,8 @@ async def get_shipments(since: datetime, until: datetime = None) -> list[dict]:
         filter_str += f";moment<{until_str}"
     async with aiohttp.ClientSession() as session:
         data = await ms_get(
-            session, "entity/demand",
+            session,
+            "entity/demand",
             params={
                 "filter": filter_str,
                 "expand": "agent,owner",
@@ -87,10 +87,13 @@ async def get_sales_stats(since: datetime, until: datetime = None) -> dict:
         return {"total": 0, "count": 0, "clients": 0, "top_products": []}
 
     total = sum(s.get("sum", 0) for s in shipments)
-    clients = len(set(
-        s.get("agent", {}).get("name", "") for s in shipments
-        if s.get("agent", {}).get("name")
-    ))
+    clients = len(
+        set(
+            s.get("agent", {}).get("name", "")
+            for s in shipments
+            if s.get("agent", {}).get("name")
+        )
+    )
 
     product_sums: dict[str, dict] = {}
     for s in shipments[:30]:
@@ -111,7 +114,9 @@ async def get_sales_stats(since: datetime, until: datetime = None) -> dict:
         except Exception:
             pass
 
-    top_products = sorted(product_sums.items(), key=lambda x: x[1]["sum"], reverse=True)[:5]
+    top_products = sorted(
+        product_sums.items(), key=lambda x: x[1]["sum"], reverse=True
+    )[:5]
 
     return {
         "total": total,

@@ -52,3 +52,13 @@ def trend_arrow(current: float, previous: float) -> str:
         return f"📉 {diff:.0f}%"
     else:
         return f"➡️ {diff:+.0f}%"
+
+
+from datetime import timezone, timedelta
+
+
+def local_now() -> datetime:
+    """Текущее время по Ташкенту (UTC+5)."""
+    from config import TZ_OFFSET
+
+    return datetime.utcnow() + timedelta(hours=TZ_OFFSET)

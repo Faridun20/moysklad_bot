@@ -1,5 +1,5 @@
 """
-Хэндлеры: учёт платежей от сотрудников
+Хэндлеры: учёт платежей от сотрудников — улучшенный визуал
 """
 
 import logging
@@ -14,9 +14,14 @@ from aiogram.fsm.state import State, StatesGroup
 
 from config import ADMIN_IDS
 from utils.roles import can_manage_payments
+from utils.formatters import (
+    format_payment_notify, format_payment_confirmed,
+    format_payment_rejected, format_payments_report, DIV
+)
 from services.database import (
     add_payment, confirm_payment, reject_payment,
-    get_payment, get_payments_report, get_summary_by_employee
+    get_payment, get_payments_report, get_summary_by_employee,
+    add_audit_log, get_role
 )
 
 logger = logging.getLogger(__name__)
@@ -26,21 +31,16 @@ CURRENCIES = ["USD", "UZS", "RUB", "EUR"]
 
 
 class PaymentState(StatesGroup):
-    waiting_for_amount = State()
+    waiting_for_amount   = State()
     waiting_for_currency = State()
-    waiting_for_comment = State()
+    waiting_for_comment  = State()
 
 
 def is_admin(user_id: int) -> bool:
     return can_manage_payments(user_id)
 
 
-def format_date(dt_str: str) -> str:
-    try:
-        return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y %H:%M")
-    except Exception:
-        return dt_str
-
+# ─── Клавиатуры ──────────────────────────────────────────────────────────────
 
 def currency_keyboard():
     kb = InlineKeyboardBuilder()
@@ -70,31 +70,31 @@ def pay_report_keyboard():
     return kb.as_markup()
 
 
-# ─── Команды и callback для запуска платежа ──────────────────────────────────
+# ─── Запуск платежа ───────────────────────────────────────────────────────────
 
 @router.message(Command("pay"))
 async def cmd_pay(message: Message, state: FSMContext):
-    """Начать процесс отправки платежа через команду."""
     await state.clear()
     await state.set_state(PaymentState.waiting_for_amount)
     await message.answer(
-        "💵 <b>Отправка платежа</b>\n\n"
-        "Введите сумму платежа (только цифры):\n"
-        "Например: <code>1500</code>",
+        f"{DIV}\n"
+        f"💵 <b>Отправка платежа</b>\n\n"
+        f"Введите сумму (только цифры):\n"
+        f"<code>1500</code>",
         parse_mode="HTML"
     )
 
 
 @router.callback_query(F.data == "pay_start")
 async def cb_pay_start(call: CallbackQuery, state: FSMContext):
-    """Начать процесс отправки платежа через кнопку меню."""
     await call.answer()
     await state.clear()
     await state.set_state(PaymentState.waiting_for_amount)
     await call.message.answer(
-        "💵 <b>Отправка платежа</b>\n\n"
-        "Введите сумму платежа (только цифры):\n"
-        "Например: <code>1500</code>",
+        f"{DIV}\n"
+        f"💵 <b>Отправка платежа</b>\n\n"
+        f"Введите сумму (только цифры):\n"
+        f"<code>1500</code>",
         parse_mode="HTML"
     )
 
@@ -111,12 +111,10 @@ async def process_amount(message: Message, state: FSMContext):
             "❌ Введите корректную сумму, например: <code>1500</code>",
             parse_mode="HTML"
         )
-
     await state.update_data(amount=amount)
     await state.set_state(PaymentState.waiting_for_currency)
     await message.answer(
-        f"✅ Сумма: <b>{amount:,.0f}</b>\n\n"
-        "Выберите валюту:",
+        f"✅ Сумма: <b>{amount:,.0f}</b>\n\nВыберите валюту:",
         parse_mode="HTML",
         reply_markup=currency_keyboard()
     )
@@ -129,8 +127,8 @@ async def process_currency(call: CallbackQuery, state: FSMContext):
     await state.set_state(PaymentState.waiting_for_comment)
     await call.message.edit_text(
         f"✅ Валюта: <b>{currency}</b>\n\n"
-        "📝 Напишите комментарий — за что переданы деньги?\n"
-        "Например: <code>за май, оплата аренды</code>",
+        f"📝 Напишите комментарий — за что переданы деньги?\n"
+        f"<code>за май, оплата аренды</code>",
         parse_mode="HTML"
     )
     await call.answer()
@@ -146,15 +144,14 @@ async def pay_cancel(call: CallbackQuery, state: FSMContext):
 @router.message(PaymentState.waiting_for_comment)
 async def process_comment(message: Message, state: FSMContext, bot: Bot):
     comment = message.text.strip()
-    data = await state.get_data()
+    data    = await state.get_data()
     await state.clear()
 
-    amount = data["amount"]
+    amount   = data["amount"]
     currency = data["currency"]
-
-    user = message.from_user
+    user     = message.from_user
     full_name = user.full_name or user.username or str(user.id)
-    username = f"@{user.username}" if user.username else "—"
+    username  = f"@{user.username}" if user.username else "—"
 
     payment_id = add_payment(
         user_id=user.id,
@@ -165,37 +162,35 @@ async def process_comment(message: Message, state: FSMContext, bot: Bot):
         comment=comment,
     )
 
+    # Аудит лог
+    add_audit_log(
+        user.id, full_name, get_role(user.id),
+        "payment_sent",
+        f"Платёж #{payment_id}: {amount:,.0f} {currency} — {comment}"
+    )
+
     await message.answer(
-        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-        f"✅ <b>Платёж отправлен на подтверждение</b>\n\n"
-        f"💰 Сумма: <b>{amount:,.0f} {currency}</b>\n"
-        f"📝 Комментарий: {comment}\n\n"
-        f"<i>Ожидайте подтверждения от руководителя</i>",
+        f"{DIV}\n"
+        f"✅ <b>Платёж отправлен!</b>\n\n"
+        f"<b>💰 Сумма:</b> {amount:,.0f} {currency}\n"
+        f"<b>📝 Комментарий:</b> {comment}\n\n"
+        f"<i>⏳ Ожидайте подтверждения</i>",
         parse_mode="HTML"
     )
 
-    notify_text = (
-        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-        f"💵 <b>Новый платёж #{payment_id}</b>\n\n"
-        f"👤 Сотрудник: <b>{full_name}</b> ({username})\n"
-        f"💰 Сумма: <b>{amount:,.0f} {currency}</b>\n"
-        f"📝 Комментарий: {comment}\n"
-        f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-    )
-
+    notify = format_payment_notify(payment_id, full_name, username, amount, currency, comment)
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
-                admin_id,
-                notify_text,
+                admin_id, notify,
                 parse_mode="HTML",
                 reply_markup=confirm_keyboard(payment_id)
             )
         except Exception as e:
-            logger.warning("Не удалось отправить уведомление админу %d: %s", admin_id, e)
+            logger.warning("Не удалось уведомить %d: %s", admin_id, e)
 
 
-# ─── Подтверждение/отклонение (только для админов) ───────────────────────────
+# ─── Подтверждение / Отклонение ───────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("pay_ok:"))
 async def confirm_pay(call: CallbackQuery, bot: Bot):
@@ -203,27 +198,33 @@ async def confirm_pay(call: CallbackQuery, bot: Bot):
         return await call.answer("⛔ Нет доступа", show_alert=True)
 
     payment_id = int(call.data.split(":")[1])
-    payment = get_payment(payment_id)
+    payment    = get_payment(payment_id)
 
     if not payment:
         return await call.answer("❌ Платёж не найден", show_alert=True)
     if payment["status"] != "pending":
-        return await call.answer("⚠️ Платёж уже обработан", show_alert=True)
+        return await call.answer("⚠️ Уже обработан", show_alert=True)
 
     confirm_payment(payment_id)
-    await call.answer("✅ Платёж принят")
 
+    admin_name = call.from_user.full_name or str(call.from_user.id)
+    add_audit_log(
+        call.from_user.id, admin_name, get_role(call.from_user.id),
+        "payment_confirmed",
+        f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']}"
+    )
+
+    await call.answer("✅ Принято")
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
     await call.message.edit_text(
-        call.message.text + f"\n\n✅ <b>Принято</b> — {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+        call.message.text + f"\n\n{DIV}\n✅ <b>Принято</b>  <code>{now}</code>  — {admin_name}",
         parse_mode="HTML"
     )
 
     try:
         await bot.send_message(
             payment["user_id"],
-            f"✅ <b>Ваш платёж принят!</b>\n\n"
-            f"💰 {payment['amount']:,.0f} {payment['currency']}\n"
-            f"📝 {payment['comment']}",
+            format_payment_confirmed(payment["amount"], payment["currency"], payment["comment"]),
             parse_mode="HTML"
         )
     except Exception as e:
@@ -236,35 +237,40 @@ async def reject_pay(call: CallbackQuery, bot: Bot):
         return await call.answer("⛔ Нет доступа", show_alert=True)
 
     payment_id = int(call.data.split(":")[1])
-    payment = get_payment(payment_id)
+    payment    = get_payment(payment_id)
 
     if not payment:
         return await call.answer("❌ Платёж не найден", show_alert=True)
     if payment["status"] != "pending":
-        return await call.answer("⚠️ Платёж уже обработан", show_alert=True)
+        return await call.answer("⚠️ Уже обработан", show_alert=True)
 
     reject_payment(payment_id)
-    await call.answer("❌ Платёж отклонён")
 
+    admin_name = call.from_user.full_name or str(call.from_user.id)
+    add_audit_log(
+        call.from_user.id, admin_name, get_role(call.from_user.id),
+        "payment_rejected",
+        f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']}"
+    )
+
+    await call.answer("❌ Отклонено")
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
     await call.message.edit_text(
-        call.message.text + f"\n\n❌ <b>Отклонено</b> — {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+        call.message.text + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{now}</code>  — {admin_name}",
         parse_mode="HTML"
     )
 
     try:
         await bot.send_message(
             payment["user_id"],
-            f"❌ <b>Ваш платёж отклонён</b>\n\n"
-            f"💰 {payment['amount']:,.0f} {payment['currency']}\n"
-            f"📝 {payment['comment']}\n\n"
-            f"<i>Свяжитесь с руководителем для уточнения</i>",
+            format_payment_rejected(payment["amount"], payment["currency"], payment["comment"]),
             parse_mode="HTML"
         )
     except Exception as e:
         logger.warning("Не удалось уведомить сотрудника: %s", e)
 
 
-# ─── Отчёт (только для админов) ───────────────────────────────────────────────
+# ─── Отчёт ────────────────────────────────────────────────────────────────────
 
 @router.message(Command("payreport"))
 async def cmd_payreport(message: Message):
@@ -280,85 +286,41 @@ async def cb_payreport(call: CallbackQuery):
     await call.answer()
 
     period = call.data.split(":")[1]
-    now = datetime.now()
 
+    if period == "menu":
+        return await call.message.answer(
+            "📊 За какой период показать отчёт?",
+            reply_markup=pay_report_keyboard()
+        )
+
+    now = datetime.now()
     if period == "today":
         since = now.replace(hour=0, minute=0, second=0).strftime("%Y-%m-%d %H:%M:%S")
-        until = None
-        label = "сегодня"
+        until, label = None, "сегодня"
     elif period == "week":
         since = (now - timedelta(weeks=1)).strftime("%Y-%m-%d %H:%M:%S")
-        until = None
-        label = "эта неделя"
+        until, label = None, "эта неделя"
     elif period == "month":
         since = now.replace(day=1, hour=0, minute=0, second=0).strftime("%Y-%m-%d %H:%M:%S")
-        until = None
-        label = "этот месяц"
+        until, label = None, "этот месяц"
     else:
-        since = None
-        until = None
-        label = "всё время"
+        since, until, label = None, None, "всё время"
 
-    summary = get_summary_by_employee(since, until)
+    summary  = get_summary_by_employee(since, until)
     payments = get_payments_report(since, until)
 
     if not payments:
-        return await call.message.answer(f"📊 Нет платежей за {label}.")
-
-    lines = []
-    lines.append("<code>━━━━━━━━━━━━━━━━━━━━</code>")
-    lines.append(f"📊 <b>Отчёт по платежам · {label}</b>")
-    lines.append("")
-    lines.append("<b>По сотрудникам:</b>")
-    for s in summary:
-        lines.append(
-            f"👤 <b>{s['full_name']}</b>\n"
-            f"    {s['total']:,.0f} {s['currency']} · {s['count']} платежей"
+        return await call.message.answer(
+            f"{DIV}\n📊 <b>Платежи · {label}</b>\n\n<i>Нет платежей за период</i>",
+            parse_mode="HTML"
         )
 
-    lines.append("")
-    total_by_currency: dict[str, float] = {}
-    for p in payments:
-        total_by_currency[p["currency"]] = total_by_currency.get(p["currency"], 0) + p["amount"]
-    lines.append("<b>Итого:</b>")
-    for cur, total in total_by_currency.items():
-        lines.append(f"  💰 {total:,.0f} {cur}")
-
-    lines.append("")
-    lines.append(f"<b>Все платежи ({len(payments)}):</b>")
-    for p in payments:
-        lines.append(
-            f"<code>━━━━━━━━━━━━</code>\n"
-            f"👤 {p['full_name']}\n"
-            f"💰 {p['amount']:,.0f} {p['currency']}\n"
-            f"📝 {p['comment']}\n"
-            f"🕐 {format_date(p['created_at'])}"
-        )
-
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        summary_lines = lines[:lines.index("") + 1] if "" in lines else lines
-        await call.message.answer("\n".join(summary_lines), parse_mode="HTML")
-        for p in payments:
-            detail = (
-                f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-                f"👤 {p['full_name']}\n"
-                f"💰 {p['amount']:,.0f} {p['currency']}\n"
-                f"📝 {p['comment']}\n"
-                f"🕐 {format_date(p['created_at'])}"
-            )
-            await call.message.answer(detail, parse_mode="HTML")
-    else:
-        await call.message.answer(text, parse_mode="HTML")
+    messages = format_payments_report(summary, payments, label)
+    for msg in messages:
+        await call.message.answer(msg, parse_mode="HTML")
 
     kb = InlineKeyboardBuilder()
     kb.button(text="📅 Другой период", callback_data="pr:menu")
-    kb.button(text="🏠 Меню", callback_data="menu")
+    kb.button(text="🏠 Меню",         callback_data="menu")
     kb.adjust(1)
     await call.message.answer("Выберите действие:", reply_markup=kb.as_markup())
-
-
-@router.callback_query(F.data == "pr:menu")
-async def cb_pr_menu(call: CallbackQuery):
-    await call.answer()
-    await call.message.answer("📊 За какой период показать отчёт?", reply_markup=pay_report_keyboard())

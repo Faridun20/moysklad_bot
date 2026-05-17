@@ -1,5 +1,5 @@
 """
-Форматирование сообщений для Telegram
+Форматирование сообщений для Telegram — улучшенный визуал
 """
 
 from utils.helpers import (
@@ -9,6 +9,18 @@ from utils.helpers import (
 
 PAGE_SIZE = 10
 
+# ─── Общие элементы ───────────────────────────────────────────────────────────
+
+DIV  = "<code>━━━━━━━━━━━━━━━━━━━━</code>"
+DIV2 = "<code>────────────────────</code>"
+
+
+def section_header(emoji: str, title: str, subtitle: str = "") -> str:
+    sub = f"\n<code>{subtitle}</code>" if subtitle else ""
+    return f"{DIV}\n{emoji} <b>{title}</b>{sub}"
+
+
+# ─── Остатки ──────────────────────────────────────────────────────────────────
 
 def format_stock_page(rows: list[dict], page: int, cat_name: str = "") -> str:
     total = len(rows)
@@ -16,110 +28,227 @@ def format_stock_page(rows: list[dict], page: int, cat_name: str = "") -> str:
     start = page * PAGE_SIZE
     end = min(start + PAGE_SIZE, total)
 
-    lines = []
     cat_str = f" · {cat_name}" if cat_name else ""
-    lines.append("<code>━━━━━━━━━━━━━━━━━━━━</code>")
-    lines.append(f"📦 <b>Склад{cat_str}</b>")
-    lines.append(f"<code>стр {page + 1}/{total_pages} · {total} позиций</code>")
-    lines.append("")
+    lines = [
+        section_header("📦", f"Склад{cat_str}",
+                       f"стр {page + 1}/{total_pages} · {total} позиций"),
+        "",
+    ]
 
     for r in rows[start:end]:
-        name = r.get("name", "—")
-        stock = r.get("stock", 0)
-        reserve = r.get("reserve", 0)
-        unit = r.get("uom", {}).get("name", "шт")
-        folder_name = get_folder_name(r.get("folder", {}))
-        indicator = stock_indicator(stock)
+        name     = r.get("name", "—")
+        stock    = r.get("stock", 0)
+        reserve  = r.get("reserve", 0)
+        unit     = r.get("uom", {}).get("name", "шт")
+        folder   = get_folder_name(r.get("folder", {}))
+        ind      = stock_indicator(stock)
 
-        if folder_name and not cat_name:
-            lines.append(f"{indicator} <b>{name}</b>  <i>{folder_name}</i>")
-        else:
-            lines.append(f"{indicator} <b>{name}</b>")
+        # Название + папка
+        folder_str = f"  <i>{folder}</i>" if folder and not cat_name else ""
+        lines.append(f"{ind} <b>{name}</b>{folder_str}")
 
-        reserve_str = f"  резерв: {reserve} {unit}" if reserve else ""
+        # Остаток + резерв в одну строку
+        reserve_str = f"   <i>резерв: {reserve} {unit}</i>" if reserve else ""
         lines.append(f"    <code>{stock} {unit}</code>{reserve_str}")
         lines.append("")
 
-    lines.append("<code>🟢 ≥100  🟡 20–99  🔴 &lt;20</code>")
+    lines.append(DIV2)
+    lines.append("<code>🟢 ≥100   🟡 20–99   🔴 &lt;20</code>")
     return "\n".join(lines)
 
 
+# ─── Отгрузка ─────────────────────────────────────────────────────────────────
+
 def format_shipment(s: dict, positions: list[dict] = None) -> str:
-    name = s.get("name", "—")
-    moment = format_date(s.get("moment", "—"))
-    agent = s.get("agent", {}).get("name", "—")
-    owner = s.get("owner", {}).get("name", "—")
+    name    = s.get("name", "—")
+    moment  = format_date(s.get("moment", "—"))
+    agent   = s.get("agent", {}).get("name", "—")
+    owner   = s.get("owner", {}).get("name", "—")
     sum_str = format_price(s.get("sum", 0))
 
-    lines = []
-    lines.append("<code>━━━━━━━━━━━━━━━━━━━━</code>")
-    lines.append(f"🚚 <b>{name}</b>")
-    lines.append(f"<code>{moment}</code>")
-    lines.append("")
-    lines.append(f"👤 Клиент: {agent}")
-    lines.append(f"👨‍💼 Ответственный: {owner}")
-    lines.append(f"💰 <b>{sum_str} $</b>")
+    lines = [
+        DIV,
+        f"🚚 <b>{name}</b>   <code>{moment}</code>",
+        "",
+        f"<b>👤 Клиент:</b> {agent}",
+        f"<b>👨‍💼 Менеджер:</b> {owner}",
+        f"<b>💰 Итого: {sum_str} $</b>",
+    ]
 
     if positions:
         lines.append("")
-        lines.append("<b>Товары:</b>")
+        lines.append(f"<b>📋 Товары ({len(positions)}):</b>")
+        lines.append(DIV2)
         for pos in positions[:15]:
             assortment = pos.get("assortment", {})
-            pos_name = assortment.get("name", "—")
-            qty = pos.get("quantity", 0)
-            uom = (
+            pos_name   = assortment.get("name", "—")
+            qty        = pos.get("quantity", 0)
+            uom        = (
                 pos.get("uom", {}).get("name", "")
                 or assortment.get("uom", {}).get("name", "шт")
             )
-            price_raw = pos.get("price", 0)
-            price_str = format_price(price_raw)
-            total_pos = format_price(price_raw * qty)
+            price_raw  = pos.get("price", 0)
+            price_str  = format_price(price_raw)
+            total_pos  = format_price(price_raw * qty)
             lines.append(
-                f"  • <b>{pos_name}</b>\n"
-                f"    <code>{qty} {uom}</code>  ·  {price_str} $/ед.  ·  итого: {total_pos} $"
+                f"▸ <b>{pos_name}</b>\n"
+                f"  <code>{qty} {uom}</code>  ·  {price_str} $  →  <b>{total_pos} $</b>"
             )
         if len(positions) > 15:
-            lines.append(f"  <i>...и ещё {len(positions) - 15} поз.</i>")
+            lines.append(f"\n<i>…ещё {len(positions) - 15} позиций</i>")
     else:
-        lines.append("\n<i>Нет данных о товарах</i>")
+        lines.append(f"\n{DIV2}\n<i>Товары не загружены</i>")
 
     return "\n".join(lines)
 
 
+# ─── Аналитика продаж ─────────────────────────────────────────────────────────
+
 def format_sales_report(label: str, stats: dict, prev_stats: dict = None) -> str:
-    total = stats["total"]
-    count = stats["count"]
+    total   = stats["total"]
+    count   = stats["count"]
     clients = stats["clients"]
-    top = stats["top_products"]
+    top     = stats["top_products"]
 
     total_str = format_price(total)
-    avg_str = format_price(total / count) if count else "0"
-
-    lines = []
-    lines.append("<code>━━━━━━━━━━━━━━━━━━━━</code>")
-    lines.append(f"📊 <b>Продажи · {label}</b>")
-    lines.append("")
+    avg_str   = format_price(total / count) if count else "0"
 
     trend = ""
     if prev_stats and prev_stats["total"] > 0:
         trend = "  " + trend_arrow(total, prev_stats["total"])
 
-    lines.append(f"💰 Выручка: <b>{total_str} $</b>{trend}")
-    lines.append(f"🚚 Отгрузок: <b>{count}</b>")
-    lines.append(f"👥 Клиентов: <b>{clients}</b>")
+    lines = [
+        section_header("📊", f"Продажи · {label}"),
+        "",
+        f"💰 <b>Выручка:</b>  <b>{total_str} $</b>{trend}",
+        f"🚚 <b>Отгрузок:</b>  {count}",
+        f"👥 <b>Клиентов:</b>  {clients}",
+    ]
     if count:
-        lines.append(f"📋 Средний чек: <b>{avg_str} $</b>")
+        lines.append(f"📋 <b>Средний чек:</b>  {avg_str} $")
 
     if top:
         lines.append("")
-        lines.append("<b>🏆 Топ-5 товаров:</b>")
-        for i, (name, data) in enumerate(top, 1):
+        lines.append(f"<b>🏆 Топ товаров:</b>")
+        lines.append(DIV2)
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        for i, (name, data) in enumerate(top):
             t_sum = format_price(data["sum"])
-            qty = data["qty"]
-            lines.append(f"  {i}. <b>{name}</b>")
-            lines.append(f"      <code>{qty} шт · {t_sum} $</code>")
+            qty   = data["qty"]
+            medal = medals[i] if i < len(medals) else f"{i+1}."
+            lines.append(f"{medal} <b>{name}</b>")
+            lines.append(f"    <code>{qty} шт  ·  {t_sum} $</code>")
 
     if count == 0:
-        lines.append("\n<i>Нет данных за период</i>")
+        lines.append(f"\n{DIV2}\n<i>Нет данных за период</i>")
 
     return "\n".join(lines)
+
+
+# ─── Платёж ───────────────────────────────────────────────────────────────────
+
+def format_payment_notify(payment_id: int, full_name: str, username: str,
+                           amount: float, currency: str, comment: str) -> str:
+    from datetime import datetime
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    return (
+        f"{DIV}\n"
+        f"💵 <b>Новый платёж #{payment_id}</b>\n"
+        f"\n"
+        f"<b>👤 Сотрудник:</b> {full_name} ({username})\n"
+        f"<b>💰 Сумма:</b> {amount:,.0f} {currency}\n"
+        f"<b>📝 Комментарий:</b> {comment}\n"
+        f"<b>🕐 Время:</b> {now}"
+    )
+
+
+def format_payment_confirmed(amount: float, currency: str, comment: str) -> str:
+    return (
+        f"{DIV}\n"
+        f"✅ <b>Платёж принят!</b>\n"
+        f"\n"
+        f"<b>💰 Сумма:</b> {amount:,.0f} {currency}\n"
+        f"<b>📝 Комментарий:</b> {comment}"
+    )
+
+
+def format_payment_rejected(amount: float, currency: str, comment: str) -> str:
+    return (
+        f"{DIV}\n"
+        f"❌ <b>Платёж отклонён</b>\n"
+        f"\n"
+        f"<b>💰 Сумма:</b> {amount:,.0f} {currency}\n"
+        f"<b>📝 Комментарий:</b> {comment}\n"
+        f"\n"
+        f"<i>Свяжитесь с руководителем</i>"
+    )
+
+
+# ─── Отчёт по платежам ────────────────────────────────────────────────────────
+
+def format_payments_report(summary: list[dict], payments: list[dict],
+                            label: str) -> list[str]:
+    """Возвращает список сообщений (Telegram ограничивает 4096 символов)."""
+    lines = [
+        section_header("📊", f"Платежи · {label}"),
+        "",
+        "<b>По сотрудникам:</b>",
+        DIV2,
+    ]
+
+    total_by_currency: dict[str, float] = {}
+    for s in summary:
+        lines.append(
+            f"👤 <b>{s['full_name']}</b>\n"
+            f"    <code>{s['total']:,.0f} {s['currency']}  ·  {s['count']} платежей</code>"
+        )
+        total_by_currency[s["currency"]] = (
+            total_by_currency.get(s["currency"], 0) + s["total"]
+        )
+
+    lines.append("")
+    lines.append("<b>Итого:</b>")
+    for cur, total in total_by_currency.items():
+        lines.append(f"  💰 <b>{total:,.0f} {cur}</b>")
+
+    # Разбиваем на сообщения
+    messages = []
+    current = "\n".join(lines)
+
+    for p in payments:
+        entry = (
+            f"\n{DIV2}\n"
+            f"👤 {p['full_name']}\n"
+            f"💰 {p['amount']:,.0f} {p['currency']}\n"
+            f"📝 {p['comment']}\n"
+            f"🕐 {p['created_at'][:16]}"
+        )
+        if len(current) + len(entry) > 3800:
+            messages.append(current)
+            current = entry.lstrip("\n")
+        else:
+            current += entry
+
+    if current:
+        messages.append(current)
+
+    return messages
+
+
+# ─── Аудит лог ────────────────────────────────────────────────────────────────
+
+def format_audit_entry(r: dict) -> str:
+    ACTION_EMOJI = {
+        "user_added":        "🟢",
+        "user_removed":      "🔴",
+        "role_changed":      "🔄",
+        "payment_sent":      "💵",
+        "payment_confirmed": "✅",
+        "payment_rejected":  "❌",
+        "login":             "👤",
+    }
+    emoji      = ACTION_EMOJI.get(r["action"], "▪️")
+    dt         = r["created_at"][:16]
+    role_str   = f" [{r['role']}]" if r.get("role") else ""
+    detail_str = f"\n    <i>{r['details']}</i>" if r.get("details") else ""
+    return f"{emoji} <code>{dt}</code>  <b>{r['full_name']}</b>{role_str}{detail_str}"

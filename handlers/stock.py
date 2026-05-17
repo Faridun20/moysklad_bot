@@ -7,13 +7,16 @@ from aiogram import Bot, Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 
-from utils.roles import can_view_stock, can_view_analytics, can_manage_payments, is_admin
+from utils.roles import (
+    can_view_stock,
+    can_view_analytics,
+    can_manage_payments,
+    is_admin,
+)
 from services.moysklad import get_all_stock, get_categories
 from utils.helpers import extract_id_from_href
 from utils.formatters import format_stock_page
-from utils.keyboards import (
-    stock_nav_keyboard, categories_keyboard, main_keyboard
-)
+from utils.keyboards import stock_nav_keyboard, categories_keyboard, main_keyboard
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -31,6 +34,7 @@ def is_allowed(user_id: int) -> bool:
 
 # ─── Команды ─────────────────────────────────────────────────────────────────
 
+
 @router.message(Command("stock"))
 async def cmd_stock(message: Message, bot: Bot):
     if not is_allowed(message.from_user.id):
@@ -46,6 +50,7 @@ async def cmd_categories(message: Message, bot: Bot):
 
 
 # ─── Callback ─────────────────────────────────────────────────────────────────
+
 
 @router.callback_query(F.data.startswith("sp:"))
 async def cb_stock_all(call: CallbackQuery, bot: Bot):
@@ -108,6 +113,7 @@ async def cb_stock_cat_page(call: CallbackQuery, bot: Bot):
 
 # ─── Логика ───────────────────────────────────────────────────────────────────
 
+
 async def show_categories(bot: Bot, chat_id: int, page: int):
     try:
         cats = categories_cache.get(chat_id)
@@ -125,7 +131,9 @@ async def show_categories(bot: Bot, chat_id: int, page: int):
         )
     except Exception as e:
         logger.exception("Ошибка категорий")
-        await bot.send_message(chat_id, f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML")
+        await bot.send_message(
+            chat_id, f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML"
+        )
 
 
 async def show_stock_all(bot: Bot, chat_id: int, page: int):
@@ -134,13 +142,20 @@ async def show_stock_all(bot: Bot, chat_id: int, page: int):
         rows = await get_all_stock()
         if not rows:
             return await bot.send_message(chat_id, "📦 Склад пуст.")
-        stock_cache[chat_id] = {"rows": rows, "mode": "all", "cat_name": "", "cat_idx": 0}
+        stock_cache[chat_id] = {
+            "rows": rows,
+            "mode": "all",
+            "cat_name": "",
+            "cat_idx": 0,
+        }
         txt = format_stock_page(rows, page)
         kb = stock_nav_keyboard(page, len(rows), "all")
         await bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         logger.error("Ошибка остатков: %s", e)
-        await bot.send_message(chat_id, f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML")
+        await bot.send_message(
+            chat_id, f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML"
+        )
 
 
 async def show_stock_category(bot: Bot, chat_id: int, page: int, idx: int, cat: dict):
@@ -151,15 +166,26 @@ async def show_stock_category(bot: Bot, chat_id: int, page: int, idx: int, cat: 
         cat_id = extract_id_from_href(cat_href)
         cat_name = cat.get("name", "—")
         rows = [
-            r for r in all_rows
-            if extract_id_from_href(r.get("folder", {}).get("meta", {}).get("href", "")) == cat_id
+            r
+            for r in all_rows
+            if extract_id_from_href(r.get("folder", {}).get("meta", {}).get("href", ""))
+            == cat_id
         ]
-        stock_cache[chat_id] = {"rows": rows, "mode": "cat", "cat_name": cat_name, "cat_idx": idx}
+        stock_cache[chat_id] = {
+            "rows": rows,
+            "mode": "cat",
+            "cat_name": cat_name,
+            "cat_idx": idx,
+        }
         if not rows:
-            return await bot.send_message(chat_id, f"📦 В категории «{cat_name}» нет товаров с остатком.")
+            return await bot.send_message(
+                chat_id, f"📦 В категории «{cat_name}» нет товаров с остатком."
+            )
         txt = format_stock_page(rows, page, cat_name)
         kb = stock_nav_keyboard(page, len(rows), "cat", idx)
         await bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         logger.error("Ошибка категории: %s", e)
-        await bot.send_message(chat_id, f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML")
+        await bot.send_message(
+            chat_id, f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML"
+        )

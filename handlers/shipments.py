@@ -13,7 +13,11 @@ from utils.roles import can_view_stock
 from services.moysklad import get_shipments, get_shipment_positions
 from utils.helpers import extract_id_from_href
 from utils.formatters import format_shipment
-from utils.keyboards import period_keyboard, shipments_nav_keyboard, shipments_back_keyboard
+from utils.keyboards import (
+    period_keyboard,
+    shipments_nav_keyboard,
+    shipments_back_keyboard,
+)
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -30,19 +34,25 @@ def is_allowed(user_id: int) -> bool:
 
 # ─── Команды ─────────────────────────────────────────────────────────────────
 
+
 @router.message(Command("shipments"))
 async def cmd_shipments(message: Message):
     if not is_allowed(message.from_user.id):
         return
-    await message.answer("📅 За какой период показать отгрузки?", reply_markup=period_keyboard())
+    await message.answer(
+        "📅 За какой период показать отгрузки?", reply_markup=period_keyboard()
+    )
 
 
 # ─── Callback ─────────────────────────────────────────────────────────────────
 
+
 @router.callback_query(F.data == "sh_period")
 async def cb_sh_period(call: CallbackQuery):
     await call.answer()
-    await call.message.answer("📅 За какой период показать отгрузки?", reply_markup=period_keyboard())
+    await call.message.answer(
+        "📅 За какой период показать отгрузки?", reply_markup=period_keyboard()
+    )
 
 
 @router.callback_query(F.data.startswith("sh:"))
@@ -58,7 +68,9 @@ async def cb_shipments_period(call: CallbackQuery, bot: Bot):
         since = now.replace(hour=0, minute=0, second=0, microsecond=0)
         until, label = None, "сегодня"
     elif period == "yesterday":
-        since = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        since = (now - timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
         until = now.replace(hour=0, minute=0, second=0, microsecond=0)
         label = "вчера"
     elif period == "7d":
@@ -84,21 +96,23 @@ async def cb_shipments_page(call: CallbackQuery, bot: Bot):
     if not cached:
         return await call.message.answer(
             "❌ Данные устарели. Выберите период заново.",
-            reply_markup=shipments_back_keyboard()
+            reply_markup=shipments_back_keyboard(),
         )
     await show_shipments(
-        bot, call.message.chat.id,
-        cached["since"], cached["until"],
-        cached["label"], page
+        bot,
+        call.message.chat.id,
+        cached["since"],
+        cached["until"],
+        cached["label"],
+        page,
     )
 
 
 # ─── Логика ───────────────────────────────────────────────────────────────────
 
+
 async def show_shipments(
-    bot: Bot, chat_id: int,
-    since: datetime, until: datetime,
-    label: str, page: int = 0
+    bot: Bot, chat_id: int, since: datetime, until: datetime, label: str, page: int = 0
 ):
     is_first = page == 0
     if is_first:
@@ -107,8 +121,10 @@ async def show_shipments(
         if is_first or chat_id not in shipments_cache:
             shipments = await get_shipments(since, until)
             shipments_cache[chat_id] = {
-                "shipments": shipments, "label": label,
-                "since": since, "until": until
+                "shipments": shipments,
+                "label": label,
+                "since": since,
+                "until": until,
             }
         else:
             cached = shipments_cache[chat_id]
@@ -117,8 +133,9 @@ async def show_shipments(
 
         if not shipments:
             return await bot.send_message(
-                chat_id, f"🚚 Нет отгрузок за {label}.",
-                reply_markup=shipments_back_keyboard()
+                chat_id,
+                f"🚚 Нет отгрузок за {label}.",
+                reply_markup=shipments_back_keyboard(),
             )
 
         total = len(shipments)
@@ -146,10 +163,11 @@ async def show_shipments(
 
         kb = shipments_nav_keyboard(page, total_pages)
         await bot.send_message(
-            chat_id, f"Стр. {page + 1} из {total_pages}",
-            reply_markup=kb
+            chat_id, f"Стр. {page + 1} из {total_pages}", reply_markup=kb
         )
 
     except Exception as e:
         logger.error("Ошибка отгрузок: %s", e)
-        await bot.send_message(chat_id, f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML")
+        await bot.send_message(
+            chat_id, f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML"
+        )

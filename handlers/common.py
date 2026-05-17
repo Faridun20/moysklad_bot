@@ -2,6 +2,8 @@
 Общие хэндлеры: /start, меню, управление ролями
 """
 
+from email.mime import message
+from email import message
 import logging
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
@@ -9,15 +11,21 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import ADMIN_IDS
-from services.database import get_role, set_role, get_all_users, ensure_user
+from services.database import (
+    add_audit_log,
+    get_role,
+    set_role,
+    get_all_users,
+    ensure_user,
+)
 
 logger = logging.getLogger(__name__)
 router = Router()
 
 ROLE_NAMES = {
-    "admin":    "👑 Администратор",
-    "boss":     "🏆 Руководитель",
-    "manager":  "💼 Менеджер",
+    "admin": "👑 Администратор",
+    "boss": "🏆 Руководитель",
+    "manager": "💼 Менеджер",
     "employee": "👤 Сотрудник",
 }
 
@@ -26,9 +34,9 @@ def get_keyboard_for_role(role: str):
     kb = InlineKeyboardBuilder()
 
     if role in ("admin", "boss", "manager"):
-        kb.button(text="📦 Все остатки",       callback_data="sp:0")
-        kb.button(text="🗂 По категориям",     callback_data="cats:0")
-        kb.button(text="🚚 Отгрузки",         callback_data="sh_period")
+        kb.button(text="📦 Все остатки", callback_data="sp:0")
+        kb.button(text="🗂 По категориям", callback_data="cats:0")
+        kb.button(text="🚚 Отгрузки", callback_data="sh_period")
         kb.button(text="📊 Аналитика продаж", callback_data="analytics")
 
     if role in ("admin", "boss", "employee"):
@@ -37,8 +45,12 @@ def get_keyboard_for_role(role: str):
     if role in ("admin", "boss"):
         kb.button(text="📋 Отчёт по платежам", callback_data="pr:menu")
 
+    if role in ("admin", "boss"):
+        kb.button(text="📊 Отчёты", callback_data="reports_menu")
+
     if role == "admin":
         kb.button(text="👥 Пользователи", callback_data="users_list")
+        kb.button(text="📋 Аудит лог", callback_data="al:today")
 
     kb.adjust(1)
     return kb.as_markup()
@@ -79,10 +91,7 @@ def get_welcome_text(role: str) -> str:
             "/analytics — аналитика продаж"
         )
     else:
-        return base + (
-            "Доступные команды:\n"
-            "/pay — отправить платёж руководителю"
-        )
+        return base + ("Доступные команды:\n" "/pay — отправить платёж руководителю")
 
 
 @router.message(CommandStart())
@@ -112,6 +121,7 @@ async def cb_menu(call: CallbackQuery):
 
 # ─── Управление ролями (только для админов) ───────────────────────────────────
 
+
 @router.message(Command("addrole"))
 async def cmd_addrole(message: Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -123,7 +133,7 @@ async def cmd_addrole(message: Message):
             "❌ Формат: <code>/addrole [user_id] [роль]</code>\n\n"
             "Роли: <code>admin</code>, <code>manager</code>, <code>employee</code>\n\n"
             "Пример: <code>/addrole 123456789 manager</code>",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
 
     try:
@@ -133,13 +143,27 @@ async def cmd_addrole(message: Message):
 
     role = parts[2].lower()
     if role not in ("admin", "boss", "manager", "employee"):
-        return await message.answer("❌ Роль должна быть: admin, boss, manager или employee")
+        return await message.answer(
+            "❌ Роль должна быть: admin, boss, manager или employee"
+        )
 
     set_role(target_id, "", "", role)
+    from services.database import add_audit_log
+    from services.database import get_role as get_role_db
+
+    admin_name = message.from_user.full_name or str(message.from_user.id)
+    admin_role = get_role_db(message.from_user.id)
+    add_audit_log(
+        message.from_user.id,
+        admin_name,
+        admin_role,
+        "role_changed",
+        f"Пользователю {target_id} назначена роль {role}",
+    )
     role_name = ROLE_NAMES.get(role, role)
     await message.answer(
         f"✅ Пользователю <code>{target_id}</code> назначена роль <b>{role_name}</b>",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 

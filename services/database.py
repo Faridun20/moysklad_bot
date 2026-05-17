@@ -1,6 +1,7 @@
 """
 База данных SQLite — платежи и роли пользователей
 """
+
 import os
 import sqlite3
 import logging
@@ -40,7 +41,18 @@ def init_db():
             role      TEXT NOT NULL DEFAULT 'employee'
         )
     """)
-
+    # Таблица аудит лога
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL,
+            full_name  TEXT,
+            role       TEXT,
+            action     TEXT NOT NULL,
+            details    TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
     logger.info("База данных инициализирована")
@@ -50,6 +62,7 @@ def init_db():
 
 
 # ─── Роли ────────────────────────────────────────────────────────────────────
+
 
 def get_role(user_id: int) -> str:
     """Получить роль пользователя. По умолчанию — employee."""
@@ -67,14 +80,17 @@ def set_role(user_id: int, username: str, full_name: str, role: str) -> bool:
         return False
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         INSERT INTO user_roles (user_id, username, full_name, role)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
             username = excluded.username,
             full_name = excluded.full_name,
             role = excluded.role
-    """, (user_id, username, full_name, role))
+    """,
+        (user_id, username, full_name, role),
+    )
     conn.commit()
     conn.close()
     return True
@@ -106,11 +122,14 @@ def ensure_user(user_id: int, username: str, full_name: str, admin_ids: list[int
 
     if row:
         # Пользователь уже есть — просто освежим username/full_name
-        cur.execute("""
+        cur.execute(
+            """
             UPDATE user_roles
                SET username = ?, full_name = ?
              WHERE user_id = ?
-        """, (username, full_name, user_id))
+        """,
+            (username, full_name, user_id),
+        )
         conn.commit()
         conn.close()
         return
@@ -125,25 +144,45 @@ def ensure_user(user_id: int, username: str, full_name: str, admin_ids: list[int
     else:
         role = "employee"
 
-    cur.execute("""
+    cur.execute(
+        """
         INSERT INTO user_roles (user_id, username, full_name, role)
         VALUES (?, ?, ?, ?)
-    """, (user_id, username, full_name, role))
+    """,
+        (user_id, username, full_name, role),
+    )
     conn.commit()
     conn.close()
 
 
 # ─── Платежи ─────────────────────────────────────────────────────────────────
 
-def add_payment(user_id: int, username: str, full_name: str,
-                amount: float, currency: str, comment: str) -> int:
+
+def add_payment(
+    user_id: int,
+    username: str,
+    full_name: str,
+    amount: float,
+    currency: str,
+    comment: str,
+) -> int:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         INSERT INTO payments (user_id, username, full_name, amount, currency, comment, status, created_at)
         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-    """, (user_id, username, full_name, amount, currency, comment,
-          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    """,
+        (
+            user_id,
+            username,
+            full_name,
+            amount,
+            currency,
+            comment,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
     payment_id = cur.lastrowid
     conn.commit()
     conn.close()
@@ -153,10 +192,13 @@ def add_payment(user_id: int, username: str, full_name: str,
 def confirm_payment(payment_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         UPDATE payments SET status = 'confirmed', confirmed_at = ?
         WHERE id = ? AND status = 'pending'
-    """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), payment_id))
+    """,
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), payment_id),
+    )
     updated = cur.rowcount > 0
     conn.commit()
     conn.close()
@@ -166,10 +208,13 @@ def confirm_payment(payment_id: int) -> bool:
 def reject_payment(payment_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         UPDATE payments SET status = 'rejected'
         WHERE id = ? AND status = 'pending'
-    """, (payment_id,))
+    """,
+        (payment_id,),
+    )
     updated = cur.rowcount > 0
     conn.commit()
     conn.close()
@@ -233,14 +278,17 @@ def add_user(user_id: int, username: str, full_name: str, role: str) -> bool:
         return False
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         INSERT INTO user_roles (user_id, username, full_name, role)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
             username = excluded.username,
             full_name = excluded.full_name,
             role = excluded.role
-    """, (user_id, username, full_name, role))
+    """,
+        (user_id, username, full_name, role),
+    )
     conn.commit()
     conn.close()
     return True
@@ -261,6 +309,7 @@ def _load_predefined_users():
     """Загрузить предопределённых пользователей из config при запуске."""
     try:
         from config import ADMIN_IDS, BOSS_IDS, MANAGER_IDS
+
         try:
             from config import PREDEFINED_USERS
         except ImportError:
@@ -271,36 +320,98 @@ def _load_predefined_users():
 
         # Из PREDEFINED_USERS (если задан в config_local)
         for u in PREDEFINED_USERS:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO user_roles (user_id, username, full_name, role)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(user_id) DO NOTHING
-            """, (u["user_id"], "", u.get("full_name", ""), u["role"]))
+            """,
+                (u["user_id"], "", u.get("full_name", ""), u["role"]),
+            )
 
         # Из ADMIN_IDS, BOSS_IDS, MANAGER_IDS
         for uid in ADMIN_IDS:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO user_roles (user_id, username, full_name, role)
                 VALUES (?, ?, ?, 'admin')
                 ON CONFLICT(user_id) DO NOTHING
-            """, (uid, "", "Admin"))
+            """,
+                (uid, "", "Admin"),
+            )
 
         for uid in BOSS_IDS:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO user_roles (user_id, username, full_name, role)
                 VALUES (?, ?, ?, 'boss')
                 ON CONFLICT(user_id) DO NOTHING
-            """, (uid, "", "Boss"))
+            """,
+                (uid, "", "Boss"),
+            )
 
         for uid in MANAGER_IDS:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO user_roles (user_id, username, full_name, role)
                 VALUES (?, ?, ?, 'manager')
                 ON CONFLICT(user_id) DO NOTHING
-            """, (uid, "", "Manager"))
+            """,
+                (uid, "", "Manager"),
+            )
 
         conn.commit()
         conn.close()
         logger.info("Предопределённые пользователи загружены")
     except Exception as e:
         logger.warning("Ошибка загрузки пользователей: %s", e)
+
+
+def add_audit_log(
+    user_id: int, full_name: str, role: str, action: str, details: str = ""
+):
+    """Записать действие в аудит лог."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO audit_log (user_id, full_name, role, action, details, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """,
+        (
+            user_id,
+            full_name,
+            role,
+            action,
+            details,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_audit_log(limit: int = 50, user_id: int = None) -> list[dict]:
+    """Получить записи аудит лога."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    if user_id:
+        cur.execute(
+            """
+            SELECT * FROM audit_log WHERE user_id = ?
+            ORDER BY created_at DESC LIMIT ?
+        """,
+            (user_id, limit),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT * FROM audit_log
+            ORDER BY created_at DESC LIMIT ?
+        """,
+            (limit,),
+        )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]

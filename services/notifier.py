@@ -43,7 +43,7 @@ async def shipment_notifier(bot: Bot):
 
                 txt = "🔔 <b>Новая отгрузка!</b>\n" + format_shipment(s, positions)
 
-                for uid in (ALLOWED_USERS or []):
+                for uid in ALLOWED_USERS or []:
                     try:
                         await bot.send_message(uid, txt, parse_mode="HTML")
                     except Exception as e:
