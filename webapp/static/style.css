@@ -286,8 +286,9 @@ body {
   left: 12px;
   right: 12px;
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   background: var(--bg-card);
+  border: 1px solid var(--divider);
   border-radius: 24px;
   padding: 8px;
   box-shadow: 0 4px 20px rgba(0,0,0,0.08), 0 1px 3px rgba(0,0,0,0.05);
@@ -338,6 +339,36 @@ body {
   font-size: 13px;
 }
 
+/* ─── Под-вкладки внутри объединённого экрана «Склад и заказы» ─── */
+.sub-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin-bottom: 12px;
+  background: var(--bg-soft);
+  border-radius: 14px;
+  padding: 4px;
+}
+
+.sub-tab {
+  padding: 10px;
+  background: transparent;
+  border: none;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-mute);
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.sub-tab.active {
+  background: var(--bg-card);
+  color: var(--text);
+  box-shadow: var(--shadow-card);
+}
+
 /* ─── Категории (chips) ───────────────────────────────────────── */
 .cat-scroll {
   display: flex;
@@ -362,7 +393,7 @@ body {
   border-radius: 20px;
   background: var(--bg-card);
   color: var(--text);
-  border: none;
+  border: 1px solid var(--divider);
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
@@ -373,6 +404,7 @@ body {
 .cat-btn.active {
   background: var(--accent);
   color: var(--accent-fg);
+  border-color: var(--accent);
 }
 
 /* ─── Список стока / клиентов (карточный стиль) ───────────────── */
@@ -473,18 +505,29 @@ body {
 .form-input {
   width: 100%;
   padding: 14px;
-  border: none;
+  /* В тёмной теме --bg-card и --bg-page часто оказываются почти
+     одного оттенка → инпут визуально сливается с фоном. Добавляем
+     явную границу из переменной --divider, она лёгкая и не ломает
+     светлую тему. */
+  border: 1px solid var(--divider);
   border-radius: var(--radius);
   background: var(--bg-card);
   color: var(--text);
   font-size: 16px;
   font-family: inherit;
   box-shadow: var(--shadow-card);
+  -webkit-appearance: none;
+}
+
+.form-input::placeholder {
+  color: var(--text-mute);
+  opacity: 0.7;
 }
 
 .form-input:focus {
-  outline: 2px solid var(--accent);
-  outline-offset: -1px;
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
 }
 
 .cur-row {

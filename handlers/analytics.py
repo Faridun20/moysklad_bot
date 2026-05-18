@@ -139,6 +139,18 @@ async def show_company_analytics(
         await bot.send_message(chat_id, user_safe_error(e, "company_analytics"))
 
 
+def _safe_ts(o: dict) -> str:
+    """Timestamp как строка YYYY-MM-DD HH:MM:SS. Защищаемся от
+    Postgres-datetime/None/T-разделителя."""
+    raw = o.get("updated_at") or o.get("created_at") or ""
+    if raw is None:
+        return ""
+    s = str(raw)
+    if len(s) >= 11 and s[10] == "T":
+        s = s[:10] + " " + s[11:]
+    return s[:19]
+
+
 def _personal_stats_from_local(
     user_id: int, since: datetime, until: datetime
 ) -> dict:
@@ -160,8 +172,14 @@ def _personal_stats_from_local(
     relevant = [
         o for o in orders
         if o["status"] in ("approved", "shipped")
-        and since_iso <= (o.get("updated_at") or o.get("created_at") or "")[:19] <= until_iso
+        and since_iso <= _safe_ts(o) <= until_iso
     ]
+    logger.info(
+        "analytics.bot user=%s total_orders=%d approved=%d relevant=%d period=[%s..%s]",
+        user_id, len(orders),
+        sum(1 for o in orders if o["status"] in ("approved", "shipped")),
+        len(relevant), since_iso, until_iso,
+    )
     if not relevant:
         return {"total": 0, "count": 0, "clients": 0, "top_products": []}
 
