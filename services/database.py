@@ -345,7 +345,13 @@ def init_db():
             # отгрузки. Нужен чтобы paymentin привязывался к конкретной
             # отгрузке (operations field в API МойСклад). NULL если
             # отгрузка ещё не отправлена или create_demand упал.
+            # LEGACY: новые заказы используют ms_customerorder_id ниже.
             ("orders", "ms_demand_id", "TEXT"),
+            # ID «Заказа покупателя» (customerorder) в МойСклад.
+            # Новый workflow — бот создаёт именно customerorder, а не
+            # demand. paymentin привязывается сюда через operations
+            # вместо ms_demand_id для новых заказов.
+            ("orders", "ms_customerorder_id", "TEXT"),
             # ID входящего платежа (paymentin) в МойСклад. Заполняется
             # после успешного create_paymentin. Защищает от дубликатов:
             # повторный confirm не плодит новые paymentin'ы в МойСклад.
@@ -730,14 +736,28 @@ def get_order_payment_summary(order_id: int) -> dict:
 
 
 def set_order_ms_demand_id(order_id: int, ms_demand_id: str) -> bool:
-    """Сохранить id демэнд-документа МойСклад на заказе. Вызывается
-    после успешного create_demand_from_request, чтобы потом paymentin
-    мог привязаться к этому demand через operations-поле."""
+    """Сохранить id демэнд-документа МойСклад на заказе. Legacy: новые
+    заказы используют set_order_ms_customerorder_id."""
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
             q("UPDATE orders SET ms_demand_id = ?, updated_at = ? WHERE id = ?"),
             (ms_demand_id, now_str(), order_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    return updated
+
+
+def set_order_ms_customerorder_id(order_id: int, co_id: str) -> bool:
+    """Сохранить id customerorder МойСклад на заказе. Используется
+    после успешного create_customerorder_from_request — нужно чтобы
+    paymentin привязался к этому заказу через operations."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE orders SET ms_customerorder_id = ?, updated_at = ? WHERE id = ?"),
+            (co_id, now_str(), order_id),
         )
         updated = cur.rowcount > 0
         conn.commit()

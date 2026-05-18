@@ -897,47 +897,119 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
     manager_name = (order or {}).get("full_name") or req.get("full_name") or "—"
     manager_user_id = (order or {}).get("user_id") or req.get("user_id")
 
-    from services.ms_demand import create_demand_from_request, is_ready as demand_ready
+    # Цепочка в МойСклад:
+    #   1) customerorder — для PDF печатной формы (через export endpoint)
+    #   2) demand линкованный с customerorder — чтобы СРАЗУ списать остатки
+    #      и не зависеть от того, не забыл ли бухгалтер вручную создать
+    #      отгрузку. Без этого был риск разрыва между snapshot бота
+    #      (остатки старые) и реальностью (товар уже зарезервирован).
+    # Backend URL'ы в чат не отправляем — только PDF файлом.
+    from services.ms_demand import (
+        is_ready as ms_ready,
+        create_demand_from_request,
+    )
+    from services.ms_customerorder import create_customerorder_from_request
     demand_line = ""
-    if order and items and demand_ready():
-        result = await create_demand_from_request(
+    pdf_to_send: tuple[bytes, str] | None = None
+    if order and items and ms_ready():
+        co_result = await create_customerorder_from_request(
             order, items, manager_name, telegram_user_id=manager_user_id,
         )
-        if result.get("ok"):
-            # Сохраняем demand_id на заказе — нужен чтобы потом
-            # paymentin'ы привязывались к этой отгрузке через operations.
-            from services.database import set_order_ms_demand_id
-            if result.get("demand_id"):
-                set_order_ms_demand_id(order["id"], result["demand_id"])
-            demand_line = (
-                f"\n📦 Отгрузка в МойСклад: <a href=\"{result['url']}\">"
-                f"{result.get('name') or 'открыть'}</a>"
+        if co_result.get("ok"):
+            from services.database import (
+                set_order_ms_customerorder_id, set_order_ms_demand_id,
             )
-            add_audit_log(
-                call.from_user.id, boss_name, get_role(call.from_user.id),
-                "ms_demand_created",
-                f"Заявка #{req_id} → demand {result['demand_id']}",
+            co_id = co_result.get("customerorder_id")
+            if co_id:
+                set_order_ms_customerorder_id(order["id"], co_id)
+
+            # PDF берём от customerorder — он содержит читаемую форму заказа
+            if co_result.get("pdf_bytes"):
+                pdf_to_send = (
+                    co_result["pdf_bytes"],
+                    co_result.get("pdf_filename") or f"order_{order['id']}.pdf",
+                )
+
+            # Сразу создаём demand, линкованный с customerorder.
+            # Если demand упадёт — customerorder остаётся, бухгалтер
+            # должен будет вручную создать отгрузку. Это худший случай,
+            # но в чат явно об этом скажем.
+            from services.moysklad import MS_BASE
+            co_href = f"{MS_BASE}/entity/customerorder/{co_id}" if co_id else None
+            demand_result = await create_demand_from_request(
+                order, items, manager_name,
+                telegram_user_id=manager_user_id,
+                customerorder_href=co_href,
             )
+            if demand_result.get("ok"):
+                demand_id = demand_result.get("demand_id")
+                if demand_id:
+                    set_order_ms_demand_id(order["id"], demand_id)
+                demand_line = (
+                    f"\n📄 Заказ покупателя создан в МойСклад"
+                    f"\n📦 Отгрузка проведена, остатки списаны"
+                )
+                if pdf_to_send:
+                    demand_line += " — печатная форма ниже 👇"
+                add_audit_log(
+                    call.from_user.id, boss_name, get_role(call.from_user.id),
+                    "ms_co_and_demand_created",
+                    f"Заявка #{req_id} → customerorder {co_id} + demand {demand_id}",
+                )
+            else:
+                reason = demand_result.get("reason", "неизвестная ошибка")
+                logger.warning(
+                    "Customerorder создан, но demand упал для #%s: %s",
+                    req_id, reason,
+                )
+                demand_line = (
+                    f"\n📄 Заказ покупателя создан в МойСклад"
+                    f"\n⚠️ <b>Отгрузка НЕ создана автоматически:</b>\n"
+                    f"<code>{_esc(reason[:200])}</code>\n"
+                    f"Остатки не списались — создайте demand вручную в МойСклад "
+                    f"(или из карточки этого заказа покупателя)."
+                )
+                if pdf_to_send:
+                    demand_line += "\nПечатная форма ниже 👇"
+                add_audit_log(
+                    call.from_user.id, boss_name, get_role(call.from_user.id),
+                    "ms_demand_failed",
+                    f"Заявка #{req_id} → CO {co_id} ok, demand fail: {reason[:200]}",
+                )
+                # Личное уведомление боссу для разбора
+                try:
+                    await bot.send_message(
+                        call.from_user.id,
+                        f"⚠️ MS demand fail для заявки #{req_id} "
+                        f"(customerorder {co_id[:8]} создан):\n"
+                        f"<code>{_esc(reason[:500])}</code>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
         else:
-            reason = result.get("reason", "неизвестная ошибка")
-            logger.warning("Не удалось создать MS demand для заявки #%s: %s",
-                           req_id, reason)
+            reason = co_result.get("reason", "неизвестная ошибка")
+            logger.warning(
+                "Не удалось создать customerorder для заявки #%s: %s",
+                req_id, reason,
+            )
             demand_line = (
-                f"\n⚠️ <b>Не удалось создать отгрузку в МойСклад:</b>\n"
-                f"<code>{reason[:300]}</code>\n"
-                f"Заявка в боте одобрена — отгрузку нужно завести вручную."
+                f"\n⚠️ <b>Не удалось создать заказ в МойСклад:</b>\n"
+                f"<code>{_esc(reason[:300])}</code>\n"
+                f"Заявка в боте одобрена — заказ нужно завести вручную."
             )
             try:
                 await bot.send_message(
                     call.from_user.id,
-                    f"⚠️ MS demand fail для заявки #{req_id}:\n<code>{reason[:500]}</code>",
+                    f"⚠️ MS customerorder fail для заявки #{req_id}:\n"
+                    f"<code>{_esc(reason[:500])}</code>",
                     parse_mode="HTML",
                 )
             except Exception:
                 pass
-    elif not demand_ready():
+    elif not ms_ready():
         logger.info(
-            "MS demand context не готов — не пушим заявку #%s в МойСклад", req_id
+            "MS context не готов — не создаём документы для заявки #%s", req_id,
         )
 
     # Уведомляем менеджера
@@ -954,6 +1026,32 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
         )
     except Exception as e:
         logger.warning("Не удалось уведомить менеджера: %s", e)
+
+    # ─── Шлём PDF печатной формы заказчику и руководителю ──────────
+    # Файл вместо ссылки — никаких URL на бэкенд МойСклад. PDF
+    # содержит имя клиента, состав заказа, цены — то, что нужно
+    # для распечатки/отправки клиенту.
+    if pdf_to_send:
+        from aiogram.types import BufferedInputFile
+        pdf_bytes, pdf_name = pdf_to_send
+        file = BufferedInputFile(pdf_bytes, filename=pdf_name)
+        caption = f"📄 Печатная форма — заявка #{req_id}"
+        # Менеджеру (создателю)
+        try:
+            await bot.send_document(
+                chat_id=req["user_id"], document=file, caption=caption,
+            )
+        except Exception:
+            logger.exception("Не удалось отправить PDF менеджеру")
+        # И боссу-апруверу — он же может захотеть подшить копию
+        if call.from_user.id != req["user_id"]:
+            try:
+                file2 = BufferedInputFile(pdf_bytes, filename=pdf_name)
+                await bot.send_document(
+                    chat_id=call.from_user.id, document=file2, caption=caption,
+                )
+            except Exception:
+                logger.exception("Не удалось отправить PDF боссу")
 
     # ─── Для paid-заказов автоматически создаём payment-pending ────
     # Раньше «оплачено сразу» проходило мимо подтверждения боссом —

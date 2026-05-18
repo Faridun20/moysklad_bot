@@ -137,11 +137,15 @@ async def create_paymentin_for_payment(payment_id: int) -> dict:
         ).strip(),
     }
 
-    # Привязка к demand-документу, если есть. operations — массив,
+    # Привязка платежа к документу. Предпочитаем customerorder (новый
+    # workflow), fallback на legacy demand. operations — массив,
     # формально можно прицепить несколько; у нас один.
-    if order.get("ms_demand_id"):
-        demand_href = f"{MS_BASE}/entity/demand/{order['ms_demand_id']}"
-        payload["operations"] = [_meta(demand_href, "demand")]
+    if order.get("ms_customerorder_id"):
+        op_href = f"{MS_BASE}/entity/customerorder/{order['ms_customerorder_id']}"
+        payload["operations"] = [_meta(op_href, "customerorder")]
+    elif order.get("ms_demand_id"):
+        op_href = f"{MS_BASE}/entity/demand/{order['ms_demand_id']}"
+        payload["operations"] = [_meta(op_href, "demand")]
 
     try:
         sess = await get_session()
