@@ -10,7 +10,7 @@ from aiogram.types import Message, CallbackQuery
 
 from config import ADMIN_IDS
 from services.database import set_role, get_role, get_all_users, add_audit_log
-from services.roles import can_manage_users
+from services.roles import can_manage_users, invalidate_role
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -53,6 +53,7 @@ async def cmd_addrole(message: Message):
         )
 
     set_role(target_id, "", "", role)
+    invalidate_role(target_id)
 
     admin_name = message.from_user.full_name or str(message.from_user.id)
     admin_role = get_role(message.from_user.id)

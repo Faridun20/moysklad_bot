@@ -22,16 +22,16 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services.roles import can_create_orders, is_boss
 from services.database import (
-    create_order, get_order, get_user_orders, get_all_orders,
+    create_order, get_order, get_orders_by_ids, get_user_orders, get_all_orders,
     update_order_status, update_order_agent,
     add_order_item, get_order_items, remove_order_item,
     create_shipment_request, get_shipment_request,
     get_pending_requests, approve_shipment_request, reject_shipment_request,
     get_role, add_audit_log, get_all_users,
 )
-from services.moysklad import get_all_stock, get_categories
+from services.moysklad import get_all_stock, get_categories, ms_get
 from services.notifier import get_notify_recipients, send_to_recipients
-from utils.helpers import extract_id_from_href
+from utils.helpers import extract_id_from_href, extract_href, safe_get
 from utils.formatters import DIV, DIV2
 
 logger = logging.getLogger(__name__)
@@ -159,8 +159,10 @@ def my_orders_keyboard(orders: list[dict]):
 
 def pending_requests_keyboard(requests: list[dict]):
     kb = InlineKeyboardBuilder()
-    for r in requests[:10]:
-        order = get_order(r["order_id"])
+    head = requests[:10]
+    orders_by_id = get_orders_by_ids([r["order_id"] for r in head])
+    for r in head:
+        order = orders_by_id.get(r["order_id"])
         name = order["full_name"] if order else "—"
         kb.button(
             text=f"⏳ Заявка #{r['id']} · {name}",
@@ -309,7 +311,7 @@ async def cb_add_item(call: CallbackQuery, state: FSMContext):
         kb = InlineKeyboardBuilder()
         kb.button(text="📦 Все товары", callback_data=f"cat_pick:all:{order_id}")
         for cat in cats[:15]:
-            cat_id = extract_id_from_href(cat.get("meta", {}).get("href", ""))
+            cat_id = extract_id_from_href(extract_href(cat))
             name = cat.get("name", "—")[:25]
             kb.button(text=f"📁 {name}", callback_data=f"cat_pick:{cat_id}:{order_id}")
         kb.button(text="❌ Отмена", callback_data=f"ord_view:{order_id}")
@@ -336,9 +338,7 @@ async def cb_cat_pick(call: CallbackQuery, state: FSMContext):
         if cat_id != "all":
             filtered = [
                 r for r in all_stock
-                if extract_id_from_href(
-                    r.get("folder", {}).get("meta", {}).get("href", "")
-                ) == cat_id
+                if extract_id_from_href(extract_href(r, "folder")) == cat_id
             ]
         else:
             filtered = all_stock
@@ -348,15 +348,15 @@ async def cb_cat_pick(call: CallbackQuery, state: FSMContext):
 
         # Показываем по 10 товаров
         kb = InlineKeyboardBuilder()
-        for r in filtered[:20]:
+        head = filtered[:20]
+        for i, r in enumerate(head):
             name = r.get("name", "—")
             stock = r.get("stock", 0)
             unit = r.get("uom", {}).get("name", "шт")
-            href = r.get("meta", {}).get("href", "")
             # Кодируем href кратко через индекс
             kb.button(
                 text=f"{name} ({stock} {unit})",
-                callback_data=f"prod_pick:{order_id}:{filtered.index(r)}",
+                callback_data=f"prod_pick:{order_id}:{i}",
             )
 
         kb.button(text="◀️ Назад", callback_data=f"ord_add:{order_id}")
@@ -368,10 +368,10 @@ async def cb_cat_pick(call: CallbackQuery, state: FSMContext):
             order_id=order_id,
             products=[{
                 "name": r.get("name", "—"),
-                "href": r.get("meta", {}).get("href", ""),
-                "unit": r.get("uom", {}).get("name", "шт"),
+                "href": extract_href(r),
+                "unit": safe_get(r, "uom", "name", default="шт"),
                 "stock": r.get("stock", 0),
-            } for r in filtered[:20]]
+            } for r in head]
         )
         await state.set_state(OrderState.choosing_product)
 
@@ -464,20 +464,10 @@ async def cb_choose_agent(call: CallbackQuery, state: FSMContext):
     await call.message.answer("⏳ Загружаю список клиентов…")
 
     try:
-        import aiohttp
-        from config import MS_TOKEN
-        MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
-        headers = {"Authorization": f"Bearer {MS_TOKEN}", "Accept-Encoding": "gzip"}
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{MS_BASE}/entity/counterparty",
-                headers=headers,
-                params={"limit": 50, "order": "name"},
-            ) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-
+        data = await ms_get(
+            "entity/counterparty",
+            params={"limit": 50, "order": "name"},
+        )
         agents = data.get("rows", [])
         if not agents:
             return await call.message.answer("❌ Клиенты не найдены.")
@@ -493,7 +483,7 @@ async def cb_choose_agent(call: CallbackQuery, state: FSMContext):
         await state.update_data(
             order_id=order_id,
             agents=[{
-                "id": extract_id_from_href(a.get("meta", {}).get("href", "")),
+                "id": extract_id_from_href(extract_href(a)),
                 "name": a.get("name", "—"),
             } for a in agents[:20]]
         )

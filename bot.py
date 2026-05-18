@@ -19,6 +19,7 @@ from handlers import (
 
 # Сервисы и задачи
 from services.database import init_db
+from services.moysklad import get_session, close_session
 from services.notifier import shipment_notifier
 from tasks.scheduled import (
     daily_report_task,
@@ -51,16 +52,25 @@ def register_routers(dp: Dispatcher):
         dp.include_router(r)
 
 
-def start_background_tasks(bot: Bot):
-    """Запустить фоновые задачи."""
-    tasks = [
+def start_background_tasks(bot: Bot) -> list[asyncio.Task]:
+    """Запустить фоновые задачи. Возвращает список созданных Task'ов."""
+    coros = [
         shipment_notifier(bot),
         daily_report_task(bot),
         weekly_report_task(bot),
         monthly_report_task(bot),
     ]
-    for task in tasks:
-        asyncio.create_task(task)
+    return [asyncio.create_task(c, name=c.__qualname__) for c in coros]
+
+
+async def _shutdown(tasks: list[asyncio.Task]) -> None:
+    """Аккуратно отменить фоновые задачи и дождаться их завершения."""
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    await close_session()
 
 
 async def main():
@@ -70,14 +80,21 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
 
     register_routers(dp)
-    start_background_tasks(bot)
+
+    # Предварительно прогреваем общую aiohttp-сессию для МойСклад
+    await get_session()
+
+    bg_tasks = start_background_tasks(bot)
 
     # Запускаем WebApp параллельно с ботом
     from webapp.server import start_webapp
-    asyncio.create_task(start_webapp())
+    bg_tasks.append(asyncio.create_task(start_webapp(), name="webapp"))
 
     logger.info("Бот запущен")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await _shutdown(bg_tasks)
 
 
 if __name__ == "__main__":

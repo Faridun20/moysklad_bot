@@ -20,8 +20,22 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(title="МойСклад WebApp")
 
-# Раздаём статику (CSS, JS)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+class CachedStaticFiles(StaticFiles):
+    """StaticFiles + Cache-Control: пусть браузер хранит CSS/JS сутки."""
+
+    def __init__(self, *args, max_age: int = 86400, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cache_header = f"public, max-age={max_age}"
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers.setdefault("Cache-Control", self._cache_header)
+        return resp
+
+
+# Раздаём статику (CSS, JS) с кэшированием на сутки
+app.mount("/static", CachedStaticFiles(directory=STATIC_DIR), name="static")
 
 
 # ─── Главная страница ─────────────────────────────────────────────────────────
