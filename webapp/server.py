@@ -5,6 +5,8 @@ FastAPI сервер для WebApp.
 import asyncio
 import logging
 import os
+import subprocess
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -17,6 +19,34 @@ from services.database import get_role
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+def _compute_app_version() -> str:
+    """
+    Версия для cache-busting статики WebApp.
+    Берём в порядке надёжности:
+      1) Railway-переменная с SHA коммита (RAILWAY_GIT_COMMIT_SHA)
+      2) короткий git SHA, если доступен .git
+      3) unix-таймстамп старта процесса — гарантирует уникальность
+         для каждого нового запуска даже без git.
+    """
+    sha = os.environ.get("RAILWAY_GIT_COMMIT_SHA") or os.environ.get("GIT_COMMIT_SHA")
+    if sha:
+        return sha[:8]
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short=8", "HEAD"],
+            cwd=Path(__file__).parent.parent,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        return out.decode().strip() or str(int(time.time()))
+    except Exception:
+        return str(int(time.time()))
+
+
+APP_VERSION = _compute_app_version()
+logger.info("WebApp version: %s", APP_VERSION)
 
 app = FastAPI(title="МойСклад WebApp")
 
@@ -41,11 +71,31 @@ app.mount("/static", CachedStaticFiles(directory=STATIC_DIR), name="static")
 # ─── Главная страница ─────────────────────────────────────────────────────────
 
 
+_INDEX_HTML_CACHE: str | None = None
+
+
+def _read_index_html() -> str:
+    """Читаем index.html один раз и подставляем версию для cache-busting.
+    Раньше мобильный Telegram месяцами держал старую app.js в WebView-кэше;
+    теперь URL вида app.js?v=<sha> меняется на каждом деплое и кэш обходится
+    автоматически."""
+    global _INDEX_HTML_CACHE
+    if _INDEX_HTML_CACHE is None:
+        raw = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        _INDEX_HTML_CACHE = raw.replace("{{VERSION}}", APP_VERSION)
+    return _INDEX_HTML_CACHE
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    """Отдаём главную HTML страницу."""
-    html_file = STATIC_DIR / "index.html"
-    return HTMLResponse(html_file.read_text(encoding="utf-8"))
+    """Отдаём главную HTML страницу.
+    Cache-Control: no-cache гарантирует, что браузер всегда проверит свежесть
+    HTML — но статика (CSS/JS) по-прежнему кэшируется надолго через
+    версионированные URL."""
+    return HTMLResponse(
+        _read_index_html(),
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
 
 
 # ─── API: проверка авторизации ────────────────────────────────────────────────
