@@ -689,17 +689,61 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
         parse_mode="HTML",
     )
 
+    # Push отгрузки в МойСклад. Делаем это до уведомления менеджера, чтобы
+    # включить ссылку на demand в сообщение. Если МойСклад не отвечает —
+    # заявка всё равно остаётся одобренной в боте, ошибку логируем + шлём
+    # боссу для разбора.
+    order = get_order(req["order_id"])
+    items = get_order_items(req["order_id"]) if order else []
+    manager_name = (order or {}).get("full_name") or req.get("full_name") or "—"
+
+    from services.ms_demand import create_demand_from_request, is_ready as demand_ready
+    demand_line = ""
+    if order and items and demand_ready():
+        result = await create_demand_from_request(order, items, manager_name)
+        if result.get("ok"):
+            demand_line = (
+                f"\n📦 Отгрузка в МойСклад: <a href=\"{result['url']}\">"
+                f"{result.get('name') or 'открыть'}</a>"
+            )
+            add_audit_log(
+                call.from_user.id, boss_name, get_role(call.from_user.id),
+                "ms_demand_created",
+                f"Заявка #{req_id} → demand {result['demand_id']}",
+            )
+        else:
+            reason = result.get("reason", "неизвестная ошибка")
+            logger.warning("Не удалось создать MS demand для заявки #%s: %s",
+                           req_id, reason)
+            demand_line = (
+                f"\n⚠️ <b>Не удалось создать отгрузку в МойСклад:</b>\n"
+                f"<code>{reason[:300]}</code>\n"
+                f"Заявка в боте одобрена — отгрузку нужно завести вручную."
+            )
+            try:
+                await bot.send_message(
+                    call.from_user.id,
+                    f"⚠️ MS demand fail для заявки #{req_id}:\n<code>{reason[:500]}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+    elif not demand_ready():
+        logger.info(
+            "MS demand context не готов — не пушим заявку #%s в МойСклад", req_id
+        )
+
     # Уведомляем менеджера
     try:
-        order = get_order(req["order_id"])
         await bot.send_message(
             req["user_id"],
             f"{DIV}\n"
             f"✅ <b>Заявка #{req_id} одобрена!</b>\n\n"
             f"👨‍💼 Одобрил: {boss_name}\n"
-            f"🕐 {now}\n\n"
+            f"🕐 {now}{demand_line}\n\n"
             f"Можно приступать к отгрузке.",
             parse_mode="HTML",
+            disable_web_page_preview=True,
         )
     except Exception as e:
         logger.warning("Не удалось уведомить менеджера: %s", e)

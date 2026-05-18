@@ -25,6 +25,7 @@ from services.moysklad import get_session, close_session
 from services.notifier import shipment_notifier
 from services import snapshot
 from services.ms_webhooks import ensure_subscriptions
+from services.ms_demand import init_demand_context
 from tasks.scheduled import (
     daily_report_task,
     weekly_report_task,
@@ -126,6 +127,17 @@ async def main():
             logger.exception("ensure_subscriptions failed")
 
     asyncio.create_task(_register_webhooks(), name="register_webhooks")
+
+    # Готовим контекст для push-а отгрузок в МойСклад (org/store/attribute).
+    # Без него cb_approve_request не сможет создавать demand-документы.
+    async def _init_demand():
+        try:
+            result = await init_demand_context()
+            logger.info("ms_demand.init_demand_context: %s", result)
+        except Exception:
+            logger.exception("init_demand_context failed")
+
+    asyncio.create_task(_init_demand(), name="init_demand")
 
     # Закрепляем кнопку «Открыть» в композере чата, если задан WEBAPP_URL.
     # Это делает WebApp доступным в один тап рядом с полем ввода.
