@@ -27,7 +27,7 @@ from handlers import (
 # Сервисы и задачи
 from services.database import init_db
 from services.moysklad import get_session, close_session
-from services.notifier import shipment_notifier
+from services.notifier import shipment_notifier, close_tg_session
 from services import snapshot
 from services.ms_webhooks import ensure_subscriptions
 from services.ms_demand import init_demand_context
@@ -130,6 +130,7 @@ async def _shutdown(tasks: list[asyncio.Task]) -> None:
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     await close_session()
+    await close_tg_session()
 
 
 async def main():

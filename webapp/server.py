@@ -671,10 +671,10 @@ async def api_payments_history(request: Request):
 @app.post("/api/payments/send")
 async def api_payments_send(request: Request):
     """Отправить новый платёж на подтверждение."""
-    from config import ADMIN_IDS, TELEGRAM_TOKEN
+    from config import ADMIN_IDS
     from services.database import add_payment, add_audit_log
+    from services.notifier import tg_send_message
     from utils.formatters import format_payment_notify
-    import aiohttp
 
     data = await request.json()
     # Платежи отправляют только менеджеры (и админ для тестов). Босс
@@ -736,20 +736,10 @@ async def api_payments_send(request: Request):
     from services.notifier import get_notify_recipients
     recipients = get_notify_recipients()
 
-    async with aiohttp.ClientSession() as session:
-        for uid in recipients:
-            try:
-                await session.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                    json={
-                        "chat_id": uid,
-                        "text": notify_text,
-                        "parse_mode": "HTML",
-                        "reply_markup": keyboard,
-                    },
-                )
-            except Exception as e:
-                logger.warning("Не удалось уведомить %d: %s", uid, e)
+    # tg_send_message переиспользует общую ClientSession — никакого
+    # TCP+TLS-рукопожатия на каждое уведомление.
+    for uid in recipients:
+        await tg_send_message(uid, notify_text, reply_markup=keyboard)
 
     return JSONResponse({"payment_id": payment_id, "status": "pending"})
 
@@ -949,11 +939,9 @@ async def api_submit_order(request: Request):
         get_order, get_order_items, create_shipment_request,
         update_order_status, add_audit_log,
     )
-    from services.notifier import get_notify_recipients
+    from services.notifier import get_notify_recipients, tg_send_message
     from utils.formatters import DIV
     from handlers.orders import format_request_notify
-    import aiohttp as _aiohttp
-    from config import TELEGRAM_TOKEN
 
     order_id = data["order_id"]
     order = get_order(order_id)
@@ -988,20 +976,8 @@ async def api_submit_order(request: Request):
             {"text": "❌ Отклонить", "callback_data": f"req_no:{req_id}"},
         ]]
     }
-    async with _aiohttp.ClientSession() as session:
-        for uid in get_notify_recipients():
-            try:
-                await session.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                    json={
-                        "chat_id": uid,
-                        "text": notify_text,
-                        "parse_mode": "HTML",
-                        "reply_markup": keyboard,
-                    },
-                )
-            except Exception:
-                pass
+    for uid in get_notify_recipients():
+        await tg_send_message(uid, notify_text, reply_markup=keyboard)
 
     return JSONResponse({"req_id": req_id})
 
