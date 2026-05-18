@@ -106,6 +106,7 @@ async def cmd_start(message: Message):
     role = get_role(user.id)
 
     # Автоматически синхронизируем менеджеров с МойСклад
+    sync_status_line = ""
     if role == "manager":
         from services.ms_sync import sync_manager
         result = await sync_manager(
@@ -113,19 +114,39 @@ async def cmd_start(message: Message):
             user.full_name or user.username or str(user.id),
             user.username or "",
         )
-        if result["status"] == "linked":
+        status = result.get("status")
+        if status == "linked":
             logger.info(
                 "Менеджер %s привязан к МойСклад: %s",
-                user.full_name, result["ms_id"]
+                user.full_name, result.get("ms_id"),
             )
-        elif result["status"] == "created":
+            sync_status_line = (
+                f"\n✅ <b>Привязан к МойСклад:</b> {result.get('ms_name', '—')}"
+            )
+        elif status == "created":
             logger.info(
                 "Создан сотрудник МойСклад для %s: %s",
-                user.full_name, result["ms_id"]
+                user.full_name, result.get("ms_id"),
+            )
+            sync_status_line = (
+                "\n✅ <b>Создан сотрудник в МойСклад.</b>"
+            )
+        elif status == "already_linked":
+            sync_status_line = "\n✅ <b>Аккаунт уже привязан к МойСклад.</b>"
+        elif status == "failed":
+            reason = result.get("reason", "неизвестная ошибка")
+            logger.warning(
+                "Не удалось привязать %s к МойСклад: %s", user.full_name, reason
+            )
+            sync_status_line = (
+                "\n⚠️ <b>Не удалось привязать аккаунт к МойСклад.</b>\n"
+                f"<code>{reason[:300]}</code>\n"
+                "Обратитесь к админу — без привязки аналитика по сотруднику "
+                "недоступна."
             )
 
     await message.answer(
-        get_welcome_text(role),
+        get_welcome_text(role) + sync_status_line,
         parse_mode="HTML",
         reply_markup=get_keyboard_for_role(role),
     )

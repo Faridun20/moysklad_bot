@@ -4,9 +4,11 @@ Telegram-бот МойСклад — точка запуска
 
 import asyncio
 import logging
+import os
 
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import MenuButtonWebApp, MenuButtonDefault, WebAppInfo
 
 from handlers import orders
 from config import TELEGRAM_TOKEN
@@ -83,6 +85,27 @@ async def main():
 
     # Предварительно прогреваем общую aiohttp-сессию для МойСклад
     await get_session()
+
+    # Закрепляем кнопку «Открыть» в композере чата, если задан WEBAPP_URL.
+    # Это делает WebApp доступным в один тап рядом с полем ввода.
+    webapp_url = os.environ.get("WEBAPP_URL", "").strip()
+    if webapp_url:
+        try:
+            await bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(
+                    text="Открыть",
+                    web_app=WebAppInfo(url=webapp_url),
+                )
+            )
+            logger.info("Menu Button установлен на %s", webapp_url)
+        except Exception as e:
+            logger.warning("Не удалось установить Menu Button: %s", e)
+    else:
+        # На случай если WEBAPP_URL убрали — возвращаем дефолтную кнопку
+        try:
+            await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
+        except Exception:
+            pass
 
     bg_tasks = start_background_tasks(bot)
 
