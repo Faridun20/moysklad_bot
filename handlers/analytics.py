@@ -95,7 +95,10 @@ async def cb_analytics_period(call: CallbackQuery, bot: Bot):
     await call.answer()
 
     period = call.data.split(":")[1]
-    now = datetime.utcnow()
+    # Local time — совпадает с DB now_str(). Раньше был datetime.utcnow(),
+    # и сегодняшние одобренные заказы (созданные в локальной TZ) выпадали
+    # из «окна» аналитики на величину TZ-offset.
+    now = datetime.now()
     since, until, prev_since, prev_until, label = get_period(period, now)
 
     role = get_role(call.from_user.id)
@@ -265,7 +268,8 @@ async def show_manager_analytics(
 async def show_manager_summary(bot: Bot, chat_id: int, user_id: int):
     """Краткая сводка менеджера за текущий месяц — из локальной БД."""
     try:
-        now = datetime.utcnow()
+        # Local time, чтобы совпадало с DB now_str(). См. cb_analytics_period.
+        now = datetime.now()
         since = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         stats = _personal_stats_from_local(user_id, since, now)
         if stats["count"] == 0:

@@ -310,7 +310,13 @@ async def api_home(request: Request):
     if role not in ("admin", "boss", "manager"):
         raise HTTPException(status_code=403, detail="Нет доступа")
 
-    now = datetime.utcnow()
+    # ВАЖНО про TZ: now_str() в services/database пишет datetime.now() —
+    # это LOCAL-время сервера (на Railway обычно UTC, но если в env
+    # стоит TZ=Asia/Tashkent — будет +5). Чтобы сравнения с DB timestamp'ами
+    # совпадали, читаем «now» тем же способом, что и пишем. Раньше тут был
+    # datetime.utcnow() — в результате сегодняшние заказы выпадали из окна
+    # на пару часов.
+    now = datetime.now()
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago = now - timedelta(days=7)
 
@@ -521,7 +527,8 @@ async def api_analytics(request: Request):
         raise HTTPException(status_code=403, detail="Нет доступа")
 
     period = data.get("period", "week")
-    now = datetime.utcnow()
+    # Local-time чтобы совпадало с now_str() (см. /api/home комментарий).
+    now = datetime.now()
 
     periods = {
         "week": (now - timedelta(weeks=1), now - timedelta(weeks=2), "Неделя"),
