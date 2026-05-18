@@ -70,7 +70,7 @@ async function showScreen(screen) {
   try {
     switch (screen) {
       case 'home':
-        content.innerHTML = renderHome();
+        await renderHome();
         break;
       case 'stock':
         await renderStock();
@@ -94,31 +94,137 @@ async function showScreen(screen) {
   }
 }
 
-function renderHome() {
-  return `
-    <div class="section-label">Сводка</div>
-    <div class="stat-grid">
+async function renderHome() {
+  const content = document.getElementById('content');
+  content.innerHTML = `<div class="loader">⏳ Собираю сводку…</div>`;
+
+  let data;
+  try {
+    const r = await fetch('/api/home', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: tg.initData }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${r.status}`);
+    }
+    data = await r.json();
+  } catch (e) {
+    content.innerHTML = `<div class="error">❌ ${e.message}</div>`;
+    return;
+  }
+
+  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const isBoss = data.role === 'admin' || data.role === 'boss';
+
+  // ─── Сводка за сегодня ──────────────────────────────
+  const today = `
+    <div class="section-label">Сегодня</div>
+    <div class="stat-grid stat-grid--three">
       <div class="stat">
-        <div class="stat-value">—</div>
+        <div class="stat-value">${fmt(data.today.revenue)}</div>
         <div class="stat-label">Выручка</div>
       </div>
       <div class="stat">
-        <div class="stat-value">—</div>
+        <div class="stat-value">${data.today.shipments}</div>
         <div class="stat-label">Отгрузок</div>
       </div>
-    </div>
-
-    <div class="section-label">Информация</div>
-    <div class="card">
-      <p style="margin-bottom: 8px;">
-        ✅ <b>WebApp подключён успешно</b>
-      </p>
-      <p style="font-size: 12px; color: #888;">
-        ID: ${currentUser.user_id}<br>
-        Роль: ${currentUser.role}
-      </p>
+      <div class="stat">
+        <div class="stat-value">${data.today.clients}</div>
+        <div class="stat-label">Клиентов</div>
+      </div>
     </div>
   `;
+
+  // ─── Мои заказы ─────────────────────────────────────
+  const mo = data.my_orders;
+  const ordersBlock = mo.total === 0 ? `
+    <div class="section-label">Мои заказы</div>
+    <div class="card" style="text-align:center; color:#888;">
+      Пока нет заказов. Создайте новый во вкладке «Заказы».
+    </div>
+  ` : `
+    <div class="section-label">Мои заказы</div>
+    <div class="stat-grid stat-grid--three">
+      <div class="stat">
+        <div class="stat-value">${mo.draft}</div>
+        <div class="stat-label">📝 Черновики</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value">${mo.pending}</div>
+        <div class="stat-label">⏳ Ожидают</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value">${mo.approved}</div>
+        <div class="stat-label">✅ Одобрено</div>
+      </div>
+    </div>
+    ${mo.recent.length > 0 ? `
+      <div class="card" style="padding:0;">
+        ${mo.recent.map(o => `
+          <div class="stock-row" style="cursor:pointer;" data-order-id="${o.id}">
+            <div class="stock-info">
+              <div class="stock-name">${STATUS_EMOJI[o.status] || '📋'} Заказ #${o.id}${o.agent_name ? ' · ' + escapeHtml(o.agent_name) : ''}</div>
+              <div class="stock-folder">${o.created_at}</div>
+            </div>
+            <span class="stock-badge ${o.status === 'approved' ? 'badge-green' : o.status === 'rejected' ? 'badge-red' : 'badge-yellow'}">${STATUS_NAME[o.status]}</span>
+          </div>
+        `).join('')}
+      </div>
+    ` : ''}
+  `;
+
+  // ─── Для босса: ожидающие заявки + топ-сотрудники ──
+  let bossBlock = '';
+  if (isBoss) {
+    const pendingBlock = data.pending_requests > 0 ? `
+      <div class="section-label">Требует внимания</div>
+      <div class="card" style="cursor:pointer;" id="go-requests">
+        <p style="font-weight:600;">⏳ Заявок на отгрузку: ${data.pending_requests}</p>
+        <p style="font-size:12px; color:#888; margin-top:4px;">Нажмите чтобы открыть Заказы</p>
+      </div>
+    ` : '';
+
+    const topEmp = data.top_employees || [];
+    const topBlock = topEmp.length === 0 ? '' : `
+      <div class="section-label">Топ сотрудники (неделя)</div>
+      <div class="card" style="padding:0;">
+        ${topEmp.map((e, i) => `
+          <div class="stock-row">
+            <div class="stock-info">
+              <div class="stock-name">${i + 1}. ${escapeHtml(e.name)}</div>
+              <div class="stock-folder">${e.count} отгр.</div>
+            </div>
+            <span class="stock-badge badge-green">${fmt(e.revenue)}</span>
+          </div>
+        `).join('')}
+      </div>
+    `;
+
+    bossBlock = pendingBlock + topBlock;
+  }
+
+  // ─── Предупреждение о непривязанном МойСклад ─────
+  const linkWarning = (!data.ms_linked && data.role === 'manager') ? `
+    <div class="card" style="border-color:#f59e0b; background:#fef3c7; color:#92400e;">
+      ⚠️ <b>Аккаунт не привязан к МойСклад.</b><br>
+      <span style="font-size:12px;">Откройте чат с ботом и нажмите /start для автопривязки. Без этого персональная аналитика недоступна.</span>
+    </div>
+  ` : '';
+
+  content.innerHTML = today + ordersBlock + bossBlock + linkWarning;
+
+  // Клик по карточке "Заявок на отгрузку" → переход на Заказы
+  const goReq = document.getElementById('go-requests');
+  if (goReq) {
+    goReq.addEventListener('click', () => showScreen('orders'));
+  }
+
+  // Клик по строке недавнего заказа → переход на Заказы
+  document.querySelectorAll('[data-order-id]').forEach(row => {
+    row.addEventListener('click', () => showScreen('orders'));
+  });
 }
 
 // ─── Экран: Склад ───────────────────────────────────
