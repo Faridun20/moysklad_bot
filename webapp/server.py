@@ -103,6 +103,60 @@ class CachedStaticFiles(StaticFiles):
 app.mount("/static", CachedStaticFiles(directory=STATIC_DIR), name="static")
 
 
+# ─── Telegram webhook (опционально) ──────────────────────────────────────────
+#
+# В webhook-режиме bot.py регистрирует dp+bot через set_telegram_dispatcher(),
+# а Telegram POST'ит апдейты сюда. Без вызова этой функции endpoint вернёт
+# 503 — это безопасно, потому что webhook у Telegram при этом не зарегистрирован.
+
+_tg_bot = None
+_tg_dispatcher = None
+
+
+def set_telegram_dispatcher(bot, dispatcher) -> None:
+    """Регистрирует aiogram Bot+Dispatcher для приёма webhook-апдейтов.
+    Вызывается из bot.py при TG_USE_WEBHOOK=1."""
+    global _tg_bot, _tg_dispatcher
+    _tg_bot = bot
+    _tg_dispatcher = dispatcher
+
+
+@app.post("/tg/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    """Принимает Update-объекты от Telegram.
+
+    Защита: секрет в URL + проверка заголовка X-Telegram-Bot-Api-Secret-Token
+    (Telegram отправляет именно его, если мы при set_webhook указали secret_token).
+    Двойная защита нужна, чтобы случайно слитый URL не давал никому
+    отправлять апдейты — нужен ещё и заголовок.
+    """
+    from config import TG_WEBHOOK_SECRET
+
+    if not TG_WEBHOOK_SECRET or secret != TG_WEBHOOK_SECRET:
+        raise HTTPException(status_code=404, detail="not found")
+    header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if header_secret != TG_WEBHOOK_SECRET:
+        raise HTTPException(status_code=404, detail="not found")
+    if _tg_dispatcher is None or _tg_bot is None:
+        # Бот ещё не подключил себя сюда — режим webhook отключён.
+        # 503 говорит Telegram «попробуй позже», без потери апдейта.
+        raise HTTPException(status_code=503, detail="bot not ready")
+
+    from aiogram.types import Update
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad payload")
+
+    try:
+        update = Update.model_validate(payload, context={"bot": _tg_bot})
+        await _tg_dispatcher.feed_webhook_update(_tg_bot, update)
+    except Exception:
+        logger.exception("Ошибка обработки Telegram update")
+        # 200 всё равно — иначе Telegram заретраит и засрёт лог
+    return JSONResponse({"ok": True})
+
+
 # ─── Webhook от МойСклад ─────────────────────────────────────────────────────
 
 

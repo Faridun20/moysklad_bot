@@ -15,7 +15,9 @@ from aiogram.types import (
 )
 
 from handlers import orders
-from config import TELEGRAM_TOKEN
+from config import (
+    TELEGRAM_TOKEN, TG_USE_WEBHOOK, TG_WEBHOOK_SECRET, WEBAPP_URL,
+)
 from services.rate_limit import acquire as rate_limit_acquire
 
 # Хэндлеры
@@ -217,13 +219,51 @@ async def main():
     bg_tasks = start_background_tasks(bot)
 
     # Запускаем WebApp параллельно с ботом
-    from webapp.server import start_webapp
-    bg_tasks.append(asyncio.create_task(start_webapp(), name="webapp"))
+    from webapp import server as webapp_server
+    bg_tasks.append(asyncio.create_task(webapp_server.start_webapp(), name="webapp"))
 
-    logger.info("Бот запущен")
+    # ─── Режим приёма апдейтов ───────────────────────────────────
+    # Webhook: webapp принимает POST'ы от Telegram, мы не дёргаем
+    # api.telegram.org каждую секунду. Polling: классическая
+    # модель, работает без публичного URL.
+    use_webhook = TG_USE_WEBHOOK and TG_WEBHOOK_SECRET and WEBAPP_URL
+    if TG_USE_WEBHOOK and not use_webhook:
+        logger.warning(
+            "TG_USE_WEBHOOK=1, но не задан WEBAPP_URL или TG_WEBHOOK_SECRET — "
+            "фолбэк на polling. Задайте обе переменные, чтобы включить webhook."
+        )
+
+    logger.info(
+        "Бот запущен в режиме: %s",
+        "webhook" if use_webhook else "polling",
+    )
     try:
-        await dp.start_polling(bot)
+        if use_webhook:
+            # Регистрируем dp/bot у webapp, чтобы /tg/<secret> мог отдавать
+            # апдейты в dispatcher.
+            webapp_server.set_telegram_dispatcher(bot, dp)
+            webhook_url = f"{WEBAPP_URL}/tg/{TG_WEBHOOK_SECRET}"
+            # secret_token шлётся Telegram'ом в заголовке X-Telegram-Bot-
+            # Api-Secret-Token; webapp проверяет соответствие.
+            await bot.set_webhook(
+                url=webhook_url,
+                secret_token=TG_WEBHOOK_SECRET,
+                drop_pending_updates=False,
+                allowed_updates=dp.resolve_used_update_types(),
+            )
+            logger.info("Telegram webhook установлен: %s", webhook_url)
+            # Просто блокируемся, пока приходят сигналы — реальная обработка
+            # апдейтов идёт через FastAPI endpoint /tg/<secret>.
+            stop_event = asyncio.Event()
+            await stop_event.wait()
+        else:
+            await dp.start_polling(bot)
     finally:
+        if use_webhook:
+            try:
+                await bot.delete_webhook(drop_pending_updates=False)
+            except Exception:
+                logger.exception("Не удалось снять webhook")
         await _shutdown(bg_tasks)
 
 

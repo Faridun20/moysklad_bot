@@ -27,3 +27,13 @@ except ImportError:
     ADMIN_IDS = _parse_ids("ADMIN_IDS")
     BOSS_IDS = _parse_ids("BOSS_IDS")
     MANAGER_IDS = _parse_ids("MANAGER_IDS")
+
+    # ─── Telegram webhook (опционально) ────────────────────────────
+    # Если TG_USE_WEBHOOK=1 и заданы WEBAPP_URL + TG_WEBHOOK_SECRET —
+    # бот переключается с long-polling на webhook. Это снимает
+    # 1-2 запроса/сек к api.telegram.org и даёт мгновенную реакцию.
+    # Иначе работаем по-старому (polling) — обратной совместимости
+    # хватает, чтобы выкатить deploy без правки env.
+    TG_USE_WEBHOOK = os.environ.get("TG_USE_WEBHOOK", "").lower() in ("1", "true", "yes")
+    TG_WEBHOOK_SECRET = os.environ.get("TG_WEBHOOK_SECRET", "")
+    WEBAPP_URL = os.environ.get("WEBAPP_URL", "").rstrip("/")
