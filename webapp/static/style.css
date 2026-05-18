@@ -524,5 +524,250 @@ body {
   cursor: pointer;
 }
 
+/* ─── Редактор заказа ───────────────────────────── */
+.orders-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  gap: 8px;
+}
+
+.btn-new-order {
+  flex-shrink: 0;
+  padding: 7px 14px;
+  background: var(--tg-theme-button-color, #0a84ff);
+  color: var(--tg-theme-button-text-color, #fff);
+  border: none;
+  border-radius: 16px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.editor-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 0 12px;
+  border-bottom: 0.5px solid var(--tg-theme-section-separator-color, #e0e0e0);
+  margin-bottom: 12px;
+}
+
+.editor-header button {
+  background: none;
+  border: none;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 4px;
+  color: var(--tg-theme-button-color, #0a84ff);
+}
+
+.editor-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--tg-theme-text-color, #000);
+}
+
+.btn-agent {
+  width: 100%;
+  padding: 12px;
+  background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+  border: 1px dashed var(--tg-theme-section-separator-color, #ccc);
+  border-radius: 10px;
+  font-size: 14px;
+  cursor: pointer;
+  color: var(--tg-theme-button-color, #0a84ff);
+  text-align: left;
+}
+
+.agent-selected {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+  border-radius: 10px;
+  font-size: 13px;
+}
+
+.agent-selected button {
+  background: none;
+  border: none;
+  color: var(--tg-theme-button-color, #0a84ff);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.editor-items {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.editor-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+  border-radius: 10px;
+}
+
+.editor-item-info { flex: 1; }
+.editor-item-name { font-size: 13px; font-weight: 500; }
+.editor-item-qty  { font-size: 12px; color: var(--tg-theme-hint-color, #888); }
+
+.editor-item-del {
+  background: none;
+  border: none;
+  font-size: 16px;
+  cursor: pointer;
+  color: #A32D2D;
+  padding: 4px 8px;
+}
+
+.editor-empty {
+  text-align: center;
+  padding: 16px;
+  color: var(--tg-theme-hint-color, #888);
+  font-size: 13px;
+  background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+  border-radius: 10px;
+  margin-bottom: 8px;
+}
+
+.btn-add-product {
+  width: 100%;
+  padding: 10px;
+  background: none;
+  border: 1px dashed var(--tg-theme-button-color, #0a84ff);
+  border-radius: 10px;
+  color: var(--tg-theme-button-color, #0a84ff);
+  font-size: 13px;
+  cursor: pointer;
+  margin-bottom: 12px;
+}
+
+.editor-footer {
+  position: sticky;
+  bottom: 70px;
+  padding: 12px 0 0;
+}
+
+.editor-hint {
+  text-align: center;
+  font-size: 11px;
+  color: var(--tg-theme-hint-color, #888);
+  margin-top: 6px;
+}
+
+.btn-submit-order {
+  width: 100%;
+  padding: 13px;
+  background: var(--tg-theme-button-color, #0a84ff);
+  color: #fff;
+  border: none;
+  border-radius: 12px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn-submit-order:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-edit-order {
+  width: 100%;
+  margin-top: 8px;
+  padding: 7px;
+  background: none;
+  border: 1px solid var(--tg-theme-button-color, #0a84ff);
+  border-radius: 8px;
+  color: var(--tg-theme-button-color, #0a84ff);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.order-item-preview {
+  font-size: 11px;
+  color: var(--tg-theme-hint-color, #888);
+  padding: 1px 0;
+}
+
+/* ─── Поиск клиента / товара ─────────────────────── */
+.agent-search-wrap {
+  margin-bottom: 8px;
+}
+
+.agent-row {
+  padding: 12px;
+  background: var(--tg-theme-bg-color, #fff);
+  border: 0.5px solid var(--tg-theme-section-separator-color, #e0e0e0);
+  border-radius: 10px;
+  margin-bottom: 6px;
+  cursor: pointer;
+}
+
+.agent-name  { font-size: 13px; font-weight: 500; }
+.agent-phone { font-size: 11px; color: var(--tg-theme-hint-color, #888); margin-top: 2px; }
+
+.prod-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  background: var(--tg-theme-bg-color, #fff);
+  border: 0.5px solid var(--tg-theme-section-separator-color, #e0e0e0);
+  border-radius: 10px;
+  margin-bottom: 6px;
+  cursor: pointer;
+}
+
+.prod-info  { flex: 1; min-width: 0; }
+.prod-name  { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.prod-folder{ font-size: 11px; color: var(--tg-theme-hint-color, #888); }
+
+/* ─── Ввод количества ────────────────────────────── */
+.qty-screen {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 24px 16px;
+  gap: 12px;
+}
+
+.qty-product-name {
+  font-size: 16px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.qty-stock {
+  font-size: 13px;
+  color: var(--tg-theme-hint-color, #888);
+}
+
+.qty-input {
+  width: 120px;
+  text-align: center;
+  font-size: 32px;
+  font-weight: 600;
+  padding: 10px;
+  border: 2px solid var(--tg-theme-button-color, #0a84ff);
+  border-radius: 12px;
+  background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+  color: var(--tg-theme-text-color, #000);
+}
+
+.qty-unit {
+  font-size: 14px;
+  color: var(--tg-theme-hint-color, #888);
+}
+
 .pay-status.pay-ok    { color: #3B6D11; }
 .pay-status.pay-error { color: #A32D2D; }

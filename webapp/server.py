@@ -378,6 +378,183 @@ async def api_pending_requests(request: Request):
 
     return JSONResponse({"requests": result})
 
+# ─── API: создание заказа ────────────────────────────────────────────────────
+
+
+@app.post("/api/orders/create")
+async def api_create_order(request: Request):
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+
+    from services.database import create_order, get_role
+    role = get_role(user["id"])
+    if role not in ("admin", "boss", "manager"):
+        raise HTTPException(status_code=403, detail="Нет доступа")
+
+    full_name = (
+        f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+        or user.get("username", str(user["id"]))
+    )
+    order_id = create_order(user["id"], full_name, data.get("comment", ""))
+    return JSONResponse({"order_id": order_id})
+
+
+@app.post("/api/orders/add_item")
+async def api_add_item(request: Request):
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+
+    from services.database import add_order_item, get_order
+    order = get_order(data["order_id"])
+    if not order or order["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Нет доступа")
+
+    item_id = add_order_item(
+        order_id=data["order_id"],
+        product_name=data["product_name"],
+        product_href=data.get("product_href", ""),
+        quantity=float(data["quantity"]),
+        unit=data.get("unit", "шт"),
+        note=data.get("note", ""),
+    )
+    return JSONResponse({"item_id": item_id})
+
+
+@app.post("/api/orders/remove_item")
+async def api_remove_item(request: Request):
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+
+    from services.database import remove_order_item
+    remove_order_item(data["item_id"])
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/orders/set_agent")
+async def api_set_agent(request: Request):
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+
+    from services.database import update_order_agent, get_order
+    order = get_order(data["order_id"])
+    if not order or order["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Нет доступа")
+
+    update_order_agent(data["order_id"], data["agent_id"], data["agent_name"])
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/orders/submit")
+async def api_submit_order(request: Request):
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+
+    from services.database import (
+        get_order, get_order_items, create_shipment_request,
+        update_order_status, add_audit_log, get_role,
+    )
+    from services.notifier import get_notify_recipients
+    from utils.formatters import DIV
+    from handlers.orders import format_request_notify
+    import aiohttp as _aiohttp
+    from config import TELEGRAM_TOKEN
+
+    order_id = data["order_id"]
+    order = get_order(order_id)
+    if not order or order["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Нет доступа")
+    if order["status"] != "draft":
+        raise HTTPException(status_code=400, detail="Заказ уже отправлен")
+
+    items = get_order_items(order_id)
+    if not items:
+        raise HTTPException(status_code=400, detail="Добавьте товары")
+    if not order.get("agent_name"):
+        raise HTTPException(status_code=400, detail="Выберите клиента")
+
+    full_name = (
+        f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+        or user.get("username", str(user["id"]))
+    )
+    req_id = create_shipment_request(order_id, user["id"], full_name)
+    update_order_status(order_id, "pending")
+    add_audit_log(
+        user["id"], full_name, get_role(user["id"]),
+        "shipment_request_sent",
+        f"Заявка #{req_id} (заказ #{order_id}) через WebApp",
+    )
+
+    # Уведомляем руководителей
+    notify_text = format_request_notify(order, items, req_id)
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "✅ Одобрить",  "callback_data": f"req_ok:{req_id}"},
+            {"text": "❌ Отклонить", "callback_data": f"req_no:{req_id}"},
+        ]]
+    }
+    async with _aiohttp.ClientSession() as session:
+        for uid in get_notify_recipients():
+            try:
+                await session.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                    json={
+                        "chat_id": uid,
+                        "text": notify_text,
+                        "parse_mode": "HTML",
+                        "reply_markup": keyboard,
+                    },
+                )
+            except Exception:
+                pass
+
+    return JSONResponse({"req_id": req_id})
+
+
+@app.post("/api/agents")
+async def api_agents(request: Request):
+    """Список клиентов (контрагентов) из МойСклад."""
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+
+    import aiohttp as _aiohttp
+    from config import MS_TOKEN
+    MS_BASE_URL = "https://api.moysklad.ru/api/remap/1.2"
+    headers = {"Authorization": f"Bearer {MS_TOKEN}", "Accept-Encoding": "gzip"}
+
+    search = data.get("search", "")
+    params = {"limit": 50, "order": "name"}
+    if search:
+        params["search"] = search
+
+    async with _aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{MS_BASE_URL}/entity/counterparty",
+            headers=headers, params=params,
+        ) as resp:
+            resp.raise_for_status()
+            result = await resp.json()
+
+    agents = [
+        {
+            "id": a.get("id", ""),
+            "name": a.get("name", "—"),
+            "phone": a.get("phone", ""),
+        }
+        for a in result.get("rows", [])
+    ]
+    return JSONResponse({"agents": agents})
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 async def start_webapp():
