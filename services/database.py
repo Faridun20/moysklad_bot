@@ -63,9 +63,8 @@ def init_db():
         cur = get_cursor(conn)
         id_type = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
 
-        # Роли пользователей — добавлено поле moysklad_employee_id
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS user_roles (
+        tables = [
+            f"""CREATE TABLE IF NOT EXISTS user_roles (
                 user_id              BIGINT PRIMARY KEY,
                 username             TEXT,
                 full_name            TEXT,
@@ -73,15 +72,9 @@ def init_db():
                 moysklad_employee_id TEXT,
                 ms_sync_status       TEXT DEFAULT 'pending',
                 created_at           TEXT
-            )
-        """)
+            )""",
 
-        # Миграция — добавляем колонки если их нет (для старых БД)
-        _migrate(cur)
-
-        # Платежи
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS payments (
+            f"""CREATE TABLE IF NOT EXISTS payments (
                 id           {id_type},
                 user_id      BIGINT NOT NULL,
                 username     TEXT,
@@ -92,12 +85,9 @@ def init_db():
                 status       TEXT NOT NULL DEFAULT 'pending',
                 created_at   TEXT NOT NULL,
                 confirmed_at TEXT
-            )
-        """)
+            )""",
 
-        # Аудит лог
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS audit_log (
+            f"""CREATE TABLE IF NOT EXISTS audit_log (
                 id         {id_type},
                 user_id    BIGINT NOT NULL,
                 full_name  TEXT,
@@ -105,12 +95,9 @@ def init_db():
                 action     TEXT NOT NULL,
                 details    TEXT,
                 created_at TEXT NOT NULL
-            )
-        """)
+            )""",
 
-        # Заказы (черновики менеджера)
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS orders (
+            f"""CREATE TABLE IF NOT EXISTS orders (
                 id          {id_type},
                 user_id     BIGINT NOT NULL,
                 full_name   TEXT,
@@ -120,12 +107,9 @@ def init_db():
                 agent_name  TEXT,
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL
-            )
-        """)
+            )""",
 
-        # Позиции заказа
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS order_items (
+            f"""CREATE TABLE IF NOT EXISTS order_items (
                 id           {id_type},
                 order_id     BIGINT NOT NULL,
                 product_name TEXT NOT NULL,
@@ -133,28 +117,47 @@ def init_db():
                 quantity     REAL NOT NULL DEFAULT 1,
                 unit         TEXT DEFAULT 'шт',
                 note         TEXT
-            )
-        """)
+            )""",
 
-        # Заявки на отгрузку
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS shipment_requests (
-                id          {id_type},
-                order_id    BIGINT NOT NULL,
-                user_id     BIGINT NOT NULL,
-                full_name   TEXT,
-                status      TEXT NOT NULL DEFAULT 'pending',
-                comment     TEXT,
-                approved_by BIGINT,
+            f"""CREATE TABLE IF NOT EXISTS shipment_requests (
+                id               {id_type},
+                order_id         BIGINT NOT NULL,
+                user_id          BIGINT NOT NULL,
+                full_name        TEXT,
+                status           TEXT NOT NULL DEFAULT 'pending',
+                comment          TEXT,
+                approved_by      BIGINT,
                 approved_by_name TEXT,
-                created_at  TEXT NOT NULL,
-                approved_at TEXT
-            )
-        """)
+                created_at       TEXT NOT NULL,
+                approved_at      TEXT
+            )""",
+        ]
 
-        conn.commit()
+        # Создаём каждую таблицу в отдельной транзакции
+        for sql in tables:
+            try:
+                cur.execute(sql)
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.warning("Таблица уже существует или ошибка: %s", e)
+
+        # Миграции в отдельных транзакциях
+        migrations = [
+            ("user_roles", "moysklad_employee_id", "TEXT"),
+            ("user_roles", "ms_sync_status", "TEXT DEFAULT 'pending'"),
+            ("user_roles", "created_at", "TEXT"),
+        ]
+        for table, column, col_type in migrations:
+            try:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+                conn.commit()
+            except Exception:
+                conn.rollback()  # Колонка уже существует — норм
+
     logger.info("База данных инициализирована")
     _load_predefined_users()
+
 
 
 def _migrate(cur):
