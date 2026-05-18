@@ -703,6 +703,83 @@ def set_order_ms_demand_id(order_id: int, ms_demand_id: str) -> bool:
     return updated
 
 
+def get_payments_needing_ms_sync(limit: int = 100) -> list[dict]:
+    """Confirmed-платежи, привязанные к заказу, которые ещё НЕ улетели
+    в МойСклад (либо upload не сработал, либо ещё не пробовали).
+
+    Используется и cron-retry'ем, и /sync_payments командой.
+    Включает:
+      - 'failed' — предыдущая попытка упала (MS_TOKEN, 429, 5xx и т.п.)
+      - NULL    — confirmed до того как фича была деплоена, или
+                  fire-and-forget hook не успел отработать (event loop
+                  закрылся)
+    Исключает уже синхронизированные (ms_paymentin_id IS NOT NULL).
+    """
+    query = (
+        "SELECT * FROM payments "
+        "WHERE status = 'confirmed' "
+        "  AND order_id IS NOT NULL "
+        "  AND ms_paymentin_id IS NULL "
+        "ORDER BY confirmed_at ASC LIMIT ?"
+    )
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q(query), (limit,))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_ms_sync_stats() -> dict:
+    """Сводка статуса синхронизации платежей с МойСклад.
+    Для /sync_payments команды — показывает админу что в каком состоянии.
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            "SELECT "
+            "  COUNT(*) FILTER (WHERE ms_paymentin_id IS NOT NULL) AS synced, "
+            "  COUNT(*) FILTER (WHERE ms_sync_status = 'failed') AS failed, "
+            "  COUNT(*) FILTER (WHERE status = 'confirmed' AND order_id IS NOT NULL "
+            "                    AND ms_paymentin_id IS NULL "
+            "                    AND (ms_sync_status IS NULL OR ms_sync_status != 'failed')) "
+            "    AS never_tried "
+            "FROM payments"
+            if USE_POSTGRES else
+            # SQLite не поддерживает FILTER — используем SUM(CASE...)
+            "SELECT "
+            "  SUM(CASE WHEN ms_paymentin_id IS NOT NULL THEN 1 ELSE 0 END) AS synced, "
+            "  SUM(CASE WHEN ms_sync_status = 'failed' THEN 1 ELSE 0 END) AS failed, "
+            "  SUM(CASE WHEN status = 'confirmed' AND order_id IS NOT NULL "
+            "                AND ms_paymentin_id IS NULL "
+            "                AND (ms_sync_status IS NULL OR ms_sync_status != 'failed') "
+            "           THEN 1 ELSE 0 END) AS never_tried "
+            "FROM payments"
+        )
+        row = cur.fetchone()
+    if not row:
+        return {"synced": 0, "failed": 0, "never_tried": 0}
+    return {
+        "synced":      int(row["synced"] or 0) if USE_POSTGRES else int(row[0] or 0),
+        "failed":      int(row["failed"] or 0) if USE_POSTGRES else int(row[1] or 0),
+        "never_tried": int(row["never_tried"] or 0) if USE_POSTGRES else int(row[2] or 0),
+    }
+
+
+def get_recent_ms_sync_failures(limit: int = 5) -> list[dict]:
+    """Последние failed-синхронизации с текстом ошибки — для UI команды."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "SELECT id, amount, currency, order_id, ms_sync_error "
+                "FROM payments "
+                "WHERE ms_sync_status = 'failed' "
+                "ORDER BY id DESC LIMIT ?"
+            ),
+            (limit,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
 def set_payment_ms_sync(
     payment_id: int,
     *,

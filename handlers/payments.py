@@ -36,6 +36,9 @@ from services.database import (
     get_summary_by_employee,
     add_audit_log,
     get_role,
+    get_ms_sync_stats,
+    get_payments_needing_ms_sync,
+    get_recent_ms_sync_failures,
 )
 
 logger = logging.getLogger(__name__)
@@ -354,3 +357,114 @@ async def cb_payreport(call: CallbackQuery):
     kb.button(text="🏠 Меню", callback_data="menu")
     kb.adjust(1)
     await call.message.answer("Выберите действие:", reply_markup=kb.as_markup())
+
+
+# ─── /sync_payments: показать состояние и ретрайнуть синки в МойСклад ───────
+
+
+def _esc(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _format_sync_status() -> tuple[str, bool]:
+    """HTML-сообщение про статус синхронизации + флаг «есть что ретрайнуть»."""
+    stats = get_ms_sync_stats()
+    pending_count = stats["failed"] + stats["never_tried"]
+
+    lines = [
+        f"{DIV}",
+        "🔄 <b>Синхронизация платежей в МойСклад</b>",
+        "",
+        f"✅ Синхронизированы:    <b>{stats['synced']}</b>",
+        f"❌ Failed:               <b>{stats['failed']}</b>",
+        f"⏳ Ещё не пробовали:     <b>{stats['never_tried']}</b>",
+    ]
+    if stats["failed"] > 0:
+        fails = get_recent_ms_sync_failures(limit=5)
+        if fails:
+            lines.append("\n<b>Последние ошибки:</b>")
+            for f in fails:
+                err = (f.get("ms_sync_error") or "")[:120]
+                cur_ = f.get("currency") or "—"
+                amount = f.get("amount") or 0
+                oid = f.get("order_id") or "—"
+                lines.append(
+                    f"  • Платёж #{f['id']} (#{oid}, {int(round(float(amount)))} {_esc(cur_)}): "
+                    f"<code>{_esc(err)}</code>"
+                )
+    if pending_count == 0:
+        lines.append("\n<i>Всё синхронизировано, ретрайнуть нечего.</i>")
+    return ("\n".join(lines), pending_count > 0)
+
+
+@router.message(Command("sync_payments"))
+async def cmd_sync_payments(message: Message):
+    """Только admin/boss. Показывает статус и кнопку Retry."""
+    if not can_manage_payments(message.from_user.id):
+        return
+
+    text, has_pending = _format_sync_status()
+    kb = InlineKeyboardBuilder()
+    if has_pending:
+        kb.button(text="🔄 Retry all", callback_data="ms_sync_retry")
+    kb.button(text="🔄 Обновить", callback_data="ms_sync_refresh")
+    kb.adjust(1)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data == "ms_sync_refresh")
+async def cb_sync_refresh(call: CallbackQuery):
+    if not can_manage_payments(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    text, has_pending = _format_sync_status()
+    kb = InlineKeyboardBuilder()
+    if has_pending:
+        kb.button(text="🔄 Retry all", callback_data="ms_sync_retry")
+    kb.button(text="🔄 Обновить", callback_data="ms_sync_refresh")
+    kb.adjust(1)
+    try:
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb.as_markup())
+    except Exception:
+        pass
+    await call.answer("Обновлено")
+
+
+@router.callback_query(F.data == "ms_sync_retry")
+async def cb_sync_retry(call: CallbackQuery):
+    """Прогнать все failed/never_tried прямо сейчас."""
+    if not can_manage_payments(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+
+    await call.answer("⏳ Начал синхронизацию…")
+    # Получаем кандидатов и ретраим по очереди
+    pending = get_payments_needing_ms_sync(limit=100)
+    if not pending:
+        await call.message.answer("Нечего синхронизировать.")
+        return
+
+    from services.ms_payments import create_paymentin_for_payment
+    ok_count = 0
+    fail_count = 0
+    for p in pending:
+        result = await create_paymentin_for_payment(p["id"])
+        if result.get("ok"):
+            ok_count += 1
+        else:
+            fail_count += 1
+
+    # Перечитываем актуальные цифры и обновляем сообщение
+    text, has_pending = _format_sync_status()
+    summary = (
+        f"\n\n<b>Итог retry:</b> ✅ {ok_count} · ❌ {fail_count}"
+    )
+    kb = InlineKeyboardBuilder()
+    if has_pending:
+        kb.button(text="🔄 Retry all", callback_data="ms_sync_retry")
+    kb.button(text="🔄 Обновить", callback_data="ms_sync_refresh")
+    kb.adjust(1)
+    try:
+        await call.message.edit_text(
+            text + summary, parse_mode="HTML", reply_markup=kb.as_markup(),
+        )
+    except Exception:
+        pass
