@@ -1,0 +1,155 @@
+"""
+CLI: ежедневное напоминание о долгах. Запускается из Railway Cron.
+
+Что делает:
+  1. Берёт все открытые долги (credit + paid_at IS NULL) с due_date <= сегодня.
+  2. Группирует:
+     - Каждому МЕНЕДЖЕРУ — его собственные долги.
+     - Каждому boss/admin — сводку по всей компании.
+  3. Шлёт одно сообщение на получателя (а не одно на долг — чтобы не
+     спамить чат).
+
+Использование:
+    python -m tasks.run_debts_notify
+
+Расписание в Railway Cron: 0 6 * * *  (6:00 UTC = 11:00 Ташкент)
+       или 0 9 * * * если предпочитаешь UTC.
+"""
+
+import asyncio
+import logging
+import sys
+from datetime import date
+
+from config import BASE_CURRENCY
+from services.database import (
+    init_db, get_open_debts, get_order_items_by_ids, get_all_users,
+)
+from services.moysklad import close_session
+from services.notifier import tg_send_message, close_tg_session
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("debts_notify")
+
+
+def _esc(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _fmt_amount(n: float) -> str:
+    return f"{int(round(n)):,}".replace(",", " ")
+
+
+def _to_ru(iso: str) -> str:
+    if not iso or len(iso) < 10:
+        return iso or ""
+    y, m, d = iso[:10].split("-")
+    return f"{d}.{m}.{y}"
+
+
+def _format_message(debts: list[dict], items_by_order: dict, today_str: str,
+                    is_boss_view: bool) -> str:
+    """Свёрнутое сообщение про долги для одного получателя."""
+    overdue = [d for d in debts if d.get("due_date") and d["due_date"] < today_str]
+    today = [d for d in debts if d.get("due_date") == today_str]
+
+    def _row(d: dict) -> str:
+        items = items_by_order.get(d["id"], [])
+        total = sum(
+            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
+            for it in items
+        )
+        currency = d.get("currency") or BASE_CURRENCY
+        agent = _esc(d.get("agent_name") or "—")
+        owner_part = (
+            f" — {_esc(d.get('full_name') or '—')}"
+            if is_boss_view else ""
+        )
+        due_human = _to_ru(d.get("due_date") or "")
+        return (
+            f"  • #{d['id']} · {agent} · "
+            f"<b>{_fmt_amount(total)} {_esc(currency)}</b> "
+            f"({due_human}{owner_part})"
+        )
+
+    parts = ["💳 <b>Напоминание о долгах</b>\n"]
+    if overdue:
+        parts.append(f"⚠️ <b>Просрочено ({len(overdue)}):</b>")
+        parts.extend(_row(d) for d in overdue[:20])
+        if len(overdue) > 20:
+            parts.append(f"  …и ещё {len(overdue) - 20}")
+    if today:
+        if overdue:
+            parts.append("")  # пустая строка между блоками
+        parts.append(f"⏰ <b>Сегодня к оплате ({len(today)}):</b>")
+        parts.extend(_row(d) for d in today[:20])
+        if len(today) > 20:
+            parts.append(f"  …и ещё {len(today) - 20}")
+    parts.append(
+        "\n<i>Откройте WebApp → «Долги», чтобы отметить оплаченные, "
+        "или используйте команду /debts в чате.</i>"
+    )
+    return "\n".join(parts)
+
+
+async def main() -> int:
+    init_db()
+
+    today_str = date.today().isoformat()
+
+    # Все долги к оплате на сегодня + просроченные (через due_through=today).
+    all_debts = get_open_debts(due_through=today_str)
+    if not all_debts:
+        logger.info("Нет долгов к оплате сегодня — никому ничего не шлём.")
+        return 0
+
+    # Один батч-запрос на все позиции
+    items_by_order = get_order_items_by_ids([d["id"] for d in all_debts])
+
+    # Группируем по user_id (менеджеру-владельцу заказа)
+    by_manager: dict[int, list[dict]] = {}
+    for d in all_debts:
+        by_manager.setdefault(d["user_id"], []).append(d)
+
+    users = get_all_users()
+    bosses = [u for u in users if u["role"] in ("admin", "boss")]
+    managers_by_id = {u["user_id"]: u for u in users if u["role"] == "manager"}
+
+    sent = 0
+    try:
+        # 1. Менеджерам — их собственные долги
+        for uid, debts in by_manager.items():
+            if uid not in managers_by_id and not any(
+                u["user_id"] == uid and u["role"] in ("admin", "boss") for u in users
+            ):
+                # У владельца заказа нет активного аккаунта — пропускаем
+                # (босс всё равно получит сводку ниже).
+                continue
+            text = _format_message(debts, items_by_order, today_str, is_boss_view=False)
+            await tg_send_message(uid, text)
+            sent += 1
+
+        # 2. Boss/admin — сводка по всей компании
+        boss_text = _format_message(all_debts, items_by_order, today_str, is_boss_view=True)
+        for boss in bosses:
+            await tg_send_message(boss["user_id"], boss_text)
+            sent += 1
+
+        logger.info(
+            "debts_notify: отправлено %d сообщений (долгов всего: %d)",
+            sent, len(all_debts),
+        )
+        return 0
+    except Exception:
+        logger.exception("debts_notify: ошибка")
+        return 1
+    finally:
+        await close_session()
+        await close_tg_session()
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

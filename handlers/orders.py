@@ -187,11 +187,22 @@ def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
         if grand_total > 0 else ""
     )
 
+    # Тип оплаты: для credit'а явно показываем дату возврата,
+    # чтобы босс ещё на этапе апрува видел условия и решал,
+    # давать ли клиенту в долг.
+    payment_type = order.get("payment_type") or "paid"
+    if payment_type == "credit":
+        due = order.get("due_date") or "—"
+        payment_str = f"\n💳 <b>В долг</b>, погасить до <b>{_esc(due)}</b>"
+    else:
+        payment_str = "\n💵 Оплата сразу"
+
     return (
         f"{DIV}\n"
         f"🔔 <b>Новая заявка на отгрузку #{req_id}</b>\n"
         f"\n"
-        f"👨‍💼 Менеджер: <b>{_esc(order['full_name'])}</b>{agent_str}{comment_str}\n"
+        f"👨‍💼 Менеджер: <b>{_esc(order['full_name'])}</b>{agent_str}{comment_str}"
+        f"{payment_str}\n"
         f"\n"
         f"<b>📦 Товары:</b>\n{items_text}"
         f"{total_str}"

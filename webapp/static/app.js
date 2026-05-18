@@ -84,6 +84,9 @@ async function showScreen(screen) {
         ordersData = null;
         await renderOrdersScreen();
         break;
+      case 'debts':
+        await renderDebts();
+        break;
       case 'analytics':
         await renderAnalytics();
         break;
@@ -631,6 +634,27 @@ function renderOrderEditor() {
     <div class="editor-items" id="editor-items">${itemsList}</div>
     <button class="btn-add-product" id="btn-add-product">+ Добавить товар</button>
 
+    <div class="section-label">Оплата</div>
+    <div class="payment-selector">
+      <label class="payment-option">
+        <input type="radio" name="payment_type" value="paid"
+          ${(currentDraftOrder.payment_type || 'paid') === 'paid' ? 'checked' : ''}>
+        <span>💵 Оплачено сразу</span>
+      </label>
+      <label class="payment-option">
+        <input type="radio" name="payment_type" value="credit"
+          ${currentDraftOrder.payment_type === 'credit' ? 'checked' : ''}>
+        <span>💳 В долг</span>
+      </label>
+    </div>
+    <div class="due-date-wrap" id="due-date-wrap"
+      style="display: ${currentDraftOrder.payment_type === 'credit' ? 'block' : 'none'};">
+      <label class="due-date-label">Дата возврата долга:</label>
+      <input type="date" id="due-date-input" class="due-date-input"
+        value="${currentDraftOrder.due_date || ''}"
+        min="${new Date().toISOString().slice(0,10)}">
+    </div>
+
     <div class="editor-footer">
       <button class="btn-submit-order" id="btn-submit"
         ${order.items.length === 0 || !order.agent_name ? 'disabled' : ''}>
@@ -666,6 +690,18 @@ function renderOrderEditor() {
       currentDraftOrder.items.splice(idx, 1);
       renderOrderEditor();
     });
+  });
+
+  // Тип оплаты — радио + показ/скрытие date picker
+  document.querySelectorAll('input[name="payment_type"]').forEach(r => {
+    r.addEventListener('change', () => {
+      currentDraftOrder.payment_type = r.value;
+      document.getElementById('due-date-wrap').style.display =
+        r.value === 'credit' ? 'block' : 'none';
+    });
+  });
+  document.getElementById('due-date-input')?.addEventListener('change', e => {
+    currentDraftOrder.due_date = e.target.value;
   });
 
   // Отправить заявку
@@ -949,11 +985,22 @@ function openQuantityInput(name, unit, maxStock, href) {
 
 async function submitOrder() {
   const btn = document.getElementById('btn-submit');
-  if (btn) btn.disabled = true;
+  const paymentType = currentDraftOrder.payment_type || 'paid';
+  const dueDate = currentDraftOrder.due_date || '';
 
+  // Frontend-валидация: для credit обязательна дата возврата.
+  // Бекенд тоже проверяет, но здесь короче UX-фидбек.
+  if (paymentType === 'credit' && !dueDate) {
+    tg.showAlert('⚠️ Укажите дату возврата долга');
+    return;
+  }
+
+  if (btn) btn.disabled = true;
   try {
     const result = await api('/api/orders/submit', {
       order_id: currentDraftOrder.id,
+      payment_type: paymentType,
+      due_date: dueDate || null,
     });
     tg.HapticFeedback?.notificationOccurred('success');
     tg.showAlert(`✅ Заявка #${result.req_id} отправлена руководителю!`);
@@ -1287,6 +1334,130 @@ function initNav() {
     });
   });
 }
+
+
+// ─── Экран «Долги» ──────────────────────────────────────────────────────────
+//
+// Бекенд возвращает уже размеченные долги (state = overdue|due_today|upcoming).
+// Менеджер видит только свои; boss/admin — все. Фильтр сверху — переключение
+// "все / только просроченные+сегодня".
+
+let debtsFilter = 'all';  // 'all' | 'today'
+
+async function renderDebts() {
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loader">⏳ Загрузка долгов…</div>';
+  try {
+    const data = await api('/api/debts', { mode: debtsFilter });
+    const debts = data.debts || [];
+    const scopeLabel = data.scope === 'company' ? 'Все долги' : 'Мои долги';
+    const today = data.today;
+
+    // Сводка по статусам
+    let overdueCount = 0, todayCount = 0, upcomingCount = 0;
+    let overdueSum = 0, todaySum = 0, upcomingSum = 0;
+    for (const d of debts) {
+      if (d.state === 'overdue') { overdueCount++; overdueSum += d.total; }
+      else if (d.state === 'due_today') { todayCount++; todaySum += d.total; }
+      else { upcomingCount++; upcomingSum += d.total; }
+    }
+    const fmt = n => Math.round(n).toLocaleString('ru-RU');
+
+    let html = `
+      <div class="debts-header">
+        <div class="debts-title">${scopeLabel}</div>
+        <div class="debts-tabs">
+          <button class="debts-tab ${debtsFilter === 'all' ? 'active' : ''}" data-f="all">Все</button>
+          <button class="debts-tab ${debtsFilter === 'today' ? 'active' : ''}" data-f="today">К оплате сейчас</button>
+        </div>
+      </div>
+      <div class="debts-summary">
+        <div class="debt-stat debt-stat-overdue">
+          <div class="debt-stat-num">${overdueCount}</div>
+          <div class="debt-stat-label">Просрочено</div>
+          <div class="debt-stat-sum">${fmt(overdueSum)}</div>
+        </div>
+        <div class="debt-stat debt-stat-today">
+          <div class="debt-stat-num">${todayCount}</div>
+          <div class="debt-stat-label">Сегодня</div>
+          <div class="debt-stat-sum">${fmt(todaySum)}</div>
+        </div>
+        ${debtsFilter === 'all' ? `
+        <div class="debt-stat debt-stat-upcoming">
+          <div class="debt-stat-num">${upcomingCount}</div>
+          <div class="debt-stat-label">Будущие</div>
+          <div class="debt-stat-sum">${fmt(upcomingSum)}</div>
+        </div>
+        ` : ''}
+      </div>
+    `;
+
+    if (debts.length === 0) {
+      html += '<div class="empty">Нет открытых долгов</div>';
+    } else {
+      html += '<div class="debts-list">' + debts.map(d => {
+        const stateClass = `debt-${d.state}`;
+        const stateLabel = d.state === 'overdue' ? '⚠️ Просрочен'
+          : d.state === 'due_today' ? '⏰ Сегодня' : '📅 Срок';
+        const dueStr = d.due_date ? formatDateRU(d.due_date) : '—';
+        const ownerStr = d.is_mine ? '' : ` <span class="debt-owner">· ${escapeHtml(d.full_name)}</span>`;
+        return `
+          <div class="debt-card ${stateClass}">
+            <div class="debt-card-top">
+              <div class="debt-agent">🏢 ${escapeHtml(d.agent_name)}</div>
+              <div class="debt-amount">${fmt(d.total)} ${escapeHtml(d.currency)}</div>
+            </div>
+            <div class="debt-card-mid">
+              <span class="debt-state">${stateLabel}: <b>${dueStr}</b></span>
+              <span class="debt-meta">#${d.id} · ${d.items_count} поз.${ownerStr}</span>
+            </div>
+            <button class="btn-mark-paid" data-id="${d.id}">✅ Отметить оплачено</button>
+          </div>
+        `;
+      }).join('') + '</div>';
+    }
+
+    content.innerHTML = html;
+
+    // Tabs
+    document.querySelectorAll('.debts-tab').forEach(t => {
+      t.addEventListener('click', () => {
+        debtsFilter = t.dataset.f;
+        renderDebts();
+      });
+    });
+
+    // Mark-paid
+    document.querySelectorAll('.btn-mark-paid').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = parseInt(btn.dataset.id);
+        tg.showConfirm('Отметить долг как погашенный?', async ok => {
+          if (!ok) return;
+          btn.disabled = true;
+          try {
+            await api('/api/orders/mark_paid', { order_id: id });
+            tg.HapticFeedback?.notificationOccurred('success');
+            await renderDebts();
+          } catch (e) {
+            tg.HapticFeedback?.notificationOccurred('error');
+            tg.showAlert('❌ ' + e.message);
+            btn.disabled = false;
+          }
+        });
+      });
+    });
+  } catch (e) {
+    content.innerHTML = `<div class="error">❌ ${e.message || e}</div>`;
+  }
+}
+
+// Маленький хелпер — дата YYYY-MM-DD → ДД.ММ.ГГГГ
+function formatDateRU(iso) {
+  if (!iso || iso.length < 10) return iso || '—';
+  const [y, m, d] = iso.slice(0, 10).split('-');
+  return `${d}.${m}.${y}`;
+}
+
 
 // Запуск
 init()

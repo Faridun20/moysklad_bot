@@ -190,16 +190,19 @@ def init_db():
             )""",
 
             f"""CREATE TABLE IF NOT EXISTS orders (
-                id          {id_type},
-                user_id     BIGINT NOT NULL,
-                full_name   TEXT,
-                status      TEXT NOT NULL DEFAULT 'draft',
-                comment     TEXT,
-                agent_id    TEXT,
-                agent_name  TEXT,
-                currency    TEXT,
-                created_at  TEXT NOT NULL,
-                updated_at  TEXT NOT NULL
+                id            {id_type},
+                user_id       BIGINT NOT NULL,
+                full_name     TEXT,
+                status        TEXT NOT NULL DEFAULT 'draft',
+                comment       TEXT,
+                agent_id      TEXT,
+                agent_name    TEXT,
+                currency      TEXT,
+                payment_type  TEXT NOT NULL DEFAULT 'paid',
+                due_date      TEXT,
+                paid_at       TEXT,
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL
             )""",
 
             f"""CREATE TABLE IF NOT EXISTS order_items (
@@ -307,6 +310,18 @@ def init_db():
             # Хранится на уровне ордера, чтобы все позиции одного заказа
             # были в одной валюте.
             ("orders", "currency", "TEXT"),
+            # Тип оплаты: 'paid' (оплачено сразу) или 'credit' (в долг).
+            # Default 'paid' — все старые заказы считаем как оплаченные,
+            # чтобы миграция была безопасной (не объявить вдруг весь
+            # архив должниками).
+            ("orders", "payment_type", "TEXT NOT NULL DEFAULT 'paid'"),
+            # Дата к которой клиент обязался погасить долг (ISO YYYY-MM-DD).
+            # Заполняется только когда payment_type='credit', NULL иначе.
+            ("orders", "due_date", "TEXT"),
+            # Когда долг был погашен (ISO YYYY-MM-DD HH:MM:SS). NULL пока
+            # не погашен. Для 'paid' заказов также NULL — там оплата
+            # сразу, отдельный timestamp не нужен (есть created_at).
+            ("orders", "paid_at", "TEXT"),
         ]
         for table, column, col_type in migrations:
             try:
@@ -315,11 +330,15 @@ def init_db():
             except Exception:
                 conn.rollback()  # Колонка уже существует — норм
 
-        # Индексы для snapshot-таблиц
+        # Индексы для snapshot-таблиц + поиска долгов
         snapshot_indexes = [
             "CREATE INDEX IF NOT EXISTS idx_ms_products_folder ON ms_products(folder_id)",
             "CREATE INDEX IF NOT EXISTS idx_ms_stock_folder ON ms_stock(folder_id)",
             "CREATE INDEX IF NOT EXISTS idx_ms_categories_parent ON ms_categories(parent_id)",
+            # Каждое утреннее уведомление о долгах сканирует все credit-заказы
+            # с paid_at IS NULL. Без индекса — full scan по orders, при тысячах
+            # записей это секунды. Составной индекс покрывает фильтр и сортировку.
+            "CREATE INDEX IF NOT EXISTS idx_orders_credit_due ON orders(payment_type, paid_at, due_date)",
         ]
         for sql in snapshot_indexes:
             try:
@@ -759,6 +778,120 @@ def update_order_agent(order_id: int, agent_id: str, agent_name: str) -> bool:
         updated = cur.rowcount > 0
         conn.commit()
     return updated
+
+
+def set_order_payment(
+    order_id: int,
+    payment_type: str,
+    due_date: str | None = None,
+) -> bool:
+    """Установить тип оплаты заказа (paid|credit).
+
+    Для credit обязателен due_date (ISO YYYY-MM-DD) — дата к которой
+    клиент обязался погасить долг. Для paid due_date игнорируется
+    и обнуляется (на случай если заказ переводят из credit обратно).
+
+    Не сбрасывает paid_at — закрытый долг остаётся закрытым.
+    """
+    if payment_type not in ("paid", "credit"):
+        return False
+    if payment_type == "credit" and not due_date:
+        return False
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        if payment_type == "paid":
+            cur.execute(
+                q(
+                    "UPDATE orders SET payment_type = ?, due_date = NULL, "
+                    "updated_at = ? WHERE id = ?"
+                ),
+                (payment_type, now_str(), order_id),
+            )
+        else:
+            cur.execute(
+                q(
+                    "UPDATE orders SET payment_type = ?, due_date = ?, "
+                    "updated_at = ? WHERE id = ?"
+                ),
+                (payment_type, due_date, now_str(), order_id),
+            )
+        updated = cur.rowcount > 0
+        conn.commit()
+    return updated
+
+
+def mark_order_paid(
+    order_id: int,
+    marked_by: int,
+    marked_by_name: str,
+) -> bool:
+    """Закрыть долг по credit-заказу: проставить paid_at = now().
+
+    Идемпотентно: если paid_at уже стоит — ничего не делаем и
+    возвращаем False (чтобы не писать дублирующий audit-log).
+    Также возвращает False если заказ не credit или не существует.
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "UPDATE orders SET paid_at = ?, updated_at = ? "
+                "WHERE id = ? AND payment_type = 'credit' AND paid_at IS NULL"
+            ),
+            (now_str(), now_str(), order_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    if updated:
+        order = get_order(order_id)
+        details = (
+            f"Долг по заказу #{order_id} погашен "
+            f"(клиент: {order.get('agent_name') or '—'})"
+            if order else f"Долг по заказу #{order_id} погашен"
+        )
+        add_audit_log(
+            marked_by, marked_by_name, get_role(marked_by),
+            "debt_paid",
+            details,
+        )
+    return updated
+
+
+def get_open_debts(
+    user_id: int | None = None,
+    due_through: str | None = None,
+) -> list[dict]:
+    """Список открытых долгов (credit + paid_at IS NULL).
+
+    Параметры:
+      user_id      — если указан, отдаём только долги этого менеджера;
+                     иначе все долги (для boss/admin).
+      due_through  — ISO YYYY-MM-DD; вернуть только долги с due_date <=
+                     этой даты (т.е. «к оплате на сегодня и просроченные»).
+                     None — отдаём все открытые без фильтра по дате.
+
+    Сортировка: сначала просроченные (старая due_date), потом сегодняшние.
+    Это удобно и для UI, и для уведомлений.
+    """
+    query = (
+        "SELECT * FROM orders "
+        "WHERE payment_type = 'credit' AND paid_at IS NULL "
+        "AND status IN ('approved', 'shipped')"
+    )
+    params: list = []
+    if user_id is not None:
+        query += " AND user_id = ?"
+        params.append(user_id)
+    if due_through is not None:
+        query += " AND due_date IS NOT NULL AND due_date <= ?"
+        params.append(due_through)
+    query += " ORDER BY due_date ASC NULLS LAST, id ASC" if USE_POSTGRES \
+        else " ORDER BY CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, due_date ASC, id ASC"
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q(query), params)
+        rows = cur.fetchall()
+    return [dict(r) for r in rows]
 
 
 def update_order_currency(order_id: int, currency: str) -> bool:
