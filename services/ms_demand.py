@@ -215,6 +215,10 @@ async def create_demand_from_request(
         "positions": positions,
         "moment": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.000"),
         "description": _build_description(order, telegram_full_name),
+        # applicable=false — отгрузка создаётся черновиком, остатки не
+        # списываются. Складской руками проводит документ когда реально
+        # отгрузил товар.
+        "applicable": False,
     }
 
     # Кастомный атрибут «кто оформил через бота»
