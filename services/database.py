@@ -382,29 +382,70 @@ def init_db():
                 conn.rollback()
                 logger.debug("Индекс не создан: %s", e)
 
-        # ─── Backfill для подтверждений оплаты ────────────────────────
-        # Включаем подтверждение оплаты боссом. Раньше менеджер просто
-        # ставил paid_at и долг считался закрытым; теперь нужен второй
-        # шаг (подтверждение). Для уже закрытых долгов подтверждаем
-        # автоматически (paid_confirmed_at = paid_at) — иначе они
-        # окажутся «висящими» и завалят боссу очередь подтверждений.
-        # Идемпотентно: только записи где paid_at стоит, а confirmed —
-        # нет. На свежей БД эффект = 0 строк.
+        # ─── Backfill для подтверждений оплаты (только legacy) ────────
+        # Когда был добавлен двухступенчатый workflow (paid_at →
+        # paid_confirmed_at), нужно было закрыть исторические долги:
+        # для них paid_at = «полностью оплачено», и без backfill они бы
+        # повисли «требуют подтверждения».
+        #
+        # ВАЖНО: после добавления частичных платежей `paid_at` стал
+        # значить «менеджер отметил ХОТЯ БЫ ОДИН платёж», а не «всё
+        # закрыто». Если бы мы backfill'или такие заказы, частичные
+        # долги исчезали бы из списка после каждого редеплоя. Поэтому
+        # backfill теперь применяется ТОЛЬКО к legacy-заказам, у которых
+        # вообще нет записей в payments — они точно из старой эпохи.
         try:
             cur.execute(
                 "UPDATE orders "
                 "SET paid_confirmed_at = paid_at, "
                 "    paid_confirmed_by = user_id, "
                 "    paid_confirmed_by_name = COALESCE(full_name, '') "
-                "WHERE paid_at IS NOT NULL AND paid_confirmed_at IS NULL"
+                "WHERE paid_at IS NOT NULL AND paid_confirmed_at IS NULL "
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM payments WHERE order_id = orders.id"
+                "  )"
             )
             rows = cur.rowcount
             conn.commit()
             if rows > 0:
-                logger.info("Backfill: %d ранее закрытых долгов автоподтверждены", rows)
+                logger.info("Backfill legacy: %d закрытых долгов автоподтверждены", rows)
         except Exception as e:
             conn.rollback()
             logger.warning("Backfill paid_confirmed: %s", e)
+
+        # ─── Recovery: восстановить долги, ошибочно закрытые старым backfill'ом ──
+        # Заказы где paid_confirmed_at стоит, но фактически сумма confirmed
+        # платежей < total заказа — backfill сработал ошибочно (см. выше).
+        # Откатываем paid_confirmed_at в NULL, долг возвращается в список.
+        # Запросом обходим оба драйвера (Postgres и SQLite оба понимают
+        # скалярные subqueries).
+        try:
+            cur.execute(
+                "UPDATE orders "
+                "SET paid_confirmed_at = NULL, "
+                "    paid_confirmed_by = NULL, "
+                "    paid_confirmed_by_name = NULL "
+                "WHERE paid_confirmed_at IS NOT NULL "
+                "  AND EXISTS (SELECT 1 FROM payments WHERE order_id = orders.id) "
+                "  AND ("
+                "    (SELECT COALESCE(SUM(amount), 0) FROM payments "
+                "     WHERE order_id = orders.id AND status = 'confirmed')"
+                "    <"
+                "    (SELECT COALESCE(SUM(quantity * price), 0) FROM order_items "
+                "     WHERE order_id = orders.id) - 0.01"
+                "  )"
+            )
+            rows = cur.rowcount
+            conn.commit()
+            if rows > 0:
+                logger.warning(
+                    "Recovery: %d ошибочно закрытых долгов восстановлены "
+                    "(см. историю — backfill закрыл частично оплаченные)",
+                    rows,
+                )
+        except Exception as e:
+            conn.rollback()
+            logger.warning("Recovery paid_confirmed: %s", e)
 
     logger.info("База данных инициализирована")
     _load_predefined_users()
