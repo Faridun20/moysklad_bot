@@ -11,6 +11,21 @@ def extract_id_from_href(href: str) -> str:
     return href.rstrip("/").split("/")[-1]
 
 
+def user_safe_error(e: Exception, context: str = "") -> str:
+    """
+    Сообщение об ошибке, безопасное для отправки пользователю.
+
+    Полное исключение пишется в лог через logger.exception, юзеру
+    показываем generic-текст без внутренностей (имена таблиц, MS API
+    payload, пути файлов и т.п. могли утечь в `<code>{e}</code>`).
+    """
+    import logging
+    logging.getLogger(__name__).exception(
+        "user-visible error (%s): %s", context, e
+    )
+    return "❌ Произошла внутренняя ошибка. Попробуйте позже или обратитесь к админу."
+
+
 def safe_get(obj, *path, default=None):
     """
     Безопасно достать значение по цепочке ключей:

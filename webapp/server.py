@@ -16,6 +16,23 @@ from fastapi.staticfiles import StaticFiles
 from webapp.auth import verify_init_data
 from services.database import get_role
 
+
+def _authorize(data: dict, allowed_roles: tuple[str, ...] = ("admin", "boss", "manager")) -> dict:
+    """
+    Общая проверка для API endpoint'ов: валидируем initData и роль.
+
+    Возвращает dict-юзера из Telegram. Бросает HTTPException на любой
+    отказ. Используйте вместо того, чтобы дублировать verify_init_data +
+    get_role + role-check в каждом endpoint'е (легко забыть).
+    """
+    user = verify_init_data(data.get("initData", ""))
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+    role = get_role(user["id"])
+    if role not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Нет доступа")
+    return user
+
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -565,11 +582,10 @@ async def api_payments_send(request: Request):
     import aiohttp
 
     data = await request.json()
-    user = verify_init_data(data.get("initData", ""))
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+    # Только manager+ (раньше эндпоинт принимал любого верифицированного
+    # юзера — random Telegram-юзер мог спамить платежами в Telegram бoссу).
+    user = _authorize(data, allowed_roles=("admin", "boss", "manager"))
 
-    # Валидация
     try:
         amount = float(data.get("amount", 0))
         if amount <= 0:
@@ -886,9 +902,7 @@ async def api_agents(request: Request):
     from services.moysklad import ms_get
 
     data = await request.json()
-    user = verify_init_data(data.get("initData", ""))
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+    user = _authorize(data, allowed_roles=("admin", "boss", "manager"))
 
     search = (data.get("search", "") or "").strip()
     rows = snapshot.get_counterparties(search=search if search else None, limit=50)

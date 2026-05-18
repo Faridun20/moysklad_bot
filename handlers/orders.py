@@ -10,8 +10,17 @@
 6. Менеджер получает уведомление
 """
 
+import html
 import logging
 from datetime import datetime
+
+
+def _esc(s) -> str:
+    """HTML-escape для пользовательских строк перед вставкой в bot-сообщения
+    с parse_mode='HTML'. Имя товара/клиента/менеджера может прилететь с
+    `<` или `&` (например, через UI МойСклад), и без escape сообщение
+    либо ломалось бы, либо открывало путь к HTML-инъекции."""
+    return html.escape(str(s or ""), quote=False)
 
 from aiogram import Bot, Router, F
 from aiogram.filters import Command
@@ -31,7 +40,7 @@ from services.database import (
 )
 from services.moysklad import get_all_stock, get_categories, ms_get
 from services.notifier import get_notify_recipients, send_to_recipients
-from utils.helpers import extract_id_from_href, extract_href, safe_get
+from utils.helpers import extract_id_from_href, extract_href, safe_get, user_safe_error
 from utils.formatters import DIV, DIV2
 
 logger = logging.getLogger(__name__)
@@ -83,14 +92,17 @@ def _fmt_num(n: float) -> str:
 def format_order(order: dict, items: list[dict]) -> str:
     status_emoji = STATUS_EMOJI.get(order["status"], "📋")
     status_name  = STATUS_NAME.get(order["status"], order["status"])
-    agent_str    = f"\n👤 Клиент: <b>{order['agent_name']}</b>" if order.get("agent_name") else ""
-    comment_str  = f"\n📝 {order['comment']}" if order.get("comment") else ""
+    agent_str    = (
+        f"\n👤 Клиент: <b>{_esc(order['agent_name'])}</b>"
+        if order.get("agent_name") else ""
+    )
+    comment_str  = f"\n📝 {_esc(order['comment'])}" if order.get("comment") else ""
 
     lines = [
         DIV,
-        f"{status_emoji} <b>Заказ #{order['id']}</b>   <code>{status_name}</code>",
-        f"<code>{order['created_at'][:16]}</code>",
-        f"👤 Менеджер: {order['full_name']}{agent_str}{comment_str}",
+        f"{status_emoji} <b>Заказ #{order['id']}</b>   <code>{_esc(status_name)}</code>",
+        f"<code>{_esc(order['created_at'][:16])}</code>",
+        f"👤 Менеджер: {_esc(order['full_name'])}{agent_str}{comment_str}",
         "",
     ]
 
@@ -99,18 +111,19 @@ def format_order(order: dict, items: list[dict]) -> str:
         lines.append(DIV2)
         total_items = len(items)
         for i, item in enumerate(items[:10]):
-            note_str = f"  <i>{item['note']}</i>" if item.get("note") else ""
+            note_str = f"  <i>{_esc(item['note'])}</i>" if item.get("note") else ""
             price = float(item.get("price", 0) or 0)
             qty = float(item.get("quantity", 0))
+            unit = _esc(item.get("unit") or "шт")
             if price > 0:
                 price_str = (
-                    f"     <code>{_fmt_num(qty)} {item['unit']} × "
+                    f"     <code>{_fmt_num(qty)} {unit} × "
                     f"{_fmt_num(price)} = {_fmt_num(qty * price)}</code>"
                 )
             else:
-                price_str = f"     <code>{_fmt_num(qty)} {item['unit']}</code>"
+                price_str = f"     <code>{_fmt_num(qty)} {unit}</code>"
             lines.append(
-                f"  {i+1}. <b>{item['product_name']}</b>\n{price_str}{note_str}"
+                f"  {i+1}. <b>{_esc(item['product_name'])}</b>\n{price_str}{note_str}"
             )
         if total_items > 10:
             lines.append(f"  <i>...и ещё {total_items - 10} позиций</i>")
@@ -128,30 +141,33 @@ def format_order(order: dict, items: list[dict]) -> str:
 def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
     """Сообщение боссу о новой заявке. Видны цены — нужны для апрува."""
     lines = []
-    grand_total = 0.0
     for it in items[:10]:
         qty = float(it.get("quantity", 0))
         price = float(it.get("price", 0) or 0)
         sub = qty * price
-        grand_total += sub
+        name = _esc(it["product_name"])
+        unit = _esc(it.get("unit") or "шт")
         if price > 0:
             lines.append(
-                f"  • {it['product_name']}: {_fmt_num(qty)} {it['unit']} "
+                f"  • {name}: {_fmt_num(qty)} {unit} "
                 f"× {_fmt_num(price)} = <b>{_fmt_num(sub)}</b>"
             )
         else:
             lines.append(
-                f"  • {it['product_name']}: {_fmt_num(qty)} {it['unit']} "
+                f"  • {name}: {_fmt_num(qty)} {unit} "
                 f"<i>(цена не указана)</i>"
             )
     items_text = "\n".join(lines)
-    # Считаем итог по всем позициям (а не только по первым 10 в выводе)
+    # Итог по всем позициям (не только по первым 10 в выводе)
     grand_total = sum(_line_total(it) for it in items)
     if len(items) > 10:
         items_text += f"\n  ...и ещё {len(items) - 10} поз."
 
-    agent_str = f"\n👤 Клиент: <b>{order['agent_name']}</b>" if order.get("agent_name") else ""
-    comment_str = f"\n📝 {order['comment']}" if order.get("comment") else ""
+    agent_str = (
+        f"\n👤 Клиент: <b>{_esc(order['agent_name'])}</b>"
+        if order.get("agent_name") else ""
+    )
+    comment_str = f"\n📝 {_esc(order['comment'])}" if order.get("comment") else ""
     total_str = (
         f"\n\n<b>💰 Итого: {_fmt_num(grand_total)}</b>"
         if grand_total > 0 else ""
@@ -161,7 +177,7 @@ def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
         f"{DIV}\n"
         f"🔔 <b>Новая заявка на отгрузку #{req_id}</b>\n"
         f"\n"
-        f"👨‍💼 Менеджер: <b>{order['full_name']}</b>{agent_str}{comment_str}\n"
+        f"👨‍💼 Менеджер: <b>{_esc(order['full_name'])}</b>{agent_str}{comment_str}\n"
         f"\n"
         f"<b>📦 Товары:</b>\n{items_text}"
         f"{total_str}"
@@ -322,13 +338,23 @@ async def cb_new_order(call: CallbackQuery):
 @router.callback_query(F.data.startswith("ord_view:"))
 async def cb_view_order(call: CallbackQuery):
     await call.answer()
-    order_id = int(call.data.split(":")[1])
+    try:
+        order_id = int(call.data.split(":")[1])
+    except (IndexError, ValueError):
+        return await call.message.answer("❌ Некорректный запрос.")
+
     order = get_order(order_id)
     if not order:
         return await call.message.answer("❌ Заказ не найден.")
 
-    items = get_order_items(order_id)
+    # Защита от информации utечки: видеть заказ может только владелец
+    # или босс/админ. Раньше любой Telegram-юзер с угадаенным ID видел
+    # содержимое заявок чужой компании.
     is_owner = order["user_id"] == call.from_user.id
+    if not is_owner and not is_boss(call.from_user.id):
+        return await call.message.answer("⛔ Нет доступа к этому заказу.")
+
+    items = get_order_items(order_id)
     txt = format_order(order, items)
     kb = order_actions_keyboard(order_id, order["status"], is_owner)
     await call.message.answer(txt, parse_mode="HTML", reply_markup=kb)
@@ -369,7 +395,7 @@ async def cb_add_item(call: CallbackQuery, state: FSMContext):
             reply_markup=kb.as_markup(),
         )
     except Exception as e:
-        await call.message.answer(f"❌ Ошибка загрузки каталога:\n<code>{e}</code>", parse_mode="HTML")
+        await call.message.answer(user_safe_error(e, "ord_add catalog"))
 
 
 @router.callback_query(F.data.startswith("cat_pick:"))
@@ -428,7 +454,7 @@ async def cb_cat_pick(call: CallbackQuery, state: FSMContext):
             reply_markup=kb.as_markup(),
         )
     except Exception as e:
-        await call.message.answer(f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML")
+        await call.message.answer(user_safe_error(e, "cat_pick"))
 
 
 @router.callback_query(F.data.startswith("prod_pick:"), OrderState.choosing_product)
@@ -591,7 +617,7 @@ async def cb_choose_agent(call: CallbackQuery, state: FSMContext):
             reply_markup=kb.as_markup(),
         )
     except Exception as e:
-        await call.message.answer(f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML")
+        await call.message.answer(user_safe_error(e, "choose_agent"))
 
 
 @router.callback_query(F.data.startswith("agent_pick:"), OrderState.choosing_agent)
@@ -762,7 +788,14 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
         return await call.answer("⚠️ Заявка уже обработана", show_alert=True)
 
     boss_name = call.from_user.full_name or str(call.from_user.id)
-    approve_shipment_request(req_id, call.from_user.id, boss_name)
+    # Атомарный UPDATE ... WHERE status='pending' — защита от race condition
+    # когда два босса одновременно жмут «Одобрить». Только один из них
+    # получит rowcount==1, остальные — False, и мы прервёмся.
+    ok = approve_shipment_request(req_id, call.from_user.id, boss_name)
+    if not ok:
+        return await call.answer(
+            "⚠️ Заявка уже обработана другим пользователем", show_alert=True
+        )
     await call.answer("✅ Заявка одобрена")
 
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
@@ -848,7 +881,11 @@ async def cb_reject_request(call: CallbackQuery, bot: Bot):
         return await call.answer("⚠️ Заявка уже обработана", show_alert=True)
 
     boss_name = call.from_user.full_name or str(call.from_user.id)
-    reject_shipment_request(req_id, call.from_user.id, boss_name)
+    ok = reject_shipment_request(req_id, call.from_user.id, boss_name)
+    if not ok:
+        return await call.answer(
+            "⚠️ Заявка уже обработана другим пользователем", show_alert=True
+        )
     await call.answer("❌ Заявка отклонена")
 
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
