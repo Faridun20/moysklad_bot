@@ -3,6 +3,7 @@
 """
 
 import os
+import time
 import logging
 from datetime import datetime
 from contextlib import contextmanager
@@ -15,6 +16,10 @@ _default_db = os.path.join(tempfile.gettempdir(), "payments.db")
 DB_PATH = os.environ.get("DB_PATH", _default_db)
 USE_POSTGRES = bool(DATABASE_URL)
 
+# Логировать запросы дольше N мс (предупреждение).
+# 0 — выключено. Управляется переменной окружения SQL_SLOW_MS.
+SQL_SLOW_MS = float(os.environ.get("SQL_SLOW_MS", "200"))
+
 if USE_POSTGRES:
     import psycopg2
     from psycopg2.extras import RealDictCursor
@@ -22,6 +27,37 @@ if USE_POSTGRES:
 else:
     import sqlite3
     logger.info("Используется SQLite: %s", DB_PATH)
+
+
+class _TimedCursor:
+    """Прозрачная обёртка над курсором: засекает время execute()
+    и логирует запросы дольше SQL_SLOW_MS."""
+
+    __slots__ = ("_cur",)
+
+    def __init__(self, cur):
+        self._cur = cur
+
+    def execute(self, query, params=None):
+        if SQL_SLOW_MS <= 0:
+            return self._cur.execute(query, params) if params is not None else self._cur.execute(query)
+        start = time.perf_counter()
+        try:
+            if params is not None:
+                return self._cur.execute(query, params)
+            return self._cur.execute(query)
+        finally:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            if elapsed_ms >= SQL_SLOW_MS:
+                short = " ".join(query.split())[:120]
+                logger.warning("SQL slow %.0f ms: %s", elapsed_ms, short)
+
+    def executemany(self, query, seq):
+        return self._cur.executemany(query, seq)
+
+    def __getattr__(self, name):
+        # fetchone / fetchall / lastrowid / rowcount / close / __iter__ и т.д.
+        return getattr(self._cur, name)
 
 
 @contextmanager
@@ -43,8 +79,10 @@ def get_conn():
 
 def get_cursor(conn):
     if USE_POSTGRES:
-        return conn.cursor(cursor_factory=RealDictCursor)
-    return conn.cursor()
+        raw = conn.cursor(cursor_factory=RealDictCursor)
+    else:
+        raw = conn.cursor()
+    return _TimedCursor(raw)
 
 
 def q(query: str) -> str:
@@ -500,6 +538,21 @@ def get_order(order_id: int) -> dict | None:
         cur.execute(q("SELECT * FROM orders WHERE id = ?"), (order_id,))
         row = cur.fetchone()
     return dict(row) if row else None
+
+
+def get_orders_by_ids(order_ids: list[int]) -> dict[int, dict]:
+    """Батч-загрузка заказов по id → словарь {id: order_dict}."""
+    if not order_ids:
+        return {}
+    placeholders = ",".join(["?"] * len(order_ids))
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(f"SELECT * FROM orders WHERE id IN ({placeholders})"),
+            list(order_ids),
+        )
+        rows = cur.fetchall()
+    return {r["id"]: dict(r) for r in rows}
 
 
 def get_user_orders(user_id: int, status: str = None) -> list[dict]:

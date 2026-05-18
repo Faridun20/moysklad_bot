@@ -2,11 +2,16 @@
 Все запросы к API МойСклад
 """
 
+import asyncio
+import logging
+import time
 import aiohttp
 from datetime import datetime
 
 from config import MS_TOKEN
 from utils.helpers import extract_id_from_href
+
+logger = logging.getLogger(__name__)
 
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 MS_HEADERS = {
@@ -15,36 +20,134 @@ MS_HEADERS = {
     "Content-Type": "application/json",
 }
 
+# Таймаут на любой запрос к МойСклад
+_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
-async def ms_get(session: aiohttp.ClientSession, path: str, params: dict = None):
+# Персистентная сессия — создаётся один раз на старте бота.
+_session: aiohttp.ClientSession | None = None
+_session_lock = asyncio.Lock()
+
+
+async def get_session() -> aiohttp.ClientSession:
+    """Вернуть глобальную сессию, создавая её при первом обращении."""
+    global _session
+    if _session is None or _session.closed:
+        async with _session_lock:
+            if _session is None or _session.closed:
+                connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+                _session = aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=_HTTP_TIMEOUT,
+                    headers=MS_HEADERS,
+                )
+    return _session
+
+
+async def close_session() -> None:
+    """Закрыть сессию при остановке бота."""
+    global _session
+    if _session is not None and not _session.closed:
+        await _session.close()
+    _session = None
+
+
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY = 0.5  # сек, удваивается на каждой попытке
+# 429 — rate limit; 5xx — временный сбой на стороне МойСклад
+_RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+
+async def ms_get(path: str, params: dict = None, session: aiohttp.ClientSession = None):
+    """GET с ретраями: сетевые ошибки, таймауты и 429/5xx."""
+    sess = session if session is not None else await get_session()
     url = f"{MS_BASE}/{path}"
-    async with session.get(url, headers=MS_HEADERS, params=params) as resp:
-        resp.raise_for_status()
-        return await resp.json()
+    last_exc: Exception | None = None
+
+    for attempt in range(_MAX_RETRIES):
+        try:
+            async with sess.get(url, params=params) as resp:
+                if resp.status in _RETRY_STATUSES and attempt < _MAX_RETRIES - 1:
+                    # МойСклад возвращает Retry-After для 429 — уважаем его
+                    retry_after = resp.headers.get("Retry-After")
+                    delay = (
+                        float(retry_after) if retry_after and retry_after.isdigit()
+                        else _RETRY_BASE_DELAY * (2 ** attempt)
+                    )
+                    logger.warning(
+                        "MS %s → %s, retry %d/%d через %.1fs",
+                        path, resp.status, attempt + 1, _MAX_RETRIES, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                resp.raise_for_status()
+                return await resp.json()
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+            last_exc = e
+            if attempt >= _MAX_RETRIES - 1:
+                break
+            delay = _RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(
+                "MS %s → %s, retry %d/%d через %.1fs",
+                path, type(e).__name__, attempt + 1, _MAX_RETRIES, delay,
+            )
+            await asyncio.sleep(delay)
+
+    # Все попытки исчерпаны
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"MoyСклад {path}: исчерпаны {_MAX_RETRIES} попыток")
+
+
+# ─── TTL-кэш для тяжёлого get_all_stock ──────────────────────────────────────
+
+_STOCK_TTL = 30  # сек
+_stock_cache: dict = {"ts": 0.0, "data": None}
+_stock_lock = asyncio.Lock()
+
+
+def invalidate_stock_cache() -> None:
+    """Сбросить кэш склада (например, после успешной отгрузки)."""
+    _stock_cache["ts"] = 0.0
+    _stock_cache["data"] = None
 
 
 async def get_all_stock() -> list[dict]:
-    """Получить все остатки со всех страниц."""
-    all_rows = []
-    offset = 0
-    limit = 100
-    async with aiohttp.ClientSession() as session:
+    """Получить все остатки со всех страниц (с TTL-кэшем)."""
+    now = time.monotonic()
+    if _stock_cache["data"] is not None and now - _stock_cache["ts"] < _STOCK_TTL:
+        return _stock_cache["data"]
+
+    async with _stock_lock:
+        # Кто-то мог обновить кэш, пока мы ждали лок
+        now = time.monotonic()
+        if _stock_cache["data"] is not None and now - _stock_cache["ts"] < _STOCK_TTL:
+            return _stock_cache["data"]
+
+        all_rows = []
+        offset = 0
+        limit = 100
+        sess = await get_session()
         while True:
             data = await ms_get(
-                session, "report/stock/all", params={"limit": limit, "offset": offset}
+                "report/stock/all",
+                params={"limit": limit, "offset": offset},
+                session=sess,
             )
             rows = data if isinstance(data, list) else data.get("rows", [])
             all_rows.extend(rows)
             if len(rows) < limit:
                 break
             offset += limit
-    return [r for r in all_rows if r.get("stock", 0) != 0]
+
+        result = [r for r in all_rows if r.get("stock", 0) != 0]
+        _stock_cache["data"] = result
+        _stock_cache["ts"] = time.monotonic()
+        return result
 
 
 async def get_categories() -> list[dict]:
     """Получить список категорий товаров."""
-    async with aiohttp.ClientSession() as session:
-        data = await ms_get(session, "entity/productfolder", params={"limit": 100})
+    data = await ms_get("entity/productfolder", params={"limit": 100})
     return data if isinstance(data, list) else data.get("rows", [])
 
 
@@ -55,28 +158,24 @@ async def get_shipments(since: datetime, until: datetime = None) -> list[dict]:
     if until:
         until_str = until.strftime("%Y-%m-%d %H:%M:%S.000")
         filter_str += f";moment<{until_str}"
-    async with aiohttp.ClientSession() as session:
-        data = await ms_get(
-            session,
-            "entity/demand",
-            params={
-                "filter": filter_str,
-                "expand": "agent,owner",
-                "order": "moment,desc",
-                "limit": 100,
-            },
-        )
+    data = await ms_get(
+        "entity/demand",
+        params={
+            "filter": filter_str,
+            "expand": "agent,owner",
+            "order": "moment,desc",
+            "limit": 100,
+        },
+    )
     return data if isinstance(data, list) else data.get("rows", [])
 
 
 async def get_shipment_positions(demand_id: str) -> list[dict]:
     """Получить позиции (товары) конкретной отгрузки."""
-    async with aiohttp.ClientSession() as session:
-        data = await ms_get(
-            session,
-            f"entity/demand/{demand_id}/positions",
-            params={"limit": 100, "expand": "assortment,uom"},
-        )
+    data = await ms_get(
+        f"entity/demand/{demand_id}/positions",
+        params={"limit": 100, "expand": "assortment,uom"},
+    )
     return data if isinstance(data, list) else data.get("rows", [])
 
 
@@ -138,17 +237,15 @@ async def get_employee_shipments(
     if employee_href:
         filter_str += f";owner={employee_href}"
 
-    async with aiohttp.ClientSession() as session:
-        data = await ms_get(
-            session,
-            "entity/demand",
-            params={
-                "filter": filter_str,
-                "expand": "agent,owner",
-                "order": "moment,desc",
-                "limit": 100,
-            },
-        )
+    data = await ms_get(
+        "entity/demand",
+        params={
+            "filter": filter_str,
+            "expand": "agent,owner",
+            "order": "moment,desc",
+            "limit": 100,
+        },
+    )
     return data if isinstance(data, list) else data.get("rows", [])
 
 

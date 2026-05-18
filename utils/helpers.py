@@ -11,6 +11,27 @@ def extract_id_from_href(href: str) -> str:
     return href.rstrip("/").split("/")[-1]
 
 
+def safe_get(obj, *path, default=None):
+    """
+    Безопасно достать значение по цепочке ключей:
+        safe_get(row, "folder", "meta", "href", default="")
+    вместо row.get("folder", {}).get("meta", {}).get("href", "").
+    """
+    cur = obj
+    for key in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key)
+        if cur is None:
+            return default
+    return cur
+
+
+def extract_href(obj, *path) -> str:
+    """Кратко: вытащить href по вложенному пути (часто `meta.href`)."""
+    return safe_get(obj, *path, "meta", "href", default="") or ""
+
+
 def get_folder_name(folder: dict) -> str:
     return folder.get("name", "") if folder else ""
 
