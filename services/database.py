@@ -295,17 +295,27 @@ def _migrate(cur):
 
 
 def get_role(user_id: int) -> str:
+    """
+    Вернуть роль пользователя из БД. Если строки нет — возвращаем 'guest'
+    (нулевые права). Это означает, что любая попытка вызвать handler с
+    проверкой роли тут же отклонит непривилегированного пользователя.
+    Раньше default был 'manager', что фактически открывало бота миру.
+    """
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return "guest"
     with get_conn() as conn:
         cur = get_cursor(conn)
-        cur.execute(q("SELECT role FROM user_roles WHERE user_id = ?"), (user_id,))
+        cur.execute(q("SELECT role FROM user_roles WHERE user_id = ?"), (uid,))
         row = cur.fetchone()
     if not row:
-        return "manager"  # По умолчанию — менеджер (не employee!)
+        return "guest"
     return row["role"] if USE_POSTGRES else row[0]
 
 
 def set_role(user_id: int, username: str, full_name: str, role: str) -> bool:
-    valid_roles = ("admin", "boss", "manager")  # employee убран
+    valid_roles = ("admin", "boss", "manager", "guest")
     if role not in valid_roles:
         return False
     with get_conn() as conn:
@@ -349,7 +359,20 @@ def get_user(user_id: int) -> dict | None:
 
 
 def ensure_user(user_id: int, username: str, full_name: str, admin_ids: list[int]):
-    from config import BOSS_IDS
+    """
+    Создать запись о пользователе если её нет; обновить имя/username если есть.
+
+    Правила выбора роли для НОВЫХ пользователей:
+      - В ADMIN_IDS  → admin
+      - В BOSS_IDS   → boss
+      - В ALLOWED_USERS (если этот env задан) → manager
+      - Если ALLOWED_USERS НЕ задан (пустой) → manager (backward compat)
+      - Иначе → guest (нулевые права, нужно повысить через /addrole)
+
+    Раньше всем по умолчанию ставили 'manager' — это открывало бот любому
+    Telegram-юзеру, который найдёт его @username.
+    """
+    from config import BOSS_IDS, ALLOWED_USERS
 
     with get_conn() as conn:
         cur = get_cursor(conn)
@@ -364,13 +387,18 @@ def ensure_user(user_id: int, username: str, full_name: str, admin_ids: list[int
             conn.commit()
             return
 
-        # Определяем роль
         if user_id in admin_ids:
             role = "admin"
         elif user_id in BOSS_IDS:
             role = "boss"
+        elif ALLOWED_USERS and user_id in ALLOWED_USERS:
+            role = "manager"
+        elif not ALLOWED_USERS:
+            # Whitelist не настроен — оставляем старое поведение,
+            # чтобы не сломать существующие развёртки одним deploy-ом.
+            role = "manager"
         else:
-            role = "manager"  # Все новые — менеджеры
+            role = "guest"
 
         cur.execute(
             q("INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, ?, ?, ?)"),

@@ -9,29 +9,38 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 from urllib.parse import parse_qsl
 
 from config import TELEGRAM_TOKEN
 
 logger = logging.getLogger(__name__)
 
+# Максимальный возраст initData — 24 часа. Перехваченный initData старше
+# 24 часов считается просроченным и отвергается, защита от replay-атак.
+# Telegram официально рекомендует <= 86400 секунд.
+MAX_INIT_DATA_AGE = 86400
+
 
 def verify_init_data(init_data: str) -> dict | None:
     """
     Проверить подпись initData.
     Возвращает словарь с данными пользователя если всё ок, иначе None.
+
+    Проверки:
+      1. Подпись HMAC-SHA256 совпадает (timing-safe сравнение)
+      2. auth_date не старше MAX_INIT_DATA_AGE (защита от replay)
+      3. Поле user парсится как JSON
     """
     if not init_data:
         return None
 
     try:
-        # Парсим query string
         parsed = dict(parse_qsl(init_data, strict_parsing=True))
         received_hash = parsed.pop("hash", None)
         if not received_hash:
             return None
 
-        # Собираем строку для проверки подписи
         data_check_string = "\n".join(
             f"{k}={v}" for k, v in sorted(parsed.items())
         )
@@ -43,7 +52,6 @@ def verify_init_data(init_data: str) -> dict | None:
             digestmod=hashlib.sha256,
         ).digest()
 
-        # Вычисляем ожидаемый hash
         expected_hash = hmac.new(
             key=secret_key,
             msg=data_check_string.encode(),
@@ -54,7 +62,21 @@ def verify_init_data(init_data: str) -> dict | None:
             logger.warning("Неверная подпись initData")
             return None
 
-        # Подпись валидна — парсим данные пользователя
+        # Проверка свежести: defence against replay. Раньше не проверяли
+        # вовсе — перехваченный (например, из логов прокси) initData
+        # работал бесконечно.
+        try:
+            auth_date = int(parsed.get("auth_date", "0"))
+        except ValueError:
+            logger.warning("initData: некорректный auth_date")
+            return None
+        age = int(time.time()) - auth_date
+        if age > MAX_INIT_DATA_AGE:
+            logger.warning(
+                "initData просрочен: возраст %s сек > %s", age, MAX_INIT_DATA_AGE
+            )
+            return None
+
         user_str = parsed.get("user", "")
         if not user_str:
             return None

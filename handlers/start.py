@@ -8,7 +8,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import WebAppInfo
-from services.roles import is_boss
+from services.roles import is_boss, is_guest
 from utils.formatters import DIV   
 from config import ADMIN_IDS
 from services.database import (
@@ -104,6 +104,18 @@ async def cmd_start(message: Message):
     user = message.from_user
     ensure_user(user.id, user.username or "", user.full_name or "", ADMIN_IDS)
     role = get_role(user.id)
+
+    # Гости — те, кого админ ещё не активировал. Не показываем им меню
+    # каталога/заявок, только короткое сообщение со своим ID. Админ
+    # повышает роль командой /addrole <id> manager.
+    if role == "guest":
+        return await message.answer(
+            "👋 Здравствуйте!\n\n"
+            "Ваш аккаунт ещё не активирован для работы с этим ботом.\n"
+            f"Передайте свой ID администратору: <code>{user.id}</code>\n\n"
+            "После активации напишите /start ещё раз.",
+            parse_mode="HTML",
+        )
 
     # Автоматически синхронизируем менеджеров с МойСклад
     sync_status_line = ""
@@ -202,6 +214,10 @@ async def cb_menu(call: CallbackQuery):
     ensure_user(user.id, user.username or "", user.full_name or "", ADMIN_IDS)
     role = get_role(user.id)
     await call.answer()
+    if role == "guest":
+        return await call.message.answer(
+            "⛔ Ваш аккаунт ещё не активирован. Напишите /start."
+        )
     await call.message.answer(
         get_welcome_text(role),
         parse_mode="HTML",

@@ -35,10 +35,22 @@ def invalidate_all_roles() -> None:
 
 
 def _has_role(user_id: int, *roles: str) -> bool:
-    """Админ из ADMIN_IDS всегда True. Иначе — сверка с БД через кэш."""
+    """Админ из ADMIN_IDS всегда True. Иначе — сверка с БД через кэш.
+
+    Замечание: 'guest' никогда не входит в список разрешённых ролей
+    (это нулевые права по дизайну) — _has_role вернёт False для гостей.
+    """
     if user_id in ADMIN_IDS:
         return True
     return _cached_role(user_id) in roles
+
+
+def is_guest(user_id: int) -> bool:
+    """Пользователь без прав. Используется в /start чтобы показать
+    «обратитесь к админу» вместо обычного welcome."""
+    if user_id in ADMIN_IDS:
+        return False
+    return _cached_role(user_id) == "guest"
 
 
 # ─── Публичные предикаты ─────────────────────────────────────────────────────
