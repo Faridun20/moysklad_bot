@@ -12,8 +12,8 @@ except ImportError:
     MS_TOKEN = os.environ.get("MS_TOKEN", "")
     CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "300"))
     import tempfile
-_default_db = os.path.join(tempfile.gettempdir(), "payments.db")
-DB_PATH = os.environ.get("DB_PATH", _default_db)
+    _default_db = os.path.join(tempfile.gettempdir(), "payments.db")
+    DB_PATH = os.environ.get("DB_PATH", _default_db)
     TZ_OFFSET = int(os.environ.get("TZ_OFFSET", "5"))
 
     def _parse_ids(key: str) -> list[int]:
