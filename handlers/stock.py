@@ -15,7 +15,7 @@ from services.roles import (
     is_admin,
 )
 from services.moysklad import get_all_stock, get_categories
-from utils.helpers import extract_id_from_href, extract_href
+from utils.helpers import extract_id_from_href, extract_href, user_safe_error
 from utils.formatters import format_stock_page
 from utils.keyboards import stock_nav_keyboard, categories_keyboard, main_keyboard
 
@@ -163,10 +163,7 @@ async def show_categories(bot: Bot, chat_id: int, page: int):
             reply_markup=categories_keyboard(cats, page),
         )
     except Exception as e:
-        logger.exception("Ошибка категорий")
-        await bot.send_message(
-            chat_id, f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML"
-        )
+        await bot.send_message(chat_id, user_safe_error(e, "show_categories"))
 
 
 async def show_stock_all(bot: Bot, chat_id: int, page: int):
@@ -185,10 +182,7 @@ async def show_stock_all(bot: Bot, chat_id: int, page: int):
         kb = stock_nav_keyboard(page, len(rows), "all")
         await bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
-        logger.error("Ошибка остатков: %s", e)
-        await bot.send_message(
-            chat_id, f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML"
-        )
+        await bot.send_message(chat_id, user_safe_error(e, "show_stock_all"))
 
 
 async def show_stock_category(bot: Bot, chat_id: int, page: int, idx: int, cat: dict):
@@ -216,7 +210,4 @@ async def show_stock_category(bot: Bot, chat_id: int, page: int, idx: int, cat: 
         kb = stock_nav_keyboard(page, len(rows), "cat", idx)
         await bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
-        logger.error("Ошибка категории: %s", e)
-        await bot.send_message(
-            chat_id, f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML"
-        )
+        await bot.send_message(chat_id, user_safe_error(e, "show_stock_category"))

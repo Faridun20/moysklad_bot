@@ -15,15 +15,23 @@ from fastapi.staticfiles import StaticFiles
 
 from webapp.auth import verify_init_data
 from services.database import get_role
+from services.rate_limit import acquire as rate_limit_acquire
 
 
-def _authorize(data: dict, allowed_roles: tuple[str, ...] = ("admin", "boss", "manager")) -> dict:
+def _authorize(
+    data: dict,
+    allowed_roles: tuple[str, ...] = ("admin", "boss", "manager"),
+    rate_limit_scope: str | None = None,
+    rate_limit_max: int = 30,
+    rate_limit_window: float = 60.0,
+) -> dict:
     """
-    Общая проверка для API endpoint'ов: валидируем initData и роль.
+    Общая проверка для API endpoint'ов: валидируем initData и роль,
+    опционально применяем per-user rate limit для дорогих эндпоинтов.
 
-    Возвращает dict-юзера из Telegram. Бросает HTTPException на любой
-    отказ. Используйте вместо того, чтобы дублировать verify_init_data +
-    get_role + role-check в каждом endpoint'е (легко забыть).
+    Возвращает dict-юзера из Telegram. Бросает HTTPException на отказ.
+    Используйте вместо того, чтобы дублировать verify_init_data +
+    get_role + role-check + rate-limit в каждом endpoint'е (легко забыть).
     """
     user = verify_init_data(data.get("initData", ""))
     if not user:
@@ -31,6 +39,14 @@ def _authorize(data: dict, allowed_roles: tuple[str, ...] = ("admin", "boss", "m
     role = get_role(user["id"])
     if role not in allowed_roles:
         raise HTTPException(status_code=403, detail="Нет доступа")
+    if rate_limit_scope:
+        if not rate_limit_acquire(
+            rate_limit_scope, user["id"], rate_limit_max, rate_limit_window
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail="Слишком много запросов, подождите минуту",
+            )
     return user
 
 logger = logging.getLogger(__name__)
@@ -126,6 +142,18 @@ async def ms_webhook(secret: str, request: Request):
 
     # МойСклад ждёт 200 быстро, иначе ретраит. Сам рефреш делаем в фоне.
     return JSONResponse({"ok": True, "received": len(events)})
+
+
+# ─── Health-check ────────────────────────────────────────────────────────────
+
+
+@app.get("/healthz")
+async def healthz():
+    """Лёгкий ping-endpoint для Railway-мониторинга и uptime-чекеров.
+    Не задевает БД и МойСклад — отвечает быстро даже если они лежат,
+    чтобы внешний мониторинг видел: HTTP-слой жив, паника не общая."""
+    import time as _t
+    return JSONResponse({"ok": True, "version": APP_VERSION, "ts": int(_t.time())})
 
 
 # ─── Главная страница ─────────────────────────────────────────────────────────
@@ -584,7 +612,14 @@ async def api_payments_send(request: Request):
     data = await request.json()
     # Только manager+ (раньше эндпоинт принимал любого верифицированного
     # юзера — random Telegram-юзер мог спамить платежами в Telegram бoссу).
-    user = _authorize(data, allowed_roles=("admin", "boss", "manager"))
+    # Rate-limit жёсткий: 5 платежей в минуту на пользователя.
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_payments_send",
+        rate_limit_max=5,
+        rate_limit_window=60.0,
+    )
 
     try:
         amount = float(data.get("amount", 0))
@@ -750,14 +785,15 @@ async def api_pending_requests(request: Request):
 @app.post("/api/orders/create")
 async def api_create_order(request: Request):
     data = await request.json()
-    user = verify_init_data(data.get("initData", ""))
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_orders_create",
+        rate_limit_max=10,
+        rate_limit_window=60.0,
+    )
 
-    from services.database import create_order, get_role
-    role = get_role(user["id"])
-    if role not in ("admin", "boss", "manager"):
-        raise HTTPException(status_code=403, detail="Нет доступа")
+    from services.database import create_order
 
     full_name = (
         f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
@@ -902,7 +938,13 @@ async def api_agents(request: Request):
     from services.moysklad import ms_get
 
     data = await request.json()
-    user = _authorize(data, allowed_roles=("admin", "boss", "manager"))
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_agents",
+        rate_limit_max=30,
+        rate_limit_window=60.0,
+    )
 
     search = (data.get("search", "") or "").strip()
     rows = snapshot.get_counterparties(search=search if search else None, limit=50)

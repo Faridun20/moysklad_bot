@@ -11,7 +11,7 @@ from aiogram.types import Message, CallbackQuery
 
 from services.roles import can_view_stock
 from services.moysklad import get_shipments, get_shipment_positions
-from utils.helpers import extract_id_from_href
+from utils.helpers import extract_id_from_href, user_safe_error
 from utils.formatters import format_shipment
 from utils.keyboards import (
     period_keyboard,
@@ -167,7 +167,4 @@ async def show_shipments(
         )
 
     except Exception as e:
-        logger.error("Ошибка отгрузок: %s", e)
-        await bot.send_message(
-            chat_id, f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML"
-        )
+        await bot.send_message(chat_id, user_safe_error(e, "shipments_list"))
