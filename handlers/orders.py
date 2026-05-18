@@ -19,6 +19,8 @@ try:
 except ImportError:
     _BASE_CURRENCY = "USD"
 
+ALLOWED_CURRENCIES = ("USD", "UZS", "RUB", "EUR")
+
 
 def _esc(s) -> str:
     """HTML-escape для пользовательских строк перед вставкой в bot-сообщения
@@ -28,9 +30,10 @@ def _esc(s) -> str:
     return html.escape(str(s or ""), quote=False)
 
 
-def _cur(amount: float) -> str:
-    """Форматирует сумму с валютой: «150 USD»."""
-    return f"{_fmt_num(amount)} {_BASE_CURRENCY}"
+def _cur(amount: float, currency: str | None = None) -> str:
+    """Форматирует сумму с валютой: «150 USD». Если валюта не передана —
+    дефолт из BASE_CURRENCY (для обратной совместимости старых вызовов)."""
+    return f"{_fmt_num(amount)} {currency or _BASE_CURRENCY}"
 
 from aiogram import Bot, Router, F
 from aiogram.filters import Command
@@ -42,7 +45,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from services.roles import can_create_orders, is_boss
 from services.database import (
     create_order, get_order, get_orders_by_ids, get_user_orders, get_all_orders,
-    update_order_status, update_order_agent,
+    update_order_status, update_order_agent, update_order_currency,
     add_order_item, get_order_items, remove_order_item,
     create_shipment_request, get_shipment_request,
     get_pending_requests, approve_shipment_request, reject_shipment_request,
@@ -107,11 +110,12 @@ def format_order(order: dict, items: list[dict]) -> str:
         if order.get("agent_name") else ""
     )
     comment_str  = f"\n📝 {_esc(order['comment'])}" if order.get("comment") else ""
+    currency     = order.get("currency") or _BASE_CURRENCY
 
     lines = [
         DIV,
         f"{status_emoji} <b>Заказ #{order['id']}</b>   <code>{_esc(status_name)}</code>",
-        f"<code>{_esc(order['created_at'][:16])}</code>",
+        f"<code>{_esc(order['created_at'][:16])}</code> · <code>{_esc(currency)}</code>",
         f"👤 Менеджер: {_esc(order['full_name'])}{agent_str}{comment_str}",
         "",
     ]
@@ -128,7 +132,7 @@ def format_order(order: dict, items: list[dict]) -> str:
             if price > 0:
                 price_str = (
                     f"     <code>{_fmt_num(qty)} {unit} × "
-                    f"{_cur(price)} = {_cur(qty * price)}</code>"
+                    f"{_cur(price, currency)} = {_cur(qty * price, currency)}</code>"
                 )
             else:
                 price_str = f"     <code>{_fmt_num(qty)} {unit}</code>"
@@ -141,7 +145,7 @@ def format_order(order: dict, items: list[dict]) -> str:
         grand_total = sum(_line_total(it) for it in items)
         if grand_total > 0:
             lines.append(DIV2)
-            lines.append(f"<b>💰 Итого: {_cur(grand_total)}</b>")
+            lines.append(f"<b>💰 Итого: {_cur(grand_total, currency)}</b>")
     else:
         lines.append("<i>Товары не добавлены</i>")
 
@@ -150,6 +154,7 @@ def format_order(order: dict, items: list[dict]) -> str:
 
 def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
     """Сообщение боссу о новой заявке. Видны цены — нужны для апрува."""
+    currency = order.get("currency") or _BASE_CURRENCY
     lines = []
     for it in items[:10]:
         qty = float(it.get("quantity", 0))
@@ -160,7 +165,7 @@ def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
         if price > 0:
             lines.append(
                 f"  • {name}: {_fmt_num(qty)} {unit} "
-                f"× {_cur(price)} = <b>{_cur(sub)}</b>"
+                f"× {_cur(price, currency)} = <b>{_cur(sub, currency)}</b>"
             )
         else:
             lines.append(
@@ -178,7 +183,7 @@ def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
     )
     comment_str = f"\n📝 {_esc(order['comment'])}" if order.get("comment") else ""
     total_str = (
-        f"\n\n<b>💰 Итого: {_cur(grand_total)}</b>"
+        f"\n\n<b>💰 Итого: {_cur(grand_total, currency)}</b>"
         if grand_total > 0 else ""
     )
 
@@ -201,10 +206,20 @@ def order_actions_keyboard(order_id: int, status: str, is_owner: bool):
     if status == "draft" and is_owner:
         kb.button(text="➕ Добавить товар",  callback_data=f"ord_add:{order_id}")
         kb.button(text="👤 Выбрать клиента", callback_data=f"ord_agent:{order_id}")
+        kb.button(text="💱 Валюта",          callback_data=f"ord_cur:{order_id}")
         kb.button(text="🚀 Отправить заявку", callback_data=f"ord_submit:{order_id}")
         kb.button(text="🗑 Удалить заказ",   callback_data=f"ord_delete:{order_id}")
     kb.button(text="🏠 Меню", callback_data="menu")
     kb.adjust(1)
+    return kb.as_markup()
+
+
+def currency_picker_keyboard(order_id: int):
+    kb = InlineKeyboardBuilder()
+    for c in ALLOWED_CURRENCIES:
+        kb.button(text=c, callback_data=f"ord_cur_set:{order_id}:{c}")
+    kb.button(text="❌ Отмена", callback_data=f"ord_view:{order_id}")
+    kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 
@@ -505,12 +520,16 @@ async def process_quantity(message: Message, state: FSMContext):
 
     data = await state.get_data()
     product = data["selected_product"]
+    order_id = data["order_id"]
+    order = get_order(order_id)
+    currency = (order or {}).get("currency") or _BASE_CURRENCY
     await state.update_data(quantity=qty)
     await state.set_state(OrderState.entering_price)
 
     await message.answer(
         f"✅ Количество: <b>{qty} {product['unit']}</b>\n\n"
-        f"💰 Введите <b>цену за {product['unit']}</b> в {_BASE_CURRENCY}.\n"
+        f"💰 Введите <b>цену за {product['unit']}</b> в <b>{currency}</b>.\n"
+        f"<i>(валюту заказа можно сменить кнопкой «💱 Валюта»)</i>\n"
         f"Например: <code>150</code> или <code>49.99</code>.\n"
         f"Если цена ещё не известна — введите <code>0</code>.",
         parse_mode="HTML",
@@ -551,9 +570,10 @@ async def process_price(message: Message, state: FSMContext):
     items = get_order_items(order_id)
     subtotal = qty * price
 
+    currency = (order or {}).get("currency") or _BASE_CURRENCY
     await message.answer(
         f"✅ Добавлено: <b>{_esc(product['name'])}</b>\n"
-        f"   {qty} {product['unit']} × {_cur(price)} = <b>{_cur(subtotal)}</b>\n\n"
+        f"   {qty} {product['unit']} × {_cur(price, currency)} = <b>{_cur(subtotal, currency)}</b>\n\n"
         + format_order(order, items),
         parse_mode="HTML",
         reply_markup=order_actions_keyboard(order_id, "draft", True),
@@ -565,6 +585,50 @@ async def process_price(message: Message, state: FSMContext):
         get_role(message.from_user.id),
         "order_item_added",
         f"Заказ #{order_id}: {product['name']} × {qty} @ {price}",
+    )
+
+
+# ─── Callback: выбор валюты заказа ───────────────────────────────────────────
+
+
+@router.callback_query(F.data.startswith("ord_cur:"))
+async def cb_choose_currency(call: CallbackQuery):
+    if not can_create_orders(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    await call.answer()
+    order_id = int(call.data.split(":")[1])
+    order = get_order(order_id)
+    if not order or order["user_id"] != call.from_user.id:
+        return await call.message.answer("⛔ Это не ваш заказ.")
+    current = order.get("currency") or _BASE_CURRENCY
+    await call.message.answer(
+        f"💱 Текущая валюта заказа: <b>{current}</b>\n\nВыберите новую:",
+        parse_mode="HTML",
+        reply_markup=currency_picker_keyboard(order_id),
+    )
+
+
+@router.callback_query(F.data.startswith("ord_cur_set:"))
+async def cb_set_currency(call: CallbackQuery):
+    if not can_create_orders(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    parts = call.data.split(":")
+    order_id = int(parts[1])
+    currency = parts[2]
+    if currency not in ALLOWED_CURRENCIES:
+        return await call.answer("Недопустимая валюта", show_alert=True)
+    order = get_order(order_id)
+    if not order or order["user_id"] != call.from_user.id:
+        return await call.answer("Нет доступа", show_alert=True)
+    update_order_currency(order_id, currency)
+    await call.answer(f"✅ Валюта: {currency}")
+    # Перерисовываем карточку заказа
+    order = get_order(order_id)
+    items = get_order_items(order_id)
+    await call.message.answer(
+        format_order(order, items),
+        parse_mode="HTML",
+        reply_markup=order_actions_keyboard(order_id, "draft", True),
     )
 
 

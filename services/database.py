@@ -145,6 +145,7 @@ def init_db():
                 comment     TEXT,
                 agent_id    TEXT,
                 agent_name  TEXT,
+                currency    TEXT,
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL
             )""",
@@ -250,6 +251,10 @@ def init_db():
             # т.е. как пользователь ввёл — например 150.50 USD).
             # При создании demand в МойСклад умножаем на 100 (минорные единицы).
             ("order_items", "price", "REAL DEFAULT 0"),
+            # Валюта заказа (USD/UZS/RUB/EUR). По умолчанию BASE_CURRENCY.
+            # Хранится на уровне ордера, чтобы все позиции одного заказа
+            # были в одной валюте.
+            ("orders", "currency", "TEXT"),
         ]
         for table, column, col_type in migrations:
             try:
@@ -694,6 +699,20 @@ def update_order_agent(order_id: int, agent_id: str, agent_name: str) -> bool:
         cur.execute(
             q("UPDATE orders SET agent_id = ?, agent_name = ?, updated_at = ? WHERE id = ?"),
             (agent_id, agent_name, now_str(), order_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    return updated
+
+
+def update_order_currency(order_id: int, currency: str) -> bool:
+    """Установить валюту заказа. Применяется ко всем позициям одного
+    ордера — менять между позициями не имеет смысла."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE orders SET currency = ?, updated_at = ? WHERE id = ?"),
+            (currency, now_str(), order_id),
         )
         updated = cur.rowcount > 0
         conn.commit()

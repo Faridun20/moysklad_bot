@@ -74,11 +74,15 @@ async function showScreen(screen) {
         await renderHome();
         break;
       case 'stock':
-        await renderStock();
+        // Лега̀cy: внешние ссылки могут звать stock, перенаправляем
+        // в объединённый таб «Склад и заказы» сразу на под-вкладку каталога.
+        ordersSubTab = 'stock';
+        ordersData = null;
+        await renderOrdersScreen();
         break;
       case 'orders':
         ordersData = null;
-        await renderOrders();
+        await renderOrdersScreen();
         break;
       case 'analytics':
         await renderAnalytics();
@@ -93,6 +97,35 @@ async function showScreen(screen) {
     // Если render упал — показываем ошибку, а не оставляем старый контент
     content.innerHTML = `<div class="error">❌ ${e.message || e}</div>`;
   }
+}
+
+// Текущая под-вкладка для объединённого экрана «Склад и заказы»
+let ordersSubTab = 'orders';
+
+async function renderOrdersScreen() {
+  // Делегируем в существующие render-функции (они пишут в #content).
+  if (ordersSubTab === 'orders') {
+    await renderOrders();
+  } else {
+    await renderStock();
+  }
+  // Поверх их вывода — прикрепляем переключатель под-вкладок.
+  const content = document.getElementById('content');
+  const tabsHtml = `
+    <div class="sub-tabs">
+      <button class="sub-tab ${ordersSubTab === 'orders' ? 'active' : ''}"
+              data-sub="orders">📋 Заказы</button>
+      <button class="sub-tab ${ordersSubTab === 'stock' ? 'active' : ''}"
+              data-sub="stock">📦 Каталог</button>
+    </div>
+  `;
+  content.insertAdjacentHTML('afterbegin', tabsHtml);
+  document.querySelectorAll('.sub-tab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      ordersSubTab = btn.dataset.sub;
+      renderOrdersScreen();
+    });
+  });
 }
 
 async function renderHome() {
@@ -133,14 +166,16 @@ async function renderHome() {
     </div>
   `;
 
-  // ─── Action-grid: быстрые действия 4 кнопки ─────────
+  // ─── Action-grid: 4 быстрых действия. Склад и Заказы объединены
+  //    в одной вкладке «Склад и заказы», поэтому в гриде разделяем
+  //    «открыть каталог» и «создать заказ» по data-new флагу.
   const actions = isBoss ? `
     <div class="action-grid">
-      <button class="action-btn" data-go="stock">
-        <span class="action-btn-icon">📦</span>Склад
+      <button class="action-btn" data-go="orders">
+        <span class="action-btn-icon">📦</span>Каталог
       </button>
       <button class="action-btn" data-go="orders">
-        <span class="action-btn-icon">📋</span>Заказы
+        <span class="action-btn-icon">⏳</span>Заявки
       </button>
       <button class="action-btn" data-go="analytics">
         <span class="action-btn-icon">📊</span>Аналитика
@@ -151,8 +186,8 @@ async function renderHome() {
     </div>
   ` : `
     <div class="action-grid">
-      <button class="action-btn" data-go="stock">
-        <span class="action-btn-icon">📦</span>Склад
+      <button class="action-btn" data-go="orders">
+        <span class="action-btn-icon">📦</span>Каталог
       </button>
       <button class="action-btn" data-go="orders" data-new="1">
         <span class="action-btn-icon">➕</span>Заказ
@@ -802,6 +837,17 @@ async function openProductPicker() {
 
 function openQuantityInput(name, unit, maxStock, href) {
   const content = document.getElementById('content');
+  const currencies = ['USD', 'UZS', 'RUB', 'EUR'];
+  // Если у заказа уже была валюта (после первой позиции) — берём её и
+  // блокируем переключение. Все позиции одного ордера в одной валюте.
+  const lockedCurrency = (currentDraftOrder && currentDraftOrder.currency) || null;
+  const initialCur = lockedCurrency || 'USD';
+
+  const curButtons = currencies.map(c =>
+    `<button class="cur-btn ${c === initialCur ? 'active' : ''}"
+             data-cur="${c}" ${lockedCurrency ? 'disabled' : ''}>${c}</button>`
+  ).join('');
+
   content.innerHTML = `
     <div class="editor-header">
       <button id="qty-back">◀️</button>
@@ -818,13 +864,21 @@ function openQuantityInput(name, unit, maxStock, href) {
       </div>
 
       <div class="form-row">
+        <label class="form-label">Валюта заказа</label>
+        <div class="cur-row">${curButtons}</div>
+        ${lockedCurrency
+          ? '<div class="qty-stock" style="margin-top:4px;font-size:11px;">Валюта фиксируется после первой позиции</div>'
+          : ''}
+      </div>
+
+      <div class="form-row">
         <label class="form-label">Цена за ${unit}</label>
         <input type="number" id="price-input" class="form-input"
           placeholder="0" inputmode="decimal" min="0" step="0.01">
       </div>
 
       <div id="line-total" class="qty-stock" style="margin: 8px 0 16px;">
-        Итого: <b>0</b>
+        Итого: <b>0 ${initialCur}</b>
       </div>
 
       <button class="btn-primary" id="qty-confirm">✅ Добавить в заявку</button>
@@ -837,11 +891,22 @@ function openQuantityInput(name, unit, maxStock, href) {
   const totalEl = document.getElementById('line-total');
   qtyEl.focus();
 
+  let selectedCurrency = initialCur;
+  document.querySelectorAll('.cur-btn[data-cur]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (lockedCurrency) return;
+      document.querySelectorAll('.cur-btn[data-cur]').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      selectedCurrency = btn.dataset.cur;
+      updateTotal();
+    });
+  });
+
   function updateTotal() {
     const q = parseFloat(qtyEl.value) || 0;
     const p = parseFloat(priceEl.value) || 0;
     const t = q * p;
-    totalEl.innerHTML = `Итого: <b>${t.toLocaleString('ru-RU', {maximumFractionDigits: 2})}</b>`;
+    totalEl.innerHTML = `Итого: <b>${t.toLocaleString('ru-RU', {maximumFractionDigits: 2})} ${selectedCurrency}</b>`;
   }
   qtyEl.addEventListener('input', updateTotal);
   priceEl.addEventListener('input', updateTotal);
@@ -868,10 +933,12 @@ function openQuantityInput(name, unit, maxStock, href) {
         quantity: qty,
         unit: unit,
         price: price,
+        currency: selectedCurrency,
       });
       currentDraftOrder.items.push({
         name, quantity: qty, unit, price, item_id: result.item_id,
       });
+      if (!currentDraftOrder.currency) currentDraftOrder.currency = selectedCurrency;
       tg.HapticFeedback?.notificationOccurred('success');
       renderOrderEditor();
     } catch (e) {
@@ -971,27 +1038,24 @@ async function renderAnalytics() {
   const content = document.getElementById('content');
   content.innerHTML = `<div class="loader">⏳ Считаю статистику…</div>`;
 
-  let data = analyticsCache[analyticsPeriod];
-  if (!data) {
-    try {
-      const response = await fetch('/api/analytics', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ initData: tg.initData, period: analyticsPeriod }),
-      });
-      if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.detail || 'Ошибка');
-      }
-      data = await response.json();
-      analyticsCache[analyticsPeriod] = data;
-    } catch (e) {
-      content.innerHTML = `<div class="error">❌ ${e.message}</div>`;
-      return;
+  // Кэш не используем — данные постоянно меняются (новые апрувы), и
+  // показывать «вчерашние ноль» когда уже есть продажи — хуже чем
+  // короткая загрузка. Стабильно ждать 200-300мс на API_HOME-like запрос.
+  try {
+    const response = await fetch('/api/analytics', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: tg.initData, period: analyticsPeriod }),
+    });
+    if (!response.ok) {
+      const err = await response.json();
+      throw new Error(err.detail || 'Ошибка');
     }
+    const data = await response.json();
+    renderAnalyticsContent(data);
+  } catch (e) {
+    content.innerHTML = `<div class="error">❌ ${e.message}</div>`;
   }
-
-  renderAnalyticsContent(data);
 }
 
 function renderAnalyticsContent(data) {

@@ -515,6 +515,20 @@ async def api_analytics(request: Request):
     })
 
 
+def _ts(o: dict) -> str:
+    """Достать timestamp заказа как строку YYYY-MM-DD HH:MM:SS.
+    Защищаемся от случаев когда updated_at — datetime-объект (Postgres),
+    None, или строка с T-разделителем — возвращаем единый формат."""
+    raw = o.get("updated_at") or o.get("created_at") or ""
+    if raw is None:
+        return ""
+    s = str(raw)
+    # ISO с 'T' → пробел, чтобы сравнения работали единообразно
+    if len(s) >= 11 and s[10] == "T":
+        s = s[:10] + " " + s[11:]
+    return s[:19]
+
+
 def _personal_analytics(
     user_id: int,
     since,
@@ -540,8 +554,19 @@ def _personal_analytics(
     relevant = [
         o for o in orders
         if o["status"] in ("approved", "shipped")
-        and prev_since_iso <= (o.get("updated_at") or o.get("created_at") or "")[:19] <= until_iso
+        and prev_since_iso <= _ts(o) <= until_iso
     ]
+
+    # Диагностический лог — увидим в Railway почему аналитика пуста,
+    # если такое снова случится. Логируем только агрегаты, не PII.
+    logger.info(
+        "analytics user=%s role=manager orders=%d approved=%d relevant=%d "
+        "period=[%s..%s] (prev_since=%s)",
+        user_id, len(orders),
+        sum(1 for o in orders if o["status"] in ("approved", "shipped")),
+        len(relevant), since_iso, until_iso, prev_since_iso,
+    )
+
     items_by_order = get_order_items_by_ids([o["id"] for o in relevant]) if relevant else {}
 
     def _agg(start_iso, end_iso):
@@ -551,7 +576,7 @@ def _personal_analytics(
         product_sums: dict[str, dict] = {}
         by_day = [0] * 7
         for o in relevant:
-            ts = (o.get("updated_at") or o.get("created_at") or "")[:19]
+            ts = _ts(o)
             if ts < start_iso or ts > end_iso:
                 continue
             items = items_by_order.get(o["id"], [])
@@ -740,6 +765,7 @@ async def api_orders(request: Request):
     else:
         orders = get_user_orders(user["id"])
 
+    from config import BASE_CURRENCY
     result = []
     for o in orders:
         items = get_order_items(o["id"])
@@ -753,6 +779,7 @@ async def api_orders(request: Request):
             "full_name": o["full_name"],
             "agent_name": o.get("agent_name", ""),
             "comment": o.get("comment", ""),
+            "currency": o.get("currency") or BASE_CURRENCY,
             "created_at": o["created_at"][:16],
             "items_count": len(items),
             "total": total,
@@ -767,7 +794,7 @@ async def api_orders(request: Request):
             ],
         })
 
-    return JSONResponse({"orders": result, "role": role})
+    return JSONResponse({"orders": result, "role": role, "default_currency": BASE_CURRENCY})
 
 
 @app.post("/api/orders/requests")
@@ -845,7 +872,7 @@ async def api_add_item(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
 
-    from services.database import add_order_item, get_order
+    from services.database import add_order_item, get_order, update_order_currency
     order = get_order(data["order_id"])
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
@@ -856,6 +883,13 @@ async def api_add_item(request: Request):
             raise ValueError
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Неверная цена")
+
+    # Если в payload пришла валюта и она ещё не зафиксирована на ордере —
+    # сохраняем. Все позиции одного ордера должны быть в одной валюте.
+    requested_currency = (data.get("currency") or "").upper()
+    if requested_currency and requested_currency in ("USD", "UZS", "RUB", "EUR"):
+        if not order.get("currency"):
+            update_order_currency(data["order_id"], requested_currency)
 
     item_id = add_order_item(
         order_id=data["order_id"],
