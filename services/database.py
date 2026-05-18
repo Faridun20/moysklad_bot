@@ -1267,11 +1267,12 @@ def mark_order_paid(
         )
         conn.commit()
 
+    remaining_after = max(0.0, summary['remaining'] - amount)
     add_audit_log(
         marked_by, marked_by_name, get_role(marked_by),
         "debt_payment_claimed",
         f"Заказ #{order_id}: менеджер отметил {amount:,.0f} {currency} "
-        f"(остаток после approve: {summary['remaining'] - amount:,.0f})",
+        f"(после подтверждения останется: {remaining_after:,.0f})",
     )
     return (True, payment_id)
 

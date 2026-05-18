@@ -372,9 +372,10 @@ body {
 /* ─── Категории (chips) ───────────────────────────────────────── */
 .cat-scroll {
   display: flex;
-  gap: 6px;
+  gap: 8px;
   overflow-x: auto;
-  padding-bottom: 8px;
+  padding: 0 14px 10px;     /* боковые отступы, чтобы первый/последний chip не липли к краю */
+  margin-top: 12px;          /* воздух от поля поиска сверху */
   margin-bottom: 8px;
   scrollbar-width: none;
 }
@@ -939,14 +940,26 @@ body {
 /* ─── Сводка «получено / ожидает» ─────────────────────────────── */
 .money-summary {
   display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-  padding: 0 14px;
+  padding: 0 14px; margin-top: 12px;
 }
 .money-block {
-  padding: 12px; border-radius: 12px;
+  padding: 14px;
+  min-height: 92px;             /* выравниваем высоту даже если содержимое разной длины */
+  display: flex; flex-direction: column; justify-content: space-between;
+  border-radius: 14px;
   background: var(--bg-card, #f5f5f5);
 }
-.money-label { font-size: 12px; color: var(--text-mute, #888); margin-bottom: 4px; }
-.money-value { font-size: 15px; font-weight: 700; line-height: 1.3; word-break: break-word; }
+.money-label {
+  font-size: 12px;
+  color: var(--text-mute, #888);
+  margin-bottom: 8px;
+  white-space: nowrap;          /* не давать «подтверждения» уехать на 2 строку */
+  overflow: hidden; text-overflow: ellipsis;
+}
+.money-value {
+  font-size: 15px; font-weight: 700; line-height: 1.25;
+  word-break: break-word;
+}
 .money-received .money-value { color: #1e8e3e; }
 .money-pending  .money-value { color: #f9a825; }
 /* Бледный плейсхолдер для пустых сумм — вместо тонкой «—» */
@@ -1023,12 +1036,25 @@ body {
 
 /* ─── Partial-оплата (input + кнопка в ряд) ────────────────────── */
 .pay-input-row {
-  display: flex; gap: 8px; align-items: stretch;
+  display: flex; gap: 8px; align-items: stretch; margin-top: 8px;
 }
 .pay-amount-input {
-  flex: 1; padding: 10px 12px; font-size: 14px;
-  border: 1px solid var(--text-mute, #ccc); border-radius: 10px;
-  background: var(--bg, #fff); color: var(--text, #000);
+  flex: 1; min-width: 0;
+  padding: 10px 12px; font-size: 14px;
+  /* Используем Telegram theme vars — fallback на тёмные тона, чтобы
+     input не светился белым на тёмной теме. */
+  border: 1px solid var(--tg-theme-section-separator-color, rgba(255,255,255,0.1));
+  border-radius: 10px;
+  background: var(--tg-theme-bg-color, #1e1e1e);
+  color: var(--tg-theme-text-color, #fff);
+  outline: none;
+}
+.pay-amount-input::placeholder {
+  color: var(--tg-theme-hint-color, rgba(255,255,255,0.4));
+  opacity: 1;
+}
+.pay-amount-input:focus {
+  border-color: var(--accent, #2481cc);
 }
 .pay-input-row .btn-mark-paid {
   flex-shrink: 0; width: auto; padding: 10px 14px;
