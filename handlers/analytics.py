@@ -20,6 +20,7 @@ from services.database import (
 )
 from utils.formatters import format_sales_report
 from utils.keyboards import analytics_keyboard, analytics_back_keyboard
+from utils.helpers import user_safe_error
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -135,10 +136,7 @@ async def show_company_analytics(
             reply_markup=analytics_back_keyboard(),
         )
     except Exception as e:
-        logger.error("Ошибка аналитики компании: %s", e)
-        await bot.send_message(
-            chat_id, f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML"
-        )
+        await bot.send_message(chat_id, user_safe_error(e, "company_analytics"))
 
 
 def _personal_stats_from_local(
@@ -235,10 +233,7 @@ async def show_manager_analytics(
             reply_markup=analytics_back_keyboard(),
         )
     except Exception as e:
-        logger.error("Ошибка аналитики менеджера %d: %s", user_id, e)
-        await bot.send_message(
-            chat_id, f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML"
-        )
+        await bot.send_message(chat_id, user_safe_error(e, f"manager_analytics:{user_id}"))
 
 
 async def show_manager_summary(bot: Bot, chat_id: int, user_id: int):

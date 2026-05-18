@@ -5,13 +5,18 @@ Telegram-бот МойСклад — точка запуска
 import asyncio
 import logging
 import os
+from typing import Any, Awaitable, Callable
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, BaseMiddleware
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import MenuButtonWebApp, MenuButtonDefault, WebAppInfo
+from aiogram.types import (
+    MenuButtonWebApp, MenuButtonDefault, WebAppInfo,
+    Message, CallbackQuery, TelegramObject, User,
+)
 
 from handlers import orders
 from config import TELEGRAM_TOKEN
+from services.rate_limit import acquire as rate_limit_acquire
 
 # Хэндлеры
 from handlers import (
@@ -38,6 +43,47 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+class RateLimitMiddleware(BaseMiddleware):
+    """
+    Бросает «вы шлёте слишком быстро» вместо обработки, если юзер
+    превысил лимит. По умолчанию 30 действий в минуту — комфортно для
+    нормального использования, душит спам кнопками и сообщениями.
+
+    Сообщения и callback'и считаются отдельно (разные скоупы), чтобы
+    тыкание кнопок «Назад/Меню» не блокировало печать сообщения.
+    """
+
+    def __init__(self, max_calls: int = 30, window_sec: float = 60.0):
+        self.max_calls = max_calls
+        self.window_sec = window_sec
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        user: User | None = data.get("event_from_user")
+        if user is not None:
+            scope = "bot_msg" if isinstance(event, Message) else "bot_cb"
+            if not rate_limit_acquire(scope, user.id, self.max_calls, self.window_sec):
+                # Тихо отвечаем юзеру и не пропускаем дальше
+                if isinstance(event, CallbackQuery):
+                    await event.answer(
+                        "⏳ Слишком много действий — подождите минуту",
+                        show_alert=True,
+                    )
+                elif isinstance(event, Message):
+                    try:
+                        await event.answer(
+                            "⏳ Слишком много сообщений — подождите минуту."
+                        )
+                    except Exception:
+                        pass
+                return
+        return await handler(event, data)
 
 
 def register_routers(dp: Dispatcher):
@@ -91,6 +137,13 @@ async def main():
 
     bot = Bot(token=TELEGRAM_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
+
+    # Защита от спама. Применяется глобально ко всем сообщениям и
+    # callback'ам перед роутингом. ADMIN_IDS не освобождаются от лимита
+    # сознательно — лимит «30 действий в минуту» комфортен и для них.
+    rate_mw = RateLimitMiddleware()
+    dp.message.middleware(rate_mw)
+    dp.callback_query.middleware(rate_mw)
 
     register_routers(dp)
 

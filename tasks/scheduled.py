@@ -82,9 +82,14 @@ async def build_sales_and_stock_report(
         sales_text = format_sales_report(label, current_stats, prev_stats)
         stock_text = format_stock_report(stock_data)
         return sales_text + "\n\n" + stock_text
-    except Exception as e:
-        logger.error("Ошибка сборки отчёта: %s", e)
-        return f"❌ Ошибка при формировании отчёта:\n<code>{e}</code>"
+    except Exception:
+        # Полное исключение в логи, в отчёт — generic. Раньше exception
+        # text вставлялся в <code>…</code> и мог сломать HTML parsing
+        # (или утечь внутренности МойСклад API в Telegram-чат).
+        logger.exception("Ошибка сборки отчёта")
+        return (
+            "❌ Не удалось собрать отчёт. Подробности в логах сервиса."
+        )
 
 
 async def send_report(bot: Bot, text: str):

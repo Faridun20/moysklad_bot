@@ -16,7 +16,7 @@ from tasks.scheduled import build_sales_and_stock_report, get_stock_report_data
 from config import ADMIN_IDS
 from services.moysklad import get_all_stock, get_sales_stats
 from services.roles import can_manage_users, is_boss
-from utils.helpers import format_price, trend_arrow, extract_id_from_href
+from utils.helpers import format_price, trend_arrow, extract_id_from_href, user_safe_error
 from utils.formatters import format_sales_report, format_stock_report
 from services.database import get_role
 
@@ -76,9 +76,7 @@ async def cb_report(call: CallbackQuery, bot: Bot):
                 txt, parse_mode="HTML", reply_markup=kb.as_markup()
             )
         except Exception as e:
-            await call.message.answer(
-                f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML"
-            )
+            await call.message.answer(user_safe_error(e, "report_stock"))
         return
 
     await call.message.answer(
@@ -122,5 +120,4 @@ async def cb_report(call: CallbackQuery, bot: Bot):
         kb.adjust(1)
         await call.message.answer(text, parse_mode="HTML", reply_markup=kb.as_markup())
     except Exception as e:
-        logger.error("Ошибка отчёта: %s", e)
-        await call.message.answer(f"❌ Ошибка:\n<code>{e}</code>", parse_mode="HTML")
+        await call.message.answer(user_safe_error(e, "cb_report"))
