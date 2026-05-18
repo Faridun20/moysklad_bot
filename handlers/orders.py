@@ -955,6 +955,52 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
     except Exception as e:
         logger.warning("Не удалось уведомить менеджера: %s", e)
 
+    # ─── Для paid-заказов автоматически создаём payment-pending ────
+    # Раньше «оплачено сразу» проходило мимо подтверждения боссом —
+    # система верила менеджеру на слово. Теперь даже paid-заказы
+    # требуют второго клика «Принято» от босса, чтобы зафиксировать
+    # факт получения денег в кассу и при этом синхронизировать платёж
+    # с МойСклад. Credit-заказы НЕ трогаем — у них своя двухступенчатая
+    # логика через mark_paid + confirm.
+    if order and (order.get("payment_type") or "paid") == "paid":
+        total = sum(
+            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
+            for it in items
+        )
+        if total > 0.01:
+            currency = order.get("currency") or "USD"
+            try:
+                from services.database import add_payment, get_payments_for_order
+                # Идемпотентность: если для этого заказа уже есть pending/
+                # confirmed payment (например, босс по ошибке одобрил
+                # дважды или мы рестартанули в момент перехода) — не
+                # плодим дубликаты.
+                existing = [
+                    p for p in get_payments_for_order(order["id"])
+                    if p["status"] in ("pending", "confirmed")
+                ]
+                if not existing:
+                    payment_id = add_payment(
+                        user_id=order["user_id"],
+                        username="",
+                        full_name=manager_name,
+                        amount=total,
+                        currency=currency,
+                        comment=f"Оплата по заказу #{order['id']} (отгрузка одобрена)",
+                        order_id=order["id"],
+                    )
+                    # Шлём боссам тот же confirm-push, что используется
+                    # для credit-заказов. Реюз кода — единая точка
+                    # сборки сообщения и кнопок Принять/Отклонить.
+                    from handlers.debts import _push_payment_confirmation
+                    await _push_payment_confirmation(
+                        bot, order["id"], manager_name, payment_id,
+                    )
+            except Exception:
+                logger.exception(
+                    "Не удалось создать auto-payment для paid-заказа #%s", order["id"],
+                )
+
 
 @router.callback_query(F.data.startswith("req_no:"))
 async def cb_reject_request(call: CallbackQuery, bot: Bot):
