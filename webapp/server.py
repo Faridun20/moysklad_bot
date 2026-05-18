@@ -141,6 +141,12 @@ async def ms_webhook(secret: str, request: Request):
             ),
         )
         mark_stock_dirty()
+        # Документ изменился → читалки (get_sales_stats, get_shipments,
+        # позиции) могут отдавать устаревшие данные. Сбрасываем все
+        # TTL-кэши МС, чтобы следующее открытие «Аналитики» увидело
+        # свежие цифры.
+        from services.moysklad import invalidate_ms_cache
+        invalidate_ms_cache()
 
     # МойСклад ждёт 200 быстро, иначе ретраит. Сам рефреш делаем в фоне.
     return JSONResponse({"ok": True, "received": len(events)})

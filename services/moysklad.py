@@ -3,6 +3,7 @@
 """
 
 import asyncio
+import functools
 import logging
 import time
 import aiohttp
@@ -96,6 +97,94 @@ async def ms_get(path: str, params: dict = None, session: aiohttp.ClientSession 
     if last_exc is not None:
         raise last_exc
     raise RuntimeError(f"MoyСклад {path}: исчерпаны {_MAX_RETRIES} попыток")
+
+
+# ─── Универсальный TTL-кэш для read-only МС эндпоинтов ───────────────────────
+#
+# Зачем: открытие «Аналитики» одним боссом = 1×get_sales_stats (≥1 запрос
+# к МС) + 15×get_shipment_positions внутри неё + ещё 1 для prev-периода +
+# 1×get_shipments. Итого ~30+ запросов. Если 5 боссов жмут одновременно —
+# 150 запросов, привет 429. Кэш + inflight-coalescing превращают залп в
+# один поход за ключ-периодом.
+
+_MS_CACHE_REGISTRY: list[tuple[str, dict]] = []  # для invalidate_all()
+
+
+def _ms_cache_key(args, kwargs):
+    """Нормализуем datetime в ключе до минуты, иначе каждый вызов с
+    datetime.utcnow() даёт уникальный ключ и кэш бесполезен."""
+    def _norm(v):
+        if isinstance(v, datetime):
+            return v.replace(second=0, microsecond=0)
+        return v
+    return (
+        tuple(_norm(a) for a in args),
+        tuple((k, _norm(v)) for k, v in sorted(kwargs.items())),
+    )
+
+
+def _ms_ttl_cache(ttl: float, name: str = ""):
+    """Async TTL-cache + inflight-coalescing.
+
+    Поведение:
+      - hit моложе ttl сек → возвращаем как есть, без похода в API
+      - miss или истёкший — берём per-key lock, проверяем повторно,
+        делаем один запрос, кладём в кэш. Второй concurrent-вызов
+        с тем же ключом ждёт на том же lock'е и получает готовое
+        значение (никакого двойного похода в МС).
+    """
+    def decorator(fn):
+        cache: dict = {}
+        locks: dict = {}
+        registry_lock = asyncio.Lock()
+
+        _MS_CACHE_REGISTRY.append((name or fn.__name__, cache))
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            key = _ms_cache_key(args, kwargs)
+            now = time.monotonic()
+            entry = cache.get(key)
+            if entry is not None and now - entry[0] < ttl:
+                return entry[1]
+
+            async with registry_lock:
+                lock = locks.get(key)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    locks[key] = lock
+
+            async with lock:
+                # Повторная проверка под локом — другой coroutine мог
+                # уже наполнить кэш, пока мы ждали.
+                entry = cache.get(key)
+                if entry is not None and time.monotonic() - entry[0] < ttl:
+                    return entry[1]
+                result = await fn(*args, **kwargs)
+                cache[key] = (time.monotonic(), result)
+                # Ленивая чистка: если ключей больше 200, выкидываем
+                # все протухшие. Для нашего usage'а (4 периода × роли)
+                # этого хватит навечно.
+                if len(cache) > 200:
+                    cutoff = time.monotonic() - ttl
+                    stale = [k for k, (t, _) in cache.items() if t < cutoff]
+                    for k in stale:
+                        cache.pop(k, None)
+                        locks.pop(k, None)
+                return result
+
+        wrapper.cache_clear = lambda: (cache.clear(), locks.clear())
+        return wrapper
+    return decorator
+
+
+def invalidate_ms_cache() -> None:
+    """Сбросить ВСЕ TTL-кэши read-only МС-эндпоинтов.
+    Вызывать когда хотим гарантированно свежие данные (например,
+    из webhook handler'а после события об изменении документа)."""
+    for _, cache in _MS_CACHE_REGISTRY:
+        cache.clear()
+    invalidate_stock_cache()
 
 
 # ─── TTL-кэш для raw API stock (используется при отсутствии snapshot) ───────
@@ -210,8 +299,10 @@ async def get_categories() -> list[dict]:
     return raw
 
 
+@_ms_ttl_cache(ttl=60.0, name="get_shipments")
 async def get_shipments(since: datetime, until: datetime = None) -> list[dict]:
-    """Получить отгрузки за период."""
+    """Получить отгрузки за период. Результат кэшируется на 60 сек —
+    несколько боссов смотрят аналитику одновременно без 429 от МС."""
     since_str = since.strftime("%Y-%m-%d %H:%M:%S.000")
     filter_str = f"moment>{since_str}"
     if until:
@@ -229,8 +320,13 @@ async def get_shipments(since: datetime, until: datetime = None) -> list[dict]:
     return data if isinstance(data, list) else data.get("rows", [])
 
 
+@_ms_ttl_cache(ttl=3600.0, name="get_shipment_positions")
 async def get_shipment_positions(demand_id: str) -> list[dict]:
-    """Получить позиции (товары) конкретной отгрузки."""
+    """Получить позиции (товары) конкретной отгрузки.
+
+    Позиции demand-документа неизменяемы после создания, поэтому кэш
+    на час безопасен. До этого 15+ позиций отгрузки запрашивались на
+    каждое открытие «Аналитики» — теперь только один раз за demand."""
     data = await ms_get(
         f"entity/demand/{demand_id}/positions",
         params={"limit": 100, "expand": "assortment,uom"},
@@ -238,8 +334,12 @@ async def get_shipment_positions(demand_id: str) -> list[dict]:
     return data if isinstance(data, list) else data.get("rows", [])
 
 
+@_ms_ttl_cache(ttl=60.0, name="get_sales_stats")
 async def get_sales_stats(since: datetime, until: datetime = None) -> dict:
-    """Статистика продаж за период: выручка, отгрузки, клиенты, топ товаров."""
+    """Статистика продаж за период: выручка, отгрузки, клиенты, топ товаров.
+    Кэш 60 сек поверх get_shipments+get_shipment_positions: даже если
+    несколько ролей одновременно запросили одинаковый период, агрегат
+    считается один раз."""
     shipments = await get_shipments(since, until)
     if not shipments:
         return {"total": 0, "count": 0, "clients": 0, "top_products": []}
@@ -283,6 +383,7 @@ async def get_sales_stats(since: datetime, until: datetime = None) -> dict:
         "top_products": top_products,
     }
 
+@_ms_ttl_cache(ttl=60.0, name="get_employee_shipments")
 async def get_employee_shipments(
     since: datetime,
     until: datetime = None,
@@ -308,6 +409,7 @@ async def get_employee_shipments(
     return data if isinstance(data, list) else data.get("rows", [])
 
 
+@_ms_ttl_cache(ttl=60.0, name="get_employee_stats")
 async def get_employee_stats(
     since: datetime,
     until: datetime = None,
