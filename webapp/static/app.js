@@ -119,8 +119,9 @@ async function renderHome() {
   const isBoss = data.role === 'admin' || data.role === 'boss';
 
   // ─── Сводка за сегодня ──────────────────────────────
+  const todayLabel = data.today.scope === 'personal' ? 'Моё сегодня' : 'Сегодня (компания)';
   const today = `
-    <div class="section-label">Сегодня</div>
+    <div class="section-label">${todayLabel}</div>
     <div class="stat-grid stat-grid--three">
       <div class="stat">
         <div class="stat-value">${fmt(data.today.revenue)}</div>
@@ -411,10 +412,15 @@ function renderOrdersMain() {
         <div class="order-meta">
           <span>📦 ${o.items_count} тов.</span>
           <span>${o.created_at}</span>
+          ${o.total > 0 ? `<span class="order-total">💰 ${Math.round(o.total).toLocaleString('ru-RU')}</span>` : ''}
         </div>
-        ${o.items.slice(0, 2).map(it =>
-          `<div class="order-item-preview">• ${it.name} — ${it.quantity} ${it.unit}</div>`
-        ).join('')}
+        ${o.items.slice(0, 2).map(it => {
+          const sub = (it.quantity || 0) * (it.price || 0);
+          const priceStr = (it.price && it.price > 0)
+            ? ` × ${it.price.toLocaleString('ru-RU')} = <b>${Math.round(sub).toLocaleString('ru-RU')}</b>`
+            : '';
+          return `<div class="order-item-preview">• ${escapeHtml(it.name)} — ${it.quantity} ${it.unit}${priceStr}</div>`;
+        }).join('')}
         ${o.status === 'draft' && !isBoss
           ? `<button class="btn-edit-order" data-id="${o.id}">✏️ Редактировать</button>`
           : ''}
@@ -493,17 +499,33 @@ function renderOrderEditor() {
   const content = document.getElementById('content');
   const order = currentDraftOrder;
 
+  const grandTotal = order.items.reduce(
+    (sum, it) => sum + (it.quantity || 0) * (it.price || 0), 0
+  );
   const itemsList = order.items.length === 0
     ? '<div class="editor-empty">Товары не добавлены</div>'
-    : order.items.map((it, i) => `
-        <div class="editor-item">
-          <div class="editor-item-info">
-            <div class="editor-item-name">${it.name}</div>
-            <div class="editor-item-qty">${it.quantity} ${it.unit || 'шт'}</div>
+    : order.items.map((it, i) => {
+        const sub = (it.quantity || 0) * (it.price || 0);
+        const subStr = it.price > 0
+          ? ` · ${it.price.toLocaleString('ru-RU')} = <b>${Math.round(sub).toLocaleString('ru-RU')}</b>`
+          : '';
+        return `
+          <div class="editor-item">
+            <div class="editor-item-info">
+              <div class="editor-item-name">${escapeHtml(it.name)}</div>
+              <div class="editor-item-qty">${it.quantity} ${it.unit || 'шт'}${subStr}</div>
+            </div>
+            <button class="editor-item-del" data-idx="${i}">✕</button>
           </div>
-          <button class="editor-item-del" data-idx="${i}">✕</button>
+        `;
+      }).join('') + (grandTotal > 0 ? `
+        <div class="editor-item" style="background: var(--tg-theme-secondary-bg-color, #f5f5f5); font-weight: 600;">
+          <div class="editor-item-info">
+            <div class="editor-item-name">💰 Итого</div>
+          </div>
+          <div>${Math.round(grandTotal).toLocaleString('ru-RU')}</div>
         </div>
-      `).join('');
+      ` : '');
 
   content.innerHTML = `
     <div class="editor-header">
@@ -684,10 +706,14 @@ async function openProductPicker() {
       : filtered.slice(0, 50).map(p => {
           const ind = p.stock >= 100 ? 'green' : p.stock >= 20 ? 'yellow' : 'red';
           return `
-            <div class="prod-row" data-name="${p.name}" data-unit="${p.unit}" data-stock="${p.stock}">
+            <div class="prod-row"
+                 data-name="${escapeHtml(p.name)}"
+                 data-unit="${escapeHtml(p.unit)}"
+                 data-stock="${p.stock}"
+                 data-href="${escapeHtml(p.href || '')}">
               <div class="prod-info">
-                <div class="prod-name">${p.name}</div>
-                ${p.folder_name ? `<div class="prod-folder">${p.folder_name}</div>` : ''}
+                <div class="prod-name">${escapeHtml(p.name)}</div>
+                ${p.folder_name ? `<div class="prod-folder">${escapeHtml(p.folder_name)}</div>` : ''}
               </div>
               <span class="stock-badge badge-${ind}">${p.stock} ${p.unit}</span>
             </div>
@@ -696,7 +722,9 @@ async function openProductPicker() {
 
     document.querySelectorAll('.prod-row').forEach(row => {
       row.addEventListener('click', () => openQuantityInput(
-        row.dataset.name, row.dataset.unit, parseFloat(row.dataset.stock)
+        row.dataset.name, row.dataset.unit,
+        parseFloat(row.dataset.stock),
+        row.dataset.href || ''
       ));
     });
   }
@@ -721,30 +749,63 @@ async function openProductPicker() {
   renderProducts();
 }
 
-function openQuantityInput(name, unit, maxStock) {
+function openQuantityInput(name, unit, maxStock, href) {
   const content = document.getElementById('content');
   content.innerHTML = `
     <div class="editor-header">
       <button id="qty-back">◀️</button>
-      <div class="editor-title">Количество</div>
+      <div class="editor-title">Количество и цена</div>
     </div>
     <div class="qty-screen">
-      <div class="qty-product-name">${name}</div>
+      <div class="qty-product-name">${escapeHtml(name)}</div>
       <div class="qty-stock">На складе: ${maxStock} ${unit}</div>
-      <input type="number" id="qty-input" class="qty-input"
-        placeholder="0" inputmode="decimal" min="0.1" step="0.1">
-      <div class="qty-unit">${unit}</div>
-      <button class="btn-primary" id="qty-confirm">✅ Добавить</button>
+
+      <div class="form-row" style="margin-top:12px;">
+        <label class="form-label">Количество (${unit})</label>
+        <input type="number" id="qty-input" class="form-input"
+          placeholder="0" inputmode="decimal" min="0.1" step="0.1">
+      </div>
+
+      <div class="form-row">
+        <label class="form-label">Цена за ${unit}</label>
+        <input type="number" id="price-input" class="form-input"
+          placeholder="0" inputmode="decimal" min="0" step="0.01">
+      </div>
+
+      <div id="line-total" class="qty-stock" style="margin: 8px 0 16px;">
+        Итого: <b>0</b>
+      </div>
+
+      <button class="btn-primary" id="qty-confirm">✅ Добавить в заявку</button>
     </div>
   `;
 
   document.getElementById('qty-back').addEventListener('click', openProductPicker);
-  document.getElementById('qty-input').focus();
+  const qtyEl = document.getElementById('qty-input');
+  const priceEl = document.getElementById('price-input');
+  const totalEl = document.getElementById('line-total');
+  qtyEl.focus();
+
+  function updateTotal() {
+    const q = parseFloat(qtyEl.value) || 0;
+    const p = parseFloat(priceEl.value) || 0;
+    const t = q * p;
+    totalEl.innerHTML = `Итого: <b>${t.toLocaleString('ru-RU', {maximumFractionDigits: 2})}</b>`;
+  }
+  qtyEl.addEventListener('input', updateTotal);
+  priceEl.addEventListener('input', updateTotal);
 
   document.getElementById('qty-confirm').addEventListener('click', async () => {
-    const qty = parseFloat(document.getElementById('qty-input').value);
+    const qty = parseFloat(qtyEl.value);
+    const price = parseFloat(priceEl.value) || 0;
     if (!qty || qty <= 0) {
       tg.HapticFeedback?.notificationOccurred('error');
+      tg.showAlert('Введите количество');
+      return;
+    }
+    if (price < 0) {
+      tg.HapticFeedback?.notificationOccurred('error');
+      tg.showAlert('Цена не может быть отрицательной');
       return;
     }
 
@@ -752,12 +813,13 @@ function openQuantityInput(name, unit, maxStock) {
       const result = await api('/api/orders/add_item', {
         order_id: currentDraftOrder.id,
         product_name: name,
-        product_href: '',
+        product_href: href || '',
         quantity: qty,
         unit: unit,
+        price: price,
       });
       currentDraftOrder.items.push({
-        name, quantity: qty, unit, item_id: result.item_id,
+        name, quantity: qty, unit, price, item_id: result.item_id,
       });
       tg.HapticFeedback?.notificationOccurred('success');
       renderOrderEditor();
