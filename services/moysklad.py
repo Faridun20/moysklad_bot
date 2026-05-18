@@ -98,7 +98,7 @@ async def ms_get(path: str, params: dict = None, session: aiohttp.ClientSession 
     raise RuntimeError(f"MoyСклад {path}: исчерпаны {_MAX_RETRIES} попыток")
 
 
-# ─── TTL-кэш для тяжёлого get_all_stock ──────────────────────────────────────
+# ─── TTL-кэш для raw API stock (используется при отсутствии snapshot) ───────
 
 _STOCK_TTL = 30  # сек
 _stock_cache: dict = {"ts": 0.0, "data": None}
@@ -106,26 +106,25 @@ _stock_lock = asyncio.Lock()
 
 
 def invalidate_stock_cache() -> None:
-    """Сбросить кэш склада (например, после успешной отгрузки)."""
+    """Сбросить TTL-кэш сырого API-выкачивания склада."""
     _stock_cache["ts"] = 0.0
     _stock_cache["data"] = None
 
 
-async def get_all_stock() -> list[dict]:
-    """Получить все остатки со всех страниц (с TTL-кэшем)."""
+async def _api_get_all_stock() -> list[dict]:
+    """Старый путь: качаем остатки с API МойСклад страница за страницей.
+    Оставлен как fallback и для использования из services.snapshot.refresh_stock.
+    Не вызывайте напрямую из handlers — используйте get_all_stock()."""
     now = time.monotonic()
     if _stock_cache["data"] is not None and now - _stock_cache["ts"] < _STOCK_TTL:
         return _stock_cache["data"]
-
     async with _stock_lock:
-        # Кто-то мог обновить кэш, пока мы ждали лок
         now = time.monotonic()
         if _stock_cache["data"] is not None and now - _stock_cache["ts"] < _STOCK_TTL:
             return _stock_cache["data"]
-
         all_rows = []
         offset = 0
-        limit = 100
+        limit = 1000
         sess = await get_session()
         while True:
             data = await ms_get(
@@ -138,17 +137,76 @@ async def get_all_stock() -> list[dict]:
             if len(rows) < limit:
                 break
             offset += limit
-
         result = [r for r in all_rows if r.get("stock", 0) != 0]
         _stock_cache["data"] = result
         _stock_cache["ts"] = time.monotonic()
         return result
 
 
+def _reshape_stock_row(r: dict) -> dict:
+    """Snapshot-row → формат МойСклад API (с meta/folder/uom).
+    Сохраняет совместимость с handlers и webapp, которые ожидают
+    оригинальные ключи r.get('folder', {}).get('meta', {}).get('href') и т.д."""
+    href = f"{MS_BASE}/entity/product/{r['ms_id']}"
+    folder_href = (
+        f"{MS_BASE}/entity/productfolder/{r['folder_id']}" if r.get("folder_id") else ""
+    )
+    return {
+        "name": r.get("name", ""),
+        "stock": r.get("stock", 0),
+        "reserve": r.get("reserve", 0),
+        "meta": {"href": href},
+        "uom": {"name": r.get("unit") or "шт"},
+        "folder": (
+            {
+                "meta": {"href": folder_href},
+                "name": r.get("folder_name", "") or "",
+            }
+            if folder_href
+            else {}
+        ),
+    }
+
+
+def _reshape_category_row(r: dict) -> dict:
+    href = f"{MS_BASE}/entity/productfolder/{r['ms_id']}"
+    return {
+        "name": r.get("name", ""),
+        "meta": {"href": href},
+    }
+
+
+async def get_all_stock() -> list[dict]:
+    """
+    Список остатков для UI. Сначала пытается отдать из локального
+    snapshot (мгновенно, без запросов к МойСклад). Если snapshot пуст
+    (только что развернулись) — падает на сырой API-pull с TTL-кэшем
+    и параллельно инициирует первичный рефреш.
+    """
+    from services import snapshot  # lazy чтобы избежать циклов
+    rows = snapshot.get_stock(only_positive=True)
+    if rows:
+        return [_reshape_stock_row(r) for r in rows]
+    # Snapshot ещё не наполнен — fallback на raw API
+    logger.info("snapshot пуст — отдаём stock из live API")
+    raw = await _api_get_all_stock()
+    # Параллельно запускаем первичный рефреш, чтобы при следующем запросе
+    # snapshot уже работал. Не ждём результата — это fire-and-forget.
+    asyncio.create_task(snapshot.refresh_stock())
+    return raw
+
+
 async def get_categories() -> list[dict]:
-    """Получить список категорий товаров."""
-    data = await ms_get("entity/productfolder", params={"limit": 100})
-    return data if isinstance(data, list) else data.get("rows", [])
+    """Список категорий для UI. Аналогично — сначала snapshot, потом API."""
+    from services import snapshot
+    rows = snapshot.get_categories()
+    if rows:
+        return [_reshape_category_row(r) for r in rows]
+    logger.info("snapshot пуст — отдаём categories из live API")
+    data = await ms_get("entity/productfolder", params={"limit": 1000})
+    raw = data if isinstance(data, list) else data.get("rows", [])
+    asyncio.create_task(snapshot.refresh_categories())
+    return raw
 
 
 async def get_shipments(since: datetime, until: datetime = None) -> list[dict]:

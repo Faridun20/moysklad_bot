@@ -171,6 +171,64 @@ def init_db():
                 created_at       TEXT NOT NULL,
                 approved_at      TEXT
             )""",
+
+            # ─── Snapshot МойСклад (локальная копия справочников + остатков) ──
+            # Идея: справочники качаем раз в день, остатки — каждые 2 часа
+            # как safety-net + точечная инвалидация через вебхуки.
+            # Поле ms_id хранит UUID из МойСклад (PRIMARY KEY).
+
+            f"""CREATE TABLE IF NOT EXISTS ms_products (
+                ms_id      TEXT PRIMARY KEY,
+                name       TEXT,
+                folder_id  TEXT,
+                code       TEXT,
+                unit       TEXT,
+                href       TEXT,
+                updated_at TEXT
+            )""",
+
+            f"""CREATE TABLE IF NOT EXISTS ms_categories (
+                ms_id      TEXT PRIMARY KEY,
+                name       TEXT,
+                parent_id  TEXT,
+                href       TEXT,
+                updated_at TEXT
+            )""",
+
+            f"""CREATE TABLE IF NOT EXISTS ms_counterparties (
+                ms_id      TEXT PRIMARY KEY,
+                name       TEXT,
+                phone      TEXT,
+                href       TEXT,
+                updated_at TEXT
+            )""",
+
+            f"""CREATE TABLE IF NOT EXISTS ms_employees (
+                ms_id      TEXT PRIMARY KEY,
+                name       TEXT,
+                href       TEXT,
+                updated_at TEXT
+            )""",
+
+            f"""CREATE TABLE IF NOT EXISTS ms_stock (
+                ms_id       TEXT PRIMARY KEY,
+                name        TEXT,
+                folder_id   TEXT,
+                folder_name TEXT,
+                unit        TEXT,
+                stock       REAL DEFAULT 0,
+                reserve     REAL DEFAULT 0,
+                updated_at  TEXT
+            )""",
+
+            f"""CREATE TABLE IF NOT EXISTS ms_snapshot_meta (
+                dataset           TEXT PRIMARY KEY,
+                last_refresh      TEXT,
+                last_full_refresh TEXT,
+                last_webhook_at   TEXT,
+                rows_count        INTEGER DEFAULT 0,
+                status            TEXT
+            )""",
         ]
 
         # Создаём каждую таблицу в отдельной транзакции
@@ -194,6 +252,20 @@ def init_db():
                 conn.commit()
             except Exception:
                 conn.rollback()  # Колонка уже существует — норм
+
+        # Индексы для snapshot-таблиц
+        snapshot_indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_ms_products_folder ON ms_products(folder_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ms_stock_folder ON ms_stock(folder_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ms_categories_parent ON ms_categories(parent_id)",
+        ]
+        for sql in snapshot_indexes:
+            try:
+                cur.execute(sql)
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.debug("Индекс не создан: %s", e)
 
     logger.info("База данных инициализирована")
     _load_predefined_users()
