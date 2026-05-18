@@ -68,6 +68,49 @@ class CachedStaticFiles(StaticFiles):
 app.mount("/static", CachedStaticFiles(directory=STATIC_DIR), name="static")
 
 
+# ─── Webhook от МойСклад ─────────────────────────────────────────────────────
+
+
+@app.post("/api/ms-webhook/{secret}")
+async def ms_webhook(secret: str, request: Request):
+    """
+    МойСклад дёргает этот endpoint при изменениях документов, влияющих
+    на остатки (demand/supply/loss/move/inventory). Секрет в URL —
+    единственная защита от чужих POST-ов.
+
+    Получив событие, помечаем stock как dirty. Фоновая корутина
+    _stock_debounce_loop через несколько секунд сделает refresh_stock,
+    батча все полученные события в один pull.
+    """
+    from services.ms_webhooks import get_webhook_secret
+    from services.snapshot import mark_stock_dirty
+
+    if secret != get_webhook_secret():
+        # Не отдаём 401 чтобы не подсказывать злоумышленнику, что секрет нужен;
+        # просто молчим.
+        raise HTTPException(status_code=404, detail="not found")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    events = payload.get("events", []) if isinstance(payload, dict) else []
+    if events:
+        logger.info(
+            "ms-webhook: %d event(s): %s",
+            len(events),
+            ", ".join(
+                f"{e.get('action')}.{(e.get('meta') or {}).get('type')}"
+                for e in events[:5]
+            ),
+        )
+        mark_stock_dirty()
+
+    # МойСклад ждёт 200 быстро, иначе ретраит. Сам рефреш делаем в фоне.
+    return JSONResponse({"ok": True, "received": len(events)})
+
+
 # ─── Главная страница ─────────────────────────────────────────────────────────
 
 
@@ -694,39 +737,34 @@ async def api_submit_order(request: Request):
 
 @app.post("/api/agents")
 async def api_agents(request: Request):
-    """Список клиентов (контрагентов) из МойСклад."""
+    """Список клиентов (контрагентов). Сначала из локального snapshot,
+    если он пуст — fallback на live API."""
+    from services import snapshot
+    from services.moysklad import ms_get
+
     data = await request.json()
     user = verify_init_data(data.get("initData", ""))
     if not user:
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
 
-    import aiohttp as _aiohttp
-    from config import MS_TOKEN
-    MS_BASE_URL = "https://api.moysklad.ru/api/remap/1.2"
-    headers = {"Authorization": f"Bearer {MS_TOKEN}", "Accept-Encoding": "gzip"}
+    search = (data.get("search", "") or "").strip()
+    rows = snapshot.get_counterparties(search=search if search else None, limit=50)
+    if rows:
+        return JSONResponse({"agents": [
+            {"id": r["ms_id"], "name": r.get("name", "—"), "phone": r.get("phone", "")}
+            for r in rows
+        ]})
 
-    search = data.get("search", "")
+    # Snapshot пуст — live fallback + триггер первичного рефреша
     params = {"limit": 50, "order": "name"}
     if search:
         params["search"] = search
-
-    async with _aiohttp.ClientSession() as session:
-        async with session.get(
-            f"{MS_BASE_URL}/entity/counterparty",
-            headers=headers, params=params,
-        ) as resp:
-            resp.raise_for_status()
-            result = await resp.json()
-
-    agents = [
-        {
-            "id": a.get("id", ""),
-            "name": a.get("name", "—"),
-            "phone": a.get("phone", ""),
-        }
+    result = await ms_get("entity/counterparty", params=params)
+    asyncio.create_task(snapshot.refresh_counterparties())
+    return JSONResponse({"agents": [
+        {"id": a.get("id", ""), "name": a.get("name", "—"), "phone": a.get("phone", "")}
         for a in result.get("rows", [])
-    ]
-    return JSONResponse({"agents": agents})
+    ]})
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 async def start_webapp():

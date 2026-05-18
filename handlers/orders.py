@@ -464,11 +464,25 @@ async def cb_choose_agent(call: CallbackQuery, state: FSMContext):
     await call.message.answer("⏳ Загружаю список клиентов…")
 
     try:
-        data = await ms_get(
-            "entity/counterparty",
-            params={"limit": 50, "order": "name"},
-        )
-        agents = data.get("rows", [])
+        # Сначала пробуем snapshot — мгновенно, без удара по МойСклад API
+        from services import snapshot
+        snap_rows = snapshot.get_counterparties(limit=50)
+        if snap_rows:
+            agents = [
+                {
+                    "id": r["ms_id"],
+                    "name": r.get("name", "—"),
+                    "phone": r.get("phone", ""),
+                    "meta": {"href": ""},  # пустой, для совместимости с extract_href
+                }
+                for r in snap_rows
+            ]
+        else:
+            data = await ms_get(
+                "entity/counterparty",
+                params={"limit": 50, "order": "name"},
+            )
+            agents = data.get("rows", [])
         if not agents:
             return await call.message.answer("❌ Клиенты не найдены.")
 
@@ -479,11 +493,12 @@ async def cb_choose_agent(call: CallbackQuery, state: FSMContext):
         kb.button(text="❌ Отмена", callback_data=f"ord_view:{order_id}")
         kb.adjust(1)
 
-        # Сохраняем в state
+        # Сохраняем в state — id берём напрямую из dict (snapshot) или
+        # извлекаем из meta.href (live API fallback).
         await state.update_data(
             order_id=order_id,
             agents=[{
-                "id": extract_id_from_href(extract_href(a)),
+                "id": a.get("id") or extract_id_from_href(extract_href(a)),
                 "name": a.get("name", "—"),
             } for a in agents[:20]]
         )

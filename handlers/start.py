@@ -157,6 +157,45 @@ async def cmd_start(message: Message):
         await show_manager_summary(message.bot, message.chat.id, message.from_user.id)
 
 
+@router.message(Command("refresh"))
+async def cmd_refresh(message: Message):
+    """Принудительно перечитать snapshot МойСклад. Доступно только админу."""
+    if message.from_user.id not in ADMIN_IDS and get_role(message.from_user.id) != "admin":
+        return await message.answer("⛔ Только для администратора.")
+
+    from services import snapshot
+    await message.answer("⏳ Перечитываю snapshot МойСклад…")
+    try:
+        counts = await snapshot.refresh_all()
+    except Exception as e:
+        return await message.answer(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
+
+    lines = ["✅ <b>Snapshot обновлён</b>", ""]
+    for key, val in counts.items():
+        lines.append(f"• {key}: <code>{val}</code>")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("snapshot"))
+async def cmd_snapshot_stats(message: Message):
+    """Показать статистику snapshot — что и когда последний раз обновлялось."""
+    if message.from_user.id not in ADMIN_IDS and get_role(message.from_user.id) != "admin":
+        return await message.answer("⛔ Только для администратора.")
+    from services import snapshot
+    stats = snapshot.stats()
+    lines = ["📊 <b>Snapshot МойСклад</b>", ""]
+    lines.append("<b>Строк в локальных таблицах:</b>")
+    for tbl in ("ms_products", "ms_categories", "ms_counterparties",
+                "ms_employees", "ms_stock"):
+        lines.append(f"  • {tbl}: <code>{stats.get(tbl, 0)}</code>")
+    lines.append("")
+    lines.append("<b>Метаданные:</b>")
+    for m in stats.get("meta", []):
+        last = m.get("last_full_refresh") or m.get("last_refresh") or "—"
+        lines.append(f"  • {m['dataset']}: {last} ({m.get('rows_count', 0)} rows)")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 @router.callback_query(F.data == "menu")
 async def cb_menu(call: CallbackQuery):
     user = call.from_user
