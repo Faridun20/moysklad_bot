@@ -17,7 +17,7 @@ from aiogram.types import (
 from handlers import orders
 from config import (
     TELEGRAM_TOKEN, TG_USE_WEBHOOK, TG_WEBHOOK_SECRET, WEBAPP_URL,
-    REDIS_URL, BOT_MODE,
+    REDIS_URL, BOT_MODE, ENABLE_SCHEDULED_REPORTS,
 )
 from services.rate_limit import acquire as rate_limit_acquire
 
@@ -123,15 +123,31 @@ def build_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
 
 
 def start_background_tasks(bot: Bot) -> list[asyncio.Task]:
-    """Запустить фоновые задачи. Возвращает список созданных Task'ов."""
+    """Запустить фоновые задачи. Возвращает список созданных Task'ов.
+
+    Если ENABLE_SCHEDULED_REPORTS=0 — отчётные циклы не запускаются
+    (предполагается, что их дёргает Railway Cron через
+    tasks.run_report). Snapshot и notifier остаются всегда — они
+    нужны 24/7 и под cron не подходят (snapshot реагирует на webhook'и
+    в реальном времени, notifier проверяет новые отгрузки каждые
+    CHECK_INTERVAL_SEC секунд).
+    """
     coros = [
         shipment_notifier(bot),
-        daily_report_task(bot),
-        weekly_report_task(bot),
-        monthly_report_task(bot),
         snapshot_refresh_task(bot),
         snapshot._stock_debounce_loop(),
     ]
+    if ENABLE_SCHEDULED_REPORTS:
+        coros.extend([
+            daily_report_task(bot),
+            weekly_report_task(bot),
+            monthly_report_task(bot),
+        ])
+    else:
+        logger.info(
+            "ENABLE_SCHEDULED_REPORTS=0 — отчёты внутри бота отключены, "
+            "ожидается запуск через Railway Cron Jobs."
+        )
     return [
         asyncio.create_task(
             c, name=getattr(c, "__qualname__", None) or getattr(c, "__name__", "task")
