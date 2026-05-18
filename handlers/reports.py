@@ -11,7 +11,7 @@ from aiogram import Bot, Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from tasks.scheduled import build_sales_and_stock_report
+from tasks.scheduled import build_sales_and_stock_report, get_stock_report_data
 
 from config import ADMIN_IDS
 from services.moysklad import get_all_stock, get_sales_stats
@@ -27,25 +27,6 @@ MONTH_NAMES = [
     "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
     "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
 ]
-
-async def get_stock_report_data() -> dict:
-    rows = await get_all_stock()
-    if not rows:
-        return {"slow": [], "fast": [], "critical": []}
-
-    rows_with_days = [(r, r.get("stockDays", 0)) for r in rows]
-
-    slow = sorted(
-        [(r, d) for r, d in rows_with_days if d >= 30], key=lambda x: x[1], reverse=True
-    )[:10]
-
-    fast = sorted([(r, d) for r, d in rows_with_days if 0 < d < 7], key=lambda x: x[1])[
-        :10
-    ]
-
-    critical = [r for r in rows if r.get("stock", 0) < 20][:10]
-
-    return {"slow": slow, "fast": fast, "critical": critical}
 
 def reports_keyboard():
     kb = InlineKeyboardBuilder()
