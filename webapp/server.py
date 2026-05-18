@@ -75,6 +75,112 @@ async def get_me(request: Request):
     })
 
 
+# ─── API: главный экран (сводка дня + мои заказы + для босса аналитика) ────
+
+
+@app.post("/api/home")
+async def api_home(request: Request):
+    """
+    Данные для Главного экрана WebApp — компактная сводка, чтобы юзер
+    видел что-то полезное сразу, не переключаясь по табам.
+
+    Возвращает разное содержимое в зависимости от роли:
+    - все: today (выручка/отгрузок/клиентов за сегодня) + my_orders сводка
+    - boss/admin: дополнительно pending_requests и top_employees за неделю
+    """
+    from datetime import datetime, timedelta
+    from services.moysklad import get_sales_stats, get_shipments
+    from services.database import (
+        get_user_orders, get_pending_requests,
+        get_moysklad_employee_id,
+    )
+
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+
+    user_id = user["id"]
+    role = get_role(user_id)
+    if role not in ("admin", "boss", "manager"):
+        raise HTTPException(status_code=403, detail="Нет доступа")
+
+    now = datetime.utcnow()
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_ago = now - timedelta(days=7)
+
+    # Сводка за сегодня — общая (по всему МойСклад)
+    try:
+        today_stats = await get_sales_stats(start_of_day, now)
+    except Exception as e:
+        logger.warning("home: failed to load today stats: %s", e)
+        today_stats = {"total": 0, "count": 0, "clients": 0, "top_products": []}
+
+    # Заказы текущего юзера
+    my_orders = get_user_orders(user_id)
+    orders_by_status = {"draft": 0, "pending": 0, "approved": 0, "rejected": 0, "shipped": 0}
+    for o in my_orders:
+        orders_by_status[o["status"]] = orders_by_status.get(o["status"], 0) + 1
+
+    recent = [
+        {
+            "id": o["id"],
+            "status": o["status"],
+            "agent_name": o.get("agent_name", ""),
+            "created_at": o["created_at"][:16],
+        }
+        for o in my_orders[:5]
+    ]
+
+    result = {
+        "role": role,
+        "today": {
+            "revenue": today_stats["total"] / 100,  # копейки → ₽/₸ etc
+            "shipments": today_stats["count"],
+            "clients": today_stats["clients"],
+        },
+        "my_orders": {
+            "draft": orders_by_status["draft"],
+            "pending": orders_by_status["pending"],
+            "approved": orders_by_status["approved"],
+            "rejected": orders_by_status["rejected"],
+            "total": len(my_orders),
+            "recent": recent,
+        },
+        "ms_linked": bool(get_moysklad_employee_id(user_id)),
+    }
+
+    # Для босса/админа — дополнительно
+    if role in ("admin", "boss"):
+        pending = get_pending_requests()
+        result["pending_requests"] = len(pending)
+
+        # Топ-сотрудники за последнюю неделю по выручке.
+        # Берём отгрузки за неделю и группируем по owner.name.
+        # Это +1 запрос к МойСклад, но дешевле чем дёргать get_employee_stats
+        # на каждого сотрудника отдельно.
+        try:
+            week_shipments = await get_shipments(week_ago, now)
+            by_owner: dict[str, dict] = {}
+            for s in week_shipments:
+                owner_name = (s.get("owner") or {}).get("name") or "—"
+                cur = by_owner.setdefault(owner_name, {"sum": 0, "count": 0})
+                cur["sum"] += s.get("sum", 0)
+                cur["count"] += 1
+            top_emp = sorted(
+                by_owner.items(), key=lambda kv: kv[1]["sum"], reverse=True
+            )[:5]
+            result["top_employees"] = [
+                {"name": name, "revenue": d["sum"] / 100, "count": d["count"]}
+                for name, d in top_emp
+            ]
+        except Exception as e:
+            logger.warning("home: failed to load top employees: %s", e)
+            result["top_employees"] = []
+
+    return JSONResponse(result)
+
+
 # ─── API: остатки склада ─────────────────────────────────────────────────────
 
 

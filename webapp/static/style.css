@@ -85,6 +85,11 @@ body {
   margin-bottom: 12px;
 }
 
+/* Для рядов из 3 карточек — равные колонки на ширине */
+.stat-grid--three {
+  grid-template-columns: 1fr 1fr 1fr;
+}
+
 .stat {
   background: var(--tg-theme-secondary-bg-color, #f5f5f5);
   border-radius: 10px;
