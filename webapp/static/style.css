@@ -90,7 +90,7 @@ body {
 .section-label {
   font-size: 13px;
   color: var(--text-mute);
-  margin: 20px 4px 8px;
+  margin: 20px 14px 8px;     /* 14px по бокам — выравниваем с padding карточек ниже */
   font-weight: 500;
 }
 
@@ -895,15 +895,18 @@ body {
   color: #fff;
 }
 .debts-summary {
-  padding: 0 14px; display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+  padding: 0 14px;
+  margin-top: 12px;           /* воздух от money-summary сверху */
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
   gap: 10px;
 }
 .debt-stat {
-  padding: 12px; border-radius: 12px; text-align: center;
+  padding: 14px 8px;          /* чуть выше, чтобы цифры дышали */
+  border-radius: 12px; text-align: center;
   background: var(--bg-card, #f5f5f5);
 }
-.debt-stat-num { font-size: 26px; font-weight: 700; }
-.debt-stat-label { font-size: 12px; color: var(--text-mute, #888); margin: 4px 0; }
+.debt-stat-num { font-size: 24px; font-weight: 700; line-height: 1.1; }
+.debt-stat-label { font-size: 12px; color: var(--text-mute, #888); margin: 6px 0 4px; }
 .debt-stat-sum { font-size: 14px; font-weight: 600; }
 .debt-stat-overdue .debt-stat-num { color: #d93025; }
 .debt-stat-today .debt-stat-num   { color: #f9a825; }
