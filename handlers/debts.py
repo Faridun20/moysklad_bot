@@ -264,7 +264,9 @@ async def _push_payment_confirmation(
     due = order.get("due_date") or "—"
     amount = float(payment.get("amount") or 0)
     confirmed_before = max(0.0, summary["confirmed"])
-    remaining_after = max(0.0, summary["remaining"])
+    # summary["remaining"] = total - confirmed (без учёта pending).
+    # «Останется после подтверждения ЭТОГО платежа» — отнимаем amount.
+    remaining_after = max(0.0, summary["remaining"] - amount)
 
     lines = [
         f"{DIV}",

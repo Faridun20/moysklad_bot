@@ -1349,11 +1349,10 @@ async def _notify_bosses_payment_pending(
         due = order.get("due_date") or "—"
         amount = float(payment.get("amount") or 0)
         fmt = lambda n: f"{int(round(n)):,}".replace(",", " ")
-        # summary["remaining"] = total - confirmed - pending. Текущий
-        # платёж уже в pending → если подтвердим, он переедет из pending
-        # в confirmed, общий остаток не изменится. То есть «остаток после
-        # подтверждения» = текущий summary["remaining"].
-        remaining_after = max(0.0, summary["remaining"])
+        # summary["remaining"] = total - confirmed (без учёта pending).
+        # «Останется после подтверждения ЭТОГО платежа» =
+        #   remaining - amount_of_this_payment.
+        remaining_after = max(0.0, summary["remaining"] - amount)
         confirmed_before = max(0.0, summary["confirmed"])
         total = summary["total"]
 

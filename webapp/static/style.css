@@ -861,9 +861,17 @@ body {
   display: block; font-size: 13px; color: var(--text-mute, #888); margin-bottom: 6px;
 }
 .due-date-input {
-  width: 100%; padding: 10px 12px; font-size: 15px;
-  border: 1px solid var(--text-mute, #ccc); border-radius: 10px;
-  background: var(--bg, #fff); color: var(--text, #000);
+  width: 100%; padding: 12px; font-size: 15px;
+  border: 1px solid var(--tg-theme-section-separator-color, rgba(255,255,255,0.1));
+  border-radius: 10px;
+  background: var(--tg-theme-bg-color, #1e1e1e);
+  color: var(--tg-theme-text-color, #fff);
+  outline: none;
+  /* Android Chrome: цвет иконки календаря через color-scheme */
+  color-scheme: dark light;
+}
+.due-date-input:focus {
+  border-color: var(--accent, #2481cc);
 }
 
 /* ─── Экран «Долги» ──────────────────────────────────────────────── */
