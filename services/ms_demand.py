@@ -164,9 +164,17 @@ async def create_demand_from_request(
     items: list[dict],
     telegram_full_name: str,
     telegram_user_id: int | None = None,
+    customerorder_href: str | None = None,
 ) -> dict:
     """
     Создать demand-документ в МойСклад на основе заявки бота.
+
+    customerorder_href (optional) — если передан, demand линкуется с
+    указанным заказом покупателя через customerOrder.meta. В МойСклад
+    эти два документа будут связаны: бухгалтер увидит цепочку
+    «Заказ → Отгрузка» в карточке заказа. Это нужно для нового
+    workflow где бот auto-create'ит оба документа: customerorder
+    для PDF + demand для списания остатков.
 
     Возвращает:
         {"ok": True, "demand_id": "...", "url": "https://online.moysklad..."}
@@ -234,6 +242,11 @@ async def create_demand_from_request(
         # отдельно подтверждать документ.
         "applicable": True,
     }
+    # Связь с заказом покупателя — МойСклад покажет цепочку «Заказ →
+    # Отгрузка» в карточке заказа. Без этого documents висят отдельно
+    # и бухгалтеру неочевидно что они про одно и то же.
+    if customerorder_href:
+        payload["customerOrder"] = _meta(customerorder_href, "customerorder")
 
     # Кастомные атрибуты — кто оформил заявку через бот.
     # Два атрибута: читаемое имя + стабильный user_id (на случай если
