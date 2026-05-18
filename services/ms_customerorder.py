@@ -233,27 +233,16 @@ async def create_customerorder_from_request(
             "mediaType": "application/json",
         }}
 
-    # Кастомные атрибуты — реюзаем из ms_demand
-    attrs: list[dict] = []
-    for meta_obj, value in (
-        (ms_demand._CTX.get("attribute_name_meta"),
-         telegram_full_name[:255] if telegram_full_name else ""),
-        (ms_demand._CTX.get("attribute_uid_meta"), telegram_user_id),
-    ):
-        if not (isinstance(meta_obj, dict) and meta_obj.get("href")):
-            continue
-        if value in (None, ""):
-            continue
-        attrs.append({
-            "meta": {
-                "href": meta_obj["href"],
-                "type": "attributemetadata",
-                "mediaType": "application/json",
-            },
-            "value": value,
-        })
-    if attrs:
-        payload["attributes"] = attrs
+    # ВАЖНО: кастомные атрибуты (telegram_full_name / telegram_user_id)
+    # из ms_demand._CTX зарегистрированы в МойСклад ТОЛЬКО для demand'а.
+    # Каждая сущность в МойСклад имеет свой набор кастомных атрибутов;
+    # если попробовать передать demand-атрибут на customerorder, API
+    # отдаст HTTP 400 «href указывает на сущность неправильного типа».
+    #
+    # Поэтому attributes здесь не ставим. Для трекинга достаточно
+    # description (включает имя менеджера и номер заявки бота),
+    # а аналитика по boss-stats группирует по demand-атрибутам —
+    # demand'у мы их корректно передаём в ms_demand.create_demand_from_request.
 
     try:
         sess = await get_session()
