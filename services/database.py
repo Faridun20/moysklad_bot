@@ -341,6 +341,19 @@ def init_db():
             # (клиент платит частями). Когда суммa confirmed payments >=
             # order.total, заказ автоматически считается закрытым.
             ("payments", "order_id", "BIGINT"),
+            # ID документа Demand в МойСклад, созданного при approve
+            # отгрузки. Нужен чтобы paymentin привязывался к конкретной
+            # отгрузке (operations field в API МойСклад). NULL если
+            # отгрузка ещё не отправлена или create_demand упал.
+            ("orders", "ms_demand_id", "TEXT"),
+            # ID входящего платежа (paymentin) в МойСклад. Заполняется
+            # после успешного create_paymentin. Защищает от дубликатов:
+            # повторный confirm не плодит новые paymentin'ы в МойСклад.
+            ("payments", "ms_paymentin_id", "TEXT"),
+            # Статус синхронизации с МойСклад: NULL (ещё не пробовали),
+            # 'synced', 'failed' (с описанием в ms_sync_error).
+            ("payments", "ms_sync_status", "TEXT"),
+            ("payments", "ms_sync_error",  "TEXT"),
         ]
         for table, column, col_type in migrations:
             try:
@@ -675,6 +688,55 @@ def get_order_payment_summary(order_id: int) -> dict:
     }
 
 
+def set_order_ms_demand_id(order_id: int, ms_demand_id: str) -> bool:
+    """Сохранить id демэнд-документа МойСклад на заказе. Вызывается
+    после успешного create_demand_from_request, чтобы потом paymentin
+    мог привязаться к этому demand через operations-поле."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE orders SET ms_demand_id = ?, updated_at = ? WHERE id = ?"),
+            (ms_demand_id, now_str(), order_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    return updated
+
+
+def set_payment_ms_sync(
+    payment_id: int,
+    *,
+    paymentin_id: str | None = None,
+    status: str | None = None,
+    error: str | None = None,
+) -> bool:
+    """Обновить состояние синхронизации платежа с МойСклад.
+    status: 'synced' | 'failed' | None (не менять)."""
+    fields = []
+    params: list = []
+    if paymentin_id is not None:
+        fields.append("ms_paymentin_id = ?")
+        params.append(paymentin_id)
+    if status is not None:
+        fields.append("ms_sync_status = ?")
+        params.append(status)
+    if error is not None:
+        fields.append("ms_sync_error = ?")
+        params.append(error[:500])  # обрезаем чтоб не раздуть row
+    if not fields:
+        return False
+    params.append(payment_id)
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(f"UPDATE payments SET {', '.join(fields)} WHERE id = ?"),
+            params,
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    return updated
+
+
 def delete_order(order_id: int, requested_by: int) -> bool:
     """Удалить заказ-черновик. Только status='draft' можно удалять, и
     только владелец (даже boss/admin не удаляет чужие — нужно жёстче
@@ -741,7 +803,41 @@ def confirm_payment(payment_id: int, confirmed_by: int = None, confirmed_name: s
         _maybe_close_order_after_payment(
             payment["order_id"], confirmed_by, confirmed_name,
         )
+        # Best-effort: синхронизируем входящий платёж в МойСклад.
+        # Делаем fire-and-forget — БД-операция уже коммитнута, ошибка
+        # MS-API не должна откатывать подтверждение. Статус синхрона
+        # пишется в payments.ms_sync_status; failed можно ретраить
+        # вручную или фоновой задачей.
+        _trigger_ms_paymentin_sync(payment_id)
     return updated
+
+
+def _trigger_ms_paymentin_sync(payment_id: int) -> None:
+    """Запустить async create_paymentin_for_payment в фоне, если есть
+    активный event loop. Если зов из чисто sync-контекста (cron-скрипта),
+    запускаем синхронно через asyncio.run."""
+    try:
+        import asyncio
+        from services.ms_payments import create_paymentin_for_payment
+    except Exception:
+        # ms_payments недоступен (например, тестовое окружение без MS_TOKEN)
+        return
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Внутри aiohttp/aiogram — кидаем задачу в текущий loop
+            asyncio.create_task(create_paymentin_for_payment(payment_id))
+            return
+    except RuntimeError:
+        pass
+    # Sync-контекст: запускаем кратковременный loop
+    try:
+        import asyncio
+        asyncio.run(create_paymentin_for_payment(payment_id))
+    except Exception:
+        # Молча игнорируем — статус failed уже записан внутри ms_payments
+        pass
 
 
 def _maybe_close_order_after_payment(

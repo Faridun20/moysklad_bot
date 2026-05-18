@@ -904,6 +904,11 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
             order, items, manager_name, telegram_user_id=manager_user_id,
         )
         if result.get("ok"):
+            # Сохраняем demand_id на заказе — нужен чтобы потом
+            # paymentin'ы привязывались к этой отгрузке через operations.
+            from services.database import set_order_ms_demand_id
+            if result.get("demand_id"):
+                set_order_ms_demand_id(order["id"], result["demand_id"])
             demand_line = (
                 f"\n📦 Отгрузка в МойСклад: <a href=\"{result['url']}\">"
                 f"{result.get('name') or 'открыть'}</a>"
