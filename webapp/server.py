@@ -204,9 +204,14 @@ async def api_analytics(request: Request):
 
 @app.post("/api/payments/history")
 async def api_payments_history(request: Request):
-    """История платежей текущего пользователя."""
-    import sqlite3
-    from services.database import DB_PATH
+    """История платежей текущего пользователя.
+
+    Работает поверх get_conn(), поэтому одинаково корректно для SQLite
+    и PostgreSQL — раньше эндпоинт жёстко звал sqlite3.connect(DB_PATH),
+    и на Railway (где БД — Postgres, а DB_PATH указывает на ephemeral
+    /tmp/payments.db) валился с «unable to open database file».
+    """
+    from services.database import get_conn, get_cursor, q
 
     data = await request.json()
     user = verify_init_data(data.get("initData", ""))
@@ -216,23 +221,20 @@ async def api_payments_history(request: Request):
     user_id = user["id"]
 
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, amount, currency, comment, status, created_at
-            FROM payments
-            WHERE user_id = ?
-            ORDER BY created_at DESC
-            LIMIT 50
-            """,
-            (user_id,),
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q(
+                    "SELECT id, amount, currency, comment, status, created_at "
+                    "FROM payments WHERE user_id = ? "
+                    "ORDER BY created_at DESC LIMIT 50"
+                ),
+                (user_id,),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
         return JSONResponse({"payments": rows})
     except Exception as e:
+        logger.exception("payments/history failed for user_id=%s", user_id)
         raise HTTPException(status_code=500, detail=str(e))
 
 

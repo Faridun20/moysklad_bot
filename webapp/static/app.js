@@ -61,23 +61,36 @@ async function showScreen(screen) {
 
   const content = document.getElementById('content');
 
-  switch (screen) {
-    case 'home':
-      content.innerHTML = renderHome();
-      break;
-    case 'stock':
-      await renderStock();
-      break;
-   case 'orders':
-      ordersData = null;
-      await renderOrders();
-      break;
-    case 'analytics':
-      await renderAnalytics();
-      break;
-    case 'payments':
-      await renderPayments();
-      break;
+  // Сбрасываем фильтр категории при каждом входе в "Склад",
+  // чтобы не показывать последнюю открытую категорию из прошлой сессии.
+  if (screen === 'stock') {
+    stockCurrentCat = 'all';
+  }
+
+  try {
+    switch (screen) {
+      case 'home':
+        content.innerHTML = renderHome();
+        break;
+      case 'stock':
+        await renderStock();
+        break;
+      case 'orders':
+        ordersData = null;
+        await renderOrders();
+        break;
+      case 'analytics':
+        await renderAnalytics();
+        break;
+      case 'payments':
+        await renderPayments();
+        break;
+      default:
+        content.innerHTML = `<div class="error">Неизвестный экран: ${screen}</div>`;
+    }
+  } catch (e) {
+    // Если render упал — показываем ошибку, а не оставляем старый контент
+    content.innerHTML = `<div class="error">❌ ${e.message || e}</div>`;
   }
 }
 
@@ -106,6 +119,110 @@ function renderHome() {
       </p>
     </div>
   `;
+}
+
+// ─── Экран: Склад ───────────────────────────────────
+
+let stockData = null;          // { products, categories }
+let stockCurrentCat = 'all';   // id выбранной категории или 'all'
+let stockSearch = '';
+
+async function renderStock() {
+  const content = document.getElementById('content');
+  content.innerHTML = `<div class="loader">⏳ Загружаю остатки…</div>`;
+
+  if (!stockData) {
+    try {
+      const r = await fetch('/api/stock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initData: tg.initData }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.detail || 'Ошибка загрузки склада');
+      }
+      stockData = await r.json();
+    } catch (e) {
+      content.innerHTML = `<div class="error">❌ ${e.message}</div>`;
+      return;
+    }
+  }
+
+  renderStockContent();
+}
+
+function renderStockContent() {
+  const content = document.getElementById('content');
+  const { products, categories } = stockData;
+
+  // Категории — таблетки сверху
+  const catBtns = [{ id: 'all', name: `Все (${products.length})` }, ...categories]
+    .map(c =>
+      `<button class="cat-btn ${stockCurrentCat === c.id ? 'active' : ''}" data-cat="${c.id}">${c.name}</button>`
+    ).join('');
+
+  const search = stockSearch.toLowerCase();
+  const filtered = products.filter(p => {
+    if (stockCurrentCat !== 'all' && p.folder_id !== stockCurrentCat) return false;
+    if (search && !p.name.toLowerCase().includes(search)) return false;
+    return true;
+  });
+
+  const badge = (stock) => {
+    if (stock <= 0) return '<span class="stock-badge badge-red">нет</span>';
+    if (stock < 20) return `<span class="stock-badge badge-red">${stock}</span>`;
+    if (stock < 100) return `<span class="stock-badge badge-yellow">${stock}</span>`;
+    return `<span class="stock-badge badge-green">${stock}</span>`;
+  };
+
+  const list = filtered.length === 0
+    ? '<div class="loader">Нет товаров</div>'
+    : filtered.slice(0, 200).map(p => `
+        <div class="stock-row">
+          <div class="stock-info">
+            <div class="stock-name">${escapeHtml(p.name)}</div>
+            <div class="stock-folder">${escapeHtml(p.folder_name || '—')} · ${p.unit}</div>
+          </div>
+          ${badge(p.stock)}
+        </div>
+      `).join('');
+
+  const truncated = filtered.length > 200
+    ? `<div class="loader">Показаны первые 200 из ${filtered.length}. Уточните фильтр.</div>`
+    : '';
+
+  content.innerHTML = `
+    <div class="section-label">Категории</div>
+    <div class="cat-row">${catBtns}</div>
+    <div class="form-row" style="margin: 8px 0;">
+      <input id="stock-search" class="form-input" placeholder="🔎 Поиск товара…" value="${escapeHtml(stockSearch)}">
+    </div>
+    <div class="section-label">Товары</div>
+    <div class="stock-list">${list}</div>
+    ${truncated}
+  `;
+
+  document.querySelectorAll('[data-cat]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      stockCurrentCat = btn.dataset.cat;
+      renderStockContent();
+    });
+  });
+  const searchInput = document.getElementById('stock-search');
+  if (searchInput) {
+    searchInput.addEventListener('input', e => {
+      stockSearch = e.target.value;
+      renderStockContent();
+    });
+    // не дёргаем фокус, чтобы не открывать клавиатуру при первом рендере
+  }
+}
+
+function escapeHtml(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 // ─── Экран: Заказы ──────────────────────────────────
