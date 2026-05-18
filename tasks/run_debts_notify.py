@@ -100,18 +100,26 @@ async def main() -> int:
 
     today_str = date.today().isoformat()
 
-    # Все долги к оплате на сегодня + просроченные (через due_through=today).
-    all_debts = get_open_debts(due_through=today_str)
-    if not all_debts:
+    # get_open_debts теперь включает «менеджер отметил, ждём подтверждения
+    # босса» (paid_at IS NOT NULL, paid_confirmed_at IS NULL). Менеджеру
+    # бесполезно напоминать про долги, которые он уже отметил — он там
+    # ничего сделать не может. Боссу же ВАЖНО про них помнить (он должен
+    # подтвердить). Поэтому фильтр идёт по двум разным спискам.
+    all_debts_full = get_open_debts(due_through=today_str)
+    # Что нужно менеджеру (требует от него действия)
+    all_debts_for_managers = [d for d in all_debts_full if not d.get("paid_at")]
+    # Что нужно боссу (включая awaiting confirmation)
+    all_debts_for_bosses = all_debts_full
+    if not all_debts_for_managers and not all_debts_for_bosses:
         logger.info("Нет долгов к оплате сегодня — никому ничего не шлём.")
         return 0
 
     # Один батч-запрос на все позиции
-    items_by_order = get_order_items_by_ids([d["id"] for d in all_debts])
+    items_by_order = get_order_items_by_ids([d["id"] for d in all_debts_full])
 
     # Группируем по user_id (менеджеру-владельцу заказа)
     by_manager: dict[int, list[dict]] = {}
-    for d in all_debts:
+    for d in all_debts_for_managers:
         by_manager.setdefault(d["user_id"], []).append(d)
 
     users = get_all_users()
@@ -132,15 +140,22 @@ async def main() -> int:
             await tg_send_message(uid, text)
             sent += 1
 
-        # 2. Boss/admin — сводка по всей компании
-        boss_text = _format_message(all_debts, items_by_order, today_str, is_boss_view=True)
+        # 2. Boss/admin — сводка по всей компании (включая awaiting confirmation)
+        boss_text = _format_message(all_debts_for_bosses, items_by_order, today_str, is_boss_view=True)
+        # Дополним подсказкой про подтверждения, если они есть
+        awaiting_count = sum(1 for d in all_debts_for_bosses if d.get("paid_at"))
+        if awaiting_count:
+            boss_text += (
+                f"\n\n⏳ <b>Требуют подтверждения: {awaiting_count}</b>"
+                f"\nОткройте WebApp → «Долги» или /debts в чате."
+            )
         for boss in bosses:
             await tg_send_message(boss["user_id"], boss_text)
             sent += 1
 
         logger.info(
-            "debts_notify: отправлено %d сообщений (долгов всего: %d)",
-            sent, len(all_debts),
+            "debts_notify: отправлено %d сообщений (для менеджеров: %d, для боссов: %d)",
+            sent, len(all_debts_for_managers), len(all_debts_for_bosses),
         )
         return 0
     except Exception:
