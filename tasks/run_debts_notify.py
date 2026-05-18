@@ -23,7 +23,8 @@ from datetime import date
 
 from config import BASE_CURRENCY
 from services.database import (
-    init_db, get_open_debts, get_order_items_by_ids, get_all_users,
+    init_db, get_open_debts, get_order_items_by_ids,
+    get_payments_for_orders, get_all_users,
 )
 from services.moysklad import close_session
 from services.notifier import tg_send_message, close_tg_session
@@ -100,22 +101,31 @@ async def main() -> int:
 
     today_str = date.today().isoformat()
 
-    # get_open_debts теперь включает «менеджер отметил, ждём подтверждения
-    # босса» (paid_at IS NOT NULL, paid_confirmed_at IS NULL). Менеджеру
-    # бесполезно напоминать про долги, которые он уже отметил — он там
-    # ничего сделать не может. Боссу же ВАЖНО про них помнить (он должен
-    # подтвердить). Поэтому фильтр идёт по двум разным спискам.
+    # get_open_debts возвращает все credit+paid_confirmed_at IS NULL.
+    # Делим по платежам:
+    #   - менеджеру нужно действие, если по долгу НЕТ pending payments
+    #     (он ещё ничего не отмечал или босс отклонил всё)
+    #   - боссу — всё, ему важно видеть и долги с pending'ами для approve
     all_debts_full = get_open_debts(due_through=today_str)
-    # Что нужно менеджеру (требует от него действия)
-    all_debts_for_managers = [d for d in all_debts_full if not d.get("paid_at")]
-    # Что нужно боссу (включая awaiting confirmation)
-    all_debts_for_bosses = all_debts_full
-    if not all_debts_for_managers and not all_debts_for_bosses:
+    if not all_debts_full:
         logger.info("Нет долгов к оплате сегодня — никому ничего не шлём.")
         return 0
 
-    # Один батч-запрос на все позиции
-    items_by_order = get_order_items_by_ids([d["id"] for d in all_debts_full])
+    # Один батч на позиции и на платежи
+    debt_ids = [d["id"] for d in all_debts_full]
+    items_by_order = get_order_items_by_ids(debt_ids)
+    payments_by_order = get_payments_for_orders(debt_ids)
+
+    def _has_pending(order_id):
+        return any(
+            p["status"] == "pending"
+            for p in payments_by_order.get(order_id, [])
+        )
+
+    all_debts_for_managers = [
+        d for d in all_debts_full if not _has_pending(d["id"])
+    ]
+    all_debts_for_bosses = all_debts_full
 
     # Группируем по user_id (менеджеру-владельцу заказа)
     by_manager: dict[int, list[dict]] = {}
@@ -143,11 +153,11 @@ async def main() -> int:
         # 2. Boss/admin — сводка по всей компании (включая awaiting confirmation)
         boss_text = _format_message(all_debts_for_bosses, items_by_order, today_str, is_boss_view=True)
         # Дополним подсказкой про подтверждения, если они есть
-        awaiting_count = sum(1 for d in all_debts_for_bosses if d.get("paid_at"))
+        awaiting_count = sum(1 for d in all_debts_for_bosses if _has_pending(d["id"]))
         if awaiting_count:
             boss_text += (
                 f"\n\n⏳ <b>Требуют подтверждения: {awaiting_count}</b>"
-                f"\nОткройте WebApp → «Долги» или /debts в чате."
+                f"\nОткройте WebApp → «Финансы» → «Долги» или /debts в чате."
             )
         for boss in bosses:
             await tg_send_message(boss["user_id"], boss_text)

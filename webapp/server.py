@@ -1156,11 +1156,10 @@ async def api_debts(request: Request):
         due_through=due_through,
     )
 
-    # Подтягиваем позиции одним батчем — нужны для суммы
-    items_by_order = (
-        await adb.get_order_items_by_ids([d["id"] for d in debts])
-        if debts else {}
-    )
+    # Батчем: позиции для total + платежи для подсчёта confirmed/pending
+    debt_ids = [d["id"] for d in debts]
+    items_by_order = await adb.get_order_items_by_ids(debt_ids) if debt_ids else {}
+    payments_by_order = await adb.get_payments_for_orders(debt_ids) if debt_ids else {}
 
     result = []
     for o in debts:
@@ -1169,16 +1168,23 @@ async def api_debts(request: Request):
             float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
             for it in items
         )
+        payments = payments_by_order.get(o["id"], [])
+        confirmed = sum(p["amount"] for p in payments if p["status"] == "confirmed")
+        pending = sum(p["amount"] for p in payments if p["status"] == "pending")
+        remaining = max(0.0, total - confirmed)
         due = o.get("due_date")
-        # State дописывает «awaiting_confirmation» — даже если по дате
-        # это «upcoming/today/overdue», важнее показать, что менеджер
-        # уже отметил оплату и ждёт подтверждения босса.
-        if o.get("paid_at"):
+        # State:
+        #  - awaiting_confirmation — есть pending payments (boss решает)
+        #  - partial — есть confirmed, но ещё не всё (pending=0)
+        #  - иначе по due_date: overdue/due_today/upcoming
+        if pending > 0:
             state = "awaiting_confirmation"
+        elif confirmed > 0:
+            state = "partial"
         elif due:
             state = "overdue" if due < today else ("due_today" if due == today else "upcoming")
         else:
-            state = "upcoming"  # без даты не считаем просроченным
+            state = "upcoming"
         result.append({
             "id": o["id"],
             "user_id": o["user_id"],
@@ -1187,6 +1193,9 @@ async def api_debts(request: Request):
             "due_date": due,
             "currency": o.get("currency") or BASE_CURRENCY,
             "total": total,
+            "confirmed": confirmed,
+            "pending": pending,
+            "remaining": remaining,
             "items_count": len(items),
             "created_at": (o.get("created_at") or "")[:10],
             "paid_at": (o.get("paid_at") or "")[:16] if o.get("paid_at") else None,
@@ -1194,40 +1203,60 @@ async def api_debts(request: Request):
             "is_mine": o["user_id"] == user_id,
         })
 
-    # Сводка «получено» — отдельные суммы по валютам (без конвертации).
-    # Для расчёта берём только подтверждённые: paid_confirmed_at IS NOT NULL.
-    # Менеджер видит свои; босс — все.
-    confirmed_orders = await adb.get_all_orders() if is_boss else await adb.get_user_orders(user_id)
-    received_by_currency: dict[str, float] = {}
-    pending_by_currency: dict[str, float] = {}
-    confirmed_ids = [o["id"] for o in confirmed_orders if o.get("paid_confirmed_at")]
-    awaiting_ids = [o["id"] for o in confirmed_orders if o.get("paid_at") and not o.get("paid_confirmed_at")]
-    if confirmed_ids or awaiting_ids:
-        all_items = await adb.get_order_items_by_ids(confirmed_ids + awaiting_ids)
-        for o in confirmed_orders:
-            if o.get("paid_confirmed_at"):
-                bucket = received_by_currency
-            elif o.get("paid_at"):
-                bucket = pending_by_currency
-            else:
-                continue
-            cur_ = o.get("currency") or BASE_CURRENCY
-            total = sum(
-                float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
-                for it in all_items.get(o["id"], [])
-            )
-            bucket[cur_] = bucket.get(cur_, 0.0) + total
+    # Сводка «получено / ожидает» — по сумме payments, а не по orders.
+    # Берём ВСЕ payments (включая привязанные к закрытым заказам), потому
+    # что money_received = «реально пришло за всё время», а не только по
+    # открытым долгам. Менеджер — свои, босс — все.
+    summary = await _money_summary(
+        adb, user_id=None if is_boss else user_id,
+    )
 
     return JSONResponse({
         "debts": result,
         "role": role,
         "scope": "company" if is_boss else "personal",
         "today": today,
-        # «Получено» — сумма уже подтверждённых поступлений за всё время.
-        # «Ожидает подтверждения» — менеджер отметил, босс ещё нет.
-        "money_received": [{"currency": k, "total": v} for k, v in received_by_currency.items()],
-        "money_pending": [{"currency": k, "total": v} for k, v in pending_by_currency.items()],
+        "money_received": [{"currency": k, "total": v} for k, v in summary["received"].items()],
+        "money_pending":  [{"currency": k, "total": v} for k, v in summary["pending"].items()],
     })
+
+
+async def _money_summary(adb, user_id: int | None) -> dict:
+    """Сводка денежных потоков: отдельные суммы по валютам.
+
+    Считается по payments (а не по orders) — это даёт точные цифры
+    при частичных оплатах. Менеджер видит свои payments, boss — все.
+    """
+    import asyncio
+    from services.database import get_conn, get_cursor, q
+
+    def _load():
+        where = "WHERE 1=1"
+        params: list = []
+        if user_id is not None:
+            where += " AND user_id = ?"
+            params.append(user_id)
+        sql = (
+            f"SELECT status, currency, SUM(amount) AS total "
+            f"FROM payments {where} "
+            f"GROUP BY status, currency"
+        )
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(q(sql), params)
+            return [dict(r) for r in cur.fetchall()]
+
+    rows = await asyncio.to_thread(_load)
+    received: dict[str, float] = {}
+    pending: dict[str, float] = {}
+    for r in rows:
+        cur_ = r.get("currency") or "USD"
+        amt = float(r.get("total") or 0)
+        if r.get("status") == "confirmed":
+            received[cur_] = received.get(cur_, 0.0) + amt
+        elif r.get("status") == "pending":
+            pending[cur_] = pending.get(cur_, 0.0) + amt
+    return {"received": received, "pending": pending}
 
 
 @app.post("/api/orders/mark_paid")
@@ -1275,50 +1304,78 @@ async def api_mark_paid(request: Request):
         f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
         or user.get("username", str(user_id))
     )
-    updated = await adb.mark_order_paid(order_id, user_id, full_name)
+    username = f"@{user['username']}" if user.get("username") else ""
 
-    # Если менеджер отметил оплату — шлём боссам push для подтверждения
-    # (это и есть «двухступенчатый» контроль).
-    if updated:
-        await _notify_bosses_payment_pending(order_id, full_name)
+    # amount: если передан и валиден — частичная оплата; иначе закроет остаток
+    amount_raw = data.get("amount")
+    amount = None
+    if amount_raw is not None and amount_raw != "":
+        try:
+            amount = float(amount_raw)
+            if amount <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Неверная сумма")
 
-    return JSONResponse({"ok": True, "updated": updated})
+    ok, payment_id = await adb.mark_order_paid(
+        order_id, user_id, full_name, amount=amount, username=username,
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=400,
+            detail="Не удалось создать платёж (возможно, заказ уже полностью оплачен)",
+        )
+
+    # Сразу шлём боссу push с inline-кнопками для approve.
+    await _notify_bosses_payment_pending(order_id, full_name, payment_id)
+
+    return JSONResponse({"ok": True, "payment_id": payment_id})
 
 
-async def _notify_bosses_payment_pending(order_id: int, manager_name: str) -> None:
-    """Когда менеджер отметил оплату по credit-заказу — шлём push'ы всем
-    boss/admin с inline-кнопками confirm/reject. Best-effort: тихо
-    логируем ошибки, не валим API-вызов."""
+async def _notify_bosses_payment_pending(
+    order_id: int, manager_name: str, payment_id: int | None,
+) -> None:
+    """Когда менеджер отметил частичную/полную оплату по credit-заказу —
+    шлём push'ы всем boss/admin с кнопками confirm/reject через
+    стандартный payment-approval flow (pay_ok/pay_no callbacks).
+    Best-effort, тихо ловим ошибки."""
     from services import async_db as adb
     from services.notifier import aget_notify_recipients, tg_send_message
 
     try:
         order = await adb.get_order(order_id)
-        if not order:
+        if not order or not payment_id:
             return
-        items = await adb.get_order_items(order_id)
-        total = sum(
-            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
-            for it in items
-        )
+        payment = await adb.get_payment(payment_id)
+        if not payment:
+            return
+        summary = await adb.get_order_payment_summary(order_id)
         from config import BASE_CURRENCY
         currency = order.get("currency") or BASE_CURRENCY
         agent = order.get("agent_name") or "—"
         due = order.get("due_date") or "—"
+        amount = float(payment.get("amount") or 0)
+        fmt = lambda n: f"{int(round(n)):,}".replace(",", " ")
+        remaining_after = max(0.0, summary["remaining"])
         text = (
             "💳 <b>Требуется подтверждение оплаты</b>\n\n"
             f"Заказ #{order_id}\n"
             f"👨‍💼 Менеджер: <b>{manager_name}</b>\n"
             f"🏢 Клиент: <b>{agent}</b>\n"
-            f"💰 Сумма: <b>{int(round(total)):,}</b> {currency}\n"
-            f"📅 Срок был: {due}\n\n"
-            "Менеджер отметил «деньги получил». Подтвердите, что они "
-            "реально пришли в кассу."
-        ).replace(",", " ")
+            f"💵 Получено: <b>{fmt(amount)} {currency}</b> "
+            f"(всего заказ {fmt(summary['total'])}, "
+            f"остаток после approve: {fmt(remaining_after)})\n"
+            f"📅 Срок: {due}\n\n"
+            "Подтвердите, что эта сумма реально пришла в кассу."
+        )
+        # Используем СУЩЕСТВУЮЩИЕ pay_ok/pay_no callbacks — это
+        # стандартный payment-approval flow в handlers/payments.py.
+        # После approve платежа _maybe_close_order_after_payment
+        # автоматически проверит, закрылся ли заказ.
         keyboard = {
             "inline_keyboard": [[
-                {"text": "✅ Подтверждаю",  "callback_data": f"pay_conf_ok:{order_id}"},
-                {"text": "❌ Отклонить",   "callback_data": f"pay_conf_no:{order_id}"},
+                {"text": "✅ Принять",   "callback_data": f"pay_ok:{payment_id}"},
+                {"text": "❌ Отклонить", "callback_data": f"pay_no:{payment_id}"},
             ]]
         }
         for uid in await aget_notify_recipients():
@@ -1329,7 +1386,12 @@ async def _notify_bosses_payment_pending(order_id: int, manager_name: str) -> No
 
 @app.post("/api/orders/confirm_payment")
 async def api_confirm_payment(request: Request):
-    """Босс подтверждает поступление денег по заказу."""
+    """Босс подтверждает все pending платежи по заказу одной кнопкой.
+
+    Подтверждает каждый payment через стандартный confirm_payment(),
+    после каждого — _maybe_close_order_after_payment проверяет, не
+    закрылся ли заказ полностью.
+    """
     from services import async_db as adb
 
     data = await request.json()
@@ -1350,13 +1412,14 @@ async def api_confirm_payment(request: Request):
         f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
         or user.get("username", str(user["id"]))
     )
-    updated = await adb.confirm_payment_received(order_id, user["id"], full_name)
-    return JSONResponse({"ok": True, "updated": updated})
+    n = await adb.confirm_all_pending_payments_for_order(order_id, user["id"], full_name)
+    return JSONResponse({"ok": True, "confirmed_count": n})
 
 
 @app.post("/api/orders/reject_payment")
 async def api_reject_payment(request: Request):
-    """Босс отклоняет: денег не вижу. Сбрасываем paid_at, цикл с нуля."""
+    """Босс отклоняет все pending платежи по заказу. Заказ остаётся
+    в долгах с тем что было до отклонения."""
     from services import async_db as adb
 
     data = await request.json()
@@ -1377,10 +1440,10 @@ async def api_reject_payment(request: Request):
         f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
         or user.get("username", str(user["id"]))
     )
-    updated = await adb.reject_payment_received(order_id, user["id"], full_name)
+    n = await adb.reject_all_pending_payments_for_order(order_id, user["id"], full_name)
 
     # Опционально: уведомить менеджера-владельца что босс отклонил
-    if updated:
+    if n > 0:
         try:
             from services import async_db as adb2
             from services.notifier import tg_send_message
@@ -1394,7 +1457,37 @@ async def api_reject_payment(request: Request):
         except Exception:
             logger.exception("Не удалось уведомить менеджера об отклонении #%s", order_id)
 
-    return JSONResponse({"ok": True, "updated": updated})
+    return JSONResponse({"ok": True, "rejected_count": n})
+
+
+@app.post("/api/orders/delete_draft")
+async def api_delete_draft(request: Request):
+    """Удалить черновик заказа (только владелец, только status='draft').
+
+    Каскадно удаляет позиции. Возвращает 404 если заказа нет, 403 если
+    не свой или уже не draft."""
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_delete_draft",
+        rate_limit_max=20,
+        rate_limit_window=60.0,
+    )
+    try:
+        order_id = int(data.get("order_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="order_id обязателен")
+
+    ok = await adb.delete_order(order_id, user["id"])
+    if not ok:
+        raise HTTPException(
+            status_code=403,
+            detail="Нельзя удалить (не свой / уже не черновик / не существует)",
+        )
+    return JSONResponse({"ok": True})
 
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────

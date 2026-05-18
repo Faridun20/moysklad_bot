@@ -973,3 +973,53 @@ body {
   text-align: center; font-size: 13px; color: var(--text-mute, #888);
   font-style: italic;
 }
+
+/* ─── Подвкладки «Финансы» (Долги / Платежи) ───────────────────── */
+.finance-tabs {
+  display: flex; gap: 8px; padding: 14px 14px 0;
+}
+.finance-tab {
+  flex: 1; padding: 12px; border: 0; border-radius: 12px;
+  background: var(--bg-card, #f5f5f5);
+  color: var(--text, #000); font-size: 14px; font-weight: 600;
+  cursor: pointer;
+}
+.finance-tab.active {
+  background: var(--accent, #2481cc);
+  color: #fff;
+}
+
+/* ─── Partial-оплата (input + кнопка в ряд) ────────────────────── */
+.pay-input-row {
+  display: flex; gap: 8px; align-items: stretch;
+}
+.pay-amount-input {
+  flex: 1; padding: 10px 12px; font-size: 14px;
+  border: 1px solid var(--text-mute, #ccc); border-radius: 10px;
+  background: var(--bg, #fff); color: var(--text, #000);
+}
+.pay-input-row .btn-mark-paid {
+  flex-shrink: 0; width: auto; padding: 10px 14px;
+}
+.debt-breakdown {
+  display: flex; flex-wrap: wrap; gap: 10px;
+  font-size: 13px; color: var(--text-mute, #888);
+  padding: 6px 0; margin-bottom: 6px;
+}
+.debt-breakdown b { color: var(--text, #000); }
+
+/* Жёлтая полоска для partial-state */
+.debt-card.debt-partial { border-left-color: #f9a825; }
+
+/* ─── Кнопки управления черновиком ─────────────────────────────── */
+.draft-actions {
+  display: flex; gap: 8px; margin-top: 8px;
+}
+.draft-actions .btn-edit-order { flex: 1; }
+.btn-delete-draft {
+  flex-shrink: 0; padding: 8px 14px;
+  background: transparent; border: 1px solid #d93025;
+  color: #d93025; border-radius: 10px;
+  font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.btn-delete-draft:disabled { opacity: 0.5; cursor: default; }
