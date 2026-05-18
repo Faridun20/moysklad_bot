@@ -14,7 +14,9 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from webapp.auth import verify_init_data
-from services.database import get_role
+# Берём роль из in-memory кэша (TTL 60s) вместо SELECT'а на каждый API-запрос.
+# `get_role` оставляем как имя для обратной совместимости с кодом ниже.
+from services.roles import cached_role as get_role
 from services.rate_limit import acquire as rate_limit_acquire
 
 
@@ -664,7 +666,7 @@ async def api_payments_history(request: Request):
 async def api_payments_send(request: Request):
     """Отправить новый платёж на подтверждение."""
     from config import ADMIN_IDS, TELEGRAM_TOKEN
-    from services.database import add_payment, add_audit_log, get_role
+    from services.database import add_payment, add_audit_log
     from utils.formatters import format_payment_notify
     import aiohttp
 
@@ -756,7 +758,7 @@ async def api_orders(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
 
-    from services.database import get_user_orders, get_order_items, get_role
+    from services.database import get_user_orders, get_order_items
     role = get_role(user["id"])
 
     if role in ("admin", "boss"):
@@ -805,7 +807,6 @@ async def api_pending_requests(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
 
-    from services.database import get_role
     role = get_role(user["id"])
     if role not in ("admin", "boss"):
         raise HTTPException(status_code=403, detail="Нет доступа")
@@ -940,7 +941,7 @@ async def api_submit_order(request: Request):
 
     from services.database import (
         get_order, get_order_items, create_shipment_request,
-        update_order_status, add_audit_log, get_role,
+        update_order_status, add_audit_log,
     )
     from services.notifier import get_notify_recipients
     from utils.formatters import DIV

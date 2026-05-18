@@ -22,8 +22,32 @@ SQL_SLOW_MS = float(os.environ.get("SQL_SLOW_MS", "200"))
 
 if USE_POSTGRES:
     import psycopg2
+    from psycopg2 import pool as _pg_pool
     from psycopg2.extras import RealDictCursor
     logger.info("Используется PostgreSQL")
+
+    # Размер пула. Минимум 1 коннект всегда держим открытым, максимум
+    # PG_POOL_MAX — это потолок одновременно открытых коннектов от этого
+    # процесса. Railway Postgres даёт ~50-100 коннектов на инстанс; 10
+    # достаточно для бота на сотни юзеров и оставляет запас другим
+    # сервисам (webapp как отдельный процесс, миграции и т.п.).
+    _PG_POOL_MIN = int(os.environ.get("PG_POOL_MIN", "1"))
+    _PG_POOL_MAX = int(os.environ.get("PG_POOL_MAX", "10"))
+    _pg_connection_pool: _pg_pool.ThreadedConnectionPool | None = None
+
+    def _get_pool() -> _pg_pool.ThreadedConnectionPool:
+        """Ленивая инициализация пула — позволяет импортировать модуль
+        в окружениях без DATABASE_URL (тесты, миграции) без падения."""
+        global _pg_connection_pool
+        if _pg_connection_pool is None:
+            _pg_connection_pool = _pg_pool.ThreadedConnectionPool(
+                _PG_POOL_MIN, _PG_POOL_MAX, DATABASE_URL
+            )
+            logger.info(
+                "Postgres pool создан: min=%d, max=%d",
+                _PG_POOL_MIN, _PG_POOL_MAX,
+            )
+        return _pg_connection_pool
 else:
     import sqlite3
     logger.info("Используется SQLite: %s", DB_PATH)
@@ -62,12 +86,28 @@ class _TimedCursor:
 
 @contextmanager
 def get_conn():
+    """Контекстный менеджер для коннекта к БД.
+
+    Postgres: берём из ThreadedConnectionPool и возвращаем обратно
+    (а не close — close уничтожает коннект и пул его пересоздаёт, что
+    убивает весь смысл пула). При исключении делаем rollback, чтобы
+    не вернуть в пул коннект с «грязной» транзакцией.
+
+    SQLite: по-старому — отдельное соединение на каждый вызов.
+    """
     if USE_POSTGRES:
-        conn = psycopg2.connect(DATABASE_URL)
+        pool = _get_pool()
+        conn = pool.getconn()
         try:
             yield conn
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
         finally:
-            conn.close()
+            pool.putconn(conn)
     else:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
@@ -93,6 +133,18 @@ def q(query: str) -> str:
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _invalidate_role_cache(user_id: int) -> None:
+    """Сбрасываем кэш ролей. Лениво импортируем services.roles, иначе
+    круговой импорт (roles уже зависит от database)."""
+    try:
+        from services.roles import invalidate_role
+        invalidate_role(user_id)
+    except Exception:
+        # Кэш — мягкий, рассинхрон протухнет через TTL за 60 сек.
+        # Не валим write-операцию из-за проблем с кэшем.
+        pass
 
 
 # ─── Инициализация ────────────────────────────────────────────────────────────
@@ -344,6 +396,7 @@ def set_role(user_id: int, username: str, full_name: str, role: str) -> bool:
                     role = excluded.role
             """, (user_id, username, full_name, role, now_str()))
         conn.commit()
+    _invalidate_role_cache(user_id)
     return True
 
 
@@ -410,6 +463,7 @@ def ensure_user(user_id: int, username: str, full_name: str, admin_ids: list[int
             (user_id, username, full_name, role, now_str()),
         )
         conn.commit()
+    _invalidate_role_cache(user_id)
 
 
 def set_moysklad_employee(user_id: int, ms_employee_id: str, status: str = "linked") -> bool:
@@ -457,6 +511,8 @@ def remove_user(user_id: int, removed_by: int = None, removed_name: str = "") ->
         cur.execute(q("DELETE FROM user_roles WHERE user_id = ?"), (user_id,))
         deleted = cur.rowcount > 0
         conn.commit()
+    if deleted:
+        _invalidate_role_cache(user_id)
     if deleted and removed_by and target:
         add_audit_log(
             removed_by, removed_name, get_role(removed_by),
