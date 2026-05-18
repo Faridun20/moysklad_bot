@@ -96,7 +96,7 @@ async def get_sales_stats(since: datetime, until: datetime = None) -> dict:
     )
 
     product_sums: dict[str, dict] = {}
-    for s in shipments[:30]:
+    for s in shipments[:15]:
         demand_id = extract_id_from_href(s.get("meta", {}).get("href", ""))
         if not demand_id:
             continue
@@ -183,7 +183,7 @@ async def get_employee_stats(
 
     # По товарам
     product_sums: dict[str, dict] = {}
-    for s in shipments[:20]:
+    for s in shipments[:10]:  # Уменьшаем чтобы не превышать лимит
         demand_id = extract_id_from_href(s.get("meta", {}).get("href", ""))
         if not demand_id:
             continue

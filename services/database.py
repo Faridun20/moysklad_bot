@@ -10,7 +10,9 @@ from contextlib import contextmanager
 logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-DB_PATH = os.environ.get("DB_PATH", "payments.db")
+import tempfile
+_default_db = os.path.join(tempfile.gettempdir(), "payments.db")
+DB_PATH = os.environ.get("DB_PATH", _default_db)
 USE_POSTGRES = bool(DATABASE_URL)
 
 if USE_POSTGRES:

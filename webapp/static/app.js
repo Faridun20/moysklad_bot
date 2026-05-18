@@ -411,7 +411,7 @@ async function loadAgents(search) {
 
 // ─── Выбор товара ───────────────────────────────────
 
-let stockCache = null;
+let orderStockCache = null;
 
 async function openProductPicker() {
   const content = document.getElementById('content');
@@ -432,10 +432,10 @@ async function openProductPicker() {
   document.getElementById('prod-back').addEventListener('click', renderOrderEditor);
 
   // Загружаем склад
-  if (!stockCache) {
+  if (!orderStockCache) {
     try {
       const data = await api('/api/stock', {});
-      stockCache = data;
+      orderStockCache = data;
     } catch (e) {
       document.getElementById('prod-list').innerHTML = `<div class="error">❌ ${e.message}</div>`;
       return;
@@ -443,7 +443,7 @@ async function openProductPicker() {
   }
 
   let selectedCat = 'all';
-  const { products, categories } = stockCache;
+  const { products, categories } = orderStockCache;
 
   function renderProducts() {
     const search = document.getElementById('prod-search')?.value.toLowerCase() || '';
