@@ -174,18 +174,23 @@ async def get_me(request: Request):
 @app.post("/api/home")
 async def api_home(request: Request):
     """
-    Данные для Главного экрана WebApp — компактная сводка, чтобы юзер
-    видел что-то полезное сразу, не переключаясь по табам.
+    Главный экран WebApp — разный для ролей.
 
-    Возвращает разное содержимое в зависимости от роли:
-    - все: today (выручка/отгрузок/клиентов за сегодня) + my_orders сводка
-    - boss/admin: дополнительно pending_requests и top_employees за неделю
+    Менеджер видит ТОЛЬКО свои данные:
+      - today: его выручка/отгрузки/клиенты за сегодня (из локальной БД)
+      - my_orders: его заказы (по статусам + последние 5)
+
+    Босс/админ видит общую картину:
+      - today: общая выручка/отгрузки/клиенты по всему МойСклад
+      - my_orders: его собственные заказы
+      - pending_requests: количество заявок ожидающих апрува
+      - top_employees: лидерборд за неделю
     """
     from datetime import datetime, timedelta
     from services.moysklad import get_sales_stats, get_shipments
     from services.database import (
         get_user_orders, get_pending_requests,
-        get_moysklad_employee_id,
+        get_moysklad_employee_id, get_order_items,
     )
 
     data = await request.json()
@@ -202,14 +207,7 @@ async def api_home(request: Request):
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago = now - timedelta(days=7)
 
-    # Сводка за сегодня — общая (по всему МойСклад)
-    try:
-        today_stats = await get_sales_stats(start_of_day, now)
-    except Exception as e:
-        logger.warning("home: failed to load today stats: %s", e)
-        today_stats = {"total": 0, "count": 0, "clients": 0, "top_products": []}
-
-    # Заказы текущего юзера
+    # Заказы текущего юзера — нужны и менеджеру (сводка), и боссу (его лично)
     my_orders = get_user_orders(user_id)
     orders_by_status = {"draft": 0, "pending": 0, "approved": 0, "rejected": 0, "shipped": 0}
     for o in my_orders:
@@ -225,13 +223,56 @@ async def api_home(request: Request):
         for o in my_orders[:5]
     ]
 
-    result = {
-        "role": role,
-        "today": {
-            "revenue": today_stats["total"] / 100,  # копейки → ₽/₸ etc
+    is_boss = role in ("admin", "boss")
+
+    # ─── Сегодня ──────────────────────────────────────
+    if is_boss:
+        # Босс видит общую выручку компании
+        try:
+            today_stats = await get_sales_stats(start_of_day, now)
+        except Exception as e:
+            logger.warning("home: failed to load today stats: %s", e)
+            today_stats = {"total": 0, "count": 0, "clients": 0, "top_products": []}
+        today = {
+            "revenue": today_stats["total"] / 100,
             "shipments": today_stats["count"],
             "clients": today_stats["clients"],
-        },
+            "scope": "company",
+        }
+    else:
+        # Менеджер: считаем личные показатели из локальных одобренных заявок.
+        # Источник — наша БД, без обращения к МойСклад. Аналогично кешу.
+        my_today_revenue = 0.0
+        my_today_count = 0
+        my_today_clients: set[str] = set()
+        today_iso = start_of_day.strftime("%Y-%m-%d")
+        for o in my_orders:
+            # Считаем «отгруженные сегодня» как заказы со статусом approved/shipped,
+            # созданные/обновлённые сегодня. Простой и достаточно точный прокси
+            # до полноценного учёта по дате demand.
+            if o["status"] not in ("approved", "shipped"):
+                continue
+            updated = (o.get("updated_at") or o.get("created_at") or "")[:10]
+            if updated != today_iso:
+                continue
+            items = get_order_items(o["id"])
+            my_today_revenue += sum(
+                float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
+                for it in items
+            )
+            my_today_count += 1
+            if o.get("agent_name"):
+                my_today_clients.add(o["agent_name"])
+        today = {
+            "revenue": my_today_revenue,
+            "shipments": my_today_count,
+            "clients": len(my_today_clients),
+            "scope": "personal",  # фронт показывает «Моё за сегодня»
+        }
+
+    result = {
+        "role": role,
+        "today": today,
         "my_orders": {
             "draft": orders_by_status["draft"],
             "pending": orders_by_status["pending"],
@@ -243,15 +284,10 @@ async def api_home(request: Request):
         "ms_linked": bool(get_moysklad_employee_id(user_id)),
     }
 
-    # Для босса/админа — дополнительно
-    if role in ("admin", "boss"):
+    if is_boss:
         pending = get_pending_requests()
         result["pending_requests"] = len(pending)
 
-        # Топ-сотрудники за последнюю неделю по выручке.
-        # Берём отгрузки за неделю и группируем по owner.name.
-        # Это +1 запрос к МойСклад, но дешевле чем дёргать get_employee_stats
-        # на каждого сотрудника отдельно.
         try:
             week_shipments = await get_shipments(week_ago, now)
             by_owner: dict[str, dict] = {}
@@ -307,6 +343,9 @@ async def api_stock(request: Request):
             "stock": r.get("stock", 0),
             "reserve": r.get("reserve", 0),
             "unit": r.get("uom", {}).get("name", "шт"),
+            # href нужен чтобы при создании заявки через WebApp
+            # позиция уехала в МойСклад demand с правильной ссылкой на товар
+            "href": r.get("meta", {}).get("href", ""),
             "folder_id": extract_id_from_href(
                 r.get("folder", {}).get("meta", {}).get("href", "")
             ),
@@ -331,17 +370,23 @@ async def api_stock(request: Request):
 
 @app.post("/api/analytics")
 async def api_analytics(request: Request):
-    """Аналитика продаж за период."""
+    """
+    Аналитика продаж за период.
+
+    Менеджер видит ТОЛЬКО свои показатели (из локальной БД).
+    Босс/админ — общую по компании (из МойСклад API).
+    """
     from datetime import datetime, timedelta
     from services.moysklad import get_sales_stats, get_shipments
-    from utils.helpers import extract_id_from_href
+    from services.database import get_user_orders, get_order_items
 
     data = await request.json()
     user = verify_init_data(data.get("initData", ""))
     if not user:
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
 
-    role = get_role(user["id"])
+    user_id = user["id"]
+    role = get_role(user_id)
     if role not in ("admin", "boss", "manager"):
         raise HTTPException(status_code=403, detail="Нет доступа")
 
@@ -356,6 +401,11 @@ async def api_analytics(request: Request):
     }
     since, prev_since, label = periods.get(period, periods["month"])
 
+    if role == "manager":
+        # Личная аналитика — считаем из локальной БД по одобренным заявкам.
+        return JSONResponse(_personal_analytics(user_id, since, now, prev_since, label))
+
+    # Босс/админ — компания, из МойСклад
     try:
         current, prev, shipments = await asyncio.gather(
             get_sales_stats(since, now),
@@ -365,7 +415,6 @@ async def api_analytics(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # По дням недели
     days_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     by_day = [0] * 7
     for s in shipments:
@@ -376,12 +425,10 @@ async def api_analytics(request: Request):
         except Exception:
             pass
 
-    # Тренд
     trend = 0
     if prev["total"] > 0:
         trend = round((current["total"] - prev["total"]) / prev["total"] * 100)
 
-    # Топ товаров — top_products это список tuples (name, data)
     top = [
         {"name": name, "sum": d["sum"] / 100, "qty": d["qty"]}
         for name, d in current["top_products"][:5]
@@ -389,6 +436,7 @@ async def api_analytics(request: Request):
 
     return JSONResponse({
         "label": label,
+        "scope": "company",
         "total": current["total"] / 100,
         "count": current["count"],
         "clients": current["clients"],
@@ -397,6 +445,77 @@ async def api_analytics(request: Request):
         "by_day": [{"day": days_ru[i], "count": by_day[i]} for i in range(7)],
         "top_products": top,
     })
+
+
+def _personal_analytics(
+    user_id: int,
+    since,
+    until,
+    prev_since,
+    label: str,
+) -> dict:
+    """Личная аналитика менеджера из локальной БД (no МойСклад API)."""
+    from datetime import datetime
+    from services.database import get_user_orders, get_order_items
+
+    orders = get_user_orders(user_id)
+    since_iso = since.strftime("%Y-%m-%d %H:%M:%S")
+    until_iso = until.strftime("%Y-%m-%d %H:%M:%S")
+    prev_since_iso = prev_since.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _agg(start_iso, end_iso):
+        total = 0.0
+        count = 0
+        clients: set[str] = set()
+        product_sums: dict[str, dict] = {}
+        by_day = [0] * 7
+        for o in orders:
+            if o["status"] not in ("approved", "shipped"):
+                continue
+            ts = (o.get("updated_at") or o.get("created_at") or "")[:19]
+            if ts < start_iso or ts > end_iso:
+                continue
+            items = get_order_items(o["id"])
+            sub = sum(
+                float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
+                for it in items
+            )
+            total += sub
+            count += 1
+            if o.get("agent_name"):
+                clients.add(o["agent_name"])
+            try:
+                d = datetime.strptime(ts[:10], "%Y-%m-%d").weekday()
+                by_day[d] += 1
+            except Exception:
+                pass
+            for it in items:
+                name = it.get("product_name", "—")
+                qty = float(it.get("quantity", 0))
+                price = float(it.get("price", 0) or 0)
+                agg = product_sums.setdefault(name, {"sum": 0.0, "qty": 0.0})
+                agg["sum"] += qty * price
+                agg["qty"] += qty
+        top = sorted(product_sums.items(), key=lambda kv: kv[1]["sum"], reverse=True)[:5]
+        return total, count, len(clients), top, by_day
+
+    cur_total, cur_count, cur_clients, cur_top, by_day = _agg(since_iso, until_iso)
+    prev_total, prev_count, _, _, _ = _agg(prev_since_iso, since_iso)
+
+    trend = round((cur_total - prev_total) / prev_total * 100) if prev_total > 0 else 0
+    days_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+    return {
+        "label": label,
+        "scope": "personal",
+        "total": cur_total,
+        "count": cur_count,
+        "clients": cur_clients,
+        "avg_check": (cur_total / cur_count) if cur_count else 0,
+        "trend": trend,
+        "by_day": [{"day": days_ru[i], "count": by_day[i]} for i in range(7)],
+        "top_products": [{"name": n, "sum": d["sum"], "qty": d["qty"]} for n, d in cur_top],
+    }
 
 # ─── API: платежи ─────────────────────────────────────────────────────────────
 
@@ -538,6 +657,10 @@ async def api_orders(request: Request):
     result = []
     for o in orders:
         items = get_order_items(o["id"])
+        total = sum(
+            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
+            for it in items
+        )
         result.append({
             "id": o["id"],
             "status": o["status"],
@@ -546,11 +669,13 @@ async def api_orders(request: Request):
             "comment": o.get("comment", ""),
             "created_at": o["created_at"][:16],
             "items_count": len(items),
+            "total": total,
             "items": [
                 {
                     "name": it["product_name"],
                     "quantity": it["quantity"],
                     "unit": it["unit"],
+                    "price": float(it.get("price", 0) or 0),
                 }
                 for it in items
             ],
@@ -578,6 +703,10 @@ async def api_pending_requests(request: Request):
     for r in requests:
         order = get_order(r["order_id"])
         items = get_order_items(r["order_id"]) if order else []
+        total = sum(
+            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
+            for it in items
+        )
         result.append({
             "id": r["id"],
             "order_id": r["order_id"],
@@ -585,8 +714,14 @@ async def api_pending_requests(request: Request):
             "status": r["status"],
             "created_at": r["created_at"][:16],
             "agent_name": order.get("agent_name", "") if order else "",
+            "total": total,
             "items": [
-                {"name": it["product_name"], "quantity": it["quantity"], "unit": it["unit"]}
+                {
+                    "name": it["product_name"],
+                    "quantity": it["quantity"],
+                    "unit": it["unit"],
+                    "price": float(it.get("price", 0) or 0),
+                }
                 for it in items
             ],
         })
@@ -628,12 +763,20 @@ async def api_add_item(request: Request):
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
 
+    try:
+        price = float(data.get("price", 0) or 0)
+        if price < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Неверная цена")
+
     item_id = add_order_item(
         order_id=data["order_id"],
         product_name=data["product_name"],
         product_href=data.get("product_href", ""),
         quantity=float(data["quantity"]),
         unit=data.get("unit", "шт"),
+        price=price,
         note=data.get("note", ""),
     )
     return JSONResponse({"item_id": item_id})

@@ -156,6 +156,7 @@ def init_db():
                 product_href TEXT,
                 quantity     REAL NOT NULL DEFAULT 1,
                 unit         TEXT DEFAULT 'шт',
+                price        REAL DEFAULT 0,
                 note         TEXT
             )""",
 
@@ -245,6 +246,10 @@ def init_db():
             ("user_roles", "moysklad_employee_id", "TEXT"),
             ("user_roles", "ms_sync_status", "TEXT DEFAULT 'pending'"),
             ("user_roles", "created_at", "TEXT"),
+            # Цена за единицу для позиции заказа (в основной валюте,
+            # т.е. как пользователь ввёл — например 150.50 USD).
+            # При создании demand в МойСклад умножаем на 100 (минорные единицы).
+            ("order_items", "price", "REAL DEFAULT 0"),
         ]
         for table, column, col_type in migrations:
             try:
@@ -680,20 +685,23 @@ def update_order_status(order_id: int, status: str) -> bool:
 
 
 def add_order_item(order_id: int, product_name: str, product_href: str,
-                   quantity: float, unit: str, note: str = "") -> int:
+                   quantity: float, unit: str, price: float = 0.0,
+                   note: str = "") -> int:
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
             cur.execute("""
-                INSERT INTO order_items (order_id, product_name, product_href, quantity, unit, note)
-                VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
-            """, (order_id, product_name, product_href, quantity, unit, note))
+                INSERT INTO order_items
+                    (order_id, product_name, product_href, quantity, unit, price, note)
+                VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
+            """, (order_id, product_name, product_href, quantity, unit, price, note))
             item_id = cur.fetchone()["id"]
         else:
             cur.execute("""
-                INSERT INTO order_items (order_id, product_name, product_href, quantity, unit, note)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (order_id, product_name, product_href, quantity, unit, note))
+                INSERT INTO order_items
+                    (order_id, product_name, product_href, quantity, unit, price, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (order_id, product_name, product_href, quantity, unit, price, note))
             item_id = cur.lastrowid
         conn.commit()
     return item_id

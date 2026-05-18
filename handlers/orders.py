@@ -44,6 +44,7 @@ router = Router()
 class OrderState(StatesGroup):
     choosing_product  = State()  # выбор товара
     entering_quantity = State()  # ввод количества
+    entering_price    = State()  # ввод цены за единицу
     choosing_agent    = State()  # выбор клиента
     entering_comment  = State()  # комментарий к заявке
 
@@ -68,6 +69,17 @@ STATUS_NAME = {
 }
 
 
+def _line_total(item: dict) -> float:
+    return float(item.get("quantity", 0)) * float(item.get("price", 0) or 0)
+
+
+def _fmt_num(n: float) -> str:
+    """Без бесконечных нулей: 150.0 → 150, 49.99 → 49.99."""
+    if float(n).is_integer():
+        return str(int(n))
+    return f"{n:.2f}".rstrip("0").rstrip(".")
+
+
 def format_order(order: dict, items: list[dict]) -> str:
     status_emoji = STATUS_EMOJI.get(order["status"], "📋")
     status_name  = STATUS_NAME.get(order["status"], order["status"])
@@ -88,12 +100,25 @@ def format_order(order: dict, items: list[dict]) -> str:
         total_items = len(items)
         for i, item in enumerate(items[:10]):
             note_str = f"  <i>{item['note']}</i>" if item.get("note") else ""
+            price = float(item.get("price", 0) or 0)
+            qty = float(item.get("quantity", 0))
+            if price > 0:
+                price_str = (
+                    f"     <code>{_fmt_num(qty)} {item['unit']} × "
+                    f"{_fmt_num(price)} = {_fmt_num(qty * price)}</code>"
+                )
+            else:
+                price_str = f"     <code>{_fmt_num(qty)} {item['unit']}</code>"
             lines.append(
-                f"  {i+1}. <b>{item['product_name']}</b>\n"
-                f"     <code>{item['quantity']} {item['unit']}</code>{note_str}"
+                f"  {i+1}. <b>{item['product_name']}</b>\n{price_str}{note_str}"
             )
         if total_items > 10:
             lines.append(f"  <i>...и ещё {total_items - 10} позиций</i>")
+
+        grand_total = sum(_line_total(it) for it in items)
+        if grand_total > 0:
+            lines.append(DIV2)
+            lines.append(f"<b>💰 Итого: {_fmt_num(grand_total)}</b>")
     else:
         lines.append("<i>Товары не добавлены</i>")
 
@@ -101,14 +126,36 @@ def format_order(order: dict, items: list[dict]) -> str:
 
 
 def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
-    items_text = "\n".join(
-        f"  • {it['product_name']}: {it['quantity']} {it['unit']}"
-        for it in items[:10]
-    )
+    """Сообщение боссу о новой заявке. Видны цены — нужны для апрува."""
+    lines = []
+    grand_total = 0.0
+    for it in items[:10]:
+        qty = float(it.get("quantity", 0))
+        price = float(it.get("price", 0) or 0)
+        sub = qty * price
+        grand_total += sub
+        if price > 0:
+            lines.append(
+                f"  • {it['product_name']}: {_fmt_num(qty)} {it['unit']} "
+                f"× {_fmt_num(price)} = <b>{_fmt_num(sub)}</b>"
+            )
+        else:
+            lines.append(
+                f"  • {it['product_name']}: {_fmt_num(qty)} {it['unit']} "
+                f"<i>(цена не указана)</i>"
+            )
+    items_text = "\n".join(lines)
+    # Считаем итог по всем позициям (а не только по первым 10 в выводе)
+    grand_total = sum(_line_total(it) for it in items)
     if len(items) > 10:
         items_text += f"\n  ...и ещё {len(items) - 10} поз."
+
     agent_str = f"\n👤 Клиент: <b>{order['agent_name']}</b>" if order.get("agent_name") else ""
     comment_str = f"\n📝 {order['comment']}" if order.get("comment") else ""
+    total_str = (
+        f"\n\n<b>💰 Итого: {_fmt_num(grand_total)}</b>"
+        if grand_total > 0 else ""
+    )
 
     return (
         f"{DIV}\n"
@@ -117,6 +164,7 @@ def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
         f"👨‍💼 Менеджер: <b>{order['full_name']}</b>{agent_str}{comment_str}\n"
         f"\n"
         f"<b>📦 Товары:</b>\n{items_text}"
+        f"{total_str}"
     )
 
 
@@ -415,11 +463,42 @@ async def process_quantity(message: Message, state: FSMContext):
         if qty <= 0:
             raise ValueError
     except ValueError:
-        return await message.answer("❌ Введите корректное количество, например: <code>5</code>", parse_mode="HTML")
+        return await message.answer(
+            "❌ Введите корректное количество, например: <code>5</code>",
+            parse_mode="HTML",
+        )
+
+    data = await state.get_data()
+    product = data["selected_product"]
+    await state.update_data(quantity=qty)
+    await state.set_state(OrderState.entering_price)
+
+    await message.answer(
+        f"✅ Количество: <b>{qty} {product['unit']}</b>\n\n"
+        f"💰 Введите <b>цену за {product['unit']}</b> (в валюте МойСклад).\n"
+        f"Например: <code>150</code> или <code>49.99</code>.\n"
+        f"Если цена ещё не известна — введите <code>0</code>.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(OrderState.entering_price)
+async def process_price(message: Message, state: FSMContext):
+    text = (message.text or "").strip().replace(",", ".").replace(" ", "")
+    try:
+        price = float(text)
+        if price < 0:
+            raise ValueError
+    except ValueError:
+        return await message.answer(
+            "❌ Введите корректную цену, например: <code>150</code> или <code>49.99</code>",
+            parse_mode="HTML",
+        )
 
     data = await state.get_data()
     order_id = data["order_id"]
     product = data["selected_product"]
+    qty = data["quantity"]
 
     item_id = add_order_item(
         order_id=order_id,
@@ -427,6 +506,7 @@ async def process_quantity(message: Message, state: FSMContext):
         product_href=product["href"],
         quantity=qty,
         unit=product["unit"],
+        price=price,
     )
 
     await state.clear()
@@ -434,9 +514,11 @@ async def process_quantity(message: Message, state: FSMContext):
     # Показываем текущий заказ
     order = get_order(order_id)
     items = get_order_items(order_id)
+    subtotal = qty * price
 
     await message.answer(
-        f"✅ Добавлено: <b>{product['name']}</b> — {qty} {product['unit']}\n\n"
+        f"✅ Добавлено: <b>{product['name']}</b>\n"
+        f"   {qty} {product['unit']} × {price:g} = <b>{subtotal:g}</b>\n\n"
         + format_order(order, items),
         parse_mode="HTML",
         reply_markup=order_actions_keyboard(order_id, "draft", True),
@@ -447,7 +529,7 @@ async def process_quantity(message: Message, state: FSMContext):
         message.from_user.full_name or str(message.from_user.id),
         get_role(message.from_user.id),
         "order_item_added",
-        f"Заказ #{order_id}: добавлен {product['name']} × {qty}",
+        f"Заказ #{order_id}: {product['name']} × {qty} @ {price}",
     )
 
 
@@ -696,11 +778,14 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
     order = get_order(req["order_id"])
     items = get_order_items(req["order_id"]) if order else []
     manager_name = (order or {}).get("full_name") or req.get("full_name") or "—"
+    manager_user_id = (order or {}).get("user_id") or req.get("user_id")
 
     from services.ms_demand import create_demand_from_request, is_ready as demand_ready
     demand_line = ""
     if order and items and demand_ready():
-        result = await create_demand_from_request(order, items, manager_name)
+        result = await create_demand_from_request(
+            order, items, manager_name, telegram_user_id=manager_user_id,
+        )
         if result.get("ok"):
             demand_line = (
                 f"\n📦 Отгрузка в МойСклад: <a href=\"{result['url']}\">"

@@ -35,8 +35,12 @@ _CTX: dict[str, Any] = {
     "ready": False,
     "org_meta": None,        # {"href": "...", "type": "organization", "mediaType": "application/json"}
     "store_meta": None,
-    "attribute_meta": None,  # meta кастомного атрибута для записи telegram_full_name
+    # Кастомные атрибуты на entity/demand. Имя — человекочитаемое,
+    # ID — стабильный числовой, не теряется при смене имени в TG.
+    "attribute_name_meta": None,
+    "attribute_uid_meta": None,
     "attribute_name": "telegram_full_name",
+    "attribute_uid": "telegram_user_id",
 }
 
 
@@ -73,11 +77,13 @@ async def _pick_first(path: str, env_var: str, entity_type: str) -> dict | None:
         return None
 
 
-async def _ensure_custom_attribute(name: str) -> dict | None:
+async def _ensure_custom_attribute(name: str, attr_type: str = "string") -> dict | None:
     """
     Проверить, есть ли на entity/demand кастомный атрибут с именем `name`.
-    Если нет — создать. Возвращает meta атрибута для использования в позиции
-    `attributes` тела demand-документа.
+    Если нет — создать. Возвращает meta атрибута для использования в
+    позиции `attributes` тела demand-документа.
+
+    `attr_type`: "string" | "long" (числовой 64-битный) и т.д.
     """
     try:
         data = await ms_get("entity/demand/metadata/attributes")
@@ -90,8 +96,7 @@ async def _ensure_custom_attribute(name: str) -> dict | None:
         logger.exception("Не удалось прочитать attribute metadata: %s", e)
         return None
 
-    # Создаём
-    payload = {"name": name, "type": "string"}
+    payload = {"name": name, "type": attr_type}
     try:
         sess = await get_session()
         async with sess.post(
@@ -107,7 +112,7 @@ async def _ensure_custom_attribute(name: str) -> dict | None:
                 return None
             import json
             created = json.loads(body)
-            logger.info("Создан MS demand attribute '%s'", name)
+            logger.info("Создан MS demand attribute '%s' (%s)", name, attr_type)
             return created.get("meta")
     except Exception as e:
         logger.exception("create custom attribute failed: %s", e)
@@ -117,31 +122,36 @@ async def _ensure_custom_attribute(name: str) -> dict | None:
 async def init_demand_context() -> dict:
     """
     Один раз при старте бота: подтянуть meta организации, склада и
-    кастомного атрибута. Без них create_demand_from_request не работает.
+    двух кастомных атрибутов (имя + telegram_user_id).
     """
     attr_name = os.environ.get("MS_TG_ATTRIBUTE_NAME", "").strip() \
         or _CTX["attribute_name"]
+    attr_uid = os.environ.get("MS_TG_UID_ATTRIBUTE_NAME", "").strip() \
+        or _CTX["attribute_uid"]
     _CTX["attribute_name"] = attr_name
+    _CTX["attribute_uid"] = attr_uid
 
     org = await _pick_first("organization", "MS_ORG_ID", "organization")
     store = await _pick_first("store", "MS_STORE_ID", "store")
-    attr = await _ensure_custom_attribute(attr_name)
+    attr_name_meta = await _ensure_custom_attribute(attr_name, "string")
+    attr_uid_meta = await _ensure_custom_attribute(attr_uid, "long")
 
     _CTX["org_meta"] = org
     _CTX["store_meta"] = store
-    _CTX["attribute_meta"] = attr
-    _CTX["ready"] = bool(org and store)  # attribute опционален, без него demand тоже создастся
+    _CTX["attribute_name_meta"] = attr_name_meta
+    _CTX["attribute_uid_meta"] = attr_uid_meta
+    _CTX["ready"] = bool(org and store)
 
     logger.info(
-        "ms_demand context: org=%s, store=%s, attr=%s",
-        bool(org), bool(store), bool(attr),
+        "ms_demand context: org=%s, store=%s, attr_name=%s, attr_uid=%s",
+        bool(org), bool(store), bool(attr_name_meta), bool(attr_uid_meta),
     )
     return {
         "ready": _CTX["ready"],
         "org": bool(org),
         "store": bool(store),
-        "attribute": bool(attr),
-        "attribute_name": attr_name,
+        "attribute_name": bool(attr_name_meta),
+        "attribute_uid": bool(attr_uid_meta),
     }
 
 
@@ -153,6 +163,7 @@ async def create_demand_from_request(
     order: dict,
     items: list[dict],
     telegram_full_name: str,
+    telegram_user_id: int | None = None,
 ) -> dict:
     """
     Создать demand-документ в МойСклад на основе заявки бота.
@@ -182,9 +193,12 @@ async def create_demand_from_request(
         if not product_id:
             skipped.append(it.get("product_name", "?"))
             continue
+        # МойСклад хранит цену в минорных единицах валюты (центы/копейки).
+        price_major = float(it.get("price", 0) or 0)
+        price_minor = int(round(price_major * 100))
         positions.append({
             "quantity": float(it.get("quantity", 1)),
-            "price": 0,        # цена 0 — складской редактирует при необходимости
+            "price": price_minor,
             "discount": 0,
             "vat": 0,
             "assortment": {
@@ -221,18 +235,28 @@ async def create_demand_from_request(
         "applicable": True,
     }
 
-    # Кастомный атрибут «кто оформил через бота»
-    if _CTX["attribute_meta"]:
-        attr_meta_dict = _CTX["attribute_meta"]
-        if isinstance(attr_meta_dict, dict) and "href" in attr_meta_dict:
-            payload["attributes"] = [{
-                "meta": {
-                    "href": attr_meta_dict["href"],
-                    "type": "attributemetadata",
-                    "mediaType": "application/json",
-                },
-                "value": telegram_full_name[:255],
-            }]
+    # Кастомные атрибуты — кто оформил заявку через бот.
+    # Два атрибута: читаемое имя + стабильный user_id (на случай если
+    # менеджер сменит имя в Telegram — id остаётся прежним).
+    attrs: list[dict] = []
+    for meta_obj, value in (
+        (_CTX["attribute_name_meta"], telegram_full_name[:255] if telegram_full_name else ""),
+        (_CTX["attribute_uid_meta"], telegram_user_id),
+    ):
+        if not (isinstance(meta_obj, dict) and meta_obj.get("href")):
+            continue
+        if value in (None, ""):
+            continue
+        attrs.append({
+            "meta": {
+                "href": meta_obj["href"],
+                "type": "attributemetadata",
+                "mediaType": "application/json",
+            },
+            "value": value,
+        })
+    if attrs:
+        payload["attributes"] = attrs
 
     try:
         sess = await get_session()
