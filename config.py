@@ -11,6 +11,9 @@ except ImportError:
     TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
     MS_TOKEN = os.environ.get("MS_TOKEN", "")
     CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "300"))
+    # Валюта для отображения цен в боте/WebApp (отображательная — на
+    # стороне МойСклад валюта берётся из организации). Дефолт — USD.
+    BASE_CURRENCY = os.environ.get("BASE_CURRENCY", "USD")
     import tempfile
     _default_db = os.path.join(tempfile.gettempdir(), "payments.db")
     DB_PATH = os.environ.get("DB_PATH", _default_db)

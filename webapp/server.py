@@ -286,35 +286,37 @@ async def api_home(request: Request):
         }
     else:
         # Менеджер: считаем личные показатели из локальных одобренных заявок.
-        # Источник — наша БД, без обращения к МойСклад. Аналогично кешу.
-        my_today_revenue = 0.0
-        my_today_count = 0
-        my_today_clients: set[str] = set()
+        # Источник — наша БД, без обращения к МойСклад. Батч-запросом
+        # подтягиваем сразу все позиции (раньше был N+1 по заказам).
+        from services.database import get_order_items_by_ids
         today_iso = start_of_day.strftime("%Y-%m-%d")
-        for o in my_orders:
-            # Считаем «отгруженные сегодня» как заказы со статусом approved/shipped,
-            # созданные/обновлённые сегодня. Простой и достаточно точный прокси
-            # до полноценного учёта по дате demand.
-            if o["status"] not in ("approved", "shipped"):
-                continue
-            updated = (o.get("updated_at") or o.get("created_at") or "")[:10]
-            if updated != today_iso:
-                continue
-            items = get_order_items(o["id"])
+        relevant_today = [
+            o for o in my_orders
+            if o["status"] in ("approved", "shipped")
+            and (o.get("updated_at") or o.get("created_at") or "")[:10] == today_iso
+        ]
+        items_by_order = (
+            get_order_items_by_ids([o["id"] for o in relevant_today])
+            if relevant_today else {}
+        )
+        my_today_revenue = 0.0
+        my_today_clients: set[str] = set()
+        for o in relevant_today:
+            items = items_by_order.get(o["id"], [])
             my_today_revenue += sum(
                 float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
                 for it in items
             )
-            my_today_count += 1
             if o.get("agent_name"):
                 my_today_clients.add(o["agent_name"])
         today = {
             "revenue": my_today_revenue,
-            "shipments": my_today_count,
+            "shipments": len(relevant_today),
             "clients": len(my_today_clients),
-            "scope": "personal",  # фронт показывает «Моё за сегодня»
+            "scope": "personal",
         }
 
+    from config import BASE_CURRENCY
     result = {
         "role": role,
         "today": today,
@@ -327,22 +329,31 @@ async def api_home(request: Request):
             "recent": recent,
         },
         "ms_linked": bool(get_moysklad_employee_id(user_id)),
+        "currency": BASE_CURRENCY,
     }
 
     if is_boss:
         pending = get_pending_requests()
         result["pending_requests"] = len(pending)
 
+        # Топ-сотрудники: группируем по нашему кастомному атрибуту
+        # telegram_full_name (его проставляет ms_demand при создании
+        # отгрузки из бота). Если атрибута нет — попадаем в "Прочее /
+        # МойСклад" (отгрузки, заведённые вручную через веб МойСклад).
+        # Раньше группировали по `owner` — это техническая учётная запись
+        # МойСклад API-токена → все отгрузки прилипали к одному имени.
         try:
             week_shipments = await get_shipments(week_ago, now)
-            by_owner: dict[str, dict] = {}
+            by_manager: dict[str, dict] = {}
             for s in week_shipments:
-                owner_name = (s.get("owner") or {}).get("name") or "—"
-                cur = by_owner.setdefault(owner_name, {"sum": 0, "count": 0})
-                cur["sum"] += s.get("sum", 0)
+                tg_name = _extract_tg_attribute(s, "telegram_full_name")
+                if not tg_name:
+                    tg_name = "Прочее (вручную в МойСклад)"
+                cur = by_manager.setdefault(tg_name, {"sum": 0, "count": 0})
+                cur["sum"] += s.get("sum", 0) or 0
                 cur["count"] += 1
             top_emp = sorted(
-                by_owner.items(), key=lambda kv: kv[1]["sum"], reverse=True
+                by_manager.items(), key=lambda kv: kv[1]["sum"], reverse=True
             )[:5]
             result["top_employees"] = [
                 {"name": name, "revenue": d["sum"] / 100, "count": d["count"]}
@@ -353,6 +364,18 @@ async def api_home(request: Request):
             result["top_employees"] = []
 
     return JSONResponse(result)
+
+
+def _extract_tg_attribute(demand: dict, attr_name: str) -> str | None:
+    """Найти значение нашего кастомного атрибута в demand-документе.
+    МойСклад возвращает attributes inline в виде
+    [{"name": "...", "value": ...}, ...]."""
+    attrs = demand.get("attributes") or []
+    for a in attrs:
+        if a.get("name") == attr_name:
+            v = a.get("value")
+            return str(v) if v not in (None, "") else None
+    return None
 
 
 # ─── API: остатки склада ─────────────────────────────────────────────────────
@@ -499,14 +522,27 @@ def _personal_analytics(
     prev_since,
     label: str,
 ) -> dict:
-    """Личная аналитика менеджера из локальной БД (no МойСклад API)."""
+    """Личная аналитика менеджера из локальной БД (no МойСклад API).
+
+    Все позиции грузятся одним батч-запросом — раньше был N+1 по
+    заказам, что давало многосекундные задержки на Postgres.
+    """
     from datetime import datetime
-    from services.database import get_user_orders, get_order_items
+    from services.database import get_user_orders, get_order_items_by_ids
 
     orders = get_user_orders(user_id)
     since_iso = since.strftime("%Y-%m-%d %H:%M:%S")
     until_iso = until.strftime("%Y-%m-%d %H:%M:%S")
     prev_since_iso = prev_since.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Берём все одобренные заказы, попавшие хоть в один из двух окон —
+    # текущее [since, until] или предыдущее [prev_since, since].
+    relevant = [
+        o for o in orders
+        if o["status"] in ("approved", "shipped")
+        and prev_since_iso <= (o.get("updated_at") or o.get("created_at") or "")[:19] <= until_iso
+    ]
+    items_by_order = get_order_items_by_ids([o["id"] for o in relevant]) if relevant else {}
 
     def _agg(start_iso, end_iso):
         total = 0.0
@@ -514,13 +550,11 @@ def _personal_analytics(
         clients: set[str] = set()
         product_sums: dict[str, dict] = {}
         by_day = [0] * 7
-        for o in orders:
-            if o["status"] not in ("approved", "shipped"):
-                continue
+        for o in relevant:
             ts = (o.get("updated_at") or o.get("created_at") or "")[:19]
             if ts < start_iso or ts > end_iso:
                 continue
-            items = get_order_items(o["id"])
+            items = items_by_order.get(o["id"], [])
             sub = sum(
                 float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
                 for it in items
@@ -610,12 +644,13 @@ async def api_payments_send(request: Request):
     import aiohttp
 
     data = await request.json()
-    # Только manager+ (раньше эндпоинт принимал любого верифицированного
-    # юзера — random Telegram-юзер мог спамить платежами в Telegram бoссу).
+    # Платежи отправляют только менеджеры (и админ для тестов). Босс
+    # эти платежи апрувит — отправлять ему нечего. Раньше эндпоинт
+    # принимал boss и спамил его же бесполезными уведомлениями.
     # Rate-limit жёсткий: 5 платежей в минуту на пользователя.
     user = _authorize(
         data,
-        allowed_roles=("admin", "boss", "manager"),
+        allowed_roles=("admin", "manager"),
         rate_limit_scope="api_payments_send",
         rate_limit_max=5,
         rate_limit_window=60.0,

@@ -137,10 +137,11 @@ async def _api_get_all_stock() -> list[dict]:
             if len(rows) < limit:
                 break
             offset += limit
-        result = [r for r in all_rows if r.get("stock", 0) != 0]
-        _stock_cache["data"] = result
+        # Не фильтруем по stock != 0 — нулевые остатки тоже показываем
+        # в каталоге, чтобы товар не пропадал после полной отгрузки.
+        _stock_cache["data"] = all_rows
         _stock_cache["ts"] = time.monotonic()
-        return result
+        return all_rows
 
 
 def _reshape_stock_row(r: dict) -> dict:
@@ -184,7 +185,7 @@ async def get_all_stock() -> list[dict]:
     и параллельно инициирует первичный рефреш.
     """
     from services import snapshot  # lazy чтобы избежать циклов
-    rows = snapshot.get_stock(only_positive=True)
+    rows = snapshot.get_stock(only_positive=False)
     if rows:
         return [_reshape_stock_row(r) for r in rows]
     # Snapshot ещё не наполнен — fallback на raw API

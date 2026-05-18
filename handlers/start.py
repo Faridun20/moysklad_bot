@@ -30,40 +30,33 @@ ROLE_NAMES = {
 
 def get_keyboard_for_role(role: str):
     """
-    Компактное 2-колоночное меню под роль.
-
-    Группы сгруппированы по смыслу:
-      • Каталог (Остатки/Категории)
-      • Отгрузки/Аналитика
-      • Заказы (Новый/Мои + для босса Заявки)
-      • Платежи
-      • Админка
-    Финальная строка — WebApp (full-width).
+    Главное меню под роль. «Каталог» (Остатки + Категории) собран в
+    одну кнопку, открывающую подменю — раньше эти два пункта занимали
+    отдельный ряд. Заказы рядом с каталогом тематически.
     """
     kb = InlineKeyboardBuilder()
 
-    # Группа 1: Каталог (всем кроме guest)
+    # Каталог — одна кнопка, ведёт в shop_menu (там Остатки+Категории)
     if role in ("admin", "boss", "manager"):
-        kb.button(text="📦 Остатки", callback_data="sp:0")
-        kb.button(text="🗂 Категории", callback_data="cats:0")
+        kb.button(text="🛒 Каталог", callback_data="shop_menu")
 
-    # Группа 2: Активность
-    if role in ("admin", "boss", "manager"):
-        kb.button(text="🚚 Отгрузки", callback_data="sh_period")
-        kb.button(text="📊 Аналитика", callback_data="analytics")
-
-    # Группа 3: Заказы
+    # Заказы — самое частое действие, в один тап
     if role in ("admin", "boss", "manager"):
         kb.button(text="➕ Новый заказ", callback_data="ord_new")
         kb.button(text="📋 Мои заказы", callback_data="ord_my")
+
+    # Отгрузки + Аналитика
+    if role in ("admin", "boss", "manager"):
+        kb.button(text="🚚 Отгрузки", callback_data="sh_period")
+        kb.button(text="📊 Аналитика", callback_data="analytics")
 
     # Заявки на отгрузку — только босс/админ
     if role in ("admin", "boss"):
         kb.button(text="⏳ Заявки на апрув", callback_data="ord_requests")
         kb.button(text="📈 Отчёты", callback_data="reports_menu")
 
-    # Платежи: отдельная строка
-    if role in ("admin", "boss", "manager"):
+    # Платежи: отправляют только менеджеры (и админ для теста).
+    if role in ("admin", "manager"):
         kb.button(text="💵 Отправить платёж", callback_data="pay_start")
     if role in ("admin", "boss"):
         kb.button(text="📊 Отчёт по платежам", callback_data="pr:menu")
@@ -73,28 +66,41 @@ def get_keyboard_for_role(role: str):
         kb.button(text="👥 Пользователи", callback_data="users_list")
         kb.button(text="📋 Аудит", callback_data="al:today")
 
-    # WebApp кнопка отдельным рядом во всю ширину (если задан URL)
+    # WebApp кнопкой во всю ширину
     webapp_url = os.environ.get("WEBAPP_URL", "")
     has_webapp = bool(webapp_url)
     if has_webapp:
         kb.button(text="🌐 Открыть WebApp", web_app=WebAppInfo(url=webapp_url))
 
-    # Раскладка: первые блоки парами по 2; WebApp один в строке
-    # Считаем общее число кнопок без WebApp, чтобы корректно сгруппировать
+    # Раскладка
     rows: list[int] = []
     if role in ("admin", "boss", "manager"):
-        rows += [2, 2, 2]
+        rows += [1]      # Каталог во всю ширину (важная точка входа)
+        rows += [2]      # Новый + Мои
+        rows += [2]      # Отгрузки + Аналитика
     if role in ("admin", "boss"):
-        rows += [2]                  # Заявки + Отчёты
-    if role in ("admin", "boss"):
-        rows += [2]                  # Платёж + Отчёт по платежам
-    elif role == "manager":
-        rows += [1]                  # один Платёж
+        rows += [2]      # Заявки + Отчёты
     if role == "admin":
-        rows += [2]                  # Пользователи + Аудит
+        rows += [2]      # Платёж + Отчёт по платежам
+    elif role == "boss":
+        rows += [1]      # Только отчёт
+    elif role == "manager":
+        rows += [1]      # Только отправка
+    if role == "admin":
+        rows += [2]      # Пользователи + Аудит
     if has_webapp:
-        rows += [1]                  # WebApp полная ширина
+        rows += [1]
     kb.adjust(*rows)
+    return kb.as_markup()
+
+
+def shop_submenu_keyboard():
+    """Подменю «Каталог» — Остатки + Категории + назад."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📦 Все остатки", callback_data="sp:0")
+    kb.button(text="🗂 По категориям", callback_data="cats:0")
+    kb.button(text="◀️ Назад", callback_data="menu")
+    kb.adjust(2, 1)
     return kb.as_markup()
 
 
@@ -228,6 +234,18 @@ async def cb_menu(call: CallbackQuery):
         parse_mode="HTML",
         reply_markup=get_keyboard_for_role(role),
     )
+
+@router.callback_query(F.data == "shop_menu")
+async def cb_shop_menu(call: CallbackQuery):
+    if get_role(call.from_user.id) not in ("admin", "boss", "manager"):
+        return await call.answer("Нет доступа", show_alert=True)
+    await call.answer()
+    await call.message.answer(
+        "🛒 <b>Каталог склада</b>\n\nЧто хотите посмотреть?",
+        parse_mode="HTML",
+        reply_markup=shop_submenu_keyboard(),
+    )
+
 
 @router.callback_query(F.data == "ord_my")
 async def cb_ord_my(call: CallbackQuery):

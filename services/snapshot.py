@@ -250,7 +250,10 @@ async def refresh_stock() -> int:
 
 _stock_dirty = False
 _stock_lock = asyncio.Lock()
-_DEBOUNCE_SEC = 5
+# Уменьшили debounce с 5 до 2 секунд — менеджер на проде заметил,
+# что после апрува остаток в WebApp обновляется заметно. 2с — баланс
+# между «батчинг webhook'ов одной отгрузки» и «мгновенная UI-реакция».
+_DEBOUNCE_SEC = 2
 
 
 def mark_stock_dirty() -> None:
@@ -291,8 +294,14 @@ async def _stock_debounce_loop() -> None:
 
 # ─── Чтение ──────────────────────────────────────────────────────────────────
 
-def get_stock(folder_id: str | None = None, only_positive: bool = True) -> list[dict]:
-    """Список остатков. Если folder_id задан — только товары категории."""
+def get_stock(folder_id: str | None = None, only_positive: bool = False) -> list[dict]:
+    """Список остатков. Если folder_id задан — только товары категории.
+
+    По умолчанию `only_positive=False` — возвращаем и нулевые остатки,
+    чтобы товар не пропадал из каталога после полной отгрузки. Раньше
+    стояло True и менеджеры теряли позиции из списка как только
+    останавливалась продажа.
+    """
     where = []
     args: list = []
     if folder_id and folder_id != "all":
