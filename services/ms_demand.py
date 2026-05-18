@@ -204,16 +204,21 @@ async def create_demand_from_request(
 
     agent_href = f"{MS_BASE}/entity/counterparty/{order['agent_id']}"
 
+    # МойСклад ждёт каждую ссылку как {"meta": {"href", "type", "mediaType"}}.
+    # _CTX["org_meta"] и _CTX["store_meta"] хранят сам meta-dict (плоский),
+    # поэтому здесь оборачиваем его в { "meta": ... }.
     payload: dict[str, Any] = {
         "name": f"Заявка #{order['id']} (бот)",
-        "organization": _meta(_CTX["org_meta"]["href"], "organization")["meta"]
-        if isinstance(_CTX["org_meta"], dict) else _CTX["org_meta"],
-        "agent": _meta(agent_href, "counterparty")["meta"],
-        "store": _meta(_CTX["store_meta"]["href"], "store")["meta"]
-        if isinstance(_CTX["store_meta"], dict) else _CTX["store_meta"],
+        "organization": _meta(_CTX["org_meta"]["href"], "organization"),
+        "agent": _meta(agent_href, "counterparty"),
+        "store": _meta(_CTX["store_meta"]["href"], "store"),
         "positions": positions,
         "moment": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.000"),
         "description": _build_description(order, telegram_full_name),
+        # applicable=true — отгрузка сразу проведена и остатки списываются
+        # в МойСклад в момент апрува заявки боссом. Складскому не нужно
+        # отдельно подтверждать документ.
+        "applicable": True,
     }
 
     # Кастомный атрибут «кто оформил через бота»
