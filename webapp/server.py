@@ -1349,18 +1349,33 @@ async def _notify_bosses_payment_pending(
         due = order.get("due_date") or "—"
         amount = float(payment.get("amount") or 0)
         fmt = lambda n: f"{int(round(n)):,}".replace(",", " ")
+        # summary["remaining"] = total - confirmed - pending. Текущий
+        # платёж уже в pending → если подтвердим, он переедет из pending
+        # в confirmed, общий остаток не изменится. То есть «остаток после
+        # подтверждения» = текущий summary["remaining"].
         remaining_after = max(0.0, summary["remaining"])
-        text = (
-            "💳 <b>Требуется подтверждение оплаты</b>\n\n"
-            f"Заказ #{order_id}\n"
-            f"👨‍💼 Менеджер: <b>{manager_name}</b>\n"
-            f"🏢 Клиент: <b>{agent}</b>\n"
-            f"💵 Получено: <b>{fmt(amount)} {currency}</b> "
-            f"(всего заказ {fmt(summary['total'])}, "
-            f"остаток после approve: {fmt(remaining_after)})\n"
-            f"📅 Срок: {due}\n\n"
-            "Подтвердите, что эта сумма реально пришла в кассу."
-        )
+        confirmed_before = max(0.0, summary["confirmed"])
+        total = summary["total"]
+
+        lines = [
+            "💳 <b>Требуется подтверждение оплаты</b>",
+            "",
+            f"Заказ #{order_id}",
+            f"👨‍💼 Менеджер: <b>{manager_name}</b>",
+            f"🏢 Клиент: <b>{agent}</b>",
+            f"💵 Сумма платежа: <b>{fmt(amount)} {currency}</b>",
+            f"📦 По заказу всего: <b>{fmt(total)} {currency}</b>",
+        ]
+        if confirmed_before > 0:
+            lines.append(f"✅ Уже оплачено ранее: <b>{fmt(confirmed_before)} {currency}</b>")
+        if remaining_after <= 0:
+            lines.append("🎉 Этот платёж <b>закрывает долг полностью</b>")
+        else:
+            lines.append(f"📎 Останется к получению: <b>{fmt(remaining_after)} {currency}</b>")
+        lines.append(f"📅 Срок: {due}")
+        lines.append("")
+        lines.append("Подтвердите, что эта сумма реально пришла в кассу.")
+        text = "\n".join(lines)
         # Используем СУЩЕСТВУЮЩИЕ pay_ok/pay_no callbacks — это
         # стандартный payment-approval flow в handlers/payments.py.
         # После approve платежа _maybe_close_order_after_payment

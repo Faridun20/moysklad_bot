@@ -263,18 +263,29 @@ async def _push_payment_confirmation(
     agent = _esc(order.get("agent_name") or "—")
     due = order.get("due_date") or "—"
     amount = float(payment.get("amount") or 0)
-    text = (
-        f"{DIV}\n"
-        "💳 <b>Требуется подтверждение оплаты</b>\n\n"
-        f"Заказ #{order_id}\n"
-        f"👨‍💼 Менеджер: <b>{_esc(manager_name)}</b>\n"
-        f"🏢 Клиент: <b>{agent}</b>\n"
-        f"💵 Получено: <b>{_fmt_amount(amount)} {_esc(currency)}</b>\n"
-        f"📊 По заказу: всего {_fmt_amount(summary['total'])} · "
-        f"остаток после approve: {_fmt_amount(max(0, summary['remaining']))}\n"
-        f"📅 Срок: {_esc(_to_ru(due))}\n\n"
-        "Подтвердите, что эта сумма реально пришла в кассу."
-    )
+    confirmed_before = max(0.0, summary["confirmed"])
+    remaining_after = max(0.0, summary["remaining"])
+
+    lines = [
+        f"{DIV}",
+        "💳 <b>Требуется подтверждение оплаты</b>",
+        "",
+        f"Заказ #{order_id}",
+        f"👨‍💼 Менеджер: <b>{_esc(manager_name)}</b>",
+        f"🏢 Клиент: <b>{agent}</b>",
+        f"💵 Сумма платежа: <b>{_fmt_amount(amount)} {_esc(currency)}</b>",
+        f"📦 По заказу всего: <b>{_fmt_amount(summary['total'])} {_esc(currency)}</b>",
+    ]
+    if confirmed_before > 0:
+        lines.append(f"✅ Уже оплачено ранее: <b>{_fmt_amount(confirmed_before)} {_esc(currency)}</b>")
+    if remaining_after <= 0:
+        lines.append("🎉 Этот платёж <b>закрывает долг полностью</b>")
+    else:
+        lines.append(f"📎 Останется к получению: <b>{_fmt_amount(remaining_after)} {_esc(currency)}</b>")
+    lines.append(f"📅 Срок: {_esc(_to_ru(due))}")
+    lines.append("")
+    lines.append("Подтвердите, что эта сумма реально пришла в кассу.")
+    text = "\n".join(lines)
     # Используем существующие callback'и pay_ok/pay_no из handlers/payments.py
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Принять",   callback_data=f"pay_ok:{payment_id}")

@@ -62,6 +62,11 @@ async function showScreen(screen) {
 
   const content = document.getElementById('content');
 
+  // Если был открыт экран с MainButton (например, ввод количества) —
+  // скрываем её при переключении, иначе кнопка зависнет на других
+  // экранах с устаревшим обработчиком.
+  try { tg.MainButton?.hide(); } catch {}
+
   // Сбрасываем фильтр категории при каждом входе в "Склад",
   // чтобы не показывать последнюю открытую категорию из прошлой сессии.
   if (screen === 'stock') {
@@ -945,15 +950,16 @@ function openQuantityInput(name, unit, maxStock, href) {
           placeholder="0" inputmode="decimal" min="0" step="0.01">
       </div>
 
-      <div id="line-total" class="qty-stock" style="margin: 8px 0 16px;">
+      <div id="line-total" class="qty-stock" style="margin: 8px 0 80px;">
         Итого: <b>0 ${initialCur}</b>
       </div>
-
-      <button class="btn-primary" id="qty-confirm">✅ Добавить в заявку</button>
     </div>
   `;
 
-  document.getElementById('qty-back').addEventListener('click', openProductPicker);
+  document.getElementById('qty-back').addEventListener('click', () => {
+    tg.MainButton?.hide();
+    openProductPicker();
+  });
   const qtyEl = document.getElementById('qty-input');
   const priceEl = document.getElementById('price-input');
   const totalEl = document.getElementById('line-total');
@@ -979,7 +985,10 @@ function openQuantityInput(name, unit, maxStock, href) {
   qtyEl.addEventListener('input', updateTotal);
   priceEl.addEventListener('input', updateTotal);
 
-  document.getElementById('qty-confirm').addEventListener('click', async () => {
+  // ─── MainButton: «Добавить в заявку» ─────────────────────────
+  // Нативная кнопка Telegram — всегда видна над виртуальной клавиатурой,
+  // в отличие от HTML-кнопки внизу формы, которую клавиатура перекрывала.
+  async function onConfirm() {
     const qty = parseFloat(qtyEl.value);
     const price = parseFloat(priceEl.value) || 0;
     if (!qty || qty <= 0) {
@@ -992,7 +1001,7 @@ function openQuantityInput(name, unit, maxStock, href) {
       tg.showAlert('Цена не может быть отрицательной');
       return;
     }
-
+    tg.MainButton?.showProgress?.();
     try {
       const result = await api('/api/orders/add_item', {
         order_id: currentDraftOrder.id,
@@ -1008,11 +1017,33 @@ function openQuantityInput(name, unit, maxStock, href) {
       });
       if (!currentDraftOrder.currency) currentDraftOrder.currency = selectedCurrency;
       tg.HapticFeedback?.notificationOccurred('success');
+      tg.MainButton?.hideProgress?.();
+      tg.MainButton?.hide();
+      tg.MainButton?.offClick?.(onConfirm);
       renderOrderEditor();
     } catch (e) {
+      tg.MainButton?.hideProgress?.();
       tg.showAlert('❌ ' + e.message);
     }
-  });
+  }
+
+  if (tg.MainButton) {
+    tg.MainButton.setText('✅ Добавить в заявку');
+    tg.MainButton.show();
+    tg.MainButton.onClick(onConfirm);
+  } else {
+    // Fallback для окружений без MainButton API (типа браузера) —
+    // отрисуем обычную кнопку
+    const totalEl2 = document.getElementById('line-total');
+    if (totalEl2) {
+      const btn = document.createElement('button');
+      btn.className = 'btn-primary';
+      btn.id = 'qty-confirm-fallback';
+      btn.textContent = '✅ Добавить в заявку';
+      btn.addEventListener('click', onConfirm);
+      totalEl2.parentNode.appendChild(btn);
+    }
+  }
 }
 
 async function submitOrder() {
@@ -1480,11 +1511,11 @@ async function renderDebts(container) {
         <div class="money-summary">
           <div class="money-block money-received ${receivedItems.length === 0 ? 'money-empty' : ''}">
             <div class="money-label">💵 Получено</div>
-            <div class="money-value">${receivedRows || '<span class="money-placeholder">пока нет поступлений</span>'}</div>
+            <div class="money-value">${receivedRows || '<span class="money-placeholder">пока пусто</span>'}</div>
           </div>
           <div class="money-block money-pending ${pendingItems.length === 0 ? 'money-empty' : ''}">
-            <div class="money-label">⏳ Ожидает подтверждения</div>
-            <div class="money-value">${pendingRows || '<span class="money-placeholder">нет ожидающих</span>'}</div>
+            <div class="money-label">⏳ Ждёт подтверждения</div>
+            <div class="money-value">${pendingRows || '<span class="money-placeholder">пусто</span>'}</div>
           </div>
         </div>
       `;
@@ -1588,7 +1619,7 @@ async function renderDebts(container) {
             ${d.is_mine || isBoss ? `
               <div class="pay-input-row">
                 <input type="number" class="pay-amount-input" data-id="${d.id}"
-                       placeholder="Сумма (по умолч. ${fmt(d.remaining)})"
+                       placeholder="Сумма · ост. ${fmt(d.remaining)}"
                        min="0" step="0.01" inputmode="decimal">
                 <button class="btn-mark-paid" data-id="${d.id}">✅ Отметить</button>
               </div>
