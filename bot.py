@@ -8,6 +8,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
+from handlers import orders
 from config import TELEGRAM_TOKEN
 
 # Хэндлеры
@@ -44,6 +45,7 @@ def register_routers(dp: Dispatcher):
         reports.router,
         audit.router,
         log.router,
+        orders.router,
     ]
     for r in routers:
         dp.include_router(r)

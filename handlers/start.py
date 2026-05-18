@@ -40,14 +40,15 @@ def get_keyboard_for_role(role: str):
         kb.button(text="🚚 Отгрузки", callback_data="sh_period")
         kb.button(text="📊 Аналитика продаж", callback_data="analytics")
 
-    if role in ("admin", "boss", "employee"):
+    if role in ("admin", "boss", "manager"):
         kb.button(text="💵 Отправить платёж", callback_data="pay_start")
+        kb.button(text="📋 Мои заказы",       callback_data="ord_my")
+        kb.button(text="➕ Новый заказ",       callback_data="ord_new")
 
     if role in ("admin", "boss"):
         kb.button(text="📋 Отчёт по платежам", callback_data="pr:menu")
-
-    if role in ("admin", "boss"):
         kb.button(text="📊 Отчёты", callback_data="reports_menu")
+        kb.button(text="⏳ Заявки на отгрузку", callback_data="ord_requests")
 
     if role == "admin":
         kb.button(text="👥 Пользователи",  callback_data="users_list")
@@ -101,11 +102,36 @@ async def cmd_start(message: Message):
     user = message.from_user
     ensure_user(user.id, user.username or "", user.full_name or "", ADMIN_IDS)
     role = get_role(user.id)
+
+    # Автоматически синхронизируем менеджеров с МойСклад
+    if role == "manager":
+        from services.ms_sync import sync_manager
+        result = await sync_manager(
+            user.id,
+            user.full_name or user.username or str(user.id),
+            user.username or "",
+        )
+        if result["status"] == "linked":
+            logger.info(
+                "Менеджер %s привязан к МойСклад: %s",
+                user.full_name, result["ms_id"]
+            )
+        elif result["status"] == "created":
+            logger.info(
+                "Создан сотрудник МойСклад для %s: %s",
+                user.full_name, result["ms_id"]
+            )
+
     await message.answer(
         get_welcome_text(role),
         parse_mode="HTML",
         reply_markup=get_keyboard_for_role(role),
     )
+
+    # Показываем сводку за месяц для менеджера
+    if role == "manager":
+        from handlers.analytics import show_manager_summary
+        await show_manager_summary(message.bot, message.chat.id, message.from_user.id)
 
 
 @router.callback_query(F.data == "menu")
@@ -120,4 +146,40 @@ async def cb_menu(call: CallbackQuery):
         reply_markup=get_keyboard_for_role(role),
     )
 
+@router.callback_query(F.data == "ord_my")
+async def cb_ord_my(call: CallbackQuery):
+    await call.answer()
+    from services.database import get_user_orders
+    from handlers.orders import my_orders_keyboard
+    orders = get_user_orders(call.from_user.id)
+    if not orders:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="➕ Создать заказ", callback_data="ord_new")
+        kb.button(text="🏠 Меню",          callback_data="menu")
+        kb.adjust(1)
+        return await call.message.answer("📋 У вас пока нет заказов.", reply_markup=kb.as_markup())
+    await call.message.answer(
+        f"📋 <b>Мои заказы</b> ({len(orders)}):",
+        parse_mode="HTML",
+        reply_markup=my_orders_keyboard(orders),
+    )
 
+
+@router.callback_query(F.data == "ord_requests")
+async def cb_ord_requests(call: CallbackQuery):
+    if not is_boss(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    await call.answer()
+    from services.database import get_pending_requests
+    from handlers.orders import pending_requests_keyboard
+    requests = get_pending_requests()
+    if not requests:
+        return await call.message.answer(
+            f"{DIV}\n⏳ <b>Заявки на отгрузку</b>\n\n<i>Нет новых заявок</i>",
+            parse_mode="HTML",
+        )
+    await call.message.answer(
+        f"⏳ <b>Заявки ({len(requests)}):</b>",
+        parse_mode="HTML",
+        reply_markup=pending_requests_keyboard(requests),
+    )

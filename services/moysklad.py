@@ -124,3 +124,96 @@ async def get_sales_stats(since: datetime, until: datetime = None) -> dict:
         "clients": clients,
         "top_products": top_products,
     }
+
+async def get_employee_shipments(
+    since: datetime,
+    until: datetime = None,
+    employee_href: str = None,
+) -> list[dict]:
+    """Получить отгрузки конкретного сотрудника по его href."""
+    since_str = since.strftime("%Y-%m-%d %H:%M:%S.000")
+    filter_str = f"moment>{since_str}"
+    if until:
+        filter_str += f";moment<{until.strftime('%Y-%m-%d %H:%M:%S.000')}"
+    if employee_href:
+        filter_str += f";owner={employee_href}"
+
+    async with aiohttp.ClientSession() as session:
+        data = await ms_get(
+            session,
+            "entity/demand",
+            params={
+                "filter": filter_str,
+                "expand": "agent,owner",
+                "order": "moment,desc",
+                "limit": 100,
+            },
+        )
+    return data if isinstance(data, list) else data.get("rows", [])
+
+
+async def get_employee_stats(
+    since: datetime,
+    until: datetime = None,
+    employee_href: str = None,
+) -> dict:
+    """Персональная статистика сотрудника."""
+    shipments = await get_employee_shipments(since, until, employee_href)
+    if not shipments:
+        return {
+            "total": 0, "count": 0, "clients": 0,
+            "top_products": [], "by_day": {}, "product_sums": {}
+        }
+
+    total = sum(s.get("sum", 0) for s in shipments)
+    clients = len(set(
+        s.get("agent", {}).get("name", "")
+        for s in shipments if s.get("agent", {}).get("name")
+    ))
+
+    # По дням недели
+    days_ru = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс"}
+    by_day = {v: 0 for v in days_ru.values()}
+    for s in shipments:
+        try:
+            day_num = datetime.strptime(s.get("moment", "")[:10], "%Y-%m-%d").weekday()
+            by_day[days_ru[day_num]] += 1
+        except Exception:
+            pass
+
+    # По товарам
+    product_sums: dict[str, dict] = {}
+    for s in shipments[:20]:
+        demand_id = extract_id_from_href(s.get("meta", {}).get("href", ""))
+        if not demand_id:
+            continue
+        try:
+            positions = await get_shipment_positions(demand_id)
+            for pos in positions:
+                name = pos.get("assortment", {}).get("name", "—")
+                qty = pos.get("quantity", 0)
+                price = pos.get("price", 0)
+                if name not in product_sums:
+                    product_sums[name] = {"sum": 0, "qty": 0}
+                product_sums[name]["sum"] += qty * price
+                product_sums[name]["qty"] += qty
+        except Exception:
+            pass
+
+    top_products = sorted(
+        product_sums.items(), key=lambda x: x[1]["sum"], reverse=True
+    )[:5]
+
+    return {
+        "total": total,
+        "count": len(shipments),
+        "clients": clients,
+        "top_products": top_products,
+        "by_day": by_day,
+        "product_sums": product_sums,
+    }
+
+
+async def get_employee_href(ms_employee_id: str) -> str:
+    """Получить href сотрудника по его ID."""
+    return f"{MS_BASE}/entity/employee/{ms_employee_id}"

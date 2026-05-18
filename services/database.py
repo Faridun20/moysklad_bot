@@ -1,7 +1,5 @@
 """
-База данных — работает с SQLite (локально) и PostgreSQL (продакшен).
-Выбор движка автоматический — если есть DATABASE_URL → PostgreSQL,
-иначе → SQLite.
+База данных — SQLite (локально) и PostgreSQL (продакшен).
 """
 
 import os
@@ -10,8 +8,6 @@ from datetime import datetime
 from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
-
-# ─── Определяем тип БД ────────────────────────────────────────────────────────
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DB_PATH = os.environ.get("DB_PATH", "payments.db")
@@ -26,12 +22,8 @@ else:
     logger.info("Используется SQLite: %s", DB_PATH)
 
 
-# ─── Подключение ──────────────────────────────────────────────────────────────
-
-
 @contextmanager
 def get_conn():
-    """Контекстный менеджер для подключения к БД."""
     if USE_POSTGRES:
         conn = psycopg2.connect(DATABASE_URL)
         try:
@@ -48,15 +40,12 @@ def get_conn():
 
 
 def get_cursor(conn):
-    """Возвращает курсор с правильным row_factory."""
     if USE_POSTGRES:
         return conn.cursor(cursor_factory=RealDictCursor)
     return conn.cursor()
 
 
-# Для PostgreSQL — заменяем ? на %s в запросах
 def q(query: str) -> str:
-    """Адаптировать SQL под выбранный движок."""
     if USE_POSTGRES:
         return query.replace("?", "%s")
     return query
@@ -66,19 +55,31 @@ def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-# ─── Инициализация таблиц ─────────────────────────────────────────────────────
+# ─── Инициализация ────────────────────────────────────────────────────────────
 
 
 def init_db():
     with get_conn() as conn:
         cur = get_cursor(conn)
+        id_type = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
 
-        if USE_POSTGRES:
-            id_type = "SERIAL PRIMARY KEY"
-        else:
-            id_type = "INTEGER PRIMARY KEY AUTOINCREMENT"
+        # Роли пользователей — добавлено поле moysklad_employee_id
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS user_roles (
+                user_id              BIGINT PRIMARY KEY,
+                username             TEXT,
+                full_name            TEXT,
+                role                 TEXT NOT NULL DEFAULT 'manager',
+                moysklad_employee_id TEXT,
+                ms_sync_status       TEXT DEFAULT 'pending',
+                created_at           TEXT
+            )
+        """)
 
-        # Таблица платежей
+        # Миграция — добавляем колонки если их нет (для старых БД)
+        _migrate(cur)
+
+        # Платежи
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS payments (
                 id           {id_type},
@@ -91,16 +92,6 @@ def init_db():
                 status       TEXT NOT NULL DEFAULT 'pending',
                 created_at   TEXT NOT NULL,
                 confirmed_at TEXT
-            )
-        """)
-
-        # Таблица ролей
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS user_roles (
-                user_id   BIGINT PRIMARY KEY,
-                username  TEXT,
-                full_name TEXT,
-                role      TEXT NOT NULL DEFAULT 'employee'
             )
         """)
 
@@ -117,10 +108,67 @@ def init_db():
             )
         """)
 
+        # Заказы (черновики менеджера)
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS orders (
+                id          {id_type},
+                user_id     BIGINT NOT NULL,
+                full_name   TEXT,
+                status      TEXT NOT NULL DEFAULT 'draft',
+                comment     TEXT,
+                agent_id    TEXT,
+                agent_name  TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            )
+        """)
+
+        # Позиции заказа
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS order_items (
+                id           {id_type},
+                order_id     BIGINT NOT NULL,
+                product_name TEXT NOT NULL,
+                product_href TEXT,
+                quantity     REAL NOT NULL DEFAULT 1,
+                unit         TEXT DEFAULT 'шт',
+                note         TEXT
+            )
+        """)
+
+        # Заявки на отгрузку
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS shipment_requests (
+                id          {id_type},
+                order_id    BIGINT NOT NULL,
+                user_id     BIGINT NOT NULL,
+                full_name   TEXT,
+                status      TEXT NOT NULL DEFAULT 'pending',
+                comment     TEXT,
+                approved_by BIGINT,
+                approved_by_name TEXT,
+                created_at  TEXT NOT NULL,
+                approved_at TEXT
+            )
+        """)
+
         conn.commit()
     logger.info("База данных инициализирована")
-
     _load_predefined_users()
+
+
+def _migrate(cur):
+    """Добавляем новые колонки в существующие таблицы."""
+    migrations = [
+        ("user_roles", "moysklad_employee_id", "TEXT"),
+        ("user_roles", "ms_sync_status", "TEXT DEFAULT 'pending'"),
+        ("user_roles", "created_at", "TEXT"),
+    ]
+    for table, column, col_type in migrations:
+        try:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+        except Exception:
+            pass  # Колонка уже существует
 
 
 # ─── Роли ────────────────────────────────────────────────────────────────────
@@ -132,33 +180,34 @@ def get_role(user_id: int) -> str:
         cur.execute(q("SELECT role FROM user_roles WHERE user_id = ?"), (user_id,))
         row = cur.fetchone()
     if not row:
-        return "employee"
+        return "manager"  # По умолчанию — менеджер (не employee!)
     return row["role"] if USE_POSTGRES else row[0]
 
 
 def set_role(user_id: int, username: str, full_name: str, role: str) -> bool:
-    if role not in ("admin", "boss", "manager", "employee"):
+    valid_roles = ("admin", "boss", "manager")  # employee убран
+    if role not in valid_roles:
         return False
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
             cur.execute("""
-                INSERT INTO user_roles (user_id, username, full_name, role)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO user_roles (user_id, username, full_name, role, created_at)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT(user_id) DO UPDATE SET
                     username = EXCLUDED.username,
                     full_name = EXCLUDED.full_name,
                     role = EXCLUDED.role
-            """, (user_id, username, full_name, role))
+            """, (user_id, username, full_name, role, now_str()))
         else:
             cur.execute("""
-                INSERT INTO user_roles (user_id, username, full_name, role)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO user_roles (user_id, username, full_name, role, created_at)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     username = excluded.username,
                     full_name = excluded.full_name,
                     role = excluded.role
-            """, (user_id, username, full_name, role))
+            """, (user_id, username, full_name, role, now_str()))
         conn.commit()
     return True
 
@@ -171,8 +220,16 @@ def get_all_users() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_user(user_id: int) -> dict | None:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("SELECT * FROM user_roles WHERE user_id = ?"), (user_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
 def ensure_user(user_id: int, username: str, full_name: str, admin_ids: list[int]):
-    from config import MANAGER_IDS, BOSS_IDS
+    from config import BOSS_IDS
 
     with get_conn() as conn:
         cur = get_cursor(conn)
@@ -187,42 +244,71 @@ def ensure_user(user_id: int, username: str, full_name: str, admin_ids: list[int
             conn.commit()
             return
 
+        # Определяем роль
         if user_id in admin_ids:
             role = "admin"
         elif user_id in BOSS_IDS:
             role = "boss"
-        elif user_id in MANAGER_IDS:
-            role = "manager"
         else:
-            role = "employee"
+            role = "manager"  # Все новые — менеджеры
 
         cur.execute(
-            q("INSERT INTO user_roles (user_id, username, full_name, role) VALUES (?, ?, ?, ?)"),
-            (user_id, username, full_name, role),
+            q("INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, ?, ?, ?)"),
+            (user_id, username, full_name, role, now_str()),
         )
         conn.commit()
 
 
-def add_user(user_id: int, username: str, full_name: str, role: str) -> bool:
-    return set_role(user_id, username, full_name, role)
+def set_moysklad_employee(user_id: int, ms_employee_id: str, status: str = "linked") -> bool:
+    """Привязать Telegram пользователя к сотруднику МойСклад."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE user_roles SET moysklad_employee_id = ?, ms_sync_status = ? WHERE user_id = ?"),
+            (ms_employee_id, status, user_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    return updated
+
+
+def get_moysklad_employee_id(user_id: int) -> str | None:
+    """Получить ID сотрудника МойСклад для Telegram пользователя."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("SELECT moysklad_employee_id FROM user_roles WHERE user_id = ?"), (user_id,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    return row["moysklad_employee_id"] if USE_POSTGRES else row[0]
+
+
+def get_unsynced_managers() -> list[dict]:
+    """Получить менеджеров без привязки к МойСклад."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute("""
+            SELECT * FROM user_roles
+            WHERE role = 'manager'
+            AND (moysklad_employee_id IS NULL OR ms_sync_status = 'pending')
+        """)
+        rows = cur.fetchall()
+    return [dict(r) for r in rows]
 
 
 def remove_user(user_id: int, removed_by: int = None, removed_name: str = "") -> bool:
-    # Перед удалением сохраняем данные для лога
     users = get_all_users()
     target = next((u for u in users if u["user_id"] == user_id), None)
-
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(q("DELETE FROM user_roles WHERE user_id = ?"), (user_id,))
         deleted = cur.rowcount > 0
         conn.commit()
-
     if deleted and removed_by and target:
         add_audit_log(
             removed_by, removed_name, get_role(removed_by),
             "user_removed",
-            f"Удалён пользователь {target['full_name']} (ID: {user_id}, роль: {target['role']})",
+            f"Удалён {target['full_name']} (ID: {user_id}, роль: {target['role']})",
         )
     return deleted
 
@@ -236,8 +322,7 @@ def add_payment(user_id, username, full_name, amount, currency, comment) -> int:
         if USE_POSTGRES:
             cur.execute("""
                 INSERT INTO payments (user_id, username, full_name, amount, currency, comment, status, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s)
-                RETURNING id
+                VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s) RETURNING id
             """, (user_id, username, full_name, amount, currency, comment, now_str()))
             payment_id = cur.fetchone()["id"]
         else:
@@ -261,31 +346,14 @@ def confirm_payment(payment_id: int, confirmed_by: int = None, confirmed_name: s
         conn.commit()
     if updated and confirmed_by:
         payment = get_payment(payment_id)
-        add_audit_log(
-            confirmed_by, confirmed_name, get_role(confirmed_by),
-            "payment_confirmed",
-            f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
-        )
+        if payment:
+            add_audit_log(
+                confirmed_by, confirmed_name, get_role(confirmed_by),
+                "payment_confirmed",
+                f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
+            )
     return updated
 
-def archive_payment(payment_id: int, archived_by: int, archived_name: str) -> bool:
-    """Архивировать платёж — данные сохраняются, но помечаются как archived."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("UPDATE payments SET status = 'archived' WHERE id = ?"),
-            (payment_id,),
-        )
-        updated = cur.rowcount > 0
-        conn.commit()
-    if updated:
-        payment = get_payment(payment_id)
-        add_audit_log(
-            archived_by, archived_name, get_role(archived_by),
-            "payment_archived",
-            f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
-        )
-    return updated
 
 def reject_payment(payment_id: int, rejected_by: int = None, rejected_name: str = "") -> bool:
     with get_conn() as conn:
@@ -298,11 +366,29 @@ def reject_payment(payment_id: int, rejected_by: int = None, rejected_name: str 
         conn.commit()
     if updated and rejected_by:
         payment = get_payment(payment_id)
-        add_audit_log(
-            rejected_by, rejected_name, get_role(rejected_by),
-            "payment_rejected",
-            f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
-        )
+        if payment:
+            add_audit_log(
+                rejected_by, rejected_name, get_role(rejected_by),
+                "payment_rejected",
+                f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
+            )
+    return updated
+
+
+def archive_payment(payment_id: int, archived_by: int, archived_name: str) -> bool:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("UPDATE payments SET status = 'archived' WHERE id = ?"), (payment_id,))
+        updated = cur.rowcount > 0
+        conn.commit()
+    if updated:
+        payment = get_payment(payment_id)
+        if payment:
+            add_audit_log(
+                archived_by, archived_name, get_role(archived_by),
+                "payment_archived",
+                f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
+            )
     return updated
 
 
@@ -381,40 +467,243 @@ def get_audit_log(limit: int = 50, user_id: int = None) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+# ─── Заказы ───────────────────────────────────────────────────────────────────
+
+
+def create_order(user_id: int, full_name: str, comment: str = "") -> int:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        if USE_POSTGRES:
+            cur.execute("""
+                INSERT INTO orders (user_id, full_name, status, comment, created_at, updated_at)
+                VALUES (%s, %s, 'draft', %s, %s, %s) RETURNING id
+            """, (user_id, full_name, comment, now_str(), now_str()))
+            order_id = cur.fetchone()["id"]
+        else:
+            cur.execute("""
+                INSERT INTO orders (user_id, full_name, status, comment, created_at, updated_at)
+                VALUES (?, ?, 'draft', ?, ?, ?)
+            """, (user_id, full_name, comment, now_str(), now_str()))
+            order_id = cur.lastrowid
+        conn.commit()
+    return order_id
+
+
+def get_order(order_id: int) -> dict | None:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("SELECT * FROM orders WHERE id = ?"), (order_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def get_user_orders(user_id: int, status: str = None) -> list[dict]:
+    query = "SELECT * FROM orders WHERE user_id = ?"
+    params = [user_id]
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY created_at DESC"
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q(query), params)
+        rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_all_orders(status: str = None) -> list[dict]:
+    query = "SELECT * FROM orders"
+    params = []
+    if status:
+        query += " WHERE status = ?"
+        params.append(status)
+    query += " ORDER BY created_at DESC"
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q(query), params)
+        rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_order_agent(order_id: int, agent_id: str, agent_name: str) -> bool:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE orders SET agent_id = ?, agent_name = ?, updated_at = ? WHERE id = ?"),
+            (agent_id, agent_name, now_str(), order_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    return updated
+
+
+def update_order_status(order_id: int, status: str) -> bool:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE orders SET status = ?, updated_at = ? WHERE id = ?"),
+            (status, now_str(), order_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    return updated
+
+
+def add_order_item(order_id: int, product_name: str, product_href: str,
+                   quantity: float, unit: str, note: str = "") -> int:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        if USE_POSTGRES:
+            cur.execute("""
+                INSERT INTO order_items (order_id, product_name, product_href, quantity, unit, note)
+                VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+            """, (order_id, product_name, product_href, quantity, unit, note))
+            item_id = cur.fetchone()["id"]
+        else:
+            cur.execute("""
+                INSERT INTO order_items (order_id, product_name, product_href, quantity, unit, note)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (order_id, product_name, product_href, quantity, unit, note))
+            item_id = cur.lastrowid
+        conn.commit()
+    return item_id
+
+
+def get_order_items(order_id: int) -> list[dict]:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("SELECT * FROM order_items WHERE order_id = ?"), (order_id,))
+        rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+def remove_order_item(item_id: int) -> bool:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("DELETE FROM order_items WHERE id = ?"), (item_id,))
+        deleted = cur.rowcount > 0
+        conn.commit()
+    return deleted
+
+
+# ─── Заявки на отгрузку ───────────────────────────────────────────────────────
+
+
+def create_shipment_request(order_id: int, user_id: int, full_name: str, comment: str = "") -> int:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        if USE_POSTGRES:
+            cur.execute("""
+                INSERT INTO shipment_requests (order_id, user_id, full_name, status, comment, created_at)
+                VALUES (%s, %s, %s, 'pending', %s, %s) RETURNING id
+            """, (order_id, user_id, full_name, comment, now_str()))
+            req_id = cur.fetchone()["id"]
+        else:
+            cur.execute("""
+                INSERT INTO shipment_requests (order_id, user_id, full_name, status, comment, created_at)
+                VALUES (?, ?, ?, 'pending', ?, ?)
+            """, (order_id, user_id, full_name, comment, now_str()))
+            req_id = cur.lastrowid
+        conn.commit()
+    return req_id
+
+
+def get_shipment_request(req_id: int) -> dict | None:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("SELECT * FROM shipment_requests WHERE id = ?"), (req_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def get_pending_requests() -> list[dict]:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute("SELECT * FROM shipment_requests WHERE status = 'pending' ORDER BY created_at DESC")
+        rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+def approve_shipment_request(req_id: int, approved_by: int, approved_name: str) -> bool:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("""UPDATE shipment_requests
+               SET status = 'approved', approved_by = ?, approved_by_name = ?, approved_at = ?
+               WHERE id = ? AND status = 'pending'"""),
+            (approved_by, approved_name, now_str(), req_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    if updated:
+        req = get_shipment_request(req_id)
+        update_order_status(req["order_id"], "approved")
+        add_audit_log(
+            approved_by, approved_name, get_role(approved_by),
+            "shipment_approved",
+            f"Заявка #{req_id} одобрена (заказ #{req['order_id']} от {req['full_name']})",
+        )
+    return updated
+
+
+def reject_shipment_request(req_id: int, rejected_by: int, rejected_name: str) -> bool:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("""UPDATE shipment_requests
+               SET status = 'rejected', approved_by = ?, approved_by_name = ?, approved_at = ?
+               WHERE id = ? AND status = 'pending'"""),
+            (rejected_by, rejected_name, now_str(), req_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    if updated:
+        req = get_shipment_request(req_id)
+        update_order_status(req["order_id"], "rejected")
+        add_audit_log(
+            rejected_by, rejected_name, get_role(rejected_by),
+            "shipment_rejected",
+            f"Заявка #{req_id} отклонена (заказ #{req['order_id']} от {req['full_name']})",
+        )
+    return updated
+
+
 # ─── Загрузка предопределённых пользователей ──────────────────────────────────
 
 
 def _load_predefined_users():
     try:
-        from config import ADMIN_IDS, BOSS_IDS, MANAGER_IDS
+        from config import ADMIN_IDS, BOSS_IDS
         try:
-            from config import PREDEFINED_USERS
-        except ImportError:
+            MANAGER_IDS = __import__("config").MANAGER_IDS
+        except Exception:
+            MANAGER_IDS = []
+        try:
+            PREDEFINED_USERS = __import__("config").PREDEFINED_USERS
+        except Exception:
             PREDEFINED_USERS = []
 
         with get_conn() as conn:
             cur = get_cursor(conn)
-
             for u in PREDEFINED_USERS:
                 cur.execute(
-                    q("INSERT INTO user_roles (user_id, username, full_name, role) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO NOTHING"),
-                    (u["user_id"], "", u.get("full_name", ""), u["role"]),
+                    q("INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO NOTHING"),
+                    (u["user_id"], "", u.get("full_name", ""), u["role"], now_str()),
                 )
-
             for uid in ADMIN_IDS:
                 cur.execute(
-                    q("INSERT INTO user_roles (user_id, username, full_name, role) VALUES (?, ?, ?, 'admin') ON CONFLICT(user_id) DO NOTHING"),
-                    (uid, "", "Admin"),
+                    q("INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, 'Admin', 'admin', ?) ON CONFLICT(user_id) DO NOTHING"),
+                    (uid, "", now_str()),
                 )
             for uid in BOSS_IDS:
                 cur.execute(
-                    q("INSERT INTO user_roles (user_id, username, full_name, role) VALUES (?, ?, ?, 'boss') ON CONFLICT(user_id) DO NOTHING"),
-                    (uid, "", "Boss"),
+                    q("INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, 'Boss', 'boss', ?) ON CONFLICT(user_id) DO NOTHING"),
+                    (uid, "", now_str()),
                 )
             for uid in MANAGER_IDS:
                 cur.execute(
-                    q("INSERT INTO user_roles (user_id, username, full_name, role) VALUES (?, ?, ?, 'manager') ON CONFLICT(user_id) DO NOTHING"),
-                    (uid, "", "Manager"),
+                    q("INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, 'Manager', 'manager', ?) ON CONFLICT(user_id) DO NOTHING"),
+                    (uid, "", now_str()),
                 )
             conn.commit()
         logger.info("Предопределённые пользователи загружены")

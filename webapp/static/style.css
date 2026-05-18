@@ -109,7 +109,7 @@ body {
   left: 0;
   right: 0;
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   background: var(--tg-theme-bg-color, #ffffff);
   border-top: 0.5px solid var(--tg-theme-section-separator-color, #e0e0e0);
   padding: 8px 0 calc(8px + env(safe-area-inset-bottom));
@@ -388,6 +388,140 @@ body {
   text-align: center;
   font-size: 12px;
   color: var(--tg-theme-hint-color, #888);
+}
+
+/* ─── Заказы ────────────────────────────────────── */
+.orders-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.order-card {
+  background: var(--tg-theme-bg-color, #fff);
+  border: 0.5px solid var(--tg-theme-section-separator-color, #e0e0e0);
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.order-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 6px;
+}
+
+.order-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--tg-theme-text-color, #000);
+}
+
+.order-manager {
+  font-size: 11px;
+  color: var(--tg-theme-hint-color, #888);
+  margin-top: 2px;
+}
+
+.order-agent {
+  font-size: 12px;
+  color: var(--tg-theme-text-color, #000);
+  margin-bottom: 4px;
+}
+
+.order-status {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+
+.status-draft    { background: #F1EFE8; color: #5F5E5A; }
+.status-pending  { background: #FAEEDA; color: #854F0B; }
+.status-approved { background: #EAF3DE; color: #3B6D11; }
+.status-rejected { background: #FCEBEB; color: #A32D2D; }
+.status-shipped  { background: #E6F1FB; color: #185FA5; }
+
+.order-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--tg-theme-hint-color, #888);
+  margin-bottom: 6px;
+}
+
+.order-items {
+  background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+  border-radius: 8px;
+  padding: 8px;
+  margin-top: 6px;
+}
+
+.order-item {
+  font-size: 12px;
+  color: var(--tg-theme-text-color, #000);
+  padding: 2px 0;
+}
+
+.order-item-more {
+  font-size: 11px;
+  color: var(--tg-theme-hint-color, #888);
+  margin-top: 2px;
+}
+
+.requests-btn {
+  width: 100%;
+  padding: 10px;
+  background: #FAEEDA;
+  color: #854F0B;
+  border: none;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 500;
+  margin-bottom: 12px;
+  cursor: pointer;
+}
+
+.req-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.btn-approve {
+  flex: 1;
+  padding: 8px;
+  background: #EAF3DE;
+  color: #3B6D11;
+  border: none;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.btn-reject {
+  flex: 1;
+  padding: 8px;
+  background: #FCEBEB;
+  color: #A32D2D;
+  border: none;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.btn-secondary {
+  width: 100%;
+  padding: 10px;
+  background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+  color: var(--tg-theme-text-color, #000);
+  border: 0.5px solid var(--tg-theme-section-separator-color, #e0e0e0);
+  border-radius: 10px;
+  font-size: 13px;
+  cursor: pointer;
 }
 
 .pay-status.pay-ok    { color: #3B6D11; }

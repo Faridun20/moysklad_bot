@@ -300,6 +300,84 @@ async def api_payments_send(request: Request):
 
     return JSONResponse({"payment_id": payment_id, "status": "pending"})
 
+# ─── API: заказы ─────────────────────────────────────────────────────────────
+
+
+@app.post("/api/orders")
+async def api_orders(request: Request):
+    """Список заказов текущего пользователя."""
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+
+    from services.database import get_user_orders, get_order_items, get_role
+    role = get_role(user["id"])
+
+    if role in ("admin", "boss"):
+        from services.database import get_all_orders
+        orders = get_all_orders()
+    else:
+        orders = get_user_orders(user["id"])
+
+    result = []
+    for o in orders:
+        items = get_order_items(o["id"])
+        result.append({
+            "id": o["id"],
+            "status": o["status"],
+            "full_name": o["full_name"],
+            "agent_name": o.get("agent_name", ""),
+            "comment": o.get("comment", ""),
+            "created_at": o["created_at"][:16],
+            "items_count": len(items),
+            "items": [
+                {
+                    "name": it["product_name"],
+                    "quantity": it["quantity"],
+                    "unit": it["unit"],
+                }
+                for it in items
+            ],
+        })
+
+    return JSONResponse({"orders": result, "role": role})
+
+
+@app.post("/api/orders/requests")
+async def api_pending_requests(request: Request):
+    """Заявки на отгрузку — только для boss/admin."""
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+
+    from services.database import get_role
+    role = get_role(user["id"])
+    if role not in ("admin", "boss"):
+        raise HTTPException(status_code=403, detail="Нет доступа")
+
+    from services.database import get_pending_requests, get_order, get_order_items
+    requests = get_pending_requests()
+    result = []
+    for r in requests:
+        order = get_order(r["order_id"])
+        items = get_order_items(r["order_id"]) if order else []
+        result.append({
+            "id": r["id"],
+            "order_id": r["order_id"],
+            "full_name": r["full_name"],
+            "status": r["status"],
+            "created_at": r["created_at"][:16],
+            "agent_name": order.get("agent_name", "") if order else "",
+            "items": [
+                {"name": it["product_name"], "quantity": it["quantity"], "unit": it["unit"]}
+                for it in items
+            ],
+        })
+
+    return JSONResponse({"requests": result})
+
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 async def start_webapp():

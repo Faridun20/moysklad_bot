@@ -65,6 +65,9 @@ async function showScreen(screen) {
     case 'stock':
       await renderStock();
       break;
+    case 'orders':
+      await renderOrders();
+      break;
     case 'analytics':
       await renderAnalytics();
       break;
@@ -100,6 +103,203 @@ function renderHome() {
     </div>
   `;
 }
+
+// ─── Экран: Заказы ──────────────────────────────────
+
+let ordersData = null;
+
+const STATUS_EMOJI = {
+  draft:    '📝',
+  pending:  '⏳',
+  approved: '✅',
+  rejected: '❌',
+  shipped:  '🚚',
+};
+
+const STATUS_NAME = {
+  draft:    'Черновик',
+  pending:  'На рассмотрении',
+  approved: 'Одобрено',
+  rejected: 'Отклонено',
+  shipped:  'Отгружено',
+};
+
+async function renderOrders() {
+  const content = document.getElementById('content');
+  content.innerHTML = `<div class="loader">⏳ Загружаю заказы…</div>`;
+
+  try {
+    const response = await fetch('/api/orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: tg.initData }),
+    });
+    if (!response.ok) throw new Error((await response.json()).detail);
+    ordersData = await response.json();
+  } catch (e) {
+    content.innerHTML = `<div class="error">❌ ${e.message}</div>`;
+    return;
+  }
+
+  renderOrdersList();
+}
+
+function renderOrdersList() {
+  const content = document.getElementById('content');
+  const { orders, role } = ordersData;
+  const isBoss = role === 'admin' || role === 'boss';
+
+  // Фильтры
+  const filters = [
+    { id: 'all',      label: 'Все' },
+    { id: 'draft',    label: '📝 Черновики' },
+    { id: 'pending',  label: '⏳ На рассмотрении' },
+    { id: 'approved', label: '✅ Одобрено' },
+    { id: 'rejected', label: '❌ Отклонено' },
+  ];
+
+  const filterButtons = filters.map(f =>
+    `<button class="cat-btn ${currentOrderFilter === f.id ? 'active' : ''}" data-filter="${f.id}">${f.label}</button>`
+  ).join('');
+
+  const filtered = currentOrderFilter === 'all'
+    ? orders
+    : orders.filter(o => o.status === currentOrderFilter);
+
+  const orderItems = filtered.length === 0
+    ? '<div class="loader">Нет заказов</div>'
+    : filtered.map(o => `
+        <div class="order-card" data-id="${o.id}">
+          <div class="order-header">
+            <div>
+              <div class="order-title">
+                ${STATUS_EMOJI[o.status] || '📋'} Заказ #${o.id}
+              </div>
+              ${isBoss ? `<div class="order-manager">👤 ${o.full_name}</div>` : ''}
+            </div>
+            <span class="order-status status-${o.status}">${STATUS_NAME[o.status] || o.status}</span>
+          </div>
+          ${o.agent_name ? `<div class="order-agent">🏢 ${o.agent_name}</div>` : ''}
+          <div class="order-meta">
+            <span>📦 ${o.items_count} товаров</span>
+            <span>${o.created_at}</span>
+          </div>
+          ${o.items_count > 0 ? `
+            <div class="order-items">
+              ${o.items.slice(0, 3).map(it =>
+                `<div class="order-item">• ${it.name}: <b>${it.quantity} ${it.unit}</b></div>`
+              ).join('')}
+              ${o.items.length > 3 ? `<div class="order-item-more">...ещё ${o.items.length - 3} поз.</div>` : ''}
+            </div>
+          ` : ''}
+        </div>
+      `).join('');
+
+  content.innerHTML = `
+    <div class="section-label">Фильтр</div>
+    <div class="cat-scroll">${filterButtons}</div>
+
+    ${isBoss ? `
+      <button class="requests-btn" id="show-requests">
+        ⏳ Заявки на рассмотрении
+      </button>
+    ` : ''}
+
+    <div class="section-label">Заказы · ${filtered.length}</div>
+    <div class="orders-list">${orderItems}</div>
+  `;
+
+  // Обработчики фильтров
+  document.querySelectorAll('.cat-btn[data-filter]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      currentOrderFilter = btn.dataset.filter;
+      renderOrdersList();
+    });
+  });
+
+  // Кнопка заявок для руководителя
+  const reqBtn = document.getElementById('show-requests');
+  if (reqBtn) {
+    reqBtn.addEventListener('click', () => renderPendingRequests());
+  }
+}
+
+let currentOrderFilter = 'all';
+
+async function renderPendingRequests() {
+  const content = document.getElementById('content');
+  content.innerHTML = `<div class="loader">⏳ Загружаю заявки…</div>`;
+
+  try {
+    const response = await fetch('/api/orders/requests', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: tg.initData }),
+    });
+    if (!response.ok) throw new Error((await response.json()).detail);
+    const data = await response.json();
+
+    if (data.requests.length === 0) {
+      content.innerHTML = `
+        <div class="section-label">Заявки на отгрузку</div>
+        <div class="loader">✅ Нет заявок на рассмотрении</div>
+        <button class="btn-secondary" id="back-orders">◀️ К заказам</button>
+      `;
+      document.getElementById('back-orders').addEventListener('click', renderOrdersList);
+      return;
+    }
+
+    const items = data.requests.map(r => `
+      <div class="order-card">
+        <div class="order-header">
+          <div>
+            <div class="order-title">⏳ Заявка #${r.id}</div>
+            <div class="order-manager">👤 ${r.full_name}</div>
+          </div>
+          <span class="order-status status-pending">Ожидает</span>
+        </div>
+        ${r.agent_name ? `<div class="order-agent">🏢 ${r.agent_name}</div>` : ''}
+        <div class="order-meta"><span>${r.created_at}</span></div>
+        <div class="order-items">
+          ${r.items.slice(0, 5).map(it =>
+            `<div class="order-item">• ${it.name}: <b>${it.quantity} ${it.unit}</b></div>`
+          ).join('')}
+          ${r.items.length > 5 ? `<div class="order-item-more">...ещё ${r.items.length - 5} поз.</div>` : ''}
+        </div>
+        <div class="req-actions">
+          <button class="btn-approve" data-req="${r.id}">✅ Одобрить</button>
+          <button class="btn-reject"  data-req="${r.id}">❌ Отклонить</button>
+        </div>
+      </div>
+    `).join('');
+
+    content.innerHTML = `
+      <div class="section-label">Заявки на отгрузку · ${data.requests.length}</div>
+      <div class="orders-list">${items}</div>
+      <button class="btn-secondary" id="back-orders" style="margin-top:12px">◀️ К заказам</button>
+    `;
+
+    document.getElementById('back-orders').addEventListener('click', renderOrdersList);
+
+    // Одобрить/отклонить через бота
+    document.querySelectorAll('.btn-approve').forEach(btn => {
+      btn.addEventListener('click', () => handleRequest(btn.dataset.req, 'approve'));
+    });
+    document.querySelectorAll('.btn-reject').forEach(btn => {
+      btn.addEventListener('click', () => handleRequest(btn.dataset.req, 'reject'));
+    });
+
+  } catch (e) {
+    content.innerHTML = `<div class="error">❌ ${e.message}</div>`;
+  }
+}
+
+async function handleRequest(reqId, action) {
+  // Отправляем действие через Telegram бота
+  tg.sendData(JSON.stringify({ action: `req_${action === 'approve' ? 'ok' : 'no'}:${reqId}` }));
+  tg.showAlert(action === 'approve' ? '✅ Заявка одобрена' : '❌ Заявка отклонена');
+  await renderPendingRequests();
+} 
 
 // ─── Обработчики ────────────────────────────────────
 

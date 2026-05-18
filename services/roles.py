@@ -30,3 +30,11 @@ def can_manage_payments(user_id: int) -> bool:
 def can_manage_users(user_id: int) -> bool:
     """Только полный админ."""
     return user_id in ADMIN_IDS or get_role(user_id) == "admin"
+
+def is_manager(user_id: int) -> bool:
+    return get_role(user_id) == "manager"
+
+
+def can_create_orders(user_id: int) -> bool:
+    """Создавать заказы и заявки на отгрузку."""
+    return get_role(user_id) in ("admin", "boss", "manager") or user_id in ADMIN_IDS

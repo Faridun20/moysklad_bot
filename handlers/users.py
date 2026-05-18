@@ -108,3 +108,52 @@ async def show_users(message):
     lines.append("\n<i>Чтобы изменить роль:</i>")
     lines.append("<code>/addrole [ID] [admin/boss/manager/employee]</code>")
     await message.answer("\n".join(lines), parse_mode="HTML")
+
+@router.message(Command("syncms"))
+async def cmd_syncms(message: Message):
+    """Ручная синхронизация всех менеджеров с МойСклад."""
+    if not can_manage_users(message.from_user.id):
+        return await message.answer("⛔ Нет доступа.")
+
+    await message.answer("⏳ Синхронизирую менеджеров с МойСклад…")
+
+    from services.ms_sync import sync_all_managers
+    users = get_all_users()
+    results = await sync_all_managers(users)
+
+    await message.answer(
+        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
+        f"✅ <b>Синхронизация завершена</b>\n\n"
+        f"🔗 Привязано: <b>{results['linked']}</b>\n"
+        f"🆕 Создано в МойСклад: <b>{results['created']}</b>\n"
+        f"❌ Ошибок: <b>{results['failed']}</b>",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("msstaff"))
+async def cmd_msstaff(message: Message):
+    """Показать список сотрудников МойСклад с их ID."""
+    if not can_manage_users(message.from_user.id):
+        return await message.answer("⛔ Нет доступа.")
+
+    await message.answer("⏳ Загружаю сотрудников МойСклад…")
+
+    from services.ms_sync import get_ms_employees
+    try:
+        employees = await get_ms_employees()
+        if not employees:
+            return await message.answer("👥 Сотрудников не найдено.")
+
+        lines = [
+            "<code>━━━━━━━━━━━━━━━━━━━━</code>",
+            "👥 <b>Сотрудники МойСклад:</b>\n",
+        ]
+        for emp in employees[:20]:
+            name = emp.get("name", "—")
+            uid = emp.get("id", "—")
+            lines.append(f"• <b>{name}</b>\n  <code>{uid}</code>")
+
+        await message.answer("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
