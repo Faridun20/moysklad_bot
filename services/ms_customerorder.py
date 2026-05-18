@@ -50,20 +50,31 @@ async def _resolve_print_template() -> dict | None:
     global _template_cache
     if _template_cache is not None:
         return _template_cache
-    for endpoint in ("embeddedtemplates", "customtemplates"):
+    # МойСклад использует SINGULAR в путях: /embeddedtemplate, /customtemplate
+    # (а не /embeddedtemplates с 's'). Это критично — plural-форма даёт 404,
+    # из-за чего предыдущая версия молча падала и PDF не приходил.
+    for endpoint in ("embeddedtemplate", "customtemplate"):
         try:
             data = await ms_get(f"entity/customerorder/metadata/{endpoint}")
             rows = data.get("rows", []) if isinstance(data, dict) else []
+            logger.info(
+                "templates from %s: count=%d", endpoint, len(rows),
+            )
             if rows:
                 _template_cache = rows[0]
                 logger.info(
-                    "customerorder template: %s (%s)",
-                    rows[0].get("name"), endpoint,
+                    "Выбран print-шаблон: %s (тип meta: %s)",
+                    rows[0].get("name"),
+                    (rows[0].get("meta") or {}).get("type"),
                 )
                 return _template_cache
         except Exception:
             logger.exception("template resolve from %s failed", endpoint)
-    logger.warning("Не найдено ни одного print-шаблона для customerorder")
+    logger.warning(
+        "Не найдено ни одного print-шаблона для customerorder. "
+        "PDF не будет отправлен — проверь что в МойСклад → Настройки → "
+        "Шаблоны печати есть хотя бы один шаблон для заказов покупателей."
+    )
     return None
 
 
@@ -84,57 +95,95 @@ async def _try_get_print_pdf(co_id: str) -> tuple[bytes | None, str | None]:
         return None, None
     template_meta = template.get("meta")
     if not template_meta:
+        logger.warning("template без поля meta: %s", template)
         return None, None
 
+    # Чистим meta — оставляем только href/type/mediaType (МойСклад ругается
+    # на лишние поля типа uuidHref). Тип нормализуем — должен быть
+    # 'embeddedtemplate' или 'customtemplate', а не 'embeddedtemplates'.
+    template_meta_clean = {
+        "href": template_meta.get("href"),
+        "type": (template_meta.get("type") or "embeddedtemplate").rstrip("s"),
+        "mediaType": template_meta.get("mediaType", "application/json"),
+    }
+    if "/customtemplate" in (template_meta_clean["href"] or ""):
+        template_meta_clean["type"] = "customtemplate"
+    elif "/embeddedtemplate" in (template_meta_clean["href"] or ""):
+        template_meta_clean["type"] = "embeddedtemplate"
+
+    logger.info(
+        "PDF request: co_id=%s, template href=%s, type=%s",
+        co_id, template_meta_clean["href"], template_meta_clean["type"],
+    )
+
     sess = await get_session()
-    # POST publication. Принципиальный момент: МойСклад отвечает 303 See Other
-    # и в Location ставит URL с готовым файлом. Перехватываем редирект.
+    export_url = f"{MS_BASE}/entity/customerorder/{co_id}/export"
+    body = {"template": {"meta": template_meta_clean}, "extension": "pdf"}
+
     try:
-        async with sess.post(
-            f"{MS_BASE}/entity/customerorder/{co_id}/export",
-            json={"template": {"meta": template_meta}, "extension": "pdf"},
-            allow_redirects=False,
-        ) as resp:
-            # 303 → Location указывает на готовый файл; сам файл часто
-            # доступен после короткой задержки. 200 → файл inline в body.
+        async with sess.post(export_url, json=body, allow_redirects=False) as resp:
+            logger.info(
+                "export response: status=%d, ctype=%s, location=%s",
+                resp.status,
+                resp.headers.get("Content-Type", ""),
+                resp.headers.get("Location", "")[:200],
+            )
             if resp.status == 200:
                 ctype = resp.headers.get("Content-Type", "")
                 if "pdf" in ctype.lower() or "octet-stream" in ctype.lower():
                     data = await resp.read()
+                    logger.info("PDF inline: %d bytes", len(data))
                     return data, _filename_from_resp(resp, co_id)
-                # JSON-ответ — значит publication не пришла напрямую
-                logger.warning("export 200 but non-PDF content-type: %s", ctype)
+                body_text = await resp.text()
+                logger.warning(
+                    "export 200 but non-PDF ctype=%s; body[:400]=%s",
+                    ctype, body_text[:400],
+                )
                 return None, None
             if resp.status in (302, 303):
                 location = resp.headers.get("Location")
                 if not location:
-                    logger.warning("export redirect without Location")
+                    logger.warning("export redirect без Location header")
                     return None, None
-                # location может быть относительной — нормализуем
                 if location.startswith("/"):
                     location = "https://api.moysklad.ru" + location
-                # Скачиваем по location тем же sess (auth header сохранится)
-                # Может быть задержка на rendering — ретраим до 3 раз
+                logger.info("PDF redirect → %s", location)
                 import asyncio
-                for attempt in range(3):
+                for attempt in range(5):
                     async with sess.get(location, allow_redirects=False) as dl:
+                        logger.info(
+                            "PDF download attempt %d: status=%d",
+                            attempt + 1, dl.status,
+                        )
                         if dl.status == 200:
-                            return await dl.read(), _filename_from_resp(dl, co_id)
+                            data = await dl.read()
+                            logger.info("PDF downloaded: %d bytes", len(data))
+                            return data, _filename_from_resp(dl, co_id)
                         if dl.status in (202, 425):
-                            # Rendering, попробуем ещё раз
+                            # Rendering ещё в процессе — ретрай
                             await asyncio.sleep(1.5 * (attempt + 1))
                             continue
-                        logger.warning("download status %d", dl.status)
+                        if dl.status in (302, 303):
+                            # Ещё один редирект — иногда МойСклад шлёт цепочку
+                            location = dl.headers.get("Location") or location
+                            if location.startswith("/"):
+                                location = "https://api.moysklad.ru" + location
+                            continue
+                        err_body = await dl.text()
+                        logger.warning(
+                            "PDF download status=%d, body[:300]=%s",
+                            dl.status, err_body[:300],
+                        )
                         return None, None
-                logger.warning("download still not ready after retries")
+                logger.warning("PDF не готов после 5 попыток")
                 return None, None
-            body = await resp.text()
+            err_body = await resp.text()
             logger.warning(
-                "export failed %d: %s", resp.status, body[:200],
+                "export failed: status=%d, body=%s", resp.status, err_body[:400],
             )
             return None, None
     except Exception:
-        logger.exception("export exception")
+        logger.exception("export exception for co=%s", co_id)
         return None, None
 
 
