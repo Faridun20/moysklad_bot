@@ -840,6 +840,8 @@ async def api_orders(request: Request):
             "payment_type": o.get("payment_type") or "paid",
             "due_date": o.get("due_date"),
             "paid_at": (o.get("paid_at") or "")[:16] if o.get("paid_at") else None,
+            "paid_confirmed_at": (o.get("paid_confirmed_at") or "")[:16]
+                if o.get("paid_confirmed_at") else None,
             "created_at": o["created_at"][:16],
             "items_count": len(items),
             "total": total,
@@ -1161,12 +1163,18 @@ async def api_debts(request: Request):
             for it in items
         )
         due = o.get("due_date")
-        if due:
+        # State дописывает «awaiting_confirmation» — даже если по дате
+        # это «upcoming/today/overdue», важнее показать, что менеджер
+        # уже отметил оплату и ждёт подтверждения босса.
+        if o.get("paid_at"):
+            state = "awaiting_confirmation"
+        elif due:
             state = "overdue" if due < today else ("due_today" if due == today else "upcoming")
         else:
             state = "upcoming"  # без даты не считаем просроченным
         result.append({
             "id": o["id"],
+            "user_id": o["user_id"],
             "agent_name": o.get("agent_name") or "—",
             "full_name": o.get("full_name") or "—",
             "due_date": due,
@@ -1174,15 +1182,44 @@ async def api_debts(request: Request):
             "total": total,
             "items_count": len(items),
             "created_at": (o.get("created_at") or "")[:10],
+            "paid_at": (o.get("paid_at") or "")[:16] if o.get("paid_at") else None,
             "state": state,
             "is_mine": o["user_id"] == user_id,
         })
+
+    # Сводка «получено» — отдельные суммы по валютам (без конвертации).
+    # Для расчёта берём только подтверждённые: paid_confirmed_at IS NOT NULL.
+    # Менеджер видит свои; босс — все.
+    confirmed_orders = await adb.get_all_orders() if is_boss else await adb.get_user_orders(user_id)
+    received_by_currency: dict[str, float] = {}
+    pending_by_currency: dict[str, float] = {}
+    confirmed_ids = [o["id"] for o in confirmed_orders if o.get("paid_confirmed_at")]
+    awaiting_ids = [o["id"] for o in confirmed_orders if o.get("paid_at") and not o.get("paid_confirmed_at")]
+    if confirmed_ids or awaiting_ids:
+        all_items = await adb.get_order_items_by_ids(confirmed_ids + awaiting_ids)
+        for o in confirmed_orders:
+            if o.get("paid_confirmed_at"):
+                bucket = received_by_currency
+            elif o.get("paid_at"):
+                bucket = pending_by_currency
+            else:
+                continue
+            cur_ = o.get("currency") or BASE_CURRENCY
+            total = sum(
+                float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
+                for it in all_items.get(o["id"], [])
+            )
+            bucket[cur_] = bucket.get(cur_, 0.0) + total
 
     return JSONResponse({
         "debts": result,
         "role": role,
         "scope": "company" if is_boss else "personal",
         "today": today,
+        # «Получено» — сумма уже подтверждённых поступлений за всё время.
+        # «Ожидает подтверждения» — менеджер отметил, босс ещё нет.
+        "money_received": [{"currency": k, "total": v} for k, v in received_by_currency.items()],
+        "money_pending": [{"currency": k, "total": v} for k, v in pending_by_currency.items()],
     })
 
 
@@ -1232,6 +1269,124 @@ async def api_mark_paid(request: Request):
         or user.get("username", str(user_id))
     )
     updated = await adb.mark_order_paid(order_id, user_id, full_name)
+
+    # Если менеджер отметил оплату — шлём боссам push для подтверждения
+    # (это и есть «двухступенчатый» контроль).
+    if updated:
+        await _notify_bosses_payment_pending(order_id, full_name)
+
+    return JSONResponse({"ok": True, "updated": updated})
+
+
+async def _notify_bosses_payment_pending(order_id: int, manager_name: str) -> None:
+    """Когда менеджер отметил оплату по credit-заказу — шлём push'ы всем
+    boss/admin с inline-кнопками confirm/reject. Best-effort: тихо
+    логируем ошибки, не валим API-вызов."""
+    from services import async_db as adb
+    from services.notifier import aget_notify_recipients, tg_send_message
+
+    try:
+        order = await adb.get_order(order_id)
+        if not order:
+            return
+        items = await adb.get_order_items(order_id)
+        total = sum(
+            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
+            for it in items
+        )
+        from config import BASE_CURRENCY
+        currency = order.get("currency") or BASE_CURRENCY
+        agent = order.get("agent_name") or "—"
+        due = order.get("due_date") or "—"
+        text = (
+            "💳 <b>Требуется подтверждение оплаты</b>\n\n"
+            f"Заказ #{order_id}\n"
+            f"👨‍💼 Менеджер: <b>{manager_name}</b>\n"
+            f"🏢 Клиент: <b>{agent}</b>\n"
+            f"💰 Сумма: <b>{int(round(total)):,}</b> {currency}\n"
+            f"📅 Срок был: {due}\n\n"
+            "Менеджер отметил «деньги получил». Подтвердите, что они "
+            "реально пришли в кассу."
+        ).replace(",", " ")
+        keyboard = {
+            "inline_keyboard": [[
+                {"text": "✅ Подтверждаю",  "callback_data": f"pay_conf_ok:{order_id}"},
+                {"text": "❌ Отклонить",   "callback_data": f"pay_conf_no:{order_id}"},
+            ]]
+        }
+        for uid in await aget_notify_recipients():
+            await tg_send_message(uid, text, reply_markup=keyboard)
+    except Exception:
+        logger.exception("Не удалось отправить уведомление о подтверждении оплаты #%s", order_id)
+
+
+@app.post("/api/orders/confirm_payment")
+async def api_confirm_payment(request: Request):
+    """Босс подтверждает поступление денег по заказу."""
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),  # только начальство
+        rate_limit_scope="api_confirm_payment",
+        rate_limit_max=30,
+        rate_limit_window=60.0,
+    )
+
+    try:
+        order_id = int(data.get("order_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="order_id обязателен")
+
+    full_name = (
+        f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+        or user.get("username", str(user["id"]))
+    )
+    updated = await adb.confirm_payment_received(order_id, user["id"], full_name)
+    return JSONResponse({"ok": True, "updated": updated})
+
+
+@app.post("/api/orders/reject_payment")
+async def api_reject_payment(request: Request):
+    """Босс отклоняет: денег не вижу. Сбрасываем paid_at, цикл с нуля."""
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_reject_payment",
+        rate_limit_max=30,
+        rate_limit_window=60.0,
+    )
+
+    try:
+        order_id = int(data.get("order_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="order_id обязателен")
+
+    full_name = (
+        f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+        or user.get("username", str(user["id"]))
+    )
+    updated = await adb.reject_payment_received(order_id, user["id"], full_name)
+
+    # Опционально: уведомить менеджера-владельца что босс отклонил
+    if updated:
+        try:
+            from services import async_db as adb2
+            from services.notifier import tg_send_message
+            order = await adb2.get_order(order_id)
+            if order and order.get("user_id"):
+                await tg_send_message(
+                    order["user_id"],
+                    f"⚠️ Босс отклонил подтверждение оплаты по заказу #{order_id} "
+                    f"({order.get('agent_name') or '—'}). Долг снова открыт.",
+                )
+        except Exception:
+            logger.exception("Не удалось уведомить менеджера об отклонении #%s", order_id)
+
     return JSONResponse({"ok": True, "updated": updated})
 
 

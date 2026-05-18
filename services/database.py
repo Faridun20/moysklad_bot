@@ -190,19 +190,22 @@ def init_db():
             )""",
 
             f"""CREATE TABLE IF NOT EXISTS orders (
-                id            {id_type},
-                user_id       BIGINT NOT NULL,
-                full_name     TEXT,
-                status        TEXT NOT NULL DEFAULT 'draft',
-                comment       TEXT,
-                agent_id      TEXT,
-                agent_name    TEXT,
-                currency      TEXT,
-                payment_type  TEXT NOT NULL DEFAULT 'paid',
-                due_date      TEXT,
-                paid_at       TEXT,
-                created_at    TEXT NOT NULL,
-                updated_at    TEXT NOT NULL
+                id                      {id_type},
+                user_id                 BIGINT NOT NULL,
+                full_name               TEXT,
+                status                  TEXT NOT NULL DEFAULT 'draft',
+                comment                 TEXT,
+                agent_id                TEXT,
+                agent_name              TEXT,
+                currency                TEXT,
+                payment_type            TEXT NOT NULL DEFAULT 'paid',
+                due_date                TEXT,
+                paid_at                 TEXT,
+                paid_confirmed_at       TEXT,
+                paid_confirmed_by       BIGINT,
+                paid_confirmed_by_name  TEXT,
+                created_at              TEXT NOT NULL,
+                updated_at              TEXT NOT NULL
             )""",
 
             f"""CREATE TABLE IF NOT EXISTS order_items (
@@ -322,6 +325,15 @@ def init_db():
             # не погашен. Для 'paid' заказов также NULL — там оплата
             # сразу, отдельный timestamp не нужен (есть created_at).
             ("orders", "paid_at", "TEXT"),
+            # Двухступенчатое подтверждение оплаты:
+            #  - paid_at:           менеджер отметил «деньги получил»
+            #  - paid_confirmed_*:  босс/админ подтвердил «да, в кассе»
+            # Заказ считается реально оплаченным ТОЛЬКО когда оба поля
+            # заполнены. Если босс отклонил — paid_at обнуляется (см.
+            # reject_payment_received), цикл начинается заново.
+            ("orders", "paid_confirmed_at", "TEXT"),
+            ("orders", "paid_confirmed_by", "BIGINT"),
+            ("orders", "paid_confirmed_by_name", "TEXT"),
         ]
         for table, column, col_type in migrations:
             try:
@@ -347,6 +359,30 @@ def init_db():
             except Exception as e:
                 conn.rollback()
                 logger.debug("Индекс не создан: %s", e)
+
+        # ─── Backfill для подтверждений оплаты ────────────────────────
+        # Включаем подтверждение оплаты боссом. Раньше менеджер просто
+        # ставил paid_at и долг считался закрытым; теперь нужен второй
+        # шаг (подтверждение). Для уже закрытых долгов подтверждаем
+        # автоматически (paid_confirmed_at = paid_at) — иначе они
+        # окажутся «висящими» и завалят боссу очередь подтверждений.
+        # Идемпотентно: только записи где paid_at стоит, а confirmed —
+        # нет. На свежей БД эффект = 0 строк.
+        try:
+            cur.execute(
+                "UPDATE orders "
+                "SET paid_confirmed_at = paid_at, "
+                "    paid_confirmed_by = user_id, "
+                "    paid_confirmed_by_name = COALESCE(full_name, '') "
+                "WHERE paid_at IS NOT NULL AND paid_confirmed_at IS NULL"
+            )
+            rows = cur.rowcount
+            conn.commit()
+            if rows > 0:
+                logger.info("Backfill: %d ранее закрытых долгов автоподтверждены", rows)
+        except Exception as e:
+            conn.rollback()
+            logger.warning("Backfill paid_confirmed: %s", e)
 
     logger.info("База данных инициализирована")
     _load_predefined_users()
@@ -857,6 +893,107 @@ def mark_order_paid(
     return updated
 
 
+def confirm_payment_received(
+    order_id: int,
+    confirmed_by: int,
+    confirmed_by_name: str,
+) -> bool:
+    """Босс подтверждает что деньги по заказу реально пришли в кассу.
+
+    Возможно только если менеджер до этого уже отметил paid_at
+    (нельзя подтвердить то, чего ещё нет). Идемпотентно: повторный
+    вызов на уже подтверждённый заказ возвращает False.
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "UPDATE orders "
+                "SET paid_confirmed_at = ?, paid_confirmed_by = ?, "
+                "    paid_confirmed_by_name = ?, updated_at = ? "
+                "WHERE id = ? AND paid_at IS NOT NULL "
+                "AND paid_confirmed_at IS NULL"
+            ),
+            (now_str(), confirmed_by, confirmed_by_name, now_str(), order_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    if updated:
+        order = get_order(order_id)
+        details = (
+            f"Получение денег по заказу #{order_id} подтверждено "
+            f"(клиент: {order.get('agent_name') or '—'}, "
+            f"менеджер: {order.get('full_name') or '—'})"
+            if order else f"Получение денег по #{order_id} подтверждено"
+        )
+        add_audit_log(
+            confirmed_by, confirmed_by_name, get_role(confirmed_by),
+            "payment_confirmed",
+            details,
+        )
+    return updated
+
+
+def reject_payment_received(
+    order_id: int,
+    rejected_by: int,
+    rejected_by_name: str,
+) -> bool:
+    """Босс отклоняет: «нет, денег не вижу». Сбрасываем paid_at в NULL,
+    цикл начинается заново — менеджер должен снова отметить когда деньги
+    реально появятся, и подтвердить заново.
+
+    Срабатывает только на «висящих» подтверждениях (paid_at стоит,
+    paid_confirmed_at пуст). На уже подтверждённый — игнор.
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "UPDATE orders "
+                "SET paid_at = NULL, updated_at = ? "
+                "WHERE id = ? AND paid_at IS NOT NULL "
+                "AND paid_confirmed_at IS NULL"
+            ),
+            (now_str(), order_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    if updated:
+        order = get_order(order_id)
+        details = (
+            f"Подтверждение оплаты #{order_id} отклонено "
+            f"(клиент: {order.get('agent_name') or '—'}, "
+            f"менеджер: {order.get('full_name') or '—'})"
+            if order else f"Подтверждение #{order_id} отклонено"
+        )
+        add_audit_log(
+            rejected_by, rejected_by_name, get_role(rejected_by),
+            "payment_rejected_received",
+            details,
+        )
+    return updated
+
+
+def get_pending_confirmations(user_id: int | None = None) -> list[dict]:
+    """Заказы, где менеджер отметил оплату, но босс ещё не подтвердил.
+    user_id фильтрует по автору (для менеджера — показать свои)."""
+    query = (
+        "SELECT * FROM orders "
+        "WHERE paid_at IS NOT NULL AND paid_confirmed_at IS NULL"
+    )
+    params: list = []
+    if user_id is not None:
+        query += " AND user_id = ?"
+        params.append(user_id)
+    query += " ORDER BY paid_at ASC, id ASC"
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q(query), params)
+        rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_open_debts(
     user_id: int | None = None,
     due_through: str | None = None,
@@ -872,10 +1009,16 @@ def get_open_debts(
 
     Сортировка: сначала просроченные (старая due_date), потом сегодняшние.
     Это удобно и для UI, и для уведомлений.
+
+    Заказ остаётся «открытым» пока paid_confirmed_at IS NULL — то есть
+    пока босс не подтвердил поступление. Менеджерский paid_at одного
+    недостаточно: до подтверждения деньги формально ещё не получены,
+    и заказ всё ещё в списке долгов (но с пометкой `awaiting_confirmation`
+    на стороне UI).
     """
     query = (
         "SELECT * FROM orders "
-        "WHERE payment_type = 'credit' AND paid_at IS NULL "
+        "WHERE payment_type = 'credit' AND paid_confirmed_at IS NULL "
         "AND status IN ('approved', 'shipped')"
     )
     params: list = []

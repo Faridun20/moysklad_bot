@@ -1338,9 +1338,14 @@ function initNav() {
 
 // ─── Экран «Долги» ──────────────────────────────────────────────────────────
 //
-// Бекенд возвращает уже размеченные долги (state = overdue|due_today|upcoming).
-// Менеджер видит только свои; boss/admin — все. Фильтр сверху — переключение
-// "все / только просроченные+сегодня".
+// Бекенд возвращает уже размеченные долги. Состояния (state):
+//   - overdue                — просрочен (due_date < сегодня, не отмечен)
+//   - due_today              — сегодня к оплате, не отмечен
+//   - upcoming               — будущий срок, не отмечен
+//   - awaiting_confirmation  — менеджер отметил, ждём подтверждения босса
+//
+// Менеджер видит свои; boss/admin — все + блок «На подтверждении» с
+// кнопками confirm/reject.
 
 let debtsFilter = 'all';  // 'all' | 'today'
 
@@ -1350,18 +1355,32 @@ async function renderDebts() {
   try {
     const data = await api('/api/debts', { mode: debtsFilter });
     const debts = data.debts || [];
+    const isBoss = data.role === 'boss' || data.role === 'admin';
     const scopeLabel = data.scope === 'company' ? 'Все долги' : 'Мои долги';
     const today = data.today;
 
-    // Сводка по статусам
+    // Разделяем долги по состояниям
+    const awaiting = debts.filter(d => d.state === 'awaiting_confirmation');
+    const open = debts.filter(d => d.state !== 'awaiting_confirmation');
+
     let overdueCount = 0, todayCount = 0, upcomingCount = 0;
     let overdueSum = 0, todaySum = 0, upcomingSum = 0;
-    for (const d of debts) {
+    for (const d of open) {
       if (d.state === 'overdue') { overdueCount++; overdueSum += d.total; }
       else if (d.state === 'due_today') { todayCount++; todaySum += d.total; }
       else { upcomingCount++; upcomingSum += d.total; }
     }
     const fmt = n => Math.round(n).toLocaleString('ru-RU');
+
+    // Сводка «получено» / «ожидает подтверждения» по валютам
+    const receivedRows = (data.money_received || [])
+      .filter(x => x.total > 0)
+      .map(x => `${fmt(x.total)} ${escapeHtml(x.currency)}`)
+      .join(' · ');
+    const pendingRows = (data.money_pending || [])
+      .filter(x => x.total > 0)
+      .map(x => `${fmt(x.total)} ${escapeHtml(x.currency)}`)
+      .join(' · ');
 
     let html = `
       <div class="debts-header">
@@ -1369,6 +1388,16 @@ async function renderDebts() {
         <div class="debts-tabs">
           <button class="debts-tab ${debtsFilter === 'all' ? 'active' : ''}" data-f="all">Все</button>
           <button class="debts-tab ${debtsFilter === 'today' ? 'active' : ''}" data-f="today">К оплате сейчас</button>
+        </div>
+      </div>
+      <div class="money-summary">
+        <div class="money-block money-received">
+          <div class="money-label">💵 Получено (подтверждено)</div>
+          <div class="money-value">${receivedRows || '—'}</div>
+        </div>
+        <div class="money-block money-pending">
+          <div class="money-label">⏳ Ожидает подтверждения</div>
+          <div class="money-value">${pendingRows || '—'}</div>
         </div>
       </div>
       <div class="debts-summary">
@@ -1392,10 +1421,43 @@ async function renderDebts() {
       </div>
     `;
 
-    if (debts.length === 0) {
-      html += '<div class="empty">Нет открытых долгов</div>';
-    } else {
-      html += '<div class="debts-list">' + debts.map(d => {
+    // ─── Блок «На подтверждении» — отдельно ───────────────────────
+    if (awaiting.length > 0) {
+      html += `
+        <div class="section-label section-awaiting">⏳ Ожидают подтверждения (${awaiting.length})</div>
+        <div class="debts-list">${awaiting.map(d => {
+          const ownerStr = d.is_mine ? '' : ` <span class="debt-owner">· ${escapeHtml(d.full_name)}</span>`;
+          const paidWhen = d.paid_at ? ` · отмечено ${escapeHtml(d.paid_at)}` : '';
+          return `
+            <div class="debt-card debt-awaiting">
+              <div class="debt-card-top">
+                <div class="debt-agent">🏢 ${escapeHtml(d.agent_name)}</div>
+                <div class="debt-amount">${fmt(d.total)} ${escapeHtml(d.currency)}</div>
+              </div>
+              <div class="debt-card-mid">
+                <span class="debt-state">⏳ Ждёт подтверждения${paidWhen}</span>
+                <span class="debt-meta">#${d.id} · ${d.items_count} поз.${ownerStr}</span>
+              </div>
+              ${isBoss ? `
+                <div class="debt-actions">
+                  <button class="btn-confirm-pay" data-id="${d.id}">✅ Подтвердить</button>
+                  <button class="btn-reject-pay"  data-id="${d.id}">❌ Отклонить</button>
+                </div>
+              ` : `
+                <div class="debt-hint">Босс должен подтвердить</div>
+              `}
+            </div>
+          `;
+        }).join('')}</div>
+      `;
+    }
+
+    // ─── Открытые долги (ещё не отмечены менеджером) ──────────────
+    if (open.length === 0 && awaiting.length === 0) {
+      html += '<div class="empty">Открытых долгов нет</div>';
+    } else if (open.length > 0) {
+      html += `<div class="section-label">💳 Открытые (${open.length})</div>`;
+      html += '<div class="debts-list">' + open.map(d => {
         const stateClass = `debt-${d.state}`;
         const stateLabel = d.state === 'overdue' ? '⚠️ Просрочен'
           : d.state === 'due_today' ? '⏰ Сегодня' : '📅 Срок';
@@ -1427,16 +1489,56 @@ async function renderDebts() {
       });
     });
 
-    // Mark-paid
+    // Mark-paid (менеджер отмечает)
     document.querySelectorAll('.btn-mark-paid').forEach(btn => {
       btn.addEventListener('click', async () => {
         const id = parseInt(btn.dataset.id);
-        tg.showConfirm('Отметить долг как погашенный?', async ok => {
+        tg.showConfirm('Отметить, что деньги получены?\\nБосс должен будет подтвердить.', async ok => {
           if (!ok) return;
           btn.disabled = true;
           try {
             await api('/api/orders/mark_paid', { order_id: id });
             tg.HapticFeedback?.notificationOccurred('success');
+            await renderDebts();
+          } catch (e) {
+            tg.HapticFeedback?.notificationOccurred('error');
+            tg.showAlert('❌ ' + e.message);
+            btn.disabled = false;
+          }
+        });
+      });
+    });
+
+    // Confirm-payment (босс подтверждает)
+    document.querySelectorAll('.btn-confirm-pay').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = parseInt(btn.dataset.id);
+        tg.showConfirm('Подтверждаете, что деньги по этому заказу пришли?', async ok => {
+          if (!ok) return;
+          btn.disabled = true;
+          try {
+            await api('/api/orders/confirm_payment', { order_id: id });
+            tg.HapticFeedback?.notificationOccurred('success');
+            await renderDebts();
+          } catch (e) {
+            tg.HapticFeedback?.notificationOccurred('error');
+            tg.showAlert('❌ ' + e.message);
+            btn.disabled = false;
+          }
+        });
+      });
+    });
+
+    // Reject-payment (босс отклоняет — возвращает долг в открытые)
+    document.querySelectorAll('.btn-reject-pay').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = parseInt(btn.dataset.id);
+        tg.showConfirm('Отклонить? Долг вернётся в «открытые» — менеджер должен будет снова отметить, когда деньги действительно появятся.', async ok => {
+          if (!ok) return;
+          btn.disabled = true;
+          try {
+            await api('/api/orders/reject_payment', { order_id: id });
+            tg.HapticFeedback?.notificationOccurred('warning');
             await renderDebts();
           } catch (e) {
             tg.HapticFeedback?.notificationOccurred('error');
