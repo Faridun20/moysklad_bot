@@ -1437,53 +1437,84 @@ async function renderDebts(container) {
     const fmt = n => Math.round(n).toLocaleString('ru-RU');
 
     // Сводка «получено» / «ожидает подтверждения» по валютам
-    const receivedRows = (data.money_received || [])
-      .filter(x => x.total > 0)
-      .map(x => `${fmt(x.total)} ${escapeHtml(x.currency)}`)
-      .join(' · ');
-    const pendingRows = (data.money_pending || [])
-      .filter(x => x.total > 0)
-      .map(x => `${fmt(x.total)} ${escapeHtml(x.currency)}`)
-      .join(' · ');
+    const receivedItems = (data.money_received || []).filter(x => x.total > 0);
+    const pendingItems  = (data.money_pending  || []).filter(x => x.total > 0);
+    const receivedRows = receivedItems
+      .map(x => `${fmt(x.total)} ${escapeHtml(x.currency)}`).join(' · ');
+    const pendingRows = pendingItems
+      .map(x => `${fmt(x.total)} ${escapeHtml(x.currency)}`).join(' · ');
+
+    // ─── Полностью пустое состояние ───────────────────────────────
+    // Когда нет ни долгов, ни подтверждённых платежей, ни ожидающих —
+    // экран выглядел «полузагруженным» (две карточки с тоненькими «—»
+    // и три нолика). Заменяем на единственный дружелюбный блок.
+    const totalEmpty = (
+      debts.length === 0 &&
+      receivedItems.length === 0 &&
+      pendingItems.length === 0
+    );
 
     let html = `
       <div class="debts-header">
-        <div class="debts-title">${scopeLabel}</div>
         <div class="debts-tabs">
           <button class="debts-tab ${debtsFilter === 'all' ? 'active' : ''}" data-f="all">Все</button>
           <button class="debts-tab ${debtsFilter === 'today' ? 'active' : ''}" data-f="today">К оплате сейчас</button>
         </div>
       </div>
-      <div class="money-summary">
-        <div class="money-block money-received">
-          <div class="money-label">💵 Получено (подтверждено)</div>
-          <div class="money-value">${receivedRows || '—'}</div>
-        </div>
-        <div class="money-block money-pending">
-          <div class="money-label">⏳ Ожидает подтверждения</div>
-          <div class="money-value">${pendingRows || '—'}</div>
-        </div>
-      </div>
-      <div class="debts-summary">
-        <div class="debt-stat debt-stat-overdue">
-          <div class="debt-stat-num">${overdueCount}</div>
-          <div class="debt-stat-label">Просрочено</div>
-          <div class="debt-stat-sum">${fmt(overdueSum)}</div>
-        </div>
-        <div class="debt-stat debt-stat-today">
-          <div class="debt-stat-num">${todayCount}</div>
-          <div class="debt-stat-label">Сегодня</div>
-          <div class="debt-stat-sum">${fmt(todaySum)}</div>
-        </div>
-        ${debtsFilter === 'all' ? `
-        <div class="debt-stat debt-stat-upcoming">
-          <div class="debt-stat-num">${upcomingCount}</div>
-          <div class="debt-stat-label">Будущие</div>
-          <div class="debt-stat-sum">${fmt(upcomingSum)}</div>
-        </div>
-        ` : ''}
-      </div>
     `;
+
+    if (totalEmpty) {
+      html += `
+        <div class="finance-empty">
+          <div class="finance-empty-icon">💳</div>
+          <div class="finance-empty-title">Долгов и платежей пока нет</div>
+          <div class="finance-empty-hint">
+            Когда менеджер оформит заказ «в долг» — он появится здесь.
+            А подтверждённые поступления попадут в сводку.
+          </div>
+        </div>
+      `;
+    } else {
+      // Если есть хоть что-то — показываем money-блоки, но компактно.
+      html += `
+        <div class="money-summary">
+          <div class="money-block money-received ${receivedItems.length === 0 ? 'money-empty' : ''}">
+            <div class="money-label">💵 Получено</div>
+            <div class="money-value">${receivedRows || '<span class="money-placeholder">пока нет поступлений</span>'}</div>
+          </div>
+          <div class="money-block money-pending ${pendingItems.length === 0 ? 'money-empty' : ''}">
+            <div class="money-label">⏳ Ожидает подтверждения</div>
+            <div class="money-value">${pendingRows || '<span class="money-placeholder">нет ожидающих</span>'}</div>
+          </div>
+        </div>
+      `;
+      // Stat-плитки показываем только если хоть один счётчик не ноль,
+      // иначе три «0 0 0» лишь засоряют экран.
+      const hasAnyStat = overdueCount + todayCount + upcomingCount > 0;
+      if (hasAnyStat) {
+        html += `
+          <div class="debts-summary">
+            <div class="debt-stat debt-stat-overdue">
+              <div class="debt-stat-num">${overdueCount}</div>
+              <div class="debt-stat-label">Просрочено</div>
+              <div class="debt-stat-sum">${fmt(overdueSum)}</div>
+            </div>
+            <div class="debt-stat debt-stat-today">
+              <div class="debt-stat-num">${todayCount}</div>
+              <div class="debt-stat-label">Сегодня</div>
+              <div class="debt-stat-sum">${fmt(todaySum)}</div>
+            </div>
+            ${debtsFilter === 'all' ? `
+            <div class="debt-stat debt-stat-upcoming">
+              <div class="debt-stat-num">${upcomingCount}</div>
+              <div class="debt-stat-label">Будущие</div>
+              <div class="debt-stat-sum">${fmt(upcomingSum)}</div>
+            </div>
+            ` : ''}
+          </div>
+        `;
+      }
+    }
 
     // ─── Блок «На подтверждении» ──────────────────────────────────
     if (awaiting.length > 0) {
@@ -1524,8 +1555,9 @@ async function renderDebts(container) {
     }
 
     // ─── Открытые долги (с partial — частично оплаченные тоже здесь) ─
-    if (open.length === 0 && awaiting.length === 0) {
-      html += '<div class="empty">Открытых долгов нет</div>';
+    if (open.length === 0 && awaiting.length === 0 && !totalEmpty) {
+      // Долгов нет, но есть деньги получено/ожидается — отдельно скажем
+      html += '<div class="empty">Открытых долгов нет — все деньги собраны 🎉</div>';
     } else if (open.length > 0) {
       html += `<div class="section-label">💳 Открытые (${open.length})</div>`;
       html += '<div class="debts-list">' + open.map(d => {
