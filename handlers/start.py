@@ -128,6 +128,32 @@ async def cmd_start(message: Message):
     ensure_user(user.id, user.username or "", user.full_name or "", ADMIN_IDS)
     role = get_role(user.id)
 
+    # Перезаписываем per-chat menu button у этого юзера с актуальным
+    # WEBAPP_URL. Это важно: Telegram кэширует Menu Button per-user,
+    # и если когда-то URL был другой (старый домен webapp-сервиса) —
+    # у юзера в превью чата осталась кнопка с битым URL → «Not Found».
+    # Глобальный set_chat_menu_button (без chat_id) кэш у юзеров НЕ
+    # перетирает; нужен явный per-chat вызов.
+    import os as _os
+    from aiogram.types import MenuButtonWebApp, MenuButtonDefault, WebAppInfo
+    webapp_url = _os.environ.get("WEBAPP_URL", "").strip().rstrip("/")
+    try:
+        if webapp_url:
+            await message.bot.set_chat_menu_button(
+                chat_id=message.chat.id,
+                menu_button=MenuButtonWebApp(
+                    text="Открыть",
+                    web_app=WebAppInfo(url=webapp_url),
+                ),
+            )
+        else:
+            await message.bot.set_chat_menu_button(
+                chat_id=message.chat.id,
+                menu_button=MenuButtonDefault(),
+            )
+    except Exception as e:
+        logger.warning("set_chat_menu_button per-chat failed for %s: %s", user.id, e)
+
     # Гости — те, кого админ ещё не активировал. Не показываем им меню
     # каталога/заявок, только короткое сообщение со своим ID. Админ
     # повышает роль командой /addrole <id> manager.
