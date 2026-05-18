@@ -295,10 +295,7 @@ async def api_home(request: Request):
     """
     from datetime import datetime, timedelta
     from services.moysklad import get_sales_stats, get_shipments
-    from services.database import (
-        get_user_orders, get_pending_requests,
-        get_moysklad_employee_id, get_order_items,
-    )
+    from services import async_db as adb
 
     data = await request.json()
     user = verify_init_data(data.get("initData", ""))
@@ -320,8 +317,9 @@ async def api_home(request: Request):
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago = now - timedelta(days=7)
 
-    # Заказы текущего юзера — нужны и менеджеру (сводка), и боссу (его лично)
-    my_orders = get_user_orders(user_id)
+    # Заказы текущего юзера — нужны и менеджеру (сводка), и боссу (его лично).
+    # await-вызов через async_db не блокирует event loop на время SQL.
+    my_orders = await adb.get_user_orders(user_id)
     orders_by_status = {"draft": 0, "pending": 0, "approved": 0, "rejected": 0, "shipped": 0}
     for o in my_orders:
         orders_by_status[o["status"]] = orders_by_status.get(o["status"], 0) + 1
@@ -356,7 +354,6 @@ async def api_home(request: Request):
         # Менеджер: считаем личные показатели из локальных одобренных заявок.
         # Источник — наша БД, без обращения к МойСклад. Батч-запросом
         # подтягиваем сразу все позиции (раньше был N+1 по заказам).
-        from services.database import get_order_items_by_ids
         today_iso = start_of_day.strftime("%Y-%m-%d")
         relevant_today = [
             o for o in my_orders
@@ -364,7 +361,7 @@ async def api_home(request: Request):
             and (o.get("updated_at") or o.get("created_at") or "")[:10] == today_iso
         ]
         items_by_order = (
-            get_order_items_by_ids([o["id"] for o in relevant_today])
+            await adb.get_order_items_by_ids([o["id"] for o in relevant_today])
             if relevant_today else {}
         )
         my_today_revenue = 0.0
@@ -396,12 +393,12 @@ async def api_home(request: Request):
             "total": len(my_orders),
             "recent": recent,
         },
-        "ms_linked": bool(get_moysklad_employee_id(user_id)),
+        "ms_linked": bool(await adb.get_moysklad_employee_id(user_id)),
         "currency": BASE_CURRENCY,
     }
 
     if is_boss:
-        pending = get_pending_requests()
+        pending = await adb.get_pending_requests()
         result["pending_requests"] = len(pending)
 
         # Топ-сотрудники: группируем по нашему кастомному атрибуту
@@ -514,7 +511,6 @@ async def api_analytics(request: Request):
     """
     from datetime import datetime, timedelta
     from services.moysklad import get_sales_stats, get_shipments
-    from services.database import get_user_orders, get_order_items
 
     data = await request.json()
     user = verify_init_data(data.get("initData", ""))
@@ -540,7 +536,7 @@ async def api_analytics(request: Request):
 
     if role == "manager":
         # Личная аналитика — считаем из локальной БД по одобренным заявкам.
-        return JSONResponse(_personal_analytics(user_id, since, now, prev_since, label))
+        return JSONResponse(await _personal_analytics(user_id, since, now, prev_since, label))
 
     # Босс/админ — компания, из МойСклад
     try:
@@ -598,7 +594,7 @@ def _ts(o: dict) -> str:
     return s[:19]
 
 
-def _personal_analytics(
+async def _personal_analytics(
     user_id: int,
     since,
     until,
@@ -611,9 +607,9 @@ def _personal_analytics(
     заказам, что давало многосекундные задержки на Postgres.
     """
     from datetime import datetime
-    from services.database import get_user_orders, get_order_items_by_ids
+    from services import async_db as adb
 
-    orders = get_user_orders(user_id)
+    orders = await adb.get_user_orders(user_id)
     since_iso = since.strftime("%Y-%m-%d %H:%M:%S")
     until_iso = until.strftime("%Y-%m-%d %H:%M:%S")
     prev_since_iso = prev_since.strftime("%Y-%m-%d %H:%M:%S")
@@ -636,7 +632,7 @@ def _personal_analytics(
         len(relevant), since_iso, until_iso, prev_since_iso,
     )
 
-    items_by_order = get_order_items_by_ids([o["id"] for o in relevant]) if relevant else {}
+    items_by_order = await adb.get_order_items_by_ids([o["id"] for o in relevant]) if relevant else {}
 
     def _agg(start_iso, end_iso):
         total = 0.0
@@ -702,6 +698,7 @@ async def api_payments_history(request: Request):
     и на Railway (где БД — Postgres, а DB_PATH указывает на ephemeral
     /tmp/payments.db) валился с «unable to open database file».
     """
+    import asyncio
     from services.database import get_conn, get_cursor, q
 
     data = await request.json()
@@ -711,7 +708,7 @@ async def api_payments_history(request: Request):
 
     user_id = user["id"]
 
-    try:
+    def _load():
         with get_conn() as conn:
             cur = get_cursor(conn)
             cur.execute(
@@ -722,7 +719,11 @@ async def api_payments_history(request: Request):
                 ),
                 (user_id,),
             )
-            rows = [dict(r) for r in cur.fetchall()]
+            return [dict(r) for r in cur.fetchall()]
+
+    try:
+        # to_thread не блокирует event loop, пока psycopg2 ждёт ответа БД
+        rows = await asyncio.to_thread(_load)
         return JSONResponse({"payments": rows})
     except Exception as e:
         logger.exception("payments/history failed for user_id=%s", user_id)
@@ -733,7 +734,7 @@ async def api_payments_history(request: Request):
 async def api_payments_send(request: Request):
     """Отправить новый платёж на подтверждение."""
     from config import ADMIN_IDS
-    from services.database import add_payment, add_audit_log
+    from services import async_db as adb
     from services.notifier import tg_send_message
     from utils.formatters import format_payment_notify
 
@@ -773,11 +774,11 @@ async def api_payments_send(request: Request):
     )
     username = f"@{user['username']}" if user.get("username") else "—"
 
-    # Сохраняем в БД
-    payment_id = add_payment(user_id, username, full_name, amount, currency, comment)
+    # Сохраняем в БД (через async-обёртку — не блокируем event loop)
+    payment_id = await adb.add_payment(user_id, username, full_name, amount, currency, comment)
 
     # Аудит
-    add_audit_log(
+    await adb.add_audit_log(
         user_id, full_name, get_role(user_id),
         "payment_sent",
         f"Платёж #{payment_id}: {amount:,.0f} {currency} — {comment}",
@@ -794,8 +795,8 @@ async def api_payments_send(request: Request):
         ]]
     }
 
-    from services.notifier import get_notify_recipients
-    recipients = get_notify_recipients()
+    from services.notifier import aget_notify_recipients
+    recipients = await aget_notify_recipients()
 
     # tg_send_message переиспользует общую ClientSession — никакого
     # TCP+TLS-рукопожатия на каждое уведомление.
@@ -815,19 +816,20 @@ async def api_orders(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
 
-    from services.database import get_user_orders, get_order_items
+    from services import async_db as adb
     role = get_role(user["id"])
 
     if role in ("admin", "boss"):
-        from services.database import get_all_orders
-        orders = get_all_orders()
+        orders = await adb.get_all_orders()
     else:
-        orders = get_user_orders(user["id"])
+        orders = await adb.get_user_orders(user["id"])
 
     from config import BASE_CURRENCY
+    # Батч-загрузка позиций: один SQL вместо N (N+1 был на больших списках)
+    items_by_order = await adb.get_order_items_by_ids([o["id"] for o in orders]) if orders else {}
     result = []
     for o in orders:
-        items = get_order_items(o["id"])
+        items = items_by_order.get(o["id"], [])
         total = sum(
             float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
             for it in items
@@ -868,12 +870,16 @@ async def api_pending_requests(request: Request):
     if role not in ("admin", "boss"):
         raise HTTPException(status_code=403, detail="Нет доступа")
 
-    from services.database import get_pending_requests, get_order, get_order_items
-    requests = get_pending_requests()
+    from services import async_db as adb
+    requests = await adb.get_pending_requests()
+    # Батч-загрузка заказов и позиций — один SQL на каждое вместо 2N.
+    order_ids = [r["order_id"] for r in requests]
+    orders_by_id = await adb.get_orders_by_ids(order_ids) if order_ids else {}
+    items_by_order = await adb.get_order_items_by_ids(order_ids) if order_ids else {}
     result = []
     for r in requests:
-        order = get_order(r["order_id"])
-        items = get_order_items(r["order_id"]) if order else []
+        order = orders_by_id.get(r["order_id"])
+        items = items_by_order.get(r["order_id"], []) if order else []
         total = sum(
             float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
             for it in items
@@ -913,13 +919,13 @@ async def api_create_order(request: Request):
         rate_limit_window=60.0,
     )
 
-    from services.database import create_order
+    from services import async_db as adb
 
     full_name = (
         f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
         or user.get("username", str(user["id"]))
     )
-    order_id = create_order(user["id"], full_name, data.get("comment", ""))
+    order_id = await adb.create_order(user["id"], full_name, data.get("comment", ""))
     return JSONResponse({"order_id": order_id})
 
 
@@ -930,8 +936,8 @@ async def api_add_item(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
 
-    from services.database import add_order_item, get_order, update_order_currency
-    order = get_order(data["order_id"])
+    from services import async_db as adb
+    order = await adb.get_order(data["order_id"])
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
 
@@ -947,9 +953,9 @@ async def api_add_item(request: Request):
     requested_currency = (data.get("currency") or "").upper()
     if requested_currency and requested_currency in ("USD", "UZS", "RUB", "EUR"):
         if not order.get("currency"):
-            update_order_currency(data["order_id"], requested_currency)
+            await adb.update_order_currency(data["order_id"], requested_currency)
 
-    item_id = add_order_item(
+    item_id = await adb.add_order_item(
         order_id=data["order_id"],
         product_name=data["product_name"],
         product_href=data.get("product_href", ""),
@@ -968,8 +974,8 @@ async def api_remove_item(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
 
-    from services.database import remove_order_item
-    remove_order_item(data["item_id"])
+    from services import async_db as adb
+    await adb.remove_order_item(data["item_id"])
     return JSONResponse({"ok": True})
 
 
@@ -980,12 +986,12 @@ async def api_set_agent(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
 
-    from services.database import update_order_agent, get_order
-    order = get_order(data["order_id"])
+    from services import async_db as adb
+    order = await adb.get_order(data["order_id"])
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
 
-    update_order_agent(data["order_id"], data["agent_id"], data["agent_name"])
+    await adb.update_order_agent(data["order_id"], data["agent_id"], data["agent_name"])
     return JSONResponse({"ok": True})
 
 
@@ -996,22 +1002,19 @@ async def api_submit_order(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
 
-    from services.database import (
-        get_order, get_order_items, create_shipment_request,
-        update_order_status, add_audit_log,
-    )
-    from services.notifier import get_notify_recipients, tg_send_message
+    from services import async_db as adb
+    from services.notifier import aget_notify_recipients, tg_send_message
     from utils.formatters import DIV
     from handlers.orders import format_request_notify
 
     order_id = data["order_id"]
-    order = get_order(order_id)
+    order = await adb.get_order(order_id)
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
     if order["status"] != "draft":
         raise HTTPException(status_code=400, detail="Заказ уже отправлен")
 
-    items = get_order_items(order_id)
+    items = await adb.get_order_items(order_id)
     if not items:
         raise HTTPException(status_code=400, detail="Добавьте товары")
     if not order.get("agent_name"):
@@ -1021,9 +1024,9 @@ async def api_submit_order(request: Request):
         f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
         or user.get("username", str(user["id"]))
     )
-    req_id = create_shipment_request(order_id, user["id"], full_name)
-    update_order_status(order_id, "pending")
-    add_audit_log(
+    req_id = await adb.create_shipment_request(order_id, user["id"], full_name)
+    await adb.update_order_status(order_id, "pending")
+    await adb.add_audit_log(
         user["id"], full_name, get_role(user["id"]),
         "shipment_request_sent",
         f"Заявка #{req_id} (заказ #{order_id}) через WebApp",
@@ -1037,7 +1040,7 @@ async def api_submit_order(request: Request):
             {"text": "❌ Отклонить", "callback_data": f"req_no:{req_id}"},
         ]]
     }
-    for uid in get_notify_recipients():
+    for uid in await aget_notify_recipients():
         await tg_send_message(uid, notify_text, reply_markup=keyboard)
 
     return JSONResponse({"req_id": req_id})

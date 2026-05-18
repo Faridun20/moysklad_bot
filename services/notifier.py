@@ -91,6 +91,10 @@ def get_notify_recipients() -> list[int]:
     """
     Получить список получателей уведомлений об отгрузках:
     все пользователи с ролью admin или boss.
+
+    Sync-версия — для использования из bot-процесса в фоновых задачах
+    (notifier loop, scheduled reports), где блокировка event loop
+    некритична (всё равно ждём следующего тика sleep'а).
     """
     try:
         users = get_all_users()
@@ -107,6 +111,12 @@ def get_notify_recipients() -> list[int]:
         return list(set(ADMIN_IDS + BOSS_IDS))
     except Exception:
         return []
+
+
+async def aget_notify_recipients() -> list[int]:
+    """Async-версия для webapp endpoint'ов: SQL уходит в thread pool,
+    event loop остаётся свободным для других одновременных запросов."""
+    return await asyncio.to_thread(get_notify_recipients)
 
 
 async def send_to_recipients(bot: Bot, text: str, recipients: list[int]):

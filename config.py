@@ -57,3 +57,15 @@ except ImportError:
     BOT_MODE = os.environ.get("BOT_MODE", "all").lower().strip()
     if BOT_MODE not in ("all", "bot", "webapp"):
         BOT_MODE = "all"
+
+    # ─── Расписанные отчёты ────────────────────────────────────────
+    # 1 (default) — daily/weekly/monthly работают внутри бот-процесса
+    #               через asyncio.sleep-циклы. Удобно для one-process
+    #               сетапа, но отчёт пропускается, если бот рестартанул
+    #               ровно в момент срабатывания.
+    # 0           — отчёты внутри бота отключены. Запускай их через
+    #               Railway Cron Jobs: python -m tasks.run_report {daily|weekly|monthly}.
+    #               Так надёжнее: cron не зависит от состояния бота.
+    ENABLE_SCHEDULED_REPORTS = os.environ.get(
+        "ENABLE_SCHEDULED_REPORTS", "1",
+    ).lower() not in ("0", "false", "no")
