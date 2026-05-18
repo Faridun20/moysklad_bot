@@ -7,9 +7,10 @@ import asyncio
 import logging
 from datetime import datetime
 
+import aiohttp
 from aiogram import Bot
 
-from config import CHECK_INTERVAL_SEC as _CHECK_INTERVAL_SEC
+from config import CHECK_INTERVAL_SEC as _CHECK_INTERVAL_SEC, TELEGRAM_TOKEN
 
 CHECK_INTERVAL_SEC = int(_CHECK_INTERVAL_SEC)
 from services.moysklad import get_shipments, get_shipment_positions
@@ -18,6 +19,72 @@ from utils.helpers import extract_id_from_href
 from utils.formatters import format_shipment, DIV
 
 logger = logging.getLogger(__name__)
+
+
+# ─── Общая aiohttp-сессия для прямых POST в Telegram Bot API ─────────────
+#
+# Используется webapp-эндпоинтами (api_payments_send, api_submit_order),
+# где у нас нет под рукой aiogram.Bot, и проще POST'нуть напрямую.
+# Раньше каждый вызов создавал свой ClientSession — это новое TCP+TLS-
+# рукопожатие к api.telegram.org. На активном чате с десятком уведомлений
+# в минуту это ощутимо.
+
+_TG_TIMEOUT = aiohttp.ClientTimeout(total=10)
+_tg_session: aiohttp.ClientSession | None = None
+_tg_session_lock = asyncio.Lock()
+
+
+async def get_tg_session() -> aiohttp.ClientSession:
+    """Вернуть общую сессию для запросов в api.telegram.org."""
+    global _tg_session
+    if _tg_session is None or _tg_session.closed:
+        async with _tg_session_lock:
+            if _tg_session is None or _tg_session.closed:
+                # limit=10 — нам не нужно больше параллельных соединений
+                # к Telegram, чтобы не упереться в их per-bot rate-limit
+                connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+                _tg_session = aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=_TG_TIMEOUT,
+                )
+    return _tg_session
+
+
+async def close_tg_session() -> None:
+    global _tg_session
+    if _tg_session is not None and not _tg_session.closed:
+        await _tg_session.close()
+    _tg_session = None
+
+
+async def tg_send_message(
+    chat_id: int,
+    text: str,
+    *,
+    parse_mode: str = "HTML",
+    reply_markup: dict | None = None,
+) -> None:
+    """Послать сообщение через Bot API без aiogram.Bot.
+
+    Ничего не возвращаем (best-effort): для уведомлений нам важнее
+    не упасть из-за единичного бага, чем дождаться ответа. Логируем,
+    если что — выгружаем в Railway.
+    """
+    payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    try:
+        sess = await get_tg_session()
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        async with sess.post(url, json=payload) as resp:
+            if resp.status >= 400:
+                body = await resp.text()
+                logger.warning(
+                    "tg sendMessage %d → %s: %s",
+                    chat_id, resp.status, body[:200],
+                )
+    except Exception as e:
+        logger.warning("tg sendMessage %d failed: %s", chat_id, e)
 
 # ─── Получатели уведомлений ───
 def get_notify_recipients() -> list[int]:

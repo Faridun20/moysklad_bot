@@ -103,6 +103,60 @@ class CachedStaticFiles(StaticFiles):
 app.mount("/static", CachedStaticFiles(directory=STATIC_DIR), name="static")
 
 
+# ─── Telegram webhook (опционально) ──────────────────────────────────────────
+#
+# В webhook-режиме bot.py регистрирует dp+bot через set_telegram_dispatcher(),
+# а Telegram POST'ит апдейты сюда. Без вызова этой функции endpoint вернёт
+# 503 — это безопасно, потому что webhook у Telegram при этом не зарегистрирован.
+
+_tg_bot = None
+_tg_dispatcher = None
+
+
+def set_telegram_dispatcher(bot, dispatcher) -> None:
+    """Регистрирует aiogram Bot+Dispatcher для приёма webhook-апдейтов.
+    Вызывается из bot.py при TG_USE_WEBHOOK=1."""
+    global _tg_bot, _tg_dispatcher
+    _tg_bot = bot
+    _tg_dispatcher = dispatcher
+
+
+@app.post("/tg/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    """Принимает Update-объекты от Telegram.
+
+    Защита: секрет в URL + проверка заголовка X-Telegram-Bot-Api-Secret-Token
+    (Telegram отправляет именно его, если мы при set_webhook указали secret_token).
+    Двойная защита нужна, чтобы случайно слитый URL не давал никому
+    отправлять апдейты — нужен ещё и заголовок.
+    """
+    from config import TG_WEBHOOK_SECRET
+
+    if not TG_WEBHOOK_SECRET or secret != TG_WEBHOOK_SECRET:
+        raise HTTPException(status_code=404, detail="not found")
+    header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if header_secret != TG_WEBHOOK_SECRET:
+        raise HTTPException(status_code=404, detail="not found")
+    if _tg_dispatcher is None or _tg_bot is None:
+        # Бот ещё не подключил себя сюда — режим webhook отключён.
+        # 503 говорит Telegram «попробуй позже», без потери апдейта.
+        raise HTTPException(status_code=503, detail="bot not ready")
+
+    from aiogram.types import Update
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad payload")
+
+    try:
+        update = Update.model_validate(payload, context={"bot": _tg_bot})
+        await _tg_dispatcher.feed_webhook_update(_tg_bot, update)
+    except Exception:
+        logger.exception("Ошибка обработки Telegram update")
+        # 200 всё равно — иначе Telegram заретраит и засрёт лог
+    return JSONResponse({"ok": True})
+
+
 # ─── Webhook от МойСклад ─────────────────────────────────────────────────────
 
 
@@ -141,6 +195,12 @@ async def ms_webhook(secret: str, request: Request):
             ),
         )
         mark_stock_dirty()
+        # Документ изменился → читалки (get_sales_stats, get_shipments,
+        # позиции) могут отдавать устаревшие данные. Сбрасываем все
+        # TTL-кэши МС, чтобы следующее открытие «Аналитики» увидело
+        # свежие цифры.
+        from services.moysklad import invalidate_ms_cache
+        invalidate_ms_cache()
 
     # МойСклад ждёт 200 быстро, иначе ретраит. Сам рефреш делаем в фоне.
     return JSONResponse({"ok": True, "received": len(events)})
@@ -665,10 +725,10 @@ async def api_payments_history(request: Request):
 @app.post("/api/payments/send")
 async def api_payments_send(request: Request):
     """Отправить новый платёж на подтверждение."""
-    from config import ADMIN_IDS, TELEGRAM_TOKEN
+    from config import ADMIN_IDS
     from services.database import add_payment, add_audit_log
+    from services.notifier import tg_send_message
     from utils.formatters import format_payment_notify
-    import aiohttp
 
     data = await request.json()
     # Платежи отправляют только менеджеры (и админ для тестов). Босс
@@ -730,20 +790,10 @@ async def api_payments_send(request: Request):
     from services.notifier import get_notify_recipients
     recipients = get_notify_recipients()
 
-    async with aiohttp.ClientSession() as session:
-        for uid in recipients:
-            try:
-                await session.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                    json={
-                        "chat_id": uid,
-                        "text": notify_text,
-                        "parse_mode": "HTML",
-                        "reply_markup": keyboard,
-                    },
-                )
-            except Exception as e:
-                logger.warning("Не удалось уведомить %d: %s", uid, e)
+    # tg_send_message переиспользует общую ClientSession — никакого
+    # TCP+TLS-рукопожатия на каждое уведомление.
+    for uid in recipients:
+        await tg_send_message(uid, notify_text, reply_markup=keyboard)
 
     return JSONResponse({"payment_id": payment_id, "status": "pending"})
 
@@ -943,11 +993,9 @@ async def api_submit_order(request: Request):
         get_order, get_order_items, create_shipment_request,
         update_order_status, add_audit_log,
     )
-    from services.notifier import get_notify_recipients
+    from services.notifier import get_notify_recipients, tg_send_message
     from utils.formatters import DIV
     from handlers.orders import format_request_notify
-    import aiohttp as _aiohttp
-    from config import TELEGRAM_TOKEN
 
     order_id = data["order_id"]
     order = get_order(order_id)
@@ -982,20 +1030,8 @@ async def api_submit_order(request: Request):
             {"text": "❌ Отклонить", "callback_data": f"req_no:{req_id}"},
         ]]
     }
-    async with _aiohttp.ClientSession() as session:
-        for uid in get_notify_recipients():
-            try:
-                await session.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                    json={
-                        "chat_id": uid,
-                        "text": notify_text,
-                        "parse_mode": "HTML",
-                        "reply_markup": keyboard,
-                    },
-                )
-            except Exception:
-                pass
+    for uid in get_notify_recipients():
+        await tg_send_message(uid, notify_text, reply_markup=keyboard)
 
     return JSONResponse({"req_id": req_id})
 

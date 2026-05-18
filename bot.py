@@ -15,7 +15,10 @@ from aiogram.types import (
 )
 
 from handlers import orders
-from config import TELEGRAM_TOKEN
+from config import (
+    TELEGRAM_TOKEN, TG_USE_WEBHOOK, TG_WEBHOOK_SECRET, WEBAPP_URL,
+    REDIS_URL, BOT_MODE,
+)
 from services.rate_limit import acquire as rate_limit_acquire
 
 # Хэндлеры
@@ -27,7 +30,7 @@ from handlers import (
 # Сервисы и задачи
 from services.database import init_db
 from services.moysklad import get_session, close_session
-from services.notifier import shipment_notifier
+from services.notifier import shipment_notifier, close_tg_session
 from services import snapshot
 from services.ms_webhooks import ensure_subscriptions
 from services.ms_demand import init_demand_context
@@ -104,6 +107,21 @@ def register_routers(dp: Dispatcher):
         dp.include_router(r)
 
 
+def build_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
+    """Создать готовую пару Bot+Dispatcher с middleware и роутерами.
+
+    Выделено, чтобы режим BOT_MODE=webapp мог поднять dispatcher для
+    приёма Telegram-webhook'ов в FastAPI без запуска polling-цикла.
+    """
+    bot = Bot(token=TELEGRAM_TOKEN)
+    dp = Dispatcher(storage=_build_fsm_storage())
+    rate_mw = RateLimitMiddleware()
+    dp.message.middleware(rate_mw)
+    dp.callback_query.middleware(rate_mw)
+    register_routers(dp)
+    return bot, dp
+
+
 def start_background_tasks(bot: Bot) -> list[asyncio.Task]:
     """Запустить фоновые задачи. Возвращает список созданных Task'ов."""
     coros = [
@@ -130,13 +148,87 @@ async def _shutdown(tasks: list[asyncio.Task]) -> None:
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     await close_session()
+    await close_tg_session()
+
+
+def _build_fsm_storage():
+    """RedisStorage если задан REDIS_URL, иначе MemoryStorage.
+
+    Зачем: с MemoryStorage черновики заказов и любые FSM-состояния
+    теряются на каждом редеплое Railway. С Redis они переживают
+    рестарт и могут жить между несколькими bot-инстансами.
+    """
+    if not REDIS_URL:
+        return MemoryStorage()
+    try:
+        from aiogram.fsm.storage.redis import RedisStorage
+        storage = RedisStorage.from_url(REDIS_URL)
+        logger.info("FSM storage: Redis (%s)", REDIS_URL.split("@")[-1])
+        return storage
+    except Exception as e:
+        # Не валим бот из-за проблем с Redis — фолбэк на память.
+        logger.warning(
+            "Redis недоступен (%s) — FSM фолбэк на MemoryStorage", e,
+        )
+        return MemoryStorage()
+
+
+async def _run_webapp_only():
+    """Режим BOT_MODE=webapp: поднимаем только FastAPI.
+
+    Если TG_USE_WEBHOOK=1 — создаём пару Bot+Dispatcher с роутерами и
+    регистрируем у webapp, чтобы webhook-апдейты от Telegram обрабатывались
+    прямо здесь. Polling в этом режиме никогда не запускается — бот
+    либо принимает webhook'и, либо вообще не обрабатывает Telegram
+    (полезно, если парный BOT_MODE=bot процесс делает polling)."""
+    init_db()
+    from webapp import server as webapp_server
+
+    bot = None
+    if TG_USE_WEBHOOK and TG_WEBHOOK_SECRET and WEBAPP_URL:
+        bot, dp = build_bot_and_dispatcher()
+        webapp_server.set_telegram_dispatcher(bot, dp)
+        # Прогрев МС-сессии (handlers будут её использовать)
+        await get_session()
+        webhook_url = f"{WEBAPP_URL}/tg/{TG_WEBHOOK_SECRET}"
+        try:
+            await bot.set_webhook(
+                url=webhook_url,
+                secret_token=TG_WEBHOOK_SECRET,
+                drop_pending_updates=False,
+                allowed_updates=dp.resolve_used_update_types(),
+            )
+            logger.info("BOT_MODE=webapp + webhook: установлен на %s", webhook_url)
+        except Exception:
+            logger.exception("set_webhook failed; webhook'и приходить не будут")
+    else:
+        logger.info(
+            "BOT_MODE=webapp: Telegram-апдейты не обрабатываются "
+            "(включите TG_USE_WEBHOOK=1 или используйте парный сервис с BOT_MODE=bot)"
+        )
+
+    try:
+        await webapp_server.start_webapp()
+    finally:
+        if bot is not None:
+            try:
+                await bot.delete_webhook(drop_pending_updates=False)
+            except Exception:
+                pass
+        await close_session()
+        await close_tg_session()
 
 
 async def main():
+    # Режим webapp полностью самодостаточен — не нужны ни Bot, ни роутеры
+    if BOT_MODE == "webapp":
+        await _run_webapp_only()
+        return
+
     init_db()
 
     bot = Bot(token=TELEGRAM_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
+    dp = Dispatcher(storage=_build_fsm_storage())
 
     # Защита от спама. Применяется глобально ко всем сообщениям и
     # callback'ам перед роутингом. ADMIN_IDS не освобождаются от лимита
@@ -215,14 +307,66 @@ async def main():
 
     bg_tasks = start_background_tasks(bot)
 
-    # Запускаем WebApp параллельно с ботом
-    from webapp.server import start_webapp
-    bg_tasks.append(asyncio.create_task(start_webapp(), name="webapp"))
+    # WebApp поднимаем только если этот процесс отвечает за HTTP-слой.
+    # В режиме BOT_MODE=bot предполагается, что FastAPI крутится в
+    # парном сервисе с BOT_MODE=webapp — задваивать порт не нужно.
+    webapp_server = None
+    if BOT_MODE == "all":
+        from webapp import server as webapp_server
+        bg_tasks.append(asyncio.create_task(webapp_server.start_webapp(), name="webapp"))
 
-    logger.info("Бот запущен")
+    # ─── Режим приёма апдейтов ───────────────────────────────────
+    # Webhook: webapp принимает POST'ы от Telegram, мы не дёргаем
+    # api.telegram.org каждую секунду. Polling: классическая
+    # модель, работает без публичного URL.
+    use_webhook = (
+        TG_USE_WEBHOOK and TG_WEBHOOK_SECRET and WEBAPP_URL
+        and webapp_server is not None  # webhook нуждается в локальном FastAPI
+    )
+    if TG_USE_WEBHOOK and not use_webhook:
+        if webapp_server is None:
+            logger.warning(
+                "TG_USE_WEBHOOK=1, но BOT_MODE=bot — webhook требует FastAPI в "
+                "этом же процессе. Фолбэк на polling. Для webhook используйте "
+                "BOT_MODE=all (один процесс) или BOT_MODE=webapp (парный сервис)."
+            )
+        else:
+            logger.warning(
+                "TG_USE_WEBHOOK=1, но не задан WEBAPP_URL или TG_WEBHOOK_SECRET — "
+                "фолбэк на polling. Задайте обе переменные, чтобы включить webhook."
+            )
+
+    logger.info(
+        "Бот запущен в режиме: %s",
+        "webhook" if use_webhook else "polling",
+    )
     try:
-        await dp.start_polling(bot)
+        if use_webhook:
+            # Регистрируем dp/bot у webapp, чтобы /tg/<secret> мог отдавать
+            # апдейты в dispatcher.
+            webapp_server.set_telegram_dispatcher(bot, dp)
+            webhook_url = f"{WEBAPP_URL}/tg/{TG_WEBHOOK_SECRET}"
+            # secret_token шлётся Telegram'ом в заголовке X-Telegram-Bot-
+            # Api-Secret-Token; webapp проверяет соответствие.
+            await bot.set_webhook(
+                url=webhook_url,
+                secret_token=TG_WEBHOOK_SECRET,
+                drop_pending_updates=False,
+                allowed_updates=dp.resolve_used_update_types(),
+            )
+            logger.info("Telegram webhook установлен: %s", webhook_url)
+            # Просто блокируемся, пока приходят сигналы — реальная обработка
+            # апдейтов идёт через FastAPI endpoint /tg/<secret>.
+            stop_event = asyncio.Event()
+            await stop_event.wait()
+        else:
+            await dp.start_polling(bot)
     finally:
+        if use_webhook:
+            try:
+                await bot.delete_webhook(drop_pending_updates=False)
+            except Exception:
+                logger.exception("Не удалось снять webhook")
         await _shutdown(bg_tasks)
 
 
