@@ -14,7 +14,7 @@ from aiogram.types import (
     Message, CallbackQuery, TelegramObject, User,
 )
 
-from handlers import orders
+from handlers import orders, debts
 from config import (
     TELEGRAM_TOKEN, TG_USE_WEBHOOK, TG_WEBHOOK_SECRET, WEBAPP_URL,
     REDIS_URL, BOT_MODE, ENABLE_SCHEDULED_REPORTS,
@@ -102,6 +102,7 @@ def register_routers(dp: Dispatcher):
         audit.router,
         log.router,
         orders.router,
+        debts.router,
     ]
     for r in routers:
         dp.include_router(r)

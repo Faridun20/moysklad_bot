@@ -1,0 +1,223 @@
+"""
+Долги: команда /debts и кнопка «Отметить оплачено».
+
+Парная задача к WebApp-экрану «Долги» — здесь то же самое доступно
+прямо в чате бота, чтобы можно было быстро посмотреть и закрыть
+долг без открытия WebApp.
+
+Команда /debts:
+  - менеджер видит только СВОИ открытые долги
+  - boss/admin — все долги по компании
+  - для каждого долга inline-кнопка «✅ Оплачено» с callback debt_paid:<id>
+
+Callback debt_paid:<id>:
+  - права: автор заказа ИЛИ boss/admin
+  - идемпотентно (повторный тап ничего не ломает)
+  - после успеха редактирует сообщение, чтобы кнопка пропала
+"""
+
+from datetime import date
+import logging
+
+from aiogram import Bot, Router, F
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+from services.roles import can_create_orders, is_boss
+from services.database import (
+    get_open_debts, get_order, mark_order_paid,
+    get_order_items_by_ids, get_role,
+)
+from config import BASE_CURRENCY
+from utils.helpers import user_safe_error
+from utils.formatters import DIV
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+
+# ─── Форматирование ──────────────────────────────────────────────────────────
+
+
+def _esc(s: str) -> str:
+    """HTML-escape — Telegram parse_mode=HTML."""
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _fmt_amount(n: float) -> str:
+    """1234567 → '1 234 567'."""
+    return f"{int(round(n)):,}".replace(",", " ")
+
+
+def _format_due(due_str: str | None, today_str: str) -> str:
+    """Дата возврата + emoji-индикатор статуса."""
+    if not due_str:
+        return "—"
+    if due_str < today_str:
+        return f"⚠️ <b>{_esc(_to_ru(due_str))}</b> (просрочен)"
+    if due_str == today_str:
+        return f"⏰ <b>сегодня</b>"
+    return f"📅 {_esc(_to_ru(due_str))}"
+
+
+def _to_ru(iso: str) -> str:
+    """YYYY-MM-DD → ДД.ММ.ГГГГ."""
+    if not iso or len(iso) < 10:
+        return iso or ""
+    y, m, d = iso[:10].split("-")
+    return f"{d}.{m}.{y}"
+
+
+def _format_debt_card(
+    order: dict,
+    items: list[dict],
+    today_str: str,
+    show_owner: bool,
+) -> str:
+    """HTML-карточка одного долга для сообщения в боте."""
+    currency = order.get("currency") or BASE_CURRENCY
+    total = sum(
+        float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
+        for it in items
+    )
+    agent = _esc(order.get("agent_name") or "—")
+    due_str = _format_due(order.get("due_date"), today_str)
+    lines = [
+        f"#{order['id']} · 🏢 <b>{agent}</b>",
+        f"💰 <b>{_fmt_amount(total)} {_esc(currency)}</b> · {due_str}",
+    ]
+    if show_owner:
+        lines.append(f"👨‍💼 {_esc(order.get('full_name') or '—')}")
+    return "\n".join(lines)
+
+
+# ─── /debts ──────────────────────────────────────────────────────────────────
+
+
+@router.message(Command("debts"))
+async def cmd_debts(message: Message):
+    """Показать открытые долги. Менеджер — свои, boss/admin — все."""
+    user_id = message.from_user.id
+    if not can_create_orders(user_id):
+        return  # нет прав вообще — молчим, как принято в этом боте
+
+    role = get_role(user_id)
+    boss_view = is_boss(user_id)
+
+    # Менеджер ограничен своими долгами. Босс/админ видит всю компанию.
+    debts = get_open_debts(user_id=None if boss_view else user_id)
+
+    if not debts:
+        await message.answer(
+            f"{DIV}\n💳 <b>Долги</b>\n\nОткрытых долгов нет.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Подтягиваем позиции батчем — нужны для сумм
+    items_by_order = get_order_items_by_ids([d["id"] for d in debts])
+    today_str = date.today().isoformat()
+
+    # Отдельным сообщением на каждый долг — чтобы у каждого была своя
+    # кнопка «Оплачено». В одном сообщении мы не сможем понять, на чью
+    # кнопку нажали без передачи order_id в callback (что и делаем).
+    # Перед карточками — короткая сводка.
+    overdue = sum(1 for d in debts if d.get("due_date") and d["due_date"] < today_str)
+    due_today = sum(1 for d in debts if d.get("due_date") == today_str)
+    upcoming = len(debts) - overdue - due_today
+    scope_str = "все долги" if boss_view else "ваши долги"
+    summary = (
+        f"{DIV}\n"
+        f"💳 <b>Долги</b> ({scope_str})\n\n"
+        f"⚠️ Просрочено: <b>{overdue}</b>\n"
+        f"⏰ Сегодня: <b>{due_today}</b>\n"
+        f"📅 Будущие: <b>{upcoming}</b>"
+    )
+    await message.answer(summary, parse_mode="HTML")
+
+    for d in debts:
+        items = items_by_order.get(d["id"], [])
+        text = _format_debt_card(d, items, today_str, show_owner=boss_view)
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Отметить оплачено", callback_data=f"debt_paid:{d['id']}")
+        kb.adjust(1)
+
+        try:
+            await message.answer(
+                text,
+                parse_mode="HTML",
+                reply_markup=kb.as_markup(),
+            )
+        except Exception:
+            # Если одно сообщение не ушло — продолжаем со следующим,
+            # лучше частично показать, чем вообще ничего.
+            logger.exception("Не удалось показать долг #%s", d["id"])
+
+
+# ─── Callback: отметить оплачено ─────────────────────────────────────────────
+
+
+@router.callback_query(F.data.startswith("debt_paid:"))
+async def cb_debt_paid(callback: CallbackQuery, bot: Bot):
+    """Закрыть долг по нажатию кнопки. Менеджер может закрыть свой,
+    boss/admin — любой."""
+    user_id = callback.from_user.id
+    try:
+        order_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+
+    order = get_order(order_id)
+    if not order:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+
+    boss_view = is_boss(user_id)
+    is_owner = order["user_id"] == user_id
+    if not (is_owner or boss_view):
+        await callback.answer("Нет доступа к этому заказу", show_alert=True)
+        return
+
+    if order.get("payment_type") != "credit":
+        await callback.answer("Этот заказ не в долг", show_alert=True)
+        return
+
+    if order.get("paid_at"):
+        # Уже закрыт — кто-то нажал параллельно. Тихо подчищаем кнопку.
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.answer("Долг уже отмечен как оплаченный")
+        return
+
+    full_name = (
+        f"{callback.from_user.first_name or ''} "
+        f"{callback.from_user.last_name or ''}".strip()
+        or callback.from_user.username or str(user_id)
+    )
+    ok = mark_order_paid(order_id, user_id, full_name)
+    if not ok:
+        # Гонка: кто-то закрыл между нашими SELECT и UPDATE.
+        await callback.answer("Не удалось закрыть долг (возможно, уже закрыт)")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    # Успех — обновляем сообщение, кнопку убираем, добавляем «✅ Оплачено».
+    try:
+        await callback.message.edit_text(
+            (callback.message.html_text or callback.message.text or "")
+            + f"\n\n✅ <b>Оплачено</b> ({_esc(full_name)})",
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+    except Exception:
+        # edit_text ругается если контент идентичен — игнорируем
+        pass
+    await callback.answer("Долг закрыт ✅")

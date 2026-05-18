@@ -834,6 +834,12 @@ async def api_orders(request: Request):
             "agent_name": o.get("agent_name", ""),
             "comment": o.get("comment", ""),
             "currency": o.get("currency") or BASE_CURRENCY,
+            # Поля долга — фронт показывает «В долг до X» или «Оплачено»
+            # на карточке заказа. paid_at=null + payment_type=credit
+            # значит ещё не закрыт.
+            "payment_type": o.get("payment_type") or "paid",
+            "due_date": o.get("due_date"),
+            "paid_at": (o.get("paid_at") or "")[:16] if o.get("paid_at") else None,
             "created_at": o["created_at"][:16],
             "items_count": len(items),
             "total": total,
@@ -1013,6 +1019,33 @@ async def api_submit_order(request: Request):
     if not order.get("agent_name"):
         raise HTTPException(status_code=400, detail="Выберите клиента")
 
+    # ─── Тип оплаты ─────────────────────────────────────────────
+    # payment_type: 'paid' (по умолчанию, оплачено сразу) или 'credit'.
+    # Для credit обязателен due_date в формате YYYY-MM-DD и не раньше
+    # сегодняшнего дня (нельзя задать долг с прошедшей датой).
+    payment_type = (data.get("payment_type") or "paid").lower()
+    due_date = (data.get("due_date") or "").strip() or None
+    if payment_type not in ("paid", "credit"):
+        raise HTTPException(status_code=400, detail="Неверный тип оплаты")
+    if payment_type == "credit":
+        if not due_date:
+            raise HTTPException(status_code=400, detail="Укажите дату возврата долга")
+        try:
+            from datetime import date
+            parsed = date.fromisoformat(due_date)
+            if parsed < date.today():
+                raise HTTPException(
+                    status_code=400,
+                    detail="Дата возврата не может быть в прошлом",
+                )
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Неверный формат даты (нужно YYYY-MM-DD)")
+    # Фиксируем на заказе ДО создания shipment_request, чтобы апрув
+    # босса видел уже актуальный тип оплаты.
+    await adb.set_order_payment(order_id, payment_type, due_date)
+    # Перечитаем — нужно для уведомления
+    order = await adb.get_order(order_id)
+
     full_name = (
         f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
         or user.get("username", str(user["id"]))
@@ -1073,6 +1106,135 @@ async def api_agents(request: Request):
         {"id": a.get("id", ""), "name": a.get("name", "—"), "phone": a.get("phone", "")}
         for a in result.get("rows", [])
     ]})
+# ─── API: долги (credit-заказы без paid_at) ─────────────────────────────────
+
+
+@app.post("/api/debts")
+async def api_debts(request: Request):
+    """Список открытых долгов.
+
+    Менеджер видит только свои долги, boss/admin — все.
+    Фильтр `mode`:
+      - all (default) — все открытые
+      - today        — к оплате сегодня и просроченные (для главного экрана)
+
+    Каждый долг возвращается с уже посчитанной суммой и пометкой
+    overdue/due_today/upcoming, чтобы фронт не пересчитывал даты.
+    """
+    from datetime import date
+    from services import async_db as adb
+    from config import BASE_CURRENCY
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_debts",
+        rate_limit_max=30,
+        rate_limit_window=60.0,
+    )
+    user_id = user["id"]
+    role = get_role(user_id)
+    is_boss = role in ("admin", "boss")
+
+    mode = (data.get("mode") or "all").lower()
+    today = date.today().isoformat()
+    due_through = today if mode == "today" else None
+
+    # Менеджер видит только свои; босс — все
+    debts = await adb.get_open_debts(
+        user_id=None if is_boss else user_id,
+        due_through=due_through,
+    )
+
+    # Подтягиваем позиции одним батчем — нужны для суммы
+    items_by_order = (
+        await adb.get_order_items_by_ids([d["id"] for d in debts])
+        if debts else {}
+    )
+
+    result = []
+    for o in debts:
+        items = items_by_order.get(o["id"], [])
+        total = sum(
+            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
+            for it in items
+        )
+        due = o.get("due_date")
+        if due:
+            state = "overdue" if due < today else ("due_today" if due == today else "upcoming")
+        else:
+            state = "upcoming"  # без даты не считаем просроченным
+        result.append({
+            "id": o["id"],
+            "agent_name": o.get("agent_name") or "—",
+            "full_name": o.get("full_name") or "—",
+            "due_date": due,
+            "currency": o.get("currency") or BASE_CURRENCY,
+            "total": total,
+            "items_count": len(items),
+            "created_at": (o.get("created_at") or "")[:10],
+            "state": state,
+            "is_mine": o["user_id"] == user_id,
+        })
+
+    return JSONResponse({
+        "debts": result,
+        "role": role,
+        "scope": "company" if is_boss else "personal",
+        "today": today,
+    })
+
+
+@app.post("/api/orders/mark_paid")
+async def api_mark_paid(request: Request):
+    """Закрыть долг по конкретному заказу.
+
+    Право: автор заказа (тот менеджер, который его создал) ИЛИ
+    boss/admin (override на случай если менеджер недоступен).
+    Идемпотентно — повторный клик ничего не ломает.
+    """
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_mark_paid",
+        rate_limit_max=20,
+        rate_limit_window=60.0,
+    )
+
+    order_id = data.get("order_id")
+    if not order_id:
+        raise HTTPException(status_code=400, detail="order_id обязателен")
+    try:
+        order_id = int(order_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="order_id должен быть числом")
+
+    order = await adb.get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+
+    user_id = user["id"]
+    role = get_role(user_id)
+    is_owner = order["user_id"] == user_id
+    is_boss = role in ("admin", "boss")
+    if not (is_owner or is_boss):
+        raise HTTPException(status_code=403, detail="Нет доступа")
+
+    if order.get("payment_type") != "credit":
+        raise HTTPException(status_code=400, detail="Это не кредитный заказ")
+
+    full_name = (
+        f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+        or user.get("username", str(user_id))
+    )
+    updated = await adb.mark_order_paid(order_id, user_id, full_name)
+    return JSONResponse({"ok": True, "updated": updated})
+
+
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 async def start_webapp():

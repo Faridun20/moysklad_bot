@@ -837,3 +837,101 @@ body {
 .qty-unit {
   font-size: 14px; color: var(--text-mute); text-align: center;
 }
+
+/* ─── Тип оплаты в редакторе заказа ─────────────────────────────── */
+.payment-selector {
+  display: flex; gap: 10px; padding: 10px 14px;
+}
+.payment-option {
+  flex: 1; display: flex; align-items: center; gap: 8px;
+  padding: 12px; border-radius: 12px;
+  background: var(--bg-card, #f5f5f5);
+  cursor: pointer; font-size: 15px;
+}
+.payment-option input { margin: 0; }
+.payment-option:has(input:checked) {
+  background: var(--accent, #2481cc);
+  color: #fff;
+}
+.due-date-wrap {
+  padding: 0 14px 12px;
+}
+.due-date-label {
+  display: block; font-size: 13px; color: var(--text-mute, #888); margin-bottom: 6px;
+}
+.due-date-input {
+  width: 100%; padding: 10px 12px; font-size: 15px;
+  border: 1px solid var(--text-mute, #ccc); border-radius: 10px;
+  background: var(--bg, #fff); color: var(--text, #000);
+}
+
+/* ─── Экран «Долги» ──────────────────────────────────────────────── */
+.debts-header {
+  padding: 14px; display: flex; flex-direction: column; gap: 10px;
+}
+.debts-title {
+  font-size: 22px; font-weight: 700;
+}
+.debts-tabs {
+  display: flex; gap: 8px;
+}
+.debts-tab {
+  flex: 1; padding: 10px; border: 0; border-radius: 10px;
+  background: var(--bg-card, #f5f5f5);
+  color: var(--text, #000); font-size: 14px;
+  cursor: pointer;
+}
+.debts-tab.active {
+  background: var(--accent, #2481cc);
+  color: #fff;
+}
+.debts-summary {
+  padding: 0 14px; display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+  gap: 10px;
+}
+.debt-stat {
+  padding: 12px; border-radius: 12px; text-align: center;
+  background: var(--bg-card, #f5f5f5);
+}
+.debt-stat-num { font-size: 26px; font-weight: 700; }
+.debt-stat-label { font-size: 12px; color: var(--text-mute, #888); margin: 4px 0; }
+.debt-stat-sum { font-size: 14px; font-weight: 600; }
+.debt-stat-overdue .debt-stat-num { color: #d93025; }
+.debt-stat-today .debt-stat-num   { color: #f9a825; }
+.debt-stat-upcoming .debt-stat-num{ color: #2481cc; }
+
+.debts-list {
+  padding: 14px; display: flex; flex-direction: column; gap: 10px;
+}
+.debt-card {
+  padding: 14px; border-radius: 14px; border-left: 4px solid transparent;
+  background: var(--bg-card, #f5f5f5);
+}
+.debt-card.debt-overdue   { border-left-color: #d93025; }
+.debt-card.debt-due_today { border-left-color: #f9a825; }
+.debt-card.debt-upcoming  { border-left-color: #2481cc; }
+.debt-card-top {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 10px; margin-bottom: 8px;
+}
+.debt-agent {
+  font-size: 16px; font-weight: 600; flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.debt-amount {
+  font-size: 16px; font-weight: 700;
+}
+.debt-card-mid {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 13px; color: var(--text-mute, #888); margin-bottom: 10px;
+  flex-wrap: wrap; gap: 6px;
+}
+.debt-state b { color: var(--text, #000); }
+.debt-owner { opacity: 0.7; }
+.btn-mark-paid {
+  width: 100%; padding: 10px; border: 0; border-radius: 10px;
+  background: var(--accent, #2481cc);
+  color: #fff;
+  font-size: 14px; font-weight: 600; cursor: pointer;
+}
+.btn-mark-paid:disabled { opacity: 0.5; cursor: default; }
