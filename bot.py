@@ -303,7 +303,11 @@ async def main():
 
     # Закрепляем кнопку «Открыть» в композере чата, если задан WEBAPP_URL.
     # Это делает WebApp доступным в один тап рядом с полем ввода.
-    webapp_url = os.environ.get("WEBAPP_URL", "").strip()
+    # Это ГЛОБАЛЬНЫЙ default menu button. Per-user кэш он НЕ перетирает —
+    # для этого в handlers/start.py в cmd_start идёт явный per-chat вызов
+    # на каждый /start, чтобы старые URL у юзеров принудительно обновились.
+    webapp_url = os.environ.get("WEBAPP_URL", "").strip().rstrip("/")
+    logger.info("Текущий WEBAPP_URL: %r", webapp_url or "(не задан)")
     if webapp_url:
         try:
             await bot.set_chat_menu_button(
@@ -312,7 +316,7 @@ async def main():
                     web_app=WebAppInfo(url=webapp_url),
                 )
             )
-            logger.info("Menu Button установлен на %s", webapp_url)
+            logger.info("Global Menu Button установлен на %s", webapp_url)
         except Exception as e:
             logger.warning("Не удалось установить Menu Button: %s", e)
     else:
