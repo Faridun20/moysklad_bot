@@ -28,7 +28,7 @@ from services.roles import can_create_orders, is_boss
 from services.database import (
     get_open_debts, get_order, mark_order_paid,
     get_order_items, get_order_items_by_ids, get_role,
-    confirm_payment_received, reject_payment_received,
+    get_order_payment_summary,
 )
 from services.notifier import get_notify_recipients
 from config import BASE_CURRENCY
@@ -77,18 +77,26 @@ def _format_debt_card(
     today_str: str,
     show_owner: bool,
 ) -> str:
-    """HTML-карточка одного долга для сообщения в боте."""
+    """HTML-карточка одного долга для сообщения в боте.
+    Показывает уже оплаченное и остаток (для частичных оплат)."""
+    summary = get_order_payment_summary(order["id"])
     currency = order.get("currency") or BASE_CURRENCY
-    total = sum(
-        float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
-        for it in items
-    )
     agent = _esc(order.get("agent_name") or "—")
     due_str = _format_due(order.get("due_date"), today_str)
     lines = [
         f"#{order['id']} · 🏢 <b>{agent}</b>",
-        f"💰 <b>{_fmt_amount(total)} {_esc(currency)}</b> · {due_str}",
+        f"💰 Сумма: <b>{_fmt_amount(summary['total'])} {_esc(currency)}</b>",
     ]
+    if summary["confirmed"] > 0 or summary["pending"] > 0:
+        lines.append(
+            f"💵 Оплачено: <b>{_fmt_amount(summary['confirmed'])}</b>"
+            + (
+                f" · ⏳ В подтверждении: <b>{_fmt_amount(summary['pending'])}</b>"
+                if summary["pending"] > 0 else ""
+            )
+            + f" · 📎 Остаток: <b>{_fmt_amount(summary['remaining'])}</b>"
+        )
+    lines.append(f"📅 Срок: {due_str}")
     if show_owner:
         lines.append(f"👨‍💼 {_esc(order.get('full_name') or '—')}")
     return "\n".join(lines)
@@ -187,13 +195,17 @@ async def cb_debt_paid(callback: CallbackQuery, bot: Bot):
         await callback.answer("Этот заказ не в долг", show_alert=True)
         return
 
-    if order.get("paid_at"):
-        # Уже закрыт — кто-то нажал параллельно. Тихо подчищаем кнопку.
+    if order.get("paid_confirmed_at"):
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await callback.answer("Долг уже отмечен как оплаченный")
+        await callback.answer("Долг уже закрыт")
+        return
+
+    summary = get_order_payment_summary(order_id)
+    if summary["remaining"] <= 0:
+        await callback.answer("Нечего оплачивать — остаток ноль")
         return
 
     full_name = (
@@ -201,61 +213,72 @@ async def cb_debt_paid(callback: CallbackQuery, bot: Bot):
         f"{callback.from_user.last_name or ''}".strip()
         or callback.from_user.username or str(user_id)
     )
-    ok = mark_order_paid(order_id, user_id, full_name)
+    username = callback.from_user.username or ""
+
+    # Из бот-кнопки сумму не спросить (нет input UI). Закрываем целиком
+    # остаток. Если нужно частично — менеджер открывает WebApp и вводит
+    # точную сумму.
+    ok, payment_id = mark_order_paid(
+        order_id, user_id, full_name, amount=None, username=username,
+    )
     if not ok:
-        # Гонка: кто-то закрыл между нашими SELECT и UPDATE.
-        await callback.answer("Не удалось закрыть долг (возможно, уже закрыт)")
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
+        await callback.answer("Не удалось создать платёж")
         return
 
-    # Успех — обновляем сообщение, кнопку убираем, добавляем пометку.
+    currency = order.get("currency") or BASE_CURRENCY
     try:
         await callback.message.edit_text(
             (callback.message.html_text or callback.message.text or "")
-            + f"\n\n⏳ <b>Ждёт подтверждения босса</b> ({_esc(full_name)})",
+            + f"\n\n⏳ <b>Платёж #{payment_id} ждёт подтверждения</b> "
+              f"({_esc(full_name)}, {_fmt_amount(summary['remaining'])} {_esc(currency)})",
             parse_mode="HTML",
             reply_markup=None,
         )
     except Exception:
-        # edit_text ругается если контент идентичен — игнорируем
         pass
     await callback.answer("Отправлено на подтверждение боссу")
 
-    # Шлём push'ы боссам — двухступенчатый контроль
-    await _push_payment_confirmation(bot, order_id, full_name)
+    # Push боссу — через стандартный payment-approval flow
+    await _push_payment_confirmation(bot, order_id, full_name, payment_id)
 
 
-async def _push_payment_confirmation(bot: Bot, order_id: int, manager_name: str) -> None:
-    """Уведомление boss/admin с кнопками подтвердить/отклонить."""
+async def _push_payment_confirmation(
+    bot: Bot, order_id: int, manager_name: str, payment_id: int,
+) -> None:
+    """Уведомление boss/admin со стандартными кнопками pay_ok/pay_no
+    (как при обычном /pay платеже — handlers/payments.py). После
+    confirm_payment(payment_id) хелпер автоматически проверит, не
+    закрылся ли заказ полностью."""
     from aiogram.utils.keyboard import InlineKeyboardBuilder
 
     order = get_order(order_id)
     if not order:
         return
-    items = get_order_items(order_id)
-    total = sum(
-        float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
-        for it in items
-    )
+    summary = get_order_payment_summary(order_id)
+    from services.database import get_payment
+    payment = get_payment(payment_id)
+    if not payment:
+        return
     currency = order.get("currency") or BASE_CURRENCY
     agent = _esc(order.get("agent_name") or "—")
     due = order.get("due_date") or "—"
+    amount = float(payment.get("amount") or 0)
     text = (
         f"{DIV}\n"
         "💳 <b>Требуется подтверждение оплаты</b>\n\n"
         f"Заказ #{order_id}\n"
         f"👨‍💼 Менеджер: <b>{_esc(manager_name)}</b>\n"
         f"🏢 Клиент: <b>{agent}</b>\n"
-        f"💰 Сумма: <b>{_fmt_amount(total)}</b> {_esc(currency)}\n"
-        f"📅 Срок был: {_esc(_to_ru(due))}\n\n"
-        "Менеджер отметил «деньги получил». Подтвердите."
+        f"💵 Получено: <b>{_fmt_amount(amount)} {_esc(currency)}</b>\n"
+        f"📊 По заказу: всего {_fmt_amount(summary['total'])} · "
+        f"остаток после approve: {_fmt_amount(max(0, summary['remaining']))}\n"
+        f"📅 Срок: {_esc(_to_ru(due))}\n\n"
+        "Подтвердите, что эта сумма реально пришла в кассу."
     )
+    # Используем существующие callback'и pay_ok/pay_no из handlers/payments.py
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Подтверждаю", callback_data=f"pay_conf_ok:{order_id}")
-    kb.button(text="❌ Отклонить",  callback_data=f"pay_conf_no:{order_id}")
+    kb.button(text="✅ Принять",   callback_data=f"pay_ok:{payment_id}")
+    kb.button(text="❌ Отклонить", callback_data=f"pay_no:{payment_id}")
     kb.adjust(2)
 
     for uid in get_notify_recipients():
@@ -265,124 +288,3 @@ async def _push_payment_confirmation(bot: Bot, order_id: int, manager_name: str)
             )
         except Exception:
             logger.exception("Не удалось уведомить %s о подтверждении #%s", uid, order_id)
-
-
-# ─── Callbacks: босс подтверждает / отклоняет ────────────────────────────────
-
-
-@router.callback_query(F.data.startswith("pay_conf_ok:"))
-async def cb_pay_confirm(callback: CallbackQuery, bot: Bot):
-    """Boss/admin подтверждает: «да, в кассе»."""
-    user_id = callback.from_user.id
-    if not is_boss(user_id):
-        await callback.answer("Только для руководства", show_alert=True)
-        return
-
-    try:
-        order_id = int(callback.data.split(":", 1)[1])
-    except (ValueError, IndexError):
-        await callback.answer("Некорректные данные", show_alert=True)
-        return
-
-    order = get_order(order_id)
-    if not order:
-        await callback.answer("Заказ не найден", show_alert=True)
-        return
-
-    if order.get("paid_confirmed_at"):
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        await callback.answer("Уже подтверждено")
-        return
-
-    full_name = (
-        f"{callback.from_user.first_name or ''} "
-        f"{callback.from_user.last_name or ''}".strip()
-        or callback.from_user.username or str(user_id)
-    )
-    ok = confirm_payment_received(order_id, user_id, full_name)
-    if not ok:
-        await callback.answer("Не удалось подтвердить (возможно, гонка)")
-        return
-
-    try:
-        await callback.message.edit_text(
-            (callback.message.html_text or callback.message.text or "")
-            + f"\n\n✅ <b>Подтверждено</b> ({_esc(full_name)})",
-            parse_mode="HTML",
-            reply_markup=None,
-        )
-    except Exception:
-        pass
-    await callback.answer("Подтверждено ✅")
-
-    # Уведомить менеджера-владельца
-    try:
-        if order.get("user_id"):
-            await bot.send_message(
-                order["user_id"],
-                f"✅ Босс подтвердил оплату по заказу #{order_id} "
-                f"({_esc(order.get('agent_name') or '—')}). Долг закрыт.",
-                parse_mode="HTML",
-            )
-    except Exception:
-        pass
-
-
-@router.callback_query(F.data.startswith("pay_conf_no:"))
-async def cb_pay_reject(callback: CallbackQuery, bot: Bot):
-    """Boss/admin отклоняет: «денег не вижу»."""
-    user_id = callback.from_user.id
-    if not is_boss(user_id):
-        await callback.answer("Только для руководства", show_alert=True)
-        return
-
-    try:
-        order_id = int(callback.data.split(":", 1)[1])
-    except (ValueError, IndexError):
-        await callback.answer("Некорректные данные", show_alert=True)
-        return
-
-    order = get_order(order_id)
-    if not order:
-        await callback.answer("Заказ не найден", show_alert=True)
-        return
-
-    if order.get("paid_confirmed_at"):
-        await callback.answer("Уже подтверждено — отклонить нельзя", show_alert=True)
-        return
-
-    full_name = (
-        f"{callback.from_user.first_name or ''} "
-        f"{callback.from_user.last_name or ''}".strip()
-        or callback.from_user.username or str(user_id)
-    )
-    ok = reject_payment_received(order_id, user_id, full_name)
-    if not ok:
-        await callback.answer("Не удалось отклонить")
-        return
-
-    try:
-        await callback.message.edit_text(
-            (callback.message.html_text or callback.message.text or "")
-            + f"\n\n❌ <b>Отклонено</b> ({_esc(full_name)})",
-            parse_mode="HTML",
-            reply_markup=None,
-        )
-    except Exception:
-        pass
-    await callback.answer("Отклонено")
-
-    # Уведомить менеджера — деньги «не приняты», цикл с начала
-    try:
-        if order.get("user_id"):
-            await bot.send_message(
-                order["user_id"],
-                f"⚠️ Босс отклонил подтверждение оплаты по заказу #{order_id} "
-                f"({_esc(order.get('agent_name') or '—')}). Долг снова открыт.",
-                parse_mode="HTML",
-            )
-    except Exception:
-        pass

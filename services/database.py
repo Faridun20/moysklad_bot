@@ -175,6 +175,7 @@ def init_db():
                 currency     TEXT NOT NULL DEFAULT 'USD',
                 comment      TEXT,
                 status       TEXT NOT NULL DEFAULT 'pending',
+                order_id     BIGINT,
                 created_at   TEXT NOT NULL,
                 confirmed_at TEXT
             )""",
@@ -334,6 +335,12 @@ def init_db():
             ("orders", "paid_confirmed_at", "TEXT"),
             ("orders", "paid_confirmed_by", "BIGINT"),
             ("orders", "paid_confirmed_by_name", "TEXT"),
+            # Связь платежа с заказом. Если payment.order_id IS NOT NULL —
+            # это «частичная оплата по заказу N», а не самостоятельный платёж
+            # в кассу. У одного заказа может быть несколько payments
+            # (клиент платит частями). Когда суммa confirmed payments >=
+            # order.total, заказ автоматически считается закрытым.
+            ("payments", "order_id", "BIGINT"),
         ]
         for table, column, col_type in migrations:
             try:
@@ -351,6 +358,8 @@ def init_db():
             # с paid_at IS NULL. Без индекса — full scan по orders, при тысячах
             # записей это секунды. Составной индекс покрывает фильтр и сортировку.
             "CREATE INDEX IF NOT EXISTS idx_orders_credit_due ON orders(payment_type, paid_at, due_date)",
+            # Для запросов «все платежи по заказу» — без него полный скан payments.
+            "CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id)",
         ]
         for sql in snapshot_indexes:
             try:
@@ -580,26 +589,136 @@ def remove_user(user_id: int, removed_by: int = None, removed_name: str = "") ->
 # ─── Платежи ─────────────────────────────────────────────────────────────────
 
 
-def add_payment(user_id, username, full_name, amount, currency, comment) -> int:
+def add_payment(
+    user_id, username, full_name, amount, currency, comment,
+    order_id: int | None = None,
+) -> int:
+    """Создать запись о платеже. Если задан order_id — это «оплата по
+    конкретному заказу» (частичная или полная); тогда после approve
+    босса автоматически проверяется, не закрыт ли заказ полностью.
+    Без order_id — самостоятельный платёж в кассу (legacy /pay flow)."""
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
             cur.execute("""
-                INSERT INTO payments (user_id, username, full_name, amount, currency, comment, status, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s) RETURNING id
-            """, (user_id, username, full_name, amount, currency, comment, now_str()))
+                INSERT INTO payments
+                    (user_id, username, full_name, amount, currency, comment, status, order_id, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s) RETURNING id
+            """, (user_id, username, full_name, amount, currency, comment, order_id, now_str()))
             payment_id = cur.fetchone()["id"]
         else:
             cur.execute("""
-                INSERT INTO payments (user_id, username, full_name, amount, currency, comment, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-            """, (user_id, username, full_name, amount, currency, comment, now_str()))
+                INSERT INTO payments
+                    (user_id, username, full_name, amount, currency, comment, status, order_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            """, (user_id, username, full_name, amount, currency, comment, order_id, now_str()))
             payment_id = cur.lastrowid
         conn.commit()
     return payment_id
 
 
+def get_payments_for_order(order_id: int) -> list[dict]:
+    """Все платежи привязанные к заказу (включая pending/rejected/archived)."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT * FROM payments WHERE order_id = ? ORDER BY created_at ASC"),
+            (order_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_payments_for_orders(order_ids: list[int]) -> dict[int, list[dict]]:
+    """Батч-версия: {order_id: [payments...]}. Заказы без платежей в
+    результат не попадают; вызывающий должен использовать .get(oid, [])."""
+    if not order_ids:
+        return {}
+    placeholders = ",".join(["?"] * len(order_ids))
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(f"SELECT * FROM payments WHERE order_id IN ({placeholders}) "
+              f"ORDER BY created_at ASC"),
+            list(order_ids),
+        )
+        rows = cur.fetchall()
+    grouped: dict[int, list[dict]] = {}
+    for r in rows:
+        d = dict(r)
+        grouped.setdefault(d["order_id"], []).append(d)
+    return grouped
+
+
+def get_order_payment_summary(order_id: int) -> dict:
+    """Сумма по заказу: total / confirmed / pending / remaining.
+
+    Используется для отображения «оплачено X из Y, остаток Z» и для
+    решения, закрыт ли заказ (remaining == 0).
+    """
+    order = get_order(order_id)
+    if not order:
+        return {"total": 0.0, "confirmed": 0.0, "pending": 0.0, "remaining": 0.0}
+    items = get_order_items(order_id)
+    total = sum(
+        float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
+        for it in items
+    )
+    payments = get_payments_for_order(order_id)
+    confirmed = sum(p["amount"] for p in payments if p["status"] == "confirmed")
+    pending = sum(p["amount"] for p in payments if p["status"] == "pending")
+    remaining = max(0.0, total - confirmed)
+    return {
+        "total": total,
+        "confirmed": confirmed,
+        "pending": pending,
+        "remaining": remaining,
+    }
+
+
+def delete_order(order_id: int, requested_by: int) -> bool:
+    """Удалить заказ-черновик. Только status='draft' можно удалять, и
+    только владелец (даже boss/admin не удаляет чужие — нужно жёстче
+    через audit). Каскадно сносим order_items.
+
+    Возвращает True если что-то удалили, False если заказ не найден,
+    не draft, или не принадлежит requested_by.
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        # Проверяем, что заказ существует, draft и принадлежит юзеру
+        cur.execute(
+            q("SELECT user_id, status FROM orders WHERE id = ?"),
+            (order_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return False
+        if USE_POSTGRES:
+            owner_id, status = row["user_id"], row["status"]
+        else:
+            owner_id, status = row[0], row[1]
+        if owner_id != requested_by or status != "draft":
+            return False
+
+        # Каскад вручную, чтобы работало и в SQLite (FK off by default)
+        cur.execute(q("DELETE FROM order_items WHERE order_id = ?"), (order_id,))
+        cur.execute(q("DELETE FROM orders WHERE id = ?"), (order_id,))
+        deleted = cur.rowcount > 0
+        conn.commit()
+    if deleted:
+        add_audit_log(
+            requested_by, "", get_role(requested_by),
+            "order_deleted",
+            f"Удалён черновик заказа #{order_id}",
+        )
+    return deleted
+
+
 def confirm_payment(payment_id: int, confirmed_by: int = None, confirmed_name: str = "") -> bool:
+    """Подтвердить платёж. Если платёж привязан к заказу (order_id) —
+    проверяем суммарно, не закрыли ли мы тем самым заказ полностью.
+    Полностью означает: SUM(amount where status='confirmed') >= order.total.
+    Тогда автоматически проставляем order.paid_confirmed_at."""
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
@@ -608,15 +727,61 @@ def confirm_payment(payment_id: int, confirmed_by: int = None, confirmed_name: s
         )
         updated = cur.rowcount > 0
         conn.commit()
-    if updated and confirmed_by:
-        payment = get_payment(payment_id)
-        if payment:
-            add_audit_log(
-                confirmed_by, confirmed_name, get_role(confirmed_by),
-                "payment_confirmed",
-                f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
-            )
+    if not updated:
+        return False
+    payment = get_payment(payment_id)
+    if confirmed_by and payment:
+        add_audit_log(
+            confirmed_by, confirmed_name, get_role(confirmed_by),
+            "payment_confirmed",
+            f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
+        )
+    # Если платёж был привязан к заказу — проверяем не закрылся ли заказ.
+    if payment and payment.get("order_id"):
+        _maybe_close_order_after_payment(
+            payment["order_id"], confirmed_by, confirmed_name,
+        )
     return updated
+
+
+def _maybe_close_order_after_payment(
+    order_id: int,
+    confirmed_by: int | None,
+    confirmed_name: str,
+) -> None:
+    """После approve платежа — если сумма confirmed дошла до order.total,
+    проставляем order.paid_confirmed_at. Идемпотентно: если уже стоит,
+    ничего не делаем (повторный confirm более старого платежа не должен
+    переписывать timestamp)."""
+    summary = get_order_payment_summary(order_id)
+    if summary["remaining"] > 0.01:  # ещё не полностью оплачен
+        return
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "UPDATE orders "
+                "SET paid_confirmed_at = ?, paid_confirmed_by = ?, "
+                "    paid_confirmed_by_name = ?, "
+                "    paid_at = COALESCE(paid_at, ?), "
+                "    updated_at = ? "
+                "WHERE id = ? AND paid_confirmed_at IS NULL"
+            ),
+            (
+                now_str(), confirmed_by or 0, confirmed_name or "",
+                now_str(),  # paid_at если ещё не было
+                now_str(), order_id,
+            ),
+        )
+        closed = cur.rowcount > 0
+        conn.commit()
+    if closed:
+        add_audit_log(
+            confirmed_by or 0, confirmed_name, get_role(confirmed_by) if confirmed_by else "",
+            "order_fully_paid",
+            f"Заказ #{order_id} полностью оплачен "
+            f"(сумма подтверждённых платежей: {summary['confirmed']:,.0f})",
+        )
 
 
 def reject_payment(payment_id: int, rejected_by: int = None, rejected_name: str = "") -> bool:
@@ -860,37 +1025,121 @@ def mark_order_paid(
     order_id: int,
     marked_by: int,
     marked_by_name: str,
-) -> bool:
-    """Закрыть долг по credit-заказу: проставить paid_at = now().
+    amount: float | None = None,
+    username: str = "",
+) -> tuple[bool, int | None]:
+    """Менеджер отмечает поступление денег по заказу.
 
-    Идемпотентно: если paid_at уже стоит — ничего не делаем и
-    возвращаем False (чтобы не писать дублирующий audit-log).
-    Также возвращает False если заказ не credit или не существует.
+    Поведение:
+      1. Создаёт payment-запись в таблице payments с order_id=N и
+         статусом 'pending'. Amount = сколько именно получено сейчас
+         (для частичной оплаты). Если None — берётся remaining (полная
+         доплата до закрытия). 0 / отрицательное — отклоняем.
+      2. Ставит order.paid_at = now() если ещё не стоит (легаси-флаг —
+         мы используем его в UI как «менеджер хоть раз отметил оплату»).
+      3. Возвращает (True, payment_id) при успехе. После approve босса
+         через стандартный confirm_payment() сумма зачтётся, и когда
+         все payments суммарно покроют order.total — заказ
+         автоматически перейдёт в paid_confirmed_at.
+
+    Возвращает (False, None) если order не существует, не credit,
+    уже полностью закрыт (paid_confirmed_at стоит), или amount некорректен.
     """
+    order = get_order(order_id)
+    if not order:
+        return (False, None)
+    if order.get("payment_type") != "credit":
+        return (False, None)
+    if order.get("paid_confirmed_at"):
+        return (False, None)  # уже полностью закрыт
+
+    summary = get_order_payment_summary(order_id)
+    # Если amount не задан — берём остаток (полная доплата)
+    if amount is None:
+        amount = summary["remaining"]
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return (False, None)
+    if amount <= 0:
+        return (False, None)
+    # Не даём ввести больше остатка с учётом уже pending
+    if amount > summary["remaining"] + 0.01:
+        amount = summary["remaining"]
+        if amount <= 0:
+            return (False, None)
+
+    from config import BASE_CURRENCY
+    currency = order.get("currency") or BASE_CURRENCY
+    comment = (
+        f"Оплата по заказу #{order_id}"
+        + (f" ({order.get('agent_name')})" if order.get("agent_name") else "")
+    )
+
+    payment_id = add_payment(
+        marked_by, username, marked_by_name, amount, currency, comment,
+        order_id=order_id,
+    )
+
+    # paid_at — флаг «менеджер хоть раз отметил». Не сбрасываем
+    # при следующих частичных, оставляем самое раннее время.
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
             q(
-                "UPDATE orders SET paid_at = ?, updated_at = ? "
-                "WHERE id = ? AND payment_type = 'credit' AND paid_at IS NULL"
+                "UPDATE orders SET paid_at = COALESCE(paid_at, ?), updated_at = ? "
+                "WHERE id = ?"
             ),
             (now_str(), now_str(), order_id),
         )
-        updated = cur.rowcount > 0
         conn.commit()
-    if updated:
-        order = get_order(order_id)
-        details = (
-            f"Долг по заказу #{order_id} погашен "
-            f"(клиент: {order.get('agent_name') or '—'})"
-            if order else f"Долг по заказу #{order_id} погашен"
-        )
-        add_audit_log(
-            marked_by, marked_by_name, get_role(marked_by),
-            "debt_paid",
-            details,
-        )
-    return updated
+
+    add_audit_log(
+        marked_by, marked_by_name, get_role(marked_by),
+        "debt_payment_claimed",
+        f"Заказ #{order_id}: менеджер отметил {amount:,.0f} {currency} "
+        f"(остаток после approve: {summary['remaining'] - amount:,.0f})",
+    )
+    return (True, payment_id)
+
+
+def confirm_all_pending_payments_for_order(
+    order_id: int,
+    confirmed_by: int,
+    confirmed_by_name: str,
+) -> int:
+    """Босс одной кнопкой подтверждает ВСЕ pending платежи по заказу.
+
+    Удобно: при частичных оплатах у заказа могут висеть несколько
+    pending payments (менеджер отмечал по очереди). Босс не хочет
+    кликать каждый отдельно — этот хелпер закрывает их пачкой.
+    Возвращает кол-во подтверждённых.
+
+    Если после серии confirm'ов сумма confirmed достигла order.total —
+    заказ автоматически закроется через _maybe_close_order_after_payment.
+    """
+    payments = get_payments_for_order(order_id)
+    pending = [p for p in payments if p["status"] == "pending"]
+    n = 0
+    for p in pending:
+        if confirm_payment(p["id"], confirmed_by, confirmed_by_name):
+            n += 1
+    return n
+
+
+def reject_all_pending_payments_for_order(
+    order_id: int,
+    rejected_by: int,
+    rejected_by_name: str,
+) -> int:
+    """Босс отклоняет ВСЕ pending платежи по заказу. Аналог confirm_all."""
+    payments = get_payments_for_order(order_id)
+    pending = [p for p in payments if p["status"] == "pending"]
+    n = 0
+    for p in pending:
+        if reject_payment(p["id"], rejected_by, rejected_by_name):
+            n += 1
+    return n
 
 
 def confirm_payment_received(
