@@ -25,6 +25,14 @@ def _cached_role(user_id: int) -> str:
     return role
 
 
+# Публичный алиас — для прямого использования в webapp/handlers,
+# когда нужна именно строка-роль (а не bool-предикат).
+# Раньше webapp/server.py звал services.database.get_role напрямую,
+# обходя кэш и делая отдельный SELECT на каждый API-запрос.
+def cached_role(user_id: int) -> str:
+    return _cached_role(user_id)
+
+
 def invalidate_role(user_id: int) -> None:
     """Сбросить кэш роли (вызывать после set_role/delete_user)."""
     _role_cache.pop(user_id, None)
