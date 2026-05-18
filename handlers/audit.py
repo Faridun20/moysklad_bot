@@ -55,21 +55,6 @@ def format_audit_log(records: list[dict], label: str) -> list[str]:
 
     return messages
 
-    # Разбиваем на части по 4000 символов
-    messages = []
-    current = ""
-    for line in lines:
-        if len(current) + len(line) + 1 > 4000:
-            messages.append(current)
-            current = line
-        else:
-            current += "\n" + line if current else line
-    if current:
-        messages.append(current)
-
-    return messages
-
-
 def filter_by_period(records: list[dict], period: str) -> list[dict]:
     now = datetime.now()
     if period == "today":
@@ -84,9 +69,18 @@ def filter_by_period(records: list[dict], period: str) -> list[dict]:
     cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
     return [r for r in records if r["created_at"] >= cutoff_str]
 
+def audit_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📅 Сегодня",       callback_data="al:today")
+    kb.button(text="📅 Неделя",        callback_data="al:week")
+    kb.button(text="📅 Месяц",         callback_data="al:month")
+    kb.button(text="📋 Всё время",     callback_data="al:all")
+    kb.button(text="👤 По сотруднику", callback_data="al:by_user")
+    kb.button(text="🏠 Меню",          callback_data="menu")
+    kb.adjust(2, 2, 1, 1)
+    return kb.as_markup()
 
 # ─── Команды ─────────────────────────────────────────────────────────────────
-
 
 @router.message(Command("audit"))
 async def cmd_audit(message: Message):

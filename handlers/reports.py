@@ -11,6 +11,7 @@ from aiogram import Bot, Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from tasks.scheduled import build_sales_and_stock_report
 
 from config import ADMIN_IDS
 from services.moysklad import get_all_stock, get_sales_stats
