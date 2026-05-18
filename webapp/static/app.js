@@ -30,6 +30,7 @@ async function init() {
 
     currentUser = await response.json();
     renderHeader();
+    initNav();
     showScreen('home');
   } catch (e) {
     showError('❌ Не удалось подключиться: ' + e.message);
@@ -54,6 +55,8 @@ async function showScreen(screen) {
 
   document.querySelectorAll('.nav-item').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.screen === screen);
+    // Переинициализируем обработчик на случай если DOM обновился
+    btn.onclick = () => showScreen(btn.dataset.screen);
   });
 
   const content = document.getElementById('content');
@@ -875,5 +878,15 @@ function renderPaymentsContent() {
   });
 }
 
+function initNav() {
+  document.querySelectorAll('.nav-item').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      showScreen(btn.dataset.screen);
+    });
+  });
+}
+
 // Запуск
-init();
+init()
