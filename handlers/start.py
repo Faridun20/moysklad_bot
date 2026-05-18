@@ -29,74 +29,91 @@ ROLE_NAMES = {
 
 
 def get_keyboard_for_role(role: str):
+    """
+    Компактное 2-колоночное меню под роль.
+
+    Группы сгруппированы по смыслу:
+      • Каталог (Остатки/Категории)
+      • Отгрузки/Аналитика
+      • Заказы (Новый/Мои + для босса Заявки)
+      • Платежи
+      • Админка
+    Финальная строка — WebApp (full-width).
+    """
     kb = InlineKeyboardBuilder()
 
-    webapp_url = os.environ.get("WEBAPP_URL", "")
-    if webapp_url:
-        kb.button(text="🌐 Открыть WebApp", web_app=WebAppInfo(url=webapp_url))
-    
-
+    # Группа 1: Каталог (всем кроме guest)
     if role in ("admin", "boss", "manager"):
-        kb.button(text="📦 Все остатки", callback_data="sp:0")
-        kb.button(text="🗂 По категориям", callback_data="cats:0")
-        kb.button(text="🚚 Отгрузки", callback_data="sh_period")
-        kb.button(text="📊 Аналитика продаж", callback_data="analytics")
+        kb.button(text="📦 Остатки", callback_data="sp:0")
+        kb.button(text="🗂 Категории", callback_data="cats:0")
 
+    # Группа 2: Активность
+    if role in ("admin", "boss", "manager"):
+        kb.button(text="🚚 Отгрузки", callback_data="sh_period")
+        kb.button(text="📊 Аналитика", callback_data="analytics")
+
+    # Группа 3: Заказы
+    if role in ("admin", "boss", "manager"):
+        kb.button(text="➕ Новый заказ", callback_data="ord_new")
+        kb.button(text="📋 Мои заказы", callback_data="ord_my")
+
+    # Заявки на отгрузку — только босс/админ
+    if role in ("admin", "boss"):
+        kb.button(text="⏳ Заявки на апрув", callback_data="ord_requests")
+        kb.button(text="📈 Отчёты", callback_data="reports_menu")
+
+    # Платежи: отдельная строка
     if role in ("admin", "boss", "manager"):
         kb.button(text="💵 Отправить платёж", callback_data="pay_start")
-        kb.button(text="📋 Мои заказы",       callback_data="ord_my")
-        kb.button(text="➕ Новый заказ",       callback_data="ord_new")
-
     if role in ("admin", "boss"):
-        kb.button(text="📋 Отчёт по платежам", callback_data="pr:menu")
-        kb.button(text="📊 Отчёты", callback_data="reports_menu")
-        kb.button(text="⏳ Заявки на отгрузку", callback_data="ord_requests")
+        kb.button(text="📊 Отчёт по платежам", callback_data="pr:menu")
 
+    # Админская строка
     if role == "admin":
-        kb.button(text="👥 Пользователи",  callback_data="users_list")
-        kb.button(text="📋 Аудит лог",     callback_data="al:today")
-        kb.button(text="🔍 Быстрый лог",   callback_data="log:20")
+        kb.button(text="👥 Пользователи", callback_data="users_list")
+        kb.button(text="📋 Аудит", callback_data="al:today")
 
-    kb.adjust(1)
+    # WebApp кнопка отдельным рядом во всю ширину (если задан URL)
+    webapp_url = os.environ.get("WEBAPP_URL", "")
+    has_webapp = bool(webapp_url)
+    if has_webapp:
+        kb.button(text="🌐 Открыть WebApp", web_app=WebAppInfo(url=webapp_url))
+
+    # Раскладка: первые блоки парами по 2; WebApp один в строке
+    # Считаем общее число кнопок без WebApp, чтобы корректно сгруппировать
+    rows: list[int] = []
+    if role in ("admin", "boss", "manager"):
+        rows += [2, 2, 2]
+    if role in ("admin", "boss"):
+        rows += [2]                  # Заявки + Отчёты
+    if role in ("admin", "boss"):
+        rows += [2]                  # Платёж + Отчёт по платежам
+    elif role == "manager":
+        rows += [1]                  # один Платёж
+    if role == "admin":
+        rows += [2]                  # Пользователи + Аудит
+    if has_webapp:
+        rows += [1]                  # WebApp полная ширина
+    kb.adjust(*rows)
     return kb.as_markup()
 
 
-def get_welcome_text(role: str) -> str:
+def get_welcome_text(role: str, first_name: str = "") -> str:
+    """
+    Короткое приветствие — без длинного списка команд (он висит в
+    автокомплите Telegram и дублирует кнопки ниже).
+    """
     role_name = ROLE_NAMES.get(role, "👤 Сотрудник")
-    base = f"👋 Привет! Я бот МойСклад.\n🎭 Ваша роль: <b>{role_name}</b>\n\n"
-
-    if role == "admin":
-        return base + (
-            "Доступные команды:\n"
-            "/stock — остатки на складе\n"
-            "/categories — категории товаров\n"
-            "/shipments — отгрузки\n"
-            "/analytics — аналитика продаж\n"
-            "/pay — отправить платёж\n"
-            "/payreport — отчёт по платежам\n"
-            "/users — список пользователей\n"
-            "/addrole [id] [роль] — назначить роль"
+    name_part = f", <b>{first_name}</b>" if first_name else ""
+    if role == "guest":
+        return (
+            f"👋 Здравствуйте{name_part}!\n"
+            f"Аккаунт ещё не активирован."
         )
-    elif role == "boss":
-        return base + (
-            "Доступные команды:\n"
-            "/stock — остатки на складе\n"
-            "/categories — категории товаров\n"
-            "/shipments — отгрузки\n"
-            "/analytics — аналитика продаж\n"
-            "/pay — отправить платёж\n"
-            "/payreport — отчёт по платежам"
-        )
-    elif role == "manager":
-        return base + (
-            "Доступные команды:\n"
-            "/stock — остатки на складе\n"
-            "/categories — категории товаров\n"
-            "/shipments — отгрузки\n"
-            "/analytics — аналитика продаж"
-        )
-    else:
-        return base + ("Доступные команды:\n" "/pay — отправить платёж руководителю")
+    return (
+        f"👋 Привет{name_part}!\n"
+        f"{role_name}"
+    )
 
 
 @router.message(CommandStart())
@@ -117,48 +134,36 @@ async def cmd_start(message: Message):
             parse_mode="HTML",
         )
 
-    # Автоматически синхронизируем менеджеров с МойСклад
+    # Автоматически синхронизируем менеджеров с МойСклад.
+    # Статус показываем коротко — только в случае проблем. Успех тихий,
+    # чтобы не шуметь при каждом /start. Полный текст ошибки от МойСклад
+    # уходит в лог через sync_manager.
     sync_status_line = ""
     if role == "manager":
         from services.ms_sync import sync_manager
+        import html as _html
         result = await sync_manager(
             user.id,
             user.full_name or user.username or str(user.id),
             user.username or "",
         )
         status = result.get("status")
-        if status == "linked":
-            logger.info(
-                "Менеджер %s привязан к МойСклад: %s",
-                user.full_name, result.get("ms_id"),
-            )
-            sync_status_line = (
-                f"\n✅ <b>Привязан к МойСклад:</b> {result.get('ms_name', '—')}"
-            )
-        elif status == "created":
-            logger.info(
-                "Создан сотрудник МойСклад для %s: %s",
-                user.full_name, result.get("ms_id"),
-            )
-            sync_status_line = (
-                "\n✅ <b>Создан сотрудник в МойСклад.</b>"
-            )
-        elif status == "already_linked":
-            sync_status_line = "\n✅ <b>Аккаунт уже привязан к МойСклад.</b>"
+        if status == "created":
+            sync_status_line = "\n\n✅ Создан профиль в МойСклад."
         elif status == "failed":
             reason = result.get("reason", "неизвестная ошибка")
             logger.warning(
-                "Не удалось привязать %s к МойСклад: %s", user.full_name, reason
+                "MS link failed for %s: %s", user.full_name, reason
             )
             sync_status_line = (
-                "\n⚠️ <b>Не удалось привязать аккаунт к МойСклад.</b>\n"
-                f"<code>{reason[:300]}</code>\n"
-                "Обратитесь к админу — без привязки аналитика по сотруднику "
-                "недоступна."
+                f"\n\n⚠️ <i>Не привязан к МойСклад: "
+                f"{_html.escape(reason[:160])}</i>\n"
+                f"<i>Передайте админу — аналитика по сотруднику "
+                f"недоступна без привязки.</i>"
             )
 
     await message.answer(
-        get_welcome_text(role) + sync_status_line,
+        get_welcome_text(role, user.first_name or "") + sync_status_line,
         parse_mode="HTML",
         reply_markup=get_keyboard_for_role(role),
     )
@@ -219,7 +224,7 @@ async def cb_menu(call: CallbackQuery):
             "⛔ Ваш аккаунт ещё не активирован. Напишите /start."
         )
     await call.message.answer(
-        get_welcome_text(role),
+        get_welcome_text(role, user.first_name or ""),
         parse_mode="HTML",
         reply_markup=get_keyboard_for_role(role),
     )

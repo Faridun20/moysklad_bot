@@ -36,15 +36,41 @@ async def get_ms_employees() -> list[dict]:
     return data.get("rows", [])
 
 
+def _parse_ms_error(body_text: str) -> str:
+    """
+    Достать человеко-читаемую ошибку из ответа МойСклад.
+    Формат тела ответа:
+        {"errors": [{"error": "...", "code": ..., "moreInfo": "..."}]}
+    Возвращаем текст первого error[]. Если JSON битый — кусок body как есть.
+    """
+    import json as _json
+    try:
+        data = _json.loads(body_text)
+        errors = data.get("errors") if isinstance(data, dict) else None
+        if errors and isinstance(errors, list):
+            msg = errors[0].get("error") or errors[0].get("moreInfo")
+            if msg:
+                return str(msg)[:280]
+    except Exception:
+        pass
+    return body_text[:200] if body_text else "пустой ответ"
+
+
 async def create_ms_employee(full_name: str, username: str) -> tuple[dict | None, str]:
     """
     Создать нового сотрудника в МойСклад.
-    Возвращает (employee_dict, reason). При ошибке employee=None,
-    reason — текст ошибки для отображения пользователю.
+
+    МойСклад требует непустой lastName (HTTP 412 иначе). Если у юзера
+    в Telegram только одно имя — подставляем username или TG-prefix
+    как фамилию, чтобы запрос прошёл и сотрудник был отличим в списке.
+
+    Возвращает (employee_dict, reason).
     """
-    parts = full_name.strip().split()
-    first_name = parts[0] if parts else full_name
-    last_name = parts[1] if len(parts) > 1 else ""
+    parts = full_name.strip().split() if full_name else []
+    first_name = parts[0] if parts else (username or "TG")
+    last_name = parts[1] if len(parts) > 1 else (
+        f"@{username}" if username else f"(TG)"
+    )
     middle_name = parts[2] if len(parts) > 2 else ""
 
     payload = {
@@ -59,10 +85,11 @@ async def create_ms_employee(full_name: str, username: str) -> tuple[dict | None
         async with sess.post(f"{MS_BASE}/entity/employee", json=payload) as resp:
             body_text = await resp.text()
             if resp.status >= 400:
+                err = _parse_ms_error(body_text)
                 logger.error(
                     "MS create employee HTTP %s: %s", resp.status, body_text[:500]
                 )
-                return None, f"HTTP {resp.status}: {body_text[:200]}"
+                return None, f"HTTP {resp.status}: {err}"
             try:
                 employee = await resp.json(content_type=None)
             except Exception:
