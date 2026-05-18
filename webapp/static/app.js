@@ -115,7 +115,9 @@ async function renderHome() {
     return;
   }
 
+  const cur = data.currency || 'USD';
   const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const fmtCur = n => `${fmt(n)} ${cur}`;
   const isBoss = data.role === 'admin' || data.role === 'boss';
 
   // ─── Сводка за сегодня ──────────────────────────────
@@ -124,7 +126,7 @@ async function renderHome() {
     <div class="section-label">${todayLabel}</div>
     <div class="stat-grid stat-grid--three">
       <div class="stat">
-        <div class="stat-value">${fmt(data.today.revenue)}</div>
+        <div class="stat-value">${fmtCur(data.today.revenue)}</div>
         <div class="stat-label">Выручка</div>
       </div>
       <div class="stat">
@@ -197,7 +199,7 @@ async function renderHome() {
               <div class="stock-name">${i + 1}. ${escapeHtml(e.name)}</div>
               <div class="stock-folder">${e.count} отгр.</div>
             </div>
-            <span class="stock-badge badge-green">${fmt(e.revenue)}</span>
+            <span class="stock-badge badge-green">${fmtCur(e.revenue)}</span>
           </div>
         `).join('')}
       </div>

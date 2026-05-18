@@ -743,6 +743,27 @@ def get_order_items(order_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_order_items_by_ids(order_ids: list[int]) -> dict[int, list[dict]]:
+    """Батч-загрузка позиций для списка заказов — один SQL вместо N.
+    Возвращает {order_id: [items, ...]}. Заказы без позиций отсутствуют
+    в результате (вызывающий должен использовать .get(oid, []))."""
+    if not order_ids:
+        return {}
+    placeholders = ",".join(["?"] * len(order_ids))
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(f"SELECT * FROM order_items WHERE order_id IN ({placeholders})"),
+            list(order_ids),
+        )
+        rows = cur.fetchall()
+    grouped: dict[int, list[dict]] = {}
+    for r in rows:
+        d = dict(r)
+        grouped.setdefault(d["order_id"], []).append(d)
+    return grouped
+
+
 def remove_order_item(item_id: int) -> bool:
     with get_conn() as conn:
         cur = get_cursor(conn)

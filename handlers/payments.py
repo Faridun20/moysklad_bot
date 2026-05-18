@@ -13,7 +13,13 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from config import ADMIN_IDS
-from services.roles import can_manage_payments
+from services.roles import can_manage_payments, _has_role
+
+
+def _can_send_payment(user_id: int) -> bool:
+    """Кто может ОТПРАВИТЬ платёж на одобрение: manager (и admin для теста).
+    Босс эти платежи апрувит — отправлять ему нечего."""
+    return _has_role(user_id, "admin", "manager")
 from utils.formatters import (
     format_payment_notify,
     format_payment_confirmed,
@@ -84,6 +90,10 @@ def pay_report_keyboard():
 
 @router.message(Command("pay"))
 async def cmd_pay(message: Message, state: FSMContext):
+    if not _can_send_payment(message.from_user.id):
+        return await message.answer(
+            "⛔ Платежи отправляют только менеджеры."
+        )
     await state.clear()
     await state.set_state(PaymentState.waiting_for_amount)
     await message.answer(
@@ -97,6 +107,10 @@ async def cmd_pay(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "pay_start")
 async def cb_pay_start(call: CallbackQuery, state: FSMContext):
+    if not _can_send_payment(call.from_user.id):
+        return await call.answer(
+            "⛔ Платежи отправляют только менеджеры", show_alert=True
+        )
     await call.answer()
     await state.clear()
     await state.set_state(PaymentState.waiting_for_amount)

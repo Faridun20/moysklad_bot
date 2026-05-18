@@ -14,6 +14,11 @@ import html
 import logging
 from datetime import datetime
 
+try:
+    from config import BASE_CURRENCY as _BASE_CURRENCY
+except ImportError:
+    _BASE_CURRENCY = "USD"
+
 
 def _esc(s) -> str:
     """HTML-escape для пользовательских строк перед вставкой в bot-сообщения
@@ -21,6 +26,11 @@ def _esc(s) -> str:
     `<` или `&` (например, через UI МойСклад), и без escape сообщение
     либо ломалось бы, либо открывало путь к HTML-инъекции."""
     return html.escape(str(s or ""), quote=False)
+
+
+def _cur(amount: float) -> str:
+    """Форматирует сумму с валютой: «150 USD»."""
+    return f"{_fmt_num(amount)} {_BASE_CURRENCY}"
 
 from aiogram import Bot, Router, F
 from aiogram.filters import Command
@@ -118,7 +128,7 @@ def format_order(order: dict, items: list[dict]) -> str:
             if price > 0:
                 price_str = (
                     f"     <code>{_fmt_num(qty)} {unit} × "
-                    f"{_fmt_num(price)} = {_fmt_num(qty * price)}</code>"
+                    f"{_cur(price)} = {_cur(qty * price)}</code>"
                 )
             else:
                 price_str = f"     <code>{_fmt_num(qty)} {unit}</code>"
@@ -131,7 +141,7 @@ def format_order(order: dict, items: list[dict]) -> str:
         grand_total = sum(_line_total(it) for it in items)
         if grand_total > 0:
             lines.append(DIV2)
-            lines.append(f"<b>💰 Итого: {_fmt_num(grand_total)}</b>")
+            lines.append(f"<b>💰 Итого: {_cur(grand_total)}</b>")
     else:
         lines.append("<i>Товары не добавлены</i>")
 
@@ -150,7 +160,7 @@ def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
         if price > 0:
             lines.append(
                 f"  • {name}: {_fmt_num(qty)} {unit} "
-                f"× {_fmt_num(price)} = <b>{_fmt_num(sub)}</b>"
+                f"× {_cur(price)} = <b>{_cur(sub)}</b>"
             )
         else:
             lines.append(
@@ -158,7 +168,6 @@ def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
                 f"<i>(цена не указана)</i>"
             )
     items_text = "\n".join(lines)
-    # Итог по всем позициям (не только по первым 10 в выводе)
     grand_total = sum(_line_total(it) for it in items)
     if len(items) > 10:
         items_text += f"\n  ...и ещё {len(items) - 10} поз."
@@ -169,7 +178,7 @@ def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
     )
     comment_str = f"\n📝 {_esc(order['comment'])}" if order.get("comment") else ""
     total_str = (
-        f"\n\n<b>💰 Итого: {_fmt_num(grand_total)}</b>"
+        f"\n\n<b>💰 Итого: {_cur(grand_total)}</b>"
         if grand_total > 0 else ""
     )
 
@@ -501,7 +510,7 @@ async def process_quantity(message: Message, state: FSMContext):
 
     await message.answer(
         f"✅ Количество: <b>{qty} {product['unit']}</b>\n\n"
-        f"💰 Введите <b>цену за {product['unit']}</b> (в валюте МойСклад).\n"
+        f"💰 Введите <b>цену за {product['unit']}</b> в {_BASE_CURRENCY}.\n"
         f"Например: <code>150</code> или <code>49.99</code>.\n"
         f"Если цена ещё не известна — введите <code>0</code>.",
         parse_mode="HTML",
@@ -543,8 +552,8 @@ async def process_price(message: Message, state: FSMContext):
     subtotal = qty * price
 
     await message.answer(
-        f"✅ Добавлено: <b>{product['name']}</b>\n"
-        f"   {qty} {product['unit']} × {price:g} = <b>{subtotal:g}</b>\n\n"
+        f"✅ Добавлено: <b>{_esc(product['name'])}</b>\n"
+        f"   {qty} {product['unit']} × {_cur(price)} = <b>{_cur(subtotal)}</b>\n\n"
         + format_order(order, items),
         parse_mode="HTML",
         reply_markup=order_actions_keyboard(order_id, "draft", True),

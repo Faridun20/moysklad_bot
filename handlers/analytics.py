@@ -16,7 +16,7 @@ from services.roles import can_view_analytics, is_boss
 from services.moysklad import get_sales_stats, get_employee_stats, get_employee_href
 from services.database import (
     get_moysklad_employee_id, get_role,
-    get_user_orders, get_order_items,
+    get_user_orders, get_order_items, get_order_items_by_ids,
 )
 from utils.formatters import format_sales_report
 from utils.keyboards import analytics_keyboard, analytics_back_keyboard
@@ -147,25 +147,33 @@ def _personal_stats_from_local(
     одобренным/отгруженным заказам в период.
 
     Источник истины — наша БД (orders + order_items), без зависимости
-    от связки МойСклад employee. Так аналитика работает у любого
-    менеджера, даже если его не получилось привязать к employee в MS.
+    от связки МойСклад employee.
+
+    Производительность: order_items грузятся одним батч-запросом для
+    всех релевантных заказов (раньше был N+1 — на каждый заказ свой
+    SELECT, что на Railway Postgres давало многосекундные задержки).
     """
     orders = get_user_orders(user_id)
     since_iso = since.strftime("%Y-%m-%d %H:%M:%S")
     until_iso = until.strftime("%Y-%m-%d %H:%M:%S")
+
+    relevant = [
+        o for o in orders
+        if o["status"] in ("approved", "shipped")
+        and since_iso <= (o.get("updated_at") or o.get("created_at") or "")[:19] <= until_iso
+    ]
+    if not relevant:
+        return {"total": 0, "count": 0, "clients": 0, "top_products": []}
+
+    items_by_order = get_order_items_by_ids([o["id"] for o in relevant])
 
     total = 0.0
     count = 0
     clients: set[str] = set()
     products_agg: dict[str, dict] = {}
 
-    for o in orders:
-        if o["status"] not in ("approved", "shipped"):
-            continue
-        ts = (o.get("updated_at") or o.get("created_at") or "")[:19]
-        if ts < since_iso or ts > until_iso:
-            continue
-        items = get_order_items(o["id"])
+    for o in relevant:
+        items = items_by_order.get(o["id"], [])
         order_sum = sum(
             float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
             for it in items
