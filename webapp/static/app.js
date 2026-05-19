@@ -293,11 +293,11 @@ async function renderHome() {
           <div class="stat-label">📝 Черновики</div>
         </div>
         <div class="stat">
-          <div class="stat-value">${mo.pending}</div>
+          <div class="stat-value ${mo.pending > 0 ? 'stat-value-amber' : ''}">${mo.pending}</div>
           <div class="stat-label">⏳ Ожидают</div>
         </div>
         <div class="stat">
-          <div class="stat-value">${mo.approved}</div>
+          <div class="stat-value ${mo.approved > 0 ? 'stat-value-green' : ''}">${mo.approved}</div>
           <div class="stat-label">✅ Одобрено</div>
         </div>
       </div>
@@ -306,7 +306,7 @@ async function renderHome() {
       <div class="card-list">
         ${mo.recent.map(o => `
           <div class="card-row" data-order-id="${o.id}">
-            <div class="card-row-icon">${STATUS_EMOJI[o.status] || '📋'}</div>
+            <div class="card-row-icon icon-${o.status}">${STATUS_EMOJI[o.status] || '📋'}</div>
             <div class="card-row-info">
               <div class="card-row-title">Заказ #${o.id}${o.agent_name ? ' · ' + escapeHtml(o.agent_name) : ''}</div>
               <div class="card-row-sub">${o.created_at}</div>
