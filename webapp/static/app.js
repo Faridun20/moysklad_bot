@@ -3,6 +3,17 @@ const tg = window.Telegram.WebApp;
 tg.ready();
 tg.expand();
 
+// initData живёт в URL-хэше — теряется при reload/навигации.
+// Кэшируем в sessionStorage: переживает SPA-переходы, но не закрытие вкладки.
+// Данные всё равно проверяются подписью + auth_date на сервере.
+const _SESSION_KEY = 'tg_init_data';
+let _initData = tg.initData || '';
+if (_initData) {
+  sessionStorage.setItem(_SESSION_KEY, _initData);
+} else {
+  _initData = sessionStorage.getItem(_SESSION_KEY) || '';
+}
+
 // Состояние приложения
 let currentUser = null;
 let currentScreen = 'home';
@@ -21,11 +32,11 @@ async function init() {
     const response = await fetch('/api/me', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData: tg.initData }),
+      body: JSON.stringify({ initData: _initData }),
     });
 
     if (response.status === 401) {
-      const isEmpty = !tg.initData;
+      const isEmpty = !_initData;
       document.getElementById('content').innerHTML = `
         <div class="error-card">
           <div class="error-icon">🔐</div>
@@ -172,7 +183,7 @@ async function renderHome() {
     const r = await fetch('/api/home', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData: tg.initData }),
+      body: JSON.stringify({ initData: _initData }),
     });
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
@@ -364,7 +375,7 @@ async function renderStock() {
       const r = await fetch('/api/stock', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ initData: tg.initData }),
+        body: JSON.stringify({ initData: _initData }),
       });
       if (!r.ok) {
         const err = await r.json().catch(() => ({}));
@@ -483,7 +494,7 @@ async function api(path, body) {
   const r = await fetch(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ initData: tg.initData, ...body }),
+    body: JSON.stringify({ initData: _initData, ...body }),
   });
   if (!r.ok) throw new Error((await r.json()).detail || 'Ошибка');
   return r.json();
@@ -1177,7 +1188,7 @@ async function renderAnalytics() {
     const response = await fetch('/api/analytics', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData: tg.initData, period: analyticsPeriod }),
+      body: JSON.stringify({ initData: _initData, period: analyticsPeriod }),
     });
     if (!response.ok) {
       const err = await response.json();
@@ -1284,7 +1295,7 @@ async function renderPayments(container) {
     const response = await fetch('/api/payments/history', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData: tg.initData }),
+      body: JSON.stringify({ initData: _initData }),
     });
     if (!response.ok) {
       const err = await response.json();
@@ -1385,7 +1396,7 @@ function renderPaymentsContent(container) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          initData: tg.initData,
+          initData: _initData,
           amount, currency: selectedCurrency, comment,
         }),
       });
