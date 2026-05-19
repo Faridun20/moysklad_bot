@@ -531,6 +531,10 @@ tests/
 | Low (PAGE_SIZE) | вынесен в config.PAGE_SIZE | [f86ad7a](https://github.com/Faridun20/moysklad_bot/commit/f86ad7a) |
 | Low (_migrate dead code) | удалён | round 1 |
 | Low (asyncpg unused) | удалён из requirements.txt | round 1 |
+| Low (audit/log dup) | format_log_entry удалён, общий format_audit_entry + chunk_messages | [d4e474f](https://github.com/Faridun20/moysklad_bot/commit/d4e474f) |
+| Low (cache forever) | _read_index_html keys cache by mtime | [d4e474f](https://github.com/Faridun20/moysklad_bot/commit/d4e474f) |
+| Low (dual reports) | warning при ENABLE_SCHEDULED_REPORTS unset + Railway | [d4e474f](https://github.com/Faridun20/moysklad_bot/commit/d4e474f) |
+| Low (type hints) | type annotations на add_payment и публичные DB-функции | [d4e474f](https://github.com/Faridun20/moysklad_bot/commit/d4e474f) |
 | Tests + CI | pytest + GitHub Actions | round 1 |
 
 ## История изменений этого документа
@@ -540,3 +544,4 @@ tests/
 | 2026-05-19 | Первоначальный аудит | Claude (general-purpose agent) |
 | 2026-05-19 | Раунд 1 фиксов: 3 Critical, тесты+CI, payment races, HTML escape | Claude |
 | 2026-05-19 | Раунд 2 фиксов: H4-H7, H11, TZ, idempotency, dedup, sync→async, PAGE_SIZE | Claude |
+| 2026-05-19 | Раунд 3: audit/log dedup, cache mtime, type hints, dual-reports warning | Claude |
