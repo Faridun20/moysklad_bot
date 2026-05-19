@@ -22,12 +22,9 @@ except ImportError:
 ALLOWED_CURRENCIES = ("USD", "UZS", "RUB", "EUR")
 
 
-def _esc(s) -> str:
-    """HTML-escape для пользовательских строк перед вставкой в bot-сообщения
-    с parse_mode='HTML'. Имя товара/клиента/менеджера может прилететь с
-    `<` или `&` (например, через UI МойСклад), и без escape сообщение
-    либо ломалось бы, либо открывало путь к HTML-инъекции."""
-    return html.escape(str(s or ""), quote=False)
+# Единая реализация в utils.helpers.esc — оставлен _esc-алиас чтобы
+# не править каждый callsite в этом большом файле.
+from utils.helpers import esc as _esc  # noqa: E402
 
 
 def _cur(amount: float, currency: str | None = None) -> str:
@@ -282,9 +279,14 @@ async def cmd_new_order(message: Message):
 
     user = message.from_user
     full_name = user.full_name or user.username or str(user.id)
-    order_id = create_order(user.id, full_name)
+    # sync DB-вызов в async handler без to_thread блокирует event loop.
+    # На bot-сервисе нагрузка низкая, но при усилении пользователей
+    # начнёт лагать. to_thread сразу делает это безопасным.
+    import asyncio as _asyncio
+    order_id = await _asyncio.to_thread(create_order, user.id, full_name)
 
-    add_audit_log(
+    await _asyncio.to_thread(
+        add_audit_log,
         user.id, full_name, get_role(user.id),
         "order_created", f"Создан заказ #{order_id}",
     )
@@ -306,14 +308,19 @@ async def cmd_my_orders(message: Message):
     if not can_create_orders(message.from_user.id):
         return await message.answer("⛔ Нет доступа.")
 
-    orders = get_user_orders(message.from_user.id)
+    import asyncio as _asyncio
+    orders = await _asyncio.to_thread(get_user_orders, message.from_user.id)
     if not orders:
         kb = InlineKeyboardBuilder()
-        kb.button(text="➕ Создать заказ", callback_data="ord_new")
-        kb.button(text="🏠 Меню",          callback_data="menu")
+        kb.button(text="➕ Создать первый заказ", callback_data="ord_new")
         kb.adjust(1)
         return await message.answer(
-            "📋 У вас пока нет заказов.",
+            "📋 <b>У вас пока нет заказов</b>\n\n"
+            "Самый удобный способ собрать заказ — открыть WebApp:\n"
+            "выберите товары, клиента и отправьте на одобрение.\n\n"
+            "🌐 Кнопка «Открыть» снизу чата.\n"
+            "Или быстро создать заказ через бота — кнопкой ниже.",
+            parse_mode="HTML",
             reply_markup=kb.as_markup(),
         )
 
@@ -329,7 +336,8 @@ async def cmd_orders(message: Message):
     if not is_boss(message.from_user.id):
         return await message.answer("⛔ Нет доступа.")
 
-    requests = get_pending_requests()
+    import asyncio as _asyncio
+    requests = await _asyncio.to_thread(get_pending_requests)
     if not requests:
         return await message.answer(
             f"{DIV}\n⏳ <b>Заявки на отгрузку</b>\n\n<i>Нет новых заявок</i>",
@@ -920,7 +928,18 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
                 set_order_ms_customerorder_id, set_order_ms_demand_id,
             )
             co_id = co_result.get("customerorder_id")
+            # Audit СРАЗУ после успешного POST в МойСклад — до того
+            # как мы пытаемся сохранить co_id в БД. SECURITY.md H6:
+            # если бот упадёт между POST и UPDATE (OOM/kill/network),
+            # без этого audit-записи orphan-CO в МойСклад будет
+            # никак не найти. С audit-записью админ ищет в логах
+            # `ms_co_created` и привязывает вручную.
             if co_id:
+                add_audit_log(
+                    call.from_user.id, boss_name, get_role(call.from_user.id),
+                    "ms_co_created",
+                    f"Заявка #{req_id} → customerorder {co_id} (до db-write)",
+                )
                 set_order_ms_customerorder_id(order["id"], co_id)
 
             # PDF берём от customerorder — он содержит читаемую форму заказа
@@ -943,7 +962,13 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
             )
             if demand_result.get("ok"):
                 demand_id = demand_result.get("demand_id")
+                # Audit ДО db-write (H6) — см. комментарий выше для CO.
                 if demand_id:
+                    add_audit_log(
+                        call.from_user.id, boss_name, get_role(call.from_user.id),
+                        "ms_demand_created",
+                        f"Заявка #{req_id} → demand {demand_id} (до db-write)",
+                    )
                     set_order_ms_demand_id(order["id"], demand_id)
                 demand_line = (
                     f"\n📄 Заказ покупателя создан в МойСклад"

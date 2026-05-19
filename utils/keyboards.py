@@ -4,7 +4,7 @@
 
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-PAGE_SIZE = 10
+from config import PAGE_SIZE  # единый источник в config
 
 
 def main_keyboard():

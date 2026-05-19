@@ -11,7 +11,7 @@ from aiogram.types import Message, CallbackQuery
 
 from services.roles import can_view_stock
 from services.moysklad import get_shipments, get_shipment_positions
-from utils.helpers import extract_id_from_href, user_safe_error
+from utils.helpers import extract_id_from_href, user_safe_error, utc_now
 from utils.formatters import format_shipment
 from utils.keyboards import (
     period_keyboard,
@@ -62,7 +62,7 @@ async def cb_shipments_period(call: CallbackQuery, bot: Bot):
     await call.answer()
 
     period = call.data.split(":")[1]
-    now = datetime.utcnow()
+    now = utc_now()
 
     if period == "today":
         since = now.replace(hour=0, minute=0, second=0, microsecond=0)

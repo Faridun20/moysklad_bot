@@ -19,10 +19,10 @@ from utils.helpers import extract_id_from_href, extract_href, user_safe_error
 from utils.formatters import format_stock_page
 from utils.keyboards import stock_nav_keyboard, categories_keyboard, main_keyboard
 
+from config import PAGE_SIZE  # единый источник, переопределяется env
+
 logger = logging.getLogger(__name__)
 router = Router()
-
-PAGE_SIZE = 10
 
 # TTL-кэши в памяти (на чат). Чистятся ленивым GC при превышении лимита.
 _CATEGORIES_TTL = 300.0   # 5 мин — категории редко меняются

@@ -16,7 +16,7 @@ from tasks.scheduled import build_sales_and_stock_report, get_stock_report_data
 from config import ADMIN_IDS
 from services.moysklad import get_all_stock, get_sales_stats
 from services.roles import can_manage_users, is_boss
-from utils.helpers import format_price, trend_arrow, extract_id_from_href, user_safe_error
+from utils.helpers import format_price, trend_arrow, extract_id_from_href, user_safe_error, utc_now
 from utils.formatters import format_sales_report, format_stock_report
 from services.database import get_role
 
@@ -61,7 +61,7 @@ async def cb_report(call: CallbackQuery, bot: Bot):
     await call.answer()
 
     period = call.data.split(":")[1]
-    now = datetime.utcnow()
+    now = utc_now()
 
     if period == "stock":
         await call.message.answer("⏳ Анализирую остатки…")

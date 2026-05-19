@@ -31,6 +31,7 @@ from config import TELEGRAM_TOKEN
 from services.database import init_db
 from services.moysklad import close_session
 from services.notifier import close_tg_session
+from utils.helpers import utc_now
 from tasks.scheduled import (
     MONTH_NAMES,
     build_sales_and_stock_report,
@@ -46,7 +47,7 @@ logger = logging.getLogger("run_report")
 
 async def _daily(bot: Bot) -> None:
     """Отчёт за вчерашний полный день."""
-    now = datetime.utcnow()
+    now = utc_now()
     since = (now - timedelta(days=1)).replace(
         hour=0, minute=0, second=0, microsecond=0,
     )
@@ -63,7 +64,7 @@ async def _daily(bot: Bot) -> None:
 
 async def _weekly(bot: Bot) -> None:
     """Отчёт за прошедшие 7 дней."""
-    now = datetime.utcnow()
+    now = utc_now()
     since = now - timedelta(days=7)
     prev_since = since - timedelta(days=7)
 
@@ -77,7 +78,7 @@ async def _weekly(bot: Bot) -> None:
 
 async def _monthly(bot: Bot) -> None:
     """Отчёт за прошедший календарный месяц."""
-    now = datetime.utcnow()
+    now = utc_now()
     first_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     if first_this.month == 1:
         first_prev = first_this.replace(year=first_this.year - 1, month=12)

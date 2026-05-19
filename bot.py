@@ -139,6 +139,20 @@ def start_background_tasks(bot: Bot) -> list[asyncio.Task]:
         snapshot._stock_debounce_loop(),
     ]
     if ENABLE_SCHEDULED_REPORTS:
+        # SECURITY.md Medium: предупреждаем при подозрении на дубли.
+        # Если в проекте есть Cron-сервисы (`cron-daily`/etc) — ENABLE
+        # должен быть 0, иначе отчёты улетают дважды. Точного API
+        # «есть ли cron-сервис» нет, проверяем мягкий heuristic:
+        # наличие RAILWAY-окружения + дефолтное значение env.
+        import os as _os
+        if _os.environ.get("RAILWAY_ENVIRONMENT") and \
+           _os.environ.get("ENABLE_SCHEDULED_REPORTS") is None:
+            logger.warning(
+                "ENABLE_SCHEDULED_REPORTS не задан явно в Railway. Если "
+                "у тебя есть отдельные cron-сервисы (cron-daily/weekly/"
+                "monthly) — поставь ENABLE_SCHEDULED_REPORTS=0 чтобы "
+                "отчёты не дублировались."
+            )
         coros.extend([
             daily_report_task(bot),
             weekly_report_task(bot),
@@ -381,6 +395,18 @@ async def main():
             stop_event = asyncio.Event()
             await stop_event.wait()
         else:
+            # Принудительно снимаем webhook перед polling. Если на
+            # Telegram-стороне остался webhook от предыдущего запуска
+            # (например, был включён TG_USE_WEBHOOK, потом переключили
+            # на polling) — getUpdates даёт TelegramConflictError, и
+            # бот зависает в бесконечном retry-loop. delete_webhook
+            # идемпотентно и безопасно: на «чистом» боте ничего не
+            # ломает.
+            try:
+                await bot.delete_webhook(drop_pending_updates=False)
+                logger.info("Перед polling сняли webhook (если был установлен)")
+            except Exception as e:
+                logger.warning("delete_webhook перед polling упал: %s", e)
             await dp.start_polling(bot)
     finally:
         if use_webhook:

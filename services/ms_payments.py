@@ -32,8 +32,9 @@ from typing import Any
 
 from services.database import (
     get_order, get_payment, set_payment_ms_sync,
+    claim_payment_for_ms_sync,
 )
-from services.moysklad import MS_BASE, get_session, ms_get
+from services.moysklad import MS_BASE, get_session, ms_get, redact_ms_error
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,16 @@ async def create_paymentin_for_payment(payment_id: int) -> dict:
             "already": True,
         }
 
+    # Атомарно «застолбили» платёж — кто-то другой между чтением и
+    # этой проверкой мог уже начать syncать. UPDATE-WHERE-not-in-progress
+    # возвращает True только тому, кто выиграл гонку.
+    if not claim_payment_for_ms_sync(payment_id):
+        return {
+            "ok": False,
+            "reason": "concurrent sync already in progress",
+            "concurrent": True,
+        }
+
     order = get_order(payment["order_id"])
     if not order:
         msg = "Заказ-родитель не найден"
@@ -152,7 +163,8 @@ async def create_paymentin_for_payment(payment_id: int) -> dict:
         async with sess.post(f"{MS_BASE}/entity/paymentin", json=payload) as resp:
             body = await resp.text()
             if resp.status >= 400:
-                err = f"HTTP {resp.status}: {body[:250]}"
+                # redact_ms_error выкидывает PII из МС-body перед логом
+                err = f"HTTP {resp.status}: {redact_ms_error(body)}"
                 logger.error("MS paymentin failed: %s", err)
                 set_payment_ms_sync(payment_id, status="failed", error=err)
                 return {"ok": False, "reason": err}

@@ -8,7 +8,6 @@ from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 
-from config import ADMIN_IDS
 from services.database import set_role, get_role, get_all_users, add_audit_log
 from services.roles import can_manage_users, invalidate_role
 
@@ -36,7 +35,7 @@ async def cmd_addrole(message: Message):
         return await message.answer(
             "❌ Формат: <code>/addrole [user_id] [роль]</code>\n\n"
             "Роли: <code>admin</code>, <code>boss</code>, "
-            "<code>manager</code>, <code>employee</code>\n\n"
+            "<code>manager</code>, <code>guest</code>\n\n"
             "Пример: <code>/addrole 123456789 manager</code>",
             parse_mode="HTML",
         )
@@ -46,13 +45,22 @@ async def cmd_addrole(message: Message):
     except ValueError:
         return await message.answer("❌ User ID должен быть числом.")
 
+    # Whitelist должен совпадать с services.database.set_role.
+    # Раньше тут принимали 'employee', но set_role его молча отвергал,
+    # и юзер оставался в прежней роли при «✅ назначено»-сообщении.
     role = parts[2].lower()
-    if role not in ("admin", "boss", "manager", "employee"):
+    VALID_ROLES = ("admin", "boss", "manager", "guest")
+    if role not in VALID_ROLES:
         return await message.answer(
-            "❌ Роль должна быть: admin, boss, manager или employee"
+            f"❌ Роль должна быть одной из: {', '.join(VALID_ROLES)}"
         )
 
-    set_role(target_id, "", "", role)
+    ok = set_role(target_id, "", "", role)
+    if not ok:
+        # Сюда можно попасть если БД отвалилась — set_role вернул False.
+        return await message.answer(
+            "❌ Не удалось назначить роль. Проверьте логи бота."
+        )
     invalidate_role(target_id)
 
     admin_name = message.from_user.full_name or str(message.from_user.id)

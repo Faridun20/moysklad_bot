@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 from utils.formatters import format_audit_entry
+from utils.helpers import chunk_messages, filter_records_by_period
 
 PERIOD_LABELS = {
     "today": "сегодня",
@@ -27,7 +28,9 @@ PERIOD_LABELS = {
 
 
 def format_audit_log(records: list[dict], label: str) -> list[str]:
-    """Возвращает список сообщений (разбитых по 4000 символов)."""
+    """Возвращает список сообщений (разбитых по TELEGRAM_MESSAGE_MAX).
+    chunk_messages в utils.helpers — единая реализация склейки
+    (раньше дублировалась в handlers/log.py:send_log)."""
     if not records:
         return [f"📋 Нет действий за {label}."]
 
@@ -36,38 +39,13 @@ def format_audit_log(records: list[dict], label: str) -> list[str]:
         f"📋 <b>Аудит лог · {label}</b>\n"
         f"<code>Записей: {len(records)}</code>\n"
     )
+    lines = [header] + [format_audit_entry(r) for r in records]
+    return chunk_messages(lines)
 
-    lines = [header]
-    for r in records:
-        lines.append(format_audit_entry(r))
 
-    # Разбиваем на части по 4000 символов
-    messages = []
-    current = ""
-    for line in lines:
-        if len(current) + len(line) + 1 > 4000:
-            messages.append(current)
-            current = line
-        else:
-            current += "\n" + line if current else line
-    if current:
-        messages.append(current)
-
-    return messages
-
-def filter_by_period(records: list[dict], period: str) -> list[dict]:
-    now = datetime.now()
-    if period == "today":
-        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    elif period == "week":
-        cutoff = now - timedelta(weeks=1)
-    elif period == "month":
-        cutoff = now - timedelta(days=30)
-    else:
-        return records
-
-    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
-    return [r for r in records if r["created_at"] >= cutoff_str]
+# Обратная совместимость: импортирующие `filter_by_period` из audit.py
+# продолжат работать. Сама реализация теперь в utils.helpers.
+filter_by_period = filter_records_by_period
 
 def audit_keyboard():
     kb = InlineKeyboardBuilder()

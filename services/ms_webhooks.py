@@ -37,18 +37,36 @@ SUBSCRIPTIONS = [
 
 
 def get_webhook_secret() -> str:
-    """Секрет для URL вебхука. Берётся из env, иначе генерируется
-    случайный (только для локальной разработки — на проде задайте env)."""
+    """Секрет для URL вебхука МойСклад.
+
+    Поведение:
+      - prod (детектится по наличию DATABASE_URL — на Railway он всегда
+        прописан) + MS_WEBHOOK_SECRET пустой → RuntimeError на старте.
+        Иначе bot и webapp в разных контейнерах сгенерили бы РАЗНЫЕ
+        ephemeral-секреты: подписки регистрируются с одним, проверяются
+        другим → 404 на webhook'и от МойСклад, никто не замечает что
+        обновления остатков перестали приходить.
+      - dev (DATABASE_URL пустой, локальный SQLite) → ephemeral
+        random-secret, OK для разработки.
+    """
     secret = os.environ.get("MS_WEBHOOK_SECRET", "").strip()
     if secret:
         return secret
-    # Fallback — стабильно случайный на время процесса
+    if os.environ.get("DATABASE_URL", "").strip():
+        # Production-окружение — random секрет недопустим, fail fast
+        raise RuntimeError(
+            "MS_WEBHOOK_SECRET не задан в production-окружении (DATABASE_URL "
+            "присутствует). При нескольких процессах (bot + webapp) ephemeral "
+            "fallback приводит к split-brain: подписки МойСклад не работают. "
+            "Задайте MS_WEBHOOK_SECRET в Railway Shared Variables (32+ "
+            "случайных символов)."
+        )
     if not hasattr(get_webhook_secret, "_cached"):
         get_webhook_secret._cached = _secrets.token_urlsafe(24)
         logger.warning(
-            "MS_WEBHOOK_SECRET не задан в env. Сгенерирован временный секрет — "
-            "после рестарта вебхуки придётся перерегистрировать. "
-            "Установите MS_WEBHOOK_SECRET в Railway."
+            "MS_WEBHOOK_SECRET не задан в env (dev-окружение). "
+            "Сгенерирован временный секрет — после рестарта подписки МойСклад "
+            "придётся перерегистрировать."
         )
     return get_webhook_secret._cached
 

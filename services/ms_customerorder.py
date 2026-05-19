@@ -21,7 +21,7 @@ from typing import Any
 
 from services import ms_demand
 from services.moysklad import MS_BASE, get_session, ms_get
-from utils.helpers import extract_id_from_href
+from utils.helpers import extract_id_from_href, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -264,7 +264,7 @@ async def create_customerorder_from_request(
         "organization": _meta(ms_demand._CTX["org_meta"]["href"], "organization"),
         "agent": _meta(agent_href, "counterparty"),
         "positions": positions,
-        "moment": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.000"),
+        "moment": utc_now().strftime("%Y-%m-%d %H:%M:%S.000"),
         "description": ms_demand._build_description(order, telegram_full_name),
         # applicable=True — заказ проведён (а не draft). Остатков НЕ
         # касается, в отличие от demand.
@@ -300,13 +300,14 @@ async def create_customerorder_from_request(
         ) as resp:
             body = await resp.text()
             if resp.status >= 400:
+                from services.moysklad import redact_ms_error
+                safe = redact_ms_error(body)
                 logger.error(
-                    "MS create customerorder HTTP %s: %s",
-                    resp.status, body[:500],
+                    "MS create customerorder HTTP %s: %s", resp.status, safe,
                 )
                 return {
                     "ok": False,
-                    "reason": f"HTTP {resp.status}: {body[:250]}",
+                    "reason": f"HTTP {resp.status}: {safe}",
                 }
             created = json.loads(body)
             co_id = created.get("id", "")

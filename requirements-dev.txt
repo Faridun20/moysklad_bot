@@ -1,0 +1,4 @@
+# Тестовые/dev-only зависимости. CI ставит вручную (см. .github/workflows/ci.yml);
+# локально: pip install -r requirements.txt -r requirements-dev.txt
+pytest>=8.0
+ruff>=0.5

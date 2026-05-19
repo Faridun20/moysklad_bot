@@ -151,6 +151,32 @@ def _invalidate_role_cache(user_id: int) -> None:
 
 
 def init_db():
+    """Гарантирует что схема существует. Безопасно вызывать из любого
+    процесса при старте — все DDL идут через `CREATE TABLE IF NOT EXISTS`.
+
+    ВНИМАНИЕ: миграции (ALTER TABLE ADD COLUMN), backfill'ы и recovery —
+    больше НЕ часть init_db. Они вынесены в `tasks/migrate.py` и должны
+    запускаться отдельным процессом ПЕРЕД стартом bot/webapp/cron.
+    Это закрывает H4: при rolling deploy нескольких процессов ALTER
+    TABLE гонялся одновременно и DDL/UPDATE recovery конфликтовали.
+
+    Если ты разрабатываешь локально (свежая SQLite-БД) — init_db
+    достаточно: миграции применяются к свежей схеме сразу через
+    CREATE TABLE с полным списком колонок.
+
+    Для прод-старта используй: `python -m tasks.migrate` перед
+    `python bot.py`. На Railway: `tasks/migrate.py` в pre-start
+    команде сервиса, или отдельный Cron Job «one-shot».
+    """
+    _create_tables()
+    _create_indexes()
+    _load_predefined_users()
+    logger.info("База данных инициализирована (CREATE TABLE only)")
+
+
+def _create_tables():
+    """Только CREATE TABLE IF NOT EXISTS. Idempotent, безопасен
+    при concurrent старте."""
     with get_conn() as conn:
         cur = get_cursor(conn)
         id_type = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
@@ -167,17 +193,20 @@ def init_db():
             )""",
 
             f"""CREATE TABLE IF NOT EXISTS payments (
-                id           {id_type},
-                user_id      BIGINT NOT NULL,
-                username     TEXT,
-                full_name    TEXT,
-                amount       REAL NOT NULL,
-                currency     TEXT NOT NULL DEFAULT 'USD',
-                comment      TEXT,
-                status       TEXT NOT NULL DEFAULT 'pending',
-                order_id     BIGINT,
-                created_at   TEXT NOT NULL,
-                confirmed_at TEXT
+                id              {id_type},
+                user_id         BIGINT NOT NULL,
+                username        TEXT,
+                full_name       TEXT,
+                amount          REAL NOT NULL,
+                currency        TEXT NOT NULL DEFAULT 'USD',
+                comment         TEXT,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                order_id        BIGINT,
+                ms_paymentin_id TEXT,
+                ms_sync_status  TEXT,
+                ms_sync_error   TEXT,
+                created_at      TEXT NOT NULL,
+                confirmed_at    TEXT
             )""",
 
             f"""CREATE TABLE IF NOT EXISTS audit_log (
@@ -205,6 +234,8 @@ def init_db():
                 paid_confirmed_at       TEXT,
                 paid_confirmed_by       BIGINT,
                 paid_confirmed_by_name  TEXT,
+                ms_demand_id            TEXT,
+                ms_customerorder_id     TEXT,
                 created_at              TEXT NOT NULL,
                 updated_at              TEXT NOT NULL
             )""",
@@ -301,7 +332,53 @@ def init_db():
                 conn.rollback()
                 logger.warning("Таблица уже существует или ошибка: %s", e)
 
-        # Миграции в отдельных транзакциях
+
+def _create_indexes():
+    """CREATE INDEX IF NOT EXISTS — idempotent. Можно гонять при каждом
+    старте, postgres и sqlite оба корректно работают."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        snapshot_indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_ms_products_folder ON ms_products(folder_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ms_stock_folder ON ms_stock(folder_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ms_categories_parent ON ms_categories(parent_id)",
+            # Каждое утреннее уведомление о долгах сканирует все credit-заказы
+            # с paid_at IS NULL. Без индекса — full scan по orders, при тысячах
+            # записей это секунды. Составной индекс покрывает фильтр и сортировку.
+            "CREATE INDEX IF NOT EXISTS idx_orders_credit_due ON orders(payment_type, paid_at, due_date)",
+            # Для запросов «все платежи по заказу» — без него полный скан payments.
+            "CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id)",
+            # Уникальность paymentin'ов в МойСклад. Спасает от race condition
+            # между cron-retry и confirm-hook: если оба попробуют создать
+            # paymentin для одного платежа, второй INSERT упадёт на UNIQUE
+            # constraint, а не наплодит дубликаты в МойСклад. Partial index —
+            # чтобы NULL'ы (ещё не синхронизированные) не конфликтовали.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_ms_paymentin_unique "
+            "ON payments(ms_paymentin_id) WHERE ms_paymentin_id IS NOT NULL",
+        ]
+        for sql in snapshot_indexes:
+            try:
+                cur.execute(sql)
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.debug("Индекс не создан: %s", e)
+
+
+def run_migrations():
+    """ALTER TABLE ADD COLUMN — догоняем старые БД до текущей схемы.
+
+    ВЫНЕСЕНО ИЗ init_db (SECURITY.md H4): раньше эти ALTER гонялись на
+    каждом старте каждого процесса. При rolling deploy bot+webapp одно-
+    временные DDL вступали в race с UPDATE-запросами от уже работающих
+    транзакций. Теперь: вызывается явно из `tasks/migrate.py` перед
+    стартом сервисов.
+
+    Идемпотентно: ADD COLUMN если колонка уже есть → SQL ошибка,
+    мы её ловим и идём дальше.
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
         migrations = [
             ("user_roles", "moysklad_employee_id", "TEXT"),
             ("user_roles", "ms_sync_status", "TEXT DEFAULT 'pending'"),
@@ -361,45 +438,32 @@ def init_db():
             ("payments", "ms_sync_status", "TEXT"),
             ("payments", "ms_sync_error",  "TEXT"),
         ]
+        applied = 0
         for table, column, col_type in migrations:
             try:
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
                 conn.commit()
+                applied += 1
             except Exception:
                 conn.rollback()  # Колонка уже существует — норм
+        logger.info("run_migrations: применено %d из %d", applied, len(migrations))
 
-        # Индексы для snapshot-таблиц + поиска долгов
-        snapshot_indexes = [
-            "CREATE INDEX IF NOT EXISTS idx_ms_products_folder ON ms_products(folder_id)",
-            "CREATE INDEX IF NOT EXISTS idx_ms_stock_folder ON ms_stock(folder_id)",
-            "CREATE INDEX IF NOT EXISTS idx_ms_categories_parent ON ms_categories(parent_id)",
-            # Каждое утреннее уведомление о долгах сканирует все credit-заказы
-            # с paid_at IS NULL. Без индекса — full scan по orders, при тысячах
-            # записей это секунды. Составной индекс покрывает фильтр и сортировку.
-            "CREATE INDEX IF NOT EXISTS idx_orders_credit_due ON orders(payment_type, paid_at, due_date)",
-            # Для запросов «все платежи по заказу» — без него полный скан payments.
-            "CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id)",
-        ]
-        for sql in snapshot_indexes:
-            try:
-                cur.execute(sql)
-                conn.commit()
-            except Exception as e:
-                conn.rollback()
-                logger.debug("Индекс не создан: %s", e)
 
-        # ─── Backfill для подтверждений оплаты (только legacy) ────────
-        # Когда был добавлен двухступенчатый workflow (paid_at →
-        # paid_confirmed_at), нужно было закрыть исторические долги:
-        # для них paid_at = «полностью оплачено», и без backfill они бы
-        # повисли «требуют подтверждения».
-        #
-        # ВАЖНО: после добавления частичных платежей `paid_at` стал
-        # значить «менеджер отметил ХОТЯ БЫ ОДИН платёж», а не «всё
-        # закрыто». Если бы мы backfill'или такие заказы, частичные
-        # долги исчезали бы из списка после каждого редеплоя. Поэтому
-        # backfill теперь применяется ТОЛЬКО к legacy-заказам, у которых
-        # вообще нет записей в payments — они точно из старой эпохи.
+def run_backfills():
+    """Одноразовые data-миграции. Идемпотентны.
+
+    1. Закрыть legacy-долги (paid_at стоит, payments записей нет —
+       значит это до partial-payments эпохи): paid_confirmed_at = paid_at.
+    2. Recovery от старого backfill-бага: если paid_confirmed_at стоит,
+       но сумма confirmed payments меньше total, сбросить confirmed_at
+       обратно в NULL.
+
+    Запускается из `tasks/migrate.py`. НЕ из init_db — этот код пишет
+    данные, не должен бежать при каждом старте сервиса.
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        # ── Backfill legacy ──────────────────────────────────────────
         try:
             cur.execute(
                 "UPDATE orders "
@@ -419,12 +483,7 @@ def init_db():
             conn.rollback()
             logger.warning("Backfill paid_confirmed: %s", e)
 
-        # ─── Recovery: восстановить долги, ошибочно закрытые старым backfill'ом ──
-        # Заказы где paid_confirmed_at стоит, но фактически сумма confirmed
-        # платежей < total заказа — backfill сработал ошибочно (см. выше).
-        # Откатываем paid_confirmed_at в NULL, долг возвращается в список.
-        # Запросом обходим оба драйвера (Postgres и SQLite оба понимают
-        # скалярные subqueries).
+        # ── Recovery ─────────────────────────────────────────────────
         try:
             cur.execute(
                 "UPDATE orders "
@@ -453,23 +512,6 @@ def init_db():
             conn.rollback()
             logger.warning("Recovery paid_confirmed: %s", e)
 
-    logger.info("База данных инициализирована")
-    _load_predefined_users()
-
-
-
-def _migrate(cur):
-    """Добавляем новые колонки в существующие таблицы."""
-    migrations = [
-        ("user_roles", "moysklad_employee_id", "TEXT"),
-        ("user_roles", "ms_sync_status", "TEXT DEFAULT 'pending'"),
-        ("user_roles", "created_at", "TEXT"),
-    ]
-    for table, column, col_type in migrations:
-        try:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
-        except Exception:
-            pass  # Колонка уже существует
 
 
 # ─── Роли ────────────────────────────────────────────────────────────────────
@@ -548,13 +590,14 @@ def ensure_user(user_id: int, username: str, full_name: str, admin_ids: list[int
       - В ADMIN_IDS  → admin
       - В BOSS_IDS   → boss
       - В ALLOWED_USERS (если этот env задан) → manager
-      - Если ALLOWED_USERS НЕ задан (пустой) → manager (backward compat)
-      - Иначе → guest (нулевые права, нужно повысить через /addrole)
+      - Иначе → guest (нулевые права, админ повышает через /addrole)
 
-    Раньше всем по умолчанию ставили 'manager' — это открывало бот любому
-    Telegram-юзеру, который найдёт его @username.
+    Опасный legacy-режим: LEGACY_OPEN_BOT=1 + ALLOWED_USERS пуст →
+    любой новичок получает manager. Это эквивалент «открытый бот»
+    и существует только для обратной совместимости со старыми
+    развёртками. На продакшене НЕ включать.
     """
-    from config import BOSS_IDS, ALLOWED_USERS
+    from config import BOSS_IDS, ALLOWED_USERS, LEGACY_OPEN_BOT
 
     with get_conn() as conn:
         cur = get_cursor(conn)
@@ -575,9 +618,15 @@ def ensure_user(user_id: int, username: str, full_name: str, admin_ids: list[int
             role = "boss"
         elif ALLOWED_USERS and user_id in ALLOWED_USERS:
             role = "manager"
-        elif not ALLOWED_USERS:
-            # Whitelist не настроен — оставляем старое поведение,
-            # чтобы не сломать существующие развёртки одним deploy-ом.
+        elif LEGACY_OPEN_BOT and not ALLOWED_USERS:
+            # Эта ветка только для legacy-развёрток. Громко логируем,
+            # чтобы оператор увидел в Railway logs что бот открыт всему миру.
+            logger.warning(
+                "LEGACY_OPEN_BOT=1 + ALLOWED_USERS пуст: user_id=%s "
+                "получил роль 'manager' автоматически. На проде смените "
+                "поведение: убрать LEGACY_OPEN_BOT и/или заполнить ALLOWED_USERS.",
+                user_id,
+            )
             role = "manager"
         else:
             role = "guest"
@@ -650,7 +699,12 @@ def remove_user(user_id: int, removed_by: int = None, removed_name: str = "") ->
 
 
 def add_payment(
-    user_id, username, full_name, amount, currency, comment,
+    user_id: int,
+    username: str,
+    full_name: str,
+    amount: float,
+    currency: str,
+    comment: str,
     order_id: int | None = None,
 ) -> int:
     """Создать запись о платеже. Если задан order_id — это «оплата по
@@ -690,16 +744,21 @@ def get_payments_for_order(order_id: int) -> list[dict]:
 
 def get_payments_for_orders(order_ids: list[int]) -> dict[int, list[dict]]:
     """Батч-версия: {order_id: [payments...]}. Заказы без платежей в
-    результат не попадают; вызывающий должен использовать .get(oid, [])."""
+    результат не попадают; вызывающий должен использовать .get(oid, []).
+
+    Дедуплицируем order_ids — если caller передал список с повторами,
+    placeholders разрастаются впустую и план запроса страдает.
+    """
     if not order_ids:
         return {}
-    placeholders = ",".join(["?"] * len(order_ids))
+    unique_ids = list(set(order_ids))
+    placeholders = ",".join(["?"] * len(unique_ids))
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
             q(f"SELECT * FROM payments WHERE order_id IN ({placeholders}) "
               f"ORDER BY created_at ASC"),
-            list(order_ids),
+            unique_ids,
         )
         rows = cur.fetchall()
     grouped: dict[int, list[dict]] = {}
@@ -841,6 +900,39 @@ def get_recent_ms_sync_failures(limit: int = 5) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+def claim_payment_for_ms_sync(payment_id: int) -> bool:
+    """Атомарно «застолбить» платёж для синхронизации с МойСклад.
+
+    Защита от race condition между cron-retry и in-process confirm-hook:
+    оба могут одновременно решить «надо синкать» и оба вызовут POST в
+    МойСклад → дубль paymentin.
+
+    Логика: атомарный UPDATE-WHERE-status-not-in-progress. Только тот,
+    кто выиграл гонку (rowcount == 1), идёт в МойСклад. Остальные
+    видят False и тихо пропускают.
+
+    Returns True если этот вызов застолбил; False если уже застолбили,
+    уже syncнули или платежа нет.
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        # Не используем NOT IN потому что SQLite не любит NULL-сравнения
+        # таким способом. Явные проверки IS NULL OR != 'in_progress'.
+        cur.execute(
+            q(
+                "UPDATE payments "
+                "SET ms_sync_status = 'in_progress' "
+                "WHERE id = ? "
+                "  AND ms_paymentin_id IS NULL "
+                "  AND (ms_sync_status IS NULL OR ms_sync_status != 'in_progress')"
+            ),
+            (payment_id,),
+        )
+        claimed = cur.rowcount > 0
+        conn.commit()
+    return claimed
+
+
 def set_payment_ms_sync(
     payment_id: int,
     *,
@@ -951,31 +1043,41 @@ def confirm_payment(payment_id: int, confirmed_by: int = None, confirmed_name: s
 
 
 def _trigger_ms_paymentin_sync(payment_id: int) -> None:
-    """Запустить async create_paymentin_for_payment в фоне, если есть
-    активный event loop. Если зов из чисто sync-контекста (cron-скрипта),
-    запускаем синхронно через asyncio.run."""
+    """Запустить async create_paymentin_for_payment в фоне.
+
+    Стратегия:
+      - Внутри активного event loop (aiogram/aiohttp в bot/webapp) —
+        кидаем create_task. Fire-and-forget: ошибки логируются в
+        ms_payments, БД-confirm уже закоммичен.
+      - В чисто sync-контексте (cron-скрипт, который не делает
+        confirm_payment напрямую, но если делает — короткоживущий
+        процесс) — поднимаем мини-loop через asyncio.run.
+
+    asyncio.get_running_loop() в Python 3.12+ — правильный способ;
+    бросает RuntimeError если нет активного loop'а, что нам нужно
+    как сигнал для fallback на asyncio.run.
+    """
+    import asyncio
     try:
-        import asyncio
         from services.ms_payments import create_paymentin_for_payment
     except Exception:
-        # ms_payments недоступен (например, тестовое окружение без MS_TOKEN)
-        return
+        return  # окружение без MS_TOKEN
 
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Внутри aiohttp/aiogram — кидаем задачу в текущий loop
-            asyncio.create_task(create_paymentin_for_payment(payment_id))
-            return
+        loop = asyncio.get_running_loop()
     except RuntimeError:
-        pass
-    # Sync-контекст: запускаем кратковременный loop
-    try:
-        import asyncio
-        asyncio.run(create_paymentin_for_payment(payment_id))
-    except Exception:
-        # Молча игнорируем — статус failed уже записан внутри ms_payments
-        pass
+        # Не в async-контексте — короткоживущий loop
+        try:
+            asyncio.run(create_paymentin_for_payment(payment_id))
+        except Exception:
+            # Статус failed уже записан внутри ms_payments — молча
+            pass
+        return
+
+    # В активном loop'е — fire-and-forget. Сохраняем ссылку чтобы
+    # не было RuntimeWarning «Task was destroyed».
+    task = loop.create_task(create_paymentin_for_payment(payment_id))
+    task.add_done_callback(lambda t: t.exception() and None)
 
 
 def _maybe_close_order_after_payment(
@@ -983,15 +1085,67 @@ def _maybe_close_order_after_payment(
     confirmed_by: int | None,
     confirmed_name: str,
 ) -> None:
-    """После approve платежа — если сумма confirmed дошла до order.total,
-    проставляем order.paid_confirmed_at. Идемпотентно: если уже стоит,
-    ничего не делаем (повторный confirm более старого платежа не должен
-    переписывать timestamp)."""
-    summary = get_order_payment_summary(order_id)
-    if summary["remaining"] > 0.01:  # ещё не полностью оплачен
-        return
+    """Атомарно проверить, закрыт ли заказ суммой confirmed-платежей,
+    и проставить paid_confirmed_at если да.
+
+    Параллельный confirm двух платежей одного заказа без блокировки приводил
+    к гонке: каждый вызов видел `remaining > 0` (потому что второй платёж
+    ещё не был зафиксирован для текущей транзакции) и оба пропускали
+    закрытие. Решение — `SELECT ... FOR UPDATE` на orders в начале
+    транзакции: пока первый confirm считает summary и UPDATE'ит заказ,
+    второй ждёт на lock'е и затем видит уже актуальные данные.
+
+    Для SQLite (локальная разработка) FOR UPDATE не поддерживается, но
+    там и нет конкуренции — один процесс. Условный SQL.
+    """
     with get_conn() as conn:
         cur = get_cursor(conn)
+
+        # Lock: для Postgres эта строка блокирует order до conn.commit().
+        if USE_POSTGRES:
+            cur.execute(
+                "SELECT paid_confirmed_at FROM orders WHERE id = %s FOR UPDATE",
+                (order_id,),
+            )
+        else:
+            cur.execute(
+                "SELECT paid_confirmed_at FROM orders WHERE id = ?",
+                (order_id,),
+            )
+        row = cur.fetchone()
+        if not row:
+            return
+        already_closed = (
+            row["paid_confirmed_at"] if USE_POSTGRES else row[0]
+        ) is not None
+        if already_closed:
+            return
+
+        # Пересчёт ВНУТРИ транзакции — видим актуальную сумму confirmed
+        cur.execute(
+            q(
+                "SELECT COALESCE(SUM(amount), 0) AS s FROM payments "
+                "WHERE order_id = ? AND status = 'confirmed'"
+            ),
+            (order_id,),
+        )
+        r = cur.fetchone()
+        confirmed_sum = float((r["s"] if USE_POSTGRES else r[0]) or 0)
+
+        cur.execute(
+            q(
+                "SELECT COALESCE(SUM(quantity * price), 0) AS t "
+                "FROM order_items WHERE order_id = ?"
+            ),
+            (order_id,),
+        )
+        r = cur.fetchone()
+        total = float((r["t"] if USE_POSTGRES else r[0]) or 0)
+
+        if confirmed_sum < total - 0.01:
+            return  # ещё не полностью оплачен
+
+        # Закрываем
         cur.execute(
             q(
                 "UPDATE orders "
@@ -1003,18 +1157,19 @@ def _maybe_close_order_after_payment(
             ),
             (
                 now_str(), confirmed_by or 0, confirmed_name or "",
-                now_str(),  # paid_at если ещё не было
-                now_str(), order_id,
+                now_str(), now_str(), order_id,
             ),
         )
         closed = cur.rowcount > 0
         conn.commit()
+
     if closed:
         add_audit_log(
-            confirmed_by or 0, confirmed_name, get_role(confirmed_by) if confirmed_by else "",
+            confirmed_by or 0, confirmed_name,
+            get_role(confirmed_by) if confirmed_by else "",
             "order_fully_paid",
             f"Заказ #{order_id} полностью оплачен "
-            f"(сумма подтверждённых платежей: {summary['confirmed']:,.0f})",
+            f"(сумма подтверждённых платежей: {confirmed_sum:,.0f})",
         )
 
 
@@ -1161,15 +1316,17 @@ def get_order(order_id: int) -> dict | None:
 
 
 def get_orders_by_ids(order_ids: list[int]) -> dict[int, dict]:
-    """Батч-загрузка заказов по id → словарь {id: order_dict}."""
+    """Батч-загрузка заказов по id → словарь {id: order_dict}.
+    order_ids дедуплицируется — placeholder'ы не расходуем впустую."""
     if not order_ids:
         return {}
-    placeholders = ",".join(["?"] * len(order_ids))
+    unique_ids = list(set(order_ids))
+    placeholders = ",".join(["?"] * len(unique_ids))
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
             q(f"SELECT * FROM orders WHERE id IN ({placeholders})"),
-            list(order_ids),
+            unique_ids,
         )
         rows = cur.fetchall()
     return {r["id"]: dict(r) for r in rows}
@@ -1279,46 +1436,116 @@ def mark_order_paid(
     Возвращает (False, None) если order не существует, не credit,
     уже полностью закрыт (paid_confirmed_at стоит), или amount некорректен.
     """
-    order = get_order(order_id)
-    if not order:
-        return (False, None)
-    if order.get("payment_type") != "credit":
-        return (False, None)
-    if order.get("paid_confirmed_at"):
-        return (False, None)  # уже полностью закрыт
-
-    summary = get_order_payment_summary(order_id)
-    # Если amount не задан — берём остаток (полная доплата)
-    if amount is None:
-        amount = summary["remaining"]
-    try:
-        amount = float(amount)
-    except (TypeError, ValueError):
-        return (False, None)
-    if amount <= 0:
-        return (False, None)
-    # Не даём ввести больше остатка с учётом уже pending
-    if amount > summary["remaining"] + 0.01:
-        amount = summary["remaining"]
-        if amount <= 0:
-            return (False, None)
-
+    # Все шаги — внутри одной транзакции с lock'ом на заказ.
+    # Раньше без блокировки два менеджера могли одновременно отметить
+    # частичные суммы 70+70 на остаток 100 — оба проходили проверку
+    # `amount ≤ remaining` (каждый считал «свой» remaining до второго),
+    # и в pending копилось 140 при долге 100. Босс потом разбирался.
+    # Теперь FOR UPDATE на orders сериализует параллельные mark_paid'ы.
     from config import BASE_CURRENCY
-    currency = order.get("currency") or BASE_CURRENCY
-    comment = (
-        f"Оплата по заказу #{order_id}"
-        + (f" ({order.get('agent_name')})" if order.get("agent_name") else "")
-    )
 
-    payment_id = add_payment(
-        marked_by, username, marked_by_name, amount, currency, comment,
-        order_id=order_id,
-    )
-
-    # paid_at — флаг «менеджер хоть раз отметил». Не сбрасываем
-    # при следующих частичных, оставляем самое раннее время.
     with get_conn() as conn:
         cur = get_cursor(conn)
+
+        # Lock заказа
+        if USE_POSTGRES:
+            cur.execute(
+                "SELECT payment_type, currency, agent_name, paid_confirmed_at "
+                "FROM orders WHERE id = %s FOR UPDATE",
+                (order_id,),
+            )
+        else:
+            cur.execute(
+                "SELECT payment_type, currency, agent_name, paid_confirmed_at "
+                "FROM orders WHERE id = ?",
+                (order_id,),
+            )
+        row = cur.fetchone()
+        if not row:
+            return (False, None)
+        if USE_POSTGRES:
+            payment_type = row["payment_type"]
+            currency = row["currency"] or BASE_CURRENCY
+            agent_name = row["agent_name"]
+            already_closed = row["paid_confirmed_at"] is not None
+        else:
+            payment_type = row[0]
+            currency = row[1] or BASE_CURRENCY
+            agent_name = row[2]
+            already_closed = row[3] is not None
+
+        if payment_type != "credit":
+            return (False, None)
+        if already_closed:
+            return (False, None)
+
+        # Под locкам считаем суммы — гарантия что между recompute и
+        # INSERT никто другой не добавит payment.
+        cur.execute(
+            q(
+                "SELECT COALESCE(SUM(amount), 0) AS s FROM payments "
+                "WHERE order_id = ? AND status IN ('pending', 'confirmed')"
+            ),
+            (order_id,),
+        )
+        r = cur.fetchone()
+        used = float((r["s"] if USE_POSTGRES else r[0]) or 0)
+
+        cur.execute(
+            q(
+                "SELECT COALESCE(SUM(quantity * price), 0) AS t "
+                "FROM order_items WHERE order_id = ?"
+            ),
+            (order_id,),
+        )
+        r = cur.fetchone()
+        total = float((r["t"] if USE_POSTGRES else r[0]) or 0)
+        remaining = max(0.0, total - used)
+
+        # Если amount не задан — берём остаток (полная доплата)
+        if amount is None:
+            amount = remaining
+        try:
+            amount = float(amount)
+        except (TypeError, ValueError):
+            return (False, None)
+        if amount <= 0:
+            return (False, None)
+        # Не даём ввести больше остатка
+        if amount > remaining + 0.01:
+            amount = remaining
+            if amount <= 0:
+                return (False, None)
+
+        # INSERT payment в той же транзакции
+        comment = (
+            f"Оплата по заказу #{order_id}"
+            + (f" ({agent_name})" if agent_name else "")
+        )
+        if USE_POSTGRES:
+            cur.execute(
+                "INSERT INTO payments "
+                "(user_id, username, full_name, amount, currency, comment, "
+                " status, created_at, order_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s) "
+                "RETURNING id",
+                (marked_by, username, marked_by_name, amount, currency,
+                 comment, now_str(), order_id),
+            )
+            payment_id = cur.fetchone()["id"]
+        else:
+            cur.execute(
+                "INSERT INTO payments "
+                "(user_id, username, full_name, amount, currency, comment, "
+                " status, created_at, order_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (marked_by, username, marked_by_name, amount, currency,
+                 comment, now_str(), order_id),
+            )
+            payment_id = cur.lastrowid
+
+        # paid_at — флаг «менеджер хоть раз отметил». COALESCE сохраняет
+        # самое раннее время для последующих частичных платежей.
         cur.execute(
             q(
                 "UPDATE orders SET paid_at = COALESCE(paid_at, ?), updated_at = ? "
@@ -1328,7 +1555,7 @@ def mark_order_paid(
         )
         conn.commit()
 
-    remaining_after = max(0.0, summary['remaining'] - amount)
+    remaining_after = max(0.0, remaining - amount)
     add_audit_log(
         marked_by, marked_by_name, get_role(marked_by),
         "debt_payment_claimed",
@@ -1584,12 +1811,13 @@ def get_order_items_by_ids(order_ids: list[int]) -> dict[int, list[dict]]:
     в результате (вызывающий должен использовать .get(oid, []))."""
     if not order_ids:
         return {}
-    placeholders = ",".join(["?"] * len(order_ids))
+    unique_ids = list(set(order_ids))
+    placeholders = ",".join(["?"] * len(unique_ids))
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
             q(f"SELECT * FROM order_items WHERE order_id IN ({placeholders})"),
-            list(order_ids),
+            unique_ids,
         )
         rows = cur.fetchall()
     grouped: dict[int, list[dict]] = {}

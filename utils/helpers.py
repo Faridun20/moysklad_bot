@@ -3,6 +3,25 @@
 """
 
 
+def esc(s) -> str:
+    """HTML-escape для строк, идущих в Telegram-сообщения с parse_mode='HTML'.
+
+    Без этой обёртки имена клиентов, комментарии менеджеров и прочий
+    пользовательский ввод попадали в HTML как есть. Симптомы:
+      - Telegram падает с «can't parse entities» если в тексте появляется
+        одинокий `<` или `>` (например, контрагент назван «<Не указан>»).
+      - XSS-style инъекция через audit_log: менеджер пишет в комментарий
+        `<a href="evil">Click</a>` — админ потом видит кликабельную ссылку.
+
+    Совместима с `parse_mode="HTML"` Telegram: экранируем &, <, > —
+    кавычки не трогаем (Telegram HTML их не парсит как разметку).
+    None / non-str → пустая строка (защита от случайного None).
+    """
+    if s is None:
+        return ""
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def extract_id_from_href(href: str) -> str:
     """Извлечь UUID из конца href-ссылки МойСклад."""
     if not href:
@@ -93,8 +112,72 @@ def trend_arrow(current: float, previous: float) -> str:
 from datetime import datetime, timezone, timedelta
 
 
+def utc_now() -> datetime:
+    """Текущее UTC-время как naive datetime.
+
+    Замена deprecated `datetime.utcnow()` (которая в Python 3.12+
+    кидает DeprecationWarning). Возвращаем naive (без tzinfo) — так
+    же как утцnow раньше — чтобы не ломать места кода, которые
+    сравнивают/форматируют naive datetimes (например МойСклад
+    `moment` строки и сравнения с `created_at` из БД).
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def local_now() -> datetime:
-    """Текущее время по Ташкенту (UTC+5)."""
+    """Текущее время по локальному TZ (TZ_OFFSET часов от UTC).
+
+    Используется когда нужна «вот сейчас по местному времени» — для
+    границы «сегодня» в UI и в фильтрах персональной аналитики
+    менеджера, чтобы они совпадали с `created_at` в БД (который
+    записывается local-time через `now_str`)."""
     from config import TZ_OFFSET
 
-    return datetime.utcnow() + timedelta(hours=TZ_OFFSET)
+    return utc_now() + timedelta(hours=TZ_OFFSET)
+
+
+# Telegram limit одного сообщения. Используется в chunk_messages.
+TELEGRAM_MESSAGE_MAX = 4000
+
+
+def filter_records_by_period(records: list[dict], period: str) -> list[dict]:
+    """Универсальный фильтр по полю `created_at` (ISO-строка).
+
+    period: 'today' | 'week' | 'month' | что-то ещё (= все записи).
+    Используется и в /audit, и в /log handlers — раньше каждый держал
+    свою копию.
+    """
+    from datetime import datetime as _dt
+    now = _dt.now()
+    if period == "today":
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "week":
+        cutoff = now - timedelta(weeks=1)
+    elif period == "month":
+        cutoff = now - timedelta(days=30)
+    else:
+        return records
+    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    return [r for r in records if r["created_at"] >= cutoff_str]
+
+
+def chunk_messages(lines: list[str], limit: int = TELEGRAM_MESSAGE_MAX) -> list[str]:
+    """Склеить строки в сообщения по limit-символов (Telegram = 4000).
+
+    Раньше эта же логика дублировалась в audit.py:format_audit_log
+    и log.py:send_log. Тут — единая реализация.
+    """
+    if not lines:
+        return []
+    messages: list[str] = []
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 1 > limit:
+            if current:
+                messages.append(current)
+            current = line
+        else:
+            current = (current + "\n" + line) if current else line
+    if current:
+        messages.append(current)
+    return messages

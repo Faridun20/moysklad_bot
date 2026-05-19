@@ -3,6 +3,7 @@
 """
 
 from utils.helpers import (
+    esc,
     get_folder_name,
     stock_indicator,
     format_date,
@@ -10,7 +11,7 @@ from utils.helpers import (
     trend_arrow,
 )
 
-PAGE_SIZE = 10
+from config import PAGE_SIZE  # единый источник в config
 
 # ─── Общие элементы ───────────────────────────────────────────────────────────
 
@@ -41,11 +42,11 @@ def format_stock_page(rows: list[dict], page: int, cat_name: str = "") -> str:
     ]
 
     for r in rows[start:end]:
-        name = r.get("name", "—")
+        name = esc(r.get("name", "—"))
         stock = r.get("stock", 0)
         reserve = r.get("reserve", 0)
-        unit = r.get("uom", {}).get("name", "шт")
-        folder = get_folder_name(r.get("folder", {}))
+        unit = esc(r.get("uom", {}).get("name", "шт"))
+        folder = esc(get_folder_name(r.get("folder", {})))
         ind = stock_indicator(stock)
 
         # Название + папка
@@ -66,10 +67,10 @@ def format_stock_page(rows: list[dict], page: int, cat_name: str = "") -> str:
 
 
 def format_shipment(s: dict, positions: list[dict] = None) -> str:
-    name = s.get("name", "—")
-    moment = format_date(s.get("moment", "—"))
-    agent = s.get("agent", {}).get("name", "—")
-    owner = s.get("owner", {}).get("name", "—")
+    name = esc(s.get("name", "—"))
+    moment = esc(format_date(s.get("moment", "—")))
+    agent = esc(s.get("agent", {}).get("name", "—"))
+    owner = esc(s.get("owner", {}).get("name", "—"))
     sum_str = format_price(s.get("sum", 0))
 
     lines = [
@@ -87,11 +88,10 @@ def format_shipment(s: dict, positions: list[dict] = None) -> str:
         lines.append(DIV2)
         for pos in positions[:15]:
             assortment = pos.get("assortment", {})
-            pos_name = assortment.get("name", "—")
+            pos_name = esc(assortment.get("name", "—"))
             qty = pos.get("quantity", 0)
-            uom = pos.get("uom", {}).get("name", "") or assortment.get("uom", {}).get(
-                "name", "шт"
-            )
+            uom = esc(pos.get("uom", {}).get("name", "")
+                      or assortment.get("uom", {}).get("name", "шт"))
             price_raw = pos.get("price", 0)
             price_str = format_price(price_raw)
             total_pos = format_price(price_raw * qty)
@@ -142,7 +142,7 @@ def format_sales_report(label: str, stats: dict, prev_stats: dict = None) -> str
             t_sum = format_price(data["sum"])
             qty = data["qty"]
             medal = medals[i] if i < len(medals) else f"{i+1}."
-            lines.append(f"{medal} <b>{name}</b>")
+            lines.append(f"{medal} <b>{esc(name)}</b>")
             lines.append(f"    <code>{qty} шт  ·  {t_sum} $</code>")
 
     if count == 0:
@@ -169,9 +169,9 @@ def format_payment_notify(
         f"{DIV}\n"
         f"💵 <b>Новый платёж #{payment_id}</b>\n"
         f"\n"
-        f"<b>👤 Сотрудник:</b> {full_name} ({username})\n"
-        f"<b>💰 Сумма:</b> {amount:,.0f} {currency}\n"
-        f"<b>📝 Комментарий:</b> {comment}\n"
+        f"<b>👤 Сотрудник:</b> {esc(full_name)} ({esc(username)})\n"
+        f"<b>💰 Сумма:</b> {amount:,.0f} {esc(currency)}\n"
+        f"<b>📝 Комментарий:</b> {esc(comment)}\n"
         f"<b>🕐 Время:</b> {now}"
     )
 
@@ -181,8 +181,8 @@ def format_payment_confirmed(amount: float, currency: str, comment: str) -> str:
         f"{DIV}\n"
         f"✅ <b>Платёж принят!</b>\n"
         f"\n"
-        f"<b>💰 Сумма:</b> {amount:,.0f} {currency}\n"
-        f"<b>📝 Комментарий:</b> {comment}"
+        f"<b>💰 Сумма:</b> {amount:,.0f} {esc(currency)}\n"
+        f"<b>📝 Комментарий:</b> {esc(comment)}"
     )
 
 
@@ -191,8 +191,8 @@ def format_payment_rejected(amount: float, currency: str, comment: str) -> str:
         f"{DIV}\n"
         f"❌ <b>Платёж отклонён</b>\n"
         f"\n"
-        f"<b>💰 Сумма:</b> {amount:,.0f} {currency}\n"
-        f"<b>📝 Комментарий:</b> {comment}\n"
+        f"<b>💰 Сумма:</b> {amount:,.0f} {esc(currency)}\n"
+        f"<b>📝 Комментарий:</b> {esc(comment)}\n"
         f"\n"
         f"<i>Свяжитесь с руководителем</i>"
     )
@@ -266,9 +266,16 @@ def format_audit_entry(r: dict) -> str:
     }
     emoji = ACTION_EMOJI.get(r["action"], "▪️")
     dt = r["created_at"][:16]
-    role_str = f" [{r['role']}]" if r.get("role") else ""
-    detail_str = f"\n    <i>{r['details']}</i>" if r.get("details") else ""
-    return f"{emoji} <code>{dt}</code>  <b>{r['full_name']}</b>{role_str}{detail_str}"
+    # ВАЖНО: full_name/role/details пишутся юзерами и попадают в БД.
+    # Без escape менеджер мог бы протащить HTML в audit, который потом
+    # видит админ — потенциальная inject в Telegram-сообщение (например
+    # кликабельный <a href="evil"> вид).
+    role_str = f" [{esc(r['role'])}]" if r.get("role") else ""
+    detail_str = f"\n    <i>{esc(r['details'])}</i>" if r.get("details") else ""
+    return (
+        f"{emoji} <code>{dt}</code>  <b>{esc(r['full_name'])}</b>"
+        f"{role_str}{detail_str}"
+    )
 
 # ─── Отчёт по остаткам склада ─────────────────────────────────────────────────
 

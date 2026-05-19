@@ -20,6 +20,38 @@ from services.roles import cached_role as get_role
 from services.rate_limit import acquire as rate_limit_acquire
 
 
+# ─── Idempotency cache ──────────────────────────────────────────────
+# Защита от double-click на confirm/reject платежей. Клиент посылает
+# `idempotency_key` (random UUID per действие); если запрос с тем же
+# ключом приходит повторно в течение TTL — возвращаем кэшированный
+# результат, не дёргая БД повторно.
+# SECURITY.md (Medium): сейчас фронт может два раза кликнуть approve и
+# во время загрузки получить рассинхронизированное состояние.
+_IDEM_CACHE: dict[str, tuple[float, dict]] = {}
+_IDEM_TTL = 30.0
+
+
+def _idem_get(key: str | None) -> dict | None:
+    if not key:
+        return None
+    entry = _IDEM_CACHE.get(key)
+    if entry and time.monotonic() - entry[0] < _IDEM_TTL:
+        return entry[1]
+    return None
+
+
+def _idem_set(key: str | None, value: dict) -> None:
+    if not key:
+        return
+    # Простой GC при разрастании кэша — выкидываем протухшие записи.
+    if len(_IDEM_CACHE) > 200:
+        cutoff = time.monotonic() - _IDEM_TTL
+        for k in list(_IDEM_CACHE.keys()):
+            if _IDEM_CACHE[k][0] < cutoff:
+                _IDEM_CACHE.pop(k, None)
+    _IDEM_CACHE[key] = (time.monotonic(), value)
+
+
 def _authorize(
     data: dict,
     allowed_roles: tuple[str, ...] = ("admin", "boss", "manager"),
@@ -125,17 +157,25 @@ def set_telegram_dispatcher(bot, dispatcher) -> None:
 async def telegram_webhook(secret: str, request: Request):
     """Принимает Update-объекты от Telegram.
 
-    Защита: секрет в URL + проверка заголовка X-Telegram-Bot-Api-Secret-Token
-    (Telegram отправляет именно его, если мы при set_webhook указали secret_token).
-    Двойная защита нужна, чтобы случайно слитый URL не давал никому
-    отправлять апдейты — нужен ещё и заголовок.
+    Защита: один и тот же TG_WEBHOOK_SECRET проверяется и в URL,
+    и в заголовке `X-Telegram-Bot-Api-Secret-Token`. Это не «двойная
+    защита» по энтропии — утечка секрета компрометирует обе точки.
+    Заголовок отдаёт Telegram строго если secret_token был указан
+    при `set_webhook`; URL же позволяет Railway маршрутизировать
+    запрос. Проверки оба — это валидация что запрос не подменён
+    каким-то прокси по пути (header может потеряться) и что путь
+    не угадан случайно (без header'а можно слать что угодно по URL).
     """
+    import hmac as _hmac
     from config import TG_WEBHOOK_SECRET
 
-    if not TG_WEBHOOK_SECRET or secret != TG_WEBHOOK_SECRET:
+    if not TG_WEBHOOK_SECRET:
+        raise HTTPException(status_code=404, detail="not found")
+    # constant-time сравнение от теоретического timing-attack
+    if not _hmac.compare_digest(secret, TG_WEBHOOK_SECRET):
         raise HTTPException(status_code=404, detail="not found")
     header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if header_secret != TG_WEBHOOK_SECRET:
+    if not _hmac.compare_digest(header_secret, TG_WEBHOOK_SECRET):
         raise HTTPException(status_code=404, detail="not found")
     if _tg_dispatcher is None or _tg_bot is None:
         # Бот ещё не подключил себя сюда — режим webhook отключён.
@@ -160,6 +200,13 @@ async def telegram_webhook(secret: str, request: Request):
 # ─── Webhook от МойСклад ─────────────────────────────────────────────────────
 
 
+# Лимит payload MS-webhook'а — реалистично от МойСклад приходит ≤ 50KB
+# (события батчатся). 1MB достаточно с большим запасом, при этом
+# защищает от DoS: кто-то с известным секретом мог бы слать тяжёлые
+# body, забивая нашу память.
+_MS_WEBHOOK_MAX_BYTES = 1 * 1024 * 1024
+
+
 @app.post("/api/ms-webhook/{secret}")
 async def ms_webhook(secret: str, request: Request):
     """
@@ -171,16 +218,31 @@ async def ms_webhook(secret: str, request: Request):
     _stock_debounce_loop через несколько секунд сделает refresh_stock,
     батча все полученные события в один pull.
     """
+    import hmac as _hmac
     from services.ms_webhooks import get_webhook_secret
     from services.snapshot import mark_stock_dirty
 
-    if secret != get_webhook_secret():
-        # Не отдаём 401 чтобы не подсказывать злоумышленнику, что секрет нужен;
-        # просто молчим.
+    # constant-time сравнение секрета (timing-attack hardening)
+    if not _hmac.compare_digest(secret, get_webhook_secret()):
+        # Не отдаём 401 — не подсказываем атакующему, что секрет нужен.
         raise HTTPException(status_code=404, detail="not found")
 
+    # Лимит на размер тела (defence in depth — реальный МС шлёт ≤50KB)
+    cl = request.headers.get("Content-Length")
     try:
-        payload = await request.json()
+        if cl and int(cl) > _MS_WEBHOOK_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="payload too large")
+    except ValueError:
+        pass
+
+    try:
+        body_bytes = await request.body()
+        if len(body_bytes) > _MS_WEBHOOK_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="payload too large")
+        import json as _json
+        payload = _json.loads(body_bytes) if body_bytes else {}
+    except HTTPException:
+        raise
     except Exception:
         payload = {}
 
@@ -221,19 +283,28 @@ async def healthz():
 # ─── Главная страница ─────────────────────────────────────────────────────────
 
 
-_INDEX_HTML_CACHE: str | None = None
+_INDEX_HTML_CACHE: tuple[float, str] | None = None  # (mtime, html)
 
 
 def _read_index_html() -> str:
-    """Читаем index.html один раз и подставляем версию для cache-busting.
-    Раньше мобильный Telegram месяцами держал старую app.js в WebView-кэше;
-    теперь URL вида app.js?v=<sha> меняется на каждом деплое и кэш обходится
-    автоматически."""
+    """Читаем index.html и подставляем версию для cache-busting.
+
+    Кэшируем по mtime файла: при `hot-reload` локально (uvicorn --reload
+    редактирует index.html) — мы это сразу подхватим. На проде файл
+    не меняется в рантайме, mtime стабилен — никакой overhead'а.
+    """
     global _INDEX_HTML_CACHE
-    if _INDEX_HTML_CACHE is None:
-        raw = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-        _INDEX_HTML_CACHE = raw.replace("{{VERSION}}", APP_VERSION)
-    return _INDEX_HTML_CACHE
+    path = STATIC_DIR / "index.html"
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        # Файла нет — отдаём кэшированный (если есть) или пустую заглушку
+        return _INDEX_HTML_CACHE[1] if _INDEX_HTML_CACHE else ""
+    if _INDEX_HTML_CACHE is None or _INDEX_HTML_CACHE[0] != mtime:
+        raw = path.read_text(encoding="utf-8")
+        html = raw.replace("{{VERSION}}", APP_VERSION)
+        _INDEX_HTML_CACHE = (mtime, html)
+    return _INDEX_HTML_CACHE[1]
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1097,7 +1168,16 @@ async def api_agents(request: Request):
         rate_limit_window=60.0,
     )
 
-    search = (data.get("search", "") or "").strip()
+    # Санитизация search (SECURITY.md H11): без неё manager мог через
+    # подобранные search-запросы устроить пачку дорогих запросов в
+    # МойСклад. Длина ≤ 50, только буквы/цифры/обычные знаки —
+    # без специальных символов, которые МойСклад может интерпретировать.
+    raw_search = (data.get("search", "") or "").strip()
+    if len(raw_search) > 50:
+        raw_search = raw_search[:50]
+    # Whitelist: буквы (любые юникодные), цифры, пробелы, основные знаки
+    import re as _re
+    search = _re.sub(r"[^\w\s\-\.,'@+()/]", "", raw_search, flags=_re.UNICODE)
     rows = snapshot.get_counterparties(search=search if search else None, limit=50)
     if rows:
         return JSONResponse({"agents": [
@@ -1422,12 +1502,23 @@ async def api_confirm_payment(request: Request):
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="order_id обязателен")
 
+    # Idempotency: если фронт прислал ключ (uuid от клиента) — пробуем
+    # вернуть кэшированный результат на случай double-click.
+    idem_key = data.get("idempotency_key")
+    if idem_key:
+        cached = _idem_get(f"confirm:{user['id']}:{idem_key}")
+        if cached is not None:
+            return JSONResponse(cached)
+
     full_name = (
         f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
         or user.get("username", str(user["id"]))
     )
     n = await adb.confirm_all_pending_payments_for_order(order_id, user["id"], full_name)
-    return JSONResponse({"ok": True, "confirmed_count": n})
+    result = {"ok": True, "confirmed_count": n}
+    if idem_key:
+        _idem_set(f"confirm:{user['id']}:{idem_key}", result)
+    return JSONResponse(result)
 
 
 @app.post("/api/orders/reject_payment")
