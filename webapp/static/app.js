@@ -14,6 +14,18 @@ if (_initData) {
   _initData = sessionStorage.getItem(_SESSION_KEY) || '';
 }
 
+// Telegram Desktop передаёт initData через postMessage из родительского
+// фрейма — асинхронно, уже ПОСЛЕ того как скрипт спарсился. Повторно
+// читаем tg.initData в нужный момент и обновляем кэш.
+function _refreshInitData() {
+  const live = tg.initData || '';
+  if (live && live !== _initData) {
+    _initData = live;
+    sessionStorage.setItem(_SESSION_KEY, live);
+  }
+  return _initData;
+}
+
 // Состояние приложения
 let currentUser = null;
 let currentScreen = 'home';
@@ -29,6 +41,15 @@ const ROLE_NAMES = {
 
 async function init() {
   try {
+    // Перечитываем tg.initData — на Telegram Desktop он приходит через
+    // postMessage после загрузки страницы. Если ещё пуст — ждём 350 мс
+    // (достаточно для одного round-trip Desktop ↔ WebView) и пробуем снова.
+    _refreshInitData();
+    if (!_initData) {
+      await new Promise(r => setTimeout(r, 350));
+      _refreshInitData();
+    }
+
     const response = await fetch('/api/me', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
