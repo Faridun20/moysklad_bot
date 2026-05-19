@@ -367,7 +367,6 @@ async def api_home(request: Request):
     from datetime import datetime, timedelta
     from services.moysklad import get_sales_stats, get_shipments
     from services import async_db as adb
-    from utils.helpers import utc_now, local_now
 
     data = await request.json()
     user = verify_init_data(data.get("initData", ""))
@@ -379,15 +378,15 @@ async def api_home(request: Request):
     if role not in ("admin", "boss", "manager"):
         raise HTTPException(status_code=403, detail="Нет доступа")
 
-    # UTC time для МойСклад API (он принимает UTC), local time для
-    # сравнения «сегодня» с created_at в БД (тот записывается в
-    # local через now_str). SECURITY.md TZ-block: раньше today_iso
-    # был от UTC, а created_at — от local, и приграничные заказы
-    # (около полуночи Ташкента) могли «не попасть» в today filter.
-    now = utc_now()
+    # ВАЖНО про TZ: now_str() в services/database пишет datetime.now() —
+    # это LOCAL-время сервера (на Railway обычно UTC, но если в env
+    # стоит TZ=Asia/Tashkent — будет +5). Чтобы сравнения с DB timestamp'ами
+    # совпадали, читаем «now» тем же способом, что и пишем. Раньше тут был
+    # datetime.utcnow() — в результате сегодняшние заказы выпадали из окна
+    # на пару часов.
+    now = datetime.now()
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago = now - timedelta(days=7)
-    local_today_iso = local_now().strftime("%Y-%m-%d")
 
     # Заказы текущего юзера — нужны и менеджеру (сводка), и боссу (его лично).
     # await-вызов через async_db не блокирует event loop на время SQL.
@@ -426,12 +425,11 @@ async def api_home(request: Request):
         # Менеджер: считаем личные показатели из локальных одобренных заявок.
         # Источник — наша БД, без обращения к МойСклад. Батч-запросом
         # подтягиваем сразу все позиции (раньше был N+1 по заказам).
-        # local_today_iso (а не UTC) — сравниваем с created_at в local TZ,
-        # чтобы граница «сегодня» совпала с восприятием менеджера.
+        today_iso = start_of_day.strftime("%Y-%m-%d")
         relevant_today = [
             o for o in my_orders
             if o["status"] in ("approved", "shipped")
-            and (o.get("updated_at") or o.get("created_at") or "")[:10] == local_today_iso
+            and (o.get("updated_at") or o.get("created_at") or "")[:10] == today_iso
         ]
         items_by_order = (
             await adb.get_order_items_by_ids([o["id"] for o in relevant_today])
@@ -584,7 +582,6 @@ async def api_analytics(request: Request):
     """
     from datetime import datetime, timedelta
     from services.moysklad import get_sales_stats, get_shipments
-    from utils.helpers import utc_now
 
     data = await request.json()
     user = verify_init_data(data.get("initData", ""))
@@ -597,7 +594,8 @@ async def api_analytics(request: Request):
         raise HTTPException(status_code=403, detail="Нет доступа")
 
     period = data.get("period", "week")
-    now = utc_now()
+    # Local-time чтобы совпадало с now_str() (см. /api/home комментарий).
+    now = datetime.now()
 
     periods = {
         "week": (now - timedelta(weeks=1), now - timedelta(weeks=2), "Неделя"),
