@@ -22,7 +22,10 @@ from utils.keyboards import (
 logger = logging.getLogger(__name__)
 router = Router()
 
-# Кэш отгрузок
+# Навигационное состояние: {chat_id: {since, until, label}}.
+# Полный список отгрузок НЕ храним — get_shipments() имеет собственный
+# 60-секундный TTL-кэш. Такой подход убирает неограниченный рост памяти
+# при большом количестве чатов или тяжёлых выборках.
 shipments_cache: dict[int, dict] = {}
 
 PER_PAGE = 5
@@ -118,18 +121,14 @@ async def show_shipments(
     if is_first:
         await bot.send_message(chat_id, f"⏳ Загружаю отгрузки за {label}…")
     try:
-        if is_first or chat_id not in shipments_cache:
-            shipments = await get_shipments(since, until)
-            shipments_cache[chat_id] = {
-                "shipments": shipments,
-                "label": label,
-                "since": since,
-                "until": until,
-            }
-        else:
-            cached = shipments_cache[chat_id]
-            shipments = cached["shipments"]
-            label = cached["label"]
+        # Всегда вызываем get_shipments — при пагинации данные придут из
+        # 60-секундного TTL-кэша (быстро), при первом запросе — из API.
+        # Навигационные параметры (since/until/label) обновляем при is_first.
+        shipments = await get_shipments(since, until)
+        if is_first:
+            shipments_cache[chat_id] = {"label": label, "since": since, "until": until}
+        elif chat_id in shipments_cache:
+            label = shipments_cache[chat_id].get("label", label)
 
         if not shipments:
             return await bot.send_message(

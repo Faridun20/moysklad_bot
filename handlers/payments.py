@@ -40,10 +40,10 @@ from services.database import (
     get_recent_ms_sync_failures,
 )
 
+from config import ALLOWED_CURRENCIES as CURRENCIES
+
 logger = logging.getLogger(__name__)
 router = Router()
-
-CURRENCIES = ["USD", "UZS", "RUB", "EUR"]
 
 
 class PaymentState(StatesGroup):

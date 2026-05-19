@@ -14,12 +14,7 @@ import html
 import logging
 from datetime import datetime
 
-try:
-    from config import BASE_CURRENCY as _BASE_CURRENCY
-except ImportError:
-    _BASE_CURRENCY = "USD"
-
-ALLOWED_CURRENCIES = ("USD", "UZS", "RUB", "EUR")
+from config import BASE_CURRENCY as _BASE_CURRENCY, ALLOWED_CURRENCIES
 
 
 # Единая реализация в utils.helpers.esc — оставлен _esc-алиас чтобы

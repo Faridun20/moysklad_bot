@@ -7,6 +7,8 @@ try:
         MANAGER_IDS = []
     if "BOSS_IDS" not in dir():
         BOSS_IDS = []
+    if "ALLOWED_CURRENCIES" not in dir():
+        ALLOWED_CURRENCIES = ("USD", "UZS", "RUB", "EUR")
 except ImportError:
     TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
     MS_TOKEN = os.environ.get("MS_TOKEN", "").strip()
@@ -75,6 +77,11 @@ except ImportError:
     # история платежей. Раньше был раскопирован в 3 местах (handlers/
     # stock, utils/formatters, utils/keyboards) — теперь единая точка.
     PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "10"))
+
+    # Список поддерживаемых валют — единственный источник истины.
+    # Раньше был продублирован в handlers/payments, handlers/orders
+    # и дважды в webapp/server как inline-литерал. Теперь один список.
+    ALLOWED_CURRENCIES = ("USD", "UZS", "RUB", "EUR")
 
     # ─── Расписанные отчёты ────────────────────────────────────────
     # 1 (default) — daily/weekly/monthly работают внутри бот-процесса

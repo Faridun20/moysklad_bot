@@ -843,8 +843,9 @@ async def api_payments_send(request: Request):
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Неверная сумма")
 
+    from config import ALLOWED_CURRENCIES
     currency = data.get("currency", "USD")
-    if currency not in ("USD", "UZS", "RUB", "EUR"):
+    if currency not in ALLOWED_CURRENCIES:
         raise HTTPException(status_code=400, detail="Неверная валюта")
 
     comment = (data.get("comment", "") or "").strip()
@@ -1043,8 +1044,9 @@ async def api_add_item(request: Request):
 
     # Если в payload пришла валюта и она ещё не зафиксирована на ордере —
     # сохраняем. Все позиции одного ордера должны быть в одной валюте.
+    from config import ALLOWED_CURRENCIES
     requested_currency = (data.get("currency") or "").upper()
-    if requested_currency and requested_currency in ("USD", "UZS", "RUB", "EUR"):
+    if requested_currency and requested_currency in ALLOWED_CURRENCIES:
         if not order.get("currency"):
             await adb.update_order_currency(data["order_id"], requested_currency)
 

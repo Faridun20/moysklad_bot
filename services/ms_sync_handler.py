@@ -21,6 +21,8 @@ Entity ID извлекается из meta.href (последний сегмен
 import asyncio
 import logging
 
+from services import async_db as adb
+
 logger = logging.getLogger(__name__)
 
 # Типы событий: только они обрабатываются здесь; остальные игнорируются.
@@ -86,14 +88,9 @@ async def _handle_paymentin_deleted(paymentin_id: str) -> None:
     (или /sync_payments) создаст его повторно. Уведомляем boss/admin, чтобы
     они знали о ручном вмешательстве в МойСклад.
     """
-    from services.database import (
-        find_payment_by_ms_paymentin_id,
-        reset_payment_ms_sync,
-        add_audit_log,
-    )
     from services.notifier import aget_notify_recipients, tg_send_message
 
-    payment = await asyncio.to_thread(find_payment_by_ms_paymentin_id, paymentin_id)
+    payment = await adb.find_payment_by_ms_paymentin_id(paymentin_id)
     if not payment:
         logger.debug(
             "paymentin.DELETE %s — не найден в локальной БД, пропускаем",
@@ -102,7 +99,7 @@ async def _handle_paymentin_deleted(paymentin_id: str) -> None:
         return
 
     payment_id = payment["id"]
-    await asyncio.to_thread(reset_payment_ms_sync, payment_id)
+    await adb.reset_payment_ms_sync(payment_id)
 
     order_id = payment.get("order_id")
     order_label = f" по заказу #{order_id}" if order_id else ""
@@ -110,8 +107,7 @@ async def _handle_paymentin_deleted(paymentin_id: str) -> None:
     currency = payment.get("currency") or ""
     manager = payment.get("full_name") or "—"
 
-    await asyncio.to_thread(
-        add_audit_log,
+    await adb.add_audit_log(
         0, "МойСклад", "system",
         "ms_paymentin_deleted",
         (
@@ -142,14 +138,11 @@ async def _handle_paymentin_deleted(paymentin_id: str) -> None:
 
 async def _handle_paymentin_updated(paymentin_id: str) -> None:
     """Входящий платёж изменён в МойСклад — фиксируем в audit_log."""
-    from services.database import find_payment_by_ms_paymentin_id, add_audit_log
-
-    payment = await asyncio.to_thread(find_payment_by_ms_paymentin_id, paymentin_id)
+    payment = await adb.find_payment_by_ms_paymentin_id(paymentin_id)
     if not payment:
         return
 
-    await asyncio.to_thread(
-        add_audit_log,
+    await adb.add_audit_log(
         0, "МойСклад", "system",
         "ms_paymentin_updated",
         f"paymentin {paymentin_id} изменён в МойСклад (платёж #{payment['id']}).",
@@ -173,15 +166,10 @@ async def _handle_customerorder_updated(co_id: str) -> None:
     Переходы только из {"pending", "approved"}: не откатываем уже
     отгруженные или отклонённые заказы.
     """
-    from services.database import (
-        find_order_by_ms_customerorder_id,
-        update_order_status,
-        add_audit_log,
-    )
     from services.moysklad import ms_get
     from services.notifier import tg_send_message
 
-    order = await asyncio.to_thread(find_order_by_ms_customerorder_id, co_id)
+    order = await adb.find_order_by_ms_customerorder_id(co_id)
     if not order:
         return
 
@@ -204,9 +192,8 @@ async def _handle_customerorder_updated(co_id: str) -> None:
         return
 
     order_id = order["id"]
-    await asyncio.to_thread(update_order_status, order_id, new_status)
-    await asyncio.to_thread(
-        add_audit_log,
+    await adb.update_order_status(order_id, new_status)
+    await adb.add_audit_log(
         0, "МойСклад", "system",
         "ms_order_status_synced",
         (
@@ -238,21 +225,15 @@ async def _handle_customerorder_deleted(co_id: str) -> None:
     Снимаем ссылку ms_customerorder_id с локального заказа, уведомляем
     boss/admin. При следующем одобрении заявки будет создан новый документ.
     """
-    from services.database import (
-        find_order_by_ms_customerorder_id,
-        clear_order_ms_customerorder_id,
-        add_audit_log,
-    )
     from services.notifier import aget_notify_recipients, tg_send_message
 
-    order = await asyncio.to_thread(find_order_by_ms_customerorder_id, co_id)
+    order = await adb.find_order_by_ms_customerorder_id(co_id)
     if not order:
         return
 
     order_id = order["id"]
-    await asyncio.to_thread(clear_order_ms_customerorder_id, order_id)
-    await asyncio.to_thread(
-        add_audit_log,
+    await adb.clear_order_ms_customerorder_id(order_id)
+    await adb.add_audit_log(
         0, "МойСклад", "system",
         "ms_customerorder_deleted",
         (
