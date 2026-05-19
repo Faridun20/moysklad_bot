@@ -42,9 +42,7 @@ router = Router()
 # ─── Форматирование ──────────────────────────────────────────────────────────
 
 
-def _esc(s: str) -> str:
-    """HTML-escape — Telegram parse_mode=HTML."""
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+from utils.helpers import esc as _esc  # единая реализация — см. utils/helpers.py
 
 
 def _fmt_amount(n: float) -> str:

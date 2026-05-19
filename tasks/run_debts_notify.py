@@ -36,8 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger("debts_notify")
 
 
-def _esc(s: str) -> str:
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+from utils.helpers import esc as _esc  # единая реализация — utils/helpers.py
 
 
 def _fmt_amount(n: float) -> str:

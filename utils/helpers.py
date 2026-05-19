@@ -3,6 +3,25 @@
 """
 
 
+def esc(s) -> str:
+    """HTML-escape для строк, идущих в Telegram-сообщения с parse_mode='HTML'.
+
+    Без этой обёртки имена клиентов, комментарии менеджеров и прочий
+    пользовательский ввод попадали в HTML как есть. Симптомы:
+      - Telegram падает с «can't parse entities» если в тексте появляется
+        одинокий `<` или `>` (например, контрагент назван «<Не указан>»).
+      - XSS-style инъекция через audit_log: менеджер пишет в комментарий
+        `<a href="evil">Click</a>` — админ потом видит кликабельную ссылку.
+
+    Совместима с `parse_mode="HTML"` Telegram: экранируем &, <, > —
+    кавычки не трогаем (Telegram HTML их не парсит как разметку).
+    None / non-str → пустая строка (защита от случайного None).
+    """
+    if s is None:
+        return ""
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def extract_id_from_href(href: str) -> str:
     """Извлечь UUID из конца href-ссылки МойСклад."""
     if not href:

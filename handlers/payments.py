@@ -362,8 +362,7 @@ async def cb_payreport(call: CallbackQuery):
 # ─── /sync_payments: показать состояние и ретрайнуть синки в МойСклад ───────
 
 
-def _esc(s: str) -> str:
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+from utils.helpers import esc as _esc  # единая реализация — utils/helpers.py
 
 
 def _format_sync_status() -> tuple[str, bool]:

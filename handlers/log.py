@@ -31,14 +31,19 @@ ACTION_EMOJI = {
 
 
 def format_log_entry(r: dict) -> str:
+    from utils.helpers import esc
     emoji = ACTION_EMOJI.get(r["action"], "▪️")
     try:
         dt = datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M:%S").strftime("%d.%m %H:%M")
     except Exception:
         dt = r["created_at"][:16]
-    role_str = f" [{r['role']}]" if r.get("role") else ""
-    detail_str = f"\n    <i>{r['details']}</i>" if r.get("details") else ""
-    return f"{emoji} <code>{dt}</code>  <b>{r['full_name']}</b>{role_str}{detail_str}"
+    # full_name / role / details — пользовательский ввод, escape перед HTML
+    role_str = f" [{esc(r['role'])}]" if r.get("role") else ""
+    detail_str = f"\n    <i>{esc(r['details'])}</i>" if r.get("details") else ""
+    return (
+        f"{emoji} <code>{dt}</code>  <b>{esc(r['full_name'])}</b>"
+        f"{role_str}{detail_str}"
+    )
 
 
 def log_keyboard():

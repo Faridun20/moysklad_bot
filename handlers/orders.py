@@ -22,12 +22,9 @@ except ImportError:
 ALLOWED_CURRENCIES = ("USD", "UZS", "RUB", "EUR")
 
 
-def _esc(s) -> str:
-    """HTML-escape для пользовательских строк перед вставкой в bot-сообщения
-    с parse_mode='HTML'. Имя товара/клиента/менеджера может прилететь с
-    `<` или `&` (например, через UI МойСклад), и без escape сообщение
-    либо ломалось бы, либо открывало путь к HTML-инъекции."""
-    return html.escape(str(s or ""), quote=False)
+# Единая реализация в utils.helpers.esc — оставлен _esc-алиас чтобы
+# не править каждый callsite в этом большом файле.
+from utils.helpers import esc as _esc  # noqa: E402
 
 
 def _cur(amount: float, currency: str | None = None) -> str:
