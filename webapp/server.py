@@ -584,6 +584,7 @@ async def api_analytics(request: Request):
     """
     from datetime import datetime, timedelta
     from services.moysklad import get_sales_stats, get_shipments
+    from utils.helpers import utc_now
 
     data = await request.json()
     user = verify_init_data(data.get("initData", ""))
