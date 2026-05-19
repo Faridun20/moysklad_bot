@@ -300,13 +300,14 @@ async def create_customerorder_from_request(
         ) as resp:
             body = await resp.text()
             if resp.status >= 400:
+                from services.moysklad import redact_ms_error
+                safe = redact_ms_error(body)
                 logger.error(
-                    "MS create customerorder HTTP %s: %s",
-                    resp.status, body[:500],
+                    "MS create customerorder HTTP %s: %s", resp.status, safe,
                 )
                 return {
                     "ok": False,
-                    "reason": f"HTTP {resp.status}: {body[:250]}",
+                    "reason": f"HTTP {resp.status}: {safe}",
                 }
             created = json.loads(body)
             co_id = created.get("id", "")

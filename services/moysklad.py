@@ -4,6 +4,7 @@
 
 import asyncio
 import functools
+import json as _json
 import logging
 import time
 import aiohttp
@@ -11,6 +12,36 @@ from datetime import datetime
 
 from config import MS_TOKEN
 from utils.helpers import extract_id_from_href
+
+
+def redact_ms_error(body: str, max_len: int = 200) -> str:
+    """Безопасный лог ошибки от МойСклад API.
+
+    SECURITY.md H7: МойСклад в error-body часто включает реальные UUID,
+    имена контрагентов, поля заказов — PII, которая попадает в Railway
+    logs / Better Stack / Axiom log drain (если подключён). Аудит-агент
+    может видеть чужие данные.
+
+    Что делаем: пробуем распарсить body как JSON и достать только
+    `error` + `code` поля. Остальное (parameter, moreInfo, line) теряем —
+    они полезны для отладки, но могут содержать чувствительное.
+    Fallback на жёсткий truncate если JSON не парсится.
+    """
+    if not body:
+        return ""
+    try:
+        data = _json.loads(body)
+        errors = data.get("errors") if isinstance(data, dict) else None
+        if isinstance(errors, list) and errors:
+            err0 = errors[0] or {}
+            code = err0.get("code", "?")
+            # error-text иногда сам содержит имена / уникальные id —
+            # обрезаем агрессивно.
+            text = str(err0.get("error", ""))[:120]
+            return f"code={code} error={text!r}"
+    except Exception:
+        pass
+    return body[:max_len]
 
 logger = logging.getLogger(__name__)
 

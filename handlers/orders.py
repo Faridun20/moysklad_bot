@@ -917,7 +917,18 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
                 set_order_ms_customerorder_id, set_order_ms_demand_id,
             )
             co_id = co_result.get("customerorder_id")
+            # Audit СРАЗУ после успешного POST в МойСклад — до того
+            # как мы пытаемся сохранить co_id в БД. SECURITY.md H6:
+            # если бот упадёт между POST и UPDATE (OOM/kill/network),
+            # без этого audit-записи orphan-CO в МойСклад будет
+            # никак не найти. С audit-записью админ ищет в логах
+            # `ms_co_created` и привязывает вручную.
             if co_id:
+                add_audit_log(
+                    call.from_user.id, boss_name, get_role(call.from_user.id),
+                    "ms_co_created",
+                    f"Заявка #{req_id} → customerorder {co_id} (до db-write)",
+                )
                 set_order_ms_customerorder_id(order["id"], co_id)
 
             # PDF берём от customerorder — он содержит читаемую форму заказа
@@ -940,7 +951,13 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
             )
             if demand_result.get("ok"):
                 demand_id = demand_result.get("demand_id")
+                # Audit ДО db-write (H6) — см. комментарий выше для CO.
                 if demand_id:
+                    add_audit_log(
+                        call.from_user.id, boss_name, get_role(call.from_user.id),
+                        "ms_demand_created",
+                        f"Заявка #{req_id} → demand {demand_id} (до db-write)",
+                    )
                     set_order_ms_demand_id(order["id"], demand_id)
                 demand_line = (
                     f"\n📄 Заказ покупателя создан в МойСклад"

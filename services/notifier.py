@@ -35,15 +35,22 @@ _tg_session_lock = asyncio.Lock()
 
 
 async def get_tg_session() -> aiohttp.ClientSession:
-    """Вернуть общую сессию для запросов в api.telegram.org."""
+    """Вернуть общую сессию для запросов в api.telegram.org.
+
+    SECURITY.md H8: TELEGRAM_TOKEN раньше вставлялся в URL inline
+    (f"https://api.telegram.org/bot{TOKEN}/..."). При любом исключении
+    aiohttp путь URL'а попадал в repr/traceback и мог утечь в
+    Railway logs / log drain. Сейчас session держит base_url с
+    токеном; POST'ы делаются по относительному пути `/sendMessage`,
+    токен в exception-tracebacks больше не виден.
+    """
     global _tg_session
     if _tg_session is None or _tg_session.closed:
         async with _tg_session_lock:
             if _tg_session is None or _tg_session.closed:
-                # limit=10 — нам не нужно больше параллельных соединений
-                # к Telegram, чтобы не упереться в их per-bot rate-limit
                 connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
                 _tg_session = aiohttp.ClientSession(
+                    base_url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}",
                     connector=connector,
                     timeout=_TG_TIMEOUT,
                 )
@@ -75,8 +82,9 @@ async def tg_send_message(
         payload["reply_markup"] = reply_markup
     try:
         sess = await get_tg_session()
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        async with sess.post(url, json=payload) as resp:
+        # Относительный путь — base_url с токеном задан в session.
+        # Токен не появляется в local-trace / repr(request).
+        async with sess.post("/sendMessage", json=payload) as resp:
             if resp.status >= 400:
                 body = await resp.text()
                 logger.warning(
@@ -84,7 +92,9 @@ async def tg_send_message(
                     chat_id, resp.status, body[:200],
                 )
     except Exception as e:
-        logger.warning("tg sendMessage %d failed: %s", chat_id, e)
+        # Используем %r для chat_id (число — без токена), repr(e)
+        # для текста ошибки (тип + msg, без HTTP-URL внутри).
+        logger.warning("tg sendMessage %d failed: %r", chat_id, e)
 
 # ─── Получатели уведомлений ───
 def get_notify_recipients() -> list[int]:

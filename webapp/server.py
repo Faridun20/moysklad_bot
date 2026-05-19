@@ -168,6 +168,13 @@ async def telegram_webhook(secret: str, request: Request):
 # ─── Webhook от МойСклад ─────────────────────────────────────────────────────
 
 
+# Лимит payload MS-webhook'а — реалистично от МойСклад приходит ≤ 50KB
+# (события батчатся). 1MB достаточно с большим запасом, при этом
+# защищает от DoS: кто-то с известным секретом мог бы слать тяжёлые
+# body, забивая нашу память.
+_MS_WEBHOOK_MAX_BYTES = 1 * 1024 * 1024
+
+
 @app.post("/api/ms-webhook/{secret}")
 async def ms_webhook(secret: str, request: Request):
     """
@@ -179,16 +186,31 @@ async def ms_webhook(secret: str, request: Request):
     _stock_debounce_loop через несколько секунд сделает refresh_stock,
     батча все полученные события в один pull.
     """
+    import hmac as _hmac
     from services.ms_webhooks import get_webhook_secret
     from services.snapshot import mark_stock_dirty
 
-    if secret != get_webhook_secret():
-        # Не отдаём 401 чтобы не подсказывать злоумышленнику, что секрет нужен;
-        # просто молчим.
+    # constant-time сравнение секрета (timing-attack hardening)
+    if not _hmac.compare_digest(secret, get_webhook_secret()):
+        # Не отдаём 401 — не подсказываем атакующему, что секрет нужен.
         raise HTTPException(status_code=404, detail="not found")
 
+    # Лимит на размер тела (defence in depth — реальный МС шлёт ≤50KB)
+    cl = request.headers.get("Content-Length")
     try:
-        payload = await request.json()
+        if cl and int(cl) > _MS_WEBHOOK_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="payload too large")
+    except ValueError:
+        pass
+
+    try:
+        body_bytes = await request.body()
+        if len(body_bytes) > _MS_WEBHOOK_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="payload too large")
+        import json as _json
+        payload = _json.loads(body_bytes) if body_bytes else {}
+    except HTTPException:
+        raise
     except Exception:
         payload = {}
 
@@ -1098,7 +1120,16 @@ async def api_agents(request: Request):
         rate_limit_window=60.0,
     )
 
-    search = (data.get("search", "") or "").strip()
+    # Санитизация search (SECURITY.md H11): без неё manager мог через
+    # подобранные search-запросы устроить пачку дорогих запросов в
+    # МойСклад. Длина ≤ 50, только буквы/цифры/обычные знаки —
+    # без специальных символов, которые МойСклад может интерпретировать.
+    raw_search = (data.get("search", "") or "").strip()
+    if len(raw_search) > 50:
+        raw_search = raw_search[:50]
+    # Whitelist: буквы (любые юникодные), цифры, пробелы, основные знаки
+    import re as _re
+    search = _re.sub(r"[^\w\s\-\.,'@+()/]", "", raw_search, flags=_re.UNICODE)
     rows = snapshot.get_counterparties(search=search if search else None, limit=50)
     if rows:
         return JSONResponse({"agents": [

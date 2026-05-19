@@ -465,20 +465,6 @@ def init_db():
 
 
 
-def _migrate(cur):
-    """Добавляем новые колонки в существующие таблицы."""
-    migrations = [
-        ("user_roles", "moysklad_employee_id", "TEXT"),
-        ("user_roles", "ms_sync_status", "TEXT DEFAULT 'pending'"),
-        ("user_roles", "created_at", "TEXT"),
-    ]
-    for table, column, col_type in migrations:
-        try:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
-        except Exception:
-            pass  # Колонка уже существует
-
-
 # ─── Роли ────────────────────────────────────────────────────────────────────
 
 

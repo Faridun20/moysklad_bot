@@ -8,7 +8,6 @@ from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 
-from config import ADMIN_IDS
 from services.database import set_role, get_role, get_all_users, add_audit_log
 from services.roles import can_manage_users, invalidate_role
 
