@@ -256,13 +256,27 @@ async def ms_webhook(secret: str, request: Request):
                 for e in events[:5]
             ),
         )
-        mark_stock_dirty()
-        # Документ изменился → читалки (get_sales_stats, get_shipments,
-        # позиции) могут отдавать устаревшие данные. Сбрасываем все
-        # TTL-кэши МС, чтобы следующее открытие «Аналитики» увидело
-        # свежие цифры.
-        from services.moysklad import invalidate_ms_cache
-        invalidate_ms_cache()
+
+        from services.ms_webhooks import STOCK_SUBSCRIPTIONS
+        _stock_types = {s[0] for s in STOCK_SUBSCRIPTIONS}
+
+        # Остатки: только события от складских документов
+        stock_events = [
+            e for e in events
+            if (e.get("meta") or {}).get("type", "").lower() in _stock_types
+        ]
+        if stock_events:
+            mark_stock_dirty()
+            # Документ изменился → читалки (get_sales_stats, get_shipments,
+            # позиции) могут отдавать устаревшие данные. Сбрасываем все
+            # TTL-кэши МС, чтобы следующее открытие «Аналитики» увидело
+            # свежие цифры.
+            from services.moysklad import invalidate_ms_cache
+            invalidate_ms_cache()
+
+        # Платежи / заказы покупателя: синхронизируем локальные данные
+        from services.ms_sync_handler import handle_ms_events
+        asyncio.create_task(handle_ms_events(events))
 
     # МойСклад ждёт 200 быстро, иначе ретраит. Сам рефреш делаем в фоне.
     return JSONResponse({"ok": True, "received": len(events)})

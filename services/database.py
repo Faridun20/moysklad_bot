@@ -967,6 +967,72 @@ def set_payment_ms_sync(
     return updated
 
 
+def find_payment_by_ms_paymentin_id(paymentin_id: str) -> dict | None:
+    """Найти локальный платёж по ID paymentin в МойСклад.
+    Используется когда МойСклад присылает webhook о удалении/изменении paymentin."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT * FROM payments WHERE ms_paymentin_id = ? LIMIT 1"),
+            (paymentin_id,),
+        )
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def reset_payment_ms_sync(payment_id: int) -> bool:
+    """Сбросить привязку к paymentin (он удалён в МойСклад).
+
+    ms_paymentin_id → NULL, ms_sync_status → 'deleted_in_ms'.
+    Существующий cron run_ms_sync_retry подберёт платёж при следующем
+    запуске (условие: ms_paymentin_id IS NULL AND status='confirmed')
+    и создаст новый paymentin автоматически.
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "UPDATE payments "
+                "SET ms_paymentin_id = NULL, ms_sync_status = 'deleted_in_ms' "
+                "WHERE id = ?"
+            ),
+            (payment_id,),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    return updated
+
+
+def find_order_by_ms_customerorder_id(co_id: str) -> dict | None:
+    """Найти локальный заказ по ID customerorder в МойСклад.
+    Используется для обработки webhook-событий customerorder."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT * FROM orders WHERE ms_customerorder_id = ? LIMIT 1"),
+            (co_id,),
+        )
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def clear_order_ms_customerorder_id(order_id: int) -> bool:
+    """Снять ссылку на customerorder (документ удалён в МойСклад).
+    После сброса повторный approve заявки создаст новый customerorder."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "UPDATE orders SET ms_customerorder_id = NULL, updated_at = ? "
+                "WHERE id = ?"
+            ),
+            (now_str(), order_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    return updated
+
+
 def delete_order(order_id: int, requested_by: int) -> bool:
     """Удалить заказ-черновик. Только status='draft' можно удалять, и
     только владелец (даже boss/admin не удаляет чужие — нужно жёстче

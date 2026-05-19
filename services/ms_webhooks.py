@@ -22,8 +22,13 @@ from services.moysklad import ms_get, get_session, MS_BASE
 logger = logging.getLogger(__name__)
 
 
-# Перечень событий, влияющих на остатки. Можно расширять.
-SUBSCRIPTIONS = [
+# Подписки разделены по смыслу:
+#   STOCK_SUBSCRIPTIONS  — влияют на остатки склада (demand/supply/loss/…)
+#   ENTITY_SUBSCRIPTIONS — изменения платежей и заказов покупателя
+# В ensure_subscriptions() регистрируем все; webhook-обработчик сам
+# маршрутизирует событие по типу.
+
+STOCK_SUBSCRIPTIONS = [
     ("demand", "CREATE"),
     ("demand", "UPDATE"),
     ("demand", "DELETE"),
@@ -34,6 +39,17 @@ SUBSCRIPTIONS = [
     ("inventory", "CREATE"),
     ("retaildemand", "CREATE"),
 ]
+
+ENTITY_SUBSCRIPTIONS = [
+    # Входящий платёж: удалён / изменён вручную в МойСклад
+    ("paymentin", "DELETE"),
+    ("paymentin", "UPDATE"),
+    # Заказ покупателя: сменился статус или удалён
+    ("customerorder", "UPDATE"),
+    ("customerorder", "DELETE"),
+]
+
+SUBSCRIPTIONS = STOCK_SUBSCRIPTIONS + ENTITY_SUBSCRIPTIONS
 
 
 def get_webhook_secret() -> str:
