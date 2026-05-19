@@ -117,8 +117,13 @@ async def cmd_debts(message: Message):
     debts = get_open_debts(user_id=None if boss_view else user_id)
 
     if not debts:
+        scope = "по компании" if boss_view else "у вас"
         await message.answer(
-            f"{DIV}\n💳 <b>Долги</b>\n\nОткрытых долгов нет.",
+            f"{DIV}\n"
+            f"💳 <b>Долги</b>\n\n"
+            f"Открытых долгов {scope} нет — все деньги собраны 🎉\n\n"
+            f"<i>Долги появляются автоматически когда менеджер "
+            f"оформляет заказ «в долг».</i>",
             parse_mode="HTML",
         )
         return
@@ -162,6 +167,18 @@ async def cmd_debts(message: Message):
             # Если одно сообщение не ушло — продолжаем со следующим,
             # лучше частично показать, чем вообще ничего.
             logger.exception("Не удалось показать долг #%s", d["id"])
+
+
+# ─── Callback: «💳 Долги» из главного меню ──────────────────────────────────
+
+
+@router.callback_query(F.data == "debts_my")
+async def cb_debts_my(callback: CallbackQuery):
+    """Из inline-меню «💳 Долги» — переотправляем тот же ответ что
+    и команда /debts, чтобы юзеру не приходилось набирать команду.
+    """
+    await callback.answer()
+    await cmd_debts(callback.message)
 
 
 # ─── Callback: отметить оплачено ─────────────────────────────────────────────

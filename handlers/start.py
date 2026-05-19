@@ -3,11 +3,15 @@
 """
 import os
 import logging
-from aiogram import Router, F
+from aiogram import Bot, Router, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import (
+    Message, CallbackQuery,
+    WebAppInfo,
+    ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton,
+    BotCommand, BotCommandScopeChat,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import WebAppInfo
 from services.roles import is_boss, is_guest
 from utils.formatters import DIV   
 from config import ADMIN_IDS
@@ -30,66 +34,46 @@ ROLE_NAMES = {
 
 def get_keyboard_for_role(role: str):
     """
-    Главное меню под роль. «Каталог» (Остатки + Категории) собран в
-    одну кнопку, открывающую подменю — раньше эти два пункта занимали
-    отдельный ряд. Заказы рядом с каталогом тематически.
+    Сокращённое inline-меню — только то, что неудобно делать через WebApp:
+    срочные действия (Заявки на апрув для босса) и admin-only функции
+    (Пользователи, Аудит). Каталог / Новый заказ / Аналитика / Платежи
+    живут в WebApp — туда ведёт persistent reply-кнопка «🌐 Открыть»
+    снизу чата (webapp_reply_keyboard).
+
+    Раньше тут было 7-9 кнопок которые дублировали WebApp. Это
+    путало пользователя: где «правильно» создавать заказ — в чате
+    или в WebApp? Теперь чёткое разделение.
     """
     kb = InlineKeyboardBuilder()
+    rows: list[int] = []
 
-    # Каталог — одна кнопка, ведёт в shop_menu (там Остатки+Категории)
+    # Для всех — быстрый доступ к своим заказам и долгам (полезно
+    # когда WebApp лень открывать просто чтобы посмотреть).
     if role in ("admin", "boss", "manager"):
-        kb.button(text="🛒 Каталог", callback_data="shop_menu")
-
-    # Заказы — самое частое действие, в один тап
-    if role in ("admin", "boss", "manager"):
-        kb.button(text="➕ Новый заказ", callback_data="ord_new")
         kb.button(text="📋 Мои заказы", callback_data="ord_my")
+        kb.button(text="💳 Долги",       callback_data="debts_my")
+        rows += [2]
 
-    # Отгрузки + Аналитика
-    if role in ("admin", "boss", "manager"):
-        kb.button(text="🚚 Отгрузки", callback_data="sh_period")
-        kb.button(text="📊 Аналитика", callback_data="analytics")
-
-    # Заявки на отгрузку — только босс/админ
+    # Срочное для босса/админа — апрув заявок (push-driven но дублируем
+    # сюда чтобы можно было пересмотреть «все pending» одним тапом).
     if role in ("admin", "boss"):
         kb.button(text="⏳ Заявки на апрув", callback_data="ord_requests")
-        kb.button(text="📈 Отчёты", callback_data="reports_menu")
+        rows += [1]
 
-    # Платежи: отправляют только менеджеры (и админ для теста).
-    if role in ("admin", "manager"):
+    # Менеджер: быстрая отправка платежа в кассу (не привязанного к заказу).
+    if role == "manager":
         kb.button(text="💵 Отправить платёж", callback_data="pay_start")
-    if role in ("admin", "boss"):
-        kb.button(text="📊 Отчёт по платежам", callback_data="pr:menu")
+        rows += [1]
 
-    # Админская строка
+    # Админский ряд — управление пользователями и аудит.
     if role == "admin":
         kb.button(text="👥 Пользователи", callback_data="users_list")
-        kb.button(text="📋 Аудит", callback_data="al:today")
+        kb.button(text="📋 Аудит",        callback_data="al:today")
+        rows += [2]
 
-    # WebApp кнопкой во всю ширину
-    webapp_url = os.environ.get("WEBAPP_URL", "")
-    has_webapp = bool(webapp_url)
-    if has_webapp:
-        kb.button(text="🌐 Открыть WebApp", web_app=WebAppInfo(url=webapp_url))
-
-    # Раскладка
-    rows: list[int] = []
-    if role in ("admin", "boss", "manager"):
-        rows += [1]      # Каталог во всю ширину (важная точка входа)
-        rows += [2]      # Новый + Мои
-        rows += [2]      # Отгрузки + Аналитика
-    if role in ("admin", "boss"):
-        rows += [2]      # Заявки + Отчёты
-    if role == "admin":
-        rows += [2]      # Платёж + Отчёт по платежам
-    elif role == "boss":
-        rows += [1]      # Только отчёт
-    elif role == "manager":
-        rows += [1]      # Только отправка
-    if role == "admin":
-        rows += [2]      # Пользователи + Аудит
-    if has_webapp:
-        rows += [1]
+    if not rows:
+        # Guest или unknown role — пустой markup
+        return None
     kb.adjust(*rows)
     return kb.as_markup()
 
@@ -104,21 +88,100 @@ def shop_submenu_keyboard():
     return kb.as_markup()
 
 
-def get_welcome_text(role: str, first_name: str = "") -> str:
+def webapp_reply_keyboard(webapp_url: str | None):
+    """Persistent reply-кнопка «🌐 Открыть» снизу чата.
+
+    В отличие от inline-меню (которое теряется как только юзер прокрутил
+    выше), reply-кнопка всегда видна над полем ввода — паттерн крупных
+    WebApp-ботов (Wallet, Mini-store).
+
+    Если WEBAPP_URL не задан — снимаем клавиатуру (ReplyKeyboardRemove),
+    чтобы не оставлять висеть кнопку, ведущую в никуда.
     """
-    Короткое приветствие — без длинного списка команд (он висит в
-    автокомплите Telegram и дублирует кнопки ниже).
+    if not webapp_url:
+        return ReplyKeyboardRemove()
+    return ReplyKeyboardMarkup(
+        keyboard=[[
+            KeyboardButton(text="🌐 Открыть", web_app=WebAppInfo(url=webapp_url)),
+        ]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+# Команды для /-автокомплита Telegram. Разные наборы для разных ролей —
+# менеджеру не показываем admin-only /addrole, /audit и т.п.
+_COMMANDS_MANAGER = [
+    BotCommand(command="start",     description="🏠 Главное меню"),
+    BotCommand(command="neworder",  description="➕ Новый заказ"),
+    BotCommand(command="myorders",  description="📋 Мои заказы"),
+    BotCommand(command="pay",       description="💵 Отправить платёж"),
+    BotCommand(command="debts",     description="💳 Мои долги"),
+]
+_COMMANDS_BOSS = _COMMANDS_MANAGER + [
+    BotCommand(command="orders",        description="⏳ Заявки на апрув"),
+    BotCommand(command="shipments",     description="🚚 Последние отгрузки"),
+    BotCommand(command="analytics",     description="📊 Аналитика продаж"),
+    BotCommand(command="sync_payments", description="🔄 Статус синка с МойСклад"),
+]
+_COMMANDS_ADMIN = _COMMANDS_BOSS + [
+    BotCommand(command="users",   description="👥 Пользователи"),
+    BotCommand(command="addrole", description="🔧 Сменить роль"),
+    BotCommand(command="audit",   description="📋 Аудит лог"),
+]
+
+
+async def set_commands_for_user(bot: Bot, chat_id: int, role: str) -> None:
+    """Установить per-chat список /-команд под роль. Telegram кэширует
+    эти команды у клиента — после /start пользователь сразу увидит
+    свой набор в автокомплите.
+    """
+    if role == "admin":
+        commands = _COMMANDS_ADMIN
+    elif role == "boss":
+        commands = _COMMANDS_BOSS
+    elif role == "manager":
+        commands = _COMMANDS_MANAGER
+    else:
+        commands = [BotCommand(command="start", description="🏠 Активировать аккаунт")]
+    try:
+        await bot.set_my_commands(
+            commands=commands,
+            scope=BotCommandScopeChat(chat_id=chat_id),
+        )
+    except Exception as e:
+        logger.warning("set_my_commands для chat=%s failed: %s", chat_id, e)
+
+
+def get_welcome_text(role: str, first_name: str = "") -> str:
+    """Приветствие с короткой подсказкой про навигацию.
+
+    Главная мысль: «жми 🌐 Открыть снизу для всех действий». Подменю
+    в чате — только для срочного. Без длинного списка команд (он
+    висит в /-автокомплите Telegram через set_my_commands).
     """
     role_name = ROLE_NAMES.get(role, "👤 Сотрудник")
     name_part = f", <b>{first_name}</b>" if first_name else ""
     if role == "guest":
         return (
-            f"👋 Здравствуйте{name_part}!\n"
-            f"Аккаунт ещё не активирован."
+            f"👋 Здравствуйте{name_part}!\n\n"
+            "Ваш аккаунт ещё не активирован — обратитесь к администратору.\n\n"
+            "<i>Когда активируют — снова напишите /start</i>"
         )
+
+    hints = {
+        "admin": "Полный доступ. Управление пользователями и аудит — кнопками ниже.",
+        "boss": "Заявки на одобрение и подтверждение платежей — приходят push'ами.",
+        "manager": "Создавайте заказы и отмечайте оплаты — всё в WebApp.",
+    }
+    hint = hints.get(role, "")
+
     return (
         f"👋 Привет{name_part}!\n"
-        f"{role_name}"
+        f"{role_name}\n\n"
+        f"🌐 <b>Жмите «Открыть» снизу</b> — там всё:\n"
+        f"каталог, заказы, аналитика, долги, платежи.\n\n"
+        f"<i>{hint}</i>"
     )
 
 
@@ -154,16 +217,20 @@ async def cmd_start(message: Message):
     except Exception as e:
         logger.warning("set_chat_menu_button per-chat failed for %s: %s", user.id, e)
 
-    # Гости — те, кого админ ещё не активировал. Не показываем им меню
-    # каталога/заявок, только короткое сообщение со своим ID. Админ
-    # повышает роль командой /addrole <id> manager.
+    # Ставим список /-команд под роль (Telegram автокомплит).
+    await set_commands_for_user(message.bot, message.chat.id, role)
+
+    # Гости — те, кого админ ещё не активировал.
     if role == "guest":
         return await message.answer(
-            "👋 Здравствуйте!\n\n"
-            "Ваш аккаунт ещё не активирован для работы с этим ботом.\n"
+            f"👋 Здравствуйте!\n\n"
+            f"Ваш аккаунт ещё не активирован для работы с этим ботом.\n"
             f"Передайте свой ID администратору: <code>{user.id}</code>\n\n"
-            "После активации напишите /start ещё раз.",
+            f"После активации напишите /start ещё раз.",
             parse_mode="HTML",
+            # Снимаем reply-кнопку, чтобы гость не видел «🌐 Открыть»
+            # которая всё равно вернёт 403 (нет роли).
+            reply_markup=ReplyKeyboardRemove(),
         )
 
     # Автоматически синхронизируем менеджеров с МойСклад.
@@ -194,11 +261,23 @@ async def cmd_start(message: Message):
                 f"недоступна без привязки.</i>"
             )
 
+    # 1) Welcome + persistent reply-кнопка «🌐 Открыть» снизу чата
     await message.answer(
         get_welcome_text(role, user.first_name or "") + sync_status_line,
         parse_mode="HTML",
-        reply_markup=get_keyboard_for_role(role),
+        reply_markup=webapp_reply_keyboard(webapp_url),
     )
+
+    # 2) Если есть срочные/admin-only действия — отдельное короткое
+    #    меню inline-кнопок (Заявки на апрув, Пользователи, Аудит).
+    #    Для обычного менеджера get_keyboard_for_role вернёт inline-меню
+    #    с «Мои заказы»/«Долги»/«Платёж» — тоже отдельным сообщением.
+    inline_markup = get_keyboard_for_role(role)
+    if inline_markup is not None:
+        await message.answer(
+            "⚡ Быстрые действия:",
+            reply_markup=inline_markup,
+        )
 
     # Показываем сводку за месяц для менеджера
     if role == "manager":
@@ -255,11 +334,18 @@ async def cb_menu(call: CallbackQuery):
         return await call.message.answer(
             "⛔ Ваш аккаунт ещё не активирован. Напишите /start."
         )
+    # Welcome без reply_markup — reply-клавиатура уже была установлена
+    # один раз при /start и осталась видна (is_persistent=True).
     await call.message.answer(
         get_welcome_text(role, user.first_name or ""),
         parse_mode="HTML",
-        reply_markup=get_keyboard_for_role(role),
     )
+    inline_markup = get_keyboard_for_role(role)
+    if inline_markup is not None:
+        await call.message.answer(
+            "⚡ Быстрые действия:",
+            reply_markup=inline_markup,
+        )
 
 @router.callback_query(F.data == "shop_menu")
 async def cb_shop_menu(call: CallbackQuery):

@@ -312,11 +312,15 @@ async def cmd_my_orders(message: Message):
     orders = await _asyncio.to_thread(get_user_orders, message.from_user.id)
     if not orders:
         kb = InlineKeyboardBuilder()
-        kb.button(text="➕ Создать заказ", callback_data="ord_new")
-        kb.button(text="🏠 Меню",          callback_data="menu")
+        kb.button(text="➕ Создать первый заказ", callback_data="ord_new")
         kb.adjust(1)
         return await message.answer(
-            "📋 У вас пока нет заказов.",
+            "📋 <b>У вас пока нет заказов</b>\n\n"
+            "Самый удобный способ собрать заказ — открыть WebApp:\n"
+            "выберите товары, клиента и отправьте на одобрение.\n\n"
+            "🌐 Кнопка «Открыть» снизу чата.\n"
+            "Или быстро создать заказ через бота — кнопкой ниже.",
+            parse_mode="HTML",
             reply_markup=kb.as_markup(),
         )
 
