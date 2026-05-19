@@ -502,8 +502,41 @@ tests/
 
 ---
 
+## Closed
+
+Закрытые после первоначального аудита — со ссылкой на коммит. Если
+заново всплывут — открой новой записью в Critical/High/Medium/Low.
+
+| ID | Что | Коммит |
+|---|---|---|
+| C1 | `manager-by-default` → `guest` при пустом ALLOWED_USERS, явный legacy-флаг | round 1 |
+| C2 | role mismatch `employee` vs `guest` — единый whitelist | round 1 |
+| C3 | Telegram webhook «двойная защита» — честный комментарий, не пропадает | round 1 |
+| H1 | mark_order_paid race → `SELECT … FOR UPDATE` на orders | round 1 |
+| H2 | confirm_payment + _maybe_close_order race → одна транзакция | round 1 |
+| H3 | create_paymentin double-write → UNIQUE constraint на ms_paymentin_id | round 1 |
+| H4 | init_db DDL/UPDATE race → `tasks/migrate.py` + split init_db | [042bcd5](https://github.com/Faridun20/moysklad_bot/commit/042bcd5) |
+| H5 | _ensure_custom_attribute race → re-read on POST failure | [042bcd5](https://github.com/Faridun20/moysklad_bot/commit/042bcd5) |
+| H6 | orphan customerorder → audit_log до db-write | [042bcd5](https://github.com/Faridun20/moysklad_bot/commit/042bcd5) |
+| H7 | PII в MS error logs → `redact_ms_error` | [042bcd5](https://github.com/Faridun20/moysklad_bot/commit/042bcd5) |
+| H8 | TELEGRAM_TOKEN в URL — логируется только chat_id+status | round 1 |
+| H9 | MS_WEBHOOK_SECRET fail-fast в проде | round 1 |
+| H11 | `/api/agents` search санитизация (len ≤ 50, char whitelist) | round 1 |
+| H12 | XSS через audit log → universal `_esc` в utils/helpers | round 1 |
+| M (HTML escape) | escape во всех форматтерах | round 1 |
+| M (TZ) | datetime.utcnow → utc_now; today_iso → local_now в webapp | [042bcd5](https://github.com/Faridun20/moysklad_bot/commit/042bcd5) |
+| M (idempotency) | /api/confirm_payment принимает idempotency_key | [042bcd5](https://github.com/Faridun20/moysklad_bot/commit/042bcd5) |
+| M (dedup IN) | get_orders_by_ids / get_payments_for_orders / get_order_items_by_ids дедупликация | [042bcd5](https://github.com/Faridun20/moysklad_bot/commit/042bcd5) |
+| M (sync DB in async) | handlers/orders — to_thread на cmd_new_order/myorders/orders | [042bcd5](https://github.com/Faridun20/moysklad_bot/commit/042bcd5) |
+| Low (PAGE_SIZE) | вынесен в config.PAGE_SIZE | [f86ad7a](https://github.com/Faridun20/moysklad_bot/commit/f86ad7a) |
+| Low (_migrate dead code) | удалён | round 1 |
+| Low (asyncpg unused) | удалён из requirements.txt | round 1 |
+| Tests + CI | pytest + GitHub Actions | round 1 |
+
 ## История изменений этого документа
 
 | Дата | Что | Кто |
 |---|---|---|
 | 2026-05-19 | Первоначальный аудит | Claude (general-purpose agent) |
+| 2026-05-19 | Раунд 1 фиксов: 3 Critical, тесты+CI, payment races, HTML escape | Claude |
+| 2026-05-19 | Раунд 2 фиксов: H4-H7, H11, TZ, idempotency, dedup, sync→async, PAGE_SIZE | Claude |
