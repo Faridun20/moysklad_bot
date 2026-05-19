@@ -134,3 +134,50 @@ def local_now() -> datetime:
     from config import TZ_OFFSET
 
     return utc_now() + timedelta(hours=TZ_OFFSET)
+
+
+# Telegram limit одного сообщения. Используется в chunk_messages.
+TELEGRAM_MESSAGE_MAX = 4000
+
+
+def filter_records_by_period(records: list[dict], period: str) -> list[dict]:
+    """Универсальный фильтр по полю `created_at` (ISO-строка).
+
+    period: 'today' | 'week' | 'month' | что-то ещё (= все записи).
+    Используется и в /audit, и в /log handlers — раньше каждый держал
+    свою копию.
+    """
+    from datetime import datetime as _dt
+    now = _dt.now()
+    if period == "today":
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "week":
+        cutoff = now - timedelta(weeks=1)
+    elif period == "month":
+        cutoff = now - timedelta(days=30)
+    else:
+        return records
+    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    return [r for r in records if r["created_at"] >= cutoff_str]
+
+
+def chunk_messages(lines: list[str], limit: int = TELEGRAM_MESSAGE_MAX) -> list[str]:
+    """Склеить строки в сообщения по limit-символов (Telegram = 4000).
+
+    Раньше эта же логика дублировалась в audit.py:format_audit_log
+    и log.py:send_log. Тут — единая реализация.
+    """
+    if not lines:
+        return []
+    messages: list[str] = []
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 1 > limit:
+            if current:
+                messages.append(current)
+            current = line
+        else:
+            current = (current + "\n" + line) if current else line
+    if current:
+        messages.append(current)
+    return messages

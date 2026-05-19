@@ -13,37 +13,15 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services.roles import can_manage_users
 from services.database import get_audit_log, get_all_users
-from utils.formatters import DIV, DIV2
+from utils.formatters import DIV, DIV2, format_audit_entry
+from utils.helpers import chunk_messages, filter_records_by_period
 
 logger = logging.getLogger(__name__)
 router = Router()
 
-ACTION_EMOJI = {
-    "user_added":        "🟢",
-    "user_removed":      "🔴",
-    "role_changed":      "🔄",
-    "payment_sent":      "💵",
-    "payment_confirmed": "✅",
-    "payment_rejected":  "❌",
-    "payment_archived":  "📦",
-    "login":             "👤",
-}
-
-
-def format_log_entry(r: dict) -> str:
-    from utils.helpers import esc
-    emoji = ACTION_EMOJI.get(r["action"], "▪️")
-    try:
-        dt = datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M:%S").strftime("%d.%m %H:%M")
-    except Exception:
-        dt = r["created_at"][:16]
-    # full_name / role / details — пользовательский ввод, escape перед HTML
-    role_str = f" [{esc(r['role'])}]" if r.get("role") else ""
-    detail_str = f"\n    <i>{esc(r['details'])}</i>" if r.get("details") else ""
-    return (
-        f"{emoji} <code>{dt}</code>  <b>{esc(r['full_name'])}</b>"
-        f"{role_str}{detail_str}"
-    )
+# format_log_entry удалён — используем единый format_audit_entry из
+# utils/formatters.py. Раньше был дубль с почти тем же кодом + ACTION_EMOJI,
+# что давало риск рассинхрона: добавишь action в одном — забудешь в другом.
 
 
 def log_keyboard():
@@ -85,24 +63,16 @@ async def cb_log(call: CallbackQuery):
         kb.adjust(1)
         return await call.message.answer("👤 Выберите сотрудника:", reply_markup=kb.as_markup())
 
-    now = datetime.now()
-
     if mode == "20":
         records = get_audit_log(limit=20)
         label = "последние 20"
-    elif mode == "today":
-        records = get_audit_log(limit=200)
-        cutoff = now.replace(hour=0, minute=0, second=0).strftime("%Y-%m-%d %H:%M:%S")
-        records = [r for r in records if r["created_at"] >= cutoff]
-        label = "сегодня"
-    elif mode == "week":
-        records = get_audit_log(limit=500)
-        cutoff = (now - timedelta(weeks=1)).strftime("%Y-%m-%d %H:%M:%S")
-        records = [r for r in records if r["created_at"] >= cutoff]
-        label = "эта неделя"
+    elif mode in ("today", "week"):
+        # filter_records_by_period — общий helper из utils.helpers
+        # (раньше эта же дата-фильтрация дублировалась inline).
+        records = filter_records_by_period(get_audit_log(limit=500), mode)
+        label = "сегодня" if mode == "today" else "эта неделя"
     elif mode == "payments":
-        records = get_audit_log(limit=200)
-        records = [r for r in records if "payment" in r["action"]]
+        records = [r for r in get_audit_log(limit=200) if "payment" in r["action"]]
         label = "только платежи"
     else:
         records = get_audit_log(limit=20)
@@ -146,21 +116,10 @@ async def send_log(message, records: list[dict], label: str):
     ]
 
     for r in records:
-        lines.append(format_log_entry(r))
+        lines.append(format_audit_entry(r))
 
-    # Разбиваем если длинно
-    full_text = "\n".join(lines)
-    chunks = []
-    current = ""
-    for line in lines:
-        if len(current) + len(line) + 1 > 4000:
-            chunks.append(current)
-            current = line
-        else:
-            current += "\n" + line if current else line
-    if current:
-        chunks.append(current)
-
+    # chunk_messages — общая утилита нарезки под Telegram-лимит
+    chunks = chunk_messages(lines)
     for chunk in chunks:
         await message.answer(chunk, parse_mode="HTML")
 

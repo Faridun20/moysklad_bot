@@ -283,19 +283,28 @@ async def healthz():
 # ─── Главная страница ─────────────────────────────────────────────────────────
 
 
-_INDEX_HTML_CACHE: str | None = None
+_INDEX_HTML_CACHE: tuple[float, str] | None = None  # (mtime, html)
 
 
 def _read_index_html() -> str:
-    """Читаем index.html один раз и подставляем версию для cache-busting.
-    Раньше мобильный Telegram месяцами держал старую app.js в WebView-кэше;
-    теперь URL вида app.js?v=<sha> меняется на каждом деплое и кэш обходится
-    автоматически."""
+    """Читаем index.html и подставляем версию для cache-busting.
+
+    Кэшируем по mtime файла: при `hot-reload` локально (uvicorn --reload
+    редактирует index.html) — мы это сразу подхватим. На проде файл
+    не меняется в рантайме, mtime стабилен — никакой overhead'а.
+    """
     global _INDEX_HTML_CACHE
-    if _INDEX_HTML_CACHE is None:
-        raw = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-        _INDEX_HTML_CACHE = raw.replace("{{VERSION}}", APP_VERSION)
-    return _INDEX_HTML_CACHE
+    path = STATIC_DIR / "index.html"
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        # Файла нет — отдаём кэшированный (если есть) или пустую заглушку
+        return _INDEX_HTML_CACHE[1] if _INDEX_HTML_CACHE else ""
+    if _INDEX_HTML_CACHE is None or _INDEX_HTML_CACHE[0] != mtime:
+        raw = path.read_text(encoding="utf-8")
+        html = raw.replace("{{VERSION}}", APP_VERSION)
+        _INDEX_HTML_CACHE = (mtime, html)
+    return _INDEX_HTML_CACHE[1]
 
 
 @app.get("/", response_class=HTMLResponse)

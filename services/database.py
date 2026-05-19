@@ -699,7 +699,12 @@ def remove_user(user_id: int, removed_by: int = None, removed_name: str = "") ->
 
 
 def add_payment(
-    user_id, username, full_name, amount, currency, comment,
+    user_id: int,
+    username: str,
+    full_name: str,
+    amount: float,
+    currency: str,
+    comment: str,
     order_id: int | None = None,
 ) -> int:
     """Создать запись о платеже. Если задан order_id — это «оплата по
