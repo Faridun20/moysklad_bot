@@ -11,7 +11,7 @@ from utils.helpers import (
     trend_arrow,
 )
 
-PAGE_SIZE = 10
+from config import PAGE_SIZE  # единый источник в config
 
 # ─── Общие элементы ───────────────────────────────────────────────────────────
 

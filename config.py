@@ -70,6 +70,12 @@ except ImportError:
     # security-аудите (см. SECURITY.md C1).
     LEGACY_OPEN_BOT = os.environ.get("LEGACY_OPEN_BOT", "").lower() in ("1", "true", "yes")
 
+    # ─── UI ────────────────────────────────────────────────────────
+    # Размер страницы в пагинаторах: каталог товаров, список заказов,
+    # история платежей. Раньше был раскопирован в 3 местах (handlers/
+    # stock, utils/formatters, utils/keyboards) — теперь единая точка.
+    PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "10"))
+
     # ─── Расписанные отчёты ────────────────────────────────────────
     # 1 (default) — daily/weekly/monthly работают внутри бот-процесса
     #               через asyncio.sleep-циклы. Удобно для one-process
