@@ -32,6 +32,7 @@ from typing import Any
 
 from services.database import (
     get_order, get_payment, set_payment_ms_sync,
+    claim_payment_for_ms_sync,
 )
 from services.moysklad import MS_BASE, get_session, ms_get
 
@@ -94,6 +95,16 @@ async def create_paymentin_for_payment(payment_id: int) -> dict:
             "paymentin_id": payment["ms_paymentin_id"],
             "url": _paymentin_url(payment["ms_paymentin_id"]),
             "already": True,
+        }
+
+    # Атомарно «застолбили» платёж — кто-то другой между чтением и
+    # этой проверкой мог уже начать syncать. UPDATE-WHERE-not-in-progress
+    # возвращает True только тому, кто выиграл гонку.
+    if not claim_payment_for_ms_sync(payment_id):
+        return {
+            "ok": False,
+            "reason": "concurrent sync already in progress",
+            "concurrent": True,
         }
 
     order = get_order(payment["order_id"])

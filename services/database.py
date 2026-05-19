@@ -379,6 +379,13 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_orders_credit_due ON orders(payment_type, paid_at, due_date)",
             # Для запросов «все платежи по заказу» — без него полный скан payments.
             "CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id)",
+            # Уникальность paymentin'ов в МойСклад. Спасает от race condition
+            # между cron-retry и confirm-hook: если оба попробуют создать
+            # paymentin для одного платежа, второй INSERT упадёт на UNIQUE
+            # constraint, а не наплодит дубликаты в МойСклад. Partial index —
+            # чтобы NULL'ы (ещё не синхронизированные) не конфликтовали.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_ms_paymentin_unique "
+            "ON payments(ms_paymentin_id) WHERE ms_paymentin_id IS NOT NULL",
         ]
         for sql in snapshot_indexes:
             try:
@@ -848,6 +855,39 @@ def get_recent_ms_sync_failures(limit: int = 5) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+def claim_payment_for_ms_sync(payment_id: int) -> bool:
+    """Атомарно «застолбить» платёж для синхронизации с МойСклад.
+
+    Защита от race condition между cron-retry и in-process confirm-hook:
+    оба могут одновременно решить «надо синкать» и оба вызовут POST в
+    МойСклад → дубль paymentin.
+
+    Логика: атомарный UPDATE-WHERE-status-not-in-progress. Только тот,
+    кто выиграл гонку (rowcount == 1), идёт в МойСклад. Остальные
+    видят False и тихо пропускают.
+
+    Returns True если этот вызов застолбил; False если уже застолбили,
+    уже syncнули или платежа нет.
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        # Не используем NOT IN потому что SQLite не любит NULL-сравнения
+        # таким способом. Явные проверки IS NULL OR != 'in_progress'.
+        cur.execute(
+            q(
+                "UPDATE payments "
+                "SET ms_sync_status = 'in_progress' "
+                "WHERE id = ? "
+                "  AND ms_paymentin_id IS NULL "
+                "  AND (ms_sync_status IS NULL OR ms_sync_status != 'in_progress')"
+            ),
+            (payment_id,),
+        )
+        claimed = cur.rowcount > 0
+        conn.commit()
+    return claimed
+
+
 def set_payment_ms_sync(
     payment_id: int,
     *,
@@ -958,31 +998,41 @@ def confirm_payment(payment_id: int, confirmed_by: int = None, confirmed_name: s
 
 
 def _trigger_ms_paymentin_sync(payment_id: int) -> None:
-    """Запустить async create_paymentin_for_payment в фоне, если есть
-    активный event loop. Если зов из чисто sync-контекста (cron-скрипта),
-    запускаем синхронно через asyncio.run."""
+    """Запустить async create_paymentin_for_payment в фоне.
+
+    Стратегия:
+      - Внутри активного event loop (aiogram/aiohttp в bot/webapp) —
+        кидаем create_task. Fire-and-forget: ошибки логируются в
+        ms_payments, БД-confirm уже закоммичен.
+      - В чисто sync-контексте (cron-скрипт, который не делает
+        confirm_payment напрямую, но если делает — короткоживущий
+        процесс) — поднимаем мини-loop через asyncio.run.
+
+    asyncio.get_running_loop() в Python 3.12+ — правильный способ;
+    бросает RuntimeError если нет активного loop'а, что нам нужно
+    как сигнал для fallback на asyncio.run.
+    """
+    import asyncio
     try:
-        import asyncio
         from services.ms_payments import create_paymentin_for_payment
     except Exception:
-        # ms_payments недоступен (например, тестовое окружение без MS_TOKEN)
-        return
+        return  # окружение без MS_TOKEN
 
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Внутри aiohttp/aiogram — кидаем задачу в текущий loop
-            asyncio.create_task(create_paymentin_for_payment(payment_id))
-            return
+        loop = asyncio.get_running_loop()
     except RuntimeError:
-        pass
-    # Sync-контекст: запускаем кратковременный loop
-    try:
-        import asyncio
-        asyncio.run(create_paymentin_for_payment(payment_id))
-    except Exception:
-        # Молча игнорируем — статус failed уже записан внутри ms_payments
-        pass
+        # Не в async-контексте — короткоживущий loop
+        try:
+            asyncio.run(create_paymentin_for_payment(payment_id))
+        except Exception:
+            # Статус failed уже записан внутри ms_payments — молча
+            pass
+        return
+
+    # В активном loop'е — fire-and-forget. Сохраняем ссылку чтобы
+    # не было RuntimeWarning «Task was destroyed».
+    task = loop.create_task(create_paymentin_for_payment(payment_id))
+    task.add_done_callback(lambda t: t.exception() and None)
 
 
 def _maybe_close_order_after_payment(
@@ -990,15 +1040,67 @@ def _maybe_close_order_after_payment(
     confirmed_by: int | None,
     confirmed_name: str,
 ) -> None:
-    """После approve платежа — если сумма confirmed дошла до order.total,
-    проставляем order.paid_confirmed_at. Идемпотентно: если уже стоит,
-    ничего не делаем (повторный confirm более старого платежа не должен
-    переписывать timestamp)."""
-    summary = get_order_payment_summary(order_id)
-    if summary["remaining"] > 0.01:  # ещё не полностью оплачен
-        return
+    """Атомарно проверить, закрыт ли заказ суммой confirmed-платежей,
+    и проставить paid_confirmed_at если да.
+
+    Параллельный confirm двух платежей одного заказа без блокировки приводил
+    к гонке: каждый вызов видел `remaining > 0` (потому что второй платёж
+    ещё не был зафиксирован для текущей транзакции) и оба пропускали
+    закрытие. Решение — `SELECT ... FOR UPDATE` на orders в начале
+    транзакции: пока первый confirm считает summary и UPDATE'ит заказ,
+    второй ждёт на lock'е и затем видит уже актуальные данные.
+
+    Для SQLite (локальная разработка) FOR UPDATE не поддерживается, но
+    там и нет конкуренции — один процесс. Условный SQL.
+    """
     with get_conn() as conn:
         cur = get_cursor(conn)
+
+        # Lock: для Postgres эта строка блокирует order до conn.commit().
+        if USE_POSTGRES:
+            cur.execute(
+                "SELECT paid_confirmed_at FROM orders WHERE id = %s FOR UPDATE",
+                (order_id,),
+            )
+        else:
+            cur.execute(
+                "SELECT paid_confirmed_at FROM orders WHERE id = ?",
+                (order_id,),
+            )
+        row = cur.fetchone()
+        if not row:
+            return
+        already_closed = (
+            row["paid_confirmed_at"] if USE_POSTGRES else row[0]
+        ) is not None
+        if already_closed:
+            return
+
+        # Пересчёт ВНУТРИ транзакции — видим актуальную сумму confirmed
+        cur.execute(
+            q(
+                "SELECT COALESCE(SUM(amount), 0) AS s FROM payments "
+                "WHERE order_id = ? AND status = 'confirmed'"
+            ),
+            (order_id,),
+        )
+        r = cur.fetchone()
+        confirmed_sum = float((r["s"] if USE_POSTGRES else r[0]) or 0)
+
+        cur.execute(
+            q(
+                "SELECT COALESCE(SUM(quantity * price), 0) AS t "
+                "FROM order_items WHERE order_id = ?"
+            ),
+            (order_id,),
+        )
+        r = cur.fetchone()
+        total = float((r["t"] if USE_POSTGRES else r[0]) or 0)
+
+        if confirmed_sum < total - 0.01:
+            return  # ещё не полностью оплачен
+
+        # Закрываем
         cur.execute(
             q(
                 "UPDATE orders "
@@ -1010,18 +1112,19 @@ def _maybe_close_order_after_payment(
             ),
             (
                 now_str(), confirmed_by or 0, confirmed_name or "",
-                now_str(),  # paid_at если ещё не было
-                now_str(), order_id,
+                now_str(), now_str(), order_id,
             ),
         )
         closed = cur.rowcount > 0
         conn.commit()
+
     if closed:
         add_audit_log(
-            confirmed_by or 0, confirmed_name, get_role(confirmed_by) if confirmed_by else "",
+            confirmed_by or 0, confirmed_name,
+            get_role(confirmed_by) if confirmed_by else "",
             "order_fully_paid",
             f"Заказ #{order_id} полностью оплачен "
-            f"(сумма подтверждённых платежей: {summary['confirmed']:,.0f})",
+            f"(сумма подтверждённых платежей: {confirmed_sum:,.0f})",
         )
 
 
@@ -1286,46 +1389,116 @@ def mark_order_paid(
     Возвращает (False, None) если order не существует, не credit,
     уже полностью закрыт (paid_confirmed_at стоит), или amount некорректен.
     """
-    order = get_order(order_id)
-    if not order:
-        return (False, None)
-    if order.get("payment_type") != "credit":
-        return (False, None)
-    if order.get("paid_confirmed_at"):
-        return (False, None)  # уже полностью закрыт
-
-    summary = get_order_payment_summary(order_id)
-    # Если amount не задан — берём остаток (полная доплата)
-    if amount is None:
-        amount = summary["remaining"]
-    try:
-        amount = float(amount)
-    except (TypeError, ValueError):
-        return (False, None)
-    if amount <= 0:
-        return (False, None)
-    # Не даём ввести больше остатка с учётом уже pending
-    if amount > summary["remaining"] + 0.01:
-        amount = summary["remaining"]
-        if amount <= 0:
-            return (False, None)
-
+    # Все шаги — внутри одной транзакции с lock'ом на заказ.
+    # Раньше без блокировки два менеджера могли одновременно отметить
+    # частичные суммы 70+70 на остаток 100 — оба проходили проверку
+    # `amount ≤ remaining` (каждый считал «свой» remaining до второго),
+    # и в pending копилось 140 при долге 100. Босс потом разбирался.
+    # Теперь FOR UPDATE на orders сериализует параллельные mark_paid'ы.
     from config import BASE_CURRENCY
-    currency = order.get("currency") or BASE_CURRENCY
-    comment = (
-        f"Оплата по заказу #{order_id}"
-        + (f" ({order.get('agent_name')})" if order.get("agent_name") else "")
-    )
 
-    payment_id = add_payment(
-        marked_by, username, marked_by_name, amount, currency, comment,
-        order_id=order_id,
-    )
-
-    # paid_at — флаг «менеджер хоть раз отметил». Не сбрасываем
-    # при следующих частичных, оставляем самое раннее время.
     with get_conn() as conn:
         cur = get_cursor(conn)
+
+        # Lock заказа
+        if USE_POSTGRES:
+            cur.execute(
+                "SELECT payment_type, currency, agent_name, paid_confirmed_at "
+                "FROM orders WHERE id = %s FOR UPDATE",
+                (order_id,),
+            )
+        else:
+            cur.execute(
+                "SELECT payment_type, currency, agent_name, paid_confirmed_at "
+                "FROM orders WHERE id = ?",
+                (order_id,),
+            )
+        row = cur.fetchone()
+        if not row:
+            return (False, None)
+        if USE_POSTGRES:
+            payment_type = row["payment_type"]
+            currency = row["currency"] or BASE_CURRENCY
+            agent_name = row["agent_name"]
+            already_closed = row["paid_confirmed_at"] is not None
+        else:
+            payment_type = row[0]
+            currency = row[1] or BASE_CURRENCY
+            agent_name = row[2]
+            already_closed = row[3] is not None
+
+        if payment_type != "credit":
+            return (False, None)
+        if already_closed:
+            return (False, None)
+
+        # Под locкам считаем суммы — гарантия что между recompute и
+        # INSERT никто другой не добавит payment.
+        cur.execute(
+            q(
+                "SELECT COALESCE(SUM(amount), 0) AS s FROM payments "
+                "WHERE order_id = ? AND status IN ('pending', 'confirmed')"
+            ),
+            (order_id,),
+        )
+        r = cur.fetchone()
+        used = float((r["s"] if USE_POSTGRES else r[0]) or 0)
+
+        cur.execute(
+            q(
+                "SELECT COALESCE(SUM(quantity * price), 0) AS t "
+                "FROM order_items WHERE order_id = ?"
+            ),
+            (order_id,),
+        )
+        r = cur.fetchone()
+        total = float((r["t"] if USE_POSTGRES else r[0]) or 0)
+        remaining = max(0.0, total - used)
+
+        # Если amount не задан — берём остаток (полная доплата)
+        if amount is None:
+            amount = remaining
+        try:
+            amount = float(amount)
+        except (TypeError, ValueError):
+            return (False, None)
+        if amount <= 0:
+            return (False, None)
+        # Не даём ввести больше остатка
+        if amount > remaining + 0.01:
+            amount = remaining
+            if amount <= 0:
+                return (False, None)
+
+        # INSERT payment в той же транзакции
+        comment = (
+            f"Оплата по заказу #{order_id}"
+            + (f" ({agent_name})" if agent_name else "")
+        )
+        if USE_POSTGRES:
+            cur.execute(
+                "INSERT INTO payments "
+                "(user_id, username, full_name, amount, currency, comment, "
+                " status, created_at, order_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s) "
+                "RETURNING id",
+                (marked_by, username, marked_by_name, amount, currency,
+                 comment, now_str(), order_id),
+            )
+            payment_id = cur.fetchone()["id"]
+        else:
+            cur.execute(
+                "INSERT INTO payments "
+                "(user_id, username, full_name, amount, currency, comment, "
+                " status, created_at, order_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (marked_by, username, marked_by_name, amount, currency,
+                 comment, now_str(), order_id),
+            )
+            payment_id = cur.lastrowid
+
+        # paid_at — флаг «менеджер хоть раз отметил». COALESCE сохраняет
+        # самое раннее время для последующих частичных платежей.
         cur.execute(
             q(
                 "UPDATE orders SET paid_at = COALESCE(paid_at, ?), updated_at = ? "
@@ -1335,7 +1508,7 @@ def mark_order_paid(
         )
         conn.commit()
 
-    remaining_after = max(0.0, summary['remaining'] - amount)
+    remaining_after = max(0.0, remaining - amount)
     add_audit_log(
         marked_by, marked_by_name, get_role(marked_by),
         "debt_payment_claimed",
