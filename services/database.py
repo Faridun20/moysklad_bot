@@ -151,6 +151,32 @@ def _invalidate_role_cache(user_id: int) -> None:
 
 
 def init_db():
+    """Гарантирует что схема существует. Безопасно вызывать из любого
+    процесса при старте — все DDL идут через `CREATE TABLE IF NOT EXISTS`.
+
+    ВНИМАНИЕ: миграции (ALTER TABLE ADD COLUMN), backfill'ы и recovery —
+    больше НЕ часть init_db. Они вынесены в `tasks/migrate.py` и должны
+    запускаться отдельным процессом ПЕРЕД стартом bot/webapp/cron.
+    Это закрывает H4: при rolling deploy нескольких процессов ALTER
+    TABLE гонялся одновременно и DDL/UPDATE recovery конфликтовали.
+
+    Если ты разрабатываешь локально (свежая SQLite-БД) — init_db
+    достаточно: миграции применяются к свежей схеме сразу через
+    CREATE TABLE с полным списком колонок.
+
+    Для прод-старта используй: `python -m tasks.migrate` перед
+    `python bot.py`. На Railway: `tasks/migrate.py` в pre-start
+    команде сервиса, или отдельный Cron Job «one-shot».
+    """
+    _create_tables()
+    _create_indexes()
+    _load_predefined_users()
+    logger.info("База данных инициализирована (CREATE TABLE only)")
+
+
+def _create_tables():
+    """Только CREATE TABLE IF NOT EXISTS. Idempotent, безопасен
+    при concurrent старте."""
     with get_conn() as conn:
         cur = get_cursor(conn)
         id_type = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
@@ -167,17 +193,20 @@ def init_db():
             )""",
 
             f"""CREATE TABLE IF NOT EXISTS payments (
-                id           {id_type},
-                user_id      BIGINT NOT NULL,
-                username     TEXT,
-                full_name    TEXT,
-                amount       REAL NOT NULL,
-                currency     TEXT NOT NULL DEFAULT 'USD',
-                comment      TEXT,
-                status       TEXT NOT NULL DEFAULT 'pending',
-                order_id     BIGINT,
-                created_at   TEXT NOT NULL,
-                confirmed_at TEXT
+                id              {id_type},
+                user_id         BIGINT NOT NULL,
+                username        TEXT,
+                full_name       TEXT,
+                amount          REAL NOT NULL,
+                currency        TEXT NOT NULL DEFAULT 'USD',
+                comment         TEXT,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                order_id        BIGINT,
+                ms_paymentin_id TEXT,
+                ms_sync_status  TEXT,
+                ms_sync_error   TEXT,
+                created_at      TEXT NOT NULL,
+                confirmed_at    TEXT
             )""",
 
             f"""CREATE TABLE IF NOT EXISTS audit_log (
@@ -205,6 +234,8 @@ def init_db():
                 paid_confirmed_at       TEXT,
                 paid_confirmed_by       BIGINT,
                 paid_confirmed_by_name  TEXT,
+                ms_demand_id            TEXT,
+                ms_customerorder_id     TEXT,
                 created_at              TEXT NOT NULL,
                 updated_at              TEXT NOT NULL
             )""",
@@ -301,7 +332,53 @@ def init_db():
                 conn.rollback()
                 logger.warning("Таблица уже существует или ошибка: %s", e)
 
-        # Миграции в отдельных транзакциях
+
+def _create_indexes():
+    """CREATE INDEX IF NOT EXISTS — idempotent. Можно гонять при каждом
+    старте, postgres и sqlite оба корректно работают."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        snapshot_indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_ms_products_folder ON ms_products(folder_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ms_stock_folder ON ms_stock(folder_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ms_categories_parent ON ms_categories(parent_id)",
+            # Каждое утреннее уведомление о долгах сканирует все credit-заказы
+            # с paid_at IS NULL. Без индекса — full scan по orders, при тысячах
+            # записей это секунды. Составной индекс покрывает фильтр и сортировку.
+            "CREATE INDEX IF NOT EXISTS idx_orders_credit_due ON orders(payment_type, paid_at, due_date)",
+            # Для запросов «все платежи по заказу» — без него полный скан payments.
+            "CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id)",
+            # Уникальность paymentin'ов в МойСклад. Спасает от race condition
+            # между cron-retry и confirm-hook: если оба попробуют создать
+            # paymentin для одного платежа, второй INSERT упадёт на UNIQUE
+            # constraint, а не наплодит дубликаты в МойСклад. Partial index —
+            # чтобы NULL'ы (ещё не синхронизированные) не конфликтовали.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_ms_paymentin_unique "
+            "ON payments(ms_paymentin_id) WHERE ms_paymentin_id IS NOT NULL",
+        ]
+        for sql in snapshot_indexes:
+            try:
+                cur.execute(sql)
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.debug("Индекс не создан: %s", e)
+
+
+def run_migrations():
+    """ALTER TABLE ADD COLUMN — догоняем старые БД до текущей схемы.
+
+    ВЫНЕСЕНО ИЗ init_db (SECURITY.md H4): раньше эти ALTER гонялись на
+    каждом старте каждого процесса. При rolling deploy bot+webapp одно-
+    временные DDL вступали в race с UPDATE-запросами от уже работающих
+    транзакций. Теперь: вызывается явно из `tasks/migrate.py` перед
+    стартом сервисов.
+
+    Идемпотентно: ADD COLUMN если колонка уже есть → SQL ошибка,
+    мы её ловим и идём дальше.
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
         migrations = [
             ("user_roles", "moysklad_employee_id", "TEXT"),
             ("user_roles", "ms_sync_status", "TEXT DEFAULT 'pending'"),
@@ -361,52 +438,32 @@ def init_db():
             ("payments", "ms_sync_status", "TEXT"),
             ("payments", "ms_sync_error",  "TEXT"),
         ]
+        applied = 0
         for table, column, col_type in migrations:
             try:
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
                 conn.commit()
+                applied += 1
             except Exception:
                 conn.rollback()  # Колонка уже существует — норм
+        logger.info("run_migrations: применено %d из %d", applied, len(migrations))
 
-        # Индексы для snapshot-таблиц + поиска долгов
-        snapshot_indexes = [
-            "CREATE INDEX IF NOT EXISTS idx_ms_products_folder ON ms_products(folder_id)",
-            "CREATE INDEX IF NOT EXISTS idx_ms_stock_folder ON ms_stock(folder_id)",
-            "CREATE INDEX IF NOT EXISTS idx_ms_categories_parent ON ms_categories(parent_id)",
-            # Каждое утреннее уведомление о долгах сканирует все credit-заказы
-            # с paid_at IS NULL. Без индекса — full scan по orders, при тысячах
-            # записей это секунды. Составной индекс покрывает фильтр и сортировку.
-            "CREATE INDEX IF NOT EXISTS idx_orders_credit_due ON orders(payment_type, paid_at, due_date)",
-            # Для запросов «все платежи по заказу» — без него полный скан payments.
-            "CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id)",
-            # Уникальность paymentin'ов в МойСклад. Спасает от race condition
-            # между cron-retry и confirm-hook: если оба попробуют создать
-            # paymentin для одного платежа, второй INSERT упадёт на UNIQUE
-            # constraint, а не наплодит дубликаты в МойСклад. Partial index —
-            # чтобы NULL'ы (ещё не синхронизированные) не конфликтовали.
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_ms_paymentin_unique "
-            "ON payments(ms_paymentin_id) WHERE ms_paymentin_id IS NOT NULL",
-        ]
-        for sql in snapshot_indexes:
-            try:
-                cur.execute(sql)
-                conn.commit()
-            except Exception as e:
-                conn.rollback()
-                logger.debug("Индекс не создан: %s", e)
 
-        # ─── Backfill для подтверждений оплаты (только legacy) ────────
-        # Когда был добавлен двухступенчатый workflow (paid_at →
-        # paid_confirmed_at), нужно было закрыть исторические долги:
-        # для них paid_at = «полностью оплачено», и без backfill они бы
-        # повисли «требуют подтверждения».
-        #
-        # ВАЖНО: после добавления частичных платежей `paid_at` стал
-        # значить «менеджер отметил ХОТЯ БЫ ОДИН платёж», а не «всё
-        # закрыто». Если бы мы backfill'или такие заказы, частичные
-        # долги исчезали бы из списка после каждого редеплоя. Поэтому
-        # backfill теперь применяется ТОЛЬКО к legacy-заказам, у которых
-        # вообще нет записей в payments — они точно из старой эпохи.
+def run_backfills():
+    """Одноразовые data-миграции. Идемпотентны.
+
+    1. Закрыть legacy-долги (paid_at стоит, payments записей нет —
+       значит это до partial-payments эпохи): paid_confirmed_at = paid_at.
+    2. Recovery от старого backfill-бага: если paid_confirmed_at стоит,
+       но сумма confirmed payments меньше total, сбросить confirmed_at
+       обратно в NULL.
+
+    Запускается из `tasks/migrate.py`. НЕ из init_db — этот код пишет
+    данные, не должен бежать при каждом старте сервиса.
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        # ── Backfill legacy ──────────────────────────────────────────
         try:
             cur.execute(
                 "UPDATE orders "
@@ -426,12 +483,7 @@ def init_db():
             conn.rollback()
             logger.warning("Backfill paid_confirmed: %s", e)
 
-        # ─── Recovery: восстановить долги, ошибочно закрытые старым backfill'ом ──
-        # Заказы где paid_confirmed_at стоит, но фактически сумма confirmed
-        # платежей < total заказа — backfill сработал ошибочно (см. выше).
-        # Откатываем paid_confirmed_at в NULL, долг возвращается в список.
-        # Запросом обходим оба драйвера (Postgres и SQLite оба понимают
-        # скалярные subqueries).
+        # ── Recovery ─────────────────────────────────────────────────
         try:
             cur.execute(
                 "UPDATE orders "
@@ -459,9 +511,6 @@ def init_db():
         except Exception as e:
             conn.rollback()
             logger.warning("Recovery paid_confirmed: %s", e)
-
-    logger.info("База данных инициализирована")
-    _load_predefined_users()
 
 
 
@@ -690,16 +739,21 @@ def get_payments_for_order(order_id: int) -> list[dict]:
 
 def get_payments_for_orders(order_ids: list[int]) -> dict[int, list[dict]]:
     """Батч-версия: {order_id: [payments...]}. Заказы без платежей в
-    результат не попадают; вызывающий должен использовать .get(oid, [])."""
+    результат не попадают; вызывающий должен использовать .get(oid, []).
+
+    Дедуплицируем order_ids — если caller передал список с повторами,
+    placeholders разрастаются впустую и план запроса страдает.
+    """
     if not order_ids:
         return {}
-    placeholders = ",".join(["?"] * len(order_ids))
+    unique_ids = list(set(order_ids))
+    placeholders = ",".join(["?"] * len(unique_ids))
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
             q(f"SELECT * FROM payments WHERE order_id IN ({placeholders}) "
               f"ORDER BY created_at ASC"),
-            list(order_ids),
+            unique_ids,
         )
         rows = cur.fetchall()
     grouped: dict[int, list[dict]] = {}
@@ -1257,15 +1311,17 @@ def get_order(order_id: int) -> dict | None:
 
 
 def get_orders_by_ids(order_ids: list[int]) -> dict[int, dict]:
-    """Батч-загрузка заказов по id → словарь {id: order_dict}."""
+    """Батч-загрузка заказов по id → словарь {id: order_dict}.
+    order_ids дедуплицируется — placeholder'ы не расходуем впустую."""
     if not order_ids:
         return {}
-    placeholders = ",".join(["?"] * len(order_ids))
+    unique_ids = list(set(order_ids))
+    placeholders = ",".join(["?"] * len(unique_ids))
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
             q(f"SELECT * FROM orders WHERE id IN ({placeholders})"),
-            list(order_ids),
+            unique_ids,
         )
         rows = cur.fetchall()
     return {r["id"]: dict(r) for r in rows}
@@ -1750,12 +1806,13 @@ def get_order_items_by_ids(order_ids: list[int]) -> dict[int, list[dict]]:
     в результате (вызывающий должен использовать .get(oid, []))."""
     if not order_ids:
         return {}
-    placeholders = ",".join(["?"] * len(order_ids))
+    unique_ids = list(set(order_ids))
+    placeholders = ",".join(["?"] * len(unique_ids))
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
             q(f"SELECT * FROM order_items WHERE order_id IN ({placeholders})"),
-            list(order_ids),
+            unique_ids,
         )
         rows = cur.fetchall()
     grouped: dict[int, list[dict]] = {}

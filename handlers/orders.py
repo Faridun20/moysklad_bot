@@ -279,9 +279,14 @@ async def cmd_new_order(message: Message):
 
     user = message.from_user
     full_name = user.full_name or user.username or str(user.id)
-    order_id = create_order(user.id, full_name)
+    # sync DB-вызов в async handler без to_thread блокирует event loop.
+    # На bot-сервисе нагрузка низкая, но при усилении пользователей
+    # начнёт лагать. to_thread сразу делает это безопасным.
+    import asyncio as _asyncio
+    order_id = await _asyncio.to_thread(create_order, user.id, full_name)
 
-    add_audit_log(
+    await _asyncio.to_thread(
+        add_audit_log,
         user.id, full_name, get_role(user.id),
         "order_created", f"Создан заказ #{order_id}",
     )
@@ -303,7 +308,8 @@ async def cmd_my_orders(message: Message):
     if not can_create_orders(message.from_user.id):
         return await message.answer("⛔ Нет доступа.")
 
-    orders = get_user_orders(message.from_user.id)
+    import asyncio as _asyncio
+    orders = await _asyncio.to_thread(get_user_orders, message.from_user.id)
     if not orders:
         kb = InlineKeyboardBuilder()
         kb.button(text="➕ Создать заказ", callback_data="ord_new")
@@ -326,7 +332,8 @@ async def cmd_orders(message: Message):
     if not is_boss(message.from_user.id):
         return await message.answer("⛔ Нет доступа.")
 
-    requests = get_pending_requests()
+    import asyncio as _asyncio
+    requests = await _asyncio.to_thread(get_pending_requests)
     if not requests:
         return await message.answer(
             f"{DIV}\n⏳ <b>Заявки на отгрузку</b>\n\n<i>Нет новых заявок</i>",

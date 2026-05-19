@@ -145,8 +145,12 @@ def test_claim_payment_for_ms_sync_atomic(isolated_db):
 
 
 def test_backfill_does_not_close_partial_credit_debts(isolated_db, monkeypatch):
-    """Регрессия по последнему багу: backfill в init_db не должен
-    закрывать частично-оплаченные кредитные долги."""
+    """Регрессия по старому backfill-багу: run_backfills() не должен
+    закрывать частично-оплаченные кредитные долги.
+
+    После H4-фикса backfill вынесен из init_db в run_backfills() —
+    отдельно вызываемая функция, идемпотентная по дизайну.
+    """
     db = isolated_db
     oid = _setup_credit_order(db, 100, 4)  # 400 total
     # Частичная оплата 100 / 400
@@ -154,8 +158,6 @@ def test_backfill_does_not_close_partial_credit_debts(isolated_db, monkeypatch):
     db.confirm_payment(pid, 99, "Boss")
     # Долг ещё открыт
     assert db.get_order(oid)["paid_confirmed_at"] is None
-    # Если бы старый backfill сработал, он бы закрыл этот заказ
-    # (paid_at IS NOT NULL → paid_confirmed_at = paid_at)
-    # Запускаем init_db повторно — recovery должен сохранить статус
-    db.init_db()
+    # Прогон backfill+recovery — статус должен сохраниться
+    db.run_backfills()
     assert db.get_order(oid)["paid_confirmed_at"] is None

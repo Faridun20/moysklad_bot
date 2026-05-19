@@ -34,6 +34,10 @@ def isolated_db(monkeypatch, tmp_path):
     importlib.reload(db)
 
     db.init_db()
+    # Прогоняем миграции тоже — на случай если CREATE TABLE отстал
+    # от run_migrations (мы держим обе нотации в sync, но fixture
+    # должен работать даже на «старой» схеме).
+    db.run_migrations()
     # Глушим хук синхронизации с МойСклад — тесты не должны звонить
     # в боевой API
     db._trigger_ms_paymentin_sync = lambda *a, **k: None

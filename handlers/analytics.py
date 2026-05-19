@@ -20,7 +20,7 @@ from services.database import (
 )
 from utils.formatters import format_sales_report
 from utils.keyboards import analytics_keyboard, analytics_back_keyboard
-from utils.helpers import user_safe_error
+from utils.helpers import user_safe_error, utc_now
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -95,7 +95,7 @@ async def cb_analytics_period(call: CallbackQuery, bot: Bot):
     await call.answer()
 
     period = call.data.split(":")[1]
-    now = datetime.utcnow()
+    now = utc_now()
     since, until, prev_since, prev_until, label = get_period(period, now)
 
     role = get_role(call.from_user.id)
@@ -265,7 +265,7 @@ async def show_manager_analytics(
 async def show_manager_summary(bot: Bot, chat_id: int, user_id: int):
     """Краткая сводка менеджера за текущий месяц — из локальной БД."""
     try:
-        now = datetime.utcnow()
+        now = utc_now()
         since = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         stats = _personal_stats_from_local(user_id, since, now)
         if stats["count"] == 0:

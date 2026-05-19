@@ -112,8 +112,25 @@ def trend_arrow(current: float, previous: float) -> str:
 from datetime import datetime, timezone, timedelta
 
 
+def utc_now() -> datetime:
+    """Текущее UTC-время как naive datetime.
+
+    Замена deprecated `datetime.utcnow()` (которая в Python 3.12+
+    кидает DeprecationWarning). Возвращаем naive (без tzinfo) — так
+    же как утцnow раньше — чтобы не ломать места кода, которые
+    сравнивают/форматируют naive datetimes (например МойСклад
+    `moment` строки и сравнения с `created_at` из БД).
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def local_now() -> datetime:
-    """Текущее время по Ташкенту (UTC+5)."""
+    """Текущее время по локальному TZ (TZ_OFFSET часов от UTC).
+
+    Используется когда нужна «вот сейчас по местному времени» — для
+    границы «сегодня» в UI и в фильтрах персональной аналитики
+    менеджера, чтобы они совпадали с `created_at` в БД (который
+    записывается local-time через `now_str`)."""
     from config import TZ_OFFSET
 
-    return datetime.utcnow() + timedelta(hours=TZ_OFFSET)
+    return utc_now() + timedelta(hours=TZ_OFFSET)

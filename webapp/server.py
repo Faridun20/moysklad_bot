@@ -20,6 +20,38 @@ from services.roles import cached_role as get_role
 from services.rate_limit import acquire as rate_limit_acquire
 
 
+# ─── Idempotency cache ──────────────────────────────────────────────
+# Защита от double-click на confirm/reject платежей. Клиент посылает
+# `idempotency_key` (random UUID per действие); если запрос с тем же
+# ключом приходит повторно в течение TTL — возвращаем кэшированный
+# результат, не дёргая БД повторно.
+# SECURITY.md (Medium): сейчас фронт может два раза кликнуть approve и
+# во время загрузки получить рассинхронизированное состояние.
+_IDEM_CACHE: dict[str, tuple[float, dict]] = {}
+_IDEM_TTL = 30.0
+
+
+def _idem_get(key: str | None) -> dict | None:
+    if not key:
+        return None
+    entry = _IDEM_CACHE.get(key)
+    if entry and time.monotonic() - entry[0] < _IDEM_TTL:
+        return entry[1]
+    return None
+
+
+def _idem_set(key: str | None, value: dict) -> None:
+    if not key:
+        return
+    # Простой GC при разрастании кэша — выкидываем протухшие записи.
+    if len(_IDEM_CACHE) > 200:
+        cutoff = time.monotonic() - _IDEM_TTL
+        for k in list(_IDEM_CACHE.keys()):
+            if _IDEM_CACHE[k][0] < cutoff:
+                _IDEM_CACHE.pop(k, None)
+    _IDEM_CACHE[key] = (time.monotonic(), value)
+
+
 def _authorize(
     data: dict,
     allowed_roles: tuple[str, ...] = ("admin", "boss", "manager"),
@@ -326,6 +358,7 @@ async def api_home(request: Request):
     from datetime import datetime, timedelta
     from services.moysklad import get_sales_stats, get_shipments
     from services import async_db as adb
+    from utils.helpers import utc_now, local_now
 
     data = await request.json()
     user = verify_init_data(data.get("initData", ""))
@@ -337,9 +370,15 @@ async def api_home(request: Request):
     if role not in ("admin", "boss", "manager"):
         raise HTTPException(status_code=403, detail="Нет доступа")
 
-    now = datetime.utcnow()
+    # UTC time для МойСклад API (он принимает UTC), local time для
+    # сравнения «сегодня» с created_at в БД (тот записывается в
+    # local через now_str). SECURITY.md TZ-block: раньше today_iso
+    # был от UTC, а created_at — от local, и приграничные заказы
+    # (около полуночи Ташкента) могли «не попасть» в today filter.
+    now = utc_now()
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago = now - timedelta(days=7)
+    local_today_iso = local_now().strftime("%Y-%m-%d")
 
     # Заказы текущего юзера — нужны и менеджеру (сводка), и боссу (его лично).
     # await-вызов через async_db не блокирует event loop на время SQL.
@@ -378,11 +417,12 @@ async def api_home(request: Request):
         # Менеджер: считаем личные показатели из локальных одобренных заявок.
         # Источник — наша БД, без обращения к МойСклад. Батч-запросом
         # подтягиваем сразу все позиции (раньше был N+1 по заказам).
-        today_iso = start_of_day.strftime("%Y-%m-%d")
+        # local_today_iso (а не UTC) — сравниваем с created_at в local TZ,
+        # чтобы граница «сегодня» совпала с восприятием менеджера.
         relevant_today = [
             o for o in my_orders
             if o["status"] in ("approved", "shipped")
-            and (o.get("updated_at") or o.get("created_at") or "")[:10] == today_iso
+            and (o.get("updated_at") or o.get("created_at") or "")[:10] == local_today_iso
         ]
         items_by_order = (
             await adb.get_order_items_by_ids([o["id"] for o in relevant_today])
@@ -547,7 +587,7 @@ async def api_analytics(request: Request):
         raise HTTPException(status_code=403, detail="Нет доступа")
 
     period = data.get("period", "week")
-    now = datetime.utcnow()
+    now = utc_now()
 
     periods = {
         "week": (now - timedelta(weeks=1), now - timedelta(weeks=2), "Неделя"),
@@ -1454,12 +1494,23 @@ async def api_confirm_payment(request: Request):
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="order_id обязателен")
 
+    # Idempotency: если фронт прислал ключ (uuid от клиента) — пробуем
+    # вернуть кэшированный результат на случай double-click.
+    idem_key = data.get("idempotency_key")
+    if idem_key:
+        cached = _idem_get(f"confirm:{user['id']}:{idem_key}")
+        if cached is not None:
+            return JSONResponse(cached)
+
     full_name = (
         f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
         or user.get("username", str(user["id"]))
     )
     n = await adb.confirm_all_pending_payments_for_order(order_id, user["id"], full_name)
-    return JSONResponse({"ok": True, "confirmed_count": n})
+    result = {"ok": True, "confirmed_count": n}
+    if idem_key:
+        _idem_set(f"confirm:{user['id']}:{idem_key}", result)
+    return JSONResponse(result)
 
 
 @app.post("/api/orders/reject_payment")

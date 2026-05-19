@@ -25,7 +25,7 @@ from datetime import datetime
 from typing import Any
 
 from services.moysklad import ms_get, get_session, MS_BASE
-from utils.helpers import extract_id_from_href
+from utils.helpers import extract_id_from_href, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +258,7 @@ async def create_demand_from_request(
         "agent": _meta(agent_href, "counterparty"),
         "store": _meta(_CTX["store_meta"]["href"], "store"),
         "positions": positions,
-        "moment": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.000"),
+        "moment": utc_now().strftime("%Y-%m-%d %H:%M:%S.000"),
         "description": _build_description(order, telegram_full_name),
         # applicable=true — отгрузка сразу проведена и остатки списываются
         # в МойСклад в момент апрува заявки боссом. Складскому не нужно

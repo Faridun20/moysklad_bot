@@ -14,6 +14,7 @@ from aiogram import Bot
 from services.moysklad import get_all_stock, get_sales_stats
 from services.notifier import get_notify_recipients, send_to_recipients
 from utils.formatters import format_sales_report, format_stock_report
+from utils.helpers import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ MONTH_NAMES = [
 
 def seconds_until(hour: int, minute: int = 0, weekday: int = None) -> float:
     """Секунды до следующего наступления указанного времени UTC."""
-    now = datetime.utcnow()
+    now = utc_now()
     target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if weekday is not None:
         days_ahead = (weekday - now.weekday()) % 7
@@ -123,7 +124,7 @@ async def snapshot_refresh_task(bot: Bot):
 
     while True:
         try:
-            now = datetime.utcnow()
+            now = utc_now()
 
             # 1) Справочники — раз в день после 06:00 UTC
             today = now.date()
@@ -162,7 +163,7 @@ async def daily_report_task(bot: Bot):
     while True:
         await asyncio.sleep(seconds_until(9, 0))
         try:
-            now = datetime.utcnow()
+            now = utc_now()
             since = (now - timedelta(days=1)).replace(
                 hour=0, minute=0, second=0, microsecond=0
             )
@@ -186,7 +187,7 @@ async def weekly_report_task(bot: Bot):
     while True:
         await asyncio.sleep(seconds_until(9, 0, weekday=0))
         try:
-            now = datetime.utcnow()
+            now = utc_now()
             since = now - timedelta(days=7)
             prev_since = since - timedelta(days=7)
 
@@ -205,7 +206,7 @@ async def monthly_report_task(bot: Bot):
     """1-го числа каждого месяца в 09:00 UTC."""
     logger.info("Ежемесячный отчёт запущен")
     while True:
-        now = datetime.utcnow()
+        now = utc_now()
         if now.month == 12:
             next_first = now.replace(
                 year=now.year + 1, month=1, day=1,
@@ -221,7 +222,7 @@ async def monthly_report_task(bot: Bot):
         await asyncio.sleep(wait)
 
         try:
-            now = datetime.utcnow()
+            now = utc_now()
             first_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             if first_this.month == 1:
                 first_prev = first_this.replace(year=first_this.year - 1, month=12)
