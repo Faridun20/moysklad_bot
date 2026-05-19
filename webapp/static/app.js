@@ -176,7 +176,12 @@ async function renderOrdersScreen() {
 
 async function renderHome() {
   const content = document.getElementById('content');
-  content.innerHTML = loading('Собираю сводку…');
+  content.innerHTML = `
+    <div class="sk sk-hero"></div>
+    <div class="sk-grid">${Array(4).fill('<div class="sk sk-action"></div>').join('')}</div>
+    <div class="sk sk-label"></div>
+    ${Array(3).fill('<div class="sk sk-card"></div>').join('')}
+  `;
 
   let data;
   try {
@@ -339,6 +344,7 @@ async function renderHome() {
   // Action-grid → переход на нужный таб (и опционально открыть новый заказ)
   document.querySelectorAll('[data-go]').forEach(btn => {
     btn.addEventListener('click', () => {
+      haptic();
       const target = btn.dataset.go;
       const isNew = btn.dataset.new === '1';
       showScreen(target);
@@ -416,7 +422,11 @@ function renderStockContent() {
   };
 
   const list = filtered.length === 0
-    ? '<div class="loader">Нет товаров</div>'
+    ? `<div class="empty-state">
+        <div class="empty-state-icon">📦</div>
+        <div class="empty-state-title">Товары не найдены</div>
+        <div class="empty-state-hint">Попробуйте изменить категорию или поисковый запрос</div>
+      </div>`
     : filtered.slice(0, 200).map(p => `
         <div class="stock-row">
           <div class="stock-info">
@@ -466,6 +476,10 @@ function escapeHtml(s) {
 
 function loading(msg = 'Загрузка…') {
   return `<div class="spinner-wrap"><div class="spinner"></div><span>${msg}</span></div>`;
+}
+
+function haptic(type = 'light') {
+  try { tg.HapticFeedback?.impactOccurred(type); } catch {}
 }
 
 // ─── Экран: Заказы ──────────────────────────────────
@@ -534,9 +548,16 @@ function renderOrdersMain() {
     : orders.filter(o => o.status === currentOrderFilter);
 
   const list = filtered.length === 0
-    ? '<div class="loader">Нет заказов</div>'
+    ? `<div class="empty-state">
+        <div class="empty-state-icon">📋</div>
+        <div class="empty-state-title">Нет заказов</div>
+        <div class="empty-state-hint">${currentOrderFilter !== 'all'
+          ? 'Нет заказов с этим статусом'
+          : isBoss ? 'Менеджеры ещё не создавали заказов' : 'Нажмите «+ Новый заказ» чтобы начать'
+        }</div>
+      </div>`
     : filtered.map(o => `
-      <div class="order-card" data-id="${o.id}">
+      <div class="order-card order-card--${o.status}" data-id="${o.id}">
         <div class="order-header">
           <div>
             <div class="order-title">${STATUS_EMOJI[o.status] || '📋'} Заказ #${o.id}</div>
@@ -1224,7 +1245,7 @@ function renderAnalyticsContent(data) {
   const daysBars = data.by_day.map(d => `
     <div class="bar-row">
       <span class="bar-day">${d.day}</span>
-      <div class="bar-bg"><div class="bar-fill" style="width: ${(d.count / maxDay) * 100}%"></div></div>
+      <div class="bar-bg"><div class="bar-fill" style="width:0" data-w="${Math.round((d.count / maxDay) * 100)}"></div></div>
       <span class="bar-val">${d.count}</span>
     </div>
   `).join('');
@@ -1274,6 +1295,13 @@ function renderAnalyticsContent(data) {
     <div class="section-label">Топ товаров</div>
     <div class="card">${topItems}</div>
   `;
+
+  // Bars animate from 0 → target after paint
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    document.querySelectorAll('.bar-fill[data-w]').forEach(b => {
+      b.style.width = b.dataset.w + '%';
+    });
+  }));
 
   document.querySelectorAll('.cat-btn[data-period]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -1424,6 +1452,7 @@ function renderPaymentsContent(container) {
 function initNav() {
   document.querySelectorAll('.nav-item').forEach(btn => {
     btn.addEventListener('click', () => {
+      haptic();
       document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       showScreen(btn.dataset.screen);
@@ -1756,6 +1785,11 @@ function formatDateRU(iso) {
   return `${d}.${m}.${y}`;
 }
 
+
+// Тень топбара при прокрутке
+window.addEventListener('scroll', () => {
+  document.querySelector('.topbar')?.classList.toggle('topbar--shadow', window.scrollY > 4);
+}, { passive: true });
 
 // Запуск
 init()

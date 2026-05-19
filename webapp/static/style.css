@@ -56,6 +56,12 @@ body {
   padding: 14px 16px;
   background: var(--bg-page);
   border-bottom: 0.5px solid var(--divider);
+  transition: box-shadow 0.2s ease;
+}
+
+.topbar--shadow {
+  box-shadow: 0 2px 12px rgba(0,0,0,0.1);
+  border-bottom-color: transparent;
 }
 
 .title {
@@ -557,6 +563,7 @@ body {
 }
 .bar-fill {
   height: 100%; background: var(--accent); border-radius: 4px;
+  transition: width 0.55s cubic-bezier(0.4, 0, 0.2, 1);
 }
 .bar-val {
   font-size: 12px; color: var(--text-mute); width: 26px; text-align: right;
@@ -691,7 +698,14 @@ body {
   border-radius: var(--radius);
   padding: 14px;
   box-shadow: var(--shadow-card);
+  border-left: 3px solid transparent;
 }
+
+.order-card--draft    { border-left-color: #8e8e93; }
+.order-card--pending  { border-left-color: #f9a825; }
+.order-card--approved { border-left-color: #2e7d32; }
+.order-card--rejected { border-left-color: #a02323; }
+.order-card--shipped  { border-left-color: #1e5da0; }
 
 .order-header {
   display: flex; justify-content: space-between;
@@ -1175,6 +1189,44 @@ body {
 
 /* Жёлтая полоска для partial-state */
 .debt-card.debt-partial { border-left-color: #f9a825; }
+
+/* ─── Skeleton loading ───────────────────────────────────────────── */
+@keyframes shimmer {
+  from { background-position: -200% center; }
+  to   { background-position:  200% center; }
+}
+
+.sk {
+  background: linear-gradient(
+    90deg,
+    var(--bg-soft) 25%,
+    rgba(0,0,0,0.07) 50%,
+    var(--bg-soft) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.4s ease infinite;
+  border-radius: var(--radius-sm);
+}
+
+.sk-hero   { height: 132px; border-radius: var(--radius-lg); margin-bottom: 16px; }
+.sk-grid   { display: grid; grid-template-columns: repeat(4,1fr); gap: 8px; margin-bottom: 16px; }
+.sk-action { height: 76px; border-radius: var(--radius); }
+.sk-label  { height: 11px; width: 100px; margin: 20px 14px 8px; }
+.sk-card   { height: 64px; border-radius: var(--radius); margin-bottom: 8px; }
+
+/* ─── Empty state ────────────────────────────────────────────────── */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 52px 24px;
+  text-align: center;
+  gap: 8px;
+}
+
+.empty-state-icon  { font-size: 44px; opacity: 0.45; margin-bottom: 4px; }
+.empty-state-title { font-size: 17px; font-weight: 600; color: var(--text); }
+.empty-state-hint  { font-size: 14px; color: var(--text-mute); max-width: 260px; line-height: 1.45; }
 
 /* ─── Кнопки управления черновиком ─────────────────────────────── */
 .draft-actions {
