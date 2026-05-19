@@ -370,6 +370,19 @@ body {
   font-size: 14px;
 }
 
+.error-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 48px 24px 32px;
+  text-align: center;
+}
+.error-card .error-icon { font-size: 48px; line-height: 1; }
+.error-card .error-title { font-size: 18px; font-weight: 600; color: var(--text); }
+.error-card .error-body { font-size: 14px; color: var(--text-mute); max-width: 280px; }
+.error-card .btn-primary { margin-top: 8px; max-width: 200px; }
+
 .warn-card {
   background: #fff4d6;
   color: #6f4a06;

@@ -8,8 +8,8 @@ try:
     if "BOSS_IDS" not in dir():
         BOSS_IDS = []
 except ImportError:
-    TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-    MS_TOKEN = os.environ.get("MS_TOKEN", "")
+    TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+    MS_TOKEN = os.environ.get("MS_TOKEN", "").strip()
     CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "300"))
     # Валюта для отображения цен в боте/WebApp (отображательная — на
     # стороне МойСклад валюта берётся из организации). Дефолт — USD.

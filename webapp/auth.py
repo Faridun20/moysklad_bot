@@ -33,12 +33,14 @@ def verify_init_data(init_data: str) -> dict | None:
       3. Поле user парсится как JSON
     """
     if not init_data:
+        logger.warning("verify_init_data: initData пустой — открыт не через Telegram?")
         return None
 
     try:
         parsed = dict(parse_qsl(init_data, strict_parsing=True))
         received_hash = parsed.pop("hash", None)
         if not received_hash:
+            logger.warning("verify_init_data: нет поля hash в initData")
             return None
 
         data_check_string = "\n".join(

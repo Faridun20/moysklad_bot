@@ -24,8 +24,22 @@ async function init() {
       body: JSON.stringify({ initData: tg.initData }),
     });
 
+    if (response.status === 401) {
+      const isEmpty = !tg.initData;
+      document.getElementById('content').innerHTML = `
+        <div class="error-card">
+          <div class="error-icon">🔐</div>
+          <div class="error-title">Нет доступа</div>
+          <div class="error-body">${isEmpty
+            ? 'Откройте приложение через кнопку <b>«Открыть»</b> в боте — не через браузер.'
+            : 'Ошибка авторизации. Попробуйте закрыть и открыть снова.'
+          }</div>
+          <button class="btn-primary" onclick="location.reload()">Повторить</button>
+        </div>`;
+      return;
+    }
     if (!response.ok) {
-      throw new Error('Ошибка авторизации');
+      throw new Error(`Ошибка сервера (${response.status})`);
     }
 
     currentUser = await response.json();
@@ -33,15 +47,21 @@ async function init() {
     initNav();
     showScreen('home');
   } catch (e) {
-    showError('❌ Не удалось подключиться: ' + e.message);
+    document.getElementById('content').innerHTML = `
+      <div class="error-card">
+        <div class="error-icon">⚠️</div>
+        <div class="error-title">Нет связи</div>
+        <div class="error-body">${escapeHtml(e.message)}</div>
+        <button class="btn-primary" onclick="location.reload()">Повторить</button>
+      </div>`;
   }
 }
 
 function renderHeader() {
   const greeting = document.getElementById('greeting');
   const badge = document.getElementById('role-badge');
-  // greeting короткий — большая «привет» уже на Home в hero
-  greeting.textContent = currentUser.first_name || '';
+  const name = currentUser.first_name || '';
+  greeting.textContent = name ? `Привет, ${name}!` : 'Добро пожаловать!';
   badge.textContent = ROLE_NAMES[currentUser.role] || currentUser.role;
 }
 
