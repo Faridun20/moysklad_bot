@@ -145,7 +145,7 @@ async function renderOrdersScreen() {
 
 async function renderHome() {
   const content = document.getElementById('content');
-  content.innerHTML = `<div class="loader">⏳ Собираю сводку…</div>`;
+  content.innerHTML = loading('Собираю сводку…');
 
   let data;
   try {
@@ -187,31 +187,31 @@ async function renderHome() {
   const actions = isBoss ? `
     <div class="action-grid">
       <button class="action-btn" data-go="orders">
-        <span class="action-btn-icon">📦</span>Каталог
+        <span class="action-btn-icon icon-orange">📦</span>Каталог
       </button>
       <button class="action-btn" data-go="orders">
-        <span class="action-btn-icon">⏳</span>Заявки
+        <span class="action-btn-icon icon-amber">⏳</span>Заявки
       </button>
       <button class="action-btn" data-go="analytics">
-        <span class="action-btn-icon">📊</span>Аналитика
+        <span class="action-btn-icon icon-purple">📊</span>Аналитика
       </button>
       <button class="action-btn" data-go="payments">
-        <span class="action-btn-icon">💵</span>Платежи
+        <span class="action-btn-icon icon-green">💵</span>Платежи
       </button>
     </div>
   ` : `
     <div class="action-grid">
       <button class="action-btn" data-go="orders">
-        <span class="action-btn-icon">📦</span>Каталог
+        <span class="action-btn-icon icon-orange">📦</span>Каталог
       </button>
       <button class="action-btn" data-go="orders" data-new="1">
-        <span class="action-btn-icon">➕</span>Заказ
+        <span class="action-btn-icon icon-blue">➕</span>Заказ
       </button>
       <button class="action-btn" data-go="analytics">
-        <span class="action-btn-icon">📊</span>Аналитика
+        <span class="action-btn-icon icon-purple">📊</span>Аналитика
       </button>
       <button class="action-btn" data-go="payments">
-        <span class="action-btn-icon">💵</span>Платёж
+        <span class="action-btn-icon icon-green">💵</span>Платёж
       </button>
     </div>
   `;
@@ -337,7 +337,7 @@ let stockSearch = '';
 
 async function renderStock() {
   const content = document.getElementById('content');
-  content.innerHTML = `<div class="loader">⏳ Загружаю остатки…</div>`;
+  content.innerHTML = loading('Загружаю остатки…');
 
   if (!stockData) {
     try {
@@ -433,6 +433,10 @@ function escapeHtml(s) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+function loading(msg = 'Загрузка…') {
+  return `<div class="spinner-wrap"><div class="spinner"></div><span>${msg}</span></div>`;
+}
+
 // ─── Экран: Заказы ──────────────────────────────────
 
 let ordersData = null;
@@ -467,7 +471,7 @@ async function api(path, body) {
 
 async function renderOrders() {
   const content = document.getElementById('content');
-  content.innerHTML = `<div class="loader">⏳ Загружаю заказы…</div>`;
+  content.innerHTML = loading('Загружаю заказы…');
   try {
     ordersData = await api('/api/orders', {});
   } catch (e) {
@@ -592,7 +596,7 @@ async function openOrderEditor(orderId) {
 
   // Создаём черновик если новый
   if (!orderId) {
-    content.innerHTML = `<div class="loader">⏳ Создаю заказ…</div>`;
+    content.innerHTML = loading('Создаю заказ…');
     try {
       const result = await api('/api/orders/create', {});
       orderId = result.order_id;
@@ -779,7 +783,7 @@ async function openAgentSearch() {
 async function loadAgents(search) {
   const list = document.getElementById('agent-list');
   if (!list) return;
-  list.innerHTML = `<div class="loader">⏳ Загружаю…</div>`;
+  list.innerHTML = loading('Загружаю…');
   try {
     const data = await api('/api/agents', { search });
     if (data.agents.length === 0) {
@@ -828,9 +832,7 @@ async function openProductPicker() {
       <input type="text" id="prod-search" class="form-input" placeholder="🔍 Поиск товара…">
     </div>
     <div id="cat-filters" class="cat-scroll"></div>
-    <div id="prod-list" class="orders-list">
-      <div class="loader">⏳ Загружаю…</div>
-    </div>
+    <div id="prod-list" class="orders-list">${loading('Загружаю…')}</div>
   `;
 
   document.getElementById('prod-back').addEventListener('click', renderOrderEditor);
@@ -1080,7 +1082,7 @@ async function submitOrder() {
 
 async function renderPendingRequests() {
   const content = document.getElementById('content');
-  content.innerHTML = `<div class="loader">⏳ Загружаю заявки…</div>`;
+  content.innerHTML = loading('Загружаю заявки…');
   try {
     const data = await api('/api/orders/requests', {});
     if (data.requests.length === 0) {
@@ -1146,7 +1148,7 @@ let analyticsPeriod = 'month';
 
 async function renderAnalytics() {
   const content = document.getElementById('content');
-  content.innerHTML = `<div class="loader">⏳ Считаю статистику…</div>`;
+  content.innerHTML = loading('Считаю статистику…');
 
   // Кэш не используем — данные постоянно меняются (новые апрувы), и
   // показывать «вчерашние ноль» когда уже есть продажи — хуже чем
@@ -1256,7 +1258,7 @@ let paymentsCache = null;
 
 async function renderPayments(container) {
   container = container || document.getElementById('content');
-  container.innerHTML = `<div class="loader">⏳ Загружаю историю…</div>`;
+  container.innerHTML = loading('Загружаю историю…');
 
   try {
     const response = await fetch('/api/payments/history', {
@@ -1443,7 +1445,7 @@ async function renderFinance() {
 
 async function renderDebts(container) {
   container = container || document.getElementById('content');
-  container.innerHTML = '<div class="loader">⏳ Загрузка долгов…</div>';
+  container.innerHTML = loading('Загрузка долгов…');
   try {
     const data = await api('/api/debts', { mode: debtsFilter });
     const debts = data.debts || [];

@@ -87,6 +87,39 @@ body {
   font-size: 14px;
 }
 
+/* ─── Spinner & animations ────────────────────────────────── */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(7px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.content > * {
+  animation: fadeUp 0.18s ease both;
+}
+
+.spinner-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 48px 16px;
+  color: var(--text-mute);
+  font-size: 13px;
+}
+
+.spinner {
+  width: 28px;
+  height: 28px;
+  border: 2.5px solid var(--divider);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.65s linear infinite;
+}
+
 .section-label {
   font-size: 13px;
   color: var(--text-mute);
@@ -166,8 +199,8 @@ body {
 }
 
 .action-btn-icon {
-  width: 30px;
-  height: 30px;
+  width: 40px;
+  height: 40px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -175,6 +208,13 @@ body {
   border-radius: 50%;
   color: var(--accent);
 }
+
+/* ─── Цветные иконки быстрых действий ────────────────────── */
+.icon-orange { background: rgba(230,81,0,0.12);   color: #e65100; }
+.icon-blue   { background: rgba(33,150,243,0.12);  color: #1976d2; }
+.icon-purple { background: rgba(156,39,176,0.12);  color: #7b1fa2; }
+.icon-green  { background: rgba(76,175,80,0.12);   color: #2e7d32; }
+.icon-amber  { background: rgba(255,152,0,0.12);   color: #e65100; }
 
 /* ─── Card ────────────────────────────────────────────────────── */
 .card {
