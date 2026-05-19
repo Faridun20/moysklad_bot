@@ -125,17 +125,25 @@ def set_telegram_dispatcher(bot, dispatcher) -> None:
 async def telegram_webhook(secret: str, request: Request):
     """Принимает Update-объекты от Telegram.
 
-    Защита: секрет в URL + проверка заголовка X-Telegram-Bot-Api-Secret-Token
-    (Telegram отправляет именно его, если мы при set_webhook указали secret_token).
-    Двойная защита нужна, чтобы случайно слитый URL не давал никому
-    отправлять апдейты — нужен ещё и заголовок.
+    Защита: один и тот же TG_WEBHOOK_SECRET проверяется и в URL,
+    и в заголовке `X-Telegram-Bot-Api-Secret-Token`. Это не «двойная
+    защита» по энтропии — утечка секрета компрометирует обе точки.
+    Заголовок отдаёт Telegram строго если secret_token был указан
+    при `set_webhook`; URL же позволяет Railway маршрутизировать
+    запрос. Проверки оба — это валидация что запрос не подменён
+    каким-то прокси по пути (header может потеряться) и что путь
+    не угадан случайно (без header'а можно слать что угодно по URL).
     """
+    import hmac as _hmac
     from config import TG_WEBHOOK_SECRET
 
-    if not TG_WEBHOOK_SECRET or secret != TG_WEBHOOK_SECRET:
+    if not TG_WEBHOOK_SECRET:
+        raise HTTPException(status_code=404, detail="not found")
+    # constant-time сравнение от теоретического timing-attack
+    if not _hmac.compare_digest(secret, TG_WEBHOOK_SECRET):
         raise HTTPException(status_code=404, detail="not found")
     header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if header_secret != TG_WEBHOOK_SECRET:
+    if not _hmac.compare_digest(header_secret, TG_WEBHOOK_SECRET):
         raise HTTPException(status_code=404, detail="not found")
     if _tg_dispatcher is None or _tg_bot is None:
         # Бот ещё не подключил себя сюда — режим webhook отключён.

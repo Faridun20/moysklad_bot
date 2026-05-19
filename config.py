@@ -58,6 +58,18 @@ except ImportError:
     if BOT_MODE not in ("all", "bot", "webapp"):
         BOT_MODE = "all"
 
+    # ─── Безопасность ──────────────────────────────────────────────
+    # LEGACY_OPEN_BOT=1 — пускать любого нового юзера как 'manager'
+    # когда ALLOWED_USERS пуст. По умолчанию ВЫКЛЮЧЕНО: новые юзеры
+    # получают роль 'guest' (нулевые права), админ повышает вручную
+    # через /addrole.
+    #
+    # Раньше при пустом ALLOWED_USERS все новички автоматически
+    # становились manager'ами. Это значило: достаточно узнать @username
+    # бота → /start → ты внутри с почти полными правами. Найдено в
+    # security-аудите (см. SECURITY.md C1).
+    LEGACY_OPEN_BOT = os.environ.get("LEGACY_OPEN_BOT", "").lower() in ("1", "true", "yes")
+
     # ─── Расписанные отчёты ────────────────────────────────────────
     # 1 (default) — daily/weekly/monthly работают внутри бот-процесса
     #               через asyncio.sleep-циклы. Удобно для one-process

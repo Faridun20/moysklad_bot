@@ -548,13 +548,14 @@ def ensure_user(user_id: int, username: str, full_name: str, admin_ids: list[int
       - В ADMIN_IDS  → admin
       - В BOSS_IDS   → boss
       - В ALLOWED_USERS (если этот env задан) → manager
-      - Если ALLOWED_USERS НЕ задан (пустой) → manager (backward compat)
-      - Иначе → guest (нулевые права, нужно повысить через /addrole)
+      - Иначе → guest (нулевые права, админ повышает через /addrole)
 
-    Раньше всем по умолчанию ставили 'manager' — это открывало бот любому
-    Telegram-юзеру, который найдёт его @username.
+    Опасный legacy-режим: LEGACY_OPEN_BOT=1 + ALLOWED_USERS пуст →
+    любой новичок получает manager. Это эквивалент «открытый бот»
+    и существует только для обратной совместимости со старыми
+    развёртками. На продакшене НЕ включать.
     """
-    from config import BOSS_IDS, ALLOWED_USERS
+    from config import BOSS_IDS, ALLOWED_USERS, LEGACY_OPEN_BOT
 
     with get_conn() as conn:
         cur = get_cursor(conn)
@@ -575,9 +576,15 @@ def ensure_user(user_id: int, username: str, full_name: str, admin_ids: list[int
             role = "boss"
         elif ALLOWED_USERS and user_id in ALLOWED_USERS:
             role = "manager"
-        elif not ALLOWED_USERS:
-            # Whitelist не настроен — оставляем старое поведение,
-            # чтобы не сломать существующие развёртки одним deploy-ом.
+        elif LEGACY_OPEN_BOT and not ALLOWED_USERS:
+            # Эта ветка только для legacy-развёрток. Громко логируем,
+            # чтобы оператор увидел в Railway logs что бот открыт всему миру.
+            logger.warning(
+                "LEGACY_OPEN_BOT=1 + ALLOWED_USERS пуст: user_id=%s "
+                "получил роль 'manager' автоматически. На проде смените "
+                "поведение: убрать LEGACY_OPEN_BOT и/или заполнить ALLOWED_USERS.",
+                user_id,
+            )
             role = "manager"
         else:
             role = "guest"
