@@ -395,6 +395,18 @@ async def main():
             stop_event = asyncio.Event()
             await stop_event.wait()
         else:
+            # Принудительно снимаем webhook перед polling. Если на
+            # Telegram-стороне остался webhook от предыдущего запуска
+            # (например, был включён TG_USE_WEBHOOK, потом переключили
+            # на polling) — getUpdates даёт TelegramConflictError, и
+            # бот зависает в бесконечном retry-loop. delete_webhook
+            # идемпотентно и безопасно: на «чистом» боте ничего не
+            # ломает.
+            try:
+                await bot.delete_webhook(drop_pending_updates=False)
+                logger.info("Перед polling сняли webhook (если был установлен)")
+            except Exception as e:
+                logger.warning("delete_webhook перед polling упал: %s", e)
             await dp.start_polling(bot)
     finally:
         if use_webhook:
