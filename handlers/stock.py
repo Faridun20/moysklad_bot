@@ -118,7 +118,9 @@ async def cb_category_select(call: CallbackQuery, bot: Bot):
     idx = int(call.data.split(":")[1])
     cats = _cache_get(categories_cache, call.message.chat.id, _CATEGORIES_TTL) or []
     if not cats or idx >= len(cats):
-        return await call.message.answer("❌ Список устарел. Нажмите /categories")
+        # Кэш истёк — не оставляем пользователя в тупике, сразу
+        # перезагружаем список категорий с рабочими кнопками.
+        return await show_categories(bot, call.message.chat.id, 0)
     await show_stock_category(bot, call.message.chat.id, 0, idx, cats[idx])
 
 
@@ -140,7 +142,8 @@ async def cb_stock_cat_page(call: CallbackQuery, bot: Bot):
     else:
         cats = _cache_get(categories_cache, call.message.chat.id, _CATEGORIES_TTL) or []
         if not cats or idx >= len(cats):
-            return await call.message.answer("❌ Список устарел. Нажмите /categories")
+            # Кэш истёк — перезагружаем категории вместо тупикового сообщения.
+            return await show_categories(bot, call.message.chat.id, 0)
         await show_stock_category(bot, call.message.chat.id, page, idx, cats[idx])
 
 

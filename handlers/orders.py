@@ -219,6 +219,15 @@ def order_actions_keyboard(order_id: int, status: str, is_owner: bool):
     return kb.as_markup()
 
 
+def delete_confirm_keyboard(order_id: int):
+    """Шаг подтверждения удаления черновика — защита от случайного тапа."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да, удалить", callback_data=f"ord_delete_yes:{order_id}")
+    kb.button(text="↩️ Нет, оставить", callback_data=f"ord_view:{order_id}")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
 def currency_picker_keyboard(order_id: int):
     kb = InlineKeyboardBuilder()
     for c in ALLOWED_CURRENCIES:
@@ -812,6 +821,25 @@ async def cb_submit_order(call: CallbackQuery, state: FSMContext, bot: Bot):
 
 @router.callback_query(F.data.startswith("ord_delete:"))
 async def cb_delete_order(call: CallbackQuery):
+    """Первый шаг — спрашиваем подтверждение, ничего не удаляя."""
+    await call.answer()
+    order_id = int(call.data.split(":")[1])
+    order = await adb.get_order(order_id)
+
+    if not order or order["user_id"] != call.from_user.id:
+        return await call.message.answer("⛔ Нет доступа.")
+    if order["status"] != "draft":
+        return await call.message.answer("❌ Нельзя удалить отправленный заказ.")
+
+    await call.message.answer(
+        f"🗑 Удалить черновик заказа #{order_id}? Это действие необратимо.",
+        reply_markup=delete_confirm_keyboard(order_id),
+    )
+
+
+@router.callback_query(F.data.startswith("ord_delete_yes:"))
+async def cb_delete_order_yes(call: CallbackQuery):
+    """Второй шаг — фактическое удаление после подтверждения."""
     await call.answer()
     order_id = int(call.data.split(":")[1])
     order = await adb.get_order(order_id)

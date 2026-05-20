@@ -64,55 +64,63 @@ def categories_keyboard(cats: list[dict], page: int = 0):
         name = cats[i].get("name", "—")[:28]
         kb.button(text=f"📁 {name}", callback_data=f"ci:{i}")
 
-    nav = []
+    # Стрелки ◀️/▶️ — в одном ряду (единый паттерн со stock/shipments).
+    nav_count = 0
     if page > 0:
         kb.button(text="◀️", callback_data=f"cats:{page - 1}")
-        nav.append(1)
+        nav_count += 1
     if page < total_pages - 1:
         kb.button(text="▶️", callback_data=f"cats:{page + 1}")
-        nav.append(1)
+        nav_count += 1
 
     kb.button(text="🏠 Меню", callback_data="menu")
-    kb.adjust(1, *([1] * (end - start)), *nav, 1)
+    rows = [1, *([1] * (end - start))]
+    if nav_count:
+        rows.append(nav_count)
+    rows.append(1)
+    kb.adjust(*rows)
     return kb.as_markup()
 
 
 def stock_nav_keyboard(page: int, total: int, mode: str, cat_idx: int = 0):
     total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
     kb = InlineKeyboardBuilder()
-    nav = []
-    if mode == "all":
-        if page > 0:
-            kb.button(text="◀️ Назад", callback_data=f"sp:{page - 1}")
-            nav.append(1)
-        if page < total_pages - 1:
-            kb.button(text="Вперёд ▶️", callback_data=f"sp:{page + 1}")
-            nav.append(1)
-    else:
-        if page > 0:
-            kb.button(text="◀️ Назад", callback_data=f"sc:{page - 1}:{cat_idx}")
-            nav.append(1)
-        if page < total_pages - 1:
-            kb.button(text="Вперёд ▶️", callback_data=f"sc:{page + 1}:{cat_idx}")
-            nav.append(1)
+    nav_count = 0
+    if page > 0:
+        cb = f"sp:{page - 1}" if mode == "all" else f"sc:{page - 1}:{cat_idx}"
+        kb.button(text="◀️ Назад", callback_data=cb)
+        nav_count += 1
+    if page < total_pages - 1:
+        cb = f"sp:{page + 1}" if mode == "all" else f"sc:{page + 1}:{cat_idx}"
+        kb.button(text="Вперёд ▶️", callback_data=cb)
+        nav_count += 1
     kb.button(text="🗂 Категории", callback_data="cats:0")
     kb.button(text="🏠 Меню", callback_data="menu")
-    kb.adjust(*nav, 1, 1)
+    # Стрелки в одном ряду, затем «Категории» и «Меню» — каждая своей строкой.
+    rows = []
+    if nav_count:
+        rows.append(nav_count)
+    rows.extend([1, 1])
+    kb.adjust(*rows)
     return kb.as_markup()
 
 
 def shipments_nav_keyboard(page: int, total_pages: int):
     kb = InlineKeyboardBuilder()
-    nav = []
+    nav_count = 0
     if page > 0:
         kb.button(text="◀️ Назад", callback_data=f"shp:{page - 1}")
-        nav.append(1)
+        nav_count += 1
     if page < total_pages - 1:
         kb.button(text="Вперёд ▶️", callback_data=f"shp:{page + 1}")
-        nav.append(1)
+        nav_count += 1
     kb.button(text="📅 Другой период", callback_data="sh_period")
     kb.button(text="🏠 Меню", callback_data="menu")
-    kb.adjust(*nav, 1, 1)
+    rows = []
+    if nav_count:
+        rows.append(nav_count)
+    rows.extend([1, 1])
+    kb.adjust(*rows)
     return kb.as_markup()
 
 

@@ -101,7 +101,7 @@ async def cmd_pay(message: Message, state: FSMContext):
     await state.set_state(PaymentState.waiting_for_amount)
     await message.answer(
         f"{DIV}\n"
-        f"💵 <b>Отправка платежа</b>\n\n"
+        f"💵 <b>Отправка платежа</b>  ·  <i>Шаг 1/3</i>\n\n"
         f"Введите сумму (только цифры):\n"
         f"<code>1500</code>",
         parse_mode="HTML",
@@ -119,7 +119,7 @@ async def cb_pay_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(PaymentState.waiting_for_amount)
     await call.message.answer(
         f"{DIV}\n"
-        f"💵 <b>Отправка платежа</b>\n\n"
+        f"💵 <b>Отправка платежа</b>  ·  <i>Шаг 1/3</i>\n\n"
         f"Введите сумму (только цифры):\n"
         f"<code>1500</code>",
         parse_mode="HTML",
@@ -141,7 +141,7 @@ async def process_amount(message: Message, state: FSMContext):
     await state.update_data(amount=amount)
     await state.set_state(PaymentState.waiting_for_currency)
     await message.answer(
-        f"✅ Сумма: <b>{amount:,.0f}</b>\n\nВыберите валюту:",
+        f"✅ Сумма: <b>{amount:,.0f}</b>  ·  <i>Шаг 2/3</i>\n\nВыберите валюту:",
         parse_mode="HTML",
         reply_markup=currency_keyboard(),
     )
@@ -153,7 +153,7 @@ async def process_currency(call: CallbackQuery, state: FSMContext):
     await state.update_data(currency=currency)
     await state.set_state(PaymentState.waiting_for_comment)
     await call.message.edit_text(
-        f"✅ Валюта: <b>{currency}</b>\n\n"
+        f"✅ Валюта: <b>{currency}</b>  ·  <i>Шаг 3/3</i>\n\n"
         f"📝 Напишите комментарий — за что переданы деньги?\n"
         f"<code>за май, оплата аренды</code>",
         parse_mode="HTML",
