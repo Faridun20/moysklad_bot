@@ -1,0 +1,62 @@
+# Единый источник правды для тулчейна (ruff / pytest / mypy / coverage).
+# Цель — чтобы локально и в CI проверки вели себя одинаково.
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+# Артефакты и окружения вне разбора.
+extend-exclude = [".claude", "__pycache__", ".venv", "venv"]
+
+[tool.ruff.lint]
+# Набор нацелен на БАГИ, не на стиль:
+#   E9  — синтаксис/отступы (runtime errors)
+#   F   — pyflakes: неиспользуемые импорты/переменные, undefined names, битые f-string
+#   B   — flake8-bugbear: мутабельные дефолты, except без as, ресурсные ловушки
+#   ASYNC — типичные async-ошибки (блокирующие вызовы в корутине и т.п.)
+#   UP  — pyupgrade: устаревшие конструкции
+#   SIM — упрощения, часть которых ловит реальные логические дубли
+select = ["E9", "F", "B", "ASYNC", "UP", "SIM"]
+# Игнорим стиль/трейсбек-косметику, не баги:
+#   E501   — длина строки
+#   B904   — raise ... from внутри except: чище трейсбек, но не корректность
+#   SIM105 — contextlib.suppress вместо try/except/pass: стиль
+#   SIM102/103/108 — collapsible-if / negated-return / ternary: рефактор-стиль,
+#                    не трогаем control-flow (в т.ч. auth) ради косметики
+ignore = ["E501", "B904", "SIM105", "SIM102", "SIM103", "SIM108"]
+
+[tool.ruff.lint.per-file-ignores]
+# config.py намеренно делает `from config_local import *` (локальные секреты).
+"config.py" = ["F403", "F405"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.coverage.run]
+# Покрытие как искатель дыр (см. CI). Меряем рантайм-код, не тесты.
+source = ["services", "handlers", "webapp", "utils", "tasks"]
+omit = ["tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+# Проект — namespace-пакеты без __init__.py; без этого mypy видит файл
+# дважды ("moysklad" и "services.moysklad") и падает на резолве модулей.
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = "."
+# Импортируемые модули проверяем «тихо» — ошибки показываем только в
+# целевых files=[...], чтобы сигнал был сфокусирован, а не тонул в чужом коде.
+follow_imports = "silent"
+# Точечно и мягко: разбираем «денежные»/API-модули, не весь проект.
+# Запускается в CI как non-blocking (continue-on-error) — сигнал, не гейт.
+files = [
+    "services/order_workflow.py",
+    "services/database.py",
+    "services/moysklad.py",
+    "webapp/server.py",
+]
+warn_unused_ignores = false

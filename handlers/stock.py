@@ -10,16 +10,12 @@ from aiogram.types import Message, CallbackQuery
 
 from services.roles import (
     can_view_stock,
-    can_view_analytics,
-    can_manage_payments,
-    is_admin,
 )
 from services.moysklad import get_all_stock, get_categories
 from utils.helpers import extract_id_from_href, extract_href, user_safe_error
 from utils.formatters import format_stock_page
-from utils.keyboards import stock_nav_keyboard, categories_keyboard, main_keyboard
+from utils.keyboards import stock_nav_keyboard, categories_keyboard
 
-from config import PAGE_SIZE  # единый источник, переопределяется env
 
 logger = logging.getLogger(__name__)
 router = Router()

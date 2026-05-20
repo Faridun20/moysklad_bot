@@ -181,7 +181,7 @@ async def ms_get(path: str, params: dict = None, session: aiohttp.ClientSession 
                 resp.raise_for_status()
                 _circuit.record_success()
                 return await resp.json()
-        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+        except (TimeoutError, aiohttp.ClientConnectionError) as e:
             last_exc = e
             if attempt >= _MAX_RETRIES - 1:
                 break

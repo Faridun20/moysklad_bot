@@ -65,6 +65,33 @@ def _redact_token(text: str) -> str:
     return text
 
 
+# ─── Видимость массового отказа отправки ────────────────────────────────────
+# tg_send_message — best-effort: единичный сбой глушится в warning и тонет в
+# логах. Чтобы массовый отказ (как недавний баг с base_url, когда падали ВСЕ
+# уведомления) был заметен сразу, считаем подряд-неудачи и эскалируем в error
+# при превышении порога.
+_send_fail_streak = 0
+SEND_FAIL_ALERT_AFTER = 5
+
+
+def _note_send_ok() -> None:
+    global _send_fail_streak
+    _send_fail_streak = 0
+
+
+def _note_send_fail(chat_id: int, detail: str) -> None:
+    global _send_fail_streak
+    _send_fail_streak += 1
+    if _send_fail_streak == SEND_FAIL_ALERT_AFTER:
+        logger.error(
+            "tg sendMessage: %d неудач подряд — уведомления, похоже, не "
+            "доходят (последняя цель %d: %s)",
+            _send_fail_streak, chat_id, detail,
+        )
+    else:
+        logger.warning("tg sendMessage %d failed: %s", chat_id, detail)
+
+
 async def close_tg_session() -> None:
     global _tg_session
     if _tg_session is not None and not _tg_session.closed:
@@ -95,13 +122,14 @@ async def tg_send_message(
         ) as resp:
             if resp.status >= 400:
                 body = await resp.text()
-                logger.warning(
-                    "tg sendMessage %d → %s: %s",
-                    chat_id, resp.status, _redact_token(body[:200]),
+                _note_send_fail(
+                    chat_id, f"HTTP {resp.status}: {_redact_token(body[:200])}"
                 )
+            else:
+                _note_send_ok()
     except Exception as e:
         # repr(e) у aiohttp-ошибок может содержать URL с токеном — редактим.
-        logger.warning("tg sendMessage %d failed: %s", chat_id, _redact_token(repr(e)))
+        _note_send_fail(chat_id, _redact_token(repr(e)))
 
 # ─── Получатели уведомлений ───
 def get_notify_recipients() -> list[int]:

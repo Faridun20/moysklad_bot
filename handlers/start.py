@@ -1,7 +1,6 @@
 """
 Общие хэндлеры: /start, меню, управление ролями
 """
-import os
 import logging
 from aiogram import Bot, Router, F
 from aiogram.filters import CommandStart, Command
@@ -12,11 +11,10 @@ from aiogram.types import (
     BotCommand, BotCommandScopeChat,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from services.roles import is_boss, is_guest
+from services.roles import is_boss
 from utils.formatters import DIV   
 from config import ADMIN_IDS
 from services.database import (
-    add_audit_log,
     get_role,
     ensure_user,
 )

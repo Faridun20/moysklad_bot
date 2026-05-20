@@ -69,7 +69,7 @@ async def create_ms_employee(full_name: str, username: str) -> tuple[dict | None
     parts = full_name.strip().split() if full_name else []
     first_name = parts[0] if parts else (username or "TG")
     last_name = parts[1] if len(parts) > 1 else (
-        f"@{username}" if username else f"(TG)"
+        f"@{username}" if username else "(TG)"
     )
     middle_name = parts[2] if len(parts) > 2 else ""
 

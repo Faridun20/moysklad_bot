@@ -190,8 +190,8 @@ async def approve_shipment_request(
                         adb.set_order_ms_demand_id(order["id"], demand_id),
                     )
                 demand_line = (
-                    f"\n📄 Заказ покупателя создан в МойСклад"
-                    f"\n📦 Отгрузка проведена, остатки списаны"
+                    "\n📄 Заказ покупателя создан в МойСклад"
+                    "\n📦 Отгрузка проведена, остатки списаны"
                 )
                 if pdf_to_send:
                     demand_line += " — печатная форма ниже 👇"

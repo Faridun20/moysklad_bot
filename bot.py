@@ -5,7 +5,8 @@ Telegram-бот МойСклад — точка запуска
 import asyncio
 import logging
 import os
-from typing import Any, Awaitable, Callable
+from typing import Any
+from collections.abc import Awaitable, Callable
 
 from aiogram import Bot, Dispatcher, BaseMiddleware
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -215,6 +216,40 @@ def _build_fsm_storage():
         return MemoryStorage()
 
 
+async def _startup_selfcheck():
+    """Fail-fast диагностика на старте: режим, критичные env и что URL для
+    уведомлений реально собирается.
+
+    Прямой урок инцидента: notifier.tg_send_message строил невалидный
+    aiohttp base_url (с path), и ВСЕ уведомления молча падали в рантайме.
+    Здесь это видно сразу в логах старта, а не «когда полезли в логи».
+    Не роняем процесс — только громкий error, чтобы было заметно.
+    """
+    logger.info("Старт в режиме BOT_MODE=%s", BOT_MODE or "all")
+    if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
+        logger.error(
+            "TELEGRAM_TOKEN пуст или не вида '<id>:<secret>' — "
+            "бот и уведомления работать не будут",
+        )
+    try:
+        import services.notifier as notifier
+        sess = await notifier.get_tg_session()
+        base = getattr(sess, "_base_url", None)
+        if base is not None and base.path not in ("", "/"):
+            logger.error(
+                "notify self-check: base_url содержит path %r — "
+                "уведомления будут падать ещё до сети",
+                base.path,
+            )
+        else:
+            logger.info("notify self-check: Telegram base_url корректен ✓")
+    except Exception:
+        logger.exception(
+            "notify self-check провален — уведомления, вероятно, "
+            "не будут отправляться",
+        )
+
+
 async def _run_webapp_only():
     """Режим BOT_MODE=webapp: поднимаем только FastAPI.
 
@@ -223,6 +258,7 @@ async def _run_webapp_only():
     прямо здесь. Polling в этом режиме никогда не запускается — бот
     либо принимает webhook'и, либо вообще не обрабатывает Telegram
     (полезно, если парный BOT_MODE=bot процесс делает polling)."""
+    await _startup_selfcheck()
     init_db()
     from webapp import server as webapp_server
 
@@ -285,6 +321,7 @@ async def main():
         await _run_webapp_only()
         return
 
+    await _startup_selfcheck()
     init_db()
 
     bot = Bot(token=TELEGRAM_TOKEN)

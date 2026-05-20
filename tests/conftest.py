@@ -8,9 +8,15 @@ Pytest fixtures.
 """
 
 import os
-import tempfile
 
 import pytest
+
+# Заглушки секретов на случай запуска без env (локально / pre-commit hook):
+# config.py требует TELEGRAM_TOKEN/MS_TOKEN уже на импорте, а часть тест-
+# модулей импортируют services на этапе сборки — до фикстур. setdefault не
+# перетирает реальные значения из CI.
+os.environ.setdefault("TELEGRAM_TOKEN", "0:fake-token-for-tests")
+os.environ.setdefault("MS_TOKEN", "fake-ms-token")
 
 
 @pytest.fixture

@@ -21,7 +21,6 @@ USE_POSTGRES = bool(DATABASE_URL)
 SQL_SLOW_MS = float(os.environ.get("SQL_SLOW_MS", "200"))
 
 if USE_POSTGRES:
-    import psycopg2
     from psycopg2 import pool as _pg_pool
     from psycopg2.extras import RealDictCursor
     logger.info("Используется PostgreSQL")
@@ -182,7 +181,7 @@ def _create_tables():
         id_type = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
 
         tables = [
-            f"""CREATE TABLE IF NOT EXISTS user_roles (
+            """CREATE TABLE IF NOT EXISTS user_roles (
                 user_id              BIGINT PRIMARY KEY,
                 username             TEXT,
                 full_name            TEXT,
@@ -269,7 +268,7 @@ def _create_tables():
             # как safety-net + точечная инвалидация через вебхуки.
             # Поле ms_id хранит UUID из МойСклад (PRIMARY KEY).
 
-            f"""CREATE TABLE IF NOT EXISTS ms_products (
+            """CREATE TABLE IF NOT EXISTS ms_products (
                 ms_id      TEXT PRIMARY KEY,
                 name       TEXT,
                 folder_id  TEXT,
@@ -279,7 +278,7 @@ def _create_tables():
                 updated_at TEXT
             )""",
 
-            f"""CREATE TABLE IF NOT EXISTS ms_categories (
+            """CREATE TABLE IF NOT EXISTS ms_categories (
                 ms_id      TEXT PRIMARY KEY,
                 name       TEXT,
                 parent_id  TEXT,
@@ -287,7 +286,7 @@ def _create_tables():
                 updated_at TEXT
             )""",
 
-            f"""CREATE TABLE IF NOT EXISTS ms_counterparties (
+            """CREATE TABLE IF NOT EXISTS ms_counterparties (
                 ms_id      TEXT PRIMARY KEY,
                 name       TEXT,
                 phone      TEXT,
@@ -295,14 +294,14 @@ def _create_tables():
                 updated_at TEXT
             )""",
 
-            f"""CREATE TABLE IF NOT EXISTS ms_employees (
+            """CREATE TABLE IF NOT EXISTS ms_employees (
                 ms_id      TEXT PRIMARY KEY,
                 name       TEXT,
                 href       TEXT,
                 updated_at TEXT
             )""",
 
-            f"""CREATE TABLE IF NOT EXISTS ms_stock (
+            """CREATE TABLE IF NOT EXISTS ms_stock (
                 ms_id       TEXT PRIMARY KEY,
                 name        TEXT,
                 folder_id   TEXT,
@@ -313,7 +312,7 @@ def _create_tables():
                 updated_at  TEXT
             )""",
 
-            f"""CREATE TABLE IF NOT EXISTS ms_snapshot_meta (
+            """CREATE TABLE IF NOT EXISTS ms_snapshot_meta (
                 dataset           TEXT PRIMARY KEY,
                 last_refresh      TEXT,
                 last_full_refresh TEXT,

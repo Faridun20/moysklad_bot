@@ -1,0 +1,22 @@
+# Локальная первая линия защиты — до пуша. Установка:
+#   pip install pre-commit && pre-commit install && pre-commit install --hook-type pre-push
+#
+# ruff гоняется на staged-файлах (быстро), pytest — только на pre-push,
+# чтобы коммиты оставались мгновенными.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Версия совпадает с пином в requirements-dev.txt (один линтер везде).
+    rev: v0.15.13
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: pytest-smoke
+        name: pytest (smoke, pre-push)
+        entry: pytest tests/ -q
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

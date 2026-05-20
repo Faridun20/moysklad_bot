@@ -6,6 +6,9 @@ __pycache__/
 # Test / lint caches
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 
 # Local SQLite БД (на проде — Postgres)
 *.db

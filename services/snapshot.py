@@ -21,11 +21,9 @@
 
 import asyncio
 import logging
-from datetime import datetime
-from typing import Iterable
 
 from services.database import get_conn, get_cursor, q, now_str
-from services.moysklad import ms_get, MS_BASE
+from services.moysklad import ms_get
 from utils.helpers import extract_id_from_href, safe_get, extract_href
 
 logger = logging.getLogger(__name__)

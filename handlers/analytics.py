@@ -12,11 +12,10 @@ from aiogram import Bot, Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 
-from services.roles import can_view_analytics, is_boss, cached_role
-from services.moysklad import get_sales_stats, get_employee_stats, get_employee_href
+from services.roles import can_view_analytics, cached_role
+from services.moysklad import get_sales_stats
 from services.database import (
-    get_moysklad_employee_id,
-    get_user_orders, get_order_items, get_order_items_by_ids,
+    get_user_orders, get_order_items_by_ids,
 )
 from utils.formatters import format_sales_report
 from utils.keyboards import analytics_keyboard, analytics_back_keyboard

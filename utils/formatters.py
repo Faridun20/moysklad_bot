@@ -136,7 +136,7 @@ def format_sales_report(label: str, stats: dict, prev_stats: dict = None) -> str
 
     if top:
         lines.append("")
-        lines.append(f"<b>🏆 Топ товаров:</b>")
+        lines.append("<b>🏆 Топ товаров:</b>")
         lines.append(DIV2)
         medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
         for i, (name, data) in enumerate(top):

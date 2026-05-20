@@ -20,24 +20,8 @@ def _can_send_payment(user_id: int) -> bool:
     Босс эти платежи апрувит — отправлять ему нечего."""
     return _has_role(user_id, "admin", "manager")
 from utils.formatters import (
-    format_payment_notify,
-    format_payment_confirmed,
-    format_payment_rejected,
     format_payments_report,
     DIV,
-)
-from services.database import (
-    add_payment,
-    confirm_payment,
-    reject_payment,
-    get_payment,
-    get_payments_report,
-    get_summary_by_employee,
-    add_audit_log,
-    get_role,
-    get_ms_sync_stats,
-    get_payments_needing_ms_sync,
-    get_recent_ms_sync_failures,
 )
 from services import async_db as adb
 

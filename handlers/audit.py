@@ -3,7 +3,6 @@
 """
 
 import logging
-from datetime import datetime, timedelta
 
 from aiogram import Router, F
 from aiogram.filters import Command
@@ -11,7 +10,6 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services.roles import can_manage_users
-from services.database import get_audit_log, get_all_users
 from services import async_db as adb
 
 logger = logging.getLogger(__name__)

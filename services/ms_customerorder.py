@@ -16,7 +16,6 @@ Telegram — без ссылок на онлайн-кабинет МойСкла
 
 import json
 import logging
-from datetime import datetime
 from typing import Any
 
 from services import ms_demand
@@ -273,9 +272,6 @@ async def create_customerorder_from_request(
     # store у customerorder есть, но опциональный. Ставим если резолвили.
     store_meta = ms_demand._CTX.get("store_meta")
     if store_meta and store_meta.get("href"):
-        payload["store"] = _meta(store_meta["href"], "store")["meta"] \
-            if False else {"meta": _meta(store_meta["href"], "store")["meta"]}
-        # Хм, упрощу:
         payload["store"] = {"meta": {
             "href": store_meta["href"],
             "type": "store",

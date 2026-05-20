@@ -913,7 +913,6 @@ async def api_payments_pending(request: Request):
 @app.post("/api/payments/send")
 async def api_payments_send(request: Request):
     """Отправить новый платёж на подтверждение."""
-    from config import ADMIN_IDS
     from services import async_db as adb
     from services.notifier import tg_send_message
     from utils.formatters import format_payment_notify
@@ -1264,7 +1263,6 @@ async def api_submit_order(request: Request):
 
     from services import async_db as adb
     from services.notifier import aget_notify_recipients, tg_send_message
-    from utils.formatters import DIV
     from handlers.orders import format_request_notify
 
     order_id = data["order_id"]
@@ -1343,7 +1341,7 @@ async def api_agents(request: Request):
     from services.moysklad import ms_get
 
     data = await request.json()
-    user = _authorize(
+    _authorize(
         data,
         allowed_roles=("admin", "boss", "manager"),
         rate_limit_scope="api_agents",

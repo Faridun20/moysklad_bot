@@ -26,15 +26,9 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services.roles import can_create_orders, is_boss
-from services.database import (
-    get_open_debts, get_order, mark_order_paid,
-    get_order_items, get_order_items_by_ids, get_role,
-    get_order_payment_summary,
-)
 from services.notifier import get_notify_recipients
 from services import async_db as adb
 from config import BASE_CURRENCY
-from utils.helpers import user_safe_error
 from utils.formatters import DIV
 
 logger = logging.getLogger(__name__)
@@ -59,7 +53,7 @@ def _format_due(due_str: str | None, today_str: str) -> str:
     if due_str < today_str:
         return f"⚠️ <b>{_esc(_to_ru(due_str))}</b> (просрочен)"
     if due_str == today_str:
-        return f"⏰ <b>сегодня</b>"
+        return "⏰ <b>сегодня</b>"
     return f"📅 {_esc(_to_ru(due_str))}"
 
 
@@ -137,6 +131,7 @@ async def cmd_debts(message: Message):
             await asyncio.gather(
                 *(adb.get_order_payment_summary(d["id"]) for d in debts)
             ),
+            strict=True,
         )
     }
     today_str = date.today().isoformat()

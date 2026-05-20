@@ -29,12 +29,23 @@ jobs:
       - name: Install test deps
         run: pip install -r requirements-dev.txt
 
-      # ruff = одновременно лайтовый линтер + проверка формата. Гоним
-      # только базовые правила (errors, undefined names), не enforced
-      # whole-codebase style yet — иначе на старте красная сборка
-      # отвлечёт от настоящих проблем.
-      - name: Lint with ruff
+      # Строгий минимум (runtime-errors / undefined names) — отдельным
+      # блокирующим шагом, чтобы в логе сразу было видно, если упало именно
+      # это, а не «стиль».
+      - name: Lint (strict gate)
         run: ruff check --select=E9,F63,F7,F82 --statistics .
+
+      # Полный набор из pyproject.toml ([tool.ruff.lint]): F/B/ASYNC/UP/SIM —
+      # нацелен на баги (неиспользуемые импорты, мутабельные дефолты,
+      # async-ошибки), не на стиль.
+      - name: Lint (full ruleset)
+        run: ruff check --output-format=github .
+
+      # mypy — точечно по «денежным»/API-модулям. Non-blocking: сигнал о
+      # регрессиях типов, но пока не гейт (см. pyproject [tool.mypy]).
+      - name: Type-check (non-blocking)
+        continue-on-error: true
+        run: mypy
 
       - name: Run tests
         env:
@@ -42,4 +53,4 @@ jobs:
           # Реальные тесты переопределяют env через monkeypatch.
           TELEGRAM_TOKEN: "0:fake-ci-token"
           MS_TOKEN: "fake-ci"
-        run: pytest tests/ -v --tb=short
+        run: pytest tests/ -v --tb=short --cov --cov-report=term-missing

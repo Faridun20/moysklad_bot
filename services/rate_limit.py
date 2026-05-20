@@ -18,10 +18,9 @@
 
 import time
 from collections import deque
-from typing import Deque
 
 # Ключ: (scope, user_id) → очередь monotonic timestamp'ов вызовов
-_buckets: dict[tuple[str, int], Deque[float]] = {}
+_buckets: dict[tuple[str, int], deque[float]] = {}
 
 # Сколько ключей-«сирот» удалять за один acquire (чтобы не разрастаться).
 _GC_PROBE_KEYS = 50

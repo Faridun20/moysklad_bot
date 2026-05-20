@@ -21,7 +21,6 @@
 
 import logging
 import os
-from datetime import datetime
 from typing import Any
 
 from services.moysklad import ms_get, get_session, MS_BASE
@@ -324,7 +323,7 @@ async def create_demand_from_request(
 
 def _build_description(order: dict, telegram_full_name: str) -> str:
     lines = [
-        f"Создано через Telegram-бота.",
+        "Создано через Telegram-бота.",
         f"Менеджер: {telegram_full_name}",
         f"Внутренний номер заявки: #{order['id']}",
     ]

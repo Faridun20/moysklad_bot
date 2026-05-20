@@ -1,7 +1,17 @@
 # Тестовые/dev-only зависимости. CI ставит через этот файл (см.
 # .github/workflows/ci.yml); локально: pip install -r requirements.txt -r requirements-dev.txt
-pytest>=8.0
-ruff>=0.5
+#
+# Версии запинены (==), чтобы CI не «плыл» от обновлений тулчейна:
+# линтер/тайпчекер, поймавшие баг сегодня, должны вести себя так же завтра.
+pytest==9.0.3
+ruff==0.15.13
 # httpx нужен FastAPI TestClient (tests/test_requests_api.py). Без него
 # starlette.testclient падает на импорте.
-httpx>=0.27
+httpx==0.28.1
+# aioresponses — мок aiohttp-ТРАНСПОРТА (не наших обёрток), чтобы реально
+# исполнялась сборка URL/payload в исходящих запросах (tests/test_notifier_send.py).
+aioresponses==0.7.8
+# Покрытие — как искатель неисполняемых веток, без жёсткого порога.
+pytest-cov==7.1.0
+# Точечный статический разбор «денежных»/API-модулей (non-blocking в CI).
+mypy==2.1.0

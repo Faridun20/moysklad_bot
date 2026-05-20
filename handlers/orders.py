@@ -11,9 +11,7 @@
 """
 
 import asyncio
-import html
 import logging
-from datetime import datetime
 
 from config import BASE_CURRENCY as _BASE_CURRENCY, ALLOWED_CURRENCIES
 
@@ -36,17 +34,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services.roles import can_create_orders, is_boss
-from services.database import (
-    create_order, get_order, get_orders_by_ids, get_user_orders, get_all_orders,
-    update_order_status, update_order_agent, update_order_currency,
-    add_order_item, get_order_items, remove_order_item,
-    create_shipment_request, get_shipment_request,
-    get_pending_requests, approve_shipment_request, reject_shipment_request,
-    get_role, add_audit_log, get_all_users,
-)
 from services import async_db as adb
 from services.moysklad import get_all_stock, get_categories, ms_get
-from services.notifier import get_notify_recipients, send_to_recipients
 from utils.helpers import extract_id_from_href, extract_href, safe_get, user_safe_error
 from utils.formatters import DIV, DIV2
 
@@ -62,7 +51,6 @@ class OrderState(StatesGroup):
     entering_quantity = State()  # ввод количества
     entering_price    = State()  # ввод цены за единицу
     choosing_agent    = State()  # выбор клиента
-    entering_comment  = State()  # комментарий к заявке
 
 
 # ─── Форматирование ───────────────────────────────────────────────────────────
@@ -501,7 +489,6 @@ async def cb_cat_pick(call: CallbackQuery, state: FSMContext):
 async def cb_prod_pick(call: CallbackQuery, state: FSMContext):
     await call.answer()
     parts = call.data.split(":")
-    order_id = int(parts[1])
     idx = int(parts[2])
 
     data = await state.get_data()

@@ -109,7 +109,7 @@ def trend_arrow(current: float, previous: float) -> str:
         return f"➡️ {diff:+.0f}%"
 
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, UTC
 
 
 def utc_now() -> datetime:
@@ -121,7 +121,7 @@ def utc_now() -> datetime:
     сравнивают/форматируют naive datetimes (например МойСклад
     `moment` строки и сравнения с `created_at` из БД).
     """
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def local_now() -> datetime:

@@ -23,7 +23,7 @@ import argparse
 import asyncio
 import logging
 import sys
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from aiogram import Bot
 
