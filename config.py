@@ -20,7 +20,10 @@ except ImportError:
     if not MS_TOKEN:
         raise RuntimeError("MS_TOKEN не задан — задайте переменную окружения")
 
-    CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "300"))
+    # Интервал РЕЗЕРВНОГО поллера отгрузок. Основной канал теперь —
+    # MS-вебхук (мгновенно), поллер лишь добирает пропущенное, поэтому
+    # дефолт увеличен 300→900с (реже дёргаем MS API).
+    CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "900"))
     # Валюта для отображения цен в боте/WebApp (отображательная — на
     # стороне МойСклад валюта берётся из организации). Дефолт — USD.
     BASE_CURRENCY = os.environ.get("BASE_CURRENCY", "USD")

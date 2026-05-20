@@ -420,6 +420,19 @@ async def get_shipments(since: datetime, until: datetime = None) -> list[dict]:
     return data if isinstance(data, list) else data.get("rows", [])
 
 
+async def get_shipment(demand_id: str) -> dict | None:
+    """Получить один demand-документ с раскрытыми agent/owner.
+
+    Нужен для событийных уведомлений (MS-вебхук даёт только demand_id, а
+    format_shipment ждёт объект с agent/owner/sum). Без кэша — событие
+    про конкретную новую отгрузку приходит один раз."""
+    data = await ms_get(
+        f"entity/demand/{demand_id}",
+        params={"expand": "agent,owner"},
+    )
+    return data if isinstance(data, dict) else None
+
+
 @_ms_ttl_cache(ttl=3600.0, name="get_shipment_positions")
 async def get_shipment_positions(demand_id: str) -> list[dict]:
     """Получить позиции (товары) конкретной отгрузки.

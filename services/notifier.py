@@ -13,8 +13,8 @@ from aiogram import Bot
 from config import CHECK_INTERVAL_SEC as _CHECK_INTERVAL_SEC, TELEGRAM_TOKEN
 
 CHECK_INTERVAL_SEC = int(_CHECK_INTERVAL_SEC)
-from services.moysklad import get_shipments, get_shipment_positions
-from services.database import get_all_users
+from services.moysklad import get_shipments, get_shipment, get_shipment_positions
+from services.database import get_all_users, mark_shipment_notified
 from utils.helpers import extract_id_from_href
 from utils.formatters import format_shipment, DIV
 
@@ -192,10 +192,62 @@ async def send_to_recipients(bot: Bot, text: str, recipients: list[int]):
             logger.warning("Не удалось отправить %d: %s", uid, e)
 
 
-async def shipment_notifier(bot: Bot):
-    """Раз в CHECK_INTERVAL_SEC проверяет новые отгрузки и рассылает уведомления."""
+async def notify_new_shipment(
+    demand_id: str,
+    shipment: dict | None = None,
+    recipients: list[int] | None = None,
+) -> bool:
+    """Уведомить boss/admin об ОДНОЙ новой отгрузке. Возвращает True, если
+    уведомление отправлено.
+
+    Дедуп через БД (`mark_shipment_notified`): и MS-вебхук (webapp-процесс),
+    и поллер (bot-процесс) зовут эту функцию — на каждый demand уйдёт ровно
+    одно уведомление, кто бы ни успел первым.
+
+    Слот «застолбляется» ПЕРЕД отправкой (но после того как объект и
+    получатели готовы) — если получить demand не удалось, слот свободен и
+    поллер-резерв сможет повторить позже.
+    """
+    if not demand_id:
+        return False
+    if shipment is None:
+        try:
+            shipment = await get_shipment(demand_id)
+        except Exception as e:
+            logger.warning("notify_new_shipment: demand %s fetch failed: %s", demand_id, e)
+            return False
+    if not shipment:
+        return False
+
+    if recipients is None:
+        recipients = get_notify_recipients()
+    if not recipients:
+        logger.warning("notify_new_shipment: нет получателей")
+        return False
+
+    # Атомарно застолбить отправку — гонка вебхука и поллера решается здесь.
+    if not mark_shipment_notified(demand_id):
+        return False
+
+    positions = []
+    try:
+        positions = await get_shipment_positions(demand_id)
+    except Exception:
+        pass
+
+    txt = f"{DIV}\n🔔 <b>Новая отгрузка!</b>\n\n" + format_shipment(shipment, positions)
+    for uid in recipients:
+        await tg_send_message(uid, txt)
+    return True
+
+
+async def shipment_notifier(bot: Bot | None = None):
+    """Резервный поллер: раз в CHECK_INTERVAL_SEC добирает отгрузки, которые
+    не пришли через MS-вебхук. Дедуп общий с вебхуком (notify_new_shipment),
+    поэтому дублей нет. `bot` больше не нужен (шлём через tg_send_message),
+    оставлен для совместимости со стартом фоновых задач."""
     last_check: datetime = datetime.now()
-    logger.info("Мониторинг отгрузок запущен (интервал %s с)", CHECK_INTERVAL_SEC)
+    logger.info("Мониторинг отгрузок (резерв) запущен, интервал %s с", CHECK_INTERVAL_SEC)
 
     while True:
         await asyncio.sleep(CHECK_INTERVAL_SEC)
@@ -206,30 +258,16 @@ async def shipment_notifier(bot: Bot):
             if not shipments:
                 continue
 
-            logger.info("Новых отгрузок: %d", len(shipments))
-
-            # Получаем актуальный список получателей при каждой проверке
-            # (чтобы учитывать новых пользователей без перезапуска)
             recipients = get_notify_recipients()
             if not recipients:
                 logger.warning("Нет получателей для уведомлений об отгрузках")
                 continue
 
-            logger.info("Получатели уведомлений: %s", recipients)
-
             for s in shipments[:5]:
                 demand_id = extract_id_from_href(s.get("meta", {}).get("href", ""))
-                positions = []
-                if demand_id:
-                    try:
-                        positions = await get_shipment_positions(demand_id)
-                    except Exception:
-                        pass
-
-                txt = f"{DIV}\n" f"🔔 <b>Новая отгрузка!</b>\n\n" + format_shipment(
-                    s, positions
-                )
-                await send_to_recipients(bot, txt, recipients)
+                if not demand_id:
+                    continue
+                await notify_new_shipment(demand_id, shipment=s, recipients=recipients)
 
         except Exception as e:
             logger.error("Ошибка мониторинга: %s", e)

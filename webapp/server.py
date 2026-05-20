@@ -248,6 +248,23 @@ async def telegram_webhook(secret: str, request: Request):
 _MS_WEBHOOK_MAX_BYTES = 1 * 1024 * 1024
 
 
+def _new_demand_ids_from_events(events: list[dict]) -> list[str]:
+    """demand_id новых отгрузок (action=CREATE, type demand/retaildemand) из
+    payload MS-вебхука. Вынесено отдельно — чтобы тестировать дискриминацию
+    событий без асинхронной fire-and-forget обвязки хендлера."""
+    from utils.helpers import extract_id_from_href
+    ids: list[str] = []
+    for e in events:
+        if e.get("action") != "CREATE":
+            continue
+        if (e.get("meta") or {}).get("type", "").lower() not in ("demand", "retaildemand"):
+            continue
+        did = extract_id_from_href((e.get("meta") or {}).get("href", ""))
+        if did:
+            ids.append(did)
+    return ids
+
+
 @app.post("/api/ms-webhook/{secret}")
 async def ms_webhook(secret: str, request: Request):
     """
@@ -320,6 +337,15 @@ async def ms_webhook(secret: str, request: Request):
         _task = asyncio.create_task(handle_ms_events(events))
         _background_tasks.add(_task)
         _task.add_done_callback(_background_tasks.discard)
+
+        # Новые отгрузки → уведомляем boss/admin МГНОВЕННО (раньше это делал
+        # поллер раз в N секунд, отсюда задержка до нескольких минут). Дедуп
+        # внутри notify_new_shipment не даст задвоить с поллером-резервом.
+        from services.notifier import notify_new_shipment
+        for did in _new_demand_ids_from_events(events):
+            _nt = asyncio.create_task(notify_new_shipment(did))
+            _background_tasks.add(_nt)
+            _nt.add_done_callback(_background_tasks.discard)
 
     # МойСклад ждёт 200 быстро, иначе ретраит. Сам рефреш делаем в фоне.
     return JSONResponse({"ok": True, "received": len(events)})

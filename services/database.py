@@ -320,6 +320,15 @@ def _create_tables():
                 rows_count        INTEGER DEFAULT 0,
                 status            TEXT
             )""",
+
+            # Дедуп уведомлений об отгрузках: и MS-вебхук (webapp-процесс), и
+            # поллер (bot-процесс) пишут сюда demand_id перед отправкой. PRIMARY
+            # KEY + INSERT-if-absent гарантируют ровно одно уведомление на demand
+            # независимо от того, какой процесс успел первым.
+            """CREATE TABLE IF NOT EXISTS notified_shipments (
+                demand_id   TEXT PRIMARY KEY,
+                notified_at TEXT
+            )""",
         ]
 
         # Создаём каждую таблицу в отдельной транзакции
@@ -791,6 +800,37 @@ def get_order_payment_summary(order_id: int) -> dict:
         "pending": pending,
         "remaining": remaining,
     }
+
+
+def mark_shipment_notified(demand_id: str) -> bool:
+    """Атомарно «застолбить» отправку уведомления об отгрузке.
+
+    Возвращает True, если demand_id записан впервые (т.е. уведомлять НАДО),
+    и False, если уже был (другой процесс/проход опередил — не дублируем).
+
+    Используется и MS-вебхуком (webapp), и поллером (bot) — общий Postgres
+    обеспечивает дедуп между процессами. INSERT-if-absent атомарен, гонка
+    двух процессов разрешается на уровне PRIMARY KEY.
+    """
+    if not demand_id:
+        return False
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        if USE_POSTGRES:
+            cur.execute(
+                "INSERT INTO notified_shipments (demand_id, notified_at) "
+                "VALUES (%s, %s) ON CONFLICT (demand_id) DO NOTHING",
+                (demand_id, now_str()),
+            )
+        else:
+            cur.execute(
+                "INSERT OR IGNORE INTO notified_shipments (demand_id, notified_at) "
+                "VALUES (?, ?)",
+                (demand_id, now_str()),
+            )
+        inserted = cur.rowcount > 0
+        conn.commit()
+    return inserted
 
 
 def set_order_ms_demand_id(order_id: int, ms_demand_id: str) -> bool:
