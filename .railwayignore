@@ -1,0 +1,14 @@
+# Исключаем из контекста сборки Railway всё, что не нужно в рантайме.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.claude/
+*.db
+.env
+config_local.py
+
+# Тесты, CI, документация — не нужны для запуска сервисов
+tests/
+.github/
+*.md

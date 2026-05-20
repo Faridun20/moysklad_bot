@@ -1,0 +1,18 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+
+# Local SQLite БД (на проде — Postgres)
+*.db
+
+# Секреты и локальная конфигурация
+.env
+config_local.py
+
+# Claude Code (worktrees ~2.7M, локальные настройки)
+.claude/
