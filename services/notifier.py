@@ -37,12 +37,13 @@ _tg_session_lock = asyncio.Lock()
 async def get_tg_session() -> aiohttp.ClientSession:
     """Вернуть общую сессию для запросов в api.telegram.org.
 
-    SECURITY.md H8: TELEGRAM_TOKEN раньше вставлялся в URL inline
-    (f"https://api.telegram.org/bot{TOKEN}/..."). При любом исключении
-    aiohttp путь URL'а попадал в repr/traceback и мог утечь в
-    Railway logs / log drain. Сейчас session держит base_url с
-    токеном; POST'ы делаются по относительному пути `/sendMessage`,
-    токен в exception-tracebacks больше не виден.
+    base_url держит ТОЛЬКО origin (`https://api.telegram.org`) — aiohttp
+    запрещает path-часть в base_url (ValueError / AssertionError на
+    sess.post), поэтому токен идёт в относительном пути запроса.
+
+    SECURITY.md H8: чтобы TELEGRAM_TOKEN не утёк в Railway logs через
+    repr(exception), в except'е tg_send_message строка ошибки
+    прогоняется через _redact_token().
     """
     global _tg_session
     if _tg_session is None or _tg_session.closed:
@@ -50,11 +51,18 @@ async def get_tg_session() -> aiohttp.ClientSession:
             if _tg_session is None or _tg_session.closed:
                 connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
                 _tg_session = aiohttp.ClientSession(
-                    base_url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}",
+                    base_url="https://api.telegram.org",
                     connector=connector,
                     timeout=_TG_TIMEOUT,
                 )
     return _tg_session
+
+
+def _redact_token(text: str) -> str:
+    """Убрать TELEGRAM_TOKEN из строки (для логов ошибок)."""
+    if TELEGRAM_TOKEN and TELEGRAM_TOKEN in text:
+        return text.replace(TELEGRAM_TOKEN, "***")
+    return text
 
 
 async def close_tg_session() -> None:
@@ -82,19 +90,18 @@ async def tg_send_message(
         payload["reply_markup"] = reply_markup
     try:
         sess = await get_tg_session()
-        # Относительный путь — base_url с токеном задан в session.
-        # Токен не появляется в local-trace / repr(request).
-        async with sess.post("/sendMessage", json=payload) as resp:
+        async with sess.post(
+            f"/bot{TELEGRAM_TOKEN}/sendMessage", json=payload
+        ) as resp:
             if resp.status >= 400:
                 body = await resp.text()
                 logger.warning(
                     "tg sendMessage %d → %s: %s",
-                    chat_id, resp.status, body[:200],
+                    chat_id, resp.status, _redact_token(body[:200]),
                 )
     except Exception as e:
-        # Используем %r для chat_id (число — без токена), repr(e)
-        # для текста ошибки (тип + msg, без HTTP-URL внутри).
-        logger.warning("tg sendMessage %d failed: %r", chat_id, e)
+        # repr(e) у aiohttp-ошибок может содержать URL с токеном — редактим.
+        logger.warning("tg sendMessage %d failed: %s", chat_id, _redact_token(repr(e)))
 
 # ─── Получатели уведомлений ───
 def get_notify_recipients() -> list[int]:
