@@ -157,6 +157,43 @@ def set_telegram_dispatcher(bot, dispatcher) -> None:
     _tg_dispatcher = dispatcher
 
 
+# Отдельный Bot-инстанс для исходящих уведомлений из API-эндпоинтов
+# (approve/reject заявок). Нужен, потому что order_workflow вызывает
+# bot.send_message / bot.send_document / _push_payment_confirmation,
+# которые требуют aiogram.Bot. В webhook-режиме переиспользуем уже
+# созданный _tg_bot; иначе (BOT_MODE=webapp без webhook или BOT_MODE=all)
+# создаём свой ленивый синглтон. Это просто API-клиент к Telegram —
+# polling/dispatcher ему не нужны.
+_notify_bot = None
+_notify_bot_lock = asyncio.Lock()
+
+
+async def get_notify_bot():
+    """Вернуть aiogram.Bot для отправки уведомлений из API-эндпоинтов."""
+    global _notify_bot
+    if _tg_bot is not None:
+        return _tg_bot
+    if _notify_bot is None:
+        async with _notify_bot_lock:
+            if _notify_bot is None:
+                from aiogram import Bot
+                from config import TELEGRAM_TOKEN
+                _notify_bot = Bot(token=TELEGRAM_TOKEN)
+    return _notify_bot
+
+
+async def close_notify_bot() -> None:
+    """Закрыть собственный notify-bot (если создавали). _tg_bot не трогаем —
+    его жизненным циклом управляет bot.py."""
+    global _notify_bot
+    if _notify_bot is not None:
+        try:
+            await _notify_bot.session.close()
+        except Exception:
+            pass
+        _notify_bot = None
+
+
 @app.post("/tg/{secret}")
 async def telegram_webhook(secret: str, request: Request):
     """Принимает Update-объекты от Telegram.
@@ -1005,6 +1042,70 @@ async def api_pending_requests(request: Request):
 
     return JSONResponse({"requests": result})
 
+
+@app.post("/api/requests/approve")
+async def api_approve_request(request: Request):
+    """Босс одобряет заявку на отгрузку из WebApp.
+
+    Вся логика (атомарный UPDATE, создание customerorder+demand в
+    МойСклад, уведомление менеджера, PDF, авто-payment для paid-заказов)
+    инкапсулирована в services.order_workflow.approve_shipment_request —
+    тот же код, что вызывает Telegram-callback `req_ok:`.
+    """
+    from services.order_workflow import approve_shipment_request
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_approve_request",
+        rate_limit_max=30,
+        rate_limit_window=60.0,
+    )
+    try:
+        req_id = int(data.get("req_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="req_id обязателен")
+
+    boss_name = (
+        f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+        or user.get("username", str(user["id"]))
+    )
+    bot = await get_notify_bot()
+    result = await approve_shipment_request(req_id, user["id"], boss_name, bot)
+    if not result["ok"]:
+        raise HTTPException(status_code=409, detail=result["error"])
+    return JSONResponse({"ok": True, "req_id": req_id})
+
+
+@app.post("/api/requests/reject")
+async def api_reject_request(request: Request):
+    """Босс отклоняет заявку на отгрузку из WebApp."""
+    from services.order_workflow import reject_shipment_request
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_reject_request",
+        rate_limit_max=30,
+        rate_limit_window=60.0,
+    )
+    try:
+        req_id = int(data.get("req_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="req_id обязателен")
+
+    boss_name = (
+        f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+        or user.get("username", str(user["id"]))
+    )
+    bot = await get_notify_bot()
+    result = await reject_shipment_request(req_id, user["id"], boss_name, bot)
+    if not result["ok"]:
+        raise HTTPException(status_code=409, detail=result["error"])
+    return JSONResponse({"ok": True, "req_id": req_id})
+
 # ─── API: создание заказа ────────────────────────────────────────────────────
 
 
@@ -1544,7 +1645,36 @@ async def api_confirm_payment(request: Request):
         f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
         or user.get("username", str(user["id"]))
     )
+
+    # Берём список pending до confirm — после атомарного UPDATE мы не
+    # знаем, КОГО именно нужно уведомить (только количество). Сохраняем
+    # копии payment-dict'ов и шлём уведомления каждому владельцу.
+    pending_before = [
+        p for p in await adb.get_payments_for_order(order_id)
+        if p["status"] == "pending"
+    ]
+
     n = await adb.confirm_all_pending_payments_for_order(order_id, user["id"], full_name)
+
+    # Уведомляем менеджеров о подтверждённых платежах. Если race с другим
+    # боссом — count меньше длины pending_before, берём первые n.
+    if n > 0:
+        from services.notifier import tg_send_message
+        from utils.formatters import format_payment_confirmed
+        for p in pending_before[:n]:
+            try:
+                text = format_payment_confirmed(
+                    float(p.get("amount") or 0),
+                    p.get("currency") or "—",
+                    p.get("comment") or "",
+                )
+                await tg_send_message(p["user_id"], text)
+            except Exception:
+                logger.exception(
+                    "Не удалось уведомить менеджера %s о подтверждении платежа #%s",
+                    p.get("user_id"), p.get("id"),
+                )
+
     result = {"ok": True, "confirmed_count": n}
     if idem_key:
         _idem_set(f"confirm:{user['id']}:{idem_key}", result)
@@ -1575,22 +1705,33 @@ async def api_reject_payment(request: Request):
         f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
         or user.get("username", str(user["id"]))
     )
+
+    # Аналогично confirm: сохраняем pending до UPDATE, чтобы знать кого
+    # уведомить персонально (не только владельцу заказа — у каждого
+    # платежа может быть свой user_id).
+    pending_before = [
+        p for p in await adb.get_payments_for_order(order_id)
+        if p["status"] == "pending"
+    ]
+
     n = await adb.reject_all_pending_payments_for_order(order_id, user["id"], full_name)
 
-    # Опционально: уведомить менеджера-владельца что босс отклонил
     if n > 0:
-        try:
-            from services import async_db as adb2
-            from services.notifier import tg_send_message
-            order = await adb2.get_order(order_id)
-            if order and order.get("user_id"):
-                await tg_send_message(
-                    order["user_id"],
-                    f"⚠️ Босс отклонил подтверждение оплаты по заказу #{order_id} "
-                    f"({order.get('agent_name') or '—'}). Долг снова открыт.",
+        from services.notifier import tg_send_message
+        from utils.formatters import format_payment_rejected
+        for p in pending_before[:n]:
+            try:
+                text = format_payment_rejected(
+                    float(p.get("amount") or 0),
+                    p.get("currency") or "—",
+                    p.get("comment") or "",
                 )
-        except Exception:
-            logger.exception("Не удалось уведомить менеджера об отклонении #%s", order_id)
+                await tg_send_message(p["user_id"], text)
+            except Exception:
+                logger.exception(
+                    "Не удалось уведомить менеджера %s об отклонении платежа #%s",
+                    p.get("user_id"), p.get("id"),
+                )
 
     return JSONResponse({"ok": True, "rejected_count": n})
 

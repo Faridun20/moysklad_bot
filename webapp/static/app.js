@@ -1210,8 +1210,19 @@ async function renderPendingRequests() {
 }
 
 async function handleRequest(reqId, action) {
-  tg.sendData(JSON.stringify({ action: `req_${action === 'approve' ? 'ok' : 'no'}:${reqId}` }));
-  tg.showAlert(action === 'approve' ? '✅ Одобрено' : '❌ Отклонено');
+  // Раньше тут был tg.sendData() — он работает ТОЛЬКО когда WebApp
+  // открыт из ReplyKeyboardButton. У нас WebApp открывается из меню,
+  // поэтому sendData молча игнорировался и кнопка «не работала».
+  // Теперь — обычный HTTP-вызов, как у всех остальных операций.
+  const path = action === 'approve' ? '/api/requests/approve' : '/api/requests/reject';
+  // Блокируем повторные клики, пока запрос в полёте.
+  document.querySelectorAll('.btn-approve, .btn-reject').forEach(b => (b.disabled = true));
+  try {
+    await api(path, { req_id: Number(reqId) });
+    tg.showAlert(action === 'approve' ? '✅ Заявка одобрена' : '❌ Заявка отклонена');
+  } catch (e) {
+    tg.showAlert(`❌ ${e.message}`);
+  }
   await renderPendingRequests();
 }
 // ─── Экран: Аналитика ───────────────────────────────

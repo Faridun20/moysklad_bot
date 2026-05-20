@@ -110,7 +110,17 @@ def get_notify_recipients() -> list[int]:
         users = get_all_users()
         recipients = [u["user_id"] for u in users if u["role"] in ("admin", "boss")]
         if recipients:
+            logger.info(
+                "notify recipients (DB): %s (boss/admin из %d users)",
+                recipients, len(users),
+            )
             return recipients
+        else:
+            logger.warning(
+                "notify recipients (DB): пусто! users в БД: %d, "
+                "ни у одного нет роли admin/boss — переключаемся на config fallback",
+                len(users),
+            )
     except Exception as e:
         logger.warning("Не удалось получить список получателей из БД: %s", e)
 
@@ -118,7 +128,16 @@ def get_notify_recipients() -> list[int]:
     try:
         from config import ADMIN_IDS, BOSS_IDS
 
-        return list(set(ADMIN_IDS + BOSS_IDS))
+        recipients = list(set(ADMIN_IDS + BOSS_IDS))
+        if recipients:
+            logger.info("notify recipients (config fallback): %s", recipients)
+        else:
+            logger.error(
+                "notify recipients ПУСТО: в БД нет admin/boss и "
+                "ADMIN_IDS/BOSS_IDS в config не заданы. "
+                "Уведомления никому не уйдут!",
+            )
+        return recipients
     except Exception:
         return []
 

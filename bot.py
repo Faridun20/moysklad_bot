@@ -178,6 +178,14 @@ async def _shutdown(tasks: list[asyncio.Task]) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
     await close_session()
     await close_tg_session()
+    # В BOT_MODE=all webapp поднят в этом же процессе и мог создать
+    # собственный notify-bot для approve/reject API. Закрываем его.
+    if BOT_MODE == "all":
+        try:
+            from webapp import server as webapp_server
+            await webapp_server.close_notify_bot()
+        except Exception:
+            pass
 
 
 def _build_fsm_storage():
@@ -251,6 +259,7 @@ async def _run_webapp_only():
                 pass
         await close_session()
         await close_tg_session()
+        await webapp_server.close_notify_bot()
 
 
 async def main():

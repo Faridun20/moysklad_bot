@@ -875,249 +875,22 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
         return await call.answer("Нет доступа", show_alert=True)
 
     req_id = int(call.data.split(":")[1])
-    req = await adb.get_shipment_request(req_id)
-
-    if not req:
-        return await call.answer("❌ Заявка не найдена", show_alert=True)
-    if req["status"] != "pending":
-        return await call.answer("⚠️ Заявка уже обработана", show_alert=True)
-
     boss_name = call.from_user.full_name or str(call.from_user.id)
-    # Атомарный UPDATE ... WHERE status='pending' — защита от race condition
-    # когда два босса одновременно жмут «Одобрить». Только один из них
-    # получит rowcount==1, остальные — False, и мы прервёмся.
-    ok = await adb.approve_shipment_request(req_id, call.from_user.id, boss_name)
-    if not ok:
-        return await call.answer(
-            "⚠️ Заявка уже обработана другим пользователем", show_alert=True
-        )
-    await call.answer("✅ Заявка одобрена")
 
-    from utils.helpers import local_now
-    now = local_now().strftime("%d.%m.%Y %H:%M")
+    # Вся логика (DB, МойСклад, уведомления, PDF, авто-payment) — в сервисе.
+    # Здесь только Telegram-UI: ответ на callback + редактирование сообщения.
+    from services.order_workflow import approve_shipment_request
+    result = await approve_shipment_request(req_id, call.from_user.id, boss_name, bot)
+
+    if not result["ok"]:
+        return await call.answer(f"⚠️ {result['error']}", show_alert=True)
+
+    await call.answer("✅ Заявка одобрена")
     await call.message.edit_text(
-        call.message.text + f"\n\n{DIV}\n✅ <b>Одобрено</b>  <code>{now}</code>  — {boss_name}",
+        call.message.text
+        + f"\n\n{DIV}\n✅ <b>Одобрено</b>  <code>{result['now']}</code>  — {boss_name}",
         parse_mode="HTML",
     )
-
-    # Push отгрузки в МойСклад. Делаем это до уведомления менеджера, чтобы
-    # включить ссылку на demand в сообщение. Если МойСклад не отвечает —
-    # заявка всё равно остаётся одобренной в боте, ошибку логируем + шлём
-    # боссу для разбора.
-    order, boss_role = await asyncio.gather(
-        adb.get_order(req["order_id"]),
-        adb.get_role(call.from_user.id),
-    )
-    items = await adb.get_order_items(req["order_id"]) if order else []
-    manager_name = (order or {}).get("full_name") or req.get("full_name") or "—"
-    manager_user_id = (order or {}).get("user_id") or req.get("user_id")
-
-    # Цепочка в МойСклад:
-    #   1) customerorder — для PDF печатной формы (через export endpoint)
-    #   2) demand линкованный с customerorder — чтобы СРАЗУ списать остатки
-    #      и не зависеть от того, не забыл ли бухгалтер вручную создать
-    #      отгрузку. Без этого был риск разрыва между snapshot бота
-    #      (остатки старые) и реальностью (товар уже зарезервирован).
-    # Backend URL'ы в чат не отправляем — только PDF файлом.
-    from services.ms_demand import (
-        is_ready as ms_ready,
-        create_demand_from_request,
-    )
-    from services.ms_customerorder import create_customerorder_from_request
-    demand_line = ""
-    pdf_to_send: tuple[bytes, str] | None = None
-    if order and items and ms_ready():
-        co_result = await create_customerorder_from_request(
-            order, items, manager_name, telegram_user_id=manager_user_id,
-        )
-        if co_result.get("ok"):
-            from services.database import (
-                set_order_ms_customerorder_id, set_order_ms_demand_id,
-            )
-            co_id = co_result.get("customerorder_id")
-            # Audit СРАЗУ после успешного POST в МойСклад — до того
-            # как мы пытаемся сохранить co_id в БД. SECURITY.md H6:
-            # если бот упадёт между POST и UPDATE (OOM/kill/network),
-            # без этого audit-записи orphan-CO в МойСклад будет
-            # никак не найти. С audit-записью админ ищет в логах
-            # `ms_co_created` и привязывает вручную.
-            if co_id:
-                await asyncio.gather(
-                    adb.add_audit_log(
-                        call.from_user.id, boss_name, boss_role,
-                        "ms_co_created",
-                        f"Заявка #{req_id} → customerorder {co_id} (до db-write)",
-                    ),
-                    adb.set_order_ms_customerorder_id(order["id"], co_id),
-                )
-
-            # PDF берём от customerorder — он содержит читаемую форму заказа
-            if co_result.get("pdf_bytes"):
-                pdf_to_send = (
-                    co_result["pdf_bytes"],
-                    co_result.get("pdf_filename") or f"order_{order['id']}.pdf",
-                )
-
-            # Сразу создаём demand, линкованный с customerorder.
-            # Если demand упадёт — customerorder остаётся, бухгалтер
-            # должен будет вручную создать отгрузку. Это худший случай,
-            # но в чат явно об этом скажем.
-            from services.moysklad import MS_BASE
-            co_href = f"{MS_BASE}/entity/customerorder/{co_id}" if co_id else None
-            demand_result = await create_demand_from_request(
-                order, items, manager_name,
-                telegram_user_id=manager_user_id,
-                customerorder_href=co_href,
-            )
-            if demand_result.get("ok"):
-                demand_id = demand_result.get("demand_id")
-                # Audit ДО db-write (H6) — см. комментарий выше для CO.
-                if demand_id:
-                    await asyncio.gather(
-                        adb.add_audit_log(
-                            call.from_user.id, boss_name, boss_role,
-                            "ms_demand_created",
-                            f"Заявка #{req_id} → demand {demand_id} (до db-write)",
-                        ),
-                        adb.set_order_ms_demand_id(order["id"], demand_id),
-                    )
-                demand_line = (
-                    f"\n📄 Заказ покупателя создан в МойСклад"
-                    f"\n📦 Отгрузка проведена, остатки списаны"
-                )
-                if pdf_to_send:
-                    demand_line += " — печатная форма ниже 👇"
-                await adb.add_audit_log(
-                    call.from_user.id, boss_name, boss_role,
-                    "ms_co_and_demand_created",
-                    f"Заявка #{req_id} → customerorder {co_id} + demand {demand_id}",
-                )
-            else:
-                reason = demand_result.get("reason", "неизвестная ошибка")
-                logger.warning(
-                    "Customerorder создан, но demand упал для #%s: %s",
-                    req_id, reason,
-                )
-                demand_line = (
-                    f"\n📄 Заказ покупателя создан в МойСклад"
-                    f"\n⚠️ <b>Отгрузка НЕ создана автоматически:</b>\n"
-                    f"<code>{_esc(reason[:200])}</code>\n"
-                    f"Остатки не списались — создайте demand вручную в МойСклад "
-                    f"(или из карточки этого заказа покупателя)."
-                )
-                if pdf_to_send:
-                    demand_line += "\nПечатная форма ниже 👇"
-                await adb.add_audit_log(
-                    call.from_user.id, boss_name, boss_role,
-                    "ms_demand_failed",
-                    f"Заявка #{req_id} → CO {co_id} ok, demand fail: {reason[:200]}",
-                )
-                # Личное уведомление боссу для разбора
-                try:
-                    await bot.send_message(
-                        call.from_user.id,
-                        f"⚠️ MS demand fail для заявки #{req_id} "
-                        f"(customerorder {co_id[:8]} создан):\n"
-                        f"<code>{_esc(reason[:500])}</code>",
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
-        else:
-            reason = co_result.get("reason", "неизвестная ошибка")
-            logger.warning(
-                "Не удалось создать customerorder для заявки #%s: %s",
-                req_id, reason,
-            )
-            demand_line = (
-                f"\n⚠️ <b>Не удалось создать заказ в МойСклад:</b>\n"
-                f"<code>{_esc(reason[:300])}</code>\n"
-                f"Заявка в боте одобрена — заказ нужно завести вручную."
-            )
-            try:
-                await bot.send_message(
-                    call.from_user.id,
-                    f"⚠️ MS customerorder fail для заявки #{req_id}:\n"
-                    f"<code>{_esc(reason[:500])}</code>",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-    elif not ms_ready():
-        logger.info(
-            "MS context не готов — не создаём документы для заявки #%s", req_id,
-        )
-
-    # Уведомляем менеджера
-    from services.notify import notify_order_approved
-    await notify_order_approved(bot, req["user_id"], req_id, boss_name, now, demand_line)
-
-    # ─── Шлём PDF печатной формы заказчику и руководителю ──────────
-    # Файл вместо ссылки — никаких URL на бэкенд МойСклад. PDF
-    # содержит имя клиента, состав заказа, цены — то, что нужно
-    # для распечатки/отправки клиенту.
-    if pdf_to_send:
-        from aiogram.types import BufferedInputFile
-        pdf_bytes, pdf_name = pdf_to_send
-        file = BufferedInputFile(pdf_bytes, filename=pdf_name)
-        caption = f"📄 Печатная форма — заявка #{req_id}"
-        # Менеджеру (создателю)
-        try:
-            await bot.send_document(
-                chat_id=req["user_id"], document=file, caption=caption,
-            )
-        except Exception:
-            logger.exception("Не удалось отправить PDF менеджеру")
-        # И боссу-апруверу — он же может захотеть подшить копию
-        if call.from_user.id != req["user_id"]:
-            try:
-                file2 = BufferedInputFile(pdf_bytes, filename=pdf_name)
-                await bot.send_document(
-                    chat_id=call.from_user.id, document=file2, caption=caption,
-                )
-            except Exception:
-                logger.exception("Не удалось отправить PDF боссу")
-
-    # ─── Для paid-заказов автоматически создаём payment-pending ────
-    # Раньше «оплачено сразу» проходило мимо подтверждения боссом —
-    # система верила менеджеру на слово. Теперь даже paid-заказы
-    # требуют второго клика «Принято» от босса, чтобы зафиксировать
-    # факт получения денег в кассу и при этом синхронизировать платёж
-    # с МойСклад. Credit-заказы НЕ трогаем — у них своя двухступенчатая
-    # логика через mark_paid + confirm.
-    if order and (order.get("payment_type") or "paid") == "paid":
-        total = sum(
-            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
-            for it in items
-        )
-        if total > 0.01:
-            currency = order.get("currency") or "USD"
-            try:
-                existing = [
-                    p for p in await adb.get_payments_for_order(order["id"])
-                    if p["status"] in ("pending", "confirmed")
-                ]
-                if not existing:
-                    payment_id = await adb.add_payment(
-                        user_id=order["user_id"],
-                        username="",
-                        full_name=manager_name,
-                        amount=total,
-                        currency=currency,
-                        comment=f"Оплата по заказу #{order['id']} (отгрузка одобрена)",
-                        order_id=order["id"],
-                    )
-                    # Шлём боссам тот же confirm-push, что используется
-                    # для credit-заказов. Реюз кода — единая точка
-                    # сборки сообщения и кнопок Принять/Отклонить.
-                    from handlers.debts import _push_payment_confirmation
-                    await _push_payment_confirmation(
-                        bot, order["id"], manager_name, payment_id,
-                    )
-            except Exception:
-                logger.exception(
-                    "Не удалось создать auto-payment для paid-заказа #%s", order["id"],
-                )
 
 
 @router.callback_query(F.data.startswith("req_no:"))
@@ -1126,27 +899,17 @@ async def cb_reject_request(call: CallbackQuery, bot: Bot):
         return await call.answer("Нет доступа", show_alert=True)
 
     req_id = int(call.data.split(":")[1])
-    req = await adb.get_shipment_request(req_id)
-
-    if not req:
-        return await call.answer("❌ Заявка не найдена", show_alert=True)
-    if req["status"] != "pending":
-        return await call.answer("⚠️ Заявка уже обработана", show_alert=True)
-
     boss_name = call.from_user.full_name or str(call.from_user.id)
-    ok = await adb.reject_shipment_request(req_id, call.from_user.id, boss_name)
-    if not ok:
-        return await call.answer(
-            "⚠️ Заявка уже обработана другим пользователем", show_alert=True
-        )
-    await call.answer("❌ Заявка отклонена")
 
-    from utils.helpers import local_now
-    now = local_now().strftime("%d.%m.%Y %H:%M")
+    from services.order_workflow import reject_shipment_request
+    result = await reject_shipment_request(req_id, call.from_user.id, boss_name, bot)
+
+    if not result["ok"]:
+        return await call.answer(f"⚠️ {result['error']}", show_alert=True)
+
+    await call.answer("❌ Заявка отклонена")
     await call.message.edit_text(
-        call.message.text + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{now}</code>  — {boss_name}",
+        call.message.text
+        + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{result['now']}</code>  — {boss_name}",
         parse_mode="HTML",
     )
-
-    from services.notify import notify_order_rejected
-    await notify_order_rejected(bot, req["user_id"], req_id, boss_name, now)
