@@ -363,6 +363,11 @@ def _create_indexes():
             # чтобы NULL'ы (ещё не синхронизированные) не конфликтовали.
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_ms_paymentin_unique "
             "ON payments(ms_paymentin_id) WHERE ms_paymentin_id IS NOT NULL",
+            # Фильтры по статусу: get_paid_orders_awaiting_confirmation (orders)
+            # и get_pending_requests (shipment_requests) сканируют по status.
+            "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
+            "CREATE INDEX IF NOT EXISTS idx_shipment_requests_status "
+            "ON shipment_requests(status)",
         ]
         for sql in snapshot_indexes:
             try:
@@ -684,7 +689,7 @@ def get_unsynced_managers() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def remove_user(user_id: int, removed_by: int = None, removed_name: str = "") -> bool:
+def remove_user(user_id: int, removed_by: int | None = None, removed_name: str = "") -> bool:
     users = get_all_users()
     target = next((u for u in users if u["user_id"] == user_id), None)
     with get_conn() as conn:
@@ -831,6 +836,26 @@ def mark_shipment_notified(demand_id: str) -> bool:
         inserted = cur.rowcount > 0
         conn.commit()
     return inserted
+
+
+def prune_notified_shipments(older_than_days: int = 30) -> int:
+    """Удалить старые записи дедупа отгрузок (таблица иначе растёт без предела).
+
+    demand_id уникален и больше не «всплывёт» спустя месяцы, поэтому хранить
+    их вечно незачем. Возвращает число удалённых строк. now_str() формата
+    'YYYY-MM-DD HH:MM:SS' лексикографически сортируется — сравнение строкой ок.
+    """
+    from datetime import timedelta
+    cutoff = (datetime.now() - timedelta(days=older_than_days)).strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("DELETE FROM notified_shipments WHERE notified_at < ?"),
+            (cutoff,),
+        )
+        deleted = cur.rowcount
+        conn.commit()
+    return deleted
 
 
 def set_order_ms_demand_id(order_id: int, ms_demand_id: str) -> bool:
@@ -1111,7 +1136,7 @@ def delete_order(order_id: int, requested_by: int) -> bool:
     return deleted
 
 
-def confirm_payment(payment_id: int, confirmed_by: int = None, confirmed_name: str = "") -> bool:
+def confirm_payment(payment_id: int, confirmed_by: int | None = None, confirmed_name: str = "") -> bool:
     """Подтвердить платёж. Если платёж привязан к заказу (order_id) —
     проверяем суммарно, не закрыли ли мы тем самым заказ полностью.
     Полностью означает: SUM(amount where status='confirmed') >= order.total.
@@ -1283,7 +1308,7 @@ def _maybe_close_order_after_payment(
         )
 
 
-def reject_payment(payment_id: int, rejected_by: int = None, rejected_name: str = "") -> bool:
+def reject_payment(payment_id: int, rejected_by: int | None = None, rejected_name: str = "") -> bool:
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
@@ -1328,7 +1353,7 @@ def get_payment(payment_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-def get_payments_report(since: str = None, until: str = None) -> list[dict]:
+def get_payments_report(since: str | None = None, until: str | None = None) -> list[dict]:
     query = "SELECT * FROM payments WHERE status = 'confirmed'"
     params = []
     if since:
@@ -1345,7 +1370,7 @@ def get_payments_report(since: str = None, until: str = None) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_summary_by_employee(since: str = None, until: str = None) -> list[dict]:
+def get_summary_by_employee(since: str | None = None, until: str | None = None) -> list[dict]:
     query = """
         SELECT full_name, currency, SUM(amount) as total, COUNT(*) as count
         FROM payments WHERE status = 'confirmed'
@@ -1378,7 +1403,7 @@ def add_audit_log(user_id, full_name, role, action, details=""):
         conn.commit()
 
 
-def get_audit_log(limit: int = 50, user_id: int = None) -> list[dict]:
+def get_audit_log(limit: int = 50, user_id: int | None = None) -> list[dict]:
     with get_conn() as conn:
         cur = get_cursor(conn)
         if user_id:
@@ -1442,9 +1467,9 @@ def get_orders_by_ids(order_ids: list[int]) -> dict[int, dict]:
     return {r["id"]: dict(r) for r in rows}
 
 
-def get_user_orders(user_id: int, status: str = None) -> list[dict]:
+def get_user_orders(user_id: int, status: str | None = None) -> list[dict]:
     query = "SELECT * FROM orders WHERE user_id = ?"
-    params = [user_id]
+    params: list = [user_id]
     if status:
         query += " AND status = ?"
         params.append(status)
@@ -1456,7 +1481,7 @@ def get_user_orders(user_id: int, status: str = None) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_all_orders(status: str = None) -> list[dict]:
+def get_all_orders(status: str | None = None) -> list[dict]:
     query = "SELECT * FROM orders"
     params = []
     if status:
@@ -2034,12 +2059,13 @@ def approve_shipment_request(req_id: int, approved_by: int, approved_name: str) 
         conn.commit()
     if updated:
         req = get_shipment_request(req_id)
-        update_order_status(req["order_id"], "approved")
-        add_audit_log(
-            approved_by, approved_name, get_role(approved_by),
-            "shipment_approved",
-            f"Заявка #{req_id} одобрена (заказ #{req['order_id']} от {req['full_name']})",
-        )
+        if req is not None:
+            update_order_status(req["order_id"], "approved")
+            add_audit_log(
+                approved_by, approved_name, get_role(approved_by),
+                "shipment_approved",
+                f"Заявка #{req_id} одобрена (заказ #{req['order_id']} от {req['full_name']})",
+            )
     return updated
 
 
@@ -2056,12 +2082,13 @@ def reject_shipment_request(req_id: int, rejected_by: int, rejected_name: str) -
         conn.commit()
     if updated:
         req = get_shipment_request(req_id)
-        update_order_status(req["order_id"], "rejected")
-        add_audit_log(
-            rejected_by, rejected_name, get_role(rejected_by),
-            "shipment_rejected",
-            f"Заявка #{req_id} отклонена (заказ #{req['order_id']} от {req['full_name']})",
-        )
+        if req is not None:
+            update_order_status(req["order_id"], "rejected")
+            add_audit_log(
+                rejected_by, rejected_name, get_role(rejected_by),
+                "shipment_rejected",
+                f"Заявка #{req_id} отклонена (заказ #{req['order_id']} от {req['full_name']})",
+            )
     return updated
 
 

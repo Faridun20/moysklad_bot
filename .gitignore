@@ -19,3 +19,9 @@ config_local.py
 
 # Claude Code (worktrees ~2.7M, локальные настройки)
 .claude/
+
+# Виртуальные окружения и IDE
+.venv/
+venv/
+.idea/
+.vscode/

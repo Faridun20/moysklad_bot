@@ -40,7 +40,7 @@ Telegram-бот + Web App (Mini App в чате) для управления з�
                 ┌──────────────────┐
                 │  moysklad_bot    │  Python, BOT_MODE=bot
                 │  - polling       │  Telegram Bot API → бот
-                │  - notifier      │  фон: новые отгрузки в МойСклад
+                │  - notifier      │  фон: РЕЗЕРВНЫЙ поллер отгрузок
                 │  - snapshot      │  фон: обновление кеша справочников
                 │  - scheduled (*) │  (если ENABLE_SCHEDULED_REPORTS=1)
                 └────────┬─────────┘
@@ -103,7 +103,7 @@ Telegram-бот + Web App (Mini App в чате) для управления з�
 | `ALLOWED_USERS` | CSV id, кому давать роль `manager` по умолчанию |
 | `BASE_CURRENCY` | По умолчанию `USD`, валюта для UI |
 | `TZ`, `TZ_OFFSET` | Часовой пояс для логов и отчётов |
-| `CHECK_INTERVAL_SEC` | Интервал поллинга новых отгрузок (notifier loop), сек |
+| `CHECK_INTERVAL_SEC` | Интервал РЕЗЕРВНОГО поллера отгрузок (осн. канал — вебхук), сек, default 900 |
 | `PG_POOL_MIN`, `PG_POOL_MAX` | Размер пула psycopg2 (default 1/10) |
 | `SQL_SLOW_MS` | Порог логирования медленных запросов, мс (default 200) |
 
@@ -283,6 +283,26 @@ ms_snapshot_meta  (когда последний раз обновлялось, 
 МойСклад дёргается только если snapshot пуст (первый старт) или если
 нужны live-данные (создание demand).
 
+### `notified_shipments` — дедуп уведомлений об отгрузках
+
+```
+demand_id   TEXT PRIMARY KEY
+notified_at TEXT
+```
+
+Один demand → одно уведомление, независимо от источника. И MS-вебхук
+(webapp-процесс), и резервный поллер (bot-процесс) перед отправкой делают
+атомарный `mark_shipment_notified(demand_id)` (INSERT-if-absent); PRIMARY KEY
++ общий Postgres решают гонку между процессами. Старьё чистит
+`prune_notified_shipments()` (≈раз в сутки из поллера).
+
+### Индексы
+
+`_create_indexes()` (idempotent, гоняется на старте): `idx_orders_credit_due`
+`(payment_type, paid_at, due_date)`, `idx_orders_status (status)`,
+`idx_shipment_requests_status (status)`, `idx_payments_order_id`,
+unique `idx_payments_ms_paymentin_unique`, + индексы snapshot-таблиц.
+
 ---
 
 ## 5. Воркфлоу
@@ -402,6 +422,12 @@ Cron-сервисы `cron-daily/weekly/monthly` вызывают `python -m task
 3. Ставит `mark_stock_dirty()` (фоновый refresh подхватит).
 4. Сбрасывает `invalidate_ms_cache()` — все аналитические кэши
    протухают, чтобы свежий запрос показал актуальные цифры.
+5. На `demand.CREATE` / `retaildemand.CREATE` запускает (fire-and-forget)
+   `notifier.notify_new_shipment(demand_id)` — уведомление boss/admin о новой
+   отгрузке **мгновенно** (раньше это делал поллер раз в N секунд). Дедуп через
+   `notified_shipments`; бот-созданные demand'ы (атрибут `telegram_user_id`)
+   пропускаются. `shipment_notifier` остаётся резервом на случай пропущенного
+   вебхука.
 
 Подписка регистрируется автоматически на старте бота через
 `services.ms_webhooks.ensure_subscriptions()`. Идемпотентно: при смене
@@ -505,8 +531,12 @@ Cron-сервисы `cron-daily/weekly/monthly` вызывают `python -m task
 | `/api/orders/set_agent` | POST | выбрать клиента |
 | `/api/orders/submit` | POST | отправить на одобрение (тут принимаются payment_type + due_date) |
 | `/api/orders/mark_paid` | POST | менеджер отметил «деньги получил» |
-| `/api/orders/confirm_payment` | POST | boss подтверждает поступление |
+| `/api/orders/confirm_payment` | POST | boss подтверждает поступление (idempotency_key) |
 | `/api/orders/reject_payment` | POST | boss отклоняет |
+| `/api/orders/delete_draft` | POST | удалить черновик (каскадно) |
+| `/api/requests/approve` | POST | boss одобряет заявку (DB + МойСклад + PDF + уведомления) |
+| `/api/requests/reject` | POST | boss отклоняет заявку |
+| `/api/payments/pending` | POST | paid-заказы, ждущие подтверждения оплаты (boss) |
 | `/api/debts` | POST | список долгов + суммы получено/ожидает |
 | `/api/agents` | POST | поиск контрагентов |
 | `/api/ms-webhook/{secret}` | POST | вебхук от МойСклад |
@@ -593,8 +623,6 @@ psycopg2 + threadpool + кэш ролей закрывает реальные п
 
 - Полная миграция psycopg2 → asyncpg (драйвер). Сейчас psycopg2 в
   threadpool — работает, но overhead есть.
-- Партиальная оплата (клиент платит частями). Сейчас бинарно:
-  оплачено или нет.
 - Конвертация валют в сводных суммах. Все цифры
   «получено/ожидает» — отдельно по валютам.
 - Связь между `payments` (отдельные платежи в кассу) и `orders`.
@@ -602,6 +630,32 @@ psycopg2 + threadpool + кэш ролей закрывает реальные п
 - Кастомные роли / per-permission система. Сейчас фиксированные 4
   роли.
 - Логи длиннее 7 дней. Если нужно — Better Stack / Axiom log drain.
-- Двухступенчатое подтверждение для paid-заказов (не credit). Сейчас
-  только credit идут через confirm-workflow; paid считаются
-  «оплаченными при отгрузке».
+- Перевод бота на webhook на проде. Код готов (`TG_USE_WEBHOOK=1`), но
+  сейчас работает polling — переключение операционное (env + остановить
+  второй поллер).
+
+> Реализовано (раньше было «нет»): частичные оплаты (остаток считается в
+> `get_order_payment_summary`), подтверждение оплаты для paid-заказов
+> (`/api/payments/pending`), событийные уведомления об отгрузках, pytest+CI.
+
+---
+
+## 13. Качество: тесты, линт, типы
+
+Конфиг тулчейна — в `pyproject.toml`; версии dev-тулов запинены в
+`requirements-dev.txt`.
+
+- **pytest** (`tests/`, fixture `isolated_db` — SQLite в tmp; env-заглушки в
+  `conftest.py`). Принцип: мокаем **границу с сетью** (`aioresponses` для
+  aiohttp, `tg_send_message` на верхнем уровне), а не свой код — иначе баг в
+  обёртке проходит CI (так и случилось с `tg_send_message`/`base_url`). Покрыты:
+  денежные инварианты, контракт МойСклад (meta demand/customerorder), регрессии
+  безопасности (все `/api/*` требуют initData; HTML-escape), дедуп уведомлений.
+- **ruff** — строгий гейт (`E9,F63,F7,F82`) + полный набор (`E9,F,B,ASYNC,UP,SIM`).
+- **mypy** — точечно по `order_workflow/database/moysklad/server`, **блокирующий**
+  (0 ошибок). `pre-commit` — локальная первая линия.
+- **CI** (`.github/workflows/ci.yml`): ruff + mypy + pytest с coverage-«храповиком»
+  (`--cov-fail-under=25`).
+- **Стартовый self-check** (`bot.py:_startup_selfcheck`): логирует `BOT_MODE` и
+  проверяет, что Telegram-URL уведомлений собирается — ловит регресс на старте,
+  а не «когда полезли в логи».

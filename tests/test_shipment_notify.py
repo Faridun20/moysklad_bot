@@ -56,6 +56,28 @@ def test_mark_shipment_notified_idempotent(isolated_db):
     assert db.mark_shipment_notified("") is False     # пустой id игнорируем
 
 
+def test_prune_notified_shipments_drops_only_old(isolated_db):
+    db = isolated_db
+    db.mark_shipment_notified("fresh")  # notified_at = сейчас
+    # Состарим одну запись на 40 дней назад прямым UPDATE.
+    from datetime import datetime, timedelta
+    old_ts = (datetime.now() - timedelta(days=40)).strftime("%Y-%m-%d %H:%M:%S")
+    db.mark_shipment_notified("old")
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q("UPDATE notified_shipments SET notified_at = ? WHERE demand_id = ?"),
+            (old_ts, "old"),
+        )
+        conn.commit()
+
+    deleted = db.prune_notified_shipments(older_than_days=30)
+    assert deleted == 1
+    # Старая ушла (можно снова застолбить), свежая осталась (повтор → False).
+    assert db.mark_shipment_notified("old") is True
+    assert db.mark_shipment_notified("fresh") is False
+
+
 # ─── notify_new_shipment ─────────────────────────────────────────────────────
 
 
@@ -117,6 +139,36 @@ def test_notify_failed_fetch_leaves_slot_free(notify_env, monkeypatch):
     assert ok is False
     assert sent == []
     assert db.mark_shipment_notified("d-7") is True  # не consumed
+
+
+# ─── Подавление уведомлений о бот-созданных отгрузках ────────────────────────
+
+
+def test_bot_created_shipment_is_not_notified(notify_env):
+    db, boss_id, sent = notify_env
+    bot_demand = _shipment()
+    bot_demand["attributes"] = [
+        {"name": "telegram_user_id", "value": 12345},
+        {"name": "telegram_full_name", "value": "Менеджер"},
+    ]
+    ok = asyncio.run(
+        notifier.notify_new_shipment("d-bot", shipment=bot_demand, recipients=[boss_id])
+    )
+    assert ok is False
+    assert sent == []
+    # Слот застолблён — поллер тоже не пошлёт.
+    assert db.mark_shipment_notified("d-bot") is False
+
+
+def test_external_shipment_with_empty_attributes_is_notified(notify_env):
+    db, boss_id, sent = notify_env
+    ext = _shipment()
+    ext["attributes"] = []  # внешний demand без бот-меток
+    ok = asyncio.run(
+        notifier.notify_new_shipment("d-ext", shipment=ext, recipients=[boss_id])
+    )
+    assert ok is True
+    assert len(sent) == 1
 
 
 # ─── Разбор событий вебхука ──────────────────────────────────────────────────

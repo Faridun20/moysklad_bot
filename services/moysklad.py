@@ -148,7 +148,7 @@ class _CircuitBreaker:
 _circuit = _CircuitBreaker()
 
 
-async def ms_get(path: str, params: dict = None, session: aiohttp.ClientSession = None):
+async def ms_get(path: str, params: dict | None = None, session: aiohttp.ClientSession | None = None):
     """GET с ретраями: сетевые ошибки, таймауты и 429/5xx.
     Защищён circuit breaker'ом: после 5 подряд ошибок отклоняет без попыток.
     """
@@ -311,7 +311,7 @@ async def _api_get_all_stock() -> list[dict]:
         now = time.monotonic()
         if _stock_cache["data"] is not None and now - _stock_cache["ts"] < _STOCK_TTL:
             return _stock_cache["data"]
-        all_rows = []
+        all_rows: list = []
         offset = 0
         limit = 1000
         sess = await get_session()
@@ -400,7 +400,7 @@ async def get_categories() -> list[dict]:
 
 
 @_ms_ttl_cache(ttl=60.0, name="get_shipments")
-async def get_shipments(since: datetime, until: datetime = None) -> list[dict]:
+async def get_shipments(since: datetime, until: datetime | None = None) -> list[dict]:
     """Получить отгрузки за период. Результат кэшируется на 60 сек —
     несколько боссов смотрят аналитику одновременно без 429 от МС."""
     since_str = since.strftime("%Y-%m-%d %H:%M:%S.000")
@@ -448,7 +448,7 @@ async def get_shipment_positions(demand_id: str) -> list[dict]:
 
 
 @_ms_ttl_cache(ttl=60.0, name="get_sales_stats")
-async def get_sales_stats(since: datetime, until: datetime = None) -> dict:
+async def get_sales_stats(since: datetime, until: datetime | None = None) -> dict:
     """Статистика продаж за период: выручка, отгрузки, клиенты, топ товаров.
     Кэш 60 сек поверх get_shipments+get_shipment_positions: даже если
     несколько ролей одновременно запросили одинаковый период, агрегат
@@ -499,8 +499,8 @@ async def get_sales_stats(since: datetime, until: datetime = None) -> dict:
 @_ms_ttl_cache(ttl=60.0, name="get_employee_shipments")
 async def get_employee_shipments(
     since: datetime,
-    until: datetime = None,
-    employee_href: str = None,
+    until: datetime | None = None,
+    employee_href: str | None = None,
 ) -> list[dict]:
     """Получить отгрузки конкретного сотрудника по его href."""
     since_str = since.strftime("%Y-%m-%d %H:%M:%S.000")
@@ -525,8 +525,8 @@ async def get_employee_shipments(
 @_ms_ttl_cache(ttl=60.0, name="get_employee_stats")
 async def get_employee_stats(
     since: datetime,
-    until: datetime = None,
-    employee_href: str = None,
+    until: datetime | None = None,
+    employee_href: str | None = None,
 ) -> dict:
     """Персональная статистика сотрудника."""
     shipments = await get_employee_shipments(since, until, employee_href)

@@ -160,6 +160,15 @@ UUID).
 URL `https://api.telegram.org`, а POST на `/bot{TOKEN}/sendMessage` —
 относительно. Так токен не появляется в `repr(request)`.
 
+> ⚠️ **Регрессия и повторный фикс (2026-05-21):** первая итерация задала
+> `base_url="https://api.telegram.org/bot{TOKEN}"` — с **path-частью**, что
+> aiohttp запрещает: каждый `sess.post` падал ещё до сети, и ВСЕ
+> webapp-уведомления молча не доходили (баг жил, т.к. тесты мокали саму
+> `tg_send_message`). Исправлено в `aa8b981`: `base_url` = только origin,
+> токен в пути запроса, а в `except` строка ошибки прогоняется через
+> `_redact_token()` (цель H8 сохранена). Добавлен тест на сетевой границе
+> (`aioresponses`) + регресс-гард «base_url без path».
+
 ### H9. `MS_WEBHOOK_SECRET` fallback: ephemeral секрет между сервисами
 
 [`services/ms_webhooks.py:39-53`](services/ms_webhooks.py)
@@ -398,21 +407,15 @@ deprecated, лучше `time.monotonic()`.
 **не** перезатрёт (ON CONFLICT DO NOTHING). Это корректно, но в
 коментарии стоит описать.
 
-### Нет тестов и CI
+### Нет тестов и CI — ✅ ЗАКРЫТО
 
-Самое большое зияние:
-- 0 unit-тестов
-- 0 integration-тестов
-- `.github/workflows/` отсутствует — нет автоматического lint/import-check
-- При наличии финансовых операций (списание остатков, синхронизация
-  платежей, race в `mark_order_paid`) отсутствие тестов — главный
-  технический долг.
-
-Минимум что нужно:
-- pytest для `webapp/auth.py` (HMAC, edge cases timing)
-- pytest для full lifecycle: order → mark_paid → confirm → close
-- pytest для `rate_limit.acquire` (вечный bug-magnet)
-- GitHub Actions: ruff + pytest на каждый push
+> Историческая находка. Сейчас: pytest-набор (`tests/`, ~89 тестов на
+> `isolated_db`), CI `.github/workflows/ci.yml` (ruff + mypy + pytest с
+> coverage-«храповиком»), `pre-commit`. Тесты мокают **границу с сетью**
+> (`aioresponses`), а не свои обёртки — иначе баг проходит CI (урок H8).
+> Покрыты денежные инварианты, контракт МойСклад, регрессии безопасности
+> (`_authorize`, HTML-escape), state-machine, circuit breaker, дедуп
+> уведомлений. Остаётся непокрытым UI WebApp (проверяется вручную).
 
 ---
 
@@ -519,7 +522,7 @@ tests/
 | H5 | _ensure_custom_attribute race → re-read on POST failure | [042bcd5](https://github.com/Faridun20/moysklad_bot/commit/042bcd5) |
 | H6 | orphan customerorder → audit_log до db-write | [042bcd5](https://github.com/Faridun20/moysklad_bot/commit/042bcd5) |
 | H7 | PII в MS error logs → `redact_ms_error` | [042bcd5](https://github.com/Faridun20/moysklad_bot/commit/042bcd5) |
-| H8 | TELEGRAM_TOKEN в URL — логируется только chat_id+status | round 1 |
+| H8 | TELEGRAM_TOKEN в URL → base_url origin + токен в пути + `_redact_token`. Round-1 фикс (path в base_url) сломал отправку — повторно исправлено + тест на границе | round 1, [aa8b981](https://github.com/Faridun20/moysklad_bot/commit/aa8b981) |
 | H9 | MS_WEBHOOK_SECRET fail-fast в проде | round 1 |
 | H11 | `/api/agents` search санитизация (len ≤ 50, char whitelist) | round 1 |
 | H12 | XSS через audit log → universal `_esc` в utils/helpers | round 1 |
@@ -545,3 +548,4 @@ tests/
 | 2026-05-19 | Раунд 1 фиксов: 3 Critical, тесты+CI, payment races, HTML escape | Claude |
 | 2026-05-19 | Раунд 2 фиксов: H4-H7, H11, TZ, idempotency, dedup, sync→async, PAGE_SIZE | Claude |
 | 2026-05-19 | Раунд 3: audit/log dedup, cache mtime, type hints, dual-reports warning | Claude |
+| 2026-05-21 | H8 regression re-fix (aiohttp base_url); защитные сетки: pytest-набор + CI (ruff/mypy/coverage), мок сетевой границы, mypy-гейт; событийные уведомления об отгрузках с дедупом | Claude |

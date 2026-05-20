@@ -54,7 +54,7 @@ Telegram, руководители одобряют отгрузки и подт
    ALLOWED_USERS = []
    BASE_CURRENCY = "USD"
    TZ_OFFSET = 5
-   CHECK_INTERVAL_SEC = 300
+   CHECK_INTERVAL_SEC = 900   # интервал РЕЗЕРВНОГО поллера отгрузок (осн. канал — вебхук)
    ```
    Без `DATABASE_URL` бот использует SQLite в `/tmp/payments.db`.
    Без `REDIS_URL` — `MemoryStorage` (FSM сбрасывается на рестарте).
@@ -152,8 +152,11 @@ Telegram, руководители одобряют отгрузки и подт
 │   ├── ms_payments.py        Синхронизация платежей (paymentin)
 │   ├── ms_webhooks.py        Подписки на webhook'и МойСклад
 │   ├── ms_sync.py            Связь менеджеров с сотрудниками МойСклад
+│   ├── ms_sync_handler.py    Обработка вебхук-событий (paymentin/customerorder)
 │   ├── snapshot.py           Локальный кэш справочников МойСклад
-│   ├── notifier.py           Уведомления о новых отгрузках + общая TG-сессия
+│   ├── order_workflow.py     Машина состояний заказа + апрув/реджект заявки
+│   ├── notifier.py           Событийные уведомления об отгрузках + резервный поллер + TG-сессия
+│   ├── notify.py             Хелперы уведомлений менеджеру (approved/rejected)
 │   └── rate_limit.py         In-memory rate-limiter
 │
 ├── tasks/                    Фоновые задачи + CLI для Railway Cron
@@ -167,10 +170,15 @@ Telegram, руководители одобряют отгрузки и подт
 │   ├── auth.py               Валидация Telegram.WebApp.initData
 │   └── static/               vanilla JS, index.html, style.css
 │
-└── utils/                    Утилиты
-    ├── helpers.py            extract_id_from_href, safe-error и т.п.
-    ├── formatters.py         HTML/Markdown-форматтеры сообщений
-    └── keyboards.py          aiogram-клавиатуры
+├── utils/                    Утилиты
+│   ├── helpers.py            extract_id_from_href, safe-error и т.п.
+│   ├── formatters.py         HTML/Markdown-форматтеры сообщений
+│   └── keyboards.py          aiogram-клавиатуры
+│
+├── tests/                    pytest (isolated_db fixture, мок транспорта)
+├── pyproject.toml            конфиг ruff / pytest / mypy / coverage
+├── requirements-dev.txt      запиненные dev-тулзы (pytest, ruff, mypy, aioresponses…)
+└── .pre-commit-config.yaml   ruff + ruff-format (+ pytest на pre-push)
 ```
 
 ## Поток данных при типичном заказе
@@ -221,7 +229,19 @@ top-5 «что чинить первым».
 
 ### Тестирование
 
-Сейчас в репо нет автоматизированных тестов. Smoke-тесты делаются вручную после каждого деплоя — открыть WebApp, создать тестовый заказ, проверить полный workflow.
+В репо есть pytest-набор (`tests/`) и CI (`.github/workflows/ci.yml`):
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pytest tests/          # SQLite в /tmp (isolated_db), env-заглушки в conftest
+ruff check .           # линт (E9,F,B,ASYNC,UP,SIM из pyproject.toml)
+mypy                   # типы по «денежным»/API-модулям (блокирующий гейт)
+```
+
+Принцип тестов: мокаем **границу с внешним миром** (HTTP-транспорт через `aioresponses`,
+Telegram-`tg_send_message` на верхнем уровне), а БД — настоящая. Покрываются денежные
+инварианты, контракт МойСклад, регрессии безопасности (`_authorize`, HTML-escape) и
+дедуп уведомлений. UI WebApp всё ещё проверяется вручную после деплоя.
 
 ### Логи и мониторинг
 

@@ -14,7 +14,11 @@ from config import CHECK_INTERVAL_SEC as _CHECK_INTERVAL_SEC, TELEGRAM_TOKEN
 
 CHECK_INTERVAL_SEC = int(_CHECK_INTERVAL_SEC)
 from services.moysklad import get_shipments, get_shipment, get_shipment_positions
-from services.database import get_all_users, mark_shipment_notified
+from services.database import (
+    get_all_users,
+    mark_shipment_notified,
+    prune_notified_shipments,
+)
 from utils.helpers import extract_id_from_href
 from utils.formatters import format_shipment, DIV
 
@@ -183,13 +187,54 @@ async def aget_notify_recipients() -> list[int]:
     return await asyncio.to_thread(get_notify_recipients)
 
 
+# Рассылка параллельно, но с ограничением: у Telegram ~30 сообщений/сек
+# глобально. Semaphore сглаживает пик и не даёт словить 429 на большом списке.
+_BROADCAST_CONCURRENCY = 20
+
+
+async def _gather_limited(coros: list) -> None:
+    """Выполнить корутины с ограничением параллелизма; ошибки не пробрасываем
+    (рассылка best-effort, единичный сбой не должен ронять остальные)."""
+    sem = asyncio.Semaphore(_BROADCAST_CONCURRENCY)
+
+    async def _run(coro):
+        async with sem:
+            return await coro
+
+    await asyncio.gather(*(_run(c) for c in coros), return_exceptions=True)
+
+
 async def send_to_recipients(bot: Bot, text: str, recipients: list[int]):
-    """Разослать сообщение списку получателей."""
-    for uid in recipients:
+    """Разослать сообщение списку получателей (параллельно, с лимитом)."""
+    async def _one(uid: int):
         try:
             await bot.send_message(uid, text, parse_mode="HTML")
         except Exception as e:
             logger.warning("Не удалось отправить %d: %s", uid, e)
+
+    await _gather_limited([_one(uid) for uid in recipients])
+
+
+def _is_bot_created(shipment: dict) -> bool:
+    """True, если demand создан этим ботом — у него проставлены кастом-атрибуты
+    telegram_full_name/telegram_user_id (см. ms_demand.create_demand_from_request).
+    Такие отгрузки босс уже одобрил, повторное «новая отгрузка» — шум."""
+    attrs = shipment.get("attributes")
+    if not isinstance(attrs, list):
+        return False
+    marker_names = {"telegram_full_name", "telegram_user_id"}
+    try:
+        from services.ms_demand import _CTX
+        marker_names |= {_CTX.get("attribute_name"), _CTX.get("attribute_uid")}
+    except Exception:
+        pass
+    marker_names.discard(None)
+    return any(
+        isinstance(a, dict)
+        and a.get("name") in marker_names
+        and a.get("value") not in (None, "")
+        for a in attrs
+    )
 
 
 async def notify_new_shipment(
@@ -219,6 +264,13 @@ async def notify_new_shipment(
     if not shipment:
         return False
 
+    # Бот-созданные отгрузки (одобрение заявки → бот сам создал demand) босс
+    # уже видел — повторно не уведомляем. Слот застолбляем, чтобы и поллер
+    # промолчал.
+    if _is_bot_created(shipment):
+        mark_shipment_notified(demand_id)
+        return False
+
     if recipients is None:
         recipients = get_notify_recipients()
     if not recipients:
@@ -236,8 +288,7 @@ async def notify_new_shipment(
         pass
 
     txt = f"{DIV}\n🔔 <b>Новая отгрузка!</b>\n\n" + format_shipment(shipment, positions)
-    for uid in recipients:
-        await tg_send_message(uid, txt)
+    await _gather_limited([tg_send_message(uid, txt) for uid in recipients])
     return True
 
 
@@ -249,8 +300,20 @@ async def shipment_notifier(bot: Bot | None = None):
     last_check: datetime = datetime.now()
     logger.info("Мониторинг отгрузок (резерв) запущен, интервал %s с", CHECK_INTERVAL_SEC)
 
+    # Чистим дедуп-таблицу примерно раз в сутки (а не каждый цикл).
+    _prune_every = max(1, 86400 // CHECK_INTERVAL_SEC)
+    _cycle = 0
+
     while True:
         await asyncio.sleep(CHECK_INTERVAL_SEC)
+        _cycle += 1
+        if _cycle % _prune_every == 0:
+            try:
+                deleted = await asyncio.to_thread(prune_notified_shipments)
+                if deleted:
+                    logger.info("notified_shipments: вычищено %d старых записей", deleted)
+            except Exception as e:
+                logger.warning("prune_notified_shipments failed: %s", e)
         try:
             shipments = await get_shipments(last_check)
             last_check = datetime.now()

@@ -41,10 +41,9 @@ jobs:
       - name: Lint (full ruleset)
         run: ruff check --output-format=github .
 
-      # mypy — точечно по «денежным»/API-модулям. Non-blocking: сигнал о
-      # регрессиях типов, но пока не гейт (см. pyproject [tool.mypy]).
-      - name: Type-check (non-blocking)
-        continue-on-error: true
+      # mypy — точечно по «денежным»/API-модулям (см. pyproject [tool.mypy]).
+      # Гейт: модули вычищены до нуля ошибок, дальше тип-регрессии блокируют CI.
+      - name: Type-check
         run: mypy
 
       - name: Run tests
@@ -53,4 +52,6 @@ jobs:
           # Реальные тесты переопределяют env через monkeypatch.
           TELEGRAM_TOKEN: "0:fake-ci-token"
           MS_TOKEN: "fake-ci"
-        run: pytest tests/ -v --tb=short --cov --cov-report=term-missing
+        # --cov-fail-under=25 — «храповик» чуть ниже текущих ~27%: не флапает,
+        # но не даёт покрытию заметно просесть. Поднимать по мере роста тестов.
+        run: pytest tests/ -v --tb=short --cov --cov-report=term-missing --cov-fail-under=25
