@@ -39,6 +39,7 @@ from services.database import (
     get_payments_needing_ms_sync,
     get_recent_ms_sync_failures,
 )
+from services import async_db as adb
 
 from config import ALLOWED_CURRENCIES as CURRENCIES
 
@@ -179,7 +180,7 @@ async def process_comment(message: Message, state: FSMContext, bot: Bot):
     full_name = user.full_name or user.username or str(user.id)
     username = f"@{user.username}" if user.username else "—"
 
-    payment_id = add_payment(
+    payment_id = await adb.add_payment(
         user_id=user.id,
         username=username,
         full_name=full_name,
@@ -189,10 +190,10 @@ async def process_comment(message: Message, state: FSMContext, bot: Bot):
     )
 
     # Аудит лог
-    add_audit_log(
+    await adb.add_audit_log(
         user.id,
         full_name,
-        get_role(user.id),
+        await adb.get_role(user.id),
         "payment_sent",
         f"Платёж #{payment_id}: {amount:,.0f} {currency} — {comment}",
     )
@@ -232,7 +233,7 @@ async def confirm_pay(call: CallbackQuery, bot: Bot):
         return await call.answer("⛔ Нет доступа", show_alert=True)
 
     payment_id = int(call.data.split(":")[1])
-    payment = get_payment(payment_id)
+    payment = await adb.get_payment(payment_id)
 
     if not payment:
         return await call.answer("❌ Платёж не найден", show_alert=True)
@@ -240,7 +241,7 @@ async def confirm_pay(call: CallbackQuery, bot: Bot):
         return await call.answer("⚠️ Уже обработан", show_alert=True)
 
     admin_name = call.from_user.full_name or str(call.from_user.id)
-    confirm_payment(payment_id, call.from_user.id, admin_name)
+    await adb.confirm_payment(payment_id, call.from_user.id, admin_name)
 
     await call.answer("✅ Принято")
     now = local_now().strftime("%d.%m.%Y %H:%M")
@@ -268,7 +269,7 @@ async def reject_pay(call: CallbackQuery, bot: Bot):
         return await call.answer("⛔ Нет доступа", show_alert=True)
 
     payment_id = int(call.data.split(":")[1])
-    payment = get_payment(payment_id)
+    payment = await adb.get_payment(payment_id)
 
     if not payment:
         return await call.answer("❌ Платёж не найден", show_alert=True)
@@ -276,7 +277,7 @@ async def reject_pay(call: CallbackQuery, bot: Bot):
         return await call.answer("⚠️ Уже обработан", show_alert=True)
 
     admin_name = call.from_user.full_name or str(call.from_user.id)
-    reject_payment(payment_id, call.from_user.id, admin_name)
+    await adb.reject_payment(payment_id, call.from_user.id, admin_name)
 
     await call.answer("❌ Отклонено")
     now = local_now().strftime("%d.%m.%Y %H:%M")
@@ -338,8 +339,8 @@ async def cb_payreport(call: CallbackQuery):
     else:
         since, until, label = None, None, "всё время"
 
-    summary = get_summary_by_employee(since, until)
-    payments = get_payments_report(since, until)
+    summary = await adb.get_summary_by_employee(since, until)
+    payments = await adb.get_payments_report(since, until)
 
     if not payments:
         return await call.message.answer(
@@ -364,9 +365,9 @@ async def cb_payreport(call: CallbackQuery):
 from utils.helpers import esc as _esc, local_now  # единая реализация — utils/helpers.py
 
 
-def _format_sync_status() -> tuple[str, bool]:
+async def _format_sync_status() -> tuple[str, bool]:
     """HTML-сообщение про статус синхронизации + флаг «есть что ретрайнуть»."""
-    stats = get_ms_sync_stats()
+    stats = await adb.get_ms_sync_stats()
     pending_count = stats["failed"] + stats["never_tried"]
 
     lines = [
@@ -378,7 +379,7 @@ def _format_sync_status() -> tuple[str, bool]:
         f"⏳ Ещё не пробовали:     <b>{stats['never_tried']}</b>",
     ]
     if stats["failed"] > 0:
-        fails = get_recent_ms_sync_failures(limit=5)
+        fails = await adb.get_recent_ms_sync_failures(limit=5)
         if fails:
             lines.append("\n<b>Последние ошибки:</b>")
             for f in fails:
@@ -401,7 +402,7 @@ async def cmd_sync_payments(message: Message):
     if not can_manage_payments(message.from_user.id):
         return
 
-    text, has_pending = _format_sync_status()
+    text, has_pending = await _format_sync_status()
     kb = InlineKeyboardBuilder()
     if has_pending:
         kb.button(text="🔄 Retry all", callback_data="ms_sync_retry")
@@ -414,7 +415,7 @@ async def cmd_sync_payments(message: Message):
 async def cb_sync_refresh(call: CallbackQuery):
     if not can_manage_payments(call.from_user.id):
         return await call.answer("Нет доступа", show_alert=True)
-    text, has_pending = _format_sync_status()
+    text, has_pending = await _format_sync_status()
     kb = InlineKeyboardBuilder()
     if has_pending:
         kb.button(text="🔄 Retry all", callback_data="ms_sync_retry")
@@ -435,7 +436,7 @@ async def cb_sync_retry(call: CallbackQuery):
 
     await call.answer("⏳ Начал синхронизацию…")
     # Получаем кандидатов и ретраим по очереди
-    pending = get_payments_needing_ms_sync(limit=100)
+    pending = await adb.get_payments_needing_ms_sync(limit=100)
     if not pending:
         await call.message.answer("Нечего синхронизировать.")
         return
@@ -451,7 +452,7 @@ async def cb_sync_retry(call: CallbackQuery):
             fail_count += 1
 
     # Перечитываем актуальные цифры и обновляем сообщение
-    text, has_pending = _format_sync_status()
+    text, has_pending = await _format_sync_status()
     summary = (
         f"\n\n<b>Итог retry:</b> ✅ {ok_count} · ❌ {fail_count}"
     )

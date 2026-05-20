@@ -10,6 +10,7 @@
 6. Менеджер получает уведомление
 """
 
+import asyncio
 import html
 import logging
 from datetime import datetime
@@ -43,6 +44,7 @@ from services.database import (
     get_pending_requests, approve_shipment_request, reject_shipment_request,
     get_role, add_audit_log, get_all_users,
 )
+from services import async_db as adb
 from services.moysklad import get_all_stock, get_categories, ms_get
 from services.notifier import get_notify_recipients, send_to_recipients
 from utils.helpers import extract_id_from_href, extract_href, safe_get, user_safe_error
@@ -248,10 +250,9 @@ def my_orders_keyboard(orders: list[dict]):
     return kb.as_markup()
 
 
-def pending_requests_keyboard(requests: list[dict]):
+def pending_requests_keyboard(requests: list[dict], orders_by_id: dict):
     kb = InlineKeyboardBuilder()
     head = requests[:10]
-    orders_by_id = get_orders_by_ids([r["order_id"] for r in head])
     for r in head:
         order = orders_by_id.get(r["order_id"])
         name = order["full_name"] if order else "—"
@@ -274,17 +275,11 @@ async def cmd_new_order(message: Message):
 
     user = message.from_user
     full_name = user.full_name or user.username or str(user.id)
-    # sync DB-вызов в async handler без to_thread блокирует event loop.
-    # На bot-сервисе нагрузка низкая, но при усилении пользователей
-    # начнёт лагать. to_thread сразу делает это безопасным.
-    import asyncio as _asyncio
-    order_id = await _asyncio.to_thread(create_order, user.id, full_name)
-
-    await _asyncio.to_thread(
-        add_audit_log,
-        user.id, full_name, get_role(user.id),
-        "order_created", f"Создан заказ #{order_id}",
+    order_id, role = await asyncio.gather(
+        adb.create_order(user.id, full_name),
+        adb.get_role(user.id),
     )
+    await adb.add_audit_log(user.id, full_name, role, "order_created", f"Создан заказ #{order_id}")
 
     await message.answer(
         f"{DIV}\n"
@@ -303,8 +298,7 @@ async def cmd_my_orders(message: Message):
     if not can_create_orders(message.from_user.id):
         return await message.answer("⛔ Нет доступа.")
 
-    import asyncio as _asyncio
-    orders = await _asyncio.to_thread(get_user_orders, message.from_user.id)
+    orders = await adb.get_user_orders(message.from_user.id)
     if not orders:
         kb = InlineKeyboardBuilder()
         kb.button(text="➕ Создать первый заказ", callback_data="ord_new")
@@ -331,20 +325,20 @@ async def cmd_orders(message: Message):
     if not is_boss(message.from_user.id):
         return await message.answer("⛔ Нет доступа.")
 
-    import asyncio as _asyncio
-    requests = await _asyncio.to_thread(get_pending_requests)
+    requests = await adb.get_pending_requests()
     if not requests:
         return await message.answer(
             f"{DIV}\n⏳ <b>Заявки на отгрузку</b>\n\n<i>Нет новых заявок</i>",
             parse_mode="HTML",
         )
 
+    orders_by_id = await adb.get_orders_by_ids([r["order_id"] for r in requests[:10]])
     await message.answer(
         f"{DIV}\n"
         f"⏳ <b>Заявки на отгрузку</b>\n"
         f"<code>Ожидают рассмотрения: {len(requests)}</code>",
         parse_mode="HTML",
-        reply_markup=pending_requests_keyboard(requests),
+        reply_markup=pending_requests_keyboard(requests, orders_by_id),
     )
 
 
@@ -359,12 +353,11 @@ async def cb_new_order(call: CallbackQuery):
 
     user = call.from_user
     full_name = user.full_name or user.username or str(user.id)
-    order_id = create_order(user.id, full_name)
-
-    add_audit_log(
-        user.id, full_name, get_role(user.id),
-        "order_created", f"Создан заказ #{order_id}",
+    order_id, role = await asyncio.gather(
+        adb.create_order(user.id, full_name),
+        adb.get_role(user.id),
     )
+    await adb.add_audit_log(user.id, full_name, role, "order_created", f"Создан заказ #{order_id}")
 
     await call.message.answer(
         f"{DIV}\n✅ <b>Заказ #{order_id} создан</b>\n\nДобавьте товары:",
@@ -381,7 +374,7 @@ async def cb_view_order(call: CallbackQuery):
     except (IndexError, ValueError):
         return await call.message.answer("❌ Некорректный запрос.")
 
-    order = get_order(order_id)
+    order = await adb.get_order(order_id)
     if not order:
         return await call.message.answer("❌ Заказ не найден.")
 
@@ -392,7 +385,7 @@ async def cb_view_order(call: CallbackQuery):
     if not is_owner and not is_boss(call.from_user.id):
         return await call.message.answer("⛔ Нет доступа к этому заказу.")
 
-    items = get_order_items(order_id)
+    items = await adb.get_order_items(order_id)
     txt = format_order(order, items)
     kb = order_actions_keyboard(order_id, order["status"], is_owner)
     await call.message.answer(txt, parse_mode="HTML", reply_markup=kb)
@@ -408,7 +401,7 @@ async def cb_add_item(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
     order_id = int(call.data.split(":")[1])
-    order = get_order(order_id)
+    order = await adb.get_order(order_id)
     if not order or order["status"] != "draft":
         return await call.message.answer("❌ Заказ недоступен для редактирования.")
     if order["user_id"] != call.from_user.id:
@@ -535,7 +528,7 @@ async def process_quantity(message: Message, state: FSMContext):
     data = await state.get_data()
     product = data["selected_product"]
     order_id = data["order_id"]
-    order = get_order(order_id)
+    order = await adb.get_order(order_id)
     currency = (order or {}).get("currency") or _BASE_CURRENCY
     await state.update_data(quantity=qty)
     await state.set_state(OrderState.entering_price)
@@ -568,7 +561,7 @@ async def process_price(message: Message, state: FSMContext):
     product = data["selected_product"]
     qty = data["quantity"]
 
-    item_id = add_order_item(
+    await adb.add_order_item(
         order_id=order_id,
         product_name=product["name"],
         product_href=product["href"],
@@ -580,25 +573,25 @@ async def process_price(message: Message, state: FSMContext):
     await state.clear()
 
     # Показываем текущий заказ
-    order = get_order(order_id)
-    items = get_order_items(order_id)
+    order, items = await asyncio.gather(
+        adb.get_order(order_id),
+        adb.get_order_items(order_id),
+    )
     subtotal = qty * price
 
     currency = (order or {}).get("currency") or _BASE_CURRENCY
+    full_name = message.from_user.full_name or str(message.from_user.id)
+    role = await adb.get_role(message.from_user.id)
+    await adb.add_audit_log(
+        message.from_user.id, full_name, role,
+        "order_item_added", f"Заказ #{order_id}: {product['name']} × {qty} @ {price}",
+    )
     await message.answer(
         f"✅ Добавлено: <b>{_esc(product['name'])}</b>\n"
         f"   {qty} {product['unit']} × {_cur(price, currency)} = <b>{_cur(subtotal, currency)}</b>\n\n"
         + format_order(order, items),
         parse_mode="HTML",
         reply_markup=order_actions_keyboard(order_id, "draft", True),
-    )
-
-    add_audit_log(
-        message.from_user.id,
-        message.from_user.full_name or str(message.from_user.id),
-        get_role(message.from_user.id),
-        "order_item_added",
-        f"Заказ #{order_id}: {product['name']} × {qty} @ {price}",
     )
 
 
@@ -611,7 +604,7 @@ async def cb_choose_currency(call: CallbackQuery):
         return await call.answer("Нет доступа", show_alert=True)
     await call.answer()
     order_id = int(call.data.split(":")[1])
-    order = get_order(order_id)
+    order = await adb.get_order(order_id)
     if not order or order["user_id"] != call.from_user.id:
         return await call.message.answer("⛔ Это не ваш заказ.")
     current = order.get("currency") or _BASE_CURRENCY
@@ -631,14 +624,16 @@ async def cb_set_currency(call: CallbackQuery):
     currency = parts[2]
     if currency not in ALLOWED_CURRENCIES:
         return await call.answer("Недопустимая валюта", show_alert=True)
-    order = get_order(order_id)
+    order = await adb.get_order(order_id)
     if not order or order["user_id"] != call.from_user.id:
         return await call.answer("Нет доступа", show_alert=True)
-    update_order_currency(order_id, currency)
+    await adb.update_order_currency(order_id, currency)
     await call.answer(f"✅ Валюта: {currency}")
     # Перерисовываем карточку заказа
-    order = get_order(order_id)
-    items = get_order_items(order_id)
+    order, items = await asyncio.gather(
+        adb.get_order(order_id),
+        adb.get_order_items(order_id),
+    )
     await call.message.answer(
         format_order(order, items),
         parse_mode="HTML",
@@ -721,11 +716,13 @@ async def cb_agent_pick(call: CallbackQuery, state: FSMContext):
         return await call.message.answer("❌ Клиент не найден.")
 
     agent = agents[idx]
-    update_order_agent(order_id, agent["id"], agent["name"])
+    await adb.update_order_agent(order_id, agent["id"], agent["name"])
     await state.clear()
 
-    order = get_order(order_id)
-    items = get_order_items(order_id)
+    order, items = await asyncio.gather(
+        adb.get_order(order_id),
+        adb.get_order_items(order_id),
+    )
 
     await call.message.answer(
         f"✅ Клиент выбран: <b>{agent['name']}</b>\n\n" + format_order(order, items),
@@ -744,7 +741,7 @@ async def cb_submit_order(call: CallbackQuery, state: FSMContext, bot: Bot):
     await call.answer()
 
     order_id = int(call.data.split(":")[1])
-    order = get_order(order_id)
+    order = await adb.get_order(order_id)
 
     if not order:
         return await call.message.answer("❌ Заказ не найден.")
@@ -753,7 +750,7 @@ async def cb_submit_order(call: CallbackQuery, state: FSMContext, bot: Bot):
     if order["status"] != "draft":
         return await call.message.answer("⚠️ Заказ уже отправлен.")
 
-    items = get_order_items(order_id)
+    items = await adb.get_order_items(order_id)
     if not items:
         return await call.message.answer(
             "❌ Нельзя отправить пустой заказ.\n"
@@ -769,13 +766,16 @@ async def cb_submit_order(call: CallbackQuery, state: FSMContext, bot: Bot):
     # Создаём заявку
     user = call.from_user
     full_name = user.full_name or user.username or str(user.id)
-    req_id = create_shipment_request(order_id, user.id, full_name)
-    update_order_status(order_id, "pending")
-
-    add_audit_log(
-        user.id, full_name, get_role(user.id),
-        "shipment_request_sent",
-        f"Отправлена заявка #{req_id} (заказ #{order_id})",
+    req_id, role = await asyncio.gather(
+        adb.create_shipment_request(order_id, user.id, full_name),
+        adb.get_role(user.id),
+    )
+    await asyncio.gather(
+        adb.update_order_status(order_id, "pending"),
+        adb.add_audit_log(
+            user.id, full_name, role,
+            "shipment_request_sent", f"Отправлена заявка #{req_id} (заказ #{order_id})",
+        ),
     )
 
     await call.message.answer(
@@ -807,20 +807,21 @@ async def cb_submit_order(call: CallbackQuery, state: FSMContext, bot: Bot):
 async def cb_delete_order(call: CallbackQuery):
     await call.answer()
     order_id = int(call.data.split(":")[1])
-    order = get_order(order_id)
+    order = await adb.get_order(order_id)
 
     if not order or order["user_id"] != call.from_user.id:
         return await call.message.answer("⛔ Нет доступа.")
     if order["status"] != "draft":
         return await call.message.answer("❌ Нельзя удалить отправленный заказ.")
 
-    update_order_status(order_id, "rejected")
-    add_audit_log(
-        call.from_user.id,
-        call.from_user.full_name or str(call.from_user.id),
-        get_role(call.from_user.id),
-        "order_deleted",
-        f"Удалён черновик заказа #{order_id}",
+    full_name = call.from_user.full_name or str(call.from_user.id)
+    role, _ = await asyncio.gather(
+        adb.get_role(call.from_user.id),
+        adb.update_order_status(order_id, "rejected"),
+    )
+    await adb.add_audit_log(
+        call.from_user.id, full_name, role,
+        "order_deleted", f"Удалён черновик заказа #{order_id}",
     )
 
     await call.message.answer(f"🗑 Заказ #{order_id} удалён.")
@@ -836,15 +837,15 @@ async def cb_view_request(call: CallbackQuery):
     await call.answer()
 
     req_id = int(call.data.split(":")[1])
-    req = get_shipment_request(req_id)
+    req = await adb.get_shipment_request(req_id)
     if not req:
         return await call.message.answer("❌ Заявка не найдена.")
 
-    order = get_order(req["order_id"])
+    order = await adb.get_order(req["order_id"])
     if not order:
         return await call.message.answer("❌ Заказ не найден.")
 
-    items = get_order_items(req["order_id"])
+    items = await adb.get_order_items(req["order_id"])
     txt = format_request_notify(order, items, req_id)
 
     if req["status"] == "pending":
@@ -867,7 +868,7 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
         return await call.answer("Нет доступа", show_alert=True)
 
     req_id = int(call.data.split(":")[1])
-    req = get_shipment_request(req_id)
+    req = await adb.get_shipment_request(req_id)
 
     if not req:
         return await call.answer("❌ Заявка не найдена", show_alert=True)
@@ -878,14 +879,15 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
     # Атомарный UPDATE ... WHERE status='pending' — защита от race condition
     # когда два босса одновременно жмут «Одобрить». Только один из них
     # получит rowcount==1, остальные — False, и мы прервёмся.
-    ok = approve_shipment_request(req_id, call.from_user.id, boss_name)
+    ok = await adb.approve_shipment_request(req_id, call.from_user.id, boss_name)
     if not ok:
         return await call.answer(
             "⚠️ Заявка уже обработана другим пользователем", show_alert=True
         )
     await call.answer("✅ Заявка одобрена")
 
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    from utils.helpers import local_now
+    now = local_now().strftime("%d.%m.%Y %H:%M")
     await call.message.edit_text(
         call.message.text + f"\n\n{DIV}\n✅ <b>Одобрено</b>  <code>{now}</code>  — {boss_name}",
         parse_mode="HTML",
@@ -895,8 +897,11 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
     # включить ссылку на demand в сообщение. Если МойСклад не отвечает —
     # заявка всё равно остаётся одобренной в боте, ошибку логируем + шлём
     # боссу для разбора.
-    order = get_order(req["order_id"])
-    items = get_order_items(req["order_id"]) if order else []
+    order, boss_role = await asyncio.gather(
+        adb.get_order(req["order_id"]),
+        adb.get_role(call.from_user.id),
+    )
+    items = await adb.get_order_items(req["order_id"]) if order else []
     manager_name = (order or {}).get("full_name") or req.get("full_name") or "—"
     manager_user_id = (order or {}).get("user_id") or req.get("user_id")
 
@@ -930,12 +935,14 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
             # никак не найти. С audit-записью админ ищет в логах
             # `ms_co_created` и привязывает вручную.
             if co_id:
-                add_audit_log(
-                    call.from_user.id, boss_name, get_role(call.from_user.id),
-                    "ms_co_created",
-                    f"Заявка #{req_id} → customerorder {co_id} (до db-write)",
+                await asyncio.gather(
+                    adb.add_audit_log(
+                        call.from_user.id, boss_name, boss_role,
+                        "ms_co_created",
+                        f"Заявка #{req_id} → customerorder {co_id} (до db-write)",
+                    ),
+                    adb.set_order_ms_customerorder_id(order["id"], co_id),
                 )
-                set_order_ms_customerorder_id(order["id"], co_id)
 
             # PDF берём от customerorder — он содержит читаемую форму заказа
             if co_result.get("pdf_bytes"):
@@ -959,20 +966,22 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
                 demand_id = demand_result.get("demand_id")
                 # Audit ДО db-write (H6) — см. комментарий выше для CO.
                 if demand_id:
-                    add_audit_log(
-                        call.from_user.id, boss_name, get_role(call.from_user.id),
-                        "ms_demand_created",
-                        f"Заявка #{req_id} → demand {demand_id} (до db-write)",
+                    await asyncio.gather(
+                        adb.add_audit_log(
+                            call.from_user.id, boss_name, boss_role,
+                            "ms_demand_created",
+                            f"Заявка #{req_id} → demand {demand_id} (до db-write)",
+                        ),
+                        adb.set_order_ms_demand_id(order["id"], demand_id),
                     )
-                    set_order_ms_demand_id(order["id"], demand_id)
                 demand_line = (
                     f"\n📄 Заказ покупателя создан в МойСклад"
                     f"\n📦 Отгрузка проведена, остатки списаны"
                 )
                 if pdf_to_send:
                     demand_line += " — печатная форма ниже 👇"
-                add_audit_log(
-                    call.from_user.id, boss_name, get_role(call.from_user.id),
+                await adb.add_audit_log(
+                    call.from_user.id, boss_name, boss_role,
                     "ms_co_and_demand_created",
                     f"Заявка #{req_id} → customerorder {co_id} + demand {demand_id}",
                 )
@@ -991,8 +1000,8 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
                 )
                 if pdf_to_send:
                     demand_line += "\nПечатная форма ниже 👇"
-                add_audit_log(
-                    call.from_user.id, boss_name, get_role(call.from_user.id),
+                await adb.add_audit_log(
+                    call.from_user.id, boss_name, boss_role,
                     "ms_demand_failed",
                     f"Заявка #{req_id} → CO {co_id} ok, demand fail: {reason[:200]}",
                 )
@@ -1088,17 +1097,12 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
         if total > 0.01:
             currency = order.get("currency") or "USD"
             try:
-                from services.database import add_payment, get_payments_for_order
-                # Идемпотентность: если для этого заказа уже есть pending/
-                # confirmed payment (например, босс по ошибке одобрил
-                # дважды или мы рестартанули в момент перехода) — не
-                # плодим дубликаты.
                 existing = [
-                    p for p in get_payments_for_order(order["id"])
+                    p for p in await adb.get_payments_for_order(order["id"])
                     if p["status"] in ("pending", "confirmed")
                 ]
                 if not existing:
-                    payment_id = add_payment(
+                    payment_id = await adb.add_payment(
                         user_id=order["user_id"],
                         username="",
                         full_name=manager_name,
@@ -1126,7 +1130,7 @@ async def cb_reject_request(call: CallbackQuery, bot: Bot):
         return await call.answer("Нет доступа", show_alert=True)
 
     req_id = int(call.data.split(":")[1])
-    req = get_shipment_request(req_id)
+    req = await adb.get_shipment_request(req_id)
 
     if not req:
         return await call.answer("❌ Заявка не найдена", show_alert=True)
@@ -1134,14 +1138,15 @@ async def cb_reject_request(call: CallbackQuery, bot: Bot):
         return await call.answer("⚠️ Заявка уже обработана", show_alert=True)
 
     boss_name = call.from_user.full_name or str(call.from_user.id)
-    ok = reject_shipment_request(req_id, call.from_user.id, boss_name)
+    ok = await adb.reject_shipment_request(req_id, call.from_user.id, boss_name)
     if not ok:
         return await call.answer(
             "⚠️ Заявка уже обработана другим пользователем", show_alert=True
         )
     await call.answer("❌ Заявка отклонена")
 
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    from utils.helpers import local_now
+    now = local_now().strftime("%d.%m.%Y %H:%M")
     await call.message.edit_text(
         call.message.text + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{now}</code>  — {boss_name}",
         parse_mode="HTML",

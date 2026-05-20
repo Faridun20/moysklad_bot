@@ -13,6 +13,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services.roles import can_manage_users
 from services.database import get_audit_log, get_all_users
+from services import async_db as adb
 from utils.formatters import DIV, DIV2, format_audit_entry
 from utils.helpers import chunk_messages, filter_records_by_period
 
@@ -52,7 +53,7 @@ async def cb_log(call: CallbackQuery):
     mode = call.data.split(":")[1]
 
     if mode == "user":
-        users = get_all_users()
+        users = await adb.get_all_users()
         if not users:
             return await call.message.answer("👥 Пользователей нет.")
         kb = InlineKeyboardBuilder()
@@ -64,18 +65,16 @@ async def cb_log(call: CallbackQuery):
         return await call.message.answer("👤 Выберите сотрудника:", reply_markup=kb.as_markup())
 
     if mode == "20":
-        records = get_audit_log(limit=20)
+        records = await adb.get_audit_log(limit=20)
         label = "последние 20"
     elif mode in ("today", "week"):
-        # filter_records_by_period — общий helper из utils.helpers
-        # (раньше эта же дата-фильтрация дублировалась inline).
-        records = filter_records_by_period(get_audit_log(limit=500), mode)
+        records = filter_records_by_period(await adb.get_audit_log(limit=500), mode)
         label = "сегодня" if mode == "today" else "эта неделя"
     elif mode == "payments":
-        records = [r for r in get_audit_log(limit=200) if "payment" in r["action"]]
+        records = [r for r in await adb.get_audit_log(limit=200) if "payment" in r["action"]]
         label = "только платежи"
     else:
-        records = get_audit_log(limit=20)
+        records = await adb.get_audit_log(limit=20)
         label = "последние 20"
 
     await send_log(call.message, records, label)
@@ -88,8 +87,8 @@ async def cb_log_user(call: CallbackQuery):
     await call.answer()
 
     user_id = int(call.data.split(":")[1])
-    records = get_audit_log(limit=50, user_id=user_id)
-    users = get_all_users()
+    records = await adb.get_audit_log(limit=50, user_id=user_id)
+    users = await adb.get_all_users()
     user = next((u for u in users if u["user_id"] == user_id), None)
     name = user["full_name"] if user else str(user_id)
     await send_log(call.message, records, f"сотрудник {name}")

@@ -243,8 +243,10 @@ async def show_manager_analytics(
         parse_mode="HTML",
     )
     try:
-        current_stats = _personal_stats_from_local(user_id, since, until)
-        prev_stats = _personal_stats_from_local(user_id, prev_since, prev_until)
+        current_stats, prev_stats = await asyncio.gather(
+            asyncio.to_thread(_personal_stats_from_local, user_id, since, until),
+            asyncio.to_thread(_personal_stats_from_local, user_id, prev_since, prev_until),
+        )
 
         if current_stats["count"] == 0 and prev_stats["count"] == 0:
             return await bot.send_message(
@@ -271,7 +273,7 @@ async def show_manager_summary(bot: Bot, chat_id: int, user_id: int):
         # Local time, чтобы совпадало с DB now_str(). См. cb_analytics_period.
         now = local_now()
         since = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        stats = _personal_stats_from_local(user_id, since, now)
+        stats = await asyncio.to_thread(_personal_stats_from_local, user_id, since, now)
         if stats["count"] == 0:
             return
 

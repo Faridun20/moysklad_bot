@@ -16,6 +16,7 @@ Callback debt_paid:<id>:
   - после успеха редактирует сообщение, чтобы кнопка пропала
 """
 
+import asyncio
 from datetime import date
 import logging
 
@@ -31,6 +32,7 @@ from services.database import (
     get_order_payment_summary,
 )
 from services.notifier import get_notify_recipients
+from services import async_db as adb
 from config import BASE_CURRENCY
 from utils.helpers import user_safe_error
 from utils.formatters import DIV
@@ -74,10 +76,10 @@ def _format_debt_card(
     items: list[dict],
     today_str: str,
     show_owner: bool,
+    summary: dict,
 ) -> str:
     """HTML-карточка одного долга для сообщения в боте.
     Показывает уже оплаченное и остаток (для частичных оплат)."""
-    summary = get_order_payment_summary(order["id"])
     currency = order.get("currency") or BASE_CURRENCY
     agent = _esc(order.get("agent_name") or "—")
     due_str = _format_due(order.get("due_date"), today_str)
@@ -110,11 +112,10 @@ async def cmd_debts(message: Message):
     if not can_create_orders(user_id):
         return  # нет прав вообще — молчим, как принято в этом боте
 
-    role = get_role(user_id)
     boss_view = is_boss(user_id)
 
     # Менеджер ограничен своими долгами. Босс/админ видит всю компанию.
-    debts = get_open_debts(user_id=None if boss_view else user_id)
+    debts = await adb.get_open_debts(user_id=None if boss_view else user_id)
 
     if not debts:
         scope = "по компании" if boss_view else "у вас"
@@ -128,8 +129,16 @@ async def cmd_debts(message: Message):
         )
         return
 
-    # Подтягиваем позиции батчем — нужны для сумм
-    items_by_order = get_order_items_by_ids([d["id"] for d in debts])
+    # Подтягиваем позиции и summary батчем
+    items_by_order = await adb.get_order_items_by_ids([d["id"] for d in debts])
+    summaries = {
+        d["id"]: s for d, s in zip(
+            debts,
+            await asyncio.gather(
+                *(adb.get_order_payment_summary(d["id"]) for d in debts)
+            ),
+        )
+    }
     today_str = date.today().isoformat()
 
     # Отдельным сообщением на каждый долг — чтобы у каждого была своя
@@ -151,7 +160,7 @@ async def cmd_debts(message: Message):
 
     for d in debts:
         items = items_by_order.get(d["id"], [])
-        text = _format_debt_card(d, items, today_str, show_owner=boss_view)
+        text = _format_debt_card(d, items, today_str, show_owner=boss_view, summary=summaries[d["id"]])
 
         kb = InlineKeyboardBuilder()
         kb.button(text="✅ Отметить оплачено", callback_data=f"debt_paid:{d['id']}")
@@ -195,7 +204,7 @@ async def cb_debt_paid(callback: CallbackQuery, bot: Bot):
         await callback.answer("Некорректные данные", show_alert=True)
         return
 
-    order = get_order(order_id)
+    order = await adb.get_order(order_id)
     if not order:
         await callback.answer("Заказ не найден", show_alert=True)
         return
@@ -218,7 +227,7 @@ async def cb_debt_paid(callback: CallbackQuery, bot: Bot):
         await callback.answer("Долг уже закрыт")
         return
 
-    summary = get_order_payment_summary(order_id)
+    summary = await adb.get_order_payment_summary(order_id)
     if summary["remaining"] <= 0:
         await callback.answer("Нечего оплачивать — остаток ноль")
         return
@@ -233,7 +242,7 @@ async def cb_debt_paid(callback: CallbackQuery, bot: Bot):
     # Из бот-кнопки сумму не спросить (нет input UI). Закрываем целиком
     # остаток. Если нужно частично — менеджер открывает WebApp и вводит
     # точную сумму.
-    ok, payment_id = mark_order_paid(
+    ok, payment_id = await adb.mark_order_paid(
         order_id, user_id, full_name, amount=None, username=username,
     )
     if not ok:
@@ -266,12 +275,11 @@ async def _push_payment_confirmation(
     закрылся ли заказ полностью."""
     from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-    order = get_order(order_id)
+    order = await adb.get_order(order_id)
     if not order:
         return
-    summary = get_order_payment_summary(order_id)
-    from services.database import get_payment
-    payment = get_payment(payment_id)
+    summary = await adb.get_order_payment_summary(order_id)
+    payment = await adb.get_payment(payment_id)
     if not payment:
         return
     currency = order.get("currency") or BASE_CURRENCY

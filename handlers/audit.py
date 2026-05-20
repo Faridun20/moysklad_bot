@@ -12,6 +12,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services.roles import can_manage_users
 from services.database import get_audit_log, get_all_users
+from services import async_db as adb
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -82,7 +83,7 @@ async def cb_audit(call: CallbackQuery):
 
     if period == "by_user":
         # Показать список пользователей для выбора
-        users = get_all_users()
+        users = await adb.get_all_users()
         if not users:
             return await call.message.answer("👥 Пользователей нет.")
         kb = InlineKeyboardBuilder()
@@ -97,7 +98,7 @@ async def cb_audit(call: CallbackQuery):
         return
 
     label = PERIOD_LABELS.get(period, period)
-    records = get_audit_log(limit=200)
+    records = await adb.get_audit_log(limit=200)
     records = filter_by_period(records, period)
 
     messages = format_audit_log(records, label)
@@ -126,10 +127,10 @@ async def cb_audit_user(call: CallbackQuery):
     await call.answer()
 
     user_id = int(call.data.split(":")[1])
-    records = get_audit_log(limit=100, user_id=user_id)
+    records = await adb.get_audit_log(limit=100, user_id=user_id)
 
     # Имя пользователя
-    users = get_all_users()
+    users = await adb.get_all_users()
     user = next((u for u in users if u["user_id"] == user_id), None)
     name = user["full_name"] if user else str(user_id)
 

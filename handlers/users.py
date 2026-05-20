@@ -10,6 +10,7 @@ from aiogram.types import Message, CallbackQuery
 
 from services.database import set_role, get_role, get_all_users, add_audit_log
 from services.roles import can_manage_users, invalidate_role
+from services import async_db as adb
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -55,7 +56,7 @@ async def cmd_addrole(message: Message):
             f"❌ Роль должна быть одной из: {', '.join(VALID_ROLES)}"
         )
 
-    ok = set_role(target_id, "", "", role)
+    ok = await adb.set_role(target_id, "", "", role)
     if not ok:
         # Сюда можно попасть если БД отвалилась — set_role вернул False.
         return await message.answer(
@@ -64,8 +65,8 @@ async def cmd_addrole(message: Message):
     invalidate_role(target_id)
 
     admin_name = message.from_user.full_name or str(message.from_user.id)
-    admin_role = get_role(message.from_user.id)
-    add_audit_log(
+    admin_role = await adb.get_role(message.from_user.id)
+    await adb.add_audit_log(
         message.from_user.id,
         admin_name,
         admin_role,
@@ -96,7 +97,7 @@ async def cb_users(call: CallbackQuery):
 
 
 async def show_users(message):
-    users = get_all_users()
+    users = await adb.get_all_users()
     if not users:
         return await message.answer("👥 Пользователей пока нет.")
 
@@ -127,7 +128,7 @@ async def cmd_syncms(message: Message):
     await message.answer("⏳ Синхронизирую менеджеров с МойСклад…")
 
     from services.ms_sync import sync_all_managers
-    users = get_all_users()
+    users = await adb.get_all_users()
     results = await sync_all_managers(users)
 
     await message.answer(
