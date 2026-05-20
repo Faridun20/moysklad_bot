@@ -207,21 +207,11 @@ async def process_comment(message: Message, state: FSMContext, bot: Bot):
         parse_mode="HTML",
     )
 
-    notify = format_payment_notify(
-        payment_id, full_name, username, amount, currency, comment
+    from services.notify import notify_payment_sent
+    await notify_payment_sent(
+        bot, payment_id, full_name, username, amount, currency, comment,
+        confirm_keyboard=confirm_keyboard(payment_id),
     )
-    from services.notifier import get_notify_recipients
-    recipients = get_notify_recipients()
-    for uid in recipients:
-        try:
-            await bot.send_message(
-                uid,
-                notify,
-                parse_mode="HTML",
-                reply_markup=confirm_keyboard(payment_id),
-            )
-        except Exception as e:
-            logger.warning("Не удалось уведомить %d: %s", uid, e)
 
 
 # ─── Подтверждение / Отклонение ───────────────────────────────────────────────
@@ -251,16 +241,8 @@ async def confirm_pay(call: CallbackQuery, bot: Bot):
         parse_mode="HTML",
     )
 
-    try:
-        await bot.send_message(
-            payment["user_id"],
-            format_payment_confirmed(
-                payment["amount"], payment["currency"], payment["comment"]
-            ),
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.warning("Не удалось уведомить сотрудника: %s", e)
+    from services.notify import notify_payment_confirmed as _npayc
+    await _npayc(bot, payment)
 
 
 @router.callback_query(F.data.startswith("pay_no:"))
@@ -287,16 +269,8 @@ async def reject_pay(call: CallbackQuery, bot: Bot):
         parse_mode="HTML",
     )
 
-    try:
-        await bot.send_message(
-            payment["user_id"],
-            format_payment_rejected(
-                payment["amount"], payment["currency"], payment["comment"]
-            ),
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.warning("Не удалось уведомить сотрудника: %s", e)
+    from services.notify import notify_payment_rejected as _npayr
+    await _npayr(bot, payment)
 
 
 # ─── Отчёт ────────────────────────────────────────────────────────────────────

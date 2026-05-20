@@ -787,17 +787,12 @@ async def cb_submit_order(call: CallbackQuery, state: FSMContext, bot: Bot):
     )
 
     # Уведомляем руководителей
+    from services.notify import notify_shipment_request
     notify_text = format_request_notify(order, items, req_id)
-    recipients = get_notify_recipients()
-    for uid in recipients:
-        try:
-            await bot.send_message(
-                uid, notify_text,
-                parse_mode="HTML",
-                reply_markup=request_approve_keyboard(req_id),
-            )
-        except Exception as e:
-            logger.warning("Не удалось уведомить %d: %s", uid, e)
+    await notify_shipment_request(
+        bot, notify_text, req_id,
+        approve_keyboard=request_approve_keyboard(req_id),
+    )
 
 
 # ─── Callback: удаление заказа ────────────────────────────────────────────────
@@ -1042,19 +1037,8 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
         )
 
     # Уведомляем менеджера
-    try:
-        await bot.send_message(
-            req["user_id"],
-            f"{DIV}\n"
-            f"✅ <b>Заявка #{req_id} одобрена!</b>\n\n"
-            f"👨‍💼 Одобрил: {boss_name}\n"
-            f"🕐 {now}{demand_line}\n\n"
-            f"Можно приступать к отгрузке.",
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        logger.warning("Не удалось уведомить менеджера: %s", e)
+    from services.notify import notify_order_approved
+    await notify_order_approved(bot, req["user_id"], req_id, boss_name, now, demand_line)
 
     # ─── Шлём PDF печатной формы заказчику и руководителю ──────────
     # Файл вместо ссылки — никаких URL на бэкенд МойСклад. PDF
@@ -1152,15 +1136,5 @@ async def cb_reject_request(call: CallbackQuery, bot: Bot):
         parse_mode="HTML",
     )
 
-    try:
-        await bot.send_message(
-            req["user_id"],
-            f"{DIV}\n"
-            f"❌ <b>Заявка #{req_id} отклонена</b>\n\n"
-            f"👨‍💼 Отклонил: {boss_name}\n"
-            f"🕐 {now}\n\n"
-            f"Свяжитесь с руководителем для уточнения.",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.warning("Не удалось уведомить менеджера: %s", e)
+    from services.notify import notify_order_rejected
+    await notify_order_rejected(bot, req["user_id"], req_id, boss_name, now)
