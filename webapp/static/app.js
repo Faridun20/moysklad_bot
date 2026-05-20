@@ -1421,6 +1421,7 @@ function renderAnalyticsContent(data) {
 // ─── Экран: Платежи ─────────────────────────────────
 
 let paymentsCache = null;
+let paymentsPending = [];  // paid-заказы, ждущие подтверждения боссом
 
 async function renderPayments(container) {
   container = container || document.getElementById('content');
@@ -1440,6 +1441,17 @@ async function renderPayments(container) {
   } catch (e) {
     container.innerHTML = `<div class="error">❌ ${e.message}</div>`;
     return;
+  }
+
+  // Для босса — подтянуть paid-заказы, ожидающие подтверждения оплаты.
+  // Менеджеру эндпоинт вернёт 403 — тихо пропускаем.
+  paymentsPending = [];
+  const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
+  if (isBoss) {
+    try {
+      const data = await api('/api/payments/pending', {});
+      paymentsPending = data.pending || [];
+    } catch { /* нет доступа / нет данных — блок просто не покажем */ }
   }
 
   renderPaymentsContent(container);
@@ -1467,7 +1479,28 @@ function renderPaymentsContent(container) {
         </div>
       `).join('');
 
+  // Блок «На подтверждение» — paid-заказы с pending-оплатой (только босс).
+  const pendingHtml = paymentsPending.length === 0 ? '' : `
+    <div class="section-label section-awaiting">⏳ На подтверждение (${paymentsPending.length})</div>
+    <div class="debts-list">${paymentsPending.map(d => `
+      <div class="debt-card debt-awaiting">
+        <div class="debt-card-top">
+          <div class="debt-agent">🏢 ${escapeHtml(d.agent_name)}</div>
+          <div class="debt-amount">${fmt(d.pending)} ${escapeHtml(d.currency)}</div>
+        </div>
+        <div class="debt-card-mid">
+          <span class="debt-meta">#${d.order_id} · ${d.items_count} поз. · ${escapeHtml(d.full_name)}</span>
+        </div>
+        <div class="debt-actions">
+          <button class="btn-confirm-pay" data-id="${d.order_id}">✅ Подтвердить</button>
+          <button class="btn-reject-pay"  data-id="${d.order_id}">❌ Отклонить</button>
+        </div>
+      </div>
+    `).join('')}</div>
+  `;
+
   container.innerHTML = `
+    ${pendingHtml}
     <div class="section-label">Новый платёж (не связан с заказом)</div>
     <div class="card">
       <div class="form-row">
@@ -1553,6 +1586,45 @@ function renderPaymentsContent(container) {
     } finally {
       submit.disabled = false;
     }
+  });
+
+  // Подтверждение/отклонение оплаты по paid-заказам (блок «На подтверждение»).
+  // Реюз тех же эндпоинтов, что и в «Долги».
+  container.querySelectorAll('.btn-confirm-pay').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = parseInt(btn.dataset.id);
+      tg.showConfirm('Подтверждаете поступление оплаты по этому заказу?', async ok => {
+        if (!ok) return;
+        btn.disabled = true;
+        try {
+          await api('/api/orders/confirm_payment', { order_id: id });
+          tg.HapticFeedback?.notificationOccurred('success');
+          await renderPayments(container);
+        } catch (e) {
+          tg.HapticFeedback?.notificationOccurred('error');
+          tg.showAlert('❌ ' + e.message);
+          btn.disabled = false;
+        }
+      });
+    });
+  });
+  container.querySelectorAll('.btn-reject-pay').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = parseInt(btn.dataset.id);
+      tg.showConfirm('Отклонить оплату по этому заказу?', async ok => {
+        if (!ok) return;
+        btn.disabled = true;
+        try {
+          await api('/api/orders/reject_payment', { order_id: id });
+          tg.HapticFeedback?.notificationOccurred('warning');
+          await renderPayments(container);
+        } catch (e) {
+          tg.HapticFeedback?.notificationOccurred('error');
+          tg.showAlert('❌ ' + e.message);
+          btn.disabled = false;
+        }
+      });
+    });
   });
 }
 

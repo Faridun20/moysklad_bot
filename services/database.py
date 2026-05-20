@@ -1819,6 +1819,35 @@ def get_open_debts(
     return [dict(r) for r in rows]
 
 
+def get_paid_orders_awaiting_confirmation(user_id: int | None = None) -> list[dict]:
+    """Paid-заказы с pending-платежом, ожидающие подтверждения боссом.
+
+    Когда босс одобряет отгрузку по заказу payment_type='paid', авто-
+    создаётся pending-платёж (фиксация поступления денег + синк в МойСклад).
+    Credit-долги уже видны через get_open_debts; здесь — ТОЛЬКО paid, чтобы
+    дать боссу surface для подтверждения в WebApp (таб «Платежи»).
+
+    user_id — если указан, только заказы этого менеджера; иначе все.
+    """
+    query = (
+        "SELECT * FROM orders o "
+        "WHERE o.payment_type = 'paid' "
+        "AND o.status IN ('approved', 'shipped') "
+        "AND EXISTS (SELECT 1 FROM payments p "
+        "            WHERE p.order_id = o.id AND p.status = 'pending')"
+    )
+    params: list = []
+    if user_id is not None:
+        query += " AND o.user_id = ?"
+        params.append(user_id)
+    query += " ORDER BY o.id ASC"
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q(query), params)
+        rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
 def update_order_currency(order_id: int, currency: str) -> bool:
     """Установить валюту заказа. Применяется ко всем позициям одного
     ордера — менять между позициями не имеет смысла."""

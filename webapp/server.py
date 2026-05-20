@@ -858,6 +858,58 @@ async def api_payments_history(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/payments/pending")
+async def api_payments_pending(request: Request):
+    """Paid-заказы с pending-оплатой, ожидающие подтверждения боссом.
+
+    Surface для бага «нет возможности подтвердить оплату в WebApp»:
+    credit-долги видны в /api/debts, а paid-заказы — нет. Здесь отдаём
+    именно paid, чтобы таб «Платежи» показал блок «На подтверждение».
+    Confirm/reject — через существующие /api/orders/confirm_payment и
+    /api/orders/reject_payment (принимают order_id).
+    """
+    from services import async_db as adb
+    from config import BASE_CURRENCY
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),  # подтверждает только начальство
+        rate_limit_scope="api_payments_pending",
+        rate_limit_max=30,
+        rate_limit_window=60.0,
+    )
+
+    orders = await adb.get_paid_orders_awaiting_confirmation()
+    order_ids = [o["id"] for o in orders]
+    items_by_order = await adb.get_order_items_by_ids(order_ids) if order_ids else {}
+    payments_by_order = await adb.get_payments_for_orders(order_ids) if order_ids else {}
+
+    result = []
+    for o in orders:
+        items = items_by_order.get(o["id"], [])
+        total = sum(
+            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
+            for it in items
+        )
+        payments = payments_by_order.get(o["id"], [])
+        pending = sum(
+            float(p["amount"]) for p in payments if p["status"] == "pending"
+        )
+        result.append({
+            "order_id": o["id"],
+            "agent_name": o.get("agent_name") or "—",
+            "full_name": o.get("full_name") or "—",
+            "currency": o.get("currency") or BASE_CURRENCY,
+            "total": total,
+            "pending": pending,
+            "items_count": len(items),
+            "created_at": (o.get("created_at") or "")[:16],
+        })
+
+    return JSONResponse({"pending": result, "role": get_role(user["id"])})
+
+
 @app.post("/api/payments/send")
 async def api_payments_send(request: Request):
     """Отправить новый платёж на подтверждение."""
