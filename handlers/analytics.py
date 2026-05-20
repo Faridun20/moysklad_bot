@@ -20,7 +20,7 @@ from services.database import (
 )
 from utils.formatters import format_sales_report
 from utils.keyboards import analytics_keyboard, analytics_back_keyboard
-from utils.helpers import user_safe_error
+from utils.helpers import user_safe_error, local_now
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -98,7 +98,7 @@ async def cb_analytics_period(call: CallbackQuery, bot: Bot):
     # Local time — совпадает с DB now_str(). Раньше был datetime.utcnow(),
     # и сегодняшние одобренные заказы (созданные в локальной TZ) выпадали
     # из «окна» аналитики на величину TZ-offset.
-    now = datetime.now()
+    now = local_now()
     since, until, prev_since, prev_until, label = get_period(period, now)
 
     role = get_role(call.from_user.id)
@@ -269,7 +269,7 @@ async def show_manager_summary(bot: Bot, chat_id: int, user_id: int):
     """Краткая сводка менеджера за текущий месяц — из локальной БД."""
     try:
         # Local time, чтобы совпадало с DB now_str(). См. cb_analytics_period.
-        now = datetime.now()
+        now = local_now()
         since = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         stats = _personal_stats_from_local(user_id, since, now)
         if stats["count"] == 0:
@@ -293,3 +293,4 @@ async def show_manager_summary(bot: Bot, chat_id: int, user_id: int):
         await bot.send_message(chat_id, text, parse_mode="HTML")
     except Exception as e:
         logger.warning("Не удалось показать сводку менеджера: %s", e)
+        await bot.send_message(chat_id, user_safe_error(e, "manager_summary"))

@@ -9,6 +9,7 @@ from utils.helpers import (
     format_date,
     format_price,
     trend_arrow,
+    local_now,
 )
 
 from config import PAGE_SIZE  # единый источник в config
@@ -162,9 +163,7 @@ def format_payment_notify(
     currency: str,
     comment: str,
 ) -> str:
-    from datetime import datetime
-
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    now = local_now().strftime("%d.%m.%Y %H:%M")
     return (
         f"{DIV}\n"
         f"💵 <b>Новый платёж #{payment_id}</b>\n"

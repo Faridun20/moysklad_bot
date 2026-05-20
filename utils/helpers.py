@@ -147,8 +147,7 @@ def filter_records_by_period(records: list[dict], period: str) -> list[dict]:
     Используется и в /audit, и в /log handlers — раньше каждый держал
     свою копию.
     """
-    from datetime import datetime as _dt
-    now = _dt.now()
+    now = local_now()
     if period == "today":
         cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
     elif period == "week":

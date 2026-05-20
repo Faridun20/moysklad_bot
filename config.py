@@ -10,8 +10,16 @@ try:
     if "ALLOWED_CURRENCIES" not in dir():
         ALLOWED_CURRENCIES = ("USD", "UZS", "RUB", "EUR")
 except ImportError:
+    import logging as _logging
+
     TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
     MS_TOKEN = os.environ.get("MS_TOKEN", "").strip()
+
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN не задан — задайте переменную окружения")
+    if not MS_TOKEN:
+        raise RuntimeError("MS_TOKEN не задан — задайте переменную окружения")
+
     CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "300"))
     # Валюта для отображения цен в боте/WebApp (отображательная — на
     # стороне МойСклад валюта берётся из организации). Дефолт — USD.
@@ -23,7 +31,10 @@ except ImportError:
 
     def _parse_ids(key: str) -> list[int]:
         val = os.environ.get(key, "")
-        return [int(x.strip()) for x in val.split(",") if x.strip().isdigit()]
+        result = [int(x.strip()) for x in val.split(",") if x.strip().isdigit()]
+        if not result and key in ("ADMIN_IDS", "BOSS_IDS"):
+            _logging.warning("config: %s не задан — соответствующая роль не настроена", key)
+        return result
 
     ALLOWED_USERS = _parse_ids("ALLOWED_USERS")
     ADMIN_IDS = _parse_ids("ADMIN_IDS")

@@ -3,7 +3,7 @@
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from aiogram import Bot, Router, F
 from aiogram.filters import Command
@@ -243,7 +243,7 @@ async def confirm_pay(call: CallbackQuery, bot: Bot):
     confirm_payment(payment_id, call.from_user.id, admin_name)
 
     await call.answer("✅ Принято")
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    now = local_now().strftime("%d.%m.%Y %H:%M")
     await call.message.edit_text(
         call.message.text
         + f"\n\n{DIV}\n✅ <b>Принято</b>  <code>{now}</code>  — {admin_name}",
@@ -279,7 +279,7 @@ async def reject_pay(call: CallbackQuery, bot: Bot):
     reject_payment(payment_id, call.from_user.id, admin_name)
 
     await call.answer("❌ Отклонено")
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    now = local_now().strftime("%d.%m.%Y %H:%M")
     await call.message.edit_text(
         call.message.text
         + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{now}</code>  — {admin_name}",
@@ -323,7 +323,7 @@ async def cb_payreport(call: CallbackQuery):
             "📊 За какой период показать отчёт?", reply_markup=pay_report_keyboard()
         )
 
-    now = datetime.now()
+    now = local_now()
     if period == "today":
         since = now.replace(hour=0, minute=0, second=0).strftime("%Y-%m-%d %H:%M:%S")
         until, label = None, "сегодня"
@@ -361,7 +361,7 @@ async def cb_payreport(call: CallbackQuery):
 # ─── /sync_payments: показать состояние и ретрайнуть синки в МойСклад ───────
 
 
-from utils.helpers import esc as _esc  # единая реализация — utils/helpers.py
+from utils.helpers import esc as _esc, local_now  # единая реализация — utils/helpers.py
 
 
 def _format_sync_status() -> tuple[str, bool]:

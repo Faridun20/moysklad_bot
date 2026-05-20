@@ -20,6 +20,10 @@ from services.roles import cached_role as get_role
 from services.rate_limit import acquire as rate_limit_acquire
 
 
+# Хранилище фоновых задач — предотвращает преждевременный GC до завершения.
+_background_tasks: set[asyncio.Task] = set()
+
+
 # ─── Idempotency cache ──────────────────────────────────────────────
 # Защита от double-click на confirm/reject платежей. Клиент посылает
 # `idempotency_key` (random UUID per действие); если запрос с тем же
@@ -276,7 +280,9 @@ async def ms_webhook(secret: str, request: Request):
 
         # Платежи / заказы покупателя: синхронизируем локальные данные
         from services.ms_sync_handler import handle_ms_events
-        asyncio.create_task(handle_ms_events(events))
+        _task = asyncio.create_task(handle_ms_events(events))
+        _background_tasks.add(_task)
+        _task.add_done_callback(_background_tasks.discard)
 
     # МойСклад ждёт 200 быстро, иначе ретраит. Сам рефреш делаем в фоне.
     return JSONResponse({"ok": True, "received": len(events)})
@@ -1070,6 +1076,12 @@ async def api_remove_item(request: Request):
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
 
     from services import async_db as adb
+    item = await adb.get_order_item(data["item_id"])
+    if not item:
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
+    order = await adb.get_order(item["order_id"])
+    if not order or order["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Нет доступа")
     await adb.remove_order_item(data["item_id"])
     return JSONResponse({"ok": True})
 

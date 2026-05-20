@@ -1143,7 +1143,12 @@ def _trigger_ms_paymentin_sync(payment_id: int) -> None:
     # В активном loop'е — fire-and-forget. Сохраняем ссылку чтобы
     # не было RuntimeWarning «Task was destroyed».
     task = loop.create_task(create_paymentin_for_payment(payment_id))
-    task.add_done_callback(lambda t: t.exception() and None)
+
+    def _log_exc(t: asyncio.Task) -> None:
+        if not t.cancelled() and (exc := t.exception()):
+            logger.exception("ms_paymentin_sync payment #%d failed: %s", payment_id, exc)
+
+    task.add_done_callback(_log_exc)
 
 
 def _maybe_close_order_after_payment(
@@ -1891,6 +1896,14 @@ def get_order_items_by_ids(order_ids: list[int]) -> dict[int, list[dict]]:
         d = dict(r)
         grouped.setdefault(d["order_id"], []).append(d)
     return grouped
+
+
+def get_order_item(item_id: int) -> dict | None:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("SELECT * FROM order_items WHERE id = ?"), (item_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
 
 
 def remove_order_item(item_id: int) -> bool:
