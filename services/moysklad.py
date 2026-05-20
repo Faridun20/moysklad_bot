@@ -89,8 +89,58 @@ _RETRY_BASE_DELAY = 0.5  # сек, удваивается на каждой по
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
+class _CircuitBreaker:
+    """Простой circuit breaker для МойСклад API.
+
+    Открывается после OPEN_AFTER_FAILS подряд провальных запросов.
+    В открытом состоянии все запросы сразу падают без попыток — это
+    защищает event loop от накапливающихся таймаутов (30с каждый) при
+    длительном outage МойСклад. После HALF_OPEN_AFTER секунд переходим
+    в half-open и делаем один пробный запрос. Если успех — закрываем.
+    """
+
+    OPEN_AFTER_FAILS = 5
+    HALF_OPEN_AFTER = 60.0  # секунд
+
+    def __init__(self) -> None:
+        self._fails = 0
+        self._opened_at: float | None = None
+
+    def is_open(self) -> bool:
+        if self._opened_at is None:
+            return False
+        if time.monotonic() - self._opened_at >= self.HALF_OPEN_AFTER:
+            return False  # half-open: пробуем
+        return True
+
+    def record_success(self) -> None:
+        self._fails = 0
+        self._opened_at = None
+
+    def record_failure(self) -> None:
+        self._fails += 1
+        if self._fails >= self.OPEN_AFTER_FAILS and self._opened_at is None:
+            self._opened_at = time.monotonic()
+            logger.error(
+                "МойСклад circuit breaker ОТКРЫТ после %d ошибок подряд. "
+                "Запросы будут отклоняться %.0f сек.",
+                self._fails, self.HALF_OPEN_AFTER,
+            )
+
+
+_circuit = _CircuitBreaker()
+
+
 async def ms_get(path: str, params: dict = None, session: aiohttp.ClientSession = None):
-    """GET с ретраями: сетевые ошибки, таймауты и 429/5xx."""
+    """GET с ретраями: сетевые ошибки, таймауты и 429/5xx.
+    Защищён circuit breaker'ом: после 5 подряд ошибок отклоняет без попыток.
+    """
+    if _circuit.is_open():
+        raise RuntimeError(
+            "МойСклад временно недоступен (circuit breaker открыт). "
+            "Повторите позже."
+        )
+
     sess = session if session is not None else await get_session()
     url = f"{MS_BASE}/{path}"
     last_exc: Exception | None = None
@@ -112,6 +162,7 @@ async def ms_get(path: str, params: dict = None, session: aiohttp.ClientSession 
                     await asyncio.sleep(delay)
                     continue
                 resp.raise_for_status()
+                _circuit.record_success()
                 return await resp.json()
         except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
             last_exc = e
@@ -125,6 +176,7 @@ async def ms_get(path: str, params: dict = None, session: aiohttp.ClientSession 
             await asyncio.sleep(delay)
 
     # Все попытки исчерпаны
+    _circuit.record_failure()
     if last_exc is not None:
         raise last_exc
     raise RuntimeError(f"MoyСклад {path}: исчерпаны {_MAX_RETRIES} попыток")
