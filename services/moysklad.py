@@ -106,10 +106,17 @@ class _CircuitBreaker:
         self._fails = 0
         self._opened_at: float | None = None
 
+    def _half_open(self) -> bool:
+        """Открыт, но таймаут прошёл — пора пропустить один пробный запрос."""
+        return (
+            self._opened_at is not None
+            and time.monotonic() - self._opened_at >= self.HALF_OPEN_AFTER
+        )
+
     def is_open(self) -> bool:
         if self._opened_at is None:
             return False
-        if time.monotonic() - self._opened_at >= self.HALF_OPEN_AFTER:
+        if self._half_open():
             return False  # half-open: пробуем
         return True
 
@@ -119,12 +126,22 @@ class _CircuitBreaker:
 
     def record_failure(self) -> None:
         self._fails += 1
-        if self._fails >= self.OPEN_AFTER_FAILS and self._opened_at is None:
+        # Открываем цепь когда: (а) накопился порог ошибок и она ещё
+        # закрыта, ИЛИ (б) упал пробный запрос в half-open — тогда
+        # переоткрываем со свежим таймером. Без (б) breaker навсегда
+        # застревал в half-open и пропускал все запросы без защиты.
+        if self._opened_at is None and self._fails >= self.OPEN_AFTER_FAILS:
             self._opened_at = time.monotonic()
             logger.error(
                 "МойСклад circuit breaker ОТКРЫТ после %d ошибок подряд. "
                 "Запросы будут отклоняться %.0f сек.",
                 self._fails, self.HALF_OPEN_AFTER,
+            )
+        elif self._half_open():
+            self._opened_at = time.monotonic()
+            logger.warning(
+                "МойСклад circuit breaker: пробный запрос упал, "
+                "цепь снова открыта на %.0f сек.", self.HALF_OPEN_AFTER,
             )
 
 
