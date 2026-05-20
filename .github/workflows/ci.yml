@@ -27,7 +27,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Install test deps
-        run: pip install pytest ruff
+        run: pip install -r requirements-dev.txt
 
       # ruff = одновременно лайтовый линтер + проверка формата. Гоним
       # только базовые правила (errors, undefined names), не enforced

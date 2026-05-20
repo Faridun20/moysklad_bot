@@ -1,4 +1,7 @@
-# Тестовые/dev-only зависимости. CI ставит вручную (см. .github/workflows/ci.yml);
-# локально: pip install -r requirements.txt -r requirements-dev.txt
+# Тестовые/dev-only зависимости. CI ставит через этот файл (см.
+# .github/workflows/ci.yml); локально: pip install -r requirements.txt -r requirements-dev.txt
 pytest>=8.0
 ruff>=0.5
+# httpx нужен FastAPI TestClient (tests/test_requests_api.py). Без него
+# starlette.testclient падает на импорте.
+httpx>=0.27
