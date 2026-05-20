@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 # TTL-кэши в памяти (на чат). Чистятся ленивым GC при превышении лимита.
-_CATEGORIES_TTL = 300.0   # 5 мин — категории редко меняются
-_STOCK_TTL = 60.0         # 1 мин — остатки могут двигаться
+_CATEGORIES_TTL = 300.0  # 5 мин — категории редко меняются
+_STOCK_TTL = 60.0  # 1 мин — остатки могут двигаться
 _CACHE_MAX_ENTRIES = 500  # верхняя граница, чтобы кэш не рос бесконечно
 
 categories_cache: dict[int, tuple[float, list[dict]]] = {}
@@ -171,12 +171,17 @@ async def show_stock_all(bot: Bot, chat_id: int, page: int):
         rows = await get_all_stock()
         if not rows:
             return await bot.send_message(chat_id, "📦 Склад пуст.")
-        _cache_put(stock_cache, chat_id, {
-            "rows": rows,
-            "mode": "all",
-            "cat_name": "",
-            "cat_idx": 0,
-        }, _STOCK_TTL)
+        _cache_put(
+            stock_cache,
+            chat_id,
+            {
+                "rows": rows,
+                "mode": "all",
+                "cat_name": "",
+                "cat_idx": 0,
+            },
+            _STOCK_TTL,
+        )
         txt = format_stock_page(rows, page)
         kb = stock_nav_keyboard(page, len(rows), "all")
         await bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=kb)
@@ -190,17 +195,18 @@ async def show_stock_category(bot: Bot, chat_id: int, page: int, idx: int, cat: 
         all_rows = await get_all_stock()
         cat_id = extract_id_from_href(extract_href(cat))
         cat_name = cat.get("name", "—")
-        rows = [
-            r
-            for r in all_rows
-            if extract_id_from_href(extract_href(r, "folder")) == cat_id
-        ]
-        _cache_put(stock_cache, chat_id, {
-            "rows": rows,
-            "mode": "cat",
-            "cat_name": cat_name,
-            "cat_idx": idx,
-        }, _STOCK_TTL)
+        rows = [r for r in all_rows if extract_id_from_href(extract_href(r, "folder")) == cat_id]
+        _cache_put(
+            stock_cache,
+            chat_id,
+            {
+                "rows": rows,
+                "mode": "cat",
+                "cat_name": cat_name,
+                "cat_idx": idx,
+            },
+            _STOCK_TTL,
+        )
         if not rows:
             return await bot.send_message(
                 chat_id, f"📦 В категории «{cat_name}» нет товаров с остатком."

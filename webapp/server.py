@@ -2,6 +2,7 @@
 FastAPI сервер для WebApp.
 Запускается параллельно с ботом.
 """
+
 import asyncio
 import logging
 import os
@@ -14,6 +15,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from webapp.auth import verify_init_data
+
 # Берём роль из in-memory кэша (TTL 60s) вместо SELECT'а на каждый API-запрос.
 # `get_role` оставляем как имя для обратной совместимости с кодом ниже.
 from services.roles import cached_role as get_role
@@ -78,14 +80,13 @@ def _authorize(
     if role not in allowed_roles:
         raise HTTPException(status_code=403, detail="Нет доступа")
     if rate_limit_scope:
-        if not rate_limit_acquire(
-            rate_limit_scope, user["id"], rate_limit_max, rate_limit_window
-        ):
+        if not rate_limit_acquire(rate_limit_scope, user["id"], rate_limit_max, rate_limit_window):
             raise HTTPException(
                 status_code=429,
                 detail="Слишком много запросов, подождите минуту",
             )
     return user
+
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +179,7 @@ async def get_notify_bot():
             if _notify_bot is None:
                 from aiogram import Bot
                 from config import TELEGRAM_TOKEN
+
                 _notify_bot = Bot(token=TELEGRAM_TOKEN)
     return _notify_bot
 
@@ -224,6 +226,7 @@ async def telegram_webhook(secret: str, request: Request):
         raise HTTPException(status_code=503, detail="bot not ready")
 
     from aiogram.types import Update
+
     try:
         payload = await request.json()
     except Exception:
@@ -253,6 +256,7 @@ def _new_demand_ids_from_events(events: list[dict]) -> list[str]:
     payload MS-вебхука. Вынесено отдельно — чтобы тестировать дискриминацию
     событий без асинхронной fire-and-forget обвязки хендлера."""
     from utils.helpers import extract_id_from_href
+
     ids: list[str] = []
     for e in events:
         if e.get("action") != "CREATE":
@@ -298,6 +302,7 @@ async def ms_webhook(secret: str, request: Request):
         if len(body_bytes) > _MS_WEBHOOK_MAX_BYTES:
             raise HTTPException(status_code=413, detail="payload too large")
         import json as _json
+
         payload = _json.loads(body_bytes) if body_bytes else {}
     except HTTPException:
         raise
@@ -309,19 +314,16 @@ async def ms_webhook(secret: str, request: Request):
         logger.info(
             "ms-webhook: %d event(s): %s",
             len(events),
-            ", ".join(
-                f"{e.get('action')}.{(e.get('meta') or {}).get('type')}"
-                for e in events[:5]
-            ),
+            ", ".join(f"{e.get('action')}.{(e.get('meta') or {}).get('type')}" for e in events[:5]),
         )
 
         from services.ms_webhooks import STOCK_SUBSCRIPTIONS
+
         _stock_types = {s[0] for s in STOCK_SUBSCRIPTIONS}
 
         # Остатки: только события от складских документов
         stock_events = [
-            e for e in events
-            if (e.get("meta") or {}).get("type", "").lower() in _stock_types
+            e for e in events if (e.get("meta") or {}).get("type", "").lower() in _stock_types
         ]
         if stock_events:
             mark_stock_dirty()
@@ -330,10 +332,12 @@ async def ms_webhook(secret: str, request: Request):
             # TTL-кэши МС, чтобы следующее открытие «Аналитики» увидело
             # свежие цифры.
             from services.moysklad import invalidate_ms_cache
+
             invalidate_ms_cache()
 
         # Платежи / заказы покупателя: синхронизируем локальные данные
         from services.ms_sync_handler import handle_ms_events
+
         _task = asyncio.create_task(handle_ms_events(events))
         _background_tasks.add(_task)
         _task.add_done_callback(_background_tasks.discard)
@@ -342,6 +346,7 @@ async def ms_webhook(secret: str, request: Request):
         # поллер раз в N секунд, отсюда задержка до нескольких минут). Дедуп
         # внутри notify_new_shipment не даст задвоить с поллером-резервом.
         from services.notifier import notify_new_shipment
+
         for did in _new_demand_ids_from_events(events):
             _nt = asyncio.create_task(notify_new_shipment(did))
             _background_tasks.add(_nt)
@@ -360,6 +365,7 @@ async def healthz():
     Не задевает БД и МойСклад — отвечает быстро даже если они лежат,
     чтобы внешний мониторинг видел: HTTP-слой жив, паника не общая."""
     import time as _t
+
     return JSONResponse({"ok": True, "version": APP_VERSION, "ts": int(_t.time())})
 
 
@@ -421,12 +427,14 @@ async def get_me(request: Request):
     user_id = user["id"]
     role = get_role(user_id)
 
-    return JSONResponse({
-        "user_id": user_id,
-        "first_name": user.get("first_name", ""),
-        "username": user.get("username", ""),
-        "role": role,
-    })
+    return JSONResponse(
+        {
+            "user_id": user_id,
+            "first_name": user.get("first_name", ""),
+            "username": user.get("username", ""),
+            "role": role,
+        }
+    )
 
 
 # ─── API: главный экран (сводка дня + мои заказы + для босса аналитика) ────
@@ -510,21 +518,22 @@ async def api_home(request: Request):
         # подтягиваем сразу все позиции (раньше был N+1 по заказам).
         today_iso = start_of_day.strftime("%Y-%m-%d")
         relevant_today = [
-            o for o in my_orders
+            o
+            for o in my_orders
             if o["status"] in ("approved", "shipped")
             and (o.get("updated_at") or o.get("created_at") or "")[:10] == today_iso
         ]
         items_by_order = (
             await adb.get_order_items_by_ids([o["id"] for o in relevant_today])
-            if relevant_today else {}
+            if relevant_today
+            else {}
         )
         my_today_revenue = 0.0
         my_today_clients: set[str] = set()
         for o in relevant_today:
             items = items_by_order.get(o["id"], [])
             my_today_revenue += sum(
-                float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
-                for it in items
+                float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items
             )
             if o.get("agent_name"):
                 my_today_clients.add(o["agent_name"])
@@ -536,6 +545,7 @@ async def api_home(request: Request):
         }
 
     from config import BASE_CURRENCY
+
     result = {
         "role": role,
         "today": today,
@@ -571,9 +581,7 @@ async def api_home(request: Request):
                 cur = by_manager.setdefault(tg_name, {"sum": 0, "count": 0})
                 cur["sum"] += s.get("sum", 0) or 0
                 cur["count"] += 1
-            top_emp = sorted(
-                by_manager.items(), key=lambda kv: kv[1]["sum"], reverse=True
-            )[:5]
+            top_emp = sorted(by_manager.items(), key=lambda kv: kv[1]["sum"], reverse=True)[:5]
             result["top_employees"] = [
                 {"name": name, "revenue": d["sum"] / 100, "count": d["count"]}
                 for name, d in top_emp
@@ -633,9 +641,7 @@ async def api_stock(request: Request):
             # href нужен чтобы при создании заявки через WebApp
             # позиция уехала в МойСклад demand с правильной ссылкой на товар
             "href": r.get("meta", {}).get("href", ""),
-            "folder_id": extract_id_from_href(
-                r.get("folder", {}).get("meta", {}).get("href", "")
-            ),
+            "folder_id": extract_id_from_href(r.get("folder", {}).get("meta", {}).get("href", "")),
             "folder_name": r.get("folder", {}).get("name", ""),
         }
         for r in rows
@@ -721,17 +727,19 @@ async def api_analytics(request: Request):
         for name, d in current["top_products"][:5]
     ]
 
-    return JSONResponse({
-        "label": label,
-        "scope": "company",
-        "total": current["total"] / 100,
-        "count": current["count"],
-        "clients": current["clients"],
-        "avg_check": (current["total"] / current["count"] / 100) if current["count"] else 0,
-        "trend": trend,
-        "by_day": [{"day": days_ru[i], "count": by_day[i]} for i in range(7)],
-        "top_products": top,
-    })
+    return JSONResponse(
+        {
+            "label": label,
+            "scope": "company",
+            "total": current["total"] / 100,
+            "count": current["count"],
+            "clients": current["clients"],
+            "avg_check": (current["total"] / current["count"] / 100) if current["count"] else 0,
+            "trend": trend,
+            "by_day": [{"day": days_ru[i], "count": by_day[i]} for i in range(7)],
+            "top_products": top,
+        }
+    )
 
 
 def _ts(o: dict) -> str:
@@ -771,9 +779,9 @@ async def _personal_analytics(
     # Берём все одобренные заказы, попавшие хоть в один из двух окон —
     # текущее [since, until] или предыдущее [prev_since, since].
     relevant = [
-        o for o in orders
-        if o["status"] in ("approved", "shipped")
-        and prev_since_iso <= _ts(o) <= until_iso
+        o
+        for o in orders
+        if o["status"] in ("approved", "shipped") and prev_since_iso <= _ts(o) <= until_iso
     ]
 
     # Диагностический лог — увидим в Railway почему аналитика пуста,
@@ -781,12 +789,18 @@ async def _personal_analytics(
     logger.info(
         "analytics user=%s role=manager orders=%d approved=%d relevant=%d "
         "period=[%s..%s] (prev_since=%s)",
-        user_id, len(orders),
+        user_id,
+        len(orders),
         sum(1 for o in orders if o["status"] in ("approved", "shipped")),
-        len(relevant), since_iso, until_iso, prev_since_iso,
+        len(relevant),
+        since_iso,
+        until_iso,
+        prev_since_iso,
     )
 
-    items_by_order = await adb.get_order_items_by_ids([o["id"] for o in relevant]) if relevant else {}
+    items_by_order = (
+        await adb.get_order_items_by_ids([o["id"] for o in relevant]) if relevant else {}
+    )
 
     def _agg(start_iso, end_iso):
         total = 0.0
@@ -799,10 +813,7 @@ async def _personal_analytics(
             if ts < start_iso or ts > end_iso:
                 continue
             items = items_by_order.get(o["id"], [])
-            sub = sum(
-                float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
-                for it in items
-            )
+            sub = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
             total += sub
             count += 1
             if o.get("agent_name"):
@@ -839,6 +850,7 @@ async def _personal_analytics(
         "by_day": [{"day": days_ru[i], "count": by_day[i]} for i in range(7)],
         "top_products": [{"name": n, "sum": d["sum"], "qty": d["qty"]} for n, d in cur_top],
     }
+
 
 # ─── API: платежи ─────────────────────────────────────────────────────────────
 
@@ -914,24 +926,21 @@ async def api_payments_pending(request: Request):
     result = []
     for o in orders:
         items = items_by_order.get(o["id"], [])
-        total = sum(
-            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
-            for it in items
-        )
+        total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
         payments = payments_by_order.get(o["id"], [])
-        pending = sum(
-            float(p["amount"]) for p in payments if p["status"] == "pending"
+        pending = sum(float(p["amount"]) for p in payments if p["status"] == "pending")
+        result.append(
+            {
+                "order_id": o["id"],
+                "agent_name": o.get("agent_name") or "—",
+                "full_name": o.get("full_name") or "—",
+                "currency": o.get("currency") or BASE_CURRENCY,
+                "total": total,
+                "pending": pending,
+                "items_count": len(items),
+                "created_at": (o.get("created_at") or "")[:16],
+            }
         )
-        result.append({
-            "order_id": o["id"],
-            "agent_name": o.get("agent_name") or "—",
-            "full_name": o.get("full_name") or "—",
-            "currency": o.get("currency") or BASE_CURRENCY,
-            "total": total,
-            "pending": pending,
-            "items_count": len(items),
-            "created_at": (o.get("created_at") or "")[:16],
-        })
 
     return JSONResponse({"pending": result, "role": get_role(user["id"])})
 
@@ -964,6 +973,7 @@ async def api_payments_send(request: Request):
         raise HTTPException(status_code=400, detail="Неверная сумма")
 
     from config import ALLOWED_CURRENCIES
+
     currency = data.get("currency", "USD")
     if currency not in ALLOWED_CURRENCIES:
         raise HTTPException(status_code=400, detail="Неверная валюта")
@@ -985,23 +995,26 @@ async def api_payments_send(request: Request):
 
     # Аудит
     await adb.add_audit_log(
-        user_id, full_name, get_role(user_id),
+        user_id,
+        full_name,
+        get_role(user_id),
         "payment_sent",
         f"Платёж #{payment_id}: {amount:,.0f} {currency} — {comment}",
     )
 
     # Уведомляем админов через Telegram API напрямую
-    notify_text = format_payment_notify(
-        payment_id, full_name, username, amount, currency, comment
-    )
+    notify_text = format_payment_notify(payment_id, full_name, username, amount, currency, comment)
     keyboard = {
-        "inline_keyboard": [[
-            {"text": "✅ Принять",   "callback_data": f"pay_ok:{payment_id}"},
-            {"text": "❌ Отклонить", "callback_data": f"pay_no:{payment_id}"},
-        ]]
+        "inline_keyboard": [
+            [
+                {"text": "✅ Принять", "callback_data": f"pay_ok:{payment_id}"},
+                {"text": "❌ Отклонить", "callback_data": f"pay_no:{payment_id}"},
+            ]
+        ]
     }
 
     from services.notifier import aget_notify_recipients
+
     recipients = await aget_notify_recipients()
 
     # tg_send_message переиспользует общую ClientSession — никакого
@@ -1010,6 +1023,7 @@ async def api_payments_send(request: Request):
         await tg_send_message(uid, notify_text, reply_markup=keyboard)
 
     return JSONResponse({"payment_id": payment_id, "status": "pending"})
+
 
 # ─── API: заказы ─────────────────────────────────────────────────────────────
 
@@ -1023,6 +1037,7 @@ async def api_orders(request: Request):
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
 
     from services import async_db as adb
+
     role = get_role(user["id"])
 
     if role in ("admin", "boss"):
@@ -1031,43 +1046,44 @@ async def api_orders(request: Request):
         orders = await adb.get_user_orders(user["id"])
 
     from config import BASE_CURRENCY
+
     # Батч-загрузка позиций: один SQL вместо N (N+1 был на больших списках)
     items_by_order = await adb.get_order_items_by_ids([o["id"] for o in orders]) if orders else {}
     result = []
     for o in orders:
         items = items_by_order.get(o["id"], [])
-        total = sum(
-            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
-            for it in items
+        total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
+        result.append(
+            {
+                "id": o["id"],
+                "status": o["status"],
+                "full_name": o["full_name"],
+                "agent_name": o.get("agent_name", ""),
+                "comment": o.get("comment", ""),
+                "currency": o.get("currency") or BASE_CURRENCY,
+                # Поля долга — фронт показывает «В долг до X» или «Оплачено»
+                # на карточке заказа. paid_at=null + payment_type=credit
+                # значит ещё не закрыт.
+                "payment_type": o.get("payment_type") or "paid",
+                "due_date": o.get("due_date"),
+                "paid_at": (o.get("paid_at") or "")[:16] if o.get("paid_at") else None,
+                "paid_confirmed_at": (o.get("paid_confirmed_at") or "")[:16]
+                if o.get("paid_confirmed_at")
+                else None,
+                "created_at": o["created_at"][:16],
+                "items_count": len(items),
+                "total": total,
+                "items": [
+                    {
+                        "name": it["product_name"],
+                        "quantity": it["quantity"],
+                        "unit": it["unit"],
+                        "price": float(it.get("price", 0) or 0),
+                    }
+                    for it in items
+                ],
+            }
         )
-        result.append({
-            "id": o["id"],
-            "status": o["status"],
-            "full_name": o["full_name"],
-            "agent_name": o.get("agent_name", ""),
-            "comment": o.get("comment", ""),
-            "currency": o.get("currency") or BASE_CURRENCY,
-            # Поля долга — фронт показывает «В долг до X» или «Оплачено»
-            # на карточке заказа. paid_at=null + payment_type=credit
-            # значит ещё не закрыт.
-            "payment_type": o.get("payment_type") or "paid",
-            "due_date": o.get("due_date"),
-            "paid_at": (o.get("paid_at") or "")[:16] if o.get("paid_at") else None,
-            "paid_confirmed_at": (o.get("paid_confirmed_at") or "")[:16]
-                if o.get("paid_confirmed_at") else None,
-            "created_at": o["created_at"][:16],
-            "items_count": len(items),
-            "total": total,
-            "items": [
-                {
-                    "name": it["product_name"],
-                    "quantity": it["quantity"],
-                    "unit": it["unit"],
-                    "price": float(it.get("price", 0) or 0),
-                }
-                for it in items
-            ],
-        })
 
     return JSONResponse({"orders": result, "role": role, "default_currency": BASE_CURRENCY})
 
@@ -1085,6 +1101,7 @@ async def api_pending_requests(request: Request):
         raise HTTPException(status_code=403, detail="Нет доступа")
 
     from services import async_db as adb
+
     requests = await adb.get_pending_requests()
     # Батч-загрузка заказов и позиций — один SQL на каждое вместо 2N.
     order_ids = [r["order_id"] for r in requests]
@@ -1094,28 +1111,27 @@ async def api_pending_requests(request: Request):
     for r in requests:
         order = orders_by_id.get(r["order_id"])
         items = items_by_order.get(r["order_id"], []) if order else []
-        total = sum(
-            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
-            for it in items
+        total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
+        result.append(
+            {
+                "id": r["id"],
+                "order_id": r["order_id"],
+                "full_name": r["full_name"],
+                "status": r["status"],
+                "created_at": r["created_at"][:16],
+                "agent_name": order.get("agent_name", "") if order else "",
+                "total": total,
+                "items": [
+                    {
+                        "name": it["product_name"],
+                        "quantity": it["quantity"],
+                        "unit": it["unit"],
+                        "price": float(it.get("price", 0) or 0),
+                    }
+                    for it in items
+                ],
+            }
         )
-        result.append({
-            "id": r["id"],
-            "order_id": r["order_id"],
-            "full_name": r["full_name"],
-            "status": r["status"],
-            "created_at": r["created_at"][:16],
-            "agent_name": order.get("agent_name", "") if order else "",
-            "total": total,
-            "items": [
-                {
-                    "name": it["product_name"],
-                    "quantity": it["quantity"],
-                    "unit": it["unit"],
-                    "price": float(it.get("price", 0) or 0),
-                }
-                for it in items
-            ],
-        })
 
     return JSONResponse({"requests": result})
 
@@ -1144,9 +1160,8 @@ async def api_approve_request(request: Request):
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="req_id обязателен")
 
-    boss_name = (
-        f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
-        or user.get("username", str(user["id"]))
+    boss_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
+        "username", str(user["id"])
     )
     bot = await get_notify_bot()
     result = await approve_shipment_request(req_id, user["id"], boss_name, bot)
@@ -1173,15 +1188,15 @@ async def api_reject_request(request: Request):
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="req_id обязателен")
 
-    boss_name = (
-        f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
-        or user.get("username", str(user["id"]))
+    boss_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
+        "username", str(user["id"])
     )
     bot = await get_notify_bot()
     result = await reject_shipment_request(req_id, user["id"], boss_name, bot)
     if not result["ok"]:
         raise HTTPException(status_code=409, detail=result["error"])
     return JSONResponse({"ok": True, "req_id": req_id})
+
 
 # ─── API: создание заказа ────────────────────────────────────────────────────
 
@@ -1199,9 +1214,8 @@ async def api_create_order(request: Request):
 
     from services import async_db as adb
 
-    full_name = (
-        f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
-        or user.get("username", str(user["id"]))
+    full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
+        "username", str(user["id"])
     )
     order_id = await adb.create_order(user["id"], full_name, data.get("comment", ""))
     return JSONResponse({"order_id": order_id})
@@ -1215,6 +1229,7 @@ async def api_add_item(request: Request):
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
 
     from services import async_db as adb
+
     order = await adb.get_order(data["order_id"])
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
@@ -1229,6 +1244,7 @@ async def api_add_item(request: Request):
     # Если в payload пришла валюта и она ещё не зафиксирована на ордере —
     # сохраняем. Все позиции одного ордера должны быть в одной валюте.
     from config import ALLOWED_CURRENCIES
+
     requested_currency = (data.get("currency") or "").upper()
     if requested_currency and requested_currency in ALLOWED_CURRENCIES:
         if not order.get("currency"):
@@ -1254,6 +1270,7 @@ async def api_remove_item(request: Request):
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
 
     from services import async_db as adb
+
     item = await adb.get_order_item(data["item_id"])
     if not item:
         raise HTTPException(status_code=404, detail="Позиция не найдена")
@@ -1272,6 +1289,7 @@ async def api_set_agent(request: Request):
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
 
     from services import async_db as adb
+
     order = await adb.get_order(data["order_id"])
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
@@ -1296,6 +1314,7 @@ async def api_submit_order(request: Request):
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
     from services.order_workflow import validate_transition
+
     err = validate_transition(order, "pending")
     if err:
         raise HTTPException(status_code=400, detail=err)
@@ -1319,6 +1338,7 @@ async def api_submit_order(request: Request):
             raise HTTPException(status_code=400, detail="Укажите дату возврата долга")
         try:
             from datetime import date
+
             parsed = date.fromisoformat(due_date)
             if parsed < date.today():
                 raise HTTPException(
@@ -1333,14 +1353,15 @@ async def api_submit_order(request: Request):
     # Перечитаем — нужно для уведомления
     order = await adb.get_order(order_id)
 
-    full_name = (
-        f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
-        or user.get("username", str(user["id"]))
+    full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
+        "username", str(user["id"])
     )
     req_id = await adb.create_shipment_request(order_id, user["id"], full_name)
     await adb.update_order_status(order_id, "pending")
     await adb.add_audit_log(
-        user["id"], full_name, get_role(user["id"]),
+        user["id"],
+        full_name,
+        get_role(user["id"]),
         "shipment_request_sent",
         f"Заявка #{req_id} (заказ #{order_id}) через WebApp",
     )
@@ -1348,10 +1369,12 @@ async def api_submit_order(request: Request):
     # Уведомляем руководителей
     notify_text = format_request_notify(order, items, req_id)
     keyboard = {
-        "inline_keyboard": [[
-            {"text": "✅ Одобрить",  "callback_data": f"req_ok:{req_id}"},
-            {"text": "❌ Отклонить", "callback_data": f"req_no:{req_id}"},
-        ]]
+        "inline_keyboard": [
+            [
+                {"text": "✅ Одобрить", "callback_data": f"req_ok:{req_id}"},
+                {"text": "❌ Отклонить", "callback_data": f"req_no:{req_id}"},
+            ]
+        ]
     }
     for uid in await aget_notify_recipients():
         await tg_send_message(uid, notify_text, reply_markup=keyboard)
@@ -1384,13 +1407,18 @@ async def api_agents(request: Request):
         raw_search = raw_search[:50]
     # Whitelist: буквы (любые юникодные), цифры, пробелы, основные знаки
     import re as _re
+
     search = _re.sub(r"[^\w\s\-\.,'@+()/]", "", raw_search, flags=_re.UNICODE)
     rows = snapshot.get_counterparties(search=search if search else None, limit=50)
     if rows:
-        return JSONResponse({"agents": [
-            {"id": r["ms_id"], "name": r.get("name", "—"), "phone": r.get("phone", "")}
-            for r in rows
-        ]})
+        return JSONResponse(
+            {
+                "agents": [
+                    {"id": r["ms_id"], "name": r.get("name", "—"), "phone": r.get("phone", "")}
+                    for r in rows
+                ]
+            }
+        )
 
     # Snapshot пуст — live fallback + триггер первичного рефреша
     params = {"limit": 50, "order": "name"}
@@ -1398,10 +1426,16 @@ async def api_agents(request: Request):
         params["search"] = search
     result = await ms_get("entity/counterparty", params=params)
     asyncio.create_task(snapshot.refresh_counterparties())
-    return JSONResponse({"agents": [
-        {"id": a.get("id", ""), "name": a.get("name", "—"), "phone": a.get("phone", "")}
-        for a in result.get("rows", [])
-    ]})
+    return JSONResponse(
+        {
+            "agents": [
+                {"id": a.get("id", ""), "name": a.get("name", "—"), "phone": a.get("phone", "")}
+                for a in result.get("rows", [])
+            ]
+        }
+    )
+
+
 # ─── API: долги (credit-заказы без paid_at) ─────────────────────────────────
 
 
@@ -1451,10 +1485,7 @@ async def api_debts(request: Request):
     result = []
     for o in debts:
         items = items_by_order.get(o["id"], [])
-        total = sum(
-            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
-            for it in items
-        )
+        total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
         payments = payments_by_order.get(o["id"], [])
         confirmed = sum(p["amount"] for p in payments if p["status"] == "confirmed")
         pending = sum(p["amount"] for p in payments if p["status"] == "pending")
@@ -1472,40 +1503,45 @@ async def api_debts(request: Request):
             state = "overdue" if due < today else ("due_today" if due == today else "upcoming")
         else:
             state = "upcoming"
-        result.append({
-            "id": o["id"],
-            "user_id": o["user_id"],
-            "agent_name": o.get("agent_name") or "—",
-            "full_name": o.get("full_name") or "—",
-            "due_date": due,
-            "currency": o.get("currency") or BASE_CURRENCY,
-            "total": total,
-            "confirmed": confirmed,
-            "pending": pending,
-            "remaining": remaining,
-            "items_count": len(items),
-            "created_at": (o.get("created_at") or "")[:10],
-            "paid_at": (o.get("paid_at") or "")[:16] if o.get("paid_at") else None,
-            "state": state,
-            "is_mine": o["user_id"] == user_id,
-        })
+        result.append(
+            {
+                "id": o["id"],
+                "user_id": o["user_id"],
+                "agent_name": o.get("agent_name") or "—",
+                "full_name": o.get("full_name") or "—",
+                "due_date": due,
+                "currency": o.get("currency") or BASE_CURRENCY,
+                "total": total,
+                "confirmed": confirmed,
+                "pending": pending,
+                "remaining": remaining,
+                "items_count": len(items),
+                "created_at": (o.get("created_at") or "")[:10],
+                "paid_at": (o.get("paid_at") or "")[:16] if o.get("paid_at") else None,
+                "state": state,
+                "is_mine": o["user_id"] == user_id,
+            }
+        )
 
     # Сводка «получено / ожидает» — по сумме payments, а не по orders.
     # Берём ВСЕ payments (включая привязанные к закрытым заказам), потому
     # что money_received = «реально пришло за всё время», а не только по
     # открытым долгам. Менеджер — свои, босс — все.
     summary = await _money_summary(
-        adb, user_id=None if is_boss else user_id,
+        adb,
+        user_id=None if is_boss else user_id,
     )
 
-    return JSONResponse({
-        "debts": result,
-        "role": role,
-        "scope": "company" if is_boss else "personal",
-        "today": today,
-        "money_received": [{"currency": k, "total": v} for k, v in summary["received"].items()],
-        "money_pending":  [{"currency": k, "total": v} for k, v in summary["pending"].items()],
-    })
+    return JSONResponse(
+        {
+            "debts": result,
+            "role": role,
+            "scope": "company" if is_boss else "personal",
+            "today": today,
+            "money_received": [{"currency": k, "total": v} for k, v in summary["received"].items()],
+            "money_pending": [{"currency": k, "total": v} for k, v in summary["pending"].items()],
+        }
+    )
 
 
 async def _money_summary(adb, user_id: int | None) -> dict:
@@ -1587,9 +1623,8 @@ async def api_mark_paid(request: Request):
     if order.get("payment_type") != "credit":
         raise HTTPException(status_code=400, detail="Это не кредитный заказ")
 
-    full_name = (
-        f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
-        or user.get("username", str(user_id))
+    full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
+        "username", str(user_id)
     )
     username = f"@{user['username']}" if user.get("username") else ""
 
@@ -1605,7 +1640,11 @@ async def api_mark_paid(request: Request):
             raise HTTPException(status_code=400, detail="Неверная сумма")
 
     ok, payment_id = await adb.mark_order_paid(
-        order_id, user_id, full_name, amount=amount, username=username,
+        order_id,
+        user_id,
+        full_name,
+        amount=amount,
+        username=username,
     )
     if not ok:
         raise HTTPException(
@@ -1620,7 +1659,9 @@ async def api_mark_paid(request: Request):
 
 
 async def _notify_bosses_payment_pending(
-    order_id: int, manager_name: str, payment_id: int | None,
+    order_id: int,
+    manager_name: str,
+    payment_id: int | None,
 ) -> None:
     """Когда менеджер отметил частичную/полную оплату по credit-заказу —
     шлём push'ы всем boss/admin с кнопками confirm/reject через
@@ -1638,6 +1679,7 @@ async def _notify_bosses_payment_pending(
             return
         summary = await adb.get_order_payment_summary(order_id)
         from config import BASE_CURRENCY
+
         currency = order.get("currency") or BASE_CURRENCY
         agent = order.get("agent_name") or "—"
         due = order.get("due_date") or "—"
@@ -1674,10 +1716,12 @@ async def _notify_bosses_payment_pending(
         # После approve платежа _maybe_close_order_after_payment
         # автоматически проверит, закрылся ли заказ.
         keyboard = {
-            "inline_keyboard": [[
-                {"text": "✅ Принять",   "callback_data": f"pay_ok:{payment_id}"},
-                {"text": "❌ Отклонить", "callback_data": f"pay_no:{payment_id}"},
-            ]]
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Принять", "callback_data": f"pay_ok:{payment_id}"},
+                    {"text": "❌ Отклонить", "callback_data": f"pay_no:{payment_id}"},
+                ]
+            ]
         }
         for uid in await aget_notify_recipients():
             await tg_send_message(uid, text, reply_markup=keyboard)
@@ -1717,17 +1761,15 @@ async def api_confirm_payment(request: Request):
         if cached is not None:
             return JSONResponse(cached)
 
-    full_name = (
-        f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
-        or user.get("username", str(user["id"]))
+    full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
+        "username", str(user["id"])
     )
 
     # Берём список pending до confirm — после атомарного UPDATE мы не
     # знаем, КОГО именно нужно уведомить (только количество). Сохраняем
     # копии payment-dict'ов и шлём уведомления каждому владельцу.
     pending_before = [
-        p for p in await adb.get_payments_for_order(order_id)
-        if p["status"] == "pending"
+        p for p in await adb.get_payments_for_order(order_id) if p["status"] == "pending"
     ]
 
     n = await adb.confirm_all_pending_payments_for_order(order_id, user["id"], full_name)
@@ -1737,6 +1779,7 @@ async def api_confirm_payment(request: Request):
     if n > 0:
         from services.notifier import tg_send_message
         from utils.formatters import format_payment_confirmed
+
         for p in pending_before[:n]:
             try:
                 text = format_payment_confirmed(
@@ -1748,7 +1791,8 @@ async def api_confirm_payment(request: Request):
             except Exception:
                 logger.exception(
                     "Не удалось уведомить менеджера %s о подтверждении платежа #%s",
-                    p.get("user_id"), p.get("id"),
+                    p.get("user_id"),
+                    p.get("id"),
                 )
 
     result = {"ok": True, "confirmed_count": n}
@@ -1777,17 +1821,15 @@ async def api_reject_payment(request: Request):
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="order_id обязателен")
 
-    full_name = (
-        f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
-        or user.get("username", str(user["id"]))
+    full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
+        "username", str(user["id"])
     )
 
     # Аналогично confirm: сохраняем pending до UPDATE, чтобы знать кого
     # уведомить персонально (не только владельцу заказа — у каждого
     # платежа может быть свой user_id).
     pending_before = [
-        p for p in await adb.get_payments_for_order(order_id)
-        if p["status"] == "pending"
+        p for p in await adb.get_payments_for_order(order_id) if p["status"] == "pending"
     ]
 
     n = await adb.reject_all_pending_payments_for_order(order_id, user["id"], full_name)
@@ -1795,6 +1837,7 @@ async def api_reject_payment(request: Request):
     if n > 0:
         from services.notifier import tg_send_message
         from utils.formatters import format_payment_rejected
+
         for p in pending_before[:n]:
             try:
                 text = format_payment_rejected(
@@ -1806,7 +1849,8 @@ async def api_reject_payment(request: Request):
             except Exception:
                 logger.exception(
                     "Не удалось уведомить менеджера %s об отклонении платежа #%s",
-                    p.get("user_id"), p.get("id"),
+                    p.get("user_id"),
+                    p.get("id"),
                 )
 
     return JSONResponse({"ok": True, "rejected_count": n})
@@ -1844,9 +1888,11 @@ async def api_delete_draft(request: Request):
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
+
 async def start_webapp():
     """Запустить FastAPI сервер в фоне."""
     import uvicorn
+
     port = int(os.environ.get("PORT", "8080"))
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)

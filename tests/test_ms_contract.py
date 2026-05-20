@@ -67,19 +67,23 @@ def _prime_ctx(monkeypatch):
     """Минимально достаточный _CTX, как после init_demand_context()."""
     monkeypatch.setitem(ms_demand._CTX, "ready", True)
     monkeypatch.setitem(
-        ms_demand._CTX, "org_meta",
+        ms_demand._CTX,
+        "org_meta",
         {"href": f"{MS_BASE}/entity/organization/ORG", "type": "organization"},
     )
     monkeypatch.setitem(
-        ms_demand._CTX, "store_meta",
+        ms_demand._CTX,
+        "store_meta",
         {"href": f"{MS_BASE}/entity/store/STORE", "type": "store"},
     )
     monkeypatch.setitem(
-        ms_demand._CTX, "attribute_name_meta",
+        ms_demand._CTX,
+        "attribute_name_meta",
         {"href": f"{MS_BASE}/entity/demand/metadata/attributes/ATTR_NAME"},
     )
     monkeypatch.setitem(
-        ms_demand._CTX, "attribute_uid_meta",
+        ms_demand._CTX,
+        "attribute_uid_meta",
         {"href": f"{MS_BASE}/entity/demand/metadata/attributes/ATTR_UID"},
     )
 
@@ -88,23 +92,28 @@ def test_create_demand_builds_correct_payload(monkeypatch):
     _prime_ctx(monkeypatch)
 
     order = {"id": 42, "agent_id": "AGENT-UUID", "comment": "тест"}
-    items = [{
-        "product_name": "Товар",
-        "product_href": f"{MS_BASE}/entity/product/PROD-UUID",
-        "quantity": 3,
-        "price": 150.0,  # мажорные единицы — в payload должно стать 15000
-    }]
+    items = [
+        {
+            "product_name": "Товар",
+            "product_href": f"{MS_BASE}/entity/product/PROD-UUID",
+            "quantity": 3,
+            "price": 150.0,  # мажорные единицы — в payload должно стать 15000
+        }
+    ]
     co_href = f"{MS_BASE}/entity/customerorder/CO-UUID"
 
     captured = {}
 
     async def scenario():
         from services import moysklad
+
         moysklad._session = None
         try:
             with aioresponses() as m:
+
                 def _cb(url, **kwargs):
                     captured["payload"] = kwargs["json"]
+
                 m.post(
                     f"{MS_BASE}/entity/demand",
                     status=200,
@@ -112,7 +121,10 @@ def test_create_demand_builds_correct_payload(monkeypatch):
                     callback=_cb,
                 )
                 return await ms_demand.create_demand_from_request(
-                    order, items, "Менеджер", telegram_user_id=777,
+                    order,
+                    items,
+                    "Менеджер",
+                    telegram_user_id=777,
                     customerorder_href=co_href,
                 )
         finally:
@@ -147,8 +159,6 @@ def test_create_demand_refuses_without_agent(monkeypatch):
     order = {"id": 1, "comment": ""}  # нет agent_id
     items = [{"product_href": f"{MS_BASE}/entity/product/P", "quantity": 1, "price": 1.0}]
 
-    result = asyncio.run(
-        ms_demand.create_demand_from_request(order, items, "M")
-    )
+    result = asyncio.run(ms_demand.create_demand_from_request(order, items, "M"))
     assert result["ok"] is False
     assert "клиент" in result["reason"].lower() or "agent" in result["reason"].lower()

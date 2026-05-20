@@ -46,26 +46,27 @@ def format_audit_log(records: list[dict], label: str) -> list[str]:
 # продолжат работать. Сама реализация теперь в utils.helpers.
 filter_by_period = filter_records_by_period
 
+
 def audit_keyboard():
     kb = InlineKeyboardBuilder()
-    kb.button(text="📅 Сегодня",       callback_data="al:today")
-    kb.button(text="📅 Неделя",        callback_data="al:week")
-    kb.button(text="📅 Месяц",         callback_data="al:month")
-    kb.button(text="📋 Всё время",     callback_data="al:all")
+    kb.button(text="📅 Сегодня", callback_data="al:today")
+    kb.button(text="📅 Неделя", callback_data="al:week")
+    kb.button(text="📅 Месяц", callback_data="al:month")
+    kb.button(text="📋 Всё время", callback_data="al:all")
     kb.button(text="👤 По сотруднику", callback_data="al:by_user")
-    kb.button(text="🏠 Меню",          callback_data="menu")
+    kb.button(text="🏠 Меню", callback_data="menu")
     kb.adjust(2, 2, 1, 1)
     return kb.as_markup()
 
+
 # ─── Команды ─────────────────────────────────────────────────────────────────
+
 
 @router.message(Command("audit"))
 async def cmd_audit(message: Message):
     if not can_manage_users(message.from_user.id):
         return await message.answer("⛔ Нет доступа.")
-    await message.answer(
-        "📋 За какой период показать лог?", reply_markup=audit_keyboard()
-    )
+    await message.answer("📋 За какой период показать лог?", reply_markup=audit_keyboard())
 
 
 # ─── Callback ─────────────────────────────────────────────────────────────────
@@ -90,9 +91,7 @@ async def cb_audit(call: CallbackQuery):
             kb.button(text=f"👤 {name}", callback_data=f"alu:{u['user_id']}")
         kb.button(text="🏠 Меню", callback_data="menu")
         kb.adjust(1)
-        await call.message.answer(
-            "👤 Выберите сотрудника:", reply_markup=kb.as_markup()
-        )
+        await call.message.answer("👤 Выберите сотрудника:", reply_markup=kb.as_markup())
         return
 
     label = PERIOD_LABELS.get(period, period)
@@ -113,9 +112,7 @@ async def cb_audit(call: CallbackQuery):
 @router.callback_query(F.data == "audit_menu")
 async def cb_audit_menu(call: CallbackQuery):
     await call.answer()
-    await call.message.answer(
-        "📋 За какой период показать лог?", reply_markup=audit_keyboard()
-    )
+    await call.message.answer("📋 За какой период показать лог?", reply_markup=audit_keyboard())
 
 
 @router.callback_query(F.data.startswith("alu:"))

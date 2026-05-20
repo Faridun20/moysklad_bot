@@ -11,13 +11,23 @@ from collections.abc import Awaitable, Callable
 from aiogram import Bot, Dispatcher, BaseMiddleware
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    MenuButtonWebApp, MenuButtonDefault, WebAppInfo,
-    Message, CallbackQuery, TelegramObject, User,
+    MenuButtonWebApp,
+    MenuButtonDefault,
+    WebAppInfo,
+    Message,
+    CallbackQuery,
+    TelegramObject,
+    User,
 )
 
 from config import (
-    TELEGRAM_TOKEN, TG_USE_WEBHOOK, TG_WEBHOOK_SECRET, WEBAPP_URL,
-    REDIS_URL, BOT_MODE, ENABLE_SCHEDULED_REPORTS,
+    TELEGRAM_TOKEN,
+    TG_USE_WEBHOOK,
+    TG_WEBHOOK_SECRET,
+    WEBAPP_URL,
+    REDIS_URL,
+    BOT_MODE,
+    ENABLE_SCHEDULED_REPORTS,
 )
 from services.rate_limit import acquire as rate_limit_acquire
 
@@ -74,9 +84,7 @@ class RateLimitMiddleware(BaseMiddleware):
                     )
                 elif isinstance(event, Message):
                     try:
-                        await event.answer(
-                            "⏳ Слишком много сообщений — подождите минуту."
-                        )
+                        await event.answer("⏳ Слишком много сообщений — подождите минуту.")
                     except Exception:
                         pass
                 return
@@ -86,10 +94,19 @@ class RateLimitMiddleware(BaseMiddleware):
 def register_routers(dp: Dispatcher):
     """Подключить все роутеры."""
     from handlers import (
-        start, users, stock, shipments,
-        analytics, payments, reports, audit, log,
-        orders, debts,
+        start,
+        users,
+        stock,
+        shipments,
+        analytics,
+        payments,
+        reports,
+        audit,
+        log,
+        orders,
+        debts,
     )
+
     routers = [
         start.router,
         users.router,
@@ -144,19 +161,24 @@ def start_background_tasks(bot: Bot) -> list[asyncio.Task]:
         # «есть ли cron-сервис» нет, проверяем мягкий heuristic:
         # наличие RAILWAY-окружения + дефолтное значение env.
         import os as _os
-        if _os.environ.get("RAILWAY_ENVIRONMENT") and \
-           _os.environ.get("ENABLE_SCHEDULED_REPORTS") is None:
+
+        if (
+            _os.environ.get("RAILWAY_ENVIRONMENT")
+            and _os.environ.get("ENABLE_SCHEDULED_REPORTS") is None
+        ):
             logger.warning(
                 "ENABLE_SCHEDULED_REPORTS не задан явно в Railway. Если "
                 "у тебя есть отдельные cron-сервисы (cron-daily/weekly/"
                 "monthly) — поставь ENABLE_SCHEDULED_REPORTS=0 чтобы "
                 "отчёты не дублировались."
             )
-        coros.extend([
-            daily_report_task(bot),
-            weekly_report_task(bot),
-            monthly_report_task(bot),
-        ])
+        coros.extend(
+            [
+                daily_report_task(bot),
+                weekly_report_task(bot),
+                monthly_report_task(bot),
+            ]
+        )
     else:
         logger.info(
             "ENABLE_SCHEDULED_REPORTS=0 — отчёты внутри бота отключены, "
@@ -184,6 +206,7 @@ async def _shutdown(tasks: list[asyncio.Task]) -> None:
     if BOT_MODE == "all":
         try:
             from webapp import server as webapp_server
+
             await webapp_server.close_notify_bot()
         except Exception:
             pass
@@ -205,13 +228,15 @@ def _build_fsm_storage():
         return MemoryStorage()
     try:
         from aiogram.fsm.storage.redis import RedisStorage
+
         storage = RedisStorage.from_url(REDIS_URL)
         logger.info("FSM storage: Redis (%s)", REDIS_URL.split("@")[-1])
         return storage
     except Exception as e:
         # Не валим бот из-за проблем с Redis — фолбэк на память.
         logger.warning(
-            "Redis недоступен (%s) — FSM фолбэк на MemoryStorage", e,
+            "Redis недоступен (%s) — FSM фолбэк на MemoryStorage",
+            e,
         )
         return MemoryStorage()
 
@@ -228,11 +253,11 @@ async def _startup_selfcheck():
     logger.info("Старт в режиме BOT_MODE=%s", BOT_MODE or "all")
     if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
         logger.error(
-            "TELEGRAM_TOKEN пуст или не вида '<id>:<secret>' — "
-            "бот и уведомления работать не будут",
+            "TELEGRAM_TOKEN пуст или не вида '<id>:<secret>' — бот и уведомления работать не будут",
         )
     try:
         import services.notifier as notifier
+
         sess = await notifier.get_tg_session()
         base = getattr(sess, "_base_url", None)
         if base is not None and base.path not in ("", "/"):
@@ -245,8 +270,7 @@ async def _startup_selfcheck():
             logger.info("notify self-check: Telegram base_url корректен ✓")
     except Exception:
         logger.exception(
-            "notify self-check провален — уведомления, вероятно, "
-            "не будут отправляться",
+            "notify self-check провален — уведомления, вероятно, не будут отправляться",
         )
 
 
@@ -351,7 +375,8 @@ async def main():
             else:
                 logger.info(
                     "snapshot уже инициализирован: products=%d, stock=%d",
-                    stats.get("ms_products", 0), stats.get("ms_stock", 0),
+                    stats.get("ms_products", 0),
+                    stats.get("ms_stock", 0),
                 )
         except Exception:
             logger.exception("initial snapshot failed")
@@ -414,6 +439,7 @@ async def main():
     webapp_server = None
     if BOT_MODE == "all":
         from webapp import server as webapp_server
+
         bg_tasks.append(asyncio.create_task(webapp_server.start_webapp(), name="webapp"))
 
     # ─── Режим приёма апдейтов ───────────────────────────────────
@@ -421,7 +447,9 @@ async def main():
     # api.telegram.org каждую секунду. Polling: классическая
     # модель, работает без публичного URL.
     use_webhook = (
-        TG_USE_WEBHOOK and TG_WEBHOOK_SECRET and WEBAPP_URL
+        TG_USE_WEBHOOK
+        and TG_WEBHOOK_SECRET
+        and WEBAPP_URL
         and webapp_server is not None  # webhook нуждается в локальном FastAPI
     )
     if TG_USE_WEBHOOK and not use_webhook:

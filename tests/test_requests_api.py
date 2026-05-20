@@ -125,7 +125,8 @@ def test_manager_cannot_approve(client_env, monkeypatch):
 
     # Подменяем верификацию: теперь «заходит» менеджер, не босс
     monkeypatch.setattr(
-        server, "verify_init_data",
+        server,
+        "verify_init_data",
         lambda init_data: {"id": ids["mgr"], "first_name": "Manager"},
     )
     resp = client.post(

@@ -72,7 +72,7 @@ def test_success_after_half_open_fully_closes(clock):
         cb.record_failure()
     clock["t"] += _CircuitBreaker.HALF_OPEN_AFTER + 1
     assert cb.is_open() is False  # half-open
-    cb.record_success()           # пробный удался → полностью закрыт
+    cb.record_success()  # пробный удался → полностью закрыт
     assert cb.is_open() is False
     # И счётчик обнулён — нужен снова полный порог чтобы открыть
     for _ in range(_CircuitBreaker.OPEN_AFTER_FAILS - 1):

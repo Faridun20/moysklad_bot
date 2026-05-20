@@ -34,8 +34,10 @@ import logging
 import sys
 
 from services.database import (
-    _create_tables, _create_indexes,
-    run_migrations, run_backfills,
+    _create_tables,
+    _create_indexes,
+    run_migrations,
+    run_backfills,
 )
 
 logging.basicConfig(

@@ -108,7 +108,9 @@ async def _handle_paymentin_deleted(paymentin_id: str) -> None:
     manager = payment.get("full_name") or "—"
 
     await adb.add_audit_log(
-        0, "МойСклад", "system",
+        0,
+        "МойСклад",
+        "system",
         "ms_paymentin_deleted",
         (
             f"paymentin {paymentin_id} удалён в МойСклад. "
@@ -132,7 +134,8 @@ async def _handle_paymentin_deleted(paymentin_id: str) -> None:
 
     logger.info(
         "paymentin.DELETE %s → платёж #%d сброшен (ms_paymentin_id=NULL)",
-        paymentin_id, payment_id,
+        paymentin_id,
+        payment_id,
     )
 
 
@@ -143,13 +146,16 @@ async def _handle_paymentin_updated(paymentin_id: str) -> None:
         return
 
     await adb.add_audit_log(
-        0, "МойСклад", "system",
+        0,
+        "МойСклад",
+        "system",
         "ms_paymentin_updated",
         f"paymentin {paymentin_id} изменён в МойСклад (платёж #{payment['id']}).",
     )
     logger.info(
         "paymentin.UPDATE %s → платёж #%d (только audit_log)",
-        paymentin_id, payment["id"],
+        paymentin_id,
+        payment["id"],
     )
 
 
@@ -194,7 +200,9 @@ async def _handle_customerorder_updated(co_id: str) -> None:
     order_id = order["id"]
     await adb.update_order_status(order_id, new_status)
     await adb.add_audit_log(
-        0, "МойСклад", "system",
+        0,
+        "МойСклад",
+        "system",
         "ms_order_status_synced",
         (
             f"Заказ #{order_id}: статус {local_status} → {new_status} "
@@ -215,7 +223,11 @@ async def _handle_customerorder_updated(co_id: str) -> None:
 
     logger.info(
         "customerorder.UPDATE %s → заказ #%d: %s → %s (state=%s)",
-        co_id, order_id, local_status, new_status, state_name,
+        co_id,
+        order_id,
+        local_status,
+        new_status,
+        state_name,
     )
 
 
@@ -234,7 +246,9 @@ async def _handle_customerorder_deleted(co_id: str) -> None:
     order_id = order["id"]
     await adb.clear_order_ms_customerorder_id(order_id)
     await adb.add_audit_log(
-        0, "МойСклад", "system",
+        0,
+        "МойСклад",
+        "system",
         "ms_customerorder_deleted",
         (
             f"Заказ покупателя ms_customerorder_id={co_id} удалён в МойСклад. "
@@ -255,5 +269,6 @@ async def _handle_customerorder_deleted(co_id: str) -> None:
 
     logger.info(
         "customerorder.DELETE %s → заказ #%d: ms_customerorder_id сброшен",
-        co_id, order_id,
+        co_id,
+        order_id,
     )

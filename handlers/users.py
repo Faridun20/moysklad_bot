@@ -51,16 +51,12 @@ async def cmd_addrole(message: Message):
     role = parts[2].lower()
     VALID_ROLES = ("admin", "boss", "manager", "guest")
     if role not in VALID_ROLES:
-        return await message.answer(
-            f"❌ Роль должна быть одной из: {', '.join(VALID_ROLES)}"
-        )
+        return await message.answer(f"❌ Роль должна быть одной из: {', '.join(VALID_ROLES)}")
 
     ok = await adb.set_role(target_id, "", "", role)
     if not ok:
         # Сюда можно попасть если БД отвалилась — set_role вернул False.
-        return await message.answer(
-            "❌ Не удалось назначить роль. Проверьте логи бота."
-        )
+        return await message.answer("❌ Не удалось назначить роль. Проверьте логи бота.")
     invalidate_role(target_id)
 
     admin_name = message.from_user.full_name or str(message.from_user.id)
@@ -108,15 +104,12 @@ async def show_users(message):
         role_name = ROLE_NAMES.get(u["role"], u["role"])
         name = u["full_name"] or u["username"] or str(u["user_id"])
         username = f" (@{u['username']})" if u["username"] else ""
-        lines.append(
-            f"{role_name}\n"
-            f"  {name}{username}\n"
-            f"  ID: <code>{u['user_id']}</code>\n"
-        )
+        lines.append(f"{role_name}\n  {name}{username}\n  ID: <code>{u['user_id']}</code>\n")
 
     lines.append("\n<i>Чтобы изменить роль:</i>")
     lines.append("<code>/addrole [ID] [admin/boss/manager/employee]</code>")
     await message.answer("\n".join(lines), parse_mode="HTML")
+
 
 @router.message(Command("syncms"))
 async def cmd_syncms(message: Message):
@@ -127,6 +120,7 @@ async def cmd_syncms(message: Message):
     await message.answer("⏳ Синхронизирую менеджеров с МойСклад…")
 
     from services.ms_sync import sync_all_managers
+
     users = await adb.get_all_users()
     results = await sync_all_managers(users)
 
@@ -149,6 +143,7 @@ async def cmd_msstaff(message: Message):
     await message.answer("⏳ Загружаю сотрудников МойСклад…")
 
     from services.ms_sync import get_ms_employees
+
     try:
         employees = await get_ms_employees()
         if not employees:

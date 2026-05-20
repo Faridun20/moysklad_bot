@@ -31,7 +31,9 @@ import logging
 from typing import Any
 
 from services.database import (
-    get_order, get_payment, set_payment_ms_sync,
+    get_order,
+    get_payment,
+    set_payment_ms_sync,
     claim_payment_for_ms_sync,
 )
 from services.moysklad import MS_BASE, get_session, ms_get, redact_ms_error
@@ -119,6 +121,7 @@ async def create_paymentin_for_payment(payment_id: int) -> dict:
 
     # Контекст МойСклад: организация + meta валюты + (опционально) demand
     from services import ms_demand
+
     if not ms_demand.is_ready():
         msg = "Контекст ms_demand не готов (org не резолвлена)"
         set_payment_ms_sync(payment_id, status="failed", error=msg)
@@ -143,8 +146,7 @@ async def create_paymentin_for_payment(payment_id: int) -> dict:
         "rate": {"currency": {"meta": currency_meta}},
         "applicable": True,
         "description": (
-            f"{payment.get('comment') or ''}\n"
-            f"Менеджер: {payment.get('full_name') or '—'}"
+            f"{payment.get('comment') or ''}\nМенеджер: {payment.get('full_name') or '—'}"
         ).strip(),
     }
 
@@ -178,8 +180,11 @@ async def create_paymentin_for_payment(payment_id: int) -> dict:
             )
             logger.info(
                 "MS paymentin создан: id=%s sum=%s %s (payment #%d, order #%d)",
-                paymentin_id, payment["amount"], currency,
-                payment_id, order["id"],
+                paymentin_id,
+                payment["amount"],
+                currency,
+                payment_id,
+                order["id"],
             )
             return {
                 "ok": True,

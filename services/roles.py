@@ -63,6 +63,7 @@ def is_guest(user_id: int) -> bool:
 
 # ─── Публичные предикаты ─────────────────────────────────────────────────────
 
+
 def is_admin(user_id: int) -> bool:
     return _has_role(user_id, "admin")
 

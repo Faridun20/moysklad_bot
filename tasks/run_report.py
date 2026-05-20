@@ -49,7 +49,10 @@ async def _daily(bot: Bot) -> None:
     """Отчёт за вчерашний полный день."""
     now = utc_now()
     since = (now - timedelta(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0,
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
     )
     until = now.replace(hour=0, minute=0, second=0, microsecond=0)
     prev_since = since - timedelta(days=1)
@@ -57,7 +60,10 @@ async def _daily(bot: Bot) -> None:
     text = "📬 <b>Ежедневный отчёт</b>\n\n"
     text += await build_sales_and_stock_report(
         f"{since.strftime('%d.%m.%Y')}",
-        since, until, prev_since, since,
+        since,
+        until,
+        prev_since,
+        since,
     )
     await send_report(bot, text)
 
@@ -71,7 +77,10 @@ async def _weekly(bot: Bot) -> None:
     text = "📬 <b>Еженедельный отчёт</b>\n\n"
     text += await build_sales_and_stock_report(
         "прошедшая неделя",
-        since, now, prev_since, since,
+        since,
+        now,
+        prev_since,
+        since,
     )
     await send_report(bot, text)
 
@@ -93,7 +102,11 @@ async def _monthly(bot: Bot) -> None:
     label = f"{MONTH_NAMES[first_prev.month]} {first_prev.year}"
     text = f"📬 <b>Ежемесячный отчёт · {label}</b>\n\n"
     text += await build_sales_and_stock_report(
-        label, first_prev, first_this, first_prev_prev, first_prev,
+        label,
+        first_prev,
+        first_this,
+        first_prev_prev,
+        first_prev,
     )
     await send_report(bot, text)
 

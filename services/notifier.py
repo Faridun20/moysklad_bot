@@ -90,7 +90,9 @@ def _note_send_fail(chat_id: int, detail: str) -> None:
         logger.error(
             "tg sendMessage: %d неудач подряд — уведомления, похоже, не "
             "доходят (последняя цель %d: %s)",
-            _send_fail_streak, chat_id, detail,
+            _send_fail_streak,
+            chat_id,
+            detail,
         )
     else:
         logger.warning("tg sendMessage %d failed: %s", chat_id, detail)
@@ -121,19 +123,16 @@ async def tg_send_message(
         payload["reply_markup"] = reply_markup
     try:
         sess = await get_tg_session()
-        async with sess.post(
-            f"/bot{TELEGRAM_TOKEN}/sendMessage", json=payload
-        ) as resp:
+        async with sess.post(f"/bot{TELEGRAM_TOKEN}/sendMessage", json=payload) as resp:
             if resp.status >= 400:
                 body = await resp.text()
-                _note_send_fail(
-                    chat_id, f"HTTP {resp.status}: {_redact_token(body[:200])}"
-                )
+                _note_send_fail(chat_id, f"HTTP {resp.status}: {_redact_token(body[:200])}")
             else:
                 _note_send_ok()
     except Exception as e:
         # repr(e) у aiohttp-ошибок может содержать URL с токеном — редактим.
         _note_send_fail(chat_id, _redact_token(repr(e)))
+
 
 # ─── Получатели уведомлений ───
 def get_notify_recipients() -> list[int]:
@@ -151,7 +150,8 @@ def get_notify_recipients() -> list[int]:
         if recipients:
             logger.info(
                 "notify recipients (DB): %s (boss/admin из %d users)",
-                recipients, len(users),
+                recipients,
+                len(users),
             )
             return recipients
         else:
@@ -206,6 +206,7 @@ async def _gather_limited(coros: list) -> None:
 
 async def send_to_recipients(bot: Bot, text: str, recipients: list[int]):
     """Разослать сообщение списку получателей (параллельно, с лимитом)."""
+
     async def _one(uid: int):
         try:
             await bot.send_message(uid, text, parse_mode="HTML")
@@ -225,14 +226,13 @@ def _is_bot_created(shipment: dict) -> bool:
     marker_names = {"telegram_full_name", "telegram_user_id"}
     try:
         from services.ms_demand import _CTX
+
         marker_names |= {_CTX.get("attribute_name"), _CTX.get("attribute_uid")}
     except Exception:
         pass
     marker_names.discard(None)
     return any(
-        isinstance(a, dict)
-        and a.get("name") in marker_names
-        and a.get("value") not in (None, "")
+        isinstance(a, dict) and a.get("name") in marker_names and a.get("value") not in (None, "")
         for a in attrs
     )
 

@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 import tempfile
+
 _default_db = os.path.join(tempfile.gettempdir(), "payments.db")
 DB_PATH = os.environ.get("DB_PATH", _default_db)
 USE_POSTGRES = bool(DATABASE_URL)
@@ -23,6 +24,7 @@ SQL_SLOW_MS = float(os.environ.get("SQL_SLOW_MS", "200"))
 if USE_POSTGRES:
     from psycopg2 import pool as _pg_pool
     from psycopg2.extras import RealDictCursor
+
     logger.info("Используется PostgreSQL")
 
     # Размер пула. Минимум 1 коннект всегда держим открытым, максимум
@@ -44,11 +46,13 @@ if USE_POSTGRES:
             )
             logger.info(
                 "Postgres pool создан: min=%d, max=%d",
-                _PG_POOL_MIN, _PG_POOL_MAX,
+                _PG_POOL_MIN,
+                _PG_POOL_MAX,
             )
         return _pg_connection_pool
 else:
     import sqlite3
+
     logger.info("Используется SQLite: %s", DB_PATH)
 
 
@@ -63,7 +67,9 @@ class _TimedCursor:
 
     def execute(self, query, params=None):
         if SQL_SLOW_MS <= 0:
-            return self._cur.execute(query, params) if params is not None else self._cur.execute(query)
+            return (
+                self._cur.execute(query, params) if params is not None else self._cur.execute(query)
+            )
         start = time.perf_counter()
         try:
             if params is not None:
@@ -139,6 +145,7 @@ def _invalidate_role_cache(user_id: int) -> None:
     круговой импорт (roles уже зависит от database)."""
     try:
         from services.roles import invalidate_role
+
         invalidate_role(user_id)
     except Exception:
         # Кэш — мягкий, рассинхрон протухнет через TTL за 60 сек.
@@ -190,7 +197,6 @@ def _create_tables():
                 ms_sync_status       TEXT DEFAULT 'pending',
                 created_at           TEXT
             )""",
-
             f"""CREATE TABLE IF NOT EXISTS payments (
                 id              {id_type},
                 user_id         BIGINT NOT NULL,
@@ -207,7 +213,6 @@ def _create_tables():
                 created_at      TEXT NOT NULL,
                 confirmed_at    TEXT
             )""",
-
             f"""CREATE TABLE IF NOT EXISTS audit_log (
                 id         {id_type},
                 user_id    BIGINT NOT NULL,
@@ -217,7 +222,6 @@ def _create_tables():
                 details    TEXT,
                 created_at TEXT NOT NULL
             )""",
-
             f"""CREATE TABLE IF NOT EXISTS orders (
                 id                      {id_type},
                 user_id                 BIGINT NOT NULL,
@@ -238,7 +242,6 @@ def _create_tables():
                 created_at              TEXT NOT NULL,
                 updated_at              TEXT NOT NULL
             )""",
-
             f"""CREATE TABLE IF NOT EXISTS order_items (
                 id           {id_type},
                 order_id     BIGINT NOT NULL,
@@ -249,7 +252,6 @@ def _create_tables():
                 price        REAL DEFAULT 0,
                 note         TEXT
             )""",
-
             f"""CREATE TABLE IF NOT EXISTS shipment_requests (
                 id               {id_type},
                 order_id         BIGINT NOT NULL,
@@ -262,12 +264,10 @@ def _create_tables():
                 created_at       TEXT NOT NULL,
                 approved_at      TEXT
             )""",
-
             # ─── Snapshot МойСклад (локальная копия справочников + остатков) ──
             # Идея: справочники качаем раз в день, остатки — каждые 2 часа
             # как safety-net + точечная инвалидация через вебхуки.
             # Поле ms_id хранит UUID из МойСклад (PRIMARY KEY).
-
             """CREATE TABLE IF NOT EXISTS ms_products (
                 ms_id      TEXT PRIMARY KEY,
                 name       TEXT,
@@ -277,7 +277,6 @@ def _create_tables():
                 href       TEXT,
                 updated_at TEXT
             )""",
-
             """CREATE TABLE IF NOT EXISTS ms_categories (
                 ms_id      TEXT PRIMARY KEY,
                 name       TEXT,
@@ -285,7 +284,6 @@ def _create_tables():
                 href       TEXT,
                 updated_at TEXT
             )""",
-
             """CREATE TABLE IF NOT EXISTS ms_counterparties (
                 ms_id      TEXT PRIMARY KEY,
                 name       TEXT,
@@ -293,14 +291,12 @@ def _create_tables():
                 href       TEXT,
                 updated_at TEXT
             )""",
-
             """CREATE TABLE IF NOT EXISTS ms_employees (
                 ms_id      TEXT PRIMARY KEY,
                 name       TEXT,
                 href       TEXT,
                 updated_at TEXT
             )""",
-
             """CREATE TABLE IF NOT EXISTS ms_stock (
                 ms_id       TEXT PRIMARY KEY,
                 name        TEXT,
@@ -311,7 +307,6 @@ def _create_tables():
                 reserve     REAL DEFAULT 0,
                 updated_at  TEXT
             )""",
-
             """CREATE TABLE IF NOT EXISTS ms_snapshot_meta (
                 dataset           TEXT PRIMARY KEY,
                 last_refresh      TEXT,
@@ -320,7 +315,6 @@ def _create_tables():
                 rows_count        INTEGER DEFAULT 0,
                 status            TEXT
             )""",
-
             # Дедуп уведомлений об отгрузках: и MS-вебхук (webapp-процесс), и
             # поллер (bot-процесс) пишут сюда demand_id перед отправкой. PRIMARY
             # KEY + INSERT-if-absent гарантируют ровно одно уведомление на demand
@@ -366,8 +360,7 @@ def _create_indexes():
             # Фильтры по статусу: get_paid_orders_awaiting_confirmation (orders)
             # и get_pending_requests (shipment_requests) сканируют по status.
             "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
-            "CREATE INDEX IF NOT EXISTS idx_shipment_requests_status "
-            "ON shipment_requests(status)",
+            "CREATE INDEX IF NOT EXISTS idx_shipment_requests_status ON shipment_requests(status)",
         ]
         for sql in snapshot_indexes:
             try:
@@ -449,7 +442,7 @@ def run_migrations():
             # Статус синхронизации с МойСклад: NULL (ещё не пробовали),
             # 'synced', 'failed' (с описанием в ms_sync_error).
             ("payments", "ms_sync_status", "TEXT"),
-            ("payments", "ms_sync_error",  "TEXT"),
+            ("payments", "ms_sync_error", "TEXT"),
         ]
         applied = 0
         for table, column, col_type in migrations:
@@ -526,7 +519,6 @@ def run_backfills():
             logger.warning("Recovery paid_confirmed: %s", e)
 
 
-
 # ─── Роли ────────────────────────────────────────────────────────────────────
 
 
@@ -557,23 +549,29 @@ def set_role(user_id: int, username: str, full_name: str, role: str) -> bool:
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO user_roles (user_id, username, full_name, role, created_at)
                 VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT(user_id) DO UPDATE SET
                     username = EXCLUDED.username,
                     full_name = EXCLUDED.full_name,
                     role = EXCLUDED.role
-            """, (user_id, username, full_name, role, now_str()))
+            """,
+                (user_id, username, full_name, role, now_str()),
+            )
         else:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO user_roles (user_id, username, full_name, role, created_at)
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     username = excluded.username,
                     full_name = excluded.full_name,
                     role = excluded.role
-            """, (user_id, username, full_name, role, now_str()))
+            """,
+                (user_id, username, full_name, role, now_str()),
+            )
         conn.commit()
     _invalidate_role_cache(user_id)
     return True
@@ -645,7 +643,9 @@ def ensure_user(user_id: int, username: str, full_name: str, admin_ids: list[int
             role = "guest"
 
         cur.execute(
-            q("INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, ?, ?, ?)"),
+            q(
+                "INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, ?, ?, ?)"
+            ),
             (user_id, username, full_name, role, now_str()),
         )
         conn.commit()
@@ -657,7 +657,9 @@ def set_moysklad_employee(user_id: int, ms_employee_id: str, status: str = "link
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("UPDATE user_roles SET moysklad_employee_id = ?, ms_sync_status = ? WHERE user_id = ?"),
+            q(
+                "UPDATE user_roles SET moysklad_employee_id = ?, ms_sync_status = ? WHERE user_id = ?"
+            ),
             (ms_employee_id, status, user_id),
         )
         updated = cur.rowcount > 0
@@ -701,7 +703,9 @@ def remove_user(user_id: int, removed_by: int | None = None, removed_name: str =
         _invalidate_role_cache(user_id)
     if deleted and removed_by and target:
         add_audit_log(
-            removed_by, removed_name, get_role(removed_by),
+            removed_by,
+            removed_name,
+            get_role(removed_by),
             "user_removed",
             f"Удалён {target['full_name']} (ID: {user_id}, роль: {target['role']})",
         )
@@ -727,18 +731,24 @@ def add_payment(
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO payments
                     (user_id, username, full_name, amount, currency, comment, status, order_id, created_at)
                 VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s) RETURNING id
-            """, (user_id, username, full_name, amount, currency, comment, order_id, now_str()))
+            """,
+                (user_id, username, full_name, amount, currency, comment, order_id, now_str()),
+            )
             payment_id = cur.fetchone()["id"]
         else:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO payments
                     (user_id, username, full_name, amount, currency, comment, status, order_id, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-            """, (user_id, username, full_name, amount, currency, comment, order_id, now_str()))
+            """,
+                (user_id, username, full_name, amount, currency, comment, order_id, now_str()),
+            )
             payment_id = cur.lastrowid
         conn.commit()
     return payment_id
@@ -769,8 +779,7 @@ def get_payments_for_orders(order_ids: list[int]) -> dict[int, list[dict]]:
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q(f"SELECT * FROM payments WHERE order_id IN ({placeholders}) "
-              f"ORDER BY created_at ASC"),
+            q(f"SELECT * FROM payments WHERE order_id IN ({placeholders}) ORDER BY created_at ASC"),
             unique_ids,
         )
         rows = cur.fetchall()
@@ -791,10 +800,7 @@ def get_order_payment_summary(order_id: int) -> dict:
     if not order:
         return {"total": 0.0, "confirmed": 0.0, "pending": 0.0, "remaining": 0.0}
     items = get_order_items(order_id)
-    total = sum(
-        float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
-        for it in items
-    )
+    total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
     payments = get_payments_for_order(order_id)
     confirmed = sum(p["amount"] for p in payments if p["status"] == "confirmed")
     pending = sum(p["amount"] for p in payments if p["status"] == "pending")
@@ -829,8 +835,7 @@ def mark_shipment_notified(demand_id: str) -> bool:
             )
         else:
             cur.execute(
-                "INSERT OR IGNORE INTO notified_shipments (demand_id, notified_at) "
-                "VALUES (?, ?)",
+                "INSERT OR IGNORE INTO notified_shipments (demand_id, notified_at) VALUES (?, ?)",
                 (demand_id, now_str()),
             )
         inserted = cur.rowcount > 0
@@ -846,6 +851,7 @@ def prune_notified_shipments(older_than_days: int = 30) -> int:
     'YYYY-MM-DD HH:MM:SS' лексикографически сортируется — сравнение строкой ок.
     """
     from datetime import timedelta
+
     cutoff = (datetime.now() - timedelta(days=older_than_days)).strftime("%Y-%m-%d %H:%M:%S")
     with get_conn() as conn:
         cur = get_cursor(conn)
@@ -927,9 +933,9 @@ def get_ms_sync_stats() -> dict:
             "                    AND (ms_sync_status IS NULL OR ms_sync_status != 'failed')) "
             "    AS never_tried "
             "FROM payments"
-            if USE_POSTGRES else
+            if USE_POSTGRES
             # SQLite не поддерживает FILTER — используем SUM(CASE...)
-            "SELECT "
+            else "SELECT "
             "  SUM(CASE WHEN ms_paymentin_id IS NOT NULL THEN 1 ELSE 0 END) AS synced, "
             "  SUM(CASE WHEN ms_sync_status = 'failed' THEN 1 ELSE 0 END) AS failed, "
             "  SUM(CASE WHEN status = 'confirmed' AND order_id IS NOT NULL "
@@ -942,8 +948,8 @@ def get_ms_sync_stats() -> dict:
     if not row:
         return {"synced": 0, "failed": 0, "never_tried": 0}
     return {
-        "synced":      int(row["synced"] or 0) if USE_POSTGRES else int(row[0] or 0),
-        "failed":      int(row["failed"] or 0) if USE_POSTGRES else int(row[1] or 0),
+        "synced": int(row["synced"] or 0) if USE_POSTGRES else int(row[0] or 0),
+        "failed": int(row["failed"] or 0) if USE_POSTGRES else int(row[1] or 0),
         "never_tried": int(row["never_tried"] or 0) if USE_POSTGRES else int(row[2] or 0),
     }
 
@@ -1086,10 +1092,7 @@ def clear_order_ms_customerorder_id(order_id: int) -> bool:
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q(
-                "UPDATE orders SET ms_customerorder_id = NULL, updated_at = ? "
-                "WHERE id = ?"
-            ),
+            q("UPDATE orders SET ms_customerorder_id = NULL, updated_at = ? WHERE id = ?"),
             (now_str(), order_id),
         )
         updated = cur.rowcount > 0
@@ -1129,14 +1132,18 @@ def delete_order(order_id: int, requested_by: int) -> bool:
         conn.commit()
     if deleted:
         add_audit_log(
-            requested_by, "", get_role(requested_by),
+            requested_by,
+            "",
+            get_role(requested_by),
             "order_deleted",
             f"Удалён черновик заказа #{order_id}",
         )
     return deleted
 
 
-def confirm_payment(payment_id: int, confirmed_by: int | None = None, confirmed_name: str = "") -> bool:
+def confirm_payment(
+    payment_id: int, confirmed_by: int | None = None, confirmed_name: str = ""
+) -> bool:
     """Подтвердить платёж. Если платёж привязан к заказу (order_id) —
     проверяем суммарно, не закрыли ли мы тем самым заказ полностью.
     Полностью означает: SUM(amount where status='confirmed') >= order.total.
@@ -1144,7 +1151,9 @@ def confirm_payment(payment_id: int, confirmed_by: int | None = None, confirmed_
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("UPDATE payments SET status = 'confirmed', confirmed_at = ? WHERE id = ? AND status = 'pending'"),
+            q(
+                "UPDATE payments SET status = 'confirmed', confirmed_at = ? WHERE id = ? AND status = 'pending'"
+            ),
             (now_str(), payment_id),
         )
         updated = cur.rowcount > 0
@@ -1154,14 +1163,18 @@ def confirm_payment(payment_id: int, confirmed_by: int | None = None, confirmed_
     payment = get_payment(payment_id)
     if confirmed_by and payment:
         add_audit_log(
-            confirmed_by, confirmed_name, get_role(confirmed_by),
+            confirmed_by,
+            confirmed_name,
+            get_role(confirmed_by),
             "payment_confirmed",
             f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
         )
     # Если платёж был привязан к заказу — проверяем не закрылся ли заказ.
     if payment and payment.get("order_id"):
         _maybe_close_order_after_payment(
-            payment["order_id"], confirmed_by, confirmed_name,
+            payment["order_id"],
+            confirmed_by,
+            confirmed_name,
         )
         # Best-effort: синхронизируем входящий платёж в МойСклад.
         # Делаем fire-and-forget — БД-операция уже коммитнута, ошибка
@@ -1188,6 +1201,7 @@ def _trigger_ms_paymentin_sync(payment_id: int) -> None:
     как сигнал для fallback на asyncio.run.
     """
     import asyncio
+
     try:
         from services.ms_payments import create_paymentin_for_payment
     except Exception:
@@ -1250,9 +1264,7 @@ def _maybe_close_order_after_payment(
         row = cur.fetchone()
         if not row:
             return
-        already_closed = (
-            row["paid_confirmed_at"] if USE_POSTGRES else row[0]
-        ) is not None
+        already_closed = (row["paid_confirmed_at"] if USE_POSTGRES else row[0]) is not None
         if already_closed:
             return
 
@@ -1268,10 +1280,7 @@ def _maybe_close_order_after_payment(
         confirmed_sum = float((r["s"] if USE_POSTGRES else r[0]) or 0)
 
         cur.execute(
-            q(
-                "SELECT COALESCE(SUM(quantity * price), 0) AS t "
-                "FROM order_items WHERE order_id = ?"
-            ),
+            q("SELECT COALESCE(SUM(quantity * price), 0) AS t FROM order_items WHERE order_id = ?"),
             (order_id,),
         )
         r = cur.fetchone()
@@ -1291,8 +1300,12 @@ def _maybe_close_order_after_payment(
                 "WHERE id = ? AND paid_confirmed_at IS NULL"
             ),
             (
-                now_str(), confirmed_by or 0, confirmed_name or "",
-                now_str(), now_str(), order_id,
+                now_str(),
+                confirmed_by or 0,
+                confirmed_name or "",
+                now_str(),
+                now_str(),
+                order_id,
             ),
         )
         closed = cur.rowcount > 0
@@ -1300,7 +1313,8 @@ def _maybe_close_order_after_payment(
 
     if closed:
         add_audit_log(
-            confirmed_by or 0, confirmed_name,
+            confirmed_by or 0,
+            confirmed_name,
             get_role(confirmed_by) if confirmed_by else "",
             "order_fully_paid",
             f"Заказ #{order_id} полностью оплачен "
@@ -1308,7 +1322,9 @@ def _maybe_close_order_after_payment(
         )
 
 
-def reject_payment(payment_id: int, rejected_by: int | None = None, rejected_name: str = "") -> bool:
+def reject_payment(
+    payment_id: int, rejected_by: int | None = None, rejected_name: str = ""
+) -> bool:
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
@@ -1321,7 +1337,9 @@ def reject_payment(payment_id: int, rejected_by: int | None = None, rejected_nam
         payment = get_payment(payment_id)
         if payment:
             add_audit_log(
-                rejected_by, rejected_name, get_role(rejected_by),
+                rejected_by,
+                rejected_name,
+                get_role(rejected_by),
                 "payment_rejected",
                 f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
             )
@@ -1338,7 +1356,9 @@ def archive_payment(payment_id: int, archived_by: int, archived_name: str) -> bo
         payment = get_payment(payment_id)
         if payment:
             add_audit_log(
-                archived_by, archived_name, get_role(archived_by),
+                archived_by,
+                archived_name,
+                get_role(archived_by),
                 "payment_archived",
                 f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
             )
@@ -1397,7 +1417,9 @@ def add_audit_log(user_id, full_name, role, action, details=""):
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("INSERT INTO audit_log (user_id, full_name, role, action, details, created_at) VALUES (?, ?, ?, ?, ?, ?)"),
+            q(
+                "INSERT INTO audit_log (user_id, full_name, role, action, details, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+            ),
             (user_id, full_name, role, action, details, now_str()),
         )
         conn.commit()
@@ -1427,16 +1449,22 @@ def create_order(user_id: int, full_name: str, comment: str = "") -> int:
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO orders (user_id, full_name, status, comment, created_at, updated_at)
                 VALUES (%s, %s, 'draft', %s, %s, %s) RETURNING id
-            """, (user_id, full_name, comment, now_str(), now_str()))
+            """,
+                (user_id, full_name, comment, now_str(), now_str()),
+            )
             order_id = cur.fetchone()["id"]
         else:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO orders (user_id, full_name, status, comment, created_at, updated_at)
                 VALUES (?, ?, 'draft', ?, ?, ?)
-            """, (user_id, full_name, comment, now_str(), now_str()))
+            """,
+                (user_id, full_name, comment, now_str(), now_str()),
+            )
             order_id = cur.lastrowid
         conn.commit()
     return order_id
@@ -1536,10 +1564,7 @@ def set_order_payment(
             )
         else:
             cur.execute(
-                q(
-                    "UPDATE orders SET payment_type = ?, due_date = ?, "
-                    "updated_at = ? WHERE id = ?"
-                ),
+                q("UPDATE orders SET payment_type = ?, due_date = ?, updated_at = ? WHERE id = ?"),
                 (payment_type, due_date, now_str(), order_id),
             )
         updated = cur.rowcount > 0
@@ -1627,10 +1652,7 @@ def mark_order_paid(
         used = float((r["s"] if USE_POSTGRES else r[0]) or 0)
 
         cur.execute(
-            q(
-                "SELECT COALESCE(SUM(quantity * price), 0) AS t "
-                "FROM order_items WHERE order_id = ?"
-            ),
+            q("SELECT COALESCE(SUM(quantity * price), 0) AS t FROM order_items WHERE order_id = ?"),
             (order_id,),
         )
         r = cur.fetchone()
@@ -1653,10 +1675,7 @@ def mark_order_paid(
                 return (False, None)
 
         # INSERT payment в той же транзакции
-        comment = (
-            f"Оплата по заказу #{order_id}"
-            + (f" ({agent_name})" if agent_name else "")
-        )
+        comment = f"Оплата по заказу #{order_id}" + (f" ({agent_name})" if agent_name else "")
         if USE_POSTGRES:
             cur.execute(
                 "INSERT INTO payments "
@@ -1664,8 +1683,16 @@ def mark_order_paid(
                 " status, created_at, order_id) "
                 "VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s) "
                 "RETURNING id",
-                (marked_by, username, marked_by_name, amount, currency,
-                 comment, now_str(), order_id),
+                (
+                    marked_by,
+                    username,
+                    marked_by_name,
+                    amount,
+                    currency,
+                    comment,
+                    now_str(),
+                    order_id,
+                ),
             )
             payment_id = cur.fetchone()["id"]
         else:
@@ -1674,25 +1701,32 @@ def mark_order_paid(
                 "(user_id, username, full_name, amount, currency, comment, "
                 " status, created_at, order_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
-                (marked_by, username, marked_by_name, amount, currency,
-                 comment, now_str(), order_id),
+                (
+                    marked_by,
+                    username,
+                    marked_by_name,
+                    amount,
+                    currency,
+                    comment,
+                    now_str(),
+                    order_id,
+                ),
             )
             payment_id = cur.lastrowid
 
         # paid_at — флаг «менеджер хоть раз отметил». COALESCE сохраняет
         # самое раннее время для последующих частичных платежей.
         cur.execute(
-            q(
-                "UPDATE orders SET paid_at = COALESCE(paid_at, ?), updated_at = ? "
-                "WHERE id = ?"
-            ),
+            q("UPDATE orders SET paid_at = COALESCE(paid_at, ?), updated_at = ? WHERE id = ?"),
             (now_str(), now_str(), order_id),
         )
         conn.commit()
 
     remaining_after = max(0.0, remaining - amount)
     add_audit_log(
-        marked_by, marked_by_name, get_role(marked_by),
+        marked_by,
+        marked_by_name,
+        get_role(marked_by),
         "debt_payment_claimed",
         f"Заказ #{order_id}: менеджер отметил {amount:,.0f} {currency} "
         f"(после подтверждения останется: {remaining_after:,.0f})",
@@ -1770,10 +1804,13 @@ def confirm_payment_received(
             f"Получение денег по заказу #{order_id} подтверждено "
             f"(клиент: {order.get('agent_name') or '—'}, "
             f"менеджер: {order.get('full_name') or '—'})"
-            if order else f"Получение денег по #{order_id} подтверждено"
+            if order
+            else f"Получение денег по #{order_id} подтверждено"
         )
         add_audit_log(
-            confirmed_by, confirmed_by_name, get_role(confirmed_by),
+            confirmed_by,
+            confirmed_by_name,
+            get_role(confirmed_by),
             "payment_confirmed",
             details,
         )
@@ -1811,10 +1848,13 @@ def reject_payment_received(
             f"Подтверждение оплаты #{order_id} отклонено "
             f"(клиент: {order.get('agent_name') or '—'}, "
             f"менеджер: {order.get('full_name') or '—'})"
-            if order else f"Подтверждение #{order_id} отклонено"
+            if order
+            else f"Подтверждение #{order_id} отклонено"
         )
         add_audit_log(
-            rejected_by, rejected_by_name, get_role(rejected_by),
+            rejected_by,
+            rejected_by_name,
+            get_role(rejected_by),
             "payment_rejected_received",
             details,
         )
@@ -1824,10 +1864,7 @@ def reject_payment_received(
 def get_pending_confirmations(user_id: int | None = None) -> list[dict]:
     """Заказы, где менеджер отметил оплату, но босс ещё не подтвердил.
     user_id фильтрует по автору (для менеджера — показать свои)."""
-    query = (
-        "SELECT * FROM orders "
-        "WHERE paid_at IS NOT NULL AND paid_confirmed_at IS NULL"
-    )
+    query = "SELECT * FROM orders WHERE paid_at IS NOT NULL AND paid_confirmed_at IS NULL"
     params: list = []
     if user_id is not None:
         query += " AND user_id = ?"
@@ -1874,8 +1911,11 @@ def get_open_debts(
     if due_through is not None:
         query += " AND due_date IS NOT NULL AND due_date <= ?"
         params.append(due_through)
-    query += " ORDER BY due_date ASC NULLS LAST, id ASC" if USE_POSTGRES \
+    query += (
+        " ORDER BY due_date ASC NULLS LAST, id ASC"
+        if USE_POSTGRES
         else " ORDER BY CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, due_date ASC, id ASC"
+    )
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(q(query), params)
@@ -1938,24 +1978,36 @@ def update_order_status(order_id: int, status: str) -> bool:
     return updated
 
 
-def add_order_item(order_id: int, product_name: str, product_href: str,
-                   quantity: float, unit: str, price: float = 0.0,
-                   note: str = "") -> int:
+def add_order_item(
+    order_id: int,
+    product_name: str,
+    product_href: str,
+    quantity: float,
+    unit: str,
+    price: float = 0.0,
+    note: str = "",
+) -> int:
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO order_items
                     (order_id, product_name, product_href, quantity, unit, price, note)
                 VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
-            """, (order_id, product_name, product_href, quantity, unit, price, note))
+            """,
+                (order_id, product_name, product_href, quantity, unit, price, note),
+            )
             item_id = cur.fetchone()["id"]
         else:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO order_items
                     (order_id, product_name, product_href, quantity, unit, price, note)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (order_id, product_name, product_href, quantity, unit, price, note))
+            """,
+                (order_id, product_name, product_href, quantity, unit, price, note),
+            )
             item_id = cur.lastrowid
         conn.commit()
     return item_id
@@ -2015,16 +2067,22 @@ def create_shipment_request(order_id: int, user_id: int, full_name: str, comment
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO shipment_requests (order_id, user_id, full_name, status, comment, created_at)
                 VALUES (%s, %s, %s, 'pending', %s, %s) RETURNING id
-            """, (order_id, user_id, full_name, comment, now_str()))
+            """,
+                (order_id, user_id, full_name, comment, now_str()),
+            )
             req_id = cur.fetchone()["id"]
         else:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO shipment_requests (order_id, user_id, full_name, status, comment, created_at)
                 VALUES (?, ?, ?, 'pending', ?, ?)
-            """, (order_id, user_id, full_name, comment, now_str()))
+            """,
+                (order_id, user_id, full_name, comment, now_str()),
+            )
             req_id = cur.lastrowid
         conn.commit()
     return req_id
@@ -2041,7 +2099,9 @@ def get_shipment_request(req_id: int) -> dict | None:
 def get_pending_requests() -> list[dict]:
     with get_conn() as conn:
         cur = get_cursor(conn)
-        cur.execute("SELECT * FROM shipment_requests WHERE status = 'pending' ORDER BY created_at DESC")
+        cur.execute(
+            "SELECT * FROM shipment_requests WHERE status = 'pending' ORDER BY created_at DESC"
+        )
         rows = cur.fetchall()
     return [dict(r) for r in rows]
 
@@ -2062,7 +2122,9 @@ def approve_shipment_request(req_id: int, approved_by: int, approved_name: str) 
         if req is not None:
             update_order_status(req["order_id"], "approved")
             add_audit_log(
-                approved_by, approved_name, get_role(approved_by),
+                approved_by,
+                approved_name,
+                get_role(approved_by),
                 "shipment_approved",
                 f"Заявка #{req_id} одобрена (заказ #{req['order_id']} от {req['full_name']})",
             )
@@ -2085,7 +2147,9 @@ def reject_shipment_request(req_id: int, rejected_by: int, rejected_name: str) -
         if req is not None:
             update_order_status(req["order_id"], "rejected")
             add_audit_log(
-                rejected_by, rejected_name, get_role(rejected_by),
+                rejected_by,
+                rejected_name,
+                get_role(rejected_by),
                 "shipment_rejected",
                 f"Заявка #{req_id} отклонена (заказ #{req['order_id']} от {req['full_name']})",
             )
@@ -2098,6 +2162,7 @@ def reject_shipment_request(req_id: int, rejected_by: int, rejected_name: str) -
 def _load_predefined_users():
     try:
         from config import ADMIN_IDS, BOSS_IDS
+
         try:
             MANAGER_IDS = __import__("config").MANAGER_IDS
         except Exception:
@@ -2111,22 +2176,30 @@ def _load_predefined_users():
             cur = get_cursor(conn)
             for u in PREDEFINED_USERS:
                 cur.execute(
-                    q("INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO NOTHING"),
+                    q(
+                        "INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO NOTHING"
+                    ),
                     (u["user_id"], "", u.get("full_name", ""), u["role"], now_str()),
                 )
             for uid in ADMIN_IDS:
                 cur.execute(
-                    q("INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, 'Admin', 'admin', ?) ON CONFLICT(user_id) DO NOTHING"),
+                    q(
+                        "INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, 'Admin', 'admin', ?) ON CONFLICT(user_id) DO NOTHING"
+                    ),
                     (uid, "", now_str()),
                 )
             for uid in BOSS_IDS:
                 cur.execute(
-                    q("INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, 'Boss', 'boss', ?) ON CONFLICT(user_id) DO NOTHING"),
+                    q(
+                        "INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, 'Boss', 'boss', ?) ON CONFLICT(user_id) DO NOTHING"
+                    ),
                     (uid, "", now_str()),
                 )
             for uid in MANAGER_IDS:
                 cur.execute(
-                    q("INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, 'Manager', 'manager', ?) ON CONFLICT(user_id) DO NOTHING"),
+                    q(
+                        "INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, 'Manager', 'manager', ?) ON CONFLICT(user_id) DO NOTHING"
+                    ),
                     (uid, "", now_str()),
                 )
             conn.commit()

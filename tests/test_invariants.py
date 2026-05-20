@@ -54,7 +54,7 @@ def test_debt_equals_total_minus_confirmed(isolated_db):
     s1 = db.get_order_payment_summary(order_id)
     assert s1["confirmed"] == 100.0
     assert s1["remaining"] == 300.0  # total − confirmed
-    assert s1["pending"] == 300.0    # второй ещё ждёт
+    assert s1["pending"] == 300.0  # второй ещё ждёт
 
 
 def test_overpayment_does_not_drive_remaining_negative(isolated_db):

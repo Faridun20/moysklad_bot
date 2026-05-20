@@ -33,9 +33,7 @@ async def _send(bot: Bot, chat_id: int, text: str, **kwargs: Any) -> None:
         logger.warning("notify._send(%s): %s", chat_id, e)
 
 
-async def _broadcast(
-    bot: Bot, text: str, recipients: list[int], **kwargs: Any
-) -> None:
+async def _broadcast(bot: Bot, text: str, recipients: list[int], **kwargs: Any) -> None:
     """Разослать сообщение нескольким получателям."""
     for uid in recipients:
         await _send(bot, uid, text, **kwargs)
@@ -56,7 +54,8 @@ async def notify_shipment_request(
     for uid in recipients:
         try:
             await bot.send_message(
-                uid, notify_text,
+                uid,
+                notify_text,
                 parse_mode="HTML",
                 reply_markup=approve_keyboard,
             )
@@ -120,7 +119,8 @@ async def notify_payment_sent(
     for uid in recipients:
         try:
             await bot.send_message(
-                uid, text,
+                uid,
+                text,
                 parse_mode="HTML",
                 reply_markup=confirm_keyboard,
             )
@@ -133,9 +133,7 @@ async def notify_payment_confirmed(
     payment: dict,
 ) -> None:
     """Уведомить сотрудника о принятом платеже."""
-    text = format_payment_confirmed(
-        payment["amount"], payment["currency"], payment["comment"]
-    )
+    text = format_payment_confirmed(payment["amount"], payment["currency"], payment["comment"])
     await _send(bot, payment["user_id"], text)
 
 
@@ -144,7 +142,5 @@ async def notify_payment_rejected(
     payment: dict,
 ) -> None:
     """Уведомить сотрудника об отклонённом платеже."""
-    text = format_payment_rejected(
-        payment["amount"], payment["currency"], payment["comment"]
-    )
+    text = format_payment_rejected(payment["amount"], payment["currency"], payment["comment"])
     await _send(bot, payment["user_id"], text)

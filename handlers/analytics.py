@@ -15,7 +15,8 @@ from aiogram.types import Message, CallbackQuery
 from services.roles import can_view_analytics, cached_role
 from services.moysklad import get_sales_stats
 from services.database import (
-    get_user_orders, get_order_items_by_ids,
+    get_user_orders,
+    get_order_items_by_ids,
 )
 from utils.formatters import format_sales_report
 from utils.keyboards import analytics_keyboard, analytics_back_keyboard
@@ -29,36 +30,50 @@ def get_period(period: str, now: datetime) -> tuple:
     """Вернуть (since, until, prev_since, prev_until, label) для периода."""
     periods = {
         "week": (
-            now - timedelta(weeks=1), now,
-            now - timedelta(weeks=2), now - timedelta(weeks=1),
+            now - timedelta(weeks=1),
+            now,
+            now - timedelta(weeks=2),
+            now - timedelta(weeks=1),
             "Эта неделя",
         ),
         "month": (
-            now - timedelta(days=30), now,
-            now - timedelta(days=60), now - timedelta(days=30),
+            now - timedelta(days=30),
+            now,
+            now - timedelta(days=60),
+            now - timedelta(days=30),
             "Этот месяц",
         ),
         "3month": (
-            now - timedelta(days=90), now,
-            now - timedelta(days=180), now - timedelta(days=90),
+            now - timedelta(days=90),
+            now,
+            now - timedelta(days=180),
+            now - timedelta(days=90),
             "3 месяца",
         ),
         "6month": (
-            now - timedelta(days=182), now,
-            now - timedelta(days=365), now - timedelta(days=182),
+            now - timedelta(days=182),
+            now,
+            now - timedelta(days=365),
+            now - timedelta(days=182),
             "Полгода",
         ),
         "year": (
-            now - timedelta(days=365), now,
-            now - timedelta(days=730), now - timedelta(days=365),
+            now - timedelta(days=365),
+            now,
+            now - timedelta(days=730),
+            now - timedelta(days=365),
             "Год",
         ),
     }
     return periods.get(
         period,
-        (now - timedelta(days=30), now,
-         now - timedelta(days=60), now - timedelta(days=30),
-         "Месяц"),
+        (
+            now - timedelta(days=30),
+            now,
+            now - timedelta(days=60),
+            now - timedelta(days=30),
+            "Месяц",
+        ),
     )
 
 
@@ -104,21 +119,34 @@ async def cb_analytics_period(call: CallbackQuery, bot: Bot):
 
     if role == "manager":
         await show_manager_analytics(
-            bot, call.message.chat.id,
+            bot,
+            call.message.chat.id,
             call.from_user.id,
-            since, until, prev_since, prev_until, label,
+            since,
+            until,
+            prev_since,
+            prev_until,
+            label,
         )
     else:
         await show_company_analytics(
-            bot, call.message.chat.id,
-            since, until, prev_since, prev_until, label,
+            bot,
+            call.message.chat.id,
+            since,
+            until,
+            prev_since,
+            prev_until,
+            label,
         )
 
 
 async def show_company_analytics(
-    bot: Bot, chat_id: int,
-    since: datetime, until: datetime,
-    prev_since: datetime, prev_until: datetime,
+    bot: Bot,
+    chat_id: int,
+    since: datetime,
+    until: datetime,
+    prev_since: datetime,
+    prev_until: datetime,
     label: str,
 ):
     """Общая аналитика компании для boss/admin."""
@@ -134,7 +162,9 @@ async def show_company_analytics(
         )
         txt = format_sales_report(f"🏢 Компания · {label}", current_stats, prev_stats)
         await bot.send_message(
-            chat_id, txt, parse_mode="HTML",
+            chat_id,
+            txt,
+            parse_mode="HTML",
             reply_markup=analytics_back_keyboard(),
         )
     except RuntimeError as e:
@@ -164,9 +194,7 @@ def _safe_ts(o: dict) -> str:
     return s[:19]
 
 
-def _personal_stats_from_local(
-    user_id: int, since: datetime, until: datetime
-) -> dict:
+def _personal_stats_from_local(user_id: int, since: datetime, until: datetime) -> dict:
     """
     Личные показатели менеджера из локальной БД — суммы и счётчики по
     одобренным/отгруженным заказам в период.
@@ -183,15 +211,18 @@ def _personal_stats_from_local(
     until_iso = until.strftime("%Y-%m-%d %H:%M:%S")
 
     relevant = [
-        o for o in orders
-        if o["status"] in ("approved", "shipped")
-        and since_iso <= _safe_ts(o) <= until_iso
+        o
+        for o in orders
+        if o["status"] in ("approved", "shipped") and since_iso <= _safe_ts(o) <= until_iso
     ]
     logger.info(
         "analytics.bot user=%s total_orders=%d approved=%d relevant=%d period=[%s..%s]",
-        user_id, len(orders),
+        user_id,
+        len(orders),
         sum(1 for o in orders if o["status"] in ("approved", "shipped")),
-        len(relevant), since_iso, until_iso,
+        len(relevant),
+        since_iso,
+        until_iso,
     )
     if not relevant:
         return {"total": 0, "count": 0, "clients": 0, "top_products": []}
@@ -206,8 +237,7 @@ def _personal_stats_from_local(
     for o in relevant:
         items = items_by_order.get(o["id"], [])
         order_sum = sum(
-            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
-            for it in items
+            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items
         )
         total += order_sum
         count += 1
@@ -221,9 +251,7 @@ def _personal_stats_from_local(
             agg["sum"] += qty * price
             agg["qty"] += qty
 
-    top_products = sorted(
-        products_agg.items(), key=lambda kv: kv[1]["sum"], reverse=True
-    )[:5]
+    top_products = sorted(products_agg.items(), key=lambda kv: kv[1]["sum"], reverse=True)[:5]
 
     # Формат совместим с format_sales_report — total в минорных единицах (×100)
     return {
@@ -235,10 +263,13 @@ def _personal_stats_from_local(
 
 
 async def show_manager_analytics(
-    bot: Bot, chat_id: int,
+    bot: Bot,
+    chat_id: int,
     user_id: int,
-    since: datetime, until: datetime,
-    prev_since: datetime, prev_until: datetime,
+    since: datetime,
+    until: datetime,
+    prev_since: datetime,
+    prev_until: datetime,
     label: str,
 ):
     """Персональная аналитика менеджера — из локальной БД.
@@ -266,11 +297,11 @@ async def show_manager_analytics(
                 reply_markup=analytics_back_keyboard(),
             )
 
-        txt = format_sales_report(
-            f"👤 Моя аналитика · {label}", current_stats, prev_stats
-        )
+        txt = format_sales_report(f"👤 Моя аналитика · {label}", current_stats, prev_stats)
         await bot.send_message(
-            chat_id, txt, parse_mode="HTML",
+            chat_id,
+            txt,
+            parse_mode="HTML",
             reply_markup=analytics_back_keyboard(),
         )
     except Exception as e:

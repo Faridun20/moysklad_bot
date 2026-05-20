@@ -23,8 +23,11 @@ from datetime import date
 
 from config import BASE_CURRENCY
 from services.database import (
-    init_db, get_open_debts, get_order_items_by_ids,
-    get_payments_for_orders, get_all_users,
+    init_db,
+    get_open_debts,
+    get_order_items_by_ids,
+    get_payments_for_orders,
+    get_all_users,
 )
 from services.moysklad import close_session
 from services.notifier import tg_send_message, close_tg_session
@@ -50,24 +53,19 @@ def _to_ru(iso: str) -> str:
     return f"{d}.{m}.{y}"
 
 
-def _format_message(debts: list[dict], items_by_order: dict, today_str: str,
-                    is_boss_view: bool) -> str:
+def _format_message(
+    debts: list[dict], items_by_order: dict, today_str: str, is_boss_view: bool
+) -> str:
     """Свёрнутое сообщение про долги для одного получателя."""
     overdue = [d for d in debts if d.get("due_date") and d["due_date"] < today_str]
     today = [d for d in debts if d.get("due_date") == today_str]
 
     def _row(d: dict) -> str:
         items = items_by_order.get(d["id"], [])
-        total = sum(
-            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
-            for it in items
-        )
+        total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
         currency = d.get("currency") or BASE_CURRENCY
         agent = _esc(d.get("agent_name") or "—")
-        owner_part = (
-            f" — {_esc(d.get('full_name') or '—')}"
-            if is_boss_view else ""
-        )
+        owner_part = f" — {_esc(d.get('full_name') or '—')}" if is_boss_view else ""
         due_human = _to_ru(d.get("due_date") or "")
         return (
             f"  • #{d['id']} · {agent} · "
@@ -116,14 +114,9 @@ async def main() -> int:
     payments_by_order = get_payments_for_orders(debt_ids)
 
     def _has_pending(order_id):
-        return any(
-            p["status"] == "pending"
-            for p in payments_by_order.get(order_id, [])
-        )
+        return any(p["status"] == "pending" for p in payments_by_order.get(order_id, []))
 
-    all_debts_for_managers = [
-        d for d in all_debts_full if not _has_pending(d["id"])
-    ]
+    all_debts_for_managers = [d for d in all_debts_full if not _has_pending(d["id"])]
     all_debts_for_bosses = all_debts_full
 
     # Группируем по user_id (менеджеру-владельцу заказа)
@@ -150,7 +143,9 @@ async def main() -> int:
             sent += 1
 
         # 2. Boss/admin — сводка по всей компании (включая awaiting confirmation)
-        boss_text = _format_message(all_debts_for_bosses, items_by_order, today_str, is_boss_view=True)
+        boss_text = _format_message(
+            all_debts_for_bosses, items_by_order, today_str, is_boss_view=True
+        )
         # Дополним подсказкой про подтверждения, если они есть
         awaiting_count = sum(1 for d in all_debts_for_bosses if _has_pending(d["id"]))
         if awaiting_count:
@@ -164,7 +159,9 @@ async def main() -> int:
 
         logger.info(
             "debts_notify: отправлено %d сообщений (для менеджеров: %d, для боссов: %d)",
-            sent, len(all_debts_for_managers), len(all_debts_for_bosses),
+            sent,
+            len(all_debts_for_managers),
+            len(all_debts_for_bosses),
         )
         return 0
     except Exception:

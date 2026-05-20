@@ -42,9 +42,7 @@ def is_allowed(user_id: int) -> bool:
 async def cmd_shipments(message: Message):
     if not is_allowed(message.from_user.id):
         return
-    await message.answer(
-        "📅 За какой период показать отгрузки?", reply_markup=period_keyboard()
-    )
+    await message.answer("📅 За какой период показать отгрузки?", reply_markup=period_keyboard())
 
 
 # ─── Callback ─────────────────────────────────────────────────────────────────
@@ -71,9 +69,7 @@ async def cb_shipments_period(call: CallbackQuery, bot: Bot):
         since = now.replace(hour=0, minute=0, second=0, microsecond=0)
         until, label = None, "сегодня"
     elif period == "yesterday":
-        since = (now - timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        since = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         until = now.replace(hour=0, minute=0, second=0, microsecond=0)
         label = "вчера"
     elif period == "7d":
@@ -161,9 +157,7 @@ async def show_shipments(
             await bot.send_message(chat_id, txt, parse_mode="HTML")
 
         kb = shipments_nav_keyboard(page, total_pages)
-        await bot.send_message(
-            chat_id, f"Стр. {page + 1} из {total_pages}", reply_markup=kb
-        )
+        await bot.send_message(chat_id, f"Стр. {page + 1} из {total_pages}", reply_markup=kb)
 
     except Exception as e:
         await bot.send_message(chat_id, user_safe_error(e, "shipments_list"))

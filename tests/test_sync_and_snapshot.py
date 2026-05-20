@@ -37,8 +37,14 @@ def test_handle_ms_events_routes_by_type_and_action(monkeypatch):
     events = [
         {"action": "DELETE", "meta": {"type": "paymentin", "href": f"{_BASE}/paymentin/P1"}},
         {"action": "UPDATE", "meta": {"type": "paymentin", "href": f"{_BASE}/paymentin/P2"}},
-        {"action": "UPDATE", "meta": {"type": "customerorder", "href": f"{_BASE}/customerorder/C1"}},
-        {"action": "DELETE", "meta": {"type": "customerorder", "href": f"{_BASE}/customerorder/C2"}},
+        {
+            "action": "UPDATE",
+            "meta": {"type": "customerorder", "href": f"{_BASE}/customerorder/C1"},
+        },
+        {
+            "action": "DELETE",
+            "meta": {"type": "customerorder", "href": f"{_BASE}/customerorder/C2"},
+        },
         # Не обрабатываемые — должны игнорироваться:
         {"action": "CREATE", "meta": {"type": "demand", "href": f"{_BASE}/demand/D1"}},
         {"action": "CREATE", "meta": {"type": "paymentin", "href": f"{_BASE}/paymentin/P3"}},

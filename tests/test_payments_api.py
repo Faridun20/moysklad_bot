@@ -47,7 +47,8 @@ def pay_env(isolated_db, monkeypatch):
 
     monkeypatch.setattr(notifier, "tg_send_message", _fake_send)
     monkeypatch.setattr(
-        server, "verify_init_data",
+        server,
+        "verify_init_data",
         lambda init_data: {"id": int(init_data), "first_name": "Boss"},
     )
 
@@ -118,7 +119,8 @@ def test_manager_cannot_confirm_payment(pay_env, monkeypatch):
     import webapp.server as server
 
     monkeypatch.setattr(
-        server, "verify_init_data",
+        server,
+        "verify_init_data",
         lambda init_data: {"id": ids["mgr"], "first_name": "Manager"},
     )
     resp = client.post(
@@ -158,15 +160,23 @@ def paid_env(isolated_db, monkeypatch):
     # payment_type='paid' по умолчанию; явно одобряем заказ
     db.update_order_status(order_id, "approved")
     # Авто-платёж, который создаётся при одобрении paid-заказа
-    db.add_payment(mgr_id, "", "Manager", 300.0, "USD",
-                   "Оплата по заказу (отгрузка одобрена)", order_id=order_id)
+    db.add_payment(
+        mgr_id,
+        "",
+        "Manager",
+        300.0,
+        "USD",
+        "Оплата по заказу (отгрузка одобрена)",
+        order_id=order_id,
+    )
 
     async def _fake_send(chat_id, text, **kwargs):
         pass
 
     monkeypatch.setattr(notifier, "tg_send_message", _fake_send)
     monkeypatch.setattr(
-        server, "verify_init_data",
+        server,
+        "verify_init_data",
         lambda init_data: {"id": int(init_data), "first_name": "U"},
     )
 
@@ -178,7 +188,8 @@ def paid_env(isolated_db, monkeypatch):
 def test_pending_lists_paid_order_for_boss(paid_env):
     client, db, ids = paid_env
     resp = client.post(
-        "/api/payments/pending", json={"initData": str(ids["boss"])},
+        "/api/payments/pending",
+        json={"initData": str(ids["boss"])},
     )
     assert resp.status_code == 200, resp.text
     pending = resp.json()["pending"]
@@ -194,7 +205,8 @@ def test_pending_forbidden_for_manager(paid_env, monkeypatch):
     import webapp.server as server
 
     monkeypatch.setattr(
-        server, "verify_init_data",
+        server,
+        "verify_init_data",
         lambda init_data: {"id": ids["mgr"], "first_name": "Manager"},
     )
     resp = client.post("/api/payments/pending", json={"initData": "x"})
@@ -213,7 +225,8 @@ def test_pending_clears_after_confirm(paid_env):
     assert ok.json()["confirmed_count"] == 1
 
     resp = client.post(
-        "/api/payments/pending", json={"initData": str(ids["boss"])},
+        "/api/payments/pending",
+        json={"initData": str(ids["boss"])},
     )
     assert resp.status_code == 200
     assert resp.json()["pending"] == []

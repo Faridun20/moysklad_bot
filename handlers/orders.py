@@ -26,6 +26,7 @@ def _cur(amount: float, currency: str | None = None) -> str:
     дефолт из BASE_CURRENCY (для обратной совместимости старых вызовов)."""
     return f"{_fmt_num(amount)} {currency or _BASE_CURRENCY}"
 
+
 from aiogram import Bot, Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
@@ -47,29 +48,29 @@ router = Router()
 
 
 class OrderState(StatesGroup):
-    choosing_product  = State()  # выбор товара
+    choosing_product = State()  # выбор товара
     entering_quantity = State()  # ввод количества
-    entering_price    = State()  # ввод цены за единицу
-    choosing_agent    = State()  # выбор клиента
+    entering_price = State()  # ввод цены за единицу
+    choosing_agent = State()  # выбор клиента
 
 
 # ─── Форматирование ───────────────────────────────────────────────────────────
 
 
 STATUS_EMOJI = {
-    "draft":    "📝",
-    "pending":  "⏳",
+    "draft": "📝",
+    "pending": "⏳",
     "approved": "✅",
     "rejected": "❌",
-    "shipped":  "🚚",
+    "shipped": "🚚",
 }
 
 STATUS_NAME = {
-    "draft":    "Черновик",
-    "pending":  "На рассмотрении",
+    "draft": "Черновик",
+    "pending": "На рассмотрении",
     "approved": "Одобрено",
     "rejected": "Отклонено",
-    "shipped":  "Отгружено",
+    "shipped": "Отгружено",
 }
 
 
@@ -86,13 +87,12 @@ def _fmt_num(n: float) -> str:
 
 def format_order(order: dict, items: list[dict]) -> str:
     status_emoji = STATUS_EMOJI.get(order["status"], "📋")
-    status_name  = STATUS_NAME.get(order["status"], order["status"])
-    agent_str    = (
-        f"\n👤 Клиент: <b>{_esc(order['agent_name'])}</b>"
-        if order.get("agent_name") else ""
+    status_name = STATUS_NAME.get(order["status"], order["status"])
+    agent_str = (
+        f"\n👤 Клиент: <b>{_esc(order['agent_name'])}</b>" if order.get("agent_name") else ""
     )
-    comment_str  = f"\n📝 {_esc(order['comment'])}" if order.get("comment") else ""
-    currency     = order.get("currency") or _BASE_CURRENCY
+    comment_str = f"\n📝 {_esc(order['comment'])}" if order.get("comment") else ""
+    currency = order.get("currency") or _BASE_CURRENCY
 
     lines = [
         DIV,
@@ -118,9 +118,7 @@ def format_order(order: dict, items: list[dict]) -> str:
                 )
             else:
                 price_str = f"     <code>{_fmt_num(qty)} {unit}</code>"
-            lines.append(
-                f"  {i+1}. <b>{_esc(item['product_name'])}</b>\n{price_str}{note_str}"
-            )
+            lines.append(f"  {i + 1}. <b>{_esc(item['product_name'])}</b>\n{price_str}{note_str}")
         if total_items > 10:
             lines.append(f"  <i>...и ещё {total_items - 10} позиций</i>")
 
@@ -150,24 +148,17 @@ def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
                 f"× {_cur(price, currency)} = <b>{_cur(sub, currency)}</b>"
             )
         else:
-            lines.append(
-                f"  • {name}: {_fmt_num(qty)} {unit} "
-                f"<i>(цена не указана)</i>"
-            )
+            lines.append(f"  • {name}: {_fmt_num(qty)} {unit} <i>(цена не указана)</i>")
     items_text = "\n".join(lines)
     grand_total = sum(_line_total(it) for it in items)
     if len(items) > 10:
         items_text += f"\n  ...и ещё {len(items) - 10} поз."
 
     agent_str = (
-        f"\n👤 Клиент: <b>{_esc(order['agent_name'])}</b>"
-        if order.get("agent_name") else ""
+        f"\n👤 Клиент: <b>{_esc(order['agent_name'])}</b>" if order.get("agent_name") else ""
     )
     comment_str = f"\n📝 {_esc(order['comment'])}" if order.get("comment") else ""
-    total_str = (
-        f"\n\n<b>💰 Итого: {_cur(grand_total, currency)}</b>"
-        if grand_total > 0 else ""
-    )
+    total_str = f"\n\n<b>💰 Итого: {_cur(grand_total, currency)}</b>" if grand_total > 0 else ""
 
     # Тип оплаты: для credit'а явно показываем дату возврата,
     # чтобы босс ещё на этапе апрува видел условия и решал,
@@ -197,11 +188,11 @@ def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
 def order_actions_keyboard(order_id: int, status: str, is_owner: bool):
     kb = InlineKeyboardBuilder()
     if status == "draft" and is_owner:
-        kb.button(text="➕ Добавить товар",  callback_data=f"ord_add:{order_id}")
+        kb.button(text="➕ Добавить товар", callback_data=f"ord_add:{order_id}")
         kb.button(text="👤 Выбрать клиента", callback_data=f"ord_agent:{order_id}")
-        kb.button(text="💱 Валюта",          callback_data=f"ord_cur:{order_id}")
+        kb.button(text="💱 Валюта", callback_data=f"ord_cur:{order_id}")
         kb.button(text="🚀 Отправить заявку", callback_data=f"ord_submit:{order_id}")
-        kb.button(text="🗑 Удалить заказ",   callback_data=f"ord_delete:{order_id}")
+        kb.button(text="🗑 Удалить заказ", callback_data=f"ord_delete:{order_id}")
     kb.button(text="🏠 Меню", callback_data="menu")
     kb.adjust(1)
     return kb.as_markup()
@@ -227,8 +218,8 @@ def currency_picker_keyboard(order_id: int):
 
 def request_approve_keyboard(req_id: int):
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Одобрить",   callback_data=f"req_ok:{req_id}")
-    kb.button(text="❌ Отклонить",  callback_data=f"req_no:{req_id}")
+    kb.button(text="✅ Одобрить", callback_data=f"req_ok:{req_id}")
+    kb.button(text="❌ Отклонить", callback_data=f"req_no:{req_id}")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -242,7 +233,7 @@ def my_orders_keyboard(orders: list[dict]):
             callback_data=f"ord_view:{o['id']}",
         )
     kb.button(text="➕ Новый заказ", callback_data="ord_new")
-    kb.button(text="🏠 Меню",        callback_data="menu")
+    kb.button(text="🏠 Меню", callback_data="menu")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -331,9 +322,7 @@ async def cmd_orders(message: Message):
 
     orders_by_id = await adb.get_orders_by_ids([r["order_id"] for r in requests[:10]])
     await message.answer(
-        f"{DIV}\n"
-        f"⏳ <b>Заявки на отгрузку</b>\n"
-        f"<code>Ожидают рассмотрения: {len(requests)}</code>",
+        f"{DIV}\n⏳ <b>Заявки на отгрузку</b>\n<code>Ожидают рассмотрения: {len(requests)}</code>",
         parse_mode="HTML",
         reply_markup=pending_requests_keyboard(requests, orders_by_id),
     )
@@ -439,8 +428,7 @@ async def cb_cat_pick(call: CallbackQuery, state: FSMContext):
 
         if cat_id != "all":
             filtered = [
-                r for r in all_stock
-                if extract_id_from_href(extract_href(r, "folder")) == cat_id
+                r for r in all_stock if extract_id_from_href(extract_href(r, "folder")) == cat_id
             ]
         else:
             filtered = all_stock
@@ -468,12 +456,15 @@ async def cb_cat_pick(call: CallbackQuery, state: FSMContext):
         # Сохраняем список товаров в state
         await state.update_data(
             order_id=order_id,
-            products=[{
-                "name": r.get("name", "—"),
-                "href": extract_href(r),
-                "unit": safe_get(r, "uom", "name", default="шт"),
-                "stock": r.get("stock", 0),
-            } for r in head]
+            products=[
+                {
+                    "name": r.get("name", "—"),
+                    "href": extract_href(r),
+                    "unit": safe_get(r, "uom", "name", default="шт"),
+                    "stock": r.get("stock", 0),
+                }
+                for r in head
+            ],
         )
         await state.set_state(OrderState.choosing_product)
 
@@ -525,8 +516,7 @@ async def process_quantity(message: Message, state: FSMContext):
     if not data.get("selected_product") or not data.get("order_id"):
         await state.clear()
         return await message.answer(
-            "⚠️ Сессия сброшена (возможно, бот перезагружался). "
-            "Откройте заказ снова: /myorders",
+            "⚠️ Сессия сброшена (возможно, бот перезагружался). Откройте заказ снова: /myorders",
         )
     product = data["selected_product"]
     order_id = data["order_id"]
@@ -562,8 +552,7 @@ async def process_price(message: Message, state: FSMContext):
     if not data.get("order_id") or not data.get("selected_product"):
         await state.clear()
         return await message.answer(
-            "⚠️ Сессия сброшена (возможно, бот перезагружался). "
-            "Откройте заказ снова: /myorders",
+            "⚠️ Сессия сброшена (возможно, бот перезагружался). Откройте заказ снова: /myorders",
         )
     order_id = data["order_id"]
     product = data["selected_product"]
@@ -591,8 +580,11 @@ async def process_price(message: Message, state: FSMContext):
     full_name = message.from_user.full_name or str(message.from_user.id)
     role = await adb.get_role(message.from_user.id)
     await adb.add_audit_log(
-        message.from_user.id, full_name, role,
-        "order_item_added", f"Заказ #{order_id}: {product['name']} × {qty} @ {price}",
+        message.from_user.id,
+        full_name,
+        role,
+        "order_item_added",
+        f"Заказ #{order_id}: {product['name']} × {qty} @ {price}",
     )
     await message.answer(
         f"✅ Добавлено: <b>{_esc(product['name'])}</b>\n"
@@ -664,6 +656,7 @@ async def cb_choose_agent(call: CallbackQuery, state: FSMContext):
     try:
         # Сначала пробуем snapshot — мгновенно, без удара по МойСклад API
         from services import snapshot
+
         snap_rows = snapshot.get_counterparties(limit=50)
         if snap_rows:
             agents = [
@@ -695,10 +688,13 @@ async def cb_choose_agent(call: CallbackQuery, state: FSMContext):
         # извлекаем из meta.href (live API fallback).
         await state.update_data(
             order_id=order_id,
-            agents=[{
-                "id": a.get("id") or extract_id_from_href(extract_href(a)),
-                "name": a.get("name", "—"),
-            } for a in agents[:20]]
+            agents=[
+                {
+                    "id": a.get("id") or extract_id_from_href(extract_href(a)),
+                    "name": a.get("name", "—"),
+                }
+                for a in agents[:20]
+            ],
         )
         await state.set_state(OrderState.choosing_agent)
 
@@ -761,14 +757,12 @@ async def cb_submit_order(call: CallbackQuery, state: FSMContext, bot: Bot):
     items = await adb.get_order_items(order_id)
     if not items:
         return await call.message.answer(
-            "❌ Нельзя отправить пустой заказ.\n"
-            "Сначала добавьте товары."
+            "❌ Нельзя отправить пустой заказ.\nСначала добавьте товары."
         )
 
     if not order.get("agent_name"):
         return await call.message.answer(
-            "❌ Нельзя отправить заявку без клиента.\n"
-            "Нажмите «👤 Выбрать клиента»."
+            "❌ Нельзя отправить заявку без клиента.\nНажмите «👤 Выбрать клиента»."
         )
 
     # Создаём заявку
@@ -781,8 +775,11 @@ async def cb_submit_order(call: CallbackQuery, state: FSMContext, bot: Bot):
     await asyncio.gather(
         adb.update_order_status(order_id, "pending"),
         adb.add_audit_log(
-            user.id, full_name, role,
-            "shipment_request_sent", f"Отправлена заявка #{req_id} (заказ #{order_id})",
+            user.id,
+            full_name,
+            role,
+            "shipment_request_sent",
+            f"Отправлена заявка #{req_id} (заказ #{order_id})",
         ),
     )
 
@@ -796,9 +793,12 @@ async def cb_submit_order(call: CallbackQuery, state: FSMContext, bot: Bot):
 
     # Уведомляем руководителей
     from services.notify import notify_shipment_request
+
     notify_text = format_request_notify(order, items, req_id)
     await notify_shipment_request(
-        bot, notify_text, req_id,
+        bot,
+        notify_text,
+        req_id,
         approve_keyboard=request_approve_keyboard(req_id),
     )
 
@@ -842,8 +842,11 @@ async def cb_delete_order_yes(call: CallbackQuery):
         adb.update_order_status(order_id, "rejected"),
     )
     await adb.add_audit_log(
-        call.from_user.id, full_name, role,
-        "order_deleted", f"Удалён черновик заказа #{order_id}",
+        call.from_user.id,
+        full_name,
+        role,
+        "order_deleted",
+        f"Удалён черновик заказа #{order_id}",
     )
 
     await call.message.answer(f"🗑 Заказ #{order_id} удалён.")
@@ -871,8 +874,9 @@ async def cb_view_request(call: CallbackQuery):
     txt = format_request_notify(order, items, req_id)
 
     if req["status"] == "pending":
-        await call.message.answer(txt, parse_mode="HTML",
-                                  reply_markup=request_approve_keyboard(req_id))
+        await call.message.answer(
+            txt, parse_mode="HTML", reply_markup=request_approve_keyboard(req_id)
+        )
     else:
         status_str = "✅ Одобрено" if req["status"] == "approved" else "❌ Отклонено"
         await call.message.answer(
@@ -895,6 +899,7 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
     # Вся логика (DB, МойСклад, уведомления, PDF, авто-payment) — в сервисе.
     # Здесь только Telegram-UI: ответ на callback + редактирование сообщения.
     from services.order_workflow import approve_shipment_request
+
     result = await approve_shipment_request(req_id, call.from_user.id, boss_name, bot)
 
     if not result["ok"]:
@@ -917,6 +922,7 @@ async def cb_reject_request(call: CallbackQuery, bot: Bot):
     boss_name = call.from_user.full_name or str(call.from_user.id)
 
     from services.order_workflow import reject_shipment_request
+
     result = await reject_shipment_request(req_id, call.from_user.id, boss_name, bot)
 
     if not result["ok"]:

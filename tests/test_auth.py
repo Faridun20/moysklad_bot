@@ -31,9 +31,7 @@ def _make_init_data(token: str, user: dict, auth_date: int | None = None) -> str
         "user": json.dumps(user, separators=(",", ":")),
         "query_id": "AAH-test",
     }
-    data_check_string = "\n".join(
-        f"{k}={v}" for k, v in sorted(fields.items())
-    )
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
     secret_key = hmac.new(
         key=b"WebAppData",
         msg=token.encode(),
@@ -56,6 +54,7 @@ def _reload_auth(monkeypatch):
     import importlib
     import config
     import webapp.auth as auth
+
     importlib.reload(config)
     importlib.reload(auth)
     return auth
@@ -76,7 +75,7 @@ def test_invalid_signature_rejected(monkeypatch):
     user = {"id": 12345}
     init_data = _make_init_data(FAKE_TOKEN, user)
     # Портим hash — даже один символ должен отвергаться
-    broken = init_data.replace("hash=", "hash=00")[:len(init_data)]
+    broken = init_data.replace("hash=", "hash=00")[: len(init_data)]
     result = auth.verify_init_data(broken)
     assert result is None
 
@@ -121,10 +120,14 @@ def test_malformed_user_json_rejected(monkeypatch):
     fields = {"auth_date": auth_date, "user": bad_user}
     data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
     secret_key = hmac.new(
-        b"WebAppData", FAKE_TOKEN.encode(), hashlib.sha256,
+        b"WebAppData",
+        FAKE_TOKEN.encode(),
+        hashlib.sha256,
     ).digest()
     real_hash = hmac.new(
-        secret_key, data_check_string.encode(), hashlib.sha256,
+        secret_key,
+        data_check_string.encode(),
+        hashlib.sha256,
     ).hexdigest()
     fields["hash"] = real_hash
     init_data = urlencode(fields)

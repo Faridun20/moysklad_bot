@@ -25,12 +25,12 @@ router = Router()
 
 def log_keyboard():
     kb = InlineKeyboardBuilder()
-    kb.button(text="🕐 Последние 20",   callback_data="log:20")
-    kb.button(text="📅 Сегодня",        callback_data="log:today")
-    kb.button(text="📅 Неделя",         callback_data="log:week")
-    kb.button(text="👤 По сотруднику",  callback_data="log:user")
+    kb.button(text="🕐 Последние 20", callback_data="log:20")
+    kb.button(text="📅 Сегодня", callback_data="log:today")
+    kb.button(text="📅 Неделя", callback_data="log:week")
+    kb.button(text="👤 По сотруднику", callback_data="log:user")
     kb.button(text="💵 Только платежи", callback_data="log:payments")
-    kb.button(text="🏠 Меню",           callback_data="menu")
+    kb.button(text="🏠 Меню", callback_data="menu")
     kb.adjust(2, 2, 1, 1)
     return kb.as_markup()
 
@@ -122,6 +122,6 @@ async def send_log(message, records: list[dict], label: str):
 
     kb = InlineKeyboardBuilder()
     kb.button(text="📋 Другой фильтр", callback_data="log:menu")
-    kb.button(text="🏠 Меню",          callback_data="menu")
+    kb.button(text="🏠 Меню", callback_data="menu")
     kb.adjust(1)
     await message.answer("Выберите действие:", reply_markup=kb.as_markup())

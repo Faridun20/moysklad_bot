@@ -19,6 +19,8 @@ def _can_send_payment(user_id: int) -> bool:
     """Кто может ОТПРАВИТЬ платёж на одобрение: manager (и admin для теста).
     Босс эти платежи апрувит — отправлять ему нечего."""
     return _has_role(user_id, "admin", "manager")
+
+
 from utils.formatters import (
     format_payments_report,
     DIV,
@@ -78,9 +80,7 @@ def pay_report_keyboard():
 @router.message(Command("pay"))
 async def cmd_pay(message: Message, state: FSMContext):
     if not _can_send_payment(message.from_user.id):
-        return await message.answer(
-            "⛔ Платежи отправляют только менеджеры."
-        )
+        return await message.answer("⛔ Платежи отправляют только менеджеры.")
     await state.clear()
     await state.set_state(PaymentState.waiting_for_amount)
     await message.answer(
@@ -95,9 +95,7 @@ async def cmd_pay(message: Message, state: FSMContext):
 @router.callback_query(F.data == "pay_start")
 async def cb_pay_start(call: CallbackQuery, state: FSMContext):
     if not _can_send_payment(call.from_user.id):
-        return await call.answer(
-            "⛔ Платежи отправляют только менеджеры", show_alert=True
-        )
+        return await call.answer("⛔ Платежи отправляют только менеджеры", show_alert=True)
     await call.answer()
     await state.clear()
     await state.set_state(PaymentState.waiting_for_amount)
@@ -192,8 +190,15 @@ async def process_comment(message: Message, state: FSMContext, bot: Bot):
     )
 
     from services.notify import notify_payment_sent
+
     await notify_payment_sent(
-        bot, payment_id, full_name, username, amount, currency, comment,
+        bot,
+        payment_id,
+        full_name,
+        username,
+        amount,
+        currency,
+        comment,
         confirm_keyboard=confirm_keyboard(payment_id),
     )
 
@@ -220,12 +225,12 @@ async def confirm_pay(call: CallbackQuery, bot: Bot):
     await call.answer("✅ Принято")
     now = local_now().strftime("%d.%m.%Y %H:%M")
     await call.message.edit_text(
-        call.message.text
-        + f"\n\n{DIV}\n✅ <b>Принято</b>  <code>{now}</code>  — {admin_name}",
+        call.message.text + f"\n\n{DIV}\n✅ <b>Принято</b>  <code>{now}</code>  — {admin_name}",
         parse_mode="HTML",
     )
 
     from services.notify import notify_payment_confirmed as _npayc
+
     await _npayc(bot, payment)
 
 
@@ -248,12 +253,12 @@ async def reject_pay(call: CallbackQuery, bot: Bot):
     await call.answer("❌ Отклонено")
     now = local_now().strftime("%d.%m.%Y %H:%M")
     await call.message.edit_text(
-        call.message.text
-        + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{now}</code>  — {admin_name}",
+        call.message.text + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{now}</code>  — {admin_name}",
         parse_mode="HTML",
     )
 
     from services.notify import notify_payment_rejected as _npayr
+
     await _npayr(bot, payment)
 
 
@@ -264,9 +269,7 @@ async def reject_pay(call: CallbackQuery, bot: Bot):
 async def cmd_payreport(message: Message):
     if not is_admin(message.from_user.id):
         return await message.answer("⛔ Нет доступа.")
-    await message.answer(
-        "📊 За какой период показать отчёт?", reply_markup=pay_report_keyboard()
-    )
+    await message.answer("📊 За какой период показать отчёт?", reply_markup=pay_report_keyboard())
 
 
 @router.callback_query(F.data.startswith("pr:"))
@@ -290,9 +293,7 @@ async def cb_payreport(call: CallbackQuery):
         since = (now - timedelta(weeks=1)).strftime("%Y-%m-%d %H:%M:%S")
         until, label = None, "эта неделя"
     elif period == "month":
-        since = now.replace(day=1, hour=0, minute=0, second=0).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        since = now.replace(day=1, hour=0, minute=0, second=0).strftime("%Y-%m-%d %H:%M:%S")
         until, label = None, "этот месяц"
     else:
         since, until, label = None, None, "всё время"
@@ -400,6 +401,7 @@ async def cb_sync_retry(call: CallbackQuery):
         return
 
     from services.ms_payments import create_paymentin_for_payment
+
     ok_count = 0
     fail_count = 0
     for p in pending:
@@ -411,9 +413,7 @@ async def cb_sync_retry(call: CallbackQuery):
 
     # Перечитываем актуальные цифры и обновляем сообщение
     text, has_pending = await _format_sync_status()
-    summary = (
-        f"\n\n<b>Итог retry:</b> ✅ {ok_count} · ❌ {fail_count}"
-    )
+    summary = f"\n\n<b>Итог retry:</b> ✅ {ok_count} · ❌ {fail_count}"
     kb = InlineKeyboardBuilder()
     if has_pending:
         kb.button(text="🔄 Retry all", callback_data="ms_sync_retry")
@@ -421,7 +421,9 @@ async def cb_sync_retry(call: CallbackQuery):
     kb.adjust(1)
     try:
         await call.message.edit_text(
-            text + summary, parse_mode="HTML", reply_markup=kb.as_markup(),
+            text + summary,
+            parse_mode="HTML",
+            reply_markup=kb.as_markup(),
         )
     except Exception:
         pass

@@ -86,7 +86,8 @@ def _format_debt_card(
             f"💵 Оплачено: <b>{_fmt_amount(summary['confirmed'])}</b>"
             + (
                 f" · ⏳ В подтверждении: <b>{_fmt_amount(summary['pending'])}</b>"
-                if summary["pending"] > 0 else ""
+                if summary["pending"] > 0
+                else ""
             )
             + f" · 📎 Остаток: <b>{_fmt_amount(summary['remaining'])}</b>"
         )
@@ -126,11 +127,10 @@ async def cmd_debts(message: Message):
     # Подтягиваем позиции и summary батчем
     items_by_order = await adb.get_order_items_by_ids([d["id"] for d in debts])
     summaries = {
-        d["id"]: s for d, s in zip(
+        d["id"]: s
+        for d, s in zip(
             debts,
-            await asyncio.gather(
-                *(adb.get_order_payment_summary(d["id"]) for d in debts)
-            ),
+            await asyncio.gather(*(adb.get_order_payment_summary(d["id"]) for d in debts)),
             strict=True,
         )
     }
@@ -155,7 +155,9 @@ async def cmd_debts(message: Message):
 
     for d in debts:
         items = items_by_order.get(d["id"], [])
-        text = _format_debt_card(d, items, today_str, show_owner=boss_view, summary=summaries[d["id"]])
+        text = _format_debt_card(
+            d, items, today_str, show_owner=boss_view, summary=summaries[d["id"]]
+        )
 
         kb = InlineKeyboardBuilder()
         kb.button(text="✅ Отметить оплачено", callback_data=f"debt_paid:{d['id']}")
@@ -228,9 +230,9 @@ async def cb_debt_paid(callback: CallbackQuery, bot: Bot):
         return
 
     full_name = (
-        f"{callback.from_user.first_name or ''} "
-        f"{callback.from_user.last_name or ''}".strip()
-        or callback.from_user.username or str(user_id)
+        f"{callback.from_user.first_name or ''} {callback.from_user.last_name or ''}".strip()
+        or callback.from_user.username
+        or str(user_id)
     )
     username = callback.from_user.username or ""
 
@@ -238,7 +240,11 @@ async def cb_debt_paid(callback: CallbackQuery, bot: Bot):
     # остаток. Если нужно частично — менеджер открывает WebApp и вводит
     # точную сумму.
     ok, payment_id = await adb.mark_order_paid(
-        order_id, user_id, full_name, amount=None, username=username,
+        order_id,
+        user_id,
+        full_name,
+        amount=None,
+        username=username,
     )
     if not ok:
         await callback.answer("Не удалось создать платёж")
@@ -249,7 +255,7 @@ async def cb_debt_paid(callback: CallbackQuery, bot: Bot):
         await callback.message.edit_text(
             (callback.message.html_text or callback.message.text or "")
             + f"\n\n⏳ <b>Платёж #{payment_id} ждёт подтверждения</b> "
-              f"({_esc(full_name)}, {_fmt_amount(summary['remaining'])} {_esc(currency)})",
+            f"({_esc(full_name)}, {_fmt_amount(summary['remaining'])} {_esc(currency)})",
             parse_mode="HTML",
             reply_markup=None,
         )
@@ -262,7 +268,10 @@ async def cb_debt_paid(callback: CallbackQuery, bot: Bot):
 
 
 async def _push_payment_confirmation(
-    bot: Bot, order_id: int, manager_name: str, payment_id: int,
+    bot: Bot,
+    order_id: int,
+    manager_name: str,
+    payment_id: int,
 ) -> None:
     """Уведомление boss/admin со стандартными кнопками pay_ok/pay_no
     (как при обычном /pay платеже — handlers/payments.py). После
@@ -297,25 +306,32 @@ async def _push_payment_confirmation(
         f"📦 По заказу всего: <b>{_fmt_amount(summary['total'])} {_esc(currency)}</b>",
     ]
     if confirmed_before > 0:
-        lines.append(f"✅ Уже оплачено ранее: <b>{_fmt_amount(confirmed_before)} {_esc(currency)}</b>")
+        lines.append(
+            f"✅ Уже оплачено ранее: <b>{_fmt_amount(confirmed_before)} {_esc(currency)}</b>"
+        )
     if remaining_after <= 0:
         lines.append("🎉 Этот платёж <b>закрывает долг полностью</b>")
     else:
-        lines.append(f"📎 Останется к получению: <b>{_fmt_amount(remaining_after)} {_esc(currency)}</b>")
+        lines.append(
+            f"📎 Останется к получению: <b>{_fmt_amount(remaining_after)} {_esc(currency)}</b>"
+        )
     lines.append(f"📅 Срок: {_esc(_to_ru(due))}")
     lines.append("")
     lines.append("Подтвердите, что эта сумма реально пришла в кассу.")
     text = "\n".join(lines)
     # Используем существующие callback'и pay_ok/pay_no из handlers/payments.py
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Принять",   callback_data=f"pay_ok:{payment_id}")
+    kb.button(text="✅ Принять", callback_data=f"pay_ok:{payment_id}")
     kb.button(text="❌ Отклонить", callback_data=f"pay_no:{payment_id}")
     kb.adjust(2)
 
     for uid in get_notify_recipients():
         try:
             await bot.send_message(
-                uid, text, parse_mode="HTML", reply_markup=kb.as_markup(),
+                uid,
+                text,
+                parse_mode="HTML",
+                reply_markup=kb.as_markup(),
             )
         except Exception:
             logger.exception("Не удалось уведомить %s о подтверждении #%s", uid, order_id)

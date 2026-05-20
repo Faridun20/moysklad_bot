@@ -38,16 +38,18 @@ from services import database as _db
 
 # Эти атрибуты НЕ нужно оборачивать — это либо чистые helper'ы без
 # I/O, либо константы/контекстные менеджеры с особой семантикой.
-_SKIP = frozenset({
-    "get_conn",        # contextmanager — обернуть нельзя, использовать редко
-    "get_cursor",      # принимает уже открытый conn, sync wrapping излишен
-    "q",               # просто string substitution
-    "now_str",         # просто datetime → string
-    "USE_POSTGRES",
-    "DATABASE_URL",
-    "DB_PATH",
-    "SQL_SLOW_MS",
-})
+_SKIP = frozenset(
+    {
+        "get_conn",  # contextmanager — обернуть нельзя, использовать редко
+        "get_cursor",  # принимает уже открытый conn, sync wrapping излишен
+        "q",  # просто string substitution
+        "now_str",  # просто datetime → string
+        "USE_POSTGRES",
+        "DATABASE_URL",
+        "DB_PATH",
+        "SQL_SLOW_MS",
+    }
+)
 
 
 def __getattr__(name: str):

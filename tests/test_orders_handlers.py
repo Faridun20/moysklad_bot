@@ -66,8 +66,8 @@ def test_delete_shows_confirm_and_keeps_draft(isolated_db):
     markup = kwargs.get("reply_markup")
     assert markup is not None
     cbs = _kb_callbacks(markup)
-    assert f"ord_delete_yes:{oid}" in cbs   # кнопка «Да»
-    assert f"ord_view:{oid}" in cbs          # кнопка «Нет, оставить»
+    assert f"ord_delete_yes:{oid}" in cbs  # кнопка «Да»
+    assert f"ord_view:{oid}" in cbs  # кнопка «Нет, оставить»
 
 
 def test_delete_yes_actually_deletes(isolated_db):

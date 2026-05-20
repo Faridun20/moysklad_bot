@@ -39,9 +39,8 @@ def user_safe_error(e: Exception, context: str = "") -> str:
     payload, пути файлов и т.п. могли утечь в `<code>{e}</code>`).
     """
     import logging
-    logging.getLogger(__name__).exception(
-        "user-visible error (%s): %s", context, e
-    )
+
+    logging.getLogger(__name__).exception("user-visible error (%s): %s", context, e)
     return "❌ Произошла внутренняя ошибка. Попробуйте позже или обратитесь к админу."
 
 

@@ -23,23 +23,25 @@ logger = logging.getLogger(__name__)
 
 # Допустимые переходы: текущий_статус → список разрешённых следующих
 TRANSITIONS: dict[str, list[str]] = {
-    "draft":    ["pending", "rejected"],   # отправить или отменить (удалить)
-    "pending":  ["approved", "rejected"],  # решение боса
-    "approved": ["shipped"],               # фиксация отгрузки
+    "draft": ["pending", "rejected"],  # отправить или отменить (удалить)
+    "pending": ["approved", "rejected"],  # решение боса
+    "approved": ["shipped"],  # фиксация отгрузки
     "rejected": [],
-    "shipped":  [],
+    "shipped": [],
 }
 
 # Какие роли могут инициировать какие переходы
 _ROLE_TRANSITIONS: dict[str, set[str]] = {
     "manager": {"draft→pending"},
-    "boss":    {"pending→approved", "pending→rejected"},
-    "admin":   {
-        "draft→pending", "pending→approved",
-        "pending→rejected", "approved→shipped",
+    "boss": {"pending→approved", "pending→rejected"},
+    "admin": {
+        "draft→pending",
+        "pending→approved",
+        "pending→rejected",
+        "approved→shipped",
         "draft→rejected",
     },
-    "guest":   set(),
+    "guest": set(),
 }
 
 
@@ -111,8 +113,10 @@ async def approve_shipment_request(
         return {"ok": False, "error": "Заявка не найдена", "req_id": req_id, "order_id": None}
     if req["status"] != "pending":
         return {
-            "ok": False, "error": "Заявка уже обработана",
-            "req_id": req_id, "order_id": req.get("order_id"),
+            "ok": False,
+            "error": "Заявка уже обработана",
+            "req_id": req_id,
+            "order_id": req.get("order_id"),
         }
 
     # Атомарный UPDATE ... WHERE status='pending' — защита от race condition,
@@ -121,8 +125,10 @@ async def approve_shipment_request(
     ok = await adb.approve_shipment_request(req_id, boss_user_id, boss_name)
     if not ok:
         return {
-            "ok": False, "error": "Заявка уже обработана другим пользователем",
-            "req_id": req_id, "order_id": req.get("order_id"),
+            "ok": False,
+            "error": "Заявка уже обработана другим пользователем",
+            "req_id": req_id,
+            "order_id": req.get("order_id"),
         }
 
     now_str = local_now().strftime("%d.%m.%Y %H:%M")
@@ -149,7 +155,10 @@ async def approve_shipment_request(
 
     if order and items and ms_ready():
         co_result = await create_customerorder_from_request(
-            order, items, manager_name, telegram_user_id=manager_user_id,
+            order,
+            items,
+            manager_name,
+            telegram_user_id=manager_user_id,
         )
         if co_result.get("ok"):
             co_id = co_result.get("customerorder_id")
@@ -158,7 +167,9 @@ async def approve_shipment_request(
             if co_id:
                 await asyncio.gather(
                     adb.add_audit_log(
-                        boss_user_id, boss_name, boss_role,
+                        boss_user_id,
+                        boss_name,
+                        boss_role,
                         "ms_co_created",
                         f"Заявка #{req_id} → customerorder {co_id} (до db-write)",
                     ),
@@ -172,9 +183,12 @@ async def approve_shipment_request(
                 )
 
             from services.moysklad import MS_BASE
+
             co_href = f"{MS_BASE}/entity/customerorder/{co_id}" if co_id else None
             demand_result = await create_demand_from_request(
-                order, items, manager_name,
+                order,
+                items,
+                manager_name,
                 telegram_user_id=manager_user_id,
                 customerorder_href=co_href,
             )
@@ -183,7 +197,9 @@ async def approve_shipment_request(
                 if demand_id:
                     await asyncio.gather(
                         adb.add_audit_log(
-                            boss_user_id, boss_name, boss_role,
+                            boss_user_id,
+                            boss_name,
+                            boss_role,
                             "ms_demand_created",
                             f"Заявка #{req_id} → demand {demand_id} (до db-write)",
                         ),
@@ -196,7 +212,9 @@ async def approve_shipment_request(
                 if pdf_to_send:
                     demand_line += " — печатная форма ниже 👇"
                 await adb.add_audit_log(
-                    boss_user_id, boss_name, boss_role,
+                    boss_user_id,
+                    boss_name,
+                    boss_role,
                     "ms_co_and_demand_created",
                     f"Заявка #{req_id} → customerorder {co_id} + demand {demand_id}",
                 )
@@ -204,7 +222,8 @@ async def approve_shipment_request(
                 reason = demand_result.get("reason", "неизвестная ошибка")
                 logger.warning(
                     "Customerorder создан, но demand упал для #%s: %s",
-                    req_id, reason,
+                    req_id,
+                    reason,
                 )
                 demand_line = (
                     f"\n📄 Заказ покупателя создан в МойСклад"
@@ -216,7 +235,9 @@ async def approve_shipment_request(
                 if pdf_to_send:
                     demand_line += "\nПечатная форма ниже 👇"
                 await adb.add_audit_log(
-                    boss_user_id, boss_name, boss_role,
+                    boss_user_id,
+                    boss_name,
+                    boss_role,
                     "ms_demand_failed",
                     f"Заявка #{req_id} → CO {co_id} ok, demand fail: {reason[:200]}",
                 )
@@ -235,7 +256,8 @@ async def approve_shipment_request(
             reason = co_result.get("reason", "неизвестная ошибка")
             logger.warning(
                 "Не удалось создать customerorder для заявки #%s: %s",
-                req_id, reason,
+                req_id,
+                reason,
             )
             demand_line = (
                 f"\n⚠️ <b>Не удалось создать заказ в МойСклад:</b>\n"
@@ -254,15 +276,22 @@ async def approve_shipment_request(
                     pass
     elif not ms_ready():
         logger.info(
-            "MS context не готов — не создаём документы для заявки #%s", req_id,
+            "MS context не готов — не создаём документы для заявки #%s",
+            req_id,
         )
 
     # Уведомляем менеджера
     if bot is not None and req.get("user_id"):
         from services.notify import notify_order_approved
+
         try:
             await notify_order_approved(
-                bot, req["user_id"], req_id, boss_name, now_str, demand_line,
+                bot,
+                req["user_id"],
+                req_id,
+                boss_name,
+                now_str,
+                demand_line,
             )
         except Exception:
             logger.exception("notify_order_approved failed for req #%s", req_id)
@@ -271,12 +300,15 @@ async def approve_shipment_request(
     if pdf_to_send and bot is not None:
         try:
             from aiogram.types import BufferedInputFile
+
             pdf_bytes, pdf_name = pdf_to_send
             caption = f"📄 Печатная форма — заявка #{req_id}"
             try:
                 file1 = BufferedInputFile(pdf_bytes, filename=pdf_name)
                 await bot.send_document(
-                    chat_id=req["user_id"], document=file1, caption=caption,
+                    chat_id=req["user_id"],
+                    document=file1,
+                    caption=caption,
                 )
             except Exception:
                 logger.exception("Не удалось отправить PDF менеджеру")
@@ -284,7 +316,9 @@ async def approve_shipment_request(
                 try:
                     file2 = BufferedInputFile(pdf_bytes, filename=pdf_name)
                     await bot.send_document(
-                        chat_id=boss_user_id, document=file2, caption=caption,
+                        chat_id=boss_user_id,
+                        document=file2,
+                        caption=caption,
                     )
                 except Exception:
                     logger.exception("Не удалось отправить PDF боссу")
@@ -294,15 +328,13 @@ async def approve_shipment_request(
     # Для paid-заказов автоматически создаём payment-pending,
     # чтобы босс одной кнопкой зафиксировал реальное получение денег.
     if order and (order.get("payment_type") or "paid") == "paid":
-        total = sum(
-            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
-            for it in items
-        )
+        total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
         if total > 0.01:
             currency = order.get("currency") or "USD"
             try:
                 existing = [
-                    p for p in await adb.get_payments_for_order(order["id"])
+                    p
+                    for p in await adb.get_payments_for_order(order["id"])
                     if p["status"] in ("pending", "confirmed")
                 ]
                 if not existing:
@@ -317,8 +349,12 @@ async def approve_shipment_request(
                     )
                     if bot is not None:
                         from handlers.debts import _push_payment_confirmation
+
                         await _push_payment_confirmation(
-                            bot, order["id"], manager_name, payment_id,
+                            bot,
+                            order["id"],
+                            manager_name,
+                            payment_id,
                         )
             except Exception:
                 logger.exception(
@@ -356,24 +392,33 @@ async def reject_shipment_request(
         return {"ok": False, "error": "Заявка не найдена", "req_id": req_id, "order_id": None}
     if req["status"] != "pending":
         return {
-            "ok": False, "error": "Заявка уже обработана",
-            "req_id": req_id, "order_id": req.get("order_id"),
+            "ok": False,
+            "error": "Заявка уже обработана",
+            "req_id": req_id,
+            "order_id": req.get("order_id"),
         }
 
     ok = await adb.reject_shipment_request(req_id, boss_user_id, boss_name)
     if not ok:
         return {
-            "ok": False, "error": "Заявка уже обработана другим пользователем",
-            "req_id": req_id, "order_id": req.get("order_id"),
+            "ok": False,
+            "error": "Заявка уже обработана другим пользователем",
+            "req_id": req_id,
+            "order_id": req.get("order_id"),
         }
 
     now_str = local_now().strftime("%d.%m.%Y %H:%M")
 
     if bot is not None and req.get("user_id"):
         from services.notify import notify_order_rejected
+
         try:
             await notify_order_rejected(
-                bot, req["user_id"], req_id, boss_name, now_str,
+                bot,
+                req["user_id"],
+                req_id,
+                boss_name,
+                now_str,
             )
         except Exception:
             logger.exception("notify_order_rejected failed for req #%s", req_id)

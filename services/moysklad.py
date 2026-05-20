@@ -43,6 +43,7 @@ def redact_ms_error(body: str, max_len: int = 200) -> str:
         pass
     return body[:max_len]
 
+
 logger = logging.getLogger(__name__)
 
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
@@ -135,27 +136,29 @@ class _CircuitBreaker:
             logger.error(
                 "МойСклад circuit breaker ОТКРЫТ после %d ошибок подряд. "
                 "Запросы будут отклоняться %.0f сек.",
-                self._fails, self.HALF_OPEN_AFTER,
+                self._fails,
+                self.HALF_OPEN_AFTER,
             )
         elif self._half_open():
             self._opened_at = time.monotonic()
             logger.warning(
-                "МойСклад circuit breaker: пробный запрос упал, "
-                "цепь снова открыта на %.0f сек.", self.HALF_OPEN_AFTER,
+                "МойСклад circuit breaker: пробный запрос упал, цепь снова открыта на %.0f сек.",
+                self.HALF_OPEN_AFTER,
             )
 
 
 _circuit = _CircuitBreaker()
 
 
-async def ms_get(path: str, params: dict | None = None, session: aiohttp.ClientSession | None = None):
+async def ms_get(
+    path: str, params: dict | None = None, session: aiohttp.ClientSession | None = None
+):
     """GET с ретраями: сетевые ошибки, таймауты и 429/5xx.
     Защищён circuit breaker'ом: после 5 подряд ошибок отклоняет без попыток.
     """
     if _circuit.is_open():
         raise RuntimeError(
-            "МойСклад временно недоступен (circuit breaker открыт). "
-            "Повторите позже."
+            "МойСклад временно недоступен (circuit breaker открыт). Повторите позже."
         )
 
     sess = session if session is not None else await get_session()
@@ -169,12 +172,17 @@ async def ms_get(path: str, params: dict | None = None, session: aiohttp.ClientS
                     # МойСклад возвращает Retry-After для 429 — уважаем его
                     retry_after = resp.headers.get("Retry-After")
                     delay = (
-                        float(retry_after) if retry_after and retry_after.isdigit()
-                        else _RETRY_BASE_DELAY * (2 ** attempt)
+                        float(retry_after)
+                        if retry_after and retry_after.isdigit()
+                        else _RETRY_BASE_DELAY * (2**attempt)
                     )
                     logger.warning(
                         "MS %s → %s, retry %d/%d через %.1fs",
-                        path, resp.status, attempt + 1, _MAX_RETRIES, delay,
+                        path,
+                        resp.status,
+                        attempt + 1,
+                        _MAX_RETRIES,
+                        delay,
                     )
                     await asyncio.sleep(delay)
                     continue
@@ -185,10 +193,14 @@ async def ms_get(path: str, params: dict | None = None, session: aiohttp.ClientS
             last_exc = e
             if attempt >= _MAX_RETRIES - 1:
                 break
-            delay = _RETRY_BASE_DELAY * (2 ** attempt)
+            delay = _RETRY_BASE_DELAY * (2**attempt)
             logger.warning(
                 "MS %s → %s, retry %d/%d через %.1fs",
-                path, type(e).__name__, attempt + 1, _MAX_RETRIES, delay,
+                path,
+                type(e).__name__,
+                attempt + 1,
+                _MAX_RETRIES,
+                delay,
             )
             await asyncio.sleep(delay)
 
@@ -213,10 +225,12 @@ _MS_CACHE_REGISTRY: list[tuple[str, dict]] = []  # для invalidate_all()
 def _ms_cache_key(args, kwargs):
     """Нормализуем datetime в ключе до минуты, иначе каждый вызов с
     datetime.utcnow() даёт уникальный ключ и кэш бесполезен."""
+
     def _norm(v):
         if isinstance(v, datetime):
             return v.replace(second=0, microsecond=0)
         return v
+
     return (
         tuple(_norm(a) for a in args),
         tuple((k, _norm(v)) for k, v in sorted(kwargs.items())),
@@ -233,6 +247,7 @@ def _ms_ttl_cache(ttl: float, name: str = ""):
         с тем же ключом ждёт на том же lock'е и получает готовое
         значение (никакого двойного похода в МС).
     """
+
     def decorator(fn):
         cache: dict = {}
         locks: dict = {}
@@ -275,6 +290,7 @@ def _ms_ttl_cache(ttl: float, name: str = ""):
 
         wrapper.cache_clear = lambda: (cache.clear(), locks.clear())
         return wrapper
+
     return decorator
 
 
@@ -338,9 +354,7 @@ def _reshape_stock_row(r: dict) -> dict:
     Сохраняет совместимость с handlers и webapp, которые ожидают
     оригинальные ключи r.get('folder', {}).get('meta', {}).get('href') и т.д."""
     href = f"{MS_BASE}/entity/product/{r['ms_id']}"
-    folder_href = (
-        f"{MS_BASE}/entity/productfolder/{r['folder_id']}" if r.get("folder_id") else ""
-    )
+    folder_href = f"{MS_BASE}/entity/productfolder/{r['folder_id']}" if r.get("folder_id") else ""
     return {
         "name": r.get("name", ""),
         "stock": r.get("stock", 0),
@@ -374,6 +388,7 @@ async def get_all_stock() -> list[dict]:
     и параллельно инициирует первичный рефреш.
     """
     from services import snapshot  # lazy чтобы избежать циклов
+
     rows = snapshot.get_stock(only_positive=False)
     if rows:
         return [_reshape_stock_row(r) for r in rows]
@@ -389,6 +404,7 @@ async def get_all_stock() -> list[dict]:
 async def get_categories() -> list[dict]:
     """Список категорий для UI. Аналогично — сначала snapshot, потом API."""
     from services import snapshot
+
     rows = snapshot.get_categories()
     if rows:
         return [_reshape_category_row(r) for r in rows]
@@ -459,11 +475,7 @@ async def get_sales_stats(since: datetime, until: datetime | None = None) -> dic
 
     total = sum(s.get("sum", 0) for s in shipments)
     clients = len(
-        set(
-            s.get("agent", {}).get("name", "")
-            for s in shipments
-            if s.get("agent", {}).get("name")
-        )
+        set(s.get("agent", {}).get("name", "") for s in shipments if s.get("agent", {}).get("name"))
     )
 
     product_sums: dict[str, dict] = {}
@@ -485,9 +497,7 @@ async def get_sales_stats(since: datetime, until: datetime | None = None) -> dic
         except Exception:
             pass
 
-    top_products = sorted(
-        product_sums.items(), key=lambda x: x[1]["sum"], reverse=True
-    )[:5]
+    top_products = sorted(product_sums.items(), key=lambda x: x[1]["sum"], reverse=True)[:5]
 
     return {
         "total": total,
@@ -495,6 +505,7 @@ async def get_sales_stats(since: datetime, until: datetime | None = None) -> dic
         "clients": clients,
         "top_products": top_products,
     }
+
 
 @_ms_ttl_cache(ttl=60.0, name="get_employee_shipments")
 async def get_employee_shipments(
@@ -532,15 +543,18 @@ async def get_employee_stats(
     shipments = await get_employee_shipments(since, until, employee_href)
     if not shipments:
         return {
-            "total": 0, "count": 0, "clients": 0,
-            "top_products": [], "by_day": {}, "product_sums": {}
+            "total": 0,
+            "count": 0,
+            "clients": 0,
+            "top_products": [],
+            "by_day": {},
+            "product_sums": {},
         }
 
     total = sum(s.get("sum", 0) for s in shipments)
-    clients = len(set(
-        s.get("agent", {}).get("name", "")
-        for s in shipments if s.get("agent", {}).get("name")
-    ))
+    clients = len(
+        set(s.get("agent", {}).get("name", "") for s in shipments if s.get("agent", {}).get("name"))
+    )
 
     # По дням недели
     days_ru = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс"}
@@ -571,9 +585,7 @@ async def get_employee_stats(
         except Exception:
             pass
 
-    top_products = sorted(
-        product_sums.items(), key=lambda x: x[1]["sum"], reverse=True
-    )[:5]
+    top_products = sorted(product_sums.items(), key=lambda x: x[1]["sum"], reverse=True)[:5]
 
     return {
         "total": total,

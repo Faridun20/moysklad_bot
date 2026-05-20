@@ -44,6 +44,7 @@ def _parse_ms_error(body_text: str) -> str:
     Возвращаем текст первого error[]. Если JSON битый — кусок body как есть.
     """
     import json as _json
+
     try:
         data = _json.loads(body_text)
         errors = data.get("errors") if isinstance(data, dict) else None
@@ -68,9 +69,7 @@ async def create_ms_employee(full_name: str, username: str) -> tuple[dict | None
     """
     parts = full_name.strip().split() if full_name else []
     first_name = parts[0] if parts else (username or "TG")
-    last_name = parts[1] if len(parts) > 1 else (
-        f"@{username}" if username else "(TG)"
-    )
+    last_name = parts[1] if len(parts) > 1 else (f"@{username}" if username else "(TG)")
     middle_name = parts[2] if len(parts) > 2 else ""
 
     payload = {
@@ -86,17 +85,13 @@ async def create_ms_employee(full_name: str, username: str) -> tuple[dict | None
             body_text = await resp.text()
             if resp.status >= 400:
                 err = _parse_ms_error(body_text)
-                logger.error(
-                    "MS create employee HTTP %s: %s", resp.status, body_text[:500]
-                )
+                logger.error("MS create employee HTTP %s: %s", resp.status, body_text[:500])
                 return None, f"HTTP {resp.status}: {err}"
             try:
                 employee = await resp.json(content_type=None)
             except Exception:
                 return None, f"Невалидный JSON от МойСклад: {body_text[:200]}"
-        logger.info(
-            "Создан сотрудник МойСклад: %s (ID: %s)", full_name, employee.get("id")
-        )
+        logger.info("Создан сотрудник МойСклад: %s (ID: %s)", full_name, employee.get("id"))
         return employee, ""
     except Exception as e:
         logger.exception("Ошибка создания сотрудника МойСклад")
@@ -121,7 +116,11 @@ async def sync_manager(user_id: int, full_name: str, username: str) -> dict:
         employees = await get_ms_employees()
     except Exception as e:
         logger.exception("Ошибка загрузки сотрудников МойСклад")
-        return {"status": "failed", "ms_id": None, "reason": f"Не удалось получить список сотрудников: {e}"}
+        return {
+            "status": "failed",
+            "ms_id": None,
+            "reason": f"Не удалось получить список сотрудников: {e}",
+        }
 
     # Ищем по имени (полное или частичное совпадение)
     ms_employee = None
@@ -134,7 +133,8 @@ async def sync_manager(user_id: int, full_name: str, username: str) -> dict:
             ms_employee = emp
             logger.info(
                 "Найден сотрудник МойСклад по имени: %s → %s",
-                full_name, emp.get("name"),
+                full_name,
+                emp.get("name"),
             )
             break
 
@@ -142,7 +142,9 @@ async def sync_manager(user_id: int, full_name: str, username: str) -> dict:
         ms_id = ms_employee["id"]
         set_moysklad_employee(user_id, ms_id, "linked")
         add_audit_log(
-            user_id, full_name, get_role(user_id),
+            user_id,
+            full_name,
+            get_role(user_id),
             "ms_linked",
             f"Привязан к сотруднику МойСклад: {ms_employee.get('name')} (ID: {ms_id})",
         )
@@ -160,7 +162,9 @@ async def sync_manager(user_id: int, full_name: str, username: str) -> dict:
         ms_id = new_employee["id"]
         set_moysklad_employee(user_id, ms_id, "created")
         add_audit_log(
-            user_id, full_name, get_role(user_id),
+            user_id,
+            full_name,
+            get_role(user_id),
             "ms_created",
             f"Создан новый сотрудник в МойСклад: {full_name} (ID: {ms_id})",
         )

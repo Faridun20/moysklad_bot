@@ -108,11 +108,15 @@ async def create_webhook(entity_type: str, action: str, url: str) -> dict | None
         if resp.status >= 400:
             logger.error(
                 "MS create webhook %s.%s -> %s: %s",
-                entity_type, action, resp.status, body[:300],
+                entity_type,
+                action,
+                resp.status,
+                body[:300],
             )
             return None
         try:
             import json
+
             return json.loads(body)
         except Exception:
             return None
@@ -123,8 +127,7 @@ async def delete_webhook(webhook_id: str) -> bool:
     async with sess.delete(f"{MS_BASE}/entity/webhook/{webhook_id}") as resp:
         if resp.status >= 400:
             body = await resp.text()
-            logger.warning("MS delete webhook %s: %s %s",
-                           webhook_id, resp.status, body[:200])
+            logger.warning("MS delete webhook %s: %s %s", webhook_id, resp.status, body[:200])
             return False
     return True
 
@@ -139,9 +142,7 @@ async def ensure_subscriptions() -> dict:
     """
     target_url = get_webhook_url()
     if not target_url:
-        logger.warning(
-            "ensure_subscriptions: WEBAPP_URL не задан — пропускаем регистрацию"
-        )
+        logger.warning("ensure_subscriptions: WEBAPP_URL не задан — пропускаем регистрацию")
         return {"skipped": True, "reason": "no WEBAPP_URL"}
 
     try:
@@ -165,8 +166,11 @@ async def ensure_subscriptions() -> dict:
         # Если уже есть наша актуальная подписка — пропускаем,
         # лишние с устаревшим URL удаляем.
         matching = [w for w in bucket if w.get("url") == target_url]
-        stale = [w for w in bucket if w.get("url") != target_url
-                 and "/api/ms-webhook" in (w.get("url") or "")]
+        stale = [
+            w
+            for w in bucket
+            if w.get("url") != target_url and "/api/ms-webhook" in (w.get("url") or "")
+        ]
 
         for w in stale:
             wid = w.get("id")
@@ -180,7 +184,9 @@ async def ensure_subscriptions() -> dict:
 
     logger.info(
         "ensure_subscriptions: existing=%d, created=%s, removed_stale=%s",
-        len(existing), created, removed_stale,
+        len(existing),
+        created,
+        removed_stale,
     )
     return {
         "existing": len(existing),

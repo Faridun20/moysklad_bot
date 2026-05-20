@@ -50,10 +50,10 @@ def notify_env(isolated_db, monkeypatch):
 
 def test_mark_shipment_notified_idempotent(isolated_db):
     db = isolated_db
-    assert db.mark_shipment_notified("d-1") is True   # впервые → уведомлять
+    assert db.mark_shipment_notified("d-1") is True  # впервые → уведомлять
     assert db.mark_shipment_notified("d-1") is False  # повтор → не дублировать
     assert db.mark_shipment_notified("d-2") is True
-    assert db.mark_shipment_notified("") is False     # пустой id игнорируем
+    assert db.mark_shipment_notified("") is False  # пустой id игнорируем
 
 
 def test_prune_notified_shipments_drops_only_old(isolated_db):
@@ -61,6 +61,7 @@ def test_prune_notified_shipments_drops_only_old(isolated_db):
     db.mark_shipment_notified("fresh")  # notified_at = сейчас
     # Состарим одну запись на 40 дней назад прямым UPDATE.
     from datetime import datetime, timedelta
+
     old_ts = (datetime.now() - timedelta(days=40)).strftime("%Y-%m-%d %H:%M:%S")
     db.mark_shipment_notified("old")
     with db.get_conn() as conn:
@@ -118,9 +119,7 @@ def test_notify_fetches_shipment_when_not_given(notify_env, monkeypatch):
 def test_notify_no_recipients_leaves_slot_free(notify_env):
     db, boss_id, sent = notify_env
 
-    ok = asyncio.run(
-        notifier.notify_new_shipment("d-5", shipment=_shipment(), recipients=[])
-    )
+    ok = asyncio.run(notifier.notify_new_shipment("d-5", shipment=_shipment(), recipients=[]))
     assert ok is False
     assert sent == []
     # Слот НЕ застолблён — поллер-резерв сможет повторить попытку позже.
@@ -164,9 +163,7 @@ def test_external_shipment_with_empty_attributes_is_notified(notify_env):
     db, boss_id, sent = notify_env
     ext = _shipment()
     ext["attributes"] = []  # внешний demand без бот-меток
-    ok = asyncio.run(
-        notifier.notify_new_shipment("d-ext", shipment=ext, recipients=[boss_id])
-    )
+    ok = asyncio.run(notifier.notify_new_shipment("d-ext", shipment=ext, recipients=[boss_id]))
     assert ok is True
     assert len(sent) == 1
 

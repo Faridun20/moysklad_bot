@@ -23,6 +23,7 @@ def test_default_role_for_new_user_is_guest(isolated_db, monkeypatch):
     monkeypatch.delenv("LEGACY_OPEN_BOT", raising=False)
     import importlib
     import config
+
     importlib.reload(config)
     db = isolated_db
     db.ensure_user(99, "newbie", "New Bie", admin_ids=[])
@@ -35,6 +36,7 @@ def test_legacy_open_bot_falls_back_to_manager(isolated_db, monkeypatch):
     monkeypatch.setenv("LEGACY_OPEN_BOT", "1")
     import importlib
     import config
+
     importlib.reload(config)
     db = isolated_db
     db.ensure_user(88, "legacy", "Legacy", admin_ids=[])

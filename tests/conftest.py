@@ -36,6 +36,7 @@ def isolated_db(monkeypatch, tmp_path):
     import importlib
     import config
     import services.database as db
+
     importlib.reload(config)
     importlib.reload(db)
 

@@ -28,6 +28,7 @@ except ImportError:
     # стороне МойСклад валюта берётся из организации). Дефолт — USD.
     BASE_CURRENCY = os.environ.get("BASE_CURRENCY", "USD")
     import tempfile
+
     _default_db = os.path.join(tempfile.gettempdir(), "payments.db")
     DB_PATH = os.environ.get("DB_PATH", _default_db)
     TZ_OFFSET = int(os.environ.get("TZ_OFFSET", "5"))
@@ -106,5 +107,6 @@ except ImportError:
     #               Railway Cron Jobs: python -m tasks.run_report {daily|weekly|monthly}.
     #               Так надёжнее: cron не зависит от состояния бота.
     ENABLE_SCHEDULED_REPORTS = os.environ.get(
-        "ENABLE_SCHEDULED_REPORTS", "1",
+        "ENABLE_SCHEDULED_REPORTS",
+        "1",
     ).lower() not in ("0", "false", "no")

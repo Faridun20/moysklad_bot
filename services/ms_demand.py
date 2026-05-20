@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # Кэш метаданных МойСклад, инициализируется один раз в init_demand_context()
 _CTX: dict[str, Any] = {
     "ready": False,
-    "org_meta": None,        # {"href": "...", "type": "organization", "mediaType": "application/json"}
+    "org_meta": None,  # {"href": "...", "type": "organization", "mediaType": "application/json"}
     "store_meta": None,
     # Кастомные атрибуты на entity/demand. Имя — человекочитаемое,
     # ID — стабильный числовой, не теряется при смене имени в TG.
@@ -67,8 +67,7 @@ async def _pick_first(path: str, env_var: str, entity_type: str) -> dict | None:
         data = await ms_get(f"entity/{path}", params={"limit": 1})
         rows = data.get("rows", []) if isinstance(data, dict) else []
         if not rows:
-            logger.error("Нет ни одного %s в МойСклад — demand создать не получится",
-                         entity_type)
+            logger.error("Нет ни одного %s в МойСклад — demand создать не получится", entity_type)
             return None
         return rows[0].get("meta")
     except Exception as e:
@@ -113,7 +112,9 @@ async def _ensure_custom_attribute(name: str, attr_type: str = "string") -> dict
                 logger.warning(
                     "Создание attribute '%s' дало HTTP %s — пробуем "
                     "перечитать (возможно race с другим процессом): %s",
-                    name, resp.status, body[:200],
+                    name,
+                    resp.status,
+                    body[:200],
                 )
                 try:
                     data = await ms_get("entity/demand/metadata/attributes")
@@ -121,18 +122,21 @@ async def _ensure_custom_attribute(name: str, attr_type: str = "string") -> dict
                     for a in attrs:
                         if a.get("name") == name:
                             logger.info(
-                                "Recovery успешен: attribute '%s' создан "
-                                "конкурентным процессом", name,
+                                "Recovery успешен: attribute '%s' создан конкурентным процессом",
+                                name,
                             )
                             return a.get("meta")
                 except Exception:
                     logger.exception("Recovery после конкурентного POST упал")
                 logger.error(
                     "Не удалось создать custom attribute '%s' (HTTP %s): %s",
-                    name, resp.status, body[:300],
+                    name,
+                    resp.status,
+                    body[:300],
                 )
                 return None
             import json
+
             created = json.loads(body)
             logger.info("Создан MS demand attribute '%s' (%s)", name, attr_type)
             return created.get("meta")
@@ -146,10 +150,8 @@ async def init_demand_context() -> dict:
     Один раз при старте бота: подтянуть meta организации, склада и
     двух кастомных атрибутов (имя + telegram_user_id).
     """
-    attr_name = os.environ.get("MS_TG_ATTRIBUTE_NAME", "").strip() \
-        or _CTX["attribute_name"]
-    attr_uid = os.environ.get("MS_TG_UID_ATTRIBUTE_NAME", "").strip() \
-        or _CTX["attribute_uid"]
+    attr_name = os.environ.get("MS_TG_ATTRIBUTE_NAME", "").strip() or _CTX["attribute_name"]
+    attr_uid = os.environ.get("MS_TG_UID_ATTRIBUTE_NAME", "").strip() or _CTX["attribute_uid"]
     _CTX["attribute_name"] = attr_name
     _CTX["attribute_uid"] = attr_uid
 
@@ -166,7 +168,10 @@ async def init_demand_context() -> dict:
 
     logger.info(
         "ms_demand context: org=%s, store=%s, attr_name=%s, attr_uid=%s",
-        bool(org), bool(store), bool(attr_name_meta), bool(attr_uid_meta),
+        bool(org),
+        bool(store),
+        bool(attr_name_meta),
+        bool(attr_uid_meta),
     )
     return {
         "ready": _CTX["ready"],
@@ -226,19 +231,21 @@ async def create_demand_from_request(
         # МойСклад хранит цену в минорных единицах валюты (центы/копейки).
         price_major = float(it.get("price", 0) or 0)
         price_minor = int(round(price_major * 100))
-        positions.append({
-            "quantity": float(it.get("quantity", 1)),
-            "price": price_minor,
-            "discount": 0,
-            "vat": 0,
-            "assortment": {
-                "meta": {
-                    "href": href,
-                    "type": "product",
-                    "mediaType": "application/json",
-                }
-            },
-        })
+        positions.append(
+            {
+                "quantity": float(it.get("quantity", 1)),
+                "price": price_minor,
+                "discount": 0,
+                "vat": 0,
+                "assortment": {
+                    "meta": {
+                        "href": href,
+                        "type": "product",
+                        "mediaType": "application/json",
+                    }
+                },
+            }
+        )
 
     if not positions:
         return {
@@ -282,14 +289,16 @@ async def create_demand_from_request(
             continue
         if value in (None, ""):
             continue
-        attrs.append({
-            "meta": {
-                "href": meta_obj["href"],
-                "type": "attributemetadata",
-                "mediaType": "application/json",
-            },
-            "value": value,
-        })
+        attrs.append(
+            {
+                "meta": {
+                    "href": meta_obj["href"],
+                    "type": "attributemetadata",
+                    "mediaType": "application/json",
+                },
+                "value": value,
+            }
+        )
     if attrs:
         payload["attributes"] = attrs
 
@@ -299,6 +308,7 @@ async def create_demand_from_request(
             body = await resp.text()
             if resp.status >= 400:
                 from services.moysklad import redact_ms_error
+
                 safe = redact_ms_error(body)
                 logger.error("MS create demand HTTP %s: %s", resp.status, safe)
                 return {
@@ -306,6 +316,7 @@ async def create_demand_from_request(
                     "reason": f"HTTP {resp.status}: {safe}",
                 }
             import json
+
             created = json.loads(body)
             demand_id = created.get("id", "")
             return {

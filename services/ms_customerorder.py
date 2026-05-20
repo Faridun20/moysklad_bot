@@ -57,7 +57,9 @@ async def _resolve_print_template() -> dict | None:
             data = await ms_get(f"entity/customerorder/metadata/{endpoint}")
             rows = data.get("rows", []) if isinstance(data, dict) else []
             logger.info(
-                "templates from %s: count=%d", endpoint, len(rows),
+                "templates from %s: count=%d",
+                endpoint,
+                len(rows),
             )
             if rows:
                 _template_cache = rows[0]
@@ -112,7 +114,9 @@ async def _try_get_print_pdf(co_id: str) -> tuple[bytes | None, str | None]:
 
     logger.info(
         "PDF request: co_id=%s, template href=%s, type=%s",
-        co_id, template_meta_clean["href"], template_meta_clean["type"],
+        co_id,
+        template_meta_clean["href"],
+        template_meta_clean["type"],
     )
 
     sess = await get_session()
@@ -136,7 +140,8 @@ async def _try_get_print_pdf(co_id: str) -> tuple[bytes | None, str | None]:
                 body_text = await resp.text()
                 logger.warning(
                     "export 200 but non-PDF ctype=%s; body[:400]=%s",
-                    ctype, body_text[:400],
+                    ctype,
+                    body_text[:400],
                 )
                 return None, None
             if resp.status in (302, 303):
@@ -148,11 +153,13 @@ async def _try_get_print_pdf(co_id: str) -> tuple[bytes | None, str | None]:
                     location = "https://api.moysklad.ru" + location
                 logger.info("PDF redirect → %s", location)
                 import asyncio
+
                 for attempt in range(5):
                     async with sess.get(location, allow_redirects=False) as dl:
                         logger.info(
                             "PDF download attempt %d: status=%d",
-                            attempt + 1, dl.status,
+                            attempt + 1,
+                            dl.status,
                         )
                         if dl.status == 200:
                             data = await dl.read()
@@ -171,14 +178,17 @@ async def _try_get_print_pdf(co_id: str) -> tuple[bytes | None, str | None]:
                         err_body = await dl.text()
                         logger.warning(
                             "PDF download status=%d, body[:300]=%s",
-                            dl.status, err_body[:300],
+                            dl.status,
+                            err_body[:300],
                         )
                         return None, None
                 logger.warning("PDF не готов после 5 попыток")
                 return None, None
             err_body = await resp.text()
             logger.warning(
-                "export failed: status=%d, body=%s", resp.status, err_body[:400],
+                "export failed: status=%d, body=%s",
+                resp.status,
+                err_body[:400],
             )
             return None, None
     except Exception:
@@ -191,10 +201,12 @@ def _filename_from_resp(resp, co_id: str) -> str:
     cd = resp.headers.get("Content-Disposition", "")
     # filename="..." или filename*=UTF-8''...
     import re
-    m = re.search(r'filename\*?=(?:UTF-8\'\')?\"?([^\";]+)\"?', cd)
+
+    m = re.search(r"filename\*?=(?:UTF-8\'\')?\"?([^\";]+)\"?", cd)
     if m:
         try:
             from urllib.parse import unquote
+
             return unquote(m.group(1))
         except Exception:
             return m.group(1)
@@ -236,19 +248,21 @@ async def create_customerorder_from_request(
             skipped.append(it.get("product_name", "?"))
             continue
         price_minor = int(round(float(it.get("price", 0) or 0) * 100))
-        positions.append({
-            "quantity": float(it.get("quantity", 1)),
-            "price": price_minor,
-            "discount": 0,
-            "vat": 0,
-            "assortment": {
-                "meta": {
-                    "href": href,
-                    "type": "product",
-                    "mediaType": "application/json",
-                }
-            },
-        })
+        positions.append(
+            {
+                "quantity": float(it.get("quantity", 1)),
+                "price": price_minor,
+                "discount": 0,
+                "vat": 0,
+                "assortment": {
+                    "meta": {
+                        "href": href,
+                        "type": "product",
+                        "mediaType": "application/json",
+                    }
+                },
+            }
+        )
 
     if not positions:
         return {
@@ -272,11 +286,13 @@ async def create_customerorder_from_request(
     # store у customerorder есть, но опциональный. Ставим если резолвили.
     store_meta = ms_demand._CTX.get("store_meta")
     if store_meta and store_meta.get("href"):
-        payload["store"] = {"meta": {
-            "href": store_meta["href"],
-            "type": "store",
-            "mediaType": "application/json",
-        }}
+        payload["store"] = {
+            "meta": {
+                "href": store_meta["href"],
+                "type": "store",
+                "mediaType": "application/json",
+            }
+        }
 
     # ВАЖНО: кастомные атрибуты (telegram_full_name / telegram_user_id)
     # из ms_demand._CTX зарегистрированы в МойСклад ТОЛЬКО для demand'а.
@@ -292,14 +308,18 @@ async def create_customerorder_from_request(
     try:
         sess = await get_session()
         async with sess.post(
-            f"{MS_BASE}/entity/customerorder", json=payload,
+            f"{MS_BASE}/entity/customerorder",
+            json=payload,
         ) as resp:
             body = await resp.text()
             if resp.status >= 400:
                 from services.moysklad import redact_ms_error
+
                 safe = redact_ms_error(body)
                 logger.error(
-                    "MS create customerorder HTTP %s: %s", resp.status, safe,
+                    "MS create customerorder HTTP %s: %s",
+                    resp.status,
+                    safe,
                 )
                 return {
                     "ok": False,

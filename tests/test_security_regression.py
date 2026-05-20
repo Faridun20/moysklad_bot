@@ -37,6 +37,7 @@ def _api_post_paths(app) -> list[str]:
 @pytest.fixture
 def client(isolated_db):
     import webapp.server as server
+
     return TestClient(server.app)
 
 
@@ -54,8 +55,7 @@ def test_every_api_endpoint_rejects_bad_initdata(client):
             failures.append((path, resp.status_code))
 
     assert not failures, (
-        "эндпоинты пустили запрос с мусорным initData (нет _authorize?): "
-        f"{failures}"
+        f"эндпоинты пустили запрос с мусорным initData (нет _authorize?): {failures}"
     )
 
 
@@ -64,6 +64,7 @@ def test_every_api_endpoint_rejects_bad_initdata(client):
 
 def test_esc_escapes_html_metacharacters():
     from utils.helpers import esc
+
     out = esc("<script>alert(1)</script> & <b>")
     assert "<script>" not in out
     assert "&lt;script&gt;" in out
@@ -72,6 +73,7 @@ def test_esc_escapes_html_metacharacters():
 
 def test_format_order_escapes_agent_name_and_comment():
     from handlers.orders import format_order
+
     order = {
         "id": 1,
         "status": "draft",

@@ -1,18 +1,23 @@
 """
 Общие хэндлеры: /start, меню, управление ролями
 """
+
 import logging
 from aiogram import Bot, Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
-    Message, CallbackQuery,
+    Message,
+    CallbackQuery,
     WebAppInfo,
-    ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton,
-    BotCommand, BotCommandScopeChat,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    KeyboardButton,
+    BotCommand,
+    BotCommandScopeChat,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from services.roles import is_boss
-from utils.formatters import DIV   
+from utils.formatters import DIV
 from config import ADMIN_IDS
 from services.database import (
     get_role,
@@ -49,7 +54,7 @@ def get_keyboard_for_role(role: str):
     # когда WebApp лень открывать просто чтобы посмотреть).
     if role in ("admin", "boss", "manager"):
         kb.button(text="📋 Мои заказы", callback_data="ord_my")
-        kb.button(text="💳 Долги",       callback_data="debts_my")
+        kb.button(text="💳 Долги", callback_data="debts_my")
         rows += [2]
 
     # Срочное для босса/админа — апрув заявок (push-driven но дублируем
@@ -66,7 +71,7 @@ def get_keyboard_for_role(role: str):
     # Админский ряд — управление пользователями и аудит.
     if role == "admin":
         kb.button(text="👥 Пользователи", callback_data="users_list")
-        kb.button(text="📋 Аудит",        callback_data="al:today")
+        kb.button(text="📋 Аудит", callback_data="al:today")
         rows += [2]
 
     if not rows:
@@ -99,9 +104,11 @@ def webapp_reply_keyboard(webapp_url: str | None):
     if not webapp_url:
         return ReplyKeyboardRemove()
     return ReplyKeyboardMarkup(
-        keyboard=[[
-            KeyboardButton(text="🌐 Открыть", web_app=WebAppInfo(url=webapp_url)),
-        ]],
+        keyboard=[
+            [
+                KeyboardButton(text="🌐 Открыть", web_app=WebAppInfo(url=webapp_url)),
+            ]
+        ],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -110,22 +117,22 @@ def webapp_reply_keyboard(webapp_url: str | None):
 # Команды для /-автокомплита Telegram. Разные наборы для разных ролей —
 # менеджеру не показываем admin-only /addrole, /audit и т.п.
 _COMMANDS_MANAGER = [
-    BotCommand(command="start",     description="🏠 Главное меню"),
-    BotCommand(command="neworder",  description="➕ Новый заказ"),
-    BotCommand(command="myorders",  description="📋 Мои заказы"),
-    BotCommand(command="pay",       description="💵 Отправить платёж"),
-    BotCommand(command="debts",     description="💳 Мои долги"),
+    BotCommand(command="start", description="🏠 Главное меню"),
+    BotCommand(command="neworder", description="➕ Новый заказ"),
+    BotCommand(command="myorders", description="📋 Мои заказы"),
+    BotCommand(command="pay", description="💵 Отправить платёж"),
+    BotCommand(command="debts", description="💳 Мои долги"),
 ]
 _COMMANDS_BOSS = _COMMANDS_MANAGER + [
-    BotCommand(command="orders",        description="⏳ Заявки на апрув"),
-    BotCommand(command="shipments",     description="🚚 Последние отгрузки"),
-    BotCommand(command="analytics",     description="📊 Аналитика продаж"),
+    BotCommand(command="orders", description="⏳ Заявки на апрув"),
+    BotCommand(command="shipments", description="🚚 Последние отгрузки"),
+    BotCommand(command="analytics", description="📊 Аналитика продаж"),
     BotCommand(command="sync_payments", description="🔄 Статус синка с МойСклад"),
 ]
 _COMMANDS_ADMIN = _COMMANDS_BOSS + [
-    BotCommand(command="users",   description="👥 Пользователи"),
+    BotCommand(command="users", description="👥 Пользователи"),
     BotCommand(command="addrole", description="🔧 Сменить роль"),
-    BotCommand(command="audit",   description="📋 Аудит лог"),
+    BotCommand(command="audit", description="📋 Аудит лог"),
 ]
 
 
@@ -197,6 +204,7 @@ async def cmd_start(message: Message):
     # перетирает; нужен явный per-chat вызов.
     import os as _os
     from aiogram.types import MenuButtonWebApp, MenuButtonDefault, WebAppInfo
+
     webapp_url = _os.environ.get("WEBAPP_URL", "").strip().rstrip("/")
     try:
         if webapp_url:
@@ -239,6 +247,7 @@ async def cmd_start(message: Message):
     if role == "manager":
         from services.ms_sync import sync_manager
         import html as _html
+
         result = await sync_manager(
             user.id,
             user.full_name or user.username or str(user.id),
@@ -249,9 +258,7 @@ async def cmd_start(message: Message):
             sync_status_line = "\n\n✅ Создан профиль в МойСклад."
         elif status == "failed":
             reason = result.get("reason", "неизвестная ошибка")
-            logger.warning(
-                "MS link failed for %s: %s", user.full_name, reason
-            )
+            logger.warning("MS link failed for %s: %s", user.full_name, reason)
             sync_status_line = (
                 f"\n\n⚠️ <i>Не привязан к МойСклад: "
                 f"{_html.escape(reason[:160])}</i>\n"
@@ -280,6 +287,7 @@ async def cmd_start(message: Message):
     # Показываем сводку за месяц для менеджера
     if role == "manager":
         from handlers.analytics import show_manager_summary
+
         await show_manager_summary(message.bot, message.chat.id, message.from_user.id)
 
 
@@ -290,6 +298,7 @@ async def cmd_refresh(message: Message):
         return await message.answer("⛔ Только для администратора.")
 
     from services import snapshot
+
     await message.answer("⏳ Перечитываю snapshot МойСклад…")
     try:
         counts = await snapshot.refresh_all()
@@ -308,11 +317,11 @@ async def cmd_snapshot_stats(message: Message):
     if message.from_user.id not in ADMIN_IDS and get_role(message.from_user.id) != "admin":
         return await message.answer("⛔ Только для администратора.")
     from services import snapshot
+
     stats = snapshot.stats()
     lines = ["📊 <b>Snapshot МойСклад</b>", ""]
     lines.append("<b>Строк в локальных таблицах:</b>")
-    for tbl in ("ms_products", "ms_categories", "ms_counterparties",
-                "ms_employees", "ms_stock"):
+    for tbl in ("ms_products", "ms_categories", "ms_counterparties", "ms_employees", "ms_stock"):
         lines.append(f"  • {tbl}: <code>{stats.get(tbl, 0)}</code>")
     lines.append("")
     lines.append("<b>Метаданные:</b>")
@@ -329,9 +338,7 @@ async def cb_menu(call: CallbackQuery):
     role = get_role(user.id)
     await call.answer()
     if role == "guest":
-        return await call.message.answer(
-            "⛔ Ваш аккаунт ещё не активирован. Напишите /start."
-        )
+        return await call.message.answer("⛔ Ваш аккаунт ещё не активирован. Напишите /start.")
     # Welcome без reply_markup — reply-клавиатура уже была установлена
     # один раз при /start и осталась видна (is_persistent=True).
     await call.message.answer(
@@ -344,6 +351,7 @@ async def cb_menu(call: CallbackQuery):
             "⚡ Быстрые действия:",
             reply_markup=inline_markup,
         )
+
 
 @router.callback_query(F.data == "shop_menu")
 async def cb_shop_menu(call: CallbackQuery):
@@ -362,11 +370,12 @@ async def cb_ord_my(call: CallbackQuery):
     await call.answer()
     from services.database import get_user_orders
     from handlers.orders import my_orders_keyboard
+
     orders = get_user_orders(call.from_user.id)
     if not orders:
         kb = InlineKeyboardBuilder()
         kb.button(text="➕ Создать заказ", callback_data="ord_new")
-        kb.button(text="🏠 Меню",          callback_data="menu")
+        kb.button(text="🏠 Меню", callback_data="menu")
         kb.adjust(1)
         return await call.message.answer("📋 У вас пока нет заказов.", reply_markup=kb.as_markup())
     await call.message.answer(
@@ -383,6 +392,7 @@ async def cb_ord_requests(call: CallbackQuery):
     await call.answer()
     from services.database import get_pending_requests
     from handlers.orders import pending_requests_keyboard
+
     requests = get_pending_requests()
     if not requests:
         return await call.message.answer(

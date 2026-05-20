@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 # ─── meta ────────────────────────────────────────────────────────────────────
 
+
 def meta_set(dataset: str, **fields) -> None:
     """Обновить метаданные снапшота для конкретного датасета."""
     cols = ["last_refresh"]
@@ -73,6 +74,7 @@ def meta_get(dataset: str) -> dict | None:
 
 
 # ─── Рефреш справочников ──────────────────────────────────────────────────────
+
 
 async def _fetch_all(path: str, params: dict | None = None) -> list[dict]:
     """Постранично выкачать всё из endpoint'а МойСклад."""
@@ -198,6 +200,7 @@ async def refresh_employees() -> int:
 
 # ─── Рефреш остатков ──────────────────────────────────────────────────────────
 
+
 async def refresh_stock() -> int:
     """Полный pull остатков. Вызывается как safety-net каждые 2 часа
     и из webhook-обработчика (после debounce)."""
@@ -205,9 +208,7 @@ async def refresh_stock() -> int:
     offset = 0
     limit = 1000
     while True:
-        data = await ms_get(
-            "report/stock/all", params={"limit": limit, "offset": offset}
-        )
+        data = await ms_get("report/stock/all", params={"limit": limit, "offset": offset})
         chunk = data if isinstance(data, list) else data.get("rows", [])
         rows.extend(chunk)
         if len(chunk) < limit:
@@ -292,6 +293,7 @@ async def _stock_debounce_loop() -> None:
 
 # ─── Чтение ──────────────────────────────────────────────────────────────────
 
+
 def get_stock(folder_id: str | None = None, only_positive: bool = False) -> list[dict]:
     """Список остатков. Если folder_id задан — только товары категории.
 
@@ -322,9 +324,7 @@ def get_stock(folder_id: str | None = None, only_positive: bool = False) -> list
 def get_categories() -> list[dict]:
     with get_conn() as conn:
         cur = get_cursor(conn)
-        cur.execute(
-            q("SELECT ms_id, name, parent_id, href FROM ms_categories ORDER BY name")
-        )
+        cur.execute(q("SELECT ms_id, name, parent_id, href FROM ms_categories ORDER BY name"))
         return [dict(r) for r in cur.fetchall()]
 
 
@@ -353,18 +353,23 @@ def stats() -> dict:
     out = {}
     with get_conn() as conn:
         cur = get_cursor(conn)
-        for tbl in ("ms_products", "ms_categories", "ms_counterparties",
-                    "ms_employees", "ms_stock"):
+        for tbl in (
+            "ms_products",
+            "ms_categories",
+            "ms_counterparties",
+            "ms_employees",
+            "ms_stock",
+        ):
             cur.execute(f"SELECT COUNT(*) AS c FROM {tbl}")
             row = cur.fetchone()
-            out[tbl] = (dict(row) if not isinstance(row, dict) else row).get("c", 0) \
-                if row else 0
+            out[tbl] = (dict(row) if not isinstance(row, dict) else row).get("c", 0) if row else 0
         cur.execute("SELECT * FROM ms_snapshot_meta")
         out["meta"] = [dict(r) for r in cur.fetchall()]
     return out
 
 
 # ─── Высокоуровневые сценарии ────────────────────────────────────────────────
+
 
 async def refresh_reference() -> dict:
     """Все справочники подряд. Вызывается утром и при /refresh."""
@@ -378,8 +383,10 @@ async def refresh_reference() -> dict:
         return_exceptions=True,
     )
     for name, val in [
-        ("products", products), ("categories", categories),
-        ("counterparties", counterparties), ("employees", employees),
+        ("products", products),
+        ("categories", categories),
+        ("counterparties", counterparties),
+        ("employees", employees),
     ]:
         if isinstance(val, Exception):
             logger.error("snapshot.refresh_reference: %s failed: %s", name, val)

@@ -25,6 +25,7 @@ def _run(coro):
     tg_send_message держит глобальный ClientSession, привязанный к loop'у;
     сбрасываем его до и после, чтобы тесты не делили сессию между loop'ами.
     """
+
     async def _wrapped():
         notifier._tg_session = None
         try:
@@ -74,6 +75,7 @@ def test_tg_send_message_includes_reply_markup():
 
 def test_tg_send_message_swallows_http_error():
     """best-effort: даже при 400 от Telegram не пробрасываем исключение."""
+
     async def scenario():
         with aioresponses() as m:
             m.post(_expected_url(), status=400, payload={"ok": False})
@@ -123,6 +125,7 @@ def test_base_url_has_no_path():
     aiohttp запрещает path-часть в base_url; если она вернётся, все
     уведомления снова начнут молча падать. Сетевого вызова тут нет.
     """
+
     async def scenario():
         sess = await notifier.get_tg_session()
         assert sess._base_url is not None

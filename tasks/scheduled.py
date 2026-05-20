@@ -19,8 +19,19 @@ from utils.helpers import utc_now
 logger = logging.getLogger(__name__)
 
 MONTH_NAMES = [
-    "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+    "",
+    "Январь",
+    "Февраль",
+    "Март",
+    "Апрель",
+    "Май",
+    "Июнь",
+    "Июль",
+    "Август",
+    "Сентябрь",
+    "Октябрь",
+    "Ноябрь",
+    "Декабрь",
 ]
 
 
@@ -70,8 +81,10 @@ async def get_stock_report_data() -> dict:
 
 async def build_sales_and_stock_report(
     label: str,
-    since: datetime, until: datetime,
-    prev_since: datetime, prev_until: datetime,
+    since: datetime,
+    until: datetime,
+    prev_since: datetime,
+    prev_until: datetime,
 ) -> str:
     """Собрать полный отчёт: продажи + склад."""
     try:
@@ -88,9 +101,7 @@ async def build_sales_and_stock_report(
         # text вставлялся в <code>…</code> и мог сломать HTML parsing
         # (или утечь внутренности МойСклад API в Telegram-чат).
         logger.exception("Ошибка сборки отчёта")
-        return (
-            "❌ Не удалось собрать отчёт. Подробности в логах сервиса."
-        )
+        return "❌ Не удалось собрать отчёт. Подробности в логах сервиса."
 
 
 async def send_report(bot: Bot, text: str):
@@ -164,16 +175,17 @@ async def daily_report_task(bot: Bot):
         await asyncio.sleep(seconds_until(9, 0))
         try:
             now = utc_now()
-            since = (now - timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
+            since = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             until = now.replace(hour=0, minute=0, second=0, microsecond=0)
             prev_since = since - timedelta(days=1)
 
             text = "📬 <b>Ежедневный отчёт</b>\n\n"
             text += await build_sales_and_stock_report(
                 f"{since.strftime('%d.%m.%Y')}",
-                since, until, prev_since, since,
+                since,
+                until,
+                prev_since,
+                since,
             )
             await send_report(bot, text)
             logger.info("Ежедневный отчёт отправлен")
@@ -194,7 +206,10 @@ async def weekly_report_task(bot: Bot):
             text = "📬 <b>Еженедельный отчёт</b>\n\n"
             text += await build_sales_and_stock_report(
                 "прошедшая неделя",
-                since, now, prev_since, since,
+                since,
+                now,
+                prev_since,
+                since,
             )
             await send_report(bot, text)
             logger.info("Еженедельный отчёт отправлен")
@@ -209,13 +224,22 @@ async def monthly_report_task(bot: Bot):
         now = utc_now()
         if now.month == 12:
             next_first = now.replace(
-                year=now.year + 1, month=1, day=1,
-                hour=9, minute=0, second=0, microsecond=0,
+                year=now.year + 1,
+                month=1,
+                day=1,
+                hour=9,
+                minute=0,
+                second=0,
+                microsecond=0,
             )
         else:
             next_first = now.replace(
-                month=now.month + 1, day=1,
-                hour=9, minute=0, second=0, microsecond=0,
+                month=now.month + 1,
+                day=1,
+                hour=9,
+                minute=0,
+                second=0,
+                microsecond=0,
             )
         wait = max((next_first - now).total_seconds(), 1)
         logger.info("Ежемесячный отчёт через %.0f ч", wait / 3600)
@@ -237,7 +261,11 @@ async def monthly_report_task(bot: Bot):
             label = f"{MONTH_NAMES[first_prev.month]} {first_prev.year}"
             text = f"📬 <b>Ежемесячный отчёт · {label}</b>\n\n"
             text += await build_sales_and_stock_report(
-                label, first_prev, first_this, first_prev_prev, first_prev,
+                label,
+                first_prev,
+                first_this,
+                first_prev_prev,
+                first_prev,
             )
             await send_report(bot, text)
             logger.info("Ежемесячный отчёт отправлен")

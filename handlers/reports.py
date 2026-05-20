@@ -20,9 +20,21 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 MONTH_NAMES = [
-    "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+    "",
+    "Январь",
+    "Февраль",
+    "Март",
+    "Апрель",
+    "Май",
+    "Июнь",
+    "Июль",
+    "Август",
+    "Сентябрь",
+    "Октябрь",
+    "Ноябрь",
+    "Декабрь",
 ]
+
 
 def reports_keyboard():
     kb = InlineKeyboardBuilder()
@@ -68,16 +80,12 @@ async def cb_report(call: CallbackQuery, bot: Bot):
             kb.button(text="📊 Другие отчёты", callback_data="reports_menu")
             kb.button(text="🏠 Меню", callback_data="menu")
             kb.adjust(1)
-            await call.message.answer(
-                txt, parse_mode="HTML", reply_markup=kb.as_markup()
-            )
+            await call.message.answer(txt, parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception as e:
             await call.message.answer(user_safe_error(e, "report_stock"))
         return
 
-    await call.message.answer(
-        "⏳ Формирую отчёт…\n<i>До 30 секунд</i>", parse_mode="HTML"
-    )
+    await call.message.answer("⏳ Формирую отчёт…\n<i>До 30 секунд</i>", parse_mode="HTML")
 
     if period == "today":
         since = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -107,9 +115,7 @@ async def cb_report(call: CallbackQuery, bot: Bot):
         return
 
     try:
-        text = await build_sales_and_stock_report(
-            label, since, until, prev_since, prev_until
-        )
+        text = await build_sales_and_stock_report(label, since, until, prev_since, prev_until)
         kb = InlineKeyboardBuilder()
         kb.button(text="📊 Другие отчёты", callback_data="reports_menu")
         kb.button(text="🏠 Меню", callback_data="menu")

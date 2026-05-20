@@ -65,12 +65,15 @@ async def main(limit: int) -> int:
                 else:
                     logger.info(
                         "payment #%d: synced → paymentin %s",
-                        pid, result.get("paymentin_id"),
+                        pid,
+                        result.get("paymentin_id"),
                     )
             else:
                 fail_count += 1
                 logger.warning(
-                    "payment #%d: failed → %s", pid, result.get("reason"),
+                    "payment #%d: failed → %s",
+                    pid,
+                    result.get("reason"),
                 )
     finally:
         await close_session()
@@ -78,7 +81,9 @@ async def main(limit: int) -> int:
 
     logger.info(
         "ms_sync_retry: успешно %d, провалено %d из %d",
-        ok_count, fail_count, len(pending),
+        ok_count,
+        fail_count,
+        len(pending),
     )
     # Возвращаем 0 даже если есть failed — это «нормальное» состояние,
     # cron-job не должен помечать себя как сбоившийся; настоящий сбой
@@ -89,7 +94,9 @@ async def main(limit: int) -> int:
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Retry failed МойСклад payment syncs")
     p.add_argument(
-        "--limit", type=int, default=100,
+        "--limit",
+        type=int,
+        default=100,
         help="Максимум платежей за один запуск (default 100)",
     )
     return p.parse_args(argv)

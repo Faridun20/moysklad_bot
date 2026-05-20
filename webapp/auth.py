@@ -43,9 +43,7 @@ def verify_init_data(init_data: str) -> dict | None:
             logger.warning("verify_init_data: нет поля hash в initData")
             return None
 
-        data_check_string = "\n".join(
-            f"{k}={v}" for k, v in sorted(parsed.items())
-        )
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
 
         # Секретный ключ = HMAC-SHA256(token, "WebAppData")
         secret_key = hmac.new(
@@ -74,9 +72,7 @@ def verify_init_data(init_data: str) -> dict | None:
             return None
         age = int(time.time()) - auth_date
         if age > MAX_INIT_DATA_AGE:
-            logger.warning(
-                "initData просрочен: возраст %s сек > %s", age, MAX_INIT_DATA_AGE
-            )
+            logger.warning("initData просрочен: возраст %s сек > %s", age, MAX_INIT_DATA_AGE)
             return None
 
         user_str = parsed.get("user", "")

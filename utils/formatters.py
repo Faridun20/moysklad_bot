@@ -36,9 +36,7 @@ def format_stock_page(rows: list[dict], page: int, cat_name: str = "") -> str:
 
     cat_str = f" · {cat_name}" if cat_name else ""
     lines = [
-        section_header(
-            "📦", f"Склад{cat_str}", f"стр {page + 1}/{total_pages} · {total} позиций"
-        ),
+        section_header("📦", f"Склад{cat_str}", f"стр {page + 1}/{total_pages} · {total} позиций"),
         "",
     ]
 
@@ -91,8 +89,9 @@ def format_shipment(s: dict, positions: list[dict] = None) -> str:
             assortment = pos.get("assortment", {})
             pos_name = esc(assortment.get("name", "—"))
             qty = pos.get("quantity", 0)
-            uom = esc(pos.get("uom", {}).get("name", "")
-                      or assortment.get("uom", {}).get("name", "шт"))
+            uom = esc(
+                pos.get("uom", {}).get("name", "") or assortment.get("uom", {}).get("name", "шт")
+            )
             price_raw = pos.get("price", 0)
             price_str = format_price(price_raw)
             total_pos = format_price(price_raw * qty)
@@ -142,7 +141,7 @@ def format_sales_report(label: str, stats: dict, prev_stats: dict = None) -> str
         for i, (name, data) in enumerate(top):
             t_sum = format_price(data["sum"])
             qty = data["qty"]
-            medal = medals[i] if i < len(medals) else f"{i+1}."
+            medal = medals[i] if i < len(medals) else f"{i + 1}."
             lines.append(f"{medal} <b>{esc(name)}</b>")
             lines.append(f"    <code>{qty} шт  ·  {t_sum} $</code>")
 
@@ -200,9 +199,7 @@ def format_payment_rejected(amount: float, currency: str, comment: str) -> str:
 # ─── Отчёт по платежам ────────────────────────────────────────────────────────
 
 
-def format_payments_report(
-    summary: list[dict], payments: list[dict], label: str
-) -> list[str]:
+def format_payments_report(summary: list[dict], payments: list[dict], label: str) -> list[str]:
     """Возвращает список сообщений (Telegram ограничивает 4096 символов)."""
     lines = [
         section_header("📊", f"Платежи · {label}"),
@@ -217,9 +214,7 @@ def format_payments_report(
             f"👤 <b>{s['full_name']}</b>\n"
             f"    <code>{s['total']:,.0f} {s['currency']}  ·  {s['count']} платежей</code>"
         )
-        total_by_currency[s["currency"]] = (
-            total_by_currency.get(s["currency"], 0) + s["total"]
-        )
+        total_by_currency[s["currency"]] = total_by_currency.get(s["currency"], 0) + s["total"]
 
     lines.append("")
     lines.append("<b>Итого:</b>")
@@ -271,10 +266,8 @@ def format_audit_entry(r: dict) -> str:
     # кликабельный <a href="evil"> вид).
     role_str = f" [{esc(r['role'])}]" if r.get("role") else ""
     detail_str = f"\n    <i>{esc(r['details'])}</i>" if r.get("details") else ""
-    return (
-        f"{emoji} <code>{dt}</code>  <b>{esc(r['full_name'])}</b>"
-        f"{role_str}{detail_str}"
-    )
+    return f"{emoji} <code>{dt}</code>  <b>{esc(r['full_name'])}</b>{role_str}{detail_str}"
+
 
 # ─── Отчёт по остаткам склада ─────────────────────────────────────────────────
 
