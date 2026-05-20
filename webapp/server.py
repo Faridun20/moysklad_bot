@@ -1118,8 +1118,10 @@ async def api_submit_order(request: Request):
     order = await adb.get_order(order_id)
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
-    if order["status"] != "draft":
-        raise HTTPException(status_code=400, detail="Заказ уже отправлен")
+    from services.order_workflow import validate_transition
+    err = validate_transition(order, "pending")
+    if err:
+        raise HTTPException(status_code=400, detail=err)
 
     items = await adb.get_order_items(order_id)
     if not items:
