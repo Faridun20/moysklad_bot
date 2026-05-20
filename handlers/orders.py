@@ -526,6 +526,12 @@ async def process_quantity(message: Message, state: FSMContext):
         )
 
     data = await state.get_data()
+    if not data.get("selected_product") or not data.get("order_id"):
+        await state.clear()
+        return await message.answer(
+            "⚠️ Сессия сброшена (возможно, бот перезагружался). "
+            "Откройте заказ снова: /myorders",
+        )
     product = data["selected_product"]
     order_id = data["order_id"]
     order = await adb.get_order(order_id)
@@ -557,6 +563,12 @@ async def process_price(message: Message, state: FSMContext):
         )
 
     data = await state.get_data()
+    if not data.get("order_id") or not data.get("selected_product"):
+        await state.clear()
+        return await message.answer(
+            "⚠️ Сессия сброшена (возможно, бот перезагружался). "
+            "Откройте заказ снова: /myorders",
+        )
     order_id = data["order_id"]
     product = data["selected_product"]
     qty = data["quantity"]

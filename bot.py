@@ -188,6 +188,11 @@ def _build_fsm_storage():
     рестарт и могут жить между несколькими bot-инстансами.
     """
     if not REDIS_URL:
+        logger.warning(
+            "REDIS_URL не задан — FSM использует MemoryStorage. "
+            "Состояния заказов (черновики, шаг добавления товара) "
+            "теряются при каждом рестарте бота."
+        )
         return MemoryStorage()
     try:
         from aiogram.fsm.storage.redis import RedisStorage
