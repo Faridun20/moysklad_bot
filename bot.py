@@ -249,6 +249,23 @@ async def _run_webapp_only():
             "(включите TG_USE_WEBHOOK=1 или используйте парный сервис с BOT_MODE=bot)"
         )
 
+    # Прогрев МС-сессии — нужна для approve-флоу (создание customerorder/
+    # demand) при одобрении заявок через /api/requests/approve.
+    await get_session()
+
+    # КРИТИЧНО: webapp-процесс тоже одобряет заявки (через WebApp), а значит
+    # создаёт документы в МойСклад. Без demand-контекста (org/store/attrs)
+    # ms_ready()=False → PDF и demand не создаются. main() инициализирует
+    # его для bot-процесса; здесь делаем то же для webapp-процесса.
+    async def _init_demand():
+        try:
+            result = await init_demand_context()
+            logger.info("ms_demand.init_demand_context: %s", result)
+        except Exception:
+            logger.exception("init_demand_context failed")
+
+    asyncio.create_task(_init_demand(), name="init_demand")
+
     try:
         await webapp_server.start_webapp()
     finally:
