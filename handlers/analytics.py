@@ -12,10 +12,10 @@ from aiogram import Bot, Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 
-from services.roles import can_view_analytics, is_boss
+from services.roles import can_view_analytics, is_boss, cached_role
 from services.moysklad import get_sales_stats, get_employee_stats, get_employee_href
 from services.database import (
-    get_moysklad_employee_id, get_role,
+    get_moysklad_employee_id,
     get_user_orders, get_order_items, get_order_items_by_ids,
 )
 from utils.formatters import format_sales_report
@@ -67,7 +67,7 @@ def get_period(period: str, now: datetime) -> tuple:
 async def cmd_analytics(message: Message):
     if not can_view_analytics(message.from_user.id):
         return await message.answer("⛔ Нет доступа.")
-    role = get_role(message.from_user.id)
+    role = cached_role(message.from_user.id)
     prefix = "📊 Ваша аналитика" if role == "manager" else "📊 Аналитика компании"
     await message.answer(
         f"{prefix}\nЗа какой период?",
@@ -80,7 +80,7 @@ async def cb_analytics(call: CallbackQuery):
     if not can_view_analytics(call.from_user.id):
         return await call.answer("Нет доступа", show_alert=True)
     await call.answer()
-    role = get_role(call.from_user.id)
+    role = cached_role(call.from_user.id)
     prefix = "📊 Ваша аналитика" if role == "manager" else "📊 Аналитика компании"
     await call.message.answer(
         f"{prefix}\nЗа какой период?",
@@ -101,7 +101,7 @@ async def cb_analytics_period(call: CallbackQuery, bot: Bot):
     now = local_now()
     since, until, prev_since, prev_until, label = get_period(period, now)
 
-    role = get_role(call.from_user.id)
+    role = cached_role(call.from_user.id)
 
     if role == "manager":
         await show_manager_analytics(
@@ -138,6 +138,17 @@ async def show_company_analytics(
             chat_id, txt, parse_mode="HTML",
             reply_markup=analytics_back_keyboard(),
         )
+    except RuntimeError as e:
+        if "circuit breaker" in str(e).lower() or "временно недоступен" in str(e):
+            await bot.send_message(
+                chat_id,
+                "⚠️ <b>МойСклад временно недоступен.</b>\n"
+                "Данные аналитики недоступны, попробуйте через несколько минут.",
+                parse_mode="HTML",
+                reply_markup=analytics_back_keyboard(),
+            )
+        else:
+            await bot.send_message(chat_id, user_safe_error(e, "company_analytics"))
     except Exception as e:
         await bot.send_message(chat_id, user_safe_error(e, "company_analytics"))
 
