@@ -115,9 +115,11 @@ async function showScreen(screen) {
   const content = document.getElementById('content');
 
   // Если был открыт экран с MainButton (например, ввод количества) —
-  // скрываем её при переключении, иначе кнопка зависнет на других
-  // экранах с устаревшим обработчиком.
-  try { tg.MainButton?.hide(); } catch {}
+  // скрываем её и снимаем обработчик при переключении, иначе кнопка
+  // зависнет на других экранах с устаревшим onClick.
+  clearMainButton();
+  // Корневые табы не показывают нативную «Назад».
+  hideBack();
 
   // Сбрасываем фильтр категории при каждом входе в "Склад",
   // чтобы не показывать последнюю открытую категорию из прошлой сессии.
@@ -189,6 +191,7 @@ async function renderOrdersScreen() {
   content.insertAdjacentHTML('afterbegin', tabsHtml);
   document.querySelectorAll('.sub-tab').forEach(btn => {
     btn.addEventListener('click', () => {
+      haptic('light');
       ordersSubTab = btn.dataset.sub;
       renderOrdersScreen();
     });
@@ -418,31 +421,32 @@ async function renderStock() {
   renderStockContent();
 }
 
-function renderStockContent() {
-  const content = document.getElementById('content');
-  const { products, categories } = stockData;
+function _stockBadge(stock) {
+  if (stock <= 0) return '<span class="stock-badge badge-red">нет</span>';
+  if (stock < 20) return `<span class="stock-badge badge-red">${stock}</span>`;
+  if (stock < 100) return `<span class="stock-badge badge-yellow">${stock}</span>`;
+  return `<span class="stock-badge badge-green">${stock}</span>`;
+}
 
-  // Категории — таблетки сверху
-  const catBtns = [{ id: 'all', name: `Все (${products.length})` }, ...categories]
-    .map(c =>
-      `<button class="cat-btn ${stockCurrentCat === c.id ? 'active' : ''}" data-cat="${c.id}">${c.name}</button>`
-    ).join('');
-
+function _stockFiltered() {
+  const { products } = stockData;
   const search = stockSearch.toLowerCase();
-  const filtered = products.filter(p => {
+  return products.filter(p => {
     if (stockCurrentCat !== 'all' && p.folder_id !== stockCurrentCat) return false;
     if (search && !p.name.toLowerCase().includes(search)) return false;
     return true;
   });
+}
 
-  const badge = (stock) => {
-    if (stock <= 0) return '<span class="stock-badge badge-red">нет</span>';
-    if (stock < 20) return `<span class="stock-badge badge-red">${stock}</span>`;
-    if (stock < 100) return `<span class="stock-badge badge-yellow">${stock}</span>`;
-    return `<span class="stock-badge badge-green">${stock}</span>`;
-  };
+// Перерисовать ТОЛЬКО список товаров + строку «показаны первые N».
+// Каркас экрана (поле поиска, таблетки категорий) не трогаем — иначе
+// поиск теряет фокус и сбрасывается скролл при каждом нажатии клавиши.
+function renderStockList() {
+  const listEl = document.getElementById('stock-list');
+  if (!listEl) return;
+  const filtered = _stockFiltered();
 
-  const list = filtered.length === 0
+  listEl.innerHTML = filtered.length === 0
     ? `<div class="empty-state">
         <div class="empty-state-icon">📦</div>
         <div class="empty-state-title">Товары не найдены</div>
@@ -454,13 +458,27 @@ function renderStockContent() {
             <div class="stock-name">${escapeHtml(p.name)}</div>
             <div class="stock-folder">${escapeHtml(p.folder_name || '—')} · ${p.unit}</div>
           </div>
-          ${badge(p.stock)}
+          ${_stockBadge(p.stock)}
         </div>
       `).join('');
 
-  const truncated = filtered.length > 200
-    ? `<div class="loader">Показаны первые 200 из ${filtered.length}. Уточните фильтр.</div>`
-    : '';
+  const truncEl = document.getElementById('stock-trunc');
+  if (truncEl) {
+    truncEl.innerHTML = filtered.length > 200
+      ? `<div class="loader">Показаны первые 200 из ${filtered.length}. Уточните фильтр.</div>`
+      : '';
+  }
+}
+
+function renderStockContent() {
+  const content = document.getElementById('content');
+  const { products, categories } = stockData;
+
+  // Категории — таблетки сверху
+  const catBtns = [{ id: 'all', name: `Все (${products.length})` }, ...categories]
+    .map(c =>
+      `<button class="cat-btn ${stockCurrentCat === c.id ? 'active' : ''}" data-cat="${c.id}">${c.name}</button>`
+    ).join('');
 
   content.innerHTML = `
     <div class="section-label">Категории</div>
@@ -469,21 +487,27 @@ function renderStockContent() {
       <input id="stock-search" class="form-input" placeholder="🔎 Поиск товара…" value="${escapeHtml(stockSearch)}">
     </div>
     <div class="section-label">Товары</div>
-    <div class="stock-list">${list}</div>
-    ${truncated}
+    <div class="stock-list" id="stock-list"></div>
+    <div id="stock-trunc"></div>
   `;
+  renderStockList();
 
   document.querySelectorAll('[data-cat]').forEach(btn => {
     btn.addEventListener('click', () => {
+      haptic('light');
       stockCurrentCat = btn.dataset.cat;
-      renderStockContent();
+      // Подсветить активную таблетку без полного ре-рендера каркаса.
+      document.querySelectorAll('[data-cat]').forEach(b =>
+        b.classList.toggle('active', b.dataset.cat === stockCurrentCat)
+      );
+      renderStockList();
     });
   });
   const searchInput = document.getElementById('stock-search');
   if (searchInput) {
     searchInput.addEventListener('input', e => {
       stockSearch = e.target.value;
-      renderStockContent();
+      renderStockList();  // обновляем только список — поле держит фокус
     });
     // не дёргаем фокус, чтобы не открывать клавиатуру при первом рендере
   }
@@ -501,6 +525,40 @@ function loading(msg = 'Загрузка…') {
 
 function haptic(type = 'light') {
   try { tg.HapticFeedback?.impactOccurred(type); } catch {}
+}
+
+// ─── Нативная кнопка «Назад» Telegram ───────────────
+// Используем родную tg.BackButton на вложенных экранах вместо
+// самодельных ◀️. Храним последний хендлер, чтобы снять его перед
+// привязкой нового — иначе обработчики копятся и срабатывают разом.
+let _backHandler = null;
+function showBack(handler) {
+  try {
+    if (_backHandler) tg.BackButton.offClick(_backHandler);
+    _backHandler = handler;
+    tg.BackButton.onClick(handler);
+    tg.BackButton.show();
+  } catch {}
+}
+function hideBack() {
+  try {
+    if (_backHandler) tg.BackButton.offClick(_backHandler);
+    _backHandler = null;
+    tg.BackButton.hide();
+  } catch {}
+}
+
+// ─── Очистка зависшей MainButton ────────────────────
+// onConfirm из openQuantityInput — замыкание; при уходе с экрана без
+// нажатия «назад» обработчик оставался привязанным и срабатывал на
+// чужих экранах. Снимаем его централизованно.
+let _mainBtnHandler = null;
+function clearMainButton() {
+  try {
+    if (_mainBtnHandler) tg.MainButton.offClick(_mainBtnHandler);
+    _mainBtnHandler = null;
+    tg.MainButton?.hide();
+  } catch {}
 }
 
 // ─── Экран: Заказы ──────────────────────────────────
@@ -548,6 +606,9 @@ async function renderOrders() {
 }
 
 function renderOrdersMain() {
+  // Список заказов — корневой вид вкладки. Прячем нативную «Назад»
+  // на случай возврата из вложенного экрана (редактор, заявки).
+  hideBack();
   const content = document.getElementById('content');
   const { orders, role } = ordersData;
   const isBoss = role === 'admin' || role === 'boss';
@@ -622,6 +683,7 @@ function renderOrdersMain() {
   // Фильтры
   document.querySelectorAll('.cat-btn[data-filter]').forEach(btn => {
     btn.addEventListener('click', () => {
+      haptic('light');
       currentOrderFilter = btn.dataset.filter;
       renderOrdersMain();
     });
@@ -732,7 +794,6 @@ function renderOrderEditor() {
 
   content.innerHTML = `
     <div class="editor-header">
-      <button class="editor-back" id="editor-back">◀️</button>
       <div class="editor-title">Заказ #${order.id}</div>
     </div>
 
@@ -761,8 +822,7 @@ function renderOrderEditor() {
         <span>💳 В долг</span>
       </label>
     </div>
-    <div class="due-date-wrap" id="due-date-wrap"
-      style="display: ${currentDraftOrder.payment_type === 'credit' ? 'block' : 'none'};">
+    <div class="due-date-wrap ${currentDraftOrder.payment_type === 'credit' ? '' : 'hidden'}" id="due-date-wrap">
       <label class="due-date-label">Дата возврата долга:</label>
       <input type="date" id="due-date-input" class="due-date-input"
         value="${currentDraftOrder.due_date || ''}"
@@ -780,8 +840,8 @@ function renderOrderEditor() {
     </div>
   `;
 
-  // Назад
-  document.getElementById('editor-back').addEventListener('click', () => {
+  // Назад — нативная кнопка Telegram
+  showBack(() => {
     ordersData = null;
     renderOrders();
   });
@@ -810,8 +870,8 @@ function renderOrderEditor() {
   document.querySelectorAll('input[name="payment_type"]').forEach(r => {
     r.addEventListener('change', () => {
       currentDraftOrder.payment_type = r.value;
-      document.getElementById('due-date-wrap').style.display =
-        r.value === 'credit' ? 'block' : 'none';
+      document.getElementById('due-date-wrap')
+        .classList.toggle('hidden', r.value !== 'credit');
     });
   });
   document.getElementById('due-date-input')?.addEventListener('change', e => {
@@ -829,7 +889,6 @@ async function openAgentSearch() {
   const content = document.getElementById('content');
   content.innerHTML = `
     <div class="editor-header">
-      <button id="agent-back">◀️</button>
       <div class="editor-title">Выбор клиента</div>
     </div>
     <div class="agent-search-wrap">
@@ -840,7 +899,7 @@ async function openAgentSearch() {
     </div>
   `;
 
-  document.getElementById('agent-back').addEventListener('click', renderOrderEditor);
+  showBack(renderOrderEditor);
 
   const input = document.getElementById('agent-search');
   let timer;
@@ -872,6 +931,7 @@ async function loadAgents(search) {
 
     document.querySelectorAll('.agent-row').forEach(row => {
       row.addEventListener('click', async () => {
+        haptic('light');
         currentDraftOrder.agent_id = row.dataset.id;
         currentDraftOrder.agent_name = row.dataset.name;
         try {
@@ -898,7 +958,6 @@ async function openProductPicker() {
   const content = document.getElementById('content');
   content.innerHTML = `
     <div class="editor-header">
-      <button id="prod-back">◀️</button>
       <div class="editor-title">Выбор товара</div>
     </div>
     <div class="agent-search-wrap">
@@ -908,7 +967,7 @@ async function openProductPicker() {
     <div id="prod-list" class="orders-list">${loading('Загружаю…')}</div>
   `;
 
-  document.getElementById('prod-back').addEventListener('click', renderOrderEditor);
+  showBack(renderOrderEditor);
 
   // Загружаем склад
   if (!orderStockCache) {
@@ -955,11 +1014,14 @@ async function openProductPicker() {
         }).join('');
 
     document.querySelectorAll('.prod-row').forEach(row => {
-      row.addEventListener('click', () => openQuantityInput(
-        row.dataset.name, row.dataset.unit,
-        parseFloat(row.dataset.stock),
-        row.dataset.href || ''
-      ));
+      row.addEventListener('click', () => {
+        haptic('light');
+        openQuantityInput(
+          row.dataset.name, row.dataset.unit,
+          parseFloat(row.dataset.stock),
+          row.dataset.href || ''
+        );
+      });
     });
   }
 
@@ -972,6 +1034,7 @@ async function openProductPicker() {
 
   catFilters.querySelectorAll('.cat-btn').forEach(btn => {
     btn.addEventListener('click', () => {
+      haptic('light');
       catFilters.querySelectorAll('.cat-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       selectedCat = btn.dataset.cat;
@@ -979,7 +1042,14 @@ async function openProductPicker() {
     });
   });
 
-  document.getElementById('prod-search').addEventListener('input', renderProducts);
+  // Дебаунс поиска товара — как в поиске клиентов (иначе фильтрация
+  // дёргается на каждое нажатие при больших каталогах).
+  const prodSearch = document.getElementById('prod-search');
+  let prodTimer;
+  prodSearch.addEventListener('input', () => {
+    clearTimeout(prodTimer);
+    prodTimer = setTimeout(renderProducts, 250);
+  });
   renderProducts();
 }
 
@@ -998,7 +1068,6 @@ function openQuantityInput(name, unit, maxStock, href) {
 
   content.innerHTML = `
     <div class="editor-header">
-      <button id="qty-back">◀️</button>
       <div class="editor-title">Количество и цена</div>
     </div>
     <div class="qty-screen">
@@ -1031,8 +1100,8 @@ function openQuantityInput(name, unit, maxStock, href) {
     </div>
   `;
 
-  document.getElementById('qty-back').addEventListener('click', () => {
-    tg.MainButton?.hide();
+  showBack(() => {
+    clearMainButton();
     openProductPicker();
   });
   const qtyEl = document.getElementById('qty-input');
@@ -1093,8 +1162,7 @@ function openQuantityInput(name, unit, maxStock, href) {
       if (!currentDraftOrder.currency) currentDraftOrder.currency = selectedCurrency;
       tg.HapticFeedback?.notificationOccurred('success');
       tg.MainButton?.hideProgress?.();
-      tg.MainButton?.hide();
-      tg.MainButton?.offClick?.(onConfirm);
+      clearMainButton();
       renderOrderEditor();
     } catch (e) {
       tg.MainButton?.hideProgress?.();
@@ -1105,6 +1173,9 @@ function openQuantityInput(name, unit, maxStock, href) {
   if (tg.MainButton) {
     tg.MainButton.setText('✅ Добавить в заявку');
     tg.MainButton.show();
+    // Запоминаем хендлер, чтобы clearMainButton() мог его снять при
+    // уходе с экрана (см. showScreen / qty-back).
+    _mainBtnHandler = onConfirm;
     tg.MainButton.onClick(onConfirm);
   } else {
     // Fallback для окружений без MainButton API (типа браузера) —
@@ -1158,12 +1229,18 @@ async function renderPendingRequests() {
   content.innerHTML = loading('Загружаю заявки…');
   try {
     const data = await api('/api/orders/requests', {});
+    showBack(renderOrdersMain);
     if (data.requests.length === 0) {
       content.innerHTML = `
-        <div class="loader">✅ Нет заявок</div>
-        <button class="btn-secondary" id="back-orders" style="margin:16px">◀️ К заказам</button>
+        <div class="editor-header">
+          <div class="editor-title">Заявки</div>
+        </div>
+        <div class="empty-state">
+          <div class="empty-state-icon">✅</div>
+          <div class="empty-state-title">Нет заявок на рассмотрении</div>
+          <div class="empty-state-hint">Новые заявки появятся здесь автоматически</div>
+        </div>
       `;
-      document.getElementById('back-orders').addEventListener('click', renderOrdersMain);
       return;
     }
     const items = data.requests.map(r => `
@@ -1191,13 +1268,11 @@ async function renderPendingRequests() {
 
     content.innerHTML = `
       <div class="editor-header">
-        <button id="req-back">◀️</button>
         <div class="editor-title">Заявки (${data.requests.length})</div>
       </div>
       <div class="orders-list">${items}</div>
     `;
 
-    document.getElementById('req-back').addEventListener('click', renderOrdersMain);
     document.querySelectorAll('.btn-approve').forEach(btn =>
       btn.addEventListener('click', () => handleRequest(btn.dataset.req, 'approve'))
     );

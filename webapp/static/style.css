@@ -28,6 +28,9 @@
   --shadow-card: 0 1px 2px rgba(0,0,0,0.04);
 }
 
+/* Утилита: скрыть элемент без инлайн-стилей в JS. */
+.hidden { display: none !important; }
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
                "Segoe UI", Roboto, sans-serif;
@@ -149,9 +152,13 @@ body {
   text-align: center;
 }
 
+/* Текст на hero берёт цвет из --accent-fg (= tg-theme-button-text-color),
+   а не хардкод #fff. Иначе на светлом акценте белый текст исчезает.
+   Приглушённые варианты — через opacity, чтобы не плодить rgba-хардкоды. */
 .hero-label {
   font-size: 13px;
-  color: rgba(255,255,255,0.75);
+  color: var(--accent-fg);
+  opacity: 0.75;
   margin-bottom: 4px;
 }
 
@@ -160,13 +167,14 @@ body {
   font-weight: 700;
   letter-spacing: -1px;
   line-height: 1.1;
-  color: #fff;
+  color: var(--accent-fg);
 }
 
 .hero-currency {
   font-size: 26px;
   font-weight: 500;
-  color: rgba(255,255,255,0.65);
+  color: var(--accent-fg);
+  opacity: 0.65;
   margin-left: 4px;
 }
 
@@ -175,8 +183,9 @@ body {
   font-size: 13px;
   padding: 4px 12px;
   border-radius: 12px;
-  background: rgba(255,255,255,0.18);
-  color: rgba(255,255,255,0.9);
+  background: rgba(127,127,127,0.18);
+  color: var(--accent-fg);
+  opacity: 0.92;
   margin-top: 10px;
 }
 
