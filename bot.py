@@ -14,18 +14,11 @@ from aiogram.types import (
     Message, CallbackQuery, TelegramObject, User,
 )
 
-from handlers import orders, debts
 from config import (
     TELEGRAM_TOKEN, TG_USE_WEBHOOK, TG_WEBHOOK_SECRET, WEBAPP_URL,
     REDIS_URL, BOT_MODE, ENABLE_SCHEDULED_REPORTS,
 )
 from services.rate_limit import acquire as rate_limit_acquire
-
-# Хэндлеры
-from handlers import (
-    start, users, stock, shipments,
-    analytics, payments, reports, audit, log,
-)
 
 # Сервисы и задачи
 from services.database import init_db
@@ -91,6 +84,11 @@ class RateLimitMiddleware(BaseMiddleware):
 
 def register_routers(dp: Dispatcher):
     """Подключить все роутеры."""
+    from handlers import (
+        start, users, stock, shipments,
+        analytics, payments, reports, audit, log,
+        orders, debts,
+    )
     routers = [
         start.router,
         users.router,
