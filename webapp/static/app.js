@@ -612,6 +612,7 @@ function renderOrdersMain() {
   const content = document.getElementById('content');
   const { orders, role } = ordersData;
   const isBoss = role === 'admin' || role === 'boss';
+  const canShip = isBoss || role === 'warehouse_keeper';
 
   const filters = [
     { id: 'all', label: 'Все' },
@@ -664,6 +665,11 @@ function renderOrdersMain() {
           <div class="draft-actions">
             <button class="btn-edit-order" data-id="${o.id}">✏️ Редактировать</button>
             <button class="btn-delete-draft" data-id="${o.id}">🗑️ Удалить</button>
+          </div>
+        ` : ''}
+        ${o.status === 'approved' && canShip ? `
+          <div class="draft-actions">
+            <button class="btn-confirm-pay btn-ship-order" data-id="${o.id}">🚚 Отгрузить</button>
           </div>
         ` : ''}
         ${o.status === 'approved' && isBoss ? `
@@ -722,6 +728,29 @@ function renderOrdersMain() {
         } catch (e) {
           tg.HapticFeedback?.notificationOccurred('error');
           tg.showAlert('❌ ' + e.message);
+          btn.disabled = false;
+        }
+      });
+    });
+  });
+
+  // Отгрузка заказа (босс/кладовщик).
+  document.querySelectorAll('.btn-ship-order').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = parseInt(btn.dataset.id);
+      tg.showConfirm(`Отметить заказ #${id} отгруженным?`, async ok => {
+        if (!ok) return;
+        btn.disabled = true;
+        try {
+          await api('/api/orders/ship', { order_id: id });
+          tg.HapticFeedback?.notificationOccurred('success');
+          tg.showAlert(`🚚 Заказ #${id} отгружен`);
+          ordersData = null;
+          await renderOrders();
+        } catch (err) {
+          tg.HapticFeedback?.notificationOccurred('error');
+          tg.showAlert('❌ ' + err.message);
           btn.disabled = false;
         }
       });

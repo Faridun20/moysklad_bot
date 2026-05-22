@@ -79,7 +79,10 @@ async def cmd_return(message: Message, state: FSMContext):
     order = await adb.get_order(order_id)
     if not order:
         return await message.answer("❌ Заказ не найден.")
-    if order.get("status") not in ("shipped", "paid", "partially_returned"):
+    # Отгружен/оплачен/частично-возвращён ИЛИ оплачен по легаси (paid_confirmed_at).
+    if order.get("status") not in ("shipped", "paid", "partially_returned") and not order.get(
+        "paid_confirmed_at"
+    ):
         return await message.answer("⚠️ Возврат доступен только для отгруженных/оплаченных заказов.")
 
     items = await adb.get_order_items(order_id)

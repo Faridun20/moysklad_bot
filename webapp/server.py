@@ -1483,7 +1483,10 @@ async def api_returns_create(request: Request):
     order = await adb.get_order(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Заказ не найден")
-    if order.get("status") not in ("shipped", "paid", "partially_returned"):
+    # Отгружен/оплачен/частично-возвращён ИЛИ оплачен по легаси (paid_confirmed_at).
+    if order.get("status") not in ("shipped", "paid", "partially_returned") and not order.get(
+        "paid_confirmed_at"
+    ):
         raise HTTPException(
             status_code=409, detail="Возврат доступен только для отгруженных/оплаченных"
         )
@@ -1543,6 +1546,41 @@ async def api_create_order(request: Request):
     )
     order_id = await adb.create_order(user["id"], full_name, data.get("comment", ""))
     return JSONResponse({"order_id": order_id})
+
+
+@app.post("/api/orders/ship")
+async def api_orders_ship(request: Request):
+    """Босс/админ/кладовщик отмечает заказ отгруженным (approved → shipped).
+    Альтернатива МС-вебхуку. Уведомляем создателя заказа."""
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "warehouse_keeper"),
+        rate_limit_scope="api_orders_ship",
+    )
+    try:
+        order_id = int(data.get("order_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="order_id обязателен")
+
+    order = await adb.get_order(order_id)
+    name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
+        "username", str(user["id"])
+    )
+    res = await adb.mark_order_shipped(order_id, user["id"], name)
+    if not res.get("ok"):
+        raise HTTPException(status_code=409, detail=res.get("error", "не удалось отгрузить"))
+
+    creator = order.get("user_id") if order else None
+    if creator and creator != user["id"]:
+        bot = await get_notify_bot()
+        try:
+            await bot.send_message(creator, f"🚚 Ваш заказ #{order_id} отгружен.")
+        except Exception:
+            logger.warning("order ship notify failed", exc_info=True)
+    return JSONResponse({"ok": True, "order_id": order_id})
 
 
 @app.post("/api/orders/cancel")

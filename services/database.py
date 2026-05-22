@@ -1086,6 +1086,40 @@ def reject_order_to_draft(
     return {"ok": True, "error": None, "frozen": bool(frozen), "rejection_count": rc}
 
 
+def mark_order_shipped(order_id: int, shipped_by: int, shipped_name: str) -> dict:
+    """Отметить заказ отгруженным (approved → shipped), DB-часть. Альтернатива
+    МС-вебхуку (stateType=Successful) — для аккаунтов без статуса типа
+    «Успешный». Выставляет shipped_at/shipped_by. Возвращает {ok, error}."""
+    order = get_order(order_id)
+    if not order:
+        return {"ok": False, "error": "Заказ не найден"}
+    if order.get("status") != "approved":
+        return {"ok": False, "error": "Отгрузить можно только одобренный заказ"}
+
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "UPDATE orders SET status = 'shipped', shipped_at = ?, shipped_by = ?, "
+                "updated_at = ? WHERE id = ? AND status = 'approved'"
+            ),
+            (now_str(), shipped_by, now_str(), order_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    if not updated:
+        return {"ok": False, "error": "Заказ уже обработан"}
+
+    add_audit_log(
+        shipped_by,
+        shipped_name,
+        get_role(shipped_by),
+        "order_shipped",
+        f"Заказ #{order_id} отмечен отгруженным",
+    )
+    return {"ok": True, "error": None}
+
+
 def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, reason: str) -> dict:
     """Отмена заказа (IMPLEMENTATION.md §6.7), DB-часть. Reverse-demand в
     МойСклад — отдельной фазой. Для approved действует окно отмены
@@ -1506,6 +1540,23 @@ def get_batches_expiring_within(days: int = 7) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+def _is_returnable(order: dict) -> bool:
+    """Заказ можно вернуть, если он отгружен/оплачен/частично-возвращён ИЛИ
+    фактически оплачен по легаси-схеме (paid_confirmed_at заполнен — оплата
+    через /pay подтверждена, но ярлык status мог остаться 'approved')."""
+    if order.get("status") in ("shipped", "paid", "partially_returned"):
+        return True
+    return bool(order.get("paid_confirmed_at"))
+
+
+def is_order_returnable(order_id: int) -> bool:
+    """Публичная проверка для бот/webapp-прехеков (та же логика, что в create_return)."""
+    order = get_order(order_id)
+    if order is None:
+        return False
+    return _is_returnable(order)
+
+
 def create_return(
     order_id: int,
     return_type: str,
@@ -1523,7 +1574,7 @@ def create_return(
     order = get_order(order_id)
     if not order:
         return {"ok": False, "error": "Заказ не найден"}
-    if order.get("status") not in ("shipped", "paid", "partially_returned"):
+    if not _is_returnable(order):
         return {"ok": False, "error": "Возврат доступен только для отгруженных/оплаченных"}
     if not items:
         return {"ok": False, "error": "Не указаны позиции возврата"}

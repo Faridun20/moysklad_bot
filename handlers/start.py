@@ -125,6 +125,7 @@ _COMMANDS_MANAGER = [
 ]
 _COMMANDS_BOSS = _COMMANDS_MANAGER + [
     BotCommand(command="orders", description="⏳ Заявки на апрув"),
+    BotCommand(command="ship", description="🚚 Отгрузить заказ"),
     BotCommand(command="shipments", description="🚚 Последние отгрузки"),
     BotCommand(command="analytics", description="📊 Аналитика продаж"),
     BotCommand(command="sync_payments", description="🔄 Статус синка с МойСклад"),
