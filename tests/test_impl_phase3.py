@@ -148,7 +148,9 @@ def test_cancel_approved_within_window(isolated_db):
     assert db.get_order(oid)["status"] == "cancelled"
 
 
-def test_cancel_blocked_after_deadline(isolated_db):
+def test_cancel_ignores_legacy_deadline(isolated_db):
+    """M2: окно отмены убрано (поле нигде не заполнялось — проверка была мёртвой).
+    Даже с дедлайном в прошлом отмена approved-заказа проходит."""
     db = isolated_db
     oid, mgr = _agent_order(db, 100.0, status="approved", agent="A-8")
     from datetime import datetime, timedelta
@@ -158,9 +160,9 @@ def test_cancel_blocked_after_deadline(isolated_db):
         cur = db.get_cursor(conn)
         cur.execute(db.q("UPDATE orders SET cancellation_deadline = ? WHERE id = ?"), (past, oid))
         conn.commit()
-    r = db.cancel_order(oid, 1, "Boss", "поздно")
-    assert r["ok"] is False
-    assert db.get_order(oid)["status"] == "approved"
+    r = db.cancel_order(oid, 1, "Boss", "передумали")
+    assert r["ok"] is True
+    assert db.get_order(oid)["status"] == "cancelled"
 
 
 def test_cancel_blocked_for_shipped(isolated_db):

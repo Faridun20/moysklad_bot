@@ -31,6 +31,7 @@ from services.database import (
     get_setting,
     get_stale_pending_orders,
     init_db,
+    run_migrations,
 )
 from services.moysklad import close_session
 from services.notifier import close_tg_session, tg_send_message
@@ -126,6 +127,7 @@ def assemble_digest(title: str, blocks: list[str | None]) -> str | None:
 
 async def main() -> int:
     init_db()
+    run_migrations()  # M1: на свежей БД догнать колонки (идемпотентно)
 
     stale_hours = int(get_setting("stale_pending_hours", 48))
     cash_days = int(get_setting("cash_deposit_escalation_days", 2))

@@ -25,6 +25,7 @@ from services.database import (
     prune_audit_log,
     prune_notified_shipments,
     purge_soft_deleted,
+    run_migrations,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -33,6 +34,7 @@ logger = logging.getLogger("maintenance")
 
 def main() -> int:
     init_db()
+    run_migrations()  # M1: на свежей БД догнать колонки (идемпотентно)
     try:
         audit_months = int(get_setting("audit_log_retention_months", 6))
         soft_days = int(get_setting("soft_delete_retention_days", 365))

@@ -1122,9 +1122,12 @@ def mark_order_shipped(order_id: int, shipped_by: int, shipped_name: str) -> dic
 
 def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, reason: str) -> dict:
     """Отмена заказа (IMPLEMENTATION.md §6.7), DB-часть. Reverse-demand в
-    МойСклад — отдельной фазой. Для approved действует окно отмены
-    (cancellation_deadline); shipped по спеке требует возврата на 100% —
-    здесь не пропускаем (нужен return-флоу)."""
+    МойСклад — отдельной фазой. Отмена доступна для approved; shipped по спеке
+    требует возврата на 100% — здесь не пропускаем (нужен return-флоу).
+
+    M2: окно отмены (cancellation_deadline) убрано — поле нигде не заполнялось,
+    проверка была мёртвой и вводила в заблуждение. Если понадобится временно́е
+    окно — заполнять deadline при одобрении и вернуть проверку сюда."""
     order = get_order(order_id)
     if not order:
         return {"ok": False, "error": "Заказ не найден"}
@@ -1134,9 +1137,6 @@ def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, reason: 
             "ok": False,
             "error": "Отмена доступна только для approved (shipped → через возврат)",
         }
-    deadline = order.get("cancellation_deadline")
-    if deadline and now_str() > deadline:
-        return {"ok": False, "error": "Окно отмены истекло"}
 
     with get_conn() as conn:
         cur = get_cursor(conn)
@@ -2209,31 +2209,42 @@ def prune_audit_log(retention_months: int = 6) -> int:
     from datetime import timedelta
 
     cutoff = (datetime.now() - timedelta(days=retention_months * 30)).strftime("%Y-%m-%d %H:%M:%S")
+    return _batched_delete("audit_log", "created_at < ?", (cutoff,))
+
+
+def _batched_delete(table: str, where: str, params: tuple, batch: int = 5000) -> int:
+    """Удалять строки порциями (L2): один большой DELETE держит длинный лок на
+    проде. Работает в SQLite и Postgres через DELETE ... WHERE id IN (SELECT ...
+    LIMIT). Коммит после каждой порции. Возвращает число удалённых."""
+    total = 0
     with get_conn() as conn:
         cur = get_cursor(conn)
-        cur.execute(q("DELETE FROM audit_log WHERE created_at < ?"), (cutoff,))
-        deleted = cur.rowcount
-        conn.commit()
-    return deleted
+        while True:
+            cur.execute(
+                q(
+                    f"DELETE FROM {table} WHERE id IN ("
+                    f"SELECT id FROM {table} WHERE {where} ORDER BY id LIMIT ?)"
+                ),
+                (*params, batch),
+            )
+            n = cur.rowcount or 0
+            conn.commit()
+            total += n
+            if n <= 0:
+                break
+    return total
 
 
 def purge_soft_deleted(retention_days: int = 365) -> dict[str, int]:
     """Физически удалить soft-deleted строки (deleted_at IS NOT NULL) старше
     retention_days. Возвращает {table: removed}. Таблицы с deleted_at:
-    orders, cash_deposits, returns."""
+    orders, cash_deposits, returns. Удаление порциями (L2)."""
     from datetime import timedelta
 
     cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
     out: dict[str, int] = {}
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        for table in ("orders", "cash_deposits", "returns"):
-            cur.execute(
-                q(f"DELETE FROM {table} WHERE deleted_at IS NOT NULL AND deleted_at < ?"),
-                (cutoff,),
-            )
-            out[table] = cur.rowcount
-        conn.commit()
+    for table in ("orders", "cash_deposits", "returns"):
+        out[table] = _batched_delete(table, "deleted_at IS NOT NULL AND deleted_at < ?", (cutoff,))
     return out
 
 

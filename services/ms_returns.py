@@ -68,6 +68,13 @@ async def create_salesreturn(return_id: int) -> dict:
         )
     if not positions:
         return {"ok": False, "reason": f"Нет разобранных позиций (skipped: {skipped})"}
+    if skipped:
+        # L1: возврат в МС уйдёт неполным относительно локального — заметно в логах.
+        logger.warning(
+            "salesreturn возврата #%s: пропущены позиции без product_href: %s",
+            return_id,
+            skipped,
+        )
 
     payload = {
         "name": f"Возврат по заказу #{order['id']} (бот)",
