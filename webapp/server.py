@@ -1490,6 +1490,10 @@ async def api_returns_create(request: Request):
         raise HTTPException(
             status_code=409, detail="Возврат доступен только для отгруженных/оплаченных"
         )
+    # H2: менеджер вправе вернуть только свой заказ; начальство/склад — любой.
+    privileged = get_role(user["id"]) in ("admin", "boss", "warehouse_keeper")
+    if not privileged and order.get("user_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Возврат только по своим заказам")
 
     items = await adb.get_order_items(order_id)
     ret_items = [
@@ -1507,7 +1511,7 @@ async def api_returns_create(request: Request):
         ret_items,
         refund_method=refund,
         created_by=user["id"],
-        force=True,
+        force=privileged,
     )
     if not res.get("ok"):
         raise HTTPException(status_code=409, detail=res.get("error", "не удалось"))

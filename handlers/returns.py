@@ -21,7 +21,12 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services import async_db as adb
-from services.roles import can_confirm_return, can_create_return, is_warehouse_keeper
+from services.roles import (
+    _has_role,
+    can_confirm_return,
+    can_create_return,
+    is_warehouse_keeper,
+)
 from utils.formatters import DIV
 from utils.helpers import esc
 
@@ -79,6 +84,10 @@ async def cmd_return(message: Message, state: FSMContext):
     order = await adb.get_order(order_id)
     if not order:
         return await message.answer("❌ Заказ не найден.")
+    # H2: менеджер вправе вернуть только свой заказ; начальство/склад — любой.
+    privileged = _has_role(message.from_user.id, "admin", "boss", "warehouse_keeper")
+    if not privileged and order.get("user_id") != message.from_user.id:
+        return await message.answer("⛔ Можно оформлять возврат только по своим заказам.")
     # Отгружен/оплачен/частично-возвращён ИЛИ оплачен по легаси (paid_confirmed_at).
     if order.get("status") not in ("shipped", "paid", "partially_returned") and not order.get(
         "paid_confirmed_at"
@@ -132,6 +141,8 @@ async def cb_return_refund(call: CallbackQuery, state: FSMContext, bot: Bot):
         )
         for it in items
     ]
+    # H2: force (обход дедлайна возврата) — только начальству/складу, не менеджеру.
+    privileged = _has_role(call.from_user.id, "admin", "boss", "warehouse_keeper")
     res = await adb.create_return(
         order_id,
         "full",
@@ -139,7 +150,7 @@ async def cb_return_refund(call: CallbackQuery, state: FSMContext, bot: Bot):
         ret_items,
         refund_method=refund,
         created_by=call.from_user.id,
-        force=True,
+        force=privileged,
     )
     if not res.get("ok"):
         return await call.answer(f"⚠️ {res.get('error', 'не удалось')}", show_alert=True)

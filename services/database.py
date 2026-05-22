@@ -1210,9 +1210,30 @@ def _order_confirmed_deposit_amount(order_id: int) -> float:
     return float((row["s"] if USE_POSTGRES else row[0]) or 0)
 
 
+def _order_allocated_deposit_amount(order_id: int) -> float:
+    """Сколько распределено на заказ сдачами в статусе pending ИЛИ confirmed.
+    M3: при FIFO-распределении учитываем и pending — иначе две сдачи подряд
+    «забронируют» один и тот же остаток дважды."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "SELECT COALESCE(SUM(cdo.amount_allocated), 0) AS s "
+                "FROM cash_deposit_orders cdo "
+                "JOIN cash_deposits d ON d.id = cdo.deposit_id "
+                "WHERE cdo.order_id = ? AND d.status IN ('pending', 'confirmed') "
+                "AND (d.deleted_at IS NULL)"
+            ),
+            (order_id,),
+        )
+        row = cur.fetchone()
+    return float((row["s"] if USE_POSTGRES else row[0]) or 0)
+
+
 def get_manager_open_orders_for_deposit(manager_id: int) -> list[dict]:
     """Отгруженные неоплаченные заказы менеджера (для распределения сдачи).
-    Возвращает [{id, total, covered, remaining}] по возрастанию created_at."""
+    Возвращает [{id, total, covered, remaining}] по возрастанию created_at.
+    covered учитывает уже распределённое pending+confirmed-сдачами (M3)."""
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
@@ -1226,10 +1247,16 @@ def get_manager_open_orders_for_deposit(manager_id: int) -> list[dict]:
     out = []
     for oid in ids:
         total = _order_total(oid)
-        covered = _order_confirmed_deposit_amount(oid)
-        out.append(
-            {"id": oid, "total": total, "covered": covered, "remaining": max(0.0, total - covered)}
-        )
+        covered = _order_allocated_deposit_amount(oid)
+        if total - covered > 0.01:
+            out.append(
+                {
+                    "id": oid,
+                    "total": total,
+                    "covered": covered,
+                    "remaining": max(0.0, total - covered),
+                }
+            )
     return out
 
 
@@ -1578,6 +1605,38 @@ def create_return(
         return {"ok": False, "error": "Возврат доступен только для отгруженных/оплаченных"}
     if not items:
         return {"ok": False, "error": "Не указаны позиции возврата"}
+
+    # H1: не плодим параллельные возвраты по одному заказу.
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "SELECT COUNT(*) AS c FROM returns WHERE order_id = ? "
+                "AND status = 'pending' AND (deleted_at IS NULL)"
+            ),
+            (order_id,),
+        )
+        row = cur.fetchone()
+    if int((row["c"] if USE_POSTGRES else row[0]) or 0) > 0:
+        return {"ok": False, "error": "По заказу уже есть возврат на рассмотрении"}
+
+    # H1: режем количество по доступному остатку (quantity - returned_qty) и
+    # пересчитываем сумму по цене позиции — не доверяем переданному amount.
+    oitems = {it["id"]: it for it in get_order_items(order_id)}
+    clamped: list[tuple] = []
+    for oitem_id, qty, _amount in items:
+        oi = oitems.get(oitem_id)
+        if not oi:
+            continue
+        available = float(oi.get("quantity", 0) or 0) - float(oi.get("returned_qty", 0) or 0)
+        take = min(float(qty), available)
+        if take <= 0:
+            continue
+        price = float(oi.get("price", 0) or 0)
+        clamped.append((oitem_id, take, round(take * price, 2)))
+    if not clamped:
+        return {"ok": False, "error": "Нет позиций, доступных к возврату"}
+    items = clamped
 
     deadline_days = int(get_setting("return_deadline_days", 90))
     shipped_at = order.get("shipped_at")
