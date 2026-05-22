@@ -18,6 +18,7 @@ python -m tasks.migrate                    # schema + data миграции, Д�
 python -m tasks.run_report {daily|weekly|monthly}
 python -m tasks.run_debts_notify
 python -m tasks.run_ms_sync_retry
+python -m tasks.run_ops_monitor          # дайджест: зависшие заявки/сдачи/возвраты/партии (1×/день)
 ```
 
 Конфиг тулчейна — в `pyproject.toml` (`[tool.ruff]`, `[tool.pytest.ini_options]`,
