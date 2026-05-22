@@ -666,6 +666,15 @@ function renderOrdersMain() {
             <button class="btn-delete-draft" data-id="${o.id}">🗑️ Удалить</button>
           </div>
         ` : ''}
+        ${o.status === 'approved' && isBoss ? `
+          <div class="draft-actions">
+            <button class="btn-reject-pay btn-cancel-order" data-id="${o.id}">🚫 Отменить заказ</button>
+          </div>
+          <div class="limit-edit cancel-box" data-id="${o.id}" hidden>
+            <input type="text" class="form-input cancel-reason" placeholder="Причина отмены">
+            <button class="btn-reject-pay cancel-send" data-id="${o.id}">Подтвердить отмену</button>
+          </div>
+        ` : ''}
       </div>
     `).join('');
 
@@ -716,6 +725,36 @@ function renderOrdersMain() {
           btn.disabled = false;
         }
       });
+    });
+  });
+
+  // Отмена заказа (босс): раскрыть поле причины.
+  document.querySelectorAll('.btn-cancel-order').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const box = document.querySelector(`.cancel-box[data-id="${btn.dataset.id}"]`);
+      if (box) box.hidden = !box.hidden;
+    });
+  });
+  document.querySelectorAll('.cancel-send').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const id = parseInt(btn.dataset.id);
+      const box = document.querySelector(`.cancel-box[data-id="${btn.dataset.id}"]`);
+      const reason = box.querySelector('.cancel-reason').value.trim();
+      if (reason.length < 3) { tg.showAlert('❌ Укажите причину'); return; }
+      btn.disabled = true;
+      try {
+        await api('/api/orders/cancel', { order_id: id, reason });
+        tg.HapticFeedback?.notificationOccurred('success');
+        tg.showAlert(`🚫 Заказ #${id} отменён`);
+        ordersData = null;
+        await renderOrders();
+      } catch (err) {
+        tg.HapticFeedback?.notificationOccurred('error');
+        tg.showAlert('❌ ' + err.message);
+        btn.disabled = false;
+      }
     });
   });
 

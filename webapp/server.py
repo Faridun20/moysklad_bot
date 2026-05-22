@@ -1537,6 +1537,50 @@ async def api_create_order(request: Request):
     return JSONResponse({"order_id": order_id})
 
 
+@app.post("/api/orders/cancel")
+async def api_orders_cancel(request: Request):
+    """Босс/админ отменяет approved-заказ (симметрично /cancel в боте).
+    Shipped → через возврат. Уведомляем создателя заказа."""
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_orders_cancel",
+    )
+    try:
+        order_id = int(data.get("order_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="order_id обязателен")
+    reason = (data.get("reason") or "").strip()
+    if len(reason) < 3:
+        raise HTTPException(status_code=400, detail="Укажите причину отмены")
+
+    order = await adb.get_order(order_id)
+    name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
+        "username", str(user["id"])
+    )
+    res = await adb.cancel_order(order_id, user["id"], name, reason)
+    if not res.get("ok"):
+        raise HTTPException(status_code=409, detail=res.get("error", "не удалось отменить"))
+
+    creator = order.get("user_id") if order else None
+    if creator and creator != user["id"]:
+        from utils.helpers import esc
+
+        bot = await get_notify_bot()
+        try:
+            await bot.send_message(
+                creator,
+                f"🚫 Ваш заказ #{order_id} отменён боссом.\nПричина: {esc(reason)}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.warning("order cancel notify failed", exc_info=True)
+    return JSONResponse({"ok": True, "order_id": order_id})
+
+
 @app.post("/api/orders/add_item")
 async def api_add_item(request: Request):
     data = await request.json()
