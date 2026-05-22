@@ -1788,9 +1788,59 @@ async function renderCashbox(container) {
       : '';
   }
 
+  // Блок оформления возврата (менеджер/кладовщик/босс).
+  const role = currentUser && currentUser.role;
+  const canReturn = ['admin', 'boss', 'warehouse_keeper', 'manager'].includes(role);
+  const returnBlock = canReturn ? `
+      <div class="section-label">Оформить возврат</div>
+      <div class="card">
+        <div class="form-row">
+          <label class="form-label">Номер заказа</label>
+          <input type="number" id="ret-order" class="form-input" placeholder="142" inputmode="numeric">
+        </div>
+        <div class="form-row">
+          <label class="form-label">Причина</label>
+          <input type="text" id="ret-reason" class="form-input" placeholder="Брак партии">
+        </div>
+        <div class="form-row">
+          <label class="form-label">Возврат денег</label>
+          <div class="cur-row">
+            <button class="cur-btn active" data-refund="debt_reduction">📉 В счёт долга</button>
+            <button class="cur-btn" data-refund="cash">💵 Наличными</button>
+            <button class="cur-btn" data-refund="no_refund">🚫 Без возврата</button>
+          </div>
+        </div>
+        <button id="ret-create" class="btn-primary">↩️ Оформить полный возврат</button>
+      </div>
+  ` : '';
+
   const confirmBlocks = depBlock + retBlock;
-  container.innerHTML = createBlock + myBlock + confirmBlocks
+  container.innerHTML = createBlock + returnBlock + myBlock + confirmBlocks
     || '<div class="loader">Нет записей на подтверждении</div>';
+
+  // Оформление возврата.
+  let selectedRefund = 'debt_reduction';
+  container.querySelectorAll('[data-refund]').forEach(b => {
+    b.addEventListener('click', () => {
+      container.querySelectorAll('[data-refund]').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+      selectedRefund = b.dataset.refund;
+    });
+  });
+  const retBtn = container.querySelector('#ret-create');
+  if (retBtn) {
+    retBtn.addEventListener('click', () => {
+      const orderId = parseInt(container.querySelector('#ret-order').value, 10);
+      const reason = container.querySelector('#ret-reason').value.trim();
+      if (!orderId) { tg.showAlert('❌ Укажите номер заказа'); return; }
+      if (reason.length < 3) { tg.showAlert('❌ Опишите причину'); return; }
+      haptic('light');
+      retBtn.disabled = true;
+      api('/api/returns/create', { order_id: orderId, reason, refund_method: selectedRefund })
+        .then(r => { tg.showAlert(`✅ Возврат #${r.return_id} отправлен на подтверждение`); renderCashbox(container); })
+        .catch(e => { tg.showAlert('❌ ' + e.message); retBtn.disabled = false; });
+    });
+  }
 
   // Создание сдачи (менеджер).
   const createBtn = container.querySelector('#dep-create');

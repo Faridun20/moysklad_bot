@@ -150,3 +150,46 @@ def test_returns_pending_and_confirm(client_env):
     )
     assert resp.status_code == 200, resp.text
     assert db.get_order(ids["order"])["status"] == "returned"
+
+
+def test_return_create_full(client_env):
+    client, db, ids, fake_bot = client_env
+    resp = client.post(
+        "/api/returns/create",
+        json={
+            "initData": str(ids["mgr"]),
+            "order_id": ids["order"],
+            "reason": "брак партии",
+            "refund_method": "debt_reduction",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    pend = db.get_pending_returns()
+    assert any(p["order_id"] == ids["order"] for p in pend)
+    assert fake_bot.sent  # подтверждающим ушло уведомление
+
+
+def test_return_create_validation(client_env):
+    client, db, ids, _ = client_env
+    # короткая причина
+    resp = client.post(
+        "/api/returns/create",
+        json={
+            "initData": str(ids["mgr"]),
+            "order_id": ids["order"],
+            "reason": "x",
+            "refund_method": "cash",
+        },
+    )
+    assert resp.status_code == 400
+    # плохой способ возврата
+    resp = client.post(
+        "/api/returns/create",
+        json={
+            "initData": str(ids["mgr"]),
+            "order_id": ids["order"],
+            "reason": "нормальная причина",
+            "refund_method": "bitcoin",
+        },
+    )
+    assert resp.status_code == 400

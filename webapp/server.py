@@ -1448,6 +1448,72 @@ async def api_returns_confirm(request: Request):
     )
 
 
+@app.post("/api/returns/create")
+async def api_returns_create(request: Request):
+    """Оформить полный возврат по заказу (быстрый флоу, как /return в боте).
+    Частичный возврат позиций — отдельной фазой."""
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "warehouse_keeper", "manager"),
+        rate_limit_scope="api_returns_create",
+        rate_limit_max=10,
+    )
+    try:
+        order_id = int(data.get("order_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="order_id обязателен")
+    reason = (data.get("reason") or "").strip()
+    if len(reason) < 3:
+        raise HTTPException(status_code=400, detail="Опишите причину возврата")
+    refund = data.get("refund_method")
+    if refund not in ("cash", "debt_reduction", "no_refund"):
+        raise HTTPException(status_code=400, detail="Некорректный способ возврата денег")
+
+    order = await adb.get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    if order.get("status") not in ("shipped", "paid", "partially_returned"):
+        raise HTTPException(
+            status_code=409, detail="Возврат доступен только для отгруженных/оплаченных"
+        )
+
+    items = await adb.get_order_items(order_id)
+    ret_items = [
+        (
+            it["id"],
+            float(it.get("quantity", 0)),
+            round(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0), 2),
+        )
+        for it in items
+    ]
+    res = await adb.create_return(
+        order_id,
+        "full",
+        reason,
+        ret_items,
+        refund_method=refund,
+        created_by=user["id"],
+        force=True,
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=409, detail=res.get("error", "не удалось"))
+
+    # То же уведомление с кнопками, что и бот-команда /return.
+    from handlers.returns import _notify_confirmers
+
+    bot = await get_notify_bot()
+    try:
+        await _notify_confirmers(bot, res["return_id"], order_id, res["total_amount"], refund)
+    except Exception:
+        logger.warning("return create notify failed", exc_info=True)
+    return JSONResponse(
+        {"ok": True, "return_id": res["return_id"], "total_amount": res["total_amount"]}
+    )
+
+
 # ─── API: создание заказа ────────────────────────────────────────────────────
 
 
