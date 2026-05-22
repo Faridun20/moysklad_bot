@@ -1272,8 +1272,10 @@ async def api_deposits_pending(request: Request):
         rate_limit_scope="api_deposits_pending",
     )
     deposits = await adb.get_pending_cash_deposits()
+    # Батч вместо N+1: одним запросом тянем заказы всех сдач сразу.
+    orders_by_deposit = await adb.get_cash_deposit_orders_batch([d["id"] for d in deposits])
     for d in deposits:
-        d["orders"] = await adb.get_cash_deposit_orders(d["id"])
+        d["orders"] = orders_by_deposit.get(d["id"], [])
     return JSONResponse({"ok": True, "deposits": deposits})
 
 

@@ -779,23 +779,39 @@ def seed_app_settings() -> int:
     return inserted
 
 
+# TTL-кэш настроек: app_settings меняются редко, а читаются на горячих путях
+# (кредитный дефолт, окна, пороги — иногда несколько раз за запрос). Ключ →
+# (monotonic_ts, value). Инвалидация — в set_setting; в тестах кэш обнуляется
+# reload'ом модуля (см. фикстуру isolated_db в conftest).
+_SETTINGS_TTL = 120.0
+_settings_cache: dict[str, tuple[float, Any]] = {}
+
+
 def get_setting(key: str, default=None):
     """Прочитать настройку (JSON-десериализация value). Падать не должна —
-    при любой проблеме возвращает default."""
+    при любой проблеме возвращает default. Значение из БД/дефолтов кэшируется
+    на _SETTINGS_TTL сек; переданный вызывающим default НЕ кэшируется."""
     import json as _json
 
+    entry = _settings_cache.get(key)
+    if entry is not None and time.monotonic() - entry[0] < _SETTINGS_TTL:
+        return entry[1]
     try:
         with get_conn() as conn:
             cur = get_cursor(conn)
             cur.execute(q("SELECT value FROM app_settings WHERE key = ?"), (key,))
             row = cur.fetchone()
         if not row:
-            # Не засеяно — берём из дефолтов, если есть.
+            # Не засеяно — берём из дефолтов, если есть (их тоже кэшируем).
             if key in _DEFAULT_SETTINGS:
-                return _DEFAULT_SETTINGS[key][0]
-            return default
+                val = _DEFAULT_SETTINGS[key][0]
+                _settings_cache[key] = (time.monotonic(), val)
+                return val
+            return default  # неизвестный ключ — не кэшируем чужой default
         raw = row["value"] if USE_POSTGRES else row[0]
-        return _json.loads(raw)
+        val = _json.loads(raw)
+        _settings_cache[key] = (time.monotonic(), val)
+        return val
     except Exception as e:
         logger.warning("get_setting %s failed: %s", key, e)
         return default
@@ -824,6 +840,7 @@ def set_setting(key: str, value, updated_by: int | None = None) -> None:
                 (key, _json.dumps(value), updated_by, now_str()),
             )
         conn.commit()
+    _settings_cache.pop(key, None)  # инвалидация TTL-кэша
 
 
 # ─── IMPLEMENTATION.md Фаза 3: кредитные лимиты ───────────────────────────────
@@ -1465,6 +1482,34 @@ def get_cash_deposit_orders(deposit_id: int) -> list[dict]:
             (deposit_id,),
         )
         return [dict(r) for r in cur.fetchall()]
+
+
+def get_cash_deposit_orders_batch(deposit_ids: list[int]) -> dict[int, list[dict]]:
+    """Батч-версия get_cash_deposit_orders: {deposit_id: [{order_id, amount_allocated}]}.
+    Один SQL вместо N (был N+1 в /api/deposits/pending). Депозиты без привязанных
+    заказов в результат не попадают — caller использует .get(id, [])."""
+    if not deposit_ids:
+        return {}
+    unique_ids = list(set(deposit_ids))
+    placeholders = ",".join(["?"] * len(unique_ids))
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                f"SELECT deposit_id, order_id, amount_allocated FROM cash_deposit_orders "
+                f"WHERE deposit_id IN ({placeholders})"
+            ),
+            unique_ids,
+        )
+        rows = cur.fetchall()
+    grouped: dict[int, list[dict]] = {}
+    for r in rows:
+        d = dict(r)
+        # Форма элемента — как у get_cash_deposit_orders (без deposit_id).
+        grouped.setdefault(d["deposit_id"], []).append(
+            {"order_id": d["order_id"], "amount_allocated": d["amount_allocated"]}
+        )
+    return grouped
 
 
 def get_manager_cash_deposits(manager_id: int, limit: int = 20) -> list[dict]:
