@@ -323,13 +323,11 @@ def _create_tables():
                 demand_id   TEXT PRIMARY KEY,
                 notified_at TEXT
             )""",
-
             # ─── IMPLEMENTATION.md Фаза 1–2 (адаптировано под dual-DB) ──────────
             # Конвенции проекта: TEXT для JSON/UUID/timestamp, REAL для денег,
             # INTEGER 0/1 для boolean, BIGINT — telegram user_id, без FK
             # (как и остальные таблицы здесь). Postgres-специфику (JSONB,
             # gen_random_uuid, NUMERIC) НЕ используем — иначе ломается SQLite.
-
             # Кредитный лимит контрагента. agent_id — UUID контрагента МойСклад.
             """CREATE TABLE IF NOT EXISTS credit_limits (
                 agent_id     TEXT PRIMARY KEY,
@@ -340,7 +338,6 @@ def _create_tables():
                 updated_at   TEXT,
                 created_at   TEXT
             )""",
-
             # Сдача наличных в кассу (manager → касса). status: pending|confirmed|rejected.
             f"""CREATE TABLE IF NOT EXISTS cash_deposits (
                 id           {id_type},
@@ -355,7 +352,6 @@ def _create_tables():
                 deleted_at   TEXT,
                 created_at   TEXT
             )""",
-
             # Распределение одной сдачи по заказам (composite PK).
             """CREATE TABLE IF NOT EXISTS cash_deposit_orders (
                 deposit_id       BIGINT NOT NULL,
@@ -364,7 +360,6 @@ def _create_tables():
                 is_manual        INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (deposit_id, order_id)
             )""",
-
             # Возвраты товара. return_type: partial|full. status: pending|confirmed|rejected.
             f"""CREATE TABLE IF NOT EXISTS returns (
                 id           {id_type},
@@ -382,7 +377,6 @@ def _create_tables():
                 confirmed_at TEXT,
                 deleted_at   TEXT
             )""",
-
             f"""CREATE TABLE IF NOT EXISTS return_items (
                 id            {id_type},
                 return_id     BIGINT NOT NULL,
@@ -390,7 +384,6 @@ def _create_tables():
                 qty           REAL NOT NULL,
                 amount        REAL NOT NULL
             )""",
-
             # Партии товара (FEFO). Используется только если МойСклад
             # поддерживает партии для товара; иначе order_items.batch_id NULL.
             """CREATE TABLE IF NOT EXISTS product_batches (
@@ -403,7 +396,6 @@ def _create_tables():
                 received_at       TEXT,
                 updated_at        TEXT
             )""",
-
             # Журнал изменений заказа (before/after/summary как JSON-текст).
             f"""CREATE TABLE IF NOT EXISTS order_change_log (
                 id              {id_type},
@@ -415,7 +407,6 @@ def _create_tables():
                 summary         TEXT,
                 created_at      TEXT
             )""",
-
             # Недоставленные уведомления (для retry-крона). channel: telegram|email|sms.
             f"""CREATE TABLE IF NOT EXISTS failed_notifications (
                 id                {id_type},
@@ -431,7 +422,6 @@ def _create_tables():
                 resolved_by       BIGINT,
                 created_at        TEXT
             )""",
-
             # Журнал выгрузок audit_log в Google Drive (интеграция — позже).
             f"""CREATE TABLE IF NOT EXISTS audit_archive_exports (
                 id              {id_type},
@@ -445,7 +435,6 @@ def _create_tables():
                 exported_at     TEXT,
                 exported_by     BIGINT
             )""",
-
             # Контакты клиента для уведомлений (opt-in).
             """CREATE TABLE IF NOT EXISTS client_contacts (
                 agent_id              TEXT PRIMARY KEY,
@@ -458,7 +447,6 @@ def _create_tables():
                 created_at            TEXT,
                 updated_at            TEXT
             )""",
-
             # Ключи идемпотентности для мутаций (result как JSON-текст).
             """CREATE TABLE IF NOT EXISTS idempotency_keys (
                 key        TEXT PRIMARY KEY,
@@ -468,7 +456,6 @@ def _create_tables():
                 created_at TEXT,
                 expires_at TEXT
             )""",
-
             # Настройки приложения (value как JSON-текст). Источник «магических чисел».
             """CREATE TABLE IF NOT EXISTS app_settings (
                 key         TEXT PRIMARY KEY,
@@ -477,7 +464,6 @@ def _create_tables():
                 updated_by  BIGINT,
                 updated_at  TEXT
             )""",
-
             # Журнал запусков cron-задач.
             f"""CREATE TABLE IF NOT EXISTS cron_runs (
                 id          {id_type},
@@ -619,7 +605,6 @@ def run_migrations():
             # 'synced', 'failed' (с описанием в ms_sync_error).
             ("payments", "ms_sync_status", "TEXT"),
             ("payments", "ms_sync_error", "TEXT"),
-
             # ─── IMPLEMENTATION.md Фаза 2 (адаптировано: BOOLEAN→INTEGER 0/1,
             #     JSONB→TEXT, NUMERIC→REAL, без FK). Все колонки аддитивны. ──────
             # users → у нас user_roles (telegram-id как PK).
@@ -748,7 +733,10 @@ _DEFAULT_SETTINGS: dict[str, tuple] = {
     "stale_pending_escalation_days": (5, "Через сколько дней — алерт-эскалация админу"),
     "reject_max_cycles": (3, "Максимум циклов reject→resubmit перед freeze"),
     "price_check_threshold_percent": (15, "Цена ниже прайса на X% → warning боссу"),
-    "paid_order_confirmation_threshold": (500.0, "Сумма для двухступенчатого подтверждения paid-заказов"),
+    "paid_order_confirmation_threshold": (
+        500.0,
+        "Сумма для двухступенчатого подтверждения paid-заказов",
+    ),
     "audit_log_retention_months": (6, "Сколько месяцев аудита держим в БД"),
     "soft_delete_retention_days": (365, "Через сколько дней soft-deleted удаляется физически"),
     "moysklad_retry_max_attempts": (3, "Макс попыток для МойСклад API"),
@@ -764,6 +752,7 @@ def seed_app_settings() -> int:
     """Засеять дефолтные настройки, не перетирая уже изменённые. Возвращает
     число вставленных ключей."""
     import json as _json
+
     inserted = 0
     with get_conn() as conn:
         cur = get_cursor(conn)
@@ -793,6 +782,7 @@ def get_setting(key: str, default=None):
     """Прочитать настройку (JSON-десериализация value). Падать не должна —
     при любой проблеме возвращает default."""
     import json as _json
+
     try:
         with get_conn() as conn:
             cur = get_cursor(conn)
@@ -813,6 +803,7 @@ def get_setting(key: str, default=None):
 def set_setting(key: str, value, updated_by: int | None = None) -> None:
     """Записать настройку (value сериализуется в JSON). Создаёт ключ при отсутствии."""
     import json as _json
+
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
@@ -878,8 +869,11 @@ def ensure_credit_limit(agent_id: str, agent_name: str) -> None:
 
 
 def set_credit_limit(
-    agent_id: str, agent_name: str, limit_amount: float,
-    set_by: int | None = None, notes: str | None = None,
+    agent_id: str,
+    agent_name: str,
+    limit_amount: float,
+    set_by: int | None = None,
+    notes: str | None = None,
 ) -> None:
     """Установить/изменить лимит + запись в audit_log."""
     with get_conn() as conn:
@@ -903,7 +897,10 @@ def set_credit_limit(
         conn.commit()
     if set_by:
         add_audit_log(
-            set_by, "", get_role(set_by), "credit_limit_changed",
+            set_by,
+            "",
+            get_role(set_by),
+            "credit_limit_changed",
             f"{agent_name}: лимит → {limit_amount:.0f} USD" + (f" ({notes})" if notes else ""),
         )
 
@@ -917,9 +914,11 @@ def get_agent_current_debt(agent_id: str) -> float:
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("SELECT id FROM orders WHERE agent_id = ? "
-              "AND status NOT IN ('draft', 'rejected', 'cancelled') "
-              "AND (deleted_at IS NULL)"),
+            q(
+                "SELECT id FROM orders WHERE agent_id = ? "
+                "AND status NOT IN ('draft', 'rejected', 'cancelled') "
+                "AND (deleted_at IS NULL)"
+            ),
             (agent_id,),
         )
         order_ids = [(r["id"] if USE_POSTGRES else r[0]) for r in cur.fetchall()]
@@ -929,8 +928,10 @@ def get_agent_current_debt(agent_id: str) -> float:
         with get_conn() as conn:
             cur = get_cursor(conn)
             cur.execute(
-                q("SELECT COALESCE(SUM(total_amount), 0) AS s FROM returns "
-                  "WHERE order_id = ? AND status = 'confirmed' AND (deleted_at IS NULL)"),
+                q(
+                    "SELECT COALESCE(SUM(total_amount), 0) AS s FROM returns "
+                    "WHERE order_id = ? AND status = 'confirmed' AND (deleted_at IS NULL)"
+                ),
                 (oid,),
             )
             row = cur.fetchone()
@@ -957,19 +958,28 @@ def check_credit_limit(agent_id: str, order_total: float) -> dict:
 
 
 def log_order_change(
-    order_id: int, changed_by: int, change_type: str,
-    before: dict | None = None, after: dict | None = None, summary: dict | None = None,
+    order_id: int,
+    changed_by: int,
+    change_type: str,
+    before: dict | None = None,
+    after: dict | None = None,
+    summary: dict | None = None,
 ) -> None:
     """Записать изменение заказа в order_change_log (snapshots как JSON-текст)."""
     import json as _json
+
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("INSERT INTO order_change_log "
-              "(order_id, changed_by, change_type, before_snapshot, after_snapshot, summary, created_at) "
-              "VALUES (?, ?, ?, ?, ?, ?, ?)"),
+            q(
+                "INSERT INTO order_change_log "
+                "(order_id, changed_by, change_type, before_snapshot, after_snapshot, summary, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)"
+            ),
             (
-                order_id, changed_by, change_type,
+                order_id,
+                changed_by,
+                change_type,
                 _json.dumps(before) if before is not None else None,
                 _json.dumps(after) if after is not None else None,
                 _json.dumps(summary) if summary is not None else None,
@@ -983,7 +993,10 @@ def log_order_change(
 
 
 def reject_order_to_draft(
-    order_id: int, rejected_by: int, rejected_name: str, comment: str,
+    order_id: int,
+    rejected_by: int,
+    rejected_name: str,
+    comment: str,
 ) -> dict:
     """Reject заявки по модели IMPLEMENTATION.md §6.4: заказ возвращается в
     draft с комментарием, счётчик отклонений растёт, после reject_max_cycles
@@ -1005,9 +1018,11 @@ def reject_order_to_draft(
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("UPDATE orders SET status = 'draft', rejection_comment = ?, "
-              "rejection_count = ?, frozen = ?, updated_at = ? "
-              "WHERE id = ? AND status = 'pending'"),
+            q(
+                "UPDATE orders SET status = 'draft', rejection_comment = ?, "
+                "rejection_count = ?, frozen = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'pending'"
+            ),
             (comment, rc, frozen, now_str(), order_id),
         )
         updated = cur.rowcount > 0
@@ -1016,7 +1031,10 @@ def reject_order_to_draft(
         return {"ok": False, "error": "Заказ уже обработан"}
 
     add_audit_log(
-        rejected_by, rejected_name, get_role(rejected_by), "order_rejected",
+        rejected_by,
+        rejected_name,
+        get_role(rejected_by),
+        "order_rejected",
         f"Заказ #{order_id} → draft (попытка {rc}/{max_cycles})"
         + (" — ЗАМОРОЖЕН" if frozen else ""),
     )
@@ -1033,7 +1051,10 @@ def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, reason: 
         return {"ok": False, "error": "Заказ не найден"}
     status = order.get("status")
     if status != "approved":
-        return {"ok": False, "error": "Отмена доступна только для approved (shipped → через возврат)"}
+        return {
+            "ok": False,
+            "error": "Отмена доступна только для approved (shipped → через возврат)",
+        }
     deadline = order.get("cancellation_deadline")
     if deadline and now_str() > deadline:
         return {"ok": False, "error": "Окно отмены истекло"}
@@ -1041,9 +1062,11 @@ def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, reason: 
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("UPDATE orders SET status = 'cancelled', cancelled_at = ?, "
-              "cancelled_by = ?, cancellation_reason = ?, updated_at = ? "
-              "WHERE id = ? AND status = 'approved'"),
+            q(
+                "UPDATE orders SET status = 'cancelled', cancelled_at = ?, "
+                "cancelled_by = ?, cancellation_reason = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'approved'"
+            ),
             (now_str(), cancelled_by, reason, now_str(), order_id),
         )
         updated = cur.rowcount > 0
@@ -1052,7 +1075,10 @@ def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, reason: 
         return {"ok": False, "error": "Заказ уже обработан"}
 
     add_audit_log(
-        cancelled_by, cancelled_name, get_role(cancelled_by), "order_cancelled",
+        cancelled_by,
+        cancelled_name,
+        get_role(cancelled_by),
+        "order_cancelled",
         f"Заказ #{order_id} отменён: {reason[:200]}",
     )
     return {"ok": True, "error": None}
@@ -1062,12 +1088,15 @@ def get_stale_pending_orders(hours: int = 48) -> list[dict]:
     """Заявки, висящие в pending дольше `hours` (для stale-мониторинга, §13).
     Берём COALESCE(submitted_at, created_at)."""
     from datetime import timedelta
+
     cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("SELECT * FROM orders WHERE status = 'pending' AND (deleted_at IS NULL) "
-              "AND COALESCE(submitted_at, created_at) < ? ORDER BY created_at ASC"),
+            q(
+                "SELECT * FROM orders WHERE status = 'pending' AND (deleted_at IS NULL) "
+                "AND COALESCE(submitted_at, created_at) < ? ORDER BY created_at ASC"
+            ),
             (cutoff,),
         )
         return [dict(r) for r in cur.fetchall()]
@@ -1090,10 +1119,12 @@ def _order_confirmed_deposit_amount(order_id: int) -> float:
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("SELECT COALESCE(SUM(cdo.amount_allocated), 0) AS s "
-              "FROM cash_deposit_orders cdo "
-              "JOIN cash_deposits d ON d.id = cdo.deposit_id "
-              "WHERE cdo.order_id = ? AND d.status = 'confirmed' AND (d.deleted_at IS NULL)"),
+            q(
+                "SELECT COALESCE(SUM(cdo.amount_allocated), 0) AS s "
+                "FROM cash_deposit_orders cdo "
+                "JOIN cash_deposits d ON d.id = cdo.deposit_id "
+                "WHERE cdo.order_id = ? AND d.status = 'confirmed' AND (d.deleted_at IS NULL)"
+            ),
             (order_id,),
         )
         row = cur.fetchone()
@@ -1106,8 +1137,10 @@ def get_manager_open_orders_for_deposit(manager_id: int) -> list[dict]:
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("SELECT id FROM orders WHERE user_id = ? AND status = 'shipped' "
-              "AND payment_confirmed = 0 AND (deleted_at IS NULL) ORDER BY created_at ASC"),
+            q(
+                "SELECT id FROM orders WHERE user_id = ? AND status = 'shipped' "
+                "AND payment_confirmed = 0 AND (deleted_at IS NULL) ORDER BY created_at ASC"
+            ),
             (manager_id,),
         )
         ids = [(r["id"] if USE_POSTGRES else r[0]) for r in cur.fetchall()]
@@ -1115,13 +1148,16 @@ def get_manager_open_orders_for_deposit(manager_id: int) -> list[dict]:
     for oid in ids:
         total = _order_total(oid)
         covered = _order_confirmed_deposit_amount(oid)
-        out.append({"id": oid, "total": total, "covered": covered,
-                    "remaining": max(0.0, total - covered)})
+        out.append(
+            {"id": oid, "total": total, "covered": covered, "remaining": max(0.0, total - covered)}
+        )
     return out
 
 
 def create_cash_deposit(
-    manager_id: int, amount: float, allocations: list[tuple] | None = None,
+    manager_id: int,
+    amount: float,
+    allocations: list[tuple] | None = None,
 ) -> dict:
     """Создать сдачу (status=pending) + распределение по заказам.
 
@@ -1162,8 +1198,10 @@ def create_cash_deposit(
             deposit_id = cur.lastrowid
         for order_id, alloc in allocs:
             cur.execute(
-                q("INSERT INTO cash_deposit_orders (deposit_id, order_id, amount_allocated, is_manual) "
-                  "VALUES (?, ?, ?, ?)"),
+                q(
+                    "INSERT INTO cash_deposit_orders (deposit_id, order_id, amount_allocated, is_manual) "
+                    "VALUES (?, ?, ?, ?)"
+                ),
                 (deposit_id, order_id, alloc, 1 if is_manual else 0),
             )
         conn.commit()
@@ -1176,8 +1214,10 @@ def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_name: str
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("UPDATE cash_deposits SET status = 'confirmed', confirmed_by = ?, confirmed_at = ? "
-              "WHERE id = ? AND status = 'pending'"),
+            q(
+                "UPDATE cash_deposits SET status = 'confirmed', confirmed_by = ?, confirmed_at = ? "
+                "WHERE id = ? AND status = 'pending'"
+            ),
             (confirmed_by, now_str(), deposit_id),
         )
         updated = cur.rowcount > 0
@@ -1196,15 +1236,20 @@ def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_name: str
             with get_conn() as conn:
                 cur = get_cursor(conn)
                 cur.execute(
-                    q("UPDATE orders SET payment_confirmed = 1, payment_confirmed_at = ?, "
-                      "status = 'paid', updated_at = ? WHERE id = ? AND payment_confirmed = 0"),
+                    q(
+                        "UPDATE orders SET payment_confirmed = 1, payment_confirmed_at = ?, "
+                        "status = 'paid', updated_at = ? WHERE id = ? AND payment_confirmed = 0"
+                    ),
                     (now_str(), now_str(), oid),
                 )
                 if cur.rowcount > 0:
                     closed.append(oid)
                 conn.commit()
     add_audit_log(
-        confirmed_by, confirmed_name, get_role(confirmed_by), "cash_deposit_confirmed",
+        confirmed_by,
+        confirmed_name,
+        get_role(confirmed_by),
+        "cash_deposit_confirmed",
         f"Сдача #{deposit_id} подтверждена; закрыты заказы: {closed or '—'}",
     )
     return {"ok": True, "closed_orders": closed}
@@ -1214,8 +1259,10 @@ def reject_cash_deposit(deposit_id: int, rejected_by: int, rejected_name: str, r
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("UPDATE cash_deposits SET status = 'rejected', reject_reason = ?, "
-              "confirmed_by = ?, confirmed_at = ? WHERE id = ? AND status = 'pending'"),
+            q(
+                "UPDATE cash_deposits SET status = 'rejected', reject_reason = ?, "
+                "confirmed_by = ?, confirmed_at = ? WHERE id = ? AND status = 'pending'"
+            ),
             (reason, rejected_by, now_str(), deposit_id),
         )
         updated = cur.rowcount > 0
@@ -1223,7 +1270,10 @@ def reject_cash_deposit(deposit_id: int, rejected_by: int, rejected_name: str, r
     if not updated:
         return {"ok": False, "error": "Сдача уже обработана"}
     add_audit_log(
-        rejected_by, rejected_name, get_role(rejected_by), "cash_deposit_rejected",
+        rejected_by,
+        rejected_name,
+        get_role(rejected_by),
+        "cash_deposit_rejected",
         f"Сдача #{deposit_id} отклонена: {reason[:200]}",
     )
     return {"ok": True}
@@ -1234,8 +1284,10 @@ def get_pending_cash_deposits() -> list[dict]:
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("SELECT * FROM cash_deposits WHERE status = 'pending' AND (deleted_at IS NULL) "
-              "ORDER BY deposited_at ASC")
+            q(
+                "SELECT * FROM cash_deposits WHERE status = 'pending' AND (deleted_at IS NULL) "
+                "ORDER BY deposited_at ASC"
+            )
         )
         return [dict(r) for r in cur.fetchall()]
 
@@ -1243,13 +1295,16 @@ def get_pending_cash_deposits() -> list[dict]:
 def get_overdue_undeposited_orders(days: int = 2) -> list[dict]:
     """Отгруженные неоплаченные заказы старше `days` (cash-эскалация, §7.6)."""
     from datetime import timedelta
+
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("SELECT * FROM orders WHERE status = 'shipped' AND payment_confirmed = 0 "
-              "AND (deleted_at IS NULL) AND COALESCE(shipped_at, created_at) < ? "
-              "ORDER BY user_id, created_at"),
+            q(
+                "SELECT * FROM orders WHERE status = 'shipped' AND payment_confirmed = 0 "
+                "AND (deleted_at IS NULL) AND COALESCE(shipped_at, created_at) < ? "
+                "ORDER BY user_id, created_at"
+            ),
             (cutoff,),
         )
         return [dict(r) for r in cur.fetchall()]
@@ -1259,12 +1314,16 @@ def get_overdue_undeposited_orders(days: int = 2) -> list[dict]:
 
 
 def upsert_product_batch(
-    product_id: str, moysklad_batch_id: str | None, batch_code: str,
-    expiry_date: str | None, qty_remaining: float,
+    product_id: str,
+    moysklad_batch_id: str | None,
+    batch_code: str,
+    expiry_date: str | None,
+    qty_remaining: float,
 ) -> str:
     """UPSERT партии по moysklad_batch_id (натуральный ключ из МС). Возвращает
     id строки (uuid). Используется синком партий (§9.1)."""
     import uuid as _uuid
+
     with get_conn() as conn:
         cur = get_cursor(conn)
         existing = None
@@ -1277,18 +1336,30 @@ def upsert_product_batch(
             existing = (row["id"] if USE_POSTGRES else row[0]) if row else None
         if existing:
             cur.execute(
-                q("UPDATE product_batches SET product_id = ?, batch_code = ?, "
-                  "expiry_date = ?, qty_remaining = ?, updated_at = ? WHERE id = ?"),
+                q(
+                    "UPDATE product_batches SET product_id = ?, batch_code = ?, "
+                    "expiry_date = ?, qty_remaining = ?, updated_at = ? WHERE id = ?"
+                ),
                 (product_id, batch_code, expiry_date, qty_remaining, now_str(), existing),
             )
             conn.commit()
             return existing
         bid = _uuid.uuid4().hex
         cur.execute(
-            q("INSERT INTO product_batches (id, product_id, moysklad_batch_id, batch_code, "
-              "expiry_date, qty_remaining, received_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"),
-            (bid, product_id, moysklad_batch_id, batch_code, expiry_date,
-             qty_remaining, now_str(), now_str()),
+            q(
+                "INSERT INTO product_batches (id, product_id, moysklad_batch_id, batch_code, "
+                "expiry_date, qty_remaining, received_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            ),
+            (
+                bid,
+                product_id,
+                moysklad_batch_id,
+                batch_code,
+                expiry_date,
+                qty_remaining,
+                now_str(),
+                now_str(),
+            ),
         )
         conn.commit()
         return bid
@@ -1300,9 +1371,11 @@ def select_batches_fefo(product_id: str, qty: float) -> list[dict]:
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("SELECT id, expiry_date, qty_remaining FROM product_batches "
-              "WHERE product_id = ? AND qty_remaining > 0 "
-              "ORDER BY (expiry_date IS NULL), expiry_date ASC"),
+            q(
+                "SELECT id, expiry_date, qty_remaining FROM product_batches "
+                "WHERE product_id = ? AND qty_remaining > 0 "
+                "ORDER BY (expiry_date IS NULL), expiry_date ASC"
+            ),
             (product_id,),
         )
         rows = [dict(r) for r in cur.fetchall()]
@@ -1322,8 +1395,10 @@ def _adjust_batch_qty(batch_id: str, delta: float) -> None:
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("UPDATE product_batches SET qty_remaining = qty_remaining + ?, updated_at = ? "
-              "WHERE id = ?"),
+            q(
+                "UPDATE product_batches SET qty_remaining = qty_remaining + ?, updated_at = ? "
+                "WHERE id = ?"
+            ),
             (delta, now_str(), batch_id),
         )
         conn.commit()
@@ -1332,20 +1407,27 @@ def _adjust_batch_qty(batch_id: str, delta: float) -> None:
 def get_batches_expiring_within(days: int = 7) -> list[dict]:
     """Партии с остатком, истекающие в ближайшие `days` дней (§9.4)."""
     from datetime import timedelta
+
     cutoff = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("SELECT * FROM product_batches WHERE qty_remaining > 0 "
-              "AND expiry_date IS NOT NULL AND expiry_date <= ? ORDER BY expiry_date ASC"),
+            q(
+                "SELECT * FROM product_batches WHERE qty_remaining > 0 "
+                "AND expiry_date IS NOT NULL AND expiry_date <= ? ORDER BY expiry_date ASC"
+            ),
             (cutoff,),
         )
         return [dict(r) for r in cur.fetchall()]
 
 
 def create_return(
-    order_id: int, return_type: str, reason: str,
-    items: list[tuple], refund_method: str | None, created_by: int,
+    order_id: int,
+    return_type: str,
+    reason: str,
+    items: list[tuple],
+    refund_method: str | None,
+    created_by: int,
     force: bool = False,
 ) -> dict:
     """Создать возврат (status=pending) + позиции. items = [(order_item_id, qty, amount)].
@@ -1365,9 +1447,13 @@ def create_return(
     shipped_at = order.get("shipped_at")
     if shipped_at and not force:
         from datetime import timedelta
+
         limit = (datetime.now() - timedelta(days=deadline_days)).strftime("%Y-%m-%d %H:%M:%S")
         if shipped_at < limit:
-            return {"ok": False, "error": f"Возврат позже {deadline_days} дней — нужно подтверждение"}
+            return {
+                "ok": False,
+                "error": f"Возврат позже {deadline_days} дней — нужно подтверждение",
+            }
 
     total_amount = round(sum(float(a) for _, _, a in items), 2)
     with get_conn() as conn:
@@ -1390,8 +1476,10 @@ def create_return(
             return_id = cur.lastrowid
         for oitem_id, qty, amount in items:
             cur.execute(
-                q("INSERT INTO return_items (return_id, order_item_id, qty, amount) "
-                  "VALUES (?, ?, ?, ?)"),
+                q(
+                    "INSERT INTO return_items (return_id, order_item_id, qty, amount) "
+                    "VALUES (?, ?, ?, ?)"
+                ),
                 (return_id, oitem_id, qty, amount),
             )
         conn.commit()
@@ -1429,8 +1517,10 @@ def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str = "") 
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("UPDATE returns SET status = 'confirmed', confirmed_by = ?, confirmed_at = ? "
-              "WHERE id = ? AND status = 'pending'"),
+            q(
+                "UPDATE returns SET status = 'confirmed', confirmed_by = ?, confirmed_at = ? "
+                "WHERE id = ? AND status = 'pending'"
+            ),
             (confirmed_by, now_str(), return_id),
         )
         if cur.rowcount == 0:
@@ -1461,10 +1551,14 @@ def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str = "") 
     order_id = ret["order_id"]
     # Полностью ли возвращён заказ?
     items = get_order_items(order_id)
-    fully = all(
-        float(it.get("returned_qty") or 0) + 1e-9 >= float(it.get("quantity") or 0)
-        for it in items
-    ) if items else False
+    fully = (
+        all(
+            float(it.get("returned_qty") or 0) + 1e-9 >= float(it.get("quantity") or 0)
+            for it in items
+        )
+        if items
+        else False
+    )
     new_status = "returned" if fully else "partially_returned"
     return_status = "full" if fully else "partial"
     with get_conn() as conn:
@@ -1481,18 +1575,30 @@ def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str = "") 
         with get_conn() as conn:
             cur = get_cursor(conn)
             cur.execute(
-                q("INSERT INTO cash_deposits (manager_id, amount, deposited_at, status, "
-                  "confirmed_by, confirmed_at, notes, created_at) "
-                  "VALUES (?, ?, ?, 'confirmed', ?, ?, ?, ?)"),
-                ((order or {}).get("user_id") or confirmed_by, -float(ret["total_amount"]),
-                 now_str(), confirmed_by, now_str(), f"refund возврат #{return_id}", now_str()),
+                q(
+                    "INSERT INTO cash_deposits (manager_id, amount, deposited_at, status, "
+                    "confirmed_by, confirmed_at, notes, created_at) "
+                    "VALUES (?, ?, ?, 'confirmed', ?, ?, ?, ?)"
+                ),
+                (
+                    (order or {}).get("user_id") or confirmed_by,
+                    -float(ret["total_amount"]),
+                    now_str(),
+                    confirmed_by,
+                    now_str(),
+                    f"refund возврат #{return_id}",
+                    now_str(),
+                ),
             )
             conn.commit()
     # debt_reduction / no_refund — отдельной записи не требуют (долг учитывает
     # подтверждённые возвраты в get_agent_current_debt).
 
     add_audit_log(
-        confirmed_by, confirmed_name, get_role(confirmed_by), "return_confirmed",
+        confirmed_by,
+        confirmed_name,
+        get_role(confirmed_by),
+        "return_confirmed",
         f"Возврат #{return_id} по заказу #{order_id} ({return_status}, "
         f"{ret['total_amount']:.0f} USD, {ret.get('refund_method')})",
     )
@@ -1503,8 +1609,10 @@ def get_pending_returns() -> list[dict]:
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("SELECT * FROM returns WHERE status = 'pending' AND (deleted_at IS NULL) "
-              "ORDER BY created_at ASC")
+            q(
+                "SELECT * FROM returns WHERE status = 'pending' AND (deleted_at IS NULL) "
+                "ORDER BY created_at ASC"
+            )
         )
         return [dict(r) for r in cur.fetchall()]
 

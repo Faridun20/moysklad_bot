@@ -58,8 +58,10 @@ def test_manual_allocation(mgr_orders):
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)
         cur.execute(
-            db.q("SELECT order_id, amount_allocated, is_manual FROM cash_deposit_orders "
-                 "WHERE deposit_id = ? ORDER BY order_id"),
+            db.q(
+                "SELECT order_id, amount_allocated, is_manual FROM cash_deposit_orders "
+                "WHERE deposit_id = ? ORDER BY order_id"
+            ),
             (res["deposit_id"],),
         )
         rows = cur.fetchall()
@@ -91,6 +93,7 @@ def test_pending_list_and_overdue(mgr_orders):
 
     # Состарим отгрузку o2 → попадёт в overdue.
     from datetime import datetime, timedelta
+
     old = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)

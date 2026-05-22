@@ -49,6 +49,7 @@ async def cmd_addrole(message: Message):
     # Раньше тут была своя копия, рассинхрон с set_role давал silent-fail.
     role = parts[2].lower()
     from services.roles import VALID_ROLES
+
     if role not in VALID_ROLES:
         return await message.answer(f"❌ Роль должна быть одной из: {', '.join(VALID_ROLES)}")
 

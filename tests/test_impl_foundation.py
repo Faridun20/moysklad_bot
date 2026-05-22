@@ -17,10 +17,19 @@ def _order(status: str) -> dict:
 # ─── Схема: новые таблицы и колонки ──────────────────────────────────────────
 
 _NEW_TABLES = {
-    "credit_limits", "cash_deposits", "cash_deposit_orders", "returns",
-    "return_items", "product_batches", "order_change_log", "failed_notifications",
-    "audit_archive_exports", "client_contacts", "idempotency_keys",
-    "app_settings", "cron_runs",
+    "credit_limits",
+    "cash_deposits",
+    "cash_deposit_orders",
+    "returns",
+    "return_items",
+    "product_batches",
+    "order_change_log",
+    "failed_notifications",
+    "audit_archive_exports",
+    "client_contacts",
+    "idempotency_keys",
+    "app_settings",
+    "cron_runs",
 }
 
 
@@ -39,8 +48,14 @@ def test_new_order_columns_present(isolated_db):
         cur = db.get_cursor(conn)
         cur.execute("PRAGMA table_info(orders)")
         cols = {r[1] for r in cur.fetchall()}
-    for c in ("frozen", "cancelled_at", "payment_confirmed", "rejection_count",
-              "cancellation_deadline", "return_status"):
+    for c in (
+        "frozen",
+        "cancelled_at",
+        "payment_confirmed",
+        "rejection_count",
+        "cancellation_deadline",
+        "return_status",
+    ):
         assert c in cols, f"нет колонки orders.{c}"
 
 
@@ -96,6 +111,7 @@ def test_role_predicates(isolated_db):
     db = isolated_db
     import importlib
     import services.roles as roles
+
     importlib.reload(roles)
     db.set_role(601, "b", "B", "bookkeeper")
     db.set_role(602, "w", "W", "warehouse_keeper")

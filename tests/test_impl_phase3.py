@@ -52,8 +52,10 @@ def test_confirmed_return_reduces_debt(isolated_db):
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)
         cur.execute(
-            db.q("INSERT INTO returns (order_id, return_type, reason, total_amount, "
-                 "created_by, status, created_at) VALUES (?, ?, ?, ?, ?, 'confirmed', ?)"),
+            db.q(
+                "INSERT INTO returns (order_id, return_type, reason, total_amount, "
+                "created_by, status, created_at) VALUES (?, ?, ?, ?, ?, 'confirmed', ?)"
+            ),
             (oid, "partial", "брак", 100.0, mgr, db.now_str()),
         )
         conn.commit()
@@ -96,11 +98,14 @@ def test_reject_only_from_pending(isolated_db):
 def test_log_order_change_writes_row(isolated_db):
     db = isolated_db
     oid, mgr = _agent_order(db, 100.0, agent="A-6")
-    db.log_order_change(oid, mgr, "edit", before={"x": 1}, after={"x": 2},
-                        summary={"items_added": 1})
+    db.log_order_change(
+        oid, mgr, "edit", before={"x": 1}, after={"x": 2}, summary={"items_added": 1}
+    )
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)
-        cur.execute(db.q("SELECT change_type, summary FROM order_change_log WHERE order_id = ?"), (oid,))
+        cur.execute(
+            db.q("SELECT change_type, summary FROM order_change_log WHERE order_id = ?"), (oid,)
+        )
         row = cur.fetchone()
     assert row is not None
 
@@ -112,8 +117,8 @@ def test_compute_resubmit_summary():
     ]
     after = [
         {"product_href": "a", "quantity": 3, "price": 10},  # modified (qty)
-        {"product_href": "c", "quantity": 1, "price": 7},   # added
-    ]                                                        # b — removed
+        {"product_href": "c", "quantity": 1, "price": 7},  # added
+    ]  # b — removed
     s = compute_resubmit_summary(before, after, 25.0, 37.0, payment_type_changed=True)
     assert s["items_added"] == 1
     assert s["items_removed"] == 1
@@ -132,6 +137,7 @@ def test_cancel_approved_within_window(isolated_db):
     oid, mgr = _agent_order(db, 100.0, status="approved", agent="A-7")
     # Дедлайн в будущем → отмена проходит.
     from datetime import datetime, timedelta
+
     future = (datetime.now() + timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S")
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)
@@ -146,6 +152,7 @@ def test_cancel_blocked_after_deadline(isolated_db):
     db = isolated_db
     oid, mgr = _agent_order(db, 100.0, status="approved", agent="A-8")
     from datetime import datetime, timedelta
+
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)
@@ -168,6 +175,7 @@ def test_get_stale_pending_orders(isolated_db):
     old_oid, mgr = _agent_order(db, 100.0, status="pending", agent="A-10")
     fresh_oid, _ = _agent_order(db, 100.0, status="pending", agent="A-11")
     from datetime import datetime, timedelta
+
     old_ts = (datetime.now() - timedelta(hours=72)).strftime("%Y-%m-%d %H:%M:%S")
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)

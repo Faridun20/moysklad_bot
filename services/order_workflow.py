@@ -119,8 +119,9 @@ def compute_resubmit_summary(
     modified = 0
     for key in before_by.keys() & after_by.keys():
         b, a = before_by[key], after_by[key]
-        if (float(b.get("quantity", 0)) != float(a.get("quantity", 0))
-                or float(b.get("price", 0) or 0) != float(a.get("price", 0) or 0)):
+        if float(b.get("quantity", 0)) != float(a.get("quantity", 0)) or float(
+            b.get("price", 0) or 0
+        ) != float(a.get("price", 0) or 0):
             modified += 1
 
     return {
