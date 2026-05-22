@@ -35,6 +35,14 @@ if USE_POSTGRES:
     # сервисам (webapp как отдельный процесс, миграции и т.п.).
     _PG_POOL_MIN = int(os.environ.get("PG_POOL_MIN", "1"))
     _PG_POOL_MAX = int(os.environ.get("PG_POOL_MAX", "10"))
+    # Сколько ждать свободный коннект при временно исчерпанном пуле, прежде чем
+    # сдаться. asyncio.to_thread (через который идут все adb.* вызовы) может
+    # запустить больше DB-потоков, чем коннектов в пуле — размер дефолтного
+    # executor'а зависит от числа CPU хоста и обычно > PG_POOL_MAX. При всплеске
+    # параллельных запросов с фронта getconn() моментально кидал PoolError → 500.
+    # Теперь ждём освобождения (запросы выстраиваются в очередь к пулу).
+    _PG_POOL_ACQUIRE_TIMEOUT = float(os.environ.get("PG_POOL_ACQUIRE_TIMEOUT", "10"))
+    _PG_POOL_ACQUIRE_INTERVAL = 0.05
     _pg_connection_pool: _pg_pool.ThreadedConnectionPool | None = None
 
     def _get_pool() -> _pg_pool.ThreadedConnectionPool:
@@ -51,6 +59,34 @@ if USE_POSTGRES:
                 _PG_POOL_MAX,
             )
         return _pg_connection_pool
+
+    def _pool_getconn():
+        """getconn с ожиданием: при исчерпании пула ждём до
+        _PG_POOL_ACQUIRE_TIMEOUT сек, опрашивая раз в _PG_POOL_ACQUIRE_INTERVAL,
+        вместо мгновенного PoolError → 500. Выполняется в worker-потоке
+        (asyncio.to_thread), поэтому time.sleep не блокирует event loop.
+        По истечении таймаута пробрасываем PoolError."""
+        pool = _get_pool()
+        deadline = time.monotonic() + _PG_POOL_ACQUIRE_TIMEOUT
+        waited = False
+        while True:
+            try:
+                return pool.getconn()
+            except _pg_pool.PoolError:
+                if time.monotonic() >= deadline:
+                    logger.error(
+                        "Postgres pool исчерпан: ждали %.1fs (max=%d) — сдаёмся",
+                        _PG_POOL_ACQUIRE_TIMEOUT,
+                        _PG_POOL_MAX,
+                    )
+                    raise
+                if not waited:
+                    waited = True
+                    logger.warning(
+                        "Postgres pool исчерпан (max=%d) — ждём свободный коннект…",
+                        _PG_POOL_MAX,
+                    )
+                time.sleep(_PG_POOL_ACQUIRE_INTERVAL)
 else:
     import sqlite3
 
@@ -103,7 +139,7 @@ def get_conn():
     """
     if USE_POSTGRES:
         pool = _get_pool()
-        conn = pool.getconn()
+        conn = _pool_getconn()
         try:
             yield conn
         except Exception:
