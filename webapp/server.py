@@ -1198,6 +1198,203 @@ async def api_reject_request(request: Request):
     return JSONResponse({"ok": True, "req_id": req_id})
 
 
+# ─── API: кредитные лимиты (IMPLEMENTATION.md §3) ─────────────────────────────
+
+
+@app.post("/api/credit/overview")
+async def api_credit_overview(request: Request):
+    """Сводка по контрагентам: лимит + текущий долг + свободный остаток.
+    Только начальство. Логика — services.database.get_credit_overview."""
+    from services import async_db as adb
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_credit_overview",
+        rate_limit_max=30,
+        rate_limit_window=60.0,
+    )
+    agents = await adb.get_credit_overview()
+    return JSONResponse({"ok": True, "agents": agents})
+
+
+@app.post("/api/credit/set")
+async def api_credit_set(request: Request):
+    """Установить кредитный лимит контрагента. Только начальство."""
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_credit_set",
+        rate_limit_max=30,
+        rate_limit_window=60.0,
+    )
+    agent_id = (data.get("agent_id") or "").strip()
+    agent_name = (data.get("agent_name") or "").strip()
+    if not agent_id:
+        raise HTTPException(status_code=400, detail="agent_id обязателен")
+    try:
+        limit_amount = float(data.get("limit_amount"))
+        if limit_amount < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="limit_amount должен быть числом >= 0")
+
+    await adb.set_credit_limit(
+        agent_id, agent_name, limit_amount, set_by=user["id"], notes="WebApp"
+    )
+    return JSONResponse({"ok": True, "agent_id": agent_id, "limit_amount": limit_amount})
+
+
+# ─── API: сдачи наличных (IMPLEMENTATION.md §7) ───────────────────────────────
+
+
+@app.post("/api/deposits/pending")
+async def api_deposits_pending(request: Request):
+    """Сдачи, ждущие подтверждения, с привязанными заказами. admin/boss/bookkeeper."""
+    from services import async_db as adb
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss", "bookkeeper"),
+        rate_limit_scope="api_deposits_pending",
+    )
+    deposits = await adb.get_pending_cash_deposits()
+    for d in deposits:
+        d["orders"] = await adb.get_cash_deposit_orders(d["id"])
+    return JSONResponse({"ok": True, "deposits": deposits})
+
+
+@app.post("/api/deposits/confirm")
+async def api_deposits_confirm(request: Request):
+    """Подтвердить сдачу. Покрытые заказы → paid; уведомляем менеджера."""
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "bookkeeper"),
+        rate_limit_scope="api_deposits_confirm",
+    )
+    try:
+        deposit_id = int(data.get("deposit_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="deposit_id обязателен")
+
+    name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
+        "username", str(user["id"])
+    )
+    dep = await adb.get_cash_deposit(deposit_id)
+    res = await adb.confirm_cash_deposit(deposit_id, user["id"], name)
+    if not res.get("ok"):
+        raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
+
+    if dep and dep.get("manager_id"):
+        closed = res.get("closed_orders") or []
+        extra = f" Закрыты заказы: {', '.join('#' + str(o) for o in closed)}." if closed else ""
+        bot = await get_notify_bot()
+        try:
+            await bot.send_message(
+                dep["manager_id"], f"✅ Ваша сдача #{deposit_id} подтверждена.{extra}"
+            )
+        except Exception:
+            logger.warning("deposit confirm notify failed", exc_info=True)
+    return JSONResponse(
+        {"ok": True, "deposit_id": deposit_id, "closed_orders": res.get("closed_orders", [])}
+    )
+
+
+@app.post("/api/deposits/reject")
+async def api_deposits_reject(request: Request):
+    """Отклонить сдачу с причиной; уведомляем менеджера."""
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "bookkeeper"),
+        rate_limit_scope="api_deposits_reject",
+    )
+    try:
+        deposit_id = int(data.get("deposit_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="deposit_id обязателен")
+    reason = (data.get("reason") or "").strip()
+    if len(reason) < 3:
+        raise HTTPException(status_code=400, detail="Причина обязательна")
+
+    name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
+        "username", str(user["id"])
+    )
+    dep = await adb.get_cash_deposit(deposit_id)
+    res = await adb.reject_cash_deposit(deposit_id, user["id"], name, reason)
+    if not res.get("ok"):
+        raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
+
+    if dep and dep.get("manager_id"):
+        from utils.helpers import esc
+
+        bot = await get_notify_bot()
+        try:
+            await bot.send_message(
+                dep["manager_id"],
+                f"❌ Ваша сдача #{deposit_id} отклонена.\nПричина: {esc(reason)}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.warning("deposit reject notify failed", exc_info=True)
+    return JSONResponse({"ok": True, "deposit_id": deposit_id})
+
+
+# ─── API: возвраты (IMPLEMENTATION.md §8) ─────────────────────────────────────
+
+
+@app.post("/api/returns/pending")
+async def api_returns_pending(request: Request):
+    """Возвраты на подтверждении. admin/boss/warehouse_keeper."""
+    from services import async_db as adb
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss", "warehouse_keeper"),
+        rate_limit_scope="api_returns_pending",
+    )
+    returns = await adb.get_pending_returns()
+    return JSONResponse({"ok": True, "returns": returns})
+
+
+@app.post("/api/returns/confirm")
+async def api_returns_confirm(request: Request):
+    """Подтвердить возврат (статус заказа → returned/partially_returned)."""
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_returns_confirm",
+    )
+    try:
+        return_id = int(data.get("return_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="return_id обязателен")
+
+    name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
+        "username", str(user["id"])
+    )
+    res = await adb.confirm_return(return_id, user["id"], name)
+    if not res.get("ok"):
+        raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
+    return JSONResponse(
+        {"ok": True, "return_id": return_id, "order_status": res.get("order_status")}
+    )
+
+
 # ─── API: создание заказа ────────────────────────────────────────────────────
 
 
