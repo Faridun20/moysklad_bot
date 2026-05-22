@@ -479,23 +479,31 @@ async def get_sales_stats(since: datetime, until: datetime | None = None) -> dic
     )
 
     product_sums: dict[str, dict] = {}
+    demand_ids: list[str] = []
     for s in shipments[:15]:
-        demand_id = extract_id_from_href(s.get("meta", {}).get("href", ""))
-        if not demand_id:
-            continue
-        try:
-            positions = await get_shipment_positions(demand_id)
-            for pos in positions:
-                name = pos.get("assortment", {}).get("name", "—")
-                qty = pos.get("quantity", 0)
-                price = pos.get("price", 0)
-                pos_sum = qty * price
-                if name not in product_sums:
-                    product_sums[name] = {"sum": 0, "qty": 0}
-                product_sums[name]["sum"] += pos_sum
-                product_sums[name]["qty"] += qty
-        except Exception:
-            pass
+        did = extract_id_from_href(s.get("meta", {}).get("href", ""))
+        if did:
+            demand_ids.append(did)
+    # Позиции отгрузок независимы между собой — тянем параллельно. Раньше это
+    # был цикл из 15 последовательных HTTP к МС на каждое открытие «Аналитики»
+    # (секунды ожидания на холодном кэше). get_shipment_positions TTL-кэширован,
+    # ключи (demand_id) различны → без cache-стэмпиды.
+    results = await asyncio.gather(
+        *(get_shipment_positions(did) for did in demand_ids),
+        return_exceptions=True,
+    )
+    for positions in results:
+        if isinstance(positions, BaseException):
+            continue  # эквивалент прежнего per-item try/except: pass
+        for pos in positions:
+            name = pos.get("assortment", {}).get("name", "—")
+            qty = pos.get("quantity", 0)
+            price = pos.get("price", 0)
+            pos_sum = qty * price
+            if name not in product_sums:
+                product_sums[name] = {"sum": 0, "qty": 0}
+            product_sums[name]["sum"] += pos_sum
+            product_sums[name]["qty"] += qty
 
     top_products = sorted(product_sums.items(), key=lambda x: x[1]["sum"], reverse=True)[:5]
 
@@ -568,22 +576,27 @@ async def get_employee_stats(
 
     # По товарам
     product_sums: dict[str, dict] = {}
-    for s in shipments[:10]:  # Уменьшаем чтобы не превышать лимит
-        demand_id = extract_id_from_href(s.get("meta", {}).get("href", ""))
-        if not demand_id:
+    demand_ids: list[str] = []
+    for s in shipments[:10]:  # ограничиваем, чтобы не превышать лимит MS
+        did = extract_id_from_href(s.get("meta", {}).get("href", ""))
+        if did:
+            demand_ids.append(did)
+    # Параллельно (см. комментарий в get_sales_stats) — независимые позиции.
+    results = await asyncio.gather(
+        *(get_shipment_positions(did) for did in demand_ids),
+        return_exceptions=True,
+    )
+    for positions in results:
+        if isinstance(positions, BaseException):
             continue
-        try:
-            positions = await get_shipment_positions(demand_id)
-            for pos in positions:
-                name = pos.get("assortment", {}).get("name", "—")
-                qty = pos.get("quantity", 0)
-                price = pos.get("price", 0)
-                if name not in product_sums:
-                    product_sums[name] = {"sum": 0, "qty": 0}
-                product_sums[name]["sum"] += qty * price
-                product_sums[name]["qty"] += qty
-        except Exception:
-            pass
+        for pos in positions:
+            name = pos.get("assortment", {}).get("name", "—")
+            qty = pos.get("quantity", 0)
+            price = pos.get("price", 0)
+            if name not in product_sums:
+                product_sums[name] = {"sum": 0, "qty": 0}
+            product_sums[name]["sum"] += qty * price
+            product_sums[name]["qty"] += qty
 
     top_products = sorted(product_sums.items(), key=lambda x: x[1]["sum"], reverse=True)[:5]
 
