@@ -1443,6 +1443,14 @@ async def api_returns_confirm(request: Request):
     res = await adb.confirm_return(return_id, user["id"], name)
     if not res.get("ok"):
         raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
+
+    # Best-effort: создать «Возврат покупателя» в МойСклад (no-op без MS-контекста).
+    from services import ms_returns
+
+    try:
+        await ms_returns.create_salesreturn(return_id)
+    except Exception:
+        logger.warning("MS salesreturn create failed", exc_info=True)
     return JSONResponse(
         {"ok": True, "return_id": return_id, "order_status": res.get("order_status")}
     )

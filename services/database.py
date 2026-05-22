@@ -1702,6 +1702,45 @@ def get_pending_returns() -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+def get_return(return_id: int) -> dict | None:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("SELECT * FROM returns WHERE id = ?"), (return_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def get_return_positions_for_ms(return_id: int) -> list[dict]:
+    """Позиции возврата с product_href и ценой (из order_items) — для сборки
+    документа «Возврат покупателя» в МойСклад. amount берём из return_items."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "SELECT oi.product_href AS product_href, oi.product_name AS product_name, "
+                "ri.qty AS qty, oi.price AS price "
+                "FROM return_items ri JOIN order_items oi ON oi.id = ri.order_item_id "
+                "WHERE ri.return_id = ?"
+            ),
+            (return_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def set_return_ms_id(return_id: int, ms_id: str) -> bool:
+    """Сохранить id документа «Возврат покупателя» из МойСклад (идемпотентность
+    повторной отправки)."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE returns SET moysklad_return_id = ? WHERE id = ?"),
+            (ms_id, return_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    return updated
+
+
 # ─── Роли ────────────────────────────────────────────────────────────────────
 
 # Единый whitelist ролей (SECURITY.md C2 — раньше дублировался в database и

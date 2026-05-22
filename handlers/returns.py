@@ -190,6 +190,14 @@ async def cb_return_confirm(call: CallbackQuery, bot: Bot):
     if not res.get("ok"):
         return await call.answer(f"⚠️ {res.get('error', 'уже обработано')}", show_alert=True)
 
+    # Best-effort: документ «Возврат покупателя» в МойСклад (no-op без контекста).
+    from services import ms_returns
+
+    try:
+        await ms_returns.create_salesreturn(return_id)
+    except Exception:
+        logger.warning("MS salesreturn create failed", exc_info=True)
+
     await call.answer("✅ Возврат подтверждён")
     await call.message.edit_text(
         (call.message.text or "")

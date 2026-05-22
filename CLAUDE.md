@@ -50,7 +50,8 @@ python -m tasks.run_maintenance          # janitor: чистка дедупа/а
 **МойСклад:**
 - Не слать ссылки `https://online.moysklad.ru/app/#.../edit?id=...` в чат — backend access leak. PDF из `services/ms_customerorder._try_get_print_pdf` отправляется файлом.
 - Error bodies в логах ВСЕГДА через `services.moysklad.redact_ms_error(body)`.
-- Кастомные атрибуты привязаны к сущности (`demand` vs `customerorder`) — нельзя переиспользовать meta, иначе HTTP 400.
+- Кастомные атрибуты привязаны к сущности (`demand` vs `customerorder`) — нельзя переиспользовать meta, иначе HTTP 400. На `salesreturn` атрибуты demand НЕ ставим (`services/ms_returns.py` их не шлёт).
+- Подтверждение возврата создаёт «Возврат покупателя» (`entity/salesreturn`) — `services.ms_returns.create_salesreturn` (best-effort, gated через `ms_demand.is_ready()`, идемпотентно по `moysklad_return_id`, линкуется с исходной отгрузкой). Боевая проверка — `python -m tasks.verify_ms_returns` (read-only) → `--return-id N --create`.
 
 **Time:** `utils.helpers.utc_now()` вместо deprecated `datetime.utcnow()`. `utils.helpers.local_now()` для сравнений с `created_at` (пишется в local TZ через `now_str()`).
 
