@@ -21,26 +21,49 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Допустимые переходы: текущий_статус → список разрешённых следующих
+# Допустимые переходы: текущий_статус → список разрешённых следующих.
+# IMPLEMENTATION.md §5.3 (адаптировано). Новые статусы добавлены аддитивно,
+# существующие рёбра сохранены — старые тесты не ломаются.
 TRANSITIONS: dict[str, list[str]] = {
     "draft": ["pending", "rejected"],  # отправить или отменить (удалить)
-    "pending": ["approved", "rejected"],  # решение боса
-    "approved": ["shipped"],  # фиксация отгрузки
+    "pending": ["approved", "rejected", "draft"],  # +draft = reject с комментарием
+    "approved": ["shipped", "cancelled"],  # отгрузка или отмена (4ч-окно)
+    "shipped": ["paid", "cancelled", "partially_returned", "returned"],
+    "paid": ["partially_returned", "returned"],
+    "partially_returned": ["returned"],
     "rejected": [],
-    "shipped": [],
+    "cancelled": [],
+    "returned": [],
 }
 
-# Какие роли могут инициировать какие переходы
+# Рёбра возвратов — общие для boss/warehouse_keeper/admin.
+_RETURN_EDGES = {
+    "shipped→partially_returned",
+    "shipped→returned",
+    "paid→partially_returned",
+    "paid→returned",
+    "partially_returned→returned",
+}
+_BOSS_EDGES = {
+    "pending→approved",
+    "pending→rejected",
+    "pending→draft",
+    "approved→shipped",
+    "approved→cancelled",
+    "shipped→paid",
+    "shipped→cancelled",
+} | _RETURN_EDGES
+
+# Какие роли могут инициировать какие переходы (ключ "from→to").
 _ROLE_TRANSITIONS: dict[str, set[str]] = {
     "manager": {"draft→pending"},
-    "boss": {"pending→approved", "pending→rejected"},
-    "admin": {
-        "draft→pending",
-        "pending→approved",
-        "pending→rejected",
-        "approved→shipped",
-        "draft→rejected",
-    },
+    "boss": set(_BOSS_EDGES),
+    # Бухгалтер: подтверждает поступление денег (shipped→paid).
+    "bookkeeper": {"shipped→paid"},
+    # Кладовщик: фиксирует отгрузку и обрабатывает возвраты.
+    "warehouse_keeper": {"approved→shipped"} | _RETURN_EDGES,
+    # Админ — всё вышеперечисленное + удаление черновика.
+    "admin": _BOSS_EDGES | {"draft→pending", "draft→rejected"},
     "guest": set(),
 }
 
@@ -68,6 +91,47 @@ def validate_transition(order: dict, new_status: str) -> str | None:
     if new_status not in TRANSITIONS.get(current, []):
         return f"Переход {current!r}→{new_status!r} недопустим"
     return None
+
+
+def _items_key(item: dict) -> str:
+    """Ключ позиции для diff'а: предпочитаем product_href, иначе имя."""
+    return str(item.get("product_href") or item.get("product_name") or "")
+
+
+def compute_resubmit_summary(
+    before_items: list[dict],
+    after_items: list[dict],
+    before_total: float,
+    after_total: float,
+    payment_type_changed: bool = False,
+) -> dict:
+    """Diff между до-reject и текущим состоянием заказа (IMPLEMENTATION.md §6.5).
+
+    Чистая функция (без БД) — легко тестировать. Позиции матчатся по
+    product_href (fallback — имя); modified = совпал ключ, но изменились
+    qty/price.
+    """
+    before_by = {_items_key(i): i for i in before_items}
+    after_by = {_items_key(i): i for i in after_items}
+
+    added = len(after_by.keys() - before_by.keys())
+    removed = len(before_by.keys() - after_by.keys())
+    modified = 0
+    for key in before_by.keys() & after_by.keys():
+        b, a = before_by[key], after_by[key]
+        if (float(b.get("quantity", 0)) != float(a.get("quantity", 0))
+                or float(b.get("price", 0) or 0) != float(a.get("price", 0) or 0)):
+            modified += 1
+
+    return {
+        "items_added": added,
+        "items_removed": removed,
+        "items_modified": modified,
+        "total_before": round(float(before_total), 2),
+        "total_after": round(float(after_total), 2),
+        "total_diff": round(float(after_total) - float(before_total), 2),
+        "payment_type_changed": bool(payment_type_changed),
+    }
 
 
 # ─── Полный жизненный цикл апрува/реджекта ──────────────────────────────────

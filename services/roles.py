@@ -9,7 +9,11 @@
 import time
 
 from config import ADMIN_IDS
-from services.database import get_role as _db_get_role
+from services.database import VALID_ROLES, get_role as _db_get_role
+
+# Re-export единого whitelist ролей (определён в services.database, чтобы не
+# было циклического импорта). Используется и в handlers/users для валидации.
+__all__ = ["VALID_ROLES"]
 
 _ROLE_TTL = 60.0  # сек
 _role_cache: dict[int, tuple[float, str]] = {}
@@ -99,3 +103,42 @@ def is_manager(user_id: int) -> bool:
 def can_create_orders(user_id: int) -> bool:
     """Создавать заказы и заявки на отгрузку."""
     return _has_role(user_id, "admin", "boss", "manager")
+
+
+# ─── IMPLEMENTATION.md §4: новые роли и права ────────────────────────────────
+
+
+def is_bookkeeper(user_id: int) -> bool:
+    return _cached_role(user_id) == "bookkeeper"
+
+
+def is_warehouse_keeper(user_id: int) -> bool:
+    return _cached_role(user_id) == "warehouse_keeper"
+
+
+def can_confirm_deposit(user_id: int) -> bool:
+    """Подтверждать/отклонять сдачу налички (cash deposit)."""
+    return _has_role(user_id, "admin", "boss", "bookkeeper")
+
+
+def can_confirm_shipment(user_id: int) -> bool:
+    """Подтверждать физическую отгрузку (APPROVED→SHIPPED)."""
+    return _has_role(user_id, "admin", "boss", "warehouse_keeper")
+
+
+def can_create_return(user_id: int) -> bool:
+    """Оформить возврат."""
+    return _has_role(user_id, "admin", "boss", "warehouse_keeper", "manager")
+
+
+def can_confirm_return(user_id: int) -> bool:
+    """Финальное подтверждение возврата."""
+    return _has_role(user_id, "admin", "boss")
+
+
+def can_change_credit_limit(user_id: int) -> bool:
+    return _has_role(user_id, "admin", "boss")
+
+
+def can_change_settings(user_id: int) -> bool:
+    return _has_role(user_id, "admin")

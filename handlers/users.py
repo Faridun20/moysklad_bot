@@ -45,11 +45,10 @@ async def cmd_addrole(message: Message):
     except ValueError:
         return await message.answer("❌ User ID должен быть числом.")
 
-    # Whitelist должен совпадать с services.database.set_role.
-    # Раньше тут принимали 'employee', но set_role его молча отвергал,
-    # и юзер оставался в прежней роли при «✅ назначено»-сообщении.
+    # Whitelist — единый источник из services.database (через roles).
+    # Раньше тут была своя копия, рассинхрон с set_role давал silent-fail.
     role = parts[2].lower()
-    VALID_ROLES = ("admin", "boss", "manager", "guest")
+    from services.roles import VALID_ROLES
     if role not in VALID_ROLES:
         return await message.answer(f"❌ Роль должна быть одной из: {', '.join(VALID_ROLES)}")
 

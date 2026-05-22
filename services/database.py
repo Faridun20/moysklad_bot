@@ -323,6 +323,171 @@ def _create_tables():
                 demand_id   TEXT PRIMARY KEY,
                 notified_at TEXT
             )""",
+
+            # ─── IMPLEMENTATION.md Фаза 1–2 (адаптировано под dual-DB) ──────────
+            # Конвенции проекта: TEXT для JSON/UUID/timestamp, REAL для денег,
+            # INTEGER 0/1 для boolean, BIGINT — telegram user_id, без FK
+            # (как и остальные таблицы здесь). Postgres-специфику (JSONB,
+            # gen_random_uuid, NUMERIC) НЕ используем — иначе ломается SQLite.
+
+            # Кредитный лимит контрагента. agent_id — UUID контрагента МойСклад.
+            """CREATE TABLE IF NOT EXISTS credit_limits (
+                agent_id     TEXT PRIMARY KEY,
+                agent_name   TEXT NOT NULL,
+                limit_amount REAL NOT NULL DEFAULT 2000.0,
+                set_by       BIGINT,
+                notes        TEXT,
+                updated_at   TEXT,
+                created_at   TEXT
+            )""",
+
+            # Сдача наличных в кассу (manager → касса). status: pending|confirmed|rejected.
+            f"""CREATE TABLE IF NOT EXISTS cash_deposits (
+                id           {id_type},
+                manager_id   BIGINT NOT NULL,
+                amount       REAL NOT NULL,
+                deposited_at TEXT,
+                confirmed_by BIGINT,
+                confirmed_at TEXT,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                reject_reason TEXT,
+                notes        TEXT,
+                deleted_at   TEXT,
+                created_at   TEXT
+            )""",
+
+            # Распределение одной сдачи по заказам (composite PK).
+            """CREATE TABLE IF NOT EXISTS cash_deposit_orders (
+                deposit_id       BIGINT NOT NULL,
+                order_id         BIGINT NOT NULL,
+                amount_allocated REAL NOT NULL,
+                is_manual        INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (deposit_id, order_id)
+            )""",
+
+            # Возвраты товара. return_type: partial|full. status: pending|confirmed|rejected.
+            f"""CREATE TABLE IF NOT EXISTS returns (
+                id           {id_type},
+                order_id     BIGINT NOT NULL,
+                return_type  TEXT NOT NULL,
+                reason       TEXT NOT NULL,
+                total_amount REAL NOT NULL,
+                refund_method TEXT,
+                moysklad_return_id TEXT,
+                created_by   BIGINT NOT NULL,
+                confirmed_by BIGINT,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                goods_received INTEGER NOT NULL DEFAULT 0,
+                created_at   TEXT,
+                confirmed_at TEXT,
+                deleted_at   TEXT
+            )""",
+
+            f"""CREATE TABLE IF NOT EXISTS return_items (
+                id            {id_type},
+                return_id     BIGINT NOT NULL,
+                order_item_id BIGINT NOT NULL,
+                qty           REAL NOT NULL,
+                amount        REAL NOT NULL
+            )""",
+
+            # Партии товара (FEFO). Используется только если МойСклад
+            # поддерживает партии для товара; иначе order_items.batch_id NULL.
+            """CREATE TABLE IF NOT EXISTS product_batches (
+                id                TEXT PRIMARY KEY,
+                product_id        TEXT NOT NULL,
+                moysklad_batch_id TEXT,
+                batch_code        TEXT,
+                expiry_date       TEXT,
+                qty_remaining     REAL NOT NULL DEFAULT 0,
+                received_at       TEXT,
+                updated_at        TEXT
+            )""",
+
+            # Журнал изменений заказа (before/after/summary как JSON-текст).
+            f"""CREATE TABLE IF NOT EXISTS order_change_log (
+                id              {id_type},
+                order_id        BIGINT NOT NULL,
+                changed_by      BIGINT NOT NULL,
+                change_type     TEXT NOT NULL,
+                before_snapshot TEXT,
+                after_snapshot  TEXT,
+                summary         TEXT,
+                created_at      TEXT
+            )""",
+
+            # Недоставленные уведомления (для retry-крона). channel: telegram|email|sms.
+            f"""CREATE TABLE IF NOT EXISTS failed_notifications (
+                id                {id_type},
+                user_id           BIGINT NOT NULL,
+                notification_type TEXT NOT NULL,
+                channel           TEXT NOT NULL,
+                payload           TEXT NOT NULL,
+                attempts          INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at   TEXT,
+                last_error        TEXT,
+                is_critical       INTEGER NOT NULL DEFAULT 0,
+                resolved_at       TEXT,
+                resolved_by       BIGINT,
+                created_at        TEXT
+            )""",
+
+            # Журнал выгрузок audit_log в Google Drive (интеграция — позже).
+            f"""CREATE TABLE IF NOT EXISTS audit_archive_exports (
+                id              {id_type},
+                period_start    TEXT NOT NULL,
+                period_end      TEXT NOT NULL,
+                file_name       TEXT NOT NULL,
+                drive_file_id   TEXT NOT NULL,
+                drive_file_url  TEXT NOT NULL,
+                records_count   INTEGER NOT NULL,
+                file_size_bytes BIGINT NOT NULL,
+                exported_at     TEXT,
+                exported_by     BIGINT
+            )""",
+
+            # Контакты клиента для уведомлений (opt-in).
+            """CREATE TABLE IF NOT EXISTS client_contacts (
+                agent_id              TEXT PRIMARY KEY,
+                telegram_chat_id      BIGINT,
+                email                 TEXT,
+                phone                 TEXT,
+                notifications_opted_in INTEGER NOT NULL DEFAULT 0,
+                opted_in_at           TEXT,
+                opted_in_by           BIGINT,
+                created_at            TEXT,
+                updated_at            TEXT
+            )""",
+
+            # Ключи идемпотентности для мутаций (result как JSON-текст).
+            """CREATE TABLE IF NOT EXISTS idempotency_keys (
+                key        TEXT PRIMARY KEY,
+                operation  TEXT NOT NULL,
+                user_id    BIGINT NOT NULL,
+                result     TEXT,
+                created_at TEXT,
+                expires_at TEXT
+            )""",
+
+            # Настройки приложения (value как JSON-текст). Источник «магических чисел».
+            """CREATE TABLE IF NOT EXISTS app_settings (
+                key         TEXT PRIMARY KEY,
+                value       TEXT NOT NULL,
+                description TEXT,
+                updated_by  BIGINT,
+                updated_at  TEXT
+            )""",
+
+            # Журнал запусков cron-задач.
+            f"""CREATE TABLE IF NOT EXISTS cron_runs (
+                id          {id_type},
+                task_name   TEXT NOT NULL,
+                started_at  TEXT,
+                finished_at TEXT,
+                status      TEXT NOT NULL DEFAULT 'running',
+                error_message TEXT,
+                metadata    TEXT
+            )""",
         ]
 
         # Создаём каждую таблицу в отдельной транзакции
@@ -361,6 +526,17 @@ def _create_indexes():
             # и get_pending_requests (shipment_requests) сканируют по status.
             "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
             "CREATE INDEX IF NOT EXISTS idx_shipment_requests_status ON shipment_requests(status)",
+            # IMPLEMENTATION.md Фаза 1–2: индексы новых таблиц.
+            "CREATE INDEX IF NOT EXISTS idx_cash_deposits_manager_status ON cash_deposits(manager_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_cash_deposits_pending ON cash_deposits(status, deposited_at)",
+            "CREATE INDEX IF NOT EXISTS idx_returns_order ON returns(order_id)",
+            "CREATE INDEX IF NOT EXISTS idx_returns_status ON returns(status)",
+            "CREATE INDEX IF NOT EXISTS idx_batches_product_expiry ON product_batches(product_id, expiry_date)",
+            "CREATE INDEX IF NOT EXISTS idx_change_log_order ON order_change_log(order_id, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_failed_notif_unresolved ON failed_notifications(is_critical, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_credit_limits_updated_at ON credit_limits(updated_at)",
+            "CREATE INDEX IF NOT EXISTS idx_idempotency_expires ON idempotency_keys(expires_at)",
+            "CREATE INDEX IF NOT EXISTS idx_cron_runs_task_started ON cron_runs(task_name, started_at)",
         ]
         for sql in snapshot_indexes:
             try:
@@ -443,6 +619,41 @@ def run_migrations():
             # 'synced', 'failed' (с описанием в ms_sync_error).
             ("payments", "ms_sync_status", "TEXT"),
             ("payments", "ms_sync_error", "TEXT"),
+
+            # ─── IMPLEMENTATION.md Фаза 2 (адаптировано: BOOLEAN→INTEGER 0/1,
+            #     JSONB→TEXT, NUMERIC→REAL, без FK). Все колонки аддитивны. ──────
+            # users → у нас user_roles (telegram-id как PK).
+            ("user_roles", "active", "INTEGER NOT NULL DEFAULT 1"),
+            ("user_roles", "email", "TEXT"),
+            ("user_roles", "phone", "TEXT"),
+            ("user_roles", "deactivated_at", "TEXT"),
+            ("user_roles", "deactivated_by", "BIGINT"),
+            # orders
+            ("orders", "deleted_at", "TEXT"),
+            ("orders", "rejection_comment", "TEXT"),
+            ("orders", "rejection_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "frozen", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "cancellation_deadline", "TEXT"),
+            ("orders", "cancelled_at", "TEXT"),
+            ("orders", "cancelled_by", "BIGINT"),
+            ("orders", "cancellation_reason", "TEXT"),
+            ("orders", "credit_limit_override", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "credit_limit_override_by", "BIGINT"),
+            ("orders", "price_check_warnings", "TEXT"),
+            ("orders", "payment_confirmed", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "payment_confirmed_at", "TEXT"),
+            ("orders", "client_notification_sent", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "return_status", "TEXT"),
+            ("orders", "submitted_at", "TEXT"),
+            ("orders", "approved_by", "BIGINT"),
+            ("orders", "approved_at", "TEXT"),
+            ("orders", "shipped_at", "TEXT"),
+            ("orders", "shipped_by", "BIGINT"),
+            # order_items
+            ("order_items", "stock_snap", "REAL"),
+            ("order_items", "price_at_submit", "REAL"),
+            ("order_items", "batch_id", "TEXT"),
+            ("order_items", "returned_qty", "REAL NOT NULL DEFAULT 0"),
         ]
         applied = 0
         for table, column, col_type in migrations:
@@ -518,8 +729,792 @@ def run_backfills():
             conn.rollback()
             logger.warning("Recovery paid_confirmed: %s", e)
 
+    # ── Сидинг app_settings (идемпотентно) ───────────────────────────
+    seed_app_settings()
+
+
+# ─── Настройки приложения (app_settings) ──────────────────────────────────────
+#
+# Источник «магических чисел» (IMPLEMENTATION.md §3.13/§19). value хранится
+# как JSON-текст (dual-DB: ни JSONB, ни native-типов). get_setting парсит JSON.
+
+_DEFAULT_SETTINGS: dict[str, tuple] = {
+    # key: (value, description)
+    "credit_limit_default": (2000.0, "Дефолтный кредитный лимит для новых клиентов (USD)"),
+    "cancellation_window_hours": (4, "Окно отмены одобренного заказа (часов)"),
+    "cash_deposit_reminder_time": ("18:00", "Время напоминания о сдаче налички (Asia/Tashkent)"),
+    "cash_deposit_escalation_days": (2, "Через сколько дней без сдачи — алерт боссам"),
+    "stale_pending_hours": (48, "Через сколько часов pending-заявка считается зависшей"),
+    "stale_pending_escalation_days": (5, "Через сколько дней — алерт-эскалация админу"),
+    "reject_max_cycles": (3, "Максимум циклов reject→resubmit перед freeze"),
+    "price_check_threshold_percent": (15, "Цена ниже прайса на X% → warning боссу"),
+    "paid_order_confirmation_threshold": (500.0, "Сумма для двухступенчатого подтверждения paid-заказов"),
+    "audit_log_retention_months": (6, "Сколько месяцев аудита держим в БД"),
+    "soft_delete_retention_days": (365, "Через сколько дней soft-deleted удаляется физически"),
+    "moysklad_retry_max_attempts": (3, "Макс попыток для МойСклад API"),
+    "moysklad_circuit_breaker_threshold": (10, "Сколько фейлов за 5 мин → пауза"),
+    "client_notifications_enabled": (True, "Глобальный switch уведомлений клиентам"),
+    "return_deadline_days": (90, "Лимит на оформление возврата (дней с отгрузки)"),
+    "auto_create_demand_on_approve": (True, "Создавать demand в МойСклад при approve"),
+    "auto_ship_on_approve": (True, "Авто-переход в shipped сразу после approve"),
+}
+
+
+def seed_app_settings() -> int:
+    """Засеять дефолтные настройки, не перетирая уже изменённые. Возвращает
+    число вставленных ключей."""
+    import json as _json
+    inserted = 0
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        for key, (value, desc) in _DEFAULT_SETTINGS.items():
+            try:
+                if USE_POSTGRES:
+                    cur.execute(
+                        "INSERT INTO app_settings (key, value, description, updated_at) "
+                        "VALUES (%s, %s, %s, %s) ON CONFLICT (key) DO NOTHING",
+                        (key, _json.dumps(value), desc, now_str()),
+                    )
+                else:
+                    cur.execute(
+                        "INSERT OR IGNORE INTO app_settings (key, value, description, updated_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (key, _json.dumps(value), desc, now_str()),
+                    )
+                inserted += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.debug("seed_app_settings %s: %s", key, e)
+    return inserted
+
+
+def get_setting(key: str, default=None):
+    """Прочитать настройку (JSON-десериализация value). Падать не должна —
+    при любой проблеме возвращает default."""
+    import json as _json
+    try:
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(q("SELECT value FROM app_settings WHERE key = ?"), (key,))
+            row = cur.fetchone()
+        if not row:
+            # Не засеяно — берём из дефолтов, если есть.
+            if key in _DEFAULT_SETTINGS:
+                return _DEFAULT_SETTINGS[key][0]
+            return default
+        raw = row["value"] if USE_POSTGRES else row[0]
+        return _json.loads(raw)
+    except Exception as e:
+        logger.warning("get_setting %s failed: %s", key, e)
+        return default
+
+
+def set_setting(key: str, value, updated_by: int | None = None) -> None:
+    """Записать настройку (value сериализуется в JSON). Создаёт ключ при отсутствии."""
+    import json as _json
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        if USE_POSTGRES:
+            cur.execute(
+                "INSERT INTO app_settings (key, value, updated_by, updated_at) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "
+                "updated_by = EXCLUDED.updated_by, updated_at = EXCLUDED.updated_at",
+                (key, _json.dumps(value), updated_by, now_str()),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO app_settings (key, value, updated_by, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                "updated_by = excluded.updated_by, updated_at = excluded.updated_at",
+                (key, _json.dumps(value), updated_by, now_str()),
+            )
+        conn.commit()
+
+
+# ─── IMPLEMENTATION.md Фаза 3: кредитные лимиты ───────────────────────────────
+#
+# agent_id — UUID контрагента МойСклад. Дефолтный лимит — из app_settings
+# (credit_limit_default). current_debt считаем из существующей платёжной
+# модели (remaining по заказу) минус подтверждённые возвраты — без отдельного
+# «долгового» поля, чтобы не плодить параллельную истину.
+
+
+def get_credit_limit(agent_id: str) -> float:
+    """Лимит контрагента; если строки нет — дефолт из app_settings."""
+    if not agent_id:
+        return float(get_setting("credit_limit_default", 2000.0))
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("SELECT limit_amount FROM credit_limits WHERE agent_id = ?"), (agent_id,))
+        row = cur.fetchone()
+    if row:
+        return float(row["limit_amount"] if USE_POSTGRES else row[0])
+    return float(get_setting("credit_limit_default", 2000.0))
+
+
+def ensure_credit_limit(agent_id: str, agent_name: str) -> None:
+    """Завести строку лимита для нового клиента (set_by=NULL → «авто»)."""
+    if not agent_id:
+        return
+    default = float(get_setting("credit_limit_default", 2000.0))
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        if USE_POSTGRES:
+            cur.execute(
+                "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, set_by, created_at, updated_at) "
+                "VALUES (%s, %s, %s, NULL, %s, %s) ON CONFLICT (agent_id) DO NOTHING",
+                (agent_id, agent_name, default, now_str(), now_str()),
+            )
+        else:
+            cur.execute(
+                "INSERT OR IGNORE INTO credit_limits (agent_id, agent_name, limit_amount, set_by, created_at, updated_at) "
+                "VALUES (?, ?, ?, NULL, ?, ?)",
+                (agent_id, agent_name, default, now_str(), now_str()),
+            )
+        conn.commit()
+
+
+def set_credit_limit(
+    agent_id: str, agent_name: str, limit_amount: float,
+    set_by: int | None = None, notes: str | None = None,
+) -> None:
+    """Установить/изменить лимит + запись в audit_log."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        if USE_POSTGRES:
+            cur.execute(
+                "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, set_by, notes, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (agent_id) DO UPDATE SET limit_amount = EXCLUDED.limit_amount, "
+                "set_by = EXCLUDED.set_by, notes = EXCLUDED.notes, updated_at = EXCLUDED.updated_at",
+                (agent_id, agent_name, limit_amount, set_by, notes, now_str(), now_str()),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, set_by, notes, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(agent_id) DO UPDATE SET limit_amount = excluded.limit_amount, "
+                "set_by = excluded.set_by, notes = excluded.notes, updated_at = excluded.updated_at",
+                (agent_id, agent_name, limit_amount, set_by, notes, now_str(), now_str()),
+            )
+        conn.commit()
+    if set_by:
+        add_audit_log(
+            set_by, "", get_role(set_by), "credit_limit_changed",
+            f"{agent_name}: лимит → {limit_amount:.0f} USD" + (f" ({notes})" if notes else ""),
+        )
+
+
+def get_agent_current_debt(agent_id: str) -> float:
+    """Текущий долг контрагента: сумма непогашенных остатков по его открытым
+    заказам минус подтверждённые возвраты. Открытые = не draft/rejected/
+    cancelled и не soft-deleted."""
+    if not agent_id:
+        return 0.0
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT id FROM orders WHERE agent_id = ? "
+              "AND status NOT IN ('draft', 'rejected', 'cancelled') "
+              "AND (deleted_at IS NULL)"),
+            (agent_id,),
+        )
+        order_ids = [(r["id"] if USE_POSTGRES else r[0]) for r in cur.fetchall()]
+    debt = 0.0
+    for oid in order_ids:
+        summary = get_order_payment_summary(oid)
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q("SELECT COALESCE(SUM(total_amount), 0) AS s FROM returns "
+                  "WHERE order_id = ? AND status = 'confirmed' AND (deleted_at IS NULL)"),
+                (oid,),
+            )
+            row = cur.fetchone()
+        returns_sum = float((row["s"] if USE_POSTGRES else row[0]) or 0)
+        debt += max(0.0, summary["remaining"] - returns_sum)
+    return debt
+
+
+def check_credit_limit(agent_id: str, order_total: float) -> dict:
+    """Проверка лимита для нового заказа. НЕ блокирует — даёт данные для
+    решения боса (over_limit + цифры)."""
+    debt = get_agent_current_debt(agent_id)
+    limit = get_credit_limit(agent_id)
+    projected = debt + order_total
+    return {
+        "current_debt": debt,
+        "limit": limit,
+        "projected": projected,
+        "over_limit": projected > limit,
+    }
+
+
+# ─── IMPLEMENTATION.md Фаза 3: журнал изменений заказа ────────────────────────
+
+
+def log_order_change(
+    order_id: int, changed_by: int, change_type: str,
+    before: dict | None = None, after: dict | None = None, summary: dict | None = None,
+) -> None:
+    """Записать изменение заказа в order_change_log (snapshots как JSON-текст)."""
+    import json as _json
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("INSERT INTO order_change_log "
+              "(order_id, changed_by, change_type, before_snapshot, after_snapshot, summary, created_at) "
+              "VALUES (?, ?, ?, ?, ?, ?, ?)"),
+            (
+                order_id, changed_by, change_type,
+                _json.dumps(before) if before is not None else None,
+                _json.dumps(after) if after is not None else None,
+                _json.dumps(summary) if summary is not None else None,
+                now_str(),
+            ),
+        )
+        conn.commit()
+
+
+# ─── IMPLEMENTATION.md Фаза 3: reject→draft + freeze, cancel, stale ───────────
+
+
+def reject_order_to_draft(
+    order_id: int, rejected_by: int, rejected_name: str, comment: str,
+) -> dict:
+    """Reject заявки по модели IMPLEMENTATION.md §6.4: заказ возвращается в
+    draft с комментарием, счётчик отклонений растёт, после reject_max_cycles
+    заказ замораживается (frozen=1, resubmit запрещён до разморозки админом).
+
+    Атомарный UPDATE ... WHERE status='pending' — защита от гонки.
+    Возвращает {ok, error, frozen, rejection_count}.
+    """
+    order = get_order(order_id)
+    if not order:
+        return {"ok": False, "error": "Заказ не найден"}
+    if order.get("status") != "pending":
+        return {"ok": False, "error": "Заказ не в статусе pending"}
+
+    rc = int(order.get("rejection_count") or 0) + 1
+    max_cycles = int(get_setting("reject_max_cycles", 3))
+    frozen = 1 if rc >= max_cycles else 0
+
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE orders SET status = 'draft', rejection_comment = ?, "
+              "rejection_count = ?, frozen = ?, updated_at = ? "
+              "WHERE id = ? AND status = 'pending'"),
+            (comment, rc, frozen, now_str(), order_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    if not updated:
+        return {"ok": False, "error": "Заказ уже обработан"}
+
+    add_audit_log(
+        rejected_by, rejected_name, get_role(rejected_by), "order_rejected",
+        f"Заказ #{order_id} → draft (попытка {rc}/{max_cycles})"
+        + (" — ЗАМОРОЖЕН" if frozen else ""),
+    )
+    return {"ok": True, "error": None, "frozen": bool(frozen), "rejection_count": rc}
+
+
+def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, reason: str) -> dict:
+    """Отмена заказа (IMPLEMENTATION.md §6.7), DB-часть. Reverse-demand в
+    МойСклад — отдельной фазой. Для approved действует окно отмены
+    (cancellation_deadline); shipped по спеке требует возврата на 100% —
+    здесь не пропускаем (нужен return-флоу)."""
+    order = get_order(order_id)
+    if not order:
+        return {"ok": False, "error": "Заказ не найден"}
+    status = order.get("status")
+    if status != "approved":
+        return {"ok": False, "error": "Отмена доступна только для approved (shipped → через возврат)"}
+    deadline = order.get("cancellation_deadline")
+    if deadline and now_str() > deadline:
+        return {"ok": False, "error": "Окно отмены истекло"}
+
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE orders SET status = 'cancelled', cancelled_at = ?, "
+              "cancelled_by = ?, cancellation_reason = ?, updated_at = ? "
+              "WHERE id = ? AND status = 'approved'"),
+            (now_str(), cancelled_by, reason, now_str(), order_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    if not updated:
+        return {"ok": False, "error": "Заказ уже обработан"}
+
+    add_audit_log(
+        cancelled_by, cancelled_name, get_role(cancelled_by), "order_cancelled",
+        f"Заказ #{order_id} отменён: {reason[:200]}",
+    )
+    return {"ok": True, "error": None}
+
+
+def get_stale_pending_orders(hours: int = 48) -> list[dict]:
+    """Заявки, висящие в pending дольше `hours` (для stale-мониторинга, §13).
+    Берём COALESCE(submitted_at, created_at)."""
+    from datetime import timedelta
+    cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT * FROM orders WHERE status = 'pending' AND (deleted_at IS NULL) "
+              "AND COALESCE(submitted_at, created_at) < ? ORDER BY created_at ASC"),
+            (cutoff,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ─── IMPLEMENTATION.md Фаза 4: сдача наличных (cash deposits) ─────────────────
+#
+# Менеджер сдаёт собранные деньги в кассу; босс/бухгалтер подтверждает.
+# Закрывает дыру «собрал у клиента, но не сдал в офис». Используем новую
+# модель: при покрытии заказа подтверждёнными сдачами он переходит в 'paid'
+# (payment_confirmed=1). order total берём из get_order_payment_summary.
+
+
+def _order_total(order_id: int) -> float:
+    return float(get_order_payment_summary(order_id)["total"])
+
+
+def _order_confirmed_deposit_amount(order_id: int) -> float:
+    """Сколько уже распределено на заказ подтверждёнными сдачами."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT COALESCE(SUM(cdo.amount_allocated), 0) AS s "
+              "FROM cash_deposit_orders cdo "
+              "JOIN cash_deposits d ON d.id = cdo.deposit_id "
+              "WHERE cdo.order_id = ? AND d.status = 'confirmed' AND (d.deleted_at IS NULL)"),
+            (order_id,),
+        )
+        row = cur.fetchone()
+    return float((row["s"] if USE_POSTGRES else row[0]) or 0)
+
+
+def get_manager_open_orders_for_deposit(manager_id: int) -> list[dict]:
+    """Отгруженные неоплаченные заказы менеджера (для распределения сдачи).
+    Возвращает [{id, total, covered, remaining}] по возрастанию created_at."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT id FROM orders WHERE user_id = ? AND status = 'shipped' "
+              "AND payment_confirmed = 0 AND (deleted_at IS NULL) ORDER BY created_at ASC"),
+            (manager_id,),
+        )
+        ids = [(r["id"] if USE_POSTGRES else r[0]) for r in cur.fetchall()]
+    out = []
+    for oid in ids:
+        total = _order_total(oid)
+        covered = _order_confirmed_deposit_amount(oid)
+        out.append({"id": oid, "total": total, "covered": covered,
+                    "remaining": max(0.0, total - covered)})
+    return out
+
+
+def create_cash_deposit(
+    manager_id: int, amount: float, allocations: list[tuple] | None = None,
+) -> dict:
+    """Создать сдачу (status=pending) + распределение по заказам.
+
+    allocations: список (order_id, amount) для ручного режима; если None —
+    авто-FIFO по открытым заказам менеджера. Возвращает {ok, deposit_id,
+    allocations}.
+    """
+    if amount is None or amount <= 0:
+        return {"ok": False, "error": "Сумма должна быть > 0"}
+
+    is_manual = allocations is not None
+    allocs: list[tuple] = list(allocations) if allocations is not None else []
+    if not is_manual:
+        left = amount
+        for o in get_manager_open_orders_for_deposit(manager_id):
+            if left <= 0:
+                break
+            take = min(o["remaining"], left)
+            if take > 0:
+                allocs.append((o["id"], round(take, 2)))
+                left -= take
+
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        if USE_POSTGRES:
+            cur.execute(
+                "INSERT INTO cash_deposits (manager_id, amount, deposited_at, status, created_at) "
+                "VALUES (%s, %s, %s, 'pending', %s) RETURNING id",
+                (manager_id, amount, now_str(), now_str()),
+            )
+            deposit_id = cur.fetchone()["id"]
+        else:
+            cur.execute(
+                "INSERT INTO cash_deposits (manager_id, amount, deposited_at, status, created_at) "
+                "VALUES (?, ?, ?, 'pending', ?)",
+                (manager_id, amount, now_str(), now_str()),
+            )
+            deposit_id = cur.lastrowid
+        for order_id, alloc in allocs:
+            cur.execute(
+                q("INSERT INTO cash_deposit_orders (deposit_id, order_id, amount_allocated, is_manual) "
+                  "VALUES (?, ?, ?, ?)"),
+                (deposit_id, order_id, alloc, 1 if is_manual else 0),
+            )
+        conn.commit()
+    return {"ok": True, "deposit_id": deposit_id, "allocations": allocs}
+
+
+def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_name: str = "") -> dict:
+    """Подтвердить сдачу (атомарно). Каждый покрытый заказ → 'paid'.
+    Возвращает {ok, closed_orders}."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE cash_deposits SET status = 'confirmed', confirmed_by = ?, confirmed_at = ? "
+              "WHERE id = ? AND status = 'pending'"),
+            (confirmed_by, now_str(), deposit_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+        if not updated:
+            return {"ok": False, "error": "Сдача уже обработана"}
+        cur.execute(
+            q("SELECT order_id FROM cash_deposit_orders WHERE deposit_id = ?"),
+            (deposit_id,),
+        )
+        order_ids = [(r["order_id"] if USE_POSTGRES else r[0]) for r in cur.fetchall()]
+
+    closed = []
+    for oid in order_ids:
+        if _order_confirmed_deposit_amount(oid) + 0.01 >= _order_total(oid):
+            with get_conn() as conn:
+                cur = get_cursor(conn)
+                cur.execute(
+                    q("UPDATE orders SET payment_confirmed = 1, payment_confirmed_at = ?, "
+                      "status = 'paid', updated_at = ? WHERE id = ? AND payment_confirmed = 0"),
+                    (now_str(), now_str(), oid),
+                )
+                if cur.rowcount > 0:
+                    closed.append(oid)
+                conn.commit()
+    add_audit_log(
+        confirmed_by, confirmed_name, get_role(confirmed_by), "cash_deposit_confirmed",
+        f"Сдача #{deposit_id} подтверждена; закрыты заказы: {closed or '—'}",
+    )
+    return {"ok": True, "closed_orders": closed}
+
+
+def reject_cash_deposit(deposit_id: int, rejected_by: int, rejected_name: str, reason: str) -> dict:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE cash_deposits SET status = 'rejected', reject_reason = ?, "
+              "confirmed_by = ?, confirmed_at = ? WHERE id = ? AND status = 'pending'"),
+            (reason, rejected_by, now_str(), deposit_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    if not updated:
+        return {"ok": False, "error": "Сдача уже обработана"}
+    add_audit_log(
+        rejected_by, rejected_name, get_role(rejected_by), "cash_deposit_rejected",
+        f"Сдача #{deposit_id} отклонена: {reason[:200]}",
+    )
+    return {"ok": True}
+
+
+def get_pending_cash_deposits() -> list[dict]:
+    """Сдачи, ждущие подтверждения (для боса/бухгалтера)."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT * FROM cash_deposits WHERE status = 'pending' AND (deleted_at IS NULL) "
+              "ORDER BY deposited_at ASC")
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_overdue_undeposited_orders(days: int = 2) -> list[dict]:
+    """Отгруженные неоплаченные заказы старше `days` (cash-эскалация, §7.6)."""
+    from datetime import timedelta
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT * FROM orders WHERE status = 'shipped' AND payment_confirmed = 0 "
+              "AND (deleted_at IS NULL) AND COALESCE(shipped_at, created_at) < ? "
+              "ORDER BY user_id, created_at"),
+            (cutoff,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ─── IMPLEMENTATION.md Фаза 5: возвраты + FEFO/партии ─────────────────────────
+
+
+def upsert_product_batch(
+    product_id: str, moysklad_batch_id: str | None, batch_code: str,
+    expiry_date: str | None, qty_remaining: float,
+) -> str:
+    """UPSERT партии по moysklad_batch_id (натуральный ключ из МС). Возвращает
+    id строки (uuid). Используется синком партий (§9.1)."""
+    import uuid as _uuid
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        existing = None
+        if moysklad_batch_id:
+            cur.execute(
+                q("SELECT id FROM product_batches WHERE moysklad_batch_id = ?"),
+                (moysklad_batch_id,),
+            )
+            row = cur.fetchone()
+            existing = (row["id"] if USE_POSTGRES else row[0]) if row else None
+        if existing:
+            cur.execute(
+                q("UPDATE product_batches SET product_id = ?, batch_code = ?, "
+                  "expiry_date = ?, qty_remaining = ?, updated_at = ? WHERE id = ?"),
+                (product_id, batch_code, expiry_date, qty_remaining, now_str(), existing),
+            )
+            conn.commit()
+            return existing
+        bid = _uuid.uuid4().hex
+        cur.execute(
+            q("INSERT INTO product_batches (id, product_id, moysklad_batch_id, batch_code, "
+              "expiry_date, qty_remaining, received_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"),
+            (bid, product_id, moysklad_batch_id, batch_code, expiry_date,
+             qty_remaining, now_str(), now_str()),
+        )
+        conn.commit()
+        return bid
+
+
+def select_batches_fefo(product_id: str, qty: float) -> list[dict]:
+    """FEFO-резерв: вернуть [{batch_id, take}] из партий с ближайшим expiry
+    (§6.2.5). NULL-expiry — в конец (берём после датированных)."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT id, expiry_date, qty_remaining FROM product_batches "
+              "WHERE product_id = ? AND qty_remaining > 0 "
+              "ORDER BY (expiry_date IS NULL), expiry_date ASC"),
+            (product_id,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    out = []
+    left = qty
+    for r in rows:
+        if left <= 0:
+            break
+        take = min(float(r["qty_remaining"]), left)
+        if take > 0:
+            out.append({"batch_id": r["id"], "take": round(take, 3)})
+            left -= take
+    return out
+
+
+def _adjust_batch_qty(batch_id: str, delta: float) -> None:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE product_batches SET qty_remaining = qty_remaining + ?, updated_at = ? "
+              "WHERE id = ?"),
+            (delta, now_str(), batch_id),
+        )
+        conn.commit()
+
+
+def get_batches_expiring_within(days: int = 7) -> list[dict]:
+    """Партии с остатком, истекающие в ближайшие `days` дней (§9.4)."""
+    from datetime import timedelta
+    cutoff = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT * FROM product_batches WHERE qty_remaining > 0 "
+              "AND expiry_date IS NOT NULL AND expiry_date <= ? ORDER BY expiry_date ASC"),
+            (cutoff,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def create_return(
+    order_id: int, return_type: str, reason: str,
+    items: list[tuple], refund_method: str | None, created_by: int,
+    force: bool = False,
+) -> dict:
+    """Создать возврат (status=pending) + позиции. items = [(order_item_id, qty, amount)].
+    return_type: 'partial'|'full'. refund_method: 'cash'|'debt_reduction'|'no_refund'.
+    Доступно для shipped/paid/partially_returned. Дедлайн (return_deadline_days)
+    блокирует, если не force (вызывающий решает по роли). Возвращает {ok, return_id}.
+    """
+    order = get_order(order_id)
+    if not order:
+        return {"ok": False, "error": "Заказ не найден"}
+    if order.get("status") not in ("shipped", "paid", "partially_returned"):
+        return {"ok": False, "error": "Возврат доступен только для отгруженных/оплаченных"}
+    if not items:
+        return {"ok": False, "error": "Не указаны позиции возврата"}
+
+    deadline_days = int(get_setting("return_deadline_days", 90))
+    shipped_at = order.get("shipped_at")
+    if shipped_at and not force:
+        from datetime import timedelta
+        limit = (datetime.now() - timedelta(days=deadline_days)).strftime("%Y-%m-%d %H:%M:%S")
+        if shipped_at < limit:
+            return {"ok": False, "error": f"Возврат позже {deadline_days} дней — нужно подтверждение"}
+
+    total_amount = round(sum(float(a) for _, _, a in items), 2)
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        if USE_POSTGRES:
+            cur.execute(
+                "INSERT INTO returns (order_id, return_type, reason, total_amount, "
+                "refund_method, created_by, status, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s) RETURNING id",
+                (order_id, return_type, reason, total_amount, refund_method, created_by, now_str()),
+            )
+            return_id = cur.fetchone()["id"]
+        else:
+            cur.execute(
+                "INSERT INTO returns (order_id, return_type, reason, total_amount, "
+                "refund_method, created_by, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+                (order_id, return_type, reason, total_amount, refund_method, created_by, now_str()),
+            )
+            return_id = cur.lastrowid
+        for oitem_id, qty, amount in items:
+            cur.execute(
+                q("INSERT INTO return_items (return_id, order_item_id, qty, amount) "
+                  "VALUES (?, ?, ?, ?)"),
+                (return_id, oitem_id, qty, amount),
+            )
+        conn.commit()
+    return {"ok": True, "return_id": return_id, "total_amount": total_amount}
+
+
+def mark_return_goods_received(return_id: int, by: int) -> dict:
+    """Кладовщик отметил «товар получен» (флаг, статус остаётся pending)."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE returns SET goods_received = 1 WHERE id = ? AND status = 'pending'"),
+            (return_id,),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    return {"ok": updated}
+
+
+def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str = "") -> dict:
+    """Подтвердить возврат: returned_qty += по позициям, статус заказа
+    (returned|partially_returned), восстановление остатков по партиям FEFO,
+    обработка refund (cash → отрицательная сдача; debt_reduction/no_refund —
+    учёт в долге). Возвращает {ok, order_status}."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("SELECT * FROM returns WHERE id = ?"), (return_id,))
+        row = cur.fetchone()
+        ret = dict(row) if row else None
+    if not ret:
+        return {"ok": False, "error": "Возврат не найден"}
+    if ret.get("status") != "pending":
+        return {"ok": False, "error": "Возврат уже обработан"}
+
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE returns SET status = 'confirmed', confirmed_by = ?, confirmed_at = ? "
+              "WHERE id = ? AND status = 'pending'"),
+            (confirmed_by, now_str(), return_id),
+        )
+        if cur.rowcount == 0:
+            conn.rollback()
+            return {"ok": False, "error": "Возврат уже обработан"}
+        cur.execute(
+            q("SELECT order_item_id, qty FROM return_items WHERE return_id = ?"),
+            (return_id,),
+        )
+        ritems = [dict(r) for r in cur.fetchall()]
+        for ri in ritems:
+            cur.execute(
+                q("UPDATE order_items SET returned_qty = returned_qty + ? WHERE id = ?"),
+                (ri["qty"], ri["order_item_id"]),
+            )
+        conn.commit()
+
+    # Восстановление остатков по партиям — отдельно, через _adjust_batch_qty.
+    for ri in ritems:
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(q("SELECT batch_id FROM order_items WHERE id = ?"), (ri["order_item_id"],))
+            br = cur.fetchone()
+        batch_id = (br["batch_id"] if USE_POSTGRES else br[0]) if br else None
+        if batch_id:
+            _adjust_batch_qty(batch_id, float(ri["qty"]))
+
+    order_id = ret["order_id"]
+    # Полностью ли возвращён заказ?
+    items = get_order_items(order_id)
+    fully = all(
+        float(it.get("returned_qty") or 0) + 1e-9 >= float(it.get("quantity") or 0)
+        for it in items
+    ) if items else False
+    new_status = "returned" if fully else "partially_returned"
+    return_status = "full" if fully else "partial"
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE orders SET status = ?, return_status = ?, updated_at = ? WHERE id = ?"),
+            (new_status, return_status, now_str(), order_id),
+        )
+        conn.commit()
+
+    # Refund: cash → отрицательная подтверждённая сдача (учёт выдачи из кассы).
+    if ret.get("refund_method") == "cash":
+        order = get_order(order_id)
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q("INSERT INTO cash_deposits (manager_id, amount, deposited_at, status, "
+                  "confirmed_by, confirmed_at, notes, created_at) "
+                  "VALUES (?, ?, ?, 'confirmed', ?, ?, ?, ?)"),
+                ((order or {}).get("user_id") or confirmed_by, -float(ret["total_amount"]),
+                 now_str(), confirmed_by, now_str(), f"refund возврат #{return_id}", now_str()),
+            )
+            conn.commit()
+    # debt_reduction / no_refund — отдельной записи не требуют (долг учитывает
+    # подтверждённые возвраты в get_agent_current_debt).
+
+    add_audit_log(
+        confirmed_by, confirmed_name, get_role(confirmed_by), "return_confirmed",
+        f"Возврат #{return_id} по заказу #{order_id} ({return_status}, "
+        f"{ret['total_amount']:.0f} USD, {ret.get('refund_method')})",
+    )
+    return {"ok": True, "order_status": new_status}
+
+
+def get_pending_returns() -> list[dict]:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT * FROM returns WHERE status = 'pending' AND (deleted_at IS NULL) "
+              "ORDER BY created_at ASC")
+        )
+        return [dict(r) for r in cur.fetchall()]
+
 
 # ─── Роли ────────────────────────────────────────────────────────────────────
+
+# Единый whitelist ролей (SECURITY.md C2 — раньше дублировался в database и
+# handlers/users, рассинхрон давал silent-fail при назначении роли).
+# IMPLEMENTATION.md §4.1: 6 ролей.
+VALID_ROLES = ("admin", "boss", "bookkeeper", "warehouse_keeper", "manager", "guest")
 
 
 def get_role(user_id: int) -> str:
@@ -543,7 +1538,7 @@ def get_role(user_id: int) -> str:
 
 
 def set_role(user_id: int, username: str, full_name: str, role: str) -> bool:
-    valid_roles = ("admin", "boss", "manager", "guest")
+    valid_roles = VALID_ROLES
     if role not in valid_roles:
         return False
     with get_conn() as conn:
