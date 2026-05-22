@@ -93,6 +93,33 @@ def test_deposit_confirm_forbidden_for_manager(client_env):
     assert resp.status_code == 403
 
 
+def test_deposit_create_and_my(client_env):
+    client, db, ids, fake_bot = client_env
+    # менеджер создаёт сдачу из WebApp
+    resp = client.post(
+        "/api/deposits/create",
+        json={"initData": str(ids["mgr"]), "amount": 250},
+    )
+    assert resp.status_code == 200, resp.text
+    dep_id = resp.json()["deposit_id"]
+    assert db.get_cash_deposit(dep_id)["status"] == "pending"
+    assert fake_bot.sent  # подтверждающим ушло уведомление
+
+    # свои сдачи
+    resp = client.post("/api/deposits/my", json={"initData": str(ids["mgr"])})
+    assert resp.status_code == 200, resp.text
+    assert any(d["id"] == dep_id for d in resp.json()["deposits"])
+
+
+def test_deposit_create_bad_amount(client_env):
+    client, db, ids, _ = client_env
+    resp = client.post(
+        "/api/deposits/create",
+        json={"initData": str(ids["mgr"]), "amount": 0},
+    )
+    assert resp.status_code == 400
+
+
 def test_returns_pending_and_confirm(client_env):
     client, db, ids, _ = client_env
     items = db.get_order_items(ids["order"])

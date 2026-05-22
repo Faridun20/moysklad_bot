@@ -1350,6 +1350,59 @@ async def api_deposits_reject(request: Request):
     return JSONResponse({"ok": True, "deposit_id": deposit_id})
 
 
+@app.post("/api/deposits/create")
+async def api_deposits_create(request: Request):
+    """Менеджер сдаёт наличные: создаём сдачу (авто-FIFO по своим открытым
+    заказам) и шлём подтверждающим карточку с кнопками (как /deposit в боте)."""
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_deposits_create",
+        rate_limit_max=10,
+    )
+    try:
+        amount = float(data.get("amount"))
+        if amount <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Сумма должна быть положительным числом")
+
+    res = await adb.create_cash_deposit(user["id"], amount)
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", "не удалось создать сдачу"))
+
+    name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
+        "username", str(user["id"])
+    )
+    # Переиспользуем то же уведомление с клавиатурой, что и бот-команда /deposit.
+    from handlers.deposits import _notify_confirmers
+
+    bot = await get_notify_bot()
+    try:
+        await _notify_confirmers(bot, res["deposit_id"], name, amount)
+    except Exception:
+        logger.warning("deposit create notify failed", exc_info=True)
+    return JSONResponse({"ok": True, "deposit_id": res["deposit_id"]})
+
+
+@app.post("/api/deposits/my")
+async def api_deposits_my(request: Request):
+    """Свои сдачи (для менеджера). admin/boss тоже видят свои."""
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_deposits_my",
+    )
+    deposits = await adb.get_manager_cash_deposits(user["id"])
+    return JSONResponse({"ok": True, "deposits": deposits})
+
+
 # ─── API: возвраты (IMPLEMENTATION.md §8) ─────────────────────────────────────
 
 

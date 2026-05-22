@@ -1666,8 +1666,8 @@ async function renderFinance() {
   const limitsTab = isBoss
     ? `<button class="finance-tab ${financeTab === 'limits' ? 'active' : ''}" data-tab="limits">📊 Лимиты</button>`
     : '';
-  // Вкладка «Касса» — кто подтверждает сдачи/возвраты.
-  const canCashbox = isBoss || role === 'bookkeeper' || role === 'warehouse_keeper';
+  // Вкладка «Касса» — подтверждающие (сдачи/возвраты) и менеджеры (сдают наличные).
+  const canCashbox = isBoss || role === 'bookkeeper' || role === 'warehouse_keeper' || role === 'manager';
   const cashboxTab = canCashbox
     ? `<button class="finance-tab ${financeTab === 'cashbox' ? 'active' : ''}" data-tab="cashbox">🧾 Касса</button>`
     : '';
@@ -1710,8 +1710,10 @@ async function renderCashbox(container) {
   // Каждый список может вернуть 403 (роль не видит) — тихо пропускаем.
   let deposits = [];
   let returns = [];
+  let myDeposits = null;  // null = роль не может сдавать (нет блока «Сдать наличные»)
   try { deposits = (await api('/api/deposits/pending', {})).deposits || []; } catch {}
   try { returns = (await api('/api/returns/pending', {})).returns || []; } catch {}
+  try { myDeposits = (await api('/api/deposits/my', {})).deposits || []; } catch {}
 
   const depCards = deposits.map(d => {
     const orders = (d.orders || [])
@@ -1756,7 +1758,54 @@ async function renderCashbox(container) {
   const retBlock = returns.length
     ? `<div class="section-label">↩️ Возвраты на подтверждении (${returns.length})</div><div class="debts-list">${retCards}</div>`
     : '';
-  container.innerHTML = (depBlock + retBlock) || '<div class="loader">Нет записей на подтверждении</div>';
+
+  // Блок менеджера: сдать наличные + свои сдачи (если роль может сдавать).
+  let createBlock = '';
+  let myBlock = '';
+  if (myDeposits !== null) {
+    createBlock = `
+      <div class="section-label">Сдать наличные</div>
+      <div class="card">
+        <div class="form-row">
+          <label class="form-label">Сумма (USD)</label>
+          <input type="number" id="dep-amount" class="form-input" placeholder="500" inputmode="decimal">
+        </div>
+        <button id="dep-create" class="btn-primary">💵 Сдать в кассу</button>
+        <div class="debt-hint">Распределится по вашим открытым заказам автоматически.</div>
+      </div>
+    `;
+    const stEmoji = { pending: '⏳', confirmed: '✅', rejected: '❌' };
+    const rows = myDeposits.map(d => `
+      <div class="stock-row">
+        <div class="stock-info">
+          <div class="stock-name">${stEmoji[d.status] || '•'} #${d.id} — ${fmt(d.amount)} USD</div>
+          <div class="stock-folder">${(d.created_at || '').slice(0, 16)}${d.status === 'rejected' && d.reject_reason ? ' · ' + escapeHtml(d.reject_reason) : ''}</div>
+        </div>
+      </div>
+    `).join('');
+    myBlock = myDeposits.length
+      ? `<div class="section-label">Мои сдачи</div><div class="stock-list">${rows}</div>`
+      : '';
+  }
+
+  const confirmBlocks = depBlock + retBlock;
+  container.innerHTML = createBlock + myBlock + confirmBlocks
+    || '<div class="loader">Нет записей на подтверждении</div>';
+
+  // Создание сдачи (менеджер).
+  const createBtn = container.querySelector('#dep-create');
+  if (createBtn) {
+    createBtn.addEventListener('click', () => {
+      const raw = container.querySelector('#dep-amount').value;
+      const amount = parseFloat(String(raw).replace(',', '.').replace(/\s/g, ''));
+      if (isNaN(amount) || amount <= 0) { tg.showAlert('❌ Введите положительную сумму'); return; }
+      haptic('light');
+      createBtn.disabled = true;
+      api('/api/deposits/create', { amount })
+        .then(r => { tg.showAlert(`✅ Сдача #${r.deposit_id} отправлена на подтверждение`); renderCashbox(container); })
+        .catch(e => { tg.showAlert('❌ ' + e.message); createBtn.disabled = false; });
+    });
+  }
 
   // Сдачи: подтвердить / отклонить (причина — inline).
   container.querySelectorAll('.debt-card[data-dep]').forEach(card => {
