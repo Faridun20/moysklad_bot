@@ -2052,6 +2052,42 @@ def prune_notified_shipments(older_than_days: int = 30) -> int:
     return deleted
 
 
+def prune_audit_log(retention_months: int = 6) -> int:
+    """Удалить записи аудита старше retention_months (janitor, §13). Экспорт в
+    Drive перед удалением — отдельной интеграцией (audit_archive_exports);
+    здесь только чистка БД. Месяц ≈ 30 дней (для janitor-задачи достаточно).
+    Возвращает число удалённых строк."""
+    from datetime import timedelta
+
+    cutoff = (datetime.now() - timedelta(days=retention_months * 30)).strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("DELETE FROM audit_log WHERE created_at < ?"), (cutoff,))
+        deleted = cur.rowcount
+        conn.commit()
+    return deleted
+
+
+def purge_soft_deleted(retention_days: int = 365) -> dict[str, int]:
+    """Физически удалить soft-deleted строки (deleted_at IS NOT NULL) старше
+    retention_days. Возвращает {table: removed}. Таблицы с deleted_at:
+    orders, cash_deposits, returns."""
+    from datetime import timedelta
+
+    cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
+    out: dict[str, int] = {}
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        for table in ("orders", "cash_deposits", "returns"):
+            cur.execute(
+                q(f"DELETE FROM {table} WHERE deleted_at IS NOT NULL AND deleted_at < ?"),
+                (cutoff,),
+            )
+            out[table] = cur.rowcount
+        conn.commit()
+    return out
+
+
 def set_order_ms_demand_id(order_id: int, ms_demand_id: str) -> bool:
     """Сохранить id демэнд-документа МойСклад на заказе. Legacy: новые
     заказы используют set_order_ms_customerorder_id."""

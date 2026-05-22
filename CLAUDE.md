@@ -19,6 +19,7 @@ python -m tasks.run_report {daily|weekly|monthly}
 python -m tasks.run_debts_notify
 python -m tasks.run_ms_sync_retry
 python -m tasks.run_ops_monitor          # дайджест: зависшие заявки/сдачи/возвраты/партии (1×/день)
+python -m tasks.run_maintenance          # janitor: чистка дедупа/аудита/soft-deleted (ночью)
 ```
 
 Конфиг тулчейна — в `pyproject.toml` (`[tool.ruff]`, `[tool.pytest.ini_options]`,
