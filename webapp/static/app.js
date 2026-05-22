@@ -1370,16 +1370,23 @@ async function handleRequest(reqId, action) {
 }
 // ─── Экран: Аналитика ───────────────────────────────
 
-let analyticsCache = {};
+let analyticsCache = {};  // period -> { ts, data }
 let analyticsPeriod = 'month';
+const ANALYTICS_TTL_MS = 60 * 1000;
 
 async function renderAnalytics() {
   const content = document.getElementById('content');
-  content.innerHTML = loading('Считаю статистику…');
 
-  // Кэш не используем — данные постоянно меняются (новые апрувы), и
-  // показывать «вчерашние ноль» когда уже есть продажи — хуже чем
-  // короткая загрузка. Стабильно ждать 200-300мс на API_HOME-like запрос.
+  // Короткий кэш по периоду (TTL 60с): переключение неделя/месяц/3мес туда-обратно
+  // отдаётся мгновенно, без повторного запроса. TTL намеренно короткий — аналитика
+  // строится на отгрузках МойСклад, показывать сильно устаревшие цифры не годится.
+  const cached = analyticsCache[analyticsPeriod];
+  if (cached && Date.now() - cached.ts < ANALYTICS_TTL_MS) {
+    renderAnalyticsContent(cached.data);
+    return;
+  }
+
+  content.innerHTML = loading('Считаю статистику…');
   try {
     const response = await fetch('/api/analytics', {
       method: 'POST',
@@ -1391,6 +1398,7 @@ async function renderAnalytics() {
       throw new Error(err.detail || 'Ошибка');
     }
     const data = await response.json();
+    analyticsCache[analyticsPeriod] = { ts: Date.now(), data };
     renderAnalyticsContent(data);
   } catch (e) {
     content.innerHTML = `<div class="error">❌ ${e.message}</div>`;
