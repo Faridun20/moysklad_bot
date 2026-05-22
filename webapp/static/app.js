@@ -1660,10 +1660,25 @@ let debtsFilter = 'all';   // 'all' | 'today'
 
 async function renderFinance() {
   const content = document.getElementById('content');
+  const role = currentUser && currentUser.role;
+  const isBoss = role === 'admin' || role === 'boss';
+  // Вкладка «Лимиты» — только начальству (эндпоинт всё равно отдаст 403 другим).
+  const limitsTab = isBoss
+    ? `<button class="finance-tab ${financeTab === 'limits' ? 'active' : ''}" data-tab="limits">📊 Лимиты</button>`
+    : '';
+  // Вкладка «Касса» — кто подтверждает сдачи/возвраты.
+  const canCashbox = isBoss || role === 'bookkeeper' || role === 'warehouse_keeper';
+  const cashboxTab = canCashbox
+    ? `<button class="finance-tab ${financeTab === 'cashbox' ? 'active' : ''}" data-tab="cashbox">🧾 Касса</button>`
+    : '';
+  if (financeTab === 'limits' && !isBoss) financeTab = 'debts';
+  if (financeTab === 'cashbox' && !canCashbox) financeTab = 'debts';
   content.innerHTML = `
     <div class="finance-tabs">
       <button class="finance-tab ${financeTab === 'debts' ? 'active' : ''}" data-tab="debts">💳 Долги</button>
       <button class="finance-tab ${financeTab === 'payments' ? 'active' : ''}" data-tab="payments">💵 Платежи</button>
+      ${cashboxTab}
+      ${limitsTab}
     </div>
     <div id="finance-body"></div>
   `;
@@ -1675,11 +1690,178 @@ async function renderFinance() {
     });
   });
   // Контент подгружаем в #finance-body
+  const body = document.getElementById('finance-body');
   if (financeTab === 'debts') {
-    await renderDebts(document.getElementById('finance-body'));
+    await renderDebts(body);
+  } else if (financeTab === 'limits') {
+    await renderCreditLimits(body);
+  } else if (financeTab === 'cashbox') {
+    await renderCashbox(body);
   } else {
-    await renderPayments(document.getElementById('finance-body'));
+    await renderPayments(body);
   }
+}
+
+async function renderCashbox(container) {
+  container = container || document.getElementById('content');
+  container.innerHTML = loading('Загрузка кассы…');
+  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+
+  // Каждый список может вернуть 403 (роль не видит) — тихо пропускаем.
+  let deposits = [];
+  let returns = [];
+  try { deposits = (await api('/api/deposits/pending', {})).deposits || []; } catch {}
+  try { returns = (await api('/api/returns/pending', {})).returns || []; } catch {}
+
+  const depCards = deposits.map(d => {
+    const orders = (d.orders || [])
+      .map(o => `#${o.order_id} — ${fmt(o.amount_allocated)} USD`).join(', ') || '—';
+    return `
+      <div class="debt-card" data-dep="${d.id}">
+        <div class="debt-card-top">
+          <div class="debt-agent">💵 Сдача #${d.id}</div>
+          <div class="debt-amount">${fmt(d.amount)} USD</div>
+        </div>
+        <div class="debt-card-mid"><span class="debt-meta">Заказы: ${escapeHtml(orders)}</span></div>
+        <div class="debt-actions">
+          <button class="btn-confirm-pay dep-confirm">✅ Подтвердить</button>
+          <button class="btn-reject-pay dep-reject">❌ Отклонить</button>
+        </div>
+        <div class="limit-edit dep-reject-box" hidden>
+          <input type="text" class="form-input dep-reason" placeholder="Причина отклонения">
+          <button class="btn-reject-pay dep-reject-send">Отклонить сдачу</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  const retCards = returns.map(r => `
+      <div class="debt-card" data-ret="${r.id}">
+        <div class="debt-card-top">
+          <div class="debt-agent">↩️ Возврат #${r.id}</div>
+          <div class="debt-amount">${fmt(r.total_amount)} USD</div>
+        </div>
+        <div class="debt-card-mid">
+          <span class="debt-meta">Заказ #${r.order_id} · ${escapeHtml(r.reason || '')}</span>
+        </div>
+        <div class="debt-actions">
+          <button class="btn-confirm-pay ret-confirm">✅ Подтвердить возврат</button>
+        </div>
+      </div>
+  `).join('');
+
+  const depBlock = deposits.length
+    ? `<div class="section-label">💵 Сдачи на подтверждении (${deposits.length})</div><div class="debts-list">${depCards}</div>`
+    : '';
+  const retBlock = returns.length
+    ? `<div class="section-label">↩️ Возвраты на подтверждении (${returns.length})</div><div class="debts-list">${retCards}</div>`
+    : '';
+  container.innerHTML = (depBlock + retBlock) || '<div class="loader">Нет записей на подтверждении</div>';
+
+  // Сдачи: подтвердить / отклонить (причина — inline).
+  container.querySelectorAll('.debt-card[data-dep]').forEach(card => {
+    const id = card.dataset.dep;
+    card.querySelector('.dep-confirm').addEventListener('click', () => {
+      haptic('light');
+      api('/api/deposits/confirm', { deposit_id: Number(id) })
+        .then(() => { tg.showAlert('✅ Сдача подтверждена'); renderCashbox(container); })
+        .catch(e => tg.showAlert('❌ ' + e.message));
+    });
+    const box = card.querySelector('.dep-reject-box');
+    card.querySelector('.dep-reject').addEventListener('click', () => { box.hidden = !box.hidden; });
+    card.querySelector('.dep-reject-send').addEventListener('click', () => {
+      const reason = card.querySelector('.dep-reason').value.trim();
+      if (reason.length < 3) { tg.showAlert('❌ Укажите причину'); return; }
+      api('/api/deposits/reject', { deposit_id: Number(id), reason })
+        .then(() => { tg.showAlert('❌ Сдача отклонена'); renderCashbox(container); })
+        .catch(e => tg.showAlert('❌ ' + e.message));
+    });
+  });
+
+  // Возвраты: подтвердить.
+  container.querySelectorAll('.debt-card[data-ret]').forEach(card => {
+    card.querySelector('.ret-confirm').addEventListener('click', () => {
+      haptic('light');
+      api('/api/returns/confirm', { return_id: Number(card.dataset.ret) })
+        .then(() => { tg.showAlert('✅ Возврат подтверждён'); renderCashbox(container); })
+        .catch(e => tg.showAlert('❌ ' + e.message));
+    });
+  });
+}
+
+async function renderCreditLimits(container) {
+  container = container || document.getElementById('content');
+  container.innerHTML = loading('Загрузка лимитов…');
+  let agents = [];
+  try {
+    const data = await api('/api/credit/overview', {});
+    agents = data.agents || [];
+  } catch (e) {
+    container.innerHTML = `<div class="error">❌ ${e.message}</div>`;
+    return;
+  }
+
+  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  if (agents.length === 0) {
+    container.innerHTML = '<div class="loader">Нет контрагентов с активными заказами</div>';
+    return;
+  }
+
+  const cards = agents.map(a => {
+    const badge = a.over_limit
+      ? '<span class="stock-badge badge-red">превышен</span>'
+      : '<span class="stock-badge badge-green">в норме</span>';
+    return `
+      <div class="debt-card" data-agent="${escapeHtml(a.agent_id)}" data-name="${escapeHtml(a.agent_name)}" data-limit="${a.limit}">
+        <div class="debt-card-top">
+          <div class="debt-agent">🏢 ${escapeHtml(a.agent_name)}</div>
+          ${badge}
+        </div>
+        <div class="debt-card-mid">
+          <span class="debt-meta">лимит ${fmt(a.limit)} · долг ${fmt(a.debt)} · свободно ${fmt(a.free)} USD</span>
+        </div>
+        <div class="debt-actions">
+          <button class="btn-edit-limit">✏️ Изменить лимит</button>
+        </div>
+        <div class="limit-edit" hidden>
+          <input type="number" class="form-input limit-input" inputmode="decimal" value="${a.limit}">
+          <div class="debt-actions">
+            <button class="btn-confirm-pay limit-save">Сохранить</button>
+            <button class="btn-reject-pay limit-cancel">Отмена</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  container.innerHTML = `<div class="section-label">Кредитные лимиты</div><div class="debts-list">${cards}</div>`;
+
+  // Inline-редактирование: prompt() в Telegram WebApp ненадёжен, поэтому
+  // показываем поле ввода прямо в карточке.
+  container.querySelectorAll('.debt-card').forEach(card => {
+    const editBox = card.querySelector('.limit-edit');
+    const editBtn = card.querySelector('.btn-edit-limit');
+    editBtn.addEventListener('click', () => {
+      haptic('light');
+      editBox.hidden = !editBox.hidden;
+    });
+    card.querySelector('.limit-cancel').addEventListener('click', () => { editBox.hidden = true; });
+    card.querySelector('.limit-save').addEventListener('click', () => {
+      const raw = card.querySelector('.limit-input').value;
+      const amount = parseFloat(String(raw).replace(',', '.').replace(/\s/g, ''));
+      if (isNaN(amount) || amount < 0) {
+        tg.showAlert('❌ Лимит должен быть неотрицательным числом.');
+        return;
+      }
+      api('/api/credit/set', {
+        agent_id: card.dataset.agent,
+        agent_name: card.dataset.name,
+        limit_amount: amount,
+      })
+        .then(() => { tg.showAlert(`✅ Лимит обновлён: ${fmt(amount)} USD`); renderCreditLimits(container); })
+        .catch(e => tg.showAlert('❌ ' + e.message));
+    });
+  });
 }
 
 async function renderDebts(container) {
