@@ -497,14 +497,24 @@ async def api_home(request: Request):
     ]
 
     is_boss = role in ("admin", "boss")
+    # Заполняется только в boss-ветке ниже, но читается в отдельном boss-блоке
+    # (лидерборд) — объявляем заранее, чтобы тип был определён (mypy has-type).
+    week_shipments: list[dict] | BaseException = []
 
     # ─── Сегодня ──────────────────────────────────────
     if is_boss:
-        # Босс видит общую выручку компании
-        try:
-            today_stats = await get_sales_stats(start_of_day, now)
-        except Exception as e:
-            logger.warning("home: failed to load today stats: %s", e)
+        # Босс видит общую выручку за сегодня + лидерборд за неделю. Оба источника
+        # — независимые запросы к МойСклад; тянем их параллельно (раньше шли
+        # последовательно через всю функцию — ~1с на двух round-trip'ах подряд).
+        ms_results = await asyncio.gather(
+            get_sales_stats(start_of_day, now),
+            get_shipments(week_ago, now),
+            return_exceptions=True,
+        )
+        today_stats = ms_results[0]
+        week_shipments = ms_results[1]
+        if isinstance(today_stats, BaseException):
+            logger.warning("home: failed to load today stats: %s", today_stats)
             today_stats = {"total": 0, "count": 0, "clients": 0, "top_products": []}
         today = {
             "revenue": today_stats["total"] / 100,
@@ -565,14 +575,15 @@ async def api_home(request: Request):
         pending = await adb.get_pending_requests()
         result["pending_requests"] = len(pending)
 
-        # Топ-сотрудники: группируем по нашему кастомному атрибуту
-        # telegram_full_name (его проставляет ms_demand при создании
-        # отгрузки из бота). Если атрибута нет — попадаем в "Прочее /
-        # МойСклад" (отгрузки, заведённые вручную через веб МойСклад).
-        # Раньше группировали по `owner` — это техническая учётная запись
-        # МойСклад API-токена → все отгрузки прилипали к одному имени.
-        try:
-            week_shipments = await get_shipments(week_ago, now)
+        # Топ-сотрудники из УЖЕ полученных недельных отгрузок (см. gather выше).
+        # Группируем по кастомному атрибуту telegram_full_name (его проставляет
+        # ms_demand при создании отгрузки из бота). Нет атрибута → "Прочее
+        # (вручную в МойСклад)". Раньше группировали по `owner` — техническая
+        # учётка API-токена, все отгрузки липли к одному имени.
+        if isinstance(week_shipments, BaseException):
+            logger.warning("home: failed to load top employees: %s", week_shipments)
+            result["top_employees"] = []
+        else:
             by_manager: dict[str, dict] = {}
             for s in week_shipments:
                 tg_name = _extract_tg_attribute(s, "telegram_full_name")
@@ -586,9 +597,6 @@ async def api_home(request: Request):
                 {"name": name, "revenue": d["sum"] / 100, "count": d["count"]}
                 for name, d in top_emp
             ]
-        except Exception as e:
-            logger.warning("home: failed to load top employees: %s", e)
-            result["top_employees"] = []
 
     return JSONResponse(result)
 
