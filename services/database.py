@@ -7,6 +7,7 @@ import time
 import logging
 from datetime import datetime
 from contextlib import contextmanager
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -913,11 +914,14 @@ def get_agent_current_debt(agent_id: str) -> float:
         return 0.0
     with get_conn() as conn:
         cur = get_cursor(conn)
+        # Исключаем неактуальные: черновики/отклонённые/отменённые, полностью
+        # оплаченные (в т.ч. через cash deposit → payment_confirmed=1 /
+        # status='paid') и полностью возвращённые.
         cur.execute(
             q(
                 "SELECT id FROM orders WHERE agent_id = ? "
-                "AND status NOT IN ('draft', 'rejected', 'cancelled') "
-                "AND (deleted_at IS NULL)"
+                "AND status NOT IN ('draft', 'rejected', 'cancelled', 'paid', 'returned') "
+                "AND payment_confirmed = 0 AND (deleted_at IS NULL)"
             ),
             (agent_id,),
         )
@@ -952,6 +956,47 @@ def check_credit_limit(agent_id: str, order_total: float) -> dict:
         "projected": projected,
         "over_limit": projected > limit,
     }
+
+
+def get_credit_overview() -> list[dict]:
+    """Сводка по контрагентам для боса: лимит + текущий долг. Объединяет
+    строки credit_limits и контрагентов из активных заказов (даже без явной
+    строки лимита — у них дефолтный лимит). Сортировка: сначала те, кто ближе
+    к лимиту/превысил."""
+    agents: dict[str, str] = {}
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute("SELECT agent_id, agent_name FROM credit_limits")
+        for r in cur.fetchall():
+            aid = r["agent_id"] if USE_POSTGRES else r[0]
+            if aid:
+                agents[aid] = (r["agent_name"] if USE_POSTGRES else r[1]) or aid
+        cur.execute(
+            "SELECT DISTINCT agent_id, agent_name FROM orders "
+            "WHERE agent_id IS NOT NULL AND agent_id != '' "
+            "AND status NOT IN ('draft', 'rejected', 'cancelled') AND (deleted_at IS NULL)"
+        )
+        for r in cur.fetchall():
+            aid = r["agent_id"] if USE_POSTGRES else r[0]
+            if aid and aid not in agents:
+                agents[aid] = (r["agent_name"] if USE_POSTGRES else r[1]) or aid
+
+    out: list[dict[str, Any]] = []
+    for aid, name in agents.items():
+        debt = get_agent_current_debt(aid)
+        limit = get_credit_limit(aid)
+        out.append(
+            {
+                "agent_id": aid,
+                "agent_name": name,
+                "limit": limit,
+                "debt": debt,
+                "free": limit - debt,
+                "over_limit": debt > limit,
+            }
+        )
+    out.sort(key=lambda a: float(a["free"]))
+    return out
 
 
 # ─── IMPLEMENTATION.md Фаза 3: журнал изменений заказа ────────────────────────
@@ -1277,6 +1322,46 @@ def reject_cash_deposit(deposit_id: int, rejected_by: int, rejected_name: str, r
         f"Сдача #{deposit_id} отклонена: {reason[:200]}",
     )
     return {"ok": True}
+
+
+def get_cash_deposit(deposit_id: int) -> dict | None:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("SELECT * FROM cash_deposits WHERE id = ?"), (deposit_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def get_cash_deposit_orders(deposit_id: int) -> list[dict]:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT order_id, amount_allocated FROM cash_deposit_orders WHERE deposit_id = ?"),
+            (deposit_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_manager_cash_deposits(manager_id: int, limit: int = 20) -> list[dict]:
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "SELECT * FROM cash_deposits WHERE manager_id = ? AND (deleted_at IS NULL) "
+                "ORDER BY created_at DESC LIMIT ?"
+            ),
+            (manager_id, limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_deposit_confirmers() -> list[int]:
+    """user_id ролей, которые подтверждают сдачи: admin/boss/bookkeeper."""
+    try:
+        users = get_all_users()
+    except Exception:
+        return []
+    return [u["user_id"] for u in users if u["role"] in ("admin", "boss", "bookkeeper")]
 
 
 def get_pending_cash_deposits() -> list[dict]:

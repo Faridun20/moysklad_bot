@@ -105,6 +105,10 @@ def register_routers(dp: Dispatcher):
         log,
         orders,
         debts,
+        deposits,
+        returns,
+        credit,
+        order_cancel,
     )
 
     routers = [
@@ -119,6 +123,10 @@ def register_routers(dp: Dispatcher):
         log.router,
         orders.router,
         debts.router,
+        deposits.router,
+        returns.router,
+        credit.router,
+        order_cancel.router,
     ]
     for r in routers:
         dp.include_router(r)

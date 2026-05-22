@@ -101,3 +101,22 @@ def test_pending_list_and_overdue(mgr_orders):
         conn.commit()
     overdue_ids = {o["id"] for o in db.get_overdue_undeposited_orders(days=2)}
     assert o2 in overdue_ids
+
+
+def test_deposit_paid_order_excluded_from_agent_debt(isolated_db):
+    """Регресс (найдено smoke-прогоном): заказ, закрытый cash-deposit'ом
+    (status=paid, payment_confirmed=1, без строки в payments), не должен
+    висеть в долге контрагента."""
+    db = isolated_db
+    mgr = 200
+    db.set_role(mgr, "m", "M", "manager")
+    oid = db.create_order(mgr, "M", "")
+    db.update_order_agent(oid, "A-PAID", "Клиент")
+    db.add_order_item(oid, "Товар", "", 1, "шт", 250.0)
+    db.update_order_status(oid, "shipped")
+    assert db.get_agent_current_debt("A-PAID") == 250.0
+
+    dep = db.create_cash_deposit(mgr, 250.0)
+    db.confirm_cash_deposit(dep["deposit_id"], 1, "Boss")
+    assert db.get_order(oid)["status"] == "paid"
+    assert db.get_agent_current_debt("A-PAID") == 0.0
