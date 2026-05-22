@@ -958,19 +958,52 @@ def check_credit_limit(agent_id: str, order_total: float) -> dict:
     }
 
 
+def _confirmed_returns_by_order(order_ids: list[int]) -> dict[int, float]:
+    """{order_id: сумма подтверждённых (не удалённых) возвратов}. Фильтр идентичен
+    тому, что в get_agent_current_debt — используется для батч-расчёта долга."""
+    if not order_ids:
+        return {}
+    unique_ids = list(set(order_ids))
+    placeholders = ",".join(["?"] * len(unique_ids))
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                f"SELECT order_id, COALESCE(SUM(total_amount), 0) AS s FROM returns "
+                f"WHERE order_id IN ({placeholders}) AND status = 'confirmed' "
+                f"AND (deleted_at IS NULL) GROUP BY order_id"
+            ),
+            unique_ids,
+        )
+        rows = cur.fetchall()
+    result: dict[int, float] = {}
+    for r in rows:
+        oid = r["order_id"] if USE_POSTGRES else r[0]
+        result[oid] = float((r["s"] if USE_POSTGRES else r[1]) or 0)
+    return result
+
+
 def get_credit_overview() -> list[dict]:
     """Сводка по контрагентам для боса: лимит + текущий долг. Объединяет
     строки credit_limits и контрагентов из активных заказов (даже без явной
     строки лимита — у них дефолтный лимит). Сортировка: сначала те, кто ближе
-    к лимиту/превысил."""
+    к лимиту/превысил.
+
+    Батч-версия (без N+1): раньше на каждого агента звался get_agent_current_debt,
+    а тот — get_order_payment_summary на КАЖДЫЙ заказ (≈ A×(1+4N) запросов). Теперь
+    долг считается из 4 групповых выборок, клампинг — в Python (логика тождественна
+    get_agent_current_debt; держим её тут, чтобы не плодить кросс-БД GREATEST/MAX)."""
     agents: dict[str, str] = {}
+    limits_map: dict[str, float] = {}
     with get_conn() as conn:
         cur = get_cursor(conn)
-        cur.execute("SELECT agent_id, agent_name FROM credit_limits")
+        cur.execute("SELECT agent_id, agent_name, limit_amount FROM credit_limits")
         for r in cur.fetchall():
             aid = r["agent_id"] if USE_POSTGRES else r[0]
-            if aid:
-                agents[aid] = (r["agent_name"] if USE_POSTGRES else r[1]) or aid
+            if not aid:
+                continue
+            agents[aid] = (r["agent_name"] if USE_POSTGRES else r[1]) or aid
+            limits_map[aid] = float(r["limit_amount"] if USE_POSTGRES else r[2])
         cur.execute(
             "SELECT DISTINCT agent_id, agent_name FROM orders "
             "WHERE agent_id IS NOT NULL AND agent_id != '' "
@@ -981,10 +1014,41 @@ def get_credit_overview() -> list[dict]:
             if aid and aid not in agents:
                 agents[aid] = (r["agent_name"] if USE_POSTGRES else r[1]) or aid
 
+        # Открытые заказы (фильтр идентичен get_agent_current_debt) — один запрос
+        # на всех агентов; долг по ним разбираем в Python.
+        cur.execute(
+            "SELECT id, agent_id FROM orders "
+            "WHERE status NOT IN ('draft', 'rejected', 'cancelled', 'paid', 'returned') "
+            "AND payment_confirmed = 0 AND (deleted_at IS NULL)"
+        )
+        open_rows = [
+            ((r["id"] if USE_POSTGRES else r[0]), (r["agent_id"] if USE_POSTGRES else r[1]))
+            for r in cur.fetchall()
+        ]
+
+    open_ids = [oid for oid, _ in open_rows]
+    items_by_order = get_order_items_by_ids(open_ids)
+    payments_by_order = get_payments_for_orders(open_ids)
+    returns_by_order = _confirmed_returns_by_order(open_ids)
+    default_limit = float(get_setting("credit_limit_default", 2000.0))
+
+    # debt[aid] = Σ по открытым заказам max(0, max(0, total−confirmed) − returns)
+    # — бит-в-бит как цикл в get_agent_current_debt.
+    debt_by_agent: dict[str, float] = {}
+    for oid, aid in open_rows:
+        items = items_by_order.get(oid, [])
+        total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
+        payments = payments_by_order.get(oid, [])
+        confirmed = sum(p["amount"] for p in payments if p["status"] == "confirmed")
+        returns_sum = returns_by_order.get(oid, 0.0)
+        order_debt = max(0.0, max(0.0, total - confirmed) - returns_sum)
+        if order_debt:
+            debt_by_agent[aid] = debt_by_agent.get(aid, 0.0) + order_debt
+
     out: list[dict[str, Any]] = []
     for aid, name in agents.items():
-        debt = get_agent_current_debt(aid)
-        limit = get_credit_limit(aid)
+        debt = debt_by_agent.get(aid, 0.0)
+        limit = limits_map.get(aid, default_limit)
         out.append(
             {
                 "agent_id": aid,
