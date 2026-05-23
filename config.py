@@ -12,6 +12,16 @@ try:
 except ImportError:
     import logging as _logging
 
+    # Именованный logger вместо root, иначе первый же warning при
+    # импорте (ADMIN_IDS/BOSS_IDS не заданы) триггерит
+    # logging.basicConfig(level=WARNING) с дефолтным формат-форматтером.
+    # После этого entrypoint'ы (bot.py, tasks/run_*.py) ставят свой
+    # basicConfig(level=INFO) — а тот становится no-op, и ВСЕ INFO-логи
+    # на проде глушатся (видно в Railway logs: только WARNING/ERROR).
+    # Через именованный logger предупреждение всё равно пишется в stderr
+    # (через logging.lastResort), но root logger остаётся чист.
+    _logger = _logging.getLogger("config")
+
     TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
     MS_TOKEN = os.environ.get("MS_TOKEN", "").strip()
 
@@ -37,7 +47,7 @@ except ImportError:
         val = os.environ.get(key, "")
         result = [int(x.strip()) for x in val.split(",") if x.strip().isdigit()]
         if not result and key in ("ADMIN_IDS", "BOSS_IDS"):
-            _logging.warning("config: %s не задан — соответствующая роль не настроена", key)
+            _logger.warning("%s не задан — соответствующая роль не настроена", key)
         return result
 
     ALLOWED_USERS = _parse_ids("ALLOWED_USERS")

@@ -44,17 +44,29 @@ async def main(limit: int) -> int:
 
     # Lazy-импорт чтобы не падать на старте если ms_payments тянет что-то
     from services.ms_payments import create_paymentin_for_payment
-
-    pending = get_payments_needing_ms_sync(limit=limit)
-    if not pending:
-        logger.info("Нет платежей требующих повторной синхронизации.")
-        return 0
-
-    logger.info("Найдено %d платежей для синхронизации", len(pending))
+    from services.ms_demand import init_demand_context, is_ready
 
     ok_count = 0
     fail_count = 0
+    pending: list = []
     try:
+        # create_paymentin_for_payment упирается в ms_demand.is_ready() —
+        # без org_meta МС-payload собрать не из чего, платёж копится в failed.
+        # В bot-процессе контекст инициализирует bot.main(); cron-сервис
+        # запускается отдельным контейнером, поэтому делаем это сами.
+        if not is_ready():
+            try:
+                await init_demand_context()
+            except Exception:
+                logger.exception("init_demand_context упал — ретрай платежей будет провален")
+
+        pending = get_payments_needing_ms_sync(limit=limit)
+        if not pending:
+            logger.info("Нет платежей требующих повторной синхронизации.")
+            return 0
+
+        logger.info("Найдено %d платежей для синхронизации", len(pending))
+
         for p in pending:
             pid = p["id"]
             result = await create_paymentin_for_payment(pid)
@@ -76,15 +88,19 @@ async def main(limit: int) -> int:
                     result.get("reason"),
                 )
     finally:
+        # aiohttp-сессии (МС + Telegram-notify) держим закрытыми во ВСЕХ
+        # ветках, иначе на noop-прогоне (нет платежей) словим
+        # "Unclosed client session" — init_demand_context уже сходил в МС.
         await close_session()
         await close_tg_session()
 
-    logger.info(
-        "ms_sync_retry: успешно %d, провалено %d из %d",
-        ok_count,
-        fail_count,
-        len(pending),
-    )
+    if pending:
+        logger.info(
+            "ms_sync_retry: успешно %d, провалено %d из %d",
+            ok_count,
+            fail_count,
+            len(pending),
+        )
     # Возвращаем 0 даже если есть failed — это «нормальное» состояние,
     # cron-job не должен помечать себя как сбоившийся; настоящий сбой
     # (например, no DATABASE_URL) поймает try/except в asyncio.run.
