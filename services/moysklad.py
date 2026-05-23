@@ -449,6 +449,14 @@ async def get_shipment(demand_id: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+# Параллельно тянем позиции 15+ отгрузок (asyncio.gather в get_sales_stats /
+# get_employee_stats). Без семафора это залп 15 одновременных запросов,
+# который стабильно бьёт 429-rate-limit МС → ретраи 0.5/1.0/2.0с цепочкой и
+# заметная latency у /api/analytics. Семафор на cache-miss держит ≤4
+# конкурентных HTTP. Кэш-хит сюда не доходит (декоратор отдаёт до тела).
+_POSITIONS_CONCURRENCY = asyncio.Semaphore(4)
+
+
 @_ms_ttl_cache(ttl=3600.0, name="get_shipment_positions")
 async def get_shipment_positions(demand_id: str) -> list[dict]:
     """Получить позиции (товары) конкретной отгрузки.
@@ -456,10 +464,11 @@ async def get_shipment_positions(demand_id: str) -> list[dict]:
     Позиции demand-документа неизменяемы после создания, поэтому кэш
     на час безопасен. До этого 15+ позиций отгрузки запрашивались на
     каждое открытие «Аналитики» — теперь только один раз за demand."""
-    data = await ms_get(
-        f"entity/demand/{demand_id}/positions",
-        params={"limit": 100, "expand": "assortment,uom"},
-    )
+    async with _POSITIONS_CONCURRENCY:
+        data = await ms_get(
+            f"entity/demand/{demand_id}/positions",
+            params={"limit": 100, "expand": "assortment,uom"},
+        )
     return data if isinstance(data, list) else data.get("rows", [])
 
 

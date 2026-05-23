@@ -25,3 +25,6 @@ config_local.py
 venv/
 .idea/
 .vscode/
+
+# Локально скачанный Railway CLI (для проверки прод-логов)
+.railway-cli/
