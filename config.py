@@ -68,6 +68,15 @@ except ImportError:
     TG_USE_WEBHOOK = os.environ.get("TG_USE_WEBHOOK", "").lower() in ("1", "true", "yes")
     TG_WEBHOOK_SECRET = os.environ.get("TG_WEBHOOK_SECRET", "")
     WEBAPP_URL = os.environ.get("WEBAPP_URL", "").rstrip("/")
+    # Telegram молча игнорирует WebAppInfo URL без HTTPS — кнопка появляется,
+    # клик не открывает ничего. Проверяем на этапе импорта (warning, не fatal),
+    # чтобы кривой env-var не уходил в прод незамеченным.
+    if WEBAPP_URL and not WEBAPP_URL.startswith(("https://", "http://localhost", "http://127.0.0.1")):
+        _logger.warning(
+            "config: WEBAPP_URL=%r — Telegram WebApp требует HTTPS. "
+            "Кнопка 'Открыть' появится, но клик не откроет WebApp.",
+            WEBAPP_URL,
+        )
 
     # ─── Redis (опционально) ──────────────────────────────────────
     # Если задан REDIS_URL — FSM aiogram использует RedisStorage,
