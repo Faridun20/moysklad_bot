@@ -4,7 +4,6 @@ Telegram-бот МойСклад — точка запуска
 
 import asyncio
 import logging
-import os
 from typing import Any
 from collections.abc import Awaitable, Callable
 
@@ -94,6 +93,39 @@ class RateLimitMiddleware(BaseMiddleware):
                         pass
                 return
         return await handler(event, data)
+
+
+async def set_global_menu_button(bot: Bot) -> None:
+    """Установить глобальный (default-для-всех) Menu Button в композере чата.
+
+    Глобальный set_chat_menu_button (без chat_id) применяется к НОВЫМ чатам.
+    Per-user кэш Telegram он НЕ перетирает — для этого в handlers/start.py
+    делается явный per-chat вызов на каждый /start.
+
+    Если WEBAPP_URL не задан — возвращаем дефолтную кнопку (на случай если
+    раньше был задан, а сейчас убрали).
+
+    Вызывается из main() (BOT_MODE=all/bot) и из _run_webapp_only() —
+    чтобы любой процесс, у которого есть Bot-инстанс, мог обновить меню.
+    """
+    if WEBAPP_URL:
+        try:
+            await bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(
+                    text="Открыть",
+                    web_app=WebAppInfo(url=WEBAPP_URL),
+                )
+            )
+            logger.info("Global Menu Button установлен на %s", WEBAPP_URL)
+        except Exception as e:
+            logger.warning("Не удалось установить Menu Button: %s", e)
+    else:
+        # На случай если WEBAPP_URL убрали — возвращаем дефолтную кнопку
+        try:
+            await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
+            logger.info("Global Menu Button сброшен (WEBAPP_URL пуст)")
+        except Exception:
+            pass
 
 
 def register_routers(dp: Dispatcher):
@@ -318,6 +350,10 @@ async def _run_webapp_only():
             logger.info("BOT_MODE=webapp + webhook: установлен на %s", webhook_url)
         except Exception:
             logger.exception("set_webhook failed; webhook'и приходить не будут")
+        # Глобальный Menu Button — раньше ставился только в BOT_MODE=all/bot.
+        # Если у нас pure-webapp процесс и парный bot-сервис лежит/не настроен,
+        # без этого вызова новые юзеры не получат «Открыть» в композере чата.
+        await set_global_menu_button(bot)
     else:
         logger.info(
             "BOT_MODE=webapp: Telegram-апдейты не обрабатываются "
@@ -427,28 +463,8 @@ async def main():
 
     # Закрепляем кнопку «Открыть» в композере чата, если задан WEBAPP_URL.
     # Это делает WebApp доступным в один тап рядом с полем ввода.
-    # Это ГЛОБАЛЬНЫЙ default menu button. Per-user кэш он НЕ перетирает —
-    # для этого в handlers/start.py в cmd_start идёт явный per-chat вызов
-    # на каждый /start, чтобы старые URL у юзеров принудительно обновились.
-    webapp_url = os.environ.get("WEBAPP_URL", "").strip().rstrip("/")
-    logger.info("Текущий WEBAPP_URL: %r", webapp_url or "(не задан)")
-    if webapp_url:
-        try:
-            await bot.set_chat_menu_button(
-                menu_button=MenuButtonWebApp(
-                    text="Открыть",
-                    web_app=WebAppInfo(url=webapp_url),
-                )
-            )
-            logger.info("Global Menu Button установлен на %s", webapp_url)
-        except Exception as e:
-            logger.warning("Не удалось установить Menu Button: %s", e)
-    else:
-        # На случай если WEBAPP_URL убрали — возвращаем дефолтную кнопку
-        try:
-            await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
-        except Exception:
-            pass
+    logger.info("Текущий WEBAPP_URL: %r", WEBAPP_URL or "(не задан)")
+    await set_global_menu_button(bot)
 
     bg_tasks = start_background_tasks(bot)
 

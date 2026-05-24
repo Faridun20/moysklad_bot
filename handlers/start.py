@@ -18,7 +18,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from services.roles import is_boss
 from utils.formatters import DIV
-from config import ADMIN_IDS
+from config import ADMIN_IDS, WEBAPP_URL
 from services.database import (
     get_role,
     ensure_user,
@@ -203,17 +203,19 @@ async def cmd_start(message: Message):
     # у юзера в превью чата осталась кнопка с битым URL → «Not Found».
     # Глобальный set_chat_menu_button (без chat_id) кэш у юзеров НЕ
     # перетирает; нужен явный per-chat вызов.
-    import os as _os
+    #
+    # Гостям ставим MenuButtonDefault даже при наличии WEBAPP_URL —
+    # WebApp у них откажет 403 на _authorize, лучше не показывать
+    # тизерную кнопку которая всё равно не работает.
     from aiogram.types import MenuButtonWebApp, MenuButtonDefault, WebAppInfo
 
-    webapp_url = _os.environ.get("WEBAPP_URL", "").strip().rstrip("/")
     try:
-        if webapp_url:
+        if WEBAPP_URL and role != "guest":
             await message.bot.set_chat_menu_button(
                 chat_id=message.chat.id,
                 menu_button=MenuButtonWebApp(
                     text="Открыть",
-                    web_app=WebAppInfo(url=webapp_url),
+                    web_app=WebAppInfo(url=WEBAPP_URL),
                 ),
             )
         else:
@@ -268,10 +270,12 @@ async def cmd_start(message: Message):
             )
 
     # 1) Welcome + persistent reply-кнопка «🌐 Открыть» снизу чата
+    #    Гостям передаём None → ReplyKeyboardRemove (та же логика что и
+    #    для Menu Button выше: не показываем кнопку которая отдаст 403).
     await message.answer(
         get_welcome_text(role, user.first_name or "") + sync_status_line,
         parse_mode="HTML",
-        reply_markup=webapp_reply_keyboard(webapp_url),
+        reply_markup=webapp_reply_keyboard(WEBAPP_URL if role != "guest" else None),
     )
 
     # 2) Если есть срочные/admin-only действия — отдельное короткое
