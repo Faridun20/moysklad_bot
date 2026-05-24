@@ -16,6 +16,7 @@ CHECK_INTERVAL_SEC = int(_CHECK_INTERVAL_SEC)
 from services.moysklad import get_shipments, get_shipment, get_shipment_positions
 from services.database import (
     get_all_users,
+    get_pool_stats,
     mark_shipment_notified,
     prune_notified_shipments,
 )
@@ -302,7 +303,14 @@ async def shipment_notifier(bot: Bot | None = None):
 
     # Чистим дедуп-таблицу примерно раз в сутки (а не каждый цикл).
     _prune_every = max(1, 86400 // CHECK_INTERVAL_SEC)
+    # Логируем pool-stats примерно раз в час, чтобы не засорять логи
+    # (при CHECK_INTERVAL_SEC=900 это каждые 4 цикла).
+    _pool_every = max(1, 3600 // CHECK_INTERVAL_SEC)
     _cycle = 0
+    # Чтобы не повторять алерт каждый цикл при устойчиво высокой
+    # загрузке пула — взводим флаг при первой засветке выше порога,
+    # сбрасываем когда util падает ниже него.
+    _pool_alert_armed = False
 
     while True:
         await asyncio.sleep(CHECK_INTERVAL_SEC)
@@ -314,6 +322,32 @@ async def shipment_notifier(bot: Bot | None = None):
                     logger.info("notified_shipments: вычищено %d старых записей", deleted)
             except Exception as e:
                 logger.warning("prune_notified_shipments failed: %s", e)
+        if _cycle % _pool_every == 0:
+            try:
+                stats = await asyncio.to_thread(get_pool_stats)
+                if stats:
+                    logger.info(
+                        "pg_pool: used=%d/free=%d (max=%d, util=%.1f%%)",
+                        stats.get("used", 0),
+                        stats.get("free", 0),
+                        stats.get("max", 0),
+                        stats.get("util_pct", 0.0),
+                    )
+                    util = float(stats.get("util_pct", 0.0))
+                    if util >= 80.0 and not _pool_alert_armed:
+                        _pool_alert_armed = True
+                        logger.warning(
+                            "pg_pool: загрузка %.1f%% (used=%d/max=%d) — близко к "
+                            "исчерпанию, увеличь PG_POOL_MAX или ищи утечку коннектов",
+                            util,
+                            stats.get("used", 0),
+                            stats.get("max", 0),
+                        )
+                    elif util < 60.0 and _pool_alert_armed:
+                        _pool_alert_armed = False
+                        logger.info("pg_pool: загрузка вернулась к норме (%.1f%%)", util)
+            except Exception as e:
+                logger.debug("pool stats failed: %s", e)
         try:
             shipments = await get_shipments(last_check)
             last_check = datetime.now()

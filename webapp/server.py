@@ -15,6 +15,10 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from webapp.auth import verify_init_data
+from services.observability import (
+    init_sentry as _init_sentry,
+    set_user as _sentry_set_user,
+)
 
 # Берём роль из in-memory кэша (TTL 60s) вместо SELECT'а на каждый API-запрос.
 # `get_role` оставляем как имя для обратной совместимости с кодом ниже.
@@ -85,6 +89,10 @@ def _authorize(
                 status_code=429,
                 detail="Слишком много запросов, подождите минуту",
             )
+    # Sentry scope: привязываем user_id ДО основной логики endpoint'а.
+    # Если endpoint бросит HTTPException 500 или uncaught — событие
+    # уйдёт в Sentry с тегом user.id. No-op без SENTRY_DSN.
+    _sentry_set_user(user["id"], user.get("username"))
     return user
 
 
@@ -2353,6 +2361,11 @@ async def start_webapp():
     """Запустить FastAPI сервер в фоне."""
     import uvicorn
 
+    # Sentry: ставим тут, потому что bot.main() уже вызвал init_sentry
+    # для BOT_MODE=all/bot, но в BOT_MODE=webapp _run_webapp_only делает
+    # init_sentry до start_webapp. Двойной вызов идемпотентен (_initialized
+    # gate в observability.init_sentry). No-op без SENTRY_DSN.
+    _init_sentry(component="webapp")
     port = int(os.environ.get("PORT", "8080"))
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)

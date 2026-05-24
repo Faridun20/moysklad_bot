@@ -2638,6 +2638,168 @@ def get_recent_ms_sync_failures(limit: int = 5) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+def get_pool_stats() -> dict:
+    """Снимок состояния Postgres-пула: used/free/min/max/util_pct.
+
+    Возвращает пустой dict если используется SQLite или пул не
+    инициализирован. Лезет в private-атрибуты psycopg2.pool —
+    публичного API нет, но интерфейс стабилен между версиями 2.x.
+
+    Используется shipment_notifier loop'ом для периодического
+    логирования; если util_pct устойчиво > 80% — pg max'ы пора
+    поднимать или искать утечку коннектов.
+    """
+    if not USE_POSTGRES:
+        return {}
+    if _pg_connection_pool is None:
+        return {"used": 0, "free": 0, "min": _PG_POOL_MIN, "max": _PG_POOL_MAX, "util_pct": 0.0}
+    pool = _pg_connection_pool
+    # ThreadedConnectionPool._used — dict(key→conn) для checked-out,
+    # ._pool — list для свободных. .minconn / .maxconn — public.
+    try:
+        used = len(getattr(pool, "_used", {}))
+        free = len(getattr(pool, "_pool", []))
+        maxconn = int(getattr(pool, "maxconn", _PG_POOL_MAX))
+        minconn = int(getattr(pool, "minconn", _PG_POOL_MIN))
+        util = (used / maxconn * 100.0) if maxconn > 0 else 0.0
+        return {
+            "used": used,
+            "free": free,
+            "min": minconn,
+            "max": maxconn,
+            "util_pct": round(util, 1),
+        }
+    except Exception:
+        return {}
+
+
+def record_cron_run(
+    task_name: str,
+    status: str,
+    started_at: str,
+    finished_at: str,
+    duration_ms: int,
+    error_message: str | None = None,
+) -> None:
+    """Записать факт запуска cron-задачи в `cron_runs`.
+
+    Вызывается обёрткой `run_cron_main` из tasks/run_*.py — каждая
+    cron-CLI пишет финальный статус ровно один раз. INSERT-only:
+    история запусков (cleanup отдельным cron'ом в будущем).
+
+    `status`: 'ok' | 'failed'. Сейчас не используем 'running' — пишем
+    в конце с известным финальным состоянием. Если процесс убит
+    SIGTERM до finally — запись не появится, и ops_monitor увидит
+    «stale» (этого мы и хотим).
+    """
+    if not task_name:
+        return
+    err = (error_message or "")[:2000] if error_message else None
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "INSERT INTO cron_runs "
+                "(task_name, started_at, finished_at, status, error_message, metadata) "
+                "VALUES (?, ?, ?, ?, ?, ?)"
+            ),
+            (
+                task_name[:100],
+                started_at,
+                finished_at,
+                status[:32],
+                err,
+                str(duration_ms),  # храним в metadata как строку; отдельной колонки нет
+            ),
+        )
+        conn.commit()
+
+
+def get_last_cron_runs() -> list[dict]:
+    """Вернуть по одной записи на task — последнюю по started_at.
+
+    Используется в ops_monitor для алерта «cron не запускался».
+    SQL: SELECT DISTINCT ON (task_name) для Postgres, GROUP BY + JOIN
+    для SQLite (DISTINCT ON только pg-only).
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        if USE_POSTGRES:
+            cur.execute(
+                "SELECT DISTINCT ON (task_name) task_name, started_at, finished_at, "
+                "status, error_message, metadata "
+                "FROM cron_runs "
+                "ORDER BY task_name, started_at DESC"
+            )
+        else:
+            # SQLite: max(started_at) per task через GROUP BY с трюком
+            # «max-of-tuple» (max(started_at || '|' || id) даёт стабильную
+            # выборку даже при совпадении started_at).
+            cur.execute(
+                "SELECT cr.task_name, cr.started_at, cr.finished_at, cr.status, "
+                "cr.error_message, cr.metadata "
+                "FROM cron_runs cr "
+                "INNER JOIN ("
+                "  SELECT task_name, MAX(id) AS max_id "
+                "  FROM cron_runs GROUP BY task_name"
+                ") last ON cr.task_name = last.task_name AND cr.id = last.max_id "
+                "ORDER BY cr.task_name"
+            )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_stale_crons(thresholds_hours: dict[str, float]) -> list[dict]:
+    """Вернуть cron'ы, чей последний УСПЕШНЫЙ запуск старше порога.
+
+    `thresholds_hours`: {'ms_sync_retry': 1.0, 'ops_monitor': 26.0, ...}
+    Порог в часах. Если task'и нет в выдаче `get_last_cron_runs` —
+    включаем в результат с last_success=None (значит, ни разу не было).
+
+    Возвращаем: [{task_name, last_success_at, hours_ago, threshold_hours,
+                  last_status, last_error}]
+    """
+    now = datetime.now()
+    rows = get_last_cron_runs()
+    # last successful run per task: если last = failed, надо искать
+    # предыдущий ok'ный. Для простоты: считаем последний run; если он
+    # failed — отмечаем `last_status='failed'`, hours_ago = от него
+    # (а не от последнего ok). Это даёт алерт и при «давно failed».
+    by_task = {r["task_name"]: r for r in rows}
+    stale: list[dict] = []
+    for task_name, threshold_h in thresholds_hours.items():
+        last = by_task.get(task_name)
+        if last is None:
+            stale.append(
+                {
+                    "task_name": task_name,
+                    "last_success_at": None,
+                    "hours_ago": None,
+                    "threshold_hours": threshold_h,
+                    "last_status": None,
+                    "last_error": None,
+                }
+            )
+            continue
+        try:
+            last_at = datetime.strptime(last["started_at"], "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            continue
+        hours_ago = (now - last_at).total_seconds() / 3600
+        # Алертим: либо stale (давно), либо последний run failed.
+        if hours_ago > threshold_h or last.get("status") != "ok":
+            stale.append(
+                {
+                    "task_name": task_name,
+                    "last_success_at": last["started_at"],
+                    "hours_ago": round(hours_ago, 1),
+                    "threshold_hours": threshold_h,
+                    "last_status": last.get("status"),
+                    "last_error": last.get("error_message"),
+                }
+            )
+    return stale
+
+
 def reset_stale_in_progress_payments(older_than_minutes: int = 30) -> int:
     """Сбросить ms_sync_status='in_progress' у платежей, застрявших дольше N минут.
 

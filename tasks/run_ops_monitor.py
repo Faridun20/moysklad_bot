@@ -18,7 +18,6 @@ cash_deposit_escalation_days, и т.д.) с дефолтами.
 Расписание Railway Cron (пример): 0 7 * * *  (7:00 UTC = 12:00 Ташкент).
 """
 
-import asyncio
 import logging
 import sys
 
@@ -32,6 +31,7 @@ from services.database import (
     get_pending_cash_deposits,
     get_pending_returns,
     get_setting,
+    get_stale_crons,
     get_stale_pending_orders,
     init_db,
     run_migrations,
@@ -117,6 +117,32 @@ def build_expiring_batches_block(batches: list[dict], days: int) -> str | None:
     return "\n".join(lines)
 
 
+def build_cron_health_block(stale_crons: list[dict]) -> str | None:
+    """Алерт о cron'ах, которые не отчитались success'ом дольше порога.
+
+    Источник — services.database.get_stale_crons (порядок по task_name).
+    Включаем в дайджест только если есть что-то — boss'у в текущий
+    digest идут реальные проблемы (как зависшие заявки), не «всё ОК».
+    """
+    if not stale_crons:
+        return None
+    lines = [f"🛑 <b>Cron: не отчитались ({len(stale_crons)})</b>"]
+    for c in stale_crons:
+        task = _esc(c["task_name"])
+        thr = c.get("threshold_hours", 0)
+        if c.get("last_success_at") is None:
+            lines.append(f"  • <code>{task}</code> · ни разу не запускался (порог {thr}ч)")
+            continue
+        ago = c.get("hours_ago") or 0
+        status = c.get("last_status") or "?"
+        err = _esc(str(c.get("last_error") or "")[:120])
+        suffix = f" · err: {err}" if err else ""
+        lines.append(
+            f"  • <code>{task}</code> · {ago}ч назад · status={status} (порог {thr}ч){suffix}"
+        )
+    return "\n".join(lines)
+
+
 def assemble_digest(title: str, blocks: list[str | None]) -> str | None:
     """Склеить непустые блоки в одну сводку. None — если всё пусто."""
     present = [b for b in blocks if b]
@@ -149,15 +175,30 @@ async def main() -> int:
     returns = get_pending_returns()
     overdue = get_overdue_undeposited_orders(days=cash_days)
     batches = get_batches_expiring_within(days=batch_days)
+    # Cron health: проверяем что регулярные cron'ы реально отчитываются.
+    # Пороги подобраны с большим запасом к реальному расписанию (`*/15` →
+    # порог 1ч; ежедневный → 26ч). Если cron не запускался / упал —
+    # boss увидит в дайджесте.
+    cron_thresholds = {
+        "ms_sync_retry": 1.0,  # */15 минут → должен бегать ≤1ч назад
+        "ops_monitor": 26.0,  # 1×/день → 26ч с запасом
+        "maintenance": 26.0,
+        "debts_notify": 26.0,
+        "report_daily": 26.0,
+        "report_weekly": 7 * 24 + 2.0,
+        "report_monthly": 31 * 24 + 6.0,
+    }
+    stale_crons = get_stale_crons(cron_thresholds)
 
     b_stale = build_stale_orders_block(stale, stale_hours)
     b_dep = build_pending_deposits_block(deposits)
     b_ret = build_pending_returns_block(returns)
     b_over = build_overdue_undeposited_block(overdue, cash_days)
     b_batch = build_expiring_batches_block(batches, batch_days)
+    b_cron = build_cron_health_block(stale_crons)
 
     boss_digest = assemble_digest(
-        "📋 <b>Операционная сводка</b>", [b_stale, b_dep, b_ret, b_over, b_batch]
+        "📋 <b>Операционная сводка</b>", [b_stale, b_dep, b_ret, b_over, b_batch, b_cron]
     )
     bookkeeper_digest = assemble_digest("📋 <b>Сводка: финансы</b>", [b_dep])
     warehouse_digest = assemble_digest("📋 <b>Сводка: склад</b>", [b_ret, b_batch])
@@ -178,12 +219,13 @@ async def main() -> int:
                 await tg_send_message(u["user_id"], digest)
                 sent += 1
         logger.info(
-            "ops_monitor: stale=%d deposits=%d returns=%d overdue=%d batches=%d → %d сообщений",
+            "ops_monitor: stale=%d deposits=%d returns=%d overdue=%d batches=%d crons_stale=%d → %d сообщений",
             len(stale),
             len(deposits),
             len(returns),
             len(overdue),
             len(batches),
+            len(stale_crons),
             sent,
         )
         return 0
@@ -196,4 +238,6 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    from tasks._cron_runner import run_cron
+
+    sys.exit(run_cron("ops_monitor", main))

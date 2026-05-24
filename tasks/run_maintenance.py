@@ -56,4 +56,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    from tasks._cron_runner import run_cron
+
+    sys.exit(run_cron("maintenance", main))
