@@ -110,3 +110,78 @@ def test_before_breadcrumb_redacts_token_in_message(monkeypatch):
     out = obs._before_breadcrumb(crumb, {})
     assert "999:my-secret-token" not in out["message"]
     assert "***REDACTED***" in out["message"]
+
+
+# ─── Полный путь с реальной sentry-sdk инициализацией ─────────────────────────
+#
+# sentry_sdk.init не шлёт HTTP до flush() — безопасно в тестах. Используем
+# фейковый DSN, проверяем что init возвращает True, is_enabled() True,
+# и хелперы реально доходят до sentry-sdk без exception'а.
+
+
+_FAKE_DSN = "https://abc123@o123456.ingest.sentry.io/789"
+
+
+def _close_sentry_client():
+    """Best-effort: закрыть текущий sentry-sdk client между тестами,
+    чтобы не утекали транспорты и hub-state."""
+    try:
+        import sentry_sdk
+
+        client = sentry_sdk.Hub.current.client
+        if client is not None:
+            client.close(timeout=0.1)
+    except Exception:
+        pass
+
+
+def test_init_sentry_returns_true_with_dsn(monkeypatch):
+    monkeypatch.setenv("SENTRY_DSN", _FAKE_DSN)
+    obs = _fresh_obs()
+    try:
+        assert obs.init_sentry("test_component") is True
+        assert obs.is_enabled() is True
+        # Повторный init — idempotent (gate на _initialized)
+        assert obs.init_sentry("again") is True
+    finally:
+        _close_sentry_client()
+
+
+def test_helpers_dispatch_to_sentry_when_initialized(monkeypatch):
+    """После init: capture_exception / set_user / set_tag / set_context /
+    capture_message пробрасывают вызов в sentry_sdk без exception'а.
+
+    Реальные события уходят в внутреннюю очередь sentry-sdk и flush'аются
+    лишь по close() — HTTP не делаем."""
+    monkeypatch.setenv("SENTRY_DSN", _FAKE_DSN)
+    obs = _fresh_obs()
+    try:
+        obs.init_sentry("test_dispatch")
+        obs.capture_exception(ValueError("bug"))
+        obs.capture_exception()  # без аргументов — current exc
+        obs.capture_message("info-level", level="warning")
+        obs.set_user(42, "username")
+        obs.set_user(None)  # logout
+        obs.set_tag("rollout", "canary")
+        obs.set_context("order", {"id": 1, "secret": "leak"})  # secret режется
+    finally:
+        _close_sentry_client()
+
+
+def test_init_sentry_handles_import_error(monkeypatch):
+    """Если sentry_sdk не установлен — init возвращает False, не падает."""
+    monkeypatch.setenv("SENTRY_DSN", _FAKE_DSN)
+    # Подменяем builtins.__import__ чтобы import sentry_sdk вернул ImportError
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **kw):
+        if name == "sentry_sdk" or name.startswith("sentry_sdk."):
+            raise ImportError("simulated: sentry-sdk not installed")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    obs = _fresh_obs()
+    assert obs.init_sentry("test_noimport") is False
+    assert obs.is_enabled() is False
