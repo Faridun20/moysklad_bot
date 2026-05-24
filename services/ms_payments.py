@@ -36,6 +36,7 @@ from services.database import (
     set_payment_ms_sync,
     claim_payment_for_ms_sync,
 )
+from services.metrics import measure_async
 from services.moysklad import MS_BASE, get_session, ms_get, redact_ms_error
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,7 @@ async def _resolve_currency_meta(iso_code: str) -> dict | None:
     return None
 
 
+@measure_async("ms.create_paymentin")
 async def create_paymentin_for_payment(payment_id: int) -> dict:
     """Создать «Входящий платёж» в МойСклад на основе подтверждённого
     платежа из нашей БД.

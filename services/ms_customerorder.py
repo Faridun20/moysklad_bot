@@ -19,6 +19,7 @@ import logging
 from typing import Any
 
 from services import ms_demand
+from services.metrics import measure_async
 from services.moysklad import MS_BASE, get_session, ms_get
 from utils.helpers import extract_id_from_href, utc_now
 
@@ -213,6 +214,7 @@ def _filename_from_resp(resp, co_id: str) -> str:
     return f"order_{co_id[:8]}.pdf"
 
 
+@measure_async("ms.create_customerorder")
 async def create_customerorder_from_request(
     order: dict,
     items: list[dict],

@@ -20,6 +20,7 @@ from services.database import (
     mark_shipment_notified,
     prune_notified_shipments,
 )
+from services import metrics
 from utils.helpers import extract_id_from_href
 from utils.formatters import format_shipment, DIV
 
@@ -280,6 +281,7 @@ async def notify_new_shipment(
 
     # Атомарно застолбить отправку — гонка вебхука и поллера решается здесь.
     if not mark_shipment_notified(demand_id):
+        metrics.incr("notify.shipment.dedup_skip")
         return False
 
     positions = []
@@ -289,7 +291,9 @@ async def notify_new_shipment(
         pass
 
     txt = f"{DIV}\n🔔 <b>Новая отгрузка!</b>\n\n" + format_shipment(shipment, positions)
-    await _gather_limited([tg_send_message(uid, txt) for uid in recipients])
+    async with metrics.atimer("notify.shipment.broadcast"):
+        await _gather_limited([tg_send_message(uid, txt) for uid in recipients])
+    metrics.incr("notify.shipment.sent")
     return True
 
 

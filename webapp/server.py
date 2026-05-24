@@ -131,6 +131,44 @@ logger.info("WebApp version: %s", APP_VERSION)
 app = FastAPI(title="МойСклад WebApp")
 
 
+# ─── Metrics middleware: латентность + status-code counters для /api/* ─────
+#
+# Цель — за ровно один хук покрыть все 50+ /api/* endpoint'ов. Раньше
+# любой долгий response (например /api/analytics на холодном кэше) был
+# «чёрным ящиком» — могли заметить только из Telegram-жалоб «WebApp
+# тупит». Теперь — /api/metrics показывает p50/p95 на каждый endpoint.
+@app.middleware("http")
+async def _metrics_middleware(request: Request, call_next):
+    path = request.url.path
+    if not path.startswith("/api/"):
+        return await call_next(request)
+    # Нормализация: убираем ID из путей типа /api/orders/123/items.
+    # Сейчас наши endpoint'ы POST-only с body-параметрами, динамических
+    # path-сегментов нет, нормализация не нужна. Если в будущем появятся —
+    # добавить regex-подмена тут (?P<id>\d+ → '{id}').
+    metric_name = path
+    import time as _time
+
+    from services import metrics as _metrics
+
+    start = _time.perf_counter()
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        if status >= 500:
+            _metrics.incr(f"{metric_name}.5xx")
+        elif status >= 400:
+            _metrics.incr(f"{metric_name}.4xx")
+        else:
+            _metrics.incr(f"{metric_name}.ok")
+        return response
+    except Exception:
+        _metrics.incr(f"{metric_name}.error")
+        raise
+    finally:
+        _metrics.record_timing(metric_name, (_time.perf_counter() - start) * 1000.0)
+
+
 class CachedStaticFiles(StaticFiles):
     """StaticFiles + Cache-Control: пусть браузер хранит CSS/JS сутки."""
 
@@ -375,6 +413,34 @@ async def healthz():
     import time as _t
 
     return JSONResponse({"ok": True, "version": APP_VERSION, "ts": int(_t.time())})
+
+
+@app.post("/api/metrics")
+async def api_metrics(request: Request):
+    """Снимок in-process метрик: counts, p50/p95, MS API latency, pool stats.
+
+    Только admin/boss — содержит technical-info (URL'ы endpoint'ов,
+    error counts), это не для рядового менеджера. Используется для
+    диагностики «WebApp тупит» / «новая отгрузка не пришла».
+
+    Возвращает JSON со структурой:
+        {
+          "uptime_sec": ...,
+          "version": "...",
+          "counters": {"/api/home.ok": 1234, "ms.create_demand.error": 2, ...},
+          "timings": {"/api/home": {"count": N, "p50_ms": ..., "p95_ms": ...}, ...},
+          "pool": {"used": N, "free": N, "max": N, "util_pct": N} | {}
+        }
+    """
+    from services import metrics as _metrics
+    from services.database import get_pool_stats
+
+    data = await request.json()
+    _authorize(data, allowed_roles=("admin", "boss"), rate_limit_scope="api_metrics")
+    snap = _metrics.snapshot()
+    snap["version"] = APP_VERSION
+    snap["pool"] = await asyncio.to_thread(get_pool_stats)
+    return JSONResponse(snap)
 
 
 # ─── Главная страница ─────────────────────────────────────────────────────────
