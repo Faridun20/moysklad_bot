@@ -96,6 +96,27 @@ Telegram, руководители одобряют отгрузки и подт
 | `TZ` | `Asia/Tashkent` или другой |
 | `ENABLE_SCHEDULED_REPORTS` | `0` чтобы отчёты не дублировались с cron-сервисом |
 | `PG_POOL_MIN`, `PG_POOL_MAX` | Размер пула коннектов Postgres (default 1/10) |
+| `SENTRY_DSN` | Если задан — exceptions/warnings идут в Sentry (PII scrubbed) |
+| `BACKUP_TG_CHAT_ID` | ID приватного TG-канала для ежедневного backup БД |
+
+## Backup БД в Telegram-канал
+
+Ежедневный backup Postgres (или SQLite для dev) — `pg_dump | gzip` → upload в приватный Telegram-канал через того же бота. Без AWS/Google Cloud, восстановление = `gunzip | psql`.
+
+**Setup (5 минут):**
+1. Создать **приватный** канал в Telegram
+2. Добавить бота как Administrator (right: Post Messages)
+3. Получить `chat_id` канала: forward любое сообщение оттуда в [@userinfobot](https://t.me/userinfobot), id вида `-100xxxxxxxxxx`
+4. Поставить в Railway env cron-сервиса:
+   - `BACKUP_TG_CHAT_ID=-100xxxxxxxxxx`
+5. Создать Railway Cron Job:
+   - Command: `python -m tasks.run_backup`
+   - Schedule: `0 3 * * *` (3:00 UTC = 8:00 Ташкент)
+
+**Лимит:** Telegram Bot API = 50 MB на файл. У БД сейчас сильный запас, при росте >40 MB cron шлёт WARNING; при >50 MB upload не запускается (нужен переход на B2/R2).
+
+**Мониторинг:** `tasks/run_backup` интегрирован с `cron_runs` — если backup не прошёл, `cron-ops` дайджест покажет «🛑 backup: failed».
+
 
 ## Команды бота
 
