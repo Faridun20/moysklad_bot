@@ -187,6 +187,7 @@ async def main() -> int:
         "report_daily": 26.0,
         "report_weekly": 7 * 24 + 2.0,
         "report_monthly": 31 * 24 + 6.0,
+        "backup": 26.0,  # 1×/день → если backup не прошёл, очень критично
     }
     stale_crons = get_stale_crons(cron_thresholds)
 
