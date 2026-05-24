@@ -973,9 +973,13 @@ async def api_payments_send(request: Request):
         rate_limit_window=60.0,
     )
 
+    # Round 6 (S3): isnan/isinf + верхний лимит — float('1e308') проходит
+    # `> 0`, отравляет FIFO-математику в БД, отдаёт `nan USD` боссу в UI.
+    import math
+
     try:
         amount = float(data.get("amount", 0))
-        if amount <= 0:
+        if not (math.isfinite(amount) and 0 < amount < 10_000_000):
             raise ValueError
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Неверная сумма")
@@ -986,7 +990,10 @@ async def api_payments_send(request: Request):
     if currency not in ALLOWED_CURRENCIES:
         raise HTTPException(status_code=400, detail="Неверная валюта")
 
-    comment = (data.get("comment", "") or "").strip()
+    # Round 6 (S7): cap 1000 — DB-колонка TEXT (unbounded), идёт в Telegram-
+    # уведомление и в audit_log. Без cap'а — DB-bloat + риск >4096 char для
+    # шаблона уведомления.
+    comment = (data.get("comment", "") or "").strip()[:1000]
     if not comment:
         raise HTTPException(status_code=400, detail="Укажите комментарий")
 
@@ -1240,16 +1247,22 @@ async def api_credit_set(request: Request):
         rate_limit_max=30,
         rate_limit_window=60.0,
     )
-    agent_id = (data.get("agent_id") or "").strip()
-    agent_name = (data.get("agent_name") or "").strip()
+    # Round 6 (S4): жёсткие cap'ы — agent_id UUID-style ≤64, agent_name ≤200
+    # (DB-колонки TEXT unbounded, без cap'а admin/boss могут раздуть строки).
+    agent_id = (data.get("agent_id") or "").strip()[:64]
+    agent_name = (data.get("agent_name") or "").strip()[:200]
     if not agent_id:
         raise HTTPException(status_code=400, detail="agent_id обязателен")
+    # Round 6 (S3): isnan/isinf + верхний лимит. inf лимит делает любой долг
+    # «свободным», ломает overview.
+    import math
+
     try:
         limit_amount = float(data.get("limit_amount"))
-        if limit_amount < 0:
+        if not (math.isfinite(limit_amount) and 0 <= limit_amount < 10_000_000):
             raise ValueError
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="limit_amount должен быть числом >= 0")
+        raise HTTPException(status_code=400, detail="limit_amount должен быть числом 0..10M")
 
     await adb.set_credit_limit(
         agent_id, agent_name, limit_amount, set_by=user["id"], notes="WebApp"
@@ -1333,7 +1346,8 @@ async def api_deposits_reject(request: Request):
         deposit_id = int(data.get("deposit_id"))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="deposit_id обязателен")
-    reason = (data.get("reason") or "").strip()
+    # Round 6 (S2): cap 500 — DB column TEXT, шлётся в Telegram (4096 лимит).
+    reason = (data.get("reason") or "").strip()[:500]
     if len(reason) < 3:
         raise HTTPException(status_code=400, detail="Причина обязательна")
 
@@ -1373,12 +1387,17 @@ async def api_deposits_create(request: Request):
         rate_limit_scope="api_deposits_create",
         rate_limit_max=10,
     )
+    # Round 6 (S3): isnan/isinf + верхний лимит — `1e308` отравляет FIFO.
+    import math
+
     try:
         amount = float(data.get("amount"))
-        if amount <= 0:
+        if not (math.isfinite(amount) and 0 < amount < 10_000_000):
             raise ValueError
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Сумма должна быть положительным числом")
+        raise HTTPException(
+            status_code=400, detail="Сумма должна быть положительным числом до 10М"
+        )
 
     res = await adb.create_cash_deposit(user["id"], amount)
     if not res.get("ok"):
@@ -1483,7 +1502,8 @@ async def api_returns_create(request: Request):
         order_id = int(data.get("order_id"))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="order_id обязателен")
-    reason = (data.get("reason") or "").strip()
+    # Round 6 (S2): cap 500 — DB-колонка TEXT, идёт в дальнейшие уведомления.
+    reason = (data.get("reason") or "").strip()[:500]
     if len(reason) < 3:
         raise HTTPException(status_code=400, detail="Опишите причину возврата")
     refund = data.get("refund_method")
@@ -1613,7 +1633,8 @@ async def api_orders_cancel(request: Request):
         order_id = int(data.get("order_id"))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="order_id обязателен")
-    reason = (data.get("reason") or "").strip()
+    # Round 6 (S2): cap 500 — DB-колонка TEXT, шлётся в Telegram.
+    reason = (data.get("reason") or "").strip()[:500]
     if len(reason) < 3:
         raise HTTPException(status_code=400, detail="Укажите причину отмены")
 
@@ -1644,9 +1665,15 @@ async def api_orders_cancel(request: Request):
 @app.post("/api/orders/add_item")
 async def api_add_item(request: Request):
     data = await request.json()
-    user = verify_init_data(data.get("initData", ""))
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+    # Round 6 (L_R5): _authorize вместо голого verify_init_data — иначе
+    # юзер, понижённый до guest после создания draft'а, мог дописывать
+    # позиции к своему старому ордеру (owner-check проходит, role не
+    # проверялась).
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_orders_add_item",
+    )
 
     from services import async_db as adb
 
@@ -1685,9 +1712,12 @@ async def api_add_item(request: Request):
 @app.post("/api/orders/remove_item")
 async def api_remove_item(request: Request):
     data = await request.json()
-    user = verify_init_data(data.get("initData", ""))
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+    # Round 6 (L_R5): _authorize вместо verify_init_data — см. add_item.
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_orders_remove_item",
+    )
 
     from services import async_db as adb
 
@@ -1704,9 +1734,12 @@ async def api_remove_item(request: Request):
 @app.post("/api/orders/set_agent")
 async def api_set_agent(request: Request):
     data = await request.json()
-    user = verify_init_data(data.get("initData", ""))
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+    # Round 6 (L_R5): _authorize. Round 6 (S4): cap agent_id/agent_name.
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_orders_set_agent",
+    )
 
     from services import async_db as adb
 
@@ -1714,16 +1747,23 @@ async def api_set_agent(request: Request):
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
 
-    await adb.update_order_agent(data["order_id"], data["agent_id"], data["agent_name"])
+    agent_id = (data.get("agent_id") or "").strip()[:64]
+    agent_name = (data.get("agent_name") or "").strip()[:200]
+    await adb.update_order_agent(data["order_id"], agent_id, agent_name)
     return JSONResponse({"ok": True})
 
 
 @app.post("/api/orders/submit")
 async def api_submit_order(request: Request):
     data = await request.json()
-    user = verify_init_data(data.get("initData", ""))
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+    # Round 6 (L_R5): _authorize вместо verify_init_data — без неё guest мог
+    # сабмитить свой старый draft и боссы получали заявку от понижённого юзера.
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_orders_submit",
+        rate_limit_max=10,
+    )
 
     from services import async_db as adb
     from services.notifier import aget_notify_recipients, tg_send_message

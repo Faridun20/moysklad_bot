@@ -15,6 +15,19 @@ from tasks.run_ops_monitor import (
 )
 
 
+# ─── Round 6 RACE-4: idempotency-guard ────────────────────────────────────────
+
+
+def test_claim_ops_monitor_run_idempotent_per_day(isolated_db):
+    """Первый вызов за день — True, второй — False. Защищает от двойной рассылки
+    дайджеста при Railway-cron retry / случайном параллельном запуске."""
+    db = isolated_db
+    assert db.claim_ops_monitor_run("2026-05-24") is True
+    assert db.claim_ops_monitor_run("2026-05-24") is False
+    # Следующий день — новая запись, проходит.
+    assert db.claim_ops_monitor_run("2026-05-25") is True
+
+
 def test_blocks_return_none_when_empty():
     assert build_stale_orders_block([], 48) is None
     assert build_pending_deposits_block([]) is None

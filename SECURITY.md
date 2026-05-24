@@ -548,6 +548,19 @@ tests/
 | Low (MS positions 429-spam) | `_get_positions_semaphore()` lazy per-loop, cap=8 — cold-cache `/api/analytics` без retry-chain 0.5/1.0/2.0с | PR #35 cap=4 → PR #36 cap=8 + lazy [36600d5](https://github.com/Faridun20/moysklad_bot/commit/36600d5) |
 | Low (locks dict memory leak) | `_ms_ttl_cache.locks` чистится в `try/except BaseException` вокруг `await fn()` — для consistently-failing keys (404, deleted demands) lock больше не leaks вечно | PR #36 [36600d5](https://github.com/Faridun20/moysklad_bot/commit/36600d5) |
 | Low (module-level Semaphore landmine) | `_get_positions_semaphore()` lazy по `id(running_loop)` — future tests с >cap acquire'ами через `asyncio.run` больше не упадут «bound to a different event loop» | PR #36 [36600d5](https://github.com/Faridun20/moysklad_bot/commit/36600d5) |
+| Round 6 RACE-1 (cash_deposit double-allocation) | `create_cash_deposit` берёт `pg_advisory_xact_lock(manager_id)` — два параллельных /deposit от одного менеджера сериализуются, FIFO-расчёт + INSERT внутри одной транзакции | PR #38 |
+| Round 6 RACE-2 (create_return TOCTOU) | `create_return` берёт `pg_advisory_xact_lock(order_id)` + commit/rollback внутри одной tx — двойной pending по одному заказу больше невозможен | PR #38 |
+| Round 6 RACE-3 (set_return_ms_id race) | Conditional UPDATE: `... WHERE moysklad_return_id IS NULL` — два параллельных create_salesreturn'а: второй вернёт False, caller знает что надо чистить orphan | PR #38 |
+| Round 6 RACE-4 (ops_monitor double-digest) | Idempotency-таблица `ops_monitor_runs(run_date PK)` + `claim_ops_monitor_run(today)` — повторный запуск за тот же день делает noop | PR #38 |
+| Round 6 L_R2 (confirm_return overshoot) | Атомарный UPDATE `... WHERE returned_qty + ? <= quantity` с проверкой rowcount — overshoot из concurrent confirm двух return'ов одного заказа невозможен | PR #38 |
+| Round 6 L_R6 (mark_order_shipped двойной audit) | Если `ms_demand_id` уже стоит — audit пишет «sync» а не «отмечен вручную»; убирает спам менеджеру | PR #38 |
+| Round 6 S1 (edit_text round-trip HTML) | handlers `cb_deposit_confirm`/`cb_return_confirm` используют `call.message.html_text` (а не decoded `.text`) — повторный parse_mode="HTML" не ломается на `<`/`>` в именах | PR #38 |
+| Round 6 S2 (no length cap on reason/comment) | Cap'ы 500/1000 chars на API-edge: deposits/reject, returns/create, orders/cancel, payments/send, credit/set + одноимённые FSM-handlers в боте | PR #38 |
+| Round 6 S3 (amount overflow → inf/NaN) | Новый `_validate_amount` в БД + `math.isfinite()` + верхний лимит 10М на API-edge: deposits/create, credit/set, payments/send — `1e308`/inf/NaN отвергаются 400 | PR #38 |
+| Round 6 S4 (agent_id/agent_name unbounded) | Cap'ы 64/200 chars на `agent_id`/`agent_name` в /api/credit/set и /api/orders/set_agent | PR #38 |
+| Round 6 S5 (ms_returns exception leaks repr) | `redact_ms_error(str(e))` в exception-path `create_salesreturn` — единообразно с HTTP-error path | PR #38 |
+| Round 6 L_R1 (FSM-handler role-degraded) | `process_*_reason` (deposits/returns/order_cancel) повторяют role-check после FSM-перехода — если админ снял роль во время ввода причины, действие не пройдёт | PR #38 |
+| Round 6 L_R5 (api_add_item etc no role-check) | `_authorize(roles=admin/boss/manager)` добавлен в api_add_item / api_remove_item / api_set_agent / api_submit_order — guest не может сабмитить старый draft под видом manager'а | PR #38 |
 
 ## История изменений этого документа
 
@@ -560,3 +573,4 @@ tests/
 | 2026-05-21 | H8 regression re-fix (aiohttp base_url); защитные сетки: pytest-набор + CI (ruff/mypy/coverage), мок сетевой границы, mypy-гейт; событийные уведомления об отгрузках с дедупом | Claude |
 | 2026-05-23 | Раунд 4 (Railway logs review): PR #35 — cron-ms-retry init_demand_context, INFO-логи (named logger в config), `_POSITIONS_CONCURRENCY=Semaphore(4)`; вживую проверены прод-логи через Railway CLI | Claude |
 | 2026-05-24 | Раунд 5 (self-code-review PR #35 → 10 находок): PR #36 — orphan-reaper для 'in_progress', noop-skip для init_demand_context, /positions pagination, cache_clear narrow, lazy-by-loop Semaphore(8), locks-pop на except, `config:` префикс в message; +6 тестов (194 total) | Claude |
+| 2026-05-24 | Раунд 6 (security audit на новых модулях deposits/returns/cancel/ship/credit/ms_returns/ops_monitor): 4 race (advisory-lock'и, conditional UPDATE, idempotency-table), 4 input-validation (amount upper bound, length caps, html_text round-trip), 5 role/authz фиксов (process_*_reason role-recheck, _authorize на add_item etc.) — итого 13 пунктов в одном PR | Claude |

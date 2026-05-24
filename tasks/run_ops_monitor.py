@@ -22,7 +22,10 @@ import asyncio
 import logging
 import sys
 
+from datetime import datetime
+
 from services.database import (
+    claim_ops_monitor_run,
     get_all_users,
     get_batches_expiring_within,
     get_overdue_undeposited_orders,
@@ -128,6 +131,14 @@ def assemble_digest(title: str, blocks: list[str | None]) -> str | None:
 async def main() -> int:
     init_db()
     run_migrations()  # M1: на свежей БД догнать колонки (идемпотентно)
+
+    # Round 6 RACE-4: idempotency-guard. Railway Cron при сетевом hiccup'е
+    # может ретраить запуск, или ручной запуск пересечётся с плановым —
+    # без этого дайджест разойдётся всем 2 раза в день.
+    today = datetime.now().strftime("%Y-%m-%d")
+    if not claim_ops_monitor_run(today):
+        logger.info("ops_monitor: уже запускался сегодня (%s) — пропускаю", today)
+        return 0
 
     stale_hours = int(get_setting("stale_pending_hours", 48))
     cash_days = int(get_setting("cash_deposit_escalation_days", 2))
