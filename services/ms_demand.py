@@ -23,6 +23,7 @@ import logging
 import os
 from typing import Any
 
+from services.metrics import measure_async
 from services.moysklad import ms_get, get_session, MS_BASE
 from utils.helpers import extract_id_from_href, utc_now
 
@@ -186,6 +187,7 @@ def is_ready() -> bool:
     return _CTX["ready"]
 
 
+@measure_async("ms.create_demand")
 async def create_demand_from_request(
     order: dict,
     items: list[dict],

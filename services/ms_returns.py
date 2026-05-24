@@ -23,6 +23,7 @@ import logging
 
 from services import database as db
 from services import ms_demand
+from services.metrics import measure_async
 from services.moysklad import MS_BASE, get_session, redact_ms_error
 from utils.helpers import extract_id_from_href, utc_now
 
@@ -33,6 +34,7 @@ def _meta(href: str, entity_type: str) -> dict:
     return {"meta": {"href": href, "type": entity_type, "mediaType": "application/json"}}
 
 
+@measure_async("ms.create_salesreturn")
 async def create_salesreturn(return_id: int) -> dict:
     """Создать «Возврат покупателя» в МойСклад. Возвращает
     {ok, ms_id?, url?} / {ok: False, reason}. Безопасно вызывать повторно."""
