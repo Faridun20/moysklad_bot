@@ -117,6 +117,8 @@ Telegram, руководители одобряют отгрузки и подт
 
 **Мониторинг:** `tasks/run_backup` интегрирован с `cron_runs` — если backup не прошёл, `cron-ops` дайджест покажет «🛑 backup: failed».
 
+**Билд:** `nixpacks.toml` добавляет `postgresql_16` в Nixpacks-образ — иначе `pg_dump` отсутствует в контейнере и cron падает с `FileNotFoundError`.
+
 
 ## Команды бота
 

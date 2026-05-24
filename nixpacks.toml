@@ -1,0 +1,24 @@
+# Railway/Nixpacks build configuration.
+#
+# Без этого файла Nixpacks автоматически детектит Python и ставит только
+# pip-зависимости из requirements.txt. Системные пакеты (вроде pg_dump
+# из postgresql client tools) приходится добавлять явно.
+#
+# Зачем postgresql_16:
+#   tasks/run_backup.py делает pg_dump для ежедневного backup БД в
+#   приватный Telegram-канал (PR #46). Без postgresql client tools
+#   subprocess.Popen падает с FileNotFoundError: pg_dump.
+#
+# Версия 16 совпадает с актуальным major Postgres на Railway (2026).
+# pg_dump backward-compatible — может дампить более старые сервера,
+# но не наоборот. Если Railway обновится до Postgres 17 — поднять
+# тут версию (это снимет warning при дампе, не блокирующий).
+#
+# Размер overhead: ~30 MB на образ — приемлемо. Альтернатива (ставить
+# только в cron-backup сервис через NIXPACKS_PKGS env-var) сложнее в
+# поддержке: легко забыть на новом cron'е.
+
+# nixPkgs добавляются к auto-detected Python — explicitly указывать python311
+# не надо, Nixpacks сам подхватит из runtime.txt.
+[phases.setup]
+nixPkgs = ["...", "postgresql_16"]
