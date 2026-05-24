@@ -52,6 +52,9 @@ jobs:
           # Реальные тесты переопределяют env через monkeypatch.
           TELEGRAM_TOKEN: "0:fake-ci-token"
           MS_TOKEN: "fake-ci"
-        # --cov-fail-under=25 — «храповик» чуть ниже текущих ~27%: не флапает,
-        # но не даёт покрытию заметно просесть. Поднимать по мере роста тестов.
-        run: pytest tests/ -v --tb=short --cov --cov-report=term-missing --cov-fail-under=25
+        # --cov-fail-under=35 — «храповик» с буфером 5-6% ниже фактических ~41%
+        # (после PR #40: +9 ms_payments contract, +5 reject_shipment, +3 sentry
+        # init dispatch = 17 новых). Buffer защищает от шума метрики (1-2%
+        # колебание между прогонами) и оставляет пространство для рефакторов,
+        # но не даёт «забыть» дописать тесты к большим PR'ам.
+        run: pytest tests/ -v --tb=short --cov --cov-report=term-missing --cov-fail-under=35
