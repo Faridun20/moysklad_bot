@@ -24,6 +24,22 @@ def _order_with_total(db, total_price: float, qty: int = 1):
     return order_id, mgr_id
 
 
+# ─── Round 6: amount validation (S3) ──────────────────────────────────────────
+
+
+def test_create_cash_deposit_rejects_nan_inf_and_too_large(isolated_db):
+    """`amount > 0` пропускает 1e308 / NaN / inf — без верхней границы FIFO-
+    математика отравляется (inf*0 = NaN), а UI боссу показывает 'nan USD'."""
+    db = isolated_db
+    db.set_role(300, "mgr", "Manager", "manager")
+    for bad in (float("nan"), float("inf"), -1.0, 0.0, 10_000_001.0, 1e308):
+        res = db.create_cash_deposit(300, bad)
+        assert res["ok"] is False, f"должен быть отклонён: {bad!r}"
+    # Граничные валидные — проходят.
+    ok = db.create_cash_deposit(300, 9_999_999.99)
+    assert ok["ok"] is True
+
+
 def test_confirm_payment_is_idempotent(isolated_db):
     db = isolated_db
     order_id, mgr = _order_with_total(db, 400.0, qty=4)

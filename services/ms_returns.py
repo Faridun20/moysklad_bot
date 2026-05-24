@@ -110,7 +110,12 @@ async def create_salesreturn(return_id: int) -> dict:
             }
     except Exception as e:
         logger.exception("create salesreturn failed")
-        return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+        # Round 6 (S5): redact_ms_error на str(e) — exception repr
+        # (особенно от aiohttp.ClientConnectorError) может включать URL/internals.
+        # HTTP-error путь выше уже использует redact_ms_error; этот путь — нет;
+        # делаем поведение единообразным на случай если caller начнёт
+        # сурфейсить `reason` в API-ответ.
+        return {"ok": False, "reason": f"{type(e).__name__}: {redact_ms_error(str(e)[:200])}"}
 
 
 async def _to_thread(fn, *args):

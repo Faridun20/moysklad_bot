@@ -360,6 +360,13 @@ def _create_tables():
                 demand_id   TEXT PRIMARY KEY,
                 notified_at TEXT
             )""",
+            # Round 6 RACE-4: idempotency-guard для ops_monitor cron.
+            # PRIMARY KEY (run_date) + INSERT-if-absent через `claim_ops_monitor_run`
+            # — параллельный/повторный запуск за тот же день делает noop.
+            """CREATE TABLE IF NOT EXISTS ops_monitor_runs (
+                run_date   TEXT PRIMARY KEY,
+                started_at TEXT
+            )""",
             # ─── IMPLEMENTATION.md Фаза 1–2 (адаптировано под dual-DB) ──────────
             # Конвенции проекта: TEXT для JSON/UUID/timestamp, REAL для денег,
             # INTEGER 0/1 для boolean, BIGINT — telegram user_id, без FK
@@ -1206,7 +1213,12 @@ def reject_order_to_draft(
 def mark_order_shipped(order_id: int, shipped_by: int, shipped_name: str) -> dict:
     """Отметить заказ отгруженным (approved → shipped), DB-часть. Альтернатива
     МС-вебхуку (stateType=Successful) — для аккаунтов без статуса типа
-    «Успешный». Выставляет shipped_at/shipped_by. Возвращает {ok, error}."""
+    «Успешный». Выставляет shipped_at/shipped_by. Возвращает {ok, error}.
+
+    Round 6 (L_R6): если у заказа уже есть `ms_demand_id`, значит МС-сторона
+    отгрузила раньше (через webhook или manual API). Audit'им как
+    'sync', а не как 'ручную отгрузку' — иначе менеджер видит спам.
+    """
     order = get_order(order_id)
     if not order:
         return {"ok": False, "error": "Заказ не найден"}
@@ -1227,14 +1239,19 @@ def mark_order_shipped(order_id: int, shipped_by: int, shipped_name: str) -> dic
     if not updated:
         return {"ok": False, "error": "Заказ уже обработан"}
 
+    already_in_ms = bool(order.get("ms_demand_id"))
     add_audit_log(
         shipped_by,
         shipped_name,
         get_role(shipped_by),
         "order_shipped",
-        f"Заказ #{order_id} отмечен отгруженным",
+        (
+            f"Заказ #{order_id} sync (demand уже в МС, локальный статус догнан)"
+            if already_in_ms
+            else f"Заказ #{order_id} отмечен отгруженным"
+        ),
     )
-    return {"ok": True, "error": None}
+    return {"ok": True, "error": None, "already_in_ms": already_in_ms}
 
 
 def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, reason: str) -> dict:
@@ -1377,6 +1394,33 @@ def get_manager_open_orders_for_deposit(manager_id: int) -> list[dict]:
     return out
 
 
+# Round 6: верхняя граница финансовых сумм (нижняя `> 0` уже была).
+# Защищает от inf/NaN и от случайного `1e308`, который "проходит" сравнение
+# `amount > 0`, но потом отравляет FIFO-математику и `/api/credit/overview`
+# (показывает `nan USD` боссу).
+_AMOUNT_MAX = 10_000_000.0
+
+
+def _validate_amount(amount: float | None) -> tuple[bool, str | None]:
+    """True если amount — конечное положительное число в разумных пределах.
+    Возвращает (ok, error_message)."""
+    import math
+
+    if amount is None:
+        return False, "Сумма не задана"
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return False, "Сумма должна быть числом"
+    if math.isnan(amount) or math.isinf(amount):
+        return False, "Сумма должна быть числом"
+    if amount <= 0:
+        return False, "Сумма должна быть > 0"
+    if amount > _AMOUNT_MAX:
+        return False, f"Сумма превышает лимит ({_AMOUNT_MAX:.0f})"
+    return True, None
+
+
 def create_cash_deposit(
     manager_id: int,
     amount: float,
@@ -1387,24 +1431,41 @@ def create_cash_deposit(
     allocations: список (order_id, amount) для ручного режима; если None —
     авто-FIFO по открытым заказам менеджера. Возвращает {ok, deposit_id,
     allocations}.
+
+    Конкурентность (Round 6 RACE-1): в Postgres берём advisory-lock на
+    (manager_id), чтобы 2 параллельных /deposit от одного менеджера не
+    переаллоцировали один и тот же остаток заказа дважды. Без локa
+    `get_manager_open_orders_for_deposit` читает pending+confirmed
+    распределения вне транзакции — два вызова видят одинаковый `remaining`,
+    распределяют сверх лимита, аналитика по cash-flow завышается. На
+    SQLite (локалка) advisory-lock'а нет, но там один-процессный сценарий.
     """
-    if amount is None or amount <= 0:
-        return {"ok": False, "error": "Сумма должна быть > 0"}
+    ok, err = _validate_amount(amount)
+    if not ok:
+        return {"ok": False, "error": err}
 
     is_manual = allocations is not None
     allocs: list[tuple] = list(allocations) if allocations is not None else []
-    if not is_manual:
-        left = amount
-        for o in get_manager_open_orders_for_deposit(manager_id):
-            if left <= 0:
-                break
-            take = min(o["remaining"], left)
-            if take > 0:
-                allocs.append((o["id"], round(take, 2)))
-                left -= take
 
     with get_conn() as conn:
         cur = get_cursor(conn)
+        if USE_POSTGRES:
+            # Сериализуем FIFO-расчёт + INSERT по manager_id. pg_advisory_xact_lock
+            # держится до конца транзакции, второй параллельный вызов ждёт.
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"cash_deposit:manager:{manager_id}",),
+            )
+        if not is_manual:
+            left = amount
+            for o in get_manager_open_orders_for_deposit(manager_id):
+                if left <= 0:
+                    break
+                take = min(o["remaining"], left)
+                if take > 0:
+                    allocs.append((o["id"], round(take, 2)))
+                    left -= take
+
         if USE_POSTGRES:
             cur.execute(
                 "INSERT INTO cash_deposits (manager_id, amount, deposited_at, status, created_at) "
@@ -1479,6 +1540,10 @@ def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_name: str
 
 
 def reject_cash_deposit(deposit_id: int, rejected_by: int, rejected_name: str, reason: str) -> dict:
+    # Round 6 (L_R8): clip reason — DB-колонка TEXT (unbounded), а сообщение
+    # потом шлётся менеджеру через bot.send_message (Telegram-лимит 4096).
+    # UI-валидация в webapp/server.py есть, но прямой бот-FSM вызов её обходит.
+    reason = (reason or "").strip()[:500]
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
@@ -1751,9 +1816,17 @@ def create_return(
     if not items:
         return {"ok": False, "error": "Не указаны позиции возврата"}
 
-    # H1: не плодим параллельные возвраты по одному заказу.
+    # H1 + Round 6 RACE-2: не плодим параллельные возвраты по одному заказу.
+    # Advisory-lock по order_id сериализует две одновременные create_return
+    # (раньше TOCTOU между SELECT COUNT и INSERT пропускал оба, потом каждый
+    # confirm_return наращивал returned_qty → overflow > quantity).
     with get_conn() as conn:
         cur = get_cursor(conn)
+        if USE_POSTGRES:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"return:order:{order_id}",),
+            )
         cur.execute(
             q(
                 "SELECT COUNT(*) AS c FROM returns WHERE order_id = ? "
@@ -1762,8 +1835,9 @@ def create_return(
             (order_id,),
         )
         row = cur.fetchone()
-    if int((row["c"] if USE_POSTGRES else row[0]) or 0) > 0:
-        return {"ok": False, "error": "По заказу уже есть возврат на рассмотрении"}
+        if int((row["c"] if USE_POSTGRES else row[0]) or 0) > 0:
+            conn.rollback()
+            return {"ok": False, "error": "По заказу уже есть возврат на рассмотрении"}
 
     # H1: режем количество по доступному остатку (quantity - returned_qty) и
     # пересчитываем сумму по цене позиции — не доверяем переданному amount.
@@ -1871,11 +1945,28 @@ def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str = "") 
             (return_id,),
         )
         ritems = [dict(r) for r in cur.fetchall()]
+        # Round 6 (L_R2): атомарная проверка returned_qty + delta <= quantity.
+        # Без неё concurrent confirm двух разных returns по одному заказу мог
+        # наращивать returned_qty за пределы quantity (overshoot → лишний MS-doc).
         for ri in ritems:
             cur.execute(
-                q("UPDATE order_items SET returned_qty = returned_qty + ? WHERE id = ?"),
-                (ri["qty"], ri["order_item_id"]),
+                q(
+                    "UPDATE order_items "
+                    "SET returned_qty = returned_qty + ? "
+                    "WHERE id = ? AND returned_qty + ? <= quantity"
+                ),
+                (ri["qty"], ri["order_item_id"], ri["qty"]),
             )
+            if cur.rowcount == 0:
+                # Overshoot — откатываем confirm целиком, заявка остаётся в pending.
+                conn.rollback()
+                return {
+                    "ok": False,
+                    "error": (
+                        "Превышен доступный остаток к возврату (другой возврат "
+                        "уже учтён). Перепроверьте и создайте новый."
+                    ),
+                }
         conn.commit()
 
     # Восстановление остатков по партиям — отдельно, через _adjust_batch_qty.
@@ -1982,13 +2073,61 @@ def get_return_positions_for_ms(return_id: int) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+def claim_ops_monitor_run(run_date: str) -> bool:
+    """Round 6 RACE-4: idempotency-guard для ops_monitor.
+
+    Railway Cron при сетевом hiccup'е может ретраить запуск, или ручной запуск
+    может пересечься с плановым — без guard'а дайджест разойдётся всем 2 раза.
+
+    Возвращает True если этот вызов «застолбил» дату (первый за сегодня),
+    False если уже запускался. `tasks/run_ops_monitor.main()` должен exit 0
+    при False.
+
+    Использует ту же таблицу `notified_shipments`-style паттерн с PRIMARY
+    KEY-based atomic INSERT-if-absent. CREATE TABLE в init_db; run_date —
+    'YYYY-MM-DD' строка (по local TZ через now_str()).
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        try:
+            if USE_POSTGRES:
+                cur.execute(
+                    "INSERT INTO ops_monitor_runs (run_date, started_at) "
+                    "VALUES (%s, %s) ON CONFLICT (run_date) DO NOTHING",
+                    (run_date, now_str()),
+                )
+            else:
+                cur.execute(
+                    "INSERT OR IGNORE INTO ops_monitor_runs (run_date, started_at) "
+                    "VALUES (?, ?)",
+                    (run_date, now_str()),
+                )
+            claimed = cur.rowcount > 0
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return claimed
+
+
 def set_return_ms_id(return_id: int, ms_id: str) -> bool:
     """Сохранить id документа «Возврат покупателя» из МойСклад (идемпотентность
-    повторной отправки)."""
+    повторной отправки).
+
+    Round 6 (RACE-3): conditional UPDATE — если ms_id уже стоит, не
+    перезаписываем. Защищает от race'а двух параллельных create_salesreturn:
+    оба прочли NULL, оба POST в МС, оба зовут set_return_ms_id — без guard'а
+    второй перетёр бы первый id, первый salesreturn в МС становится orphan'ом.
+    Возвращаемый bool теперь говорит «выиграл ли я гонку» — caller может,
+    если хочет, попытаться удалить только что созданный orphan-doc в МС.
+    """
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("UPDATE returns SET moysklad_return_id = ? WHERE id = ?"),
+            q(
+                "UPDATE returns SET moysklad_return_id = ? "
+                "WHERE id = ? AND moysklad_return_id IS NULL"
+            ),
             (ms_id, return_id),
         )
         updated = cur.rowcount > 0

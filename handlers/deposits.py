@@ -135,8 +135,14 @@ async def cb_deposit_confirm(call: CallbackQuery, bot: Bot):
         return await call.answer(f"⚠️ {res.get('error', 'уже обработано')}", show_alert=True)
 
     await call.answer("✅ Подтверждено")
+    # Round 6 (S1): html_text сохраняет HTML-entities из оригинала; .text
+    # отдаёт Telegram-decoded строку, на которой повторный parse_mode="HTML"
+    # ломается если в оригинале был `<` или `>` (например, esc(<Имя>) в
+    # карточке от _notify_confirmers). getattr с fallback — для совместимости
+    # с тестовыми моками без свойства html_text.
+    original = getattr(call.message, "html_text", None) or call.message.text or ""
     await call.message.edit_text(
-        (call.message.text or "") + f"\n\n{DIV}\n✅ <b>Подтверждено</b> — {esc(name)}",
+        original + f"\n\n{DIV}\n✅ <b>Подтверждено</b> — {esc(name)}",
         parse_mode="HTML",
     )
     if dep and dep.get("manager_id"):
@@ -166,7 +172,14 @@ async def cb_deposit_reject(call: CallbackQuery, state: FSMContext):
 
 @router.message(DepositReject.waiting_for_reason)
 async def process_deposit_reject_reason(message: Message, state: FSMContext, bot: Bot):
-    reason = (message.text or "").strip()
+    # Round 6 (L_R1): повторный role-check после FSM-перехода. Между callback'ом
+    # (cb_deposit_reject) и сообщением с причиной админ мог снять роль; без
+    # этого юзер успевает выполнить reject уже не будучи confirmer'ом.
+    if not can_confirm_deposit(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Нет доступа — действие отменено.")
+    # Round 6 (L_R8): жёсткий cap на reason — DB-колонка TEXT, шлётся в Telegram.
+    reason = (message.text or "").strip()[:500]
     if len(reason) < 3:
         return await message.answer("❌ Причина слишком короткая. Повторите.")
     data = await state.get_data()

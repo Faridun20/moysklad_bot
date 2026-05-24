@@ -109,7 +109,13 @@ async def cmd_return(message: Message, state: FSMContext):
 
 @router.message(ReturnFlow.waiting_reason)
 async def process_return_reason(message: Message, state: FSMContext):
-    reason = (message.text or "").strip()
+    # Round 6 (L_R1): повторный role-check после FSM-перехода (роль могла быть
+    # снята после старта flow).
+    if not can_create_return(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Нет доступа — оформление возврата отменено.")
+    # Round 6 (L_R8): жёсткий cap на reason.
+    reason = (message.text or "").strip()[:500]
     if len(reason) < 3:
         return await message.answer("❌ Причина слишком короткая. Повторите.")
     await state.update_data(reason=reason)
@@ -213,8 +219,9 @@ async def cb_return_confirm(call: CallbackQuery, bot: Bot):
         logger.warning("MS salesreturn create failed", exc_info=True)
 
     await call.answer("✅ Возврат подтверждён")
+    # Round 6 (S1): html_text сохраняет HTML-entities. См. handlers/deposits.py.
+    original = getattr(call.message, "html_text", None) or call.message.text or ""
     await call.message.edit_text(
-        (call.message.text or "")
-        + f"\n\n{DIV}\n✅ <b>Подтверждено</b> ({res['order_status']}) — {esc(name)}",
+        original + f"\n\n{DIV}\n✅ <b>Подтверждено</b> ({res['order_status']}) — {esc(name)}",
         parse_mode="HTML",
     )

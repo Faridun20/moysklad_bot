@@ -70,7 +70,12 @@ async def cb_cancel_abort(call: CallbackQuery, state: FSMContext):
 
 @router.message(CancelFlow.waiting_reason)
 async def process_cancel_reason(message: Message, state: FSMContext, bot: Bot):
-    reason = (message.text or "").strip()
+    # Round 6 (L_R1): повторный role-check после FSM-перехода.
+    if not _can_cancel(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Нет доступа — отмена сброшена.")
+    # Round 6 (L_R8): жёсткий cap на reason.
+    reason = (message.text or "").strip()[:500]
     if len(reason) < 3:
         return await message.answer("❌ Причина слишком короткая. Повторите.")
     data = await state.get_data()
