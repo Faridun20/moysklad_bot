@@ -1,57 +1,21 @@
 """
-Тесты способов запуска WebApp в Telegram — Menu Button и Reply Keyboard.
+Тесты способов запуска WebApp в Telegram — Menu Button.
+
+PR #47: Reply Keyboard убрана по запросу — дублировала Menu Button и
+занимала место под полем ввода. WebApp теперь только через Menu Button.
 
 Покрываем pure-функции (без сети, без БД):
-  * webapp_reply_keyboard(url) → ReplyKeyboardMarkup с web_app
-  * webapp_reply_keyboard(None/'') → ReplyKeyboardRemove
   * set_global_menu_button — sync вызовы через FakeBot
+  * config HTTPS-валидация WEBAPP_URL
 """
 
 import asyncio
 
 import pytest
 from aiogram.types import (
-    KeyboardButton,
     MenuButtonDefault,
     MenuButtonWebApp,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
-
-
-# ─── Reply Keyboard ─────────────────────────────────────────────────────────
-
-
-def test_reply_keyboard_with_url_returns_markup():
-    from handlers.start import webapp_reply_keyboard
-
-    kb = webapp_reply_keyboard("https://example.com")
-    assert isinstance(kb, ReplyKeyboardMarkup)
-    # is_persistent + resize_keyboard включены
-    assert kb.is_persistent is True
-    assert kb.resize_keyboard is True
-    # Один ряд с одной кнопкой «🌐 Открыть»
-    assert len(kb.keyboard) == 1
-    assert len(kb.keyboard[0]) == 1
-    btn = kb.keyboard[0][0]
-    assert isinstance(btn, KeyboardButton)
-    assert "Открыть" in btn.text
-    assert btn.web_app is not None
-    assert btn.web_app.url == "https://example.com"
-
-
-def test_reply_keyboard_none_returns_remove():
-    """url=None → ReplyKeyboardRemove (убрать кнопку, ведущую в никуда)."""
-    from handlers.start import webapp_reply_keyboard
-
-    assert isinstance(webapp_reply_keyboard(None), ReplyKeyboardRemove)
-
-
-def test_reply_keyboard_empty_returns_remove():
-    """url='' тоже трактуется как «нет URL»."""
-    from handlers.start import webapp_reply_keyboard
-
-    assert isinstance(webapp_reply_keyboard(""), ReplyKeyboardRemove)
 
 
 # ─── Global Menu Button ─────────────────────────────────────────────────────
