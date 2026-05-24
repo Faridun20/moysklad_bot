@@ -213,8 +213,41 @@ def init_db():
     """
     _create_tables()
     _create_indexes()
+    _seed_currency_rates()
     _load_predefined_users()
     logger.info("База данных инициализирована (CREATE TABLE only)")
+
+
+def _seed_currency_rates():
+    """Сид BASE_CURRENCY с rate=1.0 — гарантирует что convert_to_base
+    работает «из коробки» хотя бы для одной валюты. Остальные ставит
+    админ через /api/currency/rates. Идемпотентно через UNIQUE PK."""
+    from config import BASE_CURRENCY
+
+    base = (BASE_CURRENCY or "USD").upper()
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        try:
+            if USE_POSTGRES:
+                cur.execute(
+                    q(
+                        "INSERT INTO currency_rates (currency_code, rate_to_base, updated_at) "
+                        "VALUES (?, 1.0, ?) ON CONFLICT (currency_code) DO NOTHING"
+                    ),
+                    (base, now_str()),
+                )
+            else:
+                cur.execute(
+                    q(
+                        "INSERT OR IGNORE INTO currency_rates "
+                        "(currency_code, rate_to_base, updated_at) VALUES (?, 1.0, ?)"
+                    ),
+                    (base, now_str()),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            logger.debug("seed currency_rates skipped (likely table not yet created)")
 
 
 def _create_tables():
@@ -517,6 +550,16 @@ def _create_tables():
                 status      TEXT NOT NULL DEFAULT 'running',
                 error_message TEXT,
                 metadata    TEXT
+            )""",
+            # Курсы валют → к BASE_CURRENCY (USD по умолчанию). Записываются
+            # вручную через /api/currency/rates админом. Историю изменений
+            # не храним (rate_at_payment-точность — отдельная задача), здесь
+            # «текущий рыночный курс» для UI-сводок.
+            """CREATE TABLE IF NOT EXISTS currency_rates (
+                currency_code TEXT PRIMARY KEY,
+                rate_to_base  REAL NOT NULL,
+                updated_at    TEXT,
+                updated_by    BIGINT
             )""",
         ]
 
@@ -1419,6 +1462,146 @@ def _validate_amount(amount: float | None) -> tuple[bool, str | None]:
     if amount > _AMOUNT_MAX:
         return False, f"Сумма превышает лимит ({_AMOUNT_MAX:.0f})"
     return True, None
+
+
+# ─── Currency rates (PR #42: tech debt #3a) ──────────────────────────────────
+#
+# Простая модель: один курс на валюту относительно BASE_CURRENCY (USD).
+# Не храним историю — для UI-сводок («сколько денег у нас всего в USD»)
+# достаточно «текущего» курса. Историческая точность (rate-at-payment)
+# отдельная задача с другой моделью данных.
+#
+# Кэш: rates меняются редко (ручной admin-update раз в день максимум),
+# TTL 5 минут даёт мгновенный hit для всех queries без stale-данных
+# больше чем на 5 мин.
+
+import threading as _threading
+
+_CURRENCY_RATES_CACHE: dict[str, tuple[float, float]] = {}  # code → (loaded_at_monotonic, rate)
+_CURRENCY_RATES_CACHE_TTL = 300.0  # 5 минут
+_currency_rates_lock = _threading.Lock()
+
+
+def get_currency_rate(currency_code: str) -> float | None:
+    """Получить rate валюты к BASE_CURRENCY. None если валюта неизвестна.
+
+    Кэшируется на 5 мин — TTL вне lock'а, sync-friendly. Если код упал
+    в БД-вызове, возвращаем None (caller решает: использовать 1.0
+    fallback или явный warning)."""
+    if not currency_code:
+        return None
+    code = currency_code.upper()
+    now = time.monotonic()
+    with _currency_rates_lock:
+        cached = _CURRENCY_RATES_CACHE.get(code)
+        if cached is not None and (now - cached[0]) < _CURRENCY_RATES_CACHE_TTL:
+            return cached[1]
+    # Cache miss / stale → читаем БД
+    try:
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q("SELECT rate_to_base FROM currency_rates WHERE currency_code = ?"),
+                (code,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            rate = float(row["rate_to_base"]) if hasattr(row, "keys") else float(row[0])
+    except Exception:
+        logger.exception("get_currency_rate(%s) failed", code)
+        return None
+    with _currency_rates_lock:
+        _CURRENCY_RATES_CACHE[code] = (now, rate)
+    return rate
+
+
+def set_currency_rate(currency_code: str, rate: float, updated_by: int) -> tuple[bool, str | None]:
+    """Установить/обновить rate. UPSERT с автоинвалидацией кэша.
+
+    Возвращает (ok, error_msg). Валидирует rate как amount (> 0, конечное).
+    `currency_code` — нормализуется UPPER, должен быть в ALLOWED_CURRENCIES."""
+    from config import ALLOWED_CURRENCIES
+
+    code = (currency_code or "").upper().strip()
+    if not code:
+        return False, "currency_code пустой"
+    if code not in ALLOWED_CURRENCIES:
+        return False, f"currency_code должен быть из {list(ALLOWED_CURRENCIES)}"
+    ok, err = _validate_amount(rate)
+    if not ok:
+        return False, f"rate: {err}"
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        if USE_POSTGRES:
+            cur.execute(
+                q(
+                    "INSERT INTO currency_rates "
+                    "(currency_code, rate_to_base, updated_at, updated_by) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT (currency_code) DO UPDATE SET "
+                    "rate_to_base = EXCLUDED.rate_to_base, "
+                    "updated_at = EXCLUDED.updated_at, "
+                    "updated_by = EXCLUDED.updated_by"
+                ),
+                (code, float(rate), now_str(), updated_by),
+            )
+        else:
+            cur.execute(
+                q(
+                    "INSERT OR REPLACE INTO currency_rates "
+                    "(currency_code, rate_to_base, updated_at, updated_by) "
+                    "VALUES (?, ?, ?, ?)"
+                ),
+                (code, float(rate), now_str(), updated_by),
+            )
+        conn.commit()
+    # Инвалидируем кэш именно этой валюты, остальные не трогаем.
+    with _currency_rates_lock:
+        _CURRENCY_RATES_CACHE.pop(code, None)
+    return True, None
+
+
+def get_all_currency_rates() -> list[dict]:
+    """Все курсы. Для admin-UI и /api/currency/rates."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            "SELECT currency_code, rate_to_base, updated_at, updated_by "
+            "FROM currency_rates ORDER BY currency_code"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def convert_to_base(amount: float, from_currency: str | None) -> float | None:
+    """Перевести amount из from_currency в BASE_CURRENCY.
+
+    Возвращает None если валюта неизвестна (rate не задан админом).
+    Это намеренно: caller должен явно обработать «не могу посчитать»,
+    а не молча умножить на 1.0 и выдать неверный итог.
+    """
+    from config import BASE_CURRENCY
+
+    if amount is None:
+        return None
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return None
+    code = (from_currency or BASE_CURRENCY).upper()
+    base = (BASE_CURRENCY or "USD").upper()
+    if code == base:
+        return amount
+    rate = get_currency_rate(code)
+    if rate is None or rate <= 0:
+        return None
+    return amount * rate
+
+
+def _invalidate_currency_rates_cache() -> None:
+    """Сбросить весь кэш (для тестов и admin-debug endpoint'а)."""
+    with _currency_rates_lock:
+        _CURRENCY_RATES_CACHE.clear()
 
 
 def create_cash_deposit(
@@ -2416,7 +2599,13 @@ def get_order_payment_summary(order_id: int) -> dict:
 
     Используется для отображения «оплачено X из Y, остаток Z» и для
     решения, закрыт ли заказ (remaining == 0).
+
+    Дополнительно (PR #42): `*_base` поля — пересчёт в BASE_CURRENCY через
+    `convert_to_base`. None если курс валюты заказа не задан в админке;
+    UI может в этом случае показать «—» вместо враного «$0.00».
     """
+    from config import BASE_CURRENCY
+
     order = get_order(order_id)
     if not order:
         return {"total": 0.0, "confirmed": 0.0, "pending": 0.0, "remaining": 0.0}
@@ -2426,11 +2615,20 @@ def get_order_payment_summary(order_id: int) -> dict:
     confirmed = sum(p["amount"] for p in payments if p["status"] == "confirmed")
     pending = sum(p["amount"] for p in payments if p["status"] == "pending")
     remaining = max(0.0, total - confirmed)
+
+    currency = (order.get("currency") or BASE_CURRENCY).upper()
     return {
         "total": total,
         "confirmed": confirmed,
         "pending": pending,
         "remaining": remaining,
+        "currency": currency,
+        # *_base — None если convert_to_base не смог (курс не задан админом).
+        "total_base": convert_to_base(total, currency),
+        "confirmed_base": convert_to_base(confirmed, currency),
+        "pending_base": convert_to_base(pending, currency),
+        "remaining_base": convert_to_base(remaining, currency),
+        "base_currency": (BASE_CURRENCY or "USD").upper(),
     }
 
 

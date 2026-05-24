@@ -1344,6 +1344,51 @@ async def api_credit_set(request: Request):
     return JSONResponse({"ok": True, "agent_id": agent_id, "limit_amount": limit_amount})
 
 
+# ─── API: курсы валют (PR #42 / tech debt #3a) ────────────────────────────────
+
+
+@app.post("/api/currency/rates")
+async def api_currency_rates(request: Request):
+    """Прочитать все курсы валют. Любая авторизованная роль (для UI-сводок)."""
+    from services import async_db as adb
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager", "bookkeeper", "warehouse_keeper"),
+        rate_limit_scope="api_currency_rates_get",
+    )
+    rates = await adb.get_all_currency_rates()
+    from config import BASE_CURRENCY
+
+    return JSONResponse({"ok": True, "base": BASE_CURRENCY, "rates": rates})
+
+
+@app.post("/api/currency/rates/set")
+async def api_currency_rates_set(request: Request):
+    """Установить курс валюты к BASE_CURRENCY. Только admin/boss.
+
+    Payload: {"initData": "...", "currency_code": "UZS", "rate_to_base": 0.000079}
+    Семантика: 1 unit currency_code = rate_to_base unit BASE_CURRENCY.
+    Например для UZS→USD при курсе 1 USD ≈ 12 600 UZS:
+        1 UZS = 1/12600 ≈ 0.0000794 USD → rate_to_base = 0.0000794
+    """
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_currency_rates_set",
+    )
+    code = (data.get("currency_code") or "").strip()
+    rate = data.get("rate_to_base")
+    ok, err = await adb.set_currency_rate(code, rate, user["id"])
+    if not ok:
+        raise HTTPException(status_code=400, detail=err)
+    return JSONResponse({"ok": True, "currency_code": code.upper(), "rate_to_base": float(rate)})
+
+
 # ─── API: сдачи наличных (IMPLEMENTATION.md §7) ───────────────────────────────
 
 
