@@ -20,7 +20,6 @@ CLI-entrypoint для отчётов: запускается из Railway Cron J
 """
 
 import argparse
-import asyncio
 import logging
 import sys
 from datetime import timedelta
@@ -162,5 +161,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    from tasks._cron_runner import run_cron
+
     args = _parse_args(sys.argv[1:])
-    sys.exit(asyncio.run(main(args.report_type)))
+    # task_name включает тип отчёта, чтобы ops_monitor мог алертить
+    # отдельно по daily/weekly/monthly — у них разные пороги stale'ности.
+    sys.exit(run_cron(f"report_{args.report_type}", main, args.report_type))

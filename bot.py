@@ -38,6 +38,7 @@ from services.notifier import shipment_notifier, close_tg_session
 from services import snapshot
 from services.ms_webhooks import ensure_subscriptions
 from services.ms_demand import init_demand_context
+from services.observability import init_sentry as _init_sentry, set_user as _sentry_set_user
 from tasks.scheduled import (
     daily_report_task,
     weekly_report_task,
@@ -74,6 +75,10 @@ class RateLimitMiddleware(BaseMiddleware):
     ) -> Any:
         user: User | None = data.get("event_from_user")
         if user is not None:
+            # Привязываем user_id к Sentry scope ДО handler'а — exception'ы
+            # из handler'ов автоматически попадают в Sentry с пометкой кто.
+            # No-op без SENTRY_DSN.
+            _sentry_set_user(user.id, user.username)
             scope = "bot_msg" if isinstance(event, Message) else "bot_cb"
             if not rate_limit_acquire(scope, user.id, self.max_calls, self.window_sec):
                 # Тихо отвечаем юзеру и не пропускаем дальше
@@ -350,6 +355,10 @@ async def _run_webapp_only():
 
 
 async def main():
+    # Sentry: ставим ДО любых сетевых вызовов чтобы ловить crash'и старта
+    # (init_db, set_webhook, init_demand_context). No-op без SENTRY_DSN.
+    _init_sentry(component="bot" if BOT_MODE != "webapp" else "webapp")
+
     # Режим webapp полностью самодостаточен — не нужны ни Bot, ни роутеры
     if BOT_MODE == "webapp":
         await _run_webapp_only()

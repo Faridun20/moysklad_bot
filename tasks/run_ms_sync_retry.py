@@ -24,7 +24,6 @@ CLI: ретрай неудавшихся (или вообще не запуще�
 """
 
 import argparse
-import asyncio
 import logging
 import sys
 
@@ -139,5 +138,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    from tasks._cron_runner import run_cron
+
     args = _parse_args(sys.argv[1:])
-    sys.exit(asyncio.run(main(args.limit)))
+    sys.exit(run_cron("ms_sync_retry", main, args.limit))

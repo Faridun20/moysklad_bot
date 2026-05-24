@@ -16,7 +16,6 @@ CLI: ежедневное напоминание о долгах. Запуска
        или 0 9 * * * если предпочитаешь UTC.
 """
 
-import asyncio
 import logging
 import sys
 from datetime import date
@@ -173,4 +172,6 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    from tasks._cron_runner import run_cron
+
+    sys.exit(run_cron("debts_notify", main))
