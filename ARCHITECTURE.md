@@ -251,6 +251,24 @@ confirmed_at TEXT
 произвольные платежи в кассу, не связанные с заказом (`/pay` в боте).
 Менеджер их создаёт, босс подтверждает.
 
+Дополнительные колонки для синхронизации с МойСклад:
+- `ms_paymentin_id TEXT` — id входящего платежа в МС (NULL = ещё не sync'нут)
+- `ms_sync_status TEXT` — `NULL` / `'in_progress'` / `'synced'` / `'failed'`
+- `ms_sync_error TEXT` — текст последней причины фейла (для `/sync_payments` UI)
+
+**Жизненный цикл `ms_sync_status`:**
+- `NULL` → `'in_progress'` (атомарный `claim_payment_for_ms_sync` ставит «застолблено»)
+- `'in_progress'` → `'synced'` (после успешного POST `entity/paymentin`, заодно ставится `ms_paymentin_id`)
+- `'in_progress'` → `'failed'` (HTTP/network error; `ms_sync_error` записывается)
+- `'failed'` → попадает обратно в очередь `get_payments_needing_ms_sync` (фильтр на `ms_paymentin_id IS NULL`)
+
+**Reaper для orphan'ов:** если процесс убили mid-claim (Railway SIGTERM, OOM,
+длинный init_demand_context'а), строка останется в `'in_progress'` навсегда — 
+`claim_payment_for_ms_sync` отвергает уже-`'in_progress'`. Защита — функция
+`reset_stale_in_progress_payments(older_than_minutes=30)`, вызывается в
+самом начале `tasks/run_ms_sync_retry.main()`. Сбрасывает orphan-строки
+обратно в `NULL`, следующий cron-tick их подберёт.
+
 ### `audit_log`
 
 ```
@@ -397,6 +415,24 @@ Cron-сервисы `cron-daily/weekly/monthly` вызывают `python -m task
 - TTL-кэш с inflight-coalescing для `get_shipments` / `get_sales_stats`
   / `get_shipment_positions` (декоратор `_ms_ttl_cache`). Это спасает
   от 429, когда несколько боссов одновременно открывают «Аналитику».
+- `get_shipment_positions(demand_id)` пагинирует через offset-loop
+  (`limit=100` на страницу) — крупные B2B-заказы с >100 line items
+  собираются полностью, иначе хвост молча терялся в `top_products`.
+- Concurrency `/positions` ограничен через `_get_positions_semaphore()`
+  (lazy semaphore по `id(running_loop)`, cap=8). Без него `asyncio.gather`
+  на 15+ demand'ов в одном `/api/analytics` стабильно бьёт 429-rate-limit
+  МС, вызывая retry-цепочки 0.5/1.0/2.0с и заметную latency у боссов.
+  Не используй module-level `asyncio.Semaphore()` — он биндится к первому
+  loop'у при contention и валит cross-loop тесты (`asyncio.run` ×N).
+- `cache_clear()` декоратора `_ms_ttl_cache` чистит ТОЛЬКО `cache`, не
+  `locks`. Иначе MS-webhook `invalidate_ms_cache()` race'ит с in-flight
+  winner'ом: winner держит локальный `lock`, мы стираем dict-entry,
+  следующий caller создаёт свежий lock и запускает второй HTTP
+  параллельно → inflight-coalescing нарушено. Stale `locks[key]` сидят
+  безвредно до stale-prune при `len(cache)>200`.
+- На каждом cache-miss при exception в `await fn(...)` делается
+  `locks.pop(key, None)` (BaseException-safe, под `try/except`) — иначе
+  для consistently-failing demand_id'ов (404, deleted) lock leaks вечно.
 
 ### 6.2 Snapshot
 
@@ -445,7 +481,17 @@ Cron-сервисы `cron-daily/weekly/monthly` вызывают `python -m task
 - Идёт в `entity/demand`, прикладывает позиции.
 
 Контекст организации/склада подгружается один раз при старте через
-`init_demand_context()`.
+`init_demand_context()`. Функция НЕ бросает exception (helpers
+`_pick_first` / `_ensure_custom_attribute` глотают сетевые сбои и
+возвращают None), вместо этого возвращает dict с булевыми флагами
+`ready/org/store/attribute_name/attribute_uid`. Callers инспектируют
+dict-возврат, а не оборачивают вызов в `try/except` (был dead code в
+старой версии `run_ms_sync_retry`).
+
+В bot-процессе `init_demand_context()` вызывается в `main()` при старте.
+В cron-CLI (`tasks/run_ms_sync_retry`) — лениво: только если есть
+pending платежи. Без этой оптимизации 96 cron-тиков/день делали бы
+~200-400 МС API calls впустую на noop-прогонах.
 
 ---
 
@@ -600,6 +646,14 @@ psycopg2 + threadpool + кэш ролей закрывает реальные п
   `services.roles.invalidate_role(user_id)`.
 - При вебхуке от МойСклад — `invalidate_ms_cache()` чистит все
   `_ms_ttl_cache` сразу.
+
+Concurrency-ограничители (не TTL, но рядом по смыслу):
+
+- `services/moysklad._get_positions_semaphore()` — lazy `asyncio.Semaphore(8)`
+  по `id(running_loop)`, ограничивает cold-cache fan-out `get_shipment_positions`.
+  Cache-hit семафор не трогает (декоратор `_ms_ttl_cache` отдаёт до тела).
+  Lazy-by-loop — чтобы short-lived `asyncio.run()` в CLI и per-test loops
+  в pytest не словили `RuntimeError: bound to a different event loop`.
 
 ---
 

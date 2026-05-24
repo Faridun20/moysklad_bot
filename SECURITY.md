@@ -539,6 +539,15 @@ tests/
 | Low (dual reports) | warning при ENABLE_SCHEDULED_REPORTS unset + Railway | [d4e474f](https://github.com/Faridun20/moysklad_bot/commit/d4e474f) |
 | Low (type hints) | type annotations на add_payment и публичные DB-функции | [d4e474f](https://github.com/Faridun20/moysklad_bot/commit/d4e474f) |
 | Tests + CI | pytest + GitHub Actions | round 1 |
+| Medium (cron-ms-retry context) | init_demand_context() в cron-CLI (раньше: «Контекст ms_demand не готов» застрял на 2 платежах >25 ч) | PR #35 [a920fd3](https://github.com/Faridun20/moysklad_bot/commit/a920fd3) |
+| Medium (cron-ms-retry orphans) | `reset_stale_in_progress_payments(30)` reaper — orphan'ы `in_progress` от mid-claim SIGTERM сбрасываются за 30 мин (раньше залипали навсегда: claim-UPDATE отвергает `in_progress`) | PR #36 [36600d5](https://github.com/Faridun20/moysklad_bot/commit/36600d5) |
+| Medium (silent ms_sync_error overwrite) | cron при `init_demand_context().ready == False` делает early-return до цикла, не перезаписывает реальный `ms_sync_error` (типа «429») на «Контекст не готов» | PR #36 [36600d5](https://github.com/Faridun20/moysklad_bot/commit/36600d5) |
+| Medium (MS /positions truncation) | `get_shipment_positions` пагинирует offset-loop'ом — крупные B2B-заказы >100 line items больше не теряют хвост в `top_products` аналитики | PR #36 [36600d5](https://github.com/Faridun20/moysklad_bot/commit/36600d5) |
+| Medium (cache_clear race breaks inflight) | `cache_clear` чистит только `cache`, не `locks` — MS-webhook `invalidate_ms_cache()` больше не race'ит с in-flight winner'ом и не запускает второй параллельный HTTP | PR #36 [36600d5](https://github.com/Faridun20/moysklad_bot/commit/36600d5) |
+| Low (INFO log silencing) | `config.py` использует named logger, не root → entrypoint'ы `bot.py`/`tasks/run_*.py` корректно ставят `basicConfig(level=INFO)`. Раньше `WARNING:root:config:...` на импорте триггерил неявный `basicConfig(level=WARNING)` и весь INFO глушился на проде | PR #35 [a920fd3](https://github.com/Faridun20/moysklad_bot/commit/a920fd3), PR #36 [36600d5](https://github.com/Faridun20/moysklad_bot/commit/36600d5) (`config:` префикс возвращён в message) |
+| Low (MS positions 429-spam) | `_get_positions_semaphore()` lazy per-loop, cap=8 — cold-cache `/api/analytics` без retry-chain 0.5/1.0/2.0с | PR #35 cap=4 → PR #36 cap=8 + lazy [36600d5](https://github.com/Faridun20/moysklad_bot/commit/36600d5) |
+| Low (locks dict memory leak) | `_ms_ttl_cache.locks` чистится в `try/except BaseException` вокруг `await fn()` — для consistently-failing keys (404, deleted demands) lock больше не leaks вечно | PR #36 [36600d5](https://github.com/Faridun20/moysklad_bot/commit/36600d5) |
+| Low (module-level Semaphore landmine) | `_get_positions_semaphore()` lazy по `id(running_loop)` — future tests с >cap acquire'ами через `asyncio.run` больше не упадут «bound to a different event loop» | PR #36 [36600d5](https://github.com/Faridun20/moysklad_bot/commit/36600d5) |
 
 ## История изменений этого документа
 
@@ -549,3 +558,5 @@ tests/
 | 2026-05-19 | Раунд 2 фиксов: H4-H7, H11, TZ, idempotency, dedup, sync→async, PAGE_SIZE | Claude |
 | 2026-05-19 | Раунд 3: audit/log dedup, cache mtime, type hints, dual-reports warning | Claude |
 | 2026-05-21 | H8 regression re-fix (aiohttp base_url); защитные сетки: pytest-набор + CI (ruff/mypy/coverage), мок сетевой границы, mypy-гейт; событийные уведомления об отгрузках с дедупом | Claude |
+| 2026-05-23 | Раунд 4 (Railway logs review): PR #35 — cron-ms-retry init_demand_context, INFO-логи (named logger в config), `_POSITIONS_CONCURRENCY=Semaphore(4)`; вживую проверены прод-логи через Railway CLI | Claude |
+| 2026-05-24 | Раунд 5 (self-code-review PR #35 → 10 находок): PR #36 — orphan-reaper для 'in_progress', noop-skip для init_demand_context, /positions pagination, cache_clear narrow, lazy-by-loop Semaphore(8), locks-pop на except, `config:` префикс в message; +6 тестов (194 total) | Claude |
