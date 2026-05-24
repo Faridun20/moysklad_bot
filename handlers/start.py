@@ -8,10 +8,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
     CallbackQuery,
-    WebAppInfo,
-    ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
-    KeyboardButton,
     BotCommand,
     BotCommandScopeChat,
 )
@@ -40,8 +37,8 @@ def get_keyboard_for_role(role: str):
     Сокращённое inline-меню — только то, что неудобно делать через WebApp:
     срочные действия (Заявки на апрув для босса) и admin-only функции
     (Пользователи, Аудит). Каталог / Новый заказ / Аналитика / Платежи
-    живут в WebApp — туда ведёт persistent reply-кнопка «🌐 Открыть»
-    снизу чата (webapp_reply_keyboard).
+    живут в WebApp — туда ведёт Menu Button слева от поля ввода
+    (set_chat_menu_button в bot.py).
 
     Раньше тут было 7-9 кнопок которые дублировали WebApp. Это
     путало пользователя: где «правильно» создавать заказ — в чате
@@ -91,27 +88,14 @@ def shop_submenu_keyboard():
     return kb.as_markup()
 
 
-def webapp_reply_keyboard(webapp_url: str | None):
-    """Persistent reply-кнопка «🌐 Открыть» снизу чата.
-
-    В отличие от inline-меню (которое теряется как только юзер прокрутил
-    выше), reply-кнопка всегда видна над полем ввода — паттерн крупных
-    WebApp-ботов (Wallet, Mini-store).
-
-    Если WEBAPP_URL не задан — снимаем клавиатуру (ReplyKeyboardRemove),
-    чтобы не оставлять висеть кнопку, ведущую в никуда.
-    """
-    if not webapp_url:
-        return ReplyKeyboardRemove()
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text="🌐 Открыть", web_app=WebAppInfo(url=webapp_url)),
-            ]
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
+# Reply Keyboard убран по запросу пользователя (PR #47). Дублировал
+# Menu Button (слева от поля ввода) и занимал место снизу. WebApp
+# теперь только через Menu Button.
+#
+# При первом /start после обновления юзерам шлём ReplyKeyboardRemove,
+# чтобы у тех кто видел persistent-кнопку она исчезла. После одного
+# /start клиент Telegram кэширует «нет reply-keyboard» и больше не
+# показывает.
 
 
 # Команды для /-автокомплита Telegram. Разные наборы для разных ролей —
@@ -162,9 +146,9 @@ async def set_commands_for_user(bot: Bot, chat_id: int, role: str) -> None:
 def get_welcome_text(role: str, first_name: str = "") -> str:
     """Приветствие с короткой подсказкой про навигацию.
 
-    Главная мысль: «жми 🌐 Открыть снизу для всех действий». Подменю
-    в чате — только для срочного. Без длинного списка команд (он
-    висит в /-автокомплите Telegram через set_my_commands).
+    Главная мысль: «жми Открыть слева от поля ввода». Inline-меню
+    для срочного/admin-only. Без длинного списка команд (он висит
+    в /-автокомплите Telegram через set_my_commands).
     """
     role_name = ROLE_NAMES.get(role, "👤 Сотрудник")
     name_part = f", <b>{first_name}</b>" if first_name else ""
@@ -185,7 +169,7 @@ def get_welcome_text(role: str, first_name: str = "") -> str:
     return (
         f"👋 Привет{name_part}!\n"
         f"{role_name}\n\n"
-        f"🌐 <b>Жмите «Открыть» снизу</b> — там всё:\n"
+        f"🌐 <b>Жмите «Открыть» слева от поля ввода</b> — там всё:\n"
         f"каталог, заказы, аналитика, долги, платежи.\n\n"
         f"<i>{hint}</i>"
     )
@@ -269,13 +253,14 @@ async def cmd_start(message: Message):
                 f"недоступна без привязки.</i>"
             )
 
-    # 1) Welcome + persistent reply-кнопка «🌐 Открыть» снизу чата
-    #    Гостям передаём None → ReplyKeyboardRemove (та же логика что и
-    #    для Menu Button выше: не показываем кнопку которая отдаст 403).
+    # 1) Welcome + ReplyKeyboardRemove чтобы у юзеров, которые получили
+    #    persistent reply-кнопку «🌐 Открыть» в старых версиях бота, она
+    #    исчезла. После одного /start клиент Telegram запоминает «нет
+    #    клавиатуры» и больше её не показывает.
     await message.answer(
         get_welcome_text(role, user.first_name or "") + sync_status_line,
         parse_mode="HTML",
-        reply_markup=webapp_reply_keyboard(WEBAPP_URL if role != "guest" else None),
+        reply_markup=ReplyKeyboardRemove(),
     )
 
     # 2) Если есть срочные/admin-only действия — отдельное короткое
@@ -344,8 +329,8 @@ async def cb_menu(call: CallbackQuery):
     await call.answer()
     if role == "guest":
         return await call.message.answer("⛔ Ваш аккаунт ещё не активирован. Напишите /start.")
-    # Welcome без reply_markup — reply-клавиатура уже была установлена
-    # один раз при /start и осталась видна (is_persistent=True).
+    # Reply-keyboard убрана (PR #47), WebApp только через Menu Button
+    # слева от поля ввода. Здесь только welcome-текст.
     await call.message.answer(
         get_welcome_text(role, user.first_name or ""),
         parse_mode="HTML",
