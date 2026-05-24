@@ -3262,6 +3262,118 @@ def confirm_payment(
     return updated
 
 
+def link_payment_to_order(
+    payment_id: int,
+    order_id: int,
+    linked_by: int,
+    linked_name: str = "",
+) -> dict:
+    """Ретроспективно привязать стендалон-платёж к заказу.
+
+    Use case: бухгалтер/босс видит /pay-платёж в кассе без order_id
+    («бытовой» по умолчанию), но понимает что это была частичная оплата
+    конкретного заказа. До этой функции — только удалить и пересоздать
+    с order_id, теряя audit-trail.
+
+    Семантика:
+      * атомарный UPDATE WHERE order_id IS NULL — два параллельных линка
+        к разным заказам: только первый выигрывает, второй вернёт ok=False
+      * заказ должен существовать, иначе FK-семантика ломается
+      * если платёж уже confirmed — после link триггерим _maybe_close_order
+        (мог сразу закрыть заказ) + _trigger_ms_paymentin_sync (создать
+        paymentin в МС, который не создавался без order'а)
+      * audit-log запись о ретроспективной привязке
+
+    Возвращает {ok, error?, ms_sync_triggered?, order_closed?}.
+    """
+    if not payment_id or not order_id:
+        return {"ok": False, "error": "payment_id и order_id обязательны"}
+
+    payment = get_payment(payment_id)
+    if not payment:
+        return {"ok": False, "error": "Платёж не найден"}
+    if payment.get("order_id"):
+        return {
+            "ok": False,
+            "error": f"Платёж уже привязан к заказу #{payment['order_id']}",
+        }
+    order = get_order(order_id)
+    if not order:
+        return {"ok": False, "error": "Заказ не найден"}
+    if order.get("deleted_at"):
+        return {"ok": False, "error": "Заказ удалён"}
+
+    # Атомарно линкуем — защита от race: два параллельных линка к РАЗНЫМ
+    # заказам, оба прошли проверки выше; UPDATE-WHERE-NULL выиграет только
+    # один. WHERE id = ? обязательно дополняет, иначе при concurrent
+    # link'е разных платежей к разным заказам мы случайно обновим не тот.
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE payments SET order_id = ? WHERE id = ? AND order_id IS NULL"),
+            (order_id, payment_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    if not updated:
+        # Кто-то между нашими read и UPDATE прилинковал другой заказ.
+        # Перечитываем чтобы вернуть оператору актуальную картину.
+        fresh = get_payment(payment_id)
+        return {
+            "ok": False,
+            "error": f"Параллельная привязка: платёж уже принадлежит заказу #{fresh.get('order_id') if fresh else '?'}",
+        }
+
+    add_audit_log(
+        linked_by,
+        linked_name or "",
+        get_role(linked_by) or "",
+        "payment_linked_to_order",
+        f"Платёж #{payment_id} ({payment['amount']:,.2f} {payment.get('currency', 'USD')}) "
+        f"привязан к заказу #{order_id} (был стендалон)",
+    )
+
+    result: dict = {"ok": True, "ms_sync_triggered": False, "order_closed": False}
+
+    # Если платёж уже был подтверждён до линка — теперь это credit на заказ,
+    # надо проверить не закрыли ли мы его и создать paymentin в МС.
+    if payment.get("status") == "confirmed":
+        _maybe_close_order_after_payment(order_id, linked_by, linked_name)
+        # Проверяем статус заказа после _maybe_close.
+        updated_order = get_order(order_id)
+        if updated_order and updated_order.get("paid_confirmed_at"):
+            result["order_closed"] = True
+        _trigger_ms_paymentin_sync(payment_id)
+        result["ms_sync_triggered"] = True
+
+    return result
+
+
+def get_unlinked_payments(limit: int = 100) -> list[dict]:
+    """Confirmed-платежи без order_id — кандидаты для ретроспективного link'а.
+
+    Только confirmed: pending-платежи в UI и так видны в общем списке,
+    rejected/cancelled — не интересно для link'а.
+
+    Возвращает свежие первыми (для UI «недавно подтверждённое сначала»).
+    """
+    if limit <= 0:
+        limit = 100
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "SELECT id, user_id, username, full_name, amount, currency, "
+                "comment, confirmed_at, status "
+                "FROM payments "
+                "WHERE order_id IS NULL AND status = 'confirmed' "
+                "ORDER BY id DESC LIMIT ?"
+            ),
+            (int(limit),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
 def _trigger_ms_paymentin_sync(payment_id: int) -> None:
     """Запустить async create_paymentin_for_payment в фоне.
 

@@ -1027,6 +1027,65 @@ async def api_payments_pending(request: Request):
     return JSONResponse({"pending": result, "role": get_role(user["id"])})
 
 
+@app.post("/api/payments/unlinked")
+async def api_payments_unlinked(request: Request):
+    """Confirmed-платежи без order_id — кандидаты для ретроспективного линка.
+
+    PR #43 (tech debt #3b): бухгалтер/босс видит «бытовые» платежи в кассе
+    и понимает, что некоторые из них на самом деле — частичные оплаты
+    конкретного заказа. Этот endpoint показывает список таких платежей;
+    `/api/payments/link` потом привязывает.
+    """
+    from services import async_db as adb
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss", "bookkeeper"),
+        rate_limit_scope="api_payments_unlinked",
+    )
+    limit = int(data.get("limit", 100))
+    payments = await adb.get_unlinked_payments(limit=limit)
+    return JSONResponse({"ok": True, "payments": payments})
+
+
+@app.post("/api/payments/link")
+async def api_payments_link(request: Request):
+    """Ретроспективно привязать стендалон-платёж к заказу.
+
+    Только admin/boss — изменяет финансовые связи, нужен audit-grade
+    контроль (audit-запись пишется внутри link_payment_to_order).
+
+    Payload: {"initData": "...", "payment_id": N, "order_id": M}
+    """
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_payments_link",
+    )
+    try:
+        payment_id = int(data.get("payment_id"))
+        order_id = int(data.get("order_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="payment_id и order_id обязательны (числа)")
+    res = await adb.link_payment_to_order(
+        payment_id,
+        order_id,
+        linked_by=user["id"],
+        linked_name=(user.get("first_name") or "") + " " + (user.get("last_name") or ""),
+    )
+    if not res.get("ok"):
+        # 409 Conflict для race-кейса (платёж уже привязан); 400 для
+        # валидационных (платежа/заказа нет).
+        err = res.get("error", "Не удалось привязать")
+        status = 409 if "уже" in err or "Параллельная" in err else 400
+        raise HTTPException(status_code=status, detail=err)
+    return JSONResponse(res)
+
+
 @app.post("/api/payments/send")
 async def api_payments_send(request: Request):
     """Отправить новый платёж на подтверждение."""
