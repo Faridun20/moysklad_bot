@@ -217,7 +217,10 @@ payment (status=pending)  →  push боссу
 
 Найденные при последнем аудите вопросы (Critical / High / Medium / Low) —
 см. **[SECURITY.md](SECURITY.md)**. Там же лежит приоритизированный
-top-5 «что чинить первым».
+top-5 «что чинить первым» и таблица **Closed** с ссылками на коммиты.
+Последние раунды (4-5, май 2026) закрыли cron-стабильность
+(`run_ms_sync_retry` orphan-reaper + init-context + early-noop), MS
+`/positions` pagination и race в `_ms_ttl_cache.cache_clear`.
 
 ## Документация
 

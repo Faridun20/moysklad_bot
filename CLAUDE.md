@@ -52,10 +52,22 @@ python -m tasks.run_maintenance          # janitor: чистка дедупа/а
 - Error bodies в логах ВСЕГДА через `services.moysklad.redact_ms_error(body)`.
 - Кастомные атрибуты привязаны к сущности (`demand` vs `customerorder`) — нельзя переиспользовать meta, иначе HTTP 400. На `salesreturn` атрибуты demand НЕ ставим (`services/ms_returns.py` их не шлёт).
 - Подтверждение возврата создаёт «Возврат покупателя» (`entity/salesreturn`) — `services.ms_returns.create_salesreturn` (best-effort, gated через `ms_demand.is_ready()`, идемпотентно по `moysklad_return_id`, линкуется с исходной отгрузкой). Боевая проверка — `python -m tasks.verify_ms_returns` (read-only) → `--return-id N --create`.
+- Любой paginated MS endpoint (`limit=100`-max) — крути offset-loop. Real пример: `services/moysklad.get_shipment_positions` (демонд может иметь >100 line items в B2B-заказе, иначе хвост молча теряется в `top_products` аналитики). Pattern — `services/snapshot._fetch_all`.
+- Концурентность к МС ограничивай через `_get_positions_semaphore()`-style helper (loop-keyed lazy semaphore), а НЕ module-level `asyncio.Semaphore()` — последний биндится к первому loop'у при contention и валит cross-loop тесты с `RuntimeError: bound to a different event loop`. Cap=8 для positions сейчас.
 
 **Time:** `utils.helpers.utc_now()` вместо deprecated `datetime.utcnow()`. `utils.helpers.local_now()` для сравнений с `created_at` (пишется в local TZ через `now_str()`).
+- В SQL **не** сравнивай `confirmed_at`/`created_at` (local TZ string) с `datetime('now',...)` SQLite (UTC) или `NOW()` Postgres — лекс-сравнение в разных TZ молча всегда False (silent bug). Вычисляй порог в Python через `datetime.now() - timedelta(...)` и передавай параметром. Пример — `services/database.reset_stale_in_progress_payments`.
 
 **Idempotency:** `/api/orders/confirm_payment` принимает `idempotency_key` через `_idem_get/_idem_set`. Применяй тот же паттерн для новых write-endpoint'ов.
+
+**Logging:**
+- НЕ дёргай root logger (`logging.warning(...)`/`logging.info(...)`) на module-import time. Первый же вызов авто-триггерит `basicConfig(level=WARNING)` с дефолт-форматтером, и любой последующий `logging.basicConfig(level=INFO, ...)` в bot.py/tasks/run_*.py становится no-op → ВСЕ INFO глушатся на проде. Используй `logger = logging.getLogger(__name__)` — propagation идёт через `lastResort`, root остаётся чист.
+- В cron-CLI (`tasks/run_*.py`) ставь `logging.basicConfig(level=INFO, format=...)` ДО любого импорта, который потенциально логирует на module-уровне. Сейчас все cron-CLI и `bot.py` это делают корректно.
+
+**Cron-CLI стабильность:**
+- Перед основной логикой вызывай идемпотентный reaper для своих долгоживущих in-flight состояний. Пример — `services.database.reset_stale_in_progress_payments(30)` в начале `tasks/run_ms_sync_retry`: сбрасывает orphan'ов 'in_progress' (claim был, но процесс убили до set_failed). Без него стуки залипают навсегда, потому что `claim_payment_for_ms_sync` отвергает уже-'in_progress'.
+- В `tasks/run_ms_sync_retry`: pending-fetch ДО любого МС-вызова, `return 0` на пустой очереди ДО `init_demand_context()` — иначе 96 cron-тиков/день делают ~200-400 МС API calls впустую.
+- `init_demand_context()` сам по себе НЕ raises (helpers `_pick_first`/`_ensure_custom_attribute` глотают exception); инспектируй возвращаемый dict (`ready/org/store/attribute_name/attribute_uid`), а не оборачивай в `try/except` (dead code).
 
 ## Security audit
 
@@ -73,3 +85,5 @@ python -m tasks.run_maintenance          # janitor: чистка дедупа/а
 ## Тесты (конвенция)
 
 Мокай ГРАНИЦУ с внешним миром, а не свой код. Урок: баг в `tg_send_message` пережил CI, потому что тесты мокали саму `tg_send_message`. Для исходящих HTTP — `aioresponses` (мок транспорта, реально исполняется сборка URL/payload). БД — настоящая (`isolated_db`), не мок.
+
+Если добавляешь module-level `asyncio.Semaphore`/`Lock` — добавь регресс-тест с 2× `asyncio.run` и contention >cap (см. `tests/test_analytics_parallel.py::test_positions_semaphore_survives_multiple_asyncio_run_with_contention`). Без waiter'а в очереди loop-binding не воспроизводится и landmine ждёт первого «толстого» теста.
