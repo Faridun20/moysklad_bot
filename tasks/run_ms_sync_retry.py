@@ -28,7 +28,11 @@ import asyncio
 import logging
 import sys
 
-from services.database import init_db, get_payments_needing_ms_sync
+from services.database import (
+    init_db,
+    get_payments_needing_ms_sync,
+    reset_stale_in_progress_payments,
+)
 from services.moysklad import close_session
 from services.notifier import close_tg_session
 
@@ -42,30 +46,48 @@ logger = logging.getLogger("ms_sync_retry")
 async def main(limit: int) -> int:
     init_db()
 
-    # Lazy-импорт чтобы не падать на старте если ms_payments тянет что-то
+    # Reaper: сбросить orphan'ов из 'in_progress' (claim был, но процесс
+    # убили до set_payment_ms_sync). Без этого orphan-строки навсегда
+    # выпадают из retry — claim-UPDATE отвергает 'in_progress'.
+    reset_stale_in_progress_payments(older_than_minutes=30)
+
+    # ВАЖНО: pending fetch ДО init_demand_context. Если pending пусто (наша
+    # обычная ветка — 96 noop-прогонов в день при `*/15 * * * *`), сразу
+    # return 0 без обращения к МС API. До этого фикса каждый noop-прогон
+    # делал 2-4 МС-вызова (org/store/2× attributes) впустую.
+    pending = get_payments_needing_ms_sync(limit=limit)
+    if not pending:
+        logger.info("Нет платежей требующих повторной синхронизации.")
+        return 0
+
+    logger.info("Найдено %d платежей для синхронизации", len(pending))
+
+    # Lazy-импорт ms_payments/ms_demand чтобы импорт не падал, если эти
+    # модули тянут что-то неподъёмное на старте контейнера.
     from services.ms_payments import create_paymentin_for_payment
-    from services.ms_demand import init_demand_context, is_ready
+    from services.ms_demand import init_demand_context
 
     ok_count = 0
     fail_count = 0
-    pending: list = []
     try:
-        # create_paymentin_for_payment упирается в ms_demand.is_ready() —
-        # без org_meta МС-payload собрать не из чего, платёж копится в failed.
-        # В bot-процессе контекст инициализирует bot.main(); cron-сервис
-        # запускается отдельным контейнером, поэтому делаем это сами.
-        if not is_ready():
-            try:
-                await init_demand_context()
-            except Exception:
-                logger.exception("init_demand_context упал — ретрай платежей будет провален")
-
-        pending = get_payments_needing_ms_sync(limit=limit)
-        if not pending:
-            logger.info("Нет платежей требующих повторной синхронизации.")
+        # init_demand_context() сам по себе НЕ raises (его helpers
+        # _pick_first/_ensure_custom_attribute глотают exception и
+        # возвращают None). Поэтому try/except здесь не нужен.
+        # Инспектируем dict-возврат — он содержит ready/org/store/attr*
+        # как bool. is_ready()-метод даёт только агрегат, а нам нужен
+        # точный диагноз partial-init в логах.
+        init_result = await init_demand_context()
+        if not init_result.get("ready"):
+            # МС недоступен/токен ротируется. ВАЖНО: не входить в цикл —
+            # иначе каждый create_paymentin_for_payment сделает claim+set_failed
+            # и перезапишет реальную ms_sync_error (типа "429" или
+            # "currency not found") на бесполезное "Контекст ms_demand не готов".
+            logger.error(
+                "init_demand_context не дошёл: %s — пропускаю %d платежей до следующего тика",
+                init_result,
+                len(pending),
+            )
             return 0
-
-        logger.info("Найдено %d платежей для синхронизации", len(pending))
 
         for p in pending:
             pid = p["id"]
@@ -88,19 +110,17 @@ async def main(limit: int) -> int:
                     result.get("reason"),
                 )
     finally:
-        # aiohttp-сессии (МС + Telegram-notify) держим закрытыми во ВСЕХ
-        # ветках, иначе на noop-прогоне (нет платежей) словим
-        # "Unclosed client session" — init_demand_context уже сходил в МС.
+        # aiohttp-сессии (МС + Telegram-notify) — закрываем во всех ветках,
+        # включая early-return при init failure (init уже мог открыть сессию).
         await close_session()
         await close_tg_session()
 
-    if pending:
-        logger.info(
-            "ms_sync_retry: успешно %d, провалено %d из %d",
-            ok_count,
-            fail_count,
-            len(pending),
-        )
+    logger.info(
+        "ms_sync_retry: успешно %d, провалено %d из %d",
+        ok_count,
+        fail_count,
+        len(pending),
+    )
     # Возвращаем 0 даже если есть failed — это «нормальное» состояние,
     # cron-job не должен помечать себя как сбоившийся; настоящий сбой
     # (например, no DATABASE_URL) поймает try/except в asyncio.run.

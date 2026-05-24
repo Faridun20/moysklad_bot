@@ -5,7 +5,7 @@
 import os
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import contextmanager
 from typing import Any
 
@@ -2497,6 +2497,55 @@ def get_recent_ms_sync_failures(limit: int = 5) -> list[dict]:
             (limit,),
         )
         return [dict(r) for r in cur.fetchall()]
+
+
+def reset_stale_in_progress_payments(older_than_minutes: int = 30) -> int:
+    """Сбросить ms_sync_status='in_progress' у платежей, застрявших дольше N минут.
+
+    Защита от orphan'ов: claim_payment_for_ms_sync ставит 'in_progress'
+    ДО HTTP-POST в МойСклад. Если процесс убили mid-claim (Railway SIGTERM,
+    OOM, увеличенное окно из-за init_demand_context), строка навсегда
+    залипает — claim-UPDATE отвергает 'in_progress', retry никогда её не
+    возьмёт.
+
+    Вызывается из tasks/run_ms_sync_retry.main() в самом начале, до
+    основной логики. Возвращает количество сброшенных строк.
+
+    Порог по confirmed_at (а не отдельной колонке ms_sync_claimed_at) —
+    достаточно точный для текущей нагрузки: легальный sync укладывается
+    в секунды, 30+ минут — гарантированно orphan. Дополнительная колонка
+    потребовала бы миграции и пока не оправдана.
+
+    Порог вычисляем в Python через тот же `now_str()` (local TZ через
+    `datetime.now()`), что и при записи `confirmed_at` — иначе бы
+    SQLite/Postgres-side функции `datetime('now',...)`/`NOW()` вернули
+    UTC, и сравнение строк в разных TZ всегда было бы False (тихий баг).
+    """
+    threshold = (datetime.now() - timedelta(minutes=older_than_minutes)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "UPDATE payments "
+                "SET ms_sync_status = NULL "
+                "WHERE ms_sync_status = 'in_progress' "
+                "  AND ms_paymentin_id IS NULL "
+                "  AND confirmed_at < ?"
+            ),
+            (threshold,),
+        )
+        reset = cur.rowcount or 0
+        conn.commit()
+    if reset > 0:
+        logger.warning(
+            "reset_stale_in_progress_payments: сброшено %d orphan-строк "
+            "(старше %d мин)",
+            reset,
+            older_than_minutes,
+        )
+    return reset
 
 
 def claim_payment_for_ms_sync(payment_id: int) -> bool:
