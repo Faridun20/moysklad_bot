@@ -47,7 +47,11 @@ except ImportError:
         val = os.environ.get(key, "")
         result = [int(x.strip()) for x in val.split(",") if x.strip().isdigit()]
         if not result and key in ("ADMIN_IDS", "BOSS_IDS"):
-            _logger.warning("%s не задан — соответствующая роль не настроена", key)
+            # «config:» префикс сохраняем в message — root-logger в момент
+            # импорта ещё не configured, format может быть голым `%(message)s`
+            # (через lastResort). Префикс делает строку грепабельной по
+            # `config:` в Railway logs независимо от форматтера.
+            _logger.warning("config: %s не задан — соответствующая роль не настроена", key)
         return result
 
     ALLOWED_USERS = _parse_ids("ALLOWED_USERS")

@@ -275,7 +275,18 @@ def _ms_ttl_cache(ttl: float, name: str = ""):
                 entry = cache.get(key)
                 if entry is not None and time.monotonic() - entry[0] < ttl:
                     return entry[1]
-                result = await fn(*args, **kwargs)
+                try:
+                    result = await fn(*args, **kwargs)
+                except BaseException:
+                    # При исключении (включая CancelledError) cache[key]
+                    # не пишется → cache не растёт → stale-prune (gate'нут
+                    # на len(cache)>200) никогда не сработает → locks[key]
+                    # утечёт навсегда. Чистим явно перед re-raise. Для
+                    # high-cardinality persistently-failing ключей (например,
+                    # удалённых demand_id из старой истории аналитики)
+                    # это закрывает unbounded memory growth.
+                    locks.pop(key, None)
+                    raise
                 cache[key] = (time.monotonic(), result)
                 # Ленивая чистка: если ключей больше 200, выкидываем
                 # все протухшие. Для нашего usage'а (4 периода × роли)
@@ -288,7 +299,16 @@ def _ms_ttl_cache(ttl: float, name: str = ""):
                         locks.pop(k, None)
                 return result
 
-        wrapper.cache_clear = lambda: (cache.clear(), locks.clear())
+        # ВАЖНО: clear НЕ трогает locks. Иначе invalidate_ms_cache() из
+        # MS-webhook'а может race'ить с in-flight winner'ом: winner держит
+        # local-var lock + делает await ms_get, мы из webhook'а делаем
+        # locks.clear() — следующий caller для того же ключа создаёт
+        # СВЕЖИЙ lock и запускает СВОЙ HTTP параллельно с winner'ом.
+        # Inflight-coalescing нарушен. Trade-off: stale locks сидят в dict
+        # до следующего stale-prune (gated на len(cache)>200) — безвредно,
+        # любая повторная попытка для того же ключа просто пройдёт через
+        # пустой lock мгновенно.
+        wrapper.cache_clear = lambda: cache.clear()
         return wrapper
 
     return decorator
@@ -451,25 +471,65 @@ async def get_shipment(demand_id: str) -> dict | None:
 
 # Параллельно тянем позиции 15+ отгрузок (asyncio.gather в get_sales_stats /
 # get_employee_stats). Без семафора это залп 15 одновременных запросов,
-# который стабильно бьёт 429-rate-limit МС → ретраи 0.5/1.0/2.0с цепочкой и
-# заметная latency у /api/analytics. Семафор на cache-miss держит ≤4
-# конкурентных HTTP. Кэш-хит сюда не доходит (декоратор отдаёт до тела).
-_POSITIONS_CONCURRENCY = asyncio.Semaphore(4)
+# стабильно бьющий 429-rate-limit МС → retry-chain 0.5/1.0/2.0с цепочкой и
+# заметная latency у /api/analytics. Семафор держит ≤8 конкурентных HTTP
+# (Connector limit=20 выдержит; МС rate ~45req/s). На холодном кэше с 30
+# fan-out: ceil(30/8)*RTT ≈ 800мс — приемлемо. Кэш-хит сюда не доходит
+# (декоратор отдаёт до тела).
+#
+# Lazy-init по loop-id: модульный Semaphore() лениво-binds к first loop
+# при contention; короткоживущие asyncio.run() в CLI + per-test loops в
+# pytest могут привести к "bound to a different event loop" если waiter
+# когда-нибудь enqueued. Helper отдаёт свежий семафор для каждого loop'а,
+# проблему обходит начисто (precedent — _session_lock — пока пронесло).
+_POSITIONS_SEM_BY_LOOP: dict[int, asyncio.Semaphore] = {}
+_POSITIONS_CONCURRENCY_LIMIT = 8
+
+
+def _get_positions_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _POSITIONS_SEM_BY_LOOP.get(id(loop))
+    if sem is None:
+        sem = asyncio.Semaphore(_POSITIONS_CONCURRENCY_LIMIT)
+        _POSITIONS_SEM_BY_LOOP[id(loop)] = sem
+    return sem
 
 
 @_ms_ttl_cache(ttl=3600.0, name="get_shipment_positions")
 async def get_shipment_positions(demand_id: str) -> list[dict]:
-    """Получить позиции (товары) конкретной отгрузки.
+    """Получить ВСЕ позиции (товары) конкретной отгрузки.
 
     Позиции demand-документа неизменяемы после создания, поэтому кэш
     на час безопасен. До этого 15+ позиций отгрузки запрашивались на
-    каждое открытие «Аналитики» — теперь только один раз за demand."""
-    async with _POSITIONS_CONCURRENCY:
-        data = await ms_get(
-            f"entity/demand/{demand_id}/positions",
-            params={"limit": 100, "expand": "assortment,uom"},
-        )
-    return data if isinstance(data, list) else data.get("rows", [])
+    каждое открытие «Аналитики» — теперь только один раз за demand.
+
+    Пагинация: МС /positions возвращает максимум 100 строк за запрос.
+    До пагинации demand'ы с >100 line items (крупные B2B-заказы) молча
+    теряли хвост → top_products в аналитике врал. Loop offset+=100
+    собирает все страницы. Семафор acquire'ится на каждую страницу
+    (а не на весь demand) — это правильно: для больших demand'ов
+    нагрузка размывается равномерно по rate-limit.
+    """
+    rows: list[dict] = []
+    offset = 0
+    page_limit = 100
+    sem = _get_positions_semaphore()
+    while True:
+        async with sem:
+            data = await ms_get(
+                f"entity/demand/{demand_id}/positions",
+                params={
+                    "limit": page_limit,
+                    "offset": offset,
+                    "expand": "assortment,uom",
+                },
+            )
+        chunk = data if isinstance(data, list) else data.get("rows", [])
+        rows.extend(chunk)
+        if len(chunk) < page_limit:
+            break
+        offset += page_limit
+    return rows
 
 
 @_ms_ttl_cache(ttl=60.0, name="get_sales_stats")
