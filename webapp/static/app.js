@@ -1576,20 +1576,48 @@ function renderAnalyticsContent(data) {
     </div>
   `).join('');
 
+  const medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'];
   const topItems = data.top_products.length === 0
     ? '<div class="loader">Нет данных</div>'
     : data.top_products.map((p, i) => {
-        const medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'];
+        // PR D: прибыль по товару (если задана себестоимость) — boss/admin.
+        const profitStr = (p.margin_known && p.profit != null)
+          ? ` · <span class="top-profit">прибыль ${fmt(p.profit)} $</span>` : '';
         return `
           <div class="top-row">
             <span class="top-medal">${medals[i] || (i + 1)}</span>
             <div class="top-info">
-              <div class="top-name">${p.name}</div>
-              <div class="top-sub">${fmt(p.qty)} шт · ${fmt(p.sum)} $</div>
+              <div class="top-name">${escapeHtml(p.name)}</div>
+              <div class="top-sub">${fmt(p.qty)} шт · ${fmt(p.sum)} $${profitStr}</div>
             </div>
           </div>
         `;
       }).join('');
+
+  // PR D: топ клиентов / менеджеров (company-scope, boss/admin).
+  const clientItems = (data.top_clients || []).map((c, i) => `
+    <div class="top-row">
+      <span class="top-medal">${medals[i] || (i + 1)}</span>
+      <div class="top-info">
+        <div class="top-name">${escapeHtml(c.name)}</div>
+        <div class="top-sub">${fmt(c.revenue)} $ · ${c.count} отгр.</div>
+      </div>
+    </div>`).join('');
+  const managerItems = (data.top_managers || []).map((m, i) => `
+    <div class="top-row">
+      <span class="top-medal">${medals[i] || (i + 1)}</span>
+      <div class="top-info">
+        <div class="top-name">${escapeHtml(m.name)}</div>
+        <div class="top-sub">${fmt(m.revenue)} $ · ${m.count} отгр.</div>
+      </div>
+    </div>`).join('');
+  const clientsBlock = clientItems
+    ? `<div class="section-label">Топ клиентов</div><div class="card">${clientItems}</div>` : '';
+  const managersBlock = managerItems
+    ? `<div class="section-label">Топ менеджеров</div><div class="card">${managerItems}</div>` : '';
+  // Кнопка Excel — только company-scope (boss/admin).
+  const exportBlock = data.scope === 'company'
+    ? `<button class="btn-primary" id="analytics-export" style="margin-top:12px">📊 Выгрузить Excel</button>` : '';
 
   content.innerHTML = `
     <div class="section-label">Период</div>
@@ -1620,7 +1648,28 @@ function renderAnalyticsContent(data) {
 
     <div class="section-label">Топ товаров</div>
     <div class="card">${topItems}</div>
+    ${clientsBlock}
+    ${managersBlock}
+    ${exportBlock}
   `;
+
+  const exportBtn = document.getElementById('analytics-export');
+  if (exportBtn) {
+    exportBtn.addEventListener('click', async () => {
+      haptic('light');
+      exportBtn.disabled = true;
+      exportBtn.textContent = '⏳ Готовлю файл…';
+      try {
+        await api('/api/analytics/export', { period: analyticsPeriod });
+        exportBtn.textContent = '✅ Отправлено в чат';
+        tg.showAlert && tg.showAlert('Excel-файл отправлен в чат с ботом');
+      } catch (e) {
+        exportBtn.disabled = false;
+        exportBtn.textContent = '📊 Выгрузить Excel';
+        tg.showAlert ? tg.showAlert(e.message) : alert(e.message);
+      }
+    });
+  }
 
   // Bars animate from 0 → target after paint
   requestAnimationFrame(() => requestAnimationFrame(() => {
