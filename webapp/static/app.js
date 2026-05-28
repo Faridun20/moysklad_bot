@@ -3,6 +3,29 @@ const tg = window.Telegram.WebApp;
 tg.ready();
 tg.expand();
 
+// ─── Интеграция темы Telegram (PR E) ────────────────────────────────
+// CSS уже использует var(--tg-theme-*), но JS-сторона раньше не
+// синхронизировала header/background и не реагировала на смену темы.
+// Без этого хедер Telegram (нативный) не совпадал с фоном WebApp,
+// а переключение light↔dark на лету не подхватывалось.
+function applyTelegramTheme() {
+  try {
+    // colorScheme → класс на <html> для тёмо-специфичных CSS-правок.
+    const scheme = tg.colorScheme || 'light';
+    document.documentElement.setAttribute('data-theme', scheme);
+    // Хедер и фон WebApp = secondary_bg (наш --bg-page). Методы есть
+    // не во всех версиях клиента — оборачиваем в try.
+    if (tg.setHeaderColor) tg.setHeaderColor('secondary_bg_color');
+    if (tg.setBackgroundColor) {
+      const bg = (tg.themeParams && tg.themeParams.secondary_bg_color) || '#f2f2f7';
+      tg.setBackgroundColor(bg);
+    }
+  } catch (_e) { /* старый клиент без theme API — CSS-fallback'и справятся */ }
+}
+applyTelegramTheme();
+// Пользователь сменил тему системы/Telegram, пока WebApp открыт.
+tg.onEvent && tg.onEvent('themeChanged', applyTelegramTheme);
+
 // initData живёт в URL-хэше — теряется при reload/навигации.
 // Кэшируем в sessionStorage: переживает SPA-переходы, но не закрытие вкладки.
 // Данные всё равно проверяются подписью + auth_date на сервере.
@@ -98,7 +121,20 @@ function renderHeader() {
 }
 
 function showError(msg) {
-  document.getElementById('content').innerHTML = `<div class="error">${msg}</div>`;
+  document.getElementById('content').innerHTML = errorBox(msg);
+}
+
+// PR E: единый error-блок с кнопкой «Повторить». Раньше экраны при сбое
+// показывали голый текст без способа повторить (кроме ре-навигации).
+// Retry перезагружает текущий экран через showScreen(currentScreen).
+function errorBox(msg) {
+  return `
+    <div class="error-card">
+      <div class="error-icon">⚠️</div>
+      <div class="error-title">Не удалось загрузить</div>
+      <div class="error-body">${escapeHtml(msg)}</div>
+      <button class="btn-primary" onclick="showScreen(currentScreen)">Повторить</button>
+    </div>`;
 }
 
 // ─── Навигация ──────────────────────────────────────
@@ -164,7 +200,7 @@ async function showScreen(screen) {
     }
   } catch (e) {
     // Если render упал — показываем ошибку, а не оставляем старый контент
-    content.innerHTML = `<div class="error">❌ ${e.message || e}</div>`;
+    content.innerHTML = errorBox(e.message || String(e));
   }
 }
 
@@ -220,7 +256,7 @@ async function renderHome() {
     }
     data = await r.json();
   } catch (e) {
-    content.innerHTML = `<div class="error">❌ ${e.message}</div>`;
+    content.innerHTML = errorBox(e.message);
     return;
   }
 
@@ -413,7 +449,7 @@ async function renderStock() {
       }
       stockData = await r.json();
     } catch (e) {
-      content.innerHTML = `<div class="error">❌ ${e.message}</div>`;
+      content.innerHTML = errorBox(e.message);
       return;
     }
   }
@@ -702,7 +738,7 @@ async function runSearch(query) {
   try {
     data = await api('/api/search', { query });
   } catch (e) {
-    box.innerHTML = `<div class="error">❌ ${escapeHtml(e.message)}</div>`;
+    box.innerHTML = errorBox(e.message);
     return;
   }
   // Гонка: пока ждали ответ, пользователь мог стереть/сменить запрос.
@@ -742,7 +778,7 @@ async function renderOrders() {
   try {
     ordersData = await api('/api/orders', {});
   } catch (e) {
-    content.innerHTML = `<div class="error">❌ ${e.message}</div>`;
+    content.innerHTML = errorBox(e.message);
     return;
   }
   renderOrdersMain();
@@ -947,7 +983,7 @@ async function openOrderEditor(orderId) {
       const result = await api('/api/orders/create', {});
       orderId = result.order_id;
     } catch (e) {
-      content.innerHTML = `<div class="error">❌ ${e.message}</div>`;
+      content.innerHTML = errorBox(e.message);
       return;
     }
   }
@@ -1156,7 +1192,7 @@ async function loadAgents(search) {
       });
     });
   } catch (e) {
-    list.innerHTML = `<div class="error">❌ ${e.message}</div>`;
+    list.innerHTML = errorBox(e.message);
   }
 }
 
@@ -1186,7 +1222,7 @@ async function openProductPicker() {
       const data = await api('/api/stock', {});
       orderStockCache = data;
     } catch (e) {
-      document.getElementById('prod-list').innerHTML = `<div class="error">❌ ${e.message}</div>`;
+      document.getElementById('prod-list').innerHTML = errorBox(e.message);
       return;
     }
   }
@@ -1491,7 +1527,7 @@ async function renderPendingRequests() {
       btn.addEventListener('click', () => handleRequest(btn.dataset.req, 'reject'))
     );
   } catch (e) {
-    content.innerHTML = `<div class="error">❌ ${e.message}</div>`;
+    content.innerHTML = errorBox(e.message);
   }
 }
 
@@ -1544,7 +1580,7 @@ async function renderAnalytics() {
     analyticsCache[analyticsPeriod] = { ts: Date.now(), data };
     renderAnalyticsContent(data);
   } catch (e) {
-    content.innerHTML = `<div class="error">❌ ${e.message}</div>`;
+    content.innerHTML = errorBox(e.message);
   }
 }
 
@@ -1707,7 +1743,7 @@ async function renderPayments(container) {
     }
     paymentsCache = await response.json();
   } catch (e) {
-    container.innerHTML = `<div class="error">❌ ${e.message}</div>`;
+    container.innerHTML = errorBox(e.message);
     return;
   }
 
@@ -2169,7 +2205,7 @@ async function renderCreditLimits(container) {
     const data = await api('/api/credit/overview', {});
     agents = data.agents || [];
   } catch (e) {
-    container.innerHTML = `<div class="error">❌ ${e.message}</div>`;
+    container.innerHTML = errorBox(e.message);
     return;
   }
 
@@ -2507,7 +2543,7 @@ async function renderDebts(container) {
       });
     });
   } catch (e) {
-    container.innerHTML = `<div class="error">❌ ${e.message || e}</div>`;
+    container.innerHTML = errorBox(e.message || String(e));
   }
 }
 
