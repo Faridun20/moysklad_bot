@@ -26,6 +26,42 @@
   --radius:     16px;
   --radius-lg:  20px;
   --shadow-card: 0 1px 2px rgba(0,0,0,0.04);
+
+  /* Семантические цвета (статусы, бейджи, деньги, тренды).
+     Светлые значения = прежние hex; тёмные варианты — в блоке
+     [data-theme="dark"] ниже. Раньше эти цвета были захардкожены
+     по всему файлу и не читались на тёмной теме Telegram. */
+  --success:     #1e8e3e;             /* зелёный текст/акцент */
+  --success-bg:  #d1f5e0;             /* мягкая подложка бейджа */
+  --danger:      #c5221f;             /* красный текст/акцент */
+  --danger-bg:   #fde3e3;
+  --warn:        #6f4a06;             /* тёмный текст на --warn-bg (бейджи) */
+  --warn-strong: #f9a825;             /* яркий янтарный акцент (цифры, полоски) */
+  --warn-bg:     #fff1ce;
+  --info:        #1e5da0;             /* синий текст/акцент */
+  --info-bg:     #d6ebff;
+  --neutral:     #4f4f4f;             /* серый текст бейджа «черновик» */
+  --neutral-bg:  #ebebeb;
+}
+
+/* Тёмная тема Telegram (data-theme выставляет applyTelegramTheme в app.js).
+   Базовые поверхности тянутся из var(--tg-theme-*), а семантические цвета
+   переопределяем здесь: яркие читаемые foreground'ы + полупрозрачные
+   подложки, чтобы бейджи/статусы не «резали глаз» светлыми пятнами. */
+[data-theme="dark"] {
+  --bg-soft:     rgba(255, 255, 255, 0.08);
+  --divider:     rgba(255, 255, 255, 0.12);
+  --success:     #4ade80;
+  --success-bg:  rgba(74, 222, 128, 0.16);
+  --danger:      #ff6b6b;
+  --danger-bg:   rgba(255, 107, 107, 0.16);
+  --warn:        #f5c451;
+  --warn-strong: #f9b542;
+  --warn-bg:     rgba(249, 168, 37, 0.16);
+  --info:        #5aa9f0;
+  --info-bg:     rgba(90, 169, 240, 0.16);
+  --neutral:     #c2c2c8;
+  --neutral-bg:  rgba(255, 255, 255, 0.12);
 }
 
 /* Утилита: скрыть элемент без инлайн-стилей в JS. */
@@ -45,7 +81,9 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 100vh;
-  padding-bottom: 84px;
+  min-height: 100dvh;   /* не прыгает при появлении/скрытии адрес-бара */
+  /* запас под плавающее нижнее меню + safe-area (home-indicator/чёлка) */
+  padding-bottom: calc(84px + env(safe-area-inset-bottom));
 }
 
 /* ─── Topbar ──────────────────────────────────────────────────── */
@@ -249,8 +287,8 @@ body {
 .icon-shipped  { background: rgba(30,93,160,0.12);  }
 
 /* ─── Цвета значений в стат-картах ──────────────────────── */
-.stat-value-green { color: #2e7d32; }
-.stat-value-amber { color: #f9a825; }
+.stat-value-green { color: var(--success); }
+.stat-value-amber { color: var(--warn-strong); }
 
 /* ─── Card ────────────────────────────────────────────────────── */
 .card {
@@ -360,7 +398,8 @@ body {
 /* ─── Bottom nav (плавающие табы) ─────────────────────────────── */
 .bottom-nav {
   position: fixed;
-  bottom: 12px;
+  /* поднимаем над home-indicator на телефонах с жестовой навигацией */
+  bottom: calc(12px + env(safe-area-inset-bottom));
   left: 12px;
   right: 12px;
   display: grid;
@@ -376,13 +415,15 @@ body {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 2px;
+  justify-content: center;
+  gap: 3px;
   background: none;
   border: none;
   color: var(--text-mute);
   font-size: 10px;
   cursor: pointer;
-  padding: 6px 4px;
+  padding: 8px 4px;
+  min-height: 48px;       /* комфортная зона тапа на телефоне */
   border-radius: 16px;
   transition: background 0.15s ease, color 0.15s ease;
 }
@@ -400,8 +441,8 @@ body {
 
 /* ─── Error & status ──────────────────────────────────────────── */
 .error {
-  background: #fde3e3;
-  color: #a02323;
+  background: var(--danger-bg);
+  color: var(--danger);
   padding: 14px 16px;
   border-radius: var(--radius);
   margin: 16px 0;
@@ -422,8 +463,8 @@ body {
 .error-card .btn-primary { margin-top: 8px; max-width: 200px; }
 
 .warn-card {
-  background: #fff4d6;
-  color: #6f4a06;
+  background: var(--warn-bg);
+  color: var(--warn);
   border-radius: var(--radius);
   padding: 12px 14px;
   margin-bottom: 8px;
@@ -442,7 +483,8 @@ body {
 }
 
 .sub-tab {
-  padding: 10px;
+  padding: 12px 10px;
+  min-height: 44px;
   background: transparent;
   border: none;
   border-radius: 10px;
@@ -551,13 +593,13 @@ body {
   margin-left: 8px;
 }
 
-.badge-green  { background: #d1f5e0; color: #056e22; }
-.badge-yellow { background: #fff1ce; color: #6f4a06; }
-.badge-red    { background: #fde3e3; color: #a02323; }
+.badge-green  { background: var(--success-bg); color: var(--success); }
+.badge-yellow { background: var(--warn-bg); color: var(--warn); }
+.badge-red    { background: var(--danger-bg); color: var(--danger); }
 
 /* ─── Аналитика ───────────────────────────────────────────────── */
-.trend-up { color: #056e22; }
-.trend-dn { color: #a02323; }
+.trend-up { color: var(--success); }
+.trend-dn { color: var(--danger); }
 
 .bar-row {
   display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
@@ -590,7 +632,7 @@ body {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .top-sub { font-size: 12px; color: var(--text-mute); margin-top: 2px; }
-.top-profit { color: #2e7d32; font-weight: 600; }
+.top-profit { color: var(--success); font-weight: 600; }
 
 /* ─── Формы ───────────────────────────────────────────────────── */
 .form-row { margin-bottom: 12px; }
@@ -699,8 +741,8 @@ body {
   margin-top: 10px; text-align: center;
   font-size: 13px; color: var(--text-mute);
 }
-.pay-status.pay-ok    { color: #056e22; }
-.pay-status.pay-error { color: #a02323; }
+.pay-status.pay-ok    { color: var(--success); }
+.pay-status.pay-error { color: var(--danger); }
 
 /* ─── Заказы (карточки) ──────────────────────────────────────── */
 .order-card {
@@ -711,11 +753,11 @@ body {
   border-left: 3px solid transparent;
 }
 
-.order-card--draft    { border-left-color: #8e8e93; }
-.order-card--pending  { border-left-color: #f9a825; }
-.order-card--approved { border-left-color: #2e7d32; }
-.order-card--rejected { border-left-color: #a02323; }
-.order-card--shipped  { border-left-color: #1e5da0; }
+.order-card--draft    { border-left-color: var(--text-mute); }
+.order-card--pending  { border-left-color: var(--warn-strong); }
+.order-card--approved { border-left-color: var(--success); }
+.order-card--rejected { border-left-color: var(--danger); }
+.order-card--shipped  { border-left-color: var(--info); }
 
 .order-header {
   display: flex; justify-content: space-between;
@@ -747,11 +789,11 @@ body {
   white-space: nowrap;
 }
 
-.status-draft    { background: #ebebeb; color: #4f4f4f; }
-.status-pending  { background: #fff1ce; color: #6f4a06; }
-.status-approved { background: #d1f5e0; color: #056e22; }
-.status-rejected { background: #fde3e3; color: #a02323; }
-.status-shipped  { background: #d6ebff; color: #1e5da0; }
+.status-draft    { background: var(--neutral-bg); color: var(--neutral); }
+.status-pending  { background: var(--warn-bg); color: var(--warn); }
+.status-approved { background: var(--success-bg); color: var(--success); }
+.status-rejected { background: var(--danger-bg); color: var(--danger); }
+.status-shipped  { background: var(--info-bg); color: var(--info); }
 
 .order-meta {
   display: flex; justify-content: space-between;
@@ -770,8 +812,8 @@ body {
 .requests-btn {
   width: 100%;
   padding: 12px;
-  background: #fff1ce;
-  color: #6f4a06;
+  background: var(--warn-bg);
+  color: var(--warn);
   border: none;
   border-radius: var(--radius);
   font-size: 14px;
@@ -786,14 +828,14 @@ body {
 
 .btn-approve {
   flex: 1; padding: 10px;
-  background: #d1f5e0; color: #056e22;
+  background: var(--success-bg); color: var(--success);
   border: none; border-radius: var(--radius-sm);
   font-size: 13px; font-weight: 600; cursor: pointer;
 }
 
 .btn-reject {
   flex: 1; padding: 10px;
-  background: #fde3e3; color: #a02323;
+  background: var(--danger-bg); color: var(--danger);
   border: none; border-radius: var(--radius-sm);
   font-size: 13px; font-weight: 600; cursor: pointer;
 }
@@ -819,7 +861,8 @@ body {
 
 .editor-header button {
   background: none; border: none;
-  font-size: 20px; cursor: pointer; padding: 4px;
+  font-size: 20px; cursor: pointer;
+  padding: 8px; min-width: 40px; min-height: 40px;
   color: var(--accent);
 }
 
@@ -872,7 +915,7 @@ body {
 .editor-item-del {
   background: none; border: none;
   font-size: 18px; cursor: pointer;
-  color: #a02323; padding: 4px 8px;
+  color: var(--danger); padding: 4px 8px;
 }
 
 .editor-empty {
@@ -898,7 +941,7 @@ body {
 
 .editor-footer {
   position: sticky;
-  bottom: 84px;
+  bottom: calc(84px + env(safe-area-inset-bottom));
   padding: 12px 0 0;
 }
 
@@ -1028,9 +1071,9 @@ body {
 .debt-stat-num { font-size: 24px; font-weight: 700; line-height: 1.1; }
 .debt-stat-label { font-size: 12px; color: var(--text-mute, #888); margin: 6px 0 4px; }
 .debt-stat-sum { font-size: 14px; font-weight: 600; }
-.debt-stat-overdue .debt-stat-num { color: #d93025; }
-.debt-stat-today .debt-stat-num   { color: #f9a825; }
-.debt-stat-upcoming .debt-stat-num{ color: #2481cc; }
+.debt-stat-overdue .debt-stat-num { color: var(--danger); }
+.debt-stat-today .debt-stat-num   { color: var(--warn-strong); }
+.debt-stat-upcoming .debt-stat-num{ color: var(--info); }
 
 .debts-list {
   padding: 14px; display: flex; flex-direction: column; gap: 10px;
@@ -1039,9 +1082,9 @@ body {
   padding: 14px; border-radius: 14px; border-left: 4px solid transparent;
   background: var(--bg-card, #f5f5f5);
 }
-.debt-card.debt-overdue   { border-left-color: #d93025; }
-.debt-card.debt-due_today { border-left-color: #f9a825; }
-.debt-card.debt-upcoming  { border-left-color: #2481cc; }
+.debt-card.debt-overdue   { border-left-color: var(--danger); }
+.debt-card.debt-due_today { border-left-color: var(--warn-strong); }
+.debt-card.debt-upcoming  { border-left-color: var(--info); }
 .debt-card-top {
   display: flex; justify-content: space-between; align-items: flex-start;
   gap: 10px; margin-bottom: 8px;
@@ -1091,8 +1134,8 @@ body {
   font-size: 15px; font-weight: 700; line-height: 1.25;
   word-break: break-word;
 }
-.money-received .money-value { color: #1e8e3e; }
-.money-pending  .money-value { color: #f9a825; }
+.money-received .money-value { color: var(--success); }
+.money-pending  .money-value { color: var(--warn-strong); }
 /* Бледный плейсхолдер для пустых сумм — вместо тонкой «—» */
 .money-placeholder {
   font-size: 13px; font-weight: 400; opacity: 0.55;
@@ -1127,8 +1170,8 @@ body {
 }
 
 /* ─── Awaiting + actions ─────────────────────────────────────── */
-.section-awaiting { color: #f9a825 !important; font-weight: 700; }
-.debt-awaiting { border-left-color: #f9a825 !important; }
+.section-awaiting { color: var(--warn-strong) !important; font-weight: 700; }
+.debt-awaiting { border-left-color: var(--warn-strong) !important; }
 .debt-actions {
   display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
 }
@@ -1137,18 +1180,18 @@ body {
   font-size: 14px; font-weight: 600; cursor: pointer;
 }
 .btn-confirm-pay {
-  background: #1e8e3e; color: #fff;
+  background: var(--success); color: #fff;
 }
 .btn-reject-pay {
-  background: var(--bg, #fff);
-  color: #d93025;
-  border: 1px solid #d93025;
+  background: var(--bg-card);
+  color: var(--danger);
+  border: 1px solid var(--danger);
 }
 .btn-confirm-pay:disabled, .btn-reject-pay:disabled { opacity: 0.5; cursor: default; }
 .btn-edit-limit {
   grid-column: 1 / -1;
   padding: 10px; border: 1px solid var(--accent, #2c7be5); border-radius: 10px;
-  background: var(--bg, #fff); color: var(--accent, #2c7be5);
+  background: var(--bg-card); color: var(--accent, #2c7be5);
   font-size: 14px; font-weight: 600; cursor: pointer;
 }
 .limit-edit { margin-top: 8px; display: grid; gap: 8px; }
@@ -1207,7 +1250,7 @@ body {
 .debt-breakdown b { color: var(--text, #000); }
 
 /* Жёлтая полоска для partial-state */
-.debt-card.debt-partial { border-left-color: #f9a825; }
+.debt-card.debt-partial { border-left-color: var(--warn-strong); }
 
 /* ─── Skeleton loading ───────────────────────────────────────────── */
 @keyframes shimmer {
@@ -1254,8 +1297,8 @@ body {
 .draft-actions .btn-edit-order { flex: 1; }
 .btn-delete-draft {
   flex-shrink: 0; padding: 8px 14px;
-  background: transparent; border: 1px solid #d93025;
-  color: #d93025; border-radius: 10px;
+  background: transparent; border: 1px solid var(--danger);
+  color: var(--danger); border-radius: 10px;
   font-size: 13px; font-weight: 600; cursor: pointer;
 }
 .btn-delete-draft:disabled { opacity: 0.5; cursor: default; }
@@ -1270,9 +1313,9 @@ body {
   background: var(--bg-soft);
   border: none;
   border-radius: 50%;
-  width: 34px;
-  height: 34px;
-  font-size: 16px;
+  width: 40px;
+  height: 40px;
+  font-size: 18px;
   cursor: pointer;
   color: var(--text);
   display: flex;
@@ -1382,3 +1425,36 @@ body {
   margin-top: 8px;
 }
 .price-actions button { flex: 1; }
+
+/* ─── Тосты (лёгкая неблокирующая обратная связь) ─────────────── */
+.toast-host {
+  position: fixed;
+  left: 0; right: 0;
+  bottom: calc(96px + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 0 16px;
+  z-index: 200;
+  pointer-events: none;   /* не перехватывает тапы под собой */
+}
+.toast {
+  max-width: 92%;
+  padding: 11px 16px;
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 500;
+  box-shadow: 0 6px 24px rgba(0,0,0,0.18);
+  border: 1px solid var(--divider);
+  border-left-width: 3px;
+  animation: toastIn 0.2s ease both;
+}
+.toast--success { border-left-color: var(--success); }
+.toast--error   { border-left-color: var(--danger); }
+.toast--info    { border-left-color: var(--info); }
+.toast--out     { animation: toastOut 0.25s ease forwards; }
+@keyframes toastIn  { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes toastOut { to { opacity: 0; transform: translateY(12px); } }
