@@ -2037,6 +2037,7 @@ function initNav() {
 
 let financeTab = 'debts';  // 'debts' | 'payments'
 let debtsFilter = 'all';   // 'all' | 'today'
+let cashboxSubTab = null;  // 'confirm' | 'ops' | 'my' — дефолт зависит от роли
 
 async function renderFinance() {
   const content = document.getElementById('content');
@@ -2194,9 +2195,49 @@ async function renderCashbox(container) {
       </div>
   ` : '';
 
-  const confirmBlocks = depBlock + retBlock;
-  container.innerHTML = createBlock + returnBlock + myBlock + confirmBlocks
-    || '<div class="loader">Нет записей на подтверждении</div>';
+  // Раньше всё стояло одним длинным экраном (формы → история → подтверждения
+  // в самом низу). Разносим по под-вкладкам, чтобы срочные подтверждения были
+  // сразу, а не за тремя формами. Набор вкладок зависит от роли.
+  const isConfirmer = ['admin', 'boss', 'bookkeeper', 'warehouse_keeper'].includes(role);
+  const canCreateDeposit = myDeposits !== null;
+  const hasOps = canCreateDeposit || canReturn;
+
+  const tabs = [];
+  if (isConfirmer) {
+    const pendN = deposits.length + returns.length;
+    tabs.push({ key: 'confirm', label: `✅ Подтверждения${pendN ? ` (${pendN})` : ''}` });
+  }
+  if (hasOps) tabs.push({ key: 'ops', label: '➕ Операции' });
+  if (canCreateDeposit) tabs.push({ key: 'my', label: '📋 Мои сдачи' });
+
+  if (!tabs.find(t => t.key === cashboxSubTab)) {
+    cashboxSubTab = tabs.length ? tabs[0].key : 'confirm';
+  }
+
+  const tabBar = tabs.length > 1
+    ? `<div class="finance-tabs cashbox-tabs">${tabs.map(t =>
+        `<button class="finance-tab ${t.key === cashboxSubTab ? 'active' : ''}" data-ctab="${t.key}">${t.label}</button>`
+      ).join('')}</div>`
+    : '';
+
+  let bodyHtml;
+  if (cashboxSubTab === 'ops') {
+    bodyHtml = (createBlock + returnBlock) || '<div class="loader">Нет доступных операций</div>';
+  } else if (cashboxSubTab === 'my') {
+    bodyHtml = myBlock || '<div class="loader">У вас пока нет сдач</div>';
+  } else {
+    bodyHtml = (depBlock + retBlock) || '<div class="loader">Нет записей на подтверждении</div>';
+  }
+  container.innerHTML = tabBar + bodyHtml;
+
+  // Переключение под-вкладок кассы (контент в том же контейнере).
+  container.querySelectorAll('[data-ctab]').forEach(t => {
+    t.addEventListener('click', () => {
+      haptic('light');
+      cashboxSubTab = t.dataset.ctab;
+      renderCashbox(container);
+    });
+  });
 
   // Оформление возврата.
   let selectedRefund = 'debt_reduction';

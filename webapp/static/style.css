@@ -1216,6 +1216,12 @@ body {
   background: var(--accent, #2481cc);
   color: #fff;
 }
+/* Вложенный ряд под-вкладок кассы: чуть компактнее и без переноса. */
+.cashbox-tabs { padding-top: 4px; }
+.cashbox-tabs .finance-tab {
+  padding: 10px 6px; font-size: 13px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 
 /* ─── Partial-оплата (input + кнопка в ряд) ────────────────────── */
 .pay-input-row {

@@ -34,9 +34,31 @@ router = Router()
 
 
 class PaymentState(StatesGroup):
-    waiting_for_amount = State()
+    waiting_for_input = State()
     waiting_for_currency = State()
-    waiting_for_comment = State()
+
+
+def _parse_payment_input(text: str) -> tuple[float | None, str | None, str]:
+    """Парсит «1500 USD за аренду» → (amount, currency|None, comment).
+
+    amount=None, если первое слово не положительное число. Валюта — опциональна
+    (распознаётся только как ровно одно из ALLOWED_CURRENCIES сразу после суммы),
+    остальное — комментарий."""
+    parts = (text or "").strip().split()
+    if not parts:
+        return None, None, ""
+    try:
+        amount = float(parts[0].replace(",", "."))
+        if amount <= 0:
+            return None, None, ""
+    except ValueError:
+        return None, None, ""
+    rest = parts[1:]
+    currency: str | None = None
+    if rest and rest[0].upper() in CURRENCIES:
+        currency = rest[0].upper()
+        rest = rest[1:]
+    return amount, currency, " ".join(rest).strip()
 
 
 def is_admin(user_id: int) -> bool:
@@ -52,6 +74,21 @@ def currency_keyboard():
         kb.button(text=cur, callback_data=f"pay_cur:{cur}")
     kb.button(text="❌ Отмена", callback_data="pay_cancel")
     kb.adjust(2, 2, 1)
+    return kb.as_markup()
+
+
+_PAY_PROMPT = (
+    f"{DIV}\n"
+    f"💵 <b>Отправка платежа</b>\n\n"
+    f"Напишите одним сообщением: <b>сумма валюта комментарий</b>\n"
+    f"<code>1500 USD за аренду</code>\n\n"
+    f"<i>Если не укажете валюту — спрошу кнопками. Комментарий можно опустить.</i>"
+)
+
+
+def _pay_cancel_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="❌ Отмена", callback_data="pay_cancel")
     return kb.as_markup()
 
 
@@ -82,14 +119,8 @@ async def cmd_pay(message: Message, state: FSMContext):
     if not _can_send_payment(message.from_user.id):
         return await message.answer("⛔ Платежи отправляют только менеджеры.")
     await state.clear()
-    await state.set_state(PaymentState.waiting_for_amount)
-    await message.answer(
-        f"{DIV}\n"
-        f"💵 <b>Отправка платежа</b>  ·  <i>Шаг 1/3</i>\n\n"
-        f"Введите сумму (только цифры):\n"
-        f"<code>1500</code>",
-        parse_mode="HTML",
-    )
+    await state.set_state(PaymentState.waiting_for_input)
+    await message.answer(_PAY_PROMPT, parse_mode="HTML", reply_markup=_pay_cancel_keyboard())
 
 
 @router.callback_query(F.data == "pay_start")
@@ -98,49 +129,51 @@ async def cb_pay_start(call: CallbackQuery, state: FSMContext):
         return await call.answer("⛔ Платежи отправляют только менеджеры", show_alert=True)
     await call.answer()
     await state.clear()
-    await state.set_state(PaymentState.waiting_for_amount)
-    await call.message.answer(
-        f"{DIV}\n"
-        f"💵 <b>Отправка платежа</b>  ·  <i>Шаг 1/3</i>\n\n"
-        f"Введите сумму (только цифры):\n"
-        f"<code>1500</code>",
-        parse_mode="HTML",
-    )
+    await state.set_state(PaymentState.waiting_for_input)
+    await call.message.answer(_PAY_PROMPT, parse_mode="HTML", reply_markup=_pay_cancel_keyboard())
 
 
-@router.message(PaymentState.waiting_for_amount)
-async def process_amount(message: Message, state: FSMContext):
-    text = message.text.strip().replace(",", ".").replace(" ", "")
-    try:
-        amount = float(text)
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
+@router.message(PaymentState.waiting_for_input)
+async def process_input(message: Message, state: FSMContext, bot: Bot):
+    amount, currency, comment = _parse_payment_input(message.text)
+    if amount is None:
         return await message.answer(
-            "❌ Введите корректную сумму, например: <code>1500</code>",
+            "❌ Не понял сумму. Начните с числа, например:\n"
+            "<code>1500 USD за аренду</code>",
             parse_mode="HTML",
         )
-    await state.update_data(amount=amount)
-    await state.set_state(PaymentState.waiting_for_currency)
-    await message.answer(
-        f"✅ Сумма: <b>{amount:,.0f}</b>  ·  <i>Шаг 2/3</i>\n\nВыберите валюту:",
-        parse_mode="HTML",
-        reply_markup=currency_keyboard(),
-    )
+    if currency is None:
+        await state.update_data(amount=amount, comment=comment)
+        await state.set_state(PaymentState.waiting_for_currency)
+        return await message.answer(
+            f"✅ Сумма: <b>{amount:,.0f}</b>\n\nВыберите валюту:",
+            parse_mode="HTML",
+            reply_markup=currency_keyboard(),
+        )
+    await state.clear()
+    await _finalize_payment(message, message.from_user, bot, amount, currency, comment)
 
 
 @router.callback_query(F.data.startswith("pay_cur:"), PaymentState.waiting_for_currency)
-async def process_currency(call: CallbackQuery, state: FSMContext):
+async def process_currency(call: CallbackQuery, state: FSMContext, bot: Bot):
     currency = call.data.split(":")[1]
-    await state.update_data(currency=currency)
-    await state.set_state(PaymentState.waiting_for_comment)
-    await call.message.edit_text(
-        f"✅ Валюта: <b>{currency}</b>  ·  <i>Шаг 3/3</i>\n\n"
-        f"📝 Напишите комментарий — за что переданы деньги?\n"
-        f"<code>за май, оплата аренды</code>",
-        parse_mode="HTML",
-    )
+    data = await state.get_data()
+    await state.clear()
     await call.answer()
+    try:
+        await call.message.edit_text(
+            f"✅ Валюта: <b>{currency}</b>", parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    await _finalize_payment(
+        call.message,
+        call.from_user,
+        bot,
+        data["amount"],
+        currency,
+        data.get("comment", ""),
+    )
 
 
 @router.callback_query(F.data == "pay_cancel")
@@ -150,15 +183,9 @@ async def pay_cancel(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@router.message(PaymentState.waiting_for_comment)
-async def process_comment(message: Message, state: FSMContext, bot: Bot):
-    comment = message.text.strip()
-    data = await state.get_data()
-    await state.clear()
-
-    amount = data["amount"]
-    currency = data["currency"]
-    user = message.from_user
+async def _finalize_payment(target: Message, user, bot: Bot, amount, currency, comment):
+    """Создаёт платёж, пишет аудит, шлёт подтверждение отправителю и нотифай боссу.
+    target — сообщение, в чат которого отвечаем; user — отправитель платежа."""
     full_name = user.full_name or user.username or str(user.id)
     username = f"@{user.username}" if user.username else "—"
 
@@ -171,7 +198,6 @@ async def process_comment(message: Message, state: FSMContext, bot: Bot):
         comment=comment,
     )
 
-    # Аудит лог
     await adb.add_audit_log(
         user.id,
         full_name,
@@ -180,11 +206,12 @@ async def process_comment(message: Message, state: FSMContext, bot: Bot):
         f"Платёж #{payment_id}: {amount:,.0f} {currency} — {comment}",
     )
 
-    await message.answer(
+    comment_line = f"<b>📝 Комментарий:</b> {_esc(comment)}\n" if comment else ""
+    await target.answer(
         f"{DIV}\n"
         f"✅ <b>Платёж отправлен!</b>\n\n"
         f"<b>💰 Сумма:</b> {amount:,.0f} {currency}\n"
-        f"<b>📝 Комментарий:</b> {comment}\n\n"
+        f"{comment_line}\n"
         f"<i>⏳ Ожидайте подтверждения</i>",
         parse_mode="HTML",
     )

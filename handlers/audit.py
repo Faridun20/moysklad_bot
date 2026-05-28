@@ -62,11 +62,25 @@ def audit_keyboard():
 # ─── Команды ─────────────────────────────────────────────────────────────────
 
 
+async def _render_audit_period(target: Message, period: str):
+    """Рисует записи за период + чипы переключения под ними (audit_keyboard)."""
+    label = PERIOD_LABELS.get(period, period)
+    records = await adb.get_audit_log(limit=200)
+    records = filter_by_period(records, period)
+
+    messages = format_audit_log(records, label)
+    for i, msg in enumerate(messages):
+        # Чипы крепим к последнему сообщению — без отдельного экрана выбора.
+        kb = audit_keyboard() if i == len(messages) - 1 else None
+        await target.answer(msg, parse_mode="HTML", reply_markup=kb)
+
+
 @router.message(Command("audit"))
 async def cmd_audit(message: Message):
     if not can_manage_users(message.from_user.id):
         return await message.answer("⛔ Нет доступа.")
-    await message.answer("📋 За какой период показать лог?", reply_markup=audit_keyboard())
+    # Сразу показываем сегодняшний лог; период переключается чипами под ним.
+    await _render_audit_period(message, "today")
 
 
 # ─── Callback ─────────────────────────────────────────────────────────────────
@@ -94,25 +108,7 @@ async def cb_audit(call: CallbackQuery):
         await call.message.answer("👤 Выберите сотрудника:", reply_markup=kb.as_markup())
         return
 
-    label = PERIOD_LABELS.get(period, period)
-    records = await adb.get_audit_log(limit=200)
-    records = filter_by_period(records, period)
-
-    messages = format_audit_log(records, label)
-    for msg in messages:
-        await call.message.answer(msg, parse_mode="HTML")
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Другой период", callback_data="audit_menu")
-    kb.button(text="🏠 Меню", callback_data="menu")
-    kb.adjust(1)
-    await call.message.answer("Выберите действие:", reply_markup=kb.as_markup())
-
-
-@router.callback_query(F.data == "audit_menu")
-async def cb_audit_menu(call: CallbackQuery):
-    await call.answer()
-    await call.message.answer("📋 За какой период показать лог?", reply_markup=audit_keyboard())
+    await _render_audit_period(call.message, period)
 
 
 @router.callback_query(F.data.startswith("alu:"))
