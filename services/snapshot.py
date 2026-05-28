@@ -321,6 +321,28 @@ def get_stock(folder_id: str | None = None, only_positive: bool = False) -> list
     return rows
 
 
+def get_low_stock(threshold: float = 5.0) -> list[dict]:
+    """Товары с низким ДОСТУПНЫМ остатком: (stock − reserve) ≤ threshold,
+    но в наличии (stock > 0). Сортировка по доступному (худшие сверху).
+
+    Доступный = stock − reserve: зарезервированное под заказы уже «занято»,
+    реально продать можно только свободное. Порог настраивается через
+    app_settings `low_stock_threshold`.
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "SELECT ms_id, name, folder_name, unit, stock, reserve "
+                "FROM ms_stock "
+                "WHERE (stock - reserve) <= ? AND stock > 0 "
+                "ORDER BY (stock - reserve) ASC, name"
+            ),
+            (threshold,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
 def get_categories() -> list[dict]:
     with get_conn() as conn:
         cur = get_cursor(conn)

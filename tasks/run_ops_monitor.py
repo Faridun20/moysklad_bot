@@ -117,6 +117,90 @@ def build_expiring_batches_block(batches: list[dict], days: int) -> str | None:
     return "\n".join(lines)
 
 
+def build_low_stock_block(rows: list[dict], threshold: float) -> str | None:
+    """Алерт о низком доступном остатке. rows из snapshot.get_low_stock."""
+    if not rows:
+        return None
+    lines = [f"📉 <b>Низкий остаток (≤{_fmt_amount(threshold)}): {len(rows)}</b>"]
+    for r in rows[:15]:
+        name = _esc(r.get("name") or "—")
+        avail = float(r.get("stock", 0) or 0) - float(r.get("reserve", 0) or 0)
+        unit = _esc(r.get("unit") or "шт")
+        lines.append(f"  • {name} · {_fmt_amount(avail)} {unit}")
+    if len(rows) > 15:
+        lines.append(f"  …и ещё {len(rows) - 15}")
+    return "\n".join(lines)
+
+
+def build_dead_stock_block(rows: list[dict], days: int) -> str | None:
+    """Алерт о «мёртвом» складе: в наличии, но не продавалось N дней.
+    rows — list[dict] с name/stock/unit (см. collect_dead_stock)."""
+    if not rows:
+        return None
+    lines = [f"🧊 <b>Не продаётся &gt;{days}д: {len(rows)}</b>"]
+    for r in rows[:15]:
+        name = _esc(r.get("name") or "—")
+        qty = _fmt_amount(float(r.get("stock", 0) or 0))
+        unit = _esc(r.get("unit") or "шт")
+        lines.append(f"  • {name} · остаток {qty} {unit}")
+    if len(rows) > 15:
+        lines.append(f"  …и ещё {len(rows) - 15}")
+    return "\n".join(lines)
+
+
+def diff_dead_stock(in_stock: list[dict], sold_names: set[str]) -> list[dict]:
+    """Чистая функция (тестируемая): из остатков убрать то, что продавалось.
+
+    Матч по нормализованному имени (lower/strip) — у нас нет product_id
+    в shipment positions, только assortment.name. Возвращает позиции
+    в наличии (stock>0), которых нет в sold_names.
+    """
+    sold_norm = {(s or "").strip().lower() for s in sold_names}
+    dead = []
+    for r in in_stock:
+        if float(r.get("stock", 0) or 0) <= 0:
+            continue
+        name_norm = (r.get("name") or "").strip().lower()
+        if name_norm and name_norm not in sold_norm:
+            dead.append(r)
+    return dead
+
+
+async def collect_dead_stock(days: int) -> list[dict]:
+    """Собрать «мёртвый» склад: остатки минус то, что продавалось за `days`.
+
+    Тяжёлая по МС-вызовам (shipments + positions) — вызывается только из
+    cron (1×/день). Имена проданных собираем из позиций отгрузок за период.
+    """
+    from datetime import timedelta
+
+    from services.moysklad import get_shipments, get_shipment_positions
+    from services.snapshot import get_stock
+    from utils.helpers import extract_id_from_href
+
+    since = datetime.now() - timedelta(days=days)
+    sold_names: set[str] = set()
+    try:
+        shipments = await get_shipments(since)
+    except Exception:
+        logger.exception("collect_dead_stock: get_shipments failed")
+        return []
+    for s in shipments:
+        demand_id = extract_id_from_href(s.get("meta", {}).get("href", ""))
+        if not demand_id:
+            continue
+        try:
+            positions = await get_shipment_positions(demand_id)
+        except Exception:
+            continue
+        for p in positions:
+            name = (p.get("assortment") or {}).get("name") or p.get("name")
+            if name:
+                sold_names.add(name)
+    in_stock = get_stock(only_positive=True)
+    return diff_dead_stock(in_stock, sold_names)
+
+
 def build_cron_health_block(stale_crons: list[dict]) -> str | None:
     """Алерт о cron'ах, которые не отчитались success'ом дольше порога.
 
@@ -169,12 +253,25 @@ async def main() -> int:
     stale_hours = int(get_setting("stale_pending_hours", 48))
     cash_days = int(get_setting("cash_deposit_escalation_days", 2))
     batch_days = 7
+    low_stock_threshold = float(get_setting("low_stock_threshold", 5))
+    dead_stock_days = int(get_setting("dead_stock_days", 90))
 
     stale = get_stale_pending_orders(hours=stale_hours)
     deposits = get_pending_cash_deposits()
     returns = get_pending_returns()
     overdue = get_overdue_undeposited_orders(days=cash_days)
     batches = get_batches_expiring_within(days=batch_days)
+
+    # Складские алерты. low-stock — дешёвый локальный SELECT. dead-stock —
+    # тяжёлый по МС (shipments+positions), но ops_monitor бежит 1×/день.
+    from services.snapshot import get_low_stock
+
+    low_stock = get_low_stock(low_stock_threshold)
+    try:
+        dead_stock = await collect_dead_stock(dead_stock_days)
+    except Exception:
+        logger.exception("collect_dead_stock failed — пропускаю dead-stock блок")
+        dead_stock = []
     # Cron health: проверяем что регулярные cron'ы реально отчитываются.
     # Пороги подобраны с большим запасом к реальному расписанию (`*/15` →
     # порог 1ч; ежедневный → 26ч). Если cron не запускался / упал —
@@ -196,13 +293,18 @@ async def main() -> int:
     b_ret = build_pending_returns_block(returns)
     b_over = build_overdue_undeposited_block(overdue, cash_days)
     b_batch = build_expiring_batches_block(batches, batch_days)
+    b_low = build_low_stock_block(low_stock, low_stock_threshold)
+    b_dead = build_dead_stock_block(dead_stock, dead_stock_days)
     b_cron = build_cron_health_block(stale_crons)
 
     boss_digest = assemble_digest(
-        "📋 <b>Операционная сводка</b>", [b_stale, b_dep, b_ret, b_over, b_batch, b_cron]
+        "📋 <b>Операционная сводка</b>",
+        [b_stale, b_dep, b_ret, b_over, b_batch, b_low, b_dead, b_cron],
     )
     bookkeeper_digest = assemble_digest("📋 <b>Сводка: финансы</b>", [b_dep])
-    warehouse_digest = assemble_digest("📋 <b>Сводка: склад</b>", [b_ret, b_batch])
+    warehouse_digest = assemble_digest(
+        "📋 <b>Сводка: склад</b>", [b_ret, b_batch, b_low, b_dead]
+    )
 
     users = get_all_users()
     sent = 0
@@ -220,12 +322,15 @@ async def main() -> int:
                 await tg_send_message(u["user_id"], digest)
                 sent += 1
         logger.info(
-            "ops_monitor: stale=%d deposits=%d returns=%d overdue=%d batches=%d crons_stale=%d → %d сообщений",
+            "ops_monitor: stale=%d deposits=%d returns=%d overdue=%d batches=%d "
+            "low_stock=%d dead_stock=%d crons_stale=%d → %d сообщений",
             len(stale),
             len(deposits),
             len(returns),
             len(overdue),
             len(batches),
+            len(low_stock),
+            len(dead_stock),
             len(stale_crons),
             sent,
         )
