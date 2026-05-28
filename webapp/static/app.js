@@ -445,6 +445,7 @@ function renderStockList() {
   const listEl = document.getElementById('stock-list');
   if (!listEl) return;
   const filtered = _stockFiltered();
+  const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
 
   listEl.innerHTML = filtered.length === 0
     ? `<div class="empty-state">
@@ -452,15 +453,36 @@ function renderStockList() {
         <div class="empty-state-title">Товары не найдены</div>
         <div class="empty-state-hint">Попробуйте изменить категорию или поисковый запрос</div>
       </div>`
-    : filtered.slice(0, 200).map(p => `
-        <div class="stock-row">
+    : filtered.slice(0, 200).map((p, i) => {
+        // PR C: цена продажи (минимум) — всем; себестоимость — только boss.
+        const priceLines = [];
+        if (p.sale_price != null) priceLines.push(`мин. ${p.sale_price}`);
+        if (isBoss && p.cost_price != null) priceLines.push(`себест. ${p.cost_price}`);
+        const priceHtml = priceLines.length
+          ? `<div class="stock-price">${escapeHtml(priceLines.join(' · '))}</div>` : '';
+        // Boss может тапнуть товар → редактор цен.
+        const editAttr = isBoss ? ` data-price-idx="${i}"` : '';
+        const editHint = isBoss ? '<span class="stock-edit-hint">✏️</span>' : '';
+        return `
+        <div class="stock-row"${editAttr}>
           <div class="stock-info">
             <div class="stock-name">${escapeHtml(p.name)}</div>
             <div class="stock-folder">${escapeHtml(p.folder_name || '—')} · ${p.unit}</div>
+            ${priceHtml}
           </div>
-          ${_stockBadge(p.stock)}
-        </div>
-      `).join('');
+          ${_stockBadge(p.stock)}${editHint}
+        </div>`;
+      }).join('');
+
+  // Boss: тап по строке → редактор цены. Индекс в отфильтрованном списке.
+  if (isBoss) {
+    listEl.querySelectorAll('[data-price-idx]').forEach(row => {
+      row.addEventListener('click', () => {
+        const p = filtered[parseInt(row.dataset.priceIdx, 10)];
+        if (p) openPriceEditor(p);
+      });
+    });
+  }
 
   const truncEl = document.getElementById('stock-trunc');
   if (truncEl) {
@@ -468,6 +490,56 @@ function renderStockList() {
       ? `<div class="loader">Показаны первые 200 из ${filtered.length}. Уточните фильтр.</div>`
       : '';
   }
+}
+
+// PR C: редактор цены товара (boss/admin). Overlay с двумя полями.
+function openPriceEditor(product) {
+  haptic('light');
+  const msId = (product.href || '').split('/').filter(Boolean).pop() || '';
+  if (!msId) { tg.showAlert && tg.showAlert('Нет ms_id у товара'); return; }
+  const ov = document.createElement('div');
+  ov.className = 'price-overlay';
+  ov.innerHTML = `
+    <div class="price-modal">
+      <div class="price-modal-title">${escapeHtml(product.name)}</div>
+      <label class="price-field">
+        <span>Цена продажи (минимум)</span>
+        <input type="number" inputmode="decimal" id="pe-sale" value="${product.sale_price ?? ''}" placeholder="—">
+      </label>
+      <label class="price-field">
+        <span>Себестоимость</span>
+        <input type="number" inputmode="decimal" id="pe-cost" value="${product.cost_price ?? ''}" placeholder="—">
+      </label>
+      <div class="price-actions">
+        <button class="btn-secondary" id="pe-cancel">Отмена</button>
+        <button class="btn-primary" id="pe-save">Сохранить</button>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+  const close = () => ov.remove();
+  ov.addEventListener('click', e => { if (e.target === ov) close(); });
+  document.getElementById('pe-cancel').addEventListener('click', close);
+  document.getElementById('pe-save').addEventListener('click', async () => {
+    const saleRaw = document.getElementById('pe-sale').value.trim();
+    const costRaw = document.getElementById('pe-cost').value.trim();
+    try {
+      await api('/api/products/prices/set', {
+        ms_id: msId,
+        product_name: product.name,
+        sale_price: saleRaw === '' ? null : parseFloat(saleRaw),
+        cost_price: costRaw === '' ? null : parseFloat(costRaw),
+      });
+    } catch (e) {
+      tg.showAlert ? tg.showAlert(e.message) : alert(e.message);
+      return;
+    }
+    // Обновляем локально, чтобы список сразу показал новые цены.
+    product.sale_price = saleRaw === '' ? null : parseFloat(saleRaw);
+    product.cost_price = costRaw === '' ? null : parseFloat(costRaw);
+    close();
+    haptic('success');
+    renderStockList();
+  });
 }
 
 function renderStockContent() {

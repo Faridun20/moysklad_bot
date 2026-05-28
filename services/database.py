@@ -584,6 +584,22 @@ def _create_tables():
                 updated_by      BIGINT,
                 PRIMARY KEY (user_id, permission_code)
             )""",
+            # Цены товаров, выставленные руководством (PR C).
+            # sale_price — минимальная цена продажи: при добавлении товара
+            #   в заказ менеджер может поднять, но не опустить ниже.
+            # cost_price — себестоимость: видна ТОЛЬКО boss/admin, нужна
+            #   для расчёта прибыли. Может быть NULL (не задана).
+            # Источник истины — руководство (не МС): задаётся через
+            #   /api/products/prices/set.
+            """CREATE TABLE IF NOT EXISTS product_prices (
+                ms_id         TEXT PRIMARY KEY,
+                product_name  TEXT,
+                sale_price    REAL,
+                cost_price    REAL,
+                currency      TEXT,
+                updated_by    BIGINT,
+                updated_at    TEXT
+            )""",
         ]
 
         # Создаём каждую таблицу в отдельной транзакции
@@ -1625,6 +1641,150 @@ def _invalidate_currency_rates_cache() -> None:
     """Сбросить весь кэш (для тестов и admin-debug endpoint'а)."""
     with _currency_rates_lock:
         _CURRENCY_RATES_CACHE.clear()
+
+
+# ─── Product prices (PR C: управление ценами руководством) ───────────────────
+#
+# Руководство (boss/admin) задаёт на товар:
+#   sale_price — минимальная цена продажи (менеджер может поднять, не ниже)
+#   cost_price — себестоимость (видна только boss/admin → расчёт прибыли)
+# Источник истины — руководство, не МС. Кэш по ms_id (TTL 5 мин) как у
+# currency rates — цены меняются редко, читаются часто (каждый add_item).
+
+_PRODUCT_PRICE_CACHE: dict[str, tuple[float, dict]] = {}  # ms_id → (loaded_at, row)
+_PRODUCT_PRICE_CACHE_TTL = 300.0
+_product_price_lock = _threading.Lock()
+
+
+def set_product_price(
+    ms_id: str,
+    product_name: str,
+    sale_price: float | None,
+    cost_price: float | None,
+    currency: str | None,
+    updated_by: int,
+) -> tuple[bool, str | None]:
+    """UPSERT цены товара. Возвращает (ok, error_msg).
+
+    sale_price и cost_price — опциональны (None = не задано), но если
+    заданы — валидируются через `_validate_amount` (>0, конечные, ≤10М).
+    currency дефолтится в BASE_CURRENCY.
+    """
+    from config import BASE_CURRENCY
+
+    ms_id = (ms_id or "").strip()
+    if not ms_id:
+        return False, "ms_id обязателен"
+    for label, val in (("sale_price", sale_price), ("cost_price", cost_price)):
+        if val is not None:
+            ok, err = _validate_amount(val)
+            if not ok:
+                return False, f"{label}: {err}"
+    cur_code = (currency or BASE_CURRENCY or "USD").upper()
+    sale = float(sale_price) if sale_price is not None else None
+    cost = float(cost_price) if cost_price is not None else None
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        if USE_POSTGRES:
+            cur.execute(
+                q(
+                    "INSERT INTO product_prices "
+                    "(ms_id, product_name, sale_price, cost_price, currency, updated_by, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (ms_id) DO UPDATE SET "
+                    "product_name = EXCLUDED.product_name, "
+                    "sale_price = EXCLUDED.sale_price, "
+                    "cost_price = EXCLUDED.cost_price, "
+                    "currency = EXCLUDED.currency, "
+                    "updated_by = EXCLUDED.updated_by, "
+                    "updated_at = EXCLUDED.updated_at"
+                ),
+                (ms_id, product_name or "", sale, cost, cur_code, updated_by, now_str()),
+            )
+        else:
+            cur.execute(
+                q(
+                    "INSERT OR REPLACE INTO product_prices "
+                    "(ms_id, product_name, sale_price, cost_price, currency, updated_by, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)"
+                ),
+                (ms_id, product_name or "", sale, cost, cur_code, updated_by, now_str()),
+            )
+        conn.commit()
+    with _product_price_lock:
+        _PRODUCT_PRICE_CACHE.pop(ms_id, None)
+    return True, None
+
+
+def get_product_price(ms_id: str) -> dict | None:
+    """Цена товара по ms_id (с кэшем). None если не задана.
+
+    Возвращает полный dict (sale_price/cost_price/currency). Caller
+    обязан НЕ отдавать cost_price менеджеру (фильтровать на API-edge).
+    """
+    ms_id = (ms_id or "").strip()
+    if not ms_id:
+        return None
+    now = time.monotonic()
+    with _product_price_lock:
+        cached = _PRODUCT_PRICE_CACHE.get(ms_id)
+        if cached is not None and (now - cached[0]) < _PRODUCT_PRICE_CACHE_TTL:
+            return cached[1] or None
+    try:
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q(
+                    "SELECT ms_id, product_name, sale_price, cost_price, currency, updated_at "
+                    "FROM product_prices WHERE ms_id = ?"
+                ),
+                (ms_id,),
+            )
+            row = cur.fetchone()
+            result = dict(row) if row else {}
+    except Exception:
+        logger.exception("get_product_price(%s) failed", ms_id)
+        return None
+    with _product_price_lock:
+        _PRODUCT_PRICE_CACHE[ms_id] = (now, result)
+    return result or None
+
+
+def get_product_prices_by_ids(ms_ids: list[str]) -> dict[str, dict]:
+    """Батч-выборка цен по списку ms_id (без N+1). Возвращает {ms_id: row}.
+
+    Пропускает кэш (батч обычно для разовых расчётов прибыли по заказу).
+    """
+    ids = [str(x).strip() for x in (ms_ids or []) if str(x).strip()]
+    if not ids:
+        return {}
+    placeholders = ", ".join(["?"] * len(ids))
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "SELECT ms_id, product_name, sale_price, cost_price, currency "
+                f"FROM product_prices WHERE ms_id IN ({placeholders})"
+            ),
+            ids,
+        )
+        return {r["ms_id"]: dict(r) for r in cur.fetchall()}
+
+
+def get_all_product_prices() -> list[dict]:
+    """Все заданные цены. Для admin-UI экрана «Цены»."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            "SELECT ms_id, product_name, sale_price, cost_price, currency, updated_at "
+            "FROM product_prices ORDER BY product_name"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def _invalidate_product_price_cache() -> None:
+    with _product_price_lock:
+        _PRODUCT_PRICE_CACHE.clear()
 
 
 def create_cash_deposit(

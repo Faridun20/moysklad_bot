@@ -771,9 +771,19 @@ async def api_stock(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Готовим компактный JSON
-    products = [
-        {
+    # PR C: подмешиваем цены руководства. sale_price — всем (менеджер
+    # видит минимум и дефолт), cost_price — ТОЛЬКО boss/admin (себестоимость
+    # не раскрываем менеджерам).
+    from services import async_db as adb
+
+    is_boss = role in ("admin", "boss")
+    ms_ids = [extract_id_from_href(r.get("meta", {}).get("href", "")) for r in rows]
+    prices = await adb.get_product_prices_by_ids([i for i in ms_ids if i])
+
+    products = []
+    for r, ms_id in zip(rows, ms_ids, strict=True):
+        pp = prices.get(ms_id) if ms_id else None
+        item = {
             "name": r.get("name", "—"),
             "stock": r.get("stock", 0),
             "reserve": r.get("reserve", 0),
@@ -783,9 +793,11 @@ async def api_stock(request: Request):
             "href": r.get("meta", {}).get("href", ""),
             "folder_id": extract_id_from_href(r.get("folder", {}).get("meta", {}).get("href", "")),
             "folder_name": r.get("folder", {}).get("name", ""),
+            "sale_price": (pp.get("sale_price") if pp else None),
         }
-        for r in rows
-    ]
+        if is_boss and pp:
+            item["cost_price"] = pp.get("cost_price")
+        products.append(item)
 
     categories = [
         {
@@ -1252,44 +1264,80 @@ async def api_orders(request: Request):
         orders = await adb.get_user_orders(user["id"])
 
     from config import BASE_CURRENCY
+    from utils.helpers import extract_id_from_href
+
+    is_boss = role in ("admin", "boss")
 
     # Батч-загрузка позиций: один SQL вместо N (N+1 был на больших списках)
     items_by_order = await adb.get_order_items_by_ids([o["id"] for o in orders]) if orders else {}
+
+    # PR C: прибыль по заказу — ТОЛЬКО boss/admin. Себестоимость из
+    # product_prices (батч по всем ms_id позиций). profit = Σ (price−cost)×qty.
+    # Если у позиции cost неизвестна — заказ помечается profit_partial=True
+    # (не врём нулём). Менеджеру profit/cost не отдаём вообще.
+    cost_by_ms: dict = {}
+    if is_boss:
+        all_ms_ids = {
+            extract_id_from_href(it.get("product_href", ""))
+            for items in items_by_order.values()
+            for it in items
+            if it.get("product_href")
+        }
+        prices = await adb.get_product_prices_by_ids([i for i in all_ms_ids if i])
+        cost_by_ms = {
+            k: v.get("cost_price") for k, v in prices.items() if v.get("cost_price") is not None
+        }
+
     result = []
     for o in orders:
         items = items_by_order.get(o["id"], [])
         total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
-        result.append(
-            {
-                "id": o["id"],
-                "status": o["status"],
-                "full_name": o["full_name"],
-                "agent_name": o.get("agent_name", ""),
-                "comment": o.get("comment", ""),
-                "currency": o.get("currency") or BASE_CURRENCY,
-                # Поля долга — фронт показывает «В долг до X» или «Оплачено»
-                # на карточке заказа. paid_at=null + payment_type=credit
-                # значит ещё не закрыт.
-                "payment_type": o.get("payment_type") or "paid",
-                "due_date": o.get("due_date"),
-                "paid_at": (o.get("paid_at") or "")[:16] if o.get("paid_at") else None,
-                "paid_confirmed_at": (o.get("paid_confirmed_at") or "")[:16]
-                if o.get("paid_confirmed_at")
-                else None,
-                "created_at": o["created_at"][:16],
-                "items_count": len(items),
-                "total": total,
-                "items": [
-                    {
-                        "name": it["product_name"],
-                        "quantity": it["quantity"],
-                        "unit": it["unit"],
-                        "price": float(it.get("price", 0) or 0),
-                    }
-                    for it in items
-                ],
-            }
-        )
+        entry = {
+            "id": o["id"],
+            "status": o["status"],
+            "full_name": o["full_name"],
+            "agent_name": o.get("agent_name", ""),
+            "comment": o.get("comment", ""),
+            "currency": o.get("currency") or BASE_CURRENCY,
+            # Поля долга — фронт показывает «В долг до X» или «Оплачено»
+            # на карточке заказа. paid_at=null + payment_type=credit
+            # значит ещё не закрыт.
+            "payment_type": o.get("payment_type") or "paid",
+            "due_date": o.get("due_date"),
+            "paid_at": (o.get("paid_at") or "")[:16] if o.get("paid_at") else None,
+            "paid_confirmed_at": (o.get("paid_confirmed_at") or "")[:16]
+            if o.get("paid_confirmed_at")
+            else None,
+            "created_at": o["created_at"][:16],
+            "items_count": len(items),
+            "total": total,
+            "items": [
+                {
+                    "name": it["product_name"],
+                    "quantity": it["quantity"],
+                    "unit": it["unit"],
+                    "price": float(it.get("price", 0) or 0),
+                }
+                for it in items
+            ],
+        }
+        if is_boss:
+            profit = 0.0
+            partial = False
+            for it in items:
+                ms_id = extract_id_from_href(it.get("product_href", "")) if it.get(
+                    "product_href"
+                ) else ""
+                cost = cost_by_ms.get(ms_id)
+                qty = float(it.get("quantity", 0) or 0)
+                price = float(it.get("price", 0) or 0)
+                if cost is None:
+                    partial = True  # себестоимость не задана — не учитываем
+                else:
+                    profit += (price - float(cost)) * qty
+            entry["profit"] = round(profit, 2)
+            entry["profit_partial"] = partial  # True = часть позиций без cost
+        result.append(entry)
 
     return JSONResponse({"orders": result, "role": role, "default_currency": BASE_CURRENCY})
 
@@ -1504,6 +1552,69 @@ async def api_currency_rates_set(request: Request):
     if not ok:
         raise HTTPException(status_code=400, detail=err)
     return JSONResponse({"ok": True, "currency_code": code.upper(), "rate_to_base": float(rate)})
+
+
+# ─── API: цены товаров (PR C — управление ценами руководством) ───────────────
+
+
+@app.post("/api/products/prices")
+async def api_products_prices(request: Request):
+    """Список заданных цен товаров. Только admin/boss (содержит cost_price)."""
+    from services import async_db as adb
+
+    data = await request.json()
+    _authorize(data, allowed_roles=("admin", "boss"), rate_limit_scope="api_products_prices")
+    rows = await adb.get_all_product_prices()
+    return JSONResponse({"ok": True, "prices": rows})
+
+
+@app.post("/api/products/prices/set")
+async def api_products_prices_set(request: Request):
+    """Установить цену продажи (минимум) и/или себестоимость товара.
+
+    Только admin/boss. Payload:
+      {"initData": "...", "ms_id": "...", "product_name": "...",
+       "sale_price": 150.0, "cost_price": 100.0, "currency": "USD"}
+    sale_price/cost_price опциональны (null = не задавать/сбросить).
+    """
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=("admin", "boss"), rate_limit_scope="api_products_prices_set"
+    )
+    ms_id = (data.get("ms_id") or "").strip()[:64]
+    if not ms_id:
+        raise HTTPException(status_code=400, detail="ms_id обязателен")
+    product_name = (data.get("product_name") or "").strip()[:300]
+
+    def _opt_price(key):
+        v = data.get(key)
+        if v is None or v == "":
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{key}: не число")
+
+    sale_price = _opt_price("sale_price")
+    cost_price = _opt_price("cost_price")
+    currency = (data.get("currency") or "").strip()
+
+    ok, err = await adb.set_product_price(
+        ms_id, product_name, sale_price, cost_price, currency, user["id"]
+    )
+    if not ok:
+        raise HTTPException(status_code=400, detail=err)
+
+    await adb.add_audit_log(
+        user["id"],
+        ((user.get("first_name") or "") + " " + (user.get("last_name") or "")).strip(),
+        get_role(user["id"]),
+        "product_price_set",
+        f"{ms_id} ({product_name}): sale={sale_price} cost={cost_price}",
+    )
+    return JSONResponse({"ok": True, "ms_id": ms_id})
 
 
 # ─── API: per-user permissions (PR #44 / tech debt #3c) ──────────────────────
@@ -1989,6 +2100,7 @@ async def api_add_item(request: Request):
     )
 
     from services import async_db as adb
+    from utils.helpers import extract_id_from_href
 
     order = await adb.get_order(data["order_id"])
     if not order or order["user_id"] != user["id"]:
@@ -2000,6 +2112,24 @@ async def api_add_item(request: Request):
             raise ValueError
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Неверная цена")
+
+    # PR C: минимальная цена продажи, заданная руководством. По product_href
+    # → ms_id → product_prices.sale_price. Если задана:
+    #   • price не передан/0 → префилл sale_price (дефолт)
+    #   • price < sale_price → 400 (нельзя продать ниже минимума)
+    product_href = data.get("product_href", "")
+    ms_id = extract_id_from_href(product_href) if product_href else ""
+    if ms_id:
+        pp = await adb.get_product_price(ms_id)
+        sale_min = pp.get("sale_price") if pp else None
+        if sale_min is not None:
+            if price <= 0:
+                price = float(sale_min)  # префилл дефолтом
+            elif price < float(sale_min):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Цена ниже минимальной ({sale_min:g})",
+                )
 
     # Если в payload пришла валюта и она ещё не зафиксирована на ордере —
     # сохраняем. Все позиции одного ордера должны быть в одной валюте.
@@ -2013,7 +2143,7 @@ async def api_add_item(request: Request):
     item_id = await adb.add_order_item(
         order_id=data["order_id"],
         product_name=data["product_name"],
-        product_href=data.get("product_href", ""),
+        product_href=product_href,
         quantity=float(data["quantity"]),
         unit=data.get("unit", "шт"),
         price=price,
