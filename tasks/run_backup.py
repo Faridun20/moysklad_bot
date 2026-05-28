@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import gzip
 import logging
+import io
 import os
 import subprocess
 import sys
@@ -55,19 +56,45 @@ TG_SIZE_WARNING_BYTES = 40 * 1024 * 1024
 
 
 def _create_backup_postgres(db_url: str, out_path: Path) -> int:
-    """pg_dump → gzip → out_path. Возвращает размер байт.
+    """Backup Postgres → gzip → out_path. Возвращает размер байт.
 
-    Опции pg_dump:
-      --no-owner / --no-acl — backup без owner/acl-инфо (восстанавливается
-        в любую учётную запись)
-      --clean — DROP-statement'ы перед CREATE, чтобы восстановление в
-        существующую БД переписало
-      --if-exists — DROP IF EXISTS чтобы первый restore не упал
+    Стратегия:
+      1. Сначала `pg_dump` (полный schema + data, best). Требует
+         postgresql client в образе.
+      2. Если pg_dump отсутствует в PATH (Railway/Nixpacks без
+         postgresql client — реальный прод-кейс) → fallback на
+         pure-Python COPY-dump через psycopg2 (data-only, но работает
+         БЕЗ системных бинарей).
+
+    Pure-Python fallback гарантирует что backup не падает из-за
+    окружения. Полный dump (с pg_dump) даёт schema, но для нашего
+    DR-сценария схему держит `tasks/migrate` (CREATE TABLE), достаточно
+    данных.
+    """
+    try:
+        return _pg_dump_native(db_url, out_path)
+    except FileNotFoundError:
+        logger.warning(
+            "pg_dump не найден в PATH — fallback на pure-Python COPY-dump "
+            "(data-only). Restore: `python -m tasks.migrate` + psql < dump. "
+            "Для полного schema+data dump поставь postgresql client в образ."
+        )
+        return _pg_dump_pure_python(db_url, out_path)
+
+
+def _pg_dump_native(db_url: str, out_path: Path) -> int:
+    """pg_dump → gzip. Бросает FileNotFoundError если бинарь отсутствует.
+
+    Опции:
+      --no-owner / --no-acl — restore в любую учётную запись
+      --clean --if-exists — DROP IF EXISTS перед CREATE (idempotent restore)
     """
     cmd = ["pg_dump", "--no-owner", "--no-acl", "--clean", "--if-exists", db_url]
     with open(out_path, "wb") as fout:
         gz = gzip.GzipFile(fileobj=fout, mode="wb")
         try:
+            # Popen бросит FileNotFoundError если pg_dump нет в PATH —
+            # ловим выше для fallback.
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
             assert proc.stdout is not None
             while True:
@@ -80,6 +107,55 @@ def _create_backup_postgres(db_url: str, out_path: Path) -> int:
                 raise RuntimeError(f"pg_dump упал rc={proc.returncode}")
         finally:
             gz.close()
+    return out_path.stat().st_size
+
+
+def _pg_dump_pure_python(db_url: str, out_path: Path) -> int:
+    """Pure-Python data-dump через psycopg2 COPY — не требует pg_dump.
+
+    Формат — pg-native COPY (как data-секция pg_dump). На restore:
+      1. `python -m tasks.migrate`   (создаёт схему: CREATE TABLE + ALTER)
+      2. `psql $DATABASE_URL < dump.sql`   (TRUNCATE + COPY данные)
+
+    Data-only: схему держит код (init_db/migrate), здесь только строки.
+    Для DR это полноценно — потеряли Postgres → migrate воссоздаёт
+    структуру → backup заливает данные.
+
+    TRUNCATE ... CASCADE перед COPY делает restore идемпотентным. У нас
+    нет FK-constraints (CLAUDE.md: «без FK»), порядок таблиц не важен.
+    """
+    import psycopg2
+
+    conn = psycopg2.connect(db_url)
+    try:
+        cur = conn.cursor()
+        # Список таблиц public-схемы. Порядок алфавитный — без FK
+        # зависимостей он не важен.
+        cur.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
+        )
+        tables = [r[0] for r in cur.fetchall()]
+
+        with gzip.open(str(out_path), "wt", encoding="utf-8") as gz:
+            gz.write("-- Pure-Python COPY dump (data-only) — fallback без pg_dump\n")
+            gz.write("-- Restore: python -m tasks.migrate && psql $DATABASE_URL < this.sql\n")
+            gz.write(f"-- Tables: {len(tables)}\n\n")
+            gz.write("BEGIN;\n")
+            for t in tables:
+                # Идентификатор таблицы оборачиваем в кавычки на случай
+                # reserved word / спецсимволов (наши имена простые, но
+                # безопаснее).
+                qt = f'"{t}"'
+                gz.write(f"\nTRUNCATE TABLE {qt} CASCADE;\n")
+                gz.write(f"COPY {qt} FROM stdin;\n")
+                # copy_expert пишет str в text-mode file (наш gzip wt).
+                buf = io.StringIO()
+                cur.copy_expert(f"COPY {qt} TO STDOUT", buf)
+                gz.write(buf.getvalue())
+                gz.write("\\.\n")
+            gz.write("\nCOMMIT;\n")
+    finally:
+        conn.close()
     return out_path.stat().st_size
 
 

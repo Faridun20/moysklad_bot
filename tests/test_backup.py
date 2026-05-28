@@ -31,6 +31,63 @@ def reset_backup_module(monkeypatch):
     monkeypatch.setenv("MS_TOKEN", "fake-ms")
 
 
+# ─── Postgres backup: pg_dump native + pure-Python fallback ──────────────────
+
+
+def test_postgres_backup_uses_native_pg_dump_when_available(tmp_path, monkeypatch):
+    """Если pg_dump в PATH → используется native, fallback НЕ вызывается."""
+    from tasks import run_backup
+
+    native_called = []
+    pure_called = []
+
+    def fake_native(db_url, out_path):
+        native_called.append((db_url, out_path))
+        Path(out_path).write_bytes(b"native-dump")
+        return 11
+
+    def fake_pure(db_url, out_path):
+        pure_called.append(True)
+        return 0
+
+    monkeypatch.setattr(run_backup, "_pg_dump_native", fake_native)
+    monkeypatch.setattr(run_backup, "_pg_dump_pure_python", fake_pure)
+
+    size = run_backup._create_backup_postgres("postgresql://x", tmp_path / "out.gz")
+    assert size == 11
+    assert len(native_called) == 1
+    assert pure_called == []  # fallback не нужен
+
+
+def test_postgres_backup_falls_back_when_pg_dump_missing(tmp_path, monkeypatch, caplog):
+    """pg_dump отсутствует (FileNotFoundError) → fallback на pure-Python.
+
+    Это РЕАЛЬНЫЙ прод-кейс: Railway/Nixpacks без postgresql client.
+    """
+    import logging
+
+    from tasks import run_backup
+
+    def fake_native(db_url, out_path):
+        raise FileNotFoundError("[Errno 2] No such file or directory: 'pg_dump'")
+
+    pure_called = []
+
+    def fake_pure(db_url, out_path):
+        pure_called.append((db_url, out_path))
+        Path(out_path).write_bytes(b"pure-python-dump")
+        return 16
+
+    monkeypatch.setattr(run_backup, "_pg_dump_native", fake_native)
+    monkeypatch.setattr(run_backup, "_pg_dump_pure_python", fake_pure)
+
+    caplog.set_level(logging.WARNING, logger="backup")
+    size = run_backup._create_backup_postgres("postgresql://x", tmp_path / "out.gz")
+    assert size == 16
+    assert len(pure_called) == 1  # fallback сработал
+    assert any("pg_dump не найден" in r.message for r in caplog.records)
+
+
 # ─── _create_backup_sqlite ───────────────────────────────────────────────────
 
 
