@@ -117,7 +117,22 @@ Telegram, руководители одобряют отгрузки и подт
 
 **Мониторинг:** `tasks/run_backup` интегрирован с `cron_runs` — если backup не прошёл, `cron-ops` дайджест покажет «🛑 backup: failed».
 
-**Билд:** `nixpacks.toml` добавляет `postgresql_16` в Nixpacks-образ — иначе `pg_dump` отсутствует в контейнере и cron падает с `FileNotFoundError`.
+**Два режима дампа:**
+1. **pg_dump** (full schema + data) — если postgresql client есть в образе (`nixpacks.toml` добавляет `postgresql_16`)
+2. **pure-Python COPY-dump** (data-only) — fallback через psycopg2, если `pg_dump` отсутствует. Работает без системных бинарей.
+
+**Восстановление:**
+```bash
+gunzip moysklad-bot-postgres-YYYYMMDD-HHMMSS.sql.gz
+
+# Если дамп был через pg_dump (full):
+psql $DATABASE_URL < moysklad-bot-postgres-YYYYMMDD-HHMMSS.sql
+
+# Если дамп pure-Python (data-only) — сначала создать схему:
+python -m tasks.migrate
+psql $DATABASE_URL < moysklad-bot-postgres-YYYYMMDD-HHMMSS.sql
+```
+Тип дампа виден в первой строке файла (`-- Pure-Python COPY dump` или `-- PostgreSQL database dump`).
 
 
 ## Команды бота
