@@ -1319,3 +1319,65 @@ body {
   font-size: 14px;
   padding: 24px 12px;
 }
+/* ─── Цены товаров (PR C) ─────────────────────────────────────── */
+.stock-price {
+  font-size: 12px;
+  color: var(--accent);
+  margin-top: 2px;
+  font-weight: 500;
+}
+.stock-edit-hint {
+  font-size: 13px;
+  opacity: 0.5;
+  margin-left: 6px;
+}
+.price-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 20px;
+}
+.price-modal {
+  background: var(--bg-card);
+  border-radius: var(--radius);
+  padding: 20px;
+  width: 100%;
+  max-width: 360px;
+  box-shadow: 0 8px 40px rgba(0,0,0,0.25);
+}
+.price-modal-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 16px;
+}
+.price-field {
+  display: block;
+  margin-bottom: 14px;
+}
+.price-field span {
+  display: block;
+  font-size: 13px;
+  color: var(--text-mute);
+  margin-bottom: 5px;
+}
+.price-field input {
+  width: 100%;
+  padding: 11px 13px;
+  font-size: 16px;
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-sm);
+  background: var(--bg-page);
+  color: var(--text);
+  outline: none;
+}
+.price-field input:focus { border-color: var(--accent); }
+.price-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+}
+.price-actions button { flex: 1; }
