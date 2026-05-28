@@ -590,6 +590,7 @@ body {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .top-sub { font-size: 12px; color: var(--text-mute); margin-top: 2px; }
+.top-profit { color: #2e7d32; font-weight: 600; }
 
 /* ─── Формы ───────────────────────────────────────────────────── */
 .form-row { margin-bottom: 12px; }

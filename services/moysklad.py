@@ -547,6 +547,14 @@ async def get_sales_stats(since: datetime, until: datetime | None = None) -> dic
         set(s.get("agent", {}).get("name", "") for s in shipments if s.get("agent", {}).get("name"))
     )
 
+    # PR D: выручка по клиентам (из ВСЕХ отгрузок — s["sum"], точно).
+    by_client: dict[str, dict] = {}
+    for s in shipments:
+        cname = s.get("agent", {}).get("name") or "—"
+        c = by_client.setdefault(cname, {"sum": 0, "count": 0})
+        c["sum"] += s.get("sum", 0) or 0
+        c["count"] += 1
+
     product_sums: dict[str, dict] = {}
     demand_ids: list[str] = []
     for s in shipments[:15]:
@@ -565,22 +573,29 @@ async def get_sales_stats(since: datetime, until: datetime | None = None) -> dic
         if isinstance(positions, BaseException):
             continue  # эквивалент прежнего per-item try/except: pass
         for pos in positions:
-            name = pos.get("assortment", {}).get("name", "—")
+            assortment = pos.get("assortment", {}) or {}
+            name = assortment.get("name", "—")
+            # ms_id товара — для расчёта маржи (cost из product_prices).
+            ms_id = extract_id_from_href(assortment.get("meta", {}).get("href", ""))
             qty = pos.get("quantity", 0)
             price = pos.get("price", 0)
             pos_sum = qty * price
             if name not in product_sums:
-                product_sums[name] = {"sum": 0, "qty": 0}
+                product_sums[name] = {"sum": 0, "qty": 0, "ms_id": ms_id}
             product_sums[name]["sum"] += pos_sum
             product_sums[name]["qty"] += qty
+            if ms_id and not product_sums[name].get("ms_id"):
+                product_sums[name]["ms_id"] = ms_id
 
     top_products = sorted(product_sums.items(), key=lambda x: x[1]["sum"], reverse=True)[:5]
+    top_clients = sorted(by_client.items(), key=lambda x: x[1]["sum"], reverse=True)[:10]
 
     return {
         "total": total,
         "count": len(shipments),
         "clients": clients,
         "top_products": top_products,
+        "top_clients": top_clients,
     }
 
 

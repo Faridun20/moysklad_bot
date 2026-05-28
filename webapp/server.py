@@ -821,8 +821,7 @@ async def api_analytics(request: Request):
     Менеджер видит ТОЛЬКО свои показатели (из локальной БД).
     Босс/админ — общую по компании (из МойСклад API).
     """
-    from datetime import datetime, timedelta
-    from services.moysklad import get_sales_stats, get_shipments
+    from datetime import datetime
 
     data = await request.json()
     user = verify_init_data(data.get("initData", ""))
@@ -834,31 +833,37 @@ async def api_analytics(request: Request):
     if role not in ("admin", "boss", "manager"):
         raise HTTPException(status_code=403, detail="Нет доступа")
 
-    period = data.get("period", "week")
-    # Local-time чтобы совпадало с now_str() (см. /api/home комментарий).
     now = datetime.now()
-
-    periods = {
-        "week": (now - timedelta(weeks=1), now - timedelta(weeks=2), "Неделя"),
-        "month": (now - timedelta(days=30), now - timedelta(days=60), "Месяц"),
-        "3month": (now - timedelta(days=90), now - timedelta(days=180), "3 месяца"),
-        "year": (now - timedelta(days=365), now - timedelta(days=730), "Год"),
-    }
-    since, prev_since, label = periods.get(period, periods["month"])
+    # PR D: произвольный диапазон. Если заданы since/until (ISO) — используем их
+    # вместо preset'а. Иначе — пресет week/month/3month/year.
+    since, until, prev_since, label = _resolve_analytics_period(data, now)
 
     if role == "manager":
         # Личная аналитика — считаем из локальной БД по одобренным заявкам.
-        return JSONResponse(await _personal_analytics(user_id, since, now, prev_since, label))
+        return JSONResponse(await _personal_analytics(user_id, since, until, prev_since, label))
 
     # Босс/админ — компания, из МойСклад
-    try:
-        current, prev, shipments = await asyncio.gather(
-            get_sales_stats(since, now),
-            get_sales_stats(prev_since, since),
-            get_shipments(since, now),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    payload = await _company_analytics_payload(since, until, prev_since, label)
+    return JSONResponse(payload)
+
+
+async def _company_analytics_payload(since, until, prev_since, label: str) -> dict:
+    """Расчёт компанейской аналитики (boss/admin) из МойСклад.
+
+    Вынесено из api_analytics, чтобы /api/analytics/export переиспользовал
+    тот же расчёт. Включает маржу по топ-товарам (cost из product_prices),
+    топ клиентов и топ менеджеров.
+    """
+    from datetime import datetime
+
+    from services import async_db as adb
+    from services.moysklad import get_sales_stats, get_shipments
+
+    current, prev, shipments = await asyncio.gather(
+        get_sales_stats(since, until),
+        get_sales_stats(prev_since, since),
+        get_shipments(since, until),
+    )
 
     days_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     by_day = [0] * 7
@@ -874,24 +879,126 @@ async def api_analytics(request: Request):
     if prev["total"] > 0:
         trend = round((current["total"] - prev["total"]) / prev["total"] * 100)
 
-    top = [
-        {"name": name, "sum": d["sum"] / 100, "qty": d["qty"]}
-        for name, d in current["top_products"][:5]
+    # Маржа по топ-товарам. МС price — минорные (÷100); cost — мажорные
+    # (как ввело руководство). cost None → profit не считаем.
+    top_products = current["top_products"][:5]
+    prod_ms_ids = [d.get("ms_id") for _n, d in top_products if d.get("ms_id")]
+    costs = await adb.get_product_prices_by_ids(prod_ms_ids) if prod_ms_ids else {}
+    top = []
+    for name, d in top_products:
+        revenue = d["sum"] / 100
+        item = {"name": name, "sum": revenue, "qty": d["qty"]}
+        cost_row = costs.get(d.get("ms_id") or "")
+        cost = cost_row.get("cost_price") if cost_row else None
+        if cost is not None:
+            item["profit"] = round(revenue - float(cost) * d["qty"], 2)
+            item["margin_known"] = True
+        else:
+            item["margin_known"] = False
+        top.append(item)
+
+    top_clients = [
+        {"name": name, "revenue": d["sum"] / 100, "count": d["count"]}
+        for name, d in current.get("top_clients", [])[:10]
+    ]
+    by_manager: dict = {}
+    for s in shipments:
+        mname = _extract_tg_attribute(s, "telegram_full_name") or "Прочее (вручную)"
+        m = by_manager.setdefault(mname, {"sum": 0, "count": 0})
+        m["sum"] += s.get("sum", 0) or 0
+        m["count"] += 1
+    top_managers = [
+        {"name": name, "revenue": d["sum"] / 100, "count": d["count"]}
+        for name, d in sorted(by_manager.items(), key=lambda kv: kv[1]["sum"], reverse=True)[:10]
     ]
 
-    return JSONResponse(
-        {
-            "label": label,
-            "scope": "company",
-            "total": current["total"] / 100,
-            "count": current["count"],
-            "clients": current["clients"],
-            "avg_check": (current["total"] / current["count"] / 100) if current["count"] else 0,
-            "trend": trend,
-            "by_day": [{"day": days_ru[i], "count": by_day[i]} for i in range(7)],
-            "top_products": top,
-        }
+    return {
+        "label": label,
+        "scope": "company",
+        "total": current["total"] / 100,
+        "count": current["count"],
+        "clients": current["clients"],
+        "avg_check": (current["total"] / current["count"] / 100) if current["count"] else 0,
+        "trend": trend,
+        "by_day": [{"day": days_ru[i], "count": by_day[i]} for i in range(7)],
+        "top_products": top,
+        "top_clients": top_clients,
+        "top_managers": top_managers,
+    }
+
+
+@app.post("/api/analytics/export")
+async def api_analytics_export(request: Request):
+    """Выгрузить аналитику в Excel и прислать файлом в Telegram. boss/admin only."""
+    from datetime import datetime
+
+    from services.excel_export import build_analytics_xlsx
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=("admin", "boss"), rate_limit_scope="api_analytics_export"
     )
+    now = datetime.now()
+    since, until, prev_since, label = _resolve_analytics_period(data, now)
+    try:
+        payload = await _company_analytics_payload(since, until, prev_since, label)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    xlsx_bytes = await asyncio.to_thread(build_analytics_xlsx, payload)
+    fname = f"analytics-{(label or 'report').replace(' ', '_').replace('—', '-')[:40]}.xlsx"
+
+    from aiogram.types import BufferedInputFile
+
+    bot = await get_notify_bot()
+    try:
+        await bot.send_document(
+            chat_id=user["id"],
+            document=BufferedInputFile(xlsx_bytes, filename=fname),
+            caption=f"📊 Аналитика · {label}",
+        )
+    except Exception:
+        logger.exception("analytics export send_document failed")
+        raise HTTPException(status_code=502, detail="Не удалось отправить файл в Telegram")
+    return JSONResponse({"ok": True, "sent": True})
+
+
+def _resolve_analytics_period(data: dict, now):
+    """Вернуть (since, until, prev_since, label) для аналитики.
+
+    Если в payload заданы since/until (ISO YYYY-MM-DD) — кастомный диапазон
+    (prev_since = since − длительность, для trend). Иначе preset (until=now).
+    Кастомный диапазон clamp'ится ≤366 дней.
+    """
+    from datetime import datetime, timedelta
+
+    since_raw = (data.get("since") or "").strip()
+    until_raw = (data.get("until") or "").strip()
+    if since_raw and until_raw:
+        try:
+            since = datetime.strptime(since_raw[:10], "%Y-%m-%d")
+            until = datetime.strptime(until_raw[:10], "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Даты в формате YYYY-MM-DD")
+        if until <= since:
+            raise HTTPException(status_code=400, detail="until должен быть позже since")
+        span = until - since
+        if span > timedelta(days=366):
+            raise HTTPException(status_code=400, detail="Диапазон не больше года")
+        label = f"{since_raw[:10]} — {until_raw[:10]}"
+        return since, until, since - span, label
+
+    period = data.get("period", "week")
+    presets = {
+        "week": (now - timedelta(weeks=1), now - timedelta(weeks=2), "Неделя"),
+        "month": (now - timedelta(days=30), now - timedelta(days=60), "Месяц"),
+        "3month": (now - timedelta(days=90), now - timedelta(days=180), "3 месяца"),
+        "year": (now - timedelta(days=365), now - timedelta(days=730), "Год"),
+    }
+    # Индексируем, а не распаковываем в 3 цели — multi-target unpack из
+    # dict.get() роняет mypy 2.1 (AssertionError в check_multi_assignment_from_tuple).
+    preset = presets.get(period, presets["month"])
+    return preset[0], now, preset[1], preset[2]
 
 
 def _ts(o: dict) -> str:
