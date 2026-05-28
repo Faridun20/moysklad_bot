@@ -2,6 +2,7 @@
 Общие хэндлеры: /start, меню, управление ролями
 """
 
+import asyncio
 import logging
 from aiogram import Bot, Router, F
 from aiogram.filters import CommandStart, Command
@@ -106,6 +107,7 @@ _COMMANDS_MANAGER = [
     BotCommand(command="myorders", description="📋 Мои заказы"),
     BotCommand(command="pay", description="💵 Отправить платёж"),
     BotCommand(command="debts", description="💳 Мои долги"),
+    BotCommand(command="find", description="🔍 Поиск (заказ/платёж/клиент)"),
 ]
 _COMMANDS_BOSS = _COMMANDS_MANAGER + [
     BotCommand(command="orders", description="⏳ Заявки на апрув"),
@@ -279,6 +281,58 @@ async def cmd_start(message: Message):
         from handlers.analytics import show_manager_summary
 
         await show_manager_summary(message.bot, message.chat.id, message.from_user.id)
+
+
+@router.message(Command("find"))
+async def cmd_find(message: Message):
+    """Глобальный поиск: /find <текст> — заказы, платежи, клиенты.
+
+    Менеджер видит только свои заказы/платежи; начальство — все.
+    Клиенты (контрагенты) видны всем.
+    """
+    from services import async_db as adb
+    from services import snapshot
+    from services.roles import _has_role
+    from utils.helpers import esc
+
+    role = get_role(message.from_user.id)
+    if role == "guest":
+        return await message.answer("⛔ Нет доступа.")
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip():
+        return await message.answer(
+            "🔍 Формат: <code>/find текст</code>\nНапример: <code>/find Иванов</code>",
+            parse_mode="HTML",
+        )
+    query = parts[1].strip()[:100]
+    privileged = _has_role(message.from_user.id, "admin", "boss")
+    scope_uid = None if privileged else message.from_user.id
+
+    orders = await adb.search_orders(query, user_id=scope_uid, limit=10)
+    payments = await adb.search_payments(query, user_id=scope_uid, limit=10)
+    agents = await asyncio.to_thread(snapshot.get_counterparties, query, 10)
+
+    lines: list[str] = [f"🔍 <b>Поиск: {esc(query)}</b>"]
+    if orders:
+        lines.append("\n📦 <b>Заказы:</b>")
+        for o in orders:
+            lines.append(
+                f"  • #{o['id']} · {esc(o.get('agent_name') or '—')} · {esc(o.get('status') or '')}"
+            )
+    if payments:
+        lines.append("\n💵 <b>Платежи:</b>")
+        for p in payments:
+            amt = p.get("amount") or 0
+            lines.append(
+                f"  • #{p['id']} · {amt:g} {esc(p.get('currency') or '')} · {esc(p.get('full_name') or '—')}"
+            )
+    if agents:
+        lines.append("\n👤 <b>Клиенты:</b>")
+        for a in agents:
+            lines.append(f"  • {esc(a.get('name') or '—')}")
+    if not (orders or payments or agents):
+        lines.append("\nНичего не найдено.")
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @router.message(Command("refresh"))

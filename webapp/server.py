@@ -511,6 +511,64 @@ async def get_me(request: Request):
     )
 
 
+@app.post("/api/search")
+async def api_search(request: Request):
+    """Глобальный поиск по заказам / платежам / контрагентам.
+
+    Менеджер видит только свои заказы и платежи (user_id-скоуп);
+    boss/admin — все. Контрагенты — общий справочник (видны всем,
+    они и так нужны для создания заказов).
+    """
+    from services import async_db as adb
+    from services import snapshot
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_search",
+    )
+    query = (data.get("query") or "").strip()[:100]
+    if not query:
+        return JSONResponse({"ok": True, "orders": [], "payments": [], "agents": []})
+
+    role = get_role(user["id"])
+    # Менеджер — только свои; начальство — всё.
+    scope_uid = user["id"] if role == "manager" else None
+
+    orders = await adb.search_orders(query, user_id=scope_uid, limit=20)
+    payments = await adb.search_payments(query, user_id=scope_uid, limit=20)
+    agents = await asyncio.to_thread(snapshot.get_counterparties, query, 20)
+
+    # Урезаем заказы/платежи до полезного для UI набора полей.
+    orders_out = [
+        {
+            "id": o["id"],
+            "status": o.get("status"),
+            "agent_name": o.get("agent_name") or "—",
+            "full_name": o.get("full_name") or "—",
+            "currency": o.get("currency") or "",
+            "created_at": (o.get("created_at") or "")[:16],
+        }
+        for o in orders
+    ]
+    payments_out = [
+        {
+            "id": p["id"],
+            "amount": p.get("amount"),
+            "currency": p.get("currency") or "",
+            "status": p.get("status"),
+            "full_name": p.get("full_name") or "—",
+            "comment": (p.get("comment") or "")[:80],
+            "order_id": p.get("order_id"),
+        }
+        for p in payments
+    ]
+    return JSONResponse(
+        {"ok": True, "orders": orders_out, "payments": payments_out, "agents": agents}
+    )
+
+
 # ─── API: главный экран (сводка дня + мои заказы + для босса аналитика) ────
 
 

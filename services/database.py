@@ -153,6 +153,13 @@ def get_conn():
     else:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
+        # SQLite встроенный LOWER() — ASCII-only: 'Иванов'→'Иванов' (кириллица
+        # не лоуэркейсится). Postgres LOWER() — Unicode-aware. Чтобы LIKE-поиск
+        # вёл себя одинаково в обеих БД (важно для кириллических имён клиентов/
+        # менеджеров), переопределяем LOWER на Python str.lower() (Unicode).
+        conn.create_function(
+            "lower", 1, lambda s: s.lower() if isinstance(s, str) else s, deterministic=True
+        )
         try:
             yield conn
         finally:
@@ -3803,6 +3810,77 @@ def get_all_orders(status: str | None = None) -> list[dict]:
         cur.execute(q(query), params)
         rows = cur.fetchall()
     return [dict(r) for r in rows]
+
+
+def _like_escape(s: str) -> str:
+    r"""Экранировать LIKE-метасимволы (% _ \) в пользовательском вводе.
+
+    Без этого поиск «50%» или «order_1» интерпретировал бы %/_ как
+    wildcard'ы. Экранируем и используем ESCAPE '\' в LIKE-запросе.
+    """
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def search_orders(query: str, user_id: int | None = None, limit: int = 20) -> list[dict]:
+    """Поиск заказов по тексту: full_name / agent_name / comment, либо по id
+    если query — число.
+
+    `user_id` задан → только заказы этого пользователя (скоуп менеджера).
+    None → все (boss/admin). Исключаем soft-deleted (deleted_at IS NULL).
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+    like = f"%{_like_escape(query.lower())}%"
+    conds = [
+        "LOWER(COALESCE(full_name,'')) LIKE ? ESCAPE '\\'",
+        "LOWER(COALESCE(agent_name,'')) LIKE ? ESCAPE '\\'",
+        "LOWER(COALESCE(comment,'')) LIKE ? ESCAPE '\\'",
+    ]
+    params: list = [like, like, like]
+    if query.isdigit():
+        conds.append("id = ?")
+        params.append(int(query))
+    where = "(" + " OR ".join(conds) + ") AND deleted_at IS NULL"
+    if user_id is not None:
+        where += " AND user_id = ?"
+        params.append(user_id)
+    params.append(limit)
+    sql = f"SELECT * FROM orders WHERE {where} ORDER BY created_at DESC LIMIT ?"
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q(sql), params)
+        return [dict(r) for r in cur.fetchall()]
+
+
+def search_payments(query: str, user_id: int | None = None, limit: int = 20) -> list[dict]:
+    """Поиск платежей: full_name / username / comment, либо по id если число.
+
+    `user_id` задан → только платежи этого пользователя; None → все.
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+    like = f"%{_like_escape(query.lower())}%"
+    conds = [
+        "LOWER(COALESCE(full_name,'')) LIKE ? ESCAPE '\\'",
+        "LOWER(COALESCE(username,'')) LIKE ? ESCAPE '\\'",
+        "LOWER(COALESCE(comment,'')) LIKE ? ESCAPE '\\'",
+    ]
+    params: list = [like, like, like]
+    if query.isdigit():
+        conds.append("id = ?")
+        params.append(int(query))
+    where = "(" + " OR ".join(conds) + ")"
+    if user_id is not None:
+        where += " AND user_id = ?"
+        params.append(user_id)
+    params.append(limit)
+    sql = f"SELECT * FROM payments WHERE {where} ORDER BY id DESC LIMIT ?"
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q(sql), params)
+        return [dict(r) for r in cur.fetchall()]
 
 
 def update_order_agent(order_id: int, agent_id: str, agent_name: str) -> bool:

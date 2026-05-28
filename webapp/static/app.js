@@ -593,6 +593,77 @@ async function api(path, body) {
   return r.json();
 }
 
+// ─── Глобальный поиск ───────────────────────────────
+let _searchTimer = null;
+
+function openSearch() {
+  haptic('light');
+  showBack(() => showScreen(currentScreen));
+  const content = document.getElementById('content');
+  content.innerHTML = `
+    <div class="search-wrap">
+      <input type="search" id="search-input" class="search-input"
+             placeholder="Заказ, платёж или клиент…" autocomplete="off" />
+    </div>
+    <div id="search-results" class="search-results">
+      <div class="empty-hint">Введите минимум 2 символа</div>
+    </div>`;
+  const input = document.getElementById('search-input');
+  input.focus();
+  input.addEventListener('input', () => {
+    clearTimeout(_searchTimer);
+    const q = input.value.trim();
+    if (q.length < 2) {
+      document.getElementById('search-results').innerHTML =
+        '<div class="empty-hint">Введите минимум 2 символа</div>';
+      return;
+    }
+    _searchTimer = setTimeout(() => runSearch(q), 300);
+  });
+}
+
+async function runSearch(query) {
+  const box = document.getElementById('search-results');
+  if (!box) return;
+  box.innerHTML = loading('Ищу…');
+  let data;
+  try {
+    data = await api('/api/search', { query });
+  } catch (e) {
+    box.innerHTML = `<div class="error">❌ ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  // Гонка: пока ждали ответ, пользователь мог стереть/сменить запрос.
+  const input = document.getElementById('search-input');
+  if (!input || input.value.trim() !== query) return;
+
+  const parts = [];
+  if (data.orders && data.orders.length) {
+    parts.push('<div class="search-group-title">📦 Заказы</div>');
+    parts.push(data.orders.map(o => `
+      <div class="search-item" onclick="showScreen('orders')">
+        <b>#${o.id}</b> · ${escapeHtml(o.agent_name)} · ${escapeHtml(o.status || '')}
+        <span class="search-meta">${escapeHtml(o.full_name)}</span>
+      </div>`).join(''));
+  }
+  if (data.payments && data.payments.length) {
+    parts.push('<div class="search-group-title">💵 Платежи</div>');
+    parts.push(data.payments.map(p => `
+      <div class="search-item" onclick="showScreen('finance')">
+        <b>#${p.id}</b> · ${p.amount} ${escapeHtml(p.currency)} · ${escapeHtml(p.status || '')}
+        <span class="search-meta">${escapeHtml(p.full_name)}${p.comment ? ' · ' + escapeHtml(p.comment) : ''}</span>
+      </div>`).join(''));
+  }
+  if (data.agents && data.agents.length) {
+    parts.push('<div class="search-group-title">👤 Клиенты</div>');
+    parts.push(data.agents.map(a => `
+      <div class="search-item">${escapeHtml(a.name || '—')}${a.phone ? ' · ' + escapeHtml(a.phone) : ''}</div>`).join(''));
+  }
+  box.innerHTML = parts.length
+    ? parts.join('')
+    : '<div class="empty-hint">Ничего не найдено</div>';
+}
+
 async function renderOrders() {
   const content = document.getElementById('content');
   content.innerHTML = loading('Загружаю заказы…');
@@ -1713,6 +1784,11 @@ function initNav() {
       showScreen(btn.dataset.screen);
     });
   });
+  // Поиск в топбаре — доступен с любого экрана.
+  const searchBtn = document.getElementById('search-btn');
+  if (searchBtn) {
+    searchBtn.addEventListener('click', openSearch);
+  }
 }
 
 
