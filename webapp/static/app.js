@@ -142,8 +142,12 @@ function errorBox(msg) {
 async function showScreen(screen) {
   currentScreen = screen;
 
+  // Подсветка нижнего таба: вложенные/legacy-экраны принадлежат корневому
+  // табу (каталог → «Заказы», долги/платежи → «Финансы»). Иначе при заходе
+  // в каталог ни один таб не подсвечивался.
+  const navScreen = { stock: 'orders', debts: 'finance', payments: 'finance' }[screen] || screen;
   document.querySelectorAll('.nav-item').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.screen === screen);
+    btn.classList.toggle('active', btn.dataset.screen === navScreen);
     // Переинициализируем обработчик на случай если DOM обновился
     btn.onclick = () => showScreen(btn.dataset.screen);
   });
@@ -282,10 +286,10 @@ async function renderHome() {
   //    «открыть каталог» и «создать заказ» по data-new флагу.
   const actions = isBoss ? `
     <div class="action-grid">
-      <button class="action-btn" data-go="orders">
+      <button class="action-btn" data-go="stock">
         <span class="action-btn-icon icon-orange">📦</span>Каталог
       </button>
-      <button class="action-btn" data-go="orders">
+      <button class="action-btn" data-go="requests">
         <span class="action-btn-icon icon-amber">⏳</span>Заявки
       </button>
       <button class="action-btn" data-go="analytics">
@@ -297,7 +301,7 @@ async function renderHome() {
     </div>
   ` : `
     <div class="action-grid">
-      <button class="action-btn" data-go="orders">
+      <button class="action-btn" data-go="stock">
         <span class="action-btn-icon icon-orange">📦</span>Каталог
       </button>
       <button class="action-btn" data-go="orders" data-new="1">
@@ -327,7 +331,7 @@ async function renderHome() {
       bossBlock += `
         <div class="card" style="cursor:pointer;" id="go-requests">
           <div style="display:flex; align-items:center; gap:12px;">
-            <div class="card-row-icon" style="background:#fff1ce; color:#6f4a06;">⏳</div>
+            <div class="card-row-icon" style="background:var(--warn-bg); color:var(--warn);">⏳</div>
             <div style="flex:1;">
               <div style="font-weight:600;">${data.pending_requests} заявок на апрув</div>
               <div style="font-size:12px; color: var(--text-mute); margin-top:2px;">Нажмите чтобы открыть</div>
@@ -407,6 +411,16 @@ async function renderHome() {
       haptic();
       const target = btn.dataset.go;
       const isNew = btn.dataset.new === '1';
+      // «Заявки» (boss) → экран заявок на рассмотрении (под вкладкой «Заказы»),
+      // а не голый список заказов. Сначала корневой таб (для подсветки nav),
+      // затем поверх — список заявок.
+      if (target === 'requests') {
+        showScreen('orders');
+        if (typeof renderPendingRequests === 'function') {
+          setTimeout(renderPendingRequests, 50);
+        }
+        return;
+      }
       showScreen(target);
       // Если кликнули по «+ Заказ» — после загрузки экрана откроем редактор
       if (isNew && typeof openOrderEditor === 'function') {
@@ -416,9 +430,14 @@ async function renderHome() {
     });
   });
 
-  // Клик по карточке заявок → Заказы
+  // Клик по карточке «N заявок на апрув» → экран заявок (не просто список).
   const goReq = document.getElementById('go-requests');
-  if (goReq) goReq.addEventListener('click', () => showScreen('orders'));
+  if (goReq) goReq.addEventListener('click', () => {
+    showScreen('orders');
+    if (typeof renderPendingRequests === 'function') {
+      setTimeout(renderPendingRequests, 50);
+    }
+  });
 
   // Клик по строке недавнего заказа → Заказы
   document.querySelectorAll('[data-order-id]').forEach(row => {
@@ -431,6 +450,7 @@ async function renderHome() {
 let stockData = null;          // { products, categories }
 let stockCurrentCat = 'all';   // id выбранной категории или 'all'
 let stockSearch = '';
+let stockLimit = 200;          // сколько товаров показываем («Показать ещё» +200)
 
 async function renderStock() {
   const content = document.getElementById('content');
@@ -489,7 +509,7 @@ function renderStockList() {
         <div class="empty-state-title">Товары не найдены</div>
         <div class="empty-state-hint">Попробуйте изменить категорию или поисковый запрос</div>
       </div>`
-    : filtered.slice(0, 200).map((p, i) => {
+    : filtered.slice(0, stockLimit).map((p, i) => {
         // PR C: цена продажи (минимум) — всем; себестоимость — только boss.
         const priceLines = [];
         if (p.sale_price != null) priceLines.push(`мин. ${p.sale_price}`);
@@ -522,9 +542,18 @@ function renderStockList() {
 
   const truncEl = document.getElementById('stock-trunc');
   if (truncEl) {
-    truncEl.innerHTML = filtered.length > 200
-      ? `<div class="loader">Показаны первые 200 из ${filtered.length}. Уточните фильтр.</div>`
-      : '';
+    if (filtered.length > stockLimit) {
+      const remaining = filtered.length - stockLimit;
+      truncEl.innerHTML =
+        `<button class="btn-secondary" id="stock-more">Показать ещё (${remaining})</button>`;
+      document.getElementById('stock-more').addEventListener('click', () => {
+        haptic('light');
+        stockLimit += 200;
+        renderStockList();
+      });
+    } else {
+      truncEl.innerHTML = '';
+    }
   }
 }
 
@@ -555,7 +584,10 @@ function openPriceEditor(product) {
   const close = () => ov.remove();
   ov.addEventListener('click', e => { if (e.target === ov) close(); });
   document.getElementById('pe-cancel').addEventListener('click', close);
-  document.getElementById('pe-save').addEventListener('click', async () => {
+  document.getElementById('pe-save').addEventListener('click', async (ev) => {
+    const saveBtn = ev.currentTarget;
+    if (saveBtn.disabled) return;          // защита от дабл-клика
+    saveBtn.disabled = true;
     const saleRaw = document.getElementById('pe-sale').value.trim();
     const costRaw = document.getElementById('pe-cost').value.trim();
     try {
@@ -566,6 +598,7 @@ function openPriceEditor(product) {
         cost_price: costRaw === '' ? null : parseFloat(costRaw),
       });
     } catch (e) {
+      saveBtn.disabled = false;
       tg.showAlert ? tg.showAlert(e.message) : alert(e.message);
       return;
     }
@@ -574,6 +607,7 @@ function openPriceEditor(product) {
     product.cost_price = costRaw === '' ? null : parseFloat(costRaw);
     close();
     haptic('success');
+    toast('Цена сохранена');
     renderStockList();
   });
 }
@@ -581,6 +615,7 @@ function openPriceEditor(product) {
 function renderStockContent() {
   const content = document.getElementById('content');
   const { products, categories } = stockData;
+  stockLimit = 200;   // новый рендер каркаса — сбрасываем «показать ещё»
 
   // Категории — таблетки сверху
   const catBtns = [{ id: 'all', name: `Все (${products.length})` }, ...categories]
@@ -604,6 +639,7 @@ function renderStockContent() {
     btn.addEventListener('click', () => {
       haptic('light');
       stockCurrentCat = btn.dataset.cat;
+      stockLimit = 200;   // смена категории — список с начала
       // Подсветить активную таблетку без полного ре-рендера каркаса.
       document.querySelectorAll('[data-cat]').forEach(b =>
         b.classList.toggle('active', b.dataset.cat === stockCurrentCat)
@@ -615,6 +651,7 @@ function renderStockContent() {
   if (searchInput) {
     searchInput.addEventListener('input', e => {
       stockSearch = e.target.value;
+      stockLimit = 200;   // новый запрос — список с начала
       renderStockList();  // обновляем только список — поле держит фокус
     });
     // не дёргаем фокус, чтобы не открывать клавиатуру при первом рендере
@@ -633,6 +670,29 @@ function loading(msg = 'Загрузка…') {
 
 function haptic(type = 'light') {
   try { tg.HapticFeedback?.impactOccurred(type); } catch {}
+}
+
+// ─── Тосты ──────────────────────────────────────────
+// Лёгкая неблокирующая обратная связь для «тихих» действий (добавил
+// товар, сохранил цену, отметил оплату). В отличие от tg.showAlert не
+// прерывает поток модалкой. Хост вне #content — переживает ре-рендеры.
+function toast(msg, type = 'success') {
+  let host = document.getElementById('toast-host');
+  if (!host) {
+    host = document.createElement('div');
+    host.id = 'toast-host';
+    host.className = 'toast-host';
+    document.body.appendChild(host);
+  }
+  const el = document.createElement('div');
+  el.className = `toast toast--${type}`;
+  const icon = type === 'error' ? '⚠️' : type === 'info' ? 'ℹ️' : '✅';
+  el.textContent = `${icon} ${msg}`;
+  host.appendChild(el);
+  setTimeout(() => {
+    el.classList.add('toast--out');
+    setTimeout(() => el.remove(), 250);
+  }, 2400);
 }
 
 // ─── Нативная кнопка «Назад» Telegram ───────────────
@@ -1228,6 +1288,7 @@ async function openProductPicker() {
   }
 
   let selectedCat = 'all';
+  let prodLimit = 50;   // сколько товаров показываем («Показать ещё» +50)
   const { products, categories } = orderStockCache;
 
   function renderProducts() {
@@ -1241,9 +1302,12 @@ async function openProductPicker() {
 
     const list = document.getElementById('prod-list');
     if (!list) return;
+    const moreBtn = filtered.length > prodLimit
+      ? `<button class="btn-secondary" id="prod-more" style="margin-top:8px;">Показать ещё (${filtered.length - prodLimit})</button>`
+      : '';
     list.innerHTML = filtered.length === 0
       ? '<div class="loader">Товары не найдены</div>'
-      : filtered.slice(0, 50).map(p => {
+      : filtered.slice(0, prodLimit).map(p => {
           const ind = p.stock >= 100 ? 'green' : p.stock >= 20 ? 'yellow' : 'red';
           return `
             <div class="prod-row"
@@ -1258,7 +1322,7 @@ async function openProductPicker() {
               <span class="stock-badge badge-${ind}">${p.stock} ${p.unit}</span>
             </div>
           `;
-        }).join('');
+        }).join('') + moreBtn;
 
     document.querySelectorAll('.prod-row').forEach(row => {
       row.addEventListener('click', () => {
@@ -1269,6 +1333,11 @@ async function openProductPicker() {
           row.dataset.href || ''
         );
       });
+    });
+    document.getElementById('prod-more')?.addEventListener('click', () => {
+      haptic('light');
+      prodLimit += 50;
+      renderProducts();
     });
   }
 
@@ -1285,6 +1354,7 @@ async function openProductPicker() {
       catFilters.querySelectorAll('.cat-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       selectedCat = btn.dataset.cat;
+      prodLimit = 50;   // смена категории — список с начала
       renderProducts();
     });
   });
@@ -1295,7 +1365,7 @@ async function openProductPicker() {
   let prodTimer;
   prodSearch.addEventListener('input', () => {
     clearTimeout(prodTimer);
-    prodTimer = setTimeout(renderProducts, 250);
+    prodTimer = setTimeout(() => { prodLimit = 50; renderProducts(); }, 250);
   });
   renderProducts();
 }
@@ -1410,6 +1480,7 @@ function openQuantityInput(name, unit, maxStock, href) {
       tg.HapticFeedback?.notificationOccurred('success');
       tg.MainButton?.hideProgress?.();
       clearMainButton();
+      toast('Товар добавлен в заявку');
       renderOrderEditor();
     } catch (e) {
       tg.MainButton?.hideProgress?.();
@@ -2254,20 +2325,28 @@ async function renderCreditLimits(container) {
       editBox.hidden = !editBox.hidden;
     });
     card.querySelector('.limit-cancel').addEventListener('click', () => { editBox.hidden = true; });
-    card.querySelector('.limit-save').addEventListener('click', () => {
+    card.querySelector('.limit-save').addEventListener('click', async (ev) => {
+      const saveBtn = ev.currentTarget;
+      if (saveBtn.disabled) return;          // защита от дабл-клика
       const raw = card.querySelector('.limit-input').value;
       const amount = parseFloat(String(raw).replace(',', '.').replace(/\s/g, ''));
       if (isNaN(amount) || amount < 0) {
         tg.showAlert('❌ Лимит должен быть неотрицательным числом.');
         return;
       }
-      api('/api/credit/set', {
-        agent_id: card.dataset.agent,
-        agent_name: card.dataset.name,
-        limit_amount: amount,
-      })
-        .then(() => { tg.showAlert(`✅ Лимит обновлён: ${fmt(amount)} USD`); renderCreditLimits(container); })
-        .catch(e => tg.showAlert('❌ ' + e.message));
+      saveBtn.disabled = true;
+      try {
+        await api('/api/credit/set', {
+          agent_id: card.dataset.agent,
+          agent_name: card.dataset.name,
+          limit_amount: amount,
+        });
+        toast(`Лимит обновлён: ${fmt(amount)} USD`);
+        renderCreditLimits(container);
+      } catch (e) {
+        saveBtn.disabled = false;
+        tg.showAlert('❌ ' + e.message);
+      }
     });
   });
 }
@@ -2493,6 +2572,7 @@ async function renderDebts(container) {
             if (amount !== null) payload.amount = amount;
             await api('/api/orders/mark_paid', payload);
             tg.HapticFeedback?.notificationOccurred('success');
+            toast('Оплата отмечена, ждёт подтверждения');
             await renderDebts(container);
           } catch (e) {
             tg.HapticFeedback?.notificationOccurred('error');
