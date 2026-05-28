@@ -39,7 +39,9 @@ def log_keyboard():
 async def cmd_log(message: Message):
     if not can_manage_users(message.from_user.id):
         return await message.answer("⛔ Нет доступа.")
-    await message.answer("📋 Что показать?", reply_markup=log_keyboard())
+    # Сразу показываем последние 20; фильтры — чипами под списком.
+    records = await adb.get_audit_log(limit=20)
+    await send_log(message, records, "последние 20")
 
 
 @router.callback_query(F.data.startswith("log:"))
@@ -58,7 +60,7 @@ async def cb_log(call: CallbackQuery):
         for u in users[:20]:
             name = u["full_name"] or u["username"] or str(u["user_id"])
             kb.button(text=f"👤 {name}", callback_data=f"logu:{u['user_id']}")
-        kb.button(text="◀️ Назад", callback_data="log:menu")
+        kb.button(text="◀️ Назад", callback_data="log:20")
         kb.adjust(1)
         return await call.message.answer("👤 Выберите сотрудника:", reply_markup=kb.as_markup())
 
@@ -92,12 +94,6 @@ async def cb_log_user(call: CallbackQuery):
     await send_log(call.message, records, f"сотрудник {name}")
 
 
-@router.callback_query(F.data == "log:menu")
-async def cb_log_menu(call: CallbackQuery):
-    await call.answer()
-    await call.message.answer("📋 Что показать?", reply_markup=log_keyboard())
-
-
 async def send_log(message, records: list[dict], label: str):
     if not records:
         return await message.answer(
@@ -117,11 +113,7 @@ async def send_log(message, records: list[dict], label: str):
 
     # chunk_messages — общая утилита нарезки под Telegram-лимит
     chunks = chunk_messages(lines)
-    for chunk in chunks:
-        await message.answer(chunk, parse_mode="HTML")
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Другой фильтр", callback_data="log:menu")
-    kb.button(text="🏠 Меню", callback_data="menu")
-    kb.adjust(1)
-    await message.answer("Выберите действие:", reply_markup=kb.as_markup())
+    for i, chunk in enumerate(chunks):
+        # Фильтры крепим к последнему чанку — без отдельного экрана выбора.
+        kb = log_keyboard() if i == len(chunks) - 1 else None
+        await message.answer(chunk, parse_mode="HTML", reply_markup=kb)

@@ -49,9 +49,37 @@ router = Router()
 
 class OrderState(StatesGroup):
     choosing_product = State()  # выбор товара
-    entering_quantity = State()  # ввод количества
-    entering_price = State()  # ввод цены за единицу
+    entering_qty_price = State()  # ввод количества и цены одной строкой
     choosing_agent = State()  # выбор клиента
+
+
+def _parse_qty_price(text: str) -> tuple[float | None, float | None]:
+    """Парсит «5 150» / «5x150» / «5» → (qty, price).
+
+    qty=None → количество некорректно. price=None (при валидном qty) → цена
+    указана, но некорректна. Если цена опущена — price=0.0 (цена неизвестна).
+    Разделители кол-ва и цены: пробел, x/х/*/×."""
+    raw = (text or "").strip().lower().replace(",", ".")
+    for sep in ("х", "x", "*", "×"):
+        raw = raw.replace(sep, " ")
+    parts = raw.split()
+    if not parts:
+        return None, None
+    try:
+        qty = float(parts[0])
+        if qty <= 0:
+            return None, None
+    except ValueError:
+        return None, None
+    if len(parts) == 1:
+        return qty, 0.0
+    try:
+        price = float(parts[1])
+        if price < 0:
+            raise ValueError
+    except ValueError:
+        return qty, None
+    return qty, price
 
 
 # ─── Форматирование ───────────────────────────────────────────────────────────
@@ -490,61 +518,33 @@ async def cb_prod_pick(call: CallbackQuery, state: FSMContext):
 
     product = products[idx]
     await state.update_data(selected_product=product)
-    await state.set_state(OrderState.entering_quantity)
+    await state.set_state(OrderState.entering_qty_price)
+
+    order = await adb.get_order(data["order_id"]) if data.get("order_id") else None
+    currency = (order or {}).get("currency") or _BASE_CURRENCY
 
     await call.message.answer(
-        f"✅ Выбран: <b>{product['name']}</b>\n"
+        f"✅ Выбран: <b>{_esc(product['name'])}</b>\n"
         f"На складе: <code>{product['stock']} {product['unit']}</code>\n\n"
-        f"Введите количество:",
+        f"Введите <b>количество и цену</b> за {product['unit']} (в {currency}) одной строкой:\n"
+        f"<code>5 150</code>  ·  можно <code>5x150</code>\n\n"
+        f"<i>Только количество — <code>5</code> — добавит позицию без цены.\n"
+        f"Валюту заказа можно сменить кнопкой «💱 Валюта».</i>",
         parse_mode="HTML",
     )
 
 
-@router.message(OrderState.entering_quantity)
-async def process_quantity(message: Message, state: FSMContext):
-    try:
-        qty = float(message.text.strip().replace(",", "."))
-        if qty <= 0:
-            raise ValueError
-    except ValueError:
+@router.message(OrderState.entering_qty_price)
+async def process_qty_price(message: Message, state: FSMContext):
+    qty, price = _parse_qty_price(message.text)
+    if qty is None:
         return await message.answer(
-            "❌ Введите корректное количество, например: <code>5</code>",
+            "❌ Начните с количества. Например: <code>5</code> или <code>5 150</code>",
             parse_mode="HTML",
         )
-
-    data = await state.get_data()
-    if not data.get("selected_product") or not data.get("order_id"):
-        await state.clear()
+    if price is None:
         return await message.answer(
-            "⚠️ Сессия сброшена (возможно, бот перезагружался). Откройте заказ снова: /myorders",
-        )
-    product = data["selected_product"]
-    order_id = data["order_id"]
-    order = await adb.get_order(order_id)
-    currency = (order or {}).get("currency") or _BASE_CURRENCY
-    await state.update_data(quantity=qty)
-    await state.set_state(OrderState.entering_price)
-
-    await message.answer(
-        f"✅ Количество: <b>{qty} {product['unit']}</b>\n\n"
-        f"💰 Введите <b>цену за {product['unit']}</b> в <b>{currency}</b>.\n"
-        f"<i>(валюту заказа можно сменить кнопкой «💱 Валюта»)</i>\n"
-        f"Например: <code>150</code> или <code>49.99</code>.\n"
-        f"Если цена ещё не известна — введите <code>0</code>.",
-        parse_mode="HTML",
-    )
-
-
-@router.message(OrderState.entering_price)
-async def process_price(message: Message, state: FSMContext):
-    text = (message.text or "").strip().replace(",", ".").replace(" ", "")
-    try:
-        price = float(text)
-        if price < 0:
-            raise ValueError
-    except ValueError:
-        return await message.answer(
-            "❌ Введите корректную цену, например: <code>150</code> или <code>49.99</code>",
+            "❌ Цена некорректна. Например: <code>5 150</code> или <code>5 49.99</code>",
             parse_mode="HTML",
         )
 
@@ -556,7 +556,6 @@ async def process_price(message: Message, state: FSMContext):
         )
     order_id = data["order_id"]
     product = data["selected_product"]
-    qty = data["quantity"]
 
     await adb.add_order_item(
         order_id=order_id,

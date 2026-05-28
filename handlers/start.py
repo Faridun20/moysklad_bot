@@ -14,6 +14,7 @@ from aiogram.types import (
     BotCommandScopeChat,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.context import FSMContext
 from services.roles import is_boss
 from utils.formatters import DIV
 from config import ADMIN_IDS, WEBAPP_URL
@@ -48,11 +49,18 @@ def get_keyboard_for_role(role: str):
     kb = InlineKeyboardBuilder()
     rows: list[int] = []
 
-    # Для всех — быстрый доступ к своим заказам и долгам (полезно
-    # когда WebApp лень открывать просто чтобы посмотреть).
+    # Основной блок для работающих ролей: каталог, заказы/долги и
+    # просмотры (отгрузки/аналитика) — все потоки теперь открываются
+    # одним тапом (период/фильтр выбирается чипами уже внутри).
     if role in ("admin", "boss", "manager"):
+        kb.button(text="📦 Остатки", callback_data="sp:0")
+        kb.button(text="🗂 Категории", callback_data="cats:0")
+        rows += [2]
         kb.button(text="📋 Мои заказы", callback_data="ord_my")
         kb.button(text="💳 Долги", callback_data="debts_my")
+        rows += [2]
+        kb.button(text="🚚 Отгрузки", callback_data="sh:today")
+        kb.button(text="📊 Аналитика", callback_data="analytics")
         rows += [2]
 
     # Срочное для босса/админа — апрув заявок (push-driven но дублируем
@@ -79,16 +87,6 @@ def get_keyboard_for_role(role: str):
     return kb.as_markup()
 
 
-def shop_submenu_keyboard():
-    """Подменю «Каталог» — Остатки + Категории + назад."""
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📦 Все остатки", callback_data="sp:0")
-    kb.button(text="🗂 По категориям", callback_data="cats:0")
-    kb.button(text="◀️ Назад", callback_data="menu")
-    kb.adjust(2, 1)
-    return kb.as_markup()
-
-
 # Reply Keyboard убран по запросу пользователя (PR #47). Дублировал
 # Menu Button (слева от поля ввода) и занимал место снизу. WebApp
 # теперь только через Menu Button.
@@ -105,8 +103,12 @@ _COMMANDS_MANAGER = [
     BotCommand(command="start", description="🏠 Главное меню"),
     BotCommand(command="neworder", description="➕ Новый заказ"),
     BotCommand(command="myorders", description="📋 Мои заказы"),
+    BotCommand(command="stock", description="📦 Остатки на складе"),
+    BotCommand(command="categories", description="🗂 Товары по категориям"),
     BotCommand(command="pay", description="💵 Отправить платёж"),
     BotCommand(command="debts", description="💳 Мои долги"),
+    BotCommand(command="deposit", description="💵 Сдать наличные в кассу"),
+    BotCommand(command="return", description="↩️ Оформить возврат"),
     BotCommand(command="find", description="🔍 Поиск (заказ/платёж/клиент)"),
 ]
 _COMMANDS_BOSS = _COMMANDS_MANAGER + [
@@ -114,6 +116,9 @@ _COMMANDS_BOSS = _COMMANDS_MANAGER + [
     BotCommand(command="ship", description="🚚 Отгрузить заказ"),
     BotCommand(command="shipments", description="🚚 Последние отгрузки"),
     BotCommand(command="analytics", description="📊 Аналитика продаж"),
+    BotCommand(command="reports", description="📈 Отчёты"),
+    BotCommand(command="cancel", description="🚫 Отменить заказ"),
+    BotCommand(command="limit", description="📊 Кредитные лимиты"),
     BotCommand(command="sync_payments", description="🔄 Статус синка с МойСклад"),
 ]
 _COMMANDS_ADMIN = _COMMANDS_BOSS + [
@@ -178,7 +183,11 @@ def get_welcome_text(role: str, first_name: str = "") -> str:
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    # /start — универсальный выход: сбрасываем любое залипшее FSM-состояние
+    # (черновик платежа/заказа/возврата), иначе следующий текст юзера снова
+    # перехватит state-обработчик.
+    await state.clear()
     user = message.from_user
     ensure_user(user.id, user.username or "", user.full_name or "", ADMIN_IDS)
     role = get_role(user.id)
@@ -255,26 +264,16 @@ async def cmd_start(message: Message):
                 f"недоступна без привязки.</i>"
             )
 
-    # 1) Welcome + ReplyKeyboardRemove чтобы у юзеров, которые получили
-    #    persistent reply-кнопку «🌐 Открыть» в старых версиях бота, она
-    #    исчезла. После одного /start клиент Telegram запоминает «нет
-    #    клавиатуры» и больше её не показывает.
+    # Welcome + единое меню одним сообщением (раньше было двумя: текст
+    # отдельно, «⚡ Быстрые действия» с кнопками — отдельно).
+    # Если у роли нет меню (employee/гость уже отсеян) — снимаем возможную
+    # устаревшую reply-кнопку «🌐 Открыть» (PR #47) тем же сообщением.
+    inline_markup = get_keyboard_for_role(role)
     await message.answer(
         get_welcome_text(role, user.first_name or "") + sync_status_line,
         parse_mode="HTML",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=inline_markup or ReplyKeyboardRemove(),
     )
-
-    # 2) Если есть срочные/admin-only действия — отдельное короткое
-    #    меню inline-кнопок (Заявки на апрув, Пользователи, Аудит).
-    #    Для обычного менеджера get_keyboard_for_role вернёт inline-меню
-    #    с «Мои заказы»/«Долги»/«Платёж» — тоже отдельным сообщением.
-    inline_markup = get_keyboard_for_role(role)
-    if inline_markup is not None:
-        await message.answer(
-            "⚡ Быстрые действия:",
-            reply_markup=inline_markup,
-        )
 
     # Показываем сводку за месяц для менеджера
     if role == "manager":
@@ -376,36 +375,20 @@ async def cmd_snapshot_stats(message: Message):
 
 
 @router.callback_query(F.data == "menu")
-async def cb_menu(call: CallbackQuery):
+async def cb_menu(call: CallbackQuery, state: FSMContext):
+    # 🏠 Меню тоже сбрасывает залипшее FSM-состояние — см. cmd_start.
+    await state.clear()
     user = call.from_user
     ensure_user(user.id, user.username or "", user.full_name or "", ADMIN_IDS)
     role = get_role(user.id)
     await call.answer()
     if role == "guest":
         return await call.message.answer("⛔ Ваш аккаунт ещё не активирован. Напишите /start.")
-    # Reply-keyboard убрана (PR #47), WebApp только через Menu Button
-    # слева от поля ввода. Здесь только welcome-текст.
+    # Welcome + единое меню одним сообщением.
     await call.message.answer(
         get_welcome_text(role, user.first_name or ""),
         parse_mode="HTML",
-    )
-    inline_markup = get_keyboard_for_role(role)
-    if inline_markup is not None:
-        await call.message.answer(
-            "⚡ Быстрые действия:",
-            reply_markup=inline_markup,
-        )
-
-
-@router.callback_query(F.data == "shop_menu")
-async def cb_shop_menu(call: CallbackQuery):
-    if get_role(call.from_user.id) not in ("admin", "boss", "manager"):
-        return await call.answer("Нет доступа", show_alert=True)
-    await call.answer()
-    await call.message.answer(
-        "🛒 <b>Каталог склада</b>\n\nЧто хотите посмотреть?",
-        parse_mode="HTML",
-        reply_markup=shop_submenu_keyboard(),
+        reply_markup=get_keyboard_for_role(role),
     )
 
 
@@ -434,7 +417,7 @@ async def cb_ord_requests(call: CallbackQuery):
     if not is_boss(call.from_user.id):
         return await call.answer("Нет доступа", show_alert=True)
     await call.answer()
-    from services.database import get_pending_requests
+    from services.database import get_pending_requests, get_orders_by_ids
     from handlers.orders import pending_requests_keyboard
 
     requests = get_pending_requests()
@@ -443,8 +426,9 @@ async def cb_ord_requests(call: CallbackQuery):
             f"{DIV}\n⏳ <b>Заявки на отгрузку</b>\n\n<i>Нет новых заявок</i>",
             parse_mode="HTML",
         )
+    orders_by_id = get_orders_by_ids([r["order_id"] for r in requests[:10]])
     await call.message.answer(
         f"⏳ <b>Заявки ({len(requests)}):</b>",
         parse_mode="HTML",
-        reply_markup=pending_requests_keyboard(requests),
+        reply_markup=pending_requests_keyboard(requests, orders_by_id),
     )

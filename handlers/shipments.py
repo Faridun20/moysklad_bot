@@ -14,7 +14,6 @@ from services.moysklad import get_shipments, get_shipment_positions
 from utils.helpers import extract_id_from_href, user_safe_error, utc_now
 from utils.formatters import format_shipment
 from utils.keyboards import (
-    period_keyboard,
     shipments_nav_keyboard,
     shipments_back_keyboard,
 )
@@ -39,21 +38,16 @@ def is_allowed(user_id: int) -> bool:
 
 
 @router.message(Command("shipments"))
-async def cmd_shipments(message: Message):
+async def cmd_shipments(message: Message, bot: Bot):
     if not is_allowed(message.from_user.id):
         return
-    await message.answer("📅 За какой период показать отгрузки?", reply_markup=period_keyboard())
+    # Сразу показываем отгрузки за сегодня; период переключается чипами под списком.
+    now = utc_now()
+    since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    await show_shipments(bot, message.chat.id, since, None, "сегодня", page=0)
 
 
 # ─── Callback ─────────────────────────────────────────────────────────────────
-
-
-@router.callback_query(F.data == "sh_period")
-async def cb_sh_period(call: CallbackQuery):
-    await call.answer()
-    await call.message.answer(
-        "📅 За какой период показать отгрузки?", reply_markup=period_keyboard()
-    )
 
 
 @router.callback_query(F.data.startswith("sh:"))

@@ -15,6 +15,13 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+
+def _abort_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="❌ Отмена", callback_data="cancel_abort")
+    return kb.as_markup()
 
 from services import async_db as adb
 from services.roles import _has_role
@@ -59,6 +66,7 @@ async def cmd_cancel(message: Message, state: FSMContext):
     await message.answer(
         f"{DIV}\n🚫 <b>Отмена заказа #{order_id}</b>\n\nУкажите причину отмены (одним сообщением):",
         parse_mode="HTML",
+        reply_markup=_abort_keyboard(),
     )
 
 
@@ -66,6 +74,10 @@ async def cmd_cancel(message: Message, state: FSMContext):
 async def cb_cancel_abort(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await call.answer("Отменено")
+    try:
+        await call.message.edit_text("🚫 Отмена заказа прервана.")
+    except Exception:
+        pass
 
 
 @router.message(CancelFlow.waiting_reason)

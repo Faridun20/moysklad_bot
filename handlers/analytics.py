@@ -19,7 +19,7 @@ from services.database import (
     get_order_items_by_ids,
 )
 from utils.formatters import format_sales_report
-from utils.keyboards import analytics_keyboard, analytics_back_keyboard
+from utils.keyboards import analytics_back_keyboard
 from utils.helpers import user_safe_error, local_now
 
 logger = logging.getLogger(__name__)
@@ -77,29 +77,37 @@ def get_period(period: str, now: datetime) -> tuple:
     )
 
 
+async def _run_analytics(bot: Bot, chat_id: int, user_id: int, period: str):
+    # Local time — совпадает с DB now_str(). Раньше был datetime.utcnow(),
+    # и сегодняшние одобренные заказы (созданные в локальной TZ) выпадали
+    # из «окна» аналитики на величину TZ-offset.
+    now = local_now()
+    since, until, prev_since, prev_until, label = get_period(period, now)
+    role = cached_role(user_id)
+    if role == "manager":
+        await show_manager_analytics(
+            bot, chat_id, user_id, since, until, prev_since, prev_until, label
+        )
+    else:
+        await show_company_analytics(
+            bot, chat_id, since, until, prev_since, prev_until, label
+        )
+
+
 @router.message(Command("analytics"))
-async def cmd_analytics(message: Message):
+async def cmd_analytics(message: Message, bot: Bot):
     if not can_view_analytics(message.from_user.id):
         return await message.answer("⛔ Нет доступа.")
-    role = cached_role(message.from_user.id)
-    prefix = "📊 Ваша аналитика" if role == "manager" else "📊 Аналитика компании"
-    await message.answer(
-        f"{prefix}\nЗа какой период?",
-        reply_markup=analytics_keyboard(),
-    )
+    # Сразу показываем «этот месяц»; период переключается чипами под отчётом.
+    await _run_analytics(bot, message.chat.id, message.from_user.id, "month")
 
 
 @router.callback_query(F.data == "analytics")
-async def cb_analytics(call: CallbackQuery):
+async def cb_analytics(call: CallbackQuery, bot: Bot):
     if not can_view_analytics(call.from_user.id):
         return await call.answer("Нет доступа", show_alert=True)
     await call.answer()
-    role = cached_role(call.from_user.id)
-    prefix = "📊 Ваша аналитика" if role == "manager" else "📊 Аналитика компании"
-    await call.message.answer(
-        f"{prefix}\nЗа какой период?",
-        reply_markup=analytics_keyboard(),
-    )
+    await _run_analytics(bot, call.message.chat.id, call.from_user.id, "month")
 
 
 @router.callback_query(F.data.startswith("an:"))
@@ -107,37 +115,8 @@ async def cb_analytics_period(call: CallbackQuery, bot: Bot):
     if not can_view_analytics(call.from_user.id):
         return await call.answer("Нет доступа", show_alert=True)
     await call.answer()
-
     period = call.data.split(":")[1]
-    # Local time — совпадает с DB now_str(). Раньше был datetime.utcnow(),
-    # и сегодняшние одобренные заказы (созданные в локальной TZ) выпадали
-    # из «окна» аналитики на величину TZ-offset.
-    now = local_now()
-    since, until, prev_since, prev_until, label = get_period(period, now)
-
-    role = cached_role(call.from_user.id)
-
-    if role == "manager":
-        await show_manager_analytics(
-            bot,
-            call.message.chat.id,
-            call.from_user.id,
-            since,
-            until,
-            prev_since,
-            prev_until,
-            label,
-        )
-    else:
-        await show_company_analytics(
-            bot,
-            call.message.chat.id,
-            since,
-            until,
-            prev_since,
-            prev_until,
-            label,
-        )
+    await _run_analytics(bot, call.message.chat.id, call.from_user.id, period)
 
 
 async def show_company_analytics(
