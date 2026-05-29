@@ -17,6 +17,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from services.roles import is_boss
 from utils.formatters import DIV
+from utils.helpers import user_safe_error
 from config import ADMIN_IDS, WEBAPP_URL
 from services.database import (
     get_role,
@@ -388,7 +389,7 @@ async def cmd_refresh(message: Message):
     try:
         counts = await snapshot.refresh_all()
     except Exception as e:
-        return await message.answer(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
+        return await message.answer(user_safe_error(e, "refresh_snapshot"))
 
     lines = ["✅ <b>Snapshot обновлён</b>", ""]
     for key, val in counts.items():

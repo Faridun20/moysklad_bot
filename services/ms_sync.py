@@ -22,7 +22,7 @@ from services.database import (
     add_audit_log,
     get_role,
 )
-from services.moysklad import get_session, MS_BASE
+from services.moysklad import get_session, MS_BASE, redact_ms_error
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,9 @@ async def create_ms_employee(full_name: str, username: str) -> tuple[dict | None
             body_text = await resp.text()
             if resp.status >= 400:
                 err = _parse_ms_error(body_text)
-                logger.error("MS create employee HTTP %s: %s", resp.status, body_text[:500])
+                logger.error(
+                    "MS create employee HTTP %s: %s", resp.status, redact_ms_error(body_text)
+                )
                 return None, f"HTTP {resp.status}: {err}"
             try:
                 employee = await resp.json(content_type=None)
