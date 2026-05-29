@@ -55,3 +55,20 @@ def test_async_db_passes_through_coroutine(isolated_db):
     oid = _setup_paid_order_with_pending_payment(db=isolated_db, mgr=mgr)
     rows = asyncio.run(adb.get_paid_orders_awaiting_confirmation())
     assert any(r["id"] == oid for r in rows)
+
+
+# ─── Stage 3: get_pending_requests ──────────────────────────────────────────────
+
+
+def test_get_pending_requests_async(isolated_db):
+    db = isolated_db
+    assert inspect.iscoroutinefunction(db.get_pending_requests)
+
+    mgr = 303
+    db.set_role(mgr, "m", "Mgr", "manager")
+    oid = db.create_order(mgr, "Mgr", "")
+    db.update_order_status(oid, "draft")
+    req_id = db.create_shipment_request(oid, mgr, "Mgr", "срочно")
+
+    rows = asyncio.run(db.get_pending_requests())
+    assert any(r["id"] == req_id for r in rows)

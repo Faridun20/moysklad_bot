@@ -4839,14 +4839,16 @@ def get_shipment_request(req_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-def get_pending_requests() -> list[dict]:
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            "SELECT * FROM shipment_requests WHERE status = 'pending' ORDER BY created_at DESC"
-        )
-        rows = cur.fetchall()
-    return [dict(r) for r in rows]
+async def get_pending_requests() -> list[dict]:
+    """Заявки на отгрузку в статусе pending (для boss/admin).
+
+    asyncpg-миграция Stage 3 (задача #21): нативный async через adb_core.
+    Вызовы — async-контексты (handlers + webapp), cron не вызывает; sync-
+    обёртка не нужна.
+    """
+    return await adb_core.fetch(
+        "SELECT * FROM shipment_requests WHERE status = 'pending' ORDER BY created_at DESC"
+    )
 
 
 def approve_shipment_request(req_id: int, approved_by: int, approved_name: str) -> bool:
