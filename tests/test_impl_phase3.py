@@ -5,6 +5,8 @@ IMPLEMENTATION.md Фаза 3 (сервисный слой, адаптирова�
 кроме чистого compute_resubmit_summary.
 """
 
+import asyncio
+
 from services.order_workflow import compute_resubmit_summary
 
 
@@ -206,6 +208,8 @@ def test_get_stale_pending_orders(isolated_db):
         cur.execute(db.q("UPDATE orders SET submitted_at = ? WHERE id = ?"), (old_ts, old_oid))
         conn.commit()
 
-    stale_ids = {o["id"] for o in db.get_stale_pending_orders(hours=48)}
+    stale_ids = {
+        o["id"] for o in asyncio.run(db.get_stale_pending_orders(hours=48))
+    }  # async после asyncpg Stage 8
     assert old_oid in stale_ids
     assert fresh_oid not in stale_ids

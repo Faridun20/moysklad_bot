@@ -5,13 +5,15 @@
 Без сети, БД настоящая (isolated_db).
 """
 
+import asyncio
+
 import pytest
 
 
 def test_base_currency_seeded_on_init_db(isolated_db):
     """init_db должен засидить USD=1.0, иначе convert_to_base(x, 'USD') не работает."""
     db = isolated_db
-    rates = db.get_all_currency_rates()
+    rates = asyncio.run(db.get_all_currency_rates())  # async после asyncpg Stage 8
     by = {r["currency_code"]: r for r in rates}
     assert "USD" in by
     assert by["USD"]["rate_to_base"] == 1.0
@@ -57,7 +59,7 @@ def test_set_currency_rate_validates_currency_in_allowlist(isolated_db):
 def test_set_currency_rate_normalizes_code_uppercase(isolated_db):
     db = isolated_db
     db.set_currency_rate("uzs", 0.00008, updated_by=1)
-    rates = {r["currency_code"]: r for r in db.get_all_currency_rates()}
+    rates = {r["currency_code"]: r for r in asyncio.run(db.get_all_currency_rates())}
     assert "UZS" in rates
     assert "uzs" not in rates
 

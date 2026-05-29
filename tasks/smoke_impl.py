@@ -13,6 +13,7 @@
 чтобы не пересекаться с реальными данными.
 """
 
+import asyncio
 import os
 import sys
 
@@ -120,7 +121,7 @@ def run() -> None:
             db.q("UPDATE orders SET submitted_at = ? WHERE id = ?"), ("2000-01-01 00:00:00", o4)
         )
         conn.commit()
-    stale = db.get_stale_pending_orders(hours=48)
+    stale = asyncio.run(db.get_stale_pending_orders(hours=48))  # async после asyncpg Stage 8
     stale_ids = {o["id"] for o in stale}
     print(f"зависших pending (>48ч): {len(stale)}; #{o4} в списке: {o4 in stale_ids}")
 

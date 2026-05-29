@@ -3,6 +3,8 @@ IMPLEMENTATION.md Фаза 5: возвраты + FEFO/партии, сервис
 На настоящей SQLite (isolated_db). MS reverse-demand — отдельной фазой.
 """
 
+import asyncio
+
 import pytest
 
 
@@ -139,5 +141,7 @@ def test_batches_expiring_within(isolated_db):
     far = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
     db.upsert_product_batch("P3", "B-soon", "s", soon, 4)
     db.upsert_product_batch("P3", "B-far", "f", far, 4)
-    codes = {b["batch_code"] for b in db.get_batches_expiring_within(days=7)}
+    codes = {
+        b["batch_code"] for b in asyncio.run(db.get_batches_expiring_within(days=7))
+    }  # async после asyncpg Stage 8
     assert "s" in codes and "f" not in codes
