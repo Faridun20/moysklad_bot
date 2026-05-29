@@ -331,7 +331,20 @@ async def cmd_find(message: Message):
             lines.append(f"  • {esc(a.get('name') or '—')}")
     if not (orders or payments or agents):
         lines.append("\nНичего не найдено.")
-    await message.answer("\n".join(lines), parse_mode="HTML")
+
+    # Кнопки на найденные заказы — открыть в один тап, без захода в /myorders
+    # и поиска по номеру вручную. Доступ всё равно проверит cb_view_order.
+    markup = None
+    if orders:
+        kb = InlineKeyboardBuilder()
+        for o in orders:
+            kb.button(
+                text=f"📦 Заказ #{o['id']} · {o.get('agent_name') or '—'}",
+                callback_data=f"ord_view:{o['id']}",
+            )
+        kb.adjust(1)
+        markup = kb.as_markup()
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=markup)
 
 
 @router.message(Command("refresh"))

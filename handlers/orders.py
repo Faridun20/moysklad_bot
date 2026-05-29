@@ -464,36 +464,43 @@ async def cb_cat_pick(call: CallbackQuery, state: FSMContext):
         if not filtered:
             return await call.message.answer("📦 Нет товаров в этой категории.")
 
-        # Показываем по 10 товаров
-        kb = InlineKeyboardBuilder()
+        # Показываем по 20 товаров
         head = filtered[:20]
+        # Минимальные цены продажи (заданы руководством) — батчем, чтобы
+        # показать менеджеру прямо при выборе товара, без захода в каталог.
+        ms_ids = [extract_id_from_href(extract_href(r)) for r in head]
+        prices = await adb.get_product_prices_by_ids([m for m in ms_ids if m])
+
+        kb = InlineKeyboardBuilder()
+        products = []
         for i, r in enumerate(head):
             name = r.get("name", "—")
             stock = r.get("stock", 0)
-            unit = r.get("uom", {}).get("name", "шт")
+            unit = safe_get(r, "uom", "name", default="шт")
+            mid = ms_ids[i]
+            sale_min = (prices.get(mid) or {}).get("sale_price") if mid else None
             # Кодируем href кратко через индекс
             kb.button(
                 text=f"{name} ({stock} {unit})",
                 callback_data=f"prod_pick:{order_id}:{i}",
+            )
+            products.append(
+                {
+                    "name": name,
+                    "href": extract_href(r),
+                    "ms_id": mid or "",
+                    "unit": unit,
+                    "stock": stock,
+                    "sale_min": sale_min,
+                }
             )
 
         kb.button(text="◀️ Назад", callback_data=f"ord_add:{order_id}")
         kb.button(text="❌ Отмена", callback_data=f"ord_view:{order_id}")
         kb.adjust(1)
 
-        # Сохраняем список товаров в state
-        await state.update_data(
-            order_id=order_id,
-            products=[
-                {
-                    "name": r.get("name", "—"),
-                    "href": extract_href(r),
-                    "unit": safe_get(r, "uom", "name", default="шт"),
-                    "stock": r.get("stock", 0),
-                }
-                for r in head
-            ],
-        )
+        # Сохраняем список товаров (с мин. ценой) в state
+        await state.update_data(order_id=order_id, products=products)
         await state.set_state(OrderState.choosing_product)
 
         await call.message.answer(
@@ -523,12 +530,21 @@ async def cb_prod_pick(call: CallbackQuery, state: FSMContext):
     order = await adb.get_order(data["order_id"]) if data.get("order_id") else None
     currency = (order or {}).get("currency") or _BASE_CURRENCY
 
+    sale_min = product.get("sale_min")
+    if sale_min:
+        price_line = f"💰 Мин. цена продажи: <b>{_cur(sale_min, currency)}</b>\n"
+        only_qty_hint = "Только количество — <code>5</code> — возьму минимальную цену."
+    else:
+        price_line = ""
+        only_qty_hint = "Только количество — <code>5</code> — добавит позицию без цены."
+
     await call.message.answer(
         f"✅ Выбран: <b>{_esc(product['name'])}</b>\n"
-        f"На складе: <code>{product['stock']} {product['unit']}</code>\n\n"
+        f"На складе: <code>{product['stock']} {product['unit']}</code>\n"
+        f"{price_line}\n"
         f"Введите <b>количество и цену</b> за {product['unit']} (в {currency}) одной строкой:\n"
         f"<code>5 150</code>  ·  можно <code>5x150</code>\n\n"
-        f"<i>Только количество — <code>5</code> — добавит позицию без цены.\n"
+        f"<i>{only_qty_hint}\n"
         f"Валюту заказа можно сменить кнопкой «💱 Валюта».</i>",
         parse_mode="HTML",
     )
@@ -557,6 +573,22 @@ async def process_qty_price(message: Message, state: FSMContext):
     order_id = data["order_id"]
     product = data["selected_product"]
 
+    # Минимальная цена продажи (если задана руководством): пустую цену
+    # подставляем минимумом, ниже минимума — не даём (как в WebApp). Менеджеру
+    # не нужно идти в каталог сверять цену — она видна ещё на шаге выбора.
+    order = await adb.get_order(order_id)
+    currency = (order or {}).get("currency") or _BASE_CURRENCY
+    sale_min = product.get("sale_min")
+    if sale_min:
+        if price == 0:
+            price = float(sale_min)
+        elif price < float(sale_min):
+            return await message.answer(
+                f"❌ Цена ниже минимальной: <b>{_cur(sale_min, currency)}</b>.\n"
+                f"Введите цену ≥ минимума, либо только количество — подставлю минимум.",
+                parse_mode="HTML",
+            )
+
     await adb.add_order_item(
         order_id=order_id,
         product_name=product["name"],
@@ -568,14 +600,10 @@ async def process_qty_price(message: Message, state: FSMContext):
 
     await state.clear()
 
-    # Показываем текущий заказ
-    order, items = await asyncio.gather(
-        adb.get_order(order_id),
-        adb.get_order_items(order_id),
-    )
+    # Показываем текущий заказ (строка ордера не меняется при добавлении
+    # позиции — переиспользуем уже загруженный order, тянем только items).
+    items = await adb.get_order_items(order_id)
     subtotal = qty * price
-
-    currency = (order or {}).get("currency") or _BASE_CURRENCY
     full_name = message.from_user.full_name or str(message.from_user.id)
     role = await adb.get_role(message.from_user.id)
     await adb.add_audit_log(
