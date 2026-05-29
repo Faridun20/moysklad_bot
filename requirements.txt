@@ -3,6 +3,11 @@ aiohttp==3.9.5
 fastapi==0.115.0
 uvicorn==0.30.0
 psycopg2-binary==2.9.9
+# asyncpg — нативный async-драйвер Postgres (миграция async_db → asyncpg,
+# задача #21). aiosqlite — async-бэкенд SQLite для тестов/локалки, чтобы тот же
+# async-код-путь покрывался без реального Postgres. См. services/adb_core.py.
+asyncpg==0.30.0
+aiosqlite==0.20.0
 redis==5.0.7
 # Sentry — error tracking. Активируется только если SENTRY_DSN задан в env.
 # Без DSN init_sentry() no-op, оверхэд = 0. См. services/observability.py.
