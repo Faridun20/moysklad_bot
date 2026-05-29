@@ -759,6 +759,9 @@ def run_migrations():
             ("orders", "cancelled_at", "TEXT"),
             ("orders", "cancelled_by", "BIGINT"),
             ("orders", "cancellation_reason", "TEXT"),
+            # Когда отмена была отражена в МойСклад (реверс customerorder).
+            # NULL = ещё не синхронизировано; идемпотентность ms_cancel.
+            ("orders", "ms_cancel_synced_at", "TEXT"),
             ("orders", "credit_limit_override", "INTEGER NOT NULL DEFAULT 0"),
             ("orders", "credit_limit_override_by", "BIGINT"),
             ("orders", "price_check_warnings", "TEXT"),
@@ -3039,6 +3042,20 @@ def set_order_ms_customerorder_id(order_id: int, co_id: str) -> bool:
         cur.execute(
             q("UPDATE orders SET ms_customerorder_id = ?, updated_at = ? WHERE id = ?"),
             (co_id, now_str(), order_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    return updated
+
+
+def set_order_ms_cancel_synced(order_id: int) -> bool:
+    """Отметить, что отмена заказа отражена в МойСклад (реверс customerorder).
+    Идемпотентность ms_cancel: повторный реверс пропускается по этому полю."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("UPDATE orders SET ms_cancel_synced_at = ?, updated_at = ? WHERE id = ?"),
+            (now_str(), now_str(), order_id),
         )
         updated = cur.rowcount > 0
         conn.commit()

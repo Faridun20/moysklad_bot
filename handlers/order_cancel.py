@@ -100,6 +100,15 @@ async def process_cancel_reason(message: Message, state: FSMContext, bot: Bot):
     if not res.get("ok"):
         return await message.answer(f"⚠️ {res.get('error', 'не удалось отменить')}")
 
+    # Best-effort реверс customerorder в МойСклад (gated, идемпотентно, no-op
+    # без MS-контекста). Ошибка МС не ломает уже выполненную отмену в БД.
+    from services import ms_cancel
+
+    try:
+        await ms_cancel.reverse_customerorder(order_id)
+    except Exception:
+        logger.warning("MS reverse customerorder failed", exc_info=True)
+
     await message.answer(
         f"🚫 Заказ #{order_id} отменён.\nПричина: {esc(reason)}", parse_mode="HTML"
     )
