@@ -64,7 +64,7 @@ def _idem_set(key: str | None, value: dict) -> None:
 
 def _authorize(
     data: dict,
-    allowed_roles: tuple[str, ...] = ("admin", "boss", "manager"),
+    allowed_roles: tuple[str, ...] | None = ("admin", "boss", "manager"),
     rate_limit_scope: str | None = None,
     rate_limit_max: int = 30,
     rate_limit_window: float = 60.0,
@@ -73,6 +73,10 @@ def _authorize(
     Общая проверка для API endpoint'ов: валидируем initData и роль,
     опционально применяем per-user rate limit для дорогих эндпоинтов.
 
+    allowed_roles=None — роль НЕ проверяется (любой валидный Telegram-юзер):
+    для эндпоинтов, которые сами скоупят данные по user_id (история своих
+    платежей, свои заказы). Rate-limit при этом всё равно применяется.
+
     Возвращает dict-юзера из Telegram. Бросает HTTPException на отказ.
     Используйте вместо того, чтобы дублировать verify_init_data +
     get_role + role-check + rate-limit в каждом endpoint'е (легко забыть).
@@ -80,9 +84,10 @@ def _authorize(
     user = verify_init_data(data.get("initData", ""))
     if not user:
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
-    role = get_role(user["id"])
-    if role not in allowed_roles:
-        raise HTTPException(status_code=403, detail="Нет доступа")
+    if allowed_roles is not None:
+        role = get_role(user["id"])
+        if role not in allowed_roles:
+            raise HTTPException(status_code=403, detail="Нет доступа")
     if rate_limit_scope:
         if not rate_limit_acquire(rate_limit_scope, user["id"], rate_limit_max, rate_limit_window):
             raise HTTPException(
@@ -592,14 +597,14 @@ async def api_home(request: Request):
     from services import async_db as adb
 
     data = await request.json()
-    user = verify_init_data(data.get("initData", ""))
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid Telegram data")
-
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_home",
+        rate_limit_max=120,
+    )
     user_id = user["id"]
     role = get_role(user_id)
-    if role not in ("admin", "boss", "manager"):
-        raise HTTPException(status_code=403, detail="Нет доступа")
 
     # ВАЖНО про TZ: now_str() в services/database пишет datetime.now() —
     # это LOCAL-время сервера (на Railway обычно UTC, но если в env
@@ -755,13 +760,13 @@ async def api_stock(request: Request):
     from utils.helpers import extract_id_from_href
 
     data = await request.json()
-    user = verify_init_data(data.get("initData", ""))
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid Telegram data")
-
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_stock",
+        rate_limit_max=120,
+    )
     role = get_role(user["id"])
-    if role not in ("admin", "boss", "manager"):
-        raise HTTPException(status_code=403, detail="Нет доступа")
 
     try:
         rows, cats = await asyncio.gather(
@@ -824,14 +829,14 @@ async def api_analytics(request: Request):
     from datetime import datetime
 
     data = await request.json()
-    user = verify_init_data(data.get("initData", ""))
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid Telegram data")
-
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_analytics",
+        rate_limit_max=120,
+    )
     user_id = user["id"]
     role = get_role(user_id)
-    if role not in ("admin", "boss", "manager"):
-        raise HTTPException(status_code=403, detail="Нет доступа")
 
     now = datetime.now()
     # PR D: произвольный диапазон. Если заданы since/until (ISO) — используем их
@@ -1127,10 +1132,12 @@ async def api_payments_history(request: Request):
     from services.database import get_conn, get_cursor, q
 
     data = await request.json()
-    user = verify_init_data(data.get("initData", ""))
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid Telegram data")
-
+    user = _authorize(
+        data,
+        allowed_roles=None,  # любой валидный юзер — отдаём только его платежи
+        rate_limit_scope="api_payments_history",
+        rate_limit_max=120,
+    )
     user_id = user["id"]
 
     def _load():
@@ -1357,9 +1364,12 @@ async def api_payments_send(request: Request):
 async def api_orders(request: Request):
     """Список заказов текущего пользователя."""
     data = await request.json()
-    user = verify_init_data(data.get("initData", ""))
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+    user = _authorize(
+        data,
+        allowed_roles=None,  # любой валидный юзер — scope по роли ниже
+        rate_limit_scope="api_orders",
+        rate_limit_max=120,
+    )
 
     from services import async_db as adb
 
@@ -1453,13 +1463,12 @@ async def api_orders(request: Request):
 async def api_pending_requests(request: Request):
     """Заявки на отгрузку — только для boss/admin."""
     data = await request.json()
-    user = verify_init_data(data.get("initData", ""))
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid Telegram data")
-
-    role = get_role(user["id"])
-    if role not in ("admin", "boss"):
-        raise HTTPException(status_code=403, detail="Нет доступа")
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_orders_requests",
+        rate_limit_max=120,
+    )
 
     from services import async_db as adb
 
