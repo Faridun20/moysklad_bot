@@ -17,12 +17,13 @@ from services.moysklad import get_sales_stats
 from services.database import (
     get_user_orders,
     get_order_items_by_ids,
+    get_existing_ms_product_ids,
     _price_cents,
 )
 from services import money
 from utils.formatters import format_sales_report
 from utils.keyboards import analytics_back_keyboard
-from utils.helpers import user_safe_error, local_now
+from utils.helpers import user_safe_error, local_now, extract_id_from_href
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -137,10 +138,16 @@ async def show_company_analytics(
         parse_mode="HTML",
     )
     try:
-        current_stats, prev_stats = await asyncio.gather(
-            get_sales_stats(since, until),
-            get_sales_stats(prev_since, prev_until),
-        )
+        # Текущий период — основной (если упадёт, покажем ошибку). Предыдущий
+        # период (для тренда) — НЕ критичен: его сбой не должен обнулять весь
+        # отчёт. Раньше asyncio.gather рушил оба, и «за год» показывал пусто,
+        # когда запрос позапрошлого периода (1-2 года назад) падал/таймаутил.
+        current_stats = await get_sales_stats(since, until)
+        try:
+            prev_stats = await get_sales_stats(prev_since, prev_until)
+        except Exception as e:
+            logger.warning("prev-period stats failed (тренд пропущен): %s", e)
+            prev_stats = None
         txt = format_sales_report(f"🏢 Компания · {label}", current_stats, prev_stats)
         await bot.send_message(
             chat_id,
@@ -218,6 +225,7 @@ def _personal_stats_from_local(user_id: int, since: datetime, until: datetime) -
     count = 0
     clients: set[str] = set()
     products_agg: dict[str, dict] = {}
+    all_ms_ids: set[str] = set()
 
     for o in relevant:
         items = items_by_order.get(o["id"], [])
@@ -230,13 +238,31 @@ def _personal_stats_from_local(user_id: int, since: datetime, until: datetime) -
             clients.add(o["agent_name"])
         for it in items:
             name = it.get("product_name", "—")
+            mid = extract_id_from_href(it.get("product_href") or "")
+            if mid:
+                all_ms_ids.add(mid)
             qty = float(it.get("quantity", 0) or 0)
             line_cents = money.mul_qty(_price_cents(it), qty)
-            agg = products_agg.setdefault(name, {"sum": 0, "qty": 0.0})
+            agg = products_agg.setdefault(name, {"sum": 0, "qty": 0.0, "ms_id": mid})
             agg["sum"] += line_cents
             agg["qty"] += qty
+            if mid and not agg.get("ms_id"):
+                agg["ms_id"] = mid
 
-    top_products = sorted(products_agg.items(), key=lambda kv: kv[1]["sum"], reverse=True)[:5]
+    # Прячем из топа товары, удалённые в МойСклад (нет в снапшоте ms_products).
+    # Фильтруем ТОЛЬКО если снапшот сматчил хоть один товар (значит он
+    # заполнен) — иначе при пустом/несинхронизированном снапшоте спрятали бы
+    # всё. Позиции без ms_id (legacy/без href) не прячем — определить нельзя.
+    existing = get_existing_ms_product_ids(list(all_ms_ids)) if all_ms_ids else set()
+    if existing:
+        visible = {
+            name: d
+            for name, d in products_agg.items()
+            if not d.get("ms_id") or d["ms_id"] in existing
+        }
+    else:
+        visible = products_agg
+    top_products = sorted(visible.items(), key=lambda kv: kv[1]["sum"], reverse=True)[:5]
 
     # Формат совместим с format_sales_report — total и sum в минорных единицах.
     return {

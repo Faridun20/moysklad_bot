@@ -438,22 +438,38 @@ async def get_categories() -> list[dict]:
 @_ms_ttl_cache(ttl=60.0, name="get_shipments")
 async def get_shipments(since: datetime, until: datetime | None = None) -> list[dict]:
     """Получить отгрузки за период. Результат кэшируется на 60 сек —
-    несколько боссов смотрят аналитику одновременно без 429 от МС."""
+    несколько боссов смотрят аналитику одновременно без 429 от МС.
+
+    Пагинация offset-loop (CLAUDE.md: paginated MS endpoint — крути offset).
+    Раньше был один запрос limit=100 без offset: за длинный период (год)
+    с >100 отгрузок терялся хвост → выручка/топ занижались, а аналитика
+    «за год» выглядела неполной. Cap MAX_PAGES — защита от тысяч строк/таймаута."""
     since_str = since.strftime("%Y-%m-%d %H:%M:%S.000")
     filter_str = f"moment>{since_str}"
     if until:
         until_str = until.strftime("%Y-%m-%d %H:%M:%S.000")
         filter_str += f";moment<{until_str}"
-    data = await ms_get(
-        "entity/demand",
-        params={
-            "filter": filter_str,
-            "expand": "agent,owner",
-            "order": "moment,desc",
-            "limit": 100,
-        },
-    )
-    return data if isinstance(data, list) else data.get("rows", [])
+    rows: list[dict] = []
+    offset = 0
+    page = 100
+    max_pages = 10  # ≤1000 отгрузок — разумный потолок для аналитики
+    for _ in range(max_pages):
+        data = await ms_get(
+            "entity/demand",
+            params={
+                "filter": filter_str,
+                "expand": "agent,owner",
+                "order": "moment,desc",
+                "limit": page,
+                "offset": offset,
+            },
+        )
+        chunk = data if isinstance(data, list) else data.get("rows", [])
+        rows.extend(chunk)
+        if len(chunk) < page:
+            break
+        offset += page
+    return rows
 
 
 async def get_shipment(demand_id: str) -> dict | None:
