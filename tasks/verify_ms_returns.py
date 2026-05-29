@@ -40,7 +40,7 @@ async def _run(return_id: int | None, do_create: bool) -> int:
         print("ℹ️  Режим read-only. Для боевого создания: --return-id N --create")
         return 0
 
-    ret = get_return(return_id)
+    ret = await get_return(return_id)  # async после asyncpg Stage 10
     if not ret:
         print(f"❌ Возврат #{return_id} не найден в БД.")
         return 1

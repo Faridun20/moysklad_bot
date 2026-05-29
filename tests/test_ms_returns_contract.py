@@ -80,7 +80,7 @@ def test_salesreturn_builds_payload_and_saves_id(isolated_db, monkeypatch):
 
     res = asyncio.run(scenario())
     assert res["ok"] is True and res["ms_id"] == "SR-NEW", res
-    assert db.get_return(rid)["moysklad_return_id"] == "SR-NEW"
+    assert asyncio.run(db.get_return(rid))["moysklad_return_id"] == "SR-NEW"
 
     p = captured["payload"]
     assert p["organization"]["meta"]["type"] == "organization"
