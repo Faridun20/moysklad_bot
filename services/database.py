@@ -1438,22 +1438,18 @@ def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, reason: 
     return {"ok": True, "error": None}
 
 
-def get_stale_pending_orders(hours: int = 48) -> list[dict]:
+async def get_stale_pending_orders(hours: int = 48) -> list[dict]:
     """Заявки, висящие в pending дольше `hours` (для stale-мониторинга, §13).
-    Берём COALESCE(submitted_at, created_at)."""
+    Берём COALESCE(submitted_at, created_at). asyncpg Stage 8 (#21): native
+    async через adb_core; cutoff в Python (local TZ), параметром (CLAUDE.md)."""
     from datetime import timedelta
 
     cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "SELECT * FROM orders WHERE status = 'pending' AND (deleted_at IS NULL) "
-                "AND COALESCE(submitted_at, created_at) < ? ORDER BY created_at ASC"
-            ),
-            (cutoff,),
-        )
-        return [dict(r) for r in cur.fetchall()]
+    return await adb_core.fetch(
+        "SELECT * FROM orders WHERE status = 'pending' AND (deleted_at IS NULL) "
+        "AND COALESCE(submitted_at, created_at) < $1 ORDER BY created_at ASC",
+        cutoff,
+    )
 
 
 # ─── IMPLEMENTATION.md Фаза 4: сдача наличных (cash deposits) ─────────────────
@@ -1669,15 +1665,12 @@ def set_currency_rate(currency_code: str, rate: float, updated_by: int) -> tuple
     return True, None
 
 
-def get_all_currency_rates() -> list[dict]:
-    """Все курсы. Для admin-UI и /api/currency/rates."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            "SELECT currency_code, rate_to_base, updated_at, updated_by "
-            "FROM currency_rates ORDER BY currency_code"
-        )
-        return [dict(r) for r in cur.fetchall()]
+async def get_all_currency_rates() -> list[dict]:
+    """Все курсы. Для admin-UI и /api/currency/rates. asyncpg Stage 8 (#21)."""
+    return await adb_core.fetch(
+        "SELECT currency_code, rate_to_base, updated_at, updated_by "
+        "FROM currency_rates ORDER BY currency_code"
+    )
 
 
 def convert_to_base(amount: float, from_currency: str | None) -> float | None:
@@ -2227,21 +2220,17 @@ def _adjust_batch_qty(batch_id: str, delta: float) -> None:
         conn.commit()
 
 
-def get_batches_expiring_within(days: int = 7) -> list[dict]:
-    """Партии с остатком, истекающие в ближайшие `days` дней (§9.4)."""
+async def get_batches_expiring_within(days: int = 7) -> list[dict]:
+    """Партии с остатком, истекающие в ближайшие `days` дней (§9.4).
+    asyncpg Stage 8 (#21): cutoff в Python, параметром."""
     from datetime import timedelta
 
     cutoff = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "SELECT * FROM product_batches WHERE qty_remaining > 0 "
-                "AND expiry_date IS NOT NULL AND expiry_date <= ? ORDER BY expiry_date ASC"
-            ),
-            (cutoff,),
-        )
-        return [dict(r) for r in cur.fetchall()]
+    return await adb_core.fetch(
+        "SELECT * FROM product_batches WHERE qty_remaining > 0 "
+        "AND expiry_date IS NOT NULL AND expiry_date <= $1 ORDER BY expiry_date ASC",
+        cutoff,
+    )
 
 
 def _is_returnable(order: dict) -> bool:
@@ -2767,17 +2756,12 @@ def get_moysklad_employee_id(user_id: int) -> str | None:
     return row["moysklad_employee_id"] if USE_POSTGRES else row[0]
 
 
-def get_unsynced_managers() -> list[dict]:
-    """Получить менеджеров без привязки к МойСклад."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute("""
-            SELECT * FROM user_roles
-            WHERE role = 'manager'
-            AND (moysklad_employee_id IS NULL OR ms_sync_status = 'pending')
-        """)
-        rows = cur.fetchall()
-    return [dict(r) for r in rows]
+async def get_unsynced_managers() -> list[dict]:
+    """Менеджеры без привязки к МойСклад. asyncpg Stage 8 (#21)."""
+    return await adb_core.fetch(
+        "SELECT * FROM user_roles WHERE role = 'manager' "
+        "AND (moysklad_employee_id IS NULL OR ms_sync_status = 'pending')"
+    )
 
 
 def remove_user(user_id: int, removed_by: int | None = None, removed_name: str = "") -> bool:
@@ -3160,20 +3144,14 @@ def get_ms_sync_stats() -> dict:
     }
 
 
-def get_recent_ms_sync_failures(limit: int = 5) -> list[dict]:
-    """Последние failed-синхронизации с текстом ошибки — для UI команды."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "SELECT id, amount, currency, order_id, ms_sync_error "
-                "FROM payments "
-                "WHERE ms_sync_status = 'failed' "
-                "ORDER BY id DESC LIMIT ?"
-            ),
-            (limit,),
-        )
-        return [dict(r) for r in cur.fetchall()]
+async def get_recent_ms_sync_failures(limit: int = 5) -> list[dict]:
+    """Последние failed-синхронизации с текстом ошибки. asyncpg Stage 8 (#21)."""
+    return await adb_core.fetch(
+        "SELECT id, amount, currency, order_id, ms_sync_error "
+        "FROM payments WHERE ms_sync_status = 'failed' "
+        "ORDER BY id DESC LIMIT $1",
+        limit,
+    )
 
 
 def get_pool_stats() -> dict:
@@ -4052,24 +4030,23 @@ def get_cashbox_stats(since: str | None = None, until: str | None = None) -> dic
     return {"total_cents": total_cents, "count": count, "by_currency": by_currency}
 
 
-def get_summary_by_employee(since: str | None = None, until: str | None = None) -> list[dict]:
-    query = """
-        SELECT full_name, currency, SUM(amount) as total, COUNT(*) as count
-        FROM payments WHERE status = 'confirmed'
-    """
-    params = []
+async def get_summary_by_employee(
+    since: str | None = None, until: str | None = None
+) -> list[dict]:
+    """Платежи по сотрудникам (confirmed). asyncpg Stage 8 (#21)."""
+    query = (
+        "SELECT full_name, currency, SUM(amount) as total, COUNT(*) as count "
+        "FROM payments WHERE status = 'confirmed'"
+    )
+    params: list = []
     if since:
-        query += " AND created_at >= ?"
         params.append(since)
+        query += f" AND created_at >= ${len(params)}"
     if until:
-        query += " AND created_at <= ?"
         params.append(until)
+        query += f" AND created_at <= ${len(params)}"
     query += " GROUP BY full_name, currency ORDER BY total DESC"
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q(query), params)
-        rows = cur.fetchall()
-    return [dict(r) for r in rows]
+    return await adb_core.fetch(query, *params)
 
 
 # ─── Аудит лог ────────────────────────────────────────────────────────────────
@@ -4595,20 +4572,16 @@ def reject_payment_received(
     return updated
 
 
-def get_pending_confirmations(user_id: int | None = None) -> list[dict]:
+async def get_pending_confirmations(user_id: int | None = None) -> list[dict]:
     """Заказы, где менеджер отметил оплату, но босс ещё не подтвердил.
-    user_id фильтрует по автору (для менеджера — показать свои)."""
+    user_id фильтрует по автору. asyncpg Stage 8 (#21)."""
     query = "SELECT * FROM orders WHERE paid_at IS NOT NULL AND paid_confirmed_at IS NULL"
     params: list = []
     if user_id is not None:
-        query += " AND user_id = ?"
         params.append(user_id)
+        query += f" AND user_id = ${len(params)}"
     query += " ORDER BY paid_at ASC, id ASC"
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q(query), params)
-        rows = cur.fetchall()
-    return [dict(r) for r in rows]
+    return await adb_core.fetch(query, *params)
 
 
 def get_open_debts(
