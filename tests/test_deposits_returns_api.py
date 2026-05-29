@@ -5,6 +5,8 @@ FastAPI TestClient; мокаем границы: verify_init_data и get_notify_
 звонить в Telegram). БД/роли — настоящие (isolated_db).
 """
 
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -164,7 +166,7 @@ def test_return_create_full(client_env):
         },
     )
     assert resp.status_code == 200, resp.text
-    pend = db.get_pending_returns()
+    pend = asyncio.run(db.get_pending_returns())  # async после asyncpg Stage 5
     assert any(p["order_id"] == ids["order"] for p in pend)
     assert fake_bot.sent  # подтверждающим ушло уведомление
 

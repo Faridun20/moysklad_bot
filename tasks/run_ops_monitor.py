@@ -257,8 +257,8 @@ async def main() -> int:
     dead_stock_days = int(get_setting("dead_stock_days", 90))
 
     stale = get_stale_pending_orders(hours=stale_hours)
-    deposits = get_pending_cash_deposits()
-    returns = get_pending_returns()
+    deposits = await get_pending_cash_deposits()  # async после asyncpg Stage 5
+    returns = await get_pending_returns()  # async после asyncpg Stage 5
     overdue = get_overdue_undeposited_orders(days=cash_days)
     batches = get_batches_expiring_within(days=batch_days)
 

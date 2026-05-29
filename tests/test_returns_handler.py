@@ -113,7 +113,7 @@ def test_full_return_flow_creates_and_confirms(isolated_db):
     # «📦 Весь заказ» → создаётся полный возврат + уведомление боссу
     full_call = _FakeCall("ret_full", uid=1, bot=bot)
     asyncio.run(cb_return_full(full_call, state, bot))
-    pend = db.get_pending_returns()
+    pend = asyncio.run(db.get_pending_returns())  # async после asyncpg Stage 5
     assert len(pend) == 1
     return_id = pend[0]["id"]
     assert any(chat == 2 for chat, _, _ in bot.sent)  # боссу ушло

@@ -90,7 +90,7 @@ def test_partial_return_selected_items(isolated_db):
     asyncio.run(scenario())
 
     # Создан возврат: только Товар-А ×2 = 200
-    rets = db.get_pending_returns()
+    rets = asyncio.run(db.get_pending_returns())  # async после asyncpg Stage 5
     assert len(rets) == 1
     assert rets[0]["return_type"] == "partial"
     assert rets[0]["total_amount"] == 200.0
@@ -112,7 +112,7 @@ def test_full_shortcut_returns_everything(isolated_db):
 
     asyncio.run(scenario())
 
-    rets = db.get_pending_returns()
+    rets = asyncio.run(db.get_pending_returns())  # async после asyncpg Stage 5
     assert len(rets) == 1
     # 5×100 + 3×50 = 650
     assert rets[0]["total_amount"] == 650.0
@@ -136,5 +136,5 @@ def test_partial_done_requires_selection(isolated_db):
 
     done = asyncio.run(scenario())
     # Ничего не выбрано → возврат не создан, показан alert
-    assert db.get_pending_returns() == []
+    assert asyncio.run(db.get_pending_returns()) == []
     assert any("выберите" in (t or "").lower() for t, _ in done.alerts)
