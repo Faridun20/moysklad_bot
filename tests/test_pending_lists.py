@@ -70,9 +70,11 @@ def test_pending_returns_list_for_warehouse(isolated_db):
     oid = db.create_order(2, "M", "")
     iid = db.add_order_item(oid, "P", "href", 1, "шт", 100.0)
     db.update_order_status(oid, "shipped")
-    res = db.create_return(
-        oid, "full", "брак партии", [(iid, 1, 100.0)],
-        refund_method="cash", created_by=2, force=True,
+    res = asyncio.run(
+        db.create_return(
+            oid, "full", "брак партии", [(iid, 1, 100.0)],
+            refund_method="cash", created_by=2, force=True,
+        )
     )
     assert res["ok"]
 

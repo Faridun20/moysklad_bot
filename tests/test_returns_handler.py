@@ -144,8 +144,10 @@ def test_confirm_return_denied_for_manager(isolated_db):
 
     oid = _setup(db)
     items = db.get_order_items(oid)
-    r = db.create_return(
-        oid, "full", "x", [(items[0]["id"], 2, 200.0)], refund_method="no_refund", created_by=1
+    r = asyncio.run(
+        db.create_return(
+            oid, "full", "x", [(items[0]["id"], 2, 200.0)], refund_method="no_refund", created_by=1
+        )
     )
     call = _FakeCall(f"ret_ok:{r['return_id']}", uid=1)  # менеджер не вправе
     asyncio.run(cb_return_confirm(call, _FakeBot()))

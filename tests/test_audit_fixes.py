@@ -25,22 +25,26 @@ def test_duplicate_return_blocked(isolated_db):
     db = isolated_db
     oid = _shipped_order(db)
     items = db.get_order_items(oid)
-    r1 = db.create_return(
-        oid,
-        "full",
-        "брак",
-        [(items[0]["id"], 2, 200.0)],
-        refund_method="no_refund",
-        created_by=1,
+    r1 = asyncio.run(
+        db.create_return(
+            oid,
+            "full",
+            "брак",
+            [(items[0]["id"], 2, 200.0)],
+            refund_method="no_refund",
+            created_by=1,
+        )
     )
     assert r1["ok"]
-    r2 = db.create_return(
-        oid,
-        "full",
-        "ещё",
-        [(items[0]["id"], 2, 200.0)],
-        refund_method="no_refund",
-        created_by=1,
+    r2 = asyncio.run(
+        db.create_return(
+            oid,
+            "full",
+            "ещё",
+            [(items[0]["id"], 2, 200.0)],
+            refund_method="no_refund",
+            created_by=1,
+        )
     )
     assert r2["ok"] is False
     assert "уже есть" in r2["error"]
@@ -51,13 +55,15 @@ def test_return_qty_clamped_to_available(isolated_db):
     oid = _shipped_order(db, qty=2, price=100.0)
     items = db.get_order_items(oid)
     # просят 5 при доступных 2 → режется до 2, сумма пересчитывается
-    r = db.create_return(
-        oid,
-        "full",
-        "брак",
-        [(items[0]["id"], 5, 500.0)],
-        refund_method="no_refund",
-        created_by=1,
+    r = asyncio.run(
+        db.create_return(
+            oid,
+            "full",
+            "брак",
+            [(items[0]["id"], 5, 500.0)],
+            refund_method="no_refund",
+            created_by=1,
+        )
     )
     assert r["ok"] is True
     assert r["total_amount"] == 200.0
@@ -78,25 +84,29 @@ def test_manager_return_blocked_after_deadline(isolated_db):
         conn.commit()
     items = db.get_order_items(oid)
     # менеджер (force=False) — за дедлайном, нельзя
-    r_mgr = db.create_return(
-        oid,
-        "full",
-        "x",
-        [(items[0]["id"], 2, 200.0)],
-        refund_method="no_refund",
-        created_by=1,
-        force=False,
+    r_mgr = asyncio.run(
+        db.create_return(
+            oid,
+            "full",
+            "x",
+            [(items[0]["id"], 2, 200.0)],
+            refund_method="no_refund",
+            created_by=1,
+            force=False,
+        )
     )
     assert r_mgr["ok"] is False
     # начальство (force=True) — можно
-    r_boss = db.create_return(
-        oid,
-        "full",
-        "x",
-        [(items[0]["id"], 2, 200.0)],
-        refund_method="no_refund",
-        created_by=2,
-        force=True,
+    r_boss = asyncio.run(
+        db.create_return(
+            oid,
+            "full",
+            "x",
+            [(items[0]["id"], 2, 200.0)],
+            refund_method="no_refund",
+            created_by=2,
+            force=True,
+        )
     )
     assert r_boss["ok"] is True
 

@@ -2,6 +2,7 @@
 База данных — SQLite (локально) и PostgreSQL (продакшен).
 """
 
+import asyncio
 import os
 import time
 import logging
@@ -1191,8 +1192,6 @@ async def get_credit_overview() -> list[dict]:
     asyncpg Stage 12 (#21): native async через adb_core. Три батч-функции долга
     тоже async (await); get_setting остаётся sync (money-core, TTL-кэш) — зовём
     через to_thread, чтобы не блокировать loop на cache-miss."""
-    import asyncio
-
     agents: dict[str, str] = {}
     limits_map: dict[str, float] = {}
     for r in await adb_core.fetch("SELECT agent_id, agent_name, limit_amount FROM credit_limits"):
@@ -2208,6 +2207,19 @@ async def get_batches_expiring_within(days: int = 7) -> list[dict]:
     )
 
 
+class _TxnAbort(Exception):
+    """Внутренний сигнал отката adb_core.transaction() с user-facing сообщением.
+
+    adb_core.transaction() откатывает транзакцию на ЛЮБОМ исключении — поднимаем
+    это внутри `async with`, ловим снаружи и возвращаем {ok: False, error: message}.
+    Используется money-функциями (Stage 14+), где нужен откат уже сделанных
+    внутри критической секции записей (а не просто early-return = commit)."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
 def _is_returnable(order: dict) -> bool:
     """Заказ можно вернуть, если он отгружен/оплачен/частично-возвращён ИЛИ
     фактически оплачен по легаси-схеме (paid_confirmed_at заполнен — оплата
@@ -2217,15 +2229,18 @@ def _is_returnable(order: dict) -> bool:
     return bool(order.get("paid_confirmed_at"))
 
 
-def is_order_returnable(order_id: int) -> bool:
-    """Публичная проверка для бот/webapp-прехеков (та же логика, что в create_return)."""
-    order = get_order(order_id)
+async def is_order_returnable(order_id: int) -> bool:
+    """Публичная проверка для бот/webapp-прехеков (та же логика, что в create_return).
+
+    asyncpg Stage 14 (#21): native async; get_order пока sync (money-core) — мост
+    через to_thread, заменится на `await get_order(...)` в финальной money-стадии."""
+    order = await asyncio.to_thread(get_order, order_id)
     if order is None:
         return False
     return _is_returnable(order)
 
 
-def create_return(
+async def create_return(
     order_id: int,
     return_type: str,
     reason: str,
@@ -2238,8 +2253,13 @@ def create_return(
     return_type: 'partial'|'full'. refund_method: 'cash'|'debt_reduction'|'no_refund'.
     Доступно для shipped/paid/partially_returned. Дедлайн (return_deadline_days)
     блокирует, если не force (вызывающий решает по роли). Возвращает {ok, return_id}.
+
+    asyncpg Stage 14 (#21): native async. Pre-check reads (get_order/get_setting/
+    get_order_items) пока sync (money-core) — мостим через to_thread (они read-only
+    «до блокировки»); критическая секция (advisory-lock + dup-check + INSERT) —
+    adb_core.transaction() (advisory-xact-lock держится до конца tx, как раньше).
     """
-    order = get_order(order_id)
+    order = await asyncio.to_thread(get_order, order_id)
     if not order:
         return {"ok": False, "error": "Заказ не найден"}
     if not _is_returnable(order):
@@ -2248,11 +2268,9 @@ def create_return(
         return {"ok": False, "error": "Не указаны позиции возврата"}
 
     # Дедлайн (read-only, до блокировки).
-    deadline_days = int(get_setting("return_deadline_days", 90))
+    deadline_days = int(await asyncio.to_thread(get_setting, "return_deadline_days", 90))
     shipped_at = order.get("shipped_at")
     if shipped_at and not force:
-        from datetime import timedelta
-
         limit = (datetime.now() - timedelta(days=deadline_days)).strftime("%Y-%m-%d %H:%M:%S")
         if shipped_at < limit:
             return {
@@ -2264,7 +2282,7 @@ def create_return(
     # считаем сумму строки из price_cents (источник истины), а не из float price
     # и не доверяя переданному amount. Это read-only прикидка; финальную защиту
     # от overshoot даёт атомарный guard в confirm_return.
-    oitems = {it["id"]: it for it in get_order_items(order_id)}
+    oitems = {it["id"]: it for it in await asyncio.to_thread(get_order_items, order_id)}
     clamped: list[tuple] = []  # (order_item_id, take_qty, line_cents)
     for oitem_id, qty, _amount in items:
         oi = oitems.get(oitem_id)
@@ -2282,138 +2300,116 @@ def create_return(
     total_amount = float(money.from_cents(total_cents))
 
     # H1 + Round 6 RACE-2: не плодим параллельные возвраты по одному заказу.
-    # Advisory-lock держится до конца транзакции и теперь покрывает И dup-check,
-    # И INSERT (раньше lock снимался до INSERT — TOCTOU пропускал два возврата,
-    # потом каждый confirm_return наращивал returned_qty → overflow > quantity).
-    with get_conn() as conn:
-        cur = get_cursor(conn)
+    # Advisory-lock держится до конца транзакции и покрывает И dup-check, И INSERT
+    # (иначе TOCTOU пропускал два возврата, и каждый confirm_return наращивал
+    # returned_qty → overflow > quantity). Dup-check возвращает {ok: False} без
+    # записей — раннему return соответствует commit пустой tx (lock освобождён).
+    async with adb_core.transaction() as txn:
         if USE_POSTGRES:
-            cur.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                (f"return:order:{order_id}",),
-            )
-        cur.execute(
-            q(
-                "SELECT COUNT(*) AS c FROM returns WHERE order_id = ? "
-                "AND status = 'pending' AND (deleted_at IS NULL)"
-            ),
-            (order_id,),
+            await txn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", f"return:order:{order_id}")
+        cnt = await txn.fetchval(
+            "SELECT COUNT(*) FROM returns WHERE order_id = $1 "
+            "AND status = 'pending' AND (deleted_at IS NULL)",
+            order_id,
         )
-        row = cur.fetchone()
-        if int((row["c"] if USE_POSTGRES else row[0]) or 0) > 0:
-            conn.rollback()
+        if int(cnt or 0) > 0:
             return {"ok": False, "error": "По заказу уже есть возврат на рассмотрении"}
 
         if USE_POSTGRES:
-            cur.execute(
+            return_id = await txn.fetchval(
                 "INSERT INTO returns (order_id, return_type, reason, total_amount, total_amount_cents, "
                 "refund_method, created_by, status, created_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s) RETURNING id",
-                (order_id, return_type, reason, total_amount, total_cents, refund_method, created_by, now_str()),
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8) RETURNING id",
+                order_id, return_type, reason, total_amount, total_cents, refund_method, created_by, now_str(),
             )
-            return_id = cur.fetchone()["id"]
         else:
-            cur.execute(
+            await txn.execute(
                 "INSERT INTO returns (order_id, return_type, reason, total_amount, total_amount_cents, "
                 "refund_method, created_by, status, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
-                (order_id, return_type, reason, total_amount, total_cents, refund_method, created_by, now_str()),
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)",
+                order_id, return_type, reason, total_amount, total_cents, refund_method, created_by, now_str(),
             )
-            return_id = cur.lastrowid
+            return_id = await txn.fetchval("SELECT last_insert_rowid()")
         for oitem_id, qty, line_cents in clamped:
-            cur.execute(
-                q(
-                    "INSERT INTO return_items (return_id, order_item_id, qty, amount, amount_cents) "
-                    "VALUES (?, ?, ?, ?, ?)"
-                ),
-                (return_id, oitem_id, qty, float(money.from_cents(line_cents)), line_cents),
+            await txn.execute(
+                "INSERT INTO return_items (return_id, order_item_id, qty, amount, amount_cents) "
+                "VALUES ($1, $2, $3, $4, $5)",
+                return_id, oitem_id, qty, float(money.from_cents(line_cents)), line_cents,
             )
-        conn.commit()
     return {"ok": True, "return_id": return_id, "total_amount": total_amount}
 
 
-def mark_return_goods_received(return_id: int, by: int) -> dict:
-    """Кладовщик отметил «товар получен» (флаг, статус остаётся pending)."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("UPDATE returns SET goods_received = 1 WHERE id = ? AND status = 'pending'"),
-            (return_id,),
-        )
-        updated = cur.rowcount > 0
-        conn.commit()
-    return {"ok": updated}
+async def mark_return_goods_received(return_id: int, by: int) -> dict:
+    """Кладовщик отметил «товар получен» (флаг, статус остаётся pending).
+
+    asyncpg Stage 14 (#21): native async через adb_core."""
+    rc = await adb_core.execute(
+        "UPDATE returns SET goods_received = 1 WHERE id = $1 AND status = 'pending'",
+        return_id,
+    )
+    return {"ok": rc > 0}
 
 
-def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str = "") -> dict:
+async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str = "") -> dict:
     """Подтвердить возврат: returned_qty += по позициям, статус заказа
     (returned|partially_returned), восстановление остатков по партиям FEFO,
     обработка refund (cash → отрицательная сдача; debt_reduction/no_refund —
-    учёт в долге). Возвращает {ok, order_status}."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q("SELECT * FROM returns WHERE id = ?"), (return_id,))
-        row = cur.fetchone()
-        ret = dict(row) if row else None
+    учёт в долге). Возвращает {ok, order_status}.
+
+    asyncpg Stage 14 (#21): native async. Транзакционные границы сохранены как в
+    sync-версии — критическая секция (confirm + overshoot-guard) одна транзакция
+    (откат через _TxnAbort), батч-восстановление/статус/refund — отдельные
+    операции. Sync money-core хелперы (get_order/get_order_items/_adjust_batch_qty/
+    add_audit_log/get_role) мостим через to_thread."""
+    ret = await adb_core.fetchrow("SELECT * FROM returns WHERE id = $1", return_id)
     if not ret:
         return {"ok": False, "error": "Возврат не найден"}
     if ret.get("status") != "pending":
         return {"ok": False, "error": "Возврат уже обработан"}
 
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "UPDATE returns SET status = 'confirmed', confirmed_by = ?, confirmed_at = ? "
-                "WHERE id = ? AND status = 'pending'"
-            ),
-            (confirmed_by, now_str(), return_id),
-        )
-        if cur.rowcount == 0:
-            conn.rollback()
-            return {"ok": False, "error": "Возврат уже обработан"}
-        cur.execute(
-            q("SELECT order_item_id, qty FROM return_items WHERE return_id = ?"),
-            (return_id,),
-        )
-        ritems = [dict(r) for r in cur.fetchall()]
-        # Round 6 (L_R2): атомарная проверка returned_qty + delta <= quantity.
-        # Без неё concurrent confirm двух разных returns по одному заказу мог
-        # наращивать returned_qty за пределы quantity (overshoot → лишний MS-doc).
-        for ri in ritems:
-            cur.execute(
-                q(
-                    "UPDATE order_items "
-                    "SET returned_qty = returned_qty + ? "
-                    "WHERE id = ? AND returned_qty + ? <= quantity"
-                ),
-                (ri["qty"], ri["order_item_id"], ri["qty"]),
+    # Критическая атомарная секция: подтверждение + overshoot-guard.
+    # Round 6 (L_R2): атомарная проверка returned_qty + delta <= quantity.
+    # Без неё concurrent confirm двух разных returns по одному заказу мог
+    # наращивать returned_qty за пределы quantity (overshoot → лишний MS-doc).
+    ritems: list[dict] = []
+    try:
+        async with adb_core.transaction() as txn:
+            rc = await txn.execute(
+                "UPDATE returns SET status = 'confirmed', confirmed_by = $1, confirmed_at = $2 "
+                "WHERE id = $3 AND status = 'pending'",
+                confirmed_by, now_str(), return_id,
             )
-            if cur.rowcount == 0:
-                # Overshoot — откатываем confirm целиком, заявка остаётся в pending.
-                conn.rollback()
-                return {
-                    "ok": False,
-                    "error": (
+            if rc == 0:
+                raise _TxnAbort("Возврат уже обработан")
+            ritems = await txn.fetch(
+                "SELECT order_item_id, qty FROM return_items WHERE return_id = $1", return_id
+            )
+            for ri in ritems:
+                rc2 = await txn.execute(
+                    "UPDATE order_items SET returned_qty = returned_qty + $1 "
+                    "WHERE id = $2 AND returned_qty + $1 <= quantity",
+                    ri["qty"], ri["order_item_id"],
+                )
+                if rc2 == 0:
+                    # Overshoot — откатываем confirm целиком, заявка остаётся pending.
+                    raise _TxnAbort(
                         "Превышен доступный остаток к возврату (другой возврат "
                         "уже учтён). Перепроверьте и создайте новый."
-                    ),
-                }
-        conn.commit()
+                    )
+    except _TxnAbort as e:
+        return {"ok": False, "error": e.message}
 
     # Восстановление остатков по партиям — отдельно, через _adjust_batch_qty.
     for ri in ritems:
-        with get_conn() as conn:
-            cur = get_cursor(conn)
-            cur.execute(q("SELECT batch_id FROM order_items WHERE id = ?"), (ri["order_item_id"],))
-            br = cur.fetchone()
-        batch_id = (br["batch_id"] if USE_POSTGRES else br[0]) if br else None
+        batch_id = await adb_core.fetchval(
+            "SELECT batch_id FROM order_items WHERE id = $1", ri["order_item_id"]
+        )
         if batch_id:
-            _adjust_batch_qty(batch_id, float(ri["qty"]))
+            await asyncio.to_thread(_adjust_batch_qty, batch_id, float(ri["qty"]))
 
     order_id = ret["order_id"]
     # Полностью ли возвращён заказ?
-    items = get_order_items(order_id)
+    items = await asyncio.to_thread(get_order_items, order_id)
     fully = (
         all(
             float(it.get("returned_qty") or 0) + 1e-9 >= float(it.get("quantity") or 0)
@@ -2424,45 +2420,36 @@ def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str = "") 
     )
     new_status = "returned" if fully else "partially_returned"
     return_status = "full" if fully else "partial"
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("UPDATE orders SET status = ?, return_status = ?, updated_at = ? WHERE id = ?"),
-            (new_status, return_status, now_str(), order_id),
-        )
-        conn.commit()
+    await adb_core.execute(
+        "UPDATE orders SET status = $1, return_status = $2, updated_at = $3 WHERE id = $4",
+        new_status, return_status, now_str(), order_id,
+    )
 
     # Refund: cash → отрицательная подтверждённая сдача (учёт выдачи из кассы).
     if ret.get("refund_method") == "cash":
-        order = get_order(order_id)
-        with get_conn() as conn:
-            cur = get_cursor(conn)
-            refund_amount = -float(ret["total_amount"])
-            cur.execute(
-                q(
-                    "INSERT INTO cash_deposits (manager_id, amount, amount_cents, deposited_at, "
-                    "status, confirmed_by, confirmed_at, notes, created_at) "
-                    "VALUES (?, ?, ?, ?, 'confirmed', ?, ?, ?, ?)"
-                ),
-                (
-                    (order or {}).get("user_id") or confirmed_by,
-                    refund_amount,
-                    -money.to_cents(ret["total_amount"]),  # dual-write копеек (отриц.)
-                    now_str(),
-                    confirmed_by,
-                    now_str(),
-                    f"refund возврат #{return_id}",
-                    now_str(),
-                ),
-            )
-            conn.commit()
+        order = await asyncio.to_thread(get_order, order_id)
+        await adb_core.execute(
+            "INSERT INTO cash_deposits (manager_id, amount, amount_cents, deposited_at, "
+            "status, confirmed_by, confirmed_at, notes, created_at) "
+            "VALUES ($1, $2, $3, $4, 'confirmed', $5, $6, $7, $8)",
+            (order or {}).get("user_id") or confirmed_by,
+            -float(ret["total_amount"]),
+            -money.to_cents(ret["total_amount"]),  # dual-write копеек (отриц.)
+            now_str(),
+            confirmed_by,
+            now_str(),
+            f"refund возврат #{return_id}",
+            now_str(),
+        )
     # debt_reduction / no_refund — отдельной записи не требуют (долг учитывает
     # подтверждённые возвраты в get_agent_current_debt).
 
-    add_audit_log(
+    role = await asyncio.to_thread(get_role, confirmed_by)
+    await asyncio.to_thread(
+        add_audit_log,
         confirmed_by,
         confirmed_name,
-        get_role(confirmed_by),
+        role,
         "return_confirmed",
         f"Возврат #{return_id} по заказу #{order_id} ({return_status}, "
         f"{ret['total_amount']:.0f} USD, {ret.get('refund_method')})",
@@ -3751,8 +3738,6 @@ def _trigger_ms_paymentin_sync(payment_id: int) -> None:
     БД-confirm уже закоммичен к моменту вызова; ошибки синка некритичны
     (cron-retry добирает), поэтому всё best-effort.
     """
-    import asyncio
-
     try:
         from services.ms_payments import create_paymentin_for_payment
     except Exception:

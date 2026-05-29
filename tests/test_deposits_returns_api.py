@@ -125,13 +125,15 @@ def test_deposit_create_bad_amount(client_env):
 def test_returns_pending_and_confirm(client_env):
     client, db, ids, _ = client_env
     items = db.get_order_items(ids["order"])
-    r = db.create_return(
-        ids["order"],
-        "full",
-        "брак",
-        [(items[0]["id"], 1, 250.0)],
-        refund_method="no_refund",
-        created_by=ids["mgr"],
+    r = asyncio.run(
+        db.create_return(
+            ids["order"],
+            "full",
+            "брак",
+            [(items[0]["id"], 1, 250.0)],
+            refund_method="no_refund",
+            created_by=ids["mgr"],
+        )
     )
 
     # warehouse_keeper видит список
@@ -243,7 +245,7 @@ def test_set_return_ms_id_second_call_loses_race(isolated_db):
     db.add_order_item(oid, "P", "", 1, "шт", 100.0)
     db.update_order_status(oid, "shipped")
     items = db.get_order_items(oid)
-    r = db.create_return(oid, "full", "брак", [(items[0]["id"], 1, 100.0)], "no_refund", mgr)
+    r = asyncio.run(db.create_return(oid, "full", "брак", [(items[0]["id"], 1, 100.0)], "no_refund", mgr))
     assert r["ok"]
 
     rid = r["return_id"]
@@ -266,9 +268,9 @@ def test_create_return_blocks_second_pending_for_same_order(isolated_db):
     db.add_order_item(oid, "P", "", 2, "шт", 100.0)
     db.update_order_status(oid, "shipped")
     items = db.get_order_items(oid)
-    r1 = db.create_return(oid, "partial", "x", [(items[0]["id"], 1, 100.0)], "no_refund", mgr)
+    r1 = asyncio.run(db.create_return(oid, "partial", "x", [(items[0]["id"], 1, 100.0)], "no_refund", mgr))
     assert r1["ok"]
-    r2 = db.create_return(oid, "partial", "x", [(items[0]["id"], 1, 100.0)], "no_refund", mgr)
+    r2 = asyncio.run(db.create_return(oid, "partial", "x", [(items[0]["id"], 1, 100.0)], "no_refund", mgr))
     assert r2["ok"] is False
     assert "уже есть возврат" in r2["error"]
 
@@ -289,12 +291,12 @@ def test_confirm_return_blocks_overshoot(isolated_db):
     items = db.get_order_items(oid)
 
     # Создаём первый возврат на полные 2 шт и подтверждаем.
-    r1 = db.create_return(oid, "full", "x", [(items[0]["id"], 2, 200.0)], "no_refund", mgr)
+    r1 = asyncio.run(db.create_return(oid, "full", "x", [(items[0]["id"], 2, 200.0)], "no_refund", mgr))
     assert r1["ok"]
-    res = db.confirm_return(r1["return_id"], mgr, "M")
+    res = asyncio.run(db.confirm_return(r1["return_id"], mgr, "M"))
     assert res["ok"], res
 
     # Второй возврат на ту же позицию — create_return уже клампит до доступного
     # (доступно 0), отказывает на стадии создания.
-    r2 = db.create_return(oid, "partial", "x", [(items[0]["id"], 1, 100.0)], "no_refund", mgr)
+    r2 = asyncio.run(db.create_return(oid, "partial", "x", [(items[0]["id"], 1, 100.0)], "no_refund", mgr))
     assert r2["ok"] is False  # нечего возвращать

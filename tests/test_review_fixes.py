@@ -87,10 +87,10 @@ def test_refund_cash_writes_amount_cents(isolated_db):
 
     oitems = db.get_order_items(oid)
     items = [(oitems[0]["id"], 1, 49.99)]
-    res = db.create_return(oid, "full", "брак", items, "cash", boss)
+    res = asyncio.run(db.create_return(oid, "full", "брак", items, "cash", boss))
     assert res["ok"], res
 
-    cres = db.confirm_return(res["return_id"], boss, "Boss")
+    cres = asyncio.run(db.confirm_return(res["return_id"], boss, "Boss"))
     assert cres["ok"], cres
 
     deps = asyncio.run(db.get_manager_cash_deposits(2))  # order.user_id = 2; async (Stage 9)
