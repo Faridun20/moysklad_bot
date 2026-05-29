@@ -239,6 +239,17 @@ def start_background_tasks(bot: Bot) -> list[asyncio.Task]:
     ]
 
 
+async def _close_db_pool() -> None:
+    """Закрыть asyncpg-пул (если создавался). Best-effort: на SQLite no-op,
+    в проде освобождает коннекты к Postgres при остановке процесса."""
+    try:
+        from services import adb_core
+
+        await adb_core.close_pool()
+    except Exception:
+        logger.exception("adb_core.close_pool failed")
+
+
 async def _shutdown(tasks: list[asyncio.Task]) -> None:
     """Аккуратно отменить фоновые задачи и дождаться их завершения."""
     for t in tasks:
@@ -248,6 +259,7 @@ async def _shutdown(tasks: list[asyncio.Task]) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
     await close_session()
     await close_tg_session()
+    await _close_db_pool()
     # В BOT_MODE=all webapp поднят в этом же процессе и мог создать
     # собственный notify-bot для approve/reject API. Закрываем его.
     if BOT_MODE == "all":
@@ -388,6 +400,7 @@ async def _run_webapp_only():
         await close_session()
         await close_tg_session()
         await webapp_server.close_notify_bot()
+        await _close_db_pool()
 
 
 async def main():

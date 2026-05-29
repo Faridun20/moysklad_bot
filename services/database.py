@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from services import money  # канонические деньги (копейки); leaf-модуль, без циклов
+from services import adb_core  # async DB-слой (asyncpg/aiosqlite); leaf-модуль, без циклов
 
 logger = logging.getLogger(__name__)
 
@@ -4664,7 +4665,7 @@ def get_open_debts(
     return [dict(r) for r in rows]
 
 
-def get_paid_orders_awaiting_confirmation(user_id: int | None = None) -> list[dict]:
+async def get_paid_orders_awaiting_confirmation(user_id: int | None = None) -> list[dict]:
     """Paid-заказы с pending-платежом, ожидающие подтверждения боссом.
 
     Когда босс одобряет отгрузку по заказу payment_type='paid', авто-
@@ -4673,6 +4674,12 @@ def get_paid_orders_awaiting_confirmation(user_id: int | None = None) -> list[di
     дать боссу surface для подтверждения в WebApp (таб «Платежи»).
 
     user_id — если указан, только заказы этого менеджера; иначе все.
+
+    asyncpg-миграция Stage 1 (задача #21): пилотная функция переведена на
+    нативный async через services.adb_core (плейсхолдеры $N). Вызывается
+    только из webapp через `await adb.get_paid_orders_awaiting_confirmation()`;
+    async_db пропускает coroutine-функции без to_thread-обёртки. Sync-вызовов
+    у неё нет — поэтому она безопасна как первый пилот.
     """
     query = (
         "SELECT * FROM orders o "
@@ -4683,14 +4690,10 @@ def get_paid_orders_awaiting_confirmation(user_id: int | None = None) -> list[di
     )
     params: list = []
     if user_id is not None:
-        query += " AND o.user_id = ?"
         params.append(user_id)
+        query += f" AND o.user_id = ${len(params)}"
     query += " ORDER BY o.id ASC"
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q(query), params)
-        rows = cur.fetchall()
-    return [dict(r) for r in rows]
+    return await adb_core.fetch(query, *params)
 
 
 def update_order_currency(order_id: int, currency: str) -> bool:
