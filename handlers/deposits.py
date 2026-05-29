@@ -124,6 +124,49 @@ async def cmd_my_deposits(message: Message):
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
+async def _show_pending_deposits(target):
+    """Список сдач на подтверждении с кнопками (для боса/бухгалтера).
+    Раньше сдачи можно было подтвердить только из push-уведомления — если
+    оно потерялось, бухгалтер не мог найти очередь. Теперь есть /deposits."""
+    deposits = await adb.get_pending_cash_deposits()
+    if not deposits:
+        return await target.answer("✅ Нет сдач на подтверждении.")
+    await target.answer(
+        f"💵 <b>Сдачи на подтверждении ({len(deposits)}):</b>", parse_mode="HTML"
+    )
+    for d in deposits:
+        allocations = await adb.get_cash_deposit_orders(d["id"])
+        orders_line = (
+            "\n".join(
+                f"  • заказ #{a['order_id']} — {_fmt_amount(a['amount_allocated'])} USD"
+                for a in allocations
+            )
+            or "  <i>нет привязок</i>"
+        )
+        text = (
+            f"{DIV}\n"
+            f"💵 <b>Сдача #{d['id']}</b>\n"
+            f"💰 Сумма: <b>{_fmt_amount(d['amount'])} USD</b>\n"
+            f"📦 Закрывает заказы:\n{orders_line}"
+        )
+        await target.answer(text, parse_mode="HTML", reply_markup=_confirm_keyboard(d["id"]))
+
+
+@router.message(Command("deposits"))
+async def cmd_pending_deposits(message: Message):
+    if not can_confirm_deposit(message.from_user.id):
+        return await message.answer("⛔ Подтверждать сдачи может босс/бухгалтер.")
+    await _show_pending_deposits(message)
+
+
+@router.callback_query(F.data == "dep_pending")
+async def cb_pending_deposits(call: CallbackQuery):
+    if not can_confirm_deposit(call.from_user.id):
+        return await call.answer("⛔ Нет доступа", show_alert=True)
+    await call.answer()
+    await _show_pending_deposits(call.message)
+
+
 @router.callback_query(F.data.startswith("dep_ok:"))
 async def cb_deposit_confirm(call: CallbackQuery, bot: Bot):
     if not can_confirm_deposit(call.from_user.id):

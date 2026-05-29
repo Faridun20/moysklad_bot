@@ -1123,22 +1123,22 @@ def get_agent_current_debt(agent_id: str) -> float:
             (agent_id,),
         )
         order_ids = [(r["id"] if USE_POSTGRES else r[0]) for r in cur.fetchall()]
-    debt = 0.0
+    debt_cents = 0
     for oid in order_ids:
         summary = get_order_payment_summary(oid)
         with get_conn() as conn:
             cur = get_cursor(conn)
             cur.execute(
                 q(
-                    "SELECT COALESCE(SUM(total_amount), 0) AS s FROM returns "
+                    f"SELECT {_SUM_RETURNS_CENTS} AS s FROM returns "
                     "WHERE order_id = ? AND status = 'confirmed' AND (deleted_at IS NULL)"
                 ),
                 (oid,),
             )
             row = cur.fetchone()
-        returns_sum = float((row["s"] if USE_POSTGRES else row[0]) or 0)
-        debt += max(0.0, summary["remaining"] - returns_sum)
-    return debt
+        returns_cents = int((row["s"] if USE_POSTGRES else row[0]) or 0)
+        debt_cents += max(0, int(summary.get("remaining_cents", 0)) - returns_cents)
+    return float(money.from_cents(debt_cents))
 
 
 def check_credit_limit(agent_id: str, order_total: float) -> dict:
@@ -2857,6 +2857,19 @@ def _amount_cents(payment: dict) -> int:
     return money.to_cents(payment.get("amount", 0) or 0)
 
 
+# SQL-фрагменты «сумма денег в копейках» — берут dual-write *_cents с фолбэком
+# на legacy REAL (round(x*100)). Без placeholder'ов, безопасно встраивать в f-string.
+# Работают и в SQLite, и в Postgres (round + CAST AS INTEGER). Позволяют считать
+# суммы/сравнения точно в целых копейках вместо float (раньше нужен был epsilon).
+_SUM_PAYMENTS_CENTS = "COALESCE(SUM(COALESCE(amount_cents, CAST(round(amount * 100) AS INTEGER))), 0)"
+_SUM_ORDER_TOTAL_CENTS = (
+    "COALESCE(SUM(CAST(round(quantity * COALESCE(price_cents, round(price * 100))) AS INTEGER)), 0)"
+)
+_SUM_RETURNS_CENTS = (
+    "COALESCE(SUM(COALESCE(total_amount_cents, CAST(round(total_amount * 100) AS INTEGER))), 0)"
+)
+
+
 def get_order_payment_summary(order_id: int) -> dict:
     """Сумма по заказу: total / confirmed / pending / remaining.
 
@@ -3807,25 +3820,26 @@ def _maybe_close_order_after_payment(
         if already_closed:
             return
 
-        # Пересчёт ВНУТРИ транзакции — видим актуальную сумму confirmed
+        # Пересчёт ВНУТРИ транзакции — видим актуальную сумму confirmed.
+        # Считаем в копейках (точное сравнение) — без epsilon-костыля.
         cur.execute(
             q(
-                "SELECT COALESCE(SUM(amount), 0) AS s FROM payments "
+                f"SELECT {_SUM_PAYMENTS_CENTS} AS s FROM payments "
                 "WHERE order_id = ? AND status = 'confirmed'"
             ),
             (order_id,),
         )
         r = cur.fetchone()
-        confirmed_sum = float((r["s"] if USE_POSTGRES else r[0]) or 0)
+        confirmed_cents = int((r["s"] if USE_POSTGRES else r[0]) or 0)
 
         cur.execute(
-            q("SELECT COALESCE(SUM(quantity * price), 0) AS t FROM order_items WHERE order_id = ?"),
+            q(f"SELECT {_SUM_ORDER_TOTAL_CENTS} AS t FROM order_items WHERE order_id = ?"),
             (order_id,),
         )
         r = cur.fetchone()
-        total = float((r["t"] if USE_POSTGRES else r[0]) or 0)
+        total_cents = int((r["t"] if USE_POSTGRES else r[0]) or 0)
 
-        if confirmed_sum < total - 0.01:
+        if confirmed_cents < total_cents:
             return  # ещё не полностью оплачен
 
         # Закрываем
@@ -3857,7 +3871,7 @@ def _maybe_close_order_after_payment(
             get_role(confirmed_by) if confirmed_by else "",
             "order_fully_paid",
             f"Заказ #{order_id} полностью оплачен "
-            f"(сумма подтверждённых платежей: {confirmed_sum:,.0f})",
+            f"(сумма подтверждённых платежей: {money.format_cents(confirmed_cents)})",
         )
 
 
@@ -4250,54 +4264,57 @@ def mark_order_paid(
             return (False, None)
 
         # Под locкам считаем суммы — гарантия что между recompute и
-        # INSERT никто другой не добавит payment.
+        # INSERT никто другой не добавит payment. Считаем в копейках (точно).
         cur.execute(
             q(
-                "SELECT COALESCE(SUM(amount), 0) AS s FROM payments "
+                f"SELECT {_SUM_PAYMENTS_CENTS} AS s FROM payments "
                 "WHERE order_id = ? AND status IN ('pending', 'confirmed')"
             ),
             (order_id,),
         )
         r = cur.fetchone()
-        used = float((r["s"] if USE_POSTGRES else r[0]) or 0)
+        used_cents = int((r["s"] if USE_POSTGRES else r[0]) or 0)
 
         cur.execute(
-            q("SELECT COALESCE(SUM(quantity * price), 0) AS t FROM order_items WHERE order_id = ?"),
+            q(f"SELECT {_SUM_ORDER_TOTAL_CENTS} AS t FROM order_items WHERE order_id = ?"),
             (order_id,),
         )
         r = cur.fetchone()
-        total = float((r["t"] if USE_POSTGRES else r[0]) or 0)
-        remaining = max(0.0, total - used)
+        total_cents = int((r["t"] if USE_POSTGRES else r[0]) or 0)
+        remaining_cents = max(0, total_cents - used_cents)
 
         # Если amount не задан — берём остаток (полная доплата)
         if amount is None:
-            amount = remaining
-        try:
-            amount = float(amount)
-        except (TypeError, ValueError):
-            return (False, None)
-        if amount <= 0:
+            amount_cents = remaining_cents
+        else:
+            try:
+                amount_cents = money.to_cents(amount)
+            except (TypeError, ValueError, ArithmeticError):
+                return (False, None)
+        if amount_cents <= 0:
             return (False, None)
         # Не даём ввести больше остатка
-        if amount > remaining + 0.01:
-            amount = remaining
-            if amount <= 0:
+        if amount_cents > remaining_cents:
+            amount_cents = remaining_cents
+            if amount_cents <= 0:
                 return (False, None)
+        amount = float(money.from_cents(amount_cents))
 
         # INSERT payment в той же транзакции
         comment = f"Оплата по заказу #{order_id}" + (f" ({agent_name})" if agent_name else "")
         if USE_POSTGRES:
             cur.execute(
                 "INSERT INTO payments "
-                "(user_id, username, full_name, amount, currency, comment, "
+                "(user_id, username, full_name, amount, amount_cents, currency, comment, "
                 " status, created_at, order_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s) "
                 "RETURNING id",
                 (
                     marked_by,
                     username,
                     marked_by_name,
                     amount,
+                    amount_cents,
                     currency,
                     comment,
                     now_str(),
@@ -4308,14 +4325,15 @@ def mark_order_paid(
         else:
             cur.execute(
                 "INSERT INTO payments "
-                "(user_id, username, full_name, amount, currency, comment, "
+                "(user_id, username, full_name, amount, amount_cents, currency, comment, "
                 " status, created_at, order_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
                 (
                     marked_by,
                     username,
                     marked_by_name,
                     amount,
+                    amount_cents,
                     currency,
                     comment,
                     now_str(),
@@ -4332,7 +4350,7 @@ def mark_order_paid(
         )
         conn.commit()
 
-    remaining_after = max(0.0, remaining - amount)
+    remaining_after = float(money.from_cents(max(0, remaining_cents - amount_cents)))
     add_audit_log(
         marked_by,
         marked_by_name,

@@ -479,9 +479,11 @@ async def cb_cat_pick(call: CallbackQuery, state: FSMContext):
             unit = safe_get(r, "uom", "name", default="шт")
             mid = ms_ids[i]
             sale_min = (prices.get(mid) or {}).get("sale_price") if mid else None
-            # Кодируем href кратко через индекс
+            # Мин. цену показываем прямо в кнопке — видно всё разом, без захода
+            # в каталог. Кодируем href кратко через индекс.
+            price_tag = f" · от {_fmt_num(sale_min)}" if sale_min else ""
             kb.button(
-                text=f"{name} ({stock} {unit})",
+                text=f"{name}{price_tag} ({stock} {unit})",
                 callback_data=f"prod_pick:{order_id}:{i}",
             )
             products.append(
