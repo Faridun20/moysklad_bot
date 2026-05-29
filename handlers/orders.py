@@ -108,9 +108,9 @@ def _line_total(item: dict) -> float:
 
 def _fmt_num(n: float) -> str:
     """Без бесконечных нулей: 150.0 → 150, 49.99 → 49.99."""
-    if float(n).is_integer():
-        return str(int(n))
-    return f"{n:.2f}".rstrip("0").rstrip(".")
+    from services import money
+
+    return money.format_cents(money.to_cents(n or 0), decimals=2, grouping=False, trim=True)
 
 
 def format_order(order: dict, items: list[dict]) -> str:

@@ -44,7 +44,9 @@ def _confirm_keyboard(deposit_id: int):
 
 
 def _fmt_amount(x: float) -> str:
-    return f"{x:,.2f}".replace(",", " ")
+    from services import money
+
+    return money.format_cents(money.to_cents(x or 0), decimals=2, sep=" ")
 
 
 async def _notify_confirmers(bot: Bot, deposit_id: int, manager_name: str, amount: float):

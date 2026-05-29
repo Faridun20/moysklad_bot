@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from decimal import Decimal
 from typing import Any
+
+from services import money
 
 logger = logging.getLogger(__name__)
 
@@ -119,15 +122,28 @@ def compute_resubmit_summary(
     modified = 0
     for key in before_by.keys() & after_by.keys():
         b, a = before_by[key], after_by[key]
-        if float(b.get("quantity", 0)) != float(a.get("quantity", 0)) or float(
-            b.get("price", 0) or 0
-        ) != float(a.get("price", 0) or 0):
+        # Количество дробное — точное сравнение через Decimal(str()).
+        qty_changed = Decimal(str(b.get("quantity", 0) or 0)) != Decimal(
+            str(a.get("quantity", 0) or 0)
+        )
+        # Цена — в копейках: float `!=` давал ложные «изменено» из-за дрейфа.
+        price_changed = money.to_cents(b.get("price", 0) or 0) != money.to_cents(
+            a.get("price", 0) or 0
+        )
+        if qty_changed or price_changed:
             modified += 1
 
+    before_cents = money.to_cents(before_total)
+    after_cents = money.to_cents(after_total)
     return {
         "items_added": added,
         "items_removed": removed,
         "items_modified": modified,
+        # Канонические копейки.
+        "total_before_cents": before_cents,
+        "total_after_cents": after_cents,
+        "total_diff_cents": after_cents - before_cents,
+        # Legacy float-поля — для совместимости текущих вызывающих/тестов.
         "total_before": round(float(before_total), 2),
         "total_after": round(float(after_total), 2),
         "total_diff": round(float(after_total) - float(before_total), 2),

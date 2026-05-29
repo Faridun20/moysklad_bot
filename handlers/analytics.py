@@ -17,7 +17,9 @@ from services.moysklad import get_sales_stats
 from services.database import (
     get_user_orders,
     get_order_items_by_ids,
+    _price_cents,
 )
+from services import money
 from utils.formatters import format_sales_report
 from utils.keyboards import analytics_back_keyboard
 from utils.helpers import user_safe_error, local_now
@@ -208,33 +210,37 @@ def _personal_stats_from_local(user_id: int, since: datetime, until: datetime) -
 
     items_by_order = get_order_items_by_ids([o["id"] for o in relevant])
 
-    total = 0.0
+    # Считаем в копейках через money.mul_qty(price_cents, qty) — без float-дрейфа
+    # и без финального ×100. И total, и sum топ-товаров теперь в копейках:
+    # format_sales_report делит оба через format_price (раньше top-sum был в
+    # мажорных единицах → топ-товары отображались в 100× меньше — баг).
+    total_cents = 0
     count = 0
     clients: set[str] = set()
     products_agg: dict[str, dict] = {}
 
     for o in relevant:
         items = items_by_order.get(o["id"], [])
-        order_sum = sum(
-            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items
+        order_sum_cents = sum(
+            money.mul_qty(_price_cents(it), it.get("quantity", 0) or 0) for it in items
         )
-        total += order_sum
+        total_cents += order_sum_cents
         count += 1
         if o.get("agent_name"):
             clients.add(o["agent_name"])
         for it in items:
             name = it.get("product_name", "—")
-            qty = float(it.get("quantity", 0))
-            price = float(it.get("price", 0) or 0)
-            agg = products_agg.setdefault(name, {"sum": 0.0, "qty": 0.0})
-            agg["sum"] += qty * price
+            qty = float(it.get("quantity", 0) or 0)
+            line_cents = money.mul_qty(_price_cents(it), qty)
+            agg = products_agg.setdefault(name, {"sum": 0, "qty": 0.0})
+            agg["sum"] += line_cents
             agg["qty"] += qty
 
     top_products = sorted(products_agg.items(), key=lambda kv: kv[1]["sum"], reverse=True)[:5]
 
-    # Формат совместим с format_sales_report — total в минорных единицах (×100)
+    # Формат совместим с format_sales_report — total и sum в минорных единицах.
     return {
-        "total": int(round(total * 100)),
+        "total": total_cents,
         "count": count,
         "clients": len(clients),
         "top_products": top_products,

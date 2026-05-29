@@ -91,8 +91,13 @@ def format_date(dt_str: str) -> str:
 
 
 def format_price(raw: float) -> str:
-    """Конвертировать копейки МойСклад в читаемую цену."""
-    return f"{raw / 100:,.0f}"
+    """Конвертировать копейки МойСклад в читаемую цену.
+
+    Тонкий алиас services.money.format_cents — единый форматтер денег,
+    чтобы конвенция отображения не расходилась по модулям."""
+    from services.money import format_cents
+
+    return format_cents(int(round(raw)), decimals=0, sep=",")
 
 
 def trend_arrow(current: float, previous: float) -> str:

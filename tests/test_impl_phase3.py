@@ -127,6 +127,28 @@ def test_compute_resubmit_summary():
     assert s["total_after"] == 37.0
     assert s["total_diff"] == 12.0
     assert s["payment_type_changed"] is True
+    # Канонические копейки.
+    assert s["total_before_cents"] == 2500
+    assert s["total_after_cents"] == 3700
+    assert s["total_diff_cents"] == 1200
+
+
+def test_compute_resubmit_summary_no_float_drift():
+    # Цены с дробной частью, которые во float сравнивались бы неточно.
+    # Одинаковые позиции → items_modified == 0 (раньше float `!=` мог дать 1).
+    before = [{"product_href": "a", "quantity": 3, "price": 0.1 + 0.2}]
+    after = [{"product_href": "a", "quantity": 3, "price": 0.3}]
+    s = compute_resubmit_summary(before, after, 0.9, 0.9)
+    assert s["items_modified"] == 0
+    assert s["total_diff_cents"] == 0
+
+
+def test_compute_resubmit_summary_price_change_detected():
+    before = [{"product_href": "a", "quantity": 1, "price": 10.00}]
+    after = [{"product_href": "a", "quantity": 1, "price": 10.01}]
+    s = compute_resubmit_summary(before, after, 10.0, 10.01)
+    assert s["items_modified"] == 1
+    assert s["total_diff_cents"] == 1
 
 
 # ─── Отмена в окно + зависшие pending ────────────────────────────────────────
