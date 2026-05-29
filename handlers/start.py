@@ -128,6 +128,7 @@ _COMMANDS_BOSS = _COMMANDS_MANAGER + [
     BotCommand(command="ship", description="🚚 Отгрузить заказ"),
     BotCommand(command="shipments", description="🚚 Последние отгрузки"),
     BotCommand(command="analytics", description="📊 Аналитика продаж"),
+    BotCommand(command="cashbox", description="💰 Касса и дебиторка"),
     BotCommand(command="reports", description="📈 Отчёты"),
     BotCommand(command="cancel", description="🚫 Отменить заказ"),
     BotCommand(command="limit", description="📊 Кредитные лимиты"),

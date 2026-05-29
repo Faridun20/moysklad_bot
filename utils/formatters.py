@@ -151,6 +151,63 @@ def format_sales_report(label: str, stats: dict, prev_stats: dict = None) -> str
     return "\n".join(lines)
 
 
+# ─── Касса / дебиторка (для босса) ────────────────────────────────────────────
+
+
+def format_cashbox_report(label: str, cashbox: dict, receivables: dict) -> str:
+    """Отчёт по кассе для босса: сколько получили за период + кто ещё должен.
+
+    cashbox      — {total_cents, count, by_currency} (поступления за период).
+    receivables  — {total_cents, count, overdue_count, overdue_cents, debtors}
+                   (открытые долги «на сейчас», не за период).
+    Все суммы — в копейках (format_price делит на 100).
+    """
+    lines = [
+        section_header("💰", f"Касса · {label}"),
+        "",
+        "<b>📥 Получено за период:</b>",
+    ]
+    by_cur = cashbox.get("by_currency") or {}
+    if cashbox.get("count"):
+        if len(by_cur) <= 1:
+            lines.append(
+                f"  💵 <b>{format_price(cashbox['total_cents'])} $</b>"
+                f"  ·  {cashbox['count']} платежей"
+            )
+        else:
+            for cur, cents in sorted(by_cur.items(), key=lambda kv: kv[1], reverse=True):
+                lines.append(f"  💵 <b>{format_price(cents)} {esc(cur)}</b>")
+            lines.append(f"  <i>всего {cashbox['count']} платежей</i>")
+    else:
+        lines.append("  <i>поступлений нет</i>")
+
+    lines.append("")
+    lines.append(DIV2)
+    lines.append("<b>📉 Дебиторка (ждём оплаты):</b>")
+    if receivables.get("count"):
+        lines.append(f"  💸 Сумма долгов: <b>{format_price(receivables['total_cents'])} $</b>")
+        lines.append(f"  🧾 Заказов в долг: <b>{receivables['count']}</b>")
+        if receivables.get("overdue_count"):
+            lines.append(
+                f"  ⏰ Просрочено: <b>{receivables['overdue_count']}</b> "
+                f"на <b>{format_price(receivables['overdue_cents'])} $</b>"
+            )
+        lines.append("")
+        lines.append("<b>Кто ещё не оплатил:</b>")
+        lines.append(DIV2)
+        for d in receivables.get("debtors", []):
+            mark = "⏰" if d.get("overdue") else "▸"
+            due = f"  <i>до {esc(d['due_date'])}</i>" if d.get("due_date") else ""
+            lines.append(
+                f"{mark} <b>{esc(d['agent_name'])}</b>  <code>#{d['order_id']}</code>\n"
+                f"    <code>{format_price(d['remaining_cents'])} $</code>{due}"
+            )
+    else:
+        lines.append("  ✅ <i>Открытых долгов нет</i>")
+
+    return "\n".join(lines)
+
+
 # ─── Платёж ───────────────────────────────────────────────────────────────────
 
 
