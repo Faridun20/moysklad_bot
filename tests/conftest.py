@@ -45,8 +45,10 @@ def isolated_db(monkeypatch, tmp_path):
     # от run_migrations (мы держим обе нотации в sync, но fixture
     # должен работать даже на «старой» схеме).
     db.run_migrations()
-    # Глушим хук синхронизации с МойСклад — тесты не должны звонить
-    # в боевой API
-    db._trigger_ms_paymentin_sync = lambda *a, **k: None
+    # Глушим хук синхронизации с МойСклад — тесты не должны звонить в боевой
+    # API. Через monkeypatch (а не прямое присваивание!), чтобы заглушка
+    # СНИМАЛАСЬ после теста: иначе она протекала на весь прогон и ломала
+    # тесты, которым нужна настоящая _trigger (см. test_ms_crossloop).
+    monkeypatch.setattr(db, "_trigger_ms_paymentin_sync", lambda *a, **k: None)
 
     return db
