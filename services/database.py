@@ -2711,15 +2711,13 @@ def set_moysklad_employee(user_id: int, ms_employee_id: str, status: str = "link
     return updated
 
 
-def get_moysklad_employee_id(user_id: int) -> str | None:
-    """Получить ID сотрудника МойСклад для Telegram пользователя."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q("SELECT moysklad_employee_id FROM user_roles WHERE user_id = ?"), (user_id,))
-        row = cur.fetchone()
-    if not row:
-        return None
-    return row["moysklad_employee_id"] if USE_POSTGRES else row[0]
+async def get_moysklad_employee_id(user_id: int) -> str | None:
+    """Получить ID сотрудника МойСклад для Telegram пользователя.
+
+    asyncpg Stage 13 (#21): native async через adb_core (fetchval)."""
+    return await adb_core.fetchval(
+        "SELECT moysklad_employee_id FROM user_roles WHERE user_id = $1", user_id
+    )
 
 
 async def get_unsynced_managers() -> list[dict]:
@@ -3072,39 +3070,41 @@ def get_payments_needing_ms_sync(limit: int = 100) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
-def get_ms_sync_stats() -> dict:
+async def get_ms_sync_stats() -> dict:
     """Сводка статуса синхронизации платежей с МойСклад.
     Для /sync_payments команды — показывает админу что в каком состоянии.
+
+    asyncpg Stage 13 (#21): native async через adb_core (fetchrow). Обе
+    ветки алиасят колонки одинаково (synced/failed/never_tried) — доступ
+    по имени единый.
     """
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            "SELECT "
-            "  COUNT(*) FILTER (WHERE ms_paymentin_id IS NOT NULL) AS synced, "
-            "  COUNT(*) FILTER (WHERE ms_sync_status = 'failed') AS failed, "
-            "  COUNT(*) FILTER (WHERE status = 'confirmed' AND order_id IS NOT NULL "
-            "                    AND ms_paymentin_id IS NULL "
-            "                    AND (ms_sync_status IS NULL OR ms_sync_status != 'failed')) "
-            "    AS never_tried "
-            "FROM payments"
-            if USE_POSTGRES
-            # SQLite не поддерживает FILTER — используем SUM(CASE...)
-            else "SELECT "
-            "  SUM(CASE WHEN ms_paymentin_id IS NOT NULL THEN 1 ELSE 0 END) AS synced, "
-            "  SUM(CASE WHEN ms_sync_status = 'failed' THEN 1 ELSE 0 END) AS failed, "
-            "  SUM(CASE WHEN status = 'confirmed' AND order_id IS NOT NULL "
-            "                AND ms_paymentin_id IS NULL "
-            "                AND (ms_sync_status IS NULL OR ms_sync_status != 'failed') "
-            "           THEN 1 ELSE 0 END) AS never_tried "
-            "FROM payments"
-        )
-        row = cur.fetchone()
+    query = (
+        "SELECT "
+        "  COUNT(*) FILTER (WHERE ms_paymentin_id IS NOT NULL) AS synced, "
+        "  COUNT(*) FILTER (WHERE ms_sync_status = 'failed') AS failed, "
+        "  COUNT(*) FILTER (WHERE status = 'confirmed' AND order_id IS NOT NULL "
+        "                    AND ms_paymentin_id IS NULL "
+        "                    AND (ms_sync_status IS NULL OR ms_sync_status != 'failed')) "
+        "    AS never_tried "
+        "FROM payments"
+        if USE_POSTGRES
+        # SQLite не поддерживает FILTER — используем SUM(CASE...)
+        else "SELECT "
+        "  SUM(CASE WHEN ms_paymentin_id IS NOT NULL THEN 1 ELSE 0 END) AS synced, "
+        "  SUM(CASE WHEN ms_sync_status = 'failed' THEN 1 ELSE 0 END) AS failed, "
+        "  SUM(CASE WHEN status = 'confirmed' AND order_id IS NOT NULL "
+        "                AND ms_paymentin_id IS NULL "
+        "                AND (ms_sync_status IS NULL OR ms_sync_status != 'failed') "
+        "           THEN 1 ELSE 0 END) AS never_tried "
+        "FROM payments"
+    )
+    row = await adb_core.fetchrow(query)
     if not row:
         return {"synced": 0, "failed": 0, "never_tried": 0}
     return {
-        "synced": int(row["synced"] or 0) if USE_POSTGRES else int(row[0] or 0),
-        "failed": int(row["failed"] or 0) if USE_POSTGRES else int(row[1] or 0),
-        "never_tried": int(row["never_tried"] or 0) if USE_POSTGRES else int(row[2] or 0),
+        "synced": int(row["synced"] or 0),
+        "failed": int(row["failed"] or 0),
+        "never_tried": int(row["never_tried"] or 0),
     }
 
 
@@ -3195,40 +3195,38 @@ def record_cron_run(
         conn.commit()
 
 
-def get_last_cron_runs() -> list[dict]:
+async def get_last_cron_runs() -> list[dict]:
     """Вернуть по одной записи на task — последнюю по started_at.
 
     Используется в ops_monitor для алерта «cron не запускался».
     SQL: SELECT DISTINCT ON (task_name) для Postgres, GROUP BY + JOIN
     для SQLite (DISTINCT ON только pg-only).
+
+    asyncpg Stage 13 (#21): native async через adb_core.
     """
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        if USE_POSTGRES:
-            cur.execute(
-                "SELECT DISTINCT ON (task_name) task_name, started_at, finished_at, "
-                "status, error_message, metadata "
-                "FROM cron_runs "
-                "ORDER BY task_name, started_at DESC"
-            )
-        else:
-            # SQLite: max(started_at) per task через GROUP BY с трюком
-            # «max-of-tuple» (max(started_at || '|' || id) даёт стабильную
-            # выборку даже при совпадении started_at).
-            cur.execute(
-                "SELECT cr.task_name, cr.started_at, cr.finished_at, cr.status, "
-                "cr.error_message, cr.metadata "
-                "FROM cron_runs cr "
-                "INNER JOIN ("
-                "  SELECT task_name, MAX(id) AS max_id "
-                "  FROM cron_runs GROUP BY task_name"
-                ") last ON cr.task_name = last.task_name AND cr.id = last.max_id "
-                "ORDER BY cr.task_name"
-            )
-        return [dict(r) for r in cur.fetchall()]
+    if USE_POSTGRES:
+        return await adb_core.fetch(
+            "SELECT DISTINCT ON (task_name) task_name, started_at, finished_at, "
+            "status, error_message, metadata "
+            "FROM cron_runs "
+            "ORDER BY task_name, started_at DESC"
+        )
+    # SQLite: max(started_at) per task через GROUP BY с трюком
+    # «max-of-tuple» (max(started_at || '|' || id) даёт стабильную
+    # выборку даже при совпадении started_at).
+    return await adb_core.fetch(
+        "SELECT cr.task_name, cr.started_at, cr.finished_at, cr.status, "
+        "cr.error_message, cr.metadata "
+        "FROM cron_runs cr "
+        "INNER JOIN ("
+        "  SELECT task_name, MAX(id) AS max_id "
+        "  FROM cron_runs GROUP BY task_name"
+        ") last ON cr.task_name = last.task_name AND cr.id = last.max_id "
+        "ORDER BY cr.task_name"
+    )
 
 
-def get_stale_crons(thresholds_hours: dict[str, float]) -> list[dict]:
+async def get_stale_crons(thresholds_hours: dict[str, float]) -> list[dict]:
     """Вернуть cron'ы, чей последний УСПЕШНЫЙ запуск старше порога.
 
     `thresholds_hours`: {'ms_sync_retry': 1.0, 'ops_monitor': 26.0, ...}
@@ -3237,9 +3235,11 @@ def get_stale_crons(thresholds_hours: dict[str, float]) -> list[dict]:
 
     Возвращаем: [{task_name, last_success_at, hours_ago, threshold_hours,
                   last_status, last_error}]
+
+    asyncpg Stage 13 (#21): native async — get_last_cron_runs тоже async (await).
     """
     now = datetime.now()
-    rows = get_last_cron_runs()
+    rows = await get_last_cron_runs()
     # last successful run per task: если last = failed, надо искать
     # предыдущий ok'ный. Для простоты: считаем последний run; если он
     # failed — отмечаем `last_status='failed'`, hours_ago = от него
@@ -3936,6 +3936,10 @@ def archive_payment(payment_id: int, archived_by: int, archived_name: str) -> bo
 
 
 def get_payment(payment_id: int) -> dict | None:
+    # NB: остаётся SYNC — отложено до money-core стадии. Внутри database.py
+    # его читают sync-функции confirm_payment / link_payment_to_order (см.
+    # ниже), поэтому конвертация get_payment тянет за собой денежное ядро.
+    # Внешние async-вызовы идут через `await adb.get_payment(...)` (to_thread).
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(q("SELECT * FROM payments WHERE id = ?"), (payment_id,))
@@ -4079,21 +4083,20 @@ def get_order(order_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-def get_orders_by_ids(order_ids: list[int]) -> dict[int, dict]:
+async def get_orders_by_ids(order_ids: list[int]) -> dict[int, dict]:
     """Батч-загрузка заказов по id → словарь {id: order_dict}.
-    order_ids дедуплицируется — placeholder'ы не расходуем впустую."""
+    order_ids дедуплицируется — placeholder'ы не расходуем впустую.
+
+    asyncpg Stage 13 (#21): native async; IN-список — $1..$N."""
     if not order_ids:
         return {}
     unique_ids = list(set(order_ids))
-    placeholders = ",".join(["?"] * len(unique_ids))
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(f"SELECT * FROM orders WHERE id IN ({placeholders})"),
-            unique_ids,
-        )
-        rows = cur.fetchall()
-    return {r["id"]: dict(r) for r in rows}
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(unique_ids)))
+    rows = await adb_core.fetch(
+        f"SELECT * FROM orders WHERE id IN ({placeholders})",
+        *unique_ids,
+    )
+    return {r["id"]: r for r in rows}
 
 
 async def get_user_orders(user_id: int, status: str | None = None) -> list[dict]:

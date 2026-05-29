@@ -469,7 +469,7 @@ async def cb_ord_requests(call: CallbackQuery):
             f"{DIV}\n⏳ <b>Заявки на отгрузку</b>\n\n<i>Нет новых заявок</i>",
             parse_mode="HTML",
         )
-    orders_by_id = get_orders_by_ids([r["order_id"] for r in requests[:10]])
+    orders_by_id = await get_orders_by_ids([r["order_id"] for r in requests[:10]])
     await call.message.answer(
         f"⏳ <b>Заявки ({len(requests)}):</b>",
         parse_mode="HTML",

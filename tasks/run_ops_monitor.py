@@ -286,7 +286,7 @@ async def main() -> int:
         "report_monthly": 31 * 24 + 6.0,
         "backup": 26.0,  # 1×/день → если backup не прошёл, очень критично
     }
-    stale_crons = get_stale_crons(cron_thresholds)
+    stale_crons = await get_stale_crons(cron_thresholds)
 
     b_stale = build_stale_orders_block(stale, stale_hours)
     b_dep = build_pending_deposits_block(deposits)
