@@ -337,7 +337,7 @@ async def show_cashbox_analytics(
         until_iso = until.strftime("%Y-%m-%d %H:%M:%S")
         cashbox, receivables = await asyncio.gather(
             asyncio.to_thread(get_cashbox_stats, since_iso, until_iso),
-            asyncio.to_thread(_receivables_from_local, None),
+            _receivables_from_local(None),
         )
         txt = format_cashbox_report(label, cashbox, receivables)
         await bot.send_message(
@@ -350,7 +350,7 @@ async def show_cashbox_analytics(
         await bot.send_message(chat_id, user_safe_error(e, "cashbox_analytics"))
 
 
-def _receivables_from_local(user_id: int | None = None) -> dict:
+async def _receivables_from_local(user_id: int | None = None) -> dict:
     """Дебиторка: открытые долги (товар отгружен в кредит, оплата не
     подтверждена). Снапшот «на сейчас», не за период.
 
@@ -360,8 +360,10 @@ def _receivables_from_local(user_id: int | None = None) -> dict:
 
     Производительность: позиции и платежи грузим батч-запросами (как в
     _personal_stats_from_local), без N+1. Всё в копейках.
+
+    asyncpg Stage 12 (#21): db-функции стали native async — await напрямую.
     """
-    orders = get_open_debts(user_id)
+    orders = await get_open_debts(user_id)
     if not orders:
         return {
             "total_cents": 0,
@@ -372,8 +374,8 @@ def _receivables_from_local(user_id: int | None = None) -> dict:
         }
 
     ids = [o["id"] for o in orders]
-    items_by_order = get_order_items_by_ids(ids)
-    payments_by_order = get_payments_for_orders(ids)
+    items_by_order = await get_order_items_by_ids(ids)
+    payments_by_order = await get_payments_for_orders(ids)
     today = local_now().strftime("%Y-%m-%d")
 
     total_cents = 0
@@ -430,7 +432,7 @@ def _safe_ts(o: dict) -> str:
     return s[:19]
 
 
-def _personal_stats_from_local(user_id: int, since: datetime, until: datetime) -> dict:
+async def _personal_stats_from_local(user_id: int, since: datetime, until: datetime) -> dict:
     """
     Личные показатели менеджера из локальной БД — суммы и счётчики по
     одобренным/отгруженным заказам в период.
@@ -441,8 +443,10 @@ def _personal_stats_from_local(user_id: int, since: datetime, until: datetime) -
     Производительность: order_items грузятся одним батч-запросом для
     всех релевантных заказов (раньше был N+1 — на каждый заказ свой
     SELECT, что на Railway Postgres давало многосекундные задержки).
+
+    asyncpg Stage 12 (#21): db-функции стали native async — await напрямую.
     """
-    orders = get_user_orders(user_id)
+    orders = await get_user_orders(user_id)
     since_iso = since.strftime("%Y-%m-%d %H:%M:%S")
     until_iso = until.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -463,7 +467,7 @@ def _personal_stats_from_local(user_id: int, since: datetime, until: datetime) -
     if not relevant:
         return {"total": 0, "count": 0, "clients": 0, "top_products": []}
 
-    items_by_order = get_order_items_by_ids([o["id"] for o in relevant])
+    items_by_order = await get_order_items_by_ids([o["id"] for o in relevant])
 
     # Считаем в копейках через money.mul_qty(price_cents, qty) — без float-дрейфа
     # и без финального ×100. И total, и sum топ-товаров теперь в копейках:
@@ -501,7 +505,7 @@ def _personal_stats_from_local(user_id: int, since: datetime, until: datetime) -
     # Фильтруем ТОЛЬКО если снапшот сматчил хоть один товар (значит он
     # заполнен) — иначе при пустом/несинхронизированном снапшоте спрятали бы
     # всё. Позиции без ms_id (legacy/без href) не прячем — определить нельзя.
-    existing = get_existing_ms_product_ids(list(all_ms_ids)) if all_ms_ids else set()
+    existing = await get_existing_ms_product_ids(list(all_ms_ids)) if all_ms_ids else set()
     if existing:
         visible = {
             name: d
@@ -547,14 +551,10 @@ async def show_manager_analytics(
         parse_mode="HTML",
     )
     try:
-        current_stats = await asyncio.to_thread(
-            _personal_stats_from_local, user_id, since, until
-        )
+        current_stats = await _personal_stats_from_local(user_id, since, until)
         prev_stats = None
         if prev_since is not None and prev_until is not None:
-            prev_stats = await asyncio.to_thread(
-                _personal_stats_from_local, user_id, prev_since, prev_until
-            )
+            prev_stats = await _personal_stats_from_local(user_id, prev_since, prev_until)
 
         if current_stats["count"] == 0 and (prev_stats is None or prev_stats["count"] == 0):
             return await bot.send_message(
@@ -581,7 +581,7 @@ async def show_manager_summary(bot: Bot, chat_id: int, user_id: int):
         # Local time, чтобы совпадало с DB now_str(). См. cb_analytics_period.
         now = local_now()
         since = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        stats = await asyncio.to_thread(_personal_stats_from_local, user_id, since, now)
+        stats = await _personal_stats_from_local(user_id, since, now)
         if stats["count"] == 0:
             return
 

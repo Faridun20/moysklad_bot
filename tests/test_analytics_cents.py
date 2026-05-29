@@ -6,6 +6,7 @@ Stage 3: личная аналитика менеджера считается �
 меньше. Теперь и total, и sum в копейках.
 """
 
+import asyncio
 from datetime import datetime, timedelta
 
 
@@ -20,7 +21,7 @@ def test_personal_stats_total_and_top_in_cents(isolated_db):
 
     since = datetime.now() - timedelta(days=1)
     until = datetime.now() + timedelta(days=1)
-    stats = _personal_stats_from_local(1, since, until)
+    stats = asyncio.run(_personal_stats_from_local(1, since, until))
 
     assert stats["count"] == 1
     assert stats["total"] == 10998  # копейки (9998 + 1000)
@@ -47,7 +48,7 @@ def test_personal_stats_hides_deleted_products(isolated_db):
 
     since = datetime.now() - timedelta(days=1)
     until = datetime.now() + timedelta(days=1)
-    stats = _personal_stats_from_local(1, since, until)
+    stats = asyncio.run(_personal_stats_from_local(1, since, until))
 
     names = [n for n, _ in stats["top_products"]]
     assert "Товар-А" in names
@@ -61,5 +62,5 @@ def test_personal_stats_empty(isolated_db):
 
     since = datetime.now() - timedelta(days=1)
     until = datetime.now() + timedelta(days=1)
-    stats = _personal_stats_from_local(999, since, until)
+    stats = asyncio.run(_personal_stats_from_local(999, since, until))
     assert stats == {"total": 0, "count": 0, "clients": 0, "top_products": []}

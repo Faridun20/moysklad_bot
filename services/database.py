@@ -1159,32 +1159,25 @@ def check_credit_limit(agent_id: str, order_total: float) -> dict:
     }
 
 
-def _confirmed_returns_by_order(order_ids: list[int]) -> dict[int, float]:
+async def _confirmed_returns_by_order(order_ids: list[int]) -> dict[int, float]:
     """{order_id: сумма подтверждённых (не удалённых) возвратов}. Фильтр идентичен
-    тому, что в get_agent_current_debt — используется для батч-расчёта долга."""
+    тому, что в get_agent_current_debt — используется для батч-расчёта долга.
+
+    asyncpg Stage 12 (#21): native async через adb_core; IN-список — $1..$N."""
     if not order_ids:
         return {}
     unique_ids = list(set(order_ids))
-    placeholders = ",".join(["?"] * len(unique_ids))
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                f"SELECT order_id, COALESCE(SUM(total_amount), 0) AS s FROM returns "
-                f"WHERE order_id IN ({placeholders}) AND status = 'confirmed' "
-                f"AND (deleted_at IS NULL) GROUP BY order_id"
-            ),
-            unique_ids,
-        )
-        rows = cur.fetchall()
-    result: dict[int, float] = {}
-    for r in rows:
-        oid = r["order_id"] if USE_POSTGRES else r[0]
-        result[oid] = float((r["s"] if USE_POSTGRES else r[1]) or 0)
-    return result
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(unique_ids)))
+    rows = await adb_core.fetch(
+        f"SELECT order_id, COALESCE(SUM(total_amount), 0) AS s FROM returns "
+        f"WHERE order_id IN ({placeholders}) AND status = 'confirmed' "
+        f"AND (deleted_at IS NULL) GROUP BY order_id",
+        *unique_ids,
+    )
+    return {r["order_id"]: float(r["s"] or 0) for r in rows}
 
 
-def get_credit_overview() -> list[dict]:
+async def get_credit_overview() -> list[dict]:
     """Сводка по контрагентам для боса: лимит + текущий долг. Объединяет
     строки credit_limits и контрагентов из активных заказов (даже без явной
     строки лимита — у них дефолтный лимит). Сортировка: сначала те, кто ближе
@@ -1193,45 +1186,46 @@ def get_credit_overview() -> list[dict]:
     Батч-версия (без N+1): раньше на каждого агента звался get_agent_current_debt,
     а тот — get_order_payment_summary на КАЖДЫЙ заказ (≈ A×(1+4N) запросов). Теперь
     долг считается из 4 групповых выборок, клампинг — в Python (логика тождественна
-    get_agent_current_debt; держим её тут, чтобы не плодить кросс-БД GREATEST/MAX)."""
+    get_agent_current_debt; держим её тут, чтобы не плодить кросс-БД GREATEST/MAX).
+
+    asyncpg Stage 12 (#21): native async через adb_core. Три батч-функции долга
+    тоже async (await); get_setting остаётся sync (money-core, TTL-кэш) — зовём
+    через to_thread, чтобы не блокировать loop на cache-miss."""
+    import asyncio
+
     agents: dict[str, str] = {}
     limits_map: dict[str, float] = {}
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute("SELECT agent_id, agent_name, limit_amount FROM credit_limits")
-        for r in cur.fetchall():
-            aid = r["agent_id"] if USE_POSTGRES else r[0]
-            if not aid:
-                continue
-            agents[aid] = (r["agent_name"] if USE_POSTGRES else r[1]) or aid
-            limits_map[aid] = float(r["limit_amount"] if USE_POSTGRES else r[2])
-        cur.execute(
-            "SELECT DISTINCT agent_id, agent_name FROM orders "
-            "WHERE agent_id IS NOT NULL AND agent_id != '' "
-            "AND status NOT IN ('draft', 'rejected', 'cancelled') AND (deleted_at IS NULL)"
-        )
-        for r in cur.fetchall():
-            aid = r["agent_id"] if USE_POSTGRES else r[0]
-            if aid and aid not in agents:
-                agents[aid] = (r["agent_name"] if USE_POSTGRES else r[1]) or aid
+    for r in await adb_core.fetch("SELECT agent_id, agent_name, limit_amount FROM credit_limits"):
+        aid = r["agent_id"]
+        if not aid:
+            continue
+        agents[aid] = r["agent_name"] or aid
+        limits_map[aid] = float(r["limit_amount"])
+    for r in await adb_core.fetch(
+        "SELECT DISTINCT agent_id, agent_name FROM orders "
+        "WHERE agent_id IS NOT NULL AND agent_id != '' "
+        "AND status NOT IN ('draft', 'rejected', 'cancelled') AND (deleted_at IS NULL)"
+    ):
+        aid = r["agent_id"]
+        if aid and aid not in agents:
+            agents[aid] = r["agent_name"] or aid
 
-        # Открытые заказы (фильтр идентичен get_agent_current_debt) — один запрос
-        # на всех агентов; долг по ним разбираем в Python.
-        cur.execute(
+    # Открытые заказы (фильтр идентичен get_agent_current_debt) — один запрос
+    # на всех агентов; долг по ним разбираем в Python.
+    open_rows = [
+        (r["id"], r["agent_id"])
+        for r in await adb_core.fetch(
             "SELECT id, agent_id FROM orders "
             "WHERE status NOT IN ('draft', 'rejected', 'cancelled', 'paid', 'returned') "
             "AND payment_confirmed = 0 AND (deleted_at IS NULL)"
         )
-        open_rows = [
-            ((r["id"] if USE_POSTGRES else r[0]), (r["agent_id"] if USE_POSTGRES else r[1]))
-            for r in cur.fetchall()
-        ]
+    ]
 
     open_ids = [oid for oid, _ in open_rows]
-    items_by_order = get_order_items_by_ids(open_ids)
-    payments_by_order = get_payments_for_orders(open_ids)
-    returns_by_order = _confirmed_returns_by_order(open_ids)
-    default_limit = float(get_setting("credit_limit_default", 2000.0))
+    items_by_order = await get_order_items_by_ids(open_ids)
+    payments_by_order = await get_payments_for_orders(open_ids)
+    returns_by_order = await _confirmed_returns_by_order(open_ids)
+    default_limit = float(await asyncio.to_thread(get_setting, "credit_limit_default", 2000.0))
 
     # debt[aid] = Σ по открытым заказам max(0, max(0, total−confirmed) − returns)
     # — бит-в-бит как цикл в get_agent_current_debt.
@@ -1834,21 +1828,21 @@ async def get_product_prices_by_ids(ms_ids: list[str]) -> dict[str, dict]:
     return {r["ms_id"]: r for r in rows}
 
 
-def get_existing_ms_product_ids(ms_ids: list[str]) -> set[str]:
+async def get_existing_ms_product_ids(ms_ids: list[str]) -> set[str]:
     """Подмножество ms_ids, которые ещё ЕСТЬ в снапшоте ms_products (т.е. НЕ
     удалены в МойСклад). Аналитика использует это, чтобы прятать из топа
-    товары, удалённые в МС (иначе менеджер видит непонятные позиции)."""
+    товары, удалённые в МС (иначе менеджер видит непонятные позиции).
+
+    asyncpg Stage 12 (#21): native async; IN-список — $1..$N."""
     ids = [str(x).strip() for x in (ms_ids or []) if str(x).strip()]
     if not ids:
         return set()
-    placeholders = ", ".join(["?"] * len(ids))
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(f"SELECT ms_id FROM ms_products WHERE ms_id IN ({placeholders})"),
-            ids,
-        )
-        return {(r["ms_id"] if USE_POSTGRES else r[0]) for r in cur.fetchall()}
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(ids)))
+    rows = await adb_core.fetch(
+        f"SELECT ms_id FROM ms_products WHERE ms_id IN ({placeholders})",
+        *ids,
+    )
+    return {r["ms_id"] for r in rows}
 
 
 async def get_all_product_prices() -> list[dict]:
@@ -2811,28 +2805,26 @@ def get_payments_for_order(order_id: int) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
-def get_payments_for_orders(order_ids: list[int]) -> dict[int, list[dict]]:
+async def get_payments_for_orders(order_ids: list[int]) -> dict[int, list[dict]]:
     """Батч-версия: {order_id: [payments...]}. Заказы без платежей в
     результат не попадают; вызывающий должен использовать .get(oid, []).
 
     Дедуплицируем order_ids — если caller передал список с повторами,
     placeholders разрастаются впустую и план запроса страдает.
+
+    asyncpg Stage 12 (#21): native async; IN-список — $1..$N.
     """
     if not order_ids:
         return {}
     unique_ids = list(set(order_ids))
-    placeholders = ",".join(["?"] * len(unique_ids))
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(f"SELECT * FROM payments WHERE order_id IN ({placeholders}) ORDER BY created_at ASC"),
-            unique_ids,
-        )
-        rows = cur.fetchall()
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(unique_ids)))
+    rows = await adb_core.fetch(
+        f"SELECT * FROM payments WHERE order_id IN ({placeholders}) ORDER BY created_at ASC",
+        *unique_ids,
+    )
     grouped: dict[int, list[dict]] = {}
     for r in rows:
-        d = dict(r)
-        grouped.setdefault(d["order_id"], []).append(d)
+        grouped.setdefault(r["order_id"], []).append(r)
     return grouped
 
 
@@ -4104,18 +4096,17 @@ def get_orders_by_ids(order_ids: list[int]) -> dict[int, dict]:
     return {r["id"]: dict(r) for r in rows}
 
 
-def get_user_orders(user_id: int, status: str | None = None) -> list[dict]:
-    query = "SELECT * FROM orders WHERE user_id = ?"
+async def get_user_orders(user_id: int, status: str | None = None) -> list[dict]:
+    """Заказы менеджера (опц. фильтр по статусу).
+
+    asyncpg Stage 12 (#21): native async через adb_core."""
     params: list = [user_id]
+    query = "SELECT * FROM orders WHERE user_id = $1"
     if status:
-        query += " AND status = ?"
         params.append(status)
+        query += f" AND status = ${len(params)}"
     query += " ORDER BY created_at DESC"
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q(query), params)
-        rows = cur.fetchall()
-    return [dict(r) for r in rows]
+    return await adb_core.fetch(query, *params)
 
 
 async def get_all_orders(status: str | None = None) -> list[dict]:
@@ -4556,7 +4547,7 @@ async def get_pending_confirmations(user_id: int | None = None) -> list[dict]:
     return await adb_core.fetch(query, *params)
 
 
-def get_open_debts(
+async def get_open_debts(
     user_id: int | None = None,
     due_through: str | None = None,
 ) -> list[dict]:
@@ -4577,6 +4568,8 @@ def get_open_debts(
     недостаточно: до подтверждения деньги формально ещё не получены,
     и заказ всё ещё в списке долгов (но с пометкой `awaiting_confirmation`
     на стороне UI).
+
+    asyncpg Stage 12 (#21): native async через adb_core ($N-плейсхолдеры).
     """
     query = (
         "SELECT * FROM orders "
@@ -4585,21 +4578,17 @@ def get_open_debts(
     )
     params: list = []
     if user_id is not None:
-        query += " AND user_id = ?"
         params.append(user_id)
+        query += f" AND user_id = ${len(params)}"
     if due_through is not None:
-        query += " AND due_date IS NOT NULL AND due_date <= ?"
         params.append(due_through)
+        query += f" AND due_date IS NOT NULL AND due_date <= ${len(params)}"
     query += (
         " ORDER BY due_date ASC NULLS LAST, id ASC"
         if USE_POSTGRES
         else " ORDER BY CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, due_date ASC, id ASC"
     )
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q(query), params)
-        rows = cur.fetchall()
-    return [dict(r) for r in rows]
+    return await adb_core.fetch(query, *params)
 
 
 async def get_paid_orders_awaiting_confirmation(user_id: int | None = None) -> list[dict]:
@@ -4703,25 +4692,23 @@ def get_order_items(order_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_order_items_by_ids(order_ids: list[int]) -> dict[int, list[dict]]:
+async def get_order_items_by_ids(order_ids: list[int]) -> dict[int, list[dict]]:
     """Батч-загрузка позиций для списка заказов — один SQL вместо N.
     Возвращает {order_id: [items, ...]}. Заказы без позиций отсутствуют
-    в результате (вызывающий должен использовать .get(oid, []))."""
+    в результате (вызывающий должен использовать .get(oid, [])).
+
+    asyncpg Stage 12 (#21): native async; IN-список — $1..$N."""
     if not order_ids:
         return {}
     unique_ids = list(set(order_ids))
-    placeholders = ",".join(["?"] * len(unique_ids))
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(f"SELECT * FROM order_items WHERE order_id IN ({placeholders})"),
-            unique_ids,
-        )
-        rows = cur.fetchall()
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(unique_ids)))
+    rows = await adb_core.fetch(
+        f"SELECT * FROM order_items WHERE order_id IN ({placeholders})",
+        *unique_ids,
+    )
     grouped: dict[int, list[dict]] = {}
     for r in rows:
-        d = dict(r)
-        grouped.setdefault(d["order_id"], []).append(d)
+        grouped.setdefault(r["order_id"], []).append(r)
     return grouped
 
 

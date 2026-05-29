@@ -7,6 +7,7 @@
 какие заказы ещё не отдали», плюс выбор произвольного диапазона.
 """
 
+import asyncio
 from datetime import datetime
 
 
@@ -95,7 +96,7 @@ def test_receivables_open_credit_debts(isolated_db):
     # просроченный долг (due в прошлом)
     _credit_order(db, "C", "Client C", 80.0, due="2020-01-01")  # overdue, 8000
 
-    r = _receivables_from_local(None)
+    r = asyncio.run(_receivables_from_local(None))
 
     assert r["total_cents"] == 48000  # 30000 + 10000 + 8000
     assert r["count"] == 3  # A, B, C (D с нулевым остатком отброшен)
@@ -111,7 +112,7 @@ def test_receivables_open_credit_debts(isolated_db):
 def test_receivables_empty(isolated_db):
     from handlers.analytics import _receivables_from_local
 
-    r = _receivables_from_local(None)
+    r = asyncio.run(_receivables_from_local(None))
     assert r == {
         "total_cents": 0,
         "count": 0,
