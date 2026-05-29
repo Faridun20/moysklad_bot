@@ -935,9 +935,10 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
         return await call.answer(f"⚠️ {result['error']}", show_alert=True)
 
     await call.answer("✅ Заявка одобрена")
+    base = getattr(call.message, "html_text", None) or call.message.text or ""
     await call.message.edit_text(
-        call.message.text
-        + f"\n\n{DIV}\n✅ <b>Одобрено</b>  <code>{result['now']}</code>  — {boss_name}",
+        base
+        + f"\n\n{DIV}\n✅ <b>Одобрено</b>  <code>{result['now']}</code>  — {_esc(boss_name)}",
         parse_mode="HTML",
     )
 
@@ -958,8 +959,9 @@ async def cb_reject_request(call: CallbackQuery, bot: Bot):
         return await call.answer(f"⚠️ {result['error']}", show_alert=True)
 
     await call.answer("❌ Заявка отклонена")
+    base = getattr(call.message, "html_text", None) or call.message.text or ""
     await call.message.edit_text(
-        call.message.text
-        + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{result['now']}</code>  — {boss_name}",
+        base
+        + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{result['now']}</code>  — {_esc(boss_name)}",
         parse_mode="HTML",
     )

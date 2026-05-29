@@ -251,8 +251,9 @@ async def confirm_pay(call: CallbackQuery, bot: Bot):
 
     await call.answer("✅ Принято")
     now = local_now().strftime("%d.%m.%Y %H:%M")
+    base = getattr(call.message, "html_text", None) or call.message.text or ""
     await call.message.edit_text(
-        call.message.text + f"\n\n{DIV}\n✅ <b>Принято</b>  <code>{now}</code>  — {admin_name}",
+        base + f"\n\n{DIV}\n✅ <b>Принято</b>  <code>{now}</code>  — {_esc(admin_name)}",
         parse_mode="HTML",
     )
 
@@ -279,8 +280,9 @@ async def reject_pay(call: CallbackQuery, bot: Bot):
 
     await call.answer("❌ Отклонено")
     now = local_now().strftime("%d.%m.%Y %H:%M")
+    base = getattr(call.message, "html_text", None) or call.message.text or ""
     await call.message.edit_text(
-        call.message.text + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{now}</code>  — {admin_name}",
+        base + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{now}</code>  — {_esc(admin_name)}",
         parse_mode="HTML",
     )
 

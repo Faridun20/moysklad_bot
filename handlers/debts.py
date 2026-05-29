@@ -105,7 +105,13 @@ def _format_debt_card(
 @router.message(Command("debts"))
 async def cmd_debts(message: Message):
     """Показать открытые долги. Менеджер — свои, boss/admin — все."""
-    user_id = message.from_user.id
+    await _render_debts(message, message.from_user.id)
+
+
+async def _render_debts(message: Message, user_id: int):
+    """Тело /debts. user_id передаётся ЯВНО: при вызове из callback берём
+    callback.from_user.id, а не message.from_user.id (в callback.message
+    автор — бот, и role-check молча проваливался)."""
     if not can_create_orders(user_id):
         return  # нет прав вообще — молчим, как принято в этом боте
 
@@ -186,7 +192,7 @@ async def cb_debts_my(callback: CallbackQuery):
     и команда /debts, чтобы юзеру не приходилось набирать команду.
     """
     await callback.answer()
-    await cmd_debts(callback.message)
+    await _render_debts(callback.message, callback.from_user.id)
 
 
 # ─── Callback: отметить оплачено ─────────────────────────────────────────────

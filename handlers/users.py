@@ -10,6 +10,7 @@ from aiogram.types import Message, CallbackQuery
 
 from services.roles import can_manage_users, invalidate_role
 from services import async_db as adb
+from utils.helpers import esc, user_safe_error
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -18,7 +19,10 @@ ROLE_NAMES = {
     "admin": "👑 Администратор",
     "boss": "🏆 Руководитель",
     "manager": "💼 Менеджер",
+    "warehouse_keeper": "📦 Кладовщик",
+    "bookkeeper": "🧮 Бухгалтер",
     "employee": "👤 Сотрудник",
+    "guest": "🚫 Гость (без прав)",
 }
 
 
@@ -154,10 +158,10 @@ async def cmd_msstaff(message: Message):
             "👥 <b>Сотрудники МойСклад:</b>\n",
         ]
         for emp in employees[:20]:
-            name = emp.get("name", "—")
-            uid = emp.get("id", "—")
+            name = esc(emp.get("name", "—"))
+            uid = esc(emp.get("id", "—"))
             lines.append(f"• <b>{name}</b>\n  <code>{uid}</code>")
 
         await message.answer("\n".join(lines), parse_mode="HTML")
     except Exception as e:
-        await message.answer(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
+        await message.answer(user_safe_error(e, "msstaff"))

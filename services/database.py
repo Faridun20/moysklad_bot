@@ -2453,15 +2453,17 @@ def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str = "") 
         order = get_order(order_id)
         with get_conn() as conn:
             cur = get_cursor(conn)
+            refund_amount = -float(ret["total_amount"])
             cur.execute(
                 q(
-                    "INSERT INTO cash_deposits (manager_id, amount, deposited_at, status, "
-                    "confirmed_by, confirmed_at, notes, created_at) "
-                    "VALUES (?, ?, ?, 'confirmed', ?, ?, ?, ?)"
+                    "INSERT INTO cash_deposits (manager_id, amount, amount_cents, deposited_at, "
+                    "status, confirmed_by, confirmed_at, notes, created_at) "
+                    "VALUES (?, ?, ?, ?, 'confirmed', ?, ?, ?, ?)"
                 ),
                 (
                     (order or {}).get("user_id") or confirmed_by,
-                    -float(ret["total_amount"]),
+                    refund_amount,
+                    -money.to_cents(ret["total_amount"]),  # dual-write копеек (отриц.)
                     now_str(),
                     confirmed_by,
                     now_str(),
