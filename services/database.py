@@ -1463,37 +1463,42 @@ def get_stale_pending_orders(hours: int = 48) -> list[dict]:
 # (payment_confirmed=1). order total берём из get_order_payment_summary.
 
 
-def _order_total(order_id: int) -> float:
-    return float(get_order_payment_summary(order_id)["total"])
+def _order_total_cents(order_id: int) -> int:
+    """Сумма заказа в копейках (точно, из price_cents)."""
+    return int(get_order_payment_summary(order_id)["total_cents"])
 
 
-def _order_confirmed_deposit_amount(order_id: int) -> float:
-    """Сколько уже распределено на заказ подтверждёнными сдачами."""
+# SQL-фрагмент «распределено на заказ в копейках» — берёт amount_allocated_cents
+# с фолбэком на legacy REAL (round(amount_allocated*100)). Без placeholder'ов.
+_SUM_ALLOC_CENTS = (
+    "COALESCE(SUM(COALESCE(cdo.amount_allocated_cents, "
+    "CAST(round(cdo.amount_allocated * 100) AS INTEGER))), 0)"
+)
+
+
+def _order_confirmed_deposit_cents(order_id: int) -> int:
+    """Распределено на заказ ПОДТВЕРЖДЁННЫМИ сдачами, в копейках."""
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
             q(
-                "SELECT COALESCE(SUM(cdo.amount_allocated), 0) AS s "
-                "FROM cash_deposit_orders cdo "
+                f"SELECT {_SUM_ALLOC_CENTS} AS s FROM cash_deposit_orders cdo "
                 "JOIN cash_deposits d ON d.id = cdo.deposit_id "
                 "WHERE cdo.order_id = ? AND d.status = 'confirmed' AND (d.deleted_at IS NULL)"
             ),
             (order_id,),
         )
         row = cur.fetchone()
-    return float((row["s"] if USE_POSTGRES else row[0]) or 0)
+    return int((row["s"] if USE_POSTGRES else row[0]) or 0)
 
 
-def _order_allocated_deposit_amount(order_id: int) -> float:
-    """Сколько распределено на заказ сдачами в статусе pending ИЛИ confirmed.
-    M3: при FIFO-распределении учитываем и pending — иначе две сдачи подряд
-    «забронируют» один и тот же остаток дважды."""
+def _order_allocated_deposit_cents(order_id: int) -> int:
+    """Распределено на заказ pending+confirmed сдачами, в копейках (M3)."""
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
             q(
-                "SELECT COALESCE(SUM(cdo.amount_allocated), 0) AS s "
-                "FROM cash_deposit_orders cdo "
+                f"SELECT {_SUM_ALLOC_CENTS} AS s FROM cash_deposit_orders cdo "
                 "JOIN cash_deposits d ON d.id = cdo.deposit_id "
                 "WHERE cdo.order_id = ? AND d.status IN ('pending', 'confirmed') "
                 "AND (d.deleted_at IS NULL)"
@@ -1501,13 +1506,16 @@ def _order_allocated_deposit_amount(order_id: int) -> float:
             (order_id,),
         )
         row = cur.fetchone()
-    return float((row["s"] if USE_POSTGRES else row[0]) or 0)
+    return int((row["s"] if USE_POSTGRES else row[0]) or 0)
 
 
 def get_manager_open_orders_for_deposit(manager_id: int) -> list[dict]:
     """Отгруженные неоплаченные заказы менеджера (для распределения сдачи).
     Возвращает [{id, total, covered, remaining}] по возрастанию created_at.
-    covered учитывает уже распределённое pending+confirmed-сдачами (M3)."""
+    covered учитывает уже распределённое pending+confirmed-сдачами (M3).
+
+    Остаток считаем в копейках (без float-эпсилона 0.01) — заказ попадает
+    в список, только если непокрытый остаток ≥ 1 копейки."""
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
@@ -1520,15 +1528,16 @@ def get_manager_open_orders_for_deposit(manager_id: int) -> list[dict]:
         ids = [(r["id"] if USE_POSTGRES else r[0]) for r in cur.fetchall()]
     out = []
     for oid in ids:
-        total = _order_total(oid)
-        covered = _order_allocated_deposit_amount(oid)
-        if total - covered > 0.01:
+        total_cents = _order_total_cents(oid)
+        covered_cents = _order_allocated_deposit_cents(oid)
+        remaining_cents = total_cents - covered_cents
+        if remaining_cents > 0:
             out.append(
                 {
                     "id": oid,
-                    "total": total,
-                    "covered": covered,
-                    "remaining": max(0.0, total - covered),
+                    "total": float(money.from_cents(total_cents)),
+                    "covered": float(money.from_cents(covered_cents)),
+                    "remaining": float(money.from_cents(remaining_cents)),
                 }
             )
     return out
@@ -1963,9 +1972,18 @@ def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_name: str
 
     closed = []
     for oid in order_ids:
-        if _order_confirmed_deposit_amount(oid) + 0.01 >= _order_total(oid):
+        # Покрытие считаем в копейках (без float-эпсилона +0.01). Строку заказа
+        # блокируем FOR UPDATE и закрываем тем же атомарным UPDATE с guard'ом
+        # payment_confirmed=0 — параллельные подтверждения сдач по одному заказу
+        # не закроют его дважды (паттерн как в mark_order_paid).
+        if _order_confirmed_deposit_cents(oid) >= _order_total_cents(oid):
             with get_conn() as conn:
                 cur = get_cursor(conn)
+                if USE_POSTGRES:
+                    cur.execute(
+                        q("SELECT payment_confirmed FROM orders WHERE id = ? FOR UPDATE"),
+                        (oid,),
+                    )
                 cur.execute(
                     q(
                         "UPDATE orders SET payment_confirmed = 1, payment_confirmed_at = ?, "
@@ -2263,10 +2281,44 @@ def create_return(
     if not items:
         return {"ok": False, "error": "Не указаны позиции возврата"}
 
+    # Дедлайн (read-only, до блокировки).
+    deadline_days = int(get_setting("return_deadline_days", 90))
+    shipped_at = order.get("shipped_at")
+    if shipped_at and not force:
+        from datetime import timedelta
+
+        limit = (datetime.now() - timedelta(days=deadline_days)).strftime("%Y-%m-%d %H:%M:%S")
+        if shipped_at < limit:
+            return {
+                "ok": False,
+                "error": f"Возврат позже {deadline_days} дней — нужно подтверждение",
+            }
+
+    # H1: режем количество по доступному остатку (quantity - returned_qty) и
+    # считаем сумму строки из price_cents (источник истины), а не из float price
+    # и не доверяя переданному amount. Это read-only прикидка; финальную защиту
+    # от overshoot даёт атомарный guard в confirm_return.
+    oitems = {it["id"]: it for it in get_order_items(order_id)}
+    clamped: list[tuple] = []  # (order_item_id, take_qty, line_cents)
+    for oitem_id, qty, _amount in items:
+        oi = oitems.get(oitem_id)
+        if not oi:
+            continue
+        available = float(oi.get("quantity", 0) or 0) - float(oi.get("returned_qty", 0) or 0)
+        take = min(float(qty), available)
+        if take <= 0:
+            continue
+        clamped.append((oitem_id, take, money.mul_qty(_price_cents(oi), take)))
+    if not clamped:
+        return {"ok": False, "error": "Нет позиций, доступных к возврату"}
+
+    total_cents = sum(c for _, _, c in clamped)
+    total_amount = float(money.from_cents(total_cents))
+
     # H1 + Round 6 RACE-2: не плодим параллельные возвраты по одному заказу.
-    # Advisory-lock по order_id сериализует две одновременные create_return
-    # (раньше TOCTOU между SELECT COUNT и INSERT пропускал оба, потом каждый
-    # confirm_return наращивал returned_qty → overflow > quantity).
+    # Advisory-lock держится до конца транзакции и теперь покрывает И dup-check,
+    # И INSERT (раньше lock снимался до INSERT — TOCTOU пропускал два возврата,
+    # потом каждый confirm_return наращивал returned_qty → overflow > quantity).
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
@@ -2286,46 +2338,12 @@ def create_return(
             conn.rollback()
             return {"ok": False, "error": "По заказу уже есть возврат на рассмотрении"}
 
-    # H1: режем количество по доступному остатку (quantity - returned_qty) и
-    # пересчитываем сумму по цене позиции — не доверяем переданному amount.
-    oitems = {it["id"]: it for it in get_order_items(order_id)}
-    clamped: list[tuple] = []
-    for oitem_id, qty, _amount in items:
-        oi = oitems.get(oitem_id)
-        if not oi:
-            continue
-        available = float(oi.get("quantity", 0) or 0) - float(oi.get("returned_qty", 0) or 0)
-        take = min(float(qty), available)
-        if take <= 0:
-            continue
-        price = float(oi.get("price", 0) or 0)
-        clamped.append((oitem_id, take, round(take * price, 2)))
-    if not clamped:
-        return {"ok": False, "error": "Нет позиций, доступных к возврату"}
-    items = clamped
-
-    deadline_days = int(get_setting("return_deadline_days", 90))
-    shipped_at = order.get("shipped_at")
-    if shipped_at and not force:
-        from datetime import timedelta
-
-        limit = (datetime.now() - timedelta(days=deadline_days)).strftime("%Y-%m-%d %H:%M:%S")
-        if shipped_at < limit:
-            return {
-                "ok": False,
-                "error": f"Возврат позже {deadline_days} дней — нужно подтверждение",
-            }
-
-    total_amount = round(sum(float(a) for _, _, a in items), 2)
-    total_amount_cents = money.to_cents(total_amount)
-    with get_conn() as conn:
-        cur = get_cursor(conn)
         if USE_POSTGRES:
             cur.execute(
                 "INSERT INTO returns (order_id, return_type, reason, total_amount, total_amount_cents, "
                 "refund_method, created_by, status, created_at) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s) RETURNING id",
-                (order_id, return_type, reason, total_amount, total_amount_cents, refund_method, created_by, now_str()),
+                (order_id, return_type, reason, total_amount, total_cents, refund_method, created_by, now_str()),
             )
             return_id = cur.fetchone()["id"]
         else:
@@ -2333,16 +2351,16 @@ def create_return(
                 "INSERT INTO returns (order_id, return_type, reason, total_amount, total_amount_cents, "
                 "refund_method, created_by, status, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
-                (order_id, return_type, reason, total_amount, total_amount_cents, refund_method, created_by, now_str()),
+                (order_id, return_type, reason, total_amount, total_cents, refund_method, created_by, now_str()),
             )
             return_id = cur.lastrowid
-        for oitem_id, qty, amount in items:
+        for oitem_id, qty, line_cents in clamped:
             cur.execute(
                 q(
                     "INSERT INTO return_items (return_id, order_item_id, qty, amount, amount_cents) "
                     "VALUES (?, ?, ?, ?, ?)"
                 ),
-                (return_id, oitem_id, qty, amount, money.to_cents(amount)),
+                (return_id, oitem_id, qty, float(money.from_cents(line_cents)), line_cents),
             )
         conn.commit()
     return {"ok": True, "return_id": return_id, "total_amount": total_amount}
