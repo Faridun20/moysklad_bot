@@ -28,12 +28,30 @@ logger = logging.getLogger(__name__)
 
 
 async def get_ms_employees() -> list[dict]:
-    """Получить список всех сотрудников из МойСклад."""
+    """Получить список всех сотрудников из МойСклад.
+
+    Пагинация offset-loop (CLAUDE.md): без неё при >100 сотрудниках хвост
+    терялся, и sync_manager мог не сматчить существующего по имени →
+    создавал дубль.
+    """
     sess = await get_session()
-    async with sess.get(f"{MS_BASE}/entity/employee", params={"limit": 100}) as resp:
-        resp.raise_for_status()
-        data = await resp.json()
-    return data.get("rows", [])
+    rows: list[dict] = []
+    offset = 0
+    page = 100
+    max_pages = 20  # ≤2000 сотрудников
+    for _ in range(max_pages):
+        async with sess.get(
+            f"{MS_BASE}/entity/employee",
+            params={"limit": page, "offset": offset},
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+        chunk = data.get("rows", [])
+        rows.extend(chunk)
+        if len(chunk) < page:
+            break
+        offset += page
+    return rows
 
 
 def _parse_ms_error(body_text: str) -> str:

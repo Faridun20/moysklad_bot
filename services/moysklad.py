@@ -59,11 +59,18 @@ _HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 # Персистентная сессия — создаётся один раз на старте бота.
 _session: aiohttp.ClientSession | None = None
 _session_lock = asyncio.Lock()
+# Event loop, к которому привязана _session. aiohttp-сессия живёт на том
+# loop'е, где её создали; вызвать её из ДРУГОГО loop'а (например из
+# asyncio.run() в to_thread-воркере) → RuntimeError. Сохраняем ссылку,
+# чтобы sync-вызывающие (confirm_payment в to_thread) могли запланировать
+# корутину на правильный loop через run_coroutine_threadsafe. См.
+# database._trigger_ms_paymentin_sync.
+_session_loop: asyncio.AbstractEventLoop | None = None
 
 
 async def get_session() -> aiohttp.ClientSession:
     """Вернуть глобальную сессию, создавая её при первом обращении."""
-    global _session
+    global _session, _session_loop
     if _session is None or _session.closed:
         async with _session_lock:
             if _session is None or _session.closed:
@@ -73,15 +80,22 @@ async def get_session() -> aiohttp.ClientSession:
                     timeout=_HTTP_TIMEOUT,
                     headers=MS_HEADERS,
                 )
+                _session_loop = asyncio.get_running_loop()
     return _session
+
+
+def get_session_loop() -> asyncio.AbstractEventLoop | None:
+    """Loop, на котором создана MS-сессия (None — сессии ещё нет)."""
+    return _session_loop
 
 
 async def close_session() -> None:
     """Закрыть сессию при остановке бота."""
-    global _session
+    global _session, _session_loop
     if _session is not None and not _session.closed:
         await _session.close()
     _session = None
+    _session_loop = None
 
 
 _MAX_RETRIES = 3
@@ -621,7 +635,10 @@ async def get_employee_shipments(
     until: datetime | None = None,
     employee_href: str | None = None,
 ) -> list[dict]:
-    """Получить отгрузки конкретного сотрудника по его href."""
+    """Получить отгрузки конкретного сотрудника по его href.
+
+    Пагинация offset-loop (CLAUDE.md): без неё у сотрудника с >100
+    отгрузками за период терялся хвост → личная статистика занижалась."""
     since_str = since.strftime("%Y-%m-%d %H:%M:%S.000")
     filter_str = f"moment>{since_str}"
     if until:
@@ -629,16 +646,27 @@ async def get_employee_shipments(
     if employee_href:
         filter_str += f";owner={employee_href}"
 
-    data = await ms_get(
-        "entity/demand",
-        params={
-            "filter": filter_str,
-            "expand": "agent,owner",
-            "order": "moment,desc",
-            "limit": 100,
-        },
-    )
-    return data if isinstance(data, list) else data.get("rows", [])
+    rows: list[dict] = []
+    offset = 0
+    page = 100
+    max_pages = 10  # ≤1000 отгрузок на сотрудника — разумный потолок
+    for _ in range(max_pages):
+        data = await ms_get(
+            "entity/demand",
+            params={
+                "filter": filter_str,
+                "expand": "agent,owner",
+                "order": "moment,desc",
+                "limit": page,
+                "offset": offset,
+            },
+        )
+        chunk = data if isinstance(data, list) else data.get("rows", [])
+        rows.extend(chunk)
+        if len(chunk) < page:
+            break
+        offset += page
+    return rows
 
 
 @_ms_ttl_cache(ttl=60.0, name="get_employee_stats")

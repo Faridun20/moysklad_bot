@@ -66,14 +66,20 @@ async def _resolve_currency_meta(iso_code: str) -> dict | None:
     if iso_code in _currency_meta_cache:
         return _currency_meta_cache[iso_code]
     try:
-        data = await ms_get("entity/currency", params={"limit": 100})
-        rows = data.get("rows", []) if isinstance(data, dict) else []
-        for c in rows:
-            if (c.get("isoCode") or "").upper() == iso_code:
-                meta = c.get("meta")
-                if meta:
-                    _currency_meta_cache[iso_code] = meta
-                    return meta
+        offset = 0
+        page = 100
+        for _ in range(10):  # offset-loop: справочник валют может быть >100
+            data = await ms_get("entity/currency", params={"limit": page, "offset": offset})
+            rows = data.get("rows", []) if isinstance(data, dict) else []
+            for c in rows:
+                if (c.get("isoCode") or "").upper() == iso_code:
+                    meta = c.get("meta")
+                    if meta:
+                        _currency_meta_cache[iso_code] = meta
+                        return meta
+            if len(rows) < page:
+                break
+            offset += page
         logger.warning("MS currency %s не найдена в справочнике", iso_code)
     except Exception:
         logger.exception("Не удалось получить справочник валют МойСклад")

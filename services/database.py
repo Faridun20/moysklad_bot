@@ -3776,17 +3776,22 @@ def get_unlinked_payments(limit: int = 100) -> list[dict]:
 def _trigger_ms_paymentin_sync(payment_id: int) -> None:
     """Запустить async create_paymentin_for_payment в фоне.
 
-    Стратегия:
-      - Внутри активного event loop (aiogram/aiohttp в bot/webapp) —
-        кидаем create_task. Fire-and-forget: ошибки логируются в
-        ms_payments, БД-confirm уже закоммичен.
-      - В чисто sync-контексте (cron-скрипт, который не делает
-        confirm_payment напрямую, но если делает — короткоживущий
-        процесс) — поднимаем мини-loop через asyncio.run.
+    Три контекста вызова:
+      1. Внутри активного event loop (редко: код уже в loop'е) —
+         loop.create_task, fire-and-forget.
+      2. В to_thread-воркере (типичный путь: confirm_payment вызывается
+         через services.async_db → asyncio.to_thread из bot/webapp).
+         В воркере НЕТ running loop, а MS-сессия привязана к ГЛАВНОМУ
+         loop'у. Раньше тут делался asyncio.run(), который поднимал НОВЫЙ
+         loop и дёргал сессию чужого loop'а → RuntimeError "Timeout
+         context manager should be used inside a task" — синк молча падал
+         на каждом подтверждении, и спасал только cron-retry. Теперь
+         планируем корутину на loop сессии через run_coroutine_threadsafe.
+      3. Истинно sync-контекст (cron-скрипт, главного loop'а нет) —
+         asyncio.run поднимает свой loop и создаёт в нём свежую сессию.
 
-    asyncio.get_running_loop() в Python 3.12+ — правильный способ;
-    бросает RuntimeError если нет активного loop'а, что нам нужно
-    как сигнал для fallback на asyncio.run.
+    БД-confirm уже закоммичен к моменту вызова; ошибки синка некритичны
+    (cron-retry добирает), поэтому всё best-effort.
     """
     import asyncio
 
@@ -3795,26 +3800,44 @@ def _trigger_ms_paymentin_sync(payment_id: int) -> None:
     except Exception:
         return  # окружение без MS_TOKEN
 
+    # (1) Уже внутри running loop'а — просто планируем задачу.
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        # Не в async-контексте — короткоживущий loop
-        try:
-            asyncio.run(create_paymentin_for_payment(payment_id))
-        except Exception:
-            # Статус failed уже записан внутри ms_payments — молча
-            pass
+        loop = None
+    if loop is not None:
+        task = loop.create_task(create_paymentin_for_payment(payment_id))
+
+        def _log_exc(t: asyncio.Task) -> None:
+            if not t.cancelled() and (exc := t.exception()):
+                logger.exception("ms_paymentin_sync payment #%d failed: %s", payment_id, exc)
+
+        task.add_done_callback(_log_exc)
         return
 
-    # В активном loop'е — fire-and-forget. Сохраняем ссылку чтобы
-    # не было RuntimeWarning «Task was destroyed».
-    task = loop.create_task(create_paymentin_for_payment(payment_id))
+    # (2) Воркер-тред: если главный loop с MS-сессией ещё жив — планируем
+    # корутину НА НЕГО (там валидна сессия), не поднимая чужой loop.
+    try:
+        from services.moysklad import get_session_loop
 
-    def _log_exc(t: asyncio.Task) -> None:
-        if not t.cancelled() and (exc := t.exception()):
-            logger.exception("ms_paymentin_sync payment #%d failed: %s", payment_id, exc)
+        main_loop = get_session_loop()
+    except Exception:
+        main_loop = None
+    if main_loop is not None and main_loop.is_running():
+        try:
+            asyncio.run_coroutine_threadsafe(
+                create_paymentin_for_payment(payment_id), main_loop
+            )
+        except Exception:
+            logger.exception("ms_paymentin_sync payment #%d: schedule failed", payment_id)
+        return
 
-    task.add_done_callback(_log_exc)
+    # (3) Нет главного loop'а (cron) — свой короткий loop + свежая сессия.
+    try:
+        asyncio.run(create_paymentin_for_payment(payment_id))
+    except Exception:
+        # Статус failed уже записан внутри ms_payments — молча
+        pass
 
 
 def _maybe_close_order_after_payment(
