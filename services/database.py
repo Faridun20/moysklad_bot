@@ -1834,6 +1834,23 @@ def get_product_prices_by_ids(ms_ids: list[str]) -> dict[str, dict]:
         return {r["ms_id"]: dict(r) for r in cur.fetchall()}
 
 
+def get_existing_ms_product_ids(ms_ids: list[str]) -> set[str]:
+    """Подмножество ms_ids, которые ещё ЕСТЬ в снапшоте ms_products (т.е. НЕ
+    удалены в МойСклад). Аналитика использует это, чтобы прятать из топа
+    товары, удалённые в МС (иначе менеджер видит непонятные позиции)."""
+    ids = [str(x).strip() for x in (ms_ids or []) if str(x).strip()]
+    if not ids:
+        return set()
+    placeholders = ", ".join(["?"] * len(ids))
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(f"SELECT ms_id FROM ms_products WHERE ms_id IN ({placeholders})"),
+            ids,
+        )
+        return {(r["ms_id"] if USE_POSTGRES else r[0]) for r in cur.fetchall()}
+
+
 def get_all_product_prices() -> list[dict]:
     """Все заданные цены. Для admin-UI экрана «Цены»."""
     with get_conn() as conn:
