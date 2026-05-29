@@ -128,7 +128,7 @@ async def sync_manager(user_id: int, full_name: str, username: str) -> dict:
          "ms_name": "..." (для linked),
          "reason": "..." (для failed)}
     """
-    existing = get_moysklad_employee_id(user_id)
+    existing = await get_moysklad_employee_id(user_id)
     if existing:
         return {"status": "already_linked", "ms_id": existing}
 

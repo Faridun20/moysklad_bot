@@ -8,6 +8,7 @@
   * rc=2 от main → status=failed (нон-нулевой)
 """
 
+import asyncio
 import logging
 
 from tasks._cron_runner import run_cron
@@ -21,7 +22,7 @@ def test_run_cron_sync_success(isolated_db):
 
     rc = run_cron("test_sync_ok", my_main)
     assert rc == 0
-    last = {r["task_name"]: r for r in isolated_db.get_last_cron_runs()}
+    last = {r["task_name"]: r for r in asyncio.run(isolated_db.get_last_cron_runs())}
     assert "test_sync_ok" in last
     assert last["test_sync_ok"]["status"] == "ok"
 
@@ -34,7 +35,7 @@ def test_run_cron_sync_none_treated_as_success(isolated_db):
 
     rc = run_cron("test_sync_none", my_main)
     assert rc == 0
-    last = {r["task_name"]: r for r in isolated_db.get_last_cron_runs()}
+    last = {r["task_name"]: r for r in asyncio.run(isolated_db.get_last_cron_runs())}
     assert last["test_sync_none"]["status"] == "ok"
 
 
@@ -46,7 +47,7 @@ def test_run_cron_async_success(isolated_db):
 
     rc = run_cron("test_async_ok", my_main)
     assert rc == 0
-    last = {r["task_name"]: r for r in isolated_db.get_last_cron_runs()}
+    last = {r["task_name"]: r for r in asyncio.run(isolated_db.get_last_cron_runs())}
     assert last["test_async_ok"]["status"] == "ok"
 
 
@@ -59,7 +60,7 @@ def test_run_cron_exception_records_failed(isolated_db, caplog):
     caplog.set_level(logging.WARNING)
     rc = run_cron("test_fail", my_main)
     assert rc == 1
-    last = {r["task_name"]: r for r in isolated_db.get_last_cron_runs()}
+    last = {r["task_name"]: r for r in asyncio.run(isolated_db.get_last_cron_runs())}
     assert last["test_fail"]["status"] == "failed"
     # error_message содержит и тип, и текст
     assert "RuntimeError" in last["test_fail"]["error_message"]
@@ -74,7 +75,7 @@ def test_run_cron_async_exception_records_failed(isolated_db):
 
     rc = run_cron("test_async_fail", my_main)
     assert rc == 1
-    last = {r["task_name"]: r for r in isolated_db.get_last_cron_runs()}
+    last = {r["task_name"]: r for r in asyncio.run(isolated_db.get_last_cron_runs())}
     assert last["test_async_fail"]["status"] == "failed"
     assert "async boom" in last["test_async_fail"]["error_message"]
 
@@ -87,7 +88,7 @@ def test_run_cron_nonzero_rc_is_failed(isolated_db):
 
     rc = run_cron("test_rc2", my_main)
     assert rc == 2
-    last = {r["task_name"]: r for r in isolated_db.get_last_cron_runs()}
+    last = {r["task_name"]: r for r in asyncio.run(isolated_db.get_last_cron_runs())}
     assert last["test_rc2"]["status"] == "failed"
 
 

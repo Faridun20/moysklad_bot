@@ -5,6 +5,8 @@
 notifier'а; здесь — формирование текста.
 """
 
+import asyncio
+
 from tasks.run_ops_monitor import (
     assemble_digest,
     build_cron_health_block,
@@ -130,7 +132,7 @@ def test_record_cron_run_and_get_last(isolated_db):
     )
     db.record_cron_run("maintenance", "ok", "2026-05-24 03:00:00", "2026-05-24 03:00:30", 30000)
 
-    last = db.get_last_cron_runs()
+    last = asyncio.run(db.get_last_cron_runs())
     by = {r["task_name"]: r for r in last}
     assert set(by) == {"ms_sync_retry", "maintenance"}
     assert by["ms_sync_retry"]["status"] == "failed"  # последний
@@ -149,12 +151,14 @@ def test_get_stale_crons_finds_overdue_and_never_run(isolated_db):
     db.record_cron_run("ms_sync_retry", "ok", fresh, fresh, 100)
     db.record_cron_run("maintenance", "ok", very_old, very_old, 100)
 
-    stale = db.get_stale_crons(
-        {
-            "ms_sync_retry": 1.0,
-            "maintenance": 26.0,
-            "debts_notify": 26.0,  # ни разу
-        }
+    stale = asyncio.run(
+        db.get_stale_crons(
+            {
+                "ms_sync_retry": 1.0,
+                "maintenance": 26.0,
+                "debts_notify": 26.0,  # ни разу
+            }
+        )
     )
     by = {s["task_name"]: s for s in stale}
     # ms_sync_retry — свежий, не в stale.
@@ -175,7 +179,7 @@ def test_get_stale_crons_flags_failed_last_run(isolated_db):
     fresh = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.record_cron_run("ms_sync_retry", "failed", fresh, fresh, 100, error_message="boom")
 
-    stale = db.get_stale_crons({"ms_sync_retry": 1.0})
+    stale = asyncio.run(db.get_stale_crons({"ms_sync_retry": 1.0}))
     assert len(stale) == 1
     assert stale[0]["last_status"] == "failed"
     assert stale[0]["last_error"] == "boom"
