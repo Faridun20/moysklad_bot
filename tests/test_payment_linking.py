@@ -32,7 +32,7 @@ def _setup_order(db, manager_id: int = 100, total: float = 100.0):
 
 def test_link_rejects_missing_args(isolated_db):
     db = isolated_db
-    res = db.link_payment_to_order(0, 1, linked_by=99)
+    res = asyncio.run(db.link_payment_to_order(0, 1, linked_by=99))
     assert res["ok"] is False
     assert "обязательны" in res["error"]
 
@@ -40,7 +40,7 @@ def test_link_rejects_missing_args(isolated_db):
 def test_link_rejects_missing_payment(isolated_db):
     db = isolated_db
     oid = _setup_order(db)
-    res = db.link_payment_to_order(999, oid, linked_by=99)
+    res = asyncio.run(db.link_payment_to_order(999, oid, linked_by=99))
     assert res["ok"] is False
     assert "Платёж не найден" in res["error"]
 
@@ -49,7 +49,7 @@ def test_link_rejects_missing_order(isolated_db):
     db = isolated_db
     db.set_role(100, "m", "M", "manager")
     pid = db.add_payment(100, "@m", "M", 50.0, "USD", "x")  # без order_id
-    res = db.link_payment_to_order(pid, 999, linked_by=99)
+    res = asyncio.run(db.link_payment_to_order(pid, 999, linked_by=99))
     assert res["ok"] is False
     assert "Заказ не найден" in res["error"]
 
@@ -60,7 +60,7 @@ def test_link_rejects_already_linked_payment(isolated_db):
     oid1 = _setup_order(db)
     oid2 = _setup_order(db, manager_id=101)
     pid = db.add_payment(100, "@m", "M", 50.0, "USD", "x", order_id=oid1)
-    res = db.link_payment_to_order(pid, oid2, linked_by=99)
+    res = asyncio.run(db.link_payment_to_order(pid, oid2, linked_by=99))
     assert res["ok"] is False
     assert "уже привязан" in res["error"]
 
@@ -71,7 +71,7 @@ def test_link_pending_payment_happy_path(isolated_db):
     oid = _setup_order(db)
     pid = db.add_payment(100, "@m", "M", 50.0, "USD", "x")  # standalone
     assert db.get_payment(pid)["order_id"] is None
-    res = db.link_payment_to_order(pid, oid, linked_by=99, linked_name="Boss")
+    res = asyncio.run(db.link_payment_to_order(pid, oid, linked_by=99, linked_name="Boss"))
     assert res["ok"] is True
     assert res["ms_sync_triggered"] is False  # pending → не sync'аем
     assert res["order_closed"] is False
@@ -84,7 +84,7 @@ def test_link_confirmed_payment_triggers_ms_sync(isolated_db, monkeypatch):
     oid = _setup_order(db, total=100.0)
     pid = db.add_payment(100, "@m", "M", 50.0, "USD", "x")
     # Подтверждаем БЕЗ order_id — это standalone confirmed
-    db.confirm_payment(pid, 99, "Boss")
+    asyncio.run(db.confirm_payment(pid, 99, "Boss"))
     assert db.get_payment(pid)["status"] == "confirmed"
 
     sync_called = []
@@ -92,7 +92,7 @@ def test_link_confirmed_payment_triggers_ms_sync(isolated_db, monkeypatch):
         db, "_trigger_ms_paymentin_sync", lambda pid_: sync_called.append(pid_)
     )
 
-    res = db.link_payment_to_order(pid, oid, linked_by=99, linked_name="Boss")
+    res = asyncio.run(db.link_payment_to_order(pid, oid, linked_by=99, linked_name="Boss"))
     assert res["ok"] is True
     assert res["ms_sync_triggered"] is True
     assert sync_called == [pid]
@@ -105,10 +105,10 @@ def test_link_confirmed_payment_closes_order_if_total_reached(isolated_db, monke
     db = isolated_db
     oid = _setup_order(db, total=100.0)
     pid = db.add_payment(100, "@m", "M", 100.0, "USD", "x")
-    db.confirm_payment(pid, 99, "Boss")
+    asyncio.run(db.confirm_payment(pid, 99, "Boss"))
 
     monkeypatch.setattr(db, "_trigger_ms_paymentin_sync", lambda _: None)
-    res = db.link_payment_to_order(pid, oid, linked_by=99, linked_name="Boss")
+    res = asyncio.run(db.link_payment_to_order(pid, oid, linked_by=99, linked_name="Boss"))
     assert res["ok"] is True
     assert res["order_closed"] is True
     assert db.get_order(oid).get("paid_confirmed_at") is not None
@@ -118,7 +118,7 @@ def test_link_writes_audit_log(isolated_db):
     db = isolated_db
     oid = _setup_order(db)
     pid = db.add_payment(100, "@m", "M", 50.0, "USD", "x")
-    db.link_payment_to_order(pid, oid, linked_by=99, linked_name="Boss")
+    asyncio.run(db.link_payment_to_order(pid, oid, linked_by=99, linked_name="Boss"))
     # audit_log проверяем по action
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)
@@ -146,7 +146,7 @@ def test_link_race_second_call_loses(isolated_db, monkeypatch):
         cur.execute(db.q("UPDATE payments SET order_id = ? WHERE id = ?"), (oid1, pid))
         conn.commit()
     # Сбрасываем check-кэш (link сначала get_payment видит уже-linked)
-    res = db.link_payment_to_order(pid, oid2, linked_by=99)
+    res = asyncio.run(db.link_payment_to_order(pid, oid2, linked_by=99))
     assert res["ok"] is False
     assert "уже привязан" in res["error"]
 
@@ -158,9 +158,9 @@ def test_get_unlinked_payments_filters_by_status_and_order(isolated_db):
     oid = _setup_order(db)
     p_pending = db.add_payment(100, "@m", "M", 50.0, "USD", "pending standalone")
     p_confirmed_standalone = db.add_payment(100, "@m", "M", 60.0, "USD", "confirmed standalone")
-    db.confirm_payment(p_confirmed_standalone, 99, "Boss")
+    asyncio.run(db.confirm_payment(p_confirmed_standalone, 99, "Boss"))
     p_confirmed_linked = db.add_payment(100, "@m", "M", 70.0, "USD", "linked", order_id=oid)
-    db.confirm_payment(p_confirmed_linked, 99, "Boss")
+    asyncio.run(db.confirm_payment(p_confirmed_linked, 99, "Boss"))
 
     unlinked = asyncio.run(db.get_unlinked_payments())  # async после asyncpg Stage 2
     ids = {p["id"] for p in unlinked}
@@ -175,7 +175,7 @@ def test_get_unlinked_payments_respects_limit(isolated_db):
     pids = []
     for i in range(5):
         pid = db.add_payment(100, "@m", "M", 10.0 + i, "USD", f"p{i}")
-        db.confirm_payment(pid, 99, "Boss")
+        asyncio.run(db.confirm_payment(pid, 99, "Boss"))
         pids.append(pid)
     out = asyncio.run(db.get_unlinked_payments(limit=3))  # async после asyncpg Stage 2
     assert len(out) == 3
@@ -215,7 +215,7 @@ def test_unlinked_endpoint_open_to_bookkeeper(client_env):
     client, db, ids = client_env
     # Создаём confirmed standalone
     pid = db.add_payment(ids["mgr"], "@m", "M", 50.0, "USD", "x")
-    db.confirm_payment(pid, ids["boss"], "Boss")
+    asyncio.run(db.confirm_payment(pid, ids["boss"], "Boss"))
     resp = client.post("/api/payments/unlinked", json={"initData": str(ids["book"])})
     assert resp.status_code == 200, resp.text
     data = resp.json()
@@ -240,7 +240,7 @@ def test_link_endpoint_happy_path(client_env, monkeypatch):
     client, db, ids = client_env
     oid = _setup_order(db, manager_id=ids["mgr"], total=100.0)
     pid = db.add_payment(ids["mgr"], "@m", "M", 100.0, "USD", "x")
-    db.confirm_payment(pid, ids["boss"], "Boss")
+    asyncio.run(db.confirm_payment(pid, ids["boss"], "Boss"))
 
     resp = client.post(
         "/api/payments/link",
