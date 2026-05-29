@@ -43,7 +43,9 @@ from utils.helpers import esc as _esc  # единая реализация — �
 
 def _fmt_amount(n: float) -> str:
     """1234567 → '1 234 567'."""
-    return f"{int(round(n)):,}".replace(",", " ")
+    from services import money
+
+    return money.format_cents(money.to_cents(n or 0), decimals=0, sep=" ")
 
 
 def _format_due(due_str: str | None, today_str: str) -> str:

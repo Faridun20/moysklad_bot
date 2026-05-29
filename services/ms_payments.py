@@ -38,6 +38,7 @@ from services.database import (
 )
 from services.metrics import measure_async
 from services.moysklad import MS_BASE, get_session, ms_get, redact_ms_error
+from services import money
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +139,12 @@ async def create_paymentin_for_payment(payment_id: int) -> dict:
         return {"ok": False, "reason": msg}
 
     agent_href = f"{MS_BASE}/entity/counterparty/{order['agent_id']}"
-    amount_minor = int(round(float(payment["amount"]) * 100))
+    # МС ждёт минорные единицы. Берём канонические копейки напрямую (без
+    # float*100), с фолбэком на legacy REAL для не-забэкфилленных строк.
+    amount_minor = payment.get("amount_cents")
+    if amount_minor is None:
+        amount_minor = money.to_cents(payment.get("amount") or 0)
+    amount_minor = int(amount_minor)
 
     payload: dict[str, Any] = {
         "name": f"Платёж #{payment_id} по заказу #{order['id']} (бот)",

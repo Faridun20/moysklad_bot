@@ -31,7 +31,9 @@ class LimitFlow(StatesGroup):
 
 
 def _fmt(x: float) -> str:
-    return f"{x:,.2f}".replace(",", " ")
+    from services import money
+
+    return money.format_cents(money.to_cents(x or 0), decimals=2, sep=" ")
 
 
 def _overview_keyboard(agents: list[dict]):

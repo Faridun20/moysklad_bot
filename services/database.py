@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 from contextlib import contextmanager
 from typing import Any
 
+from services import money  # канонические деньги (копейки); leaf-модуль, без циклов
+
 logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -280,6 +282,7 @@ def _create_tables():
                 username        TEXT,
                 full_name       TEXT,
                 amount          REAL NOT NULL,
+                amount_cents    BIGINT,
                 currency        TEXT NOT NULL DEFAULT 'USD',
                 comment         TEXT,
                 status          TEXT NOT NULL DEFAULT 'pending',
@@ -327,6 +330,7 @@ def _create_tables():
                 quantity     REAL NOT NULL DEFAULT 1,
                 unit         TEXT DEFAULT 'шт',
                 price        REAL DEFAULT 0,
+                price_cents  BIGINT,
                 note         TEXT
             )""",
             f"""CREATE TABLE IF NOT EXISTS shipment_requests (
@@ -417,6 +421,7 @@ def _create_tables():
                 agent_id     TEXT PRIMARY KEY,
                 agent_name   TEXT NOT NULL,
                 limit_amount REAL NOT NULL DEFAULT 2000.0,
+                limit_amount_cents BIGINT,
                 set_by       BIGINT,
                 notes        TEXT,
                 updated_at   TEXT,
@@ -427,6 +432,7 @@ def _create_tables():
                 id           {id_type},
                 manager_id   BIGINT NOT NULL,
                 amount       REAL NOT NULL,
+                amount_cents BIGINT,
                 deposited_at TEXT,
                 confirmed_by BIGINT,
                 confirmed_at TEXT,
@@ -441,6 +447,7 @@ def _create_tables():
                 deposit_id       BIGINT NOT NULL,
                 order_id         BIGINT NOT NULL,
                 amount_allocated REAL NOT NULL,
+                amount_allocated_cents BIGINT,
                 is_manual        INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (deposit_id, order_id)
             )""",
@@ -451,6 +458,7 @@ def _create_tables():
                 return_type  TEXT NOT NULL,
                 reason       TEXT NOT NULL,
                 total_amount REAL NOT NULL,
+                total_amount_cents BIGINT,
                 refund_method TEXT,
                 moysklad_return_id TEXT,
                 created_by   BIGINT NOT NULL,
@@ -466,7 +474,8 @@ def _create_tables():
                 return_id     BIGINT NOT NULL,
                 order_item_id BIGINT NOT NULL,
                 qty           REAL NOT NULL,
-                amount        REAL NOT NULL
+                amount        REAL NOT NULL,
+                amount_cents  BIGINT
             )""",
             # Партии товара (FEFO). Используется только если МойСклад
             # поддерживает партии для товара; иначе order_items.batch_id NULL.
@@ -595,7 +604,9 @@ def _create_tables():
                 ms_id         TEXT PRIMARY KEY,
                 product_name  TEXT,
                 sale_price    REAL,
+                sale_price_cents BIGINT,
                 cost_price    REAL,
+                cost_price_cents BIGINT,
                 currency      TEXT,
                 updated_by    BIGINT,
                 updated_at    TEXT
@@ -765,6 +776,20 @@ def run_migrations():
             ("order_items", "price_at_submit", "REAL"),
             ("order_items", "batch_id", "TEXT"),
             ("order_items", "returned_qty", "REAL NOT NULL DEFAULT 0"),
+            # ─── Деньги в копейках (минорные единицы) — канон вместо float.
+            #     Аддитивные BIGINT-колонки рядом со старыми REAL; backfill
+            #     в run_backfills (x_cents = round(x*100)). Старые REAL пока
+            #     остаются для безопасного rolling-деплоя. См. services/money.py.
+            ("payments", "amount_cents", "BIGINT"),
+            ("order_items", "price_cents", "BIGINT"),
+            ("order_items", "price_at_submit_cents", "BIGINT"),
+            ("credit_limits", "limit_amount_cents", "BIGINT"),
+            ("cash_deposits", "amount_cents", "BIGINT"),
+            ("cash_deposit_orders", "amount_allocated_cents", "BIGINT"),
+            ("returns", "total_amount_cents", "BIGINT"),
+            ("return_items", "amount_cents", "BIGINT"),
+            ("product_prices", "sale_price_cents", "BIGINT"),
+            ("product_prices", "cost_price_cents", "BIGINT"),
         ]
         applied = 0
         for table, column, col_type in migrations:
@@ -839,6 +864,33 @@ def run_backfills():
         except Exception as e:
             conn.rollback()
             logger.warning("Recovery paid_confirmed: %s", e)
+
+        # ── Деньги float → копейки ───────────────────────────────────
+        # Заполняем новые *_cents BIGINT из старых REAL: cents = round(x*100).
+        # Идемпотентно (WHERE dst IS NULL). round() есть и в SQLite, и в
+        # Postgres. Имена таблиц/колонок статические — не пользовательский ввод.
+        _money_cols = [
+            ("payments", "amount", "amount_cents"),
+            ("order_items", "price", "price_cents"),
+            ("order_items", "price_at_submit", "price_at_submit_cents"),
+            ("credit_limits", "limit_amount", "limit_amount_cents"),
+            ("cash_deposits", "amount", "amount_cents"),
+            ("cash_deposit_orders", "amount_allocated", "amount_allocated_cents"),
+            ("returns", "total_amount", "total_amount_cents"),
+            ("return_items", "amount", "amount_cents"),
+            ("product_prices", "sale_price", "sale_price_cents"),
+            ("product_prices", "cost_price", "cost_price_cents"),
+        ]
+        for _table, _src, _dst in _money_cols:
+            try:
+                cur.execute(
+                    f"UPDATE {_table} SET {_dst} = CAST(round({_src} * 100) AS INTEGER) "
+                    f"WHERE {_dst} IS NULL AND {_src} IS NOT NULL"
+                )
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.warning("Backfill cents %s.%s: %s", _table, _dst, e)
 
     # ── Сидинг app_settings (идемпотентно) ───────────────────────────
     seed_app_settings()
@@ -1019,23 +1071,26 @@ def set_credit_limit(
     notes: str | None = None,
 ) -> None:
     """Установить/изменить лимит + запись в audit_log."""
+    limit_cents = money.to_cents(limit_amount or 0)
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
             cur.execute(
-                "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, set_by, notes, created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, limit_amount_cents, set_by, notes, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (agent_id) DO UPDATE SET limit_amount = EXCLUDED.limit_amount, "
+                "limit_amount_cents = EXCLUDED.limit_amount_cents, "
                 "set_by = EXCLUDED.set_by, notes = EXCLUDED.notes, updated_at = EXCLUDED.updated_at",
-                (agent_id, agent_name, limit_amount, set_by, notes, now_str(), now_str()),
+                (agent_id, agent_name, limit_amount, limit_cents, set_by, notes, now_str(), now_str()),
             )
         else:
             cur.execute(
-                "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, set_by, notes, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, limit_amount_cents, set_by, notes, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(agent_id) DO UPDATE SET limit_amount = excluded.limit_amount, "
+                "limit_amount_cents = excluded.limit_amount_cents, "
                 "set_by = excluded.set_by, notes = excluded.notes, updated_at = excluded.updated_at",
-                (agent_id, agent_name, limit_amount, set_by, notes, now_str(), now_str()),
+                (agent_id, agent_name, limit_amount, limit_cents, set_by, notes, now_str(), now_str()),
             )
         conn.commit()
     if set_by:
@@ -1634,7 +1689,8 @@ def convert_to_base(amount: float, from_currency: str | None) -> float | None:
     rate = get_currency_rate(code)
     if rate is None or rate <= 0:
         return None
-    return amount * rate
+    # Конвертация в копейках с единичным округлением — без float-дрейфа.
+    return float(money.from_cents(money.convert_cents(money.to_cents(amount), rate)))
 
 
 def _invalidate_currency_rates_cache() -> None:
@@ -1683,32 +1739,36 @@ def set_product_price(
     cur_code = (currency or BASE_CURRENCY or "USD").upper()
     sale = float(sale_price) if sale_price is not None else None
     cost = float(cost_price) if cost_price is not None else None
+    sale_c = money.to_cents(sale) if sale is not None else None
+    cost_c = money.to_cents(cost) if cost is not None else None
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
             cur.execute(
                 q(
                     "INSERT INTO product_prices "
-                    "(ms_id, product_name, sale_price, cost_price, currency, updated_by, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "(ms_id, product_name, sale_price, sale_price_cents, cost_price, cost_price_cents, currency, updated_by, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT (ms_id) DO UPDATE SET "
                     "product_name = EXCLUDED.product_name, "
                     "sale_price = EXCLUDED.sale_price, "
+                    "sale_price_cents = EXCLUDED.sale_price_cents, "
                     "cost_price = EXCLUDED.cost_price, "
+                    "cost_price_cents = EXCLUDED.cost_price_cents, "
                     "currency = EXCLUDED.currency, "
                     "updated_by = EXCLUDED.updated_by, "
                     "updated_at = EXCLUDED.updated_at"
                 ),
-                (ms_id, product_name or "", sale, cost, cur_code, updated_by, now_str()),
+                (ms_id, product_name or "", sale, sale_c, cost, cost_c, cur_code, updated_by, now_str()),
             )
         else:
             cur.execute(
                 q(
                     "INSERT OR REPLACE INTO product_prices "
-                    "(ms_id, product_name, sale_price, cost_price, currency, updated_by, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)"
+                    "(ms_id, product_name, sale_price, sale_price_cents, cost_price, cost_price_cents, currency, updated_by, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ),
-                (ms_id, product_name or "", sale, cost, cur_code, updated_by, now_str()),
+                (ms_id, product_name or "", sale, sale_c, cost, cost_c, cur_code, updated_by, now_str()),
             )
         conn.commit()
     with _product_price_lock:
@@ -1832,27 +1892,28 @@ def create_cash_deposit(
                     allocs.append((o["id"], round(take, 2)))
                     left -= take
 
+        amount_cents = money.to_cents(amount)
         if USE_POSTGRES:
             cur.execute(
-                "INSERT INTO cash_deposits (manager_id, amount, deposited_at, status, created_at) "
-                "VALUES (%s, %s, %s, 'pending', %s) RETURNING id",
-                (manager_id, amount, now_str(), now_str()),
+                "INSERT INTO cash_deposits (manager_id, amount, amount_cents, deposited_at, status, created_at) "
+                "VALUES (%s, %s, %s, %s, 'pending', %s) RETURNING id",
+                (manager_id, amount, amount_cents, now_str(), now_str()),
             )
             deposit_id = cur.fetchone()["id"]
         else:
             cur.execute(
-                "INSERT INTO cash_deposits (manager_id, amount, deposited_at, status, created_at) "
-                "VALUES (?, ?, ?, 'pending', ?)",
-                (manager_id, amount, now_str(), now_str()),
+                "INSERT INTO cash_deposits (manager_id, amount, amount_cents, deposited_at, status, created_at) "
+                "VALUES (?, ?, ?, ?, 'pending', ?)",
+                (manager_id, amount, amount_cents, now_str(), now_str()),
             )
             deposit_id = cur.lastrowid
         for order_id, alloc in allocs:
             cur.execute(
                 q(
-                    "INSERT INTO cash_deposit_orders (deposit_id, order_id, amount_allocated, is_manual) "
-                    "VALUES (?, ?, ?, ?)"
+                    "INSERT INTO cash_deposit_orders (deposit_id, order_id, amount_allocated, amount_allocated_cents, is_manual) "
+                    "VALUES (?, ?, ?, ?, ?)"
                 ),
-                (deposit_id, order_id, alloc, 1 if is_manual else 0),
+                (deposit_id, order_id, alloc, money.to_cents(alloc), 1 if is_manual else 0),
             )
         conn.commit()
     return {"ok": True, "deposit_id": deposit_id, "allocations": allocs}
@@ -2236,31 +2297,32 @@ def create_return(
             }
 
     total_amount = round(sum(float(a) for _, _, a in items), 2)
+    total_amount_cents = money.to_cents(total_amount)
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
             cur.execute(
-                "INSERT INTO returns (order_id, return_type, reason, total_amount, "
+                "INSERT INTO returns (order_id, return_type, reason, total_amount, total_amount_cents, "
                 "refund_method, created_by, status, created_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s) RETURNING id",
-                (order_id, return_type, reason, total_amount, refund_method, created_by, now_str()),
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s) RETURNING id",
+                (order_id, return_type, reason, total_amount, total_amount_cents, refund_method, created_by, now_str()),
             )
             return_id = cur.fetchone()["id"]
         else:
             cur.execute(
-                "INSERT INTO returns (order_id, return_type, reason, total_amount, "
+                "INSERT INTO returns (order_id, return_type, reason, total_amount, total_amount_cents, "
                 "refund_method, created_by, status, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
-                (order_id, return_type, reason, total_amount, refund_method, created_by, now_str()),
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                (order_id, return_type, reason, total_amount, total_amount_cents, refund_method, created_by, now_str()),
             )
             return_id = cur.lastrowid
         for oitem_id, qty, amount in items:
             cur.execute(
                 q(
-                    "INSERT INTO return_items (return_id, order_item_id, qty, amount) "
-                    "VALUES (?, ?, ?, ?)"
+                    "INSERT INTO return_items (return_id, order_item_id, qty, amount, amount_cents) "
+                    "VALUES (?, ?, ?, ?, ?)"
                 ),
-                (return_id, oitem_id, qty, amount),
+                (return_id, oitem_id, qty, amount, money.to_cents(amount)),
             )
         conn.commit()
     return {"ok": True, "return_id": return_id, "total_amount": total_amount}
@@ -2715,26 +2777,27 @@ def add_payment(
     конкретному заказу» (частичная или полная); тогда после approve
     босса автоматически проверяется, не закрыт ли заказ полностью.
     Без order_id — самостоятельный платёж в кассу (legacy /pay flow)."""
+    amount_cents = money.to_cents(amount)
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
             cur.execute(
                 """
                 INSERT INTO payments
-                    (user_id, username, full_name, amount, currency, comment, status, order_id, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s) RETURNING id
+                    (user_id, username, full_name, amount, amount_cents, currency, comment, status, order_id, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s) RETURNING id
             """,
-                (user_id, username, full_name, amount, currency, comment, order_id, now_str()),
+                (user_id, username, full_name, amount, amount_cents, currency, comment, order_id, now_str()),
             )
             payment_id = cur.fetchone()["id"]
         else:
             cur.execute(
                 """
                 INSERT INTO payments
-                    (user_id, username, full_name, amount, currency, comment, status, order_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    (user_id, username, full_name, amount, amount_cents, currency, comment, status, order_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
             """,
-                (user_id, username, full_name, amount, currency, comment, order_id, now_str()),
+                (user_id, username, full_name, amount, amount_cents, currency, comment, order_id, now_str()),
             )
             payment_id = cur.lastrowid
         conn.commit()
@@ -2777,6 +2840,23 @@ def get_payments_for_orders(order_ids: list[int]) -> dict[int, list[dict]]:
     return grouped
 
 
+def _price_cents(item: dict) -> int:
+    """Цена позиции заказа в копейках: предпочитаем price_cents, иначе из
+    legacy REAL price (для строк, ещё не покрытых backfill'ом)."""
+    pc = item.get("price_cents")
+    if pc is not None:
+        return int(pc)
+    return money.to_cents(item.get("price", 0) or 0)
+
+
+def _amount_cents(payment: dict) -> int:
+    """Сумма платежа в копейках: предпочитаем amount_cents, иначе legacy REAL."""
+    ac = payment.get("amount_cents")
+    if ac is not None:
+        return int(ac)
+    return money.to_cents(payment.get("amount", 0) or 0)
+
+
 def get_order_payment_summary(order_id: int) -> dict:
     """Сумма по заказу: total / confirmed / pending / remaining.
 
@@ -2793,11 +2873,17 @@ def get_order_payment_summary(order_id: int) -> dict:
     if not order:
         return {"total": 0.0, "confirmed": 0.0, "pending": 0.0, "remaining": 0.0}
     items = get_order_items(order_id)
-    total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
+    # Считаем в копейках (точно), с фолбэком на старый REAL для не-забэкфилленных строк.
+    total_cents = sum(money.mul_qty(_price_cents(it), it.get("quantity", 0) or 0) for it in items)
     payments = get_payments_for_order(order_id)
-    confirmed = sum(p["amount"] for p in payments if p["status"] == "confirmed")
-    pending = sum(p["amount"] for p in payments if p["status"] == "pending")
-    remaining = max(0.0, total - confirmed)
+    confirmed_cents = sum(_amount_cents(p) for p in payments if p["status"] == "confirmed")
+    pending_cents = sum(_amount_cents(p) for p in payments if p["status"] == "pending")
+    remaining_cents = max(0, total_cents - confirmed_cents)
+
+    total = float(money.from_cents(total_cents))
+    confirmed = float(money.from_cents(confirmed_cents))
+    pending = float(money.from_cents(pending_cents))
+    remaining = float(money.from_cents(remaining_cents))
 
     currency = (order.get("currency") or BASE_CURRENCY).upper()
     return {
@@ -2805,6 +2891,10 @@ def get_order_payment_summary(order_id: int) -> dict:
         "confirmed": confirmed,
         "pending": pending,
         "remaining": remaining,
+        "total_cents": total_cents,
+        "confirmed_cents": confirmed_cents,
+        "pending_cents": pending_cents,
+        "remaining_cents": remaining_cents,
         "currency": currency,
         # *_base — None если convert_to_base не смог (курс не задан админом).
         "total_base": convert_to_base(total, currency),
@@ -4507,26 +4597,27 @@ def add_order_item(
     price: float = 0.0,
     note: str = "",
 ) -> int:
+    price_cents = money.to_cents(price or 0)
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
             cur.execute(
                 """
                 INSERT INTO order_items
-                    (order_id, product_name, product_href, quantity, unit, price, note)
-                VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
+                    (order_id, product_name, product_href, quantity, unit, price, price_cents, note)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
             """,
-                (order_id, product_name, product_href, quantity, unit, price, note),
+                (order_id, product_name, product_href, quantity, unit, price, price_cents, note),
             )
             item_id = cur.fetchone()["id"]
         else:
             cur.execute(
                 """
                 INSERT INTO order_items
-                    (order_id, product_name, product_href, quantity, unit, price, note)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (order_id, product_name, product_href, quantity, unit, price, price_cents, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-                (order_id, product_name, product_href, quantity, unit, price, note),
+                (order_id, product_name, product_href, quantity, unit, price, price_cents, note),
             )
             item_id = cur.lastrowid
         conn.commit()
