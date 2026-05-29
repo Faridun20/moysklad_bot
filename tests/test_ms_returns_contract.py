@@ -33,13 +33,15 @@ def _make_confirmed_return(db, with_demand=True):
     if with_demand:
         db.set_order_ms_demand_id(oid, "DEMAND-OLD")
     items = db.get_order_items(oid)
-    r = db.create_return(
-        oid,
-        "full",
-        "брак партии",
-        [(items[0]["id"], 2, 300.0)],
-        refund_method="no_refund",
-        created_by=1,
+    r = asyncio.run(
+        db.create_return(
+            oid,
+            "full",
+            "брак партии",
+            [(items[0]["id"], 2, 300.0)],
+            refund_method="no_refund",
+            created_by=1,
+        )
     )
     return oid, r["return_id"]
 

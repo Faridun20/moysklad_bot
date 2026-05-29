@@ -6,6 +6,8 @@ DB-уровень на isolated_db + WebApp /api/orders/ship через TestClie
 пускаться в возврат; и approved-заказ можно отметить отгруженным.
 """
 
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -41,7 +43,7 @@ def test_returnable_includes_legacy_paid(isolated_db):
     oid = db.create_order(1, "M", "")
     db.add_order_item(oid, "T", "", 1, "шт", 100.0)
     db.update_order_status(oid, "approved")
-    assert db.is_order_returnable(oid) is False  # approved + не оплачен
+    assert asyncio.run(db.is_order_returnable(oid)) is False  # approved + не оплачен
 
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)
@@ -50,16 +52,18 @@ def test_returnable_includes_legacy_paid(isolated_db):
             (db.now_str(), oid),
         )
         conn.commit()
-    assert db.is_order_returnable(oid) is True  # оплачен → можно вернуть
+    assert asyncio.run(db.is_order_returnable(oid)) is True  # оплачен → можно вернуть
 
     items = db.get_order_items(oid)
-    r = db.create_return(
-        oid,
-        "full",
-        "брак",
-        [(items[0]["id"], 1, 100.0)],
-        refund_method="no_refund",
-        created_by=1,
+    r = asyncio.run(
+        db.create_return(
+            oid,
+            "full",
+            "брак",
+            [(items[0]["id"], 1, 100.0)],
+            refund_method="no_refund",
+            created_by=1,
+        )
     )
     assert r["ok"] is True
 

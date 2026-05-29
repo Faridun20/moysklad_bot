@@ -87,15 +87,17 @@ def run() -> None:
         f"order #{o2} shipped, total 200; долг агента до возврата="
         f"{db.get_agent_current_debt(AGENT)}"
     )
-    ret = db.create_return(
-        o2,
-        "partial",
-        "брак",
-        [(items[0]["id"], 1, 100.0)],
-        refund_method="debt_reduction",
-        created_by=MGR,
+    ret = asyncio.run(
+        db.create_return(
+            o2,
+            "partial",
+            "брак",
+            [(items[0]["id"], 1, 100.0)],
+            refund_method="debt_reduction",
+            created_by=MGR,
+        )
     )
-    db.confirm_return(ret["return_id"], BOSS, "SMOKE Boss")
+    asyncio.run(db.confirm_return(ret["return_id"], BOSS, "SMOKE Boss"))
     print(
         f"возврат #{ret['return_id']} подтверждён; статус #{o2} = "
         f"{db.get_order(o2)['status']}; долг агента после = "
