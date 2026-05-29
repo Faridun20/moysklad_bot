@@ -3,6 +3,8 @@ IMPLEMENTATION.md Фаза 4: сдача наличных (cash deposits), се�
 На настоящей SQLite (isolated_db). UI/cron — отдельной фазой.
 """
 
+import asyncio
+
 import pytest
 
 
@@ -88,7 +90,7 @@ def test_create_rejects_nonpositive_amount(mgr_orders):
 def test_pending_list_and_overdue(mgr_orders):
     db, mgr, o1, o2 = mgr_orders
     res = db.create_cash_deposit(mgr, 100.0)
-    pending = db.get_pending_cash_deposits()
+    pending = asyncio.run(db.get_pending_cash_deposits())  # async после asyncpg Stage 5
     assert any(p["id"] == res["deposit_id"] for p in pending)
 
     # Состарим отгрузку o2 → попадёт в overdue.

@@ -2101,17 +2101,18 @@ def get_deposit_confirmers() -> list[int]:
     return [u["user_id"] for u in users if u["role"] in ("admin", "boss", "bookkeeper")]
 
 
-def get_pending_cash_deposits() -> list[dict]:
-    """Сдачи, ждущие подтверждения (для боса/бухгалтера)."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "SELECT * FROM cash_deposits WHERE status = 'pending' AND (deleted_at IS NULL) "
-                "ORDER BY deposited_at ASC"
-            )
-        )
-        return [dict(r) for r in cur.fetchall()]
+async def get_pending_cash_deposits() -> list[dict]:
+    """Сдачи, ждущие подтверждения (для боса/бухгалтера).
+
+    asyncpg-миграция Stage 5 (задача #21): нативный async через adb_core.
+    Вызовы: handlers/webapp (`await adb.…`), async-cron run_ops_monitor
+    (`await`), тесты (`asyncio.run`). Loop-aware пул (Stage 4) делает
+    cron-вызов безопасным.
+    """
+    return await adb_core.fetch(
+        "SELECT * FROM cash_deposits WHERE status = 'pending' AND (deleted_at IS NULL) "
+        "ORDER BY deposited_at ASC"
+    )
 
 
 def get_overdue_undeposited_orders(days: int = 2) -> list[dict]:
@@ -2505,16 +2506,14 @@ def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str = "") 
     return {"ok": True, "order_status": new_status}
 
 
-def get_pending_returns() -> list[dict]:
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "SELECT * FROM returns WHERE status = 'pending' AND (deleted_at IS NULL) "
-                "ORDER BY created_at ASC"
-            )
-        )
-        return [dict(r) for r in cur.fetchall()]
+async def get_pending_returns() -> list[dict]:
+    """Возвраты, ждущие подтверждения. asyncpg-миграция Stage 5 (задача #21):
+    нативный async через adb_core. Вызовы: handlers/webapp (`await adb.…`),
+    async-cron run_ops_monitor (`await`), тесты (`asyncio.run`)."""
+    return await adb_core.fetch(
+        "SELECT * FROM returns WHERE status = 'pending' AND (deleted_at IS NULL) "
+        "ORDER BY created_at ASC"
+    )
 
 
 def get_return(return_id: int) -> dict | None:
