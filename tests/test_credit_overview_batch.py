@@ -6,6 +6,8 @@ get_credit_overview переведён на батч-выборку (без N+1)
 и поведение лимитов/сортировки. БД настоящая (isolated_db).
 """
 
+import asyncio
+
 import pytest
 
 
@@ -63,7 +65,7 @@ def test_overview_debt_matches_single_agent_path(isolated_db):
     # A-3: только строка лимита, заказов нет → долг 0, но в сводке присутствует.
     db.set_credit_limit("A-3", "VIP", 5000.0, set_by=1)
 
-    overview = db.get_credit_overview()
+    overview = asyncio.run(db.get_credit_overview())
     by_agent = {a["agent_id"]: a for a in overview}
 
     # Кросс-проверка обоих путей.
@@ -88,7 +90,7 @@ def test_overview_limits_free_and_sort(isolated_db):
     db.set_credit_limit("A-OVER", "Client", 50.0, set_by=1)  # лимит < долга
     _order(db, "A-UNDER", 100.0)  # дефолтный лимит 2000
 
-    overview = db.get_credit_overview()
+    overview = asyncio.run(db.get_credit_overview())
     by_agent = {a["agent_id"]: a for a in overview}
 
     over = by_agent["A-OVER"]

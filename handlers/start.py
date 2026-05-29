@@ -441,7 +441,7 @@ async def cb_ord_my(call: CallbackQuery):
     from services.database import get_user_orders
     from handlers.orders import my_orders_keyboard
 
-    orders = get_user_orders(call.from_user.id)
+    orders = await get_user_orders(call.from_user.id)
     if not orders:
         kb = InlineKeyboardBuilder()
         kb.button(text="➕ Создать заказ", callback_data="ord_new")

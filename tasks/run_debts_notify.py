@@ -102,15 +102,15 @@ async def main() -> int:
     #   - менеджеру нужно действие, если по долгу НЕТ pending payments
     #     (он ещё ничего не отмечал или босс отклонил всё)
     #   - боссу — всё, ему важно видеть и долги с pending'ами для approve
-    all_debts_full = get_open_debts(due_through=today_str)
+    all_debts_full = await get_open_debts(due_through=today_str)
     if not all_debts_full:
         logger.info("Нет долгов к оплате сегодня — никому ничего не шлём.")
         return 0
 
     # Один батч на позиции и на платежи
     debt_ids = [d["id"] for d in all_debts_full]
-    items_by_order = get_order_items_by_ids(debt_ids)
-    payments_by_order = get_payments_for_orders(debt_ids)
+    items_by_order = await get_order_items_by_ids(debt_ids)
+    payments_by_order = await get_payments_for_orders(debt_ids)
 
     def _has_pending(order_id):
         return any(p["status"] == "pending" for p in payments_by_order.get(order_id, []))
