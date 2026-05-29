@@ -1816,25 +1816,22 @@ def get_product_price(ms_id: str) -> dict | None:
     return result or None
 
 
-def get_product_prices_by_ids(ms_ids: list[str]) -> dict[str, dict]:
+async def get_product_prices_by_ids(ms_ids: list[str]) -> dict[str, dict]:
     """Батч-выборка цен по списку ms_id (без N+1). Возвращает {ms_id: row}.
 
     Пропускает кэш (батч обычно для разовых расчётов прибыли по заказу).
+    asyncpg Stage 9 (#21): native async через adb_core; IN-список — $1..$N.
     """
     ids = [str(x).strip() for x in (ms_ids or []) if str(x).strip()]
     if not ids:
         return {}
-    placeholders = ", ".join(["?"] * len(ids))
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "SELECT ms_id, product_name, sale_price, cost_price, currency "
-                f"FROM product_prices WHERE ms_id IN ({placeholders})"
-            ),
-            ids,
-        )
-        return {r["ms_id"]: dict(r) for r in cur.fetchall()}
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(ids)))
+    rows = await adb_core.fetch(
+        "SELECT ms_id, product_name, sale_price, cost_price, currency "
+        f"FROM product_prices WHERE ms_id IN ({placeholders})",
+        *ids,
+    )
+    return {r["ms_id"]: r for r in rows}
 
 
 def get_existing_ms_product_ids(ms_ids: list[str]) -> set[str]:
@@ -1854,15 +1851,12 @@ def get_existing_ms_product_ids(ms_ids: list[str]) -> set[str]:
         return {(r["ms_id"] if USE_POSTGRES else r[0]) for r in cur.fetchall()}
 
 
-def get_all_product_prices() -> list[dict]:
-    """Все заданные цены. Для admin-UI экрана «Цены»."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            "SELECT ms_id, product_name, sale_price, cost_price, currency, updated_at "
-            "FROM product_prices ORDER BY product_name"
-        )
-        return [dict(r) for r in cur.fetchall()]
+async def get_all_product_prices() -> list[dict]:
+    """Все заданные цены. Для admin-UI экрана «Цены». asyncpg Stage 9 (#21)."""
+    return await adb_core.fetch(
+        "SELECT ms_id, product_name, sale_price, cost_price, currency, updated_at "
+        "FROM product_prices ORDER BY product_name"
+    )
 
 
 def _invalidate_product_price_cache() -> None:
@@ -2026,45 +2020,35 @@ def reject_cash_deposit(deposit_id: int, rejected_by: int, rejected_name: str, r
     return {"ok": True}
 
 
-def get_cash_deposit(deposit_id: int) -> dict | None:
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q("SELECT * FROM cash_deposits WHERE id = ?"), (deposit_id,))
-        row = cur.fetchone()
-    return dict(row) if row else None
+async def get_cash_deposit(deposit_id: int) -> dict | None:
+    """asyncpg Stage 9 (#21): native async через adb_core."""
+    return await adb_core.fetchrow("SELECT * FROM cash_deposits WHERE id = $1", deposit_id)
 
 
-def get_cash_deposit_orders(deposit_id: int) -> list[dict]:
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("SELECT order_id, amount_allocated FROM cash_deposit_orders WHERE deposit_id = ?"),
-            (deposit_id,),
-        )
-        return [dict(r) for r in cur.fetchall()]
+async def get_cash_deposit_orders(deposit_id: int) -> list[dict]:
+    """asyncpg Stage 9 (#21)."""
+    return await adb_core.fetch(
+        "SELECT order_id, amount_allocated FROM cash_deposit_orders WHERE deposit_id = $1",
+        deposit_id,
+    )
 
 
-def get_cash_deposit_orders_batch(deposit_ids: list[int]) -> dict[int, list[dict]]:
+async def get_cash_deposit_orders_batch(deposit_ids: list[int]) -> dict[int, list[dict]]:
     """Батч-версия get_cash_deposit_orders: {deposit_id: [{order_id, amount_allocated}]}.
     Один SQL вместо N (был N+1 в /api/deposits/pending). Депозиты без привязанных
-    заказов в результат не попадают — caller использует .get(id, [])."""
+    заказов в результат не попадают — caller использует .get(id, []).
+    asyncpg Stage 9 (#21): IN-список — $1..$N."""
     if not deposit_ids:
         return {}
     unique_ids = list(set(deposit_ids))
-    placeholders = ",".join(["?"] * len(unique_ids))
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                f"SELECT deposit_id, order_id, amount_allocated FROM cash_deposit_orders "
-                f"WHERE deposit_id IN ({placeholders})"
-            ),
-            unique_ids,
-        )
-        rows = cur.fetchall()
+    placeholders = ",".join(f"${i + 1}" for i in range(len(unique_ids)))
+    rows = await adb_core.fetch(
+        f"SELECT deposit_id, order_id, amount_allocated FROM cash_deposit_orders "
+        f"WHERE deposit_id IN ({placeholders})",
+        *unique_ids,
+    )
     grouped: dict[int, list[dict]] = {}
-    for r in rows:
-        d = dict(r)
+    for d in rows:
         # Форма элемента — как у get_cash_deposit_orders (без deposit_id).
         grouped.setdefault(d["deposit_id"], []).append(
             {"order_id": d["order_id"], "amount_allocated": d["amount_allocated"]}
@@ -2072,17 +2056,14 @@ def get_cash_deposit_orders_batch(deposit_ids: list[int]) -> dict[int, list[dict
     return grouped
 
 
-def get_manager_cash_deposits(manager_id: int, limit: int = 20) -> list[dict]:
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "SELECT * FROM cash_deposits WHERE manager_id = ? AND (deleted_at IS NULL) "
-                "ORDER BY created_at DESC LIMIT ?"
-            ),
-            (manager_id, limit),
-        )
-        return [dict(r) for r in cur.fetchall()]
+async def get_manager_cash_deposits(manager_id: int, limit: int = 20) -> list[dict]:
+    """asyncpg Stage 9 (#21)."""
+    return await adb_core.fetch(
+        "SELECT * FROM cash_deposits WHERE manager_id = $1 AND (deleted_at IS NULL) "
+        "ORDER BY created_at DESC LIMIT $2",
+        manager_id,
+        limit,
+    )
 
 
 def get_deposit_confirmers() -> list[int]:

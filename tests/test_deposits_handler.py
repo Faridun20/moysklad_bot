@@ -78,7 +78,7 @@ def test_cmd_deposit_creates_and_notifies_boss(isolated_db):
     asyncio.run(cmd_deposit(msg))
 
     # Сдача создана (pending).
-    deps = db.get_manager_cash_deposits(1)
+    deps = asyncio.run(db.get_manager_cash_deposits(1))
     assert len(deps) == 1 and deps[0]["status"] == "pending"
     # Боссу ушло уведомление с кнопками.
     assert any(chat == 2 for chat, _, _ in bot.sent)
@@ -124,5 +124,5 @@ def test_cb_confirm_denied_for_manager(isolated_db):
     asyncio.run(cb_deposit_confirm(call, bot))
 
     assert any("доступа" in (a[0] or "").lower() for a in call.alerts)
-    deps = db.get_manager_cash_deposits(1)
+    deps = asyncio.run(db.get_manager_cash_deposits(1))
     assert deps[0]["status"] == "pending"  # не подтверждено
