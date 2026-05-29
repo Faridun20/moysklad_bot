@@ -93,7 +93,7 @@ def test_refund_cash_writes_amount_cents(isolated_db):
     cres = db.confirm_return(res["return_id"], boss, "Boss")
     assert cres["ok"], cres
 
-    deps = db.get_manager_cash_deposits(2)  # order.user_id = 2
+    deps = asyncio.run(db.get_manager_cash_deposits(2))  # order.user_id = 2; async (Stage 9)
     refunds = [d for d in deps if (d.get("notes") or "").startswith("refund")]
     assert len(refunds) == 1
     d = refunds[0]

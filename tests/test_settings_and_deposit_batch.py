@@ -5,6 +5,8 @@
 БД настоящая (isolated_db); кэш настроек обнуляется reload'ом модуля per-test.
 """
 
+import asyncio
+
 
 def test_settings_cache_and_invalidation(isolated_db):
     db = isolated_db
@@ -48,10 +50,10 @@ def test_cash_deposit_orders_batch_matches_per_id(isolated_db):
             )
         conn.commit()
 
-    batch = db.get_cash_deposit_orders_batch([1, 2, 3])
+    batch = asyncio.run(db.get_cash_deposit_orders_batch([1, 2, 3]))
     # Поэлементно совпадает с per-id версией (та же форма {order_id, amount_allocated}).
-    assert batch[1] == db.get_cash_deposit_orders(1)
-    assert batch[2] == db.get_cash_deposit_orders(2)
+    assert batch[1] == asyncio.run(db.get_cash_deposit_orders(1))
+    assert batch[2] == asyncio.run(db.get_cash_deposit_orders(2))
     assert len(batch[1]) == 2
     assert 3 not in batch  # сдача без привязанных заказов отсутствует
-    assert db.get_cash_deposit_orders_batch([]) == {}
+    assert asyncio.run(db.get_cash_deposit_orders_batch([])) == {}

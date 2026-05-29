@@ -104,7 +104,7 @@ def test_deposit_create_and_my(client_env):
     )
     assert resp.status_code == 200, resp.text
     dep_id = resp.json()["deposit_id"]
-    assert db.get_cash_deposit(dep_id)["status"] == "pending"
+    assert asyncio.run(db.get_cash_deposit(dep_id))["status"] == "pending"
     assert fake_bot.sent  # подтверждающим ушло уведомление
 
     # свои сдачи
@@ -210,7 +210,7 @@ def test_deposit_reject_clips_long_reason(client_env):
         json={"initData": str(ids["boss"]), "deposit_id": dep["deposit_id"], "reason": huge},
     )
     assert resp.status_code == 200, resp.text
-    stored = db.get_cash_deposit(dep["deposit_id"])
+    stored = asyncio.run(db.get_cash_deposit(dep["deposit_id"]))
     assert len(stored["reject_reason"]) <= 500
 
 

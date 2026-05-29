@@ -8,6 +8,7 @@
   * profit для boss, cost/profit НЕ утекает менеджеру
 """
 
+import asyncio
 import importlib
 
 import pytest
@@ -67,7 +68,7 @@ def test_get_product_prices_by_ids_batch(isolated_db):
     db = isolated_db
     db.set_product_price("a", "A", 10.0, 5.0, "USD", updated_by=1)
     db.set_product_price("b", "B", 20.0, 12.0, "USD", updated_by=1)
-    res = db.get_product_prices_by_ids(["a", "b", "missing"])
+    res = asyncio.run(db.get_product_prices_by_ids(["a", "b", "missing"]))
     assert set(res) == {"a", "b"}
     assert res["a"]["cost_price"] == 5.0
 
@@ -76,7 +77,7 @@ def test_get_all_product_prices(isolated_db):
     db = isolated_db
     db.set_product_price("a", "Aaa", 10.0, None, "USD", updated_by=1)
     db.set_product_price("b", "Bbb", 20.0, None, "USD", updated_by=1)
-    rows = db.get_all_product_prices()
+    rows = asyncio.run(db.get_all_product_prices())
     assert len(rows) == 2
 
 
