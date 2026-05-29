@@ -11,6 +11,7 @@
   * authz: manager → 403 на /api/payments/link
 """
 
+import asyncio
 import importlib
 
 import pytest
@@ -161,7 +162,7 @@ def test_get_unlinked_payments_filters_by_status_and_order(isolated_db):
     p_confirmed_linked = db.add_payment(100, "@m", "M", 70.0, "USD", "linked", order_id=oid)
     db.confirm_payment(p_confirmed_linked, 99, "Boss")
 
-    unlinked = db.get_unlinked_payments()
+    unlinked = asyncio.run(db.get_unlinked_payments())  # async после asyncpg Stage 2
     ids = {p["id"] for p in unlinked}
     assert p_confirmed_standalone in ids
     assert p_pending not in ids  # pending не показываем
@@ -176,7 +177,7 @@ def test_get_unlinked_payments_respects_limit(isolated_db):
         pid = db.add_payment(100, "@m", "M", 10.0 + i, "USD", f"p{i}")
         db.confirm_payment(pid, 99, "Boss")
         pids.append(pid)
-    out = db.get_unlinked_payments(limit=3)
+    out = asyncio.run(db.get_unlinked_payments(limit=3))  # async после asyncpg Stage 2
     assert len(out) == 3
     # ORDER BY id DESC — последние созданные первыми
     assert out[0]["id"] == pids[-1]

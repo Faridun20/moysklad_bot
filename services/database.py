@@ -3767,29 +3767,27 @@ def link_payment_to_order(
     return result
 
 
-def get_unlinked_payments(limit: int = 100) -> list[dict]:
+async def get_unlinked_payments(limit: int = 100) -> list[dict]:
     """Confirmed-платежи без order_id — кандидаты для ретроспективного link'а.
 
     Только confirmed: pending-платежи в UI и так видны в общем списке,
     rejected/cancelled — не интересно для link'а.
 
     Возвращает свежие первыми (для UI «недавно подтверждённое сначала»).
+
+    asyncpg-миграция Stage 2 (задача #21): нативный async через adb_core.
+    Вызовы: webapp через `await adb.…`; sync-тесты обновлены на asyncio.run.
     """
     if limit <= 0:
         limit = 100
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "SELECT id, user_id, username, full_name, amount, currency, "
-                "comment, confirmed_at, status "
-                "FROM payments "
-                "WHERE order_id IS NULL AND status = 'confirmed' "
-                "ORDER BY id DESC LIMIT ?"
-            ),
-            (int(limit),),
-        )
-        return [dict(r) for r in cur.fetchall()]
+    return await adb_core.fetch(
+        "SELECT id, user_id, username, full_name, amount, currency, "
+        "comment, confirmed_at, status "
+        "FROM payments "
+        "WHERE order_id IS NULL AND status = 'confirmed' "
+        "ORDER BY id DESC LIMIT $1",
+        int(limit),
+    )
 
 
 def _trigger_ms_paymentin_sync(payment_id: int) -> None:
