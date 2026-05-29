@@ -463,7 +463,7 @@ async def cb_ord_requests(call: CallbackQuery):
     from services.database import get_pending_requests, get_orders_by_ids
     from handlers.orders import pending_requests_keyboard
 
-    requests = get_pending_requests()
+    requests = await get_pending_requests()  # async после asyncpg Stage 3
     if not requests:
         return await call.message.answer(
             f"{DIV}\n⏳ <b>Заявки на отгрузку</b>\n\n<i>Нет новых заявок</i>",
