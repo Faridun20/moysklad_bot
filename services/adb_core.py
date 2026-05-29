@@ -27,6 +27,7 @@ Stage 0 НЕ трогает services.database (sync-путь жив) и ниче
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import tempfile
@@ -36,7 +37,12 @@ from typing import Any
 _PARAM_RE = re.compile(r"\$(\d+)")
 
 # asyncpg-пул (ленивая инициализация). Размеры — как у psycopg2-пула.
+# Пул привязан к event loop'у, на котором создан. Храним этот loop, чтобы
+# пересоздавать пул при смене loop'а (cron делает несколько asyncio.run;
+# worker-тред поднимает свой loop) — иначе вызов пула с чужого/закрытого
+# loop'а падает. См. init_pool.
 _pg_pool: Any = None
+_pg_pool_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _use_postgres() -> bool:
@@ -75,26 +81,53 @@ def _rowcount_from_status(status: str) -> int:
 
 
 async def init_pool() -> Any:
-    """Создать asyncpg-пул (идемпотентно). Для SQLite — no-op (None)."""
-    global _pg_pool
+    """Создать/вернуть asyncpg-пул для ТЕКУЩЕГО event loop'а. Для SQLite — None.
+
+    Loop-aware: если закэшированный пул привязан к другому loop'у (cron сделал
+    новый asyncio.run; worker-тред поднял свой loop), старый пул рвём
+    terminate() (синхронно, без await — его loop обычно уже закрыт) и создаём
+    свежий на текущем loop'е. В долгоживущих bot/webapp loop один — пул
+    создаётся однажды и переиспользуется.
+    """
+    global _pg_pool, _pg_pool_loop
     if not _use_postgres():
         return None
-    if _pg_pool is None:
-        import asyncpg
 
-        _pg_pool = await asyncpg.create_pool(
-            os.environ["DATABASE_URL"],
-            min_size=int(os.environ.get("PG_POOL_MIN", "1")),
-            max_size=int(os.environ.get("PG_POOL_MAX", "10")),
-        )
+    loop = asyncio.get_running_loop()
+    if _pg_pool is not None:
+        if _pg_pool_loop is loop:
+            return _pg_pool
+        # Пул с другого loop'а — нельзя graceful-close без его loop'а; рвём.
+        try:
+            _pg_pool.terminate()
+        except Exception:
+            pass
+        _pg_pool = None
+        _pg_pool_loop = None
+
+    import asyncpg
+
+    _pg_pool = await asyncpg.create_pool(
+        os.environ["DATABASE_URL"],
+        min_size=int(os.environ.get("PG_POOL_MIN", "1")),
+        max_size=int(os.environ.get("PG_POOL_MAX", "10")),
+    )
+    _pg_pool_loop = loop
     return _pg_pool
 
 
 async def close_pool() -> None:
-    global _pg_pool
+    global _pg_pool, _pg_pool_loop
     if _pg_pool is not None:
-        await _pg_pool.close()
+        try:
+            await _pg_pool.close()
+        except Exception:
+            try:
+                _pg_pool.terminate()
+            except Exception:
+                pass
         _pg_pool = None
+        _pg_pool_loop = None
 
 
 # ─── read/exec примитивы ────────────────────────────────────────────────────────

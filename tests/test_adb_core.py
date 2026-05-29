@@ -70,6 +70,80 @@ def test_execute_fetch_roundtrip(sqlite_env):
     asyncio.run(scenario())
 
 
+def test_init_pool_is_loop_aware(monkeypatch):
+    """asyncpg-пул пересоздаётся при смене event loop'а (cron: несколько
+    asyncio.run). Реального Postgres нет — мокаем asyncpg.create_pool."""
+    import sys
+    import types
+
+    created = []
+
+    class FakePool:
+        def __init__(self):
+            self.terminated = False
+
+        def terminate(self):
+            self.terminated = True
+
+        async def close(self):
+            self.terminated = True
+
+    async def fake_create_pool(*a, **k):
+        p = FakePool()
+        created.append(p)
+        return p
+
+    fake_asyncpg = types.ModuleType("asyncpg")
+    fake_asyncpg.create_pool = fake_create_pool
+    monkeypatch.setitem(sys.modules, "asyncpg", fake_asyncpg)
+    monkeypatch.setenv("DATABASE_URL", "postgres://fake/db")
+    monkeypatch.setattr(adb_core, "_pg_pool", None)
+    monkeypatch.setattr(adb_core, "_pg_pool_loop", None)
+
+    p1 = asyncio.run(adb_core.init_pool())  # loop A
+    p2 = asyncio.run(adb_core.init_pool())  # loop B (новый asyncio.run)
+
+    assert p1 is created[0]
+    assert p2 is created[1]
+    assert p1 is not p2
+    assert created[0].terminated is True  # старый пул разорван при смене loop'а
+
+
+def test_init_pool_reuses_within_same_loop(monkeypatch):
+    import sys
+    import types
+
+    created = []
+
+    class FakePool:
+        def terminate(self):
+            pass
+
+        async def close(self):
+            pass
+
+    async def fake_create_pool(*a, **k):
+        p = FakePool()
+        created.append(p)
+        return p
+
+    fake_asyncpg = types.ModuleType("asyncpg")
+    fake_asyncpg.create_pool = fake_create_pool
+    monkeypatch.setitem(sys.modules, "asyncpg", fake_asyncpg)
+    monkeypatch.setenv("DATABASE_URL", "postgres://fake/db")
+    monkeypatch.setattr(adb_core, "_pg_pool", None)
+    monkeypatch.setattr(adb_core, "_pg_pool_loop", None)
+
+    async def twice():
+        a = await adb_core.init_pool()
+        b = await adb_core.init_pool()
+        return a, b
+
+    a, b = asyncio.run(twice())
+    assert a is b  # в одном loop'е — один пул
+    assert len(created) == 1
+
+
 def test_transaction_commit_and_rollback(sqlite_env):
     async def scenario():
         await adb_core.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
