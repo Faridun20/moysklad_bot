@@ -761,6 +761,15 @@ async function api(path, body) {
   return r.json();
 }
 
+// Ключ идемпотентности для денежных действий: защищает от double-submit
+// (две строки платежа / два уведомления). Сервер дедуплицирует по нему.
+function idemKey() {
+  try {
+    if (self.crypto && self.crypto.randomUUID) return self.crypto.randomUUID();
+  } catch (e) { /* старый WebView без crypto.randomUUID */ }
+  return Date.now() + '-' + Math.random().toString(16).slice(2);
+}
+
 // ─── Глобальный поиск ───────────────────────────────
 let _searchTimer = null;
 
@@ -1972,7 +1981,7 @@ function renderPaymentsContent(container) {
         if (!ok) return;
         btn.disabled = true;
         try {
-          await api('/api/orders/confirm_payment', { order_id: id });
+          await api('/api/orders/confirm_payment', { order_id: id, idempotency_key: idemKey() });
           tg.HapticFeedback?.notificationOccurred('success');
           await renderPayments(container);
         } catch (e) {
@@ -1990,7 +1999,7 @@ function renderPaymentsContent(container) {
         if (!ok) return;
         btn.disabled = true;
         try {
-          await api('/api/orders/reject_payment', { order_id: id });
+          await api('/api/orders/reject_payment', { order_id: id, idempotency_key: idemKey() });
           tg.HapticFeedback?.notificationOccurred('warning');
           await renderPayments(container);
         } catch (e) {
@@ -2609,7 +2618,7 @@ async function renderDebts(container) {
           if (!ok) return;
           btn.disabled = true;
           try {
-            const payload = { order_id: id };
+            const payload = { order_id: id, idempotency_key: idemKey() };
             if (amount !== null) payload.amount = amount;
             await api('/api/orders/mark_paid', payload);
             tg.HapticFeedback?.notificationOccurred('success');
@@ -2632,7 +2641,7 @@ async function renderDebts(container) {
           if (!ok) return;
           btn.disabled = true;
           try {
-            await api('/api/orders/confirm_payment', { order_id: id });
+            await api('/api/orders/confirm_payment', { order_id: id, idempotency_key: idemKey() });
             tg.HapticFeedback?.notificationOccurred('success');
             await renderDebts(container);
           } catch (e) {
@@ -2652,7 +2661,7 @@ async function renderDebts(container) {
           if (!ok) return;
           btn.disabled = true;
           try {
-            await api('/api/orders/reject_payment', { order_id: id });
+            await api('/api/orders/reject_payment', { order_id: id, idempotency_key: idemKey() });
             tg.HapticFeedback?.notificationOccurred('warning');
             await renderDebts(container);
           } catch (e) {

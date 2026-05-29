@@ -2619,6 +2619,14 @@ async def api_mark_paid(request: Request):
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="order_id должен быть числом")
 
+    # Idempotency: double-click по «Оплачено» частичной суммой мог создать две
+    # строки платежа. Если фронт прислал ключ — отдаём кэшированный результат.
+    idem_key = data.get("idempotency_key")
+    if idem_key:
+        cached = _idem_get(f"mark_paid:{user['id']}:{idem_key}")
+        if cached is not None:
+            return JSONResponse(cached)
+
     order = await adb.get_order(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Заказ не найден")
@@ -2665,7 +2673,10 @@ async def api_mark_paid(request: Request):
     # Сразу шлём боссу push с inline-кнопками для approve.
     await _notify_bosses_payment_pending(order_id, full_name, payment_id)
 
-    return JSONResponse({"ok": True, "payment_id": payment_id})
+    result = {"ok": True, "payment_id": payment_id}
+    if idem_key:
+        _idem_set(f"mark_paid:{user['id']}:{idem_key}", result)
+    return JSONResponse(result)
 
 
 async def _notify_bosses_payment_pending(
@@ -2830,6 +2841,14 @@ async def api_reject_payment(request: Request):
         order_id = int(data.get("order_id"))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="order_id обязателен")
+
+    # Idempotency: double-click reject не должен слать менеджеру два
+    # уведомления об отклонении (сам UPDATE атомарен и второй раз даёт n=0).
+    idem_key = data.get("idempotency_key")
+    if idem_key:
+        cached = _idem_get(f"reject:{user['id']}:{idem_key}")
+        if cached is not None:
+            return JSONResponse(cached)
 
     full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
