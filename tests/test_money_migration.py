@@ -87,3 +87,30 @@ def test_dual_write_populates_cents(isolated_db):
     pid = db.add_payment(1, "u", "U", 200.0, "USD", "", order_id=oid)
     assert _one(db, "SELECT price_cents FROM order_items WHERE id = ?", (item_id,))["price_cents"] == 1010
     assert _one(db, "SELECT amount_cents FROM payments WHERE id = ?", (pid,))["amount_cents"] == 20000
+
+
+def test_mark_order_paid_dual_writes_cents(isolated_db):
+    # mark_order_paid — второй путь вставки платежа; тоже должен писать копейки.
+    db = isolated_db
+    db.set_role(1, "mgr", "Manager", "manager")
+    oid = db.create_order(1, "Manager", "")
+    db.add_order_item(oid, "P", "href", 1, "шт", 100.0)
+    _exec(db, "UPDATE orders SET payment_type='credit' WHERE id=?", (oid,))
+
+    ok, pid = db.mark_order_paid(oid, 1, "Manager", amount=40.0)
+    assert ok
+    row = _one(db, "SELECT amount, amount_cents FROM payments WHERE id=?", (pid,))
+    assert row["amount"] == 40.0
+    assert row["amount_cents"] == 4000
+
+
+def test_mark_order_paid_full_uses_remaining_cents(isolated_db):
+    db = isolated_db
+    db.set_role(1, "mgr", "Manager", "manager")
+    oid = db.create_order(1, "Manager", "")
+    db.add_order_item(oid, "P", "href", 2, "шт", 49.99)  # 99.98 → 9998 коп.
+    _exec(db, "UPDATE orders SET payment_type='credit' WHERE id=?", (oid,))
+
+    ok, pid = db.mark_order_paid(oid, 1, "Manager")  # amount=None → весь остаток
+    assert ok
+    assert _one(db, "SELECT amount_cents FROM payments WHERE id=?", (pid,))["amount_cents"] == 9998

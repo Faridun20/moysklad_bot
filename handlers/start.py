@@ -30,6 +30,8 @@ ROLE_NAMES = {
     "admin": "👑 Администратор",
     "boss": "🏆 Руководитель",
     "manager": "💼 Менеджер",
+    "warehouse_keeper": "📦 Кладовщик",
+    "bookkeeper": "🧮 Бухгалтер",
     "employee": "👤 Сотрудник",
 }
 
@@ -72,6 +74,16 @@ def get_keyboard_for_role(role: str):
     # Менеджер: быстрая отправка платежа в кассу (не привязанного к заказу).
     if role == "manager":
         kb.button(text="💵 Отправить платёж", callback_data="pay_start")
+        rows += [1]
+
+    # Кладовщик: очередь возвратов на подтверждение (раньше — только из push).
+    if role in ("admin", "boss", "warehouse_keeper"):
+        kb.button(text="↩️ Возвраты на подтверждении", callback_data="ret_pending")
+        rows += [1]
+
+    # Бухгалтер: очередь сдач налички на подтверждение.
+    if role in ("admin", "boss", "bookkeeper"):
+        kb.button(text="💵 Сдачи на подтверждении", callback_data="dep_pending")
         rows += [1]
 
     # Админский ряд — управление пользователями и аудит.
@@ -126,6 +138,16 @@ _COMMANDS_ADMIN = _COMMANDS_BOSS + [
     BotCommand(command="addrole", description="🔧 Сменить роль"),
     BotCommand(command="audit", description="📋 Аудит лог"),
 ]
+_COMMANDS_WAREHOUSE = [
+    BotCommand(command="start", description="🏠 Главное меню"),
+    BotCommand(command="returns", description="↩️ Возвраты на подтверждении"),
+    BotCommand(command="return", description="↩️ Оформить возврат"),
+    BotCommand(command="ship", description="🚚 Отгрузить заказ"),
+]
+_COMMANDS_BOOKKEEPER = [
+    BotCommand(command="start", description="🏠 Главное меню"),
+    BotCommand(command="deposits", description="💵 Сдачи на подтверждении"),
+]
 
 
 async def set_commands_for_user(bot: Bot, chat_id: int, role: str) -> None:
@@ -139,6 +161,10 @@ async def set_commands_for_user(bot: Bot, chat_id: int, role: str) -> None:
         commands = _COMMANDS_BOSS
     elif role == "manager":
         commands = _COMMANDS_MANAGER
+    elif role == "warehouse_keeper":
+        commands = _COMMANDS_WAREHOUSE
+    elif role == "bookkeeper":
+        commands = _COMMANDS_BOOKKEEPER
     else:
         commands = [BotCommand(command="start", description="🏠 Активировать аккаунт")]
     try:
@@ -170,6 +196,8 @@ def get_welcome_text(role: str, first_name: str = "") -> str:
         "admin": "Полный доступ. Управление пользователями и аудит — кнопками ниже.",
         "boss": "Заявки на одобрение и подтверждение платежей — приходят push'ами.",
         "manager": "Создавайте заказы и отмечайте оплаты — всё в WebApp.",
+        "warehouse_keeper": "Отгрузки и возвраты: /ship, /return, /returns и кнопки ниже.",
+        "bookkeeper": "Подтверждение сдачи налички: /deposits и кнопка ниже.",
     }
     hint = hints.get(role, "")
 

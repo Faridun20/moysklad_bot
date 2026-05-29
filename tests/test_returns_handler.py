@@ -90,6 +90,7 @@ def test_full_return_flow_creates_and_confirms(isolated_db):
         cmd_return,
         process_return_reason,
         cb_return_refund,
+        cb_return_full,
         cb_return_confirm,
     )
 
@@ -105,9 +106,13 @@ def test_full_return_flow_creates_and_confirms(isolated_db):
     asyncio.run(process_return_reason(_FakeMessage(text="брак партии", uid=1, bot=bot), state))
     assert state._data.get("reason") == "брак партии"
 
-    # способ возврата → создаётся возврат + уведомление боссу
+    # способ возврата → экран выбора позиций (полный/частичный)
     refund_call = _FakeCall("ret_rm:debt_reduction", uid=1, bot=bot)
-    asyncio.run(cb_return_refund(refund_call, state, bot))
+    asyncio.run(cb_return_refund(refund_call, state))
+
+    # «📦 Весь заказ» → создаётся полный возврат + уведомление боссу
+    full_call = _FakeCall("ret_full", uid=1, bot=bot)
+    asyncio.run(cb_return_full(full_call, state, bot))
     pend = db.get_pending_returns()
     assert len(pend) == 1
     return_id = pend[0]["id"]

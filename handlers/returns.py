@@ -43,12 +43,68 @@ _REFUND_LABELS = {
 class ReturnFlow(StatesGroup):
     waiting_reason = State()
     waiting_refund = State()
+    choosing_items = State()  # выбор позиций для частичного возврата
+    entering_item_qty = State()  # ввод количества по выбранной позиции
 
 
 def _fmt(x: float) -> str:
     from services import money
 
     return money.format_cents(money.to_cents(x or 0), decimals=2, sep=" ")
+
+
+def _q(x: float) -> str:
+    """Количество без хвостовых нулей: 2.0 → '2', 1.5 → '1.5'."""
+    x = float(x)
+    return str(int(x)) if x.is_integer() else f"{x:g}"
+
+
+def _items_keyboard(ritems: list[dict], selected: dict):
+    """Клавиатура выбора позиций частичного возврата.
+    selected: {str(order_item_id): qty}. Выбранные помечаем галочкой+кол-вом."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📦 Весь заказ", callback_data="ret_full")
+    for i, it in enumerate(ritems):
+        sel = selected.get(str(it["id"]))
+        mark = f"✓{_q(sel)} " if sel else ""
+        name = it["name"][:24]
+        kb.button(
+            text=f"{mark}поз {i + 1}: {name} · до {_q(it['avail'])} {it['unit']}",
+            callback_data=f"ret_pi:{i}",
+        )
+    if selected:
+        kb.button(text=f"✅ Готово ({len(selected)})", callback_data="ret_pdone")
+    kb.button(text="❌ Отмена", callback_data="ret_cancel")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def _finalize_return(call, bot, *, order_id, reason, refund, ret_items, return_type, user_id):
+    """Создать возврат (full/partial), отрисовать итог и уведомить подтверждающих."""
+    # H2: force (обход дедлайна) — только начальству/складу, не менеджеру.
+    privileged = _has_role(user_id, "admin", "boss", "warehouse_keeper")
+    res = await adb.create_return(
+        order_id,
+        return_type,
+        reason,
+        ret_items,
+        refund_method=refund,
+        created_by=user_id,
+        force=privileged,
+    )
+    if not res.get("ok"):
+        return await call.answer(f"⚠️ {res.get('error', 'не удалось')}", show_alert=True)
+
+    await call.answer("Возврат создан")
+    kind = "полный" if return_type == "full" else "частичный"
+    await call.message.edit_text(
+        f"{DIV}\n↩️ <b>Возврат #{res['return_id']}</b> по заказу #{order_id} ({kind}).\n"
+        f"💰 Сумма: <b>{_fmt(res['total_amount'])} USD</b>\n"
+        f"Способ: {_REFUND_LABELS.get(refund, refund)}\n\n"
+        f"Отправлено на подтверждение.",
+        parse_mode="HTML",
+    )
+    await _notify_confirmers(bot, res["return_id"], order_id, res["total_amount"], refund)
 
 
 def _refund_keyboard():
@@ -133,45 +189,146 @@ async def cb_return_cancel(call: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(ReturnFlow.waiting_refund, F.data.startswith("ret_rm:"))
-async def cb_return_refund(call: CallbackQuery, state: FSMContext, bot: Bot):
+async def cb_return_refund(call: CallbackQuery, state: FSMContext):
+    """Способ возврата выбран → переходим к выбору позиций (полный/частичный)."""
     refund = call.data.split(":")[1]
     data = await state.get_data()
-    await state.clear()
     order_id = data.get("order_id")
-    reason = data.get("reason", "")
 
+    # Готовим список позиций с доступным к возврату остатком (qty - returned_qty).
     items = await adb.get_order_items(order_id)
-    ret_items = [
-        (
-            it["id"],
-            float(it.get("quantity", 0)),
-            round(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0), 2),
+    ritems = []
+    for it in items:
+        avail = float(it.get("quantity", 0) or 0) - float(it.get("returned_qty", 0) or 0)
+        if avail <= 0:
+            continue
+        ritems.append(
+            {
+                "id": it["id"],
+                "name": it.get("product_name", "—"),
+                "unit": it.get("unit") or "шт",
+                "avail": avail,
+                "price": float(it.get("price", 0) or 0),
+            }
         )
-        for it in items
-    ]
-    # H2: force (обход дедлайна возврата) — только начальству/складу, не менеджеру.
-    privileged = _has_role(call.from_user.id, "admin", "boss", "warehouse_keeper")
-    res = await adb.create_return(
-        order_id,
-        "full",
-        reason,
-        ret_items,
-        refund_method=refund,
-        created_by=call.from_user.id,
-        force=privileged,
-    )
-    if not res.get("ok"):
-        return await call.answer(f"⚠️ {res.get('error', 'не удалось')}", show_alert=True)
+    if not ritems:
+        await state.clear()
+        return await call.answer("⚠️ Нет позиций, доступных к возврату", show_alert=True)
 
-    await call.answer("Возврат создан")
+    await state.update_data(refund=refund, ritems=ritems, selected={})
+    await state.set_state(ReturnFlow.choosing_items)
+    await call.answer()
     await call.message.edit_text(
-        f"{DIV}\n↩️ <b>Возврат #{res['return_id']}</b> по заказу #{order_id} создан.\n"
-        f"💰 Сумма: <b>{_fmt(res['total_amount'])} USD</b>\n"
-        f"Способ: {_REFUND_LABELS.get(refund, refund)}\n\n"
-        f"Отправлено на подтверждение.",
+        f"{DIV}\n↩️ <b>Что вернуть по заказу #{order_id}?</b>\n\n"
+        f"«📦 Весь заказ» — вернуть всё. Либо выберите позиции по одной "
+        f"(спрошу количество), затем «✅ Готово».",
+        parse_mode="HTML",
+        reply_markup=_items_keyboard(ritems, {}),
+    )
+
+
+@router.callback_query(ReturnFlow.choosing_items, F.data == "ret_full")
+async def cb_return_full(call: CallbackQuery, state: FSMContext, bot: Bot):
+    """Шорткат «Весь заказ» — полный возврат всех доступных позиций."""
+    data = await state.get_data()
+    await state.clear()
+    ritems = data.get("ritems", [])
+    ret_items = [(it["id"], it["avail"], round(it["avail"] * it["price"], 2)) for it in ritems]
+    await _finalize_return(
+        call,
+        bot,
+        order_id=data.get("order_id"),
+        reason=data.get("reason", ""),
+        refund=data.get("refund", "no_refund"),
+        ret_items=ret_items,
+        return_type="full",
+        user_id=call.from_user.id,
+    )
+
+
+@router.callback_query(ReturnFlow.choosing_items, F.data.startswith("ret_pi:"))
+async def cb_return_pick_item(call: CallbackQuery, state: FSMContext):
+    """Выбрана позиция → спрашиваем количество к возврату."""
+    idx = int(call.data.split(":")[1])
+    data = await state.get_data()
+    ritems = data.get("ritems", [])
+    if idx >= len(ritems):
+        return await call.answer("Позиция не найдена", show_alert=True)
+    it = ritems[idx]
+    await state.update_data(pending_idx=idx)
+    await state.set_state(ReturnFlow.entering_item_qty)
+    await call.answer()
+    await call.message.answer(
+        f"Сколько вернуть: <b>{esc(it['name'])}</b>?\n"
+        f"Доступно <b>{_q(it['avail'])} {it['unit']}</b>. "
+        f"Отправьте число (или <code>0</code> чтобы убрать позицию).",
         parse_mode="HTML",
     )
-    await _notify_confirmers(bot, res["return_id"], order_id, res["total_amount"], refund)
+
+
+@router.message(ReturnFlow.entering_item_qty)
+async def process_item_qty(message: Message, state: FSMContext):
+    raw = (message.text or "").strip().replace(",", ".")
+    try:
+        qty = float(raw)
+    except ValueError:
+        return await message.answer("❌ Введите число, например <code>2</code>.", parse_mode="HTML")
+    data = await state.get_data()
+    ritems = data.get("ritems", [])
+    selected = dict(data.get("selected", {}))
+    idx = int(data.get("pending_idx", 0))
+    if idx >= len(ritems):
+        await state.set_state(ReturnFlow.choosing_items)
+        return await message.answer("Позиция не найдена.")
+    it = ritems[idx]
+    key = str(it["id"])
+    if qty <= 0:
+        selected.pop(key, None)  # 0 — убрать позицию из выбора
+    else:
+        qty = min(qty, float(it["avail"]))  # клампим к доступному
+        selected[key] = qty
+    await state.update_data(selected=selected)
+    await state.set_state(ReturnFlow.choosing_items)
+    chosen = (
+        ", ".join(f"{esc(r['name'][:16])}×{_q(selected[str(r['id'])])}"
+                  for r in ritems if str(r["id"]) in selected)
+        or "пока ничего"
+    )
+    await message.answer(
+        f"Выбрано: {chosen}.\nДобавьте ещё позиции или нажмите «✅ Готово».",
+        parse_mode="HTML",
+        reply_markup=_items_keyboard(ritems, selected),
+    )
+
+
+@router.callback_query(ReturnFlow.choosing_items, F.data == "ret_pdone")
+async def cb_return_partial_done(call: CallbackQuery, state: FSMContext, bot: Bot):
+    """Завершить частичный возврат по выбранным позициям."""
+    data = await state.get_data()
+    ritems = data.get("ritems", [])
+    selected = data.get("selected", {})
+    if not selected:
+        return await call.answer("Выберите хотя бы одну позицию", show_alert=True)
+    price_by_id = {str(it["id"]): it["price"] for it in ritems}
+    ret_items = [
+        (int(oid), float(qty), round(float(qty) * price_by_id.get(oid, 0.0), 2))
+        for oid, qty in selected.items()
+    ]
+    # Если выбраны все позиции в полном объёме — это фактически полный возврат.
+    is_full = len(selected) == len(ritems) and all(
+        abs(float(selected.get(str(it["id"]), 0)) - float(it["avail"])) < 1e-9 for it in ritems
+    )
+    await state.clear()
+    await _finalize_return(
+        call,
+        bot,
+        order_id=data.get("order_id"),
+        reason=data.get("reason", ""),
+        refund=data.get("refund", "no_refund"),
+        ret_items=ret_items,
+        return_type="full" if is_full else "partial",
+        user_id=call.from_user.id,
+    )
 
 
 async def _notify_confirmers(bot: Bot, return_id, order_id, total, refund):
@@ -188,6 +345,41 @@ async def _notify_confirmers(bot: Bot, return_id, order_id, total, refund):
             )
         except Exception as e:
             logger.warning("return notify %d failed: %s", uid, e)
+
+
+async def _show_pending_returns(target):
+    """Список возвратов на подтверждении с кнопками (склад/босс/админ).
+    Раньше — только из push-уведомления; теперь есть команда /returns."""
+    pending = await adb.get_pending_returns()
+    if not pending:
+        return await target.answer("✅ Нет возвратов на подтверждении.")
+    await target.answer(
+        f"↩️ <b>Возвраты на подтверждении ({len(pending)}):</b>", parse_mode="HTML"
+    )
+    for r in pending:
+        gr = "📦 товар получен" if r.get("goods_received") else "⏳ товар не отмечен"
+        refund = _REFUND_LABELS.get(r.get("refund_method"), r.get("refund_method") or "—")
+        text = (
+            f"{DIV}\n↩️ <b>Возврат #{r['id']}</b> · заказ #{r['order_id']}\n"
+            f"💰 {_fmt(r['total_amount'])} USD · {refund}\n"
+            f"{gr}\n📝 {esc(r.get('reason') or '')}"
+        )
+        await target.answer(text, parse_mode="HTML", reply_markup=_confirm_keyboard(r["id"]))
+
+
+@router.message(Command("returns"))
+async def cmd_pending_returns(message: Message):
+    if not can_confirm_return(message.from_user.id) and not is_warehouse_keeper(message.from_user.id):
+        return await message.answer("⛔ Возвраты подтверждают склад/босс/админ.")
+    await _show_pending_returns(message)
+
+
+@router.callback_query(F.data == "ret_pending")
+async def cb_pending_returns(call: CallbackQuery):
+    if not can_confirm_return(call.from_user.id) and not is_warehouse_keeper(call.from_user.id):
+        return await call.answer("⛔ Нет доступа", show_alert=True)
+    await call.answer()
+    await _show_pending_returns(call.message)
 
 
 @router.callback_query(F.data.startswith("ret_got:"))
