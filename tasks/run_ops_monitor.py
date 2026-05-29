@@ -259,7 +259,7 @@ async def main() -> int:
     stale = get_stale_pending_orders(hours=stale_hours)
     deposits = await get_pending_cash_deposits()  # async после asyncpg Stage 5
     returns = await get_pending_returns()  # async после asyncpg Stage 5
-    overdue = get_overdue_undeposited_orders(days=cash_days)
+    overdue = await get_overdue_undeposited_orders(days=cash_days)  # async после asyncpg Stage 7
     batches = get_batches_expiring_within(days=batch_days)
 
     # Складские алерты. low-stock — дешёвый локальный SELECT. dead-stock —

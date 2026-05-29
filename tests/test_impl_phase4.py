@@ -101,7 +101,9 @@ def test_pending_list_and_overdue(mgr_orders):
         cur = db.get_cursor(conn)
         cur.execute(db.q("UPDATE orders SET shipped_at = ? WHERE id = ?"), (old, o2))
         conn.commit()
-    overdue_ids = {o["id"] for o in db.get_overdue_undeposited_orders(days=2)}
+    overdue_ids = {
+        o["id"] for o in asyncio.run(db.get_overdue_undeposited_orders(days=2))
+    }  # async после asyncpg Stage 7
     assert o2 in overdue_ids
 
 

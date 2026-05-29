@@ -2115,22 +2115,22 @@ async def get_pending_cash_deposits() -> list[dict]:
     )
 
 
-def get_overdue_undeposited_orders(days: int = 2) -> list[dict]:
-    """Отгруженные неоплаченные заказы старше `days` (cash-эскалация, §7.6)."""
+async def get_overdue_undeposited_orders(days: int = 2) -> list[dict]:
+    """Отгруженные неоплаченные заказы старше `days` (cash-эскалация, §7.6).
+
+    asyncpg-миграция Stage 7 (задача #21): нативный async через adb_core.
+    Порог cutoff считаем в Python (local TZ) и передаём параметром — НЕ
+    сравниваем с SQL NOW() (см. CLAUDE.md). Вызовы: async-cron (`await`),
+    тест (`asyncio.run`)."""
     from datetime import timedelta
 
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "SELECT * FROM orders WHERE status = 'shipped' AND payment_confirmed = 0 "
-                "AND (deleted_at IS NULL) AND COALESCE(shipped_at, created_at) < ? "
-                "ORDER BY user_id, created_at"
-            ),
-            (cutoff,),
-        )
-        return [dict(r) for r in cur.fetchall()]
+    return await adb_core.fetch(
+        "SELECT * FROM orders WHERE status = 'shipped' AND payment_confirmed = 0 "
+        "AND (deleted_at IS NULL) AND COALESCE(shipped_at, created_at) < $1 "
+        "ORDER BY user_id, created_at",
+        cutoff,
+    )
 
 
 # ─── IMPLEMENTATION.md Фаза 5: возвраты + FEFO/партии ─────────────────────────
@@ -4001,21 +4001,19 @@ def get_payment(payment_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-def get_payments_report(since: str | None = None, until: str | None = None) -> list[dict]:
+async def get_payments_report(since: str | None = None, until: str | None = None) -> list[dict]:
+    """Подтверждённые платежи за период. asyncpg-миграция Stage 7 (задача #21):
+    нативный async через adb_core. Вызов — только handlers/payments (`await adb`)."""
     query = "SELECT * FROM payments WHERE status = 'confirmed'"
-    params = []
+    params: list = []
     if since:
-        query += " AND created_at >= ?"
         params.append(since)
+        query += f" AND created_at >= ${len(params)}"
     if until:
-        query += " AND created_at <= ?"
         params.append(until)
+        query += f" AND created_at <= ${len(params)}"
     query += " ORDER BY created_at DESC"
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q(query), params)
-        rows = cur.fetchall()
-    return [dict(r) for r in rows]
+    return await adb_core.fetch(query, *params)
 
 
 def get_cashbox_stats(since: str | None = None, until: str | None = None) -> dict:
