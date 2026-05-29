@@ -7,17 +7,50 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import PAGE_SIZE  # единый источник в config
 
 
-def analytics_back_keyboard():
-    """Чипы переключения периода прямо под отчётом — без отдельного экрана."""
+_AN_PERIODS = [
+    ("week", "Неделя"),
+    ("month", "Месяц"),
+    ("3month", "3 мес"),
+    ("6month", "Полгода"),
+    ("year", "Год"),
+]
+
+
+def analytics_keyboard(view: str = "sales", period: str = "month", is_boss: bool = False):
+    """Клавиатура под отчётом аналитики.
+
+    - чипы периода (активный помечен •…•), callback `an:<view>:<period>`;
+    - «📅 Свой период» → `anp:<view>` (FSM ввода произвольного диапазона);
+    - для босса — переключатель Продажи/Касса;
+    - «🏠 Меню».
+
+    `view` ∈ {"sales","cash"}; `period` — ключ периода или "custom"
+    (тогда ни один чип не подсвечен).
+    """
     kb = InlineKeyboardBuilder()
-    kb.button(text="Неделя", callback_data="an:week")
-    kb.button(text="Месяц", callback_data="an:month")
-    kb.button(text="3 мес", callback_data="an:3month")
-    kb.button(text="Полгода", callback_data="an:6month")
-    kb.button(text="Год", callback_data="an:year")
+    for pk, plabel in _AN_PERIODS:
+        text = f"• {plabel} •" if pk == period else plabel
+        kb.button(text=text, callback_data=f"an:{view}:{pk}")
+    kb.button(text="📅 Свой период", callback_data=f"anp:{view}")
+    rows = [3, 2, 1]
+    if is_boss:
+        # При custom-периоде у переключателя нет валидного period-ключа —
+        # откатываемся на "month", чтобы callback оставался кликабельным.
+        keep = period if period != "custom" else "month"
+        if view == "cash":
+            kb.button(text="📊 Продажи", callback_data=f"an:sales:{keep}")
+        else:
+            kb.button(text="💰 Касса", callback_data=f"an:cash:{keep}")
+        rows.append(1)
     kb.button(text="🏠 Меню", callback_data="menu")
-    kb.adjust(3, 2, 1)
+    rows.append(1)
+    kb.adjust(*rows)
     return kb.as_markup()
+
+
+def analytics_back_keyboard():
+    """Backward-compat обёртка: продажи / месяц / без босс-чипов."""
+    return analytics_keyboard("sales", "month", False)
 
 
 def categories_keyboard(cats: list[dict], page: int = 0):

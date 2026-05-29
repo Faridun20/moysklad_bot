@@ -3977,6 +3977,42 @@ def get_payments_report(since: str | None = None, until: str | None = None) -> l
     return [dict(r) for r in rows]
 
 
+def get_cashbox_stats(since: str | None = None, until: str | None = None) -> dict:
+    """Касса: подтверждённые поступления денег за период.
+
+    Сумма CONFIRMED платежей по `created_at` в [since, until] — «сколько
+    реально получили». Группируем по валюте (платежи бывают в разных
+    валютах); `total_cents` — суммарно в копейках по всем валютам, а
+    `by_currency` даёт разбивку, если валют больше одной.
+
+    since/until — ISO-строки 'YYYY-MM-DD HH:MM:SS' в локальной TZ (как
+    `created_at` пишется через now_str()), поэтому лексикографическое
+    сравнение строк корректно. Порог считаем в Python и передаём
+    параметром — НЕ сравниваем с SQL NOW()/datetime('now') (разные TZ,
+    silent-bug; см. CLAUDE.md).
+    """
+    query = (
+        f"SELECT currency, COUNT(*) AS cnt, {_SUM_PAYMENTS_CENTS} AS total_cents "
+        "FROM payments WHERE status = 'confirmed'"
+    )
+    params: list = []
+    if since:
+        query += " AND created_at >= ?"
+        params.append(since)
+    if until:
+        query += " AND created_at <= ?"
+        params.append(until)
+    query += " GROUP BY currency"
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q(query), params)
+        rows = [dict(r) for r in cur.fetchall()]
+    total_cents = sum(int(r["total_cents"] or 0) for r in rows)
+    count = sum(int(r["cnt"] or 0) for r in rows)
+    by_currency = {(r.get("currency") or "—"): int(r["total_cents"] or 0) for r in rows}
+    return {"total_cents": total_cents, "count": count, "by_currency": by_currency}
+
+
 def get_summary_by_employee(since: str | None = None, until: str | None = None) -> list[dict]:
     query = """
         SELECT full_name, currency, SUM(amount) as total, COUNT(*) as count
