@@ -72,3 +72,40 @@ def test_get_pending_requests_async(isolated_db):
 
     rows = asyncio.run(db.get_pending_requests())
     assert any(r["id"] == req_id for r in rows)
+
+
+# ─── Stage 6: get_audit_log, get_all_orders ─────────────────────────────────────
+
+
+def test_get_audit_log_async(isolated_db):
+    db = isolated_db
+    assert inspect.iscoroutinefunction(db.get_audit_log)
+
+    db.add_audit_log(11, "Alice", "boss", "login", "вошла")
+    db.add_audit_log(22, "Bob", "manager", "payment_sent", "оплата")
+
+    all_rows = asyncio.run(db.get_audit_log(limit=50))
+    actions = {r["action"] for r in all_rows}
+    assert {"login", "payment_sent"} <= actions
+
+    only_bob = asyncio.run(db.get_audit_log(limit=50, user_id=22))
+    assert only_bob and all(r["user_id"] == 22 for r in only_bob)
+
+
+def test_get_all_orders_async(isolated_db):
+    db = isolated_db
+    assert inspect.iscoroutinefunction(db.get_all_orders)
+
+    mgr = 304
+    db.set_role(mgr, "m", "Mgr", "manager")
+    o1 = db.create_order(mgr, "Mgr", "")
+    o2 = db.create_order(mgr, "Mgr", "")
+    db.update_order_status(o2, "approved")
+
+    all_orders = asyncio.run(db.get_all_orders())
+    ids = {o["id"] for o in all_orders}
+    assert {o1, o2} <= ids
+
+    approved = asyncio.run(db.get_all_orders(status="approved"))
+    aids = {o["id"] for o in approved}
+    assert o2 in aids and o1 not in aids

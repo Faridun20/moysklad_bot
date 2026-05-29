@@ -4089,21 +4089,19 @@ def add_audit_log(user_id, full_name, role, action, details=""):
         conn.commit()
 
 
-def get_audit_log(limit: int = 50, user_id: int | None = None) -> list[dict]:
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        if user_id:
-            cur.execute(
-                q("SELECT * FROM audit_log WHERE user_id = ? ORDER BY created_at DESC LIMIT ?"),
-                (user_id, limit),
-            )
-        else:
-            cur.execute(
-                q("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?"),
-                (limit,),
-            )
-        rows = cur.fetchall()
-    return [dict(r) for r in rows]
+async def get_audit_log(limit: int = 50, user_id: int | None = None) -> list[dict]:
+    """Записи аудита (последние сверху). asyncpg-миграция Stage 6 (задача #21):
+    нативный async через adb_core. Вызовы — только async (handlers/audit, log)."""
+    if user_id:
+        return await adb_core.fetch(
+            "SELECT * FROM audit_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+            user_id,
+            limit,
+        )
+    return await adb_core.fetch(
+        "SELECT * FROM audit_log ORDER BY created_at DESC LIMIT $1",
+        limit,
+    )
 
 
 # ─── Заказы ───────────────────────────────────────────────────────────────────
@@ -4173,18 +4171,17 @@ def get_user_orders(user_id: int, status: str | None = None) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_all_orders(status: str | None = None) -> list[dict]:
+async def get_all_orders(status: str | None = None) -> list[dict]:
+    """Все заказы (опц. фильтр по статусу). asyncpg-миграция Stage 6
+    (задача #21): нативный async через adb_core. Вызов — только webapp
+    (`await adb.get_all_orders()`)."""
     query = "SELECT * FROM orders"
-    params = []
+    params: list = []
     if status:
-        query += " WHERE status = ?"
         params.append(status)
+        query += f" WHERE status = ${len(params)}"
     query += " ORDER BY created_at DESC"
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q(query), params)
-        rows = cur.fetchall()
-    return [dict(r) for r in rows]
+    return await adb_core.fetch(query, *params)
 
 
 def _like_escape(s: str) -> str:
