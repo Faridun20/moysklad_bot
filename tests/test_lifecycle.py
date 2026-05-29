@@ -6,6 +6,8 @@
 race-fix / backfill — должен прогонять эти тесты до push.
 """
 
+import asyncio
+
 
 def test_order_creation_and_status_flow(isolated_db):
     db = isolated_db
@@ -78,7 +80,7 @@ def test_full_payment_closes_order(isolated_db):
     assert o["paid_at"] is not None
     assert o["paid_confirmed_at"] is None
     # Босс подтверждает
-    db.confirm_payment(pid, 99, "Boss")
+    asyncio.run(db.confirm_payment(pid, 99, "Boss"))
     o = db.get_order(oid)
     assert o["paid_confirmed_at"] is not None
 
@@ -88,11 +90,11 @@ def test_partial_payments_close_when_sum_reaches_total(isolated_db):
     db = isolated_db
     oid = _setup_credit_order(db, 100, 4)
     _, p1 = db.mark_order_paid(oid, 1, "Manager", amount=100)
-    db.confirm_payment(p1, 99, "Boss")
+    asyncio.run(db.confirm_payment(p1, 99, "Boss"))
     # После первого confirm заказ ещё открыт
     assert db.get_order(oid)["paid_confirmed_at"] is None
     _, p2 = db.mark_order_paid(oid, 1, "Manager", amount=300)
-    db.confirm_payment(p2, 99, "Boss")
+    asyncio.run(db.confirm_payment(p2, 99, "Boss"))
     # После второго закрыт
     assert db.get_order(oid)["paid_confirmed_at"] is not None
 
@@ -125,8 +127,8 @@ def test_confirm_idempotent_on_already_confirmed(isolated_db):
     db = isolated_db
     oid = _setup_credit_order(db, 100, 1)
     _, pid = db.mark_order_paid(oid, 1, "Manager", amount=100)
-    first = db.confirm_payment(pid, 99, "Boss")
-    second = db.confirm_payment(pid, 99, "Boss")
+    first = asyncio.run(db.confirm_payment(pid, 99, "Boss"))
+    second = asyncio.run(db.confirm_payment(pid, 99, "Boss"))
     assert first is True
     assert second is False  # уже confirmed
 
@@ -136,7 +138,7 @@ def test_claim_payment_for_ms_sync_atomic(isolated_db):
     db = isolated_db
     oid = _setup_credit_order(db, 100, 1)
     _, pid = db.mark_order_paid(oid, 1, "Manager", amount=100)
-    db.confirm_payment(pid, 99, "Boss")
+    asyncio.run(db.confirm_payment(pid, 99, "Boss"))
     # Платёж confirmed, ms_paymentin_id IS NULL → claim возможен
     assert db.claim_payment_for_ms_sync(pid) is True
     # Второй raise sync — уже in_progress
@@ -157,7 +159,7 @@ def test_backfill_does_not_close_partial_credit_debts(isolated_db, monkeypatch):
     oid = _setup_credit_order(db, 100, 4)  # 400 total
     # Частичная оплата 100 / 400
     _, pid = db.mark_order_paid(oid, 1, "Manager", amount=100)
-    db.confirm_payment(pid, 99, "Boss")
+    asyncio.run(db.confirm_payment(pid, 99, "Boss"))
     # Долг ещё открыт
     assert db.get_order(oid)["paid_confirmed_at"] is None
     # Прогон backfill+recovery — статус должен сохраниться

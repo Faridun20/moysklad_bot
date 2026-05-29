@@ -3564,37 +3564,38 @@ def delete_order(order_id: int, requested_by: int) -> bool:
     return deleted
 
 
-def confirm_payment(
+async def confirm_payment(
     payment_id: int, confirmed_by: int | None = None, confirmed_name: str = ""
 ) -> bool:
     """Подтвердить платёж. Если платёж привязан к заказу (order_id) —
     проверяем суммарно, не закрыли ли мы тем самым заказ полностью.
     Полностью означает: SUM(amount where status='confirmed') >= order.total.
-    Тогда автоматически проставляем order.paid_confirmed_at."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "UPDATE payments SET status = 'confirmed', confirmed_at = ? WHERE id = ? AND status = 'pending'"
-            ),
-            (now_str(), payment_id),
-        )
-        updated = cur.rowcount > 0
-        conn.commit()
-    if not updated:
+    Тогда автоматически проставляем order.paid_confirmed_at.
+
+    asyncpg Stage 15 (#21): native async. get_payment/add_audit_log/get_role
+    (sync money-core) — мост через to_thread; _maybe_close_order_after_payment
+    теперь async (await); _trigger_ms_paymentin_sync зовём напрямую — он видит
+    running loop и делает create_task (fire-and-forget)."""
+    rc = await adb_core.execute(
+        "UPDATE payments SET status = 'confirmed', confirmed_at = $1 WHERE id = $2 AND status = 'pending'",
+        now_str(),
+        payment_id,
+    )
+    if rc <= 0:
         return False
-    payment = get_payment(payment_id)
+    payment = await asyncio.to_thread(get_payment, payment_id)
     if confirmed_by and payment:
-        add_audit_log(
+        await asyncio.to_thread(
+            add_audit_log,
             confirmed_by,
             confirmed_name,
-            get_role(confirmed_by),
+            await asyncio.to_thread(get_role, confirmed_by),
             "payment_confirmed",
             f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
         )
     # Если платёж был привязан к заказу — проверяем не закрылся ли заказ.
     if payment and payment.get("order_id"):
-        _maybe_close_order_after_payment(
+        await _maybe_close_order_after_payment(
             payment["order_id"],
             confirmed_by,
             confirmed_name,
@@ -3605,10 +3606,10 @@ def confirm_payment(
         # пишется в payments.ms_sync_status; failed можно ретраить
         # вручную или фоновой задачей.
         _trigger_ms_paymentin_sync(payment_id)
-    return updated
+    return True
 
 
-def link_payment_to_order(
+async def link_payment_to_order(
     payment_id: int,
     order_id: int,
     linked_by: int,
@@ -3631,11 +3632,15 @@ def link_payment_to_order(
       * audit-log запись о ретроспективной привязке
 
     Возвращает {ok, error?, ms_sync_triggered?, order_closed?}.
+
+    asyncpg Stage 15 (#21): native async. Pre-check reads (get_payment/get_order)
+    и audit/get_role (sync money-core) — мост через to_thread; атомарный
+    UPDATE-WHERE-NULL — adb_core.execute; _maybe_close теперь async (await).
     """
     if not payment_id or not order_id:
         return {"ok": False, "error": "payment_id и order_id обязательны"}
 
-    payment = get_payment(payment_id)
+    payment = await asyncio.to_thread(get_payment, payment_id)
     if not payment:
         return {"ok": False, "error": "Платёж не найден"}
     if payment.get("order_id"):
@@ -3643,7 +3648,7 @@ def link_payment_to_order(
             "ok": False,
             "error": f"Платёж уже привязан к заказу #{payment['order_id']}",
         }
-    order = get_order(order_id)
+    order = await asyncio.to_thread(get_order, order_id)
     if not order:
         return {"ok": False, "error": "Заказ не найден"}
     if order.get("deleted_at"):
@@ -3653,27 +3658,25 @@ def link_payment_to_order(
     # заказам, оба прошли проверки выше; UPDATE-WHERE-NULL выиграет только
     # один. WHERE id = ? обязательно дополняет, иначе при concurrent
     # link'е разных платежей к разным заказам мы случайно обновим не тот.
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("UPDATE payments SET order_id = ? WHERE id = ? AND order_id IS NULL"),
-            (order_id, payment_id),
-        )
-        updated = cur.rowcount > 0
-        conn.commit()
-    if not updated:
+    rc = await adb_core.execute(
+        "UPDATE payments SET order_id = $1 WHERE id = $2 AND order_id IS NULL",
+        order_id,
+        payment_id,
+    )
+    if rc <= 0:
         # Кто-то между нашими read и UPDATE прилинковал другой заказ.
         # Перечитываем чтобы вернуть оператору актуальную картину.
-        fresh = get_payment(payment_id)
+        fresh = await asyncio.to_thread(get_payment, payment_id)
         return {
             "ok": False,
             "error": f"Параллельная привязка: платёж уже принадлежит заказу #{fresh.get('order_id') if fresh else '?'}",
         }
 
-    add_audit_log(
+    await asyncio.to_thread(
+        add_audit_log,
         linked_by,
         linked_name or "",
-        get_role(linked_by) or "",
+        await asyncio.to_thread(get_role, linked_by) or "",
         "payment_linked_to_order",
         f"Платёж #{payment_id} ({payment['amount']:,.2f} {payment.get('currency', 'USD')}) "
         f"привязан к заказу #{order_id} (был стендалон)",
@@ -3684,9 +3687,9 @@ def link_payment_to_order(
     # Если платёж уже был подтверждён до линка — теперь это credit на заказ,
     # надо проверить не закрыли ли мы его и создать paymentin в МС.
     if payment.get("status") == "confirmed":
-        _maybe_close_order_after_payment(order_id, linked_by, linked_name)
+        await _maybe_close_order_after_payment(order_id, linked_by, linked_name)
         # Проверяем статус заказа после _maybe_close.
-        updated_order = get_order(order_id)
+        updated_order = await asyncio.to_thread(get_order, order_id)
         if updated_order and updated_order.get("paid_confirmed_at"):
             result["order_closed"] = True
         _trigger_ms_paymentin_sync(payment_id)
@@ -3783,7 +3786,7 @@ def _trigger_ms_paymentin_sync(payment_id: int) -> None:
         pass
 
 
-def _maybe_close_order_after_payment(
+async def _maybe_close_order_after_payment(
     order_id: int,
     confirmed_by: int | None,
     confirmed_name: str,
@@ -3800,120 +3803,114 @@ def _maybe_close_order_after_payment(
 
     Для SQLite (локальная разработка) FOR UPDATE не поддерживается, но
     там и нет конкуренции — один процесс. Условный SQL.
-    """
-    with get_conn() as conn:
-        cur = get_cursor(conn)
 
-        # Lock: для Postgres эта строка блокирует order до conn.commit().
+    asyncpg Stage 15 (#21): native async. FOR UPDATE-секция (lock → пересчёт
+    сумм → закрытие) в одной adb_core.transaction(); ранние return — read-only
+    пути (commit ≡ rollback, lock освобождён). add_audit_log/get_role (sync) —
+    мостим через to_thread после транзакции.
+    """
+    closed = False
+    confirmed_cents = 0
+    async with adb_core.transaction() as txn:
+        # Lock: для Postgres эта строка блокирует order до конца транзакции.
         if USE_POSTGRES:
-            cur.execute(
-                "SELECT paid_confirmed_at FROM orders WHERE id = %s FOR UPDATE",
-                (order_id,),
+            row = await txn.fetchrow(
+                "SELECT paid_confirmed_at FROM orders WHERE id = $1 FOR UPDATE", order_id
             )
         else:
-            cur.execute(
-                "SELECT paid_confirmed_at FROM orders WHERE id = ?",
-                (order_id,),
-            )
-        row = cur.fetchone()
+            row = await txn.fetchrow("SELECT paid_confirmed_at FROM orders WHERE id = $1", order_id)
         if not row:
             return
-        already_closed = (row["paid_confirmed_at"] if USE_POSTGRES else row[0]) is not None
-        if already_closed:
-            return
+        if row["paid_confirmed_at"] is not None:
+            return  # already closed
 
         # Пересчёт ВНУТРИ транзакции — видим актуальную сумму confirmed.
         # Считаем в копейках (точное сравнение) — без epsilon-костыля.
-        cur.execute(
-            q(
-                f"SELECT {_SUM_PAYMENTS_CENTS} AS s FROM payments "
-                "WHERE order_id = ? AND status = 'confirmed'"
-            ),
-            (order_id,),
+        confirmed_cents = int(
+            await txn.fetchval(
+                f"SELECT {_SUM_PAYMENTS_CENTS} FROM payments "
+                "WHERE order_id = $1 AND status = 'confirmed'",
+                order_id,
+            )
+            or 0
         )
-        r = cur.fetchone()
-        confirmed_cents = int((r["s"] if USE_POSTGRES else r[0]) or 0)
-
-        cur.execute(
-            q(f"SELECT {_SUM_ORDER_TOTAL_CENTS} AS t FROM order_items WHERE order_id = ?"),
-            (order_id,),
+        total_cents = int(
+            await txn.fetchval(
+                f"SELECT {_SUM_ORDER_TOTAL_CENTS} FROM order_items WHERE order_id = $1",
+                order_id,
+            )
+            or 0
         )
-        r = cur.fetchone()
-        total_cents = int((r["t"] if USE_POSTGRES else r[0]) or 0)
-
         if confirmed_cents < total_cents:
             return  # ещё не полностью оплачен
 
         # Закрываем
-        cur.execute(
-            q(
-                "UPDATE orders "
-                "SET paid_confirmed_at = ?, paid_confirmed_by = ?, "
-                "    paid_confirmed_by_name = ?, "
-                "    paid_at = COALESCE(paid_at, ?), "
-                "    updated_at = ? "
-                "WHERE id = ? AND paid_confirmed_at IS NULL"
-            ),
-            (
-                now_str(),
-                confirmed_by or 0,
-                confirmed_name or "",
-                now_str(),
-                now_str(),
-                order_id,
-            ),
+        rc = await txn.execute(
+            "UPDATE orders "
+            "SET paid_confirmed_at = $1, paid_confirmed_by = $2, "
+            "    paid_confirmed_by_name = $3, "
+            "    paid_at = COALESCE(paid_at, $4), "
+            "    updated_at = $5 "
+            "WHERE id = $6 AND paid_confirmed_at IS NULL",
+            now_str(),
+            confirmed_by or 0,
+            confirmed_name or "",
+            now_str(),
+            now_str(),
+            order_id,
         )
-        closed = cur.rowcount > 0
-        conn.commit()
+        closed = rc > 0
 
     if closed:
-        add_audit_log(
+        role = await asyncio.to_thread(get_role, confirmed_by) if confirmed_by else ""
+        await asyncio.to_thread(
+            add_audit_log,
             confirmed_by or 0,
             confirmed_name,
-            get_role(confirmed_by) if confirmed_by else "",
+            role,
             "order_fully_paid",
             f"Заказ #{order_id} полностью оплачен "
             f"(сумма подтверждённых платежей: {money.format_cents(confirmed_cents)})",
         )
 
 
-def reject_payment(
+async def reject_payment(
     payment_id: int, rejected_by: int | None = None, rejected_name: str = ""
 ) -> bool:
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("UPDATE payments SET status = 'rejected' WHERE id = ? AND status = 'pending'"),
-            (payment_id,),
-        )
-        updated = cur.rowcount > 0
-        conn.commit()
+    """asyncpg Stage 15 (#21): native async; get_payment/add_audit_log/get_role
+    (sync money-core) — мост через to_thread."""
+    rc = await adb_core.execute(
+        "UPDATE payments SET status = 'rejected' WHERE id = $1 AND status = 'pending'",
+        payment_id,
+    )
+    updated = rc > 0
     if updated and rejected_by:
-        payment = get_payment(payment_id)
+        payment = await asyncio.to_thread(get_payment, payment_id)
         if payment:
-            add_audit_log(
+            await asyncio.to_thread(
+                add_audit_log,
                 rejected_by,
                 rejected_name,
-                get_role(rejected_by),
+                await asyncio.to_thread(get_role, rejected_by),
                 "payment_rejected",
                 f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
             )
     return updated
 
 
-def archive_payment(payment_id: int, archived_by: int, archived_name: str) -> bool:
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q("UPDATE payments SET status = 'archived' WHERE id = ?"), (payment_id,))
-        updated = cur.rowcount > 0
-        conn.commit()
+async def archive_payment(payment_id: int, archived_by: int, archived_name: str) -> bool:
+    """asyncpg Stage 15 (#21): native async; get_payment/add_audit_log/get_role
+    (sync money-core) — мост через to_thread."""
+    rc = await adb_core.execute("UPDATE payments SET status = 'archived' WHERE id = $1", payment_id)
+    updated = rc > 0
     if updated:
-        payment = get_payment(payment_id)
+        payment = await asyncio.to_thread(get_payment, payment_id)
         if payment:
-            add_audit_log(
+            await asyncio.to_thread(
+                add_audit_log,
                 archived_by,
                 archived_name,
-                get_role(archived_by),
+                await asyncio.to_thread(get_role, archived_by),
                 "payment_archived",
                 f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
             )
@@ -4396,7 +4393,7 @@ def mark_order_paid(
     return (True, payment_id)
 
 
-def confirm_all_pending_payments_for_order(
+async def confirm_all_pending_payments_for_order(
     order_id: int,
     confirmed_by: int,
     confirmed_by_name: str,
@@ -4410,32 +4407,38 @@ def confirm_all_pending_payments_for_order(
 
     Если после серии confirm'ов сумма confirmed достигла order.total —
     заказ автоматически закроется через _maybe_close_order_after_payment.
+
+    asyncpg Stage 15 (#21): native async; confirm_payment теперь async (await);
+    get_payments_for_order (sync read) — мост через to_thread.
     """
-    payments = get_payments_for_order(order_id)
+    payments = await asyncio.to_thread(get_payments_for_order, order_id)
     pending = [p for p in payments if p["status"] == "pending"]
     n = 0
     for p in pending:
-        if confirm_payment(p["id"], confirmed_by, confirmed_by_name):
+        if await confirm_payment(p["id"], confirmed_by, confirmed_by_name):
             n += 1
     return n
 
 
-def reject_all_pending_payments_for_order(
+async def reject_all_pending_payments_for_order(
     order_id: int,
     rejected_by: int,
     rejected_by_name: str,
 ) -> int:
-    """Босс отклоняет ВСЕ pending платежи по заказу. Аналог confirm_all."""
-    payments = get_payments_for_order(order_id)
+    """Босс отклоняет ВСЕ pending платежи по заказу. Аналог confirm_all.
+
+    asyncpg Stage 15 (#21): native async; reject_payment теперь async (await);
+    get_payments_for_order (sync read) — мост через to_thread."""
+    payments = await asyncio.to_thread(get_payments_for_order, order_id)
     pending = [p for p in payments if p["status"] == "pending"]
     n = 0
     for p in pending:
-        if reject_payment(p["id"], rejected_by, rejected_by_name):
+        if await reject_payment(p["id"], rejected_by, rejected_by_name):
             n += 1
     return n
 
 
-def confirm_payment_received(
+async def confirm_payment_received(
     order_id: int,
     confirmed_by: int,
     confirmed_by_name: str,
@@ -4445,23 +4448,25 @@ def confirm_payment_received(
     Возможно только если менеджер до этого уже отметил paid_at
     (нельзя подтвердить то, чего ещё нет). Идемпотентно: повторный
     вызов на уже подтверждённый заказ возвращает False.
+
+    asyncpg Stage 15 (#21): native async; get_order/add_audit_log/get_role
+    (sync money-core) — мост через to_thread.
     """
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "UPDATE orders "
-                "SET paid_confirmed_at = ?, paid_confirmed_by = ?, "
-                "    paid_confirmed_by_name = ?, updated_at = ? "
-                "WHERE id = ? AND paid_at IS NOT NULL "
-                "AND paid_confirmed_at IS NULL"
-            ),
-            (now_str(), confirmed_by, confirmed_by_name, now_str(), order_id),
-        )
-        updated = cur.rowcount > 0
-        conn.commit()
+    rc = await adb_core.execute(
+        "UPDATE orders "
+        "SET paid_confirmed_at = $1, paid_confirmed_by = $2, "
+        "    paid_confirmed_by_name = $3, updated_at = $4 "
+        "WHERE id = $5 AND paid_at IS NOT NULL "
+        "AND paid_confirmed_at IS NULL",
+        now_str(),
+        confirmed_by,
+        confirmed_by_name,
+        now_str(),
+        order_id,
+    )
+    updated = rc > 0
     if updated:
-        order = get_order(order_id)
+        order = await asyncio.to_thread(get_order, order_id)
         details = (
             f"Получение денег по заказу #{order_id} подтверждено "
             f"(клиент: {order.get('agent_name') or '—'}, "
@@ -4469,17 +4474,18 @@ def confirm_payment_received(
             if order
             else f"Получение денег по #{order_id} подтверждено"
         )
-        add_audit_log(
+        await asyncio.to_thread(
+            add_audit_log,
             confirmed_by,
             confirmed_by_name,
-            get_role(confirmed_by),
+            await asyncio.to_thread(get_role, confirmed_by),
             "payment_confirmed",
             details,
         )
     return updated
 
 
-def reject_payment_received(
+async def reject_payment_received(
     order_id: int,
     rejected_by: int,
     rejected_by_name: str,
@@ -4490,22 +4496,21 @@ def reject_payment_received(
 
     Срабатывает только на «висящих» подтверждениях (paid_at стоит,
     paid_confirmed_at пуст). На уже подтверждённый — игнор.
+
+    asyncpg Stage 15 (#21): native async; get_order/add_audit_log/get_role
+    (sync money-core) — мост через to_thread.
     """
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "UPDATE orders "
-                "SET paid_at = NULL, updated_at = ? "
-                "WHERE id = ? AND paid_at IS NOT NULL "
-                "AND paid_confirmed_at IS NULL"
-            ),
-            (now_str(), order_id),
-        )
-        updated = cur.rowcount > 0
-        conn.commit()
+    rc = await adb_core.execute(
+        "UPDATE orders "
+        "SET paid_at = NULL, updated_at = $1 "
+        "WHERE id = $2 AND paid_at IS NOT NULL "
+        "AND paid_confirmed_at IS NULL",
+        now_str(),
+        order_id,
+    )
+    updated = rc > 0
     if updated:
-        order = get_order(order_id)
+        order = await asyncio.to_thread(get_order, order_id)
         details = (
             f"Подтверждение оплаты #{order_id} отклонено "
             f"(клиент: {order.get('agent_name') or '—'}, "
@@ -4513,10 +4518,11 @@ def reject_payment_received(
             if order
             else f"Подтверждение #{order_id} отклонено"
         )
-        add_audit_log(
+        await asyncio.to_thread(
+            add_audit_log,
             rejected_by,
             rejected_by_name,
-            get_role(rejected_by),
+            await asyncio.to_thread(get_role, rejected_by),
             "payment_rejected_received",
             details,
         )

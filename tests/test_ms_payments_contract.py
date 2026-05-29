@@ -52,7 +52,7 @@ def _make_confirmed_payment(db, *, with_customerorder=False, with_demand=False):
         db.set_order_ms_demand_id(oid, "DEMAND-UUID")
     pid = db.add_payment(mgr, "@m", "Manager", 250.0, "USD", "тестовая оплата", order_id=oid)
     # Босс подтверждает — это переводит платёж в 'confirmed'.
-    db.confirm_payment(pid, mgr, "Boss")
+    asyncio.run(db.confirm_payment(pid, mgr, "Boss"))
     return oid, pid
 
 
@@ -84,7 +84,7 @@ def test_paymentin_fails_without_agent_on_order(isolated_db, monkeypatch):
     db.add_order_item(oid, "Товар", "", 1, "шт", 100.0)
     db.update_order_status(oid, "approved")
     pid = db.add_payment(mgr, "@m", "M", 100.0, "USD", "c", order_id=oid)
-    db.confirm_payment(pid, mgr, "Boss")
+    asyncio.run(db.confirm_payment(pid, mgr, "Boss"))
 
     res = asyncio.run(ms_payments.create_paymentin_for_payment(pid))
     assert res["ok"] is False
