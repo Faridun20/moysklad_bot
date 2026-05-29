@@ -2637,12 +2637,10 @@ def get_all_users() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_user(user_id: int) -> dict | None:
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q("SELECT * FROM user_roles WHERE user_id = ?"), (user_id,))
-        row = cur.fetchone()
-    return dict(row) if row else None
+async def get_user(user_id: int) -> dict | None:
+    """asyncpg Stage 11 (#21): native async. Leaf — внутри database.py не
+    вызывается (роль читается через services.roles.cached_role/get_role)."""
+    return await adb_core.fetchrow("SELECT * FROM user_roles WHERE user_id = $1", user_id)
 
 
 def ensure_user(user_id: int, username: str, full_name: str, admin_ids: list[int]):
@@ -4727,12 +4725,10 @@ def get_order_items_by_ids(order_ids: list[int]) -> dict[int, list[dict]]:
     return grouped
 
 
-def get_order_item(item_id: int) -> dict | None:
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q("SELECT * FROM order_items WHERE id = ?"), (item_id,))
-        row = cur.fetchone()
-    return dict(row) if row else None
+async def get_order_item(item_id: int) -> dict | None:
+    """asyncpg Stage 11 (#21): native async. Leaf — внутри database.py
+    не вызывается (есть get_order_items / get_order_items_by_ids)."""
+    return await adb_core.fetchrow("SELECT * FROM order_items WHERE id = $1", item_id)
 
 
 def remove_order_item(item_id: int) -> bool:
