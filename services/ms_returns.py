@@ -42,7 +42,7 @@ async def create_salesreturn(return_id: int) -> dict:
     if not ms_demand.is_ready():
         return {"ok": False, "reason": "MS context не готов (org/store)"}
 
-    ret = await _to_thread(db.get_return, return_id)
+    ret = await db.get_return(return_id)  # native async после asyncpg Stage 10
     if not ret:
         return {"ok": False, "reason": "Возврат не найден"}
     if ret.get("moysklad_return_id"):
@@ -52,7 +52,7 @@ async def create_salesreturn(return_id: int) -> dict:
     if not order or not order.get("agent_id"):
         return {"ok": False, "reason": "Нет заказа/контрагента для возврата"}
 
-    rows = await _to_thread(db.get_return_positions_for_ms, return_id)
+    rows = await db.get_return_positions_for_ms(return_id)  # native async (Stage 10)
     positions = []
     skipped = []
     for r in rows:

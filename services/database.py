@@ -2486,29 +2486,22 @@ async def get_pending_returns() -> list[dict]:
     )
 
 
-def get_return(return_id: int) -> dict | None:
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q("SELECT * FROM returns WHERE id = ?"), (return_id,))
-        row = cur.fetchone()
-    return dict(row) if row else None
+async def get_return(return_id: int) -> dict | None:
+    """asyncpg Stage 10 (#21): native async через adb_core."""
+    return await adb_core.fetchrow("SELECT * FROM returns WHERE id = $1", return_id)
 
 
-def get_return_positions_for_ms(return_id: int) -> list[dict]:
+async def get_return_positions_for_ms(return_id: int) -> list[dict]:
     """Позиции возврата с product_href и ценой (из order_items) — для сборки
-    документа «Возврат покупателя» в МойСклад. amount берём из return_items."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "SELECT oi.product_href AS product_href, oi.product_name AS product_name, "
-                "ri.qty AS qty, oi.price AS price "
-                "FROM return_items ri JOIN order_items oi ON oi.id = ri.order_item_id "
-                "WHERE ri.return_id = ?"
-            ),
-            (return_id,),
-        )
-        return [dict(r) for r in cur.fetchall()]
+    документа «Возврат покупателя» в МойСклад. amount берём из return_items.
+    asyncpg Stage 10 (#21)."""
+    return await adb_core.fetch(
+        "SELECT oi.product_href AS product_href, oi.product_name AS product_name, "
+        "ri.qty AS qty, oi.price AS price "
+        "FROM return_items ri JOIN order_items oi ON oi.id = ri.order_item_id "
+        "WHERE ri.return_id = $1",
+        return_id,
+    )
 
 
 def claim_ops_monitor_run(run_date: str) -> bool:
