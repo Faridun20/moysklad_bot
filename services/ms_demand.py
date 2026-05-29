@@ -331,7 +331,9 @@ async def create_demand_from_request(
             }
     except Exception as e:
         logger.exception("create demand failed")
-        return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+        # Только имя класса в user-facing reason — текст исключения (репр
+        # aiohttp-ошибки может включать host/URL) остаётся в logger.exception.
+        return {"ok": False, "reason": type(e).__name__}
 
 
 def _build_description(order: dict, telegram_full_name: str) -> str:

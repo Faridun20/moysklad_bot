@@ -331,7 +331,9 @@ async def create_customerorder_from_request(
             co_id = created.get("id", "")
     except Exception as e:
         logger.exception("create customerorder failed")
-        return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+        # Только имя класса — текст исключения (host/URL в aiohttp-ошибках)
+        # остаётся в logger.exception, не утекает в user-facing reason.
+        return {"ok": False, "reason": type(e).__name__}
 
     # Заказ создан — пробуем получить печатную форму
     pdf_bytes, pdf_filename = await _try_get_print_pdf(co_id)
