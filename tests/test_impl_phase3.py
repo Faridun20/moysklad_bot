@@ -72,16 +72,16 @@ def test_reject_to_draft_increments_and_freezes(isolated_db):
     db = isolated_db
     oid, mgr = _agent_order(db, 100.0, status="pending", agent="A-4")
 
-    r1 = db.reject_order_to_draft(oid, 1, "Boss", "мало позиций")
+    r1 = asyncio.run(db.reject_order_to_draft(oid, 1, "Boss", "мало позиций"))
     assert r1["ok"] is True and r1["rejection_count"] == 1 and r1["frozen"] is False
     assert db.get_order(oid)["status"] == "draft"
     assert db.get_order(oid)["rejection_comment"] == "мало позиций"
 
     # Повторные reject'ы (нужно вернуть в pending между ними).
     db.update_order_status(oid, "pending")
-    db.reject_order_to_draft(oid, 1, "Boss", "ещё раз")
+    asyncio.run(db.reject_order_to_draft(oid, 1, "Boss", "ещё раз"))
     db.update_order_status(oid, "pending")
-    r3 = db.reject_order_to_draft(oid, 1, "Boss", "третий")
+    r3 = asyncio.run(db.reject_order_to_draft(oid, 1, "Boss", "третий"))
     assert r3["rejection_count"] == 3
     assert r3["frozen"] is True  # reject_max_cycles=3
     assert db.get_order(oid)["frozen"] == 1
@@ -90,7 +90,7 @@ def test_reject_to_draft_increments_and_freezes(isolated_db):
 def test_reject_only_from_pending(isolated_db):
     db = isolated_db
     oid, mgr = _agent_order(db, 100.0, status="approved", agent="A-5")
-    r = db.reject_order_to_draft(oid, 1, "Boss", "x")
+    r = asyncio.run(db.reject_order_to_draft(oid, 1, "Boss", "x"))
     assert r["ok"] is False
 
 
@@ -167,7 +167,7 @@ def test_cancel_approved_within_window(isolated_db):
         cur = db.get_cursor(conn)
         cur.execute(db.q("UPDATE orders SET cancellation_deadline = ? WHERE id = ?"), (future, oid))
         conn.commit()
-    r = db.cancel_order(oid, 1, "Boss", "клиент передумал")
+    r = asyncio.run(db.cancel_order(oid, 1, "Boss", "клиент передумал"))
     assert r["ok"] is True
     assert db.get_order(oid)["status"] == "cancelled"
 
@@ -184,7 +184,7 @@ def test_cancel_ignores_legacy_deadline(isolated_db):
         cur = db.get_cursor(conn)
         cur.execute(db.q("UPDATE orders SET cancellation_deadline = ? WHERE id = ?"), (past, oid))
         conn.commit()
-    r = db.cancel_order(oid, 1, "Boss", "передумали")
+    r = asyncio.run(db.cancel_order(oid, 1, "Boss", "передумали"))
     assert r["ok"] is True
     assert db.get_order(oid)["status"] == "cancelled"
 
@@ -192,7 +192,7 @@ def test_cancel_ignores_legacy_deadline(isolated_db):
 def test_cancel_blocked_for_shipped(isolated_db):
     db = isolated_db
     oid, mgr = _agent_order(db, 100.0, status="shipped", agent="A-9")
-    r = db.cancel_order(oid, 1, "Boss", "x")
+    r = asyncio.run(db.cancel_order(oid, 1, "Boss", "x"))
     assert r["ok"] is False
 
 

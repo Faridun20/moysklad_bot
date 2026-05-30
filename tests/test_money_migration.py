@@ -3,6 +3,8 @@ Stage 2 миграции денег: backfill float→копейки, COALESCE-�
 и счёт сумм заказа в копейках на реальной SQLite-схеме (isolated_db).
 """
 
+import asyncio
+
 
 def _exec(db, sql, params=()):
     with db.get_conn() as conn:
@@ -97,7 +99,7 @@ def test_mark_order_paid_dual_writes_cents(isolated_db):
     db.add_order_item(oid, "P", "href", 1, "шт", 100.0)
     _exec(db, "UPDATE orders SET payment_type='credit' WHERE id=?", (oid,))
 
-    ok, pid = db.mark_order_paid(oid, 1, "Manager", amount=40.0)
+    ok, pid = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=40.0))
     assert ok
     row = _one(db, "SELECT amount, amount_cents FROM payments WHERE id=?", (pid,))
     assert row["amount"] == 40.0
@@ -111,6 +113,6 @@ def test_mark_order_paid_full_uses_remaining_cents(isolated_db):
     db.add_order_item(oid, "P", "href", 2, "шт", 49.99)  # 99.98 → 9998 коп.
     _exec(db, "UPDATE orders SET payment_type='credit' WHERE id=?", (oid,))
 
-    ok, pid = db.mark_order_paid(oid, 1, "Manager")  # amount=None → весь остаток
+    ok, pid = asyncio.run(db.mark_order_paid(oid, 1, "Manager"))  # amount=None → весь остаток
     assert ok
     assert _one(db, "SELECT amount_cents FROM payments WHERE id=?", (pid,))["amount_cents"] == 9998

@@ -108,7 +108,7 @@ def run() -> None:
     o3 = _mk_order(100.0, 1, "pending")
     created_orders.append(o3)
     for i in range(1, 4):
-        r = db.reject_order_to_draft(o3, BOSS, "SMOKE Boss", f"причина {i}")
+        r = asyncio.run(db.reject_order_to_draft(o3, BOSS, "SMOKE Boss", f"причина {i}"))
         print(f"reject {i}: count={r['rejection_count']}, frozen={r['frozen']}")
         if i < 3:
             db.update_order_status(o3, "pending")

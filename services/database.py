@@ -1295,7 +1295,7 @@ def log_order_change(
 # ─── IMPLEMENTATION.md Фаза 3: reject→draft + freeze, cancel, stale ───────────
 
 
-def reject_order_to_draft(
+async def reject_order_to_draft(
     order_id: int,
     rejected_by: int,
     rejected_name: str,
@@ -1307,36 +1307,38 @@ def reject_order_to_draft(
 
     Атомарный UPDATE ... WHERE status='pending' — защита от гонки.
     Возвращает {ok, error, frozen, rejection_count}.
+
+    asyncpg Stage 16 (#21): native async. get_order/get_setting/add_audit_log/
+    get_role (sync money-core) — мост через to_thread; атомарный UPDATE —
+    adb_core.execute (rowcount-guard сохранён).
     """
-    order = get_order(order_id)
+    order = await asyncio.to_thread(get_order, order_id)
     if not order:
         return {"ok": False, "error": "Заказ не найден"}
     if order.get("status") != "pending":
         return {"ok": False, "error": "Заказ не в статусе pending"}
 
     rc = int(order.get("rejection_count") or 0) + 1
-    max_cycles = int(get_setting("reject_max_cycles", 3))
+    max_cycles = int(await asyncio.to_thread(get_setting, "reject_max_cycles", 3))
     frozen = 1 if rc >= max_cycles else 0
 
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "UPDATE orders SET status = 'draft', rejection_comment = ?, "
-                "rejection_count = ?, frozen = ?, updated_at = ? "
-                "WHERE id = ? AND status = 'pending'"
-            ),
-            (comment, rc, frozen, now_str(), order_id),
+    updated = (
+        await adb_core.execute(
+            "UPDATE orders SET status = 'draft', rejection_comment = $1, "
+            "rejection_count = $2, frozen = $3, updated_at = $4 "
+            "WHERE id = $5 AND status = 'pending'",
+            comment, rc, frozen, now_str(), order_id,
         )
-        updated = cur.rowcount > 0
-        conn.commit()
+        > 0
+    )
     if not updated:
         return {"ok": False, "error": "Заказ уже обработан"}
 
-    add_audit_log(
+    await asyncio.to_thread(
+        add_audit_log,
         rejected_by,
         rejected_name,
-        get_role(rejected_by),
+        await asyncio.to_thread(get_role, rejected_by),
         "order_rejected",
         f"Заказ #{order_id} → draft (попытка {rc}/{max_cycles})"
         + (" — ЗАМОРОЖЕН" if frozen else ""),
@@ -1344,7 +1346,7 @@ def reject_order_to_draft(
     return {"ok": True, "error": None, "frozen": bool(frozen), "rejection_count": rc}
 
 
-def mark_order_shipped(order_id: int, shipped_by: int, shipped_name: str) -> dict:
+async def mark_order_shipped(order_id: int, shipped_by: int, shipped_name: str) -> dict:
     """Отметить заказ отгруженным (approved → shipped), DB-часть. Альтернатива
     МС-вебхуку (stateType=Successful) — для аккаунтов без статуса типа
     «Успешный». Выставляет shipped_at/shipped_by. Возвращает {ok, error}.
@@ -1352,32 +1354,33 @@ def mark_order_shipped(order_id: int, shipped_by: int, shipped_name: str) -> dic
     Round 6 (L_R6): если у заказа уже есть `ms_demand_id`, значит МС-сторона
     отгрузила раньше (через webhook или manual API). Audit'им как
     'sync', а не как 'ручную отгрузку' — иначе менеджер видит спам.
+
+    asyncpg Stage 16 (#21): native async. get_order/add_audit_log/get_role
+    (sync money-core) — мост через to_thread; атомарный UPDATE — adb_core.execute.
     """
-    order = get_order(order_id)
+    order = await asyncio.to_thread(get_order, order_id)
     if not order:
         return {"ok": False, "error": "Заказ не найден"}
     if order.get("status") != "approved":
         return {"ok": False, "error": "Отгрузить можно только одобренный заказ"}
 
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "UPDATE orders SET status = 'shipped', shipped_at = ?, shipped_by = ?, "
-                "updated_at = ? WHERE id = ? AND status = 'approved'"
-            ),
-            (now_str(), shipped_by, now_str(), order_id),
+    updated = (
+        await adb_core.execute(
+            "UPDATE orders SET status = 'shipped', shipped_at = $1, shipped_by = $2, "
+            "updated_at = $3 WHERE id = $4 AND status = 'approved'",
+            now_str(), shipped_by, now_str(), order_id,
         )
-        updated = cur.rowcount > 0
-        conn.commit()
+        > 0
+    )
     if not updated:
         return {"ok": False, "error": "Заказ уже обработан"}
 
     already_in_ms = bool(order.get("ms_demand_id"))
-    add_audit_log(
+    await asyncio.to_thread(
+        add_audit_log,
         shipped_by,
         shipped_name,
-        get_role(shipped_by),
+        await asyncio.to_thread(get_role, shipped_by),
         "order_shipped",
         (
             f"Заказ #{order_id} sync (demand уже в МС, локальный статус догнан)"
@@ -1388,15 +1391,18 @@ def mark_order_shipped(order_id: int, shipped_by: int, shipped_name: str) -> dic
     return {"ok": True, "error": None, "already_in_ms": already_in_ms}
 
 
-def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, reason: str) -> dict:
+async def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, reason: str) -> dict:
     """Отмена заказа (IMPLEMENTATION.md §6.7), DB-часть. Reverse-demand в
     МойСклад — отдельной фазой. Отмена доступна для approved; shipped по спеке
     требует возврата на 100% — здесь не пропускаем (нужен return-флоу).
 
     M2: окно отмены (cancellation_deadline) убрано — поле нигде не заполнялось,
     проверка была мёртвой и вводила в заблуждение. Если понадобится временно́е
-    окно — заполнять deadline при одобрении и вернуть проверку сюда."""
-    order = get_order(order_id)
+    окно — заполнять deadline при одобрении и вернуть проверку сюда.
+
+    asyncpg Stage 16 (#21): native async. get_order/add_audit_log/get_role
+    (sync money-core) — мост через to_thread; атомарный UPDATE — adb_core.execute."""
+    order = await asyncio.to_thread(get_order, order_id)
     if not order:
         return {"ok": False, "error": "Заказ не найден"}
     status = order.get("status")
@@ -1406,25 +1412,23 @@ def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, reason: 
             "error": "Отмена доступна только для approved (shipped → через возврат)",
         }
 
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "UPDATE orders SET status = 'cancelled', cancelled_at = ?, "
-                "cancelled_by = ?, cancellation_reason = ?, updated_at = ? "
-                "WHERE id = ? AND status = 'approved'"
-            ),
-            (now_str(), cancelled_by, reason, now_str(), order_id),
+    updated = (
+        await adb_core.execute(
+            "UPDATE orders SET status = 'cancelled', cancelled_at = $1, "
+            "cancelled_by = $2, cancellation_reason = $3, updated_at = $4 "
+            "WHERE id = $5 AND status = 'approved'",
+            now_str(), cancelled_by, reason, now_str(), order_id,
         )
-        updated = cur.rowcount > 0
-        conn.commit()
+        > 0
+    )
     if not updated:
         return {"ok": False, "error": "Заказ уже обработан"}
 
-    add_audit_log(
+    await asyncio.to_thread(
+        add_audit_log,
         cancelled_by,
         cancelled_name,
-        get_role(cancelled_by),
+        await asyncio.to_thread(get_role, cancelled_by),
         "order_cancelled",
         f"Заказ #{order_id} отменён: {reason[:200]}",
     )
@@ -3523,41 +3527,36 @@ def clear_order_ms_customerorder_id(order_id: int) -> bool:
     return updated
 
 
-def delete_order(order_id: int, requested_by: int) -> bool:
+async def delete_order(order_id: int, requested_by: int) -> bool:
     """Удалить заказ-черновик. Только status='draft' можно удалять, и
     только владелец (даже boss/admin не удаляет чужие — нужно жёстче
     через audit). Каскадно сносим order_items.
 
     Возвращает True если что-то удалили, False если заказ не найден,
     не draft, или не принадлежит requested_by.
+
+    asyncpg Stage 16 (#21): native async. Pre-check + каскадный DELETE — в одной
+    adb_core.transaction() (как раньше один conn); ранний return — до удалений.
+    add_audit_log/get_role (sync) — мост через to_thread.
     """
-    with get_conn() as conn:
-        cur = get_cursor(conn)
+    deleted = False
+    async with adb_core.transaction() as txn:
         # Проверяем, что заказ существует, draft и принадлежит юзеру
-        cur.execute(
-            q("SELECT user_id, status FROM orders WHERE id = ?"),
-            (order_id,),
-        )
-        row = cur.fetchone()
+        row = await txn.fetchrow("SELECT user_id, status FROM orders WHERE id = $1", order_id)
         if not row:
             return False
-        if USE_POSTGRES:
-            owner_id, status = row["user_id"], row["status"]
-        else:
-            owner_id, status = row[0], row[1]
-        if owner_id != requested_by or status != "draft":
+        if row["user_id"] != requested_by or row["status"] != "draft":
             return False
 
         # Каскад вручную, чтобы работало и в SQLite (FK off by default)
-        cur.execute(q("DELETE FROM order_items WHERE order_id = ?"), (order_id,))
-        cur.execute(q("DELETE FROM orders WHERE id = ?"), (order_id,))
-        deleted = cur.rowcount > 0
-        conn.commit()
+        await txn.execute("DELETE FROM order_items WHERE order_id = $1", order_id)
+        deleted = await txn.execute("DELETE FROM orders WHERE id = $1", order_id) > 0
     if deleted:
-        add_audit_log(
+        await asyncio.to_thread(
+            add_audit_log,
             requested_by,
             "",
-            get_role(requested_by),
+            await asyncio.to_thread(get_role, requested_by),
             "order_deleted",
             f"Удалён черновик заказа #{order_id}",
         )
@@ -4190,7 +4189,7 @@ def update_order_agent(order_id: int, agent_id: str, agent_name: str) -> bool:
     return updated
 
 
-def set_order_payment(
+async def set_order_payment(
     order_id: int,
     payment_type: str,
     due_date: str | None = None,
@@ -4202,32 +4201,28 @@ def set_order_payment(
     и обнуляется (на случай если заказ переводят из credit обратно).
 
     Не сбрасывает paid_at — закрытый долг остаётся закрытым.
+
+    asyncpg Stage 16 (#21): native async через adb_core.execute.
     """
     if payment_type not in ("paid", "credit"):
         return False
     if payment_type == "credit" and not due_date:
         return False
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        if payment_type == "paid":
-            cur.execute(
-                q(
-                    "UPDATE orders SET payment_type = ?, due_date = NULL, "
-                    "updated_at = ? WHERE id = ?"
-                ),
-                (payment_type, now_str(), order_id),
-            )
-        else:
-            cur.execute(
-                q("UPDATE orders SET payment_type = ?, due_date = ?, updated_at = ? WHERE id = ?"),
-                (payment_type, due_date, now_str(), order_id),
-            )
-        updated = cur.rowcount > 0
-        conn.commit()
-    return updated
+    if payment_type == "paid":
+        rc = await adb_core.execute(
+            "UPDATE orders SET payment_type = $1, due_date = NULL, "
+            "updated_at = $2 WHERE id = $3",
+            payment_type, now_str(), order_id,
+        )
+    else:
+        rc = await adb_core.execute(
+            "UPDATE orders SET payment_type = $1, due_date = $2, updated_at = $3 WHERE id = $4",
+            payment_type, due_date, now_str(), order_id,
+        )
+    return rc > 0
 
 
-def mark_order_paid(
+async def mark_order_paid(
     order_id: int,
     marked_by: int,
     marked_by_name: str,
@@ -4250,6 +4245,13 @@ def mark_order_paid(
 
     Возвращает (False, None) если order не существует, не credit,
     уже полностью закрыт (paid_confirmed_at стоит), или amount некорректен.
+
+    asyncpg Stage 16 (#21): native async. Вся критическая секция (FOR UPDATE на
+    orders → recompute сумм → INSERT payment → UPDATE paid_at) в одной
+    adb_core.transaction(); ранние return (False, None) — ДО любых записей
+    (commit пустой/lock-only tx, lock освобождён). INSERT-id: RETURNING (pg) /
+    last_insert_rowid() (sqlite). add_audit_log/get_role (sync) — мост через
+    to_thread после транзакции.
     """
     # Все шаги — внутри одной транзакции с lock'ом на заказ.
     # Раньше без блокировки два менеджера могли одновременно отметить
@@ -4259,59 +4261,49 @@ def mark_order_paid(
     # Теперь FOR UPDATE на orders сериализует параллельные mark_paid'ы.
     from config import BASE_CURRENCY
 
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-
+    async with adb_core.transaction() as txn:
         # Lock заказа
         if USE_POSTGRES:
-            cur.execute(
+            row = await txn.fetchrow(
                 "SELECT payment_type, currency, agent_name, paid_confirmed_at "
-                "FROM orders WHERE id = %s FOR UPDATE",
-                (order_id,),
+                "FROM orders WHERE id = $1 FOR UPDATE",
+                order_id,
             )
         else:
-            cur.execute(
+            row = await txn.fetchrow(
                 "SELECT payment_type, currency, agent_name, paid_confirmed_at "
-                "FROM orders WHERE id = ?",
-                (order_id,),
+                "FROM orders WHERE id = $1",
+                order_id,
             )
-        row = cur.fetchone()
         if not row:
             return (False, None)
-        if USE_POSTGRES:
-            payment_type = row["payment_type"]
-            currency = row["currency"] or BASE_CURRENCY
-            agent_name = row["agent_name"]
-            already_closed = row["paid_confirmed_at"] is not None
-        else:
-            payment_type = row[0]
-            currency = row[1] or BASE_CURRENCY
-            agent_name = row[2]
-            already_closed = row[3] is not None
+        payment_type = row["payment_type"]
+        currency = row["currency"] or BASE_CURRENCY
+        agent_name = row["agent_name"]
+        already_closed = row["paid_confirmed_at"] is not None
 
         if payment_type != "credit":
             return (False, None)
         if already_closed:
             return (False, None)
 
-        # Под locкам считаем суммы — гарантия что между recompute и
+        # Под locком считаем суммы — гарантия что между recompute и
         # INSERT никто другой не добавит payment. Считаем в копейках (точно).
-        cur.execute(
-            q(
-                f"SELECT {_SUM_PAYMENTS_CENTS} AS s FROM payments "
-                "WHERE order_id = ? AND status IN ('pending', 'confirmed')"
-            ),
-            (order_id,),
+        used_cents = int(
+            await txn.fetchval(
+                f"SELECT {_SUM_PAYMENTS_CENTS} FROM payments "
+                "WHERE order_id = $1 AND status IN ('pending', 'confirmed')",
+                order_id,
+            )
+            or 0
         )
-        r = cur.fetchone()
-        used_cents = int((r["s"] if USE_POSTGRES else r[0]) or 0)
-
-        cur.execute(
-            q(f"SELECT {_SUM_ORDER_TOTAL_CENTS} AS t FROM order_items WHERE order_id = ?"),
-            (order_id,),
+        total_cents = int(
+            await txn.fetchval(
+                f"SELECT {_SUM_ORDER_TOTAL_CENTS} FROM order_items WHERE order_id = $1",
+                order_id,
+            )
+            or 0
         )
-        r = cur.fetchone()
-        total_cents = int((r["t"] if USE_POSTGRES else r[0]) or 0)
         remaining_cents = max(0, total_cents - used_cents)
 
         # Если amount не задан — берём остаток (полная доплата)
@@ -4334,58 +4326,39 @@ def mark_order_paid(
         # INSERT payment в той же транзакции
         comment = f"Оплата по заказу #{order_id}" + (f" ({agent_name})" if agent_name else "")
         if USE_POSTGRES:
-            cur.execute(
+            payment_id = await txn.fetchval(
                 "INSERT INTO payments "
                 "(user_id, username, full_name, amount, amount_cents, currency, comment, "
                 " status, created_at, order_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9) "
                 "RETURNING id",
-                (
-                    marked_by,
-                    username,
-                    marked_by_name,
-                    amount,
-                    amount_cents,
-                    currency,
-                    comment,
-                    now_str(),
-                    order_id,
-                ),
+                marked_by, username, marked_by_name, amount, amount_cents,
+                currency, comment, now_str(), order_id,
             )
-            payment_id = cur.fetchone()["id"]
         else:
-            cur.execute(
+            await txn.execute(
                 "INSERT INTO payments "
                 "(user_id, username, full_name, amount, amount_cents, currency, comment, "
                 " status, created_at, order_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
-                (
-                    marked_by,
-                    username,
-                    marked_by_name,
-                    amount,
-                    amount_cents,
-                    currency,
-                    comment,
-                    now_str(),
-                    order_id,
-                ),
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9)",
+                marked_by, username, marked_by_name, amount, amount_cents,
+                currency, comment, now_str(), order_id,
             )
-            payment_id = cur.lastrowid
+            payment_id = await txn.fetchval("SELECT last_insert_rowid()")
 
         # paid_at — флаг «менеджер хоть раз отметил». COALESCE сохраняет
         # самое раннее время для последующих частичных платежей.
-        cur.execute(
-            q("UPDATE orders SET paid_at = COALESCE(paid_at, ?), updated_at = ? WHERE id = ?"),
-            (now_str(), now_str(), order_id),
+        await txn.execute(
+            "UPDATE orders SET paid_at = COALESCE(paid_at, $1), updated_at = $2 WHERE id = $3",
+            now_str(), now_str(), order_id,
         )
-        conn.commit()
 
     remaining_after = float(money.from_cents(max(0, remaining_cents - amount_cents)))
-    add_audit_log(
+    await asyncio.to_thread(
+        add_audit_log,
         marked_by,
         marked_by_name,
-        get_role(marked_by),
+        await asyncio.to_thread(get_role, marked_by),
         "debt_payment_claimed",
         f"Заказ #{order_id}: менеджер отметил {amount:,.0f} {currency} "
         f"(после подтверждения останется: {remaining_after:,.0f})",

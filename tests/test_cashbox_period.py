@@ -37,7 +37,7 @@ def _credit_order(db, agent_id, agent_name, total, due="2099-12-31", mgr=900):
     db.update_order_agent(oid, agent_id, agent_name)
     db.add_order_item(oid, "Товар", "", 1, "шт", total)
     db.update_order_status(oid, "approved")
-    db.set_order_payment(oid, "credit", due)
+    asyncio.run(db.set_order_payment(oid, "credit", due))
     return oid
 
 
