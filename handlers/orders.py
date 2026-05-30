@@ -848,8 +848,10 @@ async def cb_submit_order(call: CallbackQuery, state: FSMContext, bot: Bot):
 
     # Уведомляем руководителей
     from services.notify import notify_shipment_request
+    from services.order_workflow import resubmit_diff_line
 
     notify_text = format_request_notify(order, items, req_id)
+    notify_text += await resubmit_diff_line(order_id, items)  # #30: diff после доработки
     await notify_shipment_request(
         bot,
         notify_text,
@@ -943,30 +945,59 @@ async def cb_view_request(call: CallbackQuery):
 # ─── Callback: одобрение/отклонение заявки ────────────────────────────────────
 
 
+async def _approve_flow(call: CallbackQuery, bot: Bot, req_id: int, override: bool) -> None:
+    """Общий путь одобрения заявки (обычное / с превышением лимита)."""
+    boss_name = call.from_user.full_name or str(call.from_user.id)
+    # Вся логика (DB, МойСклад, уведомления, PDF, авто-payment) — в сервисе.
+    from services.order_workflow import approve_shipment_request
+
+    result = await approve_shipment_request(
+        req_id, call.from_user.id, boss_name, bot, override=override
+    )
+
+    if not result["ok"]:
+        # Превышение кредитного лимита — предлагаем явное подтверждение.
+        if result.get("needs_override"):
+            over = result["over"]
+            kb = InlineKeyboardBuilder()
+            kb.button(text="✅ Одобрить с превышением", callback_data=f"req_ovr:{req_id}")
+            kb.adjust(1)
+            await call.answer("⚠️ Превышение лимита", show_alert=True)
+            return await call.message.answer(
+                f"⚠️ <b>Превышение кредитного лимита</b>\n"
+                f"Текущий долг: <b>{_fmt_num(over['current_debt'])}</b>\n"
+                f"Лимит: <b>{_fmt_num(over['limit'])}</b>\n"
+                f"После заказа: <b>{_fmt_num(over['projected'])}</b>\n\n"
+                f"Одобрить всё равно?",
+                parse_mode="HTML",
+                reply_markup=kb.as_markup(),
+            )
+        return await call.answer(f"⚠️ {result['error']}", show_alert=True)
+
+    await call.answer("✅ Заявка одобрена")
+    suffix = " (с превышением лимита)" if override else ""
+    base = getattr(call.message, "html_text", None) or call.message.text or ""
+    await call.message.edit_text(
+        base
+        + f"\n\n{DIV}\n✅ <b>Одобрено{suffix}</b>  <code>{result['now']}</code>  — {_esc(boss_name)}",
+        parse_mode="HTML",
+    )
+
+
 @router.callback_query(F.data.startswith("req_ok:"))
 async def cb_approve_request(call: CallbackQuery, bot: Bot):
     if not is_boss(call.from_user.id):
         return await call.answer("Нет доступа", show_alert=True)
-
     req_id = int(call.data.split(":")[1])
-    boss_name = call.from_user.full_name or str(call.from_user.id)
+    await _approve_flow(call, bot, req_id, override=False)
 
-    # Вся логика (DB, МойСклад, уведомления, PDF, авто-payment) — в сервисе.
-    # Здесь только Telegram-UI: ответ на callback + редактирование сообщения.
-    from services.order_workflow import approve_shipment_request
 
-    result = await approve_shipment_request(req_id, call.from_user.id, boss_name, bot)
-
-    if not result["ok"]:
-        return await call.answer(f"⚠️ {result['error']}", show_alert=True)
-
-    await call.answer("✅ Заявка одобрена")
-    base = getattr(call.message, "html_text", None) or call.message.text or ""
-    await call.message.edit_text(
-        base
-        + f"\n\n{DIV}\n✅ <b>Одобрено</b>  <code>{result['now']}</code>  — {_esc(boss_name)}",
-        parse_mode="HTML",
-    )
+@router.callback_query(F.data.startswith("req_ovr:"))
+async def cb_approve_request_override(call: CallbackQuery, bot: Bot):
+    if not is_boss(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    req_id = int(call.data.split(":")[1])
+    await _approve_flow(call, bot, req_id, override=True)
 
 
 @router.callback_query(F.data.startswith("req_no:"))

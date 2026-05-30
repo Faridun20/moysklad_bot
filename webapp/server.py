@@ -1537,9 +1537,16 @@ async def api_approve_request(request: Request):
     boss_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
+    override = bool(data.get("override"))
     bot = await get_notify_bot()
-    result = await approve_shipment_request(req_id, user["id"], boss_name, bot)
+    result = await approve_shipment_request(req_id, user["id"], boss_name, bot, override=override)
     if not result["ok"]:
+        # Превышение кредитного лимита — не ошибка, а запрос подтверждения:
+        # фронт показывает цифры и повторяет вызов с override=true.
+        if result.get("needs_override"):
+            return JSONResponse(
+                {"ok": False, "needs_override": True, "over": result.get("over"), "req_id": req_id}
+            )
         raise HTTPException(status_code=409, detail=result["error"])
     return JSONResponse({"ok": True, "req_id": req_id})
 
@@ -2481,7 +2488,10 @@ async def api_submit_order(request: Request):
     )
 
     # Уведомляем руководителей
+    from services.order_workflow import resubmit_diff_line
+
     notify_text = format_request_notify(order, items, req_id)
+    notify_text += await resubmit_diff_line(order_id, items)  # #30: diff после доработки
     keyboard = {
         "inline_keyboard": [
             [
