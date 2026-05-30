@@ -8,6 +8,8 @@ Smoke-тесты уведомлений о подтверждении/откло
 Замокан tg_send_message (граница с Telegram). БД и переходы — настоящие.
 """
 
+import asyncio
+
 import pytest
 
 from fastapi.testclient import TestClient
@@ -34,7 +36,7 @@ def pay_env(isolated_db, monkeypatch):
     order_id = db.create_order(mgr_id, "Manager", "")
     db.update_order_agent(order_id, "agent-uuid", "Client X")
     db.add_order_item(order_id, "Product A", "", 4, "шт", 100.0)
-    db.set_order_payment(order_id, "credit", "2026-12-31")
+    asyncio.run(db.set_order_payment(order_id, "credit", "2026-12-31"))
     db.update_order_status(order_id, "approved")
     # Два pending-платежа от менеджера по этому заказу
     db.add_payment(mgr_id, "@mgr", "Manager", 100.0, "USD", "первый", order_id=order_id)

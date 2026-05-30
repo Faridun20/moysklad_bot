@@ -20,7 +20,7 @@ def test_mark_order_shipped(isolated_db):
     oid = db.create_order(1, "M", "")
     db.add_order_item(oid, "T", "", 1, "шт", 100.0)
     db.update_order_status(oid, "approved")
-    res = db.mark_order_shipped(oid, 2, "Boss")
+    res = asyncio.run(db.mark_order_shipped(oid, 2, "Boss"))
     assert res["ok"] is True
     assert db.get_order(oid)["status"] == "shipped"
 
@@ -29,7 +29,7 @@ def test_mark_order_shipped_only_from_approved(isolated_db):
     db = isolated_db
     oid = db.create_order(1, "M", "")
     db.update_order_status(oid, "pending")
-    res = db.mark_order_shipped(oid, 2, "Boss")
+    res = asyncio.run(db.mark_order_shipped(oid, 2, "Boss"))
     assert res["ok"] is False
     assert db.get_order(oid)["status"] == "pending"
 

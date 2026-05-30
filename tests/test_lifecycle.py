@@ -64,7 +64,7 @@ def _setup_credit_order(db, total_per_unit=100, qty=4):
     oid = db.create_order(1, "Manager", "")
     db.update_order_agent(oid, "agent-uuid", "Client X")
     db.add_order_item(oid, "Product", "", qty, "шт", float(total_per_unit))
-    db.set_order_payment(oid, "credit", "2026-12-31")
+    asyncio.run(db.set_order_payment(oid, "credit", "2026-12-31"))
     db.update_order_status(oid, "approved")
     return oid
 
@@ -73,7 +73,7 @@ def test_full_payment_closes_order(isolated_db):
     """Менеджер отметил → босс подтвердил → заказ закрыт."""
     db = isolated_db
     oid = _setup_credit_order(db, 100, 4)  # total 400
-    ok, pid = db.mark_order_paid(oid, 1, "Manager", amount=400)
+    ok, pid = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=400))
     assert ok and pid
     # paid_at стоит, paid_confirmed_at — нет
     o = db.get_order(oid)
@@ -89,11 +89,11 @@ def test_partial_payments_close_when_sum_reaches_total(isolated_db):
     """Два частичных платежа 100 + 300 = 400 закрывают заказ."""
     db = isolated_db
     oid = _setup_credit_order(db, 100, 4)
-    _, p1 = db.mark_order_paid(oid, 1, "Manager", amount=100)
+    _, p1 = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=100))
     asyncio.run(db.confirm_payment(p1, 99, "Boss"))
     # После первого confirm заказ ещё открыт
     assert db.get_order(oid)["paid_confirmed_at"] is None
-    _, p2 = db.mark_order_paid(oid, 1, "Manager", amount=300)
+    _, p2 = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=300))
     asyncio.run(db.confirm_payment(p2, 99, "Boss"))
     # После второго закрыт
     assert db.get_order(oid)["paid_confirmed_at"] is not None
@@ -103,9 +103,9 @@ def test_overpay_is_capped_at_remaining(isolated_db):
     """H1 fix: попытка отметить больше остатка → сумма обрезается."""
     db = isolated_db
     oid = _setup_credit_order(db, 100, 4)  # 400 total
-    _, p1 = db.mark_order_paid(oid, 1, "Manager", amount=300)
+    _, p1 = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=300))
     # Пытаемся отметить ещё 200 — должно обрезаться до 100 (остаток)
-    ok, p2 = db.mark_order_paid(oid, 1, "Manager", amount=200)
+    ok, p2 = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=200))
     assert ok
     payment2 = db.get_payment(p2)
     assert abs(float(payment2["amount"]) - 100) < 0.01
@@ -115,9 +115,9 @@ def test_marking_after_full_remaining_is_zero_returns_false(isolated_db):
     """Третий mark когда уже всё застолбили — отлетает."""
     db = isolated_db
     oid = _setup_credit_order(db, 100, 4)
-    db.mark_order_paid(oid, 1, "Manager", amount=400)
+    asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=400))
     # Остаток 0
-    ok, pid = db.mark_order_paid(oid, 1, "Manager", amount=50)
+    ok, pid = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=50))
     assert ok is False
     assert pid is None
 
@@ -126,7 +126,7 @@ def test_confirm_idempotent_on_already_confirmed(isolated_db):
     """Повторный confirm того же payment_id ничего не меняет."""
     db = isolated_db
     oid = _setup_credit_order(db, 100, 1)
-    _, pid = db.mark_order_paid(oid, 1, "Manager", amount=100)
+    _, pid = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=100))
     first = asyncio.run(db.confirm_payment(pid, 99, "Boss"))
     second = asyncio.run(db.confirm_payment(pid, 99, "Boss"))
     assert first is True
@@ -137,7 +137,7 @@ def test_claim_payment_for_ms_sync_atomic(isolated_db):
     """H3 fix: claim возвращает True только тому, кто выиграл гонку."""
     db = isolated_db
     oid = _setup_credit_order(db, 100, 1)
-    _, pid = db.mark_order_paid(oid, 1, "Manager", amount=100)
+    _, pid = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=100))
     asyncio.run(db.confirm_payment(pid, 99, "Boss"))
     # Платёж confirmed, ms_paymentin_id IS NULL → claim возможен
     assert db.claim_payment_for_ms_sync(pid) is True
@@ -158,7 +158,7 @@ def test_backfill_does_not_close_partial_credit_debts(isolated_db, monkeypatch):
     db = isolated_db
     oid = _setup_credit_order(db, 100, 4)  # 400 total
     # Частичная оплата 100 / 400
-    _, pid = db.mark_order_paid(oid, 1, "Manager", amount=100)
+    _, pid = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=100))
     asyncio.run(db.confirm_payment(pid, 99, "Boss"))
     # Долг ещё открыт
     assert db.get_order(oid)["paid_confirmed_at"] is None

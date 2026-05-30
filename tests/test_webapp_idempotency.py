@@ -8,6 +8,7 @@ mark_paid по частичной сумме без ключа мог при dou
 звонить в Telegram). БД/роли настоящие (isolated_db).
 """
 
+import asyncio
 import importlib
 
 import pytest
@@ -30,7 +31,7 @@ def client_env(isolated_db, monkeypatch):
     db.update_order_agent(oid, "agent-uuid", "Client X")
     db.add_order_item(oid, "Product A", "", 1, "шт", 250.0)
     db.update_order_status(oid, "shipped")
-    db.set_order_payment(oid, "credit", "2099-12-31")
+    asyncio.run(db.set_order_payment(oid, "credit", "2099-12-31"))
 
     async def _noop(*a, **k):
         return None
