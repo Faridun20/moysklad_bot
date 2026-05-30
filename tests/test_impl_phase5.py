@@ -103,7 +103,7 @@ def test_return_blocked_for_draft(isolated_db):
 def test_confirmed_return_reduces_agent_debt(shipped_order):
     db, mgr, oid, items = shipped_order
     # Долг до возврата = 250 (2×100 + 1×50, без оплат).
-    assert db.get_agent_current_debt("A-1") == 250.0
+    assert asyncio.run(db.get_agent_current_debt("A-1")) == 250.0
     r = asyncio.run(
         db.create_return(
             oid,
@@ -116,7 +116,7 @@ def test_confirmed_return_reduces_agent_debt(shipped_order):
     )
     asyncio.run(db.confirm_return(r["return_id"], 1, "Boss"))
     # Возврат на 100 → долг 150.
-    assert db.get_agent_current_debt("A-1") == 150.0
+    assert asyncio.run(db.get_agent_current_debt("A-1")) == 150.0
 
 
 # ─── FEFO / партии ───────────────────────────────────────────────────────────
