@@ -1344,7 +1344,53 @@ async def reject_order_to_draft(
         f"Заказ #{order_id} → draft (попытка {rc}/{max_cycles})"
         + (" — ЗАМОРОЖЕН" if frozen else ""),
     )
+
+    # Снапшот состояния на момент reject — для diff при переотправке (#30).
+    snap_items = await get_order_items(order_id)
+    before_snapshot = {
+        "items": [
+            {
+                "product_href": it.get("product_href") or "",
+                "product_name": it.get("product_name") or "",
+                "quantity": float(it.get("quantity", 0) or 0),
+                "price": float(it.get("price", 0) or 0),
+            }
+            for it in snap_items
+        ],
+        "total": sum(
+            float(it.get("quantity", 0) or 0) * float(it.get("price", 0) or 0)
+            for it in snap_items
+        ),
+    }
+    await asyncio.to_thread(
+        log_order_change,
+        order_id,
+        rejected_by,
+        "reject",
+        before_snapshot,
+        None,
+        {"rejection_count": rc},
+    )
     return {"ok": True, "error": None, "frozen": bool(frozen), "rejection_count": rc}
+
+
+async def get_last_reject_snapshot(order_id: int) -> dict | None:
+    """Последний снапшот состояния заказа на момент reject→draft (#30). None если
+    заказ не реджектился. Используется для diff «что изменилось» при переотправке."""
+    import json as _json
+
+    row = await adb_core.fetchrow(
+        "SELECT before_snapshot FROM order_change_log "
+        "WHERE order_id = $1 AND change_type = 'reject' AND before_snapshot IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1",
+        order_id,
+    )
+    if not row or not row.get("before_snapshot"):
+        return None
+    try:
+        return _json.loads(row["before_snapshot"])
+    except (ValueError, TypeError):
+        return None
 
 
 async def unfreeze_order(order_id: int, unfrozen_by: int, unfrozen_name: str) -> dict:
@@ -3062,6 +3108,19 @@ async def set_order_ms_cancel_synced(order_id: int) -> bool:
         await adb_core.execute(
             "UPDATE orders SET ms_cancel_synced_at = $1, updated_at = $2 WHERE id = $3",
             now_str(), now_str(), order_id,
+        )
+        > 0
+    )
+
+
+async def set_order_credit_override(order_id: int, by: int) -> bool:
+    """Отметить, что заказ одобрен боссом с превышением кредитного лимита
+    (override). Снимает повторную проверку при будущих одобрениях этого заказа."""
+    return (
+        await adb_core.execute(
+            "UPDATE orders SET credit_limit_override = 1, credit_limit_override_by = $1, "
+            "updated_at = $2 WHERE id = $3",
+            by, now_str(), order_id,
         )
         > 0
     )

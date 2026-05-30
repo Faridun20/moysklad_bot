@@ -151,6 +151,38 @@ def compute_resubmit_summary(
     }
 
 
+async def resubmit_diff_line(order_id: int, items: list[dict]) -> str:
+    """Строка-сводка изменений с момента прошлого reject→draft (#30). Возвращает
+    '' если заказ не реджектился ранее. Показывается боссу в уведомлении о
+    переотправленной заявке — видно, что менеджер реально исправил."""
+    from services import async_db as adb
+
+    snap = await adb.get_last_reject_snapshot(order_id)
+    if not snap:
+        return ""
+    before_items = snap.get("items", [])
+    before_total = float(snap.get("total", 0) or 0)
+    after_total = sum(
+        float(it.get("quantity", 0) or 0) * float(it.get("price", 0) or 0) for it in items
+    )
+    s = compute_resubmit_summary(before_items, items, before_total, after_total)
+    parts = []
+    if s["items_added"]:
+        parts.append(f"+{s['items_added']} поз")
+    if s["items_removed"]:
+        parts.append(f"−{s['items_removed']} поз")
+    if s["items_modified"]:
+        parts.append(f"~{s['items_modified']} изм")
+    changes = ", ".join(parts) if parts else "позиции без изменений"
+    diff = s["total_diff"]
+    if abs(diff) >= 0.005:
+        sign = "+" if diff > 0 else "−"
+        money_part = f"сумма {sign}{abs(diff):.0f}"
+    else:
+        money_part = "сумма без изменений"
+    return f"\n♻️ <b>После доработки:</b> {changes}; {money_part}"
+
+
 # ─── Полный жизненный цикл апрува/реджекта ──────────────────────────────────
 #
 # До рефакторинга логика жила в handlers/orders.py:cb_approve_request
@@ -163,6 +195,7 @@ async def approve_shipment_request(
     boss_user_id: int,
     boss_name: str,
     bot: Any,
+    override: bool = False,
 ) -> dict:
     """Полный апрув заявки: DB, МойСклад, уведомления, PDF, авто-payment.
 
@@ -200,6 +233,34 @@ async def approve_shipment_request(
             "order_id": req.get("order_id"),
         }
 
+    # Энфорс кредитного лимита: для credit-заказов проверяем превышение ДО
+    # одобрения. over_limit НЕ блокирует жёстко — требует явного override боссом
+    # (наименее разрушительный дефолт). Уже-override'нутый заказ не перепроверяем.
+    over_info = None
+    order_pre = await adb.get_order(req["order_id"])
+    if (
+        order_pre
+        and order_pre.get("agent_id")
+        and (order_pre.get("payment_type") or "paid") == "credit"
+        and not order_pre.get("credit_limit_override")
+    ):
+        pre_items = await adb.get_order_items(req["order_id"])
+        total = sum(
+            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in pre_items
+        )
+        chk = await adb.check_credit_limit(order_pre["agent_id"], total)
+        if chk.get("over_limit"):
+            over_info = chk
+            if not override:
+                return {
+                    "ok": False,
+                    "error": "Превышение кредитного лимита",
+                    "needs_override": True,
+                    "over": chk,
+                    "req_id": req_id,
+                    "order_id": req["order_id"],
+                }
+
     # Атомарный UPDATE ... WHERE status='pending' — защита от race condition,
     # когда два босса одновременно жмут «Одобрить». Только один из них
     # получит rowcount==1, остальные — False.
@@ -218,6 +279,18 @@ async def approve_shipment_request(
         adb.get_order(req["order_id"]),
         adb.get_role(boss_user_id),
     )
+    # Одобрено с превышением лимита → фиксируем override + аудит.
+    if override and over_info:
+        await adb.set_order_credit_override(req["order_id"], boss_user_id)
+        await adb.add_audit_log(
+            boss_user_id,
+            boss_name,
+            boss_role,
+            "credit_override",
+            f"Заявка #{req_id}: одобрено с превышением лимита "
+            f"(долг {over_info['current_debt']:.0f}, лимит {over_info['limit']:.0f}, "
+            f"проекция {over_info['projected']:.0f})",
+        )
     items = await adb.get_order_items(req["order_id"]) if order else []
     manager_name = (order or {}).get("full_name") or req.get("full_name") or "—"
     manager_user_id = (order or {}).get("user_id") or req.get("user_id")
