@@ -10,12 +10,17 @@ import asyncio
 from tasks.run_ops_monitor import (
     assemble_digest,
     build_cron_health_block,
+    build_digest_keyboard,
     build_expiring_batches_block,
     build_overdue_undeposited_block,
     build_pending_deposits_block,
     build_pending_returns_block,
     build_stale_orders_block,
 )
+
+
+def _all_cb(kb: dict) -> list[str]:
+    return [b["callback_data"] for row in kb["inline_keyboard"] for b in row]
 
 
 # ─── Round 6 RACE-4: idempotency-guard ────────────────────────────────────────
@@ -67,6 +72,37 @@ def test_assemble_skips_empty_blocks():
 
 def test_assemble_none_when_all_empty():
     assert assemble_digest("Заголовок", []) is None
+
+
+# ─── #23: интерактивная клавиатура дайджеста ──────────────────────────────────
+
+
+def test_digest_keyboard_none_when_no_actions():
+    assert build_digest_keyboard() is None
+    assert build_digest_keyboard(stale=[], deposits=[], returns=[]) is None
+
+
+def test_digest_keyboard_order_buttons_capped():
+    stale = [{"id": i} for i in range(10)]
+    kb = build_digest_keyboard(stale=stale, max_orders=5)
+    cbs = _all_cb(kb)
+    assert cbs == [f"ord_view:{i}" for i in range(5)]  # первые 5, deep-link к просмотру
+
+
+def test_digest_keyboard_nav_buttons():
+    kb = build_digest_keyboard(deposits=[{"id": 1}], returns=[{"id": 2}, {"id": 3}])
+    cbs = _all_cb(kb)
+    assert "dep_pending" in cbs
+    assert "ret_pending" in cbs
+    # счётчики в подписи
+    labels = [b["text"] for row in kb["inline_keyboard"] for b in row]
+    assert any("(1)" in t for t in labels)  # 1 сдача
+    assert any("(2)" in t for t in labels)  # 2 возврата
+
+
+def test_digest_keyboard_warehouse_only_returns():
+    kb = build_digest_keyboard(returns=[{"id": 9}])
+    assert _all_cb(kb) == ["ret_pending"]
 
 
 # ─── #5 ops hardening: cron-health block ──────────────────────────────────────

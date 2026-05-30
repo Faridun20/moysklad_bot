@@ -235,6 +235,38 @@ def assemble_digest(title: str, blocks: list[str | None]) -> str | None:
     return f"{DIV}\n{title}\n\n" + "\n\n".join(present)
 
 
+def build_digest_keyboard(
+    stale: list[dict] | None = None,
+    deposits: list[dict] | None = None,
+    returns: list[dict] | None = None,
+    max_orders: int = 5,
+) -> dict | None:
+    """Инлайн-клавиатура к дайджесту: deep-link кнопки к УЖЕ существующим
+    обработчикам бота — `ord_view:{id}` (просмотр заказа), `dep_pending`
+    (список сдач), `ret_pending` (список возвратов). Возвращает dict в формате
+    Telegram Bot API (reply_markup для tg_send_message) или None, если действий нет.
+
+    Кнопки-заказы — по первым `max_orders` зависшим (по 3 в ряд); сдачи/возвраты —
+    один вход в соответствующий список. Сами обработчики живут в bot-процессе
+    (cron только отправляет сообщение, callback'и обрабатывает бот).
+    """
+    rows: list[list[dict]] = []
+    order_btns = [
+        {"text": f"⏳ #{o['id']}", "callback_data": f"ord_view:{o['id']}"}
+        for o in (stale or [])[:max_orders]
+    ]
+    for i in range(0, len(order_btns), 3):
+        rows.append(order_btns[i : i + 3])
+    nav: list[dict] = []
+    if deposits:
+        nav.append({"text": f"💵 Сдачи ({len(deposits)})", "callback_data": "dep_pending"})
+    if returns:
+        nav.append({"text": f"↩️ Возвраты ({len(returns)})", "callback_data": "ret_pending"})
+    if nav:
+        rows.append(nav)
+    return {"inline_keyboard": rows} if rows else None
+
+
 # ─── Оркестрация ──────────────────────────────────────────────────────────────
 
 
@@ -306,20 +338,25 @@ async def main() -> int:
         "📋 <b>Сводка: склад</b>", [b_ret, b_batch, b_low, b_dead]
     )
 
+    # Интерактив: deep-link кнопки к спискам/заказам (обрабатывает бот-процесс).
+    boss_kb = build_digest_keyboard(stale, deposits, returns)
+    bookkeeper_kb = build_digest_keyboard(deposits=deposits)
+    warehouse_kb = build_digest_keyboard(returns=returns)
+
     users = get_all_users()
     sent = 0
     try:
         for u in users:
             role = u["role"]
-            digest = None
+            digest = kb = None
             if role in ("admin", "boss"):
-                digest = boss_digest
+                digest, kb = boss_digest, boss_kb
             elif role == "bookkeeper":
-                digest = bookkeeper_digest
+                digest, kb = bookkeeper_digest, bookkeeper_kb
             elif role == "warehouse_keeper":
-                digest = warehouse_digest
+                digest, kb = warehouse_digest, warehouse_kb
             if digest:
-                await tg_send_message(u["user_id"], digest)
+                await tg_send_message(u["user_id"], digest, reply_markup=kb)
                 sent += 1
         logger.info(
             "ops_monitor: stale=%d deposits=%d returns=%d overdue=%d batches=%d "
