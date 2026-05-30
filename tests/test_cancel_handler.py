@@ -73,7 +73,7 @@ def test_cancel_approved_order_notifies_creator(isolated_db):
     assert state._data.get("order_id") == oid
 
     asyncio.run(process_cancel_reason(_FakeMessage(text="клиент отказался", uid=2), state, bot))
-    assert db.get_order(oid)["status"] == "cancelled"
+    assert asyncio.run(db.get_order(oid))["status"] == "cancelled"
     # создателю (1) ушло уведомление
     assert any(chat == 1 for chat, _, _ in bot.sent)
 
@@ -86,7 +86,7 @@ def test_cancel_blocked_for_shipped(isolated_db):
     msg = _FakeMessage(text=f"/cancel {oid}", uid=2)
     asyncio.run(cmd_cancel(msg, _FakeState()))
     assert any("approved" in t for t, _ in msg.answers)
-    assert db.get_order(oid)["status"] == "shipped"
+    assert asyncio.run(db.get_order(oid))["status"] == "shipped"
 
 
 def test_cancel_denied_for_manager(isolated_db):
@@ -97,4 +97,4 @@ def test_cancel_denied_for_manager(isolated_db):
     msg = _FakeMessage(text=f"/cancel {oid}", uid=1)  # менеджер
     asyncio.run(cmd_cancel(msg, _FakeState()))
     assert any("босс" in t.lower() for t, _ in msg.answers)
-    assert db.get_order(oid)["status"] == "approved"
+    assert asyncio.run(db.get_order(oid))["status"] == "approved"

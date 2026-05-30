@@ -39,7 +39,7 @@ async def _run(order_id: int | None, do_reverse: bool) -> int:
         print("ℹ️  Режим read-only. Для боевого реверса: --order-id N --reverse")
         return 0
 
-    order = get_order(order_id)
+    order = await get_order(order_id)
     if not order:
         print(f"❌ Заказ #{order_id} не найден в БД.")
         return 1

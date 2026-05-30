@@ -3,6 +3,7 @@
 Настоящая SQLite (isolated_db); время «старим» прямой записью created_at/deleted_at.
 """
 
+import asyncio
 from datetime import datetime, timedelta
 
 
@@ -41,9 +42,9 @@ def test_purge_soft_deleted(isolated_db):
 
     out = db.purge_soft_deleted(retention_days=365)
     assert out["orders"] == 1  # удалён только давний
-    assert db.get_order(keep) is not None
-    assert db.get_order(old_del) is None
-    assert db.get_order(fresh_del) is not None
+    assert asyncio.run(db.get_order(keep)) is not None
+    assert asyncio.run(db.get_order(old_del)) is None
+    assert asyncio.run(db.get_order(fresh_del)) is not None
 
 
 def test_purge_returns_all_tables_keys(isolated_db):

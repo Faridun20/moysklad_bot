@@ -48,7 +48,7 @@ async def create_salesreturn(return_id: int) -> dict:
     if ret.get("moysklad_return_id"):
         return {"ok": True, "ms_id": ret["moysklad_return_id"], "skipped": "already-synced"}
 
-    order = await _to_thread(db.get_order, ret["order_id"])
+    order = await db.get_order(ret["order_id"])  # native async (asyncpg Stage 19)
     if not order or not order.get("agent_id"):
         return {"ok": False, "reason": "Нет заказа/контрагента для возврата"}
 

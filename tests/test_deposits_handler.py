@@ -108,7 +108,7 @@ def test_cb_confirm_closes_order_and_notifies_manager(isolated_db):
     call = _FakeCall(f"dep_ok:{res['deposit_id']}", uid=2, bot=bot)
     asyncio.run(cb_deposit_confirm(call, bot))
 
-    assert db.get_order(oid)["status"] == "paid"
+    assert asyncio.run(db.get_order(oid))["status"] == "paid"
     # Менеджеру (1) ушло «подтверждена».
     assert any(chat == 1 and "подтверждена" in text for chat, text, _ in bot.sent)
 

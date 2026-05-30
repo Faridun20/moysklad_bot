@@ -24,7 +24,7 @@ def _shipped_order(db, owner=1, qty=2, price=100.0):
 def test_duplicate_return_blocked(isolated_db):
     db = isolated_db
     oid = _shipped_order(db)
-    items = db.get_order_items(oid)
+    items = asyncio.run(db.get_order_items(oid))
     r1 = asyncio.run(
         db.create_return(
             oid,
@@ -53,7 +53,7 @@ def test_duplicate_return_blocked(isolated_db):
 def test_return_qty_clamped_to_available(isolated_db):
     db = isolated_db
     oid = _shipped_order(db, qty=2, price=100.0)
-    items = db.get_order_items(oid)
+    items = asyncio.run(db.get_order_items(oid))
     # просят 5 при доступных 2 → режется до 2, сумма пересчитывается
     r = asyncio.run(
         db.create_return(
@@ -82,7 +82,7 @@ def test_manager_return_blocked_after_deadline(isolated_db):
             db.q("UPDATE orders SET shipped_at = ? WHERE id = ?"), ("2000-01-01 00:00:00", oid)
         )
         conn.commit()
-    items = db.get_order_items(oid)
+    items = asyncio.run(db.get_order_items(oid))
     # менеджер (force=False) — за дедлайном, нельзя
     r_mgr = asyncio.run(
         db.create_return(

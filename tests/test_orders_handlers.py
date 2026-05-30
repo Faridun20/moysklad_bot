@@ -53,13 +53,13 @@ def test_delete_shows_confirm_and_keeps_draft(isolated_db):
 
     db.set_role(1, "mgr", "Manager", "manager")
     oid = db.create_order(1, "Manager", "")
-    assert db.get_order(oid)["status"] == "draft"
+    assert asyncio.run(db.get_order(oid))["status"] == "draft"
 
     call = _FakeCall(f"ord_delete:{oid}", uid=1)
     asyncio.run(cb_delete_order(call))
 
     # Заказ НЕ удалён — только показан вопрос
-    assert db.get_order(oid)["status"] == "draft"
+    assert asyncio.run(db.get_order(oid))["status"] == "draft"
     assert len(call.message.answers) == 1
     text, kwargs = call.message.answers[0]
     assert "Удалить" in text
@@ -81,7 +81,7 @@ def test_delete_yes_actually_deletes(isolated_db):
     asyncio.run(cb_delete_order_yes(call))
 
     # Черновик помечен rejected (так реализовано «удаление»)
-    assert db.get_order(oid)["status"] == "rejected"
+    assert asyncio.run(db.get_order(oid))["status"] == "rejected"
 
 
 def test_delete_yes_rejects_non_owner(isolated_db):
@@ -96,4 +96,4 @@ def test_delete_yes_rejects_non_owner(isolated_db):
     call = _FakeCall(f"ord_delete_yes:{oid}", uid=2)
     asyncio.run(cb_delete_order_yes(call))
 
-    assert db.get_order(oid)["status"] == "draft"
+    assert asyncio.run(db.get_order(oid))["status"] == "draft"

@@ -69,7 +69,7 @@ def test_only_qty_prefills_min_price(isolated_db):
     msg = _FakeMessage("5", uid=1)  # только количество
     asyncio.run(process_qty_price(msg, _state_for(oid, sale_min=150.0)))
 
-    items = db.get_order_items(oid)
+    items = asyncio.run(db.get_order_items(oid))
     assert len(items) == 1
     assert items[0]["price"] == 150.0  # подставлен минимум
     assert items[0]["price_cents"] == 15000
@@ -85,7 +85,7 @@ def test_price_below_min_rejected(isolated_db):
     msg = _FakeMessage("5 100", uid=1)  # ниже минимума 150
     asyncio.run(process_qty_price(msg, _state_for(oid, sale_min=150.0)))
 
-    assert db.get_order_items(oid) == []  # позиция не добавлена
+    assert asyncio.run(db.get_order_items(oid)) == []  # позиция не добавлена
     assert any("минимальной" in t for t, _ in msg.answers)
 
 
@@ -99,7 +99,7 @@ def test_price_above_min_accepted(isolated_db):
     msg = _FakeMessage("5 200", uid=1)  # выше минимума — ок
     asyncio.run(process_qty_price(msg, _state_for(oid, sale_min=150.0)))
 
-    items = db.get_order_items(oid)
+    items = asyncio.run(db.get_order_items(oid))
     assert len(items) == 1
     assert items[0]["price"] == 200.0
 
@@ -114,6 +114,6 @@ def test_no_min_keeps_legacy_behavior(isolated_db):
     msg = _FakeMessage("5", uid=1)  # без минимума только qty → цена 0
     asyncio.run(process_qty_price(msg, _state_for(oid, sale_min=None)))
 
-    items = db.get_order_items(oid)
+    items = asyncio.run(db.get_order_items(oid))
     assert len(items) == 1
     assert items[0]["price"] == 0

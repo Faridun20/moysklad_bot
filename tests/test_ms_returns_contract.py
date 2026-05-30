@@ -32,7 +32,7 @@ def _make_confirmed_return(db, with_demand=True):
     db.update_order_status(oid, "shipped")
     if with_demand:
         db.set_order_ms_demand_id(oid, "DEMAND-OLD")
-    items = db.get_order_items(oid)
+    items = asyncio.run(db.get_order_items(oid))
     r = asyncio.run(
         db.create_return(
             oid,

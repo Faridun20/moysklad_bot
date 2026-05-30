@@ -203,7 +203,7 @@ def test_add_item_prefills_min_when_price_zero(client_env):
         },
     )
     assert resp.status_code == 200, resp.text
-    items = db.get_order_items(oid)
+    items = asyncio.run(db.get_order_items(oid))
     assert items[0]["price"] == 100.0  # префилл минимумом
 
 

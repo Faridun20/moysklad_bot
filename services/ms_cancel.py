@@ -38,7 +38,7 @@ async def reverse_customerorder(order_id: int) -> dict:
     if not ms_demand.is_ready():
         return {"ok": False, "reason": "MS context не готов (org/store)"}
 
-    order = await _to_thread(db.get_order, order_id)
+    order = await db.get_order(order_id)  # native async (asyncpg Stage 19)
     if not order:
         return {"ok": False, "reason": "Заказ не найден"}
     if order.get("ms_cancel_synced_at"):

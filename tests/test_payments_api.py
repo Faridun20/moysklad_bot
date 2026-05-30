@@ -70,7 +70,7 @@ def test_confirm_payment_notifies_manager(pay_env):
     assert resp.json()["confirmed_count"] == 2
 
     # Оба платежа подтверждены в БД
-    statuses = [p["status"] for p in db.get_payments_for_order(ids["order"])]
+    statuses = [p["status"] for p in asyncio.run(db.get_payments_for_order(ids["order"]))]
     assert statuses == ["confirmed", "confirmed"]
 
     # Менеджер получил уведомление по каждому платежу
@@ -89,7 +89,7 @@ def test_reject_payment_notifies_manager(pay_env):
     assert resp.status_code == 200, resp.text
     assert resp.json()["rejected_count"] == 2
 
-    statuses = [p["status"] for p in db.get_payments_for_order(ids["order"])]
+    statuses = [p["status"] for p in asyncio.run(db.get_payments_for_order(ids["order"]))]
     assert statuses == ["rejected", "rejected"]
 
     assert len(sent) == 2
@@ -131,7 +131,7 @@ def test_manager_cannot_confirm_payment(pay_env, monkeypatch):
     )
     assert resp.status_code == 403
     # Платежи остались pending
-    statuses = [p["status"] for p in db.get_payments_for_order(ids["order"])]
+    statuses = [p["status"] for p in asyncio.run(db.get_payments_for_order(ids["order"]))]
     assert statuses == ["pending", "pending"]
 
 

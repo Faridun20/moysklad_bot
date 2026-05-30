@@ -100,7 +100,7 @@ def test_get_order_payment_summary_includes_base_fields(isolated_db):
     db.add_order_item(oid, "Товар", "", 2, "шт", 50.0)  # total=100
     db.update_order_status(oid, "approved")
 
-    summary = db.get_order_payment_summary(oid)
+    summary = asyncio.run(db.get_order_payment_summary(oid))
     assert summary["total"] == 100.0
     assert summary["currency"] == "USD"
     assert summary["total_base"] == 100.0  # USD = base
@@ -123,7 +123,7 @@ def test_get_order_payment_summary_base_none_for_unrated_currency(isolated_db):
         cur.execute(db.q("UPDATE orders SET currency = ? WHERE id = ?"), ("EUR", oid))
         conn.commit()
 
-    summary = db.get_order_payment_summary(oid)
+    summary = asyncio.run(db.get_order_payment_summary(oid))
     assert summary["currency"] == "EUR"
     assert summary["total_base"] is None  # курс не задан → None, не 0
 
@@ -142,7 +142,7 @@ def test_get_order_payment_summary_converts_rated_currency(isolated_db):
         cur.execute(db.q("UPDATE orders SET currency = ? WHERE id = ?"), ("UZS", oid))
         conn.commit()
 
-    summary = db.get_order_payment_summary(oid)
+    summary = asyncio.run(db.get_order_payment_summary(oid))
     assert summary["currency"] == "UZS"
     assert summary["total"] == 1_000_000.0
     assert summary["total_base"] == pytest.approx(80.0)

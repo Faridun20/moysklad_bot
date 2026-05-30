@@ -22,7 +22,7 @@ def test_mark_order_shipped(isolated_db):
     db.update_order_status(oid, "approved")
     res = asyncio.run(db.mark_order_shipped(oid, 2, "Boss"))
     assert res["ok"] is True
-    assert db.get_order(oid)["status"] == "shipped"
+    assert asyncio.run(db.get_order(oid))["status"] == "shipped"
 
 
 def test_mark_order_shipped_only_from_approved(isolated_db):
@@ -31,7 +31,7 @@ def test_mark_order_shipped_only_from_approved(isolated_db):
     db.update_order_status(oid, "pending")
     res = asyncio.run(db.mark_order_shipped(oid, 2, "Boss"))
     assert res["ok"] is False
-    assert db.get_order(oid)["status"] == "pending"
+    assert asyncio.run(db.get_order(oid))["status"] == "pending"
 
 
 # ─── DB: расширенная возвратопригодность ─────────────────────────────────────
@@ -54,7 +54,7 @@ def test_returnable_includes_legacy_paid(isolated_db):
         conn.commit()
     assert asyncio.run(db.is_order_returnable(oid)) is True  # оплачен → можно вернуть
 
-    items = db.get_order_items(oid)
+    items = asyncio.run(db.get_order_items(oid))
     r = asyncio.run(
         db.create_return(
             oid,
@@ -116,7 +116,7 @@ def test_api_ship_by_warehouse(client_env):
         "/api/orders/ship", json={"initData": str(ids["wh"]), "order_id": ids["order"]}
     )
     assert resp.status_code == 200, resp.text
-    assert db.get_order(ids["order"])["status"] == "shipped"
+    assert asyncio.run(db.get_order(ids["order"]))["status"] == "shipped"
 
 
 def test_api_ship_forbidden_for_manager(client_env):
@@ -125,7 +125,7 @@ def test_api_ship_forbidden_for_manager(client_env):
         "/api/orders/ship", json={"initData": str(ids["mgr"]), "order_id": ids["order"]}
     )
     assert resp.status_code == 403
-    assert db.get_order(ids["order"])["status"] == "approved"
+    assert asyncio.run(db.get_order(ids["order"]))["status"] == "approved"
 
 
 def test_api_ship_conflict_when_not_approved(client_env):

@@ -85,7 +85,7 @@ def test_refund_cash_writes_amount_cents(isolated_db):
     db.add_order_item(oid, "Товар", "href", 1, "шт", 49.99)  # 4999 коп.
     db.update_order_status(oid, "shipped")
 
-    oitems = db.get_order_items(oid)
+    oitems = asyncio.run(db.get_order_items(oid))
     items = [(oitems[0]["id"], 1, 49.99)]
     res = asyncio.run(db.create_return(oid, "full", "брак", items, "cash", boss))
     assert res["ok"], res

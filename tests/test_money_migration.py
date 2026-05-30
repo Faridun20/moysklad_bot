@@ -72,7 +72,7 @@ def test_order_payment_summary_in_cents(isolated_db):
     db.add_order_item(oid, "P", "href", 2, "шт", 49.99)  # 2 × 49.99 = 99.98
     db.add_payment(1, "u", "U", 49.99, "USD", "частичная", order_id=oid)
 
-    s = db.get_order_payment_summary(oid)
+    s = asyncio.run(db.get_order_payment_summary(oid))
     assert s["total_cents"] == 9998
     assert s["pending_cents"] == 4999
     assert s["confirmed_cents"] == 0
