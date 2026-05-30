@@ -139,6 +139,7 @@ _COMMANDS_ADMIN = _COMMANDS_BOSS + [
     BotCommand(command="users", description="👥 Пользователи"),
     BotCommand(command="addrole", description="🔧 Сменить роль"),
     BotCommand(command="audit", description="📋 Аудит лог"),
+    BotCommand(command="frozen", description="🧊 Замороженные заказы"),
 ]
 _COMMANDS_WAREHOUSE = [
     BotCommand(command="start", description="🏠 Главное меню"),
