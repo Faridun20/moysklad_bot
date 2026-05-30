@@ -26,25 +26,25 @@ def _agent_order(db, total: float, qty: int = 1, status: str = "approved", agent
 def test_credit_limit_default_and_override(isolated_db):
     db = isolated_db
     # Нет строки → дефолт из app_settings.
-    assert db.get_credit_limit("A-NEW") == 2000.0
-    db.ensure_credit_limit("A-NEW", "Клиент")
-    assert db.get_credit_limit("A-NEW") == 2000.0
+    assert asyncio.run(db.get_credit_limit("A-NEW")) == 2000.0
+    asyncio.run(db.ensure_credit_limit("A-NEW", "Клиент"))
+    assert asyncio.run(db.get_credit_limit("A-NEW")) == 2000.0
     # Изменение лимита.
-    db.set_credit_limit("A-NEW", "Клиент", 5000.0, set_by=1, notes="VIP")
-    assert db.get_credit_limit("A-NEW") == 5000.0
+    asyncio.run(db.set_credit_limit("A-NEW", "Клиент", 5000.0, set_by=1, notes="VIP"))
+    assert asyncio.run(db.get_credit_limit("A-NEW")) == 5000.0
 
 
 def test_current_debt_and_limit_check(isolated_db):
     db = isolated_db
     oid, mgr = _agent_order(db, 300.0, status="shipped", agent="A-2")
     # Нет подтверждённых платежей → весь total в долге.
-    assert db.get_agent_current_debt("A-2") == 300.0
+    assert asyncio.run(db.get_agent_current_debt("A-2")) == 300.0
 
-    over = db.check_credit_limit("A-2", 1800.0)  # 300+1800=2100 > 2000
+    over = asyncio.run(db.check_credit_limit("A-2", 1800.0))  # 300+1800=2100 > 2000
     assert over["over_limit"] is True
     assert over["projected"] == 2100.0
 
-    under = db.check_credit_limit("A-2", 100.0)  # 300+100=400 < 2000
+    under = asyncio.run(db.check_credit_limit("A-2", 100.0))  # 300+100=400 < 2000
     assert under["over_limit"] is False
 
 
@@ -62,7 +62,7 @@ def test_confirmed_return_reduces_debt(isolated_db):
         )
         conn.commit()
     # 300 остаток − 100 возврат = 200.
-    assert db.get_agent_current_debt("A-3") == 200.0
+    assert asyncio.run(db.get_agent_current_debt("A-3")) == 200.0
 
 
 # ─── reject → draft + freeze ─────────────────────────────────────────────────

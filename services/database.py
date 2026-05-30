@@ -1033,124 +1033,126 @@ def set_setting(key: str, value, updated_by: int | None = None) -> None:
 # «долгового» поля, чтобы не плодить параллельную истину.
 
 
-def get_credit_limit(agent_id: str) -> float:
-    """Лимит контрагента; если строки нет — дефолт из app_settings."""
+async def get_credit_limit(agent_id: str) -> float:
+    """Лимит контрагента; если строки нет — дефолт из app_settings.
+
+    asyncpg Stage 18 (#21): native async через adb_core; get_setting (sync,
+    TTL-кэш) — мост через to_thread."""
     if not agent_id:
-        return float(get_setting("credit_limit_default", 2000.0))
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q("SELECT limit_amount FROM credit_limits WHERE agent_id = ?"), (agent_id,))
-        row = cur.fetchone()
-    if row:
-        return float(row["limit_amount"] if USE_POSTGRES else row[0])
-    return float(get_setting("credit_limit_default", 2000.0))
+        return float(await asyncio.to_thread(get_setting, "credit_limit_default", 2000.0))
+    val = await adb_core.fetchval(
+        "SELECT limit_amount FROM credit_limits WHERE agent_id = $1", agent_id
+    )
+    if val is not None:
+        return float(val)
+    return float(await asyncio.to_thread(get_setting, "credit_limit_default", 2000.0))
 
 
-def ensure_credit_limit(agent_id: str, agent_name: str) -> None:
-    """Завести строку лимита для нового клиента (set_by=NULL → «авто»)."""
+async def ensure_credit_limit(agent_id: str, agent_name: str) -> None:
+    """Завести строку лимита для нового клиента (set_by=NULL → «авто»).
+
+    asyncpg Stage 18 (#21): native async через adb_core (INSERT ... DO NOTHING /
+    INSERT OR IGNORE); get_setting — мост через to_thread."""
     if not agent_id:
         return
-    default = float(get_setting("credit_limit_default", 2000.0))
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        if USE_POSTGRES:
-            cur.execute(
-                "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, set_by, created_at, updated_at) "
-                "VALUES (%s, %s, %s, NULL, %s, %s) ON CONFLICT (agent_id) DO NOTHING",
-                (agent_id, agent_name, default, now_str(), now_str()),
-            )
-        else:
-            cur.execute(
-                "INSERT OR IGNORE INTO credit_limits (agent_id, agent_name, limit_amount, set_by, created_at, updated_at) "
-                "VALUES (?, ?, ?, NULL, ?, ?)",
-                (agent_id, agent_name, default, now_str(), now_str()),
-            )
-        conn.commit()
+    default = float(await asyncio.to_thread(get_setting, "credit_limit_default", 2000.0))
+    if USE_POSTGRES:
+        await adb_core.execute(
+            "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, set_by, created_at, updated_at) "
+            "VALUES ($1, $2, $3, NULL, $4, $5) ON CONFLICT (agent_id) DO NOTHING",
+            agent_id, agent_name, default, now_str(), now_str(),
+        )
+    else:
+        await adb_core.execute(
+            "INSERT OR IGNORE INTO credit_limits (agent_id, agent_name, limit_amount, set_by, created_at, updated_at) "
+            "VALUES ($1, $2, $3, NULL, $4, $5)",
+            agent_id, agent_name, default, now_str(), now_str(),
+        )
 
 
-def set_credit_limit(
+async def set_credit_limit(
     agent_id: str,
     agent_name: str,
     limit_amount: float,
     set_by: int | None = None,
     notes: str | None = None,
 ) -> None:
-    """Установить/изменить лимит + запись в audit_log."""
+    """Установить/изменить лимит + запись в audit_log.
+
+    asyncpg Stage 18 (#21): native async через adb_core (UPSERT ON CONFLICT);
+    add_audit_log/get_role (sync) — мост через to_thread."""
     limit_cents = money.to_cents(limit_amount or 0)
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        if USE_POSTGRES:
-            cur.execute(
-                "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, limit_amount_cents, set_by, notes, created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
-                "ON CONFLICT (agent_id) DO UPDATE SET limit_amount = EXCLUDED.limit_amount, "
-                "limit_amount_cents = EXCLUDED.limit_amount_cents, "
-                "set_by = EXCLUDED.set_by, notes = EXCLUDED.notes, updated_at = EXCLUDED.updated_at",
-                (agent_id, agent_name, limit_amount, limit_cents, set_by, notes, now_str(), now_str()),
-            )
-        else:
-            cur.execute(
-                "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, limit_amount_cents, set_by, notes, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(agent_id) DO UPDATE SET limit_amount = excluded.limit_amount, "
-                "limit_amount_cents = excluded.limit_amount_cents, "
-                "set_by = excluded.set_by, notes = excluded.notes, updated_at = excluded.updated_at",
-                (agent_id, agent_name, limit_amount, limit_cents, set_by, notes, now_str(), now_str()),
-            )
-        conn.commit()
+    if USE_POSTGRES:
+        await adb_core.execute(
+            "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, limit_amount_cents, set_by, notes, created_at, updated_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
+            "ON CONFLICT (agent_id) DO UPDATE SET limit_amount = EXCLUDED.limit_amount, "
+            "limit_amount_cents = EXCLUDED.limit_amount_cents, "
+            "set_by = EXCLUDED.set_by, notes = EXCLUDED.notes, updated_at = EXCLUDED.updated_at",
+            agent_id, agent_name, limit_amount, limit_cents, set_by, notes, now_str(), now_str(),
+        )
+    else:
+        await adb_core.execute(
+            "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, limit_amount_cents, set_by, notes, created_at, updated_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
+            "ON CONFLICT(agent_id) DO UPDATE SET limit_amount = excluded.limit_amount, "
+            "limit_amount_cents = excluded.limit_amount_cents, "
+            "set_by = excluded.set_by, notes = excluded.notes, updated_at = excluded.updated_at",
+            agent_id, agent_name, limit_amount, limit_cents, set_by, notes, now_str(), now_str(),
+        )
     if set_by:
-        add_audit_log(
+        await asyncio.to_thread(
+            add_audit_log,
             set_by,
             "",
-            get_role(set_by),
+            await asyncio.to_thread(get_role, set_by),
             "credit_limit_changed",
             f"{agent_name}: лимит → {limit_amount:.0f} USD" + (f" ({notes})" if notes else ""),
         )
 
 
-def get_agent_current_debt(agent_id: str) -> float:
+async def get_agent_current_debt(agent_id: str) -> float:
     """Текущий долг контрагента: сумма непогашенных остатков по его открытым
     заказам минус подтверждённые возвраты. Открытые = не draft/rejected/
-    cancelled и не soft-deleted."""
+    cancelled и не soft-deleted.
+
+    asyncpg Stage 18 (#21): native async через adb_core; get_order_payment_summary
+    (общий read, sync) — мост через to_thread (флип в Stage 19)."""
     if not agent_id:
         return 0.0
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        # Исключаем неактуальные: черновики/отклонённые/отменённые, полностью
-        # оплаченные (в т.ч. через cash deposit → payment_confirmed=1 /
-        # status='paid') и полностью возвращённые.
-        cur.execute(
-            q(
-                "SELECT id FROM orders WHERE agent_id = ? "
-                "AND status NOT IN ('draft', 'rejected', 'cancelled', 'paid', 'returned') "
-                "AND payment_confirmed = 0 AND (deleted_at IS NULL)"
-            ),
-            (agent_id,),
-        )
-        order_ids = [(r["id"] if USE_POSTGRES else r[0]) for r in cur.fetchall()]
+    # Исключаем неактуальные: черновики/отклонённые/отменённые, полностью
+    # оплаченные (в т.ч. через cash deposit → payment_confirmed=1 /
+    # status='paid') и полностью возвращённые.
+    rows = await adb_core.fetch(
+        "SELECT id FROM orders WHERE agent_id = $1 "
+        "AND status NOT IN ('draft', 'rejected', 'cancelled', 'paid', 'returned') "
+        "AND payment_confirmed = 0 AND (deleted_at IS NULL)",
+        agent_id,
+    )
+    order_ids = [r["id"] for r in rows]
     debt_cents = 0
     for oid in order_ids:
-        summary = get_order_payment_summary(oid)
-        with get_conn() as conn:
-            cur = get_cursor(conn)
-            cur.execute(
-                q(
-                    f"SELECT {_SUM_RETURNS_CENTS} AS s FROM returns "
-                    "WHERE order_id = ? AND status = 'confirmed' AND (deleted_at IS NULL)"
-                ),
-                (oid,),
+        summary = await asyncio.to_thread(get_order_payment_summary, oid)
+        returns_cents = int(
+            await adb_core.fetchval(
+                f"SELECT {_SUM_RETURNS_CENTS} FROM returns "
+                "WHERE order_id = $1 AND status = 'confirmed' AND (deleted_at IS NULL)",
+                oid,
             )
-            row = cur.fetchone()
-        returns_cents = int((row["s"] if USE_POSTGRES else row[0]) or 0)
+            or 0
+        )
         debt_cents += max(0, int(summary.get("remaining_cents", 0)) - returns_cents)
     return float(money.from_cents(debt_cents))
 
 
-def check_credit_limit(agent_id: str, order_total: float) -> dict:
+async def check_credit_limit(agent_id: str, order_total: float) -> dict:
     """Проверка лимита для нового заказа. НЕ блокирует — даёт данные для
-    решения боса (over_limit + цифры)."""
-    debt = get_agent_current_debt(agent_id)
-    limit = get_credit_limit(agent_id)
+    решения боса (over_limit + цифры).
+
+    asyncpg Stage 18 (#21): native async; get_agent_current_debt/get_credit_limit
+    теперь async (await)."""
+    debt = await get_agent_current_debt(agent_id)
+    limit = await get_credit_limit(agent_id)
     projected = debt + order_total
     return {
         "current_debt": debt,

@@ -5,6 +5,8 @@ Smoke-тесты WebApp-эндпоинтов кредитных лимитов (
 (auth проверяется в test_auth.py). БД и роли — настоящие (isolated_db).
 """
 
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -58,7 +60,7 @@ def test_set_limit_persists(client_env):
         },
     )
     assert resp.status_code == 200, resp.text
-    assert db.get_credit_limit("agent-uuid") == 7500.0
+    assert asyncio.run(db.get_credit_limit("agent-uuid")) == 7500.0
 
 
 def test_manager_forbidden(client_env):

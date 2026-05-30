@@ -57,13 +57,16 @@ def run() -> None:
     db._create_indexes()
     db.run_backfills()
     db.set_role(MGR, "smoke_mgr", "SMOKE Manager", "manager")
-    db.ensure_credit_limit(AGENT, "SMOKE Клиент")
-    print(f"роль менеджера: {db.get_role(MGR)}; лимит {AGENT}: {db.get_credit_limit(AGENT)}")
+    asyncio.run(db.ensure_credit_limit(AGENT, "SMOKE Клиент"))
+    print(
+        f"роль менеджера: {db.get_role(MGR)}; "
+        f"лимит {AGENT}: {asyncio.run(db.get_credit_limit(AGENT))}"
+    )
 
     _h("1. Кредитный лимит на отгруженном заказе (долг 250)")
     o1 = _mk_order(250.0, 1, "shipped")
     created_orders.append(o1)
-    chk = db.check_credit_limit(AGENT, 1900.0)
+    chk = asyncio.run(db.check_credit_limit(AGENT, 1900.0))
     print(f"order #{o1} shipped, total 250")
     print(
         f"долг={chk['current_debt']}, лимит={chk['limit']}, "
@@ -85,7 +88,7 @@ def run() -> None:
     items = db.get_order_items(o2)
     print(
         f"order #{o2} shipped, total 200; долг агента до возврата="
-        f"{db.get_agent_current_debt(AGENT)}"
+        f"{asyncio.run(db.get_agent_current_debt(AGENT))}"
     )
     ret = asyncio.run(
         db.create_return(
@@ -101,7 +104,7 @@ def run() -> None:
     print(
         f"возврат #{ret['return_id']} подтверждён; статус #{o2} = "
         f"{db.get_order(o2)['status']}; долг агента после = "
-        f"{db.get_agent_current_debt(AGENT)}"
+        f"{asyncio.run(db.get_agent_current_debt(AGENT))}"
     )
 
     _h("4. Reject → draft + заморозка после 3 циклов")

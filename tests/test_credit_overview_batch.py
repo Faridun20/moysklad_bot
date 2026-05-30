@@ -63,7 +63,7 @@ def test_overview_debt_matches_single_agent_path(isolated_db):
     _order(db, "A-4", 80.0, status="pending")
 
     # A-3: только строка лимита, заказов нет → долг 0, но в сводке присутствует.
-    db.set_credit_limit("A-3", "VIP", 5000.0, set_by=1)
+    asyncio.run(db.set_credit_limit("A-3", "VIP", 5000.0, set_by=1))
 
     overview = asyncio.run(db.get_credit_overview())
     by_agent = {a["agent_id"]: a for a in overview}
@@ -71,7 +71,7 @@ def test_overview_debt_matches_single_agent_path(isolated_db):
     # Кросс-проверка обоих путей.
     for a in overview:
         assert a["debt"] == pytest.approx(
-            db.get_agent_current_debt(a["agent_id"])
+            asyncio.run(db.get_agent_current_debt(a["agent_id"]))
         ), f"расхождение долга у {a['agent_id']}"
 
     # Точные числа.
@@ -87,7 +87,7 @@ def test_overview_limits_free_and_sort(isolated_db):
     db = isolated_db
     o = _order(db, "A-OVER", 100.0)
     _ = o
-    db.set_credit_limit("A-OVER", "Client", 50.0, set_by=1)  # лимит < долга
+    asyncio.run(db.set_credit_limit("A-OVER", "Client", 50.0, set_by=1))  # лимит < долга
     _order(db, "A-UNDER", 100.0)  # дефолтный лимит 2000
 
     overview = asyncio.run(db.get_credit_overview())

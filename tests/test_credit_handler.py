@@ -89,7 +89,7 @@ def test_set_limit_via_flow(isolated_db):
     assert state._data.get("agent_id") == "AG-1"
 
     asyncio.run(process_limit_amount(_FakeMessage(text="5000", uid=2), state))
-    assert db.get_credit_limit("AG-1") == 5000.0
+    assert asyncio.run(db.get_credit_limit("AG-1")) == 5000.0
 
 
 def test_limit_denied_for_manager(isolated_db):
