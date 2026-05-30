@@ -2647,9 +2647,15 @@ def get_role(user_id: int) -> str:
         return "guest"
     with get_conn() as conn:
         cur = get_cursor(conn)
-        cur.execute(q("SELECT role FROM user_roles WHERE user_id = ?"), (uid,))
+        cur.execute(
+            q("SELECT role, deactivated_at FROM user_roles WHERE user_id = ?"), (uid,)
+        )
         row = cur.fetchone()
     if not row:
+        return "guest"
+    deactivated = row["deactivated_at"] if USE_POSTGRES else row[1]
+    if deactivated:
+        # Деактивированный пользователь теряет все права (#32).
         return "guest"
     return row["role"] if USE_POSTGRES else row[0]
 
@@ -2695,6 +2701,30 @@ def get_all_users() -> list[dict]:
         cur.execute("SELECT * FROM user_roles ORDER BY role, full_name")
         rows = cur.fetchall()
     return [dict(r) for r in rows]
+
+
+async def deactivate_user(user_id: int, by: int) -> bool:
+    """Деактивировать пользователя (#32): теряет все права (get_role → guest) и
+    уведомления. Идемпотентно (повторно — False). Роль в user_roles.role
+    сохраняется, чтобы восстановить при reactivate."""
+    rc = await adb_core.execute(
+        "UPDATE user_roles SET deactivated_at = $1, deactivated_by = $2 "
+        "WHERE user_id = $3 AND deactivated_at IS NULL",
+        now_str(), by, user_id,
+    )
+    _invalidate_role_cache(user_id)
+    return rc > 0
+
+
+async def reactivate_user(user_id: int, by: int) -> bool:
+    """Снять деактивацию — роль восстанавливается из сохранённого user_roles.role."""
+    rc = await adb_core.execute(
+        "UPDATE user_roles SET deactivated_at = NULL, deactivated_by = NULL "
+        "WHERE user_id = $1 AND deactivated_at IS NOT NULL",
+        user_id,
+    )
+    _invalidate_role_cache(user_id)
+    return rc > 0
 
 
 async def get_user(user_id: int) -> dict | None:
@@ -3032,6 +3062,44 @@ def prune_audit_log(retention_months: int = 6) -> int:
 
     cutoff = (datetime.now() - timedelta(days=retention_months * 30)).strftime("%Y-%m-%d %H:%M:%S")
     return _batched_delete("audit_log", "created_at < ?", (cutoff,))
+
+
+async def get_audit_log_before(before_iso: str) -> list[dict]:
+    """Записи аудита старше cutoff — для архивации ДО prune (#33)."""
+    return await adb_core.fetch(
+        "SELECT * FROM audit_log WHERE created_at < $1 ORDER BY created_at ASC", before_iso
+    )
+
+
+async def audit_archive_exists(period_end: str) -> bool:
+    """Был ли уже экспорт с таким period_end (идемпотентность архивации, #33)."""
+    return bool(
+        await adb_core.fetchval(
+            "SELECT 1 FROM audit_archive_exports WHERE period_end = $1 LIMIT 1", period_end
+        )
+    )
+
+
+async def record_audit_archive_export(
+    period_start: str,
+    period_end: str,
+    file_name: str,
+    drive_file_id: str,
+    drive_file_url: str,
+    records_count: int,
+    file_size_bytes: int,
+    exported_by: int = 0,
+) -> bool:
+    """Зафиксировать факт экспорта аудита в Drive/файл (#33)."""
+    rc = await adb_core.execute(
+        "INSERT INTO audit_archive_exports "
+        "(period_start, period_end, file_name, drive_file_id, drive_file_url, "
+        "records_count, file_size_bytes, exported_at, exported_by) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        period_start, period_end, file_name, drive_file_id, drive_file_url,
+        records_count, file_size_bytes, now_str(), exported_by,
+    )
+    return rc > 0
 
 
 def _batched_delete(table: str, where: str, params: tuple, batch: int = 5000) -> int:
