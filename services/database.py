@@ -1457,9 +1457,13 @@ async def get_stale_pending_orders(hours: int = 48) -> list[dict]:
 # (payment_confirmed=1). order total берём из get_order_payment_summary.
 
 
-def _order_total_cents(order_id: int) -> int:
-    """Сумма заказа в копейках (точно, из price_cents)."""
-    return int(get_order_payment_summary(order_id)["total_cents"])
+async def _order_total_cents(order_id: int) -> int:
+    """Сумма заказа в копейках (точно, из price_cents).
+
+    asyncpg Stage 17 (#21): native async; get_order_payment_summary пока sync
+    (общий read, флип в Stage 19) — мост через to_thread."""
+    summary = await asyncio.to_thread(get_order_payment_summary, order_id)
+    return int(summary["total_cents"])
 
 
 # SQL-фрагмент «распределено на заказ в копейках» — берёт amount_allocated_cents
@@ -1470,60 +1474,57 @@ _SUM_ALLOC_CENTS = (
 )
 
 
-def _order_confirmed_deposit_cents(order_id: int) -> int:
-    """Распределено на заказ ПОДТВЕРЖДЁННЫМИ сдачами, в копейках."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                f"SELECT {_SUM_ALLOC_CENTS} AS s FROM cash_deposit_orders cdo "
-                "JOIN cash_deposits d ON d.id = cdo.deposit_id "
-                "WHERE cdo.order_id = ? AND d.status = 'confirmed' AND (d.deleted_at IS NULL)"
-            ),
-            (order_id,),
+async def _order_confirmed_deposit_cents(order_id: int) -> int:
+    """Распределено на заказ ПОДТВЕРЖДЁННЫМИ сдачами, в копейках.
+
+    asyncpg Stage 17 (#21): native async через adb_core (fetchval)."""
+    return int(
+        await adb_core.fetchval(
+            f"SELECT {_SUM_ALLOC_CENTS} FROM cash_deposit_orders cdo "
+            "JOIN cash_deposits d ON d.id = cdo.deposit_id "
+            "WHERE cdo.order_id = $1 AND d.status = 'confirmed' AND (d.deleted_at IS NULL)",
+            order_id,
         )
-        row = cur.fetchone()
-    return int((row["s"] if USE_POSTGRES else row[0]) or 0)
+        or 0
+    )
 
 
-def _order_allocated_deposit_cents(order_id: int) -> int:
-    """Распределено на заказ pending+confirmed сдачами, в копейках (M3)."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                f"SELECT {_SUM_ALLOC_CENTS} AS s FROM cash_deposit_orders cdo "
-                "JOIN cash_deposits d ON d.id = cdo.deposit_id "
-                "WHERE cdo.order_id = ? AND d.status IN ('pending', 'confirmed') "
-                "AND (d.deleted_at IS NULL)"
-            ),
-            (order_id,),
+async def _order_allocated_deposit_cents(order_id: int) -> int:
+    """Распределено на заказ pending+confirmed сдачами, в копейках (M3).
+
+    asyncpg Stage 17 (#21): native async через adb_core (fetchval)."""
+    return int(
+        await adb_core.fetchval(
+            f"SELECT {_SUM_ALLOC_CENTS} FROM cash_deposit_orders cdo "
+            "JOIN cash_deposits d ON d.id = cdo.deposit_id "
+            "WHERE cdo.order_id = $1 AND d.status IN ('pending', 'confirmed') "
+            "AND (d.deleted_at IS NULL)",
+            order_id,
         )
-        row = cur.fetchone()
-    return int((row["s"] if USE_POSTGRES else row[0]) or 0)
+        or 0
+    )
 
 
-def get_manager_open_orders_for_deposit(manager_id: int) -> list[dict]:
+async def get_manager_open_orders_for_deposit(manager_id: int) -> list[dict]:
     """Отгруженные неоплаченные заказы менеджера (для распределения сдачи).
     Возвращает [{id, total, covered, remaining}] по возрастанию created_at.
     covered учитывает уже распределённое pending+confirmed-сдачами (M3).
 
     Остаток считаем в копейках (без float-эпсилона 0.01) — заказ попадает
-    в список, только если непокрытый остаток ≥ 1 копейки."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "SELECT id FROM orders WHERE user_id = ? AND status = 'shipped' "
-                "AND payment_confirmed = 0 AND (deleted_at IS NULL) ORDER BY created_at ASC"
-            ),
-            (manager_id,),
-        )
-        ids = [(r["id"] if USE_POSTGRES else r[0]) for r in cur.fetchall()]
+    в список, только если непокрытый остаток ≥ 1 копейки.
+
+    asyncpg Stage 17 (#21): native async; helpers _order_total_cents/
+    _order_allocated_deposit_cents теперь async (await)."""
+    rows = await adb_core.fetch(
+        "SELECT id FROM orders WHERE user_id = $1 AND status = 'shipped' "
+        "AND payment_confirmed = 0 AND (deleted_at IS NULL) ORDER BY created_at ASC",
+        manager_id,
+    )
+    ids = [r["id"] for r in rows]
     out = []
     for oid in ids:
-        total_cents = _order_total_cents(oid)
-        covered_cents = _order_allocated_deposit_cents(oid)
+        total_cents = await _order_total_cents(oid)
+        covered_cents = await _order_allocated_deposit_cents(oid)
         remaining_cents = total_cents - covered_cents
         if remaining_cents > 0:
             out.append(
@@ -1861,7 +1862,7 @@ def _invalidate_product_price_cache() -> None:
         _PRODUCT_PRICE_CACHE.clear()
 
 
-def create_cash_deposit(
+async def create_cash_deposit(
     manager_id: int,
     amount: float,
     allocations: list[tuple] | None = None,
@@ -1879,6 +1880,12 @@ def create_cash_deposit(
     распределения вне транзакции — два вызова видят одинаковый `remaining`,
     распределяют сверх лимита, аналитика по cash-flow завышается. На
     SQLite (локалка) advisory-lock'а нет, но там один-процессный сценарий.
+
+    asyncpg Stage 17 (#21): native async. advisory-lock + FIFO-расчёт
+    (await get_manager_open_orders_for_deposit, читает на отдельных connection'ах,
+    как и в sync-версии) + INSERT cash_deposits/cash_deposit_orders — в одной
+    adb_core.transaction(). INSERT-id: RETURNING (pg) / last_insert_rowid()
+    (sqlite). _validate_amount — pure (без DB), зовём напрямую.
     """
     ok, err = _validate_amount(amount)
     if not ok:
@@ -1887,18 +1894,17 @@ def create_cash_deposit(
     is_manual = allocations is not None
     allocs: list[tuple] = list(allocations) if allocations is not None else []
 
-    with get_conn() as conn:
-        cur = get_cursor(conn)
+    async with adb_core.transaction() as txn:
         if USE_POSTGRES:
             # Сериализуем FIFO-расчёт + INSERT по manager_id. pg_advisory_xact_lock
             # держится до конца транзакции, второй параллельный вызов ждёт.
-            cur.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                (f"cash_deposit:manager:{manager_id}",),
+            await txn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1))",
+                f"cash_deposit:manager:{manager_id}",
             )
         if not is_manual:
             left = amount
-            for o in get_manager_open_orders_for_deposit(manager_id):
+            for o in await get_manager_open_orders_for_deposit(manager_id):
                 if left <= 0:
                     break
                 take = min(o["remaining"], left)
@@ -1908,52 +1914,50 @@ def create_cash_deposit(
 
         amount_cents = money.to_cents(amount)
         if USE_POSTGRES:
-            cur.execute(
+            deposit_id = await txn.fetchval(
                 "INSERT INTO cash_deposits (manager_id, amount, amount_cents, deposited_at, status, created_at) "
-                "VALUES (%s, %s, %s, %s, 'pending', %s) RETURNING id",
-                (manager_id, amount, amount_cents, now_str(), now_str()),
+                "VALUES ($1, $2, $3, $4, 'pending', $5) RETURNING id",
+                manager_id, amount, amount_cents, now_str(), now_str(),
             )
-            deposit_id = cur.fetchone()["id"]
         else:
-            cur.execute(
+            await txn.execute(
                 "INSERT INTO cash_deposits (manager_id, amount, amount_cents, deposited_at, status, created_at) "
-                "VALUES (?, ?, ?, ?, 'pending', ?)",
-                (manager_id, amount, amount_cents, now_str(), now_str()),
+                "VALUES ($1, $2, $3, $4, 'pending', $5)",
+                manager_id, amount, amount_cents, now_str(), now_str(),
             )
-            deposit_id = cur.lastrowid
+            deposit_id = await txn.fetchval("SELECT last_insert_rowid()")
         for order_id, alloc in allocs:
-            cur.execute(
-                q(
-                    "INSERT INTO cash_deposit_orders (deposit_id, order_id, amount_allocated, amount_allocated_cents, is_manual) "
-                    "VALUES (?, ?, ?, ?, ?)"
-                ),
-                (deposit_id, order_id, alloc, money.to_cents(alloc), 1 if is_manual else 0),
+            await txn.execute(
+                "INSERT INTO cash_deposit_orders (deposit_id, order_id, amount_allocated, amount_allocated_cents, is_manual) "
+                "VALUES ($1, $2, $3, $4, $5)",
+                deposit_id, order_id, alloc, money.to_cents(alloc), 1 if is_manual else 0,
             )
-        conn.commit()
     return {"ok": True, "deposit_id": deposit_id, "allocations": allocs}
 
 
-def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_name: str = "") -> dict:
+async def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_name: str = "") -> dict:
     """Подтвердить сдачу (атомарно). Каждый покрытый заказ → 'paid'.
-    Возвращает {ok, closed_orders}."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "UPDATE cash_deposits SET status = 'confirmed', confirmed_by = ?, confirmed_at = ? "
-                "WHERE id = ? AND status = 'pending'"
-            ),
-            (confirmed_by, now_str(), deposit_id),
+    Возвращает {ok, closed_orders}.
+
+    asyncpg Stage 17 (#21): native async. UPDATE статуса сдачи + чтение
+    order_ids — adb_core (как раньше: коммит между ними). Per-order close —
+    своя adb_core.transaction() с SELECT ... FOR UPDATE и guard'ом
+    payment_confirmed=0 (паттерн как в mark_order_paid; параллельные confirm'ы
+    одного заказа не закроют дважды). Helpers/add_audit_log — await/to_thread."""
+    updated = (
+        await adb_core.execute(
+            "UPDATE cash_deposits SET status = 'confirmed', confirmed_by = $1, confirmed_at = $2 "
+            "WHERE id = $3 AND status = 'pending'",
+            confirmed_by, now_str(), deposit_id,
         )
-        updated = cur.rowcount > 0
-        conn.commit()
-        if not updated:
-            return {"ok": False, "error": "Сдача уже обработана"}
-        cur.execute(
-            q("SELECT order_id FROM cash_deposit_orders WHERE deposit_id = ?"),
-            (deposit_id,),
-        )
-        order_ids = [(r["order_id"] if USE_POSTGRES else r[0]) for r in cur.fetchall()]
+        > 0
+    )
+    if not updated:
+        return {"ok": False, "error": "Сдача уже обработана"}
+    rows = await adb_core.fetch(
+        "SELECT order_id FROM cash_deposit_orders WHERE deposit_id = $1", deposit_id
+    )
+    order_ids = [r["order_id"] for r in rows]
 
     closed = []
     for oid in order_ids:
@@ -1961,56 +1965,52 @@ def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_name: str
         # блокируем FOR UPDATE и закрываем тем же атомарным UPDATE с guard'ом
         # payment_confirmed=0 — параллельные подтверждения сдач по одному заказу
         # не закроют его дважды (паттерн как в mark_order_paid).
-        if _order_confirmed_deposit_cents(oid) >= _order_total_cents(oid):
-            with get_conn() as conn:
-                cur = get_cursor(conn)
+        if await _order_confirmed_deposit_cents(oid) >= await _order_total_cents(oid):
+            async with adb_core.transaction() as txn:
                 if USE_POSTGRES:
-                    cur.execute(
-                        q("SELECT payment_confirmed FROM orders WHERE id = ? FOR UPDATE"),
-                        (oid,),
-                    )
-                cur.execute(
-                    q(
-                        "UPDATE orders SET payment_confirmed = 1, payment_confirmed_at = ?, "
-                        "status = 'paid', updated_at = ? WHERE id = ? AND payment_confirmed = 0"
-                    ),
-                    (now_str(), now_str(), oid),
+                    await txn.fetchrow("SELECT payment_confirmed FROM orders WHERE id = $1 FOR UPDATE", oid)
+                rc = await txn.execute(
+                    "UPDATE orders SET payment_confirmed = 1, payment_confirmed_at = $1, "
+                    "status = 'paid', updated_at = $2 WHERE id = $3 AND payment_confirmed = 0",
+                    now_str(), now_str(), oid,
                 )
-                if cur.rowcount > 0:
+                if rc > 0:
                     closed.append(oid)
-                conn.commit()
-    add_audit_log(
+    await asyncio.to_thread(
+        add_audit_log,
         confirmed_by,
         confirmed_name,
-        get_role(confirmed_by),
+        await asyncio.to_thread(get_role, confirmed_by),
         "cash_deposit_confirmed",
         f"Сдача #{deposit_id} подтверждена; закрыты заказы: {closed or '—'}",
     )
     return {"ok": True, "closed_orders": closed}
 
 
-def reject_cash_deposit(deposit_id: int, rejected_by: int, rejected_name: str, reason: str) -> dict:
+async def reject_cash_deposit(
+    deposit_id: int, rejected_by: int, rejected_name: str, reason: str
+) -> dict:
+    """asyncpg Stage 17 (#21): native async через adb_core.execute; add_audit_log/
+    get_role (sync) — мост через to_thread."""
     # Round 6 (L_R8): clip reason — DB-колонка TEXT (unbounded), а сообщение
     # потом шлётся менеджеру через bot.send_message (Telegram-лимит 4096).
     # UI-валидация в webapp/server.py есть, но прямой бот-FSM вызов её обходит.
     reason = (reason or "").strip()[:500]
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "UPDATE cash_deposits SET status = 'rejected', reject_reason = ?, "
-                "confirmed_by = ?, confirmed_at = ? WHERE id = ? AND status = 'pending'"
-            ),
-            (reason, rejected_by, now_str(), deposit_id),
+    updated = (
+        await adb_core.execute(
+            "UPDATE cash_deposits SET status = 'rejected', reject_reason = $1, "
+            "confirmed_by = $2, confirmed_at = $3 WHERE id = $4 AND status = 'pending'",
+            reason, rejected_by, now_str(), deposit_id,
         )
-        updated = cur.rowcount > 0
-        conn.commit()
+        > 0
+    )
     if not updated:
         return {"ok": False, "error": "Сдача уже обработана"}
-    add_audit_log(
+    await asyncio.to_thread(
+        add_audit_log,
         rejected_by,
         rejected_name,
-        get_role(rejected_by),
+        await asyncio.to_thread(get_role, rejected_by),
         "cash_deposit_rejected",
         f"Сдача #{deposit_id} отклонена: {reason[:200]}",
     )

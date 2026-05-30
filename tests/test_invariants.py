@@ -35,10 +35,10 @@ def test_create_cash_deposit_rejects_nan_inf_and_too_large(isolated_db):
     db = isolated_db
     db.set_role(300, "mgr", "Manager", "manager")
     for bad in (float("nan"), float("inf"), -1.0, 0.0, 10_000_001.0, 1e308):
-        res = db.create_cash_deposit(300, bad)
+        res = asyncio.run(db.create_cash_deposit(300, bad))
         assert res["ok"] is False, f"должен быть отклонён: {bad!r}"
     # Граничные валидные — проходят.
-    ok = db.create_cash_deposit(300, 9_999_999.99)
+    ok = asyncio.run(db.create_cash_deposit(300, 9_999_999.99))
     assert ok["ok"] is True
 
 

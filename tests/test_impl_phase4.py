@@ -28,11 +28,11 @@ def mgr_orders(isolated_db):
 
 def test_auto_fifo_and_confirm_closes_covered_order(mgr_orders):
     db, mgr, o1, o2 = mgr_orders
-    res = db.create_cash_deposit(mgr, 200.0)  # авто-FIFO → весь на o1
+    res = asyncio.run(db.create_cash_deposit(mgr, 200.0))  # авто-FIFO → весь на o1
     assert res["ok"] is True
     assert res["allocations"] == [(o1, 200.0)]
 
-    conf = db.confirm_cash_deposit(res["deposit_id"], 1, "Boss")
+    conf = asyncio.run(db.confirm_cash_deposit(res["deposit_id"], 1, "Boss"))
     assert conf["ok"] is True
     assert conf["closed_orders"] == [o1]
     # o1 закрыт, o2 — нет.
@@ -43,19 +43,19 @@ def test_auto_fifo_and_confirm_closes_covered_order(mgr_orders):
 
 def test_partial_deposit_does_not_close(mgr_orders):
     db, mgr, o1, o2 = mgr_orders
-    res = db.create_cash_deposit(mgr, 100.0)  # < total o1 (200)
-    db.confirm_cash_deposit(res["deposit_id"], 1, "Boss")
+    res = asyncio.run(db.create_cash_deposit(mgr, 100.0))  # < total o1 (200)
+    asyncio.run(db.confirm_cash_deposit(res["deposit_id"], 1, "Boss"))
     assert db.get_order(o1)["status"] == "shipped"
     assert db.get_order(o1)["payment_confirmed"] == 0
     # Долить ещё 100 → закроется.
-    res2 = db.create_cash_deposit(mgr, 100.0)
-    db.confirm_cash_deposit(res2["deposit_id"], 1, "Boss")
+    res2 = asyncio.run(db.create_cash_deposit(mgr, 100.0))
+    asyncio.run(db.confirm_cash_deposit(res2["deposit_id"], 1, "Boss"))
     assert db.get_order(o1)["status"] == "paid"
 
 
 def test_manual_allocation(mgr_orders):
     db, mgr, o1, o2 = mgr_orders
-    res = db.create_cash_deposit(mgr, 150.0, allocations=[(o1, 100.0), (o2, 50.0)])
+    res = asyncio.run(db.create_cash_deposit(mgr, 150.0, allocations=[(o1, 100.0), (o2, 50.0)]))
     assert res["ok"] is True
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)
@@ -73,23 +73,23 @@ def test_manual_allocation(mgr_orders):
 
 def test_reject_deposit_keeps_orders_open(mgr_orders):
     db, mgr, o1, o2 = mgr_orders
-    res = db.create_cash_deposit(mgr, 200.0)
-    r = db.reject_cash_deposit(res["deposit_id"], 1, "Boss", "сумма не сошлась")
+    res = asyncio.run(db.create_cash_deposit(mgr, 200.0))
+    r = asyncio.run(db.reject_cash_deposit(res["deposit_id"], 1, "Boss", "сумма не сошлась"))
     assert r["ok"] is True
     assert db.get_order(o1)["status"] == "shipped"
     # Повторная обработка отклонённой → нельзя.
-    assert db.confirm_cash_deposit(res["deposit_id"], 1, "Boss")["ok"] is False
+    assert asyncio.run(db.confirm_cash_deposit(res["deposit_id"], 1, "Boss"))["ok"] is False
 
 
 def test_create_rejects_nonpositive_amount(mgr_orders):
     db, mgr, o1, o2 = mgr_orders
-    assert db.create_cash_deposit(mgr, 0)["ok"] is False
-    assert db.create_cash_deposit(mgr, -5)["ok"] is False
+    assert asyncio.run(db.create_cash_deposit(mgr, 0))["ok"] is False
+    assert asyncio.run(db.create_cash_deposit(mgr, -5))["ok"] is False
 
 
 def test_pending_list_and_overdue(mgr_orders):
     db, mgr, o1, o2 = mgr_orders
-    res = db.create_cash_deposit(mgr, 100.0)
+    res = asyncio.run(db.create_cash_deposit(mgr, 100.0))
     pending = asyncio.run(db.get_pending_cash_deposits())  # async после asyncpg Stage 5
     assert any(p["id"] == res["deposit_id"] for p in pending)
 
@@ -120,7 +120,7 @@ def test_deposit_paid_order_excluded_from_agent_debt(isolated_db):
     db.update_order_status(oid, "shipped")
     assert db.get_agent_current_debt("A-PAID") == 250.0
 
-    dep = db.create_cash_deposit(mgr, 250.0)
-    db.confirm_cash_deposit(dep["deposit_id"], 1, "Boss")
+    dep = asyncio.run(db.create_cash_deposit(mgr, 250.0))
+    asyncio.run(db.confirm_cash_deposit(dep["deposit_id"], 1, "Boss"))
     assert db.get_order(oid)["status"] == "paid"
     assert db.get_agent_current_debt("A-PAID") == 0.0
