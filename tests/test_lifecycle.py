@@ -13,10 +13,10 @@ def test_order_creation_and_status_flow(isolated_db):
     db = isolated_db
     db.set_role(1, "mgr", "Manager", "manager")
     oid = db.create_order(1, "Manager", "test")
-    o = db.get_order(oid)
+    o = asyncio.run(db.get_order(oid))
     assert o["status"] == "draft"
     db.update_order_status(oid, "approved")
-    assert db.get_order(oid)["status"] == "approved"
+    assert asyncio.run(db.get_order(oid))["status"] == "approved"
 
 
 def test_default_role_for_new_user_is_guest(isolated_db, monkeypatch):
@@ -76,12 +76,12 @@ def test_full_payment_closes_order(isolated_db):
     ok, pid = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=400))
     assert ok and pid
     # paid_at стоит, paid_confirmed_at — нет
-    o = db.get_order(oid)
+    o = asyncio.run(db.get_order(oid))
     assert o["paid_at"] is not None
     assert o["paid_confirmed_at"] is None
     # Босс подтверждает
     asyncio.run(db.confirm_payment(pid, 99, "Boss"))
-    o = db.get_order(oid)
+    o = asyncio.run(db.get_order(oid))
     assert o["paid_confirmed_at"] is not None
 
 
@@ -92,11 +92,11 @@ def test_partial_payments_close_when_sum_reaches_total(isolated_db):
     _, p1 = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=100))
     asyncio.run(db.confirm_payment(p1, 99, "Boss"))
     # После первого confirm заказ ещё открыт
-    assert db.get_order(oid)["paid_confirmed_at"] is None
+    assert asyncio.run(db.get_order(oid))["paid_confirmed_at"] is None
     _, p2 = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=300))
     asyncio.run(db.confirm_payment(p2, 99, "Boss"))
     # После второго закрыт
-    assert db.get_order(oid)["paid_confirmed_at"] is not None
+    assert asyncio.run(db.get_order(oid))["paid_confirmed_at"] is not None
 
 
 def test_overpay_is_capped_at_remaining(isolated_db):
@@ -107,7 +107,7 @@ def test_overpay_is_capped_at_remaining(isolated_db):
     # Пытаемся отметить ещё 200 — должно обрезаться до 100 (остаток)
     ok, p2 = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=200))
     assert ok
-    payment2 = db.get_payment(p2)
+    payment2 = asyncio.run(db.get_payment(p2))
     assert abs(float(payment2["amount"]) - 100) < 0.01
 
 
@@ -161,7 +161,7 @@ def test_backfill_does_not_close_partial_credit_debts(isolated_db, monkeypatch):
     _, pid = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=100))
     asyncio.run(db.confirm_payment(pid, 99, "Boss"))
     # Долг ещё открыт
-    assert db.get_order(oid)["paid_confirmed_at"] is None
+    assert asyncio.run(db.get_order(oid))["paid_confirmed_at"] is None
     # Прогон backfill+recovery — статус должен сохраниться
     db.run_backfills()
-    assert db.get_order(oid)["paid_confirmed_at"] is None
+    assert asyncio.run(db.get_order(oid))["paid_confirmed_at"] is None

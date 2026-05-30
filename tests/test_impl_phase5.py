@@ -19,7 +19,7 @@ def shipped_order(isolated_db):
     db.add_order_item(oid, "Товар A", "", 2, "шт", 100.0)
     db.add_order_item(oid, "Товар B", "", 1, "шт", 50.0)
     db.update_order_status(oid, "shipped")
-    items = db.get_order_items(oid)
+    items = asyncio.run(db.get_order_items(oid))
     return db, mgr, oid, items
 
 
@@ -43,9 +43,9 @@ def test_partial_return_sets_partially_returned(shipped_order):
     conf = asyncio.run(db.confirm_return(r["return_id"], 1, "Boss"))
     assert conf["ok"] is True
     assert conf["order_status"] == "partially_returned"
-    assert db.get_order(oid)["return_status"] == "partial"
+    assert asyncio.run(db.get_order(oid))["return_status"] == "partial"
     # returned_qty обновился у позиции A.
-    a = next(i for i in db.get_order_items(oid) if i["id"] == item_a["id"])
+    a = next(i for i in asyncio.run(db.get_order_items(oid)) if i["id"] == item_a["id"])
     assert float(a["returned_qty"]) == 1.0
 
 
@@ -55,7 +55,7 @@ def test_full_return_sets_returned(shipped_order):
     r = asyncio.run(db.create_return(oid, "full", "отказ", full, refund_method="cash", created_by=mgr))
     conf = asyncio.run(db.confirm_return(r["return_id"], 1, "Boss"))
     assert conf["order_status"] == "returned"
-    assert db.get_order(oid)["status"] == "returned"
+    assert asyncio.run(db.get_order(oid))["status"] == "returned"
 
 
 def test_cash_refund_creates_negative_deposit(shipped_order):
@@ -91,7 +91,7 @@ def test_return_blocked_for_draft(isolated_db):
     db.set_role(mgr, "m", "M", "manager")
     oid = db.create_order(mgr, "M", "")
     db.add_order_item(oid, "T", "", 1, "шт", 10.0)
-    items = db.get_order_items(oid)
+    items = asyncio.run(db.get_order_items(oid))
     r = asyncio.run(
         db.create_return(
             oid, "partial", "x", [(items[0]["id"], 1, 10.0)], refund_method="no_refund", created_by=mgr

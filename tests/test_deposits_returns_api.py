@@ -71,7 +71,7 @@ def test_deposit_pending_and_confirm(client_env):
         json={"initData": str(ids["boss"]), "deposit_id": dep["deposit_id"]},
     )
     assert resp.status_code == 200, resp.text
-    assert db.get_order(ids["order"])["status"] == "paid"
+    assert asyncio.run(db.get_order(ids["order"]))["status"] == "paid"
     assert fake_bot.sent  # менеджер уведомлён
 
 
@@ -124,7 +124,7 @@ def test_deposit_create_bad_amount(client_env):
 
 def test_returns_pending_and_confirm(client_env):
     client, db, ids, _ = client_env
-    items = db.get_order_items(ids["order"])
+    items = asyncio.run(db.get_order_items(ids["order"]))
     r = asyncio.run(
         db.create_return(
             ids["order"],
@@ -153,7 +153,7 @@ def test_returns_pending_and_confirm(client_env):
         json={"initData": str(ids["boss"]), "return_id": r["return_id"]},
     )
     assert resp.status_code == 200, resp.text
-    assert db.get_order(ids["order"])["status"] == "returned"
+    assert asyncio.run(db.get_order(ids["order"]))["status"] == "returned"
 
 
 def test_return_create_full(client_env):
@@ -244,7 +244,7 @@ def test_set_return_ms_id_second_call_loses_race(isolated_db):
     oid = db.create_order(mgr, "M", "")
     db.add_order_item(oid, "P", "", 1, "шт", 100.0)
     db.update_order_status(oid, "shipped")
-    items = db.get_order_items(oid)
+    items = asyncio.run(db.get_order_items(oid))
     r = asyncio.run(db.create_return(oid, "full", "брак", [(items[0]["id"], 1, 100.0)], "no_refund", mgr))
     assert r["ok"]
 
@@ -267,7 +267,7 @@ def test_create_return_blocks_second_pending_for_same_order(isolated_db):
     oid = db.create_order(mgr, "M", "")
     db.add_order_item(oid, "P", "", 2, "шт", 100.0)
     db.update_order_status(oid, "shipped")
-    items = db.get_order_items(oid)
+    items = asyncio.run(db.get_order_items(oid))
     r1 = asyncio.run(db.create_return(oid, "partial", "x", [(items[0]["id"], 1, 100.0)], "no_refund", mgr))
     assert r1["ok"]
     r2 = asyncio.run(db.create_return(oid, "partial", "x", [(items[0]["id"], 1, 100.0)], "no_refund", mgr))
@@ -288,7 +288,7 @@ def test_confirm_return_blocks_overshoot(isolated_db):
     oid = db.create_order(mgr, "M", "")
     db.add_order_item(oid, "P", "", 2, "шт", 100.0)
     db.update_order_status(oid, "shipped")
-    items = db.get_order_items(oid)
+    items = asyncio.run(db.get_order_items(oid))
 
     # Создаём первый возврат на полные 2 шт и подтверждаем.
     r1 = asyncio.run(db.create_return(oid, "full", "x", [(items[0]["id"], 2, 200.0)], "no_refund", mgr))

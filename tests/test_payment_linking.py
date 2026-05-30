@@ -70,12 +70,12 @@ def test_link_pending_payment_happy_path(isolated_db):
     db = isolated_db
     oid = _setup_order(db)
     pid = db.add_payment(100, "@m", "M", 50.0, "USD", "x")  # standalone
-    assert db.get_payment(pid)["order_id"] is None
+    assert asyncio.run(db.get_payment(pid))["order_id"] is None
     res = asyncio.run(db.link_payment_to_order(pid, oid, linked_by=99, linked_name="Boss"))
     assert res["ok"] is True
     assert res["ms_sync_triggered"] is False  # pending → не sync'аем
     assert res["order_closed"] is False
-    assert db.get_payment(pid)["order_id"] == oid
+    assert asyncio.run(db.get_payment(pid))["order_id"] == oid
 
 
 def test_link_confirmed_payment_triggers_ms_sync(isolated_db, monkeypatch):
@@ -85,7 +85,7 @@ def test_link_confirmed_payment_triggers_ms_sync(isolated_db, monkeypatch):
     pid = db.add_payment(100, "@m", "M", 50.0, "USD", "x")
     # Подтверждаем БЕЗ order_id — это standalone confirmed
     asyncio.run(db.confirm_payment(pid, 99, "Boss"))
-    assert db.get_payment(pid)["status"] == "confirmed"
+    assert asyncio.run(db.get_payment(pid))["status"] == "confirmed"
 
     sync_called = []
     monkeypatch.setattr(
@@ -111,7 +111,7 @@ def test_link_confirmed_payment_closes_order_if_total_reached(isolated_db, monke
     res = asyncio.run(db.link_payment_to_order(pid, oid, linked_by=99, linked_name="Boss"))
     assert res["ok"] is True
     assert res["order_closed"] is True
-    assert db.get_order(oid).get("paid_confirmed_at") is not None
+    assert asyncio.run(db.get_order(oid)).get("paid_confirmed_at") is not None
 
 
 def test_link_writes_audit_log(isolated_db):
@@ -251,7 +251,7 @@ def test_link_endpoint_happy_path(client_env, monkeypatch):
     assert body["ok"] is True
     assert body["ms_sync_triggered"] is True
     assert body["order_closed"] is True
-    assert db.get_payment(pid)["order_id"] == oid
+    assert asyncio.run(db.get_payment(pid))["order_id"] == oid
 
 
 def test_link_endpoint_409_on_already_linked(client_env):

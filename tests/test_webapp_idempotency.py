@@ -63,7 +63,7 @@ def test_mark_paid_idempotent_double_click(client_env):
     r2 = client.post("/api/orders/mark_paid", json=body)
     assert r2.status_code == 200, r2.text
     assert r2.json()["payment_id"] == pid1
-    assert len(db.get_payments_for_order(ids["order"])) == 1
+    assert len(asyncio.run(db.get_payments_for_order(ids["order"]))) == 1
 
 
 def test_mark_paid_distinct_keys_create_two(client_env):
@@ -72,4 +72,4 @@ def test_mark_paid_distinct_keys_create_two(client_env):
     client.post("/api/orders/mark_paid", json={**base, "idempotency_key": "A"})
     client.post("/api/orders/mark_paid", json={**base, "idempotency_key": "B"})
     # Разные ключи = разные намерения → два платежа.
-    assert len(db.get_payments_for_order(ids["order"])) == 2
+    assert len(asyncio.run(db.get_payments_for_order(ids["order"]))) == 2

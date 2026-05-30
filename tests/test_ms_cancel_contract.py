@@ -81,7 +81,7 @@ def test_reverse_success_deletes_and_marks_synced(isolated_db, monkeypatch):
 
     res = asyncio.run(scenario())
     assert res["ok"] is True and res.get("ms_id") == "CO-XYZ", res
-    assert db.get_order(oid)["ms_cancel_synced_at"] is not None
+    assert asyncio.run(db.get_order(oid))["ms_cancel_synced_at"] is not None
 
 
 def test_reverse_http_error_is_best_effort(isolated_db, monkeypatch):
@@ -104,4 +104,4 @@ def test_reverse_http_error_is_best_effort(isolated_db, monkeypatch):
     res = asyncio.run(scenario())
     assert res["ok"] is False
     # synced НЕ ставим — best-effort, отмена в БД при этом не затронута.
-    assert db.get_order(oid)["ms_cancel_synced_at"] is None
+    assert asyncio.run(db.get_order(oid))["ms_cancel_synced_at"] is None

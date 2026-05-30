@@ -122,7 +122,7 @@ def test_full_return_flow_creates_and_confirms(isolated_db):
     bot2 = _FakeBot()
     conf_call = _FakeCall(f"ret_ok:{return_id}", uid=2, bot=bot2)
     asyncio.run(cb_return_confirm(conf_call, bot2))
-    assert db.get_order(oid)["status"] == "returned"  # полный возврат
+    assert asyncio.run(db.get_order(oid))["status"] == "returned"  # полный возврат
 
 
 def test_return_blocked_for_non_shipped(isolated_db):
@@ -143,7 +143,7 @@ def test_confirm_return_denied_for_manager(isolated_db):
     from handlers.returns import cb_return_confirm
 
     oid = _setup(db)
-    items = db.get_order_items(oid)
+    items = asyncio.run(db.get_order_items(oid))
     r = asyncio.run(
         db.create_return(
             oid, "full", "x", [(items[0]["id"], 2, 200.0)], refund_method="no_refund", created_by=1
@@ -152,4 +152,4 @@ def test_confirm_return_denied_for_manager(isolated_db):
     call = _FakeCall(f"ret_ok:{r['return_id']}", uid=1)  # менеджер не вправе
     asyncio.run(cb_return_confirm(call, _FakeBot()))
     assert any("доступа" in (a[0] or "").lower() for a in call.alerts)
-    assert db.get_order(oid)["status"] == "shipped"  # не подтверждён
+    assert asyncio.run(db.get_order(oid))["status"] == "shipped"  # не подтверждён

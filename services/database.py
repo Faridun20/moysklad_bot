@@ -1132,7 +1132,7 @@ async def get_agent_current_debt(agent_id: str) -> float:
     order_ids = [r["id"] for r in rows]
     debt_cents = 0
     for oid in order_ids:
-        summary = await asyncio.to_thread(get_order_payment_summary, oid)
+        summary = await get_order_payment_summary(oid)
         returns_cents = int(
             await adb_core.fetchval(
                 f"SELECT {_SUM_RETURNS_CENTS} FROM returns "
@@ -1314,7 +1314,7 @@ async def reject_order_to_draft(
     get_role (sync money-core) — мост через to_thread; атомарный UPDATE —
     adb_core.execute (rowcount-guard сохранён).
     """
-    order = await asyncio.to_thread(get_order, order_id)
+    order = await get_order(order_id)
     if not order:
         return {"ok": False, "error": "Заказ не найден"}
     if order.get("status") != "pending":
@@ -1360,7 +1360,7 @@ async def mark_order_shipped(order_id: int, shipped_by: int, shipped_name: str) 
     asyncpg Stage 16 (#21): native async. get_order/add_audit_log/get_role
     (sync money-core) — мост через to_thread; атомарный UPDATE — adb_core.execute.
     """
-    order = await asyncio.to_thread(get_order, order_id)
+    order = await get_order(order_id)
     if not order:
         return {"ok": False, "error": "Заказ не найден"}
     if order.get("status") != "approved":
@@ -1404,7 +1404,7 @@ async def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, re
 
     asyncpg Stage 16 (#21): native async. get_order/add_audit_log/get_role
     (sync money-core) — мост через to_thread; атомарный UPDATE — adb_core.execute."""
-    order = await asyncio.to_thread(get_order, order_id)
+    order = await get_order(order_id)
     if not order:
         return {"ok": False, "error": "Заказ не найден"}
     status = order.get("status")
@@ -1464,7 +1464,7 @@ async def _order_total_cents(order_id: int) -> int:
 
     asyncpg Stage 17 (#21): native async; get_order_payment_summary пока sync
     (общий read, флип в Stage 19) — мост через to_thread."""
-    summary = await asyncio.to_thread(get_order_payment_summary, order_id)
+    summary = await get_order_payment_summary(order_id)
     return int(summary["total_cents"])
 
 
@@ -2240,7 +2240,7 @@ async def is_order_returnable(order_id: int) -> bool:
 
     asyncpg Stage 14 (#21): native async; get_order пока sync (money-core) — мост
     через to_thread, заменится на `await get_order(...)` в финальной money-стадии."""
-    order = await asyncio.to_thread(get_order, order_id)
+    order = await get_order(order_id)
     if order is None:
         return False
     return _is_returnable(order)
@@ -2265,7 +2265,7 @@ async def create_return(
     «до блокировки»); критическая секция (advisory-lock + dup-check + INSERT) —
     adb_core.transaction() (advisory-xact-lock держится до конца tx, как раньше).
     """
-    order = await asyncio.to_thread(get_order, order_id)
+    order = await get_order(order_id)
     if not order:
         return {"ok": False, "error": "Заказ не найден"}
     if not _is_returnable(order):
@@ -2288,7 +2288,7 @@ async def create_return(
     # считаем сумму строки из price_cents (источник истины), а не из float price
     # и не доверяя переданному amount. Это read-only прикидка; финальную защиту
     # от overshoot даёт атомарный guard в confirm_return.
-    oitems = {it["id"]: it for it in await asyncio.to_thread(get_order_items, order_id)}
+    oitems = {it["id"]: it for it in await get_order_items(order_id)}
     clamped: list[tuple] = []  # (order_item_id, take_qty, line_cents)
     for oitem_id, qty, _amount in items:
         oi = oitems.get(oitem_id)
@@ -2415,7 +2415,7 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
 
     order_id = ret["order_id"]
     # Полностью ли возвращён заказ?
-    items = await asyncio.to_thread(get_order_items, order_id)
+    items = await get_order_items(order_id)
     fully = (
         all(
             float(it.get("returned_qty") or 0) + 1e-9 >= float(it.get("quantity") or 0)
@@ -2433,7 +2433,7 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
 
     # Refund: cash → отрицательная подтверждённая сдача (учёт выдачи из кассы).
     if ret.get("refund_method") == "cash":
-        order = await asyncio.to_thread(get_order, order_id)
+        order = await get_order(order_id)
         await adb_core.execute(
             "INSERT INTO cash_deposits (manager_id, amount, amount_cents, deposited_at, "
             "status, confirmed_by, confirmed_at, notes, created_at) "
@@ -2785,15 +2785,13 @@ def add_payment(
     return payment_id
 
 
-def get_payments_for_order(order_id: int) -> list[dict]:
-    """Все платежи привязанные к заказу (включая pending/rejected/archived)."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("SELECT * FROM payments WHERE order_id = ? ORDER BY created_at ASC"),
-            (order_id,),
-        )
-        return [dict(r) for r in cur.fetchall()]
+async def get_payments_for_order(order_id: int) -> list[dict]:
+    """Все платежи привязанные к заказу (включая pending/rejected/archived).
+
+    asyncpg Stage 19 (#21): native async (fetch)."""
+    return await adb_core.fetch(
+        "SELECT * FROM payments WHERE order_id = $1 ORDER BY created_at ASC", order_id
+    )
 
 
 async def get_payments_for_orders(order_ids: list[int]) -> dict[int, list[dict]]:
@@ -2849,7 +2847,7 @@ _SUM_RETURNS_CENTS = (
 )
 
 
-def get_order_payment_summary(order_id: int) -> dict:
+async def get_order_payment_summary(order_id: int) -> dict:
     """Сумма по заказу: total / confirmed / pending / remaining.
 
     Используется для отображения «оплачено X из Y, остаток Z» и для
@@ -2858,16 +2856,20 @@ def get_order_payment_summary(order_id: int) -> dict:
     Дополнительно (PR #42): `*_base` поля — пересчёт в BASE_CURRENCY через
     `convert_to_base`. None если курс валюты заказа не задан в админке;
     UI может в этом случае показать «—» вместо враного «$0.00».
+
+    asyncpg Stage 19 (#21): native async; get_order/get_order_items/
+    get_payments_for_order теперь async (await). convert_to_base — кэшированный
+    read-хелпер (категория get_setting), зовём прямым sync-вызовом.
     """
     from config import BASE_CURRENCY
 
-    order = get_order(order_id)
+    order = await get_order(order_id)
     if not order:
         return {"total": 0.0, "confirmed": 0.0, "pending": 0.0, "remaining": 0.0}
-    items = get_order_items(order_id)
+    items = await get_order_items(order_id)
     # Считаем в копейках (точно), с фолбэком на старый REAL для не-забэкфилленных строк.
     total_cents = sum(money.mul_qty(_price_cents(it), it.get("quantity", 0) or 0) for it in items)
-    payments = get_payments_for_order(order_id)
+    payments = await get_payments_for_order(order_id)
     confirmed_cents = sum(_amount_cents(p) for p in payments if p["status"] == "confirmed")
     pending_cents = sum(_amount_cents(p) for p in payments if p["status"] == "pending")
     remaining_cents = max(0, total_cents - confirmed_cents)
@@ -3584,7 +3586,7 @@ async def confirm_payment(
     )
     if rc <= 0:
         return False
-    payment = await asyncio.to_thread(get_payment, payment_id)
+    payment = await get_payment(payment_id)
     if confirmed_by and payment:
         await asyncio.to_thread(
             add_audit_log,
@@ -3641,7 +3643,7 @@ async def link_payment_to_order(
     if not payment_id or not order_id:
         return {"ok": False, "error": "payment_id и order_id обязательны"}
 
-    payment = await asyncio.to_thread(get_payment, payment_id)
+    payment = await get_payment(payment_id)
     if not payment:
         return {"ok": False, "error": "Платёж не найден"}
     if payment.get("order_id"):
@@ -3649,7 +3651,7 @@ async def link_payment_to_order(
             "ok": False,
             "error": f"Платёж уже привязан к заказу #{payment['order_id']}",
         }
-    order = await asyncio.to_thread(get_order, order_id)
+    order = await get_order(order_id)
     if not order:
         return {"ok": False, "error": "Заказ не найден"}
     if order.get("deleted_at"):
@@ -3667,7 +3669,7 @@ async def link_payment_to_order(
     if rc <= 0:
         # Кто-то между нашими read и UPDATE прилинковал другой заказ.
         # Перечитываем чтобы вернуть оператору актуальную картину.
-        fresh = await asyncio.to_thread(get_payment, payment_id)
+        fresh = await get_payment(payment_id)
         return {
             "ok": False,
             "error": f"Параллельная привязка: платёж уже принадлежит заказу #{fresh.get('order_id') if fresh else '?'}",
@@ -3690,7 +3692,7 @@ async def link_payment_to_order(
     if payment.get("status") == "confirmed":
         await _maybe_close_order_after_payment(order_id, linked_by, linked_name)
         # Проверяем статус заказа после _maybe_close.
-        updated_order = await asyncio.to_thread(get_order, order_id)
+        updated_order = await get_order(order_id)
         if updated_order and updated_order.get("paid_confirmed_at"):
             result["order_closed"] = True
         _trigger_ms_paymentin_sync(payment_id)
@@ -3886,7 +3888,7 @@ async def reject_payment(
     )
     updated = rc > 0
     if updated and rejected_by:
-        payment = await asyncio.to_thread(get_payment, payment_id)
+        payment = await get_payment(payment_id)
         if payment:
             await asyncio.to_thread(
                 add_audit_log,
@@ -3905,7 +3907,7 @@ async def archive_payment(payment_id: int, archived_by: int, archived_name: str)
     rc = await adb_core.execute("UPDATE payments SET status = 'archived' WHERE id = $1", payment_id)
     updated = rc > 0
     if updated:
-        payment = await asyncio.to_thread(get_payment, payment_id)
+        payment = await get_payment(payment_id)
         if payment:
             await asyncio.to_thread(
                 add_audit_log,
@@ -3918,16 +3920,10 @@ async def archive_payment(payment_id: int, archived_by: int, archived_name: str)
     return updated
 
 
-def get_payment(payment_id: int) -> dict | None:
-    # NB: остаётся SYNC — отложено до money-core стадии. Внутри database.py
-    # его читают sync-функции confirm_payment / link_payment_to_order (см.
-    # ниже), поэтому конвертация get_payment тянет за собой денежное ядро.
-    # Внешние async-вызовы идут через `await adb.get_payment(...)` (to_thread).
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q("SELECT * FROM payments WHERE id = ?"), (payment_id,))
-        row = cur.fetchone()
-    return dict(row) if row else None
+async def get_payment(payment_id: int) -> dict | None:
+    """asyncpg Stage 19 (#21): native async (fetchrow). Денежное ядро (confirm/
+    link/reject/archive_payment) уже async и зовёт это через await."""
+    return await adb_core.fetchrow("SELECT * FROM payments WHERE id = $1", payment_id)
 
 
 async def get_payments_report(since: str | None = None, until: str | None = None) -> list[dict]:
@@ -4058,12 +4054,10 @@ def create_order(user_id: int, full_name: str, comment: str = "") -> int:
     return order_id
 
 
-def get_order(order_id: int) -> dict | None:
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q("SELECT * FROM orders WHERE id = ?"), (order_id,))
-        row = cur.fetchone()
-    return dict(row) if row else None
+async def get_order(order_id: int) -> dict | None:
+    """asyncpg Stage 19 (#21): native async (fetchrow). Общий read order/payment-
+    ядра — все to_thread-мосты к нему сняты в этой стадии."""
+    return await adb_core.fetchrow("SELECT * FROM orders WHERE id = $1", order_id)
 
 
 async def get_orders_by_ids(order_ids: list[int]) -> dict[int, dict]:
@@ -4386,7 +4380,7 @@ async def confirm_all_pending_payments_for_order(
     asyncpg Stage 15 (#21): native async; confirm_payment теперь async (await);
     get_payments_for_order (sync read) — мост через to_thread.
     """
-    payments = await asyncio.to_thread(get_payments_for_order, order_id)
+    payments = await get_payments_for_order(order_id)
     pending = [p for p in payments if p["status"] == "pending"]
     n = 0
     for p in pending:
@@ -4404,7 +4398,7 @@ async def reject_all_pending_payments_for_order(
 
     asyncpg Stage 15 (#21): native async; reject_payment теперь async (await);
     get_payments_for_order (sync read) — мост через to_thread."""
-    payments = await asyncio.to_thread(get_payments_for_order, order_id)
+    payments = await get_payments_for_order(order_id)
     pending = [p for p in payments if p["status"] == "pending"]
     n = 0
     for p in pending:
@@ -4441,7 +4435,7 @@ async def confirm_payment_received(
     )
     updated = rc > 0
     if updated:
-        order = await asyncio.to_thread(get_order, order_id)
+        order = await get_order(order_id)
         details = (
             f"Получение денег по заказу #{order_id} подтверждено "
             f"(клиент: {order.get('agent_name') or '—'}, "
@@ -4485,7 +4479,7 @@ async def reject_payment_received(
     )
     updated = rc > 0
     if updated:
-        order = await asyncio.to_thread(get_order, order_id)
+        order = await get_order(order_id)
         details = (
             f"Подтверждение оплаты #{order_id} отклонено "
             f"(клиент: {order.get('agent_name') or '—'}, "
@@ -4653,12 +4647,9 @@ def add_order_item(
     return item_id
 
 
-def get_order_items(order_id: int) -> list[dict]:
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q("SELECT * FROM order_items WHERE order_id = ?"), (order_id,))
-        rows = cur.fetchall()
-    return [dict(r) for r in rows]
+async def get_order_items(order_id: int) -> list[dict]:
+    """asyncpg Stage 19 (#21): native async (fetch)."""
+    return await adb_core.fetch("SELECT * FROM order_items WHERE order_id = $1", order_id)
 
 
 async def get_order_items_by_ids(order_ids: list[int]) -> dict[int, list[dict]]:

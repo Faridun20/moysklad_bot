@@ -79,13 +79,13 @@ def run() -> None:
     conf = asyncio.run(db.confirm_cash_deposit(dep["deposit_id"], BOSS, "SMOKE Boss"))
     print(
         f"подтверждена; закрыты заказы={conf['closed_orders']}; "
-        f"статус #{o1} = {db.get_order(o1)['status']}"
+        f"статус #{o1} = {asyncio.run(db.get_order(o1))['status']}"
     )
 
     _h("3. Возврат уменьшает долг (partial return, debt_reduction)")
     o2 = _mk_order(200.0, 2, "shipped")
     created_orders.append(o2)
-    items = db.get_order_items(o2)
+    items = asyncio.run(db.get_order_items(o2))
     print(
         f"order #{o2} shipped, total 200; долг агента до возврата="
         f"{asyncio.run(db.get_agent_current_debt(AGENT))}"
@@ -103,7 +103,7 @@ def run() -> None:
     asyncio.run(db.confirm_return(ret["return_id"], BOSS, "SMOKE Boss"))
     print(
         f"возврат #{ret['return_id']} подтверждён; статус #{o2} = "
-        f"{db.get_order(o2)['status']}; долг агента после = "
+        f"{asyncio.run(db.get_order(o2))['status']}; долг агента после = "
         f"{asyncio.run(db.get_agent_current_debt(AGENT))}"
     )
 
@@ -115,7 +115,7 @@ def run() -> None:
         print(f"reject {i}: count={r['rejection_count']}, frozen={r['frozen']}")
         if i < 3:
             db.update_order_status(o3, "pending")
-    print(f"итог: frozen={db.get_order(o3)['frozen']}")
+    print(f"итог: frozen={asyncio.run(db.get_order(o3))['frozen']}")
 
     _h("5. Зависшие pending")
     o4 = _mk_order(100.0, 1, "pending")

@@ -3,6 +3,8 @@ Smoke-тесты WebApp-эндпоинта отмены заказа (/api/order
 FastAPI TestClient; мок границ verify_init_data/get_notify_bot, БД/роли настоящие.
 """
 
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -54,7 +56,7 @@ def test_cancel_approved_notifies_creator(client_env):
         json={"initData": str(ids["boss"]), "order_id": ids["order"], "reason": "клиент отказался"},
     )
     assert resp.status_code == 200, resp.text
-    assert db.get_order(ids["order"])["status"] == "cancelled"
+    assert asyncio.run(db.get_order(ids["order"]))["status"] == "cancelled"
 
 
 def test_cancel_requires_reason(client_env):
@@ -73,7 +75,7 @@ def test_cancel_forbidden_for_manager(client_env):
         json={"initData": str(ids["mgr"]), "order_id": ids["order"], "reason": "повод нормальный"},
     )
     assert resp.status_code == 403
-    assert db.get_order(ids["order"])["status"] == "approved"
+    assert asyncio.run(db.get_order(ids["order"]))["status"] == "approved"
 
 
 def test_cancel_shipped_conflict(client_env):

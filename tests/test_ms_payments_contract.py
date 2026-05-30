@@ -90,7 +90,7 @@ def test_paymentin_fails_without_agent_on_order(isolated_db, monkeypatch):
     assert res["ok"] is False
     assert "agent_id" in res["reason"]
     # И в БД статус помечен failed с этой причиной
-    stored = db.get_payment(pid)
+    stored = asyncio.run(db.get_payment(pid))
     assert stored["ms_sync_status"] == "failed"
 
 
@@ -138,7 +138,7 @@ def test_paymentin_success_with_customerorder(isolated_db, monkeypatch):
     assert res["ok"] is True, res
     assert res["paymentin_id"] == "PI-NEW"
     # И в БД сохранён id
-    stored = db.get_payment(pid)
+    stored = asyncio.run(db.get_payment(pid))
     assert stored["ms_paymentin_id"] == "PI-NEW"
     assert stored["ms_sync_status"] == "synced"
 
@@ -232,7 +232,7 @@ def test_paymentin_handles_ms_400_error(isolated_db, monkeypatch):
     res = asyncio.run(scenario())
     assert res["ok"] is False
     assert "HTTP 400" in res["reason"]
-    stored = db.get_payment(pid)
+    stored = asyncio.run(db.get_payment(pid))
     assert stored["ms_sync_status"] == "failed"
     assert "HTTP 400" in stored["ms_sync_error"]
 
@@ -262,5 +262,5 @@ def test_paymentin_fails_when_currency_not_in_ms(isolated_db, monkeypatch):
     res = asyncio.run(scenario())
     assert res["ok"] is False
     assert "Валюта USD" in res["reason"]
-    stored = db.get_payment(pid)
+    stored = asyncio.run(db.get_payment(pid))
     assert stored["ms_sync_status"] == "failed"

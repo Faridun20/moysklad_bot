@@ -36,21 +36,21 @@ def test_auto_fifo_and_confirm_closes_covered_order(mgr_orders):
     assert conf["ok"] is True
     assert conf["closed_orders"] == [o1]
     # o1 закрыт, o2 — нет.
-    assert db.get_order(o1)["status"] == "paid"
-    assert db.get_order(o1)["payment_confirmed"] == 1
-    assert db.get_order(o2)["status"] == "shipped"
+    assert asyncio.run(db.get_order(o1))["status"] == "paid"
+    assert asyncio.run(db.get_order(o1))["payment_confirmed"] == 1
+    assert asyncio.run(db.get_order(o2))["status"] == "shipped"
 
 
 def test_partial_deposit_does_not_close(mgr_orders):
     db, mgr, o1, o2 = mgr_orders
     res = asyncio.run(db.create_cash_deposit(mgr, 100.0))  # < total o1 (200)
     asyncio.run(db.confirm_cash_deposit(res["deposit_id"], 1, "Boss"))
-    assert db.get_order(o1)["status"] == "shipped"
-    assert db.get_order(o1)["payment_confirmed"] == 0
+    assert asyncio.run(db.get_order(o1))["status"] == "shipped"
+    assert asyncio.run(db.get_order(o1))["payment_confirmed"] == 0
     # Долить ещё 100 → закроется.
     res2 = asyncio.run(db.create_cash_deposit(mgr, 100.0))
     asyncio.run(db.confirm_cash_deposit(res2["deposit_id"], 1, "Boss"))
-    assert db.get_order(o1)["status"] == "paid"
+    assert asyncio.run(db.get_order(o1))["status"] == "paid"
 
 
 def test_manual_allocation(mgr_orders):
@@ -76,7 +76,7 @@ def test_reject_deposit_keeps_orders_open(mgr_orders):
     res = asyncio.run(db.create_cash_deposit(mgr, 200.0))
     r = asyncio.run(db.reject_cash_deposit(res["deposit_id"], 1, "Boss", "сумма не сошлась"))
     assert r["ok"] is True
-    assert db.get_order(o1)["status"] == "shipped"
+    assert asyncio.run(db.get_order(o1))["status"] == "shipped"
     # Повторная обработка отклонённой → нельзя.
     assert asyncio.run(db.confirm_cash_deposit(res["deposit_id"], 1, "Boss"))["ok"] is False
 
@@ -122,5 +122,5 @@ def test_deposit_paid_order_excluded_from_agent_debt(isolated_db):
 
     dep = asyncio.run(db.create_cash_deposit(mgr, 250.0))
     asyncio.run(db.confirm_cash_deposit(dep["deposit_id"], 1, "Boss"))
-    assert db.get_order(oid)["status"] == "paid"
+    assert asyncio.run(db.get_order(oid))["status"] == "paid"
     assert asyncio.run(db.get_agent_current_debt("A-PAID")) == 0.0

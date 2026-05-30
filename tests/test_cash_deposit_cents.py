@@ -26,7 +26,7 @@ def test_cash_deposit_closes_on_exact_cents_coverage(isolated_db):
     assert res["ok"], res
     cres = asyncio.run(db.confirm_cash_deposit(res["deposit_id"], 1, "Boss"))
     assert oid in cres["closed_orders"]
-    assert db.get_order(oid)["payment_confirmed"] == 1
+    assert asyncio.run(db.get_order(oid))["payment_confirmed"] == 1
 
 
 def test_cash_deposit_not_closed_when_one_cent_short(isolated_db):
@@ -38,7 +38,7 @@ def test_cash_deposit_not_closed_when_one_cent_short(isolated_db):
     cres = asyncio.run(db.confirm_cash_deposit(res["deposit_id"], 1, "Boss"))
     # 1 копейка не покрыта → заказ НЕ закрываем (раньше +0.01 эпсилон закрывал).
     assert oid not in cres["closed_orders"]
-    assert db.get_order(oid)["payment_confirmed"] == 0
+    assert asyncio.run(db.get_order(oid))["payment_confirmed"] == 0
 
 
 def test_open_orders_for_deposit_remaining_in_cents(isolated_db):

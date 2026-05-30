@@ -95,7 +95,7 @@ async def create_paymentin_for_payment(payment_id: int) -> dict:
         {"ok": True,  "paymentin_id": "...", "url": "..."}
         {"ok": False, "reason": "..."}
     """
-    payment = get_payment(payment_id)
+    payment = await get_payment(payment_id)
     if not payment:
         return {"ok": False, "reason": "Платёж не найден в БД"}
     if not payment.get("order_id"):
@@ -118,7 +118,7 @@ async def create_paymentin_for_payment(payment_id: int) -> dict:
             "concurrent": True,
         }
 
-    order = get_order(payment["order_id"])
+    order = await get_order(payment["order_id"])
     if not order:
         msg = "Заказ-родитель не найден"
         set_payment_ms_sync(payment_id, status="failed", error=msg)
