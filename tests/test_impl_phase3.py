@@ -153,38 +153,15 @@ def test_compute_resubmit_summary_price_change_detected():
     assert s["total_diff_cents"] == 1
 
 
-# ─── Отмена в окно + зависшие pending ────────────────────────────────────────
+# ─── Отмена + зависшие pending ───────────────────────────────────────────────
 
 
-def test_cancel_approved_within_window(isolated_db):
+def test_cancel_approved_works(isolated_db):
+    """Отмена approved-заказа проходит. (M2: окно cancellation_deadline убрано —
+    поле нигде не заполнялось, проверка была мёртвой; столбец удалён.)"""
     db = isolated_db
     oid, mgr = _agent_order(db, 100.0, status="approved", agent="A-7")
-    # Дедлайн в будущем → отмена проходит.
-    from datetime import datetime, timedelta
-
-    future = (datetime.now() + timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S")
-    with db.get_conn() as conn:
-        cur = db.get_cursor(conn)
-        cur.execute(db.q("UPDATE orders SET cancellation_deadline = ? WHERE id = ?"), (future, oid))
-        conn.commit()
     r = asyncio.run(db.cancel_order(oid, 1, "Boss", "клиент передумал"))
-    assert r["ok"] is True
-    assert asyncio.run(db.get_order(oid))["status"] == "cancelled"
-
-
-def test_cancel_ignores_legacy_deadline(isolated_db):
-    """M2: окно отмены убрано (поле нигде не заполнялось — проверка была мёртвой).
-    Даже с дедлайном в прошлом отмена approved-заказа проходит."""
-    db = isolated_db
-    oid, mgr = _agent_order(db, 100.0, status="approved", agent="A-8")
-    from datetime import datetime, timedelta
-
-    past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
-    with db.get_conn() as conn:
-        cur = db.get_cursor(conn)
-        cur.execute(db.q("UPDATE orders SET cancellation_deadline = ? WHERE id = ?"), (past, oid))
-        conn.commit()
-    r = asyncio.run(db.cancel_order(oid, 1, "Boss", "передумали"))
     assert r["ok"] is True
     assert asyncio.run(db.get_order(oid))["status"] == "cancelled"
 

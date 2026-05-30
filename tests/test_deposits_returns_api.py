@@ -249,8 +249,8 @@ def test_set_return_ms_id_second_call_loses_race(isolated_db):
     assert r["ok"]
 
     rid = r["return_id"]
-    assert db.set_return_ms_id(rid, "ms-id-1") is True  # выигрыш гонки
-    assert db.set_return_ms_id(rid, "ms-id-2") is False  # уже занято, новый id не запишется
+    assert asyncio.run(db.set_return_ms_id(rid, "ms-id-1")) is True  # выигрыш гонки
+    assert asyncio.run(db.set_return_ms_id(rid, "ms-id-2")) is False  # уже занято
     stored = asyncio.run(db.get_return(rid))
     assert stored["moysklad_return_id"] == "ms-id-1"
 

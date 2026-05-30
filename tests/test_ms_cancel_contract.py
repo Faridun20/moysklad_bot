@@ -56,7 +56,7 @@ def test_reverse_idempotent_when_already_synced(isolated_db, monkeypatch):
     _prime_ctx(monkeypatch)
     db = isolated_db
     oid = _make_cancelled_order(db)
-    db.set_order_ms_cancel_synced(oid)
+    asyncio.run(db.set_order_ms_cancel_synced(oid))
     # DELETE не мокаем: если код попытается слать — aioresponses упадёт.
     res = asyncio.run(ms_cancel.reverse_customerorder(oid))
     assert res["ok"] is True

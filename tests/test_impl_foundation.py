@@ -53,7 +53,6 @@ def test_new_order_columns_present(isolated_db):
         "cancelled_at",
         "payment_confirmed",
         "rejection_count",
-        "cancellation_deadline",
         "return_status",
     ):
         assert c in cols, f"нет колонки orders.{c}"
