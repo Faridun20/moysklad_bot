@@ -133,6 +133,8 @@ _COMMANDS_BOSS = _COMMANDS_MANAGER + [
     BotCommand(command="reports", description="📈 Отчёты"),
     BotCommand(command="cancel", description="🚫 Отменить заказ"),
     BotCommand(command="limit", description="📊 Кредитные лимиты"),
+    BotCommand(command="rates", description="💱 Курсы валют"),
+    BotCommand(command="prices", description="🏷 Цены товаров"),
     BotCommand(command="sync_payments", description="🔄 Статус синка с МойСклад"),
 ]
 _COMMANDS_ADMIN = _COMMANDS_BOSS + [

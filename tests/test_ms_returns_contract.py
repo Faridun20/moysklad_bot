@@ -101,7 +101,7 @@ def test_salesreturn_idempotent_when_already_synced(isolated_db, monkeypatch):
     _prime_ctx(monkeypatch)
     db = isolated_db
     _oid, rid = _make_confirmed_return(db)
-    db.set_return_ms_id(rid, "SR-EXISTING")
+    asyncio.run(db.set_return_ms_id(rid, "SR-EXISTING"))
     # Не мокаем POST: если код попытается слать — упадёт. Значит не должен.
     res = asyncio.run(ms_returns.create_salesreturn(rid))
     assert res["ok"] is True

@@ -343,6 +343,30 @@ def get_low_stock(threshold: float = 5.0) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+def search_products(query: str, limit: int = 10) -> list[dict]:
+    """Поиск товаров в снапшоте по имени (LIKE, регистронезависимо). Для бот-UI
+    выбора товара (напр. /prices ИМЯ). Возвращает [{ms_id, name, unit}]."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "SELECT ms_id, name, unit FROM ms_stock "
+                "WHERE LOWER(name) LIKE ? ORDER BY name LIMIT ?"
+            ),
+            (f"%{(query or '').lower()}%", limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_product(ms_id: str) -> dict | None:
+    """Товар снапшота по ms_id → {ms_id, name, unit} или None."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("SELECT ms_id, name, unit FROM ms_stock WHERE ms_id = ?"), (ms_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
 def get_categories() -> list[dict]:
     with get_conn() as conn:
         cur = get_cursor(conn)

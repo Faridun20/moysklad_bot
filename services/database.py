@@ -757,7 +757,6 @@ def run_migrations():
             ("orders", "rejection_comment", "TEXT"),
             ("orders", "rejection_count", "INTEGER NOT NULL DEFAULT 0"),
             ("orders", "frozen", "INTEGER NOT NULL DEFAULT 0"),
-            ("orders", "cancellation_deadline", "TEXT"),
             ("orders", "cancelled_at", "TEXT"),
             ("orders", "cancelled_by", "BIGINT"),
             ("orders", "cancellation_reason", "TEXT"),
@@ -1434,12 +1433,8 @@ async def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, re
     МойСклад — отдельной фазой. Отмена доступна для approved; shipped по спеке
     требует возврата на 100% — здесь не пропускаем (нужен return-флоу).
 
-    M2: окно отмены (cancellation_deadline) убрано — поле нигде не заполнялось,
-    проверка была мёртвой и вводила в заблуждение. Если понадобится временно́е
-    окно — заполнять deadline при одобрении и вернуть проверку сюда.
-
-    asyncpg Stage 16 (#21): native async. get_order/add_audit_log/get_role
-    (sync money-core) — мост через to_thread; атомарный UPDATE — adb_core.execute."""
+    asyncpg #21: native async; add_audit_log/get_role (sync) — мост через
+    to_thread; атомарный UPDATE — adb_core.execute."""
     order = await get_order(order_id)
     if not order:
         return {"ok": False, "error": "Заказ не найден"}
@@ -2274,8 +2269,7 @@ def _is_returnable(order: dict) -> bool:
 async def is_order_returnable(order_id: int) -> bool:
     """Публичная проверка для бот/webapp-прехеков (та же логика, что в create_return).
 
-    asyncpg Stage 14 (#21): native async; get_order пока sync (money-core) — мост
-    через to_thread, заменится на `await get_order(...)` в финальной money-стадии."""
+    asyncpg #21: native async (get_order тоже async)."""
     order = await get_order(order_id)
     if order is None:
         return False
@@ -2296,10 +2290,10 @@ async def create_return(
     Доступно для shipped/paid/partially_returned. Дедлайн (return_deadline_days)
     блокирует, если не force (вызывающий решает по роли). Возвращает {ok, return_id}.
 
-    asyncpg Stage 14 (#21): native async. Pre-check reads (get_order/get_setting/
-    get_order_items) пока sync (money-core) — мостим через to_thread (они read-only
-    «до блокировки»); критическая секция (advisory-lock + dup-check + INSERT) —
-    adb_core.transaction() (advisory-xact-lock держится до конца tx, как раньше).
+    asyncpg #21: native async. get_order/get_order_items — async; get_setting
+    (sync, TTL-кэш) — мост через to_thread; критическая секция (advisory-lock +
+    dup-check + INSERT) — adb_core.transaction() (advisory-xact-lock держится до
+    конца tx, как раньше).
     """
     order = await get_order(order_id)
     if not order:
@@ -2564,7 +2558,7 @@ def claim_ops_monitor_run(run_date: str) -> bool:
     return claimed
 
 
-def set_return_ms_id(return_id: int, ms_id: str) -> bool:
+async def set_return_ms_id(return_id: int, ms_id: str) -> bool:
     """Сохранить id документа «Возврат покупателя» из МойСклад (идемпотентность
     повторной отправки).
 
@@ -2574,19 +2568,16 @@ def set_return_ms_id(return_id: int, ms_id: str) -> bool:
     второй перетёр бы первый id, первый salesreturn в МС становится orphan'ом.
     Возвращаемый bool теперь говорит «выиграл ли я гонку» — caller может,
     если хочет, попытаться удалить только что созданный orphan-doc в МС.
-    """
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "UPDATE returns SET moysklad_return_id = ? "
-                "WHERE id = ? AND moysklad_return_id IS NULL"
-            ),
-            (ms_id, return_id),
+
+    asyncpg #21: native async через adb_core (rowcount-guard сохранён)."""
+    return (
+        await adb_core.execute(
+            "UPDATE returns SET moysklad_return_id = $1 "
+            "WHERE id = $2 AND moysklad_return_id IS NULL",
+            ms_id, return_id,
         )
-        updated = cur.rowcount > 0
-        conn.commit()
-    return updated
+        > 0
+    )
 
 
 # ─── Роли ────────────────────────────────────────────────────────────────────
@@ -3062,18 +3053,18 @@ def set_order_ms_customerorder_id(order_id: int, co_id: str) -> bool:
     return updated
 
 
-def set_order_ms_cancel_synced(order_id: int) -> bool:
+async def set_order_ms_cancel_synced(order_id: int) -> bool:
     """Отметить, что отмена заказа отражена в МойСклад (реверс customerorder).
-    Идемпотентность ms_cancel: повторный реверс пропускается по этому полю."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("UPDATE orders SET ms_cancel_synced_at = ?, updated_at = ? WHERE id = ?"),
-            (now_str(), now_str(), order_id),
+    Идемпотентность ms_cancel: повторный реверс пропускается по этому полю.
+
+    asyncpg #21: native async через adb_core."""
+    return (
+        await adb_core.execute(
+            "UPDATE orders SET ms_cancel_synced_at = $1, updated_at = $2 WHERE id = $3",
+            now_str(), now_str(), order_id,
         )
-        updated = cur.rowcount > 0
-        conn.commit()
-    return updated
+        > 0
+    )
 
 
 def get_payments_needing_ms_sync(limit: int = 100) -> list[dict]:

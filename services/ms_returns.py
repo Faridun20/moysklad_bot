@@ -103,7 +103,7 @@ async def create_salesreturn(return_id: int) -> dict:
                 return {"ok": False, "reason": f"HTTP {resp.status}: {safe}"}
             created = json.loads(body)
             ms_id = created.get("id", "")
-            await _to_thread(db.set_return_ms_id, return_id, ms_id)
+            await db.set_return_ms_id(return_id, ms_id)  # native async (asyncpg #21)
             return {
                 "ok": True,
                 "ms_id": ms_id,
@@ -118,11 +118,3 @@ async def create_salesreturn(return_id: int) -> dict:
         # делаем поведение единообразным на случай если caller начнёт
         # сурфейсить `reason` в API-ответ.
         return {"ok": False, "reason": f"{type(e).__name__}: {redact_ms_error(str(e)[:200])}"}
-
-
-async def _to_thread(fn, *args):
-    """Синхронные db-вызовы — в thread pool, чтобы не блокировать event loop
-    (как services.async_db)."""
-    import asyncio
-
-    return await asyncio.to_thread(fn, *args)

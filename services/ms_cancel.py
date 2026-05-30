@@ -54,7 +54,7 @@ async def reverse_customerorder(order_id: int) -> dict:
             body = await resp.text()
             # 200/204 — успех. 404 — документ уже удалён в МС → считаем синком.
             if resp.status in (200, 204, 404):
-                await _to_thread(db.set_order_ms_cancel_synced, order_id)
+                await db.set_order_ms_cancel_synced(order_id)  # native async (asyncpg #21)
                 return {"ok": True, "ms_id": co_id}
             safe = redact_ms_error(body)
             logger.error("MS reverse customerorder HTTP %s: %s", resp.status, safe)
@@ -62,10 +62,3 @@ async def reverse_customerorder(order_id: int) -> dict:
     except Exception as e:
         logger.exception("reverse customerorder failed")
         return {"ok": False, "reason": f"{type(e).__name__}: {redact_ms_error(str(e)[:200])}"}
-
-
-async def _to_thread(fn, *args):
-    """Синхронные db-вызовы — в thread pool, чтобы не блокировать event loop."""
-    import asyncio
-
-    return await asyncio.to_thread(fn, *args)

@@ -147,6 +147,7 @@ def register_routers(dp: Dispatcher):
         credit,
         order_cancel,
         order_ship,
+        pricing,
     )
 
     routers = [
@@ -166,6 +167,7 @@ def register_routers(dp: Dispatcher):
         credit.router,
         order_cancel.router,
         order_ship.router,
+        pricing.router,
     ]
     for r in routers:
         dp.include_router(r)
