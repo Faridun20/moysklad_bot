@@ -511,3 +511,84 @@ async def reject_shipment_request(
         "order_id": req.get("order_id"),
         "now": now_str,
     }
+
+
+async def return_order_to_draft(
+    req_id: int,
+    boss_user_id: int,
+    boss_name: str,
+    comment: str,
+    bot: Any,
+) -> dict:
+    """Вернуть заявку менеджеру на доработку (IMPLEMENTATION.md §6.4–6.5).
+
+    В отличие от reject_shipment_request (terminal: заказ → 'rejected'), здесь
+    заказ возвращается в 'draft' с причиной и счётчиком; после reject_max_cycles
+    заказ замораживается. Менеджер правит черновик и отправляет заново.
+
+    Порядок: сперва атомарный reject_order_to_draft (race-guard на orders), и
+    только при успехе помечаем заявку 'returned'. Если другой босс уже обработал
+    заказ — reject_order_to_draft вернёт ошибку, заявку не трогаем.
+
+    Возвращает {ok, error, req_id, order_id, now, frozen, rejection_count}.
+    """
+    from services import async_db as adb
+    from services import database as db
+    from utils.helpers import local_now
+
+    req = await adb.get_shipment_request(req_id)
+    if not req:
+        return {"ok": False, "error": "Заявка не найдена", "req_id": req_id, "order_id": None}
+    if req["status"] != "pending":
+        return {
+            "ok": False,
+            "error": "Заявка уже обработана",
+            "req_id": req_id,
+            "order_id": req.get("order_id"),
+        }
+
+    order_id = req["order_id"]
+    res = await db.reject_order_to_draft(order_id, boss_user_id, boss_name, comment)
+    if not res.get("ok"):
+        return {
+            "ok": False,
+            "error": res.get("error") or "Не удалось вернуть заказ в черновик",
+            "req_id": req_id,
+            "order_id": order_id,
+        }
+
+    # Заказ уже в 'draft' — снимаем заявку с pending-очереди (статус заказа не трогаем).
+    await asyncio.to_thread(
+        db.mark_shipment_request_returned, req_id, boss_user_id, boss_name
+    )
+
+    now_str = local_now().strftime("%d.%m.%Y %H:%M")
+    frozen = bool(res.get("frozen"))
+    rejection_count = int(res.get("rejection_count") or 0)
+
+    if bot is not None and req.get("user_id"):
+        from services.notify import notify_order_returned
+
+        try:
+            await notify_order_returned(
+                bot,
+                req["user_id"],
+                req_id,
+                boss_name,
+                comment,
+                now_str,
+                frozen,
+                rejection_count,
+            )
+        except Exception:
+            logger.exception("notify_order_returned failed for req #%s", req_id)
+
+    return {
+        "ok": True,
+        "error": None,
+        "req_id": req_id,
+        "order_id": order_id,
+        "now": now_str,
+        "frozen": frozen,
+        "rejection_count": rejection_count,
+    }

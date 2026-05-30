@@ -34,7 +34,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from services.roles import can_create_orders, is_boss
+from services.roles import can_create_orders, is_boss, is_admin
 from services import async_db as adb
 from services.moysklad import get_all_stock, get_categories, ms_get
 from utils.helpers import extract_id_from_href, extract_href, safe_get, user_safe_error
@@ -51,6 +51,10 @@ class OrderState(StatesGroup):
     choosing_product = State()  # выбор товара
     entering_qty_price = State()  # ввод количества и цены одной строкой
     choosing_agent = State()  # выбор клиента
+
+
+class ReturnToDraft(StatesGroup):
+    waiting_for_reason = State()  # босс вводит причину «на доработку»
 
 
 def _parse_qty_price(text: str) -> tuple[float | None, float | None]:
@@ -122,11 +126,27 @@ def format_order(order: dict, items: list[dict]) -> str:
     comment_str = f"\n📝 {_esc(order['comment'])}" if order.get("comment") else ""
     currency = order.get("currency") or _BASE_CURRENCY
 
+    # Заказ вернули на доработку → показываем причину и счётчик попыток.
+    returned_str = ""
+    if order.get("status") == "draft" and order.get("rejection_comment"):
+        rc = int(order.get("rejection_count") or 0)
+        if order.get("frozen"):
+            returned_str = (
+                f"\n🧊 <b>Заморожен</b> (отклонений: {rc}) — "
+                f"переотправка заблокирована, нужна разморозка админом"
+                f"\n↩️ Причина: <i>{_esc(order['rejection_comment'])}</i>"
+            )
+        else:
+            returned_str = (
+                f"\n↩️ <b>Возвращено на доработку</b> (попытка {rc}): "
+                f"<i>{_esc(order['rejection_comment'])}</i>"
+            )
+
     lines = [
         DIV,
         f"{status_emoji} <b>Заказ #{order['id']}</b>   <code>{_esc(status_name)}</code>",
         f"<code>{_esc(order['created_at'][:16])}</code> · <code>{_esc(currency)}</code>",
-        f"👤 Менеджер: {_esc(order['full_name'])}{agent_str}{comment_str}",
+        f"👤 Менеджер: {_esc(order['full_name'])}{agent_str}{comment_str}{returned_str}",
         "",
     ]
 
@@ -248,7 +268,8 @@ def request_approve_keyboard(req_id: int):
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Одобрить", callback_data=f"req_ok:{req_id}")
     kb.button(text="❌ Отклонить", callback_data=f"req_no:{req_id}")
-    kb.adjust(2)
+    kb.button(text="✏️ На доработку", callback_data=f"req_draft:{req_id}")
+    kb.adjust(2, 1)
     return kb.as_markup()
 
 
@@ -782,6 +803,11 @@ async def cb_submit_order(call: CallbackQuery, state: FSMContext, bot: Bot):
         return await call.message.answer("⛔ Это не ваш заказ.")
     if order["status"] != "draft":
         return await call.message.answer("⚠️ Заказ уже отправлен.")
+    if order.get("frozen"):
+        return await call.message.answer(
+            "🧊 Заказ заморожен после серии отклонений.\n"
+            "Переотправка заблокирована — обратитесь к администратору для разморозки."
+        )
 
     items = await adb.get_order_items(order_id)
     if not items:
@@ -965,3 +991,99 @@ async def cb_reject_request(call: CallbackQuery, bot: Bot):
         + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{result['now']}</code>  — {_esc(boss_name)}",
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data.startswith("req_draft:"))
+async def cb_return_to_draft(call: CallbackQuery, state: FSMContext):
+    """Босс возвращает заявку на доработку — спрашиваем причину одним сообщением."""
+    if not is_boss(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    req_id = int(call.data.split(":")[1])
+    await state.set_state(ReturnToDraft.waiting_for_reason)
+    await state.update_data(
+        req_id=req_id, msg_chat=call.message.chat.id, msg_id=call.message.message_id
+    )
+    await call.answer()
+    await call.message.answer(
+        "✍️ Укажите, что нужно доработать (одним сообщением) — менеджер увидит причину:"
+    )
+
+
+@router.message(ReturnToDraft.waiting_for_reason)
+async def process_return_to_draft_reason(message: Message, state: FSMContext, bot: Bot):
+    # Повторный role-check после FSM-перехода (роль могли снять между callback'ом
+    # и сообщением) — как в handlers/deposits.py.
+    if not is_boss(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Нет доступа — действие отменено.")
+    reason = (message.text or "").strip()[:500]
+    if len(reason) < 3:
+        return await message.answer("❌ Причина слишком короткая. Повторите.")
+    data = await state.get_data()
+    await state.clear()
+    req_id = data.get("req_id")
+    boss_name = message.from_user.full_name or str(message.from_user.id)
+
+    from services.order_workflow import return_order_to_draft
+
+    result = await return_order_to_draft(req_id, message.from_user.id, boss_name, reason, bot)
+    if not result["ok"]:
+        return await message.answer(f"⚠️ {result['error']}")
+
+    frozen_tail = "  🧊 <b>ЗАМОРОЖЕН</b>" if result.get("frozen") else ""
+    await message.answer(
+        f"↩️ Заявка #{req_id} возвращена на доработку"
+        f" (попытка {result.get('rejection_count')}).{frozen_tail}",
+        parse_mode="HTML",
+    )
+
+
+# ─── Заморозка: просмотр и разморозка (admin) ─────────────────────────────────
+
+
+@router.message(Command("frozen"))
+async def cmd_frozen(message: Message):
+    """Список замороженных заказов с кнопкой разморозки (только admin)."""
+    if not is_admin(message.from_user.id):
+        return await message.answer("⛔ Команда только для администратора.")
+    orders = await adb.get_frozen_orders()
+    if not orders:
+        return await message.answer("🧊 Замороженных заказов нет.")
+    kb = InlineKeyboardBuilder()
+    lines = [f"{DIV}", "🧊 <b>Замороженные заказы:</b>", ""]
+    for o in orders[:20]:
+        agent = _esc(o.get("agent_name") or "—")
+        lines.append(
+            f"• <b>#{o['id']}</b> · {agent} · отклонений: {int(o.get('rejection_count') or 0)}"
+        )
+        kb.button(text=f"🔓 Разморозить #{o['id']}", callback_data=f"unfreeze:{o['id']}")
+    kb.adjust(1)
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("unfreeze:"))
+async def cb_unfreeze_order(call: CallbackQuery, bot: Bot):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔ Нет доступа", show_alert=True)
+    order_id = int(call.data.split(":")[1])
+    name = call.from_user.full_name or str(call.from_user.id)
+    result = await adb.unfreeze_order(order_id, call.from_user.id, name)
+    if not result.get("ok"):
+        return await call.answer(f"⚠️ {result.get('error')}", show_alert=True)
+    await call.answer("🔓 Разморожен")
+    base = getattr(call.message, "html_text", None) or call.message.text or ""
+    await call.message.edit_text(
+        base + f"\n\n{DIV}\n🔓 <b>Заказ #{order_id} разморожен</b> — {_esc(name)}",
+        parse_mode="HTML",
+    )
+    # Best-effort: сообщаем менеджеру, что можно переотправить.
+    order = await adb.get_order(order_id)
+    if order and order.get("user_id"):
+        try:
+            await bot.send_message(
+                order["user_id"],
+                f"🔓 Заказ #{order_id} разморожен администратором — "
+                f"можно отредактировать и отправить заново.",
+            )
+        except Exception:
+            pass

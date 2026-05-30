@@ -100,6 +100,41 @@ async def notify_order_rejected(
     await _send(bot, manager_user_id, text)
 
 
+async def notify_order_returned(
+    bot: Bot,
+    manager_user_id: int,
+    req_id: int,
+    boss_name: str,
+    comment: str,
+    now: str,
+    frozen: bool,
+    rejection_count: int,
+) -> None:
+    """Уведомить менеджера, что заявка возвращена на доработку (заказ → черновик).
+
+    Если frozen — заказ заморожен после серии отклонений, переотправка заблокирована
+    до разморозки администратором.
+    """
+    if frozen:
+        tail = (
+            f"\n\n🧊 <b>Заказ заморожен</b> после {rejection_count} отклонений — "
+            f"переотправка заблокирована.\nОбратитесь к администратору для разморозки."
+        )
+    else:
+        tail = (
+            f"\n\nОтредактируйте заказ и отправьте заново "
+            f"(попытка {rejection_count})."
+        )
+    text = (
+        f"{DIV}\n"
+        f"↩️ <b>Заявка #{req_id} возвращена на доработку</b>\n\n"
+        f"👨‍💼 Вернул: {esc(boss_name)}\n"
+        f"🕐 {now}\n"
+        f"📝 Причина: {esc(comment)}{tail}"
+    )
+    await _send(bot, manager_user_id, text)
+
+
 # ─── Платежи ──────────────────────────────────────────────────────────────────
 
 

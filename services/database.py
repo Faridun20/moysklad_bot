@@ -1348,6 +1348,42 @@ async def reject_order_to_draft(
     return {"ok": True, "error": None, "frozen": bool(frozen), "rejection_count": rc}
 
 
+async def unfreeze_order(order_id: int, unfrozen_by: int, unfrozen_name: str) -> dict:
+    """Разморозить заказ (admin): frozen=0 + сброс rejection_count, чтобы цикл
+    reject→resubmit начался заново. Возвращает {ok, error}.
+
+    Native async через adb_core; add_audit_log/get_role — мост через to_thread
+    (sync, категория get_role — см. asyncpg #21)."""
+    order = await get_order(order_id)
+    if not order:
+        return {"ok": False, "error": "Заказ не найден"}
+    if not order.get("frozen"):
+        return {"ok": False, "error": "Заказ не заморожен"}
+
+    await adb_core.execute(
+        "UPDATE orders SET frozen = 0, rejection_count = 0, updated_at = $1 WHERE id = $2",
+        now_str(), order_id,
+    )
+    await asyncio.to_thread(
+        add_audit_log,
+        unfrozen_by,
+        unfrozen_name,
+        await asyncio.to_thread(get_role, unfrozen_by),
+        "order_unfrozen",
+        f"Заказ #{order_id} разморожен (счётчик отклонений сброшен)",
+    )
+    return {"ok": True, "error": None}
+
+
+async def get_frozen_orders() -> list[dict]:
+    """Замороженные заказы (frozen=1, не удалённые) — для админ-списка/разморозки.
+    Native async через adb_core."""
+    return await adb_core.fetch(
+        "SELECT * FROM orders WHERE frozen = 1 AND (deleted_at IS NULL) "
+        "ORDER BY updated_at DESC"
+    )
+
+
 async def mark_order_shipped(order_id: int, shipped_by: int, shipped_name: str) -> dict:
     """Отметить заказ отгруженным (approved → shipped), DB-часть. Альтернатива
     МС-вебхуку (stateType=Successful) — для аккаунтов без статуса типа
@@ -4781,6 +4817,37 @@ def reject_shipment_request(req_id: int, rejected_by: int, rejected_name: str) -
                 get_role(rejected_by),
                 "shipment_rejected",
                 f"Заявка #{req_id} отклонена (заказ #{req['order_id']} от {req['full_name']})",
+            )
+    return updated
+
+
+def mark_shipment_request_returned(req_id: int, returned_by: int, returned_name: str) -> bool:
+    """Пометить заявку «возвращённой на доработку» (status='returned'), НЕ трогая
+    статус заказа — его уже перевёл в 'draft' reject_order_to_draft. Так заявка
+    уходит из get_pending_requests, но заказ живёт и переотправится новой заявкой.
+
+    Атомарный UPDATE ... WHERE status='pending' — идемпотентно, защита от гонки.
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("""UPDATE shipment_requests
+               SET status = 'returned', approved_by = ?, approved_by_name = ?, approved_at = ?
+               WHERE id = ? AND status = 'pending'"""),
+            (returned_by, returned_name, now_str(), req_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    if updated:
+        req = get_shipment_request(req_id)
+        if req is not None:
+            add_audit_log(
+                returned_by,
+                returned_name,
+                get_role(returned_by),
+                "shipment_returned",
+                f"Заявка #{req_id} возвращена на доработку "
+                f"(заказ #{req['order_id']} от {req['full_name']})",
             )
     return updated
 

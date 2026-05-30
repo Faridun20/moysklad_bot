@@ -1428,6 +1428,10 @@ async def api_orders(request: Request):
             "created_at": o["created_at"][:16],
             "items_count": len(items),
             "total": total,
+            # Заморозка/возврат на доработку (reject→draft цикл).
+            "frozen": bool(o.get("frozen")),
+            "rejection_count": int(o.get("rejection_count") or 0),
+            "rejection_comment": o.get("rejection_comment") or "",
             "items": [
                 {
                     "name": it["product_name"],
@@ -1566,6 +1570,71 @@ async def api_reject_request(request: Request):
     if not result["ok"]:
         raise HTTPException(status_code=409, detail=result["error"])
     return JSONResponse({"ok": True, "req_id": req_id})
+
+
+@app.post("/api/requests/return_to_draft")
+async def api_return_to_draft(request: Request):
+    """Босс возвращает заявку на доработку (заказ → черновик, после серии → freeze)."""
+    from services.order_workflow import return_order_to_draft
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_return_to_draft",
+        rate_limit_max=30,
+        rate_limit_window=60.0,
+    )
+    try:
+        req_id = int(data.get("req_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="req_id обязателен")
+    comment = (data.get("comment") or "").strip()[:500]
+    if len(comment) < 3:
+        raise HTTPException(status_code=400, detail="Укажите причину (минимум 3 символа)")
+
+    boss_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
+        "username", str(user["id"])
+    )
+    bot = await get_notify_bot()
+    result = await return_order_to_draft(req_id, user["id"], boss_name, comment, bot)
+    if not result["ok"]:
+        raise HTTPException(status_code=409, detail=result["error"])
+    return JSONResponse(
+        {
+            "ok": True,
+            "req_id": req_id,
+            "frozen": result.get("frozen", False),
+            "rejection_count": result.get("rejection_count", 0),
+        }
+    )
+
+
+@app.post("/api/orders/unfreeze")
+async def api_unfreeze_order(request: Request):
+    """Админ размораживает заказ (frozen=0 + сброс счётчика отклонений)."""
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin",),
+        rate_limit_scope="api_unfreeze_order",
+        rate_limit_max=30,
+        rate_limit_window=60.0,
+    )
+    try:
+        order_id = int(data.get("order_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="order_id обязателен")
+
+    name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
+        "username", str(user["id"])
+    )
+    result = await adb.unfreeze_order(order_id, user["id"], name)
+    if not result["ok"]:
+        raise HTTPException(status_code=409, detail=result["error"])
+    return JSONResponse({"ok": True, "order_id": order_id})
 
 
 # ─── API: кредитные лимиты (IMPLEMENTATION.md §3) ─────────────────────────────
@@ -2337,6 +2406,11 @@ async def api_submit_order(request: Request):
     err = validate_transition(order, "pending")
     if err:
         raise HTTPException(status_code=400, detail=err)
+    if order.get("frozen"):
+        raise HTTPException(
+            status_code=409,
+            detail="Заказ заморожен после серии отклонений — обратитесь к администратору",
+        )
 
     items = await adb.get_order_items(order_id)
     if not items:
