@@ -2094,6 +2094,27 @@ async def api_returns_confirm(request: Request):
     )
 
 
+@app.post("/api/returns/goods_received")
+async def api_returns_goods_received(request: Request):
+    """Склад/boss отмечает «товар по возврату получен» (паритет бот-кнопки ret_got)."""
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "warehouse_keeper"),
+        rate_limit_scope="api_returns_goods_received",
+    )
+    try:
+        return_id = int(data.get("return_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="return_id обязателен")
+    res = await adb.mark_return_goods_received(return_id, user["id"])
+    if not res.get("ok"):
+        raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
+    return JSONResponse({"ok": True, "return_id": return_id})
+
+
 @app.post("/api/returns/create")
 async def api_returns_create(request: Request):
     """Оформить полный возврат по заказу (быстрый флоу, как /return в боте).
@@ -2805,6 +2826,10 @@ async def _notify_bosses_payment_pending(
             f"💵 Сумма платежа: <b>{fmt(amount)} {currency}</b>",
             f"📦 По заказу всего: <b>{fmt(total)} {currency}</b>",
         ]
+        if summary.get("total_base") is not None and currency != summary.get("base_currency"):
+            lines.append(
+                f"   ≈ <b>{fmt(summary['total_base'])} {summary['base_currency']}</b>"
+            )
         if confirmed_before > 0:
             lines.append(f"✅ Уже оплачено ранее: <b>{fmt(confirmed_before)} {currency}</b>")
         if remaining_after <= 0:

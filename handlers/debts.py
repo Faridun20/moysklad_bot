@@ -159,6 +159,19 @@ async def _render_debts(message: Message, user_id: int):
         f"⏰ Сегодня: <b>{due_today}</b>\n"
         f"📅 Будущие: <b>{upcoming}</b>"
     )
+    # Единый остаток к получению в базовой валюте (объединяет разные валюты).
+    # remaining_base=None у заказа, чья валюта без курса — считаем по известным,
+    # помечаем неполноту.
+    base_cur = next(
+        (s.get("base_currency") for s in summaries.values() if s.get("base_currency")), "USD"
+    )
+    rem_bases = [summaries[d["id"]].get("remaining_base") for d in debts]
+    known = [r for r in rem_bases if r is not None]
+    if known:
+        partial = " <i>(часть без курса)</i>" if len(known) < len(rem_bases) else ""
+        summary += (
+            f"\n\n💰 Осталось получить: ≈ <b>{_fmt_amount(sum(known))} {_esc(base_cur)}</b>{partial}"
+        )
     await message.answer(summary, parse_mode="HTML")
 
     for d in debts:
@@ -313,6 +326,10 @@ async def _push_payment_confirmation(
         f"💵 Сумма платежа: <b>{_fmt_amount(amount)} {_esc(currency)}</b>",
         f"📦 По заказу всего: <b>{_fmt_amount(summary['total'])} {_esc(currency)}</b>",
     ]
+    if summary.get("total_base") is not None and currency != summary.get("base_currency"):
+        lines.append(
+            f"   ≈ <b>{_fmt_amount(summary['total_base'])} {_esc(summary['base_currency'])}</b>"
+        )
     if confirmed_before > 0:
         lines.append(
             f"✅ Уже оплачено ранее: <b>{_fmt_amount(confirmed_before)} {_esc(currency)}</b>"

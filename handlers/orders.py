@@ -779,7 +779,7 @@ async def cb_agent_pick(call: CallbackQuery, state: FSMContext):
     )
 
     await call.message.answer(
-        f"✅ Клиент выбран: <b>{agent['name']}</b>\n\n" + format_order(order, items),
+        f"✅ Клиент выбран: <b>{_esc(agent['name'])}</b>\n\n" + format_order(order, items),
         parse_mode="HTML",
         reply_markup=order_actions_keyboard(order_id, "draft", True),
     )
