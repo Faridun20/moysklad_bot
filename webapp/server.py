@@ -1886,6 +1886,41 @@ async def api_permissions_grant(request: Request):
     return JSONResponse({"ok": True, "user_id": target_uid, "permission_code": code, "action": action})
 
 
+@app.post("/api/users/deactivate")
+async def api_users_deactivate(request: Request):
+    """Деактивировать/реактивировать пользователя (#32). Admin only.
+    Payload: {"initData": "...", "user_id": N, "action": "deactivate"|"reactivate"}."""
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=("admin",), rate_limit_scope="api_users_deactivate")
+    try:
+        target_uid = int(data.get("user_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="user_id обязателен (число)")
+    action = (data.get("action") or "deactivate").strip().lower()
+    if action not in ("deactivate", "reactivate"):
+        raise HTTPException(status_code=400, detail="action: deactivate|reactivate")
+    if action == "deactivate" and target_uid == user["id"]:
+        raise HTTPException(status_code=400, detail="Нельзя деактивировать самого себя")
+
+    if action == "deactivate":
+        ok = await adb.deactivate_user(target_uid, user["id"])
+    else:
+        ok = await adb.reactivate_user(target_uid, user["id"])
+    from services.roles import invalidate_role
+
+    invalidate_role(target_uid)
+    if not ok:
+        raise HTTPException(status_code=409, detail="Нечего менять (состояние уже такое)")
+
+    actor_name = ((user.get("first_name") or "") + " " + (user.get("last_name") or "")).strip()
+    await adb.add_audit_log(
+        user["id"], actor_name, "admin", f"user_{action}d", f"user #{target_uid}: {action}"
+    )
+    return JSONResponse({"ok": True, "user_id": target_uid, "action": action})
+
+
 # ─── API: сдачи наличных (IMPLEMENTATION.md §7) ───────────────────────────────
 
 

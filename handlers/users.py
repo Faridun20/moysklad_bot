@@ -108,11 +108,75 @@ async def show_users(message):
         role_name = ROLE_NAMES.get(u["role"], u["role"])
         name = u["full_name"] or u["username"] or str(u["user_id"])
         username = f" (@{u['username']})" if u["username"] else ""
-        lines.append(f"{role_name}\n  {name}{username}\n  ID: <code>{u['user_id']}</code>\n")
+        flag = "  🚫 <b>деактивирован</b>" if u.get("deactivated_at") else ""
+        lines.append(
+            f"{role_name}\n  {esc(name)}{esc(username)}\n  ID: <code>{u['user_id']}</code>{flag}\n"
+        )
 
-    lines.append("\n<i>Чтобы изменить роль:</i>")
-    lines.append("<code>/addrole [ID] [admin/boss/manager/employee]</code>")
+    lines.append("\n<i>Роль:</i> <code>/addrole [ID] [admin/boss/manager/employee]</code>")
+    lines.append("<i>Доступ:</i> <code>/deactivate [ID]</code> · <code>/reactivate [ID]</code>")
     await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("deactivate"))
+async def cmd_deactivate(message: Message):
+    if not can_manage_users(message.from_user.id):
+        return await message.answer("⛔ Нет доступа.")
+    parts = message.text.strip().split()
+    if len(parts) != 2:
+        return await message.answer("❌ Формат: <code>/deactivate [user_id]</code>", parse_mode="HTML")
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        return await message.answer("❌ User ID должен быть числом.")
+    if target_id == message.from_user.id:
+        return await message.answer("❌ Нельзя деактивировать самого себя.")
+
+    ok = await adb.deactivate_user(target_id, message.from_user.id)
+    invalidate_role(target_id)
+    if not ok:
+        return await message.answer("ℹ️ Пользователь уже деактивирован или не найден.")
+    admin_name = message.from_user.full_name or str(message.from_user.id)
+    await adb.add_audit_log(
+        message.from_user.id,
+        admin_name,
+        await adb.get_role(message.from_user.id),
+        "user_deactivated",
+        f"Пользователь {target_id} деактивирован",
+    )
+    await message.answer(
+        f"🚫 Пользователь <code>{target_id}</code> деактивирован — права сняты.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("reactivate"))
+async def cmd_reactivate(message: Message):
+    if not can_manage_users(message.from_user.id):
+        return await message.answer("⛔ Нет доступа.")
+    parts = message.text.strip().split()
+    if len(parts) != 2:
+        return await message.answer("❌ Формат: <code>/reactivate [user_id]</code>", parse_mode="HTML")
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        return await message.answer("❌ User ID должен быть числом.")
+
+    ok = await adb.reactivate_user(target_id, message.from_user.id)
+    invalidate_role(target_id)
+    if not ok:
+        return await message.answer("ℹ️ Пользователь не был деактивирован.")
+    admin_name = message.from_user.full_name or str(message.from_user.id)
+    await adb.add_audit_log(
+        message.from_user.id,
+        admin_name,
+        await adb.get_role(message.from_user.id),
+        "user_reactivated",
+        f"Пользователь {target_id} реактивирован",
+    )
+    await message.answer(
+        f"✅ Пользователь <code>{target_id}</code> снова активен.", parse_mode="HTML"
+    )
 
 
 @router.message(Command("syncms"))

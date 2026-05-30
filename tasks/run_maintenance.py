@@ -40,6 +40,21 @@ def main() -> int:
         soft_days = int(get_setting("soft_delete_retention_days", 365))
 
         shipments = prune_notified_shipments(older_than_days=30)
+
+        # Архивируем уходящие записи аудита ДО чистки (#33). cutoff — как в
+        # prune_audit_log (now − months*30д). Best-effort: ошибка не блокирует prune.
+        import asyncio
+        from datetime import datetime, timedelta
+
+        from services.audit_archive import export_audit_archive
+
+        cutoff = (datetime.now() - timedelta(days=audit_months * 30)).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            arch = asyncio.run(export_audit_archive(cutoff))
+            logger.info("maintenance: audit archive: %s", arch)
+        except Exception:
+            logger.exception("maintenance: audit archive failed (prune не блокируется)")
+
         audit = prune_audit_log(retention_months=audit_months)
         purged = purge_soft_deleted(retention_days=soft_days)
 

@@ -148,7 +148,11 @@ def get_notify_recipients() -> list[int]:
     """
     try:
         users = get_all_users()
-        recipients = [u["user_id"] for u in users if u["role"] in ("admin", "boss")]
+        recipients = [
+            u["user_id"]
+            for u in users
+            if u["role"] in ("admin", "boss") and not u.get("deactivated_at")
+        ]
         if recipients:
             logger.info(
                 "notify recipients (DB): %s (boss/admin из %d users)",

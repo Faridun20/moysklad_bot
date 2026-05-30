@@ -140,6 +140,7 @@ _COMMANDS_BOSS = _COMMANDS_MANAGER + [
 _COMMANDS_ADMIN = _COMMANDS_BOSS + [
     BotCommand(command="users", description="👥 Пользователи"),
     BotCommand(command="addrole", description="🔧 Сменить роль"),
+    BotCommand(command="deactivate", description="🚫 Деактивировать пользователя"),
     BotCommand(command="audit", description="📋 Аудит лог"),
     BotCommand(command="frozen", description="🧊 Замороженные заказы"),
 ]
