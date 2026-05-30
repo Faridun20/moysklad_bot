@@ -40,7 +40,7 @@ def _all_cbs(answers):
 def test_pending_deposits_list_for_bookkeeper(isolated_db):
     db = isolated_db
     db.set_role(1, "bk", "Book", "bookkeeper")
-    res = db.create_cash_deposit(2, 500.0)  # сдаёт менеджер #2
+    res = asyncio.run(db.create_cash_deposit(2, 500.0))  # сдаёт менеджер #2
     assert res["ok"]
 
     from handlers.deposits import cmd_pending_deposits

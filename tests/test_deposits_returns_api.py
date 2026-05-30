@@ -57,7 +57,7 @@ def client_env(isolated_db, monkeypatch):
 
 def test_deposit_pending_and_confirm(client_env):
     client, db, ids, fake_bot = client_env
-    dep = db.create_cash_deposit(ids["mgr"], 250.0)
+    dep = asyncio.run(db.create_cash_deposit(ids["mgr"], 250.0))
 
     # список
     resp = client.post("/api/deposits/pending", json={"initData": str(ids["boss"])})
@@ -77,7 +77,7 @@ def test_deposit_pending_and_confirm(client_env):
 
 def test_deposit_reject_requires_reason(client_env):
     client, db, ids, _ = client_env
-    dep = db.create_cash_deposit(ids["mgr"], 250.0)
+    dep = asyncio.run(db.create_cash_deposit(ids["mgr"], 250.0))
     resp = client.post(
         "/api/deposits/reject",
         json={"initData": str(ids["boss"]), "deposit_id": dep["deposit_id"], "reason": "x"},
@@ -87,7 +87,7 @@ def test_deposit_reject_requires_reason(client_env):
 
 def test_deposit_confirm_forbidden_for_manager(client_env):
     client, db, ids, _ = client_env
-    dep = db.create_cash_deposit(ids["mgr"], 250.0)
+    dep = asyncio.run(db.create_cash_deposit(ids["mgr"], 250.0))
     resp = client.post(
         "/api/deposits/confirm",
         json={"initData": str(ids["mgr"]), "deposit_id": dep["deposit_id"]},
@@ -205,7 +205,7 @@ def test_return_create_validation(client_env):
 def test_deposit_reject_clips_long_reason(client_env):
     """1MB reason должен резаться на API edge, не разлетаться в DB/Telegram."""
     client, db, ids, _ = client_env
-    dep = db.create_cash_deposit(ids["mgr"], 250.0)
+    dep = asyncio.run(db.create_cash_deposit(ids["mgr"], 250.0))
     huge = "x" * 100_000
     resp = client.post(
         "/api/deposits/reject",

@@ -71,9 +71,9 @@ def run() -> None:
     )
 
     _h("2. Сдача наличных закрывает заказ (cash deposit → paid)")
-    dep = db.create_cash_deposit(MGR, 250.0)
+    dep = asyncio.run(db.create_cash_deposit(MGR, 250.0))
     print(f"создана сдача #{dep['deposit_id']}, распределение={dep['allocations']}")
-    conf = db.confirm_cash_deposit(dep["deposit_id"], BOSS, "SMOKE Boss")
+    conf = asyncio.run(db.confirm_cash_deposit(dep["deposit_id"], BOSS, "SMOKE Boss"))
     print(
         f"подтверждена; закрыты заказы={conf['closed_orders']}; "
         f"статус #{o1} = {db.get_order(o1)['status']}"

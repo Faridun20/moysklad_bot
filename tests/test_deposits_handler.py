@@ -103,7 +103,7 @@ def test_cb_confirm_closes_order_and_notifies_manager(isolated_db):
     from handlers.deposits import cb_deposit_confirm
 
     oid = _setup(db)
-    res = db.create_cash_deposit(1, 250.0)
+    res = asyncio.run(db.create_cash_deposit(1, 250.0))
     bot = _FakeBot()
     call = _FakeCall(f"dep_ok:{res['deposit_id']}", uid=2, bot=bot)
     asyncio.run(cb_deposit_confirm(call, bot))
@@ -118,7 +118,7 @@ def test_cb_confirm_denied_for_manager(isolated_db):
     from handlers.deposits import cb_deposit_confirm
 
     _setup(db)
-    res = db.create_cash_deposit(1, 250.0)
+    res = asyncio.run(db.create_cash_deposit(1, 250.0))
     bot = _FakeBot()
     call = _FakeCall(f"dep_ok:{res['deposit_id']}", uid=1, bot=bot)  # менеджер не вправе
     asyncio.run(cb_deposit_confirm(call, bot))

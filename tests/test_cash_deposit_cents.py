@@ -7,6 +7,8 @@ float-эпсилона +0.01.
 ошибочно становился «оплачен». Теперь сравнение точное в копейках.
 """
 
+import asyncio
+
 
 def _shipped_order(db, mgr, total):
     db.set_role(mgr, "m", "Mgr", "manager")
@@ -20,9 +22,9 @@ def test_cash_deposit_closes_on_exact_cents_coverage(isolated_db):
     db = isolated_db
     mgr = 5001
     oid = _shipped_order(db, mgr, 100.0)  # 10000 коп.
-    res = db.create_cash_deposit(mgr, 100.0, allocations=[(oid, 100.0)])
+    res = asyncio.run(db.create_cash_deposit(mgr, 100.0, allocations=[(oid, 100.0)]))
     assert res["ok"], res
-    cres = db.confirm_cash_deposit(res["deposit_id"], 1, "Boss")
+    cres = asyncio.run(db.confirm_cash_deposit(res["deposit_id"], 1, "Boss"))
     assert oid in cres["closed_orders"]
     assert db.get_order(oid)["payment_confirmed"] == 1
 
@@ -31,9 +33,9 @@ def test_cash_deposit_not_closed_when_one_cent_short(isolated_db):
     db = isolated_db
     mgr = 5002
     oid = _shipped_order(db, mgr, 100.0)  # 10000 коп.
-    res = db.create_cash_deposit(mgr, 99.99, allocations=[(oid, 99.99)])  # 9999 коп.
+    res = asyncio.run(db.create_cash_deposit(mgr, 99.99, allocations=[(oid, 99.99)]))  # 9999 коп.
     assert res["ok"], res
-    cres = db.confirm_cash_deposit(res["deposit_id"], 1, "Boss")
+    cres = asyncio.run(db.confirm_cash_deposit(res["deposit_id"], 1, "Boss"))
     # 1 копейка не покрыта → заказ НЕ закрываем (раньше +0.01 эпсилон закрывал).
     assert oid not in cres["closed_orders"]
     assert db.get_order(oid)["payment_confirmed"] == 0
@@ -44,7 +46,7 @@ def test_open_orders_for_deposit_remaining_in_cents(isolated_db):
     mgr = 5003
     oid = _shipped_order(db, mgr, 100.0)
     # частично покрыли pending-сдачей на 30.00
-    db.create_cash_deposit(mgr, 30.0, allocations=[(oid, 30.0)])
-    rows = {o["id"]: o for o in db.get_manager_open_orders_for_deposit(mgr)}
+    asyncio.run(db.create_cash_deposit(mgr, 30.0, allocations=[(oid, 30.0)]))
+    rows = {o["id"]: o for o in asyncio.run(db.get_manager_open_orders_for_deposit(mgr))}
     assert oid in rows
     assert rows[oid]["remaining"] == 70.0  # 10000 − 3000 = 7000 коп.

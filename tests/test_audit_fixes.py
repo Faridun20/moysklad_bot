@@ -118,11 +118,11 @@ def test_pending_deposit_not_double_allocated(isolated_db):
     db = isolated_db
     db.set_role(1, "m", "M", "manager")
     _shipped_order(db, owner=1, qty=1, price=250.0)
-    d1 = db.create_cash_deposit(1, 250.0)
+    d1 = asyncio.run(db.create_cash_deposit(1, 250.0))
     assert d1["ok"] and asyncio.run(db.get_cash_deposit_orders(d1["deposit_id"]))
     # после первой pending-сдачи остаток заказа исчерпан — вторая ничего не берёт
-    assert db.get_manager_open_orders_for_deposit(1) == []
-    d2 = db.create_cash_deposit(1, 250.0)
+    assert asyncio.run(db.get_manager_open_orders_for_deposit(1)) == []
+    d2 = asyncio.run(db.create_cash_deposit(1, 250.0))
     assert d2["ok"]
     assert asyncio.run(db.get_cash_deposit_orders(d2["deposit_id"])) == []
 
