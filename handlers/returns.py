@@ -29,6 +29,7 @@ from services.roles import (
 )
 from utils.formatters import DIV
 from utils.helpers import esc
+from utils.keyboards import next_actions_keyboard
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -418,4 +419,5 @@ async def cb_return_confirm(call: CallbackQuery, bot: Bot):
     await call.message.edit_text(
         original + f"\n\n{DIV}\n✅ <b>Подтверждено</b> ({res['order_status']}) — {esc(name)}",
         parse_mode="HTML",
+        reply_markup=next_actions_keyboard([("↩️ Ещё возвраты", "ret_pending"), ("🏠 Меню", "menu")]),
     )

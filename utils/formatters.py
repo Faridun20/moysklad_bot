@@ -55,6 +55,11 @@ def format_stock_page(rows: list[dict], page: int, cat_name: str = "") -> str:
         # Остаток + резерв в одну строку
         reserve_str = f"   <i>резерв: {reserve} {unit}</i>" if reserve else ""
         lines.append(f"    <code>{stock} {unit}</code>{reserve_str}")
+        # Цена продажи (если задана через /prices) — прямо в каталоге, чтобы
+        # не уходить в /prices ради уточнения. Прикрепляется в handlers/stock.
+        price_str = r.get("_sale_price_str")
+        if price_str:
+            lines.append(f"    {price_str}")
         lines.append("")
 
     lines.append(DIV2)

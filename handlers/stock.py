@@ -12,6 +12,8 @@ from services.roles import (
     can_view_stock,
 )
 from services.moysklad import get_all_stock, get_categories
+from services import async_db as adb
+from config import BASE_CURRENCY
 from utils.helpers import extract_id_from_href, extract_href, user_safe_error
 from utils.formatters import format_stock_page
 from utils.keyboards import stock_nav_keyboard, categories_keyboard
@@ -19,6 +21,22 @@ from utils.keyboards import stock_nav_keyboard, categories_keyboard
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+
+async def _attach_prices(rows: list[dict]) -> None:
+    """Прикрепить к строкам остатков цену продажи (из /prices) → r['_sale_price_str'].
+    Один батч-запрос; форматтер потом просто рендерит поле. Best-effort."""
+    try:
+        prices = await adb.get_all_product_prices()
+    except Exception:
+        return
+    by_ms = {p["ms_id"]: p for p in prices}
+    for r in rows:
+        ms_id = extract_id_from_href(extract_href(r))
+        p = by_ms.get(ms_id)
+        if p and p.get("sale_price"):
+            cur = p.get("currency") or BASE_CURRENCY
+            r["_sale_price_str"] = f"💵 {int(round(p['sale_price']))} {cur}"
 
 # TTL-кэши в памяти (на чат). Чистятся ленивым GC при превышении лимита.
 _CATEGORIES_TTL = 300.0  # 5 мин — категории редко меняются
@@ -171,6 +189,7 @@ async def show_stock_all(bot: Bot, chat_id: int, page: int):
         rows = await get_all_stock()
         if not rows:
             return await bot.send_message(chat_id, "📦 Склад пуст.")
+        await _attach_prices(rows)
         _cache_put(
             stock_cache,
             chat_id,
@@ -196,6 +215,7 @@ async def show_stock_category(bot: Bot, chat_id: int, page: int, idx: int, cat: 
         cat_id = extract_id_from_href(extract_href(cat))
         cat_name = cat.get("name", "—")
         rows = [r for r in all_rows if extract_id_from_href(extract_href(r, "folder")) == cat_id]
+        await _attach_prices(rows)
         _cache_put(
             stock_cache,
             chat_id,
