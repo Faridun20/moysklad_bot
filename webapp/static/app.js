@@ -1025,7 +1025,7 @@ function renderOrdersMain() {
         if (!ok) return;
         btn.disabled = true;
         try {
-          await api('/api/orders/ship', { order_id: id });
+          await api('/api/orders/ship', { order_id: id, idempotency_key: idemKey() });
           tg.HapticFeedback?.notificationOccurred('success');
           tg.showAlert(`🚚 Заказ #${id} отгружен`);
           ordersData = null;
@@ -1571,6 +1571,7 @@ async function submitOrder() {
       order_id: currentDraftOrder.id,
       payment_type: paymentType,
       due_date: dueDate || null,
+      idempotency_key: idemKey(),
     });
     tg.HapticFeedback?.notificationOccurred('success');
     tg.showAlert(`✅ Заявка #${result.req_id} отправлена руководителю!`);
@@ -1671,7 +1672,7 @@ async function handleRequest(reqId, action) {
   // Блокируем повторные клики, пока запрос в полёте.
   document.querySelectorAll('.btn-approve, .btn-reject').forEach(b => (b.disabled = true));
   try {
-    await api(path, { req_id: Number(reqId) });
+    await api(path, { req_id: Number(reqId), idempotency_key: idemKey() });
     tg.showAlert(action === 'approve' ? '✅ Заявка одобрена' : '❌ Заявка отклонена');
   } catch (e) {
     tg.showAlert(`❌ ${e.message}`);
@@ -2318,7 +2319,7 @@ async function renderCashbox(container) {
       if (reason.length < 3) { tg.showAlert('❌ Опишите причину'); return; }
       haptic('light');
       retBtn.disabled = true;
-      api('/api/returns/create', { order_id: orderId, reason, refund_method: selectedRefund })
+      api('/api/returns/create', { order_id: orderId, reason, refund_method: selectedRefund, idempotency_key: idemKey() })
         .then(r => { tg.showAlert(`✅ Возврат #${r.return_id} отправлен на подтверждение`); renderCashbox(container); })
         .catch(e => { tg.showAlert('❌ ' + e.message); retBtn.disabled = false; });
     });
@@ -2333,7 +2334,7 @@ async function renderCashbox(container) {
       if (isNaN(amount) || amount <= 0) { tg.showAlert('❌ Введите положительную сумму'); return; }
       haptic('light');
       createBtn.disabled = true;
-      api('/api/deposits/create', { amount })
+      api('/api/deposits/create', { amount, idempotency_key: idemKey() })
         .then(r => { tg.showAlert(`✅ Сдача #${r.deposit_id} отправлена на подтверждение`); renderCashbox(container); })
         .catch(e => { tg.showAlert('❌ ' + e.message); createBtn.disabled = false; });
     });
@@ -2344,7 +2345,7 @@ async function renderCashbox(container) {
     const id = card.dataset.dep;
     card.querySelector('.dep-confirm').addEventListener('click', () => {
       haptic('light');
-      api('/api/deposits/confirm', { deposit_id: Number(id) })
+      api('/api/deposits/confirm', { deposit_id: Number(id), idempotency_key: idemKey() })
         .then(() => { tg.showAlert('✅ Сдача подтверждена'); renderCashbox(container); })
         .catch(e => tg.showAlert('❌ ' + e.message));
     });
@@ -2363,7 +2364,7 @@ async function renderCashbox(container) {
   container.querySelectorAll('.debt-card[data-ret]').forEach(card => {
     card.querySelector('.ret-confirm').addEventListener('click', () => {
       haptic('light');
-      api('/api/returns/confirm', { return_id: Number(card.dataset.ret) })
+      api('/api/returns/confirm', { return_id: Number(card.dataset.ret), idempotency_key: idemKey() })
         .then(() => { tg.showAlert('✅ Возврат подтверждён'); renderCashbox(container); })
         .catch(e => tg.showAlert('❌ ' + e.message));
     });
