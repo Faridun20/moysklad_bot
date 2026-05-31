@@ -52,6 +52,31 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Сильные ссылки на фоновые задачи. asyncio держит на Task только СЛАБУЮ
+# ссылку — задача без внешней strong-ref может быть собрана GC ещё до
+# завершения (CPython, документировано). Стартовые fire-and-forget таски
+# (init_demand/initial_snapshot/register_webhooks) попадают сюда, иначе
+# рискуют молча умереть на полпути.
+_startup_tasks: set[asyncio.Task] = set()
+
+
+def _log_task_exception(task: asyncio.Task) -> None:
+    """done-callback: логирует необработанное исключение фоновой задачи.
+    Раньше упавшая задача (вне held-ссылки) исчезала без следа."""
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("Фоновая задача %s упала", task.get_name(), exc_info=task.exception())
+
+
+def _spawn_startup(coro, name: str) -> asyncio.Task:
+    """create_task с удержанием сильной ссылки (страховка от GC) + логом
+    исключения через done-callback."""
+    task = asyncio.create_task(coro, name=name)
+    _startup_tasks.add(task)
+    task.add_done_callback(_startup_tasks.discard)
+    task.add_done_callback(_log_task_exception)
+    return task
+
+
 class RateLimitMiddleware(BaseMiddleware):
     """
     Бросает «вы шлёте слишком быстро» вместо обработки, если юзер
@@ -233,12 +258,17 @@ def start_background_tasks(bot: Bot) -> list[asyncio.Task]:
             "ENABLE_SCHEDULED_REPORTS=0 — отчёты внутри бота отключены, "
             "ожидается запуск через Railway Cron Jobs."
         )
-    return [
+    tasks = [
         asyncio.create_task(
             c, name=getattr(c, "__qualname__", None) or getattr(c, "__name__", "task")
         )
         for c in coros
     ]
+    # Лог необработанного исключения: упавший loop (notifier/snapshot) раньше
+    # затихал молча, хотя ссылку держит caller (bg_tasks).
+    for t in tasks:
+        t.add_done_callback(_log_task_exception)
+    return tasks
 
 
 async def _close_db_pool() -> None:
@@ -389,7 +419,7 @@ async def _run_webapp_only():
         except Exception:
             logger.exception("init_demand_context failed")
 
-    asyncio.create_task(_init_demand(), name="init_demand")
+    _spawn_startup(_init_demand(), "init_demand")
 
     try:
         await webapp_server.start_webapp()
@@ -451,7 +481,7 @@ async def main():
         except Exception:
             logger.exception("initial snapshot failed")
 
-    asyncio.create_task(_initial_snapshot(), name="initial_snapshot")
+    _spawn_startup(_initial_snapshot(), "initial_snapshot")
 
     # Регистрируем webhook-подписки в МойСклад (идемпотентно).
     # При смене WEBAPP_URL или ротации MS_WEBHOOK_SECRET — старые подписки
@@ -463,7 +493,7 @@ async def main():
         except Exception:
             logger.exception("ensure_subscriptions failed")
 
-    asyncio.create_task(_register_webhooks(), name="register_webhooks")
+    _spawn_startup(_register_webhooks(), "register_webhooks")
 
     # Готовим контекст для push-а отгрузок в МойСклад (org/store/attribute).
     # Без него cb_approve_request не сможет создавать demand-документы.
@@ -474,7 +504,7 @@ async def main():
         except Exception:
             logger.exception("init_demand_context failed")
 
-    asyncio.create_task(_init_demand(), name="init_demand")
+    _spawn_startup(_init_demand(), "init_demand")
 
     # Закрепляем кнопку «Открыть» в композере чата, если задан WEBAPP_URL.
     # Это делает WebApp доступным в один тап рядом с полем ввода.
@@ -490,7 +520,9 @@ async def main():
     if BOT_MODE == "all":
         from webapp import server as webapp_server
 
-        bg_tasks.append(asyncio.create_task(webapp_server.start_webapp(), name="webapp"))
+        _wt = asyncio.create_task(webapp_server.start_webapp(), name="webapp")
+        _wt.add_done_callback(_log_task_exception)
+        bg_tasks.append(_wt)
 
     # ─── Режим приёма апдейтов ───────────────────────────────────
     # Webhook: webapp принимает POST'ы от Telegram, мы не дёргаем
