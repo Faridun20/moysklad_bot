@@ -906,15 +906,22 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
         {"name": name, "revenue": d["sum"] / 100, "count": d["count"]}
         for name, d in current.get("top_clients", [])[:10]
     ]
-    by_manager: dict = {}
-    for s in shipments:
-        mname = _extract_tg_attribute(s, "telegram_full_name") or "Прочее (вручную)"
-        m = by_manager.setdefault(mname, {"sum": 0, "count": 0})
-        m["sum"] += s.get("sum", 0) or 0
-        m["count"] += 1
+    # Топ менеджеров — из ЛОКАЛЬНЫХ orders (надёжно), а не из МС-атрибута
+    # telegram_full_name (он ставится лишь когда demand создал бот → раньше
+    # список был почти всегда «Прочее (вручную)»). Группировка по orders.user_id.
+    perf = await adb.get_manager_performance(
+        since.strftime("%Y-%m-%d %H:%M:%S"), until.strftime("%Y-%m-%d %H:%M:%S")
+    )
     top_managers = [
-        {"name": name, "revenue": d["sum"] / 100, "count": d["count"]}
-        for name, d in sorted(by_manager.items(), key=lambda kv: kv[1]["sum"], reverse=True)[:10]
+        {
+            "name": m["full_name"],
+            "revenue": m["revenue"],
+            "count": m["shipped"],
+            "orders": m["orders_count"],
+            "debt": m["debt"],
+            "returns": m["returns_count"],
+        }
+        for m in perf[:10]
     ]
 
     return {

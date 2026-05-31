@@ -1724,7 +1724,7 @@ function renderAnalyticsContent(data) {
       <span class="top-medal">${medals[i] || (i + 1)}</span>
       <div class="top-info">
         <div class="top-name">${escapeHtml(m.name)}</div>
-        <div class="top-sub">${fmt(m.revenue)} $ · ${m.count} отгр.</div>
+        <div class="top-sub">${fmt(m.revenue)} $ · ${m.count} отгр.${m.orders != null ? ` · ${m.orders} зак.` : ''}${m.debt ? ` · долг ${fmt(m.debt)} $` : ''}</div>
       </div>
     </div>`).join('');
   const clientsBlock = clientItems

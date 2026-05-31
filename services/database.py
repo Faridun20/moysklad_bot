@@ -2945,6 +2945,96 @@ _SUM_PAYMENTS_CENTS = "COALESCE(SUM(COALESCE(amount_cents, CAST(round(amount * 1
 _SUM_ORDER_TOTAL_CENTS = (
     "COALESCE(SUM(CAST(round(quantity * COALESCE(price_cents, round(price * 100))) AS INTEGER)), 0)"
 )
+
+
+async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
+    """Аналитика по менеджерам (boss) из ЛОКАЛЬНЫХ orders, GROUP BY user_id за
+    период [since_iso, until_iso] по created_at. Надёжный источник (в отличие от
+    МС-аналитики, где нет привязки к менеджеру). Без N+1 — батч items/payments/
+    returns. Деньги — в мажорных единицах. Сортировка по выручке убыв.
+
+    На менеджера: orders_count (создано), approved/shipped, revenue (по статусам
+    shipped/paid/partially_returned/returned), debt (остаток по неоплаченным
+    shipped/partially_returned), returns_count. Имя/роль — из user_roles."""
+    orders = await adb_core.fetch(
+        "SELECT * FROM orders WHERE created_at >= $1 AND created_at <= $2 "
+        "AND (deleted_at IS NULL)",
+        since_iso, until_iso,
+    )
+    if not orders:
+        return []
+    order_ids = [o["id"] for o in orders]
+    items_by_order = await get_order_items_by_ids(order_ids)
+    payments_by_order = await get_payments_for_orders(order_ids)
+
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(order_ids)))
+    ret_rows = await adb_core.fetch(
+        f"SELECT order_id, COUNT(*) AS c FROM returns "
+        f"WHERE order_id IN ({placeholders}) AND status = 'confirmed' AND (deleted_at IS NULL) "
+        f"GROUP BY order_id",
+        *order_ids,
+    )
+    returns_by_order = {r["order_id"]: int(r["c"]) for r in ret_rows}
+
+    revenue_statuses = {"shipped", "paid", "partially_returned", "returned"}
+    debt_statuses = {"shipped", "partially_returned"}
+
+    agg: dict[int, dict] = {}
+    for o in orders:
+        uid = o["user_id"]
+        m = agg.setdefault(
+            uid,
+            {
+                "user_id": uid,
+                "full_name": o.get("full_name") or str(uid),
+                "orders_count": 0,
+                "approved": 0,
+                "shipped": 0,
+                "revenue_cents": 0,
+                "debt_cents": 0,
+                "returns_count": 0,
+            },
+        )
+        m["orders_count"] += 1
+        status = o.get("status")
+        if status == "approved":
+            m["approved"] += 1
+        elif status == "shipped":
+            m["shipped"] += 1
+        items = items_by_order.get(o["id"], [])
+        total_cents = sum(
+            money.mul_qty(_price_cents(it), it.get("quantity", 0) or 0) for it in items
+        )
+        if status in revenue_statuses:
+            m["revenue_cents"] += total_cents
+        if status in debt_statuses and not o.get("payment_confirmed"):
+            confirmed = sum(
+                _amount_cents(p)
+                for p in payments_by_order.get(o["id"], [])
+                if p["status"] == "confirmed"
+            )
+            m["debt_cents"] += max(0, total_cents - confirmed)
+        m["returns_count"] += returns_by_order.get(o["id"], 0)
+
+    users = {u["user_id"]: u for u in await asyncio.to_thread(get_all_users)}
+    result = []
+    for uid, m in agg.items():
+        u = users.get(uid)
+        result.append(
+            {
+                "user_id": uid,
+                "full_name": (u.get("full_name") if u else None) or m["full_name"],
+                "role": (u.get("role") if u else None) or "—",
+                "orders_count": m["orders_count"],
+                "approved": m["approved"],
+                "shipped": m["shipped"],
+                "revenue": float(money.from_cents(m["revenue_cents"])),
+                "debt": float(money.from_cents(m["debt_cents"])),
+                "returns_count": m["returns_count"],
+            }
+        )
+    result.sort(key=lambda x: x["revenue"], reverse=True)
+    return result
 _SUM_RETURNS_CENTS = (
     "COALESCE(SUM(COALESCE(total_amount_cents, CAST(round(total_amount * 100) AS INTEGER))), 0)"
 )
