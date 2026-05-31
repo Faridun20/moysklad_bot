@@ -455,7 +455,7 @@ async def cb_ord_my(call: CallbackQuery):
     await call.message.answer(
         f"📋 <b>Мои заказы</b> ({len(orders)}):",
         parse_mode="HTML",
-        reply_markup=my_orders_keyboard(orders),
+        reply_markup=await my_orders_keyboard(orders),
     )
 
 
@@ -477,5 +477,5 @@ async def cb_ord_requests(call: CallbackQuery):
     await call.message.answer(
         f"⏳ <b>Заявки ({len(requests)}):</b>",
         parse_mode="HTML",
-        reply_markup=pending_requests_keyboard(requests, orders_by_id),
+        reply_markup=await pending_requests_keyboard(requests, orders_by_id),
     )

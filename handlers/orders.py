@@ -117,7 +117,37 @@ def _fmt_num(n: float) -> str:
     return money.format_cents(money.to_cents(n or 0), decimals=2, grouping=False, trim=True)
 
 
-def format_order(order: dict, items: list[dict]) -> str:
+def _order_payment_block(order: dict, summary: dict | None) -> str:
+    """Блок оплаты для карточки заказа (UX: вся инфа в одном месте, без /debts).
+    Показывает тип оплаты + срок (для credit) + оплачено/остаток (если есть
+    summary). Пусто для draft/rejected/cancelled."""
+    status = order.get("status")
+    if status in ("draft", "rejected", "cancelled"):
+        return ""
+    currency = order.get("currency") or _BASE_CURRENCY
+    ptype = order.get("payment_type") or "paid"
+    parts = [DIV2]
+    if ptype == "credit":
+        due = order.get("due_date") or "—"
+        parts.append(f"💳 <b>В долг</b> до <b>{_esc(due)}</b>")
+    else:
+        parts.append("💵 Оплата сразу")
+    if summary:
+        confirmed = summary.get("confirmed", 0) or 0
+        pending = summary.get("pending", 0) or 0
+        remaining = summary.get("remaining", 0) or 0
+        if confirmed > 0 or pending > 0:
+            extra = f" · ⏳ В подтверждении: {_cur(pending, currency)}" if pending > 0 else ""
+            parts.append(
+                f"💵 Оплачено: <b>{_cur(confirmed, currency)}</b>{extra}"
+                f" · 📎 Остаток: <b>{_cur(remaining, currency)}</b>"
+            )
+        elif remaining > 0 and ptype == "credit":
+            parts.append(f"📎 Остаток: <b>{_cur(remaining, currency)}</b>")
+    return "\n".join(parts)
+
+
+def format_order(order: dict, items: list[dict], summary: dict | None = None) -> str:
     status_emoji = STATUS_EMOJI.get(order["status"], "📋")
     status_name = STATUS_NAME.get(order["status"], order["status"])
     agent_str = (
@@ -177,6 +207,10 @@ def format_order(order: dict, items: list[dict]) -> str:
     else:
         lines.append("<i>Товары не добавлены</i>")
 
+    pay_block = _order_payment_block(order, summary)
+    if pay_block:
+        lines.append(pay_block)
+
     return "\n".join(lines)
 
 
@@ -230,7 +264,42 @@ def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
     )
 
 
+async def build_credit_context(order: dict, items: list[dict]) -> str:
+    """Кредит-контекст клиента прямо в заявке боссу (долг/лимит/после заказа) —
+    чтобы решать одобрение НЕ выходя в /limit. '' для paid-заказов / без agent_id."""
+    if (order.get("payment_type") or "paid") != "credit" or not order.get("agent_id"):
+        return ""
+    total = sum(_line_total(it) for it in items)
+    try:
+        chk = await adb.check_credit_limit(order["agent_id"], total)
+    except Exception:
+        return ""
+    flag = (
+        "🔴 <b>ПРЕВЫШЕНИЕ ЛИМИТА</b>"
+        if chk.get("over_limit")
+        else "🟢 в пределах лимита"
+    )
+    return (
+        f"\n\n📊 <b>Кредит клиента</b> ({_BASE_CURRENCY}):"
+        f"\n   долг {_fmt_num(chk['current_debt'])} / лимит {_fmt_num(chk['limit'])}"
+        f"\n   после заказа: <b>{_fmt_num(chk['projected'])}</b>  {flag}"
+    )
+
+
 # ─── Клавиатуры ──────────────────────────────────────────────────────────────
+
+
+def _short_amount(total: float, currency: str) -> str:
+    """Компактная сумма для текста кнопки: «1 500 USD»."""
+    return f"{int(round(total)):,}".replace(",", " ") + f" {currency}"
+
+
+async def _order_totals(order_ids: list[int]) -> dict[int, float]:
+    """Батч-суммы заказов (для обогащения списков-кнопок). Без N+1."""
+    if not order_ids:
+        return {}
+    items_by = await adb.get_order_items_by_ids(order_ids)
+    return {oid: sum(_line_total(it) for it in items_by.get(oid, [])) for oid in order_ids}
 
 
 def order_actions_keyboard(order_id: int, status: str, is_owner: bool):
@@ -273,30 +342,36 @@ def request_approve_keyboard(req_id: int):
     return kb.as_markup()
 
 
-def my_orders_keyboard(orders: list[dict]):
+async def my_orders_keyboard(orders: list[dict]):
+    """Список заказов: эмодзи-статус + клиент + сумма прямо в кнопке (скан без
+    открытия каждого). Суммы — батчем."""
+    head = orders[:10]
+    totals = await _order_totals([o["id"] for o in head])
     kb = InlineKeyboardBuilder()
-    for o in orders[:10]:
+    for o in head:
         emoji = STATUS_EMOJI.get(o["status"], "📋")
-        kb.button(
-            text=f"{emoji} Заказ #{o['id']} · {STATUS_NAME.get(o['status'], '')}",
-            callback_data=f"ord_view:{o['id']}",
-        )
+        agent = (o.get("agent_name") or "—")[:14]
+        amt = _short_amount(totals.get(o["id"], 0.0), o.get("currency") or _BASE_CURRENCY)
+        kb.button(text=f"{emoji} #{o['id']} · {agent} · {amt}", callback_data=f"ord_view:{o['id']}")
     kb.button(text="➕ Новый заказ", callback_data="ord_new")
     kb.button(text="🏠 Меню", callback_data="menu")
     kb.adjust(1)
     return kb.as_markup()
 
 
-def pending_requests_keyboard(requests: list[dict], orders_by_id: dict):
-    kb = InlineKeyboardBuilder()
+async def pending_requests_keyboard(requests: list[dict], orders_by_id: dict):
+    """Заявки на апрув: клиент + сумма + 💳 (credit) прямо в кнопке — босс видит
+    масштаб/тип сделки без открытия каждой."""
     head = requests[:10]
+    totals = await _order_totals([r["order_id"] for r in head])
+    kb = InlineKeyboardBuilder()
     for r in head:
-        order = orders_by_id.get(r["order_id"])
-        name = order["full_name"] if order else "—"
-        kb.button(
-            text=f"⏳ Заявка #{r['id']} · {name}",
-            callback_data=f"req_view:{r['id']}",
-        )
+        order = orders_by_id.get(r["order_id"]) or {}
+        agent = (order.get("agent_name") or order.get("full_name") or "—")[:14]
+        cur = order.get("currency") or _BASE_CURRENCY
+        amt = _short_amount(totals.get(r["order_id"], 0.0), cur)
+        credit = " 💳" if (order.get("payment_type") == "credit") else ""
+        kb.button(text=f"⏳ #{r['id']} · {agent} · {amt}{credit}", callback_data=f"req_view:{r['id']}")
     kb.button(text="🏠 Меню", callback_data="menu")
     kb.adjust(1)
     return kb.as_markup()
@@ -353,7 +428,7 @@ async def cmd_my_orders(message: Message):
     await message.answer(
         f"📋 <b>Мои заказы</b> ({len(orders)}):",
         parse_mode="HTML",
-        reply_markup=my_orders_keyboard(orders),
+        reply_markup=await my_orders_keyboard(orders),
     )
 
 
@@ -373,7 +448,7 @@ async def cmd_orders(message: Message):
     await message.answer(
         f"{DIV}\n⏳ <b>Заявки на отгрузку</b>\n<code>Ожидают рассмотрения: {len(requests)}</code>",
         parse_mode="HTML",
-        reply_markup=pending_requests_keyboard(requests, orders_by_id),
+        reply_markup=await pending_requests_keyboard(requests, orders_by_id),
     )
 
 
@@ -421,7 +496,14 @@ async def cb_view_order(call: CallbackQuery):
         return await call.message.answer("⛔ Нет доступа к этому заказу.")
 
     items = await adb.get_order_items(order_id)
-    txt = format_order(order, items)
+    # Для не-черновиков подтягиваем сводку оплаты, чтобы карточка показала
+    # оплачено/остаток/срок — без перехода в /debts.
+    summary = (
+        await adb.get_order_payment_summary(order_id)
+        if order["status"] not in ("draft", "rejected", "cancelled")
+        else None
+    )
+    txt = format_order(order, items, summary=summary)
     kb = order_actions_keyboard(order_id, order["status"], is_owner)
     await call.message.answer(txt, parse_mode="HTML", reply_markup=kb)
 
@@ -852,6 +934,7 @@ async def cb_submit_order(call: CallbackQuery, state: FSMContext, bot: Bot):
     from services.order_workflow import resubmit_diff_line
 
     notify_text = format_request_notify(order, items, req_id)
+    notify_text += await build_credit_context(order, items)  # UX: долг/лимит клиента инлайн
     notify_text += await resubmit_diff_line(order_id, items)  # #30: diff после доработки
     await notify_shipment_request(
         bot,
@@ -930,6 +1013,7 @@ async def cb_view_request(call: CallbackQuery):
 
     items = await adb.get_order_items(req["order_id"])
     txt = format_request_notify(order, items, req_id)
+    txt += await build_credit_context(order, items)  # UX: долг/лимит клиента инлайн
 
     if req["status"] == "pending":
         await call.message.answer(
