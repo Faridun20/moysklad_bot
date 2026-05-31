@@ -1211,6 +1211,11 @@ async def api_payments_pending(request: Request):
                 "total": total,
                 "pending": pending,
                 "items_count": len(items),
+                # Превью позиций — босс видит, ЧТО подтверждает, без открытия заказа.
+                "items": [
+                    {"name": it["product_name"], "quantity": it["quantity"], "unit": it["unit"]}
+                    for it in items[:3]
+                ],
                 "created_at": (o.get("created_at") or "")[:16],
             }
         )

@@ -450,6 +450,7 @@ async function renderHome() {
 let stockData = null;          // { products, categories }
 let stockCurrentCat = 'all';   // id выбранной категории или 'all'
 let stockSearch = '';
+let stockInStockOnly = false;  // фильтр «только в наличии»
 let stockLimit = 200;          // сколько товаров показываем («Показать ещё» +200)
 
 async function renderStock() {
@@ -490,6 +491,7 @@ function _stockFiltered() {
   return products.filter(p => {
     if (stockCurrentCat !== 'all' && p.folder_id !== stockCurrentCat) return false;
     if (search && !p.name.toLowerCase().includes(search)) return false;
+    if (stockInStockOnly && !(p.stock > 0)) return false;
     return true;
   });
 }
@@ -629,6 +631,10 @@ function renderStockContent() {
     <div class="form-row" style="margin: 8px 0;">
       <input id="stock-search" class="form-input" placeholder="🔎 Поиск товара…" value="${escapeHtml(stockSearch)}">
     </div>
+    <div class="cat-row">
+      <button class="cat-btn ${!stockInStockOnly ? 'active' : ''}" data-instock="0">Все</button>
+      <button class="cat-btn ${stockInStockOnly ? 'active' : ''}" data-instock="1">📦 В наличии</button>
+    </div>
     <div class="section-label">Товары</div>
     <div class="stock-list" id="stock-list"></div>
     <div id="stock-trunc"></div>
@@ -656,6 +662,17 @@ function renderStockContent() {
     });
     // не дёргаем фокус, чтобы не открывать клавиатуру при первом рендере
   }
+  document.querySelectorAll('[data-instock]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('light');
+      stockInStockOnly = btn.dataset.instock === '1';
+      stockLimit = 200;
+      document.querySelectorAll('[data-instock]').forEach(b =>
+        b.classList.toggle('active', b.dataset.instock === (stockInStockOnly ? '1' : '0'))
+      );
+      renderStockList();
+    });
+  });
 }
 
 function escapeHtml(s) {
@@ -1907,8 +1924,9 @@ function renderPaymentsContent(container) {
           <div class="debt-amount">${fmt(d.pending)} ${escapeHtml(d.currency)}</div>
         </div>
         <div class="debt-card-mid">
-          <span class="debt-meta">#${d.order_id} · ${d.items_count} поз. · ${escapeHtml(d.full_name)}</span>
+          <span class="debt-meta">#${d.order_id} · из ${fmt(d.total)} ${escapeHtml(d.currency)} · ${d.items_count} поз. · ${escapeHtml(d.full_name)}</span>
         </div>
+        ${(d.items || []).length ? `<div class="debt-items-preview">📦 ${d.items.slice(0, 2).map(it => escapeHtml(it.name) + ' ×' + it.quantity).join(', ')}${d.items_count > 2 ? ' +' + (d.items_count - 2) : ''}</div>` : ''}
         <div class="debt-actions">
           <button class="btn-confirm-pay" data-id="${d.order_id}">✅ Подтвердить</button>
           <button class="btn-reject-pay"  data-id="${d.order_id}">❌ Отклонить</button>
