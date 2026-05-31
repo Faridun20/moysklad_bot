@@ -1598,6 +1598,23 @@ async function renderPendingRequests() {
         </div>
         ${r.agent_name ? `<div class="order-agent">🏢 ${r.agent_name}</div>` : ''}
         <div class="order-meta"><span>${r.created_at}</span></div>
+        ${(() => {
+          const bits = [];
+          if (r.payment_type === 'credit') {
+            const due = r.due_date ? ' до ' + String(r.due_date).split('-').reverse().join('.') : '';
+            bits.push(`<span class="order-pay order-pay--credit">💳 В долг${due}</span>`);
+          } else {
+            bits.push(`<span class="order-pay">💵 Оплата сразу</span>`);
+          }
+          if (r.total > 0) bits.push(`<span class="order-pay">💰 ${Math.round(r.total).toLocaleString('ru-RU')}</span>`);
+          return `<div class="order-pay-row">${bits.join('')}</div>`;
+        })()}
+        ${r.credit ? `
+          <div class="credit-ctx ${r.credit.over_limit ? 'credit-ctx--bad' : 'credit-ctx--ok'}">
+            📊 Кредит клиента: долг с учётом заявки <b>${fmt(r.credit.effective_debt)}</b>
+            / лимит <b>${fmt(r.credit.limit)}</b>
+            ${r.credit.over_limit ? '🔴 превышение' : '🟢 в пределах'}
+          </div>` : ''}
         <div class="order-items">
           ${r.items.slice(0, 5).map(it =>
             `<div class="order-item">• ${it.name}: <b>${it.quantity} ${it.unit}</b></div>`

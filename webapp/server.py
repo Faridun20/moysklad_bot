@@ -1493,26 +1493,36 @@ async def api_pending_requests(request: Request):
         order = orders_by_id.get(r["order_id"])
         items = items_by_order.get(r["order_id"], []) if order else []
         total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
-        result.append(
-            {
-                "id": r["id"],
-                "order_id": r["order_id"],
-                "full_name": r["full_name"],
-                "status": r["status"],
-                "created_at": r["created_at"][:16],
-                "agent_name": order.get("agent_name", "") if order else "",
-                "total": total,
-                "items": [
-                    {
-                        "name": it["product_name"],
-                        "quantity": it["quantity"],
-                        "unit": it["unit"],
-                        "price": float(it.get("price", 0) or 0),
-                    }
-                    for it in items
-                ],
-            }
-        )
+        ptype = (order.get("payment_type") or "paid") if order else "paid"
+        entry = {
+            "id": r["id"],
+            "order_id": r["order_id"],
+            "full_name": r["full_name"],
+            "status": r["status"],
+            "created_at": r["created_at"][:16],
+            "agent_name": order.get("agent_name", "") if order else "",
+            "payment_type": ptype,
+            "due_date": order.get("due_date") if order else None,
+            "total": total,
+            "items": [
+                {
+                    "name": it["product_name"],
+                    "quantity": it["quantity"],
+                    "unit": it["unit"],
+                    "price": float(it.get("price", 0) or 0),
+                }
+                for it in items
+            ],
+        }
+        # Кредит-контекст для credit-заявок — босс видит долг/лимит ПЕРЕД апрувом,
+        # не уходя в «Лимиты». Общий helper (без double-count, как в боте).
+        if order and order.get("agent_id") and ptype == "credit":
+            from services.order_workflow import order_credit_context
+
+            ctx = await order_credit_context(order, total)
+            if ctx:
+                entry["credit"] = ctx
+        result.append(entry)
 
     return JSONResponse({"requests": result})
 
