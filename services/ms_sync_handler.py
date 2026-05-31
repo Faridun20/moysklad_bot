@@ -194,7 +194,18 @@ async def _handle_customerorder_updated(co_id: str) -> None:
     state_name = state.get("name", "")
     new_status = _STATE_TYPE_TO_STATUS.get(state_type)
 
-    if not new_status or new_status == local_status:
+    if not new_status:
+        # Regular/кастомный stateType — не маппим (без конфигурации аккаунта не
+        # знаем смысла). Но ЛОГИРУЕМ для наблюдаемости (дыра #4): видно, какие
+        # статусы реально шлёт МС, чтобы при необходимости добавить маппинг.
+        if state_name or state_type:
+            logger.info(
+                "customerorder.UPDATE %s заказ #%s: непереводимый статус МС "
+                "state='%s' stateType=%s — локальный статус не тронут",
+                co_id, order.get("id"), state_name, state_type,
+            )
+        return
+    if new_status == local_status:
         return
 
     order_id = order["id"]
@@ -267,6 +278,8 @@ async def apply_ms_customerorder_delete(order: dict, co_id: str) -> None:
             # Документ в МС уже удалён → reverse не нужен, помечаем синком.
             await adb.set_order_ms_cancel_synced(order_id)
         await adb.clear_order_ms_customerorder_id(order_id)
+        # Помечаем как удалённый в МС → исключаем из аналитики менеджеров.
+        await adb.set_order_ms_deleted(order_id)
         await adb.add_audit_log(
             0,
             "МойСклад",
@@ -286,6 +299,9 @@ async def apply_ms_customerorder_delete(order: dict, co_id: str) -> None:
 
     # Не approved (shipped/paid/cancelled/…): статус не трогаем, только ссылка.
     await adb.clear_order_ms_customerorder_id(order_id)
+    # Но помечаем как удалённый в МС → исключаем «фантомную» выручку из
+    # аналитики менеджеров (в учёте долгов заказ остаётся для ручной разборки).
+    await adb.set_order_ms_deleted(order_id)
     await adb.add_audit_log(
         0,
         "МойСклад",

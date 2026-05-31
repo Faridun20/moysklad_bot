@@ -2009,8 +2009,11 @@ function renderPaymentsContent(container) {
     `).join('')}</div>
   `;
 
-  container.innerHTML = `
-    ${pendingHtml}
+  // Руководитель только получает и подтверждает оплаты — ручной ввод
+  // «Нового платежа» (аренда и т.п.) ему не нужен; это операция
+  // бухгалтера/менеджера. Поэтому форму боссу/админу не показываем.
+  const isBossPay = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
+  const payFormHtml = isBossPay ? '' : `
     <div class="section-label">Новый платёж (не связан с заказом)</div>
     <div class="card">
       <div class="form-row">
@@ -2032,7 +2035,11 @@ function renderPaymentsContent(container) {
       <button id="pay-submit" class="btn-primary">Отправить</button>
       <div id="pay-status" class="pay-status"></div>
     </div>
+  `;
 
+  container.innerHTML = `
+    ${pendingHtml}
+    ${payFormHtml}
     <div class="section-label">История платежей</div>
     <div class="stock-list">${history}</div>
   `;
@@ -2047,8 +2054,8 @@ function renderPaymentsContent(container) {
     });
   });
 
-  // Отправка
-  container.querySelector('#pay-submit').addEventListener('click', async () => {
+  // Отправка (форма есть только у не-босса — иначе обработчик не вешаем)
+  container.querySelector('#pay-submit')?.addEventListener('click', async () => {
     const amount = parseFloat(container.querySelector('#pay-amount').value);
     const comment = container.querySelector('#pay-comment').value.trim();
     const status = container.querySelector('#pay-status');
@@ -2190,23 +2197,25 @@ async function renderFinance() {
   setScreenContext(`Финансы · ${FIN_LABELS[financeTab] || ''}`);
 
   const active = t => (financeTab === t ? 'active' : '');
-  const cashboxItem = canCashbox
-    ? `<button class="seg-item ${active('cashbox')}" data-tab="cashbox">${icon('cashbox')} Касса</button>`
-    : '';
-  // «Лимиты» — read-only аналитика для босса. Вынесена из ряда разделов в
-  // доп-ссылку справа, чтобы уровень 1 был ровно из 2–3 разделов и не переносился.
-  const limitsAux = isBoss
-    ? `<button class="seg-aux ${active('limits')}" data-tab="limits">${icon('gauge')} Лимиты</button>`
-    : '';
+  // Уровень 1 — единый ровный сегмент-контрол (текстом, как iOS-segmented):
+  // все доступные разделы одинаковыми пилюлями. Иконки тут НЕ ставим — 4 пилюли
+  // с иконками клиппятся на узком экране (это и был «сломанный» вид у
+  // руководителя: 3 пилюли + отдельная по стилю ссылка «Лимиты»). «Лимиты»
+  // теперь равноправная 4-я вкладка.
+  const sections = [
+    { key: 'debts', label: 'Долги' },
+    { key: 'payments', label: 'Платежи' },
+  ];
+  if (canCashbox) sections.push({ key: 'cashbox', label: 'Касса' });
+  if (isBoss) sections.push({ key: 'limits', label: 'Лимиты' });
 
   content.innerHTML = `
     <div class="seg-row">
       <div class="seg">
-        <button class="seg-item ${active('debts')}" data-tab="debts">${icon('wallet')} Долги</button>
-        <button class="seg-item ${active('payments')}" data-tab="payments">${icon('cash')} Платежи</button>
-        ${cashboxItem}
+        ${sections.map(s =>
+          `<button class="seg-item ${active(s.key)}" data-tab="${s.key}">${s.label}</button>`
+        ).join('')}
       </div>
-      ${limitsAux}
     </div>
     <div id="finance-body"></div>
   `;

@@ -68,6 +68,7 @@ def test_co_delete_keeps_shipped_order(isolated_db, monkeypatch):
     o = asyncio.run(db.get_order(oid))
     assert o["status"] == "shipped"  # деньги/остатки двигались — статус не трогаем
     assert o["ms_customerorder_id"] is None  # ссылка снята
+    assert o["ms_deleted_at"] is not None  # но помечен удалённым в МС → вне аналитики
 
 
 def test_co_delete_unknown_order_noop(isolated_db, monkeypatch):
@@ -109,6 +110,33 @@ def test_reconcile_cancels_deleted_co(isolated_db, monkeypatch):
     rc = asyncio.run(rec.main())
     assert rc == 0
     assert asyncio.run(db.get_order(oid))["status"] == "cancelled"
+
+
+def test_reconcile_marks_deleted_shipped(isolated_db, monkeypatch):
+    """Этап 1: реконсайл проверяет НЕ только approved. Shipped-заказ, чей CO удалён
+    в МС (пропущенный вебхук), помечается ms_deleted_at — уходит из аналитики, но
+    статус/деньги не трогаем. После обработки выпадает из набора реконсиляции."""
+    import aiohttp
+
+    import tasks.run_ms_reconcile as rec
+
+    db = isolated_db
+    _mock_notify(monkeypatch)
+
+    async def _b(path):
+        raise aiohttp.ClientResponseError(None, (), status=404)
+
+    _mock_ms_get(monkeypatch, _b)
+    oid = _mk_order(db, "shipped", "CO-SHIP")
+
+    rc = asyncio.run(rec.main())
+    assert rc == 0
+    o = asyncio.run(db.get_order(oid))
+    assert o["status"] == "shipped"          # статус не тронут
+    assert o["ms_deleted_at"] is not None    # помечен фантомом
+    assert o["ms_customerorder_id"] is None  # ссылка снята
+    # Выпал из набора реконсиляции (идемпотентно, повторно не дёргаем МС).
+    assert asyncio.run(db.get_orders_with_ms_customerorder()) == []
 
 
 def test_reconcile_keeps_existing_co(isolated_db, monkeypatch):
