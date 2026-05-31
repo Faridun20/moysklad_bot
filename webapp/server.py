@@ -30,6 +30,22 @@ from services.rate_limit import acquire as rate_limit_acquire
 _background_tasks: set[asyncio.Task] = set()
 
 
+def _spawn_bg(coro, name: str) -> asyncio.Task:
+    """Запустить фоновую задачу: держим сильную ссылку (иначе GC может убить
+    её до завершения) + логируем необработанное исключение (раньше fire-and-
+    forget create_task падал молча)."""
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    def _log_exc(t: asyncio.Task) -> None:
+        if not t.cancelled() and t.exception() is not None:
+            logger.error("Фоновая задача %s упала", name, exc_info=t.exception())
+
+    task.add_done_callback(_log_exc)
+    return task
+
+
 # ─── Idempotency cache ──────────────────────────────────────────────
 # Защита от double-click на confirm/reject платежей. Клиент посылает
 # `idempotency_key` (random UUID per действие); если запрос с тем же
@@ -389,9 +405,7 @@ async def ms_webhook(secret: str, request: Request):
         # Платежи / заказы покупателя: синхронизируем локальные данные
         from services.ms_sync_handler import handle_ms_events
 
-        _task = asyncio.create_task(handle_ms_events(events))
-        _background_tasks.add(_task)
-        _task.add_done_callback(_background_tasks.discard)
+        _spawn_bg(handle_ms_events(events), "handle_ms_events")
 
         # Новые отгрузки → уведомляем boss/admin МГНОВЕННО (раньше это делал
         # поллер раз в N секунд, отсюда задержка до нескольких минут). Дедуп
@@ -399,9 +413,7 @@ async def ms_webhook(secret: str, request: Request):
         from services.notifier import notify_new_shipment
 
         for did in _new_demand_ids_from_events(events):
-            _nt = asyncio.create_task(notify_new_shipment(did))
-            _background_tasks.add(_nt)
-            _nt.add_done_callback(_background_tasks.discard)
+            _spawn_bg(notify_new_shipment(did), f"notify_new_shipment:{did}")
 
     # МойСклад ждёт 200 быстро, иначе ретраит. Сам рефреш делаем в фоне.
     return JSONResponse({"ok": True, "received": len(events)})
@@ -2676,7 +2688,7 @@ async def api_agents(request: Request):
     if search:
         params["search"] = search
     result = await ms_get("entity/counterparty", params=params)
-    asyncio.create_task(snapshot.refresh_counterparties())
+    _spawn_bg(snapshot.refresh_counterparties(), "refresh_counterparties")
     return JSONResponse(
         {
             "agents": [
