@@ -19,7 +19,7 @@ python -m tasks.run_report {daily|weekly|monthly}
 python -m tasks.run_debts_notify
 python -m tasks.run_ms_sync_retry
 python -m tasks.run_ops_monitor          # дайджест: зависшие заявки/сдачи/возвраты/партии (1×/день), inline-кнопки
-python -m tasks.run_maintenance          # janitor: архив аудита→Drive, чистка дедупа/аудита/soft-deleted (ночью)
+python -m tasks.run_maintenance          # janitor: чистка дедупа/аудита/soft-deleted (ночью)
 python -m tasks.run_ms_reconcile         # страховка: approved-заказы с ms_customerorder_id, 404 в МС → отмена локально (ежечасно)
 python -m tasks.run_backup               # дамп БД → gzip → приватный TG-канал (ночью)
 ```
@@ -69,9 +69,9 @@ Python 3.11.9).
 
 **Аналитика менеджеров:** только из ЛОКАЛЬНЫХ `orders` (`get_manager_performance`, GROUP BY `user_id`) — в demand'ах МС нет надёжной привязки к менеджеру (`telegram_full_name` ставится лишь когда demand создал бот). Сурфейсится в webapp company-аналитике (`top_managers`).
 
-**Backup / архив аудита:**
+**Backup:**
 - `tasks/run_backup`: если `pg_dump` упал (нет бинаря — `FileNotFoundError`, ИЛИ `server version mismatch` — `RuntimeError`: бинарь старее managed-Postgres) → fallback на version-independent pure-Python COPY-dump (`_pg_dump_pure_python` через libpq). Лови ОБА исключения.
-- `tasks/run_maintenance`: `prune_audit_log` выполняется ТОЛЬКО если `export_audit_archive` вернул `ok` — иначе данные удалятся неархивированными. Drive-загрузка gated на `GOOGLE_DRIVE_*` (без креды — no-op).
+- `tasks/run_maintenance`: janitor чистит дедуп отгрузок, аудит старше ретеншена (`prune_audit_log`, `audit_log_retention_months`) и soft-deleted. Внешний архив аудита (Google Drive) убран.
 
 **Time:** `utils.helpers.utc_now()` вместо deprecated `datetime.utcnow()`. `utils.helpers.local_now()` для сравнений с `created_at` (пишется в local TZ через `now_str()`).
 - В SQL **не** сравнивай `confirmed_at`/`created_at` (local TZ string) с `datetime('now',...)` SQLite (UTC) или `NOW()` Postgres — лекс-сравнение в разных TZ молча всегда False (silent bug). Вычисляй порог в Python через `datetime.now() - timedelta(...)` и передавай параметром. Пример — `services/database.reset_stale_in_progress_payments`.

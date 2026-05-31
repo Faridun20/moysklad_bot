@@ -86,48 +86,16 @@ def _count_old_audit(db):
         return cur.fetchone()[0]
 
 
-def test_maintenance_skips_prune_when_archive_fails(isolated_db, monkeypatch):
-    import services.audit_archive as aa
+def test_maintenance_prunes_old_audit(isolated_db):
+    """run_maintenance чистит аудит старше ретеншена. Drive-архив убран —
+    prune теперь безусловный (раньше гейтился на успех архивации)."""
     import tasks.run_maintenance as rm
 
     db = isolated_db
     _insert_old_audit(db)
-
-    async def _fail(cutoff, exported_by=0):
-        return {"ok": False, "error": "boom"}
-
-    monkeypatch.setattr(aa, "export_audit_archive", _fail)
-    assert rm.main() == 0
-    assert _count_old_audit(db) == 1  # НЕ удалено — архивация не прошла
-
-
-def test_maintenance_prunes_when_archive_ok(isolated_db, monkeypatch):
-    import services.audit_archive as aa
-    import tasks.run_maintenance as rm
-
-    db = isolated_db
-    _insert_old_audit(db)
-
-    async def _ok(cutoff, exported_by=0):
-        return {"ok": True, "exported": 1}
-
-    monkeypatch.setattr(aa, "export_audit_archive", _ok)
+    assert _count_old_audit(db) == 1
     assert rm.main() == 0
     assert _count_old_audit(db) == 0  # старый аудит вычищен
-
-
-def test_audit_export_refuses_on_cap(isolated_db, monkeypatch):
-    import services.audit_archive as aa
-    from services.audit_archive import export_audit_archive
-
-    db = isolated_db
-    monkeypatch.setattr(aa, "_MAX_ROWS", 2)
-    _insert_old_audit(db, "2020-01-01 00:00:00")
-    _insert_old_audit(db, "2020-01-02 00:00:00")
-
-    res = asyncio.run(export_audit_archive("2021-01-01 00:00:00"))
-    assert res["ok"] is False
-    assert res["error"] == "too-many-rows"
 
 
 # ─── F5: reject_payment идемпотентность ──────────────────────────────────────

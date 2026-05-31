@@ -141,47 +141,4 @@ def test_api_users_deactivate(isolated_db, monkeypatch):
     assert db.get_role(target) == "boss"
 
 
-# ─── #33: архив аудита ───────────────────────────────────────────────────────
-
-
-def _insert_audit(db, n, created_at):
-    with db.get_conn() as conn:
-        cur = db.get_cursor(conn)
-        for i in range(n):
-            cur.execute(
-                db.q(
-                    "INSERT INTO audit_log (user_id, full_name, role, action, details, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)"
-                ),
-                (1, "U", "admin", "act", f"d{i}", created_at),
-            )
-        conn.commit()
-
-
-def test_audit_archive_exports_and_idempotent(isolated_db, monkeypatch):
-    from services.audit_archive import export_audit_archive
-
-    db = isolated_db
-    # Drive не настроен → no-op заливка.
-    monkeypatch.delenv("GOOGLE_DRIVE_FOLDER_ID", raising=False)
-    monkeypatch.delenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", raising=False)
-    _insert_audit(db, 3, "2020-01-01 00:00:00")
-    cutoff = "2021-01-01 00:00:00"
-
-    res = asyncio.run(export_audit_archive(cutoff))
-    assert res["exported"] == 3
-    assert res["uploaded"] is False  # нет креды Drive
-    assert res["file_name"].endswith(".jsonl")
-    # Факт зафиксирован.
-    assert asyncio.run(db.audit_archive_exists(cutoff)) is True
-    # Повторно — идемпотентно.
-    res2 = asyncio.run(export_audit_archive(cutoff))
-    assert res2.get("skipped") == "already-archived"
-
-
-def test_audit_archive_nothing_to_export(isolated_db):
-    from services.audit_archive import export_audit_archive
-
-    res = asyncio.run(export_audit_archive("2000-01-01 00:00:00"))
-    assert res["exported"] == 0
-    assert res.get("skipped") == "nothing-to-archive"
+# (Тесты архива аудита удалены вместе с Drive-интеграцией.)

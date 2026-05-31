@@ -668,8 +668,8 @@ def _create_indexes():
             "CREATE INDEX IF NOT EXISTS idx_orders_agent_id ON orders(agent_id)",
             # Заказы менеджера (get_user_orders, аналитика) — фильтр+сортировка.
             "CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at)",
-            # Аудит: get_audit_log сортирует по created_at, get_audit_log_before
-            # фильтрует по нему (архивация перед prune).
+            # Аудит: get_audit_log сортирует по created_at, prune_audit_log
+            # фильтрует по нему.
             "CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at)",
         ]
         for sql in snapshot_indexes:
@@ -3170,57 +3170,12 @@ def prune_notified_shipments(older_than_days: int = 30) -> int:
 
 
 def prune_audit_log(retention_months: int = 6) -> int:
-    """Удалить записи аудита старше retention_months (janitor, §13). Экспорт в
-    Drive перед удалением — отдельной интеграцией (audit_archive_exports);
-    здесь только чистка БД. Месяц ≈ 30 дней (для janitor-задачи достаточно).
-    Возвращает число удалённых строк."""
+    """Удалить записи аудита старше retention_months (janitor, §13). Месяц ≈ 30
+    дней (для janitor-задачи достаточно). Возвращает число удалённых строк."""
     from datetime import timedelta
 
     cutoff = (datetime.now() - timedelta(days=retention_months * 30)).strftime("%Y-%m-%d %H:%M:%S")
     return _batched_delete("audit_log", "created_at < ?", (cutoff,))
-
-
-async def get_audit_log_before(before_iso: str, limit: int = 100000) -> list[dict]:
-    """Записи аудита старше cutoff — для архивации ДО prune (#33). #37 (F2):
-    с LIMIT (защита от OOM на огромном логе). Если вернулось ровно `limit` строк —
-    набор обрезан (caller это детектит и НЕ чистит, чтобы не удалить
-    неархивированное)."""
-    return await adb_core.fetch(
-        "SELECT * FROM audit_log WHERE created_at < $1 ORDER BY created_at ASC LIMIT $2",
-        before_iso,
-        limit,
-    )
-
-
-async def audit_archive_exists(period_end: str) -> bool:
-    """Был ли уже экспорт с таким period_end (идемпотентность архивации, #33)."""
-    return bool(
-        await adb_core.fetchval(
-            "SELECT 1 FROM audit_archive_exports WHERE period_end = $1 LIMIT 1", period_end
-        )
-    )
-
-
-async def record_audit_archive_export(
-    period_start: str,
-    period_end: str,
-    file_name: str,
-    drive_file_id: str,
-    drive_file_url: str,
-    records_count: int,
-    file_size_bytes: int,
-    exported_by: int = 0,
-) -> bool:
-    """Зафиксировать факт экспорта аудита в Drive/файл (#33)."""
-    rc = await adb_core.execute(
-        "INSERT INTO audit_archive_exports "
-        "(period_start, period_end, file_name, drive_file_id, drive_file_url, "
-        "records_count, file_size_bytes, exported_at, exported_by) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-        period_start, period_end, file_name, drive_file_id, drive_file_url,
-        records_count, file_size_bytes, now_str(), exported_by,
-    )
-    return rc > 0
 
 
 def _batched_delete(table: str, where: str, params: tuple, batch: int = 5000) -> int:

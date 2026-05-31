@@ -9,13 +9,5 @@ psycopg2-binary==2.9.9
 asyncpg==0.30.0
 aiosqlite==0.20.0
 redis==5.0.7
-# Sentry — error tracking. Активируется только если SENTRY_DSN задан в env.
-# Без DSN init_sentry() no-op, оверхэд = 0. См. services/observability.py.
-sentry-sdk[fastapi]==2.14.0
 # Excel-экспорт аналитики (PR D). Лёгкая зависимость без C-расширений.
 openpyxl==3.1.5
-# Google Drive — выгрузка архива аудита (services/audit_archive.py). Активируется
-# только при заданных GOOGLE_DRIVE_FOLDER_ID + GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON;
-# без креды uploader — no-op. Без этих пакетов был no-op даже с кредами.
-google-api-python-client==2.149.0
-google-auth==2.35.0
