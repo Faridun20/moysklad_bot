@@ -42,20 +42,26 @@ def main() -> int:
         shipments = prune_notified_shipments(older_than_days=30)
 
         # Архивируем уходящие записи аудита ДО чистки (#33). cutoff — как в
-        # prune_audit_log (now − months*30д). Best-effort: ошибка не блокирует prune.
+        # prune_audit_log (now − months*30д). #37 (F2): prune аудита выполняем
+        # ТОЛЬКО если архивация прошла (ok) — иначе данные удалились бы
+        # неархивированными (потеря истории).
         import asyncio
         from datetime import datetime, timedelta
 
         from services.audit_archive import export_audit_archive
 
         cutoff = (datetime.now() - timedelta(days=audit_months * 30)).strftime("%Y-%m-%d %H:%M:%S")
+        archived_ok = False
         try:
             arch = asyncio.run(export_audit_archive(cutoff))
+            archived_ok = bool(arch.get("ok"))
             logger.info("maintenance: audit archive: %s", arch)
         except Exception:
-            logger.exception("maintenance: audit archive failed (prune не блокируется)")
+            logger.exception("maintenance: audit archive FAILED — prune аудита пропущен")
 
-        audit = prune_audit_log(retention_months=audit_months)
+        audit = prune_audit_log(retention_months=audit_months) if archived_ok else 0
+        if not archived_ok:
+            logger.warning("maintenance: prune аудита пропущен (архивация не прошла)")
         purged = purge_soft_deleted(retention_days=soft_days)
 
         logger.info(

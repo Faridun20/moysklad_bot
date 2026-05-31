@@ -707,7 +707,8 @@ async def cb_choose_agent(call: CallbackQuery, state: FSMContext):
         # Сначала пробуем snapshot — мгновенно, без удара по МойСклад API
         from services import snapshot
 
-        snap_rows = snapshot.get_counterparties(limit=50)
+        # to_thread: get_counterparties — sync (psycopg2), не блокируем event loop.
+        snap_rows = await asyncio.to_thread(snapshot.get_counterparties, None, 50)
         if snap_rows:
             agents = [
                 {
