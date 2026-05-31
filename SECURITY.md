@@ -269,14 +269,12 @@ Recovery UPDATE запускается на каждом старте, пере�
 При >200 keys чистим протухшие. Для текущего usage хватит навечно, но
 при росте — потенциальный memory leak. Лучше — LRU.
 
-### `webapp/server.py:1395-1423` (`api_confirm_payment`) — нет идемпотентности
+### `api_confirm_payment` и другие write-endpoint'ы — идемпотентность — ✅ ЗАКРЫТО (Round 8)
 
-Босс может два раза кликнуть approve; второй вызов вернёт 0 confirm'ов.
-UX OK, но фронт во время первого может показывать спиннер, юзер
-рефрешит — рассинхрон возможен.
-
-**Фикс**: client-side `idempotency-key` (uuid), сохранять в `payments`
-для предотвращения дублей.
+~~Босс может два раза кликнуть approve; второй вызов вернёт 0 confirm'ов.~~
+Закрыто: `_idem_get/_idem_set` + фронт `idemKey()` на confirm/reject/mark_paid
+(ранее) и на ship/deposits/returns/approve/submit (PR #106). Повтор с тем же
+ключом → кэшированный ответ, дубль сдачи/возврата не создаётся.
 
 ### `handlers/orders.py:803-823` (cb_delete_order) vs WebApp endpoint
 
@@ -291,15 +289,16 @@ UX OK, но фронт во время первого может показыв�
 ARCHITECTURE.md говорит «в боте OK», но при росте — проблема. Используйте
 `asyncio.to_thread` или `services.async_db`.
 
-### `webapp/server.py:163-180` — non-constant-time secret compare
+### `webapp/server.py` — non-constant-time secret compare — ✅ ЗАКРЫТО (Round 8)
 
-`if secret != get_webhook_secret()` — теоретически timing-attack.
-Маловероятно через HTTP, но `hmac.compare_digest` дешевле.
+~~`if secret != get_webhook_secret()` — теоретически timing-attack.~~
+Уже в коде: `hmac.compare_digest` на `server.py:269/272/339` и `auth.py:61`.
 
-### `webapp/server.py:163-206` (ms_webhook) — нет лимита payload size
+### `webapp/server.py` (ms_webhook) — нет лимита payload size — ✅ ЗАКРЫТО (Round 8)
 
-DoS-вектор: МойСклад не пришлёт мегабайты, но кто-то с известным
-секретом может. FastAPI без middleware не лимитирует.
+~~DoS-вектор: кто-то с известным секретом мог прислать мегабайты.~~
+Уже в коде: `_MS_WEBHOOK_MAX_BYTES=1MB`, проверка `Content-Length` + длины
+body (`server.py:344–353`).
 
 ### `webapp/auth.py:38-39` — `e` в логе может содержать фрагмент initData
 
@@ -569,6 +568,10 @@ tests/
 | Round 7 (MS-delete не отражался в боте) | вебхук `customerorder.DELETE` только снимал ссылку, не меняя статус → удалённый в МС заказ висел `approved`. Теперь approved-заказ отменяется локально (+ `ms_cancel_synced`); cron `run_ms_reconcile` ловит пропущенные вебхуки | PR #95 |
 | Round 7 (перф: индексы + N+1) | Индексы `orders(agent_id)`, `orders(user_id,created_at)`, `audit_log(created_at)`; `get_agent_current_debt` — батч вместо N+1 (горячий путь из-за энфорса лимитов); `snapshot.get_counterparties` через `to_thread` | PR #97 |
 | Round 7 (backup падал на version mismatch) | `pg_dump` v15 vs managed-Postgres v18 → `RuntimeError` не ловился (только `FileNotFoundError`) → бэкапы не создавались. Fallback на version-independent pure-Python COPY-dump теперь и на `RuntimeError` | PR #98 |
+| Round 8 (timing-safe webhook compare) | Числился открытым Medium, но фактически в коде: сравнение секретов webhook через `hmac.compare_digest` (`server.py:269/272/339`, `auth.py:61`). Doc-sync: перенесён в Closed | в коде |
+| Round 8 (payload-size cap MS-webhook) | Числился открытым Medium, фактически в коде: `_MS_WEBHOOK_MAX_BYTES=1MB`, проверка `Content-Length` + длины body (`server.py:344–353`). Doc-sync | в коде |
+| Round 8 (идемпотентность write-endpoint'ов) | `_idem_get/_idem_set` расширены на `orders/ship`, `deposits/{create,confirm}`, `returns/{create,confirm,goods_received}`, `requests/approve`, `orders/submit` (+ фронт `idemKey()`). Закрывает Medium «api_confirm_payment без идемпотентности» и дубль сдач/возвратов при double-submit | PR #106 |
+| Round 8 (надёжность фоновых задач) | fire-and-forget `create_task` держали лишь слабую ссылку (GC до завершения) + молчали при падении → strong-ref set + done-callback с логом исключения (`bot.py`, `webapp/server.py`) | PR #107 |
 
 ## История изменений этого документа
 

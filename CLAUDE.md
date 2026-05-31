@@ -96,7 +96,7 @@ Python 3.11.9).
 `.github/workflows/ci.yml` на push в `main` или `claude/*`:
 - `ruff` строгий гейт (`E9,F63,F7,F82`) + полный набор (из `pyproject.toml`);
 - `mypy` — **блокирующий** (модули вычищены до 0 ошибок, тип-регрессии валят CI);
-- `pytest` + coverage с «храповиком» `--cov-fail-under=25`.
+- `pytest` + coverage с «храповиком» `--cov-fail-under=35` (факт ~41%, буфер 5-6%).
 
 `TELEGRAM_TOKEN=0:fake` и `MS_TOKEN=fake` — заглушки для импорта config (в workflow и в `tests/conftest.py` через `os.environ.setdefault`).
 
