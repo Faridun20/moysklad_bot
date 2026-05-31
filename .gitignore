@@ -13,6 +13,10 @@ htmlcov/
 # Local SQLite БД (на проде — Postgres)
 *.db
 
+# Node (фронт-тесты Vitest, webapp/static)
+node_modules/
+npm-debug.log*
+
 # Секреты и локальная конфигурация
 .env
 config_local.py

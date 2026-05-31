@@ -675,11 +675,7 @@ function renderStockContent() {
   });
 }
 
-function escapeHtml(s) {
-  return String(s || '')
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
+// escapeHtml — в helpers.js (глобал, подключается ПЕРЕД app.js). Юнит-тестируется.
 
 function loading(msg = 'Загрузка…') {
   return `<div class="spinner-wrap"><div class="spinner"></div><span>${msg}</span></div>`;
@@ -780,12 +776,7 @@ async function api(path, body) {
 
 // Ключ идемпотентности для денежных действий: защищает от double-submit
 // (две строки платежа / два уведомления). Сервер дедуплицирует по нему.
-function idemKey() {
-  try {
-    if (self.crypto && self.crypto.randomUUID) return self.crypto.randomUUID();
-  } catch (e) { /* старый WebView без crypto.randomUUID */ }
-  return Date.now() + '-' + Math.random().toString(16).slice(2);
-}
+// idemKey — в helpers.js (глобал, подключается ПЕРЕД app.js). Юнит-тестируется.
 
 // ─── Глобальный поиск ───────────────────────────────
 let _searchTimer = null;
@@ -2736,12 +2727,7 @@ async function renderDebts(container) {
   }
 }
 
-// Маленький хелпер — дата YYYY-MM-DD → ДД.ММ.ГГГГ
-function formatDateRU(iso) {
-  if (!iso || iso.length < 10) return iso || '—';
-  const [y, m, d] = iso.slice(0, 10).split('-');
-  return `${d}.${m}.${y}`;
-}
+// formatDateRU — в helpers.js (глобал, подключается ПЕРЕД app.js). Юнит-тестируется.
 
 
 // Тень топбара при прокрутке

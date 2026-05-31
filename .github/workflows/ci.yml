@@ -58,3 +58,22 @@ jobs:
         # колебание между прогонами) и оставляет пространство для рефакторов,
         # но не даёт «забыть» дописать тесты к большим PR'ам.
         run: pytest tests/ -v --tb=short --cov --cov-report=term-missing --cov-fail-under=35
+
+  # Фронт WebApp (webapp/static) теста-харнесса в Python нет — vitest гоняет
+  # чистые хелперы (helpers.js) + jsdom-смоук, что app.js грузится без ошибок.
+  # Отдельный job, чтобы не смешивать с pytest-гейтом.
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install frontend test deps
+        run: npm install
+
+      - name: Run frontend tests (Vitest)
+        run: npm test
