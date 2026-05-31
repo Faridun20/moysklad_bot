@@ -414,8 +414,8 @@ async function renderHome() {
           <div class="card-row" data-order-id="${o.id}">
             <div class="card-row-icon icon-${o.status}">${icon(STATUS_ICON[o.status] || 'list')}</div>
             <div class="card-row-info">
-              <div class="card-row-title">Заказ #${o.id}${o.agent_name ? ' · ' + escapeHtml(o.agent_name) : ''}</div>
-              <div class="card-row-sub">${o.created_at}</div>
+              <div class="card-row-title">${escapeHtml(o.agent_name || ('Заказ #' + o.id))}</div>
+              <div class="card-row-sub">Заказ #${o.id} · ${o.created_at}</div>
             </div>
             <span class="stock-badge ${o.status === 'approved' ? 'badge-green' : o.status === 'rejected' ? 'badge-red' : 'badge-yellow'}">${STATUS_NAME[o.status]}</span>
           </div>
@@ -903,6 +903,20 @@ async function runSearch(query) {
     : '<div class="empty-hint">Ничего не найдено</div>';
 }
 
+// Заголовок группы заказов по дате. key = 'YYYY-MM-DD' (из created_at).
+// «Сегодня»/«Вчера» для свежих, иначе DD.MM.YYYY (formatDateRU из helpers.js).
+function orderDateLabel(key) {
+  if (!key || key.length < 10) return 'Без даты';
+  const pad = n => String(n).padStart(2, '0');
+  const dkey = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const today = new Date();
+  const yest = new Date(today);
+  yest.setDate(today.getDate() - 1);
+  if (key === dkey(today)) return 'Сегодня';
+  if (key === dkey(yest)) return 'Вчера';
+  return formatDateRU(key);
+}
+
 async function renderOrders() {
   const content = document.getElementById('content');
   content.innerHTML = loading('Загружаю заказы…');
@@ -949,19 +963,28 @@ function renderOrdersMain() {
           : isBoss ? 'Менеджеры ещё не создавали заказов' : 'Нажмите «+ Новый заказ» чтобы начать'
         }</div>
       </div>`
-    : filtered.map(o => `
+    : (() => {
+        // Группируем по дате (created_at='YYYY-MM-DD HH:MM') и выводим клиента
+        // заголовком: легче ориентироваться, когда не помнишь ни номер, ни имя.
+        const groups = [];
+        const gidx = {};
+        for (const o of filtered) {
+          const k = (o.created_at || '').slice(0, 10);
+          if (!(k in gidx)) { gidx[k] = groups.length; groups.push({ k, items: [] }); }
+          groups[gidx[k]].items.push(o);
+        }
+        const orderCard = o => `
       <div class="order-card order-card--${o.status}" data-id="${o.id}">
         <div class="order-header">
-          <div>
-            <div class="order-title">${icon(STATUS_ICON[o.status] || 'list')} Заказ #${o.id}</div>
-            ${isBoss ? `<div class="order-manager">👤 ${o.full_name}</div>` : ''}
+          <div class="order-head-main">
+            <div class="order-title">${icon('building')} ${escapeHtml(o.agent_name || 'Без клиента')}</div>
+            <div class="order-sub">Заказ #${o.id}${isBoss ? ` · ${escapeHtml(o.full_name)}` : ''}</div>
           </div>
           <span class="order-status status-${o.status}">${STATUS_NAME[o.status]}</span>
         </div>
-        ${o.agent_name ? `<div class="order-agent">🏢 ${o.agent_name}</div>` : ''}
         <div class="order-meta">
           <span>${icon('box')} ${o.items_count} тов.</span>
-          <span>${o.created_at}</span>
+          <span>${(o.created_at || '').slice(11, 16)}</span>
           ${o.total > 0 ? `<span class="order-total">💰 ${Math.round(o.total).toLocaleString('ru-RU')}</span>` : ''}
         </div>
         ${(() => {
@@ -1009,7 +1032,12 @@ function renderOrdersMain() {
           </div>
         ` : ''}
       </div>
-    `).join('');
+    `;
+        return groups.map(g => `
+          <div class="section-label order-date-label">${orderDateLabel(g.k)}</div>
+          ${g.items.map(orderCard).join('')}
+        `).join('');
+      })();
 
   content.innerHTML = `
     <div class="orders-toolbar">
@@ -2207,14 +2235,21 @@ async function renderCashbox(container) {
   container = container || document.getElementById('content');
   container.innerHTML = loading('Загрузка кассы…');
   const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const role = currentUser && currentUser.role;
+  // Наличные сдаёт тот, кто их физически принимает от клиента (менеджер,
+  // кладовщик). Начальство/бухгалтер только ПОДТВЕРЖДАЮТ — им «Сдать наличные»
+  // и «Мои сдачи» не нужны (бессмысленный self-deposit).
+  const canDeposit = role === 'manager' || role === 'warehouse_keeper';
 
   // Каждый список может вернуть 403 (роль не видит) — тихо пропускаем.
   let deposits = [];
   let returns = [];
-  let myDeposits = null;  // null = роль не может сдавать (нет блока «Сдать наличные»)
+  let myDeposits = [];
   try { deposits = (await api('/api/deposits/pending', {})).deposits || []; } catch {}
   try { returns = (await api('/api/returns/pending', {})).returns || []; } catch {}
-  try { myDeposits = (await api('/api/deposits/my', {})).deposits || []; } catch {}
+  if (canDeposit) {
+    try { myDeposits = (await api('/api/deposits/my', {})).deposits || []; } catch {}
+  }
 
   const depCards = deposits.map(d => {
     const orders = (d.orders || [])
@@ -2260,10 +2295,11 @@ async function renderCashbox(container) {
     ? `<div class="section-label">${icon('return')} Возвраты на подтверждении (${returns.length})</div><div class="debts-list">${retCards}</div>`
     : '';
 
-  // Блок менеджера: сдать наличные + свои сдачи (если роль может сдавать).
+  // Блок «сдать наличные» + «мои сдачи» — только для тех, кто физически сдаёт
+  // (менеджер/кладовщик). Боссу/бухгалтеру self-deposit бессмысленен.
   let createBlock = '';
   let myBlock = '';
-  if (myDeposits !== null) {
+  if (canDeposit) {
     createBlock = `
       <div class="section-label">Сдать наличные</div>
       <div class="card">
@@ -2290,7 +2326,6 @@ async function renderCashbox(container) {
   }
 
   // Блок оформления возврата (менеджер/кладовщик/босс).
-  const role = currentUser && currentUser.role;
   const canReturn = ['admin', 'boss', 'warehouse_keeper', 'manager'].includes(role);
   const returnBlock = canReturn ? `
       <div class="section-label">Оформить возврат</div>
@@ -2319,7 +2354,7 @@ async function renderCashbox(container) {
   // в самом низу). Разносим по под-вкладкам, чтобы срочные подтверждения были
   // сразу, а не за тремя формами. Набор вкладок зависит от роли.
   const isConfirmer = ['admin', 'boss', 'bookkeeper', 'warehouse_keeper'].includes(role);
-  const canCreateDeposit = myDeposits !== null;
+  const canCreateDeposit = canDeposit;
   const hasOps = canCreateDeposit || canReturn;
 
   const tabs = [];

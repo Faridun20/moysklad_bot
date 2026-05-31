@@ -883,15 +883,27 @@ body {
   align-items: flex-start; margin-bottom: 6px;
 }
 
+/* Левая часть шапки тянется и сжимается, чтобы длинное имя клиента
+   обрезалось эллипсисом, а не толкало бейдж статуса. */
+.order-head-main { flex: 1; min-width: 0; }
+
 .order-title {
   font-size: 15px;
   font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
+/* Подзаголовок: «Заказ #N · менеджер» — вторично к имени клиента. */
+.order-sub,
 .order-manager {
   font-size: 12px;
   color: var(--text-mute);
   margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .order-agent {
@@ -899,6 +911,10 @@ body {
   color: var(--text);
   margin-bottom: 4px;
 }
+
+/* Заголовок-дата над группой заказов: не uppercase (даты/«Сегодня» читабельнее). */
+.order-date-label { text-transform: none; letter-spacing: 0; margin-top: 16px; }
+.orders-list > .order-date-label:first-child { margin-top: 2px; }
 
 .order-status {
   font-size: 11px;
