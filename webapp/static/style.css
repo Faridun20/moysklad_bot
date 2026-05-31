@@ -11,6 +11,10 @@
   box-sizing: border-box;
   margin: 0;
   padding: 0;
+  /* Убираем OS-оверлей подсветки тапа в webview (Telegram iOS/Android): он рисовал
+     «вторую обводку» поверх собственного :active-стиля кнопок. Свой :active и
+     клавиатурный :focus-visible сохраняются. */
+  -webkit-tap-highlight-color: transparent;
 }
 
 :root {
@@ -632,6 +636,9 @@ body {
   scrollbar-width: none;
 }
 .cat-scroll::-webkit-scrollbar { display: none; }
+
+/* Второй ряд — фильтр по периоду заказов: компактнее, прижат к ряду статусов. */
+.cat-scroll--period { margin-top: 0; padding-bottom: 4px; }
 
 .cat-row {
   display: flex;

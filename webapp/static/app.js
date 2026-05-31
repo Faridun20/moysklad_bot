@@ -784,6 +784,7 @@ function clearMainButton() {
 
 let ordersData = null;
 let currentOrderFilter = 'all';
+let currentOrderPeriod = 'all';  // 'all' | 'today' | '7d' | '30d' — фильтр по дате
 let currentDraftOrder = null; // активный черновик
 
 // Имена иконок спрайта по статусу заказа (вместо прежних эмодзи: рендерятся
@@ -905,6 +906,22 @@ async function runSearch(query) {
 
 // Заголовок группы заказов по дате. key = 'YYYY-MM-DD' (из created_at).
 // «Сегодня»/«Вчера» для свежих, иначе DD.MM.YYYY (formatDateRU из helpers.js).
+// Попадает ли заказ (created_at='YYYY-MM-DD HH:MM') в выбранный период.
+// Строковое сравнение YYYY-MM-DD корректно (лексикографически = хронологически).
+function orderInPeriod(createdAt, period) {
+  if (period === 'all') return true;
+  const key = (createdAt || '').slice(0, 10);
+  if (!key) return false;
+  const pad = n => String(n).padStart(2, '0');
+  const dkey = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const today = new Date();
+  if (period === 'today') return key === dkey(today);
+  const days = period === '7d' ? 7 : 30;
+  const cutoff = new Date(today);
+  cutoff.setDate(today.getDate() - (days - 1));
+  return key >= dkey(cutoff);
+}
+
 function orderDateLabel(key) {
   if (!key || key.length < 10) return 'Без даты';
   const pad = n => String(n).padStart(2, '0');
@@ -938,28 +955,54 @@ function renderOrdersMain() {
   const isBoss = role === 'admin' || role === 'boss';
   const canShip = isBoss || role === 'warehouse_keeper';
 
-  const filters = [
-    { id: 'all', label: 'Все', name: 'Все' },
-    { id: 'draft', label: icon('edit'), name: STATUS_NAME.draft },
-    { id: 'pending', label: icon('clock'), name: STATUS_NAME.pending },
-    { id: 'approved', label: icon('check'), name: STATUS_NAME.approved },
-    { id: 'rejected', label: icon('close'), name: STATUS_NAME.rejected },
-  ];
+  // Боссу фильтр «черновики» бесполезен (это незавершённые заявки менеджеров) —
+  // заменяем на «отгружено». Менеджеру черновики нужны (свои незаконченные).
+  const filters = isBoss
+    ? [
+        { id: 'all', label: 'Все', name: 'Все' },
+        { id: 'pending', label: icon('clock'), name: STATUS_NAME.pending },
+        { id: 'approved', label: icon('check'), name: STATUS_NAME.approved },
+        { id: 'shipped', label: icon('truck'), name: STATUS_NAME.shipped },
+        { id: 'rejected', label: icon('close'), name: STATUS_NAME.rejected },
+      ]
+    : [
+        { id: 'all', label: 'Все', name: 'Все' },
+        { id: 'draft', label: icon('edit'), name: STATUS_NAME.draft },
+        { id: 'pending', label: icon('clock'), name: STATUS_NAME.pending },
+        { id: 'approved', label: icon('check'), name: STATUS_NAME.approved },
+        { id: 'rejected', label: icon('close'), name: STATUS_NAME.rejected },
+      ];
 
   const filterBtns = filters.map(f =>
     `<button class="cat-btn ${currentOrderFilter === f.id ? 'active' : ''}" data-filter="${f.id}" aria-label="${escapeHtml(f.name)}" title="${escapeHtml(f.name)}">${f.label}</button>`
   ).join('');
 
-  const filtered = currentOrderFilter === 'all'
-    ? orders
-    : orders.filter(o => o.status === currentOrderFilter);
+  // Фильтр по периоду — для навигации, когда заказов много.
+  const periods = [
+    { id: 'all', label: 'Всё время' },
+    { id: 'today', label: 'Сегодня' },
+    { id: '7d', label: '7 дней' },
+    { id: '30d', label: '30 дней' },
+  ];
+  const periodBtns = periods.map(p =>
+    `<button class="cat-btn ${currentOrderPeriod === p.id ? 'active' : ''}" data-period="${p.id}">${p.label}</button>`
+  ).join('');
+
+  // Если активный статус-фильтр недоступен для роли (сменилась роль/состояние) —
+  // откатываем на 'all', чтобы не показать пусто из-за исчезнувшего фильтра.
+  if (!filters.some(f => f.id === currentOrderFilter)) currentOrderFilter = 'all';
+
+  const filtered = orders.filter(o =>
+    (currentOrderFilter === 'all' || o.status === currentOrderFilter) &&
+    orderInPeriod(o.created_at, currentOrderPeriod)
+  );
 
   const list = filtered.length === 0
     ? `<div class="empty-state">
         <div class="empty-state-icon">${icon('list')}</div>
         <div class="empty-state-title">Нет заказов</div>
-        <div class="empty-state-hint">${currentOrderFilter !== 'all'
-          ? 'Нет заказов с этим статусом'
+        <div class="empty-state-hint">${(currentOrderFilter !== 'all' || currentOrderPeriod !== 'all')
+          ? 'Нет заказов по выбранным фильтрам'
           : isBoss ? 'Менеджеры ещё не создавали заказов' : 'Нажмите «+ Новый заказ» чтобы начать'
         }</div>
       </div>`
@@ -1044,17 +1087,27 @@ function renderOrdersMain() {
       <div class="cat-scroll">${filterBtns}</div>
       ${!isBoss ? `<button class="btn-new-order" id="btn-new-order">+ Новый заказ</button>` : ''}
     </div>
+    <div class="cat-scroll cat-scroll--period">${periodBtns}</div>
 
     ${isBoss ? `<button class="requests-btn" id="show-requests">${icon('clock')} Заявки на рассмотрении</button>` : ''}
 
     <div class="orders-list">${list}</div>
   `;
 
-  // Фильтры
+  // Фильтры по статусу
   document.querySelectorAll('.cat-btn[data-filter]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
       currentOrderFilter = btn.dataset.filter;
+      renderOrdersMain();
+    });
+  });
+
+  // Фильтр по периоду
+  document.querySelectorAll('.cat-btn[data-period]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('light');
+      currentOrderPeriod = btn.dataset.period;
       renderOrdersMain();
     });
   });
