@@ -26,7 +26,9 @@ from services import async_db as adb
 logger = logging.getLogger(__name__)
 
 # Типы событий: только они обрабатываются здесь; остальные игнорируются.
-_HANDLED = {"paymentin", "customerorder"}
+# demand — только DELETE (бот-созданная отгрузка удалена в МС → фантом);
+# CREATE/UPDATE demand идут отдельным путём (остатки + уведомления о новых).
+_HANDLED = {"paymentin", "customerorder", "demand"}
 
 # stateType → наш локальный статус.
 # Regular-состояния (промежуточные в МойСклад) — пропускаем: не знаем их
@@ -68,6 +70,10 @@ async def handle_ms_events(events: list[dict]) -> None:
                 tasks.append(_handle_customerorder_updated(entity_id))
             elif action == "DELETE":
                 tasks.append(_handle_customerorder_deleted(entity_id))
+        elif entity_type == "demand":
+            # Только DELETE: бот-созданная отгрузка удалена в МС → заказ-фантом.
+            if action == "DELETE":
+                tasks.append(_handle_demand_deleted(entity_id))
 
     if not tasks:
         return
@@ -188,6 +194,10 @@ async def _handle_customerorder_updated(co_id: str) -> None:
     except Exception as e:
         logger.warning("customerorder.UPDATE %s: не удалось получить документ: %s", co_id, e)
         return
+
+    # Этап 2a: дрифт суммы — кто-то отредактировал позиции/цены в МС. Сигнал
+    # (флаг + уведомление), деньги/статус НЕ меняем молча.
+    await _check_order_drift(order, co_data)
 
     state = co_data.get("state") or {}
     state_type = state.get("stateType", "")
@@ -324,3 +334,98 @@ async def apply_ms_customerorder_delete(order: dict, co_id: str) -> None:
         order_id,
         status,
     )
+
+
+# Порог дрифта суммы: игнорируем мелочь (округления/НДС-копейки), флагуем только
+# материальное расхождение — больше max(1% суммы, 1 у.е.).
+_DRIFT_ABS_MIN_CENTS = 100
+
+
+async def _check_order_drift(order: dict, co_data: dict) -> None:
+    """Сверить сумму локального заказа с документом МойСклад. При материальном
+    расхождении — пометить `ms_drift_at` (идемпотентно) + уведомить boss/admin.
+    Деньги/статус НЕ трогаем: это сигнал «заказ отредактирован в МС вручную»."""
+    order_id = order["id"]
+    if order.get("ms_drift_at"):
+        return  # уже помечен — одно уведомление на заказ
+    try:
+        ms_sum = int(co_data.get("sum") or 0)
+    except (TypeError, ValueError):
+        return
+    if ms_sum <= 0:
+        return
+    local_cents = await adb.get_order_total_cents(order_id)
+    if local_cents <= 0:
+        return
+    if abs(ms_sum - local_cents) <= max(_DRIFT_ABS_MIN_CENTS, local_cents // 100):
+        return  # в пределах допуска
+    if not await adb.set_order_ms_drift(order_id):
+        return  # гонка: кто-то уже пометил
+
+    from services.notifier import aget_notify_recipients, tg_send_message
+    from utils.helpers import esc
+
+    agent = esc(order.get("agent_name") or "—")
+    await adb.add_audit_log(
+        0,
+        "МойСклад",
+        "system",
+        "ms_order_drift",
+        f"Заказ #{order_id}: сумма в МС ({ms_sum / 100:,.0f}) ≠ локальной "
+        f"({local_cents / 100:,.0f}) — отредактирован в МС вручную.",
+    )
+    text = (
+        f"⚠️ <b>Заказ изменён в МойСклад</b>\n\n"
+        f"Заказ #{order_id} (клиент: {agent}).\n"
+        f"Сумма в МС: <b>{ms_sum / 100:,.0f}</b>, в боте: <b>{local_cents / 100:,.0f}</b>.\n"
+        f"Кто-то отредактировал позиции/цены в МС. Деньги в боте НЕ тронуты — "
+        f"проверьте и поправьте вручную при необходимости."
+    )
+    for uid in await aget_notify_recipients():
+        await tg_send_message(uid, text)
+    logger.info(
+        "customerorder drift заказ #%d: МС=%d local=%d (помечен ms_drift_at)",
+        order_id, ms_sum, local_cents,
+    )
+
+
+# ─── Demand (отгрузка) ──────────────────────────────────────────────────────────
+
+
+async def _handle_demand_deleted(demand_id: str) -> None:
+    """Бот-созданная отгрузка (demand) удалена в МойСклад.
+
+    Статус/деньги/остатки НЕ трогаем (отгрузка их двигала), но помечаем заказ
+    `ms_deleted_at` → он уходит из аналитики выручки (фантом) и из списков
+    заказов; в учёте долгов остаётся для ручной разборки. Уведомляем boss/admin.
+    Идемпотентно: при уже выставленном флаге — тихо выходим (без дубль-алерта)."""
+    from services.notifier import aget_notify_recipients, tg_send_message
+    from utils.helpers import esc
+
+    order = await adb.find_order_by_ms_demand_id(demand_id)
+    if not order:
+        return
+    if order.get("ms_deleted_at"):
+        return  # уже помечен — не дублируем уведомление
+    order_id = order["id"]
+    status = order.get("status", "")
+    agent = esc(order.get("agent_name") or "—")
+
+    await adb.set_order_ms_deleted(order_id)
+    await adb.add_audit_log(
+        0,
+        "МойСклад",
+        "system",
+        "ms_demand_deleted",
+        f"demand {demand_id} удалён в МС → заказ #{order_id} (status={status}) "
+        f"помечен ms_deleted_at (вне аналитики), статус не тронут.",
+    )
+    text = (
+        f"⚠️ <b>Отгрузка удалена в МойСклад</b>\n\n"
+        f"Заказ #{order_id} (клиент: {agent}), статус: <b>{esc(status)}</b>.\n"
+        f"Отгрузка удалена вручную в МС. Заказ убран из аналитики выручки; "
+        f"деньги/остатки НЕ тронуты — проверьте вручную."
+    )
+    for uid in await aget_notify_recipients():
+        await tg_send_message(uid, text)
+    logger.info("demand.DELETE %s → заказ #%d помечен ms_deleted_at", demand_id, order_id)

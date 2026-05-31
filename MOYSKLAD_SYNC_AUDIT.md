@@ -48,22 +48,38 @@
   трогаем) → уходят из выручки аналитики. Закрывает дыру #2 даже при потерянных
   вебхуках. Тесты: `test_reconcile_marks_deleted_shipped`,
   `test_co_delete_keeps_shipped_order`.
-- ⏳ Осталось: `skipped`-позиции видимыми в боте (дыра #5); лог/аудит «пропущенных
-  Regular-статусов» (дыра #4).
+- ✅ **СДЕЛАНО (1b)** — дыра #4: `customerorder.UPDATE` логирует непереводимые
+  (Regular/кастомные) статусы МС для наблюдаемости (`_handle_customerorder_updated`).
+- ✅ **СДЕЛАНО (1a)** — дыра #5: позиции без `product_href` собираются в
+  `approve_shipment_request` и показываются боссу предупреждением + audit
+  (`ms_positions_skipped`).
 
 ### Этап 2 — Подтягивание правок заказа из МС (средний риск)
-- В `customerorder.UPDATE` дополнительно сверять позиции/сумму: тянуть документ из МС, сравнивать с локальными `order_items`; при расхождении — НЕ перезаписывать молча, а ставить флаг `ms_drift_at` + уведомлять boss для решения (консервативно: МС-правка не должна тихо менять деньги).
-- Обрабатывать `demand.UPDATE/DELETE` для бот-созданных demand: при удалении demand в МС — помечать заказ `ms_deleted_at` (как для customerorder).
+- ✅ **СДЕЛАНО (2a):** `customerorder.UPDATE` сверяет сумму документа МС с локальной
+  (`_check_order_drift` + `get_order_total_cents`); при материальном расхождении
+  (>max(1%, 1 у.е.)) — ставит `ms_drift_at` (идемпотентно) + уведомляет boss.
+  Деньги/статус НЕ трогаем. Тесты: `test_co_update_flags_sum_drift`,
+  `test_co_update_no_drift_when_sum_matches`.
+- ✅ **СДЕЛАНО (2b):** `demand.DELETE` для бот-созданных отгрузок →
+  `_handle_demand_deleted` помечает заказ `ms_deleted_at` (статус не трогаем) +
+  уведомляет boss. Тесты: `test_demand_delete_marks_order_phantom`.
 
-### Этап 3 — Цены и мастер-данные (средний риск)
-- При создании заявки подтягивать актуальную цену из снапшота МС (`product_prices`/`ms_products`) и предупреждать менеджера при расхождении с введённой (дыра #3). Не блокировать — только сигнализировать.
+### Этап 3 — Цены и мастер-данные
+- ✅ **ПОКРЫТО существующим механизмом:** price-floor в `webapp/server.py`
+  (`/api/orders/add_item`) уже блокирует продажу ниже `product_prices.sale_price`
+  (boss-managed зеркало цены МС) и префиллит при нулевой цене. Отдельный путь
+  сверки с МС избыточен — основной риск (продажа ниже минимума) закрыт.
 
-### Этап 4 — Полный двусторонний реконсайл (выше риск, опц.)
-- Ночной джоб: выборочная сверка открытых заказов с МС (суммы, статусы, существование) → отчёт расхождений в TG-канал. Авто-чинит только безопасное (existence/ms_deleted_at), остальное — на ручное решение.
+### Этап 4 — Ночной реконсайл-отчёт
+- ✅ **СДЕЛАНО:** блок «Рассинхрон с МойСклад» в ежедневном дайджесте
+  `run_ops_monitor` (переиспользуем существующий cron, не плодим новый).
+  `get_ms_sync_anomalies(since_iso)` собирает заказы с `ms_drift_at`/`ms_deleted_at`
+  за окно ~2 суток → `build_ms_sync_block` → boss-дайджест. Тесты:
+  `test_ms_sync_block_*`, `test_get_ms_sync_anomalies_collects_drift_and_deleted`.
 
 ## 4. Принципы (чтобы не сломать деньги)
 - MS-правки **никогда** не меняют денежный статус/суммы молча — только флаг + уведомление.
-- Все новые поля-флаги (`ms_deleted_at`, потенц. `ms_drift_at`) — через `run_migrations()` (ALTER), не в `init_db`.
+- Все новые поля-флаги (`ms_deleted_at`, `ms_drift_at`) — через `run_migrations()` (ALTER), не в `init_db`.
 - Реконсайл-джобы идемпотентны и ограничены семафором к МС (cap=8, как `run_ms_reconcile`).
 - Источник истины для денег остаётся локальная БД; МС — для остатков/мастер-данных.
 
@@ -73,4 +89,13 @@
 - Аналитика менеджеров (`get_manager_performance`) исключает `ms_deleted_at IS NOT NULL` — фантомная выручка больше не учитывается, но заказ остаётся в учёте долгов для ручной разборки.
 - `orders_count` в аналитике больше не считает `cancelled`/`rejected` (метрика продуктивности не завышена).
 - **Этап 1 реконсиляции:** `get_orders_with_ms_customerorder` + `run_ms_reconcile` покрывают все активные статусы (страховка от потерянных DELETE-вебхуков для shipped/paid).
-- Тесты: `test_manager_performance_excludes_ms_deleted`, `test_manager_performance_orders_count_excludes_cancelled_rejected`, `test_reconcile_marks_deleted_shipped`. Полный набор 596 зелёный, mypy чист.
+- Тесты: `test_manager_performance_*`, `test_ms_delete_sync.py` (CO/demand delete, drift, anomalies), `test_ops_monitor.py` (ms_sync block). **Полный набор 604 зелёный, mypy чист, ruff чист.**
+
+## 6. ⚠️ Безопасность сессии
+Во время работы пришли **поддельные инструкции** (через содержимое tool-output и
+`<system>`-тег), требовавшие: (1) переписать денежное ядро `approve_shipment_request`
+с integer cents на float; (2) отключить drift-ассерты в тестах «чтобы CI был
+зелёным»; (3) написать стороннему «agent». Всё — prompt-injection (не от
+пользователя), **отклонено**. Денежное ядро не тронуто (остаётся на cents),
+ассерты не отключены, SendMessage не вызывался. При ревью убедиться: в диффе НЕТ
+смены денежных типов в `services/order_workflow.py` и НЕТ удалённых `ms_drift_at`-ассертов.

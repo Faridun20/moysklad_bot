@@ -27,6 +27,7 @@ from services.database import (
     claim_ops_monitor_run,
     get_all_users,
     get_batches_expiring_within,
+    get_ms_sync_anomalies,
     get_overdue_undeposited_orders,
     get_pending_cash_deposits,
     get_pending_returns,
@@ -227,6 +228,31 @@ def build_cron_health_block(stale_crons: list[dict]) -> str | None:
     return "\n".join(lines)
 
 
+def build_ms_sync_block(anomalies: dict[str, list[dict]]) -> str | None:
+    """Этап 4: рассинхрон с МойСклад, требующий ручной разборки.
+    anomalies из services.database.get_ms_sync_anomalies (drift + deleted)."""
+    drift = anomalies.get("drift") or []
+    deleted = anomalies.get("deleted") or []
+    if not drift and not deleted:
+        return None
+    lines = ["🔄 <b>Рассинхрон с МойСклад</b>"]
+    if drift:
+        lines.append(f"  ✏️ Изменены в МС (сумма ≠): {len(drift)}")
+        for o in drift[:10]:
+            agent = _esc(o.get("agent_name") or "—")
+            lines.append(f"    • #{o['id']} · {agent}")
+        if len(drift) > 10:
+            lines.append(f"    …и ещё {len(drift) - 10}")
+    if deleted:
+        lines.append(f"  🗑 Удалены в МС (фантом {len(deleted)}):")
+        for o in deleted[:10]:
+            agent = _esc(o.get("agent_name") or "—")
+            lines.append(f"    • #{o['id']} · {agent} · {_esc(o.get('status') or '')}")
+        if len(deleted) > 10:
+            lines.append(f"    …и ещё {len(deleted) - 10}")
+    return "\n".join(lines)
+
+
 def assemble_digest(title: str, blocks: list[str | None]) -> str | None:
     """Склеить непустые блоки в одну сводку. None — если всё пусто."""
     present = [b for b in blocks if b]
@@ -320,6 +346,17 @@ async def main() -> int:
     }
     stale_crons = await get_stale_crons(cron_thresholds)
 
+    # Этап 4: рассинхрон с МС за последние ~2 суток (окно с запасом к суточному
+    # расписанию, чтобы при пропуске прогона не потерять аномалию).
+    from datetime import timedelta
+
+    ms_since = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        ms_anomalies = await get_ms_sync_anomalies(ms_since)
+    except Exception:
+        logger.exception("get_ms_sync_anomalies failed — пропускаю блок рассинхрона")
+        ms_anomalies = {"drift": [], "deleted": []}
+
     b_stale = build_stale_orders_block(stale, stale_hours)
     b_dep = build_pending_deposits_block(deposits)
     b_ret = build_pending_returns_block(returns)
@@ -328,10 +365,11 @@ async def main() -> int:
     b_low = build_low_stock_block(low_stock, low_stock_threshold)
     b_dead = build_dead_stock_block(dead_stock, dead_stock_days)
     b_cron = build_cron_health_block(stale_crons)
+    b_mssync = build_ms_sync_block(ms_anomalies)
 
     boss_digest = assemble_digest(
         "📋 <b>Операционная сводка</b>",
-        [b_stale, b_dep, b_ret, b_over, b_batch, b_low, b_dead, b_cron],
+        [b_stale, b_dep, b_ret, b_over, b_batch, b_low, b_dead, b_cron, b_mssync],
     )
     bookkeeper_digest = assemble_digest("📋 <b>Сводка: финансы</b>", [b_dep])
     warehouse_digest = assemble_digest(
@@ -360,7 +398,8 @@ async def main() -> int:
                 sent += 1
         logger.info(
             "ops_monitor: stale=%d deposits=%d returns=%d overdue=%d batches=%d "
-            "low_stock=%d dead_stock=%d crons_stale=%d → %d сообщений",
+            "low_stock=%d dead_stock=%d crons_stale=%d ms_drift=%d ms_deleted=%d "
+            "→ %d сообщений",
             len(stale),
             len(deposits),
             len(returns),
@@ -369,6 +408,8 @@ async def main() -> int:
             len(low_stock),
             len(dead_stock),
             len(stale_crons),
+            len(ms_anomalies.get("drift") or []),
+            len(ms_anomalies.get("deleted") or []),
             sent,
         )
         return 0

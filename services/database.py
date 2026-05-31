@@ -778,6 +778,11 @@ def run_migrations():
             # исключаются из аналитики менеджеров, но остаются в учёте долгов
             # для ручной разборки. NULL = в МС ещё существует.
             ("orders", "ms_deleted_at", "TEXT"),
+            # Когда обнаружено расхождение суммы заказа с документом в МойСклад
+            # (кто-то отредактировал позиции/цены в МС). Это СИГНАЛ для ручной
+            # проверки (флаг + уведомление), деньги/статус НЕ меняем молча.
+            # NULL = расхождений не зафиксировано.
+            ("orders", "ms_drift_at", "TEXT"),
             ("orders", "credit_limit_override", "INTEGER NOT NULL DEFAULT 0"),
             ("orders", "credit_limit_override_by", "BIGINT"),
             ("orders", "price_check_warnings", "TEXT"),
@@ -3283,6 +3288,31 @@ async def set_order_ms_deleted(order_id: int) -> bool:
     )
 
 
+async def set_order_ms_drift(order_id: int) -> bool:
+    """Пометить расхождение суммы заказа с документом в МойСклад (ручное
+    редактирование позиций/цен в МС). Идемпотентно (ставим только если ещё не
+    стоит) → одно уведомление на заказ. Деньги/статус НЕ меняем — это сигнал."""
+    return (
+        await adb_core.execute(
+            "UPDATE orders SET ms_drift_at = $1, updated_at = $2 "
+            "WHERE id = $3 AND ms_drift_at IS NULL",
+            now_str(), now_str(), order_id,
+        )
+        > 0
+    )
+
+
+async def get_order_total_cents(order_id: int) -> int:
+    """Сумма заказа в минорных единицах (копейках) из локальных order_items.
+    Точный аналог `total_cents` из get_order_payment_summary — для сверки с
+    документом МойСклад (поле `sum`)."""
+    val = await adb_core.fetchval(
+        f"SELECT {_SUM_ORDER_TOTAL_CENTS} FROM order_items WHERE order_id = $1",
+        order_id,
+    )
+    return int(val or 0)
+
+
 async def set_order_credit_override(order_id: int, by: int) -> bool:
     """Отметить, что заказ одобрен боссом с превышением кредитного лимита
     (override). Снимает повторную проверку при будущих одобрениях этого заказа."""
@@ -3773,6 +3803,20 @@ def find_order_by_ms_customerorder_id(co_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+def find_order_by_ms_demand_id(demand_id: str) -> dict | None:
+    """Найти локальный заказ по ID demand (отгрузки) в МойСклад.
+    Используется для обработки webhook-события demand.DELETE — бот-созданная
+    отгрузка удалена в МС → помечаем заказ фантомом (ms_deleted_at)."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT * FROM orders WHERE ms_demand_id = ? LIMIT 1"),
+            (demand_id,),
+        )
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
 async def get_orders_with_ms_customerorder() -> list[dict]:
     """Заказы со ссылкой на customerorder в МС — для cron-реконсиляции удалённых
     документов (tasks/run_ms_reconcile, страховка от пропущенных DELETE-вебхуков).
@@ -3788,6 +3832,30 @@ async def get_orders_with_ms_customerorder() -> list[dict]:
         "AND (ms_deleted_at IS NULL) AND (deleted_at IS NULL) "
         "AND status NOT IN ('cancelled', 'rejected')"
     )
+
+
+async def get_ms_sync_anomalies(since_iso: str) -> dict[str, list[dict]]:
+    """Заказы, требующие ручной разборки из-за рассинхрона с МойСклад (для
+    ночного дайджеста ops_monitor). Два набора, помеченные с `since_iso`:
+      • drift   — сумма в МС ≠ локальной (ms_drift_at): отредактированы в МС;
+      • deleted — документ удалён в МС, но статус shipped/paid (ms_deleted_at):
+                  «фантом», деньги/остатки двигались.
+    Окно since_iso ограничивает свежими — старое уже разобрали. soft-deleted
+    исключаем. Native async через adb_core."""
+    drift = await adb_core.fetch(
+        "SELECT id, agent_name, full_name, status, ms_drift_at FROM orders "
+        "WHERE ms_drift_at IS NOT NULL AND ms_drift_at >= $1 AND (deleted_at IS NULL) "
+        "ORDER BY ms_drift_at DESC",
+        since_iso,
+    )
+    deleted = await adb_core.fetch(
+        "SELECT id, agent_name, full_name, status, ms_deleted_at FROM orders "
+        "WHERE ms_deleted_at IS NOT NULL AND ms_deleted_at >= $1 AND (deleted_at IS NULL) "
+        "AND status IN ('shipped', 'paid', 'partially_returned', 'returned') "
+        "ORDER BY ms_deleted_at DESC",
+        since_iso,
+    )
+    return {"drift": list(drift), "deleted": list(deleted)}
 
 
 def clear_order_ms_customerorder_id(order_id: int) -> bool:
