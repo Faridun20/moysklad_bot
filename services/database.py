@@ -1216,6 +1216,20 @@ async def _confirmed_returns_by_order(order_ids: list[int]) -> dict[int, float]:
     return {r["order_id"]: float(r["s"] or 0) for r in rows}
 
 
+async def agent_has_order(agent_id: str) -> bool:
+    """Есть ли у контрагента хоть один (не soft-deleted) заказ. Гейт для
+    установки кредит-лимита: лимит можно задать только тому, на кого реально
+    создавали заказ, а не любому контрагенту из справочника МС (иначе плодятся
+    лимиты-сироты, которых нет в overview). Native async через adb_core."""
+    if not agent_id:
+        return False
+    row = await adb_core.fetchrow(
+        "SELECT 1 FROM orders WHERE agent_id = $1 AND (deleted_at IS NULL) LIMIT 1",
+        agent_id,
+    )
+    return row is not None
+
+
 async def get_credit_overview() -> list[dict]:
     """Сводка по контрагентам для боса: лимит + текущий долг. Объединяет
     строки credit_limits и контрагентов из активных заказов (даже без явной

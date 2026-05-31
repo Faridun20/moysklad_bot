@@ -1721,6 +1721,14 @@ async def api_credit_set(request: Request):
     agent_name = (data.get("agent_name") or "").strip()[:200]
     if not agent_id:
         raise HTTPException(status_code=400, detail="agent_id обязателен")
+    # Лимит — только контрагенту, на которого реально был заказ (а не любому из
+    # справочника МС). UI и так показывает лишь overview-контрагентов, но
+    # страхуем API: иначе можно создать лимит-сироту, которого нет в overview.
+    if not await adb.agent_has_order(agent_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Лимит можно задать только контрагенту, на которого есть заказ",
+        )
     # Round 6 (S3): isnan/isinf + верхний лимит. inf лимит делает любой долг
     # «свободным», ломает overview.
     import math
