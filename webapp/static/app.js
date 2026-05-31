@@ -2496,6 +2496,12 @@ async function renderDebts(container) {
           </div>
         </div>
       `;
+      // Единый остаток к получению в базовой валюте — не складывать валюты в уме.
+      if (data.remaining_base_total != null) {
+        const partial = data.remaining_base_partial
+          ? ' <span class="money-placeholder">(часть без курса)</span>' : '';
+        html += `<div class="money-base-total">💰 Осталось получить: ≈ <b>${fmt(data.remaining_base_total)} ${escapeHtml(data.base_currency || 'USD')}</b>${partial}</div>`;
+      }
       // Stat-плитки показываем только если хоть один счётчик не ноль,
       // иначе три «0 0 0» лишь засоряют экран.
       const hasAnyStat = overdueCount + todayCount + upcomingCount > 0;
