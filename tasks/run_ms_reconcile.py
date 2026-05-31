@@ -2,13 +2,13 @@
 CLI: реконсиляция удалённых в МойСклад заказов покупателя — страховка от
 пропущенных `customerorder.DELETE`-вебхуков. Railway Cron.
 
-За прогон: берём approved-заказы со ссылкой `ms_customerorder_id`, для каждого
-проверяем существование документа в МС (GET entity/customerorder/{id}). Если
-404 — документ удалён вручную → отменяем заказ локально той же логикой, что в
-вебхук-хендлере (`services.ms_sync_handler.apply_ms_customerorder_delete`).
-
-Только approved: их безопасно авто-отменять, после отмены уходят из набора
-(нет повторной обработки). shipped/paid не трогаем.
+За прогон: берём заказы со ссылкой `ms_customerorder_id` (все активные статусы,
+кроме cancelled/rejected), для каждого проверяем существование документа в МС
+(GET entity/customerorder/{id}). Если 404 — документ удалён вручную → применяем
+ту же логику, что в вебхук-хендлере (`apply_ms_customerorder_delete`): approved
+отменяем локально, остальные помечаем ms_deleted_at + снимаем ссылку (уходят из
+выручки аналитики). Обработанный заказ выпадает из набора (ms_deleted_at/ссылка),
+повторной обработки нет.
 
 Использование:
     python -m tasks.run_ms_reconcile
@@ -51,7 +51,7 @@ async def main() -> int:
     # Пустой набор → 0 МС-вызовов (как run_ms_sync_retry).
     orders = await get_orders_with_ms_customerorder()
     if not orders:
-        logger.info("ms_reconcile: approved-заказов с ms_customerorder_id нет — пропуск")
+        logger.info("ms_reconcile: заказов с ms_customerorder_id нет — пропуск")
         return 0
 
     # Cap concurrency к МС. Семафор создаётся внутри main → привязан к текущему

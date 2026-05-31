@@ -76,3 +76,22 @@ def test_set_limit_validation(client_env):
         json={"initData": str(ids["boss"]), "agent_id": "agent-uuid", "limit_amount": -5},
     )
     assert resp.status_code == 400
+
+
+def test_set_limit_requires_order(client_env):
+    """Лимит нельзя задать контрагенту, на которого нет ни одного заказа —
+    иначе плодятся лимиты-сироты вне overview."""
+    client, db, ids = client_env
+    resp = client.post(
+        "/api/credit/set",
+        json={
+            "initData": str(ids["boss"]),
+            "agent_id": "ghost-no-orders",
+            "agent_name": "Ghost",
+            "limit_amount": 5000,
+        },
+    )
+    assert resp.status_code == 400
+    assert "заказ" in resp.json()["detail"].lower()
+    # И лимит не сохранился.
+    assert asyncio.run(db.get_credit_limit("ghost-no-orders")) != 5000.0

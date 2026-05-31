@@ -12,6 +12,7 @@ from tasks.run_ops_monitor import (
     build_cron_health_block,
     build_digest_keyboard,
     build_expiring_batches_block,
+    build_ms_sync_block,
     build_overdue_undeposited_block,
     build_pending_deposits_block,
     build_pending_returns_block,
@@ -72,6 +73,63 @@ def test_assemble_skips_empty_blocks():
 
 def test_assemble_none_when_all_empty():
     assert assemble_digest("Заголовок", []) is None
+
+
+# ─── Этап 4: блок рассинхрона с МойСклад ──────────────────────────────────────
+
+
+def test_ms_sync_block_none_when_no_anomalies():
+    assert build_ms_sync_block({"drift": [], "deleted": []}) is None
+    assert build_ms_sync_block({}) is None
+
+
+def test_ms_sync_block_shows_drift_and_deleted():
+    block = build_ms_sync_block(
+        {
+            "drift": [{"id": 1, "agent_name": "ACME", "status": "approved"}],
+            "deleted": [{"id": 2, "agent_name": "Beta", "status": "shipped"}],
+        }
+    )
+    assert block is not None
+    assert "#1" in block and "ACME" in block        # drift
+    assert "#2" in block and "Beta" in block          # deleted
+    assert "shipped" in block
+
+
+def test_ms_sync_block_truncates_long_lists():
+    drift = [{"id": i, "agent_name": f"A{i}", "status": "approved"} for i in range(15)]
+    block = build_ms_sync_block({"drift": drift, "deleted": []})
+    assert "15" in block
+    assert "и ещё 5" in block  # показываем 10, остальные свёрнуты
+
+
+def test_get_ms_sync_anomalies_collects_drift_and_deleted(isolated_db):
+    """get_ms_sync_anomalies возвращает заказы с ms_drift_at / ms_deleted_at
+    в окне since_iso; старое (до окна) и soft-deleted исключены."""
+    db = isolated_db
+    db.set_role(1, "m", "M", "manager")
+
+    def _mk(status, **flags):
+        oid = db.create_order(1, "M", "")
+        db.update_order_agent(oid, "A", "Client")
+        sets = ", ".join(f"{k}=?" for k in ({"status": status} | flags))
+        vals = [status, *flags.values(), oid]
+        with db.get_conn() as conn:
+            cur = db.get_cursor(conn)
+            cur.execute(db.q(f"UPDATE orders SET {sets} WHERE id=?"), vals)
+            conn.commit()
+        return oid
+
+    drift_oid = _mk("approved", ms_drift_at="2026-06-01 10:00:00")
+    del_oid = _mk("shipped", ms_deleted_at="2026-06-01 10:00:00")
+    # Старое (до окна) — не попадает.
+    _mk("shipped", ms_deleted_at="2020-01-01 00:00:00")
+
+    res = asyncio.run(db.get_ms_sync_anomalies("2026-05-30 00:00:00"))
+    drift_ids = {o["id"] for o in res["drift"]}
+    deleted_ids = {o["id"] for o in res["deleted"]}
+    assert drift_ids == {drift_oid}
+    assert deleted_ids == {del_oid}
 
 
 # ─── #23: интерактивная клавиатура дайджеста ──────────────────────────────────

@@ -140,11 +140,18 @@ function showError(msg) {
 // показывали голый текст без способа повторить (кроме ре-навигации).
 // Retry перезагружает текущий экран через showScreen(currentScreen).
 function errorBox(msg) {
+  // Различаем «нет сети» и «ошибка сервера»: при офлайне нет смысла показывать
+  // технический detail — даём понятную причину и подсказку. api() при сетевом
+  // сбое кидает именно это сообщение; плюс страхуемся navigator.onLine.
+  const offline = (typeof navigator !== 'undefined' && navigator.onLine === false)
+    || msg === 'Нет подключения к интернету';
+  const title = offline ? 'Нет подключения' : 'Не удалось загрузить';
+  const body = offline ? 'Проверьте интернет и попробуйте снова.' : escapeHtml(msg);
   return `
     <div class="error-card">
       <div class="error-icon">${icon('alert')}</div>
-      <div class="error-title">Не удалось загрузить</div>
-      <div class="error-body">${escapeHtml(msg)}</div>
+      <div class="error-title">${title}</div>
+      <div class="error-body">${body}</div>
       <button class="btn-primary" onclick="showScreen(currentScreen)">Повторить</button>
     </div>`;
 }
@@ -407,8 +414,8 @@ async function renderHome() {
           <div class="card-row" data-order-id="${o.id}">
             <div class="card-row-icon icon-${o.status}">${icon(STATUS_ICON[o.status] || 'list')}</div>
             <div class="card-row-info">
-              <div class="card-row-title">Заказ #${o.id}${o.agent_name ? ' · ' + escapeHtml(o.agent_name) : ''}</div>
-              <div class="card-row-sub">${o.created_at}</div>
+              <div class="card-row-title">${escapeHtml(o.agent_name || ('Заказ #' + o.id))}</div>
+              <div class="card-row-sub">Заказ #${o.id} · ${o.created_at}</div>
             </div>
             <span class="stock-badge ${o.status === 'approved' ? 'badge-green' : o.status === 'rejected' ? 'badge-red' : 'badge-yellow'}">${STATUS_NAME[o.status]}</span>
           </div>
@@ -798,12 +805,26 @@ const STATUS_NAME = {
 };
 
 async function api(path, body) {
-  const r = await fetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ initData: _initData, ...body }),
-  });
-  if (!r.ok) throw new Error((await r.json()).detail || 'Ошибка');
+  let r;
+  try {
+    r = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: _initData, ...body }),
+    });
+  } catch {
+    // fetch отклоняется только при сетевом сбое (нет интернета, CORS, abort) —
+    // не при HTTP-ошибке. Помечаем, чтобы errorBox показал «нет связи».
+    const err = new Error('Нет подключения к интернету');
+    err.network = true;
+    throw err;
+  }
+  if (!r.ok) {
+    // Тело ошибки может быть не-JSON (502/HTML от прокси) — не падаем на парсе.
+    let detail = `Ошибка сервера (${r.status})`;
+    try { detail = (await r.json()).detail || detail; } catch { /* не-JSON */ }
+    throw new Error(detail);
+  }
   return r.json();
 }
 
@@ -882,6 +903,20 @@ async function runSearch(query) {
     : '<div class="empty-hint">Ничего не найдено</div>';
 }
 
+// Заголовок группы заказов по дате. key = 'YYYY-MM-DD' (из created_at).
+// «Сегодня»/«Вчера» для свежих, иначе DD.MM.YYYY (formatDateRU из helpers.js).
+function orderDateLabel(key) {
+  if (!key || key.length < 10) return 'Без даты';
+  const pad = n => String(n).padStart(2, '0');
+  const dkey = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const today = new Date();
+  const yest = new Date(today);
+  yest.setDate(today.getDate() - 1);
+  if (key === dkey(today)) return 'Сегодня';
+  if (key === dkey(yest)) return 'Вчера';
+  return formatDateRU(key);
+}
+
 async function renderOrders() {
   const content = document.getElementById('content');
   content.innerHTML = loading('Загружаю заказы…');
@@ -928,19 +963,28 @@ function renderOrdersMain() {
           : isBoss ? 'Менеджеры ещё не создавали заказов' : 'Нажмите «+ Новый заказ» чтобы начать'
         }</div>
       </div>`
-    : filtered.map(o => `
+    : (() => {
+        // Группируем по дате (created_at='YYYY-MM-DD HH:MM') и выводим клиента
+        // заголовком: легче ориентироваться, когда не помнишь ни номер, ни имя.
+        const groups = [];
+        const gidx = {};
+        for (const o of filtered) {
+          const k = (o.created_at || '').slice(0, 10);
+          if (!(k in gidx)) { gidx[k] = groups.length; groups.push({ k, items: [] }); }
+          groups[gidx[k]].items.push(o);
+        }
+        const orderCard = o => `
       <div class="order-card order-card--${o.status}" data-id="${o.id}">
         <div class="order-header">
-          <div>
-            <div class="order-title">${icon(STATUS_ICON[o.status] || 'list')} Заказ #${o.id}</div>
-            ${isBoss ? `<div class="order-manager">👤 ${o.full_name}</div>` : ''}
+          <div class="order-head-main">
+            <div class="order-title">${icon('building')} ${escapeHtml(o.agent_name || 'Без клиента')}</div>
+            <div class="order-sub">Заказ #${o.id}${isBoss ? ` · ${escapeHtml(o.full_name)}` : ''}</div>
           </div>
           <span class="order-status status-${o.status}">${STATUS_NAME[o.status]}</span>
         </div>
-        ${o.agent_name ? `<div class="order-agent">🏢 ${o.agent_name}</div>` : ''}
         <div class="order-meta">
           <span>${icon('box')} ${o.items_count} тов.</span>
-          <span>${o.created_at}</span>
+          <span>${(o.created_at || '').slice(11, 16)}</span>
           ${o.total > 0 ? `<span class="order-total">💰 ${Math.round(o.total).toLocaleString('ru-RU')}</span>` : ''}
         </div>
         ${(() => {
@@ -988,7 +1032,12 @@ function renderOrdersMain() {
           </div>
         ` : ''}
       </div>
-    `).join('');
+    `;
+        return groups.map(g => `
+          <div class="section-label order-date-label">${orderDateLabel(g.k)}</div>
+          ${g.items.map(orderCard).join('')}
+        `).join('');
+      })();
 
   content.innerHTML = `
     <div class="orders-toolbar">
@@ -1960,8 +2009,11 @@ function renderPaymentsContent(container) {
     `).join('')}</div>
   `;
 
-  container.innerHTML = `
-    ${pendingHtml}
+  // Руководитель только получает и подтверждает оплаты — ручной ввод
+  // «Нового платежа» (аренда и т.п.) ему не нужен; это операция
+  // бухгалтера/менеджера. Поэтому форму боссу/админу не показываем.
+  const isBossPay = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
+  const payFormHtml = isBossPay ? '' : `
     <div class="section-label">Новый платёж (не связан с заказом)</div>
     <div class="card">
       <div class="form-row">
@@ -1983,7 +2035,11 @@ function renderPaymentsContent(container) {
       <button id="pay-submit" class="btn-primary">Отправить</button>
       <div id="pay-status" class="pay-status"></div>
     </div>
+  `;
 
+  container.innerHTML = `
+    ${pendingHtml}
+    ${payFormHtml}
     <div class="section-label">История платежей</div>
     <div class="stock-list">${history}</div>
   `;
@@ -1998,8 +2054,8 @@ function renderPaymentsContent(container) {
     });
   });
 
-  // Отправка
-  container.querySelector('#pay-submit').addEventListener('click', async () => {
+  // Отправка (форма есть только у не-босса — иначе обработчик не вешаем)
+  container.querySelector('#pay-submit')?.addEventListener('click', async () => {
     const amount = parseFloat(container.querySelector('#pay-amount').value);
     const comment = container.querySelector('#pay-comment').value.trim();
     const status = container.querySelector('#pay-status');
@@ -2141,23 +2197,25 @@ async function renderFinance() {
   setScreenContext(`Финансы · ${FIN_LABELS[financeTab] || ''}`);
 
   const active = t => (financeTab === t ? 'active' : '');
-  const cashboxItem = canCashbox
-    ? `<button class="seg-item ${active('cashbox')}" data-tab="cashbox">${icon('cashbox')} Касса</button>`
-    : '';
-  // «Лимиты» — read-only аналитика для босса. Вынесена из ряда разделов в
-  // доп-ссылку справа, чтобы уровень 1 был ровно из 2–3 разделов и не переносился.
-  const limitsAux = isBoss
-    ? `<button class="seg-aux ${active('limits')}" data-tab="limits">${icon('gauge')} Лимиты</button>`
-    : '';
+  // Уровень 1 — единый ровный сегмент-контрол (текстом, как iOS-segmented):
+  // все доступные разделы одинаковыми пилюлями. Иконки тут НЕ ставим — 4 пилюли
+  // с иконками клиппятся на узком экране (это и был «сломанный» вид у
+  // руководителя: 3 пилюли + отдельная по стилю ссылка «Лимиты»). «Лимиты»
+  // теперь равноправная 4-я вкладка.
+  const sections = [
+    { key: 'debts', label: 'Долги' },
+    { key: 'payments', label: 'Платежи' },
+  ];
+  if (canCashbox) sections.push({ key: 'cashbox', label: 'Касса' });
+  if (isBoss) sections.push({ key: 'limits', label: 'Лимиты' });
 
   content.innerHTML = `
     <div class="seg-row">
       <div class="seg">
-        <button class="seg-item ${active('debts')}" data-tab="debts">${icon('wallet')} Долги</button>
-        <button class="seg-item ${active('payments')}" data-tab="payments">${icon('cash')} Платежи</button>
-        ${cashboxItem}
+        ${sections.map(s =>
+          `<button class="seg-item ${active(s.key)}" data-tab="${s.key}">${s.label}</button>`
+        ).join('')}
       </div>
-      ${limitsAux}
     </div>
     <div id="finance-body"></div>
   `;
@@ -2186,14 +2244,21 @@ async function renderCashbox(container) {
   container = container || document.getElementById('content');
   container.innerHTML = loading('Загрузка кассы…');
   const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const role = currentUser && currentUser.role;
+  // Наличные сдаёт тот, кто их физически принимает от клиента (менеджер,
+  // кладовщик). Начальство/бухгалтер только ПОДТВЕРЖДАЮТ — им «Сдать наличные»
+  // и «Мои сдачи» не нужны (бессмысленный self-deposit).
+  const canDeposit = role === 'manager' || role === 'warehouse_keeper';
 
   // Каждый список может вернуть 403 (роль не видит) — тихо пропускаем.
   let deposits = [];
   let returns = [];
-  let myDeposits = null;  // null = роль не может сдавать (нет блока «Сдать наличные»)
+  let myDeposits = [];
   try { deposits = (await api('/api/deposits/pending', {})).deposits || []; } catch {}
   try { returns = (await api('/api/returns/pending', {})).returns || []; } catch {}
-  try { myDeposits = (await api('/api/deposits/my', {})).deposits || []; } catch {}
+  if (canDeposit) {
+    try { myDeposits = (await api('/api/deposits/my', {})).deposits || []; } catch {}
+  }
 
   const depCards = deposits.map(d => {
     const orders = (d.orders || [])
@@ -2239,10 +2304,11 @@ async function renderCashbox(container) {
     ? `<div class="section-label">${icon('return')} Возвраты на подтверждении (${returns.length})</div><div class="debts-list">${retCards}</div>`
     : '';
 
-  // Блок менеджера: сдать наличные + свои сдачи (если роль может сдавать).
+  // Блок «сдать наличные» + «мои сдачи» — только для тех, кто физически сдаёт
+  // (менеджер/кладовщик). Боссу/бухгалтеру self-deposit бессмысленен.
   let createBlock = '';
   let myBlock = '';
-  if (myDeposits !== null) {
+  if (canDeposit) {
     createBlock = `
       <div class="section-label">Сдать наличные</div>
       <div class="card">
@@ -2269,7 +2335,6 @@ async function renderCashbox(container) {
   }
 
   // Блок оформления возврата (менеджер/кладовщик/босс).
-  const role = currentUser && currentUser.role;
   const canReturn = ['admin', 'boss', 'warehouse_keeper', 'manager'].includes(role);
   const returnBlock = canReturn ? `
       <div class="section-label">Оформить возврат</div>
@@ -2298,7 +2363,7 @@ async function renderCashbox(container) {
   // в самом низу). Разносим по под-вкладкам, чтобы срочные подтверждения были
   // сразу, а не за тремя формами. Набор вкладок зависит от роли.
   const isConfirmer = ['admin', 'boss', 'bookkeeper', 'warehouse_keeper'].includes(role);
-  const canCreateDeposit = myDeposits !== null;
+  const canCreateDeposit = canDeposit;
   const hasOps = canCreateDeposit || canReturn;
 
   const tabs = [];

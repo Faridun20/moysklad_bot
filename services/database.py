@@ -772,6 +772,17 @@ def run_migrations():
             # Когда отмена была отражена в МойСклад (реверс customerorder).
             # NULL = ещё не синхронизировано; идемпотентность ms_cancel.
             ("orders", "ms_cancel_synced_at", "TEXT"),
+            # Когда документ заказа был обнаружен УДАЛЁННЫМ в МойСклад (вебхук
+            # customerorder.DELETE / cron-реконсиляция). Помечает «фантомные»
+            # заказы (особенно shipped/paid, чей статус мы не трогаем) — они
+            # исключаются из аналитики менеджеров, но остаются в учёте долгов
+            # для ручной разборки. NULL = в МС ещё существует.
+            ("orders", "ms_deleted_at", "TEXT"),
+            # Когда обнаружено расхождение суммы заказа с документом в МойСклад
+            # (кто-то отредактировал позиции/цены в МС). Это СИГНАЛ для ручной
+            # проверки (флаг + уведомление), деньги/статус НЕ меняем молча.
+            # NULL = расхождений не зафиксировано.
+            ("orders", "ms_drift_at", "TEXT"),
             ("orders", "credit_limit_override", "INTEGER NOT NULL DEFAULT 0"),
             ("orders", "credit_limit_override_by", "BIGINT"),
             ("orders", "price_check_warnings", "TEXT"),
@@ -1203,6 +1214,20 @@ async def _confirmed_returns_by_order(order_ids: list[int]) -> dict[int, float]:
         *unique_ids,
     )
     return {r["order_id"]: float(r["s"] or 0) for r in rows}
+
+
+async def agent_has_order(agent_id: str) -> bool:
+    """Есть ли у контрагента хоть один (не soft-deleted) заказ. Гейт для
+    установки кредит-лимита: лимит можно задать только тому, на кого реально
+    создавали заказ, а не любому контрагенту из справочника МС (иначе плодятся
+    лимиты-сироты, которых нет в overview). Native async через adb_core."""
+    if not agent_id:
+        return False
+    row = await adb_core.fetchrow(
+        "SELECT 1 FROM orders WHERE agent_id = $1 AND (deleted_at IS NULL) LIMIT 1",
+        agent_id,
+    )
+    return row is not None
 
 
 async def get_credit_overview() -> list[dict]:
@@ -2984,7 +3009,7 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
     shipped/partially_returned), returns_count. Имя/роль — из user_roles."""
     orders = await adb_core.fetch(
         "SELECT * FROM orders WHERE created_at >= $1 AND created_at <= $2 "
-        "AND (deleted_at IS NULL)",
+        "AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)",
         since_iso, until_iso,
     )
     if not orders:
@@ -3021,8 +3046,11 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
                 "returns_count": 0,
             },
         )
-        m["orders_count"] += 1
         status = o.get("status")
+        # «Создано» — продуктивные заказы: отменённые/отклонённые не считаем
+        # (иначе счётчик завышен на отменённые боссом/МС и отклонённые заявки).
+        if status not in ("cancelled", "rejected"):
+            m["orders_count"] += 1
         if status == "approved":
             m["approved"] += 1
         elif status == "shipped":
@@ -3255,6 +3283,48 @@ async def set_order_ms_cancel_synced(order_id: int) -> bool:
         )
         > 0
     )
+
+
+async def set_order_ms_deleted(order_id: int) -> bool:
+    """Пометить, что документ заказа удалён в МойСклад (вебхук CO.DELETE /
+    cron-реконсиляция). Идемпотентно (ставим только если ещё не стоит). Заказ
+    исключается из аналитики менеджеров (фантомная выручка), но остаётся в учёте
+    долгов для ручной разборки.
+
+    asyncpg #21: native async через adb_core."""
+    return (
+        await adb_core.execute(
+            "UPDATE orders SET ms_deleted_at = $1, updated_at = $2 "
+            "WHERE id = $3 AND ms_deleted_at IS NULL",
+            now_str(), now_str(), order_id,
+        )
+        > 0
+    )
+
+
+async def set_order_ms_drift(order_id: int) -> bool:
+    """Пометить расхождение суммы заказа с документом в МойСклад (ручное
+    редактирование позиций/цен в МС). Идемпотентно (ставим только если ещё не
+    стоит) → одно уведомление на заказ. Деньги/статус НЕ меняем — это сигнал."""
+    return (
+        await adb_core.execute(
+            "UPDATE orders SET ms_drift_at = $1, updated_at = $2 "
+            "WHERE id = $3 AND ms_drift_at IS NULL",
+            now_str(), now_str(), order_id,
+        )
+        > 0
+    )
+
+
+async def get_order_total_cents(order_id: int) -> int:
+    """Сумма заказа в минорных единицах (копейках) из локальных order_items.
+    Точный аналог `total_cents` из get_order_payment_summary — для сверки с
+    документом МойСклад (поле `sum`)."""
+    val = await adb_core.fetchval(
+        f"SELECT {_SUM_ORDER_TOTAL_CENTS} FROM order_items WHERE order_id = $1",
+        order_id,
+    )
+    return int(val or 0)
 
 
 async def set_order_credit_override(order_id: int, by: int) -> bool:
@@ -3747,15 +3817,59 @@ def find_order_by_ms_customerorder_id(co_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+def find_order_by_ms_demand_id(demand_id: str) -> dict | None:
+    """Найти локальный заказ по ID demand (отгрузки) в МойСклад.
+    Используется для обработки webhook-события demand.DELETE — бот-созданная
+    отгрузка удалена в МС → помечаем заказ фантомом (ms_deleted_at)."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT * FROM orders WHERE ms_demand_id = ? LIMIT 1"),
+            (demand_id,),
+        )
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
 async def get_orders_with_ms_customerorder() -> list[dict]:
-    """Approved-заказы со ссылкой на customerorder в МС — для cron-реконсиляции
-    удалённых документов (tasks/run_ms_reconcile). Только approved: их безопасно
-    авто-отменять, и после отмены они уходят из набора (нет повторной обработки).
-    Native async через adb_core."""
+    """Заказы со ссылкой на customerorder в МС — для cron-реконсиляции удалённых
+    документов (tasks/run_ms_reconcile, страховка от пропущенных DELETE-вебхуков).
+
+    Раньше брали только approved → пропущенный вебхук для shipped/paid оставлял
+    «фантом» (CO удалён в МС, но локально висит, ms_deleted_at=NULL, и попадает в
+    выручку аналитики). Теперь — все активные статусы. Обработанный заказ уходит
+    из набора (apply_ms_customerorder_delete ставит ms_deleted_at + снимает ссылку).
+    Терминально-неактивные cancelled/rejected исключаем: revenue=0, перепроверять
+    их в МС незачем. Native async через adb_core."""
     return await adb_core.fetch(
         "SELECT * FROM orders WHERE ms_customerorder_id IS NOT NULL "
-        "AND status = 'approved' AND (deleted_at IS NULL)"
+        "AND (ms_deleted_at IS NULL) AND (deleted_at IS NULL) "
+        "AND status NOT IN ('cancelled', 'rejected')"
     )
+
+
+async def get_ms_sync_anomalies(since_iso: str) -> dict[str, list[dict]]:
+    """Заказы, требующие ручной разборки из-за рассинхрона с МойСклад (для
+    ночного дайджеста ops_monitor). Два набора, помеченные с `since_iso`:
+      • drift   — сумма в МС ≠ локальной (ms_drift_at): отредактированы в МС;
+      • deleted — документ удалён в МС, но статус shipped/paid (ms_deleted_at):
+                  «фантом», деньги/остатки двигались.
+    Окно since_iso ограничивает свежими — старое уже разобрали. soft-deleted
+    исключаем. Native async через adb_core."""
+    drift = await adb_core.fetch(
+        "SELECT id, agent_name, full_name, status, ms_drift_at FROM orders "
+        "WHERE ms_drift_at IS NOT NULL AND ms_drift_at >= $1 AND (deleted_at IS NULL) "
+        "ORDER BY ms_drift_at DESC",
+        since_iso,
+    )
+    deleted = await adb_core.fetch(
+        "SELECT id, agent_name, full_name, status, ms_deleted_at FROM orders "
+        "WHERE ms_deleted_at IS NOT NULL AND ms_deleted_at >= $1 AND (deleted_at IS NULL) "
+        "AND status IN ('shipped', 'paid', 'partially_returned', 'returned') "
+        "ORDER BY ms_deleted_at DESC",
+        since_iso,
+    )
+    return {"drift": list(drift), "deleted": list(deleted)}
 
 
 def clear_order_ms_customerorder_id(order_id: int) -> bool:
@@ -4322,7 +4436,10 @@ async def get_user_orders(user_id: int, status: str | None = None) -> list[dict]
 
     asyncpg Stage 12 (#21): native async через adb_core."""
     params: list = [user_id]
-    query = "SELECT * FROM orders WHERE user_id = $1"
+    # Прячем заказы, удалённые в МойСклад (ms_deleted_at) и soft-deleted —
+    # иначе «фантомы» (CO удалён в МС) висят в списке, рассинхрон с аналитикой,
+    # которая их уже исключает (get_manager_performance).
+    query = "SELECT * FROM orders WHERE user_id = $1 AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)"
     if status:
         params.append(status)
         query += f" AND status = ${len(params)}"
@@ -4334,11 +4451,13 @@ async def get_all_orders(status: str | None = None) -> list[dict]:
     """Все заказы (опц. фильтр по статусу). asyncpg-миграция Stage 6
     (задача #21): нативный async через adb_core. Вызов — только webapp
     (`await adb.get_all_orders()`)."""
-    query = "SELECT * FROM orders"
+    # Прячем удалённые в МС (ms_deleted_at) и soft-deleted заказы — список
+    # должен сходиться с аналитикой, которая их уже исключает.
+    query = "SELECT * FROM orders WHERE (deleted_at IS NULL) AND (ms_deleted_at IS NULL)"
     params: list = []
     if status:
         params.append(status)
-        query += f" WHERE status = ${len(params)}"
+        query += f" AND status = ${len(params)}"
     query += " ORDER BY created_at DESC"
     return await adb_core.fetch(query, *params)
 

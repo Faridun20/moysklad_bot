@@ -68,12 +68,107 @@ def test_co_delete_keeps_shipped_order(isolated_db, monkeypatch):
     o = asyncio.run(db.get_order(oid))
     assert o["status"] == "shipped"  # деньги/остатки двигались — статус не трогаем
     assert o["ms_customerorder_id"] is None  # ссылка снята
+    assert o["ms_deleted_at"] is not None  # но помечен удалённым в МС → вне аналитики
 
 
 def test_co_delete_unknown_order_noop(isolated_db, monkeypatch):
     _mock_notify(monkeypatch)
     # Нет заказа с таким CO — хендлер просто выходит.
     asyncio.run(h._handle_customerorder_deleted("CO-NONE"))
+
+
+# ─── Этап 2b: demand.DELETE ──────────────────────────────────────────────────
+
+
+def test_demand_delete_marks_order_phantom(isolated_db, monkeypatch):
+    """Бот-созданная отгрузка удалена в МС → заказ помечается ms_deleted_at,
+    статус НЕ трогаем (деньги/остатки двигались). Идемпотентно."""
+    db = isolated_db
+    sent = _mock_notify(monkeypatch)
+    db.set_role(1, "m", "M", "manager")
+    oid = db.create_order(1, "M", "")
+    db.update_order_agent(oid, "A-1", "Client")
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q("UPDATE orders SET status='shipped', ms_demand_id=? WHERE id=?"),
+            ("DM-1", oid),
+        )
+        conn.commit()
+
+    asyncio.run(h._handle_demand_deleted("DM-1"))
+
+    o = asyncio.run(db.get_order(oid))
+    assert o["status"] == "shipped"          # статус не тронут
+    assert o["ms_deleted_at"] is not None    # помечен фантомом
+    assert sent and sent[0][0] == 99         # boss уведомлён
+
+    # Идемпотентность: повторный вызов не шлёт второе уведомление.
+    sent.clear()
+    asyncio.run(h._handle_demand_deleted("DM-1"))
+    assert sent == []
+
+
+def test_demand_delete_unknown_order_noop(isolated_db, monkeypatch):
+    _mock_notify(monkeypatch)
+    asyncio.run(h._handle_demand_deleted("DM-NONE"))
+
+
+# ─── Этап 2a: дрифт суммы customerorder.UPDATE ───────────────────────────────
+
+
+def _mk_order_with_items(db, qty, price, status="approved", co_id="CO-D"):
+    db.set_role(1, "m", "M", "manager")
+    oid = db.create_order(1, "M", "")
+    db.update_order_agent(oid, "A-1", "Client")
+    db.add_order_item(oid, "P", "", qty, "шт", price)
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q("UPDATE orders SET status=?, ms_customerorder_id=? WHERE id=?"),
+            (status, co_id, oid),
+        )
+        conn.commit()
+    return oid
+
+
+def test_co_update_flags_sum_drift(isolated_db, monkeypatch):
+    """Сумма в МС материально отличается от локальной → ms_drift_at + уведомление,
+    статус/деньги не трогаем."""
+    db = isolated_db
+    sent = _mock_notify(monkeypatch)
+    oid = _mk_order_with_items(db, qty=2, price=100.0)  # локально 200.00 = 20000 коп.
+
+    async def _b(path):
+        return {"sum": 30000, "state": {}}  # 300.00 в МС — дрифт
+
+    _mock_ms_get(monkeypatch, _b)
+    asyncio.run(h._handle_customerorder_updated("CO-D"))
+
+    o = asyncio.run(db.get_order(oid))
+    assert o["ms_drift_at"] is not None
+    assert o["status"] == "approved"  # статус не тронут
+    assert sent and "изменён в МойСклад" in sent[0][1]
+
+    # Идемпотентно: повторный UPDATE не шлёт второе уведомление.
+    sent.clear()
+    asyncio.run(h._handle_customerorder_updated("CO-D"))
+    assert sent == []
+
+
+def test_co_update_no_drift_when_sum_matches(isolated_db, monkeypatch):
+    """Сумма совпадает (в пределах допуска) → дрифт не флагуем."""
+    db = isolated_db
+    _mock_notify(monkeypatch)
+    oid = _mk_order_with_items(db, qty=2, price=100.0)  # 20000 коп.
+
+    async def _b(path):
+        return {"sum": 20000, "state": {}}
+
+    _mock_ms_get(monkeypatch, _b)
+    asyncio.run(h._handle_customerorder_updated("CO-D"))
+
+    assert asyncio.run(db.get_order(oid))["ms_drift_at"] is None
 
 
 # ─── #35: cron-реконсиляция ──────────────────────────────────────────────────
@@ -109,6 +204,33 @@ def test_reconcile_cancels_deleted_co(isolated_db, monkeypatch):
     rc = asyncio.run(rec.main())
     assert rc == 0
     assert asyncio.run(db.get_order(oid))["status"] == "cancelled"
+
+
+def test_reconcile_marks_deleted_shipped(isolated_db, monkeypatch):
+    """Этап 1: реконсайл проверяет НЕ только approved. Shipped-заказ, чей CO удалён
+    в МС (пропущенный вебхук), помечается ms_deleted_at — уходит из аналитики, но
+    статус/деньги не трогаем. После обработки выпадает из набора реконсиляции."""
+    import aiohttp
+
+    import tasks.run_ms_reconcile as rec
+
+    db = isolated_db
+    _mock_notify(monkeypatch)
+
+    async def _b(path):
+        raise aiohttp.ClientResponseError(None, (), status=404)
+
+    _mock_ms_get(monkeypatch, _b)
+    oid = _mk_order(db, "shipped", "CO-SHIP")
+
+    rc = asyncio.run(rec.main())
+    assert rc == 0
+    o = asyncio.run(db.get_order(oid))
+    assert o["status"] == "shipped"          # статус не тронут
+    assert o["ms_deleted_at"] is not None    # помечен фантомом
+    assert o["ms_customerorder_id"] is None  # ссылка снята
+    # Выпал из набора реконсиляции (идемпотентно, повторно не дёргаем МС).
+    assert asyncio.run(db.get_orders_with_ms_customerorder()) == []
 
 
 def test_reconcile_keeps_existing_co(isolated_db, monkeypatch):

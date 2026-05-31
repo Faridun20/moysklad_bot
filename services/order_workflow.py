@@ -331,6 +331,9 @@ async def approve_shipment_request(
     pdf_to_send: tuple[bytes, str] | None = None
     co_id: str | None = None
     demand_id: str | None = None
+    # Этап 1a: позиции без product_href молча выпадали из МС-документа (в МС
+    # заказ меньше локального). Собираем их и показываем боссу предупреждением.
+    skipped_names: list[str] = []
 
     if order and items and ms_ready():
         co_result = await create_customerorder_from_request(
@@ -339,6 +342,9 @@ async def approve_shipment_request(
             manager_name,
             telegram_user_id=manager_user_id,
         )
+        for nm in co_result.get("skipped") or []:
+            if nm not in skipped_names:
+                skipped_names.append(nm)
         if co_result.get("ok"):
             co_id = co_result.get("customerorder_id")
             # Audit СРАЗУ после успешного POST в МойСклад — до того
@@ -371,6 +377,9 @@ async def approve_shipment_request(
                 telegram_user_id=manager_user_id,
                 customerorder_href=co_href,
             )
+            for nm in demand_result.get("skipped") or []:
+                if nm not in skipped_names:
+                    skipped_names.append(nm)
             if demand_result.get("ok"):
                 demand_id = demand_result.get("demand_id")
                 if demand_id:
@@ -457,6 +466,25 @@ async def approve_shipment_request(
         logger.info(
             "MS context не готов — не создаём документы для заявки #%s",
             req_id,
+        )
+
+    # Этап 1a: если часть позиций не попала в МС-документ (нет product_href) —
+    # предупреждаем явно, иначе расхождение «локальный заказ > МС» молчит.
+    if skipped_names and co_id:
+        preview = ", ".join(esc(n) for n in skipped_names[:5])
+        more = f" +{len(skipped_names) - 5}" if len(skipped_names) > 5 else ""
+        demand_line += (
+            f"\n⚠️ <b>{len(skipped_names)} поз. не попали в МойСклад</b> "
+            f"(нет привязки к товару МС): {preview}{more}.\n"
+            f"Добавьте их в документ вручную."
+        )
+        await adb.add_audit_log(
+            boss_user_id,
+            boss_name,
+            boss_role,
+            "ms_positions_skipped",
+            f"Заявка #{req_id} → CO {co_id}: пропущено {len(skipped_names)} поз. "
+            f"без product_href: {', '.join(skipped_names[:10])}",
         )
 
     # Уведомляем менеджера
