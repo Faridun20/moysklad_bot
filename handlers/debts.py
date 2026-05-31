@@ -83,6 +83,11 @@ def _format_debt_card(
         f"#{order['id']} · 🏢 <b>{agent}</b>",
         f"💰 Сумма: <b>{_fmt_amount(summary['total'])} {_esc(currency)}</b>",
     ]
+    # Что в заказе — чтобы не открывать его отдельно ради уточнения.
+    if items:
+        preview = ", ".join(_esc(it.get("product_name") or "?") for it in items[:2])
+        more = f" +{len(items) - 2}" if len(items) > 2 else ""
+        lines.append(f"📦 {len(items)} поз.: {preview}{more}")
     if summary["confirmed"] > 0 or summary["pending"] > 0:
         lines.append(
             f"💵 Оплачено: <b>{_fmt_amount(summary['confirmed'])}</b>"
@@ -181,6 +186,7 @@ async def _render_debts(message: Message, user_id: int):
         )
 
         kb = InlineKeyboardBuilder()
+        kb.button(text="📦 Открыть заказ", callback_data=f"ord_view:{d['id']}")
         kb.button(text="✅ Отметить оплачено", callback_data=f"debt_paid:{d['id']}")
         kb.adjust(1)
 

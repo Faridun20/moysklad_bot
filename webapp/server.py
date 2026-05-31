@@ -2531,8 +2531,10 @@ async def api_submit_order(request: Request):
 
     # Уведомляем руководителей
     from services.order_workflow import resubmit_diff_line
+    from handlers.orders import build_credit_context
 
     notify_text = format_request_notify(order, items, req_id)
+    notify_text += await build_credit_context(order, items)  # UX: долг/лимит клиента инлайн
     notify_text += await resubmit_diff_line(order_id, items)  # #30: diff после доработки
     keyboard = {
         "inline_keyboard": [
