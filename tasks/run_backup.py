@@ -70,6 +70,15 @@ def _create_backup_postgres(db_url: str, out_path: Path) -> int:
     окружения. Полный dump (с pg_dump) даёт schema, но для нашего
     DR-сценария схему держит `tasks/migrate` (CREATE TABLE), достаточно
     данных.
+
+    Fallback срабатывает в ДВУХ случаях:
+      • pg_dump отсутствует в PATH (FileNotFoundError);
+      • pg_dump есть, но упал (RuntimeError) — самый частый прод-кейс это
+        «server version mismatch»: версия бинаря pg_dump < версии сервера
+        (pg_dump отказывается дампить сервер новее себя). railpack apt даёт
+        postgresql-client из дефолтного Debian-репо (старее, чем апгрейженный
+        managed-Postgres), поэтому без PGDG-репозитория версии расходятся.
+        Pure-Python COPY-dump через libpq версионно-независим.
     """
     try:
         return _pg_dump_native(db_url, out_path)
@@ -78,6 +87,14 @@ def _create_backup_postgres(db_url: str, out_path: Path) -> int:
             "pg_dump не найден в PATH — fallback на pure-Python COPY-dump "
             "(data-only). Restore: `python -m tasks.migrate` + psql < dump. "
             "Для полного schema+data dump поставь postgresql client в образ."
+        )
+        return _pg_dump_pure_python(db_url, out_path)
+    except RuntimeError as e:
+        logger.warning(
+            "pg_dump упал (%s) — fallback на pure-Python COPY-dump (data-only). "
+            "Частая причина: server version mismatch (версия pg_dump < версии "
+            "сервера). Restore: `python -m tasks.migrate` + psql < dump.",
+            e,
         )
         return _pg_dump_pure_python(db_url, out_path)
 
