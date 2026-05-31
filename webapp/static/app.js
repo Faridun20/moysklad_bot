@@ -784,7 +784,9 @@ function clearMainButton() {
 
 let ordersData = null;
 let currentOrderFilter = 'all';
-let currentOrderPeriod = 'all';  // 'all' | 'today' | '7d' | '30d' — фильтр по дате
+let currentOrderPeriod = 'all';  // 'all' | 'today' | '7d' | '30d' | 'custom'
+let currentOrderFrom = '';       // YYYY-MM-DD — кастомный диапазон (period='custom')
+let currentOrderTo = '';
 let currentDraftOrder = null; // активный черновик
 
 // Имена иконок спрайта по статусу заказа (вместо прежних эмодзи: рендерятся
@@ -912,6 +914,10 @@ function orderInPeriod(createdAt, period) {
   if (period === 'all') return true;
   const key = (createdAt || '').slice(0, 10);
   if (!key) return false;
+  if (period === 'custom') {
+    return (!currentOrderFrom || key >= currentOrderFrom)
+        && (!currentOrderTo || key <= currentOrderTo);
+  }
   const pad = n => String(n).padStart(2, '0');
   const dkey = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
   const today = new Date();
@@ -920,6 +926,108 @@ function orderInPeriod(createdAt, period) {
   const cutoff = new Date(today);
   cutoff.setDate(today.getDate() - (days - 1));
   return key >= dkey(cutoff);
+}
+
+// ─── Календарь выбора диапазона дат (от–до) ──────────────────────────
+// Самодостаточный инлайн-компонент: рисует свой DOM в host, сам управляет
+// навигацией по месяцам и выбором диапазона, по «Применить» зовёт onApply(from,to).
+// Даты — строки 'YYYY-MM-DD'. new Date() в браузере доступен (это app.js).
+const _MONTHS_RU = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+  'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
+const _WD_RU = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+
+function _ymd(d) {
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+// День «по» в календаре включительный, а бэкенд аналитики трактует until как
+// полночь (end-exclusive) и требует until>since → шлём следующий день.
+function _nextDay(ymd) {
+  const d = new Date(ymd + 'T00:00:00');
+  d.setDate(d.getDate() + 1);
+  return _ymd(d);
+}
+
+// Хост-заглушка в разметке; календарь монтируется в неё после innerHTML.
+function dateRangeHost() {
+  return '<div class="cal-host"></div>';
+}
+
+function mountCalendar(host, initFrom, initTo, onApply) {
+  if (!host) return;
+  let from = initFrom || null;
+  let to = initTo || null;
+  const base = from ? new Date(from + 'T00:00:00') : new Date();
+  let vy = base.getFullYear();
+  let vm = base.getMonth();
+
+  function render() {
+    const first = new Date(vy, vm, 1);
+    const lead = (first.getDay() + 6) % 7;            // неделя с понедельника
+    const daysInMonth = new Date(vy, vm + 1, 0).getDate();
+    const todayKey = _ymd(new Date());
+    const p2 = n => String(n).padStart(2, '0');
+    const cells = [];
+    for (let i = 0; i < lead; i++) cells.push('<div class="cal-cell cal-empty"></div>');
+    for (let d = 1; d <= daysInMonth; d++) {
+      const key = `${vy}-${p2(vm + 1)}-${p2(d)}`;
+      const cls = ['cal-cell', 'cal-day'];
+      const isStart = from && key === from;
+      const isEnd = to && key === to;
+      if (key === todayKey) cls.push('cal-today');
+      if (isStart || isEnd) {
+        cls.push('cal-sel');
+        if (from && to && from !== to) {
+          if (isStart) cls.push('cal-sel-start');
+          if (isEnd) cls.push('cal-sel-end');
+        }
+      }
+      if (from && to && key > from && key < to) cls.push('cal-in-range');
+      cells.push(`<button type="button" class="${cls.join(' ')}" data-day="${key}">${d}</button>`);
+    }
+    const rangeLabel = from
+      ? (to ? `${formatDateRU(from)} — ${formatDateRU(to)}` : `${formatDateRU(from)} — …`)
+      : 'Выберите начало и конец';
+    host.innerHTML = `
+      <div class="cal">
+        <div class="cal-head">
+          <button type="button" class="cal-nav" data-nav="-1" aria-label="Предыдущий месяц">‹</button>
+          <div class="cal-title">${_MONTHS_RU[vm]} ${vy}</div>
+          <button type="button" class="cal-nav" data-nav="1" aria-label="Следующий месяц">›</button>
+        </div>
+        <div class="cal-grid cal-wd">${_WD_RU.map(w => `<div class="cal-wd-cell">${w}</div>`).join('')}</div>
+        <div class="cal-grid cal-days">${cells.join('')}</div>
+        <div class="cal-foot">
+          <span class="cal-range">${rangeLabel}</span>
+          <button type="button" class="btn-primary cal-apply" ${from && to ? '' : 'disabled'}>Применить</button>
+        </div>
+      </div>`;
+    wire();
+  }
+
+  function wire() {
+    host.querySelectorAll('[data-nav]').forEach(b => b.addEventListener('click', () => {
+      vm += parseInt(b.dataset.nav, 10);
+      if (vm < 0) { vm = 11; vy--; }
+      if (vm > 11) { vm = 0; vy++; }
+      render();
+    }));
+    host.querySelectorAll('[data-day]').forEach(b => b.addEventListener('click', () => {
+      const key = b.dataset.day;
+      if (!from || (from && to)) { from = key; to = null; }   // новый выбор
+      else if (key < from) { from = key; }                    // раньше начала → новое начало
+      else { to = key; }
+      haptic('light');
+      render();
+    }));
+    const apply = host.querySelector('.cal-apply');
+    if (apply) apply.addEventListener('click', () => {
+      if (from && to) { haptic('light'); onApply(from, to); }
+    });
+  }
+
+  render();
 }
 
 function orderDateLabel(key) {
@@ -983,10 +1091,12 @@ function renderOrdersMain() {
     { id: 'today', label: 'Сегодня' },
     { id: '7d', label: '7 дней' },
     { id: '30d', label: '30 дней' },
+    { id: 'custom', label: 'Период…' },
   ];
   const periodBtns = periods.map(p =>
     `<button class="cat-btn ${currentOrderPeriod === p.id ? 'active' : ''}" data-period="${p.id}">${p.label}</button>`
   ).join('');
+  const periodPanel = currentOrderPeriod === 'custom' ? dateRangeHost() : '';
 
   // Если активный статус-фильтр недоступен для роли (сменилась роль/состояние) —
   // откатываем на 'all', чтобы не показать пусто из-за исчезнувшего фильтра.
@@ -1088,6 +1198,7 @@ function renderOrdersMain() {
       ${!isBoss ? `<button class="btn-new-order" id="btn-new-order">+ Новый заказ</button>` : ''}
     </div>
     <div class="cat-scroll cat-scroll--period">${periodBtns}</div>
+    ${periodPanel}
 
     ${isBoss ? `<button class="requests-btn" id="show-requests">${icon('clock')} Заявки на рассмотрении</button>` : ''}
 
@@ -1111,6 +1222,16 @@ function renderOrdersMain() {
       renderOrdersMain();
     });
   });
+
+  // Кастомный диапазон дат: монтируем календарь, по «Применить» фильтруем.
+  if (currentOrderPeriod === 'custom') {
+    mountCalendar(content.querySelector('.cal-host'), currentOrderFrom, currentOrderTo,
+      (from, to) => {
+        currentOrderFrom = from;
+        currentOrderTo = to;
+        renderOrdersMain();
+      });
+  }
 
   // Новый заказ
   document.getElementById('btn-new-order')?.addEventListener('click', () => openOrderEditor(null));
@@ -1807,35 +1928,51 @@ async function handleRequest(reqId, action) {
 }
 // ─── Экран: Аналитика ───────────────────────────────
 
-let analyticsCache = {};  // period -> { ts, data }
-let analyticsPeriod = 'month';
+let analyticsCache = {};  // cacheKey -> { ts, data }
+let analyticsPeriod = 'month';   // preset id | 'custom'
+let analyticsSince = '';         // YYYY-MM-DD — кастомный диапазон (period='custom')
+let analyticsUntil = '';
+let lastAnalyticsData = null;    // последний успешный ответ — чтобы показать поля дат без перезапроса
 const ANALYTICS_TTL_MS = 60 * 1000;
 
 async function renderAnalytics() {
   const content = document.getElementById('content');
+  const custom = analyticsPeriod === 'custom';
 
-  // Короткий кэш по периоду (TTL 60с): переключение неделя/месяц/3мес туда-обратно
-  // отдаётся мгновенно, без повторного запроса. TTL намеренно короткий — аналитика
-  // строится на отгрузках МойСклад, показывать сильно устаревшие цифры не годится.
-  const cached = analyticsCache[analyticsPeriod];
+  // «Период…» выбран, но даты ещё не заданы → не дёргаем бэкенд: показываем поля
+  // дат поверх последних данных (или подгружаем месяц как базу, если данных нет).
+  if (custom && !(analyticsSince && analyticsUntil)) {
+    if (lastAnalyticsData) { renderAnalyticsContent(lastAnalyticsData); return; }
+    analyticsPeriod = 'month';
+    return renderAnalytics();
+  }
+
+  // Короткий кэш (TTL 60с): пресеты и конкретные диапазоны кэшируются отдельно.
+  const cacheKey = custom ? `c:${analyticsSince}:${analyticsUntil}` : analyticsPeriod;
+  const cached = analyticsCache[cacheKey];
   if (cached && Date.now() - cached.ts < ANALYTICS_TTL_MS) {
+    lastAnalyticsData = cached.data;
     renderAnalyticsContent(cached.data);
     return;
   }
 
   content.innerHTML = loading('Считаю статистику…');
   try {
+    const body = custom
+      ? { initData: _initData, since: analyticsSince, until: _nextDay(analyticsUntil) }
+      : { initData: _initData, period: analyticsPeriod };
     const response = await fetch('/api/analytics', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData: _initData, period: analyticsPeriod }),
+      body: JSON.stringify(body),
     });
     if (!response.ok) {
       const err = await response.json();
       throw new Error(err.detail || 'Ошибка');
     }
     const data = await response.json();
-    analyticsCache[analyticsPeriod] = { ts: Date.now(), data };
+    analyticsCache[cacheKey] = { ts: Date.now(), data };
+    lastAnalyticsData = data;
     renderAnalyticsContent(data);
   } catch (e) {
     content.innerHTML = errorBox(e.message);
@@ -1851,11 +1988,13 @@ function renderAnalyticsContent(data) {
     { id: 'month', label: 'Месяц' },
     { id: '3month', label: '3 мес' },
     { id: 'year', label: 'Год' },
+    { id: 'custom', label: 'Период…' },
   ];
 
   const periodButtons = periods.map(p =>
     `<button class="cat-btn ${analyticsPeriod === p.id ? 'active' : ''}" data-period="${p.id}">${p.label}</button>`
   ).join('');
+  const periodPanel = analyticsPeriod === 'custom' ? dateRangeHost() : '';
 
   const trendIcon = data.trend > 0 ? '📈' : data.trend < 0 ? '📉' : '➡️';
   const trendClass = data.trend > 0 ? 'trend-up' : data.trend < 0 ? 'trend-dn' : '';
@@ -1916,6 +2055,7 @@ function renderAnalyticsContent(data) {
   content.innerHTML = `
     <div class="section-label">Период</div>
     <div class="cat-scroll">${periodButtons}</div>
+    ${periodPanel}
 
     <div class="stat-grid">
       <div class="stat">
@@ -1954,7 +2094,10 @@ function renderAnalyticsContent(data) {
       exportBtn.disabled = true;
       exportBtn.textContent = '⏳ Готовлю файл…';
       try {
-        await api('/api/analytics/export', { period: analyticsPeriod });
+        const exportBody = (analyticsPeriod === 'custom' && analyticsSince && analyticsUntil)
+          ? { since: analyticsSince, until: _nextDay(analyticsUntil) }
+          : { period: analyticsPeriod };
+        await api('/api/analytics/export', exportBody);
         exportBtn.textContent = '✅ Отправлено в чат';
         tg.showAlert && tg.showAlert('Excel-файл отправлен в чат с ботом');
       } catch (e) {
@@ -1978,6 +2121,16 @@ function renderAnalyticsContent(data) {
       renderAnalytics();
     });
   });
+
+  // Кастомный диапазон: монтируем календарь, по «Применить» перезапрашиваем.
+  if (analyticsPeriod === 'custom') {
+    mountCalendar(content.querySelector('.cal-host'), analyticsSince, analyticsUntil,
+      (from, to) => {
+        analyticsSince = from;
+        analyticsUntil = to;
+        renderAnalytics();
+      });
+  }
 }
 
 // ─── Экран: Платежи ─────────────────────────────────
