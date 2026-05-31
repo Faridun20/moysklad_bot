@@ -18,7 +18,10 @@
   --bg-card:    var(--tg-theme-bg-color, #ffffff);
   --bg-soft:    rgba(0, 0, 0, 0.04);
   --text:       var(--tg-theme-text-color, #000000);
-  --text-mute:  var(--tg-theme-hint-color, #8e8e93);
+  /* Fallback (вне Telegram, web) затемнён до #6d6d72: прежний #8e8e93 на белом
+     давал ~3.5:1 — ниже WCAG AA 4.5:1 для мелкого текста (subtitle, *-sub,
+     stat/section-label). В Telegram цвет берётся из темы и не меняется. */
+  --text-mute:  var(--tg-theme-hint-color, #6d6d72);
   --accent:     var(--tg-theme-button-color, #007aff);
   --accent-fg:  var(--tg-theme-button-text-color, #ffffff);
   --divider:    rgba(0, 0, 0, 0.08);
@@ -66,6 +69,103 @@
 
 /* Утилита: скрыть элемент без инлайн-стилей в JS. */
 .hidden { display: none !important; }
+
+/* ─── Доступность ─────────────────────────────────────────────────
+   Видимый фокус для навигации с клавиатуры (в браузере вне Telegram).
+   Кнопки (.nav-item/.action-btn/.cat-btn/.btn-*) раньше не давали никакого
+   индикатора фокуса. У инпутов свой ring (.form-input:focus, выше по
+   специфичности) — он сохраняется. :focus-visible не срабатывает на тапы,
+   поэтому мобильный UX не меняется. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Hover-отклик для указательных устройств (десктоп-браузер). На тач-экранах
+   правило не активируется → не остаётся «залипшего» hover после тапа. */
+@media (hover: hover) {
+  .action-btn:hover,
+  .card-row:hover,
+  .btn-secondary:hover,
+  .search-item:hover { background: var(--bg-soft); }
+  .nav-item:hover:not(.active),
+  .seg-item:hover:not(.active),
+  .sub-tab:hover:not(.active),
+  .subseg-item:hover:not(.active) { color: var(--text); }
+  .cat-btn:hover:not(.active) { border-color: var(--accent); }
+  .btn-primary:hover:not(:disabled),
+  .btn-new-order:hover,
+  .btn-submit-order:hover:not(:disabled) { opacity: 0.92; }
+  .stock-row:hover,
+  .agent-row:hover,
+  .prod-row:hover { opacity: 0.85; }
+  .search-btn:hover { opacity: 0.75; }
+}
+
+/* Уважать системную настройку «уменьшить движение»: гасим fadeUp/shimmer/
+   toast/переходы. Спиннер оставляем крутиться — статичный читается как
+   «зависло». */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .spinner { animation: spin 0.65s linear infinite !important; }
+}
+
+/* ─── SVG-иконки (спрайт в index.html) ────────────────────────────
+   stroke=currentColor → цвет наследуется от родителя: muted в неактивном
+   табе, акцент в активном, авто-перекрас под тёмную тему Telegram. */
+.ic {
+  width: var(--ic-size, 20px);
+  height: var(--ic-size, 20px);
+  flex-shrink: 0;
+  vertical-align: -0.18em;
+  /* Стиль задаём здесь (а не на <g> в спрайте): наследуемые CSS-свойства
+     проходят сквозь <use> в shadow-дерево символа, presentation-атрибуты —
+     нет. Так иконки гарантированно красятся currentColor под тему/таб. */
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* Кнопки с иконкой: иконка + подпись ровно по центру, единый зазор. */
+.btn-primary, .btn-secondary,
+.btn-approve, .btn-reject,
+.btn-confirm-pay, .btn-reject-pay,
+.btn-edit-order, .btn-delete-draft, .btn-edit-limit {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+}
+.btn-approve .ic, .btn-reject .ic,
+.btn-confirm-pay .ic, .btn-reject-pay .ic,
+.btn-edit-order .ic, .btn-delete-draft .ic, .btn-edit-limit .ic { --ic-size: 17px; vertical-align: 0; }
+.stock-edit-hint .ic { --ic-size: 15px; }
+
+/* Иконки спрайта внутри мелкого текста (бейджи, лейблы, группы поиска) —
+   уменьшаем под кегль строки, чтобы не доминировали. */
+.stat-label .ic,
+.order-pay .ic,
+.debt-items-preview .ic,
+.search-group-title .ic { --ic-size: 14px; }
+.section-label .ic { --ic-size: 13px; }
+.debt-agent .ic { --ic-size: 15px; }
+.cat-btn .ic,
+.sub-tab .ic,
+.requests-btn .ic { --ic-size: 16px; }
+/* Кнопка «Заявки на рассмотрении»: иконка + подпись по центру. */
+.requests-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+.warn-card .ic { --ic-size: 16px; color: var(--warn); }
+/* Под-вкладки «Заказы/Каталог»: иконка + подпись по центру, единый зазор. */
+.sub-tab { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+.order-title .ic { --ic-size: 16px; vertical-align: -0.16em; }
+
+/* Крупные иллюстративные иконки состояний (бывшие большие эмодзи). */
+.error-card .error-icon { color: var(--text-mute); }
+.error-card .error-icon .ic { --ic-size: 46px; }
+.empty-state-icon .ic { --ic-size: 44px; }
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
@@ -196,7 +296,7 @@ body {
 .hero-label {
   font-size: 13px;
   color: var(--accent-fg);
-  opacity: 0.75;
+  opacity: 0.85;
   margin-bottom: 4px;
 }
 
@@ -212,7 +312,7 @@ body {
   font-size: 26px;
   font-weight: 500;
   color: var(--accent-fg);
-  opacity: 0.65;
+  opacity: 0.8;
   margin-left: 4px;
 }
 
@@ -272,19 +372,31 @@ body {
   border-radius: 50%;
   color: var(--accent);
 }
+.action-btn-icon .ic { --ic-size: 22px; vertical-align: 0; }
 
-/* ─── Цветные иконки быстрых действий ────────────────────── */
+/* ─── Цветные иконки быстрых действий ──────────────────────
+   Светлые hex + dark-варианты ниже: на тёмной теме исходные тёмные
+   foreground'ы (#e65100 и т.п.) на полупрозрачной подложке давали низкий
+   контраст. Брайтим до читаемых оттенков (как сделано для семантики). */
 .icon-orange { background: rgba(230,81,0,0.12);   color: #e65100; }
 .icon-blue   { background: rgba(33,150,243,0.12);  color: #1976d2; }
 .icon-purple { background: rgba(156,39,176,0.12);  color: #7b1fa2; }
 .icon-green  { background: rgba(76,175,80,0.12);   color: #2e7d32; }
 .icon-amber  { background: rgba(255,152,0,0.12);   color: #e65100; }
 
-/* ─── Иконки статуса заказов ────────────────────────────── */
-.icon-pending  { background: rgba(249,168,37,0.15); }
-.icon-approved { background: rgba(46,125,50,0.12);  }
-.icon-rejected { background: rgba(160,35,35,0.12);  }
-.icon-shipped  { background: rgba(30,93,160,0.12);  }
+[data-theme="dark"] .icon-orange { background: rgba(230,81,0,0.22);   color: #ff9e57; }
+[data-theme="dark"] .icon-blue   { background: rgba(33,150,243,0.22);  color: #5aa9f0; }
+[data-theme="dark"] .icon-purple { background: rgba(156,39,176,0.26);  color: #cf94de; }
+[data-theme="dark"] .icon-green  { background: rgba(76,175,80,0.22);   color: #4ade80; }
+[data-theme="dark"] .icon-amber  { background: rgba(255,152,0,0.22);   color: #ffb74d; }
+
+/* ─── Иконки статуса заказов ──────────────────────────────
+   color → стрелка SVG (currentColor) красится семантикой; переменные
+   --warn-strong/--success/--danger/--info уже имеют dark-варианты. */
+.icon-pending  { background: rgba(249,168,37,0.15); color: var(--warn-strong); }
+.icon-approved { background: rgba(46,125,50,0.12);  color: var(--success); }
+.icon-rejected { background: rgba(160,35,35,0.12);  color: var(--danger); }
+.icon-shipped  { background: rgba(30,93,160,0.12);  color: var(--info); }
 
 /* ─── Цвета значений в стат-картах ──────────────────────── */
 .stat-value-green { color: var(--success); }
@@ -436,7 +548,8 @@ body {
 .nav-item.active .nav-icon,
 .nav-item.active .nav-label { color: var(--accent-fg); }
 
-.nav-icon { font-size: 18px; }
+.nav-icon { display: flex; }
+.nav-icon .ic { --ic-size: 23px; vertical-align: 0; }
 .nav-label { font-size: 10px; font-weight: 500; }
 
 /* ─── Error & status ──────────────────────────────────────────── */
@@ -1132,7 +1245,9 @@ body {
   background: var(--accent, #2481cc);
   color: #fff;
   font-size: 14px; font-weight: 600; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
 }
+.btn-mark-paid .ic { --ic-size: 16px; }
 .btn-mark-paid:disabled { opacity: 0.5; cursor: default; }
 
 /* ─── Сводка «получено / ожидает» ─────────────────────────────── */
@@ -1233,25 +1348,59 @@ body {
 }
 
 /* ─── Подвкладки «Финансы» (Долги / Платежи) ───────────────────── */
-.finance-tabs {
-  display: flex; gap: 8px; padding: 14px 14px 0;
+/* ─── Сегмент-контролы навигации ──────────────────────────────────
+   Уровень 1 (разделы экрана) — pill-сегмент .seg / .seg-item.
+   Уровень 2 (под-действия) — облегчённый underline .subseg / .subseg-item,
+   визуально подчинён уровню 1: убирает «два одинаковых ряда пилюль». */
+.seg-row {
+  display: flex; align-items: center; gap: 8px; padding: 4px 0 0;
+  margin-bottom: 12px;
 }
-.finance-tab {
-  flex: 1; padding: 12px; border: 0; border-radius: 12px;
-  background: var(--bg-card, #f5f5f5);
-  color: var(--text, #000); font-size: 14px; font-weight: 600;
-  cursor: pointer;
+/* iOS-сегмент в стиле уже существующих под-вкладок «Заказы/Каталог» (.sub-tabs):
+   подложка-трек + активный сегмент как «приподнятая» карточка. Единый язык
+   верхнеуровневой навигации на всех экранах. */
+.seg {
+  display: flex; gap: 4px; flex: 1; min-width: 0;
+  background: var(--bg-soft); border-radius: 14px; padding: 4px;
 }
-.finance-tab.active {
-  background: var(--accent, #2481cc);
-  color: #fff;
-}
-/* Вложенный ряд под-вкладок кассы: чуть компактнее и без переноса. */
-.cashbox-tabs { padding-top: 4px; }
-.cashbox-tabs .finance-tab {
-  padding: 10px 6px; font-size: 13px;
+.seg-item {
+  flex: 1; min-width: 0; padding: 12px 8px; min-height: 44px; border: 0;
+  border-radius: 10px; background: transparent; color: var(--text-mute);
+  font-size: 14px; font-weight: 600; font-family: inherit; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  transition: background 0.15s ease, color 0.15s ease;
 }
+.seg-item .ic { --ic-size: 18px; }
+.seg-item.active {
+  background: var(--bg-card); color: var(--text); box-shadow: var(--shadow-card);
+}
+
+/* Доп-ссылка справа от сегмента (напр. «Лимиты» — read-only надстройка для
+   босса): намеренно НЕ pill, чтобы не путалась с разделами уровня 1. */
+.seg-aux {
+  flex-shrink: 0; padding: 11px 10px; border: 0; border-radius: 12px;
+  background: transparent; color: var(--text-mute);
+  font-size: 13px; font-weight: 600; font-family: inherit; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+}
+.seg-aux .ic { --ic-size: 17px; }
+.seg-aux.active { color: var(--accent); }
+
+/* Уровень 2: компактные underline-вкладки. */
+.subseg {
+  display: flex; gap: 4px; padding: 6px 0 0;
+  border-bottom: 0.5px solid var(--divider); margin-bottom: 8px;
+}
+.subseg-item {
+  padding: 8px 10px 10px; border: 0; background: none; cursor: pointer;
+  color: var(--text-mute); font-size: 13px; font-weight: 600; font-family: inherit;
+  display: inline-flex; align-items: center; gap: 5px;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+  white-space: nowrap;
+}
+.subseg-item .ic { --ic-size: 16px; }
+.subseg-item.active { color: var(--accent); border-bottom-color: var(--accent); }
 
 /* ─── Partial-оплата (input + кнопка в ряд) ────────────────────── */
 .pay-input-row {
@@ -1476,8 +1625,11 @@ body {
   pointer-events: none;   /* не перехватывает тапы под собой */
 }
 .toast {
+  display: flex;
+  align-items: center;
+  gap: 9px;
   max-width: 92%;
-  padding: 11px 16px;
+  padding: 11px 12px 11px 16px;
   border-radius: var(--radius);
   background: var(--bg-card);
   color: var(--text);
@@ -1487,10 +1639,52 @@ body {
   border: 1px solid var(--divider);
   border-left-width: 3px;
   animation: toastIn 0.2s ease both;
+  pointer-events: auto;   /* host выключает события — на самом тосте включаем (крестик) */
 }
+.toast-ic { display: flex; flex-shrink: 0; }
+.toast-ic .ic { --ic-size: 18px; }
+.toast-msg { flex: 1; min-width: 0; }
+.toast-close {
+  flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px;
+  margin: -4px -2px -4px 0;
+  background: none; border: none; cursor: pointer;
+  color: var(--text-mute); border-radius: 8px;
+}
+.toast-close .ic { --ic-size: 16px; }
+.toast--success .toast-ic { color: var(--success); }
+.toast--error   .toast-ic { color: var(--danger); }
+.toast--info    .toast-ic { color: var(--info); }
 .toast--success { border-left-color: var(--success); }
 .toast--error   { border-left-color: var(--danger); }
 .toast--info    { border-left-color: var(--info); }
 .toast--out     { animation: toastOut 0.25s ease forwards; }
 @keyframes toastIn  { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes toastOut { to { opacity: 0; transform: translateY(12px); } }
+
+/* ─── Адаптив: широкий экран (планшет/десктоп-браузер) ─────────────
+   Приложение рассчитано на узкий телефонный столбец. Вне Telegram (web)
+   на широком вьюпорте всё растягивалось во всю ширину — hero и action-grid
+   разъезжались. Ограничиваем контент центрированной колонкой; фиксированные
+   слои (нижнее меню, тосты) выравниваем по той же оси. На телефоне (и в
+   Telegram, где webview узкий) правило не активируется. */
+@media (min-width: 600px) {
+  .app {
+    max-width: 600px;
+    margin-inline: auto;
+    box-shadow: 0 0 0 1px var(--divider);
+  }
+  .bottom-nav {
+    left: 50%;
+    right: auto;
+    transform: translateX(-50%);
+    width: 576px;   /* 600 − 2×12 боковых отступа */
+  }
+  .toast-host {
+    left: 50%;
+    right: auto;
+    transform: translateX(-50%);
+    width: 600px;
+  }
+}

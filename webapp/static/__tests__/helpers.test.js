@@ -4,7 +4,7 @@ import { describe, it, expect } from 'vitest';
 
 import helpers from '../helpers.js';
 
-const { escapeHtml, idemKey, formatDateRU } = helpers;
+const { escapeHtml, idemKey, formatDateRU, icon } = helpers;
 
 describe('escapeHtml', () => {
   it('экранирует все спец-символы HTML', () => {
@@ -38,6 +38,27 @@ describe('formatDateRU', () => {
     expect(formatDateRU('')).toBe('—');
     expect(formatDateRU(null)).toBe('—');
     expect(formatDateRU('2026')).toBe('2026');
+  });
+});
+
+describe('icon', () => {
+  it('валидное имя → <use href="#ic-name">', () => {
+    expect(icon('home')).toBe('<svg class="ic" aria-hidden="true"><use href="#ic-home"/></svg>');
+  });
+
+  it('добавляет доп. класс', () => {
+    expect(icon('cart', 'nav-ic')).toContain('class="ic nav-ic"');
+    expect(icon('cart', 'nav-ic')).toContain('#ic-cart');
+  });
+
+  it('санитизирует имя (защита от инъекции)', () => {
+    // кавычки/скобки/угловые вырезаются → разметку сломать нельзя
+    expect(icon('a"><script>')).toBe('<svg class="ic" aria-hidden="true"><use href="#ic-ascript"/></svg>');
+  });
+
+  it('пустое/невалидное имя не падает', () => {
+    expect(icon()).toContain('#ic-');
+    expect(icon(null)).toContain('#ic-');
   });
 });
 

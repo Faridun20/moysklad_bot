@@ -34,5 +34,14 @@
     return `${d}.${m}.${y}`;
   }
 
-  return { escapeHtml, idemKey, formatDateRU };
+  // SVG-иконка из спрайта (см. <defs> в index.html). Возвращает <svg><use>,
+  // который красится currentColor → тематизируется под тему/активный таб.
+  // Имя санитизируется (только [a-z0-9-]), чтобы name не мог сломать разметку.
+  function icon(name, cls) {
+    const safe = String(name || '').replace(/[^a-z0-9-]/g, '');
+    const extra = cls ? ' ' + String(cls).replace(/[^a-z0-9 _-]/g, '') : '';
+    return `<svg class="ic${extra}" aria-hidden="true"><use href="#ic-${safe}"/></svg>`;
+  }
+
+  return { escapeHtml, idemKey, formatDateRU, icon };
 });
