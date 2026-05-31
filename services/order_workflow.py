@@ -151,6 +151,31 @@ def compute_resubmit_summary(
     }
 
 
+async def order_credit_context(order: dict, total: float) -> dict | None:
+    """Кредит-контекст клиента для заказа (для показа боссу при одобрении).
+    None для paid-заказов / без agent_id.
+
+    ВАЖНО про double-count: get_agent_current_debt суммирует заказы в статусах
+    pending/approved/shipped/partially_returned. Если ЭТОТ заказ уже в таком
+    статусе — он УЖЕ в current_debt, поэтому «долг с учётом заявки» = current_debt
+    (не current_debt + total, иначе заказ посчитается дважды). Для draft (не
+    считается в долге) — current_debt + total. Возвращает
+    {current_debt, limit, effective_debt, over_limit}."""
+    from services import async_db as adb
+
+    if (order.get("payment_type") or "paid") != "credit" or not order.get("agent_id"):
+        return None
+    chk = await adb.check_credit_limit(order["agent_id"], total)
+    counted = order.get("status") in {"pending", "approved", "shipped", "partially_returned"}
+    effective = float(chk["current_debt"]) if counted else float(chk["current_debt"]) + float(total)
+    return {
+        "current_debt": float(chk["current_debt"]),
+        "limit": float(chk["limit"]),
+        "effective_debt": effective,
+        "over_limit": effective > float(chk["limit"]),
+    }
+
+
 async def resubmit_diff_line(order_id: int, items: list[dict]) -> str:
     """Строка-сводка изменений с момента прошлого reject→draft (#30). Возвращает
     '' если заказ не реджектился ранее. Показывается боссу в уведомлении о

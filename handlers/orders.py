@@ -266,24 +266,26 @@ def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
 
 
 async def build_credit_context(order: dict, items: list[dict]) -> str:
-    """Кредит-контекст клиента прямо в заявке боссу (долг/лимит/после заказа) —
-    чтобы решать одобрение НЕ выходя в /limit. '' для paid-заказов / без agent_id."""
-    if (order.get("payment_type") or "paid") != "credit" or not order.get("agent_id"):
-        return ""
+    """Кредит-контекст клиента прямо в заявке боссу (долг с учётом заявки / лимит)
+    — чтобы решать одобрение НЕ выходя в /limit. '' для paid-заказов / без agent_id.
+    Использует order_credit_context (без double-count, см. там)."""
+    from services.order_workflow import order_credit_context
+
     total = sum(_line_total(it) for it in items)
     try:
-        chk = await adb.check_credit_limit(order["agent_id"], total)
+        ctx = await order_credit_context(order, total)
     except Exception:
         return ""
+    if not ctx:
+        return ""
     flag = (
-        "🔴 <b>ПРЕВЫШЕНИЕ ЛИМИТА</b>"
-        if chk.get("over_limit")
-        else "🟢 в пределах лимита"
+        "🔴 <b>ПРЕВЫШЕНИЕ ЛИМИТА</b>" if ctx["over_limit"] else "🟢 в пределах лимита"
     )
     return (
         f"\n\n📊 <b>Кредит клиента</b> ({_BASE_CURRENCY}):"
-        f"\n   долг {_fmt_num(chk['current_debt'])} / лимит {_fmt_num(chk['limit'])}"
-        f"\n   после заказа: <b>{_fmt_num(chk['projected'])}</b>  {flag}"
+        f"\n   долг с учётом заявки: <b>{_fmt_num(ctx['effective_debt'])}</b>"
+        f" / лимит {_fmt_num(ctx['limit'])}"
+        f"\n   {flag}"
     )
 
 

@@ -816,6 +816,14 @@ body {
 .order-pay--wait   { background: rgba(0,122,255,.14);  color: #0a6cd8; }
 .order-pay--bad    { background: rgba(255,59,48,.14);  color: #c0271d; }
 
+/* Кредит-контекст клиента в заявке (босс решает об апруве не уходя в Лимиты). */
+.credit-ctx {
+  margin: 4px 0 6px; padding: 8px 10px;
+  border-radius: 10px; font-size: 12px; line-height: 1.4;
+}
+.credit-ctx--ok  { background: rgba(52,199,89,.12);  color: var(--text); }
+.credit-ctx--bad { background: rgba(255,59,48,.12);  color: var(--text); }
+
 .order-item, .order-item-preview {
   font-size: 12px;
   color: var(--text-mute);
