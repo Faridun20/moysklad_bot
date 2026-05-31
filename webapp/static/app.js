@@ -83,7 +83,7 @@ async function init() {
       const isEmpty = !_initData;
       document.getElementById('content').innerHTML = `
         <div class="error-card">
-          <div class="error-icon">🔐</div>
+          <div class="error-icon">${icon('lock')}</div>
           <div class="error-title">Нет доступа</div>
           <div class="error-body">${isEmpty
             ? 'Откройте приложение через кнопку <b>«Открыть»</b> в боте — не через браузер.'
@@ -104,7 +104,7 @@ async function init() {
   } catch (e) {
     document.getElementById('content').innerHTML = `
       <div class="error-card">
-        <div class="error-icon">⚠️</div>
+        <div class="error-icon">${icon('alert')}</div>
         <div class="error-title">Нет связи</div>
         <div class="error-body">${escapeHtml(e.message)}</div>
         <button class="btn-primary" onclick="location.reload()">Повторить</button>
@@ -112,12 +112,24 @@ async function init() {
   }
 }
 
+// Приветствие в шапке (показывается на «Главной»). Сохраняем, чтобы при
+// возврате на home восстановить после контекст-подписи раздела.
+let _greetingText = 'Добро пожаловать!';
+
 function renderHeader() {
   const greeting = document.getElementById('greeting');
   const badge = document.getElementById('role-badge');
   const name = currentUser.first_name || '';
-  greeting.textContent = name ? `Привет, ${name}!` : 'Добро пожаловать!';
+  _greetingText = name ? `Привет, ${name}!` : 'Добро пожаловать!';
+  greeting.textContent = _greetingText;
   badge.textContent = ROLE_NAMES[currentUser.role] || currentUser.role;
+}
+
+// Контекст-подпись в шапке: на «Главной» — приветствие, на остальных экранах
+// текущий раздел (и под-раздел), чтобы было видно, где находишься.
+function setScreenContext(text) {
+  const greeting = document.getElementById('greeting');
+  if (greeting) greeting.textContent = text || _greetingText;
 }
 
 function showError(msg) {
@@ -130,7 +142,7 @@ function showError(msg) {
 function errorBox(msg) {
   return `
     <div class="error-card">
-      <div class="error-icon">⚠️</div>
+      <div class="error-icon">${icon('alert')}</div>
       <div class="error-title">Не удалось загрузить</div>
       <div class="error-body">${escapeHtml(msg)}</div>
       <button class="btn-primary" onclick="showScreen(currentScreen)">Повторить</button>
@@ -151,6 +163,13 @@ async function showScreen(screen) {
     // Переинициализируем обработчик на случай если DOM обновился
     btn.onclick = () => showScreen(btn.dataset.screen);
   });
+
+  // Подпись раздела в шапке. «Финансы» уточняет под-раздел внутри renderFinance.
+  const SCREEN_TITLES = {
+    home: null, orders: 'Заказы и склад', stock: 'Заказы и склад',
+    finance: 'Финансы', debts: 'Финансы', payments: 'Финансы', analytics: 'Аналитика',
+  };
+  setScreenContext(SCREEN_TITLES[screen]);
 
   const content = document.getElementById('content');
 
@@ -223,9 +242,9 @@ async function renderOrdersScreen() {
   const tabsHtml = `
     <div class="sub-tabs">
       <button class="sub-tab ${ordersSubTab === 'orders' ? 'active' : ''}"
-              data-sub="orders">📋 Заказы</button>
+              data-sub="orders">${icon('list')} Заказы</button>
       <button class="sub-tab ${ordersSubTab === 'stock' ? 'active' : ''}"
-              data-sub="stock">📦 Каталог</button>
+              data-sub="stock">${icon('box')} Каталог</button>
     </div>
   `;
   content.insertAdjacentHTML('afterbegin', tabsHtml);
@@ -287,31 +306,31 @@ async function renderHome() {
   const actions = isBoss ? `
     <div class="action-grid">
       <button class="action-btn" data-go="stock">
-        <span class="action-btn-icon icon-orange">📦</span>Каталог
+        <span class="action-btn-icon icon-orange">${icon('box')}</span>Каталог
       </button>
       <button class="action-btn" data-go="requests">
-        <span class="action-btn-icon icon-amber">⏳</span>Заявки
+        <span class="action-btn-icon icon-amber">${icon('clock')}</span>Заявки
       </button>
       <button class="action-btn" data-go="analytics">
-        <span class="action-btn-icon icon-purple">📊</span>Аналитика
+        <span class="action-btn-icon icon-purple">${icon('chart')}</span>Аналитика
       </button>
       <button class="action-btn" data-go="payments">
-        <span class="action-btn-icon icon-green">💵</span>Платежи
+        <span class="action-btn-icon icon-green">${icon('cash')}</span>Платежи
       </button>
     </div>
   ` : `
     <div class="action-grid">
       <button class="action-btn" data-go="stock">
-        <span class="action-btn-icon icon-orange">📦</span>Каталог
+        <span class="action-btn-icon icon-orange">${icon('box')}</span>Каталог
       </button>
       <button class="action-btn" data-go="orders" data-new="1">
-        <span class="action-btn-icon icon-blue">➕</span>Заказ
+        <span class="action-btn-icon icon-blue">${icon('plus')}</span>Заказ
       </button>
       <button class="action-btn" data-go="analytics">
-        <span class="action-btn-icon icon-purple">📊</span>Аналитика
+        <span class="action-btn-icon icon-purple">${icon('chart')}</span>Аналитика
       </button>
       <button class="action-btn" data-go="payments">
-        <span class="action-btn-icon icon-green">💵</span>Платёж
+        <span class="action-btn-icon icon-green">${icon('cash')}</span>Платёж
       </button>
     </div>
   `;
@@ -319,7 +338,7 @@ async function renderHome() {
   // ─── Предупреждение если не привязан к МойСклад ─────
   const linkWarning = (!data.ms_linked && data.role === 'manager') ? `
     <div class="warn-card">
-      ⚠️ <b>Аккаунт не привязан к МойСклад.</b><br>
+      ${icon('alert', 'warn-ic')} <b>Аккаунт не привязан к МойСклад.</b><br>
       <span style="font-size:12px;">Откройте чат с ботом и нажмите /start. Без привязки персональная аналитика недоступна.</span>
     </div>
   ` : '';
@@ -331,7 +350,7 @@ async function renderHome() {
       bossBlock += `
         <div class="card" style="cursor:pointer;" id="go-requests">
           <div style="display:flex; align-items:center; gap:12px;">
-            <div class="card-row-icon" style="background:var(--warn-bg); color:var(--warn);">⏳</div>
+            <div class="card-row-icon" style="background:var(--warn-bg); color:var(--warn);">${icon('clock')}</div>
             <div style="flex:1;">
               <div style="font-weight:600;">${data.pending_requests} заявок на апрув</div>
               <div style="font-size:12px; color: var(--text-mute); margin-top:2px;">Нажмите чтобы открыть</div>
@@ -370,15 +389,15 @@ async function renderHome() {
       <div class="stat-grid stat-grid--three">
         <div class="stat">
           <div class="stat-value">${mo.draft}</div>
-          <div class="stat-label">📝 Черновики</div>
+          <div class="stat-label">${icon('edit')} Черновики</div>
         </div>
         <div class="stat">
           <div class="stat-value ${mo.pending > 0 ? 'stat-value-amber' : ''}">${mo.pending}</div>
-          <div class="stat-label">⏳ Ожидают</div>
+          <div class="stat-label">${icon('clock')} Ожидают</div>
         </div>
         <div class="stat">
           <div class="stat-value ${mo.approved > 0 ? 'stat-value-green' : ''}">${mo.approved}</div>
-          <div class="stat-label">✅ Одобрено</div>
+          <div class="stat-label">${icon('check')} Одобрено</div>
         </div>
       </div>
     `;
@@ -386,7 +405,7 @@ async function renderHome() {
       <div class="card-list">
         ${mo.recent.map(o => `
           <div class="card-row" data-order-id="${o.id}">
-            <div class="card-row-icon icon-${o.status}">${STATUS_EMOJI[o.status] || '📋'}</div>
+            <div class="card-row-icon icon-${o.status}">${icon(STATUS_ICON[o.status] || 'list')}</div>
             <div class="card-row-info">
               <div class="card-row-title">Заказ #${o.id}${o.agent_name ? ' · ' + escapeHtml(o.agent_name) : ''}</div>
               <div class="card-row-sub">${o.created_at}</div>
@@ -507,7 +526,7 @@ function renderStockList() {
 
   listEl.innerHTML = filtered.length === 0
     ? `<div class="empty-state">
-        <div class="empty-state-icon">📦</div>
+        <div class="empty-state-icon">${icon('box')}</div>
         <div class="empty-state-title">Товары не найдены</div>
         <div class="empty-state-hint">Попробуйте изменить категорию или поисковый запрос</div>
       </div>`
@@ -520,7 +539,7 @@ function renderStockList() {
           ? `<div class="stock-price">${escapeHtml(priceLines.join(' · '))}</div>` : '';
         // Boss может тапнуть товар → редактор цен.
         const editAttr = isBoss ? ` data-price-idx="${i}"` : '';
-        const editHint = isBoss ? '<span class="stock-edit-hint">✏️</span>' : '';
+        const editHint = isBoss ? `<span class="stock-edit-hint">${icon('edit')}</span>` : '';
         return `
         <div class="stock-row"${editAttr}>
           <div class="stock-info">
@@ -626,14 +645,14 @@ function renderStockContent() {
     ).join('');
 
   content.innerHTML = `
-    <div class="section-label">Категории</div>
-    <div class="cat-row">${catBtns}</div>
-    <div class="form-row" style="margin: 8px 0;">
+    <div class="form-row" style="margin: 4px 0 8px;">
       <input id="stock-search" class="form-input" placeholder="🔎 Поиск товара…" value="${escapeHtml(stockSearch)}">
     </div>
+    <div class="section-label">Категории</div>
+    <div class="cat-row">${catBtns}</div>
     <div class="cat-row">
       <button class="cat-btn ${!stockInStockOnly ? 'active' : ''}" data-instock="0">Все</button>
-      <button class="cat-btn ${stockInStockOnly ? 'active' : ''}" data-instock="1">📦 В наличии</button>
+      <button class="cat-btn ${stockInStockOnly ? 'active' : ''}" data-instock="1">${icon('box')} В наличии</button>
     </div>
     <div class="section-label">Товары</div>
     <div class="stock-list" id="stock-list"></div>
@@ -689,7 +708,7 @@ function haptic(type = 'light') {
 // Лёгкая неблокирующая обратная связь для «тихих» действий (добавил
 // товар, сохранил цену, отметил оплату). В отличие от tg.showAlert не
 // прерывает поток модалкой. Хост вне #content — переживает ре-рендеры.
-function toast(msg, type = 'success') {
+function toast(msg, type = 'success', opts = {}) {
   let host = document.getElementById('toast-host');
   if (!host) {
     host = document.createElement('div');
@@ -699,13 +718,25 @@ function toast(msg, type = 'success') {
   }
   const el = document.createElement('div');
   el.className = `toast toast--${type}`;
-  const icon = type === 'error' ? '⚠️' : type === 'info' ? 'ℹ️' : '✅';
-  el.textContent = `${icon} ${msg}`;
+  // Иконка из спрайта (вместо эмодзи ⚠️/ℹ️/✅): тинтуется под тему, единый рендер.
+  const glyph = type === 'error' ? 'alert' : type === 'info' ? 'info' : 'check';
+  // Денежные/важные подтверждения держим дольше; ошибку — ещё дольше. Плюс
+  // ручной крестик, чтобы можно было перечитать (раньше гасло за 2.4с молча).
+  const duration = opts.duration || (type === 'error' ? 4500 : 3200);
+  el.innerHTML =
+    `<span class="toast-ic">${icon(glyph)}</span>` +
+    `<span class="toast-msg">${escapeHtml(msg)}</span>` +
+    `<button class="toast-close" aria-label="Закрыть">${icon('close')}</button>`;
   host.appendChild(el);
-  setTimeout(() => {
+  let timer;
+  const dismiss = () => {
+    if (el.classList.contains('toast--out')) return;
+    clearTimeout(timer);
     el.classList.add('toast--out');
     setTimeout(() => el.remove(), 250);
-  }, 2400);
+  };
+  el.querySelector('.toast-close').addEventListener('click', dismiss);
+  timer = setTimeout(dismiss, duration);
 }
 
 // ─── Нативная кнопка «Назад» Telegram ───────────────
@@ -748,12 +779,14 @@ let ordersData = null;
 let currentOrderFilter = 'all';
 let currentDraftOrder = null; // активный черновик
 
-const STATUS_EMOJI = {
-  draft:    '📝',
-  pending:  '⏳',
-  approved: '✅',
-  rejected: '❌',
-  shipped:  '🚚',
+// Имена иконок спрайта по статусу заказа (вместо прежних эмодзи: рендерятся
+// одинаково на всех клиентах и тинтуются под тему). Цвет задаёт .icon-<status>.
+const STATUS_ICON = {
+  draft:    'edit',
+  pending:  'clock',
+  approved: 'check',
+  rejected: 'close',
+  shipped:  'truck',
 };
 
 const STATUS_NAME = {
@@ -824,7 +857,7 @@ async function runSearch(query) {
 
   const parts = [];
   if (data.orders && data.orders.length) {
-    parts.push('<div class="search-group-title">📦 Заказы</div>');
+    parts.push(`<div class="search-group-title">${icon('box')} Заказы</div>`);
     parts.push(data.orders.map(o => `
       <div class="search-item" onclick="showScreen('orders')">
         <b>#${o.id}</b> · ${escapeHtml(o.agent_name)} · ${escapeHtml(o.status || '')}
@@ -832,7 +865,7 @@ async function runSearch(query) {
       </div>`).join(''));
   }
   if (data.payments && data.payments.length) {
-    parts.push('<div class="search-group-title">💵 Платежи</div>');
+    parts.push(`<div class="search-group-title">${icon('cash')} Платежи</div>`);
     parts.push(data.payments.map(p => `
       <div class="search-item" onclick="showScreen('finance')">
         <b>#${p.id}</b> · ${p.amount} ${escapeHtml(p.currency)} · ${escapeHtml(p.status || '')}
@@ -840,7 +873,7 @@ async function runSearch(query) {
       </div>`).join(''));
   }
   if (data.agents && data.agents.length) {
-    parts.push('<div class="search-group-title">👤 Клиенты</div>');
+    parts.push(`<div class="search-group-title">${icon('user')} Клиенты</div>`);
     parts.push(data.agents.map(a => `
       <div class="search-item">${escapeHtml(a.name || '—')}${a.phone ? ' · ' + escapeHtml(a.phone) : ''}</div>`).join(''));
   }
@@ -871,15 +904,15 @@ function renderOrdersMain() {
   const canShip = isBoss || role === 'warehouse_keeper';
 
   const filters = [
-    { id: 'all', label: 'Все' },
-    { id: 'draft', label: '📝' },
-    { id: 'pending', label: '⏳' },
-    { id: 'approved', label: '✅' },
-    { id: 'rejected', label: '❌' },
+    { id: 'all', label: 'Все', name: 'Все' },
+    { id: 'draft', label: icon('edit'), name: STATUS_NAME.draft },
+    { id: 'pending', label: icon('clock'), name: STATUS_NAME.pending },
+    { id: 'approved', label: icon('check'), name: STATUS_NAME.approved },
+    { id: 'rejected', label: icon('close'), name: STATUS_NAME.rejected },
   ];
 
   const filterBtns = filters.map(f =>
-    `<button class="cat-btn ${currentOrderFilter === f.id ? 'active' : ''}" data-filter="${f.id}">${f.label}</button>`
+    `<button class="cat-btn ${currentOrderFilter === f.id ? 'active' : ''}" data-filter="${f.id}" aria-label="${escapeHtml(f.name)}" title="${escapeHtml(f.name)}">${f.label}</button>`
   ).join('');
 
   const filtered = currentOrderFilter === 'all'
@@ -888,7 +921,7 @@ function renderOrdersMain() {
 
   const list = filtered.length === 0
     ? `<div class="empty-state">
-        <div class="empty-state-icon">📋</div>
+        <div class="empty-state-icon">${icon('list')}</div>
         <div class="empty-state-title">Нет заказов</div>
         <div class="empty-state-hint">${currentOrderFilter !== 'all'
           ? 'Нет заказов с этим статусом'
@@ -899,14 +932,14 @@ function renderOrdersMain() {
       <div class="order-card order-card--${o.status}" data-id="${o.id}">
         <div class="order-header">
           <div>
-            <div class="order-title">${STATUS_EMOJI[o.status] || '📋'} Заказ #${o.id}</div>
+            <div class="order-title">${icon(STATUS_ICON[o.status] || 'list')} Заказ #${o.id}</div>
             ${isBoss ? `<div class="order-manager">👤 ${o.full_name}</div>` : ''}
           </div>
           <span class="order-status status-${o.status}">${STATUS_NAME[o.status]}</span>
         </div>
         ${o.agent_name ? `<div class="order-agent">🏢 ${o.agent_name}</div>` : ''}
         <div class="order-meta">
-          <span>📦 ${o.items_count} тов.</span>
+          <span>${icon('box')} ${o.items_count} тов.</span>
           <span>${o.created_at}</span>
           ${o.total > 0 ? `<span class="order-total">💰 ${Math.round(o.total).toLocaleString('ru-RU')}</span>` : ''}
         </div>
@@ -920,11 +953,11 @@ function renderOrdersMain() {
           } else {
             bits.push(`<span class="order-pay">💵 Оплата сразу</span>`);
           }
-          if (o.paid_confirmed_at) bits.push(`<span class="order-pay order-pay--ok">✅ Оплачен</span>`);
-          else if (o.paid_at) bits.push(`<span class="order-pay order-pay--wait">⏳ На подтверждении</span>`);
+          if (o.paid_confirmed_at) bits.push(`<span class="order-pay order-pay--ok">${icon('check')} Оплачен</span>`);
+          else if (o.paid_at) bits.push(`<span class="order-pay order-pay--wait">${icon('clock')} На подтверждении</span>`);
           if (o.frozen) bits.push(`<span class="order-pay order-pay--bad">🧊 Заморожен</span>`);
           if (o.status === 'draft' && o.rejection_comment)
-            bits.push(`<span class="order-pay order-pay--bad">↩️ ${escapeHtml(o.rejection_comment)}</span>`);
+            bits.push(`<span class="order-pay order-pay--bad">${icon('return')} ${escapeHtml(o.rejection_comment)}</span>`);
           return bits.length ? `<div class="order-pay-row">${bits.join('')}</div>` : '';
         })()}
         ${o.items.slice(0, 2).map(it => {
@@ -936,18 +969,18 @@ function renderOrdersMain() {
         }).join('')}
         ${o.status === 'draft' && !isBoss ? `
           <div class="draft-actions">
-            <button class="btn-edit-order" data-id="${o.id}">✏️ Редактировать</button>
-            <button class="btn-delete-draft" data-id="${o.id}">🗑️ Удалить</button>
+            <button class="btn-edit-order" data-id="${o.id}">${icon('edit')} Редактировать</button>
+            <button class="btn-delete-draft" data-id="${o.id}">${icon('trash')} Удалить</button>
           </div>
         ` : ''}
         ${o.status === 'approved' && canShip ? `
           <div class="draft-actions">
-            <button class="btn-confirm-pay btn-ship-order" data-id="${o.id}">🚚 Отгрузить</button>
+            <button class="btn-confirm-pay btn-ship-order" data-id="${o.id}">${icon('truck')} Отгрузить</button>
           </div>
         ` : ''}
         ${o.status === 'approved' && isBoss ? `
           <div class="draft-actions">
-            <button class="btn-reject-pay btn-cancel-order" data-id="${o.id}">🚫 Отменить заказ</button>
+            <button class="btn-reject-pay btn-cancel-order" data-id="${o.id}">${icon('close')} Отменить заказ</button>
           </div>
           <div class="limit-edit cancel-box" data-id="${o.id}" hidden>
             <input type="text" class="form-input cancel-reason" placeholder="Причина отмены">
@@ -963,7 +996,7 @@ function renderOrdersMain() {
       ${!isBoss ? `<button class="btn-new-order" id="btn-new-order">+ Новый заказ</button>` : ''}
     </div>
 
-    ${isBoss ? `<button class="requests-btn" id="show-requests">⏳ Заявки на рассмотрении</button>` : ''}
+    ${isBoss ? `<button class="requests-btn" id="show-requests">${icon('clock')} Заявки на рассмотрении</button>` : ''}
 
     <div class="orders-list">${list}</div>
   `;
@@ -1589,7 +1622,7 @@ async function renderPendingRequests() {
           <div class="editor-title">Заявки</div>
         </div>
         <div class="empty-state">
-          <div class="empty-state-icon">✅</div>
+          <div class="empty-state-icon">${icon('check')}</div>
           <div class="empty-state-title">Нет заявок на рассмотрении</div>
           <div class="empty-state-hint">Новые заявки появятся здесь автоматически</div>
         </div>
@@ -1600,7 +1633,7 @@ async function renderPendingRequests() {
       <div class="order-card">
         <div class="order-header">
           <div>
-            <div class="order-title">⏳ Заявка #${r.id}</div>
+            <div class="order-title">${icon('clock')} Заявка #${r.id}</div>
             <div class="order-manager">👤 ${r.full_name}</div>
           </div>
           <span class="order-status status-pending">Ожидает</span>
@@ -1630,8 +1663,8 @@ async function renderPendingRequests() {
           ).join('')}
         </div>
         <div class="req-actions">
-          <button class="btn-approve" data-req="${r.id}">✅ Одобрить</button>
-          <button class="btn-reject"  data-req="${r.id}">❌ Отклонить</button>
+          <button class="btn-approve" data-req="${r.id}">${icon('check')} Одобрить</button>
+          <button class="btn-reject"  data-req="${r.id}">${icon('close')} Отклонить</button>
         </div>
       </div>
     `).join('');
@@ -1908,7 +1941,7 @@ function renderPaymentsContent(container) {
 
   // Блок «На подтверждение» — paid-заказы с pending-оплатой (только босс).
   const pendingHtml = paymentsPending.length === 0 ? '' : `
-    <div class="section-label section-awaiting">⏳ На подтверждение (${paymentsPending.length})</div>
+    <div class="section-label section-awaiting">${icon('clock')} На подтверждение (${paymentsPending.length})</div>
     <div class="debts-list">${paymentsPending.map(d => `
       <div class="debt-card debt-awaiting">
         <div class="debt-card-top">
@@ -1918,10 +1951,10 @@ function renderPaymentsContent(container) {
         <div class="debt-card-mid">
           <span class="debt-meta">#${d.order_id} · из ${fmt(d.total)} ${escapeHtml(d.currency)} · ${d.items_count} поз. · ${escapeHtml(d.full_name)}</span>
         </div>
-        ${(d.items || []).length ? `<div class="debt-items-preview">📦 ${d.items.slice(0, 2).map(it => escapeHtml(it.name) + ' ×' + it.quantity).join(', ')}${d.items_count > 2 ? ' +' + (d.items_count - 2) : ''}</div>` : ''}
+        ${(d.items || []).length ? `<div class="debt-items-preview">${icon('box')} ${d.items.slice(0, 2).map(it => escapeHtml(it.name) + ' ×' + it.quantity).join(', ')}${d.items_count > 2 ? ' +' + (d.items_count - 2) : ''}</div>` : ''}
         <div class="debt-actions">
-          <button class="btn-confirm-pay" data-id="${d.order_id}">✅ Подтвердить</button>
-          <button class="btn-reject-pay"  data-id="${d.order_id}">❌ Отклонить</button>
+          <button class="btn-confirm-pay" data-id="${d.order_id}">${icon('check')} Подтвердить</button>
+          <button class="btn-reject-pay"  data-id="${d.order_id}">${icon('close')} Отклонить</button>
         </div>
       </div>
     `).join('')}</div>
@@ -2096,29 +2129,42 @@ async function renderFinance() {
   const content = document.getElementById('content');
   const role = currentUser && currentUser.role;
   const isBoss = role === 'admin' || role === 'boss';
-  // Вкладка «Лимиты» — только начальству (эндпоинт всё равно отдаст 403 другим).
-  const limitsTab = isBoss
-    ? `<button class="finance-tab ${financeTab === 'limits' ? 'active' : ''}" data-tab="limits">📊 Лимиты</button>`
-    : '';
-  // Вкладка «Касса» — подтверждающие (сдачи/возвраты) и менеджеры (сдают наличные).
+  // «Касса» — подтверждающие (сдачи/возвраты) и менеджеры (сдают наличные).
   const canCashbox = isBoss || role === 'bookkeeper' || role === 'warehouse_keeper' || role === 'manager';
-  const cashboxTab = canCashbox
-    ? `<button class="finance-tab ${financeTab === 'cashbox' ? 'active' : ''}" data-tab="cashbox">🧾 Касса</button>`
-    : '';
+
+  // Гард: недоступные разделы откатываем на «Долги» (эндпоинты всё равно 403).
   if (financeTab === 'limits' && !isBoss) financeTab = 'debts';
   if (financeTab === 'cashbox' && !canCashbox) financeTab = 'debts';
+
+  // Уточняем под-раздел в шапке: «Финансы · Касса» и т.п.
+  const FIN_LABELS = { debts: 'Долги', payments: 'Платежи', cashbox: 'Касса', limits: 'Лимиты' };
+  setScreenContext(`Финансы · ${FIN_LABELS[financeTab] || ''}`);
+
+  const active = t => (financeTab === t ? 'active' : '');
+  const cashboxItem = canCashbox
+    ? `<button class="seg-item ${active('cashbox')}" data-tab="cashbox">${icon('cashbox')} Касса</button>`
+    : '';
+  // «Лимиты» — read-only аналитика для босса. Вынесена из ряда разделов в
+  // доп-ссылку справа, чтобы уровень 1 был ровно из 2–3 разделов и не переносился.
+  const limitsAux = isBoss
+    ? `<button class="seg-aux ${active('limits')}" data-tab="limits">${icon('gauge')} Лимиты</button>`
+    : '';
+
   content.innerHTML = `
-    <div class="finance-tabs">
-      <button class="finance-tab ${financeTab === 'debts' ? 'active' : ''}" data-tab="debts">💳 Долги</button>
-      <button class="finance-tab ${financeTab === 'payments' ? 'active' : ''}" data-tab="payments">💵 Платежи</button>
-      ${cashboxTab}
-      ${limitsTab}
+    <div class="seg-row">
+      <div class="seg">
+        <button class="seg-item ${active('debts')}" data-tab="debts">${icon('wallet')} Долги</button>
+        <button class="seg-item ${active('payments')}" data-tab="payments">${icon('cash')} Платежи</button>
+        ${cashboxItem}
+      </div>
+      ${limitsAux}
     </div>
     <div id="finance-body"></div>
   `;
-  // Переключение подвкладок без перезагрузки header
-  document.querySelectorAll('.finance-tab').forEach(t => {
+  // Переключение разделов без перезагрузки header
+  content.querySelectorAll('[data-tab]').forEach(t => {
     t.addEventListener('click', () => {
+      haptic('light');
       financeTab = t.dataset.tab;
       renderFinance();
     });
@@ -2160,8 +2206,8 @@ async function renderCashbox(container) {
         </div>
         <div class="debt-card-mid"><span class="debt-meta">Заказы: ${escapeHtml(orders)}</span></div>
         <div class="debt-actions">
-          <button class="btn-confirm-pay dep-confirm">✅ Подтвердить</button>
-          <button class="btn-reject-pay dep-reject">❌ Отклонить</button>
+          <button class="btn-confirm-pay dep-confirm">${icon('check')} Подтвердить</button>
+          <button class="btn-reject-pay dep-reject">${icon('close')} Отклонить</button>
         </div>
         <div class="limit-edit dep-reject-box" hidden>
           <input type="text" class="form-input dep-reason" placeholder="Причина отклонения">
@@ -2174,14 +2220,14 @@ async function renderCashbox(container) {
   const retCards = returns.map(r => `
       <div class="debt-card" data-ret="${r.id}">
         <div class="debt-card-top">
-          <div class="debt-agent">↩️ Возврат #${r.id}</div>
+          <div class="debt-agent">${icon('return')} Возврат #${r.id}</div>
           <div class="debt-amount">${fmt(r.total_amount)} USD</div>
         </div>
         <div class="debt-card-mid">
           <span class="debt-meta">Заказ #${r.order_id} · ${escapeHtml(r.reason || '')}</span>
         </div>
         <div class="debt-actions">
-          <button class="btn-confirm-pay ret-confirm">✅ Подтвердить возврат</button>
+          <button class="btn-confirm-pay ret-confirm">${icon('check')} Подтвердить возврат</button>
         </div>
       </div>
   `).join('');
@@ -2190,7 +2236,7 @@ async function renderCashbox(container) {
     ? `<div class="section-label">💵 Сдачи на подтверждении (${deposits.length})</div><div class="debts-list">${depCards}</div>`
     : '';
   const retBlock = returns.length
-    ? `<div class="section-label">↩️ Возвраты на подтверждении (${returns.length})</div><div class="debts-list">${retCards}</div>`
+    ? `<div class="section-label">${icon('return')} Возвраты на подтверждении (${returns.length})</div><div class="debts-list">${retCards}</div>`
     : '';
 
   // Блок менеджера: сдать наличные + свои сдачи (если роль может сдавать).
@@ -2204,7 +2250,7 @@ async function renderCashbox(container) {
           <label class="form-label">Сумма (USD)</label>
           <input type="number" id="dep-amount" class="form-input" placeholder="500" inputmode="decimal">
         </div>
-        <button id="dep-create" class="btn-primary">💵 Сдать в кассу</button>
+        <button id="dep-create" class="btn-primary">${icon('cash')} Сдать в кассу</button>
         <div class="debt-hint">Распределится по вашим открытым заказам автоматически.</div>
       </div>
     `;
@@ -2244,7 +2290,7 @@ async function renderCashbox(container) {
             <button class="cur-btn" data-refund="no_refund">🚫 Без возврата</button>
           </div>
         </div>
-        <button id="ret-create" class="btn-primary">↩️ Оформить полный возврат</button>
+        <button id="ret-create" class="btn-primary">${icon('return')} Оформить полный возврат</button>
       </div>
   ` : '';
 
@@ -2258,18 +2304,20 @@ async function renderCashbox(container) {
   const tabs = [];
   if (isConfirmer) {
     const pendN = deposits.length + returns.length;
-    tabs.push({ key: 'confirm', label: `✅ Подтверждения${pendN ? ` (${pendN})` : ''}` });
+    tabs.push({ key: 'confirm', ic: 'check', label: `Подтверждения${pendN ? ` (${pendN})` : ''}` });
   }
-  if (hasOps) tabs.push({ key: 'ops', label: '➕ Операции' });
-  if (canCreateDeposit) tabs.push({ key: 'my', label: '📋 Мои сдачи' });
+  if (hasOps) tabs.push({ key: 'ops', ic: 'plus', label: 'Операции' });
+  if (canCreateDeposit) tabs.push({ key: 'my', ic: 'list', label: 'Мои сдачи' });
 
   if (!tabs.find(t => t.key === cashboxSubTab)) {
     cashboxSubTab = tabs.length ? tabs[0].key : 'confirm';
   }
 
+  // Уровень 2 — облегчённый underline-сегмент (.subseg), визуально подчинён
+  // pill-разделам уровня 1, чтобы не было двух одинаковых рядов пилюль.
   const tabBar = tabs.length > 1
-    ? `<div class="finance-tabs cashbox-tabs">${tabs.map(t =>
-        `<button class="finance-tab ${t.key === cashboxSubTab ? 'active' : ''}" data-ctab="${t.key}">${t.label}</button>`
+    ? `<div class="subseg">${tabs.map(t =>
+        `<button class="subseg-item ${t.key === cashboxSubTab ? 'active' : ''}" data-ctab="${t.key}">${icon(t.ic)} ${t.label}</button>`
       ).join('')}</div>`
     : '';
 
@@ -2394,7 +2442,7 @@ async function renderCreditLimits(container) {
           <span class="debt-meta">лимит ${fmt(a.limit)} · долг ${fmt(a.debt)} · свободно ${fmt(a.free)} USD</span>
         </div>
         <div class="debt-actions">
-          <button class="btn-edit-limit">✏️ Изменить лимит</button>
+          <button class="btn-edit-limit">${icon('edit')} Изменить лимит</button>
         </div>
         <div class="limit-edit" hidden>
           <input type="number" class="form-input limit-input" inputmode="decimal" value="${a.limit}">
@@ -2465,8 +2513,14 @@ async function renderDebts(container) {
     let overdueSum = 0, todaySum = 0, upcomingSum = 0;
     for (const d of open) {
       const amt = d.remaining > 0 ? d.remaining : d.total;
-      if (d.state === 'overdue') { overdueCount++; overdueSum += amt; }
-      else if (d.state === 'due_today') { todayCount++; todaySum += amt; }
+      // Бакетим по СРОКУ (due_date vs серверный today), а НЕ по d.state.
+      // У частично оплаченного долга state='partial' (это прогресс оплаты,
+      // не срок) — раньше он молча проваливался в else → «Будущие», даже если
+      // срок сегодня/просрочен. Сравнение строк YYYY-MM-DD корректно; today
+      // приходит с сервера (единый TZ). Та же логика, что в handlers/debts.py.
+      const due = d.due_date;
+      if (due && due < today) { overdueCount++; overdueSum += amt; }
+      else if (due && due === today) { todayCount++; todaySum += amt; }
       else { upcomingCount++; upcomingSum += amt; }
     }
     const fmt = n => Math.round(n).toLocaleString('ru-RU');
@@ -2560,7 +2614,7 @@ async function renderDebts(container) {
     // ─── Блок «На подтверждении» ──────────────────────────────────
     if (awaiting.length > 0) {
       html += `
-        <div class="section-label section-awaiting">⏳ Ожидают подтверждения (${awaiting.length})</div>
+        <div class="section-label section-awaiting">${icon('clock')} Ожидают подтверждения (${awaiting.length})</div>
         <div class="debts-list">${awaiting.map(d => {
           const ownerStr = d.is_mine ? '' : ` <span class="debt-owner">· ${escapeHtml(d.full_name)}</span>`;
           // Покажем разбиение: оплачено / в подтверждении / остаток
@@ -2583,8 +2637,8 @@ async function renderDebts(container) {
               </div>
               ${isBoss ? `
                 <div class="debt-actions">
-                  <button class="btn-confirm-pay" data-id="${d.id}">✅ Подтвердить</button>
-                  <button class="btn-reject-pay"  data-id="${d.id}">❌ Отклонить</button>
+                  <button class="btn-confirm-pay" data-id="${d.id}">${icon('check')} Подтвердить</button>
+                  <button class="btn-reject-pay"  data-id="${d.id}">${icon('close')} Отклонить</button>
                 </div>
               ` : `
                 <div class="debt-hint">Босс должен подтвердить</div>
@@ -2631,7 +2685,7 @@ async function renderDebts(container) {
                 <input type="number" class="pay-amount-input" data-id="${d.id}"
                        placeholder="Сумма · ост. ${fmt(d.remaining)}"
                        min="0" step="0.01" inputmode="decimal">
-                <button class="btn-mark-paid" data-id="${d.id}">✅ Отметить</button>
+                <button class="btn-mark-paid" data-id="${d.id}">${icon('check')} Отметить</button>
               </div>
             ` : ''}
           </div>
