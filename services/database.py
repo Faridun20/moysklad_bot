@@ -3671,6 +3671,17 @@ def find_order_by_ms_customerorder_id(co_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+async def get_orders_with_ms_customerorder() -> list[dict]:
+    """Approved-заказы со ссылкой на customerorder в МС — для cron-реконсиляции
+    удалённых документов (tasks/run_ms_reconcile). Только approved: их безопасно
+    авто-отменять, и после отмены они уходят из набора (нет повторной обработки).
+    Native async через adb_core."""
+    return await adb_core.fetch(
+        "SELECT * FROM orders WHERE ms_customerorder_id IS NOT NULL "
+        "AND status = 'approved' AND (deleted_at IS NULL)"
+    )
+
+
 def clear_order_ms_customerorder_id(order_id: int) -> bool:
     """Снять ссылку на customerorder (документ удалён в МойСклад).
     После сброса повторный approve заявки создаст новый customerorder."""
