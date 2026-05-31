@@ -902,6 +902,23 @@ function renderOrdersMain() {
           <span>${o.created_at}</span>
           ${o.total > 0 ? `<span class="order-total">💰 ${Math.round(o.total).toLocaleString('ru-RU')}</span>` : ''}
         </div>
+        ${(() => {
+          // UX: тип оплаты / срок / статус оплаты / заморозка / причина возврата —
+          // прямо на карточке, без открытия редактора. Поля из /api/orders.
+          const bits = [];
+          if (o.payment_type === 'credit') {
+            const due = o.due_date ? ' до ' + String(o.due_date).split('-').reverse().join('.') : '';
+            bits.push(`<span class="order-pay order-pay--credit">💳 В долг${due}</span>`);
+          } else {
+            bits.push(`<span class="order-pay">💵 Оплата сразу</span>`);
+          }
+          if (o.paid_confirmed_at) bits.push(`<span class="order-pay order-pay--ok">✅ Оплачен</span>`);
+          else if (o.paid_at) bits.push(`<span class="order-pay order-pay--wait">⏳ На подтверждении</span>`);
+          if (o.frozen) bits.push(`<span class="order-pay order-pay--bad">🧊 Заморожен</span>`);
+          if (o.status === 'draft' && o.rejection_comment)
+            bits.push(`<span class="order-pay order-pay--bad">↩️ ${escapeHtml(o.rejection_comment)}</span>`);
+          return bits.length ? `<div class="order-pay-row">${bits.join('')}</div>` : '';
+        })()}
         ${o.items.slice(0, 2).map(it => {
           const sub = (it.quantity || 0) * (it.price || 0);
           const priceStr = (it.price && it.price > 0)

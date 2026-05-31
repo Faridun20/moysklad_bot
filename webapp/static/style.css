@@ -803,6 +803,19 @@ body {
 
 .order-total { color: var(--text); font-weight: 600; }
 
+/* Самодостаточная карточка заказа: тип оплаты / статус / заморозка инлайн. */
+.order-pay-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.order-pay {
+  font-size: 11px; font-weight: 600;
+  padding: 2px 8px; border-radius: 10px;
+  background: rgba(127,127,127,.12); color: var(--text-mute);
+  white-space: nowrap;
+}
+.order-pay--credit { background: rgba(255,159,10,.16); color: #c97a00; }
+.order-pay--ok     { background: rgba(52,199,89,.16);  color: #1c8b3a; }
+.order-pay--wait   { background: rgba(0,122,255,.14);  color: #0a6cd8; }
+.order-pay--bad    { background: rgba(255,59,48,.14);  color: #c0271d; }
+
 .order-item, .order-item-preview {
   font-size: 12px;
   color: var(--text-mute);
