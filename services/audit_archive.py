@@ -22,6 +22,10 @@ from services import database as db
 
 logger = logging.getLogger(__name__)
 
+# Кап на размер одного экспорта (защита от OOM). Если уходящих записей больше —
+# экспорт отклоняется, prune пропускается (см. export_audit_archive).
+_MAX_ROWS = 100000
+
 
 async def _upload_to_drive(file_name: str, content: bytes) -> tuple[str, str] | None:
     """Загрузить файл в Google Drive. Возвращает (file_id, web_url) или None (no-op).
@@ -61,9 +65,18 @@ async def export_audit_archive(before_iso: str, exported_by: int = 0) -> dict:
     зафиксировать в audit_archive_exports. Идемпотентно по period_end.
 
     Возвращает {ok, exported, uploaded?, file_name?, skipped?}."""
-    rows = await db.get_audit_log_before(before_iso)
+    rows = await db.get_audit_log_before(before_iso, limit=_MAX_ROWS)
     if not rows:
         return {"ok": True, "exported": 0, "skipped": "nothing-to-archive"}
+    if len(rows) >= _MAX_ROWS:
+        # Бэклог больше лимита — не архивируем частично и не даём prune'у удалить
+        # неархивированное (caller гейтит чистку на ok). Оператор разберётся.
+        logger.error(
+            "audit_archive: записей старше cutoff >= %d — экспорт отклонён, prune пропущен. "
+            "Разберите бэклог вручную.",
+            _MAX_ROWS,
+        )
+        return {"ok": False, "error": "too-many-rows", "exported": 0}
 
     period_start = str(rows[0].get("created_at") or before_iso)
     period_end = before_iso

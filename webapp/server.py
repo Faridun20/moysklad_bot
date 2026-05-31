@@ -3042,7 +3042,12 @@ async def api_reject_payment(request: Request):
                     p.get("id"),
                 )
 
-    return JSONResponse({"ok": True, "rejected_count": n})
+    result = {"ok": True, "rejected_count": n}
+    # #37 (F5): фиксируем результат под ключом — раньше только _idem_get без
+    # _idem_set, поэтому ретрай с тем же ключом слал повторное уведомление.
+    if idem_key:
+        _idem_set(f"reject:{user['id']}:{idem_key}", result)
+    return JSONResponse(result)
 
 
 @app.post("/api/orders/delete_draft")

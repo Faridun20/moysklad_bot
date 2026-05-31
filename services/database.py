@@ -662,6 +662,15 @@ def _create_indexes():
             "CREATE INDEX IF NOT EXISTS idx_credit_limits_updated_at ON credit_limits(updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_idempotency_expires ON idempotency_keys(expires_at)",
             "CREATE INDEX IF NOT EXISTS idx_cron_runs_task_started ON cron_runs(task_name, started_at)",
+            # Долг агента (get_agent_current_debt) и check_credit_limit (на каждом
+            # одобрении после энфорса #29) фильтруют orders по agent_id — без
+            # индекса full scan по orders.
+            "CREATE INDEX IF NOT EXISTS idx_orders_agent_id ON orders(agent_id)",
+            # Заказы менеджера (get_user_orders, аналитика) — фильтр+сортировка.
+            "CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at)",
+            # Аудит: get_audit_log сортирует по created_at, get_audit_log_before
+            # фильтрует по нему (архивация перед prune).
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at)",
         ]
         for sql in snapshot_indexes:
             try:
@@ -1115,8 +1124,10 @@ async def get_agent_current_debt(agent_id: str) -> float:
     заказам минус подтверждённые возвраты. Открытые = не draft/rejected/
     cancelled и не soft-deleted.
 
-    asyncpg Stage 18 (#21): native async через adb_core; get_order_payment_summary
-    (общий read, sync) — мост через to_thread (флип в Stage 19)."""
+    asyncpg #21: native async. #37 (F3): убран N+1 — раньше на каждый заказ
+    звался get_order_payment_summary + отдельный returns-fetchval (горячий путь
+    из-за энфорса лимитов #29). Теперь items/payments/returns берутся батчем,
+    остаток считается в Python (та же формула, что в get_order_payment_summary)."""
     if not agent_id:
         return 0.0
     # Исключаем неактуальные: черновики/отклонённые/отменённые, полностью
@@ -1129,18 +1140,33 @@ async def get_agent_current_debt(agent_id: str) -> float:
         agent_id,
     )
     order_ids = [r["id"] for r in rows]
+    if not order_ids:
+        return 0.0
+
+    items_by_order = await get_order_items_by_ids(order_ids)
+    payments_by_order = await get_payments_for_orders(order_ids)
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(order_ids)))
+    ret_rows = await adb_core.fetch(
+        f"SELECT order_id, {_SUM_RETURNS_CENTS} AS rc FROM returns "
+        f"WHERE order_id IN ({placeholders}) AND status = 'confirmed' AND (deleted_at IS NULL) "
+        f"GROUP BY order_id",
+        *order_ids,
+    )
+    returns_by_order = {r["order_id"]: int(r["rc"] or 0) for r in ret_rows}
+
     debt_cents = 0
     for oid in order_ids:
-        summary = await get_order_payment_summary(oid)
-        returns_cents = int(
-            await adb_core.fetchval(
-                f"SELECT {_SUM_RETURNS_CENTS} FROM returns "
-                "WHERE order_id = $1 AND status = 'confirmed' AND (deleted_at IS NULL)",
-                oid,
-            )
-            or 0
+        total = sum(
+            money.mul_qty(_price_cents(it), it.get("quantity", 0) or 0)
+            for it in items_by_order.get(oid, [])
         )
-        debt_cents += max(0, int(summary.get("remaining_cents", 0)) - returns_cents)
+        confirmed = sum(
+            _amount_cents(p)
+            for p in payments_by_order.get(oid, [])
+            if p["status"] == "confirmed"
+        )
+        remaining = max(0, total - confirmed)
+        debt_cents += max(0, remaining - returns_by_order.get(oid, 0))
     return float(money.from_cents(debt_cents))
 
 
@@ -3154,10 +3180,15 @@ def prune_audit_log(retention_months: int = 6) -> int:
     return _batched_delete("audit_log", "created_at < ?", (cutoff,))
 
 
-async def get_audit_log_before(before_iso: str) -> list[dict]:
-    """Записи аудита старше cutoff — для архивации ДО prune (#33)."""
+async def get_audit_log_before(before_iso: str, limit: int = 100000) -> list[dict]:
+    """Записи аудита старше cutoff — для архивации ДО prune (#33). #37 (F2):
+    с LIMIT (защита от OOM на огромном логе). Если вернулось ровно `limit` строк —
+    набор обрезан (caller это детектит и НЕ чистит, чтобы не удалить
+    неархивированное)."""
     return await adb_core.fetch(
-        "SELECT * FROM audit_log WHERE created_at < $1 ORDER BY created_at ASC", before_iso
+        "SELECT * FROM audit_log WHERE created_at < $1 ORDER BY created_at ASC LIMIT $2",
+        before_iso,
+        limit,
     )
 
 
