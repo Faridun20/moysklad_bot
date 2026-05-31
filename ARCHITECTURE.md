@@ -683,8 +683,6 @@ Concurrency-ограничители (не TTL, но рядом по смысл�
   per-user permission overrides, но не полный RBAC).
 - Логи длиннее 7 дней — Better Stack / Axiom log drain.
 - Перевод бота на webhook на проде (код готов, `TG_USE_WEBHOOK=1`; сейчас polling).
-- Google Drive архив аудита: код экспорта готов и gated на `GOOGLE_DRIVE_*`;
-  реальная заливка включится, когда добавишь creds + `google-api-python-client`.
 
 > Реализовано (раньше было «нет»): частичные оплаты; подтверждение оплаты;
 > событийные уведомления; **возвраты** (полные/частичные) + salesreturn;

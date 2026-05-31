@@ -1,15 +1,12 @@
 """
-Общая обёртка для CLI-cron'ов: Sentry + cron_runs телеметрия.
+Общая обёртка для CLI-cron'ов: cron_runs телеметрия.
 
 Каждый `tasks/run_*.py` в своём `__main__` вызывает `run_cron(task_name, main)`.
 Обёртка:
-  * `init_sentry(component="cron-<task_name>")` — no-op без SENTRY_DSN;
   * замеряет время main();
   * по результату (rc=0 / exception) делает `record_cron_run(...)` в
     таблицу `cron_runs` — ops_monitor читает её и алертит про stale'ы;
-  * exception'ы — `capture_exception` в Sentry перед re-raise (process
-    падает с rc=1 как раньше; supervisor видит crash, аналитика
-    включена).
+  * exception'ы логируются и дают rc=1 (process падает; supervisor видит crash).
 
 Поддерживает async (`asyncio.run(main())`) и sync (`main()`) callables —
 по сигнатуре. Возвращает rc для sys.exit'а вызывающего.
@@ -49,18 +46,11 @@ def run_cron(task_name: str, main: CronMain, *args: Any, **kwargs: Any) -> int:
     # быть импортирован в тестах ДО init_db, не хочется тащить тяжёлые
     # зависимости (psycopg2 pool init) если cron не запускается.
     from services.database import init_db, record_cron_run
-    from services.observability import (
-        capture_exception,
-        init_sentry,
-    )
-
-    init_sentry(component=f"cron-{task_name}")
 
     started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     t0 = time.monotonic()
     rc = 1
     err: str | None = None
-    exc: BaseException | None = None
 
     try:
         result = main(*args, **kwargs)
@@ -70,8 +60,6 @@ def run_cron(task_name: str, main: CronMain, *args: Any, **kwargs: Any) -> int:
         rc = int(result) if isinstance(result, int) else 0
     except BaseException as e:
         err = f"{type(e).__name__}: {e}"[:1000]
-        exc = e
-        capture_exception(e)
         rc = 1
     finally:
         # Гарантируем init_db перед записью — main() мог упасть ДО своего
@@ -90,17 +78,5 @@ def run_cron(task_name: str, main: CronMain, *args: Any, **kwargs: Any) -> int:
             )
         except Exception:
             logger.exception("record_cron_run failed (cron=%s, rc=%d)", task_name, rc)
-
-    if exc is not None and rc != 0:
-        # Перезбрасываем оригинал — supervisor / Railway увидят crash,
-        # а Sentry уже сохранил event'у с stack trace выше.
-        # Но для предсказуемости лучше отдать rc — supervisor увидит
-        # ненулевой код, traceback уже залогирован в `except`.
-        # Перезбрасывать БЕЗ raise здесь — потеряем traceback в stderr.
-        # Компромисс: traceback ИДЕТ в logger.exception (его делает
-        # caller через `logger.exception` в except внутри main()) и в
-        # Sentry. Здесь возвращаем rc — это и есть «cron упал», логи
-        # уже залогированы.
-        pass
 
     return rc

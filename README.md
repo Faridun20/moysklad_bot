@@ -101,16 +101,11 @@ Telegram, руководители одобряют отгрузки и подт
 | `TZ` | `Asia/Tashkent` или другой |
 | `ENABLE_SCHEDULED_REPORTS` | `0` чтобы отчёты не дублировались с cron-сервисом |
 | `PG_POOL_MIN`, `PG_POOL_MAX` | Размер пула коннектов Postgres (default 1/10) |
-| `SENTRY_DSN` | Если задан — exceptions/warnings идут в Sentry (PII scrubbed). `sentry-sdk` уже в deps, активация = только эта переменная |
 | `BACKUP_TG_CHAT_ID` | ID приватного TG-канала для ежедневного backup БД |
-| `GOOGLE_DRIVE_FOLDER_ID` + `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON` | Если заданы — `run_maintenance` грузит архив аудита в Drive. Библиотеки (`google-api-python-client`, `google-auth`) уже в deps; без креды — no-op |
 
-> **Активация опциональных интеграций — только ops (кода не требуют):**
-> - **Sentry**: задать `SENTRY_DSN` в Railway Shared Variables → перезапуск.
-> - **Drive-архив аудита**: создать сервис-аккаунт Google, выдать ему доступ к
->   папке, прокинуть `GOOGLE_DRIVE_FOLDER_ID` + `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON`.
-> - **Telegram webhook** (вместо polling): `TG_USE_WEBHOOK=1` + `TG_WEBHOOK_SECRET`
->   при заданном публичном `WEBAPP_URL`. Деплой-решение — держите откат на polling.
+> **Telegram webhook** (вместо polling, опц., только ops): `TG_USE_WEBHOOK=1` +
+> `TG_WEBHOOK_SECRET` при заданном публичном `WEBAPP_URL`. Деплой-решение —
+> держите откат на polling.
 
 ## Backup БД в Telegram-канал
 
@@ -207,7 +202,6 @@ psql $DATABASE_URL < moysklad-bot-postgres-YYYYMMDD-HHMMSS.sql
 │   ├── roles.py              Роли + TTL-кэш на 60с + деактивация
 │   ├── ms_cancel.py          Реверс customerorder при отмене заказа
 │   ├── ms_returns.py         «Возврат покупателя» (salesreturn)
-│   ├── audit_archive.py      Экспорт аудита → Google Drive (gated)
 │   ├── moysklad.py           Базовый HTTP-клиент МойСклад
 │   ├── ms_demand.py          Создание отгрузок (demand)
 │   ├── ms_customerorder.py   Создание заказов покупателей + PDF
@@ -229,7 +223,7 @@ psql $DATABASE_URL < moysklad-bot-postgres-YYYYMMDD-HHMMSS.sql
 │   ├── run_ms_sync_retry.py  CLI: ретрай failed paymentin-синков
 │   ├── run_ms_reconcile.py   CLI: реконсиляция удалённых в МС заказов
 │   ├── run_ops_monitor.py    CLI: операционный дайджест с кнопками
-│   ├── run_maintenance.py    CLI: janitor (архив аудита, чистка)
+│   ├── run_maintenance.py    CLI: janitor (чистка дедупа/аудита/soft-deleted)
 │   └── run_backup.py         CLI: дамп БД → приватный TG-канал
 │
 ├── webapp/                   FastAPI + статика (Telegram Mini App)
