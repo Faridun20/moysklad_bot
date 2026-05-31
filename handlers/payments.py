@@ -25,6 +25,7 @@ from utils.formatters import (
     format_payments_report,
     DIV,
 )
+from utils.keyboards import next_actions_keyboard
 from services import async_db as adb
 
 from config import ALLOWED_CURRENCIES as CURRENCIES
@@ -255,6 +256,7 @@ async def confirm_pay(call: CallbackQuery, bot: Bot):
     await call.message.edit_text(
         base + f"\n\n{DIV}\n✅ <b>Принято</b>  <code>{now}</code>  — {_esc(admin_name)}",
         parse_mode="HTML",
+        reply_markup=next_actions_keyboard([("💳 Долги", "debts_my"), ("🏠 Меню", "menu")]),
     )
 
     from services.notify import notify_payment_confirmed as _npayc
@@ -284,6 +286,7 @@ async def reject_pay(call: CallbackQuery, bot: Bot):
     await call.message.edit_text(
         base + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{now}</code>  — {_esc(admin_name)}",
         parse_mode="HTML",
+        reply_markup=next_actions_keyboard([("💳 Долги", "debts_my"), ("🏠 Меню", "menu")]),
     )
 
     from services.notify import notify_payment_rejected as _npayr

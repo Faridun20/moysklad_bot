@@ -7,6 +7,17 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import PAGE_SIZE  # единый источник в config
 
 
+def next_actions_keyboard(buttons: list[tuple[str, str]]):
+    """Компактная клавиатура «что дальше» после финального действия (approve/
+    confirm/reject) — убирает тупик, чтобы не печатать команду заново.
+    buttons = [(text, callback_data), ...]."""
+    kb = InlineKeyboardBuilder()
+    for text, cb in buttons:
+        kb.button(text=text, callback_data=cb)
+    kb.adjust(2 if len(buttons) > 1 else 1)
+    return kb.as_markup()
+
+
 _AN_PERIODS = [
     ("week", "Неделя"),
     ("month", "Месяц"),

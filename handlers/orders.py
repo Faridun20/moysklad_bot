@@ -39,6 +39,7 @@ from services import async_db as adb
 from services.moysklad import get_all_stock, get_categories, ms_get
 from utils.helpers import extract_id_from_href, extract_href, safe_get, user_safe_error
 from utils.formatters import DIV, DIV2
+from utils.keyboards import next_actions_keyboard
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -1066,6 +1067,7 @@ async def _approve_flow(call: CallbackQuery, bot: Bot, req_id: int, override: bo
         base
         + f"\n\n{DIV}\n✅ <b>Одобрено{suffix}</b>  <code>{result['now']}</code>  — {_esc(boss_name)}",
         parse_mode="HTML",
+        reply_markup=next_actions_keyboard([("⏳ Ещё заявки", "ord_requests"), ("🏠 Меню", "menu")]),
     )
 
 
@@ -1106,6 +1108,7 @@ async def cb_reject_request(call: CallbackQuery, bot: Bot):
         base
         + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{result['now']}</code>  — {_esc(boss_name)}",
         parse_mode="HTML",
+        reply_markup=next_actions_keyboard([("⏳ Ещё заявки", "ord_requests"), ("🏠 Меню", "menu")]),
     )
 
 

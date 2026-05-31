@@ -124,3 +124,41 @@ def test_debt_card_shows_item_preview():
     assert "3 поз." in txt
     assert "Хлеб" in txt
     assert "+1" in txt  # показали 2, ещё 1
+
+
+# ─── тир 2: «что дальше» + цена в каталоге ───────────────────────────────────
+
+
+def test_next_actions_keyboard():
+    from utils.keyboards import next_actions_keyboard
+
+    kb = next_actions_keyboard([("⏳ Ещё", "ord_requests"), ("🏠 Меню", "menu")])
+    cbs = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert cbs == ["ord_requests", "menu"]
+
+
+def test_stock_page_shows_attached_price():
+    from utils.formatters import format_stock_page
+
+    rows = [
+        {
+            "name": "Вода",
+            "stock": 50,
+            "reserve": 0,
+            "uom": {"name": "шт"},
+            "folder": {},
+            "_sale_price_str": "💵 15 USD",
+        }
+    ]
+    txt = format_stock_page(rows, 0)
+    assert "Вода" in txt
+    assert "💵 15 USD" in txt
+
+
+def test_stock_page_no_price_when_unset():
+    from utils.formatters import format_stock_page
+
+    rows = [{"name": "Сок", "stock": 10, "reserve": 0, "uom": {"name": "шт"}, "folder": {}}]
+    txt = format_stock_page(rows, 0)
+    assert "Сок" in txt
+    assert "💵" not in txt  # цена не задана — строки нет

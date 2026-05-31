@@ -22,6 +22,7 @@ from services import async_db as adb
 from services.roles import _has_role, can_confirm_deposit
 from utils.helpers import esc
 from utils.formatters import DIV
+from utils.keyboards import next_actions_keyboard
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -189,6 +190,7 @@ async def cb_deposit_confirm(call: CallbackQuery, bot: Bot):
     await call.message.edit_text(
         original + f"\n\n{DIV}\n✅ <b>Подтверждено</b> — {esc(name)}",
         parse_mode="HTML",
+        reply_markup=next_actions_keyboard([("💵 Ещё сдачи", "dep_pending"), ("🏠 Меню", "menu")]),
     )
     if dep and dep.get("manager_id"):
         closed = res.get("closed_orders") or []
