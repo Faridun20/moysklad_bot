@@ -111,6 +111,53 @@ def test_get_all_orders_async(isolated_db):
     assert o2 in aids and o1 not in aids
 
 
+def test_order_lists_hide_ms_deleted(isolated_db):
+    """get_all_orders / get_user_orders прячут заказы, удалённые в МойСклад
+    (ms_deleted_at): иначе «фантомы» висят в списке вразрез с аналитикой."""
+    mgr = 305
+    db = isolated_db
+    db.set_role(mgr, "m", "Mgr", "manager")
+    o_live = db.create_order(mgr, "Mgr", "")
+    db.update_order_status(o_live, "shipped")
+    o_ghost = db.create_order(mgr, "Mgr", "")
+    db.update_order_status(o_ghost, "shipped")
+    assert asyncio.run(db.set_order_ms_deleted(o_ghost)) is True
+
+    all_ids = {o["id"] for o in asyncio.run(db.get_all_orders())}
+    assert o_live in all_ids and o_ghost not in all_ids
+
+    user_ids = {o["id"] for o in asyncio.run(db.get_user_orders(mgr))}
+    assert o_live in user_ids and o_ghost not in user_ids
+
+
+def test_reconcile_set_covers_active_excludes_terminal(isolated_db):
+    """get_orders_with_ms_customerorder (страховка реконсиляции) берёт ВСЕ
+    активные статусы со ссылкой на CO (не только approved), но исключает
+    терминальные cancelled/rejected и уже-помеченные ms_deleted_at."""
+    mgr = 306
+    db = isolated_db
+    db.set_role(mgr, "m", "Mgr", "manager")
+
+    def _co(status, co, *, ms_deleted=False):
+        oid = db.create_order(mgr, "Mgr", "")
+        db.update_order_status(oid, status)
+        db.set_order_ms_customerorder_id(oid, co)
+        if ms_deleted:
+            asyncio.run(db.set_order_ms_deleted(oid))
+        return oid
+
+    o_appr = _co("approved", "co-appr")
+    o_ship = _co("shipped", "co-ship")     # раньше пропускался — теперь покрыт
+    o_paid = _co("paid", "co-paid")
+    o_cancel = _co("cancelled", "co-cancel")   # терминальный — исключён
+    o_reject = _co("rejected", "co-reject")    # терминальный — исключён
+    o_done = _co("shipped", "co-done", ms_deleted=True)  # уже обработан — исключён
+
+    ids = {o["id"] for o in asyncio.run(db.get_orders_with_ms_customerorder())}
+    assert {o_appr, o_ship, o_paid} <= ids
+    assert o_cancel not in ids and o_reject not in ids and o_done not in ids
+
+
 # ─── Stage 7: get_payments_report, get_overdue_undeposited_orders ────────────────
 
 

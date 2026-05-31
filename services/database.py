@@ -772,6 +772,12 @@ def run_migrations():
             # Когда отмена была отражена в МойСклад (реверс customerorder).
             # NULL = ещё не синхронизировано; идемпотентность ms_cancel.
             ("orders", "ms_cancel_synced_at", "TEXT"),
+            # Когда документ заказа был обнаружен УДАЛЁННЫМ в МойСклад (вебхук
+            # customerorder.DELETE / cron-реконсиляция). Помечает «фантомные»
+            # заказы (особенно shipped/paid, чей статус мы не трогаем) — они
+            # исключаются из аналитики менеджеров, но остаются в учёте долгов
+            # для ручной разборки. NULL = в МС ещё существует.
+            ("orders", "ms_deleted_at", "TEXT"),
             ("orders", "credit_limit_override", "INTEGER NOT NULL DEFAULT 0"),
             ("orders", "credit_limit_override_by", "BIGINT"),
             ("orders", "price_check_warnings", "TEXT"),
@@ -2984,7 +2990,7 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
     shipped/partially_returned), returns_count. Имя/роль — из user_roles."""
     orders = await adb_core.fetch(
         "SELECT * FROM orders WHERE created_at >= $1 AND created_at <= $2 "
-        "AND (deleted_at IS NULL)",
+        "AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)",
         since_iso, until_iso,
     )
     if not orders:
@@ -3021,8 +3027,11 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
                 "returns_count": 0,
             },
         )
-        m["orders_count"] += 1
         status = o.get("status")
+        # «Создано» — продуктивные заказы: отменённые/отклонённые не считаем
+        # (иначе счётчик завышен на отменённые боссом/МС и отклонённые заявки).
+        if status not in ("cancelled", "rejected"):
+            m["orders_count"] += 1
         if status == "approved":
             m["approved"] += 1
         elif status == "shipped":
@@ -3251,6 +3260,23 @@ async def set_order_ms_cancel_synced(order_id: int) -> bool:
     return (
         await adb_core.execute(
             "UPDATE orders SET ms_cancel_synced_at = $1, updated_at = $2 WHERE id = $3",
+            now_str(), now_str(), order_id,
+        )
+        > 0
+    )
+
+
+async def set_order_ms_deleted(order_id: int) -> bool:
+    """Пометить, что документ заказа удалён в МойСклад (вебхук CO.DELETE /
+    cron-реконсиляция). Идемпотентно (ставим только если ещё не стоит). Заказ
+    исключается из аналитики менеджеров (фантомная выручка), но остаётся в учёте
+    долгов для ручной разборки.
+
+    asyncpg #21: native async через adb_core."""
+    return (
+        await adb_core.execute(
+            "UPDATE orders SET ms_deleted_at = $1, updated_at = $2 "
+            "WHERE id = $3 AND ms_deleted_at IS NULL",
             now_str(), now_str(), order_id,
         )
         > 0
@@ -3748,13 +3774,19 @@ def find_order_by_ms_customerorder_id(co_id: str) -> dict | None:
 
 
 async def get_orders_with_ms_customerorder() -> list[dict]:
-    """Approved-заказы со ссылкой на customerorder в МС — для cron-реконсиляции
-    удалённых документов (tasks/run_ms_reconcile). Только approved: их безопасно
-    авто-отменять, и после отмены они уходят из набора (нет повторной обработки).
-    Native async через adb_core."""
+    """Заказы со ссылкой на customerorder в МС — для cron-реконсиляции удалённых
+    документов (tasks/run_ms_reconcile, страховка от пропущенных DELETE-вебхуков).
+
+    Раньше брали только approved → пропущенный вебхук для shipped/paid оставлял
+    «фантом» (CO удалён в МС, но локально висит, ms_deleted_at=NULL, и попадает в
+    выручку аналитики). Теперь — все активные статусы. Обработанный заказ уходит
+    из набора (apply_ms_customerorder_delete ставит ms_deleted_at + снимает ссылку).
+    Терминально-неактивные cancelled/rejected исключаем: revenue=0, перепроверять
+    их в МС незачем. Native async через adb_core."""
     return await adb_core.fetch(
         "SELECT * FROM orders WHERE ms_customerorder_id IS NOT NULL "
-        "AND status = 'approved' AND (deleted_at IS NULL)"
+        "AND (ms_deleted_at IS NULL) AND (deleted_at IS NULL) "
+        "AND status NOT IN ('cancelled', 'rejected')"
     )
 
 
@@ -4322,7 +4354,10 @@ async def get_user_orders(user_id: int, status: str | None = None) -> list[dict]
 
     asyncpg Stage 12 (#21): native async через adb_core."""
     params: list = [user_id]
-    query = "SELECT * FROM orders WHERE user_id = $1"
+    # Прячем заказы, удалённые в МойСклад (ms_deleted_at) и soft-deleted —
+    # иначе «фантомы» (CO удалён в МС) висят в списке, рассинхрон с аналитикой,
+    # которая их уже исключает (get_manager_performance).
+    query = "SELECT * FROM orders WHERE user_id = $1 AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)"
     if status:
         params.append(status)
         query += f" AND status = ${len(params)}"
@@ -4334,11 +4369,13 @@ async def get_all_orders(status: str | None = None) -> list[dict]:
     """Все заказы (опц. фильтр по статусу). asyncpg-миграция Stage 6
     (задача #21): нативный async через adb_core. Вызов — только webapp
     (`await adb.get_all_orders()`)."""
-    query = "SELECT * FROM orders"
+    # Прячем удалённые в МС (ms_deleted_at) и soft-deleted заказы — список
+    # должен сходиться с аналитикой, которая их уже исключает.
+    query = "SELECT * FROM orders WHERE (deleted_at IS NULL) AND (ms_deleted_at IS NULL)"
     params: list = []
     if status:
         params.append(status)
-        query += f" WHERE status = ${len(params)}"
+        query += f" AND status = ${len(params)}"
     query += " ORDER BY created_at DESC"
     return await adb_core.fetch(query, *params)
 
