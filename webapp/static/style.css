@@ -301,15 +301,18 @@ body {
 }
 
 .hero-value {
-  font-size: 40px;
+  /* clamp вместо фикс. 40px: крупные суммы (8+ цифр) не вылезают за карточку
+     на узких телефонах — кегль ужимается до 28px. */
+  font-size: clamp(28px, 11vw, 40px);
   font-weight: 700;
   letter-spacing: -1px;
   line-height: 1.1;
   color: var(--accent-fg);
+  overflow-wrap: anywhere;
 }
 
 .hero-currency {
-  font-size: 26px;
+  font-size: clamp(20px, 7vw, 26px);
   font-weight: 500;
   color: var(--accent-fg);
   opacity: 0.8;
@@ -344,7 +347,7 @@ body {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  padding: 14px 6px;
+  padding: 14px 4px;
   background: var(--bg-card);
   border: none;
   border-radius: var(--radius);
@@ -352,8 +355,11 @@ body {
   cursor: pointer;
   font-family: inherit;
   color: var(--text);
-  font-size: 12px;
+  /* clamp: на узких экранах (320px) подпись «Аналитика» в 4 колонки не
+     переносится на 2-ю строку и не ломает выравнивание соседей. */
+  font-size: clamp(10px, 3.2vw, 12px);
   font-weight: 500;
+  white-space: nowrap;
   transition: transform 0.08s ease, background 0.15s ease;
 }
 

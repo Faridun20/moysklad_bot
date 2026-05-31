@@ -140,11 +140,18 @@ function showError(msg) {
 // показывали голый текст без способа повторить (кроме ре-навигации).
 // Retry перезагружает текущий экран через showScreen(currentScreen).
 function errorBox(msg) {
+  // Различаем «нет сети» и «ошибка сервера»: при офлайне нет смысла показывать
+  // технический detail — даём понятную причину и подсказку. api() при сетевом
+  // сбое кидает именно это сообщение; плюс страхуемся navigator.onLine.
+  const offline = (typeof navigator !== 'undefined' && navigator.onLine === false)
+    || msg === 'Нет подключения к интернету';
+  const title = offline ? 'Нет подключения' : 'Не удалось загрузить';
+  const body = offline ? 'Проверьте интернет и попробуйте снова.' : escapeHtml(msg);
   return `
     <div class="error-card">
       <div class="error-icon">${icon('alert')}</div>
-      <div class="error-title">Не удалось загрузить</div>
-      <div class="error-body">${escapeHtml(msg)}</div>
+      <div class="error-title">${title}</div>
+      <div class="error-body">${body}</div>
       <button class="btn-primary" onclick="showScreen(currentScreen)">Повторить</button>
     </div>`;
 }
@@ -798,12 +805,26 @@ const STATUS_NAME = {
 };
 
 async function api(path, body) {
-  const r = await fetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ initData: _initData, ...body }),
-  });
-  if (!r.ok) throw new Error((await r.json()).detail || 'Ошибка');
+  let r;
+  try {
+    r = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: _initData, ...body }),
+    });
+  } catch {
+    // fetch отклоняется только при сетевом сбое (нет интернета, CORS, abort) —
+    // не при HTTP-ошибке. Помечаем, чтобы errorBox показал «нет связи».
+    const err = new Error('Нет подключения к интернету');
+    err.network = true;
+    throw err;
+  }
+  if (!r.ok) {
+    // Тело ошибки может быть не-JSON (502/HTML от прокси) — не падаем на парсе.
+    let detail = `Ошибка сервера (${r.status})`;
+    try { detail = (await r.json()).detail || detail; } catch { /* не-JSON */ }
+    throw new Error(detail);
+  }
   return r.json();
 }
 
