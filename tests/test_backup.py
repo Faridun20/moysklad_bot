@@ -88,6 +88,36 @@ def test_postgres_backup_falls_back_when_pg_dump_missing(tmp_path, monkeypatch, 
     assert any("pg_dump не найден" in r.message for r in caplog.records)
 
 
+def test_postgres_backup_falls_back_on_version_mismatch(tmp_path, monkeypatch, caplog):
+    """pg_dump есть, но упал (RuntimeError, напр. 'server version mismatch':
+    бинарь v15, сервер v18) → fallback на version-independent pure-Python.
+
+    Реальный прод-кейс: managed-Postgres апгрейднулся до 18, а pg_dump из
+    railpack-apt остался 15 → раньше backup падал (RuntimeError не ловился)."""
+    import logging
+
+    from tasks import run_backup
+
+    def fake_native(db_url, out_path):
+        raise RuntimeError("pg_dump упал rc=1")
+
+    pure_called = []
+
+    def fake_pure(db_url, out_path):
+        pure_called.append((db_url, out_path))
+        Path(out_path).write_bytes(b"pure-python-dump")
+        return 16
+
+    monkeypatch.setattr(run_backup, "_pg_dump_native", fake_native)
+    monkeypatch.setattr(run_backup, "_pg_dump_pure_python", fake_pure)
+
+    caplog.set_level(logging.WARNING, logger="backup")
+    size = run_backup._create_backup_postgres("postgresql://x", tmp_path / "out.gz")
+    assert size == 16
+    assert len(pure_called) == 1  # fallback сработал и на RuntimeError
+    assert any("server version mismatch" in r.message for r in caplog.records)
+
+
 # ─── _create_backup_sqlite ───────────────────────────────────────────────────
 
 
