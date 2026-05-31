@@ -2700,6 +2700,17 @@ async def api_debts(request: Request):
         user_id=None if is_boss else user_id,
     )
 
+    # Единый остаток к получению в базовой валюте (объединяет разные валюты) —
+    # чтобы не складывать «5000 UZS + 200 USD» в уме. convert_to_base кэширован;
+    # долги без курса валюты не учитываются (флаг partial). Как в боте (#27).
+    from services.database import convert_to_base
+
+    base_cur = (BASE_CURRENCY or "USD").upper()
+    rem_bases = [convert_to_base(r["remaining"], r["currency"]) for r in result if r["remaining"] > 0]
+    known = [b for b in rem_bases if b is not None]
+    remaining_base_total = round(sum(known), 2) if known else None
+    remaining_base_partial = bool(known) and len(known) < len(rem_bases)
+
     return JSONResponse(
         {
             "debts": result,
@@ -2708,6 +2719,9 @@ async def api_debts(request: Request):
             "today": today,
             "money_received": [{"currency": k, "total": v} for k, v in summary["received"].items()],
             "money_pending": [{"currency": k, "total": v} for k, v in summary["pending"].items()],
+            "remaining_base_total": remaining_base_total,
+            "remaining_base_partial": remaining_base_partial,
+            "base_currency": base_cur,
         }
     )
 
