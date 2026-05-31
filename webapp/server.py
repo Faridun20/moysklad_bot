@@ -1560,6 +1560,14 @@ async def api_approve_request(request: Request):
         "username", str(user["id"])
     )
     override = bool(data.get("override"))
+    # Idempotency: повторный тап «Одобрить» (или ретрай по таймауту) не должен
+    # повторно дёргать approve (двойное уведомление/PDF). Кэшируем ТОЛЬКО финальный
+    # успех, не needs_override (это запрос подтверждения — фронт повторит с override).
+    idem_key = data.get("idempotency_key")
+    if idem_key:
+        cached = _idem_get(f"approve_request:{user['id']}:{idem_key}")
+        if cached is not None:
+            return JSONResponse(cached)
     bot = await get_notify_bot()
     result = await approve_shipment_request(req_id, user["id"], boss_name, bot, override=override)
     if not result["ok"]:
@@ -1570,7 +1578,10 @@ async def api_approve_request(request: Request):
                 {"ok": False, "needs_override": True, "over": result.get("over"), "req_id": req_id}
             )
         raise HTTPException(status_code=409, detail=result["error"])
-    return JSONResponse({"ok": True, "req_id": req_id})
+    resp = {"ok": True, "req_id": req_id}
+    if idem_key:
+        _idem_set(f"approve_request:{user['id']}:{idem_key}", resp)
+    return JSONResponse(resp)
 
 
 @app.post("/api/requests/reject")
@@ -1984,6 +1995,11 @@ async def api_deposits_confirm(request: Request):
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
+    idem_key = data.get("idempotency_key")
+    if idem_key:
+        cached = _idem_get(f"deposit_confirm:{user['id']}:{idem_key}")
+        if cached is not None:
+            return JSONResponse(cached)
     dep = await adb.get_cash_deposit(deposit_id)
     res = await adb.confirm_cash_deposit(deposit_id, user["id"], name)
     if not res.get("ok"):
@@ -1999,9 +2015,10 @@ async def api_deposits_confirm(request: Request):
             )
         except Exception:
             logger.warning("deposit confirm notify failed", exc_info=True)
-    return JSONResponse(
-        {"ok": True, "deposit_id": deposit_id, "closed_orders": res.get("closed_orders", [])}
-    )
+    resp = {"ok": True, "deposit_id": deposit_id, "closed_orders": res.get("closed_orders", [])}
+    if idem_key:
+        _idem_set(f"deposit_confirm:{user['id']}:{idem_key}", resp)
+    return JSONResponse(resp)
 
 
 @app.post("/api/deposits/reject")
@@ -2072,6 +2089,13 @@ async def api_deposits_create(request: Request):
             status_code=400, detail="Сумма должна быть положительным числом до 10М"
         )
 
+    # Idempotency: create_cash_deposit НЕ защищён claim'ом — двойной POST создаёт
+    # две сдачи. Кэш-ключ отсекает дубль в пределах TTL.
+    idem_key = data.get("idempotency_key")
+    if idem_key:
+        cached = _idem_get(f"deposit_create:{user['id']}:{idem_key}")
+        if cached is not None:
+            return JSONResponse(cached)
     res = await adb.create_cash_deposit(user["id"], amount)
     if not res.get("ok"):
         raise HTTPException(status_code=400, detail=res.get("error", "не удалось создать сдачу"))
@@ -2087,7 +2111,10 @@ async def api_deposits_create(request: Request):
         await _notify_confirmers(bot, res["deposit_id"], name, amount)
     except Exception:
         logger.warning("deposit create notify failed", exc_info=True)
-    return JSONResponse({"ok": True, "deposit_id": res["deposit_id"]})
+    resp = {"ok": True, "deposit_id": res["deposit_id"]}
+    if idem_key:
+        _idem_set(f"deposit_create:{user['id']}:{idem_key}", resp)
+    return JSONResponse(resp)
 
 
 @app.post("/api/deposits/my")
@@ -2142,6 +2169,11 @@ async def api_returns_confirm(request: Request):
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
+    idem_key = data.get("idempotency_key")
+    if idem_key:
+        cached = _idem_get(f"return_confirm:{user['id']}:{idem_key}")
+        if cached is not None:
+            return JSONResponse(cached)
     res = await adb.confirm_return(return_id, user["id"], name)
     if not res.get("ok"):
         raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
@@ -2153,9 +2185,10 @@ async def api_returns_confirm(request: Request):
         await ms_returns.create_salesreturn(return_id)
     except Exception:
         logger.warning("MS salesreturn create failed", exc_info=True)
-    return JSONResponse(
-        {"ok": True, "return_id": return_id, "order_status": res.get("order_status")}
-    )
+    resp = {"ok": True, "return_id": return_id, "order_status": res.get("order_status")}
+    if idem_key:
+        _idem_set(f"return_confirm:{user['id']}:{idem_key}", resp)
+    return JSONResponse(resp)
 
 
 @app.post("/api/returns/goods_received")
@@ -2173,10 +2206,18 @@ async def api_returns_goods_received(request: Request):
         return_id = int(data.get("return_id"))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="return_id обязателен")
+    idem_key = data.get("idempotency_key")
+    if idem_key:
+        cached = _idem_get(f"return_goods:{user['id']}:{idem_key}")
+        if cached is not None:
+            return JSONResponse(cached)
     res = await adb.mark_return_goods_received(return_id, user["id"])
     if not res.get("ok"):
         raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
-    return JSONResponse({"ok": True, "return_id": return_id})
+    resp = {"ok": True, "return_id": return_id}
+    if idem_key:
+        _idem_set(f"return_goods:{user['id']}:{idem_key}", resp)
+    return JSONResponse(resp)
 
 
 @app.post("/api/returns/create")
@@ -2203,6 +2244,14 @@ async def api_returns_create(request: Request):
     refund = data.get("refund_method")
     if refund not in ("cash", "debt_reduction", "no_refund"):
         raise HTTPException(status_code=400, detail="Некорректный способ возврата денег")
+
+    # Idempotency: create_return НЕ защищён claim'ом — двойной POST создаёт два
+    # возврата. Кэш-ключ отсекает дубль в пределах TTL.
+    idem_key = data.get("idempotency_key")
+    if idem_key:
+        cached = _idem_get(f"return_create:{user['id']}:{idem_key}")
+        if cached is not None:
+            return JSONResponse(cached)
 
     order = await adb.get_order(order_id)
     if not order:
@@ -2248,9 +2297,10 @@ async def api_returns_create(request: Request):
         await _notify_confirmers(bot, res["return_id"], order_id, res["total_amount"], refund)
     except Exception:
         logger.warning("return create notify failed", exc_info=True)
-    return JSONResponse(
-        {"ok": True, "return_id": res["return_id"], "total_amount": res["total_amount"]}
-    )
+    resp = {"ok": True, "return_id": res["return_id"], "total_amount": res["total_amount"]}
+    if idem_key:
+        _idem_set(f"return_create:{user['id']}:{idem_key}", resp)
+    return JSONResponse(resp)
 
 
 # ─── API: создание заказа ────────────────────────────────────────────────────
@@ -2297,6 +2347,11 @@ async def api_orders_ship(request: Request):
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
+    idem_key = data.get("idempotency_key")
+    if idem_key:
+        cached = _idem_get(f"order_ship:{user['id']}:{idem_key}")
+        if cached is not None:
+            return JSONResponse(cached)
     res = await adb.mark_order_shipped(order_id, user["id"], name)
     if not res.get("ok"):
         raise HTTPException(status_code=409, detail=res.get("error", "не удалось отгрузить"))
@@ -2308,7 +2363,10 @@ async def api_orders_ship(request: Request):
             await bot.send_message(creator, f"🚚 Ваш заказ #{order_id} отгружен.")
         except Exception:
             logger.warning("order ship notify failed", exc_info=True)
-    return JSONResponse({"ok": True, "order_id": order_id})
+    resp = {"ok": True, "order_id": order_id}
+    if idem_key:
+        _idem_set(f"order_ship:{user['id']}:{idem_key}", resp)
+    return JSONResponse(resp)
 
 
 @app.post("/api/orders/cancel")
@@ -2486,6 +2544,13 @@ async def api_submit_order(request: Request):
     order = await adb.get_order(order_id)
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
+    # Idempotency: двойной сабмит мог создать две shipment_request до того, как
+    # статус заказа уйдёт из draft. Кэшируем финальный {req_id}.
+    idem_key = data.get("idempotency_key")
+    if idem_key:
+        cached = _idem_get(f"order_submit:{user['id']}:{idem_key}")
+        if cached is not None:
+            return JSONResponse(cached)
     from services.order_workflow import validate_transition
 
     err = validate_transition(order, "pending")
@@ -2562,7 +2627,10 @@ async def api_submit_order(request: Request):
     for uid in await aget_notify_recipients():
         await tg_send_message(uid, notify_text, reply_markup=keyboard)
 
-    return JSONResponse({"req_id": req_id})
+    resp = {"req_id": req_id}
+    if idem_key:
+        _idem_set(f"order_submit:{user['id']}:{idem_key}", resp)
+    return JSONResponse(resp)
 
 
 @app.post("/api/agents")
