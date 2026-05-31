@@ -101,8 +101,16 @@ Telegram, руководители одобряют отгрузки и подт
 | `TZ` | `Asia/Tashkent` или другой |
 | `ENABLE_SCHEDULED_REPORTS` | `0` чтобы отчёты не дублировались с cron-сервисом |
 | `PG_POOL_MIN`, `PG_POOL_MAX` | Размер пула коннектов Postgres (default 1/10) |
-| `SENTRY_DSN` | Если задан — exceptions/warnings идут в Sentry (PII scrubbed) |
+| `SENTRY_DSN` | Если задан — exceptions/warnings идут в Sentry (PII scrubbed). `sentry-sdk` уже в deps, активация = только эта переменная |
 | `BACKUP_TG_CHAT_ID` | ID приватного TG-канала для ежедневного backup БД |
+| `GOOGLE_DRIVE_FOLDER_ID` + `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON` | Если заданы — `run_maintenance` грузит архив аудита в Drive. Библиотеки (`google-api-python-client`, `google-auth`) уже в deps; без креды — no-op |
+
+> **Активация опциональных интеграций — только ops (кода не требуют):**
+> - **Sentry**: задать `SENTRY_DSN` в Railway Shared Variables → перезапуск.
+> - **Drive-архив аудита**: создать сервис-аккаунт Google, выдать ему доступ к
+>   папке, прокинуть `GOOGLE_DRIVE_FOLDER_ID` + `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON`.
+> - **Telegram webhook** (вместо polling): `TG_USE_WEBHOOK=1` + `TG_WEBHOOK_SECRET`
+>   при заданном публичном `WEBAPP_URL`. Деплой-решение — держите откат на polling.
 
 ## Backup БД в Telegram-канал
 
