@@ -296,14 +296,28 @@ async function renderHome() {
   const isBoss = data.role === 'admin' || data.role === 'boss';
   const mo = data.my_orders;
 
-  // ─── Hero: большая «балансовая» цифра + кратко ───────
+  // ─── Приветствие по времени суток ───────────────────
+  const hh = new Date().getHours();
+  const greetWord = hh < 5 ? 'Доброй ночи' : hh < 12 ? 'Доброе утро'
+    : hh < 18 ? 'Добрый день' : 'Добрый вечер';
+  const uname = (currentUser && (currentUser.first_name || currentUser.full_name || currentUser.name)) || '';
+  const greeting = `<div class="home-greeting">${greetWord}${uname ? ', ' + escapeHtml(uname) : ''}</div>`;
+
+  // ─── Hero: выручка за сегодня + тренд к вчера ────────
   const todayLabel = data.today.scope === 'personal' ? 'Моя выручка сегодня' : 'Выручка компании сегодня';
-  const heroSub = `${data.today.shipments} отгр. · ${data.today.clients} клиентов`;
+  const prevRev = data.today.prev_revenue || 0;
+  let heroDelta = `<div class="hero-delta">${data.today.shipments} отгр. · ${data.today.clients} клиентов</div>`;
+  if (prevRev > 0) {
+    const pct = Math.round((data.today.revenue - prevRev) / prevRev * 100);
+    const dir = pct > 0 ? 'up' : pct < 0 ? 'down' : '';
+    const arrow = pct > 0 ? '↑' : pct < 0 ? '↓' : '→';
+    heroDelta = `<div class="hero-delta ${dir}">${arrow} ${pct > 0 ? '+' : ''}${pct}% к вчера · ${data.today.shipments} отгр.</div>`;
+  }
   const hero = `
     <div class="hero">
       <div class="hero-label">${todayLabel}</div>
       <div class="hero-value">${fmt(data.today.revenue)}<span class="hero-currency">${cur}</span></div>
-      <div class="hero-delta">${heroSub}</div>
+      ${heroDelta}
     </div>
   `;
 
@@ -353,16 +367,27 @@ async function renderHome() {
   // ─── Босс: ожидающие заявки + лидерборд ─────────────
   let bossBlock = '';
   if (isBoss) {
-    if (data.pending_requests > 0) {
+    // Дашборд «Требует внимания»: всё, что ждёт действия босса, одним блоком
+    // с переходом в нужный раздел. Показываем только ненулевое.
+    const att = data.attention || {};
+    const attItems = [
+      { n: att.requests, label: 'Заявки на апрув', ic: 'clock', go: 'requests' },
+      { n: att.payments, label: 'Платежи на подтверждении', ic: 'cash', go: 'finance:payments' },
+      { n: att.deposits, label: 'Сдачи на подтверждении', ic: 'cashbox', go: 'finance:cashbox' },
+      { n: att.returns, label: 'Возвраты на подтверждении', ic: 'return', go: 'finance:cashbox' },
+      { n: att.debts, label: 'Открытые долги', ic: 'wallet', go: 'finance:debts' },
+    ].filter(x => x.n > 0);
+    if (attItems.length) {
       bossBlock += `
-        <div class="card" style="cursor:pointer;" id="go-requests">
-          <div style="display:flex; align-items:center; gap:12px;">
-            <div class="card-row-icon" style="background:var(--warn-bg); color:var(--warn);">${icon('clock')}</div>
-            <div style="flex:1;">
-              <div style="font-weight:600;">${data.pending_requests} заявок на апрув</div>
-              <div style="font-size:12px; color: var(--text-mute); margin-top:2px;">Нажмите чтобы открыть</div>
+        <div class="section-label">Требует внимания</div>
+        <div class="card-list">
+          ${attItems.map(x => `
+            <div class="card-row" data-att="${x.go}">
+              <div class="card-row-icon" style="background:var(--warn-bg); color:var(--warn);">${icon(x.ic)}</div>
+              <div class="card-row-info"><div class="card-row-title">${x.label}</div></div>
+              <span class="stock-badge badge-yellow">${x.n}</span>
             </div>
-          </div>
+          `).join('')}
         </div>
       `;
     }
@@ -429,7 +454,7 @@ async function renderHome() {
     `;
   }
 
-  content.innerHTML = hero + actions + linkWarning + bossBlock + ordersBlock;
+  content.innerHTML = greeting + hero + actions + linkWarning + bossBlock + ordersBlock;
 
   // Action-grid → переход на нужный таб (и опционально открыть новый заказ)
   document.querySelectorAll('[data-go]').forEach(btn => {
@@ -456,13 +481,21 @@ async function renderHome() {
     });
   });
 
-  // Клик по карточке «N заявок на апрув» → экран заявок (не просто список).
-  const goReq = document.getElementById('go-requests');
-  if (goReq) goReq.addEventListener('click', () => {
-    showScreen('orders');
-    if (typeof renderPendingRequests === 'function') {
-      setTimeout(renderPendingRequests, 50);
-    }
+  // Дашборд «Требует внимания» → переход в нужный раздел.
+  document.querySelectorAll('[data-att]').forEach(row => {
+    row.addEventListener('click', () => {
+      haptic();
+      const go = row.dataset.att;
+      if (go === 'requests') {
+        showScreen('orders');
+        if (typeof renderPendingRequests === 'function') setTimeout(renderPendingRequests, 50);
+        return;
+      }
+      if (go.indexOf('finance:') === 0) {
+        financeTab = go.slice('finance:'.length);   // глоб. состояние вкладки финансов
+        showScreen('finance');
+      }
+    });
   });
 
   // Клик по строке недавнего заказа → Заказы
