@@ -234,41 +234,77 @@ async def _handle_customerorder_updated(co_id: str) -> None:
 async def _handle_customerorder_deleted(co_id: str) -> None:
     """Заказ покупателя удалён в МойСклад.
 
-    Снимаем ссылку ms_customerorder_id с локального заказа, уведомляем
-    boss/admin. При следующем одобрении заявки будет создан новый документ.
+    Если локальный заказ ещё `approved` (документ создан, но не отгружён) —
+    ОТМЕНЯЕМ его локально, чтобы бот не показывал «живой» заказ, которого в МС
+    уже нет. `ms_cancel_synced_at` выставляем сразу (реверс в МС не нужен —
+    документ уже удалён). Для shipped/paid (деньги/остатки уже двигались) статус
+    НЕ трогаем — только снимаем ссылку и предупреждаем boss/admin для ручной
+    разборки. (cancel_order разрешает переход только из approved.)
     """
-    from services.notifier import aget_notify_recipients, tg_send_message
-
     order = await adb.find_order_by_ms_customerorder_id(co_id)
     if not order:
         return
+    await apply_ms_customerorder_delete(order, co_id)
+
+
+async def apply_ms_customerorder_delete(order: dict, co_id: str) -> None:
+    """Применить «CO удалён в МС» к локальному заказу. Общий путь для вебхука
+    (customerorder.DELETE) и cron-реконсиляции (tasks/run_ms_reconcile). approved
+    → отмена локально (idempotent через cancel_order WHERE status='approved');
+    иначе — снять ссылку + предупредить."""
+    from services.notifier import aget_notify_recipients, tg_send_message
+    from utils.helpers import esc
 
     order_id = order["id"]
+    status = order.get("status", "")
+    agent = esc(order.get("agent_name") or "—")
+
+    if status == "approved":
+        res = await adb.cancel_order(
+            order_id, 0, "МойСклад", "Заказ покупателя удалён в МойСклад"
+        )
+        if res.get("ok"):
+            # Документ в МС уже удалён → reverse не нужен, помечаем синком.
+            await adb.set_order_ms_cancel_synced(order_id)
+        await adb.clear_order_ms_customerorder_id(order_id)
+        await adb.add_audit_log(
+            0,
+            "МойСклад",
+            "system",
+            "ms_customerorder_deleted",
+            f"CO {co_id} удалён в МС → заказ #{order_id} отменён локально (был approved).",
+        )
+        text = (
+            f"⚠️ <b>Заказ покупателя удалён в МойСклад</b>\n\n"
+            f"Заказ #{order_id} (клиент: {agent}) был <b>approved</b> — "
+            f"автоматически отменён в боте (статус → cancelled)."
+        )
+        for uid in await aget_notify_recipients():
+            await tg_send_message(uid, text)
+        logger.info("customerorder.DELETE %s → заказ #%d отменён локально", co_id, order_id)
+        return
+
+    # Не approved (shipped/paid/cancelled/…): статус не трогаем, только ссылка.
     await adb.clear_order_ms_customerorder_id(order_id)
     await adb.add_audit_log(
         0,
         "МойСклад",
         "system",
         "ms_customerorder_deleted",
-        (
-            f"Заказ покупателя ms_customerorder_id={co_id} удалён в МойСклад. "
-            f"Ссылка с заказа #{order_id} снята."
-        ),
+        f"CO {co_id} удалён в МС → заказ #{order_id} (status={status}): ссылка снята, "
+        f"статус не тронут (требует ручной проверки).",
     )
-
-    agent = order.get("agent_name") or "—"
+    text = (
+        f"⚠️ <b>Заказ покупателя удалён в МойСклад</b>\n\n"
+        f"Заказ #{order_id} (клиент: {agent}), локальный статус: <b>{esc(status)}</b>.\n"
+        f"Документ удалён вручную в МС. Связь снята, но статус НЕ изменён "
+        f"(деньги/остатки могли двигаться) — проверьте вручную."
+    )
     for uid in await aget_notify_recipients():
-        await tg_send_message(
-            uid,
-            f"⚠️ <b>Заказ покупателя удалён в МойСклад</b>\n\n"
-            f"Заказ #{order_id} (клиент: {agent})\n\n"
-            f"Документ «Заказ покупателя» был удалён вручную в МойСклад. "
-            f"Связь сброшена — при повторном одобрении заявки бот "
-            f"создаст новый заказ покупателя автоматически.",
-        )
-
+        await tg_send_message(uid, text)
     logger.info(
-        "customerorder.DELETE %s → заказ #%d: ms_customerorder_id сброшен",
+        "customerorder.DELETE %s → заказ #%d (status=%s): только ссылка снята",
         co_id,
         order_id,
+        status,
     )
