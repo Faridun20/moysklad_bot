@@ -10,26 +10,31 @@ Telegram, руководители одобряют отгрузки и подт
 
 | Роль | Действия |
 |---|---|
-| **Менеджер** | Собирает заказы (товары + клиент + цены), отправляет на одобрение. Помечает оплаты по credit-заказам. Отдельные платежи в кассу через `/pay`. |
-| **Босс / админ** | Одобряет/отклоняет заявки на отгрузку. Подтверждает поступление денег в кассу. Видит долги, аналитику, аудит. |
-| **Админ** | Управляет ролями (`/addrole`), синхронизирует менеджеров с МойСклад, видит весь аудит. |
+| **Менеджер** | Собирает заказы (товары + клиент + цены), отправляет на одобрение. Помечает оплаты по credit-заказам. Сдаёт наличные (`/deposit`), оформляет возвраты (`/return`), платежи в кассу (`/pay`). |
+| **Босс** | Одобряет/отклоняет заявки (+ «✏️ На доработку», «✅ Одобрить с превышением лимита»). Подтверждает деньги. Кредит-лимиты (`/limit`), курсы (`/rates`), цены (`/prices`). Долги, аналитика (в т.ч. по менеджерам), аудит. |
+| **Бухгалтер** | Подтверждает сдачи наличных; ведёт цены/курсы. |
+| **Кладовщик** | Фиксирует отгрузку (`/ship`), обрабатывает возвраты, «товар получен». |
+| **Админ** | Всё выше + роли (`/addrole`), деактивация юзеров (`/deactivate`), `/frozen` (разморозка), синк с МойСклад, аудит. |
 
 **Главные сценарии:**
 - Менеджер → заказ → push боссу → одобрение → автоматическое создание `customerorder` + `demand` в МойСклад с PDF печатной формой в чате
-- Учёт долгов с напоминаниями: ежедневно в 9:00 каждый менеджер получает свои неоплаченные, босс — сводку по компании
-- Частичные оплаты: клиент платит частями, бот ведёт остаток
-- Двухступенчатое подтверждение: менеджер отметил «деньги получил» → босс жмёт «Принять» → автоматически создаётся `paymentin` в МойСклад
-- Sales-аналитика: ежедневные, еженедельные, месячные отчёты (Cron Jobs)
+- **Reject→draft + freeze:** босс возвращает заявку на доработку с причиной; после 3 циклов заказ замораживается до разморозки админом
+- **Кредит-лимиты с энфорсом:** превышение лимита требует явного одобрения «с превышением» (в аудите)
+- **Возвраты** (полные/частичные) → «Возврат покупателя» в МойСклад; **сдачи наличных** закрывают заказы (FIFO)
+- Учёт долгов с напоминаниями: ежедневно в 9:00 менеджер — свои неоплаченные, босс — сводку (+ единый остаток «≈ X USD» по всем валютам)
+- Частичные оплаты; двухступенчатое подтверждение → `paymentin` в МойСклад
+- **Синхронизация удаления:** удалил заказ покупателя в МойСклад → бот отменяет локальный (вебхук + ежечасная реконсиляция)
+- **Аналитика:** ежедневные/недельные/месячные отчёты (Cron) + WebApp-дашборд с разрезом **по менеджерам** (заказы/выручка/долг)
 
 ## Стек
 
 - **Python 3.11**, asyncio
 - **aiogram 3.7** — Telegram Bot API, FSM с Redis или MemoryStorage
 - **FastAPI + uvicorn** — WebApp (Telegram Mini App)
-- **PostgreSQL** через `psycopg2-binary` с `ThreadedConnectionPool`. Async-обёртка через `asyncio.to_thread` для FastAPI endpoint'ов.
+- **PostgreSQL**: денежное ядро (заказы/платежи/кредит/сдачи/возвраты) — на **`asyncpg`** (native async, `services/adb_core.py`; в тестах `aiosqlite`). Остальное — `psycopg2-binary` + `ThreadedConnectionPool`, обёрнут в `asyncio.to_thread`.
 - **Redis** (опционально) — FSM storage и кэши
-- **МойСклад REST API 1.2** — отгрузки, заказы покупателей, входящие платежи, справочники
-- **Деплой**: [Railway](https://railway.app), Nixpacks билд
+- **МойСклад REST API 1.2** — отгрузки, заказы покупателей, входящие платежи, справочники, webhook'и (создание/изменение/удаление документов)
+- **Деплой**: [Railway](https://railway.app), **Railpack** билд (`railway.json`)
 
 ## Быстрый старт
 
@@ -118,8 +123,8 @@ Telegram, руководители одобряют отгрузки и подт
 **Мониторинг:** `tasks/run_backup` интегрирован с `cron_runs` — если backup не прошёл, `cron-ops` дайджест покажет «🛑 backup: failed».
 
 **Два режима дампа:**
-1. **pg_dump** (full schema + data) — если postgresql client есть в образе (`nixpacks.toml` добавляет `postgresql_16`)
-2. **pure-Python COPY-dump** (data-only) — fallback через psycopg2, если `pg_dump` отсутствует. Работает без системных бинарей.
+1. **pg_dump** (full schema + data) — если postgresql client есть в образе (Railpack `railway.json` → `deploy.aptPackages: [postgresql-client]`)
+2. **pure-Python COPY-dump** (data-only) — fallback через psycopg2/libpq, если `pg_dump` **отсутствует** ИЛИ **упал** (частый кейс: `server version mismatch` — managed-Postgres новее, чем pg_dump из apt). Версионно-независим, работает без системных бинарей.
 
 **Восстановление:**
 ```bash
@@ -141,24 +146,30 @@ psql $DATABASE_URL < moysklad-bot-postgres-YYYYMMDD-HHMMSS.sql
 - `/start` — главное меню (открыть WebApp / «Мои заказы» / «Создать заказ»)
 - `/neworder` — быстро создать новый заказ
 - `/myorders` — мои заказы
-- `/pay` — отправить платёж в кассу (не привязан к заказу)
+- `/pay` — платёж в кассу (не привязан к заказу)
+- `/deposit` — сдать наличные в кассу (`/my_deposits` — мои сдачи)
+- `/return` — оформить возврат
 - `/debts` — мои открытые долги
+- `/find` — поиск (заказ / платёж / клиент)
 
-### Босс / админ
-- Всё перечисленное выше +
-- `/orders` — все заказы компании
-- `/shipments` — последние отгрузки в МойСклад
-- `/analytics` — аналитика продаж
-- `/audit` — аудит-лог действий
-- `/sync_payments` — статус синхронизации платежей с МойСклад (+ кнопка Retry)
-- `/snapshot` — статистика локального кэша МойСклад
-- `/refresh` — принудительно обновить snapshot
+### Босс
+- Всё выше +
+- `/orders` — заявки на апрув · `/ship` — отгрузить · `/shipments` — отгрузки
+- `/cancel` — отменить заказ
+- `/analytics` — аналитика (по менеджерам в WebApp) · `/cashbox` — касса/дебиторка · `/reports`
+- `/limit` — кредитные лимиты · `/rates` — курсы валют · `/prices` — цены товаров
+- `/audit` — аудит-лог · `/sync_payments` — статус синка (+ Retry)
+- `/snapshot`, `/refresh` — кэш МойСклад
+
+### Бухгалтер / кладовщик
+- Бухгалтер: `/deposits` — сдачи на подтверждении
+- Кладовщик: `/returns` — возвраты на подтверждении, `/ship`, `/return`
 
 ### Только админ
-- `/addrole <user_id> <admin|boss|manager|guest>` — назначить роль
-- `/users` — список пользователей
-- `/syncms` — синхронизировать менеджеров с сотрудниками МойСклад
-- `/msstaff` — список сотрудников из МойСклад
+- `/addrole <user_id> <admin|boss|manager|bookkeeper|warehouse_keeper|guest>` — роль
+- `/users` — список · `/deactivate <id>` / `/reactivate <id>` — доступ
+- `/frozen` — замороженные заказы (разморозка)
+- `/syncms`, `/msstaff` — синхронизация с сотрудниками МойСклад
 
 ## Структура репо
 
@@ -181,9 +192,14 @@ psql $DATABASE_URL < moysklad-bot-postgres-YYYYMMDD-HHMMSS.sql
 │   └── log.py                Логи в чате (/log)
 │
 ├── services/                 Бизнес-логика и интеграции
-│   ├── database.py           Postgres/SQLite + ThreadedConnectionPool
-│   ├── async_db.py           Async-обёртка для FastAPI (через to_thread)
-│   ├── roles.py              Роли + TTL-кэш на 60с
+│   ├── database.py           Postgres/SQLite + ThreadedConnectionPool (sync-часть)
+│   ├── adb_core.py           Native async DB (asyncpg/aiosqlite) — денежное ядро
+│   ├── async_db.py           Async-обёртка для sync-функций (через to_thread)
+│   ├── money.py              Деньги в копейках (*_cents), конвертация
+│   ├── roles.py              Роли + TTL-кэш на 60с + деактивация
+│   ├── ms_cancel.py          Реверс customerorder при отмене заказа
+│   ├── ms_returns.py         «Возврат покупателя» (salesreturn)
+│   ├── audit_archive.py      Экспорт аудита → Google Drive (gated)
 │   ├── moysklad.py           Базовый HTTP-клиент МойСклад
 │   ├── ms_demand.py          Создание отгрузок (demand)
 │   ├── ms_customerorder.py   Создание заказов покупателей + PDF
@@ -198,10 +214,15 @@ psql $DATABASE_URL < moysklad-bot-postgres-YYYYMMDD-HHMMSS.sql
 │   └── rate_limit.py         In-memory rate-limiter
 │
 ├── tasks/                    Фоновые задачи + CLI для Railway Cron
+│   ├── migrate.py            Schema + data миграции (ДО старта сервисов)
 │   ├── scheduled.py          In-process daily/weekly/monthly отчёты
-│   ├── run_report.py         CLI: `python -m tasks.run_report daily`
+│   ├── run_report.py         CLI: отчёты `python -m tasks.run_report daily`
 │   ├── run_debts_notify.py   CLI: утреннее напоминание о долгах
-│   └── run_ms_sync_retry.py  CLI: ретрай failed paymentin-синков
+│   ├── run_ms_sync_retry.py  CLI: ретрай failed paymentin-синков
+│   ├── run_ms_reconcile.py   CLI: реконсиляция удалённых в МС заказов
+│   ├── run_ops_monitor.py    CLI: операционный дайджест с кнопками
+│   ├── run_maintenance.py    CLI: janitor (архив аудита, чистка)
+│   └── run_backup.py         CLI: дамп БД → приватный TG-канал
 │
 ├── webapp/                   FastAPI + статика (Telegram Mini App)
 │   ├── server.py             API endpoint'ы
