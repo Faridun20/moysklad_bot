@@ -90,91 +90,101 @@ async def _fetch_all(path: str, params: dict | None = None) -> list[dict]:
 
 async def refresh_products() -> int:
     rows = await _fetch_all("entity/product")
+    ts = now_str()
+    values = [
+        (
+            ms_id,
+            r.get("name", ""),
+            extract_id_from_href(extract_href(r, "productFolder")),
+            r.get("code", "") or r.get("article", ""),
+            safe_get(r, "uom", "name", default="шт"),
+            extract_href(r),
+            ts,
+        )
+        for r in rows
+        if (ms_id := (r.get("id") or extract_id_from_href(extract_href(r))))
+    ]
     async with adb_core.transaction() as tx:
         await tx.execute("DELETE FROM ms_products")
-        for r in rows:
-            ms_id = r.get("id") or extract_id_from_href(extract_href(r))
-            if not ms_id:
-                continue
-            await tx.execute(
-                "INSERT INTO ms_products (ms_id, name, folder_id, code, unit, href, updated_at) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                ms_id,
-                r.get("name", ""),
-                extract_id_from_href(extract_href(r, "productFolder")),
-                r.get("code", "") or r.get("article", ""),
-                safe_get(r, "uom", "name", default="шт"),
-                extract_href(r),
-                now_str(),
-            )
-    await meta_set("products", last_full_refresh=now_str(), rows_count=len(rows), status="ok")
-    logger.info("snapshot.refresh_products: %d rows", len(rows))
-    return len(rows)
+        await tx.executemany(
+            "INSERT INTO ms_products (ms_id, name, folder_id, code, unit, href, updated_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            values,
+        )
+    await meta_set("products", last_full_refresh=ts, rows_count=len(values), status="ok")
+    logger.info("snapshot.refresh_products: %d rows", len(values))
+    return len(values)
 
 
 async def refresh_categories() -> int:
     rows = await _fetch_all("entity/productfolder")
+    ts = now_str()
+    values = [
+        (
+            ms_id,
+            r.get("name", ""),
+            extract_id_from_href(extract_href(r, "productFolder")),
+            extract_href(r),
+            ts,
+        )
+        for r in rows
+        if (ms_id := (r.get("id") or extract_id_from_href(extract_href(r))))
+    ]
     async with adb_core.transaction() as tx:
         await tx.execute("DELETE FROM ms_categories")
-        for r in rows:
-            ms_id = r.get("id") or extract_id_from_href(extract_href(r))
-            if not ms_id:
-                continue
-            await tx.execute(
-                "INSERT INTO ms_categories (ms_id, name, parent_id, href, updated_at) "
-                "VALUES ($1, $2, $3, $4, $5)",
-                ms_id,
-                r.get("name", ""),
-                extract_id_from_href(extract_href(r, "productFolder")),
-                extract_href(r),
-                now_str(),
-            )
-    await meta_set("categories", last_full_refresh=now_str(), rows_count=len(rows), status="ok")
-    logger.info("snapshot.refresh_categories: %d rows", len(rows))
-    return len(rows)
+        await tx.executemany(
+            "INSERT INTO ms_categories (ms_id, name, parent_id, href, updated_at) "
+            "VALUES ($1, $2, $3, $4, $5)",
+            values,
+        )
+    await meta_set("categories", last_full_refresh=ts, rows_count=len(values), status="ok")
+    logger.info("snapshot.refresh_categories: %d rows", len(values))
+    return len(values)
 
 
 async def refresh_counterparties() -> int:
     rows = await _fetch_all("entity/counterparty", params={"order": "name"})
+    ts = now_str()
+    values = [
+        (
+            ms_id,
+            r.get("name", ""),
+            r.get("phone", "") or "",
+            extract_href(r),
+            ts,
+        )
+        for r in rows
+        if (ms_id := (r.get("id") or extract_id_from_href(extract_href(r))))
+    ]
     async with adb_core.transaction() as tx:
         await tx.execute("DELETE FROM ms_counterparties")
-        for r in rows:
-            ms_id = r.get("id") or extract_id_from_href(extract_href(r))
-            if not ms_id:
-                continue
-            await tx.execute(
-                "INSERT INTO ms_counterparties (ms_id, name, phone, href, updated_at) "
-                "VALUES ($1, $2, $3, $4, $5)",
-                ms_id,
-                r.get("name", ""),
-                r.get("phone", "") or "",
-                extract_href(r),
-                now_str(),
-            )
-    await meta_set("counterparties", last_full_refresh=now_str(), rows_count=len(rows), status="ok")
-    logger.info("snapshot.refresh_counterparties: %d rows", len(rows))
-    return len(rows)
+        await tx.executemany(
+            "INSERT INTO ms_counterparties (ms_id, name, phone, href, updated_at) "
+            "VALUES ($1, $2, $3, $4, $5)",
+            values,
+        )
+    await meta_set("counterparties", last_full_refresh=ts, rows_count=len(values), status="ok")
+    logger.info("snapshot.refresh_counterparties: %d rows", len(values))
+    return len(values)
 
 
 async def refresh_employees() -> int:
     rows = await _fetch_all("entity/employee")
+    ts = now_str()
+    values = [
+        (ms_id, r.get("name", ""), extract_href(r), ts)
+        for r in rows
+        if (ms_id := (r.get("id") or extract_id_from_href(extract_href(r))))
+    ]
     async with adb_core.transaction() as tx:
         await tx.execute("DELETE FROM ms_employees")
-        for r in rows:
-            ms_id = r.get("id") or extract_id_from_href(extract_href(r))
-            if not ms_id:
-                continue
-            await tx.execute(
-                "INSERT INTO ms_employees (ms_id, name, href, updated_at) "
-                "VALUES ($1, $2, $3, $4)",
-                ms_id,
-                r.get("name", ""),
-                extract_href(r),
-                now_str(),
-            )
-    await meta_set("employees", last_full_refresh=now_str(), rows_count=len(rows), status="ok")
-    logger.info("snapshot.refresh_employees: %d rows", len(rows))
-    return len(rows)
+        await tx.executemany(
+            "INSERT INTO ms_employees (ms_id, name, href, updated_at) VALUES ($1, $2, $3, $4)",
+            values,
+        )
+    await meta_set("employees", last_full_refresh=ts, rows_count=len(values), status="ok")
+    logger.info("snapshot.refresh_employees: %d rows", len(values))
+    return len(values)
 
 
 # ─── Рефреш остатков ──────────────────────────────────────────────────────────
@@ -194,28 +204,31 @@ async def refresh_stock() -> int:
             break
         offset += limit
 
+    ts = now_str()
+    values = [
+        (
+            ms_id,
+            r.get("name", ""),
+            extract_id_from_href(extract_href(r, "folder")),
+            safe_get(r, "folder", "name", default=""),
+            safe_get(r, "uom", "name", default="шт"),
+            r.get("stock", 0) or 0,
+            r.get("reserve", 0) or 0,
+            ts,
+        )
+        for r in rows
+        if (ms_id := extract_id_from_href(extract_href(r)))
+    ]
     async with adb_core.transaction() as tx:
         await tx.execute("DELETE FROM ms_stock")
-        for r in rows:
-            href = extract_href(r)
-            ms_id = extract_id_from_href(href)
-            if not ms_id:
-                continue
-            await tx.execute(
-                "INSERT INTO ms_stock (ms_id, name, folder_id, folder_name, unit, "
-                "stock, reserve, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                ms_id,
-                r.get("name", ""),
-                extract_id_from_href(extract_href(r, "folder")),
-                safe_get(r, "folder", "name", default=""),
-                safe_get(r, "uom", "name", default="шт"),
-                r.get("stock", 0) or 0,
-                r.get("reserve", 0) or 0,
-                now_str(),
-            )
-    await meta_set("stock", last_full_refresh=now_str(), rows_count=len(rows), status="ok")
-    logger.info("snapshot.refresh_stock: %d rows", len(rows))
-    return len(rows)
+        await tx.executemany(
+            "INSERT INTO ms_stock (ms_id, name, folder_id, folder_name, unit, "
+            "stock, reserve, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            values,
+        )
+    await meta_set("stock", last_full_refresh=ts, rows_count=len(values), status="ok")
+    logger.info("snapshot.refresh_stock: %d rows", len(values))
+    return len(values)
 
 
 # ─── Дебаунс рефреша при webhook'ах ──────────────────────────────────────────

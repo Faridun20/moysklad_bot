@@ -253,6 +253,15 @@ class _PgTxn:
     async def execute(self, q: str, *a: Any) -> int:
         return _rowcount_from_status(await self._c.execute(q, *a))
 
+    async def executemany(self, q: str, rows: list[tuple]) -> int:
+        """Батч-INSERT/UPDATE одним prepared-statement'ом (asyncpg.executemany).
+        Каждая строка биндится отдельно → нет лимита параметров на один
+        statement. Возвращает число переданных строк."""
+        if not rows:
+            return 0
+        await self._c.executemany(q, rows)
+        return len(rows)
+
 
 class _SqliteTxn:
     __slots__ = ("_c",)
@@ -281,3 +290,15 @@ class _SqliteTxn:
         sql, params = _to_sqlite(q, a)
         cur = await self._c.execute(sql, params)
         return cur.rowcount
+
+    async def executemany(self, q: str, rows: list[tuple]) -> int:
+        """Батч одним sqlite3.executemany. `$N` → `?` транслируем один раз;
+        порядок плейсхолдеров применяем к каждой строке (повтор/перестановка
+        $N поддержаны, как в _to_sqlite). Возвращает число строк."""
+        if not rows:
+            return 0
+        order = [int(m.group(1)) - 1 for m in _PARAM_RE.finditer(q)]
+        sql = _PARAM_RE.sub("?", q)
+        seq = [tuple(r[i] for i in order) for r in rows]
+        await self._c.executemany(sql, seq)
+        return len(rows)
