@@ -227,3 +227,29 @@ def test_return_create_idempotent_same_key(client_env, monkeypatch):
     # В БД ровно один pending-возврат по заказу.
     pend = [x for x in asyncio.run(db.get_pending_returns()) if x["order_id"] == oid]
     assert len(pend) == 1
+
+
+# ─── Перф: кэш флага деактивации (TTL 30с) с мгновенной инвалидацией ──────────
+
+
+def test_deact_cache_invalidated_on_deactivate_same_process(isolated_db):
+    """`_authorize` зовёт cached_is_deactivated на каждый запрос — это кэш с TTL,
+    а не SELECT каждый раз. Но deactivate_user должен инвалидировать кэш в своём
+    процессе, чтобы блок наступал мгновенно (не ждать TTL)."""
+    import services.roles as roles
+
+    db = isolated_db
+    db.set_role(300, "u", "U", "manager")
+
+    # Прогреваем деакт-кэш как «активен» (False закэширован).
+    assert roles.cached_is_deactivated(300) is False
+
+    # Деактивируем — _invalidate_role_cache внутри сбрасывает и деакт-кэш.
+    assert asyncio.run(db.deactivate_user(300, by=1)) is True
+
+    # Кэш сброшен → следующий вызов читает БД заново и видит деактивацию.
+    assert roles.cached_is_deactivated(300) is True
+
+    # Реактивация так же мгновенно снимает блок.
+    assert asyncio.run(db.reactivate_user(300, by=1)) is True
+    assert roles.cached_is_deactivated(300) is False
