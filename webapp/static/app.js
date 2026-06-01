@@ -2175,223 +2175,8 @@ function renderAnalyticsContent(data) {
   }
 }
 
-// ─── Экран: Платежи ─────────────────────────────────
-
-let paymentsCache = null;
-let paymentsPending = [];  // paid-заказы, ждущие подтверждения боссом
-
-async function renderPayments(container) {
-  container = container || document.getElementById('content');
-  container.innerHTML = loading('Загружаю историю…');
-
-  try {
-    const response = await fetch('/api/payments/history', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData: _initData }),
-    });
-    if (!response.ok) {
-      const err = await response.json();
-      throw new Error(err.detail || 'Ошибка');
-    }
-    paymentsCache = await response.json();
-  } catch (e) {
-    container.innerHTML = errorBox(e.message);
-    return;
-  }
-
-  // Для босса — подтянуть paid-заказы, ожидающие подтверждения оплаты.
-  // Менеджеру эндпоинт вернёт 403 — тихо пропускаем.
-  paymentsPending = [];
-  const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
-  if (isBoss) {
-    try {
-      const data = await api('/api/payments/pending', {});
-      paymentsPending = data.pending || [];
-    } catch { /* нет доступа / нет данных — блок просто не покажем */ }
-  }
-
-  renderPaymentsContent(container);
-}
-
-function renderPaymentsContent(container) {
-  container = container || document.getElementById('content');
-  const fmt = n => Math.round(n).toLocaleString('ru-RU');
-
-  const statusBadge = s => {
-    if (s === 'confirmed') return '<span class="stock-badge badge-green">принят</span>';
-    if (s === 'rejected')  return '<span class="stock-badge badge-red">отклонён</span>';
-    return '<span class="stock-badge badge-yellow">ожидает</span>';
-  };
-
-  const history = paymentsCache.payments.length === 0
-    ? '<div class="loader">Платежей пока нет</div>'
-    : paymentsCache.payments.map(p => `
-        <div class="stock-row">
-          <div class="stock-info">
-            <div class="stock-name">${fmt(p.amount)} ${p.currency} · ${p.comment}</div>
-            <div class="stock-folder">${p.created_at.slice(0, 16)}</div>
-          </div>
-          ${statusBadge(p.status)}
-        </div>
-      `).join('');
-
-  // Блок «На подтверждение» — paid-заказы с pending-оплатой (только босс).
-  const pendingHtml = paymentsPending.length === 0 ? '' : `
-    <div class="section-label section-awaiting">${icon('clock')} На подтверждение (${paymentsPending.length})</div>
-    <div class="debts-list">${paymentsPending.map(d => `
-      <div class="debt-card debt-awaiting">
-        <div class="debt-card-top">
-          <div class="debt-agent">🏢 ${escapeHtml(d.agent_name)}</div>
-          <div class="debt-amount">${fmt(d.pending)} ${escapeHtml(d.currency)}</div>
-        </div>
-        <div class="debt-card-mid">
-          <span class="debt-meta">#${d.order_id} · из ${fmt(d.total)} ${escapeHtml(d.currency)} · ${d.items_count} поз. · ${escapeHtml(d.full_name)}</span>
-        </div>
-        ${(d.items || []).length ? `<div class="debt-items-preview">${icon('box')} ${d.items.slice(0, 2).map(it => escapeHtml(it.name) + ' ×' + it.quantity).join(', ')}${d.items_count > 2 ? ' +' + (d.items_count - 2) : ''}</div>` : ''}
-        <div class="debt-actions">
-          <button class="btn-confirm-pay" data-id="${d.order_id}">${icon('check')} Подтвердить</button>
-          <button class="btn-reject-pay"  data-id="${d.order_id}">${icon('close')} Отклонить</button>
-        </div>
-      </div>
-    `).join('')}</div>
-  `;
-
-  // Руководитель только получает и подтверждает оплаты — ручной ввод
-  // «Нового платежа» (аренда и т.п.) ему не нужен; это операция
-  // бухгалтера/менеджера. Поэтому форму боссу/админу не показываем.
-  const isBossPay = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
-  const payFormHtml = isBossPay ? '' : `
-    <div class="section-label">Новый платёж (не связан с заказом)</div>
-    <div class="card">
-      <div class="form-row">
-        <label class="form-label">Сумма</label>
-        <input type="number" id="pay-amount" class="form-input" placeholder="1500" inputmode="decimal">
-      </div>
-      <div class="form-row">
-        <label class="form-label">Валюта</label>
-        <div class="cur-row">
-          ${['USD', 'UZS', 'RUB', 'EUR'].map((c, i) =>
-            `<button class="cur-btn ${i === 0 ? 'active' : ''}" data-cur="${c}">${c}</button>`
-          ).join('')}
-        </div>
-      </div>
-      <div class="form-row">
-        <label class="form-label">Комментарий</label>
-        <input type="text" id="pay-comment" class="form-input" placeholder="За май, оплата аренды">
-      </div>
-      <button id="pay-submit" class="btn-primary">Отправить</button>
-      <div id="pay-status" class="pay-status"></div>
-    </div>
-  `;
-
-  container.innerHTML = `
-    ${pendingHtml}
-    ${payFormHtml}
-    <div class="section-label">История платежей</div>
-    <div class="stock-list">${history}</div>
-  `;
-
-  // Выбор валюты — селекторы в рамках container
-  let selectedCurrency = 'USD';
-  container.querySelectorAll('.cur-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      container.querySelectorAll('.cur-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      selectedCurrency = btn.dataset.cur;
-    });
-  });
-
-  // Отправка (форма есть только у не-босса — иначе обработчик не вешаем)
-  container.querySelector('#pay-submit')?.addEventListener('click', async () => {
-    const amount = parseFloat(container.querySelector('#pay-amount').value);
-    const comment = container.querySelector('#pay-comment').value.trim();
-    const status = container.querySelector('#pay-status');
-    const submit = container.querySelector('#pay-submit');
-
-    if (!amount || amount <= 0) {
-      status.textContent = '❌ Введите сумму';
-      status.className = 'pay-status pay-error';
-      return;
-    }
-    if (!comment) {
-      status.textContent = '❌ Укажите комментарий';
-      status.className = 'pay-status pay-error';
-      return;
-    }
-
-    submit.disabled = true;
-    status.textContent = '⏳ Отправка…';
-    status.className = 'pay-status';
-
-    try {
-      const response = await fetch('/api/payments/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          initData: _initData,
-          amount, currency: selectedCurrency, comment,
-        }),
-      });
-      if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.detail || 'Ошибка');
-      }
-
-      tg.HapticFeedback?.notificationOccurred('success');
-      status.textContent = '✅ Платёж отправлен на подтверждение';
-      status.className = 'pay-status pay-ok';
-      container.querySelector('#pay-amount').value = '';
-      container.querySelector('#pay-comment').value = '';
-      paymentsCache = null;
-      setTimeout(() => renderPayments(container), 1500);
-    } catch (e) {
-      status.textContent = '❌ ' + e.message;
-      status.className = 'pay-status pay-error';
-    } finally {
-      submit.disabled = false;
-    }
-  });
-
-  // Подтверждение/отклонение оплаты по paid-заказам (блок «На подтверждение»).
-  // Реюз тех же эндпоинтов, что и в «Долги».
-  container.querySelectorAll('.btn-confirm-pay').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const id = parseInt(btn.dataset.id);
-      tg.showConfirm('Подтверждаете поступление оплаты по этому заказу?', async ok => {
-        if (!ok) return;
-        btn.disabled = true;
-        try {
-          await api('/api/orders/confirm_payment', { order_id: id, idempotency_key: idemKey() });
-          tg.HapticFeedback?.notificationOccurred('success');
-          await renderPayments(container);
-        } catch (e) {
-          tg.HapticFeedback?.notificationOccurred('error');
-          tg.showAlert('❌ ' + e.message);
-          btn.disabled = false;
-        }
-      });
-    });
-  });
-  container.querySelectorAll('.btn-reject-pay').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const id = parseInt(btn.dataset.id);
-      tg.showConfirm('Отклонить оплату по этому заказу?', async ok => {
-        if (!ok) return;
-        btn.disabled = true;
-        try {
-          await api('/api/orders/reject_payment', { order_id: id, idempotency_key: idemKey() });
-          tg.HapticFeedback?.notificationOccurred('warning');
-          await renderPayments(container);
-        } catch (e) {
-          tg.HapticFeedback?.notificationOccurred('error');
-          tg.showAlert('❌ ' + e.message);
-          btn.disabled = false;
-        }
-      });
-    });
-  });
-}
+// (Экран «Платежи» удалён: подтверждение оплат, история движения денег и
+//  ручной платёж объединены во вкладку «Касса» — см. renderCashbox.)
 
 function initNav() {
   document.querySelectorAll('.nav-item').forEach(btn => {
@@ -2436,12 +2221,15 @@ async function renderFinance() {
   // «Касса» — подтверждающие (сдачи/возвраты) и менеджеры (сдают наличные).
   const canCashbox = isBoss || role === 'bookkeeper' || role === 'warehouse_keeper' || role === 'manager';
 
+  // «Платежи» объединены с «Кассой» (всё движение денег в одном месте) —
+  // старый/внешний вызов с financeTab='payments' перенаправляем в кассу.
+  if (financeTab === 'payments') financeTab = 'cashbox';
   // Гард: недоступные разделы откатываем на «Долги» (эндпоинты всё равно 403).
   if (financeTab === 'limits' && !isBoss) financeTab = 'debts';
   if (financeTab === 'cashbox' && !canCashbox) financeTab = 'debts';
 
   // Уточняем под-раздел в шапке: «Финансы · Касса» и т.п.
-  const FIN_LABELS = { debts: 'Долги', payments: 'Платежи', cashbox: 'Касса', limits: 'Лимиты' };
+  const FIN_LABELS = { debts: 'Долги', cashbox: 'Касса', limits: 'Лимиты' };
   setScreenContext(`Финансы · ${FIN_LABELS[financeTab] || ''}`);
 
   const active = t => (financeTab === t ? 'active' : '');
@@ -2450,10 +2238,7 @@ async function renderFinance() {
   // с иконками клиппятся на узком экране (это и был «сломанный» вид у
   // руководителя: 3 пилюли + отдельная по стилю ссылка «Лимиты»). «Лимиты»
   // теперь равноправная 4-я вкладка.
-  const sections = [
-    { key: 'debts', label: 'Долги' },
-    { key: 'payments', label: 'Платежи' },
-  ];
+  const sections = [{ key: 'debts', label: 'Долги' }];
   if (canCashbox) sections.push({ key: 'cashbox', label: 'Касса' });
   if (isBoss) sections.push({ key: 'limits', label: 'Лимиты' });
 
@@ -2481,10 +2266,8 @@ async function renderFinance() {
     await renderDebts(body);
   } else if (financeTab === 'limits') {
     await renderCreditLimits(body);
-  } else if (financeTab === 'cashbox') {
-    await renderCashbox(body);
   } else {
-    await renderPayments(body);
+    await renderCashbox(body);
   }
 }
 
@@ -2498,14 +2281,22 @@ async function renderCashbox(container) {
   // и «Мои сдачи» не нужны (бессмысленный self-deposit).
   const canDeposit = role === 'manager' || role === 'warehouse_keeper';
 
+  const isBoss = role === 'admin' || role === 'boss';
+
   // Каждый список может вернуть 403 (роль не видит) — тихо пропускаем.
   let deposits = [];
   let returns = [];
   let myDeposits = [];
+  let payPending = [];   // paid-заказы с pending-оплатой (подтверждает босс)
+  let cashHistory = [];  // единая лента движения денег (босс)
   try { deposits = (await api('/api/deposits/pending', {})).deposits || []; } catch {}
   try { returns = (await api('/api/returns/pending', {})).returns || []; } catch {}
   if (canDeposit) {
     try { myDeposits = (await api('/api/deposits/my', {})).deposits || []; } catch {}
+  }
+  if (isBoss) {
+    try { payPending = (await api('/api/payments/pending', {})).pending || []; } catch {}
+    try { cashHistory = (await api('/api/cash/history', {})).history || []; } catch {}
   }
 
   const depCards = deposits.map(d => {
@@ -2545,12 +2336,60 @@ async function renderCashbox(container) {
       </div>
   `).join('');
 
+  // Платежи по paid-заказам, ждущие подтверждения боссом (раньше — вкладка
+  // «Платежи»; теперь часть «Подтверждений» кассы).
+  const payCards = payPending.map(d => `
+      <div class="debt-card debt-awaiting" data-pay="${d.order_id}">
+        <div class="debt-card-top">
+          <div class="debt-agent">🏢 ${escapeHtml(d.agent_name || '—')}</div>
+          <div class="debt-amount">${fmt(d.pending)} ${escapeHtml(d.currency || 'USD')}</div>
+        </div>
+        <div class="debt-card-mid">
+          <span class="debt-meta">Заказ #${d.order_id} · из ${fmt(d.total)} ${escapeHtml(d.currency || 'USD')} · ${escapeHtml(d.full_name || '')}</span>
+        </div>
+        <div class="debt-actions">
+          <button class="btn-confirm-pay pay-confirm" data-id="${d.order_id}">${icon('check')} Подтвердить оплату</button>
+          <button class="btn-reject-pay pay-reject" data-id="${d.order_id}">${icon('close')} Отклонить</button>
+        </div>
+      </div>
+  `).join('');
+
+  const payBlock = payPending.length
+    ? `<div class="section-label section-awaiting">${icon('clock')} Оплаты на подтверждении (${payPending.length})</div><div class="debts-list">${payCards}</div>`
+    : '';
   const depBlock = deposits.length
     ? `<div class="section-label">💵 Сдачи на подтверждении (${deposits.length})</div><div class="debts-list">${depCards}</div>`
     : '';
   const retBlock = returns.length
     ? `<div class="section-label">${icon('return')} Возвраты на подтверждении (${returns.length})</div><div class="debts-list">${retCards}</div>`
     : '';
+
+  // История движения денег (босс): платежи + сдачи + возвраты единой лентой.
+  const KIND_META = {
+    payment: { ic: 'cash', label: 'Платёж' },
+    deposit: { ic: 'cashbox', label: 'Сдача' },
+    return: { ic: 'return', label: 'Возврат' },
+  };
+  const histStatus = s => s === 'confirmed'
+    ? '<span class="stock-badge badge-green">принят</span>'
+    : s === 'rejected' ? '<span class="stock-badge badge-red">отклонён</span>'
+    : '<span class="stock-badge badge-yellow">ожидает</span>';
+  const historyRows = cashHistory.map(h => {
+    const m = KIND_META[h.kind] || { ic: 'cash', label: h.kind };
+    const ord = h.order_id ? ` · заказ #${h.order_id}` : '';
+    return `
+      <div class="stock-row">
+        <div class="card-row-icon">${icon(m.ic)}</div>
+        <div class="stock-info">
+          <div class="stock-name">${m.label} · ${fmt(h.amount)} ${escapeHtml(h.currency || 'USD')}</div>
+          <div class="stock-folder">${escapeHtml(h.who || '')} · ${escapeHtml(h.created_at || '')}${ord}</div>
+        </div>
+        ${histStatus(h.status)}
+      </div>`;
+  }).join('');
+  const historyBlock = cashHistory.length
+    ? `<div class="stock-list">${historyRows}</div>`
+    : '<div class="loader">Движений пока нет</div>';
 
   // Блок «сдать наличные» + «мои сдачи» — только для тех, кто физически сдаёт
   // (менеджер/кладовщик). Боссу/бухгалтеру self-deposit бессмысленен.
@@ -2582,6 +2421,32 @@ async function renderCashbox(container) {
       : '';
   }
 
+  // Ручной платёж (не связан с заказом: аренда и т.п.) — для не-боссов
+  // (бухгалтер/менеджер/кладовщик). Босс только подтверждает, ему не нужен.
+  const payFormBlock = !isBoss ? `
+      <div class="section-label">Новый платёж (не связан с заказом)</div>
+      <div class="card">
+        <div class="form-row">
+          <label class="form-label">Сумма</label>
+          <input type="number" id="pay-amount" class="form-input" placeholder="1500" inputmode="decimal">
+        </div>
+        <div class="form-row">
+          <label class="form-label">Валюта</label>
+          <div class="cur-row">
+            ${['USD', 'UZS', 'RUB', 'EUR'].map((c, i) =>
+              `<button class="cur-btn ${i === 0 ? 'active' : ''}" data-cur="${c}">${c}</button>`
+            ).join('')}
+          </div>
+        </div>
+        <div class="form-row">
+          <label class="form-label">Комментарий</label>
+          <input type="text" id="pay-comment" class="form-input" placeholder="За май, оплата аренды">
+        </div>
+        <button id="pay-submit" class="btn-primary">Отправить</button>
+        <div id="pay-status" class="pay-status"></div>
+      </div>
+  ` : '';
+
   // Блок оформления возврата (менеджер/кладовщик/босс).
   const canReturn = ['admin', 'boss', 'warehouse_keeper', 'manager'].includes(role);
   const returnBlock = canReturn ? `
@@ -2612,15 +2477,17 @@ async function renderCashbox(container) {
   // сразу, а не за тремя формами. Набор вкладок зависит от роли.
   const isConfirmer = ['admin', 'boss', 'bookkeeper', 'warehouse_keeper'].includes(role);
   const canCreateDeposit = canDeposit;
-  const hasOps = canCreateDeposit || canReturn;
+  const hasOps = canCreateDeposit || canReturn || !!payFormBlock;
 
   const tabs = [];
   if (isConfirmer) {
-    const pendN = deposits.length + returns.length;
+    const pendN = deposits.length + returns.length + payPending.length;
     tabs.push({ key: 'confirm', ic: 'check', label: `Подтверждения${pendN ? ` (${pendN})` : ''}` });
   }
   if (hasOps) tabs.push({ key: 'ops', ic: 'plus', label: 'Операции' });
   if (canCreateDeposit) tabs.push({ key: 'my', ic: 'list', label: 'Мои сдачи' });
+  // История движения денег — для босса (вся компания: кто/когда/сколько).
+  if (isBoss) tabs.push({ key: 'history', ic: 'clock', label: 'История' });
 
   if (!tabs.find(t => t.key === cashboxSubTab)) {
     cashboxSubTab = tabs.length ? tabs[0].key : 'confirm';
@@ -2636,11 +2503,13 @@ async function renderCashbox(container) {
 
   let bodyHtml;
   if (cashboxSubTab === 'ops') {
-    bodyHtml = (createBlock + returnBlock) || '<div class="loader">Нет доступных операций</div>';
+    bodyHtml = (createBlock + payFormBlock + returnBlock) || '<div class="loader">Нет доступных операций</div>';
   } else if (cashboxSubTab === 'my') {
     bodyHtml = myBlock || '<div class="loader">У вас пока нет сдач</div>';
+  } else if (cashboxSubTab === 'history') {
+    bodyHtml = historyBlock;
   } else {
-    bodyHtml = (depBlock + retBlock) || '<div class="loader">Нет записей на подтверждении</div>';
+    bodyHtml = (payBlock + depBlock + retBlock) || '<div class="loader">Нет записей на подтверждении</div>';
   }
   container.innerHTML = tabBar + bodyHtml;
 
@@ -2674,6 +2543,40 @@ async function renderCashbox(container) {
       api('/api/returns/create', { order_id: orderId, reason, refund_method: selectedRefund, idempotency_key: idemKey() })
         .then(r => { tg.showAlert(`✅ Возврат #${r.return_id} отправлен на подтверждение`); renderCashbox(container); })
         .catch(e => { tg.showAlert('❌ ' + e.message); retBtn.disabled = false; });
+    });
+  }
+
+  // Ручной платёж (форма в «Операциях», не-босс).
+  let payCurrency = 'USD';
+  container.querySelectorAll('.cur-btn[data-cur]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      container.querySelectorAll('.cur-btn[data-cur]').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      payCurrency = btn.dataset.cur;
+    });
+  });
+  const paySubmit = container.querySelector('#pay-submit');
+  if (paySubmit) {
+    paySubmit.addEventListener('click', async () => {
+      const amount = parseFloat(container.querySelector('#pay-amount').value);
+      const comment = container.querySelector('#pay-comment').value.trim();
+      const status = container.querySelector('#pay-status');
+      if (!amount || amount <= 0) { status.textContent = '❌ Введите сумму'; status.className = 'pay-status pay-error'; return; }
+      if (!comment) { status.textContent = '❌ Укажите комментарий'; status.className = 'pay-status pay-error'; return; }
+      paySubmit.disabled = true;
+      status.textContent = '⏳ Отправка…'; status.className = 'pay-status';
+      try {
+        const r = await fetch('/api/payments/send', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ initData: _initData, amount, currency: payCurrency, comment }),
+        });
+        if (!r.ok) throw new Error((await r.json()).detail || 'Ошибка');
+        tg.HapticFeedback?.notificationOccurred('success');
+        renderCashbox(container);
+      } catch (e) {
+        status.textContent = '❌ ' + e.message; status.className = 'pay-status pay-error';
+        paySubmit.disabled = false;
+      }
     });
   }
 
@@ -2719,6 +2622,36 @@ async function renderCashbox(container) {
       api('/api/returns/confirm', { return_id: Number(card.dataset.ret), idempotency_key: idemKey() })
         .then(() => { tg.showAlert('✅ Возврат подтверждён'); renderCashbox(container); })
         .catch(e => tg.showAlert('❌ ' + e.message));
+    });
+  });
+
+  // Оплаты по paid-заказам: подтвердить / отклонить (перенесено из «Платежей»).
+  container.querySelectorAll('.pay-confirm').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = parseInt(btn.dataset.id, 10);
+      tg.showConfirm('Подтверждаете поступление оплаты по заказу #' + id + '?', async ok => {
+        if (!ok) return;
+        btn.disabled = true;
+        try {
+          await api('/api/orders/confirm_payment', { order_id: id, idempotency_key: idemKey() });
+          tg.HapticFeedback?.notificationOccurred('success');
+          renderCashbox(container);
+        } catch (e) { tg.showAlert('❌ ' + e.message); btn.disabled = false; }
+      });
+    });
+  });
+  container.querySelectorAll('.pay-reject').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = parseInt(btn.dataset.id, 10);
+      tg.showConfirm('Отклонить оплату по заказу #' + id + '?', async ok => {
+        if (!ok) return;
+        btn.disabled = true;
+        try {
+          await api('/api/orders/reject_payment', { order_id: id, idempotency_key: idemKey() });
+          tg.HapticFeedback?.notificationOccurred('warning');
+          renderCashbox(container);
+        } catch (e) { tg.showAlert('❌ ' + e.message); btn.disabled = false; }
+      });
     });
   });
 }

@@ -1194,6 +1194,24 @@ async def api_payments_history(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/cash/history")
+async def api_cash_history(request: Request):
+    """Единая лента движения денег (платежи + сдачи + возвраты) — для босса.
+    Менеджер видит свою историю через /api/payments/history; здесь — общая
+    картина «кто/когда/сколько», которой раньше не было."""
+    from services import async_db as adb
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_cash_history",
+        rate_limit_max=120,
+    )
+    rows = await adb.get_cash_history(80)
+    return JSONResponse({"history": rows})
+
+
 @app.post("/api/payments/pending")
 async def api_payments_pending(request: Request):
     """Paid-заказы с pending-оплатой, ожидающие подтверждения боссом.

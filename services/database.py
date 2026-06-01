@@ -4297,6 +4297,64 @@ async def get_payments_report(since: str | None = None, until: str | None = None
     return await adb_core.fetch(query, *params)
 
 
+async def get_cash_history(limit: int = 80) -> list[dict]:
+    """Единая лента движения денег для босса: платежи + сдачи наличных +
+    возвраты, в одном списке, новые сверху. Каждая запись: kind
+    (payment|deposit|return), сумма, валюта, статус, кто (имя), когда, заказ.
+
+    «Кто» резолвим по user_id через get_all_users (payments.user_id /
+    cash_deposits.manager_id / returns.created_by). Деньги форматируются на
+    фронте; здесь отдаём amount как есть (float — только для отображения, не
+    для расчётов; денежное ядро остаётся на cents в своих функциях).
+    """
+    pays = await adb_core.fetch(
+        "SELECT id, user_id, amount, currency, status, comment, order_id, created_at "
+        "FROM payments ORDER BY created_at DESC LIMIT $1",
+        limit,
+    )
+    deps = await adb_core.fetch(
+        "SELECT id, manager_id, amount, status, reject_reason, created_at "
+        "FROM cash_deposits WHERE (deleted_at IS NULL) ORDER BY created_at DESC LIMIT $1",
+        limit,
+    )
+    rets = await adb_core.fetch(
+        "SELECT id, order_id, created_by, total_amount, refund_method, status, "
+        "reason, created_at FROM returns WHERE (deleted_at IS NULL) "
+        "ORDER BY created_at DESC LIMIT $1",
+        limit,
+    )
+    names = {u["user_id"]: u.get("full_name") or str(u["user_id"]) for u in get_all_users()}
+
+    rows: list[dict] = []
+    for p in pays:
+        rows.append({
+            "kind": "payment", "id": p["id"], "amount": float(p["amount"] or 0),
+            "currency": p.get("currency") or "USD", "status": p["status"],
+            "who": names.get(p["user_id"], str(p["user_id"])),
+            "order_id": p.get("order_id"), "note": p.get("comment") or "",
+            "created_at": (p.get("created_at") or "")[:16],
+        })
+    for d in deps:
+        rows.append({
+            "kind": "deposit", "id": d["id"], "amount": float(d["amount"] or 0),
+            "currency": "USD", "status": d["status"],
+            "who": names.get(d["manager_id"], str(d["manager_id"])),
+            "order_id": None, "note": d.get("reject_reason") or "",
+            "created_at": (d.get("created_at") or "")[:16],
+        })
+    for r in rets:
+        rows.append({
+            "kind": "return", "id": r["id"], "amount": float(r["total_amount"] or 0),
+            "currency": "USD", "status": r["status"],
+            "who": names.get(r["created_by"], str(r["created_by"])),
+            "order_id": r.get("order_id"), "note": r.get("reason") or "",
+            "created_at": (r.get("created_at") or "")[:16],
+        })
+    # Сортировка по дате убыв.; created_at — строка YYYY-MM-DD HH:MM (лексикогр.).
+    rows.sort(key=lambda x: x["created_at"], reverse=True)
+    return rows[:limit]
+
+
 def get_cashbox_stats(since: str | None = None, until: str | None = None) -> dict:
     """Касса: подтверждённые поступления денег за период.
 
