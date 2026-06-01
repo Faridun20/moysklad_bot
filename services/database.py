@@ -783,6 +783,11 @@ def run_migrations():
             # проверки (флаг + уведомление), деньги/статус НЕ меняем молча.
             # NULL = расхождений не зафиксировано.
             ("orders", "ms_drift_at", "TEXT"),
+            # R4: customerorder создан в МС, но demand (отгрузка) упал — заказ
+            # approved с CO, но без списания остатков. Флаг для ночного дайджеста
+            # «нужна доделка demand вручную». Снимается при успешном set_order_ms_demand_id.
+            # NULL = проблемы нет.
+            ("orders", "ms_demand_failed_at", "TEXT"),
             ("orders", "credit_limit_override", "INTEGER NOT NULL DEFAULT 0"),
             ("orders", "credit_limit_override_by", "BIGINT"),
             ("orders", "price_check_warnings", "TEXT"),
@@ -2712,6 +2717,83 @@ def get_role(user_id: int) -> str:
     return row["role"] if USE_POSTGRES else row[0]
 
 
+def is_user_deactivated(user_id: int) -> bool:
+    """Деактивирован ли пользователь — ПРЯМОЙ read из БД, минуя кэш ролей.
+
+    R1: cached_role (TTL 60с) живёт в памяти каждого процесса отдельно — bot и
+    webapp не делят кэш. Деактивация через бот не видна webapp до истечения TTL.
+    Этот lookup по PK дешёвый и всегда свежий → зовётся в _authorize, чтобы
+    деактивация применялась мгновенно во всех процессах. False при отсутствии
+    строки (нет записи — нечего деактивировать; роль отдельно решит guest)."""
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return False
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT deactivated_at FROM user_roles WHERE user_id = ?"), (uid,)
+        )
+        row = cur.fetchone()
+    if not row:
+        return False
+    deactivated = row["deactivated_at"] if USE_POSTGRES else row[0]
+    return bool(deactivated)
+
+
+async def idem_claim(key: str, operation: str, user_id: int) -> dict | None:
+    """DB-уровневая идемпотентность для денежных create-эндпоинтов (R2).
+
+    Атомарно «застолбить» ключ: INSERT-if-absent. Возвращает:
+      - None  → ключ НАШ (вставили), вызывающий выполняет операцию и затем
+                зовёт idem_store(key, result);
+      - dict  → ключ уже был: ранее сохранённый result (или {} если операция
+                ещё в полёте/без результата) — вызывающий отдаёт его как ответ,
+                операцию НЕ повторяет.
+
+    In-memory _idem_cache в webapp не переживает рестарт и не делится между
+    воркерами — отсюда дубль deposit/return. Этот claim в общей БД закрывает
+    окно между ретраями клиента. Идемпотентно по PK (key)."""
+    import json
+
+    expires = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    rc = await adb_core.execute(
+        "INSERT INTO idempotency_keys (key, operation, user_id, result, created_at, expires_at) "
+        "VALUES ($1, $2, $3, NULL, $4, $5) ON CONFLICT (key) DO NOTHING",
+        key, operation, user_id, now_str(), expires,
+    )
+    if rc > 0:
+        return None  # ключ наш — выполняем операцию
+    row = await adb_core.fetchrow(
+        "SELECT result FROM idempotency_keys WHERE key = $1", key
+    )
+    if row and row["result"]:
+        try:
+            return json.loads(row["result"])
+        except (ValueError, TypeError):
+            return {}
+    return {}  # ключ занят, но результата ещё нет (операция в полёте)
+
+
+async def idem_store(key: str, result: dict) -> None:
+    """Сохранить результат операции под ранее застолблённым idem-ключом."""
+    import json
+
+    await adb_core.execute(
+        "UPDATE idempotency_keys SET result = $1 WHERE key = $2",
+        json.dumps(result), key,
+    )
+
+
+async def idem_release(key: str) -> None:
+    """Освободить застолблённый ключ, если операция упала ДО idem_store —
+    чтобы легитимный ретрай не получал 409 навсегда (до expiry). Удаляем только
+    строки без результата (result IS NULL): успешный ключ не трогаем."""
+    await adb_core.execute(
+        "DELETE FROM idempotency_keys WHERE key = $1 AND result IS NULL", key
+    )
+
+
 def set_role(user_id: int, username: str, full_name: str, role: str) -> bool:
     valid_roles = VALID_ROLES
     if role not in valid_roles:
@@ -3177,6 +3259,20 @@ def mark_shipment_notified(demand_id: str) -> bool:
     return inserted
 
 
+def unmark_shipment_notified(demand_id: str) -> bool:
+    """Освободить дедуп-слот отгрузки (R5): если ВСЕ отправки уведомления упали
+    (Telegram 5xx), слот нужно снять, чтобы резервный поллер повторил позже —
+    иначе уведомление потеряно навсегда. Возвращает True, если строка удалена."""
+    if not demand_id:
+        return False
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("DELETE FROM notified_shipments WHERE demand_id = ?"), (demand_id,))
+        deleted = cur.rowcount > 0
+        conn.commit()
+    return deleted
+
+
 def prune_notified_shipments(older_than_days: int = 30) -> int:
     """Удалить старые записи дедупа отгрузок (таблица иначе растёт без предела).
 
@@ -3312,6 +3408,31 @@ async def set_order_ms_drift(order_id: int) -> bool:
             "UPDATE orders SET ms_drift_at = $1, updated_at = $2 "
             "WHERE id = $3 AND ms_drift_at IS NULL",
             now_str(), now_str(), order_id,
+        )
+        > 0
+    )
+
+
+async def set_order_ms_demand_failed(order_id: int) -> bool:
+    """R4: пометить «CO создан, demand упал» — заказ ждёт ручной доделки отгрузки.
+    Идемпотентно (только если флаг ещё не стоит). Попадает в ночной дайджест."""
+    return (
+        await adb_core.execute(
+            "UPDATE orders SET ms_demand_failed_at = $1, updated_at = $2 "
+            "WHERE id = $3 AND ms_demand_failed_at IS NULL",
+            now_str(), now_str(), order_id,
+        )
+        > 0
+    )
+
+
+async def clear_order_ms_demand_failed(order_id: int) -> bool:
+    """Снять флаг demand-fail (отгрузка наконец создана — вручную или ретраем)."""
+    return (
+        await adb_core.execute(
+            "UPDATE orders SET ms_demand_failed_at = NULL, updated_at = $1 "
+            "WHERE id = $2 AND ms_demand_failed_at IS NOT NULL",
+            now_str(), order_id,
         )
         > 0
     )
@@ -3870,7 +3991,15 @@ async def get_ms_sync_anomalies(since_iso: str) -> dict[str, list[dict]]:
         "ORDER BY ms_deleted_at DESC",
         since_iso,
     )
-    return {"drift": list(drift), "deleted": list(deleted)}
+    # R4: customerorder создан, demand упал — отгрузка не проведена, остатки не
+    # списаны. Ждёт ручной доделки demand в МС.
+    demand_failed = await adb_core.fetch(
+        "SELECT id, agent_name, full_name, status, ms_demand_failed_at FROM orders "
+        "WHERE ms_demand_failed_at IS NOT NULL AND ms_demand_failed_at >= $1 "
+        "AND (deleted_at IS NULL) ORDER BY ms_demand_failed_at DESC",
+        since_iso,
+    )
+    return {"drift": list(drift), "deleted": list(deleted), "demand_failed": list(demand_failed)}
 
 
 def clear_order_ms_customerorder_id(order_id: int) -> bool:

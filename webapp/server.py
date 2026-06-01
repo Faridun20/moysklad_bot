@@ -96,6 +96,14 @@ def _authorize(
     user = verify_init_data(data.get("initData", ""))
     if not user:
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
+    # R1: деактивацию проверяем ПРЯМЫМ read из БД (минуя кэш ролей) — кэш
+    # per-process с TTL 60с, и деактивация из бот-процесса иначе не видна webapp
+    # до минуты. Касается и allowed_roles=None (свои-данные эндпоинты): уволенный
+    # не должен дёргать даже их. Lookup по PK дешёвый.
+    from services.database import is_user_deactivated
+
+    if is_user_deactivated(user["id"]):
+        raise HTTPException(status_code=403, detail="Доступ деактивирован")
     if allowed_roles is not None:
         role = get_role(user["id"])
         if role not in allowed_roles:
@@ -2140,15 +2148,29 @@ async def api_deposits_create(request: Request):
             status_code=400, detail="Сумма должна быть положительным числом до 10М"
         )
 
-    # Idempotency: create_cash_deposit НЕ защищён claim'ом — двойной POST создаёт
-    # две сдачи. Кэш-ключ отсекает дубль в пределах TTL.
+    # R2: DB-уровневая идемпотентность. create_cash_deposit не защищён claim'ом —
+    # двойной POST (ретрай клиента после рестарта webapp/мультиворкер) создаёт две
+    # сдачи. idem_claim атомарно столбит ключ в общей БД (in-mem кэш не переживал
+    # рестарт). Если ключ уже был — отдаём сохранённый результат, не повторяем.
     idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"deposit_create:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
-    res = await adb.create_cash_deposit(user["id"], amount)
+    full_key = f"deposit_create:{user['id']}:{idem_key}" if idem_key else None
+    if full_key:
+        prev = await adb.idem_claim(full_key, "deposit_create", user["id"])
+        if prev is not None:
+            if prev.get("deposit_id"):
+                return JSONResponse(prev)
+            # Ключ занят, но результата нет (операция в полёте/упала до store) —
+            # безопаснее отказать, чем рискнуть дублем.
+            raise HTTPException(status_code=409, detail="Запрос уже обрабатывается")
+    try:
+        res = await adb.create_cash_deposit(user["id"], amount)
+    except Exception:
+        if full_key:
+            await adb.idem_release(full_key)  # упало до store — освободить ретраю
+        raise
     if not res.get("ok"):
+        if full_key:
+            await adb.idem_release(full_key)
         raise HTTPException(status_code=400, detail=res.get("error", "не удалось создать сдачу"))
 
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
@@ -2163,8 +2185,8 @@ async def api_deposits_create(request: Request):
     except Exception:
         logger.warning("deposit create notify failed", exc_info=True)
     resp = {"ok": True, "deposit_id": res["deposit_id"]}
-    if idem_key:
-        _idem_set(f"deposit_create:{user['id']}:{idem_key}", resp)
+    if full_key:
+        await adb.idem_store(full_key, resp)
     return JSONResponse(resp)
 
 
@@ -2296,13 +2318,16 @@ async def api_returns_create(request: Request):
     if refund not in ("cash", "debt_reduction", "no_refund"):
         raise HTTPException(status_code=400, detail="Некорректный способ возврата денег")
 
-    # Idempotency: create_return НЕ защищён claim'ом — двойной POST создаёт два
-    # возврата. Кэш-ключ отсекает дубль в пределах TTL.
+    # R2: DB-уровневая идемпотентность (двойной POST создавал два возврата —
+    # двойной refund/занижение долга). idem_claim столбит ключ в общей БД.
     idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"return_create:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
+    full_key = f"return_create:{user['id']}:{idem_key}" if idem_key else None
+    if full_key:
+        prev = await adb.idem_claim(full_key, "return_create", user["id"])
+        if prev is not None:
+            if prev.get("return_id"):
+                return JSONResponse(prev)
+            raise HTTPException(status_code=409, detail="Запрос уже обрабатывается")
 
     order = await adb.get_order(order_id)
     if not order:
@@ -2328,16 +2353,23 @@ async def api_returns_create(request: Request):
         )
         for it in items
     ]
-    res = await adb.create_return(
-        order_id,
-        "full",
-        reason,
-        ret_items,
-        refund_method=refund,
-        created_by=user["id"],
-        force=privileged,
-    )
+    try:
+        res = await adb.create_return(
+            order_id,
+            "full",
+            reason,
+            ret_items,
+            refund_method=refund,
+            created_by=user["id"],
+            force=privileged,
+        )
+    except Exception:
+        if full_key:
+            await adb.idem_release(full_key)  # упало до store — освободить ретраю
+        raise
     if not res.get("ok"):
+        if full_key:
+            await adb.idem_release(full_key)
         raise HTTPException(status_code=409, detail=res.get("error", "не удалось"))
 
     # То же уведомление с кнопками, что и бот-команда /return.
@@ -2349,8 +2381,8 @@ async def api_returns_create(request: Request):
     except Exception:
         logger.warning("return create notify failed", exc_info=True)
     resp = {"ok": True, "return_id": res["return_id"], "total_amount": res["total_amount"]}
-    if idem_key:
-        _idem_set(f"return_create:{user['id']}:{idem_key}", resp)
+    if full_key:
+        await adb.idem_store(full_key, resp)
     return JSONResponse(resp)
 
 

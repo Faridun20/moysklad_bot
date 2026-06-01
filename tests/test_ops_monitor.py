@@ -103,6 +103,37 @@ def test_ms_sync_block_truncates_long_lists():
     assert "и ещё 5" in block  # показываем 10, остальные свёрнуты
 
 
+def test_ms_sync_block_shows_demand_failed():
+    """R4: блок показывает заказы с неудавшейся отгрузкой (demand-fail)."""
+    block = build_ms_sync_block(
+        {"drift": [], "deleted": [],
+         "demand_failed": [{"id": 7, "agent_name": "Gamma", "status": "approved"}]}
+    )
+    assert block is not None
+    assert "#7" in block and "Gamma" in block
+    assert "доделка" in block.lower() or "отгрузка не создана" in block.lower()
+
+
+def test_get_ms_sync_anomalies_collects_demand_failed(isolated_db):
+    """R4: get_ms_sync_anomalies возвращает заказы с ms_demand_failed_at в окне."""
+    db = isolated_db
+    db.set_role(1, "m", "M", "manager")
+    oid = db.create_order(1, "M", "")
+    db.update_order_agent(oid, "A", "Client")
+    db.update_order_status(oid, "approved")
+    assert asyncio.run(db.set_order_ms_demand_failed(oid)) is True
+    # Идемпотентно.
+    assert asyncio.run(db.set_order_ms_demand_failed(oid)) is False
+
+    res = asyncio.run(db.get_ms_sync_anomalies("2000-01-01 00:00:00"))
+    assert {o["id"] for o in res["demand_failed"]} == {oid}
+
+    # Снятие флага (отгрузка доделана) — уходит из набора.
+    assert asyncio.run(db.clear_order_ms_demand_failed(oid)) is True
+    res2 = asyncio.run(db.get_ms_sync_anomalies("2000-01-01 00:00:00"))
+    assert res2["demand_failed"] == []
+
+
 def test_get_ms_sync_anomalies_collects_drift_and_deleted(isolated_db):
     """get_ms_sync_anomalies возвращает заказы с ms_drift_at / ms_deleted_at
     в окне since_iso; старое (до окна) и soft-deleted исключены."""

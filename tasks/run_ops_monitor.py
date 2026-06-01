@@ -233,9 +233,17 @@ def build_ms_sync_block(anomalies: dict[str, list[dict]]) -> str | None:
     anomalies из services.database.get_ms_sync_anomalies (drift + deleted)."""
     drift = anomalies.get("drift") or []
     deleted = anomalies.get("deleted") or []
-    if not drift and not deleted:
+    demand_failed = anomalies.get("demand_failed") or []
+    if not drift and not deleted and not demand_failed:
         return None
     lines = ["🔄 <b>Рассинхрон с МойСклад</b>"]
+    if demand_failed:
+        lines.append(f"  📦 Отгрузка не создана (нужна доделка): {len(demand_failed)}")
+        for o in demand_failed[:10]:
+            agent = _esc(o.get("agent_name") or "—")
+            lines.append(f"    • #{o['id']} · {agent}")
+        if len(demand_failed) > 10:
+            lines.append(f"    …и ещё {len(demand_failed) - 10}")
     if drift:
         lines.append(f"  ✏️ Изменены в МС (сумма ≠): {len(drift)}")
         for o in drift[:10]:

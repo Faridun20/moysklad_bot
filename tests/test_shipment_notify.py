@@ -36,6 +36,7 @@ def notify_env(isolated_db, monkeypatch):
 
     async def _fake_send(chat_id, text, **kw):
         sent.append((chat_id, text))
+        return True  # как реальная tg_send_message: True при успехе (R5)
 
     async def _no_positions(demand_id):
         return []
@@ -138,6 +139,42 @@ def test_notify_failed_fetch_leaves_slot_free(notify_env, monkeypatch):
     assert ok is False
     assert sent == []
     assert db.mark_shipment_notified("d-7") is True  # не consumed
+
+
+def test_notify_all_sends_failed_frees_slot(notify_env, monkeypatch):
+    """R5: если ВСЕ отправки упали (Telegram down) — дедуп-слот освобождается,
+    чтобы резервный поллер повторил позже (иначе уведомление потеряно навсегда)."""
+    db, boss_id, sent = notify_env
+
+    async def _fail_send(chat_id, text, **kw):
+        return False  # доставка не удалась
+
+    monkeypatch.setattr(notifier, "tg_send_message", _fail_send)
+
+    ok = asyncio.run(
+        notifier.notify_new_shipment("d-fail", shipment=_shipment(), recipients=[boss_id])
+    )
+    assert ok is False
+    # Слот свободен → поллер сможет повторить (mark вернёт True = впервые).
+    assert db.mark_shipment_notified("d-fail") is True
+
+
+def test_notify_partial_success_keeps_slot(notify_env, monkeypatch):
+    """R5: если хотя бы один получатель получил уведомление — слот занят
+    (не дублируем), несмотря на сбой по другим."""
+    db, _boss, sent = notify_env
+
+    async def _mixed_send(chat_id, text, **kw):
+        return chat_id == 100  # 100 ок, остальные — нет
+
+    monkeypatch.setattr(notifier, "tg_send_message", _mixed_send)
+
+    ok = asyncio.run(
+        notifier.notify_new_shipment("d-mix", shipment=_shipment(), recipients=[100, 200])
+    )
+    assert ok is True
+    # Слот занят — повтор не нужен.
+    assert db.mark_shipment_notified("d-mix") is False
 
 
 # ─── Подавление уведомлений о бот-созданных отгрузках ────────────────────────

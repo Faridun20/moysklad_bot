@@ -393,6 +393,9 @@ async def approve_shipment_request(
                         ),
                         adb.set_order_ms_demand_id(order["id"], demand_id),
                     )
+                # R4: отгрузка прошла — снимаем флаг «нужна доделка», если стоял
+                # (напр. demand упал на прошлой попытке, эта — успешна).
+                await adb.clear_order_ms_demand_failed(order["id"])
                 demand_line = (
                     "\n📄 Заказ покупателя создан в МойСклад"
                     "\n📦 Отгрузка проведена, остатки списаны"
@@ -429,6 +432,9 @@ async def approve_shipment_request(
                     "ms_demand_failed",
                     f"Заявка #{req_id} → CO {co_id} ok, demand fail: {reason[:200]}",
                 )
+                # R4: персистентный флаг — заказ попадёт в ночной дайджест
+                # «нужна доделка demand», даже если уведомление боссу потеряется.
+                await adb.set_order_ms_demand_failed(order["id"])
                 if bot is not None:
                     try:
                         await bot.send_message(
