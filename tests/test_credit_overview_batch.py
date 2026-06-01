@@ -105,3 +105,27 @@ def test_overview_limits_free_and_sort(isolated_db):
 
     # Сортировка: меньший free (A-OVER, -50) идёт раньше.
     assert overview[0]["agent_id"] == "A-OVER"
+
+
+def test_ms_deleted_order_excluded_from_debt(isolated_db):
+    """Заказ, удалённый в МойСклад (ms_deleted_at), не порождает долг: ни в
+    get_agent_current_debt, ни в get_credit_overview, ни в get_open_debts.
+    «Нет заказа — нет долга»."""
+    db = isolated_db
+    live = _order(db, "A-LIVE", 200.0)
+    ghost = _order(db, "A-GHOST", 500.0)
+    assert asyncio.run(db.set_order_ms_deleted(ghost)) is True
+    _ = live
+
+    # Прямой долг агента-призрака — ноль.
+    assert asyncio.run(db.get_agent_current_debt("A-GHOST")) == pytest.approx(0.0)
+    assert asyncio.run(db.get_agent_current_debt("A-LIVE")) == pytest.approx(200.0)
+
+    # overview: призрака нет вовсе (нет живых заказов), живой — есть.
+    by_agent = {a["agent_id"]: a for a in asyncio.run(db.get_credit_overview())}
+    assert "A-GHOST" not in by_agent
+    assert by_agent["A-LIVE"]["debt"] == pytest.approx(200.0)
+
+    # get_open_debts (credit) тоже не содержит призрака.
+    open_ids = {o["id"] for o in asyncio.run(db.get_open_debts())}
+    assert ghost not in open_ids

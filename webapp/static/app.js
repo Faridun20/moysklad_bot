@@ -2016,17 +2016,25 @@ function renderAnalyticsContent(data) {
   const content = document.getElementById('content');
   const fmt = n => Math.round(n).toLocaleString('ru-RU');
 
-  const periods = [
+  // Пресеты — ровный сегмент-контрол (как в Финансах), «Период…» — отдельная
+  // кнопка справа (открывает календарь). Чёткое выделение активного.
+  const presets = [
     { id: 'week', label: 'Неделя' },
     { id: 'month', label: 'Месяц' },
-    { id: '3month', label: '3 мес' },
+    { id: '3month', label: 'Квартал' },
     { id: 'year', label: 'Год' },
-    { id: 'custom', label: 'Период…' },
   ];
-
-  const periodButtons = periods.map(p =>
-    `<button class="cat-btn ${analyticsPeriod === p.id ? 'active' : ''}" data-period="${p.id}">${p.label}</button>`
+  const presetSeg = presets.map(p =>
+    `<button class="seg-item ${analyticsPeriod === p.id ? 'active' : ''}" data-period="${p.id}">${p.label}</button>`
   ).join('');
+  const customLabel = (analyticsPeriod === 'custom' && analyticsSince && analyticsUntil)
+    ? `${formatDateRU(analyticsSince)}—${formatDateRU(analyticsUntil)}`
+    : 'Период…';
+  const periodBar = `
+    <div class="seg-row">
+      <div class="seg">${presetSeg}</div>
+      <button class="seg-aux ${analyticsPeriod === 'custom' ? 'active' : ''}" data-period="custom">${icon('clock')} ${customLabel}</button>
+    </div>`;
   const periodPanel = analyticsPeriod === 'custom' ? dateRangeHost() : '';
 
   const trendIcon = data.trend > 0 ? '📈' : data.trend < 0 ? '📉' : '➡️';
@@ -2087,7 +2095,7 @@ function renderAnalyticsContent(data) {
 
   content.innerHTML = `
     <div class="section-label">Период</div>
-    <div class="cat-scroll">${periodButtons}</div>
+    ${periodBar}
     ${periodPanel}
 
     <div class="stat-grid">
@@ -2148,8 +2156,9 @@ function renderAnalyticsContent(data) {
     });
   }));
 
-  document.querySelectorAll('.cat-btn[data-period]').forEach(btn => {
+  document.querySelectorAll('[data-period]').forEach(btn => {
     btn.addEventListener('click', () => {
+      haptic('light');
       analyticsPeriod = btn.dataset.period;
       renderAnalytics();
     });

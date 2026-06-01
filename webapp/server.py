@@ -1005,16 +1005,37 @@ def _resolve_analytics_period(data: dict, now):
         return since, until, since - span, label
 
     period = data.get("period", "week")
-    presets = {
-        "week": (now - timedelta(weeks=1), now - timedelta(weeks=2), "Неделя"),
-        "month": (now - timedelta(days=30), now - timedelta(days=60), "Месяц"),
-        "3month": (now - timedelta(days=90), now - timedelta(days=180), "3 месяца"),
-        "year": (now - timedelta(days=365), now - timedelta(days=730), "Год"),
-    }
-    # Индексируем, а не распаковываем в 3 цели — multi-target unpack из
-    # dict.get() роняет mypy 2.1 (AssertionError в check_multi_assignment_from_tuple).
-    preset = presets.get(period, presets["month"])
-    return preset[0], now, preset[1], preset[2]
+    # Календарные границы (а не скользящее окно «now − N дней»): «Неделя» — с
+    # понедельника текущей недели, «Месяц» — с 1-го числа, «Год» — с 1 января.
+    # prev_since — начало ПРЕДЫДУЩЕГО такого же периода (для тренда). until=now
+    # (период «по сейчас»), так что текущая неделя/месяц считаются нарастающим
+    # итогом, а сравниваются с целым предыдущим — это ожидаемо для дашборда.
+    day0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "week":
+        since = day0 - timedelta(days=day0.weekday())          # понедельник
+        prev_since = since - timedelta(weeks=1)
+        label = "Неделя"
+    elif period == "3month":
+        # Начало квартала: 1-е число первого месяца квартала.
+        q_first_month = ((now.month - 1) // 3) * 3 + 1
+        since = day0.replace(day=1, month=q_first_month)
+        prev_month = q_first_month - 3
+        prev_year = since.year
+        if prev_month <= 0:
+            prev_month += 12
+            prev_year -= 1
+        prev_since = since.replace(year=prev_year, month=prev_month)
+        label = "Квартал"
+    elif period == "year":
+        since = day0.replace(month=1, day=1)
+        prev_since = since.replace(year=since.year - 1)
+        label = "Год"
+    else:  # month (дефолт)
+        since = day0.replace(day=1)
+        prev_year, prev_month = (since.year - 1, 12) if since.month == 1 else (since.year, since.month - 1)
+        prev_since = since.replace(year=prev_year, month=prev_month)
+        label = "Месяц"
+    return since, now, prev_since, label
 
 
 def _ts(o: dict) -> str:

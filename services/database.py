@@ -1147,7 +1147,7 @@ async def get_agent_current_debt(agent_id: str) -> float:
     rows = await adb_core.fetch(
         "SELECT id FROM orders WHERE agent_id = $1 "
         "AND status NOT IN ('draft', 'rejected', 'cancelled', 'paid', 'returned') "
-        "AND payment_confirmed = 0 AND (deleted_at IS NULL)",
+        "AND payment_confirmed = 0 AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)",
         agent_id,
     )
     order_ids = [r["id"] for r in rows]
@@ -1255,7 +1255,8 @@ async def get_credit_overview() -> list[dict]:
     for r in await adb_core.fetch(
         "SELECT DISTINCT agent_id, agent_name FROM orders "
         "WHERE agent_id IS NOT NULL AND agent_id != '' "
-        "AND status NOT IN ('draft', 'rejected', 'cancelled') AND (deleted_at IS NULL)"
+        "AND status NOT IN ('draft', 'rejected', 'cancelled') "
+        "AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)"
     ):
         aid = r["agent_id"]
         if aid and aid not in agents:
@@ -1268,7 +1269,7 @@ async def get_credit_overview() -> list[dict]:
         for r in await adb_core.fetch(
             "SELECT id, agent_id FROM orders "
             "WHERE status NOT IN ('draft', 'rejected', 'cancelled', 'paid', 'returned') "
-            "AND payment_confirmed = 0 AND (deleted_at IS NULL)"
+            "AND payment_confirmed = 0 AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)"
         )
     ]
 
@@ -4897,7 +4898,9 @@ async def get_open_debts(
     query = (
         "SELECT * FROM orders "
         "WHERE payment_type = 'credit' AND paid_confirmed_at IS NULL "
-        "AND status IN ('approved', 'shipped')"
+        "AND status IN ('approved', 'shipped') "
+        # Заказ удалён в МойСклад (фантом) → долга по нему быть не должно.
+        "AND (ms_deleted_at IS NULL)"
     )
     params: list = []
     if user_id is not None:
@@ -4934,6 +4937,8 @@ async def get_paid_orders_awaiting_confirmation(user_id: int | None = None) -> l
         "SELECT * FROM orders o "
         "WHERE o.payment_type = 'paid' "
         "AND o.status IN ('approved', 'shipped') "
+        # Заказ удалён в МойСклад (фантом) → не ждём по нему подтверждения оплаты.
+        "AND (o.ms_deleted_at IS NULL) "
         "AND EXISTS (SELECT 1 FROM payments p "
         "            WHERE p.order_id = o.id AND p.status = 'pending')"
     )
