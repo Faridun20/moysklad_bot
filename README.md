@@ -305,7 +305,18 @@ mypy                   # типы по «денежным»/API-модулям (
 Принцип тестов: мокаем **границу с внешним миром** (HTTP-транспорт через `aioresponses`,
 Telegram-`tg_send_message` на верхнем уровне), а БД — настоящая. Покрываются денежные
 инварианты, контракт МойСклад, регрессии безопасности (`_authorize`, HTML-escape) и
-дедуп уведомлений. UI WebApp всё ещё проверяется вручную после деплоя.
+дедуп уведомлений.
+
+**Фронт WebApp (Vitest).** Хелперы `webapp/static/helpers.js` и jsdom-смоук загрузки
+`app.js` лежат в `webapp/static/__tests__/` и гоняются в CI (`npm test`). Локально на
+Windows без Node/пакетных менеджеров — два PowerShell-скрипта (portable Node ставится
+в `.tools/`, в репозиторий не попадает):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup-node.ps1   # 1×: portable Node LTS → .tools/node
+powershell -ExecutionPolicy Bypass -File scripts/test-js.ps1      # npm install (1×) + vitest run
+# из cmd / двойным кликом: scripts\test-js.cmd
+```
 
 ### Логи и мониторинг
 

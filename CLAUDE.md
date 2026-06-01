@@ -11,6 +11,11 @@ ruff check --select=E9,F63,F7,F82 .        # строгий минимум-ге�
 mypy                                       # точечно по order_workflow/database/moysklad/server — гейт, 0 ошибок
 pre-commit install && pre-commit install --hook-type pre-push   # локальная первая линия (опц.)
 
+# Фронт-тесты WebApp (Vitest, webapp/static/__tests__) — гоняет CI (npm test).
+# Локально: на машине нет Node/пакетных менеджеров → ставим portable Node в .tools/
+powershell -ExecutionPolicy Bypass -File scripts/setup-node.ps1   # 1× : portable Node LTS в .tools/node (gitignore)
+powershell -ExecutionPolicy Bypass -File scripts/test-js.ps1      # npm install (1×) + vitest run; scripts/test-js.cmd — из cmd
+
 python bot.py                              # локально: без Postgres → SQLite, без Redis → MemoryStorage
 python -m tasks.migrate                    # schema + data миграции, ДО старта сервисов на проде
 
@@ -105,3 +110,5 @@ Python 3.11.9).
 Мокай ГРАНИЦУ с внешним миром, а не свой код. Урок: баг в `tg_send_message` пережил CI, потому что тесты мокали саму `tg_send_message`. Для исходящих HTTP — `aioresponses` (мок транспорта, реально исполняется сборка URL/payload). БД — настоящая (`isolated_db`), не мок.
 
 Если добавляешь module-level `asyncio.Semaphore`/`Lock` — добавь регресс-тест с 2× `asyncio.run` и contention >cap (см. `tests/test_analytics_parallel.py::test_positions_semaphore_survives_multiple_asyncio_run_with_contention`). Без waiter'а в очереди loop-binding не воспроизводится и landmine ждёт первого «толстого» теста.
+
+**Фронт (Vitest):** чистые хелперы `webapp/static/helpers.js` + jsdom-смоук загрузки `app.js` — в `webapp/static/__tests__/`. Гоняет CI (`npm test`). Локально Node нет → `scripts/setup-node.ps1` ставит portable Node в `.tools/node` (gitignore, ~35MB zip с nodejs.org, без admin), `scripts/test-js.ps1` делает `npm install` (1×) + `vitest run`. Скрипты — UTF-8 **с BOM** (иначе PowerShell 5.1 читает их как ANSI и кириллица в Write-Host превращается в кракозябры).

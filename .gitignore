@@ -17,6 +17,9 @@ htmlcov/
 node_modules/
 npm-debug.log*
 
+# Локально скачанный portable Node (scripts/setup-node.ps1) — не в репо
+.tools/
+
 # Секреты и локальная конфигурация
 .env
 config_local.py
