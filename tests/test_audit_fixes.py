@@ -163,3 +163,67 @@ def test_manager_cannot_return_foreign_order(client_env):
         },
     )
     assert resp.status_code == 403
+
+
+# ─── R1 (деактивация мгновенна, минуя кэш ролей) ─────────────────────────────
+
+
+def test_deactivated_user_blocked_immediately(client_env):
+    """R1: после deactivate_user пользователь получает 403 СРАЗУ, без ожидания
+    TTL кэша ролей — _authorize проверяет deactivated_at прямым read из БД.
+    Прогреваем кэш активной ролью до деактивации, чтобы поймать stale-cache."""
+    client, db, _ = client_env
+
+    # Прогрев кэша ролей (как если бы webapp уже видел активного юзера).
+    from services.roles import cached_role
+
+    assert cached_role(200) == "manager"
+
+    # Деактивируем (как из бот-процесса — webapp-кэш НЕ инвалидируется).
+    assert asyncio.run(db.deactivate_user(200, by=1)) is True
+
+    # Эндпоинт со скоупом по себе (allowed_roles=None) — всё равно 403.
+    resp = client.post("/api/payments/history", json={"initData": "200"})
+    assert resp.status_code == 403
+    # И ролевой эндпоинт тоже.
+    resp2 = client.post("/api/orders", json={"initData": "200"})
+    assert resp2.status_code == 403
+
+
+# ─── R2 (DB-идемпотентность денежных create) ─────────────────────────────────
+
+
+def test_return_create_idempotent_same_key(client_env, monkeypatch):
+    """R2: два POST /api/returns/create с одним idempotency_key создают РОВНО
+    один возврат (DB-claim), даже если in-mem кэш «забыл» (эмулируем сбросом)."""
+    client, db, oid = client_env
+
+    # Гасим внешние уведомления (Telegram) — не часть теста.
+    import webapp.server as server
+
+    async def _noop_bot():
+        class _B:
+            async def send_message(self, *a, **k):
+                pass
+        return _B()
+    monkeypatch.setattr(server, "get_notify_bot", _noop_bot)
+
+    body = {
+        "initData": "200", "order_id": oid, "reason": "брак партии",
+        "refund_method": "debt_reduction", "idempotency_key": "FIXED-KEY-1",
+    }
+    r1 = client.post("/api/returns/create", json=body)
+    assert r1.status_code == 200, r1.text
+    rid = r1.json()["return_id"]
+
+    # Эмулируем потерю in-memory кэша (рестарт/другой воркер).
+    server._IDEM_CACHE.clear()
+
+    r2 = client.post("/api/returns/create", json=body)
+    assert r2.status_code == 200, r2.text
+    # Тот же return_id — повтор не создал второй возврат.
+    assert r2.json()["return_id"] == rid
+
+    # В БД ровно один pending-возврат по заказу.
+    pend = [x for x in asyncio.run(db.get_pending_returns()) if x["order_id"] == oid]
+    assert len(pend) == 1

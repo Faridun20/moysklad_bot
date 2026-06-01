@@ -783,6 +783,11 @@ def run_migrations():
             # проверки (флаг + уведомление), деньги/статус НЕ меняем молча.
             # NULL = расхождений не зафиксировано.
             ("orders", "ms_drift_at", "TEXT"),
+            # R4: customerorder создан в МС, но demand (отгрузка) упал — заказ
+            # approved с CO, но без списания остатков. Флаг для ночного дайджеста
+            # «нужна доделка demand вручную». Снимается при успешном set_order_ms_demand_id.
+            # NULL = проблемы нет.
+            ("orders", "ms_demand_failed_at", "TEXT"),
             ("orders", "credit_limit_override", "INTEGER NOT NULL DEFAULT 0"),
             ("orders", "credit_limit_override_by", "BIGINT"),
             ("orders", "price_check_warnings", "TEXT"),
@@ -1147,7 +1152,7 @@ async def get_agent_current_debt(agent_id: str) -> float:
     rows = await adb_core.fetch(
         "SELECT id FROM orders WHERE agent_id = $1 "
         "AND status NOT IN ('draft', 'rejected', 'cancelled', 'paid', 'returned') "
-        "AND payment_confirmed = 0 AND (deleted_at IS NULL)",
+        "AND payment_confirmed = 0 AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)",
         agent_id,
     )
     order_ids = [r["id"] for r in rows]
@@ -1255,7 +1260,8 @@ async def get_credit_overview() -> list[dict]:
     for r in await adb_core.fetch(
         "SELECT DISTINCT agent_id, agent_name FROM orders "
         "WHERE agent_id IS NOT NULL AND agent_id != '' "
-        "AND status NOT IN ('draft', 'rejected', 'cancelled') AND (deleted_at IS NULL)"
+        "AND status NOT IN ('draft', 'rejected', 'cancelled') "
+        "AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)"
     ):
         aid = r["agent_id"]
         if aid and aid not in agents:
@@ -1268,7 +1274,7 @@ async def get_credit_overview() -> list[dict]:
         for r in await adb_core.fetch(
             "SELECT id, agent_id FROM orders "
             "WHERE status NOT IN ('draft', 'rejected', 'cancelled', 'paid', 'returned') "
-            "AND payment_confirmed = 0 AND (deleted_at IS NULL)"
+            "AND payment_confirmed = 0 AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)"
         )
     ]
 
@@ -2711,6 +2717,83 @@ def get_role(user_id: int) -> str:
     return row["role"] if USE_POSTGRES else row[0]
 
 
+def is_user_deactivated(user_id: int) -> bool:
+    """Деактивирован ли пользователь — ПРЯМОЙ read из БД, минуя кэш ролей.
+
+    R1: cached_role (TTL 60с) живёт в памяти каждого процесса отдельно — bot и
+    webapp не делят кэш. Деактивация через бот не видна webapp до истечения TTL.
+    Этот lookup по PK дешёвый и всегда свежий → зовётся в _authorize, чтобы
+    деактивация применялась мгновенно во всех процессах. False при отсутствии
+    строки (нет записи — нечего деактивировать; роль отдельно решит guest)."""
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return False
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT deactivated_at FROM user_roles WHERE user_id = ?"), (uid,)
+        )
+        row = cur.fetchone()
+    if not row:
+        return False
+    deactivated = row["deactivated_at"] if USE_POSTGRES else row[0]
+    return bool(deactivated)
+
+
+async def idem_claim(key: str, operation: str, user_id: int) -> dict | None:
+    """DB-уровневая идемпотентность для денежных create-эндпоинтов (R2).
+
+    Атомарно «застолбить» ключ: INSERT-if-absent. Возвращает:
+      - None  → ключ НАШ (вставили), вызывающий выполняет операцию и затем
+                зовёт idem_store(key, result);
+      - dict  → ключ уже был: ранее сохранённый result (или {} если операция
+                ещё в полёте/без результата) — вызывающий отдаёт его как ответ,
+                операцию НЕ повторяет.
+
+    In-memory _idem_cache в webapp не переживает рестарт и не делится между
+    воркерами — отсюда дубль deposit/return. Этот claim в общей БД закрывает
+    окно между ретраями клиента. Идемпотентно по PK (key)."""
+    import json
+
+    expires = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    rc = await adb_core.execute(
+        "INSERT INTO idempotency_keys (key, operation, user_id, result, created_at, expires_at) "
+        "VALUES ($1, $2, $3, NULL, $4, $5) ON CONFLICT (key) DO NOTHING",
+        key, operation, user_id, now_str(), expires,
+    )
+    if rc > 0:
+        return None  # ключ наш — выполняем операцию
+    row = await adb_core.fetchrow(
+        "SELECT result FROM idempotency_keys WHERE key = $1", key
+    )
+    if row and row["result"]:
+        try:
+            return json.loads(row["result"])
+        except (ValueError, TypeError):
+            return {}
+    return {}  # ключ занят, но результата ещё нет (операция в полёте)
+
+
+async def idem_store(key: str, result: dict) -> None:
+    """Сохранить результат операции под ранее застолблённым idem-ключом."""
+    import json
+
+    await adb_core.execute(
+        "UPDATE idempotency_keys SET result = $1 WHERE key = $2",
+        json.dumps(result), key,
+    )
+
+
+async def idem_release(key: str) -> None:
+    """Освободить застолблённый ключ, если операция упала ДО idem_store —
+    чтобы легитимный ретрай не получал 409 навсегда (до expiry). Удаляем только
+    строки без результата (result IS NULL): успешный ключ не трогаем."""
+    await adb_core.execute(
+        "DELETE FROM idempotency_keys WHERE key = $1 AND result IS NULL", key
+    )
+
+
 def set_role(user_id: int, username: str, full_name: str, role: str) -> bool:
     valid_roles = VALID_ROLES
     if role not in valid_roles:
@@ -3176,6 +3259,20 @@ def mark_shipment_notified(demand_id: str) -> bool:
     return inserted
 
 
+def unmark_shipment_notified(demand_id: str) -> bool:
+    """Освободить дедуп-слот отгрузки (R5): если ВСЕ отправки уведомления упали
+    (Telegram 5xx), слот нужно снять, чтобы резервный поллер повторил позже —
+    иначе уведомление потеряно навсегда. Возвращает True, если строка удалена."""
+    if not demand_id:
+        return False
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("DELETE FROM notified_shipments WHERE demand_id = ?"), (demand_id,))
+        deleted = cur.rowcount > 0
+        conn.commit()
+    return deleted
+
+
 def prune_notified_shipments(older_than_days: int = 30) -> int:
     """Удалить старые записи дедупа отгрузок (таблица иначе растёт без предела).
 
@@ -3311,6 +3408,31 @@ async def set_order_ms_drift(order_id: int) -> bool:
             "UPDATE orders SET ms_drift_at = $1, updated_at = $2 "
             "WHERE id = $3 AND ms_drift_at IS NULL",
             now_str(), now_str(), order_id,
+        )
+        > 0
+    )
+
+
+async def set_order_ms_demand_failed(order_id: int) -> bool:
+    """R4: пометить «CO создан, demand упал» — заказ ждёт ручной доделки отгрузки.
+    Идемпотентно (только если флаг ещё не стоит). Попадает в ночной дайджест."""
+    return (
+        await adb_core.execute(
+            "UPDATE orders SET ms_demand_failed_at = $1, updated_at = $2 "
+            "WHERE id = $3 AND ms_demand_failed_at IS NULL",
+            now_str(), now_str(), order_id,
+        )
+        > 0
+    )
+
+
+async def clear_order_ms_demand_failed(order_id: int) -> bool:
+    """Снять флаг demand-fail (отгрузка наконец создана — вручную или ретраем)."""
+    return (
+        await adb_core.execute(
+            "UPDATE orders SET ms_demand_failed_at = NULL, updated_at = $1 "
+            "WHERE id = $2 AND ms_demand_failed_at IS NOT NULL",
+            now_str(), order_id,
         )
         > 0
     )
@@ -3869,7 +3991,15 @@ async def get_ms_sync_anomalies(since_iso: str) -> dict[str, list[dict]]:
         "ORDER BY ms_deleted_at DESC",
         since_iso,
     )
-    return {"drift": list(drift), "deleted": list(deleted)}
+    # R4: customerorder создан, demand упал — отгрузка не проведена, остатки не
+    # списаны. Ждёт ручной доделки demand в МС.
+    demand_failed = await adb_core.fetch(
+        "SELECT id, agent_name, full_name, status, ms_demand_failed_at FROM orders "
+        "WHERE ms_demand_failed_at IS NOT NULL AND ms_demand_failed_at >= $1 "
+        "AND (deleted_at IS NULL) ORDER BY ms_demand_failed_at DESC",
+        since_iso,
+    )
+    return {"drift": list(drift), "deleted": list(deleted), "demand_failed": list(demand_failed)}
 
 
 def clear_order_ms_customerorder_id(order_id: int) -> bool:
@@ -4294,6 +4424,64 @@ async def get_payments_report(since: str | None = None, until: str | None = None
         query += f" AND created_at <= ${len(params)}"
     query += " ORDER BY created_at DESC"
     return await adb_core.fetch(query, *params)
+
+
+async def get_cash_history(limit: int = 80) -> list[dict]:
+    """Единая лента движения денег для босса: платежи + сдачи наличных +
+    возвраты, в одном списке, новые сверху. Каждая запись: kind
+    (payment|deposit|return), сумма, валюта, статус, кто (имя), когда, заказ.
+
+    «Кто» резолвим по user_id через get_all_users (payments.user_id /
+    cash_deposits.manager_id / returns.created_by). Деньги форматируются на
+    фронте; здесь отдаём amount как есть (float — только для отображения, не
+    для расчётов; денежное ядро остаётся на cents в своих функциях).
+    """
+    pays = await adb_core.fetch(
+        "SELECT id, user_id, amount, currency, status, comment, order_id, created_at "
+        "FROM payments ORDER BY created_at DESC LIMIT $1",
+        limit,
+    )
+    deps = await adb_core.fetch(
+        "SELECT id, manager_id, amount, status, reject_reason, created_at "
+        "FROM cash_deposits WHERE (deleted_at IS NULL) ORDER BY created_at DESC LIMIT $1",
+        limit,
+    )
+    rets = await adb_core.fetch(
+        "SELECT id, order_id, created_by, total_amount, refund_method, status, "
+        "reason, created_at FROM returns WHERE (deleted_at IS NULL) "
+        "ORDER BY created_at DESC LIMIT $1",
+        limit,
+    )
+    names = {u["user_id"]: u.get("full_name") or str(u["user_id"]) for u in get_all_users()}
+
+    rows: list[dict] = []
+    for p in pays:
+        rows.append({
+            "kind": "payment", "id": p["id"], "amount": float(p["amount"] or 0),
+            "currency": p.get("currency") or "USD", "status": p["status"],
+            "who": names.get(p["user_id"], str(p["user_id"])),
+            "order_id": p.get("order_id"), "note": p.get("comment") or "",
+            "created_at": (p.get("created_at") or "")[:16],
+        })
+    for d in deps:
+        rows.append({
+            "kind": "deposit", "id": d["id"], "amount": float(d["amount"] or 0),
+            "currency": "USD", "status": d["status"],
+            "who": names.get(d["manager_id"], str(d["manager_id"])),
+            "order_id": None, "note": d.get("reject_reason") or "",
+            "created_at": (d.get("created_at") or "")[:16],
+        })
+    for r in rets:
+        rows.append({
+            "kind": "return", "id": r["id"], "amount": float(r["total_amount"] or 0),
+            "currency": "USD", "status": r["status"],
+            "who": names.get(r["created_by"], str(r["created_by"])),
+            "order_id": r.get("order_id"), "note": r.get("reason") or "",
+            "created_at": (r.get("created_at") or "")[:16],
+        })
+    # Сортировка по дате убыв.; created_at — строка YYYY-MM-DD HH:MM (лексикогр.).
+    rows.sort(key=lambda x: x["created_at"], reverse=True)
+    return rows[:limit]
 
 
 def get_cashbox_stats(since: str | None = None, until: str | None = None) -> dict:
@@ -4897,7 +5085,9 @@ async def get_open_debts(
     query = (
         "SELECT * FROM orders "
         "WHERE payment_type = 'credit' AND paid_confirmed_at IS NULL "
-        "AND status IN ('approved', 'shipped')"
+        "AND status IN ('approved', 'shipped') "
+        # Заказ удалён в МойСклад (фантом) → долга по нему быть не должно.
+        "AND (ms_deleted_at IS NULL)"
     )
     params: list = []
     if user_id is not None:
@@ -4934,6 +5124,8 @@ async def get_paid_orders_awaiting_confirmation(user_id: int | None = None) -> l
         "SELECT * FROM orders o "
         "WHERE o.payment_type = 'paid' "
         "AND o.status IN ('approved', 'shipped') "
+        # Заказ удалён в МойСклад (фантом) → не ждём по нему подтверждения оплаты.
+        "AND (o.ms_deleted_at IS NULL) "
         "AND EXISTS (SELECT 1 FROM payments p "
         "            WHERE p.order_id = o.id AND p.status = 'pending')"
     )

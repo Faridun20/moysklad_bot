@@ -113,12 +113,13 @@ async def tg_send_message(
     *,
     parse_mode: str = "HTML",
     reply_markup: dict | None = None,
-) -> None:
+) -> bool:
     """Послать сообщение через Bot API без aiogram.Bot.
 
-    Ничего не возвращаем (best-effort): для уведомлений нам важнее
-    не упасть из-за единичного бага, чем дождаться ответа. Логируем,
-    если что — выгружаем в Railway.
+    Best-effort: не бросаем исключений (единичный сбой не должен ронять
+    рассылку). Возвращаем True при успешной доставке, False при ошибке —
+    вызывающий может это игнорировать (большинство), либо использовать для
+    решения (R5: дедуп-слот отгрузки столбим только при успехе).
     """
     payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
     if reply_markup is not None:
@@ -129,11 +130,13 @@ async def tg_send_message(
             if resp.status >= 400:
                 body = await resp.text()
                 _note_send_fail(chat_id, f"HTTP {resp.status}: {_redact_token(body[:200])}")
-            else:
-                _note_send_ok()
+                return False
+            _note_send_ok()
+            return True
     except Exception as e:
         # repr(e) у aiohttp-ошибок может содержать URL с токеном — редактим.
         _note_send_fail(chat_id, _redact_token(repr(e)))
+        return False
 
 
 # ─── Получатели уведомлений ───
@@ -198,16 +201,18 @@ async def aget_notify_recipients() -> list[int]:
 _BROADCAST_CONCURRENCY = 20
 
 
-async def _gather_limited(coros: list) -> None:
+async def _gather_limited(coros: list) -> list:
     """Выполнить корутины с ограничением параллелизма; ошибки не пробрасываем
-    (рассылка best-effort, единичный сбой не должен ронять остальные)."""
+    (рассылка best-effort, единичный сбой не должен ронять остальные).
+    Возвращает список результатов (Exception для упавших) — вызывающий может
+    игнорировать или проверить (R5)."""
     sem = asyncio.Semaphore(_BROADCAST_CONCURRENCY)
 
     async def _run(coro):
         async with sem:
             return await coro
 
-    await asyncio.gather(*(_run(c) for c in coros), return_exceptions=True)
+    return await asyncio.gather(*(_run(c) for c in coros), return_exceptions=True)
 
 
 async def send_to_recipients(bot: Bot, text: str, recipients: list[int]):
@@ -296,7 +301,15 @@ async def notify_new_shipment(
 
     txt = f"{DIV}\n🔔 <b>Новая отгрузка!</b>\n\n" + format_shipment(shipment, positions)
     async with metrics.atimer("notify.shipment.broadcast"):
-        await _gather_limited([tg_send_message(uid, txt) for uid in recipients])
+        results = await _gather_limited([tg_send_message(uid, txt) for uid in recipients])
+    # R5: если НИ ОДНО уведомление не доставлено (Telegram down) — освобождаем
+    # дедуп-слот, чтобы резервный поллер повторил позже (иначе потеря навсегда).
+    if not any(r is True for r in results):
+        from services.database import unmark_shipment_notified
+
+        unmark_shipment_notified(demand_id)
+        metrics.incr("notify.shipment.all_failed")
+        return False
     metrics.incr("notify.shipment.sent")
     return True
 

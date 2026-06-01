@@ -96,6 +96,14 @@ def _authorize(
     user = verify_init_data(data.get("initData", ""))
     if not user:
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
+    # R1: деактивацию проверяем ПРЯМЫМ read из БД (минуя кэш ролей) — кэш
+    # per-process с TTL 60с, и деактивация из бот-процесса иначе не видна webapp
+    # до минуты. Касается и allowed_roles=None (свои-данные эндпоинты): уволенный
+    # не должен дёргать даже их. Lookup по PK дешёвый.
+    from services.database import is_user_deactivated
+
+    if is_user_deactivated(user["id"]):
+        raise HTTPException(status_code=403, detail="Доступ деактивирован")
     if allowed_roles is not None:
         role = get_role(user["id"])
         if role not in allowed_roles:
@@ -1005,16 +1013,37 @@ def _resolve_analytics_period(data: dict, now):
         return since, until, since - span, label
 
     period = data.get("period", "week")
-    presets = {
-        "week": (now - timedelta(weeks=1), now - timedelta(weeks=2), "Неделя"),
-        "month": (now - timedelta(days=30), now - timedelta(days=60), "Месяц"),
-        "3month": (now - timedelta(days=90), now - timedelta(days=180), "3 месяца"),
-        "year": (now - timedelta(days=365), now - timedelta(days=730), "Год"),
-    }
-    # Индексируем, а не распаковываем в 3 цели — multi-target unpack из
-    # dict.get() роняет mypy 2.1 (AssertionError в check_multi_assignment_from_tuple).
-    preset = presets.get(period, presets["month"])
-    return preset[0], now, preset[1], preset[2]
+    # Календарные границы (а не скользящее окно «now − N дней»): «Неделя» — с
+    # понедельника текущей недели, «Месяц» — с 1-го числа, «Год» — с 1 января.
+    # prev_since — начало ПРЕДЫДУЩЕГО такого же периода (для тренда). until=now
+    # (период «по сейчас»), так что текущая неделя/месяц считаются нарастающим
+    # итогом, а сравниваются с целым предыдущим — это ожидаемо для дашборда.
+    day0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "week":
+        since = day0 - timedelta(days=day0.weekday())          # понедельник
+        prev_since = since - timedelta(weeks=1)
+        label = "Неделя"
+    elif period == "3month":
+        # Начало квартала: 1-е число первого месяца квартала.
+        q_first_month = ((now.month - 1) // 3) * 3 + 1
+        since = day0.replace(day=1, month=q_first_month)
+        prev_month = q_first_month - 3
+        prev_year = since.year
+        if prev_month <= 0:
+            prev_month += 12
+            prev_year -= 1
+        prev_since = since.replace(year=prev_year, month=prev_month)
+        label = "Квартал"
+    elif period == "year":
+        since = day0.replace(month=1, day=1)
+        prev_since = since.replace(year=since.year - 1)
+        label = "Год"
+    else:  # month (дефолт)
+        since = day0.replace(day=1)
+        prev_year, prev_month = (since.year - 1, 12) if since.month == 1 else (since.year, since.month - 1)
+        prev_since = since.replace(year=prev_year, month=prev_month)
+        label = "Месяц"
+    return since, now, prev_since, label
 
 
 def _ts(o: dict) -> str:
@@ -1171,6 +1200,24 @@ async def api_payments_history(request: Request):
     except Exception as e:
         logger.exception("payments/history failed for user_id=%s", user_id)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/cash/history")
+async def api_cash_history(request: Request):
+    """Единая лента движения денег (платежи + сдачи + возвраты) — для босса.
+    Менеджер видит свою историю через /api/payments/history; здесь — общая
+    картина «кто/когда/сколько», которой раньше не было."""
+    from services import async_db as adb
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_cash_history",
+        rate_limit_max=120,
+    )
+    rows = await adb.get_cash_history(80)
+    return JSONResponse({"history": rows})
 
 
 @app.post("/api/payments/pending")
@@ -2101,15 +2148,29 @@ async def api_deposits_create(request: Request):
             status_code=400, detail="Сумма должна быть положительным числом до 10М"
         )
 
-    # Idempotency: create_cash_deposit НЕ защищён claim'ом — двойной POST создаёт
-    # две сдачи. Кэш-ключ отсекает дубль в пределах TTL.
+    # R2: DB-уровневая идемпотентность. create_cash_deposit не защищён claim'ом —
+    # двойной POST (ретрай клиента после рестарта webapp/мультиворкер) создаёт две
+    # сдачи. idem_claim атомарно столбит ключ в общей БД (in-mem кэш не переживал
+    # рестарт). Если ключ уже был — отдаём сохранённый результат, не повторяем.
     idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"deposit_create:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
-    res = await adb.create_cash_deposit(user["id"], amount)
+    full_key = f"deposit_create:{user['id']}:{idem_key}" if idem_key else None
+    if full_key:
+        prev = await adb.idem_claim(full_key, "deposit_create", user["id"])
+        if prev is not None:
+            if prev.get("deposit_id"):
+                return JSONResponse(prev)
+            # Ключ занят, но результата нет (операция в полёте/упала до store) —
+            # безопаснее отказать, чем рискнуть дублем.
+            raise HTTPException(status_code=409, detail="Запрос уже обрабатывается")
+    try:
+        res = await adb.create_cash_deposit(user["id"], amount)
+    except Exception:
+        if full_key:
+            await adb.idem_release(full_key)  # упало до store — освободить ретраю
+        raise
     if not res.get("ok"):
+        if full_key:
+            await adb.idem_release(full_key)
         raise HTTPException(status_code=400, detail=res.get("error", "не удалось создать сдачу"))
 
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
@@ -2124,8 +2185,8 @@ async def api_deposits_create(request: Request):
     except Exception:
         logger.warning("deposit create notify failed", exc_info=True)
     resp = {"ok": True, "deposit_id": res["deposit_id"]}
-    if idem_key:
-        _idem_set(f"deposit_create:{user['id']}:{idem_key}", resp)
+    if full_key:
+        await adb.idem_store(full_key, resp)
     return JSONResponse(resp)
 
 
@@ -2257,13 +2318,16 @@ async def api_returns_create(request: Request):
     if refund not in ("cash", "debt_reduction", "no_refund"):
         raise HTTPException(status_code=400, detail="Некорректный способ возврата денег")
 
-    # Idempotency: create_return НЕ защищён claim'ом — двойной POST создаёт два
-    # возврата. Кэш-ключ отсекает дубль в пределах TTL.
+    # R2: DB-уровневая идемпотентность (двойной POST создавал два возврата —
+    # двойной refund/занижение долга). idem_claim столбит ключ в общей БД.
     idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"return_create:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
+    full_key = f"return_create:{user['id']}:{idem_key}" if idem_key else None
+    if full_key:
+        prev = await adb.idem_claim(full_key, "return_create", user["id"])
+        if prev is not None:
+            if prev.get("return_id"):
+                return JSONResponse(prev)
+            raise HTTPException(status_code=409, detail="Запрос уже обрабатывается")
 
     order = await adb.get_order(order_id)
     if not order:
@@ -2289,16 +2353,23 @@ async def api_returns_create(request: Request):
         )
         for it in items
     ]
-    res = await adb.create_return(
-        order_id,
-        "full",
-        reason,
-        ret_items,
-        refund_method=refund,
-        created_by=user["id"],
-        force=privileged,
-    )
+    try:
+        res = await adb.create_return(
+            order_id,
+            "full",
+            reason,
+            ret_items,
+            refund_method=refund,
+            created_by=user["id"],
+            force=privileged,
+        )
+    except Exception:
+        if full_key:
+            await adb.idem_release(full_key)  # упало до store — освободить ретраю
+        raise
     if not res.get("ok"):
+        if full_key:
+            await adb.idem_release(full_key)
         raise HTTPException(status_code=409, detail=res.get("error", "не удалось"))
 
     # То же уведомление с кнопками, что и бот-команда /return.
@@ -2310,8 +2381,8 @@ async def api_returns_create(request: Request):
     except Exception:
         logger.warning("return create notify failed", exc_info=True)
     resp = {"ok": True, "return_id": res["return_id"], "total_amount": res["total_amount"]}
-    if idem_key:
-        _idem_set(f"return_create:{user['id']}:{idem_key}", resp)
+    if full_key:
+        await adb.idem_store(full_key, resp)
     return JSONResponse(resp)
 
 
