@@ -15,12 +15,14 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
-from services.roles import is_boss
+# cached_role вместо database.get_role: per-process кэш ролей (TTL 60с) —
+# /start и команды не делают синхронный SELECT к БД на каждый вызов
+# (конвенция CLAUDE.md). Значение идентично get_role (guest для деактивированных).
+from services.roles import cached_role as get_role, is_boss
 from utils.formatters import DIV
 from utils.helpers import user_safe_error
 from config import ADMIN_IDS, WEBAPP_URL
 from services.database import (
-    get_role,
     ensure_user,
 )
 

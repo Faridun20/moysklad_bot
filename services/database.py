@@ -189,14 +189,15 @@ def now_str() -> str:
 
 
 def _invalidate_role_cache(user_id: int) -> None:
-    """Сбрасываем кэш ролей. Лениво импортируем services.roles, иначе
-    круговой импорт (roles уже зависит от database)."""
+    """Сбрасываем кэш ролей И флага деактивации. Лениво импортируем
+    services.roles, иначе круговой импорт (roles уже зависит от database)."""
     try:
-        from services.roles import invalidate_role
+        from services.roles import invalidate_deactivated, invalidate_role
 
         invalidate_role(user_id)
+        invalidate_deactivated(user_id)
     except Exception:
-        # Кэш — мягкий, рассинхрон протухнет через TTL за 60 сек.
+        # Кэш — мягкий, рассинхрон протухнет через TTL.
         # Не валим write-операцию из-за проблем с кэшем.
         pass
 

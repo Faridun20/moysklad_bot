@@ -201,12 +201,11 @@ async function showScreen(screen) {
       case 'stock':
         // Лега̀cy: внешние ссылки могут звать stock, перенаправляем
         // в объединённый таб «Склад и заказы» сразу на под-вкладку каталога.
+        // ordersData не сбрасываем — TTL-кэш отдаёт свежие данные без рефетча.
         ordersSubTab = 'stock';
-        ordersData = null;
         await renderOrdersScreen();
         break;
       case 'orders':
-        ordersData = null;
         await renderOrdersScreen();
         break;
       case 'finance':
@@ -511,6 +510,7 @@ let stockCurrentCat = 'all';   // id выбранной категории ил�
 let stockSearch = '';
 let stockInStockOnly = false;  // фильтр «только в наличии»
 let stockLimit = 200;          // сколько товаров показываем («Показать ещё» +200)
+let _stockSearchTimer = null;  // дебаунс ввода в поиске по складу
 
 async function renderStock() {
   const content = document.getElementById('content');
@@ -591,15 +591,9 @@ function renderStockList() {
         </div>`;
       }).join('');
 
-  // Boss: тап по строке → редактор цены. Индекс в отфильтрованном списке.
-  if (isBoss) {
-    listEl.querySelectorAll('[data-price-idx]').forEach(row => {
-      row.addEventListener('click', () => {
-        const p = filtered[parseInt(row.dataset.priceIdx, 10)];
-        if (p) openPriceEditor(p);
-      });
-    });
-  }
+  // Boss: тап по строке → редактор цены. Слушатель НЕ вешаем здесь (был бы
+  // re-attach N строк на каждое нажатие в поиске) — делегирование на #stock-list
+  // навешено один раз в renderStockContent.
 
   const truncEl = document.getElementById('stock-trunc');
   if (truncEl) {
@@ -700,6 +694,22 @@ function renderStockContent() {
   `;
   renderStockList();
 
+  // Boss: делегированный клик по строке товара → редактор цены. Вешаем ОДИН
+  // раз на контейнер (строки пересоздаются в renderStockList — индивидуальные
+  // слушатели пришлось бы перевешивать на каждое нажатие в поиске).
+  const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
+  if (isBoss) {
+    const listEl = document.getElementById('stock-list');
+    if (listEl) {
+      listEl.addEventListener('click', e => {
+        const row = e.target.closest('[data-price-idx]');
+        if (!row) return;
+        const p = _stockFiltered()[parseInt(row.dataset.priceIdx, 10)];
+        if (p) openPriceEditor(p);
+      });
+    }
+  }
+
   document.querySelectorAll('[data-cat]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
@@ -714,10 +724,13 @@ function renderStockContent() {
   });
   const searchInput = document.getElementById('stock-search');
   if (searchInput) {
+    // Дебаунс: на каждое нажатие фильтровали весь каталог и перестраивали до
+    // 200 строк → джанк на больших списках. Ждём паузу в наборе ~180мс.
     searchInput.addEventListener('input', e => {
       stockSearch = e.target.value;
       stockLimit = 200;   // новый запрос — список с начала
-      renderStockList();  // обновляем только список — поле держит фокус
+      clearTimeout(_stockSearchTimer);
+      _stockSearchTimer = setTimeout(renderStockList, 180);  // поле держит фокус
     });
     // не дёргаем фокус, чтобы не открывать клавиатуру при первом рендере
   }
@@ -816,6 +829,8 @@ function clearMainButton() {
 // ─── Экран: Заказы ──────────────────────────────────
 
 let ordersData = null;
+let ordersDataTs = 0;            // отметка времени загрузки ordersData (TTL-кэш)
+const ORDERS_TTL_MS = 60000;     // как у analyticsCache — переключение вкладок не рефетчит
 let currentOrderFilter = 'all';
 let currentOrderPeriod = 'all';  // 'all' | 'today' | '7d' | '30d' | 'custom'
 let currentOrderFrom = '';       // YYYY-MM-DD — кастомный диапазон (period='custom')
@@ -1077,12 +1092,18 @@ function orderDateLabel(key) {
 
 async function renderOrders() {
   const content = document.getElementById('content');
-  content.innerHTML = loading('Загружаю заказы…');
-  try {
-    ordersData = await api('/api/orders', {});
-  } catch (e) {
-    content.innerHTML = errorBox(e.message);
-    return;
+  // Кэш заказов: переключение вкладок (Заказы↔Каталог↔Финансы) не должно
+  // каждый раз дёргать /api/orders. Мутации (delete/ship/cancel) ставят
+  // ordersData = null — это форсит свежую загрузку ниже.
+  if (!ordersData || Date.now() - ordersDataTs > ORDERS_TTL_MS) {
+    content.innerHTML = loading('Загружаю заказы…');
+    try {
+      ordersData = await api('/api/orders', {});
+      ordersDataTs = Date.now();
+    } catch (e) {
+      content.innerHTML = errorBox(e.message);
+      return;
+    }
   }
   renderOrdersMain();
 }
@@ -2284,20 +2305,26 @@ async function renderCashbox(container) {
   const isBoss = role === 'admin' || role === 'boss';
 
   // Каждый список может вернуть 403 (роль не видит) — тихо пропускаем.
+  // Запросы независимы → тянем параллельно (Promise.all), а не по очереди:
+  // для босса было ~5 round-trip'ов подряд (~1с спиннера).
   let deposits = [];
   let returns = [];
   let myDeposits = [];
   let payPending = [];   // paid-заказы с pending-оплатой (подтверждает босс)
   let cashHistory = [];  // единая лента движения денег (босс)
-  try { deposits = (await api('/api/deposits/pending', {})).deposits || []; } catch {}
-  try { returns = (await api('/api/returns/pending', {})).returns || []; } catch {}
+  const _grab = (path, key) => api(path, {}).then(r => r[key] || []).catch(() => []);
+  const tasks = [
+    _grab('/api/deposits/pending', 'deposits').then(v => { deposits = v; }),
+    _grab('/api/returns/pending', 'returns').then(v => { returns = v; }),
+  ];
   if (canDeposit) {
-    try { myDeposits = (await api('/api/deposits/my', {})).deposits || []; } catch {}
+    tasks.push(_grab('/api/deposits/my', 'deposits').then(v => { myDeposits = v; }));
   }
   if (isBoss) {
-    try { payPending = (await api('/api/payments/pending', {})).pending || []; } catch {}
-    try { cashHistory = (await api('/api/cash/history', {})).history || []; } catch {}
+    tasks.push(_grab('/api/payments/pending', 'pending').then(v => { payPending = v; }));
+    tasks.push(_grab('/api/cash/history', 'history').then(v => { cashHistory = v; }));
   }
+  await Promise.all(tasks);
 
   const depCards = deposits.map(d => {
     const orders = (d.orders || [])

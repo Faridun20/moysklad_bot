@@ -96,13 +96,14 @@ def _authorize(
     user = verify_init_data(data.get("initData", ""))
     if not user:
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
-    # R1: деактивацию проверяем ПРЯМЫМ read из БД (минуя кэш ролей) — кэш
-    # per-process с TTL 60с, и деактивация из бот-процесса иначе не видна webapp
-    # до минуты. Касается и allowed_roles=None (свои-данные эндпоинты): уволенный
-    # не должен дёргать даже их. Lookup по PK дешёвый.
-    from services.database import is_user_deactivated
+    # R1: деактивацию проверяем отдельно от роли — кэш ролей per-process с TTL,
+    # деактивация из бот-процесса иначе не видна webapp до истечения TTL. Касается
+    # и allowed_roles=None (свои-данные эндпоинты): уволенный не должен дёргать
+    # даже их. Через короткий деакт-кэш (TTL 30с, инвалидируется при
+    # deactivate/reactivate) — иначе это был бы SELECT на КАЖДЫЙ /api/* запрос.
+    from services.roles import cached_is_deactivated
 
-    if is_user_deactivated(user["id"]):
+    if cached_is_deactivated(user["id"]):
         raise HTTPException(status_code=403, detail="Доступ деактивирован")
     if allowed_roles is not None:
         role = get_role(user["id"])
@@ -150,6 +151,13 @@ APP_VERSION = _compute_app_version()
 logger.info("WebApp version: %s", APP_VERSION)
 
 app = FastAPI(title="МойСклад WebApp")
+
+# Gzip: статика (app.js ~141KB, style.css ~59KB) и крупные JSON-ответы
+# (/api/orders, /api/stock, /api/analytics) отдавались несжатыми — заметно на
+# мобильном. minimum_size — не жмём мелочь, где оверхед сжатия не окупается.
+from starlette.middleware.gzip import GZipMiddleware  # noqa: E402
+
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
 # ─── Metrics middleware: латентность + status-code counters для /api/* ─────
