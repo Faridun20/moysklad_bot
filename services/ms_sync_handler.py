@@ -309,8 +309,9 @@ async def apply_ms_customerorder_delete(order: dict, co_id: str) -> None:
 
     # Не approved (shipped/paid/cancelled/…): статус не трогаем, только ссылка.
     await adb.clear_order_ms_customerorder_id(order_id)
-    # Но помечаем как удалённый в МС → исключаем «фантомную» выручку из
-    # аналитики менеджеров (в учёте долгов заказ остаётся для ручной разборки).
+    # Помечаем как удалённый в МС → заказ уходит из аналитики, списков, а также
+    # из учёта долгов/лимитов (нет заказа в МС → нет долга по нему). Деньги/
+    # остатки в боте не трогаем — попадает в ночной ops-дайджест для ручной сверки.
     await adb.set_order_ms_deleted(order_id)
     await adb.add_audit_log(
         0,
@@ -393,18 +394,26 @@ async def _check_order_drift(order: dict, co_data: dict) -> None:
 
 
 async def _handle_demand_deleted(demand_id: str) -> None:
-    """Бот-созданная отгрузка (demand) удалена в МойСклад.
+    """Вебхук demand.DELETE: находим заказ по ms_demand_id и применяем
+    apply_ms_demand_delete. Идемпотентно (флаг уже стоит → тихо выходим)."""
+    order = await adb.find_order_by_ms_demand_id(demand_id)
+    if not order:
+        return
+    await apply_ms_demand_delete(order, demand_id)
+
+
+async def apply_ms_demand_delete(order: dict, demand_id: str) -> None:
+    """Применить «отгрузка (demand) удалена в МС» к локальному заказу. Общий путь
+    для вебхука (demand.DELETE) и cron-реконсиляции (run_ms_reconcile проверяет
+    существование demand-документа, не только customerorder).
 
     Статус/деньги/остатки НЕ трогаем (отгрузка их двигала), но помечаем заказ
-    `ms_deleted_at` → он уходит из аналитики выручки (фантом) и из списков
-    заказов; в учёте долгов остаётся для ручной разборки. Уведомляем boss/admin.
+    `ms_deleted_at` → он уходит из аналитики выручки, списков заказов И из учёта
+    долгов/лимитов (фантом: нет отгрузки → нет долга). Уведомляем boss/admin.
     Идемпотентно: при уже выставленном флаге — тихо выходим (без дубль-алерта)."""
     from services.notifier import aget_notify_recipients, tg_send_message
     from utils.helpers import esc
 
-    order = await adb.find_order_by_ms_demand_id(demand_id)
-    if not order:
-        return
     if order.get("ms_deleted_at"):
         return  # уже помечен — не дублируем уведомление
     order_id = order["id"]
