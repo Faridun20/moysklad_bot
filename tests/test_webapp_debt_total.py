@@ -74,3 +74,46 @@ def test_debts_base_total_none_when_empty(isolated_db, monkeypatch):
     client = _client(db, monkeypatch, mgr)
     body = client.post("/api/debts", json={"initData": str(mgr), "mode": "all"}).json()
     assert body["remaining_base_total"] is None
+
+
+def _confirmed_payment(db, mgr, amount, currency, order_id):
+    pid = db.add_payment(mgr, "m", "Mgr", amount, currency, "", order_id=order_id)
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("UPDATE payments SET status='confirmed' WHERE id=?"), (pid,))
+        conn.commit()
+    return pid
+
+
+def test_money_received_excludes_deleted_orders(isolated_db, monkeypatch):
+    """«Получено» не должно учитывать платежи по удалённым/фантомным заказам
+    (ms_deleted_at), но обязано считать платежи по живым заказам и standalone-
+    платежи без order_id."""
+    db = isolated_db
+    db._invalidate_currency_rates_cache()
+    mgr = 210
+
+    live = _credit_shipped(db, mgr, 100.0, "USD", "A-live")
+    _confirmed_payment(db, mgr, 100.0, "USD", live)
+
+    phantom = _credit_shipped(db, mgr, 50.0, "USD", "A-phantom")
+    _confirmed_payment(db, mgr, 50.0, "USD", phantom)
+
+    _confirmed_payment(db, mgr, 30.0, "USD", None)  # standalone /pay
+
+    client = _client(db, monkeypatch, mgr)
+
+    # До удаления: 100 (live) + 50 (phantom) + 30 (standalone) = 180.
+    body = client.post("/api/debts", json={"initData": str(mgr), "mode": "all"}).json()
+    received = {r["currency"]: r["total"] for r in body["money_received"]}
+    assert received.get("USD") == 180.0
+
+    # Помечаем phantom удалённым в МС — его 50 должны уйти из «получено».
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("UPDATE orders SET ms_deleted_at='2026-06-03 00:00:00' WHERE id=?"), (phantom,))
+        conn.commit()
+
+    body2 = client.post("/api/debts", json={"initData": str(mgr), "mode": "all"}).json()
+    received2 = {r["currency"]: r["total"] for r in body2["money_received"]}
+    assert received2.get("USD") == 130.0  # 100 live + 30 standalone, без 50 phantom

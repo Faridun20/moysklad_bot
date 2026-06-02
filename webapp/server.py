@@ -2910,15 +2910,20 @@ async def _money_summary(adb, user_id: int | None) -> dict:
     from services.database import get_conn, get_cursor, q
 
     def _load():
-        where = "WHERE 1=1"
+        # LEFT JOIN orders: платежи по удалённым/фантомным заказам (deleted_at /
+        # ms_deleted_at) НЕ должны попадать в «получено» — заказа нет, значит и
+        # денег по нему в сводке быть не должно. Standalone-платежи без order_id
+        # (o.id IS NULL) считаем как раньше — это реальные поступления.
+        where = "WHERE (o.id IS NULL OR (o.ms_deleted_at IS NULL AND o.deleted_at IS NULL))"
         params: list = []
         if user_id is not None:
-            where += " AND user_id = ?"
+            where += " AND p.user_id = ?"
             params.append(user_id)
         sql = (
-            f"SELECT status, currency, SUM(amount) AS total "
-            f"FROM payments {where} "
-            f"GROUP BY status, currency"
+            f"SELECT p.status, p.currency, SUM(p.amount) AS total "
+            f"FROM payments p LEFT JOIN orders o ON o.id = p.order_id "
+            f"{where} "
+            f"GROUP BY p.status, p.currency"
         )
         with get_conn() as conn:
             cur = get_cursor(conn)
