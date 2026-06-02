@@ -257,7 +257,80 @@ def test_reconcile_empty_makes_no_ms_calls(isolated_db, monkeypatch):
         return {}
 
     calls = _mock_ms_get(monkeypatch, _b)
-    # Нет approved-заказов с ms_customerorder_id.
+    # Нет заказов со ссылками на МС (ни CO, ни demand).
     rc = asyncio.run(rec.main())
     assert rc == 0
     assert calls == []  # 0 МС-вызовов до проверки набора
+
+
+def _mk_demand_order(db, status, demand_id, agent="Client"):
+    db.set_role(1, "m", "M", "manager")
+    oid = db.create_order(1, "M", "")
+    db.update_order_agent(oid, "A-1", agent)
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q("UPDATE orders SET status=?, ms_demand_id=? WHERE id=?"),
+            (status, demand_id, oid),
+        )
+        conn.commit()
+    return oid
+
+
+def test_reconcile_marks_deleted_demand(isolated_db, monkeypatch):
+    """Удалили в МС именно отгрузку (а заказ покупателя отсутствует/не связан):
+    demand-документ 404 → заказ помечается ms_deleted_at и выпадает из набора."""
+    import aiohttp
+
+    import tasks.run_ms_reconcile as rec
+
+    db = isolated_db
+    _mock_notify(monkeypatch)
+
+    async def _b(path):
+        raise aiohttp.ClientResponseError(None, (), status=404)
+
+    _mock_ms_get(monkeypatch, _b)
+    oid = _mk_demand_order(db, "shipped", "DM-9")
+
+    rc = asyncio.run(rec.main())
+    assert rc == 0
+    o = asyncio.run(db.get_order(oid))
+    assert o["status"] == "shipped"          # статус/деньги не трогаем
+    assert o["ms_deleted_at"] is not None    # помечен фантомом → вне долгов/аналитики
+    assert asyncio.run(db.get_orders_with_ms_demand()) == []  # идемпотентно
+
+
+def test_reconcile_demand_deleted_while_co_alive(isolated_db, monkeypatch):
+    """Заказ покупателя в МС жив, но отгрузка удалена → заказ всё равно помечается
+    ms_deleted_at (раньше reconcile проверял только CO и пропускал такой случай)."""
+    import aiohttp
+
+    import tasks.run_ms_reconcile as rec
+
+    db = isolated_db
+    _mock_notify(monkeypatch)
+
+    async def _b(path):
+        if "/demand/" in path:
+            raise aiohttp.ClientResponseError(None, (), status=404)
+        return {"id": "CO-X"}  # заказ покупателя ещё существует
+
+    _mock_ms_get(monkeypatch, _b)
+    db.set_role(1, "m", "M", "manager")
+    oid = db.create_order(1, "M", "")
+    db.update_order_agent(oid, "A-1", "Client")
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q(
+                "UPDATE orders SET status='shipped', ms_customerorder_id=?, "
+                "ms_demand_id=? WHERE id=?"
+            ),
+            ("CO-X", "DM-X", oid),
+        )
+        conn.commit()
+
+    rc = asyncio.run(rec.main())
+    assert rc == 0
+    assert asyncio.run(db.get_order(oid))["ms_deleted_at"] is not None

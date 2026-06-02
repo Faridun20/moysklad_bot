@@ -3971,6 +3971,22 @@ async def get_orders_with_ms_customerorder() -> list[dict]:
     )
 
 
+async def get_orders_with_ms_demand() -> list[dict]:
+    """Заказы со ссылкой на demand (отгрузку) в МС — для cron-реконсиляции
+    удалённых отгрузок (страховка от пропущенных demand.DELETE-вебхуков).
+
+    Если пользователь удаляет в МС именно отгрузку (а не заказ покупателя),
+    customerorder остаётся жив → reconcile по CO такой заказ не ловит. Этот
+    набор закрывает дыру: проверяем существование demand-документа. Уже
+    помеченные ms_deleted_at и терминальные cancelled/rejected исключаем.
+    Native async через adb_core."""
+    return await adb_core.fetch(
+        "SELECT * FROM orders WHERE ms_demand_id IS NOT NULL "
+        "AND (ms_deleted_at IS NULL) AND (deleted_at IS NULL) "
+        "AND status NOT IN ('cancelled', 'rejected')"
+    )
+
+
 async def get_ms_sync_anomalies(since_iso: str) -> dict[str, list[dict]]:
     """Заказы, требующие ручной разборки из-за рассинхрона с МойСклад (для
     ночного дайджеста ops_monitor). Два набора, помеченные с `since_iso`:
