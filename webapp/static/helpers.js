@@ -156,11 +156,22 @@
     if (!pays.length && !(dep.count > 0)) {
       return '<div class="loader">За период поступлений нет</div>';
     }
+    // Единый итог в базовой валюте (если есть курсы). base_partial → пометка,
+    // что часть валют без курса не вошла в сумму.
+    let head = '';
+    if (summary.base_total != null) {
+      const note = summary.base_partial
+        ? '<div class="money-total-note">часть валют без курса не учтена</div>'
+        : '';
+      head =
+        `<div class="money-total">≈ ${opsAmount(summary.base_total)} ` +
+        `${escapeHtml(summary.base_currency || 'USD')}</div>${note}`;
+    }
     const rows = pays
       .map((p) => row(`${p.currency} · ${fmtC(p.total_cents)}`, `${p.count} платеж.`))
       .join('');
     const depRow = row(`Наличные (сдачи) · ${fmtC(dep.total_cents)} USD`, `${dep.count || 0} сдач.`);
-    return `<div class="stock-list">${rows}${depRow}</div>`;
+    return `${head}<div class="stock-list">${rows}${depRow}</div>`;
   }
 
   return {

@@ -1582,6 +1582,21 @@ async def api_money_summary(request: Request):
     until_s = until.strftime("%Y-%m-%d %H:%M:%S")
     totals = await adb.get_money_totals(since_s, until_s)
     totals["period"] = {"label": label, "since": since_s[:10], "until": until_s[:10]}
+
+    # Единый итог в базовой валюте (через курсы, как в долгах): платежи по валютам
+    # + сдачи (USD=база). convert_to_base кэширован; None — если курс не задан →
+    # base_partial, чтобы UI пометил «часть валют без курса».
+    from config import BASE_CURRENCY
+    from services.database import convert_to_base
+
+    base_cur = (BASE_CURRENCY or "USD").upper()
+    parts = [(p["total_cents"] / 100, p["currency"]) for p in totals["payments"]]
+    parts.append((totals["deposits"]["total_cents"] / 100, base_cur))  # сдачи в USD
+    bases = [convert_to_base(amt, cur) for amt, cur in parts if amt > 0]
+    known = [x for x in bases if x is not None]
+    totals["base_currency"] = base_cur
+    totals["base_total"] = round(sum(known), 2) if known else None
+    totals["base_partial"] = bool(known) and len(known) < len(bases)
     return JSONResponse(totals)
 
 

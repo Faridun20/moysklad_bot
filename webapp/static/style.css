@@ -1486,6 +1486,13 @@ body {
 .subseg-item .ic { --ic-size: 16px; }
 .subseg-item.active { color: var(--accent); border-bottom-color: var(--accent); }
 
+/* Итог поступлений в базовой валюте (вкладка «Обзор» раздела «Деньги»). */
+.money-total {
+  font-size: 26px; font-weight: 800; color: var(--text);
+  margin: 8px 2px 2px; letter-spacing: -0.5px;
+}
+.money-total-note { font-size: 12px; color: var(--text-mute); margin: 0 2px 8px; }
+
 /* ─── Partial-оплата (input + кнопка в ряд) ────────────────────── */
 .pay-input-row {
   display: flex; gap: 8px; align-items: stretch; margin-top: 8px;
