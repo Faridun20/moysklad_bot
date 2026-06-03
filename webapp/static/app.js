@@ -2272,7 +2272,9 @@ function initNav() {
 
 let financeTab = 'debts';  // 'debts' | 'payments'
 let debtsFilter = 'all';   // 'all' | 'today'
-let cashboxSubTab = null;  // 'confirm' | 'ops' | 'my' — дефолт зависит от роли
+let cashboxSubTab = null;  // 'confirm' | 'ops' | 'my' | 'totals' | 'history' — дефолт зависит от роли
+let moneyPeriod = 'month'; // период для вкладки «Итоги» (week|month|3month|year)
+let moneySummary = null;   // кэш ответа /api/money/summary за текущий moneyPeriod
 
 async function renderFinance() {
   const content = document.getElementById('content');
@@ -2289,7 +2291,7 @@ async function renderFinance() {
   if (financeTab === 'cashbox' && !canCashbox) financeTab = 'debts';
 
   // Уточняем под-раздел в шапке: «Финансы · Касса» и т.п.
-  const FIN_LABELS = { debts: 'Долги', cashbox: 'Касса', limits: 'Лимиты' };
+  const FIN_LABELS = { debts: 'Долги', cashbox: 'Деньги', limits: 'Лимиты' };
   setScreenContext(`Финансы · ${FIN_LABELS[financeTab] || ''}`);
 
   const active = t => (financeTab === t ? 'active' : '');
@@ -2299,7 +2301,7 @@ async function renderFinance() {
   // руководителя: 3 пилюли + отдельная по стилю ссылка «Лимиты»). «Лимиты»
   // теперь равноправная 4-я вкладка.
   const sections = [{ key: 'debts', label: 'Долги' }];
-  if (canCashbox) sections.push({ key: 'cashbox', label: 'Касса' });
+  if (canCashbox) sections.push({ key: 'cashbox', label: 'Деньги' });
   if (isBoss) sections.push({ key: 'limits', label: 'Лимиты' });
 
   content.innerHTML = `
@@ -2362,6 +2364,11 @@ async function renderCashbox(container) {
   if (isBoss) {
     tasks.push(_grab('/api/payments/pending', 'pending').then(v => { payPending = v; }));
     tasks.push(_grab('/api/cash/history', 'history').then(v => { cashHistory = v; }));
+    // Итоги поступлений за период (платежи по валютам + сдачи). Свой формат
+    // ответа (не {key:[]}), поэтому грузим отдельно, а не через _grab.
+    tasks.push(
+      api('/api/money/summary', { period: moneyPeriod }).then(v => { moneySummary = v; }).catch(() => { moneySummary = null; })
+    );
   }
   await Promise.all(tasks);
 
@@ -2457,6 +2464,24 @@ async function renderCashbox(container) {
     ? `<div class="stock-list">${historyRows}</div>`
     : '<div class="loader">Движений пока нет</div>';
 
+  // Итоги поступлений за период (босс): платежи по валютам + сдачи. Сверху —
+  // выбор периода (как в Аналитике), ниже — суммы (renderMoneyTotalsHtml).
+  const MONEY_PERIODS = [
+    { key: 'week', label: 'Неделя' },
+    { key: 'month', label: 'Месяц' },
+    { key: '3month', label: 'Квартал' },
+    { key: 'year', label: 'Год' },
+  ];
+  const totalsBlock = `
+    <div class="subseg" style="margin-top:4px;">
+      ${MONEY_PERIODS.map(p =>
+        `<button class="subseg-item ${p.key === moneyPeriod ? 'active' : ''}" data-mperiod="${p.key}">${p.label}</button>`
+      ).join('')}
+    </div>
+    <div class="section-label">Поступления · ${escapeHtml((moneySummary && moneySummary.period && moneySummary.period.label) || '')}</div>
+    ${renderMoneyTotalsHtml(moneySummary)}
+  `;
+
   // Блок «сдать наличные» + «мои сдачи» — только для тех, кто физически сдаёт
   // (менеджер/кладовщик). Боссу/бухгалтеру self-deposit бессмысленен.
   let createBlock = '';
@@ -2489,21 +2514,23 @@ async function renderCashbox(container) {
 
   // Ручной платёж (не связан с заказом: аренда и т.п.) — для не-боссов
   // (бухгалтер/менеджер/кладовщик). Босс только подтверждает, ему не нужен.
+  // Несколько валютных строк за один сабмит → отдельные платежи (одно
+  // уведомление боссу с кнопкой на каждый). Строки добавляются динамически.
+  const payRowHtml = (cur) => `
+      <div class="form-row pay-row">
+        <input type="number" class="form-input pay-row-amount" placeholder="1500" inputmode="decimal">
+        <select class="form-input pay-row-cur">
+          ${['USD', 'UZS', 'RUB', 'EUR'].map(c =>
+            `<option ${c === (cur || 'USD') ? 'selected' : ''}>${c}</option>`
+          ).join('')}
+        </select>
+        <button class="cur-btn pay-row-del" title="Убрать строку">${icon('close')}</button>
+      </div>`;
   const payFormBlock = !isBoss ? `
       <div class="section-label">Новый платёж (не связан с заказом)</div>
       <div class="card">
-        <div class="form-row">
-          <label class="form-label">Сумма</label>
-          <input type="number" id="pay-amount" class="form-input" placeholder="1500" inputmode="decimal">
-        </div>
-        <div class="form-row">
-          <label class="form-label">Валюта</label>
-          <div class="cur-row">
-            ${['USD', 'UZS', 'RUB', 'EUR'].map((c, i) =>
-              `<button class="cur-btn ${i === 0 ? 'active' : ''}" data-cur="${c}">${c}</button>`
-            ).join('')}
-          </div>
-        </div>
+        <div id="pay-rows">${payRowHtml('USD')}</div>
+        <button id="pay-add-row" class="cur-btn">${icon('plus')} Ещё валюта</button>
         <div class="form-row">
           <label class="form-label">Комментарий</label>
           <input type="text" id="pay-comment" class="form-input" placeholder="За май, оплата аренды">
@@ -2552,7 +2579,8 @@ async function renderCashbox(container) {
   }
   if (hasOps) tabs.push({ key: 'ops', ic: 'plus', label: 'Операции' });
   if (canCreateDeposit) tabs.push({ key: 'my', ic: 'list', label: 'Мои сдачи' });
-  // История движения денег — для босса (вся компания: кто/когда/сколько).
+  // Итоги поступлений за период + история движения денег — для босса.
+  if (isBoss) tabs.push({ key: 'totals', ic: 'cash', label: 'Итоги' });
   if (isBoss) tabs.push({ key: 'history', ic: 'clock', label: 'История' });
 
   if (!tabs.find(t => t.key === cashboxSubTab)) {
@@ -2572,6 +2600,8 @@ async function renderCashbox(container) {
     bodyHtml = (createBlock + payFormBlock + returnBlock) || '<div class="loader">Нет доступных операций</div>';
   } else if (cashboxSubTab === 'my') {
     bodyHtml = myBlock || '<div class="loader">У вас пока нет сдач</div>';
+  } else if (cashboxSubTab === 'totals') {
+    bodyHtml = totalsBlock;
   } else if (cashboxSubTab === 'history') {
     bodyHtml = historyBlock;
   } else {
@@ -2612,31 +2642,61 @@ async function renderCashbox(container) {
     });
   }
 
-  // Ручной платёж (форма в «Операциях», не-босс).
-  let payCurrency = 'USD';
-  container.querySelectorAll('.cur-btn[data-cur]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      container.querySelectorAll('.cur-btn[data-cur]').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      payCurrency = btn.dataset.cur;
+  // Выбор периода для вкладки «Итоги» — рефетчим /api/money/summary.
+  container.querySelectorAll('[data-mperiod]').forEach(b => {
+    b.addEventListener('click', () => {
+      haptic('light');
+      moneyPeriod = b.dataset.mperiod;
+      renderCashbox(container);
     });
   });
+
+  // Мульти-валютный платёж: динамические строки (сумма+валюта) за один сабмит.
+  const addRowBtn = container.querySelector('#pay-add-row');
+  if (addRowBtn) {
+    const rowsBox = container.querySelector('#pay-rows');
+    const wireDelete = () => {
+      rowsBox.querySelectorAll('.pay-row-del').forEach(btn => {
+        btn.onclick = () => {
+          // Последнюю строку не удаляем — хотя бы одна нужна.
+          if (rowsBox.querySelectorAll('.pay-row').length > 1) btn.closest('.pay-row').remove();
+        };
+      });
+    };
+    wireDelete();
+    addRowBtn.addEventListener('click', () => {
+      // Новая строка с той же валютой, что в последней (удобно вводить серию).
+      const last = rowsBox.querySelector('.pay-row:last-child .pay-row-cur');
+      const cur = last ? last.value : 'USD';
+      const tmp = document.createElement('div');
+      tmp.innerHTML = `
+        <div class="form-row pay-row">
+          <input type="number" class="form-input pay-row-amount" placeholder="1500" inputmode="decimal">
+          <select class="form-input pay-row-cur">
+            ${['USD', 'UZS', 'RUB', 'EUR'].map(c => `<option ${c === cur ? 'selected' : ''}>${c}</option>`).join('')}
+          </select>
+          <button class="cur-btn pay-row-del" title="Убрать строку">${icon('close')}</button>
+        </div>`;
+      rowsBox.appendChild(tmp.firstElementChild);
+      wireDelete();
+    });
+  }
   const paySubmit = container.querySelector('#pay-submit');
   if (paySubmit) {
     paySubmit.addEventListener('click', async () => {
-      const amount = parseFloat(container.querySelector('#pay-amount').value);
-      const comment = container.querySelector('#pay-comment').value.trim();
       const status = container.querySelector('#pay-status');
-      if (!amount || amount <= 0) { status.textContent = '❌ Введите сумму'; status.className = 'pay-status pay-error'; return; }
+      const comment = container.querySelector('#pay-comment').value.trim();
+      const rawRows = Array.from(container.querySelectorAll('.pay-row')).map(r => ({
+        amount: r.querySelector('.pay-row-amount').value,
+        currency: r.querySelector('.pay-row-cur').value,
+      }));
+      const parsed = parsePaymentItems(rawRows);
+      if (parsed.error) { status.textContent = '❌ ' + parsed.error; status.className = 'pay-status pay-error'; return; }
       if (!comment) { status.textContent = '❌ Укажите комментарий'; status.className = 'pay-status pay-error'; return; }
       paySubmit.disabled = true;
       status.textContent = '⏳ Отправка…'; status.className = 'pay-status';
       try {
-        const r = await fetch('/api/payments/send', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ initData: _initData, amount, currency: payCurrency, comment }),
-        });
-        if (!r.ok) throw new Error((await r.json()).detail || 'Ошибка');
+        await api('/api/payments/send', { items: parsed.items, comment });
         tg.HapticFeedback?.notificationOccurred('success');
         renderCashbox(container);
       } catch (e) {

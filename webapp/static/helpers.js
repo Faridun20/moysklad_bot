@@ -125,5 +125,46 @@
     return blocks.join('');
   }
 
-  return { escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml };
+  // Парсинг строк мульти-валютной формы платежа в payload для /api/payments/send.
+  // Чистая функция (тестируется): принимает [{amount, currency}] как ввёл юзер
+  // (amount — строка/число), возвращает {items:[{amount:Number, currency}]} или
+  // {error}. Запятая как десятичный разделитель, пробелы игнорируются.
+  function parsePaymentItems(rows) {
+    const items = [];
+    for (const r of rows || []) {
+      const amt = parseFloat(String((r && r.amount) || '').replace(',', '.').replace(/\s/g, ''));
+      if (!isFinite(amt) || amt <= 0) {
+        return { error: 'Введите положительную сумму во всех строках' };
+      }
+      items.push({ amount: amt, currency: (r && r.currency) || 'USD' });
+    }
+    if (!items.length) return { error: 'Добавьте хотя бы одну строку' };
+    return { items };
+  }
+
+  // Рендер блока «Итоги» раздела «Деньги» (данные /api/money/summary):
+  // подтверждённые платежи по валютам + сдачи наличных. Чистая функция.
+  function renderMoneyTotalsHtml(summary) {
+    summary = summary || {};
+    const pays = summary.payments || [];
+    const dep = summary.deposits || { total_cents: 0, count: 0 };
+    const fmtC = (cents) => opsAmount((Number(cents) || 0) / 100);
+    const row = (title, sub) =>
+      `<div class="stock-row"><div class="stock-info">` +
+      `<div class="stock-name">${escapeHtml(title)}</div>` +
+      `<div class="stock-folder">${escapeHtml(sub)}</div></div></div>`;
+    if (!pays.length && !(dep.count > 0)) {
+      return '<div class="loader">За период поступлений нет</div>';
+    }
+    const rows = pays
+      .map((p) => row(`${p.currency} · ${fmtC(p.total_cents)}`, `${p.count} платеж.`))
+      .join('');
+    const depRow = row(`Наличные (сдачи) · ${fmtC(dep.total_cents)} USD`, `${dep.count || 0} сдач.`);
+    return `<div class="stock-list">${rows}${depRow}</div>`;
+  }
+
+  return {
+    escapeHtml, idemKey, formatDateRU, icon, opsAmount,
+    renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml,
+  };
 });

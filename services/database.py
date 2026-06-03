@@ -4537,6 +4537,67 @@ def get_cashbox_stats(since: str | None = None, until: str | None = None) -> dic
     return {"total_cents": total_cents, "count": count, "by_currency": by_currency}
 
 
+async def get_money_totals(since: str | None = None, until: str | None = None) -> dict:
+    """Поступления компании за период (раздел «Деньги», boss/admin).
+
+    - payments: подтверждённые платежи по валютам (в копейках). Платежи по
+      удалённым/фантомным заказам (ms_deleted_at/deleted_at) исключаем — как в
+      сводке долгов «получено»; standalone-платежи без order_id считаем.
+    - deposits: подтверждённые сдачи наличных (USD), суммарно.
+
+    since/until — ISO 'YYYY-MM-DD HH:MM:SS' в локальной TZ (как пишется
+    created_at); порог считаем в Python, передаём параметром (CLAUDE.md) —
+    НЕ сравниваем с SQL NOW()/datetime('now') (разные TZ, silent-bug).
+    """
+    pay_sql = (
+        "SELECT p.currency AS currency, COUNT(*) AS cnt, "
+        "COALESCE(SUM(COALESCE(p.amount_cents, CAST(round(p.amount * 100) AS INTEGER))), 0) "
+        "AS total_cents "
+        "FROM payments p LEFT JOIN orders o ON o.id = p.order_id "
+        "WHERE p.status = 'confirmed' "
+        "AND (o.id IS NULL OR (o.ms_deleted_at IS NULL AND o.deleted_at IS NULL))"
+    )
+    pay_params: list = []
+    if since:
+        pay_params.append(since)
+        pay_sql += f" AND p.created_at >= ${len(pay_params)}"
+    if until:
+        pay_params.append(until)
+        pay_sql += f" AND p.created_at <= ${len(pay_params)}"
+    pay_sql += " GROUP BY p.currency ORDER BY total_cents DESC"
+    pay_rows = await adb_core.fetch(pay_sql, *pay_params)
+
+    dep_sql = (
+        "SELECT COUNT(*) AS cnt, "
+        "COALESCE(SUM(COALESCE(amount_cents, CAST(round(amount * 100) AS INTEGER))), 0) "
+        "AS total_cents "
+        "FROM cash_deposits WHERE status = 'confirmed' AND (deleted_at IS NULL)"
+    )
+    dep_params: list = []
+    if since:
+        dep_params.append(since)
+        dep_sql += f" AND created_at >= ${len(dep_params)}"
+    if until:
+        dep_params.append(until)
+        dep_sql += f" AND created_at <= ${len(dep_params)}"
+    dep_row = await adb_core.fetchrow(dep_sql, *dep_params)
+
+    return {
+        "payments": [
+            {
+                "currency": r.get("currency") or "—",
+                "total_cents": int(r["total_cents"] or 0),
+                "count": int(r["cnt"] or 0),
+            }
+            for r in pay_rows
+        ],
+        "deposits": {
+            "total_cents": int((dep_row or {}).get("total_cents") or 0),
+            "count": int((dep_row or {}).get("cnt") or 0),
+        },
+    }
+
+
 async def get_summary_by_employee(
     since: str | None = None, until: str | None = None
 ) -> list[dict]:
