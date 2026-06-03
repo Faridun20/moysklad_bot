@@ -4,7 +4,10 @@ import { describe, it, expect } from 'vitest';
 
 import helpers from '../helpers.js';
 
-const { escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml } = helpers;
+const {
+  escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml,
+  parsePaymentItems, renderMoneyTotalsHtml,
+} = helpers;
 
 describe('escapeHtml', () => {
   it('экранирует все спец-символы HTML', () => {
@@ -129,5 +132,54 @@ describe('renderOpsSummaryHtml', () => {
     });
     expect(html).toContain('Рассинхрон с МойСклад');
     expect(html).toContain('badge-yellow">3<'); // 1 + 2
+  });
+});
+
+describe('parsePaymentItems', () => {
+  it('парсит строки в items с числовыми суммами', () => {
+    const r = parsePaymentItems([
+      { amount: '100', currency: 'USD' },
+      { amount: '50 000', currency: 'UZS' },
+      { amount: '1,5', currency: 'EUR' },
+    ]);
+    expect(r.error).toBeUndefined();
+    expect(r.items).toEqual([
+      { amount: 100, currency: 'USD' },
+      { amount: 50000, currency: 'UZS' },
+      { amount: 1.5, currency: 'EUR' },
+    ]);
+  });
+  it('пустой список → ошибка', () => {
+    expect(parsePaymentItems([]).error).toBeTruthy();
+  });
+  it('неположительная/нечисловая сумма → ошибка', () => {
+    expect(parsePaymentItems([{ amount: '0', currency: 'USD' }]).error).toBeTruthy();
+    expect(parsePaymentItems([{ amount: 'abc', currency: 'USD' }]).error).toBeTruthy();
+    expect(parsePaymentItems([{ amount: '-5', currency: 'USD' }]).error).toBeTruthy();
+  });
+  it('валюта по умолчанию USD', () => {
+    expect(parsePaymentItems([{ amount: '10' }]).items[0].currency).toBe('USD');
+  });
+});
+
+describe('renderMoneyTotalsHtml', () => {
+  it('пусто → «поступлений нет»', () => {
+    expect(renderMoneyTotalsHtml({})).toContain('поступлений нет');
+    expect(renderMoneyTotalsHtml(null)).toContain('поступлений нет');
+  });
+  it('платежи по валютам (cents→units) + строка сдач', () => {
+    const html = renderMoneyTotalsHtml({
+      payments: [{ currency: 'USD', total_cents: 1234500, count: 3 }],
+      deposits: { total_cents: 50000, count: 2 },
+    });
+    expect(html).toContain('USD · 12 345');
+    expect(html).toContain('3 платеж.');
+    expect(html).toContain('Наличные (сдачи) · 500 USD');
+    expect(html).toContain('2 сдач.');
+  });
+  it('экранирует валюту', () => {
+    const html = renderMoneyTotalsHtml({ payments: [{ currency: '<x>', total_cents: 100, count: 1 }], deposits: { count: 0 } });
+    expect(html).toContain('&lt;x&gt;');
+    expect(html).not.toContain('<x>');
   });
 });

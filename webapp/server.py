@@ -1383,9 +1383,91 @@ async def api_payments_link(request: Request):
     return JSONResponse(res)
 
 
+def _payment_identity(user: dict) -> tuple[int, str, str]:
+    """(user_id, full_name, username) для платежа из Telegram-юзера."""
+    user_id = user["id"]
+    full_name = (
+        f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+        or user.get("username", "")
+        or str(user_id)
+    )
+    username = f"@{user['username']}" if user.get("username") else "—"
+    return user_id, full_name, username
+
+
+def _validate_payment_amount(raw) -> float:
+    """0 < amount < 10M, конечное. Иначе HTTP 400 (S3: nan/inf отравляют FIFO)."""
+    import math
+
+    try:
+        amount = float(raw)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Неверная сумма")
+    if not (math.isfinite(amount) and 0 < amount < 10_000_000):
+        raise HTTPException(status_code=400, detail="Неверная сумма")
+    return amount
+
+
+async def _send_payments_batch(user: dict, items: list, comment_raw: str):
+    """Мульти-валютная отправка: несколько строк {amount, currency} → отдельные
+    платежи (каждый — одна валюта), ОДНО уведомление боссу с кнопкой
+    принять/отклонить на каждый. Экономит менеджеру N сабмитов."""
+    from config import ALLOWED_CURRENCIES
+    from services import async_db as adb
+    from services.notifier import aget_notify_recipients, tg_send_message
+    from utils.helpers import esc
+
+    if len(items) > 20:
+        raise HTTPException(status_code=400, detail="Слишком много строк (макс 20)")
+    comment = (comment_raw or "").strip()[:1000]
+    if not comment:
+        raise HTTPException(status_code=400, detail="Укажите комментарий")
+
+    parsed: list[tuple[float, str]] = []
+    for it in items:
+        amount = _validate_payment_amount((it or {}).get("amount", 0))
+        currency = (it or {}).get("currency", "USD")
+        if currency not in ALLOWED_CURRENCIES:
+            raise HTTPException(status_code=400, detail="Неверная валюта")
+        parsed.append((amount, currency))
+
+    user_id, full_name, username = _payment_identity(user)
+    role = get_role(user_id)
+    created: list[tuple[int, float, str]] = []
+    for amount, currency in parsed:
+        pid = await adb.add_payment(user_id, username, full_name, amount, currency, comment)
+        await adb.add_audit_log(
+            user_id,
+            full_name,
+            role,
+            "payment_sent",
+            f"Платёж #{pid}: {amount:,.0f} {currency} — {comment}",
+        )
+        created.append((pid, amount, currency))
+
+    lines = "\n".join(f"• {a:,.0f} {c}" for _, a, c in created)
+    notify_text = (
+        f"💳 <b>Новые платежи</b> от {esc(full_name)} ({esc(username)})\n"
+        f"{esc(comment)}\n\n{lines}"
+    )
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": f"✅ {a:,.0f} {c}", "callback_data": f"pay_ok:{pid}"},
+                {"text": "❌", "callback_data": f"pay_no:{pid}"},
+            ]
+            for pid, a, c in created
+        ]
+    }
+    for uid in await aget_notify_recipients():
+        await tg_send_message(uid, notify_text, reply_markup=keyboard)
+
+    return JSONResponse({"payment_ids": [pid for pid, _, _ in created], "status": "pending"})
+
+
 @app.post("/api/payments/send")
 async def api_payments_send(request: Request):
-    """Отправить новый платёж на подтверждение."""
+    """Отправить новый платёж на подтверждение (одиночный или мульти-валютный)."""
     from services import async_db as adb
     from services.notifier import tg_send_message
     from utils.formatters import format_payment_notify
@@ -1402,6 +1484,11 @@ async def api_payments_send(request: Request):
         rate_limit_max=5,
         rate_limit_window=60.0,
     )
+
+    # Мульти-валютная отправка: items=[{amount, currency}, …] + общий comment.
+    items = data.get("items")
+    if isinstance(items, list) and items:
+        return await _send_payments_batch(user, items, data.get("comment", ""))
 
     # Round 6 (S3): isnan/isinf + верхний лимит — float('1e308') проходит
     # `> 0`, отравляет FIFO-математику в БД, отдаёт `nan USD` боссу в UI.
@@ -1468,6 +1555,34 @@ async def api_payments_send(request: Request):
         await tg_send_message(uid, notify_text, reply_markup=keyboard)
 
     return JSONResponse({"payment_id": payment_id, "status": "pending"})
+
+
+# ─── API: деньги (итоги за период) ───────────────────────────────────────────
+
+
+@app.post("/api/money/summary")
+async def api_money_summary(request: Request):
+    """Поступления компании за период (boss/admin): подтверждённые платежи по
+    валютам + сдачи наличных. Период — как в аналитике (week/month/3month/year
+    или произвольный since/until). Деньги на удалённых заказах исключены."""
+    from datetime import datetime
+
+    from services import async_db as adb
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_money_summary",
+        rate_limit_max=60,
+    )
+    now = datetime.now()
+    since, until, _prev, label = _resolve_analytics_period(data, now)
+    since_s = since.strftime("%Y-%m-%d %H:%M:%S")
+    until_s = until.strftime("%Y-%m-%d %H:%M:%S")
+    totals = await adb.get_money_totals(since_s, until_s)
+    totals["period"] = {"label": label, "since": since_s[:10], "until": until_s[:10]}
+    return JSONResponse(totals)
 
 
 # ─── API: заказы ─────────────────────────────────────────────────────────────
