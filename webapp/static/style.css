@@ -1469,8 +1469,14 @@ body {
 .subseg {
   display: flex; gap: 4px; padding: 6px 0 0;
   border-bottom: 0.5px solid var(--divider); margin-bottom: 8px;
+  /* Много под-вкладок (Подтверждения\Операции\Итоги\История) не должны ломать
+     ряд: при переполнении — горизонтальный скролл, а не «съехавшие» кнопки. */
+  overflow-x: auto; flex-wrap: nowrap;
+  -webkit-overflow-scrolling: touch; scrollbar-width: none;
 }
+.subseg::-webkit-scrollbar { display: none; }
 .subseg-item {
+  flex-shrink: 0;   /* не сжимать — иначе подписи наезжают друг на друга */
   padding: 8px 10px 10px; border: 0; background: none; cursor: pointer;
   color: var(--text-mute); font-size: 13px; font-weight: 600; font-family: inherit;
   display: inline-flex; align-items: center; gap: 5px;

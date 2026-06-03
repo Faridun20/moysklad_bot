@@ -2473,9 +2473,9 @@ async function renderCashbox(container) {
     { key: 'year', label: 'Год' },
   ];
   const totalsBlock = `
-    <div class="subseg" style="margin-top:4px;">
+    <div class="cat-row" style="margin-top:10px;">
       ${MONEY_PERIODS.map(p =>
-        `<button class="subseg-item ${p.key === moneyPeriod ? 'active' : ''}" data-mperiod="${p.key}">${p.label}</button>`
+        `<button class="cat-btn ${p.key === moneyPeriod ? 'active' : ''}" data-mperiod="${p.key}">${p.label}</button>`
       ).join('')}
     </div>
     <div class="section-label">Поступления · ${escapeHtml((moneySummary && moneySummary.period && moneySummary.period.label) || '')}</div>
@@ -2608,6 +2608,13 @@ async function renderCashbox(container) {
     bodyHtml = (payBlock + depBlock + retBlock) || '<div class="loader">Нет записей на подтверждении</div>';
   }
   container.innerHTML = tabBar + bodyHtml;
+
+  // Если ряд под-вкладок шире экрана (скроллится) — подтягиваем активную в зону
+  // видимости, чтобы после переключения она не оставалась за краем.
+  const activeSub = container.querySelector('.subseg-item.active');
+  if (activeSub && activeSub.scrollIntoView) {
+    try { activeSub.scrollIntoView({ inline: 'center', block: 'nearest' }); } catch (e) { /* старый WebView */ }
+  }
 
   // Переключение под-вкладок кассы (контент в том же контейнере).
   container.querySelectorAll('[data-ctab]').forEach(t => {
