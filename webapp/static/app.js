@@ -2372,6 +2372,23 @@ async function renderCashbox(container) {
   }
   await Promise.all(tasks);
 
+  // Бейдж на разделе «Деньги» (уровень 1) с числом ожидающих подтверждений —
+  // видно сразу, не открывая раздел. Обновляем после каждого рефетча (подтвердил
+  // сдачу → счётчик уменьшился), поэтому сперва снимаем старый.
+  const moneyPill = document.querySelector('.seg-item[data-tab="cashbox"]');
+  if (moneyPill) {
+    const old = moneyPill.querySelector('.seg-badge');
+    if (old) old.remove();
+    const pendTotal = deposits.length + returns.length + payPending.length;
+    if (pendTotal > 0) {
+      const b = document.createElement('span');
+      b.className = 'stock-badge badge-yellow seg-badge';
+      b.textContent = pendTotal;
+      b.style.marginLeft = '6px';
+      moneyPill.appendChild(b);
+    }
+  }
+
   const depCards = deposits.map(d => {
     const orders = (d.orders || [])
       .map(o => `#${o.order_id} — ${fmt(o.amount_allocated)} USD`).join(', ') || '—';
@@ -2579,9 +2596,9 @@ async function renderCashbox(container) {
   }
   if (hasOps) tabs.push({ key: 'ops', ic: 'plus', label: 'Операции' });
   if (canCreateDeposit) tabs.push({ key: 'my', ic: 'list', label: 'Мои сдачи' });
-  // Итоги поступлений за период + история движения денег — для босса.
-  if (isBoss) tabs.push({ key: 'totals', ic: 'cash', label: 'Итоги' });
-  if (isBoss) tabs.push({ key: 'history', ic: 'clock', label: 'История' });
+  // «Обзор» (босс): итоги поступлений за период + лента движения денег на одном
+  // экране — меньше вкладок, ключевая цифра и история рядом.
+  if (isBoss) tabs.push({ key: 'overview', ic: 'cash', label: 'Обзор' });
 
   if (!tabs.find(t => t.key === cashboxSubTab)) {
     cashboxSubTab = tabs.length ? tabs[0].key : 'confirm';
@@ -2600,10 +2617,9 @@ async function renderCashbox(container) {
     bodyHtml = (createBlock + payFormBlock + returnBlock) || '<div class="loader">Нет доступных операций</div>';
   } else if (cashboxSubTab === 'my') {
     bodyHtml = myBlock || '<div class="loader">У вас пока нет сдач</div>';
-  } else if (cashboxSubTab === 'totals') {
-    bodyHtml = totalsBlock;
-  } else if (cashboxSubTab === 'history') {
-    bodyHtml = historyBlock;
+  } else if (cashboxSubTab === 'overview') {
+    // Итоги за период (сверху) + лента движения денег (снизу) на одном экране.
+    bodyHtml = totalsBlock + '<div class="section-label">Движение денег</div>' + historyBlock;
   } else {
     bodyHtml = (payBlock + depBlock + retBlock) || '<div class="loader">Нет записей на подтверждении</div>';
   }
