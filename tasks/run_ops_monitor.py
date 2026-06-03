@@ -23,22 +23,16 @@ import sys
 
 from datetime import datetime
 
+from config import WEBAPP_URL
 from services.database import (
     claim_ops_monitor_run,
     get_all_users,
-    get_batches_expiring_within,
-    get_ms_sync_anomalies,
-    get_overdue_undeposited_orders,
-    get_pending_cash_deposits,
-    get_pending_returns,
-    get_setting,
-    get_stale_crons,
-    get_stale_pending_orders,
     init_db,
     run_migrations,
 )
 from services.moysklad import close_session
 from services.notifier import close_tg_session, tg_send_message
+from services.ops_summary import gather_ops_summary
 from utils.helpers import esc as _esc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -301,6 +295,85 @@ def build_digest_keyboard(
     return {"inline_keyboard": rows} if rows else None
 
 
+# ─── Дневной пинг (короткое уведомление → смотри в WebApp) ────────────────────
+#
+# Раньше ops_monitor рассылал большие дайджесты в Telegram. Теперь сводку
+# смотрят в WebApp (`/api/ops-summary` + блок «Требует внимания» на главной),
+# а бот шлёт лишь ОДИН короткий пинг в день: «есть N событий — откройте WebApp».
+# Событийные уведомления с кнопками (заявки/платежи/сдачи/возвраты) остаются
+# в боте без изменений — это срочные действия, а не сводка.
+
+# Какие секции gather_ops_summary показываем в пинге каждой роли.
+_PING_ROLE_SECTIONS: dict[str, list[str]] = {
+    "admin": [
+        "stale_orders", "overdue_undeposited", "deposits", "returns",
+        "expiring_batches", "low_stock", "stale_crons", "ms_anomalies",
+    ],
+    "boss": [
+        "stale_orders", "overdue_undeposited", "deposits", "returns",
+        "expiring_batches", "low_stock", "stale_crons", "ms_anomalies",
+    ],
+    "bookkeeper": ["deposits"],
+    "warehouse_keeper": ["returns", "expiring_batches", "low_stock"],
+}
+
+_PING_SECTION_LABELS: dict[str, str] = {
+    "stale_orders": "⏳ Зависшие заявки",
+    "overdue_undeposited": "🚨 Деньги не сданы",
+    "deposits": "💵 Сдачи на подтверждении",
+    "returns": "↩️ Возвраты на подтверждении",
+    "expiring_batches": "⌛ Истекают партии",
+    "low_stock": "📉 Низкий остаток",
+    "stale_crons": "🛑 Cron не отчитались",
+    "ms_anomalies": "🔄 Рассинхрон с МС",
+}
+
+_PING_HEADERS: dict[str, tuple[str, str]] = {
+    "admin": ("📲 <b>Операционная сводка</b>", "Детали, отчёты и аналитика — в WebApp."),
+    "boss": ("📲 <b>Операционная сводка</b>", "Детали, отчёты и аналитика — в WebApp."),
+    "bookkeeper": ("📲 <b>Сводка: финансы</b>", "Подтвердите в WebApp."),
+    "warehouse_keeper": ("📲 <b>Сводка: склад</b>", "Детали в WebApp."),
+}
+
+
+def _section_count(summary: dict, key: str) -> int:
+    sec = summary.get(key) or {}
+    if key == "ms_anomalies":
+        return (
+            int(sec.get("drift") or 0)
+            + int(sec.get("deleted") or 0)
+            + int(sec.get("demand_failed") or 0)
+        )
+    return int(sec.get("count") or 0)
+
+
+def build_daily_ping(role: str, summary: dict) -> str | None:
+    """Короткий текст пинга для роли. None — если для роли нечего показать
+    (нет релевантных секций ИЛИ всё по нулям → не спамим)."""
+    keys = _PING_ROLE_SECTIONS.get(role)
+    if not keys:
+        return None
+    lines: list[str] = []
+    total = 0
+    for k in keys:
+        n = _section_count(summary, k)
+        if n:
+            total += n
+            lines.append(f"  {_PING_SECTION_LABELS[k]}: {n}")
+    if total == 0:
+        return None
+    header, footer = _PING_HEADERS[role]
+    return f"{header}\n\nТребует внимания: <b>{total}</b>\n" + "\n".join(lines) + f"\n\n{footer}"
+
+
+def build_ping_keyboard(webapp_url: str | None) -> dict | None:
+    """Inline-кнопка, открывающая WebApp (`web_app` работает в приватных чатах).
+    Без WEBAPP_URL — без кнопки (текст пинга всё равно зовёт открыть WebApp)."""
+    if not webapp_url:
+        return None
+    return {"inline_keyboard": [[{"text": "📲 Открыть WebApp", "web_app": {"url": webapp_url}}]]}
+
+
 # ─── Оркестрация ──────────────────────────────────────────────────────────────
 
 
@@ -310,116 +383,24 @@ async def main() -> int:
 
     # Round 6 RACE-4: idempotency-guard. Railway Cron при сетевом hiccup'е
     # может ретраить запуск, или ручной запуск пересечётся с плановым —
-    # без этого дайджест разойдётся всем 2 раза в день.
+    # без этого пинг разойдётся всем 2 раза в день.
     today = datetime.now().strftime("%Y-%m-%d")
     if not claim_ops_monitor_run(today):
         logger.info("ops_monitor: уже запускался сегодня (%s) — пропускаю", today)
         return 0
 
-    stale_hours = int(get_setting("stale_pending_hours", 48))
-    cash_days = int(get_setting("cash_deposit_escalation_days", 2))
-    batch_days = 7
-    low_stock_threshold = float(get_setting("low_stock_threshold", 5))
-    dead_stock_days = int(get_setting("dead_stock_days", 90))
-
-    stale = await get_stale_pending_orders(hours=stale_hours)  # async после asyncpg Stage 8
-    deposits = await get_pending_cash_deposits()  # async после asyncpg Stage 5
-    returns = await get_pending_returns()  # async после asyncpg Stage 5
-    overdue = await get_overdue_undeposited_orders(days=cash_days)  # async после asyncpg Stage 7
-    batches = await get_batches_expiring_within(days=batch_days)  # async после asyncpg Stage 8
-
-    # Складские алерты. low-stock — дешёвый локальный SELECT. dead-stock —
-    # тяжёлый по МС (shipments+positions), но ops_monitor бежит 1×/день.
-    from services.snapshot import get_low_stock
-
-    low_stock = get_low_stock(low_stock_threshold)
-    try:
-        dead_stock = await collect_dead_stock(dead_stock_days)
-    except Exception:
-        logger.exception("collect_dead_stock failed — пропускаю dead-stock блок")
-        dead_stock = []
-    # Cron health: проверяем что регулярные cron'ы реально отчитываются.
-    # Пороги подобраны с большим запасом к реальному расписанию (`*/15` →
-    # порог 1ч; ежедневный → 26ч). Если cron не запускался / упал —
-    # boss увидит в дайджесте.
-    cron_thresholds = {
-        "ms_sync_retry": 1.0,  # */15 минут → должен бегать ≤1ч назад
-        "ops_monitor": 26.0,  # 1×/день → 26ч с запасом
-        "maintenance": 26.0,
-        "debts_notify": 26.0,
-        "report_daily": 26.0,
-        "report_weekly": 7 * 24 + 2.0,
-        "report_monthly": 31 * 24 + 6.0,
-        "backup": 26.0,  # 1×/день → если backup не прошёл, очень критично
-    }
-    stale_crons = await get_stale_crons(cron_thresholds)
-
-    # Этап 4: рассинхрон с МС за последние ~2 суток (окно с запасом к суточному
-    # расписанию, чтобы при пропуске прогона не потерять аномалию).
-    from datetime import timedelta
-
-    ms_since = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        ms_anomalies = await get_ms_sync_anomalies(ms_since)
-    except Exception:
-        logger.exception("get_ms_sync_anomalies failed — пропускаю блок рассинхрона")
-        ms_anomalies = {"drift": [], "deleted": []}
-
-    b_stale = build_stale_orders_block(stale, stale_hours)
-    b_dep = build_pending_deposits_block(deposits)
-    b_ret = build_pending_returns_block(returns)
-    b_over = build_overdue_undeposited_block(overdue, cash_days)
-    b_batch = build_expiring_batches_block(batches, batch_days)
-    b_low = build_low_stock_block(low_stock, low_stock_threshold)
-    b_dead = build_dead_stock_block(dead_stock, dead_stock_days)
-    b_cron = build_cron_health_block(stale_crons)
-    b_mssync = build_ms_sync_block(ms_anomalies)
-
-    boss_digest = assemble_digest(
-        "📋 <b>Операционная сводка</b>",
-        [b_stale, b_dep, b_ret, b_over, b_batch, b_low, b_dead, b_cron, b_mssync],
-    )
-    bookkeeper_digest = assemble_digest("📋 <b>Сводка: финансы</b>", [b_dep])
-    warehouse_digest = assemble_digest(
-        "📋 <b>Сводка: склад</b>", [b_ret, b_batch, b_low, b_dead]
-    )
-
-    # Интерактив: deep-link кнопки к спискам/заказам (обрабатывает бот-процесс).
-    boss_kb = build_digest_keyboard(stale, deposits, returns)
-    bookkeeper_kb = build_digest_keyboard(deposits=deposits)
-    warehouse_kb = build_digest_keyboard(returns=returns)
+    summary = await gather_ops_summary()
+    kb = build_ping_keyboard(WEBAPP_URL)
 
     users = get_all_users()
     sent = 0
     try:
         for u in users:
-            role = u["role"]
-            digest = kb = None
-            if role in ("admin", "boss"):
-                digest, kb = boss_digest, boss_kb
-            elif role == "bookkeeper":
-                digest, kb = bookkeeper_digest, bookkeeper_kb
-            elif role == "warehouse_keeper":
-                digest, kb = warehouse_digest, warehouse_kb
-            if digest:
-                await tg_send_message(u["user_id"], digest, reply_markup=kb)
+            text = build_daily_ping(u["role"], summary)
+            if text:
+                await tg_send_message(u["user_id"], text, reply_markup=kb)
                 sent += 1
-        logger.info(
-            "ops_monitor: stale=%d deposits=%d returns=%d overdue=%d batches=%d "
-            "low_stock=%d dead_stock=%d crons_stale=%d ms_drift=%d ms_deleted=%d "
-            "→ %d сообщений",
-            len(stale),
-            len(deposits),
-            len(returns),
-            len(overdue),
-            len(batches),
-            len(low_stock),
-            len(dead_stock),
-            len(stale_crons),
-            len(ms_anomalies.get("drift") or []),
-            len(ms_anomalies.get("deleted") or []),
-            sent,
-        )
+        logger.info("ops_monitor ping: total=%s → %d сообщений", summary.get("total"), sent)
         return 0
     except Exception:
         logger.exception("ops_monitor: ошибка")

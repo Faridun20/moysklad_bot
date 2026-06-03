@@ -164,7 +164,7 @@ async function showScreen(screen) {
   // Подсветка нижнего таба: вложенные/legacy-экраны принадлежат корневому
   // табу (каталог → «Заказы», долги/платежи → «Финансы»). Иначе при заходе
   // в каталог ни один таб не подсвечивался.
-  const navScreen = { stock: 'orders', debts: 'finance', payments: 'finance' }[screen] || screen;
+  const navScreen = { stock: 'orders', debts: 'finance', payments: 'finance', ops: 'home' }[screen] || screen;
   document.querySelectorAll('.nav-item').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.screen === navScreen);
     // Переинициализируем обработчик на случай если DOM обновился
@@ -175,6 +175,7 @@ async function showScreen(screen) {
   const SCREEN_TITLES = {
     home: null, orders: 'Заказы и склад', stock: 'Заказы и склад',
     finance: 'Финансы', debts: 'Финансы', payments: 'Финансы', analytics: 'Аналитика',
+    ops: 'Операционная сводка',
   };
   setScreenContext(SCREEN_TITLES[screen]);
 
@@ -223,6 +224,9 @@ async function showScreen(screen) {
         break;
       case 'analytics':
         await renderAnalytics();
+        break;
+      case 'ops':
+        await renderOpsSummary();
         break;
       default:
         content.innerHTML = `<div class="error">Неизвестный экран: ${screen}</div>`;
@@ -390,6 +394,20 @@ async function renderHome() {
         </div>
       `;
     }
+    // Вход в полную операционную сводку (зависшие заявки, склад, cron, МС) —
+    // отдельный экран. Раньше это уходило дайджестом в Telegram.
+    bossBlock += `
+      <div class="section-label">Мониторинг</div>
+      <div class="card-list">
+        <div class="card-row" data-att="ops">
+          <div class="card-row-icon">${icon('clock')}</div>
+          <div class="card-row-info">
+            <div class="card-row-title">Операционная сводка</div>
+            <div class="card-row-sub">Зависшие заявки · склад · синхронизация</div>
+          </div>
+        </div>
+      </div>
+    `;
     const topEmp = data.top_employees || [];
     if (topEmp.length > 0) {
       const medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'];
@@ -485,6 +503,10 @@ async function renderHome() {
     row.addEventListener('click', () => {
       haptic();
       const go = row.dataset.att;
+      if (go === 'ops') {
+        showScreen('ops');
+        return;
+      }
       if (go === 'requests') {
         showScreen('orders');
         if (typeof renderPendingRequests === 'function') setTimeout(renderPendingRequests, 50);
@@ -1886,6 +1908,23 @@ async function submitOrder() {
   }
 }
 
+
+async function renderOpsSummary() {
+  // Операционная сводка (boss/admin): зависшие заявки, несданные деньги,
+  // складские алерты, здоровье cron, рассинхрон с МС. Раньше уходило большим
+  // дайджестом в Telegram — теперь смотрим тут, бот шлёт лишь дневной пинг.
+  const content = document.getElementById('content');
+  content.innerHTML = loading('Загружаю сводку…');
+  try {
+    const data = await api('/api/ops-summary', {});
+    showBack(() => showScreen('home'));
+    content.innerHTML =
+      `<div class="editor-header"><div class="editor-title">Операционная сводка</div></div>` +
+      renderOpsSummaryHtml(data);
+  } catch (e) {
+    content.innerHTML = errorBox(e.message || String(e));
+  }
+}
 
 async function renderPendingRequests() {
   const content = document.getElementById('content');
