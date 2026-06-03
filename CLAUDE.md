@@ -20,10 +20,9 @@ python bot.py                              # локально: без Postgres �
 python -m tasks.migrate                    # schema + data миграции, ДО старта сервисов на проде
 
 # Cron CLIs (Railway Cron Jobs)
-python -m tasks.run_report {daily|weekly|monthly}
 python -m tasks.run_debts_notify
 python -m tasks.run_ms_sync_retry
-python -m tasks.run_ops_monitor          # дайджест: зависшие заявки/сдачи/возвраты/партии (1×/день), inline-кнопки
+python -m tasks.run_ops_monitor          # дневной ПИНГ (1×/день): короткое «N событий — откройте WebApp» + web_app-кнопка. Сами данные — в WebApp (/api/ops-summary + блок «Требует внимания» на главной). Отчёты продаж/склада убраны из бота — смотрят в Аналитике WebApp.
 python -m tasks.run_maintenance          # janitor: чистка дедупа/аудита/soft-deleted (ночью)
 python -m tasks.run_ms_reconcile         # страховка: approved-заказы с ms_customerorder_id, 404 в МС → отмена локально (ежечасно)
 python -m tasks.run_backup               # дамп БД → gzip → приватный TG-канал (ночью)

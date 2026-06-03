@@ -26,7 +26,6 @@ from config import (
     WEBAPP_URL,
     REDIS_URL,
     BOT_MODE,
-    ENABLE_SCHEDULED_REPORTS,
 )
 from services.rate_limit import acquire as rate_limit_acquire
 
@@ -37,12 +36,7 @@ from services.notifier import shipment_notifier, close_tg_session
 from services import snapshot
 from services.ms_webhooks import ensure_subscriptions
 from services.ms_demand import init_demand_context
-from tasks.scheduled import (
-    daily_report_task,
-    weekly_report_task,
-    monthly_report_task,
-    snapshot_refresh_task,
-)
+from tasks.scheduled import snapshot_refresh_task
 
 logging.basicConfig(
     level=logging.INFO,
@@ -157,7 +151,6 @@ def register_routers(dp: Dispatcher):
         shipments,
         analytics,
         payments,
-        reports,
         audit,
         log,
         orders,
@@ -177,7 +170,6 @@ def register_routers(dp: Dispatcher):
         shipments.router,
         analytics.router,
         payments.router,
-        reports.router,
         audit.router,
         log.router,
         orders.router,
@@ -211,48 +203,17 @@ def build_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
 def start_background_tasks(bot: Bot) -> list[asyncio.Task]:
     """Запустить фоновые задачи. Возвращает список созданных Task'ов.
 
-    Если ENABLE_SCHEDULED_REPORTS=0 — отчётные циклы не запускаются
-    (предполагается, что их дёргает Railway Cron через
-    tasks.run_report). Snapshot и notifier остаются всегда — они
-    нужны 24/7 и под cron не подходят (snapshot реагирует на webhook'и
-    в реальном времени, notifier проверяет новые отгрузки каждые
-    CHECK_INTERVAL_SEC секунд).
+    Отчётные циклы (продажи/склад) убраны: отчёты и аналитику смотрят в WebApp,
+    а бот шлёт лишь дневной пинг (`tasks.run_ops_monitor` через Railway Cron).
+    Snapshot и notifier остаются всегда — они нужны 24/7 и под cron не подходят
+    (snapshot реагирует на webhook'и в реальном времени, notifier проверяет
+    новые отгрузки каждые CHECK_INTERVAL_SEC секунд).
     """
     coros = [
         shipment_notifier(bot),
         snapshot_refresh_task(bot),
         snapshot._stock_debounce_loop(),
     ]
-    if ENABLE_SCHEDULED_REPORTS:
-        # SECURITY.md Medium: предупреждаем при подозрении на дубли.
-        # Если в проекте есть Cron-сервисы (`cron-daily`/etc) — ENABLE
-        # должен быть 0, иначе отчёты улетают дважды. Точного API
-        # «есть ли cron-сервис» нет, проверяем мягкий heuristic:
-        # наличие RAILWAY-окружения + дефолтное значение env.
-        import os as _os
-
-        if (
-            _os.environ.get("RAILWAY_ENVIRONMENT")
-            and _os.environ.get("ENABLE_SCHEDULED_REPORTS") is None
-        ):
-            logger.warning(
-                "ENABLE_SCHEDULED_REPORTS не задан явно в Railway. Если "
-                "у тебя есть отдельные cron-сервисы (cron-daily/weekly/"
-                "monthly) — поставь ENABLE_SCHEDULED_REPORTS=0 чтобы "
-                "отчёты не дублировались."
-            )
-        coros.extend(
-            [
-                daily_report_task(bot),
-                weekly_report_task(bot),
-                monthly_report_task(bot),
-            ]
-        )
-    else:
-        logger.info(
-            "ENABLE_SCHEDULED_REPORTS=0 — отчёты внутри бота отключены, "
-            "ожидается запуск через Railway Cron Jobs."
-        )
     tasks = [
         asyncio.create_task(
             c, name=getattr(c, "__qualname__", None) or getattr(c, "__name__", "task")

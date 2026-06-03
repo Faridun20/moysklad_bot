@@ -43,5 +43,87 @@
     return `<svg class="ic${extra}" aria-hidden="true"><use href="#ic-${safe}"/></svg>`;
   }
 
-  return { escapeHtml, idemKey, formatDateRU, icon };
+  // Целое число с разделением разрядов пробелом: 12345 → "12 345".
+  function opsAmount(n) {
+    const v = Math.round(Number(n) || 0);
+    return String(v).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+  }
+
+  // Рендер операционной сводки (данные /api/ops-summary, см. services/ops_summary).
+  // Чистая функция (тестируется в Vitest): принимает dict секций, возвращает HTML.
+  // Показываем только непустые секции; если всё пусто — «всё спокойно».
+  function renderOpsSummaryHtml(summary) {
+    summary = summary || {};
+    const blocks = [];
+    const section = (title, count, rowsHtml) => {
+      blocks.push(
+        `<div class="section-label">${escapeHtml(title)} ` +
+        `<span class="stock-badge badge-yellow">${count}</span></div>` +
+        `<div class="card-list">${rowsHtml}</div>`
+      );
+    };
+    const row = (title, sub) =>
+      `<div class="card-row" style="cursor:default;">` +
+      `<div class="card-row-info"><div class="card-row-title">${escapeHtml(title)}</div>` +
+      (sub ? `<div class="card-row-sub">${escapeHtml(sub)}</div>` : '') +
+      `</div></div>`;
+
+    const so = summary.stale_orders || {};
+    if (so.count > 0) {
+      section(`Зависшие заявки (>${so.threshold_hours}ч)`, so.count,
+        (so.items || []).map(o => row(`#${o.id} · ${o.agent_name}`, o.full_name)).join(''));
+    }
+    const ov = summary.overdue_undeposited || {};
+    if (ov.count > 0) {
+      section(`Отгружено, деньги не сданы (>${ov.threshold_days}д)`, ov.count,
+        (ov.items || []).map(o => row(`#${o.id} · ${o.agent_name}`, o.full_name)).join(''));
+    }
+    const dep = summary.deposits || {};
+    if (dep.count > 0) {
+      section(`Сдачи на подтверждении · ${opsAmount(dep.total)} USD`, dep.count,
+        (dep.items || []).map(d => row(`Сдача #${d.id}`, `${opsAmount(d.amount)} USD`)).join(''));
+    }
+    const ret = summary.returns || {};
+    if (ret.count > 0) {
+      section('Возвраты на подтверждении', ret.count,
+        (ret.items || []).map(r =>
+          row(`Возврат #${r.id} · заказ #${r.order_id != null ? r.order_id : '?'}`,
+            `${opsAmount(r.total_amount)} USD`)).join(''));
+    }
+    const bat = summary.expiring_batches || {};
+    if (bat.count > 0) {
+      section(`Истекают партии (≤${bat.threshold_days}д)`, bat.count,
+        (bat.items || []).map(b => row(`${b.code}`, `до ${b.expiry_date} · остаток ${opsAmount(b.qty_remaining)}`)).join(''));
+    }
+    const low = summary.low_stock || {};
+    if (low.count > 0) {
+      section(`Низкий остаток (≤${opsAmount(low.threshold)})`, low.count,
+        (low.items || []).map(r => row(`${r.name}`, `${opsAmount(r.available)} ${r.unit}`)).join(''));
+    }
+    const cr = summary.stale_crons || {};
+    if (cr.count > 0) {
+      section('Cron: не отчитались', cr.count,
+        (cr.items || []).map(c => row(c.task_name,
+          c.never_ran ? `ни разу не запускался (порог ${c.threshold_hours}ч)`
+                      : `${c.hours_ago}ч назад · ${c.last_status} (порог ${c.threshold_hours}ч)`)).join(''));
+    }
+    const ms = summary.ms_anomalies || {};
+    const msTotal = (ms.drift || 0) + (ms.deleted || 0) + (ms.demand_failed || 0);
+    if (msTotal > 0) {
+      const items = ms.items || {};
+      const rows = []
+        .concat((items.demand_failed || []).map(o => row(`📦 Отгрузка не создана · #${o.id}`, o.agent_name)))
+        .concat((items.drift || []).map(o => row(`✏️ Изменён в МС · #${o.id}`, o.agent_name)))
+        .concat((items.deleted || []).map(o => row(`🗑 Удалён в МС · #${o.id}`, `${o.agent_name} · ${o.status}`)));
+      section('Рассинхрон с МойСклад', msTotal, rows.join(''));
+    }
+
+    if (!blocks.length) {
+      return '<div style="padding:32px 16px;text-align:center;color:var(--muted);">' +
+        '✅ Всё спокойно — нет требующих внимания позиций.</div>';
+    }
+    return blocks.join('');
+  }
+
+  return { escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml };
 });

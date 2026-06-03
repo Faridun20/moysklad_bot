@@ -732,6 +732,22 @@ async def api_home(request: Request):
         pending = await adb.get_pending_requests()
         result["pending_requests"] = len(pending)
 
+        # Дашборд «Требует внимания» (фронт уже рендерит data.attention): счётчики
+        # всего, что ждёт действия босса, чтобы он шёл в нужный раздел WebApp.
+        # Дешёвые локальные SELECT'ы — последовательно (без конкурентности на пуле,
+        # чтобы не споткнуться на одиночном соединении aiosqlite в тестах).
+        deposits_pending = await adb.get_pending_cash_deposits()
+        returns_pending = await adb.get_pending_returns()
+        payments_pending = await adb.get_paid_orders_awaiting_confirmation()
+        open_debts = await adb.get_open_debts()
+        result["attention"] = {
+            "requests": len(pending),
+            "payments": len(payments_pending),
+            "deposits": len(deposits_pending),
+            "returns": len(returns_pending),
+            "debts": len(open_debts),
+        }
+
         # Топ-сотрудники из УЖЕ полученных недельных отгрузок (см. gather выше).
         # Группируем по кастомному атрибуту telegram_full_name (его проставляет
         # ms_demand при создании отгрузки из бота). Нет атрибута → "Прочее
@@ -768,6 +784,32 @@ def _extract_tg_attribute(demand: dict, attr_name: str) -> str | None:
             v = a.get("value")
             return str(v) if v not in (None, "") else None
     return None
+
+
+# ─── API: операционная сводка ────────────────────────────────────────────────
+
+
+@app.post("/api/ops-summary")
+async def api_ops_summary(request: Request):
+    """Операционная сводка для босса/админа: зависшие заявки, несданные деньги,
+    складские алерты, здоровье cron, рассинхрон с МойСклад.
+
+    Раньше это уходило большим дайджестом в Telegram (`run_ops_monitor`) — теперь
+    смотрим в WebApp, а бот шлёт лишь короткий дневной пинг со ссылкой сюда.
+    Всё — локальные запросы (без МС API); тяжёлый dead-stock исключён.
+    """
+    from services.ops_summary import gather_ops_summary
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_ops_summary",
+        rate_limit_max=30,
+        rate_limit_window=60.0,
+    )
+    summary = await gather_ops_summary()
+    return JSONResponse(summary)
 
 
 # ─── API: остатки склада ─────────────────────────────────────────────────────
