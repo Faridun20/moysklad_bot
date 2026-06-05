@@ -1,0 +1,110 @@
+"""
+Регресс (аудит #2): подтверждённые возвраты уменьшают «к оплате» по заказу.
+Без этого возвращённый-и-доплаченный credit-заказ не закрывался (остаток
+оставался завышенным на сумму возврата) — фантомный «недоплаченный» заказ.
+
+Покрываем: get_order_payment_summary (остаток net возвратов), mark_order_paid
+(дефолт доплаты = net), авто-закрытие из confirm_payment и из confirm_return,
+закрытие через сдачу наличных (confirm_cash_deposit).
+"""
+
+import asyncio
+
+
+def _credit_shipped(db, total_per_unit, qty, mgr=2):
+    db.set_role(1, "b", "Boss", "boss")
+    db.set_role(mgr, "m", "Mgr", "manager")
+    oid = db.create_order(mgr, "Mgr", "")
+    iid = db.add_order_item(oid, "Товар", "", qty, "шт", total_per_unit)
+    db.update_order_status(oid, "shipped")
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q("UPDATE orders SET payment_type='credit', due_date='2099-01-01' WHERE id=?"),
+            (oid,),
+        )
+        conn.commit()
+    return oid, iid
+
+
+def _confirm_return(db, oid, iid, qty, amount, method="debt_reduction"):
+    r = asyncio.run(db.create_return(oid, "partial", "брак", [(iid, qty, amount)], method, 1))
+    assert r["ok"], r
+    res = asyncio.run(db.confirm_return(r["return_id"], 1, "Boss"))
+    assert res["ok"], res
+    return r["return_id"]
+
+
+def test_summary_remaining_net_of_returns(isolated_db):
+    db = isolated_db
+    oid, iid = _credit_shipped(db, 100.0, 10)  # total 1000
+    _confirm_return(db, oid, iid, 4, 400.0)     # возврат 400
+
+    summ = asyncio.run(db.get_order_payment_summary(oid))
+    assert summ["returns_cents"] == 40000
+    assert summ["remaining_cents"] == 60000  # 1000 − 400
+    assert summ["remaining"] == 600.0
+
+
+def test_pay_remaining_after_return_closes_order(isolated_db):
+    """Возврат, затем доплата остатка → mark_paid предлагает net (600), confirm
+    закрывает заказ (раньше confirmed 600 < total 1000 → не закрывался)."""
+    db = isolated_db
+    oid, iid = _credit_shipped(db, 100.0, 10)
+    _confirm_return(db, oid, iid, 4, 400.0)
+
+    ok, pid = asyncio.run(db.mark_order_paid(oid, 2, "Mgr"))  # amount=None → остаток
+    assert ok and pid
+    summ = asyncio.run(db.get_order_payment_summary(oid))
+    assert summ["pending_cents"] == 60000  # предложено ровно 600, не 1000
+    assert asyncio.run(db.confirm_payment(pid, 1, "Boss")) is True
+
+    o = asyncio.run(db.get_order(oid))
+    assert o["paid_confirmed_at"] is not None  # заказ закрыт
+    assert asyncio.run(db.get_order_payment_summary(oid))["remaining_cents"] == 0
+    assert asyncio.run(db.get_agent_current_debt(o["agent_id"])) == 0
+
+
+def test_return_after_payment_closes_order(isolated_db):
+    """Платёж покрывает будущий net, затем возврат → confirm_return добивает
+    закрытие (site 5). Платёж 600 при долге 1000 не закрыл; возврат 400 → net
+    600 == confirmed 600 → закрыт."""
+    db = isolated_db
+    oid, iid = _credit_shipped(db, 100.0, 10)
+
+    ok, pid = asyncio.run(db.mark_order_paid(oid, 2, "Mgr", amount=600.0))
+    assert ok
+    assert asyncio.run(db.confirm_payment(pid, 1, "Boss")) is True
+    assert asyncio.run(db.get_order(oid))["paid_confirmed_at"] is None  # ещё не закрыт
+
+    _confirm_return(db, oid, iid, 4, 400.0)  # возврат добивает закрытие
+
+    assert asyncio.run(db.get_order(oid))["paid_confirmed_at"] is not None
+
+
+def test_full_return_does_not_mark_paid(isolated_db):
+    """Полный возврат (status='returned') — терминальный, его НЕ помечаем
+    оплаченным через net<=0 (нет платежей)."""
+    db = isolated_db
+    oid, iid = _credit_shipped(db, 100.0, 10)
+    _confirm_return(db, oid, iid, 10, 1000.0)  # весь заказ
+
+    o = asyncio.run(db.get_order(oid))
+    assert o["status"] == "returned"
+    assert o["paid_confirmed_at"] is None  # не «оплачен»
+
+
+def test_deposit_closes_order_net_of_returns(isolated_db):
+    """Сдача распределена пока заказ 'shipped' (FIFO берёт только shipped); затем
+    возврат; при подтверждении сдачи покрытие считается против net (1000−400=600)
+    → заказ закрывается. Раньше сравнивалось с полной суммой 1000 → не закрывался."""
+    db = isolated_db
+    oid, iid = _credit_shipped(db, 100.0, 10)  # 1000, shipped
+
+    res = asyncio.run(db.create_cash_deposit(2, 600.0))  # аллокация 600 на shipped-заказ
+    assert res["ok"], res
+    _confirm_return(db, oid, iid, 4, 400.0)              # теперь net = 600
+
+    conf = asyncio.run(db.confirm_cash_deposit(res["deposit_id"], 1, "Boss"))
+    assert oid in conf["closed_orders"]
+    assert asyncio.run(db.get_order(oid))["payment_confirmed"] == 1
