@@ -1626,6 +1626,24 @@ async def _order_confirmed_deposit_cents(order_id: int) -> int:
     )
 
 
+async def _order_confirmed_returns_cents(order_id: int) -> int:
+    """Сумма подтверждённых (не удалённых) возвратов по заказу, в копейках.
+
+    Возвраты уменьшают «к оплате» по заказу (так же, как в get_agent_current_debt):
+    заказ считается закрытым, когда подтверждённые платежи/сдачи покрывают
+    total − returns. Без этого возвращённый-и-доплаченный заказ не закрывался
+    (остаток оставался завышенным на сумму возврата). _SUM_RETURNS_CENTS
+    резолвится в рантайме (определён ниже по файлу)."""
+    return int(
+        await adb_core.fetchval(
+            f"SELECT {_SUM_RETURNS_CENTS} FROM returns "
+            "WHERE order_id = $1 AND status = 'confirmed' AND (deleted_at IS NULL)",
+            order_id,
+        )
+        or 0
+    )
+
+
 async def _order_allocated_deposit_cents(order_id: int) -> int:
     """Распределено на заказ pending+confirmed сдачами, в копейках (M3).
 
@@ -2102,7 +2120,11 @@ async def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_nam
         # блокируем FOR UPDATE и закрываем тем же атомарным UPDATE с guard'ом
         # payment_confirmed=0 — параллельные подтверждения сдач по одному заказу
         # не закроют его дважды (паттерн как в mark_order_paid).
-        if await _order_confirmed_deposit_cents(oid) >= await _order_total_cents(oid):
+        # Покрытие — против суммы за вычетом подтверждённых возвратов (net owed).
+        # net<=0 (полный возврат) не закрываем как «оплачено» — статус ведёт
+        # confirm_return.
+        net_owed_cents = await _order_total_cents(oid) - await _order_confirmed_returns_cents(oid)
+        if net_owed_cents > 0 and await _order_confirmed_deposit_cents(oid) >= net_owed_cents:
             async with adb_core.transaction() as txn:
                 if USE_POSTGRES:
                     await txn.fetchrow("SELECT payment_confirmed FROM orders WHERE id = $1 FOR UPDATE", oid)
@@ -2583,6 +2605,12 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
         )
     # debt_reduction / no_refund — отдельной записи не требуют (долг учитывает
     # подтверждённые возвраты в get_agent_current_debt).
+
+    # Частичный возврат мог обнулить остаток к оплате (платежи уже покрыли
+    # total − возврат) → закрываем заказ. Полный возврат (status='returned') —
+    # терминальный, «оплатой» его не закрываем.
+    if new_status == "partially_returned":
+        await _maybe_close_order_after_payment(order_id, confirmed_by, confirmed_name)
 
     role = await asyncio.to_thread(get_role, confirmed_by)
     await asyncio.to_thread(
@@ -3203,12 +3231,16 @@ async def get_order_payment_summary(order_id: int) -> dict:
     payments = await get_payments_for_order(order_id)
     confirmed_cents = sum(_amount_cents(p) for p in payments if p["status"] == "confirmed")
     pending_cents = sum(_amount_cents(p) for p in payments if p["status"] == "pending")
-    remaining_cents = max(0, total_cents - confirmed_cents)
+    # Возвраты уменьшают «к оплате» (как в get_agent_current_debt). Без этого
+    # возвращённый-и-доплаченный заказ показывал завышенный остаток и не закрывался.
+    returns_cents = await _order_confirmed_returns_cents(order_id)
+    remaining_cents = max(0, total_cents - confirmed_cents - returns_cents)
 
     total = float(money.from_cents(total_cents))
     confirmed = float(money.from_cents(confirmed_cents))
     pending = float(money.from_cents(pending_cents))
     remaining = float(money.from_cents(remaining_cents))
+    returns_amount = float(money.from_cents(returns_cents))
 
     currency = (order.get("currency") or BASE_CURRENCY).upper()
     return {
@@ -3216,10 +3248,12 @@ async def get_order_payment_summary(order_id: int) -> dict:
         "confirmed": confirmed,
         "pending": pending,
         "remaining": remaining,
+        "returns": returns_amount,
         "total_cents": total_cents,
         "confirmed_cents": confirmed_cents,
         "pending_cents": pending_cents,
         "remaining_cents": remaining_cents,
+        "returns_cents": returns_cents,
         "currency": currency,
         # *_base — None если convert_to_base не смог (курс не задан админом).
         "total_base": convert_to_base(total, currency),
@@ -4346,8 +4380,22 @@ async def _maybe_close_order_after_payment(
             )
             or 0
         )
-        if confirmed_cents < total_cents:
-            return  # ещё не полностью оплачен
+        # Возвраты уменьшают сумму «к оплате»: заказ закрыт, когда платежи
+        # покрывают total − confirmed-возвраты. net<=0 (напр. полный возврат) —
+        # это не «оплата», закрытием здесь не занимаемся (статус ведёт confirm_return).
+        returns_cents = int(
+            await txn.fetchval(
+                f"SELECT {_SUM_RETURNS_CENTS} FROM returns "
+                "WHERE order_id = $1 AND status = 'confirmed' AND (deleted_at IS NULL)",
+                order_id,
+            )
+            or 0
+        )
+        net_cents = total_cents - returns_cents
+        if net_cents <= 0:
+            return
+        if confirmed_cents < net_cents:
+            return  # ещё не полностью оплачен (с учётом возвратов)
 
         # Закрываем
         rc = await txn.execute(
@@ -4926,7 +4974,17 @@ async def mark_order_paid(
             )
             or 0
         )
-        remaining_cents = max(0, total_cents - used_cents)
+        # Возвраты уменьшают остаток к доплате (иначе «оплатить остаток» предлагал
+        # переплату на сумму возврата).
+        returns_cents = int(
+            await txn.fetchval(
+                f"SELECT {_SUM_RETURNS_CENTS} FROM returns "
+                "WHERE order_id = $1 AND status = 'confirmed' AND (deleted_at IS NULL)",
+                order_id,
+            )
+            or 0
+        )
+        remaining_cents = max(0, total_cents - used_cents - returns_cents)
 
         # Если amount не задан — берём остаток (полная доплата)
         if amount is None:
