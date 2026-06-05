@@ -273,15 +273,15 @@ def format_payments_report(summary: list[dict], payments: list[dict], label: str
     total_by_currency: dict[str, float] = {}
     for s in summary:
         lines.append(
-            f"👤 <b>{s['full_name']}</b>\n"
-            f"    <code>{s['total']:,.0f} {s['currency']}  ·  {s['count']} платежей</code>"
+            f"👤 <b>{esc(s['full_name'])}</b>\n"
+            f"    <code>{s['total']:,.0f} {esc(s['currency'])}  ·  {s['count']} платежей</code>"
         )
         total_by_currency[s["currency"]] = total_by_currency.get(s["currency"], 0) + s["total"]
 
     lines.append("")
     lines.append("<b>Итого:</b>")
     for cur, total in total_by_currency.items():
-        lines.append(f"  💰 <b>{total:,.0f} {cur}</b>")
+        lines.append(f"  💰 <b>{total:,.0f} {esc(cur)}</b>")
 
     # Разбиваем на сообщения
     messages = []
@@ -290,10 +290,10 @@ def format_payments_report(summary: list[dict], payments: list[dict], label: str
     for p in payments:
         entry = (
             f"\n{DIV2}\n"
-            f"👤 {p['full_name']}\n"
-            f"💰 {p['amount']:,.0f} {p['currency']}\n"
-            f"📝 {p['comment']}\n"
-            f"🕐 {p['created_at'][:16]}"
+            f"👤 {esc(p['full_name'])}\n"
+            f"💰 {p['amount']:,.0f} {esc(p['currency'])}\n"
+            f"📝 {esc(p['comment'])}\n"
+            f"🕐 {esc(p['created_at'][:16])}"
         )
         if len(current) + len(entry) > 3800:
             messages.append(current)

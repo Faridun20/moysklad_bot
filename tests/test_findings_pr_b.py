@@ -95,6 +95,45 @@ def test_approve_under_limit_proceeds(isolated_db, monkeypatch):
     assert asyncio.run(db.get_order(oid))["status"] == "approved"
 
 
+def test_approve_no_false_override_from_double_count(isolated_db, monkeypatch):
+    """Регресс: заказ-одиночка ПОД лимитом не должен требовать override. Раньше
+    энфорс считал заказ дважды (он уже pending → в current_debt, плюс +total) →
+    1500 при лимите 2000 давал projected=3000 и ложное «превышение»."""
+    import services.ms_demand as ms_demand
+    from services.order_workflow import approve_shipment_request
+
+    monkeypatch.setattr(ms_demand, "is_ready", lambda: False)
+    db = isolated_db
+    roles.invalidate_all_roles()
+    db.set_role(2, "b", "Boss", "boss")
+    oid = _credit_order(db, 1500.0)  # один заказ, под лимитом 2000
+    req_id = db.create_shipment_request(oid, 1, "M")
+
+    res = asyncio.run(approve_shipment_request(req_id, 2, "Boss", _FakeBot(), override=False))
+    assert res.get("needs_override") is not True
+    assert res["ok"] is True
+    assert asyncio.run(db.get_order(oid))["status"] == "approved"
+
+
+def test_approve_over_limit_from_existing_debt(isolated_db, monkeypatch):
+    """Реальное превышение за счёт ДРУГОГО открытого заказа всё ещё требует
+    override (фикс двойного счёта не должен ослабить энфорс)."""
+    import services.ms_demand as ms_demand
+    from services.order_workflow import approve_shipment_request
+
+    monkeypatch.setattr(ms_demand, "is_ready", lambda: False)
+    db = isolated_db
+    roles.invalidate_all_roles()
+    db.set_role(2, "b", "Boss", "boss")
+    _credit_order(db, 1500.0, agent="A-1", status="approved")  # уже в долге
+    oid = _credit_order(db, 1000.0, agent="A-1")  # +1000 → 2500 > 2000
+    req_id = db.create_shipment_request(oid, 1, "M")
+
+    res = asyncio.run(approve_shipment_request(req_id, 2, "Boss", _FakeBot(), override=False))
+    assert res.get("needs_override") is True
+    assert res["over"]["over_limit"] is True
+
+
 # ─── #30: resubmit-diff ──────────────────────────────────────────────────────
 
 
