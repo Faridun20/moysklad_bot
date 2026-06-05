@@ -2719,7 +2719,7 @@ async function renderCashbox(container) {
       paySubmit.disabled = true;
       status.textContent = '⏳ Отправка…'; status.className = 'pay-status';
       try {
-        await api('/api/payments/send', { items: parsed.items, comment });
+        await api('/api/payments/send', { items: parsed.items, comment, idempotency_key: idemKey() });
         tg.HapticFeedback?.notificationOccurred('success');
         renderCashbox(container);
       } catch (e) {

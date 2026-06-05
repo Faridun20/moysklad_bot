@@ -274,6 +274,17 @@ async def approve_shipment_request(
             float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in pre_items
         )
         chk = await adb.check_credit_limit(order_pre["agent_id"], total)
+        # Заказ на этом шаге УЖЕ в статусе pending → его сумма уже входит в
+        # current_debt (get_agent_current_debt считает pending). check_credit_limit
+        # прибавляет total ещё раз → двойной счёт и ложное «превышение». Корректный
+        # прогноз для уже-учтённого заказа = current_debt (та же логика, что в
+        # order_credit_context); для не-учтённых статусов остаётся debt + total.
+        _counted = order_pre.get("status") in {
+            "pending", "approved", "shipped", "partially_returned",
+        }
+        _projected = chk["current_debt"] if _counted else chk["current_debt"] + total
+        chk["projected"] = _projected
+        chk["over_limit"] = _projected > chk["limit"]
         if chk.get("over_limit"):
             over_info = chk
             if not override:

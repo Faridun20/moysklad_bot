@@ -182,3 +182,29 @@ def test_payments_send_batch_requires_comment(isolated_db, monkeypatch):
         json={"initData": "702", "items": [{"amount": 10, "currency": "USD"}], "comment": ""},
     )
     assert r.status_code == 400
+
+
+def test_payments_send_batch_idempotent(isolated_db, monkeypatch):
+    """Ретрай с тем же idempotency_key не создаёт дубль-набор платежей и не шлёт
+    второе уведомление — отдаёт сохранённый результат."""
+    db = isolated_db
+    client, sent = _client(db, monkeypatch, 703, "manager")
+    payload = {
+        "initData": "703",
+        "items": [{"amount": 100, "currency": "USD"}],
+        "comment": "аренда",
+        "idempotency_key": "k1",
+    }
+    r1 = client.post("/api/payments/send", json=payload)
+    assert r1.status_code == 200, r1.text
+    ids1 = r1.json()["payment_ids"]
+    r2 = client.post("/api/payments/send", json=payload)  # тот же ключ
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["payment_ids"] == ids1  # тот же результат, не новый набор
+
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("SELECT COUNT(*) FROM payments WHERE user_id=?"), (703,))
+        count = cur.fetchone()[0]
+    assert count == 1  # ровно один платёж, дубля нет
+    assert len(sent) == 1  # уведомление ушло один раз

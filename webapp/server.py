@@ -1408,43 +1408,14 @@ def _validate_payment_amount(raw) -> float:
     return amount
 
 
-async def _send_payments_batch(user: dict, items: list, comment_raw: str):
-    """Мульти-валютная отправка: несколько строк {amount, currency} → отдельные
-    платежи (каждый — одна валюта), ОДНО уведомление боссу с кнопкой
-    принять/отклонить на каждый. Экономит менеджеру N сабмитов."""
-    from config import ALLOWED_CURRENCIES
-    from services import async_db as adb
+async def _notify_batch_payments(full_name, username, comment, created):
+    """Одно уведомление боссу по созданным платежам (кнопка ✅/❌ на каждый).
+    Best-effort: ошибка отправки не должна терять уже созданные платежи."""
     from services.notifier import aget_notify_recipients, tg_send_message
     from utils.helpers import esc
 
-    if len(items) > 20:
-        raise HTTPException(status_code=400, detail="Слишком много строк (макс 20)")
-    comment = (comment_raw or "").strip()[:1000]
-    if not comment:
-        raise HTTPException(status_code=400, detail="Укажите комментарий")
-
-    parsed: list[tuple[float, str]] = []
-    for it in items:
-        amount = _validate_payment_amount((it or {}).get("amount", 0))
-        currency = (it or {}).get("currency", "USD")
-        if currency not in ALLOWED_CURRENCIES:
-            raise HTTPException(status_code=400, detail="Неверная валюта")
-        parsed.append((amount, currency))
-
-    user_id, full_name, username = _payment_identity(user)
-    role = get_role(user_id)
-    created: list[tuple[int, float, str]] = []
-    for amount, currency in parsed:
-        pid = await adb.add_payment(user_id, username, full_name, amount, currency, comment)
-        await adb.add_audit_log(
-            user_id,
-            full_name,
-            role,
-            "payment_sent",
-            f"Платёж #{pid}: {amount:,.0f} {currency} — {comment}",
-        )
-        created.append((pid, amount, currency))
-
+    if not created:
+        return
     lines = "\n".join(f"• {a:,.0f} {c}" for _, a, c in created)
     notify_text = (
         f"💳 <b>Новые платежи</b> от {esc(full_name)} ({esc(username)})\n"
@@ -1462,7 +1433,70 @@ async def _send_payments_batch(user: dict, items: list, comment_raw: str):
     for uid in await aget_notify_recipients():
         await tg_send_message(uid, notify_text, reply_markup=keyboard)
 
-    return JSONResponse({"payment_ids": [pid for pid, _, _ in created], "status": "pending"})
+
+async def _send_payments_batch(user: dict, items: list, comment_raw: str, idem_key=None):
+    """Мульти-валютная отправка: несколько строк {amount, currency} → отдельные
+    платежи (каждый — одна валюта), ОДНО уведомление боссу с кнопкой принять/
+    отклонить на каждый. Экономит менеджеру N сабмитов.
+
+    Идемпотентность: ретрай с тем же idempotency_key не создаёт дубль-набор
+    (DB-level idem_claim, как в /api/deposits/create). Частичный сбой при создании
+    не теряет уведомление — шлём по уже созданным через try/finally."""
+    from config import ALLOWED_CURRENCIES
+    from services import async_db as adb
+
+    if len(items) > 20:
+        raise HTTPException(status_code=400, detail="Слишком много строк (макс 20)")
+    comment = (comment_raw or "").strip()[:1000]
+    if not comment:
+        raise HTTPException(status_code=400, detail="Укажите комментарий")
+
+    parsed: list[tuple[float, str]] = []
+    for it in items:
+        amount = _validate_payment_amount((it or {}).get("amount", 0))
+        currency = (it or {}).get("currency", "USD")
+        if currency not in ALLOWED_CURRENCIES:
+            raise HTTPException(status_code=400, detail="Неверная валюта")
+        parsed.append((amount, currency))
+
+    user_id, full_name, username = _payment_identity(user)
+
+    # DB-уровневая идемпотентность: двойной POST (ретрай клиента/мультиворкер) не
+    # создаёт второй набор платежей. Ключ занят без результата → 409 (как в deposits).
+    full_idem = f"payments_send:{user_id}:{idem_key}" if idem_key else None
+    if full_idem:
+        prev = await adb.idem_claim(full_idem, "payments_send", user_id)
+        if prev is not None:
+            if prev.get("payment_ids"):
+                return JSONResponse(prev)
+            raise HTTPException(status_code=409, detail="Запрос уже обрабатывается")
+
+    role = get_role(user_id)
+    created: list[tuple[int, float, str]] = []
+    try:
+        for amount, currency in parsed:
+            pid = await adb.add_payment(user_id, username, full_name, amount, currency, comment)
+            await adb.add_audit_log(
+                user_id,
+                full_name,
+                role,
+                "payment_sent",
+                f"Платёж #{pid}: {amount:,.0f} {currency} — {comment}",
+            )
+            created.append((pid, amount, currency))
+    except Exception:
+        # Часть платежей могла создаться до сбоя — уведомляем по ним (иначе они
+        # «осиротеют» без видимости боссу), затем освобождаем ключ под ретрай.
+        await _notify_batch_payments(full_name, username, comment, created)
+        if full_idem:
+            await adb.idem_release(full_idem)
+        raise
+
+    await _notify_batch_payments(full_name, username, comment, created)
+    resp = {"payment_ids": [pid for pid, _, _ in created], "status": "pending"}
+    if full_idem:
+        await adb.idem_store(full_idem, resp)
+    return JSONResponse(resp)
 
 
 @app.post("/api/payments/send")
@@ -1488,7 +1522,9 @@ async def api_payments_send(request: Request):
     # Мульти-валютная отправка: items=[{amount, currency}, …] + общий comment.
     items = data.get("items")
     if isinstance(items, list) and items:
-        return await _send_payments_batch(user, items, data.get("comment", ""))
+        return await _send_payments_batch(
+            user, items, data.get("comment", ""), idem_key=data.get("idempotency_key")
+        )
 
     # Round 6 (S3): isnan/isinf + верхний лимит — float('1e308') проходит
     # `> 0`, отравляет FIFO-математику в БД, отдаёт `nan USD` боссу в UI.
