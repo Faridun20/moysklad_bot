@@ -165,9 +165,11 @@ async def order_credit_context(order: dict, total: float) -> dict | None:
 
     if (order.get("payment_type") or "paid") != "credit" or not order.get("agent_id"):
         return None
-    chk = await adb.check_credit_limit(order["agent_id"], total)
+    chk = await adb.check_credit_limit(order["agent_id"], total, order.get("currency"))
     counted = order.get("status") in {"pending", "approved", "shipped", "partially_returned"}
-    effective = float(chk["current_debt"]) if counted else float(chk["current_debt"]) + float(total)
+    # effective в базовой валюте: для уже-учтённых статусов = current_debt; иначе
+    # current_debt + сумма заказа в базовой (chk["projected"]).
+    effective = float(chk["current_debt"]) if counted else float(chk["projected"])
     return {
         "current_debt": float(chk["current_debt"]),
         "limit": float(chk["limit"]),
@@ -273,18 +275,17 @@ async def approve_shipment_request(
         total = sum(
             float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in pre_items
         )
-        chk = await adb.check_credit_limit(order_pre["agent_id"], total)
+        chk = await adb.check_credit_limit(order_pre["agent_id"], total, order_pre.get("currency"))
         # Заказ на этом шаге УЖЕ в статусе pending → его сумма уже входит в
         # current_debt (get_agent_current_debt считает pending). check_credit_limit
-        # прибавляет total ещё раз → двойной счёт и ложное «превышение». Корректный
-        # прогноз для уже-учтённого заказа = current_debt (та же логика, что в
-        # order_credit_context); для не-учтённых статусов остаётся debt + total.
+        # прибавляет сумму заказа ещё раз → двойной счёт и ложное «превышение».
+        # Для уже-учтённого статуса прогноз = current_debt (всё в базовой валюте).
         _counted = order_pre.get("status") in {
             "pending", "approved", "shipped", "partially_returned",
         }
-        _projected = chk["current_debt"] if _counted else chk["current_debt"] + total
-        chk["projected"] = _projected
-        chk["over_limit"] = _projected > chk["limit"]
+        if _counted:
+            chk["projected"] = chk["current_debt"]
+            chk["over_limit"] = chk["current_debt"] > chk["limit"]
         if chk.get("over_limit"):
             over_info = chk
             if not override:

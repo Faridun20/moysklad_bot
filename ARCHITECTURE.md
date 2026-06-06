@@ -42,7 +42,6 @@ Telegram-бот + Web App (Mini App в чате) для управления з�
                 │  - polling       │  Telegram Bot API → бот
                 │  - notifier      │  фон: РЕЗЕРВНЫЙ поллер отгрузок
                 │  - snapshot      │  фон: обновление кеша справочников
-                │  - scheduled (*) │  (если ENABLE_SCHEDULED_REPORTS=1)
                 └────────┬─────────┘
                          │
                          │ DB-ссылки
@@ -71,12 +70,14 @@ Telegram-бот + Web App (Mini App в чате) для управления з�
               └──────────────────────┘
 ```
 
-Дополнительно для отчётов (если настроены):
+Дополнительно (Railway Cron Jobs):
 
-- **`cron-daily`** — `python -m tasks.run_report daily` каждый день в 9:00 UTC.
-- **`cron-weekly`** — `python -m tasks.run_report weekly` понедельник 9:00 UTC.
-- **`cron-monthly`** — `python -m tasks.run_report monthly` 1-го числа 9:00 UTC.
 - **`cron-debts`** — `python -m tasks.run_debts_notify` ежедневно ~6:00 UTC.
+- **`cron-ops`** — `python -m tasks.run_ops_monitor` 1×/день: короткий пинг
+  «есть N событий — откройте WebApp» (сводки/отчёты смотрят в WebApp).
+- **`cron-ms-reconcile`** — `python -m tasks.run_ms_reconcile` ежечасно.
+- (Отдельных `cron-daily/weekly/monthly` для отчётов больше нет — отчёты и
+  аналитику смотрят в WebApp.)
 
 Все cron-сервисы — однократные процессы Railway Cron Jobs, поднимаются
 по расписанию, выполняют действие, завершаются.
@@ -97,7 +98,6 @@ Telegram-бот + Web App (Mini App в чате) для управления з�
 | `TG_USE_WEBHOOK` | `1` → бот принимает апдейты через webhook, иначе polling |
 | `TG_WEBHOOK_SECRET` | Секрет для проверки запросов от Telegram (обязателен в webhook-режиме) |
 | `BOT_MODE` | `all` / `bot` / `webapp` — что запускает контейнер |
-| `ENABLE_SCHEDULED_REPORTS` | `0` чтобы отчёты в bot-процессе не дублировали Cron |
 | `NIXPACKS_PYTHON_VERSION` | `3.11` — пин версии Python в Railway |
 | `ADMIN_IDS`, `BOSS_IDS`, `MANAGER_IDS` | CSV Telegram user_id для bootstrap ролей |
 | `ALLOWED_USERS` | CSV id, кому давать роль `manager` по умолчанию |
@@ -389,18 +389,16 @@ Cron `cron-debts` ежедневно дёргает `python -m tasks.run_debts_n
 Один процесс, один UPDATE, потом завершается. Не зависит от состояния
 основного бота.
 
-### 5.4 Сводные отчёты
+### 5.4 Сводки и отчёты → WebApp + дневной пинг
 
-Cron-сервисы `cron-daily/weekly/monthly` вызывают `python -m tasks.run_report
-<daily|weekly|monthly>`. Скрипт:
+Отдельные текстовые отчёты в Telegram убраны. Продажи/склад/аналитику смотрят
+в WebApp (вкладка «Аналитика», раздел «Деньги» → «Обзор»), операционную сводку —
+на главной («Требует внимания») и в `/api/ops-summary`.
 
-1. Считает выручку и кол-во отгрузок за период через `services.moysklad.get_sales_stats`.
-2. Считает залежавшиеся/быстро уходящие/критичные остатки.
-3. Шлёт HTML-отчёт всем boss/admin.
-
-Если `ENABLE_SCHEDULED_REPORTS=1` — те же отчёты крутятся в bot-процессе
-через `asyncio.sleep(...)`-циклы (`tasks/scheduled.py`). На проде должно
-быть `=0` чтобы не было дубликатов.
+Бот шлёт лишь ОДИН короткий дневной пинг: `cron-ops` → `python -m
+tasks.run_ops_monitor` собирает счётчики (`services/ops_summary.gather_ops_summary`,
+всё локально, без МС API) и рассылает по роли «есть N событий — откройте WebApp»
+с inline-кнопкой `web_app`. Идемпотентно (`claim_ops_monitor_run` 1×/день).
 
 ---
 
@@ -511,7 +509,6 @@ pending платежи. Без этой оптимизации 96 cron-тико�
 - `handlers/payments.py` — `/pay` для отдельных платежей в кассу.
 - `handlers/shipments.py` — `/shipments` для boss, просмотр новых отгрузок.
 - `handlers/analytics.py` — `/analytics`, агрегаты МойСклад.
-- `handlers/reports.py` — ручной запуск daily/weekly/monthly из бота.
 - `handlers/users.py` — `/addrole`, `/users`, `/syncms`.
 - `handlers/audit.py` — `/audit`, просмотр аудит-лога.
 - `handlers/log.py` — `/log`, последние записи логов.
@@ -666,7 +663,7 @@ Concurrency-ограничители (не TTL, но рядом по смысл�
 | Добавить экран в WebApp | `webapp/static/index.html` (nav button), `webapp/static/app.js` (`case '...':` + `render*()`), `webapp/static/style.css` |
 | Добавить команду в боте | новый файл в `handlers/`, зарегистрировать в `bot.py:register_routers` |
 | Изменить вебхук от МойСклад | `webapp/server.py:ms_webhook` + `services/ms_webhooks.py:ensure_subscriptions` |
-| Изменить расписание отчётов | `tasks/scheduled.py` (если ENABLE_SCHEDULED_REPORTS=1) + Railway Cron settings (если используется `cron-*`) |
+| Изменить дневной пинг / операционную сводку | `tasks/run_ops_monitor.py` (пинг) + `services/ops_summary.py` (сбор) + `webapp/server.py:/api/ops-summary` |
 | Найти ошибку в проде | Railway Logs у нужного сервиса. Долгие SQL логируются как `SQL slow ...` через `SQL_SLOW_MS` (default 200мс) |
 | Понять что сейчас в БД | `services/database.py:init_db` — все таблицы там же |
 | Локально запустить | `BOT_MODE=all`, `DATABASE_URL=` (пусто) → SQLite, `REDIS_URL=` (пусто) → MemoryStorage |

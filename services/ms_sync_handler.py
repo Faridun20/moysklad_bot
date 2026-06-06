@@ -204,6 +204,7 @@ async def _handle_customerorder_updated(co_id: str) -> None:
     state_name = state.get("name", "")
     new_status = _STATE_TYPE_TO_STATUS.get(state_type)
 
+    order_id = order["id"]
     if not new_status:
         # Regular/кастомный stateType — не маппим (без конфигурации аккаунта не
         # знаем смысла). Но ЛОГИРУЕМ для наблюдаемости (дыра #4): видно, какие
@@ -212,14 +213,48 @@ async def _handle_customerorder_updated(co_id: str) -> None:
             logger.info(
                 "customerorder.UPDATE %s заказ #%s: непереводимый статус МС "
                 "state='%s' stateType=%s — локальный статус не тронут",
-                co_id, order.get("id"), state_name, state_type,
+                co_id, order_id, state_name, state_type,
             )
         return
     if new_status == local_status:
         return
 
-    order_id = order["id"]
-    await adb.update_order_status(order_id, new_status)
+    # Гейт по машине состояний: системный сигнал из МС не должен делать нелегальный
+    # переход. Прежде Unsuccessful маппился в 'rejected' и применялся даже к
+    # approved-заказу (approved→rejected НЕ легален: rejected — только из pending) →
+    # реальная отгрузка/остаток в МС оставались, а локально заказ «отклонён» без
+    # отката. Нелегальный переход не применяем — алертим boss/admin на ручную
+    # разборку.
+    from services.order_workflow import TRANSITIONS
+
+    if new_status not in TRANSITIONS.get(local_status, []):
+        logger.warning(
+            "customerorder.UPDATE %s заказ #%s: нелегальный переход %s→%s по сигналу "
+            "МС (state='%s', stateType=%s) — пропускаю, нужна ручная разборка",
+            co_id, order_id, local_status, new_status, state_name, state_type,
+        )
+        from services.notifier import aget_notify_recipients
+        from utils.helpers import esc
+
+        for uid in await aget_notify_recipients():
+            await tg_send_message(
+                uid,
+                f"⚠️ Заказ #{order_id}: МойСклад сообщил статус "
+                f"«{esc(state_name)}», но локальный статус <b>{local_status}</b> "
+                f"нельзя перевести в <b>{new_status}</b>. Разберите вручную.",
+            )
+        return
+
+    # CAS против снимка (TOCTOU): между чтением local_status и записью был сетевой
+    # round-trip к МС — статус мог измениться (напр. confirm_payment → paid).
+    # Применяем только если статус не изменился; иначе пропускаем без отката.
+    if not await adb.cas_order_status(order_id, new_status, local_status):
+        logger.info(
+            "customerorder.UPDATE %s заказ #%s: статус изменился конкурентно "
+            "(ожидался %s) — пропускаю",
+            co_id, order_id, local_status,
+        )
+        return
     await adb.add_audit_log(
         0,
         "МойСклад",
@@ -279,6 +314,12 @@ async def apply_ms_customerorder_delete(order: dict, co_id: str) -> None:
     order_id = order["id"]
     status = order.get("status", "")
     agent = esc(order.get("agent_name") or "—")
+
+    # Идемпотентность: уже помечен удалённым в МС → не дублируем алерт/аудит
+    # (одна и та же запись может прийти и вебхуком, и cron-реконсиляцией, либо
+    # дважды в одном батче). Симметрично apply_ms_demand_delete.
+    if order.get("ms_deleted_at"):
+        return
 
     if status == "approved":
         res = await adb.cancel_order(

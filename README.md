@@ -99,7 +99,6 @@ Telegram, руководители одобряют отгрузки и подт
 | `BOT_MODE` | `all` (default) / `bot` / `webapp` — что запускать в этом процессе |
 | `BASE_CURRENCY` | По умолчанию `USD` |
 | `TZ` | `Asia/Tashkent` или другой |
-| `ENABLE_SCHEDULED_REPORTS` | `0` чтобы отчёты не дублировались с cron-сервисом |
 | `PG_POOL_MIN`, `PG_POOL_MAX` | Размер пула коннектов Postgres (default 1/10) |
 | `BACKUP_TG_CHAT_ID` | ID приватного TG-канала для ежедневного backup БД |
 
@@ -217,8 +216,7 @@ psql $DATABASE_URL < moysklad-bot-postgres-YYYYMMDD-HHMMSS.sql
 │
 ├── tasks/                    Фоновые задачи + CLI для Railway Cron
 │   ├── migrate.py            Schema + data миграции (ДО старта сервисов)
-│   ├── scheduled.py          In-process daily/weekly/monthly отчёты
-│   ├── run_report.py         CLI: отчёты `python -m tasks.run_report daily`
+│   ├── scheduled.py          In-process snapshot-refresh (отчёты убраны → WebApp)
 │   ├── run_debts_notify.py   CLI: утреннее напоминание о долгах
 │   ├── run_ms_sync_retry.py  CLI: ретрай failed paymentin-синков
 │   ├── run_ms_reconcile.py   CLI: реконсиляция удалённых в МС заказов

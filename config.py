@@ -120,16 +120,6 @@ except ImportError:
     # Раньше был продублирован в handlers/payments, handlers/orders
     # и дважды в webapp/server как inline-литерал. Теперь один список.
     ALLOWED_CURRENCIES = ("USD", "UZS", "RUB", "EUR")
-
-    # ─── Расписанные отчёты ────────────────────────────────────────
-    # 1 (default) — daily/weekly/monthly работают внутри бот-процесса
-    #               через asyncio.sleep-циклы. Удобно для one-process
-    #               сетапа, но отчёт пропускается, если бот рестартанул
-    #               ровно в момент срабатывания.
-    # 0           — отчёты внутри бота отключены. Запускай их через
-    #               Railway Cron Jobs: python -m tasks.run_report {daily|weekly|monthly}.
-    #               Так надёжнее: cron не зависит от состояния бота.
-    ENABLE_SCHEDULED_REPORTS = os.environ.get(
-        "ENABLE_SCHEDULED_REPORTS",
-        "1",
-    ).lower() not in ("0", "false", "no")
+    # NB: расписанные отчёты (daily/weekly/monthly) и флаг ENABLE_SCHEDULED_REPORTS
+    # удалены — отчёты и аналитику смотрят в WebApp, бот шлёт лишь дневной пинг
+    # (tasks.run_ops_monitor). Раньше тут был ENABLE_SCHEDULED_REPORTS + tasks.run_report.

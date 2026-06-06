@@ -381,7 +381,13 @@ async def shipment_notifier(bot: Bot | None = None):
                 logger.warning("Нет получателей для уведомлений об отгрузках")
                 continue
 
-            for s in shipments[:5]:
+            # Обрабатываем ВСЕ отгрузки за интервал, а не первые 5: поллер —
+            # резервный канал для пропущенных вебхуков, при всплеске >5 за окно
+            # лишние молча терялись (а last_check уже сдвинут → не доберём). Дубли
+            # исключает per-demand дедуп в notify_new_shipment (mark_shipment_notified).
+            if len(shipments) > 20:
+                logger.info("shipment poller: %d отгрузок за интервал (catch-up)", len(shipments))
+            for s in shipments:
                 demand_id = extract_id_from_href(s.get("meta", {}).get("href", ""))
                 if not demand_id:
                     continue
