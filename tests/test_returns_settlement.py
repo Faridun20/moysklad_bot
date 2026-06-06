@@ -94,6 +94,25 @@ def test_full_return_does_not_mark_paid(isolated_db):
     assert o["paid_confirmed_at"] is None  # не «оплачен»
 
 
+def test_partial_cash_return_does_not_close_order(isolated_db):
+    """CASH-возврат НЕ уменьшает «к оплате» (деньги уже отданы из кассы отдельной
+    отрицательной сдачей). Заказ, оплаченный частично, с cash-возвратом остатка
+    НЕ закрывается — иначе клиента кредитуют дважды (товар назад + деньги назад)."""
+    db = isolated_db
+    oid, iid = _credit_shipped(db, 100.0, 10)  # 1000
+    ok, pid = asyncio.run(db.mark_order_paid(oid, 2, "Mgr", amount=700.0))
+    assert ok
+    assert asyncio.run(db.confirm_payment(pid, 1, "Boss")) is True
+
+    _confirm_return(db, oid, iid, 3, 300.0, method="cash")  # cash, не debt_reduction
+
+    o = asyncio.run(db.get_order(oid))
+    assert o["paid_confirmed_at"] is None  # НЕ закрыт
+    summ = asyncio.run(db.get_order_payment_summary(oid))
+    assert summ["returns_cents"] == 0          # cash-возврат не зачитывается в «к оплате»
+    assert summ["remaining_cents"] == 30000    # всё ещё должен 300
+
+
 def test_deposit_closes_order_net_of_returns(isolated_db):
     """Сдача распределена пока заказ 'shipped' (FIFO берёт только shipped); затем
     возврат; при подтверждении сдачи покрытие считается против net (1000−400=600)
