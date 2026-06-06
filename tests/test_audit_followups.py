@@ -172,3 +172,21 @@ def test_co_delete_alert_idempotent(isolated_db, monkeypatch):
     sent.clear()
     asyncio.run(h.apply_ms_customerorder_delete(asyncio.run(db.get_order(oid)), "CO-9"))
     assert sent == []
+
+
+def test_co_delete_cancels_approved_even_if_already_ms_deleted(isolated_db, monkeypatch):
+    """demand.DELETE мог выставить ms_deleted_at, оставив заказ approved (он не
+    отменяет). Последующий customerorder.DELETE всё равно ДОЛЖЕН отменить approved —
+    ранний выход по ms_deleted_at это пропускал (регресс)."""
+    db = isolated_db
+    _mock_notify(monkeypatch)
+    oid, _ = _credit_order(db, 100.0, 1, status="approved")
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q("UPDATE orders SET ms_deleted_at='2026-06-04 00:00:00' WHERE id=?"), (oid,)
+        )
+        conn.commit()
+
+    asyncio.run(h.apply_ms_customerorder_delete(asyncio.run(db.get_order(oid)), "CO-7"))
+    assert asyncio.run(db.get_order(oid))["status"] == "cancelled"

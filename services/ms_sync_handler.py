@@ -233,16 +233,21 @@ async def _handle_customerorder_updated(co_id: str) -> None:
             "МС (state='%s', stateType=%s) — пропускаю, нужна ручная разборка",
             co_id, order_id, local_status, new_status, state_name, state_type,
         )
-        from services.notifier import aget_notify_recipients
-        from utils.helpers import esc
+        # Дедуп: помечаем «нужна ручная разборка» (тем же флагом, что дрифт) и
+        # алертим ОДИН раз. Иначе каждый последующий customerorder.UPDATE по
+        # застрявшему заказу слал бы повторный алерт. set_order_ms_drift
+        # идемпотентен (True только при первой установке).
+        if await adb.set_order_ms_drift(order_id):
+            from services.notifier import aget_notify_recipients
+            from utils.helpers import esc
 
-        for uid in await aget_notify_recipients():
-            await tg_send_message(
-                uid,
-                f"⚠️ Заказ #{order_id}: МойСклад сообщил статус "
-                f"«{esc(state_name)}», но локальный статус <b>{local_status}</b> "
-                f"нельзя перевести в <b>{new_status}</b>. Разберите вручную.",
-            )
+            for uid in await aget_notify_recipients():
+                await tg_send_message(
+                    uid,
+                    f"⚠️ Заказ #{order_id}: МойСклад сообщил статус "
+                    f"«{esc(state_name)}», но локальный статус <b>{local_status}</b> "
+                    f"нельзя перевести в <b>{new_status}</b>. Разберите вручную.",
+                )
         return
 
     # CAS против снимка (TOCTOU): между чтением local_status и записью был сетевой
@@ -315,10 +320,12 @@ async def apply_ms_customerorder_delete(order: dict, co_id: str) -> None:
     status = order.get("status", "")
     agent = esc(order.get("agent_name") or "—")
 
-    # Идемпотентность: уже помечен удалённым в МС → не дублируем алерт/аудит
-    # (одна и та же запись может прийти и вебхуком, и cron-реконсиляцией, либо
-    # дважды в одном батче). Симметрично apply_ms_demand_delete.
-    if order.get("ms_deleted_at"):
+    # Идемпотентность алерта/аудита: повтор (вебхук + cron, либо дважды в батче)
+    # не должен слать второе уведомление. НО только для уже-обработанных статусов:
+    # approved-заказ всё равно надо отменить, даже если ms_deleted_at уже выставил
+    # demand.DELETE (он помечает флаг, но НЕ отменяет approved). cancel_order ниже
+    # идемпотентен (WHERE status='approved'), поэтому повтор approved безопасен.
+    if status != "approved" and order.get("ms_deleted_at"):
         return
 
     if status == "approved":

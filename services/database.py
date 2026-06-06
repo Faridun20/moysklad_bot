@@ -1169,7 +1169,7 @@ async def get_agent_current_debt(agent_id: str) -> float:
     placeholders = ", ".join(f"${i + 1}" for i in range(len(order_ids)))
     ret_rows = await adb_core.fetch(
         f"SELECT order_id, {_SUM_RETURNS_CENTS} AS rc FROM returns "
-        f"WHERE order_id IN ({placeholders}) AND status = 'confirmed' AND (deleted_at IS NULL) "
+        f"WHERE order_id IN ({placeholders}) AND {_RETURN_OWED_FILTER} "
         f"GROUP BY order_id",
         *order_ids,
     )
@@ -1290,7 +1290,7 @@ async def get_credit_overview() -> list[dict]:
         ph = ", ".join(f"${i + 1}" for i in range(len(open_ids)))
         for r in await adb_core.fetch(
             f"SELECT order_id, {_SUM_RETURNS_CENTS} AS rc FROM returns "
-            f"WHERE order_id IN ({ph}) AND status = 'confirmed' AND (deleted_at IS NULL) "
+            f"WHERE order_id IN ({ph}) AND {_RETURN_OWED_FILTER} "
             f"GROUP BY order_id",
             *open_ids,
         ):
@@ -1660,7 +1660,7 @@ async def _order_confirmed_returns_cents(order_id: int) -> int:
     return int(
         await adb_core.fetchval(
             f"SELECT {_SUM_RETURNS_CENTS} FROM returns "
-            "WHERE order_id = $1 AND status = 'confirmed' AND (deleted_at IS NULL)",
+            f"WHERE order_id = $1 AND {_RETURN_OWED_FILTER}",
             order_id,
         )
         or 0
@@ -3242,6 +3242,15 @@ _SUM_RETURNS_CENTS = (
     "COALESCE(SUM(COALESCE(total_amount_cents, CAST(round(total_amount * 100) AS INTEGER))), 0)"
 )
 
+# Возвраты, уменьшающие «к оплате» по заказу: ТОЛЬКО не-cash (debt_reduction /
+# no_refund / без метода). Cash-возврат физически отдаёт деньги (отрицательная
+# сдача в кассе) — он не должен ещё и уменьшать долг по заказу, иначе клиента
+# кредитуют дважды (вернули товар, отдали деньги — и заказ закрылся как оплаченный).
+_RETURN_OWED_FILTER = (
+    "status = 'confirmed' AND (deleted_at IS NULL) "
+    "AND (refund_method IS NULL OR refund_method != 'cash')"
+)
+
 
 async def get_order_payment_summary(order_id: int) -> dict:
     """Сумма по заказу: total / confirmed / pending / remaining.
@@ -4423,7 +4432,7 @@ async def _maybe_close_order_after_payment(
         returns_cents = int(
             await txn.fetchval(
                 f"SELECT {_SUM_RETURNS_CENTS} FROM returns "
-                "WHERE order_id = $1 AND status = 'confirmed' AND (deleted_at IS NULL)",
+                f"WHERE order_id = $1 AND {_RETURN_OWED_FILTER}",
                 order_id,
             )
             or 0
@@ -5016,7 +5025,7 @@ async def mark_order_paid(
         returns_cents = int(
             await txn.fetchval(
                 f"SELECT {_SUM_RETURNS_CENTS} FROM returns "
-                "WHERE order_id = $1 AND status = 'confirmed' AND (deleted_at IS NULL)",
+                f"WHERE order_id = $1 AND {_RETURN_OWED_FILTER}",
                 order_id,
             )
             or 0
