@@ -368,8 +368,10 @@ def build_daily_ping(role: str, summary: dict) -> str | None:
 
 def build_ping_keyboard(webapp_url: str | None) -> dict | None:
     """Inline-кнопка, открывающая WebApp (`web_app` работает в приватных чатах).
-    Без WEBAPP_URL — без кнопки (текст пинга всё равно зовёт открыть WebApp)."""
-    if not webapp_url:
+    Только HTTPS: Telegram отклоняет sendMessage с web_app-кнопкой на не-HTTPS URL
+    (тогда упал бы ВЕСЬ пинг). Без валидного URL — без кнопки (текст пинга всё
+    равно зовёт открыть WebApp)."""
+    if not webapp_url or not webapp_url.startswith("https://"):
         return None
     return {"inline_keyboard": [[{"text": "📲 Открыть WebApp", "web_app": {"url": webapp_url}}]]}
 

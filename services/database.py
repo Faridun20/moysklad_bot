@@ -1150,8 +1150,10 @@ async def get_agent_current_debt(agent_id: str) -> float:
     # Исключаем неактуальные: черновики/отклонённые/отменённые, полностью
     # оплаченные (в т.ч. через cash deposit → payment_confirmed=1 /
     # status='paid') и полностью возвращённые.
+    from config import BASE_CURRENCY
+
     rows = await adb_core.fetch(
-        "SELECT id FROM orders WHERE agent_id = $1 "
+        "SELECT id, currency FROM orders WHERE agent_id = $1 "
         "AND status NOT IN ('draft', 'rejected', 'cancelled', 'paid', 'returned') "
         "AND payment_confirmed = 0 AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)",
         agent_id,
@@ -1159,6 +1161,8 @@ async def get_agent_current_debt(agent_id: str) -> float:
     order_ids = [r["id"] for r in rows]
     if not order_ids:
         return 0.0
+    base_cur = (BASE_CURRENCY or "USD").upper()
+    currency_by_order = {r["id"]: (r["currency"] or base_cur) for r in rows}
 
     items_by_order = await get_order_items_by_ids(order_ids)
     payments_by_order = await get_payments_for_orders(order_ids)
@@ -1171,7 +1175,12 @@ async def get_agent_current_debt(agent_id: str) -> float:
     )
     returns_by_order = {r["order_id"]: int(r["rc"] or 0) for r in ret_rows}
 
-    debt_cents = 0
+    # Долг считаем в БАЗОВОЙ валюте: у заказов может быть разная currency, а лимит
+    # один (в базовой). Без конвертации «5 000 000 UZS» и «2000 USD» складывались
+    # как одно число → бессмысленное over/under-limit. convert_to_base кэширован;
+    # если курс валюты не задан — считаем сумму как есть (консервативно, не теряем
+    # долг), как и раньше.
+    debt_base = 0.0
     for oid in order_ids:
         total = sum(
             money.mul_qty(_price_cents(it), it.get("quantity", 0) or 0)
@@ -1182,44 +1191,36 @@ async def get_agent_current_debt(agent_id: str) -> float:
             for p in payments_by_order.get(oid, [])
             if p["status"] == "confirmed"
         )
-        remaining = max(0, total - confirmed)
-        debt_cents += max(0, remaining - returns_by_order.get(oid, 0))
-    return float(money.from_cents(debt_cents))
+        net_cents = max(0, max(0, total - confirmed) - returns_by_order.get(oid, 0))
+        net_major = float(money.from_cents(net_cents))
+        base = convert_to_base(net_major, currency_by_order[oid])
+        debt_base += base if base is not None else net_major
+    return round(debt_base, 2)
 
 
-async def check_credit_limit(agent_id: str, order_total: float) -> dict:
+async def check_credit_limit(agent_id: str, order_total: float, currency: str | None = None) -> dict:
     """Проверка лимита для нового заказа. НЕ блокирует — даёт данные для
-    решения боса (over_limit + цифры).
+    решения боса (over_limit + цифры). Всё в БАЗОВОЙ валюте: долг агента уже в
+    базовой (get_agent_current_debt), сумму нового заказа конвертируем по его
+    валюте (None/без курса → как есть). Лимит — в базовой.
 
     asyncpg Stage 18 (#21): native async; get_agent_current_debt/get_credit_limit
     теперь async (await)."""
     debt = await get_agent_current_debt(agent_id)
     limit = await get_credit_limit(agent_id)
-    projected = debt + order_total
+    order_total_base = order_total
+    if currency:
+        conv = convert_to_base(order_total, currency)
+        if conv is not None:
+            order_total_base = conv
+    projected = debt + order_total_base
     return {
         "current_debt": debt,
         "limit": limit,
+        "order_total_base": order_total_base,
         "projected": projected,
         "over_limit": projected > limit,
     }
-
-
-async def _confirmed_returns_by_order(order_ids: list[int]) -> dict[int, float]:
-    """{order_id: сумма подтверждённых (не удалённых) возвратов}. Фильтр идентичен
-    тому, что в get_agent_current_debt — используется для батч-расчёта долга.
-
-    asyncpg Stage 12 (#21): native async через adb_core; IN-список — $1..$N."""
-    if not order_ids:
-        return {}
-    unique_ids = list(set(order_ids))
-    placeholders = ", ".join(f"${i + 1}" for i in range(len(unique_ids)))
-    rows = await adb_core.fetch(
-        f"SELECT order_id, COALESCE(SUM(total_amount), 0) AS s FROM returns "
-        f"WHERE order_id IN ({placeholders}) AND status = 'confirmed' "
-        f"AND (deleted_at IS NULL) GROUP BY order_id",
-        *unique_ids,
-    )
-    return {r["order_id"]: float(r["s"] or 0) for r in rows}
 
 
 async def agent_has_order(agent_id: str) -> bool:
@@ -1268,35 +1269,57 @@ async def get_credit_overview() -> list[dict]:
         if aid and aid not in agents:
             agents[aid] = r["agent_name"] or aid
 
+    from config import BASE_CURRENCY
+
     # Открытые заказы (фильтр идентичен get_agent_current_debt) — один запрос
     # на всех агентов; долг по ним разбираем в Python.
     open_rows = [
-        (r["id"], r["agent_id"])
+        (r["id"], r["agent_id"], r["currency"])
         for r in await adb_core.fetch(
-            "SELECT id, agent_id FROM orders "
+            "SELECT id, agent_id, currency FROM orders "
             "WHERE status NOT IN ('draft', 'rejected', 'cancelled', 'paid', 'returned') "
             "AND payment_confirmed = 0 AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)"
         )
     ]
 
-    open_ids = [oid for oid, _ in open_rows]
+    open_ids = [oid for oid, _, _ in open_rows]
     items_by_order = await get_order_items_by_ids(open_ids)
     payments_by_order = await get_payments_for_orders(open_ids)
-    returns_by_order = await _confirmed_returns_by_order(open_ids)
+    returns_cents_by_order: dict[int, int] = {}
+    if open_ids:
+        ph = ", ".join(f"${i + 1}" for i in range(len(open_ids)))
+        for r in await adb_core.fetch(
+            f"SELECT order_id, {_SUM_RETURNS_CENTS} AS rc FROM returns "
+            f"WHERE order_id IN ({ph}) AND status = 'confirmed' AND (deleted_at IS NULL) "
+            f"GROUP BY order_id",
+            *open_ids,
+        ):
+            returns_cents_by_order[r["order_id"]] = int(r["rc"] or 0)
     default_limit = float(await asyncio.to_thread(get_setting, "credit_limit_default", 2000.0))
+    base_cur = (BASE_CURRENCY or "USD").upper()
 
-    # debt[aid] = Σ по открытым заказам max(0, max(0, total−confirmed) − returns)
-    # — бит-в-бит как цикл в get_agent_current_debt.
+    # debt[aid] = Σ по открытым заказам net = max(0, max(0, total−confirmed) − returns),
+    # в КОПЕЙКАХ и сконвертированный в БАЗОВУЮ валюту — бит-в-бит как
+    # get_agent_current_debt (мульти-валютный долг к единому лимиту).
     debt_by_agent: dict[str, float] = {}
-    for oid, aid in open_rows:
+    for oid, aid, cur in open_rows:
         items = items_by_order.get(oid, [])
-        total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
-        payments = payments_by_order.get(oid, [])
-        confirmed = sum(p["amount"] for p in payments if p["status"] == "confirmed")
-        returns_sum = returns_by_order.get(oid, 0.0)
-        order_debt = max(0.0, max(0.0, total - confirmed) - returns_sum)
-        if order_debt:
-            debt_by_agent[aid] = debt_by_agent.get(aid, 0.0) + order_debt
+        total = sum(
+            money.mul_qty(_price_cents(it), it.get("quantity", 0) or 0) for it in items
+        )
+        confirmed = sum(
+            _amount_cents(p)
+            for p in payments_by_order.get(oid, [])
+            if p["status"] == "confirmed"
+        )
+        net_cents = max(0, max(0, total - confirmed) - returns_cents_by_order.get(oid, 0))
+        if not net_cents:
+            continue
+        net_major = float(money.from_cents(net_cents))
+        base = convert_to_base(net_major, cur or base_cur)
+        debt_by_agent[aid] = debt_by_agent.get(aid, 0.0) + (
+            base if base is not None else net_major
+        )
 
     out: list[dict[str, Any]] = []
     for aid, name in agents.items():
@@ -2589,14 +2612,28 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
 
     # Refund: cash → отрицательная подтверждённая сдача (учёт выдачи из кассы).
     if ret.get("refund_method") == "cash":
+        from config import BASE_CURRENCY
+
         order = await get_order(order_id)
+        # Касса ведётся в БАЗОВОЙ валюте (у cash_deposits нет колонки валюты).
+        # total_amount возврата — в валюте заказа; конвертируем в базовую, иначе
+        # возврат по UZS-заказу вычел бы «5 000 000 USD» из итогов кассы.
+        order_cur = ((order or {}).get("currency") or BASE_CURRENCY or "USD").upper()
+        refund_major = float(ret["total_amount"])
+        refund_base = convert_to_base(refund_major, order_cur)
+        if refund_base is None:
+            refund_base = refund_major  # курс не задан — пишем как есть (best-effort)
+            logger.warning(
+                "confirm_return #%s: нет курса %s→базовая, refund в кассу записан "
+                "без конвертации", return_id, order_cur,
+            )
         await adb_core.execute(
             "INSERT INTO cash_deposits (manager_id, amount, amount_cents, deposited_at, "
             "status, confirmed_by, confirmed_at, notes, created_at) "
             "VALUES ($1, $2, $3, $4, 'confirmed', $5, $6, $7, $8)",
             (order or {}).get("user_id") or confirmed_by,
-            -float(ret["total_amount"]),
-            -money.to_cents(ret["total_amount"]),  # dual-write копеек (отриц.)
+            -refund_base,
+            -money.to_cents(refund_base),  # dual-write копеек (отриц.)
             now_str(),
             confirmed_by,
             now_str(),
@@ -5297,6 +5334,19 @@ def update_order_status(order_id: int, status: str) -> bool:
         updated = cur.rowcount > 0
         conn.commit()
     return updated
+
+
+async def cas_order_status(order_id: int, new_status: str, expected_status: str) -> bool:
+    """Compare-and-set статуса: применяет new_status ТОЛЬКО если текущий ==
+    expected_status. Защита от TOCTOU в системных обработчиках (вебхук МС читает
+    статус, потом делает сетевой round-trip к МС, потом пишет — между чтением и
+    записью статус мог измениться, напр. confirm_payment перевёл paid). Возвращает
+    True, если применено. Native async через adb_core."""
+    rc = await adb_core.execute(
+        "UPDATE orders SET status = $1, updated_at = $2 WHERE id = $3 AND status = $4",
+        new_status, now_str(), order_id, expected_status,
+    )
+    return rc > 0
 
 
 def add_order_item(
