@@ -40,6 +40,7 @@
      по всему файлу и не читались на тёмной теме Telegram. */
   --success:     #1e8e3e;             /* зелёный текст/акцент */
   --success-bg:  #d1f5e0;             /* мягкая подложка бейджа */
+  --success-fg:  #ffffff;             /* текст на --success-фоне (кнопки) */
   --danger:      #c5221f;             /* красный текст/акцент */
   --danger-bg:   #fde3e3;
   --warn:        #6f4a06;             /* тёмный текст на --warn-bg (бейджи) */
@@ -60,6 +61,7 @@
   --divider:     rgba(255, 255, 255, 0.12);
   --success:     #4ade80;
   --success-bg:  rgba(74, 222, 128, 0.16);
+  --success-fg:  #06230f;             /* тёмный текст на ярко-зелёной кнопке */
   --danger:      #ff6b6b;
   --danger-bg:   rgba(255, 107, 107, 0.16);
   --warn:        #f5c451;
@@ -69,6 +71,26 @@
   --info-bg:     rgba(90, 169, 240, 0.16);
   --neutral:     #c2c2c8;
   --neutral-bg:  rgba(255, 255, 255, 0.12);
+}
+
+/* Тёмная тема ВНЕ Telegram (обычный браузер): applyTelegramTheme ставит
+   data-theme только когда есть tg.colorScheme. Без этого правила тёмная ОС +
+   браузер давали светлый UI с тёмной обвязкой. Базовые поверхности всё равно
+   через var(--tg-theme-*) — в Telegram тема клиента побеждает фоллбэки. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg-page:    var(--tg-theme-secondary-bg-color, #1c1c1e);
+    --bg-card:    var(--tg-theme-bg-color, #2c2c2e);
+    --text:       var(--tg-theme-text-color, #ffffff);
+    --text-mute:  var(--tg-theme-hint-color, #9e9ea3);
+    --divider:    rgba(255, 255, 255, 0.12);
+    --bg-soft:    rgba(255, 255, 255, 0.08);
+    --success:    #4ade80;  --success-bg: rgba(74, 222, 128, 0.16); --success-fg: #06230f;
+    --danger:     #ff6b6b;  --danger-bg:  rgba(255, 107, 107, 0.16);
+    --warn:       #f5c451;  --warn-strong: #f9b542; --warn-bg: rgba(249, 168, 37, 0.16);
+    --info:       #5aa9f0;  --info-bg:    rgba(90, 169, 240, 0.16);
+    --neutral:    #c2c2c8;  --neutral-bg: rgba(255, 255, 255, 0.12);
+  }
 }
 
 /* Утилита: скрыть элемент без инлайн-стилей в JS. */
@@ -198,7 +220,9 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 14px 16px;
+  /* viewport-fit=cover (index.html) обрезает контент под чёлку/Dynamic Island —
+     добавляем верхний safe-area inset, чтобы заголовок не уезжал под статус-бар. */
+  padding: calc(14px + env(safe-area-inset-top)) 16px 14px;
   background: var(--bg-page);
   border-bottom: 0.5px solid var(--divider);
   transition: box-shadow 0.2s ease;
@@ -1002,18 +1026,20 @@ body {
   background: rgba(127,127,127,.12); color: var(--text-mute);
   white-space: nowrap;
 }
-.order-pay--credit { background: rgba(255,159,10,.16); color: #c97a00; }
-.order-pay--ok     { background: rgba(52,199,89,.16);  color: #1c8b3a; }
-.order-pay--wait   { background: rgba(0,122,255,.14);  color: #0a6cd8; }
-.order-pay--bad    { background: rgba(255,59,48,.14);  color: #c0271d; }
+/* Семантические токены (а не хардкод hex) — иначе на тёмной теме тёмный
+   текст ложился на тёмную полупрозрачную подложку (контраст ниже AA). */
+.order-pay--credit { background: var(--warn-bg);    color: var(--warn); }
+.order-pay--ok     { background: var(--success-bg); color: var(--success); }
+.order-pay--wait   { background: var(--info-bg);    color: var(--info); }
+.order-pay--bad    { background: var(--danger-bg);  color: var(--danger); }
 
 /* Кредит-контекст клиента в заявке (босс решает об апруве не уходя в Лимиты). */
 .credit-ctx {
   margin: 4px 0 6px; padding: 8px 10px;
   border-radius: 10px; font-size: 12px; line-height: 1.4;
 }
-.credit-ctx--ok  { background: rgba(52,199,89,.12);  color: var(--text); }
-.credit-ctx--bad { background: rgba(255,59,48,.12);  color: var(--text); }
+.credit-ctx--ok  { background: var(--success-bg); color: var(--text); }
+.credit-ctx--bad { background: var(--danger-bg);  color: var(--text); }
 
 /* Превью позиций в карточке подтверждения оплаты — что именно подтверждаешь. */
 .debt-items-preview { font-size: 12px; color: var(--text-mute); margin: 2px 0 6px; }
@@ -1130,7 +1156,10 @@ body {
 .editor-item-del {
   background: none; border: none;
   font-size: 18px; cursor: pointer;
-  color: var(--danger); padding: 4px 8px;
+  color: var(--danger);
+  /* Тач-таргет ≥44px (раньше ~26px — мимо пальцем по денежной форме). */
+  min-width: 44px; min-height: 44px;
+  display: inline-flex; align-items: center; justify-content: center;
 }
 
 .editor-empty {
@@ -1229,8 +1258,8 @@ body {
 }
 .payment-option input { margin: 0; }
 .payment-option:has(input:checked) {
-  background: var(--accent, #2481cc);
-  color: #fff;
+  background: var(--accent);
+  color: var(--accent-fg);
 }
 .due-date-wrap {
   padding: 0 14px 12px;
@@ -1240,13 +1269,15 @@ body {
 }
 .due-date-input {
   width: 100%; padding: 12px; font-size: 15px;
-  border: 1px solid var(--tg-theme-section-separator-color, rgba(255,255,255,0.1));
-  border-radius: 10px;
-  background: var(--tg-theme-bg-color, #1e1e1e);
-  color: var(--tg-theme-text-color, #fff);
+  /* Единый рецепт с .form-input (через токены), а не dark-only фоллбэки
+     (#1e1e1e/#fff) — иначе в браузере на светлой теме поле было чёрным. */
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  color: var(--text);
   outline: none;
-  /* Android Chrome: цвет иконки календаря через color-scheme */
-  color-scheme: dark light;
+  /* Иконка календаря красится под текущую тему. */
+  color-scheme: light dark;
 }
 .due-date-input:focus {
   border-color: var(--accent, #2481cc);
@@ -1269,8 +1300,8 @@ body {
   cursor: pointer;
 }
 .debts-tab.active {
-  background: var(--accent, #2481cc);
-  color: #fff;
+  background: var(--accent);
+  color: var(--accent-fg);
 }
 .debts-summary {
   padding: 0 14px;
@@ -1320,8 +1351,8 @@ body {
 .debt-owner { opacity: 0.7; }
 .btn-mark-paid {
   width: 100%; padding: 10px; border: 0; border-radius: 10px;
-  background: var(--accent, #2481cc);
-  color: #fff;
+  background: var(--accent);
+  color: var(--accent-fg);
   font-size: 14px; font-weight: 600; cursor: pointer;
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
 }
@@ -1403,7 +1434,7 @@ body {
   font-size: 14px; font-weight: 600; cursor: pointer;
 }
 .btn-confirm-pay {
-  background: var(--success); color: #fff;
+  background: var(--success); color: var(--success-fg);
 }
 .btn-reject-pay {
   background: var(--bg-card);
@@ -1500,20 +1531,20 @@ body {
 .pay-amount-input {
   flex: 1; min-width: 0;
   padding: 10px 12px; font-size: 14px;
-  /* Используем Telegram theme vars — fallback на тёмные тона, чтобы
-     input не светился белым на тёмной теме. */
-  border: 1px solid var(--tg-theme-section-separator-color, rgba(255,255,255,0.1));
-  border-radius: 10px;
-  background: var(--tg-theme-bg-color, #1e1e1e);
-  color: var(--tg-theme-text-color, #fff);
+  /* Единый рецепт через токены (как .form-input), а не dark-only фоллбэки —
+     иначе в светлом браузере поле рендерилось чёрным. */
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  color: var(--text);
   outline: none;
 }
 .pay-amount-input::placeholder {
-  color: var(--tg-theme-hint-color, rgba(255,255,255,0.4));
+  color: var(--text-mute);
   opacity: 1;
 }
 .pay-amount-input:focus {
-  border-color: var(--accent, #2481cc);
+  border-color: var(--accent);
 }
 .pay-input-row .btn-mark-paid {
   flex-shrink: 0; width: auto; padding: 10px 14px;
@@ -1589,8 +1620,8 @@ body {
   background: var(--bg-soft);
   border: none;
   border-radius: 50%;
-  width: 40px;
-  height: 40px;
+  width: 44px;
+  height: 44px;
   font-size: 18px;
   cursor: pointer;
   color: var(--text);

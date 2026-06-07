@@ -1,5 +1,13 @@
-// Telegram WebApp SDK
-const tg = window.Telegram.WebApp;
+// Telegram WebApp SDK. Гард: вне Telegram (или если telegram-web-app.js не
+// загрузился) window.Telegram отсутствует — без заглушки первая же строка
+// роняла весь скрипт в белый экран. Остальной код защищён (tg.X && / ?. /
+// try-catch / showAlert?…:alert), стаб лишь не даёт упасть на старте и даёт
+// рабочие диалоги в обычном браузере.
+const tg = (window.Telegram && window.Telegram.WebApp) || {
+  ready() {}, expand() {},
+  showAlert(m) { try { window.alert(m); } catch (_e) {} },
+  showConfirm(m, cb) { try { cb(window.confirm(m)); } catch (_e) { if (cb) cb(false); } },
+};
 tg.ready();
 tg.expand();
 
@@ -166,7 +174,11 @@ async function showScreen(screen) {
   // в каталог ни один таб не подсвечивался.
   const navScreen = { stock: 'orders', debts: 'finance', payments: 'finance', ops: 'home' }[screen] || screen;
   document.querySelectorAll('.nav-item').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.screen === navScreen);
+    const isActive = btn.dataset.screen === navScreen;
+    btn.classList.toggle('active', isActive);
+    // aria-current — активный таб для скринридера (визуально это только цвет).
+    if (isActive) btn.setAttribute('aria-current', 'page');
+    else btn.removeAttribute('aria-current');
     // Переинициализируем обработчик на случай если DOM обновился
     btn.onclick = () => showScreen(btn.dataset.screen);
   });
@@ -789,8 +801,13 @@ function toast(msg, type = 'success', opts = {}) {
     host = document.createElement('div');
     host.id = 'toast-host';
     host.className = 'toast-host';
+    // Озвучивание скринридером: тосты — единственный фидбэк денежных действий.
+    host.setAttribute('role', 'status');
+    host.setAttribute('aria-live', 'polite');
     document.body.appendChild(host);
   }
+  // Ошибки — настойчивее (assertive), успехи/инфо — вежливо (polite).
+  host.setAttribute('aria-live', type === 'error' ? 'assertive' : 'polite');
   const el = document.createElement('div');
   el.className = `toast toast--${type}`;
   // Иконка из спрайта (вместо эмодзи ⚠️/ℹ️/✅): тинтуется под тему, единый рендер.
@@ -1453,7 +1470,7 @@ function renderOrderEditor() {
               <div class="editor-item-name">${escapeHtml(it.name)}</div>
               <div class="editor-item-qty">${it.quantity} ${it.unit || 'шт'}${subStr}</div>
             </div>
-            <button class="editor-item-del" data-idx="${i}">✕</button>
+            <button class="editor-item-del" data-idx="${i}" aria-label="Удалить позицию">✕</button>
           </div>
         `;
       }).join('') + (grandTotal > 0 ? `
@@ -1928,6 +1945,9 @@ async function renderOpsSummary() {
 
 async function renderPendingRequests() {
   const content = document.getElementById('content');
+  // fmt был локальным в других рендерах, но не здесь → кредит-блок заявки
+  // (fmt(...)) кидал ReferenceError, и весь экран заявок падал в errorBox.
+  const fmt = n => Math.round(n).toLocaleString('ru-RU');
   content.innerHTML = loading('Загружаю заявки…');
   try {
     const data = await api('/api/orders/requests', {});
@@ -1996,7 +2016,12 @@ async function renderPendingRequests() {
       btn.addEventListener('click', () => handleRequest(btn.dataset.req, 'approve'))
     );
     document.querySelectorAll('.btn-reject').forEach(btn =>
-      btn.addEventListener('click', () => handleRequest(btn.dataset.req, 'reject'))
+      btn.addEventListener('click', () => {
+        // Отклонение заявки — консеквентно (менеджер переделывает): подтверждаем.
+        tg.showConfirm('Отклонить заявку? Менеджеру придётся создать её заново.', ok => {
+          if (ok) handleRequest(btn.dataset.req, 'reject');
+        });
+      })
     );
   } catch (e) {
     content.innerHTML = errorBox(e.message);
@@ -2747,30 +2772,39 @@ async function renderCashbox(container) {
   // Сдачи: подтвердить / отклонить (причина — inline).
   container.querySelectorAll('.debt-card[data-dep]').forEach(card => {
     const id = card.dataset.dep;
-    card.querySelector('.dep-confirm').addEventListener('click', () => {
+    card.querySelector('.dep-confirm').addEventListener('click', (ev) => {
+      const b = ev.currentTarget;
+      if (b.disabled) return;
+      b.disabled = true;  // защита от двойного тапа (сервер идемпотентен, UX — нет)
       haptic('light');
       api('/api/deposits/confirm', { deposit_id: Number(id), idempotency_key: idemKey() })
         .then(() => { tg.showAlert('✅ Сдача подтверждена'); renderCashbox(container); })
-        .catch(e => tg.showAlert('❌ ' + e.message));
+        .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
     });
     const box = card.querySelector('.dep-reject-box');
     card.querySelector('.dep-reject').addEventListener('click', () => { box.hidden = !box.hidden; });
-    card.querySelector('.dep-reject-send').addEventListener('click', () => {
+    card.querySelector('.dep-reject-send').addEventListener('click', (ev) => {
+      const b = ev.currentTarget;
       const reason = card.querySelector('.dep-reason').value.trim();
       if (reason.length < 3) { tg.showAlert('❌ Укажите причину'); return; }
+      if (b.disabled) return;
+      b.disabled = true;
       api('/api/deposits/reject', { deposit_id: Number(id), reason })
         .then(() => { tg.showAlert('❌ Сдача отклонена'); renderCashbox(container); })
-        .catch(e => tg.showAlert('❌ ' + e.message));
+        .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
     });
   });
 
   // Возвраты: подтвердить.
   container.querySelectorAll('.debt-card[data-ret]').forEach(card => {
-    card.querySelector('.ret-confirm').addEventListener('click', () => {
+    card.querySelector('.ret-confirm').addEventListener('click', (ev) => {
+      const b = ev.currentTarget;
+      if (b.disabled) return;
+      b.disabled = true;  // защита от двойного тапа
       haptic('light');
       api('/api/returns/confirm', { return_id: Number(card.dataset.ret), idempotency_key: idemKey() })
         .then(() => { tg.showAlert('✅ Возврат подтверждён'); renderCashbox(container); })
-        .catch(e => tg.showAlert('❌ ' + e.message));
+        .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
     });
   });
 
@@ -3111,8 +3145,8 @@ async function renderDebts(container) {
           return;
         }
         const msg = amount === null
-          ? 'Отметить полную оплату остатка?\\nБосс должен будет подтвердить.'
-          : `Отметить получение ${amount}?\\nБосс должен будет подтвердить.`;
+          ? 'Отметить полную оплату остатка?\nБосс должен будет подтвердить.'
+          : `Отметить получение ${amount}?\nБосс должен будет подтвердить.`;
         tg.showConfirm(msg, async ok => {
           if (!ok) return;
           btn.disabled = true;
