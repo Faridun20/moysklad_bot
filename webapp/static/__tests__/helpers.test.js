@@ -184,15 +184,31 @@ describe('renderMoneyTotalsHtml', () => {
     expect(html).toContain('&lt;x&gt;');
     expect(html).not.toContain('<x>');
   });
-  it('показывает единый итог в базовой валюте (+ пометка partial)', () => {
+  it('показывает единый итог в базовой валюте', () => {
     const html = renderMoneyTotalsHtml({
       payments: [{ currency: 'USD', total_cents: 100000, count: 1 }],
       deposits: { total_cents: 0, count: 0 },
-      base_total: 1000, base_currency: 'USD', base_partial: true,
+      base_total: 1000, base_currency: 'USD', missing_rates: [],
     });
     expect(html).toContain('money-total');
     expect(html).toContain('≈ 1 000 USD');
-    expect(html).toContain('без курса');
+    expect(html).not.toContain('Без курса');
+  });
+  it('крупная сумма без курса (>999) не теряется молча — показана в блоке «Без курса»', () => {
+    // Регресс «не считает суммы >999»: UZS 5 000 000 без курса не должен исчезнуть.
+    const html = renderMoneyTotalsHtml({
+      payments: [
+        { currency: 'USD', total_cents: 50000, count: 1 },
+        { currency: 'UZS', total_cents: 500000000, count: 1 },
+      ],
+      deposits: { total_cents: 0, count: 0 },
+      base_total: 500, base_currency: 'USD',
+      base_partial: true, missing_rates: [{ currency: 'UZS', amount: 5000000 }],
+    });
+    expect(html).toContain('≈ 500 USD');
+    expect(html).toContain('(неполный)');
+    expect(html).toContain('Без курса не учтено');
+    expect(html).toContain('UZS 5 000 000');  // крупная сумма видна, не потеряна
   });
   it('без base_total — баннера итога нет', () => {
     const html = renderMoneyTotalsHtml({ payments: [{ currency: 'USD', total_cents: 100, count: 1 }], deposits: { count: 0 } });
