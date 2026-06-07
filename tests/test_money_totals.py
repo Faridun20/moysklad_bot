@@ -240,6 +240,37 @@ def test_money_summary_base_total_includes_negative_deposits(isolated_db, monkey
     assert body["base_total"] == 70.0  # 100 − 30, отрицательная сдача учтена
 
 
+def test_money_summary_counts_by_confirmation_time(isolated_db, monkeypatch):
+    """«Поступления за период» считаются по confirmed_at (когда деньги получены),
+    а не created_at. Платёж/сдача, созданные ДО периода, но подтверждённые В нём,
+    обязаны попасть в итог (был баг «не считает платежи и сдачу»)."""
+    db = isolated_db
+    # Платёж создан в прошлом году, подтверждён сегодня.
+    pid = db.add_payment(40, "m", "Mgr", 100.0, "USD", "c")
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q("UPDATE payments SET status='confirmed', created_at=?, confirmed_at=? WHERE id=?"),
+            ("2020-01-01 00:00:00", db.now_str(), pid),
+        )
+        # Сдача: создана в прошлом году, подтверждена сегодня.
+        cur.execute(
+            db.q(
+                "INSERT INTO cash_deposits (manager_id, amount, amount_cents, status, "
+                "created_at, confirmed_at) VALUES (?, ?, ?, 'confirmed', ?, ?)"
+            ),
+            (40, 50.0, 5000, "2020-01-01 00:00:00", db.now_str()),
+        )
+        conn.commit()
+    client, _ = _client(db, monkeypatch, 615, "boss")
+    # Период «месяц» (с 1-го числа текущего месяца) — created_at в 2020 НЕ попал бы,
+    # но confirmed_at сегодня → должно посчитаться.
+    body = client.post("/api/money/summary", json={"initData": "615", "period": "month"}).json()
+    by = {p["currency"]: p["total_cents"] for p in body["payments"]}
+    assert by.get("USD") == 10000          # платёж посчитан по дате подтверждения
+    assert body["deposits"]["total_cents"] == 5000  # сдача тоже
+
+
 def test_money_summary_unrated_currency_not_dropped(isolated_db, monkeypatch):
     """Регресс «Обзор не считает суммы >999»: крупная сумма в валюте БЕЗ курса
     (UZS 5 000 000) не должна молча выпадать из итога — она в missing_rates,
