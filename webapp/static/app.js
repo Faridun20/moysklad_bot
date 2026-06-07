@@ -305,18 +305,19 @@ async function renderOrdersScreen() {
   } else {
     await renderStock();
   }
-  // Поверх их вывода — прикрепляем переключатель под-вкладок.
+  // Поверх их вывода — переключатель под-вкладок. Единый стиль с Аналитикой:
+  // iOS-сегмент .seg (равные доли, приподнятая активная), а не отдельный .sub-tabs.
   const content = document.getElementById('content');
   const tabsHtml = `
-    <div class="sub-tabs">
-      <button class="sub-tab ${ordersSubTab === 'orders' ? 'active' : ''}"
-              data-sub="orders">${icon('list')} Заказы</button>
-      <button class="sub-tab ${ordersSubTab === 'stock' ? 'active' : ''}"
-              data-sub="stock">${icon('box')} Каталог</button>
+    <div class="seg-row" style="margin-bottom:10px;">
+      <div class="seg">
+        <button class="seg-item ${ordersSubTab === 'orders' ? 'active' : ''}" data-sub="orders" aria-pressed="${ordersSubTab === 'orders'}">${icon('list')} Заказы</button>
+        <button class="seg-item ${ordersSubTab === 'stock' ? 'active' : ''}" data-sub="stock" aria-pressed="${ordersSubTab === 'stock'}">${icon('box')} Каталог</button>
+      </div>
     </div>
   `;
   content.insertAdjacentHTML('afterbegin', tabsHtml);
-  document.querySelectorAll('.sub-tab').forEach(btn => {
+  document.querySelectorAll('.seg-item[data-sub]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
       ordersSubTab = btn.dataset.sub;
@@ -2459,6 +2460,7 @@ function initNav() {
 let financeTab = 'debts';  // confirm | debts | ops | limits (плоско, по задачам)
 let debtsFilter = 'all';   // 'all' | 'today'
 let cashboxSubTab = null;  // последняя секция кассы (confirm|ops) — фолбэк
+let financePendCache = 0;  // последний счётчик подтверждений (мгновенный бейдж)
 
 async function renderFinance() {
   const content = document.getElementById('content');
@@ -2482,20 +2484,13 @@ async function renderFinance() {
   tabs.forEach(t => { LABELS[t.key] = t.label; });
   setScreenContext(`Финансы · ${LABELS[financeTab] || ''}`);
 
-  // Бейдж ожидающих подтверждений — на вкладке «Подтверждения», ВСЕГДА виден (а не
-  // только когда раздел открыт). Тянем только счётчики (длины списков).
-  let pendN = 0;
-  if (isConfirmer) {
-    const cnt = (p, k) => api(p, {}).then(r => (r[k] || []).length).catch(() => 0);
-    const parts = [cnt('/api/deposits/pending', 'deposits'), cnt('/api/returns/pending', 'returns')];
-    if (isBoss) parts.push(cnt('/api/payments/pending', 'pending'));
-    pendN = (await Promise.all(parts)).reduce((a, b) => a + b, 0);
-  }
-
   // Под-навигация = подчёркнутый горизонт-скролл сегмент (.subseg) — НЕ переносится
   // «по три в ряд» (раньше .cat-row с flex-wrap). Пилюли (.cat-btn) теперь только
   // для фильтров — визуальная иерархия: подчёркнутое = навигация, пилюли = фильтры.
-  content.innerHTML = `
+  // ВАЖНО: вкладки рисуем СРАЗУ (синхронно). Раньше рендер ждал сетевой подсчёт
+  // бейджа (await) — при зависшем запросе вкладки не появлялись до перезагрузки
+  // («иногда пропадали вкладки»). Бейдж берём из кэша и освежаем асинхронно ниже.
+  const tabBarHtml = (pendN) => `
     <div class="subseg">
       ${tabs.map(t => {
         const on = financeTab === t.key;
@@ -2504,8 +2499,8 @@ async function renderFinance() {
         return `<button class="subseg-item ${on ? 'active' : ''}" data-tab="${t.key}" aria-pressed="${on}">${t.label}${badge}</button>`;
       }).join('')}
     </div>
-    <div id="finance-body"></div>
-  `;
+    <div id="finance-body"></div>`;
+  content.innerHTML = tabBarHtml(isConfirmer ? financePendCache : 0);
   content.querySelectorAll('[data-tab]').forEach(t => {
     t.addEventListener('click', () => {
       haptic('light');
@@ -2517,6 +2512,29 @@ async function renderFinance() {
   const activeSeg = content.querySelector('.subseg-item.active');
   if (activeSeg && activeSeg.scrollIntoView) {
     try { activeSeg.scrollIntoView({ inline: 'center', block: 'nearest' }); } catch (e) { /* старый WebView */ }
+  }
+
+  // Бейдж ожидающих подтверждений — освежаем АСИНХРОННО, чтобы зависший запрос
+  // не блокировал появление вкладок. Обновляем счётчик на месте.
+  if (isConfirmer) {
+    const cnt = (p, k) => api(p, {}).then(r => (r[k] || []).length).catch(() => 0);
+    const parts = [cnt('/api/deposits/pending', 'deposits'), cnt('/api/returns/pending', 'returns')];
+    if (isBoss) parts.push(cnt('/api/payments/pending', 'pending'));
+    Promise.all(parts).then(arr => {
+      const n = arr.reduce((a, b) => a + b, 0);
+      financePendCache = n;
+      if (currentScreen !== 'finance') return;
+      const pill = content.querySelector('.subseg-item[data-tab="confirm"]');
+      if (!pill) return;
+      const old = pill.querySelector('.stock-badge');
+      if (old) old.remove();
+      if (n) {
+        const b = document.createElement('span');
+        b.className = 'stock-badge badge-yellow';
+        b.textContent = n;
+        pill.appendChild(b);
+      }
+    });
   }
 
   const body = document.getElementById('finance-body');
