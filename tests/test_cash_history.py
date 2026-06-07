@@ -44,3 +44,31 @@ def test_cash_history_merges_kinds_with_names(isolated_db):
 
 def test_cash_history_empty(isolated_db):
     assert asyncio.run(isolated_db.get_cash_history(80)) == []
+
+
+def test_cash_history_hides_payments_of_deleted_orders(isolated_db):
+    """Платёж по удалённому в МС заказу НЕ показываем в ленте — он исключён и из
+    итога «Деньги» (get_money_totals), лента обязана с ним совпадать. standalone-
+    платёж (без заказа) и платёж по живому заказу остаются."""
+    db = isolated_db
+    db.set_role(10, "m1", "Mgr", "manager")
+
+    live = db.create_order(10, "Mgr", "")
+    db.add_order_item(live, "P", "", 1, "шт", 100.0)
+    db.add_payment(10, "m1", "Mgr", 100.0, "USD", "по живому", order_id=live)
+
+    phantom = db.create_order(10, "Mgr", "")
+    db.add_order_item(phantom, "P", "", 1, "шт", 30.0)
+    db.add_payment(10, "m1", "Mgr", 30.0, "USD", "по удалённому", order_id=phantom)
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q("UPDATE orders SET ms_deleted_at='2026-06-03 00:00:00' WHERE id=?"), (phantom,)
+        )
+        conn.commit()
+
+    db.add_payment(10, "m1", "Mgr", 50.0, "USD", "standalone")  # order_id=None
+
+    hist = asyncio.run(db.get_cash_history(80))
+    pay_amounts = {h["amount"] for h in hist if h["kind"] == "payment"}
+    assert pay_amounts == {100.0, 50.0}  # платёж по удалённому (30) скрыт

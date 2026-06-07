@@ -4654,9 +4654,16 @@ async def get_cash_history(limit: int = 80) -> list[dict]:
     фронте; здесь отдаём amount как есть (float — только для отображения, не
     для расчётов; денежное ядро остаётся на cents в своих функциях).
     """
+    # Платежи по удалённым/фантомным заказам НЕ показываем — они исключены и из
+    # итога «Деньги» (get_money_totals), поэтому лента обязана с ним совпадать
+    # (иначе платёж «принят» в ленте, но не в сумме — противоречие). standalone-
+    # платежи (order_id IS NULL) показываем.
     pays = await adb_core.fetch(
-        "SELECT id, user_id, amount, currency, status, comment, order_id, created_at "
-        "FROM payments ORDER BY created_at DESC LIMIT $1",
+        "SELECT p.id, p.user_id, p.amount, p.currency, p.status, p.comment, "
+        "p.order_id, p.created_at "
+        "FROM payments p LEFT JOIN orders o ON o.id = p.order_id "
+        "WHERE (o.id IS NULL OR (o.ms_deleted_at IS NULL AND o.deleted_at IS NULL)) "
+        "ORDER BY p.created_at DESC LIMIT $1",
         limit,
     )
     deps = await adb_core.fetch(
