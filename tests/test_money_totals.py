@@ -184,6 +184,62 @@ def test_payments_send_batch_requires_comment(isolated_db, monkeypatch):
     assert r.status_code == 400
 
 
+def test_payments_send_batch_partial_failure_no_dup_on_retry(isolated_db, monkeypatch):
+    """Сбой add_payment в середине батча: уже созданные платежи нельзя откатить
+    (построчный автокоммит). Ретрай тем же ключом НЕ создаёт их повторно —
+    возвращает сохранённый частичный результат (status='partial')."""
+    import pytest
+
+    db = isolated_db
+    client, _ = _client(db, monkeypatch, 704, "manager")
+
+    import services.async_db as adb
+
+    real_add = adb.add_payment
+    calls = {"n": 0}
+
+    async def _flaky_add(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:  # второй платёж в батче падает
+            raise RuntimeError("boom")
+        return await real_add(*a, **k)
+
+    monkeypatch.setattr(adb, "add_payment", _flaky_add)
+    payload = {
+        "initData": "704",
+        "items": [{"amount": 100, "currency": "USD"}, {"amount": 200, "currency": "USD"}],
+        "comment": "аренда",
+        "idempotency_key": "kp",
+    }
+    with pytest.raises(RuntimeError):
+        client.post("/api/payments/send", json=payload)
+
+    def _count():
+        with db.get_conn() as conn:
+            cur = db.get_cursor(conn)
+            cur.execute(db.q("SELECT COUNT(*) FROM payments WHERE user_id=?"), (704,))
+            return cur.fetchone()[0]
+
+    assert _count() == 1  # первый платёж закоммитился
+
+    monkeypatch.setattr(adb, "add_payment", real_add)  # сбой снят
+    r2 = client.post("/api/payments/send", json=payload)  # ретрай тем же ключом
+    assert r2.status_code == 200, r2.text
+    assert r2.json().get("status") == "partial"
+    assert _count() == 1  # дубля нет — вернулся сохранённый частичный результат
+
+
+def test_money_summary_base_total_includes_negative_deposits(isolated_db, monkeypatch):
+    """Нетто-сдачи могут быть отрицательными (cash-возвраты уменьшают кассу) —
+    base_total обязан их учесть, а не отбрасывать (фильтр amt != 0, не > 0)."""
+    db = isolated_db
+    _confirmed_payment(db, 20, 100.0, "USD")  # +100 USD
+    _confirmed_deposit(db, 20, -30.0)  # cash-возврат −30 USD
+    client, _ = _client(db, monkeypatch, 610, "boss")
+    body = client.post("/api/money/summary", json={"initData": "610", "period": "year"}).json()
+    assert body["base_total"] == 70.0  # 100 − 30, отрицательная сдача учтена
+
+
 def test_payments_send_batch_idempotent(isolated_db, monkeypatch):
     """Ретрай с тем же idempotency_key не создаёт дубль-набор платежей и не шлёт
     второе уведомление — отдаёт сохранённый результат."""

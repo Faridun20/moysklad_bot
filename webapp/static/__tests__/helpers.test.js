@@ -122,16 +122,18 @@ describe('renderOpsSummaryHtml', () => {
     expect(html).not.toContain('<b>x');
   });
 
-  it('суммирует рассинхрон МС (drift+deleted+demand_failed)', () => {
+  it('суммирует рассинхрон МС (drift+deleted+demand_failed+transition_blocked)', () => {
     const html = renderOpsSummaryHtml({
-      ms_anomalies: { drift: 1, deleted: 2, demand_failed: 0, items: {
+      ms_anomalies: { drift: 1, deleted: 2, demand_failed: 0, transition_blocked: 1, items: {
         drift: [{ id: 3, agent_name: 'A' }],
         deleted: [{ id: 4, agent_name: 'B', status: 'shipped' }],
         demand_failed: [],
+        transition_blocked: [{ id: 5, agent_name: 'C', status: 'approved' }],
       } },
     });
     expect(html).toContain('Рассинхрон с МойСклад');
-    expect(html).toContain('badge-yellow">3<'); // 1 + 2
+    expect(html).toContain('badge-yellow">4<'); // 1 + 2 + 1
+    expect(html).toContain('Статус застрял · #5');
   });
 });
 

@@ -108,11 +108,12 @@
                       : `${c.hours_ago}ч назад · ${c.last_status} (порог ${c.threshold_hours}ч)`)).join(''));
     }
     const ms = summary.ms_anomalies || {};
-    const msTotal = (ms.drift || 0) + (ms.deleted || 0) + (ms.demand_failed || 0);
+    const msTotal = (ms.drift || 0) + (ms.deleted || 0) + (ms.demand_failed || 0) + (ms.transition_blocked || 0);
     if (msTotal > 0) {
       const items = ms.items || {};
       const rows = []
         .concat((items.demand_failed || []).map(o => row(`📦 Отгрузка не создана · #${o.id}`, o.agent_name)))
+        .concat((items.transition_blocked || []).map(o => row(`⛔ Статус застрял · #${o.id}`, `${o.agent_name} · ${o.status}`)))
         .concat((items.drift || []).map(o => row(`✏️ Изменён в МС · #${o.id}`, o.agent_name)))
         .concat((items.deleted || []).map(o => row(`🗑 Удалён в МС · #${o.id}`, `${o.agent_name} · ${o.status}`)));
       section('Рассинхрон с МойСклад', msTotal, rows.join(''));

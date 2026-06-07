@@ -75,10 +75,11 @@ async def gather_ops_summary() -> dict:
     try:
         ms = await get_ms_sync_anomalies(ms_since)
     except Exception:
-        ms = {"drift": [], "deleted": [], "demand_failed": []}
+        ms = {"drift": [], "deleted": [], "demand_failed": [], "transition_blocked": []}
     drift = ms.get("drift") or []
     deleted = ms.get("deleted") or []
     demand_failed = ms.get("demand_failed") or []
+    transition_blocked = ms.get("transition_blocked") or []
 
     sections: dict[str, object] = {
         "stale_orders": {
@@ -164,6 +165,7 @@ async def gather_ops_summary() -> dict:
             "drift": len(drift),
             "deleted": len(deleted),
             "demand_failed": len(demand_failed),
+            "transition_blocked": len(transition_blocked),
             "items": {
                 "drift": [
                     {"id": o["id"], "agent_name": o.get("agent_name") or "—"} for o in drift[:10]
@@ -180,6 +182,14 @@ async def gather_ops_summary() -> dict:
                     {"id": o["id"], "agent_name": o.get("agent_name") or "—"}
                     for o in demand_failed[:10]
                 ],
+                "transition_blocked": [
+                    {
+                        "id": o["id"],
+                        "agent_name": o.get("agent_name") or "—",
+                        "status": o.get("status") or "",
+                    }
+                    for o in transition_blocked[:10]
+                ],
             },
         },
     }
@@ -195,6 +205,7 @@ async def gather_ops_summary() -> dict:
         + len(drift)
         + len(deleted)
         + len(demand_failed)
+        + len(transition_blocked)
     )
     sections["total"] = total
     return sections

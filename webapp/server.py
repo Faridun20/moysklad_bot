@@ -1485,11 +1485,22 @@ async def _send_payments_batch(user: dict, items: list, comment_raw: str, idem_k
             )
             created.append((pid, amount, currency))
     except Exception:
-        # Часть платежей могла создаться до сбоя — уведомляем по ним (иначе они
-        # «осиротеют» без видимости боссу), затем освобождаем ключ под ретрай.
+        # Часть платежей могла создаться до сбоя (add_payment автокоммитит
+        # построчно) — уведомляем по ним (иначе они «осиротеют» без видимости
+        # боссу).
         await _notify_batch_payments(full_name, username, comment, created)
         if full_idem:
-            await adb.idem_release(full_idem)
+            if created:
+                # Уже закоммиченные платежи нельзя откатить → фиксируем частичный
+                # результат, чтобы ретрай вернул их, а НЕ создал второй набор
+                # (дубль денег). Недостающие позиции менеджер досоздаёт отдельно.
+                await adb.idem_store(
+                    full_idem,
+                    {"payment_ids": [pid for pid, _, _ in created], "status": "partial"},
+                )
+            else:
+                # Ничего не закоммичено → освобождаем ключ под полноценный ретрай.
+                await adb.idem_release(full_idem)
         raise
 
     await _notify_batch_payments(full_name, username, comment, created)
@@ -1628,7 +1639,9 @@ async def api_money_summary(request: Request):
     base_cur = (BASE_CURRENCY or "USD").upper()
     parts = [(p["total_cents"] / 100, p["currency"]) for p in totals["payments"]]
     parts.append((totals["deposits"]["total_cents"] / 100, base_cur))  # сдачи в USD
-    bases = [convert_to_base(amt, cur) for amt, cur in parts if amt > 0]
+    # amt != 0 (не > 0): нетто-сдачи могут быть отрицательными (cash-возвраты
+    # уменьшают кассу) — отбрасывать их = завышать итог.
+    bases = [convert_to_base(amt, cur) for amt, cur in parts if amt != 0]
     known = [x for x in bases if x is not None]
     totals["base_currency"] = base_cur
     totals["base_total"] = round(sum(known), 2) if known else None
