@@ -525,6 +525,7 @@ async def get_me(request: Request):
 
     user_id = user["id"]
     role = get_role(user_id)
+    from config import BASE_CURRENCY
 
     return JSONResponse(
         {
@@ -532,6 +533,9 @@ async def get_me(request: Request):
             "first_name": user.get("first_name", ""),
             "username": user.get("username", ""),
             "role": role,
+            # Касса/сдачи хранятся в базовой валюте (нет currency-колонки) —
+            # фронт показывает её код, а не хардкод «USD».
+            "base_currency": (BASE_CURRENCY or "USD").upper(),
         }
     )
 
