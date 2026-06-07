@@ -433,9 +433,9 @@ async function renderHome() {
     const att = data.attention || {};
     const attItems = [
       { n: att.requests, label: 'Заявки на апрув', ic: 'clock', go: 'requests' },
-      { n: att.payments, label: 'Платежи на подтверждении', ic: 'cash', go: 'finance:payments' },
-      { n: att.deposits, label: 'Сдачи на подтверждении', ic: 'cashbox', go: 'finance:cashbox' },
-      { n: att.returns, label: 'Возвраты на подтверждении', ic: 'return', go: 'finance:cashbox' },
+      { n: att.payments, label: 'Платежи на подтверждении', ic: 'cash', go: 'finance:confirm' },
+      { n: att.deposits, label: 'Сдачи на подтверждении', ic: 'cashbox', go: 'finance:confirm' },
+      { n: att.returns, label: 'Возвраты на подтверждении', ic: 'return', go: 'finance:confirm' },
       { n: att.debts, label: 'Открытые долги', ic: 'wallet', go: 'finance:debts' },
     ].filter(x => x.n > 0);
     if (attItems.length) {
@@ -2386,41 +2386,59 @@ async function renderFinance() {
   const content = document.getElementById('content');
   const role = currentUser && currentUser.role;
   const isBoss = role === 'admin' || role === 'boss';
-  // «Касса» — подтверждающие (сдачи/возвраты) и менеджеры (сдают наличные).
-  const canCashbox = isBoss || role === 'bookkeeper' || role === 'warehouse_keeper' || role === 'manager';
+  const canDeposit = role === 'manager' || role === 'warehouse_keeper';
+  const isConfirmer = ['admin', 'boss', 'bookkeeper', 'warehouse_keeper'].includes(role);
+  const canReturn = ['admin', 'boss', 'warehouse_keeper', 'manager'].includes(role);
+  // Раздел «Операции» = формы (сдать наличные / оформить возврат / новый платёж).
+  const hasOps = canDeposit || canReturn || !isBoss;
 
-  // «Платежи» объединены с «Кассой» (всё движение денег в одном месте) —
-  // старый/внешний вызов с financeTab='payments' перенаправляем в кассу.
-  if (financeTab === 'payments') financeTab = 'cashbox';
-  // Гард: недоступные разделы откатываем на «Долги» (эндпоинты всё равно 403).
-  if (financeTab === 'limits' && !isBoss) financeTab = 'debts';
-  if (financeTab === 'cashbox' && !canCashbox) financeTab = 'debts';
+  // Плоская навигация (1 уровень по задачам) вместо прежних 2-3 рядов сегментов
+  // (Деньги → под-вкладки → фильтры). Каждая задача — отдельная пилюля.
+  // Миграция старых/внешних ключей вкладки на плоские.
+  // Подтверждающие → к подтверждениям; остальные («Платёж» с главной) → к формам.
+  if (financeTab === 'payments') financeTab = isConfirmer ? 'confirm' : 'ops';
+  if (financeTab === 'cashbox') {
+    financeTab = isConfirmer ? 'confirm' : (hasOps ? 'ops' : (canDeposit ? 'my' : 'debts'));
+  }
 
-  // Уточняем под-раздел в шапке: «Финансы · Касса» и т.п.
-  const FIN_LABELS = { debts: 'Долги', cashbox: 'Деньги', limits: 'Лимиты' };
-  setScreenContext(`Финансы · ${FIN_LABELS[financeTab] || ''}`);
+  const tabs = [];
+  if (isConfirmer) tabs.push({ key: 'confirm', label: 'Подтверждения' });
+  tabs.push({ key: 'debts', label: 'Долги' });
+  if (isBoss) tabs.push({ key: 'overview', label: 'Обзор' });
+  if (hasOps) tabs.push({ key: 'ops', label: 'Операции' });
+  if (canDeposit) tabs.push({ key: 'my', label: 'Мои сдачи' });
+  if (isBoss) tabs.push({ key: 'limits', label: 'Лимиты' });
 
-  const active = t => (financeTab === t ? 'active' : '');
-  // Уровень 1 — единый ровный сегмент-контрол (текстом, как iOS-segmented):
-  // все доступные разделы одинаковыми пилюлями. Иконки тут НЕ ставим — 4 пилюли
-  // с иконками клиппятся на узком экране (это и был «сломанный» вид у
-  // руководителя: 3 пилюли + отдельная по стилю ссылка «Лимиты»). «Лимиты»
-  // теперь равноправная 4-я вкладка.
-  const sections = [{ key: 'debts', label: 'Долги' }];
-  if (canCashbox) sections.push({ key: 'cashbox', label: 'Деньги' });
-  if (isBoss) sections.push({ key: 'limits', label: 'Лимиты' });
+  // Недоступную/неизвестную вкладку откатываем на первую доступную.
+  if (!tabs.find(t => t.key === financeTab)) financeTab = (tabs[0] && tabs[0].key) || 'debts';
+
+  const LABELS = {
+    confirm: 'Подтверждения', debts: 'Долги', overview: 'Обзор',
+    ops: 'Операции', my: 'Мои сдачи', limits: 'Лимиты',
+  };
+  setScreenContext(`Финансы · ${LABELS[financeTab] || ''}`);
+
+  // Бейдж ожидающих подтверждений — на пилюле «Подтверждения», ВСЕГДА виден (а не
+  // только когда раздел открыт). Тянем только счётчики (длины списков).
+  let pendN = 0;
+  if (isConfirmer) {
+    const cnt = (p, k) => api(p, {}).then(r => (r[k] || []).length).catch(() => 0);
+    const parts = [cnt('/api/deposits/pending', 'deposits'), cnt('/api/returns/pending', 'returns')];
+    if (isBoss) parts.push(cnt('/api/payments/pending', 'pending'));
+    pendN = (await Promise.all(parts)).reduce((a, b) => a + b, 0);
+  }
 
   content.innerHTML = `
-    <div class="seg-row">
-      <div class="seg">
-        ${sections.map(s =>
-          `<button class="seg-item ${active(s.key)}" data-tab="${s.key}">${s.label}</button>`
-        ).join('')}
-      </div>
+    <div class="cat-row" style="margin: 4px 0 10px;">
+      ${tabs.map(t => {
+        const on = financeTab === t.key;
+        const badge = (t.key === 'confirm' && pendN)
+          ? ` <span class="stock-badge badge-yellow" style="margin-left:6px;">${pendN}</span>` : '';
+        return `<button class="cat-btn ${on ? 'active' : ''}" data-tab="${t.key}" aria-pressed="${on}">${t.label}${badge}</button>`;
+      }).join('')}
     </div>
     <div id="finance-body"></div>
   `;
-  // Переключение разделов без перезагрузки header
   content.querySelectorAll('[data-tab]').forEach(t => {
     t.addEventListener('click', () => {
       haptic('light');
@@ -2428,72 +2446,55 @@ async function renderFinance() {
       renderFinance();
     });
   });
-  // Контент подгружаем в #finance-body
-  const body = document.getElementById('finance-body');
-  if (financeTab === 'debts') {
-    await renderDebts(body);
-  } else if (financeTab === 'limits') {
-    await renderCreditLimits(body);
-  } else {
-    await renderCashbox(body);
+  // Активную пилюлю подтягиваем в зону видимости, если ряд переносится/скроллится.
+  const activeSeg = content.querySelector('.cat-btn.active');
+  if (activeSeg && activeSeg.scrollIntoView) {
+    try { activeSeg.scrollIntoView({ inline: 'center', block: 'nearest' }); } catch (e) { /* старый WebView */ }
   }
+
+  const body = document.getElementById('finance-body');
+  if (financeTab === 'debts') await renderDebts(body);
+  else if (financeTab === 'limits') await renderCreditLimits(body);
+  else await renderCashbox(body, financeTab);  // confirm | ops | my | overview
 }
 
-async function renderCashbox(container) {
+async function renderCashbox(container, section) {
   container = container || document.getElementById('content');
+  // section — плоская вкладка из renderFinance: confirm | ops | my | overview.
+  // Бейдж/переключение теперь на уровне renderFinance, тут только тело секции.
+  section = section || cashboxSubTab || 'confirm';
+  cashboxSubTab = section;
   container.innerHTML = loading('Загрузка кассы…');
   const fmt = n => Math.round(n).toLocaleString('ru-RU');
   const role = currentUser && currentUser.role;
   // Наличные сдаёт тот, кто их физически принимает от клиента (менеджер,
-  // кладовщик). Начальство/бухгалтер только ПОДТВЕРЖДАЮТ — им «Сдать наличные»
-  // и «Мои сдачи» не нужны (бессмысленный self-deposit).
+  // кладовщик). Начальство/бухгалтер только ПОДТВЕРЖДАЮТ.
   const canDeposit = role === 'manager' || role === 'warehouse_keeper';
-
   const isBoss = role === 'admin' || role === 'boss';
 
-  // Каждый список может вернуть 403 (роль не видит) — тихо пропускаем.
-  // Запросы независимы → тянем параллельно (Promise.all), а не по очереди:
-  // для босса было ~5 round-trip'ов подряд (~1с спиннера).
+  // Тянем ТОЛЬКО то, что нужно активной секции (раньше грузилось всё сразу).
   let deposits = [];
   let returns = [];
   let myDeposits = [];
   let payPending = [];   // paid-заказы с pending-оплатой (подтверждает босс)
   let cashHistory = [];  // единая лента движения денег (босс)
   const _grab = (path, key) => api(path, {}).then(r => r[key] || []).catch(() => []);
-  const tasks = [
-    _grab('/api/deposits/pending', 'deposits').then(v => { deposits = v; }),
-    _grab('/api/returns/pending', 'returns').then(v => { returns = v; }),
-  ];
-  if (canDeposit) {
+  const tasks = [];
+  if (section === 'confirm') {
+    tasks.push(_grab('/api/deposits/pending', 'deposits').then(v => { deposits = v; }));
+    tasks.push(_grab('/api/returns/pending', 'returns').then(v => { returns = v; }));
+    if (isBoss) tasks.push(_grab('/api/payments/pending', 'pending').then(v => { payPending = v; }));
+  }
+  if (section === 'my' && canDeposit) {
     tasks.push(_grab('/api/deposits/my', 'deposits').then(v => { myDeposits = v; }));
   }
-  if (isBoss) {
-    tasks.push(_grab('/api/payments/pending', 'pending').then(v => { payPending = v; }));
+  if (section === 'overview' && isBoss) {
     tasks.push(_grab('/api/cash/history', 'history').then(v => { cashHistory = v; }));
-    // Итоги поступлений за период (платежи по валютам + сдачи). Свой формат
-    // ответа (не {key:[]}), поэтому грузим отдельно, а не через _grab.
     tasks.push(
       api('/api/money/summary', { period: moneyPeriod }).then(v => { moneySummary = v; }).catch(() => { moneySummary = null; })
     );
   }
   await Promise.all(tasks);
-
-  // Бейдж на разделе «Деньги» (уровень 1) с числом ожидающих подтверждений —
-  // видно сразу, не открывая раздел. Обновляем после каждого рефетча (подтвердил
-  // сдачу → счётчик уменьшился), поэтому сперва снимаем старый.
-  const moneyPill = document.querySelector('.seg-item[data-tab="cashbox"]');
-  if (moneyPill) {
-    const old = moneyPill.querySelector('.seg-badge');
-    if (old) old.remove();
-    const pendTotal = deposits.length + returns.length + payPending.length;
-    if (pendTotal > 0) {
-      const b = document.createElement('span');
-      b.className = 'stock-badge badge-yellow seg-badge';
-      b.textContent = pendTotal;
-      b.style.marginLeft = '6px';
-      moneyPill.appendChild(b);
-    }
-  }
 
   const depCards = deposits.map(d => {
     const orders = (d.orders || [])
@@ -2688,64 +2689,19 @@ async function renderCashbox(container) {
       </div>
   ` : '';
 
-  // Раньше всё стояло одним длинным экраном (формы → история → подтверждения
-  // в самом низу). Разносим по под-вкладкам, чтобы срочные подтверждения были
-  // сразу, а не за тремя формами. Набор вкладок зависит от роли.
-  const isConfirmer = ['admin', 'boss', 'bookkeeper', 'warehouse_keeper'].includes(role);
-  const canCreateDeposit = canDeposit;
-  const hasOps = canCreateDeposit || canReturn || !!payFormBlock;
-
-  const tabs = [];
-  if (isConfirmer) {
-    const pendN = deposits.length + returns.length + payPending.length;
-    tabs.push({ key: 'confirm', ic: 'check', label: `Подтверждения${pendN ? ` (${pendN})` : ''}` });
-  }
-  if (hasOps) tabs.push({ key: 'ops', ic: 'plus', label: 'Операции' });
-  if (canCreateDeposit) tabs.push({ key: 'my', ic: 'list', label: 'Мои сдачи' });
-  // «Обзор» (босс): итоги поступлений за период + лента движения денег на одном
-  // экране — меньше вкладок, ключевая цифра и история рядом.
-  if (isBoss) tabs.push({ key: 'overview', ic: 'cash', label: 'Обзор' });
-
-  if (!tabs.find(t => t.key === cashboxSubTab)) {
-    cashboxSubTab = tabs.length ? tabs[0].key : 'confirm';
-  }
-
-  // Уровень 2 — облегчённый underline-сегмент (.subseg), визуально подчинён
-  // pill-разделам уровня 1, чтобы не было двух одинаковых рядов пилюль.
-  const tabBar = tabs.length > 1
-    ? `<div class="subseg">${tabs.map(t =>
-        `<button class="subseg-item ${t.key === cashboxSubTab ? 'active' : ''}" data-ctab="${t.key}">${icon(t.ic)} ${t.label}</button>`
-      ).join('')}</div>`
-    : '';
-
+  // Тело активной секции (вкладки теперь на уровне renderFinance — без 2-го ряда).
   let bodyHtml;
-  if (cashboxSubTab === 'ops') {
+  if (section === 'ops') {
     bodyHtml = (createBlock + payFormBlock + returnBlock) || '<div class="loader">Нет доступных операций</div>';
-  } else if (cashboxSubTab === 'my') {
+  } else if (section === 'my') {
     bodyHtml = myBlock || '<div class="loader">У вас пока нет сдач</div>';
-  } else if (cashboxSubTab === 'overview') {
+  } else if (section === 'overview') {
     // Итоги за период (сверху) + лента движения денег (снизу) на одном экране.
     bodyHtml = totalsBlock + '<div class="section-label">Движение денег</div>' + historyBlock;
   } else {
     bodyHtml = (payBlock + depBlock + retBlock) || '<div class="loader">Нет записей на подтверждении</div>';
   }
-  container.innerHTML = tabBar + bodyHtml;
-
-  // Если ряд под-вкладок шире экрана (скроллится) — подтягиваем активную в зону
-  // видимости, чтобы после переключения она не оставалась за краем.
-  const activeSub = container.querySelector('.subseg-item.active');
-  if (activeSub && activeSub.scrollIntoView) {
-    try { activeSub.scrollIntoView({ inline: 'center', block: 'nearest' }); } catch (e) { /* старый WebView */ }
-  }
-
-  // Переключение под-вкладок кассы (контент в том же контейнере).
-  container.querySelectorAll('[data-ctab]').forEach(t => {
-    t.addEventListener('click', () => {
-      haptic('light');
-      cashboxSubTab = t.dataset.ctab;
-      renderCashbox(container);
-    });
-  });
+  container.innerHTML = bodyHtml;
 
   // Оформление возврата.
   let selectedRefund = 'debt_reduction';
@@ -2766,7 +2722,7 @@ async function renderCashbox(container) {
       haptic('light');
       retBtn.disabled = true;
       api('/api/returns/create', { order_id: orderId, reason, refund_method: selectedRefund, idempotency_key: idemKey() })
-        .then(r => { tg.showAlert(`✅ Возврат #${r.return_id} отправлен на подтверждение`); renderCashbox(container); })
+        .then(r => { tg.showAlert(`✅ Возврат #${r.return_id} отправлен на подтверждение`); renderFinance(); })
         .catch(e => { tg.showAlert('❌ ' + e.message); retBtn.disabled = false; });
     });
   }
@@ -2776,7 +2732,7 @@ async function renderCashbox(container) {
     b.addEventListener('click', () => {
       haptic('light');
       moneyPeriod = b.dataset.mperiod;
-      renderCashbox(container);
+      renderCashbox(container, 'overview');  // остаёмся в «Обзоре», рефетчим итоги
     });
   });
 
@@ -2827,7 +2783,7 @@ async function renderCashbox(container) {
       try {
         await api('/api/payments/send', { items: parsed.items, comment, idempotency_key: idemKey() });
         tg.HapticFeedback?.notificationOccurred('success');
-        renderCashbox(container);
+        renderFinance();
       } catch (e) {
         status.textContent = '❌ ' + e.message; status.className = 'pay-status pay-error';
         paySubmit.disabled = false;
@@ -2845,7 +2801,7 @@ async function renderCashbox(container) {
       haptic('light');
       createBtn.disabled = true;
       api('/api/deposits/create', { amount, idempotency_key: idemKey() })
-        .then(r => { tg.showAlert(`✅ Сдача #${r.deposit_id} отправлена на подтверждение`); renderCashbox(container); })
+        .then(r => { tg.showAlert(`✅ Сдача #${r.deposit_id} отправлена на подтверждение`); renderFinance(); })
         .catch(e => { tg.showAlert('❌ ' + e.message); createBtn.disabled = false; });
     });
   }
@@ -2859,7 +2815,7 @@ async function renderCashbox(container) {
       b.disabled = true;  // защита от двойного тапа (сервер идемпотентен, UX — нет)
       haptic('light');
       api('/api/deposits/confirm', { deposit_id: Number(id), idempotency_key: idemKey() })
-        .then(() => { tg.showAlert('✅ Сдача подтверждена'); renderCashbox(container); })
+        .then(() => { tg.showAlert('✅ Сдача подтверждена'); renderFinance(); })
         .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
     });
     const box = card.querySelector('.dep-reject-box');
@@ -2871,7 +2827,7 @@ async function renderCashbox(container) {
       if (b.disabled) return;
       b.disabled = true;
       api('/api/deposits/reject', { deposit_id: Number(id), reason })
-        .then(() => { tg.showAlert('❌ Сдача отклонена'); renderCashbox(container); })
+        .then(() => { tg.showAlert('❌ Сдача отклонена'); renderFinance(); })
         .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
     });
   });
@@ -2884,7 +2840,7 @@ async function renderCashbox(container) {
       b.disabled = true;  // защита от двойного тапа
       haptic('light');
       api('/api/returns/confirm', { return_id: Number(card.dataset.ret), idempotency_key: idemKey() })
-        .then(() => { tg.showAlert('✅ Возврат подтверждён'); renderCashbox(container); })
+        .then(() => { tg.showAlert('✅ Возврат подтверждён'); renderFinance(); })
         .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
     });
   });
@@ -2899,7 +2855,7 @@ async function renderCashbox(container) {
         try {
           await api('/api/orders/confirm_payment', { order_id: id, idempotency_key: idemKey() });
           tg.HapticFeedback?.notificationOccurred('success');
-          renderCashbox(container);
+          renderFinance();
         } catch (e) { tg.showAlert('❌ ' + e.message); btn.disabled = false; }
       });
     });
@@ -2913,7 +2869,7 @@ async function renderCashbox(container) {
         try {
           await api('/api/orders/reject_payment', { order_id: id, idempotency_key: idemKey() });
           tg.HapticFeedback?.notificationOccurred('warning');
-          renderCashbox(container);
+          renderFinance();
         } catch (e) { tg.showAlert('❌ ' + e.message); btn.disabled = false; }
       });
     });
