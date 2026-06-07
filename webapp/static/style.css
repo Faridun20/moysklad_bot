@@ -670,8 +670,16 @@ body {
 }
 .cat-scroll::-webkit-scrollbar { display: none; }
 
-/* Второй ряд — фильтр по периоду заказов: компактнее, прижат к ряду статусов. */
-.cat-scroll--period { margin-top: 0; padding-bottom: 4px; }
+/* Заказы: ряд статус-фильтров занимает доступную ширину и скроллится, а
+   период-select / «+ Новый заказ» прижаты справа (один ряд вместо двух). */
+.orders-toolbar .cat-scroll { flex: 1 1 auto; min-width: 0; margin-top: 0; }
+/* Компактный нативный выбор периода (заменил второй ряд пилюль). */
+.period-select {
+  flex-shrink: 0; max-width: 9.5em;
+  padding: 9px 10px; border: 1px solid var(--divider); border-radius: var(--radius-sm);
+  background: var(--bg-card); color: var(--text);
+  font-size: 13px; font-family: inherit; cursor: pointer;
+}
 
 /* ─── Календарь выбора диапазона дат (заказы + аналитика) ──────────── */
 .cal-host { margin: 0 14px 10px; }
