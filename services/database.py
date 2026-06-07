@@ -4675,9 +4675,15 @@ async def get_money_totals(since: str | None = None, until: str | None = None) -
       сводке долгов «получено»; standalone-платежи без order_id считаем.
     - deposits: подтверждённые сдачи наличных (USD), суммарно.
 
+    Период считаем по ВРЕМЕНИ ПОДТВЕРЖДЕНИЯ (confirmed_at) — это «поступления»,
+    т.е. деньги, ПОЛУЧЕННЫЕ в периоде. Раньше фильтровали по created_at (время
+    создания записи) → платёж/сдача, созданные в прошлом периоде, но
+    подтверждённые в текущем, не попадали в итог («не считает платежи и сдачу»).
+    COALESCE(confirmed_at, created_at) — для легаси-строк без confirmed_at.
+
     since/until — ISO 'YYYY-MM-DD HH:MM:SS' в локальной TZ (как пишется
-    created_at); порог считаем в Python, передаём параметром (CLAUDE.md) —
-    НЕ сравниваем с SQL NOW()/datetime('now') (разные TZ, silent-bug).
+    confirmed_at/created_at); порог считаем в Python, передаём параметром
+    (CLAUDE.md) — НЕ сравниваем с SQL NOW()/datetime('now') (разные TZ).
     """
     pay_sql = (
         "SELECT p.currency AS currency, COUNT(*) AS cnt, "
@@ -4690,10 +4696,10 @@ async def get_money_totals(since: str | None = None, until: str | None = None) -
     pay_params: list = []
     if since:
         pay_params.append(since)
-        pay_sql += f" AND p.created_at >= ${len(pay_params)}"
+        pay_sql += f" AND COALESCE(p.confirmed_at, p.created_at) >= ${len(pay_params)}"
     if until:
         pay_params.append(until)
-        pay_sql += f" AND p.created_at <= ${len(pay_params)}"
+        pay_sql += f" AND COALESCE(p.confirmed_at, p.created_at) <= ${len(pay_params)}"
     pay_sql += " GROUP BY p.currency ORDER BY total_cents DESC"
     pay_rows = await adb_core.fetch(pay_sql, *pay_params)
 
@@ -4706,10 +4712,10 @@ async def get_money_totals(since: str | None = None, until: str | None = None) -
     dep_params: list = []
     if since:
         dep_params.append(since)
-        dep_sql += f" AND created_at >= ${len(dep_params)}"
+        dep_sql += f" AND COALESCE(confirmed_at, created_at) >= ${len(dep_params)}"
     if until:
         dep_params.append(until)
-        dep_sql += f" AND created_at <= ${len(dep_params)}"
+        dep_sql += f" AND COALESCE(confirmed_at, created_at) <= ${len(dep_params)}"
     dep_row = await adb_core.fetchrow(dep_sql, *dep_params)
 
     return {
