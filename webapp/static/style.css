@@ -32,6 +32,7 @@
   --radius-sm:  10px;
   --radius:     16px;
   --radius-lg:  20px;
+  --disabled-opacity: 0.5;   /* единое затемнение disabled (было вперемешку 0.4/0.5) */
   --shadow-card: 0 1px 2px rgba(0,0,0,0.04);
 
   /* Семантические цвета (статусы, бейджи, деньги, тренды).
@@ -686,7 +687,7 @@ body {
 }
 .cal-title { font-size: 15px; font-weight: 600; }
 .cal-nav {
-  width: 36px; height: 36px; flex-shrink: 0;
+  width: 44px; height: 44px; flex-shrink: 0;  /* тач-таргет ≥44px (было 36) */
   border: none; background: var(--bg-soft); color: var(--text);
   border-radius: 10px; font-size: 20px; line-height: 1; cursor: pointer;
 }
@@ -711,7 +712,7 @@ body {
 }
 .cal-range { font-size: 13px; color: var(--text-mute); flex: 1; min-width: 0; }
 .cal-foot .cal-apply { width: auto; flex-shrink: 0; padding: 10px 18px; }
-.cal-apply:disabled { opacity: 0.4; cursor: not-allowed; }
+.cal-apply:disabled { opacity: var(--disabled-opacity); cursor: not-allowed; }
 
 .cat-row {
   display: flex;
@@ -722,7 +723,9 @@ body {
 
 .cat-btn {
   flex-shrink: 0;
-  padding: 8px 14px;
+  padding: 10px 14px;
+  min-height: 40px;  /* комфортный тач-таргет в скролл-ряду (было ~33px) */
+  display: inline-flex; align-items: center;
   border-radius: 20px;
   background: var(--bg-card);
   color: var(--text);
@@ -914,7 +917,7 @@ body {
   transform: scale(0.985);
 }
 
-.btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-primary:disabled { opacity: var(--disabled-opacity); cursor: not-allowed; }
 
 .btn-secondary {
   width: 100%;
@@ -1202,7 +1205,7 @@ body {
   font-family: inherit;
 }
 
-.btn-submit-order:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-submit-order:disabled { opacity: var(--disabled-opacity); cursor: not-allowed; }
 
 .btn-edit-order {
   width: 100%; margin-top: 10px; padding: 9px;
@@ -1357,7 +1360,7 @@ body {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
 }
 .btn-mark-paid .ic { --ic-size: 16px; }
-.btn-mark-paid:disabled { opacity: 0.5; cursor: default; }
+.btn-mark-paid:disabled { opacity: var(--disabled-opacity); cursor: default; }
 
 /* ─── Сводка «получено / ожидает» ─────────────────────────────── */
 .money-summary {
@@ -1441,7 +1444,7 @@ body {
   color: var(--danger);
   border: 1px solid var(--danger);
 }
-.btn-confirm-pay:disabled, .btn-reject-pay:disabled { opacity: 0.5; cursor: default; }
+.btn-confirm-pay:disabled, .btn-reject-pay:disabled { opacity: var(--disabled-opacity); cursor: default; }
 .btn-edit-limit {
   grid-column: 1 / -1;
   padding: 10px; border: 1px solid var(--accent, #2c7be5); border-radius: 10px;
@@ -1608,7 +1611,7 @@ body {
   color: var(--danger); border-radius: 10px;
   font-size: 13px; font-weight: 600; cursor: pointer;
 }
-.btn-delete-draft:disabled { opacity: 0.5; cursor: default; }
+.btn-delete-draft:disabled { opacity: var(--disabled-opacity); cursor: default; }
 
 /* ─── Глобальный поиск ────────────────────────────────────────── */
 .topbar-right {

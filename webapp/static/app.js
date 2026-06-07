@@ -34,6 +34,19 @@ applyTelegramTheme();
 // Пользователь сменил тему системы/Telegram, пока WebApp открыт.
 tg.onEvent && tg.onEvent('themeChanged', applyTelegramTheme);
 
+// Клавиатурная активация tap-строк: строки-карточки — это div role="button"
+// tabindex="0" (не нативные кнопки, чтобы не ломать вёрстку), поэтому Enter/Space
+// сами по себе не кликают. Один делегированный хендлер на документ закрывает это
+// для скринридеров/клавиатуры разом.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
+  const el = e.target;
+  if (el && el.tagName !== 'BUTTON' && el.getAttribute && el.getAttribute('role') === 'button') {
+    e.preventDefault();
+    el.click();
+  }
+});
+
 // initData живёт в URL-хэше — теряется при reload/навигации.
 // Кэшируем в sessionStorage: переживает SPA-переходы, но не закрытие вкладки.
 // Данные всё равно проверяются подписью + auth_date на сервере.
@@ -60,6 +73,12 @@ function _refreshInitData() {
 // Состояние приложения
 let currentUser = null;
 let currentScreen = 'home';
+// Базовая валюта (касса/сдачи хранятся в ней — нет currency-колонки). Берём из
+// /api/me; показываем её код вместо хардкода «USD».
+function baseCur() { return (currentUser && currentUser.base_currency) || 'USD'; }
+// RU-раскладка вводит десятичную запятую; parseFloat('1,5')→1. Нормализуем
+// запятую и пробелы-разделители тысяч перед разбором (как parsePaymentItems).
+function parseNum(v) { return parseFloat(String(v == null ? '' : v).replace(/\s/g, '').replace(',', '.')); }
 
 const ROLE_NAMES = {
   admin: '👑 Админ',
@@ -168,6 +187,9 @@ function errorBox(msg) {
 
 async function showScreen(screen) {
   currentScreen = screen;
+  // Уходя с любого экрана через нав — снимаем «подтвердить закрытие» (его ставит
+  // редактор заказа, пока есть несохранённый черновик).
+  tg.disableClosingConfirmation && tg.disableClosingConfirmation();
 
   // Подсветка нижнего таба: вложенные/legacy-экраны принадлежат корневому
   // табу (каталог → «Заказы», долги/платежи → «Финансы»). Иначе при заходе
@@ -397,7 +419,7 @@ async function renderHome() {
         <div class="section-label">Требует внимания</div>
         <div class="card-list">
           ${attItems.map(x => `
-            <div class="card-row" data-att="${x.go}">
+            <div class="card-row" data-att="${x.go}" role="button" tabindex="0">
               <div class="card-row-icon" style="background:var(--warn-bg); color:var(--warn);">${icon(x.ic)}</div>
               <div class="card-row-info"><div class="card-row-title">${x.label}</div></div>
               <span class="stock-badge badge-yellow">${x.n}</span>
@@ -411,7 +433,7 @@ async function renderHome() {
     bossBlock += `
       <div class="section-label">Мониторинг</div>
       <div class="card-list">
-        <div class="card-row" data-att="ops">
+        <div class="card-row" data-att="ops" role="button" tabindex="0">
           <div class="card-row-icon">${icon('clock')}</div>
           <div class="card-row-info">
             <div class="card-row-title">Операционная сводка</div>
@@ -465,7 +487,7 @@ async function renderHome() {
     const recentList = mo.recent.length > 0 ? `
       <div class="card-list">
         ${mo.recent.map(o => `
-          <div class="card-row" data-order-id="${o.id}">
+          <div class="card-row" data-order-id="${o.id}" role="button" tabindex="0">
             <div class="card-row-icon icon-${o.status}">${icon(STATUS_ICON[o.status] || 'list')}</div>
             <div class="card-row-info">
               <div class="card-row-title">${escapeHtml(o.agent_name || ('Заказ #' + o.id))}</div>
@@ -612,7 +634,7 @@ function renderStockList() {
         const priceHtml = priceLines.length
           ? `<div class="stock-price">${escapeHtml(priceLines.join(' · '))}</div>` : '';
         // Boss может тапнуть товар → редактор цен.
-        const editAttr = isBoss ? ` data-price-idx="${i}"` : '';
+        const editAttr = isBoss ? ` data-price-idx="${i}" role="button" tabindex="0" aria-label="Изменить цену: ${escapeHtml(p.name)}"` : '';
         const editHint = isBoss ? `<span class="stock-edit-hint">${icon('edit')}</span>` : '';
         return `
         <div class="stock-row"${editAttr}>
@@ -970,7 +992,7 @@ async function runSearch(query) {
   if (data.orders && data.orders.length) {
     parts.push(`<div class="search-group-title">${icon('box')} Заказы</div>`);
     parts.push(data.orders.map(o => `
-      <div class="search-item" onclick="showScreen('orders')">
+      <div class="search-item" role="button" tabindex="0" onclick="showScreen('orders')">
         <b>#${o.id}</b> · ${escapeHtml(o.agent_name)} · ${escapeHtml(o.status || '')}
         <span class="search-meta">${escapeHtml(o.full_name)}</span>
       </div>`).join(''));
@@ -978,7 +1000,7 @@ async function runSearch(query) {
   if (data.payments && data.payments.length) {
     parts.push(`<div class="search-group-title">${icon('cash')} Платежи</div>`);
     parts.push(data.payments.map(p => `
-      <div class="search-item" onclick="showScreen('finance')">
+      <div class="search-item" role="button" tabindex="0" onclick="showScreen('finance')">
         <b>#${p.id}</b> · ${p.amount} ${escapeHtml(p.currency)} · ${escapeHtml(p.status || '')}
         <span class="search-meta">${escapeHtml(p.full_name)}${p.comment ? ' · ' + escapeHtml(p.comment) : ''}</span>
       </div>`).join(''));
@@ -1438,6 +1460,10 @@ async function openOrderEditor(orderId) {
     agent_name: null,
   };
 
+  // Черновик с несохранёнными позициями — просим подтверждение, если юзер
+  // свайпает WebApp закрытым (снимается в showScreen и после отправки заказа).
+  tg.enableClosingConfirmation && tg.enableClosingConfirmation();
+
   // Загружаем уже добавленные товары если редактируем
   if (ordersData) {
     const existing = ordersData.orders.find(o => o.id === orderId);
@@ -1613,9 +1639,9 @@ async function loadAgents(search) {
       return;
     }
     list.innerHTML = data.agents.map(a => `
-      <div class="agent-row" data-id="${a.id}" data-name="${a.name}">
-        <div class="agent-name">👤 ${a.name}</div>
-        ${a.phone ? `<div class="agent-phone">${a.phone}</div>` : ''}
+      <div class="agent-row" data-id="${a.id}" data-name="${escapeHtml(a.name || '')}" role="button" tabindex="0">
+        <div class="agent-name">👤 ${escapeHtml(a.name || '')}</div>
+        ${a.phone ? `<div class="agent-phone">${escapeHtml(a.phone)}</div>` : ''}
       </div>
     `).join('');
 
@@ -1693,7 +1719,7 @@ async function openProductPicker() {
       : filtered.slice(0, prodLimit).map(p => {
           const ind = p.stock >= 100 ? 'green' : p.stock >= 20 ? 'yellow' : 'red';
           return `
-            <div class="prod-row"
+            <div class="prod-row" role="button" tabindex="0"
                  data-name="${escapeHtml(p.name)}"
                  data-unit="${escapeHtml(p.unit)}"
                  data-stock="${p.stock}"
@@ -1821,8 +1847,8 @@ function openQuantityInput(name, unit, maxStock, href) {
   });
 
   function updateTotal() {
-    const q = parseFloat(qtyEl.value) || 0;
-    const p = parseFloat(priceEl.value) || 0;
+    const q = parseNum(qtyEl.value) || 0;
+    const p = parseNum(priceEl.value) || 0;
     const t = q * p;
     totalEl.innerHTML = `Итого: <b>${t.toLocaleString('ru-RU', {maximumFractionDigits: 2})} ${selectedCurrency}</b>`;
   }
@@ -1833,8 +1859,9 @@ function openQuantityInput(name, unit, maxStock, href) {
   // Нативная кнопка Telegram — всегда видна над виртуальной клавиатурой,
   // в отличие от HTML-кнопки внизу формы, которую клавиатура перекрывала.
   async function onConfirm() {
-    const qty = parseFloat(qtyEl.value);
-    const price = parseFloat(priceEl.value) || 0;
+    const qty = parseNum(qtyEl.value);
+    const price = parseNum(priceEl.value) || 0;
+    const draftId = currentDraftOrder && currentDraftOrder.id;
     if (!qty || qty <= 0) {
       tg.HapticFeedback?.notificationOccurred('error');
       tg.showAlert('Введите количество');
@@ -1856,6 +1883,12 @@ function openQuantityInput(name, unit, maxStock, href) {
         price: price,
         currency: selectedCurrency,
       });
+      // За время сетевого запроса пользователь мог уйти с экрана / сменить
+      // черновик — не пишем результат в чужой DOM (ghost-контент).
+      if (!currentDraftOrder || currentDraftOrder.id !== draftId || currentScreen !== 'orders') {
+        clearMainButton();
+        return;
+      }
       currentDraftOrder.items.push({
         name, quantity: qty, unit, price, item_id: result.item_id,
       });
@@ -1917,6 +1950,8 @@ async function submitOrder() {
     tg.showAlert(`✅ Заявка #${result.req_id} отправлена руководителю!`);
     ordersData = null;
     currentDraftOrder = null;
+    // Черновик отправлен — снимаем подтверждение закрытия.
+    tg.disableClosingConfirmation && tg.disableClosingConfirmation();
     await renderOrders();
   } catch (e) {
     tg.HapticFeedback?.notificationOccurred('error');
@@ -2416,12 +2451,12 @@ async function renderCashbox(container) {
 
   const depCards = deposits.map(d => {
     const orders = (d.orders || [])
-      .map(o => `#${o.order_id} — ${fmt(o.amount_allocated)} USD`).join(', ') || '—';
+      .map(o => `#${o.order_id} — ${fmt(o.amount_allocated)} ${baseCur()}`).join(', ') || '—';
     return `
       <div class="debt-card" data-dep="${d.id}">
         <div class="debt-card-top">
           <div class="debt-agent">💵 Сдача #${d.id}</div>
-          <div class="debt-amount">${fmt(d.amount)} USD</div>
+          <div class="debt-amount">${fmt(d.amount)} ${baseCur()}</div>
         </div>
         <div class="debt-card-mid"><span class="debt-meta">Заказы: ${escapeHtml(orders)}</span></div>
         <div class="debt-actions">
@@ -2440,7 +2475,7 @@ async function renderCashbox(container) {
       <div class="debt-card" data-ret="${r.id}">
         <div class="debt-card-top">
           <div class="debt-agent">${icon('return')} Возврат #${r.id}</div>
-          <div class="debt-amount">${fmt(r.total_amount)} USD</div>
+          <div class="debt-amount">${fmt(r.total_amount)} ${baseCur()}</div>
         </div>
         <div class="debt-card-mid">
           <span class="debt-meta">Заказ #${r.order_id} · ${escapeHtml(r.reason || '')}</span>
@@ -2533,7 +2568,7 @@ async function renderCashbox(container) {
       <div class="section-label">Сдать наличные</div>
       <div class="card">
         <div class="form-row">
-          <label class="form-label">Сумма (USD)</label>
+          <label class="form-label" for="dep-amount">Сумма (${baseCur()})</label>
           <input type="number" id="dep-amount" class="form-input" placeholder="500" inputmode="decimal">
         </div>
         <button id="dep-create" class="btn-primary">${icon('cash')} Сдать в кассу</button>
@@ -2544,7 +2579,7 @@ async function renderCashbox(container) {
     const rows = myDeposits.map(d => `
       <div class="stock-row">
         <div class="stock-info">
-          <div class="stock-name">${stEmoji[d.status] || '•'} #${d.id} — ${fmt(d.amount)} USD</div>
+          <div class="stock-name">${stEmoji[d.status] || '•'} #${d.id} — ${fmt(d.amount)} ${baseCur()}</div>
           <div class="stock-folder">${(d.created_at || '').slice(0, 16)}${d.status === 'rejected' && d.reject_reason ? ' · ' + escapeHtml(d.reject_reason) : ''}</div>
         </div>
       </div>
