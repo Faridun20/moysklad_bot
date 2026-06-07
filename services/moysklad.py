@@ -629,6 +629,73 @@ async def get_sales_stats(since: datetime, until: datetime | None = None) -> dic
     }
 
 
+@_ms_ttl_cache(ttl=300.0, name="get_counterparty_purchases")
+async def get_counterparty_purchases(agent_id: str, max_demands: int = 20) -> dict:
+    """Покупки контрагента из МС (для карточки клиента): топ-товары + последние
+    отгрузки. Фильтр demand по agent=href; позиции последних max_demands отгрузок
+    тянем параллельно (семафор), агрегируем по товару. Суммы — в копейках.
+    Кэш 5 мин на agent_id (TTL-декоратор) — не дёргаем МС на каждый тап."""
+    if not agent_id:
+        return {"top_products": [], "recent": [], "total_cents": 0, "count": 0}
+    agent_href = f"{MS_BASE}/entity/counterparty/{agent_id}"
+    demands: list[dict] = []
+    offset = 0
+    page = 100
+    while len(demands) < 1000:  # cap ~10 страниц на клиента
+        data = await ms_get(
+            "entity/demand",
+            params={
+                "filter": f"agent={agent_href}",
+                "order": "moment,desc",
+                "limit": page,
+                "offset": offset,
+                "expand": "agent",
+            },
+        )
+        chunk = data if isinstance(data, list) else data.get("rows", [])
+        demands.extend(chunk)
+        if len(chunk) < page:
+            break
+        offset += page
+    if not demands:
+        return {"top_products": [], "recent": [], "total_cents": 0, "count": 0}
+    total_cents = sum(s.get("sum", 0) or 0 for s in demands)
+    recent = [
+        {
+            "id": extract_id_from_href(s.get("meta", {}).get("href", "")),
+            "date": (s.get("moment") or "")[:16],
+            "sum_cents": s.get("sum", 0) or 0,
+        }
+        for s in demands[:10]
+    ]
+    demand_ids = [extract_id_from_href(s.get("meta", {}).get("href", "")) for s in demands[:max_demands]]
+    demand_ids = [d for d in demand_ids if d]
+    results = await asyncio.gather(
+        *(get_shipment_positions(d) for d in demand_ids), return_exceptions=True
+    )
+    product_sums: dict[str, dict] = {}
+    for positions in results:
+        if isinstance(positions, BaseException):
+            continue
+        for pos in positions:
+            name = (pos.get("assortment", {}) or {}).get("name", "—")
+            qty = pos.get("quantity", 0) or 0
+            price = pos.get("price", 0) or 0
+            p = product_sums.setdefault(name, {"sum_cents": 0, "qty": 0})
+            p["sum_cents"] += qty * price
+            p["qty"] += qty
+    top_products = [
+        {"name": n, "qty": v["qty"], "sum_cents": int(v["sum_cents"])}
+        for n, v in sorted(product_sums.items(), key=lambda x: x[1]["sum_cents"], reverse=True)[:10]
+    ]
+    return {
+        "top_products": top_products,
+        "recent": recent,
+        "total_cents": int(total_cents),
+        "count": len(demands),
+    }
+
+
 @_ms_ttl_cache(ttl=60.0, name="get_employee_shipments")
 async def get_employee_shipments(
     since: datetime,
