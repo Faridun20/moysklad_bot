@@ -1258,8 +1258,10 @@ function renderOrdersMain() {
     { id: '30d', label: '30 дней' },
     { id: 'custom', label: 'Период…' },
   ];
-  const periodBtns = periods.map(p =>
-    `<button class="cat-btn ${currentOrderPeriod === p.id ? 'active' : ''}" data-period="${p.id}" aria-pressed="${currentOrderPeriod === p.id}">${p.label}</button>`
+  // Период — компактный нативный select в тулбаре (а не второй ряд пилюль):
+  // один ряд фильтров вместо двух. «Период…» открывает календарь.
+  const periodOptions = periods.map(p =>
+    `<option value="${p.id}" ${currentOrderPeriod === p.id ? 'selected' : ''}>${p.label}</option>`
   ).join('');
   const periodPanel = currentOrderPeriod === 'custom' ? dateRangeHost() : '';
 
@@ -1360,9 +1362,9 @@ function renderOrdersMain() {
   content.innerHTML = `
     <div class="orders-toolbar">
       <div class="cat-scroll">${filterBtns}</div>
+      <select class="period-select" id="order-period" aria-label="Период">${periodOptions}</select>
       ${!isBoss ? `<button class="btn-new-order" id="btn-new-order">+ Новый заказ</button>` : ''}
     </div>
-    <div class="cat-scroll cat-scroll--period">${periodBtns}</div>
     ${periodPanel}
 
     ${isBoss ? `<button class="requests-btn" id="show-requests">${icon('clock')} Заявки на рассмотрении</button>` : ''}
@@ -1379,14 +1381,15 @@ function renderOrdersMain() {
     });
   });
 
-  // Фильтр по периоду
-  document.querySelectorAll('.cat-btn[data-period]').forEach(btn => {
-    btn.addEventListener('click', () => {
+  // Фильтр по периоду — нативный select.
+  const periodSel = document.getElementById('order-period');
+  if (periodSel) {
+    periodSel.addEventListener('change', () => {
       haptic('light');
-      currentOrderPeriod = btn.dataset.period;
+      currentOrderPeriod = periodSel.value;
       renderOrdersMain();
     });
-  });
+  }
 
   // Кастомный диапазон дат: монтируем календарь, по «Применить» фильтруем.
   if (currentOrderPeriod === 'custom') {
