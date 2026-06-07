@@ -1,0 +1,8 @@
+# Railpack/mise: managed Python 3.11.9 не публикует GitHub artifact attestations,
+# из-за чего `mise install` падает: «No GitHub artifact attestations found for
+# python@3.11.9». Отключаем проверку здесь, в репозитории, чтобы НЕ зависеть от
+# per-service Shared Variable MISE_PYTHON_GITHUB_ATTESTATIONS=false — новые сервисы
+# (cron'ы) её автоматически не наследуют и валят билд (так упал cron-ms-reconcile).
+# Версия Python по-прежнему берётся из runtime.txt; тут только настройка mise.
+[settings]
+python.github_attestations = false
