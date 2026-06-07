@@ -1,5 +1,7 @@
 // Юнит-тесты чистых хелперов фронта (webapp/static/helpers.js) — тестируем РЕАЛЬНЫЙ
 // код, который грузится в браузере (UMD: в Node даёт module.exports).
+import { readFileSync } from 'node:fs';
+
 import { describe, it, expect } from 'vitest';
 
 import helpers from '../helpers.js';
@@ -62,6 +64,21 @@ describe('icon', () => {
   it('пустое/невалидное имя не падает', () => {
     expect(icon()).toContain('#ic-');
     expect(icon(null)).toContain('#ic-');
+  });
+});
+
+describe('sprite coverage', () => {
+  const read = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8');
+  it('все icon(\'литерал\') имеют <symbol> в спрайте index.html', () => {
+    // Регресс после эмодзи→SVG: каждое строковое имя иконки должно существовать
+    // в спрайте, иначе будет «пустая» иконка. Динамические icon(var) не ловим.
+    const html = read('../index.html');
+    const names = new Set();
+    for (const src of [read('../app.js'), read('../helpers.js')]) {
+      for (const m of src.matchAll(/\bicon\(\s*'([a-z][a-z-]*)'/g)) names.add(m[1]);
+    }
+    const missing = [...names].filter((n) => !html.includes(`id="ic-${n}"`));
+    expect(missing).toEqual([]);
   });
 });
 
