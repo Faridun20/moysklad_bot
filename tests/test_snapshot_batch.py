@@ -56,3 +56,30 @@ def test_refresh_counterparties_single_batch(isolated_db, monkeypatch):
     assert calls["rows"] == n_rows
     total = asyncio.run(adb_core.fetchval("SELECT COUNT(*) FROM ms_counterparties"))
     assert total == n_rows
+
+
+def test_refresh_counterparties_syncs_balance(isolated_db, monkeypatch):
+    """report/counterparty → balance_cents (взаиморасчёты) пишется по ms_id;
+    контрагент без строки в отчёте остаётся с NULL-балансом."""
+
+    async def fake_ms_get(path, params=None):
+        if path == "report/counterparty":
+            return {"rows": [
+                {"counterparty": {"meta": {"href": "x/entity/counterparty/cp1"}}, "balance": 150000},
+                {"counterparty": {"meta": {"href": "x/entity/counterparty/cp2"}}, "balance": -5000},
+            ]}
+        return {"rows": [
+            {"id": "cp1", "name": "Client 1", "phone": "+1"},
+            {"id": "cp2", "name": "Client 2", "phone": ""},
+            {"id": "cp3", "name": "Client 3", "phone": ""},  # нет в отчёте → NULL
+        ]}
+
+    monkeypatch.setattr(snapshot, "ms_get", fake_ms_get)
+    n = asyncio.run(snapshot.refresh_counterparties())
+    assert n == 3
+    rows = {r["ms_id"]: r for r in snapshot.get_counterparties()}
+    assert rows["cp1"]["balance_cents"] == 150000   # клиент должен нам
+    assert rows["cp2"]["balance_cents"] == -5000    # аванс/переплата
+    assert rows["cp3"]["balance_cents"] is None
+    assert snapshot.get_counterparty("cp1")["balance_cents"] == 150000
+    assert snapshot.get_counterparty("nope") is None

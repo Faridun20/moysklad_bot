@@ -369,11 +369,12 @@ def _create_tables():
                 updated_at TEXT
             )""",
             """CREATE TABLE IF NOT EXISTS ms_counterparties (
-                ms_id      TEXT PRIMARY KEY,
-                name       TEXT,
-                phone      TEXT,
-                href       TEXT,
-                updated_at TEXT
+                ms_id        TEXT PRIMARY KEY,
+                name         TEXT,
+                phone        TEXT,
+                href         TEXT,
+                balance_cents BIGINT,
+                updated_at   TEXT
             )""",
             """CREATE TABLE IF NOT EXISTS ms_employees (
                 ms_id      TEXT PRIMARY KEY,
@@ -807,6 +808,10 @@ def run_migrations():
             ("orders", "approved_at", "TEXT"),
             ("orders", "shipped_at", "TEXT"),
             ("orders", "shipped_by", "BIGINT"),
+            # Баланс контрагента (взаиморасчёты) из МойСклад report/counterparty,
+            # в копейках. balance>0 — клиент должен нам; <0 — аванс/переплата.
+            # Синкается ночным refresh_counterparties. NULL = ещё не синкнут.
+            ("ms_counterparties", "balance_cents", "BIGINT"),
             # order_items
             ("order_items", "stock_snap", "REAL"),
             ("order_items", "price_at_submit", "REAL"),
