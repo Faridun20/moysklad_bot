@@ -240,6 +240,35 @@ def test_money_summary_base_total_includes_negative_deposits(isolated_db, monkey
     assert body["base_total"] == 70.0  # 100 − 30, отрицательная сдача учтена
 
 
+def test_money_summary_unrated_currency_not_dropped(isolated_db, monkeypatch):
+    """Регресс «Обзор не считает суммы >999»: крупная сумма в валюте БЕЗ курса
+    (UZS 5 000 000) не должна молча выпадать из итога — она в missing_rates,
+    base_partial=True, а в base_total входит только то, что сконвертировалось."""
+    db = isolated_db
+    _confirmed_payment(db, 30, 100.0, "USD")          # есть курс (база)
+    _confirmed_payment(db, 30, 5_000_000.0, "UZS")    # курса нет → не теряем молча
+    client, _ = _client(db, monkeypatch, 611, "boss")
+    body = client.post("/api/money/summary", json={"initData": "611", "period": "year"}).json()
+    assert body["base_total"] == 100.0          # только USD сконвертирован
+    assert body["base_partial"] is True
+    miss = {m["currency"]: m["amount"] for m in body["missing_rates"]}
+    assert miss.get("UZS") == 5_000_000.0       # крупная сумма видна явно, не потеряна
+
+
+def test_money_summary_full_total_when_rate_set(isolated_db, monkeypatch):
+    """Когда курс задан — UZS входит в единый «≈» итог, missing_rates пуст."""
+    db = isolated_db
+    db.set_currency_rate("UZS", 0.00008, 1)  # 1 UZS = 0.00008 USD
+    db._invalidate_currency_rates_cache()
+    _confirmed_payment(db, 31, 100.0, "USD")
+    _confirmed_payment(db, 31, 5_000_000.0, "UZS")  # 5M UZS → 400 USD
+    client, _ = _client(db, monkeypatch, 612, "boss")
+    body = client.post("/api/money/summary", json={"initData": "612", "period": "year"}).json()
+    assert body["base_total"] == 500.0       # 100 + 400
+    assert body["base_partial"] is False
+    assert body["missing_rates"] == []
+
+
 def test_payments_send_batch_idempotent(isolated_db, monkeypatch):
     """Ретрай с тем же idempotency_key не создаёт дубль-набор платежей и не шлёт
     второе уведомление — отдаёт сохранённый результат."""

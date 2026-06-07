@@ -1635,21 +1635,36 @@ async def api_money_summary(request: Request):
     totals["period"] = {"label": label, "since": since_s[:10], "until": until_s[:10]}
 
     # Единый итог в базовой валюте (через курсы, как в долгах): платежи по валютам
-    # + сдачи (USD=база). convert_to_base кэширован; None — если курс не задан →
-    # base_partial, чтобы UI пометил «часть валют без курса».
+    # + сдачи (база). convert_to_base → None, если курс не задан. Раньше такие
+    # суммы МОЛЧА выпадали из «≈ …» (был баг «не считает суммы >999»: крупные
+    # UZS-суммы без курса исчезали из итога). Теперь возвращаем их явным списком
+    # `missing_rates`, чтобы UI показал «без курса не учтено: …», а не терял молча.
     from config import BASE_CURRENCY
     from services.database import convert_to_base
 
     base_cur = (BASE_CURRENCY or "USD").upper()
+    # (сумма в мажорных единицах, валюта): платежи по валютам + сдачи (в базовой).
     parts = [(p["total_cents"] / 100, p["currency"]) for p in totals["payments"]]
-    parts.append((totals["deposits"]["total_cents"] / 100, base_cur))  # сдачи в USD
-    # amt != 0 (не > 0): нетто-сдачи могут быть отрицательными (cash-возвраты
-    # уменьшают кассу) — отбрасывать их = завышать итог.
-    bases = [convert_to_base(amt, cur) for amt, cur in parts if amt != 0]
-    known = [x for x in bases if x is not None]
+    parts.append((totals["deposits"]["total_cents"] / 100, base_cur))
+    known_sum = 0.0
+    known_any = False
+    missing: dict[str, float] = {}  # валюта → сумма (мажор), не вошедшая в итог
+    for amt, cur in parts:
+        # amt != 0 (не > 0): нетто-сдачи бывают отрицательными (cash-возвраты).
+        if not amt:
+            continue
+        conv = convert_to_base(amt, cur)
+        if conv is None:
+            missing[cur] = missing.get(cur, 0.0) + amt
+        else:
+            known_sum += conv
+            known_any = True
     totals["base_currency"] = base_cur
-    totals["base_total"] = round(sum(known), 2) if known else None
-    totals["base_partial"] = bool(known) and len(known) < len(bases)
+    totals["base_total"] = round(known_sum, 2) if known_any else None
+    totals["base_partial"] = known_any and bool(missing)
+    totals["missing_rates"] = [
+        {"currency": cur, "amount": round(amt, 2)} for cur, amt in missing.items()
+    ]
     return JSONResponse(totals)
 
 

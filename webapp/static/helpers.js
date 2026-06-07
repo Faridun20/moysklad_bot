@@ -149,6 +149,8 @@
     summary = summary || {};
     const pays = summary.payments || [];
     const dep = summary.deposits || { total_cents: 0, count: 0 };
+    const baseCurrency = summary.base_currency || 'USD';
+    const missing = summary.missing_rates || [];
     const fmtC = (cents) => opsAmount((Number(cents) || 0) / 100);
     const row = (title, sub) =>
       `<div class="stock-row"><div class="stock-info">` +
@@ -157,21 +159,30 @@
     if (!pays.length && !(dep.count > 0)) {
       return '<div class="loader">За период поступлений нет</div>';
     }
-    // Единый итог в базовой валюте (если есть курсы). base_partial → пометка,
-    // что часть валют без курса не вошла в сумму.
+    // Итог в базовой валюте. Валюты без курса НЕ теряем молча (был баг: крупные
+    // суммы без курса, напр. UZS, исчезали из «≈ …») — показываем их явным блоком.
     let head = '';
     if (summary.base_total != null) {
-      const note = summary.base_partial
-        ? '<div class="money-total-note">часть валют без курса не учтена</div>'
+      const partial = missing.length
+        ? ' <span class="money-total-note">(неполный)</span>'
         : '';
       head =
         `<div class="money-total">≈ ${opsAmount(summary.base_total)} ` +
-        `${escapeHtml(summary.base_currency || 'USD')}</div>${note}`;
+        `${escapeHtml(baseCurrency)}${partial}</div>`;
+    }
+    if (missing.length) {
+      const list = missing.map((m) => `${m.currency} ${opsAmount(m.amount)}`).join(', ');
+      head +=
+        `<div class="money-total-note">Без курса не учтено: ` +
+        `${escapeHtml(list)} — задайте курс валют.</div>`;
     }
     const rows = pays
       .map((p) => row(`${p.currency} · ${fmtC(p.total_cents)}`, `${p.count} платеж.`))
       .join('');
-    const depRow = row(`Наличные (сдачи) · ${fmtC(dep.total_cents)} USD`, `${dep.count || 0} сдач.`);
+    const depRow = row(
+      `Наличные (сдачи) · ${fmtC(dep.total_cents)} ${baseCurrency}`,
+      `${dep.count || 0} сдач.`
+    );
     return `${head}<div class="stock-list">${rows}${depRow}</div>`;
   }
 
