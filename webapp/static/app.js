@@ -2140,10 +2140,58 @@ let analyticsPeriod = 'month';   // preset id | 'custom'
 let analyticsSince = '';         // YYYY-MM-DD — кастомный диапазон (period='custom')
 let analyticsUntil = '';
 let lastAnalyticsData = null;    // последний успешный ответ — чтобы показать поля дат без перезапроса
+let analyticsView = 'sales';     // 'sales' | 'money' (boss): продажи vs деньги (быв. «Обзор»)
 const ANALYTICS_TTL_MS = 60 * 1000;
+
+// Шапка Аналитики: переключатель вида «Продажи|Деньги» (boss) + период-сегмент.
+// Общая для обоих видов, чтобы период/вид не расходились. Период — iOS-сегмент
+// .seg (фиксированные 2–4 — навигация), не переносится.
+function analyticsHeaderHtml(isBoss) {
+  const viewSeg = isBoss ? `
+    <div class="seg-row" style="margin-bottom:10px;">
+      <div class="seg">
+        <button class="seg-item ${analyticsView === 'sales' ? 'active' : ''}" data-aview="sales" aria-pressed="${analyticsView === 'sales'}">Продажи</button>
+        <button class="seg-item ${analyticsView === 'money' ? 'active' : ''}" data-aview="money" aria-pressed="${analyticsView === 'money'}">Деньги</button>
+      </div>
+    </div>` : '';
+  const presets = [
+    { id: 'week', label: 'Неделя' }, { id: 'month', label: 'Месяц' },
+    { id: '3month', label: 'Квартал' }, { id: 'year', label: 'Год' },
+  ];
+  const presetSeg = presets.map(p =>
+    `<button class="seg-item ${analyticsPeriod === p.id ? 'active' : ''}" data-period="${p.id}" aria-pressed="${analyticsPeriod === p.id}">${p.label}</button>`
+  ).join('');
+  const customLabel = (analyticsPeriod === 'custom' && analyticsSince && analyticsUntil)
+    ? `${formatDateRU(analyticsSince)}—${formatDateRU(analyticsUntil)}`
+    : 'Период…';
+  const periodBar = `
+    <div class="seg-row">
+      <div class="seg">${presetSeg}</div>
+      <button class="seg-aux ${analyticsPeriod === 'custom' ? 'active' : ''}" data-period="custom" aria-pressed="${analyticsPeriod === 'custom'}">${icon('clock')} ${customLabel}</button>
+    </div>`;
+  const periodPanel = analyticsPeriod === 'custom' ? dateRangeHost() : '';
+  return `${viewSeg}<div class="section-label">Период</div>${periodBar}${periodPanel}`;
+}
+
+// Навешивает обработчики шапки Аналитики (вид/период/календарь) — общие для видов.
+function wireAnalyticsHeader(content) {
+  content.querySelectorAll('[data-aview]').forEach(btn => {
+    btn.addEventListener('click', () => { haptic('light'); analyticsView = btn.dataset.aview; renderAnalytics(); });
+  });
+  content.querySelectorAll('[data-period]').forEach(btn => {
+    btn.addEventListener('click', () => { haptic('light'); analyticsPeriod = btn.dataset.period; renderAnalytics(); });
+  });
+  if (analyticsPeriod === 'custom') {
+    mountCalendar(content.querySelector('.cal-host'), analyticsSince, analyticsUntil,
+      (from, to) => { analyticsSince = from; analyticsUntil = to; renderAnalytics(); });
+  }
+}
 
 async function renderAnalytics() {
   const content = document.getElementById('content');
+  const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
+  if (!isBoss) analyticsView = 'sales';  // не-боссу доступны только «Продажи»
+  if (analyticsView === 'money' && isBoss) return renderMoneyView();
   const custom = analyticsPeriod === 'custom';
 
   // «Период…» выбран, но даты ещё не заданы → не дёргаем бэкенд: показываем поля
@@ -2189,27 +2237,7 @@ async function renderAnalytics() {
 function renderAnalyticsContent(data) {
   const content = document.getElementById('content');
   const fmt = n => Math.round(n).toLocaleString('ru-RU');
-
-  // Пресеты — ровный сегмент-контрол (как в Финансах), «Период…» — отдельная
-  // кнопка справа (открывает календарь). Чёткое выделение активного.
-  const presets = [
-    { id: 'week', label: 'Неделя' },
-    { id: 'month', label: 'Месяц' },
-    { id: '3month', label: 'Квартал' },
-    { id: 'year', label: 'Год' },
-  ];
-  const presetSeg = presets.map(p =>
-    `<button class="seg-item ${analyticsPeriod === p.id ? 'active' : ''}" data-period="${p.id}" aria-pressed="${analyticsPeriod === p.id}">${p.label}</button>`
-  ).join('');
-  const customLabel = (analyticsPeriod === 'custom' && analyticsSince && analyticsUntil)
-    ? `${formatDateRU(analyticsSince)}—${formatDateRU(analyticsUntil)}`
-    : 'Период…';
-  const periodBar = `
-    <div class="seg-row">
-      <div class="seg">${presetSeg}</div>
-      <button class="seg-aux ${analyticsPeriod === 'custom' ? 'active' : ''}" data-period="custom" aria-pressed="${analyticsPeriod === 'custom'}">${icon('clock')} ${customLabel}</button>
-    </div>`;
-  const periodPanel = analyticsPeriod === 'custom' ? dateRangeHost() : '';
+  const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
 
   const trendIcon = data.trend > 0 ? '📈' : data.trend < 0 ? '📉' : '➡️';
   const trendClass = data.trend > 0 ? 'trend-up' : data.trend < 0 ? 'trend-dn' : '';
@@ -2268,9 +2296,7 @@ function renderAnalyticsContent(data) {
     ? `<button class="btn-primary" id="analytics-export" style="margin-top:12px">📊 Выгрузить Excel</button>` : '';
 
   content.innerHTML = `
-    <div class="section-label">Период</div>
-    ${periodBar}
-    ${periodPanel}
+    ${analyticsHeaderHtml(isBoss)}
 
     <div class="stat-grid">
       <div class="stat">
@@ -2330,23 +2356,66 @@ function renderAnalyticsContent(data) {
     });
   }));
 
-  document.querySelectorAll('[data-period]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      haptic('light');
-      analyticsPeriod = btn.dataset.period;
-      renderAnalytics();
-    });
-  });
+  wireAnalyticsHeader(content);  // вид/период/календарь — общая шапка
+}
 
-  // Кастомный диапазон: монтируем календарь, по «Применить» перезапрашиваем.
-  if (analyticsPeriod === 'custom') {
-    mountCalendar(content.querySelector('.cal-host'), analyticsSince, analyticsUntil,
-      (from, to) => {
-        analyticsSince = from;
-        analyticsUntil = to;
-        renderAnalytics();
-      });
+// Аналитика → «Деньги» (быв. Финансы→«Обзор», boss): итоги поступлений за период
+// + лента движения денег. Период — общий с «Продажами» (analyticsPeriod).
+async function renderMoneyView() {
+  const content = document.getElementById('content');
+  content.innerHTML = loading('Считаю деньги…');
+  // Кастомный период выбран, но даты не заданы — откатываемся на месяц.
+  if (analyticsPeriod === 'custom' && !(analyticsSince && analyticsUntil)) analyticsPeriod = 'month';
+  const periodBody = (analyticsPeriod === 'custom' && analyticsSince && analyticsUntil)
+    ? { since: analyticsSince, until: _nextDay(analyticsUntil) }
+    : { period: analyticsPeriod };
+  let summary = null;
+  let history = [];
+  try {
+    summary = await api('/api/money/summary', periodBody);
+    history = (await api('/api/cash/history', {}).catch(() => ({ history: [] }))).history || [];
+  } catch (e) {
+    content.innerHTML = analyticsHeaderHtml(true) + errorBox(e.message);
+    wireAnalyticsHeader(content);
+    return;
   }
+  const label = (summary && summary.period && summary.period.label) || '';
+  content.innerHTML =
+    analyticsHeaderHtml(true) +
+    `<div class="section-label">Поступления · ${escapeHtml(label)}</div>` +
+    renderMoneyTotalsHtml(summary) +
+    '<div class="section-label">Движение денег</div>' +
+    cashHistoryHtml(history);
+  wireAnalyticsHeader(content);
+}
+
+// Лента движения денег (платежи + сдачи + возвраты) — общий рендер для «Денег».
+function cashHistoryHtml(history) {
+  if (!history || !history.length) return '<div class="loader">Движений пока нет</div>';
+  const KIND_META = {
+    payment: { ic: 'cash', label: 'Платёж' },
+    deposit: { ic: 'cashbox', label: 'Сдача' },
+    return: { ic: 'return', label: 'Возврат' },
+  };
+  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const histStatus = s => s === 'confirmed'
+    ? '<span class="stock-badge badge-green">принят</span>'
+    : s === 'rejected' ? '<span class="stock-badge badge-red">отклонён</span>'
+    : '<span class="stock-badge badge-yellow">ожидает</span>';
+  const rows = history.map(h => {
+    const m = KIND_META[h.kind] || { ic: 'cash', label: h.kind };
+    const ord = h.order_id ? ` · заказ #${h.order_id}` : '';
+    return `
+      <div class="stock-row">
+        <div class="card-row-icon">${icon(m.ic)}</div>
+        <div class="stock-info">
+          <div class="stock-name">${m.label} · ${fmt(h.amount)} ${escapeHtml(h.currency || baseCur())}</div>
+          <div class="stock-folder">${escapeHtml(h.who || '')} · ${escapeHtml(h.created_at || '')}${ord}</div>
+        </div>
+        ${histStatus(h.status)}
+      </div>`;
+  }).join('');
+  return `<div class="stock-list">${rows}</div>`;
 }
 
 // (Экран «Платежи» удалён: подтверждение оплат, история движения денег и
@@ -2384,11 +2453,9 @@ function initNav() {
 //   - partial                — есть подтверждённые платежи, но не всё
 //   - awaiting_confirmation  — есть pending платежи (босс решает)
 
-let financeTab = 'debts';  // 'debts' | 'payments'
+let financeTab = 'debts';  // confirm | debts | ops | limits (плоско, по задачам)
 let debtsFilter = 'all';   // 'all' | 'today'
-let cashboxSubTab = null;  // 'confirm' | 'ops' | 'my' | 'totals' | 'history' — дефолт зависит от роли
-let moneyPeriod = 'month'; // период для вкладки «Итоги» (week|month|3month|year)
-let moneySummary = null;   // кэш ответа /api/money/summary за текущий moneyPeriod
+let cashboxSubTab = null;  // последняя секция кассы (confirm|ops) — фолбэк
 
 async function renderFinance() {
   const content = document.getElementById('content');
@@ -2397,36 +2464,22 @@ async function renderFinance() {
   const canDeposit = role === 'manager' || role === 'warehouse_keeper';
   const isConfirmer = ['admin', 'boss', 'bookkeeper', 'warehouse_keeper'].includes(role);
   const canReturn = ['admin', 'boss', 'warehouse_keeper', 'manager'].includes(role);
-  // Раздел «Операции» = формы (сдать наличные / оформить возврат / новый платёж).
+  // «Платежи и сдачи» = формы (сдать наличные / возврат / новый платёж) + «Мои сдачи».
   const hasOps = canDeposit || canReturn || !isBoss;
 
-  // Плоская навигация (1 уровень по задачам) вместо прежних 2-3 рядов сегментов
-  // (Деньги → под-вкладки → фильтры). Каждая задача — отдельная пилюля.
-  // Миграция старых/внешних ключей вкладки на плоские.
-  // Подтверждающие → к подтверждениям; остальные («Платёж» с главной) → к формам.
-  if (financeTab === 'payments') financeTab = isConfirmer ? 'confirm' : 'ops';
-  if (financeTab === 'cashbox') {
-    financeTab = isConfirmer ? 'confirm' : (hasOps ? 'ops' : (canDeposit ? 'my' : 'debts'));
-  }
+  // Миграция старых/внешних ключей вкладок на текущий плоский набор.
+  if (financeTab === 'payments' || financeTab === 'cashbox') financeTab = isConfirmer ? 'confirm' : 'ops';
+  if (financeTab === 'my') financeTab = 'ops';          // свёрнуто в «Платежи и сдачи»
+  if (financeTab === 'overview') financeTab = 'debts';  // переехало в Аналитику → Деньги
 
-  const tabs = [];
-  if (isConfirmer) tabs.push({ key: 'confirm', label: 'Подтверждения' });
-  tabs.push({ key: 'debts', label: 'Долги' });
-  if (isBoss) tabs.push({ key: 'overview', label: 'Обзор' });
-  if (hasOps) tabs.push({ key: 'ops', label: 'Операции' });
-  if (canDeposit) tabs.push({ key: 'my', label: 'Мои сдачи' });
-  if (isBoss) tabs.push({ key: 'limits', label: 'Лимиты' });
-
+  const tabs = financeTabs({ isBoss, isConfirmer, hasOps, canDeposit });
   // Недоступную/неизвестную вкладку откатываем на первую доступную.
   if (!tabs.find(t => t.key === financeTab)) financeTab = (tabs[0] && tabs[0].key) || 'debts';
-
-  const LABELS = {
-    confirm: 'Подтверждения', debts: 'Долги', overview: 'Обзор',
-    ops: 'Операции', my: 'Мои сдачи', limits: 'Лимиты',
-  };
+  const LABELS = {};
+  tabs.forEach(t => { LABELS[t.key] = t.label; });
   setScreenContext(`Финансы · ${LABELS[financeTab] || ''}`);
 
-  // Бейдж ожидающих подтверждений — на пилюле «Подтверждения», ВСЕГДА виден (а не
+  // Бейдж ожидающих подтверждений — на вкладке «Подтверждения», ВСЕГДА виден (а не
   // только когда раздел открыт). Тянем только счётчики (длины списков).
   let pendN = 0;
   if (isConfirmer) {
@@ -2436,13 +2489,16 @@ async function renderFinance() {
     pendN = (await Promise.all(parts)).reduce((a, b) => a + b, 0);
   }
 
+  // Под-навигация = подчёркнутый горизонт-скролл сегмент (.subseg) — НЕ переносится
+  // «по три в ряд» (раньше .cat-row с flex-wrap). Пилюли (.cat-btn) теперь только
+  // для фильтров — визуальная иерархия: подчёркнутое = навигация, пилюли = фильтры.
   content.innerHTML = `
-    <div class="cat-row" style="margin: 4px 0 10px;">
+    <div class="subseg">
       ${tabs.map(t => {
         const on = financeTab === t.key;
         const badge = (t.key === 'confirm' && pendN)
-          ? ` <span class="stock-badge badge-yellow" style="margin-left:6px;">${pendN}</span>` : '';
-        return `<button class="cat-btn ${on ? 'active' : ''}" data-tab="${t.key}" aria-pressed="${on}">${t.label}${badge}</button>`;
+          ? ` <span class="stock-badge badge-yellow">${pendN}</span>` : '';
+        return `<button class="subseg-item ${on ? 'active' : ''}" data-tab="${t.key}" aria-pressed="${on}">${t.label}${badge}</button>`;
       }).join('')}
     </div>
     <div id="finance-body"></div>
@@ -2454,8 +2510,8 @@ async function renderFinance() {
       renderFinance();
     });
   });
-  // Активную пилюлю подтягиваем в зону видимости, если ряд переносится/скроллится.
-  const activeSeg = content.querySelector('.cat-btn.active');
+  // Активную вкладку подтягиваем в зону видимости, если ряд скроллится.
+  const activeSeg = content.querySelector('.subseg-item.active');
   if (activeSeg && activeSeg.scrollIntoView) {
     try { activeSeg.scrollIntoView({ inline: 'center', block: 'nearest' }); } catch (e) { /* старый WebView */ }
   }
@@ -2463,14 +2519,16 @@ async function renderFinance() {
   const body = document.getElementById('finance-body');
   if (financeTab === 'debts') await renderDebts(body);
   else if (financeTab === 'limits') await renderCreditLimits(body);
-  else await renderCashbox(body, financeTab);  // confirm | ops | my | overview
+  else await renderCashbox(body, financeTab);  // confirm | ops
 }
 
 async function renderCashbox(container, section) {
   container = container || document.getElementById('content');
-  // section — плоская вкладка из renderFinance: confirm | ops | my | overview.
-  // Бейдж/переключение теперь на уровне renderFinance, тут только тело секции.
+  // section — плоская вкладка из renderFinance: confirm | ops. Бейдж/переключение
+  // на уровне renderFinance, тут только тело секции. Легаси-ключи свёрнуты.
   section = section || cashboxSubTab || 'confirm';
+  if (section === 'my') section = 'ops';          // «Мои сдачи» — секция внутри ops
+  if (section === 'overview') section = 'confirm'; // «Обзор» переехал в Аналитику
   cashboxSubTab = section;
   container.innerHTML = loading('Загрузка кассы…');
   const fmt = n => Math.round(n).toLocaleString('ru-RU');
@@ -2485,7 +2543,6 @@ async function renderCashbox(container, section) {
   let returns = [];
   let myDeposits = [];
   let payPending = [];   // paid-заказы с pending-оплатой (подтверждает босс)
-  let cashHistory = [];  // единая лента движения денег (босс)
   const _grab = (path, key) => api(path, {}).then(r => r[key] || []).catch(() => []);
   const tasks = [];
   if (section === 'confirm') {
@@ -2493,14 +2550,9 @@ async function renderCashbox(container, section) {
     tasks.push(_grab('/api/returns/pending', 'returns').then(v => { returns = v; }));
     if (isBoss) tasks.push(_grab('/api/payments/pending', 'pending').then(v => { payPending = v; }));
   }
-  if (section === 'my' && canDeposit) {
+  // «Мои сдачи» — секция внутри «Платежи и сдачи» (ops) для тех, кто сдаёт.
+  if (section === 'ops' && canDeposit) {
     tasks.push(_grab('/api/deposits/my', 'deposits').then(v => { myDeposits = v; }));
-  }
-  if (section === 'overview' && isBoss) {
-    tasks.push(_grab('/api/cash/history', 'history').then(v => { cashHistory = v; }));
-    tasks.push(
-      api('/api/money/summary', { period: moneyPeriod }).then(v => { moneySummary = v; }).catch(() => { moneySummary = null; })
-    );
   }
   await Promise.all(tasks);
 
@@ -2569,50 +2621,8 @@ async function renderCashbox(container, section) {
     ? `<div class="section-label">${icon('return')} Возвраты на подтверждении (${returns.length})</div><div class="debts-list">${retCards}</div>`
     : '';
 
-  // История движения денег (босс): платежи + сдачи + возвраты единой лентой.
-  const KIND_META = {
-    payment: { ic: 'cash', label: 'Платёж' },
-    deposit: { ic: 'cashbox', label: 'Сдача' },
-    return: { ic: 'return', label: 'Возврат' },
-  };
-  const histStatus = s => s === 'confirmed'
-    ? '<span class="stock-badge badge-green">принят</span>'
-    : s === 'rejected' ? '<span class="stock-badge badge-red">отклонён</span>'
-    : '<span class="stock-badge badge-yellow">ожидает</span>';
-  const historyRows = cashHistory.map(h => {
-    const m = KIND_META[h.kind] || { ic: 'cash', label: h.kind };
-    const ord = h.order_id ? ` · заказ #${h.order_id}` : '';
-    return `
-      <div class="stock-row">
-        <div class="card-row-icon">${icon(m.ic)}</div>
-        <div class="stock-info">
-          <div class="stock-name">${m.label} · ${fmt(h.amount)} ${escapeHtml(h.currency || 'USD')}</div>
-          <div class="stock-folder">${escapeHtml(h.who || '')} · ${escapeHtml(h.created_at || '')}${ord}</div>
-        </div>
-        ${histStatus(h.status)}
-      </div>`;
-  }).join('');
-  const historyBlock = cashHistory.length
-    ? `<div class="stock-list">${historyRows}</div>`
-    : '<div class="loader">Движений пока нет</div>';
-
-  // Итоги поступлений за период (босс): платежи по валютам + сдачи. Сверху —
-  // выбор периода (как в Аналитике), ниже — суммы (renderMoneyTotalsHtml).
-  const MONEY_PERIODS = [
-    { key: 'week', label: 'Неделя' },
-    { key: 'month', label: 'Месяц' },
-    { key: '3month', label: 'Квартал' },
-    { key: 'year', label: 'Год' },
-  ];
-  const totalsBlock = `
-    <div class="cat-row" style="margin-top:10px;">
-      ${MONEY_PERIODS.map(p =>
-        `<button class="cat-btn ${p.key === moneyPeriod ? 'active' : ''}" data-mperiod="${p.key}" aria-pressed="${p.key === moneyPeriod}">${p.label}</button>`
-      ).join('')}
-    </div>
-    <div class="section-label">Поступления · ${escapeHtml((moneySummary && moneySummary.period && moneySummary.period.label) || '')}</div>
-    ${renderMoneyTotalsHtml(moneySummary)}
-  `;
+  // (Итоги поступлений за период + лента движения денег переехали в Аналитику →
+  // «Деньги» — см. renderMoneyView. Здесь касса = только подтверждения и формы.)
 
   // Блок «сдать наличные» + «мои сдачи» — только для тех, кто физически сдаёт
   // (менеджер/кладовщик). Боссу/бухгалтеру self-deposit бессмысленен.
@@ -2697,17 +2707,15 @@ async function renderCashbox(container, section) {
       </div>
   ` : '';
 
-  // Тело активной секции (вкладки теперь на уровне renderFinance — без 2-го ряда).
+  // Тело активной секции (вкладки на уровне renderFinance — без 2-го ряда).
+  // ops = формы + «Мои сдачи»; иначе (confirm) = подтверждения.
   let bodyHtml;
   if (section === 'ops') {
-    bodyHtml = (createBlock + payFormBlock + returnBlock) || '<div class="loader">Нет доступных операций</div>';
-  } else if (section === 'my') {
-    bodyHtml = myBlock || '<div class="loader">У вас пока нет сдач</div>';
-  } else if (section === 'overview') {
-    // Итоги за период (сверху) + лента движения денег (снизу) на одном экране.
-    bodyHtml = totalsBlock + '<div class="section-label">Движение денег</div>' + historyBlock;
+    bodyHtml = (createBlock + payFormBlock + returnBlock + myBlock)
+      || '<div class="loader">Нет доступных операций</div>';
   } else {
-    bodyHtml = (payBlock + depBlock + retBlock) || '<div class="loader">Нет записей на подтверждении</div>';
+    bodyHtml = (payBlock + depBlock + retBlock)
+      || '<div class="loader">Нет записей на подтверждении</div>';
   }
   container.innerHTML = bodyHtml;
 
@@ -2738,15 +2746,6 @@ async function renderCashbox(container, section) {
         .catch(e => { tg.showAlert('❌ ' + e.message); retBtn.disabled = false; });
     });
   }
-
-  // Выбор периода для вкладки «Итоги» — рефетчим /api/money/summary.
-  container.querySelectorAll('[data-mperiod]').forEach(b => {
-    b.addEventListener('click', () => {
-      haptic('light');
-      moneyPeriod = b.dataset.mperiod;
-      renderCashbox(container, 'overview');  // остаёмся в «Обзоре», рефетчим итоги
-    });
-  });
 
   // Мульти-валютный платёж: динамические строки (сумма+валюта) за один сабмит.
   const addRowBtn = container.querySelector('#pay-add-row');
