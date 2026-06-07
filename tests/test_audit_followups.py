@@ -112,6 +112,60 @@ def test_co_update_illegal_transition_skipped(isolated_db, monkeypatch):
     assert sent and any("вручную" in t for _, t in sent)
 
 
+def test_illegal_transition_alert_not_suppressed_by_drift(isolated_db, monkeypatch):
+    """Уже выставленный ms_drift_at (правка суммы в МС) НЕ должен глушить алерт о
+    нелегальном переходе — это отдельный флаг ms_transition_blocked_at. Раньше оба
+    делили ms_drift_at → drift молча съедал более опасный «застрявший статус»."""
+    db = isolated_db
+    sent = _mock_notify(monkeypatch)
+    oid, _ = _credit_order(db, 100.0, 1, status="approved")
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q(
+                "UPDATE orders SET ms_customerorder_id='CO-D1', "
+                "ms_drift_at='2026-06-04 00:00:00' WHERE id=?"
+            ),
+            (oid,),
+        )
+        conn.commit()
+
+    async def _b(path):
+        return {"sum": 10000, "state": {"stateType": "Unsuccessful", "name": "Отменён"}}
+
+    _mock_ms_get(monkeypatch, _b)
+    asyncio.run(h._handle_customerorder_updated("CO-D1"))
+
+    o = asyncio.run(db.get_order(oid))
+    assert o["status"] == "approved"  # статус не тронут
+    assert sent and any("вручную" in t for _, t in sent)  # алерт всё равно ушёл
+    assert o["ms_transition_blocked_at"] is not None  # отдельный флаг выставлен
+
+
+def test_transition_blocked_dedup_and_surfaced_as_anomaly(isolated_db, monkeypatch):
+    """Повторный customerorder.UPDATE по застрявшему заказу не шлёт второй алерт
+    (дедуп по ms_transition_blocked_at), и заказ виден в аномалиях МС-синка."""
+    db = isolated_db
+    sent = _mock_notify(monkeypatch)
+    oid, _ = _credit_order(db, 100.0, 1, status="approved")
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("UPDATE orders SET ms_customerorder_id='CO-D2' WHERE id=?"), (oid,))
+        conn.commit()
+
+    async def _b(path):
+        return {"sum": 10000, "state": {"stateType": "Unsuccessful", "name": "Отменён"}}
+
+    _mock_ms_get(monkeypatch, _b)
+    asyncio.run(h._handle_customerorder_updated("CO-D2"))
+    asyncio.run(h._handle_customerorder_updated("CO-D2"))  # повтор
+
+    assert len([t for _, t in sent if "вручную" in t]) == 1  # ровно один алерт
+
+    anomalies = asyncio.run(db.get_ms_sync_anomalies("2000-01-01 00:00:00"))
+    assert any(o["id"] == oid for o in anomalies["transition_blocked"])
+
+
 def test_co_update_legal_transition_applied(isolated_db, monkeypatch):
     """approved + Successful (→shipped) — легальный переход, применяется через CAS."""
     db = isolated_db

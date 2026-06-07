@@ -233,11 +233,12 @@ async def _handle_customerorder_updated(co_id: str) -> None:
             "МС (state='%s', stateType=%s) — пропускаю, нужна ручная разборка",
             co_id, order_id, local_status, new_status, state_name, state_type,
         )
-        # Дедуп: помечаем «нужна ручная разборка» (тем же флагом, что дрифт) и
-        # алертим ОДИН раз. Иначе каждый последующий customerorder.UPDATE по
-        # застрявшему заказу слал бы повторный алерт. set_order_ms_drift
-        # идемпотентен (True только при первой установке).
-        if await adb.set_order_ms_drift(order_id):
+        # Дедуп: помечаем «нужна ручная разборка» ОТДЕЛЬНЫМ флагом (не тем, что
+        # дрифт суммы). Иначе уже-выставленный ms_drift_at (правка цены в МС)
+        # ГЛУШИЛ бы этот алерт — а нелегальный переход опаснее (отгрузка/остаток
+        # в МС двинулись, локально заказ застрял без отката). Отдельный флаг даёт
+        # независимый дедуп И корректную категорию в ops-сводке. Идемпотентен.
+        if await adb.set_order_ms_transition_blocked(order_id):
             from services.notifier import aget_notify_recipients
             from utils.helpers import esc
 
@@ -273,13 +274,15 @@ async def _handle_customerorder_updated(co_id: str) -> None:
 
     manager_id = order.get("user_id")
     if manager_id:
+        from utils.helpers import esc
+
         status_ru = {"shipped": "Отгружен ✅", "rejected": "Отклонён ❌"}.get(
             new_status, new_status
         )
         await tg_send_message(
             manager_id,
             f"📦 Статус заказа #{order_id} обновлён в МойСклад: <b>{status_ru}</b>\n"
-            f"Клиент: {order.get('agent_name') or '—'}",
+            f"Клиент: {esc(order.get('agent_name') or '—')}",
         )
 
     logger.info(
@@ -332,12 +335,16 @@ async def apply_ms_customerorder_delete(order: dict, co_id: str) -> None:
         res = await adb.cancel_order(
             order_id, 0, "МойСклад", "Заказ покупателя удалён в МойСклад"
         )
-        if res.get("ok"):
-            # Документ в МС уже удалён → reverse не нужен, помечаем синком.
-            await adb.set_order_ms_cancel_synced(order_id)
+        # Снятие ссылки и пометка фантомом идемпотентны — делаем всегда.
         await adb.clear_order_ms_customerorder_id(order_id)
-        # Помечаем как удалённый в МС → исключаем из аналитики менеджеров.
         await adb.set_order_ms_deleted(order_id)
+        if not res.get("ok"):
+            # Конкурентный двойной вызов (вебхук + cron одновременно прочитали
+            # approved): отменил уже другой → cancel_order вернул ok=False
+            # (WHERE status='approved' не задел строку). Без второго алерта/аудита.
+            return
+        # Документ в МС уже удалён → reverse не нужен, помечаем синком.
+        await adb.set_order_ms_cancel_synced(order_id)
         await adb.add_audit_log(
             0,
             "МойСклад",

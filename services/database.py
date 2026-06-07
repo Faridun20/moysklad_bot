@@ -784,6 +784,12 @@ def run_migrations():
             # проверки (флаг + уведомление), деньги/статус НЕ меняем молча.
             # NULL = расхождений не зафиксировано.
             ("orders", "ms_drift_at", "TEXT"),
+            # Когда МойСклад сообщил статус, нелегальный для локальной машины
+            # состояний (напр. approved→rejected): отгрузка/остаток в МС двинулись,
+            # локально применить нельзя без отката. Отдельный флаг (НЕ ms_drift_at),
+            # чтобы дедуп этого алерта не глушился правкой суммы и наоборот.
+            # NULL = заблокированных переходов нет.
+            ("orders", "ms_transition_blocked_at", "TEXT"),
             # R4: customerorder создан в МС, но demand (отгрузка) упал — заказ
             # approved с CO, но без списания остатков. Флаг для ночного дайджеста
             # «нужна доделка demand вручную». Снимается при успешном set_order_ms_demand_id.
@@ -1323,7 +1329,9 @@ async def get_credit_overview() -> list[dict]:
 
     out: list[dict[str, Any]] = []
     for aid, name in agents.items():
-        debt = debt_by_agent.get(aid, 0.0)
+        # round(…, 2) бит-в-бит как get_agent_current_debt — иначе float-дрейф
+        # суммы по нескольким заказам мог дать over_limit=True здесь при False там.
+        debt = round(debt_by_agent.get(aid, 0.0), 2)
         limit = limits_map.get(aid, default_limit)
         out.append(
             {
@@ -3494,6 +3502,21 @@ async def set_order_ms_drift(order_id: int) -> bool:
     )
 
 
+async def set_order_ms_transition_blocked(order_id: int) -> bool:
+    """Пометить, что МойСклад сообщил нелегальный для локальной машины состояний
+    статус (напр. approved→rejected). Идемпотентно (только если флаг ещё не стоит)
+    → один алерт на заказ. Деньги/статус НЕ трогаем — это сигнал на ручную
+    разборку. Отдельный флаг от ms_drift_at: их дедупы не должны глушить друг друга."""
+    return (
+        await adb_core.execute(
+            "UPDATE orders SET ms_transition_blocked_at = $1, updated_at = $2 "
+            "WHERE id = $3 AND ms_transition_blocked_at IS NULL",
+            now_str(), now_str(), order_id,
+        )
+        > 0
+    )
+
+
 async def set_order_ms_demand_failed(order_id: int) -> bool:
     """R4: пометить «CO создан, demand упал» — заказ ждёт ручной доделки отгрузки.
     Идемпотентно (только если флаг ещё не стоит). Попадает в ночной дайджест."""
@@ -4072,13 +4095,21 @@ async def get_ms_sync_anomalies(since_iso: str) -> dict[str, list[dict]]:
     ночного дайджеста ops_monitor). Два набора, помеченные с `since_iso`:
       • drift   — сумма в МС ≠ локальной (ms_drift_at): отредактированы в МС;
       • deleted — документ удалён в МС, но статус shipped/paid (ms_deleted_at):
-                  «фантом», деньги/остатки двигались.
+                  «фантом», деньги/остатки двигались;
+      • transition_blocked — МС сообщил нелегальный статус (ms_transition_blocked_at):
+                  отгрузка/остаток в МС двинулись, локально не применить.
     Окно since_iso ограничивает свежими — старое уже разобрали. soft-deleted
     исключаем. Native async через adb_core."""
     drift = await adb_core.fetch(
         "SELECT id, agent_name, full_name, status, ms_drift_at FROM orders "
         "WHERE ms_drift_at IS NOT NULL AND ms_drift_at >= $1 AND (deleted_at IS NULL) "
         "ORDER BY ms_drift_at DESC",
+        since_iso,
+    )
+    transition_blocked = await adb_core.fetch(
+        "SELECT id, agent_name, full_name, status, ms_transition_blocked_at FROM orders "
+        "WHERE ms_transition_blocked_at IS NOT NULL AND ms_transition_blocked_at >= $1 "
+        "AND (deleted_at IS NULL) ORDER BY ms_transition_blocked_at DESC",
         since_iso,
     )
     deleted = await adb_core.fetch(
@@ -4096,7 +4127,12 @@ async def get_ms_sync_anomalies(since_iso: str) -> dict[str, list[dict]]:
         "AND (deleted_at IS NULL) ORDER BY ms_demand_failed_at DESC",
         since_iso,
     )
-    return {"drift": list(drift), "deleted": list(deleted), "demand_failed": list(demand_failed)}
+    return {
+        "drift": list(drift),
+        "deleted": list(deleted),
+        "demand_failed": list(demand_failed),
+        "transition_blocked": list(transition_blocked),
+    }
 
 
 def clear_order_ms_customerorder_id(order_id: int) -> bool:
