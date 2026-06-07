@@ -6,7 +6,7 @@ import helpers from '../helpers.js';
 
 const {
   escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml,
-  parsePaymentItems, renderMoneyTotalsHtml,
+  parsePaymentItems, renderMoneyTotalsHtml, financeTabs,
 } = helpers;
 
 describe('escapeHtml', () => {
@@ -213,5 +213,36 @@ describe('renderMoneyTotalsHtml', () => {
   it('без base_total — баннера итога нет', () => {
     const html = renderMoneyTotalsHtml({ payments: [{ currency: 'USD', total_cents: 100, count: 1 }], deposits: { count: 0 } });
     expect(html).not.toContain('money-total');
+  });
+});
+
+describe('financeTabs', () => {
+  const keys = (f) => financeTabs(f).map(t => t.key);
+  it('boss: 4 вкладки, без overview/my', () => {
+    const t = financeTabs({ isBoss: true, isConfirmer: true, hasOps: true, canDeposit: false });
+    expect(t.map(x => x.key)).toEqual(['confirm', 'debts', 'ops', 'limits']);
+    expect(t.find(x => x.key === 'ops').label).toBe('Платежи и сдачи');
+  });
+  it('bookkeeper (confirmer, не босс): confirm/debts/ops', () => {
+    expect(keys({ isBoss: false, isConfirmer: true, hasOps: true, canDeposit: false }))
+      .toEqual(['confirm', 'debts', 'ops']);
+  });
+  it('manager (не confirmer): только debts/ops', () => {
+    expect(keys({ isBoss: false, isConfirmer: false, hasOps: true, canDeposit: true }))
+      .toEqual(['debts', 'ops']);
+  });
+  it('любая роль — не больше 4 вкладок и без overview/my (страховка от переноса)', () => {
+    const roles = [
+      { isBoss: true, isConfirmer: true, hasOps: true, canDeposit: false },
+      { isBoss: false, isConfirmer: true, hasOps: true, canDeposit: true },
+      { isBoss: false, isConfirmer: false, hasOps: true, canDeposit: true },
+      { isBoss: false, isConfirmer: false, hasOps: false, canDeposit: false },
+    ];
+    for (const r of roles) {
+      const k = keys(r);
+      expect(k.length).toBeLessThanOrEqual(4);
+      expect(k).not.toContain('overview');
+      expect(k).not.toContain('my');
+    }
   });
 });

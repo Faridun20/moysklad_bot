@@ -143,6 +143,19 @@
     return { items };
   }
 
+  // Набор вкладок раздела «Финансы» по роли — чистая функция (тестируется).
+  // Плоская навигация: ≤4 вкладки на любую роль, чтобы ряд не переносился.
+  // «Обзор» переехал в Аналитику→Деньги; «Мои сдачи» свёрнуты в «Платежи и сдачи».
+  function financeTabs(f) {
+    f = f || {};
+    const tabs = [];
+    if (f.isConfirmer) tabs.push({ key: 'confirm', label: 'Подтверждения' });
+    tabs.push({ key: 'debts', label: 'Долги' });
+    if (f.hasOps) tabs.push({ key: 'ops', label: 'Платежи и сдачи' });
+    if (f.isBoss) tabs.push({ key: 'limits', label: 'Лимиты' });
+    return tabs;
+  }
+
   // Рендер блока «Итоги» раздела «Деньги» (данные /api/money/summary):
   // подтверждённые платежи по валютам + сдачи наличных. Чистая функция.
   function renderMoneyTotalsHtml(summary) {
@@ -188,6 +201,6 @@
 
   return {
     escapeHtml, idemKey, formatDateRU, icon, opsAmount,
-    renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml,
+    renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml, financeTabs,
   };
 });

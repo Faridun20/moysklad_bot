@@ -1519,6 +1519,9 @@ body {
 }
 .subseg-item .ic { --ic-size: 16px; }
 .subseg-item.active { color: var(--accent); border-bottom-color: var(--accent); }
+/* .subseg как top-level навигация Финансов: комфортный тач-таргет + бейдж счётчика. */
+.subseg-item { min-height: 44px; }
+.subseg-item .stock-badge { margin-left: 6px; }
 
 /* Итог поступлений в базовой валюте (вкладка «Обзор» раздела «Деньги»). */
 .money-total {
