@@ -80,14 +80,16 @@ function baseCur() { return (currentUser && currentUser.base_currency) || 'USD';
 // запятую и пробелы-разделители тысяч перед разбором (как parsePaymentItems).
 function parseNum(v) { return parseFloat(String(v == null ? '' : v).replace(/\s/g, '').replace(',', '.')); }
 
+// Роль-бейдж и так визуально выделен (.role-badge) — эмодзи убраны ради единого
+// стиля (иконографика — только SVG-спрайт).
 const ROLE_NAMES = {
-  admin: '👑 Админ',
-  boss: '🏆 Руководитель',
-  manager: '💼 Менеджер',
-  warehouse_keeper: '📦 Кладовщик',
-  bookkeeper: '🧮 Бухгалтер',
-  employee: '👤 Сотрудник',
-  guest: '🔒 Гость',
+  admin: 'Админ',
+  boss: 'Руководитель',
+  manager: 'Менеджер',
+  warehouse_keeper: 'Кладовщик',
+  bookkeeper: 'Бухгалтер',
+  employee: 'Сотрудник',
+  guest: 'Гость',
 };
 
 // Экран «нет прав»: новый/деактивированный юзер (роль guest — нулевые права).
@@ -445,7 +447,7 @@ async function renderHome() {
         <div class="card-list">
           ${attItems.map(x => `
             <div class="card-row" data-att="${x.go}" role="button" tabindex="0">
-              <div class="card-row-icon" style="background:var(--warn-bg); color:var(--warn);">${icon(x.ic)}</div>
+              <div class="card-row-icon card-row-icon--warn">${icon(x.ic)}</div>
               <div class="card-row-info"><div class="card-row-title">${x.label}</div></div>
               <span class="stock-badge badge-yellow">${x.n}</span>
             </div>
@@ -469,13 +471,12 @@ async function renderHome() {
     `;
     const topEmp = data.top_employees || [];
     if (topEmp.length > 0) {
-      const medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'];
       bossBlock += `
         <div class="section-label">Топ сотрудники · неделя</div>
         <div class="card-list">
           ${topEmp.map((e, i) => `
-            <div class="card-row" style="cursor:default;">
-              <div class="card-row-icon">${medals[i] || ''}</div>
+            <div class="card-row card-row--static">
+              <div class="card-row-icon rank-chip">${i + 1}</div>
               <div class="card-row-info">
                 <div class="card-row-title">${escapeHtml(e.name)}</div>
                 <div class="card-row-sub">${e.count} отгрузок</div>
@@ -1319,7 +1320,7 @@ function renderOrdersMain() {
         <div class="order-meta">
           <span>${icon('box')} ${o.items_count} тов.</span>
           <span>${(o.created_at || '').slice(11, 16)}</span>
-          ${o.total > 0 ? `<span class="order-total">💰 ${Math.round(o.total).toLocaleString('ru-RU')}</span>` : ''}
+          ${o.total > 0 ? `<span class="order-total">${icon('cash')} ${Math.round(o.total).toLocaleString('ru-RU')}</span>` : ''}
         </div>
         ${(() => {
           // UX: тип оплаты / срок / статус оплаты / заморозка / причина возврата —
@@ -1327,13 +1328,13 @@ function renderOrdersMain() {
           const bits = [];
           if (o.payment_type === 'credit') {
             const due = o.due_date ? ' до ' + String(o.due_date).split('-').reverse().join('.') : '';
-            bits.push(`<span class="order-pay order-pay--credit">💳 В долг${due}</span>`);
+            bits.push(`<span class="order-pay order-pay--credit">${icon('card')} В долг${due}</span>`);
           } else {
-            bits.push(`<span class="order-pay">💵 Оплата сразу</span>`);
+            bits.push(`<span class="order-pay">${icon('cash')} Оплата сразу</span>`);
           }
           if (o.paid_confirmed_at) bits.push(`<span class="order-pay order-pay--ok">${icon('check')} Оплачен</span>`);
           else if (o.paid_at) bits.push(`<span class="order-pay order-pay--wait">${icon('clock')} На подтверждении</span>`);
-          if (o.frozen) bits.push(`<span class="order-pay order-pay--bad">🧊 Заморожен</span>`);
+          if (o.frozen) bits.push(`<span class="order-pay order-pay--bad">${icon('snow')} Заморожен</span>`);
           if (o.status === 'draft' && o.rejection_comment)
             bits.push(`<span class="order-pay order-pay--bad">${icon('return')} ${escapeHtml(o.rejection_comment)}</span>`);
           return bits.length ? `<div class="order-pay-row">${bits.join('')}</div>` : '';
@@ -1567,9 +1568,9 @@ function renderOrderEditor() {
           </div>
         `;
       }).join('') + (grandTotal > 0 ? `
-        <div class="editor-item" style="background: var(--tg-theme-secondary-bg-color, #f5f5f5); font-weight: 600;">
+        <div class="editor-item editor-item--total">
           <div class="editor-item-info">
-            <div class="editor-item-name">💰 Итого</div>
+            <div class="editor-item-name">${icon('cash')} Итого</div>
           </div>
           <div>${Math.round(grandTotal).toLocaleString('ru-RU')}</div>
         </div>
@@ -1583,8 +1584,8 @@ function renderOrderEditor() {
     <div class="section-label">Клиент</div>
     <div class="agent-selector" id="agent-selector">
       ${order.agent_name
-        ? `<div class="agent-selected">🏢 ${order.agent_name} <button id="change-agent">Изменить</button></div>`
-        : `<button class="btn-agent" id="choose-agent">👤 Выбрать клиента</button>`
+        ? `<div class="agent-selected">${icon('building')} ${order.agent_name} <button id="change-agent">Изменить</button></div>`
+        : `<button class="btn-agent" id="choose-agent">${icon('user')} Выбрать клиента</button>`
       }
     </div>
 
@@ -1597,12 +1598,12 @@ function renderOrderEditor() {
       <label class="payment-option">
         <input type="radio" name="payment_type" value="paid"
           ${(currentDraftOrder.payment_type || 'paid') === 'paid' ? 'checked' : ''}>
-        <span>💵 Оплачено сразу</span>
+        <span>${icon('cash')} Оплачено сразу</span>
       </label>
       <label class="payment-option">
         <input type="radio" name="payment_type" value="credit"
           ${currentDraftOrder.payment_type === 'credit' ? 'checked' : ''}>
-        <span>💳 В долг</span>
+        <span>${icon('card')} В долг</span>
       </label>
     </div>
     <div class="due-date-wrap ${currentDraftOrder.payment_type === 'credit' ? '' : 'hidden'}" id="due-date-wrap">
@@ -1707,7 +1708,7 @@ async function loadAgents(search) {
     }
     list.innerHTML = data.agents.map(a => `
       <div class="agent-row" data-id="${a.id}" data-name="${escapeHtml(a.name || '')}" role="button" tabindex="0">
-        <div class="agent-name">👤 ${escapeHtml(a.name || '')}</div>
+        <div class="agent-name">${icon('user')} ${escapeHtml(a.name || '')}</div>
         ${a.phone ? `<div class="agent-phone">${escapeHtml(a.phone)}</div>` : ''}
       </div>
     `).join('');
@@ -2076,28 +2077,28 @@ async function renderPendingRequests() {
         <div class="order-header">
           <div>
             <div class="order-title">${icon('clock')} Заявка #${r.id}</div>
-            <div class="order-manager">👤 ${r.full_name}</div>
+            <div class="order-manager">${icon('user')} ${r.full_name}</div>
           </div>
           <span class="order-status status-pending">Ожидает</span>
         </div>
-        ${r.agent_name ? `<div class="order-agent">🏢 ${r.agent_name}</div>` : ''}
+        ${r.agent_name ? `<div class="order-agent">${icon('building')} ${r.agent_name}</div>` : ''}
         <div class="order-meta"><span>${r.created_at}</span></div>
         ${(() => {
           const bits = [];
           if (r.payment_type === 'credit') {
             const due = r.due_date ? ' до ' + String(r.due_date).split('-').reverse().join('.') : '';
-            bits.push(`<span class="order-pay order-pay--credit">💳 В долг${due}</span>`);
+            bits.push(`<span class="order-pay order-pay--credit">${icon('card')} В долг${due}</span>`);
           } else {
-            bits.push(`<span class="order-pay">💵 Оплата сразу</span>`);
+            bits.push(`<span class="order-pay">${icon('cash')} Оплата сразу</span>`);
           }
-          if (r.total > 0) bits.push(`<span class="order-pay">💰 ${Math.round(r.total).toLocaleString('ru-RU')}</span>`);
+          if (r.total > 0) bits.push(`<span class="order-pay">${icon('cash')} ${Math.round(r.total).toLocaleString('ru-RU')}</span>`);
           return `<div class="order-pay-row">${bits.join('')}</div>`;
         })()}
         ${r.credit ? `
           <div class="credit-ctx ${r.credit.over_limit ? 'credit-ctx--bad' : 'credit-ctx--ok'}">
-            📊 Кредит клиента: долг с учётом заявки <b>${fmt(r.credit.effective_debt)}</b>
+            ${icon('chart')} Кредит клиента: долг с учётом заявки <b>${fmt(r.credit.effective_debt)}</b>
             / лимит <b>${fmt(r.credit.limit)}</b>
-            ${r.credit.over_limit ? '🔴 превышение' : '🟢 в пределах'}
+            ${r.credit.over_limit ? `${icon('alert')} превышение` : `${icon('check')} в пределах`}
           </div>` : ''}
         <div class="order-items">
           ${r.items.slice(0, 5).map(it =>
@@ -2256,7 +2257,7 @@ function renderAnalyticsContent(data) {
   const fmt = n => Math.round(n).toLocaleString('ru-RU');
   const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
 
-  const trendIcon = data.trend > 0 ? '📈' : data.trend < 0 ? '📉' : '➡️';
+  const trendIcon = data.trend > 0 ? icon('trend-up') : data.trend < 0 ? icon('trend-down') : '';
   const trendClass = data.trend > 0 ? 'trend-up' : data.trend < 0 ? 'trend-dn' : '';
   const trendStr = data.trend !== 0 ? `${trendIcon} ${data.trend > 0 ? '+' : ''}${data.trend}%` : '';
 
@@ -2269,7 +2270,6 @@ function renderAnalyticsContent(data) {
     </div>
   `).join('');
 
-  const medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'];
   const topItems = data.top_products.length === 0
     ? '<div class="loader">Нет данных</div>'
     : data.top_products.map((p, i) => {
@@ -2278,7 +2278,7 @@ function renderAnalyticsContent(data) {
           ? ` · <span class="top-profit">прибыль ${fmt(p.profit)} $</span>` : '';
         return `
           <div class="top-row">
-            <span class="top-medal">${medals[i] || (i + 1)}</span>
+            <span class="top-medal rank-chip">${i + 1}</span>
             <div class="top-info">
               <div class="top-name">${escapeHtml(p.name)}</div>
               <div class="top-sub">${fmt(p.qty)} шт · ${fmt(p.sum)} $${profitStr}</div>
@@ -2290,7 +2290,7 @@ function renderAnalyticsContent(data) {
   // PR D: топ клиентов / менеджеров (company-scope, boss/admin).
   const clientItems = (data.top_clients || []).map((c, i) => `
     <div class="top-row">
-      <span class="top-medal">${medals[i] || (i + 1)}</span>
+      <span class="top-medal rank-chip">${i + 1}</span>
       <div class="top-info">
         <div class="top-name">${escapeHtml(c.name)}</div>
         <div class="top-sub">${fmt(c.revenue)} $ · ${c.count} отгр.</div>
@@ -2298,7 +2298,7 @@ function renderAnalyticsContent(data) {
     </div>`).join('');
   const managerItems = (data.top_managers || []).map((m, i) => `
     <div class="top-row">
-      <span class="top-medal">${medals[i] || (i + 1)}</span>
+      <span class="top-medal rank-chip">${i + 1}</span>
       <div class="top-info">
         <div class="top-name">${escapeHtml(m.name)}</div>
         <div class="top-sub">${fmt(m.revenue)} $ · ${m.count} отгр.${m.orders != null ? ` · ${m.orders} зак.` : ''}${m.debt ? ` · долг ${fmt(m.debt)} $` : ''}</div>
@@ -2310,7 +2310,7 @@ function renderAnalyticsContent(data) {
     ? `<div class="section-label">Топ менеджеров</div><div class="card">${managerItems}</div>` : '';
   // Кнопка Excel — только company-scope (boss/admin).
   const exportBlock = data.scope === 'company'
-    ? `<button class="btn-primary" id="analytics-export" style="margin-top:12px">📊 Выгрузить Excel</button>` : '';
+    ? `<button class="btn-primary" id="analytics-export" style="margin-top:12px">${icon('chart')} Выгрузить Excel</button>` : '';
 
   content.innerHTML = `
     ${analyticsHeaderHtml(isBoss)}
@@ -2360,7 +2360,7 @@ function renderAnalyticsContent(data) {
         tg.showAlert && tg.showAlert('Excel-файл отправлен в чат с ботом');
       } catch (e) {
         exportBtn.disabled = false;
-        exportBtn.textContent = '📊 Выгрузить Excel';
+        exportBtn.textContent = 'Выгрузить Excel';
         tg.showAlert ? tg.showAlert(e.message) : alert(e.message);
       }
     });
@@ -2596,7 +2596,7 @@ async function renderCashbox(container, section) {
     return `
       <div class="debt-card" data-dep="${d.id}">
         <div class="debt-card-top">
-          <div class="debt-agent">💵 Сдача #${d.id}</div>
+          <div class="debt-agent">${icon('cash')} Сдача #${d.id}</div>
           <div class="debt-amount">${fmt(d.amount)} ${baseCur()}</div>
         </div>
         <div class="debt-card-mid"><span class="debt-meta">Заказы: ${escapeHtml(orders)}</span></div>
@@ -2632,7 +2632,7 @@ async function renderCashbox(container, section) {
   const payCards = payPending.map(d => `
       <div class="debt-card debt-awaiting" data-pay="${d.order_id}">
         <div class="debt-card-top">
-          <div class="debt-agent">🏢 ${escapeHtml(d.agent_name || '—')}</div>
+          <div class="debt-agent">${icon('building')} ${escapeHtml(d.agent_name || '—')}</div>
           <div class="debt-amount">${fmt(d.pending)} ${escapeHtml(d.currency || 'USD')}</div>
         </div>
         <div class="debt-card-mid">
@@ -2649,7 +2649,7 @@ async function renderCashbox(container, section) {
     ? `<div class="section-label section-awaiting">${icon('clock')} Оплаты на подтверждении (${payPending.length})</div><div class="debts-list">${payCards}</div>`
     : '';
   const depBlock = deposits.length
-    ? `<div class="section-label">💵 Сдачи на подтверждении (${deposits.length})</div><div class="debts-list">${depCards}</div>`
+    ? `<div class="section-label">${icon('cash')} Сдачи на подтверждении (${deposits.length})</div><div class="debts-list">${depCards}</div>`
     : '';
   const retBlock = returns.length
     ? `<div class="section-label">${icon('return')} Возвраты на подтверждении (${returns.length})</div><div class="debts-list">${retCards}</div>`
@@ -2674,11 +2674,11 @@ async function renderCashbox(container, section) {
         <div class="debt-hint">Распределится по вашим открытым заказам автоматически.</div>
       </div>
     `;
-    const stEmoji = { pending: '⏳', confirmed: '✅', rejected: '❌' };
+    const stIcon = { pending: 'clock', confirmed: 'check', rejected: 'close' };
     const rows = myDeposits.map(d => `
       <div class="stock-row">
         <div class="stock-info">
-          <div class="stock-name">${stEmoji[d.status] || '•'} #${d.id} — ${fmt(d.amount)} ${baseCur()}</div>
+          <div class="stock-name">${icon(stIcon[d.status] || 'cash')} #${d.id} — ${fmt(d.amount)} ${baseCur()}</div>
           <div class="stock-folder">${(d.created_at || '').slice(0, 16)}${d.status === 'rejected' && d.reject_reason ? ' · ' + escapeHtml(d.reject_reason) : ''}</div>
         </div>
       </div>
@@ -2732,9 +2732,9 @@ async function renderCashbox(container, section) {
         <div class="form-row">
           <label class="form-label">Возврат денег</label>
           <div class="cur-row">
-            <button class="cur-btn active" data-refund="debt_reduction" aria-pressed="true">📉 В счёт долга</button>
-            <button class="cur-btn" data-refund="cash" aria-pressed="false">💵 Наличными</button>
-            <button class="cur-btn" data-refund="no_refund" aria-pressed="false">🚫 Без возврата</button>
+            <button class="cur-btn active" data-refund="debt_reduction" aria-pressed="true">${icon('trend-down')} В счёт долга</button>
+            <button class="cur-btn" data-refund="cash" aria-pressed="false">${icon('cash')} Наличными</button>
+            <button class="cur-btn" data-refund="no_refund" aria-pressed="false">${icon('ban')} Без возврата</button>
           </div>
         </div>
         <button id="ret-create" class="btn-primary">${icon('return')} Оформить полный возврат</button>
@@ -2957,7 +2957,7 @@ async function renderClients(container) {
   const cards = clients.map(c => `
       <div class="debt-card" data-agent="${escapeHtml(c.agent_id)}" role="button" tabindex="0">
         <div class="debt-card-top">
-          <div class="debt-agent">🏢 ${escapeHtml(c.agent_name)}</div>
+          <div class="debt-agent">${icon('building')} ${escapeHtml(c.agent_name)}</div>
           ${c.over_limit ? '<span class="stock-badge badge-red">лимит превышен</span>' : ''}
         </div>
         <div class="debt-card-mid">
@@ -3033,8 +3033,8 @@ async function renderAgentDetail(agentId) {
       </div>` : '';
 
   content.innerHTML = `
-    <div class="editor-header"><div class="editor-title">🏢 ${escapeHtml(d.name || '—')}</div></div>
-    ${d.phone ? `<div class="debt-meta" style="padding:0 2px 8px;">📞 ${escapeHtml(d.phone)}</div>` : ''}
+    <div class="editor-header"><div class="editor-title">${icon('building')} ${escapeHtml(d.name || '—')}</div></div>
+    ${d.phone ? `<div class="debt-meta" style="padding:0 2px 8px;">${icon('phone')} ${escapeHtml(d.phone)}</div>` : ''}
     <div class="card">
       <div class="agent-bal">${balLine}</div>
       <div class="debt-meta">Долг по заказам бота: <b>${fmt(d.debt)} ${escapeHtml(baseC)}</b> · лимит ${fmt(d.limit)} · свободно ${fmt(d.free)}</div>
@@ -3125,7 +3125,7 @@ async function renderDebts(container) {
     if (totalEmpty) {
       html += `
         <div class="finance-empty">
-          <div class="finance-empty-icon">💳</div>
+          <div class="finance-empty-icon">${icon('card')}</div>
           <div class="finance-empty-title">Долгов и платежей пока нет</div>
           <div class="finance-empty-hint">
             Когда менеджер оформит заказ «в долг» — он появится здесь.
@@ -3138,11 +3138,11 @@ async function renderDebts(container) {
       html += `
         <div class="money-summary">
           <div class="money-block money-received ${receivedItems.length === 0 ? 'money-empty' : ''}">
-            <div class="money-label">💵 Получено</div>
+            <div class="money-label">${icon('cash')} Получено</div>
             <div class="money-value">${receivedRows || '<span class="money-placeholder">пока пусто</span>'}</div>
           </div>
           <div class="money-block money-pending ${pendingItems.length === 0 ? 'money-empty' : ''}">
-            <div class="money-label">⏳ Ждёт подтверждения</div>
+            <div class="money-label">${icon('clock')} Ждёт подтверждения</div>
             <div class="money-value">${pendingRows || '<span class="money-placeholder">пусто</span>'}</div>
           </div>
         </div>
@@ -3151,7 +3151,7 @@ async function renderDebts(container) {
       if (data.remaining_base_total != null) {
         const partial = data.remaining_base_partial
           ? ' <span class="money-placeholder">(часть без курса)</span>' : '';
-        html += `<div class="money-base-total">💰 Осталось получить: ≈ <b>${fmt(data.remaining_base_total)} ${escapeHtml(data.base_currency || 'USD')}</b>${partial}</div>`;
+        html += `<div class="money-base-total">${icon('cash')} Осталось получить: ≈ <b>${fmt(data.remaining_base_total)} ${escapeHtml(data.base_currency || 'USD')}</b>${partial}</div>`;
       }
       // Stat-плитки показываем только если хоть один счётчик не ноль,
       // иначе три «0 0 0» лишь засоряют экран.
@@ -3190,15 +3190,15 @@ async function renderDebts(container) {
           // Покажем разбиение: оплачено / в подтверждении / остаток
           const breakdown = `
             <div class="debt-breakdown">
-              ${d.confirmed > 0 ? `<span>✅ Подтверждено: <b>${fmt(d.confirmed)}</b></span>` : ''}
-              <span>⏳ Ждёт: <b>${fmt(d.pending)}</b></span>
-              ${d.remaining > 0 ? `<span>📎 Останется: <b>${fmt(d.remaining - d.pending > 0 ? d.remaining - d.pending : 0)}</b></span>` : ''}
+              ${d.confirmed > 0 ? `<span>${icon('check')} Подтверждено: <b>${fmt(d.confirmed)}</b></span>` : ''}
+              <span>${icon('clock')} Ждёт: <b>${fmt(d.pending)}</b></span>
+              ${d.remaining > 0 ? `<span>Останется: <b>${fmt(d.remaining - d.pending > 0 ? d.remaining - d.pending : 0)}</b></span>` : ''}
             </div>
           `;
           return `
             <div class="debt-card debt-awaiting">
               <div class="debt-card-top">
-                <div class="debt-agent">🏢 ${escapeHtml(d.agent_name)}</div>
+                <div class="debt-agent">${icon('building')} ${escapeHtml(d.agent_name)}</div>
                 <div class="debt-amount">${fmt(d.total)} ${escapeHtml(d.currency)}</div>
               </div>
               ${breakdown}
@@ -3224,25 +3224,25 @@ async function renderDebts(container) {
       // Долгов нет, но есть деньги получено/ожидается — отдельно скажем
       html += '<div class="empty">Открытых долгов нет — все деньги собраны 🎉</div>';
     } else if (open.length > 0) {
-      html += `<div class="section-label">💳 Открытые (${open.length})</div>`;
+      html += `<div class="section-label">${icon('card')} Открытые (${open.length})</div>`;
       html += '<div class="debts-list">' + open.map(d => {
         const stateClass = `debt-${d.state}`;
-        const stateLabel = d.state === 'partial' ? '🟡 Частично оплачен'
-          : d.state === 'overdue' ? '⚠️ Просрочен'
-          : d.state === 'due_today' ? '⏰ Сегодня' : '📅 Срок';
+        const stateLabel = d.state === 'partial' ? `${icon('info')} Частично оплачен`
+          : d.state === 'overdue' ? `${icon('alert')} Просрочен`
+          : d.state === 'due_today' ? `${icon('clock')} Сегодня` : `${icon('calendar')} Срок`;
         const dueStr = d.due_date ? formatDateRU(d.due_date) : '—';
         const ownerStr = d.is_mine ? '' : ` <span class="debt-owner">· ${escapeHtml(d.full_name)}</span>`;
         // Для partial показываем сколько уже получено и остаток
         const breakdown = d.confirmed > 0 ? `
           <div class="debt-breakdown">
-            <span>✅ Оплачено: <b>${fmt(d.confirmed)}</b></span>
-            <span>📎 Остаток: <b>${fmt(d.remaining)}</b> ${escapeHtml(d.currency)}</span>
+            <span>${icon('check')} Оплачено: <b>${fmt(d.confirmed)}</b></span>
+            <span>Остаток: <b>${fmt(d.remaining)}</b> ${escapeHtml(d.currency)}</span>
           </div>
         ` : '';
         return `
           <div class="debt-card ${stateClass}">
             <div class="debt-card-top">
-              <div class="debt-agent">🏢 ${escapeHtml(d.agent_name)}</div>
+              <div class="debt-agent">${icon('building')} ${escapeHtml(d.agent_name)}</div>
               <div class="debt-amount">${fmt(d.total)} ${escapeHtml(d.currency)}</div>
             </div>
             ${breakdown}

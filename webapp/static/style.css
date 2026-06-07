@@ -483,6 +483,21 @@ body {
   font-size: 18px;
   flex-shrink: 0;
 }
+/* Информационная строка без перехода (топ-сотрудники) — заменяет inline cursor. */
+.card-row--static { cursor: default; }
+/* Иконка-кружок с предупреждающим тоном (блок «Требует внимания» на главной). */
+.card-row-icon--warn { background: var(--warn-bg); color: var(--warn); }
+/* SVG-иконки внутри кружка card-row-icon (были эмодзи 18px). */
+.card-row-icon .ic { --ic-size: 20px; }
+/* Числовой ранг-чип (заменил медали-эмодзи 🥇🥈🥉): монохромно, единый стиль. */
+.rank-chip {
+  font-size: 14px; font-weight: 700; color: var(--accent);
+  background: var(--bg-soft); border-radius: 50%;
+}
+.top-medal.rank-chip {
+  width: 26px; height: 26px; display: inline-flex;
+  align-items: center; justify-content: center;
+}
 
 .card-row-info {
   flex: 1;
@@ -1157,6 +1172,9 @@ body {
   box-shadow: var(--shadow-card);
 }
 
+/* Строка «Итого» в редакторе — выделена мягкой заливкой (заменяет inline-стиль
+   с хардкод-фоллбэком #f5f5f5, ломавшимся на светлой теме в браузере). */
+.editor-item--total { background: var(--bg-soft); font-weight: 600; }
 .editor-item-info { flex: 1; }
 .editor-item-name { font-size: 14px; font-weight: 500; }
 .editor-item-qty  { font-size: 12px; color: var(--text-mute); margin-top: 2px; }
@@ -1414,10 +1432,11 @@ body {
   border-radius: 16px;
 }
 .finance-empty-icon {
-  font-size: 48px;
   margin-bottom: 12px;
-  opacity: 0.7;
+  opacity: 0.45;
+  color: var(--text-mute);
 }
+.finance-empty-icon .ic { --ic-size: 44px; }
 .finance-empty-title {
   font-size: 17px;
   font-weight: 600;

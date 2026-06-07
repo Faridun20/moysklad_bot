@@ -62,9 +62,9 @@
         `<div class="card-list">${rowsHtml}</div>`
       );
     };
-    const row = (title, sub) =>
-      `<div class="card-row" style="cursor:default;">` +
-      `<div class="card-row-info"><div class="card-row-title">${escapeHtml(title)}</div>` +
+    const row = (title, sub, ic) =>
+      `<div class="card-row card-row--static">` +
+      `<div class="card-row-info"><div class="card-row-title">${ic ? icon(ic) + ' ' : ''}${escapeHtml(title)}</div>` +
       (sub ? `<div class="card-row-sub">${escapeHtml(sub)}</div>` : '') +
       `</div></div>`;
 
@@ -112,16 +112,15 @@
     if (msTotal > 0) {
       const items = ms.items || {};
       const rows = []
-        .concat((items.demand_failed || []).map(o => row(`📦 Отгрузка не создана · #${o.id}`, o.agent_name)))
-        .concat((items.transition_blocked || []).map(o => row(`⛔ Статус застрял · #${o.id}`, `${o.agent_name} · ${o.status}`)))
-        .concat((items.drift || []).map(o => row(`✏️ Изменён в МС · #${o.id}`, o.agent_name)))
-        .concat((items.deleted || []).map(o => row(`🗑 Удалён в МС · #${o.id}`, `${o.agent_name} · ${o.status}`)));
+        .concat((items.demand_failed || []).map(o => row(`Отгрузка не создана · #${o.id}`, o.agent_name, 'box')))
+        .concat((items.transition_blocked || []).map(o => row(`Статус застрял · #${o.id}`, `${o.agent_name} · ${o.status}`, 'ban')))
+        .concat((items.drift || []).map(o => row(`Изменён в МС · #${o.id}`, o.agent_name, 'edit')))
+        .concat((items.deleted || []).map(o => row(`Удалён в МС · #${o.id}`, `${o.agent_name} · ${o.status}`, 'trash')));
       section('Рассинхрон с МойСклад', msTotal, rows.join(''));
     }
 
     if (!blocks.length) {
-      return '<div style="padding:32px 16px;text-align:center;color:var(--muted);">' +
-        '✅ Всё спокойно — нет требующих внимания позиций.</div>';
+      return `<div class="loader">${icon('check')} Всё спокойно — нет требующих внимания позиций.</div>`;
     }
     return blocks.join('');
   }
