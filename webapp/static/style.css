@@ -29,11 +29,17 @@
   --accent:     var(--tg-theme-button-color, #007aff);
   --accent-fg:  var(--tg-theme-button-text-color, #ffffff);
   --divider:    rgba(0, 0, 0, 0.08);
-  --radius-sm:  10px;
-  --radius:     16px;
+  --radius-sm:  10px;   /* компактные контролы, инпуты, кнопки-в-ряд */
+  --radius:     16px;   /* карточки */
   --radius-lg:  20px;
+  --radius-chip: 12px;  /* бейджи/чипы */
+  --radius-pill: 999px; /* пилюли, role-badge */
   --disabled-opacity: 0.5;   /* единое затемнение disabled (было вперемешку 0.4/0.5) */
-  --shadow-card: 0 1px 2px rgba(0,0,0,0.04);
+  /* Шкала теней (одна на всё): карточка / плавающее / модалка. */
+  --shadow-card:  0 1px 2px rgba(0,0,0,0.04);
+  --shadow-float: 0 4px 20px rgba(0,0,0,0.10), 0 1px 3px rgba(0,0,0,0.05);
+  --shadow-modal: 0 8px 40px rgba(0,0,0,0.22);
+  --fill-neutral: rgba(127,127,127,0.12);  /* нейтральная заливка, ок на обеих темах */
 
   /* Семантические цвета (статусы, бейджи, деньги, тренды).
      Светлые значения = прежние hex; тёмные варианты — в блоке
@@ -230,7 +236,7 @@ body {
 }
 
 .topbar--shadow {
-  box-shadow: 0 2px 12px rgba(0,0,0,0.1);
+  box-shadow: var(--shadow-float);
   border-bottom-color: transparent;
 }
 
@@ -323,7 +329,7 @@ body {
   border-radius: var(--radius-lg);
   padding: 24px 20px 20px;
   margin-bottom: 8px;
-  box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+  box-shadow: var(--shadow-float);
   text-align: center;
 }
 
@@ -417,29 +423,20 @@ body {
 }
 .action-btn-icon .ic { --ic-size: 22px; vertical-align: 0; }
 
-/* ─── Цветные иконки быстрых действий ──────────────────────
-   Светлые hex + dark-варианты ниже: на тёмной теме исходные тёмные
-   foreground'ы (#e65100 и т.п.) на полупрозрачной подложке давали низкий
-   контраст. Брайтим до читаемых оттенков (как сделано для семантики). */
-.icon-orange { background: rgba(230,81,0,0.12);   color: #e65100; }
-.icon-blue   { background: rgba(33,150,243,0.12);  color: #1976d2; }
-.icon-purple { background: rgba(156,39,176,0.12);  color: #7b1fa2; }
-.icon-green  { background: rgba(76,175,80,0.12);   color: #2e7d32; }
-.icon-amber  { background: rgba(255,152,0,0.12);   color: #e65100; }
-
-[data-theme="dark"] .icon-orange { background: rgba(230,81,0,0.22);   color: #ff9e57; }
-[data-theme="dark"] .icon-blue   { background: rgba(33,150,243,0.22);  color: #5aa9f0; }
-[data-theme="dark"] .icon-purple { background: rgba(156,39,176,0.26);  color: #cf94de; }
-[data-theme="dark"] .icon-green  { background: rgba(76,175,80,0.22);   color: #4ade80; }
-[data-theme="dark"] .icon-amber  { background: rgba(255,152,0,0.22);   color: #ffb74d; }
+/* ─── Иконки быстрых действий ──────────────────────────────
+   Единый вид: акцент на мягкой подложке (как все иконки приложения). Цвет=смысл
+   оставляем только СТАТУСАМ (ниже). Раньше было 5 разных хардкод-палитр. */
+.icon-orange, .icon-blue, .icon-purple, .icon-green, .icon-amber {
+  background: var(--bg-soft); color: var(--accent);
+}
 
 /* ─── Иконки статуса заказов ──────────────────────────────
    color → стрелка SVG (currentColor) красится семантикой; переменные
    --warn-strong/--success/--danger/--info уже имеют dark-варианты. */
-.icon-pending  { background: rgba(249,168,37,0.15); color: var(--warn-strong); }
-.icon-approved { background: rgba(46,125,50,0.12);  color: var(--success); }
-.icon-rejected { background: rgba(160,35,35,0.12);  color: var(--danger); }
-.icon-shipped  { background: rgba(30,93,160,0.12);  color: var(--info); }
+.icon-pending  { background: var(--warn-bg);    color: var(--warn-strong); }
+.icon-approved { background: var(--success-bg); color: var(--success); }
+.icon-rejected { background: var(--danger-bg);  color: var(--danger); }
+.icon-shipped  { background: var(--info-bg);    color: var(--info); }
 
 /* ─── Цвета значений в стат-картах ──────────────────────── */
 .stat-value-green { color: var(--success); }
@@ -563,7 +560,7 @@ body {
   border: 1px solid var(--divider);
   border-radius: 24px;
   padding: 8px;
-  box-shadow: 0 4px 20px rgba(0,0,0,0.08), 0 1px 3px rgba(0,0,0,0.05);
+  box-shadow: var(--shadow-float);
 }
 
 .nav-item {
@@ -1034,7 +1031,7 @@ body {
 .order-pay {
   font-size: 11px; font-weight: 600;
   padding: 2px 8px; border-radius: 10px;
-  background: rgba(127,127,127,.12); color: var(--text-mute);
+  background: var(--fill-neutral); color: var(--text-mute);
   white-space: nowrap;
 }
 /* Семантические токены (а не хардкод hex) — иначе на тёмной теме тёмный
@@ -1264,7 +1261,7 @@ body {
 .payment-option {
   flex: 1; display: flex; align-items: center; gap: 8px;
   padding: 12px; border-radius: 12px;
-  background: var(--bg-card, #f5f5f5);
+  background: var(--bg-card);
   cursor: pointer; font-size: 15px;
 }
 .payment-option input { margin: 0; }
@@ -1276,7 +1273,7 @@ body {
   padding: 0 14px 12px;
 }
 .due-date-label {
-  display: block; font-size: 13px; color: var(--text-mute, #888); margin-bottom: 6px;
+  display: block; font-size: 13px; color: var(--text-mute); margin-bottom: 6px;
 }
 .due-date-input {
   width: 100%; padding: 12px; font-size: 15px;
@@ -1291,7 +1288,7 @@ body {
   color-scheme: light dark;
 }
 .due-date-input:focus {
-  border-color: var(--accent, #2481cc);
+  border-color: var(--accent);
 }
 
 /* ─── Экран «Долги» ──────────────────────────────────────────────── */
@@ -1306,8 +1303,8 @@ body {
 }
 .debts-tab {
   flex: 1; padding: 10px; border: 0; border-radius: 10px;
-  background: var(--bg-card, #f5f5f5);
-  color: var(--text, #000); font-size: 14px;
+  background: var(--bg-card);
+  color: var(--text); font-size: 14px;
   cursor: pointer;
 }
 .debts-tab.active {
@@ -1323,10 +1320,10 @@ body {
 .debt-stat {
   padding: 14px 8px;          /* чуть выше, чтобы цифры дышали */
   border-radius: 12px; text-align: center;
-  background: var(--bg-card, #f5f5f5);
+  background: var(--bg-card);
 }
 .debt-stat-num { font-size: 24px; font-weight: 700; line-height: 1.1; }
-.debt-stat-label { font-size: 12px; color: var(--text-mute, #888); margin: 6px 0 4px; }
+.debt-stat-label { font-size: 12px; color: var(--text-mute); margin: 6px 0 4px; }
 .debt-stat-sum { font-size: 14px; font-weight: 600; }
 .debt-stat-overdue .debt-stat-num { color: var(--danger); }
 .debt-stat-today .debt-stat-num   { color: var(--warn-strong); }
@@ -1336,8 +1333,8 @@ body {
   padding: 14px; display: flex; flex-direction: column; gap: 10px;
 }
 .debt-card {
-  padding: 14px; border-radius: 14px; border-left: 4px solid transparent;
-  background: var(--bg-card, #f5f5f5);
+  padding: 14px 16px; border-radius: var(--radius); border-left: 4px solid transparent;
+  background: var(--bg-card);
 }
 .debt-card.debt-overdue   { border-left-color: var(--danger); }
 .debt-card.debt-due_today { border-left-color: var(--warn-strong); }
@@ -1355,10 +1352,10 @@ body {
 }
 .debt-card-mid {
   display: flex; justify-content: space-between; align-items: center;
-  font-size: 13px; color: var(--text-mute, #888); margin-bottom: 10px;
+  font-size: 13px; color: var(--text-mute); margin-bottom: 10px;
   flex-wrap: wrap; gap: 6px;
 }
-.debt-state b { color: var(--text, #000); }
+.debt-state b { color: var(--text); }
 .debt-owner { opacity: 0.7; }
 .btn-mark-paid {
   width: 100%; padding: 10px; border: 0; border-radius: 10px;
@@ -1378,19 +1375,19 @@ body {
 /* Единый остаток к получению в базовой валюте (объединяет валюты). */
 .money-base-total {
   margin: 10px 14px 0; padding: 10px 14px;
-  border-radius: 12px; background: rgba(0,122,255,.10);
+  border-radius: var(--radius-chip); background: var(--info-bg);
   font-size: 14px; color: var(--text);
 }
 .money-block {
   padding: 14px;
   min-height: 92px;             /* выравниваем высоту даже если содержимое разной длины */
   display: flex; flex-direction: column; justify-content: space-between;
-  border-radius: 14px;
-  background: var(--bg-card, #f5f5f5);
+  border-radius: var(--radius);
+  background: var(--bg-card);
 }
 .money-label {
   font-size: 12px;
-  color: var(--text-mute, #888);
+  color: var(--text-mute);
   margin-bottom: 8px;
   white-space: nowrap;          /* не давать «подтверждения» уехать на 2 строку */
   overflow: hidden; text-overflow: ellipsis;
@@ -1404,16 +1401,16 @@ body {
 /* Бледный плейсхолдер для пустых сумм — вместо тонкой «—» */
 .money-placeholder {
   font-size: 13px; font-weight: 400; opacity: 0.55;
-  color: var(--text-mute, #888);
+  color: var(--text-mute);
 }
-.money-block.money-empty .money-value { color: var(--text-mute, #888); }
+.money-block.money-empty .money-value { color: var(--text-mute); }
 
 /* ─── Полностью пустое состояние финансов ──────────────────────── */
 .finance-empty {
   margin: 40px 20px;
   padding: 28px 20px;
   text-align: center;
-  background: var(--bg-card, #f5f5f5);
+  background: var(--bg-card);
   border-radius: 16px;
 }
 .finance-empty-icon {
@@ -1428,7 +1425,7 @@ body {
 }
 .finance-empty-hint {
   font-size: 14px;
-  color: var(--text-mute, #888);
+  color: var(--text-mute);
   line-height: 1.4;
   max-width: 320px;
   margin: 0 auto;
@@ -1455,15 +1452,15 @@ body {
 .btn-confirm-pay:disabled, .btn-reject-pay:disabled { opacity: var(--disabled-opacity); cursor: default; }
 .btn-edit-limit {
   grid-column: 1 / -1;
-  padding: 10px; border: 1px solid var(--accent, #2c7be5); border-radius: 10px;
-  background: var(--bg-card); color: var(--accent, #2c7be5);
+  padding: 10px; border: 1px solid var(--accent); border-radius: 10px;
+  background: var(--bg-card); color: var(--accent);
   font-size: 14px; font-weight: 600; cursor: pointer;
 }
 .limit-edit { margin-top: 8px; display: grid; gap: 8px; }
 .limit-edit[hidden] { display: none; }
 .limit-input { width: 100%; }
 .debt-hint {
-  text-align: center; font-size: 13px; color: var(--text-mute, #888);
+  text-align: center; font-size: 13px; color: var(--text-mute);
   font-style: italic;
 }
 
@@ -1570,10 +1567,10 @@ body {
 }
 .debt-breakdown {
   display: flex; flex-wrap: wrap; gap: 10px;
-  font-size: 13px; color: var(--text-mute, #888);
+  font-size: 13px; color: var(--text-mute);
   padding: 6px 0; margin-bottom: 6px;
 }
-.debt-breakdown b { color: var(--text, #000); }
+.debt-breakdown b { color: var(--text); }
 
 /* Жёлтая полоска для partial-state */
 .debt-card.debt-partial { border-left-color: var(--warn-strong); }
@@ -1717,7 +1714,7 @@ body {
   padding: 20px;
   width: 100%;
   max-width: 360px;
-  box-shadow: 0 8px 40px rgba(0,0,0,0.25);
+  box-shadow: var(--shadow-modal);
 }
 .price-modal-title {
   font-size: 16px;
@@ -1776,7 +1773,7 @@ body {
   color: var(--text);
   font-size: 14px;
   font-weight: 500;
-  box-shadow: 0 6px 24px rgba(0,0,0,0.18);
+  box-shadow: var(--shadow-float);
   border: 1px solid var(--divider);
   border-left-width: 3px;
   animation: toastIn 0.2s ease both;
