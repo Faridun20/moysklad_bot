@@ -152,7 +152,7 @@
     if (f.isConfirmer) tabs.push({ key: 'confirm', label: 'Подтверждения' });
     tabs.push({ key: 'debts', label: 'Долги' });
     if (f.hasOps) tabs.push({ key: 'ops', label: 'Платежи и сдачи' });
-    if (f.isBoss) tabs.push({ key: 'limits', label: 'Лимиты' });
+    if (f.isBoss) tabs.push({ key: 'limits', label: 'Клиенты' });
     return tabs;
   }
 

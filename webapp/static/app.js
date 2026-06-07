@@ -1057,13 +1057,26 @@ async function runSearch(query) {
       </div>`).join(''));
   }
   if (data.agents && data.agents.length) {
+    // Карточка контрагента — только начальству (эндпоинт detail boss/admin).
+    const canCard = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
     parts.push(`<div class="search-group-title">${icon('user')} Клиенты</div>`);
-    parts.push(data.agents.map(a => `
-      <div class="search-item">${escapeHtml(a.name || '—')}${a.phone ? ' · ' + escapeHtml(a.phone) : ''}</div>`).join(''));
+    parts.push(data.agents.map(a => {
+      const label = `${escapeHtml(a.name || '—')}${a.phone ? ' · ' + escapeHtml(a.phone) : ''}`;
+      return canCard
+        ? `<div class="search-item" role="button" tabindex="0" data-agent="${escapeHtml(a.ms_id || '')}">${label}</div>`
+        : `<div class="search-item">${label}</div>`;
+    }).join(''));
   }
   box.innerHTML = parts.length
     ? parts.join('')
     : '<div class="empty-hint">Ничего не найдено</div>';
+  // Тап по контрагенту → карточка (рендерит в #content, поиск закрывается).
+  box.querySelectorAll('.search-item[data-agent]').forEach(el => {
+    el.addEventListener('click', () => {
+      const id = el.dataset.agent;
+      if (id) { haptic('light'); renderAgentDetail(id); }
+    });
+  });
 }
 
 // Заголовок группы заказов по дате. key = 'YYYY-MM-DD' (из created_at).
@@ -2539,7 +2552,7 @@ async function renderFinance() {
 
   const body = document.getElementById('finance-body');
   if (financeTab === 'debts') await renderDebts(body);
-  else if (financeTab === 'limits') await renderCreditLimits(body);
+  else if (financeTab === 'limits') await renderClients(body);
   else await renderCashbox(body, financeTab);  // confirm | ops
 }
 
@@ -2908,87 +2921,146 @@ async function renderCashbox(container, section) {
   });
 }
 
-async function renderCreditLimits(container) {
+// Список «Клиенты» (boss/admin): контрагенты с МС-балансом + локальным долгом/
+// лимитом. Тап по карточке → детальная карточка контрагента.
+async function renderClients(container) {
   container = container || document.getElementById('content');
-  container.innerHTML = loading('Загрузка лимитов…');
-  let agents = [];
+  container.innerHTML = loading('Загрузка клиентов…');
+  let clients = [];
+  let baseC = baseCur();
   try {
-    const data = await api('/api/credit/overview', {});
-    agents = data.agents || [];
+    const data = await api('/api/clients/overview', {});
+    clients = data.clients || [];
+    baseC = data.base_currency || baseC;
   } catch (e) {
     container.innerHTML = errorBox(e.message);
     return;
   }
-
   const fmt = n => Math.round(n).toLocaleString('ru-RU');
-  if (agents.length === 0) {
-    container.innerHTML = '<div class="loader">Нет контрагентов с активными заказами</div>';
+  const fmtCents = c => opsAmount((Number(c) || 0) / 100);
+  if (!clients.length) {
+    container.innerHTML = `<div class="empty-state">
+      <div class="empty-state-icon">${icon('user')}</div>
+      <div class="empty-state-title">Пока нет клиентов</div>
+      <div class="empty-state-hint">Контрагенты появятся после синхронизации с МойСклад или первого заказа.</div>
+    </div>`;
     return;
   }
-
-  const cards = agents.map(a => {
-    const badge = a.over_limit
-      ? '<span class="stock-badge badge-red">превышен</span>'
-      : '<span class="stock-badge badge-green">в норме</span>';
-    return `
-      <div class="debt-card" data-agent="${escapeHtml(a.agent_id)}" data-name="${escapeHtml(a.agent_name)}" data-limit="${a.limit}">
+  // Сверху — кто больше должен (по МС-балансу), затем без баланса.
+  const balOf = c => (c.balance_cents != null ? c.balance_cents : -Infinity);
+  clients.sort((a, b) => balOf(b) - balOf(a));
+  const balStr = (bal) => bal == null
+    ? '<span class="money-placeholder">баланс —</span>'
+    : bal > 0 ? `<span class="bal-owe">должен ${fmtCents(bal)} ${escapeHtml(baseC)}</span>`
+    : bal < 0 ? `<span class="bal-adv">аванс ${fmtCents(-bal)} ${escapeHtml(baseC)}</span>`
+    : `0 ${escapeHtml(baseC)}`;
+  const cards = clients.map(c => `
+      <div class="debt-card" data-agent="${escapeHtml(c.agent_id)}" role="button" tabindex="0">
         <div class="debt-card-top">
-          <div class="debt-agent">🏢 ${escapeHtml(a.agent_name)}</div>
-          ${badge}
+          <div class="debt-agent">🏢 ${escapeHtml(c.agent_name)}</div>
+          ${c.over_limit ? '<span class="stock-badge badge-red">лимит превышен</span>' : ''}
         </div>
         <div class="debt-card-mid">
-          <span class="debt-meta">лимит ${fmt(a.limit)} · долг ${fmt(a.debt)} · свободно ${fmt(a.free)} USD</span>
+          <span class="debt-meta">${balStr(c.balance_cents)} · долг по заказам ${fmt(c.debt)} · лимит ${fmt(c.limit)}</span>
         </div>
-        <div class="debt-actions">
-          <button class="btn-edit-limit">${icon('edit')} Изменить лимит</button>
-        </div>
-        <div class="limit-edit" hidden>
-          <input type="number" class="form-input limit-input" inputmode="decimal" value="${a.limit}">
-          <div class="debt-actions">
-            <button class="btn-confirm-pay limit-save">Сохранить</button>
-            <button class="btn-reject-pay limit-cancel">Отмена</button>
-          </div>
-        </div>
-      </div>
-    `;
-  }).join('');
-
-  container.innerHTML = `<div class="section-label">Кредитные лимиты</div><div class="debts-list">${cards}</div>`;
-
-  // Inline-редактирование: prompt() в Telegram WebApp ненадёжен, поэтому
-  // показываем поле ввода прямо в карточке.
-  container.querySelectorAll('.debt-card').forEach(card => {
-    const editBox = card.querySelector('.limit-edit');
-    const editBtn = card.querySelector('.btn-edit-limit');
-    editBtn.addEventListener('click', () => {
-      haptic('light');
-      editBox.hidden = !editBox.hidden;
-    });
-    card.querySelector('.limit-cancel').addEventListener('click', () => { editBox.hidden = true; });
-    card.querySelector('.limit-save').addEventListener('click', async (ev) => {
-      const saveBtn = ev.currentTarget;
-      if (saveBtn.disabled) return;          // защита от дабл-клика
-      const raw = card.querySelector('.limit-input').value;
-      const amount = parseFloat(String(raw).replace(',', '.').replace(/\s/g, ''));
-      if (isNaN(amount) || amount < 0) {
-        tg.showAlert('❌ Лимит должен быть неотрицательным числом.');
-        return;
-      }
-      saveBtn.disabled = true;
-      try {
-        await api('/api/credit/set', {
-          agent_id: card.dataset.agent,
-          agent_name: card.dataset.name,
-          limit_amount: amount,
-        });
-        toast(`Лимит обновлён: ${fmt(amount)} USD`);
-        renderCreditLimits(container);
-      } catch (e) {
-        saveBtn.disabled = false;
-        tg.showAlert('❌ ' + e.message);
-      }
-    });
+      </div>`).join('');
+  container.innerHTML = `<div class="section-label">Клиенты (${clients.length})</div><div class="debts-list">${cards}</div>`;
+  container.querySelectorAll('.debt-card[data-agent]').forEach(card => {
+    card.addEventListener('click', () => { haptic('light'); renderAgentDetail(card.dataset.agent); });
   });
+}
+
+// Карточка контрагента: МС-баланс + локальный долг/лимит (правится) + покупки из
+// МС (топ-товары/последние отгрузки) + заказы в боте. Открывается из «Клиентов»
+// и из поиска. boss/admin (эндпоинт detail так гейтит).
+async function renderAgentDetail(agentId) {
+  const content = document.getElementById('content');
+  content.innerHTML = loading('Загрузка клиента…');
+  showBack(() => { financeTab = 'limits'; showScreen('finance'); });
+  let d;
+  try {
+    d = await api('/api/clients/detail', { agent_id: agentId });
+  } catch (e) {
+    content.innerHTML = errorBox(e.message);
+    return;
+  }
+  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const fmtCents = c => opsAmount((Number(c) || 0) / 100);
+  const baseC = d.base_currency || baseCur();
+  const bal = d.balance_cents;
+  const balLine = bal == null ? 'Баланс МойСклад: —'
+    : bal > 0 ? `Баланс МойСклад: должен нам <b>${fmtCents(bal)} ${escapeHtml(baseC)}</b>`
+    : bal < 0 ? `Баланс МойСклад: аванс <b>${fmtCents(-bal)} ${escapeHtml(baseC)}</b>`
+    : `Баланс МойСклад: <b>0 ${escapeHtml(baseC)}</b>`;
+
+  // Покупки из МС.
+  const pur = d.purchases || {};
+  const topRows = (pur.top_products || []).map(p =>
+    `<div class="stock-row"><div class="stock-info"><div class="stock-name">${escapeHtml(p.name)}</div>` +
+    `<div class="stock-folder">${fmt(p.qty)} шт · ${fmtCents(p.sum_cents)} ${escapeHtml(baseC)}</div></div></div>`
+  ).join('');
+  const recentRows = (pur.recent || []).map(r =>
+    `<div class="stock-row"><div class="stock-info"><div class="stock-name">${fmtCents(r.sum_cents)} ${escapeHtml(baseC)}</div>` +
+    `<div class="stock-folder">${escapeHtml(r.date || '')}</div></div></div>`
+  ).join('');
+  const purBlock = pur.count
+    ? `<div class="section-label">Покупки · ${pur.count} отгр. · ${fmtCents(pur.total_cents)} ${escapeHtml(baseC)}</div>`
+      + (topRows ? `<div class="stock-list">${topRows}</div>` : '')
+      + (recentRows ? `<div class="section-label">Последние отгрузки</div><div class="stock-list">${recentRows}</div>` : '')
+    : '<div class="section-label">Покупки</div><div class="loader">Покупок в МойСклад нет</div>';
+
+  // Заказы в боте.
+  const orders = d.orders || [];
+  const ordersRows = orders.map(o =>
+    `<div class="stock-row"><div class="stock-info">` +
+    `<div class="stock-name">#${o.id} · ${fmtCents(o.total_cents)} ${escapeHtml(o.currency || baseC)}</div>` +
+    `<div class="stock-folder">${escapeHtml(o.status || '')} · ${escapeHtml((o.created_at || '').slice(0, 16))}</div>` +
+    `</div></div>`
+  ).join('');
+  const ordersBlock = orders.length
+    ? `<div class="section-label">Заказы в боте · ${orders.length}</div><div class="stock-list">${ordersRows}</div>`
+    : '<div class="section-label">Заказы в боте</div><div class="loader">Заказов нет</div>';
+
+  // Лимит правится только у контрагента с заказами (эндпоинт credit/set это гейтит).
+  const limitBlock = orders.length ? `
+      <div class="debt-actions"><button class="btn-edit-limit" id="cl-edit">${icon('edit')} Изменить лимит</button></div>
+      <div class="limit-edit" id="cl-box" hidden>
+        <input type="number" class="form-input" id="cl-input" inputmode="decimal" value="${d.limit}">
+        <div class="debt-actions">
+          <button class="btn-confirm-pay" id="cl-save">Сохранить</button>
+          <button class="btn-reject-pay" id="cl-cancel">Отмена</button>
+        </div>
+      </div>` : '';
+
+  content.innerHTML = `
+    <div class="editor-header"><div class="editor-title">🏢 ${escapeHtml(d.name || '—')}</div></div>
+    ${d.phone ? `<div class="debt-meta" style="padding:0 2px 8px;">📞 ${escapeHtml(d.phone)}</div>` : ''}
+    <div class="card">
+      <div class="agent-bal">${balLine}</div>
+      <div class="debt-meta">Долг по заказам бота: <b>${fmt(d.debt)} ${escapeHtml(baseC)}</b> · лимит ${fmt(d.limit)} · свободно ${fmt(d.free)}</div>
+      ${limitBlock}
+    </div>
+    ${purBlock}
+    ${ordersBlock}
+  `;
+
+  if (orders.length) {
+    const box = content.querySelector('#cl-box');
+    content.querySelector('#cl-edit').addEventListener('click', () => { haptic('light'); box.hidden = !box.hidden; });
+    content.querySelector('#cl-cancel').addEventListener('click', () => { box.hidden = true; });
+    content.querySelector('#cl-save').addEventListener('click', async (ev) => {
+      const btn = ev.currentTarget;
+      if (btn.disabled) return;
+      const amount = parseNum(content.querySelector('#cl-input').value);
+      if (isNaN(amount) || amount < 0) { tg.showAlert('❌ Лимит должен быть неотрицательным числом.'); return; }
+      btn.disabled = true;
+      try {
+        await api('/api/credit/set', { agent_id: d.agent_id, agent_name: d.name, limit_amount: amount });
+        toast(`Лимит обновлён: ${fmt(amount)} ${baseC}`);
+        renderAgentDetail(agentId);
+      } catch (e) { btn.disabled = false; tg.showAlert('❌ ' + e.message); }
+    });
+  }
 }
 
 async function renderDebts(container) {
