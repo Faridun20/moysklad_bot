@@ -84,8 +84,28 @@ const ROLE_NAMES = {
   admin: '👑 Админ',
   boss: '🏆 Руководитель',
   manager: '💼 Менеджер',
+  warehouse_keeper: '📦 Кладовщик',
+  bookkeeper: '🧮 Бухгалтер',
   employee: '👤 Сотрудник',
+  guest: '🔒 Гость',
 };
+
+// Экран «нет прав»: новый/деактивированный юзер (роль guest — нулевые права).
+// Раньше он падал на главную с нерабочими кнопками/403. Прячем нав и поиск.
+function renderNoAccess() {
+  const nav = document.querySelector('.bottom-nav');
+  if (nav) nav.classList.add('hidden');
+  const sb = document.getElementById('search-btn');
+  if (sb) sb.classList.add('hidden');
+  const content = document.getElementById('content');
+  content.innerHTML = `
+    <div class="empty-state" style="padding-top:48px;">
+      <div class="empty-state-icon">${icon('lock')}</div>
+      <div class="empty-state-title">Доступ не выдан</div>
+      <div class="empty-state-hint">Ваш аккаунт пока без прав. Попросите администратора назначить роль — затем откройте приложение снова.</div>
+      <button class="btn-primary" style="margin-top:16px;" onclick="location.reload()">Обновить</button>
+    </div>`;
+}
 
 // ─── Инициализация ──────────────────────────────────
 
@@ -126,6 +146,10 @@ async function init() {
 
     currentUser = await response.json();
     renderHeader();
+    if (currentUser.role === 'guest') {
+      renderNoAccess();
+      return;
+    }
     initNav();
     showScreen('home');
   } catch (e) {
@@ -673,11 +697,13 @@ function openPriceEditor(product) {
   haptic('light');
   const msId = (product.href || '').split('/').filter(Boolean).pop() || '';
   if (!msId) { tg.showAlert && tg.showAlert('Нет ms_id у товара'); return; }
+  const trigger = document.activeElement;  // вернём фокус сюда при закрытии
+  const prevBack = _backHandler;           // восстановим back-кнопку экрана
   const ov = document.createElement('div');
   ov.className = 'price-overlay';
   ov.innerHTML = `
-    <div class="price-modal">
-      <div class="price-modal-title">${escapeHtml(product.name)}</div>
+    <div class="price-modal" role="dialog" aria-modal="true" aria-labelledby="pe-title">
+      <div class="price-modal-title" id="pe-title">${escapeHtml(product.name)}</div>
       <label class="price-field">
         <span>Цена продажи (минимум)</span>
         <input type="number" inputmode="decimal" id="pe-sale" value="${product.sale_price ?? ''}" placeholder="—">
@@ -692,9 +718,29 @@ function openPriceEditor(product) {
       </div>
     </div>`;
   document.body.appendChild(ov);
-  const close = () => ov.remove();
+  const close = () => {
+    ov.remove();
+    document.removeEventListener('keydown', onKey, true);
+    // Восстанавливаем back-кнопку экрана и фокус на инициатора.
+    if (prevBack) showBack(prevBack); else hideBack();
+    if (trigger && trigger.focus) { try { trigger.focus(); } catch (_e) {} }
+  };
+  // Esc + ловушка Tab внутри модалки (фокус не уходит на фон).
+  function onKey(e) {
+    if (e.key === 'Escape') { e.preventDefault(); close(); return; }
+    if (e.key !== 'Tab') return;
+    const f = ov.querySelectorAll('input, button');
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+  document.addEventListener('keydown', onKey, true);
+  showBack(close);                         // аппаратная «назад» закрывает модалку
   ov.addEventListener('click', e => { if (e.target === ov) close(); });
   document.getElementById('pe-cancel').addEventListener('click', close);
+  const saleEl = document.getElementById('pe-sale');
+  if (saleEl && saleEl.focus) saleEl.focus();   // фокус внутрь при открытии
   document.getElementById('pe-save').addEventListener('click', async (ev) => {
     const saveBtn = ev.currentTarget;
     if (saveBtn.disabled) return;          // защита от дабл-клика
@@ -705,8 +751,8 @@ function openPriceEditor(product) {
       await api('/api/products/prices/set', {
         ms_id: msId,
         product_name: product.name,
-        sale_price: saleRaw === '' ? null : parseFloat(saleRaw),
-        cost_price: costRaw === '' ? null : parseFloat(costRaw),
+        sale_price: saleRaw === '' ? null : parseNum(saleRaw),
+        cost_price: costRaw === '' ? null : parseNum(costRaw),
       });
     } catch (e) {
       saveBtn.disabled = false;
@@ -714,8 +760,8 @@ function openPriceEditor(product) {
       return;
     }
     // Обновляем локально, чтобы список сразу показал новые цены.
-    product.sale_price = saleRaw === '' ? null : parseFloat(saleRaw);
-    product.cost_price = costRaw === '' ? null : parseFloat(costRaw);
+    product.sale_price = saleRaw === '' ? null : parseNum(saleRaw);
+    product.cost_price = costRaw === '' ? null : parseNum(costRaw);
     close();
     haptic('success');
     toast('Цена сохранена');
