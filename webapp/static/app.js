@@ -777,7 +777,7 @@ function renderStockContent() {
   // Категории — таблетки сверху
   const catBtns = [{ id: 'all', name: `Все (${products.length})` }, ...categories]
     .map(c =>
-      `<button class="cat-btn ${stockCurrentCat === c.id ? 'active' : ''}" data-cat="${c.id}">${c.name}</button>`
+      `<button class="cat-btn ${stockCurrentCat === c.id ? 'active' : ''}" data-cat="${c.id}" aria-pressed="${stockCurrentCat === c.id}">${c.name}</button>`
     ).join('');
 
   content.innerHTML = `
@@ -787,8 +787,8 @@ function renderStockContent() {
     <div class="section-label">Категории</div>
     <div class="cat-row">${catBtns}</div>
     <div class="cat-row">
-      <button class="cat-btn ${!stockInStockOnly ? 'active' : ''}" data-instock="0">Все</button>
-      <button class="cat-btn ${stockInStockOnly ? 'active' : ''}" data-instock="1">${icon('box')} В наличии</button>
+      <button class="cat-btn ${!stockInStockOnly ? 'active' : ''}" data-instock="0" aria-pressed="${!stockInStockOnly}">Все</button>
+      <button class="cat-btn ${stockInStockOnly ? 'active' : ''}" data-instock="1" aria-pressed="${stockInStockOnly}">${icon('box')} В наличии</button>
     </div>
     <div class="section-label">Товары</div>
     <div class="stock-list" id="stock-list"></div>
@@ -818,9 +818,11 @@ function renderStockContent() {
       stockCurrentCat = btn.dataset.cat;
       stockLimit = 200;   // смена категории — список с начала
       // Подсветить активную таблетку без полного ре-рендера каркаса.
-      document.querySelectorAll('[data-cat]').forEach(b =>
-        b.classList.toggle('active', b.dataset.cat === stockCurrentCat)
-      );
+      document.querySelectorAll('[data-cat]').forEach(b => {
+        const on = b.dataset.cat === stockCurrentCat;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', String(on));
+      });
       renderStockList();
     });
   });
@@ -841,9 +843,11 @@ function renderStockContent() {
       haptic('light');
       stockInStockOnly = btn.dataset.instock === '1';
       stockLimit = 200;
-      document.querySelectorAll('[data-instock]').forEach(b =>
-        b.classList.toggle('active', b.dataset.instock === (stockInStockOnly ? '1' : '0'))
-      );
+      document.querySelectorAll('[data-instock]').forEach(b => {
+        const on = b.dataset.instock === (stockInStockOnly ? '1' : '0');
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', String(on));
+      });
       renderStockList();
     });
   });
@@ -1243,7 +1247,7 @@ function renderOrdersMain() {
       ];
 
   const filterBtns = filters.map(f =>
-    `<button class="cat-btn ${currentOrderFilter === f.id ? 'active' : ''}" data-filter="${f.id}" aria-label="${escapeHtml(f.name)}" title="${escapeHtml(f.name)}">${f.label}</button>`
+    `<button class="cat-btn ${currentOrderFilter === f.id ? 'active' : ''}" data-filter="${f.id}" aria-pressed="${currentOrderFilter === f.id}" aria-label="${escapeHtml(f.name)}" title="${escapeHtml(f.name)}">${f.label}</button>`
   ).join('');
 
   // Фильтр по периоду — для навигации, когда заказов много.
@@ -1255,7 +1259,7 @@ function renderOrdersMain() {
     { id: 'custom', label: 'Период…' },
   ];
   const periodBtns = periods.map(p =>
-    `<button class="cat-btn ${currentOrderPeriod === p.id ? 'active' : ''}" data-period="${p.id}">${p.label}</button>`
+    `<button class="cat-btn ${currentOrderPeriod === p.id ? 'active' : ''}" data-period="${p.id}" aria-pressed="${currentOrderPeriod === p.id}">${p.label}</button>`
   ).join('');
   const periodPanel = currentOrderPeriod === 'custom' ? dateRangeHost() : '';
 
@@ -1799,15 +1803,19 @@ async function openProductPicker() {
   // Категории
   const catFilters = document.getElementById('cat-filters');
   catFilters.innerHTML = [
-    `<button class="cat-btn active" data-cat="all">Все</button>`,
-    ...categories.map(c => `<button class="cat-btn" data-cat="${c.id}">${c.name}</button>`),
+    `<button class="cat-btn active" data-cat="all" aria-pressed="true">Все</button>`,
+    ...categories.map(c => `<button class="cat-btn" data-cat="${c.id}" aria-pressed="false">${escapeHtml(c.name)}</button>`),
   ].join('');
 
   catFilters.querySelectorAll('.cat-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
-      catFilters.querySelectorAll('.cat-btn').forEach(b => b.classList.remove('active'));
+      catFilters.querySelectorAll('.cat-btn').forEach(b => {
+        b.classList.remove('active');
+        b.setAttribute('aria-pressed', 'false');
+      });
       btn.classList.add('active');
+      btn.setAttribute('aria-pressed', 'true');
       selectedCat = btn.dataset.cat;
       prodLimit = 50;   // смена категории — список с начала
       renderProducts();
@@ -2191,7 +2199,7 @@ function renderAnalyticsContent(data) {
     { id: 'year', label: 'Год' },
   ];
   const presetSeg = presets.map(p =>
-    `<button class="seg-item ${analyticsPeriod === p.id ? 'active' : ''}" data-period="${p.id}">${p.label}</button>`
+    `<button class="seg-item ${analyticsPeriod === p.id ? 'active' : ''}" data-period="${p.id}" aria-pressed="${analyticsPeriod === p.id}">${p.label}</button>`
   ).join('');
   const customLabel = (analyticsPeriod === 'custom' && analyticsSince && analyticsUntil)
     ? `${formatDateRU(analyticsSince)}—${formatDateRU(analyticsUntil)}`
@@ -2199,7 +2207,7 @@ function renderAnalyticsContent(data) {
   const periodBar = `
     <div class="seg-row">
       <div class="seg">${presetSeg}</div>
-      <button class="seg-aux ${analyticsPeriod === 'custom' ? 'active' : ''}" data-period="custom">${icon('clock')} ${customLabel}</button>
+      <button class="seg-aux ${analyticsPeriod === 'custom' ? 'active' : ''}" data-period="custom" aria-pressed="${analyticsPeriod === 'custom'}">${icon('clock')} ${customLabel}</button>
     </div>`;
   const periodPanel = analyticsPeriod === 'custom' ? dateRangeHost() : '';
 
@@ -2599,7 +2607,7 @@ async function renderCashbox(container, section) {
   const totalsBlock = `
     <div class="cat-row" style="margin-top:10px;">
       ${MONEY_PERIODS.map(p =>
-        `<button class="cat-btn ${p.key === moneyPeriod ? 'active' : ''}" data-mperiod="${p.key}">${p.label}</button>`
+        `<button class="cat-btn ${p.key === moneyPeriod ? 'active' : ''}" data-mperiod="${p.key}" aria-pressed="${p.key === moneyPeriod}">${p.label}</button>`
       ).join('')}
     </div>
     <div class="section-label">Поступления · ${escapeHtml((moneySummary && moneySummary.period && moneySummary.period.label) || '')}</div>
@@ -2680,9 +2688,9 @@ async function renderCashbox(container, section) {
         <div class="form-row">
           <label class="form-label">Возврат денег</label>
           <div class="cur-row">
-            <button class="cur-btn active" data-refund="debt_reduction">📉 В счёт долга</button>
-            <button class="cur-btn" data-refund="cash">💵 Наличными</button>
-            <button class="cur-btn" data-refund="no_refund">🚫 Без возврата</button>
+            <button class="cur-btn active" data-refund="debt_reduction" aria-pressed="true">📉 В счёт долга</button>
+            <button class="cur-btn" data-refund="cash" aria-pressed="false">💵 Наличными</button>
+            <button class="cur-btn" data-refund="no_refund" aria-pressed="false">🚫 Без возврата</button>
           </div>
         </div>
         <button id="ret-create" class="btn-primary">${icon('return')} Оформить полный возврат</button>
@@ -2707,8 +2715,12 @@ async function renderCashbox(container, section) {
   let selectedRefund = 'debt_reduction';
   container.querySelectorAll('[data-refund]').forEach(b => {
     b.addEventListener('click', () => {
-      container.querySelectorAll('[data-refund]').forEach(x => x.classList.remove('active'));
+      container.querySelectorAll('[data-refund]').forEach(x => {
+        x.classList.remove('active');
+        x.setAttribute('aria-pressed', 'false');
+      });
       b.classList.add('active');
+      b.setAttribute('aria-pressed', 'true');
       selectedRefund = b.dataset.refund;
     });
   });
@@ -3012,8 +3024,8 @@ async function renderDebts(container) {
     let html = `
       <div class="debts-header">
         <div class="debts-tabs">
-          <button class="debts-tab ${debtsFilter === 'all' ? 'active' : ''}" data-f="all">Все</button>
-          <button class="debts-tab ${debtsFilter === 'today' ? 'active' : ''}" data-f="today">К оплате сейчас</button>
+          <button class="debts-tab ${debtsFilter === 'all' ? 'active' : ''}" data-f="all" aria-pressed="${debtsFilter === 'all'}">Все</button>
+          <button class="debts-tab ${debtsFilter === 'today' ? 'active' : ''}" data-f="today" aria-pressed="${debtsFilter === 'today'}">К оплате сейчас</button>
         </div>
       </div>
     `;
