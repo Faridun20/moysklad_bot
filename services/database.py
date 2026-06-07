@@ -1352,6 +1352,71 @@ async def get_credit_overview() -> list[dict]:
     return out
 
 
+async def get_orders_by_agent(agent_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    """Заказы контрагента (для карточки клиента): свежие сверху, без soft-deleted
+    и фантомных (ms_deleted_at). Сумма заказа считается из позиций (в копейках).
+    Индекс idx_orders_agent_id уже есть."""
+    if not agent_id:
+        return []
+    rows = await adb_core.fetch(
+        "SELECT id, status, currency, created_at, payment_type, due_date "
+        "FROM orders WHERE agent_id = $1 AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL) "
+        "ORDER BY created_at DESC LIMIT $2",
+        agent_id, limit,
+    )
+    ids = [r["id"] for r in rows]
+    items_by_order = await get_order_items_by_ids(ids)
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        items = items_by_order.get(r["id"], [])
+        total_cents = sum(
+            money.mul_qty(_price_cents(it), it.get("quantity", 0) or 0) for it in items
+        )
+        out.append(
+            {
+                "id": r["id"],
+                "status": r["status"],
+                "currency": r["currency"],
+                "created_at": r["created_at"],
+                "total_cents": int(total_cents),
+            }
+        )
+    return out
+
+
+async def get_clients_overview() -> list[dict[str, Any]]:
+    """Список «Клиенты»: кредит-overview (долг/лимит/over_limit) + МС-баланс
+    (взаиморасчёты) и телефон из снапшота. Плюс контрагенты с ненулевым
+    МС-балансом, но без заказов/лимита — чтобы их тоже было видно."""
+    rows = await get_credit_overview()
+    cp = await adb_core.fetch("SELECT ms_id, name, phone, balance_cents FROM ms_counterparties")
+    cp_by_id = {c["ms_id"]: c for c in cp}
+    seen = set()
+    for r in rows:
+        c = cp_by_id.get(r["agent_id"])
+        bc = c.get("balance_cents") if c else None
+        r["balance_cents"] = int(bc) if bc is not None else None
+        r["phone"] = (c or {}).get("phone") or ""
+        seen.add(r["agent_id"])
+    default_limit = float(await asyncio.to_thread(get_setting, "credit_limit_default", 2000.0))
+    for c in cp:
+        bc = c.get("balance_cents")
+        if c["ms_id"] not in seen and bc:
+            rows.append(
+                {
+                    "agent_id": c["ms_id"],
+                    "agent_name": c["name"] or c["ms_id"],
+                    "limit": default_limit,
+                    "debt": 0.0,
+                    "free": default_limit,
+                    "over_limit": False,
+                    "balance_cents": int(bc),
+                    "phone": c.get("phone") or "",
+                }
+            )
+    return rows
+
+
 # ─── IMPLEMENTATION.md Фаза 3: журнал изменений заказа ────────────────────────
 
 

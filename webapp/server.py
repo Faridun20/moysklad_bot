@@ -2041,6 +2041,78 @@ async def api_credit_set(request: Request):
     return JSONResponse({"ok": True, "agent_id": agent_id, "limit_amount": limit_amount})
 
 
+# ─── API: контрагенты («Клиенты») ─────────────────────────────────────────────
+
+
+@app.post("/api/clients/overview")
+async def api_clients_overview(request: Request):
+    """Список контрагентов: МС-баланс + локальный долг/лимит. Только начальство."""
+    from services import async_db as adb
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_clients_overview",
+        rate_limit_max=30,
+        rate_limit_window=60.0,
+    )
+    from config import BASE_CURRENCY
+
+    clients = await adb.get_clients_overview()
+    return JSONResponse(
+        {"ok": True, "clients": clients, "base_currency": (BASE_CURRENCY or "USD").upper()}
+    )
+
+
+@app.post("/api/clients/detail")
+async def api_clients_detail(request: Request):
+    """Карточка контрагента: имя/телефон/МС-баланс (снапшот) + локальный долг/лимит
+    + заказы в боте + покупки из МС (отгрузки). Только начальство."""
+    from services import async_db as adb
+    from services import moysklad, snapshot
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_clients_detail",
+        rate_limit_max=30,
+        rate_limit_window=60.0,
+    )
+    agent_id = (data.get("agent_id") or "").strip()[:64]
+    if not agent_id:
+        raise HTTPException(status_code=400, detail="agent_id обязателен")
+
+    cp = await asyncio.to_thread(snapshot.get_counterparty, agent_id)
+    debt = await adb.get_agent_current_debt(agent_id)
+    limit = await adb.get_credit_limit(agent_id)
+    orders = await adb.get_orders_by_agent(agent_id)
+    # Покупки из МС — best-effort: при сбое МС карточка всё равно открывается.
+    try:
+        purchases = await moysklad.get_counterparty_purchases(agent_id)
+    except Exception:
+        purchases = {"top_products": [], "recent": [], "total_cents": 0, "count": 0}
+    from config import BASE_CURRENCY
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "agent_id": agent_id,
+            "name": (cp or {}).get("name") or "",
+            "phone": (cp or {}).get("phone") or "",
+            "balance_cents": (cp or {}).get("balance_cents"),
+            "debt": debt,
+            "limit": limit,
+            "free": round(limit - debt, 2),
+            "over_limit": debt > limit,
+            "orders": orders,
+            "purchases": purchases,
+            "base_currency": (BASE_CURRENCY or "USD").upper(),
+        }
+    )
+
+
 # ─── API: курсы валют (PR #42 / tech debt #3a) ────────────────────────────────
 
 
