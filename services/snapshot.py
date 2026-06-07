@@ -144,6 +144,17 @@ async def refresh_categories() -> int:
 
 async def refresh_counterparties() -> int:
     rows = await _fetch_all("entity/counterparty", params={"order": "name"})
+    # Баланс (взаиморасчёты) — отдельный дешёвый bulk-отчёт report/counterparty.
+    # Строка: counterparty.meta.href → id, balance — в копейках (>0 клиент должен
+    # нам, <0 аванс). Best-effort: если отчёт недоступен — пишем балансы как NULL.
+    balances: dict[str, int] = {}
+    try:
+        for r in await _fetch_all("report/counterparty"):
+            bid = extract_id_from_href(extract_href(r, "counterparty"))
+            if bid:
+                balances[bid] = int(r.get("balance") or 0)
+    except Exception as e:  # noqa: BLE001 — отчёт опционален, имя/телефон важнее
+        logger.warning("snapshot.refresh_counterparties: report/counterparty failed: %s", e)
     ts = now_str()
     values = [
         (
@@ -151,6 +162,7 @@ async def refresh_counterparties() -> int:
             r.get("name", ""),
             r.get("phone", "") or "",
             extract_href(r),
+            balances.get(ms_id),
             ts,
         )
         for r in rows
@@ -159,12 +171,14 @@ async def refresh_counterparties() -> int:
     async with adb_core.transaction() as tx:
         await tx.execute("DELETE FROM ms_counterparties")
         await tx.executemany(
-            "INSERT INTO ms_counterparties (ms_id, name, phone, href, updated_at) "
-            "VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO ms_counterparties (ms_id, name, phone, href, balance_cents, updated_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
             values,
         )
     await meta_set("counterparties", last_full_refresh=ts, rows_count=len(values), status="ok")
-    logger.info("snapshot.refresh_counterparties: %d rows", len(values))
+    logger.info(
+        "snapshot.refresh_counterparties: %d rows (%d с балансом)", len(values), len(balances)
+    )
     return len(values)
 
 
@@ -362,15 +376,30 @@ def get_categories() -> list[dict]:
 
 def get_counterparties(search: str | None = None, limit: int = 50) -> list[dict]:
     if search:
-        sql = "SELECT ms_id, name, phone FROM ms_counterparties WHERE LOWER(name) LIKE ? ORDER BY name LIMIT ?"
+        sql = (
+            "SELECT ms_id, name, phone, balance_cents FROM ms_counterparties "
+            "WHERE LOWER(name) LIKE ? ORDER BY name LIMIT ?"
+        )
         args = (f"%{search.lower()}%", limit)
     else:
-        sql = "SELECT ms_id, name, phone FROM ms_counterparties ORDER BY name LIMIT ?"
+        sql = "SELECT ms_id, name, phone, balance_cents FROM ms_counterparties ORDER BY name LIMIT ?"
         args = (limit,)
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(q(sql), args)
         return [dict(r) for r in cur.fetchall()]
+
+
+def get_counterparty(ms_id: str) -> dict | None:
+    """Один контрагент из снапшота (для карточки): ms_id, name, phone, balance_cents."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT ms_id, name, phone, balance_cents, href FROM ms_counterparties WHERE ms_id = ?"),
+            (ms_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
 
 
 def get_employees() -> list[dict]:
