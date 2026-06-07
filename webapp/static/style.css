@@ -1531,6 +1531,11 @@ body {
 .subseg-item { min-height: 44px; }
 .subseg-item .stock-badge { margin-left: 6px; }
 
+/* Карточка контрагента («Клиенты»): строка баланса МойСклад. */
+.agent-bal { font-size: 16px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+.bal-owe { color: var(--danger); font-weight: 600; }   /* клиент должен нам */
+.bal-adv { color: var(--success); font-weight: 600; }  /* аванс/переплата */
+
 /* Итог поступлений в базовой валюте (вкладка «Обзор» раздела «Деньги»). */
 .money-total {
   font-size: 26px; font-weight: 800; color: var(--text);
