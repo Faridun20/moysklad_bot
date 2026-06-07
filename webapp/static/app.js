@@ -1261,22 +1261,23 @@ function renderOrdersMain() {
         { id: 'rejected', label: icon('close'), name: STATUS_NAME.rejected },
       ];
 
-  const filterBtns = filters.map(f =>
-    `<button class="cat-btn ${currentOrderFilter === f.id ? 'active' : ''}" data-filter="${f.id}" aria-pressed="${currentOrderFilter === f.id}" aria-label="${escapeHtml(f.name)}" title="${escapeHtml(f.name)}">${f.label}</button>`
+  // Единый язык навигации со всеми экранами (база — Аналитика): статус и период
+  // — iOS-сегменты .seg / .seg-item с подписью-секцией сверху, а не разнородные
+  // пилюли + select + кнопка в один ряд (раньше «кнопки смешаны»).
+  const statusSeg = filters.map(f =>
+    `<button class="seg-item ${currentOrderFilter === f.id ? 'active' : ''}" data-filter="${f.id}" aria-pressed="${currentOrderFilter === f.id}" aria-label="${escapeHtml(f.name)}" title="${escapeHtml(f.name)}">${f.label}</button>`
   ).join('');
 
-  // Фильтр по периоду — для навигации, когда заказов много.
+  // Фильтр по периоду — для навигации, когда заказов много. Пресеты — сегмент,
+  // «Период…» (произвольный диапазон) — доп-кнопка справа (как в Аналитике).
   const periods = [
     { id: 'all', label: 'Всё время' },
     { id: 'today', label: 'Сегодня' },
     { id: '7d', label: '7 дней' },
     { id: '30d', label: '30 дней' },
-    { id: 'custom', label: 'Период…' },
   ];
-  // Период — компактный нативный select в тулбаре (а не второй ряд пилюль):
-  // один ряд фильтров вместо двух. «Период…» открывает календарь.
-  const periodOptions = periods.map(p =>
-    `<option value="${p.id}" ${currentOrderPeriod === p.id ? 'selected' : ''}>${p.label}</option>`
+  const periodSeg = periods.map(p =>
+    `<button class="seg-item ${currentOrderPeriod === p.id ? 'active' : ''}" data-operiod="${p.id}" aria-pressed="${currentOrderPeriod === p.id}">${escapeHtml(p.label)}</button>`
   ).join('');
   const periodPanel = currentOrderPeriod === 'custom' ? dateRangeHost() : '';
 
@@ -1375,20 +1376,23 @@ function renderOrdersMain() {
       })();
 
   content.innerHTML = `
-    <div class="orders-toolbar">
-      <div class="cat-scroll">${filterBtns}</div>
-      <select class="period-select" id="order-period" aria-label="Период">${periodOptions}</select>
-      ${!isBoss ? `<button class="btn-new-order" id="btn-new-order">+ Новый заказ</button>` : ''}
+    <div class="section-label">Статус</div>
+    <div class="seg-row"><div class="seg seg--scroll">${statusSeg}</div></div>
+    <div class="section-label">Период</div>
+    <div class="seg-row">
+      <div class="seg">${periodSeg}</div>
+      <button class="seg-aux ${currentOrderPeriod === 'custom' ? 'active' : ''}" data-operiod="custom" aria-pressed="${currentOrderPeriod === 'custom'}">${icon('clock')} Период…</button>
     </div>
     ${periodPanel}
+    ${!isBoss ? `<button class="btn-new-order" id="btn-new-order">${icon('plus')} Новый заказ</button>` : ''}
 
     ${isBoss ? `<button class="requests-btn" id="show-requests">${icon('clock')} Заявки на рассмотрении</button>` : ''}
 
     <div class="orders-list">${list}</div>
   `;
 
-  // Фильтры по статусу
-  document.querySelectorAll('.cat-btn[data-filter]').forEach(btn => {
+  // Фильтры по статусу (сегмент).
+  document.querySelectorAll('.seg-item[data-filter]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
       currentOrderFilter = btn.dataset.filter;
@@ -1396,15 +1400,14 @@ function renderOrdersMain() {
     });
   });
 
-  // Фильтр по периоду — нативный select.
-  const periodSel = document.getElementById('order-period');
-  if (periodSel) {
-    periodSel.addEventListener('change', () => {
+  // Фильтр по периоду (сегмент + «Период…»).
+  document.querySelectorAll('[data-operiod]').forEach(btn => {
+    btn.addEventListener('click', () => {
       haptic('light');
-      currentOrderPeriod = periodSel.value;
+      currentOrderPeriod = btn.dataset.operiod;
       renderOrdersMain();
     });
-  }
+  });
 
   // Кастомный диапазон дат: монтируем календарь, по «Применить» фильтруем.
   if (currentOrderPeriod === 'custom') {
@@ -2380,9 +2383,17 @@ function renderAnalyticsContent(data) {
 // + лента движения денег. Период — общий с «Продажами» (analyticsPeriod).
 async function renderMoneyView() {
   const content = document.getElementById('content');
+  // «Период…» выбран, но даты ещё не заданы — показываем шапку с календарём и
+  // ждём выбора дат, НЕ дёргая бэкенд и НЕ откатываясь на месяц (иначе клик по
+  // «Период…» молча сбрасывался и календарь не открывался — нельзя было выбрать
+  // произвольный диапазон в разделе «Деньги»).
+  if (analyticsPeriod === 'custom' && !(analyticsSince && analyticsUntil)) {
+    content.innerHTML = analyticsHeaderHtml(true) +
+      '<div class="loader">Выберите даты периода на календаре выше.</div>';
+    wireAnalyticsHeader(content);
+    return;
+  }
   content.innerHTML = loading('Считаю деньги…');
-  // Кастомный период выбран, но даты не заданы — откатываемся на месяц.
-  if (analyticsPeriod === 'custom' && !(analyticsSince && analyticsUntil)) analyticsPeriod = 'month';
   const periodBody = (analyticsPeriod === 'custom' && analyticsSince && analyticsUntil)
     ? { since: analyticsSince, until: _nextDay(analyticsUntil) }
     : { period: analyticsPeriod };
@@ -2946,13 +2957,15 @@ async function renderClients(container) {
     </div>`;
     return;
   }
-  // Сверху — кто больше должен (по МС-балансу), затем без баланса.
-  const balOf = c => (c.balance_cents != null ? c.balance_cents : -Infinity);
-  clients.sort((a, b) => balOf(b) - balOf(a));
+  // Сверху — кто больше должен. В МС-балансе (взаиморасчёты) ДОЛГ клиента —
+  // отрицательный (аванс/переплата — положительный), поэтому должники = самый
+  // отрицательный баланс → сортируем по возрастанию, баланс-нет в конец.
+  const balOf = c => (c.balance_cents != null ? c.balance_cents : Infinity);
+  clients.sort((a, b) => balOf(a) - balOf(b));
   const balStr = (bal) => bal == null
     ? '<span class="money-placeholder">баланс —</span>'
-    : bal > 0 ? `<span class="bal-owe">должен ${fmtCents(bal)} ${escapeHtml(baseC)}</span>`
-    : bal < 0 ? `<span class="bal-adv">аванс ${fmtCents(-bal)} ${escapeHtml(baseC)}</span>`
+    : bal < 0 ? `<span class="bal-owe">должен ${fmtCents(-bal)} ${escapeHtml(baseC)}</span>`
+    : bal > 0 ? `<span class="bal-adv">аванс ${fmtCents(bal)} ${escapeHtml(baseC)}</span>`
     : `0 ${escapeHtml(baseC)}`;
   const cards = clients.map(c => `
       <div class="debt-card" data-agent="${escapeHtml(c.agent_id)}" role="button" tabindex="0">
@@ -2987,10 +3000,11 @@ async function renderAgentDetail(agentId) {
   const fmt = n => Math.round(n).toLocaleString('ru-RU');
   const fmtCents = c => opsAmount((Number(c) || 0) / 100);
   const baseC = d.base_currency || baseCur();
+  // МС-баланс (взаиморасчёты): <0 — клиент должен нам, >0 — аванс/переплата.
   const bal = d.balance_cents;
   const balLine = bal == null ? 'Баланс МойСклад: —'
-    : bal > 0 ? `Баланс МойСклад: должен нам <b>${fmtCents(bal)} ${escapeHtml(baseC)}</b>`
-    : bal < 0 ? `Баланс МойСклад: аванс <b>${fmtCents(-bal)} ${escapeHtml(baseC)}</b>`
+    : bal < 0 ? `Баланс МойСклад: должен нам <b>${fmtCents(-bal)} ${escapeHtml(baseC)}</b>`
+    : bal > 0 ? `Баланс МойСклад: аванс <b>${fmtCents(bal)} ${escapeHtml(baseC)}</b>`
     : `Баланс МойСклад: <b>0 ${escapeHtml(baseC)}</b>`;
 
   // Покупки из МС.

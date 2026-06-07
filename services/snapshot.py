@@ -145,8 +145,9 @@ async def refresh_categories() -> int:
 async def refresh_counterparties() -> int:
     rows = await _fetch_all("entity/counterparty", params={"order": "name"})
     # Баланс (взаиморасчёты) — отдельный дешёвый bulk-отчёт report/counterparty.
-    # Строка: counterparty.meta.href → id, balance — в копейках (>0 клиент должен
-    # нам, <0 аванс). Best-effort: если отчёт недоступен — пишем балансы как NULL.
+    # Строка: counterparty.meta.href → id, balance — в копейках, храним как отдаёт
+    # МС (<0 клиент должен нам, >0 аванс — интерпретация на фронте «Клиенты»).
+    # Best-effort: если отчёт недоступен — пишем балансы как NULL.
     balances: dict[str, int] = {}
     try:
         for r in await _fetch_all("report/counterparty"):

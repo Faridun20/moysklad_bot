@@ -809,7 +809,8 @@ def run_migrations():
             ("orders", "shipped_at", "TEXT"),
             ("orders", "shipped_by", "BIGINT"),
             # Баланс контрагента (взаиморасчёты) из МойСклад report/counterparty,
-            # в копейках. balance>0 — клиент должен нам; <0 — аванс/переплата.
+            # в копейках, как отдаёт МС. balance<0 — клиент должен нам; >0 —
+            # аванс/переплата (интерпретация — на фронте «Клиенты»).
             # Синкается ночным refresh_counterparties. NULL = ещё не синкнут.
             ("ms_counterparties", "balance_cents", "BIGINT"),
             # order_items

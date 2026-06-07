@@ -1111,12 +1111,15 @@ body {
 }
 
 .btn-new-order {
-  flex-shrink: 0; padding: 9px 16px;
+  width: 100%; margin-bottom: 12px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 13px 16px;
   background: var(--accent); color: var(--accent-fg);
-  border: none; border-radius: 20px;
-  font-size: 13px; font-weight: 600; cursor: pointer;
+  border: none; border-radius: var(--radius);
+  font-size: 15px; font-weight: 600; cursor: pointer;
   white-space: nowrap;
 }
+.btn-new-order .ic { --ic-size: 18px; }
 
 .editor-header {
   display: flex; align-items: center; gap: 10px;
@@ -1511,6 +1514,11 @@ body {
 .seg-item.active {
   background: var(--bg-card); color: var(--text); box-shadow: var(--shadow-card);
 }
+/* Статус-сегмент заказов (до 5 пунктов): равная ширина, на узких экранах —
+   мягкий горизонтальный скролл вместо сплющивания. */
+.seg--scroll { overflow-x: auto; scrollbar-width: none; }
+.seg--scroll::-webkit-scrollbar { display: none; }
+.seg--scroll .seg-item { flex: 1 0 0; }
 
 /* Доп-ссылка справа от сегмента (напр. «Лимиты» — read-only надстройка для
    босса): намеренно НЕ pill, чтобы не путалась с разделами уровня 1. */

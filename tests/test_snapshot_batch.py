@@ -78,8 +78,10 @@ def test_refresh_counterparties_syncs_balance(isolated_db, monkeypatch):
     n = asyncio.run(snapshot.refresh_counterparties())
     assert n == 3
     rows = {r["ms_id"]: r for r in snapshot.get_counterparties()}
-    assert rows["cp1"]["balance_cents"] == 150000   # клиент должен нам
-    assert rows["cp2"]["balance_cents"] == -5000    # аванс/переплата
+    # Храним баланс как отдаёт МС (>0 аванс/переплата, <0 клиент должен нам —
+    # интерпретация на фронте). Снапшот = верное зеркало МС.
+    assert rows["cp1"]["balance_cents"] == 150000   # аванс/переплата
+    assert rows["cp2"]["balance_cents"] == -5000    # клиент должен нам
     assert rows["cp3"]["balance_cents"] is None
     assert snapshot.get_counterparty("cp1")["balance_cents"] == 150000
     assert snapshot.get_counterparty("nope") is None
