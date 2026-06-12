@@ -104,6 +104,12 @@ async def _ensure_custom_attribute(name: str, attr_type: str = "string") -> dict
         ) as resp:
             body = await resp.text()
             if resp.status >= 400:
+                # Тело ошибки МС — ВСЕГДА через redact_ms_error (WP-16): сырое
+                # тело может нести href'ы/идентификаторы аккаунта в логи Railway
+                # (нарушение конвенции, действующей в остальном файле).
+                from services.moysklad import redact_ms_error
+
+                safe_body = redact_ms_error(body)
                 # Race-condition guard (SECURITY.md H5): два процесса в
                 # rolling deploy могли одновременно прочитать metadata,
                 # оба не нашли атрибут, оба POSTят. Второй получит
@@ -115,7 +121,7 @@ async def _ensure_custom_attribute(name: str, attr_type: str = "string") -> dict
                     "перечитать (возможно race с другим процессом): %s",
                     name,
                     resp.status,
-                    body[:200],
+                    safe_body[:200],
                 )
                 try:
                     data = await ms_get("entity/demand/metadata/attributes")
@@ -133,7 +139,7 @@ async def _ensure_custom_attribute(name: str, attr_type: str = "string") -> dict
                     "Не удалось создать custom attribute '%s' (HTTP %s): %s",
                     name,
                     resp.status,
-                    body[:300],
+                    safe_body[:300],
                 )
                 return None
             import json
