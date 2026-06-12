@@ -1620,6 +1620,25 @@ async def get_frozen_orders() -> list[dict]:
     )
 
 
+async def set_order_shipped_meta(order_id: int, shipped_by: int) -> bool:
+    """Идемпотентно проставить shipped_at/shipped_by (только если ещё не стоят).
+
+    Для отгрузки, пришедшей СИГНАЛОМ МС (вебхук stateType=Successful): там
+    cas_order_status меняет только статус, а инварианты shipped-заказа —
+    дедлайн возвратов (create_return: `if shipped_at and not force`) и
+    stale-детект — опираются на shipped_at. Без этого webhook-отгрузка
+    оставляла shipped_at=NULL → дедлайн молча не срабатывал (WP-13).
+    shipped_by=0 — системный маркер «МойСклад»."""
+    return (
+        await adb_core.execute(
+            "UPDATE orders SET shipped_at = COALESCE(shipped_at, $1), "
+            "shipped_by = COALESCE(shipped_by, $2), updated_at = $3 WHERE id = $4",
+            now_str(), shipped_by, now_str(), order_id,
+        )
+        > 0
+    )
+
+
 async def mark_order_shipped(order_id: int, shipped_by: int, shipped_name: str) -> dict:
     """Отметить заказ отгруженным (approved → shipped), DB-часть. Альтернатива
     МС-вебхуку (stateType=Successful) — для аккаунтов без статуса типа

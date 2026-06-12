@@ -261,6 +261,11 @@ async def _handle_customerorder_updated(co_id: str) -> None:
             co_id, order_id, local_status,
         )
         return
+    # Отгрузка по сигналу МС: проставляем shipped_at/shipped_by (cas_order_status
+    # меняет только статус). Без этого дедлайн возвратов и stale-детект, опирающиеся
+    # на shipped_at, для webhook-отгрузок не работали (WP-13). 0 = маркер «МойСклад».
+    if new_status == "shipped":
+        await adb.set_order_shipped_meta(order_id, 0)
     await adb.add_audit_log(
         0,
         "МойСклад",

@@ -182,7 +182,12 @@ def test_co_update_legal_transition_applied(isolated_db, monkeypatch):
     _mock_ms_get(monkeypatch, _b)
     asyncio.run(h._handle_customerorder_updated("CO-2"))
 
-    assert asyncio.run(db.get_order(oid))["status"] == "shipped"
+    shipped = asyncio.run(db.get_order(oid))
+    assert shipped["status"] == "shipped"
+    # WP-13: webhook-отгрузка проставляет shipped_at/shipped_by (инварианты
+    # дедлайна возвратов и stale-детекта). 0 = маркер «МойСклад».
+    assert shipped["shipped_at"] is not None
+    assert shipped["shipped_by"] == 0
 
 
 # ─── #7: валюта cash-возврата ─────────────────────────────────────────────────
