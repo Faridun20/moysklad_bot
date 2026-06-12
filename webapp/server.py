@@ -1412,6 +1412,31 @@ def _validate_payment_amount(raw) -> float:
     return amount
 
 
+def _validate_quantity(raw) -> float:
+    """0 < qty < 1M, конечное. Иначе 400 — negative/NaN/inf отравляют тоталы и
+    расчёт долга (get_agent_current_debt суммирует live order_items)."""
+    import math
+
+    try:
+        qty = float(raw)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Неверное количество")
+    if not (math.isfinite(qty) and 0 < qty < 1_000_000):
+        raise HTTPException(status_code=400, detail="Неверное количество")
+    return qty
+
+
+def _require_draft_order(order) -> None:
+    """Состав/агента/валюту заказа можно менять только в статусе draft. Иначе 409:
+    иначе менеджер прямым API-вызовом меняет уже одобренный/отгруженный заказ —
+    долг разъезжается с одобренным кредит-лимитом, без ре-проверки и аудита
+    (бот-путь и /api/orders/delete уже гейтят по draft)."""
+    if (order or {}).get("status") != "draft":
+        raise HTTPException(
+            status_code=409, detail="Заказ уже отправлен — редактирование недоступно"
+        )
+
+
 async def _notify_batch_payments(full_name, username, comment, created):
     """Одно уведомление боссу по созданным платежам (кнопка ✅/❌ на каждый).
     Best-effort: ошибка отправки не должна терять уже созданные платежи."""
@@ -2836,6 +2861,9 @@ async def api_add_item(request: Request):
     order = await adb.get_order(data["order_id"])
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
+    _require_draft_order(order)
+
+    quantity = _validate_quantity(data.get("quantity"))
 
     try:
         price = float(data.get("price", 0) or 0)
@@ -2875,7 +2903,7 @@ async def api_add_item(request: Request):
         order_id=data["order_id"],
         product_name=data["product_name"],
         product_href=product_href,
-        quantity=float(data["quantity"]),
+        quantity=quantity,
         unit=data.get("unit", "шт"),
         price=price,
         note=data.get("note", ""),
@@ -2901,6 +2929,7 @@ async def api_remove_item(request: Request):
     order = await adb.get_order(item["order_id"])
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
+    _require_draft_order(order)
     await adb.remove_order_item(data["item_id"])
     return JSONResponse({"ok": True})
 
@@ -2920,6 +2949,7 @@ async def api_set_agent(request: Request):
     order = await adb.get_order(data["order_id"])
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
+    _require_draft_order(order)
 
     agent_id = (data.get("agent_id") or "").strip()[:64]
     agent_name = (data.get("agent_name") or "").strip()[:200]
@@ -3309,16 +3339,12 @@ async def api_mark_paid(request: Request):
     )
     username = f"@{user['username']}" if user.get("username") else ""
 
-    # amount: если передан и валиден — частичная оплата; иначе закроет остаток
+    # amount: если передан и валиден — частичная оплата; иначе закроет остаток.
+    # Через общий валидатор (isfinite + потолок) — inf/nan/огромное не пройдут.
     amount_raw = data.get("amount")
     amount = None
     if amount_raw is not None and amount_raw != "":
-        try:
-            amount = float(amount_raw)
-            if amount <= 0:
-                raise ValueError
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="Неверная сумма")
+        amount = _validate_payment_amount(amount_raw)
 
     ok, payment_id = await adb.mark_order_paid(
         order_id,
