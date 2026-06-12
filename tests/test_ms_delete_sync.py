@@ -301,6 +301,41 @@ def test_reconcile_marks_deleted_demand(isolated_db, monkeypatch):
     assert asyncio.run(db.get_orders_with_ms_demand()) == []  # идемпотентно
 
 
+def test_reconcile_resets_deleted_paymentin(isolated_db, monkeypatch):
+    """WP-17: paymentin удалён в МС (пропущенный paymentin.DELETE-вебхук) →
+    reset_payment_ms_sync; ссылка снята, статус 'deleted_in_ms', retry пересоздаст."""
+    import aiohttp
+
+    import tasks.run_ms_reconcile as rec
+
+    db = isolated_db
+    _mock_notify(monkeypatch)
+    db.set_role(1, "m", "M", "manager")
+    pid = db.add_payment(1, "@m", "M", 100.0, "USD", "x", order_id=5)
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q("UPDATE payments SET status='confirmed', ms_paymentin_id='PI-9' WHERE id=?"),
+            (pid,),
+        )
+        conn.commit()
+
+    async def _b(path):
+        raise aiohttp.ClientResponseError(None, (), status=404)
+
+    _mock_ms_get(monkeypatch, _b)
+    rc = asyncio.run(rec.main())
+    assert rc == 0
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q("SELECT ms_paymentin_id, ms_sync_status FROM payments WHERE id=?"), (pid,)
+        )
+        row = dict(cur.fetchone())
+    assert row["ms_paymentin_id"] is None
+    assert row["ms_sync_status"] == "deleted_in_ms"
+
+
 def test_reconcile_demand_deleted_while_co_alive(isolated_db, monkeypatch):
     """Заказ покупателя в МС жив, но отгрузка удалена → заказ всё равно помечается
     ms_deleted_at (раньше reconcile проверял только CO и пропускал такой случай)."""

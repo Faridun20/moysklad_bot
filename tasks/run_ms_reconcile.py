@@ -46,7 +46,9 @@ async def main() -> int:
     from services.database import (
         get_orders_with_ms_customerorder,
         get_orders_with_ms_demand,
+        get_payments_with_ms_paymentin,
         init_db,
+        reset_payment_ms_sync,
         run_migrations,
     )
     from services.moysklad import close_session
@@ -94,6 +96,27 @@ async def main() -> int:
         elif st == "error":
             stats["errors"] += 1
 
+    async def _check_paymentin(payment: dict) -> None:
+        pin_id = payment.get("ms_paymentin_id")
+        if not pin_id:
+            return
+        async with sem:
+            st = await _doc_status("paymentin", pin_id)
+        stats["checked"] += 1
+        if st == "deleted":
+            # paymentin.DELETE-вебхук потерян (200 отдан до фоновой обработки,
+            # рестарт). Сбрасываем ссылку → retry-cron пересоздаст paymentin
+            # (как делает webhook-хендлер). WP-17.
+            await asyncio.to_thread(reset_payment_ms_sync, payment["id"])
+            stats["flagged"] += 1
+            logger.warning(
+                "ms_reconcile: платёж #%s — paymentin %s удалён в МС → сброшен "
+                "для пересоздания",
+                payment["id"], pin_id,
+            )
+        elif st == "error":
+            stats["errors"] += 1
+
     try:
         # 1) Заказы покупателя (customerorder). Пустой набор → 0 МС-вызовов.
         co_orders = await get_orders_with_ms_customerorder()
@@ -107,8 +130,14 @@ async def main() -> int:
         if demand_orders:
             await asyncio.gather(*(_check_demand(o) for o in demand_orders))
 
-        if not co_orders and not demand_orders:
-            logger.info("ms_reconcile: заказов со ссылками на МС нет — пропуск")
+        # 3) Входящие платежи (paymentin) — страховка от потерянных
+        #    paymentin.DELETE-вебхуков (WP-17).
+        pin_payments = await get_payments_with_ms_paymentin()
+        if pin_payments:
+            await asyncio.gather(*(_check_paymentin(p) for p in pin_payments))
+
+        if not co_orders and not demand_orders and not pin_payments:
+            logger.info("ms_reconcile: заказов/платежей со ссылками на МС нет — пропуск")
             return 0
 
         logger.info(

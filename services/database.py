@@ -4185,6 +4185,17 @@ def set_payment_ms_sync(
     return updated
 
 
+async def get_payments_with_ms_paymentin() -> list[dict]:
+    """Подтверждённые платежи со ссылкой на paymentin в МС — для cron-
+    реконсиляции удалённых входящих платежей (WP-17, страховка от пропущенных
+    paymentin.DELETE-вебхуков: иначе платёж навсегда «synced» на мёртвый
+    документ, retry его пропускает, деньги молча исчезают из МС)."""
+    return await adb_core.fetch(
+        "SELECT id, ms_paymentin_id FROM payments "
+        "WHERE ms_paymentin_id IS NOT NULL AND status = 'confirmed'"
+    )
+
+
 def find_payment_by_ms_paymentin_id(paymentin_id: str) -> dict | None:
     """Найти локальный платёж по ID paymentin в МойСклад.
     Используется когда МойСклад присылает webhook о удалении/изменении paymentin."""
