@@ -53,9 +53,23 @@ _IDEM_CACHE: dict[str, tuple[float, dict]] = {}
 _IDEM_TTL = 30.0
 
 
+_IDEM_KEY_MAX = 128  # WP-22: cap длины клиентского ключа (storage/memory DoS)
+
+
+def _cap_idem_key(raw) -> str | None:
+    """Ограничить длину клиентского idempotency_key (WP-22): ключ идёт в
+    in-memory кэш и в Postgres-таблицу идемпотентности; неограниченный ключ от
+    валидного юзера — вектор раздувания storage/памяти (cap по числу записей
+    не ограничивает РАЗМЕР ключа). UUID укладывается в 128 с запасом."""
+    if not raw:
+        return None
+    return str(raw)[:_IDEM_KEY_MAX]
+
+
 def _idem_get(key: str | None) -> dict | None:
     if not key:
         return None
+    key = key[: _IDEM_KEY_MAX + 64]  # cap всего ключа (scope:uid:rawkey)
     entry = _IDEM_CACHE.get(key)
     if entry and time.monotonic() - entry[0] < _IDEM_TTL:
         return entry[1]
@@ -65,6 +79,7 @@ def _idem_get(key: str | None) -> dict | None:
 def _idem_set(key: str | None, value: dict) -> None:
     if not key:
         return
+    key = key[: _IDEM_KEY_MAX + 64]
     # Простой GC при разрастании кэша — выкидываем протухшие записи.
     if len(_IDEM_CACHE) > 200:
         cutoff = time.monotonic() - _IDEM_TTL
@@ -1574,12 +1589,12 @@ async def api_payments_send(request: Request):
         rate_limit_window=60.0,
     )
 
+    idem_key = _cap_idem_key(data.get("idempotency_key"))
+
     # Мульти-валютная отправка: items=[{amount, currency}, …] + общий comment.
     items = data.get("items")
     if isinstance(items, list) and items:
-        return await _send_payments_batch(
-            user, items, data.get("comment", ""), idem_key=data.get("idempotency_key")
-        )
+        return await _send_payments_batch(user, items, data.get("comment", ""), idem_key=idem_key)
 
     # Round 6 (S3): isnan/isinf + верхний лимит — float('1e308') проходит
     # `> 0`, отравляет FIFO-математику в БД, отдаёт `nan USD` боссу в UI.
@@ -1613,8 +1628,25 @@ async def api_payments_send(request: Request):
     )
     username = f"@{user['username']}" if user.get("username") else "—"
 
+    # Идемпотентность одиночного платежа (WP-22): раньше её имела ТОЛЬКО batch-
+    # ветка → ретрай/таймаут одиночного POST создавал второй pending-платёж (босс
+    # видел два и подтверждал оба → касса завышена). DB-level idem_claim, как в
+    # batch/deposits.
+    full_idem = f"payments_send:{user_id}:{idem_key}" if idem_key else None
+    if full_idem:
+        prev = await adb.idem_claim(full_idem, "payments_send", user_id)
+        if prev is not None:
+            if prev.get("payment_ids"):
+                return JSONResponse(prev)
+            raise HTTPException(status_code=409, detail="Запрос уже обрабатывается")
+
     # Сохраняем в БД (через async-обёртку — не блокируем event loop)
-    payment_id = await adb.add_payment(user_id, username, full_name, amount, currency, comment)
+    try:
+        payment_id = await adb.add_payment(user_id, username, full_name, amount, currency, comment)
+    except Exception:
+        if full_idem:
+            await adb.idem_release(full_idem)  # ключ свободен под полноценный ретрай
+        raise
 
     # Аудит
     await adb.add_audit_log(
@@ -1645,7 +1677,10 @@ async def api_payments_send(request: Request):
     for uid in recipients:
         await tg_send_message(uid, notify_text, reply_markup=keyboard)
 
-    return JSONResponse({"payment_id": payment_id, "status": "pending"})
+    result = {"payment_id": payment_id, "payment_ids": [payment_id], "status": "pending"}
+    if full_idem:
+        await adb.idem_store(full_idem, result)  # ретрай тем же ключом вернёт это
+    return JSONResponse(result)
 
 
 # ─── API: деньги (итоги за период) ───────────────────────────────────────────
@@ -2512,7 +2547,7 @@ async def api_deposits_create(request: Request):
     # двойной POST (ретрай клиента после рестарта webapp/мультиворкер) создаёт две
     # сдачи. idem_claim атомарно столбит ключ в общей БД (in-mem кэш не переживал
     # рестарт). Если ключ уже был — отдаём сохранённый результат, не повторяем.
-    idem_key = data.get("idempotency_key")
+    idem_key = _cap_idem_key(data.get("idempotency_key"))
     full_key = f"deposit_create:{user['id']}:{idem_key}" if idem_key else None
     if full_key:
         prev = await adb.idem_claim(full_key, "deposit_create", user["id"])
@@ -2680,7 +2715,7 @@ async def api_returns_create(request: Request):
 
     # R2: DB-уровневая идемпотентность (двойной POST создавал два возврата —
     # двойной refund/занижение долга). idem_claim столбит ключ в общей БД.
-    idem_key = data.get("idempotency_key")
+    idem_key = _cap_idem_key(data.get("idempotency_key"))
     full_key = f"return_create:{user['id']}:{idem_key}" if idem_key else None
     if full_key:
         prev = await adb.idem_claim(full_key, "return_create", user["id"])

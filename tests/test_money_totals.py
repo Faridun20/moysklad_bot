@@ -331,6 +331,27 @@ def test_money_summary_full_total_when_rate_set(isolated_db, monkeypatch):
     assert body["missing_rates"] == []
 
 
+def test_payments_send_single_idempotent(isolated_db, monkeypatch):
+    """WP-22: ретрай одиночного платежа тем же idempotency_key не создаёт дубль
+    и не шлёт второе уведомление (раньше идемпотентность была только у batch)."""
+    db = isolated_db
+    client, sent = _client(db, monkeypatch, 750, "manager")
+    payload = {
+        "initData": "750", "amount": 100, "currency": "USD",
+        "comment": "аренда", "idempotency_key": "single-1",
+    }
+    r1 = client.post("/api/payments/send", json=payload)
+    assert r1.status_code == 200, r1.text
+    r2 = client.post("/api/payments/send", json=payload)  # тот же ключ
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["payment_id"] == r1.json()["payment_id"]  # тот же платёж
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("SELECT COUNT(*) FROM payments WHERE user_id=?"), (750,))
+        assert cur.fetchone()[0] == 1  # ровно один, дубля нет
+    assert len(sent) == 1  # уведомление ушло один раз
+
+
 def test_payments_send_batch_idempotent(isolated_db, monkeypatch):
     """Ретрай с тем же idempotency_key не создаёт дубль-набор платежей и не шлёт
     второе уведомление — отдаёт сохранённый результат."""
