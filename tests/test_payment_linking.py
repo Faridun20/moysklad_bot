@@ -114,6 +114,38 @@ def test_link_confirmed_payment_closes_order_if_total_reached(isolated_db, monke
     assert asyncio.run(db.get_order(oid)).get("paid_confirmed_at") is not None
 
 
+def test_link_rejects_currency_mismatch(isolated_db):
+    """WP-04: нельзя привязать платёж в чужой валюте к заказу — закрытие считает
+    копейки в валюте заказа, кросс-валюта без конверсии ложно закрывала заказ."""
+    db = isolated_db
+    oid = _setup_order(db, total=100.0)  # currency NULL → база USD
+    pid = db.add_payment(100, "@m", "M", 5_000_000.0, "UZS", "x")  # standalone UZS
+    res = asyncio.run(db.link_payment_to_order(pid, oid, linked_by=99))
+    assert res["ok"] is False
+    assert "не совпадает" in res["error"]
+    assert asyncio.run(db.get_payment(pid))["order_id"] is None  # не привязан
+
+
+def test_close_ignores_foreign_currency_payment(isolated_db, monkeypatch):
+    """WP-04: confirmed-платёж в валюте, отличной от валюты заказа, НЕ закрывает
+    заказ (раньше 5 000 000 UZS в копейках перекрывали USD-заказ)."""
+    db = isolated_db
+    monkeypatch.setattr(db, "_trigger_ms_paymentin_sync", lambda _: None)
+    oid = _setup_order(db, total=100.0)
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("UPDATE orders SET currency='USD' WHERE id=?"), (oid,))
+        conn.commit()
+    # Чужая валюта, привязана к заказу и подтверждена — закрывать не должна.
+    p_uzs = db.add_payment(100, "@m", "M", 5_000_000.0, "UZS", "x", order_id=oid)
+    asyncio.run(db.confirm_payment(p_uzs, 99, "Boss"))
+    assert asyncio.run(db.get_order(oid)).get("paid_confirmed_at") is None
+    # Платёж в валюте заказа на полную сумму — закрывает.
+    p_usd = db.add_payment(100, "@m", "M", 100.0, "USD", "x", order_id=oid)
+    asyncio.run(db.confirm_payment(p_usd, 99, "Boss"))
+    assert asyncio.run(db.get_order(oid)).get("paid_confirmed_at") is not None
+
+
 def test_link_writes_audit_log(isolated_db):
     db = isolated_db
     oid = _setup_order(db)

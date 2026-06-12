@@ -4356,6 +4356,19 @@ async def link_payment_to_order(
         return {"ok": False, "error": "Заказ не найден"}
     if order.get("deleted_at"):
         return {"ok": False, "error": "Заказ удалён"}
+    # Валюта платежа должна совпадать с валютой заказа: закрытие заказа считает
+    # копейки в валюте заказа, кросс-валютная привязка без конверсии ложно
+    # закрывала заказ (напр. UZS-платёж к USD-заказу). Конверсии при закрытии
+    # нет — поэтому требуем совпадение валют (WP-04).
+    from config import BASE_CURRENCY
+
+    pay_cur = (payment.get("currency") or BASE_CURRENCY or "USD").upper()
+    ord_cur = (order.get("currency") or BASE_CURRENCY or "USD").upper()
+    if pay_cur != ord_cur:
+        return {
+            "ok": False,
+            "error": f"Валюта платежа ({pay_cur}) не совпадает с валютой заказа ({ord_cur})",
+        }
 
     # Атомарно линкуем — защита от race: два параллельных линка к РАЗНЫМ
     # заказам, оба прошли проверки выше; UPDATE-WHERE-NULL выиграет только
@@ -4512,28 +4525,40 @@ async def _maybe_close_order_after_payment(
     пути (commit ≡ rollback, lock освобождён). add_audit_log/get_role (sync) —
     мостим через to_thread после транзакции.
     """
+    from config import BASE_CURRENCY
+
     closed = False
     confirmed_cents = 0
     async with adb_core.transaction() as txn:
-        # Lock: для Postgres эта строка блокирует order до конца транзакции.
+        # Lock: для Постгреса эта строка блокирует order до конца транзакции.
         if USE_POSTGRES:
             row = await txn.fetchrow(
-                "SELECT paid_confirmed_at FROM orders WHERE id = $1 FOR UPDATE", order_id
+                "SELECT paid_confirmed_at, currency FROM orders WHERE id = $1 FOR UPDATE", order_id
             )
         else:
-            row = await txn.fetchrow("SELECT paid_confirmed_at FROM orders WHERE id = $1", order_id)
+            row = await txn.fetchrow(
+                "SELECT paid_confirmed_at, currency FROM orders WHERE id = $1", order_id
+            )
         if not row:
             return
         if row["paid_confirmed_at"] is not None:
             return  # already closed
+
+        # Валюта заказа: платежи к заказу должны быть в ней же. Суммируем ТОЛЬКО
+        # платежи в валюте заказа (NULL-валюту платежа трактуем как валюту заказа,
+        # легаси-safe). Иначе платёж в «дорогой» валюте (напр. UZS) в копейках
+        # ложно перекрывал заказ в USD и закрывал его как оплаченный (WP-04).
+        order_cur = (row["currency"] or BASE_CURRENCY or "USD").upper()
 
         # Пересчёт ВНУТРИ транзакции — видим актуальную сумму confirmed.
         # Считаем в копейках (точное сравнение) — без epsilon-костыля.
         confirmed_cents = int(
             await txn.fetchval(
                 f"SELECT {_SUM_PAYMENTS_CENTS} FROM payments "
-                "WHERE order_id = $1 AND status = 'confirmed'",
+                "WHERE order_id = $1 AND status = 'confirmed' "
+                "AND COALESCE(UPPER(currency), $2) = $2",
                 order_id,
+                order_cur,
             )
             or 0
         )
