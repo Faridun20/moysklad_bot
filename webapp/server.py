@@ -1063,7 +1063,11 @@ def _resolve_analytics_period(data: dict, now):
         span = until - since
         if span > timedelta(days=366):
             raise HTTPException(status_code=400, detail="Диапазон не больше года")
-        label = f"{since_raw[:10]} — {until_raw[:10]}"
+        # until с фронта — ЭКСКЛЮЗИВНАЯ граница (next-day-полночь), поэтому в метке
+        # показываем ВЫБРАННЫЙ конец = until − 1 день (WP-20), иначе пользователь
+        # видел день, который не выбирал (и сверка с МС «по N-е» расходилась).
+        label_until = (until - timedelta(days=1)).strftime("%Y-%m-%d")
+        label = f"{since_raw[:10]} — {label_until}"
         return since, until, since - span, label
 
     period = data.get("period", "week")

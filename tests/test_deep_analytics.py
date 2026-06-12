@@ -164,7 +164,9 @@ def test_resolve_period_custom_dates_validation():
     )
     assert since == datetime(2031, 5, 1)
     assert until == datetime(2031, 5, 15)
-    assert "2031-05-01" in label
+    # WP-20: until с фронта эксклюзивный → в метке показываем ВЫБРАННЫЙ конец
+    # (until − 1 день), а не сам эксклюзивный until.
+    assert label == "2031-05-01 — 2031-05-14"
 
 
 def test_resolve_period_preset_returns_now_as_until():

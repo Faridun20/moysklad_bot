@@ -458,8 +458,13 @@ async def get_shipments(since: datetime, until: datetime | None = None) -> list[
     Раньше был один запрос limit=100 без offset: за длинный период (год)
     с >100 отгрузок терялся хвост → выручка/топ занижались, а аналитика
     «за год» выглядела неполной. Cap MAX_PAGES — защита от тысяч строк/таймаута."""
+    # Граница включающая (WP-20): moment>= вместо moment> — документ ровно на
+    # начале периода (полночь, частые ручные импорты с moment=YYYY-MM-DD 00:00:00)
+    # иначе выпадал и из текущего, и из предыдущего окна. until остаётся
+    # эксклюзивным (next-day-полночь с фронта) → half-open [since, until).
+    # NB: МС трактует moment в TZ аккаунта МС — он должен совпадать с бизнес-зоной.
     since_str = since.strftime("%Y-%m-%d %H:%M:%S.000")
-    filter_str = f"moment>{since_str}"
+    filter_str = f"moment>={since_str}"
     if until:
         until_str = until.strftime("%Y-%m-%d %H:%M:%S.000")
         filter_str += f";moment<{until_str}"
@@ -706,8 +711,9 @@ async def get_employee_shipments(
 
     Пагинация offset-loop (CLAUDE.md): без неё у сотрудника с >100
     отгрузками за период терялся хвост → личная статистика занижалась."""
+    # Включающая граница начала (WP-20) — см. get_shipments.
     since_str = since.strftime("%Y-%m-%d %H:%M:%S.000")
-    filter_str = f"moment>{since_str}"
+    filter_str = f"moment>={since_str}"
     if until:
         filter_str += f";moment<{until.strftime('%Y-%m-%d %H:%M:%S.000')}"
     if employee_href:
