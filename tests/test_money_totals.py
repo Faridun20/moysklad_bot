@@ -105,6 +105,37 @@ def test_get_money_totals_by_currency_excludes_deleted(isolated_db):
     assert totals["deposits"]["count"] == 1
 
 
+def test_deleted_order_payments_excluded_from_all_money_surfaces(isolated_db):
+    """WP-03: платёж по удалённому заказу исключён из ВСЕХ денежных поверхностей
+    (итог, касса, отчёт по оплатам, по сотрудникам) — иначе бот и WebApp
+    расходятся в сумме. standalone и платёж по живому заказу учитываются."""
+    db = isolated_db
+    db.set_role(1, "m", "M", "manager")
+    live = _credit_shipped(db, 1, 100.0, "USD", "A-live")
+    _confirmed_payment(db, 1, 100.0, "USD", order_id=live)
+    phantom = _credit_shipped(db, 1, 30.0, "USD", "A-phantom")
+    _confirmed_payment(db, 1, 30.0, "USD", order_id=phantom)
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q("UPDATE orders SET ms_deleted_at='2026-06-03 00:00:00' WHERE id=?"), (phantom,)
+        )
+        conn.commit()
+
+    totals = asyncio.run(db.get_money_totals())
+    assert {p["currency"]: p["total_cents"] for p in totals["payments"]}["USD"] == 10000
+
+    cb = db.get_cashbox_stats()  # sync, бот /cashbox
+    assert cb["total_cents"] == 10000  # 100, не 130
+
+    rep = asyncio.run(db.get_payments_report())  # бот /payreport
+    order_ids = {r["order_id"] for r in rep}
+    assert live in order_ids and phantom not in order_ids
+
+    emp = asyncio.run(db.get_summary_by_employee())  # бот /payreport (по сотрудникам)
+    assert sum(float(r["total"]) for r in emp) == 100.0
+
+
 def test_get_money_totals_period_filter(isolated_db):
     db = isolated_db
     db.set_role(1, "m", "M", "manager")

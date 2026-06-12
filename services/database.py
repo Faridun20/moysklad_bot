@@ -3321,6 +3321,17 @@ _SUM_RETURNS_CENTS = (
     "COALESCE(SUM(COALESCE(total_amount_cents, CAST(round(total_amount * 100) AS INTEGER))), 0)"
 )
 
+# «Живой заказ» для денежных агрегатов: платёж учитываем, только если его заказа
+# нет (standalone, order_id IS NULL) ИЛИ заказ не удалён ни в МС, ни локально.
+# ЕДИНЫЙ источник для ВСЕХ денежных поверхностей (итог «Деньги», лента, касса,
+# отчёты) — иначе бот и WebApp расходятся в сумме (платёж удалённого заказа
+# виден в одной поверхности и скрыт в другой). Требует JOIN orders o ON o.id =
+# <payments-alias>.order_id и алиас payments-таблицы.
+_LIVE_ORDER_PAYMENT_JOIN = "LEFT JOIN orders o ON o.id = {p}.order_id"
+_LIVE_ORDER_PAYMENT_FILTER = (
+    "(o.id IS NULL OR (o.ms_deleted_at IS NULL AND o.deleted_at IS NULL))"
+)
+
 # Возвраты, уменьшающие «к оплате» по заказу: ТОЛЬКО не-cash (debt_reduction /
 # no_refund / без метода). Cash-возврат физически отдаёт деньги (отрицательная
 # сдача в кассе) — он не должен ещё и уменьшать долг по заказу, иначе клиента
@@ -4632,15 +4643,18 @@ async def get_payment(payment_id: int) -> dict | None:
 async def get_payments_report(since: str | None = None, until: str | None = None) -> list[dict]:
     """Подтверждённые платежи за период. asyncpg-миграция Stage 7 (задача #21):
     нативный async через adb_core. Вызов — только handlers/payments (`await adb`)."""
-    query = "SELECT * FROM payments WHERE status = 'confirmed'"
+    query = (
+        f"SELECT p.* FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
+        f"WHERE p.status = 'confirmed' AND {_LIVE_ORDER_PAYMENT_FILTER}"
+    )
     params: list = []
     if since:
         params.append(since)
-        query += f" AND created_at >= ${len(params)}"
+        query += f" AND p.created_at >= ${len(params)}"
     if until:
         params.append(until)
-        query += f" AND created_at <= ${len(params)}"
-    query += " ORDER BY created_at DESC"
+        query += f" AND p.created_at <= ${len(params)}"
+    query += " ORDER BY p.created_at DESC"
     return await adb_core.fetch(query, *params)
 
 
@@ -4661,8 +4675,8 @@ async def get_cash_history(limit: int = 80) -> list[dict]:
     pays = await adb_core.fetch(
         "SELECT p.id, p.user_id, p.amount, p.currency, p.status, p.comment, "
         "p.order_id, p.created_at "
-        "FROM payments p LEFT JOIN orders o ON o.id = p.order_id "
-        "WHERE (o.id IS NULL OR (o.ms_deleted_at IS NULL AND o.deleted_at IS NULL)) "
+        f"FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
+        f"WHERE {_LIVE_ORDER_PAYMENT_FILTER} "
         "ORDER BY p.created_at DESC LIMIT $1",
         limit,
     )
@@ -4724,17 +4738,18 @@ def get_cashbox_stats(since: str | None = None, until: str | None = None) -> dic
     silent-bug; см. CLAUDE.md).
     """
     query = (
-        f"SELECT currency, COUNT(*) AS cnt, {_SUM_PAYMENTS_CENTS} AS total_cents "
-        "FROM payments WHERE status = 'confirmed'"
+        f"SELECT p.currency AS currency, COUNT(*) AS cnt, {_SUM_PAYMENTS_CENTS} AS total_cents "
+        f"FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
+        f"WHERE p.status = 'confirmed' AND {_LIVE_ORDER_PAYMENT_FILTER}"
     )
     params: list = []
     if since:
-        query += " AND created_at >= ?"
+        query += " AND p.created_at >= ?"
         params.append(since)
     if until:
-        query += " AND created_at <= ?"
+        query += " AND p.created_at <= ?"
         params.append(until)
-    query += " GROUP BY currency"
+    query += " GROUP BY p.currency"
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(q(query), params)
@@ -4767,9 +4782,8 @@ async def get_money_totals(since: str | None = None, until: str | None = None) -
         "SELECT p.currency AS currency, COUNT(*) AS cnt, "
         "COALESCE(SUM(COALESCE(p.amount_cents, CAST(round(p.amount * 100) AS INTEGER))), 0) "
         "AS total_cents "
-        "FROM payments p LEFT JOIN orders o ON o.id = p.order_id "
-        "WHERE p.status = 'confirmed' "
-        "AND (o.id IS NULL OR (o.ms_deleted_at IS NULL AND o.deleted_at IS NULL))"
+        f"FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
+        f"WHERE p.status = 'confirmed' AND {_LIVE_ORDER_PAYMENT_FILTER}"
     )
     pay_params: list = []
     if since:
@@ -4817,17 +4831,18 @@ async def get_summary_by_employee(
 ) -> list[dict]:
     """Платежи по сотрудникам (confirmed). asyncpg Stage 8 (#21)."""
     query = (
-        "SELECT full_name, currency, SUM(amount) as total, COUNT(*) as count "
-        "FROM payments WHERE status = 'confirmed'"
+        "SELECT p.full_name, p.currency, SUM(p.amount) as total, COUNT(*) as count "
+        f"FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
+        f"WHERE p.status = 'confirmed' AND {_LIVE_ORDER_PAYMENT_FILTER}"
     )
     params: list = []
     if since:
         params.append(since)
-        query += f" AND created_at >= ${len(params)}"
+        query += f" AND p.created_at >= ${len(params)}"
     if until:
         params.append(until)
-        query += f" AND created_at <= ${len(params)}"
-    query += " GROUP BY full_name, currency ORDER BY total DESC"
+        query += f" AND p.created_at <= ${len(params)}"
+    query += " GROUP BY p.full_name, p.currency ORDER BY total DESC"
     return await adb_core.fetch(query, *params)
 
 
