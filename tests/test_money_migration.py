@@ -98,6 +98,7 @@ def test_mark_order_paid_dual_writes_cents(isolated_db):
     oid = db.create_order(1, "Manager", "")
     db.add_order_item(oid, "P", "href", 1, "шт", 100.0)
     _exec(db, "UPDATE orders SET payment_type='credit' WHERE id=?", (oid,))
+    db.update_order_status(oid, "shipped")  # mark_paid только по активному заказу (WP-09)
 
     ok, pid = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=40.0))
     assert ok
@@ -112,6 +113,7 @@ def test_mark_order_paid_full_uses_remaining_cents(isolated_db):
     oid = db.create_order(1, "Manager", "")
     db.add_order_item(oid, "P", "href", 2, "шт", 49.99)  # 99.98 → 9998 коп.
     _exec(db, "UPDATE orders SET payment_type='credit' WHERE id=?", (oid,))
+    db.update_order_status(oid, "shipped")  # mark_paid только по активному заказу (WP-09)
 
     ok, pid = asyncio.run(db.mark_order_paid(oid, 1, "Manager"))  # amount=None → весь остаток
     assert ok

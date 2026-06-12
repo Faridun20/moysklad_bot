@@ -4335,6 +4335,11 @@ async def delete_order(order_id: int, requested_by: int) -> bool:
             return False
         if row["user_id"] != requested_by or row["status"] != "draft":
             return False
+        # Не удаляем заказ, по которому есть платежи (WP-09): payments не входят в
+        # каскад (в SQLite FK выкл.), и orphan-платёж потом подтвердился бы в кассу/
+        # МС против несуществующего заказа. Такой draft нужно разобрать вручную.
+        if await txn.fetchval("SELECT 1 FROM payments WHERE order_id = $1 LIMIT 1", order_id):
+            return False
 
         # Каскад вручную, чтобы работало и в SQLite (FK off by default)
         await txn.execute("DELETE FROM order_items WHERE order_id = $1", order_id)
@@ -5255,13 +5260,13 @@ async def mark_order_paid(
         # Lock заказа
         if USE_POSTGRES:
             row = await txn.fetchrow(
-                "SELECT payment_type, currency, agent_name, paid_confirmed_at "
+                "SELECT payment_type, currency, agent_name, paid_confirmed_at, status "
                 "FROM orders WHERE id = $1 FOR UPDATE",
                 order_id,
             )
         else:
             row = await txn.fetchrow(
-                "SELECT payment_type, currency, agent_name, paid_confirmed_at "
+                "SELECT payment_type, currency, agent_name, paid_confirmed_at, status "
                 "FROM orders WHERE id = $1",
                 order_id,
             )
@@ -5275,6 +5280,12 @@ async def mark_order_paid(
         if payment_type != "credit":
             return (False, None)
         if already_closed:
+            return (False, None)
+        # Гард статуса (WP-09): оплату принимаем только по активному кредит-заказу.
+        # Без него менеджер мог mark_paid по черновику/отклонённому (напр. кредит-
+        # заказ, возвращённый боссом в draft) — pending-платёж против не-одобренного
+        # заказа, который потом удалят (orphan-платёж в кассе).
+        if row["status"] not in ("approved", "shipped", "partially_returned"):
             return (False, None)
 
         # Под locком считаем суммы — гарантия что между recompute и
