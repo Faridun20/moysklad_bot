@@ -673,6 +673,12 @@ def _create_indexes():
             # Аудит: get_audit_log сортирует по created_at, prune_audit_log
             # фильтрует по нему.
             "CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at)",
+            # WP-26: лента «Движение денег» (get_cash_history) и касса/отчёты
+            # делают ORDER BY created_at DESC LIMIT / range по created_at на этих
+            # трёх таблицах — без индекса full scan + sort, дорожает с ростом БД.
+            "CREATE INDEX IF NOT EXISTS idx_payments_created ON payments(created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_cash_deposits_created ON cash_deposits(created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_returns_created ON returns(created_at)",
         ]
         for sql in snapshot_indexes:
             try:
