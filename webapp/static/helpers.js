@@ -212,9 +212,27 @@
     return { state: 'zero', amount: '0', currency: cur };
   }
 
+  // Единый период-сегмент (WP-29): пресеты .seg-item + доп-кнопка «Период…»
+  // (произвольный диапазон). Раньше разметка дублировалась в analyticsHeaderHtml
+  // (data-period) и renderOrdersMain (data-operiod) и уже разъехалась — в Заказах
+  // кнопка не показывала выбранный диапазон. attr — имя data-атрибута
+  // ('data-period'|'data-operiod'); customLabel — подпись доп-кнопки (даты или
+  // «Период…»). Возвращает .seg-row (seg + aux).
+  function periodSegHtml(presets, activeId, attr, customActive, customLabel) {
+    const seg = (presets || []).map((p) =>
+      `<button class="seg-item ${activeId === p.id ? 'active' : ''}" ${attr}="${p.id}" ` +
+      `aria-pressed="${activeId === p.id}">${escapeHtml(p.label)}</button>`
+    ).join('');
+    return (
+      `<div class="seg-row"><div class="seg">${seg}</div>` +
+      `<button class="seg-aux ${customActive ? 'active' : ''}" ${attr}="custom" ` +
+      `aria-pressed="${customActive}">${icon('clock')} ${escapeHtml(customLabel || 'Период…')}</button></div>`
+    );
+  }
+
   return {
     escapeHtml, idemKey, formatDateRU, icon, opsAmount,
     renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml, financeTabs,
-    balanceParts,
+    balanceParts, periodSegHtml,
   };
 });

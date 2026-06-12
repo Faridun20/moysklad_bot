@@ -1276,9 +1276,14 @@ function renderOrdersMain() {
     { id: '7d', label: '7 дней' },
     { id: '30d', label: '30 дней' },
   ];
-  const periodSeg = periods.map(p =>
-    `<button class="seg-item ${currentOrderPeriod === p.id ? 'active' : ''}" data-operiod="${p.id}" aria-pressed="${currentOrderPeriod === p.id}">${escapeHtml(p.label)}</button>`
-  ).join('');
+  // «Период…» показывает выбранный диапазон (как в Аналитике, WP-29) — раньше
+  // всегда статичный «Период…» без обратной связи.
+  const orderCustomLabel = (currentOrderPeriod === 'custom' && currentOrderFrom && currentOrderTo)
+    ? `${formatDateRU(currentOrderFrom)}—${formatDateRU(currentOrderTo)}`
+    : 'Период…';
+  const periodRow = periodSegHtml(
+    periods, currentOrderPeriod, 'data-operiod', currentOrderPeriod === 'custom', orderCustomLabel
+  );
   const periodPanel = currentOrderPeriod === 'custom' ? dateRangeHost() : '';
 
   // Если активный статус-фильтр недоступен для роли (сменилась роль/состояние) —
@@ -1379,10 +1384,7 @@ function renderOrdersMain() {
     <div class="section-label">Статус</div>
     <div class="seg-row"><div class="seg seg--scroll">${statusSeg}</div></div>
     <div class="section-label">Период</div>
-    <div class="seg-row">
-      <div class="seg">${periodSeg}</div>
-      <button class="seg-aux ${currentOrderPeriod === 'custom' ? 'active' : ''}" data-operiod="custom" aria-pressed="${currentOrderPeriod === 'custom'}">${icon('clock')} Период…</button>
-    </div>
+    ${periodRow}
     ${periodPanel}
     ${!isBoss ? `<button class="btn-new-order" id="btn-new-order">${icon('plus')} Новый заказ</button>` : ''}
 
@@ -2179,17 +2181,12 @@ function analyticsHeaderHtml(isBoss) {
     { id: 'week', label: 'Неделя' }, { id: 'month', label: 'Месяц' },
     { id: '3month', label: 'Квартал' }, { id: 'year', label: 'Год' },
   ];
-  const presetSeg = presets.map(p =>
-    `<button class="seg-item ${analyticsPeriod === p.id ? 'active' : ''}" data-period="${p.id}" aria-pressed="${analyticsPeriod === p.id}">${p.label}</button>`
-  ).join('');
   const customLabel = (analyticsPeriod === 'custom' && analyticsSince && analyticsUntil)
     ? `${formatDateRU(analyticsSince)}—${formatDateRU(analyticsUntil)}`
     : 'Период…';
-  const periodBar = `
-    <div class="seg-row">
-      <div class="seg">${presetSeg}</div>
-      <button class="seg-aux ${analyticsPeriod === 'custom' ? 'active' : ''}" data-period="custom" aria-pressed="${analyticsPeriod === 'custom'}">${icon('clock')} ${customLabel}</button>
-    </div>`;
+  const periodBar = periodSegHtml(
+    presets, analyticsPeriod, 'data-period', analyticsPeriod === 'custom', customLabel
+  );
   const periodPanel = analyticsPeriod === 'custom' ? dateRangeHost() : '';
   return `${viewSeg}<div class="section-label">Период</div>${periodBar}${periodPanel}`;
 }

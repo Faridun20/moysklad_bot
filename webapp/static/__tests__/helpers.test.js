@@ -8,8 +8,23 @@ import helpers from '../helpers.js';
 
 const {
   escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml,
-  parsePaymentItems, renderMoneyTotalsHtml, financeTabs, balanceParts,
+  parsePaymentItems, renderMoneyTotalsHtml, financeTabs, balanceParts, periodSegHtml,
 } = helpers;
+
+describe('periodSegHtml (WP-29)', () => {
+  const presets = [{ id: 'week', label: 'Неделя' }, { id: 'month', label: 'Месяц' }];
+  it('активный пресет получает .active и нужный data-атрибут', () => {
+    const html = periodSegHtml(presets, 'month', 'data-period', false, 'Период…');
+    expect(html).toContain('class="seg-item active" data-period="month"');
+    expect(html).toContain('data-period="custom"');
+  });
+  it('custom активен → подпись диапазона на доп-кнопке', () => {
+    const html = periodSegHtml(presets, 'custom', 'data-operiod', true, '01.06—12.06');
+    expect(html).toContain('data-operiod="custom"');
+    expect(html).toContain('01.06—12.06');  // показывает выбранный диапазон
+    expect(html).toMatch(/seg-aux active/);
+  });
+});
 
 describe('balanceParts (WP-27)', () => {
   it('<0 → клиент должен (owe), сумма по модулю', () => {
