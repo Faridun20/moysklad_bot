@@ -198,8 +198,23 @@
     return `${head}<div class="stock-list">${rows}${depRow}</div>`;
   }
 
+  // Разбор МС-баланса контрагента (взаиморасчёты) для отображения — ЕДИНЫЙ
+  // источник инвертированной конвенции знака (WP-27): <0 — клиент ДОЛЖЕН нам,
+  // >0 — аванс/переплата. Раньше тернарники дублировались в renderClients и
+  // renderAgentDetail и уже разъезжались (был sign-баг). Возвращает {state,
+  // amount, currency}; разметку каждый экран строит сам.
+  function balanceParts(cents, baseCurrency) {
+    const cur = String(baseCurrency || 'USD');
+    if (cents == null) return { state: 'none', amount: '', currency: cur };
+    const c = Number(cents) || 0;
+    if (c < 0) return { state: 'owe', amount: opsAmount(-c / 100), currency: cur };
+    if (c > 0) return { state: 'adv', amount: opsAmount(c / 100), currency: cur };
+    return { state: 'zero', amount: '0', currency: cur };
+  }
+
   return {
     escapeHtml, idemKey, formatDateRU, icon, opsAmount,
     renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml, financeTabs,
+    balanceParts,
   };
 });

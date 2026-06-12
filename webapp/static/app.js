@@ -2956,15 +2956,24 @@ async function renderClients(container) {
     return;
   }
   // Сверху — кто больше должен. В МС-балансе (взаиморасчёты) ДОЛГ клиента —
-  // отрицательный (аванс/переплата — положительный), поэтому должники = самый
-  // отрицательный баланс → сортируем по возрастанию, баланс-нет в конец.
-  const balOf = c => (c.balance_cents != null ? c.balance_cents : Infinity);
-  clients.sort((a, b) => balOf(a) - balOf(b));
-  const balStr = (bal) => bal == null
-    ? '<span class="money-placeholder">баланс —</span>'
-    : bal < 0 ? `<span class="bal-owe">должен ${fmtCents(-bal)} ${escapeHtml(baseC)}</span>`
-    : bal > 0 ? `<span class="bal-adv">аванс ${fmtCents(bal)} ${escapeHtml(baseC)}</span>`
-    : `0 ${escapeHtml(baseC)}`;
+  // отрицательный → должники = самый отрицательный баланс наверху; баланс-нет в
+  // конец. Null-safe компаратор (WP-28): прежний Infinity-сентинел давал
+  // Infinity−Infinity=NaN на двух null → неопределённый порядок по спецификации.
+  const balOf = c => (c.balance_cents != null ? c.balance_cents : null);
+  clients.sort((a, b) => {
+    const x = balOf(a), y = balOf(b);
+    if (x == null) return y == null ? 0 : 1;
+    if (y == null) return -1;
+    return x - y;
+  });
+  const balStr = (bal) => {
+    const p = balanceParts(bal, baseC);  // единая конвенция знака (WP-27)
+    const cur = escapeHtml(p.currency);
+    if (p.state === 'none') return '<span class="money-placeholder">баланс —</span>';
+    if (p.state === 'owe') return `<span class="bal-owe">должен ${p.amount} ${cur}</span>`;
+    if (p.state === 'adv') return `<span class="bal-adv">аванс ${p.amount} ${cur}</span>`;
+    return `0 ${cur}`;
+  };
   const cards = clients.map(c => `
       <div class="debt-card" data-agent="${escapeHtml(c.agent_id)}" role="button" tabindex="0">
         <div class="debt-card-top">
@@ -2998,12 +3007,13 @@ async function renderAgentDetail(agentId) {
   const fmt = n => Math.round(n).toLocaleString('ru-RU');
   const fmtCents = c => opsAmount((Number(c) || 0) / 100);
   const baseC = d.base_currency || baseCur();
-  // МС-баланс (взаиморасчёты): <0 — клиент должен нам, >0 — аванс/переплата.
-  const bal = d.balance_cents;
-  const balLine = bal == null ? 'Баланс МойСклад: —'
-    : bal < 0 ? `Баланс МойСклад: должен нам <b>${fmtCents(-bal)} ${escapeHtml(baseC)}</b>`
-    : bal > 0 ? `Баланс МойСклад: аванс <b>${fmtCents(bal)} ${escapeHtml(baseC)}</b>`
-    : `Баланс МойСклад: <b>0 ${escapeHtml(baseC)}</b>`;
+  // МС-баланс (взаиморасчёты) — единая конвенция знака через balanceParts (WP-27).
+  const bp = balanceParts(d.balance_cents, baseC);
+  const bpCur = escapeHtml(bp.currency);
+  const balLine = bp.state === 'none' ? 'Баланс МойСклад: —'
+    : bp.state === 'owe' ? `Баланс МойСклад: должен нам <b>${bp.amount} ${bpCur}</b>`
+    : bp.state === 'adv' ? `Баланс МойСклад: аванс <b>${bp.amount} ${bpCur}</b>`
+    : `Баланс МойСклад: <b>0 ${bpCur}</b>`;
 
   // Покупки из МС.
   const pur = d.purchases || {};

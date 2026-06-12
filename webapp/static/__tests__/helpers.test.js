@@ -8,8 +8,21 @@ import helpers from '../helpers.js';
 
 const {
   escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml,
-  parsePaymentItems, renderMoneyTotalsHtml, financeTabs,
+  parsePaymentItems, renderMoneyTotalsHtml, financeTabs, balanceParts,
 } = helpers;
+
+describe('balanceParts (WP-27)', () => {
+  it('<0 → клиент должен (owe), сумма по модулю', () => {
+    expect(balanceParts(-150000, 'USD')).toEqual({ state: 'owe', amount: '1 500', currency: 'USD' });
+  });
+  it('>0 → аванс (adv)', () => {
+    expect(balanceParts(5000, 'UZS')).toEqual({ state: 'adv', amount: '50', currency: 'UZS' });
+  });
+  it('0 → zero, null → none', () => {
+    expect(balanceParts(0, 'USD').state).toBe('zero');
+    expect(balanceParts(null, 'USD').state).toBe('none');
+  });
+});
 
 describe('escapeHtml', () => {
   it('экранирует все спец-символы HTML', () => {
