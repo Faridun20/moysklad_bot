@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import time
 from urllib.parse import parse_qsl
 
@@ -16,10 +17,12 @@ from config import TELEGRAM_TOKEN
 
 logger = logging.getLogger(__name__)
 
-# Максимальный возраст initData — 24 часа. Перехваченный initData старше
-# 24 часов считается просроченным и отвергается, защита от replay-атак.
-# Telegram официально рекомендует <= 86400 секунд.
-MAX_INIT_DATA_AGE = 86400
+# Максимальный возраст initData (WP-23). Было 86400 (24ч) — перехваченный из
+# логов прокси/реферера initData реплеился целые сутки против всех write-
+# эндпоинтов. Для денежного бэкенда окно по умолчанию ужато до 1 часа (WebApp
+# обновляет initData при каждом открытии). Тюнится env INIT_DATA_MAX_AGE_SEC
+# на случай очень долгих сессий. Telegram рекомендует <= 86400.
+MAX_INIT_DATA_AGE = int(os.environ.get("INIT_DATA_MAX_AGE_SEC", "3600"))
 
 
 def verify_init_data(init_data: str) -> dict | None:
