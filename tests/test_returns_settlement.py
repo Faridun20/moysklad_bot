@@ -35,6 +35,26 @@ def _confirm_return(db, oid, iid, qty, amount, method="debt_reduction"):
     return r["return_id"]
 
 
+def test_confirm_return_cash_records_negative_deposit_from_cents(isolated_db):
+    """WP-08: cash-возврат пишет отрицательную подтверждённую сдачу из
+    total_amount_cents в одной транзакции с подтверждением (касса не завышается,
+    нет состояния «возврат принят, выплата не записана»)."""
+    db = isolated_db
+    oid, iid = _credit_shipped(db, 100.0, 5)  # total 500
+    rid = _confirm_return(db, oid, iid, 2, 200.0, method="cash")  # 200 наличными
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q("SELECT amount_cents, status FROM cash_deposits WHERE notes = ?"),
+            (f"refund возврат #{rid}",),
+        )
+        row = cur.fetchone()
+    assert row is not None, "cash-выплата не записана"
+    d = dict(row)
+    assert d["status"] == "confirmed"
+    assert d["amount_cents"] == -20000  # −200.00, из cents
+
+
 def test_summary_remaining_net_of_returns(isolated_db):
     db = isolated_db
     oid, iid = _credit_shipped(db, 100.0, 10)  # total 1000

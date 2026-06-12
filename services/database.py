@@ -2706,7 +2706,17 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
     # Round 6 (L_R2): атомарная проверка returned_qty + delta <= quantity.
     # Без неё concurrent confirm двух разных returns по одному заказу мог
     # наращивать returned_qty за пределы quantity (overshoot → лишний MS-doc).
+    from config import BASE_CURRENCY
+
+    order_id = ret["order_id"]
     ritems: list[dict] = []
+    new_status = "partially_returned"
+    return_status = "partial"
+    # Атомарная секция (WP-08): подтверждение возврата + overshoot-guard + СТАТУС
+    # ЗАКАЗА + денежный refund — в ОДНОЙ транзакции. Раньше статус и cash-выплата
+    # писались ПОСЛЕ коммита подтверждения → крах между ними оставлял возврат
+    # «confirmed» (товар оприходован), а выплату из кассы незаписанной → касса
+    # завышалась без возможности reconcile. Теперь либо всё, либо ничего.
     try:
         async with adb_core.transaction() as txn:
             rc = await txn.execute(
@@ -2731,67 +2741,70 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
                         "Превышен доступный остаток к возврату (другой возврат "
                         "уже учтён). Перепроверьте и создайте новый."
                     )
+
+            # Полностью ли возвращён заказ? (returned_qty уже обновлён в этой txn.)
+            items = await txn.fetch(
+                "SELECT quantity, returned_qty FROM order_items WHERE order_id = $1", order_id
+            )
+            fully = (
+                all(
+                    float(it["returned_qty"] or 0) + 1e-9 >= float(it["quantity"] or 0)
+                    for it in items
+                )
+                if items
+                else False
+            )
+            new_status = "returned" if fully else "partially_returned"
+            return_status = "full" if fully else "partial"
+            await txn.execute(
+                "UPDATE orders SET status = $1, return_status = $2, updated_at = $3 WHERE id = $4",
+                new_status, return_status, now_str(), order_id,
+            )
+
+            # Refund: cash → отрицательная подтверждённая сдача (выдача из кассы).
+            if ret.get("refund_method") == "cash":
+                order = await txn.fetchrow(
+                    "SELECT user_id, currency FROM orders WHERE id = $1", order_id
+                )
+                # Касса ведётся в БАЗОВОЙ валюте (у cash_deposits нет колонки валюты).
+                # Сумму берём из total_amount_cents (точно), конвертируем в базовую —
+                # иначе возврат по UZS-заказу вычел бы «5 000 000 USD» из кассы.
+                order_cur = ((order or {}).get("currency") or BASE_CURRENCY or "USD").upper()
+                cents = ret.get("total_amount_cents")
+                refund_major = (
+                    float(money.from_cents(int(cents)))
+                    if cents is not None
+                    else float(ret.get("total_amount") or 0)
+                )
+                refund_base = convert_to_base(refund_major, order_cur)
+                if refund_base is None:
+                    refund_base = refund_major  # курс не задан — пишем как есть
+                    logger.warning(
+                        "confirm_return #%s: нет курса %s→базовая, refund в кассу "
+                        "записан без конвертации", return_id, order_cur,
+                    )
+                await txn.execute(
+                    "INSERT INTO cash_deposits (manager_id, amount, amount_cents, deposited_at, "
+                    "status, confirmed_by, confirmed_at, notes, created_at) "
+                    "VALUES ($1, $2, $3, $4, 'confirmed', $5, $6, $7, $8)",
+                    (order or {}).get("user_id") or confirmed_by,
+                    -refund_base,
+                    -money.to_cents(refund_base),  # dual-write копеек (отриц.)
+                    now_str(), confirmed_by, now_str(),
+                    f"refund возврат #{return_id}", now_str(),
+                )
+            # debt_reduction / no_refund — отдельной записи не требуют (долг учитывает
+            # подтверждённые возвраты в get_agent_current_debt).
     except _TxnAbort as e:
         return {"ok": False, "error": e.message}
 
-    # Восстановление остатков по партиям — отдельно, через _adjust_batch_qty.
+    # Восстановление остатков по партиям — после атомарной секции (склад, не деньги).
     for ri in ritems:
         batch_id = await adb_core.fetchval(
             "SELECT batch_id FROM order_items WHERE id = $1", ri["order_item_id"]
         )
         if batch_id:
             await asyncio.to_thread(_adjust_batch_qty, batch_id, float(ri["qty"]))
-
-    order_id = ret["order_id"]
-    # Полностью ли возвращён заказ?
-    items = await get_order_items(order_id)
-    fully = (
-        all(
-            float(it.get("returned_qty") or 0) + 1e-9 >= float(it.get("quantity") or 0)
-            for it in items
-        )
-        if items
-        else False
-    )
-    new_status = "returned" if fully else "partially_returned"
-    return_status = "full" if fully else "partial"
-    await adb_core.execute(
-        "UPDATE orders SET status = $1, return_status = $2, updated_at = $3 WHERE id = $4",
-        new_status, return_status, now_str(), order_id,
-    )
-
-    # Refund: cash → отрицательная подтверждённая сдача (учёт выдачи из кассы).
-    if ret.get("refund_method") == "cash":
-        from config import BASE_CURRENCY
-
-        order = await get_order(order_id)
-        # Касса ведётся в БАЗОВОЙ валюте (у cash_deposits нет колонки валюты).
-        # total_amount возврата — в валюте заказа; конвертируем в базовую, иначе
-        # возврат по UZS-заказу вычел бы «5 000 000 USD» из итогов кассы.
-        order_cur = ((order or {}).get("currency") or BASE_CURRENCY or "USD").upper()
-        refund_major = float(ret["total_amount"])
-        refund_base = convert_to_base(refund_major, order_cur)
-        if refund_base is None:
-            refund_base = refund_major  # курс не задан — пишем как есть (best-effort)
-            logger.warning(
-                "confirm_return #%s: нет курса %s→базовая, refund в кассу записан "
-                "без конвертации", return_id, order_cur,
-            )
-        await adb_core.execute(
-            "INSERT INTO cash_deposits (manager_id, amount, amount_cents, deposited_at, "
-            "status, confirmed_by, confirmed_at, notes, created_at) "
-            "VALUES ($1, $2, $3, $4, 'confirmed', $5, $6, $7, $8)",
-            (order or {}).get("user_id") or confirmed_by,
-            -refund_base,
-            -money.to_cents(refund_base),  # dual-write копеек (отриц.)
-            now_str(),
-            confirmed_by,
-            now_str(),
-            f"refund возврат #{return_id}",
-            now_str(),
-        )
-    # debt_reduction / no_refund — отдельной записи не требуют (долг учитывает
-    # подтверждённые возвраты в get_agent_current_debt).
 
     # Частичный возврат мог обнулить остаток к оплате (платежи уже покрыли
     # total − возврат) → закрываем заказ. Полный возврат (status='returned') —
