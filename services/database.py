@@ -823,6 +823,11 @@ def run_migrations():
             #     в run_backfills (x_cents = round(x*100)). Старые REAL пока
             #     остаются для безопасного rolling-деплоя. См. services/money.py.
             ("payments", "amount_cents", "BIGINT"),
+            # Время claim'а платежа для MS-синка (WP-10). Reaper orphan'ов судит
+            # устаревание по нему, а не по confirmed_at: иначе любой платёж,
+            # подтверждённый >30 мин назад, мог быть сброшен reaper'ом ПРЯМО во
+            # время in-flight POST → второй paymentin в МС (дубль).
+            ("payments", "ms_sync_claimed_at", "TEXT"),
             ("order_items", "price_cents", "BIGINT"),
             ("order_items", "price_at_submit_cents", "BIGINT"),
             ("credit_limits", "limit_amount_cents", "BIGINT"),
@@ -4056,15 +4061,16 @@ def reset_stale_in_progress_payments(older_than_minutes: int = 30) -> int:
     Вызывается из tasks/run_ms_sync_retry.main() в самом начале, до
     основной логики. Возвращает количество сброшенных строк.
 
-    Порог по confirmed_at (а не отдельной колонке ms_sync_claimed_at) —
-    достаточно точный для текущей нагрузки: легальный sync укладывается
-    в секунды, 30+ минут — гарантированно orphan. Дополнительная колонка
-    потребовала бы миграции и пока не оправдана.
+    Порог — по ВРЕМЕНИ CLAIM'а (ms_sync_claimed_at), а НЕ confirmed_at (WP-10):
+    confirmed_at — время подтверждения платежа, не начала синка; платёж,
+    подтверждённый >30 мин назад и синкаемый сейчас, имеет старый confirmed_at,
+    и reaper сбрасывал его ПРЯМО во время in-flight POST → второй paymentin в МС.
+    COALESCE с confirmed_at — для легаси-строк без claimed_at.
 
     Порог вычисляем в Python через тот же `now_str()` (local TZ через
-    `datetime.now()`), что и при записи `confirmed_at` — иначе бы
-    SQLite/Postgres-side функции `datetime('now',...)`/`NOW()` вернули
-    UTC, и сравнение строк в разных TZ всегда было бы False (тихий баг).
+    `datetime.now()`), что и при записи времён — иначе бы SQLite/Postgres-side
+    функции `datetime('now',...)`/`NOW()` вернули UTC, и сравнение строк в
+    разных TZ всегда было бы False (тихий баг).
     """
     threshold = (datetime.now() - timedelta(minutes=older_than_minutes)).strftime(
         "%Y-%m-%d %H:%M:%S"
@@ -4077,7 +4083,7 @@ def reset_stale_in_progress_payments(older_than_minutes: int = 30) -> int:
                 "SET ms_sync_status = NULL "
                 "WHERE ms_sync_status = 'in_progress' "
                 "  AND ms_paymentin_id IS NULL "
-                "  AND confirmed_at < ?"
+                "  AND COALESCE(ms_sync_claimed_at, confirmed_at) < ?"
             ),
             (threshold,),
         )
@@ -4114,12 +4120,12 @@ def claim_payment_for_ms_sync(payment_id: int) -> bool:
         cur.execute(
             q(
                 "UPDATE payments "
-                "SET ms_sync_status = 'in_progress' "
+                "SET ms_sync_status = 'in_progress', ms_sync_claimed_at = ? "
                 "WHERE id = ? "
                 "  AND ms_paymentin_id IS NULL "
                 "  AND (ms_sync_status IS NULL OR ms_sync_status != 'in_progress')"
             ),
-            (payment_id,),
+            (now_str(), payment_id),
         )
         claimed = cur.rowcount > 0
         conn.commit()

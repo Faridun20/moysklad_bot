@@ -152,8 +152,17 @@ async def create_paymentin_for_payment(payment_id: int) -> dict:
         amount_minor = money.to_cents(payment.get("amount") or 0)
     amount_minor = int(amount_minor)
 
+    # Детерминированный syncId (WP-10): идемпотентный ключ paymentin'а от id
+    # платежа. Даёт МС-стороннюю дедупликацию и позволяет подхватить уже
+    # созданный документ, если процесс упал между прошлым POST и локальной
+    # записью ms_paymentin_id (иначе reset_stale → повторный POST → дубль).
+    import uuid as _uuid
+
+    sync_id = str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"bot-paymentin-{payment_id}"))
+
     payload: dict[str, Any] = {
         "name": f"Платёж #{payment_id} по заказу #{order['id']} (бот)",
+        "syncId": sync_id,
         "organization": _meta(org_meta["href"], "organization"),
         "agent": _meta(agent_href, "counterparty"),
         "sum": amount_minor,
@@ -163,6 +172,25 @@ async def create_paymentin_for_payment(payment_id: int) -> dict:
             f"{payment.get('comment') or ''}\nМенеджер: {payment.get('full_name') or '—'}"
         ).strip(),
     }
+
+    # Перед POST ищем существующий paymentin с этим syncId — если он есть
+    # (краш между прошлым POST-успехом и локальной записью), подхватываем его
+    # и НЕ создаём дубль. Best-effort: ошибка поиска не блокирует основной путь.
+    try:
+        existing = await ms_get(
+            "entity/paymentin", params={"filter": f"syncId={sync_id}", "limit": 1}
+        )
+        rows = (existing or {}).get("rows") or []
+        if rows:
+            paymentin_id = rows[0].get("id", "")
+            set_payment_ms_sync(payment_id, paymentin_id=paymentin_id, status="synced", error="")
+            logger.info(
+                "MS paymentin уже существует (syncId), подхвачен: id=%s (payment #%d)",
+                paymentin_id, payment_id,
+            )
+            return {"ok": True, "paymentin_id": paymentin_id, "adopted": True}
+    except Exception as e:  # noqa: BLE001 — поиск опционален, POST не блокируем
+        logger.warning("MS paymentin pre-search по syncId не удался: %s", e)
 
     # Привязка платежа к документу. Предпочитаем customerorder (новый
     # workflow), fallback на legacy demand. operations — массив,
