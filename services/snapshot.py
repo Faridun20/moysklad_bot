@@ -23,7 +23,7 @@ import asyncio
 import logging
 
 from services import adb_core
-from services.database import get_conn, get_cursor, q, now_str
+from services.database import USE_POSTGRES, get_conn, get_cursor, now_str, q
 from services.moysklad import ms_get
 from utils.helpers import extract_id_from_href, safe_get, extract_href
 
@@ -88,6 +88,20 @@ async def _fetch_all(path: str, params: dict | None = None) -> list[dict]:
     return rows
 
 
+async def _try_snapshot_lock(tx, name: str) -> bool:
+    """pg try-advisory-lock на снапшот (WP-15). True = захватили (на SQLite — один
+    процесс, всегда True). False = другой процесс уже обновляет этот снапшот →
+    выходим тихо, без гонки DELETE+INSERT: иначе проигравший рефреш падал на
+    ms_id PK-коллизии (его meta_set не выполнялся, тик терялся, ошибки в часы
+    пик). Лок держится до конца транзакции."""
+    if not USE_POSTGRES:
+        return True
+    got = await tx.fetchval(
+        "SELECT pg_try_advisory_xact_lock(hashtext($1))", f"snapshot:{name}"
+    )
+    return bool(got)
+
+
 async def refresh_products() -> int:
     rows = await _fetch_all("entity/product")
     ts = now_str()
@@ -105,6 +119,9 @@ async def refresh_products() -> int:
         if (ms_id := (r.get("id") or extract_id_from_href(extract_href(r))))
     ]
     async with adb_core.transaction() as tx:
+        if not await _try_snapshot_lock(tx, "products"):
+            logger.info("refresh_products: уже выполняется в другом процессе — пропуск")
+            return 0
         await tx.execute("DELETE FROM ms_products")
         await tx.executemany(
             "INSERT INTO ms_products (ms_id, name, folder_id, code, unit, href, updated_at) "
@@ -131,6 +148,9 @@ async def refresh_categories() -> int:
         if (ms_id := (r.get("id") or extract_id_from_href(extract_href(r))))
     ]
     async with adb_core.transaction() as tx:
+        if not await _try_snapshot_lock(tx, "categories"):
+            logger.info("refresh_categories: уже выполняется в другом процессе — пропуск")
+            return 0
         await tx.execute("DELETE FROM ms_categories")
         await tx.executemany(
             "INSERT INTO ms_categories (ms_id, name, parent_id, href, updated_at) "
@@ -170,6 +190,9 @@ async def refresh_counterparties() -> int:
         if (ms_id := (r.get("id") or extract_id_from_href(extract_href(r))))
     ]
     async with adb_core.transaction() as tx:
+        if not await _try_snapshot_lock(tx, "counterparties"):
+            logger.info("refresh_counterparties: уже выполняется в другом процессе — пропуск")
+            return 0
         await tx.execute("DELETE FROM ms_counterparties")
         await tx.executemany(
             "INSERT INTO ms_counterparties (ms_id, name, phone, href, balance_cents, updated_at) "
@@ -192,6 +215,9 @@ async def refresh_employees() -> int:
         if (ms_id := (r.get("id") or extract_id_from_href(extract_href(r))))
     ]
     async with adb_core.transaction() as tx:
+        if not await _try_snapshot_lock(tx, "employees"):
+            logger.info("refresh_employees: уже выполняется в другом процессе — пропуск")
+            return 0
         await tx.execute("DELETE FROM ms_employees")
         await tx.executemany(
             "INSERT INTO ms_employees (ms_id, name, href, updated_at) VALUES ($1, $2, $3, $4)",
@@ -235,6 +261,9 @@ async def refresh_stock() -> int:
         if (ms_id := extract_id_from_href(extract_href(r)))
     ]
     async with adb_core.transaction() as tx:
+        if not await _try_snapshot_lock(tx, "stock"):
+            logger.info("refresh_stock: уже выполняется в другом процессе — пропуск")
+            return 0
         await tx.execute("DELETE FROM ms_stock")
         await tx.executemany(
             "INSERT INTO ms_stock (ms_id, name, folder_id, folder_name, unit, "
