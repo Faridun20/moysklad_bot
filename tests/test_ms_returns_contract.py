@@ -97,6 +97,47 @@ def test_salesreturn_builds_payload_and_saves_id(isolated_db, monkeypatch):
     assert "attributes" not in p
 
 
+def test_salesreturn_deletes_orphan_on_lost_race(isolated_db, monkeypatch):
+    """WP-14: если set_return_ms_id вернул False (гонку выиграл другой вызов),
+    наш только что созданный документ — orphan-дубль → удаляем его в МС."""
+    _prime_ctx(monkeypatch)
+    db = isolated_db
+    _oid, rid = _make_confirmed_return(db, with_demand=True)
+
+    async def _lost(*a, **k):  # симулируем проигрыш гонки
+        return False
+
+    monkeypatch.setattr(ms_returns.db, "set_return_ms_id", _lost)
+    deleted = {}
+
+    async def scenario():
+        from services import moysklad
+
+        moysklad._session = None
+        try:
+            with aioresponses() as m:
+                m.post(
+                    f"{MS_BASE}/entity/salesreturn",
+                    status=200,
+                    payload={"id": "SR-ORPHAN", "name": "Возврат"},
+                )
+
+                def _del_cb(url, **kwargs):
+                    deleted["url"] = str(url)
+
+                m.delete(
+                    f"{MS_BASE}/entity/salesreturn/SR-ORPHAN", status=200, callback=_del_cb
+                )
+                return await ms_returns.create_salesreturn(rid)
+        finally:
+            await moysklad.close_session()
+
+    res = asyncio.run(scenario())
+    assert res["ok"] is True
+    assert res.get("adopted") is True
+    assert "SR-ORPHAN" in deleted.get("url", "")  # orphan удалён в МС
+
+
 def test_salesreturn_idempotent_when_already_synced(isolated_db, monkeypatch):
     _prime_ctx(monkeypatch)
     db = isolated_db

@@ -103,7 +103,31 @@ async def create_salesreturn(return_id: int) -> dict:
                 return {"ok": False, "reason": f"HTTP {resp.status}: {safe}"}
             created = json.loads(body)
             ms_id = created.get("id", "")
-            await db.set_return_ms_id(return_id, ms_id)  # native async (asyncpg #21)
+            won = await db.set_return_ms_id(return_id, ms_id)  # «выиграл ли гонку»
+            if not won:
+                # Гонку проиграли: другой параллельный create_salesreturn уже
+                # записал id. Наш только что созданный документ в МС — orphan-дубль
+                # (склад и баланс контрагента задвоились бы) → удаляем best-effort
+                # (WP-14: SECURITY.md RACE-3 для этого и вернул bool).
+                logger.warning(
+                    "salesreturn возврата #%s: проиграли гонку set_return_ms_id — "
+                    "удаляю orphan-документ %s в МС",
+                    return_id, ms_id,
+                )
+                try:
+                    async with sess.delete(f"{MS_BASE}/entity/salesreturn/{ms_id}") as dresp:
+                        if dresp.status >= 400:
+                            logger.error(
+                                "salesreturn orphan-delete %s: HTTP %s", ms_id, dresp.status
+                            )
+                except Exception as de:  # noqa: BLE001 — удаление best-effort
+                    logger.warning(
+                        "salesreturn orphan-delete %s не удался: %s",
+                        ms_id, redact_ms_error(str(de)[:200]),
+                    )
+                fresh = await db.get_return(return_id)
+                winner_id = (fresh or {}).get("moysklad_return_id") or ms_id
+                return {"ok": True, "ms_id": winner_id, "skipped": skipped, "adopted": True}
             return {
                 "ok": True,
                 "ms_id": ms_id,
