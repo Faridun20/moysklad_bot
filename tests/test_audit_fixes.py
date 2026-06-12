@@ -188,6 +188,10 @@ def test_deactivated_user_blocked_immediately(client_env):
     # И ролевой эндпоинт тоже.
     resp2 = client.post("/api/orders", json={"initData": "200"})
     assert resp2.status_code == 403
+    # WP-21: /api/me раньше обходил гейт деактивации (звал verify_init_data
+    # напрямую) → отдавал 200. Теперь тоже 403.
+    resp3 = client.post("/api/me", json={"initData": "200"})
+    assert resp3.status_code == 403
 
 
 # ─── R2 (DB-идемпотентность денежных create) ─────────────────────────────────

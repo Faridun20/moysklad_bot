@@ -517,11 +517,11 @@ async def get_me(request: Request):
     проверяет подпись, возвращает информацию о пользователе и его роли.
     """
     data = await request.json()
-    init_data = data.get("initData", "")
-
-    user = verify_init_data(init_data)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+    # Через _authorize (allowed_roles=None) — валидирует initData И проверяет
+    # деактивацию (WP-21): раньше /api/me звал verify_init_data напрямую, минуя
+    # гейт деактивации → уволенный получал 200 (роль guest) вместо 403. Это
+    # единственный аутентифицированный эндпоинт, обходивший проверку.
+    user = _authorize(data, allowed_roles=None, rate_limit_scope="api_me", rate_limit_max=60)
 
     user_id = user["id"]
     role = get_role(user_id)
