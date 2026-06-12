@@ -4887,7 +4887,11 @@ async def get_cash_history(
         f"ORDER BY r.created_at DESC LIMIT ${len(ret_params)}",
         *ret_params,
     )
-    names = {u["user_id"]: u.get("full_name") or str(u["user_id"]) for u in get_all_users()}
+    # get_all_users — СИНХРОННЫЙ DB-read; внутри async-корутины (она минует
+    # to_thread-мост async_db) прямой вызов блокировал event loop FastAPI на
+    # запрос (WP-25). Через to_thread — не блокируем цикл.
+    users = await asyncio.to_thread(get_all_users)
+    names = {u["user_id"]: u.get("full_name") or str(u["user_id"]) for u in users}
 
     from config import BASE_CURRENCY
 
