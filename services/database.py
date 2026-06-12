@@ -4796,35 +4796,50 @@ async def get_cash_history(limit: int = 80) -> list[dict]:
         "FROM cash_deposits WHERE (deleted_at IS NULL) ORDER BY created_at DESC LIMIT $1",
         limit,
     )
+    # Возвраты: сумма в валюте ЗАКАЗА (LEFT JOIN orders.currency) — раньше
+    # хардкодили "USD" и брали float total_amount, из-за чего возврат на UZS-заказ
+    # показывался как «5 000 000 USD» (WP-07). Берём total_amount_cents.
     rets = await adb_core.fetch(
-        "SELECT id, order_id, created_by, total_amount, refund_method, status, "
-        "reason, created_at FROM returns WHERE (deleted_at IS NULL) "
-        "ORDER BY created_at DESC LIMIT $1",
+        "SELECT r.id, r.order_id, r.created_by, r.total_amount, r.total_amount_cents, "
+        "r.refund_method, r.status, r.reason, r.created_at, o.currency AS order_currency "
+        "FROM returns r LEFT JOIN orders o ON o.id = r.order_id "
+        "WHERE (r.deleted_at IS NULL) ORDER BY r.created_at DESC LIMIT $1",
         limit,
     )
     names = {u["user_id"]: u.get("full_name") or str(u["user_id"]) for u in get_all_users()}
+
+    from config import BASE_CURRENCY
+
+    base_cur = (BASE_CURRENCY or "USD").upper()
+
+    def _ret_amount(r: dict) -> float:
+        cents = r.get("total_amount_cents")
+        if cents is not None:
+            return float(money.from_cents(int(cents)))
+        return float(r.get("total_amount") or 0)
 
     rows: list[dict] = []
     for p in pays:
         rows.append({
             "kind": "payment", "id": p["id"], "amount": float(p["amount"] or 0),
-            "currency": p.get("currency") or "USD", "status": p["status"],
+            "currency": p.get("currency") or base_cur, "status": p["status"],
             "who": names.get(p["user_id"], str(p["user_id"])),
             "order_id": p.get("order_id"), "note": p.get("comment") or "",
             "created_at": (p.get("created_at") or "")[:16],
         })
     for d in deps:
+        # Сдачи наличных хранятся в базовой валюте (нет поля currency).
         rows.append({
             "kind": "deposit", "id": d["id"], "amount": float(d["amount"] or 0),
-            "currency": "USD", "status": d["status"],
+            "currency": base_cur, "status": d["status"],
             "who": names.get(d["manager_id"], str(d["manager_id"])),
             "order_id": None, "note": d.get("reject_reason") or "",
             "created_at": (d.get("created_at") or "")[:16],
         })
     for r in rets:
         rows.append({
-            "kind": "return", "id": r["id"], "amount": float(r["total_amount"] or 0),
-            "currency": "USD", "status": r["status"],
+            "kind": "return", "id": r["id"], "amount": _ret_amount(r),
+            "currency": (r.get("order_currency") or base_cur), "status": r["status"],
             "who": names.get(r["created_by"], str(r["created_by"])),
             "order_id": r.get("order_id"), "note": r.get("reason") or "",
             "created_at": (r.get("created_at") or "")[:16],
