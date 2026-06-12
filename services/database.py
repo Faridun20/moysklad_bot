@@ -1187,6 +1187,19 @@ async def get_agent_current_debt(agent_id: str) -> float:
     )
     returns_by_order = {r["order_id"]: int(r["rc"] or 0) for r in ret_rows}
 
+    # Подтверждённые сдачи наличных, распределённые на заказ, тоже гасят долг —
+    # иначе частично-покрытый сдачей заказ (ещё payment_confirmed=0) показывал
+    # завышенный долг (WP-05). Сдачи распределяются только на базовые заказы.
+    dep_rows = await adb_core.fetch(
+        f"SELECT cdo.order_id AS oid, {_SUM_ALLOC_CENTS} AS dc "
+        "FROM cash_deposit_orders cdo JOIN cash_deposits d ON d.id = cdo.deposit_id "
+        f"WHERE cdo.order_id IN ({placeholders}) "
+        "AND d.status = 'confirmed' AND (d.deleted_at IS NULL) "
+        "GROUP BY cdo.order_id",
+        *order_ids,
+    )
+    deposits_by_order = {r["oid"]: int(r["dc"] or 0) for r in dep_rows}
+
     # Долг считаем в БАЗОВОЙ валюте: у заказов может быть разная currency, а лимит
     # один (в базовой). Без конвертации «5 000 000 UZS» и «2000 USD» складывались
     # как одно число → бессмысленное over/under-limit. convert_to_base кэширован;
@@ -1203,7 +1216,8 @@ async def get_agent_current_debt(agent_id: str) -> float:
             for p in payments_by_order.get(oid, [])
             if p["status"] == "confirmed"
         )
-        net_cents = max(0, max(0, total - confirmed) - returns_by_order.get(oid, 0))
+        paid = confirmed + deposits_by_order.get(oid, 0)
+        net_cents = max(0, max(0, total - paid) - returns_by_order.get(oid, 0))
         net_major = float(money.from_cents(net_cents))
         base = convert_to_base(net_major, currency_by_order[oid])
         debt_base += base if base is not None else net_major
@@ -1762,26 +1776,64 @@ async def _order_allocated_deposit_cents(order_id: int) -> int:
     )
 
 
+async def _order_confirmed_payment_cents(order_id: int) -> int:
+    """Подтверждённые платежи по заказу в ВАЛЮТЕ ЗАКАЗА, в копейках. Платежи к
+    заказу — в его валюте (link/close это гарантируют, WP-04); NULL-валюту
+    платежа трактуем как валюту заказа."""
+    from config import BASE_CURRENCY
+
+    cur = await adb_core.fetchval("SELECT currency FROM orders WHERE id = $1", order_id)
+    order_cur = (cur or BASE_CURRENCY or "USD").upper()
+    return int(
+        await adb_core.fetchval(
+            f"SELECT {_SUM_PAYMENTS_CENTS} FROM payments "
+            "WHERE order_id = $1 AND status = 'confirmed' "
+            "AND COALESCE(UPPER(currency), $2) = $2",
+            order_id,
+            order_cur,
+        )
+        or 0
+    )
+
+
+def _is_base_currency(currency: str | None) -> bool:
+    """Заказ в базовой валюте (или валюта не задана = база). Сдачи (cash_deposits)
+    хранятся в базовой валюте без поля currency, поэтому распределять их можно
+    ТОЛЬКО на заказы в базовой валюте — иначе FIFO сравнивает копейки разных
+    валют без конверсии (WP-05). Заказы в иной валюте сдачей не закрываем."""
+    from config import BASE_CURRENCY
+
+    base = (BASE_CURRENCY or "USD").upper()
+    return (currency or base).upper() == base
+
+
 async def get_manager_open_orders_for_deposit(manager_id: int) -> list[dict]:
-    """Отгруженные неоплаченные заказы менеджера (для распределения сдачи).
-    Возвращает [{id, total, covered, remaining}] по возрастанию created_at.
-    covered учитывает уже распределённое pending+confirmed-сдачами (M3).
+    """Отгруженные неоплаченные заказы менеджера В БАЗОВОЙ ВАЛЮТЕ (для распределения
+    сдачи). Возвращает [{id, total, covered, remaining}] по возрастанию created_at.
+    remaining = total − возвраты − подтверждённые платежи − распределённое
+    pending+confirmed-сдачами: сдача не должна перекрывать уже оплаченное
+    платежами или возвращённое (WP-05).
+
+    Заказы в не-базовой валюте исключаем: сдача в базовой валюте без конверсии
+    их не покрывает.
 
     Остаток считаем в копейках (без float-эпсилона 0.01) — заказ попадает
-    в список, только если непокрытый остаток ≥ 1 копейки.
-
-    asyncpg Stage 17 (#21): native async; helpers _order_total_cents/
-    _order_allocated_deposit_cents теперь async (await)."""
+    в список, только если непокрытый остаток ≥ 1 копейки."""
     rows = await adb_core.fetch(
-        "SELECT id FROM orders WHERE user_id = $1 AND status = 'shipped' "
+        "SELECT id, currency FROM orders WHERE user_id = $1 AND status = 'shipped' "
         "AND payment_confirmed = 0 AND (deleted_at IS NULL) ORDER BY created_at ASC",
         manager_id,
     )
-    ids = [r["id"] for r in rows]
     out = []
-    for oid in ids:
+    for r in rows:
+        if not _is_base_currency(r["currency"]):
+            continue  # сдача в базовой валюте не покрывает заказ в иной валюте
+        oid = r["id"]
         total_cents = await _order_total_cents(oid)
-        covered_cents = await _order_allocated_deposit_cents(oid)
+        returns_cents = await _order_confirmed_returns_cents(oid)
+        paid_cents = await _order_confirmed_payment_cents(oid)
+        alloc_cents = await _order_allocated_deposit_cents(oid)
+        covered_cents = returns_cents + paid_cents + alloc_cents
         remaining_cents = total_cents - covered_cents
         if remaining_cents > 0:
             out.append(
@@ -2225,8 +2277,15 @@ async def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_nam
         # Покрытие — против суммы за вычетом подтверждённых возвратов (net owed).
         # net<=0 (полный возврат) не закрываем как «оплачено» — статус ведёт
         # confirm_return.
+        # Покрытие = подтверждённые сдачи + подтверждённые платежи (в валюте
+        # заказа = базовой; сдачи распределяются только на базовые заказы). Раньше
+        # учитывались только сдачи → заказ, оплаченный наполовину платежом +
+        # наполовину сдачей, не закрывался (WP-05).
         net_owed_cents = await _order_total_cents(oid) - await _order_confirmed_returns_cents(oid)
-        if net_owed_cents > 0 and await _order_confirmed_deposit_cents(oid) >= net_owed_cents:
+        covered_cents = await _order_confirmed_deposit_cents(
+            oid
+        ) + await _order_confirmed_payment_cents(oid)
+        if net_owed_cents > 0 and covered_cents >= net_owed_cents:
             async with adb_core.transaction() as txn:
                 if USE_POSTGRES:
                     await txn.fetchrow("SELECT payment_confirmed FROM orders WHERE id = $1 FOR UPDATE", oid)
@@ -4580,11 +4639,26 @@ async def _maybe_close_order_after_payment(
             )
             or 0
         )
+        # Подтверждённые сдачи наличных, распределённые на заказ, тоже покрывают
+        # долг — иначе заказ, оплаченный наполовину сдачей + наполовину платежом,
+        # не закрывался (WP-05). Сдачи в базовой валюте, заказ при наличии сдач
+        # тоже базовый (см. _is_base_currency).
+        deposit_cents = int(
+            await txn.fetchval(
+                f"SELECT {_SUM_ALLOC_CENTS} FROM cash_deposit_orders cdo "
+                "JOIN cash_deposits d ON d.id = cdo.deposit_id "
+                "WHERE cdo.order_id = $1 AND d.status = 'confirmed' AND (d.deleted_at IS NULL)",
+                order_id,
+            )
+            or 0
+        )
+        covered_cents = confirmed_cents + deposit_cents
+
         net_cents = total_cents - returns_cents
         if net_cents <= 0:
             return
-        if confirmed_cents < net_cents:
-            return  # ещё не полностью оплачен (с учётом возвратов)
+        if covered_cents < net_cents:
+            return  # ещё не полностью оплачен (платежи + сдачи, с учётом возвратов)
 
         # Закрываем
         rc = await txn.execute(
