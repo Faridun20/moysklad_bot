@@ -367,7 +367,19 @@ async def apply_ms_customerorder_delete(order: dict, co_id: str) -> None:
     # Помечаем как удалённый в МС → заказ уходит из аналитики, списков, а также
     # из учёта долгов/лимитов (нет заказа в МС → нет долга по нему). Деньги/
     # остатки в боте не трогаем — попадает в ночной ops-дайджест для ручной сверки.
-    await adb.set_order_ms_deleted(order_id)
+    # Гейтим аудит/алерт по результату set_order_ms_deleted (идемпотентный «я
+    # первый», WHERE ms_deleted_at IS NULL): line-331 guard читает СТАЛЫЙ in-memory
+    # ms_deleted_at, поэтому конкурентные вебхук + cron-реконсиляция оба проходили
+    # его и оба слали уведомление (WP-12). Проигравший — тихо выходит.
+    won = await adb.set_order_ms_deleted(order_id)
+    if not won:
+        logger.info(
+            "customerorder.DELETE %s → заказ #%d уже помечен удалённым (гонка) — "
+            "без повторного алерта",
+            co_id,
+            order_id,
+        )
+        return
     await adb.add_audit_log(
         0,
         "МойСклад",
@@ -470,12 +482,21 @@ async def apply_ms_demand_delete(order: dict, demand_id: str) -> None:
     from utils.helpers import esc
 
     if order.get("ms_deleted_at"):
-        return  # уже помечен — не дублируем уведомление
+        return  # уже помечен (по стале in-memory) — быстрый выход
     order_id = order["id"]
     status = order.get("status", "")
     agent = esc(order.get("agent_name") or "—")
 
-    await adb.set_order_ms_deleted(order_id)
+    # Гейтим аудит/алерт по результату set_order_ms_deleted: line-484 guard читает
+    # стале in-memory ms_deleted_at, поэтому конкурентные вебхук + cron могли оба
+    # пройти его и оба слать уведомление (WP-12). Только победитель шлёт.
+    if not await adb.set_order_ms_deleted(order_id):
+        logger.info(
+            "demand.DELETE %s → заказ #%d уже помечен (гонка) — без повторного алерта",
+            demand_id,
+            order_id,
+        )
+        return
     await adb.add_audit_log(
         0,
         "МойСклад",

@@ -228,6 +228,31 @@ def test_co_delete_alert_idempotent(isolated_db, monkeypatch):
     assert sent == []
 
 
+def test_co_delete_shipped_alert_dedup_on_race(isolated_db, monkeypatch):
+    """WP-12: два конкурентных вызова с ОДНИМ стале order-dict (ms_deleted_at=None
+    в памяти) для shipped-заказа шлют ровно одно уведомление — проигравший гонку
+    set_order_ms_deleted выходит тихо."""
+    db = isolated_db
+    sent = _mock_notify(monkeypatch)
+    oid, _ = _credit_order(db, 100.0, 1, status="shipped")
+    stale = asyncio.run(db.get_order(oid))  # ms_deleted_at=None в памяти
+    asyncio.run(h.apply_ms_customerorder_delete(stale, "CO-5"))
+    asyncio.run(h.apply_ms_customerorder_delete(stale, "CO-5"))  # тот же стале dict
+    assert len(sent) == 1
+    assert asyncio.run(db.get_order(oid))["status"] == "shipped"  # статус не тронут
+
+
+def test_demand_delete_alert_dedup_on_race(isolated_db, monkeypatch):
+    """WP-12: то же для demand.DELETE."""
+    db = isolated_db
+    sent = _mock_notify(monkeypatch)
+    oid, _ = _credit_order(db, 100.0, 1, status="shipped")
+    stale = asyncio.run(db.get_order(oid))
+    asyncio.run(h.apply_ms_demand_delete(stale, "DM-1"))
+    asyncio.run(h.apply_ms_demand_delete(stale, "DM-1"))
+    assert len(sent) == 1
+
+
 def test_co_delete_cancels_approved_even_if_already_ms_deleted(isolated_db, monkeypatch):
     """demand.DELETE мог выставить ms_deleted_at, оставив заказ approved (он не
     отменяет). Последующий customerorder.DELETE всё равно ДОЛЖЕН отменить approved —
