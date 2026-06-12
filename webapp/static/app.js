@@ -2212,16 +2212,20 @@ async function renderAnalytics() {
   const content = document.getElementById('content');
   const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
   if (!isBoss) analyticsView = 'sales';  // не-боссу доступны только «Продажи»
+
+  // «Период…» выбран, но даты ещё не заданы → показываем шапку с календарём и
+  // ждём выбор дат — ЕДИНО для обоих видов (WP-24), ДО диспатча в renderMoneyView.
+  // Раньше money-вид ждал, а sales-вид сбрасывал analyticsPeriod='month' →
+  // переключение видов в этом состоянии молча теряло custom-выбор.
+  if (analyticsPeriod === 'custom' && !(analyticsSince && analyticsUntil)) {
+    content.innerHTML = analyticsHeaderHtml(isBoss) +
+      '<div class="loader">Выберите даты периода на календаре выше.</div>';
+    wireAnalyticsHeader(content);
+    return;
+  }
+
   if (analyticsView === 'money' && isBoss) return renderMoneyView();
   const custom = analyticsPeriod === 'custom';
-
-  // «Период…» выбран, но даты ещё не заданы → не дёргаем бэкенд: показываем поля
-  // дат поверх последних данных (или подгружаем месяц как базу, если данных нет).
-  if (custom && !(analyticsSince && analyticsUntil)) {
-    if (lastAnalyticsData) { renderAnalyticsContent(lastAnalyticsData); return; }
-    analyticsPeriod = 'month';
-    return renderAnalytics();
-  }
 
   // Короткий кэш (TTL 60с): пресеты и конкретные диапазоны кэшируются отдельно.
   const cacheKey = custom ? `c:${analyticsSince}:${analyticsUntil}` : analyticsPeriod;
@@ -2383,16 +2387,8 @@ function renderAnalyticsContent(data) {
 // + лента движения денег. Период — общий с «Продажами» (analyticsPeriod).
 async function renderMoneyView() {
   const content = document.getElementById('content');
-  // «Период…» выбран, но даты ещё не заданы — показываем шапку с календарём и
-  // ждём выбора дат, НЕ дёргая бэкенд и НЕ откатываясь на месяц (иначе клик по
-  // «Период…» молча сбрасывался и календарь не открывался — нельзя было выбрать
-  // произвольный диапазон в разделе «Деньги»).
-  if (analyticsPeriod === 'custom' && !(analyticsSince && analyticsUntil)) {
-    content.innerHTML = analyticsHeaderHtml(true) +
-      '<div class="loader">Выберите даты периода на календаре выше.</div>';
-    wireAnalyticsHeader(content);
-    return;
-  }
+  // custom-без-дат обрабатывается единым guard'ом в renderAnalytics ДО диспатча
+  // сюда (WP-24), поэтому здесь analyticsPeriod либо пресет, либо custom с датами.
   content.innerHTML = loading('Считаю деньги…');
   const periodBody = (analyticsPeriod === 'custom' && analyticsSince && analyticsUntil)
     ? { since: analyticsSince, until: _nextDay(analyticsUntil) }
