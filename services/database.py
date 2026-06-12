@@ -4793,42 +4793,69 @@ async def get_payments_report(since: str | None = None, until: str | None = None
     return await adb_core.fetch(query, *params)
 
 
-async def get_cash_history(limit: int = 80) -> list[dict]:
+async def get_cash_history(
+    limit: int = 80, since: str | None = None, until: str | None = None
+) -> list[dict]:
     """Единая лента движения денег для босса: платежи + сдачи наличных +
     возвраты, в одном списке, новые сверху. Каждая запись: kind
     (payment|deposit|return), сумма, валюта, статус, кто (имя), когда, заказ.
+
+    since/until (WP-11): период по COALESCE(confirmed_at, created_at) — как в
+    итоге «Деньги» (get_money_totals), чтобы лента и итог были за один период.
 
     «Кто» резолвим по user_id через get_all_users (payments.user_id /
     cash_deposits.manager_id / returns.created_by). Деньги форматируются на
     фронте; здесь отдаём amount как есть (float — только для отображения, не
     для расчётов; денежное ядро остаётся на cents в своих функциях).
     """
+
+    def _period(conf: str, created: str, params: list) -> str:
+        clause = ""
+        if since:
+            params.append(since)
+            clause += f" AND COALESCE({conf}, {created}) >= ${len(params)}"
+        if until:
+            params.append(until)
+            clause += f" AND COALESCE({conf}, {created}) <= ${len(params)}"
+        return clause
+
     # Платежи по удалённым/фантомным заказам НЕ показываем — они исключены и из
     # итога «Деньги» (get_money_totals), поэтому лента обязана с ним совпадать
     # (иначе платёж «принят» в ленте, но не в сумме — противоречие). standalone-
     # платежи (order_id IS NULL) показываем.
+    pay_params: list = []
+    pay_clause = _period("p.confirmed_at", "p.created_at", pay_params)
+    pay_params.append(limit)
     pays = await adb_core.fetch(
         "SELECT p.id, p.user_id, p.amount, p.currency, p.status, p.comment, "
         "p.order_id, p.created_at "
         f"FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
-        f"WHERE {_LIVE_ORDER_PAYMENT_FILTER} "
-        "ORDER BY p.created_at DESC LIMIT $1",
-        limit,
+        f"WHERE {_LIVE_ORDER_PAYMENT_FILTER}{pay_clause} "
+        f"ORDER BY p.created_at DESC LIMIT ${len(pay_params)}",
+        *pay_params,
     )
+    dep_params: list = []
+    dep_clause = _period("confirmed_at", "created_at", dep_params)
+    dep_params.append(limit)
     deps = await adb_core.fetch(
         "SELECT id, manager_id, amount, status, reject_reason, created_at "
-        "FROM cash_deposits WHERE (deleted_at IS NULL) ORDER BY created_at DESC LIMIT $1",
-        limit,
+        f"FROM cash_deposits WHERE (deleted_at IS NULL){dep_clause} "
+        f"ORDER BY created_at DESC LIMIT ${len(dep_params)}",
+        *dep_params,
     )
-    # Возвраты: сумма в валюте ЗАКАЗА (LEFT JOIN orders.currency) — раньше
-    # хардкодили "USD" и брали float total_amount, из-за чего возврат на UZS-заказ
-    # показывался как «5 000 000 USD» (WP-07). Берём total_amount_cents.
+    # Возвраты: сумма в валюте ЗАКАЗА (LEFT JOIN orders.currency, WP-07) + фильтр
+    # «живого заказа» (WP-11) — возврат по удалённому заказу не показываем, как и
+    # его платежи (иначе в ленте висит «Возврат · заказ #N» по заказу-фантому).
+    ret_params: list = []
+    ret_clause = _period("r.confirmed_at", "r.created_at", ret_params)
+    ret_params.append(limit)
     rets = await adb_core.fetch(
         "SELECT r.id, r.order_id, r.created_by, r.total_amount, r.total_amount_cents, "
         "r.refund_method, r.status, r.reason, r.created_at, o.currency AS order_currency "
         "FROM returns r LEFT JOIN orders o ON o.id = r.order_id "
-        "WHERE (r.deleted_at IS NULL) ORDER BY r.created_at DESC LIMIT $1",
-        limit,
+        f"WHERE (r.deleted_at IS NULL) AND {_LIVE_ORDER_PAYMENT_FILTER}{ret_clause} "
+        f"ORDER BY r.created_at DESC LIMIT ${len(ret_params)}",
+        *ret_params,
     )
     names = {u["user_id"]: u.get("full_name") or str(u["user_id"]) for u in get_all_users()}
 

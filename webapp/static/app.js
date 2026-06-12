@@ -2401,7 +2401,9 @@ async function renderMoneyView() {
   let history = [];
   try {
     summary = await api('/api/money/summary', periodBody);
-    history = (await api('/api/cash/history', {}).catch(() => ({ history: [] }))).history || [];
+    // Лента — за ТОТ ЖЕ период, что и итог (WP-11), иначе под заголовком периода
+    // висели движения за всё время.
+    history = (await api('/api/cash/history', periodBody).catch(() => ({ history: [] }))).history || [];
   } catch (e) {
     content.innerHTML = analyticsHeaderHtml(true) + errorBox(e.message);
     wireAnalyticsHeader(content);

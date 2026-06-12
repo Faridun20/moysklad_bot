@@ -1261,6 +1261,8 @@ async def api_cash_history(request: Request):
     """Единая лента движения денег (платежи + сдачи + возвраты) — для босса.
     Менеджер видит свою историю через /api/payments/history; здесь — общая
     картина «кто/когда/сколько», которой раньше не было."""
+    from datetime import datetime
+
     from services import async_db as adb
 
     data = await request.json()
@@ -1270,7 +1272,16 @@ async def api_cash_history(request: Request):
         rate_limit_scope="api_cash_history",
         rate_limit_max=120,
     )
-    rows = await adb.get_cash_history(80)
+    # Период — как в /api/money/summary, чтобы лента и итог «Деньги» были за один
+    # период (WP-11). Раньше лента всегда отдавала последние 80 движений за всё
+    # время → под январским заголовком висели июньские платежи.
+    now = datetime.now()
+    since, until, _prev, _label = _resolve_analytics_period(data, now)
+    rows = await adb.get_cash_history(
+        80,
+        since=since.strftime("%Y-%m-%d %H:%M:%S"),
+        until=until.strftime("%Y-%m-%d %H:%M:%S"),
+    )
     return JSONResponse({"history": rows})
 
 
