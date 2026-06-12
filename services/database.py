@@ -1148,6 +1148,35 @@ async def set_credit_limit(
         )
 
 
+async def get_confirmed_returns_cents_for_orders(order_ids: list[int]) -> dict[int, int]:
+    """Подтверждённые (не-cash) возвраты по заказам, в копейках, батчем.
+    Единый источник для долга — get_agent_current_debt и /api/debts (WP-06)."""
+    if not order_ids:
+        return {}
+    ph = ", ".join(f"${i + 1}" for i in range(len(order_ids)))
+    rows = await adb_core.fetch(
+        f"SELECT order_id, {_SUM_RETURNS_CENTS} AS rc FROM returns "
+        f"WHERE order_id IN ({ph}) AND {_RETURN_OWED_FILTER} GROUP BY order_id",
+        *order_ids,
+    )
+    return {r["order_id"]: int(r["rc"] or 0) for r in rows}
+
+
+async def get_confirmed_deposit_cents_for_orders(order_ids: list[int]) -> dict[int, int]:
+    """Подтверждённые сдачи, распределённые на заказы, в копейках, батчем (WP-06)."""
+    if not order_ids:
+        return {}
+    ph = ", ".join(f"${i + 1}" for i in range(len(order_ids)))
+    rows = await adb_core.fetch(
+        f"SELECT cdo.order_id AS oid, {_SUM_ALLOC_CENTS} AS dc "
+        "FROM cash_deposit_orders cdo JOIN cash_deposits d ON d.id = cdo.deposit_id "
+        f"WHERE cdo.order_id IN ({ph}) AND d.status = 'confirmed' AND (d.deleted_at IS NULL) "
+        "GROUP BY cdo.order_id",
+        *order_ids,
+    )
+    return {r["oid"]: int(r["dc"] or 0) for r in rows}
+
+
 async def get_agent_current_debt(agent_id: str) -> float:
     """Текущий долг контрагента: сумма непогашенных остатков по его открытым
     заказам минус подтверждённые возвраты. Открытые = не draft/rejected/
@@ -1178,27 +1207,10 @@ async def get_agent_current_debt(agent_id: str) -> float:
 
     items_by_order = await get_order_items_by_ids(order_ids)
     payments_by_order = await get_payments_for_orders(order_ids)
-    placeholders = ", ".join(f"${i + 1}" for i in range(len(order_ids)))
-    ret_rows = await adb_core.fetch(
-        f"SELECT order_id, {_SUM_RETURNS_CENTS} AS rc FROM returns "
-        f"WHERE order_id IN ({placeholders}) AND {_RETURN_OWED_FILTER} "
-        f"GROUP BY order_id",
-        *order_ids,
-    )
-    returns_by_order = {r["order_id"]: int(r["rc"] or 0) for r in ret_rows}
-
-    # Подтверждённые сдачи наличных, распределённые на заказ, тоже гасят долг —
-    # иначе частично-покрытый сдачей заказ (ещё payment_confirmed=0) показывал
-    # завышенный долг (WP-05). Сдачи распределяются только на базовые заказы.
-    dep_rows = await adb_core.fetch(
-        f"SELECT cdo.order_id AS oid, {_SUM_ALLOC_CENTS} AS dc "
-        "FROM cash_deposit_orders cdo JOIN cash_deposits d ON d.id = cdo.deposit_id "
-        f"WHERE cdo.order_id IN ({placeholders}) "
-        "AND d.status = 'confirmed' AND (d.deleted_at IS NULL) "
-        "GROUP BY cdo.order_id",
-        *order_ids,
-    )
-    deposits_by_order = {r["oid"]: int(r["dc"] or 0) for r in dep_rows}
+    # Возвраты и подтверждённые сдачи гасят долг — батч-хелперы (единый источник
+    # с /api/debts, WP-05/06). Сдачи распределяются только на базовые заказы.
+    returns_by_order = await get_confirmed_returns_cents_for_orders(order_ids)
+    deposits_by_order = await get_confirmed_deposit_cents_for_orders(order_ids)
 
     # Долг считаем в БАЗОВОЙ валюте: у заказов может быть разная currency, а лимит
     # один (в базовой). Без конвертации «5 000 000 UZS» и «2000 USD» складывались
@@ -5501,7 +5513,10 @@ async def get_open_debts(
     query = (
         "SELECT * FROM orders "
         "WHERE payment_type = 'credit' AND paid_confirmed_at IS NULL "
-        "AND status IN ('approved', 'shipped') "
+        # partially_returned тоже несёт остаток долга (частичный возврат не
+        # закрыл заказ) — иначе он исчезал из «Долги», но висел в «Клиенты»/
+        # кредит-чеке (WP-06, согласовано с get_agent_current_debt).
+        "AND status IN ('approved', 'shipped', 'partially_returned') "
         # Заказ удалён в МойСклад (фантом) → долга по нему быть не должно.
         "AND (ms_deleted_at IS NULL)"
     )

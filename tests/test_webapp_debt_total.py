@@ -85,6 +85,42 @@ def _confirmed_payment(db, mgr, amount, currency, order_id):
     return pid
 
 
+def _confirmed_return(db, order_id, amount, status="confirmed"):
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q(
+                "INSERT INTO returns (order_id, return_type, reason, total_amount, "
+                "total_amount_cents, refund_method, created_by, status, created_at) "
+                "VALUES (?, 'partial', 'x', ?, ?, 'debt_reduction', 1, ?, ?)"
+            ),
+            (order_id, amount, int(round(amount * 100)), status, db.now_str()),
+        )
+        conn.commit()
+
+
+def test_debts_remaining_subtracts_returns_matches_agent_debt(isolated_db, monkeypatch):
+    """WP-06: остаток в /api/debts вычитает подтверждённые возвраты и совпадает с
+    get_agent_current_debt (кредит-чек/«Клиенты»). partially_returned виден."""
+    import asyncio
+
+    db = isolated_db
+    db._invalidate_currency_rates_cache()
+    mgr = 220
+    oid = _credit_shipped(db, mgr, 100.0, "USD", "AG")
+    _confirmed_return(db, oid, 30.0)  # non-cash возврат уменьшает долг
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("UPDATE orders SET status='partially_returned' WHERE id=?"), (oid,))
+        conn.commit()
+
+    client = _client(db, monkeypatch, mgr)
+    body = client.post("/api/debts", json={"initData": str(mgr), "mode": "all"}).json()
+    row = next(d for d in body["debts"] if d["id"] == oid)  # виден несмотря на статус
+    assert row["remaining"] == 70.0
+    assert asyncio.run(db.get_agent_current_debt("AG")) == 70.0  # та же цифра
+
+
 def test_money_received_excludes_deleted_orders(isolated_db, monkeypatch):
     """«Получено» не должно учитывать платежи по удалённым/фантомным заказам
     (ms_deleted_at), но обязано считать платежи по живым заказам и standalone-

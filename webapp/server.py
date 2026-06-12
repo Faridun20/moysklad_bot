@@ -3161,10 +3161,19 @@ async def api_debts(request: Request):
         due_through=due_through,
     )
 
-    # Батчем: позиции для total + платежи для подсчёта confirmed/pending
+    # Батчем: позиции для total + платежи + возвраты + сдачи. Остаток считаем по
+    # ТОЙ ЖЕ формуле, что get_agent_current_debt / кредит-чек: total − платежи −
+    # подтверждённые сдачи − возвраты (WP-06). Раньше возвраты и сдачи не
+    # вычитались → «Долги» и «Клиенты» показывали разный долг одного клиента.
     debt_ids = [d["id"] for d in debts]
     items_by_order = await adb.get_order_items_by_ids(debt_ids) if debt_ids else {}
     payments_by_order = await adb.get_payments_for_orders(debt_ids) if debt_ids else {}
+    returns_cents_by_order = (
+        await adb.get_confirmed_returns_cents_for_orders(debt_ids) if debt_ids else {}
+    )
+    deposits_cents_by_order = (
+        await adb.get_confirmed_deposit_cents_for_orders(debt_ids) if debt_ids else {}
+    )
 
     result = []
     for o in debts:
@@ -3173,7 +3182,9 @@ async def api_debts(request: Request):
         payments = payments_by_order.get(o["id"], [])
         confirmed = sum(p["amount"] for p in payments if p["status"] == "confirmed")
         pending = sum(p["amount"] for p in payments if p["status"] == "pending")
-        remaining = max(0.0, total - confirmed)
+        deposits = deposits_cents_by_order.get(o["id"], 0) / 100.0
+        returns_owed = returns_cents_by_order.get(o["id"], 0) / 100.0
+        remaining = max(0.0, total - confirmed - deposits - returns_owed)
         due = o.get("due_date")
         # State:
         #  - awaiting_confirmation — есть pending payments (boss решает)
