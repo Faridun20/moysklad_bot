@@ -187,6 +187,32 @@ def test_analytics_export_forbidden_for_manager(client_env, monkeypatch):
     assert resp.status_code == 403
 
 
+def test_company_analytics_degrades_when_ms_down(client_env, monkeypatch):
+    """MS недоступен (401/сеть/5xx) → /api/analytics НЕ 500, а 200 с
+    ms_unavailable=True. Регресс на «Не удалось загрузить: Unexpected token
+    'I', "Internal S"… is not valid JSON» (500-боди — не JSON)."""
+    from fastapi.testclient import TestClient
+
+    import services.moysklad as moysklad
+
+    async def _boom(*a, **k):
+        raise RuntimeError("MS 401 Unauthorized")
+
+    # _company_analytics_payload делает `from services.moysklad import …`
+    # на каждый вызов → патч атрибутов модуля перехватывается.
+    monkeypatch.setattr(moysklad, "get_sales_stats", _boom)
+    monkeypatch.setattr(moysklad, "get_shipments", _boom)
+
+    server, _db, ids = client_env
+    client = TestClient(server.app)
+    resp = client.post("/api/analytics", json={"initData": str(ids["boss"]), "period": "week"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ms_unavailable"] is True
+    assert body["total"] == 0
+    assert body["scope"] == "company"
+
+
 def test_analytics_export_sends_document_for_boss(client_env, monkeypatch):
     from fastapi.testclient import TestClient
 

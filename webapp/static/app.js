@@ -2325,8 +2325,13 @@ function renderAnalyticsContent(data) {
   const exportBlock = data.scope === 'company'
     ? `<button class="btn-primary u-mt-3" id="analytics-export">${icon('chart')} Выгрузить Excel</button>` : '';
 
+  const msWarn = data.ms_unavailable
+    ? `<div class="warn-card">${icon('alert', 'warn-ic')} Продажи из МойСклад временно недоступны — показаны нулевые суммы и локальный топ-менеджеров.</div>`
+    : '';
+
   content.innerHTML = `
     ${analyticsHeaderHtml(isBoss)}
+    ${msWarn}
 
     <div class="stat-grid">
       <div class="stat">

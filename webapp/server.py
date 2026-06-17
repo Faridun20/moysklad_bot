@@ -980,11 +980,29 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
     from services import async_db as adb
     from services.moysklad import get_sales_stats, get_shipments
 
+    # МойСклад может быть недоступен (сеть, истёкший/битый токен, 5xx). Раньше
+    # любое исключение тут всплывало как HTTP 500, и WebApp показывал «Не удалось
+    # загрузить: Unexpected token … is not valid JSON» (500-боди — не JSON).
+    # Деградируем мягко: пустые продажи + локальный топ-менеджеров всё равно
+    # отдаём, плюс флаг ms_unavailable для подсказки в UI.
+    _empty_stats: dict = {"total": 0, "count": 0, "clients": 0, "top_products": []}
+    _ms_state = {"ok": True}
+
+    async def _safe_call(coro, default, label):
+        """Значение MS-вызова или default при сбое (сеть/токен/5xx) + флаг."""
+        try:
+            return await coro
+        except Exception as e:  # noqa: BLE001 — сюда же ClientResponseError 4xx/5xx
+            logger.warning("analytics: %s недоступен: %s", label, e)
+            _ms_state["ok"] = False
+            return default
+
     current, prev, shipments = await asyncio.gather(
-        get_sales_stats(since, until),
-        get_sales_stats(prev_since, since),
-        get_shipments(since, until),
+        _safe_call(get_sales_stats(since, until), _empty_stats, "get_sales_stats"),
+        _safe_call(get_sales_stats(prev_since, since), _empty_stats, "get_sales_stats(prev)"),
+        _safe_call(get_shipments(since, until), [], "get_shipments"),
     )
+    ms_unavailable = not _ms_state["ok"]
 
     days_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     by_day = [0] * 7
@@ -1052,6 +1070,7 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
         "top_products": top,
         "top_clients": top_clients,
         "top_managers": top_managers,
+        "ms_unavailable": ms_unavailable,
     }
 
 
