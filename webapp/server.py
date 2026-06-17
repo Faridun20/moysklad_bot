@@ -89,6 +89,34 @@ def _idem_set(key: str | None, value: dict) -> None:
     _IDEM_CACHE[key] = (time.monotonic(), value)
 
 
+def _dev_bypass_user() -> dict | None:
+    """ЛОКАЛЬНЫЙ обход Telegram-авторизации для визуальной отладки WebApp в
+    обычном браузере (без подписанного initData). Возвращает синтетического
+    юзера ИЛИ None (обход не активен / запрещён).
+
+    Активируется ТОЛЬКО env-флагом DEV_AUTH_BYPASS ∈ {1,true,yes}.
+    Жёсткий предохранитель: если задан DATABASE_URL (= прод/Postgres) — обход
+    игнорируется с ERROR-логом, чтобы случайно выставленный на Railway флаг
+    не отключил авторизацию денежного бэкенда. Роль юзера всё равно берётся из
+    БД (get_role в _authorize) — сид-скрипт даёт DEV_USER_ID роль admin.
+
+    Читаем os.environ напрямую (не через config): устойчиво к обоим путям
+    конфига (config_local.py vs env-ветка config.py)."""
+    if os.environ.get("DEV_AUTH_BYPASS", "").strip().lower() not in ("1", "true", "yes"):
+        return None
+    if os.environ.get("DATABASE_URL"):
+        logger.error(
+            "DEV_AUTH_BYPASS проигнорирован: задан DATABASE_URL (прод/Postgres) — "
+            "обход авторизации запрещён вне локальной SQLite."
+        )
+        return None
+    try:
+        uid = int(os.environ.get("DEV_USER_ID") or "999000001")
+    except ValueError:
+        uid = 999000001
+    return {"id": uid, "first_name": "Dev", "username": "dev"}
+
+
 def _authorize(
     data: dict,
     allowed_roles: tuple[str, ...] | None = ("admin", "boss", "manager"),
@@ -108,7 +136,7 @@ def _authorize(
     Используйте вместо того, чтобы дублировать verify_init_data +
     get_role + role-check + rate-limit в каждом endpoint'е (легко забыть).
     """
-    user = verify_init_data(data.get("initData", ""))
+    user = _dev_bypass_user() or verify_init_data(data.get("initData", ""))
     if not user:
         raise HTTPException(status_code=401, detail="Invalid Telegram data")
     # R1: деактивацию проверяем отдельно от роли — кэш ролей per-process с TTL,
@@ -164,6 +192,13 @@ def _compute_app_version() -> str:
 
 APP_VERSION = _compute_app_version()
 logger.info("WebApp version: %s", APP_VERSION)
+
+# Однократное предупреждение, если активен локальный обход авторизации.
+if _dev_bypass_user() is not None:
+    logger.warning(
+        "DEV_AUTH_BYPASS активен — Telegram-авторизация ОТКЛЮЧЕНА (локальная "
+        "отладка). НЕ для прода: при DATABASE_URL обход сам себя глушит."
+    )
 
 app = FastAPI(title="МойСклад WebApp")
 

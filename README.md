@@ -69,6 +69,37 @@ Telegram, руководители одобряют отгрузки и подт
    ```
 5. В Telegram напиши боту `/start` — должен ответить.
 
+### Визуальная проверка WebApp в браузере (без Telegram)
+
+Чтобы посмотреть интерфейс WebApp локально в обычном браузере (вёрстка, тёмная
+тема, экраны Главная/Заказы/Финансы/Аналитика), нужен **dev-обход авторизации** и
+**примерные данные** — Telegram-авторизация (`initData`) в браузере недоступна, а
+свежая БД пуста.
+
+PowerShell (Windows):
+```powershell
+$env:TELEGRAM_TOKEN='0:fake'; $env:MS_TOKEN='fake'   # для UI-only достаточно заглушек
+$env:DEV_AUTH_BYPASS='1'; $env:DEV_USER_ID='999000001'
+python -m tasks.seed_dev      # наполнить локальную SQLite примерными данными (идемпотентно)
+python bot.py                 # uvicorn на http://localhost:8080 (BOT_MODE=all)
+```
+bash/macOS/Linux:
+```bash
+export TELEGRAM_TOKEN='0:fake' MS_TOKEN='fake' DEV_AUTH_BYPASS=1 DEV_USER_ID=999000001
+python -m tasks.seed_dev && python bot.py
+```
+Открой **http://localhost:8080**. Тёмная тема — переключи тему ОС (CSS реагирует на
+`prefers-color-scheme` вне Telegram).
+
+- `DEV_AUTH_BYPASS=1` пускает синтетического dev-юзера (роль берётся из БД; сид даёт
+  ему `admin`). **Предохранитель:** при заданном `DATABASE_URL` (прод/Postgres) обход
+  автоматически отключается — на проде он бесполезен и безопасен.
+- Без реального `MS_TOKEN` экраны **Каталог/сток** и **MS-балансы** во вкладке
+  «Клиенты» останутся пустыми — данные тянутся из МойСклад вживую. Остальные экраны
+  (заказы, долги, платежи, аналитика по локальным заказам) наполняются сидом.
+- БД по умолчанию — `%TEMP%/payments.db` (Windows) / `/tmp/payments.db`. Задай
+  `$env:DB_PATH` (или `DB_PATH=`), чтобы файл переживал перезапуски.
+
 ### Деплой на Railway
 
 См. подробный гайд в [ARCHITECTURE.md → раздел 2: Топология Railway](ARCHITECTURE.md#2-топология-railway).
@@ -101,6 +132,7 @@ Telegram, руководители одобряют отгрузки и подт
 | `TZ` | `Asia/Tashkent` или другой |
 | `PG_POOL_MIN`, `PG_POOL_MAX` | Размер пула коннектов Postgres (default 1/10) |
 | `BACKUP_TG_CHAT_ID` | ID приватного TG-канала для ежедневного backup БД |
+| `DEV_AUTH_BYPASS=1` + `DEV_USER_ID` | **Только локально:** обход Telegram-авторизации для просмотра WebApp в браузере (самоблокируется при `DATABASE_URL`). См. «Визуальная проверка WebApp» выше |
 
 > **Telegram webhook** (вместо polling, опц., только ops): `TG_USE_WEBHOOK=1` +
 > `TG_WEBHOOK_SECRET` при заданном публичном `WEBAPP_URL`. Деплой-решение —
