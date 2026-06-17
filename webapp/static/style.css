@@ -554,6 +554,15 @@ body {
 
 .stat-grid--three { grid-template-columns: 1fr 1fr 1fr; }
 
+/* Выручка по валютам (личная аналитика): по строке на валюту, без сложения. */
+.rev-row {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px; padding: 8px 0; border-bottom: 0.5px solid var(--divider);
+}
+.rev-row:last-child { border-bottom: none; }
+.rev-amount { font-size: 20px; font-weight: 700; letter-spacing: -0.3px; }
+.rev-meta { font-size: 12px; color: var(--text-mute); display: inline-flex; align-items: center; gap: 6px; }
+
 .stat {
   background: var(--bg-card);
   border-radius: var(--radius);

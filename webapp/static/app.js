@@ -2289,12 +2289,13 @@ function renderAnalyticsContent(data) {
         // PR D: прибыль по товару (если задана себестоимость) — boss/admin.
         const profitStr = (p.margin_known && p.profit != null)
           ? ` · <span class="top-profit">прибыль ${fmt(p.profit)} $</span>` : '';
+        const unit = p.currency ? escapeHtml(p.currency) : '$';
         return `
           <div class="top-row">
             <span class="top-medal rank-chip">${i + 1}</span>
             <div class="top-info">
               <div class="top-name">${escapeHtml(p.name)}</div>
-              <div class="top-sub">${fmt(p.qty)} шт · ${fmt(p.sum)} $${profitStr}</div>
+              <div class="top-sub">${fmt(p.qty)} шт · ${fmt(p.sum)} ${unit}${profitStr}</div>
             </div>
           </div>
         `;
@@ -2329,10 +2330,30 @@ function renderAnalyticsContent(data) {
     ? `<div class="warn-card">${icon('alert', 'warn-ic')} Продажи из МойСклад временно недоступны — показаны нулевые суммы и локальный топ-менеджеров.</div>`
     : '';
 
-  content.innerHTML = `
-    ${analyticsHeaderHtml(isBoss)}
-    ${msWarn}
-
+  // Personal-аналитика: выручка РАЗДЕЛЬНО по валютам (не складываем USD+UZS+EUR).
+  // Company (МС) — единая базовая валюта, прежний 4-блок.
+  let statsBlock;
+  if (data.scope === 'personal' && Array.isArray(data.revenue)) {
+    const revLines = data.revenue.length
+      ? data.revenue.map(r => {
+          const tI = r.trend > 0 ? icon('trend-up') : r.trend < 0 ? icon('trend-down') : '';
+          const tC = r.trend > 0 ? 'trend-up' : r.trend < 0 ? 'trend-dn' : '';
+          const tS = r.trend ? `<span class="${tC} u-fs-11">${tI} ${r.trend > 0 ? '+' : ''}${r.trend}%</span>` : '';
+          return `<div class="rev-row">
+            <span class="rev-amount">${fmt(r.total)} ${escapeHtml(r.currency)}</span>
+            <span class="rev-meta">${r.count} отгр. ${tS}</span>
+          </div>`;
+        }).join('')
+      : '<div class="money-placeholder">Нет продаж за период</div>';
+    statsBlock = `
+      <div class="section-label">Выручка по валютам</div>
+      <div class="card">${revLines}</div>
+      <div class="stat-grid">
+        <div class="stat"><div class="stat-value">${data.count}</div><div class="stat-label">Отгрузок</div></div>
+        <div class="stat"><div class="stat-value">${data.clients}</div><div class="stat-label">Клиентов</div></div>
+      </div>`;
+  } else {
+    statsBlock = `
     <div class="stat-grid">
       <div class="stat">
         <div class="stat-value">${fmt(data.total)} $</div>
@@ -2351,7 +2372,13 @@ function renderAnalyticsContent(data) {
         <div class="stat-value">${fmt(data.avg_check)} $</div>
         <div class="stat-label">Средний чек</div>
       </div>
-    </div>
+    </div>`;
+  }
+
+  content.innerHTML = `
+    ${analyticsHeaderHtml(isBoss)}
+    ${msWarn}
+    ${statsBlock}
 
     <div class="section-label">Активность по дням</div>
     <div class="card">${daysBars}</div>

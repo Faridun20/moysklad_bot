@@ -1233,19 +1233,29 @@ async def _personal_analytics(
         await adb.get_order_items_by_ids([o["id"] for o in relevant]) if relevant else {}
     )
 
+    from config import BASE_CURRENCY
+
+    base_cur = (BASE_CURRENCY or "USD").upper()
+
     def _agg(start_iso, end_iso):
-        total = 0.0
+        # Деньги НЕ суммируем между валютами (USD + UZS + EUR — бессмысленно):
+        # выручка и топ-товары группируются по валюте заказа. Раньше total был
+        # одним числом и складывал разные валюты в мусор.
+        totals: dict[str, float] = {}
+        counts: dict[str, int] = {}
         count = 0
         clients: set[str] = set()
-        product_sums: dict[str, dict] = {}
+        product_sums: dict[tuple[str, str], dict] = {}
         by_day = [0] * 7
         for o in relevant:
             ts = _ts(o)
             if ts < start_iso or ts > end_iso:
                 continue
+            cur = (o.get("currency") or base_cur).upper()
             items = items_by_order.get(o["id"], [])
             sub = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
-            total += sub
+            totals[cur] = totals.get(cur, 0.0) + sub
+            counts[cur] = counts.get(cur, 0) + 1
             count += 1
             if o.get("agent_name"):
                 clients.add(o["agent_name"])
@@ -1258,28 +1268,38 @@ async def _personal_analytics(
                 name = it.get("product_name", "—")
                 qty = float(it.get("quantity", 0))
                 price = float(it.get("price", 0) or 0)
-                agg = product_sums.setdefault(name, {"sum": 0.0, "qty": 0.0})
+                agg = product_sums.setdefault((name, cur), {"sum": 0.0, "qty": 0.0})
                 agg["sum"] += qty * price
                 agg["qty"] += qty
-        top = sorted(product_sums.items(), key=lambda kv: kv[1]["sum"], reverse=True)[:5]
-        return total, count, len(clients), top, by_day
+        return totals, counts, count, len(clients), product_sums, by_day
 
-    cur_total, cur_count, cur_clients, cur_top, by_day = _agg(since_iso, until_iso)
-    prev_total, prev_count, _, _, _ = _agg(prev_since_iso, since_iso)
+    cur_totals, cur_counts, cur_count, cur_clients, cur_products, by_day = _agg(since_iso, until_iso)
+    prev_totals, _pc, _, _, _, _ = _agg(prev_since_iso, since_iso)
 
-    trend = round((cur_total - prev_total) / prev_total * 100) if prev_total > 0 else 0
+    # Выручка по валютам (сорт. по убыванию), тренд считается ПО КАЖДОЙ валюте
+    # отдельно — иначе процент сравнивал бы несравнимые суммы.
+    revenue = []
+    for cur in sorted(cur_totals, key=lambda c: cur_totals[c], reverse=True):
+        tot = cur_totals[cur]
+        prev = prev_totals.get(cur, 0.0)
+        tr = round((tot - prev) / prev * 100) if prev > 0 else 0
+        revenue.append({"currency": cur, "total": tot, "count": cur_counts.get(cur, 0), "trend": tr})
+
+    top_sorted = sorted(cur_products.items(), key=lambda kv: kv[1]["sum"], reverse=True)[:5]
+    top_products = [
+        {"name": n, "currency": c, "sum": d["sum"], "qty": d["qty"]} for (n, c), d in top_sorted
+    ]
+
     days_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
     return {
         "label": label,
         "scope": "personal",
-        "total": cur_total,
+        "revenue": revenue,
         "count": cur_count,
         "clients": cur_clients,
-        "avg_check": (cur_total / cur_count) if cur_count else 0,
-        "trend": trend,
         "by_day": [{"day": days_ru[i], "count": by_day[i]} for i in range(7)],
-        "top_products": [{"name": n, "sum": d["sum"], "qty": d["qty"]} for n, d in cur_top],
+        "top_products": top_products,
     }
 
 

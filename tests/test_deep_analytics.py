@@ -187,6 +187,36 @@ def test_analytics_export_forbidden_for_manager(client_env, monkeypatch):
     assert resp.status_code == 403
 
 
+def test_personal_analytics_splits_currencies(client_env):
+    """Личная аналитика менеджера НЕ складывает разные валюты: выручка
+    возвращается списком {currency, total} по каждой валюте отдельно."""
+    from fastapi.testclient import TestClient
+
+    server, db, ids = client_env
+    mgr = ids["mgr"]
+
+    def mk(cur, qty, price):
+        oid = db.create_order(mgr, "M", "")
+        db.update_order_agent(oid, "A" + cur, "Client " + cur)
+        db.update_order_currency(oid, cur)
+        db.add_order_item(oid, "Товар", "", qty, "шт", price)
+        db.update_order_status(oid, "shipped")
+        return oid
+
+    mk("USD", 2, 100.0)      # 200 USD
+    mk("UZS", 3, 50000.0)    # 150 000 UZS
+
+    client = TestClient(server.app)
+    resp = client.post("/api/analytics", json={"initData": str(mgr), "period": "month"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["scope"] == "personal"
+    rev = {r["currency"]: r["total"] for r in body["revenue"]}
+    assert rev.get("USD") == 200.0
+    assert rev.get("UZS") == 150000.0
+    assert len(body["revenue"]) == 2  # не схлопнуто в одно число
+
+
 def test_company_analytics_degrades_when_ms_down(client_env, monkeypatch):
     """MS недоступен (401/сеть/5xx) → /api/analytics НЕ 500, а 200 с
     ms_unavailable=True. Регресс на «Не удалось загрузить: Unexpected token
