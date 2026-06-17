@@ -228,6 +228,44 @@ def main() -> int:
         add_payment(user_id=mgr2, full_name="Борис Менеджер", amount=285.0,
                     currency="EUR", order_id=o, status="pending")
 
+        # ─── Доп. данные для АНАЛИТИКИ: заказы по дням на обоих менеджеров ──
+        # Личная аналитика менеджера (webapp _personal_analytics) считается из
+        # ЛОКАЛЬНЫХ approved/shipped заказов за период → даёт график по дням,
+        # топ-товары, выручку. Company-аналитика (boss/admin) тянется из МойСклад
+        # и локально пуста — поэтому Аналитику смотрят под ролью manager
+        # (DEV_USER_ID=999000002, см. README).
+        demo_products = [
+            ("Кабель ВВГ 3×2.5", 1.20, "м"),
+            ("Автомат ABB 16A", 4.50, "шт"),
+            ("Розетка Legrand", 2.10, "шт"),
+            ("Светильник IP65", 12.00, "шт"),
+            ("Щит ЩРН-24", 35.00, "шт"),
+            ("Гофра d20", 0.30, "м"),
+            ("Лампа LED 12W", 9.50, "шт"),
+        ]
+        clients = ["Ромашка", "Сидоров", "Стройка", "Свет", "Котов", "Монтаж", "Энергия"]
+        for i in range(14):
+            mgr = mgr1 if i % 2 == 0 else mgr2
+            client = clients[i % len(clients)]
+            day = -((i % 7) + 1)  # распределяем по последним 7 дням
+            status = "approved" if i % 3 == 0 else "shipped"
+            o = add_order(
+                user_id=mgr, full_name=f"ООО {client}", status=status,
+                agent_name=client, currency="USD",
+                payment_type=("credit" if i % 2 else "paid"),
+                due_date=(_date(7) if i % 2 else None),
+                created_offset=day, shipped=(status == "shipped"),
+            )
+            p1 = demo_products[i % len(demo_products)]
+            add_item(o, p1[0], 10 + i * 3, p1[1], p1[2])
+            p2 = demo_products[(i + 3) % len(demo_products)]
+            add_item(o, p2[0], 5 + i, p2[1], p2[2])
+            if i % 4 == 0:  # часть с подтверждённой оплатой → money/received
+                add_payment(
+                    user_id=mgr, full_name="Менеджер", amount=50.0 + i * 10,
+                    currency="USD", order_id=o, status="confirmed",
+                )
+
         # ─── Сдачи наличными (касса) ───────────────────────────────────────
         add_deposit(manager_id=mgr1, amount=500.0, status="confirmed")
         add_deposit(manager_id=mgr2, amount=320.0, status="pending")  # ждёт босса

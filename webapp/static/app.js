@@ -519,7 +519,7 @@ async function renderHome() {
               <div class="card-row-title">${escapeHtml(o.agent_name || ('Заказ #' + o.id))}</div>
               <div class="card-row-sub">Заказ #${o.id} · ${o.created_at}</div>
             </div>
-            <span class="stock-badge ${o.status === 'approved' ? 'badge-green' : o.status === 'rejected' ? 'badge-red' : 'badge-yellow'}">${STATUS_NAME[o.status]}</span>
+            <span class="stock-badge ${o.status === 'approved' ? 'badge-green' : o.status === 'rejected' ? 'badge-red' : 'badge-yellow'}">${STATUS_NAME[o.status] || o.status}</span>
           </div>
         `).join('')}
       </div>
@@ -958,6 +958,10 @@ const STATUS_ICON = {
   approved: 'check',
   rejected: 'close',
   shipped:  'truck',
+  paid:     'check',
+  partially_returned: 'return',
+  returned: 'return',
+  cancelled: 'close',
 };
 
 const STATUS_NAME = {
@@ -966,6 +970,10 @@ const STATUS_NAME = {
   approved: 'Одобрено',
   rejected: 'Отклонено',
   shipped:  'Отгружено',
+  paid:     'Оплачено',
+  partially_returned: 'Частичный возврат',
+  returned: 'Возврат',
+  cancelled: 'Отменён',
 };
 
 async function api(path, body) {
@@ -1321,12 +1329,12 @@ function renderOrdersMain() {
             <div class="order-title">${icon('building')} ${escapeHtml(o.agent_name || 'Без клиента')}</div>
             <div class="order-sub">Заказ #${o.id}${isBoss ? ` · ${escapeHtml(o.full_name)}` : ''}</div>
           </div>
-          <span class="order-status status-${o.status}">${STATUS_NAME[o.status]}</span>
+          <span class="order-status status-${o.status}">${STATUS_NAME[o.status] || o.status}</span>
         </div>
         <div class="order-meta">
           <span>${icon('box')} ${o.items_count} тов.</span>
           <span>${(o.created_at || '').slice(11, 16)}</span>
-          ${o.total > 0 ? `<span class="order-total">${icon('cash')} ${Math.round(o.total).toLocaleString('ru-RU')}</span>` : ''}
+          ${o.total > 0 ? `<span class="order-total">${icon('cash')} ${Math.round(o.total).toLocaleString('ru-RU')} ${escapeHtml(o.currency || '')}</span>` : ''}
         </div>
         ${(() => {
           // UX: тип оплаты / срок / статус оплаты / заморозка / причина возврата —
@@ -1347,8 +1355,9 @@ function renderOrdersMain() {
         })()}
         ${o.items.slice(0, 2).map(it => {
           const sub = (it.quantity || 0) * (it.price || 0);
+          const cur = o.currency ? ' ' + escapeHtml(o.currency) : '';
           const priceStr = (it.price && it.price > 0)
-            ? ` × ${it.price.toLocaleString('ru-RU')} = <b>${Math.round(sub).toLocaleString('ru-RU')}</b>`
+            ? ` × ${it.price.toLocaleString('ru-RU')} = <b>${Math.round(sub).toLocaleString('ru-RU')}${cur}</b>`
             : '';
           return `<div class="order-item-preview">• ${escapeHtml(it.name)} — ${it.quantity} ${it.unit}${priceStr}</div>`;
         }).join('')}
@@ -2096,7 +2105,7 @@ async function renderPendingRequests() {
           } else {
             bits.push(`<span class="order-pay">${icon('cash')} Оплата сразу</span>`);
           }
-          if (r.total > 0) bits.push(`<span class="order-pay">${icon('cash')} ${Math.round(r.total).toLocaleString('ru-RU')}</span>`);
+          if (r.total > 0) bits.push(`<span class="order-pay">${icon('cash')} ${Math.round(r.total).toLocaleString('ru-RU')} ${escapeHtml(r.currency || '')}</span>`);
           return `<div class="order-pay-row">${bits.join('')}</div>`;
         })()}
         ${r.credit ? `
