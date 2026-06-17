@@ -244,26 +244,32 @@ def main() -> int:
             ("Лампа LED 12W", 9.50, "шт"),
         ]
         clients = ["Ромашка", "Сидоров", "Стройка", "Свет", "Котов", "Монтаж", "Энергия"]
+        # Чередуем валюты, чтобы корзины долгов и аналитика наглядно
+        # разбивались по валютам (а не схлопывались в одну сумму).
+        currencies = ["USD", "USD", "UZS", "USD", "EUR"]
         for i in range(14):
             mgr = mgr1 if i % 2 == 0 else mgr2
             client = clients[i % len(clients)]
+            ocur = currencies[i % len(currencies)]  # НЕ `cur` — затрёт курсор!
             day = -((i % 7) + 1)  # распределяем по последним 7 дням
             status = "approved" if i % 3 == 0 else "shipped"
+            # UZS-цены крупные (тысячи), иначе суммы мизерные.
+            mul = 10000 if ocur == "UZS" else 1
             o = add_order(
                 user_id=mgr, full_name=f"ООО {client}", status=status,
-                agent_name=client, currency="USD",
+                agent_name=client, currency=ocur,
                 payment_type=("credit" if i % 2 else "paid"),
                 due_date=(_date(7) if i % 2 else None),
                 created_offset=day, shipped=(status == "shipped"),
             )
             p1 = demo_products[i % len(demo_products)]
-            add_item(o, p1[0], 10 + i * 3, p1[1], p1[2])
+            add_item(o, p1[0], 10 + i * 3, p1[1] * mul, p1[2])
             p2 = demo_products[(i + 3) % len(demo_products)]
-            add_item(o, p2[0], 5 + i, p2[1], p2[2])
+            add_item(o, p2[0], 5 + i, p2[1] * mul, p2[2])
             if i % 4 == 0:  # часть с подтверждённой оплатой → money/received
                 add_payment(
-                    user_id=mgr, full_name="Менеджер", amount=50.0 + i * 10,
-                    currency="USD", order_id=o, status="confirmed",
+                    user_id=mgr, full_name="Менеджер", amount=(50.0 + i * 10) * mul,
+                    currency=ocur, order_id=o, status="confirmed",
                 )
 
         # ─── Сдачи наличными (касса) ───────────────────────────────────────

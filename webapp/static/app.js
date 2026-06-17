@@ -3139,21 +3139,32 @@ async function renderDebts(container) {
 
     // Сводка по open-долгам — по remaining (а не total), это честнее
     // показывает «сколько ещё должны»: частично оплаченный — меньше.
+    // Суммы НЕ складываем между валютами — копим по валюте в каждой корзине.
     let overdueCount = 0, todayCount = 0, upcomingCount = 0;
-    let overdueSum = 0, todaySum = 0, upcomingSum = 0;
+    const overdueByCur = {}, todayByCur = {}, upcomingByCur = {};
     for (const d of open) {
       const amt = d.remaining > 0 ? d.remaining : d.total;
+      const cur = d.currency || 'USD';
       // Бакетим по СРОКУ (due_date vs серверный today), а НЕ по d.state.
       // У частично оплаченного долга state='partial' (это прогресс оплаты,
       // не срок) — раньше он молча проваливался в else → «Будущие», даже если
       // срок сегодня/просрочен. Сравнение строк YYYY-MM-DD корректно; today
       // приходит с сервера (единый TZ). Та же логика, что в handlers/debts.py.
       const due = d.due_date;
-      if (due && due < today) { overdueCount++; overdueSum += amt; }
-      else if (due && due === today) { todayCount++; todaySum += amt; }
-      else { upcomingCount++; upcomingSum += amt; }
+      let bucket;
+      if (due && due < today) { overdueCount++; bucket = overdueByCur; }
+      else if (due && due === today) { todayCount++; bucket = todayByCur; }
+      else { upcomingCount++; bucket = upcomingByCur; }
+      bucket[cur] = (bucket[cur] || 0) + amt;
     }
     const fmt = n => Math.round(n).toLocaleString('ru-RU');
+    // Суммы корзины по валютам: «380 USD», на каждой строке своя валюта.
+    const sumByCur = byCur => {
+      const keys = Object.keys(byCur).sort((a, b) => byCur[b] - byCur[a]);
+      return keys.length
+        ? keys.map(c => `${fmt(byCur[c])} ${escapeHtml(c)}`).join('<br>')
+        : '0';
+    };
 
     // Сводка «получено» / «ожидает подтверждения» по валютам
     const receivedItems = (data.money_received || []).filter(x => x.total > 0);
@@ -3222,18 +3233,18 @@ async function renderDebts(container) {
             <div class="debt-stat debt-stat-overdue">
               <div class="debt-stat-num">${overdueCount}</div>
               <div class="debt-stat-label">Просрочено</div>
-              <div class="debt-stat-sum">${fmt(overdueSum)}</div>
+              <div class="debt-stat-sum">${sumByCur(overdueByCur)}</div>
             </div>
             <div class="debt-stat debt-stat-today">
               <div class="debt-stat-num">${todayCount}</div>
               <div class="debt-stat-label">Сегодня</div>
-              <div class="debt-stat-sum">${fmt(todaySum)}</div>
+              <div class="debt-stat-sum">${sumByCur(todayByCur)}</div>
             </div>
             ${debtsFilter === 'all' ? `
             <div class="debt-stat debt-stat-upcoming">
               <div class="debt-stat-num">${upcomingCount}</div>
               <div class="debt-stat-label">Будущие</div>
-              <div class="debt-stat-sum">${fmt(upcomingSum)}</div>
+              <div class="debt-stat-sum">${sumByCur(upcomingByCur)}</div>
             </div>
             ` : ''}
           </div>
@@ -3248,11 +3259,12 @@ async function renderDebts(container) {
         <div class="debts-list">${awaiting.map(d => {
           const ownerStr = d.is_mine ? '' : ` <span class="debt-owner">· ${escapeHtml(d.full_name)}</span>`;
           // Покажем разбиение: оплачено / в подтверждении / остаток
+          const dcur = escapeHtml(d.currency || '');
           const breakdown = `
             <div class="debt-breakdown">
-              ${d.confirmed > 0 ? `<span>${icon('check')} Подтверждено: <b>${fmt(d.confirmed)}</b></span>` : ''}
-              <span>${icon('clock')} Ждёт: <b>${fmt(d.pending)}</b></span>
-              ${d.remaining > 0 ? `<span>Останется: <b>${fmt(d.remaining - d.pending > 0 ? d.remaining - d.pending : 0)}</b></span>` : ''}
+              ${d.confirmed > 0 ? `<span>${icon('check')} Подтверждено: <b>${fmt(d.confirmed)} ${dcur}</b></span>` : ''}
+              <span>${icon('clock')} Ждёт: <b>${fmt(d.pending)} ${dcur}</b></span>
+              ${d.remaining > 0 ? `<span>Останется: <b>${fmt(d.remaining - d.pending > 0 ? d.remaining - d.pending : 0)} ${dcur}</b></span>` : ''}
             </div>
           `;
           return `
@@ -3299,7 +3311,7 @@ async function renderDebts(container) {
         // Для partial показываем сколько уже получено и остаток
         const breakdown = d.confirmed > 0 ? `
           <div class="debt-breakdown">
-            <span>${icon('check')} Оплачено: <b>${fmt(d.confirmed)}</b></span>
+            <span>${icon('check')} Оплачено: <b>${fmt(d.confirmed)} ${escapeHtml(d.currency)}</b></span>
             <span>Остаток: <b>${fmt(d.remaining)}</b> ${escapeHtml(d.currency)}</span>
           </div>
         ` : '';
@@ -3317,7 +3329,7 @@ async function renderDebts(container) {
             ${d.is_mine || isBoss ? `
               <div class="pay-input-row">
                 <input type="number" class="pay-amount-input" data-id="${d.id}"
-                       placeholder="Сумма · ост. ${fmt(d.remaining)}"
+                       placeholder="Сумма · ост. ${fmt(d.remaining)} ${escapeHtml(d.currency || '')}"
                        min="0" step="0.01" inputmode="decimal">
                 <button class="btn-mark-paid" data-id="${d.id}">${icon('check')} Отметить</button>
               </div>
