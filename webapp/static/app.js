@@ -2310,14 +2310,25 @@ function renderAnalyticsContent(data) {
         <div class="top-sub">${fmt(c.revenue)} $ · ${c.count} отгр.</div>
       </div>
     </div>`).join('');
-  const managerItems = (data.top_managers || []).map((m, i) => `
+  // Выручка/долг менеджера — РАЗДЕЛЬНО по валютам (не складываем); fallback на
+  // суммарное поле, если разбивка не пришла.
+  const curList = (arr, fallback, suffix) => {
+    const items = (arr || []).filter(x => x.amount > 0);
+    if (items.length) return items.map(x => `${fmt(x.amount)} ${escapeHtml(x.currency)}`).join(' · ');
+    return fallback ? `${fmt(fallback)} ${suffix}` : '';
+  };
+  const managerItems = (data.top_managers || []).map((m, i) => {
+    const rev = curList(m.revenue_by_currency, m.revenue, '$');
+    const debt = curList(m.debt_by_currency, 0, '');
+    return `
     <div class="top-row">
       <span class="top-medal rank-chip">${i + 1}</span>
       <div class="top-info">
         <div class="top-name">${escapeHtml(m.name)}</div>
-        <div class="top-sub">${fmt(m.revenue)} $ · ${m.count} отгр.${m.orders != null ? ` · ${m.orders} зак.` : ''}${m.debt ? ` · долг ${fmt(m.debt)} $` : ''}</div>
+        <div class="top-sub">${rev} · ${m.count} отгр.${m.orders != null ? ` · ${m.orders} зак.` : ''}${debt ? ` · долг ${debt}` : ''}</div>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
   const clientsBlock = clientItems
     ? `<div class="section-label">Топ клиентов</div><div class="card">${clientItems}</div>` : '';
   const managersBlock = managerItems
@@ -3012,6 +3023,12 @@ async function renderClients(container) {
     if (p.state === 'adv') return `<span class="bal-adv">аванс ${p.amount} ${cur}</span>`;
     return `0 ${cur}`;
   };
+  // Долг по заказам — РАЗДЕЛЬНО по валютам (не складываем). Лимит — в базовой.
+  const debtStr = (c) => {
+    const items = (c.debt_by_currency || []).filter(x => x.amount > 0);
+    if (!items.length) return 'долг 0';
+    return 'долг ' + items.map(x => `${fmt(x.amount)} ${escapeHtml(x.currency)}`).join(' · ');
+  };
   const cards = clients.map(c => `
       <div class="debt-card" data-agent="${escapeHtml(c.agent_id)}" role="button" tabindex="0">
         <div class="debt-card-top">
@@ -3019,7 +3036,7 @@ async function renderClients(container) {
           ${c.over_limit ? '<span class="stock-badge badge-red">лимит превышен</span>' : ''}
         </div>
         <div class="debt-card-mid">
-          <span class="debt-meta">${balStr(c.balance_cents)} · долг по заказам ${fmt(c.debt)} · лимит ${fmt(c.limit)}</span>
+          <span class="debt-meta">${balStr(c.balance_cents)} · ${debtStr(c)} · лимит ${fmt(c.limit)} ${escapeHtml(baseC)}</span>
         </div>
       </div>`).join('');
   container.innerHTML = `<div class="section-label">Клиенты (${clients.length})</div><div class="debts-list">${cards}</div>`;
@@ -3218,11 +3235,19 @@ async function renderDebts(container) {
           </div>
         </div>
       `;
-      // Единый остаток к получению в базовой валюте — не складывать валюты в уме.
-      if (data.remaining_base_total != null) {
-        const partial = data.remaining_base_partial
-          ? ' <span class="money-placeholder">(часть без курса)</span>' : '';
-        html += `<div class="money-base-total">${icon('cash')} Осталось получить: ≈ <b>${fmt(data.remaining_base_total)} ${escapeHtml(data.base_currency || 'USD')}</b>${partial}</div>`;
+      // Остаток к получению — РАЗДЕЛЬНО по валютам (не складываем); ниже —
+      // вспомогательный конвертированный ≈ итог в базовой валюте.
+      const remItems = (data.remaining_by_currency || []).filter(x => x.total > 0);
+      if (remItems.length) {
+        const remRows = remItems
+          .map(x => `<b>${fmt(x.total)} ${escapeHtml(x.currency)}</b>`).join(' · ');
+        let approx = '';
+        if (data.remaining_base_total != null && remItems.length > 1) {
+          const partial = data.remaining_base_partial
+            ? ' <span class="money-placeholder">(часть без курса)</span>' : '';
+          approx = ` <span class="money-placeholder">≈ ${fmt(data.remaining_base_total)} ${escapeHtml(data.base_currency || 'USD')}${partial}</span>`;
+        }
+        html += `<div class="money-base-total">${icon('cash')} Осталось получить: ${remRows}${approx}</div>`;
       }
       // Stat-плитки показываем только если хоть один счётчик не ноль,
       // иначе три «0 0 0» лишь засоряют экран.

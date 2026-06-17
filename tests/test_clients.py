@@ -64,6 +64,20 @@ def test_clients_overview_includes_ms_balance(isolated_db):
     assert rows["Z9"]["balance_cents"] == -5000
 
 
+def test_clients_overview_debt_split_by_currency(isolated_db):
+    """Долг клиента в разных валютах НЕ складывается: debt_by_currency содержит
+    отдельную запись на каждую валюту."""
+    db = isolated_db
+    for cur, qty, price in [("USD", 2, 100.0), ("UZS", 3, 50000.0)]:
+        oid = _shipped_order(db, "MULTI", "Multi Cur", price, qty)
+        db.update_order_currency(oid, cur)
+    rows = {r["agent_id"]: r for r in asyncio.run(db.get_clients_overview())}
+    dbc = {x["currency"]: x["amount"] for x in rows["MULTI"]["debt_by_currency"]}
+    assert dbc.get("USD") == 200.0
+    assert dbc.get("UZS") == 150000.0
+    assert len(rows["MULTI"]["debt_by_currency"]) == 2
+
+
 def test_clients_detail_boss(isolated_db, monkeypatch):
     db = isolated_db
     import services.moysklad as moysklad

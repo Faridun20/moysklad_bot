@@ -187,6 +187,28 @@ def test_analytics_export_forbidden_for_manager(client_env, monkeypatch):
     assert resp.status_code == 403
 
 
+def test_manager_performance_splits_currencies(isolated_db):
+    """get_manager_performance: выручка/долг РАЗДЕЛЬНО по валютам (топ-менеджеров
+    в company-аналитике больше не складывает USD+EUR в одно число с «$»)."""
+    import datetime as dt
+
+    db = isolated_db
+    db.set_role(5, "m", "Менеджер", "manager")
+    for cur, qty, price in [("USD", 2, 100.0), ("EUR", 1, 50.0)]:
+        oid = db.create_order(5, "Менеджер", "")
+        db.update_order_agent(oid, "A", "Client")
+        db.update_order_currency(oid, cur)
+        db.add_order_item(oid, "Товар", "", qty, "шт", price)
+        db.update_order_status(oid, "shipped")
+    since = (dt.datetime.now() - dt.timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    until = (dt.datetime.now() + dt.timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    perf = asyncio.run(db.get_manager_performance(since, until))
+    m = next(x for x in perf if x["user_id"] == 5)
+    rev = {x["currency"]: x["amount"] for x in m["revenue_by_currency"]}
+    assert rev.get("USD") == 200.0
+    assert rev.get("EUR") == 50.0
+
+
 def test_personal_analytics_splits_currencies(client_env):
     """Личная аналитика менеджера НЕ складывает разные валюты: выручка
     возвращается списком {currency, total} по каждой валюте отдельно."""

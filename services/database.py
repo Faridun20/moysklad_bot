@@ -1351,6 +1351,9 @@ async def get_credit_overview() -> list[dict]:
     # в КОПЕЙКАХ и сконвертированный в БАЗОВУЮ валюту — бит-в-бит как
     # get_agent_current_debt (мульти-валютный долг к единому лимиту).
     debt_by_agent: dict[str, float] = {}
+    # Долг РАЗДЕЛЬНО по валютам (для отображения — не складываем UZS+USD+EUR).
+    # debt (base) ниже остаётся для over_limit (лимит — в базовой валюте).
+    debt_cur_by_agent: dict[str, dict[str, float]] = {}
     for oid, aid, cur in open_rows:
         items = items_by_order.get(oid, [])
         total = sum(
@@ -1365,6 +1368,9 @@ async def get_credit_overview() -> list[dict]:
         if not net_cents:
             continue
         net_major = float(money.from_cents(net_cents))
+        ocur = (cur or base_cur).upper()
+        dc = debt_cur_by_agent.setdefault(aid, {})
+        dc[ocur] = dc.get(ocur, 0.0) + net_major
         base = convert_to_base(net_major, cur or base_cur)
         debt_by_agent[aid] = debt_by_agent.get(aid, 0.0) + (
             base if base is not None else net_major
@@ -1376,12 +1382,18 @@ async def get_credit_overview() -> list[dict]:
         # суммы по нескольким заказам мог дать over_limit=True здесь при False там.
         debt = round(debt_by_agent.get(aid, 0.0), 2)
         limit = limits_map.get(aid, default_limit)
+        dc = debt_cur_by_agent.get(aid, {})
+        debt_by_currency = [
+            {"currency": c, "amount": round(v, 2)}
+            for c, v in sorted(dc.items(), key=lambda kv: kv[1], reverse=True)
+        ]
         out.append(
             {
                 "agent_id": aid,
                 "agent_name": name,
                 "limit": limit,
                 "debt": debt,
+                "debt_by_currency": debt_by_currency,
                 "free": limit - debt,
                 "over_limit": debt > limit,
             }
@@ -1446,6 +1458,7 @@ async def get_clients_overview() -> list[dict[str, Any]]:
                     "agent_name": c["name"] or c["ms_id"],
                     "limit": default_limit,
                     "debt": 0.0,
+                    "debt_by_currency": [],
                     "free": default_limit,
                     "over_limit": False,
                     "balance_cents": int(bc),
@@ -3372,6 +3385,10 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
     revenue_statuses = {"shipped", "paid", "partially_returned", "returned"}
     debt_statuses = {"shipped", "partially_returned"}
 
+    from config import BASE_CURRENCY
+
+    base_cur = (BASE_CURRENCY or "USD").upper()
+
     agg: dict[int, dict] = {}
     for o in orders:
         uid = o["user_id"]
@@ -3385,6 +3402,9 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
                 "shipped": 0,
                 "revenue_cents": 0,
                 "debt_cents": 0,
+                # Выручка/долг РАЗДЕЛЬНО по валютам (не складываем разные валюты).
+                "revenue_cents_cur": {},
+                "debt_cents_cur": {},
                 "returns_count": 0,
             },
         )
@@ -3397,19 +3417,23 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
             m["approved"] += 1
         elif status == "shipped":
             m["shipped"] += 1
+        ocur = (o.get("currency") or base_cur).upper()
         items = items_by_order.get(o["id"], [])
         total_cents = sum(
             money.mul_qty(_price_cents(it), it.get("quantity", 0) or 0) for it in items
         )
         if status in revenue_statuses:
             m["revenue_cents"] += total_cents
+            m["revenue_cents_cur"][ocur] = m["revenue_cents_cur"].get(ocur, 0) + total_cents
         if status in debt_statuses and not o.get("payment_confirmed"):
             confirmed = sum(
                 _amount_cents(p)
                 for p in payments_by_order.get(o["id"], [])
                 if p["status"] == "confirmed"
             )
-            m["debt_cents"] += max(0, total_cents - confirmed)
+            net = max(0, total_cents - confirmed)
+            m["debt_cents"] += net
+            m["debt_cents_cur"][ocur] = m["debt_cents_cur"].get(ocur, 0) + net
         m["returns_count"] += returns_by_order.get(o["id"], 0)
 
     users = {u["user_id"]: u for u in await asyncio.to_thread(get_all_users)}
@@ -3426,6 +3450,18 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
                 "shipped": m["shipped"],
                 "revenue": float(money.from_cents(m["revenue_cents"])),
                 "debt": float(money.from_cents(m["debt_cents"])),
+                "revenue_by_currency": [
+                    {"currency": c, "amount": float(money.from_cents(v))}
+                    for c, v in sorted(
+                        m["revenue_cents_cur"].items(), key=lambda kv: kv[1], reverse=True
+                    )
+                ],
+                "debt_by_currency": [
+                    {"currency": c, "amount": float(money.from_cents(v))}
+                    for c, v in sorted(
+                        m["debt_cents_cur"].items(), key=lambda kv: kv[1], reverse=True
+                    )
+                ],
                 "returns_count": m["returns_count"],
             }
         )

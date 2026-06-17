@@ -1050,9 +1050,11 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
         {
             "name": m["full_name"],
             "revenue": m["revenue"],
+            "revenue_by_currency": m.get("revenue_by_currency", []),
             "count": m["shipped"],
             "orders": m["orders_count"],
             "debt": m["debt"],
+            "debt_by_currency": m.get("debt_by_currency", []),
             "returns": m["returns_count"],
         }
         for m in perf[:10]
@@ -3362,6 +3364,17 @@ async def api_debts(request: Request):
     remaining_base_total = round(sum(known), 2) if known else None
     remaining_base_partial = bool(known) and len(known) < len(rem_bases)
 
+    # Остаток к получению РАЗДЕЛЬНО по валютам (не складываем) — фронт покажет
+    # построчно; конвертированный ≈ итог остаётся как вспомогательный.
+    rem_by_cur: dict[str, float] = {}
+    for r in result:
+        if r["remaining"] > 0:
+            rem_by_cur[r["currency"]] = rem_by_cur.get(r["currency"], 0.0) + r["remaining"]
+    remaining_by_currency = [
+        {"currency": k, "total": v}
+        for k, v in sorted(rem_by_cur.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+
     return JSONResponse(
         {
             "debts": result,
@@ -3370,6 +3383,7 @@ async def api_debts(request: Request):
             "today": today,
             "money_received": [{"currency": k, "total": v} for k, v in summary["received"].items()],
             "money_pending": [{"currency": k, "total": v} for k, v in summary["pending"].items()],
+            "remaining_by_currency": remaining_by_currency,
             "remaining_base_total": remaining_base_total,
             "remaining_base_partial": remaining_base_partial,
             "base_currency": base_cur,
