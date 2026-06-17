@@ -101,11 +101,11 @@ function renderNoAccess() {
   if (sb) sb.classList.add('hidden');
   const content = document.getElementById('content');
   content.innerHTML = `
-    <div class="empty-state" style="padding-top:48px;">
+    <div class="empty-state">
       <div class="empty-state-icon">${icon('lock')}</div>
       <div class="empty-state-title">Доступ не выдан</div>
       <div class="empty-state-hint">Ваш аккаунт пока без прав. Попросите администратора назначить роль — затем откройте приложение снова.</div>
-      <button class="btn-primary" style="margin-top:16px;" onclick="location.reload()">Обновить</button>
+      <button class="btn-primary" onclick="location.reload()">Обновить</button>
     </div>`;
 }
 
@@ -311,7 +311,7 @@ async function renderOrdersScreen() {
   // iOS-сегмент .seg (равные доли, приподнятая активная), а не отдельный .sub-tabs.
   const content = document.getElementById('content');
   const tabsHtml = `
-    <div class="seg-row" style="margin-bottom:10px;">
+    <div class="seg-row">
       <div class="seg">
         <button class="seg-item ${ordersSubTab === 'orders' ? 'active' : ''}" data-sub="orders" aria-pressed="${ordersSubTab === 'orders'}">${icon('list')} Заказы</button>
         <button class="seg-item ${ordersSubTab === 'stock' ? 'active' : ''}" data-sub="stock" aria-pressed="${ordersSubTab === 'stock'}">${icon('box')} Каталог</button>
@@ -374,7 +374,7 @@ async function renderHome() {
   if (prevRev > 0) {
     const pct = Math.round((data.today.revenue - prevRev) / prevRev * 100);
     const dir = pct > 0 ? 'up' : pct < 0 ? 'down' : '';
-    const arrow = pct > 0 ? '↑' : pct < 0 ? '↓' : '→';
+    const arrow = pct > 0 ? icon('trend-up') : pct < 0 ? icon('trend-down') : '';
     heroDelta = `<div class="hero-delta ${dir}">${arrow} ${pct > 0 ? '+' : ''}${pct}% к вчера · ${data.today.shipments} отгр.</div>`;
   }
   const hero = `
@@ -424,7 +424,7 @@ async function renderHome() {
   const linkWarning = (!data.ms_linked && data.role === 'manager') ? `
     <div class="warn-card">
       ${icon('alert', 'warn-ic')} <b>Аккаунт не привязан к МойСклад.</b><br>
-      <span style="font-size:12px;">Откройте чат с ботом и нажмите /start. Без привязки персональная аналитика недоступна.</span>
+      <span class="u-fs-12">Откройте чат с ботом и нажмите /start. Без привязки персональная аналитика недоступна.</span>
     </div>
   ` : '';
 
@@ -783,8 +783,8 @@ function renderStockContent() {
     ).join('');
 
   content.innerHTML = `
-    <div class="form-row" style="margin: 4px 0 8px;">
-      <input id="stock-search" class="form-input" placeholder="🔎 Поиск товара…" value="${escapeHtml(stockSearch)}">
+    <div class="form-row">
+      <input id="stock-search" class="form-input" placeholder="Поиск товара…" value="${escapeHtml(stockSearch)}">
     </div>
     <div class="section-label">Категории</div>
     <div class="cat-row">${catBtns}</div>
@@ -1569,7 +1569,7 @@ function renderOrderEditor() {
               <div class="editor-item-name">${escapeHtml(it.name)}</div>
               <div class="editor-item-qty">${it.quantity} ${it.unit || 'шт'}${subStr}</div>
             </div>
-            <button class="editor-item-del" data-idx="${i}" aria-label="Удалить позицию">✕</button>
+            <button class="editor-item-del" data-idx="${i}" aria-label="Удалить позицию">${icon('close')}</button>
           </div>
         `;
       }).join('') + (grandTotal > 0 ? `
@@ -1621,7 +1621,7 @@ function renderOrderEditor() {
     <div class="editor-footer">
       <button class="btn-submit-order" id="btn-submit"
         ${order.items.length === 0 || !order.agent_name ? 'disabled' : ''}>
-        🚀 Отправить заявку
+        ${icon('check')} Отправить заявку
       </button>
       ${order.items.length === 0 || !order.agent_name
         ? '<div class="editor-hint">Добавьте товары и выберите клиента</div>'
@@ -1681,7 +1681,7 @@ async function openAgentSearch() {
       <div class="editor-title">Выбор клиента</div>
     </div>
     <div class="agent-search-wrap">
-      <input type="text" id="agent-search" class="form-input" placeholder="🔍 Поиск по имени…">
+      <input type="text" id="agent-search" class="form-input" placeholder="Поиск по имени…">
     </div>
     <div id="agent-list" class="orders-list">
       <div class="loader">Введите имя для поиска</div>
@@ -1750,7 +1750,7 @@ async function openProductPicker() {
       <div class="editor-title">Выбор товара</div>
     </div>
     <div class="agent-search-wrap">
-      <input type="text" id="prod-search" class="form-input" placeholder="🔍 Поиск товара…">
+      <input type="text" id="prod-search" class="form-input" placeholder="Поиск товара…">
     </div>
     <div id="cat-filters" class="cat-scroll"></div>
     <div id="prod-list" class="orders-list">${loading('Загружаю…')}</div>
@@ -1785,7 +1785,7 @@ async function openProductPicker() {
     const list = document.getElementById('prod-list');
     if (!list) return;
     const moreBtn = filtered.length > prodLimit
-      ? `<button class="btn-secondary" id="prod-more" style="margin-top:8px;">Показать ещё (${filtered.length - prodLimit})</button>`
+      ? `<button class="btn-secondary u-mt-2" id="prod-more">Показать ещё (${filtered.length - prodLimit})</button>`
       : '';
     list.innerHTML = filtered.length === 0
       ? '<div class="loader">Товары не найдены</div>'
@@ -1877,7 +1877,7 @@ function openQuantityInput(name, unit, maxStock, href) {
       <div class="qty-product-name">${escapeHtml(name)}</div>
       <div class="qty-stock">На складе: ${maxStock} ${unit}</div>
 
-      <div class="form-row" style="margin-top:12px;">
+      <div class="form-row u-mt-3">
         <label class="form-label">Количество (${unit})</label>
         <input type="number" id="qty-input" class="form-input"
           placeholder="0" inputmode="decimal" min="0.1" step="0.1">
@@ -1887,7 +1887,7 @@ function openQuantityInput(name, unit, maxStock, href) {
         <label class="form-label">Валюта заказа</label>
         <div class="cur-row">${curButtons}</div>
         ${lockedCurrency
-          ? '<div class="qty-stock" style="margin-top:4px;font-size:11px;">Валюта фиксируется после первой позиции</div>'
+          ? '<div class="qty-stock u-mt-1 u-fs-11">Валюта фиксируется после первой позиции</div>'
           : ''}
       </div>
 
@@ -1897,7 +1897,7 @@ function openQuantityInput(name, unit, maxStock, href) {
           placeholder="0" inputmode="decimal" min="0" step="0.01">
       </div>
 
-      <div id="line-total" class="qty-stock" style="margin: 8px 0 80px;">
+      <div id="line-total" class="qty-stock qty-line-total">
         Итого: <b>0 ${initialCur}</b>
       </div>
     </div>
@@ -1996,7 +1996,7 @@ function openQuantityInput(name, unit, maxStock, href) {
       const btn = document.createElement('button');
       btn.className = 'btn-primary';
       btn.id = 'qty-confirm-fallback';
-      btn.textContent = '✅ Добавить в заявку';
+      btn.innerHTML = `${icon('check')} Добавить в заявку`;
       btn.addEventListener('click', onConfirm);
       totalEl2.parentNode.appendChild(btn);
     }
@@ -2171,7 +2171,7 @@ const ANALYTICS_TTL_MS = 60 * 1000;
 // .seg (фиксированные 2–4 — навигация), не переносится.
 function analyticsHeaderHtml(isBoss) {
   const viewSeg = isBoss ? `
-    <div class="seg-row" style="margin-bottom:10px;">
+    <div class="seg-row">
       <div class="seg">
         <button class="seg-item ${analyticsView === 'sales' ? 'active' : ''}" data-aview="sales" aria-pressed="${analyticsView === 'sales'}">Продажи</button>
         <button class="seg-item ${analyticsView === 'money' ? 'active' : ''}" data-aview="money" aria-pressed="${analyticsView === 'money'}">Деньги</button>
@@ -2314,7 +2314,7 @@ function renderAnalyticsContent(data) {
     ? `<div class="section-label">Топ менеджеров</div><div class="card">${managerItems}</div>` : '';
   // Кнопка Excel — только company-scope (boss/admin).
   const exportBlock = data.scope === 'company'
-    ? `<button class="btn-primary" id="analytics-export" style="margin-top:12px">${icon('chart')} Выгрузить Excel</button>` : '';
+    ? `<button class="btn-primary u-mt-3" id="analytics-export">${icon('chart')} Выгрузить Excel</button>` : '';
 
   content.innerHTML = `
     ${analyticsHeaderHtml(isBoss)}
@@ -2323,7 +2323,7 @@ function renderAnalyticsContent(data) {
       <div class="stat">
         <div class="stat-value">${fmt(data.total)} $</div>
         <div class="stat-label">Выручка</div>
-        ${trendStr ? `<div class="${trendClass}" style="font-size:11px;margin-top:4px">${trendStr}</div>` : ''}
+        ${trendStr ? `<div class="${trendClass} u-fs-11 u-mt-1">${trendStr}</div>` : ''}
       </div>
       <div class="stat">
         <div class="stat-value">${data.count}</div>
@@ -2354,17 +2354,17 @@ function renderAnalyticsContent(data) {
     exportBtn.addEventListener('click', async () => {
       haptic('light');
       exportBtn.disabled = true;
-      exportBtn.textContent = '⏳ Готовлю файл…';
+      exportBtn.innerHTML = `${icon('clock')} Готовлю файл…`;
       try {
         const exportBody = (analyticsPeriod === 'custom' && analyticsSince && analyticsUntil)
           ? { since: analyticsSince, until: _nextDay(analyticsUntil) }
           : { period: analyticsPeriod };
         await api('/api/analytics/export', exportBody);
-        exportBtn.textContent = '✅ Отправлено в чат';
+        exportBtn.innerHTML = `${icon('check')} Отправлено в чат`;
         tg.showAlert && tg.showAlert('Excel-файл отправлен в чат с ботом');
       } catch (e) {
         exportBtn.disabled = false;
-        exportBtn.textContent = 'Выгрузить Excel';
+        exportBtn.innerHTML = `${icon('chart')} Выгрузить Excel`;
         tg.showAlert ? tg.showAlert(e.message) : alert(e.message);
       }
     });
@@ -3053,7 +3053,7 @@ async function renderAgentDetail(agentId) {
 
   content.innerHTML = `
     <div class="editor-header"><div class="editor-title">${icon('building')} ${escapeHtml(d.name || '—')}</div></div>
-    ${d.phone ? `<div class="debt-meta" style="padding:0 2px 8px;">${icon('phone')} ${escapeHtml(d.phone)}</div>` : ''}
+    ${d.phone ? `<div class="debt-meta agent-phone">${icon('phone')} ${escapeHtml(d.phone)}</div>` : ''}
     <div class="card">
       <div class="agent-bal">${balLine}</div>
       <div class="debt-meta">Долг по заказам бота: <b>${fmt(d.debt)} ${escapeHtml(baseC)}</b> · лимит ${fmt(d.limit)} · свободно ${fmt(d.free)}</div>
@@ -3241,7 +3241,11 @@ async function renderDebts(container) {
     // ─── Открытые долги (с partial — частично оплаченные тоже здесь) ─
     if (open.length === 0 && awaiting.length === 0 && !totalEmpty) {
       // Долгов нет, но есть деньги получено/ожидается — отдельно скажем
-      html += '<div class="empty">Открытых долгов нет — все деньги собраны 🎉</div>';
+      html += `<div class="empty-state">
+        <div class="empty-state-icon">${icon('check')}</div>
+        <div class="empty-state-title">Открытых долгов нет</div>
+        <div class="empty-state-hint">Все деньги собраны.</div>
+      </div>`;
     } else if (open.length > 0) {
       html += `<div class="section-label">${icon('card')} Открытые (${open.length})</div>`;
       html += '<div class="debts-list">' + open.map(d => {

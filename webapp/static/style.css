@@ -40,6 +40,7 @@
   --shadow-float: 0 4px 20px rgba(0,0,0,0.10), 0 1px 3px rgba(0,0,0,0.05);
   --shadow-modal: 0 8px 40px rgba(0,0,0,0.22);
   --fill-neutral: rgba(127,127,127,0.12);  /* нейтральная заливка, ок на обеих темах */
+  --sk-highlight: rgba(0,0,0,0.07);        /* «блик» шиммера скелетона (тёмный на свете) */
 
   /* Семантические цвета (статусы, бейджи, деньги, тренды).
      Светлые значения = прежние hex; тёмные варианты — в блоке
@@ -66,6 +67,7 @@
 [data-theme="dark"] {
   --bg-soft:     rgba(255, 255, 255, 0.08);
   --divider:     rgba(255, 255, 255, 0.12);
+  --sk-highlight: rgba(255, 255, 255, 0.09);  /* на тёмной теме блик светлый, иначе невидим */
   --success:     #4ade80;
   --success-bg:  rgba(74, 222, 128, 0.16);
   --success-fg:  #06230f;             /* тёмный текст на ярко-зелёной кнопке */
@@ -92,6 +94,7 @@
     --text-mute:  var(--tg-theme-hint-color, #9e9ea3);
     --divider:    rgba(255, 255, 255, 0.12);
     --bg-soft:    rgba(255, 255, 255, 0.08);
+    --sk-highlight: rgba(255, 255, 255, 0.09);
     --success:    #4ade80;  --success-bg: rgba(74, 222, 128, 0.16); --success-fg: #06230f;
     --danger:     #ff6b6b;  --danger-bg:  rgba(255, 107, 107, 0.16);
     --warn:       #f5c451;  --warn-strong: #f9b542; --warn-bg: rgba(249, 168, 37, 0.16);
@@ -102,6 +105,15 @@
 
 /* Утилита: скрыть элемент без инлайн-стилей в JS. */
 .hidden { display: none !important; }
+
+/* Точечные утилиты отступа/кегля — заменяют разрозненные инлайн-стили в
+   JS-шаблонах (единый шаг 4px и две ступени мелкого кегля). */
+.u-mt-1 { margin-top: 4px; }
+.u-mt-2 { margin-top: 8px; }
+.u-mt-3 { margin-top: 12px; }
+.u-mt-4 { margin-top: 16px; }
+.u-fs-11 { font-size: 11px; }
+.u-fs-12 { font-size: 12px; }
 
 /* ─── Доступность ─────────────────────────────────────────────────
    Видимый фокус для навигации с клавиатуры (в браузере вне Telegram).
@@ -123,7 +135,6 @@
   .search-item:hover { background: var(--bg-soft); }
   .nav-item:hover:not(.active),
   .seg-item:hover:not(.active),
-  .sub-tab:hover:not(.active),
   .subseg-item:hover:not(.active) { color: var(--text); }
   .cat-btn:hover:not(.active) { border-color: var(--accent); }
   .btn-primary:hover:not(:disabled),
@@ -186,13 +197,10 @@
 .section-label .ic { --ic-size: 13px; }
 .debt-agent .ic { --ic-size: 15px; }
 .cat-btn .ic,
-.sub-tab .ic,
 .requests-btn .ic { --ic-size: 16px; }
 /* Кнопка «Заявки на рассмотрении»: иконка + подпись по центру. */
 .requests-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
 .warn-card .ic { --ic-size: 16px; color: var(--warn); }
-/* Под-вкладки «Заказы/Каталог»: иконка + подпись по центру, единый зазор. */
-.sub-tab { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
 .order-title .ic { --ic-size: 16px; vertical-align: -0.16em; }
 
 /* Крупные иллюстративные иконки состояний (бывшие большие эмодзи). */
@@ -254,7 +262,7 @@ body {
 .role-badge {
   font-size: 12px;
   padding: 5px 12px;
-  border-radius: 20px;
+  border-radius: var(--radius-pill);
   background: var(--accent);
   color: var(--accent-fg);
   font-weight: 600;
@@ -363,15 +371,18 @@ body {
 }
 
 .hero-delta {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-size: 13px;
   padding: 4px 12px;
-  border-radius: 12px;
-  background: rgba(127,127,127,0.18);
+  border-radius: var(--radius-chip);
+  background: var(--fill-neutral);
   color: var(--accent-fg);
   opacity: 0.92;
   margin-top: 10px;
 }
+.hero-delta .ic { --ic-size: 15px; vertical-align: 0; }
 
 .hero-delta.up   { background: rgba(255,255,255,0.25); }
 .hero-delta.down { background: rgba(0,0,0,0.15); }
@@ -591,7 +602,7 @@ body {
   cursor: pointer;
   padding: 8px 4px;
   min-height: 48px;       /* комфортная зона тапа на телефоне */
-  border-radius: 16px;
+  border-radius: var(--radius);
   transition: background 0.15s ease, color 0.15s ease;
 }
 
@@ -625,7 +636,7 @@ body {
   padding: 48px 24px 32px;
   text-align: center;
 }
-.error-card .error-icon { font-size: 48px; line-height: 1; }
+.error-card .error-icon { line-height: 1; }
 .error-card .error-title { font-size: 18px; font-weight: 600; color: var(--text); }
 .error-card .error-body { font-size: 14px; color: var(--text-mute); max-width: 280px; }
 .error-card .btn-primary { margin-top: 8px; max-width: 200px; }
@@ -637,37 +648,6 @@ body {
   padding: 12px 14px;
   margin-bottom: 8px;
   font-size: 13px;
-}
-
-/* ─── Под-вкладки внутри объединённого экрана «Склад и заказы» ─── */
-.sub-tabs {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 4px;
-  margin-bottom: 12px;
-  background: var(--bg-soft);
-  border-radius: 14px;
-  padding: 4px;
-}
-
-.sub-tab {
-  padding: 12px 10px;
-  min-height: 44px;
-  background: transparent;
-  border: none;
-  border-radius: 10px;
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-mute);
-  cursor: pointer;
-  font-family: inherit;
-  transition: background 0.15s ease, color 0.15s ease;
-}
-
-.sub-tab.active {
-  background: var(--bg-card);
-  color: var(--text);
-  box-shadow: var(--shadow-card);
 }
 
 /* ─── Категории (chips) ───────────────────────────────────────── */
@@ -698,7 +678,7 @@ body {
 .cal-nav {
   width: 44px; height: 44px; flex-shrink: 0;  /* тач-таргет ≥44px (было 36) */
   border: none; background: var(--bg-soft); color: var(--text);
-  border-radius: 10px; font-size: 20px; line-height: 1; cursor: pointer;
+  border-radius: var(--radius-sm); font-size: 20px; line-height: 1; cursor: pointer;
 }
 .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
 .cal-wd { margin-bottom: 2px; }
@@ -735,7 +715,7 @@ body {
   padding: 10px 14px;
   min-height: 40px;  /* комфортный тач-таргет в скролл-ряду (было ~33px) */
   display: inline-flex; align-items: center;
-  border-radius: 20px;
+  border-radius: var(--radius-pill);
   background: var(--bg-card);
   color: var(--text);
   border: 1px solid var(--divider);
@@ -799,7 +779,7 @@ body {
   font-size: 13px;
   font-weight: 600;
   padding: 4px 12px;
-  border-radius: 12px;
+  border-radius: var(--radius-chip);
   white-space: nowrap;
   margin-left: 8px;
 }
@@ -836,7 +816,6 @@ body {
   padding: 10px 0; border-bottom: 0.5px solid var(--divider);
 }
 .top-row:last-child { border-bottom: none; }
-.top-medal { font-size: 20px; width: 26px; text-align: center; }
 .top-info { flex: 1; min-width: 0; }
 .top-name {
   font-size: 14px; font-weight: 500;
@@ -889,11 +868,14 @@ body {
   display: flex; gap: 6px;
 }
 
+/* Выбор значения (валюта / тип возврата) — accent-fill при выборе, как
+   .payment-option; единый радиус chip-семьи. */
 .cur-btn {
   flex: 1;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   padding: 12px;
   border: none;
-  border-radius: var(--radius);
+  border-radius: var(--radius-chip);
   background: var(--bg-card);
   color: var(--text);
   font-size: 13px;
@@ -901,6 +883,7 @@ body {
   cursor: pointer;
   box-shadow: var(--shadow-card);
 }
+.cur-btn .ic { --ic-size: 16px; }
 
 .cur-btn.active {
   background: var(--accent);
@@ -1012,7 +995,7 @@ body {
   font-size: 11px;
   font-weight: 600;
   padding: 4px 10px;
-  border-radius: 12px;
+  border-radius: var(--radius-chip);
   white-space: nowrap;
 }
 
@@ -1034,7 +1017,7 @@ body {
 .order-pay-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
 .order-pay {
   font-size: 11px; font-weight: 600;
-  padding: 2px 8px; border-radius: 10px;
+  padding: 2px 8px; border-radius: var(--radius-chip);
   background: var(--fill-neutral); color: var(--text-mute);
   white-space: nowrap;
 }
@@ -1048,7 +1031,7 @@ body {
 /* Кредит-контекст клиента в заявке (босс решает об апруве не уходя в Лимиты). */
 .credit-ctx {
   margin: 4px 0 6px; padding: 8px 10px;
-  border-radius: 10px; font-size: 12px; line-height: 1.4;
+  border-radius: var(--radius-sm); font-size: 12px; line-height: 1.4;
 }
 .credit-ctx--ok  { background: var(--success-bg); color: var(--text); }
 .credit-ctx--bad { background: var(--danger-bg);  color: var(--text); }
@@ -1168,12 +1151,13 @@ body {
 
 .editor-item-del {
   background: none; border: none;
-  font-size: 18px; cursor: pointer;
+  cursor: pointer;
   color: var(--danger);
   /* Тач-таргет ≥44px (раньше ~26px — мимо пальцем по денежной форме). */
   min-width: 44px; min-height: 44px;
   display: inline-flex; align-items: center; justify-content: center;
 }
+.editor-item-del .ic { --ic-size: 18px; }
 
 .editor-empty {
   text-align: center; padding: 20px;
@@ -1213,7 +1197,9 @@ body {
   border: none; border-radius: var(--radius);
   font-size: 16px; font-weight: 600; cursor: pointer;
   font-family: inherit;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
 }
+.btn-submit-order .ic { --ic-size: 18px; vertical-align: 0; }
 
 .btn-submit-order:disabled { opacity: var(--disabled-opacity); cursor: not-allowed; }
 
@@ -1243,6 +1229,8 @@ body {
   font-size: 13px; color: var(--text-mute);
   text-align: center;
 }
+/* Итог строки: нижний отступ резервирует место под плавающей MainButton. */
+.qty-line-total { margin: 8px 0 80px; }
 
 .qty-input {
   width: 100%; text-align: center;
@@ -1265,7 +1253,7 @@ body {
 }
 .payment-option {
   flex: 1; display: flex; align-items: center; gap: 8px;
-  padding: 12px; border-radius: 12px;
+  padding: 12px; border-radius: var(--radius-chip);
   background: var(--bg-card);
   cursor: pointer; font-size: 15px;
 }
@@ -1303,18 +1291,21 @@ body {
 .debts-title {
   font-size: 22px; font-weight: 700;
 }
+/* Фильтр «Все / К оплате сейчас» — тот же сегмент-язык, что .seg
+   (трек-подложка + активный сегмент как приподнятая карточка). */
 .debts-tabs {
-  display: flex; gap: 8px;
+  display: flex; gap: 4px;
+  background: var(--bg-soft); border-radius: 14px; padding: 4px;
 }
 .debts-tab {
-  flex: 1; padding: 10px; border: 0; border-radius: 10px;
-  background: var(--bg-card);
-  color: var(--text); font-size: 14px;
-  cursor: pointer;
+  flex: 1; padding: 10px; border: 0; border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-mute); font-size: 14px; font-weight: 600;
+  cursor: pointer; font-family: inherit;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 .debts-tab.active {
-  background: var(--accent);
-  color: var(--accent-fg);
+  background: var(--bg-card); color: var(--text); box-shadow: var(--shadow-card);
 }
 .debts-summary {
   padding: 0 14px;
@@ -1324,7 +1315,7 @@ body {
 }
 .debt-stat {
   padding: 14px 8px;          /* чуть выше, чтобы цифры дышали */
-  border-radius: 12px; text-align: center;
+  border-radius: var(--radius-chip); text-align: center;
   background: var(--bg-card);
 }
 .debt-stat-num { font-size: 24px; font-weight: 700; line-height: 1.1; }
@@ -1363,7 +1354,7 @@ body {
 .debt-state b { color: var(--text); }
 .debt-owner { opacity: 0.7; }
 .btn-mark-paid {
-  width: 100%; padding: 10px; border: 0; border-radius: 10px;
+  width: 100%; padding: 10px; border: 0; border-radius: var(--radius-sm);
   background: var(--accent);
   color: var(--accent-fg);
   font-size: 14px; font-weight: 600; cursor: pointer;
@@ -1416,7 +1407,7 @@ body {
   padding: 28px 20px;
   text-align: center;
   background: var(--bg-card);
-  border-radius: 16px;
+  border-radius: var(--radius);
 }
 .finance-empty-icon {
   margin-bottom: 12px;
@@ -1444,7 +1435,7 @@ body {
   display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
 }
 .btn-confirm-pay, .btn-reject-pay {
-  padding: 10px; border: 0; border-radius: 10px;
+  padding: 10px; border: 0; border-radius: var(--radius-sm);
   font-size: 14px; font-weight: 600; cursor: pointer;
 }
 .btn-confirm-pay {
@@ -1458,7 +1449,7 @@ body {
 .btn-confirm-pay:disabled, .btn-reject-pay:disabled { opacity: var(--disabled-opacity); cursor: default; }
 .btn-edit-limit {
   grid-column: 1 / -1;
-  padding: 10px; border: 1px solid var(--accent); border-radius: 10px;
+  padding: 10px; border: 1px solid var(--accent); border-radius: var(--radius-sm);
   background: var(--bg-card); color: var(--accent);
   font-size: 14px; font-weight: 600; cursor: pointer;
 }
@@ -1479,16 +1470,16 @@ body {
   display: flex; align-items: center; gap: 8px; padding: 4px 0 0;
   margin-bottom: 12px;
 }
-/* iOS-сегмент в стиле уже существующих под-вкладок «Заказы/Каталог» (.sub-tabs):
-   подложка-трек + активный сегмент как «приподнятая» карточка. Единый язык
-   верхнеуровневой навигации на всех экранах. */
+/* iOS-сегмент: подложка-трек + активный сегмент как «приподнятая» карточка.
+   Единый язык верхнеуровневой навигации (и любых 2–4-позиционных
+   переключателей: фильтр долгов, выбор валюты) на всех экранах. */
 .seg {
   display: flex; gap: 4px; flex: 1; min-width: 0;
   background: var(--bg-soft); border-radius: 14px; padding: 4px;
 }
 .seg-item {
   flex: 1; min-width: 0; padding: 12px 8px; min-height: 44px; border: 0;
-  border-radius: 10px; background: transparent; color: var(--text-mute);
+  border-radius: var(--radius-sm); background: transparent; color: var(--text-mute);
   font-size: 14px; font-weight: 600; font-family: inherit; cursor: pointer;
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -1507,7 +1498,7 @@ body {
 /* Доп-ссылка справа от сегмента (напр. «Лимиты» — read-only надстройка для
    босса): намеренно НЕ pill, чтобы не путалась с разделами уровня 1. */
 .seg-aux {
-  flex-shrink: 0; padding: 11px 10px; border: 0; border-radius: 12px;
+  flex-shrink: 0; padding: 11px 10px; border: 0; border-radius: var(--radius-chip);
   background: transparent; color: var(--text-mute);
   font-size: 13px; font-weight: 600; font-family: inherit; cursor: pointer;
   display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
@@ -1541,6 +1532,7 @@ body {
 
 /* Карточка контрагента («Клиенты»): строка баланса МойСклад. */
 .agent-bal { font-size: 16px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+.agent-phone { padding: 0 2px 8px; }
 .bal-owe { color: var(--danger); font-weight: 600; }   /* клиент должен нам */
 .bal-adv { color: var(--success); font-weight: 600; }  /* аванс/переплата */
 
@@ -1596,7 +1588,7 @@ body {
   background: linear-gradient(
     90deg,
     var(--bg-soft) 25%,
-    rgba(0,0,0,0.07) 50%,
+    var(--sk-highlight) 50%,
     var(--bg-soft) 75%
   );
   background-size: 200% 100%;
@@ -1620,9 +1612,10 @@ body {
   gap: 8px;
 }
 
-.empty-state-icon  { font-size: 44px; opacity: 0.45; margin-bottom: 4px; }
+.empty-state-icon  { opacity: 0.45; margin-bottom: 4px; color: var(--text-mute); }
 .empty-state-title { font-size: 17px; font-weight: 600; color: var(--text); }
 .empty-state-hint  { font-size: 14px; color: var(--text-mute); max-width: 260px; line-height: 1.45; }
+.empty-state .btn-primary { margin-top: 8px; max-width: 220px; }
 
 /* ─── Кнопки управления черновиком ─────────────────────────────── */
 .draft-actions {
@@ -1632,7 +1625,7 @@ body {
 .btn-delete-draft {
   flex-shrink: 0; padding: 8px 14px;
   background: transparent; border: 1px solid var(--danger);
-  color: var(--danger); border-radius: 10px;
+  color: var(--danger); border-radius: var(--radius-sm);
   font-size: 13px; font-weight: 600; cursor: pointer;
 }
 .btn-delete-draft:disabled { opacity: var(--disabled-opacity); cursor: default; }
@@ -1649,7 +1642,6 @@ body {
   border-radius: 50%;
   width: 44px;
   height: 44px;
-  font-size: 18px;
   cursor: pointer;
   color: var(--text);
   display: flex;
