@@ -80,16 +80,23 @@ PowerShell (Windows):
 ```powershell
 $env:TELEGRAM_TOKEN='0:fake'; $env:MS_TOKEN='fake'   # для UI-only достаточно заглушек
 $env:DEV_AUTH_BYPASS='1'; $env:DEV_USER_ID='999000001'
+$env:BOT_MODE='webapp'        # ТОЛЬКО FastAPI: без Telegram-поллинга (фейк-токен иначе уронит процесс)
 python -m tasks.seed_dev      # наполнить локальную SQLite примерными данными (идемпотентно)
-python bot.py                 # uvicorn на http://localhost:8080 (BOT_MODE=all)
+python bot.py                 # uvicorn на http://localhost:8080
 ```
 bash/macOS/Linux:
 ```bash
-export TELEGRAM_TOKEN='0:fake' MS_TOKEN='fake' DEV_AUTH_BYPASS=1 DEV_USER_ID=999000001
+export TELEGRAM_TOKEN='0:fake' MS_TOKEN='fake' DEV_AUTH_BYPASS=1 DEV_USER_ID=999000001 BOT_MODE=webapp
 python -m tasks.seed_dev && python bot.py
 ```
 Открой **http://localhost:8080**. Тёмная тема — переключи тему ОС (CSS реагирует на
 `prefers-color-scheme` вне Telegram).
+
+> **Важно:** `BOT_MODE=webapp` обязателен с заглушкой-токеном — иначе `bot.py`
+> (режим `all` по умолчанию) попытается запустить Telegram-поллинг и упадёт с
+> `TelegramUnauthorizedError: invalid token`. В режиме `webapp` поднимается только
+> FastAPI (это и нужно для просмотра UI). MS-ошибки `401 Unauthorized` в логе при
+> фейковом `MS_TOKEN` — ожидаемы и не мешают.
 
 - `DEV_AUTH_BYPASS=1` пускает синтетического dev-юзера (роль берётся из БД; сид даёт
   ему `admin`). **Предохранитель:** при заданном `DATABASE_URL` (прод/Postgres) обход
