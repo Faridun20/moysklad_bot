@@ -222,11 +222,11 @@ def main() -> int:
 
         # 8) Отгружен + ОЖИДАЮЩИЙ платёж → долг awaiting_confirmation
         o = add_order(user_id=mgr2, full_name="ТД Энергия", status="shipped",
-                      agent_name="Энергия", currency="EUR", payment_type="credit",
+                      agent_name="Энергия", currency="USD", payment_type="credit",
                       due_date=_date(2), created_offset=-2, shipped=True)
         add_item(o, "Трансформатор 100ВА", 3, 95.00)
         add_payment(user_id=mgr2, full_name="Борис Менеджер", amount=285.0,
-                    currency="EUR", order_id=o, status="pending")
+                    currency="USD", order_id=o, status="pending")
 
         # ─── Доп. данные для АНАЛИТИКИ: заказы по дням на обоих менеджеров ──
         # Личная аналитика менеджера (webapp _personal_analytics) считается из
@@ -246,7 +246,7 @@ def main() -> int:
         clients = ["Ромашка", "Сидоров", "Стройка", "Свет", "Котов", "Монтаж", "Энергия"]
         # Чередуем валюты, чтобы корзины долгов и аналитика наглядно
         # разбивались по валютам (а не схлопывались в одну сумму).
-        currencies = ["USD", "USD", "UZS", "USD", "EUR"]
+        currencies = ["USD", "USD", "UZS", "USD", "UZS"]
         for i in range(14):
             mgr = mgr1 if i % 2 == 0 else mgr2
             client = clients[i % len(clients)]

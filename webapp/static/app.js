@@ -1873,7 +1873,7 @@ async function openProductPicker() {
 
 function openQuantityInput(name, unit, maxStock, href) {
   const content = document.getElementById('content');
-  const currencies = ['USD', 'UZS', 'RUB', 'EUR'];
+  const currencies = ['USD', 'UZS'];
   // Если у заказа уже была валюта (после первой позиции) — берём её и
   // блокируем переключение. Все позиции одного ордера в одной валюте.
   const lockedCurrency = (currentDraftOrder && currentDraftOrder.currency) || null;
@@ -2760,7 +2760,7 @@ async function renderCashbox(container, section) {
       <div class="form-row pay-row">
         <input type="number" class="form-input pay-row-amount" placeholder="1500" inputmode="decimal">
         <select class="form-input pay-row-cur">
-          ${['USD', 'UZS', 'RUB', 'EUR'].map(c =>
+          ${['USD', 'UZS'].map(c =>
             `<option ${c === (cur || 'USD') ? 'selected' : ''}>${c}</option>`
           ).join('')}
         </select>
@@ -2867,7 +2867,7 @@ async function renderCashbox(container, section) {
         <div class="form-row pay-row">
           <input type="number" class="form-input pay-row-amount" placeholder="1500" inputmode="decimal">
           <select class="form-input pay-row-cur">
-            ${['USD', 'UZS', 'RUB', 'EUR'].map(c => `<option ${c === cur ? 'selected' : ''}>${c}</option>`).join('')}
+            ${['USD', 'UZS'].map(c => `<option ${c === cur ? 'selected' : ''}>${c}</option>`).join('')}
           </select>
           <button class="cur-btn pay-row-del" title="Убрать строку">${icon('close')}</button>
         </div>`;

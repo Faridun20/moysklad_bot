@@ -8,7 +8,7 @@ try:
     if "BOSS_IDS" not in dir():
         BOSS_IDS = []
     if "ALLOWED_CURRENCIES" not in dir():
-        ALLOWED_CURRENCIES = ("USD", "UZS", "RUB", "EUR")
+        ALLOWED_CURRENCIES = ("USD", "UZS")
 except ImportError:
     import logging as _logging
 
@@ -119,7 +119,7 @@ except ImportError:
     # Список поддерживаемых валют — единственный источник истины.
     # Раньше был продублирован в handlers/payments, handlers/orders
     # и дважды в webapp/server как inline-литерал. Теперь один список.
-    ALLOWED_CURRENCIES = ("USD", "UZS", "RUB", "EUR")
+    ALLOWED_CURRENCIES = ("USD", "UZS")
     # NB: расписанные отчёты (daily/weekly/monthly) и флаг ENABLE_SCHEDULED_REPORTS
     # удалены — отчёты и аналитику смотрят в WebApp, бот шлёт лишь дневной пинг
     # (tasks.run_ops_monitor). Раньше тут был ENABLE_SCHEDULED_REPORTS + tasks.run_report.

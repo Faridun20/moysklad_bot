@@ -189,12 +189,12 @@ def test_analytics_export_forbidden_for_manager(client_env, monkeypatch):
 
 def test_manager_performance_splits_currencies(isolated_db):
     """get_manager_performance: выручка/долг РАЗДЕЛЬНО по валютам (топ-менеджеров
-    в company-аналитике больше не складывает USD+EUR в одно число с «$»)."""
+    в company-аналитике больше не складывает USD+UZS в одно число с «$»)."""
     import datetime as dt
 
     db = isolated_db
     db.set_role(5, "m", "Менеджер", "manager")
-    for cur, qty, price in [("USD", 2, 100.0), ("EUR", 1, 50.0)]:
+    for cur, qty, price in [("USD", 2, 100.0), ("UZS", 1, 500000.0)]:
         oid = db.create_order(5, "Менеджер", "")
         db.update_order_agent(oid, "A", "Client")
         db.update_order_currency(oid, cur)
@@ -206,7 +206,7 @@ def test_manager_performance_splits_currencies(isolated_db):
     m = next(x for x in perf if x["user_id"] == 5)
     rev = {x["currency"]: x["amount"] for x in m["revenue_by_currency"]}
     assert rev.get("USD") == 200.0
-    assert rev.get("EUR") == 50.0
+    assert rev.get("UZS") == 500000.0
 
 
 def test_personal_analytics_splits_currencies(client_env):

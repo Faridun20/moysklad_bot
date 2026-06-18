@@ -81,6 +81,6 @@ def test_set_rate_rejects_invalid_amount_400(client_env):
     client, _db, ids = client_env
     resp = client.post(
         "/api/currency/rates/set",
-        json={"initData": str(ids["boss"]), "currency_code": "EUR", "rate_to_base": -1.0},
+        json={"initData": str(ids["boss"]), "currency_code": "UZS", "rate_to_base": -1.0},
     )
     assert resp.status_code == 400

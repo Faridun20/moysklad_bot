@@ -44,7 +44,7 @@ def test_set_currency_rate_persists_and_invalidates_cache(isolated_db):
 def test_set_currency_rate_validates_amount(isolated_db):
     db = isolated_db
     for bad in (-1.0, 0.0, float("nan"), float("inf"), 10_000_001.0):
-        ok, err = db.set_currency_rate("EUR", bad, updated_by=1)
+        ok, err = db.set_currency_rate("UZS", bad, updated_by=1)
         assert ok is False, f"должен отвергать {bad!r}"
         assert err is not None
 
