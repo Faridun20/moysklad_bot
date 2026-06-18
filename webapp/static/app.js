@@ -647,11 +647,17 @@ function renderStockList() {
   const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
 
   listEl.innerHTML = filtered.length === 0
-    ? `<div class="empty-state">
-        <div class="empty-state-icon">${icon('box')}</div>
-        <div class="empty-state-title">Товары не найдены</div>
-        <div class="empty-state-hint">Попробуйте изменить категорию или поисковый запрос</div>
-      </div>`
+    ? (stockData.ms_unavailable
+        ? `<div class="empty-state">
+            <div class="empty-state-icon">${icon('alert')}</div>
+            <div class="empty-state-title">Каталог недоступен</div>
+            <div class="empty-state-hint">Не удалось загрузить товары из МойСклад. Проверьте подключение и токен — затем нажмите «Обновить».</div>
+          </div>`
+        : `<div class="empty-state">
+            <div class="empty-state-icon">${icon('box')}</div>
+            <div class="empty-state-title">Товары не найдены</div>
+            <div class="empty-state-hint">Попробуйте изменить категорию или поисковый запрос</div>
+          </div>`)
     : filtered.slice(0, stockLimit).map((p, i) => {
         // PR C: цена продажи (минимум) — всем; себестоимость — только boss.
         const priceLines = [];

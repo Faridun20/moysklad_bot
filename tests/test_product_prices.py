@@ -274,3 +274,23 @@ def test_stock_hides_cost_from_manager(client_env, monkeypatch):
     r_boss = client.post("/api/stock", json={"initData": str(ids["boss"])})
     p_boss = r_boss.json()["products"][0]
     assert p_boss["cost_price"] == 150.0
+
+
+def test_stock_degrades_when_ms_down(client_env, monkeypatch):
+    """МойСклад недоступен → /api/stock НЕ 500, а 200 с пустым каталогом и
+    ms_unavailable=True (регресс на «401 Unauthorized» на экране «Каталог»)."""
+    client, _db, ids = client_env
+
+    async def _boom():
+        raise RuntimeError("401 Unauthorized")
+
+    import services.moysklad as ms
+
+    monkeypatch.setattr(ms, "get_all_stock", _boom)
+    monkeypatch.setattr(ms, "get_categories", _boom)
+
+    r = client.post("/api/stock", json={"initData": str(ids["boss"])})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ms_unavailable"] is True
+    assert body["products"] == [] and body["categories"] == []

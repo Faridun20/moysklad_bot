@@ -884,13 +884,17 @@ async def api_stock(request: Request):
     )
     role = get_role(user["id"])
 
+    # МойСклад может быть недоступен (сеть/токен/5xx). Раньше это всплывало как
+    # HTTP 500 с сырым «401 Unauthorized …» на экране «Каталог». Деградируем
+    # мягко: пустой каталог + флаг ms_unavailable, фронт покажет подсказку.
     try:
         rows, cats = await asyncio.gather(
             get_all_stock(),
             get_categories(),
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.warning("stock: каталог МойСклад недоступен: %s", e)
+        return JSONResponse({"products": [], "categories": [], "ms_unavailable": True})
 
     # PR C: подмешиваем цены руководства. sale_price — всем (менеджер
     # видит минимум и дефолт), cost_price — ТОЛЬКО boss/admin (себестоимость
