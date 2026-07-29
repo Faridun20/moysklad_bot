@@ -236,9 +236,11 @@ async def create_demand_from_request(
         if not product_id:
             skipped.append(it.get("product_name", "?"))
             continue
-        # МойСклад хранит цену в минорных единицах валюты (центы/копейки).
-        price_major = float(it.get("price", 0) or 0)
-        price_minor = int(round(price_major * 100))
+        # МойСклад хранит цену в минорных единицах валюты (центы/копейки) —
+        # ровно в тех же, что и мы (T1.3), поэтому берём price_cents как есть.
+        # Раньше здесь было int(round(price_major * 100)) по float: на границе
+        # x.xx5 документ в МС расходился с локальной суммой на копейку.
+        price_minor = int(it.get("price_cents") or 0)
         positions.append(
             {
                 "quantity": float(it.get("quantity", 1)),

@@ -55,10 +55,10 @@ def test_confirmed_return_reduces_debt(isolated_db):
         cur = db.get_cursor(conn)
         cur.execute(
             db.q(
-                "INSERT INTO returns (order_id, return_type, reason, total_amount, "
+                "INSERT INTO returns (order_id, return_type, reason, total_amount_cents, "
                 "created_by, status, created_at) VALUES (?, ?, ?, ?, ?, 'confirmed', ?)"
             ),
-            (oid, "partial", "брак", 100.0, mgr, db.now_str()),
+            (oid, "partial", "брак", 10000, mgr, db.now_str()),
         )
         conn.commit()
     # 300 остаток − 100 возврат = 200.

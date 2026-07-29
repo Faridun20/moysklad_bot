@@ -68,10 +68,12 @@ def test_cash_refund_creates_negative_deposit(shipped_order):
     asyncio.run(db.confirm_return(r["return_id"], 1, "Boss"))
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)
-        cur.execute(db.q("SELECT amount, status FROM cash_deposits WHERE amount < 0"))
+        cur.execute(
+            db.q("SELECT amount_cents, status FROM cash_deposits WHERE amount_cents < 0")
+        )
         row = cur.fetchone()
     assert row is not None
-    assert float(row["amount"] if db.USE_POSTGRES else row[0]) == -50.0
+    assert int(row["amount_cents"] if db.USE_POSTGRES else row[0]) == -5000
 
 
 def test_return_confirm_is_idempotent(shipped_order):

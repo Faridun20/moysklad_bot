@@ -90,11 +90,11 @@ def _confirmed_return(db, order_id, amount, status="confirmed"):
         cur = db.get_cursor(conn)
         cur.execute(
             db.q(
-                "INSERT INTO returns (order_id, return_type, reason, total_amount, "
+                "INSERT INTO returns (order_id, return_type, reason, "
                 "total_amount_cents, refund_method, created_by, status, created_at) "
-                "VALUES (?, 'partial', 'x', ?, ?, 'debt_reduction', 1, ?, ?)"
+                "VALUES (?, 'partial', 'x', ?, 'debt_reduction', 1, ?, ?)"
             ),
-            (order_id, amount, int(round(amount * 100)), status, db.now_str()),
+            (order_id, int(round(amount * 100)), status, db.now_str()),
         )
         conn.commit()
 

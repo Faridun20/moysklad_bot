@@ -43,10 +43,10 @@ def test_cash_deposit_orders_batch_matches_per_id(isolated_db):
         for dep_id, oid, amt in rows:
             cur.execute(
                 db.q(
-                    "INSERT INTO cash_deposit_orders (deposit_id, order_id, amount_allocated) "
+                    "INSERT INTO cash_deposit_orders (deposit_id, order_id, amount_allocated_cents) "
                     "VALUES (?, ?, ?)"
                 ),
-                (dep_id, oid, amt),
+                (dep_id, oid, int(round(amt * 100))),
             )
         conn.commit()
 

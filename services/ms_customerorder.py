@@ -249,7 +249,9 @@ async def create_customerorder_from_request(
         if not product_id:
             skipped.append(it.get("product_name", "?"))
             continue
-        price_minor = int(round(float(it.get("price", 0) or 0) * 100))
+        # Цена уже в копейках (T1.3) — МС ждёт минорные единицы, конвертация
+        # не нужна. Было int(round(float(...) * 100)) → дрейф на x.xx5.
+        price_minor = int(it.get("price_cents") or 0)
         positions.append(
             {
                 "quantity": float(it.get("quantity", 1)),

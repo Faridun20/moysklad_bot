@@ -46,10 +46,10 @@ def _confirmed_deposit(db, uid, amount, created_at="2026-06-03 10:00:00"):
         cur = db.get_cursor(conn)
         cur.execute(
             db.q(
-                "INSERT INTO cash_deposits (manager_id, amount, amount_cents, deposited_at, "
-                "status, created_at) VALUES (?, ?, ?, ?, 'confirmed', ?)"
+                "INSERT INTO cash_deposits (manager_id, amount_cents, deposited_at, "
+                "status, created_at) VALUES (?, ?, ?, 'confirmed', ?)"
             ),
-            (uid, amount, int(round(amount * 100)), created_at, created_at),
+            (uid, int(round(amount * 100)), created_at, created_at),
         )
         conn.commit()
 
@@ -287,10 +287,10 @@ def test_money_summary_counts_by_confirmation_time(isolated_db, monkeypatch):
         # Сдача: создана в прошлом году, подтверждена сегодня.
         cur.execute(
             db.q(
-                "INSERT INTO cash_deposits (manager_id, amount, amount_cents, status, "
-                "created_at, confirmed_at) VALUES (?, ?, ?, 'confirmed', ?, ?)"
+                "INSERT INTO cash_deposits (manager_id, amount_cents, status, "
+                "created_at, confirmed_at) VALUES (?, ?, 'confirmed', ?, ?)"
             ),
-            (40, 50.0, 5000, "2020-01-01 00:00:00", db.now_str()),
+            (40, 5000, "2020-01-01 00:00:00", db.now_str()),
         )
         conn.commit()
     client, _ = _client(db, monkeypatch, 615, "boss")

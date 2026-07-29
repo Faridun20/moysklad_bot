@@ -44,6 +44,13 @@ def _fmt_amount(n: float) -> str:
     return f"{int(round(n)):,}".replace(",", " ")
 
 
+def _fmt_cents(cents: int) -> str:
+    """Копейки → строка (деньги хранятся только в копейках, T1.3)."""
+    from services import money
+
+    return money.format_cents(int(cents or 0), decimals=0, sep=" ")
+
+
 # ─── Чистые билдеры блоков (тестируются без сети/БД) ──────────────────────────
 
 
@@ -63,10 +70,10 @@ def build_stale_orders_block(orders: list[dict], hours: int) -> str | None:
 def build_pending_deposits_block(deposits: list[dict]) -> str | None:
     if not deposits:
         return None
-    total = sum(float(d.get("amount", 0) or 0) for d in deposits)
-    lines = [f"💵 <b>Сдачи на подтверждении: {len(deposits)}</b> (на {_fmt_amount(total)} USD)"]
+    total_cents = sum(int(d.get("amount_cents") or 0) for d in deposits)
+    lines = [f"💵 <b>Сдачи на подтверждении: {len(deposits)}</b> (на {_fmt_cents(total_cents)} USD)"]
     for d in deposits[:15]:
-        lines.append(f"  • сдача #{d['id']} — {_fmt_amount(float(d.get('amount', 0) or 0))} USD")
+        lines.append(f"  • сдача #{d['id']} — {_fmt_cents(d.get('amount_cents'))} USD")
     if len(deposits) > 15:
         lines.append(f"  …и ещё {len(deposits) - 15}")
     return "\n".join(lines)
@@ -77,7 +84,7 @@ def build_pending_returns_block(returns: list[dict]) -> str | None:
         return None
     lines = [f"↩️ <b>Возвраты на подтверждении: {len(returns)}</b>"]
     for r in returns[:15]:
-        amt = _fmt_amount(float(r.get("total_amount", 0) or 0))
+        amt = _fmt_cents(r.get("total_amount_cents"))
         lines.append(f"  • возврат #{r['id']} · заказ #{r.get('order_id', '?')} — {amt} USD")
     if len(returns) > 15:
         lines.append(f"  …и ещё {len(returns) - 15}")

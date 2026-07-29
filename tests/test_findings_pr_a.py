@@ -139,10 +139,10 @@ def rclient(isolated_db, monkeypatch):
             cur = db.get_cursor(conn)
             cur.execute(
                 db.q(
-                    "INSERT INTO returns (order_id, return_type, reason, total_amount, "
+                    "INSERT INTO returns (order_id, return_type, reason, total_amount_cents, "
                     "created_by, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
                 ),
-                (oid, "partial", "x", 50.0, mgr, status, db.now_str()),
+                (oid, "partial", "x", 5000, mgr, status, db.now_str()),
             )
             rid = cur.lastrowid
             conn.commit()

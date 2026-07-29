@@ -111,18 +111,18 @@ def main() -> int:
         def add_item(order_id, name, qty, price, unit="шт"):
             cur.execute(
                 "INSERT INTO order_items (order_id, product_name, product_href, "
-                "quantity, unit, price, price_cents, note) VALUES (?,?,?,?,?,?,?,?)",
-                (order_id, name, "", qty, unit, price, money.to_cents(price), ""),
+                "quantity, unit, price_cents, note) VALUES (?,?,?,?,?,?,?)",
+                (order_id, name, "", qty, unit, money.to_cents(price), ""),
             )
 
         def add_payment(*, user_id, full_name, amount, currency, order_id, status):
             confirmed_at = _ts() if status == "confirmed" else None
             cur.execute(
-                "INSERT INTO payments (user_id, username, full_name, amount, "
+                "INSERT INTO payments (user_id, username, full_name, "
                 "amount_cents, currency, comment, status, order_id, created_at, "
-                "confirmed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "confirmed_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
-                    user_id, "dev", full_name, amount, money.to_cents(amount),
+                    user_id, "dev", full_name, money.to_cents(amount),
                     currency, f"{SEED_MARK} оплата", status, order_id, _ts(),
                     confirmed_at,
                 ),
@@ -131,11 +131,11 @@ def main() -> int:
         def add_deposit(*, manager_id, amount, status):
             confirmed_at = _ts() if status == "confirmed" else None
             cur.execute(
-                "INSERT INTO cash_deposits (manager_id, amount, amount_cents, "
+                "INSERT INTO cash_deposits (manager_id, amount_cents, "
                 "deposited_at, confirmed_by, confirmed_at, status, notes, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?)",
                 (
-                    manager_id, amount, money.to_cents(amount), _ts(),
+                    manager_id, money.to_cents(amount), _ts(),
                     (dev_uid if status == "confirmed" else None), confirmed_at,
                     status, f"{SEED_MARK} сдача", _ts(),
                 ),
@@ -144,11 +144,11 @@ def main() -> int:
         def add_return(*, order_id, amount, refund_method, status):
             confirmed_at = _ts() if status == "confirmed" else None
             cur.execute(
-                "INSERT INTO returns (order_id, return_type, reason, total_amount, "
+                "INSERT INTO returns (order_id, return_type, reason, "
                 "total_amount_cents, refund_method, created_by, confirmed_by, status, "
-                "created_at, confirmed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "created_at, confirmed_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
-                    order_id, "partial", f"{SEED_MARK} брак части товара", amount,
+                    order_id, "partial", f"{SEED_MARK} брак части товара",
                     money.to_cents(amount), refund_method, mgr1,
                     (dev_uid if status == "confirmed" else None), status, _ts(),
                     confirmed_at,
@@ -157,11 +157,11 @@ def main() -> int:
 
         def add_credit_limit(agent_name, limit_amount):
             cur.execute(
-                "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, "
+                "INSERT INTO credit_limits (agent_id, agent_name, "
                 "limit_amount_cents, set_by, notes, updated_at, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?)",
                 (
-                    f"agent-{agent_name}", agent_name, limit_amount,
+                    f"agent-{agent_name}", agent_name,
                     money.to_cents(limit_amount), dev_uid, f"{SEED_MARK} лимит",
                     _ts(), _ts(),
                 ),

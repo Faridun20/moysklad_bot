@@ -63,7 +63,7 @@ async def create_salesreturn(return_id: int) -> dict:
         positions.append(
             {
                 "quantity": float(r.get("qty", 0) or 0),
-                "price": int(round(float(r.get("price", 0) or 0) * 100)),
+                "price": int(r.get("price_cents") or 0),
                 "vat": 0,
                 "assortment": _meta(r["product_href"], "product"),
             }

@@ -50,12 +50,20 @@ def _fmt_amount(x: float) -> str:
     return money.format_cents(money.to_cents(x or 0), decimals=2, sep=" ")
 
 
+def _fmt_cents(cents: int) -> str:
+    """Копейки → строка. Деньги хранятся только в копейках (T1.3), поэтому
+    экраны сдач читают *_cents, а не мажорный float."""
+    from services import money
+
+    return money.format_cents(int(cents or 0), decimals=2, sep=" ")
+
+
 async def _notify_confirmers(bot: Bot, deposit_id: int, manager_name: str, amount: float):
     """Отправить боссам/бухгалтерам карточку сдачи с кнопками."""
     allocations = await adb.get_cash_deposit_orders(deposit_id)
     orders_line = (
         "\n".join(
-            f"  • заказ #{a['order_id']} — {_fmt_amount(a['amount_allocated'])} USD"
+            f"  • заказ #{a['order_id']} — {_fmt_cents(a['amount_allocated_cents'])} USD"
             for a in allocations
         )
         or "  <i>нет открытых заказов для привязки</i>"
@@ -118,7 +126,7 @@ async def cmd_my_deposits(message: Message):
     lines = [f"{DIV}", "💵 <b>Мои сдачи:</b>\n"]
     for d in deposits:
         st = d.get("status", "pending")
-        line = f"{emoji.get(st, '•')} #{d['id']} — {_fmt_amount(d['amount'])} USD  ·  {st}"
+        line = f"{emoji.get(st, '•')} #{d['id']} — {_fmt_cents(d['amount_cents'])} USD  ·  {st}"
         if st == "rejected" and d.get("reject_reason"):
             line += f"\n   <i>{esc(d['reject_reason'])}</i>"
         lines.append(line)
@@ -139,7 +147,7 @@ async def _show_pending_deposits(target):
         allocations = await adb.get_cash_deposit_orders(d["id"])
         orders_line = (
             "\n".join(
-                f"  • заказ #{a['order_id']} — {_fmt_amount(a['amount_allocated'])} USD"
+                f"  • заказ #{a['order_id']} — {_fmt_cents(a['amount_allocated_cents'])} USD"
                 for a in allocations
             )
             or "  <i>нет привязок</i>"
@@ -147,7 +155,7 @@ async def _show_pending_deposits(target):
         text = (
             f"{DIV}\n"
             f"💵 <b>Сдача #{d['id']}</b>\n"
-            f"💰 Сумма: <b>{_fmt_amount(d['amount'])} USD</b>\n"
+            f"💰 Сумма: <b>{_fmt_cents(d['amount_cents'])} USD</b>\n"
             f"📦 Закрывает заказы:\n{orders_line}"
         )
         await target.answer(text, parse_mode="HTML", reply_markup=_confirm_keyboard(d["id"]))

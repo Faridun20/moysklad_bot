@@ -20,6 +20,7 @@ from webapp.auth import verify_init_data
 # `get_role` оставляем как имя для обратной совместимости с кодом ниже.
 from services.roles import cached_role as get_role
 from services.rate_limit import acquire as rate_limit_acquire
+from services import money
 
 
 # Хранилище фоновых задач — предотвращает преждевременный GC до завершения.
@@ -1338,13 +1339,17 @@ async def api_payments_history(request: Request):
             cur = get_cursor(conn)
             cur.execute(
                 q(
-                    "SELECT id, amount, currency, comment, status, created_at "
+                    "SELECT id, amount_cents, currency, comment, status, created_at "
                     "FROM payments WHERE user_id = ? "
                     "ORDER BY created_at DESC LIMIT 50"
                 ),
                 (user_id,),
             )
-            return [dict(r) for r in cur.fetchall()]
+            # amount (мажорные) — для контракта JSON, считаем из копеек.
+            return [
+                dict(r, amount=float(money.from_cents(int(r["amount_cents"] or 0))))
+                for r in cur.fetchall()
+            ]
 
     try:
         # to_thread не блокирует event loop, пока psycopg2 ждёт ответа БД
@@ -3308,13 +3313,29 @@ async def api_debts(request: Request):
     result = []
     for o in debts:
         items = items_by_order.get(o["id"], [])
-        total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
         payments = payments_by_order.get(o["id"], [])
-        confirmed = sum(p["amount"] for p in payments if p["status"] == "confirmed")
-        pending = sum(p["amount"] for p in payments if p["status"] == "pending")
-        deposits = deposits_cents_by_order.get(o["id"], 0) / 100.0
-        returns_owed = returns_cents_by_order.get(o["id"], 0) / 100.0
-        remaining = max(0.0, total - confirmed - deposits - returns_owed)
+        # T1.3: считаем строго в копейках — из price_cents/amount_cents, без
+        # float-сложения REAL-колонок. Наружу (JSON) отдаём мажорные единицы,
+        # контракт фронта не меняется.
+        total_cents = sum(
+            money.mul_qty(int(it.get("price_cents") or 0), it.get("quantity", 0) or 0)
+            for it in items
+        )
+        confirmed_cents = sum(
+            int(p.get("amount_cents") or 0) for p in payments if p["status"] == "confirmed"
+        )
+        pending_cents = sum(
+            int(p.get("amount_cents") or 0) for p in payments if p["status"] == "pending"
+        )
+        deposits_cents = deposits_cents_by_order.get(o["id"], 0)
+        returns_cents = returns_cents_by_order.get(o["id"], 0)
+        remaining_cents = max(
+            0, total_cents - confirmed_cents - deposits_cents - returns_cents
+        )
+        total = float(money.from_cents(total_cents))
+        confirmed = float(money.from_cents(confirmed_cents))
+        pending = float(money.from_cents(pending_cents))
+        remaining = float(money.from_cents(remaining_cents))
         due = o.get("due_date")
         # State:
         #  - awaiting_confirmation — есть pending payments (boss решает)
@@ -3415,7 +3436,7 @@ async def _money_summary(adb, user_id: int | None) -> dict:
             where += " AND p.user_id = ?"
             params.append(user_id)
         sql = (
-            f"SELECT p.status, p.currency, SUM(p.amount) AS total "
+            f"SELECT p.status, p.currency, COALESCE(SUM(p.amount_cents), 0) AS total_cents "
             f"FROM payments p LEFT JOIN orders o ON o.id = p.order_id "
             f"{where} "
             f"GROUP BY p.status, p.currency"
@@ -3430,7 +3451,7 @@ async def _money_summary(adb, user_id: int | None) -> dict:
     pending: dict[str, float] = {}
     for r in rows:
         cur_ = r.get("currency") or "USD"
-        amt = float(r.get("total") or 0)
+        amt = float(money.from_cents(int(r.get("total_cents") or 0)))
         if r.get("status") == "confirmed":
             received[cur_] = received.get(cur_, 0.0) + amt
         elif r.get("status") == "pending":

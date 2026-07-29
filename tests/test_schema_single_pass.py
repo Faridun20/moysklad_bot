@@ -58,7 +58,7 @@ FOLDED_COLUMNS = {
         "ms_transition_blocked_at",
         "ms_demand_failed_at",
     },
-    "order_items": {"price", "price_cents", "returned_qty"},
+    "order_items": {"price_cents", "returned_qty"},
     "credit_limits": {"limit_amount_cents"},
     "cash_deposits": {"amount_cents"},
     "cash_deposit_orders": {"amount_allocated_cents"},

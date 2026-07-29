@@ -289,8 +289,7 @@ def _create_tables():
                 user_id            BIGINT NOT NULL,
                 username           TEXT,
                 full_name          TEXT,
-                amount             REAL NOT NULL,
-                amount_cents       BIGINT,
+                amount_cents       BIGINT NOT NULL,
                 currency           TEXT NOT NULL DEFAULT 'USD',
                 comment            TEXT,
                 status             TEXT NOT NULL DEFAULT 'pending',
@@ -370,8 +369,7 @@ def _create_tables():
                 product_href         TEXT,
                 quantity             REAL NOT NULL DEFAULT 1,
                 unit                 TEXT DEFAULT 'шт',
-                price                REAL DEFAULT 0,
-                price_cents          BIGINT,
+                price_cents          BIGINT NOT NULL DEFAULT 0,
                 batch_id             TEXT,
                 returned_qty         REAL NOT NULL DEFAULT 0,
                 note                 TEXT
@@ -456,7 +454,8 @@ def _create_tables():
                 started_at TEXT
             )""",
             # ─── IMPLEMENTATION.md Фаза 1–2 (адаптировано под dual-DB) ──────────
-            # Конвенции проекта: TEXT для JSON/UUID/timestamp, REAL для денег,
+            # Конвенции проекта: TEXT для JSON/UUID/timestamp, BIGINT-копейки
+            # для денег (REAL — только количества/остатки/курсы),
             # INTEGER 0/1 для boolean, BIGINT — telegram user_id, без FK
             # (как и остальные таблицы здесь). Postgres-специфику (JSONB,
             # gen_random_uuid, NUMERIC) НЕ используем — иначе ломается SQLite.
@@ -464,8 +463,7 @@ def _create_tables():
             """CREATE TABLE IF NOT EXISTS credit_limits (
                 agent_id     TEXT PRIMARY KEY,
                 agent_name   TEXT NOT NULL,
-                limit_amount REAL NOT NULL DEFAULT 2000.0,
-                limit_amount_cents BIGINT,
+                limit_amount_cents BIGINT NOT NULL DEFAULT 200000,
                 set_by       BIGINT,
                 notes        TEXT,
                 updated_at   TEXT,
@@ -475,8 +473,7 @@ def _create_tables():
             f"""CREATE TABLE IF NOT EXISTS cash_deposits (
                 id           {id_type},
                 manager_id   BIGINT NOT NULL,
-                amount       REAL NOT NULL,
-                amount_cents BIGINT,
+                amount_cents BIGINT NOT NULL,
                 deposited_at TEXT,
                 confirmed_by BIGINT,
                 confirmed_at TEXT,
@@ -490,8 +487,7 @@ def _create_tables():
             """CREATE TABLE IF NOT EXISTS cash_deposit_orders (
                 deposit_id       BIGINT NOT NULL,
                 order_id         BIGINT NOT NULL,
-                amount_allocated REAL NOT NULL,
-                amount_allocated_cents BIGINT,
+                amount_allocated_cents BIGINT NOT NULL,
                 is_manual        INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (deposit_id, order_id)
             )""",
@@ -501,8 +497,7 @@ def _create_tables():
                 order_id     BIGINT NOT NULL,
                 return_type  TEXT NOT NULL,
                 reason       TEXT NOT NULL,
-                total_amount REAL NOT NULL,
-                total_amount_cents BIGINT,
+                total_amount_cents BIGINT NOT NULL,
                 refund_method TEXT,
                 moysklad_return_id TEXT,
                 created_by   BIGINT NOT NULL,
@@ -518,8 +513,7 @@ def _create_tables():
                 return_id     BIGINT NOT NULL,
                 order_item_id BIGINT NOT NULL,
                 qty           REAL NOT NULL,
-                amount        REAL NOT NULL,
-                amount_cents  BIGINT
+                amount_cents  BIGINT NOT NULL
             )""",
             # Партии товара (FEFO). Используется только если МойСклад
             # поддерживает партии для товара; иначе order_items.batch_id NULL.
@@ -647,9 +641,7 @@ def _create_tables():
             """CREATE TABLE IF NOT EXISTS product_prices (
                 ms_id         TEXT PRIMARY KEY,
                 product_name  TEXT,
-                sale_price    REAL,
                 sale_price_cents BIGINT,
-                cost_price    REAL,
                 cost_price_cents BIGINT,
                 currency      TEXT,
                 updated_by    BIGINT,
@@ -730,13 +722,17 @@ def _create_indexes():
 
 
 def run_backfills():
-    """Одноразовые data-миграции. Идемпотентны.
+    """Одноразовые data-миграции + сидинг настроек. Идемпотентны.
 
     1. Закрыть legacy-долги (paid_at стоит, payments записей нет —
        значит это до partial-payments эпохи): paid_confirmed_at = paid_at.
-    2. Recovery от старого backfill-бага: если paid_confirmed_at стоит,
-       но сумма confirmed payments меньше total, сбросить confirmed_at
-       обратно в NULL.
+    2. seed_app_settings — дефолты «магических чисел».
+
+    Recovery-backfill (сброс paid_confirmed_at по сравнению SUM(amount)
+    с SUM(quantity*price)) удалён в T1.3: он лечил данные, испорченные
+    старым backfill-багом, и читал REAL-колонки денег, которых больше нет.
+    Заполнение *_cents из REAL удалено там же — источник исчез, деньги
+    пишутся в копейках с самого начала.
 
     Запускается из `tasks/migrate.py`. НЕ из init_db — этот код пишет
     данные, не должен бежать при каждом старте сервиса.
@@ -762,61 +758,6 @@ def run_backfills():
         except Exception as e:
             conn.rollback()
             logger.warning("Backfill paid_confirmed: %s", e)
-
-        # ── Recovery ─────────────────────────────────────────────────
-        try:
-            cur.execute(
-                "UPDATE orders "
-                "SET paid_confirmed_at = NULL, "
-                "    paid_confirmed_by = NULL, "
-                "    paid_confirmed_by_name = NULL "
-                "WHERE paid_confirmed_at IS NOT NULL "
-                "  AND EXISTS (SELECT 1 FROM payments WHERE order_id = orders.id) "
-                "  AND ("
-                "    (SELECT COALESCE(SUM(amount), 0) FROM payments "
-                "     WHERE order_id = orders.id AND status = 'confirmed')"
-                "    <"
-                "    (SELECT COALESCE(SUM(quantity * price), 0) FROM order_items "
-                "     WHERE order_id = orders.id) - 0.01"
-                "  )"
-            )
-            rows = cur.rowcount
-            conn.commit()
-            if rows > 0:
-                logger.warning(
-                    "Recovery: %d ошибочно закрытых долгов восстановлены "
-                    "(см. историю — backfill закрыл частично оплаченные)",
-                    rows,
-                )
-        except Exception as e:
-            conn.rollback()
-            logger.warning("Recovery paid_confirmed: %s", e)
-
-        # ── Деньги float → копейки ───────────────────────────────────
-        # Заполняем новые *_cents BIGINT из старых REAL: cents = round(x*100).
-        # Идемпотентно (WHERE dst IS NULL). round() есть и в SQLite, и в
-        # Postgres. Имена таблиц/колонок статические — не пользовательский ввод.
-        _money_cols = [
-            ("payments", "amount", "amount_cents"),
-            ("order_items", "price", "price_cents"),
-            ("credit_limits", "limit_amount", "limit_amount_cents"),
-            ("cash_deposits", "amount", "amount_cents"),
-            ("cash_deposit_orders", "amount_allocated", "amount_allocated_cents"),
-            ("returns", "total_amount", "total_amount_cents"),
-            ("return_items", "amount", "amount_cents"),
-            ("product_prices", "sale_price", "sale_price_cents"),
-            ("product_prices", "cost_price", "cost_price_cents"),
-        ]
-        for _table, _src, _dst in _money_cols:
-            try:
-                cur.execute(
-                    f"UPDATE {_table} SET {_dst} = CAST(round({_src} * 100) AS INTEGER) "
-                    f"WHERE {_dst} IS NULL AND {_src} IS NOT NULL"
-                )
-                conn.commit()
-            except Exception as e:
-                conn.rollback()
-                logger.warning("Backfill cents %s.%s: %s", _table, _dst, e)
 
     # ── Сидинг app_settings (идемпотентно) ───────────────────────────
     seed_app_settings()
@@ -962,10 +903,10 @@ async def get_credit_limit(agent_id: str) -> float:
     if not agent_id:
         return float(await asyncio.to_thread(get_setting, "credit_limit_default", 2000.0))
     val = await adb_core.fetchval(
-        "SELECT limit_amount FROM credit_limits WHERE agent_id = $1", agent_id
+        "SELECT limit_amount_cents FROM credit_limits WHERE agent_id = $1", agent_id
     )
     if val is not None:
-        return float(val)
+        return float(money.from_cents(val))
     return float(await asyncio.to_thread(get_setting, "credit_limit_default", 2000.0))
 
 
@@ -976,18 +917,20 @@ async def ensure_credit_limit(agent_id: str, agent_name: str) -> None:
     INSERT OR IGNORE); get_setting — мост через to_thread."""
     if not agent_id:
         return
-    default = float(await asyncio.to_thread(get_setting, "credit_limit_default", 2000.0))
+    default_cents = money.to_cents(
+        await asyncio.to_thread(get_setting, "credit_limit_default", 2000.0)
+    )
     if USE_POSTGRES:
         await adb_core.execute(
-            "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, set_by, created_at, updated_at) "
+            "INSERT INTO credit_limits (agent_id, agent_name, limit_amount_cents, set_by, created_at, updated_at) "
             "VALUES ($1, $2, $3, NULL, $4, $5) ON CONFLICT (agent_id) DO NOTHING",
-            agent_id, agent_name, default, now_str(), now_str(),
+            agent_id, agent_name, default_cents, now_str(), now_str(),
         )
     else:
         await adb_core.execute(
-            "INSERT OR IGNORE INTO credit_limits (agent_id, agent_name, limit_amount, set_by, created_at, updated_at) "
+            "INSERT OR IGNORE INTO credit_limits (agent_id, agent_name, limit_amount_cents, set_by, created_at, updated_at) "
             "VALUES ($1, $2, $3, NULL, $4, $5)",
-            agent_id, agent_name, default, now_str(), now_str(),
+            agent_id, agent_name, default_cents, now_str(), now_str(),
         )
 
 
@@ -1005,21 +948,21 @@ async def set_credit_limit(
     limit_cents = money.to_cents(limit_amount or 0)
     if USE_POSTGRES:
         await adb_core.execute(
-            "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, limit_amount_cents, set_by, notes, created_at, updated_at) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
-            "ON CONFLICT (agent_id) DO UPDATE SET limit_amount = EXCLUDED.limit_amount, "
+            "INSERT INTO credit_limits (agent_id, agent_name, limit_amount_cents, set_by, notes, created_at, updated_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7) "
+            "ON CONFLICT (agent_id) DO UPDATE SET "
             "limit_amount_cents = EXCLUDED.limit_amount_cents, "
             "set_by = EXCLUDED.set_by, notes = EXCLUDED.notes, updated_at = EXCLUDED.updated_at",
-            agent_id, agent_name, limit_amount, limit_cents, set_by, notes, now_str(), now_str(),
+            agent_id, agent_name, limit_cents, set_by, notes, now_str(), now_str(),
         )
     else:
         await adb_core.execute(
-            "INSERT INTO credit_limits (agent_id, agent_name, limit_amount, limit_amount_cents, set_by, notes, created_at, updated_at) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
-            "ON CONFLICT(agent_id) DO UPDATE SET limit_amount = excluded.limit_amount, "
+            "INSERT INTO credit_limits (agent_id, agent_name, limit_amount_cents, set_by, notes, created_at, updated_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7) "
+            "ON CONFLICT(agent_id) DO UPDATE SET "
             "limit_amount_cents = excluded.limit_amount_cents, "
             "set_by = excluded.set_by, notes = excluded.notes, updated_at = excluded.updated_at",
-            agent_id, agent_name, limit_amount, limit_cents, set_by, notes, now_str(), now_str(),
+            agent_id, agent_name, limit_cents, set_by, notes, now_str(), now_str(),
         )
     if set_by:
         await asyncio.to_thread(
@@ -1175,12 +1118,14 @@ async def get_credit_overview() -> list[dict]:
     через to_thread, чтобы не блокировать loop на cache-miss."""
     agents: dict[str, str] = {}
     limits_map: dict[str, float] = {}
-    for r in await adb_core.fetch("SELECT agent_id, agent_name, limit_amount FROM credit_limits"):
+    for r in await adb_core.fetch(
+        "SELECT agent_id, agent_name, limit_amount_cents FROM credit_limits"
+    ):
         aid = r["agent_id"]
         if not aid:
             continue
         agents[aid] = r["agent_name"] or aid
-        limits_map[aid] = float(r["limit_amount"])
+        limits_map[aid] = float(money.from_cents(r["limit_amount_cents"] or 0))
     for r in await adb_core.fetch(
         "SELECT DISTINCT agent_id, agent_name FROM orders "
         "WHERE agent_id IS NOT NULL AND agent_id != '' "
@@ -1647,12 +1592,8 @@ async def _order_total_cents(order_id: int) -> int:
     return int(summary["total_cents"])
 
 
-# SQL-фрагмент «распределено на заказ в копейках» — берёт amount_allocated_cents
-# с фолбэком на legacy REAL (round(amount_allocated*100)). Без placeholder'ов.
-_SUM_ALLOC_CENTS = (
-    "COALESCE(SUM(COALESCE(cdo.amount_allocated_cents, "
-    "CAST(round(cdo.amount_allocated * 100) AS INTEGER))), 0)"
-)
+# SQL-фрагмент «распределено на заказ в копейках». Без placeholder'ов.
+_SUM_ALLOC_CENTS = "COALESCE(SUM(cdo.amount_allocated_cents), 0)"
 
 
 async def _order_confirmed_deposit_cents(order_id: int) -> int:
@@ -1978,43 +1919,76 @@ def set_product_price(
             if not ok:
                 return False, f"{label}: {err}"
     cur_code = (currency or BASE_CURRENCY or "USD").upper()
-    sale = float(sale_price) if sale_price is not None else None
-    cost = float(cost_price) if cost_price is not None else None
-    sale_c = money.to_cents(sale) if sale is not None else None
-    cost_c = money.to_cents(cost) if cost is not None else None
+    sale_c = money.to_cents(sale_price) if sale_price is not None else None
+    cost_c = money.to_cents(cost_price) if cost_price is not None else None
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
             cur.execute(
                 q(
                     "INSERT INTO product_prices "
-                    "(ms_id, product_name, sale_price, sale_price_cents, cost_price, cost_price_cents, currency, updated_by, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "(ms_id, product_name, sale_price_cents, cost_price_cents, currency, updated_by, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT (ms_id) DO UPDATE SET "
                     "product_name = EXCLUDED.product_name, "
-                    "sale_price = EXCLUDED.sale_price, "
                     "sale_price_cents = EXCLUDED.sale_price_cents, "
-                    "cost_price = EXCLUDED.cost_price, "
                     "cost_price_cents = EXCLUDED.cost_price_cents, "
                     "currency = EXCLUDED.currency, "
                     "updated_by = EXCLUDED.updated_by, "
                     "updated_at = EXCLUDED.updated_at"
                 ),
-                (ms_id, product_name or "", sale, sale_c, cost, cost_c, cur_code, updated_by, now_str()),
+                (ms_id, product_name or "", sale_c, cost_c, cur_code, updated_by, now_str()),
             )
         else:
             cur.execute(
                 q(
                     "INSERT OR REPLACE INTO product_prices "
-                    "(ms_id, product_name, sale_price, sale_price_cents, cost_price, cost_price_cents, currency, updated_by, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "(ms_id, product_name, sale_price_cents, cost_price_cents, currency, updated_by, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)"
                 ),
-                (ms_id, product_name or "", sale, sale_c, cost, cost_c, cur_code, updated_by, now_str()),
+                (ms_id, product_name or "", sale_c, cost_c, cur_code, updated_by, now_str()),
             )
         conn.commit()
     with _product_price_lock:
         _PRODUCT_PRICE_CACHE.pop(ms_id, None)
     return True, None
+
+
+def _with_major(row, *pairs: tuple[str, str]):
+    """Дописать к строке мажорные ключи, посчитанные из копеек.
+
+    Деньги хранятся ТОЛЬКО в копейках (T1.3), но потребители строк —
+    бот-экраны, JSON-ответы WebApp и фронт — исторически читают мажорные
+    ключи (`amount`, `total_amount`, `amount_allocated`). Контракт API
+    менять не в этой задаче, поэтому конвертация живёт здесь, на границе
+    чтения: единственный float в цепочке и только для отображения.
+
+    Денежные РАСЧЁТЫ используют *_cents напрямую и сюда не заглядывают.
+    """
+    if row is None:
+        return None
+    if isinstance(row, list):
+        return [_with_major(r, *pairs) for r in row]
+    d = dict(row)
+    for major, cents in pairs:
+        c = d.get(cents)
+        d[major] = float(money.from_cents(int(c))) if c is not None else 0.0
+    return d
+
+
+def _price_row_major(row: dict | None) -> dict:
+    """Строка product_prices → dict, где рядом с *_cents лежат мажорные
+    sale_price/cost_price. Хранение — только копейки (T1.3), но потребители
+    (бот-экраны, /api/stock, расчёт прибыли) исторически читают мажорные
+    ключи, и контракт JSON-ответов на этом держится. Конвертация — здесь,
+    на границе чтения, а не в схеме."""
+    if not row:
+        return {}
+    d = dict(row)
+    for major, cents in (("sale_price", "sale_price_cents"), ("cost_price", "cost_price_cents")):
+        c = d.get(cents)
+        d[major] = float(money.from_cents(int(c))) if c is not None else None
+    return d
 
 
 def get_product_price(ms_id: str) -> dict | None:
@@ -2036,13 +2010,13 @@ def get_product_price(ms_id: str) -> dict | None:
             cur = get_cursor(conn)
             cur.execute(
                 q(
-                    "SELECT ms_id, product_name, sale_price, cost_price, currency, updated_at "
-                    "FROM product_prices WHERE ms_id = ?"
+                    "SELECT ms_id, product_name, sale_price_cents, cost_price_cents, "
+                    "currency, updated_at FROM product_prices WHERE ms_id = ?"
                 ),
                 (ms_id,),
             )
             row = cur.fetchone()
-            result = dict(row) if row else {}
+            result = _price_row_major(row)
     except Exception:
         logger.exception("get_product_price(%s) failed", ms_id)
         return None
@@ -2062,11 +2036,11 @@ async def get_product_prices_by_ids(ms_ids: list[str]) -> dict[str, dict]:
         return {}
     placeholders = ", ".join(f"${i + 1}" for i in range(len(ids)))
     rows = await adb_core.fetch(
-        "SELECT ms_id, product_name, sale_price, cost_price, currency "
+        "SELECT ms_id, product_name, sale_price_cents, cost_price_cents, currency "
         f"FROM product_prices WHERE ms_id IN ({placeholders})",
         *ids,
     )
-    return {r["ms_id"]: r for r in rows}
+    return {r["ms_id"]: _price_row_major(r) for r in rows}
 
 
 async def get_existing_ms_product_ids(ms_ids: list[str]) -> set[str]:
@@ -2088,10 +2062,11 @@ async def get_existing_ms_product_ids(ms_ids: list[str]) -> set[str]:
 
 async def get_all_product_prices() -> list[dict]:
     """Все заданные цены. Для admin-UI экрана «Цены». asyncpg Stage 9 (#21)."""
-    return await adb_core.fetch(
-        "SELECT ms_id, product_name, sale_price, cost_price, currency, updated_at "
+    rows = await adb_core.fetch(
+        "SELECT ms_id, product_name, sale_price_cents, cost_price_cents, currency, updated_at "
         "FROM product_prices ORDER BY product_name"
     )
+    return [_price_row_major(r) for r in rows]
 
 
 def _invalidate_product_price_cache() -> None:
@@ -2152,22 +2127,22 @@ async def create_cash_deposit(
         amount_cents = money.to_cents(amount)
         if USE_POSTGRES:
             deposit_id = await txn.fetchval(
-                "INSERT INTO cash_deposits (manager_id, amount, amount_cents, deposited_at, status, created_at) "
-                "VALUES ($1, $2, $3, $4, 'pending', $5) RETURNING id",
-                manager_id, amount, amount_cents, now_str(), now_str(),
+                "INSERT INTO cash_deposits (manager_id, amount_cents, deposited_at, status, created_at) "
+                "VALUES ($1, $2, $3, 'pending', $4) RETURNING id",
+                manager_id, amount_cents, now_str(), now_str(),
             )
         else:
             await txn.execute(
-                "INSERT INTO cash_deposits (manager_id, amount, amount_cents, deposited_at, status, created_at) "
-                "VALUES ($1, $2, $3, $4, 'pending', $5)",
-                manager_id, amount, amount_cents, now_str(), now_str(),
+                "INSERT INTO cash_deposits (manager_id, amount_cents, deposited_at, status, created_at) "
+                "VALUES ($1, $2, $3, 'pending', $4)",
+                manager_id, amount_cents, now_str(), now_str(),
             )
             deposit_id = await txn.fetchval("SELECT last_insert_rowid()")
         for order_id, alloc in allocs:
             await txn.execute(
-                "INSERT INTO cash_deposit_orders (deposit_id, order_id, amount_allocated, amount_allocated_cents, is_manual) "
-                "VALUES ($1, $2, $3, $4, $5)",
-                deposit_id, order_id, alloc, money.to_cents(alloc), 1 if is_manual else 0,
+                "INSERT INTO cash_deposit_orders (deposit_id, order_id, amount_allocated_cents, is_manual) "
+                "VALUES ($1, $2, $3, $4)",
+                deposit_id, order_id, money.to_cents(alloc), 1 if is_manual else 0,
             )
     return {"ok": True, "deposit_id": deposit_id, "allocations": allocs}
 
@@ -2267,15 +2242,17 @@ async def reject_cash_deposit(
 
 async def get_cash_deposit(deposit_id: int) -> dict | None:
     """asyncpg Stage 9 (#21): native async через adb_core."""
-    return await adb_core.fetchrow("SELECT * FROM cash_deposits WHERE id = $1", deposit_id)
+    row = await adb_core.fetchrow("SELECT * FROM cash_deposits WHERE id = $1", deposit_id)
+    return _with_major(row, ("amount", "amount_cents"))
 
 
 async def get_cash_deposit_orders(deposit_id: int) -> list[dict]:
     """asyncpg Stage 9 (#21)."""
-    return await adb_core.fetch(
-        "SELECT order_id, amount_allocated FROM cash_deposit_orders WHERE deposit_id = $1",
+    rows = await adb_core.fetch(
+        "SELECT order_id, amount_allocated_cents FROM cash_deposit_orders WHERE deposit_id = $1",
         deposit_id,
     )
+    return _with_major(rows, ("amount_allocated", "amount_allocated_cents"))
 
 
 async def get_cash_deposit_orders_batch(deposit_ids: list[int]) -> dict[int, list[dict]]:
@@ -2288,7 +2265,7 @@ async def get_cash_deposit_orders_batch(deposit_ids: list[int]) -> dict[int, lis
     unique_ids = list(set(deposit_ids))
     placeholders = ",".join(f"${i + 1}" for i in range(len(unique_ids)))
     rows = await adb_core.fetch(
-        f"SELECT deposit_id, order_id, amount_allocated FROM cash_deposit_orders "
+        f"SELECT deposit_id, order_id, amount_allocated_cents FROM cash_deposit_orders "
         f"WHERE deposit_id IN ({placeholders})",
         *unique_ids,
     )
@@ -2296,19 +2273,23 @@ async def get_cash_deposit_orders_batch(deposit_ids: list[int]) -> dict[int, lis
     for d in rows:
         # Форма элемента — как у get_cash_deposit_orders (без deposit_id).
         grouped.setdefault(d["deposit_id"], []).append(
-            {"order_id": d["order_id"], "amount_allocated": d["amount_allocated"]}
+            _with_major(
+                {"order_id": d["order_id"], "amount_allocated_cents": d["amount_allocated_cents"]},
+                ("amount_allocated", "amount_allocated_cents"),
+            )
         )
     return grouped
 
 
 async def get_manager_cash_deposits(manager_id: int, limit: int = 20) -> list[dict]:
     """asyncpg Stage 9 (#21)."""
-    return await adb_core.fetch(
+    rows = await adb_core.fetch(
         "SELECT * FROM cash_deposits WHERE manager_id = $1 AND (deleted_at IS NULL) "
         "ORDER BY created_at DESC LIMIT $2",
         manager_id,
         limit,
     )
+    return _with_major(rows, ("amount", "amount_cents"))
 
 
 def get_deposit_confirmers() -> list[int]:
@@ -2328,10 +2309,11 @@ async def get_pending_cash_deposits() -> list[dict]:
     (`await`), тесты (`asyncio.run`). Loop-aware пул (Stage 4) делает
     cron-вызов безопасным.
     """
-    return await adb_core.fetch(
+    rows = await adb_core.fetch(
         "SELECT * FROM cash_deposits WHERE status = 'pending' AND (deleted_at IS NULL) "
         "ORDER BY deposited_at ASC"
     )
+    return _with_major(rows, ("amount", "amount_cents"))
 
 
 async def get_overdue_undeposited_orders(days: int = 2) -> list[dict]:
@@ -2568,24 +2550,24 @@ async def create_return(
 
         if USE_POSTGRES:
             return_id = await txn.fetchval(
-                "INSERT INTO returns (order_id, return_type, reason, total_amount, total_amount_cents, "
+                "INSERT INTO returns (order_id, return_type, reason, total_amount_cents, "
                 "refund_method, created_by, status, created_at) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8) RETURNING id",
-                order_id, return_type, reason, total_amount, total_cents, refund_method, created_by, now_str(),
+                "VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7) RETURNING id",
+                order_id, return_type, reason, total_cents, refund_method, created_by, now_str(),
             )
         else:
             await txn.execute(
-                "INSERT INTO returns (order_id, return_type, reason, total_amount, total_amount_cents, "
+                "INSERT INTO returns (order_id, return_type, reason, total_amount_cents, "
                 "refund_method, created_by, status, created_at) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)",
-                order_id, return_type, reason, total_amount, total_cents, refund_method, created_by, now_str(),
+                "VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)",
+                order_id, return_type, reason, total_cents, refund_method, created_by, now_str(),
             )
             return_id = await txn.fetchval("SELECT last_insert_rowid()")
         for oitem_id, qty, line_cents in clamped:
             await txn.execute(
-                "INSERT INTO return_items (return_id, order_item_id, qty, amount, amount_cents) "
-                "VALUES ($1, $2, $3, $4, $5)",
-                return_id, oitem_id, qty, float(money.from_cents(line_cents)), line_cents,
+                "INSERT INTO return_items (return_id, order_item_id, qty, amount_cents) "
+                "VALUES ($1, $2, $3, $4)",
+                return_id, oitem_id, qty, line_cents,
             )
     return {"ok": True, "return_id": return_id, "total_amount": total_amount}
 
@@ -2686,12 +2668,7 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
                 # Сумму берём из total_amount_cents (точно), конвертируем в базовую —
                 # иначе возврат по UZS-заказу вычел бы «5 000 000 USD» из кассы.
                 order_cur = ((order or {}).get("currency") or BASE_CURRENCY or "USD").upper()
-                cents = ret.get("total_amount_cents")
-                refund_major = (
-                    float(money.from_cents(int(cents)))
-                    if cents is not None
-                    else float(ret.get("total_amount") or 0)
-                )
+                refund_major = float(money.from_cents(int(ret.get("total_amount_cents") or 0)))
                 refund_base = convert_to_base(refund_major, order_cur)
                 if refund_base is None:
                     refund_base = refund_major  # курс не задан — пишем как есть
@@ -2700,12 +2677,11 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
                         "записан без конвертации", return_id, order_cur,
                     )
                 await txn.execute(
-                    "INSERT INTO cash_deposits (manager_id, amount, amount_cents, deposited_at, "
+                    "INSERT INTO cash_deposits (manager_id, amount_cents, deposited_at, "
                     "status, confirmed_by, confirmed_at, notes, created_at) "
-                    "VALUES ($1, $2, $3, $4, 'confirmed', $5, $6, $7, $8)",
+                    "VALUES ($1, $2, $3, 'confirmed', $4, $5, $6, $7)",
                     (order or {}).get("user_id") or confirmed_by,
-                    -refund_base,
-                    -money.to_cents(refund_base),  # dual-write копеек (отриц.)
+                    -money.to_cents(refund_base),  # выдача из кассы — отрицательная сдача
                     now_str(), confirmed_by, now_str(),
                     f"refund возврат #{return_id}", now_str(),
                 )
@@ -2736,7 +2712,8 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
         role,
         "return_confirmed",
         f"Возврат #{return_id} по заказу #{order_id} ({return_status}, "
-        f"{ret['total_amount']:.0f} USD, {ret.get('refund_method')})",
+        f"{money.format_cents(int(ret.get('total_amount_cents') or 0))} USD, "
+        f"{ret.get('refund_method')})",
     )
     return {"ok": True, "order_status": new_status}
 
@@ -2745,15 +2722,17 @@ async def get_pending_returns() -> list[dict]:
     """Возвраты, ждущие подтверждения. asyncpg-миграция Stage 5 (задача #21):
     нативный async через adb_core. Вызовы: handlers/webapp (`await adb.…`),
     async-cron run_ops_monitor (`await`), тесты (`asyncio.run`)."""
-    return await adb_core.fetch(
+    rows = await adb_core.fetch(
         "SELECT * FROM returns WHERE status = 'pending' AND (deleted_at IS NULL) "
         "ORDER BY created_at ASC"
     )
+    return _with_major(rows, ("total_amount", "total_amount_cents"))
 
 
 async def get_return(return_id: int) -> dict | None:
     """asyncpg Stage 10 (#21): native async через adb_core."""
-    return await adb_core.fetchrow("SELECT * FROM returns WHERE id = $1", return_id)
+    row = await adb_core.fetchrow("SELECT * FROM returns WHERE id = $1", return_id)
+    return _with_major(row, ("total_amount", "total_amount_cents"))
 
 
 async def get_return_positions_for_ms(return_id: int) -> list[dict]:
@@ -2762,7 +2741,7 @@ async def get_return_positions_for_ms(return_id: int) -> list[dict]:
     asyncpg Stage 10 (#21)."""
     return await adb_core.fetch(
         "SELECT oi.product_href AS product_href, oi.product_name AS product_name, "
-        "ri.qty AS qty, oi.price AS price "
+        "ri.qty AS qty, oi.price_cents AS price_cents "
         "FROM return_items ri JOIN order_items oi ON oi.id = ri.order_item_id "
         "WHERE ri.return_id = $1",
         return_id,
@@ -3147,20 +3126,20 @@ def add_payment(
             cur.execute(
                 """
                 INSERT INTO payments
-                    (user_id, username, full_name, amount, amount_cents, currency, comment, status, order_id, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s) RETURNING id
+                    (user_id, username, full_name, amount_cents, currency, comment, status, order_id, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s) RETURNING id
             """,
-                (user_id, username, full_name, amount, amount_cents, currency, comment, order_id, now_str()),
+                (user_id, username, full_name, amount_cents, currency, comment, order_id, now_str()),
             )
             payment_id = cur.fetchone()["id"]
         else:
             cur.execute(
                 """
                 INSERT INTO payments
-                    (user_id, username, full_name, amount, amount_cents, currency, comment, status, order_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    (user_id, username, full_name, amount_cents, currency, comment, status, order_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
             """,
-                (user_id, username, full_name, amount, amount_cents, currency, comment, order_id, now_str()),
+                (user_id, username, full_name, amount_cents, currency, comment, order_id, now_str()),
             )
             payment_id = cur.lastrowid
         conn.commit()
@@ -3171,9 +3150,10 @@ async def get_payments_for_order(order_id: int) -> list[dict]:
     """Все платежи привязанные к заказу (включая pending/rejected/archived).
 
     asyncpg Stage 19 (#21): native async (fetch)."""
-    return await adb_core.fetch(
+    rows = await adb_core.fetch(
         "SELECT * FROM payments WHERE order_id = $1 ORDER BY created_at ASC", order_id
     )
+    return _with_major(rows, ("amount", "amount_cents"))
 
 
 async def get_payments_for_orders(order_ids: list[int]) -> dict[int, list[dict]]:
@@ -3195,35 +3175,28 @@ async def get_payments_for_orders(order_ids: list[int]) -> dict[int, list[dict]]
     )
     grouped: dict[int, list[dict]] = {}
     for r in rows:
-        grouped.setdefault(r["order_id"], []).append(r)
+        grouped.setdefault(r["order_id"], []).append(
+            _with_major(r, ("amount", "amount_cents"))
+        )
     return grouped
 
 
 def _price_cents(item: dict) -> int:
-    """Цена позиции заказа в копейках: предпочитаем price_cents, иначе из
-    legacy REAL price (для строк, ещё не покрытых backfill'ом)."""
-    pc = item.get("price_cents")
-    if pc is not None:
-        return int(pc)
-    return money.to_cents(item.get("price", 0) or 0)
+    """Цена позиции заказа в копейках. Деньги хранятся только в копейках,
+    поэтому это просто чтение колонки (0 для NULL)."""
+    return int(item.get("price_cents") or 0)
 
 
 def _amount_cents(payment: dict) -> int:
-    """Сумма платежа в копейках: предпочитаем amount_cents, иначе legacy REAL."""
-    ac = payment.get("amount_cents")
-    if ac is not None:
-        return int(ac)
-    return money.to_cents(payment.get("amount", 0) or 0)
+    """Сумма платежа в копейках."""
+    return int(payment.get("amount_cents") or 0)
 
 
-# SQL-фрагменты «сумма денег в копейках» — берут dual-write *_cents с фолбэком
-# на legacy REAL (round(x*100)). Без placeholder'ов, безопасно встраивать в f-string.
-# Работают и в SQLite, и в Postgres (round + CAST AS INTEGER). Позволяют считать
-# суммы/сравнения точно в целых копейках вместо float (раньше нужен был epsilon).
-_SUM_PAYMENTS_CENTS = "COALESCE(SUM(COALESCE(amount_cents, CAST(round(amount * 100) AS INTEGER))), 0)"
-_SUM_ORDER_TOTAL_CENTS = (
-    "COALESCE(SUM(CAST(round(quantity * COALESCE(price_cents, round(price * 100))) AS INTEGER)), 0)"
-)
+# SQL-фрагменты «сумма денег в копейках». Без placeholder'ов, безопасно
+# встраивать в f-string. Работают и в SQLite, и в Postgres. Суммы и сравнения —
+# в целых копейках, без float и без epsilon.
+_SUM_PAYMENTS_CENTS = "COALESCE(SUM(amount_cents), 0)"
+_SUM_ORDER_TOTAL_CENTS = "COALESCE(SUM(CAST(round(quantity * price_cents) AS INTEGER)), 0)"
 
 
 async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
@@ -3340,9 +3313,7 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
         )
     result.sort(key=lambda x: x["revenue"], reverse=True)
     return result
-_SUM_RETURNS_CENTS = (
-    "COALESCE(SUM(COALESCE(total_amount_cents, CAST(round(total_amount * 100) AS INTEGER))), 0)"
-)
+_SUM_RETURNS_CENTS = "COALESCE(SUM(total_amount_cents), 0)"
 
 # «Живой заказ» для денежных агрегатов: платёж учитываем, только если его заказа
 # нет (standalone, order_id IS NULL) ИЛИ заказ не удалён ни в МС, ни локально.
@@ -3693,7 +3664,7 @@ def get_payments_needing_ms_sync(limit: int = 100) -> list[dict]:
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(q(query), (limit,))
-        return [dict(r) for r in cur.fetchall()]
+        return [_with_major(r, ("amount", "amount_cents")) for r in cur.fetchall()]
 
 
 async def get_ms_sync_stats() -> dict:
@@ -3736,12 +3707,13 @@ async def get_ms_sync_stats() -> dict:
 
 async def get_recent_ms_sync_failures(limit: int = 5) -> list[dict]:
     """Последние failed-синхронизации с текстом ошибки. asyncpg Stage 8 (#21)."""
-    return await adb_core.fetch(
-        "SELECT id, amount, currency, order_id, ms_sync_error "
+    rows = await adb_core.fetch(
+        "SELECT id, amount_cents, currency, order_id, ms_sync_error "
         "FROM payments WHERE ms_sync_status = 'failed' "
         "ORDER BY id DESC LIMIT $1",
         limit,
     )
+    return _with_major(rows, ("amount", "amount_cents"))
 
 
 def get_pool_stats() -> dict:
@@ -4121,7 +4093,7 @@ def find_payment_by_ms_paymentin_id(paymentin_id: str) -> dict | None:
             (paymentin_id,),
         )
         row = cur.fetchone()
-    return dict(row) if row else None
+    return _with_major(row, ("amount", "amount_cents")) if row else None
 
 
 def reset_payment_ms_sync(payment_id: int) -> bool:
@@ -4467,14 +4439,15 @@ async def get_unlinked_payments(limit: int = 100) -> list[dict]:
     """
     if limit <= 0:
         limit = 100
-    return await adb_core.fetch(
-        "SELECT id, user_id, username, full_name, amount, currency, "
+    rows = await adb_core.fetch(
+        "SELECT id, user_id, username, full_name, amount_cents, currency, "
         "comment, confirmed_at, status "
         "FROM payments "
         "WHERE order_id IS NULL AND status = 'confirmed' "
         "ORDER BY id DESC LIMIT $1",
         int(limit),
     )
+    return _with_major(rows, ("amount", "amount_cents"))
 
 
 def _trigger_ms_paymentin_sync(payment_id: int) -> None:
@@ -4717,7 +4690,8 @@ async def archive_payment(payment_id: int, archived_by: int, archived_name: str)
 async def get_payment(payment_id: int) -> dict | None:
     """asyncpg Stage 19 (#21): native async (fetchrow). Денежное ядро (confirm/
     link/reject/archive_payment) уже async и зовёт это через await."""
-    return await adb_core.fetchrow("SELECT * FROM payments WHERE id = $1", payment_id)
+    row = await adb_core.fetchrow("SELECT * FROM payments WHERE id = $1", payment_id)
+    return _with_major(row, ("amount", "amount_cents"))
 
 
 async def get_payments_report(since: str | None = None, until: str | None = None) -> list[dict]:
@@ -4735,7 +4709,8 @@ async def get_payments_report(since: str | None = None, until: str | None = None
         params.append(until)
         query += f" AND p.created_at <= ${len(params)}"
     query += " ORDER BY p.created_at DESC"
-    return await adb_core.fetch(query, *params)
+    rows = await adb_core.fetch(query, *params)
+    return _with_major(rows, ("amount", "amount_cents"))
 
 
 async def get_cash_history(
@@ -4772,7 +4747,7 @@ async def get_cash_history(
     pay_clause = _period("p.confirmed_at", "p.created_at", pay_params)
     pay_params.append(limit)
     pays = await adb_core.fetch(
-        "SELECT p.id, p.user_id, p.amount, p.currency, p.status, p.comment, "
+        "SELECT p.id, p.user_id, p.amount_cents, p.currency, p.status, p.comment, "
         "p.order_id, p.created_at "
         f"FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
         f"WHERE {_LIVE_ORDER_PAYMENT_FILTER}{pay_clause} "
@@ -4783,7 +4758,7 @@ async def get_cash_history(
     dep_clause = _period("confirmed_at", "created_at", dep_params)
     dep_params.append(limit)
     deps = await adb_core.fetch(
-        "SELECT id, manager_id, amount, status, reject_reason, created_at "
+        "SELECT id, manager_id, amount_cents, status, reject_reason, created_at "
         f"FROM cash_deposits WHERE (deleted_at IS NULL){dep_clause} "
         f"ORDER BY created_at DESC LIMIT ${len(dep_params)}",
         *dep_params,
@@ -4795,7 +4770,7 @@ async def get_cash_history(
     ret_clause = _period("r.confirmed_at", "r.created_at", ret_params)
     ret_params.append(limit)
     rets = await adb_core.fetch(
-        "SELECT r.id, r.order_id, r.created_by, r.total_amount, r.total_amount_cents, "
+        "SELECT r.id, r.order_id, r.created_by, r.total_amount_cents, "
         "r.refund_method, r.status, r.reason, r.created_at, o.currency AS order_currency "
         "FROM returns r LEFT JOIN orders o ON o.id = r.order_id "
         f"WHERE (r.deleted_at IS NULL) AND {_LIVE_ORDER_PAYMENT_FILTER}{ret_clause} "
@@ -4812,16 +4787,11 @@ async def get_cash_history(
 
     base_cur = (BASE_CURRENCY or "USD").upper()
 
-    def _ret_amount(r: dict) -> float:
-        cents = r.get("total_amount_cents")
-        if cents is not None:
-            return float(money.from_cents(int(cents)))
-        return float(r.get("total_amount") or 0)
-
     rows: list[dict] = []
     for p in pays:
         rows.append({
-            "kind": "payment", "id": p["id"], "amount": float(p["amount"] or 0),
+            "kind": "payment", "id": p["id"],
+            "amount": float(money.from_cents(int(p["amount_cents"] or 0))),
             "currency": p.get("currency") or base_cur, "status": p["status"],
             "who": names.get(p["user_id"], str(p["user_id"])),
             "order_id": p.get("order_id"), "note": p.get("comment") or "",
@@ -4830,7 +4800,8 @@ async def get_cash_history(
     for d in deps:
         # Сдачи наличных хранятся в базовой валюте (нет поля currency).
         rows.append({
-            "kind": "deposit", "id": d["id"], "amount": float(d["amount"] or 0),
+            "kind": "deposit", "id": d["id"],
+            "amount": float(money.from_cents(int(d["amount_cents"] or 0))),
             "currency": base_cur, "status": d["status"],
             "who": names.get(d["manager_id"], str(d["manager_id"])),
             "order_id": None, "note": d.get("reject_reason") or "",
@@ -4838,7 +4809,8 @@ async def get_cash_history(
         })
     for r in rets:
         rows.append({
-            "kind": "return", "id": r["id"], "amount": _ret_amount(r),
+            "kind": "return", "id": r["id"],
+            "amount": float(money.from_cents(int(r["total_amount_cents"] or 0))),
             "currency": (r.get("order_currency") or base_cur), "status": r["status"],
             "who": names.get(r["created_by"], str(r["created_by"])),
             "order_id": r.get("order_id"), "note": r.get("reason") or "",
@@ -4906,8 +4878,7 @@ async def get_money_totals(since: str | None = None, until: str | None = None) -
     """
     pay_sql = (
         "SELECT p.currency AS currency, COUNT(*) AS cnt, "
-        "COALESCE(SUM(COALESCE(p.amount_cents, CAST(round(p.amount * 100) AS INTEGER))), 0) "
-        "AS total_cents "
+        "COALESCE(SUM(p.amount_cents), 0) AS total_cents "
         f"FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
         f"WHERE p.status = 'confirmed' AND {_LIVE_ORDER_PAYMENT_FILTER}"
     )
@@ -4923,8 +4894,7 @@ async def get_money_totals(since: str | None = None, until: str | None = None) -
 
     dep_sql = (
         "SELECT COUNT(*) AS cnt, "
-        "COALESCE(SUM(COALESCE(amount_cents, CAST(round(amount * 100) AS INTEGER))), 0) "
-        "AS total_cents "
+        "COALESCE(SUM(amount_cents), 0) AS total_cents "
         "FROM cash_deposits WHERE status = 'confirmed' AND (deleted_at IS NULL)"
     )
     dep_params: list = []
@@ -4957,7 +4927,8 @@ async def get_summary_by_employee(
 ) -> list[dict]:
     """Платежи по сотрудникам (confirmed). asyncpg Stage 8 (#21)."""
     query = (
-        "SELECT p.full_name, p.currency, SUM(p.amount) as total, COUNT(*) as count "
+        "SELECT p.full_name, p.currency, "
+        "COALESCE(SUM(p.amount_cents), 0) as total_cents, COUNT(*) as count "
         f"FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
         f"WHERE p.status = 'confirmed' AND {_LIVE_ORDER_PAYMENT_FILTER}"
     )
@@ -4968,8 +4939,9 @@ async def get_summary_by_employee(
     if until:
         params.append(until)
         query += f" AND p.created_at <= ${len(params)}"
-    query += " GROUP BY p.full_name, p.currency ORDER BY total DESC"
-    return await adb_core.fetch(query, *params)
+    query += " GROUP BY p.full_name, p.currency ORDER BY total_cents DESC"
+    rows = await adb_core.fetch(query, *params)
+    return _with_major(rows, ("total", "total_cents"))
 
 
 # ─── Аудит лог ────────────────────────────────────────────────────────────────
@@ -5151,7 +5123,7 @@ def search_payments(query: str, user_id: int | None = None, limit: int = 20) -> 
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(q(sql), params)
-        return [dict(r) for r in cur.fetchall()]
+        return [_with_major(r, ("amount", "amount_cents")) for r in cur.fetchall()]
 
 
 def update_order_agent(order_id: int, agent_id: str, agent_name: str) -> bool:
@@ -5321,20 +5293,20 @@ async def mark_order_paid(
         if USE_POSTGRES:
             payment_id = await txn.fetchval(
                 "INSERT INTO payments "
-                "(user_id, username, full_name, amount, amount_cents, currency, comment, "
+                "(user_id, username, full_name, amount_cents, currency, comment, "
                 " status, created_at, order_id) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9) "
+                "VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8) "
                 "RETURNING id",
-                marked_by, username, marked_by_name, amount, amount_cents,
+                marked_by, username, marked_by_name, amount_cents,
                 currency, comment, now_str(), order_id,
             )
         else:
             await txn.execute(
                 "INSERT INTO payments "
-                "(user_id, username, full_name, amount, amount_cents, currency, comment, "
+                "(user_id, username, full_name, amount_cents, currency, comment, "
                 " status, created_at, order_id) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9)",
-                marked_by, username, marked_by_name, amount, amount_cents,
+                "VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)",
+                marked_by, username, marked_by_name, amount_cents,
                 currency, comment, now_str(), order_id,
             )
             payment_id = await txn.fetchval("SELECT last_insert_rowid()")
@@ -5644,20 +5616,20 @@ def add_order_item(
             cur.execute(
                 """
                 INSERT INTO order_items
-                    (order_id, product_name, product_href, quantity, unit, price, price_cents, note)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+                    (order_id, product_name, product_href, quantity, unit, price_cents, note)
+                VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
             """,
-                (order_id, product_name, product_href, quantity, unit, price, price_cents, note),
+                (order_id, product_name, product_href, quantity, unit, price_cents, note),
             )
             item_id = cur.fetchone()["id"]
         else:
             cur.execute(
                 """
                 INSERT INTO order_items
-                    (order_id, product_name, product_href, quantity, unit, price, price_cents, note)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (order_id, product_name, product_href, quantity, unit, price_cents, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-                (order_id, product_name, product_href, quantity, unit, price, price_cents, note),
+                (order_id, product_name, product_href, quantity, unit, price_cents, note),
             )
             item_id = cur.lastrowid
         conn.commit()
@@ -5666,7 +5638,8 @@ def add_order_item(
 
 async def get_order_items(order_id: int) -> list[dict]:
     """asyncpg Stage 19 (#21): native async (fetch)."""
-    return await adb_core.fetch("SELECT * FROM order_items WHERE order_id = $1", order_id)
+    rows = await adb_core.fetch("SELECT * FROM order_items WHERE order_id = $1", order_id)
+    return _with_major(rows, ("price", "price_cents"))
 
 
 async def get_order_items_by_ids(order_ids: list[int]) -> dict[int, list[dict]]:
@@ -5685,14 +5658,17 @@ async def get_order_items_by_ids(order_ids: list[int]) -> dict[int, list[dict]]:
     )
     grouped: dict[int, list[dict]] = {}
     for r in rows:
-        grouped.setdefault(r["order_id"], []).append(r)
+        grouped.setdefault(r["order_id"], []).append(
+            _with_major(r, ("price", "price_cents"))
+        )
     return grouped
 
 
 async def get_order_item(item_id: int) -> dict | None:
     """asyncpg Stage 11 (#21): native async. Leaf — внутри database.py
     не вызывается (есть get_order_items / get_order_items_by_ids)."""
-    return await adb_core.fetchrow("SELECT * FROM order_items WHERE id = $1", item_id)
+    row = await adb_core.fetchrow("SELECT * FROM order_items WHERE id = $1", item_id)
+    return _with_major(row, ("price", "price_cents"))
 
 
 def remove_order_item(item_id: int) -> bool:
