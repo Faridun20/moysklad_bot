@@ -599,22 +599,6 @@ def _create_tables():
                 updated_at    TEXT,
                 updated_by    BIGINT
             )""",
-            # Per-user overrides прав (PR #44 / tech debt #3c).
-            # Существующий enum-based system (admin/boss/manager/...) остаётся
-            # как «дефолт по роли» — см. services.roles.ROLE_DEFAULTS. Эта
-            # таблица позволяет админу точечно выдать или отозвать право
-            # конкретному юзеру, не создавая новую роль. has_permission()
-            # сначала смотрит сюда, потом falls back к ROLE_DEFAULTS.
-            # granted: 1 = explicit grant (даже если роль не имеет),
-            #          0 = explicit revoke (даже если роль имеет по дефолту).
-            """CREATE TABLE IF NOT EXISTS user_permissions (
-                user_id         BIGINT NOT NULL,
-                permission_code TEXT NOT NULL,
-                granted         INTEGER NOT NULL DEFAULT 1,
-                updated_at      TEXT,
-                updated_by      BIGINT,
-                PRIMARY KEY (user_id, permission_code)
-            )""",
             # Цены товаров, выставленные руководством (PR C).
             # sale_price — минимальная цена продажи: при добавлении товара
             #   в заказ менеджер может поднять, но не опустить ниже.
@@ -3729,83 +3713,6 @@ async def get_stale_crons(thresholds_hours: dict[str, float]) -> list[dict]:
                 }
             )
     return stale
-
-
-# ─── Per-user permissions (PR #44 / tech debt #3c) ──────────────────────────
-
-
-def get_user_permission_overrides(user_id: int) -> dict[str, bool]:
-    """Вернуть словарь permission_code → granted (True/False) для user'а.
-
-    Только записи из user_permissions; defaults по роли — отдельно через
-    ROLE_DEFAULTS (services.roles). Пустой dict = у юзера нет ни одного
-    override, работают только дефолты.
-    """
-    if not user_id:
-        return {}
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("SELECT permission_code, granted FROM user_permissions WHERE user_id = ?"),
-            (int(user_id),),
-        )
-        out: dict[str, bool] = {}
-        for r in cur.fetchall():
-            d = dict(r)
-            out[d["permission_code"]] = bool(d["granted"])
-        return out
-
-
-def set_user_permission_override(
-    user_id: int,
-    permission_code: str,
-    granted: bool,
-    updated_by: int,
-) -> None:
-    """UPSERT user_permissions: явный grant (True) или revoke (False)."""
-    if not user_id or not permission_code:
-        return
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        if USE_POSTGRES:
-            cur.execute(
-                q(
-                    "INSERT INTO user_permissions "
-                    "(user_id, permission_code, granted, updated_at, updated_by) "
-                    "VALUES (?, ?, ?, ?, ?) "
-                    "ON CONFLICT (user_id, permission_code) DO UPDATE SET "
-                    "granted = EXCLUDED.granted, "
-                    "updated_at = EXCLUDED.updated_at, "
-                    "updated_by = EXCLUDED.updated_by"
-                ),
-                (int(user_id), permission_code, 1 if granted else 0, now_str(), updated_by),
-            )
-        else:
-            cur.execute(
-                q(
-                    "INSERT OR REPLACE INTO user_permissions "
-                    "(user_id, permission_code, granted, updated_at, updated_by) "
-                    "VALUES (?, ?, ?, ?, ?)"
-                ),
-                (int(user_id), permission_code, 1 if granted else 0, now_str(), updated_by),
-            )
-        conn.commit()
-
-
-def clear_user_permission_override(user_id: int, permission_code: str) -> bool:
-    """Удалить override — юзер вернётся к role-default'у. Возвращает True если
-    запись была."""
-    if not user_id or not permission_code:
-        return False
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("DELETE FROM user_permissions WHERE user_id = ? AND permission_code = ?"),
-            (int(user_id), permission_code),
-        )
-        deleted = (cur.rowcount or 0) > 0
-        conn.commit()
-    return deleted
 
 
 def reset_stale_in_progress_payments(older_than_minutes: int = 30) -> int:
