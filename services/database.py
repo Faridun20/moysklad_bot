@@ -209,15 +209,13 @@ def init_db():
     """Гарантирует что схема существует. Безопасно вызывать из любого
     процесса при старте — все DDL идут через `CREATE TABLE IF NOT EXISTS`.
 
-    ВНИМАНИЕ: миграции (ALTER TABLE ADD COLUMN), backfill'ы и recovery —
-    больше НЕ часть init_db. Они вынесены в `tasks/migrate.py` и должны
-    запускаться отдельным процессом ПЕРЕД стартом bot/webapp/cron.
-    Это закрывает H4: при rolling deploy нескольких процессов ALTER
-    TABLE гонялся одновременно и DDL/UPDATE recovery конфликтовали.
+    Инкрементальных миграций в проекте нет: каждая таблица объявлена
+    в `_create_tables` ОДИН раз, сразу с финальным набором колонок,
+    типов и ограничений. Добавляешь колонку — правишь определение
+    таблицы, а не пишешь ALTER.
 
-    Если ты разрабатываешь локально (свежая SQLite-БД) — init_db
-    достаточно: миграции применяются к свежей схеме сразу через
-    CREATE TABLE с полным списком колонок.
+    Backfill'ы и сидинг настроек — не часть init_db (они пишут данные,
+    не должны бежать при каждом старте сервиса), они в `tasks/migrate.py`.
 
     Для прод-старта используй: `python -m tasks.migrate` перед
     `python bot.py`. На Railway: `tasks/migrate.py` в pre-start
@@ -270,6 +268,7 @@ def _create_tables():
         id_type = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
 
         tables = [
+            # deactivated_at/_by — «увольнение»: get_role отдаёт guest, пока стоит.
             """CREATE TABLE IF NOT EXISTS user_roles (
                 user_id              BIGINT PRIMARY KEY,
                 username             TEXT,
@@ -277,24 +276,34 @@ def _create_tables():
                 role                 TEXT NOT NULL DEFAULT 'manager',
                 moysklad_employee_id TEXT,
                 ms_sync_status       TEXT DEFAULT 'pending',
+                active               INTEGER NOT NULL DEFAULT 1,
+                email                TEXT,
+                phone                TEXT,
+                deactivated_at       TEXT,
+                deactivated_by       BIGINT,
                 created_at           TEXT
             )""",
+            # ms_sync_claimed_at — время claim'а для MS-синка (WP-10). Reaper
+            # orphan'ов судит устаревание по нему, а не по confirmed_at: иначе
+            # платёж, подтверждённый >30 мин назад, мог быть сброшен reaper'ом
+            # ПРЯМО во время in-flight POST → второй paymentin в МС (дубль).
             f"""CREATE TABLE IF NOT EXISTS payments (
-                id              {id_type},
-                user_id         BIGINT NOT NULL,
-                username        TEXT,
-                full_name       TEXT,
-                amount          REAL NOT NULL,
-                amount_cents    BIGINT,
-                currency        TEXT NOT NULL DEFAULT 'USD',
-                comment         TEXT,
-                status          TEXT NOT NULL DEFAULT 'pending',
-                order_id        BIGINT,
-                ms_paymentin_id TEXT,
-                ms_sync_status  TEXT,
-                ms_sync_error   TEXT,
-                created_at      TEXT NOT NULL,
-                confirmed_at    TEXT
+                id                 {id_type},
+                user_id            BIGINT NOT NULL,
+                username           TEXT,
+                full_name          TEXT,
+                amount             REAL NOT NULL,
+                amount_cents       BIGINT,
+                currency           TEXT NOT NULL DEFAULT 'USD',
+                comment            TEXT,
+                status             TEXT NOT NULL DEFAULT 'pending',
+                order_id           BIGINT,
+                ms_paymentin_id    TEXT,
+                ms_sync_status     TEXT,
+                ms_sync_error      TEXT,
+                ms_sync_claimed_at TEXT,
+                created_at         TEXT NOT NULL,
+                confirmed_at       TEXT
             )""",
             f"""CREATE TABLE IF NOT EXISTS audit_log (
                 id         {id_type},
@@ -305,36 +314,77 @@ def _create_tables():
                 details    TEXT,
                 created_at TEXT NOT NULL
             )""",
+            # payment_type: 'paid' (оплачено сразу) | 'credit' (в долг).
+            # due_date заполняется только для 'credit'.
+            # Двухступенчатое подтверждение оплаты:
+            #   paid_at          — менеджер отметил «деньги получил»
+            #   paid_confirmed_* — босс/админ подтвердил «да, в кассе»
+            # ms_cancel_synced_at    — отмена отражена в МС (реверс customerorder)
+            # ms_deleted_at          — документ обнаружен удалённым в МС
+            # ms_drift_at            — сумма разошлась с документом в МС (сигнал, не автоправка)
+            # ms_transition_blocked_at — МС прислал нелегальный для нашей FSM статус
+            # ms_demand_failed_at    — customerorder создан, demand упал (нужна доделка)
             f"""CREATE TABLE IF NOT EXISTS orders (
-                id                      {id_type},
-                user_id                 BIGINT NOT NULL,
-                full_name               TEXT,
-                status                  TEXT NOT NULL DEFAULT 'draft',
-                comment                 TEXT,
-                agent_id                TEXT,
-                agent_name              TEXT,
-                currency                TEXT,
-                payment_type            TEXT NOT NULL DEFAULT 'paid',
-                due_date                TEXT,
-                paid_at                 TEXT,
-                paid_confirmed_at       TEXT,
-                paid_confirmed_by       BIGINT,
-                paid_confirmed_by_name  TEXT,
-                ms_demand_id            TEXT,
-                ms_customerorder_id     TEXT,
-                created_at              TEXT NOT NULL,
-                updated_at              TEXT NOT NULL
+                id                       {id_type},
+                user_id                  BIGINT NOT NULL,
+                full_name                TEXT,
+                status                   TEXT NOT NULL DEFAULT 'draft',
+                comment                  TEXT,
+                agent_id                 TEXT,
+                agent_name               TEXT,
+                currency                 TEXT,
+                payment_type             TEXT NOT NULL DEFAULT 'paid',
+                due_date                 TEXT,
+                paid_at                  TEXT,
+                paid_confirmed_at        TEXT,
+                paid_confirmed_by        BIGINT,
+                paid_confirmed_by_name   TEXT,
+                payment_confirmed        INTEGER NOT NULL DEFAULT 0,
+                payment_confirmed_at     TEXT,
+                client_notification_sent INTEGER NOT NULL DEFAULT 0,
+                price_check_warnings     TEXT,
+                approved_by              BIGINT,
+                approved_at              TEXT,
+                rejection_comment        TEXT,
+                rejection_count          INTEGER NOT NULL DEFAULT 0,
+                frozen                   INTEGER NOT NULL DEFAULT 0,
+                credit_limit_override    INTEGER NOT NULL DEFAULT 0,
+                credit_limit_override_by BIGINT,
+                return_status            TEXT,
+                submitted_at             TEXT,
+                shipped_at               TEXT,
+                shipped_by               BIGINT,
+                cancelled_at             TEXT,
+                cancelled_by             BIGINT,
+                cancellation_reason      TEXT,
+                ms_demand_id             TEXT,
+                ms_customerorder_id      TEXT,
+                ms_cancel_synced_at      TEXT,
+                ms_deleted_at            TEXT,
+                ms_drift_at              TEXT,
+                ms_transition_blocked_at TEXT,
+                ms_demand_failed_at      TEXT,
+                deleted_at               TEXT,
+                created_at               TEXT NOT NULL,
+                updated_at               TEXT NOT NULL
             )""",
+            # price — цена за единицу в валюте заказа (как ввёл пользователь).
+            # price_cents — она же в копейках (канон, см. services/money.py).
             f"""CREATE TABLE IF NOT EXISTS order_items (
-                id           {id_type},
-                order_id     BIGINT NOT NULL,
-                product_name TEXT NOT NULL,
-                product_href TEXT,
-                quantity     REAL NOT NULL DEFAULT 1,
-                unit         TEXT DEFAULT 'шт',
-                price        REAL DEFAULT 0,
-                price_cents  BIGINT,
-                note         TEXT
+                id                   {id_type},
+                order_id             BIGINT NOT NULL,
+                product_name         TEXT NOT NULL,
+                product_href         TEXT,
+                quantity             REAL NOT NULL DEFAULT 1,
+                unit                 TEXT DEFAULT 'шт',
+                price                REAL DEFAULT 0,
+                price_cents          BIGINT,
+                price_at_submit      REAL,
+                price_at_submit_cents BIGINT,
+                stock_snap           REAL,
+                batch_id             TEXT,
+                returned_qty         REAL NOT NULL DEFAULT 0,
+                note                 TEXT
             )""",
             f"""CREATE TABLE IF NOT EXISTS shipment_requests (
                 id               {id_type},
@@ -687,172 +737,6 @@ def _create_indexes():
             except Exception as e:
                 conn.rollback()
                 logger.debug("Индекс не создан: %s", e)
-
-
-def run_migrations():
-    """ALTER TABLE ADD COLUMN — догоняем старые БД до текущей схемы.
-
-    ВЫНЕСЕНО ИЗ init_db (SECURITY.md H4): раньше эти ALTER гонялись на
-    каждом старте каждого процесса. При rolling deploy bot+webapp одно-
-    временные DDL вступали в race с UPDATE-запросами от уже работающих
-    транзакций. Теперь: вызывается явно из `tasks/migrate.py` перед
-    стартом сервисов.
-
-    Идемпотентно: ADD COLUMN если колонка уже есть → SQL ошибка,
-    мы её ловим и идём дальше.
-    """
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        migrations = [
-            ("user_roles", "moysklad_employee_id", "TEXT"),
-            ("user_roles", "ms_sync_status", "TEXT DEFAULT 'pending'"),
-            ("user_roles", "created_at", "TEXT"),
-            # Цена за единицу для позиции заказа (в основной валюте,
-            # т.е. как пользователь ввёл — например 150.50 USD).
-            # При создании demand в МойСклад умножаем на 100 (минорные единицы).
-            ("order_items", "price", "REAL DEFAULT 0"),
-            # Валюта заказа (USD/UZS/RUB/EUR). По умолчанию BASE_CURRENCY.
-            # Хранится на уровне ордера, чтобы все позиции одного заказа
-            # были в одной валюте.
-            ("orders", "currency", "TEXT"),
-            # Тип оплаты: 'paid' (оплачено сразу) или 'credit' (в долг).
-            # Default 'paid' — все старые заказы считаем как оплаченные,
-            # чтобы миграция была безопасной (не объявить вдруг весь
-            # архив должниками).
-            ("orders", "payment_type", "TEXT NOT NULL DEFAULT 'paid'"),
-            # Дата к которой клиент обязался погасить долг (ISO YYYY-MM-DD).
-            # Заполняется только когда payment_type='credit', NULL иначе.
-            ("orders", "due_date", "TEXT"),
-            # Когда долг был погашен (ISO YYYY-MM-DD HH:MM:SS). NULL пока
-            # не погашен. Для 'paid' заказов также NULL — там оплата
-            # сразу, отдельный timestamp не нужен (есть created_at).
-            ("orders", "paid_at", "TEXT"),
-            # Двухступенчатое подтверждение оплаты:
-            #  - paid_at:           менеджер отметил «деньги получил»
-            #  - paid_confirmed_*:  босс/админ подтвердил «да, в кассе»
-            # Заказ считается реально оплаченным ТОЛЬКО когда оба поля
-            # заполнены. Если босс отклонил — paid_at обнуляется (см.
-            # reject_payment_received), цикл начинается заново.
-            ("orders", "paid_confirmed_at", "TEXT"),
-            ("orders", "paid_confirmed_by", "BIGINT"),
-            ("orders", "paid_confirmed_by_name", "TEXT"),
-            # Связь платежа с заказом. Если payment.order_id IS NOT NULL —
-            # это «частичная оплата по заказу N», а не самостоятельный платёж
-            # в кассу. У одного заказа может быть несколько payments
-            # (клиент платит частями). Когда суммa confirmed payments >=
-            # order.total, заказ автоматически считается закрытым.
-            ("payments", "order_id", "BIGINT"),
-            # ID документа Demand в МойСклад, созданного при approve
-            # отгрузки. Нужен чтобы paymentin привязывался к конкретной
-            # отгрузке (operations field в API МойСклад). NULL если
-            # отгрузка ещё не отправлена или create_demand упал.
-            # LEGACY: новые заказы используют ms_customerorder_id ниже.
-            ("orders", "ms_demand_id", "TEXT"),
-            # ID «Заказа покупателя» (customerorder) в МойСклад.
-            # Новый workflow — бот создаёт именно customerorder, а не
-            # demand. paymentin привязывается сюда через operations
-            # вместо ms_demand_id для новых заказов.
-            ("orders", "ms_customerorder_id", "TEXT"),
-            # ID входящего платежа (paymentin) в МойСклад. Заполняется
-            # после успешного create_paymentin. Защищает от дубликатов:
-            # повторный confirm не плодит новые paymentin'ы в МойСклад.
-            ("payments", "ms_paymentin_id", "TEXT"),
-            # Статус синхронизации с МойСклад: NULL (ещё не пробовали),
-            # 'synced', 'failed' (с описанием в ms_sync_error).
-            ("payments", "ms_sync_status", "TEXT"),
-            ("payments", "ms_sync_error", "TEXT"),
-            # ─── IMPLEMENTATION.md Фаза 2 (адаптировано: BOOLEAN→INTEGER 0/1,
-            #     JSONB→TEXT, NUMERIC→REAL, без FK). Все колонки аддитивны. ──────
-            # users → у нас user_roles (telegram-id как PK).
-            ("user_roles", "active", "INTEGER NOT NULL DEFAULT 1"),
-            ("user_roles", "email", "TEXT"),
-            ("user_roles", "phone", "TEXT"),
-            ("user_roles", "deactivated_at", "TEXT"),
-            ("user_roles", "deactivated_by", "BIGINT"),
-            # orders
-            ("orders", "deleted_at", "TEXT"),
-            ("orders", "rejection_comment", "TEXT"),
-            ("orders", "rejection_count", "INTEGER NOT NULL DEFAULT 0"),
-            ("orders", "frozen", "INTEGER NOT NULL DEFAULT 0"),
-            ("orders", "cancelled_at", "TEXT"),
-            ("orders", "cancelled_by", "BIGINT"),
-            ("orders", "cancellation_reason", "TEXT"),
-            # Когда отмена была отражена в МойСклад (реверс customerorder).
-            # NULL = ещё не синхронизировано; идемпотентность ms_cancel.
-            ("orders", "ms_cancel_synced_at", "TEXT"),
-            # Когда документ заказа был обнаружен УДАЛЁННЫМ в МойСклад (вебхук
-            # customerorder.DELETE / cron-реконсиляция). Помечает «фантомные»
-            # заказы (особенно shipped/paid, чей статус мы не трогаем) — они
-            # исключаются из аналитики менеджеров, но остаются в учёте долгов
-            # для ручной разборки. NULL = в МС ещё существует.
-            ("orders", "ms_deleted_at", "TEXT"),
-            # Когда обнаружено расхождение суммы заказа с документом в МойСклад
-            # (кто-то отредактировал позиции/цены в МС). Это СИГНАЛ для ручной
-            # проверки (флаг + уведомление), деньги/статус НЕ меняем молча.
-            # NULL = расхождений не зафиксировано.
-            ("orders", "ms_drift_at", "TEXT"),
-            # Когда МойСклад сообщил статус, нелегальный для локальной машины
-            # состояний (напр. approved→rejected): отгрузка/остаток в МС двинулись,
-            # локально применить нельзя без отката. Отдельный флаг (НЕ ms_drift_at),
-            # чтобы дедуп этого алерта не глушился правкой суммы и наоборот.
-            # NULL = заблокированных переходов нет.
-            ("orders", "ms_transition_blocked_at", "TEXT"),
-            # R4: customerorder создан в МС, но demand (отгрузка) упал — заказ
-            # approved с CO, но без списания остатков. Флаг для ночного дайджеста
-            # «нужна доделка demand вручную». Снимается при успешном set_order_ms_demand_id.
-            # NULL = проблемы нет.
-            ("orders", "ms_demand_failed_at", "TEXT"),
-            ("orders", "credit_limit_override", "INTEGER NOT NULL DEFAULT 0"),
-            ("orders", "credit_limit_override_by", "BIGINT"),
-            ("orders", "price_check_warnings", "TEXT"),
-            ("orders", "payment_confirmed", "INTEGER NOT NULL DEFAULT 0"),
-            ("orders", "payment_confirmed_at", "TEXT"),
-            ("orders", "client_notification_sent", "INTEGER NOT NULL DEFAULT 0"),
-            ("orders", "return_status", "TEXT"),
-            ("orders", "submitted_at", "TEXT"),
-            ("orders", "approved_by", "BIGINT"),
-            ("orders", "approved_at", "TEXT"),
-            ("orders", "shipped_at", "TEXT"),
-            ("orders", "shipped_by", "BIGINT"),
-            # Баланс контрагента (взаиморасчёты) из МойСклад report/counterparty,
-            # в копейках, как отдаёт МС. balance<0 — клиент должен нам; >0 —
-            # аванс/переплата (интерпретация — на фронте «Клиенты»).
-            # Синкается ночным refresh_counterparties. NULL = ещё не синкнут.
-            ("ms_counterparties", "balance_cents", "BIGINT"),
-            # order_items
-            ("order_items", "stock_snap", "REAL"),
-            ("order_items", "price_at_submit", "REAL"),
-            ("order_items", "batch_id", "TEXT"),
-            ("order_items", "returned_qty", "REAL NOT NULL DEFAULT 0"),
-            # ─── Деньги в копейках (минорные единицы) — канон вместо float.
-            #     Аддитивные BIGINT-колонки рядом со старыми REAL; backfill
-            #     в run_backfills (x_cents = round(x*100)). Старые REAL пока
-            #     остаются для безопасного rolling-деплоя. См. services/money.py.
-            ("payments", "amount_cents", "BIGINT"),
-            # Время claim'а платежа для MS-синка (WP-10). Reaper orphan'ов судит
-            # устаревание по нему, а не по confirmed_at: иначе любой платёж,
-            # подтверждённый >30 мин назад, мог быть сброшен reaper'ом ПРЯМО во
-            # время in-flight POST → второй paymentin в МС (дубль).
-            ("payments", "ms_sync_claimed_at", "TEXT"),
-            ("order_items", "price_cents", "BIGINT"),
-            ("order_items", "price_at_submit_cents", "BIGINT"),
-            ("credit_limits", "limit_amount_cents", "BIGINT"),
-            ("cash_deposits", "amount_cents", "BIGINT"),
-            ("cash_deposit_orders", "amount_allocated_cents", "BIGINT"),
-            ("returns", "total_amount_cents", "BIGINT"),
-            ("return_items", "amount_cents", "BIGINT"),
-            ("product_prices", "sale_price_cents", "BIGINT"),
-            ("product_prices", "cost_price_cents", "BIGINT"),
-        ]
-        applied = 0
-        for table, column, col_type in migrations:
-            try:
-                cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
-                conn.commit()
-                applied += 1
-            except Exception:
-                conn.rollback()  # Колонка уже существует — норм
-        logger.info("run_migrations: применено %d из %d", applied, len(migrations))
 
 
 def run_backfills():

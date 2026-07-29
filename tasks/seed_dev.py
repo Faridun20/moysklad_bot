@@ -59,7 +59,6 @@ def main() -> int:
     mgr1, mgr2 = 999000002, 999000003
 
     db.init_db()
-    db.run_migrations()
 
     # ─── Роли (через хелпер — единая точка записи user_roles) ──────────────
     db.set_role(dev_uid, "dev", "Dev Админ", "admin")

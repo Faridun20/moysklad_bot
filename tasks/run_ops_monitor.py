@@ -28,7 +28,6 @@ from services.database import (
     claim_ops_monitor_run,
     get_all_users,
     init_db,
-    run_migrations,
 )
 from services.moysklad import close_session
 from services.notifier import close_tg_session, tg_send_message
@@ -381,7 +380,6 @@ def build_ping_keyboard(webapp_url: str | None) -> dict | None:
 
 async def main() -> int:
     init_db()
-    run_migrations()  # M1: на свежей БД догнать колонки (идемпотентно)
 
     # Round 6 RACE-4: idempotency-guard. Railway Cron при сетевом hiccup'е
     # может ретраить запуск, или ручной запуск пересечётся с плановым —
