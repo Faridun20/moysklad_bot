@@ -596,10 +596,6 @@ def _create_indexes():
             "CREATE INDEX IF NOT EXISTS idx_ms_products_folder ON ms_products(folder_id)",
             "CREATE INDEX IF NOT EXISTS idx_ms_stock_folder ON ms_stock(folder_id)",
             "CREATE INDEX IF NOT EXISTS idx_ms_categories_parent ON ms_categories(parent_id)",
-            # Каждое утреннее уведомление о долгах сканирует все credit-заказы
-            # с paid_at IS NULL. Без индекса — full scan по orders, при тысячах
-            # записей это секунды. Составной индекс покрывает фильтр и сортировку.
-            "CREATE INDEX IF NOT EXISTS idx_orders_credit_due ON orders(payment_type, paid_at, due_date)",
             # Для запросов «все платежи по заказу» — без него полный скан payments.
             "CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id)",
             # Уникальность paymentin'ов в МойСклад. Спасает от race condition
@@ -637,6 +633,42 @@ def _create_indexes():
             "CREATE INDEX IF NOT EXISTS idx_payments_created ON payments(created_at)",
             "CREATE INDEX IF NOT EXISTS idx_cash_deposits_created ON cash_deposits(created_at)",
             "CREATE INDEX IF NOT EXISTS idx_returns_created ON returns(created_at)",
+            # ── Уникальность (§2.1, §3.4) ────────────────────────────────────
+            # Одна pending-заявка на заказ. Закрывает двойной сабмит на уровне
+            # БД: второй INSERT падает на constraint, а не плодит две заявки
+            # (и, следом, два customerorder+demand в МС с двойным списанием).
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_shipment_requests_one_pending "
+            "ON shipment_requests(order_id) WHERE status = 'pending'",
+            # Один pending-возврат на заказ. Раньше защищал только
+            # advisory-lock, и только на Postgres.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_returns_one_pending "
+            "ON returns(order_id) WHERE status = 'pending'",
+            # Однозначность обратного поиска по документам МС:
+            # find_order_by_ms_customerorder_id брал LIMIT 1 из потенциально
+            # нескольких строк.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_ms_customerorder "
+            "ON orders(ms_customerorder_id) WHERE ms_customerorder_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_ms_demand "
+            "ON orders(ms_demand_id) WHERE ms_demand_id IS NOT NULL",
+            # ── Под реальные фильтры (§3.8) ──────────────────────────────────
+            # PK (deposit_id, order_id) не работает для поиска по order_id, а по
+            # нему идут _order_confirmed_deposit_cents / _order_allocated_deposit_cents
+            # / get_confirmed_deposit_cents_for_orders.
+            "CREATE INDEX IF NOT EXISTS idx_cash_deposit_orders_order "
+            "ON cash_deposit_orders(order_id)",
+            # get_payments_for_order(s) + confirm_all_pending_* фильтруют по паре.
+            "CREATE INDEX IF NOT EXISTS idx_payments_order_status "
+            "ON payments(order_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_payments_pending "
+            "ON payments(status) WHERE status = 'pending'",
+            # get_all_users() — полный скан с сортировкой на КАЖДОЕ уведомление
+            # (через get_notify_recipients).
+            "CREATE INDEX IF NOT EXISTS idx_user_roles_role ON user_roles(role)",
+            # get_open_debts: payment_type='credit' + status IN (...) +
+            # paid_confirmed_at IS NULL. Прежний idx_orders_credit_due был
+            # (payment_type, paid_at, due_date) — запрос им не покрывался.
+            "CREATE INDEX IF NOT EXISTS idx_orders_debt_lookup "
+            "ON orders(payment_type, status, paid_confirmed_at)",
         ]
         for sql in snapshot_indexes:
             try:
