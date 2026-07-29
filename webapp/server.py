@@ -3426,11 +3426,12 @@ async def _money_summary(adb, user_id: int | None) -> dict:
     from services.database import get_conn, get_cursor, q
 
     def _load():
-        # LEFT JOIN orders: платежи по удалённым/фантомным заказам (deleted_at /
-        # ms_deleted_at) НЕ должны попадать в «получено» — заказа нет, значит и
-        # денег по нему в сводке быть не должно. Standalone-платежи без order_id
-        # (o.id IS NULL) считаем как раньше — это реальные поступления.
-        where = "WHERE (o.id IS NULL OR (o.ms_deleted_at IS NULL AND o.deleted_at IS NULL))"
+        # LEFT JOIN orders: платежи по фантомным заказам (ms_deleted_at —
+        # документ удалён в МойСклад) НЕ должны попадать в «получено»: заказа
+        # нет, значит и денег по нему в сводке быть не должно. Standalone-
+        # платежи без order_id (o.id IS NULL) считаем как раньше — это
+        # реальные поступления.
+        where = "WHERE (o.id IS NULL OR o.ms_deleted_at IS NULL)"
         params: list = []
         if user_id is not None:
             where += " AND p.user_id = ?"

@@ -356,7 +356,6 @@ def _create_tables():
                 ms_drift_at              TEXT,
                 ms_transition_blocked_at TEXT,
                 ms_demand_failed_at      TEXT,
-                deleted_at               TEXT,
                 created_at               TEXT NOT NULL,
                 updated_at               TEXT NOT NULL
             )""",
@@ -480,7 +479,6 @@ def _create_tables():
                 status       TEXT NOT NULL DEFAULT 'pending',
                 reject_reason TEXT,
                 notes        TEXT,
-                deleted_at   TEXT,
                 created_at   TEXT
             )""",
             # Распределение одной сдачи по заказам (composite PK).
@@ -505,8 +503,7 @@ def _create_tables():
                 status       TEXT NOT NULL DEFAULT 'pending',
                 goods_received INTEGER NOT NULL DEFAULT 0,
                 created_at   TEXT,
-                confirmed_at TEXT,
-                deleted_at   TEXT
+                confirmed_at TEXT
             )""",
             f"""CREATE TABLE IF NOT EXISTS return_items (
                 id            {id_type},
@@ -783,7 +780,6 @@ _DEFAULT_SETTINGS: dict[str, tuple] = {
         "Сумма для двухступенчатого подтверждения paid-заказов",
     ),
     "audit_log_retention_months": (6, "Сколько месяцев аудита держим в БД"),
-    "soft_delete_retention_days": (365, "Через сколько дней soft-deleted удаляется физически"),
     "moysklad_retry_max_attempts": (3, "Макс попыток для МойСклад API"),
     "moysklad_circuit_breaker_threshold": (10, "Сколько фейлов за 5 мин → пауза"),
     "client_notifications_enabled": (True, "Глобальный switch уведомлений клиентам"),
@@ -997,7 +993,7 @@ async def get_confirmed_deposit_cents_for_orders(order_ids: list[int]) -> dict[i
     rows = await adb_core.fetch(
         f"SELECT cdo.order_id AS oid, {_SUM_ALLOC_CENTS} AS dc "
         "FROM cash_deposit_orders cdo JOIN cash_deposits d ON d.id = cdo.deposit_id "
-        f"WHERE cdo.order_id IN ({ph}) AND d.status = 'confirmed' AND (d.deleted_at IS NULL) "
+        f"WHERE cdo.order_id IN ({ph}) AND d.status = 'confirmed' "
         "GROUP BY cdo.order_id",
         *order_ids,
     )
@@ -1007,7 +1003,7 @@ async def get_confirmed_deposit_cents_for_orders(order_ids: list[int]) -> dict[i
 async def get_agent_current_debt(agent_id: str) -> float:
     """Текущий долг контрагента: сумма непогашенных остатков по его открытым
     заказам минус подтверждённые возвраты. Открытые = не draft/rejected/
-    cancelled и не soft-deleted.
+    cancelled.
 
     asyncpg #21: native async. #37 (F3): убран N+1 — раньше на каждый заказ
     звался get_order_payment_summary + отдельный returns-fetchval (горячий путь
@@ -1023,7 +1019,7 @@ async def get_agent_current_debt(agent_id: str) -> float:
     rows = await adb_core.fetch(
         "SELECT id, currency FROM orders WHERE agent_id = $1 "
         "AND status NOT IN ('draft', 'rejected', 'cancelled', 'paid', 'returned') "
-        "AND payment_confirmed = 0 AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)",
+        "AND payment_confirmed = 0 AND (ms_deleted_at IS NULL)",
         agent_id,
     )
     order_ids = [r["id"] for r in rows]
@@ -1089,14 +1085,14 @@ async def check_credit_limit(agent_id: str, order_total: float, currency: str | 
 
 
 async def agent_has_order(agent_id: str) -> bool:
-    """Есть ли у контрагента хоть один (не soft-deleted) заказ. Гейт для
+    """Есть ли у контрагента хоть один заказ. Гейт для
     установки кредит-лимита: лимит можно задать только тому, на кого реально
     создавали заказ, а не любому контрагенту из справочника МС (иначе плодятся
     лимиты-сироты, которых нет в overview). Native async через adb_core."""
     if not agent_id:
         return False
     row = await adb_core.fetchrow(
-        "SELECT 1 FROM orders WHERE agent_id = $1 AND (deleted_at IS NULL) LIMIT 1",
+        "SELECT 1 FROM orders WHERE agent_id = $1 LIMIT 1",
         agent_id,
     )
     return row is not None
@@ -1130,7 +1126,7 @@ async def get_credit_overview() -> list[dict]:
         "SELECT DISTINCT agent_id, agent_name FROM orders "
         "WHERE agent_id IS NOT NULL AND agent_id != '' "
         "AND status NOT IN ('draft', 'rejected', 'cancelled') "
-        "AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)"
+        "AND (ms_deleted_at IS NULL)"
     ):
         aid = r["agent_id"]
         if aid and aid not in agents:
@@ -1145,7 +1141,7 @@ async def get_credit_overview() -> list[dict]:
         for r in await adb_core.fetch(
             "SELECT id, agent_id, currency FROM orders "
             "WHERE status NOT IN ('draft', 'rejected', 'cancelled', 'paid', 'returned') "
-            "AND payment_confirmed = 0 AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)"
+            "AND payment_confirmed = 0 AND (ms_deleted_at IS NULL)"
         )
     ]
 
@@ -1221,14 +1217,14 @@ async def get_credit_overview() -> list[dict]:
 
 
 async def get_orders_by_agent(agent_id: str, limit: int = 50) -> list[dict[str, Any]]:
-    """Заказы контрагента (для карточки клиента): свежие сверху, без soft-deleted
-    и фантомных (ms_deleted_at). Сумма заказа считается из позиций (в копейках).
+    """Заказы контрагента (для карточки клиента): свежие сверху, без
+    фантомных (ms_deleted_at). Сумма заказа считается из позиций (в копейках).
     Индекс idx_orders_agent_id уже есть."""
     if not agent_id:
         return []
     rows = await adb_core.fetch(
         "SELECT id, status, currency, created_at, payment_type, due_date "
-        "FROM orders WHERE agent_id = $1 AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL) "
+        "FROM orders WHERE agent_id = $1 AND (ms_deleted_at IS NULL) "
         "ORDER BY created_at DESC LIMIT $2",
         agent_id, limit,
     )
@@ -1452,7 +1448,7 @@ async def get_frozen_orders() -> list[dict]:
     """Замороженные заказы (frozen=1, не удалённые) — для админ-списка/разморозки.
     Native async через adb_core."""
     return await adb_core.fetch(
-        "SELECT * FROM orders WHERE frozen = 1 AND (deleted_at IS NULL) "
+        "SELECT * FROM orders WHERE frozen = 1 "
         "ORDER BY updated_at DESC"
     )
 
@@ -1569,7 +1565,7 @@ async def get_stale_pending_orders(hours: int = 48) -> list[dict]:
 
     cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     return await adb_core.fetch(
-        "SELECT * FROM orders WHERE status = 'pending' AND (deleted_at IS NULL) "
+        "SELECT * FROM orders WHERE status = 'pending' "
         "AND COALESCE(submitted_at, created_at) < $1 ORDER BY created_at ASC",
         cutoff,
     )
@@ -1604,7 +1600,7 @@ async def _order_confirmed_deposit_cents(order_id: int) -> int:
         await adb_core.fetchval(
             f"SELECT {_SUM_ALLOC_CENTS} FROM cash_deposit_orders cdo "
             "JOIN cash_deposits d ON d.id = cdo.deposit_id "
-            "WHERE cdo.order_id = $1 AND d.status = 'confirmed' AND (d.deleted_at IS NULL)",
+            "WHERE cdo.order_id = $1 AND d.status = 'confirmed'",
             order_id,
         )
         or 0
@@ -1637,8 +1633,7 @@ async def _order_allocated_deposit_cents(order_id: int) -> int:
         await adb_core.fetchval(
             f"SELECT {_SUM_ALLOC_CENTS} FROM cash_deposit_orders cdo "
             "JOIN cash_deposits d ON d.id = cdo.deposit_id "
-            "WHERE cdo.order_id = $1 AND d.status IN ('pending', 'confirmed') "
-            "AND (d.deleted_at IS NULL)",
+            "WHERE cdo.order_id = $1 AND d.status IN ('pending', 'confirmed')",
             order_id,
         )
         or 0
@@ -1690,7 +1685,7 @@ async def get_manager_open_orders_for_deposit(manager_id: int) -> list[dict]:
     в список, только если непокрытый остаток ≥ 1 копейки."""
     rows = await adb_core.fetch(
         "SELECT id, currency FROM orders WHERE user_id = $1 AND status = 'shipped' "
-        "AND payment_confirmed = 0 AND (deleted_at IS NULL) ORDER BY created_at ASC",
+        "AND payment_confirmed = 0 ORDER BY created_at ASC",
         manager_id,
     )
     out = []
@@ -2284,7 +2279,7 @@ async def get_cash_deposit_orders_batch(deposit_ids: list[int]) -> dict[int, lis
 async def get_manager_cash_deposits(manager_id: int, limit: int = 20) -> list[dict]:
     """asyncpg Stage 9 (#21)."""
     rows = await adb_core.fetch(
-        "SELECT * FROM cash_deposits WHERE manager_id = $1 AND (deleted_at IS NULL) "
+        "SELECT * FROM cash_deposits WHERE manager_id = $1 "
         "ORDER BY created_at DESC LIMIT $2",
         manager_id,
         limit,
@@ -2310,7 +2305,7 @@ async def get_pending_cash_deposits() -> list[dict]:
     cron-вызов безопасным.
     """
     rows = await adb_core.fetch(
-        "SELECT * FROM cash_deposits WHERE status = 'pending' AND (deleted_at IS NULL) "
+        "SELECT * FROM cash_deposits WHERE status = 'pending' "
         "ORDER BY deposited_at ASC"
     )
     return _with_major(rows, ("amount", "amount_cents"))
@@ -2328,7 +2323,7 @@ async def get_overdue_undeposited_orders(days: int = 2) -> list[dict]:
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     return await adb_core.fetch(
         "SELECT * FROM orders WHERE status = 'shipped' AND payment_confirmed = 0 "
-        "AND (deleted_at IS NULL) AND COALESCE(shipped_at, created_at) < $1 "
+        "AND COALESCE(shipped_at, created_at) < $1 "
         "ORDER BY user_id, created_at",
         cutoff,
     )
@@ -2542,7 +2537,7 @@ async def create_return(
             await txn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", f"return:order:{order_id}")
         cnt = await txn.fetchval(
             "SELECT COUNT(*) FROM returns WHERE order_id = $1 "
-            "AND status = 'pending' AND (deleted_at IS NULL)",
+            "AND status = 'pending'",
             order_id,
         )
         if int(cnt or 0) > 0:
@@ -2723,7 +2718,7 @@ async def get_pending_returns() -> list[dict]:
     нативный async через adb_core. Вызовы: handlers/webapp (`await adb.…`),
     async-cron run_ops_monitor (`await`), тесты (`asyncio.run`)."""
     rows = await adb_core.fetch(
-        "SELECT * FROM returns WHERE status = 'pending' AND (deleted_at IS NULL) "
+        "SELECT * FROM returns WHERE status = 'pending' "
         "ORDER BY created_at ASC"
     )
     return _with_major(rows, ("total_amount", "total_amount_cents"))
@@ -3210,7 +3205,7 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
     shipped/partially_returned), returns_count. Имя/роль — из user_roles."""
     orders = await adb_core.fetch(
         "SELECT * FROM orders WHERE created_at >= $1 AND created_at <= $2 "
-        "AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)",
+        "AND (ms_deleted_at IS NULL)",
         since_iso, until_iso,
     )
     if not orders:
@@ -3222,7 +3217,7 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
     placeholders = ", ".join(f"${i + 1}" for i in range(len(order_ids)))
     ret_rows = await adb_core.fetch(
         f"SELECT order_id, COUNT(*) AS c FROM returns "
-        f"WHERE order_id IN ({placeholders}) AND status = 'confirmed' AND (deleted_at IS NULL) "
+        f"WHERE order_id IN ({placeholders}) AND status = 'confirmed' "
         f"GROUP BY order_id",
         *order_ids,
     )
@@ -3323,7 +3318,7 @@ _SUM_RETURNS_CENTS = "COALESCE(SUM(total_amount_cents), 0)"
 # <payments-alias>.order_id и алиас payments-таблицы.
 _LIVE_ORDER_PAYMENT_JOIN = "LEFT JOIN orders o ON o.id = {p}.order_id"
 _LIVE_ORDER_PAYMENT_FILTER = (
-    "(o.id IS NULL OR (o.ms_deleted_at IS NULL AND o.deleted_at IS NULL))"
+    "(o.id IS NULL OR o.ms_deleted_at IS NULL)"
 )
 
 # Возвраты, уменьшающие «к оплате» по заказу: ТОЛЬКО не-cash (debt_reduction /
@@ -3331,7 +3326,7 @@ _LIVE_ORDER_PAYMENT_FILTER = (
 # сдача в кассе) — он не должен ещё и уменьшать долг по заказу, иначе клиента
 # кредитуют дважды (вернули товар, отдали деньги — и заказ закрылся как оплаченный).
 _RETURN_OWED_FILTER = (
-    "status = 'confirmed' AND (deleted_at IS NULL) "
+    "status = 'confirmed' "
     "AND (refund_method IS NULL OR refund_method != 'cash')"
 )
 
@@ -3489,19 +3484,6 @@ def _batched_delete(table: str, where: str, params: tuple, batch: int = 5000) ->
             if n <= 0:
                 break
     return total
-
-
-def purge_soft_deleted(retention_days: int = 365) -> dict[str, int]:
-    """Физически удалить soft-deleted строки (deleted_at IS NOT NULL) старше
-    retention_days. Возвращает {table: removed}. Таблицы с deleted_at:
-    orders, cash_deposits, returns. Удаление порциями (L2)."""
-    from datetime import timedelta
-
-    cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
-    out: dict[str, int] = {}
-    for table in ("orders", "cash_deposits", "returns"):
-        out[table] = _batched_delete(table, "deleted_at IS NOT NULL AND deleted_at < ?", (cutoff,))
-    return out
 
 
 def set_order_ms_demand_id(order_id: int, ms_demand_id: str) -> bool:
@@ -4158,7 +4140,7 @@ async def get_orders_with_ms_customerorder() -> list[dict]:
     их в МС незачем. Native async через adb_core."""
     return await adb_core.fetch(
         "SELECT * FROM orders WHERE ms_customerorder_id IS NOT NULL "
-        "AND (ms_deleted_at IS NULL) AND (deleted_at IS NULL) "
+        "AND (ms_deleted_at IS NULL) "
         "AND status NOT IN ('cancelled', 'rejected')"
     )
 
@@ -4174,7 +4156,7 @@ async def get_orders_with_ms_demand() -> list[dict]:
     Native async через adb_core."""
     return await adb_core.fetch(
         "SELECT * FROM orders WHERE ms_demand_id IS NOT NULL "
-        "AND (ms_deleted_at IS NULL) AND (deleted_at IS NULL) "
+        "AND (ms_deleted_at IS NULL) "
         "AND status NOT IN ('cancelled', 'rejected')"
     )
 
@@ -4191,19 +4173,19 @@ async def get_ms_sync_anomalies(since_iso: str) -> dict[str, list[dict]]:
     исключаем. Native async через adb_core."""
     drift = await adb_core.fetch(
         "SELECT id, agent_name, full_name, status, ms_drift_at FROM orders "
-        "WHERE ms_drift_at IS NOT NULL AND ms_drift_at >= $1 AND (deleted_at IS NULL) "
+        "WHERE ms_drift_at IS NOT NULL AND ms_drift_at >= $1 "
         "ORDER BY ms_drift_at DESC",
         since_iso,
     )
     transition_blocked = await adb_core.fetch(
         "SELECT id, agent_name, full_name, status, ms_transition_blocked_at FROM orders "
         "WHERE ms_transition_blocked_at IS NOT NULL AND ms_transition_blocked_at >= $1 "
-        "AND (deleted_at IS NULL) ORDER BY ms_transition_blocked_at DESC",
+        "ORDER BY ms_transition_blocked_at DESC",
         since_iso,
     )
     deleted = await adb_core.fetch(
         "SELECT id, agent_name, full_name, status, ms_deleted_at FROM orders "
-        "WHERE ms_deleted_at IS NOT NULL AND ms_deleted_at >= $1 AND (deleted_at IS NULL) "
+        "WHERE ms_deleted_at IS NOT NULL AND ms_deleted_at >= $1 "
         "AND status IN ('shipped', 'paid', 'partially_returned', 'returned') "
         "ORDER BY ms_deleted_at DESC",
         since_iso,
@@ -4213,7 +4195,7 @@ async def get_ms_sync_anomalies(since_iso: str) -> dict[str, list[dict]]:
     demand_failed = await adb_core.fetch(
         "SELECT id, agent_name, full_name, status, ms_demand_failed_at FROM orders "
         "WHERE ms_demand_failed_at IS NOT NULL AND ms_demand_failed_at >= $1 "
-        "AND (deleted_at IS NULL) ORDER BY ms_demand_failed_at DESC",
+        "ORDER BY ms_demand_failed_at DESC",
         since_iso,
     )
     return {
@@ -4366,8 +4348,6 @@ async def link_payment_to_order(
     order = await get_order(order_id)
     if not order:
         return {"ok": False, "error": "Заказ не найден"}
-    if order.get("deleted_at"):
-        return {"ok": False, "error": "Заказ удалён"}
     # Валюта платежа должна совпадать с валютой заказа: закрытие заказа считает
     # копейки в валюте заказа, кросс-валютная привязка без конверсии ложно
     # закрывала заказ (напр. UZS-платёж к USD-заказу). Конверсии при закрытии
@@ -4601,7 +4581,7 @@ async def _maybe_close_order_after_payment(
             await txn.fetchval(
                 f"SELECT {_SUM_ALLOC_CENTS} FROM cash_deposit_orders cdo "
                 "JOIN cash_deposits d ON d.id = cdo.deposit_id "
-                "WHERE cdo.order_id = $1 AND d.status = 'confirmed' AND (d.deleted_at IS NULL)",
+                "WHERE cdo.order_id = $1 AND d.status = 'confirmed'",
                 order_id,
             )
             or 0
@@ -4759,7 +4739,7 @@ async def get_cash_history(
     dep_params.append(limit)
     deps = await adb_core.fetch(
         "SELECT id, manager_id, amount_cents, status, reject_reason, created_at "
-        f"FROM cash_deposits WHERE (deleted_at IS NULL){dep_clause} "
+        f"FROM cash_deposits WHERE 1 = 1{dep_clause} "
         f"ORDER BY created_at DESC LIMIT ${len(dep_params)}",
         *dep_params,
     )
@@ -4773,7 +4753,7 @@ async def get_cash_history(
         "SELECT r.id, r.order_id, r.created_by, r.total_amount_cents, "
         "r.refund_method, r.status, r.reason, r.created_at, o.currency AS order_currency "
         "FROM returns r LEFT JOIN orders o ON o.id = r.order_id "
-        f"WHERE (r.deleted_at IS NULL) AND {_LIVE_ORDER_PAYMENT_FILTER}{ret_clause} "
+        f"WHERE {_LIVE_ORDER_PAYMENT_FILTER}{ret_clause} "
         f"ORDER BY r.created_at DESC LIMIT ${len(ret_params)}",
         *ret_params,
     )
@@ -4862,7 +4842,7 @@ async def get_money_totals(since: str | None = None, until: str | None = None) -
     """Поступления компании за период (раздел «Деньги», boss/admin).
 
     - payments: подтверждённые платежи по валютам (в копейках). Платежи по
-      удалённым/фантомным заказам (ms_deleted_at/deleted_at) исключаем — как в
+      фантомным заказам (ms_deleted_at) исключаем — как в
       сводке долгов «получено»; standalone-платежи без order_id считаем.
     - deposits: подтверждённые сдачи наличных (USD), суммарно.
 
@@ -4895,7 +4875,7 @@ async def get_money_totals(since: str | None = None, until: str | None = None) -
     dep_sql = (
         "SELECT COUNT(*) AS cnt, "
         "COALESCE(SUM(amount_cents), 0) AS total_cents "
-        "FROM cash_deposits WHERE status = 'confirmed' AND (deleted_at IS NULL)"
+        "FROM cash_deposits WHERE status = 'confirmed'"
     )
     dep_params: list = []
     if since:
@@ -5029,10 +5009,10 @@ async def get_user_orders(user_id: int, status: str | None = None) -> list[dict]
 
     asyncpg Stage 12 (#21): native async через adb_core."""
     params: list = [user_id]
-    # Прячем заказы, удалённые в МойСклад (ms_deleted_at) и soft-deleted —
+    # Прячем заказы, удалённые в МойСклад (ms_deleted_at) —
     # иначе «фантомы» (CO удалён в МС) висят в списке, рассинхрон с аналитикой,
     # которая их уже исключает (get_manager_performance).
-    query = "SELECT * FROM orders WHERE user_id = $1 AND (deleted_at IS NULL) AND (ms_deleted_at IS NULL)"
+    query = "SELECT * FROM orders WHERE user_id = $1 AND (ms_deleted_at IS NULL)"
     if status:
         params.append(status)
         query += f" AND status = ${len(params)}"
@@ -5044,9 +5024,9 @@ async def get_all_orders(status: str | None = None) -> list[dict]:
     """Все заказы (опц. фильтр по статусу). asyncpg-миграция Stage 6
     (задача #21): нативный async через adb_core. Вызов — только webapp
     (`await adb.get_all_orders()`)."""
-    # Прячем удалённые в МС (ms_deleted_at) и soft-deleted заказы — список
+    # Прячем удалённые в МС (ms_deleted_at) заказы — список
     # должен сходиться с аналитикой, которая их уже исключает.
-    query = "SELECT * FROM orders WHERE (deleted_at IS NULL) AND (ms_deleted_at IS NULL)"
+    query = "SELECT * FROM orders WHERE (ms_deleted_at IS NULL)"
     params: list = []
     if status:
         params.append(status)
@@ -5069,7 +5049,7 @@ def search_orders(query: str, user_id: int | None = None, limit: int = 20) -> li
     если query — число.
 
     `user_id` задан → только заказы этого пользователя (скоуп менеджера).
-    None → все (boss/admin). Исключаем soft-deleted (deleted_at IS NULL).
+    None → все (boss/admin).
     """
     query = (query or "").strip()
     if not query:
@@ -5084,7 +5064,7 @@ def search_orders(query: str, user_id: int | None = None, limit: int = 20) -> li
     if query.isdigit():
         conds.append("id = ?")
         params.append(int(query))
-    where = "(" + " OR ".join(conds) + ") AND deleted_at IS NULL"
+    where = "(" + " OR ".join(conds) + ")"
     if user_id is not None:
         where += " AND user_id = ?"
         params.append(user_id)

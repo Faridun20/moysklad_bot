@@ -3,9 +3,7 @@ CLI: периодическая чистка БД (IMPLEMENTATION.md §13, janit
 
 Что делает за один прогон (всё идемпотентно, по ретеншенам из app_settings):
   • prune_notified_shipments  — дедуп-записи отгрузок старше 30 дней;
-  • prune_audit_log           — аудит старше audit_log_retention_months;
-  • purge_soft_deleted        — физ-удаление soft-deleted старше
-                                soft_delete_retention_days (orders/cash_deposits/returns).
+  • prune_audit_log           — аудит старше audit_log_retention_months.
 
 Использование:
     python -m tasks.run_maintenance
@@ -21,7 +19,6 @@ from services.database import (
     init_db,
     prune_audit_log,
     prune_notified_shipments,
-    purge_soft_deleted,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -32,20 +29,17 @@ def main() -> int:
     init_db()
     try:
         audit_months = int(get_setting("audit_log_retention_months", 6))
-        soft_days = int(get_setting("soft_delete_retention_days", 365))
 
         shipments = prune_notified_shipments(older_than_days=30)
 
         # Аудит старше ретеншена удаляем напрямую (внешний архив убран).
         # Ретеншен — audit_log_retention_months (по умолчанию 6 мес).
         audit = prune_audit_log(retention_months=audit_months)
-        purged = purge_soft_deleted(retention_days=soft_days)
 
         logger.info(
-            "maintenance: notified_shipments=-%d audit_log=-%d soft_deleted=%s",
+            "maintenance: notified_shipments=-%d audit_log=-%d",
             shipments,
             audit,
-            purged,
         )
         return 0
     except Exception:
