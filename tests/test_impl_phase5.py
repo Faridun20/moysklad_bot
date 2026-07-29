@@ -124,36 +124,3 @@ def test_confirmed_return_reduces_agent_debt(shipped_order):
 # ─── FEFO / партии ───────────────────────────────────────────────────────────
 
 
-def test_batch_upsert_and_fefo_order(isolated_db):
-    db = isolated_db
-    db.upsert_product_batch("P1", "B-LATE", "late", "2026-12-31", 5)
-    db.upsert_product_batch("P1", "B-SOON", "soon", "2026-06-01", 3)
-    db.upsert_product_batch("P1", "B-NONE", "nodate", None, 10)
-    # Нужно 6 → берём сначала ближайший (3), потом следующий по дате (3 из late).
-    alloc = db.select_batches_fefo("P1", 6)
-    takes = [a["take"] for a in alloc]
-    assert takes[0] == 3.0  # B-SOON первым (раньше истекает)
-    assert sum(takes) == 6.0
-
-
-def test_batch_upsert_updates_existing(isolated_db):
-    db = isolated_db
-    bid1 = db.upsert_product_batch("P2", "B-1", "c", "2026-06-01", 5)
-    bid2 = db.upsert_product_batch("P2", "B-1", "c", "2026-06-01", 8)  # тот же moysklad_batch_id
-    assert bid1 == bid2
-    alloc = db.select_batches_fefo("P2", 100)  # возьмём всё доступное
-    assert alloc[0]["take"] == 8.0  # обновилось, не задвоилось
-
-
-def test_batches_expiring_within(isolated_db):
-    db = isolated_db
-    from datetime import datetime, timedelta
-
-    soon = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d")
-    far = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
-    db.upsert_product_batch("P3", "B-soon", "s", soon, 4)
-    db.upsert_product_batch("P3", "B-far", "f", far, 4)
-    codes = {
-        b["batch_code"] for b in asyncio.run(db.get_batches_expiring_within(days=7))
-    }  # async после asyncpg Stage 8
-    assert "s" in codes and "f" not in codes

@@ -16,7 +16,6 @@
 import asyncio
 
 from services.database import (
-    get_batches_expiring_within,
     get_ms_sync_anomalies,
     get_overdue_undeposited_orders,
     get_pending_cash_deposits,
@@ -55,14 +54,12 @@ async def gather_ops_summary() -> dict:
 
     stale_hours = int(get_setting("stale_pending_hours", 48))
     cash_days = int(get_setting("cash_deposit_escalation_days", 2))
-    batch_days = 7
     low_stock_threshold = float(get_setting("low_stock_threshold", 5))
 
     stale = await get_stale_pending_orders(hours=stale_hours)
     deposits = await get_pending_cash_deposits()
     returns = await get_pending_returns()
     overdue = await get_overdue_undeposited_orders(days=cash_days)
-    batches = await get_batches_expiring_within(days=batch_days)
 
     # snapshot.get_low_stock — sync (локальная БД). Не блокируем event loop.
     from services.snapshot import get_low_stock
@@ -122,18 +119,6 @@ async def gather_ops_summary() -> dict:
                     "full_name": o.get("full_name") or "—",
                 }
                 for o in _cap(overdue)
-            ],
-        },
-        "expiring_batches": {
-            "count": len(batches),
-            "threshold_days": batch_days,
-            "items": [
-                {
-                    "code": b.get("batch_code") or b.get("product_id") or "—",
-                    "expiry_date": b.get("expiry_date") or "—",
-                    "qty_remaining": float(b.get("qty_remaining", 0) or 0),
-                }
-                for b in _cap(batches)
             ],
         },
         "low_stock": {
@@ -199,7 +184,6 @@ async def gather_ops_summary() -> dict:
         + len(deposits)
         + len(returns)
         + len(overdue)
-        + len(batches)
         + len(low_stock)
         + len(stale_crons)
         + len(drift)

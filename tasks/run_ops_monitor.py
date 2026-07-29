@@ -5,9 +5,9 @@ CLI: операционный монитор (IMPLEMENTATION.md Фаза 6). З�
 (дайджест), а не по сообщению на каждую запись — чтобы не спамить чат:
 
   • boss/admin   — всё: зависшие заявки, неподтверждённые сдачи/возвраты,
-                   просроченные несданные наличные, истекающие партии;
+                   просроченные несданные наличные, низкий остаток;
   • bookkeeper   — неподтверждённые сдачи;
-  • warehouse    — неподтверждённые возвраты + истекающие партии.
+  • warehouse    — неподтверждённые возвраты + низкий остаток.
 
 Пороговые значения берём из app_settings (stale_pending_hours,
 cash_deposit_escalation_days, и т.д.) с дефолтами.
@@ -101,20 +101,6 @@ def build_overdue_undeposited_block(orders: list[dict], days: int) -> str | None
         lines.append(f"  • #{o['id']} · {agent} · {owner}")
     if len(orders) > 15:
         lines.append(f"  …и ещё {len(orders) - 15}")
-    return "\n".join(lines)
-
-
-def build_expiring_batches_block(batches: list[dict], days: int) -> str | None:
-    if not batches:
-        return None
-    lines = [f"⌛ <b>Истекают партии (≤{days}д): {len(batches)}</b>"]
-    for b in batches[:15]:
-        code = _esc(b.get("batch_code") or b.get("product_id") or "—")
-        exp = _esc(b.get("expiry_date") or "—")
-        qty = _fmt_amount(float(b.get("qty_remaining", 0) or 0))
-        lines.append(f"  • {code} · до {exp} · остаток {qty}")
-    if len(batches) > 15:
-        lines.append(f"  …и ещё {len(batches) - 15}")
     return "\n".join(lines)
 
 
@@ -313,14 +299,14 @@ def build_digest_keyboard(
 _PING_ROLE_SECTIONS: dict[str, list[str]] = {
     "admin": [
         "stale_orders", "overdue_undeposited", "deposits", "returns",
-        "expiring_batches", "low_stock", "stale_crons", "ms_anomalies",
+        "low_stock", "stale_crons", "ms_anomalies",
     ],
     "boss": [
         "stale_orders", "overdue_undeposited", "deposits", "returns",
-        "expiring_batches", "low_stock", "stale_crons", "ms_anomalies",
+        "low_stock", "stale_crons", "ms_anomalies",
     ],
     "bookkeeper": ["deposits"],
-    "warehouse_keeper": ["returns", "expiring_batches", "low_stock"],
+    "warehouse_keeper": ["returns", "low_stock"],
 }
 
 _PING_SECTION_LABELS: dict[str, str] = {
@@ -328,7 +314,6 @@ _PING_SECTION_LABELS: dict[str, str] = {
     "overdue_undeposited": "🚨 Деньги не сданы",
     "deposits": "💵 Сдачи на подтверждении",
     "returns": "↩️ Возвраты на подтверждении",
-    "expiring_batches": "⌛ Истекают партии",
     "low_stock": "📉 Низкий остаток",
     "stale_crons": "🛑 Cron не отчитались",
     "ms_anomalies": "🔄 Рассинхрон с МС",

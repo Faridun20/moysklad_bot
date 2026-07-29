@@ -369,7 +369,6 @@ def _create_tables():
                 quantity             REAL NOT NULL DEFAULT 1,
                 unit                 TEXT DEFAULT 'шт',
                 price_cents          BIGINT NOT NULL DEFAULT 0,
-                batch_id             TEXT,
                 returned_qty         REAL NOT NULL DEFAULT 0,
                 note                 TEXT
             )""",
@@ -511,18 +510,6 @@ def _create_tables():
                 order_item_id BIGINT NOT NULL,
                 qty           REAL NOT NULL,
                 amount_cents  BIGINT NOT NULL
-            )""",
-            # Партии товара (FEFO). Используется только если МойСклад
-            # поддерживает партии для товара; иначе order_items.batch_id NULL.
-            """CREATE TABLE IF NOT EXISTS product_batches (
-                id                TEXT PRIMARY KEY,
-                product_id        TEXT NOT NULL,
-                moysklad_batch_id TEXT,
-                batch_code        TEXT,
-                expiry_date       TEXT,
-                qty_remaining     REAL NOT NULL DEFAULT 0,
-                received_at       TEXT,
-                updated_at        TEXT
             )""",
             # Журнал изменений заказа (before/after/summary как JSON-текст).
             f"""CREATE TABLE IF NOT EXISTS order_change_log (
@@ -687,7 +674,6 @@ def _create_indexes():
             "CREATE INDEX IF NOT EXISTS idx_cash_deposits_pending ON cash_deposits(status, deposited_at)",
             "CREATE INDEX IF NOT EXISTS idx_returns_order ON returns(order_id)",
             "CREATE INDEX IF NOT EXISTS idx_returns_status ON returns(status)",
-            "CREATE INDEX IF NOT EXISTS idx_batches_product_expiry ON product_batches(product_id, expiry_date)",
             "CREATE INDEX IF NOT EXISTS idx_change_log_order ON order_change_log(order_id, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_failed_notif_unresolved ON failed_notifications(is_critical, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_credit_limits_updated_at ON credit_limits(updated_at)",
@@ -2329,113 +2315,6 @@ async def get_overdue_undeposited_orders(days: int = 2) -> list[dict]:
     )
 
 
-# ─── IMPLEMENTATION.md Фаза 5: возвраты + FEFO/партии ─────────────────────────
-
-
-def upsert_product_batch(
-    product_id: str,
-    moysklad_batch_id: str | None,
-    batch_code: str,
-    expiry_date: str | None,
-    qty_remaining: float,
-) -> str:
-    """UPSERT партии по moysklad_batch_id (натуральный ключ из МС). Возвращает
-    id строки (uuid). Используется синком партий (§9.1)."""
-    import uuid as _uuid
-
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        existing = None
-        if moysklad_batch_id:
-            cur.execute(
-                q("SELECT id FROM product_batches WHERE moysklad_batch_id = ?"),
-                (moysklad_batch_id,),
-            )
-            row = cur.fetchone()
-            existing = (row["id"] if USE_POSTGRES else row[0]) if row else None
-        if existing:
-            cur.execute(
-                q(
-                    "UPDATE product_batches SET product_id = ?, batch_code = ?, "
-                    "expiry_date = ?, qty_remaining = ?, updated_at = ? WHERE id = ?"
-                ),
-                (product_id, batch_code, expiry_date, qty_remaining, now_str(), existing),
-            )
-            conn.commit()
-            return existing
-        bid = _uuid.uuid4().hex
-        cur.execute(
-            q(
-                "INSERT INTO product_batches (id, product_id, moysklad_batch_id, batch_code, "
-                "expiry_date, qty_remaining, received_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-            ),
-            (
-                bid,
-                product_id,
-                moysklad_batch_id,
-                batch_code,
-                expiry_date,
-                qty_remaining,
-                now_str(),
-                now_str(),
-            ),
-        )
-        conn.commit()
-        return bid
-
-
-def select_batches_fefo(product_id: str, qty: float) -> list[dict]:
-    """FEFO-резерв: вернуть [{batch_id, take}] из партий с ближайшим expiry
-    (§6.2.5). NULL-expiry — в конец (берём после датированных)."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "SELECT id, expiry_date, qty_remaining FROM product_batches "
-                "WHERE product_id = ? AND qty_remaining > 0 "
-                "ORDER BY (expiry_date IS NULL), expiry_date ASC"
-            ),
-            (product_id,),
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-    out = []
-    left = qty
-    for r in rows:
-        if left <= 0:
-            break
-        take = min(float(r["qty_remaining"]), left)
-        if take > 0:
-            out.append({"batch_id": r["id"], "take": round(take, 3)})
-            left -= take
-    return out
-
-
-def _adjust_batch_qty(batch_id: str, delta: float) -> None:
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "UPDATE product_batches SET qty_remaining = qty_remaining + ?, updated_at = ? "
-                "WHERE id = ?"
-            ),
-            (delta, now_str(), batch_id),
-        )
-        conn.commit()
-
-
-async def get_batches_expiring_within(days: int = 7) -> list[dict]:
-    """Партии с остатком, истекающие в ближайшие `days` дней (§9.4).
-    asyncpg Stage 8 (#21): cutoff в Python, параметром."""
-    from datetime import timedelta
-
-    cutoff = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
-    return await adb_core.fetch(
-        "SELECT * FROM product_batches WHERE qty_remaining > 0 "
-        "AND expiry_date IS NOT NULL AND expiry_date <= $1 ORDER BY expiry_date ASC",
-        cutoff,
-    )
-
-
 class _TxnAbort(Exception):
     """Внутренний сигнал отката adb_core.transaction() с user-facing сообщением.
 
@@ -2580,9 +2459,9 @@ async def mark_return_goods_received(return_id: int, by: int) -> dict:
 
 async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str = "") -> dict:
     """Подтвердить возврат: returned_qty += по позициям, статус заказа
-    (returned|partially_returned), восстановление остатков по партиям FEFO,
-    обработка refund (cash → отрицательная сдача; debt_reduction/no_refund —
-    учёт в долге). Возвращает {ok, order_status}.
+    (returned|partially_returned), обработка refund (cash → отрицательная
+    сдача; debt_reduction/no_refund — учёт в долге).
+    Возвращает {ok, order_status}.
 
     asyncpg Stage 14 (#21): native async. Транзакционные границы сохранены как в
     sync-версии — критическая секция (confirm + overshoot-guard) одна транзакция
@@ -2684,14 +2563,6 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
             # подтверждённые возвраты в get_agent_current_debt).
     except _TxnAbort as e:
         return {"ok": False, "error": e.message}
-
-    # Восстановление остатков по партиям — после атомарной секции (склад, не деньги).
-    for ri in ritems:
-        batch_id = await adb_core.fetchval(
-            "SELECT batch_id FROM order_items WHERE id = $1", ri["order_item_id"]
-        )
-        if batch_id:
-            await asyncio.to_thread(_adjust_batch_qty, batch_id, float(ri["qty"]))
 
     # Частичный возврат мог обнулить остаток к оплате (платежи уже покрыли
     # total − возврат) → закрываем заказ. Полный возврат (status='returned') —

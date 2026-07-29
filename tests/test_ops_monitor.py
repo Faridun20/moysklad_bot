@@ -11,7 +11,6 @@ from tasks.run_ops_monitor import (
     assemble_digest,
     build_cron_health_block,
     build_digest_keyboard,
-    build_expiring_batches_block,
     build_ms_sync_block,
     build_overdue_undeposited_block,
     build_pending_deposits_block,
@@ -42,7 +41,6 @@ def test_blocks_return_none_when_empty():
     assert build_pending_deposits_block([]) is None
     assert build_pending_returns_block([]) is None
     assert build_overdue_undeposited_block([], 2) is None
-    assert build_expiring_batches_block([], 7) is None
 
 
 def test_stale_block_counts_and_truncates():

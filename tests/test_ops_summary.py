@@ -18,7 +18,6 @@ _SECTION_KEYS = (
     "overdue_undeposited",
     "deposits",
     "returns",
-    "expiring_batches",
     "low_stock",
     "stale_crons",
     "ms_anomalies",

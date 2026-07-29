@@ -22,7 +22,6 @@ _NEW_TABLES = {
     "cash_deposit_orders",
     "returns",
     "return_items",
-    "product_batches",
     "order_change_log",
     "failed_notifications",
     "audit_archive_exports",
