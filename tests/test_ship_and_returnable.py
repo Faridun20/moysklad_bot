@@ -38,12 +38,30 @@ def test_mark_order_shipped_only_from_approved(isolated_db):
 
 
 def test_returnable_includes_legacy_paid(isolated_db):
-    """Заказ в статусе approved, но оплаченный (paid_confirmed_at) — возвратопригоден."""
+    """Заказ в статусе approved, но оплаченный (paid_confirmed_at) — возвратопригоден.
+
+    Публичная обёртка is_order_returnable удалена в T1.7 (ноль вызовов вне
+    тестов); предикат _is_returnable живёт внутри create_return, поэтому
+    проверяем его через живой путь: до оплаты возврат отклоняется, после —
+    проходит."""
     db = isolated_db
     oid = db.create_order(1, "M", "")
     db.add_order_item(oid, "T", "", 1, "шт", 100.0)
     db.update_order_status(oid, "approved")
-    assert asyncio.run(db.is_order_returnable(oid)) is False  # approved + не оплачен
+    items = asyncio.run(db.get_order_items(oid))
+
+    # approved + не оплачен → создать возврат нельзя.
+    denied = asyncio.run(
+        db.create_return(
+            oid,
+            "full",
+            "брак",
+            [(items[0]["id"], 1, 100.0)],
+            refund_method="no_refund",
+            created_by=1,
+        )
+    )
+    assert denied["ok"] is False
 
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)
@@ -52,9 +70,7 @@ def test_returnable_includes_legacy_paid(isolated_db):
             (db.now_str(), oid),
         )
         conn.commit()
-    assert asyncio.run(db.is_order_returnable(oid)) is True  # оплачен → можно вернуть
 
-    items = asyncio.run(db.get_order_items(oid))
     r = asyncio.run(
         db.create_return(
             oid,

@@ -522,46 +522,6 @@ def _create_tables():
                 summary         TEXT,
                 created_at      TEXT
             )""",
-            # Недоставленные уведомления (для retry-крона). channel: telegram|email|sms.
-            f"""CREATE TABLE IF NOT EXISTS failed_notifications (
-                id                {id_type},
-                user_id           BIGINT NOT NULL,
-                notification_type TEXT NOT NULL,
-                channel           TEXT NOT NULL,
-                payload           TEXT NOT NULL,
-                attempts          INTEGER NOT NULL DEFAULT 0,
-                last_attempt_at   TEXT,
-                last_error        TEXT,
-                is_critical       INTEGER NOT NULL DEFAULT 0,
-                resolved_at       TEXT,
-                resolved_by       BIGINT,
-                created_at        TEXT
-            )""",
-            # Журнал выгрузок audit_log в Google Drive (интеграция — позже).
-            f"""CREATE TABLE IF NOT EXISTS audit_archive_exports (
-                id              {id_type},
-                period_start    TEXT NOT NULL,
-                period_end      TEXT NOT NULL,
-                file_name       TEXT NOT NULL,
-                drive_file_id   TEXT NOT NULL,
-                drive_file_url  TEXT NOT NULL,
-                records_count   INTEGER NOT NULL,
-                file_size_bytes BIGINT NOT NULL,
-                exported_at     TEXT,
-                exported_by     BIGINT
-            )""",
-            # Контакты клиента для уведомлений (opt-in).
-            """CREATE TABLE IF NOT EXISTS client_contacts (
-                agent_id              TEXT PRIMARY KEY,
-                telegram_chat_id      BIGINT,
-                email                 TEXT,
-                phone                 TEXT,
-                notifications_opted_in INTEGER NOT NULL DEFAULT 0,
-                opted_in_at           TEXT,
-                opted_in_by           BIGINT,
-                created_at            TEXT,
-                updated_at            TEXT
-            )""",
             # Ключи идемпотентности для мутаций (result как JSON-текст).
             """CREATE TABLE IF NOT EXISTS idempotency_keys (
                 key        TEXT PRIMARY KEY,
@@ -659,7 +619,6 @@ def _create_indexes():
             "CREATE INDEX IF NOT EXISTS idx_returns_order ON returns(order_id)",
             "CREATE INDEX IF NOT EXISTS idx_returns_status ON returns(status)",
             "CREATE INDEX IF NOT EXISTS idx_change_log_order ON order_change_log(order_id, created_at)",
-            "CREATE INDEX IF NOT EXISTS idx_failed_notif_unresolved ON failed_notifications(is_critical, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_credit_limits_updated_at ON credit_limits(updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_idempotency_expires ON idempotency_keys(expires_at)",
             "CREATE INDEX IF NOT EXISTS idx_cron_runs_task_started ON cron_runs(task_name, started_at)",
@@ -2321,16 +2280,6 @@ def _is_returnable(order: dict) -> bool:
     return bool(order.get("paid_confirmed_at"))
 
 
-async def is_order_returnable(order_id: int) -> bool:
-    """Публичная проверка для бот/webapp-прехеков (та же логика, что в create_return).
-
-    asyncpg #21: native async (get_order тоже async)."""
-    order = await get_order(order_id)
-    if order is None:
-        return False
-    return _is_returnable(order)
-
-
 async def create_return(
     order_id: int,
     return_type: str,
@@ -2922,35 +2871,6 @@ async def get_moysklad_employee_id(user_id: int) -> str | None:
     return await adb_core.fetchval(
         "SELECT moysklad_employee_id FROM user_roles WHERE user_id = $1", user_id
     )
-
-
-async def get_unsynced_managers() -> list[dict]:
-    """Менеджеры без привязки к МойСклад. asyncpg Stage 8 (#21)."""
-    return await adb_core.fetch(
-        "SELECT * FROM user_roles WHERE role = 'manager' "
-        "AND (moysklad_employee_id IS NULL OR ms_sync_status = 'pending')"
-    )
-
-
-def remove_user(user_id: int, removed_by: int | None = None, removed_name: str = "") -> bool:
-    users = get_all_users()
-    target = next((u for u in users if u["user_id"] == user_id), None)
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q("DELETE FROM user_roles WHERE user_id = ?"), (user_id,))
-        deleted = cur.rowcount > 0
-        conn.commit()
-    if deleted:
-        _invalidate_role_cache(user_id)
-    if deleted and removed_by and target:
-        add_audit_log(
-            removed_by,
-            removed_name,
-            get_role(removed_by),
-            "user_removed",
-            f"Удалён {target['full_name']} (ID: {user_id}, роль: {target['role']})",
-        )
-    return deleted
 
 
 # ─── Платежи ─────────────────────────────────────────────────────────────────
@@ -4426,25 +4346,6 @@ async def reject_payment(
     return updated
 
 
-async def archive_payment(payment_id: int, archived_by: int, archived_name: str) -> bool:
-    """asyncpg Stage 15 (#21): native async; get_payment/add_audit_log/get_role
-    (sync money-core) — мост через to_thread."""
-    rc = await adb_core.execute("UPDATE payments SET status = 'archived' WHERE id = $1", payment_id)
-    updated = rc > 0
-    if updated:
-        payment = await get_payment(payment_id)
-        if payment:
-            await asyncio.to_thread(
-                add_audit_log,
-                archived_by,
-                archived_name,
-                await asyncio.to_thread(get_role, archived_by),
-                "payment_archived",
-                f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
-            )
-    return updated
-
-
 async def get_payment(payment_id: int) -> dict | None:
     """asyncpg Stage 19 (#21): native async (fetchrow). Денежное ядро (confirm/
     link/reject/archive_payment) уже async и зовёт это через await."""
@@ -5134,109 +5035,6 @@ async def reject_all_pending_payments_for_order(
     return n
 
 
-async def confirm_payment_received(
-    order_id: int,
-    confirmed_by: int,
-    confirmed_by_name: str,
-) -> bool:
-    """Босс подтверждает что деньги по заказу реально пришли в кассу.
-
-    Возможно только если менеджер до этого уже отметил paid_at
-    (нельзя подтвердить то, чего ещё нет). Идемпотентно: повторный
-    вызов на уже подтверждённый заказ возвращает False.
-
-    asyncpg Stage 15 (#21): native async; get_order/add_audit_log/get_role
-    (sync money-core) — мост через to_thread.
-    """
-    rc = await adb_core.execute(
-        "UPDATE orders "
-        "SET paid_confirmed_at = $1, paid_confirmed_by = $2, "
-        "    paid_confirmed_by_name = $3, updated_at = $4 "
-        "WHERE id = $5 AND paid_at IS NOT NULL "
-        "AND paid_confirmed_at IS NULL",
-        now_str(),
-        confirmed_by,
-        confirmed_by_name,
-        now_str(),
-        order_id,
-    )
-    updated = rc > 0
-    if updated:
-        order = await get_order(order_id)
-        details = (
-            f"Получение денег по заказу #{order_id} подтверждено "
-            f"(клиент: {order.get('agent_name') or '—'}, "
-            f"менеджер: {order.get('full_name') or '—'})"
-            if order
-            else f"Получение денег по #{order_id} подтверждено"
-        )
-        await asyncio.to_thread(
-            add_audit_log,
-            confirmed_by,
-            confirmed_by_name,
-            await asyncio.to_thread(get_role, confirmed_by),
-            "payment_confirmed",
-            details,
-        )
-    return updated
-
-
-async def reject_payment_received(
-    order_id: int,
-    rejected_by: int,
-    rejected_by_name: str,
-) -> bool:
-    """Босс отклоняет: «нет, денег не вижу». Сбрасываем paid_at в NULL,
-    цикл начинается заново — менеджер должен снова отметить когда деньги
-    реально появятся, и подтвердить заново.
-
-    Срабатывает только на «висящих» подтверждениях (paid_at стоит,
-    paid_confirmed_at пуст). На уже подтверждённый — игнор.
-
-    asyncpg Stage 15 (#21): native async; get_order/add_audit_log/get_role
-    (sync money-core) — мост через to_thread.
-    """
-    rc = await adb_core.execute(
-        "UPDATE orders "
-        "SET paid_at = NULL, updated_at = $1 "
-        "WHERE id = $2 AND paid_at IS NOT NULL "
-        "AND paid_confirmed_at IS NULL",
-        now_str(),
-        order_id,
-    )
-    updated = rc > 0
-    if updated:
-        order = await get_order(order_id)
-        details = (
-            f"Подтверждение оплаты #{order_id} отклонено "
-            f"(клиент: {order.get('agent_name') or '—'}, "
-            f"менеджер: {order.get('full_name') or '—'})"
-            if order
-            else f"Подтверждение #{order_id} отклонено"
-        )
-        await asyncio.to_thread(
-            add_audit_log,
-            rejected_by,
-            rejected_by_name,
-            await asyncio.to_thread(get_role, rejected_by),
-            "payment_rejected_received",
-            details,
-        )
-    return updated
-
-
-async def get_pending_confirmations(user_id: int | None = None) -> list[dict]:
-    """Заказы, где менеджер отметил оплату, но босс ещё не подтвердил.
-    user_id фильтрует по автору. asyncpg Stage 8 (#21)."""
-    query = "SELECT * FROM orders WHERE paid_at IS NOT NULL AND paid_confirmed_at IS NULL"
-    params: list = []
-    if user_id is not None:
-        params.append(user_id)
-        query += f" AND user_id = ${len(params)}"
-    query += " ORDER BY paid_at ASC, id ASC"
-    return await adb_core.fetch(query, *params)
-
-
 async def get_open_debts(
     user_id: int | None = None,
     due_through: str | None = None,
@@ -5578,20 +5376,8 @@ def _load_predefined_users():
             MANAGER_IDS = __import__("config").MANAGER_IDS
         except Exception:
             MANAGER_IDS = []
-        try:
-            PREDEFINED_USERS = __import__("config").PREDEFINED_USERS
-        except Exception:
-            PREDEFINED_USERS = []
-
         with get_conn() as conn:
             cur = get_cursor(conn)
-            for u in PREDEFINED_USERS:
-                cur.execute(
-                    q(
-                        "INSERT INTO user_roles (user_id, username, full_name, role, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO NOTHING"
-                    ),
-                    (u["user_id"], "", u.get("full_name", ""), u["role"], now_str()),
-                )
             for uid in ADMIN_IDS:
                 cur.execute(
                     q(
