@@ -276,9 +276,6 @@ def _create_tables():
                 role                 TEXT NOT NULL DEFAULT 'manager',
                 moysklad_employee_id TEXT,
                 ms_sync_status       TEXT DEFAULT 'pending',
-                active               INTEGER NOT NULL DEFAULT 1,
-                email                TEXT,
-                phone                TEXT,
                 deactivated_at       TEXT,
                 deactivated_by       BIGINT,
                 created_at           TEXT
@@ -341,10 +338,6 @@ def _create_tables():
                 paid_confirmed_by_name   TEXT,
                 payment_confirmed        INTEGER NOT NULL DEFAULT 0,
                 payment_confirmed_at     TEXT,
-                client_notification_sent INTEGER NOT NULL DEFAULT 0,
-                price_check_warnings     TEXT,
-                approved_by              BIGINT,
-                approved_at              TEXT,
                 rejection_comment        TEXT,
                 rejection_count          INTEGER NOT NULL DEFAULT 0,
                 frozen                   INTEGER NOT NULL DEFAULT 0,
@@ -379,9 +372,6 @@ def _create_tables():
                 unit                 TEXT DEFAULT 'шт',
                 price                REAL DEFAULT 0,
                 price_cents          BIGINT,
-                price_at_submit      REAL,
-                price_at_submit_cents BIGINT,
-                stock_snap           REAL,
                 batch_id             TEXT,
                 returned_qty         REAL NOT NULL DEFAULT 0,
                 note                 TEXT
@@ -809,7 +799,6 @@ def run_backfills():
         _money_cols = [
             ("payments", "amount", "amount_cents"),
             ("order_items", "price", "price_cents"),
-            ("order_items", "price_at_submit", "price_at_submit_cents"),
             ("credit_limits", "limit_amount", "limit_amount_cents"),
             ("cash_deposits", "amount", "amount_cents"),
             ("cash_deposit_orders", "amount_allocated", "amount_allocated_cents"),

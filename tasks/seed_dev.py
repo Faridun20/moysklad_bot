@@ -95,15 +95,13 @@ def main() -> int:
                 "INSERT INTO orders (user_id, full_name, status, comment, agent_id, "
                 "agent_name, currency, payment_type, due_date, payment_confirmed, "
                 "payment_confirmed_at, paid_confirmed_at, shipped_at, shipped_by, "
-                "approved_at, approved_by, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     user_id, full_name, status, f"{SEED_MARK} demo",
                     f"agent-{agent_name}", agent_name, currency, payment_type, due_date,
                     1 if paid else 0,
                     paid_at, paid_at, shipped_at, (dev_uid if shipped else None),
-                    (_ts(created_offset) if status != "draft" else None),
-                    (dev_uid if status != "draft" else None),
                     _ts(created_offset), _ts(created_offset),
                 ),
             )

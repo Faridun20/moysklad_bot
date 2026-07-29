@@ -68,6 +68,21 @@ FOLDED_COLUMNS = {
     "ms_counterparties": {"balance_cents"},
 }
 
+# T1.2 — колонки-призраки: объявлены миграцией, но нигде не читались и не
+# писались. Проверка таблично-адресная: approved_by/approved_at у
+# shipment_requests — живые (их пишет approve_shipment_request), убирали
+# только одноимённую пару у orders.
+GHOST_COLUMNS = {
+    "orders": {
+        "approved_by",
+        "approved_at",
+        "price_check_warnings",
+        "client_notification_sent",
+    },
+    "order_items": {"stock_snap", "price_at_submit", "price_at_submit_cents"},
+    "user_roles": {"active", "email", "phone"},
+}
+
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
@@ -90,6 +105,21 @@ def test_init_db_creates_full_schema_in_one_pass(isolated_db, table, expected):
         f"{table}: init_db() не создал колонки {sorted(missing)} — "
         f"добавь их в определение таблицы в _create_tables, НЕ через ALTER"
     )
+
+
+@pytest.mark.parametrize("table,ghosts", sorted(GHOST_COLUMNS.items()))
+def test_ghost_columns_removed(isolated_db, table, ghosts):
+    """Колонок-призраков в схеме нет."""
+    actual = _columns(isolated_db.DB_PATH, table)
+    assert actual, f"таблица {table} не создана init_db()"
+    still_there = ghosts & actual
+    assert not still_there, f"{table}: колонки-призраки вернулись: {sorted(still_there)}"
+
+
+def test_shipment_requests_keeps_its_approval_columns(isolated_db):
+    """Страховка от переусердствования: у shipment_requests пара живая."""
+    actual = _columns(isolated_db.DB_PATH, "shipment_requests")
+    assert {"approved_by", "approved_by_name", "approved_at"} <= actual
 
 
 def test_no_alter_table_anywhere_in_project():

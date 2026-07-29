@@ -64,7 +64,9 @@ def test_new_user_roles_columns_present(isolated_db):
         cur = db.get_cursor(conn)
         cur.execute("PRAGMA table_info(user_roles)")
         cols = {r[1] for r in cur.fetchall()}
-    assert {"active", "email", "phone", "deactivated_at"} <= cols
+    # active/email/phone удалены в T1.2 как призраки (ни read, ни write).
+    # Деактивация живёт в deactivated_at/_by — их и проверяем.
+    assert {"deactivated_at", "deactivated_by"} <= cols
 
 
 # ─── app_settings ────────────────────────────────────────────────────────────
