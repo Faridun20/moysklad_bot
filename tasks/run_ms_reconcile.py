@@ -57,7 +57,13 @@ async def main() -> int:
 
     # Cap concurrency к МС. Семафор создаётся внутри main → привязан к текущему
     # loop'у (cron делает один asyncio.run), cross-loop проблемы нет.
-    sem = asyncio.Semaphore(8)
+    #
+    # MS-2: берём общий предел из moysklad (4) вместо локальной восьмёрки —
+    # лимит параллельности у МойСклад 5 на пользователя, а cron бежит
+    # одновременно с ботом и webapp поверх одного аккаунта.
+    from services.moysklad import _MS_PARALLEL_LIMIT
+
+    sem = asyncio.Semaphore(_MS_PARALLEL_LIMIT)
     stats = {"checked": 0, "flagged": 0, "errors": 0}
 
     async def _check_co(order: dict) -> None:
