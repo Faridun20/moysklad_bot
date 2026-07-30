@@ -375,3 +375,45 @@ def test_archived_machines_hidden_from_default_list(isolated_db):
     _run(machines.set_status(mid, "archived", user_id=2))
     assert _run(machines.list_machines(role="boss")) == []
     assert len(_run(machines.list_machines(role="boss", status="archived"))) == 1
+
+
+# ─── Крон архивации (T4.3) ────────────────────────────────────────────────────
+
+
+def test_archive_cli_reads_setting_and_reports(isolated_db, monkeypatch):
+    """CLI берёт порог из app_settings и не падает на кривом значении —
+    настройку правит человек, а молча не архивировать хуже, чем взять дефолт."""
+    from tasks import run_machines_archive
+
+    db = isolated_db
+    _setup_roles(db)
+    monkeypatch.setattr(run_machines_archive, "init_db", lambda: None)
+
+    captured = {}
+
+    async def _fake_archive(days=90):
+        captured["days"] = days
+        return 3
+
+    monkeypatch.setattr(run_machines_archive, "archive_sold_machines", _fake_archive)
+    monkeypatch.setattr(run_machines_archive, "get_setting", lambda *_a: 30)
+    assert run_machines_archive.main() == 0
+    assert captured["days"] == 30
+
+    monkeypatch.setattr(run_machines_archive, "get_setting", lambda *_a: "каждый вторник")
+    assert run_machines_archive.main() == 0
+    assert captured["days"] == 90  # дефолт вместо мусора
+
+
+def test_archive_cli_returns_nonzero_on_failure(isolated_db, monkeypatch):
+    """Cron-раннер должен увидеть провал: молчаливый успех спрячет поломку."""
+    from tasks import run_machines_archive
+
+    monkeypatch.setattr(run_machines_archive, "init_db", lambda: None)
+    monkeypatch.setattr(run_machines_archive, "get_setting", lambda *_a: 90)
+
+    async def _boom(days=90):
+        raise RuntimeError("БД недоступна")
+
+    monkeypatch.setattr(run_machines_archive, "archive_sold_machines", _boom)
+    assert run_machines_archive.main() == 1

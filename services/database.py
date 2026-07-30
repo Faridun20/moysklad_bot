@@ -857,6 +857,7 @@ _DEFAULT_SETTINGS: dict[str, tuple] = {
     "return_deadline_days": (90, "Лимит на оформление возврата (дней с отгрузки)"),
     "auto_create_demand_on_approve": (True, "Создавать demand в МойСклад при approve"),
     "auto_ship_on_approve": (True, "Авто-переход в shipped сразу после approve"),
+    "machines_archive_days": (90, "Через сколько дней проданная техника уходит в архив"),
 }
 
 
