@@ -3035,63 +3035,34 @@ async def api_submit_order(request: Request):
     order = await adb.get_order(order_id)
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
-    # Idempotency: двойной сабмит мог создать две shipment_request до того, как
-    # статус заказа уйдёт из draft. Кэшируем финальный {req_id}.
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"order_submit:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
-    from services.order_workflow import validate_transition
-
-    err = validate_transition(order, "pending")
-    if err:
-        raise HTTPException(status_code=400, detail=err)
-    if order.get("frozen"):
-        raise HTTPException(
-            status_code=409,
-            detail="Заказ заморожен после серии отклонений — обратитесь к администратору",
-        )
-
-    items = await adb.get_order_items(order_id)
-    if not items:
-        raise HTTPException(status_code=400, detail="Добавьте товары")
-    if not order.get("agent_name"):
-        raise HTTPException(status_code=400, detail="Выберите клиента")
-
-    # ─── Тип оплаты ─────────────────────────────────────────────
-    # payment_type: 'paid' (по умолчанию, оплачено сразу) или 'credit'.
-    # Для credit обязателен due_date в формате YYYY-MM-DD и не раньше
-    # сегодняшнего дня (нельзя задать долг с прошедшей датой).
-    payment_type = (data.get("payment_type") or "paid").lower()
-    due_date = (data.get("due_date") or "").strip() or None
-    if payment_type not in ("paid", "credit"):
-        raise HTTPException(status_code=400, detail="Неверный тип оплаты")
-    if payment_type == "credit":
-        if not due_date:
-            raise HTTPException(status_code=400, detail="Укажите дату возврата долга")
-        try:
-            from datetime import date
-
-            parsed = date.fromisoformat(due_date)
-            if parsed < date.today():
-                raise HTTPException(
-                    status_code=400,
-                    detail="Дата возврата не может быть в прошлом",
-                )
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Неверный формат даты (нужно YYYY-MM-DD)")
-    # Фиксируем на заказе ДО создания shipment_request, чтобы апрув
-    # босса видел уже актуальный тип оплаты.
-    await adb.set_order_payment(order_id, payment_type, due_date)
-    # Перечитаем — нужно для уведомления
-    order = await adb.get_order(order_id)
 
     full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
-    req_id = await adb.create_shipment_request(order_id, user["id"], full_name)
-    await adb.update_order_status(order_id, "pending")
+
+    # T2.3: весь сабмит — в одной транзакции внутри order_workflow.submit_order
+    # (CAS на draft, тип оплаты, submitted_at, вставка заявки). Здесь остаются
+    # только HTTP-специфика: коды ответов и уведомления.
+    from services.order_workflow import submit_order
+
+    idem_key = data.get("idempotency_key")
+    res = await submit_order(
+        order_id,
+        user["id"],
+        full_name,
+        payment_type=data.get("payment_type"),
+        due_date=data.get("due_date"),
+        idem_key=f"order_submit:{user['id']}:{idem_key}" if idem_key else None,
+    )
+    if not res.get("ok"):
+        # 409 — состояние заказа (уже отправлен / заморожен), 400 — данные.
+        detail = res.get("error") or "Не удалось отправить заявку"
+        conflict = res.get("status") is not None or "уже отправлен" in detail or "заморожен" in detail
+        raise HTTPException(status_code=409 if conflict else 400, detail=detail)
+
+    req_id = res["req_id"]
+    order = await adb.get_order(order_id)  # перечитываем: нужен для уведомления
+    items = await adb.get_order_items(order_id)
     await adb.add_audit_log(
         user["id"],
         full_name,
@@ -3118,10 +3089,7 @@ async def api_submit_order(request: Request):
     for uid in await aget_notify_recipients():
         await tg_send_message(uid, notify_text, reply_markup=keyboard)
 
-    resp = {"req_id": req_id}
-    if idem_key:
-        _idem_set(f"order_submit:{user['id']}:{idem_key}", resp)
-    return JSONResponse(resp)
+    return JSONResponse({"req_id": req_id})
 
 
 @app.post("/api/agents")
