@@ -195,13 +195,14 @@ def test_concurrency_stays_within_documented_limit():
     assert ms._HTTP_CONCURRENCY <= 20
 
 
-def test_reconcile_uses_the_same_limit():
-    """Cron бежит одновременно с ботом поверх того же аккаунта — своей
-    восьмёрки у него быть не должно."""
+def test_reconcile_spends_no_parallelism_at_all():
+    """Cron бежит одновременно с ботом поверх того же аккаунта. После MS-4 он
+    спрашивает МС батчами, поэтому своего семафора у него быть не должно
+    вовсе — ни на 8, ни на сколько-то ещё."""
     import inspect
 
     from tasks import run_ms_reconcile
 
-    src = inspect.getsource(run_ms_reconcile.main)
-    assert "_MS_PARALLEL_LIMIT" in src
-    assert "Semaphore(8)" not in src
+    src = inspect.getsource(run_ms_reconcile)
+    assert "Semaphore" not in src
+    assert "_alive_ids" in src
