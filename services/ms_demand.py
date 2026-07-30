@@ -261,6 +261,11 @@ async def create_demand_from_request(
         return {
             "ok": False,
             "reason": f"Не удалось разобрать ни одной позиции (skipped: {skipped})",
+            # T2.12: skipped обязан ехать В РЕЗУЛЬТАТЕ, а не только в тексте
+            # reason. order_workflow собирает его из result и показывает боссу
+            # список позиций, не попавших в МойСклад; из строки reason он их
+            # не достанет (§2.16).
+            "skipped": skipped,
         }
 
     agent_href = f"{MS_BASE}/entity/counterparty/{order['agent_id']}"
@@ -347,6 +352,7 @@ async def create_demand_from_request(
                 return {
                     "ok": False,
                     "reason": f"HTTP {resp.status}: {safe}",
+                    "skipped": skipped,  # T2.12: не теряем список непрошедших позиций
                 }
             import json
 
@@ -364,7 +370,7 @@ async def create_demand_from_request(
         logger.exception("create demand failed")
         # Только имя класса в user-facing reason — текст исключения (репр
         # aiohttp-ошибки может включать host/URL) остаётся в logger.exception.
-        return {"ok": False, "reason": type(e).__name__}
+        return {"ok": False, "reason": type(e).__name__, "skipped": skipped}
 
 
 def _build_description(order: dict, telegram_full_name: str) -> str:

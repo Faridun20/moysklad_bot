@@ -103,8 +103,13 @@ class RateLimitMiddleware(BaseMiddleware):
                 elif isinstance(event, Message):
                     try:
                         await event.answer("⏳ Слишком много сообщений — подождите минуту.")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # Не молчим: если предупреждения о лимите не доходят,
+                        # юзер видит «бот не отвечает» без объяснений (§2.16).
+                        logger.warning(
+                            "Не удалось предупредить user_id=%s о рейт-лимите: %s",
+                            user.id, e,
+                        )
                 return
         return await handler(event, data)
 
@@ -138,8 +143,8 @@ async def set_global_menu_button(bot: Bot) -> None:
         try:
             await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
             logger.info("Global Menu Button сброшен (WEBAPP_URL пуст)")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Не удалось сбросить Menu Button: %s", e)
 
 
 def register_routers(dp: Dispatcher):
@@ -255,8 +260,10 @@ async def _shutdown(tasks: list[asyncio.Task]) -> None:
             from webapp import server as webapp_server
 
             await webapp_server.close_notify_bot()
-        except Exception:
-            pass
+        except Exception as e:
+            # Шатдаун: не роняем процесс, но незакрытая сессия — утечка
+            # сокета, о ней надо знать (§2.16).
+            logger.warning("Не удалось закрыть notify-bot webapp: %s", e)
 
 
 def _build_fsm_storage():
@@ -383,8 +390,10 @@ async def _run_webapp_only():
         if bot is not None:
             try:
                 await bot.delete_webhook(drop_pending_updates=False)
-            except Exception:
-                pass
+            except Exception as e:
+                # Шатдаун: процесс не роняем, но неснятый webhook означает, что
+                # Telegram продолжит слать апдейты в мёртвый URL (§2.16).
+                logger.warning("Не удалось снять webhook при остановке: %s", e)
         await close_session()
         await close_tg_session()
         await webapp_server.close_notify_bot()
