@@ -53,7 +53,6 @@ def run() -> None:
 
     _h("Подготовка схемы")
     db._create_tables()
-    db.run_migrations()
     db._create_indexes()
     db.run_backfills()
     db.set_role(MGR, "smoke_mgr", "SMOKE Manager", "manager")

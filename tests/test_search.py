@@ -60,19 +60,6 @@ def test_search_orders_user_scope(isolated_db):
     assert {mine, other} <= {o["id"] for o in res_all}
 
 
-def test_search_orders_excludes_soft_deleted(isolated_db):
-    db = isolated_db
-    db.set_role(100, "m", "M", "manager")
-    oid = _mk_order(db, 100, agent_name="УдалённыйКлиент")
-    # Помечаем удалённым
-    with db.get_conn() as conn:
-        cur = db.get_cursor(conn)
-        cur.execute(db.q("UPDATE orders SET deleted_at = ? WHERE id = ?"), (db.now_str(), oid))
-        conn.commit()
-    res = db.search_orders("удалённыйклиент")
-    assert all(o["id"] != oid for o in res)
-
-
 def test_search_orders_escapes_like_metachars(isolated_db):
     """% и _ в query не должны работать как wildcard."""
     db = isolated_db

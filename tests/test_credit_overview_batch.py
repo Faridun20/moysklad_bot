@@ -33,10 +33,10 @@ def _confirmed_return(db, oid, amount, mgr=900):
         cur = db.get_cursor(conn)
         cur.execute(
             db.q(
-                "INSERT INTO returns (order_id, return_type, reason, total_amount, "
+                "INSERT INTO returns (order_id, return_type, reason, total_amount_cents, "
                 "created_by, status, created_at) VALUES (?, ?, ?, ?, ?, 'confirmed', ?)"
             ),
-            (oid, "partial", "брак", amount, mgr, db.now_str()),
+            (oid, "partial", "брак", int(round(amount * 100)), mgr, db.now_str()),
         )
         conn.commit()
 

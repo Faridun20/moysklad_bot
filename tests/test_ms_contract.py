@@ -97,7 +97,7 @@ def test_create_demand_builds_correct_payload(monkeypatch):
             "product_name": "Товар",
             "product_href": f"{MS_BASE}/entity/product/PROD-UUID",
             "quantity": 3,
-            "price": 150.0,  # мажорные единицы — в payload должно стать 15000
+            "price_cents": 15000,  # копейки — в payload уходят как есть
         }
     ]
     co_href = f"{MS_BASE}/entity/customerorder/CO-UUID"
@@ -157,7 +157,7 @@ def test_create_demand_builds_correct_payload(monkeypatch):
 def test_create_demand_refuses_without_agent(monkeypatch):
     _prime_ctx(monkeypatch)
     order = {"id": 1, "comment": ""}  # нет agent_id
-    items = [{"product_href": f"{MS_BASE}/entity/product/P", "quantity": 1, "price": 1.0}]
+    items = [{"product_href": f"{MS_BASE}/entity/product/P", "quantity": 1, "price_cents": 100}]
 
     result = asyncio.run(ms_demand.create_demand_from_request(order, items, "M"))
     assert result["ok"] is False

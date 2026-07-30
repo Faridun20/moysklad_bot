@@ -61,7 +61,7 @@ def test_manual_allocation(mgr_orders):
         cur = db.get_cursor(conn)
         cur.execute(
             db.q(
-                "SELECT order_id, amount_allocated, is_manual FROM cash_deposit_orders "
+                "SELECT order_id, amount_allocated_cents, is_manual FROM cash_deposit_orders "
                 "WHERE deposit_id = ? ORDER BY order_id"
             ),
             (res["deposit_id"],),

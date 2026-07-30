@@ -22,10 +22,10 @@ def test_cash_history_merges_kinds_with_names(isolated_db):
         cur = db.get_cursor(conn)
         cur.execute(
             db.q(
-                "INSERT INTO returns (order_id, return_type, reason, total_amount, "
+                "INSERT INTO returns (order_id, return_type, reason, total_amount_cents, "
                 "created_by, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)"
             ),
-            (oid, "full", "брак", 200.0, 10, db.now_str()),
+            (oid, "full", "брак", 20000, 10, db.now_str()),
         )
         conn.commit()
 
@@ -58,11 +58,11 @@ def test_cash_history_uses_order_currency_for_returns(isolated_db):
         cur.execute(db.q("UPDATE orders SET currency='UZS' WHERE id=?"), (oid,))
         cur.execute(
             db.q(
-                "INSERT INTO returns (order_id, return_type, reason, total_amount, "
+                "INSERT INTO returns (order_id, return_type, reason, "
                 "total_amount_cents, refund_method, created_by, status, created_at) "
-                "VALUES (?, 'partial', 'x', ?, ?, 'debt_reduction', 10, 'confirmed', ?)"
+                "VALUES (?, 'partial', 'x', ?, 'debt_reduction', 10, 'confirmed', ?)"
             ),
-            (oid, 5_000_000.0, 500_000_000, db.now_str()),
+            (oid, 500_000_000, db.now_str()),
         )
         conn.commit()
     ret = next(h for h in asyncio.run(db.get_cash_history(80)) if h["kind"] == "return")
@@ -112,9 +112,9 @@ def test_cash_history_hides_returns_of_deleted_orders(isolated_db):
         cur.execute(db.q("UPDATE orders SET ms_deleted_at='2026-06-03 00:00:00' WHERE id=?"), (oid,))
         cur.execute(
             db.q(
-                "INSERT INTO returns (order_id, return_type, reason, total_amount, "
+                "INSERT INTO returns (order_id, return_type, reason, "
                 "total_amount_cents, refund_method, created_by, status, created_at) "
-                "VALUES (?, 'partial', 'x', 50.0, 5000, 'debt_reduction', 10, 'confirmed', ?)"
+                "VALUES (?, 'partial', 'x', 5000, 'debt_reduction', 10, 'confirmed', ?)"
             ),
             (oid, db.now_str()),
         )

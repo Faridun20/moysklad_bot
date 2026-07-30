@@ -1,9 +1,15 @@
 """
-Stage 2 миграции денег: backfill float→копейки, COALESCE-фолбэк читателей
-и счёт сумм заказа в копейках на реальной SQLite-схеме (isolated_db).
+Деньги хранятся ТОЛЬКО в копейках (T1.3): REAL-колонок денег в схеме нет,
+писатели пишут *_cents, читатели считают в целых копейках.
+
+Тесты про backfill float→копейки и про COALESCE-фолбэк читателей удалены
+вместе с самим механизмом: заполнять *_cents стало неоткуда (исходных
+REAL-колонок нет), а фолбэк читателя нечем накормить.
 """
 
 import asyncio
+
+import pytest
 
 
 def _exec(db, sql, params=()):
@@ -20,50 +26,82 @@ def _one(db, sql, params=()):
         return dict(cur.fetchone())
 
 
-def test_backfill_fills_cents_from_legacy_float(isolated_db):
+# ─── Схема: REAL-колонок денег больше нет ────────────────────────────────────
+
+MONEY_REAL_COLUMNS = [
+    ("payments", "amount"),
+    ("order_items", "price"),
+    ("credit_limits", "limit_amount"),
+    ("cash_deposits", "amount"),
+    ("cash_deposit_orders", "amount_allocated"),
+    ("returns", "total_amount"),
+    ("return_items", "amount"),
+    ("product_prices", "sale_price"),
+    ("product_prices", "cost_price"),
+]
+
+
+@pytest.mark.parametrize("table,column", MONEY_REAL_COLUMNS)
+def test_money_real_columns_are_gone(isolated_db, table, column):
     db = isolated_db
-    # Legacy-строки: *_cents оставляем NULL (как на старой проде до миграции).
-    _exec(
-        db,
-        "INSERT INTO payments (user_id, username, full_name, amount, currency, status, created_at) "
-        "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-        (1, "u", "U", 1500.0, "USD", db.now_str()),
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(f"PRAGMA table_info({table})")
+        cols = {r[1] for r in cur.fetchall()}
+    assert cols, f"таблица {table} не создана"
+    assert column not in cols, (
+        f"{table}.{column} — REAL-колонка денег, должна быть только {column}_cents"
     )
-    _exec(
-        db,
-        "INSERT INTO order_items (order_id, product_name, product_href, quantity, unit, price) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (1, "P", "href", 2, "шт", 49.99),
-    )
-
-    db.run_backfills()
-
-    assert _one(db, "SELECT amount_cents FROM payments")["amount_cents"] == 150000
-    assert _one(db, "SELECT price_cents FROM order_items")["price_cents"] == 4999
+    assert any(c.endswith("_cents") for c in cols), f"{table}: нет ни одной *_cents колонки"
 
 
-def test_backfill_idempotent(isolated_db):
+# ─── Round-trip: точность не теряется ────────────────────────────────────────
+
+
+def test_price_roundtrip_is_exact_through_db(isolated_db):
+    """1234.56 переживает запись/чтение без потери копейки.
+
+    На Postgres REAL — это float4: 1234.56 хранился как 1234.5599975585938.
+    В копейках (BIGINT) значение точное.
+    """
     db = isolated_db
-    _exec(
-        db,
-        "INSERT INTO payments (user_id, username, full_name, amount, currency, status, created_at) "
-        "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-        (1, "u", "U", 33.33, "USD", db.now_str()),
-    )
-    db.run_backfills()
-    first = _one(db, "SELECT amount_cents FROM payments")["amount_cents"]
-    db.run_backfills()  # второй прогон не должен ничего менять
-    second = _one(db, "SELECT amount_cents FROM payments")["amount_cents"]
-    assert first == second == 3333
+    oid = db.create_order(1, "U")
+    item_id = db.add_order_item(oid, "P", "href", 1, "шт", 1234.56)
+
+    assert _one(db, "SELECT price_cents FROM order_items WHERE id = ?", (item_id,))[
+        "price_cents"
+    ] == 123456
+
+    items = asyncio.run(db.get_order_items(oid))
+    assert items[0]["price_cents"] == 123456
+    assert items[0]["price"] == 1234.56  # мажорный ключ считается из копеек
 
 
-def test_reader_fallback_when_cents_null(isolated_db):
+def test_payment_amount_roundtrip_is_exact(isolated_db):
     db = isolated_db
-    # Без backfill: _cents == NULL → читатели берут из legacy REAL.
-    assert db._amount_cents({"amount": 12.34, "amount_cents": None}) == 1234
-    assert db._amount_cents({"amount": 0, "amount_cents": 7777}) == 7777
-    assert db._price_cents({"price": 49.99, "price_cents": None}) == 4999
-    assert db._price_cents({"price": 0, "price_cents": 100}) == 100
+    oid = db.create_order(1, "U")
+    pid = db.add_payment(1, "u", "U", 1234.56, "USD", "", order_id=oid)
+    assert _one(db, "SELECT amount_cents FROM payments WHERE id = ?", (pid,))[
+        "amount_cents"
+    ] == 123456
+    payment = asyncio.run(db.get_payment(pid))
+    assert payment["amount_cents"] == 123456
+    assert payment["amount"] == 1234.56
+
+
+def test_order_total_sums_exactly_in_cents(isolated_db):
+    """Три позиции по 1234.56 → ровно 3703.68, без float-дрейфа."""
+    db = isolated_db
+    oid = db.create_order(1, "U")
+    for _ in range(3):
+        db.add_order_item(oid, "P", "href", 1, "шт", 1234.56)
+
+    s = asyncio.run(db.get_order_payment_summary(oid))
+    assert s["total_cents"] == 370368
+    assert s["total"] == 3703.68
+
+
+# ─── Писатели/читатели в копейках ────────────────────────────────────────────
 
 
 def test_order_payment_summary_in_cents(isolated_db):
@@ -82,7 +120,7 @@ def test_order_payment_summary_in_cents(isolated_db):
     assert s["pending"] == 49.99
 
 
-def test_dual_write_populates_cents(isolated_db):
+def test_writers_store_cents(isolated_db):
     db = isolated_db
     oid = db.create_order(1, "U")
     item_id = db.add_order_item(oid, "P", "href", 1, "шт", 10.10)
@@ -91,8 +129,8 @@ def test_dual_write_populates_cents(isolated_db):
     assert _one(db, "SELECT amount_cents FROM payments WHERE id = ?", (pid,))["amount_cents"] == 20000
 
 
-def test_mark_order_paid_dual_writes_cents(isolated_db):
-    # mark_order_paid — второй путь вставки платежа; тоже должен писать копейки.
+def test_mark_order_paid_writes_cents(isolated_db):
+    # mark_order_paid — второй путь вставки платежа; тоже пишет копейки.
     db = isolated_db
     db.set_role(1, "mgr", "Manager", "manager")
     oid = db.create_order(1, "Manager", "")
@@ -102,9 +140,7 @@ def test_mark_order_paid_dual_writes_cents(isolated_db):
 
     ok, pid = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=40.0))
     assert ok
-    row = _one(db, "SELECT amount, amount_cents FROM payments WHERE id=?", (pid,))
-    assert row["amount"] == 40.0
-    assert row["amount_cents"] == 4000
+    assert _one(db, "SELECT amount_cents FROM payments WHERE id=?", (pid,))["amount_cents"] == 4000
 
 
 def test_mark_order_paid_full_uses_remaining_cents(isolated_db):

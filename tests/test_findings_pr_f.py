@@ -52,10 +52,10 @@ def test_agent_debt_batched_correct(isolated_db):
         cur.execute(db.q("UPDATE payments SET status='confirmed' WHERE id=?"), (pid,))
         cur.execute(
             db.q(
-                "INSERT INTO returns (order_id, return_type, reason, total_amount, "
+                "INSERT INTO returns (order_id, return_type, reason, total_amount_cents, "
                 "created_by, status, created_at) VALUES (?, ?, ?, ?, ?, 'confirmed', ?)"
             ),
-            (o1, "partial", "x", 30.0, 1, db.now_str()),
+            (o1, "partial", "x", 3000, 1, db.now_str()),
         )
         conn.commit()
 

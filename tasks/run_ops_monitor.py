@@ -5,9 +5,9 @@ CLI: операционный монитор (IMPLEMENTATION.md Фаза 6). З�
 (дайджест), а не по сообщению на каждую запись — чтобы не спамить чат:
 
   • boss/admin   — всё: зависшие заявки, неподтверждённые сдачи/возвраты,
-                   просроченные несданные наличные, истекающие партии;
+                   просроченные несданные наличные, низкий остаток;
   • bookkeeper   — неподтверждённые сдачи;
-  • warehouse    — неподтверждённые возвраты + истекающие партии.
+  • warehouse    — неподтверждённые возвраты + низкий остаток.
 
 Пороговые значения берём из app_settings (stale_pending_hours,
 cash_deposit_escalation_days, и т.д.) с дефолтами.
@@ -28,7 +28,6 @@ from services.database import (
     claim_ops_monitor_run,
     get_all_users,
     init_db,
-    run_migrations,
 )
 from services.moysklad import close_session
 from services.notifier import close_tg_session, tg_send_message
@@ -43,6 +42,13 @@ DIV = "─" * 16
 
 def _fmt_amount(n: float) -> str:
     return f"{int(round(n)):,}".replace(",", " ")
+
+
+def _fmt_cents(cents: int) -> str:
+    """Копейки → строка (деньги хранятся только в копейках, T1.3)."""
+    from services import money
+
+    return money.format_cents(int(cents or 0), decimals=0, sep=" ")
 
 
 # ─── Чистые билдеры блоков (тестируются без сети/БД) ──────────────────────────
@@ -64,10 +70,10 @@ def build_stale_orders_block(orders: list[dict], hours: int) -> str | None:
 def build_pending_deposits_block(deposits: list[dict]) -> str | None:
     if not deposits:
         return None
-    total = sum(float(d.get("amount", 0) or 0) for d in deposits)
-    lines = [f"💵 <b>Сдачи на подтверждении: {len(deposits)}</b> (на {_fmt_amount(total)} USD)"]
+    total_cents = sum(int(d.get("amount_cents") or 0) for d in deposits)
+    lines = [f"💵 <b>Сдачи на подтверждении: {len(deposits)}</b> (на {_fmt_cents(total_cents)} USD)"]
     for d in deposits[:15]:
-        lines.append(f"  • сдача #{d['id']} — {_fmt_amount(float(d.get('amount', 0) or 0))} USD")
+        lines.append(f"  • сдача #{d['id']} — {_fmt_cents(d.get('amount_cents'))} USD")
     if len(deposits) > 15:
         lines.append(f"  …и ещё {len(deposits) - 15}")
     return "\n".join(lines)
@@ -78,7 +84,7 @@ def build_pending_returns_block(returns: list[dict]) -> str | None:
         return None
     lines = [f"↩️ <b>Возвраты на подтверждении: {len(returns)}</b>"]
     for r in returns[:15]:
-        amt = _fmt_amount(float(r.get("total_amount", 0) or 0))
+        amt = _fmt_cents(r.get("total_amount_cents"))
         lines.append(f"  • возврат #{r['id']} · заказ #{r.get('order_id', '?')} — {amt} USD")
     if len(returns) > 15:
         lines.append(f"  …и ещё {len(returns) - 15}")
@@ -95,20 +101,6 @@ def build_overdue_undeposited_block(orders: list[dict], days: int) -> str | None
         lines.append(f"  • #{o['id']} · {agent} · {owner}")
     if len(orders) > 15:
         lines.append(f"  …и ещё {len(orders) - 15}")
-    return "\n".join(lines)
-
-
-def build_expiring_batches_block(batches: list[dict], days: int) -> str | None:
-    if not batches:
-        return None
-    lines = [f"⌛ <b>Истекают партии (≤{days}д): {len(batches)}</b>"]
-    for b in batches[:15]:
-        code = _esc(b.get("batch_code") or b.get("product_id") or "—")
-        exp = _esc(b.get("expiry_date") or "—")
-        qty = _fmt_amount(float(b.get("qty_remaining", 0) or 0))
-        lines.append(f"  • {code} · до {exp} · остаток {qty}")
-    if len(batches) > 15:
-        lines.append(f"  …и ещё {len(batches) - 15}")
     return "\n".join(lines)
 
 
@@ -307,14 +299,14 @@ def build_digest_keyboard(
 _PING_ROLE_SECTIONS: dict[str, list[str]] = {
     "admin": [
         "stale_orders", "overdue_undeposited", "deposits", "returns",
-        "expiring_batches", "low_stock", "stale_crons", "ms_anomalies",
+        "low_stock", "stale_crons", "ms_anomalies",
     ],
     "boss": [
         "stale_orders", "overdue_undeposited", "deposits", "returns",
-        "expiring_batches", "low_stock", "stale_crons", "ms_anomalies",
+        "low_stock", "stale_crons", "ms_anomalies",
     ],
     "bookkeeper": ["deposits"],
-    "warehouse_keeper": ["returns", "expiring_batches", "low_stock"],
+    "warehouse_keeper": ["returns", "low_stock"],
 }
 
 _PING_SECTION_LABELS: dict[str, str] = {
@@ -322,7 +314,6 @@ _PING_SECTION_LABELS: dict[str, str] = {
     "overdue_undeposited": "🚨 Деньги не сданы",
     "deposits": "💵 Сдачи на подтверждении",
     "returns": "↩️ Возвраты на подтверждении",
-    "expiring_batches": "⌛ Истекают партии",
     "low_stock": "📉 Низкий остаток",
     "stale_crons": "🛑 Cron не отчитались",
     "ms_anomalies": "🔄 Рассинхрон с МС",
@@ -381,7 +372,6 @@ def build_ping_keyboard(webapp_url: str | None) -> dict | None:
 
 async def main() -> int:
     init_db()
-    run_migrations()  # M1: на свежей БД догнать колонки (идемпотентно)
 
     # Round 6 RACE-4: idempotency-guard. Railway Cron при сетевом hiccup'е
     # может ретраить запуск, или ручной запуск пересечётся с плановым —

@@ -90,11 +90,6 @@
           row(`Возврат #${r.id} · заказ #${r.order_id != null ? r.order_id : '?'}`,
             `${opsAmount(r.total_amount)} USD`)).join(''));
     }
-    const bat = summary.expiring_batches || {};
-    if (bat.count > 0) {
-      section(`Истекают партии (≤${bat.threshold_days}д)`, bat.count,
-        (bat.items || []).map(b => row(`${b.code}`, `до ${b.expiry_date} · остаток ${opsAmount(b.qty_remaining)}`)).join(''));
-    }
     const low = summary.low_stock || {};
     if (low.count > 0) {
       section(`Низкий остаток (≤${opsAmount(low.threshold)})`, low.count,

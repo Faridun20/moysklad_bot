@@ -33,12 +33,11 @@ logger = logging.getLogger("diagnose_ms_debts")
 
 
 async def main() -> int:
-    from services.database import get_open_debts, get_order_payment_summary, init_db, run_migrations
+    from services.database import get_open_debts, get_order_payment_summary, init_db
     from services.moysklad import close_session
     from tasks.run_ms_reconcile import _doc_status
 
     init_db()
-    run_migrations()
 
     debts = await get_open_debts()
     if not debts:

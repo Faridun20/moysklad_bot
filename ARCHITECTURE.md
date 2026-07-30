@@ -316,10 +316,25 @@ notified_at TEXT
 
 ### Индексы
 
-`_create_indexes()` (idempotent, гоняется на старте): `idx_orders_credit_due`
-`(payment_type, paid_at, due_date)`, `idx_orders_status (status)`,
-`idx_shipment_requests_status (status)`, `idx_payments_order_id`,
-unique `idx_payments_ms_paymentin_unique`, + индексы snapshot-таблиц.
+`_create_indexes()` (idempotent, гоняется на старте). Объявлены прямо в схеме:
+боевой базы нет, поэтому `CONCURRENTLY` не нужен.
+
+**Уникальность — это инвариант, а не оптимизация:**
+`idx_shipment_requests_one_pending (order_id) WHERE status='pending'` (закрывает
+двойной сабмит на уровне БД), `idx_returns_one_pending (order_id) WHERE
+status='pending'`, `idx_orders_ms_customerorder` / `idx_orders_ms_demand`
+(partial, `WHERE ... IS NOT NULL` — однозначность обратного поиска по документам
+МС), unique `idx_payments_ms_paymentin_unique`.
+
+**Под реальные фильтры:** `idx_orders_debt_lookup (payment_type, status,
+paid_confirmed_at)` — под `get_open_debts`; `idx_orders_status`,
+`idx_orders_agent_id`, `idx_orders_user_created`; `idx_payments_order_status
+(order_id, status)` — он же покрывает «все платежи по заказу» как префикс;
+`idx_payments_pending (status) WHERE status='pending'`;
+`idx_cash_deposit_orders_order (order_id)` — PK `(deposit_id, order_id)` для
+поиска по `order_id` не работает; `idx_user_roles_role (role)`;
+`idx_shipment_requests_status`, индексы `created_at` денежных лент и
+snapshot-таблиц.
 
 ---
 

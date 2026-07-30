@@ -45,6 +45,13 @@ def _fmt_amount(n: float) -> str:
     return f"{int(round(n)):,}".replace(",", " ")
 
 
+def _fmt_cents(cents: int) -> str:
+    """Копейки → строка для сообщения (деньги хранятся только в копейках)."""
+    from services import money
+
+    return money.format_cents(int(cents or 0), decimals=0, sep=" ")
+
+
 def _to_ru(iso: str) -> str:
     if not iso or len(iso) < 10:
         return iso or ""
@@ -60,15 +67,21 @@ def _format_message(
     today = [d for d in debts if d.get("due_date") == today_str]
 
     def _row(d: dict) -> str:
+        from services import money as _money
+
         items = items_by_order.get(d["id"], [])
-        total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
+        # T1.3: сумма из price_cents, без float-арифметики по REAL-колонке.
+        total_cents = sum(
+            _money.mul_qty(int(it.get("price_cents") or 0), it.get("quantity", 0) or 0)
+            for it in items
+        )
         currency = d.get("currency") or BASE_CURRENCY
         agent = _esc(d.get("agent_name") or "—")
         owner_part = f" — {_esc(d.get('full_name') or '—')}" if is_boss_view else ""
         due_human = _to_ru(d.get("due_date") or "")
         return (
             f"  • #{d['id']} · {agent} · "
-            f"<b>{_fmt_amount(total)} {_esc(currency)}</b> "
+            f"<b>{_fmt_cents(total_cents)} {_esc(currency)}</b> "
             f"({due_human}{owner_part})"
         )
 

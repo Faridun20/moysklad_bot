@@ -11,7 +11,6 @@ from tasks.run_ops_monitor import (
     assemble_digest,
     build_cron_health_block,
     build_digest_keyboard,
-    build_expiring_batches_block,
     build_ms_sync_block,
     build_overdue_undeposited_block,
     build_pending_deposits_block,
@@ -42,7 +41,6 @@ def test_blocks_return_none_when_empty():
     assert build_pending_deposits_block([]) is None
     assert build_pending_returns_block([]) is None
     assert build_overdue_undeposited_block([], 2) is None
-    assert build_expiring_batches_block([], 7) is None
 
 
 def test_stale_block_counts_and_truncates():
@@ -53,14 +51,14 @@ def test_stale_block_counts_and_truncates():
 
 
 def test_deposits_block_sums_amount():
-    deposits = [{"id": 1, "amount": 100.0}, {"id": 2, "amount": 250.0}]
+    deposits = [{"id": 1, "amount_cents": 10000}, {"id": 2, "amount_cents": 25000}]
     block = build_pending_deposits_block(deposits)
     assert "350" in block
     assert "#1" in block and "#2" in block
 
 
 def test_returns_block_shows_order():
-    returns = [{"id": 5, "order_id": 42, "total_amount": 200.0}]
+    returns = [{"id": 5, "order_id": 42, "total_amount_cents": 20000}]
     block = build_pending_returns_block(returns)
     assert "#5" in block and "#42" in block and "200" in block
 

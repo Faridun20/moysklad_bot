@@ -49,13 +49,11 @@ async def main() -> int:
         get_payments_with_ms_paymentin,
         init_db,
         reset_payment_ms_sync,
-        run_migrations,
     )
     from services.moysklad import close_session
     from services.ms_sync_handler import apply_ms_customerorder_delete, apply_ms_demand_delete
 
     init_db()
-    run_migrations()
 
     # Cap concurrency к МС. Семафор создаётся внутри main → привязан к текущему
     # loop'у (cron делает один asyncio.run), cross-loop проблемы нет.

@@ -215,18 +215,6 @@ async def _gather_limited(coros: list) -> list:
     return await asyncio.gather(*(_run(c) for c in coros), return_exceptions=True)
 
 
-async def send_to_recipients(bot: Bot, text: str, recipients: list[int]):
-    """Разослать сообщение списку получателей (параллельно, с лимитом)."""
-
-    async def _one(uid: int):
-        try:
-            await bot.send_message(uid, text, parse_mode="HTML")
-        except Exception as e:
-            logger.warning("Не удалось отправить %d: %s", uid, e)
-
-    await _gather_limited([_one(uid) for uid in recipients])
-
-
 def _is_bot_created(shipment: dict) -> bool:
     """True, если demand создан этим ботом — у него проставлены кастом-атрибуты
     telegram_full_name/telegram_user_id (см. ms_demand.create_demand_from_request).
