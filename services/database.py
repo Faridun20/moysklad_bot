@@ -3292,12 +3292,19 @@ def _batched_delete(table: str, where: str, params: tuple, batch: int = 5000) ->
 
 
 def set_order_ms_demand_id(order_id: int, ms_demand_id: str) -> bool:
-    """Сохранить id демэнд-документа МойСклад на заказе. Legacy: новые
-    заказы используют set_order_ms_customerorder_id."""
+    """Сохранить id демэнд-документа МойСклад на заказе.
+
+    Условный UPDATE (T2.4): пишем только если ссылки ещё нет. Безусловная
+    запись при повторном approve перетирала ссылку на первый документ, и он
+    становился сиротой — его не находили ни find_order_by_ms_demand_id, ни
+    реконсиляция, при том что остатки в МС он уже списал."""
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("UPDATE orders SET ms_demand_id = ?, updated_at = ? WHERE id = ?"),
+            q(
+                "UPDATE orders SET ms_demand_id = ?, updated_at = ? "
+                "WHERE id = ? AND ms_demand_id IS NULL"
+            ),
             (ms_demand_id, now_str(), order_id),
         )
         updated = cur.rowcount > 0
@@ -3308,11 +3315,20 @@ def set_order_ms_demand_id(order_id: int, ms_demand_id: str) -> bool:
 def set_order_ms_customerorder_id(order_id: int, co_id: str) -> bool:
     """Сохранить id customerorder МойСклад на заказе. Используется
     после успешного create_customerorder_from_request — нужно чтобы
-    paymentin привязался к этому заказу через operations."""
+    paymentin привязался к этому заказу через operations.
+
+    Условный UPDATE (T2.4): пишем только если ссылки ещё нет. Раньше запись
+    была безусловной — повторный approve перезаписывал ссылку, и первый
+    документ становился сиротой: его не находил ни
+    find_order_by_ms_customerorder_id, ни реконсиляция, а товар он уже
+    зарезервировал (§2.1). Возвращает False, если ссылка уже стояла."""
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("UPDATE orders SET ms_customerorder_id = ?, updated_at = ? WHERE id = ?"),
+            q(
+                "UPDATE orders SET ms_customerorder_id = ?, updated_at = ? "
+                "WHERE id = ? AND ms_customerorder_id IS NULL"
+            ),
             (co_id, now_str(), order_id),
         )
         updated = cur.rowcount > 0

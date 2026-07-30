@@ -553,7 +553,17 @@ async def approve_shipment_request(
     # заказ меньше локального). Собираем их и показываем боссу предупреждением.
     skipped_names: list[str] = []
 
-    if order and items and ms_ready():
+    # T2.4: не постим в МойСклад, если документ по заказу уже есть. Раньше
+    # повторный approve (два босса, ретрай, старая кнопка) заново создавал
+    # customerorder и demand — товар резервировался и списывался ДВАЖДЫ, а
+    # ссылка на первый документ перезатиралась, и он становился сиротой (§2.1).
+    # Второй эшелон защиты — детерминированный syncId внутри самих
+    # create_*_from_request: даже если сюда зашли параллельно, МС отдаст тот же
+    # документ, а не создаст новый.
+    existing_co = (order or {}).get("ms_customerorder_id")
+    existing_demand = (order or {}).get("ms_demand_id")
+
+    if order and items and ms_ready() and not existing_co:
         co_result = await create_customerorder_from_request(
             order,
             items,
@@ -588,12 +598,16 @@ async def approve_shipment_request(
             from services.moysklad import MS_BASE
 
             co_href = f"{MS_BASE}/entity/customerorder/{co_id}" if co_id else None
-            demand_result = await create_demand_from_request(
-                order,
-                items,
-                manager_name,
-                telegram_user_id=manager_user_id,
-                customerorder_href=co_href,
+            demand_result: dict[str, Any] = (
+                {"ok": False, "reason": "demand уже создан", "skipped": []}
+                if existing_demand
+                else await create_demand_from_request(
+                    order,
+                    items,
+                    manager_name,
+                    telegram_user_id=manager_user_id,
+                    customerorder_href=co_href,
+                )
             )
             for nm in demand_result.get("skipped") or []:
                 if nm not in skipped_names:
