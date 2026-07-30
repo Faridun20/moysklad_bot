@@ -977,18 +977,18 @@ async def cb_delete_order_yes(call: CallbackQuery):
     if order["status"] != "draft":
         return await call.message.answer("❌ Нельзя удалить отправленный заказ.")
 
-    full_name = call.from_user.full_name or str(call.from_user.id)
-    role, _ = await asyncio.gather(
-        adb.get_role(call.from_user.id),
-        adb.update_order_status(order_id, "rejected"),
-    )
-    await adb.add_audit_log(
-        call.from_user.id,
-        full_name,
-        role,
-        "order_deleted",
-        f"Удалён черновик заказа #{order_id}",
-    )
+    # T2.7: то же, что и в WebApp — физическое удаление через delete_order
+    # (каскад по order_items, отказ при наличии платежей, свой audit-лог).
+    # Раньше бот просто ставил статус 'rejected' и оставлял строку с позициями,
+    # хотя в аудит писал «Удалён черновик заказа #N». В итоге 'rejected' означал
+    # две разные вещи — «босс отклонил заявку» и «менеджер удалил черновик», —
+    # и такие заказы продолжали попадать в выборки аналитики (§5.2.1).
+    if not await adb.delete_order(order_id, call.from_user.id):
+        return await call.message.answer(
+            "⚠️ Не удалось удалить заказ.\n"
+            "Если по нему уже есть платежи — удаление заблокировано, "
+            "обратитесь к администратору."
+        )
 
     await call.message.answer(f"🗑 Заказ #{order_id} удалён.")
 
