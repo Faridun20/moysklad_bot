@@ -3219,46 +3219,26 @@ async def api_debts(request: Request):
         due_through=due_through,
     )
 
-    # Батчем: позиции для total + платежи + возвраты + сдачи. Остаток считаем по
-    # ТОЙ ЖЕ формуле, что get_agent_current_debt / кредит-чек: total − платежи −
-    # подтверждённые сдачи − возвраты (WP-06). Раньше возвраты и сдачи не
-    # вычитались → «Долги» и «Клиенты» показывали разный долг одного клиента.
+    # T2.1: остаток считает services.debts — тот же код, что в карточке заказа
+    # и в утреннем напоминании о долгах. Батчем (пять запросов на любое число
+    # заказов), поэтому N+1 не появляется. items тянем отдельно только ради
+    # items_count в ответе.
+    from services.debts import calc_order_balances
+
     debt_ids = [d["id"] for d in debts]
     items_by_order = await adb.get_order_items_by_ids(debt_ids) if debt_ids else {}
-    payments_by_order = await adb.get_payments_for_orders(debt_ids) if debt_ids else {}
-    returns_cents_by_order = (
-        await adb.get_confirmed_returns_cents_for_orders(debt_ids) if debt_ids else {}
-    )
-    deposits_cents_by_order = (
-        await adb.get_confirmed_deposit_cents_for_orders(debt_ids) if debt_ids else {}
-    )
+    balances = await calc_order_balances(debt_ids) if debt_ids else {}
 
     result = []
     for o in debts:
         items = items_by_order.get(o["id"], [])
-        payments = payments_by_order.get(o["id"], [])
-        # T1.3: считаем строго в копейках — из price_cents/amount_cents, без
-        # float-сложения REAL-колонок. Наружу (JSON) отдаём мажорные единицы,
-        # контракт фронта не меняется.
-        total_cents = sum(
-            money.mul_qty(int(it.get("price_cents") or 0), it.get("quantity", 0) or 0)
-            for it in items
-        )
-        confirmed_cents = sum(
-            int(p.get("amount_cents") or 0) for p in payments if p["status"] == "confirmed"
-        )
-        pending_cents = sum(
-            int(p.get("amount_cents") or 0) for p in payments if p["status"] == "pending"
-        )
-        deposits_cents = deposits_cents_by_order.get(o["id"], 0)
-        returns_cents = returns_cents_by_order.get(o["id"], 0)
-        remaining_cents = max(
-            0, total_cents - confirmed_cents - deposits_cents - returns_cents
-        )
-        total = float(money.from_cents(total_cents))
-        confirmed = float(money.from_cents(confirmed_cents))
-        pending = float(money.from_cents(pending_cents))
-        remaining = float(money.from_cents(remaining_cents))
+        bal = balances.get(o["id"])
+        if bal is None:
+            continue
+        total = float(money.from_cents(bal.total_cents))
+        confirmed = float(money.from_cents(bal.confirmed_cents))
+        pending = float(money.from_cents(bal.pending_cents))
+        remaining = float(money.from_cents(bal.remaining_cents))
         due = o.get("due_date")
         # State:
         #  - awaiting_confirmation — есть pending payments (boss решает)

@@ -13,6 +13,18 @@ from typing import Any
 from services import money  # канонические деньги (копейки); leaf-модуль, без циклов
 from services import adb_core  # async DB-слой (asyncpg/aiosqlite); leaf-модуль, без циклов
 
+# SQL-фрагменты денежных сумм и формула остатка живут в services.debts —
+# единственный источник истины (T2.1). Импортируем под старыми именами,
+# чтобы не трогать десяток call-сайтов. debts зависит только от adb_core,
+# цикла нет.
+from services.debts import (
+    RETURN_OWED_FILTER as _RETURN_OWED_FILTER,
+    SUM_ALLOC_CENTS as _SUM_ALLOC_CENTS,
+    SUM_ORDER_TOTAL_CENTS as _SUM_ORDER_TOTAL_CENTS,
+    SUM_PAYMENTS_CENTS as _SUM_PAYMENTS_CENTS,
+    SUM_RETURNS_CENTS as _SUM_RETURNS_CENTS,
+)
+
 logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -1550,10 +1562,6 @@ async def _order_total_cents(order_id: int) -> int:
     return int(summary["total_cents"])
 
 
-# SQL-фрагмент «распределено на заказ в копейках». Без placeholder'ов.
-_SUM_ALLOC_CENTS = "COALESCE(SUM(cdo.amount_allocated_cents), 0)"
-
-
 async def _order_confirmed_deposit_cents(order_id: int) -> int:
     """Распределено на заказ ПОДТВЕРЖДЁННЫМИ сдачами, в копейках.
 
@@ -2995,13 +3003,6 @@ def _amount_cents(payment: dict) -> int:
     return int(payment.get("amount_cents") or 0)
 
 
-# SQL-фрагменты «сумма денег в копейках». Без placeholder'ов, безопасно
-# встраивать в f-string. Работают и в SQLite, и в Postgres. Суммы и сравнения —
-# в целых копейках, без float и без epsilon.
-_SUM_PAYMENTS_CENTS = "COALESCE(SUM(amount_cents), 0)"
-_SUM_ORDER_TOTAL_CENTS = "COALESCE(SUM(CAST(round(quantity * price_cents) AS INTEGER)), 0)"
-
-
 async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
     """Аналитика по менеджерам (boss) из ЛОКАЛЬНЫХ orders, GROUP BY user_id за
     период [since_iso, until_iso] по created_at. Надёжный источник (в отличие от
@@ -3116,7 +3117,7 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
         )
     result.sort(key=lambda x: x["revenue"], reverse=True)
     return result
-_SUM_RETURNS_CENTS = "COALESCE(SUM(total_amount_cents), 0)"
+
 
 # «Живой заказ» для денежных агрегатов: платёж учитываем, только если его заказа
 # нет (standalone, order_id IS NULL) ИЛИ заказ не удалён ни в МС, ни локально.
@@ -3129,14 +3130,6 @@ _LIVE_ORDER_PAYMENT_FILTER = (
     "(o.id IS NULL OR o.ms_deleted_at IS NULL)"
 )
 
-# Возвраты, уменьшающие «к оплате» по заказу: ТОЛЬКО не-cash (debt_reduction /
-# no_refund / без метода). Cash-возврат физически отдаёт деньги (отрицательная
-# сдача в кассе) — он не должен ещё и уменьшать долг по заказу, иначе клиента
-# кредитуют дважды (вернули товар, отдали деньги — и заказ закрылся как оплаченный).
-_RETURN_OWED_FILTER = (
-    "status = 'confirmed' "
-    "AND (refund_method IS NULL OR refund_method != 'cash')"
-)
 
 
 async def get_order_payment_summary(order_id: int) -> dict:
@@ -3155,19 +3148,21 @@ async def get_order_payment_summary(order_id: int) -> dict:
     """
     from config import BASE_CURRENCY
 
+    from services.debts import calc_order_balance
+
     order = await get_order(order_id)
     if not order:
         return {"total": 0.0, "confirmed": 0.0, "pending": 0.0, "remaining": 0.0}
-    items = await get_order_items(order_id)
-    # Считаем в копейках (точно), с фолбэком на старый REAL для не-забэкфилленных строк.
-    total_cents = sum(money.mul_qty(_price_cents(it), it.get("quantity", 0) or 0) for it in items)
-    payments = await get_payments_for_order(order_id)
-    confirmed_cents = sum(_amount_cents(p) for p in payments if p["status"] == "confirmed")
-    pending_cents = sum(_amount_cents(p) for p in payments if p["status"] == "pending")
-    # Возвраты уменьшают «к оплате» (как в get_agent_current_debt). Без этого
-    # возвращённый-и-доплаченный заказ показывал завышенный остаток и не закрывался.
-    returns_cents = await _order_confirmed_returns_cents(order_id)
-    remaining_cents = max(0, total_cents - confirmed_cents - returns_cents)
+    # T2.1: остаток считает services.debts — единственный источник истины.
+    # Раньше здесь была своя формула БЕЗ сдач наличных, поэтому заказ, закрытый
+    # сдачей, показывал долг в карточке и в пуше боссу (§2.10).
+    bal = await calc_order_balance(order_id)
+    total_cents = bal.total_cents
+    confirmed_cents = bal.confirmed_cents
+    pending_cents = bal.pending_cents
+    returns_cents = bal.returns_cents
+    deposits_cents = bal.deposits_cents
+    remaining_cents = bal.remaining_cents
 
     total = float(money.from_cents(total_cents))
     confirmed = float(money.from_cents(confirmed_cents))
@@ -3182,11 +3177,13 @@ async def get_order_payment_summary(order_id: int) -> dict:
         "pending": pending,
         "remaining": remaining,
         "returns": returns_amount,
+        "deposits": float(money.from_cents(deposits_cents)),
         "total_cents": total_cents,
         "confirmed_cents": confirmed_cents,
         "pending_cents": pending_cents,
         "remaining_cents": remaining_cents,
         "returns_cents": returns_cents,
+        "deposits_cents": deposits_cents,
         "currency": currency,
         # *_base — None если convert_to_base не смог (курс не задан админом).
         "total_base": convert_to_base(total, currency),

@@ -24,7 +24,6 @@ from config import BASE_CURRENCY
 from services.database import (
     init_db,
     get_open_debts,
-    get_order_items_by_ids,
     get_payments_for_orders,
     get_all_users,
 )
@@ -60,28 +59,28 @@ def _to_ru(iso: str) -> str:
 
 
 def _format_message(
-    debts: list[dict], items_by_order: dict, today_str: str, is_boss_view: bool
+    debts: list[dict], balances: dict, today_str: str, is_boss_view: bool
 ) -> str:
-    """Свёрнутое сообщение про долги для одного получателя."""
+    """Свёрнутое сообщение про долги для одного получателя.
+
+    T2.1: показываем ОСТАТОК (services.debts), а не полную сумму заказа.
+    Раньше здесь складывались позиции и всё: ни подтверждённые платежи, ни
+    сдачи, ни возвраты не вычитались — клиент внёс 80%, а в утреннем
+    напоминании всё равно висело 100%, при том что WebApp показывал 20%.
+    """
     overdue = [d for d in debts if d.get("due_date") and d["due_date"] < today_str]
     today = [d for d in debts if d.get("due_date") == today_str]
 
     def _row(d: dict) -> str:
-        from services import money as _money
-
-        items = items_by_order.get(d["id"], [])
-        # T1.3: сумма из price_cents, без float-арифметики по REAL-колонке.
-        total_cents = sum(
-            _money.mul_qty(int(it.get("price_cents") or 0), it.get("quantity", 0) or 0)
-            for it in items
-        )
-        currency = d.get("currency") or BASE_CURRENCY
+        bal = balances.get(d["id"])
+        remaining_cents = bal.remaining_cents if bal is not None else 0
+        currency = (bal.currency if bal is not None else None) or d.get("currency") or BASE_CURRENCY
         agent = _esc(d.get("agent_name") or "—")
         owner_part = f" — {_esc(d.get('full_name') or '—')}" if is_boss_view else ""
         due_human = _to_ru(d.get("due_date") or "")
         return (
             f"  • #{d['id']} · {agent} · "
-            f"<b>{_fmt_cents(total_cents)} {_esc(currency)}</b> "
+            f"<b>{_fmt_cents(remaining_cents)} {_esc(currency)}</b> "
             f"({due_human}{owner_part})"
         )
 
@@ -120,9 +119,12 @@ async def main() -> int:
         logger.info("Нет долгов к оплате сегодня — никому ничего не шлём.")
         return 0
 
-    # Один батч на позиции и на платежи
+    # Один батч на остатки и на платежи. Остаток — из services.debts, тем же
+    # кодом, что /api/debts и карточка заказа (T2.1).
+    from services.debts import calc_order_balances
+
     debt_ids = [d["id"] for d in all_debts_full]
-    items_by_order = await get_order_items_by_ids(debt_ids)
+    balances = await calc_order_balances(debt_ids)
     payments_by_order = await get_payments_for_orders(debt_ids)
 
     def _has_pending(order_id):
@@ -137,7 +139,13 @@ async def main() -> int:
         by_manager.setdefault(d["user_id"], []).append(d)
 
     users = get_all_users()
-    bosses = [u for u in users if u["role"] in ("admin", "boss")]
+    # deactivated_at — как в notifier.get_notify_recipients: уволенный
+    # руководитель не должен продолжать получать сводку долгов компании.
+    bosses = [
+        u
+        for u in users
+        if u["role"] in ("admin", "boss") and not u.get("deactivated_at")
+    ]
     managers_by_id = {u["user_id"]: u for u in users if u["role"] == "manager"}
 
     sent = 0
@@ -150,13 +158,13 @@ async def main() -> int:
                 # У владельца заказа нет активного аккаунта — пропускаем
                 # (босс всё равно получит сводку ниже).
                 continue
-            text = _format_message(debts, items_by_order, today_str, is_boss_view=False)
+            text = _format_message(debts, balances, today_str, is_boss_view=False)
             await tg_send_message(uid, text)
             sent += 1
 
         # 2. Boss/admin — сводка по всей компании (включая awaiting confirmation)
         boss_text = _format_message(
-            all_debts_for_bosses, items_by_order, today_str, is_boss_view=True
+            all_debts_for_bosses, balances, today_str, is_boss_view=True
         )
         # Дополним подсказкой про подтверждения, если они есть
         awaiting_count = sum(1 for d in all_debts_for_bosses if _has_pending(d["id"]))
