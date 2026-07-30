@@ -220,8 +220,8 @@ def test_return_create_idempotent_same_key(client_env, monkeypatch):
     assert r1.status_code == 200, r1.text
     rid = r1.json()["return_id"]
 
-    # Эмулируем потерю in-memory кэша (рестарт/другой воркер).
-    server._IDEM_CACHE.clear()
+    # T2.5: in-memory кэша больше нет — ключ живёт в общей БД, поэтому
+    # «рестарт/другой воркер» эмулировать нечем: состояние и так общее.
 
     r2 = client.post("/api/returns/create", json=body)
     assert r2.status_code == 200, r2.text

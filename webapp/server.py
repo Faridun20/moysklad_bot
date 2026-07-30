@@ -43,51 +43,71 @@ def _spawn_bg(coro, name: str) -> asyncio.Task:
     return task
 
 
-# ─── Idempotency cache ──────────────────────────────────────────────
-# Защита от double-click на confirm/reject платежей. Клиент посылает
-# `idempotency_key` (random UUID per действие); если запрос с тем же
-# ключом приходит повторно в течение TTL — возвращаем кэшированный
-# результат, не дёргая БД повторно.
-# SECURITY.md (Medium): сейчас фронт может два раза кликнуть approve и
-# во время загрузки получить рассинхронизированное состояние.
-_IDEM_CACHE: dict[str, tuple[float, dict]] = {}
-_IDEM_TTL = 30.0
-
+# ─── Идемпотентность мутаций ─────────────────────────────────────────
+# Ключ идемпотентности живёт в ОБЩЕЙ БД (таблица idempotency_keys), а не в
+# памяти процесса.
+#
+# Был in-memory кэш с TTL 30 c. Он не переживал рестарт и не делился между
+# воркерами uvicorn, поэтому на денежных ручках (mark_paid, approve,
+# confirm_payment) защиты фактически не было: ретрай клиента после рестарта
+# или запрос, попавший в другой воркер, проходил как новый — лишний платёж,
+# лишний документ в МойСклад, двойное уведомление (T2.5).
 
 _IDEM_KEY_MAX = 128  # WP-22: cap длины клиентского ключа (storage/memory DoS)
 
 
 def _cap_idem_key(raw) -> str | None:
     """Ограничить длину клиентского idempotency_key (WP-22): ключ идёт в
-    in-memory кэш и в Postgres-таблицу идемпотентности; неограниченный ключ от
-    валидного юзера — вектор раздувания storage/памяти (cap по числу записей
-    не ограничивает РАЗМЕР ключа). UUID укладывается в 128 с запасом."""
+    таблицу идемпотентности; неограниченный ключ от валидного юзера — вектор
+    раздувания storage (cap по числу записей не ограничивает РАЗМЕР ключа).
+    UUID укладывается в 128 с запасом."""
     if not raw:
         return None
     return str(raw)[:_IDEM_KEY_MAX]
 
 
-def _idem_get(key: str | None) -> dict | None:
-    if not key:
-        return None
-    key = key[: _IDEM_KEY_MAX + 64]  # cap всего ключа (scope:uid:rawkey)
-    entry = _IDEM_CACHE.get(key)
-    if entry and time.monotonic() - entry[0] < _IDEM_TTL:
-        return entry[1]
-    return None
+class _Idem:
+    """Claim → работа → store, с освобождением ключа при сбое.
 
+    `claim()` возвращает сохранённый результат прошлого выполнения (тогда
+    endpoint просто отдаёт его) либо None — значит ключ наш и надо работать.
+    Если ключ занят, а результата ещё нет (операция в полёте или упала до
+    store), поднимаем 409: безопаснее отказать, чем рискнуть дублем денег.
 
-def _idem_set(key: str | None, value: dict) -> None:
-    if not key:
-        return
-    key = key[: _IDEM_KEY_MAX + 64]
-    # Простой GC при разрастании кэша — выкидываем протухшие записи.
-    if len(_IDEM_CACHE) > 200:
-        cutoff = time.monotonic() - _IDEM_TTL
-        for k in list(_IDEM_CACHE.keys()):
-            if _IDEM_CACHE[k][0] < cutoff:
-                _IDEM_CACHE.pop(k, None)
-    _IDEM_CACHE[key] = (time.monotonic(), value)
+    Без ключа от клиента все методы — no-op, поведение как раньше.
+    """
+
+    __slots__ = ("_adb", "_key", "_op", "_uid")
+
+    def __init__(self, adb, operation: str, user_id: int, raw_key):
+        capped = _cap_idem_key(raw_key)
+        self._adb = adb
+        self._op = operation
+        self._uid = user_id
+        self._key = f"{operation}:{user_id}:{capped}" if capped else None
+
+    @property
+    def active(self) -> bool:
+        return self._key is not None
+
+    async def claim(self) -> dict | None:
+        if not self._key:
+            return None
+        prev = await self._adb.idem_claim(self._key, self._op, self._uid)
+        if prev is None:
+            return None  # ключ наш
+        if prev:
+            return prev  # готовый результат прошлой попытки
+        raise HTTPException(status_code=409, detail="Запрос уже обрабатывается")
+
+    async def store(self, result: dict) -> None:
+        if self._key:
+            await self._adb.idem_store(self._key, result)
+
+    async def release(self) -> None:
+        """Освободить ключ — операция не состоялась, ретрай должен быть возможен."""
+        if self._key:
+            await self._adb.idem_release(self._key)
 
 
 def _dev_bypass_user() -> dict | None:
@@ -2020,16 +2040,28 @@ async def api_approve_request(request: Request):
     )
     override = bool(data.get("override"))
     # Idempotency: повторный тап «Одобрить» (или ретрай по таймауту) не должен
-    # повторно дёргать approve (двойное уведомление/PDF). Кэшируем ТОЛЬКО финальный
-    # успех, не needs_override (это запрос подтверждения — фронт повторит с override).
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"approve_request:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
+    # повторно дёргать approve — это двойное уведомление, второй PDF и, до T2.4,
+    # второй комплект документов в МойСклад. Ключ в общей БД (T2.5).
+    # Сохраняем ТОЛЬКО финальный успех: needs_override — это запрос
+    # подтверждения, и фронт повторит вызов ТЕМ ЖЕ ключом с override=true,
+    # поэтому ключ обязательно освобождаем, иначе повтор упрётся в 409.
+    from services import async_db as adb
+
+    idem = _Idem(adb, "approve_request", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+
     bot = await get_notify_bot()
-    result = await approve_shipment_request(req_id, user["id"], boss_name, bot, override=override)
+    try:
+        result = await approve_shipment_request(
+            req_id, user["id"], boss_name, bot, override=override
+        )
+    except Exception:
+        await idem.release()
+        raise
     if not result["ok"]:
+        await idem.release()
         # Превышение кредитного лимита — не ошибка, а запрос подтверждения:
         # фронт показывает цифры и повторяет вызов с override=true.
         if result.get("needs_override"):
@@ -2038,8 +2070,7 @@ async def api_approve_request(request: Request):
             )
         raise HTTPException(status_code=409, detail=result["error"])
     resp = {"ok": True, "req_id": req_id}
-    if idem_key:
-        _idem_set(f"approve_request:{user['id']}:{idem_key}", resp)
+    await idem.store(resp)
     return JSONResponse(resp)
 
 
@@ -2457,14 +2488,18 @@ async def api_deposits_confirm(request: Request):
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"deposit_confirm:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
+    idem = _Idem(adb, "deposit_confirm", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
     dep = await adb.get_cash_deposit(deposit_id)
-    res = await adb.confirm_cash_deposit(deposit_id, user["id"], name)
+    try:
+        res = await adb.confirm_cash_deposit(deposit_id, user["id"], name)
+    except Exception:
+        await idem.release()
+        raise
     if not res.get("ok"):
+        await idem.release()
         raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
 
     if dep and dep.get("manager_id"):
@@ -2478,8 +2513,7 @@ async def api_deposits_confirm(request: Request):
         except Exception:
             logger.warning("deposit confirm notify failed", exc_info=True)
     resp = {"ok": True, "deposit_id": deposit_id, "closed_orders": res.get("closed_orders", [])}
-    if idem_key:
-        _idem_set(f"deposit_confirm:{user['id']}:{idem_key}", resp)
+    await idem.store(resp)
     return JSONResponse(resp)
 
 
@@ -2645,13 +2679,17 @@ async def api_returns_confirm(request: Request):
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"return_confirm:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
-    res = await adb.confirm_return(return_id, user["id"], name)
+    idem = _Idem(adb, "return_confirm", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await adb.confirm_return(return_id, user["id"], name)
+    except Exception:
+        await idem.release()
+        raise
     if not res.get("ok"):
+        await idem.release()
         raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
 
     # Best-effort: создать «Возврат покупателя» в МойСклад (no-op без MS-контекста).
@@ -2662,8 +2700,7 @@ async def api_returns_confirm(request: Request):
     except Exception:
         logger.warning("MS salesreturn create failed", exc_info=True)
     resp = {"ok": True, "return_id": return_id, "order_status": res.get("order_status")}
-    if idem_key:
-        _idem_set(f"return_confirm:{user['id']}:{idem_key}", resp)
+    await idem.store(resp)
     return JSONResponse(resp)
 
 
@@ -2682,17 +2719,20 @@ async def api_returns_goods_received(request: Request):
         return_id = int(data.get("return_id"))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="return_id обязателен")
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"return_goods:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
-    res = await adb.mark_return_goods_received(return_id, user["id"])
+    idem = _Idem(adb, "return_goods", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await adb.mark_return_goods_received(return_id, user["id"])
+    except Exception:
+        await idem.release()
+        raise
     if not res.get("ok"):
+        await idem.release()
         raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
     resp = {"ok": True, "return_id": return_id}
-    if idem_key:
-        _idem_set(f"return_goods:{user['id']}:{idem_key}", resp)
+    await idem.store(resp)
     return JSONResponse(resp)
 
 
@@ -2833,13 +2873,17 @@ async def api_orders_ship(request: Request):
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"order_ship:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
-    res = await adb.mark_order_shipped(order_id, user["id"], name)
+    idem = _Idem(adb, "order_ship", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await adb.mark_order_shipped(order_id, user["id"], name)
+    except Exception:
+        await idem.release()
+        raise
     if not res.get("ok"):
+        await idem.release()
         raise HTTPException(status_code=409, detail=res.get("error", "не удалось отгрузить"))
 
     creator = order.get("user_id") if order else None
@@ -2850,8 +2894,7 @@ async def api_orders_ship(request: Request):
         except Exception:
             logger.warning("order ship notify failed", exc_info=True)
     resp = {"ok": True, "order_id": order_id}
-    if idem_key:
-        _idem_set(f"order_ship:{user['id']}:{idem_key}", resp)
+    await idem.store(resp)
     return JSONResponse(resp)
 
 
@@ -3359,12 +3402,12 @@ async def api_mark_paid(request: Request):
         raise HTTPException(status_code=400, detail="order_id должен быть числом")
 
     # Idempotency: double-click по «Оплачено» частичной суммой мог создать две
-    # строки платежа. Если фронт прислал ключ — отдаём кэшированный результат.
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"mark_paid:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
+    # строки платежа. Ключ — в общей БД (T2.5), поэтому защита переживает
+    # рестарт и работает между воркерами.
+    idem = _Idem(adb, "mark_paid", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
 
     order = await adb.get_order(order_id)
     if not order:
@@ -3392,14 +3435,19 @@ async def api_mark_paid(request: Request):
     if amount_raw is not None and amount_raw != "":
         amount = _validate_payment_amount(amount_raw)
 
-    ok, payment_id = await adb.mark_order_paid(
-        order_id,
-        user_id,
-        full_name,
-        amount=amount,
-        username=username,
-    )
+    try:
+        ok, payment_id = await adb.mark_order_paid(
+            order_id,
+            user_id,
+            full_name,
+            amount=amount,
+            username=username,
+        )
+    except Exception:
+        await idem.release()  # упало до store — ретрай должен быть возможен
+        raise
     if not ok:
+        await idem.release()
         raise HTTPException(
             status_code=400,
             detail="Не удалось создать платёж (возможно, заказ уже полностью оплачен)",
@@ -3409,8 +3457,7 @@ async def api_mark_paid(request: Request):
     await _notify_bosses_payment_pending(order_id, full_name, payment_id)
 
     result = {"ok": True, "payment_id": payment_id}
-    if idem_key:
-        _idem_set(f"mark_paid:{user['id']}:{idem_key}", result)
+    await idem.store(result)
     return JSONResponse(result)
 
 
@@ -3513,13 +3560,12 @@ async def api_confirm_payment(request: Request):
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="order_id обязателен")
 
-    # Idempotency: если фронт прислал ключ (uuid от клиента) — пробуем
-    # вернуть кэшированный результат на случай double-click.
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"confirm:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
+    # Idempotency: ключ в общей БД (T2.5) — двойной клик «Подтвердить» не
+    # подтвердит платежи дважды даже после рестарта или в другом воркере.
+    idem = _Idem(adb, "confirm_payment", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
 
     full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
@@ -3532,7 +3578,11 @@ async def api_confirm_payment(request: Request):
         p for p in await adb.get_payments_for_order(order_id) if p["status"] == "pending"
     ]
 
-    n = await adb.confirm_all_pending_payments_for_order(order_id, user["id"], full_name)
+    try:
+        n = await adb.confirm_all_pending_payments_for_order(order_id, user["id"], full_name)
+    except Exception:
+        await idem.release()
+        raise
 
     # Уведомляем менеджеров о подтверждённых платежах. Если race с другим
     # боссом — count меньше длины pending_before, берём первые n.
@@ -3556,8 +3606,7 @@ async def api_confirm_payment(request: Request):
                 )
 
     result = {"ok": True, "confirmed_count": n}
-    if idem_key:
-        _idem_set(f"confirm:{user['id']}:{idem_key}", result)
+    await idem.store(result)
     return JSONResponse(result)
 
 
@@ -3583,11 +3632,11 @@ async def api_reject_payment(request: Request):
 
     # Idempotency: double-click reject не должен слать менеджеру два
     # уведомления об отклонении (сам UPDATE атомарен и второй раз даёт n=0).
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"reject:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
+    # Ключ в общей БД (T2.5).
+    idem = _Idem(adb, "reject_payment", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
 
     full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
@@ -3600,7 +3649,11 @@ async def api_reject_payment(request: Request):
         p for p in await adb.get_payments_for_order(order_id) if p["status"] == "pending"
     ]
 
-    n = await adb.reject_all_pending_payments_for_order(order_id, user["id"], full_name)
+    try:
+        n = await adb.reject_all_pending_payments_for_order(order_id, user["id"], full_name)
+    except Exception:
+        await idem.release()
+        raise
 
     if n > 0:
         from services.notifier import tg_send_message
@@ -3622,10 +3675,9 @@ async def api_reject_payment(request: Request):
                 )
 
     result = {"ok": True, "rejected_count": n}
-    # #37 (F5): фиксируем результат под ключом — раньше только _idem_get без
-    # _idem_set, поэтому ретрай с тем же ключом слал повторное уведомление.
-    if idem_key:
-        _idem_set(f"reject:{user['id']}:{idem_key}", result)
+    # #37 (F5): фиксируем результат под ключом — когда-то здесь был только
+    # claim без store, поэтому ретрай тем же ключом слал повторное уведомление.
+    await idem.store(result)
     return JSONResponse(result)
 
 
