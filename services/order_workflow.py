@@ -838,9 +838,9 @@ async def approve_shipment_request(
                         order_id=order["id"],
                     )
                     if bot is not None:
-                        from handlers.debts import _push_payment_confirmation
+                        from services.notify import notify_payment_confirmation_needed
 
-                        await _push_payment_confirmation(
+                        await notify_payment_confirmation_needed(
                             bot,
                             order["id"],
                             manager_name,

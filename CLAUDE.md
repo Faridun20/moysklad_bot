@@ -40,6 +40,23 @@ Python 3.11.9).
 
 Детали в `ARCHITECTURE.md`. Главное: `BOT_MODE` env переключает процесс между `all` / `bot` / `webapp`. На Railway prod два сервиса (`moysklad_bot` + `Webapp`) с разными `BOT_MODE`, общий Postgres + Redis через Project Shared Variables.
 
+**Разделение бот ↔ WebApp (T3.3).** Бот = уведомления + решения по ним + то,
+чего в WebApp нет. Работа (заказы, каталог, финансы, аналитика, сдачи,
+возвраты, лимиты, курсы, цены) — только в WebApp; дублирующие экраны из бота
+вырезаны вместе с `handlers/{analytics,stock,credit,pricing,debts}.py`.
+Не добавляй в бота экран, который уже есть в WebApp: снятые команды перечислены
+в `handlers.start._RETIRED_COMMANDS` и отвечают подсказкой, где искать
+операцию. В боте остаются: кнопки-решения на push-карточках (`req_*`, `pay_*`,
+`dep_*`, `ret_*`, `unfreeze:`), ops/admin-команды без API-аналога (`/audit`,
+`/log`, `/users`, `/addrole`, `/deactivate`, `/reactivate`, `/syncms`,
+`/msstaff`, `/sync_payments`, `/frozen`, `/refresh`, `/snapshot`),
+`/find`, `/ship`, `/cancel`, `/shipments`, `/pay`.
+Новую callback-кнопку рисуешь — проверь, что на неё есть хендлер:
+`tests/test_bot_trimmed.py::test_no_dangling_callback_buttons_in_bot_code`
+сканирует все `callback_data` в `handlers/`, `tasks/`, `utils/`.
+Кнопка входа в WebApp — `handlers._ui.webapp_keyboard()` (только https-URL,
+иначе Bot API отвергнет сообщение целиком).
+
 ## Conventions (нетривиальные)
 
 **DB:**
@@ -100,7 +117,7 @@ Python 3.11.9).
 `.github/workflows/ci.yml` на push в `main` или `claude/*`:
 - `ruff` строгий гейт (`E9,F63,F7,F82`) + полный набор (из `pyproject.toml`);
 - `mypy` — **блокирующий** (модули вычищены до 0 ошибок, тип-регрессии валят CI);
-- `pytest` + coverage с «храповиком» `--cov-fail-under=35` (факт ~41%, буфер 5-6%).
+- `pytest` + coverage с «храповиком» `--cov-fail-under=55` (факт после T3.3 ~67%, буфер ~12%: срез бот-дублей убрал в основном непокрытый код).
 
 `TELEGRAM_TOKEN=0:fake` и `MS_TOKEN=fake` — заглушки для импорта config (в workflow и в `tests/conftest.py` через `os.environ.setdefault`).
 

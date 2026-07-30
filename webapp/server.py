@@ -5,6 +5,7 @@ FastAPI сервер для WebApp.
 
 import asyncio
 import logging
+import math
 import os
 import subprocess
 import time
@@ -2734,6 +2735,70 @@ async def api_returns_goods_received(request: Request):
     return JSONResponse(resp)
 
 
+@app.post("/api/returns/positions")
+async def api_returns_positions(request: Request):
+    """Позиции заказа, доступные к возврату (T3.1).
+
+    Нужен фронту, чтобы собрать ЧАСТИЧНЫЙ возврат: в /api/orders позиции
+    приходят без id и без returned_qty, поэтому выбрать «вернуть 2 из 5»
+    было не из чего — частичный возврат существовал только в боте (§5.2.6).
+
+    Доступное = quantity − returned_qty. Гейты (роль, владелец, статус
+    заказа) — те же, что в /api/returns/create: экран не должен показывать
+    то, что потом отвергнет создание.
+    """
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "warehouse_keeper", "manager"),
+        rate_limit_scope="api_returns_positions",
+    )
+    try:
+        order_id = int(data.get("order_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="order_id обязателен")
+
+    order = await adb.get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    if order.get("status") not in ("shipped", "paid", "partially_returned") and not order.get(
+        "paid_confirmed_at"
+    ):
+        raise HTTPException(
+            status_code=409, detail="Возврат доступен только для отгруженных/оплаченных"
+        )
+    privileged = get_role(user["id"]) in ("admin", "boss", "warehouse_keeper")
+    if not privileged and order.get("user_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Возврат только по своим заказам")
+
+    from config import BASE_CURRENCY
+
+    positions = []
+    for it in await adb.get_order_items(order_id):
+        avail = float(it.get("quantity", 0) or 0) - float(it.get("returned_qty", 0) or 0)
+        if avail <= 0:
+            continue
+        positions.append(
+            {
+                "item_id": it["id"],
+                "name": it.get("product_name") or "—",
+                "unit": it.get("unit") or "шт",
+                "available": avail,
+                "price": float(it.get("price", 0) or 0),
+            }
+        )
+    return JSONResponse(
+        {
+            "ok": True,
+            "order_id": order_id,
+            "currency": order.get("currency") or BASE_CURRENCY,
+            "positions": positions,
+        }
+    )
+
+
 @app.post("/api/returns/create")
 async def api_returns_create(request: Request):
     """Оформить полный возврат по заказу (быстрый флоу, как /return в боте).
@@ -2785,19 +2850,74 @@ async def api_returns_create(request: Request):
     if not privileged and order.get("user_id") != user["id"]:
         raise HTTPException(status_code=403, detail="Возврат только по своим заказам")
 
+    # T3.1: частичный возврат. Раньше эндпоинт жёстко слал "full" и возвращал
+    # ВСЕ позиции целиком — частичный возврат существовал только в боте
+    # (§5.2.6). Теперь фронт может прислать items: [{item_id, quantity}].
+    #
+    # Доступное к возврату = quantity − returned_qty (как в боте): позиция,
+    # уже возвращённая прошлым возвратом, второй раз не отдаётся.
     items = await adb.get_order_items(order_id)
-    ret_items = [
-        (
-            it["id"],
-            float(it.get("quantity", 0)),
-            round(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0), 2),
-        )
+    avail_by_id = {
+        it["id"]: float(it.get("quantity", 0) or 0) - float(it.get("returned_qty", 0) or 0)
         for it in items
-    ]
+    }
+    price_by_id = {it["id"]: float(it.get("price", 0) or 0) for it in items}
+    returnable = {iid: a for iid, a in avail_by_id.items() if a > 0}
+    if not returnable:
+        if full_key:
+            await adb.idem_release(full_key)
+        raise HTTPException(status_code=409, detail="Нет позиций, доступных к возврату")
+
+    raw_items = data.get("items")
+    if raw_items is None:
+        # Полный возврат — всё доступное (поведение по умолчанию, как было).
+        ret_items = [
+            (iid, avail, round(avail * price_by_id[iid], 2)) for iid, avail in returnable.items()
+        ]
+        return_type = "full"
+    else:
+        if not isinstance(raw_items, list) or not raw_items:
+            if full_key:
+                await adb.idem_release(full_key)
+            raise HTTPException(status_code=400, detail="Выберите хотя бы одну позицию")
+        ret_items = []
+        for row in raw_items:
+            try:
+                iid = int(str((row or {}).get("item_id")))
+                qty = float(str((row or {}).get("quantity")))
+            except (TypeError, ValueError, AttributeError):
+                if full_key:
+                    await adb.idem_release(full_key)
+                raise HTTPException(status_code=400, detail="Позиция: нужны item_id и quantity")
+            if iid not in returnable:
+                if full_key:
+                    await adb.idem_release(full_key)
+                raise HTTPException(
+                    status_code=400, detail=f"Позиция {iid} недоступна к возврату"
+                )
+            if not (math.isfinite(qty) and 0 < qty <= returnable[iid] + 1e-9):
+                if full_key:
+                    await adb.idem_release(full_key)
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Позиция {iid}: количество должно быть от 0 до "
+                        f"{returnable[iid]:g}"
+                    ),
+                )
+            qty = min(qty, returnable[iid])
+            ret_items.append((iid, qty, round(qty * price_by_id[iid], 2)))
+        # Выбраны все позиции в полном объёме — это фактически полный возврат
+        # (та же логика, что в боте: от типа зависит статус заказа).
+        is_full = len(ret_items) == len(returnable) and all(
+            abs(qty - returnable[iid]) < 1e-9 for iid, qty, _ in ret_items
+        )
+        return_type = "full" if is_full else "partial"
+
     try:
         res = await adb.create_return(
             order_id,
-            "full",
+            return_type,
             reason,
             ret_items,
             refund_method=refund,
@@ -2846,7 +2966,12 @@ async def api_create_order(request: Request):
     full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
-    order_id = await adb.create_order(user["id"], full_name, data.get("comment", ""))
+    # T3.2: тот же дефект, что у бот-кнопки «Новый заказ» — openOrderEditor(null)
+    # создаёт черновик на КАЖДОЕ открытие редактора, так что выход назад и
+    # повторный вход плодят пустые заказы. Переиспользуем пустой черновик.
+    order_id, _created = await adb.get_or_create_draft(
+        user["id"], full_name, data.get("comment", "")
+    )
     return JSONResponse({"order_id": order_id})
 
 

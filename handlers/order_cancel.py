@@ -23,6 +23,7 @@ def _abort_keyboard():
     kb.button(text="❌ Отмена", callback_data="cancel_abort")
     return kb.as_markup()
 
+from handlers._ui import finish_message
 from services import async_db as adb
 from services.roles import _has_role
 from utils.formatters import DIV
@@ -62,11 +63,16 @@ async def cmd_cancel(message: Message, state: FSMContext):
         )
     await state.clear()
     await state.set_state(CancelFlow.waiting_reason)
-    await state.update_data(order_id=order_id)
-    await message.answer(
+    prompt = await message.answer(
         f"{DIV}\n🚫 <b>Отмена заказа #{order_id}</b>\n\nУкажите причину отмены (одним сообщением):",
         parse_mode="HTML",
         reply_markup=_abort_keyboard(),
+    )
+    # T3.2: запоминаем сообщение с кнопкой «❌ Отмена», чтобы погасить её, когда
+    # причина принята. Иначе кнопка живёт и на уже отменённом заказе отвечает
+    # «отмена прервана» — прямая ложь, заказ-то отменён.
+    await state.update_data(
+        order_id=order_id, msg_chat=prompt.chat.id, msg_id=prompt.message_id
     )
 
 
@@ -105,9 +111,9 @@ async def process_cancel_reason(message: Message, state: FSMContext, bot: Bot):
     if not res.get("ok"):
         return await message.answer(f"⚠️ {res.get('error', 'не удалось отменить')}")
 
-    await message.answer(
-        f"🚫 Заказ #{order_id} отменён.\nПричина: {esc(reason)}", parse_mode="HTML"
-    )
+    note = f"🚫 Заказ #{order_id} отменён.\nПричина: {esc(reason)}"
+    if not await finish_message(bot, data.get("msg_chat"), data.get("msg_id"), note):
+        await message.answer(note, parse_mode="HTML")
     # Уведомить создателя заказа (если это не сам отменяющий).
     creator = order.get("user_id") if order else None
     if creator and creator != message.from_user.id:

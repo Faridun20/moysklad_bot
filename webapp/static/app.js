@@ -2128,6 +2128,11 @@ async function renderPendingRequests() {
         <div class="req-actions">
           <button class="btn-approve" data-req="${r.id}">${icon('check')} Одобрить</button>
           <button class="btn-reject"  data-req="${r.id}">${icon('close')} Отклонить</button>
+          <button class="btn-draft"   data-req="${r.id}">${icon('edit')} На доработку</button>
+        </div>
+        <div class="limit-edit draft-box" data-req="${r.id}" hidden>
+          <input type="text" class="form-input draft-comment" placeholder="Что исправить?">
+          <button class="btn-reject-pay draft-send" data-req="${r.id}">Вернуть менеджеру</button>
         </div>
       </div>
     `).join('');
@@ -2150,9 +2155,45 @@ async function renderPendingRequests() {
         });
       })
     );
+    // T3.1: «На доработку» — мягкая альтернатива отклонению: заказ возвращается
+    // в черновик, менеджер правит и переотправляет ту же заявку. Эндпоинт был,
+    // кнопки не было, поэтому босс мог только «Одобрить» или «Отклонить».
+    // Причина обязательна (сервер требует ≥3 символов) — раскрываем поле,
+    // как в отмене заказа.
+    document.querySelectorAll('.btn-draft').forEach(btn =>
+      btn.addEventListener('click', () => {
+        const box = document.querySelector(`.draft-box[data-req="${btn.dataset.req}"]`);
+        if (box) box.hidden = !box.hidden;
+      })
+    );
+    document.querySelectorAll('.draft-send').forEach(btn =>
+      btn.addEventListener('click', () => returnRequestToDraft(btn.dataset.req))
+    );
   } catch (e) {
     content.innerHTML = errorBox(e.message);
   }
+}
+
+async function returnRequestToDraft(reqId) {
+  const box = document.querySelector(`.draft-box[data-req="${reqId}"]`);
+  const comment = (box?.querySelector('.draft-comment')?.value || '').trim();
+  if (comment.length < 3) {
+    tg.showAlert('❌ Опишите, что исправить (минимум 3 символа)');
+    return;
+  }
+  document.querySelectorAll('.btn-approve, .btn-reject, .btn-draft, .draft-send')
+    .forEach(b => (b.disabled = true));
+  try {
+    await api('/api/requests/return_to_draft', {
+      req_id: Number(reqId),
+      comment,
+      idempotency_key: idemKey(),
+    });
+    tg.showAlert('✏️ Заявка возвращена на доработку');
+  } catch (e) {
+    tg.showAlert(`❌ ${e.message}`);
+  }
+  await renderPendingRequests();
 }
 
 async function handleRequest(reqId, action) {
@@ -2686,8 +2727,18 @@ async function renderCashbox(container, section) {
           <span class="debt-meta">Заказ #${r.order_id} · ${escapeHtml(r.reason || '')}</span>
         </div>
         <div class="debt-actions">
-          <button class="btn-confirm-pay ret-confirm">${icon('check')} Подтвердить возврат</button>
+          ${r.goods_received
+            ? `<span class="debt-meta">${icon('check')} Товар принят</span>`
+            : `<button class="btn-reject-pay ret-goods">${icon('box')} Товар получен</button>`}
+          <button class="btn-confirm-pay ret-confirm" ${r.goods_received ? '' : 'disabled'}>
+            ${icon('check')} Подтвердить возврат
+          </button>
         </div>
+        ${r.goods_received ? '' : `
+          <div class="debt-card-mid">
+            <span class="debt-meta">Сначала отметьте приёмку товара — иначе деньги
+            уйдут из кассы за непривезённый товар.</span>
+          </div>`}
       </div>
   `).join('');
 
@@ -2801,6 +2852,8 @@ async function renderCashbox(container, section) {
             <button class="cur-btn" data-refund="no_refund" aria-pressed="false">${icon('ban')} Без возврата</button>
           </div>
         </div>
+        <button id="ret-load" class="cur-btn">${icon('list')} Выбрать позиции</button>
+        <div id="ret-positions" class="stock-list" hidden></div>
         <button id="ret-create" class="btn-primary">${icon('return')} Оформить полный возврат</button>
       </div>
   ` : '';
@@ -2830,6 +2883,44 @@ async function renderCashbox(container, section) {
       selectedRefund = b.dataset.refund;
     });
   });
+  // T3.1: частичный возврат. Раньше кнопка всегда оформляла ПОЛНЫЙ возврат —
+  // выбрать «вернуть 2 из 5» можно было только в боте (§5.2.6).
+  // Позиции подгружаем отдельно (/api/returns/positions), потому что в списке
+  // заказов у позиций нет ни id, ни возвращённого количества.
+  const retLoad = container.querySelector('#ret-load');
+  const retBox = container.querySelector('#ret-positions');
+  if (retLoad && retBox) {
+    retLoad.addEventListener('click', async () => {
+      const orderId = parseInt(container.querySelector('#ret-order').value, 10);
+      if (!orderId) { tg.showAlert('❌ Сначала укажите номер заказа'); return; }
+      haptic('light');
+      retLoad.disabled = true;
+      try {
+        const d = await api('/api/returns/positions', { order_id: orderId });
+        const pos = d.positions || [];
+        if (!pos.length) {
+          retBox.hidden = true;
+          tg.showAlert('⚠️ Нет позиций, доступных к возврату');
+          return;
+        }
+        retBox.innerHTML = `
+          <div class="section-label">Что вернуть (доступно к возврату)</div>
+          ${pos.map(p => `
+            <div class="form-row ret-pos" data-item="${p.item_id}" data-avail="${p.available}">
+              <label class="form-label">${escapeHtml(p.name)} · до ${p.available} ${escapeHtml(p.unit)}</label>
+              <input type="number" step="any" min="0" max="${p.available}"
+                     class="form-input ret-qty" value="${p.available}" inputmode="decimal">
+            </div>`).join('')}
+          <div class="debt-meta">Обнулите количество, чтобы не возвращать позицию.</div>`;
+        retBox.hidden = false;
+      } catch (e) {
+        tg.showAlert('❌ ' + e.message);
+      } finally {
+        retLoad.disabled = false;
+      }
+    });
+  }
+
   const retBtn = container.querySelector('#ret-create');
   if (retBtn) {
     retBtn.addEventListener('click', () => {
@@ -2837,9 +2928,26 @@ async function renderCashbox(container, section) {
       const reason = container.querySelector('#ret-reason').value.trim();
       if (!orderId) { tg.showAlert('❌ Укажите номер заказа'); return; }
       if (reason.length < 3) { tg.showAlert('❌ Опишите причину'); return; }
+
+      // Позиции не подгружали → полный возврат (прежнее поведение).
+      // Подгрузили → шлём выбранные; сервер сам решит full/partial.
+      let items = null;
+      if (retBox && !retBox.hidden) {
+        items = [];
+        retBox.querySelectorAll('.ret-pos').forEach(row => {
+          const qty = parseFloat(row.querySelector('.ret-qty').value);
+          if (isFinite(qty) && qty > 0) {
+            items.push({ item_id: Number(row.dataset.item), quantity: qty });
+          }
+        });
+        if (!items.length) { tg.showAlert('❌ Укажите количество хотя бы по одной позиции'); return; }
+      }
+
       haptic('light');
       retBtn.disabled = true;
-      api('/api/returns/create', { order_id: orderId, reason, refund_method: selectedRefund, idempotency_key: idemKey() })
+      const payload = { order_id: orderId, reason, refund_method: selectedRefund, idempotency_key: idemKey() };
+      if (items) payload.items = items;
+      api('/api/returns/create', payload)
         .then(r => { tg.showAlert(`✅ Возврат #${r.return_id} отправлен на подтверждение`); renderFinance(); })
         .catch(e => { tg.showAlert('❌ ' + e.message); retBtn.disabled = false; });
     });
@@ -2941,8 +3049,22 @@ async function renderCashbox(container, section) {
     });
   });
 
-  // Возвраты: подтвердить.
+  // Возвраты: отметить приёмку товара, затем подтвердить.
   container.querySelectorAll('.debt-card[data-ret]').forEach(card => {
+    // T3.1: кнопка «Товар получен». Эндпоинт был, кнопки не было — после T2.8
+    // (подтверждение требует приёмки) отметить её можно было только из бота.
+    card.querySelector('.ret-goods')?.addEventListener('click', (ev) => {
+      const b = ev.currentTarget;
+      if (b.disabled) return;
+      b.disabled = true;
+      haptic('light');
+      api('/api/returns/goods_received', {
+        return_id: Number(card.dataset.ret),
+        idempotency_key: idemKey(),
+      })
+        .then(() => { tg.showAlert('📦 Товар отмечен как принятый'); renderFinance(); })
+        .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
+    });
     card.querySelector('.ret-confirm').addEventListener('click', (ev) => {
       const b = ev.currentTarget;
       if (b.disabled) return;
@@ -3045,9 +3167,105 @@ async function renderClients(container) {
           <span class="debt-meta">${balStr(c.balance_cents)} · ${debtStr(c)} · лимит ${fmt(c.limit)} ${escapeHtml(baseC)}</span>
         </div>
       </div>`).join('');
-  container.innerHTML = `<div class="section-label">Клиенты (${clients.length})</div><div class="debts-list">${cards}</div>`;
+  // T3.1: вход на экран курсов валют. Эндпоинты /api/currency/rates{,/set}
+  // существовали, но фронт их не звал — курс можно было задать только через
+  // /rates в боте. Отдельным подэкраном, а не пятой вкладкой: вкладок в
+  // «Финансах» намеренно ≤4, чтобы ряд не переносился.
+  const ratesEntry = `
+    <div class="debt-card" id="open-rates" role="button" tabindex="0">
+      <div class="debt-card-top">
+        <div class="debt-agent">${icon('card')} Курсы валют</div>
+      </div>
+      <div class="debt-card-mid">
+        <span class="debt-meta">Курс к базовой валюте — для сводок в разных валютах</span>
+      </div>
+    </div>`;
+  container.innerHTML = `${ratesEntry}<div class="section-label">Клиенты (${clients.length})</div><div class="debts-list">${cards}</div>`;
+  container.querySelector('#open-rates')?.addEventListener('click', () => {
+    haptic('light');
+    renderCurrencyRates();
+  });
   container.querySelectorAll('.debt-card[data-agent]').forEach(card => {
     card.addEventListener('click', () => { haptic('light'); renderAgentDetail(card.dataset.agent); });
+  });
+}
+
+// Экран курсов валют (T3.1). Открывается из «Финансы → Клиенты».
+//
+// Семантика rate_to_base: 1 единица валюты = rate_to_base единиц базовой.
+// Например при базовой USD: 1 UZS ≈ 0.0000794 USD. Курс задают вручную —
+// автоподтяжки нет, поэтому показываем, когда его обновляли в последний раз:
+// протухший курс молча искажает все сводки в базовой валюте.
+async function renderCurrencyRates() {
+  const content = document.getElementById('content');
+  content.innerHTML = loading('Загрузка курсов…');
+  setScreenContext('Финансы · Курсы валют');
+  showBack(() => { financeTab = 'limits'; showScreen('finance'); });
+
+  let data;
+  try {
+    data = await api('/api/currency/rates', {});
+  } catch (e) {
+    content.innerHTML = errorBox(e.message);
+    return;
+  }
+  const base = (data.base || baseCur()).toUpperCase();
+  const rates = data.rates || [];
+  const canEdit = !!currentUser && ['admin', 'boss'].includes(currentUser.role);
+
+  const rows = rates.map(r => {
+    const code = String(r.currency_code || '').toUpperCase();
+    const isBase = code === base;
+    const upd = r.updated_at ? String(r.updated_at).slice(0, 16) : '—';
+    return `
+      <div class="debt-card" data-rate="${escapeHtml(code)}">
+        <div class="debt-card-top">
+          <div class="debt-agent">${escapeHtml(code)}</div>
+          <div class="debt-amount">${isBase ? 'базовая' : escapeHtml(String(r.rate_to_base))}</div>
+        </div>
+        <div class="debt-card-mid">
+          <span class="debt-meta">1 ${escapeHtml(code)} = ${escapeHtml(String(r.rate_to_base))} ${escapeHtml(base)} · обновлён ${escapeHtml(upd)}</span>
+        </div>
+        ${canEdit && !isBase ? `
+          <div class="limit-edit">
+            <input type="number" step="any" class="form-input rate-input"
+                   value="${escapeHtml(String(r.rate_to_base))}" inputmode="decimal">
+            <button class="btn-confirm-pay rate-save" data-code="${escapeHtml(code)}">Сохранить</button>
+          </div>` : ''}
+      </div>`;
+  }).join('');
+
+  content.innerHTML = `
+    <div class="section-label">Курсы к ${escapeHtml(base)}</div>
+    ${rows || '<div class="empty-state"><div class="empty-state-title">Курсы не заданы</div></div>'}
+    ${canEdit ? '' : '<div class="debt-meta">Изменять курсы может админ или руководитель.</div>'}
+  `;
+
+  content.querySelectorAll('.rate-save').forEach(btn => {
+    btn.addEventListener('click', async (ev) => {
+      const b = ev.currentTarget;
+      const card = b.closest('.debt-card');
+      const raw = card.querySelector('.rate-input').value;
+      const rate = parseFloat(raw);
+      if (!isFinite(rate) || rate <= 0) {
+        tg.showAlert('❌ Курс должен быть положительным числом');
+        return;
+      }
+      if (b.disabled) return;
+      b.disabled = true;
+      haptic('light');
+      try {
+        await api('/api/currency/rates/set', {
+          currency_code: b.dataset.code,
+          rate_to_base: rate,
+        });
+        tg.showAlert(`✅ Курс ${b.dataset.code} обновлён`);
+        await renderCurrencyRates();
+      } catch (e) {
+        b.disabled = false;
+        tg.showAlert('❌ ' + e.message);
+      }
+    });
   });
 }
 

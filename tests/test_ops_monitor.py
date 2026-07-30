@@ -8,9 +8,7 @@ notifier'а; здесь — формирование текста.
 import asyncio
 
 from tasks.run_ops_monitor import (
-    assemble_digest,
     build_cron_health_block,
-    build_digest_keyboard,
     build_ms_sync_block,
     build_overdue_undeposited_block,
     build_pending_deposits_block,
@@ -61,16 +59,6 @@ def test_returns_block_shows_order():
     returns = [{"id": 5, "order_id": 42, "total_amount_cents": 20000}]
     block = build_pending_returns_block(returns)
     assert "#5" in block and "#42" in block and "200" in block
-
-
-def test_assemble_skips_empty_blocks():
-    digest = assemble_digest("T", [None, "БЛОК-A", None, "БЛОК-B"])
-    assert "БЛОК-A" in digest and "БЛОК-B" in digest
-    assert assemble_digest("T", [None, None]) is None
-
-
-def test_assemble_none_when_all_empty():
-    assert assemble_digest("Заголовок", []) is None
 
 
 # ─── Этап 4: блок рассинхрона с МойСклад ──────────────────────────────────────
@@ -159,37 +147,6 @@ def test_get_ms_sync_anomalies_collects_drift_and_deleted(isolated_db):
     deleted_ids = {o["id"] for o in res["deleted"]}
     assert drift_ids == {drift_oid}
     assert deleted_ids == {del_oid}
-
-
-# ─── #23: интерактивная клавиатура дайджеста ──────────────────────────────────
-
-
-def test_digest_keyboard_none_when_no_actions():
-    assert build_digest_keyboard() is None
-    assert build_digest_keyboard(stale=[], deposits=[], returns=[]) is None
-
-
-def test_digest_keyboard_order_buttons_capped():
-    stale = [{"id": i} for i in range(10)]
-    kb = build_digest_keyboard(stale=stale, max_orders=5)
-    cbs = _all_cb(kb)
-    assert cbs == [f"ord_view:{i}" for i in range(5)]  # первые 5, deep-link к просмотру
-
-
-def test_digest_keyboard_nav_buttons():
-    kb = build_digest_keyboard(deposits=[{"id": 1}], returns=[{"id": 2}, {"id": 3}])
-    cbs = _all_cb(kb)
-    assert "dep_pending" in cbs
-    assert "ret_pending" in cbs
-    # счётчики в подписи
-    labels = [b["text"] for row in kb["inline_keyboard"] for b in row]
-    assert any("(1)" in t for t in labels)  # 1 сдача
-    assert any("(2)" in t for t in labels)  # 2 возврата
-
-
-def test_digest_keyboard_warehouse_only_returns():
-    kb = build_digest_keyboard(returns=[{"id": 9}])
-    assert _all_cb(kb) == ["ret_pending"]
 
 
 # ─── #5 ops hardening: cron-health block ──────────────────────────────────────

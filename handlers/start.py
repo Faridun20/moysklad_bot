@@ -12,14 +12,15 @@ from aiogram.types import (
     ReplyKeyboardRemove,
     BotCommand,
     BotCommandScopeChat,
+    WebAppInfo,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 # cached_role вместо database.get_role: per-process кэш ролей (TTL 60с) —
 # /start и команды не делают синхронный SELECT к БД на каждый вызов
 # (конвенция CLAUDE.md). Значение идентично get_role (guest для деактивированных).
-from services.roles import cached_role as get_role, is_boss
-from utils.formatters import DIV
+from handlers._ui import webapp_keyboard
+from services.roles import cached_role as get_role
 from utils.helpers import user_safe_error
 from config import ADMIN_IDS, WEBAPP_URL
 from services.database import (
@@ -41,52 +42,35 @@ ROLE_NAMES = {
 
 def get_keyboard_for_role(role: str):
     """
-    Сокращённое inline-меню — только то, что неудобно делать через WebApp:
-    срочные действия (Заявки на апрув для босса) и admin-only функции
-    (Пользователи, Аудит). Каталог / Новый заказ / Аналитика / Платежи
-    живут в WebApp — туда ведёт Menu Button слева от поля ввода
-    (set_chat_menu_button в bot.py).
+    Inline-меню: вход в WebApp + то, чего в WebApp нет.
 
-    Раньше тут было 7-9 кнопок которые дублировали WebApp. Это
-    путало пользователя: где «правильно» создавать заказ — в чате
-    или в WebApp? Теперь чёткое разделение.
+    T3.3: заказы, остатки, долги, аналитика, очереди сдач и возвратов из бота
+    вырезаны — их кнопки вели в удалённые экраны. Осталось: WebApp (там вся
+    работа), отгрузки (аналога в WebApp нет) и админский ряд —
+    пользователи/аудит (эндпоинтов под них тоже нет).
+
+    Решения (одобрить заявку, подтвердить платёж/сдачу/возврат) в меню не
+    нужны: они приходят кнопками прямо в push-уведомлении.
     """
+    if role == "guest":
+        return None
+
     kb = InlineKeyboardBuilder()
     rows: list[int] = []
 
-    # Основной блок для работающих ролей: каталог, заказы/долги и
-    # просмотры (отгрузки/аналитика) — все потоки теперь открываются
-    # одним тапом (период/фильтр выбирается чипами уже внутри).
-    if role in ("admin", "boss", "manager"):
-        kb.button(text="📦 Остатки", callback_data="sp:0")
-        kb.button(text="🗂 Категории", callback_data="cats:0")
-        rows += [2]
-        kb.button(text="📋 Мои заказы", callback_data="ord_my")
-        kb.button(text="💳 Долги", callback_data="debts_my")
-        rows += [2]
-        kb.button(text="🚚 Отгрузки", callback_data="sh:today")
-        kb.button(text="📊 Аналитика", callback_data="analytics")
-        rows += [2]
-
-    # Срочное для босса/админа — апрув заявок (push-driven но дублируем
-    # сюда чтобы можно было пересмотреть «все pending» одним тапом).
-    if role in ("admin", "boss"):
-        kb.button(text="⏳ Заявки на апрув", callback_data="ord_requests")
+    if WEBAPP_URL and WEBAPP_URL.startswith("https://"):
+        kb.button(text="🌐 Открыть WebApp", web_app=WebAppInfo(url=WEBAPP_URL))
         rows += [1]
 
-    # Менеджер: быстрая отправка платежа в кассу (не привязанного к заказу).
+    # Отгрузки из МойСклад — единственный список, которого нет в WebApp.
+    if role in ("admin", "boss", "manager", "warehouse_keeper"):
+        kb.button(text="🚚 Отгрузки", callback_data="sh:today")
+        rows += [1]
+
+    # Менеджер: быстрая отправка платежа в кассу (не привязанного к заказу) —
+    # три касания в чате против захода в WebApp.
     if role == "manager":
         kb.button(text="💵 Отправить платёж", callback_data="pay_start")
-        rows += [1]
-
-    # Кладовщик: очередь возвратов на подтверждение (раньше — только из push).
-    if role in ("admin", "boss", "warehouse_keeper"):
-        kb.button(text="↩️ Возвраты на подтверждении", callback_data="ret_pending")
-        rows += [1]
-
-    # Бухгалтер: очередь сдач налички на подтверждение.
-    if role in ("admin", "boss", "bookkeeper"):
-        kb.button(text="💵 Сдачи на подтверждении", callback_data="dep_pending")
         rows += [1]
 
     # Админский ряд — управление пользователями и аудит.
@@ -96,7 +80,6 @@ def get_keyboard_for_role(role: str):
         rows += [2]
 
     if not rows:
-        # Guest или unknown role — пустой markup
         return None
     kb.adjust(*rows)
     return kb.as_markup()
@@ -114,29 +97,20 @@ def get_keyboard_for_role(role: str):
 
 # Команды для /-автокомплита Telegram. Разные наборы для разных ролей —
 # менеджеру не показываем admin-only /addrole, /audit и т.п.
+#
+# T3.3: список сокращён до того, что бот реально делает. Всё, что переехало в
+# WebApp (заказы, остатки, долги, аналитика, сдачи, возвраты, лимиты, курсы,
+# цены), из автокомплита убрано — иначе Telegram предлагает команды, которых
+# больше нет. Набравшему по памяти отвечает `cmd_retired` подсказкой.
 _COMMANDS_MANAGER = [
     BotCommand(command="start", description="🏠 Главное меню"),
-    BotCommand(command="neworder", description="➕ Новый заказ"),
-    BotCommand(command="myorders", description="📋 Мои заказы"),
-    BotCommand(command="stock", description="📦 Остатки на складе"),
-    BotCommand(command="categories", description="🗂 Товары по категориям"),
     BotCommand(command="pay", description="💵 Отправить платёж"),
-    BotCommand(command="debts", description="💳 Мои долги"),
-    BotCommand(command="deposit", description="💵 Сдать наличные в кассу"),
-    BotCommand(command="return", description="↩️ Оформить возврат"),
     BotCommand(command="find", description="🔍 Поиск (заказ/платёж/клиент)"),
 ]
 _COMMANDS_BOSS = _COMMANDS_MANAGER + [
-    BotCommand(command="orders", description="⏳ Заявки на апрув"),
     BotCommand(command="ship", description="🚚 Отгрузить заказ"),
     BotCommand(command="shipments", description="🚚 Последние отгрузки"),
-    BotCommand(command="analytics", description="📊 Аналитика продаж"),
-    BotCommand(command="cashbox", description="💰 Касса и дебиторка"),
-    BotCommand(command="reports", description="📈 Отчёты"),
     BotCommand(command="cancel", description="🚫 Отменить заказ"),
-    BotCommand(command="limit", description="📊 Кредитные лимиты"),
-    BotCommand(command="rates", description="💱 Курсы валют"),
-    BotCommand(command="prices", description="🏷 Цены товаров"),
     BotCommand(command="sync_payments", description="🔄 Статус синка с МойСклад"),
 ]
 _COMMANDS_ADMIN = _COMMANDS_BOSS + [
@@ -148,13 +122,11 @@ _COMMANDS_ADMIN = _COMMANDS_BOSS + [
 ]
 _COMMANDS_WAREHOUSE = [
     BotCommand(command="start", description="🏠 Главное меню"),
-    BotCommand(command="returns", description="↩️ Возвраты на подтверждении"),
-    BotCommand(command="return", description="↩️ Оформить возврат"),
     BotCommand(command="ship", description="🚚 Отгрузить заказ"),
+    BotCommand(command="shipments", description="🚚 Последние отгрузки"),
 ]
 _COMMANDS_BOOKKEEPER = [
     BotCommand(command="start", description="🏠 Главное меню"),
-    BotCommand(command="deposits", description="💵 Сдачи на подтверждении"),
 ]
 
 
@@ -204,8 +176,8 @@ def get_welcome_text(role: str, first_name: str = "") -> str:
         "admin": "Полный доступ. Управление пользователями и аудит — кнопками ниже.",
         "boss": "Заявки на одобрение и подтверждение платежей — приходят push'ами.",
         "manager": "Создавайте заказы и отмечайте оплаты — всё в WebApp.",
-        "warehouse_keeper": "Отгрузки и возвраты: /ship, /return, /returns и кнопки ниже.",
-        "bookkeeper": "Подтверждение сдачи налички: /deposits и кнопка ниже.",
+        "warehouse_keeper": "Отгрузка — /ship; приёмку возврата подтверждайте кнопкой в уведомлении.",
+        "bookkeeper": "Сдачи налички подтверждайте кнопкой прямо в уведомлении.",
     }
     hint = hints.get(role, "")
 
@@ -304,18 +276,15 @@ async def cmd_start(message: Message, state: FSMContext):
     # отдельно, «⚡ Быстрые действия» с кнопками — отдельно).
     # Если у роли нет меню (employee/гость уже отсеян) — снимаем возможную
     # устаревшую reply-кнопку «🌐 Открыть» (PR #47) тем же сообщением.
+    # T3.3: сводка за месяц для менеджера больше не досылается вторым
+    # сообщением — она и так первое, что показывает главная WebApp
+    # (/api/home), а бот-аналитика вырезана вместе с handlers/analytics.
     inline_markup = get_keyboard_for_role(role)
     await message.answer(
         get_welcome_text(role, user.first_name or "") + sync_status_line,
         parse_mode="HTML",
         reply_markup=inline_markup or ReplyKeyboardRemove(),
     )
-
-    # Показываем сводку за месяц для менеджера
-    if role == "manager":
-        from handlers.analytics import show_manager_summary
-
-        await show_manager_summary(message.bot, message.chat.id, message.from_user.id)
 
 
 @router.message(Command("find"))
@@ -441,43 +410,47 @@ async def cb_menu(call: CallbackQuery, state: FSMContext):
     )
 
 
-@router.callback_query(F.data == "ord_my")
-async def cb_ord_my(call: CallbackQuery):
-    await call.answer()
-    from services.database import get_user_orders
-    from handlers.orders import my_orders_keyboard
+# ─── Снятые команды: подсказка вместо тишины (T3.3) ──────────────────────────
 
-    orders = await get_user_orders(call.from_user.id)
-    if not orders:
-        kb = InlineKeyboardBuilder()
-        kb.button(text="➕ Создать заказ", callback_data="ord_new")
-        kb.button(text="🏠 Меню", callback_data="menu")
-        kb.adjust(1)
-        return await call.message.answer("📋 У вас пока нет заказов.", reply_markup=kb.as_markup())
-    await call.message.answer(
-        f"📋 <b>Мои заказы</b> ({len(orders)}):",
+
+# Команда → куда идти в WebApp. Набравший старую команду по памяти должен
+# понять, что бот не сломался, а операция переехала.
+_RETIRED_COMMANDS = {
+    "neworder": "Заказы → «➕ Новый заказ»",
+    "myorders": "Заказы",
+    "orders": "Заявки",
+    "stock": "Каталог",
+    "categories": "Каталог",
+    "debts": "Финансы → Долги",
+    "deposit": "Финансы → Касса → «Сдать наличные»",
+    "my_deposits": "Финансы → Касса",
+    "deposits": "Финансы → Касса → «Сдачи на подтверждении»",
+    "return": "Заказы → заказ → «Оформить возврат»",
+    "returns": "Финансы → Касса → «Возвраты»",
+    "limit": "Финансы → Клиенты → клиент → «Кредитный лимит»",
+    "rates": "Финансы → Клиенты → «Курсы валют»",
+    "prices": "Каталог → товар → «Цена»",
+    "analytics": "Аналитика",
+    "cashbox": "Финансы → Касса",
+    "reports": "Аналитика",
+    "payreport": "Финансы → История платежей",
+}
+
+
+@router.message(Command(*_RETIRED_COMMANDS))
+async def cmd_retired(message: Message):
+    """Ответ на команду, вырезанную в T3.3.
+
+    Молча игнорировать нельзя: пользователь с мышечной памятью решит, что бот
+    сломался, и будет писать админу. Отвечаем, где теперь эта операция, и
+    даём кнопку входа — Menu Button слева от поля ввода замечают не все.
+    """
+    command = (message.text or "").lstrip("/").split()[0].split("@")[0].lower()
+    where = _RETIRED_COMMANDS.get(command, "")
+    where_line = f"\n📍 Экран: <b>{where}</b>" if where else ""
+    await message.answer(
+        f"🌐 Эта операция теперь в WebApp.{where_line}\n\n"
+        f"<i>Открыть: кнопка ниже или «Открыть» слева от поля ввода.</i>",
         parse_mode="HTML",
-        reply_markup=await my_orders_keyboard(orders),
-    )
-
-
-@router.callback_query(F.data == "ord_requests")
-async def cb_ord_requests(call: CallbackQuery):
-    if not is_boss(call.from_user.id):
-        return await call.answer("Нет доступа", show_alert=True)
-    await call.answer()
-    from services.database import get_pending_requests, get_orders_by_ids
-    from handlers.orders import pending_requests_keyboard
-
-    requests = await get_pending_requests()  # async после asyncpg Stage 3
-    if not requests:
-        return await call.message.answer(
-            f"{DIV}\n⏳ <b>Заявки на отгрузку</b>\n\n<i>Нет новых заявок</i>",
-            parse_mode="HTML",
-        )
-    orders_by_id = await get_orders_by_ids([r["order_id"] for r in requests[:10]])
-    await call.message.answer(
-        f"⏳ <b>Заявки ({len(requests)}):</b>",
-        parse_mode="HTML",
-        reply_markup=await pending_requests_keyboard(requests, orders_by_id),
+        reply_markup=webapp_keyboard(),
     )

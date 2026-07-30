@@ -1,5 +1,8 @@
 """
 Тесты bot-хендлеров возвратов (handlers/returns). Фейковые объекты + asyncio.run.
+
+T3.3: оформление возврата ушло в WebApp (тесты — test_partial_return_api.py),
+в боте остались кнопки push-карточки: приёмка товара и подтверждение.
 """
 
 import asyncio
@@ -52,27 +55,6 @@ class _FakeCall:
         self.alerts.append((text, kwargs))
 
 
-class _FakeState:
-    """Минимальный FSMContext: хранит data и state в памяти."""
-
-    def __init__(self):
-        self._data = {}
-        self._state = None
-
-    async def clear(self):
-        self._data = {}
-        self._state = None
-
-    async def set_state(self, st):
-        self._state = st
-
-    async def update_data(self, **kw):
-        self._data.update(kw)
-
-    async def get_data(self):
-        return dict(self._data)
-
-
 def _setup(db):
     roles.invalidate_all_roles()
     db.set_role(1, "mgr", "Manager", "manager")
@@ -82,63 +64,6 @@ def _setup(db):
     db.add_order_item(oid, "Товар", "", 2, "шт", 100.0)  # total 200
     db.update_order_status(oid, "shipped")
     return oid
-
-
-def test_full_return_flow_creates_and_confirms(isolated_db):
-    db = isolated_db
-    from handlers.returns import (
-        cmd_return,
-        process_return_reason,
-        cb_return_refund,
-        cb_return_full,
-        cb_return_confirm,
-    )
-
-    oid = _setup(db)
-    bot = _FakeBot()
-    state = _FakeState()
-
-    # /return <oid>
-    asyncio.run(cmd_return(_FakeMessage(text=f"/return {oid}", uid=1, bot=bot), state))
-    assert state._data.get("order_id") == oid
-
-    # причина
-    asyncio.run(process_return_reason(_FakeMessage(text="брак партии", uid=1, bot=bot), state))
-    assert state._data.get("reason") == "брак партии"
-
-    # способ возврата → экран выбора позиций (полный/частичный)
-    refund_call = _FakeCall("ret_rm:debt_reduction", uid=1, bot=bot)
-    asyncio.run(cb_return_refund(refund_call, state))
-
-    # «📦 Весь заказ» → создаётся полный возврат + уведомление боссу
-    full_call = _FakeCall("ret_full", uid=1, bot=bot)
-    asyncio.run(cb_return_full(full_call, state, bot))
-    pend = asyncio.run(db.get_pending_returns())  # async после asyncpg Stage 5
-    assert len(pend) == 1
-    return_id = pend[0]["id"]
-    assert any(chat == 2 for chat, _, _ in bot.sent)  # боссу ушло
-
-    # T2.8: склад отмечает приёмку товара — без неё подтверждение отклонят.
-    asyncio.run(db.mark_return_goods_received(return_id, 2))
-
-    # босс подтверждает
-    bot2 = _FakeBot()
-    conf_call = _FakeCall(f"ret_ok:{return_id}", uid=2, bot=bot2)
-    asyncio.run(cb_return_confirm(conf_call, bot2))
-    assert asyncio.run(db.get_order(oid))["status"] == "returned"  # полный возврат
-
-
-def test_return_blocked_for_non_shipped(isolated_db):
-    db = isolated_db
-    from handlers.returns import cmd_return
-
-    roles.invalidate_all_roles()
-    db.set_role(1, "mgr", "Manager", "manager")
-    oid = db.create_order(1, "Manager", "")  # draft
-    db.add_order_item(oid, "T", "", 1, "шт", 10.0)
-    msg = _FakeMessage(text=f"/return {oid}", uid=1)
-    asyncio.run(cmd_return(msg, _FakeState()))
-    assert any("отгруженных" in t for t, _ in msg.answers)
 
 
 def test_confirm_return_denied_for_manager(isolated_db):
@@ -156,3 +81,37 @@ def test_confirm_return_denied_for_manager(isolated_db):
     asyncio.run(cb_return_confirm(call, _FakeBot()))
     assert any("доступа" in (a[0] or "").lower() for a in call.alerts)
     assert asyncio.run(db.get_order(oid))["status"] == "shipped"  # не подтверждён
+
+
+def test_goods_received_then_confirm_closes_order(isolated_db):
+    """Путь кнопок push-карточки: «📦 Товар получен» → «✅ Подтвердить возврат».
+
+    После T2.8 подтверждение без приёмки отклоняется, поэтому проверяем связку,
+    а не каждую кнопку отдельно: это и есть весь бот-путь возврата после T3.3.
+    """
+    db = isolated_db
+    from handlers.returns import cb_return_confirm, cb_return_goods_received
+
+    oid = _setup(db)
+    items = asyncio.run(db.get_order_items(oid))
+    r = asyncio.run(
+        db.create_return(
+            oid,
+            "full",
+            "брак",
+            [(items[0]["id"], 2, 200.0)],
+            refund_method="no_refund",
+            created_by=1,
+        )
+    )
+    ret_id = r["return_id"]
+
+    # Склад отмечает приёмку — кнопка «Товар получен» из уведомления.
+    got_call = _FakeCall(f"ret_got:{ret_id}", uid=2)
+    asyncio.run(cb_return_goods_received(got_call))
+    assert asyncio.run(db.get_return(ret_id))["goods_received"]
+
+    # Босс подтверждает — заказ уходит в returned.
+    conf_call = _FakeCall(f"ret_ok:{ret_id}", uid=2)
+    asyncio.run(cb_return_confirm(conf_call, _FakeBot()))
+    assert asyncio.run(db.get_order(oid))["status"] == "returned"

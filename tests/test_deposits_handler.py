@@ -68,36 +68,6 @@ def _setup(db):
     return oid
 
 
-def test_cmd_deposit_creates_and_notifies_boss(isolated_db):
-    db = isolated_db
-    from handlers.deposits import cmd_deposit
-
-    _setup(db)
-    bot = _FakeBot()
-    msg = _FakeMessage(text="/deposit 250", uid=1, bot=bot)
-    asyncio.run(cmd_deposit(msg))
-
-    # Сдача создана (pending).
-    deps = asyncio.run(db.get_manager_cash_deposits(1))
-    assert len(deps) == 1 and deps[0]["status"] == "pending"
-    # Боссу ушло уведомление с кнопками.
-    assert any(chat == 2 for chat, _, _ in bot.sent)
-    boss_msg = next(kw for chat, _, kw in bot.sent if chat == 2)
-    assert boss_msg.get("reply_markup") is not None
-    # Менеджеру — подтверждение создания.
-    assert any("создана" in t for t, _ in msg.answers)
-
-
-def test_deposit_bad_amount(isolated_db):
-    db = isolated_db
-    from handlers.deposits import cmd_deposit
-
-    _setup(db)
-    msg = _FakeMessage(text="/deposit ноль", uid=1)
-    asyncio.run(cmd_deposit(msg))
-    assert any("положительным" in t for t, _ in msg.answers)
-
-
 def test_cb_confirm_closes_order_and_notifies_manager(isolated_db):
     db = isolated_db
     from handlers.deposits import cb_deposit_confirm

@@ -163,6 +163,91 @@ async def notify_payment_sent(
             logger.warning("Не удалось уведомить %d о платеже #%d: %s", uid, payment_id, e)
 
 
+def _fmt_amount(n: float) -> str:
+    """1234567 → '1 234 567'."""
+    from services import money
+
+    return money.format_cents(money.to_cents(n or 0), decimals=0, sep=" ")
+
+
+def _to_ru(iso: str) -> str:
+    """YYYY-MM-DD → ДД.ММ.ГГГГ."""
+    if not iso or len(iso) < 10:
+        return iso or ""
+    y, m, d = iso[:10].split("-")
+    return f"{d}.{m}.{y}"
+
+
+async def notify_payment_confirmation_needed(
+    bot: Bot,
+    order_id: int,
+    manager_name: str,
+    payment_id: int,
+) -> None:
+    """Запрос подтверждения оплаты по кредит-заказу — boss/admin.
+
+    T3.3: переехало из `handlers/debts._push_payment_confirmation` вместе со
+    срезом бот-экрана «Долги». Зовётся из `order_workflow` на пути mark_paid
+    (WebApp), поэтому уведомление не может жить в хендлере, которого больше
+    нет. Кнопки — те же pay_ok/pay_no, что у обычного платежа: подтверждение
+    остаётся в боте, а сумму вводят в WebApp.
+    """
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+    from config import BASE_CURRENCY
+    from services import async_db as adb
+
+    order = await adb.get_order(order_id)
+    if not order:
+        return
+    summary = await adb.get_order_payment_summary(order_id)
+    payment = await adb.get_payment(payment_id)
+    if not payment:
+        return
+    currency = order.get("currency") or BASE_CURRENCY
+    agent = esc(order.get("agent_name") or "—")
+    due = order.get("due_date") or "—"
+    amount = float(payment.get("amount") or 0)
+    confirmed_before = max(0.0, summary["confirmed"])
+    # summary["remaining"] = total - confirmed (без учёта pending).
+    # «Останется после подтверждения ЭТОГО платежа» — отнимаем amount.
+    remaining_after = max(0.0, summary["remaining"] - amount)
+
+    lines = [
+        f"{DIV}",
+        "💳 <b>Требуется подтверждение оплаты</b>",
+        "",
+        f"Заказ #{order_id}",
+        f"👨‍💼 Менеджер: <b>{esc(manager_name)}</b>",
+        f"🏢 Клиент: <b>{agent}</b>",
+        f"💵 Сумма платежа: <b>{_fmt_amount(amount)} {esc(currency)}</b>",
+        f"📦 По заказу всего: <b>{_fmt_amount(summary['total'])} {esc(currency)}</b>",
+    ]
+    if summary.get("total_base") is not None and currency != summary.get("base_currency"):
+        lines.append(
+            f"   ≈ <b>{_fmt_amount(summary['total_base'])} {esc(summary['base_currency'])}</b>"
+        )
+    if confirmed_before > 0:
+        lines.append(f"✅ Уже оплачено ранее: <b>{_fmt_amount(confirmed_before)} {esc(currency)}</b>")
+    if remaining_after <= 0:
+        lines.append("🎉 Этот платёж <b>закрывает долг полностью</b>")
+    else:
+        lines.append(
+            f"📎 Останется к получению: <b>{_fmt_amount(remaining_after)} {esc(currency)}</b>"
+        )
+    lines.append(f"📅 Срок: {esc(_to_ru(due))}")
+    lines.append("")
+    lines.append("Подтвердите, что эта сумма реально пришла в кассу.")
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Принять", callback_data=f"pay_ok:{payment_id}")
+    kb.button(text="❌ Отклонить", callback_data=f"pay_no:{payment_id}")
+    kb.adjust(2)
+    await _broadcast(
+        bot, "\n".join(lines), get_notify_recipients(), reply_markup=kb.as_markup()
+    )
+
+
 async def notify_payment_confirmed(
     bot: Bot,
     payment: dict,
