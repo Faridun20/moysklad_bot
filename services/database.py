@@ -5403,12 +5403,13 @@ def mark_shipment_request_returned(req_id: int, returned_by: int, returned_name:
 
 def _load_predefined_users():
     try:
-        from config import ADMIN_IDS, BOSS_IDS
+        # MANAGER_IDS импортируем наравне с остальными: config.py определяет её
+        # в ОБЕИХ ветках (фолбэк `MANAGER_IDS = []` при config_local и
+        # _parse_ids("MANAGER_IDS") при env). Отдельный try/__import__/except
+        # вокруг неё маскировал бы реальную ошибку импорта конфига под «нет
+        # менеджеров».
+        from config import ADMIN_IDS, BOSS_IDS, MANAGER_IDS
 
-        try:
-            MANAGER_IDS = __import__("config").MANAGER_IDS
-        except Exception:
-            MANAGER_IDS = []
         with get_conn() as conn:
             cur = get_cursor(conn)
             for uid in ADMIN_IDS:
