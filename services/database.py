@@ -8,7 +8,7 @@ import time
 import logging
 from datetime import datetime, timedelta
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, NamedTuple
 
 from services import money  # канонические деньги (копейки); leaf-модуль, без циклов
 from services import adb_core  # async DB-слой (asyncpg/aiosqlite); leaf-модуль, без циклов
@@ -5161,12 +5161,52 @@ def update_order_currency(order_id: int, currency: str) -> bool:
     return updated
 
 
-def update_order_status(order_id: int, status: str) -> bool:
+def legal_sources_for(target_status: str) -> tuple[str, ...]:
+    """Из каких статусов переход в `target_status` легален — по TRANSITIONS.
+
+    Второй список легальных переходов не заводим: машина состояний одна, она
+    в services.order_workflow. Импорт ленивый — order_workflow тянет database
+    внутри функций, module-level импорт в обе стороны дал бы цикл."""
+    from services.order_workflow import TRANSITIONS
+
+    return tuple(src for src, targets in TRANSITIONS.items() if target_status in targets)
+
+
+def _status_cas_sql(expected_status: str | tuple[str, ...] | None) -> tuple[str, list]:
+    """WHERE-хвост и параметры для compare-and-set статуса заказа."""
+    if expected_status is None:
+        return "", []
+    expected = (expected_status,) if isinstance(expected_status, str) else tuple(expected_status)
+    if not expected:
+        # Пустой набор = переход нелегален ни из какого статуса. Ставим заведомо
+        # ложное условие, а не «без guard'а» — иначе опечатка в target_status
+        # молча превратилась бы в безусловный UPDATE.
+        return " AND 1 = 0", []
+    ph = ", ".join("?" for _ in expected)
+    return f" AND status IN ({ph})", list(expected)
+
+
+def update_order_status(
+    order_id: int,
+    status: str,
+    expected_status: str | tuple[str, ...] | None = None,
+) -> bool:
+    """Перевести заказ в статус. Возвращает True, если строка реально изменилась.
+
+    `expected_status` — compare-and-set: UPDATE применяется, только если текущий
+    статус входит в набор. Без него UPDATE безусловный (легаси-вызовы; они
+    закрываются в T2.3/T2.7).
+
+    Зачем CAS: МойСклад мог прислать `Unsuccessful` и перевести заказ
+    pending→rejected, а заявка при этом осталась `pending`. Босс открывал старое
+    сообщение в чате, жал «Одобрить» — и заказ ВОСКРЕСАЛ из rejected в approved
+    с новыми документами в МС (§2.2)."""
+    tail, extra = _status_cas_sql(expected_status)
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("UPDATE orders SET status = ?, updated_at = ? WHERE id = ?"),
-            (status, now_str(), order_id),
+            q(f"UPDATE orders SET status = ?, updated_at = ? WHERE id = ?{tail}"),
+            (status, now_str(), order_id, *extra),
         )
         updated = cur.rowcount > 0
         conn.commit()
@@ -5314,54 +5354,113 @@ async def get_pending_requests() -> list[dict]:
     )
 
 
-def approve_shipment_request(req_id: int, approved_by: int, approved_name: str) -> bool:
+class ShipmentDecision(NamedTuple):
+    """Итог решения по заявке. `applied` — заявка И заказ реально переведены.
+
+    `reason` при отказе:
+      • 'request_taken' — заявку уже обработал кто-то другой;
+      • 'order_moved'   — заявка была pending, но заказ успел уйти в другой
+                          статус (напр. МС прислал Unsuccessful → rejected).
+    `order_status` — фактический статус заказа на момент отказа, для сообщения.
+    """
+
+    applied: bool
+    reason: str | None = None
+    order_status: str | None = None
+    order_id: int | None = None
+
+
+def _decide_shipment_request(
+    req_id: int,
+    by: int,
+    by_name: str,
+    *,
+    req_status: str,
+    order_status: str,
+    audit_action: str,
+    audit_text: str,
+) -> ShipmentDecision:
+    """Атомарно перевести заявку И заказ. Либо оба, либо ни одного.
+
+    Раньше это были две отдельные транзакции, и апдейт заказа шёл БЕЗ guard'а:
+    заявка становилась approved, а заказ продавливался в approved из любого
+    статуса — отклонённый заказ воскресал и получал новые документы в МС (§2.2).
+    Теперь заказ переводится compare-and-set в той же транзакции: не прошёл CAS
+    — откатывается и заявка.
+    """
+    allowed = legal_sources_for(order_status)
+    tail, extra = _status_cas_sql(allowed)
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
             q("""UPDATE shipment_requests
-               SET status = 'approved', approved_by = ?, approved_by_name = ?, approved_at = ?
+               SET status = ?, approved_by = ?, approved_by_name = ?, approved_at = ?
                WHERE id = ? AND status = 'pending'"""),
-            (approved_by, approved_name, now_str(), req_id),
+            (req_status, by, by_name, now_str(), req_id),
         )
-        updated = cur.rowcount > 0
-        conn.commit()
-    if updated:
-        req = get_shipment_request(req_id)
-        if req is not None:
-            update_order_status(req["order_id"], "approved")
-            add_audit_log(
-                approved_by,
-                approved_name,
-                get_role(approved_by),
-                "shipment_approved",
-                f"Заявка #{req_id} одобрена (заказ #{req['order_id']} от {req['full_name']})",
-            )
-    return updated
+        if (cur.rowcount or 0) == 0:
+            conn.rollback()
+            return ShipmentDecision(False, "request_taken")
 
+        cur.execute(q("SELECT order_id FROM shipment_requests WHERE id = ?"), (req_id,))
+        row = cur.fetchone()
+        order_id = (row["order_id"] if USE_POSTGRES else row[0]) if row else None
+        if order_id is None:
+            conn.rollback()
+            return ShipmentDecision(False, "request_taken")
 
-def reject_shipment_request(req_id: int, rejected_by: int, rejected_name: str) -> bool:
-    with get_conn() as conn:
-        cur = get_cursor(conn)
         cur.execute(
-            q("""UPDATE shipment_requests
-               SET status = 'rejected', approved_by = ?, approved_by_name = ?, approved_at = ?
-               WHERE id = ? AND status = 'pending'"""),
-            (rejected_by, rejected_name, now_str(), req_id),
+            q(f"UPDATE orders SET status = ?, updated_at = ? WHERE id = ?{tail}"),
+            (order_status, now_str(), order_id, *extra),
         )
-        updated = cur.rowcount > 0
+        if (cur.rowcount or 0) == 0:
+            # Заказ ушёл из допустимого статуса — откатываем И заявку, иначе
+            # останется одобренная заявка при отклонённом заказе.
+            cur.execute(q("SELECT status FROM orders WHERE id = ?"), (order_id,))
+            r = cur.fetchone()
+            actual = (r["status"] if USE_POSTGRES else r[0]) if r else None
+            conn.rollback()
+            return ShipmentDecision(False, "order_moved", actual, order_id)
         conn.commit()
-    if updated:
-        req = get_shipment_request(req_id)
-        if req is not None:
-            update_order_status(req["order_id"], "rejected")
-            add_audit_log(
-                rejected_by,
-                rejected_name,
-                get_role(rejected_by),
-                "shipment_rejected",
-                f"Заявка #{req_id} отклонена (заказ #{req['order_id']} от {req['full_name']})",
-            )
-    return updated
+
+    req = get_shipment_request(req_id)
+    if req is not None:
+        add_audit_log(by, by_name, get_role(by), audit_action, audit_text.format(req=req))
+    return ShipmentDecision(True, None, order_status, order_id)
+
+
+def approve_shipment_request(
+    req_id: int, approved_by: int, approved_name: str
+) -> ShipmentDecision:
+    return _decide_shipment_request(
+        req_id,
+        approved_by,
+        approved_name,
+        req_status="approved",
+        order_status="approved",
+        audit_action="shipment_approved",
+        audit_text=(
+            f"Заявка #{req_id} одобрена "
+            "(заказ #{req[order_id]} от {req[full_name]})"
+        ),
+    )
+
+
+def reject_shipment_request(
+    req_id: int, rejected_by: int, rejected_name: str
+) -> ShipmentDecision:
+    return _decide_shipment_request(
+        req_id,
+        rejected_by,
+        rejected_name,
+        req_status="rejected",
+        order_status="rejected",
+        audit_action="shipment_rejected",
+        audit_text=(
+            f"Заявка #{req_id} отклонена "
+            "(заказ #{req[order_id]} от {req[full_name]})"
+        ),
+    )
 
 
 def mark_shipment_request_returned(req_id: int, returned_by: int, returned_name: str) -> bool:

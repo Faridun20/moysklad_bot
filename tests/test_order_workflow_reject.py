@@ -53,7 +53,7 @@ def test_reject_request_already_processed(isolated_db):
     db = isolated_db
     rid, _oid = _make_pending_request(db)
     # Сначала approve'аем чтобы статус стал не-pending.
-    assert db.approve_shipment_request(rid, 1, "Boss") is True
+    assert db.approve_shipment_request(rid, 1, "Boss").applied is True
     bot = _FakeBot()
     res = asyncio.run(order_workflow.reject_shipment_request(rid, 2, "Boss2", bot))
     assert res["ok"] is False

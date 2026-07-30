@@ -217,6 +217,38 @@ async def resubmit_diff_line(order_id: int, items: list[dict]) -> str:
 # Теперь — один сервис, который вызывают и Telegram callback, и /api/.
 
 
+
+# Человекочитаемые названия статусов — для объяснения боссу, почему кнопка
+# из старого сообщения больше не срабатывает.
+_STATUS_RU: dict[str, str] = {
+    "draft": "черновик",
+    "pending": "на согласовании",
+    "approved": "одобрен",
+    "shipped": "отгружен",
+    "paid": "оплачен",
+    "rejected": "отклонён",
+    "cancelled": "отменён",
+    "partially_returned": "частично возвращён",
+    "returned": "возвращён",
+}
+
+
+def _decision_error(decision, order_id) -> str:
+    """Сообщение боссу по отказу CAS (T2.2).
+
+    Различаем два случая: заявку разобрал другой человек — или заказ уехал в
+    другой статус (напр. МойСклад прислал Unsuccessful и заказ стал rejected),
+    а кнопка осталась в старом сообщении чата.
+    """
+    if decision.reason == "order_moved":
+        human = _STATUS_RU.get(decision.order_status or "", decision.order_status or "?")
+        return (
+            f"Заказ #{order_id} уже в статусе «{human}» — решение по заявке "
+            f"больше не применимо. Откройте заказ и посмотрите актуальное состояние."
+        )
+    return "Заявка уже обработана другим пользователем"
+
+
 async def approve_shipment_request(
     req_id: int,
     boss_user_id: int,
@@ -301,11 +333,11 @@ async def approve_shipment_request(
     # Атомарный UPDATE ... WHERE status='pending' — защита от race condition,
     # когда два босса одновременно жмут «Одобрить». Только один из них
     # получит rowcount==1, остальные — False.
-    ok = await adb.approve_shipment_request(req_id, boss_user_id, boss_name)
-    if not ok:
+    decision = await adb.approve_shipment_request(req_id, boss_user_id, boss_name)
+    if not decision.applied:
         return {
             "ok": False,
-            "error": "Заявка уже обработана другим пользователем",
+            "error": _decision_error(decision, req.get("order_id")),
             "req_id": req_id,
             "order_id": req.get("order_id"),
         }
@@ -623,11 +655,11 @@ async def reject_shipment_request(
             "order_id": req.get("order_id"),
         }
 
-    ok = await adb.reject_shipment_request(req_id, boss_user_id, boss_name)
-    if not ok:
+    decision = await adb.reject_shipment_request(req_id, boss_user_id, boss_name)
+    if not decision.applied:
         return {
             "ok": False,
-            "error": "Заявка уже обработана другим пользователем",
+            "error": _decision_error(decision, req.get("order_id")),
             "req_id": req_id,
             "order_id": req.get("order_id"),
         }
