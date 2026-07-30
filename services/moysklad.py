@@ -234,6 +234,24 @@ async def ms_get(
                 resp.raise_for_status()
                 _circuit.record_success()
                 return await resp.json()
+        except aiohttp.ClientResponseError as e:
+            # T2.9: raise_for_status() бросает ClientResponseError, а раньше
+            # except ловил только TimeoutError/ClientConnectionError — исключение
+            # уходило наружу МИМО record_failure() и record_success(). Счётчик
+            # брейкера застывал, и он открывался только на таймаутах и сетевых
+            # обрывах, хотя докстринг обещал «после 5 провальных запросов».
+            #
+            # Различаем, чья это ошибка:
+            #   429 / 5xx — деградация МойСклад, считаем в брейкер (сюда мы
+            #               попадаем, только исчерпав ретраи выше);
+            #   прочие 4xx — наша ошибка (кривой фильтр, нет прав, 404).
+            #               Ретраить и открывать цепь бессмысленно: повтор даст
+            #               то же самое, а открытая цепь положит ВСЕ остальные
+            #               МС-операции. Брейкер не трогаем вовсе.
+            if e.status in _RETRY_STATUSES:
+                last_exc = e
+                break  # → record_failure() ниже
+            raise
         except (TimeoutError, aiohttp.ClientConnectionError) as e:
             last_exc = e
             if attempt >= _MAX_RETRIES - 1:
