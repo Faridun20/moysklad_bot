@@ -269,66 +269,6 @@ def test_webapp_create_order_reuses_empty_draft(isolated_db, monkeypatch):
     assert len(asyncio.run(db.get_user_orders(20, status="draft"))) == 1
 
 
-def test_new_order_button_twice_gives_one_draft(isolated_db):
-    """Три тапа по «Новый заказ» → один черновик в /myorders (было три)."""
-    db = isolated_db
-    from handlers.orders import cb_new_order
-
-    roles.invalidate_all_roles()
-    db.set_role(1, "mgr", "Manager", "manager")
-
-    for _ in range(3):
-        asyncio.run(cb_new_order(_FakeCall("ord_new", uid=1)))
-
-    drafts = asyncio.run(db.get_user_orders(1, status="draft"))
-    assert len(drafts) == 1
-
-
-# ─── пикеры и списки ──────────────────────────────────────────────────────────
-
-
-def test_agent_pick_drops_the_list_keyboard(isolated_db):
-    """Клиент выбран, state очищен → фильтр choosing_agent больше не совпадает,
-    повторный тап висел бы без ответа. Кнопки списка снимаем."""
-    db = isolated_db
-    from handlers.orders import cb_agent_pick
-
-    roles.invalidate_all_roles()
-    db.set_role(1, "mgr", "Manager", "manager")
-    oid = db.create_order(1, "Manager", "")
-
-    state = _FakeState()
-    asyncio.run(state.update_data(order_id=oid, agents=[{"id": "AG-1", "name": "Клиент"}]))
-    call = _FakeCall(f"agent_pick:{oid}:0", uid=1)
-    asyncio.run(cb_agent_pick(call, state))
-
-    assert asyncio.run(db.get_order(oid))["agent_id"] == "AG-1"
-    assert call.message.markup is None
-
-
-def test_product_pick_drops_the_list_keyboard(isolated_db):
-    db = isolated_db
-    from handlers.orders import cb_prod_pick
-
-    roles.invalidate_all_roles()
-    db.set_role(1, "mgr", "Manager", "manager")
-    oid = db.create_order(1, "Manager", "")
-
-    state = _FakeState()
-    asyncio.run(
-        state.update_data(
-            order_id=oid,
-            products=[
-                {"name": "Товар", "href": "", "ms_id": "", "unit": "шт", "stock": 5, "sale_min": None}
-            ],
-        )
-    )
-    call = _FakeCall(f"prod_pick:{oid}:0", uid=1)
-    asyncio.run(cb_prod_pick(call, state))
-
-    assert call.message.markup is None
-
-
 def test_deposit_reject_flow_kills_card_buttons_and_stamps_result(isolated_db):
     """Вход в FSM снимает кнопки карточки (подтвердить параллельно с отклонением
     нельзя), а после ввода причины решение помечается на самой карточке."""
@@ -381,26 +321,3 @@ def test_cancel_flow_kills_abort_button_after_reason(isolated_db):
     asyncio.run(process_cancel_reason(_FakeMessage(text="клиент отказался", uid=2, bot=bot), state, bot))
     assert asyncio.run(db.get_order(oid))["status"] == "cancelled"
     assert (55, 9, None) in bot.markup_edits  # клавиатуру промпта сняли
-
-
-def test_pending_returns_list_hides_used_goods_button(isolated_db):
-    """/returns не должен заново выдавать отработавшую «📦 Товар получен»."""
-    db = isolated_db
-    from handlers.returns import _show_pending_returns
-
-    oid = db.create_order(1, "Manager", "")
-    iid = db.add_order_item(oid, "Товар", "", 2, "шт", 100.0)
-    db.update_order_status(oid, "shipped")
-    res = asyncio.run(db.create_return(oid, "full", "брак", [(iid, 2, 200.0)], "no_refund", 1))
-    assert res["ok"], res
-    ret_id = res["return_id"]
-    asyncio.run(db.mark_return_goods_received(ret_id, 1))
-
-    target = _FakeMessage()
-    asyncio.run(_show_pending_returns(target))
-
-    cards = [kw["reply_markup"] for _, kw in target.answers if kw.get("reply_markup")]
-    assert cards, target.answers
-    cbs = _kb_callbacks(cards[0])
-    assert f"ret_ok:{ret_id}" in cbs  # подтвердить возврат — можно
-    assert f"ret_got:{ret_id}" not in cbs  # приёмка уже отмечена

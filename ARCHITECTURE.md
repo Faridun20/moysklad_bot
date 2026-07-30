@@ -345,7 +345,7 @@ snapshot-таблиц.
 ```
 [менеджер]
    │
-   │ создаёт заказ в WebApp (или /neworder)
+   │ создаёт заказ в WebApp
    ▼
 order: status=draft, agent, items, payment_type, due_date?
    │
@@ -371,7 +371,7 @@ push → все boss/admin
 ```
 [menager] approved/shipped credit order, due_date=2026-05-20
    │
-   │ Открытый долг — виден в /debts и WebApp «Долги»
+   │ Открытый долг — виден в WebApp «Финансы → Долги»
    ▼
    │ Менеджер нажал «✅ Отметить оплачено»
    ▼
@@ -516,17 +516,28 @@ pending платежи. Без этой оптимизации 96 cron-тико�
 
 - `bot.py` — точка входа, регистрирует роутеры, поднимает middleware и
   ветвится по `BOT_MODE`.
-- `handlers/start.py` — `/start`, главное меню, выбор экрана.
-- `handlers/orders.py` — создание заказа, добавление позиций, отправка
-  на одобрение, FSM для выбора количества/цены/клиента.
-- `handlers/debts.py` — `/debts`, кнопки «Отметить оплачено» /
-  «Подтверждаю» / «Отклонить».
-- `handlers/payments.py` — `/pay` для отдельных платежей в кассу.
-- `handlers/shipments.py` — `/shipments` для boss, просмотр новых отгрузок.
-- `handlers/analytics.py` — `/analytics`, агрегаты МойСклад.
-- `handlers/users.py` — `/addrole`, `/users`, `/syncms`.
+T3.3: бот срезан до того, чего нет в WebApp. Экраны-дубли (создание заказа с
+каталогом МойСклад, списки заказов и заявок, остатки, долги, аналитика, касса,
+сдачи, возвраты, кредит-лимиты, курсы, цены) удалены вместе с
+`handlers/{analytics,stock,credit,pricing,debts}.py`; их команды отвечают
+подсказкой `handlers.start.cmd_retired` со ссылкой на экран WebApp.
+
+- `handlers/start.py` — `/start`, меню (вход в WebApp), `/find`, `/refresh`,
+  `/snapshot`, подсказка по снятым командам.
+- `handlers/orders.py` — решения по заявке (одобрить / отклонить / на доработку /
+  с превышением лимита), карточка заказа для чтения, `/frozen` + разморозка.
+  Плюс форматтеры карточек, которые зовёт WebApp при создании заявки.
+- `handlers/payments.py` — `/pay` (платёж в кассу), подтверждение/отклонение
+  платежа кнопками, `/sync_payments` со статусом МС-синка и retry.
+- `handlers/deposits.py` — подтверждение/отклонение сдачи наличных кнопками.
+- `handlers/returns.py` — приёмка товара и подтверждение возврата кнопками.
+- `handlers/shipments.py` — `/shipments`, просмотр новых отгрузок.
+- `handlers/order_ship.py` / `handlers/order_cancel.py` — `/ship`, `/cancel`.
+- `handlers/users.py` — `/addrole`, `/users`, `/deactivate`, `/syncms`.
 - `handlers/audit.py` — `/audit`, просмотр аудит-лога.
 - `handlers/log.py` — `/log`, последние записи логов.
+- `handlers/_ui.py` — общие приёмы работы с inline-клавиатурами (T3.2) и
+  кнопка входа в WebApp.
 
 ### 7.2 Middlewares
 

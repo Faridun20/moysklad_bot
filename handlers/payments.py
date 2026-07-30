@@ -1,9 +1,13 @@
 """
-Хэндлеры: учёт платежей от сотрудников — улучшенный визуал
+Хэндлеры: платежи сотрудников — отправка, подтверждение, статус МС-синка.
+
+T3.3: отчёт /payreport вырезан — история платежей и сводки есть в WebApp
+(«Финансы», /api/payments/history). Отправка платежа (/pay) осталась: это
+три касания в чате против захода в WebApp, а подтверждение боссом (pay_ok/
+pay_no) приходит push-карточкой. /sync_payments в WebApp аналога не имеет.
 """
 
 import logging
-from datetime import timedelta
 
 from aiogram import Bot, Router, F
 from aiogram.filters import Command
@@ -21,12 +25,9 @@ def _can_send_payment(user_id: int) -> bool:
     return _has_role(user_id, "admin", "manager")
 
 
-from handlers._ui import drop_keyboard
-from utils.formatters import (
-    format_payments_report,
-    DIV,
-)
-from utils.keyboards import next_actions_keyboard
+from handlers._ui import drop_keyboard, webapp_keyboard
+from utils.formatters import DIV
+from utils.helpers import esc as _esc, local_now  # единая реализация — utils/helpers.py
 from services import async_db as adb
 
 from config import ALLOWED_CURRENCIES as CURRENCIES
@@ -99,17 +100,6 @@ def confirm_keyboard(payment_id: int):
     kb.button(text="✅ Принять", callback_data=f"pay_ok:{payment_id}")
     kb.button(text="❌ Отклонить", callback_data=f"pay_no:{payment_id}")
     kb.adjust(2)
-    return kb.as_markup()
-
-
-def pay_report_keyboard():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📅 Сегодня", callback_data="pr:today")
-    kb.button(text="📅 Эта неделя", callback_data="pr:week")
-    kb.button(text="📅 Этот месяц", callback_data="pr:month")
-    kb.button(text="📅 Всё время", callback_data="pr:all")
-    kb.button(text="🏠 Меню", callback_data="menu")
-    kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 
@@ -257,7 +247,7 @@ async def confirm_pay(call: CallbackQuery, bot: Bot):
     await call.message.edit_text(
         base + f"\n\n{DIV}\n✅ <b>Принято</b>  <code>{now}</code>  — {_esc(admin_name)}",
         parse_mode="HTML",
-        reply_markup=next_actions_keyboard([("💳 Долги", "debts_my"), ("🏠 Меню", "menu")]),
+        reply_markup=webapp_keyboard("🌐 Долги — в WebApp"),
     )
 
     from services.notify import notify_payment_confirmed as _npayc
@@ -287,74 +277,12 @@ async def reject_pay(call: CallbackQuery, bot: Bot):
     await call.message.edit_text(
         base + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{now}</code>  — {_esc(admin_name)}",
         parse_mode="HTML",
-        reply_markup=next_actions_keyboard([("💳 Долги", "debts_my"), ("🏠 Меню", "menu")]),
+        reply_markup=webapp_keyboard("🌐 Долги — в WebApp"),
     )
 
     from services.notify import notify_payment_rejected as _npayr
 
     await _npayr(bot, payment)
-
-
-# ─── Отчёт ────────────────────────────────────────────────────────────────────
-
-
-@router.message(Command("payreport"))
-async def cmd_payreport(message: Message):
-    if not is_admin(message.from_user.id):
-        return await message.answer("⛔ Нет доступа.")
-    await message.answer("📊 За какой период показать отчёт?", reply_markup=pay_report_keyboard())
-
-
-@router.callback_query(F.data.startswith("pr:"))
-async def cb_payreport(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return await call.answer("⛔ Нет доступа", show_alert=True)
-    await call.answer()
-
-    period = call.data.split(":")[1]
-
-    if period == "menu":
-        return await call.message.answer(
-            "📊 За какой период показать отчёт?", reply_markup=pay_report_keyboard()
-        )
-
-    now = local_now()
-    if period == "today":
-        since = now.replace(hour=0, minute=0, second=0).strftime("%Y-%m-%d %H:%M:%S")
-        until, label = None, "сегодня"
-    elif period == "week":
-        since = (now - timedelta(weeks=1)).strftime("%Y-%m-%d %H:%M:%S")
-        until, label = None, "эта неделя"
-    elif period == "month":
-        since = now.replace(day=1, hour=0, minute=0, second=0).strftime("%Y-%m-%d %H:%M:%S")
-        until, label = None, "этот месяц"
-    else:
-        since, until, label = None, None, "всё время"
-
-    summary = await adb.get_summary_by_employee(since, until)
-    payments = await adb.get_payments_report(since, until)
-
-    if not payments:
-        return await call.message.answer(
-            f"{DIV}\n📊 <b>Платежи · {label}</b>\n\n<i>Нет платежей за период</i>",
-            parse_mode="HTML",
-        )
-
-    messages = format_payments_report(summary, payments, label)
-    for msg in messages:
-        await call.message.answer(msg, parse_mode="HTML")
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📅 Другой период", callback_data="pr:menu")
-    kb.button(text="🏠 Меню", callback_data="menu")
-    kb.adjust(1)
-    await call.message.answer("Выберите действие:", reply_markup=kb.as_markup())
-
-
-# ─── /sync_payments: показать состояние и ретрайнуть синки в МойСклад ───────
-
-
-from utils.helpers import esc as _esc, local_now  # единая реализация — utils/helpers.py
 
 
 async def _format_sync_status() -> tuple[str, bool]:

@@ -1,9 +1,12 @@
 """
-Хэндлеры: сдача наличных в кассу (cash deposits, IMPLEMENTATION.md §7).
+Хэндлеры: решения по сдаче наличных в кассу (IMPLEMENTATION.md §7).
 
-Менеджер: /deposit <сумма> — создать сдачу (авто-распределение по своим
-открытым заказам). /my_deposits — список своих сдач.
-Босс/бухгалтер: кнопки «Подтвердить»/«Отклонить» под уведомлением.
+T3.3: создание сдачи (/deposit), свои сдачи (/my_deposits) и очередь
+(/deposits) вырезаны — это WebApp («Финансы → Касса»). В боте остались кнопки
+«Подтвердить»/«Отклонить» под push-карточкой: бухгалтер решает прямо в
+уведомлении, отклонение спрашивает причину.
+
+`_notify_confirmers` зовёт и WebApp (webapp/server.py) при создании сдачи.
 
 Логика — в services.database (create/confirm/reject_cash_deposit); тут только
 Telegram-UI и уведомления.
@@ -12,18 +15,16 @@ Telegram-UI и уведомления.
 import logging
 
 from aiogram import Bot, F, Router
-from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services import async_db as adb
-from services.roles import _has_role, can_confirm_deposit
-from handlers._ui import drop_keyboard, finish_message
+from services.roles import can_confirm_deposit
+from handlers._ui import drop_keyboard, finish_message, webapp_keyboard
 from utils.helpers import esc
 from utils.formatters import DIV
-from utils.keyboards import next_actions_keyboard
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -31,10 +32,6 @@ router = Router()
 
 class DepositReject(StatesGroup):
     waiting_for_reason = State()
-
-
-def _can_deposit(user_id: int) -> bool:
-    return _has_role(user_id, "admin", "boss", "manager")
 
 
 def _confirm_keyboard(deposit_id: int):
@@ -95,97 +92,6 @@ async def _notify_confirmers(bot: Bot, deposit_id: int, manager_name: str, amoun
             logger.warning("deposit notify %d failed: %s", uid, e)
 
 
-@router.message(Command("deposit"))
-async def cmd_deposit(message: Message):
-    if not _can_deposit(message.from_user.id):
-        return await message.answer("⛔ Сдавать наличные могут менеджеры.")
-    parts = (message.text or "").strip().split()
-    if len(parts) != 2:
-        return await message.answer(
-            "💵 Формат: <code>/deposit СУММА</code>\nНапример: <code>/deposit 500</code>",
-            parse_mode="HTML",
-        )
-    try:
-        amount = float(parts[1].replace(",", ".").replace(" ", ""))
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        return await message.answer("❌ Сумма должна быть положительным числом.")
-
-    res = await adb.create_cash_deposit(message.from_user.id, amount)
-    if not res.get("ok"):
-        return await message.answer(f"⚠️ {res.get('error', 'не удалось создать сдачу')}")
-
-    manager_name = message.from_user.full_name or str(message.from_user.id)
-    await _notify_confirmers(message.bot, res["deposit_id"], manager_name, amount)
-    await message.answer(
-        f"✅ Сдача #{res['deposit_id']} на <b>{_fmt_amount(amount)} {_base_cur()}</b> создана "
-        f"и отправлена на подтверждение.",
-        parse_mode="HTML",
-    )
-
-
-@router.message(Command("my_deposits"))
-async def cmd_my_deposits(message: Message):
-    if not _can_deposit(message.from_user.id):
-        return await message.answer("⛔ Нет доступа.")
-    deposits = await adb.get_manager_cash_deposits(message.from_user.id)
-    if not deposits:
-        return await message.answer("📭 Сдач пока нет.")
-    emoji = {"pending": "⏳", "confirmed": "✅", "rejected": "❌"}
-    lines = [f"{DIV}", "💵 <b>Мои сдачи:</b>\n"]
-    for d in deposits:
-        st = d.get("status", "pending")
-        line = f"{emoji.get(st, '•')} #{d['id']} — {_fmt_cents(d['amount_cents'])} {_base_cur()}  ·  {st}"
-        if st == "rejected" and d.get("reject_reason"):
-            line += f"\n   <i>{esc(d['reject_reason'])}</i>"
-        lines.append(line)
-    await message.answer("\n".join(lines), parse_mode="HTML")
-
-
-async def _show_pending_deposits(target):
-    """Список сдач на подтверждении с кнопками (для боса/бухгалтера).
-    Раньше сдачи можно было подтвердить только из push-уведомления — если
-    оно потерялось, бухгалтер не мог найти очередь. Теперь есть /deposits."""
-    deposits = await adb.get_pending_cash_deposits()
-    if not deposits:
-        return await target.answer("✅ Нет сдач на подтверждении.")
-    await target.answer(
-        f"💵 <b>Сдачи на подтверждении ({len(deposits)}):</b>", parse_mode="HTML"
-    )
-    for d in deposits:
-        allocations = await adb.get_cash_deposit_orders(d["id"])
-        orders_line = (
-            "\n".join(
-                f"  • заказ #{a['order_id']} — {_fmt_cents(a['amount_allocated_cents'])} {_base_cur()}"
-                for a in allocations
-            )
-            or "  <i>нет привязок</i>"
-        )
-        text = (
-            f"{DIV}\n"
-            f"💵 <b>Сдача #{d['id']}</b>\n"
-            f"💰 Сумма: <b>{_fmt_cents(d['amount_cents'])} {_base_cur()}</b>\n"
-            f"📦 Закрывает заказы:\n{orders_line}"
-        )
-        await target.answer(text, parse_mode="HTML", reply_markup=_confirm_keyboard(d["id"]))
-
-
-@router.message(Command("deposits"))
-async def cmd_pending_deposits(message: Message):
-    if not can_confirm_deposit(message.from_user.id):
-        return await message.answer("⛔ Подтверждать сдачи может босс/бухгалтер.")
-    await _show_pending_deposits(message)
-
-
-@router.callback_query(F.data == "dep_pending")
-async def cb_pending_deposits(call: CallbackQuery):
-    if not can_confirm_deposit(call.from_user.id):
-        return await call.answer("⛔ Нет доступа", show_alert=True)
-    await call.answer()
-    await _show_pending_deposits(call.message)
-
-
 @router.callback_query(F.data.startswith("dep_ok:"))
 async def cb_deposit_confirm(call: CallbackQuery, bot: Bot):
     if not can_confirm_deposit(call.from_user.id):
@@ -208,7 +114,7 @@ async def cb_deposit_confirm(call: CallbackQuery, bot: Bot):
     await call.message.edit_text(
         original + f"\n\n{DIV}\n✅ <b>Подтверждено</b> — {esc(name)}",
         parse_mode="HTML",
-        reply_markup=next_actions_keyboard([("💵 Ещё сдачи", "dep_pending"), ("🏠 Меню", "menu")]),
+        reply_markup=webapp_keyboard("🌐 Ещё сдачи — в WebApp"),
     )
     if dep and dep.get("manager_id"):
         closed = res.get("closed_orders") or []

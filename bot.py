@@ -149,42 +149,35 @@ async def set_global_menu_button(bot: Bot) -> None:
 
 def register_routers(dp: Dispatcher):
     """Подключить все роутеры."""
+    # T3.3: каталог/остатки, аналитика, кредит-лимиты, курсы и цены, экран
+    # долгов вырезаны из бота — они есть в WebApp. Остались решения по
+    # push-карточкам, ops/admin-команды без аналога в WebApp и /find.
     from handlers import (
         start,
         users,
-        stock,
         shipments,
-        analytics,
         payments,
         audit,
         log,
         orders,
-        debts,
         deposits,
         returns,
-        credit,
         order_cancel,
         order_ship,
-        pricing,
     )
 
     routers = [
         start.router,
         users.router,
-        stock.router,
         shipments.router,
-        analytics.router,
         payments.router,
         audit.router,
         log.router,
         orders.router,
-        debts.router,
         deposits.router,
         returns.router,
-        credit.router,
         order_cancel.router,
         order_ship.router,
-        pricing.router,
     ]
     for r in routers:
         dp.include_router(r)

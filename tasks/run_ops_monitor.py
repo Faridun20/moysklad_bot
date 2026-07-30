@@ -254,46 +254,6 @@ def build_ms_sync_block(anomalies: dict[str, list[dict]]) -> str | None:
     return "\n".join(lines)
 
 
-def assemble_digest(title: str, blocks: list[str | None]) -> str | None:
-    """Склеить непустые блоки в одну сводку. None — если всё пусто."""
-    present = [b for b in blocks if b]
-    if not present:
-        return None
-    return f"{DIV}\n{title}\n\n" + "\n\n".join(present)
-
-
-def build_digest_keyboard(
-    stale: list[dict] | None = None,
-    deposits: list[dict] | None = None,
-    returns: list[dict] | None = None,
-    max_orders: int = 5,
-) -> dict | None:
-    """Инлайн-клавиатура к дайджесту: deep-link кнопки к УЖЕ существующим
-    обработчикам бота — `ord_view:{id}` (просмотр заказа), `dep_pending`
-    (список сдач), `ret_pending` (список возвратов). Возвращает dict в формате
-    Telegram Bot API (reply_markup для tg_send_message) или None, если действий нет.
-
-    Кнопки-заказы — по первым `max_orders` зависшим (по 3 в ряд); сдачи/возвраты —
-    один вход в соответствующий список. Сами обработчики живут в bot-процессе
-    (cron только отправляет сообщение, callback'и обрабатывает бот).
-    """
-    rows: list[list[dict]] = []
-    order_btns = [
-        {"text": f"⏳ #{o['id']}", "callback_data": f"ord_view:{o['id']}"}
-        for o in (stale or [])[:max_orders]
-    ]
-    for i in range(0, len(order_btns), 3):
-        rows.append(order_btns[i : i + 3])
-    nav: list[dict] = []
-    if deposits:
-        nav.append({"text": f"💵 Сдачи ({len(deposits)})", "callback_data": "dep_pending"})
-    if returns:
-        nav.append({"text": f"↩️ Возвраты ({len(returns)})", "callback_data": "ret_pending"})
-    if nav:
-        rows.append(nav)
-    return {"inline_keyboard": rows} if rows else None
-
-
 # ─── Дневной пинг (короткое уведомление → смотри в WebApp) ────────────────────
 #
 # Раньше ops_monitor рассылал большие дайджесты в Telegram. Теперь сводку

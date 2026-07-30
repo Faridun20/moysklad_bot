@@ -18,11 +18,36 @@
 
 import logging
 
-from aiogram.types import CallbackQuery
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, WebAppInfo
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from config import WEBAPP_URL
 from utils.helpers import local_now
 
 logger = logging.getLogger(__name__)
+
+
+def webapp_keyboard(
+    text: str = "🌐 Открыть WebApp", *, menu: bool = True
+) -> InlineKeyboardMarkup | None:
+    """Кнопка входа в WebApp (+ «🏠 Меню»).
+
+    T3.3: «что дальше» после решения ведёт в WebApp — списки заявок/сдач/
+    возвратов из бота вырезаны, и старые callback'и (`ord_requests`,
+    `dep_pending`, `ret_pending`, `debts_my`) больше никем не обрабатываются:
+    кнопка на них висела бы без ответа.
+
+    web_app-кнопку Telegram принимает только с https-URL, поэтому при пустом
+    или локальном WEBAPP_URL остаётся одно «Меню» (а если и его не просят —
+    None: пустой markup Bot API отвергает).
+    """
+    kb = InlineKeyboardBuilder()
+    if WEBAPP_URL and WEBAPP_URL.startswith("https://"):
+        kb.button(text=text, web_app=WebAppInfo(url=WEBAPP_URL))
+    if menu:
+        kb.button(text="🏠 Меню", callback_data="menu")
+    markup = kb.as_markup()
+    return markup if markup.inline_keyboard else None
 
 
 def _stamp() -> str:

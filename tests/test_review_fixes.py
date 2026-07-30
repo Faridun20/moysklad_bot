@@ -12,7 +12,6 @@
 
 import asyncio
 
-from services.roles import invalidate_all_roles
 
 
 class _FakeUser:
@@ -49,32 +48,6 @@ def _credit_debt(db, mgr, agent="A"):
     db.update_order_status(oid, "approved")
     asyncio.run(db.set_order_payment(oid, "credit", "2099-12-31"))
     return oid
-
-
-def test_debts_menu_button_uses_callback_user(isolated_db):
-    db = isolated_db
-    invalidate_all_roles()
-    mgr = 7001
-    db.set_role(mgr, "mgr", "Manager", "manager")
-    _credit_debt(db, mgr)
-
-    from handlers.debts import cb_debts_my
-
-    call = _FakeCall("debts_my", uid=mgr)
-    asyncio.run(cb_debts_my(call))
-
-    # Должны показать долги (сводка + карточка), а не молчать.
-    assert call.message.answers, "меню «Долги» молчит — баг вернулся"
-    assert "Долг" in "\n".join(call.message.answers)
-
-
-def test_debts_silent_for_user_without_rights(isolated_db):
-    invalidate_all_roles()
-    from handlers.debts import cb_debts_my
-
-    call = _FakeCall("debts_my", uid=8002)  # роль не задана → guest
-    asyncio.run(cb_debts_my(call))
-    assert call.message.answers == []  # нет прав → тихо, без падения
 
 
 def test_refund_cash_writes_amount_cents(isolated_db):

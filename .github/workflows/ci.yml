@@ -52,12 +52,12 @@ jobs:
           # Реальные тесты переопределяют env через monkeypatch.
           TELEGRAM_TOKEN: "0:fake-ci-token"
           MS_TOKEN: "fake-ci"
-        # --cov-fail-under=35 — «храповик» с буфером 5-6% ниже фактических ~41%
-        # (после PR #40: +9 ms_payments contract, +5 reject_shipment, +3 sentry
-        # init dispatch = 17 новых). Buffer защищает от шума метрики (1-2%
-        # колебание между прогонами) и оставляет пространство для рефакторов,
+        # --cov-fail-under=55 — «храповик». Факт после T3.3 — ~67%: срез
+        # бот-дублей убрал в основном НЕпокрытый код (экраны каталога,
+        # аналитики, списков), поэтому прежний порог 35 стал бессмысленным.
+        # Буфер ~12% защищает от шума метрики и оставляет место рефакторам,
         # но не даёт «забыть» дописать тесты к большим PR'ам.
-        run: pytest tests/ -v --tb=short --cov --cov-report=term-missing --cov-fail-under=35
+        run: pytest tests/ -v --tb=short --cov --cov-report=term-missing --cov-fail-under=55
 
   # Фронт WebApp (webapp/static) теста-харнесса в Python нет — vitest гоняет
   # чистые хелперы (helpers.js) + jsdom-смоук, что app.js грузится без ошибок.

@@ -4,67 +4,15 @@
 
 from utils.helpers import (
     esc,
-    get_folder_name,
-    stock_indicator,
     format_date,
     format_price,
-    trend_arrow,
     local_now,
 )
-
-from config import PAGE_SIZE  # единый источник в config
 
 # ─── Общие элементы ───────────────────────────────────────────────────────────
 
 DIV = "<code>━━━━━━━━━━━━━━━━━━━━</code>"
 DIV2 = "<code>────────────────────</code>"
-
-
-def section_header(emoji: str, title: str, subtitle: str = "") -> str:
-    sub = f"\n<code>{subtitle}</code>" if subtitle else ""
-    return f"{DIV}\n{emoji} <b>{title}</b>{sub}"
-
-
-# ─── Остатки ──────────────────────────────────────────────────────────────────
-
-
-def format_stock_page(rows: list[dict], page: int, cat_name: str = "") -> str:
-    total = len(rows)
-    total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
-    start = page * PAGE_SIZE
-    end = min(start + PAGE_SIZE, total)
-
-    cat_str = f" · {cat_name}" if cat_name else ""
-    lines = [
-        section_header("📦", f"Склад{cat_str}", f"стр {page + 1}/{total_pages} · {total} позиций"),
-        "",
-    ]
-
-    for r in rows[start:end]:
-        name = esc(r.get("name", "—"))
-        stock = r.get("stock", 0)
-        reserve = r.get("reserve", 0)
-        unit = esc(r.get("uom", {}).get("name", "шт"))
-        folder = esc(get_folder_name(r.get("folder", {})))
-        ind = stock_indicator(stock)
-
-        # Название + папка
-        folder_str = f"  <i>{folder}</i>" if folder and not cat_name else ""
-        lines.append(f"{ind} <b>{name}</b>{folder_str}")
-
-        # Остаток + резерв в одну строку
-        reserve_str = f"   <i>резерв: {reserve} {unit}</i>" if reserve else ""
-        lines.append(f"    <code>{stock} {unit}</code>{reserve_str}")
-        # Цена продажи (если задана через /prices) — прямо в каталоге, чтобы
-        # не уходить в /prices ради уточнения. Прикрепляется в handlers/stock.
-        price_str = r.get("_sale_price_str")
-        if price_str:
-            lines.append(f"    {price_str}")
-        lines.append("")
-
-    lines.append(DIV2)
-    lines.append("<code>🟢 ≥100   🟡 20–99   🔴 &lt;20</code>")
-    return "\n".join(lines)
 
 
 # ─── Отгрузка ─────────────────────────────────────────────────────────────────
@@ -108,107 +56,6 @@ def format_shipment(s: dict, positions: list[dict] = None) -> str:
             lines.append(f"\n<i>…ещё {len(positions) - 15} позиций</i>")
     else:
         lines.append(f"\n{DIV2}\n<i>Товары не загружены</i>")
-
-    return "\n".join(lines)
-
-
-# ─── Аналитика продаж ─────────────────────────────────────────────────────────
-
-
-def format_sales_report(label: str, stats: dict, prev_stats: dict = None) -> str:
-    total = stats["total"]
-    count = stats["count"]
-    clients = stats["clients"]
-    top = stats["top_products"]
-
-    total_str = format_price(total)
-    avg_str = format_price(total / count) if count else "0"
-
-    trend = ""
-    if prev_stats and prev_stats["total"] > 0:
-        trend = "  " + trend_arrow(total, prev_stats["total"])
-
-    lines = [
-        section_header("📊", f"Продажи · {label}"),
-        "",
-        f"💰 <b>Выручка:</b>  <b>{total_str} $</b>{trend}",
-        f"🚚 <b>Отгрузок:</b>  {count}",
-        f"👥 <b>Клиентов:</b>  {clients}",
-    ]
-    if count:
-        lines.append(f"📋 <b>Средний чек:</b>  {avg_str} $")
-
-    if top:
-        lines.append("")
-        lines.append("<b>🏆 Топ товаров:</b>")
-        lines.append(DIV2)
-        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-        for i, (name, data) in enumerate(top):
-            t_sum = format_price(data["sum"])
-            qty = data["qty"]
-            medal = medals[i] if i < len(medals) else f"{i + 1}."
-            lines.append(f"{medal} <b>{esc(name)}</b>")
-            lines.append(f"    <code>{qty} шт  ·  {t_sum} $</code>")
-
-    if count == 0:
-        lines.append(f"\n{DIV2}\n<i>Нет данных за период</i>")
-
-    return "\n".join(lines)
-
-
-# ─── Касса / дебиторка (для босса) ────────────────────────────────────────────
-
-
-def format_cashbox_report(label: str, cashbox: dict, receivables: dict) -> str:
-    """Отчёт по кассе для босса: сколько получили за период + кто ещё должен.
-
-    cashbox      — {total_cents, count, by_currency} (поступления за период).
-    receivables  — {total_cents, count, overdue_count, overdue_cents, debtors}
-                   (открытые долги «на сейчас», не за период).
-    Все суммы — в копейках (format_price делит на 100).
-    """
-    lines = [
-        section_header("💰", f"Касса · {label}"),
-        "",
-        "<b>📥 Получено за период:</b>",
-    ]
-    by_cur = cashbox.get("by_currency") or {}
-    if cashbox.get("count"):
-        if len(by_cur) <= 1:
-            lines.append(
-                f"  💵 <b>{format_price(cashbox['total_cents'])} $</b>"
-                f"  ·  {cashbox['count']} платежей"
-            )
-        else:
-            for cur, cents in sorted(by_cur.items(), key=lambda kv: kv[1], reverse=True):
-                lines.append(f"  💵 <b>{format_price(cents)} {esc(cur)}</b>")
-            lines.append(f"  <i>всего {cashbox['count']} платежей</i>")
-    else:
-        lines.append("  <i>поступлений нет</i>")
-
-    lines.append("")
-    lines.append(DIV2)
-    lines.append("<b>📉 Дебиторка (ждём оплаты):</b>")
-    if receivables.get("count"):
-        lines.append(f"  💸 Сумма долгов: <b>{format_price(receivables['total_cents'])} $</b>")
-        lines.append(f"  🧾 Заказов в долг: <b>{receivables['count']}</b>")
-        if receivables.get("overdue_count"):
-            lines.append(
-                f"  ⏰ Просрочено: <b>{receivables['overdue_count']}</b> "
-                f"на <b>{format_price(receivables['overdue_cents'])} $</b>"
-            )
-        lines.append("")
-        lines.append("<b>Кто ещё не оплатил:</b>")
-        lines.append(DIV2)
-        for d in receivables.get("debtors", []):
-            mark = "⏰" if d.get("overdue") else "▸"
-            due = f"  <i>до {esc(d['due_date'])}</i>" if d.get("due_date") else ""
-            lines.append(
-                f"{mark} <b>{esc(d['agent_name'])}</b>  <code>#{d['order_id']}</code>\n"
-                f"    <code>{format_price(d['remaining_cents'])} $</code>{due}"
-            )
-    else:
-        lines.append("  ✅ <i>Открытых долгов нет</i>")
 
     return "\n".join(lines)
 
@@ -258,55 +105,6 @@ def format_payment_rejected(amount: float, currency: str, comment: str) -> str:
     )
 
 
-# ─── Отчёт по платежам ────────────────────────────────────────────────────────
-
-
-def format_payments_report(summary: list[dict], payments: list[dict], label: str) -> list[str]:
-    """Возвращает список сообщений (Telegram ограничивает 4096 символов)."""
-    lines = [
-        section_header("📊", f"Платежи · {label}"),
-        "",
-        "<b>По сотрудникам:</b>",
-        DIV2,
-    ]
-
-    total_by_currency: dict[str, float] = {}
-    for s in summary:
-        lines.append(
-            f"👤 <b>{esc(s['full_name'])}</b>\n"
-            f"    <code>{s['total']:,.0f} {esc(s['currency'])}  ·  {s['count']} платежей</code>"
-        )
-        total_by_currency[s["currency"]] = total_by_currency.get(s["currency"], 0) + s["total"]
-
-    lines.append("")
-    lines.append("<b>Итого:</b>")
-    for cur, total in total_by_currency.items():
-        lines.append(f"  💰 <b>{total:,.0f} {esc(cur)}</b>")
-
-    # Разбиваем на сообщения
-    messages = []
-    current = "\n".join(lines)
-
-    for p in payments:
-        entry = (
-            f"\n{DIV2}\n"
-            f"👤 {esc(p['full_name'])}\n"
-            f"💰 {p['amount']:,.0f} {esc(p['currency'])}\n"
-            f"📝 {esc(p['comment'])}\n"
-            f"🕐 {esc(p['created_at'][:16])}"
-        )
-        if len(current) + len(entry) > 3800:
-            messages.append(current)
-            current = entry.lstrip("\n")
-        else:
-            current += entry
-
-    if current:
-        messages.append(current)
-
-    return messages
-
-
 # ─── Аудит лог ────────────────────────────────────────────────────────────────
 
 
@@ -329,47 +127,3 @@ def format_audit_entry(r: dict) -> str:
     role_str = f" [{esc(r['role'])}]" if r.get("role") else ""
     detail_str = f"\n    <i>{esc(r['details'])}</i>" if r.get("details") else ""
     return f"{emoji} <code>{dt}</code>  <b>{esc(r['full_name'])}</b>{role_str}{detail_str}"
-
-
-# ─── Отчёт по остаткам склада ─────────────────────────────────────────────────
-
-
-def format_stock_report(data: dict) -> str:
-    slow = data["slow"]
-    fast = data["fast"]
-    critical = data["critical"]
-
-    lines = [DIV, "📦 <b>Отчёт по остаткам склада</b>", ""]
-
-    if slow:
-        lines.append("🐢 <b>Залежались (≥30 дней):</b>")
-        for r, days in slow[:5]:
-            name = r.get("name", "—")
-            stock = r.get("stock", 0)
-            unit = r.get("uom", {}).get("name", "шт")
-            lines.append(f"  • <b>{name}</b>")
-            lines.append(f"    <code>{stock} {unit} · {days} дней</code>")
-        lines.append("")
-
-    if fast:
-        lines.append("🚀 <b>Быстро уходят (&lt;7 дней):</b>")
-        for r, days in fast[:5]:
-            name = r.get("name", "—")
-            stock = r.get("stock", 0)
-            unit = r.get("uom", {}).get("name", "шт")
-            lines.append(f"  • <b>{name}</b>")
-            lines.append(f"    <code>{stock} {unit} · {days} дней</code>")
-        lines.append("")
-
-    if critical:
-        lines.append("🔴 <b>Критический остаток (&lt;20):</b>")
-        for r in critical[:5]:
-            name = r.get("name", "—")
-            stock = r.get("stock", 0)
-            unit = r.get("uom", {}).get("name", "шт")
-            lines.append(f"  • <b>{name}</b>: <code>{stock} {unit}</code>")
-
-    if not slow and not fast and not critical:
-        lines.append("✅ <i>Всё в норме — проблем не обнаружено</i>")
-
-    return "\n".join(lines)
