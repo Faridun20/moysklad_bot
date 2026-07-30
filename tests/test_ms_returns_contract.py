@@ -97,14 +97,48 @@ def test_salesreturn_builds_payload_and_saves_id(isolated_db, monkeypatch):
     assert "attributes" not in p
 
 
-def test_salesreturn_deletes_orphan_on_lost_race(isolated_db, monkeypatch):
-    """WP-14: если set_return_ms_id вернул False (гонку выиграл другой вызов),
-    наш только что созданный документ — orphan-дубль → удаляем его в МС."""
+def test_salesreturn_carries_deterministic_sync_id(isolated_db, monkeypatch):
+    """MS-8: syncId — «внешний ключ» документа на стороне МС. Без него повторный
+    POST создавал ВТОРОЙ возврат, который двигал склад и баланс контрагента."""
+    _prime_ctx(monkeypatch)
+    db = isolated_db
+    _oid, rid = _make_confirmed_return(db, with_demand=True)
+    sent = {}
+
+    async def scenario():
+        from services import moysklad
+
+        moysklad._session = None
+        try:
+            with aioresponses() as m:
+
+                def _cb(url, **kwargs):
+                    sent.update(kwargs.get("json") or {})
+                    from aioresponses import CallbackResult
+
+                    return CallbackResult(status=200, payload={"id": "SR-1"})
+
+                m.post(f"{MS_BASE}/entity/salesreturn", callback=_cb)
+                return await ms_returns.create_salesreturn(rid)
+        finally:
+            await moysklad.close_session()
+
+    res = asyncio.run(scenario())
+    assert res["ok"] is True
+    from services.moysklad import order_sync_id
+
+    assert sent["syncId"] == order_sync_id("salesreturn", rid)
+
+
+def test_lost_race_no_longer_deletes_document(isolated_db, monkeypatch):
+    """С syncId оба параллельных вызова получают ОДИН документ, поэтому
+    компенсирующее удаление больше не нужно — и не должно выполняться: раньше
+    оно било по документу, который на самом деле не дубль."""
     _prime_ctx(monkeypatch)
     db = isolated_db
     _oid, rid = _make_confirmed_return(db, with_demand=True)
 
-    async def _lost(*a, **k):  # симулируем проигрыш гонки
+    async def _lost(*a, **k):  # гонку выиграл другой вызов
         return False
 
     monkeypatch.setattr(ms_returns.db, "set_return_ms_id", _lost)
@@ -119,15 +153,13 @@ def test_salesreturn_deletes_orphan_on_lost_race(isolated_db, monkeypatch):
                 m.post(
                     f"{MS_BASE}/entity/salesreturn",
                     status=200,
-                    payload={"id": "SR-ORPHAN", "name": "Возврат"},
+                    payload={"id": "SR-SAME", "name": "Возврат"},
                 )
 
                 def _del_cb(url, **kwargs):
                     deleted["url"] = str(url)
 
-                m.delete(
-                    f"{MS_BASE}/entity/salesreturn/SR-ORPHAN", status=200, callback=_del_cb
-                )
+                m.delete(f"{MS_BASE}/entity/salesreturn/SR-SAME", status=200, callback=_del_cb)
                 return await ms_returns.create_salesreturn(rid)
         finally:
             await moysklad.close_session()
@@ -135,7 +167,7 @@ def test_salesreturn_deletes_orphan_on_lost_race(isolated_db, monkeypatch):
     res = asyncio.run(scenario())
     assert res["ok"] is True
     assert res.get("adopted") is True
-    assert "SR-ORPHAN" in deleted.get("url", "")  # orphan удалён в МС
+    assert deleted == {}  # документ не трогаем
 
 
 def test_salesreturn_idempotent_when_already_synced(isolated_db, monkeypatch):
