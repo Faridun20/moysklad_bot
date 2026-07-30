@@ -2923,7 +2923,13 @@ async def api_orders_cancel(request: Request):
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
-    res = await adb.cancel_order(order_id, user["id"], name, reason)
+    # T2.6: тот же код, что и в боте — с реверсом customerorder в МойСклад.
+    # Раньше здесь реверса НЕ было: заказ, отменённый из WebApp, оставался
+    # в МС живым документом с резервом товара навсегда, и реконсиляция его
+    # уже не подбирала (§5.2.2).
+    from services.order_workflow import cancel_order_full
+
+    res = await cancel_order_full(order_id, user["id"], name, reason)
     if not res.get("ok"):
         raise HTTPException(status_code=409, detail=res.get("error", "не удалось отменить"))
 

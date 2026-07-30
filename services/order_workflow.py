@@ -394,6 +394,51 @@ async def submit_order(
 
 
 
+
+# ─── Отмена заказа ───────────────────────────────────────────────────────────
+
+
+async def cancel_order_full(
+    order_id: int, user_id: int, user_name: str, reason: str
+) -> dict:
+    """Отменить заказ ЛОКАЛЬНО и откатить документ в МойСклад. Общий код для
+    обоих входов (T2.6).
+
+    Раньше реверс делал только бот (`handlers/order_cancel`), а
+    `/api/orders/cancel` — нет. Заказ, отменённый из WebApp, оставался
+    в МойСклад живым customerorder'ом с резервом товара НАВСЕГДА: cron-
+    реконсиляция его не подбирает (`get_orders_with_ms_customerorder`
+    исключает `cancelled`), значит рассинхрон никто уже не заметит (§5.2.2).
+
+    Реверс — best-effort и намеренно ПОСЛЕ локальной отмены: ошибка МС не
+    должна откатывать то, что оператор уже подтвердил. `ms_cancel_synced_at`
+    проставляет сам `reverse_customerorder`, он же идемпотентен (повторный
+    вызов вернёт skipped).
+
+    Возвращает результат `cancel_order` плюс `ms_reverse` — что вышло с МС
+    (для логов и текста оператору).
+    """
+    from services import async_db as adb
+
+    res = await adb.cancel_order(order_id, user_id, user_name, reason)
+    if not res.get("ok"):
+        return res
+
+    from services import ms_cancel
+
+    try:
+        ms_res = await ms_cancel.reverse_customerorder(order_id)
+    except Exception as e:  # noqa: BLE001 — отмена уже применена, МС догоним
+        logger.warning("MS reverse customerorder failed", exc_info=True)
+        ms_res = {"ok": False, "reason": type(e).__name__}
+    if not ms_res.get("ok"):
+        logger.warning(
+            "Заказ #%s отменён локально, но реверс в МС не прошёл: %s",
+            order_id, ms_res.get("reason"),
+        )
+    return {**res, "ms_reverse": ms_res}
+
+
 _STATUS_RU: dict[str, str] = {
     "draft": "черновик",
     "pending": "на согласовании",
