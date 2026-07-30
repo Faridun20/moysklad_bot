@@ -49,6 +49,24 @@ def test_stale_credit_due_index_is_gone(isolated_db):
     assert "idx_orders_credit_due" not in _index_names(isolated_db)
 
 
+def test_redundant_payments_order_index_is_gone(isolated_db):
+    """idx_payments_order_id избыточен: idx_payments_order_status
+    (order_id, status) перекрывает его префиксом, а лишний индекс удорожает
+    каждую вставку платежа."""
+    assert "idx_payments_order_id" not in _index_names(isolated_db)
+
+
+def test_payments_by_order_still_uses_index(isolated_db):
+    """Удаление избыточного индекса не должно отправить запрос в full scan:
+    его покрывает префикс составного."""
+    plan = _plan(
+        isolated_db,
+        "SELECT * FROM payments WHERE order_id = 1 ORDER BY created_at ASC",
+    )
+    assert "idx_payments_order_status" in plan, plan
+    assert "SCAN payments" not in plan, plan
+
+
 def test_open_debts_query_uses_new_index(isolated_db):
     """Готовность T1.8: EXPLAIN на get_open_debts использует новый индекс."""
     plan = _plan(

@@ -596,8 +596,6 @@ def _create_indexes():
             "CREATE INDEX IF NOT EXISTS idx_ms_products_folder ON ms_products(folder_id)",
             "CREATE INDEX IF NOT EXISTS idx_ms_stock_folder ON ms_stock(folder_id)",
             "CREATE INDEX IF NOT EXISTS idx_ms_categories_parent ON ms_categories(parent_id)",
-            # Для запросов «все платежи по заказу» — без него полный скан payments.
-            "CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id)",
             # Уникальность paymentin'ов в МойСклад. Спасает от race condition
             # между cron-retry и confirm-hook: если оба попробуют создать
             # paymentin для одного платежа, второй INSERT упадёт на UNIQUE
@@ -657,6 +655,9 @@ def _create_indexes():
             "CREATE INDEX IF NOT EXISTS idx_cash_deposit_orders_order "
             "ON cash_deposit_orders(order_id)",
             # get_payments_for_order(s) + confirm_all_pending_* фильтруют по паре.
+            # Он же покрывает «все платежи по заказу» (order_id — префикс), поэтому
+            # отдельный idx_payments_order_id не нужен: лишний индекс только
+            # удорожал бы каждую вставку платежа.
             "CREATE INDEX IF NOT EXISTS idx_payments_order_status "
             "ON payments(order_id, status)",
             "CREATE INDEX IF NOT EXISTS idx_payments_pending "
