@@ -117,10 +117,16 @@ def test_delta_window_has_overlap(isolated_db):
         m.get(_CURRENT, callback=cb, repeat=True)
         _run(snap.refresh_stock_delta)
 
-    asked = datetime.strptime(seen[0]["changedSince"], "%Y-%m-%d %H:%M:%S")
-    marker = datetime.now() - timedelta(minutes=10)
-    # Запрошенный момент раньше отметки минимум на величину нахлёста.
-    assert (marker - asked.replace(tzinfo=None)).total_seconds() >= 0
+    # Момент уехал в МСК, поэтому сравнивать с локальным «наивно» нельзя —
+    # на контейнере в UTC (CI) и на машине в UTC+5 разница разная. Возвращаем
+    # его в абсолютное время и только потом сравниваем.
+    asked = datetime.strptime(seen[0]["changedSince"], "%Y-%m-%d %H:%M:%S").replace(
+        tzinfo=snap._MSK
+    )
+    marker = (datetime.now().astimezone()) - timedelta(minutes=10)
+    overlap = (marker - asked).total_seconds()
+    assert overlap >= snap._DELTA_OVERLAP_SEC - 5  # секунда на исполнение теста
+    assert overlap < snap._DELTA_OVERLAP_SEC + 60  # нахлёст, а не «с начала времён»
 
 
 # ─── Применение ───────────────────────────────────────────────────────────────
