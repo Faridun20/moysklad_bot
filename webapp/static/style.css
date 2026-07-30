@@ -42,6 +42,29 @@
   --fill-neutral: rgba(127,127,127,0.12);  /* нейтральная заливка, ок на обеих темах */
   --sk-highlight: rgba(0,0,0,0.07);        /* «блик» шиммера скелетона (тёмный на свете) */
 
+  /* ── Шкалы отступов и типографики (UI-WP-03) ────────────────────────────
+     Значения НЕ новые: это те же 4/8/12/16/20/24 и 10..24, что уже стояли
+     инлайн по всему файлу. Токенизация нужна, чтобы новые компоненты (S2+)
+     не изобретали шестой промежуточный размер: раньше в файле встречались
+     и 13px, и 14px, и 15px подряд без причины.
+     Нечётные разовые значения (2px, 6px, 10px, 14px) остаются инлайн —
+     токен заводим только когда значение переиспользуется трижды. */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+
+  --text-2xs: 10px;   /* мелкие подписи в бейджах */
+  --text-xs:  11px;   /* section-label, вторичные подписи */
+  --text-sm:  12px;   /* subtitle, sub-строки карточек */
+  --text-base:13px;   /* базовый размер плотных списков */
+  --text-md:  15px;   /* основной текст карточки */
+  --text-lg:  17px;   /* заголовок карточки/экрана */
+  --text-xl:  20px;   /* крупные числа (stat) */
+  --text-2xl: 24px;   /* hero-баланс */
+
   /* Семантические цвета (статусы, бейджи, деньги, тренды).
      Светлые значения = прежние hex; тёмные варианты — в блоке
      [data-theme="dark"] ниже. Раньше эти цвета были захардкожены
@@ -453,34 +476,85 @@ body {
 .stat-value-green { color: var(--success); }
 .stat-value-amber { color: var(--warn-strong); }
 
-/* ─── Card ────────────────────────────────────────────────────── */
-.card {
+/* ─── Примитивы поверхностей (UI-WP-01) ───────────────────────────────────
+   Одна идея — белая поверхность с radius=16 и --shadow-card — была
+   переизобретена десять раз: .card, .card-list+.card-row, .stock-row,
+   .agent-row, .prod-row, .order-card, .debt-card, .stat, .editor-item,
+   .search-item. Каждая со своим padding и своим :active, поэтому «поправить
+   тень у карточек» означало найти десять мест и три из них забыть.
+
+   Теперь тень/радиус/фон живут в ОДНОМ месте, а старые классы получают их
+   через общий селектор — переписывать все вызовы в app.js одним махом не
+   нужно, новые экраны (S2+) пишут .c-surface/.c-row напрямую. */
+.c-surface,
+.card,
+.card-list,
+.prod-row,
+.stock-row,
+.agent-row,
+.order-card,
+.debt-card,
+.editor-item,
+.search-item,
+.stat {
   background: var(--bg-card);
   border-radius: var(--radius);
-  padding: 14px 16px;
-  margin-bottom: 8px;
   box-shadow: var(--shadow-card);
 }
 
+/* Контейнер списка строк: собственных отступов нет, скругление режет углы
+   первой и последней строки. */
+.c-surface--list,
 .card-list {
-  background: var(--bg-card);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-card);
-  margin-bottom: 8px;
+  padding: 0;
   overflow: hidden;
 }
+
+/* Самодостаточная карточка. */
+.c-surface--pad,
+.card {
+  padding: 14px var(--sp-4);
+}
+
+/* Строка внутри списочной поверхности. */
+.c-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  transition: background 0.1s ease;
+}
+
+.c-row + .c-row,
+.card-row + .card-row { border-top: 0.5px solid var(--divider); }
+
+/* Кликабельная строка: тач-таргет ≥44px даже в плотных списках (WCAG,
+   UI-WP-31) и явная реакция на нажатие. */
+.c-row[role="button"],
+.c-row--tap {
+  cursor: pointer;
+  min-height: 44px;
+}
+.c-row[role="button"]:active,
+.c-row--tap:active { background: var(--bg-soft); }
+
+/* ─── Card ────────────────────────────────────────────────────── */
+.card {
+  margin-bottom: var(--sp-2);
+}
+
+.card-list { margin-bottom: var(--sp-2); }
 
 .card-row {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
-  border-top: 0.5px solid var(--divider);
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  min-height: 44px;          /* тач-таргет: было визуально ~40px в плотных списках */
   cursor: pointer;
   transition: background 0.1s ease;
 }
 
-.card-row:first-child { border-top: none; }
 .card-row:active { background: var(--bg-soft); }
 
 .card-row-icon {
@@ -563,12 +637,7 @@ body {
 .rev-amount { font-size: 20px; font-weight: 700; letter-spacing: -0.3px; }
 .rev-meta { font-size: 12px; color: var(--text-mute); display: inline-flex; align-items: center; gap: 6px; }
 
-.stat {
-  background: var(--bg-card);
-  border-radius: var(--radius);
-  padding: 14px;
-  box-shadow: var(--shadow-card);
-}
+.stat { padding: 14px; }
 
 .stat-value {
   font-size: 20px;
@@ -755,10 +824,8 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 12px 14px;
-  background: var(--bg-card);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-card);
+  padding: var(--sp-3) 14px;
+  min-height: 44px;
   cursor: pointer;
   transition: opacity 0.1s ease, transform 0.08s ease;
 }
@@ -949,14 +1016,49 @@ body {
 
 /* ─── Заказы (карточки) ──────────────────────────────────────── */
 .order-card {
-  background: var(--bg-card);
-  border-radius: var(--radius);
   padding: 14px;
-  box-shadow: var(--shadow-card);
   border-left: 3px solid transparent;
 }
 
-.order-card--draft    { border-left-color: var(--text-mute); }
+/* ─── Статус-система (UI-WP-02) ───────────────────────────────────────────
+   Было четыре независимых матрицы классов на одни и те же пять состояний:
+   .order-card--*, .status-*, .icon-*, .order-pay--* плюс .debt-* у долгов.
+   Добавить шестой статус значило дописать его в четыре места и в одном
+   забыть — что и произошло с `partial`, доехавшим только до долгов.
+
+   Теперь состояние живёт в атрибуте data-status, а цвет выводится из двух
+   переменных. Новый статус — три строки CSS, а не grep по файлу.
+   overdue/due_today/upcoming/partial переиспользуют ту же семантику
+   (просрочено = danger, сегодня = warn, впереди = info). */
+[data-status] { --status-c: transparent; --status-bg: var(--neutral-bg); }
+
+[data-status="draft"]     { --status-c: var(--neutral);      --status-bg: var(--neutral-bg); }
+[data-status="pending"]   { --status-c: var(--warn-strong);  --status-bg: var(--warn-bg); }
+[data-status="approved"]  { --status-c: var(--success);      --status-bg: var(--success-bg); }
+[data-status="rejected"]  { --status-c: var(--danger);       --status-bg: var(--danger-bg); }
+[data-status="shipped"]   { --status-c: var(--info);         --status-bg: var(--info-bg); }
+[data-status="overdue"]   { --status-c: var(--danger);       --status-bg: var(--danger-bg); }
+[data-status="due_today"] { --status-c: var(--warn-strong);  --status-bg: var(--warn-bg); }
+[data-status="upcoming"]  { --status-c: var(--info);         --status-bg: var(--info-bg); }
+[data-status="partial"]   { --status-c: var(--warn-strong);  --status-bg: var(--warn-bg); }
+
+/* Карточка со статусом: цветная полоса слева. */
+.order-card[data-status],
+.debt-card[data-status] { border-left-color: var(--status-c); }
+
+/* Бейдж статуса внутри такой карточки. */
+[data-status] .c-badge {
+  background: var(--status-bg);
+  color: var(--status-c);
+  padding: var(--sp-1) 10px;
+  border-radius: var(--radius-chip);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+
+/* Переходный период: старые классы отдают тот же цвет, что и data-status,
+   чтобы экраны можно было переводить по одному (S2+), а не все разом. */
+.order-card--draft    { border-left-color: var(--neutral); }
 .order-card--pending  { border-left-color: var(--warn-strong); }
 .order-card--approved { border-left-color: var(--success); }
 .order-card--rejected { border-left-color: var(--danger); }
@@ -1000,14 +1102,15 @@ body {
 .order-date-label { text-transform: none; letter-spacing: 0; margin-top: 16px; }
 .orders-list > .order-date-label:first-child { margin-top: 2px; }
 
+/* Бейдж статуса в карточке заказа: цвет приходит от data-status родителя
+   (.c-badge), здесь — только размер и вес. */
 .order-status {
-  font-size: 11px;
+  font-size: var(--text-xs);
   font-weight: 600;
-  padding: 4px 10px;
-  border-radius: var(--radius-chip);
-  white-space: nowrap;
 }
 
+/* Переходный период (UI-WP-02): экраны, ещё не переведённые на data-status,
+   продолжают работать со старыми классами. Удалить, когда их не останется. */
 .status-draft    { background: var(--neutral-bg); color: var(--neutral); }
 .status-pending  { background: var(--warn-bg); color: var(--warn); }
 .status-approved { background: var(--success-bg); color: var(--success); }
@@ -1145,10 +1248,7 @@ body {
 
 .editor-item {
   display: flex; justify-content: space-between; align-items: center;
-  padding: 12px 14px;
-  background: var(--bg-card);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-card);
+  padding: var(--sp-3) 14px;
 }
 
 /* Строка «Итого» в редакторе — выделена мягкой заливкой (заменяет inline-стиль
@@ -1338,8 +1438,7 @@ body {
   padding: 14px; display: flex; flex-direction: column; gap: 10px;
 }
 .debt-card {
-  padding: 14px 16px; border-radius: var(--radius); border-left: 4px solid transparent;
-  background: var(--bg-card);
+  padding: 14px var(--sp-4); border-left: 4px solid transparent;
 }
 .debt-card.debt-overdue   { border-left-color: var(--danger); }
 .debt-card.debt-due_today { border-left-color: var(--warn-strong); }
@@ -1678,11 +1777,9 @@ body {
   margin: 12px 2px 4px;
 }
 .search-item {
-  background: var(--bg-card);
-  border-radius: var(--radius-sm);
-  padding: 10px 12px;
+  border-radius: var(--radius-sm);   /* мельче карточки: это строка выдачи */
+  padding: 10px var(--sp-3);
   font-size: 14px;
-  box-shadow: var(--shadow-card);
   cursor: pointer;
 }
 .search-item:active { opacity: 0.6; }

@@ -1329,13 +1329,13 @@ function renderOrdersMain() {
           groups[gidx[k]].items.push(o);
         }
         const orderCard = o => `
-      <div class="order-card order-card--${o.status}" data-id="${o.id}">
+      <div class="order-card" data-status="${o.status}" data-id="${o.id}">
         <div class="order-header">
           <div class="order-head-main">
             <div class="order-title">${icon('building')} ${escapeHtml(o.agent_name || 'Без клиента')}</div>
             <div class="order-sub">Заказ #${o.id}${isBoss ? ` · ${escapeHtml(o.full_name)}` : ''}</div>
           </div>
-          <span class="order-status status-${o.status}">${STATUS_NAME[o.status] || o.status}</span>
+          <span class="order-status c-badge">${STATUS_NAME[o.status] || o.status}</span>
         </div>
         <div class="order-meta">
           <span>${icon('box')} ${o.items_count} тов.</span>
@@ -2093,13 +2093,13 @@ async function renderPendingRequests() {
       return;
     }
     const items = data.requests.map(r => `
-      <div class="order-card">
+      <div class="order-card" data-status="pending">
         <div class="order-header">
           <div>
             <div class="order-title">${icon('clock')} Заявка #${r.id}</div>
             <div class="order-manager">${icon('user')} ${r.full_name}</div>
           </div>
-          <span class="order-status status-pending">Ожидает</span>
+          <span class="order-status c-badge">Ожидает</span>
         </div>
         ${r.agent_name ? `<div class="order-agent">${icon('building')} ${r.agent_name}</div>` : ''}
         <div class="order-meta"><span>${r.created_at}</span></div>
@@ -3551,7 +3551,8 @@ async function renderDebts(container) {
     } else if (open.length > 0) {
       html += `<div class="section-label">${icon('card')} Открытые (${open.length})</div>`;
       html += '<div class="debts-list">' + open.map(d => {
-        const stateClass = `debt-${d.state}`;
+        // UI-WP-02: состояние — атрибутом, а не отдельным классом: полоса
+        // карточки и бейдж выводятся из одной пары переменных.
         const stateLabel = d.state === 'partial' ? `${icon('info')} Частично оплачен`
           : d.state === 'overdue' ? `${icon('alert')} Просрочен`
           : d.state === 'due_today' ? `${icon('clock')} Сегодня` : `${icon('calendar')} Срок`;
@@ -3565,7 +3566,7 @@ async function renderDebts(container) {
           </div>
         ` : '';
         return `
-          <div class="debt-card ${stateClass}">
+          <div class="debt-card" data-status="${d.state}">
             <div class="debt-card-top">
               <div class="debt-agent">${icon('building')} ${escapeHtml(d.agent_name)}</div>
               <div class="debt-amount">${fmt(d.total)} ${escapeHtml(d.currency)}</div>
