@@ -4246,7 +4246,7 @@ async def _maybe_close_order_after_payment(
     пути (commit ≡ rollback, lock освобождён). add_audit_log/get_role (sync) —
     мостим через to_thread после транзакции.
     """
-    from config import BASE_CURRENCY
+    from services.debts import calc_order_balance
 
     closed = False
     confirmed_cents = 0
@@ -4265,61 +4265,23 @@ async def _maybe_close_order_after_payment(
         if row["paid_confirmed_at"] is not None:
             return  # already closed
 
-        # Валюта заказа: платежи к заказу должны быть в ней же. Суммируем ТОЛЬКО
-        # платежи в валюте заказа (NULL-валюту платежа трактуем как валюту заказа,
-        # легаси-safe). Иначе платёж в «дорогой» валюте (напр. UZS) в копейках
-        # ложно перекрывал заказ в USD и закрывал его как оплаченный (WP-04).
-        order_cur = (row["currency"] or BASE_CURRENCY or "USD").upper()
+        # Пересчёт ВНУТРИ транзакции (conn=txn) — видим актуальные суммы под тем
+        # же FOR UPDATE, под которым потом закрываем заказ.
+        #
+        # T2.1: формула — из services.debts, а не своя копия. Она учитывает
+        # платежи ТОЛЬКО в валюте заказа (иначе платёж в «дешёвой» валюте вроде
+        # UZS в копейках ложно перекрывал USD-заказ, WP-04) и подтверждённые
+        # сдачи наличных (иначе заказ, оплаченный наполовину сдачей, не
+        # закрывался, WP-05).
+        bal = await calc_order_balance(order_id, conn=txn)
+        confirmed_cents = bal.confirmed_cents
 
-        # Пересчёт ВНУТРИ транзакции — видим актуальную сумму confirmed.
-        # Считаем в копейках (точное сравнение) — без epsilon-костыля.
-        confirmed_cents = int(
-            await txn.fetchval(
-                f"SELECT {_SUM_PAYMENTS_CENTS} FROM payments "
-                "WHERE order_id = $1 AND status = 'confirmed' "
-                "AND COALESCE(UPPER(currency), $2) = $2",
-                order_id,
-                order_cur,
-            )
-            or 0
-        )
-        total_cents = int(
-            await txn.fetchval(
-                f"SELECT {_SUM_ORDER_TOTAL_CENTS} FROM order_items WHERE order_id = $1",
-                order_id,
-            )
-            or 0
-        )
-        # Возвраты уменьшают сумму «к оплате»: заказ закрыт, когда платежи
-        # покрывают total − confirmed-возвраты. net<=0 (напр. полный возврат) —
-        # это не «оплата», закрытием здесь не занимаемся (статус ведёт confirm_return).
-        returns_cents = int(
-            await txn.fetchval(
-                f"SELECT {_SUM_RETURNS_CENTS} FROM returns "
-                f"WHERE order_id = $1 AND {_RETURN_OWED_FILTER}",
-                order_id,
-            )
-            or 0
-        )
-        # Подтверждённые сдачи наличных, распределённые на заказ, тоже покрывают
-        # долг — иначе заказ, оплаченный наполовину сдачей + наполовину платежом,
-        # не закрывался (WP-05). Сдачи в базовой валюте, заказ при наличии сдач
-        # тоже базовый (см. _is_base_currency).
-        deposit_cents = int(
-            await txn.fetchval(
-                f"SELECT {_SUM_ALLOC_CENTS} FROM cash_deposit_orders cdo "
-                "JOIN cash_deposits d ON d.id = cdo.deposit_id "
-                "WHERE cdo.order_id = $1 AND d.status = 'confirmed'",
-                order_id,
-            )
-            or 0
-        )
-        covered_cents = confirmed_cents + deposit_cents
-
-        net_cents = total_cents - returns_cents
+        # net <= 0 (напр. полный возврат) — это не «оплата», закрытием здесь не
+        # занимаемся: статус ведёт confirm_return.
+        net_cents = bal.total_cents - bal.returns_cents
         if net_cents <= 0:
             return
-        if covered_cents < net_cents:
+        if bal.remaining_cents > 0:
             return  # ещё не полностью оплачен (платежи + сдачи, с учётом возвратов)
 
         # Закрываем

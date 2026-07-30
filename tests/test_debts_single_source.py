@@ -177,6 +177,53 @@ def test_cross_currency_payment_does_not_cover_order(isolated_db):
     assert bal.remaining_cents == 100000
 
 
+# ─── Формула существует ровно в одном месте ─────────────────────────────────
+
+
+def test_close_order_delegates_to_shared_formula():
+    """`_maybe_close_order_after_payment` считает остаток тем же кодом.
+
+    Это была четвёртая копия формулы: свой инлайновый SQL внутри
+    FOR UPDATE-транзакции. Формула совпадала, но следующая правка развела бы
+    их снова — а именно эта функция решает, закрывать ли заказ.
+    """
+    import inspect
+
+    from services.database import _maybe_close_order_after_payment
+
+    src = inspect.getsource(_maybe_close_order_after_payment)
+    assert "calc_order_balance(order_id, conn=txn)" in src
+    # Никаких собственных SUM'ов по денежным таблицам.
+    for fragment in ("FROM payments", "FROM order_items", "FROM returns", "cash_deposit_orders"):
+        assert fragment not in src, f"вернулась инлайновая сумма: {fragment}"
+
+
+def test_closing_uses_deposits_and_currency_filter(isolated_db):
+    """Поведенческая проверка того же: заказ закрывается сдачей + платежом,
+    а платёж в чужой валюте его не закрывает."""
+    db = isolated_db
+
+    # Сдача 600 + платёж 400 = 1000 → заказ закрыт.
+    # Путь сдачи помечает закрытие через payment_confirmed/status='paid'
+    # (paid_confirmed_at заполняет только путь платежа).
+    o1 = _order_1000(db)
+    _confirm_payment_of(db, o1, 1, 400.0)
+    _confirmed_deposit_for(db, o1, 1, 600.0)
+    closed = asyncio.run(db.get_order(o1))
+    assert closed["status"] == "paid" and closed["payment_confirmed"] == 1
+    assert asyncio.run(calc_remaining_cents(o1)) == 0
+
+    # Платёж в UZS по USD-заказу заказ не закрывает.
+    o2 = _order_1000(db)
+    db.add_payment(1, "u", "U", 5000.0, "UZS", "чужая валюта", order_id=o2)
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("UPDATE payments SET status='confirmed' WHERE order_id=?"), (o2,))
+        conn.commit()
+    asyncio.run(db._maybe_close_order_after_payment(o2, 1, "Boss"))
+    assert asyncio.run(db.get_order(o2))["paid_confirmed_at"] is None
+
+
 # ─── Получатели напоминания ─────────────────────────────────────────────────
 
 
