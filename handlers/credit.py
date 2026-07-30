@@ -8,6 +8,7 @@
 set_credit_limit); тут только Telegram-UI.
 """
 
+import math
 import logging
 
 from aiogram import F, Router
@@ -94,17 +95,38 @@ async def cb_limit_set(call: CallbackQuery, state: FSMContext):
 
 @router.message(LimitFlow.waiting_amount)
 async def process_limit_amount(message: Message, state: FSMContext):
+    # T2.10: повторный role-check после FSM-перехода — как в deposits.py и
+    # pricing.py. Между нажатием `lim_set:` и вводом суммы админ мог снять
+    # роль; это был единственный FSM в проекте без такой перепроверки.
+    if not can_change_credit_limit(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Нет доступа — действие отменено.")
+
     raw = (message.text or "").strip().replace(",", ".").replace(" ", "")
+    # Проверка была `amount < 0`, а `float('inf') < 0` — ложь, поэтому
+    # «inf»/«nan» проходили насквозь. Бесконечный лимит делает ЛЮБОЙ долг
+    # «свободным»: кредит-чек перестаёт срабатывать, а overview ломается на
+    # арифметике с inf (§5.2.8). Валидация — та же, что в /api/credit/set.
     try:
         amount = float(raw)
-        if amount < 0:
-            raise ValueError
     except ValueError:
-        return await message.answer("❌ Лимит должен быть неотрицательным числом. Повторите.")
+        return await message.answer("❌ Лимит должен быть числом. Повторите.")
+    if not (math.isfinite(amount) and 0 <= amount < 10_000_000):
+        return await message.answer(
+            "❌ Лимит должен быть числом от 0 до 10 000 000. Повторите."
+        )
+
     data = await state.get_data()
     await state.clear()
     agent_id = data.get("agent_id")
     agent_name = data.get("agent_name", "")
+    # Лимит — только контрагенту, на которого реально был заказ (паритет с
+    # WebApp): иначе в credit_limits заводится сирота, которого нет в overview
+    # и который никогда не всплывёт в интерфейсе.
+    if not agent_id or not await adb.agent_has_order(agent_id):
+        return await message.answer(
+            "❌ Лимит можно задать только контрагенту, на которого есть заказ."
+        )
     await adb.set_credit_limit(
         agent_id, agent_name, amount, set_by=message.from_user.id, notes="через /limit"
     )
