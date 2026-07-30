@@ -90,6 +90,7 @@ def test_refund_cash_writes_amount_cents(isolated_db):
     res = asyncio.run(db.create_return(oid, "full", "брак", items, "cash", boss))
     assert res["ok"], res
 
+    asyncio.run(db.mark_return_goods_received(res["return_id"], boss))
     cres = asyncio.run(db.confirm_return(res["return_id"], boss, "Boss"))
     assert cres["ok"], cres
 

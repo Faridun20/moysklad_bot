@@ -2465,12 +2465,31 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
     # завышалась без возможности reconcile. Теперь либо всё, либо ничего.
     try:
         async with adb_core.transaction() as txn:
+            # T2.8: подтвердить возврат можно только если товар ПРИНЯТ.
+            # goods_received писался (mark_return_goods_received), но никогда не
+            # проверялся: босс подтверждал возврат → returned_qty рос, заказ
+            # уходил в returned, а при refund_method='cash' деньги выдавались из
+            # кассы (отрицательная сдача) — за товар, который физически мог не
+            # приехать (§2.12).
+            #
+            # Проверка — частью того же CAS-UPDATE, а не отдельным SELECT'ом:
+            # иначе между проверкой и записью флаг мог смениться.
             rc = await txn.execute(
                 "UPDATE returns SET status = 'confirmed', confirmed_by = $1, confirmed_at = $2 "
-                "WHERE id = $3 AND status = 'pending'",
+                "WHERE id = $3 AND status = 'pending' AND goods_received = 1",
                 confirmed_by, now_str(), return_id,
             )
             if rc == 0:
+                # Различаем причины: «уже обработан» и «товар не принят» — иначе
+                # кладовщик получит непонятное сообщение и пойдёт к админу.
+                row = await txn.fetchrow(
+                    "SELECT status, goods_received FROM returns WHERE id = $1", return_id
+                )
+                if row and row["status"] == "pending" and not row["goods_received"]:
+                    raise _TxnAbort(
+                        "Сначала отметьте, что товар принят "
+                        "(кнопка «Товар получен» в карточке возврата)"
+                    )
                 raise _TxnAbort("Возврат уже обработан")
             ritems = await txn.fetch(
                 "SELECT order_item_id, qty FROM return_items WHERE return_id = $1", return_id
