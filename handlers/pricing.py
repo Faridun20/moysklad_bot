@@ -25,6 +25,7 @@ from config import ALLOWED_CURRENCIES, BASE_CURRENCY
 from services import async_db as adb
 from services import snapshot
 from services.roles import is_boss
+from handlers._ui import drop_keyboard
 from utils.helpers import esc
 from utils.formatters import DIV
 
@@ -79,6 +80,10 @@ async def cb_rate_set(call: CallbackQuery, state: FSMContext):
     await state.set_state(RateFlow.waiting_rate)
     await state.update_data(code=code)
     await call.answer()
+    # T3.2: снимаем клавиатуру списка при входе в FSM. Иначе второй тап по
+    # другому коду переключал выбранную валюту посреди ввода курса, и число
+    # уходило не туда.
+    await drop_keyboard(call)
     await call.message.answer(
         f"💱 Введите курс <b>1 {esc(code)}</b> в {esc(BASE_CURRENCY)} "
         f"(число, напр. <code>0.000079</code>):",
@@ -172,6 +177,7 @@ async def cb_price_set(call: CallbackQuery, state: FSMContext):
     await state.set_state(PriceFlow.waiting_price)
     await state.update_data(ms_id=ms_id, name=name, cur_cost=cur_cost, cur_currency=cur_currency)
     await call.answer()
+    await drop_keyboard(call)  # T3.2: см. cb_rate_set — тот же класс ошибки
     await call.message.answer(
         f"🏷 Товар: <b>{esc(name)}</b>\n"
         f"Введите «<b>продажа себестоимость</b>» через пробел или только продажу.\n"

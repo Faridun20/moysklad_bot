@@ -2966,7 +2966,12 @@ async def api_create_order(request: Request):
     full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
-    order_id = await adb.create_order(user["id"], full_name, data.get("comment", ""))
+    # T3.2: тот же дефект, что у бот-кнопки «Новый заказ» — openOrderEditor(null)
+    # создаёт черновик на КАЖДОЕ открытие редактора, так что выход назад и
+    # повторный вход плодят пустые заказы. Переиспользуем пустой черновик.
+    order_id, _created = await adb.get_or_create_draft(
+        user["id"], full_name, data.get("comment", "")
+    )
     return JSONResponse({"order_id": order_id})
 
 

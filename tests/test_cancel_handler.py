@@ -17,19 +17,32 @@ class _FakeUser:
 class _FakeBot:
     def __init__(self):
         self.sent = []
+        self.markup_edits = []
 
     async def send_message(self, chat_id, text, **kwargs):
         self.sent.append((chat_id, text, kwargs))
+
+    async def edit_message_reply_markup(self, chat_id, message_id, reply_markup=None):
+        self.markup_edits.append((chat_id, message_id, reply_markup))
+
+
+class _FakeChat:
+    id = 42
 
 
 class _FakeMessage:
     def __init__(self, text="", uid=1):
         self.text = text
         self.from_user = _FakeUser(uid)
+        self.chat = _FakeChat()
+        self.message_id = 7
         self.answers = []
 
+    # aiogram отдаёт отправленное сообщение — cmd_cancel запоминает его
+    # chat/message_id, чтобы потом погасить кнопку «Отмена» (T3.2).
     async def answer(self, text, **kwargs):
         self.answers.append((text, kwargs))
+        return _FakeMessage(text=text, uid=self.from_user.id)
 
 
 class _FakeState:

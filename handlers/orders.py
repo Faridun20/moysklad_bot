@@ -18,6 +18,7 @@ from config import BASE_CURRENCY as _BASE_CURRENCY, ALLOWED_CURRENCIES
 
 # Единая реализация в utils.helpers.esc — оставлен _esc-алиас чтобы
 # не править каждый callsite в этом большом файле.
+from handlers._ui import drop_keyboard, finish_card, finish_message
 from utils.helpers import esc as _esc  # noqa: E402
 
 
@@ -390,11 +391,13 @@ async def cmd_new_order(message: Message):
 
     user = message.from_user
     full_name = user.full_name or user.username or str(user.id)
-    order_id, role = await asyncio.gather(
-        adb.create_order(user.id, full_name),
-        adb.get_role(user.id),
-    )
-    await adb.add_audit_log(user.id, full_name, role, "order_created", f"Создан заказ #{order_id}")
+    # T3.2: переиспользуем пустой черновик вместо создания нового на каждый вызов.
+    order_id, created = await adb.get_or_create_draft(user.id, full_name)
+    if created:
+        role = await adb.get_role(user.id)
+        await adb.add_audit_log(
+            user.id, full_name, role, "order_created", f"Создан заказ #{order_id}"
+        )
 
     await message.answer(
         f"{DIV}\n"
@@ -466,11 +469,15 @@ async def cb_new_order(call: CallbackQuery):
 
     user = call.from_user
     full_name = user.full_name or user.username or str(user.id)
-    order_id, role = await asyncio.gather(
-        adb.create_order(user.id, full_name),
-        adb.get_role(user.id),
-    )
-    await adb.add_audit_log(user.id, full_name, role, "order_created", f"Создан заказ #{order_id}")
+    # T3.2: каждое нажатие «Новый заказ» создавало НОВЫЙ черновик — тапнул
+    # трижды, получил три пустых заказа в /myorders. Возвращаем существующий
+    # пустой, если он есть.
+    order_id, created = await adb.get_or_create_draft(user.id, full_name)
+    if created:
+        role = await adb.get_role(user.id)
+        await adb.add_audit_log(
+            user.id, full_name, role, "order_created", f"Создан заказ #{order_id}"
+        )
 
     await call.message.answer(
         f"{DIV}\n✅ <b>Заказ #{order_id} создан</b>\n\nДобавьте товары:",
@@ -634,6 +641,11 @@ async def cb_prod_pick(call: CallbackQuery, state: FSMContext):
     product = products[idx]
     await state.update_data(selected_product=product)
     await state.set_state(OrderState.entering_qty_price)
+    # T3.2: список товаров отработал. Хендлер отфильтрован по состоянию
+    # choosing_product, так что второй тап по списку уже НЕ ловится ничем —
+    # Telegram крутит спиннер до таймаута. Снимаем кнопки, чтобы было видно:
+    # шаг пройден, теперь ждём количество.
+    await drop_keyboard(call)
 
     order = await adb.get_order(data["order_id"]) if data.get("order_id") else None
     currency = (order or {}).get("currency") or _BASE_CURRENCY
@@ -858,6 +870,10 @@ async def cb_agent_pick(call: CallbackQuery, state: FSMContext):
     agent = agents[idx]
     await adb.update_order_agent(order_id, agent["id"], agent["name"])
     await state.clear()
+    # T3.2: клиент выбран, state очищен → фильтр choosing_agent больше не
+    # совпадает и повторный тап по списку висит без ответа. Снимаем кнопки;
+    # сменить клиента можно кнопкой «👤 Клиент» на карточке заказа.
+    await drop_keyboard(call)
 
     order, items = await asyncio.gather(
         adb.get_order(order_id),
@@ -921,6 +937,11 @@ async def cb_submit_order(call: CallbackQuery, state: FSMContext, bot: Bot):
         f"Отправлена заявка #{req_id} (заказ #{order_id})",
     )
 
+    # T3.2: заказ ушёл на согласование — кнопки карточки («Отправить»,
+    # «Добавить позицию», «Удалить») больше не применимы. Раньше карточка
+    # оставалась с рабочей клавиатурой, и повторный «Отправить» упирался
+    # в ошибку вместо понятного «уже отправлено».
+    await finish_card(call, f"✅ Заявка #{req_id} отправлена")
     await call.message.answer(
         f"{DIV}\n"
         f"✅ <b>Заявка #{req_id} отправлена!</b>\n\n"
@@ -990,7 +1011,9 @@ async def cb_delete_order_yes(call: CallbackQuery):
             "обратитесь к администратору."
         )
 
-    await call.message.answer(f"🗑 Заказ #{order_id} удалён.")
+    # T3.2: снимаем клавиатуру подтверждения — «Да, удалить» на удалённом
+    # заказе второй раз ничего не удалит, но выглядит рабочей.
+    await finish_card(call, f"🗑 Заказ #{order_id} удалён")
 
 
 # ─── Callback: просмотр заявки (руководитель) ─────────────────────────────────
@@ -1048,6 +1071,11 @@ async def _approve_flow(call: CallbackQuery, bot: Bot, req_id: int, override: bo
             kb.button(text="✅ Одобрить с превышением", callback_data=f"req_ovr:{req_id}")
             kb.adjust(1)
             await call.answer("⚠️ Превышение лимита", show_alert=True)
+            # T3.2: снимаем кнопки заявки. Решение теперь принимается ТОЛЬКО
+            # через «Одобрить с превышением» в следующем сообщении — иначе
+            # босс мог обойти явное подтверждение, повторно нажав «Одобрить»
+            # на старой карточке.
+            await finish_card(call, "⚠️ Превышение лимита — нужно подтверждение")
             return await call.message.answer(
                 f"⚠️ <b>Превышение кредитного лимита</b>\n"
                 f"Текущий долг: <b>{_fmt_num(over['current_debt'])}</b>\n"
@@ -1122,6 +1150,9 @@ async def cb_return_to_draft(call: CallbackQuery, state: FSMContext):
         req_id=req_id, msg_chat=call.message.chat.id, msg_id=call.message.message_id
     )
     await call.answer()
+    # T3.2: снимаем кнопки заявки на время ввода причины — иначе ту же заявку
+    # можно одобрить, пока босс печатает, что доработать.
+    await drop_keyboard(call)
     await call.message.answer(
         "✍️ Укажите, что нужно доработать (одним сообщением) — менеджер увидит причину:"
     )
@@ -1149,11 +1180,14 @@ async def process_return_to_draft_reason(message: Message, state: FSMContext, bo
         return await message.answer(f"⚠️ {result['error']}")
 
     frozen_tail = "  🧊 <b>ЗАМОРОЖЕН</b>" if result.get("frozen") else ""
-    await message.answer(
+    note = (
         f"↩️ Заявка #{req_id} возвращена на доработку"
-        f" (попытка {result.get('rejection_count')}).{frozen_tail}",
-        parse_mode="HTML",
+        f" (попытка {result.get('rejection_count')}).{frozen_tail}"
     )
+    # T3.2: помечаем саму карточку заявки (её кнопки сняты на входе в FSM) —
+    # иначе в истории она остаётся «на согласовании» без следа решения.
+    if not await finish_message(bot, data.get("msg_chat"), data.get("msg_id"), note):
+        await message.answer(note, parse_mode="HTML")
 
 
 # ─── Заморозка: просмотр и разморозка (admin) ─────────────────────────────────

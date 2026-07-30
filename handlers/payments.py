@@ -21,6 +21,7 @@ def _can_send_payment(user_id: int) -> bool:
     return _has_role(user_id, "admin", "manager")
 
 
+from handlers._ui import drop_keyboard
 from utils.formatters import (
     format_payments_report,
     DIV,
@@ -426,6 +427,10 @@ async def cb_sync_retry(call: CallbackQuery):
         return await call.answer("Нет доступа", show_alert=True)
 
     await call.answer("⏳ Начал синхронизацию…")
+    # T3.2: снимаем кнопку СРАЗУ, а не после всего цикла. Прогон 100 платежей
+    # — это 100 сетевых вызовов в МойСклад; всё это время кнопка оставалась
+    # активной, и второй тап запускал параллельный проход по тем же платежам.
+    await drop_keyboard(call)
     # Получаем кандидатов и ретраим по очереди
     pending = await adb.get_payments_needing_ms_sync(limit=100)
     if not pending:

@@ -21,6 +21,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from services import async_db as adb
 from services.roles import can_change_credit_limit
 from utils.formatters import DIV
+from handlers._ui import drop_keyboard
 from utils.helpers import esc
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,9 @@ async def cb_limit_set(call: CallbackQuery, state: FSMContext):
     await state.set_state(LimitFlow.waiting_amount)
     await state.update_data(agent_id=agent_id, agent_name=agent["agent_name"])
     await call.answer()
+    # T3.2: снимаем клавиатуру списка. Второй тап по другому контрагенту
+    # переписывал agent_id в FSM — сумма уходила не тому клиенту.
+    await drop_keyboard(call)
     await call.message.answer(
         f"💳 <b>{esc(agent['agent_name'])}</b>\n"
         f"Текущий лимит: <b>{_fmt(agent['limit'])} USD</b>\n\n"

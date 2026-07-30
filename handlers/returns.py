@@ -28,6 +28,7 @@ from services.roles import (
     is_warehouse_keeper,
 )
 from utils.formatters import DIV
+from handlers._ui import replace_keyboard
 from utils.helpers import esc
 from utils.keyboards import next_actions_keyboard
 
@@ -117,10 +118,17 @@ def _refund_keyboard():
     return kb.as_markup()
 
 
-def _confirm_keyboard(return_id: int):
+def _confirm_keyboard(return_id: int, *, goods_received: bool = False):
+    """Клавиатура карточки возврата.
+
+    goods_received=True — приёмка уже отмечена, кнопку убираем: повторное
+    нажатие ничего не меняет (T3.2), а «Подтвердить возврат» должна остаться,
+    иначе после T2.8 боссу нечем закрыть возврат.
+    """
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Подтвердить возврат", callback_data=f"ret_ok:{return_id}")
-    kb.button(text="📦 Товар получен", callback_data=f"ret_got:{return_id}")
+    if not goods_received:
+        kb.button(text="📦 Товар получен", callback_data=f"ret_got:{return_id}")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -365,7 +373,15 @@ async def _show_pending_returns(target):
             f"💰 {_fmt(r['total_amount'])} USD · {refund}\n"
             f"{gr}\n📝 {esc(r.get('reason') or '')}"
         )
-        await target.answer(text, parse_mode="HTML", reply_markup=_confirm_keyboard(r["id"]))
+        # T3.2: приёмка уже отмечена → кнопку «Товар получен» в список не
+        # ставим, иначе /returns заново выдаёт отработавшую кнопку.
+        await target.answer(
+            text,
+            parse_mode="HTML",
+            reply_markup=_confirm_keyboard(
+                r["id"], goods_received=bool(r.get("goods_received"))
+            ),
+        )
 
 
 @router.message(Command("returns"))
@@ -392,6 +408,11 @@ async def cb_return_goods_received(call: CallbackQuery):
     if not res.get("ok"):
         return await call.answer("⚠️ Уже обработано", show_alert=True)
     await call.answer("📦 Отмечено: товар получен")
+    # T3.2: помечаем результат в карточке и убираем отработавшую кнопку;
+    # «Подтвердить возврат» оставляем — процесс продолжается.
+    await replace_keyboard(
+        call, "📦 Товар получен", _confirm_keyboard(return_id, goods_received=True)
+    )
 
 
 @router.callback_query(F.data.startswith("ret_ok:"))

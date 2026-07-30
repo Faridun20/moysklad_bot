@@ -20,6 +20,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services import async_db as adb
 from services.roles import _has_role, can_confirm_deposit
+from handlers._ui import drop_keyboard, finish_message
 from utils.helpers import esc
 from utils.formatters import DIV
 from utils.keyboards import next_actions_keyboard
@@ -231,6 +232,9 @@ async def cb_deposit_reject(call: CallbackQuery, state: FSMContext):
         deposit_id=deposit_id, msg_chat=call.message.chat.id, msg_id=call.message.message_id
     )
     await call.answer()
+    # T3.2: пока вводится причина, кнопки карточки не должны работать — иначе
+    # ту же сдачу можно подтвердить параллельно с отклонением.
+    await drop_keyboard(call)
     await call.message.answer("✍️ Укажите причину отклонения сдачи (одним сообщением):")
 
 
@@ -256,7 +260,12 @@ async def process_deposit_reject_reason(message: Message, state: FSMContext, bot
     if not res.get("ok"):
         return await message.answer(f"⚠️ {res.get('error', 'уже обработано')}")
 
-    await message.answer(f"❌ Сдача #{deposit_id} отклонена.")
+    # T3.2: пометку вешаем на саму карточку сдачи (кнопки с неё сняты ещё на
+    # входе в FSM) — иначе карточка навсегда остаётся «на подтверждении», а
+    # решение теряется отдельной строкой ниже в чате.
+    note = f"❌ Сдача #{deposit_id} отклонена"
+    if not await finish_message(bot, data.get("msg_chat"), data.get("msg_id"), note):
+        await message.answer(f"{note}.")
     if dep and dep.get("manager_id"):
         try:
             await bot.send_message(

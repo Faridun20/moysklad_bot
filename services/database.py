@@ -4877,6 +4877,31 @@ async def get_audit_log(limit: int = 50, user_id: int | None = None) -> list[dic
 # ─── Заказы ───────────────────────────────────────────────────────────────────
 
 
+async def get_or_create_draft(user_id: int, full_name: str, comment: str = "") -> tuple[int, bool]:
+    """Черновик для «создать заказ»: переиспользуем пустой, иначе создаём.
+
+    T3.2: кнопка «Новый заказ» создавала черновик на КАЖДОЕ нажатие. Тапнул
+    трижды — три пустых заказа в /myorders, и непонятно, в каком из них ты
+    сейчас работаешь. Пустой = без позиций, без клиента и без комментария:
+    в такой заказ пользователь ещё ничего не вложил, поэтому вернуть его
+    безопасно.
+
+    Возвращает (order_id, created) — created=False, если переиспользовали.
+    """
+    row = await adb_core.fetchrow(
+        "SELECT o.id FROM orders o "
+        "WHERE o.user_id = $1 AND o.status = 'draft' "
+        "  AND (o.agent_id IS NULL OR o.agent_id = '') "
+        "  AND (o.comment IS NULL OR o.comment = '') "
+        "  AND NOT EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = o.id) "
+        "ORDER BY o.id DESC LIMIT 1",
+        user_id,
+    )
+    if row and not comment:
+        return int(row["id"]), False
+    return await asyncio.to_thread(create_order, user_id, full_name, comment), True
+
+
 def create_order(user_id: int, full_name: str, comment: str = "") -> int:
     with get_conn() as conn:
         cur = get_cursor(conn)
