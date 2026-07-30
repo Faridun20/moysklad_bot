@@ -72,8 +72,11 @@ jobs:
         with:
           node-version: "20"
 
+      # npm ci, а НЕ npm install: ставит строго по package-lock.json и падает,
+      # если лок разошёлся с package.json. `npm install` в этой ситуации молча
+      # правит лок — и CI проверял бы не тот набор версий, что лежит в репозитории.
       - name: Install frontend test deps
-        run: npm install
+        run: npm ci
 
       - name: Run frontend tests (Vitest)
         run: npm test
