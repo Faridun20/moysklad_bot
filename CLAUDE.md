@@ -26,6 +26,7 @@ python -m tasks.run_ops_monitor          # дневной ПИНГ (1×/день
 python -m tasks.run_maintenance          # janitor: чистка дедупа/аудита/soft-deleted (ночью)
 python -m tasks.run_ms_reconcile         # страховка: approved-заказы с ms_customerorder_id, 404 в МС → отмена локально (ежечасно)
 python -m tasks.run_backup               # дамп БД → gzip → приватный TG-канал (ночью)
+python -m tasks.run_machines_archive     # техника: проданное >90 дней назад → archived (ночью, T4.3)
 ```
 
 **Сборка/деплой:** Railway **Railpack** (не Nixpacks) — `railway.json`
@@ -87,6 +88,20 @@ Python 3.11.9).
 - **Удаление заказа в МС → отмена в боте:** вебхук `customerorder.DELETE` (`ms_sync_handler.apply_ms_customerorder_delete`, общий с cron-реконсиляцией): `approved`-заказ отменяется локально (`cancel_order` + `set_order_ms_cancel_synced`, чтобы reverse в МС не пытался удалить уже-удалённое); shipped/paid — статус не трогаем (деньги/остатки двигались), только снимаем ссылку + предупреждаем. Раньше хендлер только снимал `ms_customerorder_id` → заказ висел `approved` (баг). `tasks/run_ms_reconcile` — страховка от пропущенных вебхуков.
 
 **Кредит-лимиты (энфорс):** при одобрении credit-заявки `approve_shipment_request(..., override)` считает `check_credit_limit`; при превышении возвращает `needs_override` и НЕ одобряет → босс жмёт «Одобрить с превышением» (`req_ovr:` / webapp `override=true`), это ставит `orders.credit_limit_override` + audit. `get_agent_current_debt` считает долг батчем (items/payments/returns), без N+1.
+
+**Техника (волна 4):** `machines/machine_hours/machine_photos/machine_deals` —
+единственная часть схемы с FOREIGN KEY (связи строго иерархические). На SQLite
+FK не энфорсятся, поэтому `services.machines.delete_machine` чистит детей явно.
+Себестоимость (`cost_cents`) режет `visible_machine` в СЕРВИСЕ, не на фронте —
+иначе любой новый вызов вернёт её обратно. Моточасы: история в `machine_hours`,
+последнее значение дублируется в `machines.hours`; показание меньше предыдущего
+отвергается (опечатка), откат — только boss через `force=True`. Фото храним
+`tg_file_id` + обязательный `file_unique_id` (переживает смену сервера Bot API,
+tg_file_id — нет). VIN нормализуется (upper, без пробелов/дефисов) перед
+записью, длина НЕ фиксируется 17 символами — у корейской техники серийники
+другие. **Решение (волна 7): остаёмся на облачном Bot API**, локальный сервер
+не поднимаем — `file_id` привязан к паре «бот + сервер», переезд обнулил бы все
+`tg_file_id`; фиксируем сейчас, пока таблица пустая.
 
 **Аналитика менеджеров:** только из ЛОКАЛЬНЫХ `orders` (`get_manager_performance`, GROUP BY `user_id`) — в demand'ах МС нет надёжной привязки к менеджеру (`telegram_full_name` ставится лишь когда demand создал бот). Сурфейсится в webapp company-аналитике (`top_managers`).
 

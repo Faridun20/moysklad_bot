@@ -106,8 +106,14 @@ _COMMANDS_MANAGER = [
     BotCommand(command="start", description="🏠 Главное меню"),
     BotCommand(command="pay", description="💵 Отправить платёж"),
     BotCommand(command="find", description="🔍 Поиск (заказ/платёж/клиент)"),
+    # Волна 4: техника. Экрана в WebApp нет — фото и моточасы вводят в чате.
+    BotCommand(command="machines", description="🚜 Машины"),
+    BotCommand(command="newmachine", description="🚜 Завести машину"),
 ]
 _COMMANDS_BOSS = _COMMANDS_MANAGER + [
+    BotCommand(command="sell", description="🚜 Продажа машины"),
+    BotCommand(command="credit", description="🚜 Машина в рассрочку"),
+    BotCommand(command="machine_deals", description="💳 Рассрочки по технике"),
     BotCommand(command="ship", description="🚚 Отгрузить заказ"),
     BotCommand(command="shipments", description="🚚 Последние отгрузки"),
     BotCommand(command="cancel", description="🚫 Отменить заказ"),

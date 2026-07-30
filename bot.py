@@ -164,6 +164,7 @@ def register_routers(dp: Dispatcher):
         returns,
         order_cancel,
         order_ship,
+        machines,
     )
 
     routers = [
@@ -178,6 +179,9 @@ def register_routers(dp: Dispatcher):
         returns.router,
         order_cancel.router,
         order_ship.router,
+        # Волна 4: учёт экскаваторов. В WebApp экрана нет — фото приходят
+        # file_id'ом из Telegram, моточасы вводят с площадки телефоном.
+        machines.router,
     ]
     for r in routers:
         dp.include_router(r)

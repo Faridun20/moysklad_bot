@@ -592,6 +592,84 @@ def _create_tables():
                 updated_by    BIGINT,
                 updated_at    TEXT
             )""",
+            # ── Учёт экскаваторов (волна 4, T4.1) ────────────────────────────
+            #
+            # Отличие от остальной схемы: здесь есть FOREIGN KEY. Связи строго
+            # иерархические (часы/фото/сделки не существуют без машины), каскад
+            # избавляет от ручной уборки. На SQLite (тесты) FK по умолчанию не
+            # энфорсятся, поэтому сервис всё равно чистит детей явно — иначе
+            # поведение разъезжалось бы между тестами и продом.
+            #
+            # cost_cents (себестоимость) видит только boss/admin — срез делает
+            # слой сервиса, не фронт.
+            f"""CREATE TABLE IF NOT EXISTS machines (
+                id               {id_type},
+                vin              TEXT NOT NULL UNIQUE,
+                name             TEXT NOT NULL,
+                brand            TEXT,
+                model            TEXT,
+                year             INTEGER,
+                hours            INTEGER,
+                hours_updated_at TEXT,
+                price_cents      BIGINT,
+                cost_cents       BIGINT,
+                currency         TEXT NOT NULL DEFAULT 'USD',
+                status           TEXT NOT NULL DEFAULT 'in_transit',
+                eta_date         TEXT,
+                container_no     TEXT,
+                location         TEXT,
+                notes            TEXT,
+                ms_product_id    TEXT,
+                created_by       BIGINT NOT NULL,
+                created_at       TEXT,
+                updated_at       TEXT,
+                CONSTRAINT machines_status_chk CHECK (status IN
+                    ('in_transit','in_stock','reserved','sold','on_credit','archived'))
+            )""",
+            # Каждое показание моточасов — отдельной строкой (видна динамика и
+            # ловятся опечатки); в machines.hours дублируется последнее.
+            f"""CREATE TABLE IF NOT EXISTS machine_hours (
+                id          {id_type},
+                machine_id  INTEGER NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+                hours       INTEGER NOT NULL CHECK (hours >= 0),
+                recorded_by BIGINT NOT NULL,
+                recorded_at TEXT
+            )""",
+            # Файлы не скачиваем — на Railway эфемерная ФС; храним tg_file_id.
+            # file_unique_id обязателен (волна 7): tg_file_id привязан к паре
+            # «бот + сервер Bot API», и переезд на локальный Bot API server его
+            # обнулит. file_unique_id переживает переезд и показывает, какие
+            # записи осиротели, — поэтому NOT NULL, а не опционально.
+            f"""CREATE TABLE IF NOT EXISTS machine_photos (
+                id             {id_type},
+                machine_id     INTEGER NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+                tg_file_id     TEXT NOT NULL,
+                file_unique_id TEXT NOT NULL,
+                caption        TEXT,
+                sort_order     INTEGER NOT NULL DEFAULT 0,
+                uploaded_by    BIGINT NOT NULL,
+                uploaded_at    TEXT,
+                UNIQUE (machine_id, file_unique_id)
+            )""",
+            # Сделка по машине. order_id/agent_ms_id — необязательная связь с
+            # заказом и контрагентом МС: продажа техники может идти и мимо них.
+            f"""CREATE TABLE IF NOT EXISTS machine_deals (
+                id             {id_type},
+                machine_id     INTEGER NOT NULL REFERENCES machines(id),
+                kind           TEXT NOT NULL CHECK (kind IN ('sale','credit')),
+                price_cents    BIGINT NOT NULL,
+                currency       TEXT NOT NULL DEFAULT 'USD',
+                buyer_name     TEXT NOT NULL,
+                buyer_phone    TEXT,
+                buyer_passport TEXT,
+                buyer_note     TEXT,
+                order_id       BIGINT,
+                agent_ms_id    TEXT,
+                sold_at        TEXT,
+                due_date       TEXT,
+                closed_at      TEXT,
+                created_by     BIGINT NOT NULL
+            )""",
         ]
 
         # Создаём каждую таблицу в отдельной транзакции
@@ -692,6 +770,15 @@ def _create_indexes():
             # (payment_type, paid_at, due_date) — запрос им не покрывался.
             "CREATE INDEX IF NOT EXISTS idx_orders_debt_lookup "
             "ON orders(payment_type, status, paid_confirmed_at)",
+            # ── Машины (T4.1) ────────────────────────────────────────────────
+            # Список машин всегда фильтруется по статусу (витрина «в наличии»,
+            # «в пути», архив).
+            "CREATE INDEX IF NOT EXISTS idx_machines_status ON machines(status)",
+            # История моточасов и сделок читается «последние сверху» по машине.
+            "CREATE INDEX IF NOT EXISTS idx_machine_hours_machine "
+            "ON machine_hours(machine_id, recorded_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_machine_deals_machine "
+            "ON machine_deals(machine_id, sold_at DESC)",
         ]
         for sql in snapshot_indexes:
             try:
@@ -770,6 +857,7 @@ _DEFAULT_SETTINGS: dict[str, tuple] = {
     "return_deadline_days": (90, "Лимит на оформление возврата (дней с отгрузки)"),
     "auto_create_demand_on_approve": (True, "Создавать demand в МойСклад при approve"),
     "auto_ship_on_approve": (True, "Авто-переход в shipped сразу после approve"),
+    "machines_archive_days": (90, "Через сколько дней проданная техника уходит в архив"),
 }
 
 
