@@ -811,16 +811,14 @@ async def api_home(request: Request):
         # всего, что ждёт действия босса, чтобы он шёл в нужный раздел WebApp.
         # Дешёвые локальные SELECT'ы — последовательно (без конкурентности на пуле,
         # чтобы не споткнуться на одиночном соединении aiosqlite в тестах).
-        deposits_pending = await adb.get_pending_cash_deposits()
-        returns_pending = await adb.get_pending_returns()
-        payments_pending = await adb.get_paid_orders_awaiting_confirmation()
-        open_debts = await adb.get_open_debts()
+        # T2.13 (§3.8): COUNT(*) вместо четырёх полных SELECT * ради len().
+        counts = await adb.count_boss_attention()
         result["attention"] = {
             "requests": len(pending),
-            "payments": len(payments_pending),
-            "deposits": len(deposits_pending),
-            "returns": len(returns_pending),
-            "debts": len(open_debts),
+            "payments": counts["payments"],
+            "deposits": counts["deposits"],
+            "returns": counts["returns"],
+            "debts": counts["debts"],
         }
 
         # Топ-сотрудники из УЖЕ полученных недельных отгрузок (см. gather выше).

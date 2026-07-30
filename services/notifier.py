@@ -358,8 +358,13 @@ async def shipment_notifier(bot: Bot | None = None):
             except Exception as e:
                 logger.debug("pool stats failed: %s", e)
         try:
+            # T2.13 (§2.15): отметку времени берём ДО запроса. Раньше
+            # last_check выставлялся ПОСЛЕ round-trip'а к МС, и отгрузки,
+            # созданные за время самого запроса, в следующее окно уже не
+            # попадали — это потеря, а не дубль, дедуп тут не спасает.
+            window_start = datetime.now()
             shipments = await get_shipments(last_check)
-            last_check = datetime.now()
+            last_check = window_start
 
             if not shipments:
                 continue

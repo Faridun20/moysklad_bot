@@ -3,7 +3,8 @@ CLI: периодическая чистка БД (IMPLEMENTATION.md §13, janit
 
 Что делает за один прогон (всё идемпотентно, по ретеншенам из app_settings):
   • prune_notified_shipments  — дедуп-записи отгрузок старше 30 дней;
-  • prune_audit_log           — аудит старше audit_log_retention_months.
+  • prune_audit_log           — аудит старше audit_log_retention_months;
+  • prune_idempotency_keys    — протухшие ключи идемпотентности.
 
 Использование:
     python -m tasks.run_maintenance
@@ -18,6 +19,7 @@ from services.database import (
     get_setting,
     init_db,
     prune_audit_log,
+    prune_idempotency_keys,
     prune_notified_shipments,
 )
 
@@ -36,10 +38,15 @@ def main() -> int:
         # Ретеншен — audit_log_retention_months (по умолчанию 6 мес).
         audit = prune_audit_log(retention_months=audit_months)
 
+        # T2.13 (§3.5): expires_at писался, но никогда не читался — таблица
+        # росла вечно, а протухший ключ продолжал отдавать старый результат.
+        idem = prune_idempotency_keys()
+
         logger.info(
-            "maintenance: notified_shipments=-%d audit_log=-%d",
+            "maintenance: notified_shipments=-%d audit_log=-%d idempotency_keys=-%d",
             shipments,
             audit,
+            idem,
         )
         return 0
     except Exception:

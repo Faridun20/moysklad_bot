@@ -74,10 +74,17 @@ async def cmd_addrole(message: Message):
     )
 
     role_name = ROLE_NAMES.get(role, role)
-    await message.answer(
-        f"✅ Пользователю <code>{target_id}</code> назначена роль <b>{role_name}</b>",
-        parse_mode="HTML",
-    )
+    text = f"✅ Пользователю <code>{target_id}</code> назначена роль <b>{role_name}</b>"
+    # T2.13 (§2.8): set_role не снимает deactivated_at, а get_role у
+    # деактивированного отдаёт guest. Без этой строки админ видел «роль
+    # назначена», человек не мог ничего сделать, и причина нигде не всплывала.
+    if await adb.is_user_deactivated(target_id):
+        text += (
+            "\n\n⚠️ <b>Пользователь деактивирован</b> — роль не действует, "
+            "он остаётся с правами гостя.\n"
+            f"Верните доступ: <code>/reactivate {target_id}</code>"
+        )
+    await message.answer(text, parse_mode="HTML")
 
 
 @router.message(Command("users"))

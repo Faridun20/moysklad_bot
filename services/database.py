@@ -2866,8 +2866,12 @@ def set_role(user_id: int, username: str, full_name: str, role: str) -> bool:
                 INSERT INTO user_roles (user_id, username, full_name, role, created_at)
                 VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT(user_id) DO UPDATE SET
-                    username = EXCLUDED.username,
-                    full_name = EXCLUDED.full_name,
+                -- T2.13 (§2.8): NULLIF+COALESCE. /addrole зовёт set_role с
+                -- пустыми username/full_name (у админа их нет), и безусловный
+                -- EXCLUDED затирал реальное имя — /users показывал голый ID
+                -- до следующего /start пользователя.
+                    username = COALESCE(NULLIF(EXCLUDED.username, ''), user_roles.username),
+                    full_name = COALESCE(NULLIF(EXCLUDED.full_name, ''), user_roles.full_name),
                     role = EXCLUDED.role
             """,
                 (user_id, username, full_name, role, now_str()),
@@ -2878,8 +2882,12 @@ def set_role(user_id: int, username: str, full_name: str, role: str) -> bool:
                 INSERT INTO user_roles (user_id, username, full_name, role, created_at)
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
-                    username = excluded.username,
-                    full_name = excluded.full_name,
+                -- T2.13 (§2.8): NULLIF+COALESCE. /addrole зовёт set_role с
+                -- пустыми username/full_name (у админа их нет), и безусловный
+                -- EXCLUDED затирал реальное имя — /users показывал голый ID
+                -- до следующего /start пользователя.
+                    username = COALESCE(NULLIF(excluded.username, ''), user_roles.username),
+                    full_name = COALESCE(NULLIF(excluded.full_name, ''), user_roles.full_name),
                     role = excluded.role
             """,
                 (user_id, username, full_name, role, now_str()),
@@ -3353,6 +3361,39 @@ def prune_notified_shipments(older_than_days: int = 30) -> int:
         deleted = cur.rowcount
         conn.commit()
     return deleted
+
+
+def prune_idempotency_keys() -> int:
+    """Удалить протухшие ключи идемпотентности (expires_at < сейчас).
+
+    T2.13 (§3.5): expires_at писался, но НИКОГДА не читался — таблица росла
+    вечно. Порог считаем в Python и передаём параметром: created_at/expires_at
+    пишутся в локальной TZ через now_str(), а SQL-функции текущего времени
+    (NOW() / datetime('now')) отдают UTC — лексикографическое сравнение строк
+    в разных TZ молча всегда даёт False (CLAUDE.md).
+    """
+    # У таблицы PK — `key` (TEXT), поэтому _batched_delete (он ходит по `id`)
+    # тут не подходит; порции режем по самому ключу.
+    cutoff = now_str()
+    total = 0
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        while True:
+            cur.execute(
+                q(
+                    "DELETE FROM idempotency_keys WHERE key IN ("
+                    "SELECT key FROM idempotency_keys "
+                    "WHERE expires_at IS NOT NULL AND expires_at < ? "
+                    "ORDER BY key LIMIT ?)"
+                ),
+                (cutoff, 5000),
+            )
+            n = cur.rowcount or 0
+            conn.commit()
+            total += n
+            if n <= 0:
+                break
+    return total
 
 
 def prune_audit_log(retention_months: int = 6) -> int:
@@ -3894,14 +3935,43 @@ def set_payment_ms_sync(
     return updated
 
 
+def _reconcile_window() -> tuple[str, int]:
+    """(порог даты, LIMIT) для cron-реконсиляции МС — из env, с дефолтами."""
+    from datetime import timedelta
+
+    try:
+        days = int(os.environ.get("MS_RECONCILE_WINDOW_DAYS", "30"))
+    except ValueError:
+        days = 30
+    try:
+        limit = int(os.environ.get("MS_RECONCILE_LIMIT", "500"))
+    except ValueError:
+        limit = 500
+    cutoff = (datetime.now() - timedelta(days=max(1, days))).strftime("%Y-%m-%d %H:%M:%S")
+    return cutoff, max(1, limit)
+
+
 async def get_payments_with_ms_paymentin() -> list[dict]:
     """Подтверждённые платежи со ссылкой на paymentin в МС — для cron-
     реконсиляции удалённых входящих платежей (WP-17, страховка от пропущенных
     paymentin.DELETE-вебхуков: иначе платёж навсегда «synced» на мёртвый
-    документ, retry его пропускает, деньги молча исчезают из МС)."""
+    документ, retry его пропускает, деньги молча исчезают из МС).
+
+    T2.13 (§3.9): окно по updated_at + LIMIT. Раньше выборка была без границ, а
+    run_ms_reconcile делает по одному GET в МойСклад НА КАЖДУЮ строку. Через год
+    работы это тысячи запросов за прогон → 429 → (при рабочем брейкере, T2.9)
+    каскадный отказ остальных МС-функций. Окно и лимит — из env
+    (MS_RECONCILE_WINDOW_DAYS, дефолт 30; MS_RECONCILE_LIMIT, дефолт 500).
+    Порог считаем в Python и передаём параметром — SQL NOW()/datetime('now')
+    отдают UTC, а updated_at пишется в локальной TZ (CLAUDE.md).
+    """
+    cutoff, limit = _reconcile_window()
     return await adb_core.fetch(
         "SELECT id, ms_paymentin_id FROM payments "
-        "WHERE ms_paymentin_id IS NOT NULL AND status = 'confirmed'"
+        "WHERE ms_paymentin_id IS NOT NULL AND status = 'confirmed' "
+        "AND COALESCE(confirmed_at, created_at) >= $1 "
+        "ORDER BY id DESC LIMIT $2",
+        cutoff, limit,
     )
 
 
@@ -3977,11 +4047,24 @@ async def get_orders_with_ms_customerorder() -> list[dict]:
     выручку аналитики). Теперь — все активные статусы. Обработанный заказ уходит
     из набора (apply_ms_customerorder_delete ставит ms_deleted_at + снимает ссылку).
     Терминально-неактивные cancelled/rejected исключаем: revenue=0, перепроверять
-    их в МС незачем. Native async через adb_core."""
+    их в МС незачем. Native async через adb_core.
+
+    T2.13 (§3.9): окно по updated_at + LIMIT. Раньше выборка была без границ, а
+    run_ms_reconcile делает по одному GET в МойСклад НА КАЖДУЮ строку. Через год
+    работы это тысячи запросов за прогон → 429 → (при рабочем брейкере, T2.9)
+    каскадный отказ остальных МС-функций. Окно и лимит — из env
+    (MS_RECONCILE_WINDOW_DAYS, дефолт 30; MS_RECONCILE_LIMIT, дефолт 500).
+    Порог считаем в Python и передаём параметром — SQL NOW()/datetime('now')
+    отдают UTC, а updated_at пишется в локальной TZ (CLAUDE.md).
+    """
+    cutoff, limit = _reconcile_window()
     return await adb_core.fetch(
         "SELECT * FROM orders WHERE ms_customerorder_id IS NOT NULL "
         "AND (ms_deleted_at IS NULL) "
-        "AND status NOT IN ('cancelled', 'rejected')"
+        "AND status NOT IN ('cancelled', 'rejected') "
+        "AND COALESCE(updated_at, created_at) >= $1 "
+        "ORDER BY id DESC LIMIT $2",
+        cutoff, limit,
     )
 
 
@@ -3993,12 +4076,66 @@ async def get_orders_with_ms_demand() -> list[dict]:
     customerorder остаётся жив → reconcile по CO такой заказ не ловит. Этот
     набор закрывает дыру: проверяем существование demand-документа. Уже
     помеченные ms_deleted_at и терминальные cancelled/rejected исключаем.
-    Native async через adb_core."""
+    Native async через adb_core.
+
+    T2.13 (§3.9): окно по updated_at + LIMIT. Раньше выборка была без границ, а
+    run_ms_reconcile делает по одному GET в МойСклад НА КАЖДУЮ строку. Через год
+    работы это тысячи запросов за прогон → 429 → (при рабочем брейкере, T2.9)
+    каскадный отказ остальных МС-функций. Окно и лимит — из env
+    (MS_RECONCILE_WINDOW_DAYS, дефолт 30; MS_RECONCILE_LIMIT, дефолт 500).
+    Порог считаем в Python и передаём параметром — SQL NOW()/datetime('now')
+    отдают UTC, а updated_at пишется в локальной TZ (CLAUDE.md).
+    """
+    cutoff, limit = _reconcile_window()
     return await adb_core.fetch(
         "SELECT * FROM orders WHERE ms_demand_id IS NOT NULL "
         "AND (ms_deleted_at IS NULL) "
-        "AND status NOT IN ('cancelled', 'rejected')"
+        "AND status NOT IN ('cancelled', 'rejected') "
+        "AND COALESCE(updated_at, created_at) >= $1 "
+        "ORDER BY id DESC LIMIT $2",
+        cutoff, limit,
     )
+
+
+async def count_boss_attention() -> dict[str, int]:
+    """Счётчики для блока «Требует внимания» на главной — одними COUNT(*).
+
+    T2.13 (§3.8): /api/home делал четыре полных `SELECT *`
+    (get_pending_cash_deposits, get_pending_returns,
+    get_paid_orders_awaiting_confirmation, get_open_debts) ТОЛЬКО ради len().
+    Строки сериализовались из БД и выбрасывались; при rate-limit 120/мин на
+    эндпоинте это заметная нагрузка, растущая с размером базы.
+    """
+    deposits = await adb_core.fetchval(
+        "SELECT COUNT(*) FROM cash_deposits WHERE status = 'pending'"
+    )
+    returns_ = await adb_core.fetchval(
+        "SELECT COUNT(*) FROM returns WHERE status = 'pending'"
+    )
+    # Зеркалит get_paid_orders_awaiting_confirmation: ТОЛЬКО payment_type='paid'
+    # в approved/shipped (credit-долги считаются отдельно, в debts) и без
+    # фантомов. Расхождение фильтров здесь давало бы боссу счётчик, не
+    # совпадающий с содержимым таба «Платежи».
+    payments = await adb_core.fetchval(
+        "SELECT COUNT(*) FROM orders o "
+        "WHERE o.payment_type = 'paid' "
+        "AND o.status IN ('approved', 'shipped') "
+        "AND (o.ms_deleted_at IS NULL) "
+        "AND EXISTS (SELECT 1 FROM payments p "
+        "            WHERE p.order_id = o.id AND p.status = 'pending')"
+    )
+    debts = await adb_core.fetchval(
+        "SELECT COUNT(*) FROM orders "
+        "WHERE payment_type = 'credit' AND paid_confirmed_at IS NULL "
+        "AND status IN ('approved', 'shipped', 'partially_returned') "
+        "AND (ms_deleted_at IS NULL)"
+    )
+    return {
+        "deposits": int(deposits or 0),
+        "returns": int(returns_ or 0),
+        "payments": int(payments or 0),
+        "debts": int(debts or 0),
+    }
 
 
 async def get_ms_sync_anomalies(since_iso: str) -> dict[str, list[dict]]:
@@ -4787,8 +4924,15 @@ async def get_orders_by_ids(order_ids: list[int]) -> dict[int, dict]:
     return {r["id"]: r for r in rows}
 
 
-async def get_user_orders(user_id: int, status: str | None = None) -> list[dict]:
-    """Заказы менеджера (опц. фильтр по статусу).
+async def get_user_orders(
+    user_id: int, status: str | None = None, limit: int = 200
+) -> list[dict]:
+    """Заказы менеджера (опц. фильтр по статусу), свежие первыми.
+
+    T2.13 (§3.8): добавлен LIMIT. Выборка была без границ, а /api/home зовёт её
+    на каждое открытие главной (rate-limit 120/мин) — у менеджера с историей
+    в тысячи заказов это полный скан и сериализация всего архива ради
+    счётчиков и пяти последних.
 
     asyncpg Stage 12 (#21): native async через adb_core."""
     params: list = [user_id]
@@ -4799,7 +4943,8 @@ async def get_user_orders(user_id: int, status: str | None = None) -> list[dict]
     if status:
         params.append(status)
         query += f" AND status = ${len(params)}"
-    query += " ORDER BY created_at DESC"
+    params.append(max(1, int(limit)))
+    query += f" ORDER BY created_at DESC LIMIT ${len(params)}"
     return await adb_core.fetch(query, *params)
 
 
