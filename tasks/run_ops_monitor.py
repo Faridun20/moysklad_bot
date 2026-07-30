@@ -44,6 +44,13 @@ def _fmt_amount(n: float) -> str:
     return f"{int(round(n)):,}".replace(",", " ")
 
 
+def _base_cur() -> str:
+    """Валюта кассы — из BASE_CURRENCY, а не литерал «USD» (T2.13, §3.7)."""
+    from config import BASE_CURRENCY
+
+    return (BASE_CURRENCY or "USD").upper()
+
+
 def _fmt_cents(cents: int) -> str:
     """Копейки → строка (деньги хранятся только в копейках, T1.3)."""
     from services import money
@@ -71,9 +78,9 @@ def build_pending_deposits_block(deposits: list[dict]) -> str | None:
     if not deposits:
         return None
     total_cents = sum(int(d.get("amount_cents") or 0) for d in deposits)
-    lines = [f"💵 <b>Сдачи на подтверждении: {len(deposits)}</b> (на {_fmt_cents(total_cents)} USD)"]
+    lines = [f"💵 <b>Сдачи на подтверждении: {len(deposits)}</b> (на {_fmt_cents(total_cents)} {_base_cur()})"]
     for d in deposits[:15]:
-        lines.append(f"  • сдача #{d['id']} — {_fmt_cents(d.get('amount_cents'))} USD")
+        lines.append(f"  • сдача #{d['id']} — {_fmt_cents(d.get('amount_cents'))} {_base_cur()}")
     if len(deposits) > 15:
         lines.append(f"  …и ещё {len(deposits) - 15}")
     return "\n".join(lines)
@@ -85,7 +92,7 @@ def build_pending_returns_block(returns: list[dict]) -> str | None:
     lines = [f"↩️ <b>Возвраты на подтверждении: {len(returns)}</b>"]
     for r in returns[:15]:
         amt = _fmt_cents(r.get("total_amount_cents"))
-        lines.append(f"  • возврат #{r['id']} · заказ #{r.get('order_id', '?')} — {amt} USD")
+        lines.append(f"  • возврат #{r['id']} · заказ #{r.get('order_id', '?')} — {amt} {_base_cur()}")
     if len(returns) > 15:
         lines.append(f"  …и ещё {len(returns) - 15}")
     return "\n".join(lines)

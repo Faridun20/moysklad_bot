@@ -148,6 +148,21 @@ def test_returns_pending_and_confirm(client_env):
     )
     assert resp.status_code == 403
 
+    # T2.8: без отметки о приёмке товара подтверждение отклоняется.
+    resp = client.post(
+        "/api/returns/confirm",
+        json={"initData": str(ids["boss"]), "return_id": r["return_id"]},
+    )
+    assert resp.status_code == 409, resp.text
+    assert "товар принят" in resp.json()["detail"]
+
+    # Склад отмечает приёмку — теперь босс может подтвердить.
+    resp = client.post(
+        "/api/returns/goods_received",
+        json={"initData": str(ids["wh"]), "return_id": r["return_id"]},
+    )
+    assert resp.status_code == 200, resp.text
+
     resp = client.post(
         "/api/returns/confirm",
         json={"initData": str(ids["boss"]), "return_id": r["return_id"]},
@@ -293,6 +308,7 @@ def test_confirm_return_blocks_overshoot(isolated_db):
     # Создаём первый возврат на полные 2 шт и подтверждаем.
     r1 = asyncio.run(db.create_return(oid, "full", "x", [(items[0]["id"], 2, 200.0)], "no_refund", mgr))
     assert r1["ok"]
+    asyncio.run(db.mark_return_goods_received(r1["return_id"], mgr))
     res = asyncio.run(db.confirm_return(r1["return_id"], mgr, "M"))
     assert res["ok"], res
 

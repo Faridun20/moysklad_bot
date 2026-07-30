@@ -261,15 +261,43 @@ async def create_demand_from_request(
         return {
             "ok": False,
             "reason": f"Не удалось разобрать ни одной позиции (skipped: {skipped})",
+            # T2.12: skipped обязан ехать В РЕЗУЛЬТАТЕ, а не только в тексте
+            # reason. order_workflow собирает его из result и показывает боссу
+            # список позиций, не попавших в МойСклад; из строки reason он их
+            # не достанет (§2.16).
+            "skipped": skipped,
         }
 
     agent_href = f"{MS_BASE}/entity/counterparty/{order['agent_id']}"
+
+    # Детерминированный syncId (T2.4): идемпотентный ключ документа от id
+    # заказа. Позволяет подхватить уже созданную отгрузку, если процесс упал
+    # между прошлым POST и локальной записью ms_demand_id. Для demand это
+    # особенно важно: он СПИСЫВАЕТ ОСТАТКИ, и дубль означает двойное списание.
+    from services.moysklad import find_by_sync_id, order_sync_id
+
+    sync_id = order_sync_id("demand", order["id"])
+
+    adopted = await find_by_sync_id("demand", sync_id)
+    if adopted:
+        logger.info(
+            "MS demand уже существует (syncId), подхвачен: id=%s (заказ #%s)",
+            adopted, order["id"],
+        )
+        return {
+            "ok": True,
+            "demand_id": adopted,
+            "name": f"Заявка #{order['id']} (бот)",
+            "skipped": skipped,
+            "adopted": True,
+        }
 
     # МойСклад ждёт каждую ссылку как {"meta": {"href", "type", "mediaType"}}.
     # _CTX["org_meta"] и _CTX["store_meta"] хранят сам meta-dict (плоский),
     # поэтому здесь оборачиваем его в { "meta": ... }.
     payload: dict[str, Any] = {
         "name": f"Заявка #{order['id']} (бот)",
+        "syncId": sync_id,
         "organization": _meta(_CTX["org_meta"]["href"], "organization"),
         "agent": _meta(agent_href, "counterparty"),
         "store": _meta(_CTX["store_meta"]["href"], "store"),
@@ -324,6 +352,7 @@ async def create_demand_from_request(
                 return {
                     "ok": False,
                     "reason": f"HTTP {resp.status}: {safe}",
+                    "skipped": skipped,  # T2.12: не теряем список непрошедших позиций
                 }
             import json
 
@@ -341,7 +370,7 @@ async def create_demand_from_request(
         logger.exception("create demand failed")
         # Только имя класса в user-facing reason — текст исключения (репр
         # aiohttp-ошибки может включать host/URL) остаётся в logger.exception.
-        return {"ok": False, "reason": type(e).__name__}
+        return {"ok": False, "reason": type(e).__name__, "skipped": skipped}
 
 
 def _build_description(order: dict, telegram_full_name: str) -> str:

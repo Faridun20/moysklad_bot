@@ -164,6 +164,37 @@ class _CircuitBreaker:
 _circuit = _CircuitBreaker()
 
 
+def order_sync_id(entity: str, order_id: int) -> str:
+    """Детерминированный syncId документа МойСклад по локальному id заказа.
+
+    syncId — «внешний ключ» документа на стороне МС: он уникален в рамках
+    аккаунта, поэтому один и тот же (entity, order_id) всегда даёт один и тот
+    же документ. Это делает создание идемпотентным: если процесс упал между
+    успешным POST и локальной записью ms_*_id, повторная попытка находит
+    существующий документ вместо создания дубля (T2.4). Тот же приём уже
+    работает для paymentin (ms_payments).
+    """
+    import uuid as _uuid
+
+    return str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"bot-{entity}-{order_id}"))
+
+
+async def find_by_sync_id(entity: str, sync_id: str) -> str | None:
+    """id документа МС с таким syncId, или None.
+
+    Best-effort: ошибка поиска НЕ блокирует основной путь — вернём None и
+    пойдём создавать. Хуже дубль, чем сорванный апрув.
+    """
+    try:
+        found = await ms_get(f"entity/{entity}", params={"filter": f"syncId={sync_id}", "limit": 1})
+        rows = (found or {}).get("rows") or []
+        if rows:
+            return rows[0].get("id") or None
+    except Exception as e:  # noqa: BLE001 — поиск опционален
+        logger.warning("MS %s pre-search по syncId не удался: %s", entity, e)
+    return None
+
+
 async def ms_get(
     path: str, params: dict | None = None, session: aiohttp.ClientSession | None = None
 ):
@@ -203,6 +234,24 @@ async def ms_get(
                 resp.raise_for_status()
                 _circuit.record_success()
                 return await resp.json()
+        except aiohttp.ClientResponseError as e:
+            # T2.9: raise_for_status() бросает ClientResponseError, а раньше
+            # except ловил только TimeoutError/ClientConnectionError — исключение
+            # уходило наружу МИМО record_failure() и record_success(). Счётчик
+            # брейкера застывал, и он открывался только на таймаутах и сетевых
+            # обрывах, хотя докстринг обещал «после 5 провальных запросов».
+            #
+            # Различаем, чья это ошибка:
+            #   429 / 5xx — деградация МойСклад, считаем в брейкер (сюда мы
+            #               попадаем, только исчерпав ретраи выше);
+            #   прочие 4xx — наша ошибка (кривой фильтр, нет прав, 404).
+            #               Ретраить и открывать цепь бессмысленно: повтор даст
+            #               то же самое, а открытая цепь положит ВСЕ остальные
+            #               МС-операции. Брейкер не трогаем вовсе.
+            if e.status in _RETRY_STATUSES:
+                last_exc = e
+                break  # → record_failure() ниже
+            raise
         except (TimeoutError, aiohttp.ClientConnectionError) as e:
             last_exc = e
             if attempt >= _MAX_RETRIES - 1:

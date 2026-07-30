@@ -887,41 +887,38 @@ async def cb_submit_order(call: CallbackQuery, state: FSMContext, bot: Bot):
         return await call.message.answer("❌ Заказ не найден.")
     if order["user_id"] != call.from_user.id:
         return await call.message.answer("⛔ Это не ваш заказ.")
-    if order["status"] != "draft":
-        return await call.message.answer("⚠️ Заказ уже отправлен.")
-    if order.get("frozen"):
-        return await call.message.answer(
-            "🧊 Заказ заморожен после серии отклонений.\n"
-            "Переотправка заблокирована — обратитесь к администратору для разморозки."
-        )
 
-    items = await adb.get_order_items(order_id)
-    if not items:
-        return await call.message.answer(
-            "❌ Нельзя отправить пустой заказ.\nСначала добавьте товары."
-        )
+    # T2.3: сабмит идёт через общую submit_order — одна транзакция, CAS на
+    # draft, запись типа оплаты. Раньше бот вообще не трогал payment_type, и
+    # заказ оставался на схемном дефолте 'paid': рассрочка, отправленная из
+    # бота, молча учитывалась как оплаченная (§5.2.3). Тип оплаты берём
+    # С ЗАКАЗА — интерфейса выбора в боте нет, он появится (или бот-путь
+    # уйдёт целиком) в волне 3.
+    from services.order_workflow import submit_order
 
-    if not order.get("agent_name"):
-        return await call.message.answer(
-            "❌ Нельзя отправить заявку без клиента.\nНажмите «👤 Выбрать клиента»."
-        )
-
-    # Создаём заявку
     user = call.from_user
     full_name = user.full_name or user.username or str(user.id)
-    req_id, role = await asyncio.gather(
-        adb.create_shipment_request(order_id, user.id, full_name),
-        adb.get_role(user.id),
+    res = await submit_order(
+        order_id,
+        user.id,
+        full_name,
+        payment_type=order.get("payment_type"),
+        due_date=order.get("due_date"),
     )
-    await asyncio.gather(
-        adb.update_order_status(order_id, "pending"),
-        adb.add_audit_log(
-            user.id,
-            full_name,
-            role,
-            "shipment_request_sent",
-            f"Отправлена заявка #{req_id} (заказ #{order_id})",
-        ),
+    if not res.get("ok"):
+        return await call.message.answer(
+            f"⚠️ {res.get('error') or 'Не удалось отправить заявку'}"
+        )
+
+    req_id = res["req_id"]
+    items = await adb.get_order_items(order_id)
+    role = await adb.get_role(user.id)
+    await adb.add_audit_log(
+        user.id,
+        full_name,
+        role,
+        "shipment_request_sent",
+        f"Отправлена заявка #{req_id} (заказ #{order_id})",
     )
 
     await call.message.answer(
@@ -980,18 +977,18 @@ async def cb_delete_order_yes(call: CallbackQuery):
     if order["status"] != "draft":
         return await call.message.answer("❌ Нельзя удалить отправленный заказ.")
 
-    full_name = call.from_user.full_name or str(call.from_user.id)
-    role, _ = await asyncio.gather(
-        adb.get_role(call.from_user.id),
-        adb.update_order_status(order_id, "rejected"),
-    )
-    await adb.add_audit_log(
-        call.from_user.id,
-        full_name,
-        role,
-        "order_deleted",
-        f"Удалён черновик заказа #{order_id}",
-    )
+    # T2.7: то же, что и в WebApp — физическое удаление через delete_order
+    # (каскад по order_items, отказ при наличии платежей, свой audit-лог).
+    # Раньше бот просто ставил статус 'rejected' и оставлял строку с позициями,
+    # хотя в аудит писал «Удалён черновик заказа #N». В итоге 'rejected' означал
+    # две разные вещи — «босс отклонил заявку» и «менеджер удалил черновик», —
+    # и такие заказы продолжали попадать в выборки аналитики (§5.2.1).
+    if not await adb.delete_order(order_id, call.from_user.id):
+        return await call.message.answer(
+            "⚠️ Не удалось удалить заказ.\n"
+            "Если по нему уже есть платежи — удаление заблокировано, "
+            "обратитесь к администратору."
+        )
 
     await call.message.answer(f"🗑 Заказ #{order_id} удалён.")
 

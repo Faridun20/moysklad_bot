@@ -40,7 +40,13 @@ _STATE_TYPE_TO_STATUS = {
 
 # Статусы заказа, из которых допустим переход по сигналу из МойСклад.
 # Уже отгруженные / отклонённые — не откатываем.
-_UPDATABLE_STATUSES = {"pending", "approved"}
+#
+# T2.13 (§2.17): 'pending' убран. Successful из МС означает shipped, но
+# TRANSITIONS['pending'] = [approved, rejected, draft] — перехода pending→shipped
+# нет, поэтому КАЖДОЕ такое событие уходило в ветку «нелегальный переход» и
+# сыпало предупреждением боссу. Для аккаунтов МС, где заказ помечают «Успешным»
+# до апрува в боте, синк не работал никогда — только спамил.
+_UPDATABLE_STATUSES = {"approved"}
 
 
 async def handle_ms_events(events: list[dict]) -> None:

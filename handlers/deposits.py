@@ -50,6 +50,15 @@ def _fmt_amount(x: float) -> str:
     return money.format_cents(money.to_cents(x or 0), decimals=2, sep=" ")
 
 
+def _base_cur() -> str:
+    """Валюта кассы. T2.13 (§3.7): касса ведётся в BASE_CURRENCY, а подпись
+    была захардкожена как «USD» — при смене базовой валюты цифры оказывались
+    подписаны неверно."""
+    from config import BASE_CURRENCY
+
+    return (BASE_CURRENCY or "USD").upper()
+
+
 def _fmt_cents(cents: int) -> str:
     """Копейки → строка. Деньги хранятся только в копейках (T1.3), поэтому
     экраны сдач читают *_cents, а не мажорный float."""
@@ -63,7 +72,7 @@ async def _notify_confirmers(bot: Bot, deposit_id: int, manager_name: str, amoun
     allocations = await adb.get_cash_deposit_orders(deposit_id)
     orders_line = (
         "\n".join(
-            f"  • заказ #{a['order_id']} — {_fmt_cents(a['amount_allocated_cents'])} USD"
+            f"  • заказ #{a['order_id']} — {_fmt_cents(a['amount_allocated_cents'])} {_base_cur()}"
             for a in allocations
         )
         or "  <i>нет открытых заказов для привязки</i>"
@@ -72,7 +81,7 @@ async def _notify_confirmers(bot: Bot, deposit_id: int, manager_name: str, amoun
         f"{DIV}\n"
         f"💵 <b>Сдача наличных #{deposit_id}</b>\n\n"
         f"👨‍💼 Менеджер: <b>{esc(manager_name)}</b>\n"
-        f"💰 Сумма: <b>{_fmt_amount(amount)} USD</b>\n"
+        f"💰 Сумма: <b>{_fmt_amount(amount)} {_base_cur()}</b>\n"
         f"📦 Закрывает заказы:\n{orders_line}"
     )
     recipients = await adb.get_deposit_confirmers()
@@ -109,7 +118,7 @@ async def cmd_deposit(message: Message):
     manager_name = message.from_user.full_name or str(message.from_user.id)
     await _notify_confirmers(message.bot, res["deposit_id"], manager_name, amount)
     await message.answer(
-        f"✅ Сдача #{res['deposit_id']} на <b>{_fmt_amount(amount)} USD</b> создана "
+        f"✅ Сдача #{res['deposit_id']} на <b>{_fmt_amount(amount)} {_base_cur()}</b> создана "
         f"и отправлена на подтверждение.",
         parse_mode="HTML",
     )
@@ -126,7 +135,7 @@ async def cmd_my_deposits(message: Message):
     lines = [f"{DIV}", "💵 <b>Мои сдачи:</b>\n"]
     for d in deposits:
         st = d.get("status", "pending")
-        line = f"{emoji.get(st, '•')} #{d['id']} — {_fmt_cents(d['amount_cents'])} USD  ·  {st}"
+        line = f"{emoji.get(st, '•')} #{d['id']} — {_fmt_cents(d['amount_cents'])} {_base_cur()}  ·  {st}"
         if st == "rejected" and d.get("reject_reason"):
             line += f"\n   <i>{esc(d['reject_reason'])}</i>"
         lines.append(line)
@@ -147,7 +156,7 @@ async def _show_pending_deposits(target):
         allocations = await adb.get_cash_deposit_orders(d["id"])
         orders_line = (
             "\n".join(
-                f"  • заказ #{a['order_id']} — {_fmt_cents(a['amount_allocated_cents'])} USD"
+                f"  • заказ #{a['order_id']} — {_fmt_cents(a['amount_allocated_cents'])} {_base_cur()}"
                 for a in allocations
             )
             or "  <i>нет привязок</i>"
@@ -155,7 +164,7 @@ async def _show_pending_deposits(target):
         text = (
             f"{DIV}\n"
             f"💵 <b>Сдача #{d['id']}</b>\n"
-            f"💰 Сумма: <b>{_fmt_cents(d['amount_cents'])} USD</b>\n"
+            f"💰 Сумма: <b>{_fmt_cents(d['amount_cents'])} {_base_cur()}</b>\n"
             f"📦 Закрывает заказы:\n{orders_line}"
         )
         await target.answer(text, parse_mode="HTML", reply_markup=_confirm_keyboard(d["id"]))

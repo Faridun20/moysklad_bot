@@ -203,6 +203,7 @@ def test_cash_refund_converted_to_base(isolated_db):
 
     r = asyncio.run(db.create_return(oid, "full", "брак", [(iid, 10, 5_000_000.0)], "cash", 1))
     assert r["ok"], r
+    asyncio.run(db.mark_return_goods_received(r["return_id"], 1))
     asyncio.run(db.confirm_return(r["return_id"], 1, "Boss"))
 
     with db.get_conn() as conn:

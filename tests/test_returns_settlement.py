@@ -30,6 +30,7 @@ def _credit_shipped(db, total_per_unit, qty, mgr=2):
 def _confirm_return(db, oid, iid, qty, amount, method="debt_reduction"):
     r = asyncio.run(db.create_return(oid, "partial", "брак", [(iid, qty, amount)], method, 1))
     assert r["ok"], r
+    asyncio.run(db.mark_return_goods_received(r["return_id"], 1))
     res = asyncio.run(db.confirm_return(r["return_id"], 1, "Boss"))
     assert res["ok"], res
     return r["return_id"]

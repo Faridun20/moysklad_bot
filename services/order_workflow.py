@@ -20,7 +20,7 @@ import logging
 from decimal import Decimal
 from typing import Any
 
-from services import money
+from services import adb_core, money
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +217,257 @@ async def resubmit_diff_line(order_id: int, items: list[dict]) -> str:
 # Теперь — один сервис, который вызывают и Telegram callback, и /api/.
 
 
+
+# Человекочитаемые названия статусов — для объяснения боссу, почему кнопка
+# из старого сообщения больше не срабатывает.
+
+# ─── Submit заявки на отгрузку ───────────────────────────────────────────────
+
+
+class _SubmitAbort(Exception):
+    """Откат транзакции сабмита с сообщением пользователю."""
+
+    def __init__(self, message: str, status: str | None = None):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+
+def validate_payment_terms(
+    payment_type: str | None, due_date: str | None
+) -> tuple[str, str | None, str | None]:
+    """Нормализовать и проверить условия оплаты. → (payment_type, due_date, error).
+
+    Единая валидация для обоих входов. Раньше она была только в WebApp, а бот
+    сабмитил вообще не трогая payment_type — заказ оставался на схемном
+    дефолте 'paid', и рассрочка молча учитывалась как оплаченная (§5.2.3).
+    """
+    from datetime import date
+
+    ptype = (payment_type or "paid").lower()
+    due = (due_date or "").strip() or None
+    if ptype not in ("paid", "credit"):
+        return ptype, due, "Неверный тип оплаты"
+    if ptype != "credit":
+        # Для paid срок долга не имеет смысла — обнуляем, чтобы не тащить
+        # хвост от прошлого credit-состояния заказа.
+        return ptype, None, None
+    if not due:
+        return ptype, due, "Укажите дату возврата долга"
+    try:
+        parsed = date.fromisoformat(due)
+    except ValueError:
+        return ptype, due, "Неверный формат даты (нужно YYYY-MM-DD)"
+    if parsed < date.today():
+        return ptype, due, "Дата возврата не может быть в прошлом"
+    return ptype, due, None
+
+
+def _is_unique_violation(exc: BaseException) -> bool:
+    """Нарушение UNIQUE — на обоих бэкендах (sqlite3.IntegrityError /
+    asyncpg.UniqueViolationError). Ловим по типу и по тексту, чтобы не тащить
+    в импорты драйвер, которого может не быть."""
+    name = type(exc).__name__
+    if name in ("IntegrityError", "UniqueViolationError"):
+        return True
+    text = str(exc).lower()
+    return "unique" in text and "constraint" in text
+
+
+async def submit_order(
+    order_id: int,
+    user_id: int,
+    full_name: str,
+    *,
+    payment_type: str | None = None,
+    due_date: str | None = None,
+    comment: str = "",
+    idem_key: str | None = None,
+) -> dict:
+    """Отправить заказ на согласование. ЕДИНСТВЕННЫЙ путь сабмита (T2.3).
+
+    Всё в одной транзакции: SELECT ... FOR UPDATE на заказе, проверка
+    status='draft', запись типа оплаты, перевод в 'pending' с submitted_at,
+    вставка заявки. Либо всё, либо ничего.
+
+    Что чинится:
+      • бот не записывал payment_type — рассрочка учитывалась как оплаченная
+        (§5.2.3, схемный дефолт 'paid');
+      • create_shipment_request и update_order_status шли двумя транзакциями:
+        краш между ними оставлял заявку 'pending' при заказе 'draft', а двойной
+        тап успевал создать ДВЕ заявки (§2.1) — теперь CAS на draft отсекает
+        второй сабмит, а уникальный индекс из T1.8 страхует на уровне БД;
+      • submitted_at не записывался вовсе (§2.11), из-за чего переотправленный
+        заказ немедленно объявлялся «зависшей заявкой» по старому created_at.
+
+    submitted_at пишем `now_str()` — в ОДНОМ кадре с created_at (локальное
+    наивное время). get_stale_pending_orders сравнивает
+    COALESCE(submitted_at, created_at) с порогом, посчитанным в Python через
+    datetime.now(); UTC здесь разъехался бы с локальным на величину смещения
+    и досрочно помечал заявки зависшими.
+
+    Возвращает {"ok": True, "req_id": N, "payment_type", "due_date"} либо
+    {"ok": False, "error": "...", "status": <текущий статус>}.
+    """
+    from services import async_db as adb
+    from services.database import USE_POSTGRES, now_str
+
+    ptype, due, err = validate_payment_terms(payment_type, due_date)
+    if err:
+        return {"ok": False, "error": err}
+
+    if idem_key:
+        cached = await adb.idem_claim(idem_key, "order_submit", user_id)
+        if cached is not None:
+            # Ключ уже застолблён — повторная отправка того же запроса.
+            return cached or {"ok": False, "error": "Заявка уже отправлена"}
+
+    result: dict
+    try:
+        async with adb_core.transaction() as txn:
+            lock = " FOR UPDATE" if USE_POSTGRES else ""
+            order = await txn.fetchrow(
+                f"SELECT id, status, agent_name, frozen FROM orders WHERE id = $1{lock}",
+                order_id,
+            )
+            if not order:
+                raise _SubmitAbort("Заказ не найден")
+            if order["status"] != "draft":
+                raise _SubmitAbort(
+                    "Заказ уже отправлен — повторная отправка не нужна",
+                    status=order["status"],
+                )
+            if order.get("frozen"):
+                raise _SubmitAbort(
+                    "Заказ заморожен после серии отклонений — обратитесь к администратору"
+                )
+            if not (order.get("agent_name") or "").strip():
+                raise _SubmitAbort("Выберите клиента")
+
+            n_items = int(
+                await txn.fetchval(
+                    "SELECT COUNT(*) FROM order_items WHERE order_id = $1", order_id
+                )
+                or 0
+            )
+            if n_items == 0:
+                raise _SubmitAbort("Добавьте товары")
+
+            stamp = now_str()
+            moved = await txn.execute(
+                "UPDATE orders SET status = 'pending', payment_type = $1, due_date = $2, "
+                "submitted_at = $3, updated_at = $4 WHERE id = $5 AND status = 'draft'",
+                ptype, due, stamp, stamp, order_id,
+            )
+            if not moved:
+                # Кто-то успел между SELECT и UPDATE (на SQLite нет FOR UPDATE).
+                raise _SubmitAbort("Заказ уже отправлен — повторная отправка не нужна")
+
+            await txn.execute(
+                "INSERT INTO shipment_requests "
+                "(order_id, user_id, full_name, status, comment, created_at) "
+                "VALUES ($1, $2, $3, 'pending', $4, $5)",
+                order_id, user_id, full_name, comment, stamp,
+            )
+            req_id = int(
+                await txn.fetchval(
+                    "SELECT id FROM shipment_requests WHERE order_id = $1 "
+                    "AND status = 'pending'",
+                    order_id,
+                )
+                or 0
+            )
+            result = {"ok": True, "req_id": req_id, "payment_type": ptype, "due_date": due}
+    except _SubmitAbort as e:
+        result = {"ok": False, "error": e.message, "status": e.status}
+    except Exception as e:  # noqa: BLE001 — нужен именно разбор причины
+        if not _is_unique_violation(e):
+            raise
+        # Уникальный индекс из T1.8: вторая pending-заявка по тому же заказу.
+        # Это не 500, а «уже отправлено».
+        logger.info("submit_order: заявка по заказу #%s уже существует", order_id)
+        result = {"ok": False, "error": "Заявка уже отправлена"}
+
+    if idem_key:
+        await adb.idem_store(idem_key, result)
+    return result
+
+
+
+
+# ─── Отмена заказа ───────────────────────────────────────────────────────────
+
+
+async def cancel_order_full(
+    order_id: int, user_id: int, user_name: str, reason: str
+) -> dict:
+    """Отменить заказ ЛОКАЛЬНО и откатить документ в МойСклад. Общий код для
+    обоих входов (T2.6).
+
+    Раньше реверс делал только бот (`handlers/order_cancel`), а
+    `/api/orders/cancel` — нет. Заказ, отменённый из WebApp, оставался
+    в МойСклад живым customerorder'ом с резервом товара НАВСЕГДА: cron-
+    реконсиляция его не подбирает (`get_orders_with_ms_customerorder`
+    исключает `cancelled`), значит рассинхрон никто уже не заметит (§5.2.2).
+
+    Реверс — best-effort и намеренно ПОСЛЕ локальной отмены: ошибка МС не
+    должна откатывать то, что оператор уже подтвердил. `ms_cancel_synced_at`
+    проставляет сам `reverse_customerorder`, он же идемпотентен (повторный
+    вызов вернёт skipped).
+
+    Возвращает результат `cancel_order` плюс `ms_reverse` — что вышло с МС
+    (для логов и текста оператору).
+    """
+    from services import async_db as adb
+
+    res = await adb.cancel_order(order_id, user_id, user_name, reason)
+    if not res.get("ok"):
+        return res
+
+    from services import ms_cancel
+
+    try:
+        ms_res = await ms_cancel.reverse_customerorder(order_id)
+    except Exception as e:  # noqa: BLE001 — отмена уже применена, МС догоним
+        logger.warning("MS reverse customerorder failed", exc_info=True)
+        ms_res = {"ok": False, "reason": type(e).__name__}
+    if not ms_res.get("ok"):
+        logger.warning(
+            "Заказ #%s отменён локально, но реверс в МС не прошёл: %s",
+            order_id, ms_res.get("reason"),
+        )
+    return {**res, "ms_reverse": ms_res}
+
+
+_STATUS_RU: dict[str, str] = {
+    "draft": "черновик",
+    "pending": "на согласовании",
+    "approved": "одобрен",
+    "shipped": "отгружен",
+    "paid": "оплачен",
+    "rejected": "отклонён",
+    "cancelled": "отменён",
+    "partially_returned": "частично возвращён",
+    "returned": "возвращён",
+}
+
+
+def _decision_error(decision, order_id) -> str:
+    """Сообщение боссу по отказу CAS (T2.2).
+
+    Различаем два случая: заявку разобрал другой человек — или заказ уехал в
+    другой статус (напр. МойСклад прислал Unsuccessful и заказ стал rejected),
+    а кнопка осталась в старом сообщении чата.
+    """
+    if decision.reason == "order_moved":
+        human = _STATUS_RU.get(decision.order_status or "", decision.order_status or "?")
+        return (
+            f"Заказ #{order_id} уже в статусе «{human}» — решение по заявке "
+            f"больше не применимо. Откройте заказ и посмотрите актуальное состояние."
+        )
+    return "Заявка уже обработана другим пользователем"
+
+
 async def approve_shipment_request(
     req_id: int,
     boss_user_id: int,
@@ -301,11 +552,11 @@ async def approve_shipment_request(
     # Атомарный UPDATE ... WHERE status='pending' — защита от race condition,
     # когда два босса одновременно жмут «Одобрить». Только один из них
     # получит rowcount==1, остальные — False.
-    ok = await adb.approve_shipment_request(req_id, boss_user_id, boss_name)
-    if not ok:
+    decision = await adb.approve_shipment_request(req_id, boss_user_id, boss_name)
+    if not decision.applied:
         return {
             "ok": False,
-            "error": "Заявка уже обработана другим пользователем",
+            "error": _decision_error(decision, req.get("order_id")),
             "req_id": req_id,
             "order_id": req.get("order_id"),
         }
@@ -347,7 +598,17 @@ async def approve_shipment_request(
     # заказ меньше локального). Собираем их и показываем боссу предупреждением.
     skipped_names: list[str] = []
 
-    if order and items and ms_ready():
+    # T2.4: не постим в МойСклад, если документ по заказу уже есть. Раньше
+    # повторный approve (два босса, ретрай, старая кнопка) заново создавал
+    # customerorder и demand — товар резервировался и списывался ДВАЖДЫ, а
+    # ссылка на первый документ перезатиралась, и он становился сиротой (§2.1).
+    # Второй эшелон защиты — детерминированный syncId внутри самих
+    # create_*_from_request: даже если сюда зашли параллельно, МС отдаст тот же
+    # документ, а не создаст новый.
+    existing_co = (order or {}).get("ms_customerorder_id")
+    existing_demand = (order or {}).get("ms_demand_id")
+
+    if order and items and ms_ready() and not existing_co:
         co_result = await create_customerorder_from_request(
             order,
             items,
@@ -382,12 +643,16 @@ async def approve_shipment_request(
             from services.moysklad import MS_BASE
 
             co_href = f"{MS_BASE}/entity/customerorder/{co_id}" if co_id else None
-            demand_result = await create_demand_from_request(
-                order,
-                items,
-                manager_name,
-                telegram_user_id=manager_user_id,
-                customerorder_href=co_href,
+            demand_result: dict[str, Any] = (
+                {"ok": False, "reason": "demand уже создан", "skipped": []}
+                if existing_demand
+                else await create_demand_from_request(
+                    order,
+                    items,
+                    manager_name,
+                    telegram_user_id=manager_user_id,
+                    customerorder_href=co_href,
+                )
             )
             for nm in demand_result.get("skipped") or []:
                 if nm not in skipped_names:
@@ -623,11 +888,11 @@ async def reject_shipment_request(
             "order_id": req.get("order_id"),
         }
 
-    ok = await adb.reject_shipment_request(req_id, boss_user_id, boss_name)
-    if not ok:
+    decision = await adb.reject_shipment_request(req_id, boss_user_id, boss_name)
+    if not decision.applied:
         return {
             "ok": False,
-            "error": "Заявка уже обработана другим пользователем",
+            "error": _decision_error(decision, req.get("order_id")),
             "req_id": req_id,
             "order_id": req.get("order_id"),
         }

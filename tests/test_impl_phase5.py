@@ -40,6 +40,7 @@ def test_partial_return_sets_partially_returned(shipped_order):
         )
     )
     assert r["ok"] is True
+    asyncio.run(db.mark_return_goods_received(r["return_id"], 1))
     conf = asyncio.run(db.confirm_return(r["return_id"], 1, "Boss"))
     assert conf["ok"] is True
     assert conf["order_status"] == "partially_returned"
@@ -53,6 +54,7 @@ def test_full_return_sets_returned(shipped_order):
     db, mgr, oid, items = shipped_order
     full = [(items[0]["id"], 2, 200.0), (items[1]["id"], 1, 50.0)]
     r = asyncio.run(db.create_return(oid, "full", "отказ", full, refund_method="cash", created_by=mgr))
+    asyncio.run(db.mark_return_goods_received(r["return_id"], 1))
     conf = asyncio.run(db.confirm_return(r["return_id"], 1, "Boss"))
     assert conf["order_status"] == "returned"
     assert asyncio.run(db.get_order(oid))["status"] == "returned"
@@ -65,6 +67,7 @@ def test_cash_refund_creates_negative_deposit(shipped_order):
             oid, "partial", "брак", [(items[1]["id"], 1, 50.0)], refund_method="cash", created_by=mgr
         )
     )
+    asyncio.run(db.mark_return_goods_received(r["return_id"], 1))
     asyncio.run(db.confirm_return(r["return_id"], 1, "Boss"))
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)
@@ -83,7 +86,9 @@ def test_return_confirm_is_idempotent(shipped_order):
             oid, "partial", "x", [(items[0]["id"], 1, 100.0)], refund_method="no_refund", created_by=mgr
         )
     )
+    asyncio.run(db.mark_return_goods_received(r["return_id"], 1))
     assert asyncio.run(db.confirm_return(r["return_id"], 1, "Boss"))["ok"] is True
+    asyncio.run(db.mark_return_goods_received(r["return_id"], 1))
     assert asyncio.run(db.confirm_return(r["return_id"], 1, "Boss"))["ok"] is False
 
 
@@ -116,6 +121,7 @@ def test_confirmed_return_reduces_agent_debt(shipped_order):
             created_by=mgr,
         )
     )
+    asyncio.run(db.mark_return_goods_received(r["return_id"], 1))
     asyncio.run(db.confirm_return(r["return_id"], 1, "Boss"))
     # Возврат на 100 → долг 150.
     assert asyncio.run(db.get_agent_current_debt("A-1")) == 150.0

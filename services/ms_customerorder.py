@@ -276,8 +276,35 @@ async def create_customerorder_from_request(
 
     agent_href = f"{MS_BASE}/entity/counterparty/{order['agent_id']}"
 
+    # Детерминированный syncId (T2.4): идемпотентный ключ документа от id
+    # заказа. Даёт МС-стороннюю дедупликацию и позволяет подхватить уже
+    # созданный customerorder, если процесс упал между прошлым POST и
+    # локальной записью ms_customerorder_id — иначе повторный approve
+    # создавал ВТОРОЙ документ и резервировал товар дважды (§2.1).
+    from services.moysklad import find_by_sync_id, order_sync_id
+
+    sync_id = order_sync_id("customerorder", order["id"])
+
+    adopted = await find_by_sync_id("customerorder", sync_id)
+    if adopted:
+        logger.info(
+            "MS customerorder уже существует (syncId), подхвачен: id=%s (заказ #%s)",
+            adopted, order["id"],
+        )
+        pdf_bytes, pdf_filename = await _try_get_print_pdf(adopted)
+        return {
+            "ok": True,
+            "customerorder_id": adopted,
+            "name": f"Заказ #{order['id']} (бот)",
+            "skipped": skipped,
+            "adopted": True,
+            "pdf_bytes": pdf_bytes,
+            "pdf_filename": pdf_filename,
+        }
+
     payload: dict[str, Any] = {
         "name": f"Заказ #{order['id']} (бот)",
+        "syncId": sync_id,
         "organization": _meta(ms_demand._CTX["org_meta"]["href"], "organization"),
         "agent": _meta(agent_href, "counterparty"),
         "positions": positions,

@@ -118,6 +118,9 @@ def test_full_return_flow_creates_and_confirms(isolated_db):
     return_id = pend[0]["id"]
     assert any(chat == 2 for chat, _, _ in bot.sent)  # боссу ушло
 
+    # T2.8: склад отмечает приёмку товара — без неё подтверждение отклонят.
+    asyncio.run(db.mark_return_goods_received(return_id, 2))
+
     # босс подтверждает
     bot2 = _FakeBot()
     conf_call = _FakeCall(f"ret_ok:{return_id}", uid=2, bot=bot2)

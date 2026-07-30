@@ -100,3 +100,97 @@ def test_limit_denied_for_manager(isolated_db):
     msg = _FakeMessage(text="/limit", uid=1)  # менеджер
     asyncio.run(cmd_limit(msg))
     assert any("доступ" in t.lower() for t, _ in msg.answers)
+
+
+# ─── T2.10: валидация суммы и перепроверка роли ─────────────────────────────
+#
+# §5.2.8: проверка была `amount < 0`, а `float('inf') < 0` — ложь, поэтому
+# «inf» и «nan» проходили насквозь. Бесконечный лимит делает ЛЮБОЙ долг
+# «свободным»: кредит-чек перестаёт срабатывать вовсе. Плюс это был
+# единственный FSM в проекте без перепроверки роли после перехода.
+
+import pytest  # noqa: E402
+
+
+def _flow_to_amount(db, uid=2, agent="AG-1"):
+    """Довести FSM до состояния ожидания суммы."""
+    from handlers.credit import cb_limit_set
+
+    state = _FakeState()
+    call = _FakeCall(f"lim_set:{agent}", uid=uid)
+    asyncio.run(cb_limit_set(call, state))
+    return state
+
+
+@pytest.mark.parametrize("bad", ["inf", "-inf", "Infinity", "nan", "NaN"])
+def test_non_finite_limit_is_rejected(isolated_db, bad):
+    db = isolated_db
+    from handlers.credit import process_limit_amount
+
+    _setup(db)
+    state = _flow_to_amount(db)
+    msg = _FakeMessage(text=bad, uid=2)
+    asyncio.run(process_limit_amount(msg, state))
+
+    assert any("от 0 до" in t or "числом" in t for t, _ in msg.answers), msg.answers
+    # Лимит не изменился — остался дефолтным из app_settings.
+    assert asyncio.run(db.get_credit_limit("AG-1")) == 2000.0
+
+
+@pytest.mark.parametrize("bad", ["-5", "10000000", "99999999"])
+def test_out_of_range_limit_is_rejected(isolated_db, bad):
+    db = isolated_db
+    from handlers.credit import process_limit_amount
+
+    _setup(db)
+    state = _flow_to_amount(db)
+    msg = _FakeMessage(text=bad, uid=2)
+    asyncio.run(process_limit_amount(msg, state))
+
+    assert any("от 0 до" in t for t, _ in msg.answers), msg.answers
+    assert asyncio.run(db.get_credit_limit("AG-1")) == 2000.0
+
+
+def test_zero_limit_is_allowed(isolated_db):
+    """0 — валидная граница: «в долг не отпускать вообще»."""
+    db = isolated_db
+    from handlers.credit import process_limit_amount
+
+    _setup(db)
+    state = _flow_to_amount(db)
+    asyncio.run(process_limit_amount(_FakeMessage(text="0", uid=2), state))
+    assert asyncio.run(db.get_credit_limit("AG-1")) == 0.0
+
+
+def test_role_revoked_between_steps_blocks_write(isolated_db):
+    """Роль снята между `lim_set:` и вводом суммы — запись не проходит."""
+    db = isolated_db
+    from handlers.credit import process_limit_amount
+
+    _setup(db)
+    state = _flow_to_amount(db)
+
+    db.set_role(2, "boss", "Boss", "manager")  # понизили
+    roles.invalidate_all_roles()
+
+    msg = _FakeMessage(text="5000", uid=2)
+    asyncio.run(process_limit_amount(msg, state))
+
+    assert any("доступ" in t.lower() for t, _ in msg.answers), msg.answers
+    assert asyncio.run(db.get_credit_limit("AG-1")) == 2000.0
+
+
+def test_agent_without_orders_is_rejected(isolated_db):
+    """Паритет с /api/credit/set: лимит-сирота не заводим."""
+    db = isolated_db
+    from handlers.credit import process_limit_amount
+
+    _setup(db)
+    state = _FakeState()
+    asyncio.run(state.update_data(agent_id="GHOST", agent_name="Призрак"))
+
+    msg = _FakeMessage(text="5000", uid=2)
+    asyncio.run(process_limit_amount(msg, state))
+
+    assert any("есть заказ" in t for t, _ in msg.answers), msg.answers
+    assert asyncio.run(db.get_credit_limit("GHOST")) == 2000.0  # дефолт, записи нет
