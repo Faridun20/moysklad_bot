@@ -974,6 +974,55 @@ async def get_confirmed_deposit_cents_for_orders(order_ids: list[int]) -> dict[i
     return {r["oid"]: int(r["dc"] or 0) for r in rows}
 
 
+async def get_allocated_deposit_cents_for_orders(
+    order_ids: list[int], conn=None
+) -> dict[int, int]:
+    """Распределено на заказы сдачами pending+confirmed, в копейках, батчем.
+
+    В отличие от get_confirmed_deposit_cents_for_orders учитывает и pending:
+    неподтверждённая сдача уже «застолбила» остаток, второй раз распределять
+    его нельзя. `conn` — чтобы считать внутри транзакции под advisory-lock'ом.
+    """
+    if not order_ids:
+        return {}
+    db = conn if conn is not None else adb_core
+    ph = ", ".join(f"${i + 1}" for i in range(len(order_ids)))
+    rows = await db.fetch(
+        f"SELECT cdo.order_id AS oid, {_SUM_ALLOC_CENTS} AS dc "
+        "FROM cash_deposit_orders cdo JOIN cash_deposits d ON d.id = cdo.deposit_id "
+        f"WHERE cdo.order_id IN ({ph}) AND d.status IN ('pending', 'confirmed') "
+        "GROUP BY cdo.order_id",
+        *order_ids,
+    )
+    return {r["oid"]: int(r["dc"] or 0) for r in rows}
+
+
+async def deposit_remaining_cents_for_orders(
+    order_ids: list[int], conn=None
+) -> dict[int, int]:
+    """Сколько ещё можно покрыть сдачей по каждому заказу, в копейках.
+
+    total − возвраты − подтверждённые платежи − распределённое сдачами
+    (pending+confirmed). Отличается от services.debts.calc_remaining_cents
+    последним слагаемым: там учитываются только ПОДТВЕРЖДЁННЫЕ сдачи, а для
+    распределения новой сдачи надо видеть и застолблённое pending'ом.
+
+    Два запроса на любое число заказов. `conn` — для расчёта внутри транзакции.
+    """
+    from services.debts import calc_order_balances
+
+    if not order_ids:
+        return {}
+    balances = await calc_order_balances(order_ids, conn=conn)
+    allocated = await get_allocated_deposit_cents_for_orders(order_ids, conn=conn)
+    out: dict[int, int] = {}
+    for oid, bal in balances.items():
+        out[oid] = (
+            bal.total_cents - bal.returns_cents - bal.confirmed_cents - allocated.get(oid, 0)
+        )
+    return out
+
+
 async def get_agent_current_debt(agent_id: str) -> float:
     """Текущий долг контрагента: сумма непогашенных остатков по его открытым
     заказам минус подтверждённые возвраты. Открытые = не draft/rejected/
@@ -1595,21 +1644,6 @@ async def _order_confirmed_returns_cents(order_id: int) -> int:
     )
 
 
-async def _order_allocated_deposit_cents(order_id: int) -> int:
-    """Распределено на заказ pending+confirmed сдачами, в копейках (M3).
-
-    asyncpg Stage 17 (#21): native async через adb_core (fetchval)."""
-    return int(
-        await adb_core.fetchval(
-            f"SELECT {_SUM_ALLOC_CENTS} FROM cash_deposit_orders cdo "
-            "JOIN cash_deposits d ON d.id = cdo.deposit_id "
-            "WHERE cdo.order_id = $1 AND d.status IN ('pending', 'confirmed')",
-            order_id,
-        )
-        or 0
-    )
-
-
 async def _order_confirmed_payment_cents(order_id: int) -> int:
     """Подтверждённые платежи по заказу в ВАЛЮТЕ ЗАКАЗА, в копейках. Платежи к
     заказу — в его валюте (link/close это гарантируют, WP-04); NULL-валюту
@@ -1641,7 +1675,13 @@ def _is_base_currency(currency: str | None) -> bool:
     return (currency or base).upper() == base
 
 
-async def get_manager_open_orders_for_deposit(manager_id: int) -> list[dict]:
+async def _calc_balances(order_ids: list[int], conn=None):
+    from services.debts import calc_order_balances
+
+    return await calc_order_balances(order_ids, conn=conn)
+
+
+async def get_manager_open_orders_for_deposit(manager_id: int, conn=None) -> list[dict]:
     """Отгруженные неоплаченные заказы менеджера В БАЗОВОЙ ВАЛЮТЕ (для распределения
     сдачи). Возвращает [{id, total, covered, remaining}] по возрастанию created_at.
     remaining = total − возвраты − подтверждённые платежи − распределённое
@@ -1653,31 +1693,39 @@ async def get_manager_open_orders_for_deposit(manager_id: int) -> list[dict]:
 
     Остаток считаем в копейках (без float-эпсилона 0.01) — заказ попадает
     в список, только если непокрытый остаток ≥ 1 копейки."""
-    rows = await adb_core.fetch(
+    db = conn if conn is not None else adb_core
+    rows = await db.fetch(
         "SELECT id, currency FROM orders WHERE user_id = $1 AND status = 'shipped' "
         "AND payment_confirmed = 0 ORDER BY created_at ASC",
         manager_id,
     )
+    # Заказы в не-базовой валюте отсеиваем сразу: сдача в базовой их не покрывает.
+    ordered_ids = [r["id"] for r in rows if _is_base_currency(r["currency"])]
+    if not ordered_ids:
+        return []
+
+    # T2.11: раньше здесь было 4 запроса НА КАЖДЫЙ заказ, и каждый брал свой
+    # коннект из пула — при вызове изнутри транзакции это выедало пул и
+    # вставало намертво. Теперь два запроса на любое число заказов.
+    remaining_by_id = await deposit_remaining_cents_for_orders(ordered_ids, conn=conn)
+    balances = await _calc_balances(ordered_ids, conn=conn)
+
     out = []
-    for r in rows:
-        if not _is_base_currency(r["currency"]):
-            continue  # сдача в базовой валюте не покрывает заказ в иной валюте
-        oid = r["id"]
-        total_cents = await _order_total_cents(oid)
-        returns_cents = await _order_confirmed_returns_cents(oid)
-        paid_cents = await _order_confirmed_payment_cents(oid)
-        alloc_cents = await _order_allocated_deposit_cents(oid)
-        covered_cents = returns_cents + paid_cents + alloc_cents
-        remaining_cents = total_cents - covered_cents
-        if remaining_cents > 0:
-            out.append(
-                {
-                    "id": oid,
-                    "total": float(money.from_cents(total_cents)),
-                    "covered": float(money.from_cents(covered_cents)),
-                    "remaining": float(money.from_cents(remaining_cents)),
-                }
-            )
+    for oid in ordered_ids:  # порядок FIFO — по created_at, как в SELECT выше
+        remaining_cents = remaining_by_id.get(oid, 0)
+        if remaining_cents <= 0:
+            continue
+        bal = balances.get(oid)
+        total_cents = bal.total_cents if bal else 0
+        out.append(
+            {
+                "id": oid,
+                "total": float(money.from_cents(total_cents)),
+                "covered": float(money.from_cents(total_cents - remaining_cents)),
+                "remaining": float(money.from_cents(remaining_cents)),
+                "remaining_cents": remaining_cents,
+            }
+        )
     return out
 
 
@@ -2071,23 +2119,42 @@ async def create_cash_deposit(
     is_manual = allocations is not None
     allocs: list[tuple] = list(allocations) if allocations is not None else []
 
+    # T2.11: FIFO-расчёт — ДО захвата коннекта под транзакцию.
+    # Раньше он шёл внутри `async with transaction()`, а
+    # get_manager_open_orders_for_deposit делала 4 запроса на каждый заказ,
+    # и каждый брал СВОЙ коннект из того же пула. При PG_POOL_MAX=10
+    # одновременных сдачах все коннекты держали транзакции, а внутренние
+    # запросы ждали свободного — asyncpg.Pool.acquire() без таймаута ждёт
+    # вечно, процесс вставал до рестарта (§2.13).
+    candidates: list[dict] = []
+    if not is_manual:
+        candidates = await get_manager_open_orders_for_deposit(manager_id)
+
     async with adb_core.transaction() as txn:
         if USE_POSTGRES:
-            # Сериализуем FIFO-расчёт + INSERT по manager_id. pg_advisory_xact_lock
-            # держится до конца транзакции, второй параллельный вызов ждёт.
+            # Сериализуем перепроверку + INSERT по manager_id.
+            # pg_advisory_xact_lock держится до конца транзакции, второй
+            # параллельный вызов ждёт.
             await txn.execute(
                 "SELECT pg_advisory_xact_lock(hashtext($1))",
                 f"cash_deposit:manager:{manager_id}",
             )
         if not is_manual:
-            left = amount
-            for o in await get_manager_open_orders_for_deposit(manager_id):
-                if left <= 0:
+            # Перепроверка ПОД ЛОКОМ: между расчётом и этим моментом другой
+            # вызов мог распределить часть остатка. Читаем свежие остатки тем
+            # же коннектом (conn=txn) — новых захватов из пула не делаем.
+            fresh = await deposit_remaining_cents_for_orders(
+                [o["id"] for o in candidates], conn=txn
+            )
+            left_cents = money.to_cents(amount)
+            for o in candidates:
+                if left_cents <= 0:
                     break
-                take = min(o["remaining"], left)
-                if take > 0:
-                    allocs.append((o["id"], round(take, 2)))
-                    left -= take
+                available = min(int(o.get("remaining_cents") or 0), fresh.get(o["id"], 0))
+                take_cents = min(available, left_cents)
+                if take_cents > 0:
+                    allocs.append((o["id"], float(money.from_cents(take_cents))))
+                    left_cents -= take_cents
 
         amount_cents = money.to_cents(amount)
         if USE_POSTGRES:
