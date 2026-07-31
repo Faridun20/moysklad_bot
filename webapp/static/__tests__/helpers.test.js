@@ -8,7 +8,7 @@ import helpers from '../helpers.js';
 
 const {
   escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml,
-  parsePaymentItems, renderMoneyTotalsHtml, financeTabs, balanceParts, periodSegHtml,
+  parsePaymentItems, renderMoneyTotalsHtml, financeTabs, balanceParts, periodSegHtml, rangeLabel,
   formatMoney, msBalanceLabel, emptyState, skeleton, errorBoxHtml,
 } = helpers;
 
@@ -428,5 +428,42 @@ describe('errorBoxHtml (UI-WP-09)', () => {
   it('кнопку повтора можно привязать к своему обработчику', () => {
     expect(errorBoxHtml('x', { retryAttr: 'onclick="reload()"' })).toContain('onclick="reload()"');
     expect(errorBoxHtml('x', { retry: false })).not.toContain('Повторить');
+  });
+});
+
+describe('rangeLabel (UI-BUG-02)', () => {
+  const today = new Date('2026-07-15T12:00:00Z');
+
+  it('внутри текущего года год не печатает — он не несёт информации', () => {
+    expect(rangeLabel('2026-07-01', '2026-07-31', today)).toBe('01.07—31.07');
+  });
+
+  it('диапазон, выходящий за текущий год, год показывает', () => {
+    expect(rangeLabel('2025-12-20', '2026-01-10', today)).toBe('20.12.25—10.01.26');
+  });
+
+  it('без обеих дат подписи нет — кнопка остаётся иконкой', () => {
+    expect(rangeLabel('', '2026-07-31', today)).toBe('');
+    expect(rangeLabel('2026-07-01', null, today)).toBe('');
+  });
+
+  it('короче полного формата — ради него всё и затевалось', () => {
+    const short = rangeLabel('2026-07-01', '2026-07-31', today);
+    expect(short.length).toBeLessThan('01.07.2026—31.07.2026'.length);
+  });
+});
+
+describe('доп-кнопка периода (UI-BUG-02)', () => {
+  const presets = [{ id: 'week', label: 'Неделя' }];
+
+  it('при выбранном пресете — только иконка с доступной подписью', () => {
+    const html = periodSegHtml(presets, 'week', 'data-period', false, '');
+    expect(html).toContain('aria-label="Выбрать период"');
+    expect(html).not.toContain('Период…');
+  });
+
+  it('в режиме custom показывает выбранный диапазон', () => {
+    const html = periodSegHtml(presets, 'custom', 'data-period', true, '01.07—31.07');
+    expect(html).toContain('01.07—31.07');
   });
 });

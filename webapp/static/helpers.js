@@ -295,6 +295,25 @@
     return { text: `0 ${p.currency}`, tone: 'zero' };
   }
 
+  // Короткая подпись диапазона (UI-BUG-02). Полные даты «01.07.2026—31.07.2026»
+  // — это ~150px, из-за которых ряд с сегментом гарантированно переполнялся и
+  // кнопку срезал вьюпорт. Год печатаем, только если диапазон выходит за
+  // текущий: внутри года он не несёт информации, а место занимает.
+  //
+  // Формула была продублирована в app.js дважды (заказы и аналитика) — тот
+  // самый дубль, который WP-29 обещал убрать, но убрал только разметку.
+  function rangeLabel(from, to, today) {
+    if (!from || !to) return '';
+    const year = String(from).slice(0, 4);
+    const yearTo = String(to).slice(0, 4);
+    const nowYear = String((today || new Date()).getFullYear());
+    const short = (iso) => `${String(iso).slice(8, 10)}.${String(iso).slice(5, 7)}`;
+    const sameCurrentYear = year === nowYear && yearTo === nowYear;
+    return sameCurrentYear
+      ? `${short(from)}—${short(to)}`
+      : `${short(from)}.${year.slice(2)}—${short(to)}.${yearTo.slice(2)}`;
+  }
+
   // Единый период-сегмент (WP-29): пресеты .seg-item + доп-кнопка «Период…»
   // (произвольный диапазон). Раньше разметка дублировалась в analyticsHeaderHtml
   // (data-period) и renderOrdersMain (data-operiod) и уже разъехалась — в Заказах
@@ -311,15 +330,21 @@
       // доп-кнопка справа, и на 360dp они не влезают. Без варианта подписи
       // резались.
       `<div class="seg-row"><div class="seg seg--scroll">${seg}</div>` +
+      // UI-BUG-02: пока активен пресет, кнопка — только иконка с aria-label.
+      // Подпись «Период…» занимала ~62px, из-за которых ряд и рушился; текст
+      // нужен лишь когда выбран произвольный диапазон и его надо показать.
       `<button class="seg-aux ${customActive ? 'active' : ''}" ${attr}="custom" ` +
-      `aria-pressed="${customActive}">${icon('clock')} ${escapeHtml(customLabel || 'Период…')}</button></div>`
+      `aria-pressed="${customActive}" aria-label="Выбрать период"` +
+      `${customActive ? '' : ' title="Выбрать период"'}>` +
+      `${icon('clock')}${customActive && customLabel ? ' ' + escapeHtml(customLabel) : ''}` +
+      `</button></div>`
     );
   }
 
   return {
     escapeHtml, idemKey, formatDateRU, icon, opsAmount,
     renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml, financeTabs,
-    balanceParts, periodSegHtml, formatMoney, msBalanceLabel,
+    balanceParts, periodSegHtml, rangeLabel, formatMoney, msBalanceLabel,
     emptyState, skeleton, errorBoxHtml,
   };
 });

@@ -1174,7 +1174,9 @@ function mountCalendar(host, initFrom, initTo, onApply) {
       if (from && to && key > from && key < to) cls.push('cal-in-range');
       cells.push(`<button type="button" class="${cls.join(' ')}" data-day="${key}">${d}</button>`);
     }
-    const rangeLabel = from
+    // Подпись в подвале календаря — полные даты (место есть) и промежуточное
+    // состояние «выбрано только начало», которого нет у общего rangeLabel.
+    const calRangeText = from
       ? (to ? `${formatDateRU(from)} — ${formatDateRU(to)}` : `${formatDateRU(from)} — …`)
       : 'Выберите начало и конец';
     host.innerHTML = `
@@ -1187,7 +1189,7 @@ function mountCalendar(host, initFrom, initTo, onApply) {
         <div class="cal-grid cal-wd">${_WD_RU.map(w => `<div class="cal-wd-cell">${w}</div>`).join('')}</div>
         <div class="cal-grid cal-days">${cells.join('')}</div>
         <div class="cal-foot">
-          <span class="cal-range">${rangeLabel}</span>
+          <span class="cal-range">${calRangeText}</span>
           <button type="button" class="btn-primary cal-apply" ${from && to ? '' : 'disabled'}>Применить</button>
         </div>
       </div>`;
@@ -1290,11 +1292,11 @@ function renderOrdersMain() {
     { id: '7d', label: '7 дней' },
     { id: '30d', label: '30 дней' },
   ];
-  // «Период…» показывает выбранный диапазон (как в Аналитике, WP-29) — раньше
-  // всегда статичный «Период…» без обратной связи.
+  // Подпись диапазона — общий rangeLabel (UI-BUG-02): формула была скопирована
+  // сюда и в шапку Аналитики.
   const orderCustomLabel = (currentOrderPeriod === 'custom' && currentOrderFrom && currentOrderTo)
-    ? `${formatDateRU(currentOrderFrom)}—${formatDateRU(currentOrderTo)}`
-    : 'Период…';
+    ? rangeLabel(currentOrderFrom, currentOrderTo)
+    : '';
   const periodRow = periodSegHtml(
     periods, currentOrderPeriod, 'data-operiod', currentOrderPeriod === 'custom', orderCustomLabel
   );
@@ -2246,8 +2248,8 @@ function analyticsHeaderHtml(isBoss) {
     { id: '3month', label: 'Квартал' }, { id: 'year', label: 'Год' },
   ];
   const customLabel = (analyticsPeriod === 'custom' && analyticsSince && analyticsUntil)
-    ? `${formatDateRU(analyticsSince)}—${formatDateRU(analyticsUntil)}`
-    : 'Период…';
+    ? rangeLabel(analyticsSince, analyticsUntil)
+    : '';
   const periodBar = periodSegHtml(
     presets, analyticsPeriod, 'data-period', analyticsPeriod === 'custom', customLabel
   );

@@ -1631,7 +1631,12 @@ body {
 /* Доп-ссылка справа от сегмента (напр. «Лимиты» — read-only надстройка для
    босса): намеренно НЕ pill, чтобы не путалась с разделами уровня 1. */
 .seg-aux {
-  flex-shrink: 0; padding: 11px 10px; border: 0; border-radius: var(--radius-chip);
+  /* UI-BUG-02: без потолка ширины подпись диапазона выталкивала кнопку за
+     вьюпорт — flex-shrink:0 запрещал ей ужиматься, а боковых отступов у ряда
+     нет. Половину ряда доп-кнопка занимать не должна: её роль вспомогательная. */
+  flex-shrink: 0; max-width: 42%; overflow: hidden; text-overflow: ellipsis;
+  min-height: 44px;
+  padding: 11px 10px; border: 0; border-radius: var(--radius-chip);
   background: transparent; color: var(--text-mute);
   font-size: 13px; font-weight: 600; font-family: inherit; cursor: pointer;
   display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
