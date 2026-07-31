@@ -341,10 +341,52 @@
     );
   }
 
+  // ─── Техника ──────────────────────────────────────────────────────────────
+  // Словарь подписей статусов НЕ дублируем на фронте: он приходит с сервера
+  // (`status_labels`), где живёт вместе с самим жизненным циклом машины. Иначе
+  // добавленный статус пришлось бы вписывать в двух языках и в одном забыть.
+  function machineStatusLabel(status, labels) {
+    const key = String(status || '');
+    return (labels && labels[key]) || key || '—';
+  }
+
+  // Подстрочник строки списка: «JCB7788 · 15 200 м/ч · 25 000 USD».
+  // Пустые части выпадают целиком — «—» вместо цены выглядит как «цена ноль»,
+  // хотя на самом деле её просто ещё не заводили.
+  function machineSubtitle(m) {
+    const parts = [];
+    if (m && m.vin) parts.push(String(m.vin));
+    if (m && m.hours != null && m.hours !== '') {
+      parts.push(`${Number(m.hours).toLocaleString('ru-RU')} м/ч`);
+    }
+    if (m && m.price_cents) {
+      parts.push(formatMoney(Number(m.price_cents) / 100, m.currency || 'USD'));
+    }
+    return escapeHtml(parts.join(' · '));
+  }
+
+  // Фильтр по статусу. Показываем только непустые статусы: пункт «Забронированы
+  // 0» ничего не отбирает, а место в ряду занимает. `seg--scroll` — потому что
+  // статусов шесть и на 360dp они не помещаются.
+  function machineStatusSegHtml(counts, active, labels) {
+    const c = counts || {};
+    const order = ['in_transit', 'in_stock', 'reserved', 'sold', 'on_credit', 'archived'];
+    const pill = (id, label, n) =>
+      `<button class="seg-item ${active === id ? 'active' : ''}" data-mstatus="${escapeHtml(id)}" ` +
+      `aria-pressed="${active === id}">${escapeHtml(label)} ${n}</button>`;
+    const pills = order
+      .filter((s) => Number(c[s] || 0) > 0)
+      .map((s) => pill(s, machineStatusLabel(s, labels), Number(c[s])))
+      .join('');
+    return `<div class="seg-row"><div class="seg seg--scroll">` +
+      `${pill('all', 'Все', Number(c.all || 0))}${pills}</div></div>`;
+  }
+
   return {
     escapeHtml, idemKey, formatDateRU, icon, opsAmount,
     renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml, financeTabs,
     balanceParts, periodSegHtml, rangeLabel, formatMoney, msBalanceLabel,
     emptyState, skeleton, errorBoxHtml,
+    machineStatusLabel, machineSubtitle, machineStatusSegHtml,
   };
 });

@@ -40,6 +40,23 @@ describe('статус-система (UI-WP-02)', () => {
     for (const s of ['overdue', 'due_today', 'upcoming', 'partial', 'in_stock', 'low', 'out']) {
       expect(declaredStatuses.has(s), `нет цвета для состояния: ${s}`).toBe(true);
     }
+    // Техника: статус машины тоже приходит с сервера выражением.
+    for (const s of ['in_transit', 'in_stock', 'reserved', 'sold', 'on_credit', 'archived']) {
+      expect(declaredStatuses.has(s), `нет цвета для статуса техники: ${s}`).toBe(true);
+    }
+  });
+
+  it('статусы техники объявлены в ОБЩЕЙ матрице, а не только у бейджа склада', () => {
+    // `.stock-badge[data-status="in_stock"]` красит только склад. Строка
+    // техники берёт цвет через --status-c, и без правила в общей матрице
+    // бейдж остался бы бесцветным — при этом проверка «статус объявлен»
+    // прошла бы, потому что селектор в файле есть.
+    const generic = new Set(
+      [...css.matchAll(/(^|\n)\s*\[data-status="([a-z_]+)"\]/g)].map((m) => m[2]),
+    );
+    for (const s of ['in_transit', 'in_stock', 'reserved', 'sold', 'on_credit', 'archived']) {
+      expect(generic.has(s), `статус техники вне общей матрицы: ${s}`).toBe(true);
+    }
   });
 
   it('статусы выводят цвет через переменные, а не хардкодом', () => {

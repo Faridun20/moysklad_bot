@@ -299,11 +299,18 @@ let ordersSubTab = 'orders';
 //
 // В Аналитике этого бага нет ровно потому, что там шапка входит в КАЖДЫЙ
 // innerHTML (analyticsHeaderHtml + wireAnalyticsHeader). Здесь тот же паттерн.
+// Техника — та же тройка ролей, что и у ручек /api/machines/*. Вкладку, которая
+// гарантированно ответит 403, не рисуем.
+function canSeeMachines() {
+  return !!currentUser && ['admin', 'boss', 'manager'].includes(currentUser.role);
+}
+
 function ordersShellHtml() {
   const tab = (id, label, ic) =>
     `<button class="seg-item ${ordersSubTab === id ? 'active' : ''}" data-sub="${id}" ` +
     `aria-pressed="${ordersSubTab === id}">${icon(ic)} ${label}</button>`;
-  return `<div class="seg-row"><div class="seg">${tab('orders', 'Заказы', 'list')}${tab('stock', 'Каталог', 'box')}</div></div>`;
+  const machines = canSeeMachines() ? tab('machines', 'Техника', 'truck') : '';
+  return `<div class="seg-row"><div class="seg seg--scroll">${tab('orders', 'Заказы', 'list')}${tab('stock', 'Каталог', 'box')}${machines}</div></div>`;
 }
 
 function wireOrdersShell(root) {
@@ -319,8 +326,11 @@ function wireOrdersShell(root) {
 async function renderOrdersScreen() {
   // Только диспатч: шелл рисует каждая ветка сама, иначе он теряется при
   // первом же ре-рендере внутри вкладки.
+  if (ordersSubTab === 'machines' && !canSeeMachines()) ordersSubTab = 'orders';
   if (ordersSubTab === 'orders') {
     await renderOrders();
+  } else if (ordersSubTab === 'machines') {
+    await renderMachines();
   } else {
     await renderStock();
   }
@@ -872,6 +882,150 @@ function renderStockContent() {
       renderStockList();
     });
   });
+}
+
+// ─── Экран: Техника ─────────────────────────────────
+// Раздел переехал из бота: карточка машины — это десяток полей, история
+// моточасов, сделка с покупателем и фотографии, то есть работа для экрана.
+// В боте остались быстрый просмотр и ввод моточасов с площадки.
+//
+// Данные не кэшируем: парк 10–25 машин, а устаревший статус на экране опаснее
+// лишнего запроса — по нему принимают решение о продаже.
+let machinesFilter = 'all';
+let machinesData = null;
+
+async function renderMachines() {
+  const content = document.getElementById('content');
+  // Шелл — в КАЖДЫЙ innerHTML, включая скелетон и ветку ошибки (UI-BUG-04):
+  // иначе первый же ре-рендер уносит вкладки вместе с обработчиками.
+  content.innerHTML = ordersShellHtml() + skeleton('label') + skeleton('list', 4);
+  wireOrdersShell(content);
+  setScreenContext('Заказы · Техника');
+
+  let data;
+  try {
+    data = await api('/api/machines/list', {
+      status: machinesFilter === 'all' ? '' : machinesFilter,
+    });
+  } catch (e) {
+    content.innerHTML = ordersShellHtml() + errorBox(e.message);
+    wireOrdersShell(content);
+    return;
+  }
+  machinesData = data;
+  const labels = data.status_labels || {};
+  const rows = (data.machines || []).map(m => `
+    <div class="c-row c-row--tap" data-machine="${m.id}" data-status="${escapeHtml(m.status || '')}"
+         role="button" tabindex="0">
+      <div class="card-row-info">
+        <div class="card-row-title">${escapeHtml(m.name || '—')}</div>
+        <div class="card-row-sub">${machineSubtitle(m)}</div>
+      </div>
+      <span class="c-badge">${escapeHtml(machineStatusLabel(m.status, labels))}</span>
+    </div>`).join('');
+
+  content.innerHTML = ordersShellHtml()
+    + machineStatusSegHtml(data.counts, machinesFilter, labels)
+    + (rows
+      ? `<div class="c-surface c-surface--list">${rows}</div>`
+      : emptyState({
+          icon: 'box',
+          title: 'Техники нет',
+          hint: machinesFilter === 'all'
+            ? 'Здесь появятся экскаваторы: в пути, на складе и проданные.'
+            : 'В этом статусе машин нет — выберите другой фильтр.',
+        }));
+  wireOrdersShell(content);
+
+  content.querySelectorAll('[data-mstatus]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('light');
+      machinesFilter = btn.dataset.mstatus;
+      renderMachines();
+    });
+  });
+  content.querySelectorAll('[data-machine]').forEach(row => {
+    row.addEventListener('click', () => {
+      haptic('light');
+      renderMachineCard(Number(row.dataset.machine));
+    });
+  });
+}
+
+function machineFactsHtml(m, card) {
+  const labels = card.status_labels || {};
+  const facts = [
+    ['Статус', machineStatusLabel(m.status, labels)],
+    ['VIN', m.vin || '—'],
+    ['Марка и модель', [m.brand, m.model, m.year].filter(Boolean).join(' · ') || '—'],
+    ['Моточасы', m.hours != null ? `${Number(m.hours).toLocaleString('ru-RU')} м/ч` : '—'],
+    ['Цена', m.price_cents ? formatMoney(m.price_cents / 100, m.currency || 'USD') : '—'],
+  ];
+  // Себестоимости нет в ответе для менеджера — не «пусто», а поля не существует.
+  if ('cost_cents' in m) {
+    facts.push(['Себестоимость', m.cost_cents ? formatMoney(m.cost_cents / 100, m.currency || 'USD') : '—']);
+  }
+  for (const [label, key] of [['Локация', 'location'], ['Контейнер', 'container_no'], ['Прибытие', 'eta_date']]) {
+    if (m[key]) facts.push([label, m[key]]);
+  }
+  if (m.notes) facts.push(['Заметки', m.notes]);
+  return `<div class="c-surface c-surface--list">${facts.map(([k, v]) => `
+    <div class="c-row">
+      <div class="card-row-info"><div class="card-row-sub">${escapeHtml(k)}</div></div>
+      <div class="card-row-value">${escapeHtml(String(v))}</div>
+    </div>`).join('')}</div>`;
+}
+
+function machineHoursHtml(hours) {
+  if (!hours || !hours.length) return '';
+  return `<div class="section-label">Моточасы</div>
+    <div class="c-surface c-surface--list">${hours.map(h => `
+      <div class="c-row">
+        <div class="card-row-info">
+          <div class="card-row-title">${Number(h.hours).toLocaleString('ru-RU')} м/ч</div>
+          <div class="card-row-sub">${escapeHtml(String(h.recorded_at || '').slice(0, 16))}</div>
+        </div>
+      </div>`).join('')}</div>`;
+}
+
+function machineDealsHtml(deals) {
+  if (!deals || !deals.length) return '';
+  return `<div class="section-label">Сделки</div>
+    <div class="c-surface c-surface--list">${deals.map(d => {
+      const kind = d.kind === 'credit' ? 'Рассрочка' : 'Продажа';
+      const state = d.closed_at ? 'Закрыта' : (d.kind === 'credit' ? `до ${d.due_date || '—'}` : '');
+      const meta = [d.buyer_name, d.buyer_phone, state].filter(Boolean).join(' · ');
+      return `
+      <div class="c-row" data-status="${d.closed_at || d.kind === 'sale' ? 'approved' : 'pending'}">
+        <div class="card-row-info">
+          <div class="card-row-title">${kind} · ${escapeHtml(String(d.sold_at || '').slice(0, 10))}</div>
+          <div class="card-row-sub">${escapeHtml(meta)}</div>
+        </div>
+        <div class="card-row-value">${formatMoney(Number(d.price_cents || 0) / 100, d.currency || 'USD')}</div>
+      </div>`;
+    }).join('')}</div>`;
+}
+
+async function renderMachineCard(machineId) {
+  const content = document.getElementById('content');
+  content.innerHTML = skeleton('label') + skeleton('list', 5);
+  setScreenContext('Техника · карточка');
+  showBack(() => { ordersSubTab = 'machines'; showScreen('orders'); });
+
+  let card;
+  try {
+    card = await api('/api/machines/card', { machine_id: machineId });
+  } catch (e) {
+    content.innerHTML = errorBox(e.message);
+    return;
+  }
+  const m = card.machine || {};
+  content.innerHTML = `
+    <div class="section-label">${escapeHtml(m.name || 'Машина')}</div>
+    ${machineFactsHtml(m, card)}
+    ${machineHoursHtml(card.hours)}
+    ${machineDealsHtml(card.deals)}
+  `;
 }
 
 // escapeHtml — в helpers.js (глобал, подключается ПЕРЕД app.js). Юнит-тестируется.

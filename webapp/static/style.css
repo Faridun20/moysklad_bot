@@ -1091,6 +1091,17 @@ body {
 [data-status="upcoming"]  { --status-c: var(--info);         --status-bg: var(--info-bg); }
 [data-status="partial"]   { --status-c: var(--warn-strong);  --status-bg: var(--warn-bg); }
 
+/* Техника. Цвет отвечает на один вопрос — «нужно ли что-то делать»:
+   в пути — процесс идёт (info), на складе — можно продавать (success),
+   бронь и рассрочка ждут денег и решения (warn), продана и архив — закрыто
+   (neutral). Поэтому пары повторяют цвет: различает их подпись, а не оттенок. */
+[data-status="in_transit"] { --status-c: var(--info);        --status-bg: var(--info-bg); }
+[data-status="in_stock"]   { --status-c: var(--success);     --status-bg: var(--success-bg); }
+[data-status="reserved"]   { --status-c: var(--warn-strong); --status-bg: var(--warn-bg); }
+[data-status="on_credit"]  { --status-c: var(--warn-strong); --status-bg: var(--warn-bg); }
+[data-status="sold"]       { --status-c: var(--neutral);     --status-bg: var(--neutral-bg); }
+[data-status="archived"]   { --status-c: var(--neutral);     --status-bg: var(--neutral-bg); }
+
 /* Карточка со статусом: цветная полоса слева. */
 .order-card[data-status],
 .debt-card[data-status] { border-left-color: var(--status-c); }

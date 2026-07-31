@@ -103,6 +103,83 @@ describe('под-вкладки Заказы/Каталог переживают
   });
 });
 
+describe('под-вкладка «Техника»', () => {
+  const LIST = {
+    ok: true,
+    machines: [{ id: 7, name: 'JCB 3CX', vin: 'JCB7788', status: 'in_stock', hours: 15200,
+                 price_cents: 2500000, currency: 'USD' }],
+    counts: { all: 1, in_stock: 1 },
+    can_manage: true,
+    status_labels: { in_stock: '🏗 На складе' },
+  };
+  const driver = (role = 'boss') => `
+    currentUser = { role: '${role}' };
+    window.__calls = [];
+    api = async (path, body) => { window.__calls.push([path, body]); return ${JSON.stringify(LIST)}; };
+    ordersSubTab = 'machines';
+    window.__ready = renderOrdersScreen();
+  `;
+
+  it('вкладка есть у менеджера и выше', () => {
+    const window = boot("currentUser = { role: 'manager' };");
+    expect(window.ordersShellHtml()).toContain('data-sub="machines"');
+  });
+
+  it('роли без доступа к ручке вкладку не видят', () => {
+    // Ручки /api/machines/* отвечают 403 бухгалтеру и кладовщику — вкладка,
+    // которая гарантированно упадёт, только сбивает с толку.
+    const window = boot("currentUser = { role: 'bookkeeper' };");
+    expect(window.ordersShellHtml()).not.toContain('data-sub="machines"');
+  });
+
+  it('и не могут в неё попасть в обход переключателя', async () => {
+    const window = boot(`
+      currentUser = { role: 'bookkeeper' };
+      window.__calls = [];
+      api = async (p) => { window.__calls.push(p); return { ok: true, orders: [], role: 'bookkeeper' }; };
+      ordersSubTab = 'machines';
+      window.__ready = renderOrdersScreen();
+    `);
+    await window.__ready;
+    expect(window.__calls.some(p => String(p).includes('/api/machines/'))).toBe(false);
+  });
+
+  it('список рисуется, а вкладки остаются на месте (UI-BUG-04)', async () => {
+    const window = boot(driver());
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('[data-sub="machines"]')).not.toBeNull();
+    expect(content.querySelector('[data-sub="orders"]')).not.toBeNull();
+    expect(content.textContent).toContain('JCB 3CX');
+    expect(content.querySelector('[data-machine="7"]').dataset.status).toBe('in_stock');
+  });
+
+  it('вкладки остаются и когда экран показывает ошибку сети', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => { throw new Error('Нет подключения к интернету'); };
+      ordersSubTab = 'machines';
+      window.__ready = renderOrdersScreen();
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('[data-sub="machines"]')).not.toBeNull();
+    expect(content.textContent).toContain('Нет подключения');
+  });
+
+  it('фильтр по статусу уходит на сервер, а не режет список на клиенте', async () => {
+    const window = boot(driver());
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    content.querySelector('[data-mstatus="in_stock"]').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    const last = window.__calls[window.__calls.length - 1];
+    expect(last[0]).toBe('/api/machines/list');
+    expect(last[1].status).toBe('in_stock');
+  });
+});
+
 describe('курсы валют: «Сохранить» действительно отправляет курс', () => {
   // Регресс: обработчик поднимался от кнопки к `.debt-card`, которого после
   // пересборки экрана на дизайн-систему в разметке курсов нет. closest отдавал

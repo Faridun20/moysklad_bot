@@ -10,6 +10,7 @@ const {
   escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml,
   parsePaymentItems, renderMoneyTotalsHtml, financeTabs, balanceParts, periodSegHtml, rangeLabel,
   formatMoney, msBalanceLabel, emptyState, skeleton, errorBoxHtml,
+  machineStatusLabel, machineSubtitle, machineStatusSegHtml,
 } = helpers;
 
 describe('periodSegHtml (WP-29)', () => {
@@ -465,5 +466,78 @@ describe('доп-кнопка периода (UI-BUG-02)', () => {
   it('в режиме custom показывает выбранный диапазон', () => {
     const html = periodSegHtml(presets, 'custom', 'data-period', true, '01.07—31.07');
     expect(html).toContain('01.07—31.07');
+  });
+});
+
+describe('техника: подписи и подстрочник', () => {
+  // Словарь приходит с сервера — там он живёт вместе с жизненным циклом машины.
+  const LABELS = {
+    in_transit: '🚢 В пути',
+    in_stock: '🏗 На складе',
+    reserved: '🔒 Забронирована',
+    sold: '✅ Продана',
+    on_credit: '💳 В рассрочку',
+    archived: '📦 Архив',
+  };
+
+  it.each(Object.keys(LABELS))('статус %s получает подпись из словаря', (s) => {
+    expect(machineStatusLabel(s, LABELS)).toBe(LABELS[s]);
+  });
+
+  it('незнакомый статус показывает себя, а не пустоту', () => {
+    // Новый статус на сервере не должен оставить в списке пустой бейдж —
+    // код в интерфейсе хотя бы объясняет, что происходит.
+    expect(machineStatusLabel('in_repair', LABELS)).toBe('in_repair');
+    expect(machineStatusLabel('', LABELS)).toBe('—');
+    expect(machineStatusLabel('in_stock', undefined)).toBe('in_stock');
+  });
+
+  it('подстрочник собирает VIN, моточасы и цену', () => {
+    const s = machineSubtitle({ vin: 'JCB7788', hours: 15200, price_cents: 2500000, currency: 'USD' });
+    expect(s).toContain('JCB7788');
+    expect(s).toContain('м/ч');
+    expect(s).toContain('USD');
+  });
+
+  it('пустые части выпадают целиком, а не превращаются в «—»', () => {
+    // «—» на месте цены читается как «цена ноль», хотя её просто не заводили.
+    expect(machineSubtitle({ vin: 'A1' })).toBe('A1');
+    expect(machineSubtitle({})).toBe('');
+    expect(machineSubtitle({ vin: 'A1', hours: 0 })).toContain('0 м/ч');
+  });
+
+  it('VIN экранируется — он приходит из накладной, а не из справочника', () => {
+    expect(machineSubtitle({ vin: '<img src=x>' })).not.toContain('<img');
+  });
+});
+
+describe('техника: фильтр по статусу', () => {
+  const counts = { all: 3, in_transit: 1, in_stock: 2, reserved: 0, sold: 0, on_credit: 0, archived: 4 };
+
+  it('пустые статусы в ряд не попадают', () => {
+    // «Забронированы 0» ничего не отбирает, а место в ряду занимает.
+    const html = machineStatusSegHtml(counts, 'all', {});
+    expect(html).toContain('data-mstatus="in_transit"');
+    expect(html).not.toContain('data-mstatus="reserved"');
+  });
+
+  it('«Все» показывает размер списка без фильтра — архив в него не входит', () => {
+    const html = machineStatusSegHtml(counts, 'all', {});
+    expect(html).toContain('Все 3');
+    expect(html).toContain('data-mstatus="archived"');
+  });
+
+  it('активный фильтр отмечен и классом, и aria-pressed', () => {
+    const html = machineStatusSegHtml(counts, 'in_stock', {});
+    expect(html).toContain('class="seg-item active" data-mstatus="in_stock"');
+    expect(html).toMatch(/data-mstatus="in_stock" aria-pressed="true"/);
+  });
+
+  it('трек скроллится: статусов шесть и на 360dp они не помещаются', () => {
+    expect(machineStatusSegHtml(counts, 'all', {})).toContain('seg seg--scroll');
+  });
+
+  it('без данных не падает', () => {
+    expect(machineStatusSegHtml(null, 'all')).toContain('Все 0');
   });
 });
