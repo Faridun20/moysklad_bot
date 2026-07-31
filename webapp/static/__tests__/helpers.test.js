@@ -9,6 +9,7 @@ import helpers from '../helpers.js';
 const {
   escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml,
   parsePaymentItems, renderMoneyTotalsHtml, financeTabs, balanceParts, periodSegHtml,
+  formatMoney, msBalanceLabel,
 } = helpers;
 
 describe('periodSegHtml (WP-29)', () => {
@@ -289,5 +290,58 @@ describe('financeTabs', () => {
       expect(k).not.toContain('overview');
       expect(k).not.toContain('my');
     }
+  });
+});
+
+describe('formatMoney (UI-WP-05)', () => {
+  // toLocaleString разделяет разряды НЕразрывным пробелом (U+00A0/U+202F).
+  // Нам важна группировка, а не кодпойнт пробела, — нормализуем.
+  const norm = (s) => String(s).replace(/[  ]/g, ' ');
+
+  it('форматирует тысячи по-русски и клеит валюту через пробел', () => {
+    expect(norm(formatMoney(1234567, 'USD'))).toBe('1 234 567 USD');
+  });
+
+  it('округляет: копейки в списках только шумят', () => {
+    expect(norm(formatMoney(1234.56))).toBe('1 235');
+  });
+
+  it('без валюты отдаёт только число — вызывающий клеит сам', () => {
+    expect(formatMoney(500)).toBe('500');
+  });
+
+  it('не печатает NaN/Infinity в интерфейс', () => {
+    expect(formatMoney(NaN, 'USD')).toBe('—');
+    expect(formatMoney(Infinity)).toBe('—');
+    expect(formatMoney(undefined)).toBe('—');
+  });
+
+  it('ноль — это сумма, а не пустое место', () => {
+    expect(formatMoney(0, 'UZS')).toBe('0 UZS');
+  });
+});
+
+describe('msBalanceLabel (UI-WP-05)', () => {
+  it('отрицательный баланс МС = клиент должен нам', () => {
+    const b = msBalanceLabel(-125000, 'USD');
+    expect(b.tone).toBe('owe');
+    expect(b.text).toContain('должен');
+    expect(b.text).toContain('USD');
+  });
+
+  it('положительный баланс = аванс', () => {
+    expect(msBalanceLabel(50000, 'USD').tone).toBe('advance');
+  });
+
+  it('ноль отличается от «нет данных»', () => {
+    expect(msBalanceLabel(0, 'USD').tone).toBe('zero');
+    expect(msBalanceLabel(null, 'USD').tone).toBe('none');
+    expect(msBalanceLabel(null, 'USD').text).toBe('—');
+  });
+
+  it('подпись одна и та же для обоих экранов — расхождения формулировок больше нет', () => {
+    const fromClients = msBalanceLabel(-1000, 'USD');
+    const fromDetail = msBalanceLabel(-1000, 'USD');
+    expect(fromClients.text).toBe(fromDetail.text);
   });
 });

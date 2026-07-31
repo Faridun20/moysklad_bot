@@ -207,6 +207,31 @@
     return { state: 'zero', amount: '0', currency: cur };
   }
 
+  // Единый формат суммы (UI-WP-05). `Math.round(n).toLocaleString('ru-RU')`
+  // был скопирован в четырнадцать локальных `fmt` по app.js — и уже разъезжался:
+  // где-то округляли, где-то нет, где-то валюту клеили без пробела. Копейки в
+  // UI не показываем осознанно: суммы сделок — тысячи, дробная часть только
+  // шумит; точные значения живут в БД.
+  function formatMoney(n, currency) {
+    const num = Number(n);
+    if (!isFinite(num)) return '—';
+    const text = Math.round(num).toLocaleString('ru-RU');
+    return currency ? `${text} ${currency}` : text;
+  }
+
+  // Готовая подпись МС-баланса (UI-WP-05). balanceParts даёт знак и сумму, но
+  // САМА ПОДПИСЬ дублировалась в renderClients (balStr) и renderAgentDetail
+  // (balLine) двумя разными тернарниками — и формулировки уже разошлись
+  // («должен» против «должен нам»). tone отдаём отдельно, чтобы экран сам решал
+  // про класс/вёрстку и не парсил текст.
+  function msBalanceLabel(cents, baseCurrency) {
+    const p = balanceParts(cents, baseCurrency);
+    if (p.state === 'none') return { text: '—', tone: 'none' };
+    if (p.state === 'owe') return { text: `должен ${p.amount} ${p.currency}`, tone: 'owe' };
+    if (p.state === 'adv') return { text: `аванс ${p.amount} ${p.currency}`, tone: 'advance' };
+    return { text: `0 ${p.currency}`, tone: 'zero' };
+  }
+
   // Единый период-сегмент (WP-29): пресеты .seg-item + доп-кнопка «Период…»
   // (произвольный диапазон). Раньше разметка дублировалась в analyticsHeaderHtml
   // (data-period) и renderOrdersMain (data-operiod) и уже разъехалась — в Заказах
@@ -228,6 +253,6 @@
   return {
     escapeHtml, idemKey, formatDateRU, icon, opsAmount,
     renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml, financeTabs,
-    balanceParts, periodSegHtml,
+    balanceParts, periodSegHtml, formatMoney, msBalanceLabel,
   };
 });

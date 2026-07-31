@@ -355,7 +355,7 @@ async function renderHome() {
   }
 
   const cur = data.currency || 'USD';
-  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   const fmtCur = n => `${fmt(n)} ${cur}`;
   const isBoss = data.role === 'admin' || data.role === 'boss';
   const mo = data.my_orders;
@@ -1340,7 +1340,7 @@ function renderOrdersMain() {
         <div class="order-meta">
           <span>${icon('box')} ${o.items_count} тов.</span>
           <span>${(o.created_at || '').slice(11, 16)}</span>
-          ${o.total > 0 ? `<span class="order-total">${icon('cash')} ${Math.round(o.total).toLocaleString('ru-RU')} ${escapeHtml(o.currency || '')}</span>` : ''}
+          ${o.total > 0 ? `<span class="order-total">${icon('cash')} ${formatMoney(o.total, escapeHtml(o.currency || ''))}</span>` : ''}
         </div>
         ${(() => {
           // UX: тип оплаты / срок / статус оплаты / заморозка / причина возврата —
@@ -1363,7 +1363,7 @@ function renderOrdersMain() {
           const sub = (it.quantity || 0) * (it.price || 0);
           const cur = o.currency ? ' ' + escapeHtml(o.currency) : '';
           const priceStr = (it.price && it.price > 0)
-            ? ` × ${it.price.toLocaleString('ru-RU')} = <b>${Math.round(sub).toLocaleString('ru-RU')}${cur}</b>`
+            ? ` × ${formatMoney(it.price)} = <b>${formatMoney(sub)}${cur}</b>`
             : '';
           return `<div class="order-item-preview">• ${escapeHtml(it.name)} — ${it.quantity} ${it.unit}${priceStr}</div>`;
         }).join('')}
@@ -1576,7 +1576,7 @@ function renderOrderEditor() {
     : order.items.map((it, i) => {
         const sub = (it.quantity || 0) * (it.price || 0);
         const subStr = it.price > 0
-          ? ` · ${it.price.toLocaleString('ru-RU')} = <b>${Math.round(sub).toLocaleString('ru-RU')}</b>`
+          ? ` · ${formatMoney(it.price)} = <b>${formatMoney(sub)}</b>`
           : '';
         return `
           <div class="editor-item">
@@ -1592,7 +1592,7 @@ function renderOrderEditor() {
           <div class="editor-item-info">
             <div class="editor-item-name">${icon('cash')} Итого</div>
           </div>
-          <div>${Math.round(grandTotal).toLocaleString('ru-RU')}</div>
+          <div>${formatMoney(grandTotal)}</div>
         </div>
       ` : '');
 
@@ -1942,6 +1942,9 @@ function openQuantityInput(name, unit, maxStock, href) {
     const q = parseNum(qtyEl.value) || 0;
     const p = parseNum(priceEl.value) || 0;
     const t = q * p;
+    // Осознанное исключение из formatMoney (UI-WP-05): это ЖИВОЙ пересчёт под
+    // вводом «количество × цена». Округление до рублей скрыло бы то, что
+    // пользователь только что набрал (2,5 × 1,20), — здесь нужны копейки.
     totalEl.innerHTML = `Итого: <b>${t.toLocaleString('ru-RU', {maximumFractionDigits: 2})} ${selectedCurrency}</b>`;
   }
   qtyEl.addEventListener('input', updateTotal);
@@ -2074,7 +2077,7 @@ async function renderPendingRequests() {
   const content = document.getElementById('content');
   // fmt был локальным в других рендерах, но не здесь → кредит-блок заявки
   // (fmt(...)) кидал ReferenceError, и весь экран заявок падал в errorBox.
-  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   content.innerHTML = loading('Загружаю заявки…');
   try {
     const data = await api('/api/orders/requests', {});
@@ -2111,7 +2114,7 @@ async function renderPendingRequests() {
           } else {
             bits.push(`<span class="order-pay">${icon('cash')} Оплата сразу</span>`);
           }
-          if (r.total > 0) bits.push(`<span class="order-pay">${icon('cash')} ${Math.round(r.total).toLocaleString('ru-RU')} ${escapeHtml(r.currency || '')}</span>`);
+          if (r.total > 0) bits.push(`<span class="order-pay">${icon('cash')} ${formatMoney(r.total, escapeHtml(r.currency || ''))}</span>`);
           return `<div class="order-pay-row">${bits.join('')}</div>`;
         })()}
         ${r.credit ? `
@@ -2314,7 +2317,7 @@ async function renderAnalytics() {
 
 function renderAnalyticsContent(data) {
   const content = document.getElementById('content');
-  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
 
   const trendIcon = data.trend > 0 ? icon('trend-up') : data.trend < 0 ? icon('trend-down') : '';
@@ -2519,7 +2522,7 @@ function cashHistoryHtml(history) {
     deposit: { ic: 'cashbox', label: 'Сдача' },
     return: { ic: 'return', label: 'Возврат' },
   };
-  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   const histStatus = s => s === 'confirmed'
     ? '<span class="stock-badge badge-green">принят</span>'
     : s === 'rejected' ? '<span class="stock-badge badge-red">отклонён</span>'
@@ -2670,7 +2673,7 @@ async function renderCashbox(container, section) {
   if (section === 'overview') section = 'confirm'; // «Обзор» переехал в Аналитику
   cashboxSubTab = section;
   container.innerHTML = loading('Загрузка кассы…');
-  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   const role = currentUser && currentUser.role;
   // Наличные сдаёт тот, кто их физически принимает от клиента (менеджер,
   // кладовщик). Начальство/бухгалтер только ПОДТВЕРЖДАЮТ.
@@ -3122,7 +3125,7 @@ async function renderClients(container) {
     container.innerHTML = errorBox(e.message);
     return;
   }
-  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   const fmtCents = c => opsAmount((Number(c) || 0) / 100);
   if (!clients.length) {
     container.innerHTML = `<div class="empty-state">
@@ -3143,13 +3146,14 @@ async function renderClients(container) {
     if (y == null) return -1;
     return x - y;
   });
+  // UI-WP-05: подпись строит общий хелпер (знак — по конвенции WP-27), экран
+  // отвечает только за класс.
   const balStr = (bal) => {
-    const p = balanceParts(bal, baseC);  // единая конвенция знака (WP-27)
-    const cur = escapeHtml(p.currency);
-    if (p.state === 'none') return '<span class="money-placeholder">баланс —</span>';
-    if (p.state === 'owe') return `<span class="bal-owe">должен ${p.amount} ${cur}</span>`;
-    if (p.state === 'adv') return `<span class="bal-adv">аванс ${p.amount} ${cur}</span>`;
-    return `0 ${cur}`;
+    const b = msBalanceLabel(bal, baseC);
+    if (b.tone === 'none') return '<span class="money-placeholder">баланс —</span>';
+    if (b.tone === 'owe') return `<span class="bal-owe">${escapeHtml(b.text)}</span>`;
+    if (b.tone === 'advance') return `<span class="bal-adv">${escapeHtml(b.text)}</span>`;
+    return escapeHtml(b.text);
   };
   // Долг по заказам — РАЗДЕЛЬНО по валютам (не складываем). Лимит — в базовой.
   const debtStr = (c) => {
@@ -3283,16 +3287,15 @@ async function renderAgentDetail(agentId) {
     content.innerHTML = errorBox(e.message);
     return;
   }
-  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   const fmtCents = c => opsAmount((Number(c) || 0) / 100);
   const baseC = d.base_currency || baseCur();
-  // МС-баланс (взаиморасчёты) — единая конвенция знака через balanceParts (WP-27).
-  const bp = balanceParts(d.balance_cents, baseC);
-  const bpCur = escapeHtml(bp.currency);
-  const balLine = bp.state === 'none' ? 'Баланс МойСклад: —'
-    : bp.state === 'owe' ? `Баланс МойСклад: должен нам <b>${bp.amount} ${bpCur}</b>`
-    : bp.state === 'adv' ? `Баланс МойСклад: аванс <b>${bp.amount} ${bpCur}</b>`
-    : `Баланс МойСклад: <b>0 ${bpCur}</b>`;
+  // МС-баланс: подпись — общая (UI-WP-05), формулировка больше не расходится
+  // с экраном клиентов.
+  const bal = msBalanceLabel(d.balance_cents, baseC);
+  const balLine = bal.tone === 'none'
+    ? 'Баланс МойСклад: —'
+    : `Баланс МойСклад: <b>${escapeHtml(bal.text)}</b>`;
 
   // Покупки из МС.
   const pur = d.purchases || {};
@@ -3398,7 +3401,7 @@ async function renderDebts(container) {
       else { upcomingCount++; bucket = upcomingByCur; }
       bucket[cur] = (bucket[cur] || 0) + amt;
     }
-    const fmt = n => Math.round(n).toLocaleString('ru-RU');
+    const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
     // Суммы корзины по валютам: «380 USD», на каждой строке своя валюта.
     const sumByCur = byCur => {
       const keys = Object.keys(byCur).sort((a, b) => byCur[b] - byCur[a]);
