@@ -3303,8 +3303,11 @@ async function renderCurrencyRates() {
   content.querySelectorAll('.rate-save').forEach(btn => {
     btn.addEventListener('click', async (ev) => {
       const b = ev.currentTarget;
-      const card = b.closest('.debt-card');
-      const raw = card.querySelector('.rate-input').value;
+      // Поле и кнопка лежат в одной строке-примитиве. Раньше здесь искался
+      // `.debt-card`, но после пересборки на дизайн-систему такого класса в
+      // разметке курсов нет — closest отдавал null и «Сохранить» падала.
+      const row = b.closest('.c-row');
+      const raw = row.querySelector('.rate-input').value;
       const rate = parseFloat(raw);
       if (!isFinite(rate) || rate <= 0) {
         tg.showAlert('❌ Курс должен быть положительным числом');

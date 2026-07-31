@@ -66,21 +66,20 @@ describe('загрузка фронта (helpers.js + app.js)', () => {
   });
 });
 
+// Драйвер выполняем В ТОМ ЖЕ eval, что и app.js: состояние и функции объявлены
+// на верхнем уровне скрипта, и подменить `api` снаружи нельзя.
+function boot(driver = '') {
+  const window = makeWindow();
+  window.eval(read('helpers.js'));
+  window.eval(`${read('app.js')}\n${driver}`);
+  return window;
+}
+
 describe('под-вкладки Заказы/Каталог переживают ре-рендер (UI-BUG-04)', () => {
   // Регресс: шелл вставлялся поверх готового DOM через insertAdjacentHTML, и
   // любой полный ре-рендер внутри вкладки (смена статуса, выбор периода,
   // ошибка сети) переписывал innerHTML и уносил его вместе с обработчиками —
   // пользователь не мог уйти в Каталог, не выходя из раздела.
-  // Драйвер выполняем В ТОМ ЖЕ eval, что и app.js: его состояние объявлено
-  // через `let` на верхнем уровне скрипта, а такие привязки в область
-  // следующего eval не попадают — снаружи их не выставить.
-  const boot = (driver = '') => {
-    const window = makeWindow();
-    window.eval(read('helpers.js'));
-    window.eval(`${read('app.js')}\n${driver}`);
-    return window;
-  };
-
   it('шелл входит в шаблон, а не накладывается сверху', () => {
     const window = boot();
     const html = window.ordersShellHtml();
@@ -101,5 +100,61 @@ describe('под-вкладки Заказы/Каталог переживают
     content.innerHTML = window.ordersShellHtml() + window.errorBox('Нет подключения к интернету');
     expect(content.querySelector('[data-sub="orders"]')).not.toBeNull();
     expect(content.textContent).toContain('Нет подключения');
+  });
+});
+
+describe('курсы валют: «Сохранить» действительно отправляет курс', () => {
+  // Регресс: обработчик поднимался от кнопки к `.debt-card`, которого после
+  // пересборки экрана на дизайн-систему в разметке курсов нет. closest отдавал
+  // null, чтение `.value` бросало TypeError ДО try/catch — кнопка молча не
+  // работала. Проверяем следствие (ушёл ли запрос), а не текст селектора.
+  const RATES = {
+    base: 'USD',
+    rates: [
+      { currency_code: 'USD', rate_to_base: 1, updated_at: '2026-07-01 10:00' },
+      { currency_code: 'UZS', rate_to_base: 0.00008, updated_at: '2026-07-01 10:00' },
+    ],
+  };
+  const driver = `
+    currentUser = { role: 'boss', base_currency: 'USD' };
+    window.__calls = [];
+    api = async (path, body) => {
+      window.__calls.push([path, body]);
+      return path === '/api/currency/rates' ? ${JSON.stringify(RATES)} : { ok: true };
+    };
+    window.__ready = renderCurrencyRates();
+  `;
+
+  it('редактор курса отрисован для руководителя', async () => {
+    const window = boot(driver);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    // Базовую валюту не редактируют — редактор ровно один, у UZS.
+    expect(content.querySelectorAll('.rate-save').length).toBe(1);
+    expect(content.querySelector('.rate-save').dataset.code).toBe('UZS');
+  });
+
+  it('клик по «Сохранить» отправляет новое значение из поля рядом', async () => {
+    const window = boot(driver);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    content.querySelector('.rate-input').value = '0.00009';
+    content.querySelector('.rate-save').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    const set = window.__calls.filter(([p]) => p === '/api/currency/rates/set');
+    expect(set).toHaveLength(1);
+    expect(set[0][1]).toEqual({ currency_code: 'UZS', rate_to_base: 0.00009 });
+  });
+
+  it('нечисловой курс отсекается до запроса', async () => {
+    const window = boot(driver);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    content.querySelector('.rate-input').value = '-1';
+    content.querySelector('.rate-save').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__calls.filter(([p]) => p.endsWith('/set'))).toHaveLength(0);
   });
 });
