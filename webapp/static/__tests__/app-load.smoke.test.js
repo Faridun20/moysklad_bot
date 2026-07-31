@@ -313,6 +313,89 @@ describe('техника: формы', () => {
   });
 });
 
+describe('карточка клиента: состав отгрузки', () => {
+  const DEMAND = 'a1b2c3d4-1111-2222-3333-444455556666';
+  const DETAIL = {
+    ok: true, agent_id: 'AG-1', name: 'Acme', phone: '', balance_cents: 0,
+    debt: 0, limit: 0, free: 0, orders: [], money_history: [], base_currency: 'USD',
+    purchases: {
+      count: 1, total_cents: 232000, top_products: [],
+      recent: [{ id: DEMAND, date: '2026-04-24 09:03', sum_cents: 232000 }],
+    },
+  };
+  const POSITIONS = {
+    ok: true, currency: 'USD',
+    positions: [{ name: 'Кабель PV 0.6', quantity: 29, unit: 'шт', price_cents: 8000, sum_cents: 232000 }],
+    sum_cents: 232000,
+  };
+  const bootAgent = () => boot(`
+    currentUser = { role: 'boss' };
+    window.__calls = [];
+    api = async (path, body) => {
+      window.__calls.push([path, body]);
+      return path === '/api/clients/detail' ? ${JSON.stringify(DETAIL)} : ${JSON.stringify(POSITIONS)};
+    };
+    window.__ready = renderAgentDetail('AG-1');
+  `);
+
+  it('отгрузка не тянет состав, пока её не открыли', async () => {
+    // Десять отгрузок — это десять запросов в МойСклад ради строк, которые
+    // чаще всего никто не раскроет, а бюджет запросов к МС общий на всех.
+    const window = bootAgent();
+    await window.__ready;
+    expect(window.__calls.map(c => c[0])).toEqual(['/api/clients/detail']);
+    expect(window.document.querySelector(`[data-shipment="${DEMAND}"]`)).not.toBeNull();
+  });
+
+  it('тап раскрывает позиции', async () => {
+    const window = bootAgent();
+    await window.__ready;
+    window.document.querySelector(`[data-shipment="${DEMAND}"]`).click();
+    await new Promise(r => setTimeout(r, 0));
+
+    const box = window.document.getElementById(`shipment-${DEMAND}`);
+    expect(box.hidden).toBe(false);
+    expect(box.textContent).toContain('Кабель PV 0.6');
+    expect(window.__calls[1]).toEqual(['/api/clients/shipment', { demand_id: DEMAND }]);
+  });
+
+  it('повторное открытие не ходит в МойСклад второй раз', async () => {
+    const window = bootAgent();
+    await window.__ready;
+    const row = window.document.querySelector(`[data-shipment="${DEMAND}"]`);
+    row.click();
+    await new Promise(r => setTimeout(r, 0));
+    row.click();  // свернули
+    row.click();  // раскрыли снова
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__calls.filter(c => c[0] === '/api/clients/shipment')).toHaveLength(1);
+  });
+
+  it('сбой МойСклад показывается в строке и не блокирует повтор', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__tries = 0;
+      api = async (path) => {
+        if (path === '/api/clients/detail') return ${JSON.stringify(DETAIL)};
+        window.__tries++;
+        throw new Error('МойСклад не ответил, попробуйте позже');
+      };
+      window.__ready = renderAgentDetail('AG-1');
+    `);
+    await window.__ready;
+    const row = window.document.querySelector(`[data-shipment="${DEMAND}"]`);
+    row.click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.document.getElementById(`shipment-${DEMAND}`).textContent).toContain('не ответил');
+
+    row.click();  // свернули
+    row.click();  // ошибку не кэшируем — вторая попытка должна уйти
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__tries).toBe(2);
+  });
+});
+
 describe('техника: фотографии', () => {
   const CARD = (over = {}) => ({
     ok: true,

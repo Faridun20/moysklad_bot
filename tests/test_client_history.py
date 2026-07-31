@@ -188,6 +188,78 @@ def test_detail_returns_history_and_items(isolated_db, monkeypatch):
     assert [h["kind"] for h in body["money_history"]] == ["payment"]
 
 
+DEMAND_ID = "a1b2c3d4-1111-2222-3333-444455556666"
+
+
+def _positions_stub(rows, monkeypatch):
+    from services import moysklad
+
+    async def _positions(demand_id):
+        assert demand_id == DEMAND_ID
+        return rows
+
+    monkeypatch.setattr(moysklad, "get_shipment_positions", _positions)
+
+
+def test_shipment_returns_its_contents(isolated_db, monkeypatch):
+    """Отгрузка показывалась одной суммой — увидеть, ЧТО уехало, было нельзя."""
+    db = isolated_db
+    _setup(db)
+    client = _client(db, monkeypatch, 2)
+    _positions_stub(
+        [
+            {"assortment": {"name": "Кабель PV 0.6"}, "quantity": 29, "price": 8000,
+             "uom": {"name": "шт"}},
+            {"assortment": {"name": "Автомат C16"}, "quantity": 2.5, "price": 15000},
+        ],
+        monkeypatch,
+    )
+
+    r = client.post("/api/clients/shipment", json={"initData": "2", "demand_id": DEMAND_ID})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [p["name"] for p in body["positions"]] == ["Кабель PV 0.6", "Автомат C16"]
+    assert body["positions"][0]["sum_cents"] == 29 * 8000
+    assert body["positions"][1]["unit"] == "шт"  # единицы нет в ответе МС — дефолт
+    assert body["sum_cents"] == 29 * 8000 + int(round(2.5 * 15000))
+
+
+def test_shipment_rejects_non_uuid(isolated_db, monkeypatch):
+    """`demand_id` уходит в ПУТЬ запроса к МС: строка вида `../../entity/...`
+    увела бы его в другую сущность."""
+    db = isolated_db
+    _setup(db)
+    client = _client(db, monkeypatch, 2)
+
+    for bad in ("", "../../entity/counterparty/xxx", "12345"):
+        r = client.post("/api/clients/shipment", json={"initData": "2", "demand_id": bad})
+        assert r.status_code == 400, bad
+
+
+def test_shipment_ms_failure_is_502(isolated_db, monkeypatch):
+    """МС не ответил — это не поломка карточки: остальное в ней уже отрисовано."""
+    from services import moysklad
+
+    db = isolated_db
+    _setup(db)
+    client = _client(db, monkeypatch, 2)
+
+    async def _boom(_demand_id):
+        raise RuntimeError("MS 503")
+
+    monkeypatch.setattr(moysklad, "get_shipment_positions", _boom)
+    r = client.post("/api/clients/shipment", json={"initData": "2", "demand_id": DEMAND_ID})
+    assert r.status_code == 502
+
+
+def test_shipment_is_boss_only(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+    client = _client(db, monkeypatch, 3, role="manager")
+    r = client.post("/api/clients/shipment", json={"initData": "3", "demand_id": DEMAND_ID})
+    assert r.status_code == 403
+
+
 def test_detail_stays_boss_only(isolated_db, monkeypatch):
     """История платежей клиента — чувствительные данные; ручка как была
     admin/boss, так и остаётся."""

@@ -23,10 +23,10 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 69._
+_Всего эндпоинтов: 70._
 
 
-### Админ (`admin`) — 62 эндпоинтов
+### Админ (`admin`) — 63 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -36,6 +36,7 @@ _Всего эндпоинтов: 69._
 - `/api/cash/history`
 - `/api/clients/detail`
 - `/api/clients/overview`
+- `/api/clients/shipment`
 - `/api/credit/overview`
 - `/api/credit/set`
 - `/api/currency/rates`
@@ -96,7 +97,7 @@ _Всего эндпоинтов: 69._
 </details>
 
 
-### Руководитель (`boss`) — 59 эндпоинтов
+### Руководитель (`boss`) — 60 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -106,6 +107,7 @@ _Всего эндпоинтов: 69._
 - `/api/cash/history`
 - `/api/clients/detail`
 - `/api/clients/overview`
+- `/api/clients/shipment`
 - `/api/credit/overview`
 - `/api/credit/set`
 - `/api/currency/rates`
