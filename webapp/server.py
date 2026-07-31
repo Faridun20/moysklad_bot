@@ -2416,6 +2416,136 @@ async def api_products_prices_set(request: Request):
     return JSONResponse({"ok": True, "ms_id": ms_id})
 
 
+# ─── API: техника (экскаваторы) ──────────────────────────────────────────────
+# Раздел переехал из бота: формы, списки и фотографии — работа для экрана, а не
+# для командной строки в чате. В боте остаётся быстрый просмотр и ввод моточасов
+# с площадки.
+#
+# Роли: смотреть и вводить моточасы может менеджер; заводить машину, править
+# карточку, двигать статус и оформлять сделки — только admin/boss. Себестоимость
+# и паспорт покупателя режет `services.machines` на чтении, здесь их просто не
+# существует для менеджера.
+
+_MACHINE_ROLES = ("admin", "boss", "manager")
+_MACHINE_BOSS = ("admin", "boss")
+
+
+def _machine_response(res: dict) -> JSONResponse:
+    """Результат сервиса техники → HTTP-ответ.
+
+    Тексты ошибок в сервисе писались для человека — отдаём их как есть, а не
+    переписываем здесь во второй раз.
+
+    Код важнее текста: **409** значит «состояние на сервере уже другое, обнови
+    карточку» (машину продали, пока форма была открыта; показание моточасов
+    требует подтверждения), **400** — «исправь поле». Различить их иначе фронт
+    не может, а действия у него противоположные. Дополнительные поля ответа
+    (`current`, `previous`, `needs_force`) уходят клиенту вместе с `detail`:
+    без них форма не сможет предложить подтверждение.
+    """
+    if res.get("ok"):
+        return JSONResponse(res)
+    error = str(res.get("error") or "Не удалось выполнить операцию")
+    if "не найден" in error.lower():
+        code = 404
+    elif res.get("needs_force") or "current" in res or "сделка невозможна" in error:
+        code = 409
+    else:
+        code = 400
+    return JSONResponse({**res, "detail": error}, status_code=code)
+
+
+def _machine_photo_public(row: dict) -> dict:
+    """Фото наружу: только id и подпись.
+
+    `tg_file_id` клиенту не нужен и опасен — он открывает файл через Bot API
+    любому, кто знает токен, и переживает удаление карточки. Собираем ответ
+    явным списком полей, а не `dict(row)`: при следующем ALTER TABLE неявный
+    вариант молча вынесет наружу новую колонку.
+    """
+    return {
+        "id": int(row["id"]),
+        "caption": row.get("caption") or "",
+        "sort_order": int(row.get("sort_order") or 0),
+        "uploaded_at": row.get("uploaded_at") or "",
+    }
+
+
+@app.post("/api/machines/list")
+async def api_machines_list(request: Request):
+    """Список техники + счётчики по статусам. Payload: {"status": "in_stock"?}."""
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_MACHINE_ROLES,
+        rate_limit_scope="api_machines_list",
+    )
+    role = get_role(user["id"])
+    status = (data.get("status") or "").strip() or None
+    if status and status not in machines.STATUSES:
+        # Не пустой список: «машины пропали» выглядит как потеря данных, а это
+        # опечатка в фильтре.
+        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+
+    rows = await machines.list_machines(role=role, status=status)
+    counts = await machines.count_by_status()
+    return JSONResponse(
+        {
+            "ok": True,
+            "machines": rows,
+            "counts": counts,
+            "status": status or "all",
+            "can_manage": role in _MACHINE_BOSS,
+            "can_see_cost": machines.can_see_cost(role),
+            "status_labels": machines.STATUS_LABELS,
+        }
+    )
+
+
+@app.post("/api/machines/card")
+async def api_machines_card(request: Request):
+    """Карточка машины: данные, фото, история моточасов, сделки, переходы."""
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_MACHINE_ROLES,
+        rate_limit_scope="api_machines_card",
+    )
+    role = get_role(user["id"])
+    try:
+        machine_id = int(data.get("machine_id") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="machine_id: не число")
+    if machine_id <= 0:
+        raise HTTPException(status_code=400, detail="machine_id обязателен")
+
+    machine = await machines.get_machine(machine_id, role=role)
+    if not machine:
+        raise HTTPException(status_code=404, detail="Машина не найдена")
+
+    photos = await machines.list_photos(machine_id)
+    hours = await machines.get_hours_history(machine_id)
+    deals = await machines.list_deals(machine_id, role=role)
+    return JSONResponse(
+        {
+            "ok": True,
+            "machine": machine,
+            "photos": [_machine_photo_public(p) for p in photos],
+            "hours": hours,
+            "deals": deals,
+            # Граф переходов приходит с сервера: рисовать его копию на фронте
+            # значит завести второй источник правды о жизненном цикле машины.
+            "next_statuses": machines.next_status_options(machine.get("status")),
+            "can_manage": role in _MACHINE_BOSS,
+            "status_labels": machines.STATUS_LABELS,
+        }
+    )
+
+
 @app.post("/api/users/deactivate")
 async def api_users_deactivate(request: Request):
     """Деактивировать/реактивировать пользователя (#32). Admin only.

@@ -308,6 +308,79 @@ def test_deal_price_must_be_positive_cents(isolated_db):
         assert res["ok"] is False, bad
 
 
+def test_buyer_passport_is_boss_only(isolated_db):
+    """Паспорт — персональные данные. Режется там же, где себестоимость: в
+    слое чтения, иначе первый же новый вызов вернёт его наружу."""
+    from services import machines
+
+    db = isolated_db
+    _setup_roles(db)
+    mid = _machine(db)
+    _run(
+        machines.create_deal(
+            mid, kind="sale", price_cents=1000, buyer_name="Иванов",
+            buyer_passport="AB1234567", created_by=2,
+        )
+    )
+    assert _run(machines.list_deals(mid, role="boss"))[0]["buyer_passport"] == "AB1234567"
+    assert "buyer_passport" not in _run(machines.list_deals(mid, role="manager"))[0]
+    # Роль не передали — считаем, что показывать нельзя.
+    assert "buyer_passport" not in _run(machines.list_deals(mid))[0]
+
+
+# ─── Счётчики и граф переходов ────────────────────────────────────────────────
+
+
+def test_count_by_status_matches_the_unfiltered_list(isolated_db):
+    """`all` обязан совпадать с длиной списка без фильтра — иначе счётчик в
+    интерфейсе врёт ровно на архив."""
+    from services import machines
+
+    db = isolated_db
+    _setup_roles(db)
+    _machine(db, vin="A-1")
+    _machine(db, vin="A-2", status="in_stock")
+    _machine(db, vin="A-3", status="archived")
+
+    counts = _run(machines.count_by_status())
+    assert counts["in_transit"] == 1
+    assert counts["in_stock"] == 1
+    assert counts["archived"] == 1
+    assert counts["reserved"] == 0  # статус без машин присутствует нулём
+    assert counts["all"] == len(_run(machines.list_machines(role="boss"))) == 2
+
+
+def test_transition_graph_covers_every_status(isolated_db):
+    """Статус без записи в графе — это экран без кнопок и без объяснения."""
+    from services import machines
+
+    assert set(machines.NEXT_STATUSES) == set(machines.STATUSES)
+    for status, targets in machines.NEXT_STATUSES.items():
+        assert set(targets) <= set(machines.STATUSES), status
+
+
+def test_transition_options_carry_labels():
+    """Подпись зависит от пары статусов: «на склад» и «снять бронь» ведут в
+    один in_stock, но говорят о разном."""
+    from services import machines
+
+    assert machines.next_statuses("in_transit") == ("in_stock",)
+    assert machines.next_status_options("in_transit")[0]["label"] == "🏗 На склад"
+    assert machines.next_status_options("reserved")[0]["label"] == "🏗 Снять бронь"
+    assert machines.next_status_options("archived") == []
+    assert machines.next_status_options(None) == []
+
+
+def test_sale_and_credit_are_not_in_the_manual_graph():
+    """Продажа требует цены и покупателя, поэтому идёт через create_deal —
+    кнопки «просто сменить статус на sold» быть не должно."""
+    from services import machines
+
+    reachable = {t for targets in machines.NEXT_STATUSES.values() for t in targets}
+    assert "sold" not in reachable
+    assert "on_credit" not in reachable
+
+
 # ─── Удаление и архив ─────────────────────────────────────────────────────────
 
 
