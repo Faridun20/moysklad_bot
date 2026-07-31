@@ -65,3 +65,41 @@ describe('загрузка фронта (helpers.js + app.js)', () => {
     expect(window.escapeHtml).toBeUndefined();
   });
 });
+
+describe('под-вкладки Заказы/Каталог переживают ре-рендер (UI-BUG-04)', () => {
+  // Регресс: шелл вставлялся поверх готового DOM через insertAdjacentHTML, и
+  // любой полный ре-рендер внутри вкладки (смена статуса, выбор периода,
+  // ошибка сети) переписывал innerHTML и уносил его вместе с обработчиками —
+  // пользователь не мог уйти в Каталог, не выходя из раздела.
+  // Драйвер выполняем В ТОМ ЖЕ eval, что и app.js: его состояние объявлено
+  // через `let` на верхнем уровне скрипта, а такие привязки в область
+  // следующего eval не попадают — снаружи их не выставить.
+  const boot = (driver = '') => {
+    const window = makeWindow();
+    window.eval(read('helpers.js'));
+    window.eval(`${read('app.js')}\n${driver}`);
+    return window;
+  };
+
+  it('шелл входит в шаблон, а не накладывается сверху', () => {
+    const window = boot();
+    const html = window.ordersShellHtml();
+    expect(html).toContain('data-sub="orders"');
+    expect(html).toContain('data-sub="stock"');
+  });
+
+  it('после полного ре-рендера списка заказов вкладки на месте', () => {
+    const window = boot('ordersData = { orders: [], role: "manager" }; renderOrdersMain();');
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('[data-sub="stock"]')).not.toBeNull();
+    expect(content.querySelector('[data-sub="orders"]')).not.toBeNull();
+  });
+
+  it('вкладки остаются даже когда экран показывает ошибку сети', () => {
+    const window = boot();
+    const content = window.document.getElementById('content');
+    content.innerHTML = window.ordersShellHtml() + window.errorBox('Нет подключения к интернету');
+    expect(content.querySelector('[data-sub="orders"]')).not.toBeNull();
+    expect(content.textContent).toContain('Нет подключения');
+  });
+});

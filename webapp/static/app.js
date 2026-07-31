@@ -289,32 +289,41 @@ async function showScreen(screen) {
 // Текущая под-вкладка для объединённого экрана «Склад и заказы»
 let ordersSubTab = 'orders';
 
-async function renderOrdersScreen() {
-  // Делегируем в существующие render-функции (они пишут в #content).
-  if (ordersSubTab === 'orders') {
-    await renderOrders();
-  } else {
-    await renderStock();
-  }
-  // Поверх их вывода — переключатель под-вкладок. Единый стиль с Аналитикой:
-  // iOS-сегмент .seg (равные доли, приподнятая активная), а не отдельный .sub-tabs.
-  const content = document.getElementById('content');
-  const tabsHtml = `
-    <div class="seg-row">
-      <div class="seg">
-        <button class="seg-item ${ordersSubTab === 'orders' ? 'active' : ''}" data-sub="orders" aria-pressed="${ordersSubTab === 'orders'}">${icon('list')} Заказы</button>
-        <button class="seg-item ${ordersSubTab === 'stock' ? 'active' : ''}" data-sub="stock" aria-pressed="${ordersSubTab === 'stock'}">${icon('box')} Каталог</button>
-      </div>
-    </div>
-  `;
-  content.insertAdjacentHTML('afterbegin', tabsHtml);
-  document.querySelectorAll('.seg-item[data-sub]').forEach(btn => {
+// Переключатель под-вкладок «Заказы / Каталог».
+//
+// UI-BUG-04: раньше он вставлялся через insertAdjacentHTML ПОВЕРХ уже
+// отрисованного контента. Любой полный ре-рендер внутри вкладки —
+// смена статуса, выбор периода, «Применить» в календаре, загрузка, ошибка
+// сети — переписывал content.innerHTML и уносил шелл вместе с обработчиками:
+// пользователь оставался без возможности уйти в Каталог.
+//
+// В Аналитике этого бага нет ровно потому, что там шапка входит в КАЖДЫЙ
+// innerHTML (analyticsHeaderHtml + wireAnalyticsHeader). Здесь тот же паттерн.
+function ordersShellHtml() {
+  const tab = (id, label, ic) =>
+    `<button class="seg-item ${ordersSubTab === id ? 'active' : ''}" data-sub="${id}" ` +
+    `aria-pressed="${ordersSubTab === id}">${icon(ic)} ${label}</button>`;
+  return `<div class="seg-row"><div class="seg">${tab('orders', 'Заказы', 'list')}${tab('stock', 'Каталог', 'box')}</div></div>`;
+}
+
+function wireOrdersShell(root) {
+  (root || document).querySelectorAll('.seg-item[data-sub]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
       ordersSubTab = btn.dataset.sub;
       renderOrdersScreen();
     });
   });
+}
+
+async function renderOrdersScreen() {
+  // Только диспатч: шелл рисует каждая ветка сама, иначе он теряется при
+  // первом же ре-рендере внутри вкладки.
+  if (ordersSubTab === 'orders') {
+    await renderOrders();
+  } else {
+    await renderStock();
+  }
 }
 
 async function renderHome() {
@@ -588,7 +597,8 @@ let _stockSearchTimer = null;  // дебаунс ввода в поиске по
 
 async function renderStock() {
   const content = document.getElementById('content');
-  content.innerHTML = loading('Загружаю остатки…');
+  content.innerHTML = ordersShellHtml() + loading('Загружаю остатки…');
+  wireOrdersShell(content);
 
   if (!stockData) {
     try {
@@ -603,7 +613,8 @@ async function renderStock() {
       }
       stockData = await r.json();
     } catch (e) {
-      content.innerHTML = errorBox(e.message);
+      content.innerHTML = ordersShellHtml() + errorBox(e.message);
+      wireOrdersShell(content);
       return;
     }
   }
@@ -789,6 +800,7 @@ function renderStockContent() {
     ).join('');
 
   content.innerHTML = `
+    ${ordersShellHtml()}
     <div class="form-row">
       <input id="stock-search" class="form-input" placeholder="Поиск товара…" value="${escapeHtml(stockSearch)}">
     </div>
@@ -802,6 +814,7 @@ function renderStockContent() {
     <div class="stock-list" id="stock-list"></div>
     <div id="stock-trunc"></div>
   `;
+  wireOrdersShell(content);   // UI-BUG-04
   renderStockList();
 
   // Boss: делегированный клик по строке товара → редактор цены. Вешаем ОДИН
@@ -1238,12 +1251,14 @@ async function renderOrders() {
   // каждый раз дёргать /api/orders. Мутации (delete/ship/cancel) ставят
   // ordersData = null — это форсит свежую загрузку ниже.
   if (!ordersData || Date.now() - ordersDataTs > ORDERS_TTL_MS) {
-    content.innerHTML = loading('Загружаю заказы…');
+    content.innerHTML = ordersShellHtml() + loading('Загружаю заказы…');
+    wireOrdersShell(content);
     try {
       ordersData = await api('/api/orders', {});
       ordersDataTs = Date.now();
     } catch (e) {
-      content.innerHTML = errorBox(e.message);
+      content.innerHTML = ordersShellHtml() + errorBox(e.message);
+      wireOrdersShell(content);
       return;
     }
   }
@@ -1398,6 +1413,7 @@ function renderOrdersMain() {
       })();
 
   content.innerHTML = `
+    ${ordersShellHtml()}
     <div class="section-label">Статус</div>
     <div class="seg-row"><div class="seg seg--scroll">${statusSeg}</div></div>
     <div class="section-label">Период</div>
@@ -1409,6 +1425,7 @@ function renderOrdersMain() {
 
     <div class="orders-list">${list}</div>
   `;
+  wireOrdersShell(content);   // UI-BUG-04: шелл — часть шаблона, значит и проводка тоже
 
   // Фильтры по статусу (сегмент).
   document.querySelectorAll('.seg-item[data-filter]').forEach(btn => {
