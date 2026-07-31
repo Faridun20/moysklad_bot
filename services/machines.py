@@ -347,6 +347,43 @@ async def update_machine_fields(
     return {"ok": True}
 
 
+async def change_vin(
+    machine_id: int, new_vin: str, *, user_id: int, full_name: str = ""
+) -> dict:
+    """Исправить серийный номер машины.
+
+    Отдельно от `update_machine_fields`, а не полем в его whitelist: у VIN свои
+    правила — нормализация и уникальность. В общем списке правимых полей он бы
+    их не получил, а UNIQUE-нарушение прилетело бы пользователю текстом драйвера.
+
+    Смена VIN — не рядовая правка: карточка после неё описывает другую машину,
+    поэтому в аудит уходит переход «старый → новый».
+    """
+    vin_norm = normalize_vin(new_vin)
+    if not vin_norm:
+        return {"ok": False, "error": "VIN обязателен"}
+    current = await adb_core.fetchrow("SELECT vin FROM machines WHERE id = $1", machine_id)
+    if not current:
+        return {"ok": False, "error": "Машина не найдена"}
+    if current["vin"] == vin_norm:
+        # Не ошибка: пользователь открыл форму и сохранил, ничего не изменив.
+        return {"ok": True, "vin": vin_norm, "changed": False}
+    clash = await adb_core.fetchrow(
+        "SELECT id FROM machines WHERE vin = $1 AND id <> $2", vin_norm, machine_id
+    )
+    if clash:
+        return {"ok": False, "error": f"Машина с VIN {vin_norm} уже заведена"}
+    await adb_core.execute(
+        "UPDATE machines SET vin = $1, updated_at = $2 WHERE id = $3",
+        vin_norm, now_str(), machine_id,
+    )
+    await _audit(
+        user_id, full_name, "machine_vin_changed",
+        f"#{machine_id}: {current['vin']} → {vin_norm}",
+    )
+    return {"ok": True, "vin": vin_norm, "changed": True, "previous": current["vin"]}
+
+
 async def set_status(
     machine_id: int,
     new_status: str,

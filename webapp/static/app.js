@@ -960,10 +960,13 @@ function machineFactsHtml(m, card) {
   const facts = [
     ['Статус', machineStatusLabel(m.status, labels)],
     ['VIN', m.vin || '—'],
-    ['Марка и модель', [m.brand, m.model, m.year].filter(Boolean).join(' · ') || '—'],
     ['Моточасы', m.hours != null ? `${Number(m.hours).toLocaleString('ru-RU')} м/ч` : '—'],
     ['Цена', m.price_cents ? formatMoney(m.price_cents / 100, m.currency || 'USD') : '—'],
   ];
+  // Марка, модель и контейнер больше не заводятся через форму, но у старых
+  // карточек они есть — прячем строку, а не показываем прочерк.
+  const spec = [m.brand, m.model, m.year].filter(Boolean).join(' · ');
+  if (spec) facts.push(['Марка и год', spec]);
   // Себестоимости нет в ответе для менеджера — не «пусто», а поля не существует.
   if ('cost_cents' in m) {
     facts.push(['Себестоимость', m.cost_cents ? formatMoney(m.cost_cents / 100, m.currency || 'USD') : '—']);
@@ -1029,8 +1032,29 @@ function machineActionsHtml(m, card) {
       buttons.push('<button class="btn-secondary" data-mact="sale">Продажа</button>');
       buttons.push('<button class="btn-secondary" data-mact="credit">Рассрочка</button>');
     }
+    // Удаление только у машины без сделок: продажа — денежный факт, стирать
+    // его вместе с карточкой нельзя, такие уводят в архив. Сервер это тоже
+    // проверяет, здесь просто не показываем заведомо отказную кнопку.
+    if (!(card.deals || []).length) {
+      buttons.push(`<button class="btn-secondary btn-danger" data-mact="delete">${icon('trash')} Удалить</button>`);
+    }
   }
   return `<div class="c-actions c-actions--wrap">${buttons.join('')}</div>`;
+}
+
+async function deleteMachine(machine) {
+  if (!await confirmDialog(
+    `Удалить карточку «${machine.name || machine.vin}»? Фото и моточасы удалятся вместе с ней.`
+  )) return;
+  const res = await apiResult('/api/machines/delete', { machine_id: machine.id });
+  if (!res.ok) {
+    tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+    return;
+  }
+  haptic('success');
+  toast('Машина удалена');
+  ordersSubTab = 'machines';
+  showScreen('orders');
 }
 
 // ─── Фотографии машины ──────────────────────────────
@@ -1177,6 +1201,7 @@ async function renderMachineCard(machineId) {
       const act = btn.dataset.mact;
       if (act === 'hours') openHoursForm(m);
       else if (act === 'edit') openMachineForm(m);
+      else if (act === 'delete') deleteMachine(m);
       else openDealForm(m, act);
     });
   });
@@ -1286,19 +1311,15 @@ function openMachineForm(machine) {
   const editing = !!machine;
   const m = machine || {};
   const cents = (v) => (v ? String(v / 100) : '');
-  const fields = [];
-  // VIN правится только при заведении: сервис его в whitelist не пускает, и
-  // смена серийника — это не правка карточки, а другая машина.
-  if (!editing) {
-    fields.push({ key: 'vin', label: 'VIN / серийный номер', required: true,
-                  hint: 'Пробелы и дефисы можно не убирать' });
-  }
-  fields.push(
-    { key: 'name', label: 'Название', required: true, value: m.name || '', placeholder: 'JCB 3CX' },
-    { key: 'brand', label: 'Марка', value: m.brand || '' },
-    { key: 'model', label: 'Модель', value: m.model || '' },
+  // Марки и модели в форме нет: они и так входят в название («JCB 3CX 2019»),
+  // а два поля с теми же словами приходилось заполнять дважды. Контейнер
+  // отслеживается отдельной сущностью, а не строкой в карточке машины.
+  const fields = [
+    { key: 'vin', label: 'VIN / серийный номер', required: true, value: m.vin || '',
+      hint: editing ? 'Исправляется только при опечатке' : 'Пробелы и дефисы можно не убирать' },
+    { key: 'name', label: 'Название', required: true, value: m.name || '', placeholder: 'JCB 3CX 2019' },
     { key: 'year', label: 'Год', type: 'number', value: m.year || '' },
-  );
+  ];
   if (!editing) fields.push({ key: 'hours', label: 'Моточасы', type: 'number' });
   fields.push({ key: 'price', label: 'Цена, USD', type: 'number', value: cents(m.price_cents) });
   if (isMachineBoss()) {
@@ -1306,7 +1327,6 @@ function openMachineForm(machine) {
   }
   fields.push(
     { key: 'location', label: 'Локация', value: m.location || '' },
-    { key: 'container_no', label: 'Контейнер', value: m.container_no || '' },
     { key: 'eta_date', label: 'Прибытие', type: 'date', value: m.eta_date || '' },
     { key: 'notes', label: 'Заметки', type: 'textarea', value: m.notes || '' },
   );
@@ -3915,19 +3935,50 @@ async function renderCurrencyRates() {
   });
 }
 
-// Состав отгрузки из МойСклад — тем же языком, что состав заказа ниже, чтобы
-// «что уехало» и «что заказывали» читались одинаково.
-function shipmentItemsHtml(res) {
-  const items = res.positions || [];
-  if (!items.length) return '<div class="order-item">В отгрузке нет позиций</div>';
-  const cur = escapeHtml(res.currency || 'USD');
+// Состав документа (заказа или отгрузки) — вложенная поверхность со строками
+// «товар · количество × цена» и колонкой сумм справа.
+//
+// Раньше это был мелкий серый список «• Товар: 16 шт × 360 USD = 5 760 USD»:
+// он не отличался от подзаголовка строки, которую раскрыли, а суммы не
+// выстраивались в колонку — сравнить их глазами было нельзя. Отсюда общий
+// рендер: «что уехало» и «что заказывали» должны читаться одинаково.
+function itemsBoxHtml(items, currency, opts) {
+  const o = opts || {};
+  if (!items || !items.length) {
+    return `<div class="items-box"><div class="items-empty">${escapeHtml(o.empty || 'Позиций нет')}</div></div>`;
+  }
+  const cur = escapeHtml(currency || 'USD');
   const money = c => opsAmount((Number(c) || 0) / 100);
-  return items.map(it => {
+  const rows = items.map(it => {
     const qty = `${formatMoney(it.quantity)} ${escapeHtml(it.unit || 'шт')}`;
-    const price = it.price_cents ? ` × ${money(it.price_cents)} ${cur}` : '';
-    const sum = it.sum_cents ? ` = <b>${money(it.sum_cents)} ${cur}</b>` : '';
-    return `<div class="order-item">• ${escapeHtml(it.name)}: ${qty}${price}${sum}</div>`;
+    const meta = it.price_cents ? `${qty} × ${money(it.price_cents)} ${cur}` : qty;
+    // Сумма позиции: у отгрузки её считает сервер, у заказа — количество × цену.
+    const sumCents = it.sum_cents != null
+      ? it.sum_cents
+      : Math.round((it.price_cents || 0) * (it.quantity || 0));
+    return `
+      <div class="items-row">
+        <div class="items-info">
+          <div class="items-name">${escapeHtml(it.name)}</div>
+          <div class="items-meta">${meta}</div>
+        </div>
+        <div class="items-sum">${sumCents ? `${money(sumCents)} ${cur}` : '—'}</div>
+      </div>`;
   }).join('');
+  // Итог печатаем, только когда позиций больше одной: под единственной строкой
+  // он дословно её повторяет.
+  const total = items.reduce(
+    (s, it) => s + (it.sum_cents != null ? it.sum_cents : Math.round((it.price_cents || 0) * (it.quantity || 0))),
+    0,
+  );
+  const totalRow = items.length > 1 && total
+    ? `<div class="items-total"><span>Итого · ${items.length} поз.</span><b>${money(total)} ${cur}</b></div>`
+    : '';
+  return `<div class="items-box">${rows}${totalRow}</div>`;
+}
+
+function shipmentItemsHtml(res) {
+  return itemsBoxHtml(res.positions, res.currency, { empty: 'В отгрузке нет позиций' });
 }
 
 // Карточка контрагента: МС-баланс + локальный долг/лимит (правится) + покупки из
@@ -3979,19 +4030,8 @@ async function renderAgentDetail(agentId) {
   // же ответе (их всё равно грузят ради суммы), поэтому раскрытие ничего не
   // запрашивает и работает мгновенно даже без сети.
   const orders = d.orders || [];
-  const orderItemsHtml = (o) => {
-    const items = o.items || [];
-    if (!items.length) return '<div class="order-item">Позиции не добавлены</div>';
-    const cur = escapeHtml(o.currency || baseC);
-    return items.map(it => {
-      const qty = `${formatMoney(it.quantity)} ${escapeHtml(it.unit || 'шт')}`;
-      const price = it.price_cents ? ` × ${fmtCents(it.price_cents)} ${cur}` : '';
-      const sum = it.price_cents
-        ? ` = <b>${fmtCents(Math.round(it.price_cents * (it.quantity || 0)))} ${cur}</b>`
-        : '';
-      return `<div class="order-item">• ${escapeHtml(it.name)}: ${qty}${price}${sum}</div>`;
-    }).join('');
-  };
+  const orderItemsHtml = (o) =>
+    itemsBoxHtml(o.items, o.currency || baseC, { empty: 'Позиции не добавлены' });
   const ordersRows = orders.map(o =>
     `<div class="c-row c-row--tap" data-order-open="${o.id}" data-status="${escapeHtml(o.status || '')}" role="button" tabindex="0" aria-expanded="false">` +
     `<div class="card-row-info">` +

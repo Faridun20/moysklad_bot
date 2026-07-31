@@ -291,6 +291,44 @@ describe('техника: формы', () => {
     expect(window.document.getElementById('content').textContent).toContain('JCB 3CX');
   });
 
+  it('форма правки даёт исправить VIN, но не спрашивает марку и модель', async () => {
+    // Марка и модель и так входят в название («JCB 3CX 2019») — два поля с
+    // теми же словами приходилось заполнять дважды. Контейнер отслеживается
+    // отдельно, а не строкой в карточке машины.
+    const window = boot7('boss', []);
+    await window.__ready;
+    window.document.querySelector('[data-mact="edit"]').click();
+
+    expect(window.document.querySelector('#ms-f-vin').value).toBe('JCB7788');
+    expect(window.document.querySelector('#ms-f-brand')).toBeNull();
+    expect(window.document.querySelector('#ms-f-model')).toBeNull();
+    expect(window.document.querySelector('#ms-f-container_no')).toBeNull();
+  });
+
+  it('удаление спрашивает подтверждение и уводит со страницы машины', async () => {
+    const window = boot7('boss', [{ ok: true, status: 200, body: { ok: true }, error: '' }]);
+    await window.__ready;
+    window.document.querySelector('[data-mact="delete"]').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__confirmed).toContain('Удалить');
+    expect(window.__writes[0][0]).toBe('/api/machines/delete');
+    expect(window.__writes[0][1]).toEqual({ machine_id: 7 });
+  });
+
+  it('у машины со сделкой кнопки удаления нет', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify({
+        ...CARD,
+        deals: [{ id: 1, kind: 'sale', price_cents: 100, sold_at: '2026-01-01', buyer_name: 'A' }],
+      })});
+      window.__ready = renderMachineCard(7);
+    `);
+    await window.__ready;
+    expect(window.document.querySelector('[data-mact="delete"]')).toBeNull();
+  });
+
   it('форма сделки требует срок оплаты только для рассрочки', async () => {
     const window = boot7('boss', []);
     await window.__ready;
@@ -357,6 +395,44 @@ describe('карточка клиента: состав отгрузки', () =>
     expect(box.hidden).toBe(false);
     expect(box.textContent).toContain('Кабель PV 0.6');
     expect(window.__calls[1]).toEqual(['/api/clients/shipment', { demand_id: DEMAND }]);
+  });
+
+  it('позиции выстроены строками с колонкой сумм, а не абзацем текста', () => {
+    // Регресс: состав печатался списком «• Товар: 16 шт × 360 USD = 5 760 USD»
+    // тем же мелким серым текстом, что и подзаголовок раскрытой строки —
+    // сравнить суммы глазами было нельзя.
+    const window = boot('');
+    const html = window.itemsBoxHtml(
+      [
+        { name: 'ThinkPower 6kw', quantity: 16, unit: 'шт', price_cents: 36000, sum_cents: 576000 },
+        { name: 'Штекер', quantity: 200, unit: 'шт', price_cents: 100, sum_cents: 20000 },
+      ],
+      'USD',
+    );
+    expect(html).toContain('items-box');
+    expect((html.match(/items-row/g) || []).length).toBe(2);
+    expect(html).toContain('items-sum');
+    expect(html).toContain('Итого · 2 поз.');
+  });
+
+  it('под единственной позицией итог не печатается — он её повторяет', () => {
+    const window = boot('');
+    const html = window.itemsBoxHtml(
+      [{ name: 'Кабель', quantity: 1, unit: 'шт', price_cents: 8000, sum_cents: 8000 }], 'USD');
+    expect(html).not.toContain('items-total');
+  });
+
+  it('сумма позиции считается, когда сервер её не прислал', () => {
+    // У заказа в ответе только цена и количество — итог строки считает фронт.
+    const window = boot('');
+    const html = window.itemsBoxHtml(
+      [{ name: 'Кабель', quantity: 3, unit: 'шт', price_cents: 8000 }], 'USD');
+    expect(html).toContain('240 USD');
+  });
+
+  it('название товара экранируется — оно приходит из МойСклад', () => {
+    const window = boot('');
+    expect(window.itemsBoxHtml([{ name: '<img src=x>', quantity: 1 }], 'USD')).not.toContain('<img');
   });
 
   it('повторное открытие не ходит в МойСклад второй раз', async () => {

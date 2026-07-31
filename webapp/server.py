@@ -2734,6 +2734,19 @@ async def api_machines_update(request: Request):
     if not isinstance(raw, dict) or not raw:
         raise HTTPException(status_code=400, detail="Нечего менять")
 
+    # VIN правится отдельной функцией сервиса: у него нормализация и проверка
+    # уникальности, которых нет у остальных полей. Делаем это ДО прочих правок —
+    # если серийник занят, карточка не должна остаться частично изменённой.
+    if "vin" in raw:
+        vin_res = await machines.change_vin(
+            machine_id, str(raw.pop("vin") or ""),
+            user_id=user["id"], full_name=_actor_name(user),
+        )
+        if not vin_res.get("ok"):
+            return _machine_response(vin_res)
+        if not raw:
+            return JSONResponse(vin_res)
+
     fields: dict = {}
     for key, value in raw.items():
         if key in ("price", "price_cents"):
@@ -2749,6 +2762,26 @@ async def api_machines_update(request: Request):
             fields[key] = (str(value).strip()[:1000] or None) if value is not None else None
     res = await machines.update_machine_fields(
         machine_id, user_id=user["id"], full_name=_actor_name(user), **fields
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/delete")
+async def api_machines_delete(request: Request):
+    """Удалить карточку машины. Только admin/boss.
+
+    Для машины со сделкой сервис откажет: продажа — денежный факт, и стирать
+    его вместе с карточкой нельзя. Такие уводят в архив.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_delete"
+    )
+    machine_id = _machine_id_arg(data)
+    res = await machines.delete_machine(
+        machine_id, user_id=user["id"], full_name=_actor_name(user)
     )
     return _machine_response(res)
 

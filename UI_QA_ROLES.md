@@ -23,10 +23,10 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 70._
+_Всего эндпоинтов: 71._
 
 
-### Админ (`admin`) — 63 эндпоинтов
+### Админ (`admin`) — 64 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -53,6 +53,7 @@ _Всего эндпоинтов: 70._
 - `/api/machines/deal`
 - `/api/machines/deal_close`
 - `/api/machines/deals_open`
+- `/api/machines/delete`
 - `/api/machines/hours`
 - `/api/machines/list`
 - `/api/machines/photo`
@@ -97,7 +98,7 @@ _Всего эндпоинтов: 70._
 </details>
 
 
-### Руководитель (`boss`) — 60 эндпоинтов
+### Руководитель (`boss`) — 61 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -124,6 +125,7 @@ _Всего эндпоинтов: 70._
 - `/api/machines/deal`
 - `/api/machines/deal_close`
 - `/api/machines/deals_open`
+- `/api/machines/delete`
 - `/api/machines/hours`
 - `/api/machines/list`
 - `/api/machines/photo`
