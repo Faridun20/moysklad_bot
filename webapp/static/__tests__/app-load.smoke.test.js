@@ -646,6 +646,136 @@ describe('техника: фотографии', () => {
   });
 });
 
+describe('контейнеры', () => {
+  const LIST = {
+    ok: true,
+    containers: [
+      { id: 3, number: 'MSKU1234567', status: 'arrived', arrived_at: '2026-08-12',
+        diff: { total: 4, unchecked: 0, short: 1, extra: 1, mismatch: 2 } },
+      { id: 4, number: 'TCLU7654321', status: 'in_transit', eta_date: '2026-09-01',
+        diff: { total: 2, unchecked: 2, short: 0, extra: 0, mismatch: 0 } },
+    ],
+    counts: { all: 2, in_transit: 1, arrived: 1 },
+    can_manage: true,
+    status_labels: { in_transit: '🚢 В пути', arrived: '📦 Прибыл' },
+  };
+  const CARD = (over = {}) => ({
+    ok: true,
+    container: { id: 3, number: 'MSKU1234567', status: 'arrived', arrived_at: '2026-08-12' },
+    items: [
+      { id: 10, name: 'Кабель PV 0.6', unit: 'шт', expected_qty: 500, arrived_qty: 500,
+        delta: 0, state: 'match' },
+      { id: 11, name: 'ThinkPower 6kw', unit: 'шт', expected_qty: 20, arrived_qty: 18,
+        delta: -2, state: 'short' },
+    ],
+    diff: { total: 2, unchecked: 0, short: 1, extra: 0, mismatch: 1 },
+    can_manage: true,
+    status_labels: { in_transit: '🚢 В пути', arrived: '📦 Прибыл' },
+    ...over,
+  });
+
+  it('вкладка есть у тех же ролей, что и техника', () => {
+    expect(boot("currentUser = { role: 'manager' };").ordersShellHtml())
+      .toContain('data-sub="containers"');
+    expect(boot("currentUser = { role: 'bookkeeper' };").ordersShellHtml())
+      .not.toContain('data-sub="containers"');
+  });
+
+  it('расхождение видно в списке — открывать каждый контейнер не нужно', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify(LIST)});
+      ordersSubTab = 'containers';
+      window.__ready = renderOrdersScreen();
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toContain('расхождений: 2');
+    // Контейнер с расхождением подсвечен как проблемный, а не как «прибыл».
+    expect(content.querySelector('[data-container="3"]').dataset.status).toBe('rejected');
+    expect(content.querySelector('[data-container="4"]').dataset.status).toBe('in_transit');
+    // Шелл под-вкладок на месте (UI-BUG-04).
+    expect(content.querySelector('[data-sub="orders"]')).not.toBeNull();
+  });
+
+  it('не сверенный прибывший контейнер так и подписан', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify({
+        ...LIST,
+        containers: [{ id: 5, number: 'X', status: 'arrived', arrived_at: '2026-08-12',
+                       diff: { total: 3, unchecked: 3, short: 0, extra: 0, mismatch: 0 } }],
+      })});
+      ordersSubTab = 'containers';
+      window.__ready = renderOrdersScreen();
+    `);
+    await window.__ready;
+    expect(window.document.getElementById('content').textContent).toContain('не сверен');
+  });
+
+  it('в карточке прибывшего есть поля факта и итог сверки', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify(CARD())});
+      window.__ready = renderContainerCard(3);
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toContain('Расхождений: 1');
+    expect(content.querySelector('.qty-input[data-item="11"]').value).toBe('18');
+    expect(content.querySelector('#cont-save')).not.toBeNull();
+    // Пока не прибыл — отмечать нечего, поэтому кнопки прибытия здесь нет.
+    expect(content.querySelector('#cont-arrive')).toBeNull();
+  });
+
+  it('пока контейнер в пути, полей факта нет — заполнять их нечем', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify(CARD({
+        container: { id: 4, number: 'TCLU7654321', status: 'in_transit', eta_date: '2026-09-01' },
+        items: [{ id: 12, name: 'Кабель', unit: 'шт', expected_qty: 500, arrived_qty: null,
+                  delta: null, state: 'unchecked' }],
+        diff: { total: 1, unchecked: 1, short: 0, extra: 0, mismatch: 0 },
+      }))});
+      window.__ready = renderContainerCard(4);
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('.qty-input')).toBeNull();
+    expect(content.querySelector('#cont-arrive')).not.toBeNull();
+    expect(content.querySelector('#cont-del')).not.toBeNull();
+  });
+
+  it('сверка уходит одним запросом на весь состав', async () => {
+    // Приёмщик считает подряд и не должен ждать сети после каждой позиции.
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__writes = [];
+      api = async () => (${JSON.stringify(CARD())});
+      apiResult = async (path, body) => { window.__writes.push([path, body]); return { ok: true, status: 200, body: { ok: true }, error: '' }; };
+      window.__ready = renderContainerCard(3);
+    `);
+    await window.__ready;
+    window.document.querySelector('.qty-input[data-item="11"]').value = '19';
+    window.document.querySelector('#cont-save').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__writes).toHaveLength(1);
+    expect(window.__writes[0][0]).toBe('/api/containers/check');
+    expect(window.__writes[0][1].quantities).toEqual({ 10: '500', 11: '19' });
+  });
+
+  it('удалить прибывший контейнер нельзя даже боссу', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify(CARD())});
+      window.__ready = renderContainerCard(3);
+    `);
+    await window.__ready;
+    expect(window.document.querySelector('#cont-del')).toBeNull();
+  });
+});
+
 describe('курсы валют: «Сохранить» действительно отправляет курс', () => {
   // Регресс: обработчик поднимался от кнопки к `.debt-card`, которого после
   // пересборки экрана на дизайн-систему в разметке курсов нет. closest отдавал

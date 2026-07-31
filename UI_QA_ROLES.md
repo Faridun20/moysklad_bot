@@ -23,10 +23,10 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 72._
+_Всего эндпоинтов: 81._
 
 
-### Админ (`admin`) — 65 эндпоинтов
+### Админ (`admin`) — 74 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -37,6 +37,15 @@ _Всего эндпоинтов: 72._
 - `/api/clients/detail`
 - `/api/clients/overview`
 - `/api/clients/shipment`
+- `/api/containers/arrive`
+- `/api/containers/card`
+- `/api/containers/check`
+- `/api/containers/create`
+- `/api/containers/delete`
+- `/api/containers/item_add`
+- `/api/containers/item_delete`
+- `/api/containers/list`
+- `/api/containers/update`
 - `/api/credit/overview`
 - `/api/credit/set`
 - `/api/currency/rates`
@@ -99,7 +108,7 @@ _Всего эндпоинтов: 72._
 </details>
 
 
-### Руководитель (`boss`) — 62 эндпоинтов
+### Руководитель (`boss`) — 71 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -110,6 +119,15 @@ _Всего эндпоинтов: 72._
 - `/api/clients/detail`
 - `/api/clients/overview`
 - `/api/clients/shipment`
+- `/api/containers/arrive`
+- `/api/containers/card`
+- `/api/containers/check`
+- `/api/containers/create`
+- `/api/containers/delete`
+- `/api/containers/item_add`
+- `/api/containers/item_delete`
+- `/api/containers/list`
+- `/api/containers/update`
 - `/api/credit/overview`
 - `/api/credit/set`
 - `/api/currency/rates`
@@ -169,12 +187,20 @@ _Всего эндпоинтов: 72._
 </details>
 
 
-### Менеджер (`manager`) — 25 эндпоинтов
+### Менеджер (`manager`) — 33 эндпоинтов
 
 <details><summary>Показать список</summary>
 
 - `/api/agents`
 - `/api/analytics`
+- `/api/containers/arrive`
+- `/api/containers/card`
+- `/api/containers/check`
+- `/api/containers/create`
+- `/api/containers/item_add`
+- `/api/containers/item_delete`
+- `/api/containers/list`
+- `/api/containers/update`
 - `/api/currency/rates`
 - `/api/debts`
 - `/api/deposits/create`

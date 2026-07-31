@@ -309,8 +309,11 @@ function ordersShellHtml() {
   const tab = (id, label, ic) =>
     `<button class="seg-item ${ordersSubTab === id ? 'active' : ''}" data-sub="${id}" ` +
     `aria-pressed="${ordersSubTab === id}">${icon(ic)} ${label}</button>`;
-  const machines = canSeeMachines() ? tab('machines', 'Техника', 'truck') : '';
-  return `<div class="seg-row"><div class="seg seg--scroll">${tab('orders', 'Заказы', 'list')}${tab('stock', 'Каталог', 'box')}${machines}</div></div>`;
+  // Техника и контейнеры — те же три роли, что у их ручек.
+  const extra = canSeeMachines()
+    ? tab('machines', 'Техника', 'truck') + tab('containers', 'Контейнеры', 'box')
+    : '';
+  return `<div class="seg-row"><div class="seg seg--scroll">${tab('orders', 'Заказы', 'list')}${tab('stock', 'Каталог', 'box')}${extra}</div></div>`;
 }
 
 function wireOrdersShell(root) {
@@ -326,11 +329,13 @@ function wireOrdersShell(root) {
 async function renderOrdersScreen() {
   // Только диспатч: шелл рисует каждая ветка сама, иначе он теряется при
   // первом же ре-рендере внутри вкладки.
-  if (ordersSubTab === 'machines' && !canSeeMachines()) ordersSubTab = 'orders';
+  if (['machines', 'containers'].includes(ordersSubTab) && !canSeeMachines()) ordersSubTab = 'orders';
   if (ordersSubTab === 'orders') {
     await renderOrders();
   } else if (ordersSubTab === 'machines') {
     await renderMachines();
+  } else if (ordersSubTab === 'containers') {
+    await renderContainers();
   } else {
     await renderStock();
   }
@@ -1118,6 +1123,284 @@ async function deleteMachine(machine) {
   toast('Машина удалена');
   ordersSubTab = 'machines';
   showScreen('orders');
+}
+
+// ─── Экран: Контейнеры ──────────────────────────────
+// Что едет, что уже здесь и сошёлся ли состав. Расхождение показываем на обоих
+// уровнях: в списке — счётчиком, в карточке — построчно. Сверка, ради которой
+// раздел и заводился, не должна требовать открыть каждый контейнер по очереди.
+let containersFilter = 'all';
+
+async function renderContainers() {
+  const content = document.getElementById('content');
+  content.innerHTML = ordersShellHtml() + skeleton('label') + skeleton('list', 3);
+  wireOrdersShell(content);
+  setScreenContext('Заказы · Контейнеры');
+
+  let data;
+  try {
+    data = await api('/api/containers/list', {
+      status: containersFilter === 'all' ? '' : containersFilter,
+    });
+  } catch (e) {
+    content.innerHTML = ordersShellHtml() + errorBox(e.message);
+    wireOrdersShell(content);
+    return;
+  }
+  const labels = data.status_labels || {};
+  const rows = (data.containers || []).map(c => {
+    const d = c.diff || {};
+    // Подстрочник отвечает на «надо ли открывать»: расхождения важнее ETA.
+    const parts = [];
+    if (c.status === 'arrived' && c.arrived_at) parts.push(`прибыл ${String(c.arrived_at).slice(0, 10)}`);
+    else if (c.eta_date) parts.push(`ожидается ${c.eta_date}`);
+    if (d.total) parts.push(`${d.total} поз.`);
+    if (d.mismatch) parts.push(`расхождений: ${d.mismatch}`);
+    else if (d.unchecked && c.status === 'arrived') parts.push('не сверен');
+    return `
+      <div class="c-row c-row--tap" data-container="${c.id}"
+           data-status="${d.mismatch ? 'rejected' : escapeHtml(c.status || '')}"
+           role="button" tabindex="0">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(c.number || '—')}</div>
+          <div class="card-row-sub">${escapeHtml(parts.join(' · '))}</div>
+        </div>
+        <span class="c-badge">${escapeHtml(machineStatusLabel(c.status, labels))}</span>
+      </div>`;
+  }).join('');
+
+  const counts = data.counts || {};
+  const seg = ['all', 'in_transit', 'arrived']
+    .filter(s => s === 'all' || Number(counts[s] || 0) > 0)
+    .map(s => {
+      const label = s === 'all' ? 'Все' : machineStatusLabel(s, labels);
+      return `<button class="seg-item ${containersFilter === s ? 'active' : ''}" data-cstatus="${s}" ` +
+        `aria-pressed="${containersFilter === s}">${escapeHtml(label)} ${Number(counts[s] || 0)}</button>`;
+    }).join('');
+
+  content.innerHTML = ordersShellHtml()
+    + `<div class="seg-row"><div class="seg seg--scroll">${seg}</div></div>`
+    + (rows
+      ? `<div class="c-surface c-surface--list">${rows}</div>`
+      : emptyState({
+          icon: 'box',
+          title: 'Контейнеров нет',
+          hint: 'Заведите контейнер, когда он выйдет в путь — и будет видно, чего ждать.',
+        }))
+    + `<div class="c-actions"><button class="btn-secondary" id="container-new">${icon('plus')} Новый контейнер</button></div>`;
+  wireOrdersShell(content);
+
+  content.querySelector('#container-new')?.addEventListener('click', () => openContainerForm());
+  content.querySelectorAll('[data-cstatus]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('light');
+      containersFilter = btn.dataset.cstatus;
+      renderContainers();
+    });
+  });
+  content.querySelectorAll('[data-container]').forEach(row => {
+    row.addEventListener('click', () => {
+      haptic('light');
+      renderContainerCard(Number(row.dataset.container));
+    });
+  });
+}
+
+function openContainerForm() {
+  const key = idemKey();
+  openMachineSheet({
+    title: 'Новый контейнер',
+    fields: [
+      { key: 'number', label: 'Номер контейнера', required: true,
+        hint: 'Пробелы и дефисы можно не убирать' },
+      { key: 'eta_date', label: 'Ожидаемое прибытие', type: 'date' },
+      { key: 'notes', label: 'Заметки', type: 'textarea' },
+    ],
+    submitLabel: 'Завести',
+    onSubmit: async (data, { showErr }) => {
+      const res = await apiResult('/api/containers/create', { ...data, idempotency_key: key });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      toast('Контейнер заведён');
+      renderContainerCard(res.body.container_id);
+      return true;
+    },
+  });
+}
+
+function openContainerItemForm(containerId, arrived) {
+  openMachineSheet({
+    title: arrived ? 'Позиция сверх заявленного' : 'Позиция в контейнере',
+    hint: arrived ? 'Товар, которого не было в заявленном составе.' : '',
+    fields: [
+      { key: 'name', label: 'Наименование', required: true },
+      arrived
+        ? { key: 'arrived_qty', label: 'Прибыло', type: 'number', required: true }
+        : { key: 'expected_qty', label: 'Заявлено', type: 'number', required: true },
+      { key: 'unit', label: 'Единица', value: 'шт' },
+    ],
+    submitLabel: 'Добавить',
+    onSubmit: async (data, { showErr }) => {
+      const res = await apiResult('/api/containers/item_add', { container_id: containerId, ...data });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      renderContainerCard(containerId);
+      return true;
+    },
+  });
+}
+
+// Строка состава: заявлено → прибыло и расхождение. Пока контейнер в пути,
+// колонки «прибыло» нет вовсе — заполнять её нечем.
+function containerItemsHtml(items, arrived, canManage) {
+  if (!items.length) {
+    return `<div class="c-surface c-surface--pad"><div class="items-empty">Состав не заполнен</div></div>`;
+  }
+  const rows = items.map(it => {
+    const qty = `${formatMoney(it.expected_qty)} ${escapeHtml(it.unit || 'шт')}`;
+    const sub = arrived
+      ? (it.state === 'unchecked'
+          ? `заявлено ${qty} · не сверено`
+          : `заявлено ${qty} · прибыло ${formatMoney(it.arrived_qty)}`)
+      : `заявлено ${qty}`;
+    const mark = it.state === 'short' ? `${formatMoney(it.delta)}`
+      : it.state === 'extra' ? `+${formatMoney(it.delta)}`
+      : it.state === 'match' ? '✓' : '—';
+    const state = it.state === 'short' ? 'rejected'
+      : it.state === 'extra' ? 'pending'
+      : it.state === 'match' ? 'approved' : 'draft';
+    const input = arrived && canManage
+      ? `<input type="number" inputmode="decimal" class="qty-input" data-item="${it.id}"
+                value="${it.arrived_qty == null ? '' : it.arrived_qty}" aria-label="Прибыло: ${escapeHtml(it.name)}">`
+      : `<div class="card-row-value">${escapeHtml(mark)}</div>`;
+    return `
+      <div class="c-row" data-status="${state}">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(it.name)}</div>
+          <div class="card-row-sub">${sub}</div>
+        </div>
+        ${input}
+        ${canManage ? `<button class="pay-toggle" data-item-del="${it.id}" aria-label="Убрать позицию">${icon('trash')}</button>` : ''}
+      </div>`;
+  }).join('');
+  return `<div class="c-surface c-surface--list">${rows}</div>`;
+}
+
+async function renderContainerCard(containerId) {
+  const content = document.getElementById('content');
+  content.innerHTML = skeleton('label') + skeleton('list', 4);
+  setScreenContext('Контейнер');
+  showBack(() => { ordersSubTab = 'containers'; showScreen('orders'); });
+
+  let card;
+  try {
+    card = await api('/api/containers/card', { container_id: containerId });
+  } catch (e) {
+    content.innerHTML = errorBox(e.message);
+    return;
+  }
+  const c = card.container || {};
+  const d = card.diff || {};
+  const arrived = c.status === 'arrived';
+  const canManage = true;   // ручки состава открыты всем трём ролям
+
+  const facts = [
+    ['Статус', machineStatusLabel(c.status, card.status_labels)],
+    arrived ? ['Прибыл', String(c.arrived_at || '').slice(0, 10) || '—']
+            : ['Ожидается', c.eta_date || '—'],
+    ['Позиций', String(d.total || 0)],
+  ];
+  if (c.notes) facts.push(['Заметки', c.notes]);
+
+  // Итог сверки — крупно и сверху: ради него раздел и существует.
+  const verdict = !arrived ? ''
+    : d.mismatch
+      ? `<div class="c-error">Расхождений: ${d.mismatch} (недостача ${d.short}, лишнее ${d.extra})</div>`
+      : d.unchecked
+        ? `<div class="items-total schedule-total"><span>Не сверено позиций</span><b>${d.unchecked}</b></div>`
+        : `<div class="items-total schedule-total"><span>Состав сошёлся</span><b>${d.total} поз.</b></div>`;
+
+  content.innerHTML = `
+    <div class="section-label">${escapeHtml(c.number || 'Контейнер')}</div>
+    <div class="c-surface c-surface--list">${facts.map(([k, v]) => `
+      <div class="c-row">
+        <div class="card-row-info"><div class="card-row-sub">${escapeHtml(k)}</div></div>
+        <div class="card-row-value">${escapeHtml(String(v))}</div>
+      </div>`).join('')}</div>
+    ${verdict}
+    <div class="c-actions c-actions--wrap">
+      <button class="btn-secondary" id="cont-item-add">${icon('plus')} ${arrived ? 'Лишняя позиция' : 'Позиция'}</button>
+      ${arrived ? '<button class="btn-primary" id="cont-save">Сохранить сверку</button>'
+                : '<button class="btn-primary" id="cont-arrive">Отметить прибытие</button>'}
+      ${!arrived && card.can_manage ? `<button class="btn-secondary btn-danger" id="cont-del">${icon('trash')} Удалить</button>` : ''}
+    </div>
+    <div class="section-label">Состав</div>
+    ${containerItemsHtml(card.items || [], arrived, canManage)}
+  `;
+
+  content.querySelector('#cont-item-add')?.addEventListener('click', () =>
+    openContainerItemForm(containerId, arrived));
+
+  content.querySelector('#cont-arrive')?.addEventListener('click', async () => {
+    if (!await confirmDialog('Контейнер прибыл? После этого можно проставить фактические количества.')) return;
+    const res = await apiResult('/api/containers/arrive', { container_id: containerId });
+    if (!res.ok) {
+      tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+      if (res.status === 409) renderContainerCard(containerId);
+      return;
+    }
+    haptic('success');
+    toast('Контейнер прибыл');
+    renderContainerCard(containerId);
+  });
+
+  content.querySelector('#cont-save')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    if (btn.disabled) return;
+    // Шлём весь состав одним запросом: приёмщик считает подряд и не должен
+    // ждать сети после каждой позиции.
+    const quantities = {};
+    content.querySelectorAll('.qty-input[data-item]').forEach(el => {
+      quantities[el.dataset.item] = el.value.trim();
+    });
+    if (!Object.keys(quantities).length) return;
+    btn.disabled = true;
+    const res = await apiResult('/api/containers/check', {
+      container_id: containerId, quantities,
+    });
+    btn.disabled = false;
+    if (!res.ok) {
+      tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+      return;
+    }
+    haptic('success');
+    toast('Сверка сохранена');
+    renderContainerCard(containerId);
+  });
+
+  content.querySelector('#cont-del')?.addEventListener('click', async () => {
+    if (!await confirmDialog(`Удалить контейнер ${c.number}? Состав удалится вместе с ним.`)) return;
+    const res = await apiResult('/api/containers/delete', { container_id: containerId });
+    if (!res.ok) {
+      tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+      return;
+    }
+    haptic('success');
+    toast('Контейнер удалён');
+    ordersSubTab = 'containers';
+    showScreen('orders');
+  });
+
+  content.querySelectorAll('[data-item-del]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const res = await apiResult('/api/containers/item_delete', {
+        container_id: containerId, item_id: Number(btn.dataset.itemDel),
+      });
+      if (!res.ok) { tg.showAlert ? tg.showAlert(res.error) : alert(res.error); return; }
+      haptic('light');
+      renderContainerCard(containerId);
+    });
+  });
 }
 
 // ─── Фотографии машины ──────────────────────────────
