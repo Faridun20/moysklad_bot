@@ -22,6 +22,25 @@ def esc(s) -> str:
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def redact_token(text: str) -> str:
+    """Убрать TELEGRAM_TOKEN из строки — обязательно для любого лога, куда
+    может попасть текст ошибки Bot API.
+
+    Токен входит в URL файлового API (`/file/bot<TOKEN>/...`), поэтому его
+    печатает не только наш код, но и текст исключения aiogram. Утёкший в логи
+    токен — это полный доступ к боту.
+
+    Жил приватной функцией в `services.notifier`; понадобился прокси фотографий
+    в webapp, а тянуть notifier ради одной строки значит тянуть и его
+    aiohttp-сессию.
+    """
+    from config import TELEGRAM_TOKEN
+
+    if TELEGRAM_TOKEN and TELEGRAM_TOKEN in text:
+        return text.replace(TELEGRAM_TOKEN, "***")
+    return text
+
+
 def extract_id_from_href(href: str) -> str:
     """Извлечь UUID из конца href-ссылки МойСклад."""
     if not href:

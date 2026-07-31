@@ -4,17 +4,21 @@ FastAPI сервер для WebApp.
 """
 
 import asyncio
+import base64
+import binascii
 import logging
 import math
 import os
 import subprocess
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from utils.helpers import redact_token
 from webapp.auth import verify_init_data
 
 # Берём роль из in-memory кэша (TTL 60s) вместо SELECT'а на каждый API-запрос.
@@ -2460,7 +2464,7 @@ def _machine_photo_public(row: dict) -> dict:
 
     `tg_file_id` клиенту не нужен и опасен — он открывает файл через Bot API
     любому, кто знает токен, и переживает удаление карточки. Собираем ответ
-    явным списком полей, а не `dict(row)`: при следующем ALTER TABLE неявный
+    явным списком полей, а не `dict(row)`: при следующей правке схемы неявный
     вариант молча вынесет наружу новую колонку.
     """
     return {
@@ -2541,6 +2545,8 @@ async def api_machines_card(request: Request):
             # значит завести второй источник правды о жизненном цикле машины.
             "next_statuses": machines.next_status_options(machine.get("status")),
             "can_manage": role in _MACHINE_BOSS,
+            # Без канала-хранилища загрузка не работает — кнопку рисовать нельзя.
+            "can_upload_photo": _machine_photos_chat_id() is not None,
             "status_labels": machines.STATUS_LABELS,
         }
     )
@@ -2848,6 +2854,238 @@ async def api_machines_deals_open(request: Request):
     )
     deals = await machines.get_open_credit_deals(role=get_role(user["id"]))
     return JSONResponse({"ok": True, "deals": deals})
+
+
+# ─── Фотографии техники ──────────────────────────────────────────────────────
+# Единственный сторедж фотографий — Telegram: он хранит их бесплатно и вечно, а
+# файловая система Railway эфемерна (после каждого деплоя пусто). Отсюда два
+# следствия, которые и определяют весь код ниже.
+#
+# 1. Прямую ссылку Telegram клиенту отдать НЕЛЬЗЯ: она выглядит как
+#    `https://api.telegram.org/file/bot<TOKEN>/...` и содержит токен бота. Файл
+#    проксируем через себя.
+# 2. Кэшируем в памяти процесса, а не на диске — по той же причине эфемерности.
+#    Ключ — `file_unique_id`: он переживает смену сервера Bot API, в отличие от
+#    `tg_file_id`. Кэшируем сразу байты, а не `file_path`: тот живёт около часа
+#    и всё равно требует второго запроса.
+
+_PHOTO_CACHE: "OrderedDict[str, tuple[float, bytes]]" = OrderedDict()
+_PHOTO_CACHE_TTL = 600.0
+_PHOTO_CACHE_MAX_BYTES = 32 * 1024 * 1024
+_PHOTO_MAX_BYTES = 5 * 1024 * 1024
+# Сигнатуры форматов, которые Telegram принимает как фото. Проверяем именно
+# байты: заявленный в data-URL тип пишет клиент, и через поле «фотография»
+# иначе пройдёт что угодно.
+_PHOTO_MAGIC = ((b"\xff\xd8\xff", "image/jpeg"), (b"\x89PNG\r\n\x1a\n", "image/png"))
+
+
+def _photo_cache_get(key: str) -> bytes | None:
+    entry = _PHOTO_CACHE.get(key)
+    if not entry:
+        return None
+    stamp, blob = entry
+    if time.time() - stamp > _PHOTO_CACHE_TTL:
+        _PHOTO_CACHE.pop(key, None)
+        return None
+    _PHOTO_CACHE.move_to_end(key)
+    return blob
+
+
+def _photo_cache_put(key: str, blob: bytes) -> None:
+    _PHOTO_CACHE[key] = (time.time(), blob)
+    _PHOTO_CACHE.move_to_end(key)
+    total = sum(len(b) for _, b in _PHOTO_CACHE.values())
+    while total > _PHOTO_CACHE_MAX_BYTES and len(_PHOTO_CACHE) > 1:
+        _, (_, dropped) = _PHOTO_CACHE.popitem(last=False)
+        total -= len(dropped)
+
+
+def _photo_media_type(blob: bytes) -> str | None:
+    for magic, media in _PHOTO_MAGIC:
+        if blob.startswith(magic):
+            return media
+    return None
+
+
+def _machine_photos_chat_id() -> int | None:
+    """Приватный канал-хранилище для загруженных из WebApp фотографий.
+
+    Прецедент — `BACKUP_TG_CHAT_ID`. Без переменной загрузка выключена: фото
+    по-прежнему можно прислать боту, поэтому это деградация функции, а не
+    поломка раздела.
+    """
+    raw = os.environ.get("MACHINE_PHOTOS_TG_CHAT_ID", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.error("MACHINE_PHOTOS_TG_CHAT_ID должен быть числом, получено: %r", raw)
+        return None
+
+
+@app.post("/api/machines/photo")
+async def api_machines_photo(request: Request):
+    """Отдать фотографию машины байтами.
+
+    `photo_id` ищем СРЕДИ ФОТО ЗАЯВЛЕННОЙ МАШИНЫ — это и есть защита от
+    подстановки чужого id: снимок обязан принадлежать той машине, к которой
+    у пользователя есть доступ.
+    """
+    from services import machines
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=_MACHINE_ROLES,
+        rate_limit_scope="api_machines_photo",
+        rate_limit_max=120,  # лента карточки — это десяток запросов подряд
+    )
+    machine_id = _machine_id_arg(data)
+    photo_id = _machine_id_arg(data, "photo_id")
+
+    photos = await machines.list_photos(machine_id)
+    photo = next((p for p in photos if int(p["id"]) == photo_id), None)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Фото не найдено")
+
+    headers = {
+        "Cache-Control": "private, max-age=600",
+        "X-Content-Type-Options": "nosniff",
+    }
+    cached = _photo_cache_get(str(photo["file_unique_id"]))
+    if cached is not None:
+        return Response(cached, media_type=_photo_media_type(cached) or "image/jpeg", headers=headers)
+
+    try:
+        bot = await get_notify_bot()
+        meta = await bot.get_file(str(photo["tg_file_id"]))
+        if (meta.file_size or 0) > _PHOTO_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="Фото слишком большое")
+        buf = await bot.download_file(meta.file_path)
+        blob = buf.read() if hasattr(buf, "read") else bytes(buf)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Протухший file_id, удалённое сообщение, сбой сети — это «фото сейчас
+        # недоступно», а не поломка сервера: 500 поднял бы тревогу на ровном
+        # месте. Текст исключения aiogram может содержать токен (он входит в
+        # URL файлового API), поэтому в лог он идёт только через redact_token.
+        logger.warning(
+            "Не удалось отдать фото #%s машины #%s: %s",
+            photo_id, machine_id, redact_token(repr(e)),
+        )
+        raise HTTPException(status_code=404, detail="Фото недоступно")
+
+    _photo_cache_put(str(photo["file_unique_id"]), blob)
+    return Response(blob, media_type=_photo_media_type(blob) or "image/jpeg", headers=headers)
+
+
+@app.post("/api/machines/photo_upload")
+async def api_machines_photo_upload(request: Request):
+    """Загрузить фотографию машины из WebApp.
+
+    Приходит data-URL (base64), а не multipart: `python-multipart` в
+    зависимостях нет, и `UploadFile`/`Form` без него роняют приложение на
+    старте. JSON заодно сохраняет единый контракт `_authorize(data)`. Раздувание
+    base64 на треть безболезненно — браузер ужимает снимок canvas'ом до
+    отправки.
+
+    Файл кладём в приватный канал и храним только идентификаторы: своего
+    стореджа у нас нет и заводить его ради десятка снимков незачем.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_MACHINE_ROLES,
+        rate_limit_scope="api_machines_photo_upload",
+        rate_limit_max=20,
+    )
+    machine_id = _machine_id_arg(data)
+    chat_id = _machine_photos_chat_id()
+    if chat_id is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Загрузка фото не настроена: нет MACHINE_PHOTOS_TG_CHAT_ID. "
+                   "Пришлите фото боту.",
+        )
+
+    raw = str(data.get("data_url") or "")
+    if not raw.startswith("data:image/"):
+        raise HTTPException(status_code=400, detail="Ожидается изображение")
+    if "," not in raw:
+        raise HTTPException(status_code=400, detail="Повреждённое изображение")
+    # Оценка размера ДО декодирования: base64 длиннее оригинала на треть, и
+    # декодировать 40 МБ мусора, чтобы потом его отвергнуть, незачем.
+    payload = raw.split(",", 1)[1]
+    if len(payload) > _PHOTO_MAX_BYTES * 4 // 3 + 1024:
+        raise HTTPException(status_code=413, detail="Фото больше 5 МБ")
+    try:
+        blob = base64.b64decode(payload, validate=True)
+    except (ValueError, binascii.Error):
+        raise HTTPException(status_code=400, detail="Повреждённое изображение")
+    if len(blob) > _PHOTO_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Фото больше 5 МБ")
+    if _photo_media_type(blob) is None:
+        raise HTTPException(status_code=400, detail="Поддерживаются JPEG и PNG")
+
+    machine = await machines.get_machine(machine_id, role=get_role(user["id"]))
+    if not machine:
+        raise HTTPException(status_code=404, detail="Машина не найдена")
+
+    caption = (str(data.get("caption") or "")).strip()[:200]
+    try:
+        from aiogram.types import BufferedInputFile
+
+        bot = await get_notify_bot()
+        sent = await bot.send_photo(
+            chat_id,
+            BufferedInputFile(blob, filename=f"machine-{machine_id}.jpg"),
+            caption=f"#{machine_id} {machine.get('vin') or ''} {caption}".strip()[:1024],
+        )
+    except Exception as e:
+        logger.warning("Не удалось загрузить фото машины #%s: %s", machine_id, redact_token(repr(e)))
+        raise HTTPException(status_code=502, detail="Telegram не принял фото, попробуйте ещё раз")
+
+    # Берём самый крупный размер: Telegram отдаёт лесенку превью, и первый
+    # элемент — миниатюра ~90px, из которой карточку не рассмотреть.
+    best = max(sent.photo or [], key=lambda p: (p.width or 0) * (p.height or 0), default=None)
+    if best is None:
+        raise HTTPException(status_code=502, detail="Telegram не вернул файл")
+    res = await machines.add_photo(
+        machine_id,
+        tg_file_id=best.file_id,
+        file_unique_id=best.file_unique_id,
+        uploaded_by=user["id"],
+        caption=caption or None,
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/photo_delete")
+async def api_machines_photo_delete(request: Request):
+    """Открепить фотографию от машины. Только admin/boss.
+
+    Из Telegram файл не удаляем — там он и не мешает, а вот восстановить
+    случайно снятый снимок иначе было бы нечем.
+    """
+    from services import machines
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_photo_delete"
+    )
+    machine_id = _machine_id_arg(data)
+    photo_id = _machine_id_arg(data, "photo_id")
+    photos = await machines.list_photos(machine_id)
+    if not any(int(p["id"]) == photo_id for p in photos):
+        raise HTTPException(status_code=404, detail="Фото не найдено")
+    res = await machines.delete_photo(photo_id)
+    if not res.get("ok"):
+        raise HTTPException(status_code=404, detail="Фото не найдено")
+    return JSONResponse({"ok": True, "photo_id": photo_id})
 
 
 @app.post("/api/users/deactivate")

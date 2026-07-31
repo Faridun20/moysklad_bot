@@ -313,6 +313,85 @@ describe('техника: формы', () => {
   });
 });
 
+describe('техника: фотографии', () => {
+  const CARD = (over = {}) => ({
+    ok: true,
+    machine: { id: 7, name: 'JCB 3CX', vin: 'JCB7788', status: 'in_stock' },
+    photos: [{ id: 11, caption: 'перед', sort_order: 0, uploaded_at: '' }],
+    hours: [], deals: [], next_statuses: [], can_manage: true,
+    can_upload_photo: true, status_labels: {},
+    ...over,
+  });
+  const bootCard = (card) => boot(`
+    currentUser = { role: 'boss' };
+    window.__revoked = [];
+    URL.createObjectURL = () => 'blob:photo-' + Math.random();
+    URL.revokeObjectURL = (u) => window.__revoked.push(u);
+    window.fetch = async () => ({ ok: true, blob: async () => ({}) });
+    api = async () => (${JSON.stringify(card)});
+    window.__ready = renderMachineCard(7);
+  `);
+
+  it('blob-URL освобождаются — иначе снимки копятся в памяти WebView', () => {
+    const window = boot(`
+      window.__revoked = [];
+      URL.revokeObjectURL = (u) => window.__revoked.push(u);
+      _machinePhotoUrls = ['blob:a', 'blob:b'];
+      revokeMachinePhotoUrls();
+      window.__left = _machinePhotoUrls.length;
+    `);
+    expect(window.__revoked).toEqual(['blob:a', 'blob:b']);
+    expect(window.__left).toBe(0);   // повторный revoke не должен их отзывать снова
+  });
+
+  it('повторный рендер карточки освобождает прошлые снимки', async () => {
+    const window = bootCard(CARD());
+    await window.__ready;
+    await new Promise(r => setTimeout(r, 0));
+    const before = window.__revoked.length;
+    await window.renderMachineCard(7);
+    expect(window.__revoked.length).toBeGreaterThan(before);
+  });
+
+  it('кнопку загрузки не рисуем, если канал-хранилище не настроен', async () => {
+    const window = bootCard(CARD({ can_upload_photo: false }));
+    await window.__ready;
+    expect(window.document.querySelector('#machine-photo-add')).toBeNull();
+    // Сами фото при этом показываются: отдача от загрузки не зависит.
+    expect(window.document.querySelector('.machine-photo')).not.toBeNull();
+  });
+
+  it('фото тянутся POST-запросом, а не прямой ссылкой Telegram', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__fetched = [];
+      URL.createObjectURL = () => 'blob:x';
+      URL.revokeObjectURL = () => {};
+      window.fetch = async (path, opts) => { window.__fetched.push([path, opts.method]); return { ok: true, blob: async () => ({}) }; };
+      api = async () => (${JSON.stringify(CARD())});
+      window.__ready = renderMachineCard(7);
+    `);
+    await window.__ready;
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__fetched[0]).toEqual(['/api/machines/photo', 'POST']);
+  });
+
+  it('недоступное фото убирает плитку, а не ломает ленту', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      URL.createObjectURL = () => 'blob:x';
+      URL.revokeObjectURL = () => {};
+      window.fetch = async () => ({ ok: false, status: 404 });
+      api = async () => (${JSON.stringify(CARD())});
+      window.__ready = renderMachineCard(7);
+    `);
+    await window.__ready;
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.document.querySelector('.machine-photo')).toBeNull();
+    expect(window.document.getElementById('content').textContent).toContain('JCB 3CX');
+  });
+});
+
 describe('курсы валют: «Сохранить» действительно отправляет курс', () => {
   // Регресс: обработчик поднимался от кнопки к `.debt-card`, которого после
   // пересборки экрана на дизайн-систему в разметке курсов нет. closest отдавал

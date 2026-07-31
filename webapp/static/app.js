@@ -1033,8 +1033,118 @@ function machineActionsHtml(m, card) {
   return `<div class="c-actions c-actions--wrap">${buttons.join('')}</div>`;
 }
 
+// ─── Фотографии машины ──────────────────────────────
+// Файл едет через нашу ручку (`POST` + initData), поэтому <img src> сюда не
+// годится: прямая ссылка Telegram содержит токен бота, а браузер не умеет
+// POST'ить за картинкой. Тянем байты fetch'ем и показываем как blob-URL.
+//
+// Blob-URL живёт до закрытия документа: без revoke каждая пересборка карточки
+// оставляет копию снимка в памяти WebView, и за сессию их накапливаются
+// десятки мегабайт.
+let _machinePhotoUrls = [];
+
+function revokeMachinePhotoUrls() {
+  for (const url of _machinePhotoUrls) {
+    try { URL.revokeObjectURL(url); } catch { /* уже отозван */ }
+  }
+  _machinePhotoUrls = [];
+}
+
+function machinePhotosHtml(card) {
+  const photos = card.photos || [];
+  const upload = card.can_upload_photo
+    ? `<button class="btn-secondary" id="machine-photo-add">${icon('plus')} Добавить фото</button>`
+    : '';
+  if (!photos.length) {
+    return upload
+      ? `<div class="section-label">Фото</div><div class="c-actions">${upload}</div>`
+      : '';
+  }
+  const strip = photos.map(p =>
+    `<button class="machine-photo" data-photo="${p.id}" aria-label="${escapeHtml(p.caption || 'Фото машины')}">` +
+    `<img alt="${escapeHtml(p.caption || '')}" loading="lazy"></button>`
+  ).join('');
+  return `<div class="section-label">Фото · ${photos.length}</div>
+    <div class="machine-photos">${strip}</div>
+    ${upload ? `<div class="c-actions">${upload}</div>` : ''}`;
+}
+
+async function loadMachinePhotos(machineId, root) {
+  for (const btn of (root || document).querySelectorAll('.machine-photo[data-photo]')) {
+    try {
+      const r = await fetch('/api/machines/photo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initData: _initData, machine_id: machineId, photo_id: Number(btn.dataset.photo) }),
+      });
+      if (!r.ok) throw new Error('нет фото');
+      const url = URL.createObjectURL(await r.blob());
+      _machinePhotoUrls.push(url);
+      const img = btn.querySelector('img');
+      if (img) img.src = url;
+    } catch {
+      // Одно недоступное фото не должно ронять ленту — прячем плитку.
+      btn.remove();
+    }
+  }
+}
+
+// Ужимаем снимок ДО отправки: телефонные 3–5 МБ упираются в лимит ручки, а на
+// экране всё равно видно не больше 1600px по длинной стороне.
+function shrinkImage(file, maxSide = 1600, quality = 0.8) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Не удалось прочитать файл'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('Это не изображение'));
+      img.onload = () => {
+        const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+        canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function pickMachinePhoto(machineId) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/*';
+  input.addEventListener('change', async () => {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    toast('Загружаю фото…', 'info');
+    let dataUrl;
+    try {
+      dataUrl = await shrinkImage(file);
+    } catch (e) {
+      tg.showAlert ? tg.showAlert(e.message) : alert(e.message);
+      return;
+    }
+    const res = await apiResult('/api/machines/photo_upload', {
+      machine_id: machineId, data_url: dataUrl,
+    });
+    if (!res.ok) {
+      tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+      return;
+    }
+    haptic('success');
+    toast(res.body.duplicate ? 'Это фото уже есть' : 'Фото добавлено');
+    renderMachineCard(machineId);
+  });
+  input.click();
+}
+
 async function renderMachineCard(machineId) {
   const content = document.getElementById('content');
+  // Прошлые снимки больше не на экране — их blob-URL'ы держат память WebView.
+  revokeMachinePhotoUrls();
   content.innerHTML = skeleton('label') + skeleton('list', 5);
   setScreenContext('Техника · карточка');
   showBack(() => { ordersSubTab = 'machines'; showScreen('orders'); });
@@ -1051,9 +1161,16 @@ async function renderMachineCard(machineId) {
     <div class="section-label">${escapeHtml(m.name || 'Машина')}</div>
     ${machineFactsHtml(m, card)}
     ${machineActionsHtml(m, card)}
+    ${machinePhotosHtml(card)}
     ${machineHoursHtml(card.hours)}
     ${machineDealsHtml(card.deals)}
   `;
+
+  content.querySelector('#machine-photo-add')?.addEventListener('click', () => {
+    haptic('light');
+    pickMachinePhoto(machineId);
+  });
+  loadMachinePhotos(machineId, content);
 
   content.querySelectorAll('[data-mact]').forEach(btn => {
     btn.addEventListener('click', () => {
