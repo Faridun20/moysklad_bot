@@ -307,7 +307,10 @@
       `aria-pressed="${activeId === p.id}">${escapeHtml(p.label)}</button>`
     ).join('');
     return (
-      `<div class="seg-row"><div class="seg">${seg}</div>` +
+      // UI-BUG-01: именно `seg--scroll` — у периода четыре пункта плюс
+      // доп-кнопка справа, и на 360dp они не влезают. Без варианта подписи
+      // резались.
+      `<div class="seg-row"><div class="seg seg--scroll">${seg}</div>` +
       `<button class="seg-aux ${customActive ? 'active' : ''}" ${attr}="custom" ` +
       `aria-pressed="${customActive}">${icon('clock')} ${escapeHtml(customLabel || 'Период…')}</button></div>`
     );

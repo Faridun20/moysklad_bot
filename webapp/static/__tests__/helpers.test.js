@@ -19,6 +19,19 @@ describe('periodSegHtml (WP-29)', () => {
     expect(html).toContain('class="seg-item active" data-period="month"');
     expect(html).toContain('data-period="custom"');
   });
+  it('трек скроллится, а не сплющивает подписи (UI-BUG-01)', () => {
+    // Без seg--scroll пункты делят ширину поровну: на 360dp под текст остаётся
+    // ~33px, и «Всё время» резалось с двух сторон без многоточия.
+    const html = periodSegHtml(presets, 'month', 'data-period', false, 'Период…');
+    expect(html).toContain('seg seg--scroll');
+  });
+
+  it('aria-pressed отражает выбранный пресет, а не только класс', () => {
+    const html = periodSegHtml(presets, 'week', 'data-period', false, 'Период…');
+    expect(html).toContain('data-period="week" aria-pressed="true"');
+    expect(html).toContain('data-period="month" aria-pressed="false"');
+  });
+
   it('custom активен → подпись диапазона на доп-кнопке', () => {
     const html = periodSegHtml(presets, 'custom', 'data-operiod', true, '01.06—12.06');
     expect(html).toContain('data-operiod="custom"');
