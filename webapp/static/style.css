@@ -508,6 +508,7 @@ body {
 .agent-row,
 .order-card,
 .debt-card,
+.debt-stat,
 .editor-item,
 .search-item,
 .stat {
@@ -552,6 +553,10 @@ body {
 }
 .c-row[role="button"]:active,
 .c-row--tap:active { background: var(--bg-soft); }
+
+/* Строка-форма (редактор курса/лимита прямо в списке): инпут занимает
+   свободное место, кнопка прижата вправо. */
+.c-row > .form-input { flex: 1; min-width: 0; }
 
 /* ─── Card ────────────────────────────────────────────────────── */
 .card {
@@ -1413,30 +1418,21 @@ body {
 }
 /* Фильтр «Все / К оплате сейчас» — тот же сегмент-язык, что .seg
    (трек-подложка + активный сегмент как приподнятая карточка). */
-.debts-tabs {
-  display: flex; gap: 4px;
-  background: var(--bg-soft); border-radius: 14px; padding: 4px;
-}
-.debts-tab {
-  flex: 1; padding: 10px; border: 0; border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-mute); font-size: 14px; font-weight: 600;
-  cursor: pointer; font-family: inherit;
-  transition: background 0.15s ease, color 0.15s ease;
-}
-.debts-tab.active {
-  background: var(--bg-card); color: var(--text); box-shadow: var(--shadow-card);
-}
+/* UI-WP-22: .debts-tabs/.debts-tab были дословным клоном .seg/.seg-item —
+   тот же трек, радиус, активный элемент с тенью. Удалены, вкладки долгов
+   используют общий сегмент. */
 .debts-summary {
   padding: 0 14px;
   margin-top: 12px;           /* воздух от money-summary сверху */
   display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
   gap: 10px;
 }
+/* UI-WP-22: плитка сводки — та же карточная поверхность, что у .stat;
+   собственными остаются только выравнивание и цвет цифры по срочности. */
 .debt-stat {
-  padding: 14px 8px;          /* чуть выше, чтобы цифры дышали */
-  border-radius: var(--radius-chip); text-align: center;
-  background: var(--bg-card);
+  padding: 14px var(--sp-2);
+  border-radius: var(--radius-chip);
+  text-align: center;
 }
 .debt-stat-num { font-size: 24px; font-weight: 700; line-height: 1.1; }
 .debt-stat-label { font-size: 12px; color: var(--text-mute); margin: 6px 0 4px; }

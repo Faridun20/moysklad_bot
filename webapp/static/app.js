@@ -2843,7 +2843,7 @@ async function renderCashbox(container, section) {
   const canReturn = ['admin', 'boss', 'warehouse_keeper', 'manager'].includes(role);
   const returnBlock = canReturn ? `
       <div class="section-label">Оформить возврат</div>
-      <div class="card">
+      <div class="c-surface c-surface--pad">
         <div class="form-row">
           <label class="form-label">Номер заказа</label>
           <input type="number" id="ret-order" class="form-input" placeholder="142" inputmode="numeric">
@@ -3167,34 +3167,34 @@ async function renderClients(container) {
     return 'долг ' + items.map(x => `${fmt(x.amount)} ${escapeHtml(x.currency)}`).join(' · ');
   };
   const cards = clients.map(c => `
-      <div class="debt-card" data-agent="${escapeHtml(c.agent_id)}" role="button" tabindex="0">
-        <div class="debt-card-top">
-          <div class="debt-agent">${icon('building')} ${escapeHtml(c.agent_name)}</div>
-          ${c.over_limit ? '<span class="stock-badge badge-red">лимит превышен</span>' : ''}
+      <div class="c-row c-row--tap" data-agent="${escapeHtml(c.agent_id)}" role="button" tabindex="0">
+        <div class="card-row-icon">${icon('building')}</div>
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(c.agent_name)}</div>
+          <div class="card-row-sub">${balStr(c.balance_cents)} · ${debtStr(c)} · лимит ${fmt(c.limit)} ${escapeHtml(baseC)}</div>
         </div>
-        <div class="debt-card-mid">
-          <span class="debt-meta">${balStr(c.balance_cents)} · ${debtStr(c)} · лимит ${fmt(c.limit)} ${escapeHtml(baseC)}</span>
-        </div>
+        ${c.over_limit ? '<span class="stock-badge" data-status="out">лимит превышен</span>' : ''}
       </div>`).join('');
   // T3.1: вход на экран курсов валют. Эндпоинты /api/currency/rates{,/set}
   // существовали, но фронт их не звал — курс можно было задать только через
   // /rates в боте. Отдельным подэкраном, а не пятой вкладкой: вкладок в
   // «Финансах» намеренно ≤4, чтобы ряд не переносился.
   const ratesEntry = `
-    <div class="debt-card" id="open-rates" role="button" tabindex="0">
-      <div class="debt-card-top">
-        <div class="debt-agent">${icon('card')} Курсы валют</div>
-      </div>
-      <div class="debt-card-mid">
-        <span class="debt-meta">Курс к базовой валюте — для сводок в разных валютах</span>
+    <div class="c-surface c-surface--list">
+      <div class="c-row c-row--tap" id="open-rates" role="button" tabindex="0">
+        <div class="card-row-icon">${icon('card')}</div>
+        <div class="card-row-info">
+          <div class="card-row-title">Курсы валют</div>
+          <div class="card-row-sub">Курс к базовой валюте — для сводок в разных валютах</div>
+        </div>
       </div>
     </div>`;
-  container.innerHTML = `${ratesEntry}<div class="section-label">Клиенты (${clients.length})</div><div class="debts-list">${cards}</div>`;
+  container.innerHTML = `${ratesEntry}<div class="section-label">Клиенты (${clients.length})</div><div class="c-surface c-surface--list">${cards}</div>`;
   container.querySelector('#open-rates')?.addEventListener('click', () => {
     haptic('light');
     renderCurrencyRates();
   });
-  container.querySelectorAll('.debt-card[data-agent]').forEach(card => {
+  container.querySelectorAll('[data-agent]').forEach(card => {
     card.addEventListener('click', () => { haptic('light'); renderAgentDetail(card.dataset.agent); });
   });
 }
@@ -3226,27 +3226,29 @@ async function renderCurrencyRates() {
     const code = String(r.currency_code || '').toUpperCase();
     const isBase = code === base;
     const upd = r.updated_at ? String(r.updated_at).slice(0, 16) : '—';
+    // Строка курса + (для админа/босса) редактор под ней в той же поверхности.
     return `
-      <div class="debt-card" data-rate="${escapeHtml(code)}">
-        <div class="debt-card-top">
-          <div class="debt-agent">${escapeHtml(code)}</div>
-          <div class="debt-amount">${isBase ? 'базовая' : escapeHtml(String(r.rate_to_base))}</div>
+      <div class="c-row" data-rate="${escapeHtml(code)}">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(code)}</div>
+          <div class="card-row-sub">1 ${escapeHtml(code)} = ${escapeHtml(String(r.rate_to_base))} ${escapeHtml(base)} · обновлён ${escapeHtml(upd)}</div>
         </div>
-        <div class="debt-card-mid">
-          <span class="debt-meta">1 ${escapeHtml(code)} = ${escapeHtml(String(r.rate_to_base))} ${escapeHtml(base)} · обновлён ${escapeHtml(upd)}</span>
-        </div>
-        ${canEdit && !isBase ? `
-          <div class="limit-edit">
-            <input type="number" step="any" class="form-input rate-input"
-                   value="${escapeHtml(String(r.rate_to_base))}" inputmode="decimal">
-            <button class="btn-confirm-pay rate-save" data-code="${escapeHtml(code)}">Сохранить</button>
-          </div>` : ''}
-      </div>`;
+        <div class="card-row-value">${isBase ? 'базовая' : escapeHtml(String(r.rate_to_base))}</div>
+      </div>
+      ${canEdit && !isBase ? `
+        <div class="c-row">
+          <input type="number" step="any" class="form-input rate-input"
+                 value="${escapeHtml(String(r.rate_to_base))}" inputmode="decimal"
+                 aria-label="Курс ${escapeHtml(code)}">
+          <button class="btn-confirm-pay rate-save" data-code="${escapeHtml(code)}">Сохранить</button>
+        </div>` : ''}`;
   }).join('');
 
   content.innerHTML = `
     <div class="section-label">Курсы к ${escapeHtml(base)}</div>
-    ${rows || '<div class="empty-state"><div class="empty-state-title">Курсы не заданы</div></div>'}
+    ${rows
+      ? `<div class="c-surface c-surface--list">${rows}</div>`
+      : emptyState({ icon: 'card', title: 'Курсы не заданы', hint: 'Добавьте курс — сводки в разных валютах считаются через него.' })}
     ${canEdit ? '' : '<div class="debt-meta">Изменять курсы может админ или руководитель.</div>'}
   `;
 
@@ -3305,29 +3307,29 @@ async function renderAgentDetail(agentId) {
   // Покупки из МС.
   const pur = d.purchases || {};
   const topRows = (pur.top_products || []).map(p =>
-    `<div class="stock-row"><div class="stock-info"><div class="stock-name">${escapeHtml(p.name)}</div>` +
-    `<div class="stock-folder">${fmt(p.qty)} шт · ${fmtCents(p.sum_cents)} ${escapeHtml(baseC)}</div></div></div>`
+    `<div class="c-row"><div class="card-row-info"><div class="card-row-title">${escapeHtml(p.name)}</div>` +
+    `<div class="card-row-sub">${fmt(p.qty)} шт · ${fmtCents(p.sum_cents)} ${escapeHtml(baseC)}</div></div></div>`
   ).join('');
   const recentRows = (pur.recent || []).map(r =>
-    `<div class="stock-row"><div class="stock-info"><div class="stock-name">${fmtCents(r.sum_cents)} ${escapeHtml(baseC)}</div>` +
-    `<div class="stock-folder">${escapeHtml(r.date || '')}</div></div></div>`
+    `<div class="c-row"><div class="card-row-info"><div class="card-row-title">${fmtCents(r.sum_cents)} ${escapeHtml(baseC)}</div>` +
+    `<div class="card-row-sub">${escapeHtml(r.date || '')}</div></div></div>`
   ).join('');
   const purBlock = pur.count
     ? `<div class="section-label">Покупки · ${pur.count} отгр. · ${fmtCents(pur.total_cents)} ${escapeHtml(baseC)}</div>`
-      + (topRows ? `<div class="stock-list">${topRows}</div>` : '')
-      + (recentRows ? `<div class="section-label">Последние отгрузки</div><div class="stock-list">${recentRows}</div>` : '')
+      + (topRows ? `<div class="c-surface c-surface--list">${topRows}</div>` : '')
+      + (recentRows ? `<div class="section-label">Последние отгрузки</div><div class="c-surface c-surface--list">${recentRows}</div>` : '')
     : '<div class="section-label">Покупки</div><div class="loader">Покупок в МойСклад нет</div>';
 
   // Заказы в боте.
   const orders = d.orders || [];
   const ordersRows = orders.map(o =>
-    `<div class="stock-row"><div class="stock-info">` +
-    `<div class="stock-name">#${o.id} · ${fmtCents(o.total_cents)} ${escapeHtml(o.currency || baseC)}</div>` +
-    `<div class="stock-folder">${escapeHtml(o.status || '')} · ${escapeHtml((o.created_at || '').slice(0, 16))}</div>` +
+    `<div class="c-row" data-status="${escapeHtml(o.status || '')}"><div class="card-row-info">` +
+    `<div class="card-row-title">#${o.id} · ${fmtCents(o.total_cents)} ${escapeHtml(o.currency || baseC)}</div>` +
+    `<div class="card-row-sub">${escapeHtml(o.status || '')} · ${escapeHtml((o.created_at || '').slice(0, 16))}</div>` +
     `</div></div>`
   ).join('');
   const ordersBlock = orders.length
-    ? `<div class="section-label">Заказы в боте · ${orders.length}</div><div class="stock-list">${ordersRows}</div>`
+    ? `<div class="section-label">Заказы в боте · ${orders.length}</div><div class="c-surface c-surface--list">${ordersRows}</div>`
     : '<div class="section-label">Заказы в боте</div><div class="loader">Заказов нет</div>';
 
   // Лимит правится только у контрагента с заказами (эндпоинт credit/set это гейтит).
@@ -3344,7 +3346,8 @@ async function renderAgentDetail(agentId) {
   content.innerHTML = `
     <div class="editor-header"><div class="editor-title">${icon('building')} ${escapeHtml(d.name || '—')}</div></div>
     ${d.phone ? `<div class="debt-meta agent-phone">${icon('phone')} ${escapeHtml(d.phone)}</div>` : ''}
-    <div class="card">
+    <div class="section-label">Взаиморасчёты</div>
+    <div class="c-surface c-surface--pad">
       <div class="agent-bal">${balLine}</div>
       <div class="debt-meta">Долг по заказам бота: <b>${fmt(d.debt)} ${escapeHtml(baseC)}</b> · лимит ${fmt(d.limit)} · свободно ${fmt(d.free)}</div>
       ${limitBlock}
@@ -3435,9 +3438,9 @@ async function renderDebts(container) {
 
     let html = `
       <div class="debts-header">
-        <div class="debts-tabs">
-          <button class="debts-tab ${debtsFilter === 'all' ? 'active' : ''}" data-f="all" aria-pressed="${debtsFilter === 'all'}">Все</button>
-          <button class="debts-tab ${debtsFilter === 'today' ? 'active' : ''}" data-f="today" aria-pressed="${debtsFilter === 'today'}">К оплате сейчас</button>
+        <div class="seg">
+          <button class="seg-item ${debtsFilter === 'all' ? 'active' : ''}" data-f="all" aria-pressed="${debtsFilter === 'all'}">Все</button>
+          <button class="seg-item ${debtsFilter === 'today' ? 'active' : ''}" data-f="today" aria-pressed="${debtsFilter === 'today'}">К оплате сейчас</button>
         </div>
       </div>
     `;
@@ -3600,7 +3603,7 @@ async function renderDebts(container) {
     container.innerHTML = html;
 
     // Tabs (фильтр all/today)
-    container.querySelectorAll('.debts-tab').forEach(t => {
+    container.querySelectorAll('.seg-item[data-f]').forEach(t => {
       t.addEventListener('click', () => {
         debtsFilter = t.dataset.f;
         renderDebts(container);
