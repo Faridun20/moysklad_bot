@@ -2414,10 +2414,14 @@ function renderAnalyticsContent(data) {
             <span class="rev-meta">${r.count} отгр. ${tS}</span>
           </div>`;
         }).join('')
-      : '<div class="money-placeholder">Нет продаж за период</div>';
+      : '';
     return `
       <div class="section-label">Выручка по валютам</div>
-      <div class="c-surface c-surface--pad">${revLines}</div>
+      ${revLines
+        // Пусто — это строка, а не поверхность: карточка с одной серой фразой
+        // внутри давала карточку-в-карточке на стыке со счётчиками.
+        ? `<div class="c-surface c-surface--pad">${revLines}</div>`
+        : '<div class="loader">Нет продаж за период</div>'}
       <div class="stat-grid">
         <div class="stat"><div class="stat-value">${data.count}</div><div class="stat-label">Отгрузок</div></div>
         <div class="stat"><div class="stat-value">${data.clients}</div><div class="stat-label">Клиентов</div></div>
