@@ -362,9 +362,9 @@ async function renderHome() {
   let heroDelta = `<div class="hero-delta">${data.today.shipments} отгр. · ${data.today.clients} клиентов</div>`;
   if (prevRev > 0) {
     const pct = Math.round((data.today.revenue - prevRev) / prevRev * 100);
-    const dir = pct > 0 ? 'up' : pct < 0 ? 'down' : '';
+    const dir = pct > 0 ? 'up' : pct < 0 ? 'down' : 'flat';
     const arrow = pct > 0 ? icon('trend-up') : pct < 0 ? icon('trend-down') : '';
-    heroDelta = `<div class="hero-delta ${dir}">${arrow} ${pct > 0 ? '+' : ''}${pct}% к вчера · ${data.today.shipments} отгр.</div>`;
+    heroDelta = `<div class="hero-delta" data-trend="${dir}">${arrow} ${pct > 0 ? '+' : ''}${pct}% к вчера · ${data.today.shipments} отгр.</div>`;
   }
   const hero = `
     <div class="hero">
@@ -417,72 +417,75 @@ async function renderHome() {
     </div>
   ` : '';
 
-  // ─── Босс: ожидающие заявки + лидерборд ─────────────
-  let bossBlock = '';
-  if (isBoss) {
-    // Дашборд «Требует внимания»: всё, что ждёт действия босса, одним блоком
-    // с переходом в нужный раздел. Показываем только ненулевое.
+  // ─── Две ветки главной (UI-WP-14) ───────────────────
+  // /api/home отдаёт РАЗНЫЕ данные менеджеру (свод по своим заказам) и
+  // руководству (что ждёт решения + лидерборд). Раньше обе ветки собирались
+  // одной разметкой с if-ами внутри, и по коду не было видно, какой экран
+  // получится. Теперь это отдельные функции: читаешь ту, чью роль отлаживаешь.
+
+  // Что ждёт решения: показываем только ненулевое, строка ведёт в свой раздел.
+  const attentionHtml = () => {
     const att = data.attention || {};
-    const attItems = [
+    const items = [
       { n: att.requests, label: 'Заявки на апрув', ic: 'clock', go: 'requests' },
       { n: att.payments, label: 'Платежи на подтверждении', ic: 'cash', go: 'finance:confirm' },
       { n: att.deposits, label: 'Сдачи на подтверждении', ic: 'cashbox', go: 'finance:confirm' },
       { n: att.returns, label: 'Возвраты на подтверждении', ic: 'return', go: 'finance:confirm' },
       { n: att.debts, label: 'Открытые долги', ic: 'wallet', go: 'finance:debts' },
     ].filter(x => x.n > 0);
-    if (attItems.length) {
-      bossBlock += `
-        <div class="section-label">Требует внимания</div>
-        <div class="card-list">
-          ${attItems.map(x => `
-            <div class="card-row" data-att="${x.go}" role="button" tabindex="0">
-              <div class="card-row-icon card-row-icon--warn">${icon(x.ic)}</div>
-              <div class="card-row-info"><div class="card-row-title">${x.label}</div></div>
-              <span class="stock-badge badge-yellow">${x.n}</span>
-            </div>
-          `).join('')}
-        </div>
-      `;
-    }
-    // Вход в полную операционную сводку (зависшие заявки, склад, cron, МС) —
-    // отдельный экран. Раньше это уходило дайджестом в Telegram.
-    bossBlock += `
-      <div class="section-label">Мониторинг</div>
-      <div class="card-list">
-        <div class="card-row" data-att="ops" role="button" tabindex="0">
-          <div class="card-row-icon">${icon('clock')}</div>
-          <div class="card-row-info">
-            <div class="card-row-title">Операционная сводка</div>
-            <div class="card-row-sub">Зависшие заявки · склад · синхронизация</div>
+    if (!items.length) return '';
+    return `
+      <div class="section-label">Требует внимания</div>
+      <div class="c-surface c-surface--list">
+        ${items.map(x => `
+          <div class="c-row c-row--tap" data-att="${x.go}" role="button" tabindex="0">
+            <div class="card-row-icon card-row-icon--warn">${icon(x.ic)}</div>
+            <div class="card-row-info"><div class="card-row-title">${x.label}</div></div>
+            <span class="stock-badge badge-yellow">${x.n}</span>
           </div>
-        </div>
+        `).join('')}
       </div>
     `;
-    const topEmp = data.top_employees || [];
-    if (topEmp.length > 0) {
-      bossBlock += `
-        <div class="section-label">Топ сотрудники · неделя</div>
-        <div class="card-list">
-          ${topEmp.map((e, i) => `
-            <div class="card-row card-row--static">
-              <div class="card-row-icon rank-chip">${i + 1}</div>
-              <div class="card-row-info">
-                <div class="card-row-title">${escapeHtml(e.name)}</div>
-                <div class="card-row-sub">${e.count} отгрузок</div>
-              </div>
-              <div>
-                <div class="card-row-value">${fmtCur(e.revenue)}</div>
-              </div>
-            </div>
-          `).join('')}
-        </div>
-      `;
-    }
-  }
+  };
 
-  // ─── Мои заказы (для менеджера и босса показываем его собственные) ─
-  let ordersBlock = '';
-  if (mo.total > 0) {
+  // Вход в полную операционную сводку — отдельный экран (раньше уходило
+  // дайджестом в Telegram).
+  const monitoringHtml = () => `
+    <div class="section-label">Мониторинг</div>
+    <div class="c-surface c-surface--list">
+      <div class="c-row c-row--tap" data-att="ops" role="button" tabindex="0">
+        <div class="card-row-icon">${icon('clock')}</div>
+        <div class="card-row-info">
+          <div class="card-row-title">Операционная сводка</div>
+          <div class="card-row-sub">Зависшие заявки · склад · синхронизация</div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const leaderboardHtml = () => {
+    const top = data.top_employees || [];
+    if (!top.length) return '';
+    return `
+      <div class="section-label">Топ сотрудники · неделя</div>
+      <div class="c-surface c-surface--list">
+        ${top.map((e, i) => `
+          <div class="c-row">
+            <div class="card-row-icon rank-chip">${i + 1}</div>
+            <div class="card-row-info">
+              <div class="card-row-title">${escapeHtml(e.name)}</div>
+              <div class="card-row-sub">${e.count} отгрузок</div>
+            </div>
+            <div><div class="card-row-value">${fmtCur(e.revenue)}</div></div>
+          </div>
+        `).join('')}
+      </div>
+    `;
+  };
+
+  // Свод по своим заказам — есть у обеих ролей (у руководства ниже лидерборда).
+  const myOrdersHtml = () => {
+    if (!(mo.total > 0)) return '';
     const statsRow = `
       <div class="stat-grid stat-grid--three">
         <div class="stat">
@@ -500,9 +503,9 @@ async function renderHome() {
       </div>
     `;
     const recentList = mo.recent.length > 0 ? `
-      <div class="card-list">
+      <div class="c-surface c-surface--list">
         ${mo.recent.map(o => `
-          <div class="card-row" data-order-id="${o.id}" role="button" tabindex="0">
+          <div class="c-row c-row--tap" data-order-id="${o.id}" role="button" tabindex="0">
             <div class="card-row-icon icon-${o.status}">${icon(STATUS_ICON[o.status] || 'list')}</div>
             <div class="card-row-info">
               <div class="card-row-title">${escapeHtml(o.agent_name || ('Заказ #' + o.id))}</div>
@@ -513,14 +516,14 @@ async function renderHome() {
         `).join('')}
       </div>
     ` : '';
-    ordersBlock = `
-      <div class="section-label">Мои заказы</div>
-      ${statsRow}
-      ${recentList}
-    `;
-  }
+    return `<div class="section-label">Мои заказы</div>${statsRow}${recentList}`;
+  };
 
-  content.innerHTML = greeting + hero + actions + linkWarning + bossBlock + ordersBlock;
+  const bossHome = () => attentionHtml() + monitoringHtml() + leaderboardHtml() + myOrdersHtml();
+  const managerHome = () => myOrdersHtml();
+
+  content.innerHTML =
+    greeting + hero + actions + linkWarning + (isBoss ? bossHome() : managerHome());
 
   // Action-grid → переход на нужный таб (и опционально открыть новый заказ)
   document.querySelectorAll('[data-go]').forEach(btn => {

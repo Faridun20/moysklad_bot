@@ -154,6 +154,7 @@
 @media (hover: hover) {
   .action-btn:hover,
   .card-row:hover,
+  .c-row--tap:hover,
   .btn-secondary:hover,
   .search-item:hover { background: var(--bg-soft); }
   .nav-item:hover:not(.active),
@@ -412,7 +413,12 @@ body {
 }
 .hero-delta .ic { --ic-size: 15px; vertical-align: 0; }
 
+/* UI-WP-11: направление тренда — data-атрибутом, тем же языком, что и
+   статусы (UI-WP-02). Классы .up/.down оставлены рабочими на переходный
+   период: hero рисуется в одном месте, но чип тренда переиспользуем в S5. */
+.hero-delta[data-trend="up"],
 .hero-delta.up   { background: rgba(255,255,255,0.25); }
+.hero-delta[data-trend="down"],
 .hero-delta.down { background: rgba(0,0,0,0.15); }
 
 /* ─── Action grid (4 кнопки в ряд, как у Wallet) ──────────────── */
@@ -450,9 +456,12 @@ body {
   background: var(--bg-soft);
 }
 
+/* UI-WP-12: 40 → 44px. Кнопка целиком и так ≥44px, но САМА иконка была
+   заметно меньше пальца, и промах по краю попадал в подпись. Подпись на
+   clamp() — вертикально место есть, перенос строки ей не грозит. */
 .action-btn-icon {
-  width: 40px;
-  height: 40px;
+  width: 44px;
+  height: 44px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -513,6 +522,7 @@ body {
 .card-list {
   padding: 0;
   overflow: hidden;
+  margin-bottom: var(--sp-2);
 }
 
 /* Самодостаточная карточка. */
@@ -548,7 +558,6 @@ body {
   margin-bottom: var(--sp-2);
 }
 
-.card-list { margin-bottom: var(--sp-2); }
 
 .card-row {
   display: flex;
