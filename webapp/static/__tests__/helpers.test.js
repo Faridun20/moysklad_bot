@@ -9,6 +9,7 @@ import helpers from '../helpers.js';
 const {
   escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml,
   parsePaymentItems, renderMoneyTotalsHtml, financeTabs, balanceParts, periodSegHtml,
+  formatMoney, msBalanceLabel, emptyState, skeleton, errorBoxHtml,
 } = helpers;
 
 describe('periodSegHtml (WP-29)', () => {
@@ -153,7 +154,7 @@ describe('renderOpsSummaryHtml', () => {
     expect(html).toContain('Зависшие заявки');
     expect(html).toContain('#7');
     expect(html).toContain('Acme');
-    expect(html).toContain('badge-yellow">2<');
+    expect(html).toContain('data-status="low">2<');  // UI-WP-29: критичность атрибутом
     expect(html).not.toContain('Сдачи'); // count 0 — секции нет
   });
 
@@ -177,7 +178,8 @@ describe('renderOpsSummaryHtml', () => {
       } },
     });
     expect(html).toContain('Рассинхрон с МойСклад');
-    expect(html).toContain('badge-yellow">4<'); // 1 + 2 + 1
+    // Рассинхрон с МС — «плохо», а не «внимание»: учёт разошёлся с реальностью.
+    expect(html).toContain('data-status="out">4<'); // 1 + 2 + 1
     expect(html).toContain('Статус застрял · #5');
   });
 });
@@ -289,5 +291,129 @@ describe('financeTabs', () => {
       expect(k).not.toContain('overview');
       expect(k).not.toContain('my');
     }
+  });
+});
+
+describe('formatMoney (UI-WP-05)', () => {
+  // toLocaleString разделяет разряды НЕразрывным пробелом (U+00A0/U+202F).
+  // Нам важна группировка, а не кодпойнт пробела, — нормализуем.
+  const norm = (s) => String(s).replace(/[  ]/g, ' ');
+
+  it('форматирует тысячи по-русски и клеит валюту через пробел', () => {
+    expect(norm(formatMoney(1234567, 'USD'))).toBe('1 234 567 USD');
+  });
+
+  it('округляет: копейки в списках только шумят', () => {
+    expect(norm(formatMoney(1234.56))).toBe('1 235');
+  });
+
+  it('без валюты отдаёт только число — вызывающий клеит сам', () => {
+    expect(formatMoney(500)).toBe('500');
+  });
+
+  it('не печатает NaN/Infinity в интерфейс', () => {
+    expect(formatMoney(NaN, 'USD')).toBe('—');
+    expect(formatMoney(Infinity)).toBe('—');
+    expect(formatMoney(undefined)).toBe('—');
+  });
+
+  it('ноль — это сумма, а не пустое место', () => {
+    expect(formatMoney(0, 'UZS')).toBe('0 UZS');
+  });
+});
+
+describe('msBalanceLabel (UI-WP-05)', () => {
+  it('отрицательный баланс МС = клиент должен нам', () => {
+    const b = msBalanceLabel(-125000, 'USD');
+    expect(b.tone).toBe('owe');
+    expect(b.text).toContain('должен');
+    expect(b.text).toContain('USD');
+  });
+
+  it('положительный баланс = аванс', () => {
+    expect(msBalanceLabel(50000, 'USD').tone).toBe('advance');
+  });
+
+  it('ноль отличается от «нет данных»', () => {
+    expect(msBalanceLabel(0, 'USD').tone).toBe('zero');
+    expect(msBalanceLabel(null, 'USD').tone).toBe('none');
+    expect(msBalanceLabel(null, 'USD').text).toBe('—');
+  });
+
+  it('подпись одна и та же для обоих экранов — расхождения формулировок больше нет', () => {
+    const fromClients = msBalanceLabel(-1000, 'USD');
+    const fromDetail = msBalanceLabel(-1000, 'USD');
+    expect(fromClients.text).toBe(fromDetail.text);
+  });
+});
+
+describe('emptyState (UI-WP-09)', () => {
+  it('собирает иконку, заголовок и подсказку в одном порядке', () => {
+    const html = emptyState({ icon: 'box', title: 'Нет заказов', hint: 'Создайте первый' });
+    expect(html.indexOf('empty-state-icon')).toBeLessThan(html.indexOf('empty-state-title'));
+    expect(html.indexOf('empty-state-title')).toBeLessThan(html.indexOf('empty-state-hint'));
+    expect(html).toContain('Нет заказов');
+  });
+
+  it('без подсказки и кнопки не оставляет пустых блоков', () => {
+    const html = emptyState({ icon: 'box', title: 'Пусто' });
+    expect(html).not.toContain('empty-state-hint');
+    expect(html).not.toContain('<button');
+  });
+
+  it('экранирует данные — заголовок может прийти из ответа API', () => {
+    const html = emptyState({ title: '<img src=x onerror=alert(1)>' });
+    expect(html).not.toContain('<img');
+    expect(html).toContain('&lt;img');
+  });
+
+  it('кнопка действия получает свой обработчик', () => {
+    expect(emptyState({ title: 'X', action: { label: 'Обновить', onclick: 'location.reload()' } }))
+      .toContain('onclick="location.reload()"');
+    expect(emptyState({ title: 'X', action: { label: 'Ещё', id: 'load-more' } }))
+      .toContain('id="load-more"');
+  });
+});
+
+describe('skeleton (UI-WP-09)', () => {
+  it('список даёт запрошенное число строк', () => {
+    expect((skeleton('list', 4).match(/sk-card/g) || []).length).toBe(4);
+  });
+
+  it('сетка быстрых действий — всегда четыре плитки', () => {
+    expect((skeleton('grid4').match(/sk-action/g) || []).length).toBe(4);
+  });
+
+  it('неизвестный вид не роняет экран, а даёт нейтральную заглушку', () => {
+    expect(skeleton('чего-то-нет')).toContain('sk-card');
+  });
+
+  it('нулевой и отрицательный размер списка не дают пустоту', () => {
+    expect((skeleton('list', 0).match(/sk-card/g) || []).length).toBe(1);
+    expect((skeleton('list', -3).match(/sk-card/g) || []).length).toBe(1);
+  });
+});
+
+describe('errorBoxHtml (UI-WP-09)', () => {
+  it('показывает текст ошибки сервера', () => {
+    const html = errorBoxHtml('500 Internal Server Error');
+    expect(html).toContain('Не удалось загрузить');
+    expect(html).toContain('500 Internal Server Error');
+  });
+
+  it('офлайн объясняет причину вместо технического текста', () => {
+    const html = errorBoxHtml('Нет подключения к интернету');
+    expect(html).toContain('Нет подключения');
+    expect(html).toContain('Проверьте интернет');
+    expect(html).not.toContain('к интернету<');
+  });
+
+  it('экранирует сообщение — оно приходит с сервера', () => {
+    expect(errorBoxHtml('<script>alert(1)</script>')).not.toContain('<script>');
+  });
+
+  it('кнопку повтора можно привязать к своему обработчику', () => {
+    expect(errorBoxHtml('x', { retryAttr: 'onclick="reload()"' })).toContain('onclick="reload()"');
+    expect(errorBoxHtml('x', { retry: false })).not.toContain('Повторить');
   });
 });

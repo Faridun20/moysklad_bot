@@ -100,13 +100,12 @@ function renderNoAccess() {
   const sb = document.getElementById('search-btn');
   if (sb) sb.classList.add('hidden');
   const content = document.getElementById('content');
-  content.innerHTML = `
-    <div class="empty-state">
-      <div class="empty-state-icon">${icon('lock')}</div>
-      <div class="empty-state-title">Доступ не выдан</div>
-      <div class="empty-state-hint">Ваш аккаунт пока без прав. Попросите администратора назначить роль — затем откройте приложение снова.</div>
-      <button class="btn-primary" onclick="location.reload()">Обновить</button>
-    </div>`;
+  content.innerHTML = emptyState({
+    icon: 'lock',
+    title: 'Доступ не выдан',
+    hint: 'Ваш аккаунт пока без прав. Попросите администратора назначить роль — затем откройте приложение снова.',
+    action: { label: 'Обновить', onclick: 'location.reload()' },
+  });
 }
 
 // ─── Инициализация ──────────────────────────────────
@@ -192,21 +191,11 @@ function showError(msg) {
 // PR E: единый error-блок с кнопкой «Повторить». Раньше экраны при сбое
 // показывали голый текст без способа повторить (кроме ре-навигации).
 // Retry перезагружает текущий экран через showScreen(currentScreen).
+// UI-WP-09: разметка и различение «офлайн / ошибка сервера» переехали в
+// helpers.js (тестируются юнитами). Здесь остаётся только то, что специфично
+// для приложения — как именно перезагрузить текущий экран.
 function errorBox(msg) {
-  // Различаем «нет сети» и «ошибка сервера»: при офлайне нет смысла показывать
-  // технический detail — даём понятную причину и подсказку. api() при сетевом
-  // сбое кидает именно это сообщение; плюс страхуемся navigator.onLine.
-  const offline = (typeof navigator !== 'undefined' && navigator.onLine === false)
-    || msg === 'Нет подключения к интернету';
-  const title = offline ? 'Нет подключения' : 'Не удалось загрузить';
-  const body = offline ? 'Проверьте интернет и попробуйте снова.' : escapeHtml(msg);
-  return `
-    <div class="error-card">
-      <div class="error-icon">${icon('alert')}</div>
-      <div class="error-title">${title}</div>
-      <div class="error-body">${body}</div>
-      <button class="btn-primary" onclick="showScreen(currentScreen)">Повторить</button>
-    </div>`;
+  return errorBoxHtml(msg, { retryAttr: 'onclick="showScreen(currentScreen)"' });
 }
 
 // ─── Навигация ──────────────────────────────────────
@@ -331,10 +320,10 @@ async function renderOrdersScreen() {
 async function renderHome() {
   const content = document.getElementById('content');
   content.innerHTML = `
-    <div class="sk sk-hero"></div>
-    <div class="sk-grid">${Array(4).fill('<div class="sk sk-action"></div>').join('')}</div>
-    <div class="sk sk-label"></div>
-    ${Array(3).fill('<div class="sk sk-card"></div>').join('')}
+    ${skeleton('hero')}
+    ${skeleton('grid4')}
+    ${skeleton('label')}
+    ${skeleton('list', 3)}
   `;
 
   let data;
@@ -355,7 +344,7 @@ async function renderHome() {
   }
 
   const cur = data.currency || 'USD';
-  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   const fmtCur = n => `${fmt(n)} ${cur}`;
   const isBoss = data.role === 'admin' || data.role === 'boss';
   const mo = data.my_orders;
@@ -373,9 +362,9 @@ async function renderHome() {
   let heroDelta = `<div class="hero-delta">${data.today.shipments} отгр. · ${data.today.clients} клиентов</div>`;
   if (prevRev > 0) {
     const pct = Math.round((data.today.revenue - prevRev) / prevRev * 100);
-    const dir = pct > 0 ? 'up' : pct < 0 ? 'down' : '';
+    const dir = pct > 0 ? 'up' : pct < 0 ? 'down' : 'flat';
     const arrow = pct > 0 ? icon('trend-up') : pct < 0 ? icon('trend-down') : '';
-    heroDelta = `<div class="hero-delta ${dir}">${arrow} ${pct > 0 ? '+' : ''}${pct}% к вчера · ${data.today.shipments} отгр.</div>`;
+    heroDelta = `<div class="hero-delta" data-trend="${dir}">${arrow} ${pct > 0 ? '+' : ''}${pct}% к вчера · ${data.today.shipments} отгр.</div>`;
   }
   const hero = `
     <div class="hero">
@@ -428,72 +417,75 @@ async function renderHome() {
     </div>
   ` : '';
 
-  // ─── Босс: ожидающие заявки + лидерборд ─────────────
-  let bossBlock = '';
-  if (isBoss) {
-    // Дашборд «Требует внимания»: всё, что ждёт действия босса, одним блоком
-    // с переходом в нужный раздел. Показываем только ненулевое.
+  // ─── Две ветки главной (UI-WP-14) ───────────────────
+  // /api/home отдаёт РАЗНЫЕ данные менеджеру (свод по своим заказам) и
+  // руководству (что ждёт решения + лидерборд). Раньше обе ветки собирались
+  // одной разметкой с if-ами внутри, и по коду не было видно, какой экран
+  // получится. Теперь это отдельные функции: читаешь ту, чью роль отлаживаешь.
+
+  // Что ждёт решения: показываем только ненулевое, строка ведёт в свой раздел.
+  const attentionHtml = () => {
     const att = data.attention || {};
-    const attItems = [
+    const items = [
       { n: att.requests, label: 'Заявки на апрув', ic: 'clock', go: 'requests' },
       { n: att.payments, label: 'Платежи на подтверждении', ic: 'cash', go: 'finance:confirm' },
       { n: att.deposits, label: 'Сдачи на подтверждении', ic: 'cashbox', go: 'finance:confirm' },
       { n: att.returns, label: 'Возвраты на подтверждении', ic: 'return', go: 'finance:confirm' },
       { n: att.debts, label: 'Открытые долги', ic: 'wallet', go: 'finance:debts' },
     ].filter(x => x.n > 0);
-    if (attItems.length) {
-      bossBlock += `
-        <div class="section-label">Требует внимания</div>
-        <div class="card-list">
-          ${attItems.map(x => `
-            <div class="card-row" data-att="${x.go}" role="button" tabindex="0">
-              <div class="card-row-icon card-row-icon--warn">${icon(x.ic)}</div>
-              <div class="card-row-info"><div class="card-row-title">${x.label}</div></div>
-              <span class="stock-badge badge-yellow">${x.n}</span>
-            </div>
-          `).join('')}
-        </div>
-      `;
-    }
-    // Вход в полную операционную сводку (зависшие заявки, склад, cron, МС) —
-    // отдельный экран. Раньше это уходило дайджестом в Telegram.
-    bossBlock += `
-      <div class="section-label">Мониторинг</div>
-      <div class="card-list">
-        <div class="card-row" data-att="ops" role="button" tabindex="0">
-          <div class="card-row-icon">${icon('clock')}</div>
-          <div class="card-row-info">
-            <div class="card-row-title">Операционная сводка</div>
-            <div class="card-row-sub">Зависшие заявки · склад · синхронизация</div>
+    if (!items.length) return '';
+    return `
+      <div class="section-label">Требует внимания</div>
+      <div class="c-surface c-surface--list">
+        ${items.map(x => `
+          <div class="c-row c-row--tap" data-att="${x.go}" role="button" tabindex="0">
+            <div class="card-row-icon card-row-icon--warn">${icon(x.ic)}</div>
+            <div class="card-row-info"><div class="card-row-title">${x.label}</div></div>
+            <span class="stock-badge badge-yellow">${x.n}</span>
           </div>
-        </div>
+        `).join('')}
       </div>
     `;
-    const topEmp = data.top_employees || [];
-    if (topEmp.length > 0) {
-      bossBlock += `
-        <div class="section-label">Топ сотрудники · неделя</div>
-        <div class="card-list">
-          ${topEmp.map((e, i) => `
-            <div class="card-row card-row--static">
-              <div class="card-row-icon rank-chip">${i + 1}</div>
-              <div class="card-row-info">
-                <div class="card-row-title">${escapeHtml(e.name)}</div>
-                <div class="card-row-sub">${e.count} отгрузок</div>
-              </div>
-              <div>
-                <div class="card-row-value">${fmtCur(e.revenue)}</div>
-              </div>
-            </div>
-          `).join('')}
-        </div>
-      `;
-    }
-  }
+  };
 
-  // ─── Мои заказы (для менеджера и босса показываем его собственные) ─
-  let ordersBlock = '';
-  if (mo.total > 0) {
+  // Вход в полную операционную сводку — отдельный экран (раньше уходило
+  // дайджестом в Telegram).
+  const monitoringHtml = () => `
+    <div class="section-label">Мониторинг</div>
+    <div class="c-surface c-surface--list">
+      <div class="c-row c-row--tap" data-att="ops" role="button" tabindex="0">
+        <div class="card-row-icon">${icon('clock')}</div>
+        <div class="card-row-info">
+          <div class="card-row-title">Операционная сводка</div>
+          <div class="card-row-sub">Зависшие заявки · склад · синхронизация</div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const leaderboardHtml = () => {
+    const top = data.top_employees || [];
+    if (!top.length) return '';
+    return `
+      <div class="section-label">Топ сотрудники · неделя</div>
+      <div class="c-surface c-surface--list">
+        ${top.map((e, i) => `
+          <div class="c-row">
+            <div class="card-row-icon rank-chip">${i + 1}</div>
+            <div class="card-row-info">
+              <div class="card-row-title">${escapeHtml(e.name)}</div>
+              <div class="card-row-sub">${e.count} отгрузок</div>
+            </div>
+            <div><div class="card-row-value">${fmtCur(e.revenue)}</div></div>
+          </div>
+        `).join('')}
+      </div>
+    `;
+  };
+
+  // Свод по своим заказам — есть у обеих ролей (у руководства ниже лидерборда).
+  const myOrdersHtml = () => {
+    if (!(mo.total > 0)) return '';
     const statsRow = `
       <div class="stat-grid stat-grid--three">
         <div class="stat">
@@ -511,9 +503,9 @@ async function renderHome() {
       </div>
     `;
     const recentList = mo.recent.length > 0 ? `
-      <div class="card-list">
+      <div class="c-surface c-surface--list">
         ${mo.recent.map(o => `
-          <div class="card-row" data-order-id="${o.id}" role="button" tabindex="0">
+          <div class="c-row c-row--tap" data-order-id="${o.id}" role="button" tabindex="0">
             <div class="card-row-icon icon-${o.status}">${icon(STATUS_ICON[o.status] || 'list')}</div>
             <div class="card-row-info">
               <div class="card-row-title">${escapeHtml(o.agent_name || ('Заказ #' + o.id))}</div>
@@ -524,14 +516,14 @@ async function renderHome() {
         `).join('')}
       </div>
     ` : '';
-    ordersBlock = `
-      <div class="section-label">Мои заказы</div>
-      ${statsRow}
-      ${recentList}
-    `;
-  }
+    return `<div class="section-label">Мои заказы</div>${statsRow}${recentList}`;
+  };
 
-  content.innerHTML = greeting + hero + actions + linkWarning + bossBlock + ordersBlock;
+  const bossHome = () => attentionHtml() + monitoringHtml() + leaderboardHtml() + myOrdersHtml();
+  const managerHome = () => myOrdersHtml();
+
+  content.innerHTML =
+    greeting + hero + actions + linkWarning + (isBoss ? bossHome() : managerHome());
 
   // Action-grid → переход на нужный таб (и опционально открыть новый заказ)
   document.querySelectorAll('[data-go]').forEach(btn => {
@@ -619,11 +611,19 @@ async function renderStock() {
   renderStockContent();
 }
 
+// UI-WP-21: пороги остатка отдают ОДИН из трёх статусов, цвет берётся из общей
+// матрицы (UI-WP-02). Раньше цвет выбирался тут же классом, поэтому «сделать
+// низкий остаток заметнее» означало править и здесь, и в CSS.
+function _stockState(stock) {
+  if (stock < 20) return 'out';      // включая ноль: продавать по сути нечего
+  if (stock < 100) return 'low';
+  return 'in_stock';
+}
+
 function _stockBadge(stock) {
-  if (stock <= 0) return '<span class="stock-badge badge-red">нет</span>';
-  if (stock < 20) return `<span class="stock-badge badge-red">${stock}</span>`;
-  if (stock < 100) return `<span class="stock-badge badge-yellow">${stock}</span>`;
-  return `<span class="stock-badge badge-green">${stock}</span>`;
+  const state = _stockState(stock);
+  const text = stock <= 0 ? 'нет' : String(stock);
+  return `<span class="stock-badge" data-status="${state}">${text}</span>`;
 }
 
 function _stockFiltered() {
@@ -648,16 +648,16 @@ function renderStockList() {
 
   listEl.innerHTML = filtered.length === 0
     ? (stockData.ms_unavailable
-        ? `<div class="empty-state">
-            <div class="empty-state-icon">${icon('alert')}</div>
-            <div class="empty-state-title">Каталог недоступен</div>
-            <div class="empty-state-hint">Не удалось загрузить товары из МойСклад. Проверьте подключение и токен — затем нажмите «Обновить».</div>
-          </div>`
-        : `<div class="empty-state">
-            <div class="empty-state-icon">${icon('box')}</div>
-            <div class="empty-state-title">Товары не найдены</div>
-            <div class="empty-state-hint">Попробуйте изменить категорию или поисковый запрос</div>
-          </div>`)
+        ? emptyState({
+            icon: 'alert',
+            title: 'Каталог недоступен',
+            hint: 'Не удалось загрузить товары из МойСклад. Проверьте подключение и токен — затем нажмите «Обновить».',
+          })
+        : emptyState({
+            icon: 'box',
+            title: 'Товары не найдены',
+            hint: 'Попробуйте изменить категорию или поисковый запрос',
+          }))
     : filtered.slice(0, stockLimit).map((p, i) => {
         // PR C: цена продажи (минимум) — всем; себестоимость — только boss.
         const priceLines = [];
@@ -669,7 +669,7 @@ function renderStockList() {
         const editAttr = isBoss ? ` data-price-idx="${i}" role="button" tabindex="0" aria-label="Изменить цену: ${escapeHtml(p.name)}"` : '';
         const editHint = isBoss ? `<span class="stock-edit-hint">${icon('edit')}</span>` : '';
         return `
-        <div class="stock-row"${editAttr}>
+        <div class="c-row stock-row"${editAttr}>
           <div class="stock-info">
             <div class="stock-name">${escapeHtml(p.name)}</div>
             <div class="stock-folder">${escapeHtml(p.folder_name || '—')} · ${p.unit}</div>
@@ -708,9 +708,9 @@ function openPriceEditor(product) {
   const trigger = document.activeElement;  // вернём фокус сюда при закрытии
   const prevBack = _backHandler;           // восстановим back-кнопку экрана
   const ov = document.createElement('div');
-  ov.className = 'price-overlay';
+  ov.className = 'c-overlay price-overlay';
   ov.innerHTML = `
-    <div class="price-modal" role="dialog" aria-modal="true" aria-labelledby="pe-title">
+    <div class="c-sheet price-modal" role="dialog" aria-modal="true" aria-labelledby="pe-title">
       <div class="price-modal-title" id="pe-title">${escapeHtml(product.name)}</div>
       <label class="price-field">
         <span>Цена продажи (минимум)</span>
@@ -1329,18 +1329,18 @@ function renderOrdersMain() {
           groups[gidx[k]].items.push(o);
         }
         const orderCard = o => `
-      <div class="order-card order-card--${o.status}" data-id="${o.id}">
+      <div class="order-card" data-status="${o.status}" data-id="${o.id}">
         <div class="order-header">
           <div class="order-head-main">
             <div class="order-title">${icon('building')} ${escapeHtml(o.agent_name || 'Без клиента')}</div>
             <div class="order-sub">Заказ #${o.id}${isBoss ? ` · ${escapeHtml(o.full_name)}` : ''}</div>
           </div>
-          <span class="order-status status-${o.status}">${STATUS_NAME[o.status] || o.status}</span>
+          <span class="order-status c-badge">${STATUS_NAME[o.status] || o.status}</span>
         </div>
         <div class="order-meta">
           <span>${icon('box')} ${o.items_count} тов.</span>
           <span>${(o.created_at || '').slice(11, 16)}</span>
-          ${o.total > 0 ? `<span class="order-total">${icon('cash')} ${Math.round(o.total).toLocaleString('ru-RU')} ${escapeHtml(o.currency || '')}</span>` : ''}
+          ${o.total > 0 ? `<span class="order-total">${icon('cash')} ${formatMoney(o.total, escapeHtml(o.currency || ''))}</span>` : ''}
         </div>
         ${(() => {
           // UX: тип оплаты / срок / статус оплаты / заморозка / причина возврата —
@@ -1363,7 +1363,7 @@ function renderOrdersMain() {
           const sub = (it.quantity || 0) * (it.price || 0);
           const cur = o.currency ? ' ' + escapeHtml(o.currency) : '';
           const priceStr = (it.price && it.price > 0)
-            ? ` × ${it.price.toLocaleString('ru-RU')} = <b>${Math.round(sub).toLocaleString('ru-RU')}${cur}</b>`
+            ? ` × ${formatMoney(it.price)} = <b>${formatMoney(sub)}${cur}</b>`
             : '';
           return `<div class="order-item-preview">• ${escapeHtml(it.name)} — ${it.quantity} ${it.unit}${priceStr}</div>`;
         }).join('')}
@@ -1576,10 +1576,10 @@ function renderOrderEditor() {
     : order.items.map((it, i) => {
         const sub = (it.quantity || 0) * (it.price || 0);
         const subStr = it.price > 0
-          ? ` · ${it.price.toLocaleString('ru-RU')} = <b>${Math.round(sub).toLocaleString('ru-RU')}</b>`
+          ? ` · ${formatMoney(it.price)} = <b>${formatMoney(sub)}</b>`
           : '';
         return `
-          <div class="editor-item">
+          <div class="c-row editor-item">
             <div class="editor-item-info">
               <div class="editor-item-name">${escapeHtml(it.name)}</div>
               <div class="editor-item-qty">${it.quantity} ${it.unit || 'шт'}${subStr}</div>
@@ -1588,11 +1588,11 @@ function renderOrderEditor() {
           </div>
         `;
       }).join('') + (grandTotal > 0 ? `
-        <div class="editor-item editor-item--total">
+        <div class="c-row editor-item editor-item--total">
           <div class="editor-item-info">
             <div class="editor-item-name">${icon('cash')} Итого</div>
           </div>
-          <div>${Math.round(grandTotal).toLocaleString('ru-RU')}</div>
+          <div>${formatMoney(grandTotal)}</div>
         </div>
       ` : '');
 
@@ -1614,17 +1614,15 @@ function renderOrderEditor() {
     <button class="btn-add-product" id="btn-add-product">+ Добавить товар</button>
 
     <div class="section-label">Оплата</div>
-    <div class="payment-selector">
-      <label class="payment-option">
-        <input type="radio" name="payment_type" value="paid"
-          ${(currentDraftOrder.payment_type || 'paid') === 'paid' ? 'checked' : ''}>
-        <span>${icon('cash')} Оплачено сразу</span>
-      </label>
-      <label class="payment-option">
-        <input type="radio" name="payment_type" value="credit"
-          ${currentDraftOrder.payment_type === 'credit' ? 'checked' : ''}>
-        <span>${icon('card')} В долг</span>
-      </label>
+    <div class="seg" role="radiogroup" aria-label="Тип оплаты">
+      ${[
+        { v: 'paid', label: 'Оплачено сразу', ic: 'cash' },
+        { v: 'credit', label: 'В долг', ic: 'card' },
+      ].map(o => {
+        const on = (currentDraftOrder.payment_type || 'paid') === o.v;
+        return `<button type="button" class="seg-item ${on ? 'active' : ''}" data-pay="${o.v}"
+          role="radio" aria-checked="${on}">${icon(o.ic)} ${o.label}</button>`;
+      }).join('')}
     </div>
     <div class="due-date-wrap ${currentDraftOrder.payment_type === 'credit' ? '' : 'hidden'}" id="due-date-wrap">
       <label class="due-date-label">Дата возврата долга:</label>
@@ -1670,12 +1668,19 @@ function renderOrderEditor() {
     });
   });
 
-  // Тип оплаты — радио + показ/скрытие date picker
-  document.querySelectorAll('input[name="payment_type"]').forEach(r => {
-    r.addEventListener('change', () => {
-      currentDraftOrder.payment_type = r.value;
+  // Тип оплаты — сегмент (UI-WP-04) + показ/скрытие выбора даты.
+  document.querySelectorAll('[data-pay]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const value = btn.dataset.pay;
+      currentDraftOrder.payment_type = value;
+      document.querySelectorAll('[data-pay]').forEach(b => {
+        const on = b === btn;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-checked', String(on));
+      });
       document.getElementById('due-date-wrap')
-        .classList.toggle('hidden', r.value !== 'credit');
+        .classList.toggle('hidden', value !== 'credit');
+      haptic();
     });
   });
   document.getElementById('due-date-input')?.addEventListener('change', e => {
@@ -1727,7 +1732,7 @@ async function loadAgents(search) {
       return;
     }
     list.innerHTML = data.agents.map(a => `
-      <div class="agent-row" data-id="${a.id}" data-name="${escapeHtml(a.name || '')}" role="button" tabindex="0">
+      <div class="c-row agent-row" data-id="${a.id}" data-name="${escapeHtml(a.name || '')}" role="button" tabindex="0">
         <div class="agent-name">${icon('user')} ${escapeHtml(a.name || '')}</div>
         ${a.phone ? `<div class="agent-phone">${escapeHtml(a.phone)}</div>` : ''}
       </div>
@@ -1807,7 +1812,7 @@ async function openProductPicker() {
       : filtered.slice(0, prodLimit).map(p => {
           const ind = p.stock >= 100 ? 'green' : p.stock >= 20 ? 'yellow' : 'red';
           return `
-            <div class="prod-row" role="button" tabindex="0"
+            <div class="c-row prod-row" role="button" tabindex="0"
                  data-name="${escapeHtml(p.name)}"
                  data-unit="${escapeHtml(p.unit)}"
                  data-stock="${p.stock}"
@@ -1942,6 +1947,9 @@ function openQuantityInput(name, unit, maxStock, href) {
     const q = parseNum(qtyEl.value) || 0;
     const p = parseNum(priceEl.value) || 0;
     const t = q * p;
+    // Осознанное исключение из formatMoney (UI-WP-05): это ЖИВОЙ пересчёт под
+    // вводом «количество × цена». Округление до рублей скрыло бы то, что
+    // пользователь только что набрал (2,5 × 1,20), — здесь нужны копейки.
     totalEl.innerHTML = `Итого: <b>${t.toLocaleString('ru-RU', {maximumFractionDigits: 2})} ${selectedCurrency}</b>`;
   }
   qtyEl.addEventListener('input', updateTotal);
@@ -2074,7 +2082,7 @@ async function renderPendingRequests() {
   const content = document.getElementById('content');
   // fmt был локальным в других рендерах, но не здесь → кредит-блок заявки
   // (fmt(...)) кидал ReferenceError, и весь экран заявок падал в errorBox.
-  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   content.innerHTML = loading('Загружаю заявки…');
   try {
     const data = await api('/api/orders/requests', {});
@@ -2084,22 +2092,22 @@ async function renderPendingRequests() {
         <div class="editor-header">
           <div class="editor-title">Заявки</div>
         </div>
-        <div class="empty-state">
-          <div class="empty-state-icon">${icon('check')}</div>
-          <div class="empty-state-title">Нет заявок на рассмотрении</div>
-          <div class="empty-state-hint">Новые заявки появятся здесь автоматически</div>
-        </div>
+        ${emptyState({
+          icon: 'check',
+          title: 'Нет заявок на рассмотрении',
+          hint: 'Новые заявки появятся здесь автоматически',
+        })}
       `;
       return;
     }
     const items = data.requests.map(r => `
-      <div class="order-card">
+      <div class="order-card" data-status="pending">
         <div class="order-header">
           <div>
             <div class="order-title">${icon('clock')} Заявка #${r.id}</div>
             <div class="order-manager">${icon('user')} ${r.full_name}</div>
           </div>
-          <span class="order-status status-pending">Ожидает</span>
+          <span class="order-status c-badge">Ожидает</span>
         </div>
         ${r.agent_name ? `<div class="order-agent">${icon('building')} ${r.agent_name}</div>` : ''}
         <div class="order-meta"><span>${r.created_at}</span></div>
@@ -2111,7 +2119,7 @@ async function renderPendingRequests() {
           } else {
             bits.push(`<span class="order-pay">${icon('cash')} Оплата сразу</span>`);
           }
-          if (r.total > 0) bits.push(`<span class="order-pay">${icon('cash')} ${Math.round(r.total).toLocaleString('ru-RU')} ${escapeHtml(r.currency || '')}</span>`);
+          if (r.total > 0) bits.push(`<span class="order-pay">${icon('cash')} ${formatMoney(r.total, escapeHtml(r.currency || ''))}</span>`);
           return `<div class="order-pay-row">${bits.join('')}</div>`;
         })()}
         ${r.credit ? `
@@ -2314,7 +2322,7 @@ async function renderAnalytics() {
 
 function renderAnalyticsContent(data) {
   const content = document.getElementById('content');
-  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
 
   const trendIcon = data.trend > 0 ? icon('trend-up') : data.trend < 0 ? icon('trend-down') : '';
@@ -2377,9 +2385,9 @@ function renderAnalyticsContent(data) {
     </div>`;
   }).join('');
   const clientsBlock = clientItems
-    ? `<div class="section-label">Топ клиентов</div><div class="card">${clientItems}</div>` : '';
+    ? `<div class="section-label">Топ клиентов</div><div class="c-surface c-surface--pad">${clientItems}</div>` : '';
   const managersBlock = managerItems
-    ? `<div class="section-label">Топ менеджеров</div><div class="card">${managerItems}</div>` : '';
+    ? `<div class="section-label">Топ менеджеров</div><div class="c-surface c-surface--pad">${managerItems}</div>` : '';
   // Кнопка Excel — только company-scope (boss/admin).
   const exportBlock = data.scope === 'company'
     ? `<button class="btn-primary u-mt-3" id="analytics-export">${icon('chart')} Выгрузить Excel</button>` : '';
@@ -2388,10 +2396,14 @@ function renderAnalyticsContent(data) {
     ? `<div class="warn-card">${icon('alert', 'warn-ic')} Продажи из МойСклад временно недоступны — показаны нулевые суммы и локальный топ-менеджеров.</div>`
     : '';
 
-  // Personal-аналитика: выручка РАЗДЕЛЬНО по валютам (не складываем USD+UZS+EUR).
-  // Company (МС) — единая базовая валюта, прежний 4-блок.
-  let statsBlock;
-  if (data.scope === 'personal' && Array.isArray(data.revenue)) {
+  // ── Две ветки показателей (UI-WP-27) ──────────────────────────────────
+  // Менеджеру и руководству приходят РАЗНЫЕ данные: у первого выручка списком
+  // по валютам (складывать USD+UZS+EUR нельзя), у второго — агрегаты МС в
+  // одной базовой валюте. Раньше обе формы собирались одной переменной с
+  // ветвлением посередине разметки, и было не видно, какой экран выйдет.
+
+  // Менеджер: по строке на валюту + два счётчика.
+  const personalStatsHtml = () => {
     const revLines = data.revenue.length
       ? data.revenue.map(r => {
           const tI = r.trend > 0 ? icon('trend-up') : r.trend < 0 ? icon('trend-down') : '';
@@ -2403,15 +2415,17 @@ function renderAnalyticsContent(data) {
           </div>`;
         }).join('')
       : '<div class="money-placeholder">Нет продаж за период</div>';
-    statsBlock = `
+    return `
       <div class="section-label">Выручка по валютам</div>
-      <div class="card">${revLines}</div>
+      <div class="c-surface c-surface--pad">${revLines}</div>
       <div class="stat-grid">
         <div class="stat"><div class="stat-value">${data.count}</div><div class="stat-label">Отгрузок</div></div>
         <div class="stat"><div class="stat-value">${data.clients}</div><div class="stat-label">Клиентов</div></div>
       </div>`;
-  } else {
-    statsBlock = `
+  };
+
+  // Руководство: четыре агрегата в базовой валюте.
+  const companyStatsHtml = () => `
     <div class="stat-grid">
       <div class="stat">
         <div class="stat-value">${fmt(data.total)} $</div>
@@ -2431,7 +2445,9 @@ function renderAnalyticsContent(data) {
         <div class="stat-label">Средний чек</div>
       </div>
     </div>`;
-  }
+
+  const isPersonal = data.scope === 'personal' && Array.isArray(data.revenue);
+  const statsBlock = isPersonal ? personalStatsHtml() : companyStatsHtml();
 
   content.innerHTML = `
     ${analyticsHeaderHtml(isBoss)}
@@ -2439,10 +2455,10 @@ function renderAnalyticsContent(data) {
     ${statsBlock}
 
     <div class="section-label">Активность по дням</div>
-    <div class="card">${daysBars}</div>
+    <div class="c-surface c-surface--pad">${daysBars}</div>
 
     <div class="section-label">Топ товаров</div>
-    <div class="card">${topItems}</div>
+    <div class="c-surface c-surface--pad">${topItems}</div>
     ${clientsBlock}
     ${managersBlock}
     ${exportBlock}
@@ -2519,25 +2535,42 @@ function cashHistoryHtml(history) {
     deposit: { ic: 'cashbox', label: 'Сдача' },
     return: { ic: 'return', label: 'Возврат' },
   };
-  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
+  // Статус движения — общая статус-система (UI-WP-02), а не своя тройка классов.
   const histStatus = s => s === 'confirmed'
-    ? '<span class="stock-badge badge-green">принят</span>'
-    : s === 'rejected' ? '<span class="stock-badge badge-red">отклонён</span>'
-    : '<span class="stock-badge badge-yellow">ожидает</span>';
-  const rows = history.map(h => {
+    ? '<span class="stock-badge" data-status="in_stock">принят</span>'
+    : s === 'rejected' ? '<span class="stock-badge" data-status="out">отклонён</span>'
+    : '<span class="stock-badge" data-status="low">ожидает</span>';
+
+  const rowHtml = (h) => {
     const m = KIND_META[h.kind] || { ic: 'cash', label: h.kind };
     const ord = h.order_id ? ` · заказ #${h.order_id}` : '';
+    const time = String(h.created_at || '').slice(11, 16);
     return `
-      <div class="stock-row">
+      <div class="c-row">
         <div class="card-row-icon">${icon(m.ic)}</div>
-        <div class="stock-info">
-          <div class="stock-name">${m.label} · ${fmt(h.amount)} ${escapeHtml(h.currency || baseCur())}</div>
-          <div class="stock-folder">${escapeHtml(h.who || '')} · ${escapeHtml(h.created_at || '')}${ord}</div>
+        <div class="card-row-info">
+          <div class="card-row-title">${m.label} · ${fmt(h.amount)} ${escapeHtml(h.currency || baseCur())}</div>
+          <div class="card-row-sub">${escapeHtml(h.who || '')}${time ? ' · ' + escapeHtml(time) : ''}${ord}</div>
         </div>
         ${histStatus(h.status)}
       </div>`;
-  }).join('');
-  return `<div class="stock-list">${rows}</div>`;
+  };
+
+  // UI-WP-28: лента группируется по дням тем же паттерном, что список заказов
+  // («Сегодня»/«Вчера»/дата). Раньше это был сплошной поток строк, где дата
+  // пряталась в подписи каждой — за период в месяц читать невозможно.
+  const groups = [];
+  const index = {};
+  for (const h of history) {
+    const key = String(h.created_at || '').slice(0, 10) || 'no-date';
+    if (!(key in index)) { index[key] = groups.length; groups.push({ key, items: [] }); }
+    groups[index[key]].items.push(h);
+  }
+  return groups.map(g =>
+    `<div class="section-label order-date-label">${orderDateLabel(g.key)}</div>` +
+    `<div class="c-surface c-surface--list">${g.items.map(rowHtml).join('')}</div>`
+  ).join('');
 }
 
 // (Экран «Платежи» удалён: подтверждение оплат, история движения денег и
@@ -2670,7 +2703,7 @@ async function renderCashbox(container, section) {
   if (section === 'overview') section = 'confirm'; // «Обзор» переехал в Аналитику
   cashboxSubTab = section;
   container.innerHTML = loading('Загрузка кассы…');
-  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   const role = currentUser && currentUser.role;
   // Наличные сдаёт тот, кто их физически принимает от клиента (менеджер,
   // кладовщик). Начальство/бухгалтер только ПОДТВЕРЖДАЮТ.
@@ -2835,7 +2868,7 @@ async function renderCashbox(container, section) {
   const canReturn = ['admin', 'boss', 'warehouse_keeper', 'manager'].includes(role);
   const returnBlock = canReturn ? `
       <div class="section-label">Оформить возврат</div>
-      <div class="card">
+      <div class="c-surface c-surface--pad">
         <div class="form-row">
           <label class="form-label">Номер заказа</label>
           <input type="number" id="ret-order" class="form-input" placeholder="142" inputmode="numeric">
@@ -3122,7 +3155,7 @@ async function renderClients(container) {
     container.innerHTML = errorBox(e.message);
     return;
   }
-  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   const fmtCents = c => opsAmount((Number(c) || 0) / 100);
   if (!clients.length) {
     container.innerHTML = `<div class="empty-state">
@@ -3143,13 +3176,14 @@ async function renderClients(container) {
     if (y == null) return -1;
     return x - y;
   });
+  // UI-WP-05: подпись строит общий хелпер (знак — по конвенции WP-27), экран
+  // отвечает только за класс.
   const balStr = (bal) => {
-    const p = balanceParts(bal, baseC);  // единая конвенция знака (WP-27)
-    const cur = escapeHtml(p.currency);
-    if (p.state === 'none') return '<span class="money-placeholder">баланс —</span>';
-    if (p.state === 'owe') return `<span class="bal-owe">должен ${p.amount} ${cur}</span>`;
-    if (p.state === 'adv') return `<span class="bal-adv">аванс ${p.amount} ${cur}</span>`;
-    return `0 ${cur}`;
+    const b = msBalanceLabel(bal, baseC);
+    if (b.tone === 'none') return '<span class="money-placeholder">баланс —</span>';
+    if (b.tone === 'owe') return `<span class="bal-owe">${escapeHtml(b.text)}</span>`;
+    if (b.tone === 'advance') return `<span class="bal-adv">${escapeHtml(b.text)}</span>`;
+    return escapeHtml(b.text);
   };
   // Долг по заказам — РАЗДЕЛЬНО по валютам (не складываем). Лимит — в базовой.
   const debtStr = (c) => {
@@ -3158,34 +3192,34 @@ async function renderClients(container) {
     return 'долг ' + items.map(x => `${fmt(x.amount)} ${escapeHtml(x.currency)}`).join(' · ');
   };
   const cards = clients.map(c => `
-      <div class="debt-card" data-agent="${escapeHtml(c.agent_id)}" role="button" tabindex="0">
-        <div class="debt-card-top">
-          <div class="debt-agent">${icon('building')} ${escapeHtml(c.agent_name)}</div>
-          ${c.over_limit ? '<span class="stock-badge badge-red">лимит превышен</span>' : ''}
+      <div class="c-row c-row--tap" data-agent="${escapeHtml(c.agent_id)}" role="button" tabindex="0">
+        <div class="card-row-icon">${icon('building')}</div>
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(c.agent_name)}</div>
+          <div class="card-row-sub">${balStr(c.balance_cents)} · ${debtStr(c)} · лимит ${fmt(c.limit)} ${escapeHtml(baseC)}</div>
         </div>
-        <div class="debt-card-mid">
-          <span class="debt-meta">${balStr(c.balance_cents)} · ${debtStr(c)} · лимит ${fmt(c.limit)} ${escapeHtml(baseC)}</span>
-        </div>
+        ${c.over_limit ? '<span class="stock-badge" data-status="out">лимит превышен</span>' : ''}
       </div>`).join('');
   // T3.1: вход на экран курсов валют. Эндпоинты /api/currency/rates{,/set}
   // существовали, но фронт их не звал — курс можно было задать только через
   // /rates в боте. Отдельным подэкраном, а не пятой вкладкой: вкладок в
   // «Финансах» намеренно ≤4, чтобы ряд не переносился.
   const ratesEntry = `
-    <div class="debt-card" id="open-rates" role="button" tabindex="0">
-      <div class="debt-card-top">
-        <div class="debt-agent">${icon('card')} Курсы валют</div>
-      </div>
-      <div class="debt-card-mid">
-        <span class="debt-meta">Курс к базовой валюте — для сводок в разных валютах</span>
+    <div class="c-surface c-surface--list">
+      <div class="c-row c-row--tap" id="open-rates" role="button" tabindex="0">
+        <div class="card-row-icon">${icon('card')}</div>
+        <div class="card-row-info">
+          <div class="card-row-title">Курсы валют</div>
+          <div class="card-row-sub">Курс к базовой валюте — для сводок в разных валютах</div>
+        </div>
       </div>
     </div>`;
-  container.innerHTML = `${ratesEntry}<div class="section-label">Клиенты (${clients.length})</div><div class="debts-list">${cards}</div>`;
+  container.innerHTML = `${ratesEntry}<div class="section-label">Клиенты (${clients.length})</div><div class="c-surface c-surface--list">${cards}</div>`;
   container.querySelector('#open-rates')?.addEventListener('click', () => {
     haptic('light');
     renderCurrencyRates();
   });
-  container.querySelectorAll('.debt-card[data-agent]').forEach(card => {
+  container.querySelectorAll('[data-agent]').forEach(card => {
     card.addEventListener('click', () => { haptic('light'); renderAgentDetail(card.dataset.agent); });
   });
 }
@@ -3217,27 +3251,29 @@ async function renderCurrencyRates() {
     const code = String(r.currency_code || '').toUpperCase();
     const isBase = code === base;
     const upd = r.updated_at ? String(r.updated_at).slice(0, 16) : '—';
+    // Строка курса + (для админа/босса) редактор под ней в той же поверхности.
     return `
-      <div class="debt-card" data-rate="${escapeHtml(code)}">
-        <div class="debt-card-top">
-          <div class="debt-agent">${escapeHtml(code)}</div>
-          <div class="debt-amount">${isBase ? 'базовая' : escapeHtml(String(r.rate_to_base))}</div>
+      <div class="c-row" data-rate="${escapeHtml(code)}">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(code)}</div>
+          <div class="card-row-sub">1 ${escapeHtml(code)} = ${escapeHtml(String(r.rate_to_base))} ${escapeHtml(base)} · обновлён ${escapeHtml(upd)}</div>
         </div>
-        <div class="debt-card-mid">
-          <span class="debt-meta">1 ${escapeHtml(code)} = ${escapeHtml(String(r.rate_to_base))} ${escapeHtml(base)} · обновлён ${escapeHtml(upd)}</span>
-        </div>
-        ${canEdit && !isBase ? `
-          <div class="limit-edit">
-            <input type="number" step="any" class="form-input rate-input"
-                   value="${escapeHtml(String(r.rate_to_base))}" inputmode="decimal">
-            <button class="btn-confirm-pay rate-save" data-code="${escapeHtml(code)}">Сохранить</button>
-          </div>` : ''}
-      </div>`;
+        <div class="card-row-value">${isBase ? 'базовая' : escapeHtml(String(r.rate_to_base))}</div>
+      </div>
+      ${canEdit && !isBase ? `
+        <div class="c-row">
+          <input type="number" step="any" class="form-input rate-input"
+                 value="${escapeHtml(String(r.rate_to_base))}" inputmode="decimal"
+                 aria-label="Курс ${escapeHtml(code)}">
+          <button class="btn-confirm-pay rate-save" data-code="${escapeHtml(code)}">Сохранить</button>
+        </div>` : ''}`;
   }).join('');
 
   content.innerHTML = `
     <div class="section-label">Курсы к ${escapeHtml(base)}</div>
-    ${rows || '<div class="empty-state"><div class="empty-state-title">Курсы не заданы</div></div>'}
+    ${rows
+      ? `<div class="c-surface c-surface--list">${rows}</div>`
+      : emptyState({ icon: 'card', title: 'Курсы не заданы', hint: 'Добавьте курс — сводки в разных валютах считаются через него.' })}
     ${canEdit ? '' : '<div class="debt-meta">Изменять курсы может админ или руководитель.</div>'}
   `;
 
@@ -3283,43 +3319,42 @@ async function renderAgentDetail(agentId) {
     content.innerHTML = errorBox(e.message);
     return;
   }
-  const fmt = n => Math.round(n).toLocaleString('ru-RU');
+  const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   const fmtCents = c => opsAmount((Number(c) || 0) / 100);
   const baseC = d.base_currency || baseCur();
-  // МС-баланс (взаиморасчёты) — единая конвенция знака через balanceParts (WP-27).
-  const bp = balanceParts(d.balance_cents, baseC);
-  const bpCur = escapeHtml(bp.currency);
-  const balLine = bp.state === 'none' ? 'Баланс МойСклад: —'
-    : bp.state === 'owe' ? `Баланс МойСклад: должен нам <b>${bp.amount} ${bpCur}</b>`
-    : bp.state === 'adv' ? `Баланс МойСклад: аванс <b>${bp.amount} ${bpCur}</b>`
-    : `Баланс МойСклад: <b>0 ${bpCur}</b>`;
+  // МС-баланс: подпись — общая (UI-WP-05), формулировка больше не расходится
+  // с экраном клиентов.
+  const bal = msBalanceLabel(d.balance_cents, baseC);
+  const balLine = bal.tone === 'none'
+    ? 'Баланс МойСклад: —'
+    : `Баланс МойСклад: <b>${escapeHtml(bal.text)}</b>`;
 
   // Покупки из МС.
   const pur = d.purchases || {};
   const topRows = (pur.top_products || []).map(p =>
-    `<div class="stock-row"><div class="stock-info"><div class="stock-name">${escapeHtml(p.name)}</div>` +
-    `<div class="stock-folder">${fmt(p.qty)} шт · ${fmtCents(p.sum_cents)} ${escapeHtml(baseC)}</div></div></div>`
+    `<div class="c-row"><div class="card-row-info"><div class="card-row-title">${escapeHtml(p.name)}</div>` +
+    `<div class="card-row-sub">${fmt(p.qty)} шт · ${fmtCents(p.sum_cents)} ${escapeHtml(baseC)}</div></div></div>`
   ).join('');
   const recentRows = (pur.recent || []).map(r =>
-    `<div class="stock-row"><div class="stock-info"><div class="stock-name">${fmtCents(r.sum_cents)} ${escapeHtml(baseC)}</div>` +
-    `<div class="stock-folder">${escapeHtml(r.date || '')}</div></div></div>`
+    `<div class="c-row"><div class="card-row-info"><div class="card-row-title">${fmtCents(r.sum_cents)} ${escapeHtml(baseC)}</div>` +
+    `<div class="card-row-sub">${escapeHtml(r.date || '')}</div></div></div>`
   ).join('');
   const purBlock = pur.count
     ? `<div class="section-label">Покупки · ${pur.count} отгр. · ${fmtCents(pur.total_cents)} ${escapeHtml(baseC)}</div>`
-      + (topRows ? `<div class="stock-list">${topRows}</div>` : '')
-      + (recentRows ? `<div class="section-label">Последние отгрузки</div><div class="stock-list">${recentRows}</div>` : '')
+      + (topRows ? `<div class="c-surface c-surface--list">${topRows}</div>` : '')
+      + (recentRows ? `<div class="section-label">Последние отгрузки</div><div class="c-surface c-surface--list">${recentRows}</div>` : '')
     : '<div class="section-label">Покупки</div><div class="loader">Покупок в МойСклад нет</div>';
 
   // Заказы в боте.
   const orders = d.orders || [];
   const ordersRows = orders.map(o =>
-    `<div class="stock-row"><div class="stock-info">` +
-    `<div class="stock-name">#${o.id} · ${fmtCents(o.total_cents)} ${escapeHtml(o.currency || baseC)}</div>` +
-    `<div class="stock-folder">${escapeHtml(o.status || '')} · ${escapeHtml((o.created_at || '').slice(0, 16))}</div>` +
+    `<div class="c-row" data-status="${escapeHtml(o.status || '')}"><div class="card-row-info">` +
+    `<div class="card-row-title">#${o.id} · ${fmtCents(o.total_cents)} ${escapeHtml(o.currency || baseC)}</div>` +
+    `<div class="card-row-sub">${escapeHtml(o.status || '')} · ${escapeHtml((o.created_at || '').slice(0, 16))}</div>` +
     `</div></div>`
   ).join('');
   const ordersBlock = orders.length
-    ? `<div class="section-label">Заказы в боте · ${orders.length}</div><div class="stock-list">${ordersRows}</div>`
+    ? `<div class="section-label">Заказы в боте · ${orders.length}</div><div class="c-surface c-surface--list">${ordersRows}</div>`
     : '<div class="section-label">Заказы в боте</div><div class="loader">Заказов нет</div>';
 
   // Лимит правится только у контрагента с заказами (эндпоинт credit/set это гейтит).
@@ -3336,7 +3371,8 @@ async function renderAgentDetail(agentId) {
   content.innerHTML = `
     <div class="editor-header"><div class="editor-title">${icon('building')} ${escapeHtml(d.name || '—')}</div></div>
     ${d.phone ? `<div class="debt-meta agent-phone">${icon('phone')} ${escapeHtml(d.phone)}</div>` : ''}
-    <div class="card">
+    <div class="section-label">Взаиморасчёты</div>
+    <div class="c-surface c-surface--pad">
       <div class="agent-bal">${balLine}</div>
       <div class="debt-meta">Долг по заказам бота: <b>${fmt(d.debt)} ${escapeHtml(baseC)}</b> · лимит ${fmt(d.limit)} · свободно ${fmt(d.free)}</div>
       ${limitBlock}
@@ -3398,7 +3434,7 @@ async function renderDebts(container) {
       else { upcomingCount++; bucket = upcomingByCur; }
       bucket[cur] = (bucket[cur] || 0) + amt;
     }
-    const fmt = n => Math.round(n).toLocaleString('ru-RU');
+    const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
     // Суммы корзины по валютам: «380 USD», на каждой строке своя валюта.
     const sumByCur = byCur => {
       const keys = Object.keys(byCur).sort((a, b) => byCur[b] - byCur[a]);
@@ -3427,9 +3463,9 @@ async function renderDebts(container) {
 
     let html = `
       <div class="debts-header">
-        <div class="debts-tabs">
-          <button class="debts-tab ${debtsFilter === 'all' ? 'active' : ''}" data-f="all" aria-pressed="${debtsFilter === 'all'}">Все</button>
-          <button class="debts-tab ${debtsFilter === 'today' ? 'active' : ''}" data-f="today" aria-pressed="${debtsFilter === 'today'}">К оплате сейчас</button>
+        <div class="seg">
+          <button class="seg-item ${debtsFilter === 'all' ? 'active' : ''}" data-f="all" aria-pressed="${debtsFilter === 'all'}">Все</button>
+          <button class="seg-item ${debtsFilter === 'today' ? 'active' : ''}" data-f="today" aria-pressed="${debtsFilter === 'today'}">К оплате сейчас</button>
         </div>
       </div>
     `;
@@ -3551,7 +3587,8 @@ async function renderDebts(container) {
     } else if (open.length > 0) {
       html += `<div class="section-label">${icon('card')} Открытые (${open.length})</div>`;
       html += '<div class="debts-list">' + open.map(d => {
-        const stateClass = `debt-${d.state}`;
+        // UI-WP-02: состояние — атрибутом, а не отдельным классом: полоса
+        // карточки и бейдж выводятся из одной пары переменных.
         const stateLabel = d.state === 'partial' ? `${icon('info')} Частично оплачен`
           : d.state === 'overdue' ? `${icon('alert')} Просрочен`
           : d.state === 'due_today' ? `${icon('clock')} Сегодня` : `${icon('calendar')} Срок`;
@@ -3565,7 +3602,7 @@ async function renderDebts(container) {
           </div>
         ` : '';
         return `
-          <div class="debt-card ${stateClass}">
+          <div class="debt-card" data-status="${d.state}">
             <div class="debt-card-top">
               <div class="debt-agent">${icon('building')} ${escapeHtml(d.agent_name)}</div>
               <div class="debt-amount">${fmt(d.total)} ${escapeHtml(d.currency)}</div>
@@ -3591,7 +3628,7 @@ async function renderDebts(container) {
     container.innerHTML = html;
 
     // Tabs (фильтр all/today)
-    container.querySelectorAll('.debts-tab').forEach(t => {
+    container.querySelectorAll('.seg-item[data-f]').forEach(t => {
       t.addEventListener('click', () => {
         debtsFilter = t.dataset.f;
         renderDebts(container);
