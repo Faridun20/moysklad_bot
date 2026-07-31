@@ -316,6 +316,83 @@ describe('техника: формы', () => {
     expect(window.__writes[0][1]).toEqual({ machine_id: 7 });
   });
 
+  it('график рассрочки виден целиком, просрочка отмечена', async () => {
+    // По графику решают, звонить ли клиенту — прятать его за ещё одним тапом
+    // значит не показывать вовсе.
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify({
+        ...CARD,
+        machine: { ...CARD.machine, status: 'on_credit' },
+        today: '2026-07-31',
+        deals: [{
+          id: 5, kind: 'credit', price_cents: 2500000, currency: 'USD',
+          buyer_name: 'Иванов', sold_at: '2026-06-30', due_date: '2026-11-30',
+          payments: [
+            { id: 10, seq: 0, due_date: '2026-06-30', amount_cents: 500000, paid_at: '2026-06-30' },
+            { id: 11, seq: 1, due_date: '2026-07-30', amount_cents: 1000000, paid_at: null },
+            { id: 12, seq: 2, due_date: '2026-08-30', amount_cents: 1000000, paid_at: null },
+          ],
+        }],
+      })});
+      window.__ready = renderMachineCard(7);
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toContain('Первоначальный взнос');
+    expect(content.textContent).toContain('Оплачено');
+    // 30.07 при «сегодня» 31.07 — просрочен; 30.08 — ещё впереди.
+    expect(content.querySelector('[data-payment="11"]').closest('.c-row').dataset.status).toBe('overdue');
+    expect(content.querySelector('[data-payment="12"]').closest('.c-row').dataset.status).toBe('upcoming');
+    // Взнос переключать нечем — он получен в момент сделки.
+    expect(content.querySelector('[data-payment="10"]')).toBeNull();
+  });
+
+  it('менеджер график видит, но отметить платёж не может', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      api = async () => (${JSON.stringify({
+        ...CARD, can_manage: false, next_statuses: [], today: '2026-07-31',
+        deals: [{
+          id: 5, kind: 'credit', price_cents: 100000, currency: 'USD', buyer_name: 'И',
+          sold_at: '2026-06-30',
+          payments: [{ id: 11, seq: 1, due_date: '2026-08-30', amount_cents: 100000, paid_at: null }],
+        }],
+      })});
+      window.__ready = renderMachineCard(7);
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toContain('Платёж 1');
+    expect(content.querySelector('[data-payment]')).toBeNull();
+  });
+
+  it('отметка платежа уходит с новым состоянием', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__writes = [];
+      tg.showAlert = (t) => { window.__alerted = t; };
+      api = async () => (${JSON.stringify({
+        ...CARD, today: '2026-07-31',
+        deals: [{
+          id: 5, kind: 'credit', price_cents: 100000, currency: 'USD', buyer_name: 'И',
+          sold_at: '2026-06-30',
+          payments: [{ id: 11, seq: 1, due_date: '2026-08-30', amount_cents: 100000, paid_at: null }],
+        }],
+      })});
+      apiResult = async (path, body) => {
+        window.__writes.push([path, body]);
+        return { ok: true, status: 200, body: { ok: true, deal_closed: true }, error: '' };
+      };
+      window.__ready = renderMachineCard(7);
+    `);
+    await window.__ready;
+    window.document.querySelector('[data-payment="11"]').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__writes[0]).toEqual(['/api/machines/payment', { payment_id: 11, paid: true }]);
+  });
+
   it('у машины со сделкой кнопки удаления нет', async () => {
     const window = boot(`
       currentUser = { role: 'boss' };
@@ -329,15 +406,33 @@ describe('техника: формы', () => {
     expect(window.document.querySelector('[data-mact="delete"]')).toBeNull();
   });
 
-  it('форма сделки требует срок оплаты только для рассрочки', async () => {
+  it('рассрочка спрашивает взнос и срок, продажа — нет', async () => {
+    // Дату последнего платежа не спрашиваем вовсе: её считает сервер по
+    // графику, а введённая руками она рано или поздно с ним разошлась бы.
     const window = boot7('boss', []);
     await window.__ready;
     window.document.querySelector('[data-mact="sale"]').click();
-    expect(window.document.querySelector('#ms-f-due_date')).toBeNull();
+    expect(window.document.querySelector('#ms-f-months')).toBeNull();
+    expect(window.document.querySelector('#ms-f-down_payment')).toBeNull();
     window.document.querySelector('#ms-cancel').click();
 
     window.document.querySelector('[data-mact="credit"]').click();
-    expect(window.document.querySelector('#ms-f-due_date')).not.toBeNull();
+    expect(window.document.querySelector('#ms-f-months')).not.toBeNull();
+    expect(window.document.querySelector('#ms-f-down_payment')).not.toBeNull();
+    expect(window.document.querySelector('#ms-f-due_date')).toBeNull();
+  });
+
+  it('срок рассрочки обязателен — без него запрос не уходит', async () => {
+    const window = boot7('boss', []);
+    await window.__ready;
+    window.document.querySelector('[data-mact="credit"]').click();
+    window.document.querySelector('#ms-f-price').value = '25000';
+    window.document.querySelector('#ms-f-buyer_name').value = 'Иванов';
+    window.document.querySelector('#ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__writes).toHaveLength(0);
+    expect(window.document.querySelector('#ms-error').textContent).toContain('Срок');
   });
 
   it('Esc закрывает форму, не отправляя ничего', async () => {

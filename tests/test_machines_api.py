@@ -635,7 +635,7 @@ def test_credit_deal_appears_in_open_list_and_closes(isolated_db, monkeypatch):
     client = _client(monkeypatch)
 
     created = _post(client, "/api/machines/deal", 2, machine_id=mid, kind="credit",
-                    price="50 000", buyer_name="Петров", due_date="2026-12-31",
+                    price="50 000", buyer_name="Петров", months=6,
                     buyer_passport="AB1", idempotency_key="c1")
     assert created.status_code == 200, created.text
     deal_id = created.json()["deal_id"]
@@ -657,7 +657,7 @@ def test_closing_a_closed_deal_is_409(isolated_db, monkeypatch):
     mid = _machine("A-1")
     client = _client(monkeypatch)
     created = _post(client, "/api/machines/deal", 2, machine_id=mid, kind="credit",
-                    price="1000", buyer_name="A", due_date="2026-12-31",
+                    price="1000", buyer_name="A", months=3,
                     idempotency_key="c1")
     deal_id = created.json()["deal_id"]
     assert _post(client, "/api/machines/deal_close", 2, deal_id=deal_id).status_code == 200

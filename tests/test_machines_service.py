@@ -284,7 +284,7 @@ def test_credit_deal_sets_on_credit_and_closes_to_sold(isolated_db):
     deal = _run(
         machines.create_deal(
             mid, kind="credit", price_cents=50_000_00, buyer_name="Петров",
-            created_by=2, due_date="2026-12-31",
+            created_by=2, months=6,
         )
     )
     assert deal["ok"] and deal["status"] == "on_credit"

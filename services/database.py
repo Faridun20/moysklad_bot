@@ -670,6 +670,48 @@ def _create_tables():
                 closed_at      TEXT,
                 created_by     BIGINT NOT NULL
             )""",
+            # График рассрочки. Первоначальный взнос — та же таблица, `seq = 0`
+            # и `paid_at` сразу: деньги уже получены, и отдельная колонка в
+            # `machine_deals` описывала бы ровно то же самое вторым способом
+            # (а заодно не доехала бы до существующей таблицы на проде —
+            # инкрементальных миграций в проекте нет).
+            f"""CREATE TABLE IF NOT EXISTS machine_deal_payments (
+                id            {id_type},
+                deal_id       INTEGER NOT NULL REFERENCES machine_deals(id),
+                seq           INTEGER NOT NULL,
+                due_date      TEXT NOT NULL,
+                amount_cents  BIGINT NOT NULL,
+                paid_at       TEXT,
+                paid_by       BIGINT,
+                notified_at   TEXT,
+                created_at    TEXT,
+                UNIQUE (deal_id, seq)
+            )""",
+            # Контейнеры в пути. Состав заводят при отправке («ожидалось»), при
+            # прибытии проставляют факт — расхождение видно сразу, а не после
+            # ручной сверки с накладной.
+            f"""CREATE TABLE IF NOT EXISTS containers (
+                id           {id_type},
+                number       TEXT NOT NULL UNIQUE,
+                status       TEXT NOT NULL DEFAULT 'in_transit'
+                             CHECK (status IN ('in_transit','arrived')),
+                eta_date     TEXT,
+                arrived_at   TEXT,
+                notes        TEXT,
+                created_by   BIGINT NOT NULL,
+                created_at   TEXT,
+                updated_at   TEXT
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS container_items (
+                id            {id_type},
+                container_id  INTEGER NOT NULL REFERENCES containers(id),
+                name          TEXT NOT NULL,
+                unit          TEXT NOT NULL DEFAULT 'шт',
+                expected_qty  REAL NOT NULL DEFAULT 0,
+                arrived_qty   REAL,
+                note          TEXT,
+                created_at    TEXT
+            )""",
         ]
 
         # Создаём каждую таблицу в отдельной транзакции
@@ -779,6 +821,16 @@ def _create_indexes():
             "ON machine_hours(machine_id, recorded_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_machine_deals_machine "
             "ON machine_deals(machine_id, sold_at DESC)",
+            # График читается по сделке (карточка) и по сроку (ежедневный
+            # обход неоплаченных платежей в напоминалке).
+            "CREATE INDEX IF NOT EXISTS idx_machine_deal_payments_deal "
+            "ON machine_deal_payments(deal_id, seq)",
+            "CREATE INDEX IF NOT EXISTS idx_machine_deal_payments_due "
+            "ON machine_deal_payments(due_date)",
+            # ── Контейнеры ───────────────────────────────────────────────────
+            "CREATE INDEX IF NOT EXISTS idx_containers_status ON containers(status)",
+            "CREATE INDEX IF NOT EXISTS idx_container_items_container "
+            "ON container_items(container_id, id)",
         ]
         for sql in snapshot_indexes:
             try:

@@ -2002,6 +2002,24 @@ body {
    только текстом в диалоге подтверждения. */
 .btn-danger { color: var(--danger); }
 
+/* ─── График рассрочки ───────────────────────────────────────────────────── */
+.schedule-total {
+  padding: 0 var(--sp-1) var(--sp-2);
+  border-top: 0;
+}
+/* Отметка «получен» прямо в строке графика: уводить её в отдельный экран
+   значит делать три тапа там, где хватает одного. */
+.pay-toggle {
+  flex-shrink: 0;
+  width: 44px; min-height: 44px;
+  margin-left: var(--sp-2);
+  padding: 0; border: 0; border-radius: var(--radius-sm);
+  background: var(--status-bg); color: var(--status-c);
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer;
+}
+.pay-toggle .ic { --ic-size: 20px; }
+
 /* Лента фотографий машины: горизонтальная прокрутка, квадратные превью.
    Снимки приходят с телефона в любой ориентации — object-fit: cover не даёт
    ленте прыгать по высоте. */

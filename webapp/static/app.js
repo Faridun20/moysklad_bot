@@ -994,24 +994,87 @@ function machineHoursHtml(hours) {
       </div>`).join('')}</div>`;
 }
 
-function machineDealsHtml(deals) {
-  if (!deals || !deals.length) return '';
-  return `<div class="section-label">Сделки</div>
-    <div class="c-surface c-surface--list">${deals.map(d => {
-      const kind = d.kind === 'credit' ? 'Рассрочка' : 'Продажа';
-      const state = d.closed_at ? 'Закрыта' : (d.kind === 'credit' ? `до ${d.due_date || '—'}` : '');
-      const meta = [d.buyer_name, d.buyer_phone, d.buyer_passport, state].filter(Boolean).join(' · ');
-      const canClose = d.kind === 'credit' && !d.closed_at && isMachineBoss();
-      return `
-      <div class="c-row" data-status="${d.closed_at || d.kind === 'sale' ? 'approved' : 'pending'}">
+// График рассрочки. Показываем всё сразу, а не за отдельным тапом: по нему
+// принимают решение «звонить ли клиенту», и прятать его за ещё одним действием
+// значит не показывать вовсе.
+function machineScheduleHtml(deal, today) {
+  const rows = deal.payments || [];
+  if (!rows.length) return '';
+  const cur = deal.currency || 'USD';
+  const paidCents = rows.filter(p => p.paid_at).reduce((s, p) => s + Number(p.amount_cents || 0), 0);
+  const totalCents = rows.reduce((s, p) => s + Number(p.amount_cents || 0), 0);
+  const boss = isMachineBoss();
+
+  const items = rows.map(p => {
+    const due = String(p.due_date || '').slice(0, 10);
+    // Состояние платежа: получен / просрочен / впереди — та же матрица цветов,
+    // что у долгов по заказам.
+    const state = p.paid_at ? 'approved' : (due < today ? 'overdue' : 'upcoming');
+    const title = p.seq === 0 ? 'Первоначальный взнос' : `Платёж ${p.seq}`;
+    const when = p.paid_at
+      ? `получен ${escapeHtml(String(p.paid_at).slice(0, 10))}`
+      : `до ${escapeHtml(due)}`;
+    // Взнос переключать нечем: он получен в момент сделки.
+    const toggle = boss && p.seq > 0
+      ? `<button class="pay-toggle" data-payment="${p.id}" data-paid="${p.paid_at ? '1' : '0'}"
+                 aria-label="${p.paid_at ? 'Снять отметку' : 'Отметить полученным'}">${icon(p.paid_at ? 'close' : 'check')}</button>`
+      : '';
+    return `
+      <div class="c-row" data-status="${state}">
         <div class="card-row-info">
-          <div class="card-row-title">${kind} · ${escapeHtml(String(d.sold_at || '').slice(0, 10))}</div>
-          <div class="card-row-sub">${escapeHtml(meta)}</div>
+          <div class="card-row-title">${title}</div>
+          <div class="card-row-sub">${when}</div>
         </div>
-        <div class="card-row-value">${formatMoney(Number(d.price_cents || 0) / 100, d.currency || 'USD')}</div>
+        <div class="card-row-value">${formatMoney(Number(p.amount_cents || 0) / 100, cur)}</div>
+        ${toggle}
+      </div>`;
+  }).join('');
+
+  const left = totalCents - paidCents;
+  return `
+    <div class="items-total schedule-total">
+      <span>Оплачено ${formatMoney(paidCents / 100, cur)} из ${formatMoney(totalCents / 100, cur)}</span>
+      <b>${left > 0 ? `осталось ${formatMoney(left / 100, cur)}` : 'закрыто'}</b>
+    </div>
+    <div class="c-surface c-surface--list">${items}</div>`;
+}
+
+function machineDealsHtml(deals, today) {
+  if (!deals || !deals.length) return '';
+  return deals.map(d => {
+    const kind = d.kind === 'credit' ? 'Рассрочка' : 'Продажа';
+    const state = d.closed_at ? 'Закрыта' : (d.kind === 'credit' ? `до ${d.due_date || '—'}` : '');
+    const meta = [d.buyer_name, d.buyer_phone, d.buyer_passport, state].filter(Boolean).join(' · ');
+    const canClose = d.kind === 'credit' && !d.closed_at && isMachineBoss();
+    return `
+      <div class="section-label">${kind} · ${escapeHtml(String(d.sold_at || '').slice(0, 10))}</div>
+      <div class="c-surface c-surface--list">
+        <div class="c-row" data-status="${d.closed_at || d.kind === 'sale' ? 'approved' : 'pending'}">
+          <div class="card-row-info">
+            <div class="card-row-title">${escapeHtml(d.buyer_name || '—')}</div>
+            <div class="card-row-sub">${escapeHtml(meta)}</div>
+          </div>
+          <div class="card-row-value">${formatMoney(Number(d.price_cents || 0) / 100, d.currency || 'USD')}</div>
+        </div>
       </div>
-      ${canClose ? `<div class="c-actions"><button class="btn-secondary" data-deal-close="${d.id}">Закрыть рассрочку</button></div>` : ''}`;
-    }).join('')}</div>`;
+      ${machineScheduleHtml(d, today)}
+      ${canClose ? `<div class="c-actions"><button class="btn-secondary" data-deal-close="${d.id}">Закрыть рассрочку досрочно</button></div>` : ''}`;
+  }).join('');
+}
+
+async function toggleMachinePayment(machineId, paymentId, wasPaid) {
+  const res = await apiResult('/api/machines/payment', {
+    payment_id: paymentId, paid: !wasPaid,
+  });
+  if (!res.ok) {
+    tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+    // 409 значит «на сервере уже другое» — перечитываем, а не спорим с экраном.
+    if (res.status === 409) renderMachineCard(machineId);
+    return;
+  }
+  haptic('success');
+  toast(res.body.deal_closed ? 'Рассрочка закрыта — все платежи получены' : 'Отмечено');
+  renderMachineCard(machineId);
 }
 
 // Кнопки карточки. Что можно — решает сервер (`can_manage`, `next_statuses`):
@@ -1187,7 +1250,7 @@ async function renderMachineCard(machineId) {
     ${machineActionsHtml(m, card)}
     ${machinePhotosHtml(card)}
     ${machineHoursHtml(card.hours)}
-    ${machineDealsHtml(card.deals)}
+    ${machineDealsHtml(card.deals, card.today || new Date().toISOString().slice(0, 10))}
   `;
 
   content.querySelector('#machine-photo-add')?.addEventListener('click', () => {
@@ -1211,6 +1274,12 @@ async function renderMachineCard(machineId) {
   });
   content.querySelectorAll('[data-deal-close]').forEach(btn => {
     btn.addEventListener('click', () => closeMachineDeal(m.id, Number(btn.dataset.dealClose)));
+  });
+  content.querySelectorAll('[data-payment]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('light');
+      toggleMachinePayment(m.id, Number(btn.dataset.payment), btn.dataset.paid === '1');
+    });
   });
 }
 
@@ -1384,13 +1453,20 @@ function openDealForm(machine, kind) {
   const key = idemKey();
   openMachineSheet({
     title: credit ? 'Рассрочка' : 'Продажа',
+    hint: credit ? 'График платежей построится сам: остаток разделится поровну по месяцам.' : '',
     fields: [
       { key: 'price', label: 'Цена, USD', type: 'number', required: true,
         value: machine.price_cents ? String(machine.price_cents / 100) : '' },
+      // Взнос и срок вместо даты последнего платежа: дату считает сервер по
+      // графику — введённая руками, она рано или поздно разошлась бы с ним.
+      ...(credit ? [
+        { key: 'down_payment', label: 'Первоначальный взнос, USD', type: 'number',
+          hint: 'Сколько клиент уже заплатил. Можно оставить пустым' },
+        { key: 'months', label: 'Срок, месяцев', type: 'number', required: true },
+      ] : []),
       { key: 'buyer_name', label: 'Покупатель', required: true },
       { key: 'buyer_phone', label: 'Телефон', type: 'tel' },
       { key: 'buyer_passport', label: 'Паспорт', hint: 'Виден только руководству' },
-      ...(credit ? [{ key: 'due_date', label: 'Срок оплаты', type: 'date', required: true }] : []),
       { key: 'buyer_note', label: 'Комментарий', type: 'textarea' },
     ],
     submitLabel: credit ? 'Оформить рассрочку' : 'Оформить продажу',
@@ -1400,7 +1476,9 @@ function openDealForm(machine, kind) {
       });
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
-      toast(credit ? 'Рассрочка оформлена' : 'Машина продана');
+      toast(credit
+        ? `Рассрочка оформлена · ${res.body.payments} платежей`
+        : 'Машина продана');
       renderMachineCard(machine.id);
       return true;
     },

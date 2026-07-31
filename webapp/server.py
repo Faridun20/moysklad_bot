@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from utils.helpers import redact_token
+from utils.helpers import local_now, redact_token
 from webapp.auth import verify_init_data
 
 # Берём роль из in-memory кэша (TTL 60s) вместо SELECT'а на каждый API-запрос.
@@ -2601,6 +2601,11 @@ async def api_machines_card(request: Request):
     photos = await machines.list_photos(machine_id)
     hours = await machines.get_hours_history(machine_id)
     deals = await machines.list_deals(machine_id, role=role)
+    # График рассрочки кладём внутрь сделки: отдельная ручка означала бы второй
+    # запрос ровно за тем, что и так открыто на экране.
+    for deal in deals:
+        if deal.get("kind") == "credit":
+            deal["payments"] = await machines.get_schedule(int(deal["id"]))
     return JSONResponse(
         {
             "ok": True,
@@ -2615,6 +2620,9 @@ async def api_machines_card(request: Request):
             # Без канала-хранилища загрузка не работает — кнопку рисовать нельзя.
             "can_upload_photo": _machine_photos_chat_id() is not None,
             "status_labels": machines.STATUS_LABELS,
+            # «Сегодня» считает сервер: просрочку платежа нельзя определять по
+            # часам телефона — они и в другом поясе, и просто сбиты.
+            "today": local_now().date().isoformat(),
         }
     )
 
@@ -2882,6 +2890,16 @@ async def api_machines_deal(request: Request):
     if not data.get("idempotency_key"):
         raise HTTPException(status_code=400, detail="idempotency_key обязателен")
 
+    # Рассрочка: взнос и срок в месяцах. Дату последнего платежа считает сервис
+    # по графику — введённая руками, она рано или поздно разошлась бы с ним.
+    down_payment_cents = _machine_money(data.get("down_payment"), "Первоначальный взнос") or 0
+    months = 0
+    if kind == "credit":
+        try:
+            months = int(data.get("months") or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Срок рассрочки — целое число месяцев")
+
     idem = _Idem(adb, "machine_deal", user["id"], data.get("idempotency_key"))
     cached = await idem.claim()
     if cached is not None:
@@ -2899,7 +2917,8 @@ async def api_machines_deal(request: Request):
             buyer_passport=_machine_text(data, "buyer_passport", 100),
             buyer_note=_machine_text(data, "buyer_note", 1000),
             agent_ms_id=_machine_text(data, "agent_ms_id", 64),
-            due_date=_machine_text(data, "due_date", 20),
+            down_payment_cents=down_payment_cents,
+            months=months,
         )
     except Exception:
         await idem.release()
@@ -2941,6 +2960,28 @@ async def api_machines_deal_close(request: Request):
         return JSONResponse({**res, "detail": res.get("error", "")}, status_code=409)
     await idem.store(res)
     return JSONResponse(res)
+
+
+@app.post("/api/machines/payment")
+async def api_machines_payment(request: Request):
+    """Отметить платёж графика рассрочки полученным (или снять отметку).
+
+    Когда получен последний платёж, сервис закрывает сделку и переводит машину
+    в «Продана» сам: закрывать руками после последнего платежа значит однажды
+    забыть это сделать.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_payment"
+    )
+    payment_id = _machine_id_arg(data, "payment_id")
+    paid = data.get("paid", True)
+    res = await machines.pay_installment(
+        payment_id, user_id=user["id"], full_name=_actor_name(user), paid=bool(paid)
+    )
+    return _machine_response(res)
 
 
 @app.post("/api/machines/deals_open")

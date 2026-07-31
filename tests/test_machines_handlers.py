@@ -248,7 +248,7 @@ def test_open_credits_listed_without_close_buttons(isolated_db):
     deal = asyncio.run(
         machines.create_deal(
             mid, kind="credit", price_cents=25_000_00, buyer_name="Иванов",
-            due_date="2026-12-31", created_by=2,
+            months=6, created_by=2,
         )
     )
     assert deal["ok"], deal
@@ -281,7 +281,7 @@ def test_open_credits_hides_passport(isolated_db):
     asyncio.run(
         machines.create_deal(
             mid, kind="credit", price_cents=1000, buyer_name="Иванов",
-            buyer_passport="AB1234567", due_date="2026-12-31", created_by=2,
+            buyer_passport="AB1234567", months=6, created_by=2,
         )
     )
     msg = _FakeMessage(text="/machine_deals", uid=2)
