@@ -2546,6 +2546,310 @@ async def api_machines_card(request: Request):
     )
 
 
+def _machine_id_arg(data: dict, key: str = "machine_id") -> int:
+    try:
+        value = int(data.get(key) or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{key}: не число")
+    if value <= 0:
+        raise HTTPException(status_code=400, detail=f"{key} обязателен")
+    return value
+
+
+def _machine_money(raw, label: str) -> int | None:
+    """Сумма из формы («25 000», «25000.50») → копейки.
+
+    Граница системы: наружу и внутрь ходят копейки, парсинг человеческой записи
+    живёт ровно здесь. Пустое поле — это «не задано», а не ноль.
+    """
+    if raw is None or str(raw).strip() == "":
+        return None
+    cents = money.parse_amount(raw)
+    if cents is None:
+        raise HTTPException(status_code=400, detail=f"{label}: не число или не больше нуля")
+    return cents
+
+
+def _machine_text(data: dict, key: str, limit: int = 200) -> str | None:
+    value = (str(data.get(key) or "")).strip()[:limit]
+    return value or None
+
+
+def _actor_name(user: dict) -> str:
+    return ((user.get("first_name") or "") + " " + (user.get("last_name") or "")).strip()
+
+
+@app.post("/api/machines/create")
+async def api_machines_create(request: Request):
+    """Завести машину. Менеджеру можно — себестоимость он всё равно не задаёт."""
+    from services import async_db as adb
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_MACHINE_ROLES,
+        rate_limit_scope="api_machines_create",
+        rate_limit_max=20,
+    )
+    role = get_role(user["id"])
+    status = (data.get("status") or "in_transit").strip()
+    if status not in machines.STATUSES:
+        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+
+    year = data.get("year")
+    hours = data.get("hours")
+    try:
+        year = int(year) if str(year or "").strip() else None
+        hours = int(hours) if str(hours or "").strip() else None
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Год и моточасы — целые числа")
+
+    payload = {
+        "vin": (data.get("vin") or "").strip()[:64],
+        "name": (data.get("name") or "").strip()[:200],
+        "created_by": user["id"],
+        "creator_name": _actor_name(user),
+        "brand": _machine_text(data, "brand", 100),
+        "model": _machine_text(data, "model", 100),
+        "year": year,
+        "hours": hours,
+        "price_cents": _machine_money(data.get("price"), "Цена"),
+        "currency": (data.get("currency") or "USD").strip().upper()[:8],
+        "status": status,
+        "eta_date": _machine_text(data, "eta_date", 20),
+        "container_no": _machine_text(data, "container_no", 50),
+        "location": _machine_text(data, "location", 200),
+        "notes": _machine_text(data, "notes", 1000),
+    }
+    # Себестоимость менеджер не видит — значит и записать не может. Иначе роль
+    # режется только на чтении, и поле утекает обратно через форму.
+    if machines.can_see_cost(role):
+        payload["cost_cents"] = _machine_money(data.get("cost"), "Себестоимость")
+
+    idem = _Idem(adb, "machine_create", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await machines.create_machine(**payload)
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/machines/update")
+async def api_machines_update(request: Request):
+    """Правка описательных полей карточки. Только admin/boss.
+
+    VIN здесь не меняется намеренно — сервис его в whitelist не пускает: смена
+    серийника это не правка, а другая машина.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_update"
+    )
+    machine_id = _machine_id_arg(data)
+    raw = data.get("fields")
+    if not isinstance(raw, dict) or not raw:
+        raise HTTPException(status_code=400, detail="Нечего менять")
+
+    fields: dict = {}
+    for key, value in raw.items():
+        if key in ("price", "price_cents"):
+            fields["price_cents"] = _machine_money(value, "Цена")
+        elif key in ("cost", "cost_cents"):
+            fields["cost_cents"] = _machine_money(value, "Себестоимость")
+        elif key == "year":
+            try:
+                fields["year"] = int(value) if str(value or "").strip() else None
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Год — целое число")
+        else:
+            fields[key] = (str(value).strip()[:1000] or None) if value is not None else None
+    res = await machines.update_machine_fields(
+        machine_id, user_id=user["id"], full_name=_actor_name(user), **fields
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/hours")
+async def api_machines_hours(request: Request):
+    """Записать моточасы. Может менеджер — показания снимают с площадки.
+
+    `force` (запись показания меньше предыдущего — законная замена счётчика)
+    только для руководства: иначе подтверждение «да, я уверен» обесценивает
+    саму проверку от опечатки.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_ROLES, rate_limit_scope="api_machines_hours"
+    )
+    role = get_role(user["id"])
+    machine_id = _machine_id_arg(data)
+    try:
+        hours = int(data.get("hours"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Моточасы — целое число")
+
+    force = bool(data.get("force"))
+    if force and role not in _MACHINE_BOSS:
+        raise HTTPException(
+            status_code=403, detail="Откат показания подтверждает руководитель"
+        )
+    res = await machines.add_hours(
+        machine_id, hours, user_id=user["id"], full_name=_actor_name(user), force=force
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/status")
+async def api_machines_status(request: Request):
+    """Сменить статус машины. Только admin/boss.
+
+    `expected` присылает фронт — тот статус, который он нарисовал. В этом смысл
+    CAS: пока карточка висела открытой, машину мог продать другой, и безусловный
+    UPDATE затёр бы его решение.
+
+    Граф переходов проверяем здесь, а не в `set_status`: внутренние вызовы
+    (`create_deal`, `close_deal`) двигают статус в обход ручного графа законно —
+    он описывает кнопки интерфейса, а не жизненный цикл целиком.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_status"
+    )
+    machine_id = _machine_id_arg(data)
+    target = (data.get("status") or "").strip()
+    expected = (data.get("expected") or "").strip()
+    if target not in machines.STATUSES:
+        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {target}")
+    if not expected:
+        raise HTTPException(status_code=400, detail="expected обязателен")
+    if target not in machines.next_statuses(expected):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Переход «{machines.STATUS_LABELS.get(expected, expected)}» → "
+            f"«{machines.STATUS_LABELS.get(target, target)}» не предусмотрен",
+        )
+    res = await machines.set_status(
+        machine_id, target, user_id=user["id"], full_name=_actor_name(user), expected=expected
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/deal")
+async def api_machines_deal(request: Request):
+    """Оформить продажу или рассрочку. Только admin/boss.
+
+    Ключ идемпотентности обязателен: сделка — денежный факт, а двойной тап по
+    «Оформить» на телефоне обычное дело. Повтор отдаёт тот же `deal_id`.
+    """
+    from services import async_db as adb
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_deal"
+    )
+    machine_id = _machine_id_arg(data)
+    kind = (data.get("kind") or "").strip()
+    if kind not in machines.DEAL_KINDS:
+        raise HTTPException(status_code=400, detail=f"Тип сделки: {' / '.join(machines.DEAL_KINDS)}")
+    price_cents = _machine_money(data.get("price"), "Цена")
+    if not price_cents:
+        raise HTTPException(status_code=400, detail="Цена сделки обязательна")
+    buyer_name = (data.get("buyer_name") or "").strip()[:200]
+    if not buyer_name:
+        raise HTTPException(status_code=400, detail="Покупатель обязателен")
+    if not data.get("idempotency_key"):
+        raise HTTPException(status_code=400, detail="idempotency_key обязателен")
+
+    idem = _Idem(adb, "machine_deal", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await machines.create_deal(
+            machine_id,
+            kind=kind,
+            price_cents=price_cents,
+            buyer_name=buyer_name,
+            created_by=user["id"],
+            creator_name=_actor_name(user),
+            currency=(data.get("currency") or "USD").strip().upper()[:8],
+            buyer_phone=_machine_text(data, "buyer_phone", 40),
+            buyer_passport=_machine_text(data, "buyer_passport", 100),
+            buyer_note=_machine_text(data, "buyer_note", 1000),
+            agent_ms_id=_machine_text(data, "agent_ms_id", 64),
+            due_date=_machine_text(data, "due_date", 20),
+        )
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/machines/deal_close")
+async def api_machines_deal_close(request: Request):
+    """Закрыть рассрочку: деньги получены полностью, машина → «Продана»."""
+    from services import async_db as adb
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_deal_close"
+    )
+    deal_id = _machine_id_arg(data, "deal_id")
+
+    idem = _Idem(adb, "machine_deal_close", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await machines.close_deal(
+            deal_id, user_id=user["id"], full_name=_actor_name(user)
+        )
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        # «Сделка не найдена или уже закрыта» — состояние на сервере другое,
+        # карточку надо перечитать, а не править поле.
+        return JSONResponse({**res, "detail": res.get("error", "")}, status_code=409)
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/machines/deals_open")
+async def api_machines_deals_open(request: Request):
+    """Незакрытые рассрочки по технике — кому напоминать о сроке."""
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_deals_open"
+    )
+    deals = await machines.get_open_credit_deals(role=get_role(user["id"]))
+    return JSONResponse({"ok": True, "deals": deals})
+
+
 @app.post("/api/users/deactivate")
 async def api_users_deactivate(request: Request):
     """Деактивировать/реактивировать пользователя (#32). Admin only.
