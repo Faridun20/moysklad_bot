@@ -154,7 +154,7 @@ describe('renderOpsSummaryHtml', () => {
     expect(html).toContain('Зависшие заявки');
     expect(html).toContain('#7');
     expect(html).toContain('Acme');
-    expect(html).toContain('badge-yellow">2<');
+    expect(html).toContain('data-status="low">2<');  // UI-WP-29: критичность атрибутом
     expect(html).not.toContain('Сдачи'); // count 0 — секции нет
   });
 
@@ -178,7 +178,8 @@ describe('renderOpsSummaryHtml', () => {
       } },
     });
     expect(html).toContain('Рассинхрон с МойСклад');
-    expect(html).toContain('badge-yellow">4<'); // 1 + 2 + 1
+    // Рассинхрон с МС — «плохо», а не «внимание»: учёт разошёлся с реальностью.
+    expect(html).toContain('data-status="out">4<'); // 1 + 2 + 1
     expect(html).toContain('Статус застрял · #5');
   });
 });

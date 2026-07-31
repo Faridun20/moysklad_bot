@@ -2385,9 +2385,9 @@ function renderAnalyticsContent(data) {
     </div>`;
   }).join('');
   const clientsBlock = clientItems
-    ? `<div class="section-label">Топ клиентов</div><div class="card">${clientItems}</div>` : '';
+    ? `<div class="section-label">Топ клиентов</div><div class="c-surface c-surface--pad">${clientItems}</div>` : '';
   const managersBlock = managerItems
-    ? `<div class="section-label">Топ менеджеров</div><div class="card">${managerItems}</div>` : '';
+    ? `<div class="section-label">Топ менеджеров</div><div class="c-surface c-surface--pad">${managerItems}</div>` : '';
   // Кнопка Excel — только company-scope (boss/admin).
   const exportBlock = data.scope === 'company'
     ? `<button class="btn-primary u-mt-3" id="analytics-export">${icon('chart')} Выгрузить Excel</button>` : '';
@@ -2396,10 +2396,14 @@ function renderAnalyticsContent(data) {
     ? `<div class="warn-card">${icon('alert', 'warn-ic')} Продажи из МойСклад временно недоступны — показаны нулевые суммы и локальный топ-менеджеров.</div>`
     : '';
 
-  // Personal-аналитика: выручка РАЗДЕЛЬНО по валютам (не складываем USD+UZS+EUR).
-  // Company (МС) — единая базовая валюта, прежний 4-блок.
-  let statsBlock;
-  if (data.scope === 'personal' && Array.isArray(data.revenue)) {
+  // ── Две ветки показателей (UI-WP-27) ──────────────────────────────────
+  // Менеджеру и руководству приходят РАЗНЫЕ данные: у первого выручка списком
+  // по валютам (складывать USD+UZS+EUR нельзя), у второго — агрегаты МС в
+  // одной базовой валюте. Раньше обе формы собирались одной переменной с
+  // ветвлением посередине разметки, и было не видно, какой экран выйдет.
+
+  // Менеджер: по строке на валюту + два счётчика.
+  const personalStatsHtml = () => {
     const revLines = data.revenue.length
       ? data.revenue.map(r => {
           const tI = r.trend > 0 ? icon('trend-up') : r.trend < 0 ? icon('trend-down') : '';
@@ -2411,15 +2415,17 @@ function renderAnalyticsContent(data) {
           </div>`;
         }).join('')
       : '<div class="money-placeholder">Нет продаж за период</div>';
-    statsBlock = `
+    return `
       <div class="section-label">Выручка по валютам</div>
-      <div class="card">${revLines}</div>
+      <div class="c-surface c-surface--pad">${revLines}</div>
       <div class="stat-grid">
         <div class="stat"><div class="stat-value">${data.count}</div><div class="stat-label">Отгрузок</div></div>
         <div class="stat"><div class="stat-value">${data.clients}</div><div class="stat-label">Клиентов</div></div>
       </div>`;
-  } else {
-    statsBlock = `
+  };
+
+  // Руководство: четыре агрегата в базовой валюте.
+  const companyStatsHtml = () => `
     <div class="stat-grid">
       <div class="stat">
         <div class="stat-value">${fmt(data.total)} $</div>
@@ -2439,7 +2445,9 @@ function renderAnalyticsContent(data) {
         <div class="stat-label">Средний чек</div>
       </div>
     </div>`;
-  }
+
+  const isPersonal = data.scope === 'personal' && Array.isArray(data.revenue);
+  const statsBlock = isPersonal ? personalStatsHtml() : companyStatsHtml();
 
   content.innerHTML = `
     ${analyticsHeaderHtml(isBoss)}
@@ -2447,10 +2455,10 @@ function renderAnalyticsContent(data) {
     ${statsBlock}
 
     <div class="section-label">Активность по дням</div>
-    <div class="card">${daysBars}</div>
+    <div class="c-surface c-surface--pad">${daysBars}</div>
 
     <div class="section-label">Топ товаров</div>
-    <div class="card">${topItems}</div>
+    <div class="c-surface c-surface--pad">${topItems}</div>
     ${clientsBlock}
     ${managersBlock}
     ${exportBlock}
@@ -2528,24 +2536,41 @@ function cashHistoryHtml(history) {
     return: { ic: 'return', label: 'Возврат' },
   };
   const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
+  // Статус движения — общая статус-система (UI-WP-02), а не своя тройка классов.
   const histStatus = s => s === 'confirmed'
-    ? '<span class="stock-badge badge-green">принят</span>'
-    : s === 'rejected' ? '<span class="stock-badge badge-red">отклонён</span>'
-    : '<span class="stock-badge badge-yellow">ожидает</span>';
-  const rows = history.map(h => {
+    ? '<span class="stock-badge" data-status="in_stock">принят</span>'
+    : s === 'rejected' ? '<span class="stock-badge" data-status="out">отклонён</span>'
+    : '<span class="stock-badge" data-status="low">ожидает</span>';
+
+  const rowHtml = (h) => {
     const m = KIND_META[h.kind] || { ic: 'cash', label: h.kind };
     const ord = h.order_id ? ` · заказ #${h.order_id}` : '';
+    const time = String(h.created_at || '').slice(11, 16);
     return `
-      <div class="stock-row">
+      <div class="c-row">
         <div class="card-row-icon">${icon(m.ic)}</div>
-        <div class="stock-info">
-          <div class="stock-name">${m.label} · ${fmt(h.amount)} ${escapeHtml(h.currency || baseCur())}</div>
-          <div class="stock-folder">${escapeHtml(h.who || '')} · ${escapeHtml(h.created_at || '')}${ord}</div>
+        <div class="card-row-info">
+          <div class="card-row-title">${m.label} · ${fmt(h.amount)} ${escapeHtml(h.currency || baseCur())}</div>
+          <div class="card-row-sub">${escapeHtml(h.who || '')}${time ? ' · ' + escapeHtml(time) : ''}${ord}</div>
         </div>
         ${histStatus(h.status)}
       </div>`;
-  }).join('');
-  return `<div class="stock-list">${rows}</div>`;
+  };
+
+  // UI-WP-28: лента группируется по дням тем же паттерном, что список заказов
+  // («Сегодня»/«Вчера»/дата). Раньше это был сплошной поток строк, где дата
+  // пряталась в подписи каждой — за период в месяц читать невозможно.
+  const groups = [];
+  const index = {};
+  for (const h of history) {
+    const key = String(h.created_at || '').slice(0, 10) || 'no-date';
+    if (!(key in index)) { index[key] = groups.length; groups.push({ key, items: [] }); }
+    groups[index[key]].items.push(h);
+  }
+  return groups.map(g =>
+    `<div class="section-label order-date-label">${orderDateLabel(g.key)}</div>` +
+    `<div class="c-surface c-surface--list">${g.items.map(rowHtml).join('')}</div>`
+  ).join('');
 }
 
 // (Экран «Платежи» удалён: подтверждение оплат, история движения денег и

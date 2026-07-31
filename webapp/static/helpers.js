@@ -55,15 +55,19 @@
   function renderOpsSummaryHtml(summary) {
     summary = summary || {};
     const blocks = [];
-    const section = (title, count, rowsHtml) => {
+    // UI-WP-29: секции сводки — общие примитивы поверхности и строки.
+    // `tone` — критичность алерта в языке общей статус-системы: просроченные
+    // деньги и рассинхрон с МС не должны выглядеть так же, как «низкий
+    // остаток», а раньше все счётчики были одинаково жёлтыми.
+    const section = (title, count, rowsHtml, tone) => {
       blocks.push(
         `<div class="section-label">${escapeHtml(title)} ` +
-        `<span class="stock-badge badge-yellow">${count}</span></div>` +
-        `<div class="card-list">${rowsHtml}</div>`
+        `<span class="stock-badge" data-status="${tone || 'low'}">${count}</span></div>` +
+        `<div class="c-surface c-surface--list">${rowsHtml}</div>`
       );
     };
     const row = (title, sub, ic) =>
-      `<div class="card-row card-row--static">` +
+      `<div class="c-row">` +
       `<div class="card-row-info"><div class="card-row-title">${ic ? icon(ic) + ' ' : ''}${escapeHtml(title)}</div>` +
       (sub ? `<div class="card-row-sub">${escapeHtml(sub)}</div>` : '') +
       `</div></div>`;
@@ -76,7 +80,7 @@
     const ov = summary.overdue_undeposited || {};
     if (ov.count > 0) {
       section(`Отгружено, деньги не сданы (>${ov.threshold_days}д)`, ov.count,
-        (ov.items || []).map(o => row(`#${o.id} · ${o.agent_name}`, o.full_name)).join(''));
+        (ov.items || []).map(o => row(`#${o.id} · ${o.agent_name}`, o.full_name)).join(''), 'out');
     }
     const dep = summary.deposits || {};
     if (dep.count > 0) {
@@ -100,7 +104,7 @@
       section('Cron: не отчитались', cr.count,
         (cr.items || []).map(c => row(c.task_name,
           c.never_ran ? `ни разу не запускался (порог ${c.threshold_hours}ч)`
-                      : `${c.hours_ago}ч назад · ${c.last_status} (порог ${c.threshold_hours}ч)`)).join(''));
+                      : `${c.hours_ago}ч назад · ${c.last_status} (порог ${c.threshold_hours}ч)`)).join(''), 'out');
     }
     const ms = summary.ms_anomalies || {};
     const msTotal = (ms.drift || 0) + (ms.deleted || 0) + (ms.demand_failed || 0) + (ms.transition_blocked || 0);
@@ -111,7 +115,7 @@
         .concat((items.transition_blocked || []).map(o => row(`Статус застрял · #${o.id}`, `${o.agent_name} · ${o.status}`, 'ban')))
         .concat((items.drift || []).map(o => row(`Изменён в МС · #${o.id}`, o.agent_name, 'edit')))
         .concat((items.deleted || []).map(o => row(`Удалён в МС · #${o.id}`, `${o.agent_name} · ${o.status}`, 'trash')));
-      section('Рассинхрон с МойСклад', msTotal, rows.join(''));
+      section('Рассинхрон с МойСклад', msTotal, rows.join(''), 'out');
     }
 
     if (!blocks.length) {
