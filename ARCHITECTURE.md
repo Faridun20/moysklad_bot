@@ -34,6 +34,9 @@ Telegram-бот + Web App (Mini App в чате) для управления з�
 
 ## 2. Топология Railway
 
+> Пошаговая инструкция по выкату (что нажимать, в каком порядке, что проверить
+> после) — в [DEPLOY.md](DEPLOY.md). Здесь — устройство и обоснование.
+
 Проект `strong-wisdom` в Railway содержит четыре сервиса:
 
 ```
@@ -98,7 +101,7 @@ Telegram-бот + Web App (Mini App в чате) для управления з�
 | `TG_USE_WEBHOOK` | `1` → бот принимает апдейты через webhook, иначе polling |
 | `TG_WEBHOOK_SECRET` | Секрет для проверки запросов от Telegram (обязателен в webhook-режиме) |
 | `BOT_MODE` | `all` / `bot` / `webapp` — что запускает контейнер |
-| `NIXPACKS_PYTHON_VERSION` | `3.11` — пин версии Python в Railway |
+| ~~`NIXPACKS_PYTHON_VERSION`~~ | Не нужна: билд на Railpack, версия Python — из `runtime.txt` |
 | `ADMIN_IDS`, `BOSS_IDS`, `MANAGER_IDS` | CSV Telegram user_id для bootstrap ролей |
 | `ALLOWED_USERS` | CSV id, кому давать роль `manager` по умолчанию |
 | `BASE_CURRENCY` | По умолчанию `USD`, валюта для UI |

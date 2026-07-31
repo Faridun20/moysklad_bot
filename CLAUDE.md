@@ -29,10 +29,11 @@ python -m tasks.run_backup               # дамп БД → gzip → прива
 python -m tasks.run_machines_archive     # техника: проданное >90 дней назад → archived (ночью, T4.3)
 ```
 
-**Сборка/деплой:** Railway **Railpack** (не Nixpacks) — `railway.json`
-(`deploy.aptPackages: [postgresql-client]`). Требует Shared Variable
-`MISE_PYTHON_GITHUB_ATTESTATIONS=false` (иначе mise падает на attestations
-Python 3.11.9).
+**Сборка/деплой:** Railway **Railpack** (не Nixpacks) — `railpack.json`
+(`deploy.aptPackages: [postgresql-client]`), версия Python — `runtime.txt`.
+Attestations mise отключены в репозитории (`mise.toml`), а НЕ через Shared
+Variable: новые сервисы (cron'ы) переменную не наследуют и валили билд.
+Пошаговый выкат с нуля — `DEPLOY.md`.
 
 Конфиг тулчейна — в `pyproject.toml` (`[tool.ruff]`, `[tool.pytest.ini_options]`,
 `[tool.mypy]`, `[tool.coverage]`). Версии dev-тулов запинены в `requirements-dev.txt`.
