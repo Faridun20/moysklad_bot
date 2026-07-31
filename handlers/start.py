@@ -106,13 +106,12 @@ _COMMANDS_MANAGER = [
     BotCommand(command="start", description="🏠 Главное меню"),
     BotCommand(command="pay", description="💵 Отправить платёж"),
     BotCommand(command="find", description="🔍 Поиск (заказ/платёж/клиент)"),
-    # Волна 4: техника. Экрана в WebApp нет — фото и моточасы вводят в чате.
+    # Техника: раздел в WebApp, в боте — быстрый взгляд и моточасы с площадки,
+    # где открыть WebApp дольше, чем набрать два числа.
     BotCommand(command="machines", description="🚜 Машины"),
-    BotCommand(command="newmachine", description="🚜 Завести машину"),
+    BotCommand(command="hours", description="⏱ Моточасы: /hours 12 15200"),
 ]
 _COMMANDS_BOSS = _COMMANDS_MANAGER + [
-    BotCommand(command="sell", description="🚜 Продажа машины"),
-    BotCommand(command="credit", description="🚜 Машина в рассрочку"),
     BotCommand(command="machine_deals", description="💳 Рассрочки по технике"),
     BotCommand(command="ship", description="🚚 Отгрузить заказ"),
     BotCommand(command="shipments", description="🚚 Последние отгрузки"),
@@ -440,6 +439,10 @@ _RETIRED_COMMANDS = {
     "cashbox": "Финансы → Касса",
     "reports": "Аналитика",
     "payreport": "Финансы → История платежей",
+    # Техника: карточка, фото и сделки переехали в WebApp.
+    "newmachine": "Заказы → Техника → «Завести машину»",
+    "sell": "Заказы → Техника → машина → «Продажа»",
+    "credit": "Заказы → Техника → машина → «Рассрочка»",
 }
 
 

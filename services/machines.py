@@ -57,10 +57,60 @@ STATUS_LABELS = {
 # проверяется тем же CAS-UPDATE, а не отдельным SELECT'ом.
 _SELLABLE = ("in_transit", "in_stock", "reserved")
 
+# Разрешённые переходы статуса «руками». Живут здесь, а не в клавиатуре бота и
+# не в шаблоне WebApp: интерфейсов у машины теперь два, а граф должен быть один
+# — иначе первое же изменение разъедет их между собой.
+#
+# Продажи и рассрочки в графе нет намеренно: они требуют цены и покупателя,
+# поэтому идут через `create_deal`, который двигает статус сам.
+NEXT_STATUSES: dict[str, tuple[str, ...]] = {
+    "in_transit": ("in_stock",),
+    "in_stock": ("reserved",),
+    "reserved": ("in_stock",),
+    "sold": ("archived",),
+    "on_credit": (),
+    "archived": (),
+}
+
+
+# Подпись действия зависит от ПАРЫ статусов, а не от целевого: «на склад» из
+# пути и «снять бронь» из брони ведут в один и тот же `in_stock`, но говорят о
+# разном. Держим здесь, чтобы бот и WebApp не расходились в формулировках.
+TRANSITION_LABELS: dict[tuple[str, str], str] = {
+    ("in_transit", "in_stock"): "🏗 На склад",
+    ("in_stock", "reserved"): "🔒 Забронировать",
+    ("reserved", "in_stock"): "🏗 Снять бронь",
+    ("sold", "archived"): "📦 В архив",
+}
+
+
+def next_statuses(status: str | None) -> tuple[str, ...]:
+    """Куда можно перевести машину из текущего статуса."""
+    return NEXT_STATUSES.get(status or "", ())
+
+
+def next_status_options(status: str | None) -> list[dict]:
+    """То же, но с подписями кнопок — интерфейсу нужен готовый список."""
+    current = status or ""
+    return [
+        {
+            "status": target,
+            "label": TRANSITION_LABELS.get(
+                (current, target), STATUS_LABELS.get(target, target)
+            ),
+        }
+        for target in next_statuses(current)
+    ]
+
 DEAL_KINDS = ("sale", "credit")
 
 # Себестоимость — только для руководства.
 _BOSS_ONLY_FIELDS = ("cost_cents",)
+
+# Паспорт покупателя — персональные данные, нужные для договора рассрочки.
+# Режем по той же причине и в том же месте, что и себестоимость: покажет их
+# ровно тот слой, который читает данные, а не каждый шаблон по отдельности.
+_BOSS_ONLY_DEAL_FIELDS = ("buyer_passport",)
 
 _VIN_SEPARATORS = re.compile(r"[\s\-—–_]+")
 _VIN_MAX = 64
@@ -90,6 +140,17 @@ def visible_machine(row: dict | None, role: str | None) -> dict | None:
     data = dict(row)
     if role not in ("admin", "boss"):
         for field in _BOSS_ONLY_FIELDS:
+            data.pop(field, None)
+    return data
+
+
+def visible_deal(row: dict | None, role: str | None) -> dict | None:
+    """Сделка без паспорта покупателя для всех, кроме руководства."""
+    if row is None:
+        return None
+    data = dict(row)
+    if role not in ("admin", "boss"):
+        for field in _BOSS_ONLY_DEAL_FIELDS:
             data.pop(field, None)
     return data
 
@@ -228,6 +289,23 @@ async def list_machines(*, role: str | None = None, status: str | None = None) -
     query += " ORDER BY id DESC"
     rows = await adb_core.fetch(query, *params)
     return [visible_machine(r, role) or {} for r in rows]
+
+
+async def count_by_status() -> dict[str, int]:
+    """Сколько машин в каждом статусе — для счётчиков в фильтре.
+
+    Одним GROUP BY, а не шестью запросами из ручки. Ключ `all` — размер списка
+    БЕЗ фильтра, то есть без архива: считать его на фронте значит продублировать
+    там правило «архив в общий список не входит» из `list_machines`.
+    """
+    rows = await adb_core.fetch("SELECT status, COUNT(*) AS n FROM machines GROUP BY status")
+    counts = dict.fromkeys(STATUSES, 0)
+    for row in rows:
+        status = str(row["status"])
+        if status in counts:
+            counts[status] = int(row["n"])
+    counts["all"] = sum(n for s, n in counts.items() if s != "archived")
+    return counts
 
 
 async def update_machine_fields(
@@ -536,20 +614,22 @@ async def close_deal(deal_id: int, *, user_id: int, full_name: str = "") -> dict
     return {"ok": True}
 
 
-async def list_deals(machine_id: int) -> list[dict]:
-    return await adb_core.fetch(
+async def list_deals(machine_id: int, *, role: str | None = None) -> list[dict]:
+    rows = await adb_core.fetch(
         "SELECT * FROM machine_deals WHERE machine_id = $1 ORDER BY sold_at DESC, id DESC",
         machine_id,
     )
+    return [visible_deal(r, role) or {} for r in rows]
 
 
-async def get_open_credit_deals() -> list[dict]:
+async def get_open_credit_deals(*, role: str | None = None) -> list[dict]:
     """Незакрытые рассрочки — для напоминаний о сроке."""
-    return await adb_core.fetch(
+    rows = await adb_core.fetch(
         "SELECT d.*, m.vin, m.name FROM machine_deals d "
         "JOIN machines m ON m.id = d.machine_id "
         "WHERE d.kind = 'credit' AND d.closed_at IS NULL ORDER BY d.due_date"
     )
+    return [visible_deal(r, role) or {} for r in rows]
 
 
 # ─── Архивация (T4.3) ────────────────────────────────────────────────────────

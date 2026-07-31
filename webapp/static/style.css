@@ -1091,6 +1091,17 @@ body {
 [data-status="upcoming"]  { --status-c: var(--info);         --status-bg: var(--info-bg); }
 [data-status="partial"]   { --status-c: var(--warn-strong);  --status-bg: var(--warn-bg); }
 
+/* Техника. Цвет отвечает на один вопрос — «нужно ли что-то делать»:
+   в пути — процесс идёт (info), на складе — можно продавать (success),
+   бронь и рассрочка ждут денег и решения (warn), продана и архив — закрыто
+   (neutral). Поэтому пары повторяют цвет: различает их подпись, а не оттенок. */
+[data-status="in_transit"] { --status-c: var(--info);        --status-bg: var(--info-bg); }
+[data-status="in_stock"]   { --status-c: var(--success);     --status-bg: var(--success-bg); }
+[data-status="reserved"]   { --status-c: var(--warn-strong); --status-bg: var(--warn-bg); }
+[data-status="on_credit"]  { --status-c: var(--warn-strong); --status-bg: var(--warn-bg); }
+[data-status="sold"]       { --status-c: var(--neutral);     --status-bg: var(--neutral-bg); }
+[data-status="archived"]   { --status-c: var(--neutral);     --status-bg: var(--neutral-bg); }
+
 /* Карточка со статусом: цветная полоса слева. */
 .order-card[data-status],
 .debt-card[data-status] { border-left-color: var(--status-c); }
@@ -1868,22 +1879,35 @@ body {
   width: 100%;
   max-width: 360px;
   box-shadow: var(--shadow-modal);
+  /* Форма техники — до десяти полей: без прокрутки нижние кнопки уезжают за
+     край экрана вместе с «Сохранить». */
+  max-height: 82vh;
+  overflow-y: auto;
 }
+.c-sheet-title,
 .price-modal-title {
   font-size: 16px;
   font-weight: 600;
   margin-bottom: 16px;
 }
+/* Поле формы и ряд кнопок — примитивы: сейчас ими пользуются редактор цены и
+   формы техники, дальше — всё остальное. Имена `.price-*` остаются алиасами
+   на переходный период (см. конвенции дизайн-системы в CLAUDE.md). */
+.c-field,
 .price-field {
   display: block;
   margin-bottom: 14px;
 }
+.c-field span,
 .price-field span {
   display: block;
   font-size: 13px;
   color: var(--text-mute);
   margin-bottom: 5px;
 }
+.c-field input,
+.c-field textarea,
+.c-field select,
 .price-field input {
   width: 100%;
   padding: 11px 13px;
@@ -1893,14 +1917,69 @@ body {
   background: var(--bg-page);
   color: var(--text);
   outline: none;
+  font-family: inherit;
 }
+.c-field input:focus,
+.c-field textarea:focus,
 .price-field input:focus { border-color: var(--accent); }
+.c-field-hint {
+  display: block;
+  margin-top: 5px;
+  font-size: var(--text-xs);
+  color: var(--text-mute);
+}
+/* Ошибка внутри формы, а не поверх неё: системный алерт закрывает диалог, и
+   при опечатке в одном поле остальные пришлось бы набирать заново. */
+.c-error {
+  margin-bottom: var(--sp-3);
+  padding: var(--sp-2) 10px;
+  border-radius: var(--radius-sm);
+  background: var(--danger-bg);
+  color: var(--danger);
+  font-size: var(--text-sm);
+}
+.c-error[hidden] { display: none; }
+.c-actions,
 .price-actions {
   display: flex;
   gap: 10px;
   margin-top: 8px;
 }
+.c-actions button,
 .price-actions button { flex: 1; }
+/* Ряд действий в карточке: кнопки переносятся, а не сплющиваются до нечитаемой
+   ширины — их бывает до пяти (моточасы, правка, статус, продажа, рассрочка). */
+.c-actions--wrap { flex-wrap: wrap; margin-bottom: var(--sp-3); }
+.c-actions--wrap button { flex: 1 1 46%; min-height: 44px; }
+
+/* Лента фотографий машины: горизонтальная прокрутка, квадратные превью.
+   Снимки приходят с телефона в любой ориентации — object-fit: cover не даёт
+   ленте прыгать по высоте. */
+.machine-photos {
+  display: flex;
+  gap: var(--sp-2);
+  overflow-x: auto;
+  padding-bottom: var(--sp-2);
+  margin-bottom: var(--sp-3);
+  -webkit-overflow-scrolling: touch;
+}
+.machine-photo {
+  flex: 0 0 auto;
+  width: 96px;
+  height: 96px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--neutral-bg);
+  cursor: pointer;
+}
+.machine-photo img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
 
 /* ─── Тосты (лёгкая неблокирующая обратная связь) ─────────────── */
 .toast-host {

@@ -146,6 +146,7 @@ cron-задач, проверка после выката, грабли). Поч
 | `TZ` | `Asia/Tashkent` или другой |
 | `PG_POOL_MIN`, `PG_POOL_MAX` | Размер пула коннектов Postgres (default 1/10) |
 | `BACKUP_TG_CHAT_ID` | ID приватного TG-канала для ежедневного backup БД |
+| `MACHINE_PHOTOS_TG_CHAT_ID` | ID приватного TG-канала для фото техники, загруженных из WebApp. Без него загрузка выключена (фото можно прислать боту) |
 | `DEV_AUTH_BYPASS=1` + `DEV_USER_ID` | **Только локально:** обход Telegram-авторизации для просмотра WebApp в браузере (самоблокируется при `DATABASE_URL`). См. «Визуальная проверка WebApp» выше |
 
 > **Telegram webhook** (вместо polling, опц., только ops): `TG_USE_WEBHOOK=1` +

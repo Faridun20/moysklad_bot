@@ -21,7 +21,7 @@ from services.database import (
     prune_notified_shipments,
 )
 from services import metrics
-from utils.helpers import extract_id_from_href
+from utils.helpers import extract_id_from_href, redact_token
 from utils.formatters import format_shipment, DIV
 
 logger = logging.getLogger(__name__)
@@ -65,10 +65,13 @@ async def get_tg_session() -> aiohttp.ClientSession:
 
 
 def _redact_token(text: str) -> str:
-    """Убрать TELEGRAM_TOKEN из строки (для логов ошибок)."""
-    if TELEGRAM_TOKEN and TELEGRAM_TOKEN in text:
-        return text.replace(TELEGRAM_TOKEN, "***")
-    return text
+    """Убрать TELEGRAM_TOKEN из строки (для логов ошибок).
+
+    Реализация переехала в `utils.helpers.redact_token` — тем же понадобился
+    прокси фотографий техники в webapp. Имя оставлено как есть: им пользуются
+    вызовы ниже и тесты.
+    """
+    return redact_token(text)
 
 
 # ─── Видимость массового отказа отправки ────────────────────────────────────

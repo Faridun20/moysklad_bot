@@ -108,38 +108,7 @@ def _machine(uid=1, vin="JCB-1", **over):
     return res["machine_id"]
 
 
-# ─── Заведение и список ───────────────────────────────────────────────────────
-
-
-def test_new_machine_one_liner_creates_and_shows_card(isolated_db):
-    db = isolated_db
-    from handlers.machines import cmd_new_machine
-
-    _setup(db)
-    msg = _FakeMessage(text="/newmachine JCB-3CX-9911 JCB 3CX 2019", uid=1)
-    asyncio.run(cmd_new_machine(msg))
-    assert "заведена" in _texts(msg)
-    assert "JCB3CX9911" in _texts(msg)  # VIN нормализован
-
-
-def test_new_machine_requires_name(isolated_db):
-    db = isolated_db
-    from handlers.machines import cmd_new_machine
-
-    _setup(db)
-    msg = _FakeMessage(text="/newmachine JCB-1", uid=1)
-    asyncio.run(cmd_new_machine(msg))
-    assert "Формат" in _texts(msg)
-
-
-def test_new_machine_denied_for_guest(isolated_db):
-    db = isolated_db
-    from handlers.machines import cmd_new_machine
-
-    _setup(db)
-    msg = _FakeMessage(text="/newmachine X Y", uid=99)  # роли нет
-    asyncio.run(cmd_new_machine(msg))
-    assert "доступа" in _texts(msg).lower()
+# ─── Список и карточка ────────────────────────────────────────────────────────
 
 
 def test_list_shows_machines_with_buttons(isolated_db):
@@ -154,17 +123,16 @@ def test_list_shows_machines_with_buttons(isolated_db):
     assert f"mach:{mid}" in _kb_callbacks(kwargs.get("reply_markup"))
 
 
-def test_empty_list_explains_how_to_add(isolated_db):
+def test_empty_list_points_to_the_webapp(isolated_db):
+    """Заведение машины переехало — подсказка должна вести туда, где оно есть."""
     db = isolated_db
     from handlers.machines import cmd_machines
 
     _setup(db)
     msg = _FakeMessage(text="/machines", uid=1)
     asyncio.run(cmd_machines(msg))
-    assert "/newmachine" in _texts(msg)
-
-
-# ─── Карточка и роли ──────────────────────────────────────────────────────────
+    assert "Техника" in _texts(msg)
+    assert "/newmachine" not in _texts(msg)
 
 
 def test_card_hides_cost_from_manager(isolated_db):
@@ -186,105 +154,77 @@ def test_card_hides_cost_from_manager(isolated_db):
     assert "Себестоимость" in _texts(boss.message)
 
 
-def test_card_offers_status_buttons_only_to_boss(isolated_db):
+def test_card_no_longer_offers_actions_moved_to_webapp(isolated_db):
+    """Кнопка, за которой в боте больше нет обработчика, обещает операцию,
+    которой нет. Остаться должен только возврат к списку."""
     db = isolated_db
     from handlers.machines import cb_machine_card
 
     _setup(db)
     mid = _machine()
-
-    mgr = _FakeCall(f"mach:{mid}", uid=1)
-    asyncio.run(cb_machine_card(mgr))
-    mgr_cbs = _kb_callbacks(mgr.message.answers[-1][1].get("reply_markup"))
-    assert not any(c.startswith("mach_st:") for c in mgr_cbs)
-    assert f"mach_hours:{mid}" in mgr_cbs  # моточасы менеджеру доступны
-
     boss = _FakeCall(f"mach:{mid}", uid=2)
     asyncio.run(cb_machine_card(boss))
-    boss_cbs = _kb_callbacks(boss.message.answers[-1][1].get("reply_markup"))
-    assert f"mach_st:{mid}:in_stock" in boss_cbs
-
-
-def test_status_change_denied_for_manager(isolated_db):
-    db = isolated_db
-    from handlers.machines import cb_set_status
-    from services import machines
-
-    _setup(db)
-    mid = _machine()
-    call = _FakeCall(f"mach_st:{mid}:in_stock", uid=1)
-    asyncio.run(cb_set_status(call))
-    assert any("руководител" in (a[0] or "").lower() for a in call.alerts)
-    assert asyncio.run(machines.get_machine(mid, role="boss"))["status"] == "in_transit"
-
-
-def test_boss_status_change_applies(isolated_db):
-    db = isolated_db
-    from handlers.machines import cb_set_status
-    from services import machines
-
-    _setup(db)
-    mid = _machine()
-    call = _FakeCall(f"mach_st:{mid}:in_stock", uid=2)
-    asyncio.run(cb_set_status(call))
-    assert asyncio.run(machines.get_machine(mid, role="boss"))["status"] == "in_stock"
+    cbs = _kb_callbacks(boss.message.answers[-1][1].get("reply_markup"))
+    assert cbs == ["mach_list"]
 
 
 # ─── Моточасы ─────────────────────────────────────────────────────────────────
 
 
-def test_hours_flow_drops_keyboard_and_records(isolated_db):
-    """T3.2: пока вводится число, кнопки карточки не должны работать — второй
-    тап по другой машине переписал бы machine_id в state."""
+def test_hours_one_liner_records(isolated_db):
+    """Показание снимают с площадки: два числа одной строкой, без диалога."""
     db = isolated_db
-    from handlers.machines import cb_add_hours, process_hours
+    from handlers.machines import cmd_hours
     from services import machines
 
     _setup(db)
     mid = _machine(hours=1000)
-    state = _FakeState()
-    call = _FakeCall(f"mach_hours:{mid}", uid=1)
-    asyncio.run(cb_add_hours(call, state))
-    assert any(a[0] == "MARKUP" and a[1] is None for a in call.message.answers)
-
-    asyncio.run(process_hours(_FakeMessage(text="1250", uid=1), state))
+    msg = _FakeMessage(text=f"/hours {mid} 1250", uid=1)
+    asyncio.run(cmd_hours(msg))
     assert asyncio.run(machines.get_machine(mid, role="boss"))["hours"] == 1250
+    assert "Моточасы" in _texts(msg)
 
 
-def test_hours_rejects_non_number(isolated_db):
+def test_hours_explains_the_format(isolated_db):
     db = isolated_db
-    from handlers.machines import process_hours
+    from handlers.machines import cmd_hours
 
     _setup(db)
     mid = _machine()
-    state = _FakeState()
-    asyncio.run(state.update_data(machine_id=mid))
-    msg = _FakeMessage(text="много", uid=1)
-    asyncio.run(process_hours(msg, state))
-    assert "целое число" in _texts(msg)
+    for text in (f"/hours {mid}", "/hours много 100", f"/hours {mid} много"):
+        msg = _FakeMessage(text=text, uid=1)
+        asyncio.run(cmd_hours(msg))
+        assert "Формат" in _texts(msg), text
+
+
+def test_hours_denied_for_guest(isolated_db):
+    db = isolated_db
+    from handlers.machines import cmd_hours
+
+    _setup(db)
+    mid = _machine()
+    msg = _FakeMessage(text=f"/hours {mid} 100", uid=99)  # роли нет
+    asyncio.run(cmd_hours(msg))
+    assert "доступа" in _texts(msg).lower()
 
 
 def test_hours_rollback_offers_force_to_boss_only(isolated_db):
     """Откат счётчика — либо опечатка, либо замена счётчика. Менеджеру просто
     отказ, боссу — кнопка подтверждения (решение уходит в аудит)."""
     db = isolated_db
-    from handlers.machines import cb_force_hours, process_hours
+    from handlers.machines import cb_force_hours, cmd_hours
     from services import machines
 
     _setup(db)
     mid = _machine(hours=15000)
 
-    mgr_state = _FakeState()
-    asyncio.run(mgr_state.update_data(machine_id=mid))
-    mgr_msg = _FakeMessage(text="1500", uid=1)
-    asyncio.run(process_hours(mgr_msg, mgr_state))
+    mgr_msg = _FakeMessage(text=f"/hours {mid} 1500", uid=1)
+    asyncio.run(cmd_hours(mgr_msg))
     assert "меньше предыдущего" in _texts(mgr_msg)
     assert mgr_msg.answers[-1][1].get("reply_markup") is None  # кнопки force нет
 
-    boss_state = _FakeState()
-    asyncio.run(boss_state.update_data(machine_id=mid))
-    boss_msg = _FakeMessage(text="1500", uid=2)
-    asyncio.run(process_hours(boss_msg, boss_state))
+    boss_msg = _FakeMessage(text=f"/hours {mid} 1500", uid=2)
+    asyncio.run(cmd_hours(boss_msg))
     cbs = _kb_callbacks(boss_msg.answers[-1][1].get("reply_markup"))
     assert f"mach_hours_f:{mid}:1500" in cbs
 
@@ -293,130 +233,68 @@ def test_hours_rollback_offers_force_to_boss_only(isolated_db):
     assert asyncio.run(machines.get_machine(mid, role="boss"))["hours"] == 1500
 
 
-# ─── Фото ─────────────────────────────────────────────────────────────────────
+# ─── Рассрочки ────────────────────────────────────────────────────────────────
 
 
-def test_photos_accepted_in_batch_and_deduped(isolated_db):
-    """Альбом приходит отдельными сообщениями, поэтому состояние держим до
-    /done; повторная отправка того же снимка не создаёт дубль."""
+def test_open_credits_listed_without_close_buttons(isolated_db):
+    """Закрытие рассрочки переехало в WebApp — кнопки без обработчика тут быть
+    не должно, но список кому напоминать боссу по-прежнему нужен в чате."""
     db = isolated_db
-    from handlers.machines import cb_add_photo, cmd_photo_done, process_photo
+    from handlers.machines import cmd_open_credits
     from services import machines
 
     _setup(db)
     mid = _machine()
-    state = _FakeState()
-    asyncio.run(cb_add_photo(_FakeCall(f"mach_photo:{mid}", uid=1), state))
-
-    first = _FakeMessage(uid=1, photo=[_FakePhotoSize("f1", "u1")])
-    asyncio.run(process_photo(first, state))
-    second = _FakeMessage(uid=1, photo=[_FakePhotoSize("f2", "u2")])
-    asyncio.run(process_photo(second, state))
-    dup = _FakeMessage(uid=1, photo=[_FakePhotoSize("f3", "u1")])
-    asyncio.run(process_photo(dup, state))
-    assert "уже в карточке" in _texts(dup)
-    assert len(asyncio.run(machines.list_photos(mid))) == 2
-
-    done = _FakeMessage(text="/done", uid=1)
-    asyncio.run(cmd_photo_done(done, state))
-    assert "Фото: 2" in _texts(done)
-
-
-def test_photo_takes_largest_size(isolated_db):
-    """Telegram отдаёт лестницу размеров — сохранять надо самый крупный."""
-    db = isolated_db
-    from handlers.machines import process_photo
-    from services import machines
-
-    _setup(db)
-    mid = _machine()
-    state = _FakeState()
-    asyncio.run(state.update_data(machine_id=mid))
-    sizes = [_FakePhotoSize("small", "u-small"), _FakePhotoSize("large", "u-large")]
-    asyncio.run(process_photo(_FakeMessage(uid=1, photo=sizes), state))
-    photos = asyncio.run(machines.list_photos(mid))
-    assert photos[0]["tg_file_id"] == "large"
-
-
-def test_non_photo_in_photo_flow_is_explained(isolated_db):
-    db = isolated_db
-    from handlers.machines import process_photo_wrong_type
-
-    _setup(db)
-    msg = _FakeMessage(text="вот файл", uid=1)
-    asyncio.run(process_photo_wrong_type(msg))
-    assert "фотографию" in _texts(msg)
-
-
-# ─── Сделки ───────────────────────────────────────────────────────────────────
-
-
-def test_sell_one_liner_creates_deal(isolated_db):
-    db = isolated_db
-    from handlers.machines import cmd_sell
-    from services import machines
-
-    _setup(db)
-    mid = _machine()
-    msg = _FakeMessage(text=f"/sell {mid} 25000 Иванов Пётр", uid=2)
-    asyncio.run(cmd_sell(msg))
-    assert "оформлена" in _texts(msg)
-    deals = asyncio.run(machines.list_deals(mid))
-    assert len(deals) == 1
-    assert deals[0]["price_cents"] == 25_000_00
-    assert deals[0]["buyer_name"] == "Иванов Пётр"
-
-
-def test_sell_denied_for_manager(isolated_db):
-    db = isolated_db
-    from handlers.machines import cmd_sell
-    from services import machines
-
-    _setup(db)
-    mid = _machine()
-    msg = _FakeMessage(text=f"/sell {mid} 25000 Иванов", uid=1)
-    asyncio.run(cmd_sell(msg))
-    assert "руководител" in _texts(msg).lower()
-    assert asyncio.run(machines.list_deals(mid)) == []
-
-
-def test_sell_rejects_bad_price(isolated_db):
-    db = isolated_db
-    from handlers.machines import cmd_sell
-
-    _setup(db)
-    mid = _machine()
-    msg = _FakeMessage(text=f"/sell {mid} бесплатно Иванов", uid=2)
-    asyncio.run(cmd_sell(msg))
-    assert "Цена" in _texts(msg)
-
-
-def test_credit_requires_due_date_format(isolated_db):
-    db = isolated_db
-    from handlers.machines import cmd_credit
-
-    _setup(db)
-    mid = _machine()
-    msg = _FakeMessage(text=f"/credit {mid} 25000 31.12.2026 Иванов", uid=2)
-    asyncio.run(cmd_credit(msg))
-    assert "ГГГГ-ММ-ДД" in _texts(msg)
-
-
-def test_credit_creates_deal_and_closes_from_list(isolated_db):
-    db = isolated_db
-    from handlers.machines import cb_close_deal, cmd_credit, cmd_open_credits
-    from services import machines
-
-    _setup(db)
-    mid = _machine()
-    asyncio.run(cmd_credit(_FakeMessage(text=f"/credit {mid} 25000 2026-12-31 Иванов", uid=2)))
-    assert asyncio.run(machines.get_machine(mid, role="boss"))["status"] == "on_credit"
+    deal = asyncio.run(
+        machines.create_deal(
+            mid, kind="credit", price_cents=25_000_00, buyer_name="Иванов",
+            due_date="2026-12-31", created_by=2,
+        )
+    )
+    assert deal["ok"], deal
 
     listing = _FakeMessage(text="/machine_deals", uid=2)
     asyncio.run(cmd_open_credits(listing, bot=None))
-    deal_id = asyncio.run(machines.list_deals(mid))[0]["id"]
-    assert f"mach_deal_close:{deal_id}" in _kb_callbacks(listing.answers[-1][1].get("reply_markup"))
+    text, kwargs = listing.answers[-1]
+    assert "Иванов" in text
+    assert not any(c.startswith("mach_deal_close") for c in _kb_callbacks(kwargs.get("reply_markup")))
 
-    asyncio.run(cb_close_deal(_FakeCall(f"mach_deal_close:{deal_id}", uid=2)))
-    assert asyncio.run(machines.get_machine(mid, role="boss"))["status"] == "sold"
-    assert asyncio.run(machines.get_open_credit_deals()) == []
+
+def test_open_credits_denied_for_manager(isolated_db):
+    db = isolated_db
+    from handlers.machines import cmd_open_credits
+
+    _setup(db)
+    msg = _FakeMessage(text="/machine_deals", uid=1)
+    asyncio.run(cmd_open_credits(msg, bot=None))
+    assert "доступа" in _texts(msg).lower()
+
+
+def test_open_credits_hides_passport(isolated_db):
+    """Паспорт покупателя в чат не печатаем — он и в сервисе режется по роли."""
+    db = isolated_db
+    from handlers.machines import cmd_open_credits
+    from services import machines
+
+    _setup(db)
+    mid = _machine()
+    asyncio.run(
+        machines.create_deal(
+            mid, kind="credit", price_cents=1000, buyer_name="Иванов",
+            buyer_passport="AB1234567", due_date="2026-12-31", created_by=2,
+        )
+    )
+    msg = _FakeMessage(text="/machine_deals", uid=2)
+    asyncio.run(cmd_open_credits(msg, bot=None))
+    assert "AB1234567" not in _texts(msg)
+
+
+# ─── Снятые команды ───────────────────────────────────────────────────────────
+
+
+def test_retired_machine_commands_point_to_the_webapp():
+    """Набравший `/sell` по памяти должен понять, что бот не сломался."""
+    from handlers.start import _RETIRED_COMMANDS
+
+    for command in ("newmachine", "sell", "credit"):
+        assert "Техника" in _RETIRED_COMMANDS[command], command

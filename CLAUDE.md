@@ -52,7 +52,10 @@ Variable: новые сервисы (cron'ы) переменную не насл
 `dep_*`, `ret_*`, `unfreeze:`), ops/admin-команды без API-аналога (`/audit`,
 `/log`, `/users`, `/addrole`, `/deactivate`, `/reactivate`, `/syncms`,
 `/msstaff`, `/sync_payments`, `/frozen`, `/refresh`, `/snapshot`),
-`/find`, `/ship`, `/cancel`, `/shipments`, `/pay`.
+`/find`, `/ship`, `/cancel`, `/shipments`, `/pay`, а из техники — только
+просмотр (`/machines`, карточка, `/machine_deals`) и `/hours <id> <часы>`
+(показание снимают с площадки, где открыть WebApp дольше, чем набрать два
+числа).
 Новую callback-кнопку рисуешь — проверь, что на неё есть хендлер:
 `tests/test_bot_trimmed.py::test_no_dangling_callback_buttons_in_bot_code`
 сканирует все `callback_data` в `handlers/`, `tasks/`, `utils/`.
@@ -107,6 +110,31 @@ tg_file_id — нет). VIN нормализуется (upper, без пробе
 не поднимаем — `file_id` привязан к паре «бот + сервер», переезд обнулил бы все
 `tg_file_id`; фиксируем сейчас, пока таблица пустая.
 
+**Техника в WebApp (раздел «Заказы → Техника»).** Формы, фотографии и сделки —
+в WebApp (`/api/machines/*`), в боте остались просмотр и `/hours`. Что помнить:
+- **Граф переходов статуса — один**, `machines.NEXT_STATUSES` / `next_status_options`
+  (подпись зависит от ПАРЫ статусов: «на склад» и «снять бронь» ведут в один
+  `in_stock`). Проверяется он **в ручке**, а не в `set_status`: внутренние
+  вызовы (`create_deal`, `close_deal`) двигают статус в обход ручного графа
+  законно. Продажи/рассрочки в графе нет — им нужны цена и покупатель.
+- **Роль режется в слое чтения**, как себестоимость: `visible_machine`
+  (`cost_cents`) и `visible_deal` (`buyer_passport`). На запись — тоже: что
+  менеджер не видит, того он и не задаёт (иначе поле возвращается через форму).
+- **`tg_file_id` наружу не выходит.** Файловый URL Telegram содержит токен
+  бота, поэтому фото проксируются `/api/machines/photo`; `photo_id` ищется
+  среди фото заявленной машины (гейт от подстановки чужого id), кэш — по
+  `file_unique_id`. Текст ошибки Bot API логируй через `utils.helpers.redact_token`.
+- **Загрузка — base64 в JSON**, не multipart: `python-multipart` в зависимостях
+  нет, `UploadFile`/`Form` без него роняют приложение на старте. Тип проверяем
+  по сигнатуре байтов, не по mime из data-URL. Канал-хранилище —
+  `MACHINE_PHOTOS_TG_CHAT_ID`; без него загрузка выключена (`can_upload_photo`
+  в ответе карточки), фото по-прежнему шлют боту.
+- Ручки пиши **в `webapp/server.py`**: `scripts/gen_role_matrix.py` парсит
+  `allowed_roles` только оттуда (константы вроде `_MACHINE_ROLES` он резолвит).
+- **Правка VIN и удаление машины не реализованы** осознанно: `vin` не в
+  whitelist `update_machine_fields`, `delete_machine` ниоткуда не вызывается.
+  Опечатка в серийнике сейчас неисправима — отдельная задача.
+
 **Аналитика менеджеров:** только из ЛОКАЛЬНЫХ `orders` (`get_manager_performance`, GROUP BY `user_id`) — в demand'ах МС нет надёжной привязки к менеджеру (`telegram_full_name` ставится лишь когда demand создал бот). Сурфейсится в webapp company-аналитике (`top_managers`).
 
 **Backup:**
@@ -155,10 +183,22 @@ tg_file_id — нет). VIN нормализуется (upper, без пробе
 `--status-c`/`--status-bg`; НЕ заводи для нового состояния свой класс с цветом.
 Переключатели: `.seg` (уровень 1) и `.subseg` (уровень 2 в Финансах) — третьего
 языка быть не должно; `.cat-btn`/`.cur-btn` — задокументированные исключения.
+Формы: поле — `.c-field`, ряд кнопок — `.c-actions` (`.price-*` остались
+алиасами), ошибка показывается ВНУТРИ формы (`.c-error`), а не системным
+алертом — он закрывает диалог вместе с уже введёнными данными.
 Деньги форматируй `formatMoney`, МС-баланс — `msBalanceLabel`; пустое/ошибка/
 скелетон — `emptyState`/`errorBoxHtml`/`skeleton` из `helpers.js` (они
-экранируют вход). Инварианты держит `webapp/static/__tests__/design-system.test.js`:
+экранируют вход). Запросы: `api()` бросает Error(detail) — этого хватает
+почти везде; `apiResult()` отдаёт полное тело и код, он нужен там, где ответ
+409 несёт данные для решения (`needs_force`, `current`).
+Под-вкладки «Заказы/Каталог/Техника»: шелл (`ordersShellHtml`) обязан входить
+в КАЖДЫЙ `innerHTML` ветки, включая скелетон и ошибку — иначе первый же
+ре-рендер уносит переключатель (UI-BUG-04).
+Инварианты держит `webapp/static/__tests__/design-system.test.js`:
 забытый цвет статуса, отсутствие тёмного варианта и таргет мельче 44px валят CI.
+Статус, объявленный только у конкретного класса (как `in_stock` у
+`.stock-badge`), в ОБЩЕЙ матрице не появляется — для него нужна отдельная
+строка, иначе элемент останется бесцветным при формально «объявленном» статусе.
 Права по ролям для ручного QA: `python scripts/gen_role_matrix.py` → `UI_QA_ROLES.md`.
 
 **Фронт (Vitest):** чистые хелперы `webapp/static/helpers.js` + jsdom-смоук загрузки `app.js` — в `webapp/static/__tests__/`. Гоняет CI (`npm test`). Локально Node нет → `scripts/setup-node.ps1` ставит portable Node в `.tools/node` (gitignore, ~35MB zip с nodejs.org, без admin), `scripts/test-js.ps1` делает `npm install` (1×) + `vitest run`. Скрипты — UTF-8 **с BOM** (иначе PowerShell 5.1 читает их как ANSI и кириллица в Write-Host превращается в кракозябры).
