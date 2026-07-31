@@ -34,7 +34,7 @@ Telegram, руководители одобряют отгрузки и подт
 - **PostgreSQL**: денежное ядро (заказы/платежи/кредит/сдачи/возвраты) — на **`asyncpg`** (native async, `services/adb_core.py`; в тестах `aiosqlite`). Остальное — `psycopg2-binary` + `ThreadedConnectionPool`, обёрнут в `asyncio.to_thread`.
 - **Redis** (опционально) — FSM storage и кэши
 - **МойСклад REST API 1.2** — отгрузки, заказы покупателей, входящие платежи, справочники, webhook'и (создание/изменение/удаление документов)
-- **Деплой**: [Railway](https://railway.app), **Railpack** билд (`railway.json`)
+- **Деплой**: [Railway](https://railway.app), **Railpack** билд (`railpack.json`) — пошагово в [DEPLOY.md](DEPLOY.md)
 
 ## Быстрый старт
 
@@ -113,14 +113,17 @@ python -m tasks.seed_dev && python bot.py
 
 ### Деплой на Railway
 
-См. подробный гайд в [ARCHITECTURE.md → раздел 2: Топология Railway](ARCHITECTURE.md#2-топология-railway).
+Пошаговый выкат с нуля — **[DEPLOY.md](DEPLOY.md)** (порядок сервисов, семь
+cron-задач, проверка после выката, грабли). Почему топология именно такая —
+[ARCHITECTURE.md → раздел 2](ARCHITECTURE.md#2-топология-railway).
 
 Кратко:
-1. Создай проект, добавь сервисы: `bot`, `webapp`, `Postgres`, `Redis` (опц.), + cron-сервисы.
-2. Подключи репо к каждому сервису через GitHub integration.
-3. Переменные окружения — в **Project Shared Variables** (см. полный список ниже).
-4. На `bot` и `webapp` сервисах поставь `BOT_MODE=bot` и `BOT_MODE=webapp` соответственно.
-5. На `webapp` — Settings → Healthcheck Path: `/healthz`.
+1. Создай проект, добавь `Postgres`, `Redis` (опц.), сервисы `bot`/`webapp` и cron'ы.
+2. Прогони `python -m tasks.migrate` ДО первого старта сервисов.
+3. Переменные окружения — в **Project Shared Variables** (список ниже).
+4. `BOT_MODE=bot` и `BOT_MODE=webapp` — переменными конкретных сервисов.
+5. На `webapp` — Settings → Healthcheck Path: `/healthz`, затем положи выданный
+   домен в `WEBAPP_URL` и **передеплой bot-сервис** (он регистрирует вебхуки МС).
 
 ## Переменные окружения
 
@@ -146,8 +149,10 @@ python -m tasks.seed_dev && python bot.py
 | `DEV_AUTH_BYPASS=1` + `DEV_USER_ID` | **Только локально:** обход Telegram-авторизации для просмотра WebApp в браузере (самоблокируется при `DATABASE_URL`). См. «Визуальная проверка WebApp» выше |
 
 > **Telegram webhook** (вместо polling, опц., только ops): `TG_USE_WEBHOOK=1` +
-> `TG_WEBHOOK_SECRET` при заданном публичном `WEBAPP_URL`. Деплой-решение —
-> держите откат на polling.
+> `TG_WEBHOOK_SECRET` при заданном публичном `WEBAPP_URL`. Работает ТОЛЬКО в
+> одиночном `BOT_MODE=all`: процесс с `BOT_MODE=bot` не поднимает FastAPI,
+> уходит в polling и снимает чужой вебхук перед стартом. Подробно — в
+> [DEPLOY.md](DEPLOY.md#грабли-на-которые-легко-наступить).
 
 ## Backup БД в Telegram-канал
 
@@ -168,7 +173,7 @@ python -m tasks.seed_dev && python bot.py
 **Мониторинг:** `tasks/run_backup` интегрирован с `cron_runs` — если backup не прошёл, `cron-ops` дайджест покажет «🛑 backup: failed».
 
 **Два режима дампа:**
-1. **pg_dump** (full schema + data) — если postgresql client есть в образе (Railpack `railway.json` → `deploy.aptPackages: [postgresql-client]`)
+1. **pg_dump** (full schema + data) — если postgresql client есть в образе (Railpack `railpack.json` → `deploy.aptPackages: [postgresql-client]`)
 2. **pure-Python COPY-dump** (data-only) — fallback через psycopg2/libpq, если `pg_dump` **отсутствует** ИЛИ **упал** (частый кейс: `server version mismatch` — managed-Postgres новее, чем pg_dump из apt). Версионно-независим, работает без системных бинарей.
 
 **Восстановление:**
@@ -326,6 +331,7 @@ top-5 «что чинить первым» и таблица **Closed** с сс�
 
 ## Документация
 
+- **[DEPLOY.md](DEPLOY.md)** — выкат на Railway с нуля: порядок сервисов, cron-задачи, проверка после деплоя, известные грабли.
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — полная техническая архитектура: топология сервисов, схема БД, API endpoint'ы, workflow'ы, интеграции, операционные нюансы. Читать если ты новый разработчик.
 - **[SECURITY.md](SECURITY.md)** — security & code audit с приоритизацией: уязвимости, race-conditions, технический долг. Раньше всего нового кода — проверь, не закрывает ли он что-то из top-5.
 - **Этот README** — лицо проекта: что, как запустить, базовые команды.
