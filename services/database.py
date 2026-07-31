@@ -1364,9 +1364,113 @@ async def get_orders_by_agent(agent_id: str, limit: int = 50) -> list[dict[str, 
                 "currency": r["currency"],
                 "created_at": r["created_at"],
                 "total_cents": int(total_cents),
+                # Состав заказа. Позиции уже загружены ради суммы — отдать их
+                # даром дешевле, чем заводить отдельную ручку: карточка клиента
+                # показывала «заказ на 25 000», но не ЧТО в нём, и ответить на
+                # «что он у нас берёт» было нечем.
+                "items": [
+                    {
+                        "name": it.get("product_name") or "—",
+                        "quantity": float(it.get("quantity", 0) or 0),
+                        "unit": it.get("unit") or "шт",
+                        "price_cents": _price_cents(it),
+                    }
+                    for it in items
+                ],
             }
         )
     return out
+
+
+async def get_agent_money_history(agent_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    """Движение денег ПО КОНКРЕТНОМУ клиенту: платежи, сдачи и возвраты.
+
+    Формат строки намеренно совпадает с `get_cash_history` (kind/amount/
+    currency/status/who/order_id/note/created_at) — карточка клиента рисует
+    ленту тем же фронтовым кодом, что и экран «Деньги», и добавление нового
+    вида движения не придётся делать дважды.
+
+    Что считается «платежом клиента»:
+      • payments по его заказам;
+      • сдачи наличных — в той части, что распределена на его заказы
+        (`cash_deposit_orders`): сдача может закрывать заказы разных клиентов,
+        и показывать её полную сумму в карточке одного было бы враньём;
+      • возвраты по его заказам — деньги, ушедшие обратно.
+
+    Заказы-фантомы (удалённые в МойСклад) исключены, как и в общей ленте:
+    иначе платёж виден в истории клиента, но не входит ни в один итог.
+    """
+    if not agent_id:
+        return []
+
+    pays = await adb_core.fetch(
+        "SELECT p.id, p.user_id, p.amount_cents, p.currency, p.status, p.comment, "
+        "p.order_id, p.created_at "
+        "FROM payments p JOIN orders o ON o.id = p.order_id "
+        "WHERE o.agent_id = $1 AND (o.ms_deleted_at IS NULL) "
+        "ORDER BY p.created_at DESC LIMIT $2",
+        agent_id, limit,
+    )
+    # Сумма — ровно та часть сдачи, что пришлась на заказы этого клиента.
+    deps = await adb_core.fetch(
+        "SELECT d.id, d.manager_id, d.status, d.reject_reason, d.created_at, "
+        "SUM(cdo.amount_allocated_cents) AS amount_cents "
+        "FROM cash_deposits d "
+        "JOIN cash_deposit_orders cdo ON cdo.deposit_id = d.id "
+        "JOIN orders o ON o.id = cdo.order_id "
+        "WHERE o.agent_id = $1 AND (o.ms_deleted_at IS NULL) "
+        "GROUP BY d.id, d.manager_id, d.status, d.reject_reason, d.created_at "
+        "ORDER BY d.created_at DESC LIMIT $2",
+        agent_id, limit,
+    )
+    rets = await adb_core.fetch(
+        "SELECT r.id, r.order_id, r.created_by, r.total_amount_cents, r.status, "
+        "r.reason, r.created_at, o.currency AS order_currency "
+        "FROM returns r JOIN orders o ON o.id = r.order_id "
+        "WHERE o.agent_id = $1 AND (o.ms_deleted_at IS NULL) "
+        "ORDER BY r.created_at DESC LIMIT $2",
+        agent_id, limit,
+    )
+
+    # get_all_users синхронный — через to_thread, чтобы не блокировать loop
+    # (тот же урок, что в get_cash_history, WP-25).
+    users = await asyncio.to_thread(get_all_users)
+    names = {u["user_id"]: u.get("full_name") or str(u["user_id"]) for u in users}
+
+    from config import BASE_CURRENCY
+
+    base_cur = (BASE_CURRENCY or "USD").upper()
+
+    rows: list[dict[str, Any]] = []
+    for p in pays:
+        rows.append({
+            "kind": "payment", "id": p["id"],
+            "amount": float(money.from_cents(int(p["amount_cents"] or 0))),
+            "currency": p.get("currency") or base_cur, "status": p["status"],
+            "who": names.get(p["user_id"], str(p["user_id"])),
+            "order_id": p.get("order_id"), "note": p.get("comment") or "",
+            "created_at": (p.get("created_at") or "")[:16],
+        })
+    for d in deps:
+        rows.append({
+            "kind": "deposit", "id": d["id"],
+            "amount": float(money.from_cents(int(d["amount_cents"] or 0))),
+            "currency": base_cur, "status": d["status"],
+            "who": names.get(d["manager_id"], str(d["manager_id"])),
+            "order_id": None, "note": d.get("reject_reason") or "",
+            "created_at": (d.get("created_at") or "")[:16],
+        })
+    for r in rets:
+        rows.append({
+            "kind": "return", "id": r["id"],
+            "amount": float(money.from_cents(int(r["total_amount_cents"] or 0))),
+            "currency": (r.get("order_currency") or base_cur), "status": r["status"],
+            "who": names.get(r["created_by"], str(r["created_by"])),
+            "order_id": r.get("order_id"), "note": r.get("reason") or "",
+            "created_at": (r.get("created_at") or "")[:16],
+        })
+    rows.sort(key=lambda x: x["created_at"], reverse=True)
+    return rows[:limit]
 
 
 async def get_clients_overview() -> list[dict[str, Any]]:

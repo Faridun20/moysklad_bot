@@ -3368,17 +3368,41 @@ async function renderAgentDetail(agentId) {
       + (recentRows ? `<div class="section-label">Последние отгрузки</div><div class="c-surface c-surface--list">${recentRows}</div>` : '')
     : '<div class="section-label">Покупки</div><div class="loader">Покупок в МойСклад нет</div>';
 
-  // Заказы в боте.
+  // Заказы в боте. Строка раскрывается в состав заказа: позиции приходят в том
+  // же ответе (их всё равно грузят ради суммы), поэтому раскрытие ничего не
+  // запрашивает и работает мгновенно даже без сети.
   const orders = d.orders || [];
+  const orderItemsHtml = (o) => {
+    const items = o.items || [];
+    if (!items.length) return '<div class="order-item">Позиции не добавлены</div>';
+    const cur = escapeHtml(o.currency || baseC);
+    return items.map(it => {
+      const qty = `${formatMoney(it.quantity)} ${escapeHtml(it.unit || 'шт')}`;
+      const price = it.price_cents ? ` × ${fmtCents(it.price_cents)} ${cur}` : '';
+      const sum = it.price_cents
+        ? ` = <b>${fmtCents(Math.round(it.price_cents * (it.quantity || 0)))} ${cur}</b>`
+        : '';
+      return `<div class="order-item">• ${escapeHtml(it.name)}: ${qty}${price}${sum}</div>`;
+    }).join('');
+  };
   const ordersRows = orders.map(o =>
-    `<div class="c-row" data-status="${escapeHtml(o.status || '')}"><div class="card-row-info">` +
+    `<div class="c-row c-row--tap" data-order-open="${o.id}" data-status="${escapeHtml(o.status || '')}" role="button" tabindex="0" aria-expanded="false">` +
+    `<div class="card-row-info">` +
     `<div class="card-row-title">#${o.id} · ${fmtCents(o.total_cents)} ${escapeHtml(o.currency || baseC)}</div>` +
-    `<div class="card-row-sub">${escapeHtml(o.status || '')} · ${escapeHtml((o.created_at || '').slice(0, 16))}</div>` +
-    `</div></div>`
+    `<div class="card-row-sub">${escapeHtml(o.status || '')} · ${escapeHtml((o.created_at || '').slice(0, 16))} · ${(o.items || []).length} поз.</div>` +
+    `</div>${icon('list')}</div>` +
+    `<div class="order-items" id="agent-order-${o.id}" hidden>${orderItemsHtml(o)}</div>`
   ).join('');
   const ordersBlock = orders.length
     ? `<div class="section-label">Заказы в боте · ${orders.length}</div><div class="c-surface c-surface--list">${ordersRows}</div>`
     : '<div class="section-label">Заказы в боте</div><div class="loader">Заказов нет</div>';
+
+  // Платежи клиента: та же лента, что на экране «Деньги» (cashHistoryHtml) —
+  // платежи, сдачи в части его заказов и возвраты, сгруппированные по дням.
+  const history = d.money_history || [];
+  const historyBlock = history.length
+    ? `<div class="section-label">Платежи · ${history.length}</div>${cashHistoryHtml(history)}`
+    : `<div class="section-label">Платежи</div><div class="loader">Движений денег не было</div>`;
 
   // Лимит правится только у контрагента с заказами (эндпоинт credit/set это гейтит).
   const limitBlock = orders.length ? `
@@ -3402,7 +3426,19 @@ async function renderAgentDetail(agentId) {
     </div>
     ${purBlock}
     ${ordersBlock}
+    ${historyBlock}
   `;
+
+  // Раскрытие состава заказа. Данные уже в DOM — только показываем/прячем.
+  content.querySelectorAll('[data-order-open]').forEach(row => {
+    row.addEventListener('click', () => {
+      haptic('light');
+      const box = content.querySelector(`#agent-order-${row.dataset.orderOpen}`);
+      if (!box) return;
+      box.hidden = !box.hidden;
+      row.setAttribute('aria-expanded', String(!box.hidden));
+    });
+  });
 
   if (orders.length) {
     const box = content.querySelector('#cl-box');

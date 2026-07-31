@@ -2278,6 +2278,10 @@ async def api_clients_detail(request: Request):
     debt = await adb.get_agent_current_debt(agent_id)
     limit = await adb.get_credit_limit(agent_id)
     orders = await adb.get_orders_by_agent(agent_id)
+    # История денег по клиенту: платежи, сдачи (в части, распределённой на его
+    # заказы) и возвраты. Формат строки — как в общей ленте «Деньги», поэтому
+    # фронт рисует её тем же кодом.
+    money_history = await adb.get_agent_money_history(agent_id)
     # Покупки из МС — best-effort: при сбое МС карточка всё равно открывается.
     try:
         purchases = await moysklad.get_counterparty_purchases(agent_id)
@@ -2297,6 +2301,7 @@ async def api_clients_detail(request: Request):
             "free": round(limit - debt, 2),
             "over_limit": debt > limit,
             "orders": orders,
+            "money_history": money_history,
             "purchases": purchases,
             "base_currency": (BASE_CURRENCY or "USD").upper(),
         }
