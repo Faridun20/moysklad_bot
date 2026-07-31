@@ -9,7 +9,7 @@ import helpers from '../helpers.js';
 const {
   escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml,
   parsePaymentItems, renderMoneyTotalsHtml, financeTabs, balanceParts, periodSegHtml,
-  formatMoney, msBalanceLabel,
+  formatMoney, msBalanceLabel, emptyState, skeleton, errorBoxHtml,
 } = helpers;
 
 describe('periodSegHtml (WP-29)', () => {
@@ -343,5 +343,76 @@ describe('msBalanceLabel (UI-WP-05)', () => {
     const fromClients = msBalanceLabel(-1000, 'USD');
     const fromDetail = msBalanceLabel(-1000, 'USD');
     expect(fromClients.text).toBe(fromDetail.text);
+  });
+});
+
+describe('emptyState (UI-WP-09)', () => {
+  it('собирает иконку, заголовок и подсказку в одном порядке', () => {
+    const html = emptyState({ icon: 'box', title: 'Нет заказов', hint: 'Создайте первый' });
+    expect(html.indexOf('empty-state-icon')).toBeLessThan(html.indexOf('empty-state-title'));
+    expect(html.indexOf('empty-state-title')).toBeLessThan(html.indexOf('empty-state-hint'));
+    expect(html).toContain('Нет заказов');
+  });
+
+  it('без подсказки и кнопки не оставляет пустых блоков', () => {
+    const html = emptyState({ icon: 'box', title: 'Пусто' });
+    expect(html).not.toContain('empty-state-hint');
+    expect(html).not.toContain('<button');
+  });
+
+  it('экранирует данные — заголовок может прийти из ответа API', () => {
+    const html = emptyState({ title: '<img src=x onerror=alert(1)>' });
+    expect(html).not.toContain('<img');
+    expect(html).toContain('&lt;img');
+  });
+
+  it('кнопка действия получает свой обработчик', () => {
+    expect(emptyState({ title: 'X', action: { label: 'Обновить', onclick: 'location.reload()' } }))
+      .toContain('onclick="location.reload()"');
+    expect(emptyState({ title: 'X', action: { label: 'Ещё', id: 'load-more' } }))
+      .toContain('id="load-more"');
+  });
+});
+
+describe('skeleton (UI-WP-09)', () => {
+  it('список даёт запрошенное число строк', () => {
+    expect((skeleton('list', 4).match(/sk-card/g) || []).length).toBe(4);
+  });
+
+  it('сетка быстрых действий — всегда четыре плитки', () => {
+    expect((skeleton('grid4').match(/sk-action/g) || []).length).toBe(4);
+  });
+
+  it('неизвестный вид не роняет экран, а даёт нейтральную заглушку', () => {
+    expect(skeleton('чего-то-нет')).toContain('sk-card');
+  });
+
+  it('нулевой и отрицательный размер списка не дают пустоту', () => {
+    expect((skeleton('list', 0).match(/sk-card/g) || []).length).toBe(1);
+    expect((skeleton('list', -3).match(/sk-card/g) || []).length).toBe(1);
+  });
+});
+
+describe('errorBoxHtml (UI-WP-09)', () => {
+  it('показывает текст ошибки сервера', () => {
+    const html = errorBoxHtml('500 Internal Server Error');
+    expect(html).toContain('Не удалось загрузить');
+    expect(html).toContain('500 Internal Server Error');
+  });
+
+  it('офлайн объясняет причину вместо технического текста', () => {
+    const html = errorBoxHtml('Нет подключения к интернету');
+    expect(html).toContain('Нет подключения');
+    expect(html).toContain('Проверьте интернет');
+    expect(html).not.toContain('к интернету<');
+  });
+
+  it('экранирует сообщение — оно приходит с сервера', () => {
+    expect(errorBoxHtml('<script>alert(1)</script>')).not.toContain('<script>');
+  });
+
+  it('кнопку повтора можно привязать к своему обработчику', () => {
+    expect(errorBoxHtml('x', { retryAttr: 'onclick="reload()"' })).toContain('onclick="reload()"');
+    expect(errorBoxHtml('x', { retry: false })).not.toContain('Повторить');
   });
 });

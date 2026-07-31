@@ -207,6 +207,65 @@
     return { state: 'zero', amount: '0', currency: cur };
   }
 
+  // ─── Общие состояния экрана (UI-WP-09) ──────────────────────────────────
+  // Пустое состояние собиралось инлайн в двадцати девяти местах app.js, и
+  // разметка успела разойтись: где-то не было иконки, где-то подсказки, где-то
+  // кнопка действия шла до подсказки. Экран без данных пользователь видит чаще
+  // всего в первый день работы — именно он и был самым несогласованным.
+  //
+  // action — {label, onclick} или {label, id}: inline-onclick оставлен для
+  // location.reload()-случаев, id — чтобы навесить обработчик после вставки.
+  function emptyState(opts) {
+    const o = opts || {};
+    const parts = [`<div class="empty-state-icon">${icon(o.icon || 'box')}</div>`];
+    if (o.title) parts.push(`<div class="empty-state-title">${escapeHtml(o.title)}</div>`);
+    if (o.hint) parts.push(`<div class="empty-state-hint">${escapeHtml(o.hint)}</div>`);
+    const a = o.action;
+    if (a && a.label) {
+      const attr = a.onclick ? ` onclick="${a.onclick}"` : (a.id ? ` id="${a.id}"` : '');
+      parts.push(`<button class="btn-primary"${attr}>${escapeHtml(a.label)}</button>`);
+    }
+    return `<div class="empty-state">${parts.join('')}</div>`;
+  }
+
+  // Скелетон под КАРКАС конкретного экрана: пользователь должен увидеть форму
+  // будущего контента, а не абстрактный спиннер. Виды покрывают то, что реально
+  // есть в приложении; список принимает количество строк.
+  function skeleton(kind, n) {
+    const one = (cls) => `<div class="sk ${cls}"></div>`;
+    switch (kind) {
+      case 'hero':   return one('sk-hero');
+      case 'grid4':  return `<div class="sk-grid">${Array(4).fill(one('sk-action')).join('')}</div>`;
+      case 'label':  return one('sk-label');
+      case 'stat3':  return `<div class="sk-grid sk-grid--3">${Array(3).fill(one('sk-card')).join('')}</div>`;
+      case 'list': {
+        // Пропущенный аргумент — три строки; явный 0 или мусор — одна.
+        // `Number(n) || 3` считал бы ноль пропуском и рисовал три.
+        const rows = n == null ? 3 : Math.max(1, Math.floor(Number(n) || 0));
+        return Array(rows).fill(one('sk-card')).join('');
+      }
+      default:       return one('sk-card');
+    }
+  }
+
+  // Ошибка загрузки с кнопкой «Повторить». Офлайн отличаем от ошибки сервера:
+  // при пропавшей сети технический detail пользователю бесполезен, а
+  // «проверьте интернет» — действие, которое он может выполнить сам.
+  function errorBoxHtml(msg, opts) {
+    const o = opts || {};
+    const offline = (typeof navigator !== 'undefined' && navigator.onLine === false)
+      || msg === 'Нет подключения к интернету';
+    const title = offline ? 'Нет подключения' : 'Не удалось загрузить';
+    const body = offline ? 'Проверьте интернет и попробуйте снова.' : escapeHtml(String(msg || ''));
+    const retry = o.retry === false ? '' :
+      `<button class="btn-primary" ${o.retryAttr || 'data-retry="1"'}>Повторить</button>`;
+    return (
+      `<div class="error-card"><div class="error-icon">${icon('alert')}</div>` +
+      `<div class="error-title">${escapeHtml(title)}</div>` +
+      `<div class="error-body">${body}</div>${retry}</div>`
+    );
+  }
+
   // Единый формат суммы (UI-WP-05). `Math.round(n).toLocaleString('ru-RU')`
   // был скопирован в четырнадцать локальных `fmt` по app.js — и уже разъезжался:
   // где-то округляли, где-то нет, где-то валюту клеили без пробела. Копейки в
@@ -254,5 +313,6 @@
     escapeHtml, idemKey, formatDateRU, icon, opsAmount,
     renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml, financeTabs,
     balanceParts, periodSegHtml, formatMoney, msBalanceLabel,
+    emptyState, skeleton, errorBoxHtml,
   };
 });

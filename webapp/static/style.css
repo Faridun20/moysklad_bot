@@ -282,12 +282,17 @@ body {
   margin-top: 1px;
 }
 
+/* UI-WP-07: раньше это был единственный залитый акцентом пилл на экране
+   помимо hero-баланса — глаз цеплялся за роль пользователя вместо суммы,
+   ради которой экран открывают. Тот же акцент, но контуром и на размер
+   мельче: роль остаётся читаемой подписью, а не вторым главным элементом. */
 .role-badge {
-  font-size: 12px;
-  padding: 5px 12px;
+  font-size: var(--text-xs);
+  padding: var(--sp-1) 10px;
   border-radius: var(--radius-pill);
-  background: var(--accent);
-  color: var(--accent-fg);
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
   font-weight: 600;
 }
 
@@ -1807,6 +1812,12 @@ body {
   opacity: 0.5;
   margin-left: 6px;
 }
+/* ─── Оверлей (UI-WP-10) ──────────────────────────────────────────────────
+   Затемнение и центрирование были описаны прямо в .price-overlay, поэтому
+   следующий оверлей (их сейчас два — редактор цены и календарь) начинался бы
+   с копирования position/inset/z-index. Выносим в примитив; постоянную
+   навигацию на модалки НЕ переводим — это ограничение плана. */
+.c-overlay,
 .price-overlay {
   position: fixed;
   inset: 0;
@@ -1815,12 +1826,14 @@ body {
   align-items: center;
   justify-content: center;
   z-index: 100;
-  padding: 20px;
+  padding: var(--sp-5);
 }
+
+.c-sheet,
 .price-modal {
   background: var(--bg-card);
   border-radius: var(--radius);
-  padding: 20px;
+  padding: var(--sp-5);
   width: 100%;
   max-width: 360px;
   box-shadow: var(--shadow-modal);

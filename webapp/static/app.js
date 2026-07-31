@@ -100,13 +100,12 @@ function renderNoAccess() {
   const sb = document.getElementById('search-btn');
   if (sb) sb.classList.add('hidden');
   const content = document.getElementById('content');
-  content.innerHTML = `
-    <div class="empty-state">
-      <div class="empty-state-icon">${icon('lock')}</div>
-      <div class="empty-state-title">Доступ не выдан</div>
-      <div class="empty-state-hint">Ваш аккаунт пока без прав. Попросите администратора назначить роль — затем откройте приложение снова.</div>
-      <button class="btn-primary" onclick="location.reload()">Обновить</button>
-    </div>`;
+  content.innerHTML = emptyState({
+    icon: 'lock',
+    title: 'Доступ не выдан',
+    hint: 'Ваш аккаунт пока без прав. Попросите администратора назначить роль — затем откройте приложение снова.',
+    action: { label: 'Обновить', onclick: 'location.reload()' },
+  });
 }
 
 // ─── Инициализация ──────────────────────────────────
@@ -192,21 +191,11 @@ function showError(msg) {
 // PR E: единый error-блок с кнопкой «Повторить». Раньше экраны при сбое
 // показывали голый текст без способа повторить (кроме ре-навигации).
 // Retry перезагружает текущий экран через showScreen(currentScreen).
+// UI-WP-09: разметка и различение «офлайн / ошибка сервера» переехали в
+// helpers.js (тестируются юнитами). Здесь остаётся только то, что специфично
+// для приложения — как именно перезагрузить текущий экран.
 function errorBox(msg) {
-  // Различаем «нет сети» и «ошибка сервера»: при офлайне нет смысла показывать
-  // технический detail — даём понятную причину и подсказку. api() при сетевом
-  // сбое кидает именно это сообщение; плюс страхуемся navigator.onLine.
-  const offline = (typeof navigator !== 'undefined' && navigator.onLine === false)
-    || msg === 'Нет подключения к интернету';
-  const title = offline ? 'Нет подключения' : 'Не удалось загрузить';
-  const body = offline ? 'Проверьте интернет и попробуйте снова.' : escapeHtml(msg);
-  return `
-    <div class="error-card">
-      <div class="error-icon">${icon('alert')}</div>
-      <div class="error-title">${title}</div>
-      <div class="error-body">${body}</div>
-      <button class="btn-primary" onclick="showScreen(currentScreen)">Повторить</button>
-    </div>`;
+  return errorBoxHtml(msg, { retryAttr: 'onclick="showScreen(currentScreen)"' });
 }
 
 // ─── Навигация ──────────────────────────────────────
@@ -331,10 +320,10 @@ async function renderOrdersScreen() {
 async function renderHome() {
   const content = document.getElementById('content');
   content.innerHTML = `
-    <div class="sk sk-hero"></div>
-    <div class="sk-grid">${Array(4).fill('<div class="sk sk-action"></div>').join('')}</div>
-    <div class="sk sk-label"></div>
-    ${Array(3).fill('<div class="sk sk-card"></div>').join('')}
+    ${skeleton('hero')}
+    ${skeleton('grid4')}
+    ${skeleton('label')}
+    ${skeleton('list', 3)}
   `;
 
   let data;
@@ -648,16 +637,16 @@ function renderStockList() {
 
   listEl.innerHTML = filtered.length === 0
     ? (stockData.ms_unavailable
-        ? `<div class="empty-state">
-            <div class="empty-state-icon">${icon('alert')}</div>
-            <div class="empty-state-title">Каталог недоступен</div>
-            <div class="empty-state-hint">Не удалось загрузить товары из МойСклад. Проверьте подключение и токен — затем нажмите «Обновить».</div>
-          </div>`
-        : `<div class="empty-state">
-            <div class="empty-state-icon">${icon('box')}</div>
-            <div class="empty-state-title">Товары не найдены</div>
-            <div class="empty-state-hint">Попробуйте изменить категорию или поисковый запрос</div>
-          </div>`)
+        ? emptyState({
+            icon: 'alert',
+            title: 'Каталог недоступен',
+            hint: 'Не удалось загрузить товары из МойСклад. Проверьте подключение и токен — затем нажмите «Обновить».',
+          })
+        : emptyState({
+            icon: 'box',
+            title: 'Товары не найдены',
+            hint: 'Попробуйте изменить категорию или поисковый запрос',
+          }))
     : filtered.slice(0, stockLimit).map((p, i) => {
         // PR C: цена продажи (минимум) — всем; себестоимость — только boss.
         const priceLines = [];
@@ -2087,11 +2076,11 @@ async function renderPendingRequests() {
         <div class="editor-header">
           <div class="editor-title">Заявки</div>
         </div>
-        <div class="empty-state">
-          <div class="empty-state-icon">${icon('check')}</div>
-          <div class="empty-state-title">Нет заявок на рассмотрении</div>
-          <div class="empty-state-hint">Новые заявки появятся здесь автоматически</div>
-        </div>
+        ${emptyState({
+          icon: 'check',
+          title: 'Нет заявок на рассмотрении',
+          hint: 'Новые заявки появятся здесь автоматически',
+        })}
       `;
       return;
     }
