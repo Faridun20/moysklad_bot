@@ -343,10 +343,14 @@ body {
   animation: spin 0.65s linear infinite;
 }
 
+/* UI-BUG-05: боковой margin 14px при `.content { padding: 0 16px }` уводил
+   подпись на 30px от края, тогда как карточки и сегменты стоят на 16px —
+   на экране получались две левые линии вместо одной. Боковой отступ даёт
+   контейнер, подписи он не нужен. */
 .section-label {
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-mute);
-  margin: 20px 14px 8px;
+  margin: var(--sp-5) 0 var(--sp-2);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.6px;
@@ -765,7 +769,9 @@ body {
   display: flex;
   gap: 8px;
   overflow-x: auto;
-  padding: 0 14px 10px;     /* боковые отступы, чтобы первый/последний chip не липли к краю */
+  /* UI-BUG-05: боковой отступ даёт `.content`; здесь остаётся только нижний.
+     Отрицательные поля не ставим — chip-scroll намеренно живёт в сетке. */
+  padding: 0 0 10px;
   margin-top: 12px;          /* воздух от поля поиска сверху */
   margin-bottom: 8px;
   scrollbar-width: none;
@@ -1401,7 +1407,7 @@ body {
    говорит отдельным языком radio-карточек. .payment-selector/.payment-option
    удалены: потребителей не осталось. */
 .due-date-wrap {
-  padding: 0 14px 12px;
+  padding: 0 0 12px;   /* UI-BUG-05: боковой отступ — у .content */
 }
 .due-date-label {
   display: block; font-size: 13px; color: var(--text-mute); margin-bottom: 6px;
@@ -1435,7 +1441,7 @@ body {
    тот же трек, радиус, активный элемент с тенью. Удалены, вкладки долгов
    используют общий сегмент. */
 .debts-summary {
-  padding: 0 14px;
+  padding: 0;                 /* UI-BUG-05 */
   margin-top: 12px;           /* воздух от money-summary сверху */
   display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
   gap: 10px;
@@ -1494,7 +1500,7 @@ body {
 /* ─── Сводка «получено / ожидает» ─────────────────────────────── */
 .money-summary {
   display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-  padding: 0 14px; margin-top: 12px;
+  padding: 0; margin-top: 12px;   /* UI-BUG-05 */
 }
 /* Единый остаток к получению в базовой валюте (объединяет валюты). */
 .money-base-total {
