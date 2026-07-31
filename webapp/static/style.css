@@ -874,6 +874,15 @@ body {
   margin-left: 8px;
 }
 
+/* UI-WP-21: остаток на складе — вариант общей статус-системы (UI-WP-02), а не
+   своя цветовая матрица: in_stock/low/out читаются как «хорошо/внимание/плохо»
+   тем же зелёным-жёлтым-красным, что статусы заказов и долгов. */
+.stock-badge[data-status="in_stock"] { background: var(--success-bg); color: var(--success); }
+.stock-badge[data-status="low"]      { background: var(--warn-bg);    color: var(--warn); }
+.stock-badge[data-status="out"]      { background: var(--danger-bg);  color: var(--danger); }
+
+/* Переходный период: цветовые классы ещё используются в бейджах заказов и
+   «Требует внимания» — их черёд в S4/S5. */
 .badge-green  { background: var(--success-bg); color: var(--success); }
 .badge-yellow { background: var(--warn-bg); color: var(--warn); }
 .badge-red    { background: var(--danger-bg); color: var(--danger); }
@@ -958,8 +967,10 @@ body {
   display: flex; gap: 6px;
 }
 
-/* Выбор значения (валюта / тип возврата) — accent-fill при выборе, как
-   .payment-option; единый радиус chip-семьи. */
+/* Выбор значения (валюта / тип возврата) — accent-fill при выборе; единый
+   радиус chip-семьи. Это НЕ дубль .seg: .cur-btn показывает варианты в один
+   ряд карточками с иконкой, .seg — компактный pill-track навигации. Свести их
+   в S4 вместе с пересборкой форм кассы. */
 .cur-btn {
   flex: 1;
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
@@ -1260,10 +1271,7 @@ body {
   display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px;
 }
 
-.editor-item {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: var(--sp-3) 14px;
-}
+.editor-item { justify-content: space-between; }
 
 /* Строка «Итого» в редакторе — выделена мягкой заливкой (заменяет inline-стиль
    с хардкод-фоллбэком #f5f5f5, ломавшимся на светлой теме в браузере). */
@@ -1371,20 +1379,9 @@ body {
 }
 
 /* ─── Тип оплаты в редакторе заказа ─────────────────────────────── */
-.payment-selector {
-  display: flex; gap: 10px; padding: 10px 14px;
-}
-.payment-option {
-  flex: 1; display: flex; align-items: center; gap: 8px;
-  padding: 12px; border-radius: var(--radius-chip);
-  background: var(--bg-card);
-  cursor: pointer; font-size: 15px;
-}
-.payment-option input { margin: 0; }
-.payment-option:has(input:checked) {
-  background: var(--accent);
-  color: var(--accent-fg);
-}
+/* UI-WP-04: тип оплаты переехал на .seg — «выбери один из двух» больше не
+   говорит отдельным языком radio-карточек. .payment-selector/.payment-option
+   удалены: потребителей не осталось. */
 .due-date-wrap {
   padding: 0 14px 12px;
 }

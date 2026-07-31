@@ -611,11 +611,19 @@ async function renderStock() {
   renderStockContent();
 }
 
+// UI-WP-21: пороги остатка отдают ОДИН из трёх статусов, цвет берётся из общей
+// матрицы (UI-WP-02). Раньше цвет выбирался тут же классом, поэтому «сделать
+// низкий остаток заметнее» означало править и здесь, и в CSS.
+function _stockState(stock) {
+  if (stock < 20) return 'out';      // включая ноль: продавать по сути нечего
+  if (stock < 100) return 'low';
+  return 'in_stock';
+}
+
 function _stockBadge(stock) {
-  if (stock <= 0) return '<span class="stock-badge badge-red">нет</span>';
-  if (stock < 20) return `<span class="stock-badge badge-red">${stock}</span>`;
-  if (stock < 100) return `<span class="stock-badge badge-yellow">${stock}</span>`;
-  return `<span class="stock-badge badge-green">${stock}</span>`;
+  const state = _stockState(stock);
+  const text = stock <= 0 ? 'нет' : String(stock);
+  return `<span class="stock-badge" data-status="${state}">${text}</span>`;
 }
 
 function _stockFiltered() {
@@ -661,7 +669,7 @@ function renderStockList() {
         const editAttr = isBoss ? ` data-price-idx="${i}" role="button" tabindex="0" aria-label="Изменить цену: ${escapeHtml(p.name)}"` : '';
         const editHint = isBoss ? `<span class="stock-edit-hint">${icon('edit')}</span>` : '';
         return `
-        <div class="stock-row"${editAttr}>
+        <div class="c-row stock-row"${editAttr}>
           <div class="stock-info">
             <div class="stock-name">${escapeHtml(p.name)}</div>
             <div class="stock-folder">${escapeHtml(p.folder_name || '—')} · ${p.unit}</div>
@@ -700,9 +708,9 @@ function openPriceEditor(product) {
   const trigger = document.activeElement;  // вернём фокус сюда при закрытии
   const prevBack = _backHandler;           // восстановим back-кнопку экрана
   const ov = document.createElement('div');
-  ov.className = 'price-overlay';
+  ov.className = 'c-overlay price-overlay';
   ov.innerHTML = `
-    <div class="price-modal" role="dialog" aria-modal="true" aria-labelledby="pe-title">
+    <div class="c-sheet price-modal" role="dialog" aria-modal="true" aria-labelledby="pe-title">
       <div class="price-modal-title" id="pe-title">${escapeHtml(product.name)}</div>
       <label class="price-field">
         <span>Цена продажи (минимум)</span>
@@ -1571,7 +1579,7 @@ function renderOrderEditor() {
           ? ` · ${formatMoney(it.price)} = <b>${formatMoney(sub)}</b>`
           : '';
         return `
-          <div class="editor-item">
+          <div class="c-row editor-item">
             <div class="editor-item-info">
               <div class="editor-item-name">${escapeHtml(it.name)}</div>
               <div class="editor-item-qty">${it.quantity} ${it.unit || 'шт'}${subStr}</div>
@@ -1580,7 +1588,7 @@ function renderOrderEditor() {
           </div>
         `;
       }).join('') + (grandTotal > 0 ? `
-        <div class="editor-item editor-item--total">
+        <div class="c-row editor-item editor-item--total">
           <div class="editor-item-info">
             <div class="editor-item-name">${icon('cash')} Итого</div>
           </div>
@@ -1606,17 +1614,15 @@ function renderOrderEditor() {
     <button class="btn-add-product" id="btn-add-product">+ Добавить товар</button>
 
     <div class="section-label">Оплата</div>
-    <div class="payment-selector">
-      <label class="payment-option">
-        <input type="radio" name="payment_type" value="paid"
-          ${(currentDraftOrder.payment_type || 'paid') === 'paid' ? 'checked' : ''}>
-        <span>${icon('cash')} Оплачено сразу</span>
-      </label>
-      <label class="payment-option">
-        <input type="radio" name="payment_type" value="credit"
-          ${currentDraftOrder.payment_type === 'credit' ? 'checked' : ''}>
-        <span>${icon('card')} В долг</span>
-      </label>
+    <div class="seg" role="radiogroup" aria-label="Тип оплаты">
+      ${[
+        { v: 'paid', label: 'Оплачено сразу', ic: 'cash' },
+        { v: 'credit', label: 'В долг', ic: 'card' },
+      ].map(o => {
+        const on = (currentDraftOrder.payment_type || 'paid') === o.v;
+        return `<button type="button" class="seg-item ${on ? 'active' : ''}" data-pay="${o.v}"
+          role="radio" aria-checked="${on}">${icon(o.ic)} ${o.label}</button>`;
+      }).join('')}
     </div>
     <div class="due-date-wrap ${currentDraftOrder.payment_type === 'credit' ? '' : 'hidden'}" id="due-date-wrap">
       <label class="due-date-label">Дата возврата долга:</label>
@@ -1662,12 +1668,19 @@ function renderOrderEditor() {
     });
   });
 
-  // Тип оплаты — радио + показ/скрытие date picker
-  document.querySelectorAll('input[name="payment_type"]').forEach(r => {
-    r.addEventListener('change', () => {
-      currentDraftOrder.payment_type = r.value;
+  // Тип оплаты — сегмент (UI-WP-04) + показ/скрытие выбора даты.
+  document.querySelectorAll('[data-pay]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const value = btn.dataset.pay;
+      currentDraftOrder.payment_type = value;
+      document.querySelectorAll('[data-pay]').forEach(b => {
+        const on = b === btn;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-checked', String(on));
+      });
       document.getElementById('due-date-wrap')
-        .classList.toggle('hidden', r.value !== 'credit');
+        .classList.toggle('hidden', value !== 'credit');
+      haptic();
     });
   });
   document.getElementById('due-date-input')?.addEventListener('change', e => {
@@ -1719,7 +1732,7 @@ async function loadAgents(search) {
       return;
     }
     list.innerHTML = data.agents.map(a => `
-      <div class="agent-row" data-id="${a.id}" data-name="${escapeHtml(a.name || '')}" role="button" tabindex="0">
+      <div class="c-row agent-row" data-id="${a.id}" data-name="${escapeHtml(a.name || '')}" role="button" tabindex="0">
         <div class="agent-name">${icon('user')} ${escapeHtml(a.name || '')}</div>
         ${a.phone ? `<div class="agent-phone">${escapeHtml(a.phone)}</div>` : ''}
       </div>
@@ -1799,7 +1812,7 @@ async function openProductPicker() {
       : filtered.slice(0, prodLimit).map(p => {
           const ind = p.stock >= 100 ? 'green' : p.stock >= 20 ? 'yellow' : 'red';
           return `
-            <div class="prod-row" role="button" tabindex="0"
+            <div class="c-row prod-row" role="button" tabindex="0"
                  data-name="${escapeHtml(p.name)}"
                  data-unit="${escapeHtml(p.unit)}"
                  data-stock="${p.stock}"
