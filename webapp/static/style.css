@@ -343,10 +343,14 @@ body {
   animation: spin 0.65s linear infinite;
 }
 
+/* UI-BUG-05: боковой margin 14px при `.content { padding: 0 16px }` уводил
+   подпись на 30px от края, тогда как карточки и сегменты стоят на 16px —
+   на экране получались две левые линии вместо одной. Боковой отступ даёт
+   контейнер, подписи он не нужен. */
 .section-label {
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-mute);
-  margin: 20px 14px 8px;
+  margin: var(--sp-5) 0 var(--sp-2);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.6px;
@@ -517,14 +521,27 @@ body {
   box-shadow: var(--shadow-card);
 }
 
+/* UI-BUG-03: внешний отступ принадлежит ПОВЕРХНОСТИ, а не каждому её виду.
+   UI-WP-01 свёл в одно место фон, радиус и тень — и оставил margin у каждого
+   класса своим. `.c-surface--pad` его не получил вовсе, поэтому две карточки
+   подряд («Выручка по валютам» + плитки) читались как один блок со «защипами»
+   на стыке радиусов.
+
+   Объявляем на `.c-surface` отдельным правилом, а НЕ в общей группе выше:
+   туда входят `.stat`, `.stock-row`, `.order-card`, `.debt-card`, которые
+   лежат внутри flex-списков с `gap` и получили бы двойной зазор. */
+.c-surface { margin-bottom: var(--sp-2); }
+
 /* Контейнер списка строк: собственных отступов нет, скругление режет углы
    первой и последней строки. */
 .c-surface--list,
 .card-list {
   padding: 0;
   overflow: hidden;
-  margin-bottom: var(--sp-2);
 }
+
+/* Legacy-алиас без `.c-surface`: отступ ему нужен свой. */
+.card-list { margin-bottom: var(--sp-2); }
 
 /* Самодостаточная карточка. */
 .c-surface--pad,
@@ -752,7 +769,9 @@ body {
   display: flex;
   gap: 8px;
   overflow-x: auto;
-  padding: 0 14px 10px;     /* боковые отступы, чтобы первый/последний chip не липли к краю */
+  /* UI-BUG-05: боковой отступ даёт `.content`; здесь остаётся только нижний.
+     Отрицательные поля не ставим — chip-scroll намеренно живёт в сетке. */
+  padding: 0 0 10px;
   margin-top: 12px;          /* воздух от поля поиска сверху */
   margin-bottom: 8px;
   scrollbar-width: none;
@@ -1388,7 +1407,7 @@ body {
    говорит отдельным языком radio-карточек. .payment-selector/.payment-option
    удалены: потребителей не осталось. */
 .due-date-wrap {
-  padding: 0 14px 12px;
+  padding: 0 0 12px;   /* UI-BUG-05: боковой отступ — у .content */
 }
 .due-date-label {
   display: block; font-size: 13px; color: var(--text-mute); margin-bottom: 6px;
@@ -1422,7 +1441,7 @@ body {
    тот же трек, радиус, активный элемент с тенью. Удалены, вкладки долгов
    используют общий сегмент. */
 .debts-summary {
-  padding: 0 14px;
+  padding: 0;                 /* UI-BUG-05 */
   margin-top: 12px;           /* воздух от money-summary сверху */
   display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
   gap: 10px;
@@ -1481,7 +1500,7 @@ body {
 /* ─── Сводка «получено / ожидает» ─────────────────────────────── */
 .money-summary {
   display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-  padding: 0 14px; margin-top: 12px;
+  padding: 0; margin-top: 12px;   /* UI-BUG-05 */
 }
 /* Единый остаток к получению в базовой валюте (объединяет валюты). */
 .money-base-total {
@@ -1604,16 +1623,26 @@ body {
 .seg-item.active {
   background: var(--bg-card); color: var(--text); box-shadow: var(--shadow-card);
 }
-/* Статус-сегмент заказов (до 5 пунктов): равная ширина, на узких экранах —
-   мягкий горизонтальный скролл вместо сплющивания. */
-.seg--scroll { overflow-x: auto; scrollbar-width: none; }
+/* Сегмент с числом пунктов, которое не гарантированно влезает (статусы заказа,
+   период): горизонтальный скролл вместо сплющивания.
+   UI-BUG-01: было `flex: 1 0 0` — при basis:0 пункты всё равно делят трек
+   поровну, контент их не расширяет, и overflow-x родителя ничего не спасал.
+   На 360dp под текст оставалось ~33px, «Всё время» обрезалось с ДВУХ сторон
+   и без многоточия (режется центрированный flex-элемент, а не текстовый блок).
+   `0 0 auto` даёт ширину по содержимому — тогда скролл начинает работать. */
+.seg--scroll { overflow-x: auto; scrollbar-width: none; justify-content: flex-start; }
 .seg--scroll::-webkit-scrollbar { display: none; }
-.seg--scroll .seg-item { flex: 1 0 0; }
+.seg--scroll .seg-item { flex: 0 0 auto; min-width: 44px; }
 
 /* Доп-ссылка справа от сегмента (напр. «Лимиты» — read-only надстройка для
    босса): намеренно НЕ pill, чтобы не путалась с разделами уровня 1. */
 .seg-aux {
-  flex-shrink: 0; padding: 11px 10px; border: 0; border-radius: var(--radius-chip);
+  /* UI-BUG-02: без потолка ширины подпись диапазона выталкивала кнопку за
+     вьюпорт — flex-shrink:0 запрещал ей ужиматься, а боковых отступов у ряда
+     нет. Половину ряда доп-кнопка занимать не должна: её роль вспомогательная. */
+  flex-shrink: 0; max-width: 42%; overflow: hidden; text-overflow: ellipsis;
+  min-height: 44px;
+  padding: 11px 10px; border: 0; border-radius: var(--radius-chip);
   background: transparent; color: var(--text-mute);
   font-size: 13px; font-weight: 600; font-family: inherit; cursor: pointer;
   display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;

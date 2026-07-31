@@ -8,7 +8,7 @@ import helpers from '../helpers.js';
 
 const {
   escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml,
-  parsePaymentItems, renderMoneyTotalsHtml, financeTabs, balanceParts, periodSegHtml,
+  parsePaymentItems, renderMoneyTotalsHtml, financeTabs, balanceParts, periodSegHtml, rangeLabel,
   formatMoney, msBalanceLabel, emptyState, skeleton, errorBoxHtml,
 } = helpers;
 
@@ -19,6 +19,19 @@ describe('periodSegHtml (WP-29)', () => {
     expect(html).toContain('class="seg-item active" data-period="month"');
     expect(html).toContain('data-period="custom"');
   });
+  it('трек скроллится, а не сплющивает подписи (UI-BUG-01)', () => {
+    // Без seg--scroll пункты делят ширину поровну: на 360dp под текст остаётся
+    // ~33px, и «Всё время» резалось с двух сторон без многоточия.
+    const html = periodSegHtml(presets, 'month', 'data-period', false, 'Период…');
+    expect(html).toContain('seg seg--scroll');
+  });
+
+  it('aria-pressed отражает выбранный пресет, а не только класс', () => {
+    const html = periodSegHtml(presets, 'week', 'data-period', false, 'Период…');
+    expect(html).toContain('data-period="week" aria-pressed="true"');
+    expect(html).toContain('data-period="month" aria-pressed="false"');
+  });
+
   it('custom активен → подпись диапазона на доп-кнопке', () => {
     const html = periodSegHtml(presets, 'custom', 'data-operiod', true, '01.06—12.06');
     expect(html).toContain('data-operiod="custom"');
@@ -415,5 +428,42 @@ describe('errorBoxHtml (UI-WP-09)', () => {
   it('кнопку повтора можно привязать к своему обработчику', () => {
     expect(errorBoxHtml('x', { retryAttr: 'onclick="reload()"' })).toContain('onclick="reload()"');
     expect(errorBoxHtml('x', { retry: false })).not.toContain('Повторить');
+  });
+});
+
+describe('rangeLabel (UI-BUG-02)', () => {
+  const today = new Date('2026-07-15T12:00:00Z');
+
+  it('внутри текущего года год не печатает — он не несёт информации', () => {
+    expect(rangeLabel('2026-07-01', '2026-07-31', today)).toBe('01.07—31.07');
+  });
+
+  it('диапазон, выходящий за текущий год, год показывает', () => {
+    expect(rangeLabel('2025-12-20', '2026-01-10', today)).toBe('20.12.25—10.01.26');
+  });
+
+  it('без обеих дат подписи нет — кнопка остаётся иконкой', () => {
+    expect(rangeLabel('', '2026-07-31', today)).toBe('');
+    expect(rangeLabel('2026-07-01', null, today)).toBe('');
+  });
+
+  it('короче полного формата — ради него всё и затевалось', () => {
+    const short = rangeLabel('2026-07-01', '2026-07-31', today);
+    expect(short.length).toBeLessThan('01.07.2026—31.07.2026'.length);
+  });
+});
+
+describe('доп-кнопка периода (UI-BUG-02)', () => {
+  const presets = [{ id: 'week', label: 'Неделя' }];
+
+  it('при выбранном пресете — только иконка с доступной подписью', () => {
+    const html = periodSegHtml(presets, 'week', 'data-period', false, '');
+    expect(html).toContain('aria-label="Выбрать период"');
+    expect(html).not.toContain('Период…');
+  });
+
+  it('в режиме custom показывает выбранный диапазон', () => {
+    const html = periodSegHtml(presets, 'custom', 'data-period', true, '01.07—31.07');
+    expect(html).toContain('01.07—31.07');
   });
 });

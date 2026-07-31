@@ -289,32 +289,41 @@ async function showScreen(screen) {
 // Текущая под-вкладка для объединённого экрана «Склад и заказы»
 let ordersSubTab = 'orders';
 
-async function renderOrdersScreen() {
-  // Делегируем в существующие render-функции (они пишут в #content).
-  if (ordersSubTab === 'orders') {
-    await renderOrders();
-  } else {
-    await renderStock();
-  }
-  // Поверх их вывода — переключатель под-вкладок. Единый стиль с Аналитикой:
-  // iOS-сегмент .seg (равные доли, приподнятая активная), а не отдельный .sub-tabs.
-  const content = document.getElementById('content');
-  const tabsHtml = `
-    <div class="seg-row">
-      <div class="seg">
-        <button class="seg-item ${ordersSubTab === 'orders' ? 'active' : ''}" data-sub="orders" aria-pressed="${ordersSubTab === 'orders'}">${icon('list')} Заказы</button>
-        <button class="seg-item ${ordersSubTab === 'stock' ? 'active' : ''}" data-sub="stock" aria-pressed="${ordersSubTab === 'stock'}">${icon('box')} Каталог</button>
-      </div>
-    </div>
-  `;
-  content.insertAdjacentHTML('afterbegin', tabsHtml);
-  document.querySelectorAll('.seg-item[data-sub]').forEach(btn => {
+// Переключатель под-вкладок «Заказы / Каталог».
+//
+// UI-BUG-04: раньше он вставлялся через insertAdjacentHTML ПОВЕРХ уже
+// отрисованного контента. Любой полный ре-рендер внутри вкладки —
+// смена статуса, выбор периода, «Применить» в календаре, загрузка, ошибка
+// сети — переписывал content.innerHTML и уносил шелл вместе с обработчиками:
+// пользователь оставался без возможности уйти в Каталог.
+//
+// В Аналитике этого бага нет ровно потому, что там шапка входит в КАЖДЫЙ
+// innerHTML (analyticsHeaderHtml + wireAnalyticsHeader). Здесь тот же паттерн.
+function ordersShellHtml() {
+  const tab = (id, label, ic) =>
+    `<button class="seg-item ${ordersSubTab === id ? 'active' : ''}" data-sub="${id}" ` +
+    `aria-pressed="${ordersSubTab === id}">${icon(ic)} ${label}</button>`;
+  return `<div class="seg-row"><div class="seg">${tab('orders', 'Заказы', 'list')}${tab('stock', 'Каталог', 'box')}</div></div>`;
+}
+
+function wireOrdersShell(root) {
+  (root || document).querySelectorAll('.seg-item[data-sub]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
       ordersSubTab = btn.dataset.sub;
       renderOrdersScreen();
     });
   });
+}
+
+async function renderOrdersScreen() {
+  // Только диспатч: шелл рисует каждая ветка сама, иначе он теряется при
+  // первом же ре-рендере внутри вкладки.
+  if (ordersSubTab === 'orders') {
+    await renderOrders();
+  } else {
+    await renderStock();
+  }
 }
 
 async function renderHome() {
@@ -588,7 +597,8 @@ let _stockSearchTimer = null;  // дебаунс ввода в поиске по
 
 async function renderStock() {
   const content = document.getElementById('content');
-  content.innerHTML = loading('Загружаю остатки…');
+  content.innerHTML = ordersShellHtml() + loading('Загружаю остатки…');
+  wireOrdersShell(content);
 
   if (!stockData) {
     try {
@@ -603,7 +613,8 @@ async function renderStock() {
       }
       stockData = await r.json();
     } catch (e) {
-      content.innerHTML = errorBox(e.message);
+      content.innerHTML = ordersShellHtml() + errorBox(e.message);
+      wireOrdersShell(content);
       return;
     }
   }
@@ -789,6 +800,7 @@ function renderStockContent() {
     ).join('');
 
   content.innerHTML = `
+    ${ordersShellHtml()}
     <div class="form-row">
       <input id="stock-search" class="form-input" placeholder="Поиск товара…" value="${escapeHtml(stockSearch)}">
     </div>
@@ -802,6 +814,7 @@ function renderStockContent() {
     <div class="stock-list" id="stock-list"></div>
     <div id="stock-trunc"></div>
   `;
+  wireOrdersShell(content);   // UI-BUG-04
   renderStockList();
 
   // Boss: делегированный клик по строке товара → редактор цены. Вешаем ОДИН
@@ -1174,7 +1187,9 @@ function mountCalendar(host, initFrom, initTo, onApply) {
       if (from && to && key > from && key < to) cls.push('cal-in-range');
       cells.push(`<button type="button" class="${cls.join(' ')}" data-day="${key}">${d}</button>`);
     }
-    const rangeLabel = from
+    // Подпись в подвале календаря — полные даты (место есть) и промежуточное
+    // состояние «выбрано только начало», которого нет у общего rangeLabel.
+    const calRangeText = from
       ? (to ? `${formatDateRU(from)} — ${formatDateRU(to)}` : `${formatDateRU(from)} — …`)
       : 'Выберите начало и конец';
     host.innerHTML = `
@@ -1187,7 +1202,7 @@ function mountCalendar(host, initFrom, initTo, onApply) {
         <div class="cal-grid cal-wd">${_WD_RU.map(w => `<div class="cal-wd-cell">${w}</div>`).join('')}</div>
         <div class="cal-grid cal-days">${cells.join('')}</div>
         <div class="cal-foot">
-          <span class="cal-range">${rangeLabel}</span>
+          <span class="cal-range">${calRangeText}</span>
           <button type="button" class="btn-primary cal-apply" ${from && to ? '' : 'disabled'}>Применить</button>
         </div>
       </div>`;
@@ -1236,12 +1251,14 @@ async function renderOrders() {
   // каждый раз дёргать /api/orders. Мутации (delete/ship/cancel) ставят
   // ordersData = null — это форсит свежую загрузку ниже.
   if (!ordersData || Date.now() - ordersDataTs > ORDERS_TTL_MS) {
-    content.innerHTML = loading('Загружаю заказы…');
+    content.innerHTML = ordersShellHtml() + loading('Загружаю заказы…');
+    wireOrdersShell(content);
     try {
       ordersData = await api('/api/orders', {});
       ordersDataTs = Date.now();
     } catch (e) {
-      content.innerHTML = errorBox(e.message);
+      content.innerHTML = ordersShellHtml() + errorBox(e.message);
+      wireOrdersShell(content);
       return;
     }
   }
@@ -1285,16 +1302,16 @@ function renderOrdersMain() {
   // Фильтр по периоду — для навигации, когда заказов много. Пресеты — сегмент,
   // «Период…» (произвольный диапазон) — доп-кнопка справа (как в Аналитике).
   const periods = [
-    { id: 'all', label: 'Всё время' },
+    { id: 'all', label: 'Всё' },   // UI-BUG-01: четыре пункта влезают на 360dp
     { id: 'today', label: 'Сегодня' },
     { id: '7d', label: '7 дней' },
     { id: '30d', label: '30 дней' },
   ];
-  // «Период…» показывает выбранный диапазон (как в Аналитике, WP-29) — раньше
-  // всегда статичный «Период…» без обратной связи.
+  // Подпись диапазона — общий rangeLabel (UI-BUG-02): формула была скопирована
+  // сюда и в шапку Аналитики.
   const orderCustomLabel = (currentOrderPeriod === 'custom' && currentOrderFrom && currentOrderTo)
-    ? `${formatDateRU(currentOrderFrom)}—${formatDateRU(currentOrderTo)}`
-    : 'Период…';
+    ? rangeLabel(currentOrderFrom, currentOrderTo)
+    : '';
   const periodRow = periodSegHtml(
     periods, currentOrderPeriod, 'data-operiod', currentOrderPeriod === 'custom', orderCustomLabel
   );
@@ -1396,6 +1413,7 @@ function renderOrdersMain() {
       })();
 
   content.innerHTML = `
+    ${ordersShellHtml()}
     <div class="section-label">Статус</div>
     <div class="seg-row"><div class="seg seg--scroll">${statusSeg}</div></div>
     <div class="section-label">Период</div>
@@ -1407,6 +1425,7 @@ function renderOrdersMain() {
 
     <div class="orders-list">${list}</div>
   `;
+  wireOrdersShell(content);   // UI-BUG-04: шелл — часть шаблона, значит и проводка тоже
 
   // Фильтры по статусу (сегмент).
   document.querySelectorAll('.seg-item[data-filter]').forEach(btn => {
@@ -2246,8 +2265,8 @@ function analyticsHeaderHtml(isBoss) {
     { id: '3month', label: 'Квартал' }, { id: 'year', label: 'Год' },
   ];
   const customLabel = (analyticsPeriod === 'custom' && analyticsSince && analyticsUntil)
-    ? `${formatDateRU(analyticsSince)}—${formatDateRU(analyticsUntil)}`
-    : 'Период…';
+    ? rangeLabel(analyticsSince, analyticsUntil)
+    : '';
   const periodBar = periodSegHtml(
     presets, analyticsPeriod, 'data-period', analyticsPeriod === 'custom', customLabel
   );
@@ -2414,10 +2433,14 @@ function renderAnalyticsContent(data) {
             <span class="rev-meta">${r.count} отгр. ${tS}</span>
           </div>`;
         }).join('')
-      : '<div class="money-placeholder">Нет продаж за период</div>';
+      : '';
     return `
       <div class="section-label">Выручка по валютам</div>
-      <div class="c-surface c-surface--pad">${revLines}</div>
+      ${revLines
+        // Пусто — это строка, а не поверхность: карточка с одной серой фразой
+        // внутри давала карточку-в-карточке на стыке со счётчиками.
+        ? `<div class="c-surface c-surface--pad">${revLines}</div>`
+        : '<div class="loader">Нет продаж за период</div>'}
       <div class="stat-grid">
         <div class="stat"><div class="stat-value">${data.count}</div><div class="stat-label">Отгрузок</div></div>
         <div class="stat"><div class="stat-value">${data.clients}</div><div class="stat-label">Клиентов</div></div>
