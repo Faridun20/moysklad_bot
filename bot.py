@@ -179,8 +179,8 @@ def register_routers(dp: Dispatcher):
         returns.router,
         order_cancel.router,
         order_ship.router,
-        # Волна 4: учёт экскаваторов. В WebApp экрана нет — фото приходят
-        # file_id'ом из Telegram, моточасы вводят с площадки телефоном.
+        # Техника: раздел в WebApp, здесь — быстрый просмотр и моточасы,
+        # которые снимают с площадки телефоном.
         machines.router,
     ]
     for r in routers:
