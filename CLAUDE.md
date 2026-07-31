@@ -145,4 +145,19 @@ tg_file_id — нет). VIN нормализуется (upper, без пробе
 
 Если добавляешь module-level `asyncio.Semaphore`/`Lock` — добавь регресс-тест с 2× `asyncio.run` и contention >cap (см. `tests/test_analytics_parallel.py::test_positions_semaphore_survives_multiple_asyncio_run_with_contention`). Без waiter'а в очереди loop-binding не воспроизводится и landmine ждёт первого «толстого» теста.
 
+**Фронт — дизайн-система (UI_REBUILD_PLAN, S0–S6).** Поверхности и строки
+списков: `.c-surface` / `.c-surface--list` / `.c-surface--pad` / `.c-row`
+(+`.c-row--tap` для кликабельных, там же min-height 44px). Старые имена
+(`.card-row`, `.stock-row`, `.debt-card`, …) — алиасы на те же правила,
+переходный период; новые экраны пишут примитивы напрямую. Статус (заказа,
+долга, остатка, движения денег) — атрибутом `data-status`, цвет выводится из
+`--status-c`/`--status-bg`; НЕ заводи для нового состояния свой класс с цветом.
+Переключатели: `.seg` (уровень 1) и `.subseg` (уровень 2 в Финансах) — третьего
+языка быть не должно; `.cat-btn`/`.cur-btn` — задокументированные исключения.
+Деньги форматируй `formatMoney`, МС-баланс — `msBalanceLabel`; пустое/ошибка/
+скелетон — `emptyState`/`errorBoxHtml`/`skeleton` из `helpers.js` (они
+экранируют вход). Инварианты держит `webapp/static/__tests__/design-system.test.js`:
+забытый цвет статуса, отсутствие тёмного варианта и таргет мельче 44px валят CI.
+Права по ролям для ручного QA: `python scripts/gen_role_matrix.py` → `UI_QA_ROLES.md`.
+
 **Фронт (Vitest):** чистые хелперы `webapp/static/helpers.js` + jsdom-смоук загрузки `app.js` — в `webapp/static/__tests__/`. Гоняет CI (`npm test`). Локально Node нет → `scripts/setup-node.ps1` ставит portable Node в `.tools/node` (gitignore, ~35MB zip с nodejs.org, без admin), `scripts/test-js.ps1` делает `npm install` (1×) + `vitest run`. Скрипты — UTF-8 **с BOM** (иначе PowerShell 5.1 читает их как ANSI и кириллица в Write-Host превращается в кракозябры).
