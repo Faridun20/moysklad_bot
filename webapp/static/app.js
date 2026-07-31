@@ -3915,9 +3915,24 @@ async function renderCurrencyRates() {
   });
 }
 
+// Состав отгрузки из МойСклад — тем же языком, что состав заказа ниже, чтобы
+// «что уехало» и «что заказывали» читались одинаково.
+function shipmentItemsHtml(res) {
+  const items = res.positions || [];
+  if (!items.length) return '<div class="order-item">В отгрузке нет позиций</div>';
+  const cur = escapeHtml(res.currency || 'USD');
+  const money = c => opsAmount((Number(c) || 0) / 100);
+  return items.map(it => {
+    const qty = `${formatMoney(it.quantity)} ${escapeHtml(it.unit || 'шт')}`;
+    const price = it.price_cents ? ` × ${money(it.price_cents)} ${cur}` : '';
+    const sum = it.sum_cents ? ` = <b>${money(it.sum_cents)} ${cur}</b>` : '';
+    return `<div class="order-item">• ${escapeHtml(it.name)}: ${qty}${price}${sum}</div>`;
+  }).join('');
+}
+
 // Карточка контрагента: МС-баланс + локальный долг/лимит (правится) + покупки из
-// МС (топ-товары/последние отгрузки) + заказы в боте. Открывается из «Клиентов»
-// и из поиска. boss/admin (эндпоинт detail так гейтит).
+// МС (топ-товары/последние отгрузки, каждая раскрывается в состав) + заказы в
+// боте. Открывается из «Клиентов» и из поиска. boss/admin (detail так гейтит).
 async function renderAgentDetail(agentId) {
   const content = document.getElementById('content');
   content.innerHTML = loading('Загрузка клиента…');
@@ -3945,9 +3960,14 @@ async function renderAgentDetail(agentId) {
     `<div class="c-row"><div class="card-row-info"><div class="card-row-title">${escapeHtml(p.name)}</div>` +
     `<div class="card-row-sub">${fmt(p.qty)} шт · ${fmtCents(p.sum_cents)} ${escapeHtml(baseC)}</div></div></div>`
   ).join('');
+  // Отгрузка раскрывается в состав. Позиции тянем по первому тапу, а не сразу
+  // все десять: это десять запросов в МойСклад ради строк, которые чаще всего
+  // никто не откроет, а бюджет запросов к МС общий на бота, WebApp и cron'ы.
   const recentRows = (pur.recent || []).map(r =>
-    `<div class="c-row"><div class="card-row-info"><div class="card-row-title">${fmtCents(r.sum_cents)} ${escapeHtml(baseC)}</div>` +
-    `<div class="card-row-sub">${escapeHtml(r.date || '')}</div></div></div>`
+    `<div class="c-row${r.id ? ' c-row--tap' : ''}"${r.id ? ` data-shipment="${escapeHtml(r.id)}" role="button" tabindex="0" aria-expanded="false"` : ''}>` +
+    `<div class="card-row-info"><div class="card-row-title">${fmtCents(r.sum_cents)} ${escapeHtml(baseC)}</div>` +
+    `<div class="card-row-sub">${escapeHtml(r.date || '')}</div></div>${r.id ? icon('list') : ''}</div>` +
+    (r.id ? `<div class="order-items" id="shipment-${escapeHtml(r.id)}" hidden></div>` : '')
   ).join('');
   const purBlock = pur.count
     ? `<div class="section-label">Покупки · ${pur.count} отгр. · ${fmtCents(pur.total_cents)} ${escapeHtml(baseC)}</div>`
@@ -4024,6 +4044,31 @@ async function renderAgentDetail(agentId) {
       if (!box) return;
       box.hidden = !box.hidden;
       row.setAttribute('aria-expanded', String(!box.hidden));
+    });
+  });
+
+  // Раскрытие состава отгрузки. В отличие от заказа позиции лежат в МойСклад,
+  // поэтому подгружаем по первому тапу и оставляем в DOM: повторное сворачивание
+  // не должно стоить ещё одного запроса.
+  content.querySelectorAll('[data-shipment]').forEach(row => {
+    row.addEventListener('click', async () => {
+      haptic('light');
+      // getElementById, а не селектор: id — идентификатор МойСклад, и
+      // экранировать его для CSS-селектора здесь незачем.
+      const box = document.getElementById(`shipment-${row.dataset.shipment}`);
+      if (!box) return;
+      box.hidden = !box.hidden;
+      row.setAttribute('aria-expanded', String(!box.hidden));
+      if (box.hidden || box.dataset.loaded) return;
+      box.innerHTML = '<div class="order-item">Загружаю состав…</div>';
+      try {
+        const res = await api('/api/clients/shipment', { demand_id: row.dataset.shipment });
+        box.innerHTML = shipmentItemsHtml(res);
+        box.dataset.loaded = '1';
+      } catch (e) {
+        // Не помечаем загруженным: следующий тап попробует снова.
+        box.innerHTML = `<div class="order-item">${escapeHtml(e.message)}</div>`;
+      }
     });
   });
 

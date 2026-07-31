@@ -9,6 +9,7 @@ import binascii
 import logging
 import math
 import os
+import re
 import subprocess
 import time
 from collections import OrderedDict
@@ -2308,6 +2309,72 @@ async def api_clients_detail(request: Request):
             "money_history": money_history,
             "purchases": purchases,
             "base_currency": (BASE_CURRENCY or "USD").upper(),
+        }
+    )
+
+
+# Идентификаторы МойСклад — UUID. Проверяем формат перед подстановкой в путь
+# запроса: значение приходит от клиента, а `entity/demand/{id}/positions` —
+# это путь, и «id» вида `../../entity/counterparty/xxx` увёл бы запрос в другую
+# сущность. Роль здесь и так admin/boss, но подставлять сырую строку в URL —
+# привычка, которая однажды выстрелит в менее защищённом месте.
+_MS_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                         r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+@app.post("/api/clients/shipment")
+async def api_clients_shipment(request: Request):
+    """Состав отгрузки клиента: позиции demand'а из МойСклад.
+
+    В карточке клиента отгрузки показывались одной суммой и датой — увидеть,
+    ЧТО именно уехало, было нельзя, хотя это первый вопрос при разборе долга.
+
+    Позиции документа после создания неизменяемы, поэтому в сервисе уже стоит
+    часовой кэш — повторное открытие той же отгрузки в МС не ходит.
+    """
+    from services import moysklad
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_clients_shipment",
+        rate_limit_max=60,
+    )
+    demand_id = (data.get("demand_id") or "").strip()
+    if not _MS_UUID_RE.match(demand_id):
+        raise HTTPException(status_code=400, detail="demand_id: ожидается идентификатор МойСклад")
+
+    try:
+        rows = await moysklad.get_shipment_positions(demand_id)
+    except Exception as e:
+        # МС недоступен — это не поломка карточки: остальное в ней уже
+        # отрисовано, разворачивается только одна строка.
+        logger.warning("Не удалось получить позиции отгрузки %s: %s", demand_id, e)
+        raise HTTPException(status_code=502, detail="МойСклад не ответил, попробуйте позже")
+
+    positions = []
+    for pos in rows:
+        quantity = float(pos.get("quantity", 0) or 0)
+        price_cents = int(pos.get("price", 0) or 0)
+        positions.append(
+            {
+                "name": (pos.get("assortment") or {}).get("name") or "—",
+                "quantity": quantity,
+                "unit": (pos.get("uom") or {}).get("name") or "шт",
+                "price_cents": price_cents,
+                "sum_cents": int(round(quantity * price_cents)),
+            }
+        )
+    from config import BASE_CURRENCY
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "demand_id": demand_id,
+            "positions": positions,
+            "sum_cents": sum(p["sum_cents"] for p in positions),
+            "currency": (BASE_CURRENCY or "USD").upper(),
         }
     )
 
