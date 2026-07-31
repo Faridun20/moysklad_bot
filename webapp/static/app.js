@@ -934,8 +934,11 @@ async function renderMachines() {
           hint: machinesFilter === 'all'
             ? 'Здесь появятся экскаваторы: в пути, на складе и проданные.'
             : 'В этом статусе машин нет — выберите другой фильтр.',
-        }));
+        }))
+    + `<div class="c-actions"><button class="btn-secondary" id="machine-new">${icon('plus')} Завести машину</button></div>`;
   wireOrdersShell(content);
+
+  content.querySelector('#machine-new')?.addEventListener('click', () => openMachineForm(null));
 
   content.querySelectorAll('[data-mstatus]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -994,7 +997,8 @@ function machineDealsHtml(deals) {
     <div class="c-surface c-surface--list">${deals.map(d => {
       const kind = d.kind === 'credit' ? 'Рассрочка' : 'Продажа';
       const state = d.closed_at ? 'Закрыта' : (d.kind === 'credit' ? `до ${d.due_date || '—'}` : '');
-      const meta = [d.buyer_name, d.buyer_phone, state].filter(Boolean).join(' · ');
+      const meta = [d.buyer_name, d.buyer_phone, d.buyer_passport, state].filter(Boolean).join(' · ');
+      const canClose = d.kind === 'credit' && !d.closed_at && isMachineBoss();
       return `
       <div class="c-row" data-status="${d.closed_at || d.kind === 'sale' ? 'approved' : 'pending'}">
         <div class="card-row-info">
@@ -1002,8 +1006,31 @@ function machineDealsHtml(deals) {
           <div class="card-row-sub">${escapeHtml(meta)}</div>
         </div>
         <div class="card-row-value">${formatMoney(Number(d.price_cents || 0) / 100, d.currency || 'USD')}</div>
-      </div>`;
+      </div>
+      ${canClose ? `<div class="c-actions"><button class="btn-secondary" data-deal-close="${d.id}">Закрыть рассрочку</button></div>` : ''}`;
     }).join('')}</div>`;
+}
+
+// Кнопки карточки. Что можно — решает сервер (`can_manage`, `next_statuses`):
+// рисовать кнопку, на которую ручка ответит 403, значит обещать пользователю
+// действие, которого у него нет.
+function machineActionsHtml(m, card) {
+  const buttons = [`<button class="btn-secondary" data-mact="hours">${icon('gauge')} Моточасы</button>`];
+  if (card.can_manage) {
+    buttons.push(`<button class="btn-secondary" data-mact="edit">${icon('edit')} Изменить</button>`);
+    for (const opt of card.next_statuses || []) {
+      buttons.push(
+        `<button class="btn-secondary" data-mstatus-to="${escapeHtml(opt.status)}" ` +
+        `data-mstatus-label="${escapeHtml(opt.label)}">${escapeHtml(opt.label)}</button>`
+      );
+    }
+    // Продажа и рассрочка — не переход статуса: им нужны цена и покупатель.
+    if (['in_transit', 'in_stock', 'reserved'].includes(m.status)) {
+      buttons.push('<button class="btn-secondary" data-mact="sale">Продажа</button>');
+      buttons.push('<button class="btn-secondary" data-mact="credit">Рассрочка</button>');
+    }
+  }
+  return `<div class="c-actions c-actions--wrap">${buttons.join('')}</div>`;
 }
 
 async function renderMachineCard(machineId) {
@@ -1023,9 +1050,267 @@ async function renderMachineCard(machineId) {
   content.innerHTML = `
     <div class="section-label">${escapeHtml(m.name || 'Машина')}</div>
     ${machineFactsHtml(m, card)}
+    ${machineActionsHtml(m, card)}
     ${machineHoursHtml(card.hours)}
     ${machineDealsHtml(card.deals)}
   `;
+
+  content.querySelectorAll('[data-mact]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const act = btn.dataset.mact;
+      if (act === 'hours') openHoursForm(m);
+      else if (act === 'edit') openMachineForm(m);
+      else openDealForm(m, act);
+    });
+  });
+  content.querySelectorAll('[data-mstatus-to]').forEach(btn => {
+    btn.addEventListener('click', () =>
+      changeMachineStatus(m, btn.dataset.mstatusTo, btn.dataset.mstatusLabel));
+  });
+  content.querySelectorAll('[data-deal-close]').forEach(btn => {
+    btn.addEventListener('click', () => closeMachineDeal(m.id, Number(btn.dataset.dealClose)));
+  });
+}
+
+// Модалка-форма для техники. Одна на все четыре случая (машина, моточасы,
+// сделка, подтверждение): поведение оболочки — Esc, ловушка Tab, аппаратная
+// «назад», возврат фокуса — писать четыре раза значит забыть его в одном месте.
+// Образец — openPriceEditor, но там оно вшито в конкретную форму.
+function openMachineSheet({ title, fields, submitLabel, hint, onSubmit }) {
+  haptic('light');
+  const trigger = document.activeElement;
+  const prevBack = _backHandler;
+  const ov = document.createElement('div');
+  ov.className = 'c-overlay';
+  const fieldHtml = (f) => {
+    const id = `ms-f-${f.key}`;
+    const common = `id="${id}" name="${escapeHtml(f.key)}"`;
+    const value = f.value == null ? '' : String(f.value);
+    const input = f.type === 'textarea'
+      ? `<textarea ${common} rows="2" placeholder="${escapeHtml(f.placeholder || '')}">${escapeHtml(value)}</textarea>`
+      : `<input ${common} type="${f.type || 'text'}"${f.type === 'number' ? ' inputmode="decimal"' : ''} ` +
+        `value="${escapeHtml(value)}" placeholder="${escapeHtml(f.placeholder || '')}">`;
+    return `<label class="c-field"><span>${escapeHtml(f.label)}${f.required ? ' *' : ''}</span>${input}` +
+      `${f.hint ? `<span class="c-field-hint">${escapeHtml(f.hint)}</span>` : ''}</label>`;
+  };
+  ov.innerHTML = `
+    <div class="c-sheet" role="dialog" aria-modal="true" aria-labelledby="ms-title">
+      <div class="c-sheet-title" id="ms-title">${escapeHtml(title)}</div>
+      ${hint ? `<div class="c-field-hint">${escapeHtml(hint)}</div>` : ''}
+      ${(fields || []).map(fieldHtml).join('')}
+      <div class="c-error" id="ms-error" hidden></div>
+      <div class="c-actions">
+        <button class="btn-secondary" id="ms-cancel">Отмена</button>
+        <button class="btn-primary" id="ms-submit">${escapeHtml(submitLabel || 'Сохранить')}</button>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+
+  const close = () => {
+    ov.remove();
+    document.removeEventListener('keydown', onKey, true);
+    if (prevBack) showBack(prevBack); else hideBack();
+    if (trigger && trigger.focus) { try { trigger.focus(); } catch (_e) {} }
+  };
+  function onKey(e) {
+    if (e.key === 'Escape') { e.preventDefault(); close(); return; }
+    if (e.key !== 'Tab') return;
+    const f = ov.querySelectorAll('input, textarea, button');
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+  document.addEventListener('keydown', onKey, true);
+  showBack(close);
+  ov.addEventListener('click', e => { if (e.target === ov) close(); });
+  ov.querySelector('#ms-cancel').addEventListener('click', close);
+  const firstInput = ov.querySelector('input, textarea');
+  if (firstInput && firstInput.focus) firstInput.focus();
+
+  const errEl = ov.querySelector('#ms-error');
+  const showErr = (msg) => {
+    // Ошибка остаётся в форме вместе с введёнными данными: showAlert закрывает
+    // всё поверх, и при опечатке в одном поле пришлось бы набирать заново.
+    errEl.textContent = msg;
+    errEl.hidden = !msg;
+  };
+  const values = () => {
+    const out = {};
+    for (const f of fields || []) {
+      const el = ov.querySelector(`#ms-f-${f.key}`);
+      out[f.key] = el ? el.value.trim() : '';
+    }
+    return out;
+  };
+  const submitBtn = ov.querySelector('#ms-submit');
+  submitBtn.addEventListener('click', async () => {
+    if (submitBtn.disabled) return;
+    const data = values();
+    const missing = (fields || []).find(f => f.required && !data[f.key]);
+    if (missing) { showErr(`Заполните: ${missing.label}`); return; }
+    submitBtn.disabled = true;
+    showErr('');
+    try {
+      const done = await onSubmit(data, { close, showErr });
+      if (done !== false) close();
+    } finally {
+      submitBtn.disabled = false;
+    }
+  });
+  return { close, showErr };
+}
+
+function isMachineBoss() {
+  return !!currentUser && ['admin', 'boss'].includes(currentUser.role);
+}
+
+function openMachineForm(machine) {
+  const editing = !!machine;
+  const m = machine || {};
+  const cents = (v) => (v ? String(v / 100) : '');
+  const fields = [];
+  // VIN правится только при заведении: сервис его в whitelist не пускает, и
+  // смена серийника — это не правка карточки, а другая машина.
+  if (!editing) {
+    fields.push({ key: 'vin', label: 'VIN / серийный номер', required: true,
+                  hint: 'Пробелы и дефисы можно не убирать' });
+  }
+  fields.push(
+    { key: 'name', label: 'Название', required: true, value: m.name || '', placeholder: 'JCB 3CX' },
+    { key: 'brand', label: 'Марка', value: m.brand || '' },
+    { key: 'model', label: 'Модель', value: m.model || '' },
+    { key: 'year', label: 'Год', type: 'number', value: m.year || '' },
+  );
+  if (!editing) fields.push({ key: 'hours', label: 'Моточасы', type: 'number' });
+  fields.push({ key: 'price', label: 'Цена, USD', type: 'number', value: cents(m.price_cents) });
+  if (isMachineBoss()) {
+    fields.push({ key: 'cost', label: 'Себестоимость, USD', type: 'number', value: cents(m.cost_cents) });
+  }
+  fields.push(
+    { key: 'location', label: 'Локация', value: m.location || '' },
+    { key: 'container_no', label: 'Контейнер', value: m.container_no || '' },
+    { key: 'eta_date', label: 'Прибытие', type: 'date', value: m.eta_date || '' },
+    { key: 'notes', label: 'Заметки', type: 'textarea', value: m.notes || '' },
+  );
+
+  const key = idemKey();
+  openMachineSheet({
+    title: editing ? 'Изменить машину' : 'Новая машина',
+    fields,
+    submitLabel: editing ? 'Сохранить' : 'Завести',
+    onSubmit: async (data, { showErr }) => {
+      const res = editing
+        ? await apiResult('/api/machines/update', { machine_id: m.id, fields: data })
+        : await apiResult('/api/machines/create', { ...data, idempotency_key: key });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      toast(editing ? 'Карточка обновлена' : 'Машина заведена');
+      if (editing) renderMachineCard(m.id); else renderMachines();
+      return true;
+    },
+  });
+}
+
+function openHoursForm(machine) {
+  openMachineSheet({
+    title: 'Моточасы',
+    hint: machine.hours != null ? `Сейчас: ${Number(machine.hours).toLocaleString('ru-RU')} м/ч` : '',
+    fields: [{ key: 'hours', label: 'Показание счётчика', type: 'number', required: true }],
+    submitLabel: 'Записать',
+    onSubmit: async (data, { showErr }) => {
+      let res = await apiResult('/api/machines/hours', { machine_id: machine.id, hours: data.hours });
+      // 409 + needs_force: показание меньше предыдущего. Обычно это опечатка
+      // (1500 вместо 15000), поэтому спрашиваем — но подтвердить замену
+      // счётчика сервер разрешит только руководителю.
+      if (!res.ok && res.body.needs_force) {
+        if (!isMachineBoss()) { showErr(res.error + ' Откат подтверждает руководитель.'); return false; }
+        const agreed = await confirmDialog(
+          `${res.error}\n\nЗаписать ${data.hours} м/ч как замену счётчика?`
+        );
+        if (!agreed) return false;
+        res = await apiResult('/api/machines/hours', {
+          machine_id: machine.id, hours: data.hours, force: true,
+        });
+      }
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      toast('Моточасы записаны');
+      renderMachineCard(machine.id);
+      return true;
+    },
+  });
+}
+
+function openDealForm(machine, kind) {
+  const credit = kind === 'credit';
+  const key = idemKey();
+  openMachineSheet({
+    title: credit ? 'Рассрочка' : 'Продажа',
+    fields: [
+      { key: 'price', label: 'Цена, USD', type: 'number', required: true,
+        value: machine.price_cents ? String(machine.price_cents / 100) : '' },
+      { key: 'buyer_name', label: 'Покупатель', required: true },
+      { key: 'buyer_phone', label: 'Телефон', type: 'tel' },
+      { key: 'buyer_passport', label: 'Паспорт', hint: 'Виден только руководству' },
+      ...(credit ? [{ key: 'due_date', label: 'Срок оплаты', type: 'date', required: true }] : []),
+      { key: 'buyer_note', label: 'Комментарий', type: 'textarea' },
+    ],
+    submitLabel: credit ? 'Оформить рассрочку' : 'Оформить продажу',
+    onSubmit: async (data, { showErr }) => {
+      const res = await apiResult('/api/machines/deal', {
+        machine_id: machine.id, kind, ...data, idempotency_key: key,
+      });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      toast(credit ? 'Рассрочка оформлена' : 'Машина продана');
+      renderMachineCard(machine.id);
+      return true;
+    },
+  });
+}
+
+// tg.showConfirm — колбэчный; оборачиваем в промис, чтобы формы читались
+// сверху вниз. Вне Telegram (отладка в браузере) падает обратно на confirm().
+function confirmDialog(text) {
+  return new Promise(resolve => {
+    try {
+      if (tg && tg.showConfirm) { tg.showConfirm(text, ok => resolve(!!ok)); return; }
+    } catch { /* вне Telegram */ }
+    resolve(typeof confirm === 'function' ? confirm(text) : true);
+  });
+}
+
+async function changeMachineStatus(machine, target, label) {
+  if (!await confirmDialog(`Перевести машину в статус «${label}»?`)) return;
+  const res = await apiResult('/api/machines/status', {
+    machine_id: machine.id, status: target, expected: machine.status,
+  });
+  if (!res.ok) {
+    // 409 значит «на сервере уже другой статус» — перечитываем карточку, а не
+    // просто показываем текст: пользователь смотрит на устаревшие данные.
+    tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+    if (res.status === 409) renderMachineCard(machine.id);
+    return;
+  }
+  haptic('success');
+  toast('Статус изменён');
+  renderMachineCard(machine.id);
+}
+
+async function closeMachineDeal(machineId, dealId) {
+  if (!await confirmDialog('Закрыть рассрочку — деньги получены полностью?')) return;
+  const res = await apiResult('/api/machines/deal_close', {
+    deal_id: dealId, idempotency_key: idemKey(),
+  });
+  if (!res.ok) {
+    tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+    if (res.status === 409) renderMachineCard(machineId);
+    return;
+  }
+  haptic('success');
+  toast('Рассрочка закрыта');
+  renderMachineCard(machineId);
 }
 
 // escapeHtml — в helpers.js (глобал, подключается ПЕРЕД app.js). Юнит-тестируется.
@@ -1171,6 +1456,34 @@ async function api(path, body) {
     throw new Error(detail);
   }
   return r.json();
+}
+
+// Тот же запрос, но с полным телом ответа вместо исключения.
+//
+// `api()` бросает Error(detail) и остальное тело теряет. Формам техники этого
+// мало: на 409 сервер присылает `needs_force` (подтвердить замену счётчика) или
+// `current` (машину уже перевели в другой статус) — по ним форма предлагает
+// действие, а не просто печатает текст. Отдельная функция, а не перепись
+// `api()`: у полусотни её вызовов поведение «бросай на ошибке» правильное.
+async function apiResult(path, body) {
+  let r;
+  try {
+    r = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: _initData, ...body }),
+    });
+  } catch {
+    return { ok: false, status: 0, body: {}, error: 'Нет подключения к интернету' };
+  }
+  let data = {};
+  try { data = await r.json(); } catch { /* не-JSON: 502/HTML от прокси */ }
+  return {
+    ok: r.ok,
+    status: r.status,
+    body: data,
+    error: data.detail || `Ошибка сервера (${r.status})`,
+  };
 }
 
 // Ключ идемпотентности для денежных действий: защищает от double-submit

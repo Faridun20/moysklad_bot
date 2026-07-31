@@ -1879,22 +1879,35 @@ body {
   width: 100%;
   max-width: 360px;
   box-shadow: var(--shadow-modal);
+  /* Форма техники — до десяти полей: без прокрутки нижние кнопки уезжают за
+     край экрана вместе с «Сохранить». */
+  max-height: 82vh;
+  overflow-y: auto;
 }
+.c-sheet-title,
 .price-modal-title {
   font-size: 16px;
   font-weight: 600;
   margin-bottom: 16px;
 }
+/* Поле формы и ряд кнопок — примитивы: сейчас ими пользуются редактор цены и
+   формы техники, дальше — всё остальное. Имена `.price-*` остаются алиасами
+   на переходный период (см. конвенции дизайн-системы в CLAUDE.md). */
+.c-field,
 .price-field {
   display: block;
   margin-bottom: 14px;
 }
+.c-field span,
 .price-field span {
   display: block;
   font-size: 13px;
   color: var(--text-mute);
   margin-bottom: 5px;
 }
+.c-field input,
+.c-field textarea,
+.c-field select,
 .price-field input {
   width: 100%;
   padding: 11px 13px;
@@ -1904,14 +1917,40 @@ body {
   background: var(--bg-page);
   color: var(--text);
   outline: none;
+  font-family: inherit;
 }
+.c-field input:focus,
+.c-field textarea:focus,
 .price-field input:focus { border-color: var(--accent); }
+.c-field-hint {
+  display: block;
+  margin-top: 5px;
+  font-size: var(--text-xs);
+  color: var(--text-mute);
+}
+/* Ошибка внутри формы, а не поверх неё: системный алерт закрывает диалог, и
+   при опечатке в одном поле остальные пришлось бы набирать заново. */
+.c-error {
+  margin-bottom: var(--sp-3);
+  padding: var(--sp-2) 10px;
+  border-radius: var(--radius-sm);
+  background: var(--danger-bg);
+  color: var(--danger);
+  font-size: var(--text-sm);
+}
+.c-error[hidden] { display: none; }
+.c-actions,
 .price-actions {
   display: flex;
   gap: 10px;
   margin-top: 8px;
 }
+.c-actions button,
 .price-actions button { flex: 1; }
+/* Ряд действий в карточке: кнопки переносятся, а не сплющиваются до нечитаемой
+   ширины — их бывает до пяти (моточасы, правка, статус, продажа, рассрочка). */
+.c-actions--wrap { flex-wrap: wrap; margin-bottom: var(--sp-3); }
+.c-actions--wrap button { flex: 1 1 46%; min-height: 44px; }
 
 /* ─── Тосты (лёгкая неблокирующая обратная связь) ─────────────── */
 .toast-host {

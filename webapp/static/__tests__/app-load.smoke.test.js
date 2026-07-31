@@ -180,6 +180,139 @@ describe('под-вкладка «Техника»', () => {
   });
 });
 
+describe('техника: формы', () => {
+  const CARD = {
+    ok: true,
+    machine: { id: 7, name: 'JCB 3CX', vin: 'JCB7788', status: 'in_stock', hours: 15200 },
+    photos: [], hours: [], deals: [],
+    next_statuses: [{ status: 'reserved', label: '🔒 Забронировать' }],
+    can_manage: true,
+    status_labels: { in_stock: '🏗 На складе', reserved: '🔒 Забронирована' },
+  };
+  // `responses` — очередь ответов apiResult по порядку вызовов.
+  const boot7 = (role, responses) => {
+    const window = boot(`
+      currentUser = { role: '${role}' };
+      tg.showConfirm = (text, cb) => { window.__confirmed = text; cb(true); };
+      tg.showAlert = (text) => { window.__alerted = text; };
+      window.__writes = [];
+      const queue = ${JSON.stringify(responses || [])};
+      api = async () => (${JSON.stringify(CARD)});
+      apiResult = async (path, body) => {
+        window.__writes.push([path, body]);
+        return queue.shift() || { ok: true, status: 200, body: { ok: true }, error: '' };
+      };
+      window.__ready = renderMachineCard(7);
+    `);
+    return window;
+  };
+
+  it('менеджер не видит кнопок, которых ему не разрешит сервер', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      api = async () => (${JSON.stringify({ ...CARD, can_manage: false, next_statuses: [] })});
+      window.__ready = renderMachineCard(7);
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('[data-mact="hours"]')).not.toBeNull();   // моточасы — можно
+    expect(content.querySelector('[data-mact="edit"]')).toBeNull();
+    expect(content.querySelector('[data-mact="sale"]')).toBeNull();
+    expect(content.querySelector('[data-mstatus-to]')).toBeNull();
+  });
+
+  it('обязательное поле не пускает запрос на сервер', async () => {
+    const window = boot7('boss', []);
+    await window.__ready;
+    window.document.querySelector('[data-mact="hours"]').click();
+    window.document.querySelector('#ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__writes).toHaveLength(0);
+    expect(window.document.querySelector('#ms-error').textContent).toContain('Показание');
+  });
+
+  it('откат моточасов: 409 → подтверждение → повтор с force', async () => {
+    const window = boot7('boss', [
+      { ok: false, status: 409, error: 'Показание меньше предыдущего (15200). Опечатка?',
+        body: { needs_force: true, previous: 15200 } },
+      { ok: true, status: 200, body: { ok: true }, error: '' },
+    ]);
+    await window.__ready;
+    window.document.querySelector('[data-mact="hours"]').click();
+    window.document.querySelector('#ms-f-hours').value = '1500';
+    window.document.querySelector('#ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__writes).toHaveLength(2);
+    expect(window.__writes[0][1].force).toBeUndefined();
+    expect(window.__writes[1][1].force).toBe(true);
+    expect(window.__confirmed).toContain('1500');
+  });
+
+  it('менеджеру откат не предлагают — его подтверждает руководитель', async () => {
+    const window = boot7('manager', [
+      { ok: false, status: 409, error: 'Показание меньше предыдущего (15200). Опечатка?',
+        body: { needs_force: true, previous: 15200 } },
+    ]);
+    await window.__ready;
+    window.document.querySelector('[data-mact="hours"]').click();
+    window.document.querySelector('#ms-f-hours').value = '1500';
+    window.document.querySelector('#ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__writes).toHaveLength(1);           // повтора с force нет
+    expect(window.__confirmed).toBeUndefined();        // и вопроса тоже
+    expect(window.document.querySelector('#ms-error').textContent).toContain('руководитель');
+  });
+
+  it('смена статуса отправляет expected — тот, что нарисован на экране', async () => {
+    const window = boot7('boss', [{ ok: true, status: 200, body: { ok: true }, error: '' }]);
+    await window.__ready;
+    window.document.querySelector('[data-mstatus-to="reserved"]').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__writes[0][0]).toBe('/api/machines/status');
+    expect(window.__writes[0][1]).toEqual({ machine_id: 7, status: 'reserved', expected: 'in_stock' });
+  });
+
+  it('устаревшая карточка (409) перечитывается, а не просто ругается', async () => {
+    const window = boot7('boss', [
+      { ok: false, status: 409, error: 'Статус уже «Продана»', body: { current: 'sold' } },
+    ]);
+    await window.__ready;
+    const before = window.__writes.length;
+    window.document.querySelector('[data-mstatus-to="reserved"]').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__writes.length).toBe(before + 1);
+    expect(window.__alerted).toContain('Продана');
+    // Карточку перерисовали: заголовок на месте, экран не остался пустым.
+    expect(window.document.getElementById('content').textContent).toContain('JCB 3CX');
+  });
+
+  it('форма сделки требует срок оплаты только для рассрочки', async () => {
+    const window = boot7('boss', []);
+    await window.__ready;
+    window.document.querySelector('[data-mact="sale"]').click();
+    expect(window.document.querySelector('#ms-f-due_date')).toBeNull();
+    window.document.querySelector('#ms-cancel').click();
+
+    window.document.querySelector('[data-mact="credit"]').click();
+    expect(window.document.querySelector('#ms-f-due_date')).not.toBeNull();
+  });
+
+  it('Esc закрывает форму, не отправляя ничего', async () => {
+    const window = boot7('boss', []);
+    await window.__ready;
+    window.document.querySelector('[data-mact="hours"]').click();
+    expect(window.document.querySelector('.c-overlay')).not.toBeNull();
+    window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    expect(window.document.querySelector('.c-overlay')).toBeNull();
+    expect(window.__writes).toHaveLength(0);
+  });
+});
+
 describe('курсы валют: «Сохранить» действительно отправляет курс', () => {
   // Регресс: обработчик поднимался от кнопки к `.debt-card`, которого после
   // пересборки экрана на дизайн-систему в разметке курсов нет. closest отдавал
