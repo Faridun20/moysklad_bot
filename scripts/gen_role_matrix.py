@@ -46,7 +46,16 @@ SCREEN_MAP = [
     ("Деньги (лента)", "admin, boss", "/api/money/summary"),
     ("Операционная сводка", "admin, boss", "/api/ops-summary"),
     ("Возвраты (приёмка)", "admin, boss, warehouse_keeper", "/api/returns/pending"),
+    ("Заказы → Техника", "admin, boss, manager", "/api/machines/list"),
+    ("Техника → карточка", "admin, boss, manager", "/api/machines/card"),
+    ("Техника → сделки", "admin, boss", "/api/machines/deal"),
 ]
+
+# Роли часто перечислены константой, а не литералом на месте: один и тот же
+# набор у десятка ручек, и разъехавшийся дубль был бы дырой в правах. Резолвим
+# такие имена, иначе генератор запишет раздел в «любая активная роль» — то есть
+# соврёт в чеклисте ровно там, где его читают.
+_CONST_RE = re.compile(r"^(_[A-Z][A-Z_0-9]*)\s*=\s*\(([^)]*)\)", re.M)
 
 HEADER = """# QA-чеклист WebApp по ролям (UI-WP-33)
 
@@ -75,13 +84,18 @@ HEADER = """# QA-чеклист WebApp по ролям (UI-WP-33)
 def parse_routes(src: str) -> list[tuple[str, list[str]]]:
     """[(путь, роли)] в порядке объявления в server.py."""
     marks = [(m.start(), m.group(1)) for m in re.finditer(r'@app\.(?:get|post)\("([^"]+)"', src)]
+    consts = {
+        m.group(1): sorted(re.findall(r'"([a-z_]+)"', m.group(2)))
+        for m in _CONST_RE.finditer(src)
+    }
     rows: list[tuple[str, list[str]]] = []
     for i, (pos, path) in enumerate(marks):
         end = marks[i + 1][0] if i + 1 < len(marks) else len(src)
         body = src[pos:end]
-        allowed = re.search(r"allowed_roles=\(([^)]*)\)", body)
+        allowed = re.search(r"allowed_roles=(\([^)]*\)|_[A-Z][A-Z_0-9]*)", body)
         if allowed:
-            roles = sorted(re.findall(r'"([a-z_]+)"', allowed.group(1)))
+            token = allowed.group(1)
+            roles = consts.get(token) or sorted(re.findall(r'"([a-z_]+)"', token))
         elif "_authorize(" in body:
             # Гейт есть, но роли не сужены — пускает любую активную (не guest).
             roles = [ANY_ROLE]

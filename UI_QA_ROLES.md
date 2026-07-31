@@ -23,10 +23,10 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 57._
+_Всего эндпоинтов: 69._
 
 
-### Админ (`admin`) — 50 эндпоинтов
+### Админ (`admin`) — 62 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -47,6 +47,18 @@ _Всего эндпоинтов: 57._
 - `/api/deposits/pending`
 - `/api/deposits/reject`
 - `/api/home`
+- `/api/machines/card`
+- `/api/machines/create`
+- `/api/machines/deal`
+- `/api/machines/deal_close`
+- `/api/machines/deals_open`
+- `/api/machines/hours`
+- `/api/machines/list`
+- `/api/machines/photo`
+- `/api/machines/photo_delete`
+- `/api/machines/photo_upload`
+- `/api/machines/status`
+- `/api/machines/update`
 - `/api/metrics`
 - `/api/money/summary`
 - `/api/ops-summary`
@@ -84,7 +96,7 @@ _Всего эндпоинтов: 57._
 </details>
 
 
-### Руководитель (`boss`) — 47 эндпоинтов
+### Руководитель (`boss`) — 59 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -105,6 +117,18 @@ _Всего эндпоинтов: 57._
 - `/api/deposits/pending`
 - `/api/deposits/reject`
 - `/api/home`
+- `/api/machines/card`
+- `/api/machines/create`
+- `/api/machines/deal`
+- `/api/machines/deal_close`
+- `/api/machines/deals_open`
+- `/api/machines/hours`
+- `/api/machines/list`
+- `/api/machines/photo`
+- `/api/machines/photo_delete`
+- `/api/machines/photo_upload`
+- `/api/machines/status`
+- `/api/machines/update`
 - `/api/metrics`
 - `/api/money/summary`
 - `/api/ops-summary`
@@ -139,7 +163,7 @@ _Всего эндпоинтов: 57._
 </details>
 
 
-### Менеджер (`manager`) — 19 эндпоинтов
+### Менеджер (`manager`) — 25 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -150,6 +174,12 @@ _Всего эндпоинтов: 57._
 - `/api/deposits/create`
 - `/api/deposits/my`
 - `/api/home`
+- `/api/machines/card`
+- `/api/machines/create`
+- `/api/machines/hours`
+- `/api/machines/list`
+- `/api/machines/photo`
+- `/api/machines/photo_upload`
 - `/api/orders/add_item`
 - `/api/orders/create`
 - `/api/orders/delete_draft`
@@ -227,5 +257,8 @@ _Всего эндпоинтов: 57._
 | Деньги (лента) | admin, boss | `/api/money/summary` |
 | Операционная сводка | admin, boss | `/api/ops-summary` |
 | Возвраты (приёмка) | admin, boss, warehouse_keeper | `/api/returns/pending` |
+| Заказы → Техника | admin, boss, manager | `/api/machines/list` |
+| Техника → карточка | admin, boss, manager | `/api/machines/card` |
+| Техника → сделки | admin, boss | `/api/machines/deal` |
 
 Таблица экранов ручная (какой экран какой эндпоинт зовёт — это знание фронта), списки выше машинные. При расхождении верить спискам.
