@@ -831,3 +831,92 @@ describe('курсы валют: «Сохранить» действительн
     expect(window.__calls.filter(([p]) => p.endsWith('/set'))).toHaveLength(0);
   });
 });
+
+describe('деньги: рассрочки в долгах и карточка покупателя', () => {
+  const DEBTS = {
+    debts: [], role: 'boss', scope: 'company', today: '2026-08-01',
+    money_received: [], money_pending: [], remaining_by_currency: [],
+    base_currency: 'USD',
+    machine_debts: [{
+      deal_id: 3, machine_name: 'JCB 3CX', buyer_name: 'Иванов П.', currency: 'USD',
+      remaining: 20000, next_due: '2026-07-01', next_amount: 4000, state: 'overdue',
+    }],
+    totals: {
+      orders: { count: 1, base_total: 1000, base_currency: 'USD', partial: false,
+                by_currency: [{ currency: 'USD', total: 1000 }] },
+      machines: { count: 5, base_total: 20000, base_currency: 'USD', partial: false,
+                  by_currency: [{ currency: 'USD', total: 20000 }] },
+      all: { count: 6, base_total: 21000, base_currency: 'USD', partial: false,
+             by_currency: [{ currency: 'USD', total: 21000 }] },
+    },
+  };
+
+  it('блок рассрочек виден и красится по ближайшему платежу', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify(DEBTS)});
+      window.__ready = renderDebts(document.getElementById('content'));
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toContain('Рассрочки по технике');
+    const row = content.querySelector('[data-buyer]');
+    expect(row.dataset.status).toBe('overdue');
+    expect(row.textContent).toContain('JCB 3CX');
+  });
+
+  it('итог «нам должны» разложен по источникам', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify(DEBTS)});
+      window.__ready = renderDebts(document.getElementById('content'));
+    `);
+    await window.__ready;
+    const text = window.document.getElementById('content').textContent;
+    expect(text).toContain('Нам должны');
+    expect(text).toContain('По заказам');
+    expect(text).toContain('По технике');
+  });
+
+  it('у менеджера (totals: null) блока итогов нет', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      api = async () => (${JSON.stringify({ ...DEBTS, role: 'manager', scope: 'personal',
+        machine_debts: [], totals: null })});
+      window.__ready = renderDebts(document.getElementById('content'));
+    `);
+    await window.__ready;
+    const text = window.document.getElementById('content').textContent;
+    expect(text).not.toContain('Нам должны');
+    expect(text).not.toContain('Рассрочки по технике');
+  });
+
+  it('карточка покупателя показывает остаток и график', async () => {
+    const CARD = {
+      ok: true, buyer: 'Иванов П.',
+      outstanding: { count: 2, base_total: 8000, base_currency: 'USD', partial: false,
+                     by_currency: [{ currency: 'USD', total: 8000 }] },
+      aging: { buckets: [{ key: 'not_due', label: 'Срок не наступил', count: 2,
+                           base_total: 8000, base_currency: 'USD', partial: false,
+                           by_currency: [{ currency: 'USD', total: 8000 }] }] },
+      deals: [{
+        id: 3, machine_name: 'JCB 3CX', sold_at: '2026-07-01', currency: 'USD',
+        payments: [
+          { id: 10, seq: 0, due_date: '2026-07-01', amount_cents: 500000, paid_at: '2026-07-01' },
+          { id: 11, seq: 1, due_date: '2026-09-01', amount_cents: 400000, paid_at: null },
+        ],
+      }],
+    };
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify(CARD)});
+      window.__ready = renderBuyerCard('Иванов П.');
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toContain('Иванов П.');
+    expect(content.textContent).toContain('Первоначальный взнос');
+    // Взнос переключать нечем — кнопка только у планового платежа.
+    expect(content.querySelectorAll('[data-payment]').length).toBe(1);
+  });
+});

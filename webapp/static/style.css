@@ -2032,6 +2032,32 @@ body {
 }
 .qty-input:focus { border-color: var(--accent); }
 
+/* ─── Бары дебиторки и прогноза ──────────────────────────────────────────────
+   Свой график ради пяти корзин — лишняя зависимость во фронте без сборщика.
+   Ширина бара считается от САМОЙ БОЛЬШОЙ корзины, а не от суммы: сравнивать
+   надо корзины между собой, иначе при одной доминирующей все прочие
+   схлопываются в невидимую полоску. */
+.aging-row + .aging-row { margin-top: var(--sp-3); }
+.aging-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: var(--sp-3); margin-bottom: var(--sp-1);
+}
+.aging-label { font-size: var(--text-sm); color: var(--text); }
+.aging-sum {
+  font-size: var(--text-sm); font-weight: 600; color: var(--text);
+  white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.aging-track {
+  height: 8px; border-radius: 4px; background: var(--bg-soft); overflow: hidden;
+}
+.aging-bar {
+  height: 100%; border-radius: 4px; background: var(--status-c);
+  /* Нулевая корзина не рисует полоску вовсе: подтёкшая полоска в 1px читается
+     как «немного есть». */
+  min-width: 0;
+}
+.aging-count { margin-top: var(--sp-1); font-size: var(--text-xs); color: var(--text-mute); }
+
 /* Лента фотографий машины: горизонтальная прокрутка, квадратные превью.
    Снимки приходят с телефона в любой ориентации — object-fit: cover не даёт
    ленте прыгать по высоте. */
