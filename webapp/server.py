@@ -2742,7 +2742,12 @@ async def api_machines_card(request: Request):
     # запрос ровно за тем, что и так открыто на экране.
     for deal in deals:
         if deal.get("kind") == "credit":
-            deal["payments"] = await machines.get_schedule(int(deal["id"]))
+            progress = await machines.deal_progress(int(deal["id"]))
+            # Платежи отдаём уже с покрытием: клиент вносит частями, и «оплачен
+            # или нет» на экране мало — видно должно быть, сколько внесено.
+            deal["payments"] = progress["payments"]
+            deal["progress"] = {k: v for k, v in progress.items() if k != "payments"}
+            deal["receipts"] = await machines.list_receipts(int(deal["id"]))
     return JSONResponse(
         {
             "ok": True,
@@ -3121,6 +3126,67 @@ async def api_machines_payment(request: Request):
     return _machine_response(res)
 
 
+@app.post("/api/machines/receipt")
+async def api_machines_receipt(request: Request):
+    """Записать полученные по рассрочке деньги — сумма любая.
+
+    Клиент платит не «платёж №3», а деньги: в один месяц больше, в другой
+    меньше. Поступления гасят график по порядку, переплата уходит в следующие
+    месяцы, а последний закрытый платёж закрывает сделку.
+    """
+    from services import async_db as adb
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_receipt"
+    )
+    deal_id = _machine_id_arg(data, "deal_id")
+    amount_cents = _machine_money(data.get("amount"), "Сумма")
+    if not amount_cents:
+        raise HTTPException(status_code=400, detail="Сумма обязательна")
+    if not data.get("idempotency_key"):
+        raise HTTPException(status_code=400, detail="idempotency_key обязателен")
+
+    idem = _Idem(adb, "machine_receipt", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await machines.add_receipt(
+            deal_id, amount_cents, user_id=user["id"], full_name=_actor_name(user),
+            note=_machine_text(data, "note", 200),
+        )
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/machines/receipt_delete")
+async def api_machines_receipt_delete(request: Request):
+    """Удалить ошибочно внесённое поступление.
+
+    Если им была закрыта рассрочка — она открывается обратно: иначе долг
+    исчезает из напоминаний и дебиторки, хотя платёж не получен.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_receipt_delete"
+    )
+    receipt_id = _machine_id_arg(data, "receipt_id")
+    res = await machines.delete_receipt(
+        receipt_id, user_id=user["id"], full_name=_actor_name(user)
+    )
+    return _machine_response(res)
+
+
 @app.post("/api/machines/deals_open")
 async def api_machines_deals_open(request: Request):
     """Незакрытые рассрочки по технике — кому напоминать о сроке."""
@@ -3385,12 +3451,13 @@ async def api_containers_list(request: Request):
     status = (data.get("status") or "").strip() or None
     if status and status not in containers.STATUSES:
         raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+    search = (data.get("search") or "").strip()[:64] or None
 
-    rows = await containers.list_containers(status)
-    # Расхождения нужны прямо в списке: иначе «сверить» значит открыть каждый
-    # контейнер по очереди.
+    # Сводку и окно правки считает сервис одним проходом — раньше здесь был
+    # запрос состава на КАЖДЫЙ контейнер, то есть N+1 на список.
+    rows = await containers.list_containers(status, search=search)
     for row in rows:
-        row["diff"] = containers.diff_summary(containers.diff(await containers.list_items(row["id"])))
+        row["diff"] = row.pop("summary", None)
     return JSONResponse(
         {
             "ok": True,
@@ -3417,6 +3484,8 @@ async def api_containers_card(request: Request):
     if not container:
         raise HTTPException(status_code=404, detail="Контейнер не найден")
 
+    from services import ms_supply
+
     items = containers.diff(await containers.list_items(container_id))
     return JSONResponse(
         {
@@ -3424,6 +3493,10 @@ async def api_containers_card(request: Request):
             "container": container,
             "items": items,
             "diff": containers.diff_summary(items),
+            # Окно правки: фронт по нему решает, показывать ли кнопки, а не
+            # выясняет это отказом ручки после нажатия.
+            "edit_window": containers.edit_window(container),
+            "supply": await ms_supply.get_link(container_id),
             "can_manage": get_role(user["id"]) in _MACHINE_BOSS,
             "status_labels": containers.STATUS_LABELS,
         }
@@ -3562,6 +3635,55 @@ async def api_containers_check(request: Request):
     res = await containers.set_arrived_quantities(
         container_id, quantities, user_id=user["id"], full_name=_actor_name(user)
     )
+    if not res.get("ok"):
+        return _machine_response(res)
+
+    # Остаток в МойСклад пополняем сразу после сохранения — ради этого приёмку
+    # и считают. Best-effort: сверка уже сохранена, и отказ МойСклад не должен
+    # выглядеть как «ничего не записалось». Что не прошло — возвращаем текстом,
+    # чтобы это можно было починить, а не узнать через неделю по остаткам.
+    from services import ms_supply
+
+    supply = await ms_supply.sync_supply(container_id)
+    res["supply"] = supply
+    return JSONResponse(res)
+
+
+@app.post("/api/containers/supplier")
+async def api_containers_supplier(request: Request):
+    """Задать поставщика контейнера — «Приёмке» в МойСклад он обязателен.
+
+    Спрашиваем заранее, а не в момент приёмки: когда считают коробки, о
+    поставщике не думают.
+    """
+    from services import ms_supply
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_supplier"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    ms_id = (data.get("supplier_ms_id") or "").strip()[:64] or None
+    name = (data.get("supplier_name") or "").strip()[:200] or None
+    if not ms_id:
+        raise HTTPException(status_code=400, detail="Выберите поставщика из справочника")
+    res = await ms_supply.set_supplier(container_id, ms_id=ms_id, name=name)
+    return _machine_response(res)
+
+
+@app.post("/api/containers/supply")
+async def api_containers_supply(request: Request):
+    """Оприходовать контейнер в МойСклад вручную — повтор после сбоя или после
+    того, как недостающий товар завели в номенклатуре."""
+    from services import ms_supply
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_supply",
+        rate_limit_max=20,
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    res = await ms_supply.sync_supply(container_id)
     return _machine_response(res)
 
 
@@ -3583,7 +3705,7 @@ async def api_containers_arrive(request: Request):
 
 @app.post("/api/containers/delete")
 async def api_containers_delete(request: Request):
-    """Удалить контейнер. Только admin/boss и только пока он не прибыл."""
+    """Удалить контейнер. Только admin/boss и пока открыто окно правки."""
     from services import containers
 
     data = await request.json()

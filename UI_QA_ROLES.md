@@ -23,10 +23,10 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 85._
+_Всего эндпоинтов: 89._
 
 
-### Админ (`admin`) — 78 эндпоинтов
+### Админ (`admin`) — 82 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -45,6 +45,8 @@ _Всего эндпоинтов: 85._
 - `/api/containers/item_add`
 - `/api/containers/item_delete`
 - `/api/containers/list`
+- `/api/containers/supplier`
+- `/api/containers/supply`
 - `/api/containers/update`
 - `/api/credit/overview`
 - `/api/credit/set`
@@ -70,6 +72,8 @@ _Всего эндпоинтов: 85._
 - `/api/machines/photo`
 - `/api/machines/photo_delete`
 - `/api/machines/photo_upload`
+- `/api/machines/receipt`
+- `/api/machines/receipt_delete`
 - `/api/machines/status`
 - `/api/machines/update`
 - `/api/metrics`
@@ -112,7 +116,7 @@ _Всего эндпоинтов: 85._
 </details>
 
 
-### Руководитель (`boss`) — 75 эндпоинтов
+### Руководитель (`boss`) — 79 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -131,6 +135,8 @@ _Всего эндпоинтов: 85._
 - `/api/containers/item_add`
 - `/api/containers/item_delete`
 - `/api/containers/list`
+- `/api/containers/supplier`
+- `/api/containers/supply`
 - `/api/containers/update`
 - `/api/credit/overview`
 - `/api/credit/set`
@@ -156,6 +162,8 @@ _Всего эндпоинтов: 85._
 - `/api/machines/photo`
 - `/api/machines/photo_delete`
 - `/api/machines/photo_upload`
+- `/api/machines/receipt`
+- `/api/machines/receipt_delete`
 - `/api/machines/status`
 - `/api/machines/update`
 - `/api/metrics`
@@ -195,7 +203,7 @@ _Всего эндпоинтов: 85._
 </details>
 
 
-### Менеджер (`manager`) — 34 эндпоинтов
+### Менеджер (`manager`) — 36 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -208,6 +216,8 @@ _Всего эндпоинтов: 85._
 - `/api/containers/item_add`
 - `/api/containers/item_delete`
 - `/api/containers/list`
+- `/api/containers/supplier`
+- `/api/containers/supply`
 - `/api/containers/update`
 - `/api/currency/rates`
 - `/api/debts`

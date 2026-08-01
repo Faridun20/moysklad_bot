@@ -26,10 +26,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import datetime, timedelta
 from typing import Any
 
 from services import adb_core
 from services.database import USE_POSTGRES, add_audit_log, get_role, now_str
+from utils.helpers import local_now
 
 logger = logging.getLogger(__name__)
 
@@ -104,16 +106,45 @@ async def get_container(container_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-async def list_containers(status: str | None = None) -> list[dict]:
-    """Список контейнеров. Прибывшие — сверху по дате прибытия, едущие — по ETA:
-    и то и другое отвечает на «что ближайшее»."""
+async def list_containers(status: str | None = None, search: str | None = None) -> list[dict]:
+    """Список контейнеров со сводкой состава.
+
+    Прибывшие — сверху по дате прибытия, едущие — по ETA: и то и другое отвечает
+    на «что ближайшее».
+
+    Сводка расхождений считается ЗДЕСЬ, а не при открытии карточки: иначе
+    «сверить контейнеры» значит открыть каждый по очереди, а именно от этого
+    раздел и должен избавлять. Один запрос на весь состав, без N+1.
+    """
     query = "SELECT * FROM containers"
     params: list[Any] = []
+    where = []
     if status:
         params.append(status)
-        query += " WHERE status = $1"
+        where.append(f"status = ${len(params)}")
+    if (search or "").strip():
+        # Ищем и по номеру, и по заметке: номер помнят не всегда, а «запчасти
+        # для JCB» помнят.
+        params.append(f"%{normalize_number(search)}%")
+        params.append(f"%{search.strip().lower()}%")
+        where.append(f"(number LIKE ${len(params) - 1} OR lower(notes) LIKE ${len(params)})")
+    if where:
+        query += " WHERE " + " AND ".join(where)
     query += " ORDER BY COALESCE(arrived_at, eta_date, created_at) DESC, id DESC"
-    return [dict(r) for r in await adb_core.fetch(query, *params)]
+    rows = [dict(r) for r in await adb_core.fetch(query, *params)]
+    if not rows:
+        return rows
+
+    items = await adb_core.fetch(
+        "SELECT container_id, expected_qty, arrived_qty FROM container_items"
+    )
+    by_container: dict[int, list[dict]] = {}
+    for it in items:
+        by_container.setdefault(int(it["container_id"]), []).append(dict(it))
+    for row in rows:
+        row["summary"] = diff_summary(diff(by_container.get(int(row["id"]), [])))
+        row["edit_window"] = edit_window(row)
+    return rows
 
 
 async def count_by_status() -> dict[str, int]:
@@ -150,19 +181,81 @@ async def update_container(
     return {"ok": True}
 
 
+# Сколько времени приёмку можно править после сохранения сверки. Ошибку в
+# количестве замечают в тот же день или на следующее утро; дальше карточка
+# закрывается и становится историей, по которой уже приняли решения.
+EDIT_WINDOW_HOURS = 24
+
+
+def edit_window(container: dict | None) -> dict:
+    """Можно ли ещё править приёмку и сколько осталось.
+
+    Считаем в Python от `local_now()`: `arrived_at` пишется локальным `now_str()`,
+    а `NOW()` в SQL отдаёт UTC — сравнение в разных кадрах молча всегда ложно
+    (CLAUDE.md).
+    """
+    if not container or container.get("status") != "arrived":
+        # Пока в пути — правь сколько угодно, ничего ещё не зафиксировано.
+        return {"open": True, "closes_at": None, "hours_left": None}
+    stamp = str(container.get("arrived_at") or "")
+    try:
+        arrived = datetime.strptime(stamp[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        # Без разборной отметки времени закрывать нечего — иначе одна кривая
+        # строка навсегда запирает карточку.
+        return {"open": True, "closes_at": None, "hours_left": None}
+    closes = arrived + timedelta(hours=EDIT_WINDOW_HOURS)
+    left = (closes - local_now().replace(tzinfo=None)).total_seconds() / 3600
+    return {
+        "open": left > 0,
+        "closes_at": closes.strftime("%Y-%m-%d %H:%M:%S"),
+        "hours_left": round(left, 1) if left > 0 else 0,
+    }
+
+
+async def _require_open_window(container_id: int) -> dict | None:
+    """Отказ, если окно правки уже закрыто. None — можно менять.
+
+    Один сторож на все операции состава: закрывать карточку в интерфейсе, но
+    принимать правки в ручках значит не закрыть её вовсе.
+    """
+    row = await adb_core.fetchrow(
+        "SELECT status, arrived_at FROM containers WHERE id = $1", container_id
+    )
+    if not row:
+        return {"ok": False, "error": "Контейнер не найден"}
+    window = edit_window(dict(row))
+    if window["open"]:
+        return None
+    return {
+        "ok": False,
+        "error": f"Приёмка закрыта — правки принимались {EDIT_WINDOW_HOURS} ч после прибытия",
+        "window_closed": True,
+    }
+
+
 async def delete_container(container_id: int, *, user_id: int, full_name: str = "") -> dict:
     """Удалить контейнер вместе с составом.
 
-    Прибывший не удаляем: это уже история приёмки, по которой сверяли товар.
+    Прибывший удаляется, пока открыто окно правки: приёмку могли завести не на
+    тот контейнер, и запрет означал бы вечную неверную строку в списке. После
+    закрытия окна это история приёмки, по которой уже принимали решения.
+
     Состав чистим явно — на SQLite внешние ключи по умолчанию выключены, и без
     этого удаление вело бы себя по-разному в тестах и на проде.
     """
     async with adb_core.transaction() as txn:
-        row = await txn.fetchrow("SELECT number, status FROM containers WHERE id = $1", container_id)
+        row = await txn.fetchrow(
+            "SELECT number, status, arrived_at FROM containers WHERE id = $1", container_id
+        )
         if not row:
             return {"ok": False, "error": "Контейнер не найден"}
-        if row["status"] == "arrived":
-            return {"ok": False, "error": "Прибывший контейнер — это история приёмки"}
+        window = edit_window(dict(row))
+        if not window["open"]:
+            return {
+                "ok": False,
+                "error": f"Приёмка закрыта — правки принимались {EDIT_WINDOW_HOURS} ч после прибытия",
+            }
         await txn.execute("DELETE FROM container_items WHERE container_id = $1", container_id)
         await txn.execute("DELETE FROM containers WHERE id = $1", container_id)
     await _audit(user_id, full_name, "container_deleted", f"#{container_id} · {row['number']}")
@@ -188,8 +281,9 @@ async def add_item(
         return {"ok": False, "error": "Название позиции обязательно"}
     if expected_qty < 0 or (arrived_qty is not None and arrived_qty < 0):
         return {"ok": False, "error": "Количество не может быть отрицательным"}
-    if not await adb_core.fetchrow("SELECT id FROM containers WHERE id = $1", container_id):
-        return {"ok": False, "error": "Контейнер не найден"}
+    guard = await _require_open_window(container_id)
+    if guard:
+        return guard
 
     sql = (
         "INSERT INTO container_items (container_id, name, unit, expected_qty, arrived_qty, "
@@ -209,6 +303,9 @@ async def add_item(
 
 
 async def delete_item(container_id: int, item_id: int) -> dict:
+    guard = await _require_open_window(container_id)
+    if guard:
+        return guard
     rows = await adb_core.execute(
         "DELETE FROM container_items WHERE id = $1 AND container_id = $2", item_id, container_id
     )
@@ -225,9 +322,15 @@ async def list_items(container_id: int) -> list[dict]:
 def diff(items: list[dict]) -> list[dict]:
     """Состав с расхождениями: сколько заявлено, сколько пришло, что не сошлось.
 
-    `arrived_qty IS NULL` — «ещё не считали»: такая позиция не расхождение, и
-    подсвечивать её красным нельзя, иначе непроверенный контейнер выглядит как
-    полностью недостающий.
+    Два правила, без которых сверка врёт:
+
+    * `arrived_qty IS NULL` — «ещё не считали»: такая позиция не расхождение, и
+      подсвечивать её красным нельзя, иначе непроверенный контейнер выглядит как
+      полностью недостающий.
+    * `expected_qty == 0` — позицию НЕ ЗАЯВЛЯЛИ, её вписали уже при приёмке.
+      Это не излишек: расхождение бывает только с тем, что обещали. Контейнер,
+      состав которого вообще не заводили заранее, — это опись прибывшего, а не
+      сверка, и красных строк в нём быть не должно.
     """
     out = []
     for it in items:
@@ -235,17 +338,25 @@ def diff(items: list[dict]) -> list[dict]:
         arrived = it.get("arrived_qty")
         arrived_f = None if arrived is None else float(arrived)
         delta = None if arrived_f is None else round(arrived_f - expected, 3)
+        if delta is None:
+            state = "unchecked"
+        elif not expected:
+            # Не заявляли — значит и не расходится. Пришло 0 при незаявленной
+            # позиции — просто пустая строка, тоже не недостача.
+            state = "received"
+        elif delta == 0:
+            state = "match"
+        elif delta < 0:
+            state = "short"
+        else:
+            state = "extra"
         out.append({
             **it,
             "expected_qty": expected,
             "arrived_qty": arrived_f,
             "delta": delta,
-            "state": (
-                "unchecked" if delta is None
-                else "match" if delta == 0
-                else "short" if delta < 0
-                else "extra"
-            ),
+            "declared": bool(expected),
+            "state": state,
         })
     return out
 
@@ -257,6 +368,7 @@ def diff_summary(rows: list[dict]) -> dict:
         "unchecked": sum(1 for r in rows if r["state"] == "unchecked"),
         "short": sum(1 for r in rows if r["state"] == "short"),
         "extra": sum(1 for r in rows if r["state"] == "extra"),
+        "received": sum(1 for r in rows if r["state"] == "received"),
         "mismatch": sum(1 for r in rows if r["state"] in ("short", "extra")),
     }
 
@@ -271,6 +383,9 @@ async def set_arrived_quantities(
     """
     if not quantities:
         return {"ok": False, "error": "Нечего сохранять"}
+    guard = await _require_open_window(container_id)
+    if guard:
+        return guard
     known = {int(i["id"]) for i in await list_items(container_id)}
     unknown = set(quantities) - known
     if unknown:

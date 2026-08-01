@@ -1012,13 +1012,22 @@ function machineScheduleHtml(deal, today) {
 
   const items = rows.map(p => {
     const due = String(p.due_date || '').slice(0, 10);
-    // Состояние платежа: получен / просрочен / впереди — та же матрица цветов,
-    // что у долгов по заказам.
-    const state = p.paid_at ? 'approved' : (due < today ? 'overdue' : 'upcoming');
+    const covered = Number(p.covered_cents || 0);
+    const amount = Number(p.amount_cents || 0);
+    // Частично внесённый платёж — не «не оплачен»: клиент принёс часть, и это
+    // должно быть видно, иначе ему позвонят как ничего не заплатившему.
+    const partial = !p.paid_at && covered > 0;
+    // Состояние платежа: получен / внесена часть / просрочен / впереди — та же
+    // матрица цветов, что у долгов по заказам.
+    const state = p.paid_at ? 'approved'
+      : partial ? 'partial'
+      : (due < today ? 'overdue' : 'upcoming');
     const title = p.seq === 0 ? 'Первоначальный взнос' : `Платёж ${p.seq}`;
     const when = p.paid_at
       ? `получен ${escapeHtml(String(p.paid_at).slice(0, 10))}`
-      : `до ${escapeHtml(due)}`;
+      : partial
+        ? `внесено ${formatMoney(covered / 100, cur)} из ${formatMoney(amount / 100, cur)} · до ${escapeHtml(due)}`
+        : `до ${escapeHtml(due)}`;
     // Взнос переключать нечем: он получен в момент сделки.
     const toggle = boss && p.seq > 0
       ? `<button class="pay-toggle" data-payment="${p.id}" data-paid="${p.paid_at ? '1' : '0'}"
@@ -1035,13 +1044,68 @@ function machineScheduleHtml(deal, today) {
       </div>`;
   }).join('');
 
-  const left = totalCents - paidCents;
+  // Прогресс считает сервер (взнос + поступления), но если его нет — считаем
+  // по покрытию строк, чтобы блок не пустовал.
+  const prog = deal.progress || {};
+  const paid = prog.paid_cents != null
+    ? Number(prog.paid_cents)
+    : rows.reduce((s, p) => s + Number(p.covered_cents || 0), 0);
+  const total = prog.planned_cents != null ? Number(prog.planned_cents) : totalCents;
+  const left = Math.max(0, total - paid);
+  const addBtn = boss && !deal.closed_at
+    ? `<div class="c-actions"><button class="btn-secondary" data-receipt-add="${deal.id}">${icon('cash')} Внести оплату</button></div>`
+    : '';
   return `
     <div class="items-total schedule-total">
-      <span>Оплачено ${formatMoney(paidCents / 100, cur)} из ${formatMoney(totalCents / 100, cur)}</span>
+      <span>Получено ${formatMoney(paid / 100, cur)} из ${formatMoney(total / 100, cur)}</span>
       <b>${left > 0 ? `осталось ${formatMoney(left / 100, cur)}` : 'закрыто'}</b>
     </div>
-    <div class="c-surface c-surface--list">${items}</div>`;
+    <div class="c-surface c-surface--list">${items}</div>
+    ${addBtn}
+    ${machineReceiptsHtml(deal)}`;
+}
+
+// Лента фактических поступлений. Клиент платит частями, и «сколько всего
+// внесено» без списка взносов проверить нельзя.
+function machineReceiptsHtml(deal) {
+  const rows = deal.receipts || [];
+  if (!rows.length) return '';
+  const cur = deal.currency || 'USD';
+  const boss = isMachineBoss();
+  return `<div class="section-label">Поступления · ${rows.length}</div>
+    <div class="c-surface c-surface--list">${rows.map(r => `
+      <div class="c-row">
+        <div class="card-row-info">
+          <div class="card-row-title">${formatMoney(Number(r.amount_cents || 0) / 100, cur)}</div>
+          <div class="card-row-sub">${escapeHtml(String(r.received_at || '').slice(0, 16))}${
+            r.note ? ' · ' + escapeHtml(r.note) : ''}</div>
+        </div>
+        ${boss ? `<button class="pay-toggle" data-receipt-del="${r.id}"
+                    aria-label="Удалить поступление">${icon('trash')}</button>` : ''}
+      </div>`).join('')}</div>`;
+}
+
+function openReceiptForm(machineId, deal) {
+  const key = idemKey();
+  openMachineSheet({
+    title: 'Оплата по рассрочке',
+    hint: 'Сумма любая — поступления гасят график по порядку',
+    fields: [
+      { key: 'amount', label: `Сумма, ${deal.currency || 'USD'}`, type: 'number', required: true },
+      { key: 'note', label: 'Комментарий' },
+    ],
+    submitLabel: 'Записать',
+    onSubmit: async (data, { showErr }) => {
+      const res = await apiResult('/api/machines/receipt', {
+        deal_id: deal.id, amount: data.amount, note: data.note, idempotency_key: key,
+      });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      toast(res.body.deal_closed ? 'Рассрочка закрыта — всё получено' : 'Оплата записана');
+      renderMachineCard(machineId);
+      return true;
+    },
+  });
 }
 
 function machineDealsHtml(deals, today) {
@@ -1130,6 +1194,8 @@ async function deleteMachine(machine) {
 // уровнях: в списке — счётчиком, в карточке — построчно. Сверка, ради которой
 // раздел и заводился, не должна требовать открыть каждый контейнер по очереди.
 let containersFilter = 'all';
+let containersSearch = '';
+let _containersSearchTimer = null;
 
 async function renderContainers() {
   const content = document.getElementById('content');
@@ -1141,6 +1207,7 @@ async function renderContainers() {
   try {
     data = await api('/api/containers/list', {
       status: containersFilter === 'all' ? '' : containersFilter,
+      search: containersSearch,
     });
   } catch (e) {
     content.innerHTML = ordersShellHtml() + errorBox(e.message);
@@ -1157,6 +1224,10 @@ async function renderContainers() {
     if (d.total) parts.push(`${d.total} поз.`);
     if (d.mismatch) parts.push(`расхождений: ${d.mismatch}`);
     else if (d.unchecked && c.status === 'arrived') parts.push('не сверен');
+    // Заметка — прямо в списке: «что в этом контейнере» спрашивают чаще, чем
+    // открывают карточку, и ради одной строки заходить внутрь незачем.
+    const note = c.notes
+      ? `<div class="card-row-sub card-row-note">${escapeHtml(c.notes)}</div>` : '';
     return `
       <div class="c-row c-row--tap" data-container="${c.id}"
            data-status="${d.mismatch ? 'rejected' : escapeHtml(c.status || '')}"
@@ -1164,6 +1235,7 @@ async function renderContainers() {
         <div class="card-row-info">
           <div class="card-row-title">${escapeHtml(c.number || '—')}</div>
           <div class="card-row-sub">${escapeHtml(parts.join(' · '))}</div>
+          ${note}
         </div>
         <span class="c-badge">${escapeHtml(machineStatusLabel(c.status, labels))}</span>
       </div>`;
@@ -1180,17 +1252,41 @@ async function renderContainers() {
 
   content.innerHTML = ordersShellHtml()
     + `<div class="seg-row"><div class="seg seg--scroll">${seg}</div></div>`
+    + `<div class="search-wrap"><input type="search" id="container-search" class="search-input"
+         placeholder="Номер или заметка…" value="${escapeHtml(containersSearch)}"
+         autocomplete="off"></div>`
     + (rows
       ? `<div class="c-surface c-surface--list">${rows}</div>`
       : emptyState({
           icon: 'box',
-          title: 'Контейнеров нет',
-          hint: 'Заведите контейнер, когда он выйдет в путь — и будет видно, чего ждать.',
+          title: containersSearch ? 'Ничего не найдено' : 'Контейнеров нет',
+          hint: containersSearch
+            ? 'Проверьте номер или поищите по слову из заметки.'
+            : 'Заведите контейнер, когда он выйдет в путь — и будет видно, чего ждать.',
         }))
     + `<div class="c-actions"><button class="btn-secondary" id="container-new">${icon('plus')} Новый контейнер</button></div>`;
   wireOrdersShell(content);
 
   content.querySelector('#container-new')?.addEventListener('click', () => openContainerForm());
+
+  const searchInput = content.querySelector('#container-search');
+  if (searchInput) {
+    // Дебаунс: иначе каждый символ — запрос к серверу.
+    searchInput.addEventListener('input', e => {
+      containersSearch = e.target.value;
+      clearTimeout(_containersSearchTimer);
+      _containersSearchTimer = setTimeout(renderContainers, 250);
+    });
+    // Экран перерисовывается целиком, поэтому поле теряет фокус после каждого
+    // поиска — без возврата курсора набирать запрос можно только по одной
+    // букве. При первом рендере (запрос пуст) фокус не трогаем, чтобы не
+    // открывать клавиатуру.
+    if (containersSearch) {
+      searchInput.focus();
+      const end = searchInput.value.length;
+      try { searchInput.setSelectionRange(end, end); } catch { /* type=search */ }
+    }
+  }
   content.querySelectorAll('[data-cstatus]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
@@ -1286,6 +1382,69 @@ function containerItemsHtml(items, arrived, canManage) {
   return `<div class="c-surface c-surface--list">${rows}</div>`;
 }
 
+// Выбор поставщика контейнера. Контрагентов берём той же ручкой, что и клиентов
+// заказа: справочник МойСклад один, и второй поиск по нему был бы дублем.
+function openSupplierPicker(containerId) {
+  let picked = null;
+  const sheet = openMachineSheet({
+    title: 'Поставщик контейнера',
+    hint: '«Приёмке» в МойСклад поставщик обязателен',
+    fields: [{ key: 'search', label: 'Поиск по названию', placeholder: 'ООО …' }],
+    submitLabel: 'Сохранить',
+    onSubmit: async (_data, { showErr }) => {
+      if (!picked) { showErr('Выберите контрагента из списка'); return false; }
+      const res = await apiResult('/api/containers/supplier', {
+        container_id: containerId,
+        supplier_ms_id: picked.id,
+        supplier_name: picked.name,
+      });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      toast('Поставщик сохранён');
+      renderContainerCard(containerId);
+      return true;
+    },
+  });
+
+  const ov = document.querySelector('.c-overlay');
+  const input = ov?.querySelector('#ms-f-search');
+  const list = document.createElement('div');
+  list.className = 'c-surface c-surface--list supplier-list';
+  input?.parentElement?.after(list);
+
+  let timer;
+  const load = async (search) => {
+    list.innerHTML = loading('Загружаю…');
+    try {
+      const data = await api('/api/agents', { search });
+      const rows = data.agents || [];
+      list.innerHTML = rows.length
+        ? rows.map(a => `
+          <div class="c-row c-row--tap" data-supplier="${escapeHtml(a.id)}"
+               data-name="${escapeHtml(a.name || '')}" role="button" tabindex="0">
+            <div class="card-row-info"><div class="card-row-title">${escapeHtml(a.name || '')}</div></div>
+          </div>`).join('')
+        : '<div class="loader">Контрагенты не найдены</div>';
+      list.querySelectorAll('[data-supplier]').forEach(row => {
+        row.addEventListener('click', () => {
+          haptic('light');
+          picked = { id: row.dataset.supplier, name: row.dataset.name };
+          list.querySelectorAll('[data-supplier]').forEach(r => r.classList.remove('picked'));
+          row.classList.add('picked');
+          sheet.showErr('');
+        });
+      });
+    } catch (e) {
+      list.innerHTML = `<div class="loader">${escapeHtml(e.message)}</div>`;
+    }
+  };
+  input?.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => load(input.value), 400);
+  });
+  load('');
+}
+
 async function renderContainerCard(containerId) {
   const content = document.getElementById('content');
   content.innerHTML = skeleton('label') + skeleton('list', 4);
@@ -1302,13 +1461,17 @@ async function renderContainerCard(containerId) {
   const c = card.container || {};
   const d = card.diff || {};
   const arrived = c.status === 'arrived';
-  const canManage = true;   // ручки состава открыты всем трём ролям
+  const supply = card.supply || {};
+  const win = card.edit_window || { open: true };
+  const canEdit = win.open;
+  const canManage = canEdit;   // ручки состава открыты всем трём ролям
 
   const facts = [
     ['Статус', machineStatusLabel(c.status, card.status_labels)],
     arrived ? ['Прибыл', String(c.arrived_at || '').slice(0, 10) || '—']
             : ['Ожидается', c.eta_date || '—'],
     ['Позиций', String(d.total || 0)],
+    ['Поставщик', supply.supplier_name || '— не выбран'],
   ];
   if (c.notes) facts.push(['Заметки', c.notes]);
 
@@ -1320,6 +1483,39 @@ async function renderContainerCard(containerId) {
         ? `<div class="items-total schedule-total"><span>Не сверено позиций</span><b>${d.unchecked}</b></div>`
         : `<div class="items-total schedule-total"><span>Состав сошёлся</span><b>${d.total} поз.</b></div>`;
 
+  // Что уехало в МойСклад и что там не приняли. Несопоставленное показываем
+  // явно: молча пропущенная позиция — это остаток, которого нет на складе, но
+  // который считают существующим.
+  let supplyBlock = '';
+  if (arrived) {
+    const unmatched = supply.unmatched || [];
+    supplyBlock = `<div class="section-label">Остатки в МойСклад</div>
+      <div class="c-surface c-surface--list">
+        <div class="c-row" data-status="${supply.ms_supply_id ? 'approved' : 'pending'}">
+          <div class="card-row-info">
+            <div class="card-row-title">${supply.ms_supply_id ? 'Приёмка создана' : 'Ещё не оприходовано'}</div>
+            <div class="card-row-sub">${supply.synced_at
+              ? escapeHtml(String(supply.synced_at).slice(0, 16))
+              : 'Цены впишете в МойСклад, когда будет удобно'}</div>
+          </div>
+        </div>
+        ${unmatched.map(u => `
+        <div class="c-row" data-status="rejected">
+          <div class="card-row-info">
+            <div class="card-row-title">${escapeHtml(u.name)}</div>
+            <div class="card-row-sub">${escapeHtml(u.reason)} — заведите товар и повторите</div>
+          </div>
+          <div class="card-row-value">${formatMoney(u.quantity)}</div>
+        </div>`).join('')}
+      </div>`;
+  }
+
+  const closedNote = arrived && !canEdit
+    ? '<div class="items-total schedule-total"><span>Приёмка закрыта</span><b>правки больше не принимаются</b></div>'
+    : arrived && win.hours_left != null
+      ? `<div class="card-row-sub">Правки принимаются ещё ${Math.ceil(win.hours_left)} ч</div>`
+      : '';
+
   content.innerHTML = `
     <div class="section-label">${escapeHtml(c.number || 'Контейнер')}</div>
     <div class="c-surface c-surface--list">${facts.map(([k, v]) => `
@@ -1328,15 +1524,33 @@ async function renderContainerCard(containerId) {
         <div class="card-row-value">${escapeHtml(String(v))}</div>
       </div>`).join('')}</div>
     ${verdict}
+    ${closedNote}
     <div class="c-actions c-actions--wrap">
-      <button class="btn-secondary" id="cont-item-add">${icon('plus')} ${arrived ? 'Лишняя позиция' : 'Позиция'}</button>
-      ${arrived ? '<button class="btn-primary" id="cont-save">Сохранить сверку</button>'
-                : '<button class="btn-primary" id="cont-arrive">Отметить прибытие</button>'}
-      ${!arrived && card.can_manage ? `<button class="btn-secondary btn-danger" id="cont-del">${icon('trash')} Удалить</button>` : ''}
+      ${canEdit ? `<button class="btn-secondary" id="cont-supplier">${icon('building')} Поставщик</button>` : ''}
+      ${canEdit ? `<button class="btn-secondary" id="cont-item-add">${icon('plus')} ${arrived ? 'Лишняя позиция' : 'Позиция'}</button>` : ''}
+      ${canEdit && arrived ? '<button class="btn-primary" id="cont-save">Сохранить сверку</button>' : ''}
+      ${canEdit && !arrived ? '<button class="btn-primary" id="cont-arrive">Отметить прибытие</button>' : ''}
+      ${arrived && !supply.ms_supply_id ? `<button class="btn-secondary" id="cont-supply">${icon('box')} Оприходовать</button>` : ''}
+      ${canEdit && card.can_manage ? `<button class="btn-secondary btn-danger" id="cont-del">${icon('trash')} Удалить</button>` : ''}
     </div>
+    ${supplyBlock}
     <div class="section-label">Состав</div>
     ${containerItemsHtml(card.items || [], arrived, canManage)}
   `;
+
+  content.querySelector('#cont-supplier')?.addEventListener('click', () =>
+    openSupplierPicker(containerId));
+
+  content.querySelector('#cont-supply')?.addEventListener('click', async () => {
+    const res = await apiResult('/api/containers/supply', { container_id: containerId });
+    if (!res.ok) {
+      tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+      return;
+    }
+    haptic('success');
+    toast(`Оприходовано позиций: ${res.body.matched}`);
+    renderContainerCard(containerId);
+  });
 
   content.querySelector('#cont-item-add')?.addEventListener('click', () =>
     openContainerItemForm(containerId, arrived));
@@ -1562,6 +1776,27 @@ async function renderMachineCard(machineId) {
     btn.addEventListener('click', () => {
       haptic('light');
       toggleMachinePayment(m.id, Number(btn.dataset.payment), btn.dataset.paid === '1');
+    });
+  });
+  content.querySelectorAll('[data-receipt-add]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const deal = (card.deals || []).find(x => String(x.id) === btn.dataset.receiptAdd);
+      if (deal) openReceiptForm(machineId, deal);
+    });
+  });
+  content.querySelectorAll('[data-receipt-del]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (!await confirmDialog('Удалить это поступление?')) return;
+      const res = await apiResult('/api/machines/receipt_delete', {
+        receipt_id: Number(btn.dataset.receiptDel),
+      });
+      if (!res.ok) {
+        tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+        return;
+      }
+      haptic('success');
+      toast(res.body.deal_reopened ? 'Поступление удалено, рассрочка снова открыта' : 'Удалено');
+      renderMachineCard(machineId);
     });
   });
 }

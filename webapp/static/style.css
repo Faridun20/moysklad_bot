@@ -2032,6 +2032,18 @@ body {
 }
 .qty-input:focus { border-color: var(--accent); }
 
+/* Заметка контейнера в строке списка: третья строка мельче и приглушённее —
+   она отвечает на «что внутри», но не спорит за внимание с номером. */
+.card-row-note {
+  margin-top: 2px;
+  font-size: var(--text-xs);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Список контрагентов внутри формы выбора поставщика. */
+.supplier-list { max-height: 40vh; overflow-y: auto; margin-bottom: var(--sp-3); }
+.supplier-list .picked { background: var(--success-bg); }
+
 /* ─── Бары дебиторки и прогноза ──────────────────────────────────────────────
    Свой график ради пяти корзин — лишняя зависимость во фронте без сборщика.
    Ширина бара считается от САМОЙ БОЛЬШОЙ корзины, а не от суммы: сравнивать
