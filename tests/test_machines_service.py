@@ -517,3 +517,36 @@ def test_archive_cli_returns_nonzero_on_failure(isolated_db, monkeypatch):
 
     monkeypatch.setattr(run_machines_archive, "archive_sold_machines", _boom)
     assert run_machines_archive.main() == 1
+
+
+def test_machine_delete_leaves_no_orphans_anywhere(isolated_db):
+    """Тот же класс ошибки, что был у контейнеров: добавили дочернюю таблицу —
+    забыли про удаление. На SQLite FK выключены, поэтому сирота не мешает; на
+    Postgres удаление падает 500-й. Проверяем ВСЕ дочерние таблицы по схеме,
+    чтобы следующая поймалась сама.
+    """
+    from services import machines
+
+    db = isolated_db
+    _setup_roles(db)
+    mid = _machine(db, hours=100)
+    _run(machines.add_photo(mid, tg_file_id="f", file_unique_id="u", uploaded_by=2))
+
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        names = [r[0] for r in cur.fetchall()]
+        children = []
+        for name in names:
+            cur.execute(f"PRAGMA foreign_key_list({name})")
+            if any(row[2] == "machines" for row in cur.fetchall()):
+                children.append(name)
+
+    assert {"machine_hours", "machine_photos", "machine_deals"} <= set(children), children
+    assert _run(machines.delete_machine(mid, user_id=2))["ok"] is True
+
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        for table in children:
+            cur.execute(db.q(f"SELECT COUNT(*) FROM {table} WHERE machine_id = ?"), (mid,))
+            assert cur.fetchone()[0] == 0, f"осиротевшие строки в {table}"
