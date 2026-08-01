@@ -1254,6 +1254,17 @@ describe('«Сегодня» — очередь дел', () => {
     expect(box.textContent).toContain('Всё разобрано');
   });
 
+  it('«дел нет» — строка, а не полэкрана', () => {
+    // Полноэкранный .empty-state занимает треть экрана телефона, и «дел нет»
+    // выглядело как «экран не загрузился». Такая пустота уместна там, где она
+    // И ЕСТЬ весь экран, а очередь — блок среди других.
+    const window = boot();
+    const box = window.document.createElement('div');
+    box.innerHTML = window.workQueueHtml([]);
+    expect(box.querySelector('.empty-state')).toBeNull();
+    expect(box.querySelector('.queue-empty')).not.toBeNull();
+  });
+
   it('строка ведёт туда, где дело закрывается — вместе с вкладкой', async () => {
     const window = boot(`
       currentUser = { role: 'boss' };
