@@ -701,6 +701,49 @@ def _create_tables():
                 note          TEXT,
                 created_at    TEXT
             )""",
+            # Подключение бота к личному аккаунту менеджера (Telegram Business).
+            # Нужно, чтобы по `business_connection_id` из апдейта понять, чей
+            # это чат: сам апдейт менеджера не называет.
+            """CREATE TABLE IF NOT EXISTS business_connections (
+                connection_id TEXT PRIMARY KEY,
+                manager_id    BIGINT NOT NULL,
+                user_chat_id  BIGINT,
+                is_enabled    INTEGER NOT NULL DEFAULT 1,
+                can_read      INTEGER NOT NULL DEFAULT 0,
+                connected_at  TEXT,
+                updated_at    TEXT
+            )""",
+            # Клиент, написавший менеджеру. Один ряд на человека, а не на
+            # переписку: вопрос «сколько клиентов написали» иначе двоился бы,
+            # если тот же человек написал двум менеджерам.
+            #
+            # ТЕКСТОВ СООБЩЕНИЙ ЗДЕСЬ НЕТ И НЕ ДОЛЖНО БЫТЬ. Для воронки нужны
+            # только «кто, когда, в какую сторону»; хранить переписку клиентов —
+            # ответственность без выгоды.
+            f"""CREATE TABLE IF NOT EXISTS leads (
+                id              {id_type},
+                tg_user_id      BIGINT NOT NULL UNIQUE,
+                manager_id      BIGINT,
+                username        TEXT,
+                display_name    TEXT,
+                status          TEXT NOT NULL DEFAULT 'new'
+                                CHECK (status IN ('new','won','lost')),
+                agent_ms_id     TEXT,
+                first_seen_at   TEXT,
+                last_inbound_at TEXT,
+                last_outbound_at TEXT,
+                first_reply_at  TEXT,
+                created_at      TEXT,
+                updated_at      TEXT
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS lead_events (
+                id         {id_type},
+                lead_id    INTEGER NOT NULL REFERENCES leads(id),
+                kind       TEXT NOT NULL,
+                manager_id BIGINT,
+                at         TEXT NOT NULL,
+                created_at TEXT
+            )""",
             # Контейнеры в пути. Состав заводят при отправке («ожидалось»), при
             # прибытии проставляют факт — расхождение видно сразу, а не после
             # ручной сверки с накладной.
@@ -857,6 +900,12 @@ def _create_indexes():
             "CREATE INDEX IF NOT EXISTS idx_machine_receipts_deal "
             "ON machine_payment_receipts(deal_id, received_at)",
             # ── Контейнеры ───────────────────────────────────────────────────
+            # Воронка: список фильтруется по менеджеру и по последней
+            # активности, события читаются по лиду.
+            "CREATE INDEX IF NOT EXISTS idx_leads_manager ON leads(manager_id)",
+            "CREATE INDEX IF NOT EXISTS idx_leads_last_inbound ON leads(last_inbound_at)",
+            "CREATE INDEX IF NOT EXISTS idx_lead_events_lead ON lead_events(lead_id, at)",
+            "CREATE INDEX IF NOT EXISTS idx_lead_events_at ON lead_events(at)",
             "CREATE INDEX IF NOT EXISTS idx_containers_status ON containers(status)",
             "CREATE INDEX IF NOT EXISTS idx_container_items_container "
             "ON container_items(container_id, id)",

@@ -3765,6 +3765,9 @@ async function renderMoneyView() {
   box.querySelectorAll('[data-buyer]').forEach(row => {
     row.addEventListener('click', () => { haptic('light'); renderBuyerCard(row.dataset.buyer); });
   });
+  box.querySelectorAll('[data-lead]').forEach(row => {
+    row.addEventListener('click', () => { haptic('light'); renderLeadCard(Number(row.dataset.lead)); });
+  });
 }
 
 // Итог «нам должны» с разбивкой по источникам. Отдаётся только руководству —
@@ -3816,6 +3819,33 @@ async function moneyInsightsHtml() {
   if (fc) {
     html += '<div class="section-label">Ожидаемые поступления</div>' + forecastRowsHtml(fc.months);
   }
+  const lead = await api('/api/leads/funnel', {}).catch(() => null);
+  if (lead && lead.funnel.contacted) {
+    html += '<div class="section-label">Обращения клиентов</div>' + leadFunnelHtml(lead.funnel);
+    if ((lead.awaiting || []).length) {
+      html += `<div class="section-label">Ждут ответа · ${lead.awaiting.length}</div>`;
+      html += '<div class="c-surface c-surface--list">' + lead.awaiting.map(l => `
+        <div class="c-row c-row--tap" data-lead="${l.id}" data-status="overdue" role="button" tabindex="0">
+          <div class="card-row-info">
+            <div class="card-row-title">${escapeHtml(l.display_name || l.username || '—')}</div>
+            <div class="card-row-sub">написал ${escapeHtml(String(l.last_inbound_at || '').slice(0, 16))}</div>
+          </div>${icon('clock')}
+        </div>`).join('') + '</div>';
+    }
+    const mgrs = (lead.by_manager || []).filter(m => m.contacted);
+    if (mgrs.length > 1) {
+      html += '<div class="section-label">По менеджерам</div>';
+      html += '<div class="c-surface c-surface--list">' + mgrs.map(m => `
+        <div class="c-row">
+          <div class="card-row-info">
+            <div class="card-row-title">${escapeHtml(m.name)}</div>
+            <div class="card-row-sub">обратились ${m.contacted} · ответили ${m.replied}${
+              m.awaiting_reply ? ` · ждут ${m.awaiting_reply}` : ''}</div>
+          </div>
+          <div class="card-row-value">${m.win_rate == null ? '—' : Math.round(m.win_rate * 100) + '%'}</div>
+        </div>`).join('') + '</div>';
+    }
+  }
   if (disc && disc.expected_count) {
     const share = disc.on_time_share == null ? '—' : `${Math.round(disc.on_time_share * 100)}%`;
     html += '<div class="section-label">Платёжная дисциплина</div>';
@@ -3839,6 +3869,82 @@ async function moneyInsightsHtml() {
     }
   }
   return html;
+}
+
+// Карточка обращения. Переписки здесь нет и не будет — мы её не храним;
+// показываем отметки времени и события, по которым считается воронка.
+async function renderLeadCard(leadId) {
+  const content = document.getElementById('content');
+  content.innerHTML = skeleton('label') + skeleton('list', 4);
+  setScreenContext('Обращение клиента');
+  showBack(() => showScreen('analytics'));
+
+  let card;
+  try {
+    card = await api('/api/leads/card', { lead_id: leadId });
+  } catch (e) {
+    content.innerHTML = errorBox(e.message);
+    return;
+  }
+  const l = card.lead || {};
+  const st = l.state || {};
+  const labels = card.status_labels || {};
+  const facts = [
+    ['Статус', labels[l.status] || l.status],
+    ['Первое обращение', String(l.first_seen_at || '').slice(0, 16) || '—'],
+    ['Последнее сообщение', String(l.last_inbound_at || '').slice(0, 16) || '—'],
+    ['Первый ответ', String(l.first_reply_at || '').slice(0, 16) || 'не отвечали'],
+    ['Контрагент', l.agent_ms_id ? 'привязан' : '— не привязан'],
+  ];
+  const flags = [
+    st.awaiting_reply ? '⏳ ждёт ответа' : '',
+    st.never_answered ? '⚠️ ни разу не ответили' : '',
+    st.silent ? '🔇 замолчал после ответа' : '',
+  ].filter(Boolean).join(' · ');
+
+  const EVENTS = {
+    inbound: 'Клиент написал', outbound: 'Менеджер ответил',
+    reengaged: 'Вернулся после паузы', won: 'Отмечен как купивший',
+    lost: 'Отмечен как не купивший', linked: 'Привязан контрагент',
+  };
+
+  content.innerHTML = `
+    <div class="editor-header"><div class="editor-title">${icon('user')} ${escapeHtml(l.display_name || l.username || '—')}</div></div>
+    ${flags ? `<div class="card-row-sub">${escapeHtml(flags)}</div>` : ''}
+    <div class="c-surface c-surface--list">${facts.map(([k, v]) => `
+      <div class="c-row">
+        <div class="card-row-info"><div class="card-row-sub">${escapeHtml(k)}</div></div>
+        <div class="card-row-value">${escapeHtml(String(v))}</div>
+      </div>`).join('')}</div>
+    <div class="c-actions c-actions--wrap">
+      <button class="btn-secondary" data-lead-status="won">${icon('check')} Купил</button>
+      <button class="btn-secondary" data-lead-status="lost">${icon('close')} Не купил</button>
+      <button class="btn-secondary" data-lead-status="new">Вернуть в работу</button>
+    </div>
+    <div class="section-label">События</div>
+    <div class="c-surface c-surface--list">${(l.events || []).map(e => `
+      <div class="c-row">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(EVENTS[e.kind] || e.kind)}</div>
+          <div class="card-row-sub">${escapeHtml(String(e.at || '').slice(0, 16))}</div>
+        </div>
+      </div>`).join('') || '<div class="loader">Событий нет</div>'}</div>
+  `;
+
+  content.querySelectorAll('[data-lead-status]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const res = await apiResult('/api/leads/status', {
+        lead_id: leadId, status: btn.dataset.leadStatus,
+      });
+      if (!res.ok) {
+        tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+        return;
+      }
+      haptic('success');
+      toast('Отмечено');
+      renderLeadCard(leadId);
+    });
+  });
 }
 
 // Карточка покупателя техники: все его сделки, графики и остаток. Покупатель
