@@ -715,7 +715,10 @@ body {
   left: 12px;
   right: 12px;
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  /* Колонки НЕ фиксируем числом: кнопки строит buildNav под роль, и их от двух
+     до пяти. Жёсткий repeat(4) переносил пятую кнопку на второй ряд. */
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
   background: var(--bg-card);
   border: 1px solid var(--divider);
   border-radius: 24px;
@@ -734,7 +737,8 @@ body {
   color: var(--text-mute);
   font-size: 10px;
   cursor: pointer;
-  padding: 8px 4px;
+  min-width: 0;             /* подпись ужимается, а не распирает ряд из пяти */
+  padding: 8px 2px;
   min-height: 48px;       /* комфортная зона тапа на телефоне */
   border-radius: var(--radius);
   transition: background 0.15s ease, color 0.15s ease;
@@ -750,7 +754,11 @@ body {
 
 .nav-icon { display: flex; }
 .nav-icon .ic { --ic-size: 23px; vertical-align: 0; }
-.nav-label { font-size: 10px; font-weight: 500; }
+.nav-label {
+  font-size: 10px; font-weight: 500;
+  /* «Клиенты» на 320dp в ряду из пяти иначе ломается пополам. */
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 /* ─── Error & status ──────────────────────────────────────────── */
 .error {
