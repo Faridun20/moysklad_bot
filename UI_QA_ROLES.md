@@ -23,10 +23,10 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 94._
+_Всего эндпоинтов: 102._
 
 
-### Админ (`admin`) — 87 эндпоинтов
+### Админ (`admin`) — 95 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -34,6 +34,10 @@ _Всего эндпоинтов: 94._
 - `/api/analytics`
 - `/api/analytics/export`
 - `/api/cash/history`
+- `/api/channel/draft`
+- `/api/channel/history`
+- `/api/channel/publish`
+- `/api/channel/stale`
 - `/api/clients/detail`
 - `/api/clients/overview`
 - `/api/clients/shipment`
@@ -104,6 +108,10 @@ _Всего эндпоинтов: 94._
 - `/api/payments/pending`
 - `/api/payments/send`
 - `/api/payments/unlinked`
+- `/api/products/photo`
+- `/api/products/photo_delete`
+- `/api/products/photo_upload`
+- `/api/products/photos`
 - `/api/products/prices`
 - `/api/products/prices/set`
 - `/api/requests/approve`
@@ -121,7 +129,7 @@ _Всего эндпоинтов: 94._
 </details>
 
 
-### Руководитель (`boss`) — 84 эндпоинтов
+### Руководитель (`boss`) — 92 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -129,6 +137,10 @@ _Всего эндпоинтов: 94._
 - `/api/analytics`
 - `/api/analytics/export`
 - `/api/cash/history`
+- `/api/channel/draft`
+- `/api/channel/history`
+- `/api/channel/publish`
+- `/api/channel/stale`
 - `/api/clients/detail`
 - `/api/clients/overview`
 - `/api/clients/shipment`
@@ -197,6 +209,10 @@ _Всего эндпоинтов: 94._
 - `/api/payments/link`
 - `/api/payments/pending`
 - `/api/payments/unlinked`
+- `/api/products/photo`
+- `/api/products/photo_delete`
+- `/api/products/photo_upload`
+- `/api/products/photos`
 - `/api/products/prices`
 - `/api/products/prices/set`
 - `/api/requests/approve`
@@ -213,7 +229,7 @@ _Всего эндпоинтов: 94._
 </details>
 
 
-### Менеджер (`manager`) — 40 эндпоинтов
+### Менеджер (`manager`) — 42 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -253,6 +269,8 @@ _Всего эндпоинтов: 94._
 - `/api/orders/set_agent`
 - `/api/orders/submit`
 - `/api/payments/send`
+- `/api/products/photo`
+- `/api/products/photos`
 - `/api/returns/create`
 - `/api/returns/positions`
 - `/api/search`

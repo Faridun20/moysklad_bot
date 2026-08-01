@@ -1989,6 +1989,337 @@ async def api_machines_buyer(request: Request):
     return JSONResponse({"ok": True, **card})
 
 
+# ─── API: канал ──────────────────────────────────────────────────────────────
+# Канал — лицо компании: черновик собирает сервер, публикует человек кнопкой.
+# Ни один сборщик не выпускает наружу количества (см. `services/channel.py`).
+
+_CHANNEL_ROLES = ("admin", "boss")
+
+
+async def _photo_bytes(tg_file_id: str, cache_key: str) -> bytes | None:
+    """Байты фото из Telegram с тем же кэшем, что у фото техники."""
+    cached = _photo_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        bot = await get_notify_bot()
+        meta = await bot.get_file(tg_file_id)
+        if (meta.file_size or 0) > _PHOTO_MAX_BYTES:
+            return None
+        buf = await bot.download_file(meta.file_path)
+        blob = buf.read() if hasattr(buf, "read") else bytes(buf)
+    except Exception as e:
+        logger.warning("Фото недоступно: %s", redact_token(repr(e)))
+        return None
+    _photo_cache_put(cache_key, blob)
+    return blob
+
+
+@app.post("/api/products/photo")
+async def api_products_photo(request: Request):
+    """Отдать фото товара байтами. Прямую ссылку Telegram отдавать нельзя —
+    в ней токен бота."""
+    from services import product_photos
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_products_photo", rate_limit_max=120,
+    )
+    ms_id = (data.get("ms_id") or "").strip()[:64]
+    photo_id = _machine_id_arg(data, "photo_id")
+    photos = await product_photos.list_photos(ms_id)
+    photo = next((p for p in photos if int(p["id"]) == photo_id), None)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Фото не найдено")
+
+    blob = await _photo_bytes(str(photo["tg_file_id"]), str(photo["file_unique_id"]))
+    if blob is None:
+        raise HTTPException(status_code=404, detail="Фото недоступно")
+    return Response(
+        blob, media_type=_photo_media_type(blob) or "image/jpeg",
+        headers={"Cache-Control": "private, max-age=600", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.post("/api/products/photos")
+async def api_products_photos(request: Request):
+    """Список фото товара. `tg_file_id` наружу не отдаём — клиенту нужен только
+    `photo_id`, а файловый URL Telegram содержит токен бота."""
+    from services import product_photos
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_products_photos",
+    )
+    ms_id = (data.get("ms_id") or "").strip()[:64]
+    if not ms_id:
+        raise HTTPException(status_code=400, detail="Не указан товар")
+    photos = await product_photos.list_photos(ms_id)
+    return JSONResponse({
+        "ok": True,
+        "photos": [
+            {
+                "id": int(p["id"]),
+                "caption": p.get("caption") or "",
+                "uploaded_at": p.get("uploaded_at") or "",
+            }
+            for p in photos
+        ],
+        "can_upload": _machine_photos_chat_id() is not None,
+    })
+
+
+@app.post("/api/products/photo_delete")
+async def api_products_photo_delete(request: Request):
+    """Открепить фото товара. Скоупится товаром — иначе `photo_id` из формы
+    стирает чужой снимок."""
+    from services import product_photos
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_products_photo_delete"
+    )
+    ms_id = (data.get("ms_id") or "").strip()[:64]
+    photo_id = _machine_id_arg(data, "photo_id")
+    if not ms_id:
+        raise HTTPException(status_code=400, detail="Не указан товар")
+    return _machine_response(await product_photos.delete_photo(ms_id, photo_id))
+
+
+@app.post("/api/products/photo_upload")
+async def api_products_photo_upload(request: Request):
+    """Загрузить фото товара. base64 в JSON — как у техники: `python-multipart`
+    в зависимостях нет."""
+    from services import product_photos
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_products_photo_upload",
+        rate_limit_max=20,
+    )
+    ms_id = (data.get("ms_id") or "").strip()[:64]
+    if not ms_id:
+        raise HTTPException(status_code=400, detail="Не указан товар")
+    chat_id = _machine_photos_chat_id()
+    if chat_id is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Загрузка фото не настроена: нет PHOTOS_TG_CHAT_ID",
+        )
+    blob = _decode_photo(data.get("data_url"))
+
+    try:
+        from aiogram.types import BufferedInputFile
+
+        bot = await get_notify_bot()
+        sent = await bot.send_photo(
+            chat_id, BufferedInputFile(blob, filename=f"product-{ms_id}.jpg"),
+            caption=(data.get("caption") or "")[:200] or None,
+        )
+    except Exception as e:
+        logger.warning("Фото товара не загружено: %s", redact_token(repr(e)))
+        raise HTTPException(status_code=502, detail="Telegram не принял фото")
+
+    best = max(sent.photo or [], key=lambda p: (p.width or 0) * (p.height or 0), default=None)
+    if best is None:
+        raise HTTPException(status_code=502, detail="Telegram не вернул файл")
+    res = await product_photos.add_photo(
+        ms_id, tg_file_id=best.file_id, file_unique_id=best.file_unique_id,
+        uploaded_by=user["id"], caption=(data.get("caption") or "")[:200] or None,
+    )
+    return _machine_response(res)
+
+
+def _decode_photo(raw_url) -> bytes:
+    """data-URL → байты, с теми же проверками, что у фото техники."""
+    raw = str(raw_url or "")
+    if not raw.startswith("data:image/") or "," not in raw:
+        raise HTTPException(status_code=400, detail="Ожидается изображение")
+    payload = raw.split(",", 1)[1]
+    if len(payload) > _PHOTO_MAX_BYTES * 4 // 3 + 1024:
+        raise HTTPException(status_code=413, detail="Фото больше 5 МБ")
+    try:
+        blob = base64.b64decode(payload, validate=True)
+    except (ValueError, binascii.Error):
+        raise HTTPException(status_code=400, detail="Повреждённое изображение")
+    if len(blob) > _PHOTO_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Фото больше 5 МБ")
+    if _photo_media_type(blob) is None:
+        raise HTTPException(status_code=400, detail="Поддерживаются JPEG и PNG")
+    return blob
+
+
+@app.post("/api/channel/draft")
+async def api_channel_draft(request: Request):
+    """Черновик поста: текст собирает СЕРВЕР, а не фронт.
+
+    Так правило «наружу не уходят количества» держится в одном месте и
+    проверяется тестом, а не повторяется в шаблоне.
+    """
+    from services import channel
+
+    data = await request.json()
+    _authorize(data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_channel_draft")
+    kind = (data.get("kind") or "").strip()
+    if kind not in channel.POST_KINDS:
+        raise HTTPException(status_code=400, detail=f"Тип поста: {', '.join(channel.POST_KINDS)}")
+
+    username = (data.get("manager_username") or "").strip()[:64] or None
+    note = (data.get("note") or "").strip()[:500] or None
+    ref = None
+    photo_id = None
+
+    if kind == "arrival":
+        container_id = _machine_id_arg(data, "container_id")
+        ref = str(container_id)
+        names = await channel.arrival_names(container_id)
+        if not names:
+            raise HTTPException(status_code=409, detail="В контейнере нет прибывших позиций")
+        text = channel.build_arrival(names, note=note, manager_username=username)
+    elif kind == "showcase":
+        from services import product_photos, snapshot
+
+        ms_id = (data.get("ms_id") or "").strip()[:64]
+        product = await asyncio.to_thread(snapshot.get_product, ms_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Товар не найден в каталоге")
+        ref = ms_id
+        prices = await _price_label(ms_id)
+        text = channel.build_showcase(
+            product, price=prices, note=note, manager_username=username
+        )
+        first = await product_photos.first_photo(ms_id)
+        photo_id = int(first["id"]) if first else None
+    else:
+        names = [str(n)[:200] for n in (data.get("names") or []) if str(n).strip()][:30]
+        if not names:
+            raise HTTPException(status_code=400, detail="Выберите хотя бы один товар")
+        text = channel.build_stale(names, note=note, manager_username=username)
+
+    return JSONResponse({
+        "ok": True, "kind": kind, "ref": ref, "text": text, "photo_id": photo_id,
+        "already_posted": await channel.already_posted(kind, ref) if ref else None,
+        "can_publish": _channel_id() is not None,
+    })
+
+
+async def _price_label(ms_id: str) -> str | None:
+    """Цена товара для витрины — только если её задавали руками."""
+    from services import async_db as adb
+    from config import BASE_CURRENCY
+
+    prices = await adb.get_product_prices_by_ids([ms_id])
+    row = prices.get(ms_id) or {}
+    price = row.get("sale_price")
+    if price is None or price == "":
+        return None
+    cents = money.parse_amount(price)
+    if cents is None:
+        return None
+    return f"{money.format_cents(cents, decimals=0, sep=' ')} " \
+           f"{(row.get('currency') or BASE_CURRENCY or 'USD').upper()}"
+
+
+@app.post("/api/channel/publish")
+async def api_channel_publish(request: Request):
+    """Опубликовать пост. Только по нажатию человеком — автопостинга нет.
+
+    Текст принимаем от клиента: черновик правят руками, и запрещать это значит
+    заставлять публиковать не то, что хотели. Сборщик при этом количеств не
+    выпускает — если человек допишет их сам, это его решение.
+    """
+    from services import channel
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_channel_publish",
+        rate_limit_max=20,
+    )
+    chat_id = _channel_id()
+    if chat_id is None:
+        raise HTTPException(status_code=503, detail="Канал не настроен: нет CHANNEL_ID")
+    kind = (data.get("kind") or "").strip()
+    if kind not in channel.POST_KINDS:
+        raise HTTPException(status_code=400, detail="Неизвестный тип поста")
+    text = (data.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Пустой пост публиковать нечего")
+    ref = (data.get("ref") or "").strip()[:64] or None
+
+    photo_blob = None
+    photo_id = data.get("photo_id")
+    if photo_id and (data.get("ms_id") or "").strip():
+        from services import product_photos
+
+        photos = await product_photos.list_photos((data.get("ms_id") or "").strip()[:64])
+        photo = next((p for p in photos if int(p["id"]) == int(photo_id)), None)
+        if photo:
+            photo_blob = await _photo_bytes(
+                str(photo["tg_file_id"]), str(photo["file_unique_id"])
+            )
+
+    try:
+        bot = await get_notify_bot()
+        if photo_blob:
+            from aiogram.types import BufferedInputFile
+
+            sent = await bot.send_photo(
+                chat_id, BufferedInputFile(photo_blob, filename="post.jpg"),
+                caption=text[:1024], parse_mode="HTML",
+            )
+        else:
+            sent = await bot.send_message(chat_id, text[:4096], parse_mode="HTML")
+    except Exception as e:
+        logger.warning("Пост в канал не ушёл: %s", redact_token(repr(e)))
+        raise HTTPException(status_code=502, detail="Telegram не принял пост")
+
+    post_id = await channel.save_post(
+        kind=kind, ref=ref, message_id=getattr(sent, "message_id", None),
+        posted_by=user["id"],
+    )
+    return JSONResponse({"ok": True, "post_id": post_id,
+                         "message_id": getattr(sent, "message_id", None)})
+
+
+@app.post("/api/channel/stale")
+async def api_channel_stale(request: Request):
+    """Кандидаты в пост «залежавшееся». Внутренний экран — остаток здесь виден.
+
+    Считается тем же кодом, что дневная ops-сводка: остатки минус всё, что
+    отгружалось за период.
+    """
+    from services import channel
+
+    data = await request.json()
+    _authorize(data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_channel_stale",
+               rate_limit_max=10)
+    days = channel.stale_days()
+    from tasks.run_ops_monitor import collect_dead_stock
+
+    try:
+        dead = await collect_dead_stock(days)
+    except Exception as e:
+        logger.warning("Не удалось собрать залежавшееся: %s", e)
+        raise HTTPException(status_code=502, detail="МойСклад не ответил, попробуйте позже")
+    return JSONResponse({
+        "ok": True, "days": days, "items": channel.stale_candidates(dead),
+    })
+
+
+@app.post("/api/channel/history")
+async def api_channel_history(request: Request):
+    from services import channel
+
+    data = await request.json()
+    _authorize(data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_channel_history")
+    return JSONResponse({
+        "ok": True, "posts": await channel.history(), "kind_labels": channel.KIND_LABELS,
+        "can_publish": _channel_id() is not None,
+    })
+
+
 # ─── API: воронка клиентов ───────────────────────────────────────────────────
 # Данные наполняет наблюдатель переписок (`handlers/business.py`). Здесь только
 # чтение и два ручных действия: исход сделки и привязка к контрагенту — их из
@@ -3366,21 +3697,36 @@ def _photo_media_type(blob: bytes) -> str | None:
     return None
 
 
+def _chat_id_env(*names: str) -> int | None:
+    """Первый заданный id канала из перечисленных переменных."""
+    for name in names:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            logger.error("%s должен быть числом, получено: %r", name, raw)
+    return None
+
+
 def _machine_photos_chat_id() -> int | None:
     """Приватный канал-хранилище для загруженных из WebApp фотографий.
 
     Прецедент — `BACKUP_TG_CHAT_ID`. Без переменной загрузка выключена: фото
     по-прежнему можно прислать боту, поэтому это деградация функции, а не
     поломка раздела.
+
+    Имя обобщено до `PHOTOS_TG_CHAT_ID`: хранилище одно на технику и на товары,
+    а заводить под каждый раздел свой канал незачем. Старое имя продолжает
+    работать — переименовывать переменную на проде ради красоты не нужно.
     """
-    raw = os.environ.get("MACHINE_PHOTOS_TG_CHAT_ID", "").strip()
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        logger.error("MACHINE_PHOTOS_TG_CHAT_ID должен быть числом, получено: %r", raw)
-        return None
+    return _chat_id_env("PHOTOS_TG_CHAT_ID", "MACHINE_PHOTOS_TG_CHAT_ID")
+
+
+def _channel_id() -> int | None:
+    """Публичный канал компании. Без него публикация выключена."""
+    return _chat_id_env("CHANNEL_ID")
 
 
 @app.post("/api/machines/photo")

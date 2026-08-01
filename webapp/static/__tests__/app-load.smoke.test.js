@@ -590,9 +590,9 @@ describe('техника: фотографии', () => {
     const window = boot(`
       window.__revoked = [];
       URL.revokeObjectURL = (u) => window.__revoked.push(u);
-      _machinePhotoUrls = ['blob:a', 'blob:b'];
-      revokeMachinePhotoUrls();
-      window.__left = _machinePhotoUrls.length;
+      _photoUrls = ['blob:a', 'blob:b'];
+      revokePhotoUrls();
+      window.__left = _photoUrls.length;
     `);
     expect(window.__revoked).toEqual(['blob:a', 'blob:b']);
     expect(window.__left).toBe(0);   // повторный revoke не должен их отзывать снова
