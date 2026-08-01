@@ -280,3 +280,136 @@ def test_ms_not_configured_is_a_clear_refusal(isolated_db, monkeypatch):
     res = _run(ms_supply.sync_supply(cid))
     assert res["ok"] is False
     assert "не настроен" in res["error"]
+
+
+# ─── Выбор товара человеком ───────────────────────────────────────────────────
+
+
+PRODUCT_URL = f"{MS_BASE}/entity/product"
+
+
+def test_chosen_product_wins_over_the_name(isolated_db):
+    """Человек выбрал карточку — переспрашивать у поиска, что он имел в виду,
+    незачем. Тем более что по имени нашёлся бы ДРУГОЙ товар."""
+    from services import containers, ms_supply
+
+    db = isolated_db
+    _setup(db)
+    _stock(db, "p-name", "Кабель")
+    cid = _container(db)
+    _run(containers.add_item(cid, name="Кабель", arrived_qty=10, ms_id="p-chosen"))
+
+    matched, unmatched = ms_supply.match_items(_run(containers.list_items(cid)))
+    assert unmatched == []
+    assert matched[0]["ms_id"] == "p-chosen"
+
+
+def test_name_matching_still_covers_old_positions(isolated_db):
+    """Позиции, заведённые до появления выбора, привязки не имеют — и должны
+    по-прежнему сопоставляться по имени."""
+    from services import containers, ms_supply
+
+    db = isolated_db
+    _setup(db)
+    _stock(db, "p-1", "Кабель PV 0.6")
+    cid = _container(db)
+    _item(cid, "Кабель PV 0.6", arrived=10)
+
+    matched, _ = ms_supply.match_items(_run(containers.list_items(cid)))
+    assert matched[0]["ms_id"] == "p-1"
+
+
+def test_unmatched_carries_the_item_id(isolated_db):
+    """Без id несопоставленное остаётся списком «сходите заведите» — починить
+    его прямо из карточки нечем."""
+    from services import containers, ms_supply
+
+    db = isolated_db
+    _setup(db)
+    cid = _container(db)
+    item = _item(cid, "Штекер тип C", arrived=5)
+
+    _, unmatched = ms_supply.match_items(_run(containers.list_items(cid)))
+    assert unmatched[0]["item_id"] == item
+
+
+def test_create_product_reuses_an_existing_card(isolated_db):
+    """Вторая строка контейнера с тем же названием не должна заводить второй
+    такой же товар — остаток разъехался бы по двум карточкам."""
+    from services import ms_supply
+
+    db = isolated_db
+    _setup(db)
+    _stock(db, "p-1", "Кабель PV 0.6")
+
+    with aioresponses() as m:
+        res = _run(ms_supply.create_product("  кабель   pv 0.6 "))
+        assert m.requests == {}, "существующий товар не должен стоить запроса в МС"
+
+    assert res["ok"] and res["ms_id"] == "p-1" and res["existed"] is True
+
+
+def test_created_product_lands_in_the_snapshot(isolated_db):
+    """Иначе до ночного полного среза его не найдёт ни поиск, ни сопоставление,
+    и человек заведёт карточку повторно."""
+    from services import ms_supply, snapshot
+
+    db = isolated_db
+    _setup(db)
+
+    with aioresponses() as m:
+        m.post(PRODUCT_URL, payload={"id": "p-new", "name": "Штекер тип C"})
+        res = _run(ms_supply.create_product("Штекер тип C", unit="уп"))
+        sent = next(iter(m.requests.values()))[0].kwargs["json"]
+
+    assert res["ok"] and res["ms_id"] == "p-new" and res["existed"] is False
+    assert sent == {"name": "Штекер тип C"}
+    assert snapshot.get_product("p-new") == {"ms_id": "p-new", "name": "Штекер тип C", "unit": "уп"}
+    # И сразу сопоставляется по имени, без второго захода в МойСклад.
+    assert _run(ms_supply.create_product("штекер   тип c"))["existed"] is True
+
+
+def test_created_product_never_overwrites_a_real_stock_row(isolated_db):
+    """Снапшот — зеркало: перезапись строки обнулила бы настоящий остаток."""
+    from services import snapshot
+
+    db = isolated_db
+    _setup(db)
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q("INSERT INTO ms_stock (ms_id, name, folder_id, folder_name, unit, stock, "
+                 "reserve) VALUES (?, ?, '', '', 'шт', 42, 0)"),
+            ("p-1", "Кабель"),
+        )
+        conn.commit()
+
+    _run(snapshot.remember_product("p-1", name="Кабель", unit="шт"))
+
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("SELECT stock FROM ms_stock WHERE ms_id = ?"), ("p-1",))
+        assert cur.fetchone()[0] == 42
+
+
+def test_linked_position_is_supplied_even_without_a_snapshot_row(isolated_db, monkeypatch):
+    """Товар завели минуту назад: в снапшоте его может не быть, а приход по нему
+    обязан пройти — на то и привязка."""
+    from services import containers, ms_supply
+
+    db = isolated_db
+    _setup(db)
+    _ready_ms(monkeypatch)
+    cid = _container(db)
+    _run(containers.add_item(cid, name="Штекер тип C", expected_qty=5, arrived_qty=5,
+                             ms_id="p-fresh"))
+    _run(containers.mark_arrived(cid, user_id=2))
+    _with_supplier(cid)
+
+    with aioresponses() as m:
+        m.post(SUPPLY_URL, payload={"id": "supply-1"})
+        res = _run(ms_supply.sync_supply(cid))
+        sent = next(iter(m.requests.values()))[0].kwargs["json"]
+
+    assert res["ok"] and res["unmatched"] == []
+    assert sent["positions"][0]["assortment"]["meta"]["href"].endswith("/product/p-fresh")

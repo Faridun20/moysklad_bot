@@ -481,3 +481,184 @@ def test_container_with_supplier_is_deletable(isolated_db):
 
     assert _run(containers.delete_container(cid, user_id=2))["ok"] is True
     assert _run(ms_supply.get_link(cid)) == {"unmatched": []}
+
+
+# ─── Привязка позиции к номенклатуре ──────────────────────────────────────────
+
+
+def _stock(db, ms_id, name, unit="шт"):
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q("INSERT INTO ms_stock (ms_id, name, folder_id, folder_name, unit, stock, "
+                 "reserve) VALUES (?, ?, '', '', ?, 0, 0)"),
+            (ms_id, name, unit),
+        )
+        conn.commit()
+
+
+def test_item_can_be_added_with_a_catalog_product(isolated_db):
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    _run(containers.add_item(cid, name="Кабель PV 0.6", expected_qty=500, ms_id="p-1"))
+
+    item = _run(containers.list_items(cid))[0]
+    assert item["ms_id"] == "p-1"
+    assert item["ms_name"] == "Кабель PV 0.6"
+
+
+def test_free_text_item_stays_legal(isolated_db):
+    """В контейнере регулярно едет то, чего в номенклатуре ещё нет: требовать
+    карточку до сохранения значит остановить приёмку на полпути."""
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    _item(cid, "Штекер тип C", 10)
+
+    assert _run(containers.list_items(cid))[0]["ms_id"] is None
+
+
+def test_link_replaces_previous_choice(isolated_db):
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    item = _item(cid, "Кабель", 10)
+    assert _run(containers.link_item(cid, item, ms_id="p-1", ms_name="Кабель PV 0.6"))["ok"]
+    assert _run(containers.link_item(cid, item, ms_id="p-2", ms_name="Кабель PV 1.0"))["ok"]
+
+    rows = _run(containers.list_items(cid))
+    assert len(rows) == 1
+    assert rows[0]["ms_id"] == "p-2"
+
+
+def test_link_refuses_item_from_another_container(isolated_db):
+    """Позицию всегда ищем ВНУТРИ заявленного контейнера — иначе подстановка
+    чужого id перевесит приход на другую карточку."""
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    mine = _container("MSKU-1111111")
+    other = _container("MSKU-2222222")
+    stranger = _item(other, "Кабель", 10)
+
+    res = _run(containers.link_item(mine, stranger, ms_id="p-1"))
+    assert res["ok"] is False
+    assert "не найдена" in res["error"]
+
+
+def test_link_is_refused_after_the_window_closes(isolated_db):
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    item = _item(cid, "Кабель", 10)
+    _run(containers.mark_arrived(cid, user_id=2))
+    _close_window(db, cid)
+
+    res = _run(containers.link_item(cid, item, ms_id="p-1"))
+    assert res["ok"] is False
+    assert res.get("window_closed") is True
+
+
+def test_deleting_item_takes_its_link_along(isolated_db):
+    """На Postgres живая связь отвергает DELETE по составу; на SQLite молчит."""
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    item = _item(cid, "Кабель", 10)
+    _run(containers.link_item(cid, item, ms_id="p-1"))
+
+    assert _run(containers.delete_item(cid, item))["ok"] is True
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("SELECT COUNT(*) FROM container_item_links WHERE item_id = ?"), (item,))
+        assert cur.fetchone()[0] == 0
+
+
+def test_child_tables_are_ordered_leaves_first(isolated_db):
+    """Порядок в CHILD_TABLES — не косметика.
+
+    `container_item_links` ссылается и на контейнер, и на позицию: удали
+    позиции первыми — Postgres отвергнет DELETE, а SQLite с выключенными FK
+    промолчит, и баг снова доедет до прода. Порядок выводим из схемы, чтобы
+    следующая такая таблица поймалась сама.
+    """
+    from services import containers
+
+    db = isolated_db
+    order = {name: i for i, name in enumerate(containers.CHILD_TABLES)}
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        for child in containers.CHILD_TABLES:
+            cur.execute(f"PRAGMA foreign_key_list({child})")
+            for row in cur.fetchall():
+                target = row[2]
+                if target in order and target != child:
+                    assert order[child] < order[target], (
+                        f"{child} ссылается на {target}, значит должна удаляться раньше"
+                    )
+
+
+def test_orphan_guard_covers_the_link_table(isolated_db):
+    """Сторож сирот обязан видеть новую дочернюю таблицу — она с FK на
+    контейнер, а значит попадает в выборку по схеме."""
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    item = _item(cid, "Кабель", 10)
+    _run(containers.link_item(cid, item, ms_id="p-1"))
+
+    assert "container_item_links" in _tables_referencing(db, "containers")
+    assert _run(containers.delete_container(cid, user_id=2))["ok"] is True
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("SELECT COUNT(*) FROM container_item_links WHERE container_id = ?"), (cid,))
+        assert cur.fetchone()[0] == 0
+
+
+def test_product_search_reads_the_snapshot(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+    _stock(db, "p-1", "Кабель PV 0.6")
+    _stock(db, "p-2", "ThinkPower 6kw")
+
+    body = _post(_client(monkeypatch), "/api/products/search", 1, query="кабель").json()
+    assert [p["ms_id"] for p in body["products"]] == ["p-1"]
+
+
+def test_product_search_ignores_a_single_letter(isolated_db, monkeypatch):
+    """Одна буква — это ещё не запрос: отдавать по ней первые двадцать товаров
+    каталога значит подсунуть случайный выбор под палец."""
+    db = isolated_db
+    _setup(db)
+    _stock(db, "p-1", "Кабель PV 0.6")
+
+    body = _post(_client(monkeypatch), "/api/products/search", 1, query="к").json()
+    assert body["products"] == []
+
+
+def test_item_link_endpoint_binds_the_position(isolated_db, monkeypatch):
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    item = _item(cid, "Кабель", 10)
+
+    res = _post(_client(monkeypatch), "/api/containers/item_link", 1,
+                container_id=cid, item_id=item, ms_id="p-1", ms_name="Кабель PV 0.6")
+    assert res.status_code == 200, res.text
+    assert _run(containers.list_items(cid))[0]["ms_id"] == "p-1"

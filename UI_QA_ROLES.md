@@ -23,10 +23,10 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 102._
+_Всего эндпоинтов: 105._
 
 
-### Админ (`admin`) — 95 эндпоинтов
+### Админ (`admin`) — 98 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -47,7 +47,9 @@ _Всего эндпоинтов: 102._
 - `/api/containers/create`
 - `/api/containers/delete`
 - `/api/containers/item_add`
+- `/api/containers/item_create_product`
 - `/api/containers/item_delete`
+- `/api/containers/item_link`
 - `/api/containers/list`
 - `/api/containers/supplier`
 - `/api/containers/supply`
@@ -114,6 +116,7 @@ _Всего эндпоинтов: 102._
 - `/api/products/photos`
 - `/api/products/prices`
 - `/api/products/prices/set`
+- `/api/products/search`
 - `/api/requests/approve`
 - `/api/requests/reject`
 - `/api/requests/return_to_draft`
@@ -129,7 +132,7 @@ _Всего эндпоинтов: 102._
 </details>
 
 
-### Руководитель (`boss`) — 92 эндпоинтов
+### Руководитель (`boss`) — 95 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -150,7 +153,9 @@ _Всего эндпоинтов: 102._
 - `/api/containers/create`
 - `/api/containers/delete`
 - `/api/containers/item_add`
+- `/api/containers/item_create_product`
 - `/api/containers/item_delete`
+- `/api/containers/item_link`
 - `/api/containers/list`
 - `/api/containers/supplier`
 - `/api/containers/supply`
@@ -215,6 +220,7 @@ _Всего эндпоинтов: 102._
 - `/api/products/photos`
 - `/api/products/prices`
 - `/api/products/prices/set`
+- `/api/products/search`
 - `/api/requests/approve`
 - `/api/requests/reject`
 - `/api/requests/return_to_draft`
@@ -229,7 +235,7 @@ _Всего эндпоинтов: 102._
 </details>
 
 
-### Менеджер (`manager`) — 42 эндпоинтов
+### Менеджер (`manager`) — 45 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -240,7 +246,9 @@ _Всего эндпоинтов: 102._
 - `/api/containers/check`
 - `/api/containers/create`
 - `/api/containers/item_add`
+- `/api/containers/item_create_product`
 - `/api/containers/item_delete`
+- `/api/containers/item_link`
 - `/api/containers/list`
 - `/api/containers/supplier`
 - `/api/containers/supply`
@@ -271,6 +279,7 @@ _Всего эндпоинтов: 102._
 - `/api/payments/send`
 - `/api/products/photo`
 - `/api/products/photos`
+- `/api/products/search`
 - `/api/returns/create`
 - `/api/returns/positions`
 - `/api/search`

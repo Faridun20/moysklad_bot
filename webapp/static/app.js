@@ -1350,10 +1350,76 @@ function openContainerForm() {
   });
 }
 
+// Живой поиск по номенклатуре под текстовым полем. Отдельной функцией, потому
+// что нужен дважды: при вводе новой позиции и при исправлении уже заведённой.
+// Ходит в снапшот (`/api/products/search`), а не в МойСклад: подсказка
+// дёргается на каждое нажатие.
+function attachProductSearch(anchor, { onPick }) {
+  const list = document.createElement('div');
+  list.className = 'c-surface c-surface--list product-suggest';
+  anchor.after(list);
+
+  let timer = null;
+  let inFlight = null;
+  const render = async (raw) => {
+    const query = String(raw || '').trim();
+    inFlight = query;
+    if (query.length < 2) { list.innerHTML = ''; return; }
+    list.innerHTML = loading('Ищу в каталоге…');
+    let rows = [];
+    try {
+      const data = await api('/api/products/search', { query });
+      // Ответ на устаревший запрос: пока он летел, человек допечатал.
+      if (inFlight !== query) return;
+      rows = data.products || [];
+    } catch (e) {
+      if (inFlight === query) list.innerHTML = `<div class="loader">${escapeHtml(e.message)}</div>`;
+      return;
+    }
+    if (!rows.length) {
+      list.innerHTML = '<div class="loader">В каталоге не найдено — можно вписать своё название</div>';
+      return;
+    }
+    list.innerHTML = rows.map(p => `
+      <div class="c-row c-row--tap" data-ms="${escapeHtml(p.ms_id)}"
+           data-name="${escapeHtml(p.name || '')}" data-unit="${escapeHtml(p.unit || 'шт')}"
+           role="button" tabindex="0">
+        <div class="card-row-info"><div class="card-row-title">${escapeHtml(p.name || '')}</div></div>
+        <div class="card-row-value">${escapeHtml(p.unit || 'шт')}</div>
+      </div>`).join('');
+    list.querySelectorAll('[data-ms]').forEach(row => {
+      row.addEventListener('click', () => {
+        haptic('light');
+        list.querySelectorAll('[data-ms]').forEach(r => r.classList.remove('picked'));
+        row.classList.add('picked');
+        onPick({ ms_id: row.dataset.ms, name: row.dataset.name, unit: row.dataset.unit });
+      });
+    });
+  };
+
+  return {
+    search(value) {
+      clearTimeout(timer);
+      timer = setTimeout(() => render(value), 300);
+    },
+    now(value) { render(value); },
+    clearPicked() {
+      list.querySelectorAll('[data-ms]').forEach(r => r.classList.remove('picked'));
+    },
+    listEl: list,
+  };
+}
+
 function openContainerItemForm(containerId, arrived) {
-  openMachineSheet({
+  // Выбранный товар держим здесь, а не в поле формы: в накладной регулярно едет
+  // то, чего в номенклатуре ещё нет, и свободный ввод обязан оставаться
+  // законным — иначе приёмка встаёт до заведения карточки.
+  let picked = null;
+  const sheet = openMachineSheet({
     title: arrived ? 'Позиция сверх заявленного' : 'Позиция в контейнере',
-    hint: arrived ? 'Товар, которого не было в заявленном составе.' : '',
+    hint: arrived
+      ? 'Товар, которого не было в заявленном составе. Начните вводить название — подскажем из каталога.'
+      : 'Начните вводить название — подскажем товар из каталога. Нет такого — впишите своё.',
     fields: [
       { key: 'name', label: 'Наименование', required: true },
       arrived
@@ -1363,12 +1429,97 @@ function openContainerItemForm(containerId, arrived) {
     ],
     submitLabel: 'Добавить',
     onSubmit: async (data, { showErr }) => {
-      const res = await apiResult('/api/containers/item_add', { container_id: containerId, ...data });
+      const res = await apiResult('/api/containers/item_add', {
+        container_id: containerId, ...data,
+        ms_id: picked ? picked.ms_id : '',
+        ms_name: picked ? picked.name : '',
+      });
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
       renderContainerCard(containerId);
       return true;
     },
+  });
+
+  const ov = document.querySelector('.c-overlay');
+  const nameInput = ov?.querySelector('#ms-f-name');
+  const unitInput = ov?.querySelector('#ms-f-unit');
+  if (!nameInput) return;
+  const suggest = attachProductSearch(nameInput.parentElement, {
+    onPick: (p) => {
+      picked = p;
+      nameInput.value = p.name;
+      if (unitInput) unitInput.value = p.unit || 'шт';
+      sheet.showErr('');
+    },
+  });
+  nameInput.addEventListener('input', () => {
+    // Правка названия после выбора отвязывает товар: иначе человек уверен, что
+    // вписал новую позицию, а приход уйдёт на прежнюю карточку.
+    if (picked && nameInput.value.trim() !== picked.name) {
+      picked = null;
+      suggest.clearPicked();
+    }
+    suggest.search(nameInput.value);
+  });
+}
+
+// Исправление привязки уже заведённой позиции: выбрать товар из каталога или
+// завести карточку по её названию. Нужно постфактум, потому что состав часто
+// заводят раньше, чем товар появляется в номенклатуре.
+function openItemLinkSheet(containerId, item) {
+  let picked = null;
+  const sheet = openMachineSheet({
+    title: 'Товар в каталоге',
+    hint: item.ms_id
+      ? `Сейчас: ${item.ms_name || item.name}`
+      : 'Позиция ни с чем не связана — приход по ней не пройдёт',
+    fields: [{ key: 'search', label: 'Поиск по каталогу', value: item.name }],
+    submitLabel: 'Привязать',
+    onSubmit: async (_data, { showErr }) => {
+      if (!picked) { showErr('Выберите товар из списка'); return false; }
+      const res = await apiResult('/api/containers/item_link', {
+        container_id: containerId, item_id: item.id,
+        ms_id: picked.ms_id, ms_name: picked.name,
+      });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      toast('Товар привязан');
+      renderContainerCard(containerId);
+      return true;
+    },
+  });
+
+  const ov = document.querySelector('.c-overlay');
+  const input = ov?.querySelector('#ms-f-search');
+  if (!input) return;
+  const suggest = attachProductSearch(input.parentElement, {
+    onPick: (p) => { picked = p; sheet.showErr(''); },
+  });
+  input.addEventListener('input', () => {
+    if (picked) { picked = null; suggest.clearPicked(); }
+    suggest.search(input.value);
+  });
+  suggest.now(item.name);
+
+  // Карточку заводит ЧЕЛОВЕК кнопкой: автосоздание из приёмки превратило бы
+  // каждую опечатку в новый товар справочника.
+  const create = document.createElement('button');
+  create.className = 'btn-secondary';
+  create.innerHTML = `${icon('plus')} Завести «${escapeHtml(item.name)}» в МойСклад`;
+  suggest.listEl.after(create);
+  create.addEventListener('click', async () => {
+    if (create.disabled) return;
+    create.disabled = true;
+    const res = await apiResult('/api/containers/item_create_product', {
+      container_id: containerId, item_id: item.id,
+    });
+    create.disabled = false;
+    if (!res.ok) { sheet.showErr(res.error); return; }
+    haptic('success');
+    toast(res.body.existed ? 'Товар уже был в каталоге — привязали' : 'Товар заведён');
+    sheet.close();
+    renderContainerCard(containerId);
   });
 }
 
@@ -1380,11 +1531,15 @@ function containerItemsHtml(items, arrived, canManage) {
   }
   const rows = items.map(it => {
     const qty = `${formatMoney(it.expected_qty)} ${escapeHtml(it.unit || 'шт')}`;
-    const sub = arrived
+    // Про каталог говорим сразу, а не в момент оприходования: непривязанная
+    // позиция — это остаток, который не доедет до МойСклад, и узнать об этом
+    // лучше пока контейнер грузят, а не когда его уже посчитали.
+    const link = it.ms_id ? '' : ' · нет в каталоге';
+    const sub = (arrived
       ? (it.state === 'unchecked'
           ? `заявлено ${qty} · не сверено`
           : `заявлено ${qty} · прибыло ${formatMoney(it.arrived_qty)}`)
-      : `заявлено ${qty}`;
+      : `заявлено ${qty}`) + link;
     const mark = it.state === 'short' ? `${formatMoney(it.delta)}`
       : it.state === 'extra' ? `+${formatMoney(it.delta)}`
       : it.state === 'match' ? '✓' : '—';
@@ -1402,6 +1557,8 @@ function containerItemsHtml(items, arrived, canManage) {
           <div class="card-row-sub">${sub}</div>
         </div>
         ${input}
+        ${canManage ? `<button class="pay-toggle" data-item-link="${it.id}"
+             aria-label="Товар в каталоге: ${escapeHtml(it.name)}">${icon(it.ms_id ? 'check' : 'search')}</button>` : ''}
         ${canManage ? `<button class="pay-toggle" data-item-del="${it.id}" aria-label="Убрать позицию">${icon('trash')}</button>` : ''}
       </div>`;
   }).join('');
@@ -1526,10 +1683,12 @@ async function renderContainerCard(containerId) {
           </div>
         </div>
         ${unmatched.map(u => `
-        <div class="c-row" data-status="rejected">
+        <div class="c-row${u.item_id && canEdit ? ' c-row--tap' : ''}" data-status="rejected"
+             ${u.item_id && canEdit ? `data-unmatched="${u.item_id}" role="button" tabindex="0"` : ''}>
           <div class="card-row-info">
             <div class="card-row-title">${escapeHtml(u.name)}</div>
-            <div class="card-row-sub">${escapeHtml(u.reason)} — заведите товар и повторите</div>
+            <div class="card-row-sub">${escapeHtml(u.reason)}${u.item_id && canEdit
+              ? ' — выберите товар или заведите карточку' : ' — заведите товар и повторите'}</div>
           </div>
           <div class="card-row-value">${formatMoney(u.quantity)}</div>
         </div>`).join('')}
@@ -1645,6 +1804,18 @@ async function renderContainerCard(containerId) {
       renderContainerCard(containerId);
     });
   });
+
+  // Привязка к каталогу открывается и из состава, и из списка несопоставленного:
+  // именно там человек узнаёт, что позиция никуда не попала.
+  const itemById = new Map((card.items || []).map(i => [String(i.id), i]));
+  const openLink = (id) => {
+    const it = itemById.get(String(id));
+    if (it) openItemLinkSheet(containerId, it);
+  };
+  content.querySelectorAll('[data-item-link]').forEach(btn =>
+    btn.addEventListener('click', () => openLink(btn.dataset.itemLink)));
+  content.querySelectorAll('[data-unmatched]').forEach(row =>
+    row.addEventListener('click', () => openLink(row.dataset.unmatched)));
 }
 
 // ─── Фотографии машины ──────────────────────────────

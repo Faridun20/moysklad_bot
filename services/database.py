@@ -807,6 +807,21 @@ def _create_tables():
                 note          TEXT,
                 created_at    TEXT
             )""",
+            # Позиция приёмки ↔ карточка номенклатуры МойСклад. Пока связи не
+            # было, оприходование угадывало товар по названию — и «Кабель PV
+            # 0.6» из накладной не находил «Кабель PV 0,6» из каталога.
+            # Отдельная таблица, а не колонка в `container_items`:
+            # инкрементальных миграций в проекте нет, и колонка в уже
+            # существующую на проде таблицу просто не доехала бы.
+            # `container_id` дублируется намеренно — по нему состав чистится
+            # одним DELETE и его же видит сторож сирот (containers.CHILD_TABLES).
+            """CREATE TABLE IF NOT EXISTS container_item_links (
+                item_id      INTEGER PRIMARY KEY REFERENCES container_items(id),
+                container_id INTEGER NOT NULL REFERENCES containers(id),
+                ms_id        TEXT NOT NULL,
+                ms_name      TEXT,
+                created_at   TEXT
+            )""",
         ]
 
         # Создаём каждую таблицу в отдельной транзакции

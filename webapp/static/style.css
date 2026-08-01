@@ -2041,8 +2041,13 @@ body {
 }
 
 /* Список контрагентов внутри формы выбора поставщика. */
-.supplier-list { max-height: 40vh; overflow-y: auto; margin-bottom: var(--sp-3); }
-.supplier-list .picked { background: var(--success-bg); }
+/* Список выбора внутри диалога: контрагенты и товары каталога. Один набор
+   правил на оба — выбирают их одинаково, а второй разошёлся бы с первым при
+   первой же правке. */
+.supplier-list,
+.product-suggest { max-height: 40vh; overflow-y: auto; margin-bottom: var(--sp-3); }
+.supplier-list .picked,
+.product-suggest .picked { background: var(--success-bg); }
 
 /* ─── Бары дебиторки и прогноза ──────────────────────────────────────────────
    Свой график ради пяти корзин — лишняя зависимость во фронте без сборщика.

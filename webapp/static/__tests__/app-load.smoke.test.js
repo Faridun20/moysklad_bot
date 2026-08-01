@@ -1025,3 +1025,107 @@ describe('рассрочка: частичные поступления', () => 
     expect(window.document.querySelector('[data-receipt-add]')).toBeNull();
   });
 });
+
+describe('позиция контейнера: товар выбирают из каталога', () => {
+  const ITEMS = [
+    { id: 1, name: 'Штекер тип C', unit: 'шт', expected_qty: 5, state: 'unchecked' },
+    { id: 2, name: 'Кабель PV 0.6', unit: 'м', expected_qty: 500, state: 'unchecked',
+      ms_id: 'p-1', ms_name: 'Кабель PV 0.6' },
+  ];
+
+  it('о позиции вне каталога говорят сразу, а не в момент оприходования', () => {
+    const window = boot();
+    const box = window.document.createElement('div');
+    box.innerHTML = window.containerItemsHtml(ITEMS, false, true);
+
+    const rows = box.querySelectorAll('.c-row');
+    expect(rows[0].textContent).toContain('нет в каталоге');
+    expect(rows[1].textContent).not.toContain('нет в каталоге');
+    // Привязку можно исправить у любой строки: ошибочный выбор тоже правят.
+    expect(box.querySelectorAll('[data-item-link]').length).toBe(2);
+  });
+
+  it('без права правки кнопки привязки нет', () => {
+    const window = boot();
+    const box = window.document.createElement('div');
+    box.innerHTML = window.containerItemsHtml(ITEMS, true, false);
+    expect(box.querySelector('[data-item-link]')).toBeNull();
+  });
+
+  const formDriver = `
+    currentUser = { role: 'manager' };
+    window.__sent = null;
+    api = async () => ({ ok: true, products: [
+      { ms_id: 'p-1', name: 'Кабель PV 0.6', unit: 'м' },
+    ] });
+    apiResult = async (path, body) => { window.__sent = body; return { ok: true, body: {} }; };
+    renderContainerCard = async () => {};
+    openContainerItemForm(7, false);
+  `;
+
+  // Подсказка приходит по debounce'у — ждём его и микротаск ответа.
+  const settle = () => new Promise(r => setTimeout(r, 400));
+
+  it('выбор из каталога подставляет название, единицу и уезжает с позицией', async () => {
+    const window = boot(formDriver);
+    const doc = window.document;
+    const name = doc.querySelector('#ms-f-name');
+    name.value = 'кабель';
+    name.dispatchEvent(new window.Event('input'));
+    await settle();
+
+    doc.querySelector('.product-suggest [data-ms="p-1"]').click();
+    expect(name.value).toBe('Кабель PV 0.6');
+    expect(doc.querySelector('#ms-f-unit').value).toBe('м');
+
+    doc.querySelector('#ms-f-expected_qty').value = '500';
+    doc.querySelector('#ms-submit').click();
+    await settle();
+    expect(window.__sent.ms_id).toBe('p-1');
+    expect(window.__sent.name).toBe('Кабель PV 0.6');
+  });
+
+  it('правка названия после выбора отвязывает товар', async () => {
+    // Иначе человек уверен, что вписал новую позицию, а приход уйдёт на
+    // прежнюю карточку — молча и не туда.
+    const window = boot(formDriver);
+    const doc = window.document;
+    const name = doc.querySelector('#ms-f-name');
+    name.value = 'кабель';
+    name.dispatchEvent(new window.Event('input'));
+    await settle();
+    doc.querySelector('.product-suggest [data-ms="p-1"]').click();
+
+    name.value = 'Кабель PV 0.6 чёрный';
+    name.dispatchEvent(new window.Event('input'));
+    await settle();
+
+    doc.querySelector('#ms-f-expected_qty').value = '10';
+    doc.querySelector('#ms-submit').click();
+    await settle();
+    expect(window.__sent.ms_id).toBe('');
+    expect(window.__sent.name).toBe('Кабель PV 0.6 чёрный');
+  });
+
+  it('свободный ввод остаётся законным: товара может ещё не быть', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      window.__sent = null;
+      api = async () => ({ ok: true, products: [] });
+      apiResult = async (path, body) => { window.__sent = body; return { ok: true, body: {} }; };
+      renderContainerCard = async () => {};
+      openContainerItemForm(7, false);
+    `);
+    const doc = window.document;
+    doc.querySelector('#ms-f-name').value = 'Штекер тип C';
+    doc.querySelector('#ms-f-name').dispatchEvent(new window.Event('input'));
+    await settle();
+    expect(doc.querySelector('.product-suggest').textContent).toContain('вписать своё название');
+
+    doc.querySelector('#ms-f-expected_qty').value = '5';
+    doc.querySelector('#ms-submit').click();
+    await settle();
+    expect(window.__sent.name).toBe('Штекер тип C');
+    expect(window.__sent.ms_id).toBe('');
+  });
+});

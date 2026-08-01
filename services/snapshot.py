@@ -517,6 +517,28 @@ def search_products(query: str, limit: int = 10) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+async def remember_product(ms_id: str, *, name: str, unit: str = "шт") -> None:
+    """Положить только что созданную карточку номенклатуры в снапшот.
+
+    Снапшот — зеркало, и обычно его двигает только синхронизация. Исключение
+    здесь осознанное: товар, заведённый минуту назад из приёмки, до ночного
+    полного среза не найдётся ни поиском, ни при сопоставлении — и вторая
+    строка того же контейнера завела бы его повторно.
+
+    Существующую строку не трогаем: перезапись обнулила бы настоящий остаток.
+    Остаток у новой карточки — ноль, и это правда: «Приёмка» ещё не проведена.
+    """
+    if not ms_id:
+        return
+    if await adb_core.fetchval("SELECT ms_id FROM ms_stock WHERE ms_id = $1", ms_id):
+        return
+    await adb_core.execute(
+        "INSERT INTO ms_stock (ms_id, name, folder_id, folder_name, unit, stock, "
+        "reserve, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        ms_id, name, None, None, unit or "шт", 0, 0, now_str(),
+    )
+
+
 def get_product(ms_id: str) -> dict | None:
     """Товар снапшота по ms_id → {ms_id, name, unit} или None."""
     with get_conn() as conn:
