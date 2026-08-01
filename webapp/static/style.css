@@ -315,25 +315,37 @@
 body {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
                "Segoe UI", Roboto, sans-serif;
-  /* Собственное поле под стеклом: точечная сетка накладной + две мягкие
-     диагональные полосы поверх фона темы. Без него размывать нечего — в
-     Telegram фон часто плоский, и панель выглядела бы мутно-белой.
-     `fixed` — чтобы поле не ехало со списком и не мельтешило при прокрутке. */
-  background:
-    radial-gradient(circle at 1px 1px, var(--field-dot) 1px, transparent 0) 0 0 / 14px 14px,
-    linear-gradient(118deg, var(--field-1) 0%, transparent 46%),
-    linear-gradient(296deg, var(--field-2) 0%, transparent 48%),
-    var(--bg-page);
-  background-attachment: fixed;
+  background: var(--bg-page);
   color: var(--text);
   font-size: 15px;
   line-height: 1.4;
   -webkit-font-smoothing: antialiased;
 }
 
+/* Собственное поле под стеклом: точечная сетка накладной + две мягкие
+   диагональные полосы. Без него размывать нечего — в Telegram фон задаёт тема
+   пользователя и он часто плоский, панель выглядела бы мутно-белой.
+
+   Рисуем ФИКСИРОВАННЫМ ПСЕВДОЭЛЕМЕНТОМ, а не `background-attachment: fixed` на
+   body. Последний уводит Chromium/WebView на медленный путь композитинга, и
+   `position: sticky` шапка на прокрутке начинает рисоваться со смещением —
+   заголовок уезжает под шапку Telegram. Псевдоэлемент даёт тот же
+   привязанный к экрану фон без этой цены. */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 1px 1px, var(--field-dot) 1px, transparent 0) 0 0 / 14px 14px,
+    linear-gradient(118deg, var(--field-1) 0%, transparent 46%),
+    linear-gradient(296deg, var(--field-2) 0%, transparent 48%);
+}
+
 /* Поле — украшение. Кому важен контраст, тому важнее ровный фон. */
 @media (prefers-contrast: more) {
-  body { background: var(--bg-page); }
+  body::before { display: none; }
 }
 
 .app {

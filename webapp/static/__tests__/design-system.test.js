@@ -235,3 +235,22 @@ describe('стекло (S7)', () => {
     expect(withoutComments).toMatch(/@media \(prefers-contrast: more\)/);
   });
 });
+
+describe('фон не мешает sticky-шапке', () => {
+  it('background-attachment: fixed не используется', () => {
+    // Он уводит Chromium/WebView на медленный путь композитинга, и sticky-шапка
+    // на прокрутке начинает рисоваться со смещением: заголовок уезжает под
+    // шапку Telegram. Поле рисует фиксированный псевдоэлемент.
+    // Комментарии вырезаем — в них это правило как раз и объясняется.
+    const code = css.replace(/\/\*[\s\S]*?\*\//g, '');
+    expect(code).not.toMatch(/background-attachment:\s*fixed/);
+  });
+
+  it('поле лежит за контентом и не ловит нажатия', () => {
+    const rule = css.match(/body::before\s*\{([^}]*)\}/);
+    expect(rule, 'поле под стеклом пропало').not.toBeNull();
+    expect(rule[1]).toMatch(/position:\s*fixed/);
+    expect(rule[1]).toMatch(/z-index:\s*-1/);
+    expect(rule[1]).toMatch(/pointer-events:\s*none/);
+  });
+});
