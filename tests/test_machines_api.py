@@ -366,16 +366,129 @@ def test_update_changes_fields(isolated_db, monkeypatch):
     assert m["price_cents"] == 3_000_000
 
 
-def test_update_rejects_vin(isolated_db, monkeypatch):
-    """Смена серийника — не правка, а другая машина. Сервис его не пускает."""
+def test_vin_typo_can_be_fixed(isolated_db, monkeypatch):
+    """Опечатка в серийнике должна исправляться: раньше карточку с ней
+    оставалось только удалить и завести заново."""
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine("JCB-0O1")
+
+    r = _post(_client(monkeypatch), "/api/machines/update", 2, machine_id=mid,
+              fields={"vin": "jcb-001"})
+    assert r.status_code == 200, r.text
+    assert _run(machines.get_machine(mid, role="boss"))["vin"] == "JCB001"  # нормализован
+
+
+def test_vin_change_rejects_duplicate(isolated_db, monkeypatch):
+    """Иначе на один экскаватор появятся две карточки."""
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine("A-1")
+    _machine("B-2")
+
+    r = _post(_client(monkeypatch), "/api/machines/update", 2, machine_id=mid,
+              fields={"vin": "b 2"})
+    assert r.status_code == 400
+    assert "уже заведена" in r.json()["detail"]
+    assert _run(machines.get_machine(mid, role="boss"))["vin"] == "A1"
+
+
+def test_vin_change_is_boss_only(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+    mid = _machine("A-1")
+
+    r = _post(_client(monkeypatch), "/api/machines/update", 1, machine_id=mid,
+              fields={"vin": "B-2"})
+    assert r.status_code == 403
+
+
+def test_vin_and_other_fields_change_together(isolated_db, monkeypatch):
+    """Форма правки одна — VIN приходит вместе с остальными полями."""
+    from services import machines
+
     db = isolated_db
     _setup(db)
     mid = _machine("A-1")
 
     r = _post(_client(monkeypatch), "/api/machines/update", 2, machine_id=mid,
-              fields={"vin": "B-2"})
+              fields={"vin": "C-3", "location": "Склад №2"})
+    assert r.status_code == 200, r.text
+    m = _run(machines.get_machine(mid, role="boss"))
+    assert m["vin"] == "C3"
+    assert m["location"] == "Склад №2"
+
+
+def test_taken_vin_leaves_the_card_untouched(isolated_db, monkeypatch):
+    """VIN проверяется ДО прочих правок: иначе локация уже сохранена, а
+    серийник — нет, и пользователь об этом не узнает."""
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine("A-1", location="Склад №1")
+    _machine("B-2")
+
+    r = _post(_client(monkeypatch), "/api/machines/update", 2, machine_id=mid,
+              fields={"vin": "B-2", "location": "Склад №9"})
     assert r.status_code == 400
-    assert "vin" in r.json()["detail"]
+    m = _run(machines.get_machine(mid, role="boss"))
+    assert m["vin"] == "A1"
+    assert m["location"] == "Склад №1"
+
+
+# ─── Удаление ─────────────────────────────────────────────────────────────────
+
+
+def test_machine_can_be_deleted_with_its_history(isolated_db, monkeypatch):
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine("A-1", hours=100)
+    _run(machines.add_photo(mid, tg_file_id="f", file_unique_id="u", uploaded_by=2))
+
+    r = _post(_client(monkeypatch), "/api/machines/delete", 2, machine_id=mid)
+    assert r.status_code == 200, r.text
+    assert _run(machines.get_machine(mid, role="boss")) is None
+    assert _run(machines.list_photos(mid)) == []
+    assert _run(machines.get_hours_history(mid)) == []
+
+
+def test_machine_with_a_deal_is_not_deletable(isolated_db, monkeypatch):
+    """Продажа — денежный факт: стирать его вместе с карточкой нельзя."""
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine("A-1")
+    _run(machines.create_deal(mid, kind="sale", price_cents=1000, buyer_name="A", created_by=2))
+
+    r = _post(_client(monkeypatch), "/api/machines/delete", 2, machine_id=mid)
+    assert r.status_code == 400
+    assert "архив" in r.json()["detail"]
+    assert _run(machines.get_machine(mid, role="boss")) is not None
+
+
+def test_delete_is_boss_only(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+    mid = _machine("A-1")
+
+    assert _post(_client(monkeypatch), "/api/machines/delete", 1,
+                 machine_id=mid).status_code == 403
+
+
+def test_delete_missing_machine_is_404(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+
+    assert _post(_client(monkeypatch), "/api/machines/delete", 2,
+                 machine_id=999).status_code == 404
 
 
 def test_manager_can_record_hours(isolated_db, monkeypatch):
@@ -522,7 +635,7 @@ def test_credit_deal_appears_in_open_list_and_closes(isolated_db, monkeypatch):
     client = _client(monkeypatch)
 
     created = _post(client, "/api/machines/deal", 2, machine_id=mid, kind="credit",
-                    price="50 000", buyer_name="Петров", due_date="2026-12-31",
+                    price="50 000", buyer_name="Петров", months=6,
                     buyer_passport="AB1", idempotency_key="c1")
     assert created.status_code == 200, created.text
     deal_id = created.json()["deal_id"]
@@ -544,7 +657,7 @@ def test_closing_a_closed_deal_is_409(isolated_db, monkeypatch):
     mid = _machine("A-1")
     client = _client(monkeypatch)
     created = _post(client, "/api/machines/deal", 2, machine_id=mid, kind="credit",
-                    price="1000", buyer_name="A", due_date="2026-12-31",
+                    price="1000", buyer_name="A", months=3,
                     idempotency_key="c1")
     deal_id = created.json()["deal_id"]
     assert _post(client, "/api/machines/deal_close", 2, deal_id=deal_id).status_code == 200

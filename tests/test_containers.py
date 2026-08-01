@@ -1,0 +1,370 @@
+"""
+Контейнеры: что едет, что здесь и сошёлся ли состав.
+
+Главное, что проверяем, — сверку. Она врёт молча: «не считали» легко спутать с
+«приехало ноль», а позиция из чужого контейнера, попавшая в приёмку, испортит
+итог, которому потом верят.
+
+БД настоящая (isolated_db), корутины через asyncio.run — pytest-asyncio в
+проекте нет.
+"""
+
+import asyncio
+import importlib
+
+from fastapi.testclient import TestClient
+
+import services.roles as roles
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _setup(db):
+    roles.invalidate_all_roles()
+    db.set_role(1, "mgr", "Manager", "manager")
+    db.set_role(2, "boss", "Boss", "boss")
+    db.set_role(3, "acc", "Bookkeeper", "bookkeeper")
+
+
+def _container(number="MSKU-1234567", **over):
+    from services import containers
+
+    payload = {"number": number, "created_by": 2, "creator_name": "Boss"}
+    payload.update(over)
+    res = _run(containers.create_container(**payload))
+    assert res["ok"], res
+    return res["container_id"]
+
+
+def _item(cid, name="Кабель PV 0.6", expected=500, **over):
+    from services import containers
+
+    res = _run(containers.add_item(cid, name=name, expected_qty=expected, **over))
+    assert res["ok"], res
+    return res["item_id"]
+
+
+# ─── Заведение ────────────────────────────────────────────────────────────────
+
+
+def test_number_is_normalized(isolated_db):
+    from services import containers
+
+    assert containers.normalize_number(" msku-123 4567 ") == "MSKU1234567"
+    assert containers.normalize_number(None) == ""
+
+
+def test_same_number_written_differently_is_rejected(isolated_db):
+    """Номер приезжает то из накладной, то из мессенджера — без нормализации
+    UNIQUE не спасает и на один контейнер появятся две карточки."""
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    _container("MSKU-1234567")
+    res = _run(containers.create_container(number="msku 1234567", created_by=2))
+    assert res["ok"] is False
+    assert "уже заведён" in res["error"]
+
+
+def test_new_container_is_in_transit(isolated_db):
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    assert _run(containers.get_container(cid))["status"] == "in_transit"
+    assert _run(containers.count_by_status()) == {"in_transit": 1, "arrived": 0, "all": 1}
+
+
+# ─── Сверка ───────────────────────────────────────────────────────────────────
+
+
+def test_unchecked_is_not_a_discrepancy(isolated_db):
+    """«Ещё не считали» и «приехало ноль» — разные вещи: в первом случае
+    непроверенный контейнер выглядел бы как полностью недостающий."""
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    _item(cid, expected=500)
+
+    rows = containers.diff(_run(containers.list_items(cid)))
+    assert rows[0]["state"] == "unchecked"
+    assert rows[0]["delta"] is None
+    summary = containers.diff_summary(rows)
+    assert summary["mismatch"] == 0 and summary["unchecked"] == 1
+
+
+def test_zero_arrived_is_a_shortage(isolated_db):
+    """Ноль означает «искали и не нашли» — это недостача целиком."""
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    item = _item(cid, expected=500)
+    _run(containers.set_arrived_quantities(cid, {item: 0}, user_id=2))
+
+    rows = containers.diff(_run(containers.list_items(cid)))
+    assert rows[0]["state"] == "short"
+    assert rows[0]["delta"] == -500
+
+
+def test_diff_counts_shortage_and_surplus(isolated_db):
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    same = _item(cid, "Кабель", 500)
+    short = _item(cid, "ThinkPower 6kw", 20)
+    extra = _item(cid, "Автомат C16", 0)
+    _run(containers.set_arrived_quantities(
+        cid, {same: 500, short: 18, extra: 5}, user_id=2
+    ))
+
+    rows = containers.diff(_run(containers.list_items(cid)))
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["Кабель"]["state"] == "match"
+    assert by_name["ThinkPower 6kw"]["delta"] == -2
+    assert by_name["Автомат C16"]["state"] == "extra"
+
+    summary = containers.diff_summary(rows)
+    assert summary == {"total": 3, "unchecked": 0, "short": 1, "extra": 1, "mismatch": 2}
+
+
+def test_check_can_be_taken_back(isolated_db):
+    """Приёмщик должен уметь отменить свою же опечатку, а не только записать
+    ноль — иначе «не считали» вернуть нечем."""
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    item = _item(cid, expected=10)
+    _run(containers.set_arrived_quantities(cid, {item: 7}, user_id=2))
+    _run(containers.set_arrived_quantities(cid, {item: ""}, user_id=2))
+
+    assert containers.diff(_run(containers.list_items(cid)))[0]["state"] == "unchecked"
+
+
+def test_item_from_another_container_is_rejected(isolated_db):
+    """Подстановка чужого id испортила бы итог, которому потом верят."""
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    mine = _container("A-1")
+    theirs = _container("B-2")
+    alien = _item(theirs)
+
+    res = _run(containers.set_arrived_quantities(mine, {alien: 5}, user_id=2))
+    assert res["ok"] is False
+    assert "не из этого" in res["error"]
+
+
+def test_negative_quantity_is_rejected(isolated_db):
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    item = _item(cid)
+    res = _run(containers.set_arrived_quantities(cid, {item: -1}, user_id=2))
+    assert res["ok"] is False
+
+
+# ─── Прибытие ─────────────────────────────────────────────────────────────────
+
+
+def test_arrival_is_cas(isolated_db):
+    """Двое отметили приёмку одновременно — ответы не должны разойтись."""
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+
+    assert _run(containers.mark_arrived(cid, user_id=2))["ok"] is True
+    second = _run(containers.mark_arrived(cid, user_id=1))
+    assert second["ok"] is False
+    assert second["current"] == "arrived"
+
+
+def test_arrived_container_leaves_the_in_transit_shelf(isolated_db):
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    _container("B-2")
+    _run(containers.mark_arrived(cid, user_id=2))
+
+    in_transit = _run(containers.list_containers("in_transit"))
+    assert [c["number"] for c in in_transit] == ["B2"]
+    assert _run(containers.count_by_status())["arrived"] == 1
+
+
+def test_arrived_container_is_not_deletable(isolated_db):
+    """Это уже история приёмки, по которой сверяли товар."""
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    _run(containers.mark_arrived(cid, user_id=2))
+
+    res = _run(containers.delete_container(cid, user_id=2))
+    assert res["ok"] is False
+    assert "история" in res["error"]
+
+
+def test_delete_removes_the_items_too(isolated_db):
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    _item(cid)
+    assert _run(containers.delete_container(cid, user_id=2))["ok"]
+    assert _run(containers.list_items(cid)) == []
+
+
+# ─── Ручки ────────────────────────────────────────────────────────────────────
+
+
+def _client(monkeypatch):
+    import webapp.server as server
+
+    importlib.reload(roles)
+    monkeypatch.setattr(server, "verify_init_data", lambda s: {"id": int(s), "first_name": "U"})
+    return TestClient(server.app)
+
+
+def _post(client, path, uid, **body):
+    return client.post(path, json={"initData": str(uid), **body})
+
+
+def test_list_carries_the_discrepancy_counter(isolated_db, monkeypatch):
+    """Иначе «сверить» значит открыть каждый контейнер по очереди."""
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    item = _item(cid, expected=20)
+    _run(containers.set_arrived_quantities(cid, {item: 18}, user_id=2))
+
+    body = _post(_client(monkeypatch), "/api/containers/list", 1).json()
+    assert body["containers"][0]["diff"]["mismatch"] == 1
+
+
+def test_card_shows_expected_against_arrived(isolated_db, monkeypatch):
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    item = _item(cid, "ThinkPower 6kw", 20)
+    _run(containers.set_arrived_quantities(cid, {item: 18}, user_id=2))
+
+    body = _post(_client(monkeypatch), "/api/containers/card", 2, container_id=cid).json()
+    row = body["items"][0]
+    assert row["expected_qty"] == 20 and row["arrived_qty"] == 18
+    assert row["delta"] == -2 and row["state"] == "short"
+    assert body["diff"]["short"] == 1
+
+
+def test_full_flow_through_the_api(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+    client = _client(monkeypatch)
+
+    created = _post(client, "/api/containers/create", 1,
+                    number="msku-777 888", eta_date="2026-08-12", idempotency_key="k1")
+    assert created.status_code == 200, created.text
+    cid = created.json()["container_id"]
+    assert created.json()["number"] == "MSKU777888"
+
+    assert _post(client, "/api/containers/item_add", 1, container_id=cid,
+                 name="Кабель PV 0.6", expected_qty=500).status_code == 200
+    assert _post(client, "/api/containers/arrive", 1, container_id=cid).status_code == 200
+
+    card = _post(client, "/api/containers/card", 1, container_id=cid).json()
+    item_id = card["items"][0]["id"]
+    saved = _post(client, "/api/containers/check", 1, container_id=cid,
+                  quantities={str(item_id): 480})
+    assert saved.status_code == 200, saved.text
+
+    card = _post(client, "/api/containers/card", 1, container_id=cid).json()
+    assert card["items"][0]["delta"] == -20
+    assert card["diff"]["mismatch"] == 1
+
+
+def test_repeated_arrive_is_409(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    client = _client(monkeypatch)
+
+    assert _post(client, "/api/containers/arrive", 1, container_id=cid).status_code == 200
+    r = _post(client, "/api/containers/arrive", 1, container_id=cid)
+    assert r.status_code == 409
+    assert r.json()["current"] == "arrived"
+
+
+def test_duplicate_number_is_400(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+    _container("MSKU-1")
+    client = _client(monkeypatch)
+
+    r = _post(client, "/api/containers/create", 1, number="msku 1", idempotency_key="k")
+    assert r.status_code == 400
+    assert "уже заведён" in r.json()["detail"]
+
+
+def test_delete_is_boss_only(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    client = _client(monkeypatch)
+
+    assert _post(client, "/api/containers/delete", 1, container_id=cid).status_code == 403
+    assert _post(client, "/api/containers/delete", 2, container_id=cid).status_code == 200
+
+
+def test_bookkeeper_has_no_access(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    client = _client(monkeypatch)
+
+    assert _post(client, "/api/containers/list", 3).status_code == 403
+    assert _post(client, "/api/containers/card", 3, container_id=cid).status_code == 403
+
+
+def test_item_delete_is_scoped_to_its_container(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+    mine = _container("A-1")
+    theirs = _container("B-2")
+    alien = _item(theirs)
+    client = _client(monkeypatch)
+
+    r = _post(client, "/api/containers/item_delete", 1, container_id=mine, item_id=alien)
+    assert r.status_code == 404
+    from services import containers
+
+    assert len(_run(containers.list_items(theirs))) == 1
+
+
+def test_unknown_status_filter_is_400(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+    r = _post(_client(monkeypatch), "/api/containers/list", 1, status="edet")
+    assert r.status_code == 400

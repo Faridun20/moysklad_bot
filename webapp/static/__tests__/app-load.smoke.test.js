@@ -291,15 +291,148 @@ describe('техника: формы', () => {
     expect(window.document.getElementById('content').textContent).toContain('JCB 3CX');
   });
 
-  it('форма сделки требует срок оплаты только для рассрочки', async () => {
+  it('форма правки даёт исправить VIN, но не спрашивает марку и модель', async () => {
+    // Марка и модель и так входят в название («JCB 3CX 2019») — два поля с
+    // теми же словами приходилось заполнять дважды. Контейнер отслеживается
+    // отдельно, а не строкой в карточке машины.
+    const window = boot7('boss', []);
+    await window.__ready;
+    window.document.querySelector('[data-mact="edit"]').click();
+
+    expect(window.document.querySelector('#ms-f-vin').value).toBe('JCB7788');
+    expect(window.document.querySelector('#ms-f-brand')).toBeNull();
+    expect(window.document.querySelector('#ms-f-model')).toBeNull();
+    expect(window.document.querySelector('#ms-f-container_no')).toBeNull();
+  });
+
+  it('удаление спрашивает подтверждение и уводит со страницы машины', async () => {
+    const window = boot7('boss', [{ ok: true, status: 200, body: { ok: true }, error: '' }]);
+    await window.__ready;
+    window.document.querySelector('[data-mact="delete"]').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__confirmed).toContain('Удалить');
+    expect(window.__writes[0][0]).toBe('/api/machines/delete');
+    expect(window.__writes[0][1]).toEqual({ machine_id: 7 });
+  });
+
+  it('график рассрочки виден целиком, просрочка отмечена', async () => {
+    // По графику решают, звонить ли клиенту — прятать его за ещё одним тапом
+    // значит не показывать вовсе.
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify({
+        ...CARD,
+        machine: { ...CARD.machine, status: 'on_credit' },
+        today: '2026-07-31',
+        deals: [{
+          id: 5, kind: 'credit', price_cents: 2500000, currency: 'USD',
+          buyer_name: 'Иванов', sold_at: '2026-06-30', due_date: '2026-11-30',
+          payments: [
+            { id: 10, seq: 0, due_date: '2026-06-30', amount_cents: 500000, paid_at: '2026-06-30' },
+            { id: 11, seq: 1, due_date: '2026-07-30', amount_cents: 1000000, paid_at: null },
+            { id: 12, seq: 2, due_date: '2026-08-30', amount_cents: 1000000, paid_at: null },
+          ],
+        }],
+      })});
+      window.__ready = renderMachineCard(7);
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toContain('Первоначальный взнос');
+    expect(content.textContent).toContain('Оплачено');
+    // 30.07 при «сегодня» 31.07 — просрочен; 30.08 — ещё впереди.
+    expect(content.querySelector('[data-payment="11"]').closest('.c-row').dataset.status).toBe('overdue');
+    expect(content.querySelector('[data-payment="12"]').closest('.c-row').dataset.status).toBe('upcoming');
+    // Взнос переключать нечем — он получен в момент сделки.
+    expect(content.querySelector('[data-payment="10"]')).toBeNull();
+  });
+
+  it('менеджер график видит, но отметить платёж не может', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      api = async () => (${JSON.stringify({
+        ...CARD, can_manage: false, next_statuses: [], today: '2026-07-31',
+        deals: [{
+          id: 5, kind: 'credit', price_cents: 100000, currency: 'USD', buyer_name: 'И',
+          sold_at: '2026-06-30',
+          payments: [{ id: 11, seq: 1, due_date: '2026-08-30', amount_cents: 100000, paid_at: null }],
+        }],
+      })});
+      window.__ready = renderMachineCard(7);
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toContain('Платёж 1');
+    expect(content.querySelector('[data-payment]')).toBeNull();
+  });
+
+  it('отметка платежа уходит с новым состоянием', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__writes = [];
+      tg.showAlert = (t) => { window.__alerted = t; };
+      api = async () => (${JSON.stringify({
+        ...CARD, today: '2026-07-31',
+        deals: [{
+          id: 5, kind: 'credit', price_cents: 100000, currency: 'USD', buyer_name: 'И',
+          sold_at: '2026-06-30',
+          payments: [{ id: 11, seq: 1, due_date: '2026-08-30', amount_cents: 100000, paid_at: null }],
+        }],
+      })});
+      apiResult = async (path, body) => {
+        window.__writes.push([path, body]);
+        return { ok: true, status: 200, body: { ok: true, deal_closed: true }, error: '' };
+      };
+      window.__ready = renderMachineCard(7);
+    `);
+    await window.__ready;
+    window.document.querySelector('[data-payment="11"]').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__writes[0]).toEqual(['/api/machines/payment', { payment_id: 11, paid: true }]);
+  });
+
+  it('у машины со сделкой кнопки удаления нет', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify({
+        ...CARD,
+        deals: [{ id: 1, kind: 'sale', price_cents: 100, sold_at: '2026-01-01', buyer_name: 'A' }],
+      })});
+      window.__ready = renderMachineCard(7);
+    `);
+    await window.__ready;
+    expect(window.document.querySelector('[data-mact="delete"]')).toBeNull();
+  });
+
+  it('рассрочка спрашивает взнос и срок, продажа — нет', async () => {
+    // Дату последнего платежа не спрашиваем вовсе: её считает сервер по
+    // графику, а введённая руками она рано или поздно с ним разошлась бы.
     const window = boot7('boss', []);
     await window.__ready;
     window.document.querySelector('[data-mact="sale"]').click();
-    expect(window.document.querySelector('#ms-f-due_date')).toBeNull();
+    expect(window.document.querySelector('#ms-f-months')).toBeNull();
+    expect(window.document.querySelector('#ms-f-down_payment')).toBeNull();
     window.document.querySelector('#ms-cancel').click();
 
     window.document.querySelector('[data-mact="credit"]').click();
-    expect(window.document.querySelector('#ms-f-due_date')).not.toBeNull();
+    expect(window.document.querySelector('#ms-f-months')).not.toBeNull();
+    expect(window.document.querySelector('#ms-f-down_payment')).not.toBeNull();
+    expect(window.document.querySelector('#ms-f-due_date')).toBeNull();
+  });
+
+  it('срок рассрочки обязателен — без него запрос не уходит', async () => {
+    const window = boot7('boss', []);
+    await window.__ready;
+    window.document.querySelector('[data-mact="credit"]').click();
+    window.document.querySelector('#ms-f-price').value = '25000';
+    window.document.querySelector('#ms-f-buyer_name').value = 'Иванов';
+    window.document.querySelector('#ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__writes).toHaveLength(0);
+    expect(window.document.querySelector('#ms-error').textContent).toContain('Срок');
   });
 
   it('Esc закрывает форму, не отправляя ничего', async () => {
@@ -357,6 +490,44 @@ describe('карточка клиента: состав отгрузки', () =>
     expect(box.hidden).toBe(false);
     expect(box.textContent).toContain('Кабель PV 0.6');
     expect(window.__calls[1]).toEqual(['/api/clients/shipment', { demand_id: DEMAND }]);
+  });
+
+  it('позиции выстроены строками с колонкой сумм, а не абзацем текста', () => {
+    // Регресс: состав печатался списком «• Товар: 16 шт × 360 USD = 5 760 USD»
+    // тем же мелким серым текстом, что и подзаголовок раскрытой строки —
+    // сравнить суммы глазами было нельзя.
+    const window = boot('');
+    const html = window.itemsBoxHtml(
+      [
+        { name: 'ThinkPower 6kw', quantity: 16, unit: 'шт', price_cents: 36000, sum_cents: 576000 },
+        { name: 'Штекер', quantity: 200, unit: 'шт', price_cents: 100, sum_cents: 20000 },
+      ],
+      'USD',
+    );
+    expect(html).toContain('items-box');
+    expect((html.match(/items-row/g) || []).length).toBe(2);
+    expect(html).toContain('items-sum');
+    expect(html).toContain('Итого · 2 поз.');
+  });
+
+  it('под единственной позицией итог не печатается — он её повторяет', () => {
+    const window = boot('');
+    const html = window.itemsBoxHtml(
+      [{ name: 'Кабель', quantity: 1, unit: 'шт', price_cents: 8000, sum_cents: 8000 }], 'USD');
+    expect(html).not.toContain('items-total');
+  });
+
+  it('сумма позиции считается, когда сервер её не прислал', () => {
+    // У заказа в ответе только цена и количество — итог строки считает фронт.
+    const window = boot('');
+    const html = window.itemsBoxHtml(
+      [{ name: 'Кабель', quantity: 3, unit: 'шт', price_cents: 8000 }], 'USD');
+    expect(html).toContain('240 USD');
+  });
+
+  it('название товара экранируется — оно приходит из МойСклад', () => {
+    const window = boot('');
+    expect(window.itemsBoxHtml([{ name: '<img src=x>', quantity: 1 }], 'USD')).not.toContain('<img');
   });
 
   it('повторное открытие не ходит в МойСклад второй раз', async () => {
@@ -472,6 +643,136 @@ describe('техника: фотографии', () => {
     await new Promise(r => setTimeout(r, 0));
     expect(window.document.querySelector('.machine-photo')).toBeNull();
     expect(window.document.getElementById('content').textContent).toContain('JCB 3CX');
+  });
+});
+
+describe('контейнеры', () => {
+  const LIST = {
+    ok: true,
+    containers: [
+      { id: 3, number: 'MSKU1234567', status: 'arrived', arrived_at: '2026-08-12',
+        diff: { total: 4, unchecked: 0, short: 1, extra: 1, mismatch: 2 } },
+      { id: 4, number: 'TCLU7654321', status: 'in_transit', eta_date: '2026-09-01',
+        diff: { total: 2, unchecked: 2, short: 0, extra: 0, mismatch: 0 } },
+    ],
+    counts: { all: 2, in_transit: 1, arrived: 1 },
+    can_manage: true,
+    status_labels: { in_transit: '🚢 В пути', arrived: '📦 Прибыл' },
+  };
+  const CARD = (over = {}) => ({
+    ok: true,
+    container: { id: 3, number: 'MSKU1234567', status: 'arrived', arrived_at: '2026-08-12' },
+    items: [
+      { id: 10, name: 'Кабель PV 0.6', unit: 'шт', expected_qty: 500, arrived_qty: 500,
+        delta: 0, state: 'match' },
+      { id: 11, name: 'ThinkPower 6kw', unit: 'шт', expected_qty: 20, arrived_qty: 18,
+        delta: -2, state: 'short' },
+    ],
+    diff: { total: 2, unchecked: 0, short: 1, extra: 0, mismatch: 1 },
+    can_manage: true,
+    status_labels: { in_transit: '🚢 В пути', arrived: '📦 Прибыл' },
+    ...over,
+  });
+
+  it('вкладка есть у тех же ролей, что и техника', () => {
+    expect(boot("currentUser = { role: 'manager' };").ordersShellHtml())
+      .toContain('data-sub="containers"');
+    expect(boot("currentUser = { role: 'bookkeeper' };").ordersShellHtml())
+      .not.toContain('data-sub="containers"');
+  });
+
+  it('расхождение видно в списке — открывать каждый контейнер не нужно', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify(LIST)});
+      ordersSubTab = 'containers';
+      window.__ready = renderOrdersScreen();
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toContain('расхождений: 2');
+    // Контейнер с расхождением подсвечен как проблемный, а не как «прибыл».
+    expect(content.querySelector('[data-container="3"]').dataset.status).toBe('rejected');
+    expect(content.querySelector('[data-container="4"]').dataset.status).toBe('in_transit');
+    // Шелл под-вкладок на месте (UI-BUG-04).
+    expect(content.querySelector('[data-sub="orders"]')).not.toBeNull();
+  });
+
+  it('не сверенный прибывший контейнер так и подписан', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify({
+        ...LIST,
+        containers: [{ id: 5, number: 'X', status: 'arrived', arrived_at: '2026-08-12',
+                       diff: { total: 3, unchecked: 3, short: 0, extra: 0, mismatch: 0 } }],
+      })});
+      ordersSubTab = 'containers';
+      window.__ready = renderOrdersScreen();
+    `);
+    await window.__ready;
+    expect(window.document.getElementById('content').textContent).toContain('не сверен');
+  });
+
+  it('в карточке прибывшего есть поля факта и итог сверки', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify(CARD())});
+      window.__ready = renderContainerCard(3);
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toContain('Расхождений: 1');
+    expect(content.querySelector('.qty-input[data-item="11"]').value).toBe('18');
+    expect(content.querySelector('#cont-save')).not.toBeNull();
+    // Пока не прибыл — отмечать нечего, поэтому кнопки прибытия здесь нет.
+    expect(content.querySelector('#cont-arrive')).toBeNull();
+  });
+
+  it('пока контейнер в пути, полей факта нет — заполнять их нечем', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify(CARD({
+        container: { id: 4, number: 'TCLU7654321', status: 'in_transit', eta_date: '2026-09-01' },
+        items: [{ id: 12, name: 'Кабель', unit: 'шт', expected_qty: 500, arrived_qty: null,
+                  delta: null, state: 'unchecked' }],
+        diff: { total: 1, unchecked: 1, short: 0, extra: 0, mismatch: 0 },
+      }))});
+      window.__ready = renderContainerCard(4);
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('.qty-input')).toBeNull();
+    expect(content.querySelector('#cont-arrive')).not.toBeNull();
+    expect(content.querySelector('#cont-del')).not.toBeNull();
+  });
+
+  it('сверка уходит одним запросом на весь состав', async () => {
+    // Приёмщик считает подряд и не должен ждать сети после каждой позиции.
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__writes = [];
+      api = async () => (${JSON.stringify(CARD())});
+      apiResult = async (path, body) => { window.__writes.push([path, body]); return { ok: true, status: 200, body: { ok: true }, error: '' }; };
+      window.__ready = renderContainerCard(3);
+    `);
+    await window.__ready;
+    window.document.querySelector('.qty-input[data-item="11"]').value = '19';
+    window.document.querySelector('#cont-save').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__writes).toHaveLength(1);
+    expect(window.__writes[0][0]).toBe('/api/containers/check');
+    expect(window.__writes[0][1].quantities).toEqual({ 10: '500', 11: '19' });
+  });
+
+  it('удалить прибывший контейнер нельзя даже боссу', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify(CARD())});
+      window.__ready = renderContainerCard(3);
+    `);
+    await window.__ready;
+    expect(window.document.querySelector('#cont-del')).toBeNull();
   });
 });
 

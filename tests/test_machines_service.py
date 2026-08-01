@@ -284,7 +284,7 @@ def test_credit_deal_sets_on_credit_and_closes_to_sold(isolated_db):
     deal = _run(
         machines.create_deal(
             mid, kind="credit", price_cents=50_000_00, buyer_name="Петров",
-            created_by=2, due_date="2026-12-31",
+            created_by=2, months=6,
         )
     )
     assert deal["ok"] and deal["status"] == "on_credit"
@@ -306,6 +306,33 @@ def test_deal_price_must_be_positive_cents(isolated_db):
             machines.create_deal(mid, kind="sale", price_cents=bad, buyer_name="A", created_by=2)
         )
         assert res["ok"] is False, bad
+
+
+def test_vin_change_is_audited_as_a_transition(isolated_db):
+    """Смена VIN — не рядовая правка: после неё карточка описывает другую
+    машину, поэтому в аудите должен быть виден переход."""
+    from services import machines
+
+    db = isolated_db
+    _setup_roles(db)
+    mid = _machine(db, vin="JCB-0O1")
+    assert _run(machines.change_vin(mid, "jcb 001", user_id=2))["changed"] is True
+
+    entries = _run(db.get_audit_log(limit=20))
+    note = next(e for e in entries if e["action"] == "machine_vin_changed")
+    assert "JCB0O1" in note["details"] and "JCB001" in note["details"]
+
+
+def test_saving_the_same_vin_is_not_an_error(isolated_db):
+    """Открыл форму, ничего не поменял, сохранил — это не конфликт."""
+    from services import machines
+
+    db = isolated_db
+    _setup_roles(db)
+    mid = _machine(db, vin="JCB-001")
+    res = _run(machines.change_vin(mid, "JCB 001", user_id=2))
+    assert res["ok"] is True
+    assert res["changed"] is False
 
 
 def test_buyer_passport_is_boss_only(isolated_db):

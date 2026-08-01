@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from utils.helpers import redact_token
+from utils.helpers import local_now, redact_token
 from webapp.auth import verify_init_data
 
 # Берём роль из in-memory кэша (TTL 60s) вместо SELECT'а на каждый API-запрос.
@@ -2601,6 +2601,11 @@ async def api_machines_card(request: Request):
     photos = await machines.list_photos(machine_id)
     hours = await machines.get_hours_history(machine_id)
     deals = await machines.list_deals(machine_id, role=role)
+    # График рассрочки кладём внутрь сделки: отдельная ручка означала бы второй
+    # запрос ровно за тем, что и так открыто на экране.
+    for deal in deals:
+        if deal.get("kind") == "credit":
+            deal["payments"] = await machines.get_schedule(int(deal["id"]))
     return JSONResponse(
         {
             "ok": True,
@@ -2615,6 +2620,9 @@ async def api_machines_card(request: Request):
             # Без канала-хранилища загрузка не работает — кнопку рисовать нельзя.
             "can_upload_photo": _machine_photos_chat_id() is not None,
             "status_labels": machines.STATUS_LABELS,
+            # «Сегодня» считает сервер: просрочку платежа нельзя определять по
+            # часам телефона — они и в другом поясе, и просто сбиты.
+            "today": local_now().date().isoformat(),
         }
     )
 
@@ -2734,6 +2742,19 @@ async def api_machines_update(request: Request):
     if not isinstance(raw, dict) or not raw:
         raise HTTPException(status_code=400, detail="Нечего менять")
 
+    # VIN правится отдельной функцией сервиса: у него нормализация и проверка
+    # уникальности, которых нет у остальных полей. Делаем это ДО прочих правок —
+    # если серийник занят, карточка не должна остаться частично изменённой.
+    if "vin" in raw:
+        vin_res = await machines.change_vin(
+            machine_id, str(raw.pop("vin") or ""),
+            user_id=user["id"], full_name=_actor_name(user),
+        )
+        if not vin_res.get("ok"):
+            return _machine_response(vin_res)
+        if not raw:
+            return JSONResponse(vin_res)
+
     fields: dict = {}
     for key, value in raw.items():
         if key in ("price", "price_cents"):
@@ -2749,6 +2770,26 @@ async def api_machines_update(request: Request):
             fields[key] = (str(value).strip()[:1000] or None) if value is not None else None
     res = await machines.update_machine_fields(
         machine_id, user_id=user["id"], full_name=_actor_name(user), **fields
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/delete")
+async def api_machines_delete(request: Request):
+    """Удалить карточку машины. Только admin/boss.
+
+    Для машины со сделкой сервис откажет: продажа — денежный факт, и стирать
+    его вместе с карточкой нельзя. Такие уводят в архив.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_delete"
+    )
+    machine_id = _machine_id_arg(data)
+    res = await machines.delete_machine(
+        machine_id, user_id=user["id"], full_name=_actor_name(user)
     )
     return _machine_response(res)
 
@@ -2849,6 +2890,16 @@ async def api_machines_deal(request: Request):
     if not data.get("idempotency_key"):
         raise HTTPException(status_code=400, detail="idempotency_key обязателен")
 
+    # Рассрочка: взнос и срок в месяцах. Дату последнего платежа считает сервис
+    # по графику — введённая руками, она рано или поздно разошлась бы с ним.
+    down_payment_cents = _machine_money(data.get("down_payment"), "Первоначальный взнос") or 0
+    months = 0
+    if kind == "credit":
+        try:
+            months = int(data.get("months") or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Срок рассрочки — целое число месяцев")
+
     idem = _Idem(adb, "machine_deal", user["id"], data.get("idempotency_key"))
     cached = await idem.claim()
     if cached is not None:
@@ -2866,7 +2917,8 @@ async def api_machines_deal(request: Request):
             buyer_passport=_machine_text(data, "buyer_passport", 100),
             buyer_note=_machine_text(data, "buyer_note", 1000),
             agent_ms_id=_machine_text(data, "agent_ms_id", 64),
-            due_date=_machine_text(data, "due_date", 20),
+            down_payment_cents=down_payment_cents,
+            months=months,
         )
     except Exception:
         await idem.release()
@@ -2908,6 +2960,28 @@ async def api_machines_deal_close(request: Request):
         return JSONResponse({**res, "detail": res.get("error", "")}, status_code=409)
     await idem.store(res)
     return JSONResponse(res)
+
+
+@app.post("/api/machines/payment")
+async def api_machines_payment(request: Request):
+    """Отметить платёж графика рассрочки полученным (или снять отметку).
+
+    Когда получен последний платёж, сервис закрывает сделку и переводит машину
+    в «Продана» сам: закрывать руками после последнего платежа значит однажды
+    забыть это сделать.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_payment"
+    )
+    payment_id = _machine_id_arg(data, "payment_id")
+    paid = data.get("paid", True)
+    res = await machines.pay_installment(
+        payment_id, user_id=user["id"], full_name=_actor_name(user), paid=bool(paid)
+    )
+    return _machine_response(res)
 
 
 @app.post("/api/machines/deals_open")
@@ -3153,6 +3227,237 @@ async def api_machines_photo_delete(request: Request):
     if not res.get("ok"):
         raise HTTPException(status_code=404, detail="Фото не найдено")
     return JSONResponse({"ok": True, "photo_id": photo_id})
+
+
+# ─── API: контейнеры ─────────────────────────────────────────────────────────
+# Что едет, что уже здесь и сошёлся ли состав. Роли те же, что у техники:
+# заводит и принимает менеджер, удаляет руководство.
+
+_CONTAINER_ROLES = ("admin", "boss", "manager")
+
+
+@app.post("/api/containers/list")
+async def api_containers_list(request: Request):
+    """Список контейнеров + счётчики. Payload: {"status": "in_transit"?}."""
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_list"
+    )
+    status = (data.get("status") or "").strip() or None
+    if status and status not in containers.STATUSES:
+        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+
+    rows = await containers.list_containers(status)
+    # Расхождения нужны прямо в списке: иначе «сверить» значит открыть каждый
+    # контейнер по очереди.
+    for row in rows:
+        row["diff"] = containers.diff_summary(containers.diff(await containers.list_items(row["id"])))
+    return JSONResponse(
+        {
+            "ok": True,
+            "containers": rows,
+            "counts": await containers.count_by_status(),
+            "status": status or "all",
+            "can_manage": get_role(user["id"]) in _MACHINE_BOSS,
+            "status_labels": containers.STATUS_LABELS,
+        }
+    )
+
+
+@app.post("/api/containers/card")
+async def api_containers_card(request: Request):
+    """Карточка контейнера: состав с расхождениями «заявлено → прибыло»."""
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_card"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    container = await containers.get_container(container_id)
+    if not container:
+        raise HTTPException(status_code=404, detail="Контейнер не найден")
+
+    items = containers.diff(await containers.list_items(container_id))
+    return JSONResponse(
+        {
+            "ok": True,
+            "container": container,
+            "items": items,
+            "diff": containers.diff_summary(items),
+            "can_manage": get_role(user["id"]) in _MACHINE_BOSS,
+            "status_labels": containers.STATUS_LABELS,
+        }
+    )
+
+
+@app.post("/api/containers/create")
+async def api_containers_create(request: Request):
+    from services import async_db as adb
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_create",
+        rate_limit_max=20,
+    )
+    idem = _Idem(adb, "container_create", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await containers.create_container(
+            number=(data.get("number") or "").strip()[:32],
+            created_by=user["id"],
+            creator_name=_actor_name(user),
+            eta_date=_machine_text(data, "eta_date", 20),
+            notes=_machine_text(data, "notes", 1000),
+        )
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/containers/update")
+async def api_containers_update(request: Request):
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_update"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    raw = data.get("fields")
+    if not isinstance(raw, dict) or not raw:
+        raise HTTPException(status_code=400, detail="Нечего менять")
+    fields = {
+        k: (str(v).strip()[:1000] or None) if v is not None else None for k, v in raw.items()
+    }
+    res = await containers.update_container(
+        container_id, user_id=user["id"], full_name=_actor_name(user), **fields
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/containers/item_add")
+async def api_containers_item_add(request: Request):
+    """Добавить позицию в состав.
+
+    `arrived_qty` задают, когда позицию нашли в прибывшем контейнере, а в
+    заявленном составе её не было — то есть для излишка.
+    """
+    from services import containers
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_item_add",
+        rate_limit_max=120,  # состав заполняют подряд, позиция за позицией
+    )
+    container_id = _machine_id_arg(data, "container_id")
+
+    def _num(key):
+        value = data.get(key)
+        if value is None or str(value).strip() == "":
+            return None
+        try:
+            return float(str(value).replace(",", "."))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{key}: не число")
+
+    res = await containers.add_item(
+        container_id,
+        name=(data.get("name") or "").strip()[:200],
+        expected_qty=_num("expected_qty") or 0,
+        arrived_qty=_num("arrived_qty"),
+        unit=(data.get("unit") or "шт").strip()[:16],
+        note=_machine_text(data, "note", 500),
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/containers/item_delete")
+async def api_containers_item_delete(request: Request):
+    from services import containers
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_item_delete"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    item_id = _machine_id_arg(data, "item_id")
+    # Позицию ищем ВНУТРИ заявленного контейнера — гейт от подстановки чужого id.
+    res = await containers.delete_item(container_id, item_id)
+    return _machine_response(res)
+
+
+@app.post("/api/containers/check")
+async def api_containers_check(request: Request):
+    """Проставить фактические количества по позициям приёмки.
+
+    Payload: {"container_id": N, "quantities": {"<item_id>": 18, ...}}.
+    Пустое значение сбрасывает факт в «ещё не считали»: приёмщик должен иметь
+    возможность отменить свою же опечатку, а не только записать ноль.
+    """
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_check"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    raw = data.get("quantities")
+    if not isinstance(raw, dict) or not raw:
+        raise HTTPException(status_code=400, detail="Нечего сохранять")
+    quantities: dict[int, object] = {}
+    for key, value in raw.items():
+        try:
+            quantities[int(key)] = value
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="item_id: не число")
+
+    res = await containers.set_arrived_quantities(
+        container_id, quantities, user_id=user["id"], full_name=_actor_name(user)
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/containers/arrive")
+async def api_containers_arrive(request: Request):
+    """Отметить контейнер прибывшим."""
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_arrive"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    res = await containers.mark_arrived(
+        container_id, user_id=user["id"], full_name=_actor_name(user)
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/containers/delete")
+async def api_containers_delete(request: Request):
+    """Удалить контейнер. Только admin/boss и только пока он не прибыл."""
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_containers_delete"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    res = await containers.delete_container(
+        container_id, user_id=user["id"], full_name=_actor_name(user)
+    )
+    return _machine_response(res)
 
 
 @app.post("/api/users/deactivate")

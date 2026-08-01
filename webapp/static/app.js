@@ -309,8 +309,11 @@ function ordersShellHtml() {
   const tab = (id, label, ic) =>
     `<button class="seg-item ${ordersSubTab === id ? 'active' : ''}" data-sub="${id}" ` +
     `aria-pressed="${ordersSubTab === id}">${icon(ic)} ${label}</button>`;
-  const machines = canSeeMachines() ? tab('machines', 'Техника', 'truck') : '';
-  return `<div class="seg-row"><div class="seg seg--scroll">${tab('orders', 'Заказы', 'list')}${tab('stock', 'Каталог', 'box')}${machines}</div></div>`;
+  // Техника и контейнеры — те же три роли, что у их ручек.
+  const extra = canSeeMachines()
+    ? tab('machines', 'Техника', 'truck') + tab('containers', 'Контейнеры', 'box')
+    : '';
+  return `<div class="seg-row"><div class="seg seg--scroll">${tab('orders', 'Заказы', 'list')}${tab('stock', 'Каталог', 'box')}${extra}</div></div>`;
 }
 
 function wireOrdersShell(root) {
@@ -326,11 +329,13 @@ function wireOrdersShell(root) {
 async function renderOrdersScreen() {
   // Только диспатч: шелл рисует каждая ветка сама, иначе он теряется при
   // первом же ре-рендере внутри вкладки.
-  if (ordersSubTab === 'machines' && !canSeeMachines()) ordersSubTab = 'orders';
+  if (['machines', 'containers'].includes(ordersSubTab) && !canSeeMachines()) ordersSubTab = 'orders';
   if (ordersSubTab === 'orders') {
     await renderOrders();
   } else if (ordersSubTab === 'machines') {
     await renderMachines();
+  } else if (ordersSubTab === 'containers') {
+    await renderContainers();
   } else {
     await renderStock();
   }
@@ -960,10 +965,13 @@ function machineFactsHtml(m, card) {
   const facts = [
     ['Статус', machineStatusLabel(m.status, labels)],
     ['VIN', m.vin || '—'],
-    ['Марка и модель', [m.brand, m.model, m.year].filter(Boolean).join(' · ') || '—'],
     ['Моточасы', m.hours != null ? `${Number(m.hours).toLocaleString('ru-RU')} м/ч` : '—'],
     ['Цена', m.price_cents ? formatMoney(m.price_cents / 100, m.currency || 'USD') : '—'],
   ];
+  // Марка, модель и контейнер больше не заводятся через форму, но у старых
+  // карточек они есть — прячем строку, а не показываем прочерк.
+  const spec = [m.brand, m.model, m.year].filter(Boolean).join(' · ');
+  if (spec) facts.push(['Марка и год', spec]);
   // Себестоимости нет в ответе для менеджера — не «пусто», а поля не существует.
   if ('cost_cents' in m) {
     facts.push(['Себестоимость', m.cost_cents ? formatMoney(m.cost_cents / 100, m.currency || 'USD') : '—']);
@@ -991,24 +999,87 @@ function machineHoursHtml(hours) {
       </div>`).join('')}</div>`;
 }
 
-function machineDealsHtml(deals) {
-  if (!deals || !deals.length) return '';
-  return `<div class="section-label">Сделки</div>
-    <div class="c-surface c-surface--list">${deals.map(d => {
-      const kind = d.kind === 'credit' ? 'Рассрочка' : 'Продажа';
-      const state = d.closed_at ? 'Закрыта' : (d.kind === 'credit' ? `до ${d.due_date || '—'}` : '');
-      const meta = [d.buyer_name, d.buyer_phone, d.buyer_passport, state].filter(Boolean).join(' · ');
-      const canClose = d.kind === 'credit' && !d.closed_at && isMachineBoss();
-      return `
-      <div class="c-row" data-status="${d.closed_at || d.kind === 'sale' ? 'approved' : 'pending'}">
+// График рассрочки. Показываем всё сразу, а не за отдельным тапом: по нему
+// принимают решение «звонить ли клиенту», и прятать его за ещё одним действием
+// значит не показывать вовсе.
+function machineScheduleHtml(deal, today) {
+  const rows = deal.payments || [];
+  if (!rows.length) return '';
+  const cur = deal.currency || 'USD';
+  const paidCents = rows.filter(p => p.paid_at).reduce((s, p) => s + Number(p.amount_cents || 0), 0);
+  const totalCents = rows.reduce((s, p) => s + Number(p.amount_cents || 0), 0);
+  const boss = isMachineBoss();
+
+  const items = rows.map(p => {
+    const due = String(p.due_date || '').slice(0, 10);
+    // Состояние платежа: получен / просрочен / впереди — та же матрица цветов,
+    // что у долгов по заказам.
+    const state = p.paid_at ? 'approved' : (due < today ? 'overdue' : 'upcoming');
+    const title = p.seq === 0 ? 'Первоначальный взнос' : `Платёж ${p.seq}`;
+    const when = p.paid_at
+      ? `получен ${escapeHtml(String(p.paid_at).slice(0, 10))}`
+      : `до ${escapeHtml(due)}`;
+    // Взнос переключать нечем: он получен в момент сделки.
+    const toggle = boss && p.seq > 0
+      ? `<button class="pay-toggle" data-payment="${p.id}" data-paid="${p.paid_at ? '1' : '0'}"
+                 aria-label="${p.paid_at ? 'Снять отметку' : 'Отметить полученным'}">${icon(p.paid_at ? 'close' : 'check')}</button>`
+      : '';
+    return `
+      <div class="c-row" data-status="${state}">
         <div class="card-row-info">
-          <div class="card-row-title">${kind} · ${escapeHtml(String(d.sold_at || '').slice(0, 10))}</div>
-          <div class="card-row-sub">${escapeHtml(meta)}</div>
+          <div class="card-row-title">${title}</div>
+          <div class="card-row-sub">${when}</div>
         </div>
-        <div class="card-row-value">${formatMoney(Number(d.price_cents || 0) / 100, d.currency || 'USD')}</div>
+        <div class="card-row-value">${formatMoney(Number(p.amount_cents || 0) / 100, cur)}</div>
+        ${toggle}
+      </div>`;
+  }).join('');
+
+  const left = totalCents - paidCents;
+  return `
+    <div class="items-total schedule-total">
+      <span>Оплачено ${formatMoney(paidCents / 100, cur)} из ${formatMoney(totalCents / 100, cur)}</span>
+      <b>${left > 0 ? `осталось ${formatMoney(left / 100, cur)}` : 'закрыто'}</b>
+    </div>
+    <div class="c-surface c-surface--list">${items}</div>`;
+}
+
+function machineDealsHtml(deals, today) {
+  if (!deals || !deals.length) return '';
+  return deals.map(d => {
+    const kind = d.kind === 'credit' ? 'Рассрочка' : 'Продажа';
+    const state = d.closed_at ? 'Закрыта' : (d.kind === 'credit' ? `до ${d.due_date || '—'}` : '');
+    const meta = [d.buyer_name, d.buyer_phone, d.buyer_passport, state].filter(Boolean).join(' · ');
+    const canClose = d.kind === 'credit' && !d.closed_at && isMachineBoss();
+    return `
+      <div class="section-label">${kind} · ${escapeHtml(String(d.sold_at || '').slice(0, 10))}</div>
+      <div class="c-surface c-surface--list">
+        <div class="c-row" data-status="${d.closed_at || d.kind === 'sale' ? 'approved' : 'pending'}">
+          <div class="card-row-info">
+            <div class="card-row-title">${escapeHtml(d.buyer_name || '—')}</div>
+            <div class="card-row-sub">${escapeHtml(meta)}</div>
+          </div>
+          <div class="card-row-value">${formatMoney(Number(d.price_cents || 0) / 100, d.currency || 'USD')}</div>
+        </div>
       </div>
-      ${canClose ? `<div class="c-actions"><button class="btn-secondary" data-deal-close="${d.id}">Закрыть рассрочку</button></div>` : ''}`;
-    }).join('')}</div>`;
+      ${machineScheduleHtml(d, today)}
+      ${canClose ? `<div class="c-actions"><button class="btn-secondary" data-deal-close="${d.id}">Закрыть рассрочку досрочно</button></div>` : ''}`;
+  }).join('');
+}
+
+async function toggleMachinePayment(machineId, paymentId, wasPaid) {
+  const res = await apiResult('/api/machines/payment', {
+    payment_id: paymentId, paid: !wasPaid,
+  });
+  if (!res.ok) {
+    tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+    // 409 значит «на сервере уже другое» — перечитываем, а не спорим с экраном.
+    if (res.status === 409) renderMachineCard(machineId);
+    return;
+  }
+  haptic('success');
+  toast(res.body.deal_closed ? 'Рассрочка закрыта — все платежи получены' : 'Отмечено');
+  renderMachineCard(machineId);
 }
 
 // Кнопки карточки. Что можно — решает сервер (`can_manage`, `next_statuses`):
@@ -1029,8 +1100,307 @@ function machineActionsHtml(m, card) {
       buttons.push('<button class="btn-secondary" data-mact="sale">Продажа</button>');
       buttons.push('<button class="btn-secondary" data-mact="credit">Рассрочка</button>');
     }
+    // Удаление только у машины без сделок: продажа — денежный факт, стирать
+    // его вместе с карточкой нельзя, такие уводят в архив. Сервер это тоже
+    // проверяет, здесь просто не показываем заведомо отказную кнопку.
+    if (!(card.deals || []).length) {
+      buttons.push(`<button class="btn-secondary btn-danger" data-mact="delete">${icon('trash')} Удалить</button>`);
+    }
   }
   return `<div class="c-actions c-actions--wrap">${buttons.join('')}</div>`;
+}
+
+async function deleteMachine(machine) {
+  if (!await confirmDialog(
+    `Удалить карточку «${machine.name || machine.vin}»? Фото и моточасы удалятся вместе с ней.`
+  )) return;
+  const res = await apiResult('/api/machines/delete', { machine_id: machine.id });
+  if (!res.ok) {
+    tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+    return;
+  }
+  haptic('success');
+  toast('Машина удалена');
+  ordersSubTab = 'machines';
+  showScreen('orders');
+}
+
+// ─── Экран: Контейнеры ──────────────────────────────
+// Что едет, что уже здесь и сошёлся ли состав. Расхождение показываем на обоих
+// уровнях: в списке — счётчиком, в карточке — построчно. Сверка, ради которой
+// раздел и заводился, не должна требовать открыть каждый контейнер по очереди.
+let containersFilter = 'all';
+
+async function renderContainers() {
+  const content = document.getElementById('content');
+  content.innerHTML = ordersShellHtml() + skeleton('label') + skeleton('list', 3);
+  wireOrdersShell(content);
+  setScreenContext('Заказы · Контейнеры');
+
+  let data;
+  try {
+    data = await api('/api/containers/list', {
+      status: containersFilter === 'all' ? '' : containersFilter,
+    });
+  } catch (e) {
+    content.innerHTML = ordersShellHtml() + errorBox(e.message);
+    wireOrdersShell(content);
+    return;
+  }
+  const labels = data.status_labels || {};
+  const rows = (data.containers || []).map(c => {
+    const d = c.diff || {};
+    // Подстрочник отвечает на «надо ли открывать»: расхождения важнее ETA.
+    const parts = [];
+    if (c.status === 'arrived' && c.arrived_at) parts.push(`прибыл ${String(c.arrived_at).slice(0, 10)}`);
+    else if (c.eta_date) parts.push(`ожидается ${c.eta_date}`);
+    if (d.total) parts.push(`${d.total} поз.`);
+    if (d.mismatch) parts.push(`расхождений: ${d.mismatch}`);
+    else if (d.unchecked && c.status === 'arrived') parts.push('не сверен');
+    return `
+      <div class="c-row c-row--tap" data-container="${c.id}"
+           data-status="${d.mismatch ? 'rejected' : escapeHtml(c.status || '')}"
+           role="button" tabindex="0">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(c.number || '—')}</div>
+          <div class="card-row-sub">${escapeHtml(parts.join(' · '))}</div>
+        </div>
+        <span class="c-badge">${escapeHtml(machineStatusLabel(c.status, labels))}</span>
+      </div>`;
+  }).join('');
+
+  const counts = data.counts || {};
+  const seg = ['all', 'in_transit', 'arrived']
+    .filter(s => s === 'all' || Number(counts[s] || 0) > 0)
+    .map(s => {
+      const label = s === 'all' ? 'Все' : machineStatusLabel(s, labels);
+      return `<button class="seg-item ${containersFilter === s ? 'active' : ''}" data-cstatus="${s}" ` +
+        `aria-pressed="${containersFilter === s}">${escapeHtml(label)} ${Number(counts[s] || 0)}</button>`;
+    }).join('');
+
+  content.innerHTML = ordersShellHtml()
+    + `<div class="seg-row"><div class="seg seg--scroll">${seg}</div></div>`
+    + (rows
+      ? `<div class="c-surface c-surface--list">${rows}</div>`
+      : emptyState({
+          icon: 'box',
+          title: 'Контейнеров нет',
+          hint: 'Заведите контейнер, когда он выйдет в путь — и будет видно, чего ждать.',
+        }))
+    + `<div class="c-actions"><button class="btn-secondary" id="container-new">${icon('plus')} Новый контейнер</button></div>`;
+  wireOrdersShell(content);
+
+  content.querySelector('#container-new')?.addEventListener('click', () => openContainerForm());
+  content.querySelectorAll('[data-cstatus]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('light');
+      containersFilter = btn.dataset.cstatus;
+      renderContainers();
+    });
+  });
+  content.querySelectorAll('[data-container]').forEach(row => {
+    row.addEventListener('click', () => {
+      haptic('light');
+      renderContainerCard(Number(row.dataset.container));
+    });
+  });
+}
+
+function openContainerForm() {
+  const key = idemKey();
+  openMachineSheet({
+    title: 'Новый контейнер',
+    fields: [
+      { key: 'number', label: 'Номер контейнера', required: true,
+        hint: 'Пробелы и дефисы можно не убирать' },
+      { key: 'eta_date', label: 'Ожидаемое прибытие', type: 'date' },
+      { key: 'notes', label: 'Заметки', type: 'textarea' },
+    ],
+    submitLabel: 'Завести',
+    onSubmit: async (data, { showErr }) => {
+      const res = await apiResult('/api/containers/create', { ...data, idempotency_key: key });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      toast('Контейнер заведён');
+      renderContainerCard(res.body.container_id);
+      return true;
+    },
+  });
+}
+
+function openContainerItemForm(containerId, arrived) {
+  openMachineSheet({
+    title: arrived ? 'Позиция сверх заявленного' : 'Позиция в контейнере',
+    hint: arrived ? 'Товар, которого не было в заявленном составе.' : '',
+    fields: [
+      { key: 'name', label: 'Наименование', required: true },
+      arrived
+        ? { key: 'arrived_qty', label: 'Прибыло', type: 'number', required: true }
+        : { key: 'expected_qty', label: 'Заявлено', type: 'number', required: true },
+      { key: 'unit', label: 'Единица', value: 'шт' },
+    ],
+    submitLabel: 'Добавить',
+    onSubmit: async (data, { showErr }) => {
+      const res = await apiResult('/api/containers/item_add', { container_id: containerId, ...data });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      renderContainerCard(containerId);
+      return true;
+    },
+  });
+}
+
+// Строка состава: заявлено → прибыло и расхождение. Пока контейнер в пути,
+// колонки «прибыло» нет вовсе — заполнять её нечем.
+function containerItemsHtml(items, arrived, canManage) {
+  if (!items.length) {
+    return `<div class="c-surface c-surface--pad"><div class="items-empty">Состав не заполнен</div></div>`;
+  }
+  const rows = items.map(it => {
+    const qty = `${formatMoney(it.expected_qty)} ${escapeHtml(it.unit || 'шт')}`;
+    const sub = arrived
+      ? (it.state === 'unchecked'
+          ? `заявлено ${qty} · не сверено`
+          : `заявлено ${qty} · прибыло ${formatMoney(it.arrived_qty)}`)
+      : `заявлено ${qty}`;
+    const mark = it.state === 'short' ? `${formatMoney(it.delta)}`
+      : it.state === 'extra' ? `+${formatMoney(it.delta)}`
+      : it.state === 'match' ? '✓' : '—';
+    const state = it.state === 'short' ? 'rejected'
+      : it.state === 'extra' ? 'pending'
+      : it.state === 'match' ? 'approved' : 'draft';
+    const input = arrived && canManage
+      ? `<input type="number" inputmode="decimal" class="qty-input" data-item="${it.id}"
+                value="${it.arrived_qty == null ? '' : it.arrived_qty}" aria-label="Прибыло: ${escapeHtml(it.name)}">`
+      : `<div class="card-row-value">${escapeHtml(mark)}</div>`;
+    return `
+      <div class="c-row" data-status="${state}">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(it.name)}</div>
+          <div class="card-row-sub">${sub}</div>
+        </div>
+        ${input}
+        ${canManage ? `<button class="pay-toggle" data-item-del="${it.id}" aria-label="Убрать позицию">${icon('trash')}</button>` : ''}
+      </div>`;
+  }).join('');
+  return `<div class="c-surface c-surface--list">${rows}</div>`;
+}
+
+async function renderContainerCard(containerId) {
+  const content = document.getElementById('content');
+  content.innerHTML = skeleton('label') + skeleton('list', 4);
+  setScreenContext('Контейнер');
+  showBack(() => { ordersSubTab = 'containers'; showScreen('orders'); });
+
+  let card;
+  try {
+    card = await api('/api/containers/card', { container_id: containerId });
+  } catch (e) {
+    content.innerHTML = errorBox(e.message);
+    return;
+  }
+  const c = card.container || {};
+  const d = card.diff || {};
+  const arrived = c.status === 'arrived';
+  const canManage = true;   // ручки состава открыты всем трём ролям
+
+  const facts = [
+    ['Статус', machineStatusLabel(c.status, card.status_labels)],
+    arrived ? ['Прибыл', String(c.arrived_at || '').slice(0, 10) || '—']
+            : ['Ожидается', c.eta_date || '—'],
+    ['Позиций', String(d.total || 0)],
+  ];
+  if (c.notes) facts.push(['Заметки', c.notes]);
+
+  // Итог сверки — крупно и сверху: ради него раздел и существует.
+  const verdict = !arrived ? ''
+    : d.mismatch
+      ? `<div class="c-error">Расхождений: ${d.mismatch} (недостача ${d.short}, лишнее ${d.extra})</div>`
+      : d.unchecked
+        ? `<div class="items-total schedule-total"><span>Не сверено позиций</span><b>${d.unchecked}</b></div>`
+        : `<div class="items-total schedule-total"><span>Состав сошёлся</span><b>${d.total} поз.</b></div>`;
+
+  content.innerHTML = `
+    <div class="section-label">${escapeHtml(c.number || 'Контейнер')}</div>
+    <div class="c-surface c-surface--list">${facts.map(([k, v]) => `
+      <div class="c-row">
+        <div class="card-row-info"><div class="card-row-sub">${escapeHtml(k)}</div></div>
+        <div class="card-row-value">${escapeHtml(String(v))}</div>
+      </div>`).join('')}</div>
+    ${verdict}
+    <div class="c-actions c-actions--wrap">
+      <button class="btn-secondary" id="cont-item-add">${icon('plus')} ${arrived ? 'Лишняя позиция' : 'Позиция'}</button>
+      ${arrived ? '<button class="btn-primary" id="cont-save">Сохранить сверку</button>'
+                : '<button class="btn-primary" id="cont-arrive">Отметить прибытие</button>'}
+      ${!arrived && card.can_manage ? `<button class="btn-secondary btn-danger" id="cont-del">${icon('trash')} Удалить</button>` : ''}
+    </div>
+    <div class="section-label">Состав</div>
+    ${containerItemsHtml(card.items || [], arrived, canManage)}
+  `;
+
+  content.querySelector('#cont-item-add')?.addEventListener('click', () =>
+    openContainerItemForm(containerId, arrived));
+
+  content.querySelector('#cont-arrive')?.addEventListener('click', async () => {
+    if (!await confirmDialog('Контейнер прибыл? После этого можно проставить фактические количества.')) return;
+    const res = await apiResult('/api/containers/arrive', { container_id: containerId });
+    if (!res.ok) {
+      tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+      if (res.status === 409) renderContainerCard(containerId);
+      return;
+    }
+    haptic('success');
+    toast('Контейнер прибыл');
+    renderContainerCard(containerId);
+  });
+
+  content.querySelector('#cont-save')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    if (btn.disabled) return;
+    // Шлём весь состав одним запросом: приёмщик считает подряд и не должен
+    // ждать сети после каждой позиции.
+    const quantities = {};
+    content.querySelectorAll('.qty-input[data-item]').forEach(el => {
+      quantities[el.dataset.item] = el.value.trim();
+    });
+    if (!Object.keys(quantities).length) return;
+    btn.disabled = true;
+    const res = await apiResult('/api/containers/check', {
+      container_id: containerId, quantities,
+    });
+    btn.disabled = false;
+    if (!res.ok) {
+      tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+      return;
+    }
+    haptic('success');
+    toast('Сверка сохранена');
+    renderContainerCard(containerId);
+  });
+
+  content.querySelector('#cont-del')?.addEventListener('click', async () => {
+    if (!await confirmDialog(`Удалить контейнер ${c.number}? Состав удалится вместе с ним.`)) return;
+    const res = await apiResult('/api/containers/delete', { container_id: containerId });
+    if (!res.ok) {
+      tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+      return;
+    }
+    haptic('success');
+    toast('Контейнер удалён');
+    ordersSubTab = 'containers';
+    showScreen('orders');
+  });
+
+  content.querySelectorAll('[data-item-del]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const res = await apiResult('/api/containers/item_delete', {
+        container_id: containerId, item_id: Number(btn.dataset.itemDel),
+      });
+      if (!res.ok) { tg.showAlert ? tg.showAlert(res.error) : alert(res.error); return; }
+      haptic('light');
+      renderContainerCard(containerId);
+    });
+  });
 }
 
 // ─── Фотографии машины ──────────────────────────────
@@ -1163,7 +1533,7 @@ async function renderMachineCard(machineId) {
     ${machineActionsHtml(m, card)}
     ${machinePhotosHtml(card)}
     ${machineHoursHtml(card.hours)}
-    ${machineDealsHtml(card.deals)}
+    ${machineDealsHtml(card.deals, card.today || new Date().toISOString().slice(0, 10))}
   `;
 
   content.querySelector('#machine-photo-add')?.addEventListener('click', () => {
@@ -1177,6 +1547,7 @@ async function renderMachineCard(machineId) {
       const act = btn.dataset.mact;
       if (act === 'hours') openHoursForm(m);
       else if (act === 'edit') openMachineForm(m);
+      else if (act === 'delete') deleteMachine(m);
       else openDealForm(m, act);
     });
   });
@@ -1186,6 +1557,12 @@ async function renderMachineCard(machineId) {
   });
   content.querySelectorAll('[data-deal-close]').forEach(btn => {
     btn.addEventListener('click', () => closeMachineDeal(m.id, Number(btn.dataset.dealClose)));
+  });
+  content.querySelectorAll('[data-payment]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('light');
+      toggleMachinePayment(m.id, Number(btn.dataset.payment), btn.dataset.paid === '1');
+    });
   });
 }
 
@@ -1286,19 +1663,15 @@ function openMachineForm(machine) {
   const editing = !!machine;
   const m = machine || {};
   const cents = (v) => (v ? String(v / 100) : '');
-  const fields = [];
-  // VIN правится только при заведении: сервис его в whitelist не пускает, и
-  // смена серийника — это не правка карточки, а другая машина.
-  if (!editing) {
-    fields.push({ key: 'vin', label: 'VIN / серийный номер', required: true,
-                  hint: 'Пробелы и дефисы можно не убирать' });
-  }
-  fields.push(
-    { key: 'name', label: 'Название', required: true, value: m.name || '', placeholder: 'JCB 3CX' },
-    { key: 'brand', label: 'Марка', value: m.brand || '' },
-    { key: 'model', label: 'Модель', value: m.model || '' },
+  // Марки и модели в форме нет: они и так входят в название («JCB 3CX 2019»),
+  // а два поля с теми же словами приходилось заполнять дважды. Контейнер
+  // отслеживается отдельной сущностью, а не строкой в карточке машины.
+  const fields = [
+    { key: 'vin', label: 'VIN / серийный номер', required: true, value: m.vin || '',
+      hint: editing ? 'Исправляется только при опечатке' : 'Пробелы и дефисы можно не убирать' },
+    { key: 'name', label: 'Название', required: true, value: m.name || '', placeholder: 'JCB 3CX 2019' },
     { key: 'year', label: 'Год', type: 'number', value: m.year || '' },
-  );
+  ];
   if (!editing) fields.push({ key: 'hours', label: 'Моточасы', type: 'number' });
   fields.push({ key: 'price', label: 'Цена, USD', type: 'number', value: cents(m.price_cents) });
   if (isMachineBoss()) {
@@ -1306,7 +1679,6 @@ function openMachineForm(machine) {
   }
   fields.push(
     { key: 'location', label: 'Локация', value: m.location || '' },
-    { key: 'container_no', label: 'Контейнер', value: m.container_no || '' },
     { key: 'eta_date', label: 'Прибытие', type: 'date', value: m.eta_date || '' },
     { key: 'notes', label: 'Заметки', type: 'textarea', value: m.notes || '' },
   );
@@ -1364,13 +1736,20 @@ function openDealForm(machine, kind) {
   const key = idemKey();
   openMachineSheet({
     title: credit ? 'Рассрочка' : 'Продажа',
+    hint: credit ? 'График платежей построится сам: остаток разделится поровну по месяцам.' : '',
     fields: [
       { key: 'price', label: 'Цена, USD', type: 'number', required: true,
         value: machine.price_cents ? String(machine.price_cents / 100) : '' },
+      // Взнос и срок вместо даты последнего платежа: дату считает сервер по
+      // графику — введённая руками, она рано или поздно разошлась бы с ним.
+      ...(credit ? [
+        { key: 'down_payment', label: 'Первоначальный взнос, USD', type: 'number',
+          hint: 'Сколько клиент уже заплатил. Можно оставить пустым' },
+        { key: 'months', label: 'Срок, месяцев', type: 'number', required: true },
+      ] : []),
       { key: 'buyer_name', label: 'Покупатель', required: true },
       { key: 'buyer_phone', label: 'Телефон', type: 'tel' },
       { key: 'buyer_passport', label: 'Паспорт', hint: 'Виден только руководству' },
-      ...(credit ? [{ key: 'due_date', label: 'Срок оплаты', type: 'date', required: true }] : []),
       { key: 'buyer_note', label: 'Комментарий', type: 'textarea' },
     ],
     submitLabel: credit ? 'Оформить рассрочку' : 'Оформить продажу',
@@ -1380,7 +1759,9 @@ function openDealForm(machine, kind) {
       });
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
-      toast(credit ? 'Рассрочка оформлена' : 'Машина продана');
+      toast(credit
+        ? `Рассрочка оформлена · ${res.body.payments} платежей`
+        : 'Машина продана');
       renderMachineCard(machine.id);
       return true;
     },
@@ -3915,19 +4296,50 @@ async function renderCurrencyRates() {
   });
 }
 
-// Состав отгрузки из МойСклад — тем же языком, что состав заказа ниже, чтобы
-// «что уехало» и «что заказывали» читались одинаково.
-function shipmentItemsHtml(res) {
-  const items = res.positions || [];
-  if (!items.length) return '<div class="order-item">В отгрузке нет позиций</div>';
-  const cur = escapeHtml(res.currency || 'USD');
+// Состав документа (заказа или отгрузки) — вложенная поверхность со строками
+// «товар · количество × цена» и колонкой сумм справа.
+//
+// Раньше это был мелкий серый список «• Товар: 16 шт × 360 USD = 5 760 USD»:
+// он не отличался от подзаголовка строки, которую раскрыли, а суммы не
+// выстраивались в колонку — сравнить их глазами было нельзя. Отсюда общий
+// рендер: «что уехало» и «что заказывали» должны читаться одинаково.
+function itemsBoxHtml(items, currency, opts) {
+  const o = opts || {};
+  if (!items || !items.length) {
+    return `<div class="items-box"><div class="items-empty">${escapeHtml(o.empty || 'Позиций нет')}</div></div>`;
+  }
+  const cur = escapeHtml(currency || 'USD');
   const money = c => opsAmount((Number(c) || 0) / 100);
-  return items.map(it => {
+  const rows = items.map(it => {
     const qty = `${formatMoney(it.quantity)} ${escapeHtml(it.unit || 'шт')}`;
-    const price = it.price_cents ? ` × ${money(it.price_cents)} ${cur}` : '';
-    const sum = it.sum_cents ? ` = <b>${money(it.sum_cents)} ${cur}</b>` : '';
-    return `<div class="order-item">• ${escapeHtml(it.name)}: ${qty}${price}${sum}</div>`;
+    const meta = it.price_cents ? `${qty} × ${money(it.price_cents)} ${cur}` : qty;
+    // Сумма позиции: у отгрузки её считает сервер, у заказа — количество × цену.
+    const sumCents = it.sum_cents != null
+      ? it.sum_cents
+      : Math.round((it.price_cents || 0) * (it.quantity || 0));
+    return `
+      <div class="items-row">
+        <div class="items-info">
+          <div class="items-name">${escapeHtml(it.name)}</div>
+          <div class="items-meta">${meta}</div>
+        </div>
+        <div class="items-sum">${sumCents ? `${money(sumCents)} ${cur}` : '—'}</div>
+      </div>`;
   }).join('');
+  // Итог печатаем, только когда позиций больше одной: под единственной строкой
+  // он дословно её повторяет.
+  const total = items.reduce(
+    (s, it) => s + (it.sum_cents != null ? it.sum_cents : Math.round((it.price_cents || 0) * (it.quantity || 0))),
+    0,
+  );
+  const totalRow = items.length > 1 && total
+    ? `<div class="items-total"><span>Итого · ${items.length} поз.</span><b>${money(total)} ${cur}</b></div>`
+    : '';
+  return `<div class="items-box">${rows}${totalRow}</div>`;
+}
+
+function shipmentItemsHtml(res) {
+  return itemsBoxHtml(res.positions, res.currency, { empty: 'В отгрузке нет позиций' });
 }
 
 // Карточка контрагента: МС-баланс + локальный долг/лимит (правится) + покупки из
@@ -3979,19 +4391,8 @@ async function renderAgentDetail(agentId) {
   // же ответе (их всё равно грузят ради суммы), поэтому раскрытие ничего не
   // запрашивает и работает мгновенно даже без сети.
   const orders = d.orders || [];
-  const orderItemsHtml = (o) => {
-    const items = o.items || [];
-    if (!items.length) return '<div class="order-item">Позиции не добавлены</div>';
-    const cur = escapeHtml(o.currency || baseC);
-    return items.map(it => {
-      const qty = `${formatMoney(it.quantity)} ${escapeHtml(it.unit || 'шт')}`;
-      const price = it.price_cents ? ` × ${fmtCents(it.price_cents)} ${cur}` : '';
-      const sum = it.price_cents
-        ? ` = <b>${fmtCents(Math.round(it.price_cents * (it.quantity || 0)))} ${cur}</b>`
-        : '';
-      return `<div class="order-item">• ${escapeHtml(it.name)}: ${qty}${price}${sum}</div>`;
-    }).join('');
-  };
+  const orderItemsHtml = (o) =>
+    itemsBoxHtml(o.items, o.currency || baseC, { empty: 'Позиции не добавлены' });
   const ordersRows = orders.map(o =>
     `<div class="c-row c-row--tap" data-order-open="${o.id}" data-status="${escapeHtml(o.status || '')}" role="button" tabindex="0" aria-expanded="false">` +
     `<div class="card-row-info">` +

@@ -29,9 +29,10 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import logging
 import re
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Any
 
 from services import adb_core, money
@@ -347,6 +348,43 @@ async def update_machine_fields(
     return {"ok": True}
 
 
+async def change_vin(
+    machine_id: int, new_vin: str, *, user_id: int, full_name: str = ""
+) -> dict:
+    """Исправить серийный номер машины.
+
+    Отдельно от `update_machine_fields`, а не полем в его whitelist: у VIN свои
+    правила — нормализация и уникальность. В общем списке правимых полей он бы
+    их не получил, а UNIQUE-нарушение прилетело бы пользователю текстом драйвера.
+
+    Смена VIN — не рядовая правка: карточка после неё описывает другую машину,
+    поэтому в аудит уходит переход «старый → новый».
+    """
+    vin_norm = normalize_vin(new_vin)
+    if not vin_norm:
+        return {"ok": False, "error": "VIN обязателен"}
+    current = await adb_core.fetchrow("SELECT vin FROM machines WHERE id = $1", machine_id)
+    if not current:
+        return {"ok": False, "error": "Машина не найдена"}
+    if current["vin"] == vin_norm:
+        # Не ошибка: пользователь открыл форму и сохранил, ничего не изменив.
+        return {"ok": True, "vin": vin_norm, "changed": False}
+    clash = await adb_core.fetchrow(
+        "SELECT id FROM machines WHERE vin = $1 AND id <> $2", vin_norm, machine_id
+    )
+    if clash:
+        return {"ok": False, "error": f"Машина с VIN {vin_norm} уже заведена"}
+    await adb_core.execute(
+        "UPDATE machines SET vin = $1, updated_at = $2 WHERE id = $3",
+        vin_norm, now_str(), machine_id,
+    )
+    await _audit(
+        user_id, full_name, "machine_vin_changed",
+        f"#{machine_id}: {current['vin']} → {vin_norm}",
+    )
+    return {"ok": True, "vin": vin_norm, "changed": True, "previous": current["vin"]}
+
+
 async def set_status(
     machine_id: int,
     new_status: str,
@@ -524,6 +562,153 @@ async def delete_photo(photo_id: int) -> dict:
 # ─── Сделки ──────────────────────────────────────────────────────────────────
 
 
+_MAX_MONTHS = 120
+
+
+def _add_months(base: date, months: int) -> date:
+    """Та же дата через N месяцев, с прижатием к концу короткого месяца.
+
+    Сделка 31 января с помесячным графиком иначе не имеет февральского платежа
+    вовсе: `date(2026, 2, 31)` не существует. Прижимаем к 28/29 — так же
+    считают банки, и платёж не выпадает из графика.
+    """
+    total = base.month - 1 + months
+    year = base.year + total // 12
+    month = total % 12 + 1
+    day = min(base.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def build_schedule(
+    price_cents: int, down_payment_cents: int, months: int, start: date
+) -> list[dict]:
+    """График рассрочки: взнос (seq 0) + `months` ежемесячных платежей.
+
+    Остаток делится поровну, а копейки от деления уходят в ПОСЛЕДНИЙ платёж:
+    сумма графика обязана сойтись с ценой до копейки, иначе рассрочка закроется
+    с «хвостом» в пару копеек, который никто не поймёт.
+    """
+    rest = price_cents - down_payment_cents
+    base = rest // months
+    schedule = []
+    if down_payment_cents:
+        schedule.append({"seq": 0, "due_date": start.isoformat(),
+                         "amount_cents": down_payment_cents, "prepaid": True})
+    for i in range(1, months + 1):
+        amount = base if i < months else rest - base * (months - 1)
+        schedule.append({
+            "seq": i,
+            "due_date": _add_months(start, i).isoformat(),
+            "amount_cents": amount,
+            "prepaid": False,
+        })
+    return schedule
+
+
+def validate_installment(price_cents: int, down_payment_cents: int, months: int) -> str:
+    """Проверка условий рассрочки. Пустая строка — всё в порядке."""
+    if not isinstance(months, int) or months < 1 or months > _MAX_MONTHS:
+        return f"Срок рассрочки — от 1 до {_MAX_MONTHS} месяцев"
+    if down_payment_cents < 0:
+        return "Первоначальный взнос не может быть отрицательным"
+    if down_payment_cents >= price_cents:
+        # Взнос во всю цену — это продажа, а не рассрочка: график был бы пустым.
+        return "Взнос не может покрывать всю цену — это продажа"
+    return ""
+
+
+async def get_schedule(deal_id: int) -> list[dict]:
+    rows = await adb_core.fetch(
+        "SELECT * FROM machine_deal_payments WHERE deal_id = $1 ORDER BY seq", deal_id
+    )
+    return [dict(r) for r in rows]
+
+
+async def pay_installment(
+    payment_id: int, *, user_id: int, full_name: str = "", paid: bool = True
+) -> dict:
+    """Отметить платёж графика полученным (или снять отметку).
+
+    CAS по `paid_at`: два «оплачен» подряд с двух телефонов не должны разойтись
+    с тем, что видно на экране, — второй получает отказ и перечитывает карточку.
+    """
+    row = await adb_core.fetchrow(
+        "SELECT p.*, d.machine_id FROM machine_deal_payments p "
+        "JOIN machine_deals d ON d.id = p.deal_id WHERE p.id = $1",
+        payment_id,
+    )
+    if not row:
+        return {"ok": False, "error": "Платёж не найден"}
+    if int(row["seq"]) == 0:
+        return {"ok": False, "error": "Первоначальный взнос уже получен"}
+    if paid:
+        changed = await adb_core.execute(
+            "UPDATE machine_deal_payments SET paid_at = $1, paid_by = $2 "
+            "WHERE id = $3 AND paid_at IS NULL",
+            now_str(), user_id, payment_id,
+        )
+        if not changed:
+            return {"ok": False, "error": "Платёж уже отмечен оплаченным",
+                    "current": "paid"}
+    else:
+        changed = await adb_core.execute(
+            "UPDATE machine_deal_payments SET paid_at = NULL, paid_by = NULL "
+            "WHERE id = $1 AND paid_at IS NOT NULL",
+            payment_id,
+        )
+        if not changed:
+            return {"ok": False, "error": "Платёж и так не отмечен", "current": "unpaid"}
+
+    await _audit(
+        user_id, full_name,
+        "machine_payment_paid" if paid else "machine_payment_unpaid",
+        f"сделка #{row['deal_id']} · платёж {row['seq']} · "
+        f"{money.format_cents(int(row['amount_cents']))}",
+    )
+    # Все платежи получены — рассрочка закрыта, машина «продана». Закрывать
+    # руками после последнего платежа значит однажды забыть это сделать.
+    rest = await adb_core.fetchval(
+        "SELECT COUNT(*) FROM machine_deal_payments WHERE deal_id = $1 AND paid_at IS NULL",
+        row["deal_id"],
+    )
+    if paid and not int(rest or 0):
+        await close_deal(int(row["deal_id"]), user_id=user_id, full_name=full_name)
+        return {"ok": True, "deal_closed": True}
+    return {"ok": True, "deal_closed": False}
+
+
+async def due_installments(today: str) -> list[dict]:
+    """Платежи, о которых пора напомнить: срок наступил, деньги не получены,
+    напоминание ещё не уходило.
+
+    `due_date <= today`, а не `= today`: если ежедневный прогон пропустил день
+    (деплой, сбой), напоминание всё равно должно уйти — иначе платёж молча
+    проваливается.
+    """
+    rows = await adb_core.fetch(
+        "SELECT p.*, d.machine_id, d.buyer_name, d.currency, d.created_by, "
+        "       m.name AS machine_name, m.vin "
+        "FROM machine_deal_payments p "
+        "JOIN machine_deals d ON d.id = p.deal_id "
+        "JOIN machines m ON m.id = d.machine_id "
+        "WHERE p.seq > 0 AND p.paid_at IS NULL AND p.notified_at IS NULL "
+        "      AND p.due_date <= $1 AND d.closed_at IS NULL "
+        "ORDER BY p.due_date",
+        today,
+    )
+    return [dict(r) for r in rows]
+
+
+async def mark_installment_notified(payment_id: int) -> bool:
+    """Пометить напоминание отправленным. Атомарно: два прогона (ретрай cron'а,
+    второй процесс) не должны прислать одно и то же дважды."""
+    return bool(await adb_core.execute(
+        "UPDATE machine_deal_payments SET notified_at = $1 "
+        "WHERE id = $2 AND notified_at IS NULL",
+        now_str(), payment_id,
+    ))
+
+
 async def create_deal(
     machine_id: int,
     *,
@@ -538,13 +723,19 @@ async def create_deal(
     buyer_note: str | None = None,
     order_id: int | None = None,
     agent_ms_id: str | None = None,
-    due_date: str | None = None,
+    down_payment_cents: int = 0,
+    months: int = 0,
 ) -> dict:
     """Оформить продажу или рассрочку.
 
     Статус машины меняем тем же CAS'ом в одной транзакции со вставкой сделки:
     иначе два одновременных «продал» создали бы две сделки на одну машину, и
     обе выглядели бы успешными.
+
+    Рассрочке нужны первоначальный взнос и срок в месяцах — график строится сам
+    (`build_schedule`) и пишется той же транзакцией. Дату последнего платежа
+    (`due_date` сделки) считаем, а не спрашиваем: введённая руками, она рано
+    или поздно разошлась бы с графиком.
     """
     if kind not in DEAL_KINDS:
         return {"ok": False, "error": f"Тип сделки: {' / '.join(DEAL_KINDS)}"}
@@ -555,8 +746,15 @@ async def create_deal(
         return {"ok": False, "error": "Цена сделки обязательна"}
     if not (buyer_name or "").strip():
         return {"ok": False, "error": "Покупатель обязателен"}
-    if kind == "credit" and not due_date:
-        return {"ok": False, "error": "Для рассрочки нужен срок оплаты"}
+
+    schedule: list[dict] = []
+    due_date: str | None = None
+    if kind == "credit":
+        err = validate_installment(price_cents, down_payment_cents, months)
+        if err:
+            return {"ok": False, "error": err}
+        schedule = build_schedule(price_cents, down_payment_cents, months, local_now().date())
+        due_date = schedule[-1]["due_date"]
 
     new_status = "sold" if kind == "sale" else "on_credit"
     stamp = now_str()
@@ -588,12 +786,33 @@ async def create_deal(
         else:
             await txn.execute(sql, *values)
             deal_id = await txn.fetchval("SELECT last_insert_rowid()")
+        # График — той же транзакцией: сделка без графика это рассрочка, о
+        # сроках которой никто не узнает.
+        for row in schedule:
+            await txn.execute(
+                "INSERT INTO machine_deal_payments (deal_id, seq, due_date, amount_cents, "
+                "paid_at, paid_by, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                deal_id, row["seq"], row["due_date"], row["amount_cents"],
+                # Взнос уже получен — помечаем оплаченным сразу, иначе он
+                # попадёт в напоминания о просрочке в тот же день.
+                stamp if row["prepaid"] else None,
+                created_by if row["prepaid"] else None,
+                stamp,
+            )
 
     await _audit(
         created_by, creator_name, "machine_deal_created",
-        f"#{machine_id} · {kind} · {money.format_cents(price_cents)} {currency} · {buyer_name}",
+        f"#{machine_id} · {kind} · {money.format_cents(price_cents)} {currency} · {buyer_name}"
+        + (f" · взнос {money.format_cents(down_payment_cents)}, {months} мес."
+           if kind == "credit" else ""),
     )
-    return {"ok": True, "deal_id": int(deal_id), "status": new_status}
+    return {
+        "ok": True,
+        "deal_id": int(deal_id),
+        "status": new_status,
+        "due_date": due_date,
+        "payments": len([r for r in schedule if not r["prepaid"]]),
+    }
 
 
 async def close_deal(deal_id: int, *, user_id: int, full_name: str = "") -> dict:

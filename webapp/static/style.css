@@ -1217,6 +1217,46 @@ body {
   padding: 2px 0;
 }
 
+/* ─── Раскрытый состав (заказ, отгрузка) ─────────────────────────────────────
+   Позиции печатались списком «• Товар: 16 шт × 360 USD = 5 760 USD» тем же
+   мелким серым текстом, что и подзаголовок строки: состав не отличался от
+   строки, которую раскрыли, а суммы не выстраивались в колонку — сравнить их
+   глазами было нельзя. Теперь это вложенная поверхность с колонкой сумм. */
+.items-box {
+  background: var(--bg-soft);
+  border-radius: var(--radius-sm);
+  margin: 0 var(--sp-3) var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+}
+.items-row {
+  display: flex; align-items: baseline; gap: var(--sp-3);
+  padding: var(--sp-2) 0;
+}
+.items-row + .items-row { border-top: 0.5px solid var(--divider); }
+.items-info { flex: 1; min-width: 0; }
+.items-name {
+  font-size: var(--text-sm); color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.items-meta { font-size: var(--text-xs); color: var(--text-mute); margin-top: 1px; }
+.items-sum {
+  flex-shrink: 0; font-size: var(--text-sm); font-weight: 600;
+  color: var(--text); white-space: nowrap;
+  /* Табличные цифры: иначе разряды в колонке не совпадают по ширине и суммы
+     не читаются столбиком. */
+  font-variant-numeric: tabular-nums;
+}
+.items-total {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: var(--sp-3); padding: var(--sp-2) 0 var(--sp-1);
+  border-top: 0.5px solid var(--divider);
+  font-size: var(--text-sm); color: var(--text-mute);
+}
+.items-total b { color: var(--text); font-variant-numeric: tabular-nums; }
+.items-empty {
+  padding: var(--sp-2) 0; font-size: var(--text-sm); color: var(--text-mute);
+}
+
 .requests-btn {
   width: 100%;
   padding: 12px;
@@ -1958,6 +1998,39 @@ body {
    ширины — их бывает до пяти (моточасы, правка, статус, продажа, рассрочка). */
 .c-actions--wrap { flex-wrap: wrap; margin-bottom: var(--sp-3); }
 .c-actions--wrap button { flex: 1 1 46%; min-height: 44px; }
+/* Необратимое действие в общем ряду: цвет предупреждает до нажатия, а не
+   только текстом в диалоге подтверждения. */
+.btn-danger { color: var(--danger); }
+
+/* ─── График рассрочки ───────────────────────────────────────────────────── */
+.schedule-total {
+  padding: 0 var(--sp-1) var(--sp-2);
+  border-top: 0;
+}
+/* Отметка «получен» прямо в строке графика: уводить её в отдельный экран
+   значит делать три тапа там, где хватает одного. */
+.pay-toggle {
+  flex-shrink: 0;
+  width: 44px; min-height: 44px;
+  margin-left: var(--sp-2);
+  padding: 0; border: 0; border-radius: var(--radius-sm);
+  background: var(--status-bg); color: var(--status-c);
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer;
+}
+.pay-toggle .ic { --ic-size: 20px; }
+
+/* Поле фактического количества прямо в строке состава: приёмщик считает
+   подряд и не должен открывать диалог на каждую позицию. */
+.qty-input {
+  flex-shrink: 0; width: 76px; min-height: 44px;
+  padding: 8px 10px; font-size: 16px; text-align: right;
+  border: 1px solid var(--divider); border-radius: var(--radius-sm);
+  background: var(--bg-page); color: var(--text);
+  outline: none; font-family: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.qty-input:focus { border-color: var(--accent); }
 
 /* Лента фотографий машины: горизонтальная прокрутка, квадратные превью.
    Снимки приходят с телефона в любой ориентации — object-fit: cover не даёт
