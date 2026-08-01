@@ -144,14 +144,103 @@
   // Набор вкладок раздела «Финансы» по роли — чистая функция (тестируется).
   // Плоская навигация: ≤4 вкладки на любую роль, чтобы ряд не переносился.
   // «Обзор» переехал в Аналитику→Деньги; «Мои сдачи» свёрнуты в «Платежи и сдачи».
-  function financeTabs(f) {
+  // ─── Разделы и их вкладки ──────────────────────────────────────────────────
+  //
+  // Правило структуры: раздел — это ПРЕДМЕТ, о котором думает человек, а не
+  // отдел, который им занимается. Поэтому «Аналитики» как раздела нет: каждая
+  // цифра лежит вкладкой «Отчёт» внутри того раздела, который она описывает.
+  // Раздельность «данные тут, отчёт о них там» и была причиной, по которой
+  // воронку обращений нельзя было найти, не зная заранее, где она.
+  //
+  // Роли режем ПО МАТРИЦЕ РУЧЕК (UI_QA_ROLES.md), а не по вкусу: таб, который
+  // гарантированно ответит 403, — это дверь, которая не открывается.
+  const NAV_SECTIONS = [
+    { key: 'today',   label: 'Сегодня',  icon: 'home',
+      roles: ['admin', 'boss', 'manager'] },
+    { key: 'sales',   label: 'Продажи',  icon: 'cart',
+      roles: ['admin', 'boss', 'manager', 'warehouse_keeper', 'bookkeeper'] },
+    { key: 'stock',   label: 'Склад',    icon: 'box',
+      roles: ['admin', 'boss', 'manager'] },
+    { key: 'money',   label: 'Деньги',   icon: 'wallet',
+      roles: ['admin', 'boss', 'manager', 'warehouse_keeper', 'bookkeeper'] },
+    { key: 'clients', label: 'Клиенты',  icon: 'user',
+      roles: ['admin', 'boss', 'manager'] },
+  ];
+
+  function navSections(role) {
+    return NAV_SECTIONS.filter((s) => s.roles.indexOf(role) !== -1);
+  }
+
+  // Экран по умолчанию для роли: первый доступный ей раздел. У кладовщика нет
+  // «Сегодня» (ручка /api/home ему не отвечает), и открывать его на экране с
+  // ошибкой — худшее, что можно сделать при входе.
+  function defaultSection(role) {
+    const list = navSections(role);
+    return list.length ? list[0].key : null;
+  }
+
+  // Продажи: заказы и отчёт по ним. Каталог отсюда уехал на «Склад» — как
+  // отдельный экран это остатки, а внутри заказа товар выбирают в форме.
+  function salesTabs(f) {
+    f = f || {};
+    const tabs = [{ key: 'orders', label: 'Заказы' }];
+    if (f.canSeeReport) tabs.push({ key: 'report', label: 'Отчёт' });
+    return tabs;
+  }
+
+  // Склад: всё, что физически лежит или едет. Контейнер в пути — это склад,
+  // который ещё не приехал.
+  function stockTabs(f) {
+    f = f || {};
+    const tabs = [{ key: 'catalog', label: 'Каталог' }];
+    if (f.canSeeGoods) {
+      tabs.push({ key: 'containers', label: 'Контейнеры' });
+      tabs.push({ key: 'machines', label: 'Техника' });
+    }
+    return tabs;
+  }
+
+  // Деньги: бывшие «Финансы» + бывшая «Аналитика → Деньги». Долги и дебиторка —
+  // один предмет, и держать их в разных разделах значило требовать от человека
+  // знать, в каком именно.
+  function moneyTabs(f) {
     f = f || {};
     const tabs = [];
-    if (f.isConfirmer) tabs.push({ key: 'confirm', label: 'Подтверждения' });
-    tabs.push({ key: 'debts', label: 'Долги' });
-    if (f.hasOps) tabs.push({ key: 'ops', label: 'Платежи и сдачи' });
-    if (f.isBoss) tabs.push({ key: 'limits', label: 'Клиенты' });
+    if (f.isConfirmer) tabs.push({ key: 'confirm', label: 'Подтвердить' });
+    if (f.canSeeDebts) tabs.push({ key: 'debts', label: 'Долги' });
+    if (f.hasOps) tabs.push({ key: 'ops', label: 'Касса' });
+    if (f.isBoss) tabs.push({ key: 'report', label: 'Отчёт' });
     return tabs;
+  }
+
+  // Клиенты: всё про отношения с покупателем. Воронка переехала сюда из отчёта
+  // о деньгах — переписка с клиентом не деньги.
+  function clientsTabs(f) {
+    f = f || {};
+    const tabs = [{ key: 'funnel', label: 'Воронка' }];
+    if (f.isBoss) {
+      tabs.push({ key: 'limits', label: 'Лимиты' });
+      tabs.push({ key: 'channel', label: 'Канал' });
+    }
+    return tabs;
+  }
+
+  // Под-навигация раздела — ОДИН вид на все пять разделов. Раньше «Заказы»
+  // рисовали .seg, а «Финансы» — .subseg, хотя уровень вложенности одинаковый.
+  // Шелл обязан входить в КАЖДЫЙ innerHTML ветки (UI-BUG-04), включая скелетон
+  // и ошибку, иначе первый же ре-рендер уносит переключатель.
+  function sectionNavHtml(tabs, active) {
+    tabs = tabs || [];
+    if (tabs.length < 2) return '';
+    const scroll = tabs.length > 3 ? ' seg--scroll' : '';
+    const items = tabs.map((t) => {
+      const on = t.key === active;
+      const badge = t.badge
+        ? ` <span class="stock-badge badge-yellow">${escapeHtml(String(t.badge))}</span>` : '';
+      return `<button class="seg-item ${on ? 'active' : ''}" data-sect="${escapeHtml(t.key)}" ` +
+             `aria-pressed="${on}">${escapeHtml(t.label)}${badge}</button>`;
+    }).join('');
+    return `<div class="seg-row"><div class="seg${scroll}">${items}</div></div>`;
   }
 
   // Рендер блока «Итоги» раздела «Деньги» (данные /api/money/summary):
@@ -494,7 +583,9 @@
 
   return {
     escapeHtml, idemKey, formatDateRU, icon, opsAmount,
-    renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml, financeTabs,
+    renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml,
+    NAV_SECTIONS, navSections, defaultSection, sectionNavHtml,
+    salesTabs, stockTabs, moneyTabs, clientsTabs,
     balanceParts, periodSegHtml, rangeLabel, formatMoney, msBalanceLabel,
     emptyState, skeleton, errorBoxHtml,
     machineStatusLabel, machineSubtitle, machineStatusSegHtml,

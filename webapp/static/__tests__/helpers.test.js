@@ -8,7 +8,8 @@ import helpers from '../helpers.js';
 
 const {
   escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml,
-  parsePaymentItems, renderMoneyTotalsHtml, financeTabs, balanceParts, periodSegHtml, rangeLabel,
+  parsePaymentItems, renderMoneyTotalsHtml, balanceParts, periodSegHtml, rangeLabel,
+  navSections, defaultSection, sectionNavHtml, salesTabs, stockTabs, moneyTabs, clientsTabs,
   formatMoney, msBalanceLabel, emptyState, skeleton, errorBoxHtml,
   machineStatusLabel, machineSubtitle, machineStatusSegHtml,
   moneyBlockLabel, agingBarsHtml, forecastRowsHtml, buyerKey, leadFunnelHtml,
@@ -278,34 +279,99 @@ describe('renderMoneyTotalsHtml', () => {
   });
 });
 
-describe('financeTabs', () => {
-  const keys = (f) => financeTabs(f).map(t => t.key);
-  it('boss: 4 вкладки, без overview/my', () => {
-    const t = financeTabs({ isBoss: true, isConfirmer: true, hasOps: true, canDeposit: false });
-    expect(t.map(x => x.key)).toEqual(['confirm', 'debts', 'ops', 'limits']);
-    expect(t.find(x => x.key === 'ops').label).toBe('Платежи и сдачи');
+describe('вкладки разделов', () => {
+  const keys = (fn, f) => fn(f).map(t => t.key);
+
+  it('Деньги у руководителя: подтвердить/долги/касса/отчёт', () => {
+    expect(keys(moneyTabs, { isBoss: true, isConfirmer: true, canSeeDebts: true, hasOps: true }))
+      .toEqual(['confirm', 'debts', 'ops', 'report']);
   });
-  it('bookkeeper (confirmer, не босс): confirm/debts/ops', () => {
-    expect(keys({ isBoss: false, isConfirmer: true, hasOps: true, canDeposit: false }))
-      .toEqual(['confirm', 'debts', 'ops']);
+
+  it('бухгалтер видит только то, на что у него есть ручки', () => {
+    // /api/deposits/* ему отвечают, /api/debts и /api/money/summary — нет.
+    expect(keys(moneyTabs, { isBoss: false, isConfirmer: true, canSeeDebts: false, hasOps: false }))
+      .toEqual(['confirm']);
   });
-  it('manager (не confirmer): только debts/ops', () => {
-    expect(keys({ isBoss: false, isConfirmer: false, hasOps: true, canDeposit: true }))
+
+  it('менеджер: долги и касса, без подтверждений и отчёта', () => {
+    expect(keys(moneyTabs, { isBoss: false, isConfirmer: false, canSeeDebts: true, hasOps: true }))
       .toEqual(['debts', 'ops']);
   });
-  it('любая роль — не больше 4 вкладок и без overview/my (страховка от переноса)', () => {
-    const roles = [
-      { isBoss: true, isConfirmer: true, hasOps: true, canDeposit: false },
-      { isBoss: false, isConfirmer: true, hasOps: true, canDeposit: true },
-      { isBoss: false, isConfirmer: false, hasOps: true, canDeposit: true },
-      { isBoss: false, isConfirmer: false, hasOps: false, canDeposit: false },
+
+  it('Продажи: отчёт только тем, кому отвечает /api/analytics', () => {
+    expect(keys(salesTabs, { canSeeReport: true })).toEqual(['orders', 'report']);
+    expect(keys(salesTabs, { canSeeReport: false })).toEqual(['orders']);
+  });
+
+  it('Склад: контейнеры и техника — та же тройка ролей, что у их ручек', () => {
+    expect(keys(stockTabs, { canSeeGoods: true })).toEqual(['catalog', 'containers', 'machines']);
+    expect(keys(stockTabs, { canSeeGoods: false })).toEqual(['catalog']);
+  });
+
+  it('Клиенты: воронка всем, лимиты и канал — руководству', () => {
+    expect(keys(clientsTabs, { isBoss: true })).toEqual(['funnel', 'limits', 'channel']);
+    expect(keys(clientsTabs, { isBoss: false })).toEqual(['funnel']);
+  });
+
+  it('ни один раздел не даёт больше 4 вкладок', () => {
+    // Пятая не влезает в ряд на 360dp и уезжает в скролл, который не виден.
+    const all = [
+      moneyTabs({ isBoss: true, isConfirmer: true, canSeeDebts: true, hasOps: true }),
+      salesTabs({ canSeeReport: true }),
+      stockTabs({ canSeeGoods: true }),
+      clientsTabs({ isBoss: true }),
     ];
-    for (const r of roles) {
-      const k = keys(r);
-      expect(k.length).toBeLessThanOrEqual(4);
-      expect(k).not.toContain('overview');
-      expect(k).not.toContain('my');
-    }
+    for (const t of all) expect(t.length).toBeLessThanOrEqual(4);
+  });
+});
+
+describe('разделы нижней панели', () => {
+  it('руководитель видит все пять', () => {
+    expect(navSections('boss').map(s => s.key))
+      .toEqual(['today', 'sales', 'stock', 'money', 'clients']);
+  });
+
+  it('кладовщик не видит «Сегодня» — /api/home ему не отвечает', () => {
+    // Таб, который гарантированно вернёт 403, — дверь, которая не открывается.
+    expect(navSections('warehouse_keeper').map(s => s.key)).toEqual(['sales', 'money']);
+  });
+
+  it('бухгалтеру тоже, и стартует он не с несуществующего экрана', () => {
+    expect(navSections('bookkeeper').map(s => s.key)).toEqual(['sales', 'money']);
+    expect(defaultSection('bookkeeper')).toBe('sales');
+    expect(defaultSection('boss')).toBe('today');
+  });
+
+  it('у guest разделов нет вовсе', () => {
+    expect(navSections('guest')).toEqual([]);
+    expect(defaultSection('guest')).toBeNull();
+  });
+});
+
+describe('sectionNavHtml', () => {
+  const tabs = [{ key: 'orders', label: 'Заказы' }, { key: 'report', label: 'Отчёт' }];
+
+  it('активная вкладка получает .active и aria-pressed', () => {
+    const html = sectionNavHtml(tabs, 'report');
+    expect(html).toContain('class="seg-item active" data-sect="report"');
+    expect(html).toContain('data-sect="report" aria-pressed="true"');
+    expect(html).toContain('data-sect="orders" aria-pressed="false"');
+  });
+
+  it('одна вкладка — переключателя нет: нечего переключать', () => {
+    expect(sectionNavHtml([{ key: 'orders', label: 'Заказы' }], 'orders')).toBe('');
+    expect(sectionNavHtml([], 'x')).toBe('');
+  });
+
+  it('четыре вкладки уезжают в скролл, а не сплющиваются (UI-BUG-01)', () => {
+    const four = tabs.concat([{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }]);
+    expect(sectionNavHtml(four, 'orders')).toContain('seg seg--scroll');
+    expect(sectionNavHtml(tabs, 'orders')).not.toContain('seg--scroll');
+  });
+
+  it('бейдж рисуется числом и экранируется', () => {
+    const html = sectionNavHtml([{ key: 'confirm', label: 'Подтвердить', badge: 3 }, tabs[0]], 'confirm');
+    expect(html).toContain('stock-badge badge-yellow">3<');
   });
 });
 

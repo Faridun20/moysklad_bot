@@ -12,7 +12,11 @@ const STATIC = path.resolve(process.cwd(), 'webapp', 'static');
 const read = (f) => fs.readFileSync(path.join(STATIC, f), 'utf8');
 
 function makeWindow() {
-  const dom = new JSDOM('<!DOCTYPE html><body><div id="content"></div></body>', {
+  // Каркас как в index.html: нижняя панель — пустой контейнер, кнопки в него
+  // кладёт buildNav под роль пользователя.
+  const dom = new JSDOM(
+    '<!DOCTYPE html><body><div id="content"></div>'
+    + '<nav class="bottom-nav" id="bottom-nav"></nav></body>', {
     url: 'https://example.org/',
     runScripts: 'outside-only',
     pretendToBeVisual: true,
@@ -75,35 +79,36 @@ function boot(driver = '') {
   return window;
 }
 
-describe('под-вкладки Заказы/Каталог переживают ре-рендер (UI-BUG-04)', () => {
+describe('вкладки раздела переживают ре-рендер (UI-BUG-04)', () => {
   // Регресс: шелл вставлялся поверх готового DOM через insertAdjacentHTML, и
   // любой полный ре-рендер внутри вкладки (смена статуса, выбор периода,
   // ошибка сети) переписывал innerHTML и уносил его вместе с обработчиками —
-  // пользователь не мог уйти в Каталог, не выходя из раздела.
+  // пользователь не мог уйти в соседнюю вкладку, не выходя из раздела.
   it('шелл входит в шаблон, а не накладывается сверху', () => {
-    const window = boot();
-    const html = window.ordersShellHtml();
-    expect(html).toContain('data-sub="orders"');
-    expect(html).toContain('data-sub="stock"');
+    const window = boot("currentUser = { role: 'boss' };");
+    const html = window.salesShellHtml();
+    expect(html).toContain('data-sect="orders"');
+    expect(html).toContain('data-sect="report"');
   });
 
   it('после полного ре-рендера списка заказов вкладки на месте', () => {
-    const window = boot('ordersData = { orders: [], role: "manager" }; renderOrdersMain();');
+    const window = boot(`currentUser = { role: 'manager' };
+      ordersData = { orders: [], role: "manager" }; renderOrdersMain();`);
     const content = window.document.getElementById('content');
-    expect(content.querySelector('[data-sub="stock"]')).not.toBeNull();
-    expect(content.querySelector('[data-sub="orders"]')).not.toBeNull();
+    expect(content.querySelector('[data-sect="orders"]')).not.toBeNull();
+    expect(content.querySelector('[data-sect="report"]')).not.toBeNull();
   });
 
   it('вкладки остаются даже когда экран показывает ошибку сети', () => {
-    const window = boot();
+    const window = boot("currentUser = { role: 'boss' };");
     const content = window.document.getElementById('content');
-    content.innerHTML = window.ordersShellHtml() + window.errorBox('Нет подключения к интернету');
-    expect(content.querySelector('[data-sub="orders"]')).not.toBeNull();
+    content.innerHTML = window.salesShellHtml() + window.errorBox('Нет подключения к интернету');
+    expect(content.querySelector('[data-sect="orders"]')).not.toBeNull();
     expect(content.textContent).toContain('Нет подключения');
   });
 });
 
-describe('под-вкладка «Техника»', () => {
+describe('«Склад» → вкладка «Техника»', () => {
   const LIST = {
     ok: true,
     machines: [{ id: 7, name: 'JCB 3CX', vin: 'JCB7788', status: 'in_stock', hours: 15200,
@@ -116,20 +121,20 @@ describe('под-вкладка «Техника»', () => {
     currentUser = { role: '${role}' };
     window.__calls = [];
     api = async (path, body) => { window.__calls.push([path, body]); return ${JSON.stringify(LIST)}; };
-    ordersSubTab = 'machines';
-    window.__ready = renderOrdersScreen();
+    stockTab = 'machines';
+    window.__ready = renderStockScreen();
   `;
 
   it('вкладка есть у менеджера и выше', () => {
     const window = boot("currentUser = { role: 'manager' };");
-    expect(window.ordersShellHtml()).toContain('data-sub="machines"');
+    expect(window.stockShellHtml()).toContain('data-sect="machines"');
   });
 
   it('роли без доступа к ручке вкладку не видят', () => {
     // Ручки /api/machines/* отвечают 403 бухгалтеру и кладовщику — вкладка,
     // которая гарантированно упадёт, только сбивает с толку.
     const window = boot("currentUser = { role: 'bookkeeper' };");
-    expect(window.ordersShellHtml()).not.toContain('data-sub="machines"');
+    expect(window.stockShellHtml()).not.toContain('data-sect="machines"');
   });
 
   it('и не могут в неё попасть в обход переключателя', async () => {
@@ -137,8 +142,9 @@ describe('под-вкладка «Техника»', () => {
       currentUser = { role: 'bookkeeper' };
       window.__calls = [];
       api = async (p) => { window.__calls.push(p); return { ok: true, orders: [], role: 'bookkeeper' }; };
-      ordersSubTab = 'machines';
-      window.__ready = renderOrdersScreen();
+      window.fetch = (p) => { window.__calls.push(p); return Promise.reject(new Error('нет сети')); };
+      stockTab = 'machines';
+      window.__ready = renderStockScreen();
     `);
     await window.__ready;
     expect(window.__calls.some(p => String(p).includes('/api/machines/'))).toBe(false);
@@ -148,8 +154,8 @@ describe('под-вкладка «Техника»', () => {
     const window = boot(driver());
     await window.__ready;
     const content = window.document.getElementById('content');
-    expect(content.querySelector('[data-sub="machines"]')).not.toBeNull();
-    expect(content.querySelector('[data-sub="orders"]')).not.toBeNull();
+    expect(content.querySelector('[data-sect="machines"]')).not.toBeNull();
+    expect(content.querySelector('[data-sect="catalog"]')).not.toBeNull();
     expect(content.textContent).toContain('JCB 3CX');
     expect(content.querySelector('[data-machine="7"]').dataset.status).toBe('in_stock');
   });
@@ -158,12 +164,12 @@ describe('под-вкладка «Техника»', () => {
     const window = boot(`
       currentUser = { role: 'boss' };
       api = async () => { throw new Error('Нет подключения к интернету'); };
-      ordersSubTab = 'machines';
-      window.__ready = renderOrdersScreen();
+      stockTab = 'machines';
+      window.__ready = renderStockScreen();
     `);
     await window.__ready;
     const content = window.document.getElementById('content');
-    expect(content.querySelector('[data-sub="machines"]')).not.toBeNull();
+    expect(content.querySelector('[data-sect="machines"]')).not.toBeNull();
     expect(content.textContent).toContain('Нет подключения');
   });
 
@@ -675,18 +681,18 @@ describe('контейнеры', () => {
   });
 
   it('вкладка есть у тех же ролей, что и техника', () => {
-    expect(boot("currentUser = { role: 'manager' };").ordersShellHtml())
-      .toContain('data-sub="containers"');
-    expect(boot("currentUser = { role: 'bookkeeper' };").ordersShellHtml())
-      .not.toContain('data-sub="containers"');
+    expect(boot("currentUser = { role: 'manager' };").stockShellHtml())
+      .toContain('data-sect="containers"');
+    expect(boot("currentUser = { role: 'bookkeeper' };").stockShellHtml())
+      .not.toContain('data-sect="containers"');
   });
 
   it('расхождение видно в списке — открывать каждый контейнер не нужно', async () => {
     const window = boot(`
       currentUser = { role: 'boss' };
       api = async () => (${JSON.stringify(LIST)});
-      ordersSubTab = 'containers';
-      window.__ready = renderOrdersScreen();
+      stockTab = 'containers';
+      window.__ready = renderStockScreen();
     `);
     await window.__ready;
     const content = window.document.getElementById('content');
@@ -694,8 +700,8 @@ describe('контейнеры', () => {
     // Контейнер с расхождением подсвечен как проблемный, а не как «прибыл».
     expect(content.querySelector('[data-container="3"]').dataset.status).toBe('rejected');
     expect(content.querySelector('[data-container="4"]').dataset.status).toBe('in_transit');
-    // Шелл под-вкладок на месте (UI-BUG-04).
-    expect(content.querySelector('[data-sub="orders"]')).not.toBeNull();
+    // Шелл вкладок раздела на месте (UI-BUG-04).
+    expect(content.querySelector('[data-sect="catalog"]')).not.toBeNull();
   });
 
   it('не сверенный прибывший контейнер так и подписан', async () => {
@@ -706,8 +712,8 @@ describe('контейнеры', () => {
         containers: [{ id: 5, number: 'X', status: 'arrived', arrived_at: '2026-08-12',
                        diff: { total: 3, unchecked: 3, short: 0, extra: 0, mismatch: 0 } }],
       })});
-      ordersSubTab = 'containers';
-      window.__ready = renderOrdersScreen();
+      stockTab = 'containers';
+      window.__ready = renderStockScreen();
     `);
     await window.__ready;
     expect(window.document.getElementById('content').textContent).toContain('не сверен');
@@ -1127,5 +1133,92 @@ describe('позиция контейнера: товар выбирают из 
     await settle();
     expect(window.__sent.name).toBe('Штекер тип C');
     expect(window.__sent.ms_id).toBe('');
+  });
+});
+
+describe('пять разделов вместо четырёх', () => {
+  const nav = (window) => Array.from(
+    window.document.querySelectorAll('#bottom-nav .nav-item')
+  ).map(b => b.dataset.screen);
+
+  it('нижняя панель строится под роль', () => {
+    const window = boot("currentUser = { role: 'boss' }; buildNav();");
+    expect(nav(window)).toEqual(['today', 'sales', 'stock', 'money', 'clients']);
+  });
+
+  it('кладовщику не рисуют дверь, которая не открывается', () => {
+    // /api/home отвечает только admin/boss/manager — «Сегодня» у кладовщика
+    // молча превращалась в экран с ошибкой.
+    const window = boot("currentUser = { role: 'warehouse_keeper' }; buildNav();");
+    expect(nav(window)).toEqual(['sales', 'money']);
+  });
+
+  it('старые адреса экранов продолжают работать', async () => {
+    // Ссылки из бота, пушей и закладок ведут на прежние имена. Алиас обязан
+    // перевести и на раздел, и на вкладку, куда содержимое переехало.
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      buildNav();
+      renderHome = async () => {}; renderSalesScreen = async () => {};
+      renderStockScreen = async () => {}; renderMoneyScreen = async () => {};
+      renderClientsScreen = async () => {};
+      window.__go = async (s) => { await showScreen(s); return [currentScreen, salesTab, stockTab, moneyTab, clientsTab]; };
+    `);
+    expect(await window.__go('home')).toEqual(['today', 'orders', 'catalog', 'confirm', 'funnel']);
+    expect((await window.__go('analytics')).slice(0, 2)).toEqual(['sales', 'report']);
+    expect((await window.__go('stock'))[0]).toBe('stock');
+    expect((await window.__go('stock'))[2]).toBe('catalog');
+    expect((await window.__go('containers'))[2]).toBe('containers');
+    expect((await window.__go('debts')).slice(0, 1)).toEqual(['money']);
+    expect((await window.__go('debts'))[3]).toBe('debts');
+    expect((await window.__go('limits'))[4]).toBe('limits');
+  });
+
+  it('подсветка таба переживает вложенный экран', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      buildNav();
+      renderOpsSummary = async () => {};
+      window.__ready = showScreen('ops');
+    `);
+    await window.__ready;
+    const active = window.document.querySelector('#bottom-nav .nav-item.active');
+    expect(active.dataset.screen).toBe('today');
+  });
+
+  it('воронка обращений живёт в «Клиентах», а не в отчёте о деньгах', async () => {
+    const FUNNEL = {
+      ok: true,
+      funnel: { contacted: 64, replied: 51, won: 19, awaiting_reply: 4 },
+      awaiting: [{ id: 3, display_name: 'Азиз Р.', last_inbound_at: '2026-08-01 18:40:00' }],
+      by_manager: [],
+    };
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__calls = [];
+      api = async (path) => { window.__calls.push(path); return ${JSON.stringify(FUNNEL)}; };
+      clientsTab = 'funnel';
+      window.__ready = renderClientsScreen();
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(window.__calls).toContain('/api/leads/funnel');
+    expect(content.textContent).toContain('Воронка обращений');
+    expect(content.textContent).toContain('Азиз Р.');
+    // И переключатель раздела на месте (UI-BUG-04).
+    expect(content.querySelector('[data-sect="limits"]')).not.toBeNull();
+  });
+
+  it('пустая воронка объясняет, что дело в подключении, а не в клиентах', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => ({ ok: true, funnel: { contacted: 0 }, awaiting: [], by_manager: [] });
+      clientsTab = 'funnel';
+      window.__ready = renderClientsScreen();
+    `);
+    await window.__ready;
+    const text = window.document.getElementById('content').textContent;
+    expect(text).toContain('Telegram');
+    expect(text).toContain('читать сообщения');
   });
 });

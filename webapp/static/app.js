@@ -152,7 +152,7 @@ async function init() {
       return;
     }
     initNav();
-    showScreen('home');
+    showScreen(defaultSection(role()) || 'today');
   } catch (e) {
     document.getElementById('content').innerHTML = `
       <div class="error-card">
@@ -200,32 +200,73 @@ function errorBox(msg) {
 
 // ─── Навигация ──────────────────────────────────────
 
+// Старые адреса экранов. Внешние ссылки — из бота, из пушей, из закладок —
+// продолжают работать: алиас переводит на новый раздел и сразу открывает ту
+// вкладку, куда содержимое переехало.
+const LEGACY_SCREENS = {
+  home: 'today',
+  orders: 'sales',
+  finance: 'money',
+  analytics: 'sales:report',
+  stock: 'stock:catalog',
+  machines: 'stock:machines',
+  containers: 'stock:containers',
+  debts: 'money:debts',
+  payments: 'money:ops',
+  cashbox: 'money:ops',
+  limits: 'clients:limits',
+  leads: 'clients:funnel',
+};
+
+const SCREEN_TITLES = {
+  today: null, sales: 'Продажи', stock: 'Склад', money: 'Деньги',
+  clients: 'Клиенты', ops: 'Требует внимания',
+};
+
+// Нижняя панель строится из таблицы разделов: набор кнопок зависит от роли.
+// Раньше панель была статикой в разметке, и кладовщик видел «Главную», которая
+// отвечала 403 — дверь, которая не открывается.
+function buildNav() {
+  const nav = document.getElementById('bottom-nav');
+  if (!nav) return;
+  const role = (currentUser && currentUser.role) || 'guest';
+  nav.innerHTML = navSections(role).map(s => `
+    <button class="nav-item" data-screen="${s.key}">
+      <span class="nav-icon">${icon(s.icon)}</span>
+      <span class="nav-label">${escapeHtml(s.label)}</span>
+    </button>`).join('');
+  nav.querySelectorAll('.nav-item').forEach(btn => {
+    btn.addEventListener('click', () => showScreen(btn.dataset.screen));
+  });
+}
+
+// Экраны, у которых нет своей кнопки, всё равно принадлежат разделу — иначе
+// при заходе в них ни один таб не подсвечивался.
+const NAV_PARENT = { ops: 'today' };
+
 async function showScreen(screen) {
+  // Алиас может нести и вкладку: 'sales:report' — раздел «Продажи», вкладка
+  // «Отчёт». Разбираем ДО всего остального, чтобы дальше работать с новым.
+  const alias = LEGACY_SCREENS[screen];
+  if (alias) {
+    const [target, tab] = alias.split(':');
+    screen = target;
+    if (tab) setSectionTab(target, tab);
+  }
   currentScreen = screen;
   // Уходя с любого экрана через нав — снимаем «подтвердить закрытие» (его ставит
   // редактор заказа, пока есть несохранённый черновик).
   tg.disableClosingConfirmation && tg.disableClosingConfirmation();
 
-  // Подсветка нижнего таба: вложенные/legacy-экраны принадлежат корневому
-  // табу (каталог → «Заказы», долги/платежи → «Финансы»). Иначе при заходе
-  // в каталог ни один таб не подсвечивался.
-  const navScreen = { stock: 'orders', debts: 'finance', payments: 'finance', ops: 'home' }[screen] || screen;
+  const navScreen = NAV_PARENT[screen] || screen;
   document.querySelectorAll('.nav-item').forEach(btn => {
     const isActive = btn.dataset.screen === navScreen;
     btn.classList.toggle('active', isActive);
     // aria-current — активный таб для скринридера (визуально это только цвет).
     if (isActive) btn.setAttribute('aria-current', 'page');
     else btn.removeAttribute('aria-current');
-    // Переинициализируем обработчик на случай если DOM обновился
-    btn.onclick = () => showScreen(btn.dataset.screen);
   });
 
-  // Подпись раздела в шапке. «Финансы» уточняет под-раздел внутри renderFinance.
-  const SCREEN_TITLES = {
-    home: null, orders: 'Заказы и склад', stock: 'Заказы и склад',
-    finance: 'Финансы', debts: 'Финансы', payments: 'Финансы', analytics: 'Аналитика',
-    ops: 'Операционная сводка',
-  };
   setScreenContext(SCREEN_TITLES[screen]);
 
   const content = document.getElementById('content');
@@ -237,48 +278,28 @@ async function showScreen(screen) {
   // Корневые табы не показывают нативную «Назад».
   hideBack();
 
-  // Сбрасываем фильтр категории при каждом входе в "Склад",
-  // чтобы не показывать последнюю открытую категорию из прошлой сессии.
-  if (screen === 'stock') {
-    stockCurrentCat = 'all';
-  }
-
   try {
     switch (screen) {
-      case 'home':
+      case 'today':
         await renderHome();
         break;
+      case 'sales':
+        await renderSalesScreen();
+        break;
       case 'stock':
-        // Лега̀cy: внешние ссылки могут звать stock, перенаправляем
-        // в объединённый таб «Склад и заказы» сразу на под-вкладку каталога.
-        // ordersData не сбрасываем — TTL-кэш отдаёт свежие данные без рефетча.
-        ordersSubTab = 'stock';
-        await renderOrdersScreen();
+        await renderStockScreen();
         break;
-      case 'orders':
-        await renderOrdersScreen();
+      case 'money':
+        await renderMoneyScreen();
         break;
-      case 'finance':
-        await renderFinance();
-        break;
-      // Legacy ссылки на отдельные «долги» и «платежи» — теперь оба
-      // под одной вкладкой «Финансы». Открываем нужную подвкладку.
-      case 'debts':
-        financeTab = 'debts';
-        await renderFinance();
-        break;
-      case 'payments':
-        financeTab = 'payments';
-        await renderFinance();
-        break;
-      case 'analytics':
-        await renderAnalytics();
+      case 'clients':
+        await renderClientsScreen();
         break;
       case 'ops':
         await renderOpsSummary();
         break;
       default:
-        content.innerHTML = `<div class="error">Неизвестный экран: ${screen}</div>`;
+        content.innerHTML = `<div class="error">Неизвестный экран: ${escapeHtml(screen)}</div>`;
     }
   } catch (e) {
     // Если render упал — показываем ошибку, а не оставляем старый контент
@@ -286,57 +307,90 @@ async function showScreen(screen) {
   }
 }
 
-// Текущая под-вкладка для объединённого экрана «Склад и заказы»
-let ordersSubTab = 'orders';
+// ─── Разделы и их вкладки ───────────────────────────
+//
+// Состояние вкладки живёт по одной переменной на раздел. Шелл (sectionNavHtml)
+// обязан входить в КАЖДЫЙ innerHTML ветки, включая скелетон и ошибку: иначе
+// первый же ре-рендер внутри вкладки уносит переключатель вместе с
+// обработчиками (UI-BUG-04).
+let salesTab = 'orders';     // orders | report
+let stockTab = 'catalog';    // catalog | containers | machines
+let moneyTab = 'confirm';    // confirm | debts | ops | report
+let clientsTab = 'funnel';   // funnel | limits | channel
 
-// Переключатель под-вкладок «Заказы / Каталог».
-//
-// UI-BUG-04: раньше он вставлялся через insertAdjacentHTML ПОВЕРХ уже
-// отрисованного контента. Любой полный ре-рендер внутри вкладки —
-// смена статуса, выбор периода, «Применить» в календаре, загрузка, ошибка
-// сети — переписывал content.innerHTML и уносил шелл вместе с обработчиками:
-// пользователь оставался без возможности уйти в Каталог.
-//
-// В Аналитике этого бага нет ровно потому, что там шапка входит в КАЖДЫЙ
-// innerHTML (analyticsHeaderHtml + wireAnalyticsHeader). Здесь тот же паттерн.
-// Техника — та же тройка ролей, что и у ручек /api/machines/*. Вкладку, которая
-// гарантированно ответит 403, не рисуем.
-function canSeeMachines() {
-  return !!currentUser && ['admin', 'boss', 'manager'].includes(currentUser.role);
+function setSectionTab(section, tab) {
+  if (section === 'sales') salesTab = tab;
+  else if (section === 'stock') stockTab = tab;
+  else if (section === 'money') moneyTab = tab;
+  else if (section === 'clients') clientsTab = tab;
 }
 
-function ordersShellHtml() {
-  const tab = (id, label, ic) =>
-    `<button class="seg-item ${ordersSubTab === id ? 'active' : ''}" data-sub="${id}" ` +
-    `aria-pressed="${ordersSubTab === id}">${icon(ic)} ${label}</button>`;
-  // Техника и контейнеры — те же три роли, что у их ручек.
-  const extra = canSeeMachines()
-    ? tab('machines', 'Техника', 'truck') + tab('containers', 'Контейнеры', 'box')
-    : '';
-  return `<div class="seg-row"><div class="seg seg--scroll">${tab('orders', 'Заказы', 'list')}${tab('stock', 'Каталог', 'box')}${extra}</div></div>`;
+function role() { return (currentUser && currentUser.role) || 'guest'; }
+function isBossRole() { return ['admin', 'boss'].includes(role()); }
+// Техника, контейнеры и каталог — та же тройка ролей, что у их ручек.
+function canSeeMachines() { return ['admin', 'boss', 'manager'].includes(role()); }
+
+function sectionTabsFor(section) {
+  const r = role();
+  const boss = isBossRole();
+  if (section === 'sales') {
+    return salesTabs({ canSeeReport: ['admin', 'boss', 'manager'].includes(r) });
+  }
+  if (section === 'stock') {
+    return stockTabs({ canSeeGoods: canSeeMachines() });
+  }
+  if (section === 'money') {
+    return moneyTabs({
+      isBoss: boss,
+      isConfirmer: ['admin', 'boss', 'bookkeeper', 'warehouse_keeper'].includes(r),
+      canSeeDebts: ['admin', 'boss', 'manager'].includes(r),
+      hasOps: ['admin', 'boss', 'manager', 'warehouse_keeper'].includes(r),
+    });
+  }
+  return clientsTabs({ isBoss: boss });
 }
 
-function wireOrdersShell(root) {
-  (root || document).querySelectorAll('.seg-item[data-sub]').forEach(btn => {
+// Шелл раздела: переключатель вкладок + подпись в шапке. Возвращает HTML;
+// активная вкладка нормализуется под доступные роли — недоступную или
+// неизвестную откатываем на первую.
+function sectionShell(section, active) {
+  const tabs = sectionTabsFor(section);
+  if (!tabs.find(t => t.key === active)) {
+    active = (tabs[0] && tabs[0].key) || '';
+    setSectionTab(section, active);
+  }
+  const label = (tabs.find(t => t.key === active) || {}).label || '';
+  setScreenContext(tabs.length > 1 ? `${SCREEN_TITLES[section]} · ${label}` : SCREEN_TITLES[section]);
+  return { html: sectionNavHtml(tabs, active), active, tabs };
+}
+
+function wireSectionNav(root, section, rerender) {
+  (root || document).querySelectorAll('.seg-item[data-sect]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
-      ordersSubTab = btn.dataset.sub;
-      renderOrdersScreen();
+      setSectionTab(section, btn.dataset.sect);
+      rerender();
     });
   });
 }
 
-async function renderOrdersScreen() {
-  // Только диспатч: шелл рисует каждая ветка сама, иначе он теряется при
-  // первом же ре-рендере внутри вкладки.
-  if (['machines', 'containers'].includes(ordersSubTab) && !canSeeMachines()) ordersSubTab = 'orders';
-  if (ordersSubTab === 'orders') {
-    await renderOrders();
-  } else if (ordersSubTab === 'machines') {
-    await renderMachines();
-  } else if (ordersSubTab === 'containers') {
-    await renderContainers();
-  } else {
+// Шелл «Продажи» — используется каждой веткой (см. UI-BUG-04).
+function salesShellHtml() { return sectionShell('sales', salesTab).html; }
+function stockShellHtml() { return sectionShell('stock', stockTab).html; }
+
+async function renderSalesScreen() {
+  salesTab = sectionShell('sales', salesTab).active;
+  if (salesTab === 'report') await renderSalesReport();
+  else await renderOrders();
+}
+
+async function renderStockScreen() {
+  stockTab = sectionShell('stock', stockTab).active;
+  if (stockTab === 'machines') await renderMachines();
+  else if (stockTab === 'containers') await renderContainers();
+  else {
+    // Фильтр категории не тащим из прошлого захода в каталог.
+    stockCurrentCat = 'all';
     await renderStock();
   }
 }
@@ -559,7 +613,7 @@ async function renderHome() {
       // а не голый список заказов. Сначала корневой таб (для подсветки nav),
       // затем поверх — список заявок.
       if (target === 'requests') {
-        showScreen('orders');
+        showScreen('sales');
         if (typeof renderPendingRequests === 'function') {
           setTimeout(renderPendingRequests, 50);
         }
@@ -584,20 +638,20 @@ async function renderHome() {
         return;
       }
       if (go === 'requests') {
-        showScreen('orders');
+        showScreen('sales');
         if (typeof renderPendingRequests === 'function') setTimeout(renderPendingRequests, 50);
         return;
       }
       if (go.indexOf('finance:') === 0) {
-        financeTab = go.slice('finance:'.length);   // глоб. состояние вкладки финансов
-        showScreen('finance');
+        moneyTab = go.slice('finance:'.length);   // глоб. состояние вкладки «Денег»
+        showScreen('money');
       }
     });
   });
 
   // Клик по строке недавнего заказа → Заказы
   document.querySelectorAll('[data-order-id]').forEach(row => {
-    row.addEventListener('click', () => showScreen('orders'));
+    row.addEventListener('click', () => showScreen('sales'));
   });
 }
 
@@ -612,8 +666,8 @@ let _stockSearchTimer = null;  // дебаунс ввода в поиске по
 
 async function renderStock() {
   const content = document.getElementById('content');
-  content.innerHTML = ordersShellHtml() + loading('Загружаю остатки…');
-  wireOrdersShell(content);
+  content.innerHTML = stockShellHtml() + loading('Загружаю остатки…');
+  wireSectionNav(content, 'stock', renderStockScreen);
 
   if (!stockData) {
     try {
@@ -628,8 +682,8 @@ async function renderStock() {
       }
       stockData = await r.json();
     } catch (e) {
-      content.innerHTML = ordersShellHtml() + errorBox(e.message);
-      wireOrdersShell(content);
+      content.innerHTML = stockShellHtml() + errorBox(e.message);
+      wireSectionNav(content, 'stock', renderStockScreen);
       return;
     }
   }
@@ -841,7 +895,7 @@ function renderStockContent() {
     ).join('');
 
   content.innerHTML = `
-    ${ordersShellHtml()}
+    ${stockShellHtml()}
     <div class="form-row">
       <input id="stock-search" class="form-input" placeholder="Поиск товара…" value="${escapeHtml(stockSearch)}">
     </div>
@@ -855,7 +909,7 @@ function renderStockContent() {
     <div class="stock-list" id="stock-list"></div>
     <div id="stock-trunc"></div>
   `;
-  wireOrdersShell(content);   // UI-BUG-04
+  wireSectionNav(content, 'stock', renderStockScreen);   // UI-BUG-04
   renderStockList();
 
   // Boss: делегированный клик по строке товара → редактор цены. Вешаем ОДИН
@@ -929,8 +983,8 @@ async function renderMachines() {
   const content = document.getElementById('content');
   // Шелл — в КАЖДЫЙ innerHTML, включая скелетон и ветку ошибки (UI-BUG-04):
   // иначе первый же ре-рендер уносит вкладки вместе с обработчиками.
-  content.innerHTML = ordersShellHtml() + skeleton('label') + skeleton('list', 4);
-  wireOrdersShell(content);
+  content.innerHTML = stockShellHtml() + skeleton('label') + skeleton('list', 4);
+  wireSectionNav(content, 'stock', renderStockScreen);
   setScreenContext('Заказы · Техника');
 
   let data;
@@ -939,8 +993,8 @@ async function renderMachines() {
       status: machinesFilter === 'all' ? '' : machinesFilter,
     });
   } catch (e) {
-    content.innerHTML = ordersShellHtml() + errorBox(e.message);
-    wireOrdersShell(content);
+    content.innerHTML = stockShellHtml() + errorBox(e.message);
+    wireSectionNav(content, 'stock', renderStockScreen);
     return;
   }
   machinesData = data;
@@ -955,7 +1009,7 @@ async function renderMachines() {
       <span class="c-badge">${escapeHtml(machineStatusLabel(m.status, labels))}</span>
     </div>`).join('');
 
-  content.innerHTML = ordersShellHtml()
+  content.innerHTML = stockShellHtml()
     + machineStatusSegHtml(data.counts, machinesFilter, labels)
     + (rows
       ? `<div class="c-surface c-surface--list">${rows}</div>`
@@ -967,7 +1021,7 @@ async function renderMachines() {
             : 'В этом статусе машин нет — выберите другой фильтр.',
         }))
     + `<div class="c-actions"><button class="btn-secondary" id="machine-new">${icon('plus')} Завести машину</button></div>`;
-  wireOrdersShell(content);
+  wireSectionNav(content, 'stock', renderStockScreen);
 
   content.querySelector('#machine-new')?.addEventListener('click', () => openMachineForm(null));
 
@@ -1211,8 +1265,8 @@ async function deleteMachine(machine) {
   }
   haptic('success');
   toast('Машина удалена');
-  ordersSubTab = 'machines';
-  showScreen('orders');
+  stockTab = 'machines';
+  showScreen('stock');
 }
 
 // ─── Экран: Контейнеры ──────────────────────────────
@@ -1225,8 +1279,8 @@ let _containersSearchTimer = null;
 
 async function renderContainers() {
   const content = document.getElementById('content');
-  content.innerHTML = ordersShellHtml() + skeleton('label') + skeleton('list', 3);
-  wireOrdersShell(content);
+  content.innerHTML = stockShellHtml() + skeleton('label') + skeleton('list', 3);
+  wireSectionNav(content, 'stock', renderStockScreen);
   setScreenContext('Заказы · Контейнеры');
 
   let data;
@@ -1236,8 +1290,8 @@ async function renderContainers() {
       search: containersSearch,
     });
   } catch (e) {
-    content.innerHTML = ordersShellHtml() + errorBox(e.message);
-    wireOrdersShell(content);
+    content.innerHTML = stockShellHtml() + errorBox(e.message);
+    wireSectionNav(content, 'stock', renderStockScreen);
     return;
   }
   const labels = data.status_labels || {};
@@ -1276,7 +1330,7 @@ async function renderContainers() {
         `aria-pressed="${containersFilter === s}">${escapeHtml(label)} ${Number(counts[s] || 0)}</button>`;
     }).join('');
 
-  content.innerHTML = ordersShellHtml()
+  content.innerHTML = stockShellHtml()
     + `<div class="seg-row"><div class="seg seg--scroll">${seg}</div></div>`
     + `<div class="search-wrap"><input type="search" id="container-search" class="search-input"
          placeholder="Номер или заметка…" value="${escapeHtml(containersSearch)}"
@@ -1291,7 +1345,7 @@ async function renderContainers() {
             : 'Заведите контейнер, когда он выйдет в путь — и будет видно, чего ждать.',
         }))
     + `<div class="c-actions"><button class="btn-secondary" id="container-new">${icon('plus')} Новый контейнер</button></div>`;
-  wireOrdersShell(content);
+  wireSectionNav(content, 'stock', renderStockScreen);
 
   content.querySelector('#container-new')?.addEventListener('click', () => openContainerForm());
 
@@ -1632,7 +1686,7 @@ async function renderContainerCard(containerId) {
   const content = document.getElementById('content');
   content.innerHTML = skeleton('label') + skeleton('list', 4);
   setScreenContext('Контейнер');
-  showBack(() => { ordersSubTab = 'containers'; showScreen('orders'); });
+  showBack(() => { stockTab = 'containers'; showScreen('stock'); });
 
   let card;
   try {
@@ -1790,8 +1844,8 @@ async function renderContainerCard(containerId) {
     }
     haptic('success');
     toast('Контейнер удалён');
-    ordersSubTab = 'containers';
-    showScreen('orders');
+    stockTab = 'containers';
+    showScreen('stock');
   });
 
   content.querySelectorAll('[data-item-del]').forEach(btn => {
@@ -1954,7 +2008,7 @@ async function renderMachineCard(machineId) {
   revokePhotoUrls();
   content.innerHTML = skeleton('label') + skeleton('list', 5);
   setScreenContext('Техника · карточка');
-  showBack(() => { ordersSubTab = 'machines'; showScreen('orders'); });
+  showBack(() => { stockTab = 'machines'; showScreen('stock'); });
 
   let card;
   try {
@@ -2494,7 +2548,7 @@ async function runSearch(query) {
   if (data.orders && data.orders.length) {
     parts.push(`<div class="search-group-title">${icon('box')} Заказы</div>`);
     parts.push(data.orders.map(o => `
-      <div class="search-item" role="button" tabindex="0" onclick="showScreen('orders')">
+      <div class="search-item" role="button" tabindex="0" onclick="showScreen('sales')">
         <b>#${o.id}</b> · ${escapeHtml(o.agent_name)} · ${escapeHtml(o.status || '')}
         <span class="search-meta">${escapeHtml(o.full_name)}</span>
       </div>`).join(''));
@@ -2502,7 +2556,7 @@ async function runSearch(query) {
   if (data.payments && data.payments.length) {
     parts.push(`<div class="search-group-title">${icon('cash')} Платежи</div>`);
     parts.push(data.payments.map(p => `
-      <div class="search-item" role="button" tabindex="0" onclick="showScreen('finance')">
+      <div class="search-item" role="button" tabindex="0" onclick="showScreen('money')">
         <b>#${p.id}</b> · ${p.amount} ${escapeHtml(p.currency)} · ${escapeHtml(p.status || '')}
         <span class="search-meta">${escapeHtml(p.full_name)}${p.comment ? ' · ' + escapeHtml(p.comment) : ''}</span>
       </div>`).join(''));
@@ -2674,14 +2728,14 @@ async function renderOrders() {
   // каждый раз дёргать /api/orders. Мутации (delete/ship/cancel) ставят
   // ordersData = null — это форсит свежую загрузку ниже.
   if (!ordersData || Date.now() - ordersDataTs > ORDERS_TTL_MS) {
-    content.innerHTML = ordersShellHtml() + loading('Загружаю заказы…');
-    wireOrdersShell(content);
+    content.innerHTML = salesShellHtml() + loading('Загружаю заказы…');
+    wireSectionNav(content, 'sales', renderSalesScreen);
     try {
       ordersData = await api('/api/orders', {});
       ordersDataTs = Date.now();
     } catch (e) {
-      content.innerHTML = ordersShellHtml() + errorBox(e.message);
-      wireOrdersShell(content);
+      content.innerHTML = salesShellHtml() + errorBox(e.message);
+      wireSectionNav(content, 'sales', renderSalesScreen);
       return;
     }
   }
@@ -2836,7 +2890,7 @@ function renderOrdersMain() {
       })();
 
   content.innerHTML = `
-    ${ordersShellHtml()}
+    ${salesShellHtml()}
     <div class="section-label">Статус</div>
     <div class="seg-row"><div class="seg seg--scroll">${statusSeg}</div></div>
     <div class="section-label">Период</div>
@@ -2848,7 +2902,7 @@ function renderOrdersMain() {
 
     <div class="orders-list">${list}</div>
   `;
-  wireOrdersShell(content);   // UI-BUG-04: шелл — часть шаблона, значит и проводка тоже
+  wireSectionNav(content, 'sales', renderSalesScreen);   // UI-BUG-04: шелл — часть шаблона, значит и проводка тоже
 
   // Фильтры по статусу (сегмент).
   document.querySelectorAll('.seg-item[data-filter]').forEach(btn => {
@@ -3511,7 +3565,7 @@ async function renderOpsSummary() {
   content.innerHTML = loading('Загружаю сводку…');
   try {
     const data = await api('/api/ops-summary', {});
-    showBack(() => showScreen('home'));
+    showBack(() => showScreen('today'));
     content.innerHTML =
       `<div class="editor-header"><div class="editor-title">Операционная сводка</div></div>` +
       renderOpsSummaryHtml(data);
@@ -3669,20 +3723,13 @@ let analyticsPeriod = 'month';   // preset id | 'custom'
 let analyticsSince = '';         // YYYY-MM-DD — кастомный диапазон (period='custom')
 let analyticsUntil = '';
 let lastAnalyticsData = null;    // последний успешный ответ — чтобы показать поля дат без перезапроса
-let analyticsView = 'sales';     // 'sales' | 'money' (boss): продажи vs деньги (быв. «Обзор»)
 const ANALYTICS_TTL_MS = 60 * 1000;
 
-// Шапка Аналитики: переключатель вида «Продажи|Деньги» (boss) + период-сегмент.
-// Общая для обоих видов, чтобы период/вид не расходились. Период — iOS-сегмент
-// .seg (фиксированные 2–4 — навигация), не переносится.
-function analyticsHeaderHtml(isBoss) {
-  const viewSeg = isBoss ? `
-    <div class="seg-row">
-      <div class="seg">
-        <button class="seg-item ${analyticsView === 'sales' ? 'active' : ''}" data-aview="sales" aria-pressed="${analyticsView === 'sales'}">Продажи</button>
-        <button class="seg-item ${analyticsView === 'money' ? 'active' : ''}" data-aview="money" aria-pressed="${analyticsView === 'money'}">Деньги</button>
-      </div>
-    </div>` : '';
+// Шапка отчёта — только период. Переключатель «Продажи|Деньги» отсюда убран:
+// это были два РАЗНЫХ отчёта в одном экране, и именно он делал «Аналитику»
+// местом, где непонятно, что где. Теперь отчёт лежит вкладкой внутри своего
+// раздела, а период у них общий — одна переменная на оба.
+function reportHeaderHtml() {
   const presets = [
     { id: 'week', label: 'Неделя' }, { id: 'month', label: 'Месяц' },
     { id: '3month', label: 'Квартал' }, { id: 'year', label: 'Год' },
@@ -3694,40 +3741,35 @@ function analyticsHeaderHtml(isBoss) {
     presets, analyticsPeriod, 'data-period', analyticsPeriod === 'custom', customLabel
   );
   const periodPanel = analyticsPeriod === 'custom' ? dateRangeHost() : '';
-  return `${viewSeg}<div class="section-label">Период</div>${periodBar}${periodPanel}`;
+  return `<div class="section-label">Период</div>${periodBar}${periodPanel}`;
 }
 
-// Навешивает обработчики шапки Аналитики (вид/период/календарь) — общие для видов.
-function wireAnalyticsHeader(content) {
-  content.querySelectorAll('[data-aview]').forEach(btn => {
-    btn.addEventListener('click', () => { haptic('light'); analyticsView = btn.dataset.aview; renderAnalytics(); });
-  });
-  content.querySelectorAll('[data-period]').forEach(btn => {
-    btn.addEventListener('click', () => { haptic('light'); analyticsPeriod = btn.dataset.period; renderAnalytics(); });
+// Обработчики периода/календаря. `rerender` — чей это отчёт: у «Продаж» и
+// «Денег» он свой, а период общий.
+function wireReportHeader(root, rerender) {
+  root.querySelectorAll('[data-period]').forEach(btn => {
+    btn.addEventListener('click', () => { haptic('light'); analyticsPeriod = btn.dataset.period; rerender(); });
   });
   if (analyticsPeriod === 'custom') {
-    mountCalendar(content.querySelector('.cal-host'), analyticsSince, analyticsUntil,
-      (from, to) => { analyticsSince = from; analyticsUntil = to; renderAnalytics(); });
+    mountCalendar(root.querySelector('.cal-host'), analyticsSince, analyticsUntil,
+      (from, to) => { analyticsSince = from; analyticsUntil = to; rerender(); });
   }
 }
 
-async function renderAnalytics() {
+// Отчёт раздела «Продажи» (бывшая «Аналитика → Продажи»).
+async function renderSalesReport() {
   const content = document.getElementById('content');
-  const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
-  if (!isBoss) analyticsView = 'sales';  // не-боссу доступны только «Продажи»
 
   // «Период…» выбран, но даты ещё не заданы → показываем шапку с календарём и
-  // ждём выбор дат — ЕДИНО для обоих видов (WP-24), ДО диспатча в renderMoneyView.
-  // Раньше money-вид ждал, а sales-вид сбрасывал analyticsPeriod='month' →
-  // переключение видов в этом состоянии молча теряло custom-выбор.
+  // ждём выбор дат (WP-24).
   if (analyticsPeriod === 'custom' && !(analyticsSince && analyticsUntil)) {
-    content.innerHTML = analyticsHeaderHtml(isBoss) +
+    content.innerHTML = salesShellHtml() + reportHeaderHtml() +
       '<div class="loader">Выберите даты периода на календаре выше.</div>';
-    wireAnalyticsHeader(content);
+    wireSectionNav(content, 'sales', renderSalesScreen);
+    wireReportHeader(content, renderSalesReport);
     return;
   }
 
-  if (analyticsView === 'money' && isBoss) return renderMoneyView();
   const custom = analyticsPeriod === 'custom';
 
   // Короткий кэш (TTL 60с): пресеты и конкретные диапазоны кэшируются отдельно.
@@ -3739,7 +3781,10 @@ async function renderAnalytics() {
     return;
   }
 
-  content.innerHTML = loading('Считаю статистику…');
+  // Шелл входит и в скелетон: без него загрузка уносит переключатель разделa
+  // (UI-BUG-04).
+  content.innerHTML = salesShellHtml() + loading('Считаю статистику…');
+  wireSectionNav(content, 'sales', renderSalesScreen);
   try {
     const body = custom
       ? { initData: _initData, since: analyticsSince, until: _nextDay(analyticsUntil) }
@@ -3758,7 +3803,8 @@ async function renderAnalytics() {
     lastAnalyticsData = data;
     renderAnalyticsContent(data);
   } catch (e) {
-    content.innerHTML = errorBox(e.message);
+    content.innerHTML = salesShellHtml() + errorBox(e.message);
+    wireSectionNav(content, 'sales', renderSalesScreen);
   }
 }
 
@@ -3896,7 +3942,8 @@ function renderAnalyticsContent(data) {
   const statsBlock = isPersonal ? personalStatsHtml() : companyStatsHtml();
 
   content.innerHTML = `
-    ${analyticsHeaderHtml(isBoss)}
+    ${salesShellHtml()}
+    ${reportHeaderHtml()}
     ${msWarn}
     ${statsBlock}
 
@@ -3938,15 +3985,24 @@ function renderAnalyticsContent(data) {
     });
   }));
 
-  wireAnalyticsHeader(content);  // вид/период/календарь — общая шапка
+  wireSectionNav(content, 'sales', renderSalesScreen);
+  wireReportHeader(content, renderSalesReport);
 }
 
-// Аналитика → «Деньги» (быв. Финансы→«Обзор», boss): итоги поступлений за период
-// + лента движения денег. Период — общий с «Продажами» (analyticsPeriod).
-async function renderMoneyView() {
-  const content = document.getElementById('content');
-  // custom-без-дат обрабатывается единым guard'ом в renderAnalytics ДО диспатча
-  // сюда (WP-24), поэтому здесь analyticsPeriod либо пресет, либо custom с датами.
+// «Деньги → Отчёт» (быв. «Аналитика → Деньги»): итоги поступлений за период,
+// дебиторка, прогноз, дисциплина и лента движения денег. Период общий с отчётом
+// по продажам (analyticsPeriod) — это один и тот же вопрос «за какой срок».
+//
+// Рисует в переданный контейнер (тело раздела), а не в #content: переключатель
+// вкладок «Денег» лежит выше и переживает ре-рендер отчёта.
+async function renderMoneyReport(container) {
+  const content = container || document.getElementById('content');
+  if (analyticsPeriod === 'custom' && !(analyticsSince && analyticsUntil)) {
+    content.innerHTML = reportHeaderHtml() +
+      '<div class="loader">Выберите даты периода на календаре выше.</div>';
+    wireReportHeader(content, () => renderMoneyReport(content));
+    return;
+  }
   content.innerHTML = loading('Считаю деньги…');
   const periodBody = (analyticsPeriod === 'custom' && analyticsSince && analyticsUntil)
     ? { since: analyticsSince, until: _nextDay(analyticsUntil) }
@@ -3959,8 +4015,8 @@ async function renderMoneyView() {
     // висели движения за всё время.
     history = (await api('/api/cash/history', periodBody).catch(() => ({ history: [] }))).history || [];
   } catch (e) {
-    content.innerHTML = analyticsHeaderHtml(true) + errorBox(e.message);
-    wireAnalyticsHeader(content);
+    content.innerHTML = reportHeaderHtml() + errorBox(e.message);
+    wireReportHeader(content, () => renderMoneyReport(content));
     return;
   }
   const label = (summary && summary.period && summary.period.label) || '';
@@ -3968,13 +4024,13 @@ async function renderMoneyView() {
   // поступления, а разделы «где деньги» дорисовываем следом. Так экран не ждёт
   // самый медленный запрос, чтобы показать хоть что-то.
   content.innerHTML =
-    analyticsHeaderHtml(true) +
+    reportHeaderHtml() +
     `<div class="section-label">Поступления · ${escapeHtml(label)}</div>` +
     renderMoneyTotalsHtml(summary) +
     '<div id="money-insights">' + skeleton('list', 3) + '</div>' +
     '<div class="section-label">Движение денег</div>' +
     cashHistoryHtml(history);
-  wireAnalyticsHeader(content);
+  wireReportHeader(content, () => renderMoneyReport(content));
 
   const box = content.querySelector('#money-insights');
   if (!box) return;
@@ -4042,33 +4098,6 @@ async function moneyInsightsHtml() {
   if (fc) {
     html += '<div class="section-label">Ожидаемые поступления</div>' + forecastRowsHtml(fc.months);
   }
-  const lead = await api('/api/leads/funnel', {}).catch(() => null);
-  if (lead && lead.funnel.contacted) {
-    html += '<div class="section-label">Обращения клиентов</div>' + leadFunnelHtml(lead.funnel);
-    if ((lead.awaiting || []).length) {
-      html += `<div class="section-label">Ждут ответа · ${lead.awaiting.length}</div>`;
-      html += '<div class="c-surface c-surface--list">' + lead.awaiting.map(l => `
-        <div class="c-row c-row--tap" data-lead="${l.id}" data-status="overdue" role="button" tabindex="0">
-          <div class="card-row-info">
-            <div class="card-row-title">${escapeHtml(l.display_name || l.username || '—')}</div>
-            <div class="card-row-sub">написал ${escapeHtml(String(l.last_inbound_at || '').slice(0, 16))}</div>
-          </div>${icon('clock')}
-        </div>`).join('') + '</div>';
-    }
-    const mgrs = (lead.by_manager || []).filter(m => m.contacted);
-    if (mgrs.length > 1) {
-      html += '<div class="section-label">По менеджерам</div>';
-      html += '<div class="c-surface c-surface--list">' + mgrs.map(m => `
-        <div class="c-row">
-          <div class="card-row-info">
-            <div class="card-row-title">${escapeHtml(m.name)}</div>
-            <div class="card-row-sub">обратились ${m.contacted} · ответили ${m.replied}${
-              m.awaiting_reply ? ` · ждут ${m.awaiting_reply}` : ''}</div>
-          </div>
-          <div class="card-row-value">${m.win_rate == null ? '—' : Math.round(m.win_rate * 100) + '%'}</div>
-        </div>`).join('') + '</div>';
-    }
-  }
   if (disc && disc.expected_count) {
     const share = disc.on_time_share == null ? '—' : `${Math.round(disc.on_time_share * 100)}%`;
     html += '<div class="section-label">Платёжная дисциплина</div>';
@@ -4092,6 +4121,114 @@ async function moneyInsightsHtml() {
     }
   }
   return html;
+}
+
+// ─── Раздел «Клиенты» ──────────────────────────────────────────────────────
+//
+// Воронка обращений жила строчками внизу отчёта о деньгах — там её было не
+// найти, не зная заранее. Переписка с клиентом не деньги, и у неё должен быть
+// свой раздел: воронка, кто ждёт ответа, кредитные лимиты и посты в канал.
+
+async function renderClientsScreen() {
+  const content = document.getElementById('content');
+  const shell = sectionShell('clients', clientsTab);
+  clientsTab = shell.active;
+  content.innerHTML = shell.html + '<div id="clients-body">' + skeleton('list', 3) + '</div>';
+  wireSectionNav(content, 'clients', renderClientsScreen);
+
+  const body = document.getElementById('clients-body');
+  if (clientsTab === 'limits') await renderCreditLimits(body);
+  else if (clientsTab === 'channel') await renderChannelHistory(body);
+  else await renderLeadsFunnel(body);
+}
+
+async function renderLeadsFunnel(container) {
+  const box = container || document.getElementById('content');
+  box.innerHTML = skeleton('list', 3);
+  let lead;
+  try {
+    lead = await api('/api/leads/funnel', {});
+  } catch (e) {
+    box.innerHTML = errorBox(e.message);
+    return;
+  }
+  const f = (lead && lead.funnel) || {};
+  if (!f.contacted) {
+    // Пустая воронка чаще всего значит не «никто не пишет», а «бот не подключён
+    // к аккаунту менеджера или ему не дали право читать». Говорим об этом прямо.
+    box.innerHTML = emptyState({
+      icon: 'user',
+      title: 'Обращений пока нет',
+      hint: 'Воронка наполняется из личных переписок менеджеров. Нужен Telegram '
+          + 'Premium и подключение бота в настройках Telegram для бизнеса — '
+          + 'с правом читать сообщения.',
+    });
+    return;
+  }
+
+  let html = '<div class="section-label">Воронка обращений</div>' + leadFunnelHtml(f);
+  if ((lead.awaiting || []).length) {
+    html += `<div class="section-label">Ждут ответа · ${lead.awaiting.length}</div>`;
+    html += '<div class="c-surface c-surface--list">' + lead.awaiting.map(l => `
+      <div class="c-row c-row--tap" data-lead="${l.id}" data-status="overdue" role="button" tabindex="0">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(l.display_name || l.username || '—')}</div>
+          <div class="card-row-sub">написал ${escapeHtml(String(l.last_inbound_at || '').slice(0, 16))}</div>
+        </div>${icon('clock')}
+      </div>`).join('') + '</div>';
+  }
+  const mgrs = (lead.by_manager || []).filter(m => m.contacted);
+  if (mgrs.length > 1) {
+    html += '<div class="section-label">По менеджерам</div>';
+    html += '<div class="c-surface c-surface--list">' + mgrs.map(m => `
+      <div class="c-row">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(m.name)}</div>
+          <div class="card-row-sub">обратились ${m.contacted} · ответили ${m.replied}${
+            m.awaiting_reply ? ` · ждут ${m.awaiting_reply}` : ''}</div>
+        </div>
+        <div class="card-row-value">${m.win_rate == null ? '—' : Math.round(m.win_rate * 100) + '%'}</div>
+      </div>`).join('') + '</div>';
+  }
+  box.innerHTML = html;
+  box.querySelectorAll('[data-lead]').forEach(row => {
+    row.addEventListener('click', () => { haptic('light'); renderLeadCard(Number(row.dataset.lead)); });
+  });
+}
+
+// История публикаций в канал. Раньше её было неоткуда открыть: пост собирался
+// из карточки товара или контейнера, а посмотреть, что уже ушло, — никак.
+async function renderChannelHistory(container) {
+  const box = container || document.getElementById('content');
+  box.innerHTML = skeleton('list', 3);
+  let data;
+  try {
+    data = await api('/api/channel/history', {});
+  } catch (e) {
+    box.innerHTML = errorBox(e.message);
+    return;
+  }
+  const posts = data.posts || [];
+  const labels = data.kind_labels || {};
+  const warn = data.can_publish ? '' :
+    '<div class="c-error">Канал не настроен: нет CHANNEL_ID. Черновики собираются, публикация выключена.</div>';
+  if (!posts.length) {
+    box.innerHTML = warn + emptyState({
+      icon: 'cart',
+      title: 'В канал ещё ничего не уходило',
+      hint: 'Пост собирают из карточки товара («Каталог») или прибывшего контейнера — '
+          + 'сервер готовит черновик, а публикуете его вы.',
+    });
+    return;
+  }
+  box.innerHTML = warn + '<div class="c-surface c-surface--list">' + posts.map(p => `
+    <div class="c-row">
+      <div class="card-row-info">
+        <div class="card-row-title">${escapeHtml(labels[p.kind] || p.kind || '')}</div>
+        <div class="card-row-sub">${escapeHtml(String(p.posted_at || '').slice(0, 16))}${
+          p.ref ? ' · ' + escapeHtml(String(p.ref)) : ''}</div>
+      </div>
+    </div>`).join('') + '</div>';
 }
 
 // ─── Канал ──────────────────────────────────────────────────────────────────
@@ -4152,7 +4289,7 @@ async function renderLeadCard(leadId) {
   const content = document.getElementById('content');
   content.innerHTML = skeleton('label') + skeleton('list', 4);
   setScreenContext('Обращение клиента');
-  showBack(() => showScreen('analytics'));
+  showBack(() => { clientsTab = 'funnel'; showScreen('clients'); });
 
   let card;
   try {
@@ -4226,7 +4363,7 @@ async function renderLeadCard(leadId) {
 // опознаётся по имени — другого идентификатора у него пока нет.
 async function renderBuyerCard(buyer) {
   const content = document.getElementById('content');
-  const back = () => { financeTab = 'debts'; showScreen('finance'); };
+  const back = () => { moneyTab = 'debts'; showScreen('money'); };
   content.innerHTML = skeleton('label') + skeleton('list', 4);
   setScreenContext('Покупатель техники');
   showBack(back);
@@ -4327,14 +4464,9 @@ function cashHistoryHtml(history) {
 //  ручной платёж объединены во вкладку «Касса» — см. renderCashbox.)
 
 function initNav() {
-  document.querySelectorAll('.nav-item').forEach(btn => {
-    btn.addEventListener('click', () => {
-      haptic();
-      document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      showScreen(btn.dataset.screen);
-    });
-  });
+  // Кнопки строит buildNav из таблицы разделов — их набор зависит от роли,
+  // поэтому статикой в разметке они быть не могут.
+  buildNav();
   // Поиск в топбаре — доступен с любого экрана.
   const searchBtn = document.getElementById('search-btn');
   if (searchBtn) {
@@ -4343,13 +4475,11 @@ function initNav() {
 }
 
 
-// ─── Экран «Финансы» (объединённые «Долги» + «Платежи») ────────────────────
+// ─── Раздел «Деньги» ───────────────────────────────────────────────────────
 //
-// Один таб в нижнем меню, две подвкладки. Сделано чтобы:
-//   1) не плодить 5 кнопок в bottom-nav (визуально переносило)
-//   2) долги и платежи семантически связаны: закрытие долга
-//      создаёт payment-запись, которая проходит через тот же
-//      approve-флоу
+// Бывшие «Финансы» и бывшая «Аналитика → Деньги» — один раздел. Долги и
+// дебиторка это один предмет, и держать их в разных разделах значило требовать
+// от человека знать, в каком именно лежит нужная ему цифра.
 //
 // Состояния долгов (state с бекенда):
 //   - overdue                — просрочен, оплат нет
@@ -4358,59 +4488,34 @@ function initNav() {
 //   - partial                — есть подтверждённые платежи, но не всё
 //   - awaiting_confirmation  — есть pending платежи (босс решает)
 
-let financeTab = 'debts';  // confirm | debts | ops | limits (плоско, по задачам)
 let debtsFilter = 'all';   // 'all' | 'today'
 let cashboxSubTab = null;  // последняя секция кассы (confirm|ops) — фолбэк
 let financePendCache = 0;  // последний счётчик подтверждений (мгновенный бейдж)
 
-async function renderFinance() {
+async function renderMoneyScreen() {
   const content = document.getElementById('content');
-  const role = currentUser && currentUser.role;
-  const isBoss = role === 'admin' || role === 'boss';
-  const canDeposit = role === 'manager' || role === 'warehouse_keeper';
-  const isConfirmer = ['admin', 'boss', 'bookkeeper', 'warehouse_keeper'].includes(role);
-  const canReturn = ['admin', 'boss', 'warehouse_keeper', 'manager'].includes(role);
-  // «Платежи и сдачи» = формы (сдать наличные / возврат / новый платёж) + «Мои сдачи».
-  const hasOps = canDeposit || canReturn || !isBoss;
+  const r = role();
+  const boss = isBossRole();
+  const isConfirmer = ['admin', 'boss', 'bookkeeper', 'warehouse_keeper'].includes(r);
 
-  // Миграция старых/внешних ключей вкладок на текущий плоский набор.
-  if (financeTab === 'payments' || financeTab === 'cashbox') financeTab = isConfirmer ? 'confirm' : 'ops';
-  if (financeTab === 'my') financeTab = 'ops';          // свёрнуто в «Платежи и сдачи»
-  if (financeTab === 'overview') financeTab = 'debts';  // переехало в Аналитику → Деньги
+  // Миграция старых/внешних ключей вкладок на текущий набор.
+  if (['payments', 'cashbox', 'my'].includes(moneyTab)) moneyTab = isConfirmer ? 'confirm' : 'ops';
+  if (moneyTab === 'overview') moneyTab = 'report';
+  if (moneyTab === 'limits') { clientsTab = 'limits'; return showScreen('clients'); }
 
-  const tabs = financeTabs({ isBoss, isConfirmer, hasOps, canDeposit });
-  // Недоступную/неизвестную вкладку откатываем на первую доступную.
-  if (!tabs.find(t => t.key === financeTab)) financeTab = (tabs[0] && tabs[0].key) || 'debts';
-  const LABELS = {};
-  tabs.forEach(t => { LABELS[t.key] = t.label; });
-  setScreenContext(`Финансы · ${LABELS[financeTab] || ''}`);
-
-  // Под-навигация = подчёркнутый горизонт-скролл сегмент (.subseg) — НЕ переносится
-  // «по три в ряд» (раньше .cat-row с flex-wrap). Пилюли (.cat-btn) теперь только
-  // для фильтров — визуальная иерархия: подчёркнутое = навигация, пилюли = фильтры.
   // ВАЖНО: вкладки рисуем СРАЗУ (синхронно). Раньше рендер ждал сетевой подсчёт
   // бейджа (await) — при зависшем запросе вкладки не появлялись до перезагрузки
   // («иногда пропадали вкладки»). Бейдж берём из кэша и освежаем асинхронно ниже.
-  const tabBarHtml = (pendN) => `
-    <div class="subseg">
-      ${tabs.map(t => {
-        const on = financeTab === t.key;
-        const badge = (t.key === 'confirm' && pendN)
-          ? ` <span class="stock-badge badge-yellow">${pendN}</span>` : '';
-        return `<button class="subseg-item ${on ? 'active' : ''}" data-tab="${t.key}" aria-pressed="${on}">${t.label}${badge}</button>`;
-      }).join('')}
-    </div>
-    <div id="finance-body"></div>`;
-  content.innerHTML = tabBarHtml(isConfirmer ? financePendCache : 0);
-  content.querySelectorAll('[data-tab]').forEach(t => {
-    t.addEventListener('click', () => {
-      haptic('light');
-      financeTab = t.dataset.tab;
-      renderFinance();
-    });
-  });
+  const shell = sectionShell('money', moneyTab);
+  moneyTab = shell.active;
+  const tabs = shell.tabs.map(t =>
+    (t.key === 'confirm' && isConfirmer && financePendCache)
+      ? { ...t, badge: financePendCache } : t);
+  content.innerHTML = sectionNavHtml(tabs, moneyTab) + '<div id="money-body"></div>';
+  wireSectionNav(content, 'money', renderMoneyScreen);
+
   // Активную вкладку подтягиваем в зону видимости, если ряд скроллится.
-  const activeSeg = content.querySelector('.subseg-item.active');
+  const activeSeg = content.querySelector('.seg-item.active');
   if (activeSeg && activeSeg.scrollIntoView) {
     try { activeSeg.scrollIntoView({ inline: 'center', block: 'nearest' }); } catch (e) { /* старый WebView */ }
   }
@@ -4418,14 +4523,14 @@ async function renderFinance() {
   // Бейдж ожидающих подтверждений — освежаем АСИНХРОННО, чтобы зависший запрос
   // не блокировал появление вкладок. Обновляем счётчик на месте.
   if (isConfirmer) {
-    const cnt = (p, k) => api(p, {}).then(r => (r[k] || []).length).catch(() => 0);
+    const cnt = (p, k) => api(p, {}).then(res => (res[k] || []).length).catch(() => 0);
     const parts = [cnt('/api/deposits/pending', 'deposits'), cnt('/api/returns/pending', 'returns')];
-    if (isBoss) parts.push(cnt('/api/payments/pending', 'pending'));
+    if (boss) parts.push(cnt('/api/payments/pending', 'pending'));
     Promise.all(parts).then(arr => {
       const n = arr.reduce((a, b) => a + b, 0);
       financePendCache = n;
-      if (currentScreen !== 'finance') return;
-      const pill = content.querySelector('.subseg-item[data-tab="confirm"]');
+      if (currentScreen !== 'money') return;
+      const pill = content.querySelector('.seg-item[data-sect="confirm"]');
       if (!pill) return;
       const old = pill.querySelector('.stock-badge');
       if (old) old.remove();
@@ -4438,16 +4543,16 @@ async function renderFinance() {
     });
   }
 
-  const body = document.getElementById('finance-body');
-  if (financeTab === 'debts') await renderDebts(body);
-  else if (financeTab === 'limits') await renderClients(body);
-  else await renderCashbox(body, financeTab);  // confirm | ops
+  const body = document.getElementById('money-body');
+  if (moneyTab === 'debts') await renderDebts(body);
+  else if (moneyTab === 'report') await renderMoneyReport(body);
+  else await renderCashbox(body, moneyTab);  // confirm | ops
 }
 
 async function renderCashbox(container, section) {
   container = container || document.getElementById('content');
-  // section — плоская вкладка из renderFinance: confirm | ops. Бейдж/переключение
-  // на уровне renderFinance, тут только тело секции. Легаси-ключи свёрнуты.
+  // section — плоская вкладка раздела «Деньги»: confirm | ops. Бейдж и
+  // переключение — на уровне renderMoneyScreen, тут только тело секции.
   section = section || cashboxSubTab || 'confirm';
   if (section === 'my') section = 'ops';          // «Мои сдачи» — секция внутри ops
   if (section === 'overview') section = 'confirm'; // «Обзор» переехал в Аналитику
@@ -4641,7 +4746,7 @@ async function renderCashbox(container, section) {
       </div>
   ` : '';
 
-  // Тело активной секции (вкладки на уровне renderFinance — без 2-го ряда).
+  // Тело активной секции (вкладки на уровне renderMoneyScreen — без 2-го ряда).
   // ops = формы + «Мои сдачи»; иначе (confirm) = подтверждения.
   let bodyHtml;
   if (section === 'ops') {
@@ -4731,7 +4836,7 @@ async function renderCashbox(container, section) {
       const payload = { order_id: orderId, reason, refund_method: selectedRefund, idempotency_key: idemKey() };
       if (items) payload.items = items;
       api('/api/returns/create', payload)
-        .then(r => { tg.showAlert(`✅ Возврат #${r.return_id} отправлен на подтверждение`); renderFinance(); })
+        .then(r => { tg.showAlert(`✅ Возврат #${r.return_id} отправлен на подтверждение`); renderMoneyScreen(); })
         .catch(e => { tg.showAlert('❌ ' + e.message); retBtn.disabled = false; });
     });
   }
@@ -4783,7 +4888,7 @@ async function renderCashbox(container, section) {
       try {
         await api('/api/payments/send', { items: parsed.items, comment, idempotency_key: idemKey() });
         tg.HapticFeedback?.notificationOccurred('success');
-        renderFinance();
+        renderMoneyScreen();
       } catch (e) {
         status.textContent = '❌ ' + e.message; status.className = 'pay-status pay-error';
         paySubmit.disabled = false;
@@ -4801,7 +4906,7 @@ async function renderCashbox(container, section) {
       haptic('light');
       createBtn.disabled = true;
       api('/api/deposits/create', { amount, idempotency_key: idemKey() })
-        .then(r => { tg.showAlert(`✅ Сдача #${r.deposit_id} отправлена на подтверждение`); renderFinance(); })
+        .then(r => { tg.showAlert(`✅ Сдача #${r.deposit_id} отправлена на подтверждение`); renderMoneyScreen(); })
         .catch(e => { tg.showAlert('❌ ' + e.message); createBtn.disabled = false; });
     });
   }
@@ -4815,7 +4920,7 @@ async function renderCashbox(container, section) {
       b.disabled = true;  // защита от двойного тапа (сервер идемпотентен, UX — нет)
       haptic('light');
       api('/api/deposits/confirm', { deposit_id: Number(id), idempotency_key: idemKey() })
-        .then(() => { tg.showAlert('✅ Сдача подтверждена'); renderFinance(); })
+        .then(() => { tg.showAlert('✅ Сдача подтверждена'); renderMoneyScreen(); })
         .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
     });
     const box = card.querySelector('.dep-reject-box');
@@ -4827,7 +4932,7 @@ async function renderCashbox(container, section) {
       if (b.disabled) return;
       b.disabled = true;
       api('/api/deposits/reject', { deposit_id: Number(id), reason })
-        .then(() => { tg.showAlert('❌ Сдача отклонена'); renderFinance(); })
+        .then(() => { tg.showAlert('❌ Сдача отклонена'); renderMoneyScreen(); })
         .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
     });
   });
@@ -4845,7 +4950,7 @@ async function renderCashbox(container, section) {
         return_id: Number(card.dataset.ret),
         idempotency_key: idemKey(),
       })
-        .then(() => { tg.showAlert('📦 Товар отмечен как принятый'); renderFinance(); })
+        .then(() => { tg.showAlert('📦 Товар отмечен как принятый'); renderMoneyScreen(); })
         .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
     });
     card.querySelector('.ret-confirm').addEventListener('click', (ev) => {
@@ -4854,7 +4959,7 @@ async function renderCashbox(container, section) {
       b.disabled = true;  // защита от двойного тапа
       haptic('light');
       api('/api/returns/confirm', { return_id: Number(card.dataset.ret), idempotency_key: idemKey() })
-        .then(() => { tg.showAlert('✅ Возврат подтверждён'); renderFinance(); })
+        .then(() => { tg.showAlert('✅ Возврат подтверждён'); renderMoneyScreen(); })
         .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
     });
   });
@@ -4869,7 +4974,7 @@ async function renderCashbox(container, section) {
         try {
           await api('/api/orders/confirm_payment', { order_id: id, idempotency_key: idemKey() });
           tg.HapticFeedback?.notificationOccurred('success');
-          renderFinance();
+          renderMoneyScreen();
         } catch (e) { tg.showAlert('❌ ' + e.message); btn.disabled = false; }
       });
     });
@@ -4883,7 +4988,7 @@ async function renderCashbox(container, section) {
         try {
           await api('/api/orders/reject_payment', { order_id: id, idempotency_key: idemKey() });
           tg.HapticFeedback?.notificationOccurred('warning');
-          renderFinance();
+          renderMoneyScreen();
         } catch (e) { tg.showAlert('❌ ' + e.message); btn.disabled = false; }
       });
     });
@@ -4892,7 +4997,7 @@ async function renderCashbox(container, section) {
 
 // Список «Клиенты» (boss/admin): контрагенты с МС-балансом + локальным долгом/
 // лимитом. Тап по карточке → детальная карточка контрагента.
-async function renderClients(container) {
+async function renderCreditLimits(container) {
   container = container || document.getElementById('content');
   container.innerHTML = loading('Загрузка клиентов…');
   let clients = [];
@@ -4984,7 +5089,7 @@ async function renderCurrencyRates() {
   const content = document.getElementById('content');
   content.innerHTML = loading('Загрузка курсов…');
   setScreenContext('Финансы · Курсы валют');
-  showBack(() => { financeTab = 'limits'; showScreen('finance'); });
+  showBack(() => { clientsTab = 'limits'; showScreen('clients'); });
 
   let data;
   try {
@@ -5110,7 +5215,7 @@ function shipmentItemsHtml(res) {
 async function renderAgentDetail(agentId) {
   const content = document.getElementById('content');
   content.innerHTML = loading('Загрузка клиента…');
-  showBack(() => { financeTab = 'limits'; showScreen('finance'); });
+  showBack(() => { clientsTab = 'limits'; showScreen('clients'); });
   let d;
   try {
     d = await api('/api/clients/detail', { agent_id: agentId });
