@@ -340,7 +340,7 @@ describe('техника: формы', () => {
     await window.__ready;
     const content = window.document.getElementById('content');
     expect(content.textContent).toContain('Первоначальный взнос');
-    expect(content.textContent).toContain('Оплачено');
+    expect(content.textContent).toContain('Получено');
     // 30.07 при «сегодня» 31.07 — просрочен; 30.08 — ещё впереди.
     expect(content.querySelector('[data-payment="11"]').closest('.c-row').dataset.status).toBe('overdue');
     expect(content.querySelector('[data-payment="12"]').closest('.c-row').dataset.status).toBe('upcoming');
@@ -765,14 +765,32 @@ describe('контейнеры', () => {
     expect(window.__writes[0][1].quantities).toEqual({ 10: '500', 11: '19' });
   });
 
-  it('удалить прибывший контейнер нельзя даже боссу', async () => {
+  it('прибывший контейнер удаляется, пока открыто окно правки', async () => {
+    // Приёмку могли завести не на тот контейнер — запрет означал бы вечную
+    // неверную строку в списке.
     const window = boot(`
       currentUser = { role: 'boss' };
       api = async () => (${JSON.stringify(CARD())});
       window.__ready = renderContainerCard(3);
     `);
     await window.__ready;
-    expect(window.document.querySelector('#cont-del')).toBeNull();
+    expect(window.document.querySelector('#cont-del')).not.toBeNull();
+  });
+
+  it('после закрытия окна карточка только читается', async () => {
+    const closed = { ...CARD(), edit_window: { open: false, hours_left: 0 } };
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify({ ...CARD(), edit_window: { open: false, hours_left: 0 } })});
+      window.__ready = renderContainerCard(3);
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('#cont-del')).toBeNull();
+    expect(content.querySelector('#cont-save')).toBeNull();
+    expect(content.querySelector('#cont-item-add')).toBeNull();
+    expect(content.textContent).toContain('Приёмка закрыта');
+    void closed;
   });
 });
 
@@ -918,5 +936,92 @@ describe('деньги: рассрочки в долгах и карточка �
     expect(content.textContent).toContain('Первоначальный взнос');
     // Взнос переключать нечем — кнопка только у планового платежа.
     expect(content.querySelectorAll('[data-payment]').length).toBe(1);
+  });
+});
+
+describe('рассрочка: частичные поступления', () => {
+  const CARD = (over) => ({
+    ok: true,
+    machine: { id: 7, name: 'JCB 3CX', vin: 'JCB7788', status: 'on_credit' },
+    photos: [], hours: [], next_statuses: [], can_manage: true,
+    can_upload_photo: false, status_labels: {},
+    deals: [{
+      id: 3, kind: 'credit', currency: 'USD', price_cents: 2500000,
+      sold_at: '2026-07-01', buyer_name: 'Иванов', closed_at: null,
+      progress: { paid_cents: 700000, planned_cents: 2500000, left_cents: 1800000 },
+      receipts: [{ id: 90, amount_cents: 200000, received_at: '2026-07-20 10:00', note: '' }],
+      payments: [
+        { id: 10, seq: 0, due_date: '2026-07-01', amount_cents: 500000,
+          paid_at: '2026-07-01', covered_cents: 500000, is_paid: true },
+        { id: 11, seq: 1, due_date: '2026-08-01', amount_cents: 400000,
+          paid_at: null, covered_cents: 200000, is_paid: false },
+        { id: 12, seq: 2, due_date: '2026-09-01', amount_cents: 400000,
+          paid_at: null, covered_cents: 0, is_paid: false },
+      ],
+    }],
+    ...over,
+  });
+  const boot7 = (card) => boot(`
+    currentUser = { role: 'boss' };
+    tg.showConfirm = (t, cb) => cb(true);
+    window.__writes = [];
+    api = async () => (${JSON.stringify(card)});
+    apiResult = async (p, b) => { window.__writes.push([p, b]); return { ok: true, status: 200, body: { ok: true }, error: '' }; };
+    window.__ready = renderMachineCard(7);
+  `);
+
+  it('частично внесённый платёж не выглядит неоплаченным', async () => {
+    // Клиент принёс часть — если показать «не оплачен», ему позвонят как
+    // ничего не заплатившему.
+    const window = boot7(CARD());
+    await window.__ready;
+    const row = window.document.querySelector('[data-payment="11"]').closest('.c-row');
+    expect(row.dataset.status).toBe('partial');
+    expect(row.textContent).toContain('внесено');
+  });
+
+  it('нетронутый платёж остаётся в своём состоянии', async () => {
+    const window = boot7(CARD());
+    await window.__ready;
+    const row = window.document.querySelector('[data-payment="12"]').closest('.c-row');
+    expect(row.dataset.status).toBe('upcoming');
+  });
+
+  it('итог показывает полученное, включая взнос', async () => {
+    const window = boot7(CARD());
+    await window.__ready;
+    const text = window.document.getElementById('content').textContent;
+    expect(text).toContain('Получено');
+    expect(text).toContain('осталось');
+  });
+
+  it('лента поступлений видна — иначе «сколько внесено» не проверить', async () => {
+    const window = boot7(CARD());
+    await window.__ready;
+    const text = window.document.getElementById('content').textContent;
+    expect(text).toContain('Поступления');
+    expect(window.document.querySelector('[data-receipt-del="90"]')).not.toBeNull();
+  });
+
+  it('оплата вводится суммой, а не только кнопкой «оплачен»', async () => {
+    const window = boot7(CARD());
+    await window.__ready;
+    window.document.querySelector('[data-receipt-add="3"]').click();
+    window.document.querySelector('#ms-f-amount').value = '1500';
+    window.document.querySelector('#ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    const call = window.__writes.find(([p]) => p === '/api/machines/receipt');
+    expect(call[1].deal_id).toBe(3);
+    expect(call[1].amount).toBe('1500');
+    expect(call[1].idempotency_key).toBeTruthy();
+  });
+
+  it('у закрытой сделки оплату не вносят', async () => {
+    const closed = CARD();
+    closed.deals[0].closed_at = '2026-09-01';
+    const window = boot7(closed);
+    await window.__ready;
+    expect(window.document.querySelector('[data-receipt-add]')).toBeNull();
   });
 });

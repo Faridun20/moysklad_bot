@@ -364,3 +364,181 @@ def test_payment_endpoint_is_boss_only(isolated_db, monkeypatch):
     assert _post(client, "/api/machines/payment", 2, payment_id=pid).status_code == 200
     # Повтор — 409: состояние на сервере уже другое, карточку надо перечитать.
     assert _post(client, "/api/machines/payment", 2, payment_id=pid).status_code == 409
+
+
+# ─── Частичные поступления ────────────────────────────────────────────────────
+# Клиент платит не «платёж №3», а деньги: в один месяц больше, в другой меньше.
+# График — план, поступления — факт, и один к одному они не ложатся.
+
+
+def test_receipts_cover_the_schedule_in_order(isolated_db):
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine()
+    deal = _credit(mid, months=5)          # 5 платежей по 4 000
+    # Принёс полтора платежа.
+    assert _run(machines.add_receipt(deal["deal_id"], 600_000, user_id=2))["ok"]
+
+    prog = _run(machines.deal_progress(deal["deal_id"]))
+    plan = [p for p in prog["payments"] if p["seq"] > 0]
+    assert plan[0]["is_paid"] is True
+    assert plan[1]["is_paid"] is False
+    assert plan[1]["covered_cents"] == 200_000   # половина второго
+    assert prog["left_cents"] == 1_400_000
+
+
+def test_overpayment_rolls_into_next_months(isolated_db):
+    """«В какие-то месяцы больше» — переплата не теряется и не висит остатком."""
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine()
+    deal = _credit(mid, months=5)
+    _run(machines.add_receipt(deal["deal_id"], 1_200_000, user_id=2))  # три платежа
+
+    plan = [p for p in _run(machines.deal_progress(deal["deal_id"]))["payments"] if p["seq"] > 0]
+    assert [p["is_paid"] for p in plan] == [True, True, True, False, False]
+
+
+def test_small_receipts_add_up(isolated_db):
+    """«В какие-то меньше»: два взноса по половине закрывают один платёж."""
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine()
+    deal = _credit(mid, months=5)
+    _run(machines.add_receipt(deal["deal_id"], 200_000, user_id=2))
+    plan = [p for p in _run(machines.deal_progress(deal["deal_id"]))["payments"] if p["seq"] > 0]
+    assert plan[0]["is_paid"] is False
+
+    _run(machines.add_receipt(deal["deal_id"], 200_000, user_id=2))
+    plan = [p for p in _run(machines.deal_progress(deal["deal_id"]))["payments"] if p["seq"] > 0]
+    assert plan[0]["is_paid"] is True
+
+
+def test_down_payment_is_not_eaten_by_receipts(isolated_db):
+    """Взнос получен в момент сделки — он не должен «съедать» поступления
+    второй раз."""
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine()
+    deal = _credit(mid, down=500_000, months=5)
+    _run(machines.add_receipt(deal["deal_id"], 400_000, user_id=2))
+
+    prog = _run(machines.deal_progress(deal["deal_id"]))
+    assert prog["down_payment_cents"] == 500_000
+    assert prog["paid_cents"] == 900_000
+    plan = [p for p in prog["payments"] if p["seq"] > 0]
+    assert plan[0]["is_paid"] is True
+
+
+def test_full_coverage_closes_the_deal(isolated_db):
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine()
+    deal = _credit(mid, months=2)
+    res = _run(machines.add_receipt(deal["deal_id"], 2_000_000, user_id=2))
+
+    assert res["deal_closed"] is True
+    assert _run(machines.get_machine(mid, role="boss"))["status"] == "sold"
+
+
+def test_receipt_into_a_closed_deal_is_rejected(isolated_db):
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine()
+    deal = _credit(mid, months=2)
+    _run(machines.add_receipt(deal["deal_id"], 2_000_000, user_id=2))
+
+    res = _run(machines.add_receipt(deal["deal_id"], 100, user_id=2))
+    assert res["ok"] is False
+    assert res["current"] == "closed"
+
+
+def test_deleting_a_receipt_reopens_the_deal(isolated_db):
+    """Убрали ошибочные деньги — рассрочка снова открыта, иначе долг исчезает
+    из напоминаний, хотя платёж не получен."""
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine()
+    deal = _credit(mid, months=2)
+    _run(machines.add_receipt(deal["deal_id"], 2_000_000, user_id=2))
+    receipt = _run(machines.list_receipts(deal["deal_id"]))[0]
+
+    res = _run(machines.delete_receipt(receipt["id"], user_id=2))
+    assert res["deal_reopened"] is True
+    assert _run(machines.get_machine(mid, role="boss"))["status"] == "on_credit"
+    plan = [p for p in _run(machines.deal_progress(deal["deal_id"]))["payments"] if p["seq"] > 0]
+    assert all(p["is_paid"] is False for p in plan)
+
+
+def test_deleting_a_receipt_takes_back_the_paid_mark(isolated_db):
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine()
+    deal = _credit(mid, months=5)
+    _run(machines.add_receipt(deal["deal_id"], 400_000, user_id=2))
+    receipt = _run(machines.list_receipts(deal["deal_id"]))[0]
+    _run(machines.delete_receipt(receipt["id"], user_id=2))
+
+    rows = [r for r in _run(machines.get_schedule(deal["deal_id"])) if r["seq"] > 0]
+    assert all(r["paid_at"] is None for r in rows)
+    # И платёж снова виден в напоминаниях — деньги-то не получены.
+    assert len(_run(machines.due_installments("2099-01-01"))) == 5
+
+
+def test_paid_button_still_works_as_a_full_receipt(isolated_db):
+    """Кнопка «оплачен» — частый случай «принёс ровно по графику»; заставлять
+    вводить сумму ради него незачем."""
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine()
+    deal = _credit(mid, months=5)
+    pid = [r for r in _run(machines.get_schedule(deal["deal_id"])) if r["seq"] == 1][0]["id"]
+
+    assert _run(machines.pay_installment(pid, user_id=2))["ok"] is True
+    assert _run(machines.list_receipts(deal["deal_id"]))[0]["amount_cents"] == 400_000
+    # Снятие отметки убирает то же поступление.
+    assert _run(machines.pay_installment(pid, user_id=2, paid=False))["ok"] is True
+    assert _run(machines.list_receipts(deal["deal_id"])) == []
+
+
+def test_negative_and_zero_receipts_are_rejected(isolated_db):
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine()
+    deal = _credit(mid)
+    for bad in (0, -100):
+        assert _run(machines.add_receipt(deal["deal_id"], bad, user_id=2))["ok"] is False
+
+
+def test_allocation_is_pure_and_testable():
+    from services import machines
+
+    schedule = [
+        {"id": 1, "seq": 0, "amount_cents": 500, "paid_at": "x"},
+        {"id": 2, "seq": 1, "amount_cents": 400, "paid_at": None},
+        {"id": 3, "seq": 2, "amount_cents": 400, "paid_at": None},
+    ]
+    rows = machines.allocate_receipts(schedule, 500)
+    assert rows[0]["is_paid"] is True          # взнос вне распределения
+    assert rows[1]["is_paid"] is True
+    assert rows[2]["covered_cents"] == 100

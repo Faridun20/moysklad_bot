@@ -46,6 +46,19 @@ def _item(cid, name="Кабель PV 0.6", expected=500, **over):
     return res["item_id"]
 
 
+def _close_window(db, cid, days=3):
+    """Отодвинуть дату прибытия в прошлое — окно правки закрывается само."""
+    from datetime import timedelta
+
+    from utils.helpers import local_now
+
+    past = (local_now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("UPDATE containers SET arrived_at = ? WHERE id = ?"), (past, cid))
+        conn.commit()
+
+
 # ─── Заведение ────────────────────────────────────────────────────────────────
 
 
@@ -131,10 +144,30 @@ def test_diff_counts_shortage_and_surplus(isolated_db):
     by_name = {r["name"]: r for r in rows}
     assert by_name["Кабель"]["state"] == "match"
     assert by_name["ThinkPower 6kw"]["delta"] == -2
-    assert by_name["Автомат C16"]["state"] == "extra"
+    # Автомат не заявляли — расхождение бывает только с тем, что обещали.
+    assert by_name["Автомат C16"]["state"] == "received"
+    assert by_name["Автомат C16"]["declared"] is False
 
     summary = containers.diff_summary(rows)
-    assert summary == {"total": 3, "unchecked": 0, "short": 1, "extra": 1, "mismatch": 2}
+    assert summary == {"total": 3, "unchecked": 0, "short": 1, "extra": 0,
+                       "received": 1, "mismatch": 1}
+
+
+def test_undeclared_items_are_not_a_mismatch(isolated_db):
+    """Контейнер, состав которого не заводили заранее, — это опись прибывшего,
+    а не сверка: красных строк в нём быть не должно."""
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    a = _item(cid, "Кабель", 0)
+    b = _item(cid, "Штекер", 0)
+    _run(containers.set_arrived_quantities(cid, {a: 500, b: 1000}, user_id=2))
+
+    summary = containers.diff_summary(containers.diff(_run(containers.list_items(cid))))
+    assert summary["mismatch"] == 0
+    assert summary["received"] == 2
 
 
 def test_check_can_be_taken_back(isolated_db):
@@ -209,8 +242,9 @@ def test_arrived_container_leaves_the_in_transit_shelf(isolated_db):
     assert _run(containers.count_by_status())["arrived"] == 1
 
 
-def test_arrived_container_is_not_deletable(isolated_db):
-    """Это уже история приёмки, по которой сверяли товар."""
+def test_arrived_container_is_deletable_while_the_window_is_open(isolated_db):
+    """Приёмку могли завести не на тот контейнер — запрет означал бы вечную
+    неверную строку в списке."""
     from services import containers
 
     db = isolated_db
@@ -218,9 +252,23 @@ def test_arrived_container_is_not_deletable(isolated_db):
     cid = _container()
     _run(containers.mark_arrived(cid, user_id=2))
 
+    assert _run(containers.delete_container(cid, user_id=2))["ok"] is True
+
+
+def test_closed_reception_is_not_deletable(isolated_db):
+    """После закрытия окна это история приёмки, по которой уже принимали
+    решения."""
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    _run(containers.mark_arrived(cid, user_id=2))
+    _close_window(db, cid)
+
     res = _run(containers.delete_container(cid, user_id=2))
     assert res["ok"] is False
-    assert "история" in res["error"]
+    assert "закрыта" in res["error"]
 
 
 def test_delete_removes_the_items_too(isolated_db):

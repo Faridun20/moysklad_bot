@@ -687,6 +687,20 @@ def _create_tables():
                 created_at    TEXT,
                 UNIQUE (deal_id, seq)
             )""",
+            # Фактические поступления по рассрочке. Отдельно от графика, потому
+            # что клиент платит не «платёж №3», а деньги: в один месяц больше,
+            # в другой меньше. График — план, поступления — факт, и один к
+            # одному они не ложатся. Покрытие графика считается распределением
+            # поступлений по порядку (`services.machines.allocate_receipts`).
+            f"""CREATE TABLE IF NOT EXISTS machine_payment_receipts (
+                id            {id_type},
+                deal_id       INTEGER NOT NULL REFERENCES machine_deals(id),
+                amount_cents  BIGINT NOT NULL,
+                received_at   TEXT NOT NULL,
+                received_by   BIGINT,
+                note          TEXT,
+                created_at    TEXT
+            )""",
             # Контейнеры в пути. Состав заводят при отправке («ожидалось»), при
             # прибытии проставляют факт — расхождение видно сразу, а не после
             # ручной сверки с накладной.
@@ -701,6 +715,19 @@ def _create_tables():
                 created_by   BIGINT NOT NULL,
                 created_at   TEXT,
                 updated_at   TEXT
+            )""",
+            # Связь контейнера с МойСклад: поставщик (нужен «Приёмке») и id
+            # созданного документа. Отдельной таблицей, а не колонками в
+            # `containers`: инкрементальных миграций в проекте нет, и новая
+            # колонка не доехала бы до уже существующей таблицы на проде.
+            """CREATE TABLE IF NOT EXISTS container_supply (
+                container_id   INTEGER PRIMARY KEY REFERENCES containers(id),
+                supplier_ms_id TEXT,
+                supplier_name  TEXT,
+                ms_supply_id   TEXT,
+                synced_at      TEXT,
+                unmatched      TEXT,
+                updated_at     TEXT
             )""",
             f"""CREATE TABLE IF NOT EXISTS container_items (
                 id            {id_type},
@@ -827,6 +854,8 @@ def _create_indexes():
             "ON machine_deal_payments(deal_id, seq)",
             "CREATE INDEX IF NOT EXISTS idx_machine_deal_payments_due "
             "ON machine_deal_payments(due_date)",
+            "CREATE INDEX IF NOT EXISTS idx_machine_receipts_deal "
+            "ON machine_payment_receipts(deal_id, received_at)",
             # ── Контейнеры ───────────────────────────────────────────────────
             "CREATE INDEX IF NOT EXISTS idx_containers_status ON containers(status)",
             "CREATE INDEX IF NOT EXISTS idx_container_items_container "
