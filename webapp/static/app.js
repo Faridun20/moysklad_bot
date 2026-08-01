@@ -399,11 +399,15 @@ async function renderStockScreen() {
 // (`services/work_queue`): в шаблоне он разъехался бы с ролями.
 function workQueueHtml(queue) {
   if (!queue || !queue.length) {
-    return `<div class="section-label">Требует вас</div>` + emptyState({
-      icon: 'check',
-      title: 'Всё разобрано',
-      hint: 'Ничего не ждёт вашего решения прямо сейчас.',
-    });
+    // Компактной строкой, а не полноэкранным emptyState: тот занимает треть
+    // экрана телефона, и «дел нет» выглядело как «экран не загрузился».
+    // Полноэкранная пустота уместна там, где она И ЕСТЬ весь экран.
+    return `<div class="section-label">Требует вас</div>`
+      + `<div class="c-surface c-surface--list"><div class="c-row queue-empty">`
+      + `<div class="card-row-icon">${icon('check')}</div>`
+      + `<div class="card-row-info"><div class="card-row-title">Всё разобрано</div>`
+      + `<div class="card-row-sub">Ничего не ждёт вашего решения прямо сейчас</div></div>`
+      + `</div></div>`;
   }
   const total = queue.reduce((a, i) => a + Number(i.count || 0), 0);
   const rows = queue.map(i => `
