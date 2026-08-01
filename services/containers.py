@@ -42,6 +42,13 @@ STATUS_LABELS = {
     "arrived": "📦 Прибыл",
 }
 
+# Таблицы, ссылающиеся на `containers`. Удаление контейнера обязано пройти по
+# всему списку: FK на Postgres энфорсятся, на SQLite — нет, поэтому забытая
+# дочерняя таблица не падает ни в одном тесте и всплывает 500-й на проде.
+# Завели новую таблицу с `container_id` — дописать сюда.
+# Сторож: tests/test_containers.py::test_delete_leaves_no_orphans_anywhere.
+CHILD_TABLES = ("container_items", "container_supply")
+
 _NUMBER_SEPARATORS = re.compile(r"[\s\-—–_]+")
 _NUMBER_MAX = 32
 _NAME_MAX = 200
@@ -241,8 +248,12 @@ async def delete_container(container_id: int, *, user_id: int, full_name: str = 
     тот контейнер, и запрет означал бы вечную неверную строку в списке. После
     закрытия окна это история приёмки, по которой уже принимали решения.
 
-    Состав чистим явно — на SQLite внешние ключи по умолчанию выключены, и без
-    этого удаление вело бы себя по-разному в тестах и на проде.
+    **Всех детей чистим явно, и это не формальность.** На SQLite внешние ключи
+    по умолчанию выключены, на Postgres — нет: пропущенная дочерняя таблица не
+    видна ни в одном тесте и всплывает на проде как 500 в момент удаления. Так
+    и случилось с `container_supply` — её добавили, а сюда не дописали.
+    Дочерние таблицы перечислены одним списком, чтобы следующую было видно куда
+    добавлять.
     """
     async with adb_core.transaction() as txn:
         row = await txn.fetchrow(
@@ -256,7 +267,8 @@ async def delete_container(container_id: int, *, user_id: int, full_name: str = 
                 "ok": False,
                 "error": f"Приёмка закрыта — правки принимались {EDIT_WINDOW_HOURS} ч после прибытия",
             }
-        await txn.execute("DELETE FROM container_items WHERE container_id = $1", container_id)
+        for child in CHILD_TABLES:
+            await txn.execute(f"DELETE FROM {child} WHERE container_id = $1", container_id)
         await txn.execute("DELETE FROM containers WHERE id = $1", container_id)
     await _audit(user_id, full_name, "container_deleted", f"#{container_id} · {row['number']}")
     return {"ok": True}

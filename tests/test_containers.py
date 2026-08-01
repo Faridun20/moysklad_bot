@@ -416,3 +416,68 @@ def test_unknown_status_filter_is_400(isolated_db, monkeypatch):
     _setup(db)
     r = _post(_client(monkeypatch), "/api/containers/list", 1, status="edet")
     assert r.status_code == 400
+
+
+# ─── Сирот после удаления быть не должно ──────────────────────────────────────
+
+
+def _tables_referencing(db, parent: str) -> list[str]:
+    """Все таблицы с внешним ключом на `parent` — по самой схеме, а не по списку
+    в тесте: список пришлось бы дописывать руками, а именно этого и не делают."""
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        names = [r[0] for r in cur.fetchall()]
+        out = []
+        for name in names:
+            cur.execute(f"PRAGMA foreign_key_list({name})")
+            if any(row[2] == parent for row in cur.fetchall()):
+                out.append(name)
+    return out
+
+
+def test_delete_leaves_no_orphans_anywhere(isolated_db):
+    """Регресс: `container_supply` не чистился при удалении контейнера.
+
+    На SQLite внешние ключи выключены, поэтому сирота не мешает и тест на
+    «удалилось» проходил; на Postgres FK энфорсится, и удаление падало 500-й.
+    Проверяем не конкретную таблицу, а ВСЕ дочерние по схеме — тогда следующая
+    такая таблица поймается сама, без правки этого теста.
+    """
+    from services import containers, ms_supply
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    _item(cid, "Кабель", 500)
+    _run(ms_supply.set_supplier(cid, ms_id="agent-1", name="ООО Поставщик"))
+
+    children = _tables_referencing(db, "containers")
+    assert "container_items" in children and "container_supply" in children, children
+    # Список в сервисе обязан покрывать схему — иначе он и есть источник бага.
+    assert set(children) <= set(containers.CHILD_TABLES), (
+        f"в схеме есть дети контейнера, которых нет в CHILD_TABLES: "
+        f"{sorted(set(children) - set(containers.CHILD_TABLES))}"
+    )
+
+    assert _run(containers.delete_container(cid, user_id=2))["ok"] is True
+
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        for table in children:
+            cur.execute(db.q(f"SELECT COUNT(*) FROM {table} WHERE container_id = ?"), (cid,))
+            assert cur.fetchone()[0] == 0, f"осиротевшие строки в {table}"
+
+
+def test_container_with_supplier_is_deletable(isolated_db):
+    """Боевой сценарий из логов: у контейнера задан поставщик — удаление
+    падало ForeignKeyViolationError."""
+    from services import containers, ms_supply
+
+    db = isolated_db
+    _setup(db)
+    cid = _container()
+    _run(ms_supply.set_supplier(cid, ms_id="agent-1", name="ООО Поставщик"))
+
+    assert _run(containers.delete_container(cid, user_id=2))["ok"] is True
+    assert _run(ms_supply.get_link(cid)) == {"unmatched": []}
