@@ -347,3 +347,62 @@ def test_stale_draft_takes_names_only(isolated_db, monkeypatch):
     from services import channel
 
     assert channel.contains_quantities(body["text"]) is False
+
+
+# ─── Фото товаров ─────────────────────────────────────────────────────────────
+
+
+def test_product_photo_is_idempotent(isolated_db):
+    """Тот же снимок второй раз — не ошибка и не дубль в карточке."""
+    from services import product_photos
+
+    db = isolated_db
+    _setup(db)
+    first = _run(product_photos.add_photo(
+        "p-1", tg_file_id="A", file_unique_id="U1", uploaded_by=2))
+    second = _run(product_photos.add_photo(
+        "p-1", tg_file_id="B", file_unique_id="U1", uploaded_by=2))
+    assert first["duplicate"] is False and second["duplicate"] is True
+    assert len(_run(product_photos.list_photos("p-1"))) == 1
+
+
+def test_product_photo_delete_is_scoped(isolated_db):
+    """Иначе photo_id из формы стирает снимок чужого товара."""
+    from services import product_photos
+
+    db = isolated_db
+    _setup(db)
+    _run(product_photos.add_photo("p-1", tg_file_id="A", file_unique_id="U1", uploaded_by=2))
+    photo_id = _run(product_photos.list_photos("p-1"))[0]["id"]
+
+    assert _run(product_photos.delete_photo("p-2", photo_id))["ok"] is False
+    assert _run(product_photos.delete_photo("p-1", photo_id))["ok"] is True
+
+
+def test_photo_counts_are_batched(isolated_db):
+    """Экран выбора товара иначе даёт N+1 на первом же открытии."""
+    from services import product_photos
+
+    db = isolated_db
+    _setup(db)
+    _run(product_photos.add_photo("p-1", tg_file_id="A", file_unique_id="U1", uploaded_by=2))
+    _run(product_photos.add_photo("p-1", tg_file_id="B", file_unique_id="U2", uploaded_by=2))
+    _run(product_photos.add_photo("p-2", tg_file_id="C", file_unique_id="U3", uploaded_by=2))
+
+    assert _run(product_photos.photos_by_products(["p-1", "p-2", "p-3"])) == {"p-1": 2, "p-2": 1}
+    assert _run(product_photos.photos_by_products([])) == {}
+
+
+def test_photo_list_never_leaks_file_ids(isolated_db, monkeypatch):
+    """Файловый URL Telegram содержит токен бота — наружу идут только id."""
+    from services import product_photos
+
+    db = isolated_db
+    _setup(db)
+    _run(product_photos.add_photo(
+        "p-1", tg_file_id="AgAC-secret", file_unique_id="U1", uploaded_by=2))
+
+    r = _post(_client(monkeypatch), "/api/products/photos", 2, ms_id="p-1")
+    assert r.status_code == 200, r.text
+    assert "AgAC-secret" not in r.text
+    assert set(r.json()["photos"][0]) == {"id", "caption", "uploaded_at"}

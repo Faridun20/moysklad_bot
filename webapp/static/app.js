@@ -746,12 +746,38 @@ function openPriceEditor(product) {
         <span>Себестоимость</span>
         <input type="number" inputmode="decimal" id="pe-cost" value="${product.cost_price ?? ''}" placeholder="—">
       </label>
+      <div id="pe-photos"></div>
+      <div class="c-actions c-actions--wrap">
+        <button class="btn-secondary" id="pe-photo-add">${icon('plus')} Фото</button>
+        <button class="btn-secondary" id="pe-post">${icon('cart')} Пост в канал</button>
+      </div>
       <div class="price-actions">
         <button class="btn-secondary" id="pe-cancel">Отмена</button>
         <button class="btn-primary" id="pe-save">Сохранить</button>
       </div>
     </div>`;
   document.body.appendChild(ov);
+
+  // Фото товара — тем же механизмом, что у техники: файл живёт в Telegram, у
+  // нас идентификаторы. Из МойСклад картинки не тянем — их там нет.
+  const reloadPhotos = async () => {
+    const box = ov.querySelector('#pe-photos');
+    if (!box) return;
+    const res = await apiResult('/api/products/photos', { ms_id: msId });
+    if (!res.ok) { box.innerHTML = ''; return; }
+    box.innerHTML = photoStripHtml(res.body.photos, {
+      addId: 'pe-photo-add-hidden', canUpload: false, alt: 'Фото товара',
+    });
+    await loadPhotos(box, '/api/products/photo', (photoId) => ({
+      ms_id: msId, photo_id: photoId,
+    }));
+  };
+  reloadPhotos();
+
+  ov.querySelector('#pe-photo-add').addEventListener('click', () =>
+    pickPhoto('/api/products/photo_upload', { ms_id: msId }, reloadPhotos));
+  ov.querySelector('#pe-post').addEventListener('click', () =>
+    openChannelComposer('showcase', { ms_id: msId }));
   const close = () => {
     ov.remove();
     document.removeEventListener('keydown', onKey, true);
@@ -1629,45 +1655,50 @@ async function renderContainerCard(containerId) {
 // Blob-URL живёт до закрытия документа: без revoke каждая пересборка карточки
 // оставляет копию снимка в памяти WebView, и за сессию их накапливаются
 // десятки мегабайт.
-let _machinePhotoUrls = [];
+let _photoUrls = [];
 
-function revokeMachinePhotoUrls() {
-  for (const url of _machinePhotoUrls) {
+function revokePhotoUrls() {
+  for (const url of _photoUrls) {
     try { URL.revokeObjectURL(url); } catch { /* уже отозван */ }
   }
-  _machinePhotoUrls = [];
+  _photoUrls = [];
 }
 
-function machinePhotosHtml(card) {
-  const photos = card.photos || [];
-  const upload = card.can_upload_photo
-    ? `<button class="btn-secondary" id="machine-photo-add">${icon('plus')} Добавить фото</button>`
+// Лента фото — общая для техники и товаров: механизм один (файл в Telegram,
+// у нас идентификаторы), и различаются только ручка и её тело.
+function photoStripHtml(photos, { addId, canUpload, alt }) {
+  const rows = photos || [];
+  const upload = canUpload
+    ? `<button class="btn-secondary" id="${addId}">${icon('plus')} Добавить фото</button>`
     : '';
-  if (!photos.length) {
+  if (!rows.length) {
     return upload
       ? `<div class="section-label">Фото</div><div class="c-actions">${upload}</div>`
       : '';
   }
-  const strip = photos.map(p =>
-    `<button class="machine-photo" data-photo="${p.id}" aria-label="${escapeHtml(p.caption || 'Фото машины')}">` +
+  const strip = rows.map(p =>
+    `<button class="machine-photo" data-photo="${p.id}" aria-label="${escapeHtml(p.caption || alt)}">` +
     `<img alt="${escapeHtml(p.caption || '')}" loading="lazy"></button>`
   ).join('');
-  return `<div class="section-label">Фото · ${photos.length}</div>
+  return `<div class="section-label">Фото · ${rows.length}</div>
     <div class="machine-photos">${strip}</div>
     ${upload ? `<div class="c-actions">${upload}</div>` : ''}`;
 }
 
-async function loadMachinePhotos(machineId, root) {
+// Файл едет через нашу ручку (POST + initData), поэтому <img src> не годится:
+// прямая ссылка Telegram содержит токен бота, а браузер не умеет POST'ить за
+// картинкой. Тянем байты fetch'ем и показываем как blob-URL.
+async function loadPhotos(root, endpoint, bodyFor) {
   for (const btn of (root || document).querySelectorAll('.machine-photo[data-photo]')) {
     try {
-      const r = await fetch('/api/machines/photo', {
+      const r = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ initData: _initData, machine_id: machineId, photo_id: Number(btn.dataset.photo) }),
+        body: JSON.stringify({ initData: _initData, ...bodyFor(Number(btn.dataset.photo)) }),
       });
       if (!r.ok) throw new Error('нет фото');
       const url = URL.createObjectURL(await r.blob());
-      _machinePhotoUrls.push(url);
+      _photoUrls.push(url);
       const img = btn.querySelector('img');
       if (img) img.src = url;
     } catch {
@@ -1675,6 +1706,20 @@ async function loadMachinePhotos(machineId, root) {
       btn.remove();
     }
   }
+}
+
+function machinePhotosHtml(card) {
+  return photoStripHtml(card.photos, {
+    addId: 'machine-photo-add',
+    canUpload: card.can_upload_photo,
+    alt: 'Фото машины',
+  });
+}
+
+async function loadMachinePhotos(machineId, root) {
+  await loadPhotos(root, '/api/machines/photo', (photoId) => ({
+    machine_id: machineId, photo_id: photoId,
+  }));
 }
 
 // Ужимаем снимок ДО отправки: телефонные 3–5 МБ упираются в лимит ручки, а на
@@ -1700,7 +1745,7 @@ function shrinkImage(file, maxSide = 1600, quality = 0.8) {
   });
 }
 
-function pickMachinePhoto(machineId) {
+function pickPhoto(endpoint, body, onDone) {
   const input = document.createElement('input');
   input.type = 'file';
   input.accept = 'image/*';
@@ -1715,24 +1760,27 @@ function pickMachinePhoto(machineId) {
       tg.showAlert ? tg.showAlert(e.message) : alert(e.message);
       return;
     }
-    const res = await apiResult('/api/machines/photo_upload', {
-      machine_id: machineId, data_url: dataUrl,
-    });
+    const res = await apiResult(endpoint, { ...body, data_url: dataUrl });
     if (!res.ok) {
       tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
       return;
     }
     haptic('success');
     toast(res.body.duplicate ? 'Это фото уже есть' : 'Фото добавлено');
-    renderMachineCard(machineId);
+    if (onDone) onDone();
   });
   input.click();
+}
+
+function pickMachinePhoto(machineId) {
+  pickPhoto('/api/machines/photo_upload', { machine_id: machineId },
+    () => renderMachineCard(machineId));
 }
 
 async function renderMachineCard(machineId) {
   const content = document.getElementById('content');
   // Прошлые снимки больше не на экране — их blob-URL'ы держат память WebView.
-  revokeMachinePhotoUrls();
+  revokePhotoUrls();
   content.innerHTML = skeleton('label') + skeleton('list', 5);
   setScreenContext('Техника · карточка');
   showBack(() => { ordersSubTab = 'machines'; showScreen('orders'); });

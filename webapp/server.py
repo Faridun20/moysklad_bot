@@ -2042,6 +2042,52 @@ async def api_products_photo(request: Request):
     )
 
 
+@app.post("/api/products/photos")
+async def api_products_photos(request: Request):
+    """Список фото товара. `tg_file_id` наружу не отдаём — клиенту нужен только
+    `photo_id`, а файловый URL Telegram содержит токен бота."""
+    from services import product_photos
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_products_photos",
+    )
+    ms_id = (data.get("ms_id") or "").strip()[:64]
+    if not ms_id:
+        raise HTTPException(status_code=400, detail="Не указан товар")
+    photos = await product_photos.list_photos(ms_id)
+    return JSONResponse({
+        "ok": True,
+        "photos": [
+            {
+                "id": int(p["id"]),
+                "caption": p.get("caption") or "",
+                "uploaded_at": p.get("uploaded_at") or "",
+            }
+            for p in photos
+        ],
+        "can_upload": _machine_photos_chat_id() is not None,
+    })
+
+
+@app.post("/api/products/photo_delete")
+async def api_products_photo_delete(request: Request):
+    """Открепить фото товара. Скоупится товаром — иначе `photo_id` из формы
+    стирает чужой снимок."""
+    from services import product_photos
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_products_photo_delete"
+    )
+    ms_id = (data.get("ms_id") or "").strip()[:64]
+    photo_id = _machine_id_arg(data, "photo_id")
+    if not ms_id:
+        raise HTTPException(status_code=400, detail="Не указан товар")
+    return _machine_response(await product_photos.delete_photo(ms_id, photo_id))
+
+
 @app.post("/api/products/photo_upload")
 async def api_products_photo_upload(request: Request):
     """Загрузить фото товара. base64 в JSON — как у техники: `python-multipart`
