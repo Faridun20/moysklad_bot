@@ -70,8 +70,15 @@ describe('статус-система (UI-WP-02)', () => {
 });
 
 describe('тёмная тема (UI-WP-30)', () => {
-  const darkStart = css.indexOf('[data-theme="dark"]');
-  const darkBlock = css.slice(darkStart, darkStart + 2000);
+  // Берём ТЕЛО правила, а не окно фиксированной длины от первого упоминания.
+  // Первым `[data-theme="dark"]` в файле идёт ссылка из комментария в :root, и
+  // окно в 2000 символов доставало до настоящего блока только пока :root был
+  // достаточно коротким — то есть тест держался на удаче, а не на инварианте.
+  const withoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
+  const darkStart = withoutComments.indexOf('[data-theme="dark"]');
+  const darkBlock = withoutComments.slice(
+    darkStart, withoutComments.indexOf('}', darkStart) + 1,
+  );
 
   it('семантические цвета имеют тёмный вариант', () => {
     // Эти токены — единственный источник цвета для статусов; без тёмного
@@ -143,5 +150,88 @@ describe('токены шкал (UI-WP-03)', () => {
     }
     const primitive = css.slice(css.indexOf('.c-row {'), css.indexOf('}', css.indexOf('.c-row {')));
     expect(primitive).toMatch(/var\(--sp-/);
+  });
+});
+
+describe('стекло (S7)', () => {
+  const withoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  // Селектор перед объявлением: наивный `[^{}]*` не годится — правила лежат
+  // внутри @supports, и скобки вложены.
+  const selectorBefore = (idx) => {
+    const head = withoutComments.slice(0, idx);
+    const open = head.lastIndexOf('{');
+    const prev = Math.max(head.lastIndexOf('}', open), head.lastIndexOf('{', open - 1));
+    return head.slice(prev + 1, open).trim();
+  };
+
+  it('размытие стоит только на неподвижном', () => {
+    // backdrop-filter на строках списка роняет прокрутку в WebView, а текст на
+    // полупрозрачном фоне теряет контраст. Карточки остаются плотными.
+    const allowed = ['.u-glass', '.bottom-nav', '.seg'];
+    const seen = [];
+    for (const m of withoutComments.matchAll(/backdrop-filter:/g)) {
+      const sel = selectorBefore(m.index);
+      seen.push(sel);
+      expect(allowed.some((a) => sel.includes(a)), `размытие на «${sel}»`).toBe(true);
+    }
+    expect(seen.length).toBeGreaterThan(0);
+  });
+
+  it('без поддержки backdrop-filter остаётся плотный фон', () => {
+    // Полупрозрачный тинт без размытия нечитаем, поэтому базовое правило
+    // .u-glass красится непрозрачной поверхностью, а стекло включается
+    // только внутри @supports.
+    const base = withoutComments.match(/\.u-glass\s*\{([^}]*)\}/);
+    expect(base, 'базовое правило .u-glass пропало').not.toBeNull();
+    expect(base[1]).toMatch(/background:\s*var\(--bg-card\)/);
+    expect(base[1]).not.toMatch(/backdrop-filter/);
+  });
+
+  it('у стекла есть тёмный вариант, а не инверсия светлого', () => {
+    const darkStart = withoutComments.indexOf('[data-theme="dark"]');
+    const darkBlock = withoutComments.slice(
+      darkStart, withoutComments.indexOf('}', darkStart) + 1,
+    );
+    for (const token of ['--glass-bg', '--glass-edge', '--glass-spec', '--field-dot']) {
+      expect(darkBlock.includes(`${token}:`), `нет тёмного варианта: ${token}`).toBe(true);
+    }
+  });
+
+  it('поле под стеклом производно от темы, а не второй набор цветов', () => {
+    // Иначе подложка спорит с темой пользователя: у него зелёный акцент, а
+    // страница синеет. Вывод из темы живёт внутри @supports (color-mix), а
+    // первое объявление — фолбэк для WebView без него.
+    const declarations = [...withoutComments.matchAll(/--field-1:\s*([^;]+);/g)].map(m => m[1]);
+    expect(declarations.length).toBeGreaterThan(1);
+    expect(declarations.some(v => /var\(--accent\)/.test(v))).toBe(true);
+  });
+
+  it('у color-mix есть фолбэк — иначе фон отваливается целиком', () => {
+    // Невалидное значение делает custom property guaranteed-invalid, и
+    // `background`, ссылающийся на неё через var(), не применяется вовсе:
+    // старый WebView остался бы без фона, а не «без украшения». Поэтому
+    // базовые объявления обязаны быть без color-mix, а вывод из темы — под
+    // @supports.
+    const baseRoot = withoutComments.slice(
+      withoutComments.indexOf(':root {'), withoutComments.indexOf('\n}'),
+    );
+    expect(baseRoot).not.toMatch(/color-mix/);
+    const baseHero = withoutComments.match(/\.hero\s*\{([^}]*)\}/)[1];
+    expect(baseHero).toMatch(/background:\s*var\(--accent\)/);
+    expect(baseHero).not.toMatch(/color-mix/);
+    // И при этом вывод из темы всё-таки есть.
+    expect(withoutComments).toMatch(/@supports \(color: color-mix/);
+  });
+
+  it('состояние строки видно формой, а не только цветом текста', () => {
+    // На площадке при ярком солнце цвет теряется первым.
+    const stripe = withoutComments.match(/\.c-row\[data-status\]::before\s*\{([^}]*)\}/);
+    expect(stripe, 'полоса состояния у строки списка пропала').not.toBeNull();
+    expect(stripe[1]).toMatch(/background:\s*var\(--status-c\)/);
+  });
+
+  it('украшения отключаются при запросе повышенного контраста', () => {
+    expect(withoutComments).toMatch(/@media \(prefers-contrast: more\)/);
   });
 });

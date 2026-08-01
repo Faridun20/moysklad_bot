@@ -81,6 +81,39 @@
   --info-bg:     #d6ebff;
   --neutral:     #4f4f4f;             /* серый текст бейджа «черновик» */
   --neutral-bg:  #ebebeb;
+
+  /* ── Стекло (S7) ────────────────────────────────────────────────────────
+     Размытие ставим ТОЛЬКО на неподвижное: нижнюю панель и переключатель
+     вкладок. `backdrop-filter` на полусотне строк списка роняет прокрутку в
+     WebView, а текст на полупрозрачном фоне теряет контраст — карточки
+     остаются плотными поверхностями.
+
+     Тинт задаётся своим токеном, а не прозрачностью --bg-card: тема Telegram
+     отдаёт непрозрачный цвет, и «полупрозрачным» его сделать нельзя. */
+  --glass-bg:    rgba(255, 255, 255, 0.72);
+  --glass-edge:  rgba(255, 255, 255, 0.66);
+  --glass-blur:  saturate(180%) blur(20px);
+  --glass-spec:  rgba(255, 255, 255, 0.9);   /* блик по верхней кромке */
+
+  /* Подложка под стекло. В Telegram фон задаёт тема пользователя и он часто
+     плоский — размывать нечего, и «стекло» выродилось бы в мутно-белый
+     прямоугольник. Поэтому страница рисует собственное поле: две мягкие
+     диагональные полосы и точечная сетка накладной. Всё производное от
+     --accent, чтобы поле не спорило с темой. */
+  --field-1:     rgba(0, 122, 255, 0.11);
+  --field-2:     rgba(30, 142, 62, 0.09);
+  --field-dot:   rgba(0, 0, 0, 0.045);
+}
+
+/* Поле выводим из акцента ТЕМЫ, но только там, где color-mix поддержан.
+   Без @supports невалидное значение делает custom property «guaranteed-invalid»,
+   и `background` со ссылкой на него отваливается ЦЕЛИКОМ — вместе с
+   var(--bg-page). Старый WebView остался бы с прозрачной страницей. */
+@supports (color: color-mix(in srgb, red 50%, blue)) {
+  :root {
+    --field-1: color-mix(in srgb, var(--accent) 14%, transparent);
+    --field-2: color-mix(in srgb, var(--success) 11%, transparent);
+  }
 }
 
 /* Тёмная тема Telegram (data-theme выставляет applyTelegramTheme в app.js).
@@ -103,6 +136,12 @@
   --info-bg:     rgba(90, 169, 240, 0.16);
   --neutral:     #c2c2c8;
   --neutral-bg:  rgba(255, 255, 255, 0.12);
+  /* Стекло на тёмной теме — не инверсия светлого: тинт уходит в холодный
+     графит, блик слабее (яркая кромка на тёмном читается как царапина). */
+  --glass-bg:    rgba(28, 30, 36, 0.68);
+  --glass-edge:  rgba(150, 175, 195, 0.20);
+  --glass-spec:  rgba(170, 200, 225, 0.28);
+  --field-dot:   rgba(255, 255, 255, 0.05);
 }
 
 /* Тёмная тема ВНЕ Telegram (обычный браузер): applyTelegramTheme ставит
@@ -123,7 +162,42 @@
     --warn:       #f5c451;  --warn-strong: #f9b542; --warn-bg: rgba(249, 168, 37, 0.16);
     --info:       #5aa9f0;  --info-bg:    rgba(90, 169, 240, 0.16);
     --neutral:    #c2c2c8;  --neutral-bg: rgba(255, 255, 255, 0.12);
+    --glass-bg:   rgba(28, 30, 36, 0.68);
+    --glass-edge: rgba(150, 175, 195, 0.20);
+    --glass-spec: rgba(170, 200, 225, 0.28);
+    --field-dot:  rgba(255, 255, 255, 0.05);
   }
+}
+
+/* ─── Стекло ──────────────────────────────────────────────────────────────
+   Один примитив на всё стеклянное, чтобы поверхности не разъехались при
+   первой же правке. Без поддержки backdrop-filter (старые WebView) остаётся
+   плотный фон: полупрозрачная панель без размытия нечитаема. */
+.u-glass {
+  background: var(--bg-card);
+  border: 1px solid var(--divider);
+  position: relative;
+}
+@supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
+  .u-glass {
+    background: var(--glass-bg);
+    border-color: var(--glass-edge);
+    -webkit-backdrop-filter: var(--glass-blur);
+    backdrop-filter: var(--glass-blur);
+  }
+  /* Блик по верхней кромке — то, что отличает стекло от полупрозрачного
+     прямоугольника. Гасим для prefers-contrast: там важнее граница. */
+  .u-glass::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 14%; right: 14%; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--glass-spec), transparent);
+    pointer-events: none;
+  }
+}
+@media (prefers-contrast: more) {
+  .u-glass { background: var(--bg-card); border-color: var(--text-mute); }
+  .u-glass::before { display: none; }
 }
 
 /* Утилита: скрыть элемент без инлайн-стилей в JS. */
@@ -235,11 +309,25 @@
 body {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
                "Segoe UI", Roboto, sans-serif;
-  background: var(--bg-page);
+  /* Собственное поле под стеклом: точечная сетка накладной + две мягкие
+     диагональные полосы поверх фона темы. Без него размывать нечего — в
+     Telegram фон часто плоский, и панель выглядела бы мутно-белой.
+     `fixed` — чтобы поле не ехало со списком и не мельтешило при прокрутке. */
+  background:
+    radial-gradient(circle at 1px 1px, var(--field-dot) 1px, transparent 0) 0 0 / 14px 14px,
+    linear-gradient(118deg, var(--field-1) 0%, transparent 46%),
+    linear-gradient(296deg, var(--field-2) 0%, transparent 48%),
+    var(--bg-page);
+  background-attachment: fixed;
   color: var(--text);
   font-size: 15px;
   line-height: 1.4;
   -webkit-font-smoothing: antialiased;
+}
+
+/* Поле — украшение. Кому важен контраст, тому важнее ровный фон. */
+@media (prefers-contrast: more) {
+  body { background: var(--bg-page); }
 }
 
 .app {
@@ -372,6 +460,31 @@ body {
   margin-bottom: 8px;
   box-shadow: var(--shadow-float);
   text-align: center;
+  position: relative;
+  overflow: hidden;
+}
+/* Градиент от акцента ТЕМЫ, а не второй хардкод-цвет: на любой теме Telegram
+   блок остаётся «своим», но перестаёт быть плоской заливкой. Внутри @supports
+   по той же причине, что и поле, — иначе фон hero отвалился бы целиком. */
+@supports (color: color-mix(in srgb, red 50%, blue)) {
+  .hero {
+    background: linear-gradient(140deg,
+      var(--accent) 0%,
+      color-mix(in srgb, var(--accent) 78%, #000) 100%);
+  }
+}
+
+/* Блик — один, из верхнего угла: имитирует преломление, а не «свечение».
+   Белый, а не производный от --accent-fg: текст на hero и так им красится,
+   и второй источник того же цвета дал бы разную яркость на разных темах. */
+.hero::after {
+  content: '';
+  position: absolute;
+  inset: -45% -25% auto auto;
+  width: 90%; height: 150%;
+  background: radial-gradient(circle at 60% 30%,
+    rgba(255, 255, 255, 0.20), transparent 55%);
+  pointer-events: none;
 }
 
 /* Текст на hero берёт цвет из --accent-fg (= tg-theme-button-text-color),
@@ -724,6 +837,27 @@ body {
   border-radius: 24px;
   padding: 8px;
   box-shadow: var(--shadow-float);
+  position: relative;
+}
+/* Панель неподвижна — размытие ей ничего не стоит на прокрутке. */
+@supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
+  .bottom-nav {
+    background: var(--glass-bg);
+    border-color: var(--glass-edge);
+    -webkit-backdrop-filter: var(--glass-blur);
+    backdrop-filter: var(--glass-blur);
+  }
+  .bottom-nav::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 16%; right: 16%; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--glass-spec), transparent);
+    pointer-events: none;
+  }
+}
+@media (prefers-contrast: more) {
+  .bottom-nav { background: var(--bg-card); }
+  .bottom-nav::before { display: none; }
 }
 
 .nav-item {
@@ -1133,6 +1267,20 @@ body {
 /* Карточка со статусом: цветная полоса слева. */
 .order-card[data-status],
 .debt-card[data-status] { border-left-color: var(--status-c); }
+
+/* Строка списка со статусом — та же полоса, но нарисованная псевдоэлементом:
+   у .c-row нет своей рамки, а состояние должно читаться формой, а не только
+   цветом. На площадке при ярком солнце цвет теряется первым. */
+.c-row[data-status] { position: relative; }
+.c-row[data-status]::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 8px; bottom: 8px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--status-c);
+  pointer-events: none;
+}
 
 /* Бейдж статуса внутри такой карточки. */
 [data-status] .c-badge {
@@ -1689,6 +1837,17 @@ body {
 .seg {
   display: flex; gap: 4px; flex: 1; min-width: 0;
   background: var(--bg-soft); border-radius: 14px; padding: 4px;
+}
+@supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
+  .seg {
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-edge);
+    -webkit-backdrop-filter: var(--glass-blur);
+    backdrop-filter: var(--glass-blur);
+  }
+}
+@media (prefers-contrast: more) {
+  .seg { background: var(--bg-soft); border-color: var(--divider); }
 }
 .seg-item {
   flex: 1; min-width: 0; padding: 12px 8px; min-height: 44px; border: 0;
