@@ -608,6 +608,26 @@ body {
 .card-row--static { cursor: default; }
 /* Иконка-кружок с предупреждающим тоном (блок «Требует внимания» на главной). */
 .card-row-icon--warn { background: var(--warn-bg); color: var(--warn); }
+
+/* Счётчик в очереди дел на «Сегодня». Число вместо иконки: у всех пунктов
+   очереди вопрос один и тот же — «сколько», — и цифра отвечает на него быстрее,
+   чем пиктограмма. Цвет наследуется от статуса строки (--status-c), поэтому
+   новое состояние не требует своего класса. */
+.queue-count {
+  flex: none;
+  min-width: 34px;
+  height: 34px;
+  padding: 0 6px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  background: var(--status-bg, var(--bg-soft));
+  color: var(--status-c, var(--text));
+}
 /* SVG-иконки внутри кружка card-row-icon (были эмодзи 18px). */
 .card-row-icon .ic { --ic-size: 20px; }
 /* Числовой ранг-чип (заменил медали-эмодзи 🥇🥈🥉): монохромно, единый стиль. */

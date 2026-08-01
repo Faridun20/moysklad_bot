@@ -308,9 +308,9 @@ describe('вкладки разделов', () => {
     expect(keys(stockTabs, { canSeeGoods: false })).toEqual(['catalog']);
   });
 
-  it('Клиенты: воронка всем, лимиты и канал — руководству', () => {
-    expect(keys(clientsTabs, { isBoss: true })).toEqual(['funnel', 'limits', 'channel']);
-    expect(keys(clientsTabs, { isBoss: false })).toEqual(['funnel']);
+  it('Клиенты: воронка и лиды всем, лимиты и канал — руководству', () => {
+    expect(keys(clientsTabs, { isBoss: true })).toEqual(['funnel', 'list', 'limits', 'channel']);
+    expect(keys(clientsTabs, { isBoss: false })).toEqual(['funnel', 'list']);
   });
 
   it('ни один раздел не даёт больше 4 вкладок', () => {
@@ -331,14 +331,16 @@ describe('разделы нижней панели', () => {
       .toEqual(['today', 'sales', 'stock', 'money', 'clients']);
   });
 
-  it('кладовщик не видит «Сегодня» — /api/home ему не отвечает', () => {
-    // Таб, который гарантированно вернёт 403, — дверь, которая не открывается.
-    expect(navSections('warehouse_keeper').map(s => s.key)).toEqual(['sales', 'money']);
+  it('кладовщик и бухгалтер не видят склад и клиентов', () => {
+    // Роли режем по матрице ручек: раздел, где всё ответит 403, — дверь,
+    // которая не открывается. «Сегодня» им доступна — очередь считает
+    // /api/today, а не /api/home.
+    expect(navSections('warehouse_keeper').map(s => s.key)).toEqual(['today', 'sales', 'money']);
+    expect(navSections('bookkeeper').map(s => s.key)).toEqual(['today', 'sales', 'money']);
   });
 
-  it('бухгалтеру тоже, и стартует он не с несуществующего экрана', () => {
-    expect(navSections('bookkeeper').map(s => s.key)).toEqual(['sales', 'money']);
-    expect(defaultSection('bookkeeper')).toBe('sales');
+  it('стартовый экран — первый доступный роли', () => {
+    expect(defaultSection('bookkeeper')).toBe('today');
     expect(defaultSection('boss')).toBe('today');
   });
 

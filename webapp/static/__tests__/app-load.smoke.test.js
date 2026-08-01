@@ -1147,10 +1147,9 @@ describe('пять разделов вместо четырёх', () => {
   });
 
   it('кладовщику не рисуют дверь, которая не открывается', () => {
-    // /api/home отвечает только admin/boss/manager — «Сегодня» у кладовщика
-    // молча превращалась в экран с ошибкой.
+    // «Склад» и «Клиенты» ответят ему 403 по всем вкладкам.
     const window = boot("currentUser = { role: 'warehouse_keeper' }; buildNav();");
-    expect(nav(window)).toEqual(['sales', 'money']);
+    expect(nav(window)).toEqual(['today', 'sales', 'money']);
   });
 
   it('старые адреса экранов продолжают работать', async () => {
@@ -1220,5 +1219,70 @@ describe('пять разделов вместо четырёх', () => {
     const text = window.document.getElementById('content').textContent;
     expect(text).toContain('Telegram');
     expect(text).toContain('читать сообщения');
+  });
+});
+
+describe('«Сегодня» — очередь дел', () => {
+  const QUEUE = {
+    ok: true,
+    total: 9,
+    queue: [
+      { key: 'overdue_debts', count: 2, title: 'Долги просрочены',
+        hint: 'срок оплаты уже прошёл', severity: 'crit', screen: 'money:debts' },
+      { key: 'awaiting_reply', count: 4, title: 'Клиенты ждут ответа',
+        hint: 'написали и не получили ответа', severity: 'warn', screen: 'clients:funnel' },
+      { key: 'unchecked_containers', count: 3, title: 'Контейнеры не сверены',
+        hint: 'прибыли, но состав не посчитан', severity: 'info', screen: 'stock:containers' },
+    ],
+  };
+
+  it('срочность видна формой строки, а не только порядком', () => {
+    const window = boot();
+    const box = window.document.createElement('div');
+    box.innerHTML = window.workQueueHtml(QUEUE.queue);
+    const rows = box.querySelectorAll('[data-queue]');
+    expect(rows[0].dataset.status).toBe('overdue');
+    expect(rows[1].dataset.status).toBe('pending');
+    expect(rows[2].dataset.status).toBe('draft');
+    expect(box.textContent).toContain('Требует вас · 9');
+  });
+
+  it('пустая очередь — это ответ, а не пустое место', () => {
+    const window = boot();
+    const box = window.document.createElement('div');
+    box.innerHTML = window.workQueueHtml([]);
+    expect(box.textContent).toContain('Всё разобрано');
+  });
+
+  it('строка ведёт туда, где дело закрывается — вместе с вкладкой', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      buildNav();
+      renderMoneyScreen = async () => {};
+      document.getElementById('content').innerHTML = workQueueHtml(${JSON.stringify(QUEUE.queue)});
+      wireWorkQueue(document.getElementById('content'));
+      window.__where = () => [currentScreen, moneyTab];
+    `);
+    window.document.querySelector('[data-queue="money:debts"]').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__where()).toEqual(['money', 'debts']);
+  });
+
+  it('роль без сводки получает экран из одной очереди, а не отказ', async () => {
+    // /api/home отвечает только admin/boss/manager. Раньше кладовщик видел
+    // errorBox вместо всего раздела.
+    const window = boot(`
+      currentUser = { role: 'warehouse_keeper', first_name: 'Пётр' };
+      window.__calls = [];
+      api = async (p) => { window.__calls.push(p); return ${JSON.stringify(QUEUE)}; };
+      window.fetch = (p) => { window.__calls.push(p); return Promise.reject(new Error('403')); };
+      window.__ready = renderHome();
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(window.__calls).toContain('/api/today');
+    expect(window.__calls).not.toContain('/api/home');
+    expect(content.textContent).toContain('Долги просрочены');
+    expect(content.querySelector('.error-card, .error')).toBeNull();
   });
 });
