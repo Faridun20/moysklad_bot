@@ -701,6 +701,31 @@ def _create_tables():
                 note          TEXT,
                 created_at    TEXT
             )""",
+            # История публикаций в канал. Нужна, чтобы один и тот же контейнер
+            # не ушёл в канал дважды — второй раз обычно потому, что первый
+            # забыли.
+            f"""CREATE TABLE IF NOT EXISTS channel_posts (
+                id         {id_type},
+                kind       TEXT NOT NULL,
+                ref        TEXT,
+                message_id BIGINT,
+                posted_by  BIGINT,
+                posted_at  TEXT,
+                created_at TEXT
+            )""",
+            # Фотографии товаров каталога. Как у техники: храним только
+            # идентификаторы Telegram, файл живёт там. `file_unique_id`
+            # обязателен — он переживает смену сервера Bot API.
+            f"""CREATE TABLE IF NOT EXISTS product_photos (
+                id             {id_type},
+                ms_id          TEXT NOT NULL,
+                tg_file_id     TEXT NOT NULL,
+                file_unique_id TEXT NOT NULL,
+                caption        TEXT,
+                uploaded_by    BIGINT,
+                uploaded_at    TEXT,
+                UNIQUE (ms_id, file_unique_id)
+            )""",
             # Подключение бота к личному аккаунту менеджера (Telegram Business).
             # Нужно, чтобы по `business_connection_id` из апдейта понять, чей
             # это чат: сам апдейт менеджера не называет.
@@ -902,6 +927,8 @@ def _create_indexes():
             # ── Контейнеры ───────────────────────────────────────────────────
             # Воронка: список фильтруется по менеджеру и по последней
             # активности, события читаются по лиду.
+            "CREATE INDEX IF NOT EXISTS idx_channel_posts_ref ON channel_posts(kind, ref)",
+            "CREATE INDEX IF NOT EXISTS idx_product_photos_ms ON product_photos(ms_id)",
             "CREATE INDEX IF NOT EXISTS idx_leads_manager ON leads(manager_id)",
             "CREATE INDEX IF NOT EXISTS idx_leads_last_inbound ON leads(last_inbound_at)",
             "CREATE INDEX IF NOT EXISTS idx_lead_events_lead ON lead_events(lead_id, at)",

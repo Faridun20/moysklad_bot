@@ -1531,6 +1531,7 @@ async function renderContainerCard(containerId) {
       ${canEdit && arrived ? '<button class="btn-primary" id="cont-save">Сохранить сверку</button>' : ''}
       ${canEdit && !arrived ? '<button class="btn-primary" id="cont-arrive">Отметить прибытие</button>' : ''}
       ${arrived && !supply.ms_supply_id ? `<button class="btn-secondary" id="cont-supply">${icon('box')} Оприходовать</button>` : ''}
+      ${arrived && card.can_manage ? `<button class="btn-secondary" id="cont-post">${icon('cart')} Пост в канал</button>` : ''}
       ${canEdit && card.can_manage ? `<button class="btn-secondary btn-danger" id="cont-del">${icon('trash')} Удалить</button>` : ''}
     </div>
     ${supplyBlock}
@@ -1540,6 +1541,9 @@ async function renderContainerCard(containerId) {
 
   content.querySelector('#cont-supplier')?.addEventListener('click', () =>
     openSupplierPicker(containerId));
+
+  content.querySelector('#cont-post')?.addEventListener('click', () =>
+    openChannelComposer('arrival', { container_id: containerId }));
 
   content.querySelector('#cont-supply')?.addEventListener('click', async () => {
     const res = await apiResult('/api/containers/supply', { container_id: containerId });
@@ -3869,6 +3873,58 @@ async function moneyInsightsHtml() {
     }
   }
   return html;
+}
+
+// ─── Канал ──────────────────────────────────────────────────────────────────
+// Черновик собирает СЕРВЕР — правило «наружу не уходят количества» живёт в
+// одном месте и проверяется тестом. Здесь только показать, дать поправить и
+// опубликовать по нажатию: автопостинга в канал компании нет.
+function openChannelComposer(kind, params) {
+  const title = { arrival: 'Пост о поступлении', showcase: 'Карточка товара',
+                  stale: 'Пост «есть в наличии»' }[kind] || 'Пост в канал';
+  openMachineSheet({
+    title,
+    hint: 'Черновик соберёт сервер — количества в него не попадают',
+    fields: [
+      { key: 'manager_username', label: 'Telegram менеджера', placeholder: 'без @',
+        hint: 'Кнопка под постом приведёт клиента к нему' },
+      { key: 'note', label: 'Что добавить от себя', type: 'textarea' },
+    ],
+    submitLabel: 'Собрать черновик',
+    onSubmit: async (data, { showErr }) => {
+      const res = await apiResult('/api/channel/draft', { kind, ...params, ...data });
+      if (!res.ok) { showErr(res.error); return false; }
+      showChannelPreview(kind, params, res.body);
+      return true;
+    },
+  });
+}
+
+function showChannelPreview(kind, params, draft) {
+  const warn = draft.already_posted
+    ? `<div class="c-error">Это уже публиковали ${escapeHtml(String(draft.already_posted.posted_at || '').slice(0, 16))}</div>`
+    : '';
+  const blocked = draft.can_publish ? '' :
+    '<div class="c-error">Канал не настроен: нет CHANNEL_ID</div>';
+  openMachineSheet({
+    title: 'Предпросмотр',
+    fields: [{ key: 'text', label: 'Текст поста', type: 'textarea', value: draft.text }],
+    submitLabel: draft.can_publish ? 'Опубликовать' : 'Нельзя опубликовать',
+    onSubmit: async (data, { showErr }) => {
+      if (!draft.can_publish) { showErr('Канал не настроен'); return false; }
+      if (!await confirmDialog('Опубликовать в канал?')) return false;
+      const res = await apiResult('/api/channel/publish', {
+        kind, ref: draft.ref, text: data.text,
+        photo_id: draft.photo_id, ms_id: params.ms_id,
+      });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      toast('Опубликовано');
+      return true;
+    },
+  });
+  const ov = document.querySelector('.c-overlay .c-sheet');
+  if (ov) ov.insertAdjacentHTML('afterbegin', warn + blocked);
 }
 
 // Карточка обращения. Переписки здесь нет и не будет — мы её не храним;
