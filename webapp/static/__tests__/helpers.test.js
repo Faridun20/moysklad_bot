@@ -11,6 +11,7 @@ const {
   parsePaymentItems, renderMoneyTotalsHtml, financeTabs, balanceParts, periodSegHtml, rangeLabel,
   formatMoney, msBalanceLabel, emptyState, skeleton, errorBoxHtml,
   machineStatusLabel, machineSubtitle, machineStatusSegHtml,
+  moneyBlockLabel, agingBarsHtml, forecastRowsHtml, buyerKey,
 } = helpers;
 
 describe('periodSegHtml (WP-29)', () => {
@@ -539,5 +540,130 @@ describe('техника: фильтр по статусу', () => {
 
   it('без данных не падает', () => {
     expect(machineStatusSegHtml(null, 'all')).toContain('Все 0');
+  });
+});
+
+describe('деньги: подпись суммы по валютам', () => {
+  const block = (over) => ({
+    by_currency: [], base_total: null, base_currency: 'USD', partial: false, count: 0, ...over,
+  });
+
+  it('пустой блок — прочерк, а не «0 USD»', () => {
+    expect(moneyBlockLabel(block())).toBe('—');
+    expect(moneyBlockLabel(null)).toBe('—');
+  });
+
+  it('одна валюта показывается как есть, без псевдоточного «≈»', () => {
+    const html = moneyBlockLabel(block({
+      count: 2, base_total: 1000, by_currency: [{ currency: 'USD', total: 1000 }],
+    }));
+    expect(html).toContain('USD');
+    expect(html).not.toContain('≈');
+  });
+
+  it('несколько валют сводятся к базовой через ≈', () => {
+    expect(moneyBlockLabel(block({
+      count: 2, base_total: 1080,
+      by_currency: [{ currency: 'USD', total: 1000 }, { currency: 'UZS', total: 1000000 }],
+    }))).toContain('≈');
+  });
+
+  it('о несчитанной части говорим вслух — по этой цифре принимают решения', () => {
+    const html = moneyBlockLabel(block({
+      count: 2, base_total: 1000, partial: true,
+      by_currency: [{ currency: 'USD', total: 1000 }, { currency: 'UZS', total: 5000 }],
+    }));
+    expect(html).toContain('без курса');
+  });
+
+  it('без единого курса перечисляем валюты, а не молчим', () => {
+    const html = moneyBlockLabel(block({
+      count: 2, base_total: null,
+      by_currency: [{ currency: 'UZS', total: 5000 }, { currency: 'KZT', total: 700 }],
+    }));
+    expect(html).toContain('UZS');
+    expect(html).toContain('KZT');
+  });
+});
+
+describe('деньги: бары дебиторки', () => {
+  const bucket = (key, label, total, count) => ({
+    key, label, count, base_total: total, base_currency: 'USD', partial: false,
+    by_currency: total == null ? [] : [{ currency: 'USD', total }],
+  });
+  const aging = {
+    buckets: [
+      bucket('overdue_90', 'Просрочено >90 дней', 1000, 2),
+      bucket('overdue_60', 'Просрочено 60—90', null, 0),
+      bucket('not_due', 'Срок не наступил', 4000, 8),
+    ],
+  };
+
+  it('ширина считается от самой большой корзины, а не от суммы', () => {
+    // Иначе при одной доминирующей все прочие схлопываются в невидимую полоску.
+    const html = agingBarsHtml(aging);
+    expect(html).toContain('width:25%');   // 1000 из 4000
+    expect(html).toContain('width:100%');  // сама большая
+  });
+
+  it('пустая корзина остаётся строкой с нулевым баром', () => {
+    const html = agingBarsHtml(aging);
+    expect(html).toContain('Просрочено 60—90');
+    expect(html).toContain('width:0%');
+  });
+
+  it('полностью пустая дебиторка — не пустые бары, а «долгов нет»', () => {
+    const html = agingBarsHtml({ buckets: [bucket('not_due', 'Срок не наступил', null, 0)] });
+    expect(html).toContain('Долгов нет');
+    expect(html).not.toContain('aging-bar');
+  });
+
+  it('подпись корзины экранируется', () => {
+    const html = agingBarsHtml({ buckets: [bucket('x', '<img src=x>', 10, 1)] });
+    expect(html).not.toContain('<img');
+  });
+
+  it('склонение по числу документов', () => {
+    expect(agingBarsHtml({ buckets: [bucket('a', 'A', 10, 1)] })).toContain('1 документ');
+    expect(agingBarsHtml({ buckets: [bucket('a', 'A', 10, 5)] })).toContain('5 документов');
+  });
+});
+
+describe('деньги: прогноз поступлений', () => {
+  const month = (m, total, count, machines) => ({
+    month: m, count, base_total: total, base_currency: 'USD', partial: false,
+    by_currency: total == null ? [] : [{ currency: 'USD', total }],
+    machines: machines || { count: 0, by_currency: [], base_total: null, partial: false },
+  });
+
+  it('месяц без поступлений не выбрасывается — это тоже ответ', () => {
+    const html = forecastRowsHtml([month('2026-08', 3000, 2), month('2026-09', null, 0)]);
+    expect(html).toContain('авг 26');
+    expect(html).toContain('сен 26');
+  });
+
+  it('доля техники подписывается отдельно', () => {
+    const html = forecastRowsHtml([month('2026-08', 5000, 2, {
+      count: 1, base_total: 4000, base_currency: 'USD', partial: false,
+      by_currency: [{ currency: 'USD', total: 4000 }],
+    })]);
+    expect(html).toContain('техника');
+  });
+
+  it('пустой прогноз объясняет себя', () => {
+    expect(forecastRowsHtml([])).toContain('Нечего прогнозировать');
+  });
+});
+
+describe('деньги: ключ покупателя', () => {
+  it('схлопывает регистр и лишние пробелы', () => {
+    // Иначе один человек выглядит как двое должников.
+    expect(buyerKey('Иванов  П.')).toBe(buyerKey('иванов п.'));
+    expect(buyerKey('  Иванов П. ')).toBe('иванов п.');
+  });
+
+  it('пустое имя не роняет', () => {
+    expect(buyerKey(null)).toBe('');
+    expect(buyerKey(undefined)).toBe('');
   });
 });

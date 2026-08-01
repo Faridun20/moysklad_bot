@@ -3506,13 +3506,159 @@ async function renderMoneyView() {
     return;
   }
   const label = (summary && summary.period && summary.period.label) || '';
+  // Дебиторка, прогноз и дисциплина — отдельные ручки, поэтому сначала рисуем
+  // поступления, а разделы «где деньги» дорисовываем следом. Так экран не ждёт
+  // самый медленный запрос, чтобы показать хоть что-то.
   content.innerHTML =
     analyticsHeaderHtml(true) +
     `<div class="section-label">Поступления · ${escapeHtml(label)}</div>` +
     renderMoneyTotalsHtml(summary) +
+    '<div id="money-insights">' + skeleton('list', 3) + '</div>' +
     '<div class="section-label">Движение денег</div>' +
     cashHistoryHtml(history);
   wireAnalyticsHeader(content);
+
+  const box = content.querySelector('#money-insights');
+  if (!box) return;
+  try {
+    box.innerHTML = await moneyInsightsHtml();
+  } catch {
+    // Разделы аналитики — надстройка: их сбой не должен уносить поступления,
+    // которые уже на экране.
+    box.innerHTML = '';
+  }
+  box.querySelectorAll('[data-buyer]').forEach(row => {
+    row.addEventListener('click', () => { haptic('light'); renderBuyerCard(row.dataset.buyer); });
+  });
+}
+
+// Итог «нам должны» с разбивкой по источникам. Отдаётся только руководству —
+// у менеджера в ответе `totals: null`, и блока просто нет.
+function receivableTotalsHtml(totals) {
+  if (!totals || !totals.all || !totals.all.count) return '';
+  const part = (label, block) => block && block.count
+    ? `<div class="c-row"><div class="card-row-info"><div class="card-row-sub">${label}</div></div>
+       <div class="card-row-value">${escapeHtml(moneyBlockLabel(block))}</div></div>`
+    : '';
+  return `
+    <div class="section-label">Нам должны</div>
+    <div class="c-surface c-surface--list">
+      <div class="c-row">
+        <div class="card-row-info"><div class="card-row-title">Всего</div></div>
+        <div class="card-row-value"><b>${escapeHtml(moneyBlockLabel(totals.all))}</b></div>
+      </div>
+      ${part('По заказам', totals.orders)}
+      ${part('По технике', totals.machines)}
+    </div>`;
+}
+
+// Разделы аналитики «Деньги», отвечающие на вопрос «где деньги и приходят ли
+// платежи». Каждый грузится своей ручкой и деградирует молча: сбой прогноза не
+// должен уносить экран поступлений.
+async function moneyInsightsHtml() {
+  const [rec, fc, disc] = await Promise.all([
+    api('/api/money/receivables', {}).catch(() => null),
+    api('/api/money/forecast', { months: 6 }).catch(() => null),
+    api('/api/money/discipline', {}).catch(() => null),
+  ]);
+  let html = '';
+  if (rec) {
+    html += receivableTotalsHtml(rec.totals);
+    html += '<div class="section-label">Дебиторка по срокам</div>' + agingBarsHtml(rec.aging);
+    const top = (rec.by_counterparty || []).filter(r => r.count);
+    if (top.length) {
+      html += '<div class="section-label">Кто должен больше всех</div>';
+      html += '<div class="c-surface c-surface--list">' + top.slice(0, 5).map(r => `
+        <div class="c-row">
+          <div class="card-row-info">
+            <div class="card-row-title">${escapeHtml(r.name)}</div>
+            <div class="card-row-sub">${r.sources.map(s => s === 'machine' ? 'техника' : 'заказы').join(' · ')}</div>
+          </div>
+          <div class="card-row-value">${escapeHtml(moneyBlockLabel(r))}</div>
+        </div>`).join('') + '</div>';
+    }
+  }
+  if (fc) {
+    html += '<div class="section-label">Ожидаемые поступления</div>' + forecastRowsHtml(fc.months);
+  }
+  if (disc && disc.expected_count) {
+    const share = disc.on_time_share == null ? '—' : `${Math.round(disc.on_time_share * 100)}%`;
+    html += '<div class="section-label">Платёжная дисциплина</div>';
+    html += `<div class="c-surface c-surface--list">
+      <div class="c-row">
+        <div class="card-row-info"><div class="card-row-sub">Собрано из ожидаемого</div></div>
+        <div class="card-row-value">${escapeHtml(moneyBlockLabel(disc.collected))} из ${escapeHtml(moneyBlockLabel(disc.expected))}</div>
+      </div>
+      <div class="c-row">
+        <div class="card-row-info"><div class="card-row-sub">Платежей в срок</div></div>
+        <div class="card-row-value">${disc.on_time_count} из ${disc.paid_count} · ${share}</div>
+      </div>
+    </div>`;
+    if ((disc.laggards || []).length) {
+      html += '<div class="section-label">Систематически задерживают</div>';
+      html += '<div class="c-surface c-surface--list">' + disc.laggards.map(l => `
+        <div class="c-row c-row--tap" data-buyer="${escapeHtml(l.name)}" role="button" tabindex="0">
+          <div class="card-row-info"><div class="card-row-title">${escapeHtml(l.name)}</div></div>
+          <div class="card-row-value">${l.late} из ${l.total}</div>
+        </div>`).join('') + '</div>';
+    }
+  }
+  return html;
+}
+
+// Карточка покупателя техники: все его сделки, графики и остаток. Покупатель
+// опознаётся по имени — другого идентификатора у него пока нет.
+async function renderBuyerCard(buyer) {
+  const content = document.getElementById('content');
+  const back = () => { financeTab = 'debts'; showScreen('finance'); };
+  content.innerHTML = skeleton('label') + skeleton('list', 4);
+  setScreenContext('Покупатель техники');
+  showBack(back);
+
+  let card;
+  try {
+    card = await api('/api/machines/buyer', { buyer });
+  } catch (e) {
+    content.innerHTML = errorBox(e.message);
+    return;
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const deals = (card.deals || []).map(d => `
+    <div class="section-label">${escapeHtml(d.machine_name || '—')} · ${escapeHtml(String(d.sold_at || '').slice(0, 10))}</div>
+    ${machineScheduleHtml(d, today)}
+  `).join('');
+
+  content.innerHTML = `
+    <div class="editor-header"><div class="editor-title">${icon('user')} ${escapeHtml(card.buyer || buyer)}</div></div>
+    <div class="section-label">Остаток к получению</div>
+    <div class="c-surface c-surface--list">
+      <div class="c-row">
+        <div class="card-row-info"><div class="card-row-title">Всего по рассрочкам</div>
+          <div class="card-row-sub">${card.outstanding.count} ${card.outstanding.count === 1 ? 'платёж' : 'платежей'}</div></div>
+        <div class="card-row-value"><b>${escapeHtml(moneyBlockLabel(card.outstanding))}</b></div>
+      </div>
+    </div>
+    ${card.outstanding.count ? agingBarsHtml(card.aging) : ''}
+    ${deals}
+  `;
+
+  content.querySelectorAll('[data-payment]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      await toggleMachinePaymentFromBuyer(buyer, Number(btn.dataset.payment), btn.dataset.paid === '1');
+    });
+  });
+}
+
+async function toggleMachinePaymentFromBuyer(buyer, paymentId, wasPaid) {
+  const res = await apiResult('/api/machines/payment', { payment_id: paymentId, paid: !wasPaid });
+  if (!res.ok) {
+    tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+    if (res.status === 409) renderBuyerCard(buyer);
+    return;
+  }
+  haptic('success');
+  toast(res.body.deal_closed ? 'Рассрочка закрыта — все платежи получены' : 'Отмечено');
+  renderBuyerCard(buyer);
 }
 
 // Лента движения денег (платежи + сдачи + возвраты) — общий рендер для «Денег».
@@ -4562,6 +4708,11 @@ async function renderDebts(container) {
       </div>
     `;
 
+    // «Нам должны» с разбивкой по источникам. Деньги лежат в двух учётах —
+    // заказы в кредит и рассрочки по технике; вопрос к ним один, поэтому и
+    // ответ должен быть один, а не два экрана.
+    html += receivableTotalsHtml(data.totals);
+
     if (totalEmpty) {
       html += `
         <div class="finance-empty">
@@ -4717,6 +4868,29 @@ async function renderDebts(container) {
       }).join('') + '</div>';
     }
 
+    // ─── Рассрочки по технике ─────────────────────────────────────
+    // Второй поток тех же денег. Строка на сделку: здесь нужен ответ «кто и
+    // сколько должен», помесячный график живёт в карточке покупателя.
+    const machineDebts = data.machine_debts || [];
+    if (machineDebts.length) {
+      html += `<div class="section-label">${icon('truck')} Рассрочки по технике (${machineDebts.length})</div>`;
+      html += '<div class="c-surface c-surface--list">' + machineDebts.map(m => {
+        const due = m.next_due ? formatDateRU(m.next_due) : '—';
+        const next = m.next_amount != null
+          ? `${fmt(m.next_amount)} ${escapeHtml(m.currency)} до ${due}`
+          : 'график исчерпан';
+        return `
+          <div class="c-row c-row--tap" data-buyer="${escapeHtml(m.buyer_name)}"
+               data-status="${escapeHtml(m.state)}" role="button" tabindex="0">
+            <div class="card-row-info">
+              <div class="card-row-title">${escapeHtml(m.machine_name)} · ${escapeHtml(m.buyer_name)}</div>
+              <div class="card-row-sub">Следующий: ${escapeHtml(next)}</div>
+            </div>
+            <div class="card-row-value">${fmt(m.remaining)} ${escapeHtml(m.currency)}</div>
+          </div>`;
+      }).join('') + '</div>';
+    }
+
     container.innerHTML = html;
 
     // Tabs (фильтр all/today)
@@ -4724,6 +4898,13 @@ async function renderDebts(container) {
       t.addEventListener('click', () => {
         debtsFilter = t.dataset.f;
         renderDebts(container);
+      });
+    });
+
+    container.querySelectorAll('[data-buyer]').forEach(row => {
+      row.addEventListener('click', () => {
+        haptic('light');
+        renderBuyerCard(row.dataset.buyer);
       });
     });
 

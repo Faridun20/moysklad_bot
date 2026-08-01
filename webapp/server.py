@@ -1852,6 +1852,143 @@ async def api_money_summary(request: Request):
     return JSONResponse(totals)
 
 
+# ─── API: дебиторка («где деньги») ───────────────────────────────────────────
+# Заказы в кредит и рассрочки по технике — два учёта, но один вопрос: сколько
+# нам должны, когда это придёт и кто тянет. Считает `services.receivables`,
+# ручки только режут по роли и отдают.
+
+
+async def _receivables_for(user_id: int) -> tuple[list, bool]:
+    """Дебиторка в объёме роли. Второй элемент — видна ли техника."""
+    from services import receivables
+
+    is_boss = get_role(user_id) in ("admin", "boss")
+    items = await receivables.collect(
+        user_id=None if is_boss else user_id,
+        # Рассрочки оформляет руководство: менеджеру это не пустой блок, а
+        # чужой участок — поэтому не отдаём вовсе, а не отдаём нулём.
+        include_machines=is_boss,
+    )
+    return items, is_boss
+
+
+@app.post("/api/money/receivables")
+async def api_money_receivables(request: Request):
+    """«Где деньги»: разбивка по срокам, итоги по источникам, топ должников."""
+    from services import receivables
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_money_receivables",
+        rate_limit_max=30,
+    )
+    items, is_boss = await _receivables_for(user["id"])
+    payload = {
+        "ok": True,
+        "scope": "company" if is_boss else "personal",
+        "aging": receivables.aging(items),
+        "totals": receivables.totals_by_source(items),
+        "by_counterparty": receivables.by_counterparty(items),
+    }
+    if is_boss:
+        # Разрез по менеджерам — управленческий: менеджеру он показал бы чужие
+        # цифры, а себя он и так видит целиком.
+        owners = receivables.by_owner(items)
+        names = await _owner_names([o["user_id"] for o in owners])
+        for row in owners:
+            row["name"] = names.get(row["user_id"], f"#{row['user_id']}")
+        payload["by_owner"] = owners
+    return JSONResponse(payload)
+
+
+async def _owner_names(user_ids: list[int]) -> dict[int, str]:
+    """id менеджера → имя. Батчем: список владельцев иначе даёт N+1."""
+    if not user_ids:
+        return {}
+    from services import async_db as adb
+
+    users = await adb.get_all_users()
+    return {
+        int(u["user_id"]): (u.get("full_name") or u.get("username") or f"#{u['user_id']}")
+        for u in users
+        if int(u["user_id"]) in set(user_ids)
+    }
+
+
+@app.post("/api/money/forecast")
+async def api_money_forecast(request: Request):
+    """Ожидаемые поступления по месяцам вперёд. Только руководство."""
+    from services import receivables
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_money_forecast",
+        rate_limit_max=30,
+    )
+    raw_months = data.get("months")
+    try:
+        # Явная проверка на None, а не `or 6`: ноль — это запрос «ноль месяцев»,
+        # и подменять его дефолтом значит молча ответить не на тот вопрос.
+        months = 6 if raw_months is None or raw_months == "" else int(raw_months)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="months: не число")
+    months = max(1, min(months, 12))
+    items = await receivables.collect()
+    return JSONResponse({"ok": True, "months": receivables.forecast(items, months=months)})
+
+
+@app.post("/api/money/discipline")
+async def api_money_discipline(request: Request):
+    """Поступают ли платежи: собрано против ожидалось и доля платежей в срок."""
+    from datetime import datetime
+
+    from services import receivables
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_money_discipline",
+        rate_limit_max=30,
+    )
+    now = datetime.now()
+    since, until, _prev, label = _resolve_analytics_period(data, now)
+    stats = await receivables.collection_stats(
+        since.strftime("%Y-%m-%d"), until.strftime("%Y-%m-%d")
+    )
+    stats["period"] = {"label": label, "since": since.strftime("%Y-%m-%d"),
+                       "until": until.strftime("%Y-%m-%d")}
+    stats["ok"] = True
+    return JSONResponse(stats)
+
+
+@app.post("/api/machines/buyer")
+async def api_machines_buyer(request: Request):
+    """Карточка покупателя техники: все его сделки, графики и остаток.
+
+    Ключ — имя: настоящего идентификатора у покупателя пока нет
+    (`machine_deals` хранит имя и паспорт), поэтому сервис схлопывает регистр
+    и пробелы.
+    """
+    from services import receivables
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_buyer"
+    )
+    buyer = (data.get("buyer") or "").strip()[:200]
+    if not buyer:
+        raise HTTPException(status_code=400, detail="buyer обязателен")
+    card = await receivables.buyer_card(buyer)
+    if not card:
+        raise HTTPException(status_code=404, detail="Покупатель не найден")
+    return JSONResponse({"ok": True, **card})
+
+
 # ─── API: заказы ─────────────────────────────────────────────────────────────
 
 
@@ -4492,9 +4629,34 @@ async def api_debts(request: Request):
         for k, v in sorted(rem_by_cur.items(), key=lambda kv: kv[1], reverse=True)
     ]
 
+    # Рассрочки по технике — второй поток тех же денег. Отдаём той же ручкой:
+    # экран один, и второй запрос за тем же экраном не нужен. В кредитный лимит
+    # контрагента они НЕ входят — покупатель техники это имя и паспорт, а не
+    # контрагент МойСклад.
+    machine_debts: list[dict] = []
+    totals = None
+    if is_boss:
+        from services import receivables
+
+        machine_debts = await receivables.machine_debt_rows(today)
+        # Итог «нам должны: заказы / техника / всего» — по тем же строкам, что
+        # уже посчитаны выше, без второго прохода по БД.
+        order_items = [
+            receivables.Receivable(
+                "order", int(r["id"]), f"#{r['id']}", r["agent_name"], r["user_id"],
+                r["due_date"], money.to_cents(r["remaining"]), r["currency"],
+            )
+            for r in result if r["remaining"] > 0
+        ]
+        totals = receivables.totals_by_source(
+            order_items + await receivables.machine_receivables()
+        )
+
     return JSONResponse(
         {
             "debts": result,
+            "machine_debts": machine_debts,
+            "totals": totals,
             "role": role,
             "scope": "company" if is_boss else "personal",
             "today": today,

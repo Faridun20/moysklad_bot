@@ -29,7 +29,7 @@ Telegram, руководители одобряют отгрузки и подт
 ## Стек
 
 - **Python 3.11**, asyncio
-- **aiogram 3.7** — Telegram Bot API, FSM с Redis или MemoryStorage
+- **aiogram 3.30** (Bot API 10.2) — Telegram Bot API, FSM с Redis или MemoryStorage
 - **FastAPI + uvicorn** — WebApp (Telegram Mini App)
 - **PostgreSQL**: денежное ядро (заказы/платежи/кредит/сдачи/возвраты) — на **`asyncpg`** (native async, `services/adb_core.py`; в тестах `aiosqlite`). Остальное — `psycopg2-binary` + `ThreadedConnectionPool`, обёрнут в `asyncio.to_thread`.
 - **Redis** (опционально) — FSM storage и кэши

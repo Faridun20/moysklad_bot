@@ -382,11 +382,85 @@
       `${pill('all', 'Все', Number(c.all || 0))}${pills}</div></div>`;
   }
 
+  // ─── Деньги: дебиторка ────────────────────────────────────────────────────
+  // Сумма приходит блоком {by_currency, base_total, partial}. Правило одно на
+  // весь фронт: `partial` значит «часть сумм без курса в итог не вошла», и
+  // молчать об этом нельзя — по этой цифре принимают решения.
+  function moneyBlockLabel(block) {
+    if (!block || !block.count) return '—';
+    const cur = block.base_currency || 'USD';
+    const rows = block.by_currency || [];
+    // Одна валюта — показываем её как есть, без псевдоточного «≈».
+    if (rows.length === 1) return formatMoney(rows[0].total, rows[0].currency);
+    if (block.base_total == null) {
+      return rows.map((r) => formatMoney(r.total, r.currency)).join(' · ');
+    }
+    return `≈ ${formatMoney(block.base_total, cur)}${block.partial ? ' (часть без курса)' : ''}`;
+  }
+
+  // Горизонтальные бары по корзинам просрочки. Ширина — доля от самой большой
+  // корзины, а не от суммы: сравнивать надо корзины между собой.
+  function agingBarsHtml(aging) {
+    const buckets = (aging && aging.buckets) || [];
+    const values = buckets.map((b) => (b.base_total == null ? 0 : b.base_total));
+    const max = Math.max(...values, 0);
+    if (!max) return emptyState({ icon: 'check', title: 'Долгов нет', hint: 'Все деньги собраны.' });
+    return `<div class="c-surface c-surface--pad">${buckets.map((b, i) => {
+      // Пустую корзину рисуем строкой без бара: нулевая полоска выглядит как
+      // подтёкший рендер, а исчезнувшая строка — как «не посчитали».
+      const pct = max ? Math.round((values[i] / max) * 100) : 0;
+      const state = b.key === 'not_due' ? 'upcoming' : 'overdue';
+      return `
+        <div class="aging-row" data-status="${escapeHtml(b.key)}">
+          <div class="aging-head">
+            <span class="aging-label">${escapeHtml(b.label)}</span>
+            <span class="aging-sum">${escapeHtml(moneyBlockLabel(b))}</span>
+          </div>
+          <div class="aging-track"><div class="aging-bar" data-status="${state}" style="width:${pct}%"></div></div>
+          <div class="aging-count">${b.count} ${b.count === 1 ? 'документ' : 'документов'}</div>
+        </div>`;
+    }).join('')}</div>`;
+  }
+
+  // Прогноз поступлений помесячно. Месяц без ожидаемых денег не выбрасываем:
+  // «в ноябре ничего не ждём» — это тоже ответ.
+  function forecastRowsHtml(months) {
+    const rows = months || [];
+    if (!rows.length) return emptyState({ icon: 'calendar', title: 'Нечего прогнозировать' });
+    const max = Math.max(...rows.map((m) => m.base_total || 0), 0);
+    const MONTHS_RU = ['янв', 'фев', 'мар', 'апр', 'май', 'июн',
+      'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
+    return `<div class="c-surface c-surface--pad">${rows.map((m) => {
+      const [y, mo] = String(m.month || '').split('-');
+      const label = `${MONTHS_RU[Number(mo) - 1] || m.month} ${String(y).slice(2)}`;
+      const pct = max ? Math.round(((m.base_total || 0) / max) * 100) : 0;
+      const share = m.machines && m.machines.count
+        ? ` · техника ${escapeHtml(moneyBlockLabel(m.machines))}` : '';
+      return `
+        <div class="aging-row">
+          <div class="aging-head">
+            <span class="aging-label">${escapeHtml(label)}</span>
+            <span class="aging-sum">${escapeHtml(moneyBlockLabel(m))}</span>
+          </div>
+          <div class="aging-track"><div class="aging-bar" data-status="approved" style="width:${pct}%"></div></div>
+          <div class="aging-count">${m.count} ${m.count === 1 ? 'платёж' : 'платежей'}${share}</div>
+        </div>`;
+    }).join('')}</div>`;
+  }
+
+  // Ключ покупателя техники: настоящего идентификатора у него нет (в сделке
+  // имя и паспорт), поэтому «Иванов  П.» и «иванов п.» обязаны схлопнуться —
+  // иначе один человек выглядит как двое должников.
+  function buyerKey(name) {
+    return String(name == null ? '' : name).trim().replace(/\s+/g, ' ').toLowerCase();
+  }
+
   return {
     escapeHtml, idemKey, formatDateRU, icon, opsAmount,
     renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml, financeTabs,
     balanceParts, periodSegHtml, rangeLabel, formatMoney, msBalanceLabel,
     emptyState, skeleton, errorBoxHtml,
     machineStatusLabel, machineSubtitle, machineStatusSegHtml,
+    moneyBlockLabel, agingBarsHtml, forecastRowsHtml, buyerKey,
   };
 });
