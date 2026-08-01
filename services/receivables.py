@@ -130,7 +130,7 @@ async def _order_receivables(user_id: int | None) -> list[Receivable]:
     return out
 
 
-async def _machine_receivables() -> list[Receivable]:
+async def machine_receivables() -> list[Receivable]:
     """Неоплаченные платежи графиков по незакрытым рассрочкам.
 
     Взнос (`seq = 0`) отмечен оплаченным в момент сделки, поэтому сюда не
@@ -168,7 +168,7 @@ async def collect(user_id: int | None = None, *, include_machines: bool = True) 
     руководство, и менеджеру это не «пустой блок», а чужой участок.
     """
     orders = await _order_receivables(user_id)
-    machines = await _machine_receivables() if include_machines else []
+    machines = await machine_receivables() if include_machines else []
     return orders + machines
 
 
@@ -400,6 +400,53 @@ async def _schedule_for(deal_id: int) -> list[dict]:
     from services import machines
 
     return await machines.get_schedule(deal_id)
+
+
+async def machine_debt_rows(today: str) -> list[dict]:
+    """Открытые рассрочки строками для экрана «Долги».
+
+    Одна строка на сделку (а не на платёж): в списке долгов нужен ответ «кто и
+    сколько должен», а помесячная разбивка живёт в карточке. Показываем остаток
+    целиком и ближайший неоплаченный платёж — по нему и красится строка.
+    """
+    deals = await adb_core.fetch(
+        "SELECT d.id, d.buyer_name, d.currency, m.name AS machine_name, m.vin "
+        "FROM machine_deals d JOIN machines m ON m.id = d.machine_id "
+        "WHERE d.kind = 'credit' AND d.closed_at IS NULL"
+    )
+    if not deals:
+        return []
+    rest_rows = await adb_core.fetch(
+        "SELECT deal_id, COALESCE(SUM(amount_cents), 0) AS rest "
+        "FROM machine_deal_payments WHERE paid_at IS NULL AND seq > 0 GROUP BY deal_id"
+    )
+    rest_by_deal = {int(r["deal_id"]): int(r["rest"] or 0) for r in rest_rows}
+    next_due = await next_due_by_deal([int(d["id"]) for d in deals])
+
+    out = []
+    for d in deals:
+        deal_id = int(d["id"])
+        rest = rest_by_deal.get(deal_id, 0)
+        if rest <= 0:
+            continue
+        nxt = next_due.get(deal_id)
+        due = str(nxt["due_date"])[:10] if nxt else None
+        out.append({
+            "deal_id": deal_id,
+            "machine_name": d["machine_name"] or d["vin"] or "—",
+            "buyer_name": d["buyer_name"] or "—",
+            "currency": (d["currency"] or _base_currency()).upper(),
+            "remaining": float(money.from_cents(rest)),
+            "next_due": due,
+            "next_amount": float(money.from_cents(int(nxt["amount_cents"]))) if nxt else None,
+            "state": (
+                "overdue" if due and due < today
+                else ("due_today" if due == today else "upcoming")
+            ),
+        })
+    # Ближайший срок сверху: список нужен, чтобы решить, кому звонить сегодня.
+    out.sort(key=lambda x: (x["next_due"] is None, x["next_due"] or ""))
+    return out
 
 
 async def next_due_by_deal(deal_ids: list[int]) -> dict[int, dict]:

@@ -23,10 +23,10 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 81._
+_Всего эндпоинтов: 85._
 
 
-### Админ (`admin`) — 74 эндпоинтов
+### Админ (`admin`) — 78 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -57,6 +57,7 @@ _Всего эндпоинтов: 81._
 - `/api/deposits/pending`
 - `/api/deposits/reject`
 - `/api/home`
+- `/api/machines/buyer`
 - `/api/machines/card`
 - `/api/machines/create`
 - `/api/machines/deal`
@@ -72,6 +73,9 @@ _Всего эндпоинтов: 81._
 - `/api/machines/status`
 - `/api/machines/update`
 - `/api/metrics`
+- `/api/money/discipline`
+- `/api/money/forecast`
+- `/api/money/receivables`
 - `/api/money/summary`
 - `/api/ops-summary`
 - `/api/orders/add_item`
@@ -108,7 +112,7 @@ _Всего эндпоинтов: 81._
 </details>
 
 
-### Руководитель (`boss`) — 71 эндпоинтов
+### Руководитель (`boss`) — 75 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -139,6 +143,7 @@ _Всего эндпоинтов: 81._
 - `/api/deposits/pending`
 - `/api/deposits/reject`
 - `/api/home`
+- `/api/machines/buyer`
 - `/api/machines/card`
 - `/api/machines/create`
 - `/api/machines/deal`
@@ -154,6 +159,9 @@ _Всего эндпоинтов: 81._
 - `/api/machines/status`
 - `/api/machines/update`
 - `/api/metrics`
+- `/api/money/discipline`
+- `/api/money/forecast`
+- `/api/money/receivables`
 - `/api/money/summary`
 - `/api/ops-summary`
 - `/api/orders/add_item`
@@ -187,7 +195,7 @@ _Всего эндпоинтов: 81._
 </details>
 
 
-### Менеджер (`manager`) — 33 эндпоинтов
+### Менеджер (`manager`) — 34 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -212,6 +220,7 @@ _Всего эндпоинтов: 81._
 - `/api/machines/list`
 - `/api/machines/photo`
 - `/api/machines/photo_upload`
+- `/api/money/receivables`
 - `/api/orders/add_item`
 - `/api/orders/create`
 - `/api/orders/delete_draft`
