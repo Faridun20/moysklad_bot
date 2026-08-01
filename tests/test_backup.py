@@ -297,3 +297,80 @@ def test_main_warns_at_size_threshold(reset_backup_module, monkeypatch, tmp_path
     assert rc == 0  # warning не fatal
     assert upload_called == [True]
     assert any("близок к Telegram limit" in r.message for r in caplog.records)
+
+
+# ─── Расшифровка отказов Telegram ─────────────────────────────────────────────
+
+
+def test_chat_not_found_explains_what_to_fix():
+    """Боевой лог: «Bad Request: chat not found» + десять кадров стека aiogram.
+    По ним не видно, что чинить надо переменную окружения, а не код."""
+    from tasks.run_backup import upload_failure_hint
+
+    hint = upload_failure_hint(
+        Exception("Telegram server says - Bad Request: chat not found"), -1001234567890
+    )
+    assert hint and "-1001234567890" in hint
+    assert "-100" in hint and "администратором" in hint
+
+
+def test_missing_rights_is_a_different_answer():
+    from tasks.run_backup import upload_failure_hint
+
+    hint = upload_failure_hint(Exception("Bad Request: not enough rights"), -100)
+    assert hint and "Post Messages" in hint
+
+
+def test_unknown_failure_gets_no_invented_hint():
+    """Выдуманная причина хуже её отсутствия: по ней чинят не то."""
+    from tasks.run_backup import upload_failure_hint
+
+    assert upload_failure_hint(TimeoutError("read timeout"), -100) is None
+
+
+def test_upload_failure_logs_the_hint_instead_of_a_traceback(
+    monkeypatch, tmp_path, reset_backup_module, caplog
+):
+    import logging
+
+    db = tmp_path / "bot.db"
+    sqlite3.connect(str(db)).close()
+    monkeypatch.setenv("DB_PATH", str(db))
+    monkeypatch.setenv("BACKUP_TG_CHAT_ID", "-1001234567890")
+
+    async def fake_upload(*a, **kw):
+        raise RuntimeError("Telegram server says - Bad Request: chat not found")
+
+    monkeypatch.setattr("tasks.run_backup._upload_to_telegram", fake_upload)
+    caplog.set_level(logging.ERROR, logger="backup")
+    from tasks.run_backup import main
+
+    assert asyncio.run(main()) == 1
+    assert any("не отправлен" in r.message for r in caplog.records)
+
+
+def test_empty_dump_is_shouted_about():
+    """«Backup создан: 0.01 MB» не отвечает на вопрос, маленькая это база или
+    пустой дамп. Узнать разницу в день восстановления — поздно."""
+    import logging
+
+    from tasks.run_backup import _log_dump_contents
+
+    logger = logging.getLogger("backup")
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logger.addHandler(handler)
+    prev = logger.level
+    logger.setLevel(logging.INFO)
+    try:
+        _log_dump_contents({"orders": 0, "payments": 0})
+        _log_dump_contents({"orders": 12, "payments": 340})
+    finally:
+        logger.setLevel(prev)
+        logger.removeHandler(handler)
+
+    assert records[0].levelno == logging.ERROR
+    assert "ПУСТОЙ" in records[0].getMessage()
+    assert "352 строк" in records[1].getMessage()
+    assert "payments=340" in records[1].getMessage()

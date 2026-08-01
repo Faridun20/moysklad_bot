@@ -44,9 +44,13 @@ def normalize_name(raw: str | None) -> str:
 def match_items(items: list[dict]) -> tuple[list[dict], list[dict]]:
     """Разложить состав на «нашли в номенклатуре» и «нет такого товара».
 
-    Совпадение требуется ТОЧНОЕ по нормализованному названию. Похожие имена не
-    склеиваем: «Кабель PV 0.6» и «Кабель PV 0.6 чёрный» — разные товары, и
-    угадывание здесь означает приход не на ту карточку.
+    Товар берётся из ПРИВЯЗКИ позиции (`ms_id`), если она есть: человек выбрал
+    карточку в каталоге, и переспрашивать у поиска, что он имел в виду, незачем.
+
+    Совпадение по названию осталось запасным путём — для позиций, заведённых до
+    появления выбора, и для тех, что вбили руками. Оно требуется ТОЧНОЕ по
+    нормализованному имени: «Кабель PV 0.6» и «Кабель PV 0.6 чёрный» — разные
+    товары, и угадывание здесь означает приход не на ту карточку.
     """
     matched: list[dict] = []
     unmatched: list[dict] = []
@@ -56,6 +60,10 @@ def match_items(items: list[dict]) -> tuple[list[dict], list[dict]]:
             # Не приехало — оприходовать нечего. Это не ошибка сопоставления.
             continue
         name = str(it.get("name") or "")
+        linked = str(it.get("ms_id") or "").strip()
+        if linked:
+            matched.append({**it, "ms_id": linked, "quantity": qty})
+            continue
         # Ищем по НОРМАЛИЗОВАННОМУ имени: поиск в снапшоте — это LIKE, и
         # «  кабель   pv 0.6 » из накладной не совпал бы с «Кабель PV 0.6»
         # из-за лишних пробелов, хотя это один и тот же товар.
@@ -67,11 +75,60 @@ def match_items(items: list[dict]) -> tuple[list[dict], list[dict]]:
             matched.append({**it, "ms_id": candidates[0]["ms_id"], "quantity": qty})
         else:
             unmatched.append({
+                "item_id": it.get("id"),
                 "name": name,
                 "quantity": qty,
                 "reason": "не найден в номенклатуре" if not candidates else "несколько совпадений",
             })
     return matched, unmatched
+
+
+async def create_product(name: str, *, unit: str = "шт") -> dict:
+    """Завести карточку товара в МойСклад по названию из приёмки.
+
+    Раньше несопоставленная позиция упиралась в тупик: «заведите товар и
+    повторите» — то есть уйдите в МойСклад, найдите там ту же накладную и
+    перебейте название руками. Теперь карточку заводит человек одной кнопкой,
+    но именно ЧЕЛОВЕК: автосоздание из приёмки превратило бы каждую опечатку в
+    новый товар в справочнике.
+
+    Дубликат проверяем по снапшоту, а не в МС: имена в МойСклад не уникальны,
+    и «есть ли такой товар» всё равно решается сравнением строк. Свежесозданную
+    карточку кладём в снапшот сразу — иначе вторая строка контейнера с тем же
+    названием завела бы второй такой же товар, и остаток разъехался бы по двум.
+    """
+    clean = " ".join(str(name or "").split())[:255]
+    if not clean:
+        return {"ok": False, "error": "Название товара обязательно"}
+
+    exact = [
+        p for p in snapshot.search_products(normalize_name(clean), limit=25)
+        if normalize_name(p.get("name")) == normalize_name(clean)
+    ]
+    if exact:
+        return {"ok": True, "ms_id": exact[0]["ms_id"], "name": exact[0].get("name") or clean,
+                "existed": True}
+
+    try:
+        sess = await get_session()
+        async with sess.post(f"{MS_BASE}/entity/product", json={"name": clean}) as resp:
+            body = await resp.text()
+            if resp.status >= 400:
+                safe = redact_ms_error(body)
+                logger.error("MS product HTTP %s: %s", resp.status, safe)
+                return {"ok": False, "error": f"МойСклад отказал: {safe}"}
+            created = json.loads(body)
+    except Exception as e:
+        logger.warning("Товар «%s» не заведён в МойСклад: %s", clean, e)
+        return {"ok": False, "error": "МойСклад недоступен, попробуйте позже"}
+
+    ms_id = str(created.get("id") or "")
+    if not ms_id:
+        return {"ok": False, "error": "МойСклад не вернул id товара"}
+    await snapshot.remember_product(
+        ms_id, name=created.get("name") or clean, unit=(unit or "шт")
+    )
+    return {"ok": True, "ms_id": ms_id, "name": created.get("name") or clean, "existed": False}
 
 
 async def get_link(container_id: int) -> dict:

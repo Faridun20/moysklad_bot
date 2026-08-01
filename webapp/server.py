@@ -2015,6 +2015,30 @@ async def _photo_bytes(tg_file_id: str, cache_key: str) -> bytes | None:
     return blob
 
 
+@app.post("/api/products/search")
+async def api_products_search(request: Request):
+    """Поиск товара в номенклатуре — для подсказок при вводе позиции.
+
+    Читаем СНАПШОТ, а не МойСклад: подсказка дёргается на каждое нажатие, и
+    десяток запросов в справочник на одну строку накладной съел бы бюджет,
+    который и так ужимается по календарю. Снапшот отстаёт максимум на сутки —
+    для «есть ли такой товар в каталоге» этого достаточно.
+    """
+    from services import snapshot
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_products_search", rate_limit_max=240,
+    )
+    query = (data.get("query") or "").strip()[:100]
+    if len(query) < 2:
+        # Пустой ввод — не повод отдавать первые 20 товаров каталога наугад.
+        return JSONResponse({"ok": True, "products": [], "query": query})
+    rows = await asyncio.to_thread(snapshot.search_products, query, 20)
+    return JSONResponse({"ok": True, "products": rows, "query": query})
+
+
 @app.post("/api/products/photo")
 async def api_products_photo(request: Request):
     """Отдать фото товара байтами. Прямую ссылку Telegram отдавать нельзя —
@@ -4049,8 +4073,73 @@ async def api_containers_item_add(request: Request):
         arrived_qty=_num("arrived_qty"),
         unit=(data.get("unit") or "шт").strip()[:16],
         note=_machine_text(data, "note", 500),
+        # Товар выбран из каталога — приёмка попадёт ровно на эту карточку,
+        # без угадывания по названию.
+        ms_id=(data.get("ms_id") or "").strip()[:64] or None,
+        ms_name=_machine_text(data, "ms_name", 200),
     )
     return _machine_response(res)
+
+
+@app.post("/api/containers/item_link")
+async def api_containers_item_link(request: Request):
+    """Привязать позицию состава к карточке номенклатуры МойСклад.
+
+    Нужна и постфактум: состав часто заводят до того, как товар появился в
+    каталоге, а несопоставленная позиция — это остаток, которого нет.
+    """
+    from services import containers
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_item_link",
+        rate_limit_max=120,
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    item_id = _machine_id_arg(data, "item_id")
+    res = await containers.link_item(
+        container_id, item_id,
+        ms_id=(data.get("ms_id") or "").strip()[:64],
+        ms_name=_machine_text(data, "ms_name", 200),
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/containers/item_create_product")
+async def api_containers_item_create_product(request: Request):
+    """Завести карточку товара в МойСклад по названию позиции и привязать её.
+
+    Заводит ЧЕЛОВЕК кнопкой: автосоздание из приёмки превратило бы каждую
+    опечатку в новую позицию справочника.
+    """
+    from services import containers, ms_supply
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES,
+        rate_limit_scope="api_containers_item_create_product", rate_limit_max=30,
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    item_id = _machine_id_arg(data, "item_id")
+    # Позицию ищем ВНУТРИ заявленного контейнера — гейт от подстановки чужого id,
+    # и заодно название берём наше, а не присланное клиентом.
+    item = next(
+        (i for i in await containers.list_items(container_id) if int(i["id"]) == item_id), None
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
+
+    created = await ms_supply.create_product(
+        str(item["name"]), unit=str(item.get("unit") or "шт")
+    )
+    if not created.get("ok"):
+        return _machine_response(created)
+    res = await containers.link_item(
+        container_id, item_id, ms_id=created["ms_id"], ms_name=created.get("name")
+    )
+    if not res.get("ok"):
+        return _machine_response(res)
+    return JSONResponse({**res, "name": created.get("name"), "existed": created.get("existed")})
 
 
 @app.post("/api/containers/item_delete")

@@ -46,8 +46,14 @@ STATUS_LABELS = {
 # всему списку: FK на Postgres энфорсятся, на SQLite — нет, поэтому забытая
 # дочерняя таблица не падает ни в одном тесте и всплывает 500-й на проде.
 # Завели новую таблицу с `container_id` — дописать сюда.
-# Сторож: tests/test_containers.py::test_delete_leaves_no_orphans_anywhere.
-CHILD_TABLES = ("container_items", "container_supply")
+#
+# **Порядок значим: от листьев к корню.** `container_item_links` ссылается не
+# только на контейнер, но и на `container_items`, поэтому удалять её надо
+# РАНЬШЕ — иначе Postgres отвергнет DELETE по составу, а SQLite с выключенными
+# FK промолчит и баг снова доедет до прода.
+# Сторожа: tests/test_containers.py::test_delete_leaves_no_orphans_anywhere и
+# ::test_child_tables_are_ordered_leaves_first.
+CHILD_TABLES = ("container_item_links", "container_items", "container_supply")
 
 _NUMBER_SEPARATORS = re.compile(r"[\s\-—–_]+")
 _NUMBER_MAX = 32
@@ -285,9 +291,16 @@ async def add_item(
     arrived_qty: float | None = None,
     unit: str = "шт",
     note: str | None = None,
+    ms_id: str | None = None,
+    ms_name: str | None = None,
 ) -> dict:
     """Добавить позицию. `arrived_qty` задают, когда позицию нашли в прибывшем
-    контейнере, но в заявленном составе её не было (излишек)."""
+    контейнере, но в заявленном составе её не было (излишек).
+
+    `ms_id` — карточка номенклатуры, выбранная из каталога. Свободный ввод
+    остаётся законным: в контейнере регулярно едет то, чего в номенклатуре ещё
+    нет, и требовать карточку до сохранения значит остановить приёмку.
+    """
     clean = (name or "").strip()[:_NAME_MAX]
     if not clean:
         return {"ok": False, "error": "Название позиции обязательно"}
@@ -301,32 +314,94 @@ async def add_item(
         "INSERT INTO container_items (container_id, name, unit, expected_qty, arrived_qty, "
         "note, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)"
     )
+    stamp = now_str()
     values = (
         container_id, clean, (unit or "шт").strip()[:_UNIT_MAX] or "шт",
-        float(expected_qty), arrived_qty, note, now_str(),
+        float(expected_qty), arrived_qty, note, stamp,
     )
+    link_id = (ms_id or "").strip()[:64]
     async with adb_core.transaction() as txn:
         if USE_POSTGRES:
             item_id = await txn.fetchval(sql + " RETURNING id", *values)
         else:
             await txn.execute(sql, *values)
             item_id = await txn.fetchval("SELECT last_insert_rowid()")
-    return {"ok": True, "item_id": int(item_id)}
+        if link_id:
+            await txn.execute(
+                "INSERT INTO container_item_links (item_id, container_id, ms_id, ms_name, "
+                "created_at) VALUES ($1, $2, $3, $4, $5)",
+                int(item_id), container_id, link_id,
+                (ms_name or clean)[:_NAME_MAX], stamp,
+            )
+    return {"ok": True, "item_id": int(item_id), "ms_id": link_id or None}
+
+
+async def link_item(
+    container_id: int, item_id: int, *, ms_id: str, ms_name: str | None = None
+) -> dict:
+    """Привязать позицию к карточке номенклатуры (или переставить привязку).
+
+    Позицию ищем ВНУТРИ заявленного контейнера — гейт от подстановки чужого id.
+    Привязка заменяется целиком: ошиблись товаром — выберите другой, отдельное
+    «отвязать» не нужно.
+    """
+    clean_id = (ms_id or "").strip()[:64]
+    if not clean_id:
+        return {"ok": False, "error": "Выберите товар из каталога"}
+    guard = await _require_open_window(container_id)
+    if guard:
+        return guard
+    row = await adb_core.fetchrow(
+        "SELECT id, name FROM container_items WHERE id = $1 AND container_id = $2",
+        item_id, container_id,
+    )
+    if not row:
+        return {"ok": False, "error": "Позиция не найдена"}
+
+    stamp = now_str()
+    async with adb_core.transaction() as txn:
+        # DELETE+INSERT вместо UPSERT: синтаксис ON CONFLICT у Postgres и SQLite
+        # совпадает не во всех версиях, а строка здесь ровно одна.
+        await txn.execute("DELETE FROM container_item_links WHERE item_id = $1", item_id)
+        await txn.execute(
+            "INSERT INTO container_item_links (item_id, container_id, ms_id, ms_name, "
+            "created_at) VALUES ($1, $2, $3, $4, $5)",
+            item_id, container_id, clean_id,
+            (ms_name or str(row["name"]))[:_NAME_MAX], stamp,
+        )
+    return {"ok": True, "item_id": item_id, "ms_id": clean_id}
 
 
 async def delete_item(container_id: int, item_id: int) -> dict:
     guard = await _require_open_window(container_id)
     if guard:
         return guard
-    rows = await adb_core.execute(
-        "DELETE FROM container_items WHERE id = $1 AND container_id = $2", item_id, container_id
-    )
+    async with adb_core.transaction() as txn:
+        # Связь с номенклатурой ссылается на позицию: на Postgres DELETE по
+        # `container_items` с живой связью отвергается.
+        await txn.execute(
+            "DELETE FROM container_item_links WHERE item_id = $1 AND container_id = $2",
+            item_id, container_id,
+        )
+        rows = await txn.execute(
+            "DELETE FROM container_items WHERE id = $1 AND container_id = $2",
+            item_id, container_id,
+        )
     return {"ok": bool(rows)} if rows else {"ok": False, "error": "Позиция не найдена"}
 
 
 async def list_items(container_id: int) -> list[dict]:
+    """Состав контейнера вместе с привязкой к номенклатуре.
+
+    JOIN, а не запрос на позицию: состав читают и карточка, и оприходование, и
+    N+1 здесь дал бы обращение к БД на каждую строку накладной.
+    """
     rows = await adb_core.fetch(
-        "SELECT * FROM container_items WHERE container_id = $1 ORDER BY id", container_id
+        "SELECT i.*, l.ms_id AS ms_id, l.ms_name AS ms_name "
+        "FROM container_items i "
+        "LEFT JOIN container_item_links l ON l.item_id = i.id "
+        "WHERE i.container_id = $1 ORDER BY i.id",
+        container_id,
     )
     return [dict(r) for r in rows]
 
