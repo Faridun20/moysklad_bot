@@ -455,6 +455,43 @@
     return String(name == null ? '' : name).trim().replace(/\s+/g, ' ').toLowerCase();
   }
 
+  // ─── Воронка обращений ────────────────────────────────────────────────────
+  // Ступени рисуем шириной от ПЕРВОЙ ступени, а не от максимума: воронка по
+  // определению сужается, и «обратились» — это её 100%.
+  function leadFunnelHtml(f) {
+    if (!f || !f.contacted) {
+      return emptyState({ icon: 'user', title: 'Обращений пока нет' });
+    }
+    const steps = [
+      { label: 'Обратились', value: f.contacted },
+      { label: 'Ответили', value: f.replied },
+      { label: 'Купили', value: f.won },
+    ];
+    const base = f.contacted || 1;
+    const rows = steps.map((s) => {
+      const pct = Math.round((s.value / base) * 100);
+      return `
+        <div class="aging-row">
+          <div class="aging-head">
+            <span class="aging-label">${escapeHtml(s.label)}</span>
+            <span class="aging-sum">${s.value} · ${pct}%</span>
+          </div>
+          <div class="aging-track"><div class="aging-bar" data-status="approved" style="width:${pct}%"></div></div>
+        </div>`;
+    }).join('');
+    // Хвосты воронки — то, что требует действия или объясняет потери.
+    const tail = [
+      f.awaiting_reply ? `ждут ответа: ${f.awaiting_reply}` : '',
+      f.never_answered ? `без ответа вовсе: ${f.never_answered}` : '',
+      f.silent ? `замолчали: ${f.silent}` : '',
+      f.lost ? `не купили: ${f.lost}` : '',
+      f.reengaged ? `вернулись: ${f.reengaged}${
+        f.reengaged_won ? ` (из них купили ${f.reengaged_won})` : ''}` : '',
+    ].filter(Boolean).join(' · ');
+    return `<div class="c-surface c-surface--pad">${rows}` +
+      (tail ? `<div class="aging-count">${escapeHtml(tail)}</div>` : '') + '</div>';
+  }
+
   return {
     escapeHtml, idemKey, formatDateRU, icon, opsAmount,
     renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml, financeTabs,
@@ -462,5 +499,6 @@
     emptyState, skeleton, errorBoxHtml,
     machineStatusLabel, machineSubtitle, machineStatusSegHtml,
     moneyBlockLabel, agingBarsHtml, forecastRowsHtml, buyerKey,
+    leadFunnelHtml,
   };
 });

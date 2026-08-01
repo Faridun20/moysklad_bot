@@ -11,7 +11,7 @@ const {
   parsePaymentItems, renderMoneyTotalsHtml, financeTabs, balanceParts, periodSegHtml, rangeLabel,
   formatMoney, msBalanceLabel, emptyState, skeleton, errorBoxHtml,
   machineStatusLabel, machineSubtitle, machineStatusSegHtml,
-  moneyBlockLabel, agingBarsHtml, forecastRowsHtml, buyerKey,
+  moneyBlockLabel, agingBarsHtml, forecastRowsHtml, buyerKey, leadFunnelHtml,
 } = helpers;
 
 describe('periodSegHtml (WP-29)', () => {
@@ -665,5 +665,44 @@ describe('деньги: ключ покупателя', () => {
   it('пустое имя не роняет', () => {
     expect(buyerKey(null)).toBe('');
     expect(buyerKey(undefined)).toBe('');
+  });
+});
+
+describe('воронка обращений', () => {
+  const f = (over) => ({
+    contacted: 10, replied: 8, won: 3, lost: 2, in_progress: 5,
+    never_answered: 2, awaiting_reply: 1, silent: 1,
+    reengaged: 2, reengaged_won: 1, reply_rate: 0.8, win_rate: 0.3, ...over,
+  });
+
+  it('ступени считаются от первой, а не от максимума', () => {
+    // Воронка по определению сужается: «обратились» — это её 100%.
+    const html = leadFunnelHtml(f());
+    expect(html).toContain('width:100%');   // обратились
+    expect(html).toContain('width:80%');    // ответили
+    expect(html).toContain('width:30%');    // купили
+  });
+
+  it('показывает и число, и долю — одно без другого обманывает', () => {
+    const html = leadFunnelHtml(f());
+    expect(html).toContain('8 · 80%');
+  });
+
+  it('хвосты объясняют потери и требуют действия', () => {
+    const html = leadFunnelHtml(f());
+    expect(html).toContain('ждут ответа: 1');
+    expect(html).toContain('вернулись: 2');
+    expect(html).toContain('купили 1');
+  });
+
+  it('нулевые хвосты не печатаются', () => {
+    const html = leadFunnelHtml(f({ silent: 0, lost: 0, reengaged: 0, never_answered: 0 }));
+    expect(html).not.toContain('замолчали');
+    expect(html).not.toContain('вернулись');
+  });
+
+  it('без обращений — объяснение, а не пустые полоски', () => {
+    expect(leadFunnelHtml(f({ contacted: 0 }))).toContain('Обращений пока нет');
+    expect(leadFunnelHtml(null)).toContain('Обращений пока нет');
   });
 });

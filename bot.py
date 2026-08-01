@@ -165,6 +165,7 @@ def register_routers(dp: Dispatcher):
         order_cancel,
         order_ship,
         machines,
+        business,
     )
 
     routers = [
@@ -182,6 +183,11 @@ def register_routers(dp: Dispatcher):
         # Техника: раздел в WebApp, здесь — быстрый просмотр и моточасы,
         # которые снимают с площадки телефоном.
         machines.router,
+        # Наблюдатель переписок менеджеров (Telegram Business). Ничего не
+        # отправляет — только пишет факты в воронку. Регистрация роутера сама
+        # добавляет business-апдейты в allowed_updates:
+        # `dp.resolve_used_update_types()` выводит их из хендлеров.
+        business.router,
     ]
     for r in routers:
         dp.include_router(r)

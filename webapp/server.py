@@ -1989,6 +1989,121 @@ async def api_machines_buyer(request: Request):
     return JSONResponse({"ok": True, **card})
 
 
+# ─── API: воронка клиентов ───────────────────────────────────────────────────
+# Данные наполняет наблюдатель переписок (`handlers/business.py`). Здесь только
+# чтение и два ручных действия: исход сделки и привязка к контрагенту — их из
+# переписки не вывести.
+
+_LEAD_ROLES = ("admin", "boss", "manager")
+
+
+@app.post("/api/leads/list")
+async def api_leads_list(request: Request):
+    """Лиды. Менеджер видит только свои — чужие переписки не его дело."""
+    from services import leads
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_list")
+    role = get_role(user["id"])
+    is_boss = role in ("admin", "boss")
+    status = (data.get("status") or "").strip() or None
+    if status and status not in leads.STATUSES:
+        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+
+    rows = await leads.list_leads(
+        manager_id=None if is_boss else user["id"], status=status
+    )
+    return JSONResponse({
+        "ok": True,
+        "leads": rows,
+        "scope": "company" if is_boss else "personal",
+        "status_labels": leads.STATUS_LABELS,
+        "connections": await leads.list_connections() if is_boss else [],
+    })
+
+
+@app.post("/api/leads/card")
+async def api_leads_card(request: Request):
+    """Карточка лида: отметки времени и события. Текстов переписки здесь нет —
+    мы их не храним."""
+    from services import leads
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_card")
+    lead_id = _machine_id_arg(data, "lead_id")
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+    return JSONResponse({"ok": True, "lead": lead, "status_labels": leads.STATUS_LABELS})
+
+
+@app.post("/api/leads/status")
+async def api_leads_status(request: Request):
+    """Отметить исход. Руками — в переписке его не видно: клиент может
+    согласиться голосом, а может пропасть без слова."""
+    from services import leads
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_status")
+    lead_id = _machine_id_arg(data, "lead_id")
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+    res = await leads.set_status(
+        lead_id, (data.get("status") or "").strip(),
+        user_id=user["id"], full_name=_actor_name(user),
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/leads/link")
+async def api_leads_link(request: Request):
+    """Связать лид с контрагентом МойСклад — чтобы «написал» и «купил»
+    встретились."""
+    from services import leads
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_link")
+    lead_id = _machine_id_arg(data, "lead_id")
+    agent_ms_id = (data.get("agent_ms_id") or "").strip()[:64] or None
+    res = await leads.link_agent(
+        lead_id, agent_ms_id, user_id=user["id"], full_name=_actor_name(user)
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/leads/funnel")
+async def api_leads_funnel(request: Request):
+    """Воронка за период + разрез по менеджерам. Только руководство."""
+    from datetime import datetime
+
+    from services import leads
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=("admin", "boss"), rate_limit_scope="api_leads_funnel"
+    )
+    since, until, _prev, label = _resolve_analytics_period(data, datetime.now())
+    since_s, until_s = since.strftime("%Y-%m-%d"), until.strftime("%Y-%m-%d")
+
+    managers = await leads.by_manager(since_s, until_s)
+    names = await _owner_names([m["manager_id"] for m in managers])
+    for row in managers:
+        row["name"] = names.get(row["manager_id"], f"#{row['manager_id']}")
+
+    return JSONResponse({
+        "ok": True,
+        "funnel": await leads.funnel(since_s, until_s),
+        "by_manager": managers,
+        "awaiting": await leads.awaiting_reply(),
+        "period": {"label": label, "since": since_s, "until": until_s},
+    })
+
+
 # ─── API: заказы ─────────────────────────────────────────────────────────────
 
 
