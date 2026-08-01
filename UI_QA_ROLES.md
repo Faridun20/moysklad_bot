@@ -23,10 +23,10 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 105._
+_Всего эндпоинтов: 106._
 
 
-### Админ (`admin`) — 98 эндпоинтов
+### Админ (`admin`) — 99 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -127,12 +127,13 @@ _Всего эндпоинтов: 105._
 - `/api/returns/positions`
 - `/api/search`
 - `/api/stock`
+- `/api/today`
 - `/api/users/deactivate`
 
 </details>
 
 
-### Руководитель (`boss`) — 95 эндпоинтов
+### Руководитель (`boss`) — 96 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -231,11 +232,12 @@ _Всего эндпоинтов: 105._
 - `/api/returns/positions`
 - `/api/search`
 - `/api/stock`
+- `/api/today`
 
 </details>
 
 
-### Менеджер (`manager`) — 45 эндпоинтов
+### Менеджер (`manager`) — 46 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -284,11 +286,12 @@ _Всего эндпоинтов: 105._
 - `/api/returns/positions`
 - `/api/search`
 - `/api/stock`
+- `/api/today`
 
 </details>
 
 
-### Кладовщик (`warehouse_keeper`) — 6 эндпоинтов
+### Кладовщик (`warehouse_keeper`) — 7 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -298,11 +301,12 @@ _Всего эндпоинтов: 105._
 - `/api/returns/goods_received`
 - `/api/returns/pending`
 - `/api/returns/positions`
+- `/api/today`
 
 </details>
 
 
-### Бухгалтер (`bookkeeper`) — 5 эндпоинтов
+### Бухгалтер (`bookkeeper`) — 6 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -311,6 +315,7 @@ _Всего эндпоинтов: 105._
 - `/api/deposits/pending`
 - `/api/deposits/reject`
 - `/api/payments/unlinked`
+- `/api/today`
 
 </details>
 

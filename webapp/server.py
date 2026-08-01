@@ -868,6 +868,33 @@ def _extract_tg_attribute(demand: dict, attr_name: str) -> str | None:
 # ─── API: операционная сводка ────────────────────────────────────────────────
 
 
+@app.post("/api/today")
+async def api_today(request: Request):
+    """Очередь дел: что ждёт этого человека и в каком порядке.
+
+    Отдаётся ВСЕМ рабочим ролям, включая кладовщика и бухгалтера: до этого
+    «Главная» держалась на `/api/home`, который им не отвечает, и раздел
+    открывался экраном с ошибкой. Порядок и состав очереди считает
+    `services.work_queue` — в шаблоне он разъехался бы с ролями.
+    """
+    from services import work_queue
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager", "warehouse_keeper", "bookkeeper"),
+        rate_limit_scope="api_today",
+        rate_limit_max=120,
+    )
+    role = get_role(user["id"])
+    queue = await work_queue.gather(user["id"], role)
+    return JSONResponse({
+        "ok": True,
+        "queue": queue,
+        "total": sum(int(i["count"]) for i in queue),
+    })
+
+
 @app.post("/api/ops-summary")
 async def api_ops_summary(request: Request):
     """Операционная сводка для босса/админа: зависшие заявки, несданные деньги,

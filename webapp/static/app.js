@@ -395,29 +395,101 @@ async function renderStockScreen() {
   }
 }
 
+// Очередь дел — то, ради чего экран открывают. Порядок и состав считает сервер
+// (`services/work_queue`): в шаблоне он разъехался бы с ролями.
+function workQueueHtml(queue) {
+  if (!queue || !queue.length) {
+    return `<div class="section-label">Требует вас</div>` + emptyState({
+      icon: 'check',
+      title: 'Всё разобрано',
+      hint: 'Ничего не ждёт вашего решения прямо сейчас.',
+    });
+  }
+  const total = queue.reduce((a, i) => a + Number(i.count || 0), 0);
+  const rows = queue.map(i => `
+    <div class="c-row c-row--tap" data-queue="${escapeHtml(i.screen)}"
+         data-status="${i.severity === 'crit' ? 'overdue' : i.severity === 'warn' ? 'pending' : 'draft'}"
+         role="button" tabindex="0">
+      <div class="queue-count">${Number(i.count) || 0}</div>
+      <div class="card-row-info">
+        <div class="card-row-title">${escapeHtml(i.title)}</div>
+        <div class="card-row-sub">${escapeHtml(i.hint || '')}</div>
+      </div>
+      ${icon('clock')}
+    </div>`).join('');
+  return `<div class="section-label">Требует вас · ${total}</div>`
+    + `<div class="c-surface c-surface--list">${rows}</div>`;
+}
+
+// Клик по строке очереди ведёт туда, где дело закрывается. Адрес приходит с
+// сервера вместе с пунктом — счётчик без адреса заставляет искать руками то,
+// о чём сам же сообщил.
+function wireWorkQueue(root) {
+  root.querySelectorAll('[data-queue]').forEach(row => {
+    row.addEventListener('click', () => {
+      haptic();
+      const target = row.dataset.queue;
+      if (target === 'requests') {
+        showScreen('sales');
+        if (typeof renderPendingRequests === 'function') setTimeout(renderPendingRequests, 50);
+        return;
+      }
+      const [screen, tab] = target.split(':');
+      if (tab) setSectionTab(screen, tab);
+      showScreen(screen);
+    });
+  });
+}
+
+// Приветствие по времени суток. Функция, а не переменная внутри renderHome:
+// экран без сводки (кладовщик, бухгалтер) здоровается тем же текстом.
+function greetWord() {
+  const hh = new Date().getHours();
+  return hh < 5 ? 'Доброй ночи' : hh < 12 ? 'Доброе утро'
+    : hh < 18 ? 'Добрый день' : 'Добрый вечер';
+}
+
 async function renderHome() {
   const content = document.getElementById('content');
   content.innerHTML = `
     ${skeleton('hero')}
-    ${skeleton('grid4')}
     ${skeleton('label')}
     ${skeleton('list', 3)}
   `;
 
-  let data;
-  try {
-    const r = await fetch('/api/home', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData: _initData }),
-    });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      throw new Error(err.detail || `HTTP ${r.status}`);
+  // Очередь доступна всем рабочим ролям, сводка выручки — только тем, кому
+  // отвечает /api/home. Кладовщик и бухгалтер получают экран из одной очереди,
+  // а не отказ вместо всего раздела.
+  const canSeeHome = ['admin', 'boss', 'manager'].includes(role());
+  const queuePromise = api('/api/today', {}).catch(() => ({ queue: [] }));
+
+  let data = null;
+  if (canSeeHome) {
+    try {
+      const r = await fetch('/api/home', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initData: _initData }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${r.status}`);
+      }
+      data = await r.json();
+    } catch (e) {
+      content.innerHTML = errorBox(e.message);
+      return;
     }
-    data = await r.json();
-  } catch (e) {
-    content.innerHTML = errorBox(e.message);
+  }
+  const queue = (await queuePromise).queue || [];
+
+  if (!data) {
+    // Роль без сводки: экран — это очередь и ничего больше.
+    const uname0 = (currentUser && currentUser.first_name) || '';
+    content.innerHTML =
+      `<div class="home-greeting">${greetWord()}${uname0 ? ', ' + escapeHtml(uname0) : ''}</div>`
+      + workQueueHtml(queue);
+    wireWorkQueue(content);
     return;
   }
 
@@ -428,11 +500,8 @@ async function renderHome() {
   const mo = data.my_orders;
 
   // ─── Приветствие по времени суток ───────────────────
-  const hh = new Date().getHours();
-  const greetWord = hh < 5 ? 'Доброй ночи' : hh < 12 ? 'Доброе утро'
-    : hh < 18 ? 'Добрый день' : 'Добрый вечер';
   const uname = (currentUser && (currentUser.first_name || currentUser.full_name || currentUser.name)) || '';
-  const greeting = `<div class="home-greeting">${greetWord}${uname ? ', ' + escapeHtml(uname) : ''}</div>`;
+  const greeting = `<div class="home-greeting">${greetWord()}${uname ? ', ' + escapeHtml(uname) : ''}</div>`;
 
   // ─── Hero: выручка за сегодня + тренд к вчера ────────
   const todayLabel = data.today.scope === 'personal' ? 'Моя выручка сегодня' : 'Выручка компании сегодня';
@@ -455,38 +524,6 @@ async function renderHome() {
   // ─── Action-grid: 4 быстрых действия. Склад и Заказы объединены
   //    в одной вкладке «Склад и заказы», поэтому в гриде разделяем
   //    «открыть каталог» и «создать заказ» по data-new флагу.
-  const actions = isBoss ? `
-    <div class="action-grid">
-      <button class="action-btn" data-go="stock">
-        <span class="action-btn-icon icon-orange">${icon('box')}</span>Каталог
-      </button>
-      <button class="action-btn" data-go="requests">
-        <span class="action-btn-icon icon-amber">${icon('clock')}</span>Заявки
-      </button>
-      <button class="action-btn" data-go="analytics">
-        <span class="action-btn-icon icon-purple">${icon('chart')}</span>Аналитика
-      </button>
-      <button class="action-btn" data-go="payments">
-        <span class="action-btn-icon icon-green">${icon('cash')}</span>Платежи
-      </button>
-    </div>
-  ` : `
-    <div class="action-grid">
-      <button class="action-btn" data-go="stock">
-        <span class="action-btn-icon icon-orange">${icon('box')}</span>Каталог
-      </button>
-      <button class="action-btn" data-go="orders" data-new="1">
-        <span class="action-btn-icon icon-blue">${icon('plus')}</span>Заказ
-      </button>
-      <button class="action-btn" data-go="analytics">
-        <span class="action-btn-icon icon-purple">${icon('chart')}</span>Аналитика
-      </button>
-      <button class="action-btn" data-go="payments">
-        <span class="action-btn-icon icon-green">${icon('cash')}</span>Платёж
-      </button>
-    </div>
-  `;
-
   // ─── Предупреждение если не привязан к МойСклад ─────
   const linkWarning = (!data.ms_linked && data.role === 'manager') ? `
     <div class="warn-card">
@@ -500,31 +537,6 @@ async function renderHome() {
   // руководству (что ждёт решения + лидерборд). Раньше обе ветки собирались
   // одной разметкой с if-ами внутри, и по коду не было видно, какой экран
   // получится. Теперь это отдельные функции: читаешь ту, чью роль отлаживаешь.
-
-  // Что ждёт решения: показываем только ненулевое, строка ведёт в свой раздел.
-  const attentionHtml = () => {
-    const att = data.attention || {};
-    const items = [
-      { n: att.requests, label: 'Заявки на апрув', ic: 'clock', go: 'requests' },
-      { n: att.payments, label: 'Платежи на подтверждении', ic: 'cash', go: 'finance:confirm' },
-      { n: att.deposits, label: 'Сдачи на подтверждении', ic: 'cashbox', go: 'finance:confirm' },
-      { n: att.returns, label: 'Возвраты на подтверждении', ic: 'return', go: 'finance:confirm' },
-      { n: att.debts, label: 'Открытые долги', ic: 'wallet', go: 'finance:debts' },
-    ].filter(x => x.n > 0);
-    if (!items.length) return '';
-    return `
-      <div class="section-label">Требует внимания</div>
-      <div class="c-surface c-surface--list">
-        ${items.map(x => `
-          <div class="c-row c-row--tap" data-att="${x.go}" role="button" tabindex="0">
-            <div class="card-row-icon card-row-icon--warn">${icon(x.ic)}</div>
-            <div class="card-row-info"><div class="card-row-title">${x.label}</div></div>
-            <span class="stock-badge badge-yellow">${x.n}</span>
-          </div>
-        `).join('')}
-      </div>
-    `;
-  };
 
   // Вход в полную операционную сводку — отдельный экран (раньше уходило
   // дайджестом в Telegram).
@@ -597,56 +609,17 @@ async function renderHome() {
     return `<div class="section-label">Мои заказы</div>${statsRow}${recentList}`;
   };
 
-  const bossHome = () => attentionHtml() + monitoringHtml() + leaderboardHtml() + myOrdersHtml();
+  const bossHome = () => monitoringHtml() + leaderboardHtml() + myOrdersHtml();
   const managerHome = () => myOrdersHtml();
 
   content.innerHTML =
-    greeting + hero + actions + linkWarning + (isBoss ? bossHome() : managerHome());
+    greeting + hero + workQueueHtml(queue) + linkWarning + (isBoss ? bossHome() : managerHome());
 
-  // Action-grid → переход на нужный таб (и опционально открыть новый заказ)
-  document.querySelectorAll('[data-go]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      haptic();
-      const target = btn.dataset.go;
-      const isNew = btn.dataset.new === '1';
-      // «Заявки» (boss) → экран заявок на рассмотрении (под вкладкой «Заказы»),
-      // а не голый список заказов. Сначала корневой таб (для подсветки nav),
-      // затем поверх — список заявок.
-      if (target === 'requests') {
-        showScreen('sales');
-        if (typeof renderPendingRequests === 'function') {
-          setTimeout(renderPendingRequests, 50);
-        }
-        return;
-      }
-      showScreen(target);
-      // Если кликнули по «+ Заказ» — после загрузки экрана откроем редактор
-      if (isNew && typeof openOrderEditor === 'function') {
-        // Дать времени renderOrders выполниться, потом инициировать создание
-        setTimeout(() => openOrderEditor(null), 50);
-      }
-    });
-  });
+  wireWorkQueue(content);
 
-  // Дашборд «Требует внимания» → переход в нужный раздел.
-  document.querySelectorAll('[data-att]').forEach(row => {
-    row.addEventListener('click', () => {
-      haptic();
-      const go = row.dataset.att;
-      if (go === 'ops') {
-        showScreen('ops');
-        return;
-      }
-      if (go === 'requests') {
-        showScreen('sales');
-        if (typeof renderPendingRequests === 'function') setTimeout(renderPendingRequests, 50);
-        return;
-      }
-      if (go.indexOf('finance:') === 0) {
-        moneyTab = go.slice('finance:'.length);   // глоб. состояние вкладки «Денег»
-        showScreen('money');
-      }
-    });
+  // Вход в операционную сводку — единственная оставшаяся строка-переход.
+  document.querySelectorAll('[data-att="ops"]').forEach(row => {
+    row.addEventListener('click', () => { haptic(); showScreen('ops'); });
   });
 
   // Клик по строке недавнего заказа → Заказы
@@ -4139,7 +4112,80 @@ async function renderClientsScreen() {
   const body = document.getElementById('clients-body');
   if (clientsTab === 'limits') await renderCreditLimits(body);
   else if (clientsTab === 'channel') await renderChannelHistory(body);
+  else if (clientsTab === 'list') await renderLeadsList(body);
   else await renderLeadsFunnel(body);
+}
+
+let leadsFilter = 'all';   // all | new | won | lost
+
+// Список обратившихся. До него исход сделки можно было поставить только тому,
+// кто прямо сейчас висит без ответа: клиент, которому ответили и который потом
+// замолчал, не находился вовсе.
+async function renderLeadsList(container) {
+  const box = container || document.getElementById('content');
+  box.innerHTML = skeleton('list', 4);
+  let data;
+  try {
+    data = await api('/api/leads/list', { status: leadsFilter === 'all' ? '' : leadsFilter });
+  } catch (e) {
+    box.innerHTML = errorBox(e.message);
+    return;
+  }
+  const labels = data.status_labels || {};
+  const filters = [['all', 'Все'], ['new', 'В работе'], ['won', 'Купили'], ['lost', 'Не купили']];
+  const chips = '<div class="seg-row"><div class="seg seg--scroll">'
+    + filters.map(([k, l]) =>
+        `<button class="seg-item ${leadsFilter === k ? 'active' : ''}" data-lfilter="${k}" `
+        + `aria-pressed="${leadsFilter === k}">${l}</button>`).join('')
+    + '</div></div>';
+
+  // Состояние выводится из отметок времени, а не хранится — поэтому подпись
+  // строки всегда совпадает с фактами (services/leads.lead_state).
+  const stateWord = (l) => {
+    const st = l.state || {};
+    if (st.awaiting_reply) return 'ждёт ответа';
+    if (st.never_answered) return 'ему не ответили';
+    if (st.silent) return 'замолчал';
+    if (st.replied) return 'в переписке';
+    return '';
+  };
+  const rows = (data.leads || []).map(l => {
+    const st = l.state || {};
+    const tone = st.awaiting_reply || st.never_answered ? 'overdue'
+      : l.status === 'won' ? 'approved'
+      : l.status === 'lost' ? 'rejected' : 'pending';
+    const when = String(l.last_inbound_at || l.first_seen_at || '').slice(0, 16);
+    const sub = [stateWord(l), when].filter(Boolean).join(' · ');
+    return `
+      <div class="c-row c-row--tap" data-lead="${l.id}" data-status="${tone}" role="button" tabindex="0">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(l.display_name || l.username || '—')}</div>
+          <div class="card-row-sub">${escapeHtml(sub)}</div>
+        </div>
+        <div class="card-row-value">${escapeHtml(labels[l.status] || '')}</div>
+      </div>`;
+  }).join('');
+
+  box.innerHTML = chips + (rows
+    ? `<div class="c-surface c-surface--list">${rows}</div>`
+    : emptyState({
+        icon: 'user',
+        title: leadsFilter === 'all' ? 'Обращений пока нет' : 'В этом состоянии никого',
+        hint: leadsFilter === 'all'
+          ? 'Список наполняется из личных переписок менеджеров — нужен Telegram Premium и подключение бота с правом читать сообщения.'
+          : 'Смените фильтр, чтобы увидеть остальных.',
+      }));
+
+  box.querySelectorAll('[data-lfilter]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('light');
+      leadsFilter = btn.dataset.lfilter;
+      renderLeadsList(box);
+    });
+  });
+  box.querySelectorAll('[data-lead]').forEach(row => {
+    row.addEventListener('click', () => { haptic('light'); renderLeadCard(Number(row.dataset.lead)); });
+  });
 }
 
 async function renderLeadsFunnel(container) {
