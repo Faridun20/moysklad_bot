@@ -34,6 +34,22 @@ applyTelegramTheme();
 // Пользователь сменил тему системы/Telegram, пока WebApp открыт.
 tg.onEvent && tg.onEvent('themeChanged', applyTelegramTheme);
 
+// ─── Высота окна ────────────────────────────────────────────────────
+// Оболочку меряем ВЫСОТОЙ ОТ TELEGRAM, а не `100dvh`. WebView сообщает свою
+// высоту, не зная про нативную шапку клиента и его панели, поэтому `dvh`
+// оказывается больше видимой области: низ приложения уходит за край, страница
+// прокручивается на пустоту, а плавающее меню будто «висит» не у дна.
+// `viewportStableHeight` — высота БЕЗ учёта временных панелей (клавиатура),
+// именно её и надо брать под каркас, иначе он прыгает на каждый ввод.
+function syncViewport() {
+  const h = tg.viewportStableHeight || tg.viewportHeight;
+  // Вне Telegram высоты нет — CSS остаётся на 100dvh, это правильный фолбэк.
+  if (!h) return;
+  document.documentElement.style.setProperty('--tg-viewport', `${h}px`);
+}
+syncViewport();
+tg.onEvent && tg.onEvent('viewportChanged', syncViewport);
+
 // Клавиатурная активация tap-строк: строки-карточки — это div role="button"
 // tabindex="0" (не нативные кнопки, чтобы не ломать вёрстку), поэтому Enter/Space
 // сами по себе не кликают. Один делегированный хендлер на документ закрывает это

@@ -1297,3 +1297,45 @@ describe('«Сегодня» — очередь дел', () => {
     expect(content.querySelector('.error-card, .error')).toBeNull();
   });
 });
+
+describe('высота окна', () => {
+  it('каркас меряется высотой от Telegram, а не 100dvh', () => {
+    // WebView не знает про нативную шапку клиента: `dvh` больше видимой
+    // области, низ приложения уходит за край и страница прокручивается на
+    // пустоту.
+    const window = makeWindow();
+    window.Telegram.WebApp.viewportStableHeight = 640;
+    window.Telegram.WebApp.viewportHeight = 700;
+    window.eval(read('helpers.js'));
+    window.eval(read('app.js'));
+    expect(window.document.documentElement.style.getPropertyValue('--tg-viewport'))
+      .toBe('640px');
+  });
+
+  it('вне Telegram переменной нет — остаётся фолбэк из CSS', () => {
+    const window = makeWindow();
+    delete window.Telegram.WebApp.viewportStableHeight;
+    delete window.Telegram.WebApp.viewportHeight;
+    window.eval(read('helpers.js'));
+    window.eval(read('app.js'));
+    expect(window.document.documentElement.style.getPropertyValue('--tg-viewport'))
+      .toBe('');
+  });
+
+  it('высота пересчитывается по viewportChanged, а не только на старте', () => {
+    // Клиент меняет её при развороте окна и повороте экрана; без подписки
+    // каркас остался бы в размере первого кадра.
+    const handlers = {};
+    const window = makeWindow();
+    window.Telegram.WebApp.viewportStableHeight = 500;
+    window.Telegram.WebApp.onEvent = (name, fn) => { handlers[name] = fn; };
+    window.eval(read('helpers.js'));
+    window.eval(read('app.js'));
+    expect(typeof handlers.viewportChanged).toBe('function');
+
+    window.Telegram.WebApp.viewportStableHeight = 812;
+    handlers.viewportChanged();
+    expect(window.document.documentElement.style.getPropertyValue('--tg-viewport'))
+      .toBe('812px');
+  });
+});

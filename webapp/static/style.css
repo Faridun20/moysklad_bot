@@ -353,6 +353,10 @@ body::before {
   flex-direction: column;
   min-height: 100vh;
   min-height: 100dvh;   /* не прыгает при появлении/скрытии адрес-бара */
+  /* В Telegram — высота от клиента (syncViewport в app.js). `dvh` там больше
+     видимой области: WebView не знает про нативную шапку, и низ приложения
+     уходит за край. Вне Telegram переменной нет и остаётся 100dvh. */
+  min-height: var(--tg-viewport, 100dvh);
   /* запас под плавающее нижнее меню + safe-area (home-indicator/чёлка) */
   padding-bottom: calc(84px + env(safe-area-inset-bottom));
 }
