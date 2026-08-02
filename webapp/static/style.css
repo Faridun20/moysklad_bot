@@ -103,6 +103,12 @@
   --field-1:     rgba(0, 122, 255, 0.11);
   --field-2:     rgba(30, 142, 62, 0.09);
   --field-dot:   rgba(0, 0, 0, 0.045);
+
+  /* Отступ плавающей панели от низа экрана. БОЛЬШЕЕ из двух, а не сумма:
+     `12px + env(safe-area-inset-bottom)` складывал собственный зазор с высотой
+     жестовой полосы Android, и панель зависала заметно выше края. Жестовая
+     полоса уже и есть тот отступ, ради которого зазор задавался. */
+  --nav-gap: max(10px, env(safe-area-inset-bottom));
 }
 
 /* Поле выводим из акцента ТЕМЫ, но только там, где color-mix поддержан.
@@ -357,8 +363,9 @@ body::before {
      видимой области: WebView не знает про нативную шапку, и низ приложения
      уходит за край. Вне Telegram переменной нет и остаётся 100dvh. */
   min-height: var(--tg-viewport, 100dvh);
-  /* запас под плавающее нижнее меню + safe-area (home-indicator/чёлка) */
-  padding-bottom: calc(84px + env(safe-area-inset-bottom));
+  /* запас под плавающее нижнее меню: его высота (66px) + зазор до контента */
+  padding-bottom: calc(84px + env(safe-area-inset-bottom));   /* фолбэк без max() */
+  padding-bottom: calc(76px + var(--nav-gap));
 }
 
 /* ─── Topbar ──────────────────────────────────────────────────── */
@@ -846,7 +853,8 @@ body::before {
 .bottom-nav {
   position: fixed;
   /* поднимаем над home-indicator на телефонах с жестовой навигацией */
-  bottom: calc(12px + env(safe-area-inset-bottom));
+  bottom: calc(12px + env(safe-area-inset-bottom));   /* фолбэк для WebView без max() */
+  bottom: var(--nav-gap);
   left: 12px;
   right: 12px;
   display: grid;
@@ -1586,7 +1594,8 @@ body::before {
 
 .editor-footer {
   position: sticky;
-  bottom: calc(84px + env(safe-area-inset-bottom));
+  bottom: calc(84px + env(safe-area-inset-bottom));   /* фолбэк без max() */
+  bottom: calc(76px + var(--nav-gap));
   padding: 12px 0 0;
 }
 
@@ -2322,7 +2331,8 @@ body::before {
 .toast-host {
   position: fixed;
   left: 0; right: 0;
-  bottom: calc(96px + env(safe-area-inset-bottom));
+  bottom: calc(96px + env(safe-area-inset-bottom));   /* фолбэк без max() */
+  bottom: calc(88px + var(--nav-gap));
   display: flex;
   flex-direction: column;
   align-items: center;
