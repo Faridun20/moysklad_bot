@@ -254,3 +254,32 @@ describe('фон не мешает sticky-шапке', () => {
     expect(rule[1]).toMatch(/pointer-events:\s*none/);
   });
 });
+
+describe('плавающие элементы у нижнего края', () => {
+  const code = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  it('отступ от низа — большее из двух, а не сумма', () => {
+    // `12px + env(safe-area-inset-bottom)` складывал собственный зазор с
+    // высотой жестовой полосы Android, и панель зависала заметно выше края.
+    expect(code).toMatch(/--nav-gap:\s*max\(\s*\d+px\s*,\s*env\(safe-area-inset-bottom\)\s*\)/);
+  });
+
+  it('у каждого плавающего элемента есть фолбэк без max()', () => {
+    // Без max() объявление невалидно, и элемент теряет `bottom` целиком —
+    // панель уехала бы в поток. Поэтому сначала простое значение, потом токен.
+    for (const cls of ['.bottom-nav', '.editor-footer', '.toast-host']) {
+      const at = code.indexOf(cls + ' {');
+      expect(at, `правило ${cls} пропало`).toBeGreaterThan(-1);
+      const body = code.slice(at, code.indexOf('}', at));
+      expect(body, `${cls}: нет фолбэка`).toMatch(/bottom:[^;]*env\(safe-area-inset-bottom\)/);
+      expect(body, `${cls}: не использует общий токен`).toMatch(/bottom:[^;]*var\(--nav-gap\)/);
+    }
+  });
+
+  it('запас под панель считается тем же токеном, что и её отступ', () => {
+    // Иначе контент прячется под меню или под ним остаётся дыра.
+    const at = code.indexOf('.app {');
+    const body = code.slice(at, code.indexOf('}', at));
+    expect(body).toMatch(/padding-bottom:[^;]*var\(--nav-gap\)/);
+  });
+});
