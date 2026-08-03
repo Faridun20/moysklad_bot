@@ -406,3 +406,93 @@ def test_photo_list_never_leaks_file_ids(isolated_db, monkeypatch):
     assert r.status_code == 200, r.text
     assert "AgAC-secret" not in r.text
     assert set(r.json()["photos"][0]) == {"id", "caption", "uploaded_at"}
+
+
+# ─── Отклик на пост ───────────────────────────────────────────────────────────
+#
+# Это КОРРЕЛЯЦИЯ, а не атрибуция: ссылка под постом ведёт прямо в личку
+# менеджера и метки не несёт. Поэтому проверяем ровно то, что обещаем, —
+# «сколько обращений пришло ПОСЛЕ поста», а не «сколько пришло ИЗ поста».
+
+from datetime import timedelta
+
+from utils.helpers import local_now
+
+
+def _stamp(**kw):
+    return (local_now().replace(tzinfo=None) - timedelta(**kw)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _lead(uid, at):
+    from services import leads
+
+    _run(leads.record_message(tg_user_id=uid, manager_id=1, inbound=True, at=at))
+
+
+def test_effect_counts_only_the_window_after_the_post(isolated_db):
+    from services import channel
+
+    db = isolated_db
+    _setup(db)
+    posted = _stamp(days=3)
+    _lead(101, _stamp(days=3, hours=-2))   # через 2 часа после поста
+    _lead(102, _stamp(days=3, hours=-20))  # через 20 часов — ещё в окне
+    _lead(103, _stamp(days=1))             # спустя двое суток — уже вне окна
+    _lead(104, _stamp(days=4))             # за сутки ДО поста
+
+    effect = _run(channel.post_effect(posted))
+    assert effect["after"] == 2
+    assert effect["window_hours"] == channel.EFFECT_WINDOW_HOURS
+
+
+def test_effect_reports_the_ordinary_day_for_comparison(isolated_db):
+    """Без фона число «7 обращений» ничего не значит: семь при обычных двух и
+    семь при обычных восьми — разные новости."""
+    from services import channel
+
+    db = isolated_db
+    _setup(db)
+    posted = _stamp(days=1)
+    # Ровно 15 обращений за 30 дней до поста → обычный день = 0,5.
+    for i in range(15):
+        _lead(1000 + i, _stamp(days=2 + i))
+
+    effect = _run(channel.post_effect(posted))
+    assert effect["baseline"] == round(15 / channel.EFFECT_BASELINE_DAYS, 1) == 0.5
+    assert effect["after"] == 0, "до поста никого не считаем в окно после него"
+
+
+def test_effect_does_not_count_the_baseline_twice(isolated_db):
+    """Обращения из окна после поста не должны попадать ещё и в фон — иначе
+    удачный пост сам себе поднимает планку и выглядит обычным."""
+    from services import channel
+
+    db = isolated_db
+    _setup(db)
+    posted = _stamp(days=5)
+    _lead(201, _stamp(days=5, hours=-1))   # в окне после поста
+    _lead(202, _stamp(days=6))             # в фоне до поста
+
+    effect = _run(channel.post_effect(posted))
+    assert effect["after"] == 1
+    assert effect["baseline"] == round(1 / channel.EFFECT_BASELINE_DAYS, 1)
+
+
+def test_effect_on_empty_history_is_zero_not_none(isolated_db):
+    """Пустой фон — законный ответ («канал новый»), а не отсутствие данных."""
+    from services import channel
+
+    db = isolated_db
+    _setup(db)
+    effect = _run(channel.post_effect(_stamp(days=1)))
+    assert effect == {"after": 0, "baseline": 0.0, "window_hours": channel.EFFECT_WINDOW_HOURS}
+
+
+def test_effect_is_none_for_a_post_without_a_timestamp(isolated_db):
+    """Считать не от чего — честнее не показывать строку вовсе."""
+    from services import channel
+
+    db = isolated_db
+    _setup(db)
+    assert _run(channel.post_effect(None)) is None
+    assert _run(channel.post_effect("не дата")) is None

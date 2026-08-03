@@ -2365,8 +2365,13 @@ async def api_channel_history(request: Request):
 
     data = await request.json()
     _authorize(data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_channel_history")
+    posts = await channel.history()
+    # Отклик считаем на каждый пост: это два локальных COUNT'а на строку, без
+    # запросов в МойСклад. История ограничена 30 постами, N+1 здесь не страшен.
+    for post in posts:
+        post["effect"] = await channel.post_effect(post.get("posted_at"))
     return JSONResponse({
-        "ok": True, "posts": await channel.history(), "kind_labels": channel.KIND_LABELS,
+        "ok": True, "posts": posts, "kind_labels": channel.KIND_LABELS,
         "can_publish": _channel_id() is not None,
     })
 
@@ -2391,9 +2396,14 @@ async def api_leads_list(request: Request):
     status = (data.get("status") or "").strip() or None
     if status and status not in leads.STATUSES:
         raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+    # Исход и состояние разговора — разные вопросы («купил ли» и «на ком ход»),
+    # поэтому это два независимых отбора, а не один общий список значений.
+    state = (data.get("state") or "").strip() or None
+    if state and state not in leads.STATE_FILTERS:
+        raise HTTPException(status_code=400, detail=f"Неизвестное состояние: {state}")
 
     rows = await leads.list_leads(
-        manager_id=None if is_boss else user["id"], status=status
+        manager_id=None if is_boss else user["id"], status=status, state=state
     )
     return JSONResponse({
         "ok": True,

@@ -66,7 +66,7 @@ Variable: новые сервисы (cron'ы) переменную не насл
 ## Conventions (нетривиальные)
 
 **DB:**
-- `init_db()` делает ТОЛЬКО `CREATE TABLE IF NOT EXISTS`. `ALTER TABLE` и backfill → в `run_migrations()` / `run_backfills()`, вызываются из `tasks/migrate.py`. **Не добавляй ALTER в init_db.**
+- `init_db()` делает ТОЛЬКО `CREATE TABLE IF NOT EXISTS`. **Инкрементальных миграций в проекте НЕТ вообще**: `ALTER TABLE` запрещён во всех `.py` (`tests/test_schema_single_pass.py::test_no_alter_table_anywhere_in_project`), `run_migrations()` не существует и его отсутствие тоже под тестом. Нужна новая колонка в таблице, которая уже на проде, — заводи ОТДЕЛЬНУЮ таблицу (прецеденты: `container_supply`, `container_item_links`, `machine_deal_payments`). Data-миграции и сидинг настроек — в `run_backfills()`, вызывается из `tasks/migrate.py`.
 - Webapp endpoint'ы: `services.async_db as adb` (`await adb.get_user(uid)`) — обёртка через `asyncio.to_thread`. В bot handlers — то же или явный `asyncio.to_thread`.
 - Роль читай через `services.roles.cached_role(user_id)` (TTL 60s) и предикаты `is_boss / can_create_orders / ...`. НЕ через `services.database.get_role` напрямую — обойдёшь кэш. **Деактивация:** `get_role` отдаёт `guest` если `user_roles.deactivated_at` стоит → деактивированный теряет ВСЕ права. `deactivate_user/reactivate_user` (адмін, `/deactivate`/`/reactivate` + webapp `/api/users/deactivate`).
 - Race-чувствительные операции (`mark_order_paid`, `confirm_payment`, `confirm_cash_deposit`) используют `SELECT ... FOR UPDATE` / advisory-lock — сохраняй паттерн.
@@ -259,6 +259,18 @@ SQLite проходит при любой перестановке.
 паузу задним числом не восстановить. Воронка считает по ПЕРВОМУ обращению в
 периоде, иначе активный клиент выглядел бы десятью обращениями и конверсия
 падала бы от активности, а не от результата.
+**Кто заговорил первым — обязательный разрез** (`first_touch_directions`): лид
+заводит ЛЮБОЕ первое сообщение, включая наше собственное после звонка клиента, и
+без разделения «обратились» раздувается тем сильнее, чем активнее работают по
+телефону. Общий `contacted` при этом НЕ трогаем — по нему сравнивают месяцы,
+разделение едет отдельными полями (`by_direction`). Скорость ответа — медиана и
+p90 (`reply_speed`), а НЕ среднее, и лиды без ответа в неё не входят: иначе
+показатель улучшался бы оттого, что человеку так и не ответили. Состояние
+разговора (`STATE_FILTERS`) фильтруется в Python через `lead_state`, а не
+условием в SQL — пороги живут в одном месте.
+Отклик поста в канале (`channel.post_effect`) — это КОРРЕЛЯЦИЯ, а не атрибуция:
+ссылка под постом ведёт прямо в личку менеджера и метки не несёт, поэтому
+подписываем «после поста», а не «из поста».
 Требует Telegram Premium у менеджера; `business_connections.can_read = 0` —
 типичная причина «клиенты не пишут», поэтому состояние подключений отдаётся
 боссу в `/api/leads/list`.

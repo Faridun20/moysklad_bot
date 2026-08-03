@@ -403,3 +403,177 @@ def test_connection_state_is_visible_to_boss(isolated_db, monkeypatch):
 
     body = _post(_client(monkeypatch), "/api/leads/list", 2).json()
     assert body["connections"][0]["can_read"] == 0
+
+
+# ─── Кто заговорил первым ─────────────────────────────────────────────────────
+
+
+def _today():
+    return local_now().strftime("%Y-%m-%d")
+
+
+def test_lead_created_by_our_own_message_is_not_an_inbound(isolated_db):
+    """Главный перекос воронки: клиент звонит, менеджер пишет ему первым — и
+    карточка заводится ИСХОДЯЩИМ. Считать такого «обратившимся» значит раздувать
+    знаменатель тем сильнее, чем активнее работают по телефону."""
+    from services import leads
+
+    db = isolated_db
+    _setup(db)
+    _run(leads.record_message(tg_user_id=100, manager_id=1, inbound=True))    # написал сам
+    _run(leads.record_message(tg_user_id=200, manager_id=1, inbound=False))   # написали мы
+
+    f = _run(leads.funnel(_today(), _today()))
+    assert f["contacted"] == 2, "общая цифра не должна меняться — по ней сравнивают месяцы"
+    assert f["by_direction"]["inbound"]["contacted"] == 1
+    assert f["by_direction"]["outbound"]["contacted"] == 1
+
+
+def test_direction_is_taken_from_the_first_message_not_the_last(isolated_db):
+    """Клиент написал, менеджер ответил, клиент написал снова — это по-прежнему
+    входящий лид. Иначе направление менялось бы от каждого сообщения."""
+    from services import leads
+
+    db = isolated_db
+    _setup(db)
+    _run(leads.record_message(tg_user_id=100, manager_id=1, inbound=True, at=_ago(hours=5)))
+    _run(leads.record_message(tg_user_id=100, manager_id=1, inbound=False, at=_ago(hours=4)))
+    _run(leads.record_message(tg_user_id=100, manager_id=1, inbound=True, at=_ago(hours=3)))
+
+    f = _run(leads.funnel(_today(), _today()))
+    assert f["by_direction"]["inbound"]["contacted"] == 1
+    assert f["by_direction"]["outbound"]["contacted"] == 0
+
+
+def test_direction_split_adds_up_to_the_whole(isolated_db):
+    """Две половины обязаны давать общее число: иначе на экране пропадут люди."""
+    from services import leads
+
+    db = isolated_db
+    _setup(db)
+    for uid in (101, 102, 103):
+        _run(leads.record_message(tg_user_id=uid, manager_id=1, inbound=True))
+    for uid in (201, 202):
+        _run(leads.record_message(tg_user_id=uid, manager_id=1, inbound=False))
+
+    f = _run(leads.funnel(_today(), _today()))
+    halves = f["by_direction"]["inbound"]["contacted"] + f["by_direction"]["outbound"]["contacted"]
+    assert halves == f["contacted"] == 5
+
+
+def test_first_touch_is_one_query_for_the_whole_batch(isolated_db):
+    """N+1 на каждый отчёт: по лиду в цикле это сотня запросов на экран."""
+    from services import leads
+
+    db = isolated_db
+    _setup(db)
+    ids = []
+    for uid in (301, 302, 303):
+        res = _run(leads.record_message(tg_user_id=uid, manager_id=1, inbound=True))
+        ids.append(res["lead_id"])
+
+    directions = _run(leads.first_touch_directions(ids))
+    assert set(directions) == set(ids)
+    assert set(directions.values()) == {"inbound"}
+    assert _run(leads.first_touch_directions([])) == {}
+
+
+# ─── Скорость ответа ──────────────────────────────────────────────────────────
+
+
+def test_speed_ignores_leads_that_never_got_an_answer(isolated_db):
+    """Иначе показатель улучшается оттого, что человеку так и не ответили."""
+    from services import leads
+
+    db = isolated_db
+    _setup(db)
+    # Ответили через 30 минут.
+    _run(leads.record_message(tg_user_id=100, manager_id=1, inbound=True, at=_ago(hours=3)))
+    _run(leads.record_message(tg_user_id=100, manager_id=1, inbound=False,
+                              at=_ago(hours=2, minutes=30)))
+    # А этому не ответили вовсе.
+    _run(leads.record_message(tg_user_id=200, manager_id=1, inbound=True, at=_ago(days=2)))
+
+    f = _run(leads.funnel(_ago(days=7)[:10], _today()))
+    assert f["speed"]["answered"] == 1
+    assert 29 <= f["speed"]["median_minutes"] <= 31
+    assert f["never_answered"] == 1
+
+
+def test_speed_shows_the_typical_case_not_the_average(isolated_db):
+    """Один забытый на трое суток клиент не должен описывать весь месяц."""
+    from services import leads
+
+    db = isolated_db
+    _setup(db)
+    # Четверым ответили за ~10 минут, пятому — через трое суток.
+    for uid in (101, 102, 103, 104):
+        _run(leads.record_message(tg_user_id=uid, manager_id=1, inbound=True, at=_ago(hours=5)))
+        _run(leads.record_message(tg_user_id=uid, manager_id=1, inbound=False,
+                                  at=_ago(hours=4, minutes=50)))
+    _run(leads.record_message(tg_user_id=105, manager_id=1, inbound=True, at=_ago(days=5)))
+    _run(leads.record_message(tg_user_id=105, manager_id=1, inbound=False, at=_ago(days=2)))
+
+    speed = _run(leads.funnel(_ago(days=30)[:10], _today()))["speed"]
+    assert speed["answered"] == 5
+    assert speed["median_minutes"] < 60, "медиана не должна утаскиваться выбросом"
+    assert speed["p90_minutes"] > 60, "но хвост обязан быть виден"
+
+
+def test_speed_is_empty_without_answers(isolated_db):
+    from services import leads
+
+    db = isolated_db
+    _setup(db)
+    _run(leads.record_message(tg_user_id=100, manager_id=1, inbound=True))
+
+    speed = _run(leads.funnel(_today(), _today()))["speed"]
+    assert speed == {"answered": 0, "median_minutes": None, "p90_minutes": None}
+
+
+# ─── Отборы по состоянию ──────────────────────────────────────────────────────
+
+
+def test_state_filter_splits_the_list_into_three_jobs(isolated_db):
+    """Три разных разговора, перемешанных сегодня в одном списке."""
+    from services import leads
+
+    db = isolated_db
+    _setup(db)
+    # Ждёт ответа: написал 20 часов назад, мы молчим.
+    _run(leads.record_message(tg_user_id=100, manager_id=1, inbound=True, at=_ago(hours=20)))
+    # Замолчал: мы ответили месяц назад, он больше не пишет.
+    _run(leads.record_message(tg_user_id=200, manager_id=1, inbound=True, at=_ago(days=40)))
+    _run(leads.record_message(tg_user_id=200, manager_id=1, inbound=False, at=_ago(days=39)))
+    # Свежий разговор — ни в один отбор не попадает.
+    _run(leads.record_message(tg_user_id=300, manager_id=1, inbound=True, at=_ago(minutes=5)))
+    _run(leads.record_message(tg_user_id=300, manager_id=1, inbound=False, at=_ago(minutes=2)))
+
+    def ids(state):
+        return {r["tg_user_id"] for r in _run(leads.list_leads(state=state))}
+
+    assert ids("awaiting_reply") == {100}
+    assert ids("never_answered") == {100}
+    assert ids("silent") == {200}
+    assert len(_run(leads.list_leads())) == 3
+
+
+def test_unknown_state_filter_is_ignored_not_fatal(isolated_db):
+    """Ручка валидирует значение; сервис не должен молча отдавать пусто на
+    неизвестное — иначе опечатка выглядит как «клиентов нет»."""
+    from services import leads
+
+    db = isolated_db
+    _setup(db)
+    _run(leads.record_message(tg_user_id=100, manager_id=1, inbound=True))
+    assert len(_run(leads.list_leads(state="что-то"))) == 1
+
+
+def test_state_filter_endpoint_rejects_garbage(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+    client = _client(monkeypatch)
+    assert client.post("/api/leads/list", json={"initData": "2", "state": "хм"}).status_code == 400
+    assert client.post(
+        "/api/leads/list", json={"initData": "2", "state": "silent"}
+    ).status_code == 200

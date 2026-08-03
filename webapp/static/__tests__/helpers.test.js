@@ -13,6 +13,7 @@ const {
   formatMoney, msBalanceLabel, emptyState, skeleton, errorBoxHtml,
   machineStatusLabel, machineSubtitle, machineStatusSegHtml,
   moneyBlockLabel, agingBarsHtml, forecastRowsHtml, buyerKey, leadFunnelHtml,
+  firstTouchHtml, replySpeedHtml, durationLabel, postEffectLabel,
 } = helpers;
 
 describe('periodSegHtml (WP-29)', () => {
@@ -772,5 +773,81 @@ describe('воронка обращений', () => {
   it('без обращений — объяснение, а не пустые полоски', () => {
     expect(leadFunnelHtml(f({ contacted: 0 }))).toContain('Обращений пока нет');
     expect(leadFunnelHtml(null)).toContain('Обращений пока нет');
+  });
+});
+
+describe('кто заговорил первым', () => {
+  const f = {
+    contacted: 5,
+    by_direction: {
+      inbound: { contacted: 3, replied: 3, won: 2, lost: 0, win_rate: 0.667 },
+      outbound: { contacted: 2, replied: 1, won: 0, lost: 1, win_rate: 0 },
+    },
+  };
+
+  it('показывает обе половины с их собственной конверсией', () => {
+    // Смешивать нельзя: у написавшего самому интерес уже есть, второго ещё надо
+    // заинтересовать — одной цифрой эти две работы не описать.
+    const html = firstTouchHtml(f);
+    expect(html).toContain('Клиент написал сам');
+    expect(html).toContain('Написали мы первыми');
+    expect(html).toContain('67%');
+    expect(html).toContain('0%');
+  });
+
+  it('пустую половину не рисует', () => {
+    const only = { by_direction: { inbound: { contacted: 4, won: 1, win_rate: 0.25 }, outbound: { contacted: 0 } } };
+    const html = firstTouchHtml(only);
+    expect(html).toContain('Клиент написал сам');
+    expect(html).not.toContain('Написали мы первыми');
+  });
+
+  it('без данных не рисует ничего, а не пустую карточку', () => {
+    expect(firstTouchHtml({})).toBe('');
+    expect(firstTouchHtml(null)).toBe('');
+  });
+});
+
+describe('скорость ответа', () => {
+  it('показывает типичный случай и хвост, а не среднее', () => {
+    const html = replySpeedHtml({ answered: 12, median_minutes: 40, p90_minutes: 380 });
+    expect(html).toContain('Обычно отвечаем за');
+    expect(html).toContain('40 мин');
+    expect(html).toContain('Каждый десятый ждёт дольше');
+    expect(html).toContain('6.3 ч');
+    expect(html).not.toContain('среднее');
+  });
+
+  it('без ответов блок не рисуется', () => {
+    // «Обычно отвечаем за —» хуже, чем отсутствие строки.
+    expect(replySpeedHtml({ answered: 0, median_minutes: null, p90_minutes: null })).toBe('');
+    expect(replySpeedHtml(null)).toBe('');
+  });
+
+  it('длительность читается словами', () => {
+    expect(durationLabel(0)).toBe('0 мин');
+    expect(durationLabel(45)).toBe('45 мин');
+    expect(durationLabel(60)).toBe('1 ч');
+    expect(durationLabel(150)).toBe('2.5 ч');
+    expect(durationLabel(60 * 30)).toBe('1.3 дн');
+    expect(durationLabel(null)).toBe('—');
+    expect(durationLabel(-5)).toBe('—');
+  });
+});
+
+describe('отклик на пост в канале', () => {
+  it('говорит «после поста», а не «из поста»', () => {
+    // Ссылка под постом ведёт прямо в личку менеджера и метки не несёт —
+    // кто именно пришёл с публикации, мы не знаем и делать вид не будем.
+    const label = postEffectLabel({ after: 7, baseline: 1.7, window_hours: 24 });
+    expect(label).toContain('после поста');
+    expect(label).not.toContain('из поста');
+    expect(label).toContain('7');
+    expect(label).toContain('1,7');
+  });
+
+  it('при полном нуле строки нет', () => {
+    expect(postEffectLabel({ after: 0, baseline: 0, window_hours: 24 })).toBe('');
+    expect(postEffectLabel(null)).toBe('');
   });
 });

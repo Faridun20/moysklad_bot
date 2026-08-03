@@ -4136,7 +4136,11 @@ async function renderClientsScreen() {
   else await renderLeadsFunnel(body);
 }
 
+// Два независимых отбора: исход сделки и состояние разговора. Это разные
+// вопросы — «купил ли» и «на ком сейчас ход», — и складывать их в один список
+// значит заставлять человека помнить, какой из двух он сейчас выбирает.
 let leadsFilter = 'all';   // all | new | won | lost
+let leadsState = '';       // '' | awaiting_reply | silent | never_answered
 
 // Список обратившихся. До него исход сделки можно было поставить только тому,
 // кто прямо сейчас висит без ответа: клиент, которому ответили и который потом
@@ -4146,7 +4150,10 @@ async function renderLeadsList(container) {
   box.innerHTML = skeleton('list', 4);
   let data;
   try {
-    data = await api('/api/leads/list', { status: leadsFilter === 'all' ? '' : leadsFilter });
+    data = await api('/api/leads/list', {
+      status: leadsFilter === 'all' ? '' : leadsFilter,
+      state: leadsState,
+    });
   } catch (e) {
     box.innerHTML = errorBox(e.message);
     return;
@@ -4157,6 +4164,19 @@ async function renderLeadsList(container) {
     + filters.map(([k, l]) =>
         `<button class="seg-item ${leadsFilter === k ? 'active' : ''}" data-lfilter="${k}" `
         + `aria-pressed="${leadsFilter === k}">${l}</button>`).join('')
+    + '</div></div>';
+  // Состояние разговора — три готовых списка дел. Раньше они были перемешаны в
+  // общем списке, и до «ему ни разу не ответили» руки не доходили никогда.
+  const states = [
+    ['', 'Любое'],
+    ['awaiting_reply', 'Ждут ответа'],
+    ['never_answered', 'Без ответа'],
+    ['silent', 'Замолчали'],
+  ];
+  const stateChips = '<div class="seg-row"><div class="seg seg--scroll">'
+    + states.map(([k, l]) =>
+        `<button class="seg-item ${leadsState === k ? 'active' : ''}" data-lstate="${k}" `
+        + `aria-pressed="${leadsState === k}">${l}</button>`).join('')
     + '</div></div>';
 
   // Состояние выводится из отметок времени, а не хранится — поэтому подпись
@@ -4186,12 +4206,13 @@ async function renderLeadsList(container) {
       </div>`;
   }).join('');
 
-  box.innerHTML = chips + (rows
+  box.innerHTML = chips + stateChips + (rows
     ? `<div class="c-surface c-surface--list">${rows}</div>`
     : emptyState({
         icon: 'user',
-        title: leadsFilter === 'all' ? 'Обращений пока нет' : 'В этом состоянии никого',
-        hint: leadsFilter === 'all'
+        title: (leadsFilter === 'all' && !leadsState)
+          ? 'Обращений пока нет' : 'По этому отбору никого',
+        hint: (leadsFilter === 'all' && !leadsState)
           ? 'Список наполняется из личных переписок менеджеров — нужен Telegram Premium и подключение бота с правом читать сообщения.'
           : 'Смените фильтр, чтобы увидеть остальных.',
       }));
@@ -4200,6 +4221,13 @@ async function renderLeadsList(container) {
     btn.addEventListener('click', () => {
       haptic('light');
       leadsFilter = btn.dataset.lfilter;
+      renderLeadsList(box);
+    });
+  });
+  box.querySelectorAll('[data-lstate]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('light');
+      leadsState = btn.dataset.lstate;
       renderLeadsList(box);
     });
   });
@@ -4233,6 +4261,13 @@ async function renderLeadsFunnel(container) {
   }
 
   let html = '<div class="section-label">Воронка обращений</div>' + leadFunnelHtml(f);
+  // Кто заговорил первым. Лид заводит любое первое сообщение, включая наше
+  // собственное после звонка, — без этого разреза «обратились» врёт тем сильнее,
+  // чем активнее работают по телефону.
+  const touch = firstTouchHtml(f);
+  if (touch) html += '<div class="section-label">Кто заговорил первым</div>' + touch;
+  const speed = replySpeedHtml(f.speed);
+  if (speed) html += '<div class="section-label">Скорость ответа</div>' + speed;
   if ((lead.awaiting || []).length) {
     html += `<div class="section-label">Ждут ответа · ${lead.awaiting.length}</div>`;
     html += '<div class="c-surface c-surface--list">' + lead.awaiting.map(l => `
@@ -4250,7 +4285,10 @@ async function renderLeadsFunnel(container) {
       <div class="c-row">
         <div class="card-row-info">
           <div class="card-row-title">${escapeHtml(m.name)}</div>
-          <div class="card-row-sub">обратились ${m.contacted} · ответили ${m.replied}${
+          <div class="card-row-sub">обратились ${m.contacted}${
+            m.inbound != null ? ` (сами ${m.inbound})` : ''} · ответили ${m.replied}${
+            m.speed && m.speed.median_minutes != null
+              ? ` · обычно за ${durationLabel(m.speed.median_minutes)}` : ''}${
             m.awaiting_reply ? ` · ждут ${m.awaiting_reply}` : ''}</div>
         </div>
         <div class="card-row-value">${m.win_rate == null ? '—' : Math.round(m.win_rate * 100) + '%'}</div>
@@ -4287,14 +4325,21 @@ async function renderChannelHistory(container) {
     });
     return;
   }
-  box.innerHTML = warn + '<div class="c-surface c-surface--list">' + posts.map(p => `
+  // Отклик подписан «после поста», а не «из поста»: ссылка под публикацией ведёт
+  // прямо в личку менеджера и метки не несёт, поэтому кто именно пришёл с поста —
+  // неизвестно. Это корреляция, и говорить о ней надо ровно так.
+  box.innerHTML = warn + '<div class="c-surface c-surface--list">' + posts.map(p => {
+    const effect = postEffectLabel(p.effect);
+    return `
     <div class="c-row">
       <div class="card-row-info">
         <div class="card-row-title">${escapeHtml(labels[p.kind] || p.kind || '')}</div>
         <div class="card-row-sub">${escapeHtml(String(p.posted_at || '').slice(0, 16))}${
           p.ref ? ' · ' + escapeHtml(String(p.ref)) : ''}</div>
+        ${effect ? `<div class="card-row-sub">${escapeHtml(effect)}</div>` : ''}
       </div>
-    </div>`).join('') + '</div>';
+    </div>`;
+  }).join('') + '</div>';
 }
 
 // ─── Канал ──────────────────────────────────────────────────────────────────

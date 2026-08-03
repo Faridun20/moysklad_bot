@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import datetime, timedelta
 
 from services import adb_core
 from services.database import get_setting, now_str
@@ -194,3 +195,54 @@ async def history(limit: int = 30) -> list[dict]:
         "SELECT * FROM channel_posts ORDER BY id DESC LIMIT $1", limit
     )
     return [dict(r) for r in rows]
+
+
+# Окно, в котором считаем отклик на пост, и глубина «обычного дня» для сравнения.
+# Сутки — потому что канал читают в течение дня; 30 дней фона хватает, чтобы
+# один удачный день не выглядел нормой.
+EFFECT_WINDOW_HOURS = 24
+EFFECT_BASELINE_DAYS = 30
+
+
+async def post_effect(posted_at: str | None) -> dict | None:
+    """Сколько новых обращений пришло в сутки после поста и сколько бывает обычно.
+
+    Это КОРРЕЛЯЦИЯ, а не атрибуция: ссылка под постом ведёт прямо в личку
+    менеджера и не несёт метки, поэтому кто именно пришёл с поста — неизвестно.
+    Отвечает на «есть ли от канала отдача вообще», и подписывать это надо
+    буквально «после поста», а не «из поста».
+
+    Сравнимо напрямую: `channel_posts.posted_at` и `leads.first_seen_at` оба
+    пишутся `now_str()` в локальном кадре.
+    """
+    stamp = _parse_stamp(posted_at)
+    if stamp is None:
+        return None
+    window_end = stamp + timedelta(hours=EFFECT_WINDOW_HOURS)
+    base_start = stamp - timedelta(days=EFFECT_BASELINE_DAYS)
+    fmt = "%Y-%m-%d %H:%M:%S"
+
+    after = await adb_core.fetchval(
+        "SELECT COUNT(*) FROM leads WHERE first_seen_at >= $1 AND first_seen_at < $2",
+        stamp.strftime(fmt), window_end.strftime(fmt),
+    )
+    before = await adb_core.fetchval(
+        "SELECT COUNT(*) FROM leads WHERE first_seen_at >= $1 AND first_seen_at < $2",
+        base_start.strftime(fmt), stamp.strftime(fmt),
+    )
+    return {
+        "after": int(after or 0),
+        # Обычный день — среднее за месяц до поста. Округляем до десятых:
+        # «обычно 1,7 в день» честнее, чем «2».
+        "baseline": round(int(before or 0) / EFFECT_BASELINE_DAYS, 1),
+        "window_hours": EFFECT_WINDOW_HOURS,
+    }
+
+
+def _parse_stamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value)[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
