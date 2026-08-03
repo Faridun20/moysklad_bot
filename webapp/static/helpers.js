@@ -581,6 +581,82 @@
       (tail ? `<div class="aging-count">${escapeHtml(tail)}</div>` : '') + '</div>';
   }
 
+  // Длительность словами. Минуты до часа, дальше часы, дальше дни: «за 40 мин»
+  // читается, «за 0,67 ч» — нет.
+  function durationLabel(minutes) {
+    if (minutes == null) return '—';
+    const m = Math.round(Number(minutes));
+    if (!isFinite(m) || m < 0) return '—';
+    if (m < 60) return `${m} мин`;
+    const h = m / 60;
+    if (h < 24) return `${h < 10 ? h.toFixed(1).replace('.0', '') : Math.round(h)} ч`;
+    const d = h / 24;
+    return `${d < 10 ? d.toFixed(1).replace('.0', '') : Math.round(d)} дн`;
+  }
+
+  // Две ступени вместо одной: клиент написал сам / написали мы первыми.
+  // Смешивать их нельзя — у первого интерес уже есть, второго ещё надо
+  // заинтересовать, и одной конверсией эти две работы не описать.
+  function firstTouchHtml(f) {
+    const d = (f && f.by_direction) || {};
+    const halves = [
+      { key: 'inbound', label: 'Клиент написал сам', hint: 'пришёл сам' },
+      { key: 'outbound', label: 'Написали мы первыми', hint: 'после звонка или по своей инициативе' },
+    ];
+    const rows = halves.map((h) => {
+      const b = d[h.key] || {};
+      const n = Number(b.contacted) || 0;
+      if (!n) return '';
+      const win = b.win_rate == null ? '—' : `${Math.round(b.win_rate * 100)}%`;
+      return `
+        <div class="c-row">
+          <div class="card-row-info">
+            <div class="card-row-title">${escapeHtml(h.label)}</div>
+            <div class="card-row-sub">${n} — купили ${Number(b.won) || 0} · ${escapeHtml(h.hint)}</div>
+          </div>
+          <div class="card-row-value">${win}</div>
+        </div>`;
+    }).filter(Boolean).join('');
+    if (!rows) return '';
+    return '<div class="c-surface c-surface--list">' + rows + '</div>';
+  }
+
+  // Скорость ответа: типичный случай и хвост. Среднее не показываем — один
+  // забытый на три дня клиент делает его бессмысленным.
+  function replySpeedHtml(speed) {
+    const s = speed || {};
+    if (!s.answered) return '';
+    return `<div class="c-surface c-surface--list">
+      <div class="c-row">
+        <div class="card-row-info"><div class="card-row-sub">Обычно отвечаем за</div></div>
+        <div class="card-row-value">${escapeHtml(durationLabel(s.median_minutes))}</div>
+      </div>
+      <div class="c-row">
+        <div class="card-row-info">
+          <div class="card-row-sub">Каждый десятый ждёт дольше</div>
+        </div>
+        <div class="card-row-value">${escapeHtml(durationLabel(s.p90_minutes))}</div>
+      </div>
+      <div class="c-row">
+        <div class="card-row-info"><div class="card-row-sub">Посчитано по ответам</div></div>
+        <div class="card-row-value">${Number(s.answered) || 0}</div>
+      </div>
+    </div>`;
+  }
+
+  // Отклик на пост в канале. Формулировка «после поста» — не «из поста»:
+  // ссылка ведёт прямо в личку менеджера и метки не несёт, поэтому кто именно
+  // пришёл с публикации, мы не знаем и делать вид не будем.
+  function postEffectLabel(effect) {
+    if (!effect) return '';
+    const after = Number(effect.after) || 0;
+    const base = Number(effect.baseline) || 0;
+    const window = Number(effect.window_hours) || 24;
+    if (!after && !base) return '';
+    const baseText = String(base).replace('.', ',');
+    return `за ${window} ч после поста — ${after} обращ. · обычно ${baseText}/день`;
+  }
+
   return {
     escapeHtml, idemKey, formatDateRU, icon, opsAmount,
     renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml,
@@ -590,6 +666,6 @@
     emptyState, skeleton, errorBoxHtml,
     machineStatusLabel, machineSubtitle, machineStatusSegHtml,
     moneyBlockLabel, agingBarsHtml, forecastRowsHtml, buyerKey,
-    leadFunnelHtml,
+    leadFunnelHtml, firstTouchHtml, replySpeedHtml, durationLabel, postEffectLabel,
   };
 });

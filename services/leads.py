@@ -243,9 +243,27 @@ def visible_lead(lead: dict, now: datetime | None = None) -> dict:
     return data
 
 
+# Отборы по состоянию разговора. Исход (`status`) и состояние — разные вопросы:
+# «купил ли» и «на ком сейчас ход». Смешивать их в один фильтр значит требовать
+# от человека держать в голове, какое из двух он сейчас выбирает.
+STATE_FILTERS = ("awaiting_reply", "silent", "never_answered")
+
+
 async def list_leads(
-    *, manager_id: int | None = None, status: str | None = None, limit: int = 100
+    *,
+    manager_id: int | None = None,
+    status: str | None = None,
+    state: str | None = None,
+    limit: int = 100,
 ) -> list[dict]:
+    """Список лидов. `state` — один из `STATE_FILTERS`, отбор по состоянию.
+
+    Состояние считается в Python над теми же строками (`lead_state`), а не
+    условием в SQL: пороги «12 часов» и «две недели» живут в одном месте, и
+    второй их экземпляр в запросе разъехался бы с первым при первой правке.
+    Из-за этого лимит применяется ПОСЛЕ отбора — иначе фильтр резал бы уже
+    урезанную выборку и терял хвост.
+    """
     query = "SELECT * FROM leads"
     params: list[Any] = []
     where = []
@@ -257,10 +275,15 @@ async def list_leads(
         where.append(f"status = ${len(params)}")
     if where:
         query += " WHERE " + " AND ".join(where)
-    params.append(limit)
+    # Потолок выборки: при отборе по состоянию берём с запасом, потому что
+    # отсев идёт уже в Python.
+    params.append(max(limit, 500) if state else limit)
     query += f" ORDER BY COALESCE(last_inbound_at, first_seen_at) DESC LIMIT ${len(params)}"
     now = local_now().replace(tzinfo=None)
-    return [visible_lead(dict(r), now) for r in await adb_core.fetch(query, *params)]
+    rows = [visible_lead(dict(r), now) for r in await adb_core.fetch(query, *params)]
+    if state in STATE_FILTERS:
+        rows = [r for r in rows if r["state"].get(state)][:limit]
+    return rows
 
 
 async def get_lead(lead_id: int) -> dict | None:
@@ -337,12 +360,83 @@ async def _audit(user_id: int, full_name: str, role: str, action: str, details: 
 # ─── Воронка ─────────────────────────────────────────────────────────────────
 
 
+async def first_touch_directions(lead_ids: list[int]) -> dict[int, str]:
+    """Кто заговорил первым по каждому лиду: `inbound` — клиент, `outbound` — мы.
+
+    Различать обязательно. Лид заводит ЛЮБОЕ первое сообщение, в том числе наше
+    собственное: позвонил клиент, менеджер написал ему в Telegram — карточка
+    создана исходящим. Считать такого наравне с тем, кто написал сам, значит
+    раздувать «обратились» тем сильнее, чем активнее работают по телефону, —
+    и занижать конверсию, которая на самом деле не падала.
+
+    Одним запросом на всю выборку: по лиду в цикле это N+1 на каждый отчёт.
+    """
+    if not lead_ids:
+        return {}
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(lead_ids)))
+    rows = await adb_core.fetch(
+        f"SELECT lead_id, kind, at, id FROM lead_events "
+        f"WHERE lead_id IN ({placeholders}) AND kind IN ('inbound', 'outbound') "
+        f"ORDER BY lead_id, at, id",
+        *lead_ids,
+    )
+    out: dict[int, str] = {}
+    for row in rows:
+        # Первый ряд на лида и есть первое касание — дальше по этому лиду не смотрим.
+        out.setdefault(int(row["lead_id"]), str(row["kind"]))
+    return out
+
+
+def _percentile(values: list[float], share: float) -> float | None:
+    """Значение, ниже которого лежит `share` выборки. Без numpy — он тут не нужен."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, round(share * (len(ordered) - 1))))
+    return ordered[idx]
+
+
+def reply_speed(leads: list[dict]) -> dict:
+    """Как быстро отвечаем: типичное время и хвост.
+
+    Медиана и p90, а НЕ среднее: один клиент, забытый на три дня, утаскивает
+    среднее так, что оно перестаёт описывать хоть один реальный случай.
+
+    Лиды без ответа в расчёт НЕ идут. Считать их нулём нельзя (мгновенный ответ
+    там, где ответа не было), бесконечностью — тоже: показатель тогда улучшался
+    бы оттого, что человеку так и не ответили. Их место — в отдельном счётчике
+    `never_answered`, который уже есть.
+    """
+    minutes: list[float] = []
+    for row in leads:
+        first_seen = _parse(row.get("first_seen_at"))
+        replied_at = _parse(row.get("first_reply_at"))
+        if not first_seen or not replied_at:
+            continue
+        delta = (replied_at - first_seen).total_seconds() / 60
+        if delta < 0:
+            # Часы на сервере переводили или строка кривая — молча пропускаем,
+            # отрицательное «время ответа» не бывает.
+            continue
+        minutes.append(delta)
+    return {
+        "answered": len(minutes),
+        "median_minutes": _percentile(minutes, 0.5),
+        "p90_minutes": _percentile(minutes, 0.9),
+    }
+
+
 async def funnel(since: str, until: str) -> dict:
     """Воронка за период: обратились → ответили → купили.
 
     Считаем по ПЕРВОМУ обращению в периоде, а не по всем событиям: иначе клиент,
     который пишет каждый день, выглядел бы как десять обращений, и конверсия
     падала бы от активности, а не от результата.
+
+    `contacted` оставлен как был — это общее число клиентов за период, и старые
+    отчёты по нему сравнимы. Разделение на «написал сам» и «написали мы» едет
+    ОТДЕЛЬНЫМИ полями: менять смысл существующей цифры значит сломать
+    сравнимость с прошлыми месяцами в день выката.
     """
     rows = await adb_core.fetch(
         "SELECT * FROM leads WHERE first_seen_at >= $1 AND first_seen_at <= $2",
@@ -356,6 +450,14 @@ async def funnel(since: str, until: str) -> dict:
     replied = sum(1 for s in states if s.replied)
     won = sum(1 for row in leads if row["status"] == "won")
     lost = sum(1 for row in leads if row["status"] == "lost")
+
+    directions = await first_touch_directions([int(r["id"]) for r in leads])
+    inbound_leads = [r for r in leads if directions.get(int(r["id"])) == "inbound"]
+    outbound_leads = [r for r in leads if directions.get(int(r["id"])) == "outbound"]
+    by_direction = {
+        "inbound": _direction_block(inbound_leads, now),
+        "outbound": _direction_block(outbound_leads, now),
+    }
 
     reengaged_rows = await adb_core.fetch(
         "SELECT DISTINCT lead_id FROM lead_events WHERE kind = 'reengaged' "
@@ -380,6 +482,27 @@ async def funnel(since: str, until: str) -> dict:
         "reengaged_won": len(reengaged_ids & won_ids),
         "reply_rate": round(replied / contacted, 3) if contacted else None,
         "win_rate": round(won / contacted, 3) if contacted else None,
+        # Две ступени вместо одной: у написавшего самому интерес уже есть, а
+        # того, кому написали мы, ещё надо заинтересовать. Одной конверсией их
+        # не описать.
+        "by_direction": by_direction,
+        "speed": reply_speed(leads),
+    }
+
+
+def _direction_block(leads: list[dict], now: datetime) -> dict:
+    """Счётчики по одной половине воронки — тем, кто написал сам, или тем, кому
+    написали мы. Форма совпадает с общей, чтобы экран рисовал их одинаково."""
+    total = len(leads)
+    states = [lead_state(row, now) for row in leads]
+    won = sum(1 for row in leads if row["status"] == "won")
+    return {
+        "contacted": total,
+        "replied": sum(1 for s in states if s.replied),
+        "won": won,
+        "lost": sum(1 for row in leads if row["status"] == "lost"),
+        "win_rate": round(won / total, 3) if total else None,
+        "speed": reply_speed(leads),
     }
 
 
@@ -396,6 +519,9 @@ async def by_manager(since: str, until: str) -> list[dict]:
             continue
         grouped.setdefault(int(row["manager_id"]), []).append(dict(row))
 
+    directions = await first_touch_directions(
+        [int(r["id"]) for items in grouped.values() for r in items]
+    )
     out = []
     for manager_id, items in grouped.items():
         states = [lead_state(i, now) for i in items]
@@ -408,6 +534,10 @@ async def by_manager(since: str, until: str) -> list[dict]:
             "won": won,
             "awaiting_reply": sum(1 for s in states if s.awaiting_reply),
             "win_rate": round(won / contacted, 3) if contacted else None,
+            # Сколько из них написали сами: менеджер, который весь месяц звонил
+            # и писал первым, и менеджер, к которому пришли, работали по-разному.
+            "inbound": sum(1 for i in items if directions.get(int(i["id"])) == "inbound"),
+            "speed": reply_speed(items),
         })
     out.sort(key=lambda r: (-r["contacted"], r["manager_id"]))
     return out
