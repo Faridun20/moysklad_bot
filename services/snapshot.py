@@ -556,7 +556,26 @@ def get_categories() -> list[dict]:
 
 
 def get_counterparties(search: str | None = None, limit: int = 50) -> list[dict]:
-    if search:
+    """Контрагенты снапшота. Ищем и по названию, и по ТЕЛЕФОНУ.
+
+    Телефон нужен потому, что клиента чаще помнят по номеру, чем по тому, как он
+    записан в МойСклад («ООО Бахор Савдо» против «Азиз»). Сравниваем по цифрам:
+    в МС номер лежит свободным текстом со скобками, дефисами и подписями вроде
+    «раб.», и поиск по сырой строке не находит ничего.
+    """
+    digits = "".join(ch for ch in (search or "") if ch.isdigit())
+    if search and digits and len(digits) >= 4:
+        # По номеру ищем без разделителей с обеих сторон: колонка чистится
+        # выражением, индекса по ней нет и быть не может (колонку не добавить),
+        # но контрагентов тысячи — полный скан здесь дешевле лишней таблицы.
+        sql = (
+            "SELECT ms_id, name, phone, balance_cents FROM ms_counterparties "
+            "WHERE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(phone,''), "
+            "' ', ''), '-', ''), '(', ''), ')', ''), '+', '') LIKE ? "
+            "OR LOWER(name) LIKE ? ORDER BY name LIMIT ?"
+        )
+        args = (f"%{digits}%", f"%{search.lower()}%", limit)
+    elif search:
         sql = (
             "SELECT ms_id, name, phone, balance_cents FROM ms_counterparties "
             "WHERE LOWER(name) LIKE ? ORDER BY name LIMIT ?"
@@ -569,6 +588,29 @@ def get_counterparties(search: str | None = None, limit: int = 50) -> list[dict]
         cur = get_cursor(conn)
         cur.execute(q(sql), args)
         return [dict(r) for r in cur.fetchall()]
+
+
+async def remember_counterparty(ms_id: str, *, name: str, phone: str | None = None) -> None:
+    """Положить только что созданного контрагента в снапшот.
+
+    Тот же приём, что и с товаром (`remember_product`): справочник обновляется
+    раз в сутки, и контрагент, заведённый минуту назад из карточки лида, до
+    ночной синхронизации не нашёлся бы ни поиском, ни при привязке — и его
+    завели бы второй раз.
+
+    Существующую строку не трогаем: перезапись стёрла бы баланс взаиморасчётов.
+    """
+    if not ms_id:
+        return
+    if await adb_core.fetchval(
+        "SELECT ms_id FROM ms_counterparties WHERE ms_id = $1", ms_id
+    ):
+        return
+    await adb_core.execute(
+        "INSERT INTO ms_counterparties (ms_id, name, phone, href, balance_cents, "
+        "updated_at) VALUES ($1, $2, $3, $4, $5, $6)",
+        ms_id, name, phone or "", "", 0, now_str(),
+    )
 
 
 def get_counterparty(ms_id: str) -> dict | None:
