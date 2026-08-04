@@ -2473,6 +2473,60 @@ async def api_leads_status(request: Request):
     return _machine_response(res)
 
 
+@app.post("/api/leads/agents")
+async def api_leads_agents(request: Request):
+    """Поиск контрагента для привязки — по названию ИЛИ телефону.
+
+    Телефон важнее названия: клиента помнят по номеру, а в МойСклад он записан
+    как «ООО Бахор Савдо». Читаем снапшот, в МойСклад не ходим.
+    """
+    from services import snapshot
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_agents",
+        rate_limit_max=240,
+    )
+    search = (data.get("search") or "").strip()[:100]
+    rows = await asyncio.to_thread(snapshot.get_counterparties, search or None, 20)
+    return JSONResponse({"ok": True, "agents": rows})
+
+
+@app.post("/api/leads/create_agent")
+async def api_leads_create_agent(request: Request):
+    """Завести контрагента в МойСклад по клиенту и сразу привязать.
+
+    Заводит ЧЕЛОВЕК кнопкой: каждый написавший — ещё не клиент, автосоздание
+    превратило бы справочник в свалку из случайных собеседников.
+    """
+    from services import leads, ms_counterparty
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_create_agent",
+        rate_limit_max=30,
+    )
+    lead_id = _machine_id_arg(data, "lead_id")
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+
+    name = _machine_text(data, "name", 255) or lead.get("display_name") or lead.get("username")
+    created = await ms_counterparty.create_counterparty(
+        name or "", phone=_machine_text(data, "phone", 64)
+    )
+    if not created.get("ok"):
+        return _machine_response(created)
+    res = await leads.link_agent(
+        lead_id, created["ms_id"], user_id=user["id"], full_name=_actor_name(user)
+    )
+    if not res.get("ok"):
+        return _machine_response(res)
+    return JSONResponse({**res, "name": created["name"], "existed": created["existed"]})
+
+
 @app.post("/api/leads/calls")
 async def api_leads_calls(request: Request):
     """Журнал звонков. Без `lead_id` отдаёт непривязанные — тех, кого ещё не
@@ -2558,6 +2612,14 @@ async def api_leads_link(request: Request):
     data = await request.json()
     user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_link")
     lead_id = _machine_id_arg(data, "lead_id")
+    # Проверка владения была только у карточки и статуса — менеджер мог привязать
+    # контрагента к чужому лиду. Ручку до сих пор не звал фронт, поэтому дыра и
+    # не всплыла; закрываем прежде, чем кнопка появится.
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
     agent_ms_id = (data.get("agent_ms_id") or "").strip()[:64] or None
     res = await leads.link_agent(
         lead_id, agent_ms_id, user_id=user["id"], full_name=_actor_name(user)

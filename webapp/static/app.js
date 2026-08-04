@@ -4499,7 +4499,10 @@ async function renderLeadCard(leadId) {
     ['Первое обращение', String(l.first_seen_at || '').slice(0, 16) || '—'],
     ['Последнее сообщение', String(l.last_inbound_at || '').slice(0, 16) || '—'],
     ['Первый ответ', String(l.first_reply_at || '').slice(0, 16) || 'не отвечали'],
-    ['Контрагент', l.agent_ms_id ? 'привязан' : '— не привязан'],
+    // Контрагент — единственный источник телефона: Telegram номер собеседника
+    // не отдаёт, поэтому он берётся из карточки МойСклад, а не из переписки.
+    ['Контрагент', (l.agent && l.agent.name) || (l.agent_ms_id ? 'привязан' : '— не привязан')],
+    ...(l.agent && l.agent.phone ? [['Телефон', l.agent.phone]] : []),
   ];
   const flags = [
     st.awaiting_reply ? '⏳ ждёт ответа' : '',
@@ -4550,6 +4553,8 @@ async function renderLeadCard(leadId) {
       <button class="btn-secondary" data-lead-status="lost">${icon('close')} Не купил</button>
       <button class="btn-secondary" data-lead-status="new">Вернуть в работу</button>
       <button class="btn-secondary" id="lead-call">${icon('phone')} Записать звонок</button>
+      <button class="btn-secondary" id="lead-agent">${icon('building')} ${
+        l.agent_ms_id ? 'Сменить контрагента' : 'Привязать контрагента'}</button>
     </div>
     ${callsBlock}
     <div class="section-label">События</div>
@@ -4585,6 +4590,113 @@ async function renderLeadCard(leadId) {
 
   content.querySelector('#lead-call')?.addEventListener('click', () =>
     openCallForm({ leadId, onDone: () => renderLeadCard(leadId) }));
+
+  content.querySelector('#lead-agent')?.addEventListener('click', () =>
+    openAgentPicker(leadId, l));
+}
+
+// Привязка клиента к контрагенту МойСклад — мост, без которого «написал» и
+// «купил» никогда не встретятся: в переписке клиент это Telegram-аккаунт, в
+// заказах — контрагент, и общих полей у них нет.
+//
+// Здесь же берётся телефон. Читать его из переписки НЕЛЬЗЯ — Telegram не отдаёт
+// боту номер собеседника вовсе, ни в каком поле. Он живёт на карточке
+// контрагента, и это единственное место, где ему и место.
+function openAgentPicker(leadId, lead) {
+  let picked = null;
+  const name = lead.display_name || lead.username || '';
+
+  const sheet = openMachineSheet({
+    title: 'Контрагент клиента',
+    hint: 'Ищите по названию или по номеру телефона',
+    fields: [{ key: 'search', label: 'Поиск в МойСклад', value: name }],
+    submitLabel: 'Привязать',
+    onSubmit: async (_data, { showErr }) => {
+      if (!picked) { showErr('Выберите контрагента из списка'); return false; }
+      const res = await apiResult('/api/leads/link', {
+        lead_id: leadId, agent_ms_id: picked.ms_id,
+      });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      toast('Контрагент привязан');
+      renderLeadCard(leadId);
+      return true;
+    },
+  });
+
+  const ov = document.querySelector('.c-overlay');
+  const input = ov?.querySelector('#ms-f-search');
+  if (!input) return;
+  const list = document.createElement('div');
+  list.className = 'c-surface c-surface--list supplier-list';
+  input.parentElement.after(list);
+
+  let inFlight = null;
+  const load = async (raw) => {
+    const search = String(raw || '').trim();
+    inFlight = search;
+    list.innerHTML = loading('Ищу…');
+    let rows = [];
+    try {
+      const data = await api('/api/leads/agents', { search });
+      if (inFlight !== search) return;   // ответ на устаревший запрос
+      rows = data.agents || [];
+    } catch (e) {
+      list.innerHTML = `<div class="loader">${escapeHtml(e.message)}</div>`;
+      return;
+    }
+    list.innerHTML = rows.length
+      ? rows.map(a => `
+        <div class="c-row c-row--tap" data-agent="${escapeHtml(a.ms_id)}"
+             data-name="${escapeHtml(a.name || '')}" role="button" tabindex="0">
+          <div class="card-row-info">
+            <div class="card-row-title">${escapeHtml(a.name || '')}</div>
+            ${a.phone ? `<div class="card-row-sub">${escapeHtml(a.phone)}</div>` : ''}
+          </div>
+        </div>`).join('')
+      : '<div class="loader">Не найдено — можно завести нового</div>';
+    list.querySelectorAll('[data-agent]').forEach(row => {
+      row.addEventListener('click', () => {
+        haptic('light');
+        picked = { ms_id: row.dataset.agent, name: row.dataset.name };
+        list.querySelectorAll('[data-agent]').forEach(r => r.classList.remove('picked'));
+        row.classList.add('picked');
+        sheet.showErr('');
+      });
+    });
+  };
+
+  let timer;
+  input.addEventListener('input', () => {
+    picked = null;
+    clearTimeout(timer);
+    timer = setTimeout(() => load(input.value), 350);
+  });
+  load(name);
+
+  // Заводит ЧЕЛОВЕК кнопкой: каждый написавший — ещё не клиент, автосоздание
+  // превратило бы справочник в свалку из случайных собеседников.
+  const create = document.createElement('button');
+  create.className = 'btn-secondary';
+  create.type = 'button';
+  create.textContent = 'Завести нового в МойСклад';
+  list.after(create);
+  create.addEventListener('click', async () => {
+    if (create.disabled) return;
+    const title = input.value.trim() || name;
+    if (!title) { sheet.showErr('Впишите название контрагента'); return; }
+    if (!await confirmDialog(`Завести контрагента «${title}» в МойСклад?`)) return;
+    create.disabled = true;
+    const res = await apiResult('/api/leads/create_agent', {
+      lead_id: leadId, name: title,
+    });
+    create.disabled = false;
+    if (!res.ok) { sheet.showErr(res.error); return; }
+    haptic('success');
+    toast(res.body.existed ? 'Такой контрагент уже был — привязали' : 'Контрагент заведён');
+    sheet.close();
+    renderLeadCard(leadId);
+  });
 }
 
 // Причина отказа. НЕОБЯЗАТЕЛЬНА: «Без причины» закрывает лид как есть.
