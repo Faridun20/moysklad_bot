@@ -2314,6 +2314,16 @@ body::before {
 }
 /* Снимок и крестик — соседи, а не вложенные кнопки: кнопка внутри кнопки это
    невалидная разметка, и на части клиентов вложенная перестаёт нажиматься. */
+/* Строка «залежалось»: вся строка — метка чекбокса, чтобы попадать пальцем не
+   только в квадратик 20px. Курсор и min-height приходят от .c-row--tap. */
+.stale-row { cursor: pointer; }
+.stale-check {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  accent-color: var(--accent);
+}
+
 .machine-photo-wrap { position: relative; flex: 0 0 auto; }
 .photo-del {
   position: absolute;

@@ -309,6 +309,15 @@ describe('вкладки разделов', () => {
     expect(keys(stockTabs, { canSeeGoods: false })).toEqual(['catalog']);
   });
 
+  it('Склад: «Залежалось» — только руководству', () => {
+    // /api/channel/stale отвечает admin/boss; у менеджера это была бы вкладка,
+    // которая гарантированно вернёт отказ.
+    expect(keys(stockTabs, { canSeeGoods: true, isBoss: true }))
+      .toEqual(['catalog', 'containers', 'machines', 'stale']);
+    expect(keys(stockTabs, { canSeeGoods: true, isBoss: false }))
+      .not.toContain('stale');
+  });
+
   it('Клиенты: воронка и лиды всем, лимиты и канал — руководству', () => {
     expect(keys(clientsTabs, { isBoss: true })).toEqual(['funnel', 'list', 'limits', 'channel']);
     expect(keys(clientsTabs, { isBoss: false })).toEqual(['funnel', 'list']);
@@ -319,7 +328,7 @@ describe('вкладки разделов', () => {
     const all = [
       moneyTabs({ isBoss: true, isConfirmer: true, canSeeDebts: true, hasOps: true }),
       salesTabs({ canSeeReport: true }),
-      stockTabs({ canSeeGoods: true }),
+      stockTabs({ canSeeGoods: true, isBoss: true }),
       clientsTabs({ isBoss: true }),
     ];
     for (const t of all) expect(t.length).toBeLessThanOrEqual(4);
