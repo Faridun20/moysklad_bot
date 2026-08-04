@@ -1689,3 +1689,162 @@ describe('снятие фото', () => {
     expect(window.__done).toBe(0);
   });
 });
+
+describe('«Залежалось»', () => {
+  const STALE = {
+    ok: true,
+    days: 60,
+    items: [
+      { name: 'Кабель PV 0.6', stock: 480, unit: 'м' },
+      { name: 'Штекер тип C', stock: 90, unit: 'шт' },
+    ],
+  };
+
+  it('вкладка есть у руководства и нет у менеджера', () => {
+    // Ручка отвечает только admin/boss — у менеджера это была бы дверь,
+    // которая гарантированно вернёт отказ.
+    expect(boot("currentUser = { role: 'boss' };").stockShellHtml())
+      .toContain('data-sect="stale"');
+    expect(boot("currentUser = { role: 'manager' };").stockShellHtml())
+      .not.toContain('data-sect="stale"');
+  });
+
+  it('остаток на экране виден — по нему и решают, что выносить', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify(STALE)});
+      stockTab = 'stale';
+      window.__ready = renderStockScreen();
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toContain('Кабель PV 0.6');
+    expect(content.textContent).toContain('480');
+    expect(content.textContent).toContain('Без продаж больше 60 дней');
+    // Шелл раздела на месте (UI-BUG-04).
+    expect(content.querySelector('[data-sect="catalog"]')).not.toBeNull();
+  });
+
+  it('в пост уходят только отмеченные и только названия', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__composer = null;
+      api = async () => (${JSON.stringify(STALE)});
+      openChannelComposer = (kind, params) => { window.__composer = [kind, params]; };
+      stockTab = 'stale';
+      window.__ready = renderStockScreen();
+    `);
+    await window.__ready;
+    const doc = window.document;
+    doc.querySelector('.stale-check[value="Кабель PV 0.6"]').click();
+    doc.querySelector('#stale-post').click();
+
+    expect(window.__composer[0]).toBe('stale');
+    expect(window.__composer[1]).toEqual({ names: ['Кабель PV 0.6'] });
+    // Ни остатка, ни единицы измерения в параметрах поста нет.
+    expect(JSON.stringify(window.__composer[1])).not.toContain('480');
+  });
+
+  it('без отметок пост не собирается', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__composer = null;
+      window.__alerts = [];
+      tg.showAlert = (m) => { window.__alerts.push(m); };
+      api = async () => (${JSON.stringify(STALE)});
+      openChannelComposer = (kind, params) => { window.__composer = [kind, params]; };
+      stockTab = 'stale';
+      window.__ready = renderStockScreen();
+    `);
+    await window.__ready;
+    window.document.querySelector('#stale-post').click();
+    expect(window.__composer).toBeNull();
+    expect(window.__alerts.join(' ')).toContain('Отметьте');
+  });
+
+  it('пустой список — это ответ «всё продаётся», а не ошибка', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => ({ ok: true, days: 60, items: [] });
+      stockTab = 'stale';
+      window.__ready = renderStockScreen();
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toContain('Всё продаётся');
+    expect(content.querySelector('[data-sect="stale"]')).not.toBeNull();
+  });
+
+  it('вкладки остаются, когда МойСклад не ответил', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => { throw new Error('МойСклад не ответил'); };
+      stockTab = 'stale';
+      window.__ready = renderStockScreen();
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toContain('МойСклад не ответил');
+    expect(content.querySelector('[data-sect="catalog"]')).not.toBeNull();
+  });
+});
+
+describe('правка контейнера', () => {
+  const CARD = { number: 'MSKU1234567', eta_date: '2026-08-20', notes: 'Запчасти для JCB' };
+
+  it('форма открывается заполненной тем, что есть', () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      openContainerEditForm(7, ${JSON.stringify(CARD)});
+    `);
+    const doc = window.document;
+    expect(doc.querySelector('#ms-f-eta_date').value).toBe('2026-08-20');
+    expect(doc.querySelector('#ms-f-notes').value).toBe('Запчасти для JCB');
+  });
+
+  it('номер не правится — по нему контейнер ищут', () => {
+    // Ошиблись номером — это другой контейнер, а не опечатка в этом.
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      openContainerEditForm(7, ${JSON.stringify(CARD)});
+    `);
+    expect(window.document.querySelector('#ms-f-number')).toBeNull();
+    expect(window.document.querySelector('.c-sheet').textContent).toContain('MSKU1234567');
+  });
+
+  it('правка уходит на сервер и перерисовывает карточку', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__sent = null;
+      window.__redrawn = 0;
+      apiResult = async (path, body) => { window.__sent = [path, body]; return { ok: true, body: {} }; };
+      renderContainerCard = async () => { window.__redrawn += 1; };
+      openContainerEditForm(7, ${JSON.stringify(CARD)});
+    `);
+    const doc = window.document;
+    doc.querySelector('#ms-f-notes').value = 'Запчасти и кабель';
+    doc.querySelector('#ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__sent[0]).toBe('/api/containers/update');
+    expect(window.__sent[1].container_id).toBe(7);
+    expect(window.__sent[1].fields.notes).toBe('Запчасти и кабель');
+    expect(window.__redrawn).toBe(1);
+  });
+
+  it('отказ ручки остаётся в форме, а не закрывает её с потерей ввода', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      apiResult = async () => ({ ok: false, error: 'Приёмка закрыта' });
+      renderContainerCard = async () => {};
+      openContainerEditForm(7, ${JSON.stringify(CARD)});
+    `);
+    const doc = window.document;
+    doc.querySelector('#ms-f-notes').value = 'новая заметка';
+    doc.querySelector('#ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(doc.querySelector('#ms-error').textContent).toContain('Приёмка закрыта');
+    expect(doc.querySelector('#ms-f-notes').value).toBe('новая заметка');
+  });
+});

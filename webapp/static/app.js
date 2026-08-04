@@ -353,7 +353,7 @@ function sectionTabsFor(section) {
     return salesTabs({ canSeeReport: ['admin', 'boss', 'manager'].includes(r) });
   }
   if (section === 'stock') {
-    return stockTabs({ canSeeGoods: canSeeMachines() });
+    return stockTabs({ canSeeGoods: canSeeMachines(), isBoss: boss });
   }
   if (section === 'money') {
     return moneyTabs({
@@ -404,6 +404,7 @@ async function renderStockScreen() {
   stockTab = sectionShell('stock', stockTab).active;
   if (stockTab === 'machines') await renderMachines();
   else if (stockTab === 'containers') await renderContainers();
+  else if (stockTab === 'stale') await renderStale();
   else {
     // Фильтр категории не тащим из прошлого захода в каталог.
     stockCurrentCat = 'all';
@@ -1273,6 +1274,73 @@ let containersFilter = 'all';
 let containersSearch = '';
 let _containersSearchTimer = null;
 
+// «Залежалось» — что лежит на складе и не продаётся. Внутренний экран, поэтому
+// остаток здесь ВИДЕН: по нему и решают, что выносить. В пост из этого списка
+// уходят только названия — правило «наружу не уходит ни одна цифра количества»
+// держит сборщик на сервере, а не эта галочка.
+let staleChecked = new Set();
+
+async function renderStale() {
+  const content = document.getElementById('content');
+  content.innerHTML = stockShellHtml() + skeleton('label') + skeleton('list', 5);
+  wireSectionNav(content, 'stock', renderStockScreen);
+
+  let data;
+  try {
+    data = await api('/api/channel/stale', {});
+  } catch (e) {
+    content.innerHTML = stockShellHtml() + errorBox(e.message);
+    wireSectionNav(content, 'stock', renderStockScreen);
+    return;
+  }
+
+  const items = data.items || [];
+  if (!items.length) {
+    content.innerHTML = stockShellHtml() + emptyState({
+      icon: 'check',
+      title: 'Всё продаётся',
+      hint: `За последние ${data.days} дней двигался весь товар, который есть на складе.`,
+    });
+    wireSectionNav(content, 'stock', renderStockScreen);
+    return;
+  }
+
+  // Выбор храним по названию: в пост уходят именно названия, а id у позиции
+  // отчёта нет — он считается из отгрузок, где товар опознан по имени.
+  staleChecked = new Set([...staleChecked].filter(n => items.some(i => i.name === n)));
+  const rows = items.map(i => `
+    <label class="c-row c-row--tap stale-row">
+      <input type="checkbox" class="stale-check" value="${escapeHtml(i.name)}"
+             ${staleChecked.has(i.name) ? 'checked' : ''}>
+      <div class="card-row-info">
+        <div class="card-row-title">${escapeHtml(i.name)}</div>
+        <div class="card-row-sub">лежит ${formatMoney(i.stock)} ${escapeHtml(i.unit)}</div>
+      </div>
+    </label>`).join('');
+
+  content.innerHTML = stockShellHtml()
+    + `<div class="section-label">Без продаж больше ${data.days} дней · ${items.length}</div>`
+    + `<div class="c-surface c-surface--list">${rows}</div>`
+    + `<div class="c-actions"><button class="btn-primary" id="stale-post">`
+    + `${icon('cart')} Собрать пост</button></div>`
+    + `<div class="card-row-sub">В пост уйдут только названия — остатки наружу не выходят.</div>`;
+  wireSectionNav(content, 'stock', renderStockScreen);
+
+  content.querySelectorAll('.stale-check').forEach(box => {
+    box.addEventListener('change', () => {
+      if (box.checked) staleChecked.add(box.value);
+      else staleChecked.delete(box.value);
+    });
+  });
+  content.querySelector('#stale-post')?.addEventListener('click', () => {
+    if (!staleChecked.size) {
+      tg.showAlert ? tg.showAlert('Отметьте, что выносить в канал') : alert('Отметьте товары');
+      return;
+    }
+    openChannelComposer('stale', { names: [...staleChecked] });
+  });
+}
+
 async function renderContainers() {
   const content = document.getElementById('content');
   content.innerHTML = stockShellHtml() + skeleton('label') + skeleton('list', 3);
@@ -1458,6 +1526,35 @@ function attachProductSearch(anchor, { onPick }) {
     },
     listEl: list,
   };
+}
+
+// Правка контейнера: срок прибытия и заметка. Ручка была с самого начала, а
+// кнопки не было — заведённый контейнер нельзя было исправить вовсе, хотя ETA
+// сдвигается почти всегда, а заметку («запчасти для JCB») дописывают потом.
+//
+// Номер не правим: по нему контейнер ищут и он уникален. Ошиблись номером —
+// это другой контейнер, а не опечатка в этом.
+function openContainerEditForm(containerId, container) {
+  openMachineSheet({
+    title: `Контейнер ${container.number || ''}`.trim(),
+    hint: 'Номер не меняется: по нему контейнер ищут, и правка означала бы, что это уже другой контейнер',
+    fields: [
+      { key: 'eta_date', label: 'Ожидаемое прибытие', type: 'date',
+        value: (container.eta_date || '').slice(0, 10) },
+      { key: 'notes', label: 'Заметки', type: 'textarea', value: container.notes || '' },
+    ],
+    submitLabel: 'Сохранить',
+    onSubmit: async (data, { showErr }) => {
+      const res = await apiResult('/api/containers/update', {
+        container_id: containerId, fields: data,
+      });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      toast('Сохранено');
+      renderContainerCard(containerId);
+      return true;
+    },
+  });
 }
 
 function openContainerItemForm(containerId, arrived) {
@@ -1761,6 +1858,7 @@ async function renderContainerCard(containerId) {
     ${verdict}
     ${closedNote}
     <div class="c-actions c-actions--wrap">
+      ${canEdit ? `<button class="btn-secondary" id="cont-edit">${icon('edit')} Изменить</button>` : ''}
       ${canEdit ? `<button class="btn-secondary" id="cont-supplier">${icon('building')} Поставщик</button>` : ''}
       ${canEdit ? `<button class="btn-secondary" id="cont-item-add">${icon('plus')} ${arrived ? 'Лишняя позиция' : 'Позиция'}</button>` : ''}
       ${canEdit && arrived ? '<button class="btn-primary" id="cont-save">Сохранить сверку</button>' : ''}
@@ -1773,6 +1871,9 @@ async function renderContainerCard(containerId) {
     <div class="section-label">Состав</div>
     ${containerItemsHtml(card.items || [], arrived, canManage)}
   `;
+
+  content.querySelector('#cont-edit')?.addEventListener('click', () =>
+    openContainerEditForm(containerId, c));
 
   content.querySelector('#cont-supplier')?.addEventListener('click', () =>
     openSupplierPicker(containerId));
