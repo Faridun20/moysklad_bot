@@ -2405,12 +2405,18 @@ async def api_leads_list(request: Request):
     rows = await leads.list_leads(
         manager_id=None if is_boss else user["id"], status=status, state=state
     )
+    from services import lead_calls
+
     return JSONResponse({
         "ok": True,
         "leads": rows,
         "scope": "company" if is_boss else "personal",
         "status_labels": leads.STATUS_LABELS,
         "connections": await leads.list_connections() if is_boss else [],
+        # Звонки без переписки — люди, которых в Telegram ещё нет. Отдаём вместе
+        # со списком: это один экран «с кем сегодня работать», и второй запрос
+        # ради него был бы лишним.
+        "unlinked_calls": await lead_calls.list_calls(unlinked=True, limit=50),
     })
 
 
@@ -2428,7 +2434,16 @@ async def api_leads_card(request: Request):
         raise HTTPException(status_code=404, detail="Лид не найден")
     if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
         raise HTTPException(status_code=403, detail="Это не ваш клиент")
-    return JSONResponse({"ok": True, "lead": lead, "status_labels": leads.STATUS_LABELS})
+    from services import lead_calls
+
+    return JSONResponse({
+        "ok": True, "lead": lead, "status_labels": leads.STATUS_LABELS,
+        "lost_reasons": [
+            {"key": k, "label": leads.LOST_REASON_LABELS[k]} for k in leads.LOST_REASONS
+        ],
+        "direction_labels": lead_calls.DIRECTION_LABELS,
+        "source_labels": lead_calls.SOURCE_LABELS,
+    })
 
 
 @app.post("/api/leads/status")
@@ -2448,7 +2463,87 @@ async def api_leads_status(request: Request):
     res = await leads.set_status(
         lead_id, (data.get("status") or "").strip(),
         user_id=user["id"], full_name=_actor_name(user),
+        # Причина отказа необязательна: обязательное поле на редко нажимаемой
+        # кнопке приводит к тому, что её перестают нажимать вовсе.
+        reason=(data.get("reason") or "").strip() or None,
+        note=_machine_text(data, "note", 500),
     )
+    return _machine_response(res)
+
+
+@app.post("/api/leads/calls")
+async def api_leads_calls(request: Request):
+    """Журнал звонков. Без `lead_id` отдаёт непривязанные — тех, кого ещё не
+    нашли в Telegram; это и есть список «кому перезвонить»."""
+    from services import lead_calls
+
+    data = await request.json()
+    _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_calls")
+    lead_id = data.get("lead_id")
+    rows = await lead_calls.list_calls(
+        lead_id=_machine_id_arg(data, "lead_id") if lead_id else None,
+        unlinked=not lead_id,
+    )
+    return JSONResponse({
+        "ok": True,
+        "calls": rows,
+        "direction_labels": lead_calls.DIRECTION_LABELS,
+        "source_labels": lead_calls.SOURCE_LABELS,
+    })
+
+
+@app.post("/api/leads/call_add")
+async def api_leads_call_add(request: Request):
+    """Записать звонок. Обязателен только менеджер: половину звонков заносят
+    постфактум, когда номера уже нет под рукой, а «звонок без номера» — всё
+    ещё обращение. Обязательное поле здесь означало бы, что звонки перестанут
+    записывать вовсе."""
+    from services import lead_calls
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_add",
+        rate_limit_max=120,
+    )
+    lead_id = data.get("lead_id")
+    res = await lead_calls.add_call(
+        manager_id=user["id"],
+        phone=_machine_text(data, "phone", 64),
+        display_name=_machine_text(data, "display_name", 200),
+        direction=(data.get("direction") or "in").strip(),
+        source=(data.get("source") or "").strip() or None,
+        interest=_machine_text(data, "interest", 200),
+        lead_id=_machine_id_arg(data, "lead_id") if lead_id else None,
+        note=_machine_text(data, "note", 500),
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/leads/call_link")
+async def api_leads_call_link(request: Request):
+    """Связать записанный звонок с телеграм-лидом. Руками: Telegram номер
+    собеседника не отдаёт, общего поля у звонка с перепиской нет, и угадывание
+    означало бы чужой звонок в чужой карточке."""
+    from services import lead_calls
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_link")
+    res = await lead_calls.link_call(
+        _machine_id_arg(data, "call_id"), _machine_id_arg(data, "lead_id"),
+        user_id=user["id"],
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/leads/call_delete")
+async def api_leads_call_delete(request: Request):
+    """Удалить ошибочную запись. Звонок — заметка менеджера, а не денежный
+    факт: запрещать правку значит копить мусор в списке «перезвонить»."""
+    from services import lead_calls
+
+    data = await request.json()
+    _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_delete")
+    res = await lead_calls.delete_call(_machine_id_arg(data, "call_id"))
     return _machine_response(res)
 
 

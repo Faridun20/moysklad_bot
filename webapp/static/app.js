@@ -4206,7 +4206,26 @@ async function renderLeadsList(container) {
       </div>`;
   }).join('');
 
-  box.innerHTML = chips + stateChips + (rows
+  // Звонки без переписки — свой блок сверху, а не строки среди лидов: это люди,
+  // которых в Telegram ещё нет, и путать их с перепиской нельзя.
+  const unlinked = (data.unlinked_calls || []);
+  const callsBlock = unlinked.length
+    ? `<div class="section-label">Звонили, но не пишут · ${unlinked.length}</div>`
+      + '<div class="c-surface c-surface--list">' + unlinked.map(c => `
+        <div class="c-row" data-status="pending">
+          <div class="card-row-info">
+            <div class="card-row-title">${escapeHtml(c.display_name || c.phone || 'Без имени')}</div>
+            <div class="card-row-sub">${escapeHtml(String(c.at || '').slice(0, 16))}${
+              c.interest ? ' · ' + escapeHtml(c.interest) : ''}${
+              c.phone && c.display_name ? ' · ' + escapeHtml(c.phone) : ''}</div>
+          </div>
+          <button class="pay-toggle" data-call-del="${c.id}" aria-label="Убрать запись">${icon('trash')}</button>
+        </div>`).join('') + '</div>'
+    : '';
+  const addCall = `<div class="c-actions"><button class="btn-secondary" id="call-new">`
+    + `${icon('phone')} Записать звонок</button></div>`;
+
+  box.innerHTML = addCall + callsBlock + chips + stateChips + (rows
     ? `<div class="c-surface c-surface--list">${rows}</div>`
     : emptyState({
         icon: 'user',
@@ -4228,6 +4247,18 @@ async function renderLeadsList(container) {
     btn.addEventListener('click', () => {
       haptic('light');
       leadsState = btn.dataset.lstate;
+      renderLeadsList(box);
+    });
+  });
+  box.querySelector('#call-new')?.addEventListener('click', () =>
+    openCallForm({ onDone: () => renderLeadsList(box) }));
+  box.querySelectorAll('[data-call-del]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const res = await apiResult('/api/leads/call_delete', {
+        call_id: Number(btn.dataset.callDel),
+      });
+      if (!res.ok) { tg.showAlert ? tg.showAlert(res.error) : alert(res.error); return; }
+      haptic('light');
       renderLeadsList(box);
     });
   });
@@ -4429,11 +4460,35 @@ async function renderLeadCard(leadId) {
     inbound: 'Клиент написал', outbound: 'Менеджер ответил',
     reengaged: 'Вернулся после паузы', won: 'Отмечен как купивший',
     lost: 'Отмечен как не купивший', linked: 'Привязан контрагент',
+    call: 'Звонок', call_linked: 'Звонок привязан к переписке',
   };
+
+  // Причина отказа — то, ради чего кнопку «Не купил» и стоит нажимать.
+  const lostBlock = l.lost
+    ? `<div class="c-error">Не купил: ${escapeHtml(l.lost.label || l.lost.reason)}${
+        l.lost.note ? ' — ' + escapeHtml(l.lost.note) : ''}</div>`
+    : '';
+  const dirLabels = card.direction_labels || {};
+  const srcLabels = card.source_labels || {};
+  const callsBlock = (l.calls || []).length
+    ? '<div class="section-label">Звонки</div><div class="c-surface c-surface--list">'
+      + l.calls.map(c => `
+        <div class="c-row">
+          <div class="card-row-info">
+            <div class="card-row-title">${escapeHtml(dirLabels[c.direction] || c.direction || '')}${
+              c.phone ? ' · ' + escapeHtml(c.phone) : ''}</div>
+            <div class="card-row-sub">${escapeHtml(String(c.at || '').slice(0, 16))}${
+              c.source ? ' · ' + escapeHtml(srcLabels[c.source] || c.source) : ''}${
+              c.interest ? ' · ' + escapeHtml(c.interest) : ''}${
+              c.note ? ' · ' + escapeHtml(c.note) : ''}</div>
+          </div>
+        </div>`).join('') + '</div>'
+    : '';
 
   content.innerHTML = `
     <div class="editor-header"><div class="editor-title">${icon('user')} ${escapeHtml(l.display_name || l.username || '—')}</div></div>
     ${flags ? `<div class="card-row-sub">${escapeHtml(flags)}</div>` : ''}
+    ${lostBlock}
     <div class="c-surface c-surface--list">${facts.map(([k, v]) => `
       <div class="c-row">
         <div class="card-row-info"><div class="card-row-sub">${escapeHtml(k)}</div></div>
@@ -4443,7 +4498,9 @@ async function renderLeadCard(leadId) {
       <button class="btn-secondary" data-lead-status="won">${icon('check')} Купил</button>
       <button class="btn-secondary" data-lead-status="lost">${icon('close')} Не купил</button>
       <button class="btn-secondary" data-lead-status="new">Вернуть в работу</button>
+      <button class="btn-secondary" id="lead-call">${icon('phone')} Записать звонок</button>
     </div>
+    ${callsBlock}
     <div class="section-label">События</div>
     <div class="c-surface c-surface--list">${(l.events || []).map(e => `
       <div class="c-row">
@@ -4456,6 +4513,12 @@ async function renderLeadCard(leadId) {
 
   content.querySelectorAll('[data-lead-status]').forEach(btn => {
     btn.addEventListener('click', async () => {
+      // «Не купил» спрашивает причину: без неё отметка говорит только «потеряли»,
+      // а решение следует из «почему», а не из «сколько».
+      if (btn.dataset.leadStatus === 'lost') {
+        openLostReasonSheet(leadId, card.lost_reasons || []);
+        return;
+      }
       const res = await apiResult('/api/leads/status', {
         lead_id: leadId, status: btn.dataset.leadStatus,
       });
@@ -4468,6 +4531,133 @@ async function renderLeadCard(leadId) {
       renderLeadCard(leadId);
     });
   });
+
+  content.querySelector('#lead-call')?.addEventListener('click', () =>
+    openCallForm({ leadId, onDone: () => renderLeadCard(leadId) }));
+}
+
+// Причина отказа. НЕОБЯЗАТЕЛЬНА: «Без причины» закрывает лид как есть.
+// Обязательное поле на редко нажимаемой кнопке приводит к тому, что её
+// перестают нажимать вовсе, — а потерять сам факт отказа хуже, чем отказ без
+// объяснения.
+function openLostReasonSheet(leadId, reasons) {
+  let picked = null;
+  const send = async (reason, note, showErr) => {
+    const res = await apiResult('/api/leads/status', {
+      lead_id: leadId, status: 'lost', reason: reason || '', note: note || '',
+    });
+    if (!res.ok) { if (showErr) showErr(res.error); return false; }
+    haptic('success');
+    toast('Отмечено');
+    renderLeadCard(leadId);
+    return true;
+  };
+
+  const sheet = openMachineSheet({
+    title: 'Почему не купил',
+    hint: 'Две причины окупают весь список: «нет в наличии» — это про закупку, «дорого» — про цену',
+    fields: [{ key: 'note', label: 'Уточнение', type: 'textarea' }],
+    submitLabel: 'Сохранить',
+    onSubmit: async (data, { showErr }) => {
+      if (!picked) { showErr('Выберите причину или нажмите «Без причины»'); return false; }
+      return send(picked, data.note, showErr);
+    },
+  });
+
+  const ov = document.querySelector('.c-overlay');
+  const host = ov?.querySelector('#ms-f-note');
+  if (!host) return;
+  const box = document.createElement('div');
+  box.className = 'seg-row';
+  box.innerHTML = '<div class="seg seg--scroll">' + reasons.map(r =>
+    `<button class="seg-item" data-reason="${escapeHtml(r.key)}" aria-pressed="false">${escapeHtml(r.label)}</button>`
+  ).join('') + '</div>';
+  host.parentElement.before(box);
+  box.querySelectorAll('[data-reason]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('light');
+      picked = btn.dataset.reason;
+      box.querySelectorAll('[data-reason]').forEach(b => {
+        b.classList.toggle('active', b === btn);
+        b.setAttribute('aria-pressed', String(b === btn));
+      });
+      sheet.showErr('');
+    });
+  });
+
+  const skip = document.createElement('button');
+  skip.className = 'btn-secondary';
+  skip.type = 'button';
+  skip.textContent = 'Без причины';
+  skip.addEventListener('click', async () => {
+    if (await send(null, null, sheet.showErr)) sheet.close();
+  });
+  ov.querySelector('#ms-cancel')?.before(skip);
+}
+
+// Запись звонка. Обязательного нет ничего: половину звонков заносят постфактум,
+// когда номера уже нет под рукой, а «звонок без номера» — всё ещё обращение.
+// Обязательное поле здесь означало бы, что звонки перестанут записывать.
+function openCallForm({ leadId = null, onDone } = {}) {
+  const SOURCES = [
+    ['', 'не указан'], ['channel', 'Наш канал'], ['referral', 'Посоветовали'],
+    ['ads', 'Реклама'], ['repeat', 'Уже покупал'], ['other', 'Другое'],
+  ];
+  let source = '';
+  let direction = 'in';
+
+  const sheet = openMachineSheet({
+    title: leadId ? 'Звонок этому клиенту' : 'Записать звонок',
+    hint: leadId ? '' : 'Клиента, которого нет в Telegram, свяжете позже — когда он напишет',
+    fields: [
+      ...(leadId ? [] : [{ key: 'display_name', label: 'Кто звонил' }]),
+      { key: 'phone', label: 'Телефон', type: 'tel', placeholder: '+998 90 123-45-67' },
+      { key: 'interest', label: 'Что спрашивал' },
+      { key: 'note', label: 'Заметка', type: 'textarea' },
+    ],
+    submitLabel: 'Записать',
+    onSubmit: async (data, { showErr }) => {
+      const res = await apiResult('/api/leads/call_add', {
+        ...data, lead_id: leadId || '', direction, source,
+      });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      toast('Звонок записан');
+      if (onDone) onDone();
+      return true;
+    },
+  });
+
+  const ov = document.querySelector('.c-overlay');
+  const anchor = ov?.querySelector('#ms-f-phone');
+  if (!anchor) return;
+  const box = document.createElement('div');
+  box.innerHTML =
+    '<div class="seg-row"><div class="seg">'
+    + [['in', 'Звонил клиент'], ['out', 'Звонили мы']].map(([k, label]) =>
+        `<button class="seg-item ${k === 'in' ? 'active' : ''}" data-dir="${k}" `
+        + `aria-pressed="${k === 'in'}">${label}</button>`).join('')
+    + '</div></div>'
+    + '<div class="section-label">Откуда узнал</div>'
+    + '<div class="seg-row"><div class="seg seg--scroll">'
+    + SOURCES.map(([k, label]) =>
+        `<button class="seg-item ${k === '' ? 'active' : ''}" data-src="${k}" `
+        + `aria-pressed="${k === ''}">${escapeHtml(label)}</button>`).join('')
+    + '</div></div>';
+  anchor.parentElement.before(box);
+  const pick = (attr, set) => box.querySelectorAll('[' + attr + ']').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('light');
+      set(btn.getAttribute(attr));
+      box.querySelectorAll('[' + attr + ']').forEach(b => {
+        b.classList.toggle('active', b === btn);
+        b.setAttribute('aria-pressed', String(b === btn));
+      });
+      sheet.showErr('');
+    });
+  });
+  pick('data-dir', (v) => { direction = v; });
+  pick('data-src', (v) => { source = v; });
 }
 
 // Карточка покупателя техники: все его сделки, графики и остаток. Покупатель

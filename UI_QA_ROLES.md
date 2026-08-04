@@ -23,10 +23,10 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 106._
+_Всего эндпоинтов: 110._
 
 
-### Админ (`admin`) — 99 эндпоинтов
+### Админ (`admin`) — 103 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -65,6 +65,10 @@ _Всего эндпоинтов: 106._
 - `/api/deposits/pending`
 - `/api/deposits/reject`
 - `/api/home`
+- `/api/leads/call_add`
+- `/api/leads/call_delete`
+- `/api/leads/call_link`
+- `/api/leads/calls`
 - `/api/leads/card`
 - `/api/leads/funnel`
 - `/api/leads/link`
@@ -133,7 +137,7 @@ _Всего эндпоинтов: 106._
 </details>
 
 
-### Руководитель (`boss`) — 96 эндпоинтов
+### Руководитель (`boss`) — 100 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -172,6 +176,10 @@ _Всего эндпоинтов: 106._
 - `/api/deposits/pending`
 - `/api/deposits/reject`
 - `/api/home`
+- `/api/leads/call_add`
+- `/api/leads/call_delete`
+- `/api/leads/call_link`
+- `/api/leads/calls`
 - `/api/leads/card`
 - `/api/leads/funnel`
 - `/api/leads/link`
@@ -237,7 +245,7 @@ _Всего эндпоинтов: 106._
 </details>
 
 
-### Менеджер (`manager`) — 46 эндпоинтов
+### Менеджер (`manager`) — 50 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -260,6 +268,10 @@ _Всего эндпоинтов: 106._
 - `/api/deposits/create`
 - `/api/deposits/my`
 - `/api/home`
+- `/api/leads/call_add`
+- `/api/leads/call_delete`
+- `/api/leads/call_link`
+- `/api/leads/calls`
 - `/api/leads/card`
 - `/api/leads/link`
 - `/api/leads/list`
