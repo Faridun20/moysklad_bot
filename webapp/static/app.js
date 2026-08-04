@@ -813,11 +813,14 @@ function openPriceEditor(product) {
     const res = await apiResult('/api/products/photos', { ms_id: msId });
     if (!res.ok) { box.innerHTML = ''; return; }
     box.innerHTML = photoStripHtml(res.body.photos, {
-      addId: 'pe-photo-add-hidden', canUpload: false, alt: 'Фото товара',
+      addId: 'pe-photo-add-hidden', canUpload: false,
+      canDelete: isMachineBoss(), alt: 'Фото товара',
     });
     await loadPhotos(box, '/api/products/photo', (photoId) => ({
       ms_id: msId, photo_id: photoId,
     }));
+    wirePhotoDelete(box, '/api/products/photo_delete',
+      (photoId) => ({ ms_id: msId, photo_id: photoId }), reloadPhotos);
   };
   reloadPhotos();
 
@@ -1884,7 +1887,7 @@ function revokePhotoUrls() {
 
 // Лента фото — общая для техники и товаров: механизм один (файл в Telegram,
 // у нас идентификаторы), и различаются только ручка и её тело.
-function photoStripHtml(photos, { addId, canUpload, alt }) {
+function photoStripHtml(photos, { addId, canUpload, canDelete, alt }) {
   const rows = photos || [];
   const upload = canUpload
     ? `<button class="btn-secondary" id="${addId}">${icon('plus')} Добавить фото</button>`
@@ -1894,13 +1897,39 @@ function photoStripHtml(photos, { addId, canUpload, alt }) {
       ? `<div class="section-label">Фото</div><div class="c-actions">${upload}</div>`
       : '';
   }
+  // Крестик рисуем ОТДЕЛЬНОЙ кнопкой рядом со снимком, а не внутри него:
+  // кнопка в кнопке — невалидная разметка, и на части клиентов вложенная
+  // перестаёт нажиматься вовсе.
   const strip = rows.map(p =>
+    `<div class="machine-photo-wrap">` +
     `<button class="machine-photo" data-photo="${p.id}" aria-label="${escapeHtml(p.caption || alt)}">` +
-    `<img alt="${escapeHtml(p.caption || '')}" loading="lazy"></button>`
+    `<img alt="${escapeHtml(p.caption || '')}" loading="lazy"></button>` +
+    (canDelete
+      ? `<button class="photo-del" data-photo-del="${p.id}" ` +
+        `aria-label="Убрать фото">${icon('close')}</button>`
+      : '') +
+    `</div>`
   ).join('');
   return `<div class="section-label">Фото · ${rows.length}</div>
     <div class="machine-photos">${strip}</div>
     ${upload ? `<div class="c-actions">${upload}</div>` : ''}`;
+}
+
+// Снятие фото. Спрашиваем подтверждение: промах по крестику на плитке 72px —
+// обычное дело, а восстановить снимок нечем, в Telegram он остаётся, но связь
+// с карточкой теряется.
+function wirePhotoDelete(root, endpoint, bodyFor, onDone) {
+  (root || document).querySelectorAll('[data-photo-del]').forEach(btn => {
+    btn.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      if (!await confirmDialog('Убрать это фото из карточки?')) return;
+      const res = await apiResult(endpoint, bodyFor(Number(btn.dataset.photoDel)));
+      if (!res.ok) { tg.showAlert ? tg.showAlert(res.error) : alert(res.error); return; }
+      haptic('light');
+      toast('Фото убрано');
+      if (onDone) onDone();
+    });
+  });
 }
 
 // Файл едет через нашу ручку (POST + initData), поэтому <img src> не годится:
@@ -1930,6 +1959,9 @@ function machinePhotosHtml(card) {
   return photoStripHtml(card.photos, {
     addId: 'machine-photo-add',
     canUpload: card.can_upload_photo,
+    // Ручка удаления отвечает только admin/boss — крестик у остальных был бы
+    // кнопкой, которая гарантированно отвечает отказом.
+    canDelete: isMachineBoss(),
     alt: 'Фото машины',
   });
 }
@@ -1938,6 +1970,9 @@ async function loadMachinePhotos(machineId, root) {
   await loadPhotos(root, '/api/machines/photo', (photoId) => ({
     machine_id: machineId, photo_id: photoId,
   }));
+  wirePhotoDelete(root, '/api/machines/photo_delete',
+    (photoId) => ({ machine_id: machineId, photo_id: photoId }),
+    () => renderMachineCard(machineId));
 }
 
 // Ужимаем снимок ДО отправки: телефонные 3–5 МБ упираются в лимит ручки, а на
