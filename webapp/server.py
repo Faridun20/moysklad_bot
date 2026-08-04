@@ -2405,7 +2405,8 @@ async def api_leads_list(request: Request):
         raise HTTPException(status_code=400, detail=f"Неизвестное состояние: {state}")
 
     rows = await leads.list_leads(
-        manager_id=None if is_boss else user["id"], status=status, state=state
+        manager_id=None if is_boss else user["id"], status=status, state=state,
+        search=(data.get("search") or "").strip()[:100] or None,
     )
     from services import lead_calls
 
@@ -2583,10 +2584,23 @@ async def api_leads_call_link(request: Request):
     from services import lead_calls
 
     data = await request.json()
-    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_link")
+    from services import leads
+
+    data_user = _authorize(
+        data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_link"
+    )
+    lead_id = _machine_id_arg(data, "lead_id")
+    # Тот же гейт, что у карточки и статуса: менеджер, который не может даже
+    # открыть чужого клиента, не должен подшивать к нему свой звонок.
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if (get_role(data_user["id"]) not in ("admin", "boss")
+            and lead.get("manager_id") != data_user["id"]):
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+
     res = await lead_calls.link_call(
-        _machine_id_arg(data, "call_id"), _machine_id_arg(data, "lead_id"),
-        user_id=user["id"],
+        _machine_id_arg(data, "call_id"), lead_id, user_id=data_user["id"],
     )
     return _machine_response(res)
 

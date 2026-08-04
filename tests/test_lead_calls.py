@@ -362,3 +362,130 @@ def test_status_endpoint_rejects_garbage_reason(isolated_db, monkeypatch):
         "initData": "2", "lead_id": lead_id, "status": "lost", "reason": "хм",
     })
     assert res.status_code == 400
+
+
+# ─── Привязка звонка к переписке из интерфейса ────────────────────────────────
+
+
+def test_leads_can_be_searched_by_name_and_username(isolated_db):
+    """Чтобы связать звонок, клиента надо сначала найти: у половины имя это
+    «Азиз», а помнят их по @handle, и наоборот."""
+    from services import leads
+
+    db = isolated_db
+    _setup(db)
+    _run(leads.record_message(tg_user_id=100, manager_id=1, inbound=True,
+                              display_name="Азиз Рахимов", username="aziz_r"))
+    _run(leads.record_message(tg_user_id=200, manager_id=1, inbound=True,
+                              display_name="Дилшод", username="stroy_master"))
+
+    def found(q):
+        return {r["tg_user_id"] for r in _run(leads.list_leads(search=q))}
+
+    assert found("азиз") == {100}
+    assert found("АЗИЗ") == {100}, "кириллица должна искаться без учёта регистра"
+    assert found("aziz_r") == {100}
+    assert found("MASTER") == {200}
+    assert found("нет такого") == set()
+
+
+def test_search_combines_with_the_other_filters(isolated_db):
+    """Отбор по состоянию и поиск — независимые сита, а не взаимоисключающие."""
+    from services import leads
+
+    db = isolated_db
+    _setup(db)
+    _run(leads.record_message(tg_user_id=100, manager_id=1, inbound=True,
+                              display_name="Азиз", at=_ago(hours=20)))
+    _run(leads.record_message(tg_user_id=200, manager_id=1, inbound=True,
+                              display_name="Азиз второй", at=_ago(minutes=5)))
+
+    both = _run(leads.list_leads(search="азиз"))
+    waiting = _run(leads.list_leads(search="азиз", state="awaiting_reply"))
+    assert len(both) == 2
+    assert {r["tg_user_id"] for r in waiting} == {100}
+
+
+def test_call_link_endpoint_attaches_the_call(isolated_db, monkeypatch):
+    from services import lead_calls
+
+    db = isolated_db
+    _setup(db)
+    call_id = _run(lead_calls.add_call(manager_id=1, phone="901234567",
+                                       display_name="Азиз"))["call_id"]
+    lead_id = _lead()
+
+    res = _client(monkeypatch).post("/api/leads/call_link", json={
+        "initData": "2", "call_id": call_id, "lead_id": lead_id,
+    })
+    assert res.status_code == 200, res.text
+    assert _run(lead_calls.list_calls(unlinked=True)) == []
+    assert len(_run(lead_calls.list_calls(lead_id=lead_id))) == 1
+
+
+def test_call_link_refuses_someone_elses_lead(isolated_db, monkeypatch):
+    """Менеджер, который не может даже открыть чужого клиента, не должен
+    подшивать к нему свой звонок."""
+    from services import lead_calls
+
+    db = isolated_db
+    _setup(db)
+    db.set_role(5, "mgr2", "Other", "manager")
+    call_id = _run(lead_calls.add_call(manager_id=5))["call_id"]
+    lead_id = _lead(manager_id=1)
+
+    res = _client(monkeypatch).post("/api/leads/call_link", json={
+        "initData": "5", "call_id": call_id, "lead_id": lead_id,
+    })
+    assert res.status_code == 403, res.text
+    assert len(_run(lead_calls.list_calls(unlinked=True))) == 1
+
+
+def test_call_link_on_a_missing_lead_is_404(isolated_db, monkeypatch):
+    from services import lead_calls
+
+    db = isolated_db
+    _setup(db)
+    call_id = _run(lead_calls.add_call(manager_id=1))["call_id"]
+    res = _client(monkeypatch).post("/api/leads/call_link", json={
+        "initData": "2", "call_id": call_id, "lead_id": 999,
+    })
+    assert res.status_code == 404, res.text
+
+
+def test_search_is_passed_through_the_list_endpoint(isolated_db, monkeypatch):
+    from services import leads
+
+    db = isolated_db
+    _setup(db)
+    _run(leads.record_message(tg_user_id=100, manager_id=1, inbound=True,
+                              display_name="Азиз"))
+    _run(leads.record_message(tg_user_id=200, manager_id=1, inbound=True,
+                              display_name="Дилшод"))
+
+    body = _client(monkeypatch).post(
+        "/api/leads/list", json={"initData": "2", "search": "дилшод"}
+    ).json()
+    assert [r["tg_user_id"] for r in body["leads"]] == [200]
+
+
+def test_async_and_sync_paths_lowercase_cyrillic_the_same(isolated_db):
+    """Расхождение, из-за которого поиск «работал на проде и не работал локально».
+
+    Встроенный SQLite LOWER() — ASCII-only, а Postgres — Unicode-aware. Синхронный
+    слой (`database.get_conn`) давно переопределяет функцию, асинхронный
+    (`adb_core`) — не переопределял, и одинаковый на вид запрос вёл себя
+    по-разному в зависимости от того, откуда его позвали.
+    """
+    from services import adb_core, database
+
+    db = isolated_db
+    _setup(db)
+    with db.get_conn() as conn:
+        sync_lowered = db.get_cursor(conn).execute(
+            db.q("SELECT lower(?)"), ("ИВАНОВ",)
+        ).fetchone()[0]
+    async_lowered = _run(adb_core.fetchval("SELECT lower($1)", "ИВАНОВ"))
+
+    assert sync_lowered == async_lowered == "иванов"
+    assert database is not None  # модуль импортирован ради get_conn выше

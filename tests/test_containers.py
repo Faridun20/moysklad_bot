@@ -662,3 +662,21 @@ def test_item_link_endpoint_binds_the_position(isolated_db, monkeypatch):
                 container_id=cid, item_id=item, ms_id="p-1", ms_name="Кабель PV 0.6")
     assert res.status_code == 200, res.text
     assert _run(containers.list_items(cid))[0]["ms_id"] == "p-1"
+
+
+def test_container_note_search_finds_cyrillic_regardless_of_case(isolated_db):
+    """Регресс того же класса, что и поиск по лидам: `lower()` на асинхронной
+    стороне был ASCII-only, и «запчасти для JCB» находились по «JCB», но не по
+    «Запчасти» с большой буквы. На Postgres работало, локально нет."""
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    _container("MSKU-7777777", notes="Запчасти для JCB")
+
+    def found(q):
+        return [c["number"] for c in _run(containers.list_containers(search=q))]
+
+    assert found("запчасти") == ["MSKU7777777"]
+    assert found("ЗАПЧАСТИ") == ["MSKU7777777"]
+    assert found("Запчасти") == ["MSKU7777777"]

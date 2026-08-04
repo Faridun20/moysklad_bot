@@ -4305,6 +4305,8 @@ async function renderLeadsList(container) {
               c.interest ? ' · ' + escapeHtml(c.interest) : ''}${
               c.phone && c.display_name ? ' · ' + escapeHtml(c.phone) : ''}</div>
           </div>
+          <button class="pay-toggle" data-call-link="${c.id}"
+                  aria-label="Связать с перепиской">${icon('user')}</button>
           <button class="pay-toggle" data-call-del="${c.id}" aria-label="Убрать запись">${icon('trash')}</button>
         </div>`).join('') + '</div>'
     : '';
@@ -4346,6 +4348,13 @@ async function renderLeadsList(container) {
       if (!res.ok) { tg.showAlert ? tg.showAlert(res.error) : alert(res.error); return; }
       haptic('light');
       renderLeadsList(box);
+    });
+  });
+  const callsById = new Map(unlinked.map(c => [String(c.id), c]));
+  box.querySelectorAll('[data-call-link]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const call = callsById.get(String(btn.dataset.callLink));
+      if (call) openCallLinkSheet(call, () => renderLeadsList(box));
     });
   });
   box.querySelectorAll('[data-lead]').forEach(row => {
@@ -4628,6 +4637,86 @@ async function renderLeadCard(leadId) {
 
   content.querySelector('#lead-agent')?.addEventListener('click', () =>
     openAgentPicker(leadId, l));
+}
+
+// Связать записанный звонок с перепиской. Руками и никак иначе: Telegram не
+// отдаёт боту номер собеседника, общего поля у звонка с чатом нет, и
+// автоматика здесь означала бы чужой звонок в чужой карточке.
+//
+// Идём от звонка к клиенту, а не наоборот: «Звонили, но не пишут» — это рабочий
+// список, по которому проходят и отмечают тех, кто с тех пор написал.
+function openCallLinkSheet(call, onDone) {
+  let picked = null;
+  const guess = call.display_name || '';
+
+  const sheet = openMachineSheet({
+    title: 'Чей это звонок',
+    hint: guess
+      ? `Звонил: ${guess}${call.phone ? ' · ' + call.phone : ''}`
+      : (call.phone || 'Найдите клиента в переписке'),
+    fields: [{ key: 'search', label: 'Поиск по переписке', value: guess }],
+    submitLabel: 'Связать',
+    onSubmit: async (_data, { showErr }) => {
+      if (!picked) { showErr('Выберите клиента из списка'); return false; }
+      const res = await apiResult('/api/leads/call_link', {
+        call_id: call.id, lead_id: picked.id,
+      });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      toast('Звонок связан');
+      if (onDone) onDone();
+      return true;
+    },
+  });
+
+  const ov = document.querySelector('.c-overlay');
+  const input = ov?.querySelector('#ms-f-search');
+  if (!input) return;
+  const list = document.createElement('div');
+  list.className = 'c-surface c-surface--list supplier-list';
+  input.parentElement.after(list);
+
+  let inFlight = null;
+  const load = async (raw) => {
+    const search = String(raw || '').trim();
+    inFlight = search;
+    list.innerHTML = loading('Ищу…');
+    let rows = [];
+    try {
+      const data = await api('/api/leads/list', { search });
+      if (inFlight !== search) return;   // ответ на устаревший запрос
+      rows = data.leads || [];
+    } catch (e) {
+      list.innerHTML = `<div class="loader">${escapeHtml(e.message)}</div>`;
+      return;
+    }
+    list.innerHTML = rows.length
+      ? rows.slice(0, 20).map(l => `
+        <div class="c-row c-row--tap" data-pick-lead="${l.id}" role="button" tabindex="0">
+          <div class="card-row-info">
+            <div class="card-row-title">${escapeHtml(l.display_name || l.username || '—')}</div>
+            <div class="card-row-sub">${escapeHtml(String(l.last_inbound_at || l.first_seen_at || '').slice(0, 16))}</div>
+          </div>
+        </div>`).join('')
+      : '<div class="loader">Не найдено — возможно, он ещё не писал в Telegram</div>';
+    list.querySelectorAll('[data-pick-lead]').forEach(row => {
+      row.addEventListener('click', () => {
+        haptic('light');
+        picked = { id: Number(row.dataset.pickLead) };
+        list.querySelectorAll('[data-pick-lead]').forEach(r => r.classList.remove('picked'));
+        row.classList.add('picked');
+        sheet.showErr('');
+      });
+    });
+  };
+
+  let timer;
+  input.addEventListener('input', () => {
+    picked = null;
+    clearTimeout(timer);
+    timer = setTimeout(() => load(input.value), 350);
+  });
+  load(guess);
 }
 
 // Привязка клиента к контрагенту МойСклад — мост, без которого «написал» и

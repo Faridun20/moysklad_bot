@@ -277,6 +277,7 @@ async def list_leads(
     manager_id: int | None = None,
     status: str | None = None,
     state: str | None = None,
+    search: str | None = None,
     limit: int = 100,
 ) -> list[dict]:
     """Список лидов. `state` — один из `STATE_FILTERS`, отбор по состоянию.
@@ -296,6 +297,16 @@ async def list_leads(
     if status:
         params.append(status)
         where.append(f"status = ${len(params)}")
+    if (search or "").strip():
+        # Ищем и по имени, и по нику: в Telegram у половины собеседников имя
+        # это «Азиз», а помнят их по @handle, и наоборот.
+        needle = f"%{search.strip().lower()}%"
+        params.append(needle)
+        params.append(needle)
+        where.append(
+            f"(LOWER(COALESCE(display_name, '')) LIKE ${len(params) - 1} "
+            f"OR LOWER(COALESCE(username, '')) LIKE ${len(params)})"
+        )
     if where:
         query += " WHERE " + " AND ".join(where)
     # Потолок выборки: при отборе по состоянию берём с запасом, потому что
