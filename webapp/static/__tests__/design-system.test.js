@@ -283,3 +283,32 @@ describe('плавающие элементы у нижнего края', () =>
     expect(body).toMatch(/padding-bottom:[^;]*var\(--nav-gap\)/);
   });
 });
+
+describe('одно правило — одно значение свойства', () => {
+  const code = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  it('position не объявлен дважды в одном правиле', () => {
+    // Так плавающая нижняя панель перестала быть плавающей: `position: fixed`
+    // стоял в начале правила, а добавленный позже `position: relative` (ради
+    // блика псевдоэлементом) молча его отменил. Панель ушла в поток, а запас,
+    // зарезервированный под неё в каркасе, превратился в пустоту под ней.
+    //
+    // `fixed` и `absolute` сами по себе задают containing block для
+    // абсолютных детей — `relative` рядом с ними не нужен никогда.
+    const clashes = [];
+    for (const m of code.matchAll(/([^{}]+)\{([^}]*)\}/g)) {
+      const declared = [...m[2].matchAll(/^\s*position:\s*([a-z-]+)/gm)].map((d) => d[1]);
+      if (new Set(declared).size > 1) clashes.push(`${m[1].trim().split('\n').pop()}: ${declared}`);
+    }
+    expect(clashes).toEqual([]);
+  });
+
+  it('нижняя панель плавающая, а не в потоке', () => {
+    // Прямая проверка того, что сломалось: запас под панель в каркасе имеет
+    // смысл только пока она вынута из потока.
+    const at = code.indexOf('.bottom-nav {');
+    const body = code.slice(at, code.indexOf('}', at));
+    expect(body).toMatch(/position:\s*fixed/);
+    expect(body).not.toMatch(/position:\s*(relative|static)/);
+  });
+});
