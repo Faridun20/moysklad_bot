@@ -1339,3 +1339,128 @@ describe('высота окна', () => {
       .toBe('812px');
   });
 });
+
+describe('звонки и причина отказа', () => {
+  const LIST = {
+    ok: true,
+    leads: [],
+    scope: 'company',
+    status_labels: { new: '🆕 В работе', won: '✅ Купил', lost: '🚫 Не купил' },
+    connections: [],
+    unlinked_calls: [
+      { id: 5, display_name: 'Азиз', phone: '901234567', at: '2026-08-04 11:20:00',
+        interest: 'кабель', direction: 'in' },
+    ],
+  };
+
+  it('звонившие без переписки — свой блок, а не строки среди лидов', async () => {
+    // Это люди, которых в Telegram ещё нет. Показать их вперемешку с перепиской
+    // значит выдать за клиентов, которым можно написать.
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify(LIST)});
+      clientsTab = 'list';
+      window.__ready = renderClientsScreen();
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toContain('Звонили, но не пишут');
+    expect(content.textContent).toContain('Азиз');
+    expect(content.querySelector('#call-new')).not.toBeNull();
+  });
+
+  it('форма звонка не требует ничего, кроме нажатия', async () => {
+    // Половину звонков заносят постфактум, когда номера уже нет под рукой.
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__sent = null;
+      api = async () => (${JSON.stringify(LIST)});
+      apiResult = async (path, body) => { window.__sent = [path, body]; return { ok: true, body: {} }; };
+      openCallForm({});
+    `);
+    const doc = window.document;
+    expect(doc.querySelector('#ms-f-phone')).not.toBeNull();
+    doc.querySelector('#ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__sent[0]).toBe('/api/leads/call_add');
+    expect(window.__sent[1].direction).toBe('in');
+  });
+
+  it('направление и источник уезжают выбранными', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__sent = null;
+      apiResult = async (path, body) => { window.__sent = body; return { ok: true, body: {} }; };
+      openCallForm({});
+    `);
+    const doc = window.document;
+    doc.querySelector('[data-dir="out"]').click();
+    doc.querySelector('[data-src="channel"]').click();
+    doc.querySelector('#ms-f-phone').value = '901234567';
+    doc.querySelector('#ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__sent.direction).toBe('out');
+    expect(window.__sent.source).toBe('channel');
+    expect(window.__sent.phone).toBe('901234567');
+  });
+
+  const REASONS = [
+    { key: 'price', label: 'Дорого' },
+    { key: 'no_stock', label: 'Нет в наличии' },
+    { key: 'other', label: 'Другое' },
+  ];
+
+  it('«Не купил» спрашивает причину, но не требует её', async () => {
+    // Обязательное поле на редко нажимаемой кнопке приводит к тому, что её
+    // перестают нажимать вовсе — и теряется сам факт отказа.
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__sent = null;
+      apiResult = async (path, body) => { window.__sent = body; return { ok: true, body: {} }; };
+      renderLeadCard = async () => {};
+      openLostReasonSheet(7, ${JSON.stringify(REASONS)});
+    `);
+    const doc = window.document;
+    expect(doc.querySelectorAll('[data-reason]').length).toBe(3);
+
+    const skip = Array.from(doc.querySelectorAll('.c-overlay button'))
+      .find(b => b.textContent === 'Без причины');
+    expect(skip, 'кнопка «Без причины» пропала').toBeTruthy();
+    skip.click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__sent.status).toBe('lost');
+    expect(window.__sent.reason).toBe('');
+  });
+
+  it('выбранная причина уезжает вместе с уточнением', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__sent = null;
+      apiResult = async (path, body) => { window.__sent = body; return { ok: true, body: {} }; };
+      renderLeadCard = async () => {};
+      openLostReasonSheet(7, ${JSON.stringify(REASONS)});
+    `);
+    const doc = window.document;
+    doc.querySelector('[data-reason="no_stock"]').click();
+    doc.querySelector('#ms-f-note').value = 'ждал неделю';
+    doc.querySelector('#ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__sent.reason).toBe('no_stock');
+    expect(window.__sent.note).toBe('ждал неделю');
+  });
+
+  it('без выбора и без «Без причины» форма не отправляется молча', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__sent = null;
+      apiResult = async (path, body) => { window.__sent = body; return { ok: true, body: {} }; };
+      renderLeadCard = async () => {};
+      openLostReasonSheet(7, ${JSON.stringify(REASONS)});
+    `);
+    const doc = window.document;
+    doc.querySelector('#ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__sent).toBeNull();
+    expect(doc.querySelector('#ms-error').textContent).toContain('причину');
+  });
+});

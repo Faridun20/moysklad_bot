@@ -46,7 +46,30 @@ STATUS_LABELS = {
 
 # Событие воронки. `reengaged` пишется только в момент нового обращения после
 # паузы — задним числом её из агрегатов не восстановить.
-EVENT_KINDS = ("inbound", "outbound", "reengaged", "won", "lost", "linked")
+EVENT_KINDS = (
+    "inbound", "outbound", "reengaged", "won", "lost", "linked",
+    # Звонок и его привязка к переписке — см. services/lead_calls.py.
+    "call", "call_linked",
+)
+
+# Причины отказа — закрытый короткий список. Две позиции окупают всю затею:
+# «нет в наличии» переводится в решение о закупке, «дорого» — в решение о цене.
+# Остальные нужны, чтобы эти две не собирали на себя всё подряд, а `other` с
+# заметкой — клапан: без него люди начнут ставить ближайшее похожее и испортят
+# главные категории.
+LOST_REASONS = (
+    "price", "no_stock", "competitor", "postponed", "wrong_fit", "no_answer", "other",
+)
+
+LOST_REASON_LABELS = {
+    "price": "Дорого",
+    "no_stock": "Нет в наличии",
+    "competitor": "Купил у других",
+    "postponed": "Отложил покупку",
+    "wrong_fit": "Не тот товар",
+    "no_answer": "Перестал отвечать",
+    "other": "Другое",
+}
 
 # Пауза, после которой новое сообщение считается ВОЗВРАТОМ, а не продолжением
 # разговора. Две недели: внутри этого срока переписка про одну покупку — обычное
@@ -296,6 +319,17 @@ async def get_lead(lead_id: int) -> dict | None:
         lead_id,
     )
     lead["events"] = [dict(e) for e in events]
+    # Звонки и причина отказа лежат в своих таблицах (в `leads` колонку не
+    # добавить), но на экране это одна карточка — собираем здесь.
+    from services import lead_calls
+
+    lead["calls"] = await lead_calls.list_calls(lead_id=lead_id, limit=20)
+    lost = await adb_core.fetchrow("SELECT * FROM lead_lost WHERE lead_id = $1", lead_id)
+    lead["lost"] = dict(lost) if lost else None
+    if lead["lost"]:
+        lead["lost"]["label"] = LOST_REASON_LABELS.get(
+            str(lead["lost"]["reason"]), str(lead["lost"]["reason"])
+        )
     return lead
 
 
@@ -303,26 +337,83 @@ async def get_lead(lead_id: int) -> dict | None:
 
 
 async def set_status(
-    lead_id: int, status: str, *, user_id: int, full_name: str = ""
+    lead_id: int, status: str, *, user_id: int, full_name: str = "",
+    reason: str | None = None, note: str | None = None,
 ) -> dict:
     """Отметить исход. Руками — потому что в переписке его не видно: клиент
-    может согласиться голосом, а может пропасть без слова."""
+    может согласиться голосом, а может пропасть без слова.
+
+    `reason` — причина отказа, НЕОБЯЗАТЕЛЬНАЯ. Кнопку «Не купил» и так нажимают
+    редко; обязательное поле привело бы к тому, что её перестанут нажимать
+    вовсе, а потерять сам факт отказа хуже, чем отказ без причины.
+    """
     if status not in STATUSES:
         return {"ok": False, "error": f"Статус: {' / '.join(STATUSES)}"}
+    if reason and reason not in LOST_REASONS:
+        return {"ok": False, "error": f"Причина: {' / '.join(LOST_REASONS)}"}
     row = await adb_core.fetchrow("SELECT status FROM leads WHERE id = $1", lead_id)
     if not row:
         return {"ok": False, "error": "Лид не найден"}
-    if row["status"] == status:
+    same = row["status"] == status
+    if same and not reason:
         return {"ok": True, "changed": False}
-    await adb_core.execute(
-        "UPDATE leads SET status = $1, updated_at = $2 WHERE id = $3",
-        status, now_str(), lead_id,
-    )
-    if status in ("won", "lost"):
-        await _event(lead_id, status, user_id, now_str())
+
+    stamp = now_str()
+    if not same:
+        await adb_core.execute(
+            "UPDATE leads SET status = $1, updated_at = $2 WHERE id = $3",
+            status, stamp, lead_id,
+        )
+        if status in ("won", "lost"):
+            await _event(lead_id, status, user_id, stamp)
+
+    if status == "lost" and reason:
+        await _set_lost_reason(lead_id, reason, note, user_id, stamp)
+    elif status != "lost":
+        # Вернули в работу или всё-таки купил — причина отказа больше не факт.
+        await adb_core.execute("DELETE FROM lead_lost WHERE lead_id = $1", lead_id)
+
     role = await _role(user_id)
-    await _audit(user_id, full_name, role, "lead_status", f"#{lead_id}: {row['status']} → {status}")
-    return {"ok": True, "changed": True}
+    details = f"#{lead_id}: {row['status']} → {status}"
+    if reason:
+        details += f" ({reason})"
+    await _audit(user_id, full_name, role, "lead_status", details)
+    return {"ok": True, "changed": not same}
+
+
+async def _set_lost_reason(
+    lead_id: int, reason: str, note: str | None, user_id: int, stamp: str
+) -> None:
+    """Причина отказа — одна на лида, поэтому перезапись, а не история:
+    передумали и уточнили — это исправление, а не второе событие."""
+    async with adb_core.transaction() as txn:
+        await txn.execute("DELETE FROM lead_lost WHERE lead_id = $1", lead_id)
+        await txn.execute(
+            "INSERT INTO lead_lost (lead_id, reason, note, at, set_by) "
+            "VALUES ($1, $2, $3, $4, $5)",
+            lead_id, reason, (note or "").strip()[:500] or None, stamp, user_id,
+        )
+
+
+async def lost_reasons(since: str, until: str) -> list[dict]:
+    """Почему не покупают — по лидам, отказавшимся за период.
+
+    Считаем по дате отметки, а не по первому обращению: вопрос «что мешает
+    продавать сейчас», а не «кого мы потеряли из пришедших в марте».
+    """
+    rows = await adb_core.fetch(
+        "SELECT reason, COUNT(*) AS n FROM lead_lost "
+        "WHERE at >= $1 AND at <= $2 GROUP BY reason",
+        since, f"{until} 23:59:59",
+    )
+    out = [
+        {"reason": str(r["reason"]),
+         "label": LOST_REASON_LABELS.get(str(r["reason"]), str(r["reason"])),
+         "count": int(r["n"])}
+        for r in rows
+    ]
+    out.sort(key=lambda r: (-r["count"], r["reason"]))
+    return out
 
 
 async def link_agent(
@@ -451,6 +542,8 @@ async def funnel(since: str, until: str) -> dict:
     won = sum(1 for row in leads if row["status"] == "won")
     lost = sum(1 for row in leads if row["status"] == "lost")
 
+    from services import lead_calls
+
     directions = await first_touch_directions([int(r["id"]) for r in leads])
     inbound_leads = [r for r in leads if directions.get(int(r["id"])) == "inbound"]
     outbound_leads = [r for r in leads if directions.get(int(r["id"])) == "outbound"]
@@ -487,6 +580,13 @@ async def funnel(since: str, until: str) -> dict:
         # не описать.
         "by_direction": by_direction,
         "speed": reply_speed(leads),
+        # Звонки, которых не нашли в Telegram, — ОТДЕЛЬНОЙ строкой, а не
+        # слагаемым в `contacted`. Подмешать их значит сломать сравнимость с
+        # прошлыми месяцами ровно в день выката: «конверсия упала» окажется
+        # неправдой — упадёт определение знаменателя, а не бизнес.
+        "calls_unlinked": await lead_calls.count_unlinked(since, until),
+        "sources": await lead_calls.sources_breakdown(since, until),
+        "lost_reasons": await lost_reasons(since, until),
     }
 
 

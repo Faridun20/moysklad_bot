@@ -769,6 +769,47 @@ def _create_tables():
                 at         TEXT NOT NULL,
                 created_at TEXT
             )""",
+            # Звонки. Отдельная таблица, а не колонки в `leads`: у позвонившего
+            # клиента нет `tg_user_id`, а он там NOT NULL UNIQUE — и ослабить
+            # его на проде нельзя (инкрементальных миграций нет).
+            #
+            # `lead_id` НЕОБЯЗАТЕЛЕН — это и есть решение. Звонок от человека,
+            # которого нет в Telegram, — законное самостоятельное состояние:
+            # он живёт в списке «перезвонить», а не притворяется перепиской.
+            # Привязка ставится руками, когда клиент напишет.
+            #
+            # `note` здесь ЗАКОНЕН, в отличие от `leads`: это заметка менеджера
+            # о собственном звонке, а не сохранённое чужое сообщение. Разница
+            # принципиальная — не переносить это послабление на переписку.
+            f"""CREATE TABLE IF NOT EXISTS lead_calls (
+                id           {id_type},
+                lead_id      INTEGER REFERENCES leads(id),
+                phone        TEXT,
+                phone_key    TEXT,
+                display_name TEXT,
+                direction    TEXT NOT NULL DEFAULT 'in'
+                             CHECK (direction IN ('in','out')),
+                source       TEXT,
+                interest     TEXT,
+                manager_id   BIGINT,
+                at           TEXT NOT NULL,
+                note         TEXT,
+                created_at   TEXT
+            )""",
+            # Причина отказа. Sidecar по образцу `container_supply`: в
+            # `lead_events` колонки под текст нет и появиться не может.
+            # Причина НЕОБЯЗАТЕЛЬНА — кнопку «Не купил» и так нажимают редко,
+            # и обязательное поле привело бы к тому, что её перестанут нажимать
+            # вовсе. Потерять сам факт отказа хуже, чем отказ без причины.
+            """CREATE TABLE IF NOT EXISTS lead_lost (
+                lead_id  INTEGER PRIMARY KEY REFERENCES leads(id),
+                reason   TEXT NOT NULL
+                         CHECK (reason IN ('price','no_stock','competitor',
+                                           'postponed','wrong_fit','no_answer','other')),
+                note     TEXT,
+                at       TEXT,
+                set_by   BIGINT
+            )""",
             # Контейнеры в пути. Состав заводят при отправке («ожидалось»), при
             # прибытии проставляют факт — расхождение видно сразу, а не после
             # ручной сверки с накладной.
@@ -948,6 +989,11 @@ def _create_indexes():
             "CREATE INDEX IF NOT EXISTS idx_leads_last_inbound ON leads(last_inbound_at)",
             "CREATE INDEX IF NOT EXISTS idx_lead_events_lead ON lead_events(lead_id, at)",
             "CREATE INDEX IF NOT EXISTS idx_lead_events_at ON lead_events(at)",
+            # Непривязанные звонки — самый частый запрос экрана («кому
+            # перезвонить»), поэтому индекс именно по нему, а не по дате.
+            "CREATE INDEX IF NOT EXISTS idx_lead_calls_lead ON lead_calls(lead_id, at)",
+            "CREATE INDEX IF NOT EXISTS idx_lead_calls_at ON lead_calls(at)",
+            "CREATE INDEX IF NOT EXISTS idx_lead_calls_phone ON lead_calls(phone_key)",
             "CREATE INDEX IF NOT EXISTS idx_containers_status ON containers(status)",
             "CREATE INDEX IF NOT EXISTS idx_container_items_container "
             "ON container_items(container_id, id)",
