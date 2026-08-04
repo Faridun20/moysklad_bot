@@ -867,7 +867,10 @@ body::before {
   border-radius: 24px;
   padding: 8px;
   box-shadow: var(--shadow-float);
-  position: relative;
+  /* position здесь БОЛЬШЕ НЕ ОБЪЯВЛЯТЬ. `fixed` стоит в начале правила и сам
+     задаёт containing block для абсолютного ::before — добавленный сюда
+     `relative` молча отменял его, панель уходила в поток, а запас под неё в
+     каркасе превращался в пустоту под ней. Сторож — design-system.test.js. */
 }
 /* Панель неподвижна — размытие ей ничего не стоит на прокрутке. */
 @supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
