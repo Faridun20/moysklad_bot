@@ -133,6 +133,24 @@ async def close_pool() -> None:
 # ─── read/exec примитивы ────────────────────────────────────────────────────────
 
 
+async def _register_sqlite_functions(conn) -> None:
+    """Довесить aiosqlite-соединению те же функции, что есть у синхронного.
+
+    Встроенный SQLite `LOWER()` — ASCII-only: «Иванов» так и остаётся «Иванов».
+    В Postgres он Unicode-aware, поэтому LIKE-поиск по кириллице (имена
+    клиентов, заметки к контейнерам) вёл себя на проде и в тестах ПО-РАЗНОМУ:
+    там находил, здесь нет. `services.database.get_conn` эту функцию давно
+    переопределяет — на асинхронной стороне её просто забыли, и расхождение
+    всплывало как «поиск не работает» ровно там, где его писали по образцу.
+
+    Соединение передаётся УЖЕ открытым: `Connection.__aenter__` делает
+    `await self`, и повторное ожидание того же объекта вешает поток намертво.
+    """
+    await conn.create_function(
+        "lower", 1, lambda v: v.lower() if isinstance(v, str) else v, deterministic=True
+    )
+
+
 async def fetch(query: str, *args: Any) -> list[dict]:
     """SELECT → список dict'ов (возможно пустой)."""
     if _use_postgres():
@@ -145,6 +163,7 @@ async def fetch(query: str, *args: Any) -> list[dict]:
 
     sql, params = _to_sqlite(query, args)
     async with aiosqlite.connect(_db_path()) as conn:
+        await _register_sqlite_functions(conn)
         conn.row_factory = aiosqlite.Row
         async with conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
@@ -163,6 +182,7 @@ async def fetchrow(query: str, *args: Any) -> dict | None:
 
     sql, params = _to_sqlite(query, args)
     async with aiosqlite.connect(_db_path()) as conn:
+        await _register_sqlite_functions(conn)
         conn.row_factory = aiosqlite.Row
         async with conn.execute(sql, params) as cur:
             row = await cur.fetchone()
@@ -179,8 +199,10 @@ async def fetchval(query: str, *args: Any) -> Any:
     import aiosqlite
 
     sql, params = _to_sqlite(query, args)
-    async with aiosqlite.connect(_db_path()) as conn, conn.execute(sql, params) as cur:
-        row = await cur.fetchone()
+    async with aiosqlite.connect(_db_path()) as conn:
+        await _register_sqlite_functions(conn)
+        async with conn.execute(sql, params) as cur:
+            row = await cur.fetchone()
     return row[0] if row else None
 
 
@@ -223,6 +245,7 @@ async def transaction():
     import aiosqlite
 
     conn = await aiosqlite.connect(_db_path())
+    await _register_sqlite_functions(conn)
     conn.row_factory = aiosqlite.Row
     try:
         yield _SqliteTxn(conn)

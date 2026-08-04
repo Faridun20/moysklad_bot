@@ -71,6 +71,17 @@ Variable: новые сервисы (cron'ы) переменную не насл
 - Роль читай через `services.roles.cached_role(user_id)` (TTL 60s) и предикаты `is_boss / can_create_orders / ...`. НЕ через `services.database.get_role` напрямую — обойдёшь кэш. **Деактивация:** `get_role` отдаёт `guest` если `user_roles.deactivated_at` стоит → деактивированный теряет ВСЕ права. `deactivate_user/reactivate_user` (адмін, `/deactivate`/`/reactivate` + webapp `/api/users/deactivate`).
 - Race-чувствительные операции (`mark_order_paid`, `confirm_payment`, `confirm_cash_deposit`) используют `SELECT ... FOR UPDATE` / advisory-lock — сохраняй паттерн.
 
+**LIKE-поиск по кириллице — только через `lower()`, и он переопределён В ОБОИХ
+слоях.** Встроенный SQLite `LOWER()` ASCII-only («Иванов» так и остаётся
+«Иванов»), Postgres — Unicode-aware. `database.get_conn` переопределял функцию
+давно, `adb_core` — нет, и одинаковый на вид запрос вёл себя по-разному в
+зависимости от того, синхронный слой его позвал или асинхронный: на проде
+находил, локально нет, и тесты этого не ловили. Теперь регистрирует и
+`adb_core._register_sqlite_functions`; сторож —
+`tests/test_lead_calls.py::test_async_and_sync_paths_lowercase_cyrillic_the_same`.
+Соединение туда передаётся УЖЕ открытым: `aiosqlite.Connection.__aenter__`
+делает `await self`, и повторное ожидание того же объекта вешает поток намертво.
+
 **Native async DB (asyncpg, задача #21):** денежное ядро (order/payment reads+writes, кредит, сдачи, возвраты) — на `services/adb_core.py` (asyncpg на проде / aiosqlite в тестах; `$N`-плейсхолдеры; `fetch/fetchrow/fetchval/execute`; `transaction()` CM с commit/rollback). Остаток (`get_setting/get_role/add_audit_log`, notifier, snapshot-reads) — sync, мостится через `async_db.__getattr__` (`asyncio.to_thread`; coroutine-функции пропускаются как есть). `_to_thread(db.X, ...)`-форма НЕ ловится grep'ом `db.X(` — аудитируй её при флипе функции в async. `snapshot.refresh_*` теперь native async внутри `adb_core.transaction()` (атомарный DELETE+INSERT); read-функции snapshot остаются sync (зовутся через to_thread).
 - Дедуп уведомлений об отгрузках: `notified_shipments(demand_id PK)` + `mark_shipment_notified(id)` (атомарный INSERT-if-absent). И MS-вебхук (webapp), и резервный поллер (bot) пишут сюда — общий Postgres гарантирует одно уведомление на demand. Старьё чистит `prune_notified_shipments()`.
 
