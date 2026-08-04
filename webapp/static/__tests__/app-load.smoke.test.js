@@ -1464,3 +1464,141 @@ describe('звонки и причина отказа', () => {
     expect(doc.querySelector('#ms-error').textContent).toContain('причину');
   });
 });
+
+describe('загрузка фото пачкой', () => {
+  // Драйвер подменяет shrinkImage (canvas в jsdom не рисует) и apiResult,
+  // и открывает выбор файлов не кликом, а прямым вызовом обработчика.
+  const boot2 = (files, apiImpl) => boot(`
+    currentUser = { role: 'boss' };
+    window.__uploads = [];
+    window.__done = 0;
+    window.__alerts = [];
+    tg.showAlert = (m) => { window.__alerts.push(m); };
+    shrinkImage = async (f) => {
+      if (f.name === 'битый.png') throw new Error('Это не изображение');
+      return 'data:image/jpeg;base64,' + f.name;
+    };
+    apiResult = async (path, body) => {
+      window.__uploads.push(body.data_url);
+      return (${apiImpl})(window.__uploads.length, body.data_url);
+    };
+    // Перехватываем создание input: клик в jsdom диалог не открывает.
+    const realCreate = document.createElement.bind(document);
+    document.createElement = (tag) => {
+      const el = realCreate(tag);
+      if (tag === 'input') {
+        el.click = () => {
+          Object.defineProperty(el, 'files', {
+            value: ${files}.map(n => ({ name: n })), configurable: true,
+          });
+          el.dispatchEvent(new window.Event('change'));
+        };
+      }
+      return el;
+    };
+    window.__ready = new Promise(res => {
+      pickPhotos('/api/products/photo_upload', { ms_id: 'p-1' }, () => {
+        window.__done += 1; res();
+      });
+    });
+  `);
+
+  const settle = () => new Promise(r => setTimeout(r, 50));
+
+  it('выбор нескольких файлов уходит несколькими запросами', async () => {
+    const window = boot2("['a.jpg','b.jpg','c.jpg']", '() => ({ ok: true, body: {} })');
+    await window.__ready;
+    expect(window.__uploads.length).toBe(3);
+    expect(window.__uploads[0]).toContain('a.jpg');
+    expect(window.__uploads[2]).toContain('c.jpg');
+  });
+
+  it('экран перерисовывается один раз, а не на каждом снимке', async () => {
+    // Перерисовка на каждом сбрасывает прокрутку и мигает половиной списка.
+    const window = boot2("['a.jpg','b.jpg','c.jpg','d.jpg']", '() => ({ ok: true, body: {} })');
+    await window.__ready;
+    await settle();
+    expect(window.__done).toBe(1);
+  });
+
+  it('частичный сбой называется вслух, а не прячется', async () => {
+    // «Загружено 3» при двух упавших — ложь, из-за которой недостающие снимки
+    // заметят через неделю.
+    // Отказ привязан к файлу, а не к номеру запроса: иначе повторная попытка
+    // сдвигает нумерацию и тест проверяет не то, что описывает.
+    const window = boot2(
+      "['a.jpg','b.jpg','c.jpg']",
+      '(n, url) => url.includes("b.jpg") ? { ok: false, error: "Telegram отказал" } : { ok: true, body: {} }',
+    );
+    await window.__ready;
+    await settle();
+    const text = window.document.getElementById('toast-host').textContent;
+    expect(text).toContain('Загружено: 2');
+    expect(text).toContain('не прошли: 1');
+    expect(window.__alerts.join(' ')).toContain('b.jpg');
+  });
+
+  it('повторная попытка вытягивает сбой, который прошёл сам', async () => {
+    // На длинной пачке Telegram притормаживает отправку — это проходит за
+    // секунду-другую, и терять из-за этого снимок незачем.
+    const window = boot2(
+      "['a.jpg']",
+      '(n) => n === 1 ? { ok: false, error: "слишком часто" } : { ok: true, body: {} }',  // первая попытка падает
+    );
+    await window.__ready;
+    await settle();
+    expect(window.__uploads.length).toBe(2);
+    const text = window.document.getElementById('toast-host').textContent;
+    expect(text).not.toContain('не прошли');
+  });
+
+  it('посторонний файл не роняет остальную пачку', async () => {
+    const window = boot2("['a.jpg','битый.png','c.jpg']", '() => ({ ok: true, body: {} })');
+    await window.__ready;
+    await settle();
+    expect(window.__uploads.length).toBe(2);
+    expect(window.__alerts.join(' ')).toContain('битый.png');
+  });
+
+  it('дубликаты считаются отдельно от новых', async () => {
+    const window = boot2(
+      "['a.jpg','b.jpg']",
+      '(n, url) => ({ ok: true, body: { duplicate: url.includes("a.jpg") } })',
+    );
+    await window.__ready;
+    await settle();
+    const text = window.document.getElementById('toast-host').textContent;
+    expect(text).toContain('уже были');
+    expect(text).toContain('Загружено: 1');
+  });
+
+  it('один файл не превращается в отчёт о пачке', async () => {
+    const window = boot2("['a.jpg']", '() => ({ ok: true, body: {} })');
+    await window.__ready;
+    await settle();
+    const text = window.document.getElementById('toast-host').textContent;
+    expect(text).toContain('Фото добавлено');
+    expect(text).not.toContain('Загружено:');
+  });
+});
+
+describe('тост с ходом дела', () => {
+  it('обновляется на месте, а не плодит по строке на шаг', () => {
+    // Пачка из десяти снимков иначе завалила бы экран десятью тостами.
+    const window = boot();
+    const t = window.toast('Загружаю 1 из 3…', 'info', { sticky: true });
+    t.update('Загружаю 2 из 3…');
+    const host = window.document.getElementById('toast-host');
+    expect(host.querySelectorAll('.toast').length).toBe(1);
+    expect(host.textContent).toContain('Загружаю 2 из 3…');
+    t.dismiss();
+  });
+
+  it('обычный тост гаснет сам, липкий — нет', () => {
+    const window = boot();
+    window.toast('обычный');
+    const sticky = window.toast('липкий', 'info', { sticky: true });
+    expect(typeof sticky.dismiss).toBe('function');
+    expect(window.document.querySelectorAll('.toast').length).toBe(2);
+  });
+});

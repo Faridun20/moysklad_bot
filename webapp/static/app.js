@@ -822,7 +822,7 @@ function openPriceEditor(product) {
   reloadPhotos();
 
   ov.querySelector('#pe-photo-add').addEventListener('click', () =>
-    pickPhoto('/api/products/photo_upload', { ms_id: msId }, reloadPhotos));
+    pickPhotos('/api/products/photo_upload', { ms_id: msId }, reloadPhotos));
   ov.querySelector('#pe-post').addEventListener('click', () =>
     openChannelComposer('showcase', { ms_id: msId }));
   const close = () => {
@@ -1963,35 +1963,77 @@ function shrinkImage(file, maxSide = 1600, quality = 0.8) {
   });
 }
 
-function pickPhoto(endpoint, body, onDone) {
+// Загрузка пачкой. Снимки уходят ПО ОДНОМУ и последовательно, а не веером:
+// каждый сохраняется отправкой в Telegram, а он ограничивает частоту сообщений
+// в один чат — двадцать параллельных запросов упёрлись бы в отказ на середине.
+// Последовательность заодно даёт честный ход дела и внятный итог.
+//
+// Экран перерисовываем ОДИН раз в конце: перерисовка на каждом снимке сбрасывает
+// прокрутку и мигает половиной списка.
+function pickPhotos(endpoint, body, onDone) {
   const input = document.createElement('input');
   input.type = 'file';
   input.accept = 'image/*';
+  input.multiple = true;
   input.addEventListener('change', async () => {
-    const file = input.files && input.files[0];
-    if (!file) return;
-    toast('Загружаю фото…', 'info');
-    let dataUrl;
-    try {
-      dataUrl = await shrinkImage(file);
-    } catch (e) {
-      tg.showAlert ? tg.showAlert(e.message) : alert(e.message);
-      return;
+    const files = Array.from(input.files || []);
+    if (!files.length) return;
+
+    const single = files.length === 1;
+    const progress = toast(
+      single ? 'Загружаю фото…' : `Загружаю 1 из ${files.length}…`,
+      'info', { sticky: true },
+    );
+    let added = 0;
+    let duplicates = 0;
+    const failed = [];
+
+    for (let i = 0; i < files.length; i++) {
+      if (!single) progress.update(`Загружаю ${i + 1} из ${files.length}…`);
+      let dataUrl;
+      try {
+        dataUrl = await shrinkImage(files[i]);
+      } catch (e) {
+        // Не картинка или битый файл — пропускаем, но не молча: остальные
+        // снимки не должны страдать из-за одного постороннего.
+        failed.push(`${files[i].name}: ${e.message}`);
+        continue;
+      }
+      let res = await apiResult(endpoint, { ...body, data_url: dataUrl });
+      if (!res.ok) {
+        // Одна повторная попытка: на длинной пачке Telegram притормаживает
+        // отправку, и это проходит само за секунду-другую.
+        await new Promise(r => setTimeout(r, 1500));
+        res = await apiResult(endpoint, { ...body, data_url: dataUrl });
+      }
+      if (!res.ok) failed.push(`${files[i].name}: ${res.error}`);
+      else if (res.body.duplicate) duplicates += 1;
+      else added += 1;
     }
-    const res = await apiResult(endpoint, { ...body, data_url: dataUrl });
-    if (!res.ok) {
-      tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
-      return;
-    }
-    haptic('success');
-    toast(res.body.duplicate ? 'Это фото уже есть' : 'Фото добавлено');
+
+    progress.dismiss();
     if (onDone) onDone();
+    haptic(failed.length ? 'error' : 'success');
+
+    // Итог одной строкой и без вранья: «загружено 8» при трёх упавших — это
+    // ложь, из-за которой недостающие снимки заметят через неделю.
+    const parts = [];
+    if (added) parts.push(single ? 'Фото добавлено' : `Загружено: ${added}`);
+    if (duplicates) parts.push(`уже были: ${duplicates}`);
+    if (failed.length) parts.push(`не прошли: ${failed.length}`);
+    if (!parts.length) parts.push('Ничего не загрузилось');
+    toast(parts.join(' · '), failed.length ? 'error' : 'success');
+    if (failed.length) {
+      const text = 'Не загрузились:\n' + failed.slice(0, 5).join('\n')
+        + (failed.length > 5 ? `\n…и ещё ${failed.length - 5}` : '');
+      tg.showAlert ? tg.showAlert(text) : alert(text);
+    }
   });
   input.click();
 }
 
 function pickMachinePhoto(machineId) {
-  pickPhoto('/api/machines/photo_upload', { machine_id: machineId },
+  pickPhotos('/api/machines/photo_upload', { machine_id: machineId },
     () => renderMachineCard(machineId));
 }
 
@@ -2363,7 +2405,16 @@ function toast(msg, type = 'success', opts = {}) {
     setTimeout(() => el.remove(), 250);
   };
   el.querySelector('.toast-close').addEventListener('click', dismiss);
-  timer = setTimeout(dismiss, duration);
+  // `sticky` — тост, который гасит вызывающий код: длинная операция должна
+  // показывать ход дела ОДНОЙ строкой, а не сыпать по тосту на шаг.
+  if (!opts.sticky) timer = setTimeout(dismiss, duration);
+  return {
+    dismiss,
+    update(text) {
+      const msgEl = el.querySelector('.toast-msg');
+      if (msgEl) msgEl.textContent = text;
+    },
+  };
 }
 
 // ─── Нативная кнопка «Назад» Telegram ───────────────

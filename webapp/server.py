@@ -2148,7 +2148,9 @@ async def api_products_photo_upload(request: Request):
     data = await request.json()
     user = _authorize(
         data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_products_photo_upload",
-        rate_limit_max=20,
+        # Пачкой грузят по одному запросу на снимок: карточка товара с десятком
+        # ракурсов — это одно действие человека, а не подозрительная активность.
+        rate_limit_max=60,
     )
     ms_id = (data.get("ms_id") or "").strip()[:64]
     if not ms_id:
@@ -3962,7 +3964,9 @@ async def api_machines_photo_upload(request: Request):
         data,
         allowed_roles=_MACHINE_ROLES,
         rate_limit_scope="api_machines_photo_upload",
-        rate_limit_max=20,
+        # Пачкой грузят по одному запросу на снимок: экскаватор снимают с
+        # десятка ракурсов, и это одно действие, а не подозрительная активность.
+        rate_limit_max=60,
     )
     machine_id = _machine_id_arg(data)
     chat_id = _machine_photos_chat_id()
