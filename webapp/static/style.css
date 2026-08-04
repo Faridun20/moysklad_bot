@@ -2312,6 +2312,32 @@ body::before {
   margin-bottom: var(--sp-3);
   -webkit-overflow-scrolling: touch;
 }
+/* Снимок и крестик — соседи, а не вложенные кнопки: кнопка внутри кнопки это
+   невалидная разметка, и на части клиентов вложенная перестаёт нажиматься. */
+.machine-photo-wrap { position: relative; flex: 0 0 auto; }
+.photo-del {
+  position: absolute;
+  top: -6px; right: -6px;
+  /* Крестик визуально 26px, но зона нажатия дотянута до 44px прозрачным
+     полем — иначе промах по нему на телефоне стоит попадания по снимку. */
+  width: 44px; height: 44px;
+  padding: 9px;
+  border: none;
+  background: none;
+  color: var(--danger);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.photo-del .ic {
+  --ic-size: 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--divider);
+  border-radius: 50%;
+  padding: 5px;
+  box-shadow: var(--shadow-card);
+}
 .machine-photo {
   flex: 0 0 auto;
   width: 96px;

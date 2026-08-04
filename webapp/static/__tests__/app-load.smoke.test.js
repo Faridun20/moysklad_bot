@@ -1602,3 +1602,90 @@ describe('тост с ходом дела', () => {
     expect(window.document.querySelectorAll('.toast').length).toBe(2);
   });
 });
+
+describe('снятие фото', () => {
+  const PHOTOS = [{ id: 11, caption: 'спереди' }, { id: 12, caption: '' }];
+
+  it('крестик есть у того, кому отвечает ручка удаления', () => {
+    const window = boot();
+    const box = window.document.createElement('div');
+    box.innerHTML = window.photoStripHtml(PHOTOS, { canDelete: true, alt: 'Фото' });
+    expect(box.querySelectorAll('[data-photo-del]').length).toBe(2);
+  });
+
+  it('и не рисуется тому, кому ручка ответит отказом', () => {
+    // Кнопка, которая гарантированно вернёт 403, только сбивает с толку.
+    const window = boot();
+    const box = window.document.createElement('div');
+    box.innerHTML = window.photoStripHtml(PHOTOS, { canDelete: false, alt: 'Фото' });
+    expect(box.querySelector('[data-photo-del]')).toBeNull();
+    expect(box.querySelectorAll('[data-photo]').length).toBe(2);
+  });
+
+  it('крестик — сосед снимка, а не кнопка внутри кнопки', () => {
+    // Вложенная кнопка это невалидная разметка, и на части клиентов она
+    // перестаёт нажиматься вовсе.
+    const window = boot();
+    const box = window.document.createElement('div');
+    box.innerHTML = window.photoStripHtml(PHOTOS, { canDelete: true, alt: 'Фото' });
+    const del = box.querySelector('[data-photo-del]');
+    expect(del.closest('.machine-photo')).toBeNull();
+    expect(del.closest('.machine-photo-wrap')).not.toBeNull();
+  });
+
+  it('снятие спрашивает подтверждение и шлёт id снимка', async () => {
+    // Промах по крестику на плитке — обычное дело, а вернуть снимок нечем.
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__asked = 0;
+      window.__sent = null;
+      window.__done = 0;
+      confirmDialog = async () => { window.__asked += 1; return true; };
+      apiResult = async (path, body) => { window.__sent = [path, body]; return { ok: true, body: {} }; };
+      const box = document.getElementById('content');
+      box.innerHTML = photoStripHtml(${JSON.stringify(PHOTOS)}, { canDelete: true, alt: 'Фото' });
+      wirePhotoDelete(box, '/api/machines/photo_delete',
+        (id) => ({ machine_id: 7, photo_id: id }), () => { window.__done += 1; });
+    `);
+    window.document.querySelector('[data-photo-del="12"]').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__asked).toBe(1);
+    expect(window.__sent[0]).toBe('/api/machines/photo_delete');
+    expect(window.__sent[1]).toEqual({ machine_id: 7, photo_id: 12 });
+    expect(window.__done).toBe(1);
+  });
+
+  it('отказ от подтверждения ничего не удаляет', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__sent = null;
+      confirmDialog = async () => false;
+      apiResult = async (path, body) => { window.__sent = [path, body]; return { ok: true, body: {} }; };
+      const box = document.getElementById('content');
+      box.innerHTML = photoStripHtml(${JSON.stringify(PHOTOS)}, { canDelete: true, alt: 'Фото' });
+      wirePhotoDelete(box, '/api/machines/photo_delete', (id) => ({ photo_id: id }), () => {});
+    `);
+    window.document.querySelector('[data-photo-del="11"]').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__sent).toBeNull();
+  });
+
+  it('отказ ручки не выдаётся за успех', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__done = 0;
+      window.__alerts = [];
+      tg.showAlert = (m) => { window.__alerts.push(m); };
+      confirmDialog = async () => true;
+      apiResult = async () => ({ ok: false, error: 'Фото не найдено' });
+      const box = document.getElementById('content');
+      box.innerHTML = photoStripHtml(${JSON.stringify(PHOTOS)}, { canDelete: true, alt: 'Фото' });
+      wirePhotoDelete(box, '/api/machines/photo_delete', (id) => ({ photo_id: id }),
+        () => { window.__done += 1; });
+    `);
+    window.document.querySelector('[data-photo-del="11"]').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__alerts.join(' ')).toContain('Фото не найдено');
+    expect(window.__done).toBe(0);
+  });
+});
