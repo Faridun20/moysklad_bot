@@ -283,6 +283,10 @@ def _create_tables():
     with get_conn() as conn:
         cur = get_cursor(conn)
         id_type = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        # Количества складского учёта: на Postgres NUMERIC (точная десятичная
+        # арифметика — остаток не накапливает дрейф при дробных отгрузках),
+        # на SQLite REAL (NUMERIC там всё равно сводится к REAL-аффинности).
+        qty_type = "NUMERIC" if USE_POSTGRES else "REAL"
 
         tables = [
             # deactivated_at/_by — «увольнение»: get_role отдаёт guest, пока стоит.
@@ -592,6 +596,143 @@ def _create_tables():
                 updated_by    BIGINT,
                 updated_at    TEXT
             )""",
+            # ═══════════════════════════════════════════════════════════════
+            # Локальный складской учёт — замена МойСклад.
+            #
+            # Идентичность: id — SERIAL (pg) / AUTOINCREMENT (sqlite).
+            # legacy_ms_id хранит UUID из МойСклад только для миграции и
+            # последующей сверки; на него нет ни одного рантайм-пути — новый
+            # код ходит исключительно по числовому id.
+            #
+            # Деньги — BIGINT в минорных единицах (копейки/центы), как везде
+            # в проекте (services/money.py). Схема из ТЗ предлагала NUMERIC;
+            # отклонились сознательно, чтобы в одной БД не оказалось двух
+            # денежных конвенций и конвертации на каждом стыке
+            # накладная↔заказ↔платёж.
+            #
+            # Количества — NUMERIC на Postgres (точная арифметика, остаток не
+            # накапливает дрейф при дробных отгрузках) / REAL на SQLite,
+            # где NUMERIC всё равно имеет REAL-аффинность.
+            #
+            # Время — TEXT в локальной TZ через now_str(), как остальные
+            # таблицы. TIMESTAMPTZ DEFAULT now() из ТЗ не берём: он пишет UTC,
+            # а весь проект сравнивает с local-TZ строками (CLAUDE.md про
+            # silent-false при сравнении TZ'ов).
+            # ═══════════════════════════════════════════════════════════════
+            f"""CREATE TABLE IF NOT EXISTS counterparties (
+                id           {id_type},
+                name         TEXT NOT NULL,
+                type         TEXT NOT NULL DEFAULT 'customer'
+                             CHECK (type IN ('supplier', 'customer')),
+                phone        TEXT,
+                telegram_id  BIGINT,
+                notes        TEXT,
+                legacy_ms_id TEXT,
+                created_at   TEXT NOT NULL
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS products (
+                id           {id_type},
+                name         TEXT NOT NULL,
+                category     TEXT,
+                sku          TEXT,
+                unit         TEXT NOT NULL DEFAULT 'шт',
+                legacy_ms_id TEXT,
+                created_at   TEXT NOT NULL
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS warehouses (
+                id   {id_type},
+                name TEXT NOT NULL
+            )""",
+            # Остаток по (товар, склад). Отрицательным не бывает: движение,
+            # уводящее в минус, откатывает всю накладную целиком.
+            f"""CREATE TABLE IF NOT EXISTS stock (
+                product_id   BIGINT NOT NULL,
+                warehouse_id BIGINT NOT NULL,
+                quantity     {qty_type} NOT NULL DEFAULT 0,
+                PRIMARY KEY (product_id, warehouse_id)
+            )""",
+            # Накладная. Промежуточного draft нет — сразу confirmed, остатки
+            # двигаются в той же транзакции, что и вставка строк.
+            f"""CREATE TABLE IF NOT EXISTS invoices (
+                id                 {id_type},
+                type               TEXT NOT NULL
+                                   CHECK (type IN ('incoming', 'outgoing')),
+                counterparty_id    BIGINT,
+                warehouse_id       BIGINT NOT NULL,
+                invoice_number     TEXT NOT NULL,
+                invoice_date       TEXT NOT NULL,
+                status             TEXT NOT NULL DEFAULT 'confirmed'
+                                   CHECK (status IN ('confirmed', 'cancelled')),
+                currency           TEXT NOT NULL DEFAULT 'USD',
+                total_amount_cents BIGINT NOT NULL DEFAULT 0,
+                comment            TEXT,
+                created_by         BIGINT,
+                created_at         TEXT NOT NULL,
+                cancelled_by       BIGINT,
+                cancelled_at       TEXT,
+                telegram_sent      INTEGER NOT NULL DEFAULT 0,
+                telegram_sent_at   TEXT
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS invoice_items (
+                id          {id_type},
+                invoice_id  BIGINT NOT NULL,
+                product_id  BIGINT NOT NULL,
+                quantity    {qty_type} NOT NULL,
+                price_cents BIGINT
+            )""",
+            # Счётчик номеров накладных. Инкремент — атомарный UPSERT
+            # ... ON CONFLICT DO UPDATE ... RETURNING в транзакции накладной.
+            """CREATE TABLE IF NOT EXISTS invoice_counters (
+                type        TEXT NOT NULL,
+                year        INTEGER NOT NULL,
+                last_number INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (type, year)
+            )""",
+            # ─── Генерация юридических документов (docxtpl + LibreOffice) ───
+            f"""CREATE TABLE IF NOT EXISTS document_templates (
+                id         {id_type},
+                type       TEXT NOT NULL,
+                file_path  TEXT NOT NULL,
+                is_active  INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS generated_documents (
+                id                 {id_type},
+                template_id        BIGINT,
+                counterparty_id    BIGINT,
+                client_name        TEXT,
+                passport_data      TEXT,
+                product_name       TEXT NOT NULL,
+                total_amount_cents BIGINT NOT NULL,
+                currency           TEXT NOT NULL DEFAULT 'USD',
+                start_date         TEXT NOT NULL,
+                term_months        INTEGER NOT NULL,
+                payment_type       TEXT NOT NULL
+                                   CHECK (payment_type IN ('single', 'installment')),
+                installments_count INTEGER,
+                file_path          TEXT,
+                created_by         BIGINT,
+                created_at         TEXT NOT NULL
+            )""",
+            # Соответствие «UUID МойСклад → локальный id». Артефакт миграции,
+            # а не рантайм-путь: заполняется scripts/migrate_from_moysklad.py
+            # и читается сверкой + будущим переводом orders/order_items/
+            # credit_limits/product_prices на числовые ключи (шаг 4 плана).
+            #
+            # Почему отдельной таблицей, а не колонками counterparty_id/
+            # product_id в существующих таблицах: добавить колонку в уже
+            # развёрнутую боевую БД можно только ALTER'ом, а он в проекте
+            # запрещён (T1.1, tests/test_schema_single_pass.py) — схема
+            # создаётся одним проходом CREATE TABLE. Таблица соответствий
+            # новая, поэтому создаётся штатно и на шаге 1 переключения не
+            # трогает денежные таблицы вообще.
+            """CREATE TABLE IF NOT EXISTS ms_id_map (
+                entity_type TEXT NOT NULL,
+                ms_id       TEXT NOT NULL,
+                local_id    BIGINT NOT NULL,
+                migrated_at TEXT NOT NULL,
+                PRIMARY KEY (entity_type, ms_id)
+            )""",
             # ── Учёт экскаваторов (волна 4, T4.1) ────────────────────────────
             #
             # Отличие от остальной схемы: здесь есть FOREIGN KEY. Связи строго
@@ -886,6 +1027,33 @@ def _create_indexes():
     with get_conn() as conn:
         cur = get_cursor(conn)
         snapshot_indexes = [
+            # ─── Локальный складской учёт ────────────────────────────
+            # Номер накладной — бизнес-ключ. UNIQUE ловит гонку двух
+            # параллельных создающих транзакций: счётчик инкрементится
+            # атомарно, но индекс — последний рубеж, если кто-то вставит
+            # номер в обход счётчика (импорт, ручной фикс).
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_number "
+            "ON invoices(invoice_number)",
+            # Партиальные UNIQUE по legacy_ms_id: сверка миграции требует
+            # ровно одну локальную строку на UUID МойСклад. NULL (товары,
+            # заведённые уже после перехода) не конфликтуют.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_products_legacy_ms "
+            "ON products(legacy_ms_id) WHERE legacy_ms_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_counterparties_legacy_ms "
+            "ON counterparties(legacy_ms_id) WHERE legacy_ms_id IS NOT NULL",
+            # SKU уникален, но только среди заполненных — в МойСклад код
+            # товара необязателен, и после миграции часть строк будет с NULL.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_products_sku "
+            "ON products(sku) WHERE sku IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_invoice_items_invoice "
+            "ON invoice_items(invoice_id)",
+            "CREATE INDEX IF NOT EXISTS idx_invoices_counterparty "
+            "ON invoices(counterparty_id)",
+            # Список накладных в WebApp: сортировка по дате, фильтр по типу.
+            "CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(invoice_date)",
+            # Обратный поиск «локальный id → ms_id» при сверке миграции.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ms_id_map_local "
+            "ON ms_id_map(entity_type, local_id)",
             "CREATE INDEX IF NOT EXISTS idx_ms_products_folder ON ms_products(folder_id)",
             "CREATE INDEX IF NOT EXISTS idx_ms_stock_folder ON ms_stock(folder_id)",
             "CREATE INDEX IF NOT EXISTS idx_ms_categories_parent ON ms_categories(parent_id)",
@@ -1007,6 +1175,22 @@ def _create_indexes():
                 logger.debug("Индекс не создан: %s", e)
 
 
+def seed_warehouses() -> int:
+    """Засеять склад по умолчанию. Идемпотентно — сеем только в пустую
+    таблицу, чтобы переименованный вручную склад не продублировался."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute("SELECT COUNT(*) AS c FROM warehouses")
+        row = cur.fetchone()
+        count = (row["c"] if isinstance(row, dict) else row[0]) or 0
+        if count:
+            return 0
+        cur.execute(q("INSERT INTO warehouses (name) VALUES (?)"), ("Основной склад",))
+        conn.commit()
+        logger.info("Засеян склад по умолчанию «Основной склад»")
+        return 1
+
+
 def run_backfills():
     """Одноразовые data-миграции + сидинг настроек. Идемпотентны.
 
@@ -1047,6 +1231,8 @@ def run_backfills():
 
     # ── Сидинг app_settings (идемпотентно) ───────────────────────────
     seed_app_settings()
+    # ── Склад по умолчанию для локального учёта (идемпотентно) ───────
+    seed_warehouses()
 
 
 # ─── Настройки приложения (app_settings) ──────────────────────────────────────

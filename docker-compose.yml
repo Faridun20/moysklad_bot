@@ -1,0 +1,202 @@
+# Self-hosted развёртывание: Postgres + Redis + бот + WebApp + cron-задачи.
+#
+# Быстрый старт:
+#   cp .env.example .env          # заполнить секреты
+#   docker compose build
+#   docker compose up -d          # migrate отработает сам, затем bot и webapp
+#
+# Секреты живут в .env рядом с этим файлом и в образ НЕ попадают
+# (см. .dockerignore) — передаются рантаймом через env_file.
+
+# ─── Общая часть для всех контейнеров приложения ────────────────────────────
+# Якорь, чтобы bot, webapp, migrate и cron-задачи не разъезжались по
+# окружению: одна правка — во всех сервисах сразу.
+x-app: &app
+  build:
+    context: .
+    args:
+      # Версия статики для cache-busting. Без неё webapp скатывается к
+      # таймстампу старта и сбрасывает кэш браузера на каждом рестарте.
+      GIT_COMMIT_SHA: ${GIT_COMMIT_SHA:-}
+      # Юр. документы (docx → pdf) ещё не написаны; 0 экономит ~400 МБ образа.
+      WITH_LIBREOFFICE: ${WITH_LIBREOFFICE:-1}
+  image: moysklad-bot:local
+  env_file: [.env]
+  environment:
+    DATABASE_URL: postgresql://${POSTGRES_USER:-bot}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD обязателен}@postgres:5432/${POSTGRES_DB:-moysklad_bot}
+    REDIS_URL: redis://redis:6379/0
+    # Бизнес-зона. КРИТИЧНО: created_at пишется в кадре контейнера
+    # (utils.helpers.local_now), и «сегодня» в аналитике считается в нём же.
+    # Поставите UTC при бизнесе в +5 — вечерние записи выпадут из «сегодня».
+    TZ: ${TZ:-Asia/Tashkent}
+    # Логотип накладной: файл кладётся в том appdata.
+    INVOICE_LOGO_PATH: ${INVOICE_LOGO_PATH:-/app/data/logo.png}
+  volumes:
+    # Логотип, шаблоны .docx и сгенерированные документы — переживают
+    # пересборку образа.
+    - appdata:/app/data
+  depends_on:
+    postgres: {condition: service_healthy}
+    redis: {condition: service_healthy}
+  restart: unless-stopped
+
+services:
+  # ─── Хранилища ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD обязателен}
+      POSTGRES_DB: ${POSTGRES_DB:-moysklad_bot}
+      TZ: ${TZ:-Asia/Tashkent}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Без healthcheck migrate стартует раньше, чем Postgres примет коннекты,
+      # и падает на первом же запросе.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bot} -d ${POSTGRES_DB:-moysklad_bot}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    # Наружу не публикуем: к БД ходят только контейнеры этой сети. Нужен
+    # доступ с хоста для psql — раскомментируйте, но лучше через
+    # `docker compose exec postgres psql`.
+    # ports: ["5432:5432"]
+
+  redis:
+    image: redis:7-alpine
+    # appendonly: FSM-состояния (черновики заказов) переживают рестарт.
+    # Без Redis бот откатится на MemoryStorage и потеряет их при каждом
+    # перезапуске — на своём сервере это заметно.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ─── Схема БД ─────────────────────────────────────────────────────────────
+  migrate:
+    <<: *app
+    # Отдельный одноразовый контейнер, а не шаг в CMD приложения: схему
+    # разворачивает ОДИН процесс перед стартом сервисов. Если зашить миграцию
+    # в запуск bot и webapp, они стартуют наперегонки.
+    command: ["python", "-m", "tasks.migrate"]
+    restart: "no"
+
+  # ─── Приложение ───────────────────────────────────────────────────────────
+  bot:
+    <<: *app
+    environment:
+      # YAML-мердж не объединяет вложенные мапы: повторяем блок целиком,
+      # иначе environment якоря затрётся, а не дополнится.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-bot}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD обязателен}@postgres:5432/${POSTGRES_DB:-moysklad_bot}
+      REDIS_URL: redis://redis:6379/0
+      TZ: ${TZ:-Asia/Tashkent}
+      INVOICE_LOGO_PATH: ${INVOICE_LOGO_PATH:-/app/data/logo.png}
+      BOT_MODE: bot
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+
+  webapp:
+    <<: *app
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-bot}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD обязателен}@postgres:5432/${POSTGRES_DB:-moysklad_bot}
+      REDIS_URL: redis://redis:6379/0
+      TZ: ${TZ:-Asia/Tashkent}
+      INVOICE_LOGO_PATH: ${INVOICE_LOGO_PATH:-/app/data/logo.png}
+      BOT_MODE: webapp
+      PORT: "8080"
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+    ports:
+      # Слушаем только localhost: Telegram требует публичный HTTPS, значит
+      # снаружи всё равно стоит ваш reverse-proxy с сертификатом. Публиковать
+      # 0.0.0.0 незачем — WebApp проверяет подпись initData, но открытый порт
+      # это лишняя поверхность.
+      - "127.0.0.1:${WEBAPP_PORT:-8080}:8080"
+    healthcheck:
+      # В образе нет ни curl, ни wget (python:slim) — проверяем Python'ом.
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ─── Cron-задачи ──────────────────────────────────────────────────────────
+  # Профиль `cron` держит их вне `docker compose up`: это одноразовые прогоны,
+  # а не демоны. Запускает их системный cron хоста (примеры внизу файла).
+  # Свой планировщик в compose не добавляем — это лишняя зависимость и лишний
+  # режим отказа там, где хватает crontab.
+  cron-backup:
+    <<: *app
+    profiles: ["cron"]
+    command: ["python", "-m", "tasks.run_backup"]
+    restart: "no"
+
+  cron-maintenance:
+    <<: *app
+    profiles: ["cron"]
+    command: ["python", "-m", "tasks.run_maintenance"]
+    restart: "no"
+
+  cron-debts-notify:
+    <<: *app
+    profiles: ["cron"]
+    command: ["python", "-m", "tasks.run_debts_notify"]
+    restart: "no"
+
+  cron-ops-monitor:
+    <<: *app
+    profiles: ["cron"]
+    command: ["python", "-m", "tasks.run_ops_monitor"]
+    restart: "no"
+
+  # Две задачи ниже обслуживают синхронизацию с МойСклад. Они уходят вместе с
+  # МС-кодом на шаге 4 плана отключения — тогда удалите и их.
+  cron-ms-sync-retry:
+    <<: *app
+    profiles: ["cron"]
+    command: ["python", "-m", "tasks.run_ms_sync_retry"]
+    restart: "no"
+
+  cron-ms-reconcile:
+    <<: *app
+    profiles: ["cron"]
+    command: ["python", "-m", "tasks.run_ms_reconcile"]
+    restart: "no"
+
+volumes:
+  pgdata:
+  redisdata:
+  appdata:
+
+# ─── crontab хоста ───────────────────────────────────────────────────────────
+# Подставьте свой путь к проекту. `--rm` обязателен, иначе остановленные
+# контейнеры копятся. Логи — в файл: у одноразовых контейнеров их иначе
+# негде смотреть после выхода.
+#
+#   cd /opt/moysklad_bot
+#   */15 * * * *  docker compose run --rm cron-ms-sync-retry   >> /var/log/msbot-sync.log 2>&1
+#   0 * * * *     docker compose run --rm cron-ms-reconcile    >> /var/log/msbot-reconcile.log 2>&1
+#   0 9 * * *     docker compose run --rm cron-debts-notify    >> /var/log/msbot-debts.log 2>&1
+#   0 18 * * *    docker compose run --rm cron-ops-monitor     >> /var/log/msbot-ops.log 2>&1
+#   30 2 * * *    docker compose run --rm cron-maintenance     >> /var/log/msbot-maint.log 2>&1
+#   0 3 * * *     docker compose run --rm cron-backup          >> /var/log/msbot-backup.log 2>&1
+#
+# Время в crontab — в зоне ХОСТА, а не в TZ из .env. Если они разные,
+# пересчитайте часы.
+#
+# ─── Миграция с МойСклад (шаг 2 плана) ───────────────────────────────────────
+#   docker compose run --rm bot python -m scripts.migrate_from_moysklad --dry-run
+#   docker compose run --rm bot python -m scripts.migrate_from_moysklad --apply
+# Ненулевой код возврата = сверка не сошлась, переключаться нельзя.

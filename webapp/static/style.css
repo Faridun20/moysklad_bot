@@ -220,7 +220,7 @@
 .u-mt-1 { margin-top: 4px; }
 .u-mt-2 { margin-top: 8px; }
 .u-mt-3 { margin-top: 12px; }
-.u-mt-4 { margin-top: 16px; }
+.
 .u-fs-11 { font-size: 11px; }
 .u-fs-12 { font-size: 12px; }
 
@@ -575,27 +575,7 @@ body::before {
   margin: 16px 0 8px;
 }
 
-.action-btn {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  padding: 14px 4px;
-  background: var(--bg-card);
-  border: none;
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-card);
-  cursor: pointer;
-  font-family: inherit;
-  color: var(--text);
-  /* clamp: на узких экранах (320px) подпись «Аналитика» в 4 колонки не
-     переносится на 2-ю строку и не ломает выравнивание соседей. */
-  font-size: clamp(10px, 3.2vw, 12px);
-  font-weight: 500;
-  white-space: nowrap;
-  transition: transform 0.08s ease, background 0.15s ease;
-}
+.
 
 .action-btn:active {
   transform: scale(0.96);
@@ -722,7 +702,6 @@ body::before {
   margin-bottom: var(--sp-2);
 }
 
-
 .card-row {
   display: flex;
   align-items: center;
@@ -809,12 +788,7 @@ body::before {
   white-space: nowrap;
 }
 
-.card-row-value-sub {
-  font-size: 11px;
-  color: var(--text-mute);
-  text-align: right;
-  margin-top: 2px;
-}
+.
 
 /* ─── Stat-grid (компактная статистика) ───────────────────────── */
 .stat-grid {
@@ -1381,10 +1355,10 @@ body::before {
 /* Переходный период (UI-WP-02): экраны, ещё не переведённые на data-status,
    продолжают работать со старыми классами. Удалить, когда их не останется. */
 .status-draft    { background: var(--neutral-bg); color: var(--neutral); }
-.status-pending  { background: var(--warn-bg); color: var(--warn); }
-.status-approved { background: var(--success-bg); color: var(--success); }
-.status-rejected { background: var(--danger-bg); color: var(--danger); }
-.status-shipped  { background: var(--info-bg); color: var(--info); }
+.s
+.
+.
+.s
 
 .order-meta {
   display: flex; justify-content: space-between;
@@ -1564,6 +1538,69 @@ body::before {
 .editor-item-name { font-size: 14px; font-weight: 500; }
 .editor-item-qty  { font-size: 12px; color: var(--text-mute); margin-top: 2px; }
 
+/* Вход в локальный складской учёт с вкладки «Каталог». Кнопки в ряд,
+   на узком экране переносятся. */
+.wh-entry {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.wh-entry .btn-secondary {
+  flex: 1;
+  min-width: 150px;
+  margin: 0;
+}
+
+/* ─── Склад: форма позиций накладной ─────────────────────────────────────
+   Своя разметка, потому что строка редактора заказа (.editor-item) —
+   готовая позиция с суммой, а здесь вводятся три поля сразу: товар,
+   количество и цена. */
+.wh-pos {
+  padding: 12px 14px;
+  background: var(--bg-card);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-card);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Кол-во и цена в один ряд, кнопка удаления прижата справа фиксированной
+   шириной — иначе на узких экранах она сжимает поля ввода до нечитаемого. */
+.wh-pos-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 44px;
+  gap: 8px;
+  align-items: center;
+}
+
+/* Подсказка о нехватке остатка. Именно подсказка: решение принимает сервер
+   под блокировкой строки stock, фронт лишь предупреждает заранее. */
+.wh-pos-warn {
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.wh-input-bad {
+  border-color: var(--danger);
+}
+
+/* Кнопки действий на карточке накладной (отправить PDF / отменить). */
+.wh-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.wh-actions .btn-secondary {
+  flex: 1;
+  min-width: 140px;
+  margin: 0;
+}
+
 .editor-item-del {
   background: none; border: none;
   cursor: pointer;
@@ -1659,9 +1696,7 @@ body::before {
   box-shadow: var(--shadow-card);
 }
 
-.qty-unit {
-  font-size: 14px; color: var(--text-mute); text-align: center;
-}
+.
 
 /* ─── Тип оплаты в редакторе заказа ─────────────────────────────── */
 /* UI-WP-04: тип оплаты переехал на .seg — «выбери один из двух» больше не
@@ -1693,9 +1728,7 @@ body::before {
 .debts-header {
   padding: 14px; display: flex; flex-direction: column; gap: 10px;
 }
-.debts-title {
-  font-size: 22px; font-weight: 700;
-}
+.
 /* Фильтр «Все / К оплате сейчас» — тот же сегмент-язык, что .seg
    (трек-подложка + активный сегмент как приподнятая карточка). */
 /* UI-WP-22: .debts-tabs/.debts-tab были дословным клоном .seg/.seg-item —
@@ -1850,7 +1883,7 @@ body::before {
 }
 .limit-edit { margin-top: 8px; display: grid; gap: 8px; }
 .limit-edit[hidden] { display: none; }
-.limit-input { width: 100%; }
+.
 .debt-hint {
   text-align: center; font-size: 13px; color: var(--text-mute);
   font-style: italic;

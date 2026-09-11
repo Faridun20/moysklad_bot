@@ -433,6 +433,34 @@
     );
   }
 
+  // ─── Склад ────────────────────────────────────────────────────────────
+  // Копейки → «1 234,56 USD». Деньги на бэкенде BIGINT в минорных единицах,
+  // поэтому делим ровно на 100 и всегда печатаем два знака: «750 USD» вместо
+  // «750.00 USD» в накладной читается как другая сумма.
+  function whMoney(cents, currency) {
+    const v = (Number(cents || 0) / 100).toLocaleString('ru-RU', {
+      minimumFractionDigits: 2, maximumFractionDigits: 2,
+    });
+    const cur = currency == null ? 'USD' : currency;
+    return cur ? `${v} ${escapeHtml(cur)}` : v;
+  }
+
+  // Количество без хвостовых нулей: 3, а не 3,000; дробные (кг, метры) —
+  // до трёх знаков.
+  function whQty(q) {
+    return Number(q || 0).toLocaleString('ru-RU', { maximumFractionDigits: 3 });
+  }
+
+  // Бейдж остатка. Отдельно от _stockBadge в app.js: там целые из МойСклад,
+  // здесь количества могут быть дробными.
+  function whStockBadge(q) {
+    const n = Number(q || 0);
+    // Состояние — атрибутом, цвет выводится из переменных (см. [data-status]
+    // в style.css). Классы badge-* — прежняя система, её разметку не плодим.
+    const state = n <= 0 ? 'out' : (n < 20 ? 'low' : 'in_stock');
+    return `<span class="stock-badge" data-status="${state}">${n <= 0 ? 'нет' : whQty(n)}</span>`;
+  }
+
   // ─── Техника ──────────────────────────────────────────────────────────────
   // Словарь подписей статусов НЕ дублируем на фронте: он приходит с сервера
   // (`status_labels`), где живёт вместе с самим жизненным циклом машины. Иначе
@@ -670,5 +698,6 @@
     machineStatusLabel, machineSubtitle, machineStatusSegHtml,
     moneyBlockLabel, agingBarsHtml, forecastRowsHtml, buyerKey,
     leadFunnelHtml, firstTouchHtml, replySpeedHtml, durationLabel, postEffectLabel,
+    whMoney, whQty, whStockBadge,
   };
 });

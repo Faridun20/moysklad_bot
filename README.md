@@ -58,7 +58,6 @@ Telegram, руководители одобряют отгрузки и подт
    MANAGER_IDS = []
    ALLOWED_USERS = []
    BASE_CURRENCY = "USD"
-   TZ_OFFSET = 5
    CHECK_INTERVAL_SEC = 900   # интервал РЕЗЕРВНОГО поллера отгрузок (осн. канал — вебхук)
    ```
    Без `DATABASE_URL` бот использует SQLite в `/tmp/payments.db`.

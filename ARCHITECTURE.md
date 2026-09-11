@@ -105,7 +105,7 @@ Telegram-бот + Web App (Mini App в чате) для управления з�
 | `ADMIN_IDS`, `BOSS_IDS`, `MANAGER_IDS` | CSV Telegram user_id для bootstrap ролей |
 | `ALLOWED_USERS` | CSV id, кому давать роль `manager` по умолчанию |
 | `BASE_CURRENCY` | По умолчанию `USD`, валюта для UI |
-| `TZ`, `TZ_OFFSET` | Часовой пояс для логов и отчётов |
+| `TZ` | Часовой пояс контейнера. Им же пишется `created_at` (`utils.helpers.local_now`), поэтому должен совпадать с бизнес-зоной |
 | `CHECK_INTERVAL_SEC` | Интервал РЕЗЕРВНОГО поллера отгрузок (осн. канал — вебхук), сек, default 900 |
 | `PG_POOL_MIN`, `PG_POOL_MAX` | Размер пула psycopg2 (default 1/10) |
 | `SQL_SLOW_MS` | Порог логирования медленных запросов, мс (default 200) |
