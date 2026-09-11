@@ -3840,6 +3840,230 @@ async def api_delete_draft(request: Request):
     return JSONResponse({"ok": True})
 
 
+# ─── API: локальный складской учёт ───────────────────────────────────────────
+#
+# Остатки и накладные ведутся в собственных таблицах (services/warehouse.py),
+# МойСклад здесь не участвует вообще. Права по ТЗ: создание — менеджер и выше,
+# отмена — только босс/админ (отмена двигает остатки назад и правит историю).
+
+
+@app.post("/api/wh/stock")
+async def api_wh_stock(request: Request):
+    """Текущие остатки локального склада."""
+    from services import warehouse
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_wh_stock",
+        rate_limit_max=120,
+    )
+    warehouse_id = data.get("warehouse_id")
+    rows = await warehouse.get_stock(
+        warehouse_id=int(warehouse_id) if warehouse_id else None,
+        only_positive=bool(data.get("only_positive")),
+    )
+    return JSONResponse(
+        {
+            "products": [
+                {
+                    "product_id": r["product_id"],
+                    "name": r["name"],
+                    "category": r["category"],
+                    "sku": r["sku"],
+                    "unit": r["unit"],
+                    "quantity": float(r["quantity"] or 0),
+                }
+                for r in rows
+            ]
+        }
+    )
+
+
+@app.post("/api/wh/counterparties")
+async def api_wh_counterparties(request: Request):
+    """Справочник контрагентов для подстановки в накладную."""
+    from services import adb_core
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_wh_counterparties",
+        rate_limit_max=120,
+    )
+    search = (data.get("search") or "").strip()
+    if search:
+        # Два условия, а не одно LOWER(...): SQLite реализует LOWER() только
+        # для ASCII и кириллицу не трогает вовсе, поэтому «ромашк» там не
+        # нашло бы «Ромашка». На Postgres (прод) первое условие полностью
+        # регистронезависимо; второе покрывает SQLite, когда регистр введён
+        # как в справочнике. Полная регистронезависимость для кириллицы на
+        # SQLite потребовала бы кастомной collation — локальной разработке
+        # это не нужно.
+        rows = await adb_core.fetch(
+            "SELECT id, name, type, phone, telegram_id FROM counterparties "
+            "WHERE LOWER(name) LIKE $1 OR name LIKE $2 ORDER BY name LIMIT 100",
+            f"%{search.lower()}%",
+            f"%{search}%",
+        )
+    else:
+        rows = await adb_core.fetch(
+            "SELECT id, name, type, phone, telegram_id FROM counterparties "
+            "ORDER BY name LIMIT 100"
+        )
+    return JSONResponse({"counterparties": rows})
+
+
+@app.post("/api/wh/invoices")
+async def api_wh_invoices(request: Request):
+    """Список накладных, новые сверху."""
+    from services import warehouse
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_wh_invoices",
+        rate_limit_max=120,
+    )
+    inv_type = data.get("type")
+    if inv_type not in (None, "", "incoming", "outgoing"):
+        raise HTTPException(status_code=400, detail="Неизвестный тип накладной")
+    try:
+        limit = min(int(data.get("limit") or 50), 200)
+        offset = max(int(data.get("offset") or 0), 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="limit/offset должны быть числами")
+
+    rows = await warehouse.list_invoices(
+        invoice_type=inv_type or None, limit=limit, offset=offset
+    )
+    return JSONResponse({"invoices": rows})
+
+
+@app.post("/api/wh/invoices/get")
+async def api_wh_invoice_get(request: Request):
+    """Одна накладная с позициями."""
+    from services import warehouse
+
+    data = await request.json()
+    _authorize(data, allowed_roles=("admin", "boss", "manager"))
+    try:
+        invoice_id = int(data.get("invoice_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invoice_id обязателен")
+
+    inv = await warehouse.get_invoice(invoice_id)
+    if inv is None:
+        raise HTTPException(status_code=404, detail="Накладная не найдена")
+    return JSONResponse({"invoice": inv})
+
+
+@app.post("/api/wh/invoices/create")
+async def api_wh_invoice_create(request: Request):
+    """Провести накладную. Остатки двигаются сразу — draft'а нет.
+
+    Идемпотентность обязательна: накладная меняет остатки, и повторно
+    отправленная форма (дрогнула связь, юзер нажал дважды) без ключа
+    списала бы товар второй раз.
+    """
+    from config import BASE_CURRENCY
+    from services import async_db as adb
+    from services import warehouse
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_wh_invoice_create",
+        rate_limit_max=30,
+    )
+
+    inv_type = data.get("type")
+    if inv_type not in ("incoming", "outgoing"):
+        raise HTTPException(status_code=400, detail="type: incoming или outgoing")
+
+    raw_items = data.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        raise HTTPException(status_code=400, detail="Добавьте хотя бы одну позицию")
+
+    counterparty_id = data.get("counterparty_id")
+    if inv_type == "outgoing" and not counterparty_id:
+        raise HTTPException(status_code=400, detail="Для расхода нужен контрагент")
+
+    idem = _Idem(adb, "wh_invoice_create", user["id"], data.get("idempotency_key"))
+    prev = await idem.claim()
+    if prev is not None:
+        return JSONResponse(prev)
+
+    try:
+        result = await warehouse.create_invoice(
+            invoice_type=inv_type,
+            warehouse_id=int(data.get("warehouse_id") or 1),
+            counterparty_id=int(counterparty_id) if counterparty_id else None,
+            items=raw_items,
+            currency=(data.get("currency") or BASE_CURRENCY),
+            invoice_date=(data.get("invoice_date") or None),
+            comment=(data.get("comment") or None),
+            created_by=user["id"],
+        )
+    except Exception:
+        # Ключ освобождаем только на НЕОЖИДАННОМ сбое: отказ по бизнес-правилу
+        # (нехватка остатка) — это законный результат, и он ниже сохраняется
+        # под ключом, чтобы ретрай той же формы отдал тот же ответ.
+        await idem.release()
+        raise
+
+    if not result.get("ok"):
+        await idem.store(result)
+        return JSONResponse(result, status_code=409)
+
+    await adb.add_audit_log(
+        user["id"],
+        user.get("first_name", ""),
+        get_role(user["id"]),
+        "wh_invoice_create",
+        f"Накладная {result['invoice_number']} ({inv_type}), "
+        f"позиций {result['positions']}, сумма {result['total_amount_cents']} коп.",
+    )
+    await idem.store(result)
+    return JSONResponse(result)
+
+
+@app.post("/api/wh/invoices/cancel")
+async def api_wh_invoice_cancel(request: Request):
+    """Отменить накладную. Только босс/админ — откат двигает остатки назад."""
+    from services import async_db as adb
+    from services import warehouse
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_wh_invoice_cancel",
+        rate_limit_max=20,
+    )
+    try:
+        invoice_id = int(data.get("invoice_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invoice_id обязателен")
+
+    result = await warehouse.cancel_invoice(invoice_id, cancelled_by=user["id"])
+    if not result.get("ok"):
+        return JSONResponse(result, status_code=409)
+
+    await adb.add_audit_log(
+        user["id"],
+        user.get("first_name", ""),
+        get_role(user["id"]),
+        "wh_invoice_cancel",
+        f"Отменена накладная #{invoice_id}, остатки откачены",
+    )
+    return JSONResponse(result)
+
+
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 
