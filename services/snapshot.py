@@ -21,6 +21,7 @@
 
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 
 from services import adb_core
 from services.database import USE_POSTGRES, get_conn, get_cursor, now_str, q
@@ -275,6 +276,130 @@ async def refresh_stock() -> int:
     return len(values)
 
 
+# ─── Дельта-остатки (MS-5) ───────────────────────────────────────────────────
+#
+# Полный `report/stock/all` стоит 5 единиц бюджета за запрос (с февраля 2026) и
+# отдаётся страницами: три страницы номенклатуры = 15 единиц. Дебаунс запускал
+# его после КАЖДОЙ пачки stock-вебхуков, то есть раз в 2 секунды в активный
+# день — ≈7,5 единиц в секунду при бюджете ≈7,3. Один этот путь способен съесть
+# весь лимит аккаунта и увести его в автоотключение.
+#
+# `report/stock/all/current` отдаёт только изменившееся, одним ответом без
+# пагинации, и в список подорожавших не входит. Возвращает пары
+# assortmentId → количество; имена, категории и единицы у нас и так приходят из
+# refresh_products, поэтому дельте достаточно UPDATE существующих строк.
+
+# Перекрываем интервалы: вебхук и запрос идут не мгновенно, а changedSince
+# отсекает строго «позже». Без нахлёста изменение, случившееся в ту же секунду,
+# потерялось бы до следующего полного среза.
+_DELTA_OVERLAP_SEC = 120
+# Документация: changedSince не глубже 24 часов. Берём запас — если наша
+# отметка старше, дельта бессмысленна, идём за полным срезом.
+_DELTA_MAX_AGE_SEC = 20 * 3600
+# МойСклад ждёт момент в часовом поясе аккаунта (МСК = UTC+3), а мы пишем и
+# считаем в локальном кадре контейнера. Наивная подстановка даёт тихий сдвиг
+# окна на разницу поясов — и часть изменений не приезжает вовсе.
+_MSK = timezone(timedelta(hours=3))
+
+
+def _changed_since_param(moment_local: datetime) -> str:
+    """Локальный момент → строка `changedSince` в часовом поясе МойСклад."""
+    aware = moment_local.astimezone() if moment_local.tzinfo is None else moment_local
+    return aware.astimezone(_MSK).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_stamp(raw: str | None) -> datetime | None:
+    """Отметку снапшота обратно в datetime (пишется через now_str())."""
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(str(raw)[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+async def _delta_rows(stock_type: str, since_local: datetime) -> dict[str, float]:
+    """{assortmentId: количество} по одному stockType ('stock' | 'reserve').
+
+    Эндпоинт принимает ровно один stockType за раз — отсюда два запроса вместо
+    одного; это всё равно на порядок дешевле полного среза.
+    """
+    data = await ms_get(
+        "report/stock/all/current",
+        params={"changedSince": _changed_since_param(since_local), "stockType": stock_type},
+    )
+    rows = data if isinstance(data, list) else (data or {}).get("rows") or []
+    out: dict[str, float] = {}
+    for r in rows:
+        assortment_id = r.get("assortmentId") or extract_id_from_href(
+            extract_href(r, "assortment")
+        )
+        if assortment_id and r.get("stock") is not None:
+            out[str(assortment_id)] = r.get("stock") or 0
+    return out
+
+
+async def refresh_stock_delta(since_local: datetime | None = None) -> int:
+    """Обновить только изменившиеся остатки. Возвращает число обновлённых строк.
+
+    Возвращает -1, когда дельта неприменима — вызывающий делает полный pull:
+      • нет отметки прошлого синка (первый запуск);
+      • отметка старше суток (changedSince глубже 24 часов не работает);
+      • приехал неизвестный assortmentId — это новая позиция номенклатуры, а её
+        имени, категории и единицы в дельте нет. Вставить строку с пустым
+        названием значит показать менеджеру безымянный товар в каталоге.
+    """
+    if since_local is None:
+        meta = await meta_get("stock")
+        # last_refresh обновляет ЛЮБОЙ meta_set по датасету stock — и полный
+        # срез, и предыдущая дельта. Ровно то, что нужно для changedSince.
+        # Отдельной колонки не заводим: в проекте нет ALTER-миграций (T1.1,
+        # тест test_schema_single_pass это стережёт), а таблица на проде уже
+        # создана — новая колонка просто не появилась бы.
+        since_local = _parse_stamp(
+            (meta or {}).get("last_refresh") or (meta or {}).get("last_full_refresh")
+        )
+    if since_local is None:
+        return -1
+    age = (datetime.now() - since_local).total_seconds()
+    if age > _DELTA_MAX_AGE_SEC or age < 0:
+        return -1
+
+    window_start = since_local - timedelta(seconds=_DELTA_OVERLAP_SEC)
+    stock = await _delta_rows("stock", window_start)
+    reserve = await _delta_rows("reserve", window_start)
+    changed = sorted(set(stock) | set(reserve))
+    ts = now_str()
+    if not changed:
+        await meta_set("stock", status="ok")  # двигаем last_refresh — окно дельты
+        return 0
+
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(changed)))
+    known = {
+        r["ms_id"]
+        for r in await adb_core.fetch(
+            f"SELECT ms_id FROM ms_stock WHERE ms_id IN ({placeholders})", *changed
+        )
+    }
+    unknown = [ms_id for ms_id in changed if ms_id not in known]
+    if unknown:
+        logger.info(
+            "refresh_stock_delta: %d новых позиций — нужен полный срез", len(unknown)
+        )
+        return -1
+
+    updates = [(stock.get(ms_id), reserve.get(ms_id), ts, ms_id) for ms_id in changed]
+    async with adb_core.transaction() as tx:
+        await tx.executemany(
+            "UPDATE ms_stock SET stock = COALESCE($1, stock), "
+            "reserve = COALESCE($2, reserve), updated_at = $3 WHERE ms_id = $4",
+            updates,
+        )
+    await meta_set("stock", status="ok")  # двигаем last_refresh — окно дельты
+    logger.info("snapshot.refresh_stock_delta: %d rows", len(updates))
+    return len(updates)
+
+
 # ─── Дебаунс рефреша при webhook'ах ──────────────────────────────────────────
 
 _stock_dirty = False
@@ -306,7 +431,11 @@ async def _stock_debounce_loop() -> None:
                     if _stock_dirty:
                         _stock_dirty = False
                         try:
-                            await refresh_stock()
+                            # MS-5: горячий путь — дельта. Полный срез только
+                            # когда дельта неприменима (первый запуск, отметка
+                            # старше суток, приехала новая позиция).
+                            if await refresh_stock_delta() < 0:
+                                await refresh_stock()
                             await meta_set("stock", last_webhook_at=now_str())
                         except Exception as e:
                             logger.exception("debounced stock refresh failed: %s", e)
@@ -388,6 +517,28 @@ def search_products(query: str, limit: int = 10) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+async def remember_product(ms_id: str, *, name: str, unit: str = "шт") -> None:
+    """Положить только что созданную карточку номенклатуры в снапшот.
+
+    Снапшот — зеркало, и обычно его двигает только синхронизация. Исключение
+    здесь осознанное: товар, заведённый минуту назад из приёмки, до ночного
+    полного среза не найдётся ни поиском, ни при сопоставлении — и вторая
+    строка того же контейнера завела бы его повторно.
+
+    Существующую строку не трогаем: перезапись обнулила бы настоящий остаток.
+    Остаток у новой карточки — ноль, и это правда: «Приёмка» ещё не проведена.
+    """
+    if not ms_id:
+        return
+    if await adb_core.fetchval("SELECT ms_id FROM ms_stock WHERE ms_id = $1", ms_id):
+        return
+    await adb_core.execute(
+        "INSERT INTO ms_stock (ms_id, name, folder_id, folder_name, unit, stock, "
+        "reserve, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        ms_id, name, None, None, unit or "шт", 0, 0, now_str(),
+    )
+
+
 def get_product(ms_id: str) -> dict | None:
     """Товар снапшота по ms_id → {ms_id, name, unit} или None."""
     with get_conn() as conn:
@@ -405,7 +556,26 @@ def get_categories() -> list[dict]:
 
 
 def get_counterparties(search: str | None = None, limit: int = 50) -> list[dict]:
-    if search:
+    """Контрагенты снапшота. Ищем и по названию, и по ТЕЛЕФОНУ.
+
+    Телефон нужен потому, что клиента чаще помнят по номеру, чем по тому, как он
+    записан в МойСклад («ООО Бахор Савдо» против «Азиз»). Сравниваем по цифрам:
+    в МС номер лежит свободным текстом со скобками, дефисами и подписями вроде
+    «раб.», и поиск по сырой строке не находит ничего.
+    """
+    digits = "".join(ch for ch in (search or "") if ch.isdigit())
+    if search and digits and len(digits) >= 4:
+        # По номеру ищем без разделителей с обеих сторон: колонка чистится
+        # выражением, индекса по ней нет и быть не может (колонку не добавить),
+        # но контрагентов тысячи — полный скан здесь дешевле лишней таблицы.
+        sql = (
+            "SELECT ms_id, name, phone, balance_cents FROM ms_counterparties "
+            "WHERE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(phone,''), "
+            "' ', ''), '-', ''), '(', ''), ')', ''), '+', '') LIKE ? "
+            "OR LOWER(name) LIKE ? ORDER BY name LIMIT ?"
+        )
+        args = (f"%{digits}%", f"%{search.lower()}%", limit)
+    elif search:
         sql = (
             "SELECT ms_id, name, phone, balance_cents FROM ms_counterparties "
             "WHERE LOWER(name) LIKE ? ORDER BY name LIMIT ?"
@@ -418,6 +588,29 @@ def get_counterparties(search: str | None = None, limit: int = 50) -> list[dict]
         cur = get_cursor(conn)
         cur.execute(q(sql), args)
         return [dict(r) for r in cur.fetchall()]
+
+
+async def remember_counterparty(ms_id: str, *, name: str, phone: str | None = None) -> None:
+    """Положить только что созданного контрагента в снапшот.
+
+    Тот же приём, что и с товаром (`remember_product`): справочник обновляется
+    раз в сутки, и контрагент, заведённый минуту назад из карточки лида, до
+    ночной синхронизации не нашёлся бы ни поиском, ни при привязке — и его
+    завели бы второй раз.
+
+    Существующую строку не трогаем: перезапись стёрла бы баланс взаиморасчётов.
+    """
+    if not ms_id:
+        return
+    if await adb_core.fetchval(
+        "SELECT ms_id FROM ms_counterparties WHERE ms_id = $1", ms_id
+    ):
+        return
+    await adb_core.execute(
+        "INSERT INTO ms_counterparties (ms_id, name, phone, href, balance_cents, "
+        "updated_at) VALUES ($1, $2, $3, $4, $5, $6)",
+        ms_id, name, phone or "", "", 0, now_str(),
+    )
 
 
 def get_counterparty(ms_id: str) -> dict | None:

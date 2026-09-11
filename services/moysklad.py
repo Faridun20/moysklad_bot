@@ -4,6 +4,7 @@
 
 import asyncio
 import functools
+from collections import deque
 import json as _json
 import logging
 import time
@@ -74,7 +75,11 @@ async def get_session() -> aiohttp.ClientSession:
     if _session is None or _session.closed:
         async with _session_lock:
             if _session is None or _session.closed:
-                connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+                # MS-2: документация МойСклад — не более 5 параллельных
+                # запросов от пользователя и 20 от аккаунта. limit=20 равнялся
+                # лимиту ВСЕГО аккаунта, то есть один наш процесс мог занять
+                # его целиком (а процессов два: бот и webapp).
+                connector = aiohttp.TCPConnector(limit=_HTTP_CONCURRENCY, ttl_dns_cache=300)
                 _session = aiohttp.ClientSession(
                     connector=connector,
                     timeout=_HTTP_TIMEOUT,
@@ -103,6 +108,34 @@ _RETRY_BASE_DELAY = 0.5  # сек, удваивается на каждой по
 # 429 — rate limit; 5xx — временный сбой на стороне МойСклад
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
 
+# MS-1: реальные заголовки лимитов у МойСклад — свои, не стандартный
+# Retry-After (его сервер не присылает вовсе, поэтому старая ветка
+# float(Retry-After) была мёртвой и всегда работал экспоненциальный fallback).
+_H_RETRY_AFTER = "X-Lognex-Retry-After"  # мс до сброса
+_H_RESET = "X-Lognex-Reset"  # мс до сброса (0 — ограничений нет)
+_H_REMAINING = "X-RateLimit-Remaining"  # сколько запросов осталось до 429
+
+# Коды ошибок 429 различаются по смыслу, и лечатся по-разному:
+_ERR_RATE = 1049  # превышен ТЕМП — ждать по заголовку и повторить
+_ERR_PARALLEL = 1073  # превышена ПАРАЛЛЕЛЬНОСТЬ — ожидание не помогает,
+#                       помогает только меньше одновременных запросов
+_PARALLEL_RETRY_DELAY = 0.2  # параллельность освобождается за время in-flight
+
+# MS-2: бюджет запросов у пользовательского токена (наш случай — токен получен
+# в личном кабинете, а не токен решения). Вес запроса растёт по расписанию:
+#   сейчас (с 12.05.2026) — вес 2: 22 запроса / 3 с ≈ 7,3 в секунду
+#   с 01.09.2026          — вес 3: 15 запросов / 3 с ≈ 5,0 в секунду
+#   с 01.12.2026          — вес 4: 11 запросов / 3 с ≈ 3,7 в секунду
+# Отдельно действует лимит параллельности: 5 запросов от пользователя, 20 от
+# аккаунта. Ставим 4, а не 5: на один аккаунт работают ДВА процесса (бот и
+# webapp) плюс cron'ы, и каждый со своим семафором.
+_MAX_RETRY_DELAY = 10.0  # потолок паузы по заголовку — не вешаем воркер
+_MAX_PROACTIVE_PAUSE = 0.5  # упреждающая пауза: тормозим, но не стоим
+_REMAINING_SOFT_FLOOR = 1  # X-RateLimit-Remaining ≤ этого → притормаживаем
+
+_MS_PARALLEL_LIMIT = 4
+_HTTP_CONCURRENCY = 8  # пул соединений на процесс: вдвое ниже лимита аккаунта
+
 
 class _CircuitBreaker:
     """Простой circuit breaker для МойСклад API.
@@ -112,14 +145,46 @@ class _CircuitBreaker:
     защищает event loop от накапливающихся таймаутов (30с каждый) при
     длительном outage МойСклад. После HALF_OPEN_AFTER секунд переходим
     в half-open и делаем один пробный запрос. Если успех — закрываем.
+
+    MS-1: одного счётчика «подряд» мало. Сценарий «каждый третий запрос —
+    429» его не открывает никогда (успех сбрасывает счётчик), но именно он
+    уводит аккаунт в автоотключение: больше 200 отказов в минуту в течение
+    часа — и доступ к API отключают до обращения в поддержку. Поэтому
+    отдельно считаем ДОЛЮ 429 в скользящем окне.
     """
 
     OPEN_AFTER_FAILS = 5
     HALF_OPEN_AFTER = 60.0  # секунд
+    WINDOW_SEC = 300.0  # окно наблюдения за долей 429
+    WINDOW_MIN_CALLS = 20  # меньше — статистики нет, не судим
+    WINDOW_RATE_LIMIT_SHARE = 0.3  # доля 429, после которой тормозим сами
 
     def __init__(self) -> None:
         self._fails = 0
         self._opened_at: float | None = None
+        self._window: deque[tuple[float, bool]] = deque()  # (когда, это_429)
+
+    def _prune(self, now: float) -> None:
+        while self._window and now - self._window[0][0] > self.WINDOW_SEC:
+            self._window.popleft()
+
+    def record_call(self, rate_limited: bool) -> None:
+        """Учесть исход запроса для оценки доли 429 в окне."""
+        now = time.monotonic()
+        self._window.append((now, rate_limited))
+        self._prune(now)
+        if self._opened_at is not None or len(self._window) < self.WINDOW_MIN_CALLS:
+            return
+        limited = sum(1 for _, rl in self._window if rl)
+        share = limited / len(self._window)
+        if share >= self.WINDOW_RATE_LIMIT_SHARE:
+            self._opened_at = now
+            logger.error(
+                "МойСклад circuit breaker ОТКРЫТ: %d%% запросов за %.0f мин упёрлись "
+                "в лимит (%d из %d). Продолжать — значит получить автоотключение "
+                "аккаунта от API.",
+                round(share * 100), self.WINDOW_SEC / 60, limited, len(self._window),
+            )
 
     def _half_open(self) -> bool:
         """Открыт, но таймаут прошёл — пора пропустить один пробный запрос."""
@@ -138,6 +203,7 @@ class _CircuitBreaker:
     def record_success(self) -> None:
         self._fails = 0
         self._opened_at = None
+        self._window.clear()
 
     def record_failure(self) -> None:
         self._fails += 1
@@ -195,6 +261,56 @@ async def find_by_sync_id(entity: str, sync_id: str) -> str | None:
     return None
 
 
+async def _rate_limit_code(resp: aiohttp.ClientResponse) -> int | None:
+    """Код ошибки из тела 429: 1049 — темп, 1073 — параллельность.
+
+    Читаем best-effort: тело 429 маленькое, но если оно не JSON (прокси,
+    HTML-заглушка), молча возвращаем None и лечим как обычный темп.
+    """
+    try:
+        body = await resp.json(content_type=None)
+    except Exception:  # noqa: BLE001 — диагностика не должна ломать ретрай
+        return None
+    errors = (body or {}).get("errors") or []
+    if errors and errors[0].get("code") is not None:
+        try:
+            return int(errors[0]["code"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _retry_delay(headers, attempt: int) -> float:
+    """Сколько ждать перед повтором.
+
+    Приоритет — заголовки МойСклад (в МИЛЛИсекундах), а не стандартный
+    Retry-After: его сервер не присылает, из-за чего прежняя ветка
+    `float(Retry-After)` была мёртвой и всегда работал слепой экспоненциальный
+    fallback. X-Lognex-Reset=0 означает «ограничений нет» — не пауза.
+    """
+    for name in (_H_RETRY_AFTER, _H_RESET):
+        raw = (headers.get(name) or "").strip()
+        if raw.isdigit() and int(raw) > 0:
+            return min(int(raw) / 1000.0, _MAX_RETRY_DELAY)
+    return _RETRY_BASE_DELAY * (2**attempt)
+
+
+def _proactive_pause(headers) -> float:
+    """Пауза ДО того, как упрёмся в 429.
+
+    X-RateLimit-Remaining приходит и на успешных ответах. Когда бюджет
+    почти исчерпан, дешевле подождать миллисекунды здесь, чем получить 429,
+    отретраить и приблизить аккаунт к автоотключению.
+    """
+    raw = (headers.get(_H_REMAINING) or "").strip()
+    if not raw.isdigit() or int(raw) > _REMAINING_SOFT_FLOOR:
+        return 0.0
+    reset = (headers.get(_H_RESET) or "").strip()
+    if reset.isdigit() and int(reset) > 0:
+        return min(int(reset) / 1000.0, _MAX_PROACTIVE_PAUSE)
+    return _MAX_PROACTIVE_PAUSE
+
+
 async def ms_get(
     path: str, params: dict | None = None, session: aiohttp.ClientSession | None = None
 ):
@@ -213,26 +329,41 @@ async def ms_get(
     for attempt in range(_MAX_RETRIES):
         try:
             async with sess.get(url, params=params) as resp:
+                if resp.status == 429:
+                    _circuit.record_call(rate_limited=True)
                 if resp.status in _RETRY_STATUSES and attempt < _MAX_RETRIES - 1:
-                    # МойСклад возвращает Retry-After для 429 — уважаем его
-                    retry_after = resp.headers.get("Retry-After")
-                    delay = (
-                        float(retry_after)
-                        if retry_after and retry_after.isdigit()
-                        else _RETRY_BASE_DELAY * (2**attempt)
-                    )
-                    logger.warning(
-                        "MS %s → %s, retry %d/%d через %.1fs",
-                        path,
-                        resp.status,
-                        attempt + 1,
-                        _MAX_RETRIES,
-                        delay,
-                    )
+                    code = await _rate_limit_code(resp) if resp.status == 429 else None
+                    if code == _ERR_PARALLEL:
+                        # Ожидание тут не лечит: лимит на ОДНОВРЕМЕННЫЕ запросы,
+                        # он освобождается по мере завершения in-flight. Ждём
+                        # чуть-чуть и пишем отдельный лог — если это повторяется,
+                        # правильный ответ не «ждать дольше», а снизить
+                        # _MS_PARALLEL_LIMIT (MS-2).
+                        delay = _PARALLEL_RETRY_DELAY
+                        logger.warning(
+                            "MS %s → 429/1073: превышена ПАРАЛЛЕЛЬНОСТЬ (лимит 5 на "
+                            "пользователя). Снижайте конкурентность, backoff не поможет.",
+                            path,
+                        )
+                    else:
+                        delay = _retry_delay(resp.headers, attempt)
+                        logger.warning(
+                            "MS %s → %s%s, retry %d/%d через %.1fs",
+                            path,
+                            resp.status,
+                            f"/{code}" if code else "",
+                            attempt + 1,
+                            _MAX_RETRIES,
+                            delay,
+                        )
                     await asyncio.sleep(delay)
                     continue
                 resp.raise_for_status()
                 _circuit.record_success()
+                pause = _proactive_pause(resp.headers)
+                if pause:
+                    logger.debug("MS %s: бюджет запросов на исходе, пауза %.2fs", path, pause)
+                    await asyncio.sleep(pause)
                 return await resp.json()
         except aiohttp.ClientResponseError as e:
             # T2.9: raise_for_status() бросает ClientResponseError, а раньше
@@ -555,11 +686,14 @@ async def get_shipment(demand_id: str) -> dict | None:
 
 # Параллельно тянем позиции 15+ отгрузок (asyncio.gather в get_sales_stats /
 # get_employee_stats). Без семафора это залп 15 одновременных запросов,
-# стабильно бьющий 429-rate-limit МС → retry-chain 0.5/1.0/2.0с цепочкой и
-# заметная latency у /api/analytics. Семафор держит ≤8 конкурентных HTTP
-# (Connector limit=20 выдержит; МС rate ~45req/s). На холодном кэше с 30
-# fan-out: ceil(30/8)*RTT ≈ 800мс — приемлемо. Кэш-хит сюда не доходит
-# (декоратор отдаёт до тела).
+# стабильно бьющий 429 МС → retry-chain 0.5/1.0/2.0с цепочкой и заметная
+# latency у /api/analytics.
+#
+# MS-2: было 8 — выше лимита параллельности МойСклад (5 на пользователя), то
+# есть часть 429 приходила с кодом 1073, который ожиданием не лечится вовсе.
+# Теперь предел общий (_MS_PARALLEL_LIMIT=4). На холодном кэше с 30 fan-out:
+# ceil(30/4)*RTT ≈ 1,6 с — медленнее, но без гарантированных отказов.
+# Кэш-хит сюда не доходит (декоратор отдаёт до тела).
 #
 # Lazy-init по loop-id: модульный Semaphore() лениво-binds к first loop
 # при contention; короткоживущие asyncio.run() в CLI + per-test loops в
@@ -567,7 +701,7 @@ async def get_shipment(demand_id: str) -> dict | None:
 # когда-нибудь enqueued. Helper отдаёт свежий семафор для каждого loop'а,
 # проблему обходит начисто (precedent — _session_lock — пока пронесло).
 _POSITIONS_SEM_BY_LOOP: dict[int, asyncio.Semaphore] = {}
-_POSITIONS_CONCURRENCY_LIMIT = 8
+_POSITIONS_CONCURRENCY_LIMIT = _MS_PARALLEL_LIMIT
 
 
 def _get_positions_semaphore() -> asyncio.Semaphore:

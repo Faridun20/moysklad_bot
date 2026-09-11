@@ -175,6 +175,9 @@ def test_co_update_no_drift_when_sum_matches(isolated_db, monkeypatch):
 
 
 def _mock_ms_get(monkeypatch, behaviour):
+    """Точечный мок `ms_get` — для вебхук-хендлеров, которые читают ОДИН
+    документ (`entity/customerorder/{id}`). Реконсиляция с MS-4 работает
+    иначе, для неё есть `_mock_ms_list`."""
     import services.moysklad as ms
 
     calls = []
@@ -187,18 +190,40 @@ def _mock_ms_get(monkeypatch, behaviour):
     return calls
 
 
+def _mock_ms_list(monkeypatch, alive: set[str]):
+    """Мок списочного запроса реконсиляции (MS-4).
+
+    Реконсиляция больше не спрашивает документы по одному: она шлёт
+    `entity/<type>?filter=id=…;id=…` и считает удалённым всё, чего нет в
+    ответе. Мок повторяет этот протокол — отдаёт только те id, что переданы
+    в `alive`. Возвращает список запрошенных путей, чтобы тесты могли
+    проверить, что лишних вызовов нет.
+    """
+    import services.moysklad as ms
+
+    calls = []
+
+    async def _ms_get(path, params=None):
+        calls.append(path)
+        asked = [
+            part.split("=", 1)[1]
+            for part in ((params or {}).get("filter") or "").split(";")
+            if part.startswith("id=")
+        ]
+        return {"rows": [{"id": i} for i in asked if i in alive]}
+
+    monkeypatch.setattr(ms, "ms_get", _ms_get)
+    return calls
+
+
 def test_reconcile_cancels_deleted_co(isolated_db, monkeypatch):
-    import aiohttp
 
     import tasks.run_ms_reconcile as rec
 
     db = isolated_db
     _mock_notify(monkeypatch)
 
-    async def _b(path):
-        raise aiohttp.ClientResponseError(None, (), status=404)
-
-    _mock_ms_get(monkeypatch, _b)
+    _mock_ms_list(monkeypatch, alive=set())
     oid = _mk_order(db, "approved", "CO-9")
 
     rc = asyncio.run(rec.main())
@@ -210,17 +235,13 @@ def test_reconcile_marks_deleted_shipped(isolated_db, monkeypatch):
     """Этап 1: реконсайл проверяет НЕ только approved. Shipped-заказ, чей CO удалён
     в МС (пропущенный вебхук), помечается ms_deleted_at — уходит из аналитики, но
     статус/деньги не трогаем. После обработки выпадает из набора реконсиляции."""
-    import aiohttp
 
     import tasks.run_ms_reconcile as rec
 
     db = isolated_db
     _mock_notify(monkeypatch)
 
-    async def _b(path):
-        raise aiohttp.ClientResponseError(None, (), status=404)
-
-    _mock_ms_get(monkeypatch, _b)
+    _mock_ms_list(monkeypatch, alive=set())
     oid = _mk_order(db, "shipped", "CO-SHIP")
 
     rc = asyncio.run(rec.main())
@@ -239,10 +260,7 @@ def test_reconcile_keeps_existing_co(isolated_db, monkeypatch):
     db = isolated_db
     _mock_notify(monkeypatch)
 
-    async def _b(path):
-        return {"id": "CO-10"}  # существует
-
-    _mock_ms_get(monkeypatch, _b)
+    _mock_ms_list(monkeypatch, alive={"CO-10"})
     oid = _mk_order(db, "approved", "CO-10")
 
     rc = asyncio.run(rec.main())
@@ -253,10 +271,7 @@ def test_reconcile_keeps_existing_co(isolated_db, monkeypatch):
 def test_reconcile_empty_makes_no_ms_calls(isolated_db, monkeypatch):
     import tasks.run_ms_reconcile as rec
 
-    async def _b(path):
-        return {}
-
-    calls = _mock_ms_get(monkeypatch, _b)
+    calls = _mock_ms_list(monkeypatch, alive=set())
     # Нет заказов со ссылками на МС (ни CO, ни demand).
     rc = asyncio.run(rec.main())
     assert rc == 0
@@ -280,17 +295,13 @@ def _mk_demand_order(db, status, demand_id, agent="Client"):
 def test_reconcile_marks_deleted_demand(isolated_db, monkeypatch):
     """Удалили в МС именно отгрузку (а заказ покупателя отсутствует/не связан):
     demand-документ 404 → заказ помечается ms_deleted_at и выпадает из набора."""
-    import aiohttp
 
     import tasks.run_ms_reconcile as rec
 
     db = isolated_db
     _mock_notify(monkeypatch)
 
-    async def _b(path):
-        raise aiohttp.ClientResponseError(None, (), status=404)
-
-    _mock_ms_get(monkeypatch, _b)
+    _mock_ms_list(monkeypatch, alive=set())
     oid = _mk_demand_order(db, "shipped", "DM-9")
 
     rc = asyncio.run(rec.main())
@@ -304,7 +315,6 @@ def test_reconcile_marks_deleted_demand(isolated_db, monkeypatch):
 def test_reconcile_resets_deleted_paymentin(isolated_db, monkeypatch):
     """WP-17: paymentin удалён в МС (пропущенный paymentin.DELETE-вебхук) →
     reset_payment_ms_sync; ссылка снята, статус 'deleted_in_ms', retry пересоздаст."""
-    import aiohttp
 
     import tasks.run_ms_reconcile as rec
 
@@ -320,10 +330,7 @@ def test_reconcile_resets_deleted_paymentin(isolated_db, monkeypatch):
         )
         conn.commit()
 
-    async def _b(path):
-        raise aiohttp.ClientResponseError(None, (), status=404)
-
-    _mock_ms_get(monkeypatch, _b)
+    _mock_ms_list(monkeypatch, alive=set())
     rc = asyncio.run(rec.main())
     assert rc == 0
     with db.get_conn() as conn:
@@ -339,19 +346,13 @@ def test_reconcile_resets_deleted_paymentin(isolated_db, monkeypatch):
 def test_reconcile_demand_deleted_while_co_alive(isolated_db, monkeypatch):
     """Заказ покупателя в МС жив, но отгрузка удалена → заказ всё равно помечается
     ms_deleted_at (раньше reconcile проверял только CO и пропускал такой случай)."""
-    import aiohttp
 
     import tasks.run_ms_reconcile as rec
 
     db = isolated_db
     _mock_notify(monkeypatch)
 
-    async def _b(path):
-        if "/demand/" in path:
-            raise aiohttp.ClientResponseError(None, (), status=404)
-        return {"id": "CO-X"}  # заказ покупателя ещё существует
-
-    _mock_ms_get(monkeypatch, _b)
+    _mock_ms_list(monkeypatch, alive={"CO-X"})  # CO жив, DM-X — нет
     db.set_role(1, "m", "M", "manager")
     oid = db.create_order(1, "M", "")
     db.update_order_agent(oid, "A-1", "Client")

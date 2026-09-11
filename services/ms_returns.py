@@ -24,7 +24,7 @@ import logging
 from services import database as db
 from services import ms_demand
 from services.metrics import measure_async
-from services.moysklad import MS_BASE, get_session, redact_ms_error
+from services.moysklad import MS_BASE, get_session, order_sync_id, redact_ms_error
 from utils.helpers import extract_id_from_href, utc_now
 
 logger = logging.getLogger(__name__)
@@ -78,8 +78,16 @@ async def create_salesreturn(return_id: int) -> dict:
             skipped,
         )
 
+    # MS-8: детерминированный syncId — «внешний ключ» документа на стороне МС.
+    # Без него идемпотентности не было вовсе: повторный POST создавал ВТОРОЙ
+    # возврат, который двигал склад и баланс контрагента, а спасала лишь
+    # компенсация (создать → заметить проигранную гонку → удалить). Между
+    # POST и записью moysklad_return_id процесс мог упасть — и тогда дубль
+    # оставался жить, а гонка его уже не ловила. Теперь МС сам вернёт ранее
+    # созданный документ.
     payload = {
         "name": f"Возврат по заказу #{order['id']} (бот)",
+        "syncId": order_sync_id("salesreturn", return_id),
         "organization": _meta(ctx["org_meta"]["href"], "organization"),
         "agent": _meta(f"{MS_BASE}/entity/counterparty/{order['agent_id']}", "counterparty"),
         "store": _meta(ctx["store_meta"]["href"], "store"),
@@ -106,25 +114,16 @@ async def create_salesreturn(return_id: int) -> dict:
             won = await db.set_return_ms_id(return_id, ms_id)  # «выиграл ли гонку»
             if not won:
                 # Гонку проиграли: другой параллельный create_salesreturn уже
-                # записал id. Наш только что созданный документ в МС — orphan-дубль
-                # (склад и баланс контрагента задвоились бы) → удаляем best-effort
-                # (WP-14: SECURITY.md RACE-3 для этого и вернул bool).
-                logger.warning(
-                    "salesreturn возврата #%s: проиграли гонку set_return_ms_id — "
-                    "удаляю orphan-документ %s в МС",
+                # записал id. Удалять документ больше НЕ нужно (MS-8): с syncId
+                # оба вызова получают от МойСклад ОДИН И ТОТ ЖЕ документ, дубля
+                # физически нет. Прежняя компенсация (создать → удалить) была
+                # обходом отсутствующей идемпотентности и сама могла оставить
+                # мусор, если DELETE не проходил.
+                logger.info(
+                    "salesreturn возврата #%s: id уже записан параллельным вызовом "
+                    "(syncId вернул тот же документ %s)",
                     return_id, ms_id,
                 )
-                try:
-                    async with sess.delete(f"{MS_BASE}/entity/salesreturn/{ms_id}") as dresp:
-                        if dresp.status >= 400:
-                            logger.error(
-                                "salesreturn orphan-delete %s: HTTP %s", ms_id, dresp.status
-                            )
-                except Exception as de:  # noqa: BLE001 — удаление best-effort
-                    logger.warning(
-                        "salesreturn orphan-delete %s не удался: %s",
-                        ms_id, redact_ms_error(str(de)[:200]),
-                    )
                 fresh = await db.get_return(return_id)
                 winner_id = (fresh or {}).get("moysklad_return_id") or ms_id
                 return {"ok": True, "ms_id": winner_id, "skipped": skipped, "adopted": True}

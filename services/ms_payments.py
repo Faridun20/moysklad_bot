@@ -37,7 +37,7 @@ from services.database import (
     claim_payment_for_ms_sync,
 )
 from services.metrics import measure_async
-from services.moysklad import MS_BASE, get_session, ms_get, redact_ms_error
+from services.moysklad import MS_BASE, get_session, ms_get, order_sync_id, redact_ms_error
 from services import money
 
 logger = logging.getLogger(__name__)
@@ -156,9 +156,9 @@ async def create_paymentin_for_payment(payment_id: int) -> dict:
     # платежа. Даёт МС-стороннюю дедупликацию и позволяет подхватить уже
     # созданный документ, если процесс упал между прошлым POST и локальной
     # записью ms_paymentin_id (иначе reset_stale → повторный POST → дубль).
-    import uuid as _uuid
-
-    sync_id = str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"bot-paymentin-{payment_id}"))
+    # MS-8 (гигиена): считаем общим хелпером, а не локальной копией формулы —
+    # разъехавшись, они дали бы разные syncId и дубли документов.
+    sync_id = order_sync_id("paymentin", payment_id)
 
     payload: dict[str, Any] = {
         "name": f"Платёж #{payment_id} по заказу #{order['id']} (бот)",

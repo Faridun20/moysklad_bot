@@ -733,6 +733,277 @@ def _create_tables():
                 migrated_at TEXT NOT NULL,
                 PRIMARY KEY (entity_type, ms_id)
             )""",
+            # ── Учёт экскаваторов (волна 4, T4.1) ────────────────────────────
+            #
+            # Отличие от остальной схемы: здесь есть FOREIGN KEY. Связи строго
+            # иерархические (часы/фото/сделки не существуют без машины), каскад
+            # избавляет от ручной уборки. На SQLite (тесты) FK по умолчанию не
+            # энфорсятся, поэтому сервис всё равно чистит детей явно — иначе
+            # поведение разъезжалось бы между тестами и продом.
+            #
+            # cost_cents (себестоимость) видит только boss/admin — срез делает
+            # слой сервиса, не фронт.
+            f"""CREATE TABLE IF NOT EXISTS machines (
+                id               {id_type},
+                vin              TEXT NOT NULL UNIQUE,
+                name             TEXT NOT NULL,
+                brand            TEXT,
+                model            TEXT,
+                year             INTEGER,
+                hours            INTEGER,
+                hours_updated_at TEXT,
+                price_cents      BIGINT,
+                cost_cents       BIGINT,
+                currency         TEXT NOT NULL DEFAULT 'USD',
+                status           TEXT NOT NULL DEFAULT 'in_transit',
+                eta_date         TEXT,
+                container_no     TEXT,
+                location         TEXT,
+                notes            TEXT,
+                ms_product_id    TEXT,
+                created_by       BIGINT NOT NULL,
+                created_at       TEXT,
+                updated_at       TEXT,
+                CONSTRAINT machines_status_chk CHECK (status IN
+                    ('in_transit','in_stock','reserved','sold','on_credit','archived'))
+            )""",
+            # Каждое показание моточасов — отдельной строкой (видна динамика и
+            # ловятся опечатки); в machines.hours дублируется последнее.
+            f"""CREATE TABLE IF NOT EXISTS machine_hours (
+                id          {id_type},
+                machine_id  INTEGER NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+                hours       INTEGER NOT NULL CHECK (hours >= 0),
+                recorded_by BIGINT NOT NULL,
+                recorded_at TEXT
+            )""",
+            # Файлы не скачиваем — на Railway эфемерная ФС; храним tg_file_id.
+            # file_unique_id обязателен (волна 7): tg_file_id привязан к паре
+            # «бот + сервер Bot API», и переезд на локальный Bot API server его
+            # обнулит. file_unique_id переживает переезд и показывает, какие
+            # записи осиротели, — поэтому NOT NULL, а не опционально.
+            f"""CREATE TABLE IF NOT EXISTS machine_photos (
+                id             {id_type},
+                machine_id     INTEGER NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+                tg_file_id     TEXT NOT NULL,
+                file_unique_id TEXT NOT NULL,
+                caption        TEXT,
+                sort_order     INTEGER NOT NULL DEFAULT 0,
+                uploaded_by    BIGINT NOT NULL,
+                uploaded_at    TEXT,
+                UNIQUE (machine_id, file_unique_id)
+            )""",
+            # Сделка по машине. order_id/agent_ms_id — необязательная связь с
+            # заказом и контрагентом МС: продажа техники может идти и мимо них.
+            f"""CREATE TABLE IF NOT EXISTS machine_deals (
+                id             {id_type},
+                machine_id     INTEGER NOT NULL REFERENCES machines(id),
+                kind           TEXT NOT NULL CHECK (kind IN ('sale','credit')),
+                price_cents    BIGINT NOT NULL,
+                currency       TEXT NOT NULL DEFAULT 'USD',
+                buyer_name     TEXT NOT NULL,
+                buyer_phone    TEXT,
+                buyer_passport TEXT,
+                buyer_note     TEXT,
+                order_id       BIGINT,
+                agent_ms_id    TEXT,
+                sold_at        TEXT,
+                due_date       TEXT,
+                closed_at      TEXT,
+                created_by     BIGINT NOT NULL
+            )""",
+            # График рассрочки. Первоначальный взнос — та же таблица, `seq = 0`
+            # и `paid_at` сразу: деньги уже получены, и отдельная колонка в
+            # `machine_deals` описывала бы ровно то же самое вторым способом
+            # (а заодно не доехала бы до существующей таблицы на проде —
+            # инкрементальных миграций в проекте нет).
+            f"""CREATE TABLE IF NOT EXISTS machine_deal_payments (
+                id            {id_type},
+                deal_id       INTEGER NOT NULL REFERENCES machine_deals(id),
+                seq           INTEGER NOT NULL,
+                due_date      TEXT NOT NULL,
+                amount_cents  BIGINT NOT NULL,
+                paid_at       TEXT,
+                paid_by       BIGINT,
+                notified_at   TEXT,
+                created_at    TEXT,
+                UNIQUE (deal_id, seq)
+            )""",
+            # Фактические поступления по рассрочке. Отдельно от графика, потому
+            # что клиент платит не «платёж №3», а деньги: в один месяц больше,
+            # в другой меньше. График — план, поступления — факт, и один к
+            # одному они не ложатся. Покрытие графика считается распределением
+            # поступлений по порядку (`services.machines.allocate_receipts`).
+            f"""CREATE TABLE IF NOT EXISTS machine_payment_receipts (
+                id            {id_type},
+                deal_id       INTEGER NOT NULL REFERENCES machine_deals(id),
+                amount_cents  BIGINT NOT NULL,
+                received_at   TEXT NOT NULL,
+                received_by   BIGINT,
+                note          TEXT,
+                created_at    TEXT
+            )""",
+            # История публикаций в канал. Нужна, чтобы один и тот же контейнер
+            # не ушёл в канал дважды — второй раз обычно потому, что первый
+            # забыли.
+            f"""CREATE TABLE IF NOT EXISTS channel_posts (
+                id         {id_type},
+                kind       TEXT NOT NULL,
+                ref        TEXT,
+                message_id BIGINT,
+                posted_by  BIGINT,
+                posted_at  TEXT,
+                created_at TEXT
+            )""",
+            # Фотографии товаров каталога. Как у техники: храним только
+            # идентификаторы Telegram, файл живёт там. `file_unique_id`
+            # обязателен — он переживает смену сервера Bot API.
+            f"""CREATE TABLE IF NOT EXISTS product_photos (
+                id             {id_type},
+                ms_id          TEXT NOT NULL,
+                tg_file_id     TEXT NOT NULL,
+                file_unique_id TEXT NOT NULL,
+                caption        TEXT,
+                uploaded_by    BIGINT,
+                uploaded_at    TEXT,
+                UNIQUE (ms_id, file_unique_id)
+            )""",
+            # Подключение бота к личному аккаунту менеджера (Telegram Business).
+            # Нужно, чтобы по `business_connection_id` из апдейта понять, чей
+            # это чат: сам апдейт менеджера не называет.
+            """CREATE TABLE IF NOT EXISTS business_connections (
+                connection_id TEXT PRIMARY KEY,
+                manager_id    BIGINT NOT NULL,
+                user_chat_id  BIGINT,
+                is_enabled    INTEGER NOT NULL DEFAULT 1,
+                can_read      INTEGER NOT NULL DEFAULT 0,
+                connected_at  TEXT,
+                updated_at    TEXT
+            )""",
+            # Клиент, написавший менеджеру. Один ряд на человека, а не на
+            # переписку: вопрос «сколько клиентов написали» иначе двоился бы,
+            # если тот же человек написал двум менеджерам.
+            #
+            # ТЕКСТОВ СООБЩЕНИЙ ЗДЕСЬ НЕТ И НЕ ДОЛЖНО БЫТЬ. Для воронки нужны
+            # только «кто, когда, в какую сторону»; хранить переписку клиентов —
+            # ответственность без выгоды.
+            f"""CREATE TABLE IF NOT EXISTS leads (
+                id              {id_type},
+                tg_user_id      BIGINT NOT NULL UNIQUE,
+                manager_id      BIGINT,
+                username        TEXT,
+                display_name    TEXT,
+                status          TEXT NOT NULL DEFAULT 'new'
+                                CHECK (status IN ('new','won','lost')),
+                agent_ms_id     TEXT,
+                first_seen_at   TEXT,
+                last_inbound_at TEXT,
+                last_outbound_at TEXT,
+                first_reply_at  TEXT,
+                created_at      TEXT,
+                updated_at      TEXT
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS lead_events (
+                id         {id_type},
+                lead_id    INTEGER NOT NULL REFERENCES leads(id),
+                kind       TEXT NOT NULL,
+                manager_id BIGINT,
+                at         TEXT NOT NULL,
+                created_at TEXT
+            )""",
+            # Звонки. Отдельная таблица, а не колонки в `leads`: у позвонившего
+            # клиента нет `tg_user_id`, а он там NOT NULL UNIQUE — и ослабить
+            # его на проде нельзя (инкрементальных миграций нет).
+            #
+            # `lead_id` НЕОБЯЗАТЕЛЕН — это и есть решение. Звонок от человека,
+            # которого нет в Telegram, — законное самостоятельное состояние:
+            # он живёт в списке «перезвонить», а не притворяется перепиской.
+            # Привязка ставится руками, когда клиент напишет.
+            #
+            # `note` здесь ЗАКОНЕН, в отличие от `leads`: это заметка менеджера
+            # о собственном звонке, а не сохранённое чужое сообщение. Разница
+            # принципиальная — не переносить это послабление на переписку.
+            f"""CREATE TABLE IF NOT EXISTS lead_calls (
+                id           {id_type},
+                lead_id      INTEGER REFERENCES leads(id),
+                phone        TEXT,
+                phone_key    TEXT,
+                display_name TEXT,
+                direction    TEXT NOT NULL DEFAULT 'in'
+                             CHECK (direction IN ('in','out')),
+                source       TEXT,
+                interest     TEXT,
+                manager_id   BIGINT,
+                at           TEXT NOT NULL,
+                note         TEXT,
+                created_at   TEXT
+            )""",
+            # Причина отказа. Sidecar по образцу `container_supply`: в
+            # `lead_events` колонки под текст нет и появиться не может.
+            # Причина НЕОБЯЗАТЕЛЬНА — кнопку «Не купил» и так нажимают редко,
+            # и обязательное поле привело бы к тому, что её перестанут нажимать
+            # вовсе. Потерять сам факт отказа хуже, чем отказ без причины.
+            """CREATE TABLE IF NOT EXISTS lead_lost (
+                lead_id  INTEGER PRIMARY KEY REFERENCES leads(id),
+                reason   TEXT NOT NULL
+                         CHECK (reason IN ('price','no_stock','competitor',
+                                           'postponed','wrong_fit','no_answer','other')),
+                note     TEXT,
+                at       TEXT,
+                set_by   BIGINT
+            )""",
+            # Контейнеры в пути. Состав заводят при отправке («ожидалось»), при
+            # прибытии проставляют факт — расхождение видно сразу, а не после
+            # ручной сверки с накладной.
+            f"""CREATE TABLE IF NOT EXISTS containers (
+                id           {id_type},
+                number       TEXT NOT NULL UNIQUE,
+                status       TEXT NOT NULL DEFAULT 'in_transit'
+                             CHECK (status IN ('in_transit','arrived')),
+                eta_date     TEXT,
+                arrived_at   TEXT,
+                notes        TEXT,
+                created_by   BIGINT NOT NULL,
+                created_at   TEXT,
+                updated_at   TEXT
+            )""",
+            # Связь контейнера с МойСклад: поставщик (нужен «Приёмке») и id
+            # созданного документа. Отдельной таблицей, а не колонками в
+            # `containers`: инкрементальных миграций в проекте нет, и новая
+            # колонка не доехала бы до уже существующей таблицы на проде.
+            """CREATE TABLE IF NOT EXISTS container_supply (
+                container_id   INTEGER PRIMARY KEY REFERENCES containers(id),
+                supplier_ms_id TEXT,
+                supplier_name  TEXT,
+                ms_supply_id   TEXT,
+                synced_at      TEXT,
+                unmatched      TEXT,
+                updated_at     TEXT
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS container_items (
+                id            {id_type},
+                container_id  INTEGER NOT NULL REFERENCES containers(id),
+                name          TEXT NOT NULL,
+                unit          TEXT NOT NULL DEFAULT 'шт',
+                expected_qty  REAL NOT NULL DEFAULT 0,
+                arrived_qty   REAL,
+                note          TEXT,
+                created_at    TEXT
+            )""",
+            # Позиция приёмки ↔ карточка номенклатуры МойСклад. Пока связи не
+            # было, оприходование угадывало товар по названию — и «Кабель PV
+            # 0.6» из накладной не находил «Кабель PV 0,6» из каталога.
+            # Отдельная таблица, а не колонка в `container_items`:
+            # инкрементальных миграций в проекте нет, и колонка в уже
+            # существующую на проде таблицу просто не доехала бы.
+            # `container_id` дублируется намеренно — по нему состав чистится
+            # одним DELETE и его же видит сторож сирот (containers.CHILD_TABLES).
+            """CREATE TABLE IF NOT EXISTS container_item_links (
+                item_id      INTEGER PRIMARY KEY REFERENCES container_items(id),
+                container_id INTEGER NOT NULL REFERENCES containers(id),
+                ms_id        TEXT NOT NULL,
+                ms_name      TEXT,
+                created_at   TEXT
+            )""",
         ]
 
         # Создаём каждую таблицу в отдельной транзакции
@@ -860,6 +1131,40 @@ def _create_indexes():
             # (payment_type, paid_at, due_date) — запрос им не покрывался.
             "CREATE INDEX IF NOT EXISTS idx_orders_debt_lookup "
             "ON orders(payment_type, status, paid_confirmed_at)",
+            # ── Машины (T4.1) ────────────────────────────────────────────────
+            # Список машин всегда фильтруется по статусу (витрина «в наличии»,
+            # «в пути», архив).
+            "CREATE INDEX IF NOT EXISTS idx_machines_status ON machines(status)",
+            # История моточасов и сделок читается «последние сверху» по машине.
+            "CREATE INDEX IF NOT EXISTS idx_machine_hours_machine "
+            "ON machine_hours(machine_id, recorded_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_machine_deals_machine "
+            "ON machine_deals(machine_id, sold_at DESC)",
+            # График читается по сделке (карточка) и по сроку (ежедневный
+            # обход неоплаченных платежей в напоминалке).
+            "CREATE INDEX IF NOT EXISTS idx_machine_deal_payments_deal "
+            "ON machine_deal_payments(deal_id, seq)",
+            "CREATE INDEX IF NOT EXISTS idx_machine_deal_payments_due "
+            "ON machine_deal_payments(due_date)",
+            "CREATE INDEX IF NOT EXISTS idx_machine_receipts_deal "
+            "ON machine_payment_receipts(deal_id, received_at)",
+            # ── Контейнеры ───────────────────────────────────────────────────
+            # Воронка: список фильтруется по менеджеру и по последней
+            # активности, события читаются по лиду.
+            "CREATE INDEX IF NOT EXISTS idx_channel_posts_ref ON channel_posts(kind, ref)",
+            "CREATE INDEX IF NOT EXISTS idx_product_photos_ms ON product_photos(ms_id)",
+            "CREATE INDEX IF NOT EXISTS idx_leads_manager ON leads(manager_id)",
+            "CREATE INDEX IF NOT EXISTS idx_leads_last_inbound ON leads(last_inbound_at)",
+            "CREATE INDEX IF NOT EXISTS idx_lead_events_lead ON lead_events(lead_id, at)",
+            "CREATE INDEX IF NOT EXISTS idx_lead_events_at ON lead_events(at)",
+            # Непривязанные звонки — самый частый запрос экрана («кому
+            # перезвонить»), поэтому индекс именно по нему, а не по дате.
+            "CREATE INDEX IF NOT EXISTS idx_lead_calls_lead ON lead_calls(lead_id, at)",
+            "CREATE INDEX IF NOT EXISTS idx_lead_calls_at ON lead_calls(at)",
+            "CREATE INDEX IF NOT EXISTS idx_lead_calls_phone ON lead_calls(phone_key)",
+            "CREATE INDEX IF NOT EXISTS idx_containers_status ON containers(status)",
+            "CREATE INDEX IF NOT EXISTS idx_container_items_container "
+            "ON container_items(container_id, id)",
         ]
         for sql in snapshot_indexes:
             try:
@@ -956,6 +1261,7 @@ _DEFAULT_SETTINGS: dict[str, tuple] = {
     "return_deadline_days": (90, "Лимит на оформление возврата (дней с отгрузки)"),
     "auto_create_demand_on_approve": (True, "Создавать demand в МойСклад при approve"),
     "auto_ship_on_approve": (True, "Авто-переход в shipped сразу после approve"),
+    "machines_archive_days": (90, "Через сколько дней проданная техника уходит в архив"),
 }
 
 
@@ -1462,9 +1768,113 @@ async def get_orders_by_agent(agent_id: str, limit: int = 50) -> list[dict[str, 
                 "currency": r["currency"],
                 "created_at": r["created_at"],
                 "total_cents": int(total_cents),
+                # Состав заказа. Позиции уже загружены ради суммы — отдать их
+                # даром дешевле, чем заводить отдельную ручку: карточка клиента
+                # показывала «заказ на 25 000», но не ЧТО в нём, и ответить на
+                # «что он у нас берёт» было нечем.
+                "items": [
+                    {
+                        "name": it.get("product_name") or "—",
+                        "quantity": float(it.get("quantity", 0) or 0),
+                        "unit": it.get("unit") or "шт",
+                        "price_cents": _price_cents(it),
+                    }
+                    for it in items
+                ],
             }
         )
     return out
+
+
+async def get_agent_money_history(agent_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    """Движение денег ПО КОНКРЕТНОМУ клиенту: платежи, сдачи и возвраты.
+
+    Формат строки намеренно совпадает с `get_cash_history` (kind/amount/
+    currency/status/who/order_id/note/created_at) — карточка клиента рисует
+    ленту тем же фронтовым кодом, что и экран «Деньги», и добавление нового
+    вида движения не придётся делать дважды.
+
+    Что считается «платежом клиента»:
+      • payments по его заказам;
+      • сдачи наличных — в той части, что распределена на его заказы
+        (`cash_deposit_orders`): сдача может закрывать заказы разных клиентов,
+        и показывать её полную сумму в карточке одного было бы враньём;
+      • возвраты по его заказам — деньги, ушедшие обратно.
+
+    Заказы-фантомы (удалённые в МойСклад) исключены, как и в общей ленте:
+    иначе платёж виден в истории клиента, но не входит ни в один итог.
+    """
+    if not agent_id:
+        return []
+
+    pays = await adb_core.fetch(
+        "SELECT p.id, p.user_id, p.amount_cents, p.currency, p.status, p.comment, "
+        "p.order_id, p.created_at "
+        "FROM payments p JOIN orders o ON o.id = p.order_id "
+        "WHERE o.agent_id = $1 AND (o.ms_deleted_at IS NULL) "
+        "ORDER BY p.created_at DESC LIMIT $2",
+        agent_id, limit,
+    )
+    # Сумма — ровно та часть сдачи, что пришлась на заказы этого клиента.
+    deps = await adb_core.fetch(
+        "SELECT d.id, d.manager_id, d.status, d.reject_reason, d.created_at, "
+        "SUM(cdo.amount_allocated_cents) AS amount_cents "
+        "FROM cash_deposits d "
+        "JOIN cash_deposit_orders cdo ON cdo.deposit_id = d.id "
+        "JOIN orders o ON o.id = cdo.order_id "
+        "WHERE o.agent_id = $1 AND (o.ms_deleted_at IS NULL) "
+        "GROUP BY d.id, d.manager_id, d.status, d.reject_reason, d.created_at "
+        "ORDER BY d.created_at DESC LIMIT $2",
+        agent_id, limit,
+    )
+    rets = await adb_core.fetch(
+        "SELECT r.id, r.order_id, r.created_by, r.total_amount_cents, r.status, "
+        "r.reason, r.created_at, o.currency AS order_currency "
+        "FROM returns r JOIN orders o ON o.id = r.order_id "
+        "WHERE o.agent_id = $1 AND (o.ms_deleted_at IS NULL) "
+        "ORDER BY r.created_at DESC LIMIT $2",
+        agent_id, limit,
+    )
+
+    # get_all_users синхронный — через to_thread, чтобы не блокировать loop
+    # (тот же урок, что в get_cash_history, WP-25).
+    users = await asyncio.to_thread(get_all_users)
+    names = {u["user_id"]: u.get("full_name") or str(u["user_id"]) for u in users}
+
+    from config import BASE_CURRENCY
+
+    base_cur = (BASE_CURRENCY or "USD").upper()
+
+    rows: list[dict[str, Any]] = []
+    for p in pays:
+        rows.append({
+            "kind": "payment", "id": p["id"],
+            "amount": float(money.from_cents(int(p["amount_cents"] or 0))),
+            "currency": p.get("currency") or base_cur, "status": p["status"],
+            "who": names.get(p["user_id"], str(p["user_id"])),
+            "order_id": p.get("order_id"), "note": p.get("comment") or "",
+            "created_at": (p.get("created_at") or "")[:16],
+        })
+    for d in deps:
+        rows.append({
+            "kind": "deposit", "id": d["id"],
+            "amount": float(money.from_cents(int(d["amount_cents"] or 0))),
+            "currency": base_cur, "status": d["status"],
+            "who": names.get(d["manager_id"], str(d["manager_id"])),
+            "order_id": None, "note": d.get("reject_reason") or "",
+            "created_at": (d.get("created_at") or "")[:16],
+        })
+    for r in rets:
+        rows.append({
+            "kind": "return", "id": r["id"],
+            "amount": float(money.from_cents(int(r["total_amount_cents"] or 0))),
+            "currency": (r.get("order_currency") or base_cur), "status": r["status"],
+            "who": names.get(r["created_by"], str(r["created_by"])),
+            "order_id": r.get("order_id"), "note": r.get("reason") or "",
+            "created_at": (r.get("created_at") or "")[:16],
+        })
+    rows.sort(key=lambda x: x["created_at"], reverse=True)
+    return rows[:limit]
 
 
 async def get_clients_overview() -> list[dict[str, Any]]:

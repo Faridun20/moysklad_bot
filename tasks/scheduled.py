@@ -35,7 +35,7 @@ async def snapshot_refresh_task(bot: Bot):
     logger.info("snapshot_refresh_task запущен")
     last_reference_day = None
     last_stock_refresh = 0.0
-    STOCK_INTERVAL = 2 * 3600  # 2 часа
+    STOCK_INTERVAL = 24 * 3600  # сутки: полный срез — страховка, горячий путь — дельта (MS-5)
 
     while True:
         try:
@@ -52,10 +52,16 @@ async def snapshot_refresh_task(bot: Bot):
                 except Exception as e:
                     logger.exception("snapshot: refresh_reference failed: %s", e)
 
-            # 2) Остатки — каждые 2 часа
+            # 2) Остатки — ПОЛНЫЙ срез раз в сутки (MS-5).
+            #
+            # Горячий путь теперь дельта по вебхукам, а полный
+            # `report/stock/all` стоит 5 единиц бюджета за страницу — по
+            # документации его берут не чаще раза в сутки. Он остаётся
+            # страховкой: подбирает то, что дельта пропустила (новые позиции,
+            # окно старше суток, сбой вебхуков).
             mono = asyncio.get_event_loop().time()
             if mono - last_stock_refresh >= STOCK_INTERVAL:
-                logger.info("snapshot: 2h safety-net refresh_stock")
+                logger.info("snapshot: суточный полный refresh_stock (страховка)")
                 try:
                     await snapshot.refresh_stock()
                     last_stock_refresh = mono

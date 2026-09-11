@@ -263,6 +263,11 @@ def build_ms_sync_block(anomalies: dict[str, list[dict]]) -> str | None:
 # в боте без изменений — это срочные действия, а не сводка.
 
 # Какие секции gather_ops_summary показываем в пинге каждой роли.
+#
+# `stale_crons` — только админу. Руководителю «cron не отчитались» ничего не
+# говорит и ничего от него не требует: это здоровье инфраструктуры, а не
+# состояние дел. Строка в сводке, по которой нельзя принять решение, приучает
+# не читать сводку целиком.
 _PING_ROLE_SECTIONS: dict[str, list[str]] = {
     "admin": [
         "stale_orders", "overdue_undeposited", "deposits", "returns",
@@ -270,7 +275,7 @@ _PING_ROLE_SECTIONS: dict[str, list[str]] = {
     ],
     "boss": [
         "stale_orders", "overdue_undeposited", "deposits", "returns",
-        "low_stock", "stale_crons", "ms_anomalies",
+        "low_stock", "ms_anomalies",
     ],
     "bookkeeper": ["deposits"],
     "warehouse_keeper": ["returns", "low_stock"],

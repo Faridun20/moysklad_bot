@@ -4,17 +4,22 @@ FastAPI сервер для WebApp.
 """
 
 import asyncio
+import base64
+import binascii
 import logging
 import math
 import os
+import re
 import subprocess
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from utils.helpers import local_now, redact_token
 from webapp.auth import verify_init_data
 
 # Берём роль из in-memory кэша (TTL 60s) вместо SELECT'а на каждый API-запрос.
@@ -861,6 +866,33 @@ def _extract_tg_attribute(demand: dict, attr_name: str) -> str | None:
 
 
 # ─── API: операционная сводка ────────────────────────────────────────────────
+
+
+@app.post("/api/today")
+async def api_today(request: Request):
+    """Очередь дел: что ждёт этого человека и в каком порядке.
+
+    Отдаётся ВСЕМ рабочим ролям, включая кладовщика и бухгалтера: до этого
+    «Главная» держалась на `/api/home`, который им не отвечает, и раздел
+    открывался экраном с ошибкой. Порядок и состав очереди считает
+    `services.work_queue` — в шаблоне он разъехался бы с ролями.
+    """
+    from services import work_queue
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager", "warehouse_keeper", "bookkeeper"),
+        rate_limit_scope="api_today",
+        rate_limit_max=120,
+    )
+    role = get_role(user["id"])
+    queue = await work_queue.gather(user["id"], role)
+    return JSONResponse({
+        "ok": True,
+        "queue": queue,
+        "total": sum(int(i["count"]) for i in queue),
+    })
 
 
 @app.post("/api/ops-summary")
@@ -1847,6 +1879,796 @@ async def api_money_summary(request: Request):
     return JSONResponse(totals)
 
 
+# ─── API: дебиторка («где деньги») ───────────────────────────────────────────
+# Заказы в кредит и рассрочки по технике — два учёта, но один вопрос: сколько
+# нам должны, когда это придёт и кто тянет. Считает `services.receivables`,
+# ручки только режут по роли и отдают.
+
+
+async def _receivables_for(user_id: int) -> tuple[list, bool]:
+    """Дебиторка в объёме роли. Второй элемент — видна ли техника."""
+    from services import receivables
+
+    is_boss = get_role(user_id) in ("admin", "boss")
+    items = await receivables.collect(
+        user_id=None if is_boss else user_id,
+        # Рассрочки оформляет руководство: менеджеру это не пустой блок, а
+        # чужой участок — поэтому не отдаём вовсе, а не отдаём нулём.
+        include_machines=is_boss,
+    )
+    return items, is_boss
+
+
+@app.post("/api/money/receivables")
+async def api_money_receivables(request: Request):
+    """«Где деньги»: разбивка по срокам, итоги по источникам, топ должников."""
+    from services import receivables
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_money_receivables",
+        rate_limit_max=30,
+    )
+    items, is_boss = await _receivables_for(user["id"])
+    payload = {
+        "ok": True,
+        "scope": "company" if is_boss else "personal",
+        "aging": receivables.aging(items),
+        "totals": receivables.totals_by_source(items),
+        "by_counterparty": receivables.by_counterparty(items),
+    }
+    if is_boss:
+        # Разрез по менеджерам — управленческий: менеджеру он показал бы чужие
+        # цифры, а себя он и так видит целиком.
+        owners = receivables.by_owner(items)
+        names = await _owner_names([o["user_id"] for o in owners])
+        for row in owners:
+            row["name"] = names.get(row["user_id"], f"#{row['user_id']}")
+        payload["by_owner"] = owners
+    return JSONResponse(payload)
+
+
+async def _owner_names(user_ids: list[int]) -> dict[int, str]:
+    """id менеджера → имя. Батчем: список владельцев иначе даёт N+1."""
+    if not user_ids:
+        return {}
+    from services import async_db as adb
+
+    users = await adb.get_all_users()
+    return {
+        int(u["user_id"]): (u.get("full_name") or u.get("username") or f"#{u['user_id']}")
+        for u in users
+        if int(u["user_id"]) in set(user_ids)
+    }
+
+
+@app.post("/api/money/forecast")
+async def api_money_forecast(request: Request):
+    """Ожидаемые поступления по месяцам вперёд. Только руководство."""
+    from services import receivables
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_money_forecast",
+        rate_limit_max=30,
+    )
+    raw_months = data.get("months")
+    try:
+        # Явная проверка на None, а не `or 6`: ноль — это запрос «ноль месяцев»,
+        # и подменять его дефолтом значит молча ответить не на тот вопрос.
+        months = 6 if raw_months is None or raw_months == "" else int(raw_months)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="months: не число")
+    months = max(1, min(months, 12))
+    items = await receivables.collect()
+    return JSONResponse({"ok": True, "months": receivables.forecast(items, months=months)})
+
+
+@app.post("/api/money/discipline")
+async def api_money_discipline(request: Request):
+    """Поступают ли платежи: собрано против ожидалось и доля платежей в срок."""
+    from datetime import datetime
+
+    from services import receivables
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_money_discipline",
+        rate_limit_max=30,
+    )
+    now = datetime.now()
+    since, until, _prev, label = _resolve_analytics_period(data, now)
+    stats = await receivables.collection_stats(
+        since.strftime("%Y-%m-%d"), until.strftime("%Y-%m-%d")
+    )
+    stats["period"] = {"label": label, "since": since.strftime("%Y-%m-%d"),
+                       "until": until.strftime("%Y-%m-%d")}
+    stats["ok"] = True
+    return JSONResponse(stats)
+
+
+@app.post("/api/machines/buyer")
+async def api_machines_buyer(request: Request):
+    """Карточка покупателя техники: все его сделки, графики и остаток.
+
+    Ключ — имя: настоящего идентификатора у покупателя пока нет
+    (`machine_deals` хранит имя и паспорт), поэтому сервис схлопывает регистр
+    и пробелы.
+    """
+    from services import receivables
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_buyer"
+    )
+    buyer = (data.get("buyer") or "").strip()[:200]
+    if not buyer:
+        raise HTTPException(status_code=400, detail="buyer обязателен")
+    card = await receivables.buyer_card(buyer)
+    if not card:
+        raise HTTPException(status_code=404, detail="Покупатель не найден")
+    return JSONResponse({"ok": True, **card})
+
+
+# ─── API: канал ──────────────────────────────────────────────────────────────
+# Канал — лицо компании: черновик собирает сервер, публикует человек кнопкой.
+# Ни один сборщик не выпускает наружу количества (см. `services/channel.py`).
+
+_CHANNEL_ROLES = ("admin", "boss")
+
+
+async def _photo_bytes(tg_file_id: str, cache_key: str) -> bytes | None:
+    """Байты фото из Telegram с тем же кэшем, что у фото техники."""
+    cached = _photo_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        bot = await get_notify_bot()
+        meta = await bot.get_file(tg_file_id)
+        if (meta.file_size or 0) > _PHOTO_MAX_BYTES:
+            return None
+        buf = await bot.download_file(meta.file_path)
+        blob = buf.read() if hasattr(buf, "read") else bytes(buf)
+    except Exception as e:
+        logger.warning("Фото недоступно: %s", redact_token(repr(e)))
+        return None
+    _photo_cache_put(cache_key, blob)
+    return blob
+
+
+@app.post("/api/products/search")
+async def api_products_search(request: Request):
+    """Поиск товара в номенклатуре — для подсказок при вводе позиции.
+
+    Читаем СНАПШОТ, а не МойСклад: подсказка дёргается на каждое нажатие, и
+    десяток запросов в справочник на одну строку накладной съел бы бюджет,
+    который и так ужимается по календарю. Снапшот отстаёт максимум на сутки —
+    для «есть ли такой товар в каталоге» этого достаточно.
+    """
+    from services import snapshot
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_products_search", rate_limit_max=240,
+    )
+    query = (data.get("query") or "").strip()[:100]
+    if len(query) < 2:
+        # Пустой ввод — не повод отдавать первые 20 товаров каталога наугад.
+        return JSONResponse({"ok": True, "products": [], "query": query})
+    rows = await asyncio.to_thread(snapshot.search_products, query, 20)
+    return JSONResponse({"ok": True, "products": rows, "query": query})
+
+
+@app.post("/api/products/photo")
+async def api_products_photo(request: Request):
+    """Отдать фото товара байтами. Прямую ссылку Telegram отдавать нельзя —
+    в ней токен бота."""
+    from services import product_photos
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_products_photo", rate_limit_max=120,
+    )
+    ms_id = (data.get("ms_id") or "").strip()[:64]
+    photo_id = _machine_id_arg(data, "photo_id")
+    photos = await product_photos.list_photos(ms_id)
+    photo = next((p for p in photos if int(p["id"]) == photo_id), None)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Фото не найдено")
+
+    blob = await _photo_bytes(str(photo["tg_file_id"]), str(photo["file_unique_id"]))
+    if blob is None:
+        raise HTTPException(status_code=404, detail="Фото недоступно")
+    return Response(
+        blob, media_type=_photo_media_type(blob) or "image/jpeg",
+        headers={"Cache-Control": "private, max-age=600", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.post("/api/products/photos")
+async def api_products_photos(request: Request):
+    """Список фото товара. `tg_file_id` наружу не отдаём — клиенту нужен только
+    `photo_id`, а файловый URL Telegram содержит токен бота."""
+    from services import product_photos
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_products_photos",
+    )
+    ms_id = (data.get("ms_id") or "").strip()[:64]
+    if not ms_id:
+        raise HTTPException(status_code=400, detail="Не указан товар")
+    photos = await product_photos.list_photos(ms_id)
+    return JSONResponse({
+        "ok": True,
+        "photos": [
+            {
+                "id": int(p["id"]),
+                "caption": p.get("caption") or "",
+                "uploaded_at": p.get("uploaded_at") or "",
+            }
+            for p in photos
+        ],
+        "can_upload": _machine_photos_chat_id() is not None,
+    })
+
+
+@app.post("/api/products/photo_delete")
+async def api_products_photo_delete(request: Request):
+    """Открепить фото товара. Скоупится товаром — иначе `photo_id` из формы
+    стирает чужой снимок."""
+    from services import product_photos
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_products_photo_delete"
+    )
+    ms_id = (data.get("ms_id") or "").strip()[:64]
+    photo_id = _machine_id_arg(data, "photo_id")
+    if not ms_id:
+        raise HTTPException(status_code=400, detail="Не указан товар")
+    return _machine_response(await product_photos.delete_photo(ms_id, photo_id))
+
+
+@app.post("/api/products/photo_upload")
+async def api_products_photo_upload(request: Request):
+    """Загрузить фото товара. base64 в JSON — как у техники: `python-multipart`
+    в зависимостях нет."""
+    from services import product_photos
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_products_photo_upload",
+        # Пачкой грузят по одному запросу на снимок: карточка товара с десятком
+        # ракурсов — это одно действие человека, а не подозрительная активность.
+        rate_limit_max=60,
+    )
+    ms_id = (data.get("ms_id") or "").strip()[:64]
+    if not ms_id:
+        raise HTTPException(status_code=400, detail="Не указан товар")
+    chat_id = _machine_photos_chat_id()
+    if chat_id is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Загрузка фото не настроена: нет PHOTOS_TG_CHAT_ID",
+        )
+    blob = _decode_photo(data.get("data_url"))
+
+    try:
+        from aiogram.types import BufferedInputFile
+
+        bot = await get_notify_bot()
+        sent = await bot.send_photo(
+            chat_id, BufferedInputFile(blob, filename=f"product-{ms_id}.jpg"),
+            caption=(data.get("caption") or "")[:200] or None,
+        )
+    except Exception as e:
+        logger.warning("Фото товара не загружено: %s", redact_token(repr(e)))
+        raise HTTPException(status_code=502, detail="Telegram не принял фото")
+
+    best = max(sent.photo or [], key=lambda p: (p.width or 0) * (p.height or 0), default=None)
+    if best is None:
+        raise HTTPException(status_code=502, detail="Telegram не вернул файл")
+    res = await product_photos.add_photo(
+        ms_id, tg_file_id=best.file_id, file_unique_id=best.file_unique_id,
+        uploaded_by=user["id"], caption=(data.get("caption") or "")[:200] or None,
+    )
+    return _machine_response(res)
+
+
+def _decode_photo(raw_url) -> bytes:
+    """data-URL → байты, с теми же проверками, что у фото техники."""
+    raw = str(raw_url or "")
+    if not raw.startswith("data:image/") or "," not in raw:
+        raise HTTPException(status_code=400, detail="Ожидается изображение")
+    payload = raw.split(",", 1)[1]
+    if len(payload) > _PHOTO_MAX_BYTES * 4 // 3 + 1024:
+        raise HTTPException(status_code=413, detail="Фото больше 5 МБ")
+    try:
+        blob = base64.b64decode(payload, validate=True)
+    except (ValueError, binascii.Error):
+        raise HTTPException(status_code=400, detail="Повреждённое изображение")
+    if len(blob) > _PHOTO_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Фото больше 5 МБ")
+    if _photo_media_type(blob) is None:
+        raise HTTPException(status_code=400, detail="Поддерживаются JPEG и PNG")
+    return blob
+
+
+@app.post("/api/channel/draft")
+async def api_channel_draft(request: Request):
+    """Черновик поста: текст собирает СЕРВЕР, а не фронт.
+
+    Так правило «наружу не уходят количества» держится в одном месте и
+    проверяется тестом, а не повторяется в шаблоне.
+    """
+    from services import channel
+
+    data = await request.json()
+    _authorize(data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_channel_draft")
+    kind = (data.get("kind") or "").strip()
+    if kind not in channel.POST_KINDS:
+        raise HTTPException(status_code=400, detail=f"Тип поста: {', '.join(channel.POST_KINDS)}")
+
+    username = (data.get("manager_username") or "").strip()[:64] or None
+    note = (data.get("note") or "").strip()[:500] or None
+    ref = None
+    photo_id = None
+
+    if kind == "arrival":
+        container_id = _machine_id_arg(data, "container_id")
+        ref = str(container_id)
+        names = await channel.arrival_names(container_id)
+        if not names:
+            raise HTTPException(status_code=409, detail="В контейнере нет прибывших позиций")
+        text = channel.build_arrival(names, note=note, manager_username=username)
+    elif kind == "showcase":
+        from services import product_photos, snapshot
+
+        ms_id = (data.get("ms_id") or "").strip()[:64]
+        product = await asyncio.to_thread(snapshot.get_product, ms_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Товар не найден в каталоге")
+        ref = ms_id
+        prices = await _price_label(ms_id)
+        text = channel.build_showcase(
+            product, price=prices, note=note, manager_username=username
+        )
+        first = await product_photos.first_photo(ms_id)
+        photo_id = int(first["id"]) if first else None
+    else:
+        names = [str(n)[:200] for n in (data.get("names") or []) if str(n).strip()][:30]
+        if not names:
+            raise HTTPException(status_code=400, detail="Выберите хотя бы один товар")
+        text = channel.build_stale(names, note=note, manager_username=username)
+
+    return JSONResponse({
+        "ok": True, "kind": kind, "ref": ref, "text": text, "photo_id": photo_id,
+        "already_posted": await channel.already_posted(kind, ref) if ref else None,
+        "can_publish": _channel_id() is not None,
+    })
+
+
+async def _price_label(ms_id: str) -> str | None:
+    """Цена товара для витрины — только если её задавали руками."""
+    from services import async_db as adb
+    from config import BASE_CURRENCY
+
+    prices = await adb.get_product_prices_by_ids([ms_id])
+    row = prices.get(ms_id) or {}
+    price = row.get("sale_price")
+    if price is None or price == "":
+        return None
+    cents = money.parse_amount(price)
+    if cents is None:
+        return None
+    return f"{money.format_cents(cents, decimals=0, sep=' ')} " \
+           f"{(row.get('currency') or BASE_CURRENCY or 'USD').upper()}"
+
+
+@app.post("/api/channel/publish")
+async def api_channel_publish(request: Request):
+    """Опубликовать пост. Только по нажатию человеком — автопостинга нет.
+
+    Текст принимаем от клиента: черновик правят руками, и запрещать это значит
+    заставлять публиковать не то, что хотели. Сборщик при этом количеств не
+    выпускает — если человек допишет их сам, это его решение.
+    """
+    from services import channel
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_channel_publish",
+        rate_limit_max=20,
+    )
+    chat_id = _channel_id()
+    if chat_id is None:
+        raise HTTPException(status_code=503, detail="Канал не настроен: нет CHANNEL_ID")
+    kind = (data.get("kind") or "").strip()
+    if kind not in channel.POST_KINDS:
+        raise HTTPException(status_code=400, detail="Неизвестный тип поста")
+    text = (data.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Пустой пост публиковать нечего")
+    ref = (data.get("ref") or "").strip()[:64] or None
+
+    photo_blob = None
+    photo_id = data.get("photo_id")
+    if photo_id and (data.get("ms_id") or "").strip():
+        from services import product_photos
+
+        photos = await product_photos.list_photos((data.get("ms_id") or "").strip()[:64])
+        photo = next((p for p in photos if int(p["id"]) == int(photo_id)), None)
+        if photo:
+            photo_blob = await _photo_bytes(
+                str(photo["tg_file_id"]), str(photo["file_unique_id"])
+            )
+
+    try:
+        bot = await get_notify_bot()
+        if photo_blob:
+            from aiogram.types import BufferedInputFile
+
+            sent = await bot.send_photo(
+                chat_id, BufferedInputFile(photo_blob, filename="post.jpg"),
+                caption=text[:1024], parse_mode="HTML",
+            )
+        else:
+            sent = await bot.send_message(chat_id, text[:4096], parse_mode="HTML")
+    except Exception as e:
+        logger.warning("Пост в канал не ушёл: %s", redact_token(repr(e)))
+        raise HTTPException(status_code=502, detail="Telegram не принял пост")
+
+    post_id = await channel.save_post(
+        kind=kind, ref=ref, message_id=getattr(sent, "message_id", None),
+        posted_by=user["id"],
+    )
+    return JSONResponse({"ok": True, "post_id": post_id,
+                         "message_id": getattr(sent, "message_id", None)})
+
+
+@app.post("/api/channel/stale")
+async def api_channel_stale(request: Request):
+    """Кандидаты в пост «залежавшееся». Внутренний экран — остаток здесь виден.
+
+    Считается тем же кодом, что дневная ops-сводка: остатки минус всё, что
+    отгружалось за период.
+    """
+    from services import channel
+
+    data = await request.json()
+    _authorize(data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_channel_stale",
+               rate_limit_max=10)
+    days = channel.stale_days()
+    from tasks.run_ops_monitor import collect_dead_stock
+
+    try:
+        dead = await collect_dead_stock(days)
+    except Exception as e:
+        logger.warning("Не удалось собрать залежавшееся: %s", e)
+        raise HTTPException(status_code=502, detail="МойСклад не ответил, попробуйте позже")
+    return JSONResponse({
+        "ok": True, "days": days, "items": channel.stale_candidates(dead),
+    })
+
+
+@app.post("/api/channel/history")
+async def api_channel_history(request: Request):
+    from services import channel
+
+    data = await request.json()
+    _authorize(data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_channel_history")
+    posts = await channel.history()
+    # Отклик считаем на каждый пост: это два локальных COUNT'а на строку, без
+    # запросов в МойСклад. История ограничена 30 постами, N+1 здесь не страшен.
+    for post in posts:
+        post["effect"] = await channel.post_effect(post.get("posted_at"))
+    return JSONResponse({
+        "ok": True, "posts": posts, "kind_labels": channel.KIND_LABELS,
+        "can_publish": _channel_id() is not None,
+    })
+
+
+# ─── API: воронка клиентов ───────────────────────────────────────────────────
+# Данные наполняет наблюдатель переписок (`handlers/business.py`). Здесь только
+# чтение и два ручных действия: исход сделки и привязка к контрагенту — их из
+# переписки не вывести.
+
+_LEAD_ROLES = ("admin", "boss", "manager")
+
+
+@app.post("/api/leads/list")
+async def api_leads_list(request: Request):
+    """Лиды. Менеджер видит только свои — чужие переписки не его дело."""
+    from services import leads
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_list")
+    role = get_role(user["id"])
+    is_boss = role in ("admin", "boss")
+    status = (data.get("status") or "").strip() or None
+    if status and status not in leads.STATUSES:
+        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+    # Исход и состояние разговора — разные вопросы («купил ли» и «на ком ход»),
+    # поэтому это два независимых отбора, а не один общий список значений.
+    state = (data.get("state") or "").strip() or None
+    if state and state not in leads.STATE_FILTERS:
+        raise HTTPException(status_code=400, detail=f"Неизвестное состояние: {state}")
+
+    rows = await leads.list_leads(
+        manager_id=None if is_boss else user["id"], status=status, state=state,
+        search=(data.get("search") or "").strip()[:100] or None,
+    )
+    from services import lead_calls
+
+    return JSONResponse({
+        "ok": True,
+        "leads": rows,
+        "scope": "company" if is_boss else "personal",
+        "status_labels": leads.STATUS_LABELS,
+        "connections": await leads.list_connections() if is_boss else [],
+        # Звонки без переписки — люди, которых в Telegram ещё нет. Отдаём вместе
+        # со списком: это один экран «с кем сегодня работать», и второй запрос
+        # ради него был бы лишним.
+        "unlinked_calls": await lead_calls.list_calls(unlinked=True, limit=50),
+    })
+
+
+@app.post("/api/leads/card")
+async def api_leads_card(request: Request):
+    """Карточка лида: отметки времени и события. Текстов переписки здесь нет —
+    мы их не храним."""
+    from services import leads
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_card")
+    lead_id = _machine_id_arg(data, "lead_id")
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+    from services import lead_calls
+
+    return JSONResponse({
+        "ok": True, "lead": lead, "status_labels": leads.STATUS_LABELS,
+        "lost_reasons": [
+            {"key": k, "label": leads.LOST_REASON_LABELS[k]} for k in leads.LOST_REASONS
+        ],
+        "direction_labels": lead_calls.DIRECTION_LABELS,
+        "source_labels": lead_calls.SOURCE_LABELS,
+    })
+
+
+@app.post("/api/leads/status")
+async def api_leads_status(request: Request):
+    """Отметить исход. Руками — в переписке его не видно: клиент может
+    согласиться голосом, а может пропасть без слова."""
+    from services import leads
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_status")
+    lead_id = _machine_id_arg(data, "lead_id")
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+    res = await leads.set_status(
+        lead_id, (data.get("status") or "").strip(),
+        user_id=user["id"], full_name=_actor_name(user),
+        # Причина отказа необязательна: обязательное поле на редко нажимаемой
+        # кнопке приводит к тому, что её перестают нажимать вовсе.
+        reason=(data.get("reason") or "").strip() or None,
+        note=_machine_text(data, "note", 500),
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/leads/agents")
+async def api_leads_agents(request: Request):
+    """Поиск контрагента для привязки — по названию ИЛИ телефону.
+
+    Телефон важнее названия: клиента помнят по номеру, а в МойСклад он записан
+    как «ООО Бахор Савдо». Читаем снапшот, в МойСклад не ходим.
+    """
+    from services import snapshot
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_agents",
+        rate_limit_max=240,
+    )
+    search = (data.get("search") or "").strip()[:100]
+    rows = await asyncio.to_thread(snapshot.get_counterparties, search or None, 20)
+    return JSONResponse({"ok": True, "agents": rows})
+
+
+@app.post("/api/leads/create_agent")
+async def api_leads_create_agent(request: Request):
+    """Завести контрагента в МойСклад по клиенту и сразу привязать.
+
+    Заводит ЧЕЛОВЕК кнопкой: каждый написавший — ещё не клиент, автосоздание
+    превратило бы справочник в свалку из случайных собеседников.
+    """
+    from services import leads, ms_counterparty
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_create_agent",
+        rate_limit_max=30,
+    )
+    lead_id = _machine_id_arg(data, "lead_id")
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+
+    name = _machine_text(data, "name", 255) or lead.get("display_name") or lead.get("username")
+    created = await ms_counterparty.create_counterparty(
+        name or "", phone=_machine_text(data, "phone", 64)
+    )
+    if not created.get("ok"):
+        return _machine_response(created)
+    res = await leads.link_agent(
+        lead_id, created["ms_id"], user_id=user["id"], full_name=_actor_name(user)
+    )
+    if not res.get("ok"):
+        return _machine_response(res)
+    return JSONResponse({**res, "name": created["name"], "existed": created["existed"]})
+
+
+@app.post("/api/leads/calls")
+async def api_leads_calls(request: Request):
+    """Журнал звонков. Без `lead_id` отдаёт непривязанные — тех, кого ещё не
+    нашли в Telegram; это и есть список «кому перезвонить»."""
+    from services import lead_calls
+
+    data = await request.json()
+    _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_calls")
+    lead_id = data.get("lead_id")
+    rows = await lead_calls.list_calls(
+        lead_id=_machine_id_arg(data, "lead_id") if lead_id else None,
+        unlinked=not lead_id,
+    )
+    return JSONResponse({
+        "ok": True,
+        "calls": rows,
+        "direction_labels": lead_calls.DIRECTION_LABELS,
+        "source_labels": lead_calls.SOURCE_LABELS,
+    })
+
+
+@app.post("/api/leads/call_add")
+async def api_leads_call_add(request: Request):
+    """Записать звонок. Обязателен только менеджер: половину звонков заносят
+    постфактум, когда номера уже нет под рукой, а «звонок без номера» — всё
+    ещё обращение. Обязательное поле здесь означало бы, что звонки перестанут
+    записывать вовсе."""
+    from services import lead_calls
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_add",
+        rate_limit_max=120,
+    )
+    lead_id = data.get("lead_id")
+    res = await lead_calls.add_call(
+        manager_id=user["id"],
+        phone=_machine_text(data, "phone", 64),
+        display_name=_machine_text(data, "display_name", 200),
+        direction=(data.get("direction") or "in").strip(),
+        source=(data.get("source") or "").strip() or None,
+        interest=_machine_text(data, "interest", 200),
+        lead_id=_machine_id_arg(data, "lead_id") if lead_id else None,
+        note=_machine_text(data, "note", 500),
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/leads/call_link")
+async def api_leads_call_link(request: Request):
+    """Связать записанный звонок с телеграм-лидом. Руками: Telegram номер
+    собеседника не отдаёт, общего поля у звонка с перепиской нет, и угадывание
+    означало бы чужой звонок в чужой карточке."""
+    from services import lead_calls
+
+    data = await request.json()
+    from services import leads
+
+    data_user = _authorize(
+        data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_link"
+    )
+    lead_id = _machine_id_arg(data, "lead_id")
+    # Тот же гейт, что у карточки и статуса: менеджер, который не может даже
+    # открыть чужого клиента, не должен подшивать к нему свой звонок.
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if (get_role(data_user["id"]) not in ("admin", "boss")
+            and lead.get("manager_id") != data_user["id"]):
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+
+    res = await lead_calls.link_call(
+        _machine_id_arg(data, "call_id"), lead_id, user_id=data_user["id"],
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/leads/call_delete")
+async def api_leads_call_delete(request: Request):
+    """Удалить ошибочную запись. Звонок — заметка менеджера, а не денежный
+    факт: запрещать правку значит копить мусор в списке «перезвонить»."""
+    from services import lead_calls
+
+    data = await request.json()
+    _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_delete")
+    res = await lead_calls.delete_call(_machine_id_arg(data, "call_id"))
+    return _machine_response(res)
+
+
+@app.post("/api/leads/link")
+async def api_leads_link(request: Request):
+    """Связать лид с контрагентом МойСклад — чтобы «написал» и «купил»
+    встретились."""
+    from services import leads
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_link")
+    lead_id = _machine_id_arg(data, "lead_id")
+    # Проверка владения была только у карточки и статуса — менеджер мог привязать
+    # контрагента к чужому лиду. Ручку до сих пор не звал фронт, поэтому дыра и
+    # не всплыла; закрываем прежде, чем кнопка появится.
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+    agent_ms_id = (data.get("agent_ms_id") or "").strip()[:64] or None
+    res = await leads.link_agent(
+        lead_id, agent_ms_id, user_id=user["id"], full_name=_actor_name(user)
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/leads/funnel")
+async def api_leads_funnel(request: Request):
+    """Воронка за период + разрез по менеджерам. Только руководство."""
+    from datetime import datetime
+
+    from services import leads
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=("admin", "boss"), rate_limit_scope="api_leads_funnel"
+    )
+    since, until, _prev, label = _resolve_analytics_period(data, datetime.now())
+    since_s, until_s = since.strftime("%Y-%m-%d"), until.strftime("%Y-%m-%d")
+
+    managers = await leads.by_manager(since_s, until_s)
+    names = await _owner_names([m["manager_id"] for m in managers])
+    for row in managers:
+        row["name"] = names.get(row["manager_id"], f"#{row['manager_id']}")
+
+    return JSONResponse({
+        "ok": True,
+        "funnel": await leads.funnel(since_s, until_s),
+        "by_manager": managers,
+        "awaiting": await leads.awaiting_reply(),
+        "period": {"label": label, "since": since_s, "until": until_s},
+    })
+
+
 # ─── API: заказы ─────────────────────────────────────────────────────────────
 
 
@@ -2278,6 +3100,10 @@ async def api_clients_detail(request: Request):
     debt = await adb.get_agent_current_debt(agent_id)
     limit = await adb.get_credit_limit(agent_id)
     orders = await adb.get_orders_by_agent(agent_id)
+    # История денег по клиенту: платежи, сдачи (в части, распределённой на его
+    # заказы) и возвраты. Формат строки — как в общей ленте «Деньги», поэтому
+    # фронт рисует её тем же кодом.
+    money_history = await adb.get_agent_money_history(agent_id)
     # Покупки из МС — best-effort: при сбое МС карточка всё равно открывается.
     try:
         purchases = await moysklad.get_counterparty_purchases(agent_id)
@@ -2297,8 +3123,81 @@ async def api_clients_detail(request: Request):
             "free": round(limit - debt, 2),
             "over_limit": debt > limit,
             "orders": orders,
+            "money_history": money_history,
             "purchases": purchases,
             "base_currency": (BASE_CURRENCY or "USD").upper(),
+        }
+    )
+
+
+# Идентификаторы МойСклад — UUID. Проверяем формат перед подстановкой в путь
+# запроса: значение приходит от клиента, а `entity/demand/{id}/positions` —
+# это путь, и «id» вида `../../entity/counterparty/xxx` увёл бы запрос в другую
+# сущность. Роль здесь и так admin/boss, но подставлять сырую строку в URL —
+# привычка, которая однажды выстрелит в менее защищённом месте.
+_MS_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                         r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+@app.post("/api/clients/shipment")
+async def api_clients_shipment(request: Request):
+    """Состав отгрузки клиента: позиции demand'а из МойСклад.
+
+    В карточке клиента отгрузки показывались одной суммой и датой — увидеть,
+    ЧТО именно уехало, было нельзя, хотя это первый вопрос при разборе долга.
+
+    Позиции документа после создания неизменяемы, поэтому в сервисе уже стоит
+    часовой кэш — повторное открытие той же отгрузки в МС не ходит.
+    """
+    from services import moysklad
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_clients_shipment",
+        rate_limit_max=60,
+    )
+    demand_id = (data.get("demand_id") or "").strip()
+    if not _MS_UUID_RE.match(demand_id):
+        raise HTTPException(status_code=400, detail="demand_id: ожидается идентификатор МойСклад")
+
+    try:
+        rows = await moysklad.get_shipment_positions(demand_id)
+    except Exception as e:
+        # МС недоступен — это не поломка карточки: остальное в ней уже
+        # отрисовано, разворачивается только одна строка.
+        logger.warning("Не удалось получить позиции отгрузки %s: %s", demand_id, e)
+        raise HTTPException(status_code=502, detail="МойСклад не ответил, попробуйте позже")
+
+    positions = []
+    # Итог копим в цикле, а не пересобираем генератором из уже готовых строк:
+    # значения словаря позиции — объединение типов (строки, float, int), и
+    # sum() по ним не проходит проверку типов (mypy — блокирующий гейт).
+    total_cents = 0
+    for pos in rows:
+        quantity = float(pos.get("quantity", 0) or 0)
+        price_cents = int(pos.get("price", 0) or 0)
+        line_cents = int(round(quantity * price_cents))
+        total_cents += line_cents
+        positions.append(
+            {
+                "name": (pos.get("assortment") or {}).get("name") or "—",
+                "quantity": quantity,
+                "unit": (pos.get("uom") or {}).get("name") or "шт",
+                "price_cents": price_cents,
+                "sum_cents": line_cents,
+            }
+        )
+    from config import BASE_CURRENCY
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "demand_id": demand_id,
+            "positions": positions,
+            "sum_cents": total_cents,
+            "currency": (BASE_CURRENCY or "USD").upper(),
         }
     )
 
@@ -2409,6 +3308,1183 @@ async def api_products_prices_set(request: Request):
         f"{ms_id} ({product_name}): sale={sale_price} cost={cost_price}",
     )
     return JSONResponse({"ok": True, "ms_id": ms_id})
+
+
+# ─── API: техника (экскаваторы) ──────────────────────────────────────────────
+# Раздел переехал из бота: формы, списки и фотографии — работа для экрана, а не
+# для командной строки в чате. В боте остаётся быстрый просмотр и ввод моточасов
+# с площадки.
+#
+# Роли: смотреть и вводить моточасы может менеджер; заводить машину, править
+# карточку, двигать статус и оформлять сделки — только admin/boss. Себестоимость
+# и паспорт покупателя режет `services.machines` на чтении, здесь их просто не
+# существует для менеджера.
+
+_MACHINE_ROLES = ("admin", "boss", "manager")
+_MACHINE_BOSS = ("admin", "boss")
+
+
+def _machine_response(res: dict) -> JSONResponse:
+    """Результат сервиса техники → HTTP-ответ.
+
+    Тексты ошибок в сервисе писались для человека — отдаём их как есть, а не
+    переписываем здесь во второй раз.
+
+    Код важнее текста: **409** значит «состояние на сервере уже другое, обнови
+    карточку» (машину продали, пока форма была открыта; показание моточасов
+    требует подтверждения), **400** — «исправь поле». Различить их иначе фронт
+    не может, а действия у него противоположные. Дополнительные поля ответа
+    (`current`, `previous`, `needs_force`) уходят клиенту вместе с `detail`:
+    без них форма не сможет предложить подтверждение.
+    """
+    if res.get("ok"):
+        return JSONResponse(res)
+    error = str(res.get("error") or "Не удалось выполнить операцию")
+    if "не найден" in error.lower():
+        code = 404
+    elif res.get("needs_force") or "current" in res or "сделка невозможна" in error:
+        code = 409
+    else:
+        code = 400
+    return JSONResponse({**res, "detail": error}, status_code=code)
+
+
+def _machine_photo_public(row: dict) -> dict:
+    """Фото наружу: только id и подпись.
+
+    `tg_file_id` клиенту не нужен и опасен — он открывает файл через Bot API
+    любому, кто знает токен, и переживает удаление карточки. Собираем ответ
+    явным списком полей, а не `dict(row)`: при следующей правке схемы неявный
+    вариант молча вынесет наружу новую колонку.
+    """
+    return {
+        "id": int(row["id"]),
+        "caption": row.get("caption") or "",
+        "sort_order": int(row.get("sort_order") or 0),
+        "uploaded_at": row.get("uploaded_at") or "",
+    }
+
+
+@app.post("/api/machines/list")
+async def api_machines_list(request: Request):
+    """Список техники + счётчики по статусам. Payload: {"status": "in_stock"?}."""
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_MACHINE_ROLES,
+        rate_limit_scope="api_machines_list",
+    )
+    role = get_role(user["id"])
+    status = (data.get("status") or "").strip() or None
+    if status and status not in machines.STATUSES:
+        # Не пустой список: «машины пропали» выглядит как потеря данных, а это
+        # опечатка в фильтре.
+        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+
+    rows = await machines.list_machines(role=role, status=status)
+    counts = await machines.count_by_status()
+    return JSONResponse(
+        {
+            "ok": True,
+            "machines": rows,
+            "counts": counts,
+            "status": status or "all",
+            "can_manage": role in _MACHINE_BOSS,
+            "can_see_cost": machines.can_see_cost(role),
+            "status_labels": machines.STATUS_LABELS,
+        }
+    )
+
+
+@app.post("/api/machines/card")
+async def api_machines_card(request: Request):
+    """Карточка машины: данные, фото, история моточасов, сделки, переходы."""
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_MACHINE_ROLES,
+        rate_limit_scope="api_machines_card",
+    )
+    role = get_role(user["id"])
+    try:
+        machine_id = int(data.get("machine_id") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="machine_id: не число")
+    if machine_id <= 0:
+        raise HTTPException(status_code=400, detail="machine_id обязателен")
+
+    machine = await machines.get_machine(machine_id, role=role)
+    if not machine:
+        raise HTTPException(status_code=404, detail="Машина не найдена")
+
+    photos = await machines.list_photos(machine_id)
+    hours = await machines.get_hours_history(machine_id)
+    deals = await machines.list_deals(machine_id, role=role)
+    # График рассрочки кладём внутрь сделки: отдельная ручка означала бы второй
+    # запрос ровно за тем, что и так открыто на экране.
+    for deal in deals:
+        if deal.get("kind") == "credit":
+            progress = await machines.deal_progress(int(deal["id"]))
+            # Платежи отдаём уже с покрытием: клиент вносит частями, и «оплачен
+            # или нет» на экране мало — видно должно быть, сколько внесено.
+            deal["payments"] = progress["payments"]
+            deal["progress"] = {k: v for k, v in progress.items() if k != "payments"}
+            deal["receipts"] = await machines.list_receipts(int(deal["id"]))
+    return JSONResponse(
+        {
+            "ok": True,
+            "machine": machine,
+            "photos": [_machine_photo_public(p) for p in photos],
+            "hours": hours,
+            "deals": deals,
+            # Граф переходов приходит с сервера: рисовать его копию на фронте
+            # значит завести второй источник правды о жизненном цикле машины.
+            "next_statuses": machines.next_status_options(machine.get("status")),
+            "can_manage": role in _MACHINE_BOSS,
+            # Без канала-хранилища загрузка не работает — кнопку рисовать нельзя.
+            "can_upload_photo": _machine_photos_chat_id() is not None,
+            "status_labels": machines.STATUS_LABELS,
+            # «Сегодня» считает сервер: просрочку платежа нельзя определять по
+            # часам телефона — они и в другом поясе, и просто сбиты.
+            "today": local_now().date().isoformat(),
+        }
+    )
+
+
+def _machine_id_arg(data: dict, key: str = "machine_id") -> int:
+    try:
+        value = int(data.get(key) or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{key}: не число")
+    if value <= 0:
+        raise HTTPException(status_code=400, detail=f"{key} обязателен")
+    return value
+
+
+def _machine_money(raw, label: str) -> int | None:
+    """Сумма из формы («25 000», «25000.50») → копейки.
+
+    Граница системы: наружу и внутрь ходят копейки, парсинг человеческой записи
+    живёт ровно здесь. Пустое поле — это «не задано», а не ноль.
+    """
+    if raw is None or str(raw).strip() == "":
+        return None
+    cents = money.parse_amount(raw)
+    if cents is None:
+        raise HTTPException(status_code=400, detail=f"{label}: не число или не больше нуля")
+    return cents
+
+
+def _machine_text(data: dict, key: str, limit: int = 200) -> str | None:
+    value = (str(data.get(key) or "")).strip()[:limit]
+    return value or None
+
+
+def _actor_name(user: dict) -> str:
+    return ((user.get("first_name") or "") + " " + (user.get("last_name") or "")).strip()
+
+
+@app.post("/api/machines/create")
+async def api_machines_create(request: Request):
+    """Завести машину. Менеджеру можно — себестоимость он всё равно не задаёт."""
+    from services import async_db as adb
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_MACHINE_ROLES,
+        rate_limit_scope="api_machines_create",
+        rate_limit_max=20,
+    )
+    role = get_role(user["id"])
+    status = (data.get("status") or "in_transit").strip()
+    if status not in machines.STATUSES:
+        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+
+    year = data.get("year")
+    hours = data.get("hours")
+    try:
+        year = int(year) if str(year or "").strip() else None
+        hours = int(hours) if str(hours or "").strip() else None
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Год и моточасы — целые числа")
+
+    payload = {
+        "vin": (data.get("vin") or "").strip()[:64],
+        "name": (data.get("name") or "").strip()[:200],
+        "created_by": user["id"],
+        "creator_name": _actor_name(user),
+        "brand": _machine_text(data, "brand", 100),
+        "model": _machine_text(data, "model", 100),
+        "year": year,
+        "hours": hours,
+        "price_cents": _machine_money(data.get("price"), "Цена"),
+        "currency": (data.get("currency") or "USD").strip().upper()[:8],
+        "status": status,
+        "eta_date": _machine_text(data, "eta_date", 20),
+        "container_no": _machine_text(data, "container_no", 50),
+        "location": _machine_text(data, "location", 200),
+        "notes": _machine_text(data, "notes", 1000),
+    }
+    # Себестоимость менеджер не видит — значит и записать не может. Иначе роль
+    # режется только на чтении, и поле утекает обратно через форму.
+    if machines.can_see_cost(role):
+        payload["cost_cents"] = _machine_money(data.get("cost"), "Себестоимость")
+
+    idem = _Idem(adb, "machine_create", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await machines.create_machine(**payload)
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/machines/update")
+async def api_machines_update(request: Request):
+    """Правка описательных полей карточки. Только admin/boss.
+
+    VIN здесь не меняется намеренно — сервис его в whitelist не пускает: смена
+    серийника это не правка, а другая машина.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_update"
+    )
+    machine_id = _machine_id_arg(data)
+    raw = data.get("fields")
+    if not isinstance(raw, dict) or not raw:
+        raise HTTPException(status_code=400, detail="Нечего менять")
+
+    # VIN правится отдельной функцией сервиса: у него нормализация и проверка
+    # уникальности, которых нет у остальных полей. Делаем это ДО прочих правок —
+    # если серийник занят, карточка не должна остаться частично изменённой.
+    if "vin" in raw:
+        vin_res = await machines.change_vin(
+            machine_id, str(raw.pop("vin") or ""),
+            user_id=user["id"], full_name=_actor_name(user),
+        )
+        if not vin_res.get("ok"):
+            return _machine_response(vin_res)
+        if not raw:
+            return JSONResponse(vin_res)
+
+    fields: dict = {}
+    for key, value in raw.items():
+        if key in ("price", "price_cents"):
+            fields["price_cents"] = _machine_money(value, "Цена")
+        elif key in ("cost", "cost_cents"):
+            fields["cost_cents"] = _machine_money(value, "Себестоимость")
+        elif key == "year":
+            try:
+                fields["year"] = int(value) if str(value or "").strip() else None
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Год — целое число")
+        else:
+            fields[key] = (str(value).strip()[:1000] or None) if value is not None else None
+    res = await machines.update_machine_fields(
+        machine_id, user_id=user["id"], full_name=_actor_name(user), **fields
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/delete")
+async def api_machines_delete(request: Request):
+    """Удалить карточку машины. Только admin/boss.
+
+    Для машины со сделкой сервис откажет: продажа — денежный факт, и стирать
+    его вместе с карточкой нельзя. Такие уводят в архив.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_delete"
+    )
+    machine_id = _machine_id_arg(data)
+    res = await machines.delete_machine(
+        machine_id, user_id=user["id"], full_name=_actor_name(user)
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/hours")
+async def api_machines_hours(request: Request):
+    """Записать моточасы. Может менеджер — показания снимают с площадки.
+
+    `force` (запись показания меньше предыдущего — законная замена счётчика)
+    только для руководства: иначе подтверждение «да, я уверен» обесценивает
+    саму проверку от опечатки.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_ROLES, rate_limit_scope="api_machines_hours"
+    )
+    role = get_role(user["id"])
+    machine_id = _machine_id_arg(data)
+    try:
+        hours = int(data.get("hours"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Моточасы — целое число")
+
+    force = bool(data.get("force"))
+    if force and role not in _MACHINE_BOSS:
+        raise HTTPException(
+            status_code=403, detail="Откат показания подтверждает руководитель"
+        )
+    res = await machines.add_hours(
+        machine_id, hours, user_id=user["id"], full_name=_actor_name(user), force=force
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/status")
+async def api_machines_status(request: Request):
+    """Сменить статус машины. Только admin/boss.
+
+    `expected` присылает фронт — тот статус, который он нарисовал. В этом смысл
+    CAS: пока карточка висела открытой, машину мог продать другой, и безусловный
+    UPDATE затёр бы его решение.
+
+    Граф переходов проверяем здесь, а не в `set_status`: внутренние вызовы
+    (`create_deal`, `close_deal`) двигают статус в обход ручного графа законно —
+    он описывает кнопки интерфейса, а не жизненный цикл целиком.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_status"
+    )
+    machine_id = _machine_id_arg(data)
+    target = (data.get("status") or "").strip()
+    expected = (data.get("expected") or "").strip()
+    if target not in machines.STATUSES:
+        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {target}")
+    if not expected:
+        raise HTTPException(status_code=400, detail="expected обязателен")
+    if target not in machines.next_statuses(expected):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Переход «{machines.STATUS_LABELS.get(expected, expected)}» → "
+            f"«{machines.STATUS_LABELS.get(target, target)}» не предусмотрен",
+        )
+    res = await machines.set_status(
+        machine_id, target, user_id=user["id"], full_name=_actor_name(user), expected=expected
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/deal")
+async def api_machines_deal(request: Request):
+    """Оформить продажу или рассрочку. Только admin/boss.
+
+    Ключ идемпотентности обязателен: сделка — денежный факт, а двойной тап по
+    «Оформить» на телефоне обычное дело. Повтор отдаёт тот же `deal_id`.
+    """
+    from services import async_db as adb
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_deal"
+    )
+    machine_id = _machine_id_arg(data)
+    kind = (data.get("kind") or "").strip()
+    if kind not in machines.DEAL_KINDS:
+        raise HTTPException(status_code=400, detail=f"Тип сделки: {' / '.join(machines.DEAL_KINDS)}")
+    price_cents = _machine_money(data.get("price"), "Цена")
+    if not price_cents:
+        raise HTTPException(status_code=400, detail="Цена сделки обязательна")
+    buyer_name = (data.get("buyer_name") or "").strip()[:200]
+    if not buyer_name:
+        raise HTTPException(status_code=400, detail="Покупатель обязателен")
+    if not data.get("idempotency_key"):
+        raise HTTPException(status_code=400, detail="idempotency_key обязателен")
+
+    # Рассрочка: взнос и срок в месяцах. Дату последнего платежа считает сервис
+    # по графику — введённая руками, она рано или поздно разошлась бы с ним.
+    down_payment_cents = _machine_money(data.get("down_payment"), "Первоначальный взнос") or 0
+    months = 0
+    if kind == "credit":
+        try:
+            months = int(data.get("months") or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Срок рассрочки — целое число месяцев")
+
+    idem = _Idem(adb, "machine_deal", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await machines.create_deal(
+            machine_id,
+            kind=kind,
+            price_cents=price_cents,
+            buyer_name=buyer_name,
+            created_by=user["id"],
+            creator_name=_actor_name(user),
+            currency=(data.get("currency") or "USD").strip().upper()[:8],
+            buyer_phone=_machine_text(data, "buyer_phone", 40),
+            buyer_passport=_machine_text(data, "buyer_passport", 100),
+            buyer_note=_machine_text(data, "buyer_note", 1000),
+            agent_ms_id=_machine_text(data, "agent_ms_id", 64),
+            down_payment_cents=down_payment_cents,
+            months=months,
+        )
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/machines/deal_close")
+async def api_machines_deal_close(request: Request):
+    """Закрыть рассрочку: деньги получены полностью, машина → «Продана»."""
+    from services import async_db as adb
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_deal_close"
+    )
+    deal_id = _machine_id_arg(data, "deal_id")
+
+    idem = _Idem(adb, "machine_deal_close", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await machines.close_deal(
+            deal_id, user_id=user["id"], full_name=_actor_name(user)
+        )
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        # «Сделка не найдена или уже закрыта» — состояние на сервере другое,
+        # карточку надо перечитать, а не править поле.
+        return JSONResponse({**res, "detail": res.get("error", "")}, status_code=409)
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/machines/payment")
+async def api_machines_payment(request: Request):
+    """Отметить платёж графика рассрочки полученным (или снять отметку).
+
+    Когда получен последний платёж, сервис закрывает сделку и переводит машину
+    в «Продана» сам: закрывать руками после последнего платежа значит однажды
+    забыть это сделать.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_payment"
+    )
+    payment_id = _machine_id_arg(data, "payment_id")
+    paid = data.get("paid", True)
+    res = await machines.pay_installment(
+        payment_id, user_id=user["id"], full_name=_actor_name(user), paid=bool(paid)
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/receipt")
+async def api_machines_receipt(request: Request):
+    """Записать полученные по рассрочке деньги — сумма любая.
+
+    Клиент платит не «платёж №3», а деньги: в один месяц больше, в другой
+    меньше. Поступления гасят график по порядку, переплата уходит в следующие
+    месяцы, а последний закрытый платёж закрывает сделку.
+    """
+    from services import async_db as adb
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_receipt"
+    )
+    deal_id = _machine_id_arg(data, "deal_id")
+    amount_cents = _machine_money(data.get("amount"), "Сумма")
+    if not amount_cents:
+        raise HTTPException(status_code=400, detail="Сумма обязательна")
+    if not data.get("idempotency_key"):
+        raise HTTPException(status_code=400, detail="idempotency_key обязателен")
+
+    idem = _Idem(adb, "machine_receipt", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await machines.add_receipt(
+            deal_id, amount_cents, user_id=user["id"], full_name=_actor_name(user),
+            note=_machine_text(data, "note", 200),
+        )
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/machines/receipt_delete")
+async def api_machines_receipt_delete(request: Request):
+    """Удалить ошибочно внесённое поступление.
+
+    Если им была закрыта рассрочка — она открывается обратно: иначе долг
+    исчезает из напоминаний и дебиторки, хотя платёж не получен.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_receipt_delete"
+    )
+    receipt_id = _machine_id_arg(data, "receipt_id")
+    res = await machines.delete_receipt(
+        receipt_id, user_id=user["id"], full_name=_actor_name(user)
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/deals_open")
+async def api_machines_deals_open(request: Request):
+    """Незакрытые рассрочки по технике — кому напоминать о сроке."""
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_deals_open"
+    )
+    deals = await machines.get_open_credit_deals(role=get_role(user["id"]))
+    return JSONResponse({"ok": True, "deals": deals})
+
+
+# ─── Фотографии техники ──────────────────────────────────────────────────────
+# Единственный сторедж фотографий — Telegram: он хранит их бесплатно и вечно, а
+# файловая система Railway эфемерна (после каждого деплоя пусто). Отсюда два
+# следствия, которые и определяют весь код ниже.
+#
+# 1. Прямую ссылку Telegram клиенту отдать НЕЛЬЗЯ: она выглядит как
+#    `https://api.telegram.org/file/bot<TOKEN>/...` и содержит токен бота. Файл
+#    проксируем через себя.
+# 2. Кэшируем в памяти процесса, а не на диске — по той же причине эфемерности.
+#    Ключ — `file_unique_id`: он переживает смену сервера Bot API, в отличие от
+#    `tg_file_id`. Кэшируем сразу байты, а не `file_path`: тот живёт около часа
+#    и всё равно требует второго запроса.
+
+_PHOTO_CACHE: "OrderedDict[str, tuple[float, bytes]]" = OrderedDict()
+_PHOTO_CACHE_TTL = 600.0
+_PHOTO_CACHE_MAX_BYTES = 32 * 1024 * 1024
+_PHOTO_MAX_BYTES = 5 * 1024 * 1024
+# Сигнатуры форматов, которые Telegram принимает как фото. Проверяем именно
+# байты: заявленный в data-URL тип пишет клиент, и через поле «фотография»
+# иначе пройдёт что угодно.
+_PHOTO_MAGIC = ((b"\xff\xd8\xff", "image/jpeg"), (b"\x89PNG\r\n\x1a\n", "image/png"))
+
+
+def _photo_cache_get(key: str) -> bytes | None:
+    entry = _PHOTO_CACHE.get(key)
+    if not entry:
+        return None
+    stamp, blob = entry
+    if time.time() - stamp > _PHOTO_CACHE_TTL:
+        _PHOTO_CACHE.pop(key, None)
+        return None
+    _PHOTO_CACHE.move_to_end(key)
+    return blob
+
+
+def _photo_cache_put(key: str, blob: bytes) -> None:
+    _PHOTO_CACHE[key] = (time.time(), blob)
+    _PHOTO_CACHE.move_to_end(key)
+    total = sum(len(b) for _, b in _PHOTO_CACHE.values())
+    while total > _PHOTO_CACHE_MAX_BYTES and len(_PHOTO_CACHE) > 1:
+        _, (_, dropped) = _PHOTO_CACHE.popitem(last=False)
+        total -= len(dropped)
+
+
+def _photo_media_type(blob: bytes) -> str | None:
+    for magic, media in _PHOTO_MAGIC:
+        if blob.startswith(magic):
+            return media
+    return None
+
+
+def _chat_id_env(*names: str) -> int | None:
+    """Первый заданный id канала из перечисленных переменных."""
+    for name in names:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            logger.error("%s должен быть числом, получено: %r", name, raw)
+    return None
+
+
+def _machine_photos_chat_id() -> int | None:
+    """Приватный канал-хранилище для загруженных из WebApp фотографий.
+
+    Прецедент — `BACKUP_TG_CHAT_ID`. Без переменной загрузка выключена: фото
+    по-прежнему можно прислать боту, поэтому это деградация функции, а не
+    поломка раздела.
+
+    Имя обобщено до `PHOTOS_TG_CHAT_ID`: хранилище одно на технику и на товары,
+    а заводить под каждый раздел свой канал незачем. Старое имя продолжает
+    работать — переименовывать переменную на проде ради красоты не нужно.
+    """
+    return _chat_id_env("PHOTOS_TG_CHAT_ID", "MACHINE_PHOTOS_TG_CHAT_ID")
+
+
+def _channel_id() -> int | None:
+    """Публичный канал компании. Без него публикация выключена."""
+    return _chat_id_env("CHANNEL_ID")
+
+
+@app.post("/api/machines/photo")
+async def api_machines_photo(request: Request):
+    """Отдать фотографию машины байтами.
+
+    `photo_id` ищем СРЕДИ ФОТО ЗАЯВЛЕННОЙ МАШИНЫ — это и есть защита от
+    подстановки чужого id: снимок обязан принадлежать той машине, к которой
+    у пользователя есть доступ.
+    """
+    from services import machines
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=_MACHINE_ROLES,
+        rate_limit_scope="api_machines_photo",
+        rate_limit_max=120,  # лента карточки — это десяток запросов подряд
+    )
+    machine_id = _machine_id_arg(data)
+    photo_id = _machine_id_arg(data, "photo_id")
+
+    photos = await machines.list_photos(machine_id)
+    photo = next((p for p in photos if int(p["id"]) == photo_id), None)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Фото не найдено")
+
+    headers = {
+        "Cache-Control": "private, max-age=600",
+        "X-Content-Type-Options": "nosniff",
+    }
+    cached = _photo_cache_get(str(photo["file_unique_id"]))
+    if cached is not None:
+        return Response(cached, media_type=_photo_media_type(cached) or "image/jpeg", headers=headers)
+
+    try:
+        bot = await get_notify_bot()
+        meta = await bot.get_file(str(photo["tg_file_id"]))
+        if (meta.file_size or 0) > _PHOTO_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="Фото слишком большое")
+        buf = await bot.download_file(meta.file_path)
+        blob = buf.read() if hasattr(buf, "read") else bytes(buf)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Протухший file_id, удалённое сообщение, сбой сети — это «фото сейчас
+        # недоступно», а не поломка сервера: 500 поднял бы тревогу на ровном
+        # месте. Текст исключения aiogram может содержать токен (он входит в
+        # URL файлового API), поэтому в лог он идёт только через redact_token.
+        logger.warning(
+            "Не удалось отдать фото #%s машины #%s: %s",
+            photo_id, machine_id, redact_token(repr(e)),
+        )
+        raise HTTPException(status_code=404, detail="Фото недоступно")
+
+    _photo_cache_put(str(photo["file_unique_id"]), blob)
+    return Response(blob, media_type=_photo_media_type(blob) or "image/jpeg", headers=headers)
+
+
+@app.post("/api/machines/photo_upload")
+async def api_machines_photo_upload(request: Request):
+    """Загрузить фотографию машины из WebApp.
+
+    Приходит data-URL (base64), а не multipart: `python-multipart` в
+    зависимостях нет, и `UploadFile`/`Form` без него роняют приложение на
+    старте. JSON заодно сохраняет единый контракт `_authorize(data)`. Раздувание
+    base64 на треть безболезненно — браузер ужимает снимок canvas'ом до
+    отправки.
+
+    Файл кладём в приватный канал и храним только идентификаторы: своего
+    стореджа у нас нет и заводить его ради десятка снимков незачем.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_MACHINE_ROLES,
+        rate_limit_scope="api_machines_photo_upload",
+        # Пачкой грузят по одному запросу на снимок: экскаватор снимают с
+        # десятка ракурсов, и это одно действие, а не подозрительная активность.
+        rate_limit_max=60,
+    )
+    machine_id = _machine_id_arg(data)
+    chat_id = _machine_photos_chat_id()
+    if chat_id is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Загрузка фото не настроена: нет MACHINE_PHOTOS_TG_CHAT_ID. "
+                   "Пришлите фото боту.",
+        )
+
+    raw = str(data.get("data_url") or "")
+    if not raw.startswith("data:image/"):
+        raise HTTPException(status_code=400, detail="Ожидается изображение")
+    if "," not in raw:
+        raise HTTPException(status_code=400, detail="Повреждённое изображение")
+    # Оценка размера ДО декодирования: base64 длиннее оригинала на треть, и
+    # декодировать 40 МБ мусора, чтобы потом его отвергнуть, незачем.
+    payload = raw.split(",", 1)[1]
+    if len(payload) > _PHOTO_MAX_BYTES * 4 // 3 + 1024:
+        raise HTTPException(status_code=413, detail="Фото больше 5 МБ")
+    try:
+        blob = base64.b64decode(payload, validate=True)
+    except (ValueError, binascii.Error):
+        raise HTTPException(status_code=400, detail="Повреждённое изображение")
+    if len(blob) > _PHOTO_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Фото больше 5 МБ")
+    if _photo_media_type(blob) is None:
+        raise HTTPException(status_code=400, detail="Поддерживаются JPEG и PNG")
+
+    machine = await machines.get_machine(machine_id, role=get_role(user["id"]))
+    if not machine:
+        raise HTTPException(status_code=404, detail="Машина не найдена")
+
+    caption = (str(data.get("caption") or "")).strip()[:200]
+    try:
+        from aiogram.types import BufferedInputFile
+
+        bot = await get_notify_bot()
+        sent = await bot.send_photo(
+            chat_id,
+            BufferedInputFile(blob, filename=f"machine-{machine_id}.jpg"),
+            caption=f"#{machine_id} {machine.get('vin') or ''} {caption}".strip()[:1024],
+        )
+    except Exception as e:
+        logger.warning("Не удалось загрузить фото машины #%s: %s", machine_id, redact_token(repr(e)))
+        raise HTTPException(status_code=502, detail="Telegram не принял фото, попробуйте ещё раз")
+
+    # Берём самый крупный размер: Telegram отдаёт лесенку превью, и первый
+    # элемент — миниатюра ~90px, из которой карточку не рассмотреть.
+    best = max(sent.photo or [], key=lambda p: (p.width or 0) * (p.height or 0), default=None)
+    if best is None:
+        raise HTTPException(status_code=502, detail="Telegram не вернул файл")
+    res = await machines.add_photo(
+        machine_id,
+        tg_file_id=best.file_id,
+        file_unique_id=best.file_unique_id,
+        uploaded_by=user["id"],
+        caption=caption or None,
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/photo_delete")
+async def api_machines_photo_delete(request: Request):
+    """Открепить фотографию от машины. Только admin/boss.
+
+    Из Telegram файл не удаляем — там он и не мешает, а вот восстановить
+    случайно снятый снимок иначе было бы нечем.
+    """
+    from services import machines
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_photo_delete"
+    )
+    machine_id = _machine_id_arg(data)
+    photo_id = _machine_id_arg(data, "photo_id")
+    photos = await machines.list_photos(machine_id)
+    if not any(int(p["id"]) == photo_id for p in photos):
+        raise HTTPException(status_code=404, detail="Фото не найдено")
+    res = await machines.delete_photo(photo_id)
+    if not res.get("ok"):
+        raise HTTPException(status_code=404, detail="Фото не найдено")
+    return JSONResponse({"ok": True, "photo_id": photo_id})
+
+
+# ─── API: контейнеры ─────────────────────────────────────────────────────────
+# Что едет, что уже здесь и сошёлся ли состав. Роли те же, что у техники:
+# заводит и принимает менеджер, удаляет руководство.
+
+_CONTAINER_ROLES = ("admin", "boss", "manager")
+
+
+@app.post("/api/containers/list")
+async def api_containers_list(request: Request):
+    """Список контейнеров + счётчики. Payload: {"status": "in_transit"?}."""
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_list"
+    )
+    status = (data.get("status") or "").strip() or None
+    if status and status not in containers.STATUSES:
+        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+    search = (data.get("search") or "").strip()[:64] or None
+
+    # Сводку и окно правки считает сервис одним проходом — раньше здесь был
+    # запрос состава на КАЖДЫЙ контейнер, то есть N+1 на список.
+    rows = await containers.list_containers(status, search=search)
+    for row in rows:
+        row["diff"] = row.pop("summary", None)
+    return JSONResponse(
+        {
+            "ok": True,
+            "containers": rows,
+            "counts": await containers.count_by_status(),
+            "status": status or "all",
+            "can_manage": get_role(user["id"]) in _MACHINE_BOSS,
+            "status_labels": containers.STATUS_LABELS,
+        }
+    )
+
+
+@app.post("/api/containers/card")
+async def api_containers_card(request: Request):
+    """Карточка контейнера: состав с расхождениями «заявлено → прибыло»."""
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_card"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    container = await containers.get_container(container_id)
+    if not container:
+        raise HTTPException(status_code=404, detail="Контейнер не найден")
+
+    from services import ms_supply
+
+    items = containers.diff(await containers.list_items(container_id))
+    return JSONResponse(
+        {
+            "ok": True,
+            "container": container,
+            "items": items,
+            "diff": containers.diff_summary(items),
+            # Окно правки: фронт по нему решает, показывать ли кнопки, а не
+            # выясняет это отказом ручки после нажатия.
+            "edit_window": containers.edit_window(container),
+            "supply": await ms_supply.get_link(container_id),
+            "can_manage": get_role(user["id"]) in _MACHINE_BOSS,
+            "status_labels": containers.STATUS_LABELS,
+        }
+    )
+
+
+@app.post("/api/containers/create")
+async def api_containers_create(request: Request):
+    from services import async_db as adb
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_create",
+        rate_limit_max=20,
+    )
+    idem = _Idem(adb, "container_create", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await containers.create_container(
+            number=(data.get("number") or "").strip()[:32],
+            created_by=user["id"],
+            creator_name=_actor_name(user),
+            eta_date=_machine_text(data, "eta_date", 20),
+            notes=_machine_text(data, "notes", 1000),
+        )
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/containers/update")
+async def api_containers_update(request: Request):
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_update"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    raw = data.get("fields")
+    if not isinstance(raw, dict) or not raw:
+        raise HTTPException(status_code=400, detail="Нечего менять")
+    fields = {
+        k: (str(v).strip()[:1000] or None) if v is not None else None for k, v in raw.items()
+    }
+    res = await containers.update_container(
+        container_id, user_id=user["id"], full_name=_actor_name(user), **fields
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/containers/item_add")
+async def api_containers_item_add(request: Request):
+    """Добавить позицию в состав.
+
+    `arrived_qty` задают, когда позицию нашли в прибывшем контейнере, а в
+    заявленном составе её не было — то есть для излишка.
+    """
+    from services import containers
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_item_add",
+        rate_limit_max=120,  # состав заполняют подряд, позиция за позицией
+    )
+    container_id = _machine_id_arg(data, "container_id")
+
+    def _num(key):
+        value = data.get(key)
+        if value is None or str(value).strip() == "":
+            return None
+        try:
+            return float(str(value).replace(",", "."))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{key}: не число")
+
+    res = await containers.add_item(
+        container_id,
+        name=(data.get("name") or "").strip()[:200],
+        expected_qty=_num("expected_qty") or 0,
+        arrived_qty=_num("arrived_qty"),
+        unit=(data.get("unit") or "шт").strip()[:16],
+        note=_machine_text(data, "note", 500),
+        # Товар выбран из каталога — приёмка попадёт ровно на эту карточку,
+        # без угадывания по названию.
+        ms_id=(data.get("ms_id") or "").strip()[:64] or None,
+        ms_name=_machine_text(data, "ms_name", 200),
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/containers/item_link")
+async def api_containers_item_link(request: Request):
+    """Привязать позицию состава к карточке номенклатуры МойСклад.
+
+    Нужна и постфактум: состав часто заводят до того, как товар появился в
+    каталоге, а несопоставленная позиция — это остаток, которого нет.
+    """
+    from services import containers
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_item_link",
+        rate_limit_max=120,
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    item_id = _machine_id_arg(data, "item_id")
+    res = await containers.link_item(
+        container_id, item_id,
+        ms_id=(data.get("ms_id") or "").strip()[:64],
+        ms_name=_machine_text(data, "ms_name", 200),
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/containers/item_create_product")
+async def api_containers_item_create_product(request: Request):
+    """Завести карточку товара в МойСклад по названию позиции и привязать её.
+
+    Заводит ЧЕЛОВЕК кнопкой: автосоздание из приёмки превратило бы каждую
+    опечатку в новую позицию справочника.
+    """
+    from services import containers, ms_supply
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES,
+        rate_limit_scope="api_containers_item_create_product", rate_limit_max=30,
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    item_id = _machine_id_arg(data, "item_id")
+    # Позицию ищем ВНУТРИ заявленного контейнера — гейт от подстановки чужого id,
+    # и заодно название берём наше, а не присланное клиентом.
+    item = next(
+        (i for i in await containers.list_items(container_id) if int(i["id"]) == item_id), None
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
+
+    created = await ms_supply.create_product(
+        str(item["name"]), unit=str(item.get("unit") or "шт")
+    )
+    if not created.get("ok"):
+        return _machine_response(created)
+    res = await containers.link_item(
+        container_id, item_id, ms_id=created["ms_id"], ms_name=created.get("name")
+    )
+    if not res.get("ok"):
+        return _machine_response(res)
+    return JSONResponse({**res, "name": created.get("name"), "existed": created.get("existed")})
+
+
+@app.post("/api/containers/item_delete")
+async def api_containers_item_delete(request: Request):
+    from services import containers
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_item_delete"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    item_id = _machine_id_arg(data, "item_id")
+    # Позицию ищем ВНУТРИ заявленного контейнера — гейт от подстановки чужого id.
+    res = await containers.delete_item(container_id, item_id)
+    return _machine_response(res)
+
+
+@app.post("/api/containers/check")
+async def api_containers_check(request: Request):
+    """Проставить фактические количества по позициям приёмки.
+
+    Payload: {"container_id": N, "quantities": {"<item_id>": 18, ...}}.
+    Пустое значение сбрасывает факт в «ещё не считали»: приёмщик должен иметь
+    возможность отменить свою же опечатку, а не только записать ноль.
+    """
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_check"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    raw = data.get("quantities")
+    if not isinstance(raw, dict) or not raw:
+        raise HTTPException(status_code=400, detail="Нечего сохранять")
+    quantities: dict[int, object] = {}
+    for key, value in raw.items():
+        try:
+            quantities[int(key)] = value
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="item_id: не число")
+
+    res = await containers.set_arrived_quantities(
+        container_id, quantities, user_id=user["id"], full_name=_actor_name(user)
+    )
+    if not res.get("ok"):
+        return _machine_response(res)
+
+    # Остаток в МойСклад пополняем сразу после сохранения — ради этого приёмку
+    # и считают. Best-effort: сверка уже сохранена, и отказ МойСклад не должен
+    # выглядеть как «ничего не записалось». Что не прошло — возвращаем текстом,
+    # чтобы это можно было починить, а не узнать через неделю по остаткам.
+    from services import ms_supply
+
+    supply = await ms_supply.sync_supply(container_id)
+    res["supply"] = supply
+    return JSONResponse(res)
+
+
+@app.post("/api/containers/supplier")
+async def api_containers_supplier(request: Request):
+    """Задать поставщика контейнера — «Приёмке» в МойСклад он обязателен.
+
+    Спрашиваем заранее, а не в момент приёмки: когда считают коробки, о
+    поставщике не думают.
+    """
+    from services import ms_supply
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_supplier"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    ms_id = (data.get("supplier_ms_id") or "").strip()[:64] or None
+    name = (data.get("supplier_name") or "").strip()[:200] or None
+    if not ms_id:
+        raise HTTPException(status_code=400, detail="Выберите поставщика из справочника")
+    res = await ms_supply.set_supplier(container_id, ms_id=ms_id, name=name)
+    return _machine_response(res)
+
+
+@app.post("/api/containers/supply")
+async def api_containers_supply(request: Request):
+    """Оприходовать контейнер в МойСклад вручную — повтор после сбоя или после
+    того, как недостающий товар завели в номенклатуре."""
+    from services import ms_supply
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_supply",
+        rate_limit_max=20,
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    res = await ms_supply.sync_supply(container_id)
+    return _machine_response(res)
+
+
+@app.post("/api/containers/arrive")
+async def api_containers_arrive(request: Request):
+    """Отметить контейнер прибывшим."""
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_arrive"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    res = await containers.mark_arrived(
+        container_id, user_id=user["id"], full_name=_actor_name(user)
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/containers/delete")
+async def api_containers_delete(request: Request):
+    """Удалить контейнер. Только admin/boss и пока открыто окно правки."""
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_containers_delete"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    res = await containers.delete_container(
+        container_id, user_id=user["id"], full_name=_actor_name(user)
+    )
+    return _machine_response(res)
 
 
 @app.post("/api/users/deactivate")
@@ -3443,9 +5519,34 @@ async def api_debts(request: Request):
         for k, v in sorted(rem_by_cur.items(), key=lambda kv: kv[1], reverse=True)
     ]
 
+    # Рассрочки по технике — второй поток тех же денег. Отдаём той же ручкой:
+    # экран один, и второй запрос за тем же экраном не нужен. В кредитный лимит
+    # контрагента они НЕ входят — покупатель техники это имя и паспорт, а не
+    # контрагент МойСклад.
+    machine_debts: list[dict] = []
+    totals = None
+    if is_boss:
+        from services import receivables
+
+        machine_debts = await receivables.machine_debt_rows(today)
+        # Итог «нам должны: заказы / техника / всего» — по тем же строкам, что
+        # уже посчитаны выше, без второго прохода по БД.
+        order_items = [
+            receivables.Receivable(
+                "order", int(r["id"]), f"#{r['id']}", r["agent_name"], r["user_id"],
+                r["due_date"], money.to_cents(r["remaining"]), r["currency"],
+            )
+            for r in result if r["remaining"] > 0
+        ]
+        totals = receivables.totals_by_source(
+            order_items + await receivables.machine_receivables()
+        )
+
     return JSONResponse(
         {
             "debts": result,
+            "machine_debts": machine_debts,
+            "totals": totals,
             "role": role,
             "scope": "company" if is_boss else "personal",
             "today": today,

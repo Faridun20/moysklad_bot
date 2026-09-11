@@ -8,6 +8,9 @@ CLI: ежедневное напоминание о долгах. Запуска
      - Каждому boss/admin — сводку по всей компании.
   3. Шлёт одно сообщение на получателя (а не одно на долг — чтобы не
      спамить чат).
+  4. Отдельным сообщением — платежи по рассрочке техники, срок которых
+     наступил. Это другой учёт (машина и покупатель, а не заказ и контрагент)
+     и другие получатели: рассрочку оформляет руководство.
 
 Использование:
     python -m tasks.run_debts_notify
@@ -104,39 +107,56 @@ def _format_message(
     return "\n".join(parts)
 
 
+async def _notify_machine_installments(bosses: list[dict], today_str: str) -> int:
+    """Платежи по рассрочке техники, срок которых наступил.
+
+    Отдельным сообщением, а не строкой в сводке долгов: это другой учёт (машина
+    и покупатель, а не заказ и контрагент), и получатели другие — рассрочку
+    оформляет руководство, менеджеру эти платежи не адресованы.
+
+    Отметку «напомнили» ставим ПОСЛЕ отправки: упавшая отправка не должна
+    съесть напоминание — тогда о платеже не узнают вовсе.
+    """
+    from services import machines
+
+    due = await machines.due_installments(today_str)
+    if not due:
+        return 0
+
+    overdue = [p for p in due if str(p["due_date"]) < today_str]
+    parts = ["🚜 <b>Платежи по рассрочке техники</b>\n"]
+    for p in due[:20]:
+        mark = "⚠️" if str(p["due_date"]) < today_str else "⏰"
+        parts.append(
+            f"  {mark} {_esc(p['machine_name'] or '—')} ({_esc(p['vin'] or '—')}) · "
+            f"{_esc(p['buyer_name'] or '—')}\n"
+            f"     платёж {p['seq']} · <b>{_fmt_cents(p['amount_cents'])} "
+            f"{_esc(p.get('currency') or BASE_CURRENCY)}</b> · {_to_ru(str(p['due_date']))}"
+        )
+    if len(due) > 20:
+        parts.append(f"  …и ещё {len(due) - 20}")
+    if overdue:
+        parts.insert(1, f"⚠️ <b>Просрочено: {len(overdue)}</b>\n")
+    parts.append(
+        "\n<i>Откройте WebApp → «Заказы» → «Техника», чтобы отметить полученные.</i>"
+    )
+    text = "\n".join(parts)
+
+    sent = 0
+    for boss in bosses:
+        await tg_send_message(boss["user_id"], text)
+        sent += 1
+    if sent:
+        for p in due:
+            await machines.mark_installment_notified(int(p["id"]))
+    logger.info("machine_installments: %d платежей, %d получателей", len(due), sent)
+    return sent
+
+
 async def main() -> int:
     init_db()
 
     today_str = date.today().isoformat()
-
-    # get_open_debts возвращает все credit+paid_confirmed_at IS NULL.
-    # Делим по платежам:
-    #   - менеджеру нужно действие, если по долгу НЕТ pending payments
-    #     (он ещё ничего не отмечал или босс отклонил всё)
-    #   - боссу — всё, ему важно видеть и долги с pending'ами для approve
-    all_debts_full = await get_open_debts(due_through=today_str)
-    if not all_debts_full:
-        logger.info("Нет долгов к оплате сегодня — никому ничего не шлём.")
-        return 0
-
-    # Один батч на остатки и на платежи. Остаток — из services.debts, тем же
-    # кодом, что /api/debts и карточка заказа (T2.1).
-    from services.debts import calc_order_balances
-
-    debt_ids = [d["id"] for d in all_debts_full]
-    balances = await calc_order_balances(debt_ids)
-    payments_by_order = await get_payments_for_orders(debt_ids)
-
-    def _has_pending(order_id):
-        return any(p["status"] == "pending" for p in payments_by_order.get(order_id, []))
-
-    all_debts_for_managers = [d for d in all_debts_full if not _has_pending(d["id"])]
-    all_debts_for_bosses = all_debts_full
-
-    # Группируем по user_id (менеджеру-владельцу заказа)
-    by_manager: dict[int, list[dict]] = {}
-    for d in all_debts_for_managers:
-        by_manager.setdefault(d["user_id"], []).append(d)
 
     users = get_all_users()
     # deactivated_at — как в notifier.get_notify_recipients: уволенный
@@ -146,43 +166,73 @@ async def main() -> int:
         for u in users
         if u["role"] in ("admin", "boss") and not u.get("deactivated_at")
     ]
-    managers_by_id = {u["user_id"]: u for u in users if u["role"] == "manager"}
+
+    # get_open_debts возвращает все credit+paid_confirmed_at IS NULL.
+    # Делим по платежам:
+    #   - менеджеру нужно действие, если по долгу НЕТ pending payments
+    #     (он ещё ничего не отмечал или босс отклонил всё)
+    #   - боссу — всё, ему важно видеть и долги с pending'ами для approve
+    all_debts_full = await get_open_debts(due_through=today_str)
 
     sent = 0
     try:
-        # 1. Менеджерам — их собственные долги
-        for uid, debts in by_manager.items():
-            if uid not in managers_by_id and not any(
-                u["user_id"] == uid and u["role"] in ("admin", "boss") for u in users
-            ):
-                # У владельца заказа нет активного аккаунта — пропускаем
-                # (босс всё равно получит сводку ниже).
-                continue
-            text = _format_message(debts, balances, today_str, is_boss_view=False)
-            await tg_send_message(uid, text)
-            sent += 1
+        if all_debts_full:
+            # Один батч на остатки и на платежи. Остаток — из services.debts, тем
+            # же кодом, что /api/debts и карточка заказа (T2.1).
+            from services.debts import calc_order_balances
 
-        # 2. Boss/admin — сводка по всей компании (включая awaiting confirmation)
-        boss_text = _format_message(
-            all_debts_for_bosses, balances, today_str, is_boss_view=True
-        )
-        # Дополним подсказкой про подтверждения, если они есть
-        awaiting_count = sum(1 for d in all_debts_for_bosses if _has_pending(d["id"]))
-        if awaiting_count:
-            boss_text += (
-                f"\n\n⏳ <b>Требуют подтверждения: {awaiting_count}</b>"
-                f"\nОткройте WebApp → «Финансы» → «Долги» или /debts в чате."
+            debt_ids = [d["id"] for d in all_debts_full]
+            balances = await calc_order_balances(debt_ids)
+            payments_by_order = await get_payments_for_orders(debt_ids)
+
+            def _has_pending(order_id):
+                return any(
+                    p["status"] == "pending" for p in payments_by_order.get(order_id, [])
+                )
+
+            all_debts_for_managers = [
+                d for d in all_debts_full if not _has_pending(d["id"])
+            ]
+            by_manager: dict[int, list[dict]] = {}
+            for d in all_debts_for_managers:
+                by_manager.setdefault(d["user_id"], []).append(d)
+            managers_by_id = {u["user_id"]: u for u in users if u["role"] == "manager"}
+
+            # 1. Менеджерам — их собственные долги
+            for uid, debts in by_manager.items():
+                if uid not in managers_by_id and not any(
+                    u["user_id"] == uid and u["role"] in ("admin", "boss") for u in users
+                ):
+                    # У владельца заказа нет активного аккаунта — пропускаем
+                    # (босс всё равно получит сводку ниже).
+                    continue
+                text = _format_message(debts, balances, today_str, is_boss_view=False)
+                await tg_send_message(uid, text)
+                sent += 1
+
+            # 2. Boss/admin — сводка по всей компании (включая awaiting confirmation)
+            boss_text = _format_message(
+                all_debts_full, balances, today_str, is_boss_view=True
             )
-        for boss in bosses:
-            await tg_send_message(boss["user_id"], boss_text)
-            sent += 1
+            # Дополним подсказкой про подтверждения, если они есть
+            awaiting_count = sum(1 for d in all_debts_full if _has_pending(d["id"]))
+            if awaiting_count:
+                boss_text += (
+                    f"\n\n⏳ <b>Требуют подтверждения: {awaiting_count}</b>"
+                    f"\nОткройте WebApp → «Финансы» → «Долги» или /debts в чате."
+                )
+            for boss in bosses:
+                await tg_send_message(boss["user_id"], boss_text)
+                sent += 1
+        else:
+            logger.info("Нет долгов по заказам к оплате сегодня.")
 
-        logger.info(
-            "debts_notify: отправлено %d сообщений (для менеджеров: %d, для боссов: %d)",
-            sent,
-            len(all_debts_for_managers),
-            len(all_debts_for_bosses),
-        )
+        # Рассрочки по технике — свой учёт, поэтому считаются ВСЕГДА, а не
+        # только когда есть долги по заказам. Раньше здесь стоял ранний выход,
+        # и платёж по технике молча пропускался в день без долгов.
+        sent += await _notify_machine_installments(bosses, today_str)
+
+        logger.info("debts_notify: отправлено %d сообщений", sent)
         return 0
     except Exception:
         logger.exception("debts_notify: ошибка")

@@ -153,6 +153,7 @@ def _pg_dump_pure_python(db_url: str, out_path: Path) -> int:
         )
         tables = [r[0] for r in cur.fetchall()]
 
+        rows_by_table: dict[str, int] = {}
         with gzip.open(str(out_path), "wt", encoding="utf-8") as gz:
             gz.write("-- Pure-Python COPY dump (data-only) — fallback без pg_dump\n")
             gz.write("-- Restore: python -m tasks.migrate && psql $DATABASE_URL < this.sql\n")
@@ -168,12 +169,45 @@ def _pg_dump_pure_python(db_url: str, out_path: Path) -> int:
                 # copy_expert пишет str в text-mode file (наш gzip wt).
                 buf = io.StringIO()
                 cur.copy_expert(f"COPY {qt} TO STDOUT", buf)
-                gz.write(buf.getvalue())
+                payload = buf.getvalue()
+                gz.write(payload)
                 gz.write("\\.\n")
+                # В COPY text-формате перевод строки внутри значения
+                # экранируется как «\n» двумя символами, поэтому реальные
+                # переводы строк — это ровно строки таблицы.
+                rows_by_table[t] = payload.count("\n")
             gz.write("\nCOMMIT;\n")
     finally:
         conn.close()
+
+    _log_dump_contents(rows_by_table)
     return out_path.stat().st_size
+
+
+def _log_dump_contents(rows_by_table: dict[str, int]) -> None:
+    """Что именно попало в дамп — иначе «Backup создан: 0.01 MB» ничего не значит.
+
+    Размер файла не отвечает на единственный важный вопрос: это маленькая база
+    или пустой дамп. Печатаем число строк и крупнейшие таблицы — по ним видно
+    сразу, а пустой дамп кричит о себе сам, не дожидаясь дня восстановления.
+    """
+    total = sum(rows_by_table.values())
+    filled = {t: n for t, n in rows_by_table.items() if n}
+    if not total:
+        logger.error(
+            "Дамп ПУСТОЙ: %d таблиц, 0 строк. Файл создан, но восстанавливать из "
+            "него нечего — проверьте, что DATABASE_URL указывает на боевую базу.",
+            len(rows_by_table),
+        )
+        return
+    top = sorted(filled.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    logger.info(
+        "Дамп: %d таблиц (%d непустых), %d строк. Крупнейшие: %s",
+        len(rows_by_table),
+        len(filled),
+        total,
+        ", ".join(f"{t}={n}" for t, n in top),
+    )
 
 
 def _create_backup_sqlite(db_path: str, out_path: Path) -> int:
@@ -192,6 +226,47 @@ def _create_backup_sqlite(db_path: str, out_path: Path) -> int:
                 break
             fout.write(chunk)
     return out_path.stat().st_size
+
+
+# Расшифровка отказов Telegram при загрузке. Без неё в логе остаётся
+# «Bad Request: chat not found» и стек aiogram на десять кадров — по нему не
+# видно, что чинить надо переменную окружения, а не код. Ключ — подстрока
+# ответа Bot API в нижнем регистре.
+_UPLOAD_HINTS: tuple[tuple[str, str], ...] = (
+    (
+        "chat not found",
+        "чата {chat_id} бот не видит. Обычно одно из двух: бота не добавили в "
+        "канал (или удалили), либо id записан без префикса -100. Перешлите "
+        "сообщение из канала в @userinfobot, сверьте id и добавьте бота "
+        "администратором.",
+    ),
+    (
+        "not enough rights",
+        "бот состоит в канале {chat_id}, но публиковать не может — дайте ему "
+        "право Post Messages.",
+    ),
+    (
+        "bot was kicked",
+        "бота удалили из канала {chat_id} — верните администратором.",
+    ),
+    (
+        "bot is not a member",
+        "бот не состоит в канале {chat_id} — добавьте его администратором.",
+    ),
+    (
+        "chat_id is empty",
+        "BACKUP_TG_CHAT_ID пуст или нечитаем.",
+    ),
+)
+
+
+def upload_failure_hint(exc: BaseException, chat_id: int) -> str | None:
+    """Человеческое объяснение отказа Telegram или None, если причина незнакомая."""
+    text = str(exc).lower()
+    for needle, hint in _UPLOAD_HINTS:
+        if needle in text:
+            return hint.format(chat_id=chat_id)
+    return None
 
 
 async def _upload_to_telegram(token: str, chat_id: int, file_path: Path, caption: str) -> None:
@@ -284,8 +359,15 @@ async def main() -> int:
             await _upload_to_telegram(TELEGRAM_TOKEN, tg_chat_id, out_path, caption)
             logger.info("Backup загружен в Telegram-канал %s", tg_chat_id)
             return 0
-        except Exception:
-            logger.exception("Upload в Telegram упал")
+        except Exception as e:
+            from utils.helpers import redact_token
+
+            hint = upload_failure_hint(e, tg_chat_id)
+            if hint:
+                # Причина известна и чинится настройкой — стек тут только шумит.
+                logger.error("Backup собран, но не отправлен: %s", hint)
+            else:
+                logger.exception("Upload в Telegram упал: %s", redact_token(repr(e)))
             return 1
 
 
