@@ -455,8 +455,10 @@
   // здесь количества могут быть дробными.
   function whStockBadge(q) {
     const n = Number(q || 0);
-    const cls = n <= 0 ? 'badge-red' : (n < 20 ? 'badge-yellow' : 'badge-green');
-    return `<span class="stock-badge ${cls}">${n <= 0 ? 'нет' : whQty(n)}</span>`;
+    // Состояние — атрибутом, цвет выводится из переменных (см. [data-status]
+    // в style.css). Классы badge-* — прежняя система, её разметку не плодим.
+    const state = n <= 0 ? 'out' : (n < 20 ? 'low' : 'in_stock');
+    return `<span class="stock-badge" data-status="${state}">${n <= 0 ? 'нет' : whQty(n)}</span>`;
   }
 
   // ─── Техника ──────────────────────────────────────────────────────────────

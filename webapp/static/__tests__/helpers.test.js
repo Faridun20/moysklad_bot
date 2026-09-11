@@ -897,11 +897,12 @@ describe('склад: форматирование', () => {
   });
 
   it('whStockBadge: нет остатка / мало / достаточно', () => {
+    // Состояние — в data-status, цвет выводится из переменных CSS.
     expect(whStockBadge(0)).toContain('нет');
-    expect(whStockBadge(0)).toContain('badge-red');
+    expect(whStockBadge(0)).toContain('data-status="out"');
     expect(whStockBadge(-1)).toContain('нет');
-    expect(whStockBadge(5)).toContain('badge-yellow');
-    expect(whStockBadge(500)).toContain('badge-green');
+    expect(whStockBadge(5)).toContain('data-status="low"');
+    expect(whStockBadge(500)).toContain('data-status="in_stock"');
     expect(whStockBadge(2.5)).toContain('2,5');
   });
 });

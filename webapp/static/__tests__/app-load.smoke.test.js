@@ -1853,3 +1853,92 @@ describe('правка контейнера', () => {
     expect(doc.querySelector('#ms-f-notes').value).toBe('новая заметка');
   });
 });
+
+describe('склад: локальные остатки и накладные', () => {
+  // Экраны живут не вкладками, а дочерними экранами раздела «Склад»: у босса
+  // раздел уже занимает все четыре слота (инвариант «не больше 4 вкладок»).
+  // Регресс, который тут стережётся: после переезда на разделы main экраны
+  // остались в коде, но кнопки, ведущей к ним, не было — они были недостижимы.
+
+  it('на дочернем экране подсвечен таб «Склад», а не пустота', async () => {
+    // Проверяем наблюдаемое: экран не имеет своей кнопки в наве, и без
+    // NAV_PARENT ни один таб не был бы активен — пользователь терял бы
+    // ориентир, где находится.
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      buildNav();
+      api = async () => ({ products: [] });
+      window.__ready = showScreen('whremains');
+    `);
+    await window.__ready;
+    const active = window.document.querySelector('.nav-item.active');
+    expect(active).not.toBeNull();
+    expect(active.dataset.screen).toBe('stock');
+  });
+
+  it('на вкладке «Каталог» есть кнопки входа', () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      stockData = { products: [], categories: [], ms_unavailable: false };
+      renderStockContent();
+    `);
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('[data-wh-go="whremains"]')).not.toBeNull();
+    expect(content.querySelector('[data-wh-go="whinvoices"]')).not.toBeNull();
+  });
+
+  it('остатки рисуют товары и количества', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => ({ products: [
+        { product_id: 1, name: 'Болт М8', sku: 'B8', unit: 'шт', quantity: 12, category: 'Крепёж' },
+        { product_id: 2, name: 'Гайка М8', sku: 'G8', unit: 'шт', quantity: 0, category: 'Крепёж' },
+      ]});
+      window.__ready = renderWhRemains();
+    `);
+    await window.__ready;
+    const text = window.document.getElementById('content').textContent;
+    expect(text).toContain('Болт М8');
+    expect(text).toContain('12');
+    // Нулевой остаток показывается словом, а не «0» — иначе его не отличить
+    // от неизвестного.
+    expect(text).toContain('нет');
+  });
+
+  it('список накладных показывает номер, сумму и статус отправки', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => ({ invoices: [
+        { id: 5, type: 'outgoing', invoice_number: 'OUT-2026-0001', invoice_date: '2026-09-11',
+          status: 'confirmed', currency: 'USD', total_amount_cents: 75000,
+          telegram_sent: 0, counterparty_name: 'ООО Ромашка' },
+      ]});
+      window.__ready = renderWhInvoiceList();
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    const text = content.textContent;
+    expect(text).toContain('OUT-2026-0001');
+    expect(text).toContain('750,00 USD');
+    expect(text).toContain('PDF не отправлен');
+    // Отмена — только руководству, и кнопка создания на месте.
+    expect(content.querySelector('[data-wh-cancel="5"]')).not.toBeNull();
+    expect(content.querySelector('#wh-new')).not.toBeNull();
+  });
+
+  it('менеджеру кнопку отмены не показывают', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      api = async () => ({ invoices: [
+        { id: 5, type: 'outgoing', invoice_number: 'OUT-2026-0001', invoice_date: '2026-09-11',
+          status: 'confirmed', currency: 'USD', total_amount_cents: 75000,
+          telegram_sent: 1, counterparty_name: 'ООО Ромашка' },
+      ]});
+      window.__ready = renderWhInvoiceList();
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('[data-wh-cancel="5"]')).toBeNull();
+    expect(content.textContent).toContain('PDF отправлен');
+  });
+});

@@ -8,7 +8,23 @@
 `services/snapshot.py`, `tasks/run_ms_reconcile.py`, `tasks/run_ms_sync_retry.py`,
 `services/database.py` (выборки реконсиляции).
 
-**Код не менялся** — это только аудит.
+**Статус на 2026-09-11.** Отчёт составлен раньше; с тех пор часть пунктов
+внедрена в `main` (волна 7). Проверено по коду, а не по сообщениям коммитов:
+
+| Пункт | Статус | Где смотреть |
+|---|---|---|
+| MS-1 заголовки лимитов, 1049 vs 1073 | **Внедрено** | `services/moysklad.py` — `_H_RETRY_AFTER`, `_H_REMAINING`, `_ERR_RATE`, `_ERR_PARALLEL`, мягкий порог `_REMAINING_SOFT_FLOOR` |
+| MS-2 конкурентность по документации | **Внедрено** | `services/moysklad.py` — `_POSITIONS_CONCURRENCY_LIMIT = _MS_PARALLEL_LIMIT` |
+| MS-4 реконсиляция батчами | **Внедрено** | `tasks/run_ms_reconcile.py` — `filter=id=<uuid>;id=<uuid>…` по 100 документов |
+| MS-5 дельта остатков | **Внедрено** | `services/snapshot.py` — `report/stock/all/current?changedSince=` с перекрытием интервалов |
+| MS-8 syncId у salesreturn | **Внедрено** | `services/ms_returns.py:90` — `order_sync_id("salesreturn", …)`; удаление orphan-дубля больше не нужно |
+| MS-3 массовый POST paymentin | Открыт | `tasks/run_ms_sync_retry.py` по-прежнему в цикле по одному |
+| MS-6 expand и N+1 сотрудников | Открыт | `services/moysklad.py:787,970` — позиции всё ещё отдельными запросами; `services/ms_sync.py:136` — список сотрудников на каждого менеджера |
+| MS-7 шаблон `demand/new` | Открыт (и не планировался) | В коде не используется — так и задумано, см. §5 |
+| MS-9 аудит МойСклад | Открыт | Обращений к `/audit` в коде нет |
+
+Разделы ниже описывают состояние на момент сверки с документацией и оставлены
+как есть: они объясняют, почему внедрённые пункты сделаны именно так.
 
 ---
 

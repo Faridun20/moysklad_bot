@@ -200,10 +200,6 @@ function setScreenContext(text) {
   if (greeting) greeting.textContent = text || _greetingText;
 }
 
-function showError(msg) {
-  document.getElementById('content').innerHTML = errorBox(msg);
-}
-
 // PR E: единый error-блок с кнопкой «Повторить». Раньше экраны при сбое
 // показывали голый текст без способа повторить (кроме ре-навигации).
 // Retry перезагружает текущий экран через showScreen(currentScreen).
@@ -6578,7 +6574,7 @@ async function renderWhInvoiceList() {
             </div>
             <div class="order-sub">${escapeHtml(inv.counterparty_name || 'Без контрагента')}</div>
           </div>
-          <span class="order-status ${cancelled ? 'status-rejected' : 'status-approved'}">
+          <span class="order-status" data-status="${cancelled ? 'rejected' : 'approved'}">
             ${cancelled ? 'отменена' : (isOut ? 'расход' : 'приход')}
           </span>
         </div>
