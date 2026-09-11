@@ -9,6 +9,7 @@ import helpers from '../helpers.js';
 const {
   escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml,
   parsePaymentItems, renderMoneyTotalsHtml, financeTabs, balanceParts, periodSegHtml,
+  whMoney, whQty, whStockBadge,
 } = helpers;
 
 describe('periodSegHtml (WP-29)', () => {
@@ -289,5 +290,49 @@ describe('financeTabs', () => {
       expect(k).not.toContain('overview');
       expect(k).not.toContain('my');
     }
+  });
+});
+
+describe('склад: форматирование', () => {
+  it('whMoney печатает копейки как деньги с двумя знаками', () => {
+    // Два знака обязательны: «750 USD» в накладной читается как другая сумма.
+    expect(whMoney(75000, 'USD')).toBe('750,00 USD');
+    expect(whMoney(9999, 'USD')).toBe('99,99 USD');
+    expect(whMoney(1, 'UZS')).toBe('0,01 UZS');
+  });
+
+  it('whMoney не теряет копейку на дробных суммах', () => {
+    expect(whMoney(253, 'USD')).toBe('2,53 USD');
+  });
+
+  it('whMoney: пустое/нулевое — ноль, а не NaN', () => {
+    expect(whMoney(0, 'USD')).toBe('0,00 USD');
+    expect(whMoney(null, 'USD')).toBe('0,00 USD');
+    expect(whMoney(undefined, 'USD')).toBe('0,00 USD');
+  });
+
+  it('whMoney экранирует валюту (приходит из БД)', () => {
+    expect(whMoney(100, '<b>')).toBe('1,00 &lt;b&gt;');
+  });
+
+  it('whMoney без валюты печатает только число (строка «Итого»)', () => {
+    expect(whMoney(75000, '')).toBe('750,00');
+  });
+
+  it('whQty срезает хвостовые нули и держит дробные', () => {
+    expect(whQty(3)).toBe('3');
+    expect(whQty(3.0)).toBe('3');
+    expect(whQty(2.5)).toBe('2,5');
+    expect(whQty(0)).toBe('0');
+    expect(whQty(null)).toBe('0');
+  });
+
+  it('whStockBadge: нет остатка / мало / достаточно', () => {
+    expect(whStockBadge(0)).toContain('нет');
+    expect(whStockBadge(0)).toContain('badge-red');
+    expect(whStockBadge(-1)).toContain('нет');
+    expect(whStockBadge(5)).toContain('badge-yellow');
+    expect(whStockBadge(500)).toContain('badge-green');
+    expect(whStockBadge(2.5)).toContain('2,5');
   });
 });

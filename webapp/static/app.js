@@ -235,7 +235,7 @@ async function showScreen(screen) {
   const SCREEN_TITLES = {
     home: null, orders: 'Заказы и склад', stock: 'Заказы и склад',
     finance: 'Финансы', debts: 'Финансы', payments: 'Финансы', analytics: 'Аналитика',
-    ops: 'Операционная сводка',
+    ops: 'Операционная сводка', warehouse: 'Склад',
   };
   setScreenContext(SCREEN_TITLES[screen]);
 
@@ -281,6 +281,9 @@ async function showScreen(screen) {
       case 'payments':
         financeTab = 'payments';
         await renderFinance();
+        break;
+      case 'warehouse':
+        await renderWarehouseScreen();
         break;
       case 'analytics':
         await renderAnalytics();
@@ -3677,6 +3680,400 @@ async function renderDebts(container) {
 }
 
 // formatDateRU — в helpers.js (глобал, подключается ПЕРЕД app.js). Юнит-тестируется.
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Склад: остатки, накладные, быстрый ввод.
+//
+// Локальные таблицы, МойСклад здесь не участвует. Три под-вкладки — ровно
+// три экрана из ТЗ.
+// ═══════════════════════════════════════════════════════════════════════════
+
+let whTab = 'stock';            // 'stock' | 'invoices' | 'new'
+let whDraft = null;             // черновик формы (живёт между перерисовками вкладки)
+let whCounterparties = [];      // справочник, тянем один раз на сессию экрана
+let whStockCache = [];          // остатки для подстановки в позиции
+let whStockSearch = '';
+
+function whIsBoss() {
+  return currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
+}
+
+// whMoney / whQty / whStockBadge — в helpers.js (глобалы). Юнит-тестируются.
+
+function whEmpty(ic, title, hint) {
+  return `<div class="empty-state">
+    <div class="empty-state-icon">${icon(ic)}</div>
+    <div class="empty-state-title">${escapeHtml(title)}</div>
+    <div class="empty-state-hint">${escapeHtml(hint)}</div>
+  </div>`;
+}
+
+async function renderWarehouseScreen() {
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="spinner-wrap"><div class="spinner"></div></div>';
+
+  const TABS = [
+    ['stock', 'Остатки', 'box'],
+    ['invoices', 'Накладные', 'list'],
+    ['new', 'Новая', 'plus'],
+  ];
+  const tabsHtml = `
+    <div class="seg-row">
+      <div class="seg">
+        ${TABS.map(([id, label, ic]) => `
+          <button class="seg-item ${whTab === id ? 'active' : ''}" data-wh="${id}"
+                  aria-pressed="${whTab === id}">${icon(ic)} ${label}</button>`).join('')}
+      </div>
+    </div>`;
+
+  try {
+    if (whTab === 'stock') await renderWhStock();
+    else if (whTab === 'invoices') await renderWhInvoices();
+    else await renderWhInvoiceNew();
+  } catch (e) {
+    content.innerHTML = errorBox(e.message || String(e));
+  }
+
+  // Переключатель поверх вывода — как в «Заказах» (renderOrdersScreen).
+  document.getElementById('content').insertAdjacentHTML('afterbegin', tabsHtml);
+  document.querySelectorAll('.seg-item[data-wh]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('light');
+      whTab = btn.dataset.wh;
+      renderWarehouseScreen();
+    });
+  });
+}
+
+// ─── Экран 1: остатки ────────────────────────────────────────────────────────
+
+async function renderWhStock() {
+  const content = document.getElementById('content');
+  const data = await api('/api/wh/stock', {});
+  whStockCache = data.products || [];
+
+  if (!whStockCache.length) {
+    content.innerHTML = whEmpty('box', 'Номенклатура пуста',
+      'Перенесите справочник из МойСклад: python -m scripts.migrate_from_moysklad --apply');
+    return;
+  }
+
+  content.innerHTML = `
+    <div class="form-row">
+      <input id="wh-stock-search" class="form-input" placeholder="Поиск по названию или артикулу…"
+             value="${escapeHtml(whStockSearch)}">
+    </div>
+    <div class="section-label">Остатки</div>
+    <div class="stock-list" id="wh-stock-list"></div>`;
+
+  drawWhStockList();
+
+  // Перерисовываем только список: каркас не трогаем, иначе поле поиска
+  // теряет фокус на каждом нажатии клавиши (та же причина, что в renderStockList).
+  const input = document.getElementById('wh-stock-search');
+  input.addEventListener('input', () => {
+    whStockSearch = input.value;
+    drawWhStockList();
+  });
+}
+
+function drawWhStockList() {
+  const list = document.getElementById('wh-stock-list');
+  if (!list) return;
+  const needle = whStockSearch.trim().toLowerCase();
+  const rows = whStockCache.filter(p =>
+    !needle ||
+    String(p.name || '').toLowerCase().includes(needle) ||
+    String(p.sku || '').toLowerCase().includes(needle));
+
+  list.innerHTML = rows.length
+    ? rows.map(p => `
+        <div class="stock-row">
+          <div class="stock-info">
+            <div class="stock-name">${escapeHtml(p.name)}</div>
+            <div class="stock-folder">${escapeHtml(p.sku || '—')} · ${escapeHtml(p.unit || '')}${
+              p.category ? ' · ' + escapeHtml(p.category) : ''}</div>
+          </div>
+          ${whStockBadge(p.quantity)}
+        </div>`).join('')
+    : whEmpty('search', 'Ничего не найдено', 'Измените поисковый запрос');
+}
+
+// ─── Экран 2: список накладных ───────────────────────────────────────────────
+
+async function renderWhInvoices() {
+  const content = document.getElementById('content');
+  const data = await api('/api/wh/invoices', { limit: 100 });
+  const rows = data.invoices || [];
+
+  if (!rows.length) {
+    content.innerHTML = whEmpty('list', 'Накладных пока нет',
+      'Оформите первую на вкладке «Новая»');
+    return;
+  }
+
+  const canCancel = whIsBoss();
+  content.innerHTML = rows.map(inv => {
+    const cancelled = inv.status === 'cancelled';
+    const isOut = inv.type === 'outgoing';
+    // Статус отправки — только у расхода: приход клиенту не отсылается.
+    const sent = isOut
+      ? (inv.telegram_sent
+          ? `<span class="order-pay order-pay--ok">${icon('check')} PDF отправлен</span>`
+          : `<span class="order-pay order-pay--wait">PDF не отправлен</span>`)
+      : '';
+    const actions = [];
+    if (isOut && !cancelled) {
+      actions.push(`<button class="btn-secondary" data-wh-send="${inv.id}">${icon('phone')} Отправить PDF</button>`);
+    }
+    if (canCancel && !cancelled) {
+      actions.push(`<button class="btn-secondary" data-wh-cancel="${inv.id}">${icon('ban')} Отменить</button>`);
+    }
+    return `
+      <div class="order-card">
+        <div class="order-header">
+          <div class="order-head-main">
+            <div class="order-title">
+              ${icon(isOut ? 'truck' : 'box')} ${escapeHtml(inv.invoice_number)}
+            </div>
+            <div class="order-sub">${escapeHtml(inv.counterparty_name || 'Без контрагента')}</div>
+          </div>
+          <span class="order-status ${cancelled ? 'status-rejected' : 'status-approved'}">
+            ${cancelled ? 'отменена' : (isOut ? 'расход' : 'приход')}
+          </span>
+        </div>
+        <div class="order-meta">
+          <span>${icon('calendar')} ${formatDateRU(inv.invoice_date)}</span>
+          <span class="order-total">${icon('cash')} ${whMoney(inv.total_amount_cents, inv.currency)}</span>
+        </div>
+        ${sent ? `<div class="order-pay-row">${sent}</div>` : ''}
+        ${actions.length ? `<div class="wh-actions">${actions.join('')}</div>` : ''}
+      </div>`;
+  }).join('');
+
+  content.querySelectorAll('[data-wh-send]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      haptic('light');
+      btn.disabled = true;
+      try {
+        // force: кнопка видна и для уже отправленных — это осознанная
+        // переотправка (клиент потерял файл, сменился телефон).
+        await api('/api/wh/invoices/send', {
+          invoice_id: Number(btn.dataset.whSend), force: true,
+        });
+        toast('PDF отправлен клиенту');
+        renderWarehouseScreen();
+      } catch (e) {
+        toast(e.message || 'Не удалось отправить', 'error');
+        btn.disabled = false;
+      }
+    });
+  });
+
+  content.querySelectorAll('[data-wh-cancel]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('warning');
+      tg.showConfirm('Отменить накладную? Остатки вернутся в исходное состояние.', async ok => {
+        if (!ok) return;
+        btn.disabled = true;
+        try {
+          await api('/api/wh/invoices/cancel', { invoice_id: Number(btn.dataset.whCancel) });
+          toast('Накладная отменена');
+          renderWarehouseScreen();
+        } catch (e) {
+          toast(e.message || 'Не удалось отменить', 'error');
+          btn.disabled = false;
+        }
+      });
+    });
+  });
+}
+
+// ─── Экран 3: быстрый ввод накладной ─────────────────────────────────────────
+
+async function renderWhInvoiceNew() {
+  const content = document.getElementById('content');
+  if (!whDraft) whDraft = { type: 'outgoing', counterparty_id: '', items: [], comment: '' };
+
+  // Справочники параллельно: без них форма бесполезна.
+  const [stock, cps] = await Promise.all([
+    api('/api/wh/stock', {}),
+    whCounterparties.length ? { counterparties: whCounterparties } : api('/api/wh/counterparties', {}),
+  ]);
+  whCounterparties = cps.counterparties || [];
+  whStockCache = stock.products || [];
+  const products = whStockCache;
+  const byId = new Map(products.map(p => [p.product_id, p]));
+
+  if (!products.length) {
+    content.innerHTML = whEmpty('box', 'Нет номенклатуры',
+      'Сначала перенесите товары из МойСклад скриптом миграции');
+    return;
+  }
+
+  const isOut = whDraft.type === 'outgoing';
+  content.innerHTML = `
+    <div class="seg-row"><div class="seg">
+      <button class="seg-item ${!isOut ? 'active' : ''}" data-whtype="incoming">${icon('box')} Приход</button>
+      <button class="seg-item ${isOut ? 'active' : ''}" data-whtype="outgoing">${icon('truck')} Расход</button>
+    </div></div>
+
+    <div class="form-row">
+      <label class="form-label" for="wh-cp">Контрагент${isOut ? ' *' : ''}</label>
+      <select id="wh-cp" class="form-input">
+        <option value="">— не указан —</option>
+        ${whCounterparties.map(c => `
+          <option value="${c.id}" ${String(whDraft.counterparty_id) === String(c.id) ? 'selected' : ''}>
+            ${escapeHtml(c.name)}${c.telegram_id ? '' : ' · без Telegram'}
+          </option>`).join('')}
+      </select>
+    </div>
+
+    <div class="form-row">
+      <label class="form-label" for="wh-comment">Примечание</label>
+      <input id="wh-comment" class="form-input" type="text" maxlength="500"
+             value="${escapeHtml(whDraft.comment || '')}" placeholder="необязательно">
+    </div>
+
+    <div class="section-label">Позиции</div>
+    <div class="editor-items" id="wh-items"></div>
+    <div class="form-row">
+      <button class="btn-secondary" id="wh-add">${icon('plus')} Добавить позицию</button>
+    </div>
+    <button class="btn-primary" id="wh-save">Сохранить накладную</button>`;
+
+  const itemsEl = document.getElementById('wh-items');
+
+  function drawItems() {
+    if (!whDraft.items.length) {
+      itemsEl.innerHTML = '<div class="editor-empty">Позиций нет — добавьте хотя бы одну.</div>';
+      return;
+    }
+    const totalCents = whDraft.items.reduce(
+      (acc, it) => acc + Math.round((Number(it.price_cents) || 0) * (Number(it.quantity) || 0)), 0);
+
+    itemsEl.innerHTML = whDraft.items.map((it, i) => {
+      const p = byId.get(Number(it.product_id));
+      const have = p ? Number(p.quantity) : 0;
+      // Подсветка нехватки — подсказка, а не защита: решение всё равно за
+      // сервером, он держит блокировку остатка и проверяет под ней.
+      const short = whDraft.type === 'outgoing' && Number(it.quantity) > have;
+      return `
+      <div class="wh-pos" data-i="${i}">
+        <select class="form-input" data-f="product_id" aria-label="Товар">
+          ${products.map(pp => `<option value="${pp.product_id}"
+            ${Number(it.product_id) === pp.product_id ? 'selected' : ''}>
+            ${escapeHtml(pp.name)} · ${whQty(pp.quantity)} ${escapeHtml(pp.unit || '')}
+          </option>`).join('')}
+        </select>
+        <div class="wh-pos-row">
+          <input class="form-input ${short ? 'wh-input-bad' : ''}" data-f="quantity"
+                 type="number" min="0" step="any" inputmode="decimal"
+                 value="${it.quantity}" placeholder="Кол-во" aria-label="Количество">
+          <input class="form-input" data-f="price" type="number" min="0" step="0.01"
+                 inputmode="decimal" value="${(Number(it.price_cents) || 0) / 100}"
+                 placeholder="Цена" aria-label="Цена за единицу">
+          <button class="editor-item-del" data-del="${i}" aria-label="Удалить позицию">${icon('trash')}</button>
+        </div>
+        ${short ? `<div class="wh-pos-warn">На складе только ${whQty(have)}</div>` : ''}
+      </div>`;
+    }).join('')
+      + `<div class="editor-item editor-item--total">
+           <div class="editor-item-info"><div class="editor-item-name">Итого</div></div>
+           <div>${whMoney(totalCents, '')}</div>
+         </div>`;
+
+    itemsEl.querySelectorAll('.wh-pos').forEach(el => {
+      const i = Number(el.dataset.i);
+      el.querySelectorAll('[data-f]').forEach(inp => {
+        inp.addEventListener('change', () => {
+          const f = inp.dataset.f;
+          if (f === 'price') {
+            // Цену вводят в деньгах, хранится и уходит на сервер в копейках.
+            whDraft.items[i].price_cents = Math.round((Number(inp.value) || 0) * 100);
+          } else if (f === 'quantity') {
+            whDraft.items[i].quantity = Number(inp.value) || 0;
+          } else {
+            whDraft.items[i].product_id = Number(inp.value);
+          }
+          drawItems();
+        });
+      });
+      const del = el.querySelector('[data-del]');
+      if (del) del.addEventListener('click', () => {
+        haptic('light');
+        whDraft.items.splice(i, 1);
+        drawItems();
+      });
+    });
+  }
+
+  drawItems();
+
+  document.querySelectorAll('[data-whtype]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('light');
+      whDraft.type = btn.dataset.whtype;
+      renderWarehouseScreen();
+    });
+  });
+  document.getElementById('wh-cp').addEventListener('change', e => {
+    whDraft.counterparty_id = e.target.value;
+  });
+  document.getElementById('wh-comment').addEventListener('input', e => {
+    whDraft.comment = e.target.value;
+  });
+  document.getElementById('wh-add').addEventListener('click', () => {
+    haptic('light');
+    whDraft.items.push({ product_id: products[0].product_id, quantity: 1, price_cents: 0 });
+    drawItems();
+  });
+
+  document.getElementById('wh-save').addEventListener('click', async () => {
+    const btn = document.getElementById('wh-save');
+    // Валидация на фронте строгая: промежуточного draft'а нет, остатки
+    // двигаются сразу, и «откатить» можно только отменой накладной.
+    if (!whDraft.items.length) return toast('Добавьте хотя бы одну позицию', 'error');
+    if (whDraft.type === 'outgoing' && !whDraft.counterparty_id) {
+      return toast('Для расхода укажите контрагента', 'error');
+    }
+    for (const it of whDraft.items) {
+      if (!(Number(it.quantity) > 0)) return toast('Количество должно быть больше нуля', 'error');
+      if (whDraft.type === 'outgoing' && !(Number(it.price_cents) > 0)) {
+        return toast('Для расхода укажите цену каждой позиции', 'error');
+      }
+    }
+
+    btn.disabled = true;
+    haptic('medium');
+    try {
+      const res = await api('/api/wh/invoices/create', {
+        type: whDraft.type,
+        counterparty_id: whDraft.counterparty_id || null,
+        comment: whDraft.comment || null,
+        items: whDraft.items.map(it => ({
+          product_id: Number(it.product_id),
+          quantity: Number(it.quantity),
+          price_cents: Number(it.price_cents) || null,
+        })),
+        // Ключ на попытку сохранения: повтор той же формы не проведёт вторую
+        // накладную и не пришлёт клиенту второй экземпляр PDF.
+        idempotency_key: idemKey(),
+      });
+      toast(`Накладная ${res.invoice_number} проведена`);
+      // Отдельным сообщением: неотправленный PDF — не ошибка проведения.
+      // Накладная сохранена, остатки списаны, отправить можно позже кнопкой.
+      if (res.pdf_warning) toast(res.pdf_warning, 'error', { duration: 6000 });
+      whDraft = null;
+      whTab = 'invoices';
+      renderWarehouseScreen();
+    } catch (e) {
+      toast(e.message || 'Не удалось сохранить', 'error');
+      btn.disabled = false;
+    }
+  });
+}
 
 
 // Тень топбара при прокрутке

@@ -4028,8 +4028,75 @@ async def api_wh_invoice_create(request: Request):
         f"Накладная {result['invoice_number']} ({inv_type}), "
         f"позиций {result['positions']}, сумма {result['total_amount_cents']} коп.",
     )
+
+    # PDF клиенту — только по расходу и только после успешного проведения.
+    # Сбой доставки не откатывает накладную: она проведена, остатки списаны.
+    # Отправляем ДО idem.store, чтобы ретрай той же формы отдал сохранённый
+    # ответ и не прислал клиенту второй экземпляр документа.
+    if inv_type == "outgoing":
+        from services.invoice_delivery import REASON_TEXT, deliver_invoice_pdf
+
+        try:
+            invoice = await warehouse.get_invoice(result["invoice_id"])
+            if invoice is None:
+                # Накладную только что создали в этой же транзакции; None здесь
+                # означал бы, что её кто-то успел удалить в обход приложения.
+                raise RuntimeError(f"накладная {result['invoice_id']} исчезла после создания")
+            bot = await get_notify_bot()
+            delivery = await deliver_invoice_pdf(invoice, bot)
+        except Exception:
+            logger.exception("Доставка PDF накладной %s упала", result["invoice_number"])
+            delivery = {"sent": False, "reason": "send_failed"}
+        result["pdf_sent"] = delivery["sent"]
+        if not delivery["sent"]:
+            result["pdf_warning"] = REASON_TEXT.get(delivery["reason"], "PDF не отправлен")
+
     await idem.store(result)
     return JSONResponse(result)
+
+
+@app.post("/api/wh/invoices/send")
+async def api_wh_invoice_send(request: Request):
+    """Отправить (или переотправить) PDF накладной клиенту вручную.
+
+    Нужен для случая из ТЗ, когда у контрагента не был привязан telegram_id
+    в момент проведения: накладная сохранена, остатки списаны, отправка
+    делается позже — этой кнопкой.
+    """
+    from services import warehouse
+    from services.invoice_delivery import REASON_TEXT, deliver_invoice_pdf
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_wh_invoice_send",
+        rate_limit_max=20,
+    )
+    try:
+        invoice_id = int(data.get("invoice_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invoice_id обязателен")
+
+    invoice = await warehouse.get_invoice(invoice_id)
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="Накладная не найдена")
+
+    bot = await get_notify_bot()
+    delivery = await deliver_invoice_pdf(invoice, bot, force=bool(data.get("force")))
+    if not delivery["sent"]:
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": delivery["reason"],
+                "reason": REASON_TEXT.get(delivery["reason"], "PDF не отправлен"),
+            },
+            status_code=409,
+        )
+    logger.info(
+        "PDF накладной #%s отправлен вручную пользователем %s", invoice_id, user["id"]
+    )
+    return JSONResponse({"ok": True, "sent": True})
 
 
 @app.post("/api/wh/invoices/cancel")

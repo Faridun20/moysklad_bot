@@ -11,3 +11,9 @@ aiosqlite==0.20.0
 redis==5.0.7
 # Excel-экспорт аналитики (PR D). Лёгкая зависимость без C-расширений.
 openpyxl==3.1.5
+# PDF расходных накладных (services/invoice_pdf.py). Тянет системные
+# pango/cairo — в образе нужны libpango-1.0-0, libpangoft2-1.0-0, libcairo2,
+# libgdk-pixbuf-2.0-0 и шрифты (fonts-dejavu). Импортируется ЛЕНИВО, внутри
+# render_invoice_pdf: без системных библиотек падает только сам рендер,
+# а не импорт модуля.
+weasyprint==70.0

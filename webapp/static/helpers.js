@@ -225,9 +225,35 @@
     );
   }
 
+  // ─── Склад ────────────────────────────────────────────────────────────
+  // Копейки → «1 234,56 USD». Деньги на бэкенде BIGINT в минорных единицах,
+  // поэтому делим ровно на 100 и всегда печатаем два знака: «750 USD» вместо
+  // «750.00 USD» в накладной читается как другая сумма.
+  function whMoney(cents, currency) {
+    const v = (Number(cents || 0) / 100).toLocaleString('ru-RU', {
+      minimumFractionDigits: 2, maximumFractionDigits: 2,
+    });
+    const cur = currency == null ? 'USD' : currency;
+    return cur ? `${v} ${escapeHtml(cur)}` : v;
+  }
+
+  // Количество без хвостовых нулей: 3, а не 3,000; дробные (кг, метры) —
+  // до трёх знаков.
+  function whQty(q) {
+    return Number(q || 0).toLocaleString('ru-RU', { maximumFractionDigits: 3 });
+  }
+
+  // Бейдж остатка. Отдельно от _stockBadge в app.js: там целые из МойСклад,
+  // здесь количества могут быть дробными.
+  function whStockBadge(q) {
+    const n = Number(q || 0);
+    const cls = n <= 0 ? 'badge-red' : (n < 20 ? 'badge-yellow' : 'badge-green');
+    return `<span class="stock-badge ${cls}">${n <= 0 ? 'нет' : whQty(n)}</span>`;
+  }
+
   return {
     escapeHtml, idemKey, formatDateRU, icon, opsAmount,
     renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml, financeTabs,
-    balanceParts, periodSegHtml,
+    balanceParts, periodSegHtml, whMoney, whQty, whStockBadge,
   };
 });
