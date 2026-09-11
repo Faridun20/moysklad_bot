@@ -44,6 +44,14 @@ FROM python:3.11.9-slim-bookworm
 #       Для полноценного pg_dump подключите репозиторий PGDG и поставьте
 #       postgresql-client-<версия вашего сервера>.
 #
+#   tzdata
+#       Контейнер ОБЯЗАН работать в бизнес-зоне: utils.helpers.local_now()
+#       возвращает datetime.now(), и в этом же кадре пишется created_at —
+#       единственная согласованная интерпретация (см. его докстринг и WP-18).
+#       Без tzdata glibc не разрешает имя зоны и МОЛЧА откатывается на UTC:
+#       записи продолжают писаться, но «сегодня» съезжает на 5 часов.
+#       Зона задаётся переменной TZ (см. docker-compose.yml).
+#
 #   libreoffice-writer (опционально, WITH_LIBREOFFICE)
 #       Конвертация docx → pdf для юридических документов. Это ~400 МБ к
 #       образу, а сама функциональность ещё не написана (ждём шаблон
@@ -57,12 +65,17 @@ RUN set -eux; \
         fonts-dejavu-core \
         fonts-liberation \
         postgresql-client \
+        tzdata \
         ca-certificates; \
     if [ "$WITH_LIBREOFFICE" = "1" ]; then \
         apt-get install -y --no-install-recommends libreoffice-writer; \
     fi; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
+
+# Бизнес-зона по умолчанию. Переопределяется в compose — но пустой TZ
+# означал бы UTC и разъехавшиеся сутки, поэтому дефолт осмысленный.
+ENV TZ=Asia/Tashkent
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
