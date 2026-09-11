@@ -41,7 +41,6 @@ except ImportError:
 
     _default_db = os.path.join(tempfile.gettempdir(), "payments.db")
     DB_PATH = os.environ.get("DB_PATH", _default_db)
-    TZ_OFFSET = int(os.environ.get("TZ_OFFSET", "5"))
 
     def _parse_ids(key: str) -> list[int]:
         val = os.environ.get(key, "")
