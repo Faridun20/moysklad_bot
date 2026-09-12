@@ -250,24 +250,6 @@ def test_deposit_create_rejects_huge_amount(client_env):
 # ─── Round 6 (RACE-3): set_return_ms_id conditional UPDATE ────────────────────
 
 
-def test_set_return_ms_id_second_call_loses_race(isolated_db):
-    """Два параллельных create_salesreturn — только первый выигрывает запись id;
-    второй вернёт False, caller знает что надо удалить orphan-doc в МС."""
-    db = isolated_db
-    mgr = 700
-    db.set_role(mgr, "m", "M", "manager")
-    oid = db.create_order(mgr, "M", "")
-    db.add_order_item(oid, "P", "", 1, "шт", 100.0)
-    db.update_order_status(oid, "shipped")
-    items = asyncio.run(db.get_order_items(oid))
-    r = asyncio.run(db.create_return(oid, "full", "брак", [(items[0]["id"], 1, 100.0)], "no_refund", mgr))
-    assert r["ok"]
-
-    rid = r["return_id"]
-    assert asyncio.run(db.set_return_ms_id(rid, "ms-id-1")) is True  # выигрыш гонки
-    assert asyncio.run(db.set_return_ms_id(rid, "ms-id-2")) is False  # уже занято
-    stored = asyncio.run(db.get_return(rid))
-    assert stored["moysklad_return_id"] == "ms-id-1"
 
 
 # ─── Round 6 (RACE-2): create_return TOCTOU — параллельные pending'и ──────────

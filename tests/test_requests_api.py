@@ -8,7 +8,6 @@ Smoke-тесты WebApp-эндпоинтов одобрения/отклонен
 pytest-asyncio не нужен). Замоканы только границы системы:
   - verify_init_data — auth проверяется отдельно в test_auth.py
   - get_notify_bot   — чтобы не звонить в реальный Telegram
-  - ms_demand.is_ready=False — чтобы не звонить в реальный МойСклад
 БД, роли и переходы статусов — настоящие.
 """
 
@@ -38,7 +37,6 @@ def client_env(isolated_db, monkeypatch):
     """
     import importlib
     import services.roles as roles
-    import services.ms_demand as ms_demand
     import webapp.server as server
 
     importlib.reload(roles)  # сбросить in-memory role-cache между тестами
@@ -62,7 +60,6 @@ def client_env(isolated_db, monkeypatch):
         return fake_bot
 
     monkeypatch.setattr(server, "get_notify_bot", _fake_get_bot)
-    monkeypatch.setattr(ms_demand, "is_ready", lambda: False)
 
     def _fake_verify(init_data: str):
         # initData передаём как строку с telegram id одобряющего

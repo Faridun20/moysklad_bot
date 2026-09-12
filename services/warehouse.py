@@ -202,6 +202,135 @@ async def _apply_stock_delta(txn, product_id: int, warehouse_id: int, delta: flo
     )
 
 
+
+async def create_invoice_in(
+    txn,
+    *,
+    invoice_type: str,
+    warehouse_id: int,
+    items: list[dict],
+    counterparty_id: int | None = None,
+    currency: str = "USD",
+    invoice_date: str | None = None,
+    comment: str | None = None,
+    created_by: int | None = None,
+) -> dict:
+    """Провести накладную ВНУТРИ уже открытой транзакции.
+
+    Отдельно от `create_invoice`, потому что есть операции, которые обязаны
+    попасть в накладную и в свою собственную запись одним коммитом: приёмка
+    контейнера сначала отменяет прежний приход, потом заводит новый, и
+    оборваться между этими двумя движениями склад не имеет права.
+
+    В отличие от публичной обёртки, при отказе БРОСАЕТ `InvoiceError` — иначе
+    вызывающая транзакция получила бы «не ок» словарём и спокойно закоммитила
+    всё, что успела записать до него.
+    """
+    if invoice_type not in INVOICE_TYPES:
+        raise InvoiceError("bad_type", f"Неизвестный тип: {invoice_type}")
+
+    positions = _normalize_items(items, invoice_type)
+    date_str = invoice_date or _today()
+    created = _db.now_str()
+    sign = 1.0 if invoice_type == "incoming" else -1.0
+    product_ids = [p["product_id"] for p in positions]
+
+    # 1) Товары существуют. Проверяем ДО блокировок: дешевле и сообщение об
+    #    опечатке в id понятнее, чем «нехватка остатка».
+    known = await txn.fetch(
+        "SELECT id FROM products WHERE id IN ("
+        + ", ".join(f"${i + 1}" for i in range(len(product_ids)))
+        + ")",
+        *product_ids,
+    )
+    known_ids = {int(r["id"]) for r in known}
+    missing = [pid for pid in product_ids if pid not in known_ids]
+    if missing:
+        raise InvoiceError(
+            "unknown_product",
+            f"Товары не найдены: {', '.join(map(str, missing))}",
+            {"product_ids": missing},
+        )
+
+    wh = await txn.fetchval("SELECT id FROM warehouses WHERE id = $1", warehouse_id)
+    if wh is None:
+        raise InvoiceError("unknown_warehouse", f"Склад #{warehouse_id} не найден")
+
+    if counterparty_id is not None:
+        cp = await txn.fetchval("SELECT id FROM counterparties WHERE id = $1", counterparty_id)
+        if cp is None:
+            raise InvoiceError("unknown_counterparty", f"Контрагент #{counterparty_id} не найден")
+
+    # 2) Блокируем остатки и проверяем достаточность — до записи.
+    current = await _lock_stock(txn, product_ids, warehouse_id)
+    if invoice_type == "outgoing":
+        short = [
+            {
+                "product_id": p["product_id"],
+                "need": p["quantity"],
+                "have": current.get(p["product_id"], 0.0),
+            }
+            for p in positions
+            if current.get(p["product_id"], 0.0) < p["quantity"]
+        ]
+        if short:
+            names = ", ".join(
+                f"#{s['product_id']} (нужно {s['need']:g}, есть {s['have']:g})" for s in short
+            )
+            raise InvoiceError(
+                "insufficient_stock", f"Не хватает остатка: {names}", {"positions": short}
+            )
+
+    # 3) Номер и шапка.
+    year = int(date_str[:4])
+    number = await _next_invoice_number(txn, invoice_type, year)
+    total_cents = sum(money.mul_qty(p["price_cents"] or 0, p["quantity"]) for p in positions)
+
+    await txn.execute(
+        "INSERT INTO invoices (type, counterparty_id, warehouse_id, invoice_number, "
+        "invoice_date, status, currency, total_amount_cents, comment, created_by, "
+        "created_at) VALUES ($1, $2, $3, $4, $5, 'confirmed', $6, $7, $8, $9, $10)",
+        invoice_type,
+        counterparty_id,
+        warehouse_id,
+        number,
+        date_str,
+        currency,
+        total_cents,
+        comment,
+        created_by,
+        created,
+    )
+    invoice_id = await txn.fetchval("SELECT id FROM invoices WHERE invoice_number = $1", number)
+
+    # 4) Строки и движение остатков.
+    for p in positions:
+        await txn.execute(
+            "INSERT INTO invoice_items (invoice_id, product_id, quantity, price_cents) "
+            "VALUES ($1, $2, $3, $4)",
+            invoice_id,
+            p["product_id"],
+            p["quantity"],
+            p["price_cents"],
+        )
+        await _apply_stock_delta(txn, p["product_id"], warehouse_id, sign * p["quantity"])
+
+    logger.info(
+        "Накладная %s проведена: id=%s, позиций=%d, сумма=%d коп.",
+        number,
+        invoice_id,
+        len(positions),
+        total_cents,
+    )
+    return {
+        "ok": True,
+        "invoice_id": int(invoice_id),
+        "invoice_number": number,
+        "total_amount_cents": int(total_cents),
+        "positions": len(positions),
+    }
+
+
 async def create_invoice(
     *,
     invoice_type: str,
@@ -221,129 +350,91 @@ async def create_invoice(
     либо {"ok": False, "code", "reason"} — во втором случае в БД не изменилось
     ничего, включая счётчик номеров.
     """
-    if invoice_type not in INVOICE_TYPES:
-        return {"ok": False, "code": "bad_type", "reason": f"Неизвестный тип: {invoice_type}"}
-
-    try:
-        positions = _normalize_items(items, invoice_type)
-    except InvoiceError as e:
-        return {"ok": False, "code": e.code, "reason": e.message, "details": e.details}
-
-    date_str = invoice_date or _today()
-    created = _db.now_str()
-    sign = 1.0 if invoice_type == "incoming" else -1.0
-    product_ids = [p["product_id"] for p in positions]
-
     try:
         async with adb_core.transaction() as txn:
-            # 1) Товары существуют. Проверяем ДО блокировок: дешевле и
-            #    сообщение об опечатке в id понятнее, чем «нехватка остатка».
-            known = await txn.fetch(
-                "SELECT id FROM products WHERE id IN ("
-                + ", ".join(f"${i + 1}" for i in range(len(product_ids)))
-                + ")",
-                *product_ids,
+            return await create_invoice_in(
+                txn,
+                invoice_type=invoice_type,
+                warehouse_id=warehouse_id,
+                items=items,
+                counterparty_id=counterparty_id,
+                currency=currency,
+                invoice_date=invoice_date,
+                comment=comment,
+                created_by=created_by,
             )
-            known_ids = {int(r["id"]) for r in known}
-            missing = [pid for pid in product_ids if pid not in known_ids]
-            if missing:
-                raise InvoiceError(
-                    "unknown_product",
-                    f"Товары не найдены: {', '.join(map(str, missing))}",
-                    {"product_ids": missing},
-                )
-
-            wh = await txn.fetchval("SELECT id FROM warehouses WHERE id = $1", warehouse_id)
-            if wh is None:
-                raise InvoiceError("unknown_warehouse", f"Склад #{warehouse_id} не найден")
-
-            if counterparty_id is not None:
-                cp = await txn.fetchval(
-                    "SELECT id FROM counterparties WHERE id = $1", counterparty_id
-                )
-                if cp is None:
-                    raise InvoiceError(
-                        "unknown_counterparty", f"Контрагент #{counterparty_id} не найден"
-                    )
-
-            # 2) Блокируем остатки и проверяем достаточность — до записи.
-            current = await _lock_stock(txn, product_ids, warehouse_id)
-            if invoice_type == "outgoing":
-                short = [
-                    {
-                        "product_id": p["product_id"],
-                        "need": p["quantity"],
-                        "have": current.get(p["product_id"], 0.0),
-                    }
-                    for p in positions
-                    if current.get(p["product_id"], 0.0) < p["quantity"]
-                ]
-                if short:
-                    names = ", ".join(
-                        f"#{s['product_id']} (нужно {s['need']:g}, есть {s['have']:g})"
-                        for s in short
-                    )
-                    raise InvoiceError(
-                        "insufficient_stock", f"Не хватает остатка: {names}", {"positions": short}
-                    )
-
-            # 3) Номер и шапка.
-            year = int(date_str[:4])
-            number = await _next_invoice_number(txn, invoice_type, year)
-            total_cents = sum(
-                money.mul_qty(p["price_cents"] or 0, p["quantity"]) for p in positions
-            )
-
-            await txn.execute(
-                "INSERT INTO invoices (type, counterparty_id, warehouse_id, invoice_number, "
-                "invoice_date, status, currency, total_amount_cents, comment, created_by, "
-                "created_at) VALUES ($1, $2, $3, $4, $5, 'confirmed', $6, $7, $8, $9, $10)",
-                invoice_type,
-                counterparty_id,
-                warehouse_id,
-                number,
-                date_str,
-                currency,
-                total_cents,
-                comment,
-                created_by,
-                created,
-            )
-            invoice_id = await txn.fetchval(
-                "SELECT id FROM invoices WHERE invoice_number = $1", number
-            )
-
-            # 4) Строки и движение остатков.
-            for p in positions:
-                await txn.execute(
-                    "INSERT INTO invoice_items (invoice_id, product_id, quantity, price_cents) "
-                    "VALUES ($1, $2, $3, $4)",
-                    invoice_id,
-                    p["product_id"],
-                    p["quantity"],
-                    p["price_cents"],
-                )
-                await _apply_stock_delta(
-                    txn, p["product_id"], warehouse_id, sign * p["quantity"]
-                )
     except InvoiceError as e:
         logger.info("Накладная не проведена (%s): %s", e.code, e.message)
         return {"ok": False, "code": e.code, "reason": e.message, "details": e.details}
 
-    logger.info(
-        "Накладная %s проведена: id=%s, позиций=%d, сумма=%d коп.",
-        number,
+
+async def cancel_invoice_in(txn, invoice_id: int, cancelled_by: int | None = None) -> dict:
+    """Отменить накладную ВНУТРИ уже открытой транзакции. Бросает `InvoiceError`."""
+    if _db.USE_POSTGRES:
+        inv = await txn.fetchrow(
+            "SELECT id, type, status, warehouse_id FROM invoices WHERE id = $1 FOR UPDATE",
+            invoice_id,
+        )
+    else:
+        inv = await txn.fetchrow(
+            "SELECT id, type, status, warehouse_id FROM invoices WHERE id = $1",
+            invoice_id,
+        )
+    if inv is None:
+        raise InvoiceError("not_found", f"Накладная #{invoice_id} не найдена")
+    if inv["status"] == "cancelled":
+        # Идемпотентно: повторная отмена не двигает остаток второй раз.
+        raise InvoiceError("already_cancelled", "Накладная уже отменена")
+
+    warehouse_id = int(inv["warehouse_id"])
+    rows = await txn.fetch(
+        "SELECT product_id, quantity FROM invoice_items WHERE invoice_id = $1 ORDER BY product_id",
         invoice_id,
-        len(positions),
-        total_cents,
     )
-    return {
-        "ok": True,
-        "invoice_id": int(invoice_id),
-        "invoice_number": number,
-        "total_amount_cents": int(total_cents),
-        "positions": len(positions),
-    }
+    if not rows:
+        raise InvoiceError("empty_invoice", "В накладной нет позиций — нечего откатывать")
+
+    # Откат меняет знак исходного движения.
+    sign = -1.0 if inv["type"] == "incoming" else 1.0
+    product_ids = [int(r["product_id"]) for r in rows]
+    current = await _lock_stock(txn, product_ids, warehouse_id)
+
+    if sign < 0:
+        short = [
+            {
+                "product_id": int(r["product_id"]),
+                "need": float(r["quantity"]),
+                "have": current.get(int(r["product_id"]), 0.0),
+            }
+            for r in rows
+            if current.get(int(r["product_id"]), 0.0) < float(r["quantity"])
+        ]
+        if short:
+            names = ", ".join(
+                f"#{s['product_id']} (нужно вернуть {s['need']:g}, есть {s['have']:g})"
+                for s in short
+            )
+            raise InvoiceError(
+                "insufficient_stock",
+                f"Отмена увела бы остаток в минус: {names}. "
+                f"Товар уже отгружен — сначала отмените расходные накладные.",
+                {"positions": short},
+            )
+
+    for r in rows:
+        await _apply_stock_delta(
+            txn, int(r["product_id"]), warehouse_id, sign * float(r["quantity"])
+        )
+
+    await txn.execute(
+        "UPDATE invoices SET status = 'cancelled', cancelled_by = $1, cancelled_at = $2 "
+        "WHERE id = $3",
+        cancelled_by,
+        _db.now_str(),
+        invoice_id,
+    )
+    logger.info("Накладная #%s отменена, остатки откачены", invoice_id)
+    return {"ok": True, "invoice_id": invoice_id}
 
 
 async def cancel_invoice(invoice_id: int, cancelled_by: int | None = None) -> dict:
@@ -355,79 +446,26 @@ async def cancel_invoice(invoice_id: int, cancelled_by: int | None = None) -> di
     """
     try:
         async with adb_core.transaction() as txn:
-            if _db.USE_POSTGRES:
-                inv = await txn.fetchrow(
-                    "SELECT id, type, status, warehouse_id FROM invoices WHERE id = $1 FOR UPDATE",
-                    invoice_id,
-                )
-            else:
-                inv = await txn.fetchrow(
-                    "SELECT id, type, status, warehouse_id FROM invoices WHERE id = $1",
-                    invoice_id,
-                )
-            if inv is None:
-                raise InvoiceError("not_found", f"Накладная #{invoice_id} не найдена")
-            if inv["status"] == "cancelled":
-                # Идемпотентно: повторная отмена не двигает остаток второй раз.
-                raise InvoiceError("already_cancelled", "Накладная уже отменена")
-
-            warehouse_id = int(inv["warehouse_id"])
-            rows = await txn.fetch(
-                "SELECT product_id, quantity FROM invoice_items WHERE invoice_id = $1 "
-                "ORDER BY product_id",
-                invoice_id,
-            )
-            if not rows:
-                raise InvoiceError("empty_invoice", "В накладной нет позиций — нечего откатывать")
-
-            # Откат меняет знак исходного движения.
-            sign = -1.0 if inv["type"] == "incoming" else 1.0
-            product_ids = [int(r["product_id"]) for r in rows]
-            current = await _lock_stock(txn, product_ids, warehouse_id)
-
-            if sign < 0:
-                short = [
-                    {
-                        "product_id": int(r["product_id"]),
-                        "need": float(r["quantity"]),
-                        "have": current.get(int(r["product_id"]), 0.0),
-                    }
-                    for r in rows
-                    if current.get(int(r["product_id"]), 0.0) < float(r["quantity"])
-                ]
-                if short:
-                    names = ", ".join(
-                        f"#{s['product_id']} (нужно вернуть {s['need']:g}, есть {s['have']:g})"
-                        for s in short
-                    )
-                    raise InvoiceError(
-                        "insufficient_stock",
-                        f"Отмена увела бы остаток в минус: {names}. "
-                        f"Товар уже отгружен — сначала отмените расходные накладные.",
-                        {"positions": short},
-                    )
-
-            for r in rows:
-                await _apply_stock_delta(
-                    txn, int(r["product_id"]), warehouse_id, sign * float(r["quantity"])
-                )
-
-            await txn.execute(
-                "UPDATE invoices SET status = 'cancelled', cancelled_by = $1, cancelled_at = $2 "
-                "WHERE id = $3",
-                cancelled_by,
-                _db.now_str(),
-                invoice_id,
-            )
+            return await cancel_invoice_in(txn, invoice_id, cancelled_by)
     except InvoiceError as e:
         logger.info("Отмена накладной #%s отклонена (%s): %s", invoice_id, e.code, e.message)
         return {"ok": False, "code": e.code, "reason": e.message, "details": e.details}
 
-    logger.info("Накладная #%s отменена, остатки откачены", invoice_id)
-    return {"ok": True, "invoice_id": invoice_id}
 
 
 # ─── Чтения ───────────────────────────────────────────────────────────────────
+
+
+async def default_warehouse_id() -> int:
+    """Склад по умолчанию — тот, что засеял `seed_warehouses`.
+
+    Берём минимальный id, а не константу 1: на проде склад могли завести
+    руками раньше сидинга, и захардкоженная единица указывала бы в пустоту —
+    накладная отвергалась бы «склад не найден» на ровном месте.
+    """
+    wid = await adb_core.fetchval("SELECT MIN(id) FROM warehouses")
+    return int(wid) if wid is not None else 1
+
 
 
 async def get_stock(warehouse_id: int | None = None, only_positive: bool = False) -> list[dict]:
@@ -500,3 +538,294 @@ async def mark_telegram_sent(invoice_id: int) -> bool:
         invoice_id,
     )
     return n > 0
+
+
+# ─── Каталог ──────────────────────────────────────────────────────────────────
+#
+# Заменяет читающую часть снапшота МойСклад (`snapshot.get_stock`,
+# `search_products`, `get_categories`, `get_low_stock`). Источник — наши
+# `products` + `stock`, промежуточного зеркала больше нет: зеркалить нечего.
+
+# «Резерв» локально — это одобренные, но ещё не отгруженные заказы. В МойСклад
+# им соответствовал customerorder, который держал товар; у нас заказ живёт в
+# своей таблице, и доступный остаток обязан его учитывать — иначе один и тот же
+# ящик пообещают двум клиентам.
+_RESERVED_STATUSES = ("approved",)
+
+
+async def _reserved_by_product() -> dict[int, float]:
+    rows = await adb_core.fetch(
+        "SELECT op.product_id AS product_id, SUM(oi.quantity) AS qty "
+        "FROM order_item_products op "
+        "JOIN order_items oi ON oi.id = op.item_id "
+        "JOIN orders o ON o.id = op.order_id "
+        "WHERE o.status = $1 GROUP BY op.product_id",
+        _RESERVED_STATUSES[0],
+    )
+    return {int(r["product_id"]): float(r["qty"] or 0) for r in rows}
+
+
+async def search_products(query: str, limit: int = 20) -> list[dict]:
+    """Поиск по номенклатуре. Кириллица — через `lower()` с обеих сторон."""
+    text = (query or "").strip()
+    if not text:
+        return []
+    return await adb_core.fetch(
+        "SELECT id AS product_id, name, unit, category, sku FROM products "
+        "WHERE lower(name) LIKE $1 ORDER BY name LIMIT $2",
+        f"%{text.lower()}%",
+        max(1, min(int(limit or 20), 100)),
+    )
+
+
+async def get_product(product_id: int | str | None) -> dict | None:
+    """Карточка товара по id. Принимает и строку — id ездят через JSON."""
+    if product_id is None or str(product_id).strip() == "":
+        return None
+    try:
+        pid = int(product_id)
+    except (TypeError, ValueError):
+        return None
+    return await adb_core.fetchrow(
+        "SELECT id AS product_id, name, unit, category, sku FROM products WHERE id = $1", pid
+    )
+
+
+async def get_categories() -> list[dict]:
+    """Категории каталога.
+
+    Категория у товара — ТЕКСТ, а не ссылка на справочник: в МойСклад это была
+    папка номенклатуры, и переносить дерево ради фильтра в одну кнопку незачем.
+    Поэтому id категории — само её название.
+    """
+    rows = await adb_core.fetch(
+        "SELECT DISTINCT category FROM products "
+        "WHERE category IS NOT NULL AND category <> '' ORDER BY category"
+    )
+    return [{"id": r["category"], "name": r["category"]} for r in rows]
+
+
+async def get_catalog(category: str | None = None, only_positive: bool = False) -> list[dict]:
+    """Каталог с остатком, резервом и доступным количеством.
+
+    Нулевые остатки по умолчанию НЕ прячем: товар не должен исчезать из
+    каталога после полной отгрузки — иначе менеджер теряет позицию из списка
+    ровно в тот момент, когда её надо заказать снова.
+    """
+    sql = (
+        "SELECT p.id AS product_id, p.name, p.unit, p.category, p.sku, "
+        "       COALESCE(SUM(s.quantity), 0) AS quantity "
+        "FROM products p LEFT JOIN stock s ON s.product_id = p.id"
+    )
+    args: list = []
+    if category and category != "all":
+        args.append(category)
+        sql += f" WHERE p.category = ${len(args)}"
+    sql += " GROUP BY p.id, p.name, p.unit, p.category, p.sku ORDER BY p.name"
+    rows = await adb_core.fetch(sql, *args)
+
+    reserved = await _reserved_by_product()
+    out = []
+    for r in rows:
+        pid = int(r["product_id"])
+        qty = float(r["quantity"] or 0)
+        res = reserved.get(pid, 0.0)
+        if only_positive and qty == 0:
+            continue
+        out.append(
+            {
+                "product_id": pid,
+                "name": r["name"],
+                "unit": r["unit"] or "шт",
+                "category": r["category"] or "",
+                "sku": r["sku"] or "",
+                "quantity": qty,
+                "reserved": res,
+                "available": qty - res,
+            }
+        )
+    return out
+
+
+async def get_low_stock(threshold: float = 5.0) -> list[dict]:
+    """Товары с низким ДОСТУПНЫМ остатком: (остаток − резерв) ≤ порога, но в
+    наличии. Худшие сверху."""
+    rows = await get_catalog()
+    low = [r for r in rows if r["quantity"] > 0 and r["available"] <= float(threshold)]
+    low.sort(key=lambda r: (r["available"], r["name"]))
+    return low
+
+
+# ─── Продажи (аналитика) ──────────────────────────────────────────────────────
+#
+# Считаем по расходным накладным — это и есть отгрузки. Раньше цифры приезжали
+# из МойСклад (`moysklad.get_sales_stats`/`get_shipments`); источник сменился,
+# форма ответа осталась прежней, чтобы экраны аналитики не переписывать.
+#
+# Отменённые накладные в выручку не идут: отмена вернула товар на склад, и
+# продажи не было.
+
+
+def _day(value) -> str:
+    """`datetime` или строка → `YYYY-MM-DD` для сравнения с `invoice_date`."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value[:10]
+    return value.strftime("%Y-%m-%d")
+
+
+def _upper_bound(value) -> tuple[str, bool]:
+    """Верхняя граница периода → (дата, строго ли меньше).
+
+    `invoice_date` хранит ДАТУ, а границы приходят моментами. Полуинтервал
+    [since, until) с обрезкой до дня ломает самый частый запрос — «сегодня»:
+    начало дня и «сейчас» дают одну и ту же дату, и условие
+    `date >= X AND date < X` не находит ничего.
+
+    Поэтому: если у `until` есть время суток, день включаем (момент внутри
+    него); если это ровно полночь — исключаем, потому что фронт передаёт
+    следующую полночь именно как «до, не включая».
+    """
+    day = _day(value)
+    if isinstance(value, str):
+        # Строка без времени — это «по этот день включительно».
+        return day, len(value) > 10 and value[11:].lstrip("0:") == ""
+    midnight = (value.hour, value.minute, value.second, value.microsecond) == (0, 0, 0, 0)
+    return day, midnight
+
+
+async def list_shipments(since, until=None, limit: int = 1000) -> list[dict]:
+    """Расходные накладные за период, новые сверху.
+
+    Границы как в прежней аналитике: `since` включающая, `until`
+    исключающая — полуинтервал [since, until).
+    """
+    args: list = ["outgoing", _day(since)]
+    sql = (
+        "SELECT i.id, i.invoice_number, i.invoice_date, i.currency, i.total_amount_cents, "
+        "       i.created_at, i.counterparty_id, c.name AS counterparty_name "
+        "FROM invoices i LEFT JOIN counterparties c ON c.id = i.counterparty_id "
+        "WHERE i.type = $1 AND i.status = 'confirmed' AND i.invoice_date >= $2"
+    )
+    if until is not None:
+        day, exclusive = _upper_bound(until)
+        args.append(day)
+        sql += f" AND i.invoice_date {'<' if exclusive else '<='} ${len(args)}"
+    args.append(max(1, min(int(limit or 1000), 5000)))
+    sql += f" ORDER BY i.invoice_date DESC, i.id DESC LIMIT ${len(args)}"
+    rows = await adb_core.fetch(sql, *args)
+    # `moment` — имя, на которое опирается разбор по дням недели в аналитике.
+    for r in rows:
+        r["moment"] = r["invoice_date"]
+        r["sum"] = int(r["total_amount_cents"] or 0)
+    return rows
+
+
+async def sales_stats(since, until=None) -> dict:
+    """Выручка, число отгрузок, клиентов, топ товаров и клиентов за период.
+
+    `total` — в копейках, как отдавал МойСклад. Валюты НЕ складываем молча:
+    рядом едет `by_currency`, и экран обязан его показывать, если валют больше
+    одной (правило слоя дебиторки, CLAUDE.md).
+    """
+    shipments = await list_shipments(since, until)
+    if not shipments:
+        return {
+            "total": 0,
+            "count": 0,
+            "clients": 0,
+            "top_products": [],
+            "top_clients": [],
+            "by_currency": {},
+        }
+
+    total = sum(int(s["total_amount_cents"] or 0) for s in shipments)
+    by_currency: dict[str, int] = {}
+    by_client: dict[str, dict] = {}
+    for s in shipments:
+        cur = s.get("currency") or "?"
+        by_currency[cur] = by_currency.get(cur, 0) + int(s["total_amount_cents"] or 0)
+        cname = s.get("counterparty_name") or "—"
+        c = by_client.setdefault(cname, {"sum": 0, "count": 0})
+        c["sum"] += int(s["total_amount_cents"] or 0)
+        c["count"] += 1
+    clients = len({s.get("counterparty_id") for s in shipments if s.get("counterparty_id")})
+
+    ids = [int(s["id"]) for s in shipments]
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(ids)))
+    positions = await adb_core.fetch(
+        f"SELECT ii.product_id, p.name, ii.quantity, ii.price_cents "
+        f"FROM invoice_items ii JOIN products p ON p.id = ii.product_id "
+        f"WHERE ii.invoice_id IN ({placeholders})",
+        *ids,
+    )
+    product_sums: dict[str, dict] = {}
+    for pos in positions:
+        name = pos["name"] or "—"
+        d = product_sums.setdefault(name, {"sum": 0, "qty": 0.0, "product_id": None})
+        d["sum"] += money.mul_qty(int(pos["price_cents"] or 0), float(pos["quantity"] or 0))
+        d["qty"] += float(pos["quantity"] or 0)
+        d["product_id"] = int(pos["product_id"])
+
+    top_products = sorted(product_sums.items(), key=lambda kv: kv[1]["sum"], reverse=True)
+    top_clients = sorted(by_client.items(), key=lambda kv: kv[1]["sum"], reverse=True)
+    return {
+        "total": total,
+        "count": len(shipments),
+        "clients": clients,
+        "top_products": top_products[:20],
+        "top_clients": top_clients[:20],
+        "by_currency": by_currency,
+    }
+
+
+async def counterparty_purchases(counterparty_id, limit: int = 20) -> dict:
+    """Покупки контрагента: топ товаров и последние отгрузки. Для карточки клиента."""
+    try:
+        cid = int(counterparty_id)
+    except (TypeError, ValueError):
+        return {"top_products": [], "recent": [], "total_cents": 0, "count": 0}
+
+    rows = await adb_core.fetch(
+        "SELECT id, invoice_number, invoice_date, currency, total_amount_cents "
+        "FROM invoices WHERE counterparty_id = $1 AND type = 'outgoing' "
+        "AND status = 'confirmed' ORDER BY invoice_date DESC, id DESC LIMIT $2",
+        cid,
+        max(1, min(int(limit or 20), 200)),
+    )
+    if not rows:
+        return {"top_products": [], "recent": [], "total_cents": 0, "count": 0}
+
+    ids = [int(r["id"]) for r in rows]
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(ids)))
+    positions = await adb_core.fetch(
+        f"SELECT ii.product_id, p.name, ii.quantity, ii.price_cents "
+        f"FROM invoice_items ii JOIN products p ON p.id = ii.product_id "
+        f"WHERE ii.invoice_id IN ({placeholders})",
+        *ids,
+    )
+    agg: dict[str, dict] = {}
+    for pos in positions:
+        name = pos["name"] or "—"
+        d = agg.setdefault(name, {"sum_cents": 0, "qty": 0.0})
+        d["sum_cents"] += money.mul_qty(int(pos["price_cents"] or 0), float(pos["quantity"] or 0))
+        d["qty"] += float(pos["quantity"] or 0)
+    top = sorted(
+        ({"name": k, **v} for k, v in agg.items()), key=lambda d: d["sum_cents"], reverse=True
+    )
+    return {
+        "top_products": top[:10],
+        "recent": [
+            {
+                "id": int(r["id"]),
+                "number": r["invoice_number"],
+                "date": r["invoice_date"],
+                "currency": r["currency"],
+                "sum_cents": int(r["total_amount_cents"] or 0),
+            }
+            for r in rows[:10]
+        ],
+        "total_cents": sum(int(r["total_amount_cents"] or 0) for r in rows),
+        "count": len(rows),
+    }

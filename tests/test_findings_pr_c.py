@@ -1,8 +1,10 @@
 """
-PR C находок: snapshot.py native async (#31), деактивация юзера (#32),
-Google Drive архив аудита (#33).
+PR C находок: деактивация пользователя (#32).
 
-Реальная БД (isolated_db); МойСклад/Drive — мок на границе.
+Блок про snapshot (#31) удалён вместе с самим снапшотом справочников
+МойСклад — зеркалить больше нечего.
+
+Реальная БД (isolated_db).
 """
 
 import asyncio
@@ -12,55 +14,8 @@ from fastapi.testclient import TestClient
 import services.roles as roles
 
 
-# ─── #31: snapshot refresh через adb_core ────────────────────────────────────
 
 
-def test_refresh_products_writes_via_adb_core(isolated_db, monkeypatch):
-    import services.snapshot as snap
-
-    async def fake_fetch(path, params=None):
-        return [{"id": "p1", "name": "A"}, {"id": "p2", "name": "B"}]
-
-    monkeypatch.setattr(snap, "_fetch_all", fake_fetch)
-    n = asyncio.run(snap.refresh_products())
-    assert n == 2
-    assert snap.stats()["ms_products"] == 2
-    meta = asyncio.run(snap.meta_get("products"))
-    assert meta is not None
-    assert meta["status"] == "ok"
-    assert meta["rows_count"] == 2
-
-
-def test_meta_set_get_async_roundtrip(isolated_db):
-    import services.snapshot as snap
-
-    asyncio.run(snap.meta_set("stock", rows_count=7, status="ok"))
-    m = asyncio.run(snap.meta_get("stock"))
-    assert m["rows_count"] == 7
-    assert m["status"] == "ok"
-
-
-def test_refresh_stock_writes_via_adb_core(isolated_db, monkeypatch):
-    import services.snapshot as snap
-
-    async def fake_ms_get(path, params=None):
-        return {
-            "rows": [
-                {
-                    "meta": {"href": "https://x/entity/product/s1"},
-                    "name": "S1",
-                    "stock": 5,
-                    "reserve": 1,
-                }
-            ]
-        }
-
-    monkeypatch.setattr(snap, "ms_get", fake_ms_get)
-    n = asyncio.run(snap.refresh_stock())
-    assert n == 1
-    rows = snap.get_stock()
-    assert len(rows) == 1
-    assert rows[0]["name"] == "S1"
 
 
 # ─── #32: деактивация пользователя ───────────────────────────────────────────

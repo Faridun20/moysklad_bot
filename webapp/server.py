@@ -9,11 +9,11 @@ import binascii
 import logging
 import math
 import os
-import re
 import subprocess
 import time
 from collections import OrderedDict
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -393,117 +393,6 @@ async def telegram_webhook(secret: str, request: Request):
     return JSONResponse({"ok": True})
 
 
-# ─── Webhook от МойСклад ─────────────────────────────────────────────────────
-
-
-# Лимит payload MS-webhook'а — реалистично от МойСклад приходит ≤ 50KB
-# (события батчатся). 1MB достаточно с большим запасом, при этом
-# защищает от DoS: кто-то с известным секретом мог бы слать тяжёлые
-# body, забивая нашу память.
-_MS_WEBHOOK_MAX_BYTES = 1 * 1024 * 1024
-
-
-def _new_demand_ids_from_events(events: list[dict]) -> list[str]:
-    """demand_id новых отгрузок (action=CREATE, type demand/retaildemand) из
-    payload MS-вебхука. Вынесено отдельно — чтобы тестировать дискриминацию
-    событий без асинхронной fire-and-forget обвязки хендлера."""
-    from utils.helpers import extract_id_from_href
-
-    ids: list[str] = []
-    for e in events:
-        if e.get("action") != "CREATE":
-            continue
-        if (e.get("meta") or {}).get("type", "").lower() not in ("demand", "retaildemand"):
-            continue
-        did = extract_id_from_href((e.get("meta") or {}).get("href", ""))
-        if did:
-            ids.append(did)
-    return ids
-
-
-@app.post("/api/ms-webhook/{secret}")
-async def ms_webhook(secret: str, request: Request):
-    """
-    МойСклад дёргает этот endpoint при изменениях документов, влияющих
-    на остатки (demand/supply/loss/move/inventory). Секрет в URL —
-    единственная защита от чужих POST-ов.
-
-    Получив событие, помечаем stock как dirty. Фоновая корутина
-    _stock_debounce_loop через несколько секунд сделает refresh_stock,
-    батча все полученные события в один pull.
-    """
-    import hmac as _hmac
-    from services.ms_webhooks import get_webhook_secret
-    from services.snapshot import mark_stock_dirty
-
-    # constant-time сравнение секрета (timing-attack hardening)
-    if not _hmac.compare_digest(secret, get_webhook_secret()):
-        # Не отдаём 401 — не подсказываем атакующему, что секрет нужен.
-        raise HTTPException(status_code=404, detail="not found")
-
-    # Лимит на размер тела (defence in depth — реальный МС шлёт ≤50KB)
-    cl = request.headers.get("Content-Length")
-    try:
-        if cl and int(cl) > _MS_WEBHOOK_MAX_BYTES:
-            raise HTTPException(status_code=413, detail="payload too large")
-    except ValueError:
-        pass
-
-    try:
-        body_bytes = await request.body()
-        if len(body_bytes) > _MS_WEBHOOK_MAX_BYTES:
-            raise HTTPException(status_code=413, detail="payload too large")
-        import json as _json
-
-        payload = _json.loads(body_bytes) if body_bytes else {}
-    except HTTPException:
-        raise
-    except Exception:
-        payload = {}
-
-    events = payload.get("events", []) if isinstance(payload, dict) else []
-    if events:
-        logger.info(
-            "ms-webhook: %d event(s): %s",
-            len(events),
-            ", ".join(f"{e.get('action')}.{(e.get('meta') or {}).get('type')}" for e in events[:5]),
-        )
-
-        from services.ms_webhooks import STOCK_SUBSCRIPTIONS
-
-        _stock_types = {s[0] for s in STOCK_SUBSCRIPTIONS}
-
-        # Остатки: только события от складских документов
-        stock_events = [
-            e for e in events if (e.get("meta") or {}).get("type", "").lower() in _stock_types
-        ]
-        if stock_events:
-            mark_stock_dirty()
-            # Документ изменился → читалки (get_sales_stats, get_shipments,
-            # позиции) могут отдавать устаревшие данные. Сбрасываем все
-            # TTL-кэши МС, чтобы следующее открытие «Аналитики» увидело
-            # свежие цифры.
-            from services.moysklad import invalidate_ms_cache
-
-            invalidate_ms_cache()
-
-        # Платежи / заказы покупателя: синхронизируем локальные данные
-        from services.ms_sync_handler import handle_ms_events
-
-        _spawn_bg(handle_ms_events(events), "handle_ms_events")
-
-        # Новые отгрузки → уведомляем boss/admin МГНОВЕННО (раньше это делал
-        # поллер раз в N секунд, отсюда задержка до нескольких минут). Дедуп
-        # внутри notify_new_shipment не даст задвоить с поллером-резервом.
-        from services.notifier import notify_new_shipment
-
-        for did in _new_demand_ids_from_events(events):
-            _spawn_bg(notify_new_shipment(did), f"notify_new_shipment:{did}")
-
-    # МойСклад ждёт 200 быстро, иначе ретраит. Сам рефреш делаем в фоне.
-    return JSONResponse({"ok": True, "received": len(events)})
-
-
 # ─── Health-check ────────────────────────────────────────────────────────────
 
 
@@ -626,7 +515,7 @@ async def api_search(request: Request):
     они и так нужны для создания заказов).
     """
     from services import async_db as adb
-    from services import snapshot
+    from services import counterparties as cp_service
 
     data = await request.json()
     user = _authorize(
@@ -644,7 +533,7 @@ async def api_search(request: Request):
 
     orders = await adb.search_orders(query, user_id=scope_uid, limit=20)
     payments = await adb.search_payments(query, user_id=scope_uid, limit=20)
-    agents = await asyncio.to_thread(snapshot.get_counterparties, query, 20)
+    agents = await cp_service.search(query, 20)
 
     # Урезаем заказы/платежи до полезного для UI набора полей.
     orders_out = [
@@ -688,14 +577,14 @@ async def api_home(request: Request):
       - my_orders: его заказы (по статусам + последние 5)
 
     Босс/админ видит общую картину:
-      - today: общая выручка/отгрузки/клиенты по всему МойСклад
+      - today: общая выручка/отгрузки/клиенты по складу компании
       - my_orders: его собственные заказы
       - pending_requests: количество заявок ожидающих апрува
       - top_employees: лидерборд за неделю
     """
     from datetime import datetime, timedelta
-    from services.moysklad import get_sales_stats, get_shipments
     from services import async_db as adb
+    from services.warehouse import sales_stats
 
     data = await request.json()
     user = _authorize(
@@ -735,24 +624,14 @@ async def api_home(request: Request):
     ]
 
     is_boss = role in ("admin", "boss")
-    # Заполняется только в boss-ветке ниже, но читается в отдельном boss-блоке
-    # (лидерборд) — объявляем заранее, чтобы тип был определён (mypy has-type).
-    week_shipments: list[dict] | BaseException = []
 
     # ─── Сегодня ──────────────────────────────────────
     if is_boss:
-        # Босс видит общую выручку за сегодня + лидерборд за неделю. Оба источника
-        # — независимые запросы к МойСклад; тянем их параллельно (раньше шли
-        # последовательно через всю функцию — ~1с на двух round-trip'ах подряд).
-        ms_results = await asyncio.gather(
-            get_sales_stats(start_of_day, now),
-            get_shipments(week_ago, now),
-            return_exceptions=True,
-        )
-        today_stats = ms_results[0]
-        week_shipments = ms_results[1]
-        if isinstance(today_stats, BaseException):
-            logger.warning("home: failed to load today stats: %s", today_stats)
+        # Босс видит общую выручку за сегодня — по расходным накладным склада.
+        try:
+            today_stats = await sales_stats(start_of_day, now)
+        except Exception as e:  # noqa: BLE001 — экран важнее одной цифры
+            logger.warning("home: failed to load today stats: %s", e)
             today_stats = {"total": 0, "count": 0, "clients": 0, "top_products": []}
         today = {
             "revenue": today_stats["total"] / 100,
@@ -761,8 +640,8 @@ async def api_home(request: Request):
             "scope": "company",
         }
     else:
-        # Менеджер: считаем личные показатели из локальных одобренных заявок.
-        # Источник — наша БД, без обращения к МойСклад. Батч-запросом
+        # Менеджер: считаем личные показатели из его же одобренных заявок.
+        # Батч-запросом
         # подтягиваем сразу все позиции (раньше был N+1 по заказам).
         today_iso = start_of_day.strftime("%Y-%m-%d")
         relevant_today = [
@@ -794,7 +673,9 @@ async def api_home(request: Request):
 
     from config import BASE_CURRENCY
 
-    result = {
+    # Явная аннотация: дальше в словарь кладут и числа, и списки словарей,
+    # а выведенный тип зафиксировался бы по первым ключам.
+    result: dict[str, Any] = {
         "role": role,
         "today": today,
         "my_orders": {
@@ -805,7 +686,6 @@ async def api_home(request: Request):
             "total": len(my_orders),
             "recent": recent,
         },
-        "ms_linked": bool(await adb.get_moysklad_employee_id(user_id)),
         "currency": BASE_CURRENCY,
     }
 
@@ -827,42 +707,24 @@ async def api_home(request: Request):
             "debts": counts["debts"],
         }
 
-        # Топ-сотрудники из УЖЕ полученных недельных отгрузок (см. gather выше).
-        # Группируем по кастомному атрибуту telegram_full_name (его проставляет
-        # ms_demand при создании отгрузки из бота). Нет атрибута → "Прочее
-        # (вручную в МойСклад)". Раньше группировали по `owner` — техническая
-        # учётка API-токена, все отгрузки липли к одному имени.
-        if isinstance(week_shipments, BaseException):
-            logger.warning("home: failed to load top employees: %s", week_shipments)
-            result["top_employees"] = []
-        else:
-            by_manager: dict[str, dict] = {}
-            for s in week_shipments:
-                tg_name = _extract_tg_attribute(s, "telegram_full_name")
-                if not tg_name:
-                    tg_name = "Прочее (вручную в МойСклад)"
-                cur = by_manager.setdefault(tg_name, {"sum": 0, "count": 0})
-                cur["sum"] += s.get("sum", 0) or 0
-                cur["count"] += 1
-            top_emp = sorted(by_manager.items(), key=lambda kv: kv[1]["sum"], reverse=True)[:5]
+        # Топ-сотрудники — из ЛОКАЛЬНЫХ заказов (`get_manager_performance`,
+        # GROUP BY user_id). Раньше группировали отгрузки МойСклад по
+        # кастомному атрибуту `telegram_full_name`, который проставлялся только
+        # когда документ создал бот, — всё остальное липло к строке «Прочее
+        # (вручную в МойСклад)». Своя таблица знает менеджера у каждого заказа.
+        try:
+            perf = await adb.get_manager_performance(
+                week_ago.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")
+            )
             result["top_employees"] = [
-                {"name": name, "revenue": d["sum"] / 100, "count": d["count"]}
-                for name, d in top_emp
+                {"name": m["full_name"], "revenue": m["revenue"], "count": m["shipped"]}
+                for m in perf[:5]
             ]
+        except Exception as e:  # noqa: BLE001 — лидерборд не важнее экрана
+            logger.warning("home: failed to load top employees: %s", e)
+            result["top_employees"] = []
 
     return JSONResponse(result)
-
-
-def _extract_tg_attribute(demand: dict, attr_name: str) -> str | None:
-    """Найти значение нашего кастомного атрибута в demand-документе.
-    МойСклад возвращает attributes inline в виде
-    [{"name": "...", "value": ...}, ...]."""
-    attrs = demand.get("attributes") or []
-    for a in attrs:
-        if a.get("name") == attr_name:
-            v = a.get("value")
-            return str(v) if v not in (None, "") else None
-    return None
 
 
 # ─── API: операционная сводка ────────────────────────────────────────────────
@@ -923,9 +785,14 @@ async def api_ops_summary(request: Request):
 
 @app.post("/api/stock")
 async def api_stock(request: Request):
-    """Список товаров со склада."""
-    from services.moysklad import get_all_stock, get_categories
-    from utils.helpers import extract_id_from_href
+    """Список товаров со склада: остаток, резерв, доступное, цены.
+
+    Источник — наши `products`/`stock`, а не каталог МойСклад. Из-за этого
+    исчезла и ветка «МойСклад недоступен»: локальная БД либо есть, либо не
+    отвечает ничего, и мягко деградировать тут не во что.
+    """
+    from services import async_db as adb
+    from services.warehouse import get_catalog, get_categories
 
     data = await request.json()
     user = _authorize(
@@ -936,55 +803,33 @@ async def api_stock(request: Request):
     )
     role = get_role(user["id"])
 
-    # МойСклад может быть недоступен (сеть/токен/5xx). Раньше это всплывало как
-    # HTTP 500 с сырым «401 Unauthorized …» на экране «Каталог». Деградируем
-    # мягко: пустой каталог + флаг ms_unavailable, фронт покажет подсказку.
-    try:
-        rows, cats = await asyncio.gather(
-            get_all_stock(),
-            get_categories(),
-        )
-    except Exception as e:
-        logger.warning("stock: каталог МойСклад недоступен: %s", e)
-        return JSONResponse({"products": [], "categories": [], "ms_unavailable": True})
+    rows, cats = await asyncio.gather(get_catalog(), get_categories())
 
-    # PR C: подмешиваем цены руководства. sale_price — всем (менеджер
-    # видит минимум и дефолт), cost_price — ТОЛЬКО boss/admin (себестоимость
-    # не раскрываем менеджерам).
-    from services import async_db as adb
-
+    # PR C: подмешиваем цены руководства. sale_price — всем (менеджер видит
+    # минимум и дефолт), cost_price — ТОЛЬКО boss/admin (себестоимость не
+    # раскрываем менеджерам).
     is_boss = role in ("admin", "boss")
-    ms_ids = [extract_id_from_href(r.get("meta", {}).get("href", "")) for r in rows]
-    prices = await adb.get_product_prices_by_ids([i for i in ms_ids if i])
+    prices = await adb.get_product_prices_by_ids([str(r["product_id"]) for r in rows])
 
     products = []
-    for r, ms_id in zip(rows, ms_ids, strict=True):
-        pp = prices.get(ms_id) if ms_id else None
+    for r in rows:
+        pp = prices.get(str(r["product_id"]))
         item = {
-            "name": r.get("name", "—"),
-            "stock": r.get("stock", 0),
-            "reserve": r.get("reserve", 0),
-            "unit": r.get("uom", {}).get("name", "шт"),
-            # href нужен чтобы при создании заявки через WebApp
-            # позиция уехала в МойСклад demand с правильной ссылкой на товар
-            "href": r.get("meta", {}).get("href", ""),
-            "folder_id": extract_id_from_href(r.get("folder", {}).get("meta", {}).get("href", "")),
-            "folder_name": r.get("folder", {}).get("name", ""),
+            "product_id": r["product_id"],
+            "name": r["name"],
+            "stock": r["quantity"],
+            "reserve": r["reserved"],
+            "available": r["available"],
+            "unit": r["unit"],
+            "folder_id": r["category"],
+            "folder_name": r["category"],
             "sale_price": (pp.get("sale_price") if pp else None),
         }
         if is_boss and pp:
             item["cost_price"] = pp.get("cost_price")
         products.append(item)
 
-    categories = [
-        {
-            "id": extract_id_from_href(c.get("meta", {}).get("href", "")),
-            "name": c.get("name", "—"),
-        }
-        for c in cats
-    ]
-
-    return JSONResponse({"products": products, "categories": categories})
+    return JSONResponse({"products": products, "categories": cats})
 
 
 # ─── API: аналитика продаж ───────────────────────────────────────────────────
@@ -995,8 +840,8 @@ async def api_analytics(request: Request):
     """
     Аналитика продаж за период.
 
-    Менеджер видит ТОЛЬКО свои показатели (из локальной БД).
-    Босс/админ — общую по компании (из МойСклад API).
+    Менеджер видит ТОЛЬКО свои показатели (по его заказам).
+    Босс/админ — общую по компании (по расходным накладным склада).
     """
     from datetime import datetime
 
@@ -1019,46 +864,46 @@ async def api_analytics(request: Request):
         # Личная аналитика — считаем из локальной БД по одобренным заявкам.
         return JSONResponse(await _personal_analytics(user_id, since, until, prev_since, label))
 
-    # Босс/админ — компания, из МойСклад
+    # Босс/админ — компания целиком
     payload = await _company_analytics_payload(since, until, prev_since, label)
     return JSONResponse(payload)
 
 
 async def _company_analytics_payload(since, until, prev_since, label: str) -> dict:
-    """Расчёт компанейской аналитики (boss/admin) из МойСклад.
+    """Расчёт компанейской аналитики (boss/admin) по расходным накладным.
 
-    Вынесено из api_analytics, чтобы /api/analytics/export переиспользовал
-    тот же расчёт. Включает маржу по топ-товарам (cost из product_prices),
-    топ клиентов и топ менеджеров.
+    Вынесено из api_analytics, чтобы /api/analytics/export переиспользовал тот
+    же расчёт. Включает маржу по топ-товарам (cost из product_prices), топ
+    клиентов и топ менеджеров.
+
+    Источник сменился с МойСклад на свой склад, и вместе с ним ушла ветка
+    «МС недоступен»: раньше любое исключение всплывало как HTTP 500 и WebApp
+    показывал «Unexpected token … is not valid JSON». Локальные запросы так не
+    падают, но обёртку `_safe_call` оставляем — пустая аналитика полезнее
+    ошибки вместо экрана.
     """
     from datetime import datetime
 
     from services import async_db as adb
-    from services.moysklad import get_sales_stats, get_shipments
+    from services.warehouse import list_shipments, sales_stats
 
-    # МойСклад может быть недоступен (сеть, истёкший/битый токен, 5xx). Раньше
-    # любое исключение тут всплывало как HTTP 500, и WebApp показывал «Не удалось
-    # загрузить: Unexpected token … is not valid JSON» (500-боди — не JSON).
-    # Деградируем мягко: пустые продажи + локальный топ-менеджеров всё равно
-    # отдаём, плюс флаг ms_unavailable для подсказки в UI.
     _empty_stats: dict = {"total": 0, "count": 0, "clients": 0, "top_products": []}
-    _ms_state = {"ok": True}
+    _state = {"ok": True}
 
     async def _safe_call(coro, default, label):
-        """Значение MS-вызова или default при сбое (сеть/токен/5xx) + флаг."""
         try:
             return await coro
-        except Exception as e:  # noqa: BLE001 — сюда же ClientResponseError 4xx/5xx
-            logger.warning("analytics: %s недоступен: %s", label, e)
-            _ms_state["ok"] = False
+        except Exception as e:  # noqa: BLE001 — экран важнее одной цифры
+            logger.warning("analytics: %s не посчитан: %s", label, e)
+            _state["ok"] = False
             return default
 
     current, prev, shipments = await asyncio.gather(
-        _safe_call(get_sales_stats(since, until), _empty_stats, "get_sales_stats"),
-        _safe_call(get_sales_stats(prev_since, since), _empty_stats, "get_sales_stats(prev)"),
-        _safe_call(get_shipments(since, until), [], "get_shipments"),
+        _safe_call(sales_stats(since, until), _empty_stats, "sales_stats"),
+        _safe_call(sales_stats(prev_since, since), _empty_stats, "sales_stats(prev)"),
+        _safe_call(list_shipments(since, until), [], "list_shipments"),
     )
-    ms_unavailable = not _ms_state["ok"]
+    stats_incomplete = not _state["ok"]
 
     days_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     by_day = [0] * 7
@@ -1074,16 +919,16 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
     if prev["total"] > 0:
         trend = round((current["total"] - prev["total"]) / prev["total"] * 100)
 
-    # Маржа по топ-товарам. МС price — минорные (÷100); cost — мажорные
+    # Маржа по топ-товарам. Выручка — в копейках (÷100); cost — мажорные
     # (как ввело руководство). cost None → profit не считаем.
     top_products = current["top_products"][:5]
-    prod_ms_ids = [d.get("ms_id") for _n, d in top_products if d.get("ms_id")]
-    costs = await adb.get_product_prices_by_ids(prod_ms_ids) if prod_ms_ids else {}
+    prod_ids = [str(d["product_id"]) for _n, d in top_products if d.get("product_id")]
+    costs = await adb.get_product_prices_by_ids(prod_ids) if prod_ids else {}
     top = []
     for name, d in top_products:
         revenue = d["sum"] / 100
         item = {"name": name, "sum": revenue, "qty": d["qty"]}
-        cost_row = costs.get(d.get("ms_id") or "")
+        cost_row = costs.get(str(d.get("product_id") or ""))
         cost = cost_row.get("cost_price") if cost_row else None
         if cost is not None:
             item["profit"] = round(revenue - float(cost) * d["qty"], 2)
@@ -1128,7 +973,7 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
         "top_products": top,
         "top_clients": top_clients,
         "top_managers": top_managers,
-        "ms_unavailable": ms_unavailable,
+        "stats_incomplete": stats_incomplete,
     }
 
 
@@ -2046,12 +1891,12 @@ async def _photo_bytes(tg_file_id: str, cache_key: str) -> bytes | None:
 async def api_products_search(request: Request):
     """Поиск товара в номенклатуре — для подсказок при вводе позиции.
 
-    Читаем СНАПШОТ, а не МойСклад: подсказка дёргается на каждое нажатие, и
-    десяток запросов в справочник на одну строку накладной съел бы бюджет,
-    который и так ужимается по календарю. Снапшот отстаёт максимум на сутки —
-    для «есть ли такой товар в каталоге» этого достаточно.
+    Читаем свою таблицу `products`: каталог теперь наш, и подсказка стоит один
+    локальный запрос. Поиск по кириллице — через `lower()` с обеих сторон
+    (CLAUDE.md: встроенный SQLite LOWER() ASCII-only, `adb_core` переопределяет
+    его Unicode-aware).
     """
-    from services import snapshot
+    from services import adb_core
 
     data = await request.json()
     _authorize(
@@ -2062,7 +1907,11 @@ async def api_products_search(request: Request):
     if len(query) < 2:
         # Пустой ввод — не повод отдавать первые 20 товаров каталога наугад.
         return JSONResponse({"ok": True, "products": [], "query": query})
-    rows = await asyncio.to_thread(snapshot.search_products, query, 20)
+    rows = await adb_core.fetch(
+        "SELECT id AS product_id, name, unit, category, sku FROM products "
+        "WHERE lower(name) LIKE $1 ORDER BY name LIMIT 20",
+        f"%{query.lower()}%",
+    )
     return JSONResponse({"ok": True, "products": rows, "query": query})
 
 
@@ -2077,9 +1926,9 @@ async def api_products_photo(request: Request):
         data, allowed_roles=("admin", "boss", "manager"),
         rate_limit_scope="api_products_photo", rate_limit_max=120,
     )
-    ms_id = (data.get("ms_id") or "").strip()[:64]
+    product_ref = _product_ref(data)
     photo_id = _machine_id_arg(data, "photo_id")
-    photos = await product_photos.list_photos(ms_id)
+    photos = await product_photos.list_photos(product_ref)
     photo = next((p for p in photos if int(p["id"]) == photo_id), None)
     if not photo:
         raise HTTPException(status_code=404, detail="Фото не найдено")
@@ -2104,10 +1953,8 @@ async def api_products_photos(request: Request):
         data, allowed_roles=("admin", "boss", "manager"),
         rate_limit_scope="api_products_photos",
     )
-    ms_id = (data.get("ms_id") or "").strip()[:64]
-    if not ms_id:
-        raise HTTPException(status_code=400, detail="Не указан товар")
-    photos = await product_photos.list_photos(ms_id)
+    product_ref = _product_ref(data, required=True)
+    photos = await product_photos.list_photos(product_ref)
     return JSONResponse({
         "ok": True,
         "photos": [
@@ -2132,11 +1979,11 @@ async def api_products_photo_delete(request: Request):
     _authorize(
         data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_products_photo_delete"
     )
-    ms_id = (data.get("ms_id") or "").strip()[:64]
+    product_ref = _product_ref(data, required=True)
     photo_id = _machine_id_arg(data, "photo_id")
-    if not ms_id:
+    if not product_ref:
         raise HTTPException(status_code=400, detail="Не указан товар")
-    return _machine_response(await product_photos.delete_photo(ms_id, photo_id))
+    return _machine_response(await product_photos.delete_photo(product_ref, photo_id))
 
 
 @app.post("/api/products/photo_upload")
@@ -2152,9 +1999,7 @@ async def api_products_photo_upload(request: Request):
         # ракурсов — это одно действие человека, а не подозрительная активность.
         rate_limit_max=60,
     )
-    ms_id = (data.get("ms_id") or "").strip()[:64]
-    if not ms_id:
-        raise HTTPException(status_code=400, detail="Не указан товар")
+    product_ref = _product_ref(data, required=True)
     chat_id = _machine_photos_chat_id()
     if chat_id is None:
         raise HTTPException(
@@ -2168,7 +2013,7 @@ async def api_products_photo_upload(request: Request):
 
         bot = await get_notify_bot()
         sent = await bot.send_photo(
-            chat_id, BufferedInputFile(blob, filename=f"product-{ms_id}.jpg"),
+            chat_id, BufferedInputFile(blob, filename=f"product-{product_ref}.jpg"),
             caption=(data.get("caption") or "")[:200] or None,
         )
     except Exception as e:
@@ -2179,7 +2024,7 @@ async def api_products_photo_upload(request: Request):
     if best is None:
         raise HTTPException(status_code=502, detail="Telegram не вернул файл")
     res = await product_photos.add_photo(
-        ms_id, tg_file_id=best.file_id, file_unique_id=best.file_unique_id,
+        product_ref, tg_file_id=best.file_id, file_unique_id=best.file_unique_id,
         uploaded_by=user["id"], caption=(data.get("caption") or "")[:200] or None,
     )
     return _machine_response(res)
@@ -2232,18 +2077,18 @@ async def api_channel_draft(request: Request):
             raise HTTPException(status_code=409, detail="В контейнере нет прибывших позиций")
         text = channel.build_arrival(names, note=note, manager_username=username)
     elif kind == "showcase":
-        from services import product_photos, snapshot
+        from services import product_photos, warehouse
 
-        ms_id = (data.get("ms_id") or "").strip()[:64]
-        product = await asyncio.to_thread(snapshot.get_product, ms_id)
+        product_ref = _product_ref(data, required=True)
+        product = await warehouse.get_product(product_ref)
         if not product:
             raise HTTPException(status_code=404, detail="Товар не найден в каталоге")
-        ref = ms_id
-        prices = await _price_label(ms_id)
+        ref = product_ref
+        prices = await _price_label(product_ref)
         text = channel.build_showcase(
             product, price=prices, note=note, manager_username=username
         )
-        first = await product_photos.first_photo(ms_id)
+        first = await product_photos.first_photo(product_ref)
         photo_id = int(first["id"]) if first else None
     else:
         names = [str(n)[:200] for n in (data.get("names") or []) if str(n).strip()][:30]
@@ -2258,13 +2103,13 @@ async def api_channel_draft(request: Request):
     })
 
 
-async def _price_label(ms_id: str) -> str | None:
+async def _price_label(product_ref: str) -> str | None:
     """Цена товара для витрины — только если её задавали руками."""
     from services import async_db as adb
     from config import BASE_CURRENCY
 
-    prices = await adb.get_product_prices_by_ids([ms_id])
-    row = prices.get(ms_id) or {}
+    prices = await adb.get_product_prices_by_ids([product_ref])
+    row = prices.get(product_ref) or {}
     price = row.get("sale_price")
     if price is None or price == "":
         return None
@@ -2303,10 +2148,10 @@ async def api_channel_publish(request: Request):
 
     photo_blob = None
     photo_id = data.get("photo_id")
-    if photo_id and (data.get("ms_id") or "").strip():
+    if photo_id and _product_ref(data):
         from services import product_photos
 
-        photos = await product_photos.list_photos((data.get("ms_id") or "").strip()[:64])
+        photos = await product_photos.list_photos(_product_ref(data))
         photo = next((p for p in photos if int(p["id"]) == int(photo_id)), None)
         if photo:
             photo_blob = await _photo_bytes(
@@ -2478,10 +2323,10 @@ async def api_leads_status(request: Request):
 async def api_leads_agents(request: Request):
     """Поиск контрагента для привязки — по названию ИЛИ телефону.
 
-    Телефон важнее названия: клиента помнят по номеру, а в МойСклад он записан
-    как «ООО Бахор Савдо». Читаем снапшот, в МойСклад не ходим.
+    Телефон важнее названия: клиента помнят по номеру, а в справочнике он
+    записан как «ООО Бахор Савдо».
     """
-    from services import snapshot
+    from services import counterparties as cp_service
 
     data = await request.json()
     _authorize(
@@ -2489,18 +2334,19 @@ async def api_leads_agents(request: Request):
         rate_limit_max=240,
     )
     search = (data.get("search") or "").strip()[:100]
-    rows = await asyncio.to_thread(snapshot.get_counterparties, search or None, 20)
+    rows = await cp_service.search(search or None, 20)
     return JSONResponse({"ok": True, "agents": rows})
 
 
 @app.post("/api/leads/create_agent")
 async def api_leads_create_agent(request: Request):
-    """Завести контрагента в МойСклад по клиенту и сразу привязать.
+    """Завести контрагента в справочнике по клиенту и сразу привязать.
 
     Заводит ЧЕЛОВЕК кнопкой: каждый написавший — ещё не клиент, автосоздание
     превратило бы справочник в свалку из случайных собеседников.
     """
-    from services import leads, ms_counterparty
+    from services import counterparties as cp_service
+    from services import leads
 
     data = await request.json()
     user = _authorize(
@@ -2515,13 +2361,16 @@ async def api_leads_create_agent(request: Request):
         raise HTTPException(status_code=403, detail="Это не ваш клиент")
 
     name = _machine_text(data, "name", 255) or lead.get("display_name") or lead.get("username")
-    created = await ms_counterparty.create_counterparty(
-        name or "", phone=_machine_text(data, "phone", 64)
+    created = await cp_service.create(
+        name or "",
+        phone=_machine_text(data, "phone", 64),
+        telegram_id=lead.get("tg_user_id"),
     )
     if not created.get("ok"):
         return _machine_response(created)
     res = await leads.link_agent(
-        lead_id, created["ms_id"], user_id=user["id"], full_name=_actor_name(user)
+        lead_id, str(created["counterparty_id"]), user_id=user["id"],
+        full_name=_actor_name(user),
     )
     if not res.get("ok"):
         return _machine_response(res)
@@ -2634,9 +2483,9 @@ async def api_leads_link(request: Request):
         raise HTTPException(status_code=404, detail="Лид не найден")
     if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
         raise HTTPException(status_code=403, detail="Это не ваш клиент")
-    agent_ms_id = (data.get("agent_ms_id") or "").strip()[:64] or None
+    counterparty_id = (data.get("counterparty_id") or "").strip()[:64] or None
     res = await leads.link_agent(
-        lead_id, agent_ms_id, user_id=user["id"], full_name=_actor_name(user)
+        lead_id, counterparty_id, user_id=user["id"], full_name=_actor_name(user)
     )
     return _machine_response(res)
 
@@ -2693,7 +2542,6 @@ async def api_orders(request: Request):
         orders = await adb.get_user_orders(user["id"])
 
     from config import BASE_CURRENCY
-    from utils.helpers import extract_id_from_href
 
     is_boss = role in ("admin", "boss")
 
@@ -2701,19 +2549,19 @@ async def api_orders(request: Request):
     items_by_order = await adb.get_order_items_by_ids([o["id"] for o in orders]) if orders else {}
 
     # PR C: прибыль по заказу — ТОЛЬКО boss/admin. Себестоимость из
-    # product_prices (батч по всем ms_id позиций). profit = Σ (price−cost)×qty.
+    # product_prices (батч по всем товарам позиций). profit = Σ (price−cost)×qty.
     # Если у позиции cost неизвестна — заказ помечается profit_partial=True
     # (не врём нулём). Менеджеру profit/cost не отдаём вообще.
-    cost_by_ms: dict = {}
+    cost_by_product: dict = {}
     if is_boss:
-        all_ms_ids = {
-            extract_id_from_href(it.get("product_href", ""))
+        all_product_ids = {
+            str(it["product_id"])
             for items in items_by_order.values()
             for it in items
-            if it.get("product_href")
+            if it.get("product_id")
         }
-        prices = await adb.get_product_prices_by_ids([i for i in all_ms_ids if i])
-        cost_by_ms = {
+        prices = await adb.get_product_prices_by_ids(sorted(all_product_ids))
+        cost_by_product = {
             k: v.get("cost_price") for k, v in prices.items() if v.get("cost_price") is not None
         }
 
@@ -2758,10 +2606,7 @@ async def api_orders(request: Request):
             profit = 0.0
             partial = False
             for it in items:
-                ms_id = extract_id_from_href(it.get("product_href", "")) if it.get(
-                    "product_href"
-                ) else ""
-                cost = cost_by_ms.get(ms_id)
+                cost = cost_by_product.get(str(it.get("product_id") or ""))
                 qty = float(it.get("quantity", 0) or 0)
                 price = float(it.get("price", 0) or 0)
                 if cost is None:
@@ -3079,10 +2924,16 @@ async def api_clients_overview(request: Request):
 
 @app.post("/api/clients/detail")
 async def api_clients_detail(request: Request):
-    """Карточка контрагента: имя/телефон/МС-баланс (снапшот) + локальный долг/лимит
-    + заказы в боте + покупки из МС (отгрузки). Только начальство."""
+    """Карточка контрагента: имя/телефон + долг/лимит + заказы в боте +
+    покупки (расходные накладные склада). Только начальство.
+
+    Баланса взаиморасчётов МойСклад здесь больше нет: «сколько должен»
+    считает `get_agent_current_debt` по нашим же заказам, и второй ответ на
+    тот же вопрос с ним бы расходился.
+    """
     from services import async_db as adb
-    from services import moysklad, snapshot
+    from services import counterparties as cp_service
+    from services import warehouse
 
     data = await request.json()
     _authorize(
@@ -3096,7 +2947,7 @@ async def api_clients_detail(request: Request):
     if not agent_id:
         raise HTTPException(status_code=400, detail="agent_id обязателен")
 
-    cp = await asyncio.to_thread(snapshot.get_counterparty, agent_id)
+    cp = await cp_service.get(agent_id)
     debt = await adb.get_agent_current_debt(agent_id)
     limit = await adb.get_credit_limit(agent_id)
     orders = await adb.get_orders_by_agent(agent_id)
@@ -3104,11 +2955,7 @@ async def api_clients_detail(request: Request):
     # заказы) и возвраты. Формат строки — как в общей ленте «Деньги», поэтому
     # фронт рисует её тем же кодом.
     money_history = await adb.get_agent_money_history(agent_id)
-    # Покупки из МС — best-effort: при сбое МС карточка всё равно открывается.
-    try:
-        purchases = await moysklad.get_counterparty_purchases(agent_id)
-    except Exception:
-        purchases = {"top_products": [], "recent": [], "total_cents": 0, "count": 0}
+    purchases = await warehouse.counterparty_purchases(agent_id)
     from config import BASE_CURRENCY
 
     return JSONResponse(
@@ -3117,7 +2964,6 @@ async def api_clients_detail(request: Request):
             "agent_id": agent_id,
             "name": (cp or {}).get("name") or "",
             "phone": (cp or {}).get("phone") or "",
-            "balance_cents": (cp or {}).get("balance_cents"),
             "debt": debt,
             "limit": limit,
             "free": round(limit - debt, 2),
@@ -3130,26 +2976,14 @@ async def api_clients_detail(request: Request):
     )
 
 
-# Идентификаторы МойСклад — UUID. Проверяем формат перед подстановкой в путь
-# запроса: значение приходит от клиента, а `entity/demand/{id}/positions` —
-# это путь, и «id» вида `../../entity/counterparty/xxx` увёл бы запрос в другую
-# сущность. Роль здесь и так admin/boss, но подставлять сырую строку в URL —
-# привычка, которая однажды выстрелит в менее защищённом месте.
-_MS_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-                         r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-
-
 @app.post("/api/clients/shipment")
 async def api_clients_shipment(request: Request):
-    """Состав отгрузки клиента: позиции demand'а из МойСклад.
+    """Состав отгрузки клиента: позиции расходной накладной.
 
     В карточке клиента отгрузки показывались одной суммой и датой — увидеть,
     ЧТО именно уехало, было нельзя, хотя это первый вопрос при разборе долга.
-
-    Позиции документа после создания неизменяемы, поэтому в сервисе уже стоит
-    часовой кэш — повторное открытие той же отгрузки в МС не ходит.
     """
-    from services import moysklad
+    from services import warehouse
 
     data = await request.json()
     _authorize(
@@ -3158,46 +2992,39 @@ async def api_clients_shipment(request: Request):
         rate_limit_scope="api_clients_shipment",
         rate_limit_max=60,
     )
-    demand_id = (data.get("demand_id") or "").strip()
-    if not _MS_UUID_RE.match(demand_id):
-        raise HTTPException(status_code=400, detail="demand_id: ожидается идентификатор МойСклад")
-
-    try:
-        rows = await moysklad.get_shipment_positions(demand_id)
-    except Exception as e:
-        # МС недоступен — это не поломка карточки: остальное в ней уже
-        # отрисовано, разворачивается только одна строка.
-        logger.warning("Не удалось получить позиции отгрузки %s: %s", demand_id, e)
-        raise HTTPException(status_code=502, detail="МойСклад не ответил, попробуйте позже")
+    invoice_id = _machine_id_arg(data, "invoice_id")
+    invoice = await warehouse.get_invoice(invoice_id)
+    if not invoice or invoice.get("type") != "outgoing":
+        raise HTTPException(status_code=404, detail="Накладная не найдена")
 
     positions = []
     # Итог копим в цикле, а не пересобираем генератором из уже готовых строк:
     # значения словаря позиции — объединение типов (строки, float, int), и
     # sum() по ним не проходит проверку типов (mypy — блокирующий гейт).
     total_cents = 0
-    for pos in rows:
+    for pos in invoice.get("items") or []:
         quantity = float(pos.get("quantity", 0) or 0)
-        price_cents = int(pos.get("price", 0) or 0)
-        line_cents = int(round(quantity * price_cents))
+        price_cents = int(pos.get("price_cents", 0) or 0)
+        line_cents = money.mul_qty(price_cents, quantity)
         total_cents += line_cents
         positions.append(
             {
-                "name": (pos.get("assortment") or {}).get("name") or "—",
+                "name": pos.get("product_name") or "—",
                 "quantity": quantity,
-                "unit": (pos.get("uom") or {}).get("name") or "шт",
+                "unit": pos.get("unit") or "шт",
                 "price_cents": price_cents,
                 "sum_cents": line_cents,
             }
         )
-    from config import BASE_CURRENCY
 
     return JSONResponse(
         {
             "ok": True,
-            "demand_id": demand_id,
+            "invoice_id": invoice_id,
+            "number": invoice.get("invoice_number"),
             "positions": positions,
             "sum_cents": total_cents,
-            "currency": (BASE_CURRENCY or "USD").upper(),
+            "currency": (invoice.get("currency") or "USD").upper(),
         }
     )
 
@@ -3266,7 +3093,7 @@ async def api_products_prices_set(request: Request):
     """Установить цену продажи (минимум) и/или себестоимость товара.
 
     Только admin/boss. Payload:
-      {"initData": "...", "ms_id": "...", "product_name": "...",
+      {"initData": "...", "product_id": N, "product_name": "...",
        "sale_price": 150.0, "cost_price": 100.0, "currency": "USD"}
     sale_price/cost_price опциональны (null = не задавать/сбросить).
     """
@@ -3276,9 +3103,7 @@ async def api_products_prices_set(request: Request):
     user = _authorize(
         data, allowed_roles=("admin", "boss"), rate_limit_scope="api_products_prices_set"
     )
-    ms_id = (data.get("ms_id") or "").strip()[:64]
-    if not ms_id:
-        raise HTTPException(status_code=400, detail="ms_id обязателен")
+    ms_id = _product_ref(data, required=True)
     product_name = (data.get("product_name") or "").strip()[:300]
 
     def _opt_price(key):
@@ -3307,7 +3132,7 @@ async def api_products_prices_set(request: Request):
         "product_price_set",
         f"{ms_id} ({product_name}): sale={sale_price} cost={cost_price}",
     )
-    return JSONResponse({"ok": True, "ms_id": ms_id})
+    return JSONResponse({"ok": True, "product_id": ms_id})
 
 
 # ─── API: техника (экскаваторы) ──────────────────────────────────────────────
@@ -3462,6 +3287,41 @@ def _machine_id_arg(data: dict, key: str = "machine_id") -> int:
         raise HTTPException(status_code=400, detail=f"{key}: не число")
     if value <= 0:
         raise HTTPException(status_code=400, detail=f"{key} обязателен")
+    return value
+
+
+def _product_ref(data: dict, required: bool = False) -> str:
+    """Идентификатор товара из тела запроса — СТРОКОЙ.
+
+    Фото и цены лежат в таблицах, чей ключ (`product_photos.ms_id`,
+    `product_prices.ms_id`) остался текстовым с эпохи МойСклад: переименовать
+    колонку нечем — инкрементальных миграций в проекте нет. После
+    `backfill_local_identifiers` там лежит id НАШЕЙ карточки, поэтому наружу
+    поле называется `product_id`, а внутрь уезжает его строковое представление.
+    """
+    raw = data.get("product_id")
+    value = "" if raw is None else str(raw).strip()[:64]
+    if required and not value:
+        raise HTTPException(status_code=400, detail="Не указан товар")
+    return value
+
+
+def _optional_id(data: dict, key: str) -> int | None:
+    """Необязательный положительный id из тела запроса. `None` — не прислали.
+
+    Отличается от `_machine_id_arg` тем, что пустое значение — законный ответ
+    «не выбрано», а не 400: поставщик контейнера и карточка товара у позиции
+    задаются не всегда.
+    """
+    raw = data.get(key)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{key}: не число")
+    if value <= 0:
+        raise HTTPException(status_code=400, detail=f"{key}: должен быть положительным")
     return value
 
 
@@ -4187,7 +4047,7 @@ async def api_containers_card(request: Request):
     if not container:
         raise HTTPException(status_code=404, detail="Контейнер не найден")
 
-    from services import ms_supply
+    from services import container_receipt
 
     items = containers.diff(await containers.list_items(container_id))
     return JSONResponse(
@@ -4199,7 +4059,7 @@ async def api_containers_card(request: Request):
             # Окно правки: фронт по нему решает, показывать ли кнопки, а не
             # выясняет это отказом ручки после нажатия.
             "edit_window": containers.edit_window(container),
-            "supply": await ms_supply.get_link(container_id),
+            "receipt": await container_receipt.get_link(container_id),
             "can_manage": get_role(user["id"]) in _MACHINE_BOSS,
             "status_labels": containers.STATUS_LABELS,
         }
@@ -4293,15 +4153,14 @@ async def api_containers_item_add(request: Request):
         note=_machine_text(data, "note", 500),
         # Товар выбран из каталога — приёмка попадёт ровно на эту карточку,
         # без угадывания по названию.
-        ms_id=(data.get("ms_id") or "").strip()[:64] or None,
-        ms_name=_machine_text(data, "ms_name", 200),
+        product_id=_optional_id(data, "product_id"),
     )
     return _machine_response(res)
 
 
 @app.post("/api/containers/item_link")
 async def api_containers_item_link(request: Request):
-    """Привязать позицию состава к карточке номенклатуры МойСклад.
+    """Привязать позицию состава к карточке номенклатуры.
 
     Нужна и постфактум: состав часто заводят до того, как товар появился в
     каталоге, а несопоставленная позиция — это остаток, которого нет.
@@ -4316,21 +4175,19 @@ async def api_containers_item_link(request: Request):
     container_id = _machine_id_arg(data, "container_id")
     item_id = _machine_id_arg(data, "item_id")
     res = await containers.link_item(
-        container_id, item_id,
-        ms_id=(data.get("ms_id") or "").strip()[:64],
-        ms_name=_machine_text(data, "ms_name", 200),
+        container_id, item_id, product_id=_optional_id(data, "product_id") or 0
     )
     return _machine_response(res)
 
 
 @app.post("/api/containers/item_create_product")
 async def api_containers_item_create_product(request: Request):
-    """Завести карточку товара в МойСклад по названию позиции и привязать её.
+    """Завести карточку товара в номенклатуре по названию позиции и привязать её.
 
     Заводит ЧЕЛОВЕК кнопкой: автосоздание из приёмки превратило бы каждую
     опечатку в новую позицию справочника.
     """
-    from services import containers, ms_supply
+    from services import container_receipt, containers
 
     data = await request.json()
     _authorize(
@@ -4347,13 +4204,13 @@ async def api_containers_item_create_product(request: Request):
     if not item:
         raise HTTPException(status_code=404, detail="Позиция не найдена")
 
-    created = await ms_supply.create_product(
+    created = await container_receipt.create_product(
         str(item["name"]), unit=str(item.get("unit") or "шт")
     )
     if not created.get("ok"):
         return _machine_response(created)
     res = await containers.link_item(
-        container_id, item_id, ms_id=created["ms_id"], ms_name=created.get("name")
+        container_id, item_id, product_id=int(created["product_id"])
     )
     if not res.get("ok"):
         return _machine_response(res)
@@ -4406,52 +4263,57 @@ async def api_containers_check(request: Request):
     if not res.get("ok"):
         return _machine_response(res)
 
-    # Остаток в МойСклад пополняем сразу после сохранения — ради этого приёмку
-    # и считают. Best-effort: сверка уже сохранена, и отказ МойСклад не должен
-    # выглядеть как «ничего не записалось». Что не прошло — возвращаем текстом,
-    # чтобы это можно было починить, а не узнать через неделю по остаткам.
-    from services import ms_supply
+    # Остаток пополняем сразу после сохранения — ради этого приёмку и считают.
+    # Best-effort: сверка уже сохранена, и отказ прихода не должен выглядеть как
+    # «ничего не записалось». Что не прошло — возвращаем текстом, чтобы это
+    # можно было починить, а не узнать через неделю по остаткам.
+    from services import container_receipt
 
-    supply = await ms_supply.sync_supply(container_id)
-    res["supply"] = supply
+    res["receipt"] = await container_receipt.receive(container_id, user_id=user["id"])
     return JSONResponse(res)
 
 
 @app.post("/api/containers/supplier")
 async def api_containers_supplier(request: Request):
-    """Задать поставщика контейнера — «Приёмке» в МойСклад он обязателен.
+    """Задать поставщика контейнера.
 
-    Спрашиваем заранее, а не в момент приёмки: когда считают коробки, о
+    Приёмку он не держит — локальной приходной накладной контрагент не
+    обязателен. Но «от кого пришло» потом некому восстановить, поэтому поле
+    спрашиваем заранее, а не в момент приёмки: когда считают коробки, о
     поставщике не думают.
     """
-    from services import ms_supply
+    from services import container_receipt
 
     data = await request.json()
     _authorize(
         data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_supplier"
     )
     container_id = _machine_id_arg(data, "container_id")
-    ms_id = (data.get("supplier_ms_id") or "").strip()[:64] or None
+    supplier_id = _optional_id(data, "supplier_id")
     name = (data.get("supplier_name") or "").strip()[:200] or None
-    if not ms_id:
+    if supplier_id is None:
         raise HTTPException(status_code=400, detail="Выберите поставщика из справочника")
-    res = await ms_supply.set_supplier(container_id, ms_id=ms_id, name=name)
+    res = await container_receipt.set_supplier(container_id, supplier_id=supplier_id, name=name)
     return _machine_response(res)
 
 
 @app.post("/api/containers/supply")
 async def api_containers_supply(request: Request):
-    """Оприходовать контейнер в МойСклад вручную — повтор после сбоя или после
-    того, как недостающий товар завели в номенклатуре."""
-    from services import ms_supply
+    """Оприходовать контейнер вручную — повтор после сбоя или после того, как
+    недостающий товар завели в номенклатуре.
+
+    Повторный вызов ПЕРЕОПРИХОДУЕТ: прежний приход отменяется, новый создаётся
+    с актуальными количествами.
+    """
+    from services import container_receipt
 
     data = await request.json()
-    _authorize(
+    user = _authorize(
         data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_supply",
         rate_limit_max=20,
     )
     container_id = _machine_id_arg(data, "container_id")
-    res = await ms_supply.sync_supply(container_id)
+    res = await container_receipt.receive(container_id, user_id=user["id"])
     return _machine_response(res)
 
 
@@ -4767,13 +4629,6 @@ async def api_returns_confirm(request: Request):
         await idem.release()
         raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
 
-    # Best-effort: создать «Возврат покупателя» в МойСклад (no-op без MS-контекста).
-    from services import ms_returns
-
-    try:
-        await ms_returns.create_salesreturn(return_id)
-    except Exception:
-        logger.warning("MS salesreturn create failed", exc_info=True)
     resp = {"ok": True, "return_id": return_id, "order_status": res.get("order_status")}
     await idem.store(resp)
     return JSONResponse(resp)
@@ -5162,7 +5017,6 @@ async def api_add_item(request: Request):
     )
 
     from services import async_db as adb
-    from utils.helpers import extract_id_from_href
 
     order = await adb.get_order(data["order_id"])
     if not order or order["user_id"] != user["id"]:
@@ -5178,14 +5032,13 @@ async def api_add_item(request: Request):
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Неверная цена")
 
-    # PR C: минимальная цена продажи, заданная руководством. По product_href
-    # → ms_id → product_prices.sale_price. Если задана:
+    # PR C: минимальная цена продажи, заданная руководством. По карточке
+    # товара → product_prices.sale_price. Если задана:
     #   • price не передан/0 → префилл sale_price (дефолт)
     #   • price < sale_price → 400 (нельзя продать ниже минимума)
-    product_href = data.get("product_href", "")
-    ms_id = extract_id_from_href(product_href) if product_href else ""
-    if ms_id:
-        pp = await adb.get_product_price(ms_id)
+    product_ref = _product_ref(data)
+    if product_ref:
+        pp = await adb.get_product_price(product_ref)
         sale_min = pp.get("sale_price") if pp else None
         if sale_min is not None:
             if price <= 0:
@@ -5208,11 +5061,12 @@ async def api_add_item(request: Request):
     item_id = await adb.add_order_item(
         order_id=data["order_id"],
         product_name=data["product_name"],
-        product_href=product_href,
+        product_href="",
         quantity=quantity,
         unit=data.get("unit", "шт"),
         price=price,
         note=data.get("note", ""),
+        product_id=int(product_ref) if product_ref.isdigit() else None,
     )
     return JSONResponse({"item_id": item_id})
 
@@ -5342,10 +5196,13 @@ async def api_submit_order(request: Request):
 
 @app.post("/api/agents")
 async def api_agents(request: Request):
-    """Список клиентов (контрагентов). Сначала из локального snapshot,
-    если он пуст — fallback на live API."""
-    from services import snapshot
-    from services.moysklad import ms_get
+    """Список клиентов (контрагентов) для подстановки в заказ.
+
+    Справочник наш, поэтому ни снапшота, ни live-fallback'а больше нет.
+    Санитизация строки поиска (SECURITY.md H11) осталась: она ограничивает
+    длину и набор символов, то есть стоимость LIKE-запроса.
+    """
+    from services import counterparties as cp_service
 
     data = await request.json()
     _authorize(
@@ -5356,39 +5213,22 @@ async def api_agents(request: Request):
         rate_limit_window=60.0,
     )
 
-    # Санитизация search (SECURITY.md H11): без неё manager мог через
-    # подобранные search-запросы устроить пачку дорогих запросов в
-    # МойСклад. Длина ≤ 50, только буквы/цифры/обычные знаки —
-    # без специальных символов, которые МойСклад может интерпретировать.
-    raw_search = (data.get("search", "") or "").strip()
-    if len(raw_search) > 50:
-        raw_search = raw_search[:50]
+    raw_search = (data.get("search", "") or "").strip()[:50]
     # Whitelist: буквы (любые юникодные), цифры, пробелы, основные знаки
     import re as _re
 
     search = _re.sub(r"[^\w\s\-\.,'@+()/]", "", raw_search, flags=_re.UNICODE)
-    rows = snapshot.get_counterparties(search=search if search else None, limit=50)
-    if rows:
-        return JSONResponse(
-            {
-                "agents": [
-                    {"id": r["ms_id"], "name": r.get("name", "—"), "phone": r.get("phone", "")}
-                    for r in rows
-                ]
-            }
-        )
-
-    # Snapshot пуст — live fallback + триггер первичного рефреша
-    params = {"limit": 50, "order": "name"}
-    if search:
-        params["search"] = search
-    result = await ms_get("entity/counterparty", params=params)
-    _spawn_bg(snapshot.refresh_counterparties(), "refresh_counterparties")
+    rows = await cp_service.search(search or None, 50)
     return JSONResponse(
         {
             "agents": [
-                {"id": a.get("id", ""), "name": a.get("name", "—"), "phone": a.get("phone", "")}
-                for a in result.get("rows", [])
+                {
+                    "id": str(r["id"]),
+                    "name": r.get("name", "—"),
+                    "phone": r.get("phone") or "",
+                    "type": r.get("type") or "customer",
+                }
+                for r in rows
             ]
         }
     )
@@ -5996,18 +5836,14 @@ async def api_wh_counterparties(request: Request):
     )
     search = (data.get("search") or "").strip()
     if search:
-        # Два условия, а не одно LOWER(...): SQLite реализует LOWER() только
-        # для ASCII и кириллицу не трогает вовсе, поэтому «ромашк» там не
-        # нашло бы «Ромашка». На Postgres (прод) первое условие полностью
-        # регистронезависимо; второе покрывает SQLite, когда регистр введён
-        # как в справочнике. Полная регистронезависимость для кириллицы на
-        # SQLite потребовала бы кастомной collation — локальной разработке
-        # это не нужно.
+        # Поиск по кириллице — через lower() с обеих сторон. Встроенный SQLite
+        # LOWER() ASCII-only, но adb_core._register_sqlite_functions
+        # переопределяет его Unicode-aware, как и синхронный слой, — поэтому
+        # запрос ведёт себя одинаково на проде и локально (CLAUDE.md).
         rows = await adb_core.fetch(
             "SELECT id, name, type, phone, telegram_id FROM counterparties "
-            "WHERE LOWER(name) LIKE $1 OR name LIKE $2 ORDER BY name LIMIT 100",
+            "WHERE lower(name) LIKE $1 ORDER BY name LIMIT 100",
             f"%{search.lower()}%",
-            f"%{search}%",
         )
     else:
         rows = await adb_core.fetch(

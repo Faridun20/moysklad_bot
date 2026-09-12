@@ -23,19 +23,11 @@ except ImportError:
     _logger = _logging.getLogger("config")
 
     TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-    MS_TOKEN = os.environ.get("MS_TOKEN", "").strip()
 
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN не задан — задайте переменную окружения")
-    if not MS_TOKEN:
-        raise RuntimeError("MS_TOKEN не задан — задайте переменную окружения")
 
-    # Интервал РЕЗЕРВНОГО поллера отгрузок. Основной канал теперь —
-    # MS-вебхук (мгновенно), поллер лишь добирает пропущенное, поэтому
-    # дефолт увеличен 300→900с (реже дёргаем MS API).
-    CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "900"))
-    # Валюта для отображения цен в боте/WebApp (отображательная — на
-    # стороне МойСклад валюта берётся из организации). Дефолт — USD.
+    # Валюта отображения цен в боте/WebApp. Дефолт — USD.
     BASE_CURRENCY = os.environ.get("BASE_CURRENCY", "USD")
     import tempfile
 

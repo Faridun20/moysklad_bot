@@ -133,19 +133,6 @@ def test_confirm_idempotent_on_already_confirmed(isolated_db):
     assert second is False  # уже confirmed
 
 
-def test_claim_payment_for_ms_sync_atomic(isolated_db):
-    """H3 fix: claim возвращает True только тому, кто выиграл гонку."""
-    db = isolated_db
-    oid = _setup_credit_order(db, 100, 1)
-    _, pid = asyncio.run(db.mark_order_paid(oid, 1, "Manager", amount=100))
-    asyncio.run(db.confirm_payment(pid, 99, "Boss"))
-    # Платёж confirmed, ms_paymentin_id IS NULL → claim возможен
-    assert db.claim_payment_for_ms_sync(pid) is True
-    # Второй raise sync — уже in_progress
-    assert db.claim_payment_for_ms_sync(pid) is False
-    # После set_payment_ms_sync synced — тем более нет
-    db.set_payment_ms_sync(pid, paymentin_id="ms-fake", status="synced")
-    assert db.claim_payment_for_ms_sync(pid) is False
 
 
 def test_backfill_does_not_close_partial_credit_debts(isolated_db, monkeypatch):

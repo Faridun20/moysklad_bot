@@ -17,18 +17,6 @@ def _client(db, monkeypatch, uid, role):
     importlib.reload(roles)
     db.set_role(uid, "u", "U", role)
     monkeypatch.setattr(server, "verify_init_data", lambda s: {"id": int(s), "first_name": "U"})
-
-    # boss-ветка /api/home ходит в МойСклад — мокаем границу (без сети).
-    import services.moysklad as ms
-
-    async def _stats(*a, **k):
-        return {"total": 0, "count": 0, "clients": 0, "top_products": []}
-
-    async def _ships(*a, **k):
-        return []
-
-    monkeypatch.setattr(ms, "get_sales_stats", _stats)
-    monkeypatch.setattr(ms, "get_shipments", _ships)
     return TestClient(server.app)
 
 
@@ -76,7 +64,7 @@ def test_ops_summary_boss(isolated_db, monkeypatch):
     client = _client(db, monkeypatch, boss, "boss")
     body = client.post("/api/ops-summary", json={"initData": str(boss)}).json()
     assert "total" in body
-    assert "stale_orders" in body and "ms_anomalies" in body
+    assert "stale_orders" in body and "shipment_failed" in body
 
 
 def test_ops_summary_forbidden_for_manager(isolated_db, monkeypatch):

@@ -265,17 +265,18 @@ def test_invoice_get_404(api):
     assert r.status_code == 404
 
 
-def test_counterparties_search(api):
-    """Поиск по подстроке имени.
+@pytest.mark.parametrize("query", ["Ромашк", "ромашк", "РОМАШК"])
+def test_counterparties_search_is_case_insensitive_for_cyrillic(api, query):
+    """Регистр запроса не влияет — и на SQLite тоже.
 
-    Ищем «Ромашк» в том же регистре, что в справочнике: на SQLite (тесты,
-    локалка) LOWER() не работает с кириллицей, и регистронезависимость там
-    доступна только для ASCII. На Postgres, где крутится прод, тот же запрос
-    находит и «ромашк» — см. комментарий в /api/wh/counterparties.
+    Встроенный SQLite LOWER() ASCII-only и «ромашк» не нашло бы «Ромашка»;
+    adb_core переопределяет функцию Unicode-aware, поэтому прод и локалка
+    отвечают одинаково. Сторож именно на кириллице: с латиницей расхождение
+    не воспроизводится и прошло бы незамеченным.
     """
     client, _db, ids = api
     body = client.post(
-        "/api/wh/counterparties", json={"initData": str(ids["mgr"]), "search": "Ромашк"}
+        "/api/wh/counterparties", json={"initData": str(ids["mgr"]), "search": query}
     ).json()
     assert [c["name"] for c in body["counterparties"]] == ["ООО Ромашка"]
 

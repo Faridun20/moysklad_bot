@@ -124,25 +124,6 @@ def test_reconcile_window_survives_garbage_env(monkeypatch):
     assert limit == 500 and cutoff
 
 
-def test_old_orders_fall_out_of_reconcile_set(isolated_db):
-    """Заказ вне окна не попадает в набор — иначе cron ходит в МС за архивом."""
-    db = isolated_db
-    db.set_role(1, "m", "M", "manager")
-    old = db.create_order(1, "M", "")
-    fresh = db.create_order(1, "M", "")
-    db.set_order_ms_customerorder_id(old, "CO-OLD")
-    db.set_order_ms_customerorder_id(fresh, "CO-NEW")
-    with db.get_conn() as conn:
-        cur = db.get_cursor(conn)
-        cur.execute(
-            db.q("UPDATE orders SET updated_at = ?, created_at = ? WHERE id = ?"),
-            ("2020-01-01 00:00:00", "2020-01-01 00:00:00", old),
-        )
-        conn.commit()
-
-    ids = {o["id"] for o in asyncio.run(db.get_orders_with_ms_customerorder())}
-    assert fresh in ids
-    assert old not in ids, "заказ вне окна не должен попадать в реконсиляцию"
 
 
 # ─── 4. /api/home: COUNT(*) вместо полных выборок (§3.8) ────────────────────
@@ -188,28 +169,11 @@ def test_get_user_orders_has_limit(isolated_db):
 # ─── 5. pending убран из _UPDATABLE_STATUSES (§2.17) ────────────────────────
 
 
-def test_pending_no_longer_updatable_from_ms():
-    """pending→shipped нелегален в TRANSITIONS, поэтому событие всегда уходило
-    в ветку «нелегальный переход» и сыпало алертом боссу."""
-    from services.ms_sync_handler import _UPDATABLE_STATUSES
-    from services.order_workflow import TRANSITIONS
-
-    assert "pending" not in _UPDATABLE_STATUSES
-    # Оставшиеся статусы действительно умеют переходить в shipped.
-    for st in _UPDATABLE_STATUSES:
-        assert "shipped" in TRANSITIONS.get(st, []), f"{st}→shipped нелегален"
 
 
 # ─── 6. Поллер берёт now ДО запроса (§2.15) ────────────────────────────────
 
 
-def test_poller_timestamps_window_before_request():
-    from services import notifier
-
-    src = inspect.getsource(notifier.shipment_notifier)
-    before = src.index("window_start = datetime.now()")
-    request = src.index("await get_shipments(last_check)")
-    assert before < request, "отметку времени снова берут после round-trip'а"
 
 
 # ─── 7. BASE_CURRENCY вместо литерала USD (§3.7) ───────────────────────────

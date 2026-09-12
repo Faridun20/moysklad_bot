@@ -271,7 +271,7 @@ def test_start_still_greets_manager(isolated_db, monkeypatch):
     roles.invalidate_all_roles()
     db.set_role(7, "mgr", "Manager", "manager")
 
-    calls = {"menu_button": 0, "commands": 0, "sync": 0}
+    calls = {"menu_button": 0, "commands": 0}
 
     class _Bot:
         async def set_chat_menu_button(self, **kwargs):
@@ -279,12 +279,6 @@ def test_start_still_greets_manager(isolated_db, monkeypatch):
 
         async def set_my_commands(self, **kwargs):
             calls["commands"] += 1
-
-    async def _fake_sync(*a, **k):
-        calls["sync"] += 1
-        return {"status": "ok"}
-
-    monkeypatch.setattr("services.ms_sync.sync_manager", _fake_sync)
 
     class _State:
         async def clear(self):

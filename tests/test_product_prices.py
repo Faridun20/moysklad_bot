@@ -112,29 +112,30 @@ def test_prices_set_forbidden_for_manager(client_env):
     client, _db, ids = client_env
     resp = client.post(
         "/api/products/prices/set",
-        json={"initData": str(ids["mgr"]), "ms_id": "p1", "sale_price": 100},
+        json={"initData": str(ids["mgr"]), "product_id": 1, "sale_price": 100},
     )
     assert resp.status_code == 403
 
 
 def test_prices_set_and_list_for_boss(client_env):
     client, db, ids = client_env
+    pid = _product(db, "Товар")
     resp = client.post(
         "/api/products/prices/set",
         json={
             "initData": str(ids["boss"]),
-            "ms_id": "p1",
+            "product_id": pid,
             "product_name": "Товар",
             "sale_price": 150,
             "cost_price": 90,
         },
     )
     assert resp.status_code == 200, resp.text
-    assert db.get_product_price("p1")["cost_price"] == 90.0
+    assert db.get_product_price(str(pid))["cost_price"] == 90.0
     # Список доступен boss
     lst = client.post("/api/products/prices", json={"initData": str(ids["boss"])})
     assert lst.status_code == 200
-    assert any(r["ms_id"] == "p1" for r in lst.json()["prices"])
+    assert any(r["ms_id"] == str(pid) for r in lst.json()["prices"])
 
 
 def test_prices_list_forbidden_for_manager(client_env):
@@ -148,10 +149,19 @@ def _make_draft(db, mgr_id):
     return oid
 
 
+def _product(db, name):
+    """Карточка товара → её id. Им же ключуется `product_prices` после перехода
+    на локальный склад (колонка называется `ms_id`, но хранит наш id)."""
+    from services import container_receipt
+
+    return asyncio.run(container_receipt.create_product(name))["product_id"]
+
+
 def test_add_item_enforces_minimum_price(client_env):
     """Цена ниже минимума → 400."""
     client, db, ids = client_env
-    db.set_product_price("PRODX", "Товар X", 100.0, None, "USD", updated_by=ids["boss"])
+    pid = _product(db, "Товар X")
+    db.set_product_price(str(pid), "Товар X", 100.0, None, "USD", updated_by=ids["boss"])
     oid = _make_draft(db, ids["mgr"])
     resp = client.post(
         "/api/orders/add_item",
@@ -159,7 +169,7 @@ def test_add_item_enforces_minimum_price(client_env):
             "initData": str(ids["mgr"]),
             "order_id": oid,
             "product_name": "Товар X",
-            "product_href": "https://api.moysklad.ru/entity/product/PRODX",
+            "product_id": pid,
             "quantity": 2,
             "price": 80,  # ниже минимума 100
         },
@@ -170,7 +180,8 @@ def test_add_item_enforces_minimum_price(client_env):
 
 def test_add_item_allows_price_above_minimum(client_env):
     client, db, ids = client_env
-    db.set_product_price("PRODY", "Товар Y", 100.0, None, "USD", updated_by=ids["boss"])
+    pid = _product(db, "Товар Y")
+    db.set_product_price(str(pid), "Товар Y", 100.0, None, "USD", updated_by=ids["boss"])
     oid = _make_draft(db, ids["mgr"])
     resp = client.post(
         "/api/orders/add_item",
@@ -178,7 +189,7 @@ def test_add_item_allows_price_above_minimum(client_env):
             "initData": str(ids["mgr"]),
             "order_id": oid,
             "product_name": "Товар Y",
-            "product_href": "https://api.moysklad.ru/entity/product/PRODY",
+            "product_id": pid,
             "quantity": 1,
             "price": 120,  # выше минимума — ок
         },
@@ -189,7 +200,8 @@ def test_add_item_allows_price_above_minimum(client_env):
 def test_add_item_prefills_min_when_price_zero(client_env):
     """price не задан/0 → подставляется sale_price."""
     client, db, ids = client_env
-    db.set_product_price("PRODZ", "Товар Z", 100.0, None, "USD", updated_by=ids["boss"])
+    pid = _product(db, "Товар Z")
+    db.set_product_price(str(pid), "Товар Z", 100.0, None, "USD", updated_by=ids["boss"])
     oid = _make_draft(db, ids["mgr"])
     resp = client.post(
         "/api/orders/add_item",
@@ -197,7 +209,7 @@ def test_add_item_prefills_min_when_price_zero(client_env):
             "initData": str(ids["mgr"]),
             "order_id": oid,
             "product_name": "Товар Z",
-            "product_href": "https://api.moysklad.ru/entity/product/PRODZ",
+            "product_id": pid,
             "quantity": 1,
             "price": 0,
         },
@@ -210,9 +222,10 @@ def test_add_item_prefills_min_when_price_zero(client_env):
 def test_orders_profit_visible_to_boss_hidden_from_manager(client_env):
     """boss видит profit; менеджер — нет (поля отсутствуют)."""
     client, db, ids = client_env
-    db.set_product_price("PRODP", "Товар P", 150.0, 100.0, "USD", updated_by=ids["boss"])
+    pid = _product(db, "Товар P")
+    db.set_product_price(str(pid), "Товар P", 150.0, 100.0, "USD", updated_by=ids["boss"])
     oid = db.create_order(ids["mgr"], "Manager", "")
-    db.add_order_item(oid, "Товар P", "https://api.moysklad.ru/entity/product/PRODP", 2, "шт", 150.0)
+    db.add_order_item(oid, "Товар P", "", 2, "шт", 150.0, product_id=pid)
 
     # Менеджер: profit отсутствует
     r_mgr = client.post("/api/orders", json={"initData": str(ids["mgr"])})
@@ -231,39 +244,24 @@ def test_orders_profit_partial_when_cost_unknown(client_env):
     """Себестоимость не задана → profit_partial=True."""
     client, db, ids = client_env
     oid = db.create_order(ids["mgr"], "Manager", "")
-    db.add_order_item(oid, "БезЦены", "https://api.moysklad.ru/entity/product/NOPRICE", 1, "шт", 50.0)
+    db.add_order_item(oid, "БезЦены", "", 1, "шт", 50.0, product_id=_product(db, "БезЦены"))
     r_boss = client.post("/api/orders", json={"initData": str(ids["boss"])})
     boss_order = next(o for o in r_boss.json()["orders"] if o["id"] == oid)
     assert boss_order["profit_partial"] is True
 
 
-def test_stock_hides_cost_from_manager(client_env, monkeypatch):
+def test_stock_hides_cost_from_manager(client_env):
     """/api/stock: менеджер видит sale_price, но НЕ cost_price."""
+    from services import warehouse
+
     client, db, ids = client_env
-    db.set_product_price("STK1", "Складской", 200.0, 150.0, "USD", updated_by=ids["boss"])
-
-    async def fake_stock():
-        return [
-            {
-                "name": "Складской",
-                "stock": 10,
-                "reserve": 0,
-                "uom": {"name": "шт"},
-                "meta": {"href": "https://api.moysklad.ru/entity/product/STK1"},
-                "folder": {"meta": {"href": ""}, "name": ""},
-            }
-        ]
-
-    async def fake_cats():
-        return []
-
-    import webapp.server as server
-
-    monkeypatch.setattr(server, "get_role", lambda uid: db.get_role(uid))
-    import services.moysklad as ms
-
-    monkeypatch.setattr(ms, "get_all_stock", fake_stock)
-    monkeypatch.setattr(ms, "get_categories", fake_cats)
+    pid = _product(db, "Складской")
+    db.set_product_price(str(pid), "Складской", 200.0, 150.0, "USD", updated_by=ids["boss"])
+    asyncio.run(warehouse.create_invoice(
+        invoice_type="incoming",
+        warehouse_id=asyncio.run(warehouse.default_warehouse_id()),
+        items=[{"product_id": pid, "quantity": 10, "price_cents": None}],
+    ))
 
     # Менеджер
     r_mgr = client.post("/api/stock", json={"initData": str(ids["mgr"])})
@@ -276,21 +274,23 @@ def test_stock_hides_cost_from_manager(client_env, monkeypatch):
     assert p_boss["cost_price"] == 150.0
 
 
-def test_stock_degrades_when_ms_down(client_env, monkeypatch):
-    """МойСклад недоступен → /api/stock НЕ 500, а 200 с пустым каталогом и
-    ms_unavailable=True (регресс на «401 Unauthorized» на экране «Каталог»)."""
-    client, _db, ids = client_env
+def test_stock_shows_reserved_and_available(client_env):
+    """Одобренный, но не отгруженный заказ держит товар: доступное меньше
+    остатка. Раньше резерв приезжал из МойСклад, теперь считается по заказам."""
+    from services import warehouse
 
-    async def _boom():
-        raise RuntimeError("401 Unauthorized")
+    client, db, ids = client_env
+    pid = _product(db, "Гвозди")
+    asyncio.run(warehouse.create_invoice(
+        invoice_type="incoming",
+        warehouse_id=asyncio.run(warehouse.default_warehouse_id()),
+        items=[{"product_id": pid, "quantity": 10, "price_cents": None}],
+    ))
+    oid = db.create_order(ids["mgr"], "Manager", "")
+    db.add_order_item(oid, "Гвозди", "", 4, "шт", 1.0, product_id=pid)
+    db.update_order_status(oid, "approved")
 
-    import services.moysklad as ms
-
-    monkeypatch.setattr(ms, "get_all_stock", _boom)
-    monkeypatch.setattr(ms, "get_categories", _boom)
-
-    r = client.post("/api/stock", json={"initData": str(ids["boss"])})
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["ms_unavailable"] is True
-    assert body["products"] == [] and body["categories"] == []
+    row = client.post("/api/stock", json={"initData": str(ids["boss"])}).json()["products"][0]
+    assert row["stock"] == 10
+    assert row["reserve"] == 4
+    assert row["available"] == 6

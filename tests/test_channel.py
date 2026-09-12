@@ -402,7 +402,7 @@ def test_photo_list_never_leaks_file_ids(isolated_db, monkeypatch):
     _run(product_photos.add_photo(
         "p-1", tg_file_id="AgAC-secret", file_unique_id="U1", uploaded_by=2))
 
-    r = _post(_client(monkeypatch), "/api/products/photos", 2, ms_id="p-1")
+    r = _post(_client(monkeypatch), "/api/products/photos", 2, product_id="p-1")
     assert r.status_code == 200, r.text
     assert "AgAC-secret" not in r.text
     assert set(r.json()["photos"][0]) == {"id", "caption", "uploaded_at"}

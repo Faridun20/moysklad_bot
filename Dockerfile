@@ -52,10 +52,13 @@ FROM python:3.11.9-slim-bookworm
 #       записи продолжают писаться, но «сегодня» съезжает на 5 часов.
 #       Зона задаётся переменной TZ (см. docker-compose.yml).
 #
-#   libreoffice-writer (опционально, WITH_LIBREOFFICE)
-#       Конвертация docx → pdf для юридических документов. Это ~400 МБ к
-#       образу, а сама функциональность ещё не написана (ждём шаблон
-#       расписки). Собрать без неё: --build-arg WITH_LIBREOFFICE=0.
+#   libreoffice-writer (обязателен для юридических документов)
+#       Конвертация docx → pdf (services/legal_docs.py). Именно -writer, а не
+#       один libreoffice-core: без него LibreOffice не умеет открывать .docx
+#       вообще и выходит с КОДОМ 0, сообщая «source file could not be loaded»
+#       только в stderr — поэтому код проверяет наличие PDF, а не returncode.
+#       Это ~400 МБ к образу. Собрать без юр. документов (расписки перестанут
+#       формироваться, остальное работает): --build-arg WITH_LIBREOFFICE=0.
 ARG WITH_LIBREOFFICE=1
 RUN set -eux; \
     apt-get update; \

@@ -56,7 +56,10 @@ follow_imports = "silent"
 files = [
     "services/order_workflow.py",
     "services/database.py",
-    "services/moysklad.py",
+    "services/warehouse.py",
+    "services/order_shipment.py",
+    "services/container_receipt.py",
+    "services/counterparties.py",
     "webapp/server.py",
 ]
 warn_unused_ignores = false

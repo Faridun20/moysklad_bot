@@ -30,7 +30,6 @@ from services.database import (
     get_payments_for_orders,
     get_all_users,
 )
-from services.moysklad import close_session
 from services.notifier import tg_send_message, close_tg_session
 
 logging.basicConfig(
@@ -237,8 +236,6 @@ async def main() -> int:
     except Exception:
         logger.exception("debts_notify: ошибка")
         return 1
-    finally:
-        await close_session()
         await close_tg_session()
 
 

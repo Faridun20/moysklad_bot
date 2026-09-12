@@ -2,10 +2,10 @@
 Форматирование сообщений для Telegram — улучшенный визуал
 """
 
+from services.money import format_cents, mul_qty
 from utils.helpers import (
     esc,
     format_date,
-    format_price,
     local_now,
 )
 
@@ -18,44 +18,49 @@ DIV2 = "<code>────────────────────</code
 # ─── Отгрузка ─────────────────────────────────────────────────────────────────
 
 
-def format_shipment(s: dict, positions: list[dict] = None) -> str:
-    name = esc(s.get("name", "—"))
-    moment = esc(format_date(s.get("moment", "—")))
-    agent = esc(s.get("agent", {}).get("name", "—"))
-    owner = esc(s.get("owner", {}).get("name", "—"))
-    sum_str = format_price(s.get("sum", 0))
+def format_shipment(invoice: dict) -> str:
+    """Расходная накладная одним сообщением: шапка + позиции.
+
+    Раньше на вход шли два документа МойСклад (demand + отдельно выкачанные
+    позиции). Теперь это одна наша накладная, и позиции лежат в ней же —
+    `warehouse.get_invoice` отдаёт их вместе с шапкой.
+    """
+    number = esc(str(invoice.get("invoice_number") or "—"))
+    moment = esc(format_date(str(invoice.get("invoice_date") or "—")))
+    agent = esc(str(invoice.get("counterparty_name") or "—"))
+    currency = esc(str(invoice.get("currency") or ""))
+    sum_str = format_cents(int(invoice.get("total_amount_cents") or 0))
+    positions = invoice.get("items") or []
 
     lines = [
         DIV,
-        f"🚚 <b>{name}</b>   <code>{moment}</code>",
+        f"🚚 <b>{number}</b>   <code>{moment}</code>",
         "",
         f"<b>👤 Клиент:</b> {agent}",
-        f"<b>👨‍💼 Менеджер:</b> {owner}",
-        f"<b>💰 Итого: {sum_str} $</b>",
+        f"<b>💰 Итого: {sum_str} {currency}</b>",
     ]
+    if invoice.get("status") == "cancelled":
+        lines.append("<b>🚫 Накладная отменена</b>")
 
     if positions:
         lines.append("")
         lines.append(f"<b>📋 Товары ({len(positions)}):</b>")
         lines.append(DIV2)
         for pos in positions[:15]:
-            assortment = pos.get("assortment", {})
-            pos_name = esc(assortment.get("name", "—"))
+            pos_name = esc(str(pos.get("product_name") or "—"))
             qty = pos.get("quantity", 0)
-            uom = esc(
-                pos.get("uom", {}).get("name", "") or assortment.get("uom", {}).get("name", "шт")
-            )
-            price_raw = pos.get("price", 0)
-            price_str = format_price(price_raw)
-            total_pos = format_price(price_raw * qty)
+            uom = esc(str(pos.get("unit") or "шт"))
+            price_cents = int(pos.get("price_cents") or 0)
+            price_str = format_cents(price_cents)
+            total_pos = format_cents(mul_qty(price_cents, float(qty or 0)))
             lines.append(
                 f"▸ <b>{pos_name}</b>\n"
-                f"  <code>{qty} {uom}</code>  ·  {price_str} $  →  <b>{total_pos} $</b>"
+                f"  <code>{qty:g} {uom}</code>  ·  {price_str}  →  <b>{total_pos}</b>"
             )
         if len(positions) > 15:
             lines.append(f"\n<i>…ещё {len(positions) - 15} позиций</i>")
     else:
-        lines.append(f"\n{DIV2}\n<i>Товары не загружены</i>")
+        lines.append(f"\n{DIV2}\n<i>Позиций нет</i>")
 
     return "\n".join(lines)
 

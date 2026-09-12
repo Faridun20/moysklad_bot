@@ -32,8 +32,11 @@ legacy_ms_id; уже перенесённые строки обновляютс�
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from decimal import Decimal
+
+import aiohttp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("ms_migrate")
@@ -51,15 +54,70 @@ def _dec(value) -> Decimal:
     return Decimal(str(value))
 
 
+# ─── Минимальный клиент МойСклад ──────────────────────────────────────────────
+#
+# СВОЙ, а не `services.moysklad`: вся МойСклад-интеграция из кода бота удалена,
+# и импортировать оттуда больше нечего. Скрипт обязан пережить это удаление —
+# иначе перенос перестал бы воспроизводиться ровно тогда, когда он ещё может
+# понадобиться (аккаунт МС живёт ещё месяц-другой после переключения).
+#
+# Всё, что здесь нужно, — постраничный GET с ретраем на 429/5xx. Ни брейкера,
+# ни бюджета запросов: скрипт запускают вручную, один раз, и он единственный
+# клиент токена в этот момент.
+
+MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
+_MS_RETRY_STATUSES = {429, 500, 502, 503, 504}
+_MS_MAX_RETRIES = 5
+_session: aiohttp.ClientSession | None = None
+
+
+async def _ms_session() -> aiohttp.ClientSession:
+    global _session
+    if _session is None or _session.closed:
+        token = os.getenv("MS_TOKEN", "")
+        if not token:
+            raise RuntimeError("MS_TOKEN не задан — выгружать нечем")
+        _session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=60),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept-Encoding": "gzip",
+                "Content-Type": "application/json",
+            },
+        )
+    return _session
+
+
+async def close_session() -> None:
+    global _session
+    if _session is not None and not _session.closed:
+        await _session.close()
+    _session = None
+
+
+async def ms_get(path: str, params: dict | None = None) -> dict:
+    """GET к МойСклад с ретраем. `X-Lognex-Retry-After` — в миллисекундах."""
+    sess = await _ms_session()
+    url = f"{MS_BASE}/{path}"
+    delay = 1.0
+    for attempt in range(_MS_MAX_RETRIES):
+        async with sess.get(url, params=params) as resp:
+            if resp.status in _MS_RETRY_STATUSES and attempt < _MS_MAX_RETRIES - 1:
+                wait = delay
+                raw = resp.headers.get("X-Lognex-Retry-After")
+                if raw and raw.isdigit():
+                    wait = max(wait, int(raw) / 1000.0)
+                logger.warning("МойСклад HTTP %s — жду %.1f с", resp.status, wait)
+                await asyncio.sleep(wait)
+                delay *= 2
+                continue
+            resp.raise_for_status()
+            return await resp.json()
+    raise RuntimeError(f"МойСклад не ответил после {_MS_MAX_RETRIES} попыток: {path}")
+
+
 async def _fetch_all(path: str, params: dict | None = None) -> list[dict]:
-    """Постранично выкачать коллекцию МойСклад.
-
-    Своя копия пагинации, а не snapshot._fetch_all: snapshot вместе со всем
-    МойСклад-кодом удаляется на шаге 4, а этот скрипт должен пережить
-    удаление и остаться воспроизводимым.
-    """
-    from services.moysklad import ms_get
-
+    """Постранично выкачать коллекцию МойСклад."""
     limit = 1000
     rows: list[dict] = []
     offset = 0
@@ -334,7 +392,6 @@ async def verify(
 
 async def main(mode: str) -> int:
     from services.database import init_db
-    from services.moysklad import close_session
 
     init_db()
     try:

@@ -53,7 +53,13 @@ STATUS_LABELS = {
 # FK промолчит и баг снова доедет до прода.
 # Сторожа: tests/test_containers.py::test_delete_leaves_no_orphans_anywhere и
 # ::test_child_tables_are_ordered_leaves_first.
-CHILD_TABLES = ("container_item_links", "container_items", "container_supply")
+CHILD_TABLES = (
+    "container_item_links",
+    "container_item_products",
+    "container_items",
+    "container_supply",
+    "container_receipt",
+)
 
 _NUMBER_SEPARATORS = re.compile(r"[\s\-—–_]+")
 _NUMBER_MAX = 32
@@ -291,13 +297,12 @@ async def add_item(
     arrived_qty: float | None = None,
     unit: str = "шт",
     note: str | None = None,
-    ms_id: str | None = None,
-    ms_name: str | None = None,
+    product_id: int | None = None,
 ) -> dict:
     """Добавить позицию. `arrived_qty` задают, когда позицию нашли в прибывшем
     контейнере, но в заявленном составе её не было (излишек).
 
-    `ms_id` — карточка номенклатуры, выбранная из каталога. Свободный ввод
+    `product_id` — карточка номенклатуры, выбранная из каталога. Свободный ввод
     остаётся законным: в контейнере регулярно едет то, чего в номенклатуре ещё
     нет, и требовать карточку до сохранения значит остановить приёмку.
     """
@@ -319,8 +324,15 @@ async def add_item(
         container_id, clean, (unit or "шт").strip()[:_UNIT_MAX] or "шт",
         float(expected_qty), arrived_qty, note, stamp,
     )
-    link_id = (ms_id or "").strip()[:64]
+    link_id = int(product_id) if product_id else None
     async with adb_core.transaction() as txn:
+        if link_id:
+            # Товар проверяем ДО вставки позиции: ссылка на несуществующую
+            # карточку прошла бы на SQLite молча (FK выключены) и всплыла бы
+            # приходом в никуда.
+            known = await txn.fetchval("SELECT id FROM products WHERE id = $1", link_id)
+            if known is None:
+                return {"ok": False, "error": f"Товар #{link_id} не найден"}
         if USE_POSTGRES:
             item_id = await txn.fetchval(sql + " RETURNING id", *values)
         else:
@@ -328,25 +340,25 @@ async def add_item(
             item_id = await txn.fetchval("SELECT last_insert_rowid()")
         if link_id:
             await txn.execute(
-                "INSERT INTO container_item_links (item_id, container_id, ms_id, ms_name, "
-                "created_at) VALUES ($1, $2, $3, $4, $5)",
-                int(item_id), container_id, link_id,
-                (ms_name or clean)[:_NAME_MAX], stamp,
+                "INSERT INTO container_item_products (item_id, container_id, product_id, "
+                "created_at) VALUES ($1, $2, $3, $4)",
+                int(item_id), container_id, link_id, stamp,
             )
-    return {"ok": True, "item_id": int(item_id), "ms_id": link_id or None}
+    return {"ok": True, "item_id": int(item_id), "product_id": link_id}
 
 
-async def link_item(
-    container_id: int, item_id: int, *, ms_id: str, ms_name: str | None = None
-) -> dict:
+async def link_item(container_id: int, item_id: int, *, product_id: int) -> dict:
     """Привязать позицию к карточке номенклатуры (или переставить привязку).
 
     Позицию ищем ВНУТРИ заявленного контейнера — гейт от подстановки чужого id.
     Привязка заменяется целиком: ошиблись товаром — выберите другой, отдельное
     «отвязать» не нужно.
     """
-    clean_id = (ms_id or "").strip()[:64]
-    if not clean_id:
+    try:
+        clean_id = int(product_id or 0)
+    except (TypeError, ValueError):
+        clean_id = 0
+    if clean_id <= 0:
         return {"ok": False, "error": "Выберите товар из каталога"}
     guard = await _require_open_window(container_id)
     if guard:
@@ -360,16 +372,18 @@ async def link_item(
 
     stamp = now_str()
     async with adb_core.transaction() as txn:
+        known = await txn.fetchval("SELECT id FROM products WHERE id = $1", clean_id)
+        if known is None:
+            return {"ok": False, "error": f"Товар #{clean_id} не найден"}
         # DELETE+INSERT вместо UPSERT: синтаксис ON CONFLICT у Postgres и SQLite
         # совпадает не во всех версиях, а строка здесь ровно одна.
-        await txn.execute("DELETE FROM container_item_links WHERE item_id = $1", item_id)
+        await txn.execute("DELETE FROM container_item_products WHERE item_id = $1", item_id)
         await txn.execute(
-            "INSERT INTO container_item_links (item_id, container_id, ms_id, ms_name, "
-            "created_at) VALUES ($1, $2, $3, $4, $5)",
-            item_id, container_id, clean_id,
-            (ms_name or str(row["name"]))[:_NAME_MAX], stamp,
+            "INSERT INTO container_item_products (item_id, container_id, product_id, "
+            "created_at) VALUES ($1, $2, $3, $4)",
+            item_id, container_id, clean_id, stamp,
         )
-    return {"ok": True, "item_id": item_id, "ms_id": clean_id}
+    return {"ok": True, "item_id": item_id, "product_id": clean_id}
 
 
 async def delete_item(container_id: int, item_id: int) -> dict:
@@ -379,6 +393,10 @@ async def delete_item(container_id: int, item_id: int) -> dict:
     async with adb_core.transaction() as txn:
         # Связь с номенклатурой ссылается на позицию: на Postgres DELETE по
         # `container_items` с живой связью отвергается.
+        await txn.execute(
+            "DELETE FROM container_item_products WHERE item_id = $1 AND container_id = $2",
+            item_id, container_id,
+        )
         await txn.execute(
             "DELETE FROM container_item_links WHERE item_id = $1 AND container_id = $2",
             item_id, container_id,
@@ -397,9 +415,10 @@ async def list_items(container_id: int) -> list[dict]:
     N+1 здесь дал бы обращение к БД на каждую строку накладной.
     """
     rows = await adb_core.fetch(
-        "SELECT i.*, l.ms_id AS ms_id, l.ms_name AS ms_name "
+        "SELECT i.*, l.product_id AS product_id, p.name AS product_name "
         "FROM container_items i "
-        "LEFT JOIN container_item_links l ON l.item_id = i.id "
+        "LEFT JOIN container_item_products l ON l.item_id = i.id "
+        "LEFT JOIN products p ON p.id = l.product_id "
         "WHERE i.container_id = $1 ORDER BY i.id",
         container_id,
     )

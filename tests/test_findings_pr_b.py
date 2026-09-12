@@ -2,7 +2,7 @@
 PR B находок: энфорс кредит-лимита + override (#29), resubmit-diff (#30).
 
 Реальная БД (isolated_db). approve_shipment_request зовём напрямую с фейк-ботом
-и ms_demand.is_ready=False (без МойСклад).
+без обращений наружу.
 """
 
 import asyncio
@@ -41,10 +41,8 @@ def _credit_order(db, total: float, agent: str = "A-1", status: str = "pending")
 
 
 def test_approve_over_limit_requires_override(isolated_db, monkeypatch):
-    import services.ms_demand as ms_demand
     from services.order_workflow import approve_shipment_request
 
-    monkeypatch.setattr(ms_demand, "is_ready", lambda: False)
     db = isolated_db
     roles.invalidate_all_roles()
     db.set_role(2, "b", "Boss", "boss")
@@ -61,10 +59,8 @@ def test_approve_over_limit_requires_override(isolated_db, monkeypatch):
 
 
 def test_approve_with_override_sets_flag(isolated_db, monkeypatch):
-    import services.ms_demand as ms_demand
     from services.order_workflow import approve_shipment_request
 
-    monkeypatch.setattr(ms_demand, "is_ready", lambda: False)
     db = isolated_db
     roles.invalidate_all_roles()
     db.set_role(2, "b", "Boss", "boss")
@@ -80,10 +76,8 @@ def test_approve_with_override_sets_flag(isolated_db, monkeypatch):
 
 
 def test_approve_under_limit_proceeds(isolated_db, monkeypatch):
-    import services.ms_demand as ms_demand
     from services.order_workflow import approve_shipment_request
 
-    monkeypatch.setattr(ms_demand, "is_ready", lambda: False)
     db = isolated_db
     roles.invalidate_all_roles()
     db.set_role(2, "b", "Boss", "boss")
@@ -99,10 +93,8 @@ def test_approve_no_false_override_from_double_count(isolated_db, monkeypatch):
     """Регресс: заказ-одиночка ПОД лимитом не должен требовать override. Раньше
     энфорс считал заказ дважды (он уже pending → в current_debt, плюс +total) →
     1500 при лимите 2000 давал projected=3000 и ложное «превышение»."""
-    import services.ms_demand as ms_demand
     from services.order_workflow import approve_shipment_request
 
-    monkeypatch.setattr(ms_demand, "is_ready", lambda: False)
     db = isolated_db
     roles.invalidate_all_roles()
     db.set_role(2, "b", "Boss", "boss")
@@ -118,10 +110,8 @@ def test_approve_no_false_override_from_double_count(isolated_db, monkeypatch):
 def test_approve_over_limit_from_existing_debt(isolated_db, monkeypatch):
     """Реальное превышение за счёт ДРУГОГО открытого заказа всё ещё требует
     override (фикс двойного счёта не должен ослабить энфорс)."""
-    import services.ms_demand as ms_demand
     from services.order_workflow import approve_shipment_request
 
-    monkeypatch.setattr(ms_demand, "is_ready", lambda: False)
     db = isolated_db
     roles.invalidate_all_roles()
     db.set_role(2, "b", "Boss", "boss")

@@ -20,7 +20,7 @@ _SECTION_KEYS = (
     "returns",
     "low_stock",
     "stale_crons",
-    "ms_anomalies",
+    "shipment_failed",
 )
 
 
@@ -71,15 +71,14 @@ def test_gather_ops_summary_counts_stale_order(isolated_db):
 def _summary(**counts):
     """Минимальный summary-dict с заданными count по секциям."""
     base = {k: {"count": 0} for k in _SECTION_KEYS}
-    base["ms_anomalies"] = {"drift": 0, "deleted": 0, "demand_failed": 0}
     for k, v in counts.items():
-        base[k] = v if k == "ms_anomalies" else {"count": v}
+        base[k] = {"count": v}
     return base
 
 
-def test_section_count_ms_anomalies_sums():
-    s = _summary(ms_anomalies={"drift": 2, "deleted": 1, "demand_failed": 3})
-    assert _section_count(s, "ms_anomalies") == 6
+def test_section_count_reads_the_section(isolated_db):
+    s = _summary(shipment_failed=6)
+    assert _section_count(s, "shipment_failed") == 6
     assert _section_count(s, "deposits") == 0
 
 

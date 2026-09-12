@@ -98,14 +98,6 @@ async def cb_return_confirm(call: CallbackQuery, bot: Bot):
     if not res.get("ok"):
         return await call.answer(f"⚠️ {res.get('error', 'уже обработано')}", show_alert=True)
 
-    # Best-effort: документ «Возврат покупателя» в МойСклад (no-op без контекста).
-    from services import ms_returns
-
-    try:
-        await ms_returns.create_salesreturn(return_id)
-    except Exception:
-        logger.warning("MS salesreturn create failed", exc_info=True)
-
     await call.answer("✅ Возврат подтверждён")
     # Round 6 (S1): html_text сохраняет HTML-entities. См. handlers/deposits.py.
     original = getattr(call.message, "html_text", None) or call.message.text or ""

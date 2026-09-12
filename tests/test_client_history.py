@@ -159,18 +159,10 @@ def test_history_empty_for_unknown_agent(isolated_db):
 
 def _client(db, monkeypatch, uid, role="boss"):
     import webapp.server as server
-    from services import moysklad
 
     importlib.reload(roles)
     db.set_role(uid, "u", "U", role)
     monkeypatch.setattr(server, "verify_init_data", lambda s: {"id": int(s), "first_name": "U"})
-
-    # Покупки из МС карточка тянет best-effort. Без заглушки тест ходит в сеть с
-    # фейковым токеном: медленно и оставляет незакрытую сессию aiohttp.
-    async def _no_purchases(_agent_id):
-        return {"top_products": [], "recent": [], "total_cents": 0, "count": 0}
-
-    monkeypatch.setattr(moysklad, "get_counterparty_purchases", _no_purchases)
     return TestClient(server.app)
 
 
@@ -188,17 +180,26 @@ def test_detail_returns_history_and_items(isolated_db, monkeypatch):
     assert [h["kind"] for h in body["money_history"]] == ["payment"]
 
 
-DEMAND_ID = "a1b2c3d4-1111-2222-3333-444455556666"
+def _outgoing_invoice(db, positions, counterparty_id=None):
+    """Провести расходную накладную и вернуть её id. Позиции — (имя, кол-во, копейки)."""
+    from services import container_receipt, warehouse
 
-
-def _positions_stub(rows, monkeypatch):
-    from services import moysklad
-
-    async def _positions(demand_id):
-        assert demand_id == DEMAND_ID
-        return rows
-
-    monkeypatch.setattr(moysklad, "get_shipment_positions", _positions)
+    items = []
+    for name, qty, price_cents in positions:
+        pid = _run(container_receipt.create_product(name))["product_id"]
+        # Приход, чтобы было что отгружать: расход в минус не уходит.
+        items.append({"product_id": pid, "quantity": qty, "price_cents": price_cents})
+    wid = _run(warehouse.default_warehouse_id())
+    _run(warehouse.create_invoice(
+        invoice_type="incoming", warehouse_id=wid,
+        items=[{**it, "price_cents": None} for it in items],
+    ))
+    res = _run(warehouse.create_invoice(
+        invoice_type="outgoing", warehouse_id=wid, items=items,
+        counterparty_id=counterparty_id,
+    ))
+    assert res["ok"], res
+    return res["invoice_id"]
 
 
 def test_shipment_returns_its_contents(isolated_db, monkeypatch):
@@ -206,57 +207,63 @@ def test_shipment_returns_its_contents(isolated_db, monkeypatch):
     db = isolated_db
     _setup(db)
     client = _client(db, monkeypatch, 2)
-    _positions_stub(
-        [
-            {"assortment": {"name": "Кабель PV 0.6"}, "quantity": 29, "price": 8000,
-             "uom": {"name": "шт"}},
-            {"assortment": {"name": "Автомат C16"}, "quantity": 2.5, "price": 15000},
-        ],
-        monkeypatch,
+    invoice_id = _outgoing_invoice(
+        db, [("Кабель PV 0.6", 29, 8000), ("Автомат C16", 2.5, 15000)]
     )
 
-    r = client.post("/api/clients/shipment", json={"initData": "2", "demand_id": DEMAND_ID})
+    r = client.post("/api/clients/shipment", json={"initData": "2", "invoice_id": invoice_id})
     assert r.status_code == 200, r.text
     body = r.json()
     assert [p["name"] for p in body["positions"]] == ["Кабель PV 0.6", "Автомат C16"]
     assert body["positions"][0]["sum_cents"] == 29 * 8000
-    assert body["positions"][1]["unit"] == "шт"  # единицы нет в ответе МС — дефолт
+    assert body["positions"][1]["unit"] == "шт"
     assert body["sum_cents"] == 29 * 8000 + int(round(2.5 * 15000))
 
 
-def test_shipment_rejects_non_uuid(isolated_db, monkeypatch):
-    """`demand_id` уходит в ПУТЬ запроса к МС: строка вида `../../entity/...`
-    увела бы его в другую сущность."""
+def test_shipment_rejects_missing_id(isolated_db, monkeypatch):
     db = isolated_db
     _setup(db)
     client = _client(db, monkeypatch, 2)
 
-    for bad in ("", "../../entity/counterparty/xxx", "12345"):
-        r = client.post("/api/clients/shipment", json={"initData": "2", "demand_id": bad})
+    for bad in ("", "не число", 0):
+        r = client.post("/api/clients/shipment", json={"initData": "2", "invoice_id": bad})
         assert r.status_code == 400, bad
 
 
-def test_shipment_ms_failure_is_502(isolated_db, monkeypatch):
-    """МС не ответил — это не поломка карточки: остальное в ней уже отрисовано."""
-    from services import moysklad
+def test_shipment_unknown_invoice_is_404(isolated_db, monkeypatch):
+    """Накладной нет — это не поломка карточки: остальное в ней уже отрисовано."""
+    db = isolated_db
+    _setup(db)
+    client = _client(db, monkeypatch, 2)
+    r = client.post("/api/clients/shipment", json={"initData": "2", "invoice_id": 999999})
+    assert r.status_code == 404
+
+
+def test_shipment_refuses_an_incoming_invoice(isolated_db, monkeypatch):
+    """Приход — не отгрузка клиента: показывать его в карточке значит выдать
+    закупку за продажу."""
+    from services import container_receipt, warehouse
 
     db = isolated_db
     _setup(db)
     client = _client(db, monkeypatch, 2)
-
-    async def _boom(_demand_id):
-        raise RuntimeError("MS 503")
-
-    monkeypatch.setattr(moysklad, "get_shipment_positions", _boom)
-    r = client.post("/api/clients/shipment", json={"initData": "2", "demand_id": DEMAND_ID})
-    assert r.status_code == 502
+    pid = _run(container_receipt.create_product("Кабель PV 0.6"))["product_id"]
+    res = _run(warehouse.create_invoice(
+        invoice_type="incoming",
+        warehouse_id=_run(warehouse.default_warehouse_id()),
+        items=[{"product_id": pid, "quantity": 5, "price_cents": None}],
+    ))
+    r = client.post(
+        "/api/clients/shipment", json={"initData": "2", "invoice_id": res["invoice_id"]}
+    )
+    assert r.status_code == 404
 
 
 def test_shipment_is_boss_only(isolated_db, monkeypatch):
     db = isolated_db
     _setup(db)
     client = _client(db, monkeypatch, 3, role="manager")
-    r = client.post("/api/clients/shipment", json={"initData": "3", "demand_id": DEMAND_ID})
+    r = client.post("/api/clients/shipment", json={"initData": "3", "invoice_id": 1})
     assert r.status_code == 403
 
 
