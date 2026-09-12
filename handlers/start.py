@@ -2,7 +2,6 @@
 Общие хэндлеры: /start, меню, управление ролями
 """
 
-import asyncio
 import logging
 from aiogram import Bot, Router, F
 from aiogram.filters import CommandStart, Command
@@ -21,7 +20,6 @@ from aiogram.fsm.context import FSMContext
 # (конвенция CLAUDE.md). Значение идентично get_role (guest для деактивированных).
 from handlers._ui import webapp_keyboard
 from services.roles import cached_role as get_role
-from utils.helpers import user_safe_error
 from config import ADMIN_IDS, WEBAPP_URL
 from services.database import (
     ensure_user,
@@ -62,7 +60,7 @@ def get_keyboard_for_role(role: str):
         kb.button(text="🌐 Открыть WebApp", web_app=WebAppInfo(url=WEBAPP_URL))
         rows += [1]
 
-    # Отгрузки из МойСклад — единственный список, которого нет в WebApp.
+    # Отгрузки — единственный список, которого нет в WebApp.
     if role in ("admin", "boss", "manager", "warehouse_keeper"):
         kb.button(text="🚚 Отгрузки", callback_data="sh:today")
         rows += [1]
@@ -116,7 +114,6 @@ _COMMANDS_BOSS = _COMMANDS_MANAGER + [
     BotCommand(command="ship", description="🚚 Отгрузить заказ"),
     BotCommand(command="shipments", description="🚚 Последние отгрузки"),
     BotCommand(command="cancel", description="🚫 Отменить заказ"),
-    BotCommand(command="sync_payments", description="🔄 Статус синка с МойСклад"),
 ]
 _COMMANDS_ADMIN = _COMMANDS_BOSS + [
     BotCommand(command="users", description="👥 Пользователи"),
@@ -250,33 +247,6 @@ async def cmd_start(message: Message, state: FSMContext):
             reply_markup=ReplyKeyboardRemove(),
         )
 
-    # Автоматически синхронизируем менеджеров с МойСклад.
-    # Статус показываем коротко — только в случае проблем. Успех тихий,
-    # чтобы не шуметь при каждом /start. Полный текст ошибки от МойСклад
-    # уходит в лог через sync_manager.
-    sync_status_line = ""
-    if role == "manager":
-        from services.ms_sync import sync_manager
-        import html as _html
-
-        result = await sync_manager(
-            user.id,
-            user.full_name or user.username or str(user.id),
-            user.username or "",
-        )
-        status = result.get("status")
-        if status == "created":
-            sync_status_line = "\n\n✅ Создан профиль в МойСклад."
-        elif status == "failed":
-            reason = result.get("reason", "неизвестная ошибка")
-            logger.warning("MS link failed for %s: %s", user.full_name, reason)
-            sync_status_line = (
-                f"\n\n⚠️ <i>Не привязан к МойСклад: "
-                f"{_html.escape(reason[:160])}</i>\n"
-                f"<i>Передайте админу — аналитика по сотруднику "
-                f"недоступна без привязки.</i>"
-            )
-
     # Welcome + единое меню одним сообщением (раньше было двумя: текст
     # отдельно, «⚡ Быстрые действия» с кнопками — отдельно).
     # Если у роли нет меню (employee/гость уже отсеян) — снимаем возможную
@@ -286,7 +256,7 @@ async def cmd_start(message: Message, state: FSMContext):
     # (/api/home), а бот-аналитика вырезана вместе с handlers/analytics.
     inline_markup = get_keyboard_for_role(role)
     await message.answer(
-        get_welcome_text(role, user.first_name or "") + sync_status_line,
+        get_welcome_text(role, user.first_name or ""),
         parse_mode="HTML",
         reply_markup=inline_markup or ReplyKeyboardRemove(),
     )
@@ -300,7 +270,7 @@ async def cmd_find(message: Message):
     Клиенты (контрагенты) видны всем.
     """
     from services import async_db as adb
-    from services import snapshot
+    from services import counterparties as cp_service
     from services.roles import _has_role
     from utils.helpers import esc
 
@@ -319,7 +289,7 @@ async def cmd_find(message: Message):
 
     orders = await adb.search_orders(query, user_id=scope_uid, limit=10)
     payments = await adb.search_payments(query, user_id=scope_uid, limit=10)
-    agents = await asyncio.to_thread(snapshot.get_counterparties, query, 10)
+    agents = await cp_service.search(query, 10)
 
     lines: list[str] = [f"🔍 <b>Поиск: {esc(query)}</b>"]
     if orders:
@@ -355,46 +325,6 @@ async def cmd_find(message: Message):
         kb.adjust(1)
         markup = kb.as_markup()
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=markup)
-
-
-@router.message(Command("refresh"))
-async def cmd_refresh(message: Message):
-    """Принудительно перечитать snapshot МойСклад. Доступно только админу."""
-    if message.from_user.id not in ADMIN_IDS and get_role(message.from_user.id) != "admin":
-        return await message.answer("⛔ Только для администратора.")
-
-    from services import snapshot
-
-    await message.answer("⏳ Перечитываю snapshot МойСклад…")
-    try:
-        counts = await snapshot.refresh_all()
-    except Exception as e:
-        return await message.answer(user_safe_error(e, "refresh_snapshot"))
-
-    lines = ["✅ <b>Snapshot обновлён</b>", ""]
-    for key, val in counts.items():
-        lines.append(f"• {key}: <code>{val}</code>")
-    await message.answer("\n".join(lines), parse_mode="HTML")
-
-
-@router.message(Command("snapshot"))
-async def cmd_snapshot_stats(message: Message):
-    """Показать статистику snapshot — что и когда последний раз обновлялось."""
-    if message.from_user.id not in ADMIN_IDS and get_role(message.from_user.id) != "admin":
-        return await message.answer("⛔ Только для администратора.")
-    from services import snapshot
-
-    stats = snapshot.stats()
-    lines = ["📊 <b>Snapshot МойСклад</b>", ""]
-    lines.append("<b>Строк в локальных таблицах:</b>")
-    for tbl in ("ms_products", "ms_categories", "ms_counterparties", "ms_employees", "ms_stock"):
-        lines.append(f"  • {tbl}: <code>{stats.get(tbl, 0)}</code>")
-    lines.append("")
-    lines.append("<b>Метаданные:</b>")
-    for m in stats.get("meta", []):
-        last = m.get("last_full_refresh") or m.get("last_refresh") or "—"
-        lines.append(f"  • {m['dataset']}: {last} ({m.get('rows_count', 0)} rows)")
-    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @router.callback_query(F.data == "menu")
@@ -444,6 +374,26 @@ _RETIRED_COMMANDS = {
     "sell": "Заказы → Техника → машина → «Продажа»",
     "credit": "Заказы → Техника → машина → «Рассрочка»",
 }
+
+
+# Команды, которых больше НЕ СУЩЕСТВУЕТ: они обслуживали интеграцию с
+# МойСклад (синхронизация сотрудников и платежей, снапшот справочников).
+# Учёт полностью локальный, синхронизировать не с чем. Отвечаем отдельно от
+# `_RETIRED_COMMANDS`: там операция переехала в WebApp, здесь — исчезла, и
+# отправлять человека искать её в интерфейсе было бы враньём.
+_REMOVED_COMMANDS = ("syncms", "msstaff", "refresh", "snapshot", "sync_payments")
+
+
+@router.message(Command(*_REMOVED_COMMANDS))
+async def cmd_removed(message: Message):
+    """Ответ на команду, удалённую вместе с интеграцией МойСклад."""
+    await message.answer(
+        "🗄 Эта команда убрана: учёт ведётся полностью у нас, "
+        "синхронизировать с МойСклад больше нечего.\n\n"
+        "<i>Остатки, накладные и справочники — в WebApp.</i>",
+        parse_mode="HTML",
+        reply_markup=webapp_keyboard(),
+    )
 
 
 @router.message(Command(*_RETIRED_COMMANDS))

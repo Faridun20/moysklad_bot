@@ -294,14 +294,6 @@
   // >0 — аванс/переплата. Раньше тернарники дублировались в renderClients и
   // renderAgentDetail и уже разъезжались (был sign-баг). Возвращает {state,
   // amount, currency}; разметку каждый экран строит сам.
-  function balanceParts(cents, baseCurrency) {
-    const cur = String(baseCurrency || 'USD');
-    if (cents == null) return { state: 'none', amount: '', currency: cur };
-    const c = Number(cents) || 0;
-    if (c < 0) return { state: 'owe', amount: opsAmount(-c / 100), currency: cur };
-    if (c > 0) return { state: 'adv', amount: opsAmount(c / 100), currency: cur };
-    return { state: 'zero', amount: '0', currency: cur };
-  }
 
   // ─── Общие состояния экрана (UI-WP-09) ──────────────────────────────────
   // Пустое состояние собиралось инлайн в двадцати девяти местах app.js, и
@@ -374,18 +366,6 @@
     return currency ? `${text} ${currency}` : text;
   }
 
-  // Готовая подпись МС-баланса (UI-WP-05). balanceParts даёт знак и сумму, но
-  // САМА ПОДПИСЬ дублировалась в renderClients (balStr) и renderAgentDetail
-  // (balLine) двумя разными тернарниками — и формулировки уже разошлись
-  // («должен» против «должен нам»). tone отдаём отдельно, чтобы экран сам решал
-  // про класс/вёрстку и не парсил текст.
-  function msBalanceLabel(cents, baseCurrency) {
-    const p = balanceParts(cents, baseCurrency);
-    if (p.state === 'none') return { text: '—', tone: 'none' };
-    if (p.state === 'owe') return { text: `должен ${p.amount} ${p.currency}`, tone: 'owe' };
-    if (p.state === 'adv') return { text: `аванс ${p.amount} ${p.currency}`, tone: 'advance' };
-    return { text: `0 ${p.currency}`, tone: 'zero' };
-  }
 
   // Короткая подпись диапазона (UI-BUG-02). Полные даты «01.07.2026—31.07.2026»
   // — это ~150px, из-за которых ряд с сегментом гарантированно переполнялся и
@@ -457,8 +437,8 @@
     return Number(q || 0).toLocaleString('ru-RU', { maximumFractionDigits: 3 });
   }
 
-  // Бейдж остатка. Отдельно от _stockBadge в app.js: там целые из МойСклад,
-  // здесь количества могут быть дробными.
+  // Бейдж остатка. Количества дробные (склад считает не только штуки), поэтому
+  // подпись строит whQty, а не toString.
   function whStockBadge(q) {
     const n = Number(q || 0);
     // Состояние — атрибутом, цвет выводится из переменных (см. [data-status]
@@ -699,7 +679,7 @@
     renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml,
     NAV_SECTIONS, navSections, defaultSection, sectionNavHtml,
     salesTabs, stockTabs, moneyTabs, clientsTabs,
-    balanceParts, periodSegHtml, rangeLabel, formatMoney, msBalanceLabel,
+    periodSegHtml, rangeLabel, formatMoney,
     emptyState, skeleton, errorBoxHtml,
     machineStatusLabel, machineSubtitle, machineStatusSegHtml,
     moneyBlockLabel, agingBarsHtml, forecastRowsHtml, buyerKey,

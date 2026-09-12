@@ -65,7 +65,6 @@ FOLDED_COLUMNS = {
     "returns": {"total_amount_cents"},
     "return_items": {"amount_cents"},
     "product_prices": {"sale_price_cents", "cost_price_cents"},
-    "ms_counterparties": {"balance_cents"},
 }
 
 # T1.2 — колонки-призраки: объявлены миграцией, но нигде не читались и не

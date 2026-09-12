@@ -9,13 +9,6 @@
 
 import asyncio
 
-import pytest
-
-
-@pytest.fixture(autouse=True)
-def _no_ms_sync(isolated_db, monkeypatch):
-    monkeypatch.setattr(isolated_db, "_trigger_ms_paymentin_sync", lambda _: None)
-
 
 def _shipped(db, manager_id, total, currency=None, agent="A1"):
     db.set_role(manager_id, "m", "Mgr", "manager")

@@ -437,23 +437,23 @@ def _tables_referencing(db, parent: str) -> list[str]:
 
 
 def test_delete_leaves_no_orphans_anywhere(isolated_db):
-    """Регресс: `container_supply` не чистился при удалении контейнера.
+    """Регресс: `container_receipt` не чистился при удалении контейнера.
 
     На SQLite внешние ключи выключены, поэтому сирота не мешает и тест на
     «удалилось» проходил; на Postgres FK энфорсится, и удаление падало 500-й.
     Проверяем не конкретную таблицу, а ВСЕ дочерние по схеме — тогда следующая
     такая таблица поймается сама, без правки этого теста.
     """
-    from services import containers, ms_supply
+    from services import container_receipt, containers
 
     db = isolated_db
     _setup(db)
     cid = _container()
     _item(cid, "Кабель", 500)
-    _run(ms_supply.set_supplier(cid, ms_id="agent-1", name="ООО Поставщик"))
+    _run(container_receipt.set_supplier(cid, supplier_id=_agent(db), name="ООО Поставщик"))
 
     children = _tables_referencing(db, "containers")
-    assert "container_items" in children and "container_supply" in children, children
+    assert "container_items" in children and "container_receipt" in children, children
     # Список в сервисе обязан покрывать схему — иначе он и есть источник бага.
     assert set(children) <= set(containers.CHILD_TABLES), (
         f"в схеме есть дети контейнера, которых нет в CHILD_TABLES: "
@@ -472,29 +472,31 @@ def test_delete_leaves_no_orphans_anywhere(isolated_db):
 def test_container_with_supplier_is_deletable(isolated_db):
     """Боевой сценарий из логов: у контейнера задан поставщик — удаление
     падало ForeignKeyViolationError."""
-    from services import containers, ms_supply
+    from services import container_receipt, containers
 
     db = isolated_db
     _setup(db)
     cid = _container()
-    _run(ms_supply.set_supplier(cid, ms_id="agent-1", name="ООО Поставщик"))
+    _run(container_receipt.set_supplier(cid, supplier_id=_agent(db), name="ООО Поставщик"))
 
     assert _run(containers.delete_container(cid, user_id=2))["ok"] is True
-    assert _run(ms_supply.get_link(cid)) == {"unmatched": []}
+    assert _run(container_receipt.get_link(cid)) == {"unmatched": [], "legacy": False}
 
 
 # ─── Привязка позиции к номенклатуре ──────────────────────────────────────────
 
 
-def _stock(db, ms_id, name, unit="шт"):
-    with db.get_conn() as conn:
-        cur = db.get_cursor(conn)
-        cur.execute(
-            db.q("INSERT INTO ms_stock (ms_id, name, folder_id, folder_name, unit, stock, "
-                 "reserve) VALUES (?, ?, '', '', ?, 0, 0)"),
-            (ms_id, name, unit),
-        )
-        conn.commit()
+def _agent(db, name="ООО Поставщик"):
+    from services import counterparties as cp
+
+    return _run(cp.create(name, cp_type="supplier"))["counterparty_id"]
+
+
+def _product(db, name, unit="шт"):
+    """Карточка номенклатуры. Возвращает её id — им теперь и связывают позиции."""
+    from services import container_receipt
+
+    return _run(container_receipt.create_product(name, unit=unit))["product_id"]
 
 
 def test_item_can_be_added_with_a_catalog_product(isolated_db):
@@ -503,11 +505,12 @@ def test_item_can_be_added_with_a_catalog_product(isolated_db):
     db = isolated_db
     _setup(db)
     cid = _container()
-    _run(containers.add_item(cid, name="Кабель PV 0.6", expected_qty=500, ms_id="p-1"))
+    pid = _product(db, "Кабель PV 0.6")
+    _run(containers.add_item(cid, name="Кабель PV 0.6", expected_qty=500, product_id=pid))
 
     item = _run(containers.list_items(cid))[0]
-    assert item["ms_id"] == "p-1"
-    assert item["ms_name"] == "Кабель PV 0.6"
+    assert item["product_id"] == pid
+    assert item["product_name"] == "Кабель PV 0.6"
 
 
 def test_free_text_item_stays_legal(isolated_db):
@@ -520,7 +523,7 @@ def test_free_text_item_stays_legal(isolated_db):
     cid = _container()
     _item(cid, "Штекер тип C", 10)
 
-    assert _run(containers.list_items(cid))[0]["ms_id"] is None
+    assert _run(containers.list_items(cid))[0]["product_id"] is None
 
 
 def test_link_replaces_previous_choice(isolated_db):
@@ -530,12 +533,14 @@ def test_link_replaces_previous_choice(isolated_db):
     _setup(db)
     cid = _container()
     item = _item(cid, "Кабель", 10)
-    assert _run(containers.link_item(cid, item, ms_id="p-1", ms_name="Кабель PV 0.6"))["ok"]
-    assert _run(containers.link_item(cid, item, ms_id="p-2", ms_name="Кабель PV 1.0"))["ok"]
+    p1 = _product(db, "Кабель PV 0.6")
+    p2 = _product(db, "Кабель PV 1.0")
+    assert _run(containers.link_item(cid, item, product_id=p1))["ok"]
+    assert _run(containers.link_item(cid, item, product_id=p2))["ok"]
 
     rows = _run(containers.list_items(cid))
     assert len(rows) == 1
-    assert rows[0]["ms_id"] == "p-2"
+    assert rows[0]["product_id"] == p2
 
 
 def test_link_refuses_item_from_another_container(isolated_db):
@@ -549,7 +554,7 @@ def test_link_refuses_item_from_another_container(isolated_db):
     other = _container("MSKU-2222222")
     stranger = _item(other, "Кабель", 10)
 
-    res = _run(containers.link_item(mine, stranger, ms_id="p-1"))
+    res = _run(containers.link_item(mine, stranger, product_id=_product(db, "Кабель PV 0.6")))
     assert res["ok"] is False
     assert "не найдена" in res["error"]
 
@@ -564,7 +569,7 @@ def test_link_is_refused_after_the_window_closes(isolated_db):
     _run(containers.mark_arrived(cid, user_id=2))
     _close_window(db, cid)
 
-    res = _run(containers.link_item(cid, item, ms_id="p-1"))
+    res = _run(containers.link_item(cid, item, product_id=_product(db, "Кабель PV 0.6")))
     assert res["ok"] is False
     assert res.get("window_closed") is True
 
@@ -577,19 +582,19 @@ def test_deleting_item_takes_its_link_along(isolated_db):
     _setup(db)
     cid = _container()
     item = _item(cid, "Кабель", 10)
-    _run(containers.link_item(cid, item, ms_id="p-1"))
+    _run(containers.link_item(cid, item, product_id=_product(db, "Кабель PV 0.6")))
 
     assert _run(containers.delete_item(cid, item))["ok"] is True
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)
-        cur.execute(db.q("SELECT COUNT(*) FROM container_item_links WHERE item_id = ?"), (item,))
+        cur.execute(db.q("SELECT COUNT(*) FROM container_item_products WHERE item_id = ?"), (item,))
         assert cur.fetchone()[0] == 0
 
 
 def test_child_tables_are_ordered_leaves_first(isolated_db):
     """Порядок в CHILD_TABLES — не косметика.
 
-    `container_item_links` ссылается и на контейнер, и на позицию: удали
+    `container_item_products` ссылается и на контейнер, и на позицию: удали
     позиции первыми — Postgres отвергнет DELETE, а SQLite с выключенными FK
     промолчит, и баг снова доедет до прода. Порядок выводим из схемы, чтобы
     следующая такая таблица поймалась сама.
@@ -619,24 +624,26 @@ def test_orphan_guard_covers_the_link_table(isolated_db):
     _setup(db)
     cid = _container()
     item = _item(cid, "Кабель", 10)
-    _run(containers.link_item(cid, item, ms_id="p-1"))
+    _run(containers.link_item(cid, item, product_id=_product(db, "Кабель PV 0.6")))
 
-    assert "container_item_links" in _tables_referencing(db, "containers")
+    assert "container_item_products" in _tables_referencing(db, "containers")
     assert _run(containers.delete_container(cid, user_id=2))["ok"] is True
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)
-        cur.execute(db.q("SELECT COUNT(*) FROM container_item_links WHERE container_id = ?"), (cid,))
+        cur.execute(
+            db.q("SELECT COUNT(*) FROM container_item_products WHERE container_id = ?"), (cid,)
+        )
         assert cur.fetchone()[0] == 0
 
 
-def test_product_search_reads_the_snapshot(isolated_db, monkeypatch):
+def test_product_search_reads_the_local_catalog(isolated_db, monkeypatch):
     db = isolated_db
     _setup(db)
-    _stock(db, "p-1", "Кабель PV 0.6")
-    _stock(db, "p-2", "ThinkPower 6kw")
+    pid = _product(db, "Кабель PV 0.6")
+    _product(db, "ThinkPower 6kw")
 
     body = _post(_client(monkeypatch), "/api/products/search", 1, query="кабель").json()
-    assert [p["ms_id"] for p in body["products"]] == ["p-1"]
+    assert [p["product_id"] for p in body["products"]] == [pid]
 
 
 def test_product_search_ignores_a_single_letter(isolated_db, monkeypatch):
@@ -644,7 +651,7 @@ def test_product_search_ignores_a_single_letter(isolated_db, monkeypatch):
     каталога значит подсунуть случайный выбор под палец."""
     db = isolated_db
     _setup(db)
-    _stock(db, "p-1", "Кабель PV 0.6")
+    _product(db, "Кабель PV 0.6")
 
     body = _post(_client(monkeypatch), "/api/products/search", 1, query="к").json()
     assert body["products"] == []
@@ -658,10 +665,11 @@ def test_item_link_endpoint_binds_the_position(isolated_db, monkeypatch):
     cid = _container()
     item = _item(cid, "Кабель", 10)
 
+    pid = _product(db, "Кабель PV 0.6")
     res = _post(_client(monkeypatch), "/api/containers/item_link", 1,
-                container_id=cid, item_id=item, ms_id="p-1", ms_name="Кабель PV 0.6")
+                container_id=cid, item_id=item, product_id=pid)
     assert res.status_code == 200, res.text
-    assert _run(containers.list_items(cid))[0]["ms_id"] == "p-1"
+    assert _run(containers.list_items(cid))[0]["product_id"] == pid
 
 
 def test_container_note_search_finds_cyrillic_regardless_of_case(isolated_db):

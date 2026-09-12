@@ -24,10 +24,9 @@ try:
 except Exception:
     pass
 
-# Заглушки токенов — нужны только для импорта config (БД берётся из
+# Заглушка токена — нужна только для импорта config (БД берётся из
 # DATABASE_URL / DB_PATH окружения, скрипт их НЕ переопределяет).
 os.environ.setdefault("TELEGRAM_TOKEN", "0:smoke")
-os.environ.setdefault("MS_TOKEN", "smoke")
 
 import services.database as db  # noqa: E402
 

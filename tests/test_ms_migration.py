@@ -214,6 +214,12 @@ def test_apply_without_warehouse_fails_loudly(isolated_db):
     import scripts.migrate_from_moysklad as m
 
     importlib.reload(m)
+    # Фикстура сеет склад по умолчанию (без него не проходит ни одна накладная);
+    # здесь проверяется ровно противоположное состояние — убираем его.
+    with isolated_db.get_conn() as conn:
+        cur = isolated_db.get_cursor(conn)
+        cur.execute("DELETE FROM warehouses")
+        conn.commit()
 
     async def go():
         with pytest.raises(RuntimeError, match="warehouses"):

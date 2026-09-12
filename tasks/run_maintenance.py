@@ -2,7 +2,6 @@
 CLI: периодическая чистка БД (IMPLEMENTATION.md §13, janitor). Railway Cron.
 
 Что делает за один прогон (всё идемпотентно, по ретеншенам из app_settings):
-  • prune_notified_shipments  — дедуп-записи отгрузок старше 30 дней;
   • prune_audit_log           — аудит старше audit_log_retention_months;
   • prune_idempotency_keys    — протухшие ключи идемпотентности.
 
@@ -20,7 +19,6 @@ from services.database import (
     init_db,
     prune_audit_log,
     prune_idempotency_keys,
-    prune_notified_shipments,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -32,8 +30,6 @@ def main() -> int:
     try:
         audit_months = int(get_setting("audit_log_retention_months", 6))
 
-        shipments = prune_notified_shipments(older_than_days=30)
-
         # Аудит старше ретеншена удаляем напрямую (внешний архив убран).
         # Ретеншен — audit_log_retention_months (по умолчанию 6 мес).
         audit = prune_audit_log(retention_months=audit_months)
@@ -43,8 +39,7 @@ def main() -> int:
         idem = prune_idempotency_keys()
 
         logger.info(
-            "maintenance: notified_shipments=-%d audit_log=-%d idempotency_keys=-%d",
-            shipments,
+            "maintenance: audit_log=-%d idempotency_keys=-%d",
             audit,
             idem,
         )

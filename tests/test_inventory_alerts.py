@@ -1,10 +1,15 @@
 """
 Тесты складских алертов (PR B): low-stock + dead-stock.
 
-  * get_low_stock — доступный остаток (stock−reserve) ≤ порога, stock>0
+  * get_low_stock — доступный остаток (остаток − резерв) ≤ порога, остаток>0
   * build_low_stock_block / build_dead_stock_block — None/счёт/truncate
   * diff_dead_stock — чистая diff-логика (продано → не dead)
+
+Резерв локально — это одобренные, но не отгруженные заказы: именно они держат
+товар, как раньше держал customerorder в МойСклад.
 """
+
+import asyncio
 
 from tasks.run_ops_monitor import (
     build_dead_stock_block,
@@ -13,38 +18,46 @@ from tasks.run_ops_monitor import (
 )
 
 
+def _run(coro):
+    return asyncio.run(coro)
+
+
 def _seed_stock(db, rows):
-    """rows: list of (ms_id, name, stock, reserve)."""
-    with db.get_conn() as conn:
-        cur = db.get_cursor(conn)
-        for ms_id, name, stock, reserve in rows:
-            cur.execute(
-                db.q(
-                    "INSERT INTO ms_stock (ms_id, name, folder_name, unit, stock, reserve, updated_at) "
-                    "VALUES (?, ?, '', 'шт', ?, ?, ?)"
-                ),
-                (ms_id, name, stock, reserve, db.now_str()),
-            )
-        conn.commit()
+    """rows: list of (name, stock, reserve). Резерв делаем одобренным заказом."""
+    from services import container_receipt, warehouse
+
+    wid = _run(warehouse.default_warehouse_id())
+    db.set_role(1, "m", "Mgr", "manager")
+    for name, stock, reserve in rows:
+        pid = _run(container_receipt.create_product(name))["product_id"]
+        if stock:
+            _run(warehouse.create_invoice(
+                invoice_type="incoming", warehouse_id=wid,
+                items=[{"product_id": pid, "quantity": stock, "price_cents": None}],
+            ))
+        if reserve:
+            oid = db.create_order(1, "Mgr", "")
+            db.add_order_item(oid, name, "", reserve, "шт", 1.0, product_id=pid)
+            db.update_order_status(oid, "approved")
 
 
 # ─── get_low_stock ───────────────────────────────────────────────────────────
 
 
 def test_get_low_stock_threshold(isolated_db):
-    import services.snapshot as snapshot
+    from services import warehouse
 
     db = isolated_db
     _seed_stock(
         db,
         [
-            ("p1", "Мало", 3, 0),  # available 3 ≤ 5 → low
-            ("p2", "Норма", 50, 0),  # available 50 → not low
-            ("p3", "Резерв", 10, 8),  # available 2 ≤ 5 → low
-            ("p4", "Ноль", 0, 0),  # stock 0 → исключается (нечего продавать)
+            ("Мало", 3, 0),  # доступно 3 ≤ 5 → low
+            ("Норма", 50, 0),  # доступно 50 → not low
+            ("Резерв", 10, 8),  # доступно 2 ≤ 5 → low
+            ("Ноль", 0, 0),  # остатка нет → исключается (нечего продавать)
         ],
     )
-    low = snapshot.get_low_stock(threshold=5)
+    low = _run(warehouse.get_low_stock(threshold=5))
     names = {r["name"] for r in low}
     assert names == {"Мало", "Резерв"}
     # Сортировка: худший доступный сверху (Резерв avail=2 < Мало avail=3)
@@ -52,11 +65,11 @@ def test_get_low_stock_threshold(isolated_db):
 
 
 def test_get_low_stock_excludes_zero_stock(isolated_db):
-    import services.snapshot as snapshot
+    from services import warehouse
 
     db = isolated_db
-    _seed_stock(db, [("p1", "Распродан", 0, 0)])
-    assert snapshot.get_low_stock(threshold=5) == []
+    _seed_stock(db, [("Распродан", 0, 0)])
+    assert _run(warehouse.get_low_stock(threshold=5)) == []
 
 
 # ─── build-блоки ─────────────────────────────────────────────────────────────
@@ -67,14 +80,14 @@ def test_build_low_stock_block_none_when_empty():
 
 
 def test_build_low_stock_block_counts_and_truncates():
-    rows = [{"name": f"Товар{i}", "stock": 2, "reserve": 0, "unit": "шт"} for i in range(20)]
+    rows = [{"name": f"Товар{i}", "available": 2, "unit": "шт"} for i in range(20)]
     block = build_low_stock_block(rows, 5)
     assert "20" in block
     assert "и ещё 5" in block  # 15 показано, 5 свёрнуто
 
 
 def test_build_low_stock_block_shows_available():
-    rows = [{"name": "Гвозди", "stock": 10, "reserve": 7, "unit": "кг"}]
+    rows = [{"name": "Гвозди", "available": 3, "unit": "кг"}]
     block = build_low_stock_block(rows, 5)
     assert "Гвозди" in block
     assert "3" in block  # available = 10 - 7

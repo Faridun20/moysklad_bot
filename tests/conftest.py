@@ -3,7 +3,6 @@ Pytest fixtures.
 
 Что важно про тесты в этом проекте:
 - Используем SQLite (DB_PATH в /tmp), Postgres в CI не нужен.
-- Заглушаем _trigger_ms_paymentin_sync чтобы тесты не тыкались в МойСклад.
 - TELEGRAM_TOKEN — заведомо фейковый, реального бота не дёргаем.
 """
 
@@ -11,12 +10,11 @@ import os
 
 import pytest
 
-# Заглушки секретов на случай запуска без env (локально / pre-commit hook):
-# config.py требует TELEGRAM_TOKEN/MS_TOKEN уже на импорте, а часть тест-
-# модулей импортируют services на этапе сборки — до фикстур. setdefault не
-# перетирает реальные значения из CI.
+# Заглушка секрета на случай запуска без env (локально / pre-commit hook):
+# config.py требует TELEGRAM_TOKEN уже на импорте, а часть тест-модулей
+# импортируют services на этапе сборки — до фикстур. setdefault не перетирает
+# реальные значения из CI.
 os.environ.setdefault("TELEGRAM_TOKEN", "0:fake-token-for-tests")
-os.environ.setdefault("MS_TOKEN", "fake-ms-token")
 
 
 @pytest.fixture
@@ -30,7 +28,6 @@ def isolated_db(monkeypatch, tmp_path):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     # Telegram-токен заглушка — нужен для импорта config
     monkeypatch.setenv("TELEGRAM_TOKEN", "0:fake-token-for-tests")
-    monkeypatch.setenv("MS_TOKEN", "fake-ms-token")
 
     # Перезагружаем модули чтобы перечитали env var DB_PATH
     import importlib
@@ -41,10 +38,9 @@ def isolated_db(monkeypatch, tmp_path):
     importlib.reload(db)
 
     db.init_db()
-    # Глушим хук синхронизации с МойСклад — тесты не должны звонить в боевой
-    # API. Через monkeypatch (а не прямое присваивание!), чтобы заглушка
-    # СНИМАЛАСЬ после теста: иначе она протекала на весь прогон и ломала
-    # тесты, которым нужна настоящая _trigger (см. test_ms_crossloop).
-    monkeypatch.setattr(db, "_trigger_ms_paymentin_sync", lambda *a, **k: None)
-
+    # Склад по умолчанию. На проде его сеет `run_backfills` (через
+    # `tasks/migrate`), в тестах — фикстура: без единой строки в `warehouses`
+    # любая накладная отвергается «склад не найден», и половина сценариев
+    # падала бы на инфраструктуре, а не на проверяемом поведении.
+    db.seed_warehouses()
     return db

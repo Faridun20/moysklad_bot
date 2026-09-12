@@ -335,14 +335,12 @@ async def get_lead(lead_id: int) -> dict | None:
     from services import lead_calls
 
     lead["calls"] = await lead_calls.list_calls(lead_id=lead_id, limit=20)
-    # Контрагент — то, ради чего привязка и делается: телефон и баланс живут
-    # там, Telegram номер собеседника не отдаёт и никогда не отдаст.
+    # Контрагент — то, ради чего привязка и делается: телефон живёт там,
+    # Telegram номер собеседника не отдаёт и никогда не отдаст.
     if lead.get("agent_ms_id"):
-        import asyncio
+        from services import counterparties as cp_service
 
-        from services import snapshot
-
-        lead["agent"] = await asyncio.to_thread(snapshot.get_counterparty, lead["agent_ms_id"])
+        lead["agent"] = await cp_service.get(lead["agent_ms_id"])
     lost = await adb_core.fetchrow("SELECT * FROM lead_lost WHERE lead_id = $1", lead_id)
     lead["lost"] = dict(lost) if lost else None
     if lead["lost"]:

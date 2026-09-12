@@ -34,7 +34,6 @@ def client_env(isolated_db, monkeypatch):
         "verify_init_data",
         lambda init_data: {"id": int(init_data), "first_name": "U", "username": "u"},
     )
-    monkeypatch.setattr(db, "_trigger_ms_paymentin_sync", lambda *a, **k: None)
     return TestClient(server.app), db, {"boss": boss_id, "mgr": mgr_id}
 
 

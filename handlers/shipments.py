@@ -1,5 +1,11 @@
 """
-Хэндлеры: отгрузки
+Хэндлеры: отгрузки.
+
+Отгрузка = расходная накладная нашего склада (`services.warehouse`). Раньше
+список приезжал из МойСклад (`entity/demand` + позиции каждого документа
+отдельным запросом), и ради этого в модуле жил TTL-кэш и постраничная догрузка
+по сети. Запрос теперь локальный: берём период целиком одним SELECT, позиции —
+по одной накладной на сообщение.
 """
 
 import logging
@@ -10,9 +16,8 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 
 from services.roles import can_view_stock
-from services.moysklad import get_shipments, get_shipment_positions
-from utils.helpers import extract_id_from_href, user_safe_error, utc_now
 from utils.formatters import format_shipment
+from utils.helpers import local_now, user_safe_error
 from utils.keyboards import (
     shipments_nav_keyboard,
     shipments_back_keyboard,
@@ -21,10 +26,8 @@ from utils.keyboards import (
 logger = logging.getLogger(__name__)
 router = Router()
 
-# Навигационное состояние: {chat_id: {since, until, label}}.
-# Полный список отгрузок НЕ храним — get_shipments() имеет собственный
-# 60-секундный TTL-кэш. Такой подход убирает неограниченный рост памяти
-# при большом количестве чатов или тяжёлых выборках.
+# Навигационное состояние: {chat_id: {since, until, label}}. Сами накладные не
+# храним — выборка локальная и стоит один запрос.
 shipments_cache: dict[int, dict] = {}
 
 PER_PAGE = 5
@@ -42,7 +45,7 @@ async def cmd_shipments(message: Message, bot: Bot):
     if not is_allowed(message.from_user.id):
         return
     # Сразу показываем отгрузки за сегодня; период переключается чипами под списком.
-    now = utc_now()
+    now = local_now()
     since = now.replace(hour=0, minute=0, second=0, microsecond=0)
     await show_shipments(bot, message.chat.id, since, None, "сегодня", page=0)
 
@@ -57,7 +60,10 @@ async def cb_shipments_period(call: CallbackQuery, bot: Bot):
     await call.answer()
 
     period = call.data.split(":")[1]
-    now = utc_now()
+    # local_now, а не utc_now: `invoices.invoice_date` пишется в локальной зоне
+    # (как и весь остальной «сегодня» в проекте). На UTC-сервере вечерняя
+    # накладная иначе выпадала бы из «сегодня».
+    now = local_now()
 
     if period == "today":
         since = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -107,27 +113,24 @@ async def cb_shipments_page(call: CallbackQuery, bot: Bot):
 async def show_shipments(
     bot: Bot, chat_id: int, since: datetime, until: datetime, label: str, page: int = 0
 ):
+    from services import warehouse
+
     is_first = page == 0
-    if is_first:
-        await bot.send_message(chat_id, f"⏳ Загружаю отгрузки за {label}…")
     try:
-        # Всегда вызываем get_shipments — при пагинации данные придут из
-        # 60-секундного TTL-кэша (быстро), при первом запросе — из API.
-        # Навигационные параметры (since/until/label) обновляем при is_first.
-        shipments = await get_shipments(since, until)
+        rows = await warehouse.list_shipments(since, until)
         if is_first:
             shipments_cache[chat_id] = {"label": label, "since": since, "until": until}
         elif chat_id in shipments_cache:
             label = shipments_cache[chat_id].get("label", label)
 
-        if not shipments:
+        if not rows:
             return await bot.send_message(
                 chat_id,
                 f"🚚 Нет отгрузок за {label}.",
                 reply_markup=shipments_back_keyboard(),
             )
 
-        total = len(shipments)
+        total = len(rows)
         total_pages = (total + PER_PAGE - 1) // PER_PAGE
         start = page * PER_PAGE
         end = min(start + PER_PAGE, total)
@@ -139,16 +142,11 @@ async def show_shipments(
         )
         await bot.send_message(chat_id, header, parse_mode="HTML")
 
-        for s in shipments[start:end]:
-            demand_id = extract_id_from_href(s.get("meta", {}).get("href", ""))
-            positions = []
-            if demand_id:
-                try:
-                    positions = await get_shipment_positions(demand_id)
-                except Exception as e:
-                    logger.warning("Позиции %s: %s", demand_id, e)
-            txt = format_shipment(s, positions)
-            await bot.send_message(chat_id, txt, parse_mode="HTML")
+        for row in rows[start:end]:
+            invoice = await warehouse.get_invoice(int(row["id"]))
+            if invoice is None:
+                continue
+            await bot.send_message(chat_id, format_shipment(invoice), parse_mode="HTML")
 
         kb = shipments_nav_keyboard(page, total_pages)
         await bot.send_message(chat_id, f"Стр. {page + 1} из {total_pages}", reply_markup=kb)

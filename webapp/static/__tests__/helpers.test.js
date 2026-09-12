@@ -8,9 +8,9 @@ import helpers from '../helpers.js';
 
 const {
   escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml,
-  parsePaymentItems, renderMoneyTotalsHtml, balanceParts, periodSegHtml, rangeLabel,
+  parsePaymentItems, renderMoneyTotalsHtml, periodSegHtml, rangeLabel,
   navSections, defaultSection, sectionNavHtml, salesTabs, stockTabs, moneyTabs, clientsTabs,
-  formatMoney, msBalanceLabel, emptyState, skeleton, errorBoxHtml,
+  formatMoney, emptyState, skeleton, errorBoxHtml,
   machineStatusLabel, machineSubtitle, machineStatusSegHtml,
   moneyBlockLabel, agingBarsHtml, forecastRowsHtml, buyerKey, leadFunnelHtml,
   firstTouchHtml, replySpeedHtml, durationLabel, postEffectLabel,
@@ -42,19 +42,6 @@ describe('periodSegHtml (WP-29)', () => {
     expect(html).toContain('data-operiod="custom"');
     expect(html).toContain('01.06—12.06');  // показывает выбранный диапазон
     expect(html).toMatch(/seg-aux active/);
-  });
-});
-
-describe('balanceParts (WP-27)', () => {
-  it('<0 → клиент должен (owe), сумма по модулю', () => {
-    expect(balanceParts(-150000, 'USD')).toEqual({ state: 'owe', amount: '1 500', currency: 'USD' });
-  });
-  it('>0 → аванс (adv)', () => {
-    expect(balanceParts(5000, 'UZS')).toEqual({ state: 'adv', amount: '50', currency: 'UZS' });
-  });
-  it('0 → zero, null → none', () => {
-    expect(balanceParts(0, 'USD').state).toBe('zero');
-    expect(balanceParts(null, 'USD').state).toBe('none');
   });
 });
 
@@ -413,31 +400,6 @@ describe('formatMoney (UI-WP-05)', () => {
 
   it('ноль — это сумма, а не пустое место', () => {
     expect(formatMoney(0, 'UZS')).toBe('0 UZS');
-  });
-});
-
-describe('msBalanceLabel (UI-WP-05)', () => {
-  it('отрицательный баланс МС = клиент должен нам', () => {
-    const b = msBalanceLabel(-125000, 'USD');
-    expect(b.tone).toBe('owe');
-    expect(b.text).toContain('должен');
-    expect(b.text).toContain('USD');
-  });
-
-  it('положительный баланс = аванс', () => {
-    expect(msBalanceLabel(50000, 'USD').tone).toBe('advance');
-  });
-
-  it('ноль отличается от «нет данных»', () => {
-    expect(msBalanceLabel(0, 'USD').tone).toBe('zero');
-    expect(msBalanceLabel(null, 'USD').tone).toBe('none');
-    expect(msBalanceLabel(null, 'USD').text).toBe('—');
-  });
-
-  it('подпись одна и та же для обоих экранов — расхождения формулировок больше нет', () => {
-    const fromClients = msBalanceLabel(-1000, 'USD');
-    const fromDetail = msBalanceLabel(-1000, 'USD');
-    expect(fromClients.text).toBe(fromDetail.text);
   });
 });
 

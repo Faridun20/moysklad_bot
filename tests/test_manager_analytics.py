@@ -100,34 +100,6 @@ def test_manager_performance_empty(isolated_db):
     ) == []
 
 
-def test_manager_performance_excludes_ms_deleted(isolated_db):
-    """Заказ, удалённый в МойСклад (ms_deleted_at стоит), не попадает в аналитику —
-    даже если локальный статус остался shipped (фантомная выручка). Долговой учёт
-    при этом не трогаем (это про аналитику)."""
-    db = isolated_db
-    db.set_role(10, "m1", "M1", "manager")
-
-    # «Живой» shipped-заказ — должен учитываться.
-    o_live = db.create_order(10, "M1", "")
-    db.update_order_agent(o_live, "A-1", "C1")
-    db.add_order_item(o_live, "P", "", 1, "шт", 100.0)
-    db.update_order_status(o_live, "shipped")
-
-    # Заказ, удалённый в МС, но локально оставшийся shipped — фантом.
-    o_ghost = db.create_order(10, "M1", "")
-    db.update_order_agent(o_ghost, "A-2", "C2")
-    db.add_order_item(o_ghost, "P", "", 5, "шт", 100.0)
-    db.update_order_status(o_ghost, "shipped")
-    assert asyncio.run(db.set_order_ms_deleted(o_ghost)) is True
-    # Повторный вызов идемпотентен (ms_deleted_at уже стоит).
-    assert asyncio.run(db.set_order_ms_deleted(o_ghost)) is False
-
-    rows = asyncio.run(
-        db.get_manager_performance("2000-01-01 00:00:00", "2999-01-01 00:00:00")
-    )
-    assert len(rows) == 1
-    assert rows[0]["orders_count"] == 1          # только живой заказ
-    assert rows[0]["revenue"] == 100.0           # фантомные 500 исключены
 
 
 def test_manager_performance_orders_count_excludes_cancelled_rejected(isolated_db):

@@ -13,11 +13,14 @@
 ## 1. Что это вообще такое
 
 Telegram-бот + Web App (Mini App в чате) для управления заказами и
-отгрузками поверх облачного товароучётного сервиса **МойСклад**. Внутренний
-инструмент компании: менеджеры собирают заказы и фиксируют оплаты,
-руководители одобряют отгрузки и подтверждают поступление денег. Снимок
-склада/каталога локально кешируется в Postgres, чтобы UI работал мгновенно
-и не упирался в rate-limit'ы МойСклад.
+отгрузками и складом. Внутренний инструмент компании: менеджеры собирают
+заказы и фиксируют оплаты, руководители одобряют отгрузки и подтверждают
+поступление денег.
+
+Учёт **полностью локальный**: каталог, остатки, контрагенты, приходные и
+расходные накладные живут в нашем Postgres. Раньше всё это было в облачном
+МойСклад, и бот лишь создавал там документы; интеграция удалена целиком —
+остался только одноразовый скрипт переноса `scripts/migrate_from_moysklad.py`.
 
 Ключевые сущности:
 
@@ -43,8 +46,8 @@ Telegram-бот + Web App (Mini App в чате) для управления з�
                 ┌──────────────────┐
                 │  moysklad_bot    │  Python, BOT_MODE=bot
                 │  - polling       │  Telegram Bot API → бот
-                │  - notifier      │  фон: РЕЗЕРВНЫЙ поллер отгрузок
-                │  - snapshot      │  фон: обновление кеша справочников
+                │                  │  фоновых циклов нет: синхронизировать
+                │                  │  не с чем, учёт локальный
                 └────────┬─────────┘
                          │
                          │ DB-ссылки
@@ -61,7 +64,6 @@ Telegram-бот + Web App (Mini App в чате) для управления з�
                 │     Webapp       │  Python, BOT_MODE=webapp
                 │  - FastAPI       │  принимает /api/* запросы от UI
                 │  - /healthz      │  healthcheck Railway
-                │  - /api/ms-webhook/<secret>  ← вебхук от МойСклад
                 │  - статика app.js/index.html │
                 └──────────────────┘
                          ▲
@@ -78,7 +80,6 @@ Telegram-бот + Web App (Mini App в чате) для управления з�
 - **`cron-debts`** — `python -m tasks.run_debts_notify` ежедневно ~6:00 UTC.
 - **`cron-ops`** — `python -m tasks.run_ops_monitor` 1×/день: короткий пинг
   «есть N событий — откройте WebApp» (сводки/отчёты смотрят в WebApp).
-- **`cron-ms-reconcile`** — `python -m tasks.run_ms_reconcile` ежечасно.
 - (Отдельных `cron-daily/weekly/monthly` для отчётов больше нет — отчёты и
   аналитику смотрят в WebApp.)
 
@@ -93,10 +94,8 @@ Telegram-бот + Web App (Mini App в чате) для управления з�
 | Переменная | Назначение |
 |---|---|
 | `TELEGRAM_TOKEN` | Токен бота от @BotFather |
-| `MS_TOKEN` | API-токен МойСклад |
 | `DATABASE_URL` | Postgres-подключение (`${{Postgres.DATABASE_URL}}`) |
 | `REDIS_URL` | Redis (`${{Redis.REDIS_URL}}`). Если пусто — FSM работает в памяти |
-| `MS_WEBHOOK_SECRET` | Секрет в URL вебхука МойСклад |
 | `WEBAPP_URL` | Публичный домен webapp-сервиса (без `/` в конце) |
 | `TG_USE_WEBHOOK` | `1` → бот принимает апдейты через webhook, иначе polling |
 | `TG_WEBHOOK_SECRET` | Секрет для проверки запросов от Telegram (обязателен в webhook-режиме) |
@@ -106,7 +105,6 @@ Telegram-бот + Web App (Mini App в чате) для управления з�
 | `ALLOWED_USERS` | CSV id, кому давать роль `manager` по умолчанию |
 | `BASE_CURRENCY` | По умолчанию `USD`, валюта для UI |
 | `TZ` | Часовой пояс контейнера. Им же пишется `created_at` (`utils.helpers.local_now`), поэтому должен совпадать с бизнес-зоной |
-| `CHECK_INTERVAL_SEC` | Интервал РЕЗЕРВНОГО поллера отгрузок (осн. канал — вебхук), сек, default 900 |
 | `PG_POOL_MIN`, `PG_POOL_MAX` | Размер пула psycopg2 (default 1/10) |
 | `SQL_SLOW_MS` | Порог логирования медленных запросов, мс (default 200) |
 
@@ -116,8 +114,8 @@ Telegram-бот + Web App (Mini App в чате) для управления з�
 
 - `all` (по умолчанию) — один процесс делает всё: Telegram-loop, FastAPI,
   фоновые задачи. Удобно для локальной разработки и маленьких деплоев.
-- `bot` — только Telegram (polling) + фоновые задачи (notifier, snapshot).
-  Не поднимает FastAPI. Используется в `moysklad_bot`-сервисе на Railway.
+- `bot` — только Telegram (polling). Не поднимает FastAPI. Используется в
+  `moysklad_bot`-сервисе на Railway.
 - `webapp` — только FastAPI. Не обрабатывает Telegram-апдейты (если не
   включён `TG_USE_WEBHOOK=1`). Используется в `Webapp`-сервисе.
 
@@ -166,8 +164,8 @@ user_id BIGINT PK
 username TEXT
 full_name TEXT
 role TEXT NOT NULL DEFAULT 'manager'
-moysklad_employee_id TEXT      -- связь с сотрудником МойСклад
-ms_sync_status TEXT            -- 'pending' | 'linked'
+moysklad_employee_id TEXT      -- legacy: связь с сотрудником МойСклад, не читается
+ms_sync_status TEXT            -- legacy, там же
 created_at TEXT
 ```
 
@@ -180,7 +178,8 @@ full_name TEXT                 -- его имя (для отображения)
 status TEXT NOT NULL DEFAULT 'draft'
                                -- draft | pending | approved | rejected | shipped
 comment TEXT
-agent_id TEXT                  -- контрагент МойСклад (UUID)
+agent_id TEXT                  -- counterparties.id СТРОКОЙ (у старых строк — UUID МС,
+                               --   пока их не переписал backfill_local_identifiers)
 agent_name TEXT
 currency TEXT                  -- USD | UZS | RUB | EUR
 payment_type TEXT NOT NULL DEFAULT 'paid'   -- 'paid' | 'credit'
@@ -209,7 +208,8 @@ INDEX idx_orders_credit_due (payment_type, paid_at, due_date)
 id SERIAL PK
 order_id BIGINT
 product_name TEXT
-product_href TEXT              -- ссылка на товар в МойСклад
+product_href TEXT              -- legacy: ссылка на товар МойСклад. Карточка нашей
+                               --   номенклатуры — в order_item_products(item_id → product_id)
 quantity REAL DEFAULT 1
 unit TEXT DEFAULT 'шт'
 price REAL DEFAULT 0           -- цена за единицу в order.currency
@@ -232,8 +232,8 @@ approved_at TEXT
 ```
 
 Когда `boss` одобряет заявку, `update_order_status(order_id, 'approved')`
-двигает связанный заказ. Из одобренного заказа `services/ms_demand.py`
-создаёт документ `demand` в МойСклад.
+двигает связанный заказ, а `services/order_shipment.py` проводит расходную
+накладную — она и списывает остаток.
 
 ### `payments` — отдельные платежи (не привязаны к заказам)
 
@@ -254,23 +254,8 @@ confirmed_at TEXT
 произвольные платежи в кассу, не связанные с заказом (`/pay` в боте).
 Менеджер их создаёт, босс подтверждает.
 
-Дополнительные колонки для синхронизации с МойСклад:
-- `ms_paymentin_id TEXT` — id входящего платежа в МС (NULL = ещё не sync'нут)
-- `ms_sync_status TEXT` — `NULL` / `'in_progress'` / `'synced'` / `'failed'`
-- `ms_sync_error TEXT` — текст последней причины фейла (для `/sync_payments` UI)
-
-**Жизненный цикл `ms_sync_status`:**
-- `NULL` → `'in_progress'` (атомарный `claim_payment_for_ms_sync` ставит «застолблено»)
-- `'in_progress'` → `'synced'` (после успешного POST `entity/paymentin`, заодно ставится `ms_paymentin_id`)
-- `'in_progress'` → `'failed'` (HTTP/network error; `ms_sync_error` записывается)
-- `'failed'` → попадает обратно в очередь `get_payments_needing_ms_sync` (фильтр на `ms_paymentin_id IS NULL`)
-
-**Reaper для orphan'ов:** если процесс убили mid-claim (Railway SIGTERM, OOM,
-длинный init_demand_context'а), строка останется в `'in_progress'` навсегда — 
-`claim_payment_for_ms_sync` отвергает уже-`'in_progress'`. Защита — функция
-`reset_stale_in_progress_payments(older_than_minutes=30)`, вызывается в
-самом начале `tasks/run_ms_sync_retry.main()`. Сбрасывает orphan-строки
-обратно в `NULL`, следующий cron-tick их подберёт.
+Колонки `ms_paymentin_id` / `ms_sync_status` / `ms_sync_error` остались от
+интеграции с МойСклад и больше не читаются: платежи никуда не уезжают.
 
 ### `audit_log`
 
@@ -287,35 +272,32 @@ created_at TEXT
 
 Пишется на каждое чувствительное действие. Просмотр через `/audit` в боте.
 
-### Snapshot МойСклад
-
-Локальная копия справочников, обновляется фоном:
+### Локальный склад
 
 ```
-ms_products       (товары: ms_id, name, folder_id, code, unit, href, updated_at)
-ms_categories     (папки товаров)
-ms_counterparties (контрагенты)
-ms_employees      (сотрудники)
-ms_stock          (остатки: stock, reserve по товару)
-ms_snapshot_meta  (когда последний раз обновлялось, dataset → last_refresh)
+products          (номенклатура: name, category, sku, unit, legacy_ms_id)
+counterparties    (контрагенты: name, type, phone, telegram_id, legacy_ms_id)
+warehouses        (склады; по умолчанию один — сеет seed_warehouses)
+stock             (остаток по паре товар+склад, PK (product_id, warehouse_id))
+invoices          (накладная: type incoming|outgoing, номер, дата, статус, сумма)
+invoice_items     (позиции накладной)
+invoice_counters  (счётчик номеров по паре тип+год)
 ```
 
-Зачем: WebApp и handlers поверх snapshot работают мгновенно. Live API
-МойСклад дёргается только если snapshot пуст (первый старт) или если
-нужны live-данные (создание demand).
+Движение остатка проходит ТОЛЬКО через `services/warehouse.py`: номер, шапка,
+строки и остаток пишутся одной транзакцией, остаток не уходит в минус,
+параллельные накладные по одному товару сериализуются `FOR UPDATE`.
 
-### `notified_shipments` — дедуп уведомлений об отгрузках
+Связки, из-за которых нельзя было обойтись колонкой (инкрементальных миграций
+в проекте нет):
 
 ```
-demand_id   TEXT PRIMARY KEY
-notified_at TEXT
+order_item_products    (позиция заказа → карточка товара)
+order_shipment         (заказ → расходная накладная; failed_at/error для дайджеста)
+container_item_products(позиция контейнера → карточка товара)
+container_receipt      (контейнер → поставщик + приходная накладная)
+ms_id_map              (UUID МойСклад → наш id; артефакт миграции)
 ```
-
-Один demand → одно уведомление, независимо от источника. И MS-вебхук
-(webapp-процесс), и резервный поллер (bot-процесс) перед отправкой делают
-атомарный `mark_shipment_notified(demand_id)` (INSERT-if-absent); PRIMARY KEY
-+ общий Postgres решают гонку между процессами. Старьё чистит
-`prune_notified_shipments()` (≈раз в сутки из поллера).
 
 ### Индексы
 
@@ -326,8 +308,8 @@ notified_at TEXT
 `idx_shipment_requests_one_pending (order_id) WHERE status='pending'` (закрывает
 двойной сабмит на уровне БД), `idx_returns_one_pending (order_id) WHERE
 status='pending'`, `idx_orders_ms_customerorder` / `idx_orders_ms_demand`
-(partial, `WHERE ... IS NOT NULL` — однозначность обратного поиска по документам
-МС), unique `idx_payments_ms_paymentin_unique`.
+(partial, `WHERE ... IS NOT NULL` — остались от МойСклад, обратного поиска по
+ним больше нет), unique `idx_payments_ms_paymentin_unique`.
 
 **Под реальные фильтры:** `idx_orders_debt_lookup (payment_type, status,
 paid_confirmed_at)` — под `get_open_debts`; `idx_orders_status`,
@@ -336,8 +318,9 @@ paid_confirmed_at)` — под `get_open_debts`; `idx_orders_status`,
 `idx_payments_pending (status) WHERE status='pending'`;
 `idx_cash_deposit_orders_order (order_id)` — PK `(deposit_id, order_id)` для
 поиска по `order_id` не работает; `idx_user_roles_role (role)`;
-`idx_shipment_requests_status`, индексы `created_at` денежных лент и
-snapshot-таблиц.
+`idx_shipment_requests_status`, индексы `created_at` денежных лент,
+`idx_order_item_products_*` и `idx_order_shipment_failed` (дайджест «остаток не
+списан»).
 
 ---
 
@@ -361,7 +344,7 @@ push → все boss/admin
    ├─ [boss] одобрил
    │     shipment_request: status=approved
    │     order: status=approved
-   │     ms_demand.create_demand_from_request → demand-документ в МойСклад
+   │     order_shipment.ship_order → расходная накладная, остаток списан
    │
    └─ [boss] отклонил
          shipment_request: status=rejected
@@ -420,94 +403,85 @@ tasks.run_ops_monitor` собирает счётчики (`services/ops_summary.
 
 ---
 
-## 6. Интеграция с МойСклад
+## 6. Склад
 
-### 6.1 HTTP-слой
+### 6.1 Движение остатка
 
-`services/moysklad.py` — общая обёртка над REST API МойСклад.
+`services/warehouse.py` — единственное место, где меняется `stock`.
 
-- Один persistent `aiohttp.ClientSession` (`get_session()`).
-- Ретраи с экспоненциальной задержкой на 429/5xx и сетевых ошибках.
-- TTL-кэш с inflight-coalescing для `get_shipments` / `get_sales_stats`
-  / `get_shipment_positions` (декоратор `_ms_ttl_cache`). Это спасает
-  от 429, когда несколько боссов одновременно открывают «Аналитику».
-- `get_shipment_positions(demand_id)` пагинирует через offset-loop
-  (`limit=100` на страницу) — крупные B2B-заказы с >100 line items
-  собираются полностью, иначе хвост молча терялся в `top_products`.
-- Concurrency `/positions` ограничен через `_get_positions_semaphore()`
-  (lazy semaphore по `id(running_loop)`, cap=8). Без него `asyncio.gather`
-  на 15+ demand'ов в одном `/api/analytics` стабильно бьёт 429-rate-limit
-  МС, вызывая retry-цепочки 0.5/1.0/2.0с и заметную latency у боссов.
-  Не используй module-level `asyncio.Semaphore()` — он биндится к первому
-  loop'у при contention и валит cross-loop тесты (`asyncio.run` ×N).
-- `cache_clear()` декоратора `_ms_ttl_cache` чистит ТОЛЬКО `cache`, не
-  `locks`. Иначе MS-webhook `invalidate_ms_cache()` race'ит с in-flight
-  winner'ом: winner держит локальный `lock`, мы стираем dict-entry,
-  следующий caller создаёт свежий lock и запускает второй HTTP
-  параллельно → inflight-coalescing нарушено. Stale `locks[key]` сидят
-  безвредно до stale-prune при `len(cache)>200`.
-- На каждом cache-miss при exception в `await fn(...)` делается
-  `locks.pop(key, None)` (BaseException-safe, под `try/except`) — иначе
-  для consistently-failing demand_id'ов (404, deleted) lock leaks вечно.
+- `create_invoice` / `cancel_invoice` — публичные обёртки; номер, шапка,
+  строки и остаток пишутся ОДНОЙ транзакцией.
+- `create_invoice_in` / `cancel_invoice_in` — то же внутри уже открытой
+  транзакции; при отказе БРОСАЮТ `InvoiceError`, а не возвращают «не ок»
+  словарём, который вызывающий спокойно закоммитит вместе со своими записями.
+- Остаток не уходит в минус: нехватка хотя бы по одной позиции откатывает ВСЮ
+  накладную — частичных списаний не бывает.
+- Позиции сортируются по `product_id` перед захватом `FOR UPDATE`: без этого
+  две накладные с составом [A,B] и [B,A] берут строки в обратном порядке и
+  получают взаимный deadlock на Postgres.
+- Повторы одного товара схлопываются ДО проверки остатка: `[A×6, A×6]` при
+  остатке 10 иначе проходит обе построчные проверки и уводит остаток в −2.
+- Номер (`IN-2026-0001` / `OUT-2026-0001`) выдаёт UPSERT по
+  `invoice_counters` внутри той же транзакции: два параллельных создателя
+  получают разные номера, а откат не оставляет дырки в нумерации.
 
-### 6.2 Snapshot
+### 6.2 Отгрузка заказа
 
-`services/snapshot.py` — локальная копия справочников.
+`services/order_shipment.py:ship_order` списывает одобренный заказ расходной
+накладной. Идемпотентность — PRIMARY KEY `order_shipment.order_id`: повторное
+одобрение (два босса, ретрай, старая кнопка) не спишет товар дважды.
 
-- `refresh_*` функции качают данные постранично и пишут в БД.
-- `snapshot_refresh_task` (фон в bot-процессе):
-  - раз в день в 06:00 UTC — `refresh_reference()` (товары, категории,
-    контрагенты, сотрудники).
-  - каждые 2 часа — `refresh_stock()` как safety-net.
-- `_stock_debounce_loop` — реагирует на флаг `mark_stock_dirty()` который
-  ставится из webhook-handler'а; делает `refresh_stock()` через 5 секунд
-  после первого события (батч).
+Позиция без карточки номенклатуры в накладную не попадает и возвращается в
+`skipped` — босс видит это в тексте одобрения. Не списалось совсем (не хватило
+остатка, ничего не сопоставлено) — заказ помечается `failed_at`/`error` и
+попадает в дайджест «нужна доделка»; само одобрение при этом НЕ откатывается:
+его принял человек.
 
-### 6.3 Webhook от МойСклад
+Отмена заказа (`order_workflow.cancel_order_full`) откатывает накладную и
+возвращает остаток. Best-effort и ПОСЛЕ локальной отмены: ошибка склада не
+должна отменять то, что оператор уже подтвердил.
 
-`webapp/server.py:ms_webhook` принимает POST'ы от МойСклад. URL:
-`{WEBAPP_URL}/api/ms-webhook/{MS_WEBHOOK_SECRET}`.
+### 6.3 Приёмка контейнера
 
-При получении события:
-1. Проверяет секрет в URL (404 если не совпадает — молчим).
-2. Логирует тип событий.
-3. Ставит `mark_stock_dirty()` (фоновый refresh подхватит).
-4. Сбрасывает `invalidate_ms_cache()` — все аналитические кэши
-   протухают, чтобы свежий запрос показал актуальные цифры.
-5. На `demand.CREATE` / `retaildemand.CREATE` запускает (fire-and-forget)
-   `notifier.notify_new_shipment(demand_id)` — уведомление boss/admin о новой
-   отгрузке **мгновенно** (раньше это делал поллер раз в N секунд). Дедуп через
-   `notified_shipments`; бот-созданные demand'ы (атрибут `telegram_user_id`)
-   пропускаются. `shipment_notifier` остаётся резервом на случай пропущенного
-   вебхука.
+`services/container_receipt.py:receive` — приходная накладная по посчитанному
+контейнеру. Повторная приёмка = отмена прежней накладной + создание новой
+одной транзакцией: количества правят сутки (`containers.EDIT_WINDOW_HOURS`), и
+остаток обязан ехать за ними.
 
-Подписка регистрируется автоматически на старте бота через
-`services.ms_webhooks.ensure_subscriptions()`. Идемпотентно: при смене
-`WEBAPP_URL` или `MS_WEBHOOK_SECRET` старые подписки удаляются, новые
-ставятся.
+Контейнер, оприходованный ещё в МойСклад (`received_at` стоит, `invoice_id`
+пуст), к повторному приходу не допускается: его остаток приехал миграцией, и
+вторая накладная прибавила бы товар второй раз.
 
-### 6.4 Создание demand
+### 6.4 Каталог и аналитика продаж
 
-`services/ms_demand.py:create_demand_from_request` создаёт документ
-«Отгрузка» в МойСклад из одобренной заявки.
+Читающая часть — там же, в `warehouse.py`:
 
-- Резолвит первую доступную организацию, склад, ставит кастомный атрибут
-  `telegram_full_name` (его потом группирует аналитика, иначе все
-  отгрузки прилипают к owner=API-token).
-- Идёт в `entity/demand`, прикладывает позиции.
+- `get_catalog` — остаток, резерв и доступное по каждому товару. Резерв
+  локально это одобренные, но не отгруженные заказы; доступное = остаток −
+  резерв, и в каталог идёт именно оно.
+- `sales_stats` / `list_shipments` / `counterparty_purchases` — выручка, топ
+  товаров и клиентов по расходным накладным. Отменённые накладные в выручку не
+  идут: отмена вернула товар на склад, продажи не было.
+- Границы периода считает `_upper_bound`: `invoice_date` — ДАТА, а границы
+  приходят моментами, и полуинтервал с обрезкой до дня ломает «сегодня».
+  Полночь исключаем, любое другое время дня включаем.
 
-Контекст организации/склада подгружается один раз при старте через
-`init_demand_context()`. Функция НЕ бросает exception (helpers
-`_pick_first` / `_ensure_custom_attribute` глотают сетевые сбои и
-возвращают None), вместо этого возвращает dict с булевыми флагами
-`ready/org/store/attribute_name/attribute_uid`. Callers инспектируют
-dict-возврат, а не оборачивают вызов в `try/except` (был dead code в
-старой версии `run_ms_sync_retry`).
+### 6.5 Разовый перенос из МойСклад
 
-В bot-процессе `init_demand_context()` вызывается в `main()` при старте.
-В cron-CLI (`tasks/run_ms_sync_retry`) — лениво: только если есть
-pending платежи. Без этой оптимизации 96 cron-тиков/день делали бы
-~200-400 МС API calls впустую на noop-прогонах.
+`scripts/migrate_from_moysklad.py` — единственное, что ещё знает про МС.
+Держит СВОЙ минимальный HTTP-клиент: он обязан пережить удаление интеграции,
+иначе перенос перестанет воспроизводиться ровно тогда, когда ещё может
+понадобиться (аккаунт МС живёт месяц-другой после переключения).
+
+Сверка с нулевым допуском: расхождение в остатках даёт ненулевой код выхода и
+обязано блокировать переключение — обратной синхронизации после перехода нет.
+
+`database.backfill_local_identifiers` (из `tasks/migrate`) переводит старые
+ссылки — `orders.agent_id`, `credit_limits.agent_id`, `leads.agent_ms_id`,
+`machine_deals.agent_ms_id`, `product_prices.ms_id`, `product_photos.ms_id`,
+позиции заказов — с UUID МойСклад на наши id. Пока этого не сделано, один и
+тот же клиент существует под двумя ключами, и долг по нему считается дважды
+по половинке.
 
 ---
 
@@ -520,18 +494,20 @@ pending платежи. Без этой оптимизации 96 cron-тико�
 - `bot.py` — точка входа, регистрирует роутеры, поднимает middleware и
   ветвится по `BOT_MODE`.
 T3.3: бот срезан до того, чего нет в WebApp. Экраны-дубли (создание заказа с
-каталогом МойСклад, списки заказов и заявок, остатки, долги, аналитика, касса,
+каталогом, списки заказов и заявок, остатки, долги, аналитика, касса,
 сдачи, возвраты, кредит-лимиты, курсы, цены) удалены вместе с
 `handlers/{analytics,stock,credit,pricing,debts}.py`; их команды отвечают
 подсказкой `handlers.start.cmd_retired` со ссылкой на экран WebApp.
 
-- `handlers/start.py` — `/start`, меню (вход в WebApp), `/find`, `/refresh`,
-  `/snapshot`, подсказка по снятым командам.
+- `handlers/start.py` — `/start`, меню (вход в WebApp), `/find`, подсказки по
+  снятым командам (`cmd_retired`) и по удалённым вместе с МойСклад
+  (`cmd_removed`: `/syncms`, `/msstaff`, `/refresh`, `/snapshot`,
+  `/sync_payments`).
 - `handlers/orders.py` — решения по заявке (одобрить / отклонить / на доработку /
   с превышением лимита), карточка заказа для чтения, `/frozen` + разморозка.
   Плюс форматтеры карточек, которые зовёт WebApp при создании заявки.
 - `handlers/payments.py` — `/pay` (платёж в кассу), подтверждение/отклонение
-  платежа кнопками, `/sync_payments` со статусом МС-синка и retry.
+  платежа кнопками.
 - `handlers/deposits.py` — подтверждение/отклонение сдачи наличных кнопками.
 - `handlers/returns.py` — приёмка товара и подтверждение возврата кнопками.
 - `handlers/shipments.py` — `/shipments`, просмотр новых отгрузок.
@@ -591,7 +567,7 @@ T3.3: бот срезан до того, чего нет в WebApp. Экраны
 | `/static/...` | GET | CSS/JS с Cache-Control 24h |
 | `/api/me` | POST | вернуть user_id + role |
 | `/api/home` | POST | главный экран (свод дня, мои заказы, лидерборд для босса) |
-| `/api/stock` | POST | список товаров + категорий (через snapshot) |
+| `/api/stock` | POST | каталог: остаток, резерв, доступное, цены |
 | `/api/analytics` | POST | агрегаты продаж за период |
 | `/api/payments/history` | POST | история платежей юзера |
 | `/api/payments/send` | POST | отправить платёж на подтверждение |
@@ -606,12 +582,12 @@ T3.3: бот срезан до того, чего нет в WebApp. Экраны
 | `/api/orders/confirm_payment` | POST | boss подтверждает поступление (idempotency_key) |
 | `/api/orders/reject_payment` | POST | boss отклоняет |
 | `/api/orders/delete_draft` | POST | удалить черновик (каскадно) |
-| `/api/requests/approve` | POST | boss одобряет заявку (DB + МойСклад + PDF + уведомления) |
+| `/api/requests/approve` | POST | boss одобряет заявку (DB + накладная + PDF + уведомления) |
 | `/api/requests/reject` | POST | boss отклоняет заявку |
 | `/api/payments/pending` | POST | paid-заказы, ждущие подтверждения оплаты (boss) |
 | `/api/debts` | POST | список долгов + суммы получено/ожидает |
 | `/api/agents` | POST | поиск контрагентов |
-| `/api/ms-webhook/{secret}` | POST | вебхук от МойСклад |
+| `/api/wh/invoices` | POST | список накладных; `/api/wh/invoices/{get,create,cancel,send}` — карточка, проведение, отмена, PDF клиенту |
 | `/tg/{secret}` | POST | вебхук от Telegram (только если включён режим) |
 
 ### 8.3 Фронт
@@ -661,25 +637,15 @@ psycopg2 + threadpool + кэш ролей закрывает реальные п
 | Где | Что | TTL |
 |---|---|---|
 | `services/roles.py` | роль по `user_id` | 60 сек |
-| `services/moysklad.py` `_api_get_all_stock` | сырой ответ `/report/stock/all` | 30 сек |
-| `services/moysklad.py` `get_shipments`, `get_sales_stats`, `get_employee_*` | через декоратор `_ms_ttl_cache` | 60 сек |
-| `services/moysklad.py` `get_shipment_positions` | через декоратор | 1 час (позиции иммутабельны) |
-| `services/snapshot.py` | snapshot МойСклад | day (справочники) / 2h (остатки) |
 
 Принудительная инвалидация:
 
 - При изменении роли — `services.database` лениво зовёт
   `services.roles.invalidate_role(user_id)`.
-- При вебхуке от МойСклад — `invalidate_ms_cache()` чистит все
-  `_ms_ttl_cache` сразу.
 
-Concurrency-ограничители (не TTL, но рядом по смыслу):
-
-- `services/moysklad._get_positions_semaphore()` — lazy `asyncio.Semaphore(8)`
-  по `id(running_loop)`, ограничивает cold-cache fan-out `get_shipment_positions`.
-  Cache-hit семафор не трогает (декоратор `_ms_ttl_cache` отдаёт до тела).
-  Lazy-by-loop — чтобы short-lived `asyncio.run()` в CLI и per-test loops
-  в pytest не словили `RuntimeError: bound to a different event loop`.
+Складских кэшей нет и не нужно: запросы локальные. Прежние TTL-кэши поверх
+МойСклад ушли вместе с интеграцией — вместе с классом ошибок «показали
+устаревшие цифры, потому что кэш не сбросился».
 
 ---
 
@@ -691,7 +657,7 @@ Concurrency-ограничители (не TTL, но рядом по смысл�
 | Добавить новое поле в заказ | `services/database.py:init_db` (тут CREATE TABLE + migrations) + использовать в `webapp/server.py` API endpoints |
 | Добавить экран в WebApp | `webapp/static/index.html` (nav button), `webapp/static/app.js` (`case '...':` + `render*()`), `webapp/static/style.css` |
 | Добавить команду в боте | новый файл в `handlers/`, зарегистрировать в `bot.py:register_routers` |
-| Изменить вебхук от МойСклад | `webapp/server.py:ms_webhook` + `services/ms_webhooks.py:ensure_subscriptions` |
+| Изменить движение остатка | `services/warehouse.py` (накладные), `services/order_shipment.py` (отгрузка заказа), `services/container_receipt.py` (приёмка) |
 | Изменить дневной пинг / операционную сводку | `tasks/run_ops_monitor.py` (пинг) + `services/ops_summary.py` (сбор) + `webapp/server.py:/api/ops-summary` |
 | Найти ошибку в проде | Railway Logs у нужного сервиса. Долгие SQL логируются как `SQL slow ...` через `SQL_SLOW_MS` (default 200мс) |
 | Понять что сейчас в БД | `services/database.py:init_db` — все таблицы там же |
@@ -702,8 +668,8 @@ Concurrency-ограничители (не TTL, но рядом по смысл�
 ## 12. Чего НЕТ сейчас (заметки на будущее)
 
 - **Полное** удаление psycopg2. Денежное ядро (order/payment/кредит/сдачи/
-  возвраты + `snapshot.refresh_*`) уже на native async `asyncpg` (`services/adb_core.py`);
-  psycopg2 остаётся для startup/миграций, snapshot-reads и backup-fallback.
+  возвраты) и склад уже на native async `asyncpg` (`services/adb_core.py`);
+  psycopg2 остаётся для startup/миграций и backup-fallback.
 - Связь между `payments` (отдельные платежи в кассу) и `orders` — разные сущности.
 - Полноценная per-permission система помимо фиксированных ролей (есть
   per-user permission overrides, но не полный RBAC).
@@ -711,12 +677,13 @@ Concurrency-ограничители (не TTL, но рядом по смысл�
 - Перевод бота на webhook на проде (код готов, `TG_USE_WEBHOOK=1`; сейчас polling).
 
 > Реализовано (раньше было «нет»): частичные оплаты; подтверждение оплаты;
-> событийные уведомления; **возвраты** (полные/частичные) + salesreturn;
+> событийные уведомления; **возвраты** (полные/частичные);
 > **сдачи наличных** (FIFO-закрытие); **кредит-лимиты с энфорсом** (override
 > боссом); **reject→draft + freeze**; **деактивация юзеров** (=guest);
 > **аналитика по менеджерам** (из локальных orders, WebApp); **конвертация
-> валют в сводных** («≈ X USD» через `convert_to_base`); **синхронизация
-> удаления заказа в МС** (вебхук + cron-реконсиляция); asyncpg money-core; pytest+CI.
+> валют в сводных** («≈ X USD» через `convert_to_base`); **полностью локальный
+> складской учёт** (каталог, остатки, накладные, PDF) вместо МойСклад;
+> asyncpg money-core; pytest+CI.
 
 ---
 
@@ -729,13 +696,15 @@ Concurrency-ограничители (не TTL, но рядом по смысл�
   `conftest.py`). Принцип: мокаем **границу с сетью** (`aioresponses` для
   aiohttp, `tg_send_message` на верхнем уровне), а не свой код — иначе баг в
   обёртке проходит CI (так и случилось с `tg_send_message`/`base_url`). Покрыты:
-  денежные инварианты, контракт МойСклад (meta demand/customerorder), регрессии
-  безопасности (все `/api/*` требуют initData; HTML-escape), дедуп уведомлений.
+  денежные инварианты, инварианты склада (остаток не в минус, порядок блокировок,
+  идемпотентность отгрузки), регрессии безопасности (все `/api/*` требуют
+  initData; HTML-escape).
 - **ruff** — строгий гейт (`E9,F63,F7,F82`) + полный набор (`E9,F,B,ASYNC,UP,SIM`).
-- **mypy** — точечно по `order_workflow/database/moysklad/server`, **блокирующий**
+- **mypy** — точечно по `order_workflow/database/warehouse/order_shipment/
+  container_receipt/counterparties/server`, **блокирующий**
   (0 ошибок). `pre-commit` — локальная первая линия.
 - **CI** (`.github/workflows/ci.yml`): ruff + mypy + pytest с coverage-«храповиком»
-  (`--cov-fail-under=25`).
+  (`--cov-fail-under=55`).
 - **Стартовый self-check** (`bot.py:_startup_selfcheck`): логирует `BOT_MODE` и
   проверяет, что Telegram-URL уведомлений собирается — ловит регресс на старте,
   а не «когда полезли в логи».

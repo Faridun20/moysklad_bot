@@ -48,24 +48,3 @@ def test_webapp_spawn_bg_success_no_error_log(caplog):
     assert not any("good" in r.getMessage() for r in caplog.records)  # успех не логируем
 
 
-def test_bot_spawn_startup_holds_ref_and_logs(caplog):
-    import bot
-
-    async def _run():
-        async def boom():
-            raise RuntimeError("boom-startup")
-
-        task = bot._spawn_startup(boom(), "init_demand")
-        # Пока задача в полёте — сильная ссылка держится.
-        assert task in bot._startup_tasks
-        await asyncio.sleep(0.05)
-        return task
-
-    with caplog.at_level(logging.ERROR):
-        task = asyncio.run(_run())
-
-    assert task.done()
-    assert task not in bot._startup_tasks  # discard после завершения
-    assert any(
-        r.levelno == logging.ERROR and "init_demand" in r.getMessage() for r in caplog.records
-    )

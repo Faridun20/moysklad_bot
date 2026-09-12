@@ -453,13 +453,13 @@ describe('техника: формы', () => {
 });
 
 describe('карточка клиента: состав отгрузки', () => {
-  const DEMAND = 'a1b2c3d4-1111-2222-3333-444455556666';
+  const INVOICE_ID = 17;
   const DETAIL = {
-    ok: true, agent_id: 'AG-1', name: 'Acme', phone: '', balance_cents: 0,
+    ok: true, agent_id: 'AG-1', name: 'Acme', phone: '',
     debt: 0, limit: 0, free: 0, orders: [], money_history: [], base_currency: 'USD',
     purchases: {
       count: 1, total_cents: 232000, top_products: [],
-      recent: [{ id: DEMAND, date: '2026-04-24 09:03', sum_cents: 232000 }],
+      recent: [{ id: INVOICE_ID, date: '2026-04-24', sum_cents: 232000 }],
     },
   };
   const POSITIONS = {
@@ -478,24 +478,24 @@ describe('карточка клиента: состав отгрузки', () =>
   `);
 
   it('отгрузка не тянет состав, пока её не открыли', async () => {
-    // Десять отгрузок — это десять запросов в МойСклад ради строк, которые
-    // чаще всего никто не раскроет, а бюджет запросов к МС общий на всех.
+    // Десять отгрузок — это десять запросов ради строк, которые чаще всего
+    // никто не раскроет.
     const window = bootAgent();
     await window.__ready;
     expect(window.__calls.map(c => c[0])).toEqual(['/api/clients/detail']);
-    expect(window.document.querySelector(`[data-shipment="${DEMAND}"]`)).not.toBeNull();
+    expect(window.document.querySelector(`[data-shipment="${INVOICE_ID}"]`)).not.toBeNull();
   });
 
   it('тап раскрывает позиции', async () => {
     const window = bootAgent();
     await window.__ready;
-    window.document.querySelector(`[data-shipment="${DEMAND}"]`).click();
+    window.document.querySelector(`[data-shipment="${INVOICE_ID}"]`).click();
     await new Promise(r => setTimeout(r, 0));
 
-    const box = window.document.getElementById(`shipment-${DEMAND}`);
+    const box = window.document.getElementById(`shipment-${INVOICE_ID}`);
     expect(box.hidden).toBe(false);
     expect(box.textContent).toContain('Кабель PV 0.6');
-    expect(window.__calls[1]).toEqual(['/api/clients/shipment', { demand_id: DEMAND }]);
+    expect(window.__calls[1]).toEqual(['/api/clients/shipment', { invoice_id: INVOICE_ID }]);
   });
 
   it('позиции выстроены строками с колонкой сумм, а не абзацем текста', () => {
@@ -531,15 +531,15 @@ describe('карточка клиента: состав отгрузки', () =>
     expect(html).toContain('240 USD');
   });
 
-  it('название товара экранируется — оно приходит из МойСклад', () => {
+  it('название товара экранируется — его вводит человек', () => {
     const window = boot('');
     expect(window.itemsBoxHtml([{ name: '<img src=x>', quantity: 1 }], 'USD')).not.toContain('<img');
   });
 
-  it('повторное открытие не ходит в МойСклад второй раз', async () => {
+  it('повторное открытие не ходит за составом второй раз', async () => {
     const window = bootAgent();
     await window.__ready;
-    const row = window.document.querySelector(`[data-shipment="${DEMAND}"]`);
+    const row = window.document.querySelector(`[data-shipment="${INVOICE_ID}"]`);
     row.click();
     await new Promise(r => setTimeout(r, 0));
     row.click();  // свернули
@@ -549,22 +549,24 @@ describe('карточка клиента: состав отгрузки', () =>
     expect(window.__calls.filter(c => c[0] === '/api/clients/shipment')).toHaveLength(1);
   });
 
-  it('сбой МойСклад показывается в строке и не блокирует повтор', async () => {
+  it('сбой показывается в строке и не блокирует повтор', async () => {
     const window = boot(`
       currentUser = { role: 'boss' };
       window.__tries = 0;
       api = async (path) => {
         if (path === '/api/clients/detail') return ${JSON.stringify(DETAIL)};
         window.__tries++;
-        throw new Error('МойСклад не ответил, попробуйте позже');
+        throw new Error('Сервер не ответил, попробуйте позже');
       };
       window.__ready = renderAgentDetail('AG-1');
     `);
     await window.__ready;
-    const row = window.document.querySelector(`[data-shipment="${DEMAND}"]`);
+    const row = window.document.querySelector(`[data-shipment="${INVOICE_ID}"]`);
     row.click();
     await new Promise(r => setTimeout(r, 0));
-    expect(window.document.getElementById(`shipment-${DEMAND}`).textContent).toContain('не ответил');
+    expect(
+      window.document.getElementById(`shipment-${INVOICE_ID}`).textContent
+    ).toContain('не ответил');
 
     row.click();  // свернули
     row.click();  // ошибку не кэшируем — вторая попытка должна уйти
@@ -1041,7 +1043,7 @@ describe('позиция контейнера: товар выбирают из 
   const ITEMS = [
     { id: 1, name: 'Штекер тип C', unit: 'шт', expected_qty: 5, state: 'unchecked' },
     { id: 2, name: 'Кабель PV 0.6', unit: 'м', expected_qty: 500, state: 'unchecked',
-      ms_id: 'p-1', ms_name: 'Кабель PV 0.6' },
+      product_id: 11, product_name: 'Кабель PV 0.6' },
   ];
 
   it('о позиции вне каталога говорят сразу, а не в момент оприходования', () => {
@@ -1067,7 +1069,7 @@ describe('позиция контейнера: товар выбирают из 
     currentUser = { role: 'manager' };
     window.__sent = null;
     api = async () => ({ ok: true, products: [
-      { ms_id: 'p-1', name: 'Кабель PV 0.6', unit: 'м' },
+      { product_id: 11, name: 'Кабель PV 0.6', unit: 'м' },
     ] });
     apiResult = async (path, body) => { window.__sent = body; return { ok: true, body: {} }; };
     renderContainerCard = async () => {};
@@ -1085,14 +1087,14 @@ describe('позиция контейнера: товар выбирают из 
     name.dispatchEvent(new window.Event('input'));
     await settle();
 
-    doc.querySelector('.product-suggest [data-ms="p-1"]').click();
+    doc.querySelector('.product-suggest [data-product="11"]').click();
     expect(name.value).toBe('Кабель PV 0.6');
     expect(doc.querySelector('#ms-f-unit').value).toBe('м');
 
     doc.querySelector('#ms-f-expected_qty').value = '500';
     doc.querySelector('#ms-submit').click();
     await settle();
-    expect(window.__sent.ms_id).toBe('p-1');
+    expect(window.__sent.product_id).toBe(11);
     expect(window.__sent.name).toBe('Кабель PV 0.6');
   });
 
@@ -1105,7 +1107,7 @@ describe('позиция контейнера: товар выбирают из 
     name.value = 'кабель';
     name.dispatchEvent(new window.Event('input'));
     await settle();
-    doc.querySelector('.product-suggest [data-ms="p-1"]').click();
+    doc.querySelector('.product-suggest [data-product="11"]').click();
 
     name.value = 'Кабель PV 0.6 чёрный';
     name.dispatchEvent(new window.Event('input'));
@@ -1114,7 +1116,7 @@ describe('позиция контейнера: товар выбирают из 
     doc.querySelector('#ms-f-expected_qty').value = '10';
     doc.querySelector('#ms-submit').click();
     await settle();
-    expect(window.__sent.ms_id).toBe('');
+    expect(window.__sent.product_id).toBe('');
     expect(window.__sent.name).toBe('Кабель PV 0.6 чёрный');
   });
 
@@ -1137,7 +1139,7 @@ describe('позиция контейнера: товар выбирают из 
     doc.querySelector('#ms-submit').click();
     await settle();
     expect(window.__sent.name).toBe('Штекер тип C');
-    expect(window.__sent.ms_id).toBe('');
+    expect(window.__sent.product_id).toBe('');
   });
 });
 
@@ -1854,11 +1856,11 @@ describe('правка контейнера', () => {
   });
 });
 
-describe('склад: локальные остатки и накладные', () => {
-  // Экраны живут не вкладками, а дочерними экранами раздела «Склад»: у босса
+describe('склад: остатки в «Каталоге» и накладные', () => {
+  // Накладные живут не вкладкой, а дочерним экраном раздела «Склад»: у босса
   // раздел уже занимает все четыре слота (инвариант «не больше 4 вкладок»).
-  // Регресс, который тут стережётся: после переезда на разделы main экраны
-  // остались в коде, но кнопки, ведущей к ним, не было — они были недостижимы.
+  // Регресс, который тут стережётся: после переезда на разделы main экран
+  // остался в коде, но кнопки, ведущей к нему, не было — он был недостижим.
 
   it('на дочернем экране подсвечен таб «Склад», а не пустота', async () => {
     // Проверяем наблюдаемое: экран не имеет своей кнопки в наве, и без
@@ -1867,8 +1869,8 @@ describe('склад: локальные остатки и накладные', 
     const window = boot(`
       currentUser = { role: 'boss' };
       buildNav();
-      api = async () => ({ products: [] });
-      window.__ready = showScreen('whremains');
+      api = async () => ({ invoices: [] });
+      window.__ready = showScreen('whinvoices');
     `);
     await window.__ready;
     const active = window.document.querySelector('.nav-item.active');
@@ -1876,30 +1878,34 @@ describe('склад: локальные остатки и накладные', 
     expect(active.dataset.screen).toBe('stock');
   });
 
-  it('на вкладке «Каталог» есть кнопки входа', () => {
+  it('на вкладке «Каталог» есть вход в накладные', () => {
     const window = boot(`
       currentUser = { role: 'boss' };
-      stockData = { products: [], categories: [], ms_unavailable: false };
+      stockData = { products: [], categories: [] };
       renderStockContent();
     `);
     const content = window.document.getElementById('content');
-    expect(content.querySelector('[data-wh-go="whremains"]')).not.toBeNull();
     expect(content.querySelector('[data-wh-go="whinvoices"]')).not.toBeNull();
   });
 
-  it('остатки рисуют товары и количества', async () => {
+  it('«Каталог» показывает доступный остаток и резерв', () => {
+    // Остатки склада и есть каталог: отдельного экрана для них нет, и обещать
+    // клиенту то, что уже обещано другому, нельзя — поэтому в строке
+    // доступное, а не полный остаток.
     const window = boot(`
       currentUser = { role: 'boss' };
-      api = async () => ({ products: [
-        { product_id: 1, name: 'Болт М8', sku: 'B8', unit: 'шт', quantity: 12, category: 'Крепёж' },
-        { product_id: 2, name: 'Гайка М8', sku: 'G8', unit: 'шт', quantity: 0, category: 'Крепёж' },
-      ]});
-      window.__ready = renderWhRemains();
+      stockData = { categories: [], products: [
+        { product_id: 1, name: 'Болт М8', unit: 'шт', stock: 12, reserve: 4, available: 8,
+          folder_name: 'Крепёж' },
+        { product_id: 2, name: 'Гайка М8', unit: 'шт', stock: 0, reserve: 0, available: 0,
+          folder_name: 'Крепёж' },
+      ]};
+      renderStockContent();
     `);
-    await window.__ready;
     const text = window.document.getElementById('content').textContent;
     expect(text).toContain('Болт М8');
-    expect(text).toContain('12');
+    expect(text).toContain('в резерве 4');
+    expect(text).toContain('8');
     // Нулевой остаток показывается словом, а не «0» — иначе его не отличить
     // от неизвестного.
     expect(text).toContain('нет');

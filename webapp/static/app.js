@@ -233,7 +233,7 @@ const LEGACY_SCREENS = {
 const SCREEN_TITLES = {
   today: null, sales: 'Продажи', stock: 'Склад', money: 'Деньги',
   clients: 'Клиенты', ops: 'Требует внимания',
-  whremains: 'Остатки склада', whinvoices: 'Накладные',
+  whinvoices: 'Накладные',
 };
 
 // Нижняя панель строится из таблицы разделов: набор кнопок зависит от роли.
@@ -255,12 +255,13 @@ function buildNav() {
 
 // Экраны, у которых нет своей кнопки, всё равно принадлежат разделу — иначе
 // при заходе в них ни один таб не подсвечивался.
-// Локальный складской учёт живёт отдельными экранами, а не вкладками: у босса
-// раздел «Склад» уже занимает все четыре слота, а пятая вкладка уезжает в
-// невидимый скролл на 360dp (инвариант под тестом в helpers.test.js). Вход —
-// кнопками из «Каталога». Когда на шаге 4 «Каталог» уедет вместе с МойСклад,
-// слот освободится и «Остатки» можно будет поднять во вкладку.
-const NAV_PARENT = { ops: 'today', whremains: 'stock', whinvoices: 'stock' };
+// «Накладные» живут отдельным экраном, а не пятой вкладкой: у босса раздел
+// «Склад» уже занимает все четыре слота, а пятая уезжает в невидимый скролл на
+// 360dp (инвариант под тестом в helpers.test.js). Вход — кнопкой из «Каталога».
+// Отдельного экрана «Остатки» больше нет: «Каталог» и ЕСТЬ остатки нашего
+// склада — после ухода МойСклад это один и тот же список, и держать два было
+// бы просто двумя дорогами к одной таблице.
+const NAV_PARENT = { ops: 'today', whinvoices: 'stock' };
 
 async function showScreen(screen) {
   // Алиас может нести и вкладку: 'sales:report' — раздел «Продажи», вкладка
@@ -315,9 +316,6 @@ async function showScreen(screen) {
         break;
       case 'ops':
         await renderOpsSummary();
-        break;
-      case 'whremains':
-        await renderWhRemains();
         break;
       case 'whinvoices':
         await renderWhInvoicesTab();
@@ -554,13 +552,7 @@ async function renderHome() {
   // ─── Action-grid: 4 быстрых действия. Склад и Заказы объединены
   //    в одной вкладке «Склад и заказы», поэтому в гриде разделяем
   //    «открыть каталог» и «создать заказ» по data-new флагу.
-  // ─── Предупреждение если не привязан к МойСклад ─────
-  const linkWarning = (!data.ms_linked && data.role === 'manager') ? `
-    <div class="warn-card">
-      ${icon('alert', 'warn-ic')} <b>Аккаунт не привязан к МойСклад.</b><br>
-      <span class="u-fs-12">Откройте чат с ботом и нажмите /start. Без привязки персональная аналитика недоступна.</span>
-    </div>
-  ` : '';
+  const linkWarning = '';
 
   // ─── Две ветки главной (UI-WP-14) ───────────────────
   // /api/home отдаёт РАЗНЫЕ данные менеджеру (свод по своим заказам) и
@@ -730,17 +722,11 @@ function renderStockList() {
   const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
 
   listEl.innerHTML = filtered.length === 0
-    ? (stockData.ms_unavailable
-        ? emptyState({
-            icon: 'alert',
-            title: 'Каталог недоступен',
-            hint: 'Не удалось загрузить товары из МойСклад. Проверьте подключение и токен — затем нажмите «Обновить».',
-          })
-        : emptyState({
-            icon: 'box',
-            title: 'Товары не найдены',
-            hint: 'Попробуйте изменить категорию или поисковый запрос',
-          }))
+    ? emptyState({
+        icon: 'box',
+        title: 'Товары не найдены',
+        hint: 'Попробуйте изменить категорию или поисковый запрос',
+      })
     : filtered.slice(0, stockLimit).map((p, i) => {
         // PR C: цена продажи (минимум) — всем; себестоимость — только boss.
         const priceLines = [];
@@ -755,10 +741,11 @@ function renderStockList() {
         <div class="c-row stock-row"${editAttr}>
           <div class="stock-info">
             <div class="stock-name">${escapeHtml(p.name)}</div>
-            <div class="stock-folder">${escapeHtml(p.folder_name || '—')} · ${p.unit}</div>
+            <div class="stock-folder">${escapeHtml(p.folder_name || '—')} · ${p.unit}${
+              p.reserve > 0 ? ` · в резерве ${whQty(p.reserve)}` : ''}</div>
             ${priceHtml}
           </div>
-          ${_stockBadge(p.stock)}${editHint}
+          ${_stockBadge(p.available != null ? p.available : p.stock)}${editHint}
         </div>`;
       }).join('');
 
@@ -786,8 +773,8 @@ function renderStockList() {
 // PR C: редактор цены товара (boss/admin). Overlay с двумя полями.
 function openPriceEditor(product) {
   haptic('light');
-  const msId = (product.href || '').split('/').filter(Boolean).pop() || '';
-  if (!msId) { tg.showAlert && tg.showAlert('Нет ms_id у товара'); return; }
+  const productId = product.product_id;
+  if (!productId) { tg.showAlert && tg.showAlert('У товара нет карточки'); return; }
   const trigger = document.activeElement;  // вернём фокус сюда при закрытии
   const prevBack = _backHandler;           // восстановим back-кнопку экрана
   const ov = document.createElement('div');
@@ -820,24 +807,24 @@ function openPriceEditor(product) {
   const reloadPhotos = async () => {
     const box = ov.querySelector('#pe-photos');
     if (!box) return;
-    const res = await apiResult('/api/products/photos', { ms_id: msId });
+    const res = await apiResult('/api/products/photos', { product_id: productId });
     if (!res.ok) { box.innerHTML = ''; return; }
     box.innerHTML = photoStripHtml(res.body.photos, {
       addId: 'pe-photo-add-hidden', canUpload: false,
       canDelete: isMachineBoss(), alt: 'Фото товара',
     });
     await loadPhotos(box, '/api/products/photo', (photoId) => ({
-      ms_id: msId, photo_id: photoId,
+      product_id: productId, photo_id: photoId,
     }));
     wirePhotoDelete(box, '/api/products/photo_delete',
-      (photoId) => ({ ms_id: msId, photo_id: photoId }), reloadPhotos);
+      (photoId) => ({ product_id: productId, photo_id: photoId }), reloadPhotos);
   };
   reloadPhotos();
 
   ov.querySelector('#pe-photo-add').addEventListener('click', () =>
-    pickPhotos('/api/products/photo_upload', { ms_id: msId }, reloadPhotos));
+    pickPhotos('/api/products/photo_upload', { product_id: productId }, reloadPhotos));
   ov.querySelector('#pe-post').addEventListener('click', () =>
-    openChannelComposer('showcase', { ms_id: msId }));
+    openChannelComposer('showcase', { product_id: productId }));
   const close = () => {
     ov.remove();
     document.removeEventListener('keydown', onKey, true);
@@ -869,7 +856,7 @@ function openPriceEditor(product) {
     const costRaw = document.getElementById('pe-cost').value.trim();
     try {
       await api('/api/products/prices/set', {
-        ms_id: msId,
+        product_id: productId,
         product_name: product.name,
         sale_price: saleRaw === '' ? null : parseNum(saleRaw),
         cost_price: costRaw === '' ? null : parseNum(costRaw),
@@ -903,7 +890,6 @@ function renderStockContent() {
   content.innerHTML = `
     ${stockShellHtml()}
     <div class="wh-entry">
-      <button class="btn-secondary" data-wh-go="whremains">${icon('box')} Остатки склада</button>
       <button class="btn-secondary" data-wh-go="whinvoices">${icon('list')} Накладные</button>
     </div>
     <div class="form-row">
@@ -1491,8 +1477,8 @@ function openContainerForm() {
 
 // Живой поиск по номенклатуре под текстовым полем. Отдельной функцией, потому
 // что нужен дважды: при вводе новой позиции и при исправлении уже заведённой.
-// Ходит в снапшот (`/api/products/search`), а не в МойСклад: подсказка
-// дёргается на каждое нажатие.
+// Ходит в нашу номенклатуру (`/api/products/search`) — подсказка дёргается на
+// каждое нажатие, и запрос обязан быть локальным.
 function attachProductSearch(anchor, { onPick }) {
   const list = document.createElement('div');
   list.className = 'c-surface c-surface--list product-suggest';
@@ -1520,18 +1506,22 @@ function attachProductSearch(anchor, { onPick }) {
       return;
     }
     list.innerHTML = rows.map(p => `
-      <div class="c-row c-row--tap" data-ms="${escapeHtml(p.ms_id)}"
+      <div class="c-row c-row--tap" data-product="${p.product_id}"
            data-name="${escapeHtml(p.name || '')}" data-unit="${escapeHtml(p.unit || 'шт')}"
            role="button" tabindex="0">
         <div class="card-row-info"><div class="card-row-title">${escapeHtml(p.name || '')}</div></div>
         <div class="card-row-value">${escapeHtml(p.unit || 'шт')}</div>
       </div>`).join('');
-    list.querySelectorAll('[data-ms]').forEach(row => {
+    list.querySelectorAll('[data-product]').forEach(row => {
       row.addEventListener('click', () => {
         haptic('light');
-        list.querySelectorAll('[data-ms]').forEach(r => r.classList.remove('picked'));
+        list.querySelectorAll('[data-product]').forEach(r => r.classList.remove('picked'));
         row.classList.add('picked');
-        onPick({ ms_id: row.dataset.ms, name: row.dataset.name, unit: row.dataset.unit });
+        onPick({
+          product_id: Number(row.dataset.product),
+          name: row.dataset.name,
+          unit: row.dataset.unit,
+        });
       });
     });
   };
@@ -1543,7 +1533,7 @@ function attachProductSearch(anchor, { onPick }) {
     },
     now(value) { render(value); },
     clearPicked() {
-      list.querySelectorAll('[data-ms]').forEach(r => r.classList.remove('picked'));
+      list.querySelectorAll('[data-product]').forEach(r => r.classList.remove('picked'));
     },
     listEl: list,
   };
@@ -1599,8 +1589,7 @@ function openContainerItemForm(containerId, arrived) {
     onSubmit: async (data, { showErr }) => {
       const res = await apiResult('/api/containers/item_add', {
         container_id: containerId, ...data,
-        ms_id: picked ? picked.ms_id : '',
-        ms_name: picked ? picked.name : '',
+        product_id: picked ? picked.product_id : '',
       });
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
@@ -1639,16 +1628,15 @@ function openItemLinkSheet(containerId, item) {
   let picked = null;
   const sheet = openMachineSheet({
     title: 'Товар в каталоге',
-    hint: item.ms_id
-      ? `Сейчас: ${item.ms_name || item.name}`
+    hint: item.product_id
+      ? `Сейчас: ${item.product_name || item.name}`
       : 'Позиция ни с чем не связана — приход по ней не пройдёт',
     fields: [{ key: 'search', label: 'Поиск по каталогу', value: item.name }],
     submitLabel: 'Привязать',
     onSubmit: async (_data, { showErr }) => {
       if (!picked) { showErr('Выберите товар из списка'); return false; }
       const res = await apiResult('/api/containers/item_link', {
-        container_id: containerId, item_id: item.id,
-        ms_id: picked.ms_id, ms_name: picked.name,
+        container_id: containerId, item_id: item.id, product_id: picked.product_id,
       });
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
@@ -1674,7 +1662,7 @@ function openItemLinkSheet(containerId, item) {
   // каждую опечатку в новый товар справочника.
   const create = document.createElement('button');
   create.className = 'btn-secondary';
-  create.innerHTML = `${icon('plus')} Завести «${escapeHtml(item.name)}» в МойСклад`;
+  create.innerHTML = `${icon('plus')} Завести «${escapeHtml(item.name)}» в каталоге`;
   suggest.listEl.after(create);
   create.addEventListener('click', async () => {
     if (create.disabled) return;
@@ -1700,9 +1688,9 @@ function containerItemsHtml(items, arrived, canManage) {
   const rows = items.map(it => {
     const qty = `${formatMoney(it.expected_qty)} ${escapeHtml(it.unit || 'шт')}`;
     // Про каталог говорим сразу, а не в момент оприходования: непривязанная
-    // позиция — это остаток, который не доедет до МойСклад, и узнать об этом
+    // позиция — это остаток, который не доедет до склада, и узнать об этом
     // лучше пока контейнер грузят, а не когда его уже посчитали.
-    const link = it.ms_id ? '' : ' · нет в каталоге';
+    const link = it.product_id ? '' : ' · нет в каталоге';
     const sub = (arrived
       ? (it.state === 'unchecked'
           ? `заявлено ${qty} · не сверено`
@@ -1726,7 +1714,7 @@ function containerItemsHtml(items, arrived, canManage) {
         </div>
         ${input}
         ${canManage ? `<button class="pay-toggle" data-item-link="${it.id}"
-             aria-label="Товар в каталоге: ${escapeHtml(it.name)}">${icon(it.ms_id ? 'check' : 'search')}</button>` : ''}
+             aria-label="Товар в каталоге: ${escapeHtml(it.name)}">${icon(it.product_id ? 'check' : 'search')}</button>` : ''}
         ${canManage ? `<button class="pay-toggle" data-item-del="${it.id}" aria-label="Убрать позицию">${icon('trash')}</button>` : ''}
       </div>`;
   }).join('');
@@ -1734,19 +1722,19 @@ function containerItemsHtml(items, arrived, canManage) {
 }
 
 // Выбор поставщика контейнера. Контрагентов берём той же ручкой, что и клиентов
-// заказа: справочник МойСклад один, и второй поиск по нему был бы дублем.
+// заказа: справочник один, и второй поиск по нему был бы дублем.
 function openSupplierPicker(containerId) {
   let picked = null;
   const sheet = openMachineSheet({
     title: 'Поставщик контейнера',
-    hint: '«Приёмке» в МойСклад поставщик обязателен',
+    hint: 'Приёмку он не держит, но «от кого пришло» потом некому вспомнить',
     fields: [{ key: 'search', label: 'Поиск по названию', placeholder: 'ООО …' }],
     submitLabel: 'Сохранить',
     onSubmit: async (_data, { showErr }) => {
       if (!picked) { showErr('Выберите контрагента из списка'); return false; }
       const res = await apiResult('/api/containers/supplier', {
         container_id: containerId,
-        supplier_ms_id: picked.id,
+        supplier_id: picked.id,
         supplier_name: picked.name,
       });
       if (!res.ok) { showErr(res.error); return false; }
@@ -1812,7 +1800,7 @@ async function renderContainerCard(containerId) {
   const c = card.container || {};
   const d = card.diff || {};
   const arrived = c.status === 'arrived';
-  const supply = card.supply || {};
+  const receipt = card.receipt || {};
   const win = card.edit_window || { open: true };
   const canEdit = win.open;
   const canManage = canEdit;   // ручки состава открыты всем трём ролям
@@ -1822,7 +1810,7 @@ async function renderContainerCard(containerId) {
     arrived ? ['Прибыл', String(c.arrived_at || '').slice(0, 10) || '—']
             : ['Ожидается', c.eta_date || '—'],
     ['Позиций', String(d.total || 0)],
-    ['Поставщик', supply.supplier_name || '— не выбран'],
+    ['Поставщик', receipt.supplier_name || '— не выбран'],
   ];
   if (c.notes) facts.push(['Заметки', c.notes]);
 
@@ -1834,20 +1822,24 @@ async function renderContainerCard(containerId) {
         ? `<div class="items-total schedule-total"><span>Не сверено позиций</span><b>${d.unchecked}</b></div>`
         : `<div class="items-total schedule-total"><span>Состав сошёлся</span><b>${d.total} поз.</b></div>`;
 
-  // Что уехало в МойСклад и что там не приняли. Несопоставленное показываем
-  // явно: молча пропущенная позиция — это остаток, которого нет на складе, но
+  // Что попало на склад и что не прошло. Несопоставленное показываем явно:
+  // молча пропущенная позиция — это остаток, которого нет на складе, но
   // который считают существующим.
   let supplyBlock = '';
   if (arrived) {
-    const unmatched = supply.unmatched || [];
-    supplyBlock = `<div class="section-label">Остатки в МойСклад</div>
+    const unmatched = receipt.unmatched || [];
+    const received = Boolean(receipt.invoice_id) || receipt.legacy;
+    const receivedSub = receipt.legacy
+      ? 'Оприходован ещё в МойСклад — остаток перенесён миграцией'
+      : (receipt.received_at
+          ? escapeHtml(String(receipt.received_at).slice(0, 16))
+          : 'Закупочные цены впишете в накладной, когда будет удобно');
+    supplyBlock = `<div class="section-label">Приход на склад</div>
       <div class="c-surface c-surface--list">
-        <div class="c-row" data-status="${supply.ms_supply_id ? 'approved' : 'pending'}">
+        <div class="c-row" data-status="${received ? 'approved' : 'pending'}">
           <div class="card-row-info">
-            <div class="card-row-title">${supply.ms_supply_id ? 'Приёмка создана' : 'Ещё не оприходовано'}</div>
-            <div class="card-row-sub">${supply.synced_at
-              ? escapeHtml(String(supply.synced_at).slice(0, 16))
-              : 'Цены впишете в МойСклад, когда будет удобно'}</div>
+            <div class="card-row-title">${received ? 'Приходная накладная проведена' : 'Ещё не оприходовано'}</div>
+            <div class="card-row-sub">${receivedSub}</div>
           </div>
         </div>
         ${unmatched.map(u => `
@@ -1884,7 +1876,7 @@ async function renderContainerCard(containerId) {
       ${canEdit ? `<button class="btn-secondary" id="cont-item-add">${icon('plus')} ${arrived ? 'Лишняя позиция' : 'Позиция'}</button>` : ''}
       ${canEdit && arrived ? '<button class="btn-primary" id="cont-save">Сохранить сверку</button>' : ''}
       ${canEdit && !arrived ? '<button class="btn-primary" id="cont-arrive">Отметить прибытие</button>' : ''}
-      ${arrived && !supply.ms_supply_id ? `<button class="btn-secondary" id="cont-supply">${icon('box')} Оприходовать</button>` : ''}
+      ${arrived && !receipt.legacy ? `<button class="btn-secondary" id="cont-supply">${icon('box')} ${receipt.invoice_id ? 'Переоприходовать' : 'Оприходовать'}</button>` : ''}
       ${arrived && card.can_manage ? `<button class="btn-secondary" id="cont-post">${icon('cart')} Пост в канал</button>` : ''}
       ${canEdit && card.can_manage ? `<button class="btn-secondary btn-danger" id="cont-del">${icon('trash')} Удалить</button>` : ''}
     </div>
@@ -1909,7 +1901,7 @@ async function renderContainerCard(containerId) {
       return;
     }
     haptic('success');
-    toast(`Оприходовано позиций: ${res.body.matched}`);
+    toast(`Оприходовано позиций: ${res.body.matched} · ${res.body.invoice_number || ''}`.trim());
     renderContainerCard(containerId);
   });
 
@@ -2769,7 +2761,7 @@ async function runSearch(query) {
     parts.push(data.agents.map(a => {
       const label = `${escapeHtml(a.name || '—')}${a.phone ? ' · ' + escapeHtml(a.phone) : ''}`;
       return canCard
-        ? `<div class="search-item" role="button" tabindex="0" data-agent="${escapeHtml(a.ms_id || '')}">${label}</div>`
+        ? `<div class="search-item" role="button" tabindex="0" data-agent="${escapeHtml(String(a.id || ''))}">${label}</div>`
         : `<div class="search-item">${label}</div>`;
     }).join(''));
   }
@@ -3507,18 +3499,21 @@ async function openProductPicker() {
     list.innerHTML = filtered.length === 0
       ? '<div class="loader">Товары не найдены</div>'
       : filtered.slice(0, prodLimit).map(p => {
-          const ind = p.stock >= 100 ? 'green' : p.stock >= 20 ? 'yellow' : 'red';
+          // Показываем ДОСТУПНОЕ (остаток минус резерв под одобренные заказы):
+          // обещать со склада то, что уже обещано другому, — верный способ
+          // отгрузить дважды.
+          const avail = p.available != null ? p.available : p.stock;
           return `
             <div class="c-row prod-row" role="button" tabindex="0"
                  data-name="${escapeHtml(p.name)}"
                  data-unit="${escapeHtml(p.unit)}"
-                 data-stock="${p.stock}"
-                 data-href="${escapeHtml(p.href || '')}">
+                 data-stock="${avail}"
+                 data-product="${p.product_id}">
               <div class="prod-info">
                 <div class="prod-name">${escapeHtml(p.name)}</div>
                 ${p.folder_name ? `<div class="prod-folder">${escapeHtml(p.folder_name)}</div>` : ''}
               </div>
-              <span class="stock-badge badge-${ind}">${p.stock} ${p.unit}</span>
+              ${whStockBadge(avail)}
             </div>
           `;
         }).join('') + moreBtn;
@@ -3529,7 +3524,7 @@ async function openProductPicker() {
         openQuantityInput(
           row.dataset.name, row.dataset.unit,
           parseFloat(row.dataset.stock),
-          row.dataset.href || ''
+          row.dataset.product || ''
         );
       });
     });
@@ -3573,7 +3568,7 @@ async function openProductPicker() {
   renderProducts();
 }
 
-function openQuantityInput(name, unit, maxStock, href) {
+function openQuantityInput(name, unit, maxStock, productId) {
   const content = document.getElementById('content');
   const currencies = ['USD', 'UZS'];
   // Если у заказа уже была валюта (после первой позиции) — берём её и
@@ -3674,7 +3669,7 @@ function openQuantityInput(name, unit, maxStock, href) {
       const result = await api('/api/orders/add_item', {
         order_id: currentDraftOrder.id,
         product_name: name,
-        product_href: href || '',
+        product_id: productId || '',
         quantity: qty,
         unit: unit,
         price: price,
@@ -4081,13 +4076,13 @@ function renderAnalyticsContent(data) {
   const exportBlock = data.scope === 'company'
     ? `<button class="btn-primary u-mt-3" id="analytics-export">${icon('chart')} Выгрузить Excel</button>` : '';
 
-  const msWarn = data.ms_unavailable
-    ? `<div class="warn-card">${icon('alert', 'warn-ic')} Продажи из МойСклад временно недоступны — показаны нулевые суммы и локальный топ-менеджеров.</div>`
+  const msWarn = data.stats_incomplete
+    ? `<div class="warn-card">${icon('alert', 'warn-ic')} Часть показателей не посчиталась — суммы могут быть занижены. Попробуйте обновить экран.</div>`
     : '';
 
   // ── Две ветки показателей (UI-WP-27) ──────────────────────────────────
   // Менеджеру и руководству приходят РАЗНЫЕ данные: у первого выручка списком
-  // по валютам (складывать USD+UZS+EUR нельзя), у второго — агрегаты МС в
+  // по валютам (складывать USD+UZS+EUR нельзя), у второго — агрегаты склада в
   // одной базовой валюте. Раньше обе формы собирались одной переменной с
   // ветвлением посередине разметки, и было не видно, какой экран выйдет.
 
@@ -4630,7 +4625,7 @@ function showChannelPreview(kind, params, draft) {
       if (!await confirmDialog('Опубликовать в канал?')) return false;
       const res = await apiResult('/api/channel/publish', {
         kind, ref: draft.ref, text: data.text,
-        photo_id: draft.photo_id, ms_id: params.ms_id,
+        photo_id: draft.photo_id, product_id: params.product_id,
       });
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
@@ -4666,7 +4661,7 @@ async function renderLeadCard(leadId) {
     ['Последнее сообщение', String(l.last_inbound_at || '').slice(0, 16) || '—'],
     ['Первый ответ', String(l.first_reply_at || '').slice(0, 16) || 'не отвечали'],
     // Контрагент — единственный источник телефона: Telegram номер собеседника
-    // не отдаёт, поэтому он берётся из карточки МойСклад, а не из переписки.
+    // не отдаёт, поэтому он берётся из карточки контрагента, а не из переписки.
     ['Контрагент', (l.agent && l.agent.name) || (l.agent_ms_id ? 'привязан' : '— не привязан')],
     ...(l.agent && l.agent.phone ? [['Телефон', l.agent.phone]] : []),
   ];
@@ -4841,7 +4836,7 @@ function openCallLinkSheet(call, onDone) {
   load(guess);
 }
 
-// Привязка клиента к контрагенту МойСклад — мост, без которого «написал» и
+// Привязка клиента к контрагенту — мост, без которого «написал» и
 // «купил» никогда не встретятся: в переписке клиент это Telegram-аккаунт, в
 // заказах — контрагент, и общих полей у них нет.
 //
@@ -4855,12 +4850,12 @@ function openAgentPicker(leadId, lead) {
   const sheet = openMachineSheet({
     title: 'Контрагент клиента',
     hint: 'Ищите по названию или по номеру телефона',
-    fields: [{ key: 'search', label: 'Поиск в МойСклад', value: name }],
+    fields: [{ key: 'search', label: 'Поиск по справочнику', value: name }],
     submitLabel: 'Привязать',
     onSubmit: async (_data, { showErr }) => {
       if (!picked) { showErr('Выберите контрагента из списка'); return false; }
       const res = await apiResult('/api/leads/link', {
-        lead_id: leadId, agent_ms_id: picked.ms_id,
+        lead_id: leadId, counterparty_id: picked.id,
       });
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
@@ -4893,7 +4888,7 @@ function openAgentPicker(leadId, lead) {
     }
     list.innerHTML = rows.length
       ? rows.map(a => `
-        <div class="c-row c-row--tap" data-agent="${escapeHtml(a.ms_id)}"
+        <div class="c-row c-row--tap" data-agent="${escapeHtml(String(a.id))}"
              data-name="${escapeHtml(a.name || '')}" role="button" tabindex="0">
           <div class="card-row-info">
             <div class="card-row-title">${escapeHtml(a.name || '')}</div>
@@ -4904,7 +4899,7 @@ function openAgentPicker(leadId, lead) {
     list.querySelectorAll('[data-agent]').forEach(row => {
       row.addEventListener('click', () => {
         haptic('light');
-        picked = { ms_id: row.dataset.agent, name: row.dataset.name };
+        picked = { id: row.dataset.agent, name: row.dataset.name };
         list.querySelectorAll('[data-agent]').forEach(r => r.classList.remove('picked'));
         row.classList.add('picked');
         sheet.showErr('');
@@ -4925,13 +4920,13 @@ function openAgentPicker(leadId, lead) {
   const create = document.createElement('button');
   create.className = 'btn-secondary';
   create.type = 'button';
-  create.textContent = 'Завести нового в МойСклад';
+  create.textContent = 'Завести нового контрагента';
   list.after(create);
   create.addEventListener('click', async () => {
     if (create.disabled) return;
     const title = input.value.trim() || name;
     if (!title) { sheet.showErr('Впишите название контрагента'); return; }
-    if (!await confirmDialog(`Завести контрагента «${title}» в МойСклад?`)) return;
+    if (!await confirmDialog(`Завести контрагента «${title}»?`)) return;
     create.disabled = true;
     const res = await apiResult('/api/leads/create_agent', {
       lead_id: leadId, name: title,
@@ -5726,30 +5721,14 @@ async function renderCreditLimits(container) {
     container.innerHTML = `<div class="empty-state">
       <div class="empty-state-icon">${icon('user')}</div>
       <div class="empty-state-title">Пока нет клиентов</div>
-      <div class="empty-state-hint">Контрагенты появятся после синхронизации с МойСклад или первого заказа.</div>
+      <div class="empty-state-hint">Контрагенты появятся после первого заказа или когда их заведут в справочнике.</div>
     </div>`;
     return;
   }
-  // Сверху — кто больше должен. В МС-балансе (взаиморасчёты) ДОЛГ клиента —
-  // отрицательный → должники = самый отрицательный баланс наверху; баланс-нет в
-  // конец. Null-safe компаратор (WP-28): прежний Infinity-сентинел давал
-  // Infinity−Infinity=NaN на двух null → неопределённый порядок по спецификации.
-  const balOf = c => (c.balance_cents != null ? c.balance_cents : null);
-  clients.sort((a, b) => {
-    const x = balOf(a), y = balOf(b);
-    if (x == null) return y == null ? 0 : 1;
-    if (y == null) return -1;
-    return x - y;
-  });
-  // UI-WP-05: подпись строит общий хелпер (знак — по конвенции WP-27), экран
-  // отвечает только за класс.
-  const balStr = (bal) => {
-    const b = msBalanceLabel(bal, baseC);
-    if (b.tone === 'none') return '<span class="money-placeholder">баланс —</span>';
-    if (b.tone === 'owe') return `<span class="bal-owe">${escapeHtml(b.text)}</span>`;
-    if (b.tone === 'advance') return `<span class="bal-adv">${escapeHtml(b.text)}</span>`;
-    return escapeHtml(b.text);
-  };
+  // Сверху — кто больше должен. Раньше сортировали по сальдо взаиморасчётов
+  // МойСклад; его больше нет, и «сколько должен» считается по нашим заказам —
+  // это тот же вопрос, но с ответом, который мы можем показать построчно.
+  clients.sort((a, b) => (Number(b.debt) || 0) - (Number(a.debt) || 0));
   // Долг по заказам — РАЗДЕЛЬНО по валютам (не складываем). Лимит — в базовой.
   const debtStr = (c) => {
     const items = (c.debt_by_currency || []).filter(x => x.amount > 0);
@@ -5761,7 +5740,7 @@ async function renderCreditLimits(container) {
         <div class="card-row-icon">${icon('building')}</div>
         <div class="card-row-info">
           <div class="card-row-title">${escapeHtml(c.agent_name)}</div>
-          <div class="card-row-sub">${balStr(c.balance_cents)} · ${debtStr(c)} · лимит ${fmt(c.limit)} ${escapeHtml(baseC)}</div>
+          <div class="card-row-sub">${debtStr(c)} · лимит ${fmt(c.limit)} ${escapeHtml(baseC)}</div>
         </div>
         ${c.over_limit ? '<span class="stock-badge" data-status="out">лимит превышен</span>' : ''}
       </div>`).join('');
@@ -5936,22 +5915,15 @@ async function renderAgentDetail(agentId) {
   const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   const fmtCents = c => opsAmount((Number(c) || 0) / 100);
   const baseC = d.base_currency || baseCur();
-  // МС-баланс: подпись — общая (UI-WP-05), формулировка больше не расходится
-  // с экраном клиентов.
-  const bal = msBalanceLabel(d.balance_cents, baseC);
-  const balLine = bal.tone === 'none'
-    ? 'Баланс МойСклад: —'
-    : `Баланс МойСклад: <b>${escapeHtml(bal.text)}</b>`;
 
-  // Покупки из МС.
+  // Покупки — расходные накладные склада.
   const pur = d.purchases || {};
   const topRows = (pur.top_products || []).map(p =>
     `<div class="c-row"><div class="card-row-info"><div class="card-row-title">${escapeHtml(p.name)}</div>` +
     `<div class="card-row-sub">${fmt(p.qty)} шт · ${fmtCents(p.sum_cents)} ${escapeHtml(baseC)}</div></div></div>`
   ).join('');
   // Отгрузка раскрывается в состав. Позиции тянем по первому тапу, а не сразу
-  // все десять: это десять запросов в МойСклад ради строк, которые чаще всего
-  // никто не откроет, а бюджет запросов к МС общий на бота, WebApp и cron'ы.
+  // все десять: чаще всего их никто не откроет.
   const recentRows = (pur.recent || []).map(r =>
     `<div class="c-row${r.id ? ' c-row--tap' : ''}"${r.id ? ` data-shipment="${escapeHtml(r.id)}" role="button" tabindex="0" aria-expanded="false"` : ''}>` +
     `<div class="card-row-info"><div class="card-row-title">${fmtCents(r.sum_cents)} ${escapeHtml(baseC)}</div>` +
@@ -5962,7 +5934,7 @@ async function renderAgentDetail(agentId) {
     ? `<div class="section-label">Покупки · ${pur.count} отгр. · ${fmtCents(pur.total_cents)} ${escapeHtml(baseC)}</div>`
       + (topRows ? `<div class="c-surface c-surface--list">${topRows}</div>` : '')
       + (recentRows ? `<div class="section-label">Последние отгрузки</div><div class="c-surface c-surface--list">${recentRows}</div>` : '')
-    : '<div class="section-label">Покупки</div><div class="loader">Покупок в МойСклад нет</div>';
+    : '<div class="section-label">Покупки</div><div class="loader">Отгрузок ещё не было</div>';
 
   // Заказы в боте. Строка раскрывается в состав заказа: позиции приходят в том
   // же ответе (их всё равно грузят ради суммы), поэтому раскрытие ничего не
@@ -6005,7 +5977,6 @@ async function renderAgentDetail(agentId) {
     ${d.phone ? `<div class="debt-meta agent-phone">${icon('phone')} ${escapeHtml(d.phone)}</div>` : ''}
     <div class="section-label">Взаиморасчёты</div>
     <div class="c-surface c-surface--pad">
-      <div class="agent-bal">${balLine}</div>
       <div class="debt-meta">Долг по заказам бота: <b>${fmt(d.debt)} ${escapeHtml(baseC)}</b> · лимит ${fmt(d.limit)} · свободно ${fmt(d.free)}</div>
       ${limitBlock}
     </div>
@@ -6025,14 +5996,13 @@ async function renderAgentDetail(agentId) {
     });
   });
 
-  // Раскрытие состава отгрузки. В отличие от заказа позиции лежат в МойСклад,
-  // поэтому подгружаем по первому тапу и оставляем в DOM: повторное сворачивание
-  // не должно стоить ещё одного запроса.
+  // Раскрытие состава отгрузки: подгружаем по первому тапу и оставляем в DOM —
+  // повторное сворачивание не должно стоить ещё одного запроса.
   content.querySelectorAll('[data-shipment]').forEach(row => {
     row.addEventListener('click', async () => {
       haptic('light');
-      // getElementById, а не селектор: id — идентификатор МойСклад, и
-      // экранировать его для CSS-селектора здесь незачем.
+      // getElementById, а не селектор: экранировать id для CSS-селектора
+      // здесь незачем.
       const box = document.getElementById(`shipment-${row.dataset.shipment}`);
       if (!box) return;
       box.hidden = !box.hidden;
@@ -6040,7 +6010,7 @@ async function renderAgentDetail(agentId) {
       if (box.hidden || box.dataset.loaded) return;
       box.innerHTML = '<div class="order-item">Загружаю состав…</div>';
       try {
-        const res = await api('/api/clients/shipment', { demand_id: row.dataset.shipment });
+        const res = await api('/api/clients/shipment', { invoice_id: Number(row.dataset.shipment) });
         box.innerHTML = shipmentItemsHtml(res);
         box.dataset.loaded = '1';
       } catch (e) {
@@ -6423,9 +6393,9 @@ async function renderDebts(container) {
 // ═══════════════════════════════════════════════════════════════════════════
 // Склад: остатки, накладные, быстрый ввод.
 //
-// Локальные таблицы, МойСклад здесь не участвует. Живёт вкладками «Остатки» и
-// «Накладные» внутри раздела «Склад»; форма создания открывается кнопкой
-// внутри «Накладных».
+// Остатки показывает вкладка «Каталог» раздела «Склад» — это те же
+// `products`/`stock`. Здесь остались накладные: список и форма создания,
+// которая открывается кнопкой внутри списка.
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Внутреннее состояние вкладки «Накладные»: список или форма создания.
@@ -6434,80 +6404,12 @@ let whView = 'list';            // 'list' | 'new'
 let whDraft = null;             // черновик формы (живёт между перерисовками вкладки)
 let whCounterparties = [];      // справочник, тянем один раз на сессию экрана
 let whStockCache = [];          // остатки для подстановки в позиции
-let whStockSearch = '';
 
 function whIsBoss() {
   return currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
 }
 
 // whMoney / whQty / whStockBadge — в helpers.js (глобалы). Юнит-тестируются.
-
-// ─── Вкладка «Остатки» ────────────────────────────────────────────────────────
-
-async function renderWhRemains() {
-  const content = document.getElementById('content');
-  showBack(() => showScreen('stock'));
-  content.innerHTML = skeleton('list', 6);
-
-  let data;
-  try {
-    data = await api('/api/wh/stock', {});
-  } catch (e) {
-    content.innerHTML = errorBox(e.message || String(e));
-    return;
-  }
-  whStockCache = data.products || [];
-
-  if (!whStockCache.length) {
-    content.innerHTML = emptyState({
-      icon: 'box',
-      title: 'Номенклатура пуста',
-      hint: 'Перенесите справочник из МойСклад: python -m scripts.migrate_from_moysklad --apply',
-    });
-    return;
-  }
-
-  content.innerHTML = `
-    <div class="form-row">
-      <input id="wh-stock-search" class="form-input" placeholder="Поиск по названию или артикулу…"
-             value="${escapeHtml(whStockSearch)}">
-    </div>
-    <div class="section-label">Остатки</div>
-    <div class="stock-list" id="wh-stock-list"></div>`;
-
-  drawWhStockList();
-
-  // Перерисовываем только список: каркас не трогаем, иначе поле поиска
-  // теряет фокус на каждом нажатии клавиши (та же причина, что в renderStockList).
-  const input = document.getElementById('wh-stock-search');
-  input.addEventListener('input', () => {
-    whStockSearch = input.value;
-    drawWhStockList();
-  });
-}
-
-function drawWhStockList() {
-  const list = document.getElementById('wh-stock-list');
-  if (!list) return;
-  const needle = whStockSearch.trim().toLowerCase();
-  const rows = whStockCache.filter(p =>
-    !needle ||
-    String(p.name || '').toLowerCase().includes(needle) ||
-    String(p.sku || '').toLowerCase().includes(needle));
-
-  list.innerHTML = rows.length
-    ? rows.map(p => `
-        <div class="stock-row">
-          <div class="stock-info">
-            <div class="stock-name">${escapeHtml(p.name)}</div>
-            <div class="stock-folder">${escapeHtml(p.sku || '—')} · ${escapeHtml(p.unit || '')}${
-              p.category ? ' · ' + escapeHtml(p.category) : ''}</div>
-          </div>
-          ${whStockBadge(p.quantity)}
-        </div>`).join('')
-    : emptyState({ icon: 'search', title: 'Ничего не найдено',
-                   hint: 'Измените поисковый запрос' });
-}
 
 // ─── Вкладка «Накладные» ───────────────────────────────────────────────
 
@@ -6659,7 +6561,7 @@ async function renderWhInvoiceNew() {
   if (!products.length) {
     content.innerHTML = emptyState({
       icon: 'box', title: 'Нет номенклатуры',
-      hint: 'Сначала перенесите товары из МойСклад скриптом миграции',
+      hint: 'Заведите товар в каталоге или перенесите справочник скриптом миграции',
     });
     return;
   }
