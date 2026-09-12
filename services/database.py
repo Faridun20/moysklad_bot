@@ -1191,6 +1191,39 @@ def seed_warehouses() -> int:
         return 1
 
 
+def seed_document_templates() -> int:
+    """Засеять шаблоны юридических документов. Идемпотентно по типу.
+
+    file_path кладём ОТНОСИТЕЛЬНЫЙ (templates/legal/…): шаблон лежит в
+    репозитории и едет с образом. Заменить его своим можно, прописав в этой
+    строке абсолютный путь в томе /app/data — `legal_docs.template_path`
+    предпочитает значение из БД, когда оно задано.
+    """
+    from services.legal_docs import TEMPLATES
+
+    inserted = 0
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        for doc_type, (filename, _lang) in TEMPLATES.items():
+            cur.execute(
+                q("SELECT id FROM document_templates WHERE type = ?"), (doc_type,)
+            )
+            if cur.fetchone():
+                continue
+            cur.execute(
+                q(
+                    "INSERT INTO document_templates (type, file_path, is_active, created_at) "
+                    "VALUES (?, ?, 1, ?)"
+                ),
+                (doc_type, f"templates/legal/{filename}", now_str()),
+            )
+            inserted += 1
+        conn.commit()
+    if inserted:
+        logger.info("Засеяно шаблонов документов: %d", inserted)
+    return inserted
+
+
 def run_backfills():
     """Одноразовые data-миграции + сидинг настроек. Идемпотентны.
 
@@ -1233,6 +1266,8 @@ def run_backfills():
     seed_app_settings()
     # ── Склад по умолчанию для локального учёта (идемпотентно) ───────
     seed_warehouses()
+    # ── Шаблоны юридических документов (идемпотентно) ────────────────
+    seed_document_templates()
 
 
 # ─── Настройки приложения (app_settings) ──────────────────────────────────────
