@@ -1942,3 +1942,56 @@ describe('склад: локальные остатки и накладные', 
     expect(content.textContent).toContain('PDF отправлен');
   });
 });
+
+describe('склад: отказ сервера доходит до менеджера', () => {
+  // Ручки склада отвечают на отказ 409 с телом {ok:false, code, reason}.
+  // api() ищет в теле поле `detail` и, не найдя, показывает «Ошибка сервера
+  // (409)» — посчитанная сервером причина терялась ровно там, где она нужна.
+  // Поэтому запись идёт через apiResult(). Регресс молчаливый: накладная
+  // действительно не проводится, и по поведению отказ неотличим от сбоя.
+
+  const boot409 = (body) => boot(`
+    currentUser = { role: 'boss' };
+    window.__toasts = [];
+    toast = (m) => window.__toasts.push(String(m));
+    api = async (p) => {
+      if (p === '/api/wh/stock') return { products: [
+        { product_id: 1, name: 'Болт М8', sku: 'B8', unit: 'шт', quantity: 3 } ]};
+      if (p === '/api/wh/counterparties') return { counterparties: [
+        { id: 1, name: 'ООО Ромашка', telegram_id: 555 } ]};
+      return {};
+    };
+    apiResult = async () => ({ ok: false, status: 409,
+                               body: ${JSON.stringify(body)},
+                               error: 'Ошибка сервера (409)' });
+    window.__ready = (async () => {
+      whView = 'new';
+      whDraft = { type: 'outgoing', counterparty_id: '1', comment: '',
+                  items: [{ product_id: 1, quantity: 99, price_cents: 100 }] };
+      await renderWhInvoiceNew();
+      document.getElementById('wh-save').click();
+      await new Promise(r => setTimeout(r, 0));
+    })();
+  `);
+
+  it('нехватка остатка показывается текстом причины, а не «ошибкой сервера»', async () => {
+    const window = boot409({
+      ok: false, code: 'insufficient_stock',
+      reason: 'Не хватает остатка: #1 (нужно 99, есть 3)',
+    });
+    await window.__ready;
+    const toasts = window.__toasts.join(' | ');
+    expect(toasts).toContain('Не хватает остатка');
+    expect(toasts).not.toContain('Ошибка сервера');
+  });
+
+  it('форма после отказа остаётся на экране — её надо править, а не набирать заново', async () => {
+    const window = boot409({ ok: false, code: 'insufficient_stock', reason: 'Не хватает' });
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    // Позиция на месте, кнопка снова активна: отказ — это возврат к правке,
+    // а не потеря введённого.
+    expect(content.querySelector('.wh-pos')).not.toBeNull();
+    expect(content.querySelector('#wh-save').disabled).toBe(false);
+  });
+});

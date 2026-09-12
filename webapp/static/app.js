@@ -6596,9 +6596,14 @@ async function renderWhInvoiceList() {
       try {
         // force: кнопка видна и для уже отправленных — это осознанная
         // переотправка (клиент потерял файл, сменился телефон).
-        await api('/api/wh/invoices/send', {
+        const r = await apiResult('/api/wh/invoices/send', {
           invoice_id: Number(btn.dataset.whSend), force: true,
         });
+        if (!r.ok) {
+          toast(r.body.reason || r.error, 'error');
+          btn.disabled = false;
+          return;
+        }
         toast('PDF отправлен клиенту');
         renderWhInvoiceList();
       } catch (e) {
@@ -6615,7 +6620,15 @@ async function renderWhInvoiceList() {
         if (!ok) return;
         btn.disabled = true;
         try {
-          await api('/api/wh/invoices/cancel', { invoice_id: Number(btn.dataset.whCancel) });
+          const r = await apiResult('/api/wh/invoices/cancel',
+                                    { invoice_id: Number(btn.dataset.whCancel) });
+          if (!r.ok) {
+            // «Отмена увела бы остаток в минус» — это ответ, а не сбой:
+            // менеджеру нужно прочитать, по каким позициям не хватает.
+            toast(r.body.reason || r.error, 'error', { duration: 6000 });
+            btn.disabled = false;
+            return;
+          }
           toast('Накладная отменена');
           renderWhInvoiceList();
         } catch (e) {
@@ -6795,7 +6808,7 @@ async function renderWhInvoiceNew() {
     btn.disabled = true;
     haptic('medium');
     try {
-      const res = await api('/api/wh/invoices/create', {
+      const r = await apiResult('/api/wh/invoices/create', {
         type: whDraft.type,
         counterparty_id: whDraft.counterparty_id || null,
         comment: whDraft.comment || null,
@@ -6808,6 +6821,15 @@ async function renderWhInvoiceNew() {
         // накладную и не пришлёт клиенту второй экземпляр PDF.
         idempotency_key: idemKey(),
       });
+      if (!r.ok) {
+        // Сервер посчитал причину отказа и вернул её (нехватка остатка — с
+        // разбором по позициям). Показываем ЕЁ, а не «ошибку сервера»:
+        // менеджеру надо понять, что править в форме. Черновик остаётся.
+        toast(r.body.reason || r.error, 'error', { duration: 6000 });
+        btn.disabled = false;
+        return;
+      }
+      const res = r.body;
       toast(`Накладная ${res.invoice_number} проведена`);
       // Отдельным сообщением: неотправленный PDF — не ошибка проведения.
       // Накладная сохранена, остатки списаны, отправить можно позже кнопкой.

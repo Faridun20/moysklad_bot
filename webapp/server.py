@@ -5996,18 +5996,14 @@ async def api_wh_counterparties(request: Request):
     )
     search = (data.get("search") or "").strip()
     if search:
-        # Два условия, а не одно LOWER(...): SQLite реализует LOWER() только
-        # для ASCII и кириллицу не трогает вовсе, поэтому «ромашк» там не
-        # нашло бы «Ромашка». На Postgres (прод) первое условие полностью
-        # регистронезависимо; второе покрывает SQLite, когда регистр введён
-        # как в справочнике. Полная регистронезависимость для кириллицы на
-        # SQLite потребовала бы кастомной collation — локальной разработке
-        # это не нужно.
+        # Поиск по кириллице — через lower() с обеих сторон. Встроенный SQLite
+        # LOWER() ASCII-only, но adb_core._register_sqlite_functions
+        # переопределяет его Unicode-aware, как и синхронный слой, — поэтому
+        # запрос ведёт себя одинаково на проде и локально (CLAUDE.md).
         rows = await adb_core.fetch(
             "SELECT id, name, type, phone, telegram_id FROM counterparties "
-            "WHERE LOWER(name) LIKE $1 OR name LIKE $2 ORDER BY name LIMIT 100",
+            "WHERE lower(name) LIKE $1 ORDER BY name LIMIT 100",
             f"%{search.lower()}%",
-            f"%{search}%",
         )
     else:
         rows = await adb_core.fetch(
