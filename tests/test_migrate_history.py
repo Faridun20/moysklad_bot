@@ -584,3 +584,45 @@ def test_advance_to_supplier_is_not_an_error(seeded, ms_api):
 
     assert problems == []
     assert stats["payments_out"] == 1
+
+
+# ─── Диагностика --explain ───────────────────────────────────────────────────
+
+
+def test_explain_order_shows_positions_and_delta(seeded, ms_api, caplog):
+    """--explain печатает позиции заказа и его отгрузок и считает превышение.
+
+    Ради этого он и нужен: «отгружено больше, чем заказано» на итоговых суммах
+    не объясняет, ЧТО именно разошлось, — ответ виден только построчно.
+    """
+    import logging
+
+    ms_api["customerorder"] = [
+        _order(name="00003", sum_minor=53000, positions=[_pos(P1_MS, "Труба", 1, 53000)])
+    ]
+    ms_api["demand"] = [
+        _demand(name="D77", positions=[_pos(P1_MS, "Труба", 1, 131850)])
+    ]
+
+    with caplog.at_level(logging.INFO, logger="ms_history"):
+        rc = asyncio.run(mig.explain_order("00003"))
+
+    assert rc == 0
+    text = caplog.text
+    assert "ЗАКАЗ 00003" in text
+    assert "Труба" in text, "позиции должны печататься построчно"
+    assert "ПРЕВЫШЕНИЕ" in text
+    assert "788.50" in text, "разница 1318.50 − 530.00"
+
+
+def test_explain_unknown_order_fails_loudly(seeded, ms_api):
+    ms_api["customerorder"] = [_order(name="00001")]
+    assert asyncio.run(mig.explain_order("нет-такого")) == 1
+
+
+def test_explain_writes_nothing(seeded, ms_api):
+    ms_api["customerorder"] = [_order(name="00003")]
+    ms_api["demand"] = [_demand()]
+    asyncio.run(mig.explain_order("00003"))
+    assert _rows(seeded, "SELECT * FROM orders") == []
+    assert _rows(seeded, "SELECT * FROM invoices") == []

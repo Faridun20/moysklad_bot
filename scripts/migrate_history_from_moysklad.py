@@ -1187,7 +1187,96 @@ async def show_totals() -> None:
         )
 
 
+async def explain_order(name: str) -> int:
+    """Показать состав заказа и всех его отгрузок построчно.
+
+    Нужен ровно для одного разговора: сверка сказала «отгружено больше, чем
+    заказано», и прежде чем решать, что с этим делать, надо увидеть ПОЗИЦИИ —
+    итоговые суммы на этот вопрос не отвечают. Только чтение, в базу не пишет.
+    """
+    orders = await pull_orders()
+    target = next(
+        (o for o in orders if o["name"] == name or o["ms_id"] == name), None
+    )
+    if target is None:
+        logger.error("Заказ %r не найден среди %d выгруженных", name, len(orders))
+        return 1
+
+    demands = await pull_demands()
+    linked = [d for d in demands if d["order_ms_id"] == target["ms_id"]]
+
+    def _lines(positions: list[dict]) -> tuple[list[str], int]:
+        out, total = [], 0
+        for pos in positions:
+            a = pos.get("assortment") or {}
+            qty = float(pos.get("quantity") or 0)
+            price = int(pos.get("price") or 0)
+            line = int(round(qty * price))
+            total += line
+            out.append(
+                f"      {str(a.get('name') or '—')[:44]:<44} "
+                f"{qty:>9,.3f} × {price / 100:>10,.2f} = {line / 100:>12,.2f}"
+            )
+        return out, total
+
+    logger.info("")
+    logger.info("═══ ЗАКАЗ %s ═══", target["name"] or target["ms_id"])
+    logger.info("  контрагент : %s", target["agent_name"] or "—")
+    logger.info("  дата       : %s", target["moment"][:10])
+    logger.info("  статус в МС: %s", target["state_name"] or "—")
+    logger.info("  сумма документа в МС : %12s", _money(target["sum_minor"]))
+    logger.info("  оплачено (payedSum)  : %12s", _money(target["payed_minor"]))
+    logger.info("  отгружено (shippedSum): %11s", _money(target["shipped_minor"]))
+    logger.info("")
+    logger.info("  ПОЗИЦИИ ЗАКАЗА:")
+    lines, ordered_total = _lines(target["positions"])
+    for ln in lines:
+        logger.info("%s", ln)
+    logger.info("      %-44s %28s", "ИТОГО по позициям:", _money(ordered_total))
+
+    shipped_total = 0
+    logger.info("")
+    logger.info("  ОТГРУЗОК ПО ЭТОМУ ЗАКАЗУ: %d", len(linked))
+    for d in linked:
+        logger.info("")
+        logger.info(
+            "  ── отгрузка %s от %s · сумма документа %s",
+            d["name"] or d["ms_id"], d["moment"][:10], _money(d["sum_minor"]),
+        )
+        lines, dem_total = _lines(d["positions"])
+        for ln in lines:
+            logger.info("%s", ln)
+        logger.info("      %-44s %28s", "ИТОГО по позициям:", _money(dem_total))
+        shipped_total += dem_total
+
+    logger.info("")
+    logger.info("  ═══ СВОДКА ═══")
+    logger.info("    заказано  : %12s", _money(ordered_total))
+    logger.info("    отгружено : %12s", _money(shipped_total))
+    delta = shipped_total - ordered_total
+    if delta > 0:
+        logger.warning("    ПРЕВЫШЕНИЕ: %s", _money(delta))
+        logger.warning("")
+        logger.warning("    Что это может значить:")
+        logger.warning("      • отгрузок по заказу больше, чем он покрывает —")
+        logger.warning("        в МС заказ дополняли, а позиции не правили;")
+        logger.warning("      • в отгрузке есть позиции, которых в заказе нет;")
+        logger.warning("      • отгрузка привязана к этому заказу ошибочно.")
+        logger.warning("    Сравните строки выше — разница видна по позициям.")
+    elif delta < 0:
+        logger.info("    недоотгружено: %s", _money(-delta))
+    else:
+        logger.info("    сходится")
+    return 0
+
+
 async def main(mode: str) -> int:
+    if mode.startswith("explain:"):
+        try:
+            return await explain_order(mode.split(":", 1)[1])
+        finally:
+            await close_session()
+
     try:
         orders = await pull_orders()
         demands = await pull_demands()
@@ -1232,9 +1321,18 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--dry-run", action="store_true", help="выгрузка и отчёт, без записи")
     g.add_argument("--apply", action="store_true", help="выгрузка, запись и сверка")
+    g.add_argument(
+        "--explain",
+        metavar="ЗАКАЗ",
+        help="показать позиции заказа и всех его отгрузок (только чтение)",
+    )
     return p.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = _parse_args(sys.argv[1:])
-    sys.exit(asyncio.run(main("dry-run" if args.dry_run else "apply")))
+    if args.explain:
+        _mode = f"explain:{args.explain}"
+    else:
+        _mode = "dry-run" if args.dry_run else "apply"
+    sys.exit(asyncio.run(main(_mode)))
