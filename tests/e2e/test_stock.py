@@ -120,7 +120,10 @@ def test_container_lifecycle_moves_stock_once(open_app, e2e):
     # Что фронт реально отправил: спор «потерял выбор фронт или сервер»
     # решается по телу запроса, а не по догадкам.
     sent: list[dict] = []
+    got: list[str] = []
     boss.on("request", lambda r: sent.append(r.post_data_json)
+            if r.url.endswith("/api/containers/item_add") else None)
+    boss.on("response", lambda r: got.append(f"{r.status} {r.text()[:200]}")
             if r.url.endswith("/api/containers/item_add") else None)
     boss.fill("#ms-f-name", "Кабель")  # одно событие input → один запрос подсказки
     boss.click(f'.c-overlay [data-product="{e2e.ids["product"]}"]')
@@ -128,10 +131,16 @@ def test_container_lifecycle_moves_stock_once(open_app, e2e):
     boss.wait_for_function("() => document.querySelector('#ms-f-name').value === 'Кабель ВВГ 3x2.5'")
     boss.fill("#ms-f-expected_qty", "10")
     boss.click("#ms-submit")
-    boss.wait_for_selector("#cont-arrive")
-    assert sent and sent[-1].get("product_id") == e2e.ids["product"], sent
-    link = e2e.rows("SELECT product_id FROM container_item_products")
-    assert link == [{"product_id": e2e.ids["product"]}]
+    # Ждём СЛЕДСТВИЕ этого действия — строку позиции на карточке, — а не
+    # «#cont-arrive»: кнопка была на карточке ещё до открытия шторки, и под
+    # нагрузкой тест читал БД раньше, чем сервер ответил.
+    boss.wait_for_selector("[data-item-del]")
+    boss.wait_for_function("() => !document.querySelector('.c-overlay')")
+    assert len(sent) == 1 and sent[0].get("product_id") == e2e.ids["product"], sent
+    items = e2e.rows("SELECT id, name FROM container_items")
+    assert len(items) == 1, (sent, got, items)
+    link = e2e.rows("SELECT item_id, product_id FROM container_item_products")
+    assert link == [{"item_id": items[0]["id"], "product_id": e2e.ids["product"]}], (sent, got, items, link)
 
     boss.click("#cont-arrive")  # confirmDialog → «да»
     boss.wait_for_selector(".qty-input[data-item]")
