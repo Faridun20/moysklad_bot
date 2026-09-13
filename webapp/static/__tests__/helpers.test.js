@@ -306,9 +306,11 @@ describe('вкладки разделов', () => {
       .not.toContain('stale');
   });
 
-  it('Клиенты: воронка и лиды всем, лимиты и канал — руководству', () => {
+  it('Клиенты: лиды всем, воронка, лимиты и канал — руководству', () => {
     expect(keys(clientsTabs, { isBoss: true })).toEqual(['funnel', 'list', 'limits', 'channel']);
-    expect(keys(clientsTabs, { isBoss: false })).toEqual(['funnel', 'list']);
+    // /api/leads/funnel отвечает только admin/boss — у менеджера «Воронка»
+    // была вкладкой с гарантированным 403 (регресс сверки вкладок с ручками).
+    expect(keys(clientsTabs, { isBoss: false })).toEqual(['list']);
   });
 
   it('ни один раздел не даёт больше 4 вкладок', () => {

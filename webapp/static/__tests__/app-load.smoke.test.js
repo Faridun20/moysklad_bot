@@ -2001,3 +2001,93 @@ describe('склад: отказ сервера доходит до менедж
     expect(content.querySelector('#wh-save').disabled).toBe(false);
   });
 });
+
+// ─── Аудит, п.1: stored-XSS в экране заявок босса ───────────────────────────
+//
+// Имя менеджера, клиент и названия позиций в заявке — ввод ДРУГИХ людей, а
+// рендерится всё в сессии босса, у которой есть initData и право одобрять с
+// превышением лимита. Без escapeHtml вставленный <img onerror> выполнялся бы.
+
+describe('заявки босса: пользовательский текст экранируется', () => {
+  const evil = '<img src=x onerror="window.__pwned=1">';
+
+  async function bootRequests() {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      buildNav();
+      api = async () => ({ requests: [{
+        id: 7, full_name: ${JSON.stringify(evil)}, agent_name: ${JSON.stringify(evil)},
+        created_at: '2026-03-14', payment_type: 'paid', total: 0,
+        items: [{ name: ${JSON.stringify(evil)}, quantity: 1, unit: ${JSON.stringify(evil)} }],
+      }] });
+      window.__ready = renderPendingRequests();
+    `);
+    await window.__ready;
+    return window;
+  }
+
+  it('ни имя менеджера, ни клиент, ни позиции не становятся разметкой', async () => {
+    const window = await bootRequests();
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('img')).toBeNull();
+    expect(window.__pwned).toBeUndefined();
+    // Текст при этом на месте — экранирован, а не вырезан.
+    expect(content.textContent).toContain('<img src=x');
+    expect(content.querySelectorAll('.order-card')).toHaveLength(1);
+  });
+});
+
+// ─── Аудит, п.5: расход проводит только руководство ─────────────────────────
+
+describe('форма накладной: «Расход» показывается только руководству', () => {
+  function bootForm(role) {
+    const window = boot(`
+      currentUser = { role: ${JSON.stringify(role)} };
+      whDraft = { type: 'outgoing', counterparty_id: '', items: [], comment: '' };
+      api = async (path) => path === '/api/wh/stock'
+        ? { products: [{ product_id: 1, name: 'Труба', quantity: 5, unit: 'шт' }] }
+        : { counterparties: [] };
+      // let whDraft — не свойство window: состояние читаем из того же scope.
+      window.__ready = renderWhInvoiceNew().then(() => { window.__type = whDraft.type; });
+    `);
+    return window;
+  }
+
+  it('менеджер видит только приход — ручка ответила бы ему 403 на расход', async () => {
+    const window = bootForm('manager');
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('[data-whtype="outgoing"]')).toBeNull();
+    expect(content.textContent).toContain('Приход на склад');
+    expect(window.__type).toBe('incoming');
+  });
+
+  it('боссу доступны оба типа', async () => {
+    const window = bootForm('boss');
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('[data-whtype="outgoing"]')).not.toBeNull();
+    expect(content.querySelector('[data-whtype="incoming"]')).not.toBeNull();
+  });
+});
+
+// ─── Сверка вкладок с ролями ручек: вкладка не должна вести к 403 ───────────
+
+describe('вкладки под роль совпадают с тем, кому отвечают ручки', () => {
+  it('менеджер в «Клиентах» открывает «Лиды», а не воронку с 403', () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      window.__tabs = sectionTabsFor('clients').map(t => t.key);
+    `);
+    expect(window.__tabs).toEqual(['list']);
+  });
+
+  it('у кладовщика в «Деньгах» нет «Кассы» — /api/deposits/my ему не отвечает', () => {
+    const window = boot(`
+      currentUser = { role: 'warehouse_keeper' };
+      window.__tabs = sectionTabsFor('money').map(t => t.key);
+    `);
+    expect(window.__tabs).not.toContain('ops');
+    expect(window.__tabs).toContain('confirm');
+  });
+});
