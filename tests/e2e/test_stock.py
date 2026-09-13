@@ -117,13 +117,19 @@ def test_container_lifecycle_moves_stock_once(open_app, e2e):
     # Позиция: товар выбирается из каталога, а не угадывается по имени.
     boss.click("#cont-item-add")
     boss.wait_for_selector("#ms-f-name")
-    boss.type("#ms-f-name", "Кабель")
+    # Что фронт реально отправил: спор «потерял выбор фронт или сервер»
+    # решается по телу запроса, а не по догадкам.
+    sent: list[dict] = []
+    boss.on("request", lambda r: sent.append(r.post_data_json)
+            if r.url.endswith("/api/containers/item_add") else None)
+    boss.fill("#ms-f-name", "Кабель")  # одно событие input → один запрос подсказки
     boss.click(f'.c-overlay [data-product="{e2e.ids["product"]}"]')
     boss.wait_for_selector(f'.c-overlay [data-product="{e2e.ids["product"]}"].picked')
     boss.wait_for_function("() => document.querySelector('#ms-f-name').value === 'Кабель ВВГ 3x2.5'")
     boss.fill("#ms-f-expected_qty", "10")
     boss.click("#ms-submit")
     boss.wait_for_selector("#cont-arrive")
+    assert sent and sent[-1].get("product_id") == e2e.ids["product"], sent
     link = e2e.rows("SELECT product_id FROM container_item_products")
     assert link == [{"product_id": e2e.ids["product"]}]
 
