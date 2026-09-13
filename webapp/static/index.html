@@ -79,24 +79,13 @@
     <div class="spinner-wrap"><div class="spinner"></div><span>Подключение…</span></div>
   </main>
 
-  <nav class="bottom-nav">
-    <button class="nav-item active" data-screen="home">
-      <span class="nav-icon"><svg class="ic"><use href="#ic-home"/></svg></span>
-      <span class="nav-label">Главная</span>
-    </button>
-    <button class="nav-item" data-screen="orders">
-      <span class="nav-icon"><svg class="ic"><use href="#ic-cart"/></svg></span>
-      <span class="nav-label">Заказы</span>
-    </button>
-    <button class="nav-item" data-screen="finance">
-      <span class="nav-icon"><svg class="ic"><use href="#ic-wallet"/></svg></span>
-      <span class="nav-label">Финансы</span>
-    </button>
-    <button class="nav-item" data-screen="analytics">
-      <span class="nav-icon"><svg class="ic"><use href="#ic-chart"/></svg></span>
-      <span class="nav-label">Аналитика</span>
-    </button>
-  </nav>
+  <!--
+    Пять разделов по предметам, а не по отделам. Раздела «Аналитика» нет:
+    отчёт лежит вкладкой внутри того раздела, который он описывает.
+    Кнопки рисует JS (buildNav в app.js) — их набор зависит от роли, а таб,
+    который гарантированно ответит 403, показывать нельзя.
+  -->
+  <nav class="bottom-nav" id="bottom-nav" aria-label="Разделы"></nav>
 
 </div>
 

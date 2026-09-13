@@ -14,12 +14,12 @@ returns / credit_limits / user_roles) реалистичным набором, �
   * Идемпотентно: свои строки помечаем маркером '[seed]' и удаляем их в начале,
     поэтому повторный запуск не плодит дубли.
   * Пишем напрямую в таблицы через services.database.get_conn() (а не через
-    многошаговый бот-flow approve→ship→pay, который требует контекста МойСклад) —
-    это самодостаточно и предсказуемо. Деньги: и amount, и amount_cents
-    (money.to_cents); время: now_str(); due_date — 'YYYY-MM-DD'.
-
-Без реального MS_TOKEN экраны Каталог/сток и MS-балансы во вкладке «Клиенты»
-останутся пустыми — это ожидаемо (данные тянутся из МойСклад вживую)."""
+    многошаговый бот-flow approve→ship→pay) — это самодостаточно и
+    предсказуемо. Деньги: и amount, и amount_cents (money.to_cents); время:
+    now_str(); due_date — 'YYYY-MM-DD'.
+  * Сеются и склад с справочниками: товары, остаток и контрагенты. Без них
+    «Каталог» пуст, а карточка клиента не находит имени — учёт локальный, и
+    подставлять эти данные больше неоткуда."""
 
 import logging
 import os
@@ -84,6 +84,62 @@ def main() -> int:
         )
         cur.execute("DELETE FROM orders WHERE comment LIKE ?", (SEED_MARK + "%",))
         cur.execute("DELETE FROM credit_limits WHERE notes LIKE ?", (SEED_MARK + "%",))
+        # Склад: чистим в порядке «дети → родители», иначе Postgres отвергнет
+        # DELETE по товару с живой строкой остатка.
+        cur.execute(
+            "DELETE FROM invoice_items WHERE invoice_id IN "
+            "(SELECT id FROM invoices WHERE comment LIKE ?)", (SEED_MARK + "%",)
+        )
+        cur.execute("DELETE FROM invoices WHERE comment LIKE ?", (SEED_MARK + "%",))
+        cur.execute(
+            "DELETE FROM stock WHERE product_id IN "
+            "(SELECT id FROM products WHERE sku LIKE ?)", (SEED_MARK + "%",)
+        )
+        cur.execute("DELETE FROM products WHERE sku LIKE ?", (SEED_MARK + "%",))
+        cur.execute("DELETE FROM counterparties WHERE notes LIKE ?", (SEED_MARK + "%",))
+
+        # Склад по умолчанию: на проде его сеет run_backfills, локально сид
+        # может быть первым, кто вообще трогает таблицу.
+        cur.execute("SELECT id FROM warehouses ORDER BY id LIMIT 1")
+        row = cur.fetchone()
+        if row:
+            warehouse_id = row["id"] if isinstance(row, dict) else row[0]
+        else:
+            cur.execute("INSERT INTO warehouses (name) VALUES (?)", ("Основной склад",))
+            warehouse_id = cur.lastrowid
+
+        agents: dict[str, int] = {}
+
+        def agent_id(name: str) -> str:
+            """Контрагент по имени → его id СТРОКОЙ (в таком виде он и лежит
+            в `orders.agent_id`)."""
+            if name not in agents:
+                cur.execute(
+                    "INSERT INTO counterparties (name, type, phone, notes, created_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (name, "customer", f"+9989012345{len(agents):02d}",
+                     f"{SEED_MARK} клиент", _ts()),
+                )
+                agents[name] = cur.lastrowid
+            return str(agents[name])
+
+        products: dict[str, int] = {}
+
+        def product_id(name: str, unit: str = "шт", category: str = "Демо") -> int:
+            """Карточка товара по имени + остаток, чтобы «Каталог» не был пуст."""
+            if name not in products:
+                cur.execute(
+                    "INSERT INTO products (name, category, sku, unit, created_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (name, category, f"{SEED_MARK}{len(products):03d}", unit, _ts()),
+                )
+                pid = cur.lastrowid
+                cur.execute(
+                    "INSERT INTO stock (product_id, warehouse_id, quantity) VALUES (?,?,?)",
+                    (pid, warehouse_id, 250),
+                )
+                products[name] = pid
+            return products[name]
 
         def add_order(
             *, user_id, full_name, status, agent_name, currency, payment_type,
@@ -99,7 +155,7 @@ def main() -> int:
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     user_id, full_name, status, f"{SEED_MARK} demo",
-                    f"agent-{agent_name}", agent_name, currency, payment_type, due_date,
+                    agent_id(agent_name), agent_name, currency, payment_type, due_date,
                     1 if paid else 0,
                     paid_at, paid_at, shipped_at, (dev_uid if shipped else None),
                     _ts(created_offset), _ts(created_offset),
@@ -109,10 +165,18 @@ def main() -> int:
             return oid
 
         def add_item(order_id, name, qty, price, unit="шт"):
+            pid = product_id(name, unit)
             cur.execute(
                 "INSERT INTO order_items (order_id, product_name, product_href, "
                 "quantity, unit, price_cents, note) VALUES (?,?,?,?,?,?,?)",
                 (order_id, name, "", qty, unit, money.to_cents(price), ""),
+            )
+            # Связь с карточкой — по ней позиция спишется со склада; без неё
+            # отгрузка «прошла бы» мимо остатка и молча.
+            cur.execute(
+                "INSERT INTO order_item_products (item_id, order_id, product_id, created_at) "
+                "VALUES (?,?,?,?)",
+                (cur.lastrowid, order_id, pid, _ts()),
             )
 
         def add_payment(*, user_id, full_name, amount, currency, order_id, status):
@@ -161,7 +225,7 @@ def main() -> int:
                 "limit_amount_cents, set_by, notes, updated_at, created_at) "
                 "VALUES (?,?,?,?,?,?,?)",
                 (
-                    f"agent-{agent_name}", agent_name,
+                    agent_id(agent_name), agent_name,
                     money.to_cents(limit_amount), dev_uid, f"{SEED_MARK} лимит",
                     _ts(), _ts(),
                 ),

@@ -12,7 +12,7 @@ CLI: инициализация схемы БД для МойСклад-бота
 Что делает:
     1. _create_tables() — CREATE TABLE IF NOT EXISTS (полная схема за проход).
     2. _create_indexes() — индексы (включая UNIQUE для paymentin).
-    3. run_backfills() — сидинг app_settings + одноразовые data-миграции.
+    3. run_backfills() — сидинг app_settings/складов + одноразовые data-миграции.
 
 В Railway: добавь pre-deploy команду на сервисах bot/webapp:
     python -m tasks.migrate && python bot.py

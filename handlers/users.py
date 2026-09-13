@@ -10,7 +10,7 @@ from aiogram.types import Message, CallbackQuery
 
 from services.roles import can_manage_users, invalidate_role
 from services import async_db as adb
-from utils.helpers import esc, user_safe_error
+from utils.helpers import esc
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -74,10 +74,17 @@ async def cmd_addrole(message: Message):
     )
 
     role_name = ROLE_NAMES.get(role, role)
-    await message.answer(
-        f"✅ Пользователю <code>{target_id}</code> назначена роль <b>{role_name}</b>",
-        parse_mode="HTML",
-    )
+    text = f"✅ Пользователю <code>{target_id}</code> назначена роль <b>{role_name}</b>"
+    # T2.13 (§2.8): set_role не снимает deactivated_at, а get_role у
+    # деактивированного отдаёт guest. Без этой строки админ видел «роль
+    # назначена», человек не мог ничего сделать, и причина нигде не всплывала.
+    if await adb.is_user_deactivated(target_id):
+        text += (
+            "\n\n⚠️ <b>Пользователь деактивирован</b> — роль не действует, "
+            "он остаётся с правами гостя.\n"
+            f"Верните доступ: <code>/reactivate {target_id}</code>"
+        )
+    await message.answer(text, parse_mode="HTML")
 
 
 @router.message(Command("users"))
@@ -179,53 +186,3 @@ async def cmd_reactivate(message: Message):
     )
 
 
-@router.message(Command("syncms"))
-async def cmd_syncms(message: Message):
-    """Ручная синхронизация всех менеджеров с МойСклад."""
-    if not can_manage_users(message.from_user.id):
-        return await message.answer("⛔ Нет доступа.")
-
-    await message.answer("⏳ Синхронизирую менеджеров с МойСклад…")
-
-    from services.ms_sync import sync_all_managers
-
-    users = await adb.get_all_users()
-    results = await sync_all_managers(users)
-
-    await message.answer(
-        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-        f"✅ <b>Синхронизация завершена</b>\n\n"
-        f"🔗 Привязано: <b>{results['linked']}</b>\n"
-        f"🆕 Создано в МойСклад: <b>{results['created']}</b>\n"
-        f"❌ Ошибок: <b>{results['failed']}</b>",
-        parse_mode="HTML",
-    )
-
-
-@router.message(Command("msstaff"))
-async def cmd_msstaff(message: Message):
-    """Показать список сотрудников МойСклад с их ID."""
-    if not can_manage_users(message.from_user.id):
-        return await message.answer("⛔ Нет доступа.")
-
-    await message.answer("⏳ Загружаю сотрудников МойСклад…")
-
-    from services.ms_sync import get_ms_employees
-
-    try:
-        employees = await get_ms_employees()
-        if not employees:
-            return await message.answer("👥 Сотрудников не найдено.")
-
-        lines = [
-            "<code>━━━━━━━━━━━━━━━━━━━━</code>",
-            "👥 <b>Сотрудники МойСклад:</b>\n",
-        ]
-        for emp in employees[:20]:
-            name = esc(emp.get("name", "—"))
-            uid = esc(emp.get("id", "—"))
-            lines.append(f"• <b>{name}</b>\n  <code>{uid}</code>")
-
-        await message.answer("\n".join(lines), parse_mode="HTML")
-    except Exception as e:
-        await message.answer(user_safe_error(e, "msstaff"))

@@ -1,28 +1,21 @@
 """
-Фоновая задача: мониторинг новых отгрузок и уведомления
-Отправляет уведомления всем пользователям с ролью admin и boss
+Отправка сообщений в Telegram из любого процесса.
+
+Общая aiohttp-сессия к Bot API + список получателей уведомлений
+(admin/boss). Здесь же жил поллер новых отгрузок МойСклад: он опрашивал
+`entity/demand` и рассказывал руководству о документах, созданных в чужом
+интерфейсе. Отгрузки теперь наши — их проводит бот, и рассказывать самому
+себе о собственном действии не нужно.
 """
 
 import asyncio
 import logging
-from datetime import datetime
 
 import aiohttp
-from aiogram import Bot
 
-from config import CHECK_INTERVAL_SEC as _CHECK_INTERVAL_SEC, TELEGRAM_TOKEN
-
-CHECK_INTERVAL_SEC = int(_CHECK_INTERVAL_SEC)
-from services.moysklad import get_shipments, get_shipment, get_shipment_positions
-from services.database import (
-    get_all_users,
-    get_pool_stats,
-    mark_shipment_notified,
-    prune_notified_shipments,
-)
-from services import metrics
-from utils.helpers import extract_id_from_href
-from utils.formatters import format_shipment, DIV
+from config import TELEGRAM_TOKEN
+from services.database import get_all_users
+from utils.helpers import redact_token
 
 logger = logging.getLogger(__name__)
 
@@ -65,10 +58,13 @@ async def get_tg_session() -> aiohttp.ClientSession:
 
 
 def _redact_token(text: str) -> str:
-    """Убрать TELEGRAM_TOKEN из строки (для логов ошибок)."""
-    if TELEGRAM_TOKEN and TELEGRAM_TOKEN in text:
-        return text.replace(TELEGRAM_TOKEN, "***")
-    return text
+    """Убрать TELEGRAM_TOKEN из строки (для логов ошибок).
+
+    Реализация переехала в `utils.helpers.redact_token` — тем же понадобился
+    прокси фотографий техники в webapp. Имя оставлено как есть: им пользуются
+    вызовы ниже и тесты.
+    """
+    return redact_token(text)
 
 
 # ─── Видимость массового отказа отправки ────────────────────────────────────
@@ -213,173 +209,3 @@ async def _gather_limited(coros: list) -> list:
             return await coro
 
     return await asyncio.gather(*(_run(c) for c in coros), return_exceptions=True)
-
-
-def _is_bot_created(shipment: dict) -> bool:
-    """True, если demand создан этим ботом — у него проставлены кастом-атрибуты
-    telegram_full_name/telegram_user_id (см. ms_demand.create_demand_from_request).
-    Такие отгрузки босс уже одобрил, повторное «новая отгрузка» — шум."""
-    attrs = shipment.get("attributes")
-    if not isinstance(attrs, list):
-        return False
-    marker_names = {"telegram_full_name", "telegram_user_id"}
-    try:
-        from services.ms_demand import _CTX
-
-        marker_names |= {_CTX.get("attribute_name"), _CTX.get("attribute_uid")}
-    except Exception:
-        pass
-    marker_names.discard(None)
-    return any(
-        isinstance(a, dict) and a.get("name") in marker_names and a.get("value") not in (None, "")
-        for a in attrs
-    )
-
-
-async def notify_new_shipment(
-    demand_id: str,
-    shipment: dict | None = None,
-    recipients: list[int] | None = None,
-) -> bool:
-    """Уведомить boss/admin об ОДНОЙ новой отгрузке. Возвращает True, если
-    уведомление отправлено.
-
-    Дедуп через БД (`mark_shipment_notified`): и MS-вебхук (webapp-процесс),
-    и поллер (bot-процесс) зовут эту функцию — на каждый demand уйдёт ровно
-    одно уведомление, кто бы ни успел первым.
-
-    Слот «застолбляется» ПЕРЕД отправкой (но после того как объект и
-    получатели готовы) — если получить demand не удалось, слот свободен и
-    поллер-резерв сможет повторить позже.
-    """
-    if not demand_id:
-        return False
-    if shipment is None:
-        try:
-            shipment = await get_shipment(demand_id)
-        except Exception as e:
-            logger.warning("notify_new_shipment: demand %s fetch failed: %s", demand_id, e)
-            return False
-    if not shipment:
-        return False
-
-    # Бот-созданные отгрузки (одобрение заявки → бот сам создал demand) босс
-    # уже видел — повторно не уведомляем. Слот застолбляем, чтобы и поллер
-    # промолчал.
-    if _is_bot_created(shipment):
-        mark_shipment_notified(demand_id)
-        return False
-
-    if recipients is None:
-        recipients = get_notify_recipients()
-    if not recipients:
-        logger.warning("notify_new_shipment: нет получателей")
-        return False
-
-    # Атомарно застолбить отправку — гонка вебхука и поллера решается здесь.
-    if not mark_shipment_notified(demand_id):
-        metrics.incr("notify.shipment.dedup_skip")
-        return False
-
-    positions = []
-    try:
-        positions = await get_shipment_positions(demand_id)
-    except Exception:
-        pass
-
-    txt = f"{DIV}\n🔔 <b>Новая отгрузка!</b>\n\n" + format_shipment(shipment, positions)
-    async with metrics.atimer("notify.shipment.broadcast"):
-        results = await _gather_limited([tg_send_message(uid, txt) for uid in recipients])
-    # R5: если НИ ОДНО уведомление не доставлено (Telegram down) — освобождаем
-    # дедуп-слот, чтобы резервный поллер повторил позже (иначе потеря навсегда).
-    if not any(r is True for r in results):
-        from services.database import unmark_shipment_notified
-
-        unmark_shipment_notified(demand_id)
-        metrics.incr("notify.shipment.all_failed")
-        return False
-    metrics.incr("notify.shipment.sent")
-    return True
-
-
-async def shipment_notifier(bot: Bot | None = None):
-    """Резервный поллер: раз в CHECK_INTERVAL_SEC добирает отгрузки, которые
-    не пришли через MS-вебхук. Дедуп общий с вебхуком (notify_new_shipment),
-    поэтому дублей нет. `bot` больше не нужен (шлём через tg_send_message),
-    оставлен для совместимости со стартом фоновых задач."""
-    last_check: datetime = datetime.now()
-    logger.info("Мониторинг отгрузок (резерв) запущен, интервал %s с", CHECK_INTERVAL_SEC)
-
-    # Чистим дедуп-таблицу примерно раз в сутки (а не каждый цикл).
-    _prune_every = max(1, 86400 // CHECK_INTERVAL_SEC)
-    # Логируем pool-stats примерно раз в час, чтобы не засорять логи
-    # (при CHECK_INTERVAL_SEC=900 это каждые 4 цикла).
-    _pool_every = max(1, 3600 // CHECK_INTERVAL_SEC)
-    _cycle = 0
-    # Чтобы не повторять алерт каждый цикл при устойчиво высокой
-    # загрузке пула — взводим флаг при первой засветке выше порога,
-    # сбрасываем когда util падает ниже него.
-    _pool_alert_armed = False
-
-    while True:
-        await asyncio.sleep(CHECK_INTERVAL_SEC)
-        _cycle += 1
-        if _cycle % _prune_every == 0:
-            try:
-                deleted = await asyncio.to_thread(prune_notified_shipments)
-                if deleted:
-                    logger.info("notified_shipments: вычищено %d старых записей", deleted)
-            except Exception as e:
-                logger.warning("prune_notified_shipments failed: %s", e)
-        if _cycle % _pool_every == 0:
-            try:
-                stats = await asyncio.to_thread(get_pool_stats)
-                if stats:
-                    logger.info(
-                        "pg_pool: used=%d/free=%d (max=%d, util=%.1f%%)",
-                        stats.get("used", 0),
-                        stats.get("free", 0),
-                        stats.get("max", 0),
-                        stats.get("util_pct", 0.0),
-                    )
-                    util = float(stats.get("util_pct", 0.0))
-                    if util >= 80.0 and not _pool_alert_armed:
-                        _pool_alert_armed = True
-                        logger.warning(
-                            "pg_pool: загрузка %.1f%% (used=%d/max=%d) — близко к "
-                            "исчерпанию, увеличь PG_POOL_MAX или ищи утечку коннектов",
-                            util,
-                            stats.get("used", 0),
-                            stats.get("max", 0),
-                        )
-                    elif util < 60.0 and _pool_alert_armed:
-                        _pool_alert_armed = False
-                        logger.info("pg_pool: загрузка вернулась к норме (%.1f%%)", util)
-            except Exception as e:
-                logger.debug("pool stats failed: %s", e)
-        try:
-            shipments = await get_shipments(last_check)
-            last_check = datetime.now()
-
-            if not shipments:
-                continue
-
-            recipients = get_notify_recipients()
-            if not recipients:
-                logger.warning("Нет получателей для уведомлений об отгрузках")
-                continue
-
-            # Обрабатываем ВСЕ отгрузки за интервал, а не первые 5: поллер —
-            # резервный канал для пропущенных вебхуков, при всплеске >5 за окно
-            # лишние молча терялись (а last_check уже сдвинут → не доберём). Дубли
-            # исключает per-demand дедуп в notify_new_shipment (mark_shipment_notified).
-            if len(shipments) > 20:
-                logger.info("shipment poller: %d отгрузок за интервал (catch-up)", len(shipments))
-            for s in shipments:
-                demand_id = extract_id_from_href(s.get("meta", {}).get("href", ""))
-                if not demand_id:
-                    continue
-                await notify_new_shipment(demand_id, shipment=s, recipients=recipients)
-
-        except Exception as e:
-            logger.error("Ошибка мониторинга: %s", e)

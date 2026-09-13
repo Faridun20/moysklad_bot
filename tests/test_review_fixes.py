@@ -12,7 +12,6 @@
 
 import asyncio
 
-from services.roles import invalidate_all_roles
 
 
 class _FakeUser:
@@ -51,32 +50,6 @@ def _credit_debt(db, mgr, agent="A"):
     return oid
 
 
-def test_debts_menu_button_uses_callback_user(isolated_db):
-    db = isolated_db
-    invalidate_all_roles()
-    mgr = 7001
-    db.set_role(mgr, "mgr", "Manager", "manager")
-    _credit_debt(db, mgr)
-
-    from handlers.debts import cb_debts_my
-
-    call = _FakeCall("debts_my", uid=mgr)
-    asyncio.run(cb_debts_my(call))
-
-    # Должны показать долги (сводка + карточка), а не молчать.
-    assert call.message.answers, "меню «Долги» молчит — баг вернулся"
-    assert "Долг" in "\n".join(call.message.answers)
-
-
-def test_debts_silent_for_user_without_rights(isolated_db):
-    invalidate_all_roles()
-    from handlers.debts import cb_debts_my
-
-    call = _FakeCall("debts_my", uid=8002)  # роль не задана → guest
-    asyncio.run(cb_debts_my(call))
-    assert call.message.answers == []  # нет прав → тихо, без падения
-
-
 def test_refund_cash_writes_amount_cents(isolated_db):
     db = isolated_db
     boss = 1
@@ -90,6 +63,7 @@ def test_refund_cash_writes_amount_cents(isolated_db):
     res = asyncio.run(db.create_return(oid, "full", "брак", items, "cash", boss))
     assert res["ok"], res
 
+    asyncio.run(db.mark_return_goods_received(res["return_id"], boss))
     cres = asyncio.run(db.confirm_return(res["return_id"], boss, "Boss"))
     assert cres["ok"], cres
 

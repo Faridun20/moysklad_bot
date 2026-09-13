@@ -22,6 +22,25 @@ def esc(s) -> str:
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def redact_token(text: str) -> str:
+    """Убрать TELEGRAM_TOKEN из строки — обязательно для любого лога, куда
+    может попасть текст ошибки Bot API.
+
+    Токен входит в URL файлового API (`/file/bot<TOKEN>/...`), поэтому его
+    печатает не только наш код, но и текст исключения aiogram. Утёкший в логи
+    токен — это полный доступ к боту.
+
+    Жил приватной функцией в `services.notifier`; понадобился прокси фотографий
+    в webapp, а тянуть notifier ради одной строки значит тянуть и его
+    aiohttp-сессию.
+    """
+    from config import TELEGRAM_TOKEN
+
+    if TELEGRAM_TOKEN and TELEGRAM_TOKEN in text:
+        return text.replace(TELEGRAM_TOKEN, "***")
+    return text
+
+
 def extract_id_from_href(href: str) -> str:
     """Извлечь UUID из конца href-ссылки МойСклад."""
     if not href:
@@ -136,8 +155,9 @@ def local_now() -> datetime:
     (на Railway контейнер по умолчанию UTC, а TZ_OFFSET=5) границы периодов и
     «сегодня» считались в кадре +5, а `created_at` писался в кадре контейнера →
     вечерние записи выпадали из «сегодня», бот-аналитика расходилась с WebApp
-    (он уже читает `datetime.now()`). Теперь оба кадра совпадают по построению,
-    `TZ_OFFSET` не влияет на сравнения с `created_at`.
+    (он уже читает `datetime.now()`). Теперь оба кадра совпадают по построению;
+    сама переменная `TZ_OFFSET` после этого нигде не читалась и удалена из
+    config.py — зону задаёт только `TZ`.
 
     ВАЖНО: контейнер ДОЛЖЕН работать в бизнес-зоне (env `TZ`), т.к. `created_at`
     уже хранится в этом кадре — это единственная согласованная интерпретация."""

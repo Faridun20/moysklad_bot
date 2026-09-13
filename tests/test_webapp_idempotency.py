@@ -42,7 +42,6 @@ def client_env(isolated_db, monkeypatch):
         "verify_init_data",
         lambda init_data: {"id": int(init_data), "first_name": "U", "username": "u"},
     )
-    server._IDEM_CACHE.clear()  # чистим глобальный кэш между тестами
     client = TestClient(server.app)
     return client, db, {"boss": boss_id, "mgr": mgr_id, "order": oid}
 
@@ -88,7 +87,6 @@ def _setup(server, monkeypatch):
     import services.roles as roles
 
     importlib.reload(roles)
-    server._IDEM_CACHE.clear()
     monkeypatch.setattr(
         server,
         "verify_init_data",

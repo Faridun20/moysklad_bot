@@ -57,26 +57,6 @@ class _FakeState:
         self._data = {}
 
 
-# ─── #26: esc имени контрагента ──────────────────────────────────────────────
-
-
-def test_agent_pick_escapes_html_in_name(isolated_db):
-    from handlers.orders import cb_agent_pick
-
-    db = isolated_db
-    roles.invalidate_all_roles()
-    db.set_role(1, "mgr", "M", "manager")
-    oid = db.create_order(1, "M", "")
-    state = _FakeState({"agents": [{"id": "a1", "name": "Evil <script> & Co"}]})
-    call = _FakeCall(f"agent_pick:{oid}:0", uid=1)
-
-    asyncio.run(cb_agent_pick(call, state))
-    txt = call.message.answers[-1][0]
-    # Имя экранировано — сырой тег не попал в HTML-сообщение.
-    assert "&lt;script&gt;" in txt
-    assert "<script>" not in txt
-
-
 # ─── #27: *_base в сводке ────────────────────────────────────────────────────
 
 

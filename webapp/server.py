@@ -4,16 +4,22 @@ FastAPI сервер для WebApp.
 """
 
 import asyncio
+import base64
+import binascii
 import logging
+import math
 import os
 import subprocess
 import time
+from collections import OrderedDict
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from utils.helpers import local_now, redact_token
 from webapp.auth import verify_init_data
 
 # Берём роль из in-memory кэша (TTL 60s) вместо SELECT'а на каждый API-запрос.
@@ -43,51 +49,71 @@ def _spawn_bg(coro, name: str) -> asyncio.Task:
     return task
 
 
-# ─── Idempotency cache ──────────────────────────────────────────────
-# Защита от double-click на confirm/reject платежей. Клиент посылает
-# `idempotency_key` (random UUID per действие); если запрос с тем же
-# ключом приходит повторно в течение TTL — возвращаем кэшированный
-# результат, не дёргая БД повторно.
-# SECURITY.md (Medium): сейчас фронт может два раза кликнуть approve и
-# во время загрузки получить рассинхронизированное состояние.
-_IDEM_CACHE: dict[str, tuple[float, dict]] = {}
-_IDEM_TTL = 30.0
-
+# ─── Идемпотентность мутаций ─────────────────────────────────────────
+# Ключ идемпотентности живёт в ОБЩЕЙ БД (таблица idempotency_keys), а не в
+# памяти процесса.
+#
+# Был in-memory кэш с TTL 30 c. Он не переживал рестарт и не делился между
+# воркерами uvicorn, поэтому на денежных ручках (mark_paid, approve,
+# confirm_payment) защиты фактически не было: ретрай клиента после рестарта
+# или запрос, попавший в другой воркер, проходил как новый — лишний платёж,
+# лишний документ в МойСклад, двойное уведомление (T2.5).
 
 _IDEM_KEY_MAX = 128  # WP-22: cap длины клиентского ключа (storage/memory DoS)
 
 
 def _cap_idem_key(raw) -> str | None:
     """Ограничить длину клиентского idempotency_key (WP-22): ключ идёт в
-    in-memory кэш и в Postgres-таблицу идемпотентности; неограниченный ключ от
-    валидного юзера — вектор раздувания storage/памяти (cap по числу записей
-    не ограничивает РАЗМЕР ключа). UUID укладывается в 128 с запасом."""
+    таблицу идемпотентности; неограниченный ключ от валидного юзера — вектор
+    раздувания storage (cap по числу записей не ограничивает РАЗМЕР ключа).
+    UUID укладывается в 128 с запасом."""
     if not raw:
         return None
     return str(raw)[:_IDEM_KEY_MAX]
 
 
-def _idem_get(key: str | None) -> dict | None:
-    if not key:
-        return None
-    key = key[: _IDEM_KEY_MAX + 64]  # cap всего ключа (scope:uid:rawkey)
-    entry = _IDEM_CACHE.get(key)
-    if entry and time.monotonic() - entry[0] < _IDEM_TTL:
-        return entry[1]
-    return None
+class _Idem:
+    """Claim → работа → store, с освобождением ключа при сбое.
 
+    `claim()` возвращает сохранённый результат прошлого выполнения (тогда
+    endpoint просто отдаёт его) либо None — значит ключ наш и надо работать.
+    Если ключ занят, а результата ещё нет (операция в полёте или упала до
+    store), поднимаем 409: безопаснее отказать, чем рискнуть дублем денег.
 
-def _idem_set(key: str | None, value: dict) -> None:
-    if not key:
-        return
-    key = key[: _IDEM_KEY_MAX + 64]
-    # Простой GC при разрастании кэша — выкидываем протухшие записи.
-    if len(_IDEM_CACHE) > 200:
-        cutoff = time.monotonic() - _IDEM_TTL
-        for k in list(_IDEM_CACHE.keys()):
-            if _IDEM_CACHE[k][0] < cutoff:
-                _IDEM_CACHE.pop(k, None)
-    _IDEM_CACHE[key] = (time.monotonic(), value)
+    Без ключа от клиента все методы — no-op, поведение как раньше.
+    """
+
+    __slots__ = ("_adb", "_key", "_op", "_uid")
+
+    def __init__(self, adb, operation: str, user_id: int, raw_key):
+        capped = _cap_idem_key(raw_key)
+        self._adb = adb
+        self._op = operation
+        self._uid = user_id
+        self._key = f"{operation}:{user_id}:{capped}" if capped else None
+
+    @property
+    def active(self) -> bool:
+        return self._key is not None
+
+    async def claim(self) -> dict | None:
+        if not self._key:
+            return None
+        prev = await self._adb.idem_claim(self._key, self._op, self._uid)
+        if prev is None:
+            return None  # ключ наш
+        if prev:
+            return prev  # готовый результат прошлой попытки
+        raise HTTPException(status_code=409, detail="Запрос уже обрабатывается")
+
+    async def store(self, result: dict) -> None:
+        if self._key:
+            await self._adb.idem_store(self._key, result)
+
+    async def release(self) -> None:
+        """Освободить ключ — операция не состоялась, ретрай должен быть возможен."""
+        if self._key:
+            await self._adb.idem_release(self._key)
 
 
 def _dev_bypass_user() -> dict | None:
@@ -367,117 +393,6 @@ async def telegram_webhook(secret: str, request: Request):
     return JSONResponse({"ok": True})
 
 
-# ─── Webhook от МойСклад ─────────────────────────────────────────────────────
-
-
-# Лимит payload MS-webhook'а — реалистично от МойСклад приходит ≤ 50KB
-# (события батчатся). 1MB достаточно с большим запасом, при этом
-# защищает от DoS: кто-то с известным секретом мог бы слать тяжёлые
-# body, забивая нашу память.
-_MS_WEBHOOK_MAX_BYTES = 1 * 1024 * 1024
-
-
-def _new_demand_ids_from_events(events: list[dict]) -> list[str]:
-    """demand_id новых отгрузок (action=CREATE, type demand/retaildemand) из
-    payload MS-вебхука. Вынесено отдельно — чтобы тестировать дискриминацию
-    событий без асинхронной fire-and-forget обвязки хендлера."""
-    from utils.helpers import extract_id_from_href
-
-    ids: list[str] = []
-    for e in events:
-        if e.get("action") != "CREATE":
-            continue
-        if (e.get("meta") or {}).get("type", "").lower() not in ("demand", "retaildemand"):
-            continue
-        did = extract_id_from_href((e.get("meta") or {}).get("href", ""))
-        if did:
-            ids.append(did)
-    return ids
-
-
-@app.post("/api/ms-webhook/{secret}")
-async def ms_webhook(secret: str, request: Request):
-    """
-    МойСклад дёргает этот endpoint при изменениях документов, влияющих
-    на остатки (demand/supply/loss/move/inventory). Секрет в URL —
-    единственная защита от чужих POST-ов.
-
-    Получив событие, помечаем stock как dirty. Фоновая корутина
-    _stock_debounce_loop через несколько секунд сделает refresh_stock,
-    батча все полученные события в один pull.
-    """
-    import hmac as _hmac
-    from services.ms_webhooks import get_webhook_secret
-    from services.snapshot import mark_stock_dirty
-
-    # constant-time сравнение секрета (timing-attack hardening)
-    if not _hmac.compare_digest(secret, get_webhook_secret()):
-        # Не отдаём 401 — не подсказываем атакующему, что секрет нужен.
-        raise HTTPException(status_code=404, detail="not found")
-
-    # Лимит на размер тела (defence in depth — реальный МС шлёт ≤50KB)
-    cl = request.headers.get("Content-Length")
-    try:
-        if cl and int(cl) > _MS_WEBHOOK_MAX_BYTES:
-            raise HTTPException(status_code=413, detail="payload too large")
-    except ValueError:
-        pass
-
-    try:
-        body_bytes = await request.body()
-        if len(body_bytes) > _MS_WEBHOOK_MAX_BYTES:
-            raise HTTPException(status_code=413, detail="payload too large")
-        import json as _json
-
-        payload = _json.loads(body_bytes) if body_bytes else {}
-    except HTTPException:
-        raise
-    except Exception:
-        payload = {}
-
-    events = payload.get("events", []) if isinstance(payload, dict) else []
-    if events:
-        logger.info(
-            "ms-webhook: %d event(s): %s",
-            len(events),
-            ", ".join(f"{e.get('action')}.{(e.get('meta') or {}).get('type')}" for e in events[:5]),
-        )
-
-        from services.ms_webhooks import STOCK_SUBSCRIPTIONS
-
-        _stock_types = {s[0] for s in STOCK_SUBSCRIPTIONS}
-
-        # Остатки: только события от складских документов
-        stock_events = [
-            e for e in events if (e.get("meta") or {}).get("type", "").lower() in _stock_types
-        ]
-        if stock_events:
-            mark_stock_dirty()
-            # Документ изменился → читалки (get_sales_stats, get_shipments,
-            # позиции) могут отдавать устаревшие данные. Сбрасываем все
-            # TTL-кэши МС, чтобы следующее открытие «Аналитики» увидело
-            # свежие цифры.
-            from services.moysklad import invalidate_ms_cache
-
-            invalidate_ms_cache()
-
-        # Платежи / заказы покупателя: синхронизируем локальные данные
-        from services.ms_sync_handler import handle_ms_events
-
-        _spawn_bg(handle_ms_events(events), "handle_ms_events")
-
-        # Новые отгрузки → уведомляем boss/admin МГНОВЕННО (раньше это делал
-        # поллер раз в N секунд, отсюда задержка до нескольких минут). Дедуп
-        # внутри notify_new_shipment не даст задвоить с поллером-резервом.
-        from services.notifier import notify_new_shipment
-
-        for did in _new_demand_ids_from_events(events):
-            _spawn_bg(notify_new_shipment(did), f"notify_new_shipment:{did}")
-
-    # МойСклад ждёт 200 быстро, иначе ретраит. Сам рефреш делаем в фоне.
-    return JSONResponse({"ok": True, "received": len(events)})
-
-
 # ─── Health-check ────────────────────────────────────────────────────────────
 
 
@@ -600,7 +515,7 @@ async def api_search(request: Request):
     они и так нужны для создания заказов).
     """
     from services import async_db as adb
-    from services import snapshot
+    from services import counterparties as cp_service
 
     data = await request.json()
     user = _authorize(
@@ -618,7 +533,7 @@ async def api_search(request: Request):
 
     orders = await adb.search_orders(query, user_id=scope_uid, limit=20)
     payments = await adb.search_payments(query, user_id=scope_uid, limit=20)
-    agents = await asyncio.to_thread(snapshot.get_counterparties, query, 20)
+    agents = await cp_service.search(query, 20)
 
     # Урезаем заказы/платежи до полезного для UI набора полей.
     orders_out = [
@@ -662,14 +577,14 @@ async def api_home(request: Request):
       - my_orders: его заказы (по статусам + последние 5)
 
     Босс/админ видит общую картину:
-      - today: общая выручка/отгрузки/клиенты по всему МойСклад
+      - today: общая выручка/отгрузки/клиенты по складу компании
       - my_orders: его собственные заказы
       - pending_requests: количество заявок ожидающих апрува
       - top_employees: лидерборд за неделю
     """
     from datetime import datetime, timedelta
-    from services.moysklad import get_sales_stats, get_shipments
     from services import async_db as adb
+    from services.warehouse import sales_stats
 
     data = await request.json()
     user = _authorize(
@@ -709,24 +624,14 @@ async def api_home(request: Request):
     ]
 
     is_boss = role in ("admin", "boss")
-    # Заполняется только в boss-ветке ниже, но читается в отдельном boss-блоке
-    # (лидерборд) — объявляем заранее, чтобы тип был определён (mypy has-type).
-    week_shipments: list[dict] | BaseException = []
 
     # ─── Сегодня ──────────────────────────────────────
     if is_boss:
-        # Босс видит общую выручку за сегодня + лидерборд за неделю. Оба источника
-        # — независимые запросы к МойСклад; тянем их параллельно (раньше шли
-        # последовательно через всю функцию — ~1с на двух round-trip'ах подряд).
-        ms_results = await asyncio.gather(
-            get_sales_stats(start_of_day, now),
-            get_shipments(week_ago, now),
-            return_exceptions=True,
-        )
-        today_stats = ms_results[0]
-        week_shipments = ms_results[1]
-        if isinstance(today_stats, BaseException):
-            logger.warning("home: failed to load today stats: %s", today_stats)
+        # Босс видит общую выручку за сегодня — по расходным накладным склада.
+        try:
+            today_stats = await sales_stats(start_of_day, now)
+        except Exception as e:  # noqa: BLE001 — экран важнее одной цифры
+            logger.warning("home: failed to load today stats: %s", e)
             today_stats = {"total": 0, "count": 0, "clients": 0, "top_products": []}
         today = {
             "revenue": today_stats["total"] / 100,
@@ -735,8 +640,8 @@ async def api_home(request: Request):
             "scope": "company",
         }
     else:
-        # Менеджер: считаем личные показатели из локальных одобренных заявок.
-        # Источник — наша БД, без обращения к МойСклад. Батч-запросом
+        # Менеджер: считаем личные показатели из его же одобренных заявок.
+        # Батч-запросом
         # подтягиваем сразу все позиции (раньше был N+1 по заказам).
         today_iso = start_of_day.strftime("%Y-%m-%d")
         relevant_today = [
@@ -768,7 +673,9 @@ async def api_home(request: Request):
 
     from config import BASE_CURRENCY
 
-    result = {
+    # Явная аннотация: дальше в словарь кладут и числа, и списки словарей,
+    # а выведенный тип зафиксировался бы по первым ключам.
+    result: dict[str, Any] = {
         "role": role,
         "today": today,
         "my_orders": {
@@ -779,7 +686,6 @@ async def api_home(request: Request):
             "total": len(my_orders),
             "recent": recent,
         },
-        "ms_linked": bool(await adb.get_moysklad_employee_id(user_id)),
         "currency": BASE_CURRENCY,
     }
 
@@ -791,57 +697,64 @@ async def api_home(request: Request):
         # всего, что ждёт действия босса, чтобы он шёл в нужный раздел WebApp.
         # Дешёвые локальные SELECT'ы — последовательно (без конкурентности на пуле,
         # чтобы не споткнуться на одиночном соединении aiosqlite в тестах).
-        deposits_pending = await adb.get_pending_cash_deposits()
-        returns_pending = await adb.get_pending_returns()
-        payments_pending = await adb.get_paid_orders_awaiting_confirmation()
-        open_debts = await adb.get_open_debts()
+        # T2.13 (§3.8): COUNT(*) вместо четырёх полных SELECT * ради len().
+        counts = await adb.count_boss_attention()
         result["attention"] = {
             "requests": len(pending),
-            "payments": len(payments_pending),
-            "deposits": len(deposits_pending),
-            "returns": len(returns_pending),
-            "debts": len(open_debts),
+            "payments": counts["payments"],
+            "deposits": counts["deposits"],
+            "returns": counts["returns"],
+            "debts": counts["debts"],
         }
 
-        # Топ-сотрудники из УЖЕ полученных недельных отгрузок (см. gather выше).
-        # Группируем по кастомному атрибуту telegram_full_name (его проставляет
-        # ms_demand при создании отгрузки из бота). Нет атрибута → "Прочее
-        # (вручную в МойСклад)". Раньше группировали по `owner` — техническая
-        # учётка API-токена, все отгрузки липли к одному имени.
-        if isinstance(week_shipments, BaseException):
-            logger.warning("home: failed to load top employees: %s", week_shipments)
-            result["top_employees"] = []
-        else:
-            by_manager: dict[str, dict] = {}
-            for s in week_shipments:
-                tg_name = _extract_tg_attribute(s, "telegram_full_name")
-                if not tg_name:
-                    tg_name = "Прочее (вручную в МойСклад)"
-                cur = by_manager.setdefault(tg_name, {"sum": 0, "count": 0})
-                cur["sum"] += s.get("sum", 0) or 0
-                cur["count"] += 1
-            top_emp = sorted(by_manager.items(), key=lambda kv: kv[1]["sum"], reverse=True)[:5]
+        # Топ-сотрудники — из ЛОКАЛЬНЫХ заказов (`get_manager_performance`,
+        # GROUP BY user_id). Раньше группировали отгрузки МойСклад по
+        # кастомному атрибуту `telegram_full_name`, который проставлялся только
+        # когда документ создал бот, — всё остальное липло к строке «Прочее
+        # (вручную в МойСклад)». Своя таблица знает менеджера у каждого заказа.
+        try:
+            perf = await adb.get_manager_performance(
+                week_ago.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")
+            )
             result["top_employees"] = [
-                {"name": name, "revenue": d["sum"] / 100, "count": d["count"]}
-                for name, d in top_emp
+                {"name": m["full_name"], "revenue": m["revenue"], "count": m["shipped"]}
+                for m in perf[:5]
             ]
+        except Exception as e:  # noqa: BLE001 — лидерборд не важнее экрана
+            logger.warning("home: failed to load top employees: %s", e)
+            result["top_employees"] = []
 
     return JSONResponse(result)
 
 
-def _extract_tg_attribute(demand: dict, attr_name: str) -> str | None:
-    """Найти значение нашего кастомного атрибута в demand-документе.
-    МойСклад возвращает attributes inline в виде
-    [{"name": "...", "value": ...}, ...]."""
-    attrs = demand.get("attributes") or []
-    for a in attrs:
-        if a.get("name") == attr_name:
-            v = a.get("value")
-            return str(v) if v not in (None, "") else None
-    return None
-
-
 # ─── API: операционная сводка ────────────────────────────────────────────────
+
+
+@app.post("/api/today")
+async def api_today(request: Request):
+    """Очередь дел: что ждёт этого человека и в каком порядке.
+
+    Отдаётся ВСЕМ рабочим ролям, включая кладовщика и бухгалтера: до этого
+    «Главная» держалась на `/api/home`, который им не отвечает, и раздел
+    открывался экраном с ошибкой. Порядок и состав очереди считает
+    `services.work_queue` — в шаблоне он разъехался бы с ролями.
+    """
+    from services import work_queue
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager", "warehouse_keeper", "bookkeeper"),
+        rate_limit_scope="api_today",
+        rate_limit_max=120,
+    )
+    role = get_role(user["id"])
+    queue = await work_queue.gather(user["id"], role)
+    return JSONResponse({
+        "ok": True,
+        "queue": queue,
+        "total": sum(int(i["count"]) for i in queue),
+    })
 
 
 @app.post("/api/ops-summary")
@@ -872,9 +785,14 @@ async def api_ops_summary(request: Request):
 
 @app.post("/api/stock")
 async def api_stock(request: Request):
-    """Список товаров со склада."""
-    from services.moysklad import get_all_stock, get_categories
-    from utils.helpers import extract_id_from_href
+    """Список товаров со склада: остаток, резерв, доступное, цены.
+
+    Источник — наши `products`/`stock`, а не каталог МойСклад. Из-за этого
+    исчезла и ветка «МойСклад недоступен»: локальная БД либо есть, либо не
+    отвечает ничего, и мягко деградировать тут не во что.
+    """
+    from services import async_db as adb
+    from services.warehouse import get_catalog, get_categories
 
     data = await request.json()
     user = _authorize(
@@ -885,55 +803,33 @@ async def api_stock(request: Request):
     )
     role = get_role(user["id"])
 
-    # МойСклад может быть недоступен (сеть/токен/5xx). Раньше это всплывало как
-    # HTTP 500 с сырым «401 Unauthorized …» на экране «Каталог». Деградируем
-    # мягко: пустой каталог + флаг ms_unavailable, фронт покажет подсказку.
-    try:
-        rows, cats = await asyncio.gather(
-            get_all_stock(),
-            get_categories(),
-        )
-    except Exception as e:
-        logger.warning("stock: каталог МойСклад недоступен: %s", e)
-        return JSONResponse({"products": [], "categories": [], "ms_unavailable": True})
+    rows, cats = await asyncio.gather(get_catalog(), get_categories())
 
-    # PR C: подмешиваем цены руководства. sale_price — всем (менеджер
-    # видит минимум и дефолт), cost_price — ТОЛЬКО boss/admin (себестоимость
-    # не раскрываем менеджерам).
-    from services import async_db as adb
-
+    # PR C: подмешиваем цены руководства. sale_price — всем (менеджер видит
+    # минимум и дефолт), cost_price — ТОЛЬКО boss/admin (себестоимость не
+    # раскрываем менеджерам).
     is_boss = role in ("admin", "boss")
-    ms_ids = [extract_id_from_href(r.get("meta", {}).get("href", "")) for r in rows]
-    prices = await adb.get_product_prices_by_ids([i for i in ms_ids if i])
+    prices = await adb.get_product_prices_by_ids([str(r["product_id"]) for r in rows])
 
     products = []
-    for r, ms_id in zip(rows, ms_ids, strict=True):
-        pp = prices.get(ms_id) if ms_id else None
+    for r in rows:
+        pp = prices.get(str(r["product_id"]))
         item = {
-            "name": r.get("name", "—"),
-            "stock": r.get("stock", 0),
-            "reserve": r.get("reserve", 0),
-            "unit": r.get("uom", {}).get("name", "шт"),
-            # href нужен чтобы при создании заявки через WebApp
-            # позиция уехала в МойСклад demand с правильной ссылкой на товар
-            "href": r.get("meta", {}).get("href", ""),
-            "folder_id": extract_id_from_href(r.get("folder", {}).get("meta", {}).get("href", "")),
-            "folder_name": r.get("folder", {}).get("name", ""),
+            "product_id": r["product_id"],
+            "name": r["name"],
+            "stock": r["quantity"],
+            "reserve": r["reserved"],
+            "available": r["available"],
+            "unit": r["unit"],
+            "folder_id": r["category"],
+            "folder_name": r["category"],
             "sale_price": (pp.get("sale_price") if pp else None),
         }
         if is_boss and pp:
             item["cost_price"] = pp.get("cost_price")
         products.append(item)
 
-    categories = [
-        {
-            "id": extract_id_from_href(c.get("meta", {}).get("href", "")),
-            "name": c.get("name", "—"),
-        }
-        for c in cats
-    ]
-
-    return JSONResponse({"products": products, "categories": categories})
+    return JSONResponse({"products": products, "categories": cats})
 
 
 # ─── API: аналитика продаж ───────────────────────────────────────────────────
@@ -944,8 +840,8 @@ async def api_analytics(request: Request):
     """
     Аналитика продаж за период.
 
-    Менеджер видит ТОЛЬКО свои показатели (из локальной БД).
-    Босс/админ — общую по компании (из МойСклад API).
+    Менеджер видит ТОЛЬКО свои показатели (по его заказам).
+    Босс/админ — общую по компании (по расходным накладным склада).
     """
     from datetime import datetime
 
@@ -968,46 +864,46 @@ async def api_analytics(request: Request):
         # Личная аналитика — считаем из локальной БД по одобренным заявкам.
         return JSONResponse(await _personal_analytics(user_id, since, until, prev_since, label))
 
-    # Босс/админ — компания, из МойСклад
+    # Босс/админ — компания целиком
     payload = await _company_analytics_payload(since, until, prev_since, label)
     return JSONResponse(payload)
 
 
 async def _company_analytics_payload(since, until, prev_since, label: str) -> dict:
-    """Расчёт компанейской аналитики (boss/admin) из МойСклад.
+    """Расчёт компанейской аналитики (boss/admin) по расходным накладным.
 
-    Вынесено из api_analytics, чтобы /api/analytics/export переиспользовал
-    тот же расчёт. Включает маржу по топ-товарам (cost из product_prices),
-    топ клиентов и топ менеджеров.
+    Вынесено из api_analytics, чтобы /api/analytics/export переиспользовал тот
+    же расчёт. Включает маржу по топ-товарам (cost из product_prices), топ
+    клиентов и топ менеджеров.
+
+    Источник сменился с МойСклад на свой склад, и вместе с ним ушла ветка
+    «МС недоступен»: раньше любое исключение всплывало как HTTP 500 и WebApp
+    показывал «Unexpected token … is not valid JSON». Локальные запросы так не
+    падают, но обёртку `_safe_call` оставляем — пустая аналитика полезнее
+    ошибки вместо экрана.
     """
     from datetime import datetime
 
     from services import async_db as adb
-    from services.moysklad import get_sales_stats, get_shipments
+    from services.warehouse import list_shipments, sales_stats
 
-    # МойСклад может быть недоступен (сеть, истёкший/битый токен, 5xx). Раньше
-    # любое исключение тут всплывало как HTTP 500, и WebApp показывал «Не удалось
-    # загрузить: Unexpected token … is not valid JSON» (500-боди — не JSON).
-    # Деградируем мягко: пустые продажи + локальный топ-менеджеров всё равно
-    # отдаём, плюс флаг ms_unavailable для подсказки в UI.
     _empty_stats: dict = {"total": 0, "count": 0, "clients": 0, "top_products": []}
-    _ms_state = {"ok": True}
+    _state = {"ok": True}
 
     async def _safe_call(coro, default, label):
-        """Значение MS-вызова или default при сбое (сеть/токен/5xx) + флаг."""
         try:
             return await coro
-        except Exception as e:  # noqa: BLE001 — сюда же ClientResponseError 4xx/5xx
-            logger.warning("analytics: %s недоступен: %s", label, e)
-            _ms_state["ok"] = False
+        except Exception as e:  # noqa: BLE001 — экран важнее одной цифры
+            logger.warning("analytics: %s не посчитан: %s", label, e)
+            _state["ok"] = False
             return default
 
     current, prev, shipments = await asyncio.gather(
-        _safe_call(get_sales_stats(since, until), _empty_stats, "get_sales_stats"),
-        _safe_call(get_sales_stats(prev_since, since), _empty_stats, "get_sales_stats(prev)"),
-        _safe_call(get_shipments(since, until), [], "get_shipments"),
+        _safe_call(sales_stats(since, until), _empty_stats, "sales_stats"),
+        _safe_call(sales_stats(prev_since, since), _empty_stats, "sales_stats(prev)"),
+        _safe_call(list_shipments(since, until), [], "list_shipments"),
     )
-    ms_unavailable = not _ms_state["ok"]
+    stats_incomplete = not _state["ok"]
 
     days_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     by_day = [0] * 7
@@ -1023,16 +919,16 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
     if prev["total"] > 0:
         trend = round((current["total"] - prev["total"]) / prev["total"] * 100)
 
-    # Маржа по топ-товарам. МС price — минорные (÷100); cost — мажорные
+    # Маржа по топ-товарам. Выручка — в копейках (÷100); cost — мажорные
     # (как ввело руководство). cost None → profit не считаем.
     top_products = current["top_products"][:5]
-    prod_ms_ids = [d.get("ms_id") for _n, d in top_products if d.get("ms_id")]
-    costs = await adb.get_product_prices_by_ids(prod_ms_ids) if prod_ms_ids else {}
+    prod_ids = [str(d["product_id"]) for _n, d in top_products if d.get("product_id")]
+    costs = await adb.get_product_prices_by_ids(prod_ids) if prod_ids else {}
     top = []
     for name, d in top_products:
         revenue = d["sum"] / 100
         item = {"name": name, "sum": revenue, "qty": d["qty"]}
-        cost_row = costs.get(d.get("ms_id") or "")
+        cost_row = costs.get(str(d.get("product_id") or ""))
         cost = cost_row.get("cost_price") if cost_row else None
         if cost is not None:
             item["profit"] = round(revenue - float(cost) * d["qty"], 2)
@@ -1077,7 +973,7 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
         "top_products": top,
         "top_clients": top_clients,
         "top_managers": top_managers,
-        "ms_unavailable": ms_unavailable,
+        "stats_incomplete": stats_incomplete,
     }
 
 
@@ -1828,6 +1724,800 @@ async def api_money_summary(request: Request):
     return JSONResponse(totals)
 
 
+# ─── API: дебиторка («где деньги») ───────────────────────────────────────────
+# Заказы в кредит и рассрочки по технике — два учёта, но один вопрос: сколько
+# нам должны, когда это придёт и кто тянет. Считает `services.receivables`,
+# ручки только режут по роли и отдают.
+
+
+async def _receivables_for(user_id: int) -> tuple[list, bool]:
+    """Дебиторка в объёме роли. Второй элемент — видна ли техника."""
+    from services import receivables
+
+    is_boss = get_role(user_id) in ("admin", "boss")
+    items = await receivables.collect(
+        user_id=None if is_boss else user_id,
+        # Рассрочки оформляет руководство: менеджеру это не пустой блок, а
+        # чужой участок — поэтому не отдаём вовсе, а не отдаём нулём.
+        include_machines=is_boss,
+    )
+    return items, is_boss
+
+
+@app.post("/api/money/receivables")
+async def api_money_receivables(request: Request):
+    """«Где деньги»: разбивка по срокам, итоги по источникам, топ должников."""
+    from services import receivables
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_money_receivables",
+        rate_limit_max=30,
+    )
+    items, is_boss = await _receivables_for(user["id"])
+    payload = {
+        "ok": True,
+        "scope": "company" if is_boss else "personal",
+        "aging": receivables.aging(items),
+        "totals": receivables.totals_by_source(items),
+        "by_counterparty": receivables.by_counterparty(items),
+    }
+    if is_boss:
+        # Разрез по менеджерам — управленческий: менеджеру он показал бы чужие
+        # цифры, а себя он и так видит целиком.
+        owners = receivables.by_owner(items)
+        names = await _owner_names([o["user_id"] for o in owners])
+        for row in owners:
+            row["name"] = names.get(row["user_id"], f"#{row['user_id']}")
+        payload["by_owner"] = owners
+    return JSONResponse(payload)
+
+
+async def _owner_names(user_ids: list[int]) -> dict[int, str]:
+    """id менеджера → имя. Батчем: список владельцев иначе даёт N+1."""
+    if not user_ids:
+        return {}
+    from services import async_db as adb
+
+    users = await adb.get_all_users()
+    return {
+        int(u["user_id"]): (u.get("full_name") or u.get("username") or f"#{u['user_id']}")
+        for u in users
+        if int(u["user_id"]) in set(user_ids)
+    }
+
+
+@app.post("/api/money/forecast")
+async def api_money_forecast(request: Request):
+    """Ожидаемые поступления по месяцам вперёд. Только руководство."""
+    from services import receivables
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_money_forecast",
+        rate_limit_max=30,
+    )
+    raw_months = data.get("months")
+    try:
+        # Явная проверка на None, а не `or 6`: ноль — это запрос «ноль месяцев»,
+        # и подменять его дефолтом значит молча ответить не на тот вопрос.
+        months = 6 if raw_months is None or raw_months == "" else int(raw_months)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="months: не число")
+    months = max(1, min(months, 12))
+    items = await receivables.collect()
+    return JSONResponse({"ok": True, "months": receivables.forecast(items, months=months)})
+
+
+@app.post("/api/money/discipline")
+async def api_money_discipline(request: Request):
+    """Поступают ли платежи: собрано против ожидалось и доля платежей в срок."""
+    from datetime import datetime
+
+    from services import receivables
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_money_discipline",
+        rate_limit_max=30,
+    )
+    now = datetime.now()
+    since, until, _prev, label = _resolve_analytics_period(data, now)
+    stats = await receivables.collection_stats(
+        since.strftime("%Y-%m-%d"), until.strftime("%Y-%m-%d")
+    )
+    stats["period"] = {"label": label, "since": since.strftime("%Y-%m-%d"),
+                       "until": until.strftime("%Y-%m-%d")}
+    stats["ok"] = True
+    return JSONResponse(stats)
+
+
+@app.post("/api/machines/buyer")
+async def api_machines_buyer(request: Request):
+    """Карточка покупателя техники: все его сделки, графики и остаток.
+
+    Ключ — имя: настоящего идентификатора у покупателя пока нет
+    (`machine_deals` хранит имя и паспорт), поэтому сервис схлопывает регистр
+    и пробелы.
+    """
+    from services import receivables
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_buyer"
+    )
+    buyer = (data.get("buyer") or "").strip()[:200]
+    if not buyer:
+        raise HTTPException(status_code=400, detail="buyer обязателен")
+    card = await receivables.buyer_card(buyer)
+    if not card:
+        raise HTTPException(status_code=404, detail="Покупатель не найден")
+    return JSONResponse({"ok": True, **card})
+
+
+# ─── API: канал ──────────────────────────────────────────────────────────────
+# Канал — лицо компании: черновик собирает сервер, публикует человек кнопкой.
+# Ни один сборщик не выпускает наружу количества (см. `services/channel.py`).
+
+_CHANNEL_ROLES = ("admin", "boss")
+
+
+async def _photo_bytes(tg_file_id: str, cache_key: str) -> bytes | None:
+    """Байты фото из Telegram с тем же кэшем, что у фото техники."""
+    cached = _photo_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        bot = await get_notify_bot()
+        meta = await bot.get_file(tg_file_id)
+        if (meta.file_size or 0) > _PHOTO_MAX_BYTES:
+            return None
+        buf = await bot.download_file(meta.file_path)
+        blob = buf.read() if hasattr(buf, "read") else bytes(buf)
+    except Exception as e:
+        logger.warning("Фото недоступно: %s", redact_token(repr(e)))
+        return None
+    _photo_cache_put(cache_key, blob)
+    return blob
+
+
+@app.post("/api/products/search")
+async def api_products_search(request: Request):
+    """Поиск товара в номенклатуре — для подсказок при вводе позиции.
+
+    Читаем свою таблицу `products`: каталог теперь наш, и подсказка стоит один
+    локальный запрос. Поиск по кириллице — через `lower()` с обеих сторон
+    (CLAUDE.md: встроенный SQLite LOWER() ASCII-only, `adb_core` переопределяет
+    его Unicode-aware).
+    """
+    from services import adb_core
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_products_search", rate_limit_max=240,
+    )
+    query = (data.get("query") or "").strip()[:100]
+    if len(query) < 2:
+        # Пустой ввод — не повод отдавать первые 20 товаров каталога наугад.
+        return JSONResponse({"ok": True, "products": [], "query": query})
+    rows = await adb_core.fetch(
+        "SELECT id AS product_id, name, unit, category, sku FROM products "
+        "WHERE lower(name) LIKE $1 ORDER BY name LIMIT 20",
+        f"%{query.lower()}%",
+    )
+    return JSONResponse({"ok": True, "products": rows, "query": query})
+
+
+@app.post("/api/products/photo")
+async def api_products_photo(request: Request):
+    """Отдать фото товара байтами. Прямую ссылку Telegram отдавать нельзя —
+    в ней токен бота."""
+    from services import product_photos
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_products_photo", rate_limit_max=120,
+    )
+    product_ref = _product_ref(data)
+    photo_id = _machine_id_arg(data, "photo_id")
+    photos = await product_photos.list_photos(product_ref)
+    photo = next((p for p in photos if int(p["id"]) == photo_id), None)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Фото не найдено")
+
+    blob = await _photo_bytes(str(photo["tg_file_id"]), str(photo["file_unique_id"]))
+    if blob is None:
+        raise HTTPException(status_code=404, detail="Фото недоступно")
+    return Response(
+        blob, media_type=_photo_media_type(blob) or "image/jpeg",
+        headers={"Cache-Control": "private, max-age=600", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.post("/api/products/photos")
+async def api_products_photos(request: Request):
+    """Список фото товара. `tg_file_id` наружу не отдаём — клиенту нужен только
+    `photo_id`, а файловый URL Telegram содержит токен бота."""
+    from services import product_photos
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_products_photos",
+    )
+    product_ref = _product_ref(data, required=True)
+    photos = await product_photos.list_photos(product_ref)
+    return JSONResponse({
+        "ok": True,
+        "photos": [
+            {
+                "id": int(p["id"]),
+                "caption": p.get("caption") or "",
+                "uploaded_at": p.get("uploaded_at") or "",
+            }
+            for p in photos
+        ],
+        "can_upload": _machine_photos_chat_id() is not None,
+    })
+
+
+@app.post("/api/products/photo_delete")
+async def api_products_photo_delete(request: Request):
+    """Открепить фото товара. Скоупится товаром — иначе `photo_id` из формы
+    стирает чужой снимок."""
+    from services import product_photos
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_products_photo_delete"
+    )
+    product_ref = _product_ref(data, required=True)
+    photo_id = _machine_id_arg(data, "photo_id")
+    if not product_ref:
+        raise HTTPException(status_code=400, detail="Не указан товар")
+    return _machine_response(await product_photos.delete_photo(product_ref, photo_id))
+
+
+@app.post("/api/products/photo_upload")
+async def api_products_photo_upload(request: Request):
+    """Загрузить фото товара. base64 в JSON — как у техники: `python-multipart`
+    в зависимостях нет."""
+    from services import product_photos
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_products_photo_upload",
+        # Пачкой грузят по одному запросу на снимок: карточка товара с десятком
+        # ракурсов — это одно действие человека, а не подозрительная активность.
+        rate_limit_max=60,
+    )
+    product_ref = _product_ref(data, required=True)
+    chat_id = _machine_photos_chat_id()
+    if chat_id is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Загрузка фото не настроена: нет PHOTOS_TG_CHAT_ID",
+        )
+    blob = _decode_photo(data.get("data_url"))
+
+    try:
+        from aiogram.types import BufferedInputFile
+
+        bot = await get_notify_bot()
+        sent = await bot.send_photo(
+            chat_id, BufferedInputFile(blob, filename=f"product-{product_ref}.jpg"),
+            caption=(data.get("caption") or "")[:200] or None,
+        )
+    except Exception as e:
+        logger.warning("Фото товара не загружено: %s", redact_token(repr(e)))
+        raise HTTPException(status_code=502, detail="Telegram не принял фото")
+
+    best = max(sent.photo or [], key=lambda p: (p.width or 0) * (p.height or 0), default=None)
+    if best is None:
+        raise HTTPException(status_code=502, detail="Telegram не вернул файл")
+    res = await product_photos.add_photo(
+        product_ref, tg_file_id=best.file_id, file_unique_id=best.file_unique_id,
+        uploaded_by=user["id"], caption=(data.get("caption") or "")[:200] or None,
+    )
+    return _machine_response(res)
+
+
+def _decode_photo(raw_url) -> bytes:
+    """data-URL → байты, с теми же проверками, что у фото техники."""
+    raw = str(raw_url or "")
+    if not raw.startswith("data:image/") or "," not in raw:
+        raise HTTPException(status_code=400, detail="Ожидается изображение")
+    payload = raw.split(",", 1)[1]
+    if len(payload) > _PHOTO_MAX_BYTES * 4 // 3 + 1024:
+        raise HTTPException(status_code=413, detail="Фото больше 5 МБ")
+    try:
+        blob = base64.b64decode(payload, validate=True)
+    except (ValueError, binascii.Error):
+        raise HTTPException(status_code=400, detail="Повреждённое изображение")
+    if len(blob) > _PHOTO_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Фото больше 5 МБ")
+    if _photo_media_type(blob) is None:
+        raise HTTPException(status_code=400, detail="Поддерживаются JPEG и PNG")
+    return blob
+
+
+@app.post("/api/channel/draft")
+async def api_channel_draft(request: Request):
+    """Черновик поста: текст собирает СЕРВЕР, а не фронт.
+
+    Так правило «наружу не уходят количества» держится в одном месте и
+    проверяется тестом, а не повторяется в шаблоне.
+    """
+    from services import channel
+
+    data = await request.json()
+    _authorize(data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_channel_draft")
+    kind = (data.get("kind") or "").strip()
+    if kind not in channel.POST_KINDS:
+        raise HTTPException(status_code=400, detail=f"Тип поста: {', '.join(channel.POST_KINDS)}")
+
+    username = (data.get("manager_username") or "").strip()[:64] or None
+    note = (data.get("note") or "").strip()[:500] or None
+    ref = None
+    photo_id = None
+
+    if kind == "arrival":
+        container_id = _machine_id_arg(data, "container_id")
+        ref = str(container_id)
+        names = await channel.arrival_names(container_id)
+        if not names:
+            raise HTTPException(status_code=409, detail="В контейнере нет прибывших позиций")
+        text = channel.build_arrival(names, note=note, manager_username=username)
+    elif kind == "showcase":
+        from services import product_photos, warehouse
+
+        product_ref = _product_ref(data, required=True)
+        product = await warehouse.get_product(product_ref)
+        if not product:
+            raise HTTPException(status_code=404, detail="Товар не найден в каталоге")
+        ref = product_ref
+        prices = await _price_label(product_ref)
+        text = channel.build_showcase(
+            product, price=prices, note=note, manager_username=username
+        )
+        first = await product_photos.first_photo(product_ref)
+        photo_id = int(first["id"]) if first else None
+    else:
+        names = [str(n)[:200] for n in (data.get("names") or []) if str(n).strip()][:30]
+        if not names:
+            raise HTTPException(status_code=400, detail="Выберите хотя бы один товар")
+        text = channel.build_stale(names, note=note, manager_username=username)
+
+    return JSONResponse({
+        "ok": True, "kind": kind, "ref": ref, "text": text, "photo_id": photo_id,
+        "already_posted": await channel.already_posted(kind, ref) if ref else None,
+        "can_publish": _channel_id() is not None,
+    })
+
+
+async def _price_label(product_ref: str) -> str | None:
+    """Цена товара для витрины — только если её задавали руками."""
+    from services import async_db as adb
+    from config import BASE_CURRENCY
+
+    prices = await adb.get_product_prices_by_ids([product_ref])
+    row = prices.get(product_ref) or {}
+    price = row.get("sale_price")
+    if price is None or price == "":
+        return None
+    cents = money.parse_amount(price)
+    if cents is None:
+        return None
+    return f"{money.format_cents(cents, decimals=0, sep=' ')} " \
+           f"{(row.get('currency') or BASE_CURRENCY or 'USD').upper()}"
+
+
+@app.post("/api/channel/publish")
+async def api_channel_publish(request: Request):
+    """Опубликовать пост. Только по нажатию человеком — автопостинга нет.
+
+    Текст принимаем от клиента: черновик правят руками, и запрещать это значит
+    заставлять публиковать не то, что хотели. Сборщик при этом количеств не
+    выпускает — если человек допишет их сам, это его решение.
+    """
+    from services import channel
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_channel_publish",
+        rate_limit_max=20,
+    )
+    chat_id = _channel_id()
+    if chat_id is None:
+        raise HTTPException(status_code=503, detail="Канал не настроен: нет CHANNEL_ID")
+    kind = (data.get("kind") or "").strip()
+    if kind not in channel.POST_KINDS:
+        raise HTTPException(status_code=400, detail="Неизвестный тип поста")
+    text = (data.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Пустой пост публиковать нечего")
+    ref = (data.get("ref") or "").strip()[:64] or None
+
+    photo_blob = None
+    photo_id = data.get("photo_id")
+    if photo_id and _product_ref(data):
+        from services import product_photos
+
+        photos = await product_photos.list_photos(_product_ref(data))
+        photo = next((p for p in photos if int(p["id"]) == int(photo_id)), None)
+        if photo:
+            photo_blob = await _photo_bytes(
+                str(photo["tg_file_id"]), str(photo["file_unique_id"])
+            )
+
+    try:
+        bot = await get_notify_bot()
+        if photo_blob:
+            from aiogram.types import BufferedInputFile
+
+            sent = await bot.send_photo(
+                chat_id, BufferedInputFile(photo_blob, filename="post.jpg"),
+                caption=text[:1024], parse_mode="HTML",
+            )
+        else:
+            sent = await bot.send_message(chat_id, text[:4096], parse_mode="HTML")
+    except Exception as e:
+        logger.warning("Пост в канал не ушёл: %s", redact_token(repr(e)))
+        raise HTTPException(status_code=502, detail="Telegram не принял пост")
+
+    post_id = await channel.save_post(
+        kind=kind, ref=ref, message_id=getattr(sent, "message_id", None),
+        posted_by=user["id"],
+    )
+    return JSONResponse({"ok": True, "post_id": post_id,
+                         "message_id": getattr(sent, "message_id", None)})
+
+
+@app.post("/api/channel/stale")
+async def api_channel_stale(request: Request):
+    """Кандидаты в пост «залежавшееся». Внутренний экран — остаток здесь виден.
+
+    Считается тем же кодом, что дневная ops-сводка: остатки минус всё, что
+    отгружалось за период.
+    """
+    from services import channel
+
+    data = await request.json()
+    _authorize(data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_channel_stale",
+               rate_limit_max=10)
+    days = channel.stale_days()
+    from tasks.run_ops_monitor import collect_dead_stock
+
+    try:
+        dead = await collect_dead_stock(days)
+    except Exception as e:
+        logger.warning("Не удалось собрать залежавшееся: %s", e)
+        raise HTTPException(status_code=502, detail="МойСклад не ответил, попробуйте позже")
+    return JSONResponse({
+        "ok": True, "days": days, "items": channel.stale_candidates(dead),
+    })
+
+
+@app.post("/api/channel/history")
+async def api_channel_history(request: Request):
+    from services import channel
+
+    data = await request.json()
+    _authorize(data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_channel_history")
+    posts = await channel.history()
+    # Отклик считаем на каждый пост: это два локальных COUNT'а на строку, без
+    # запросов в МойСклад. История ограничена 30 постами, N+1 здесь не страшен.
+    for post in posts:
+        post["effect"] = await channel.post_effect(post.get("posted_at"))
+    return JSONResponse({
+        "ok": True, "posts": posts, "kind_labels": channel.KIND_LABELS,
+        "can_publish": _channel_id() is not None,
+    })
+
+
+# ─── API: воронка клиентов ───────────────────────────────────────────────────
+# Данные наполняет наблюдатель переписок (`handlers/business.py`). Здесь только
+# чтение и два ручных действия: исход сделки и привязка к контрагенту — их из
+# переписки не вывести.
+
+_LEAD_ROLES = ("admin", "boss", "manager")
+
+
+@app.post("/api/leads/list")
+async def api_leads_list(request: Request):
+    """Лиды. Менеджер видит только свои — чужие переписки не его дело."""
+    from services import leads
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_list")
+    role = get_role(user["id"])
+    is_boss = role in ("admin", "boss")
+    status = (data.get("status") or "").strip() or None
+    if status and status not in leads.STATUSES:
+        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+    # Исход и состояние разговора — разные вопросы («купил ли» и «на ком ход»),
+    # поэтому это два независимых отбора, а не один общий список значений.
+    state = (data.get("state") or "").strip() or None
+    if state and state not in leads.STATE_FILTERS:
+        raise HTTPException(status_code=400, detail=f"Неизвестное состояние: {state}")
+
+    rows = await leads.list_leads(
+        manager_id=None if is_boss else user["id"], status=status, state=state,
+        search=(data.get("search") or "").strip()[:100] or None,
+    )
+    from services import lead_calls
+
+    return JSONResponse({
+        "ok": True,
+        "leads": rows,
+        "scope": "company" if is_boss else "personal",
+        "status_labels": leads.STATUS_LABELS,
+        "connections": await leads.list_connections() if is_boss else [],
+        # Звонки без переписки — люди, которых в Telegram ещё нет. Отдаём вместе
+        # со списком: это один экран «с кем сегодня работать», и второй запрос
+        # ради него был бы лишним.
+        "unlinked_calls": await lead_calls.list_calls(unlinked=True, limit=50),
+    })
+
+
+@app.post("/api/leads/card")
+async def api_leads_card(request: Request):
+    """Карточка лида: отметки времени и события. Текстов переписки здесь нет —
+    мы их не храним."""
+    from services import leads
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_card")
+    lead_id = _machine_id_arg(data, "lead_id")
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+    from services import lead_calls
+
+    return JSONResponse({
+        "ok": True, "lead": lead, "status_labels": leads.STATUS_LABELS,
+        "lost_reasons": [
+            {"key": k, "label": leads.LOST_REASON_LABELS[k]} for k in leads.LOST_REASONS
+        ],
+        "direction_labels": lead_calls.DIRECTION_LABELS,
+        "source_labels": lead_calls.SOURCE_LABELS,
+    })
+
+
+@app.post("/api/leads/status")
+async def api_leads_status(request: Request):
+    """Отметить исход. Руками — в переписке его не видно: клиент может
+    согласиться голосом, а может пропасть без слова."""
+    from services import leads
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_status")
+    lead_id = _machine_id_arg(data, "lead_id")
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+    res = await leads.set_status(
+        lead_id, (data.get("status") or "").strip(),
+        user_id=user["id"], full_name=_actor_name(user),
+        # Причина отказа необязательна: обязательное поле на редко нажимаемой
+        # кнопке приводит к тому, что её перестают нажимать вовсе.
+        reason=(data.get("reason") or "").strip() or None,
+        note=_machine_text(data, "note", 500),
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/leads/agents")
+async def api_leads_agents(request: Request):
+    """Поиск контрагента для привязки — по названию ИЛИ телефону.
+
+    Телефон важнее названия: клиента помнят по номеру, а в справочнике он
+    записан как «ООО Бахор Савдо».
+    """
+    from services import counterparties as cp_service
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_agents",
+        rate_limit_max=240,
+    )
+    search = (data.get("search") or "").strip()[:100]
+    rows = await cp_service.search(search or None, 20)
+    return JSONResponse({"ok": True, "agents": rows})
+
+
+@app.post("/api/leads/create_agent")
+async def api_leads_create_agent(request: Request):
+    """Завести контрагента в справочнике по клиенту и сразу привязать.
+
+    Заводит ЧЕЛОВЕК кнопкой: каждый написавший — ещё не клиент, автосоздание
+    превратило бы справочник в свалку из случайных собеседников.
+    """
+    from services import counterparties as cp_service
+    from services import leads
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_create_agent",
+        rate_limit_max=30,
+    )
+    lead_id = _machine_id_arg(data, "lead_id")
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+
+    name = _machine_text(data, "name", 255) or lead.get("display_name") or lead.get("username")
+    created = await cp_service.create(
+        name or "",
+        phone=_machine_text(data, "phone", 64),
+        telegram_id=lead.get("tg_user_id"),
+    )
+    if not created.get("ok"):
+        return _machine_response(created)
+    res = await leads.link_agent(
+        lead_id, str(created["counterparty_id"]), user_id=user["id"],
+        full_name=_actor_name(user),
+    )
+    if not res.get("ok"):
+        return _machine_response(res)
+    return JSONResponse({**res, "name": created["name"], "existed": created["existed"]})
+
+
+@app.post("/api/leads/calls")
+async def api_leads_calls(request: Request):
+    """Журнал звонков. Без `lead_id` отдаёт непривязанные — тех, кого ещё не
+    нашли в Telegram; это и есть список «кому перезвонить»."""
+    from services import lead_calls
+
+    data = await request.json()
+    _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_calls")
+    lead_id = data.get("lead_id")
+    rows = await lead_calls.list_calls(
+        lead_id=_machine_id_arg(data, "lead_id") if lead_id else None,
+        unlinked=not lead_id,
+    )
+    return JSONResponse({
+        "ok": True,
+        "calls": rows,
+        "direction_labels": lead_calls.DIRECTION_LABELS,
+        "source_labels": lead_calls.SOURCE_LABELS,
+    })
+
+
+@app.post("/api/leads/call_add")
+async def api_leads_call_add(request: Request):
+    """Записать звонок. Обязателен только менеджер: половину звонков заносят
+    постфактум, когда номера уже нет под рукой, а «звонок без номера» — всё
+    ещё обращение. Обязательное поле здесь означало бы, что звонки перестанут
+    записывать вовсе."""
+    from services import lead_calls
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_add",
+        rate_limit_max=120,
+    )
+    lead_id = data.get("lead_id")
+    res = await lead_calls.add_call(
+        manager_id=user["id"],
+        phone=_machine_text(data, "phone", 64),
+        display_name=_machine_text(data, "display_name", 200),
+        direction=(data.get("direction") or "in").strip(),
+        source=(data.get("source") or "").strip() or None,
+        interest=_machine_text(data, "interest", 200),
+        lead_id=_machine_id_arg(data, "lead_id") if lead_id else None,
+        note=_machine_text(data, "note", 500),
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/leads/call_link")
+async def api_leads_call_link(request: Request):
+    """Связать записанный звонок с телеграм-лидом. Руками: Telegram номер
+    собеседника не отдаёт, общего поля у звонка с перепиской нет, и угадывание
+    означало бы чужой звонок в чужой карточке."""
+    from services import lead_calls
+
+    data = await request.json()
+    from services import leads
+
+    data_user = _authorize(
+        data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_link"
+    )
+    lead_id = _machine_id_arg(data, "lead_id")
+    # Тот же гейт, что у карточки и статуса: менеджер, который не может даже
+    # открыть чужого клиента, не должен подшивать к нему свой звонок.
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if (get_role(data_user["id"]) not in ("admin", "boss")
+            and lead.get("manager_id") != data_user["id"]):
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+
+    res = await lead_calls.link_call(
+        _machine_id_arg(data, "call_id"), lead_id, user_id=data_user["id"],
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/leads/call_delete")
+async def api_leads_call_delete(request: Request):
+    """Удалить ошибочную запись. Звонок — заметка менеджера, а не денежный
+    факт: запрещать правку значит копить мусор в списке «перезвонить»."""
+    from services import lead_calls
+
+    data = await request.json()
+    _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_delete")
+    res = await lead_calls.delete_call(_machine_id_arg(data, "call_id"))
+    return _machine_response(res)
+
+
+@app.post("/api/leads/link")
+async def api_leads_link(request: Request):
+    """Связать лид с контрагентом МойСклад — чтобы «написал» и «купил»
+    встретились."""
+    from services import leads
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_link")
+    lead_id = _machine_id_arg(data, "lead_id")
+    # Проверка владения была только у карточки и статуса — менеджер мог привязать
+    # контрагента к чужому лиду. Ручку до сих пор не звал фронт, поэтому дыра и
+    # не всплыла; закрываем прежде, чем кнопка появится.
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+    counterparty_id = (data.get("counterparty_id") or "").strip()[:64] or None
+    res = await leads.link_agent(
+        lead_id, counterparty_id, user_id=user["id"], full_name=_actor_name(user)
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/leads/funnel")
+async def api_leads_funnel(request: Request):
+    """Воронка за период + разрез по менеджерам. Только руководство."""
+    from datetime import datetime
+
+    from services import leads
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=("admin", "boss"), rate_limit_scope="api_leads_funnel"
+    )
+    since, until, _prev, label = _resolve_analytics_period(data, datetime.now())
+    since_s, until_s = since.strftime("%Y-%m-%d"), until.strftime("%Y-%m-%d")
+
+    managers = await leads.by_manager(since_s, until_s)
+    names = await _owner_names([m["manager_id"] for m in managers])
+    for row in managers:
+        row["name"] = names.get(row["manager_id"], f"#{row['manager_id']}")
+
+    return JSONResponse({
+        "ok": True,
+        "funnel": await leads.funnel(since_s, until_s),
+        "by_manager": managers,
+        "awaiting": await leads.awaiting_reply(),
+        "period": {"label": label, "since": since_s, "until": until_s},
+    })
+
+
 # ─── API: заказы ─────────────────────────────────────────────────────────────
 
 
@@ -1852,7 +2542,6 @@ async def api_orders(request: Request):
         orders = await adb.get_user_orders(user["id"])
 
     from config import BASE_CURRENCY
-    from utils.helpers import extract_id_from_href
 
     is_boss = role in ("admin", "boss")
 
@@ -1860,19 +2549,19 @@ async def api_orders(request: Request):
     items_by_order = await adb.get_order_items_by_ids([o["id"] for o in orders]) if orders else {}
 
     # PR C: прибыль по заказу — ТОЛЬКО boss/admin. Себестоимость из
-    # product_prices (батч по всем ms_id позиций). profit = Σ (price−cost)×qty.
+    # product_prices (батч по всем товарам позиций). profit = Σ (price−cost)×qty.
     # Если у позиции cost неизвестна — заказ помечается profit_partial=True
     # (не врём нулём). Менеджеру profit/cost не отдаём вообще.
-    cost_by_ms: dict = {}
+    cost_by_product: dict = {}
     if is_boss:
-        all_ms_ids = {
-            extract_id_from_href(it.get("product_href", ""))
+        all_product_ids = {
+            str(it["product_id"])
             for items in items_by_order.values()
             for it in items
-            if it.get("product_href")
+            if it.get("product_id")
         }
-        prices = await adb.get_product_prices_by_ids([i for i in all_ms_ids if i])
-        cost_by_ms = {
+        prices = await adb.get_product_prices_by_ids(sorted(all_product_ids))
+        cost_by_product = {
             k: v.get("cost_price") for k, v in prices.items() if v.get("cost_price") is not None
         }
 
@@ -1917,10 +2606,7 @@ async def api_orders(request: Request):
             profit = 0.0
             partial = False
             for it in items:
-                ms_id = extract_id_from_href(it.get("product_href", "")) if it.get(
-                    "product_href"
-                ) else ""
-                cost = cost_by_ms.get(ms_id)
+                cost = cost_by_product.get(str(it.get("product_id") or ""))
                 qty = float(it.get("quantity", 0) or 0)
                 price = float(it.get("price", 0) or 0)
                 if cost is None:
@@ -2020,16 +2706,28 @@ async def api_approve_request(request: Request):
     )
     override = bool(data.get("override"))
     # Idempotency: повторный тап «Одобрить» (или ретрай по таймауту) не должен
-    # повторно дёргать approve (двойное уведомление/PDF). Кэшируем ТОЛЬКО финальный
-    # успех, не needs_override (это запрос подтверждения — фронт повторит с override).
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"approve_request:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
+    # повторно дёргать approve — это двойное уведомление, второй PDF и, до T2.4,
+    # второй комплект документов в МойСклад. Ключ в общей БД (T2.5).
+    # Сохраняем ТОЛЬКО финальный успех: needs_override — это запрос
+    # подтверждения, и фронт повторит вызов ТЕМ ЖЕ ключом с override=true,
+    # поэтому ключ обязательно освобождаем, иначе повтор упрётся в 409.
+    from services import async_db as adb
+
+    idem = _Idem(adb, "approve_request", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+
     bot = await get_notify_bot()
-    result = await approve_shipment_request(req_id, user["id"], boss_name, bot, override=override)
+    try:
+        result = await approve_shipment_request(
+            req_id, user["id"], boss_name, bot, override=override
+        )
+    except Exception:
+        await idem.release()
+        raise
     if not result["ok"]:
+        await idem.release()
         # Превышение кредитного лимита — не ошибка, а запрос подтверждения:
         # фронт показывает цифры и повторяет вызов с override=true.
         if result.get("needs_override"):
@@ -2038,8 +2736,7 @@ async def api_approve_request(request: Request):
             )
         raise HTTPException(status_code=409, detail=result["error"])
     resp = {"ok": True, "req_id": req_id}
-    if idem_key:
-        _idem_set(f"approve_request:{user['id']}:{idem_key}", resp)
+    await idem.store(resp)
     return JSONResponse(resp)
 
 
@@ -2227,10 +2924,16 @@ async def api_clients_overview(request: Request):
 
 @app.post("/api/clients/detail")
 async def api_clients_detail(request: Request):
-    """Карточка контрагента: имя/телефон/МС-баланс (снапшот) + локальный долг/лимит
-    + заказы в боте + покупки из МС (отгрузки). Только начальство."""
+    """Карточка контрагента: имя/телефон + долг/лимит + заказы в боте +
+    покупки (расходные накладные склада). Только начальство.
+
+    Баланса взаиморасчётов МойСклад здесь больше нет: «сколько должен»
+    считает `get_agent_current_debt` по нашим же заказам, и второй ответ на
+    тот же вопрос с ним бы расходился.
+    """
     from services import async_db as adb
-    from services import moysklad, snapshot
+    from services import counterparties as cp_service
+    from services import warehouse
 
     data = await request.json()
     _authorize(
@@ -2244,15 +2947,15 @@ async def api_clients_detail(request: Request):
     if not agent_id:
         raise HTTPException(status_code=400, detail="agent_id обязателен")
 
-    cp = await asyncio.to_thread(snapshot.get_counterparty, agent_id)
+    cp = await cp_service.get(agent_id)
     debt = await adb.get_agent_current_debt(agent_id)
     limit = await adb.get_credit_limit(agent_id)
     orders = await adb.get_orders_by_agent(agent_id)
-    # Покупки из МС — best-effort: при сбое МС карточка всё равно открывается.
-    try:
-        purchases = await moysklad.get_counterparty_purchases(agent_id)
-    except Exception:
-        purchases = {"top_products": [], "recent": [], "total_cents": 0, "count": 0}
+    # История денег по клиенту: платежи, сдачи (в части, распределённой на его
+    # заказы) и возвраты. Формат строки — как в общей ленте «Деньги», поэтому
+    # фронт рисует её тем же кодом.
+    money_history = await adb.get_agent_money_history(agent_id)
+    purchases = await warehouse.counterparty_purchases(agent_id)
     from config import BASE_CURRENCY
 
     return JSONResponse(
@@ -2261,14 +2964,67 @@ async def api_clients_detail(request: Request):
             "agent_id": agent_id,
             "name": (cp or {}).get("name") or "",
             "phone": (cp or {}).get("phone") or "",
-            "balance_cents": (cp or {}).get("balance_cents"),
             "debt": debt,
             "limit": limit,
             "free": round(limit - debt, 2),
             "over_limit": debt > limit,
             "orders": orders,
+            "money_history": money_history,
             "purchases": purchases,
             "base_currency": (BASE_CURRENCY or "USD").upper(),
+        }
+    )
+
+
+@app.post("/api/clients/shipment")
+async def api_clients_shipment(request: Request):
+    """Состав отгрузки клиента: позиции расходной накладной.
+
+    В карточке клиента отгрузки показывались одной суммой и датой — увидеть,
+    ЧТО именно уехало, было нельзя, хотя это первый вопрос при разборе долга.
+    """
+    from services import warehouse
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_clients_shipment",
+        rate_limit_max=60,
+    )
+    invoice_id = _machine_id_arg(data, "invoice_id")
+    invoice = await warehouse.get_invoice(invoice_id)
+    if not invoice or invoice.get("type") != "outgoing":
+        raise HTTPException(status_code=404, detail="Накладная не найдена")
+
+    positions = []
+    # Итог копим в цикле, а не пересобираем генератором из уже готовых строк:
+    # значения словаря позиции — объединение типов (строки, float, int), и
+    # sum() по ним не проходит проверку типов (mypy — блокирующий гейт).
+    total_cents = 0
+    for pos in invoice.get("items") or []:
+        quantity = float(pos.get("quantity", 0) or 0)
+        price_cents = int(pos.get("price_cents", 0) or 0)
+        line_cents = money.mul_qty(price_cents, quantity)
+        total_cents += line_cents
+        positions.append(
+            {
+                "name": pos.get("product_name") or "—",
+                "quantity": quantity,
+                "unit": pos.get("unit") or "шт",
+                "price_cents": price_cents,
+                "sum_cents": line_cents,
+            }
+        )
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "invoice_id": invoice_id,
+            "number": invoice.get("invoice_number"),
+            "positions": positions,
+            "sum_cents": total_cents,
+            "currency": (invoice.get("currency") or "USD").upper(),
         }
     )
 
@@ -2337,7 +3093,7 @@ async def api_products_prices_set(request: Request):
     """Установить цену продажи (минимум) и/или себестоимость товара.
 
     Только admin/boss. Payload:
-      {"initData": "...", "ms_id": "...", "product_name": "...",
+      {"initData": "...", "product_id": N, "product_name": "...",
        "sale_price": 150.0, "cost_price": 100.0, "currency": "USD"}
     sale_price/cost_price опциональны (null = не задавать/сбросить).
     """
@@ -2347,9 +3103,7 @@ async def api_products_prices_set(request: Request):
     user = _authorize(
         data, allowed_roles=("admin", "boss"), rate_limit_scope="api_products_prices_set"
     )
-    ms_id = (data.get("ms_id") or "").strip()[:64]
-    if not ms_id:
-        raise HTTPException(status_code=400, detail="ms_id обязателен")
+    ms_id = _product_ref(data, required=True)
     product_name = (data.get("product_name") or "").strip()[:300]
 
     def _opt_price(key):
@@ -2378,7 +3132,1221 @@ async def api_products_prices_set(request: Request):
         "product_price_set",
         f"{ms_id} ({product_name}): sale={sale_price} cost={cost_price}",
     )
-    return JSONResponse({"ok": True, "ms_id": ms_id})
+    return JSONResponse({"ok": True, "product_id": ms_id})
+
+
+# ─── API: техника (экскаваторы) ──────────────────────────────────────────────
+# Раздел переехал из бота: формы, списки и фотографии — работа для экрана, а не
+# для командной строки в чате. В боте остаётся быстрый просмотр и ввод моточасов
+# с площадки.
+#
+# Роли: смотреть и вводить моточасы может менеджер; заводить машину, править
+# карточку, двигать статус и оформлять сделки — только admin/boss. Себестоимость
+# и паспорт покупателя режет `services.machines` на чтении, здесь их просто не
+# существует для менеджера.
+
+_MACHINE_ROLES = ("admin", "boss", "manager")
+_MACHINE_BOSS = ("admin", "boss")
+
+
+def _machine_response(res: dict) -> JSONResponse:
+    """Результат сервиса техники → HTTP-ответ.
+
+    Тексты ошибок в сервисе писались для человека — отдаём их как есть, а не
+    переписываем здесь во второй раз.
+
+    Код важнее текста: **409** значит «состояние на сервере уже другое, обнови
+    карточку» (машину продали, пока форма была открыта; показание моточасов
+    требует подтверждения), **400** — «исправь поле». Различить их иначе фронт
+    не может, а действия у него противоположные. Дополнительные поля ответа
+    (`current`, `previous`, `needs_force`) уходят клиенту вместе с `detail`:
+    без них форма не сможет предложить подтверждение.
+    """
+    if res.get("ok"):
+        return JSONResponse(res)
+    error = str(res.get("error") or "Не удалось выполнить операцию")
+    if "не найден" in error.lower():
+        code = 404
+    elif res.get("needs_force") or "current" in res or "сделка невозможна" in error:
+        code = 409
+    else:
+        code = 400
+    return JSONResponse({**res, "detail": error}, status_code=code)
+
+
+def _machine_photo_public(row: dict) -> dict:
+    """Фото наружу: только id и подпись.
+
+    `tg_file_id` клиенту не нужен и опасен — он открывает файл через Bot API
+    любому, кто знает токен, и переживает удаление карточки. Собираем ответ
+    явным списком полей, а не `dict(row)`: при следующей правке схемы неявный
+    вариант молча вынесет наружу новую колонку.
+    """
+    return {
+        "id": int(row["id"]),
+        "caption": row.get("caption") or "",
+        "sort_order": int(row.get("sort_order") or 0),
+        "uploaded_at": row.get("uploaded_at") or "",
+    }
+
+
+@app.post("/api/machines/list")
+async def api_machines_list(request: Request):
+    """Список техники + счётчики по статусам. Payload: {"status": "in_stock"?}."""
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_MACHINE_ROLES,
+        rate_limit_scope="api_machines_list",
+    )
+    role = get_role(user["id"])
+    status = (data.get("status") or "").strip() or None
+    if status and status not in machines.STATUSES:
+        # Не пустой список: «машины пропали» выглядит как потеря данных, а это
+        # опечатка в фильтре.
+        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+
+    rows = await machines.list_machines(role=role, status=status)
+    counts = await machines.count_by_status()
+    return JSONResponse(
+        {
+            "ok": True,
+            "machines": rows,
+            "counts": counts,
+            "status": status or "all",
+            "can_manage": role in _MACHINE_BOSS,
+            "can_see_cost": machines.can_see_cost(role),
+            "status_labels": machines.STATUS_LABELS,
+        }
+    )
+
+
+@app.post("/api/machines/card")
+async def api_machines_card(request: Request):
+    """Карточка машины: данные, фото, история моточасов, сделки, переходы."""
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_MACHINE_ROLES,
+        rate_limit_scope="api_machines_card",
+    )
+    role = get_role(user["id"])
+    try:
+        machine_id = int(data.get("machine_id") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="machine_id: не число")
+    if machine_id <= 0:
+        raise HTTPException(status_code=400, detail="machine_id обязателен")
+
+    machine = await machines.get_machine(machine_id, role=role)
+    if not machine:
+        raise HTTPException(status_code=404, detail="Машина не найдена")
+
+    photos = await machines.list_photos(machine_id)
+    hours = await machines.get_hours_history(machine_id)
+    deals = await machines.list_deals(machine_id, role=role)
+    # График рассрочки кладём внутрь сделки: отдельная ручка означала бы второй
+    # запрос ровно за тем, что и так открыто на экране.
+    for deal in deals:
+        if deal.get("kind") == "credit":
+            progress = await machines.deal_progress(int(deal["id"]))
+            # Платежи отдаём уже с покрытием: клиент вносит частями, и «оплачен
+            # или нет» на экране мало — видно должно быть, сколько внесено.
+            deal["payments"] = progress["payments"]
+            deal["progress"] = {k: v for k, v in progress.items() if k != "payments"}
+            deal["receipts"] = await machines.list_receipts(int(deal["id"]))
+    return JSONResponse(
+        {
+            "ok": True,
+            "machine": machine,
+            "photos": [_machine_photo_public(p) for p in photos],
+            "hours": hours,
+            "deals": deals,
+            # Граф переходов приходит с сервера: рисовать его копию на фронте
+            # значит завести второй источник правды о жизненном цикле машины.
+            "next_statuses": machines.next_status_options(machine.get("status")),
+            "can_manage": role in _MACHINE_BOSS,
+            # Без канала-хранилища загрузка не работает — кнопку рисовать нельзя.
+            "can_upload_photo": _machine_photos_chat_id() is not None,
+            "status_labels": machines.STATUS_LABELS,
+            # «Сегодня» считает сервер: просрочку платежа нельзя определять по
+            # часам телефона — они и в другом поясе, и просто сбиты.
+            "today": local_now().date().isoformat(),
+        }
+    )
+
+
+def _machine_id_arg(data: dict, key: str = "machine_id") -> int:
+    try:
+        value = int(data.get(key) or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{key}: не число")
+    if value <= 0:
+        raise HTTPException(status_code=400, detail=f"{key} обязателен")
+    return value
+
+
+def _product_ref(data: dict, required: bool = False) -> str:
+    """Идентификатор товара из тела запроса — СТРОКОЙ.
+
+    Фото и цены лежат в таблицах, чей ключ (`product_photos.ms_id`,
+    `product_prices.ms_id`) остался текстовым с эпохи МойСклад: переименовать
+    колонку нечем — инкрементальных миграций в проекте нет. После
+    `backfill_local_identifiers` там лежит id НАШЕЙ карточки, поэтому наружу
+    поле называется `product_id`, а внутрь уезжает его строковое представление.
+    """
+    raw = data.get("product_id")
+    value = "" if raw is None else str(raw).strip()[:64]
+    if required and not value:
+        raise HTTPException(status_code=400, detail="Не указан товар")
+    return value
+
+
+def _optional_id(data: dict, key: str) -> int | None:
+    """Необязательный положительный id из тела запроса. `None` — не прислали.
+
+    Отличается от `_machine_id_arg` тем, что пустое значение — законный ответ
+    «не выбрано», а не 400: поставщик контейнера и карточка товара у позиции
+    задаются не всегда.
+    """
+    raw = data.get(key)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{key}: не число")
+    if value <= 0:
+        raise HTTPException(status_code=400, detail=f"{key}: должен быть положительным")
+    return value
+
+
+def _machine_money(raw, label: str) -> int | None:
+    """Сумма из формы («25 000», «25000.50») → копейки.
+
+    Граница системы: наружу и внутрь ходят копейки, парсинг человеческой записи
+    живёт ровно здесь. Пустое поле — это «не задано», а не ноль.
+    """
+    if raw is None or str(raw).strip() == "":
+        return None
+    cents = money.parse_amount(raw)
+    if cents is None:
+        raise HTTPException(status_code=400, detail=f"{label}: не число или не больше нуля")
+    return cents
+
+
+def _machine_text(data: dict, key: str, limit: int = 200) -> str | None:
+    value = (str(data.get(key) or "")).strip()[:limit]
+    return value or None
+
+
+def _actor_name(user: dict) -> str:
+    return ((user.get("first_name") or "") + " " + (user.get("last_name") or "")).strip()
+
+
+@app.post("/api/machines/create")
+async def api_machines_create(request: Request):
+    """Завести машину. Менеджеру можно — себестоимость он всё равно не задаёт."""
+    from services import async_db as adb
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_MACHINE_ROLES,
+        rate_limit_scope="api_machines_create",
+        rate_limit_max=20,
+    )
+    role = get_role(user["id"])
+    status = (data.get("status") or "in_transit").strip()
+    if status not in machines.STATUSES:
+        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+
+    year = data.get("year")
+    hours = data.get("hours")
+    try:
+        year = int(year) if str(year or "").strip() else None
+        hours = int(hours) if str(hours or "").strip() else None
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Год и моточасы — целые числа")
+
+    payload = {
+        "vin": (data.get("vin") or "").strip()[:64],
+        "name": (data.get("name") or "").strip()[:200],
+        "created_by": user["id"],
+        "creator_name": _actor_name(user),
+        "brand": _machine_text(data, "brand", 100),
+        "model": _machine_text(data, "model", 100),
+        "year": year,
+        "hours": hours,
+        "price_cents": _machine_money(data.get("price"), "Цена"),
+        "currency": (data.get("currency") or "USD").strip().upper()[:8],
+        "status": status,
+        "eta_date": _machine_text(data, "eta_date", 20),
+        "container_no": _machine_text(data, "container_no", 50),
+        "location": _machine_text(data, "location", 200),
+        "notes": _machine_text(data, "notes", 1000),
+    }
+    # Себестоимость менеджер не видит — значит и записать не может. Иначе роль
+    # режется только на чтении, и поле утекает обратно через форму.
+    if machines.can_see_cost(role):
+        payload["cost_cents"] = _machine_money(data.get("cost"), "Себестоимость")
+
+    idem = _Idem(adb, "machine_create", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await machines.create_machine(**payload)
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/machines/update")
+async def api_machines_update(request: Request):
+    """Правка описательных полей карточки. Только admin/boss.
+
+    VIN здесь не меняется намеренно — сервис его в whitelist не пускает: смена
+    серийника это не правка, а другая машина.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_update"
+    )
+    machine_id = _machine_id_arg(data)
+    raw = data.get("fields")
+    if not isinstance(raw, dict) or not raw:
+        raise HTTPException(status_code=400, detail="Нечего менять")
+
+    # VIN правится отдельной функцией сервиса: у него нормализация и проверка
+    # уникальности, которых нет у остальных полей. Делаем это ДО прочих правок —
+    # если серийник занят, карточка не должна остаться частично изменённой.
+    if "vin" in raw:
+        vin_res = await machines.change_vin(
+            machine_id, str(raw.pop("vin") or ""),
+            user_id=user["id"], full_name=_actor_name(user),
+        )
+        if not vin_res.get("ok"):
+            return _machine_response(vin_res)
+        if not raw:
+            return JSONResponse(vin_res)
+
+    fields: dict = {}
+    for key, value in raw.items():
+        if key in ("price", "price_cents"):
+            fields["price_cents"] = _machine_money(value, "Цена")
+        elif key in ("cost", "cost_cents"):
+            fields["cost_cents"] = _machine_money(value, "Себестоимость")
+        elif key == "year":
+            try:
+                fields["year"] = int(value) if str(value or "").strip() else None
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Год — целое число")
+        else:
+            fields[key] = (str(value).strip()[:1000] or None) if value is not None else None
+    res = await machines.update_machine_fields(
+        machine_id, user_id=user["id"], full_name=_actor_name(user), **fields
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/delete")
+async def api_machines_delete(request: Request):
+    """Удалить карточку машины. Только admin/boss.
+
+    Для машины со сделкой сервис откажет: продажа — денежный факт, и стирать
+    его вместе с карточкой нельзя. Такие уводят в архив.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_delete"
+    )
+    machine_id = _machine_id_arg(data)
+    res = await machines.delete_machine(
+        machine_id, user_id=user["id"], full_name=_actor_name(user)
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/hours")
+async def api_machines_hours(request: Request):
+    """Записать моточасы. Может менеджер — показания снимают с площадки.
+
+    `force` (запись показания меньше предыдущего — законная замена счётчика)
+    только для руководства: иначе подтверждение «да, я уверен» обесценивает
+    саму проверку от опечатки.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_ROLES, rate_limit_scope="api_machines_hours"
+    )
+    role = get_role(user["id"])
+    machine_id = _machine_id_arg(data)
+    try:
+        hours = int(data.get("hours"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Моточасы — целое число")
+
+    force = bool(data.get("force"))
+    if force and role not in _MACHINE_BOSS:
+        raise HTTPException(
+            status_code=403, detail="Откат показания подтверждает руководитель"
+        )
+    res = await machines.add_hours(
+        machine_id, hours, user_id=user["id"], full_name=_actor_name(user), force=force
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/status")
+async def api_machines_status(request: Request):
+    """Сменить статус машины. Только admin/boss.
+
+    `expected` присылает фронт — тот статус, который он нарисовал. В этом смысл
+    CAS: пока карточка висела открытой, машину мог продать другой, и безусловный
+    UPDATE затёр бы его решение.
+
+    Граф переходов проверяем здесь, а не в `set_status`: внутренние вызовы
+    (`create_deal`, `close_deal`) двигают статус в обход ручного графа законно —
+    он описывает кнопки интерфейса, а не жизненный цикл целиком.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_status"
+    )
+    machine_id = _machine_id_arg(data)
+    target = (data.get("status") or "").strip()
+    expected = (data.get("expected") or "").strip()
+    if target not in machines.STATUSES:
+        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {target}")
+    if not expected:
+        raise HTTPException(status_code=400, detail="expected обязателен")
+    if target not in machines.next_statuses(expected):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Переход «{machines.STATUS_LABELS.get(expected, expected)}» → "
+            f"«{machines.STATUS_LABELS.get(target, target)}» не предусмотрен",
+        )
+    res = await machines.set_status(
+        machine_id, target, user_id=user["id"], full_name=_actor_name(user), expected=expected
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/deal")
+async def api_machines_deal(request: Request):
+    """Оформить продажу или рассрочку. Только admin/boss.
+
+    Ключ идемпотентности обязателен: сделка — денежный факт, а двойной тап по
+    «Оформить» на телефоне обычное дело. Повтор отдаёт тот же `deal_id`.
+    """
+    from services import async_db as adb
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_deal"
+    )
+    machine_id = _machine_id_arg(data)
+    kind = (data.get("kind") or "").strip()
+    if kind not in machines.DEAL_KINDS:
+        raise HTTPException(status_code=400, detail=f"Тип сделки: {' / '.join(machines.DEAL_KINDS)}")
+    price_cents = _machine_money(data.get("price"), "Цена")
+    if not price_cents:
+        raise HTTPException(status_code=400, detail="Цена сделки обязательна")
+    buyer_name = (data.get("buyer_name") or "").strip()[:200]
+    if not buyer_name:
+        raise HTTPException(status_code=400, detail="Покупатель обязателен")
+    if not data.get("idempotency_key"):
+        raise HTTPException(status_code=400, detail="idempotency_key обязателен")
+
+    # Рассрочка: взнос и срок в месяцах. Дату последнего платежа считает сервис
+    # по графику — введённая руками, она рано или поздно разошлась бы с ним.
+    down_payment_cents = _machine_money(data.get("down_payment"), "Первоначальный взнос") or 0
+    months = 0
+    if kind == "credit":
+        try:
+            months = int(data.get("months") or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Срок рассрочки — целое число месяцев")
+
+    idem = _Idem(adb, "machine_deal", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await machines.create_deal(
+            machine_id,
+            kind=kind,
+            price_cents=price_cents,
+            buyer_name=buyer_name,
+            created_by=user["id"],
+            creator_name=_actor_name(user),
+            currency=(data.get("currency") or "USD").strip().upper()[:8],
+            buyer_phone=_machine_text(data, "buyer_phone", 40),
+            buyer_passport=_machine_text(data, "buyer_passport", 100),
+            buyer_note=_machine_text(data, "buyer_note", 1000),
+            agent_ms_id=_machine_text(data, "agent_ms_id", 64),
+            down_payment_cents=down_payment_cents,
+            months=months,
+        )
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/machines/deal_close")
+async def api_machines_deal_close(request: Request):
+    """Закрыть рассрочку: деньги получены полностью, машина → «Продана»."""
+    from services import async_db as adb
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_deal_close"
+    )
+    deal_id = _machine_id_arg(data, "deal_id")
+
+    idem = _Idem(adb, "machine_deal_close", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await machines.close_deal(
+            deal_id, user_id=user["id"], full_name=_actor_name(user)
+        )
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        # «Сделка не найдена или уже закрыта» — состояние на сервере другое,
+        # карточку надо перечитать, а не править поле.
+        return JSONResponse({**res, "detail": res.get("error", "")}, status_code=409)
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/machines/payment")
+async def api_machines_payment(request: Request):
+    """Отметить платёж графика рассрочки полученным (или снять отметку).
+
+    Когда получен последний платёж, сервис закрывает сделку и переводит машину
+    в «Продана» сам: закрывать руками после последнего платежа значит однажды
+    забыть это сделать.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_payment"
+    )
+    payment_id = _machine_id_arg(data, "payment_id")
+    paid = data.get("paid", True)
+    res = await machines.pay_installment(
+        payment_id, user_id=user["id"], full_name=_actor_name(user), paid=bool(paid)
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/receipt")
+async def api_machines_receipt(request: Request):
+    """Записать полученные по рассрочке деньги — сумма любая.
+
+    Клиент платит не «платёж №3», а деньги: в один месяц больше, в другой
+    меньше. Поступления гасят график по порядку, переплата уходит в следующие
+    месяцы, а последний закрытый платёж закрывает сделку.
+    """
+    from services import async_db as adb
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_receipt"
+    )
+    deal_id = _machine_id_arg(data, "deal_id")
+    amount_cents = _machine_money(data.get("amount"), "Сумма")
+    if not amount_cents:
+        raise HTTPException(status_code=400, detail="Сумма обязательна")
+    if not data.get("idempotency_key"):
+        raise HTTPException(status_code=400, detail="idempotency_key обязателен")
+
+    idem = _Idem(adb, "machine_receipt", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await machines.add_receipt(
+            deal_id, amount_cents, user_id=user["id"], full_name=_actor_name(user),
+            note=_machine_text(data, "note", 200),
+        )
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/machines/receipt_delete")
+async def api_machines_receipt_delete(request: Request):
+    """Удалить ошибочно внесённое поступление.
+
+    Если им была закрыта рассрочка — она открывается обратно: иначе долг
+    исчезает из напоминаний и дебиторки, хотя платёж не получен.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_receipt_delete"
+    )
+    receipt_id = _machine_id_arg(data, "receipt_id")
+    res = await machines.delete_receipt(
+        receipt_id, user_id=user["id"], full_name=_actor_name(user)
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/deals_open")
+async def api_machines_deals_open(request: Request):
+    """Незакрытые рассрочки по технике — кому напоминать о сроке."""
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_deals_open"
+    )
+    deals = await machines.get_open_credit_deals(role=get_role(user["id"]))
+    return JSONResponse({"ok": True, "deals": deals})
+
+
+# ─── Фотографии техники ──────────────────────────────────────────────────────
+# Единственный сторедж фотографий — Telegram: он хранит их бесплатно и вечно, а
+# файловая система Railway эфемерна (после каждого деплоя пусто). Отсюда два
+# следствия, которые и определяют весь код ниже.
+#
+# 1. Прямую ссылку Telegram клиенту отдать НЕЛЬЗЯ: она выглядит как
+#    `https://api.telegram.org/file/bot<TOKEN>/...` и содержит токен бота. Файл
+#    проксируем через себя.
+# 2. Кэшируем в памяти процесса, а не на диске — по той же причине эфемерности.
+#    Ключ — `file_unique_id`: он переживает смену сервера Bot API, в отличие от
+#    `tg_file_id`. Кэшируем сразу байты, а не `file_path`: тот живёт около часа
+#    и всё равно требует второго запроса.
+
+_PHOTO_CACHE: "OrderedDict[str, tuple[float, bytes]]" = OrderedDict()
+_PHOTO_CACHE_TTL = 600.0
+_PHOTO_CACHE_MAX_BYTES = 32 * 1024 * 1024
+_PHOTO_MAX_BYTES = 5 * 1024 * 1024
+# Сигнатуры форматов, которые Telegram принимает как фото. Проверяем именно
+# байты: заявленный в data-URL тип пишет клиент, и через поле «фотография»
+# иначе пройдёт что угодно.
+_PHOTO_MAGIC = ((b"\xff\xd8\xff", "image/jpeg"), (b"\x89PNG\r\n\x1a\n", "image/png"))
+
+
+def _photo_cache_get(key: str) -> bytes | None:
+    entry = _PHOTO_CACHE.get(key)
+    if not entry:
+        return None
+    stamp, blob = entry
+    if time.time() - stamp > _PHOTO_CACHE_TTL:
+        _PHOTO_CACHE.pop(key, None)
+        return None
+    _PHOTO_CACHE.move_to_end(key)
+    return blob
+
+
+def _photo_cache_put(key: str, blob: bytes) -> None:
+    _PHOTO_CACHE[key] = (time.time(), blob)
+    _PHOTO_CACHE.move_to_end(key)
+    total = sum(len(b) for _, b in _PHOTO_CACHE.values())
+    while total > _PHOTO_CACHE_MAX_BYTES and len(_PHOTO_CACHE) > 1:
+        _, (_, dropped) = _PHOTO_CACHE.popitem(last=False)
+        total -= len(dropped)
+
+
+def _photo_media_type(blob: bytes) -> str | None:
+    for magic, media in _PHOTO_MAGIC:
+        if blob.startswith(magic):
+            return media
+    return None
+
+
+def _chat_id_env(*names: str) -> int | None:
+    """Первый заданный id канала из перечисленных переменных."""
+    for name in names:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            logger.error("%s должен быть числом, получено: %r", name, raw)
+    return None
+
+
+def _machine_photos_chat_id() -> int | None:
+    """Приватный канал-хранилище для загруженных из WebApp фотографий.
+
+    Прецедент — `BACKUP_TG_CHAT_ID`. Без переменной загрузка выключена: фото
+    по-прежнему можно прислать боту, поэтому это деградация функции, а не
+    поломка раздела.
+
+    Имя обобщено до `PHOTOS_TG_CHAT_ID`: хранилище одно на технику и на товары,
+    а заводить под каждый раздел свой канал незачем. Старое имя продолжает
+    работать — переименовывать переменную на проде ради красоты не нужно.
+    """
+    return _chat_id_env("PHOTOS_TG_CHAT_ID", "MACHINE_PHOTOS_TG_CHAT_ID")
+
+
+def _channel_id() -> int | None:
+    """Публичный канал компании. Без него публикация выключена."""
+    return _chat_id_env("CHANNEL_ID")
+
+
+@app.post("/api/machines/photo")
+async def api_machines_photo(request: Request):
+    """Отдать фотографию машины байтами.
+
+    `photo_id` ищем СРЕДИ ФОТО ЗАЯВЛЕННОЙ МАШИНЫ — это и есть защита от
+    подстановки чужого id: снимок обязан принадлежать той машине, к которой
+    у пользователя есть доступ.
+    """
+    from services import machines
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=_MACHINE_ROLES,
+        rate_limit_scope="api_machines_photo",
+        rate_limit_max=120,  # лента карточки — это десяток запросов подряд
+    )
+    machine_id = _machine_id_arg(data)
+    photo_id = _machine_id_arg(data, "photo_id")
+
+    photos = await machines.list_photos(machine_id)
+    photo = next((p for p in photos if int(p["id"]) == photo_id), None)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Фото не найдено")
+
+    headers = {
+        "Cache-Control": "private, max-age=600",
+        "X-Content-Type-Options": "nosniff",
+    }
+    cached = _photo_cache_get(str(photo["file_unique_id"]))
+    if cached is not None:
+        return Response(cached, media_type=_photo_media_type(cached) or "image/jpeg", headers=headers)
+
+    try:
+        bot = await get_notify_bot()
+        meta = await bot.get_file(str(photo["tg_file_id"]))
+        if (meta.file_size or 0) > _PHOTO_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="Фото слишком большое")
+        buf = await bot.download_file(meta.file_path)
+        blob = buf.read() if hasattr(buf, "read") else bytes(buf)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Протухший file_id, удалённое сообщение, сбой сети — это «фото сейчас
+        # недоступно», а не поломка сервера: 500 поднял бы тревогу на ровном
+        # месте. Текст исключения aiogram может содержать токен (он входит в
+        # URL файлового API), поэтому в лог он идёт только через redact_token.
+        logger.warning(
+            "Не удалось отдать фото #%s машины #%s: %s",
+            photo_id, machine_id, redact_token(repr(e)),
+        )
+        raise HTTPException(status_code=404, detail="Фото недоступно")
+
+    _photo_cache_put(str(photo["file_unique_id"]), blob)
+    return Response(blob, media_type=_photo_media_type(blob) or "image/jpeg", headers=headers)
+
+
+@app.post("/api/machines/photo_upload")
+async def api_machines_photo_upload(request: Request):
+    """Загрузить фотографию машины из WebApp.
+
+    Приходит data-URL (base64), а не multipart: `python-multipart` в
+    зависимостях нет, и `UploadFile`/`Form` без него роняют приложение на
+    старте. JSON заодно сохраняет единый контракт `_authorize(data)`. Раздувание
+    base64 на треть безболезненно — браузер ужимает снимок canvas'ом до
+    отправки.
+
+    Файл кладём в приватный канал и храним только идентификаторы: своего
+    стореджа у нас нет и заводить его ради десятка снимков незачем.
+    """
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_MACHINE_ROLES,
+        rate_limit_scope="api_machines_photo_upload",
+        # Пачкой грузят по одному запросу на снимок: экскаватор снимают с
+        # десятка ракурсов, и это одно действие, а не подозрительная активность.
+        rate_limit_max=60,
+    )
+    machine_id = _machine_id_arg(data)
+    chat_id = _machine_photos_chat_id()
+    if chat_id is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Загрузка фото не настроена: нет MACHINE_PHOTOS_TG_CHAT_ID. "
+                   "Пришлите фото боту.",
+        )
+
+    raw = str(data.get("data_url") or "")
+    if not raw.startswith("data:image/"):
+        raise HTTPException(status_code=400, detail="Ожидается изображение")
+    if "," not in raw:
+        raise HTTPException(status_code=400, detail="Повреждённое изображение")
+    # Оценка размера ДО декодирования: base64 длиннее оригинала на треть, и
+    # декодировать 40 МБ мусора, чтобы потом его отвергнуть, незачем.
+    payload = raw.split(",", 1)[1]
+    if len(payload) > _PHOTO_MAX_BYTES * 4 // 3 + 1024:
+        raise HTTPException(status_code=413, detail="Фото больше 5 МБ")
+    try:
+        blob = base64.b64decode(payload, validate=True)
+    except (ValueError, binascii.Error):
+        raise HTTPException(status_code=400, detail="Повреждённое изображение")
+    if len(blob) > _PHOTO_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Фото больше 5 МБ")
+    if _photo_media_type(blob) is None:
+        raise HTTPException(status_code=400, detail="Поддерживаются JPEG и PNG")
+
+    machine = await machines.get_machine(machine_id, role=get_role(user["id"]))
+    if not machine:
+        raise HTTPException(status_code=404, detail="Машина не найдена")
+
+    caption = (str(data.get("caption") or "")).strip()[:200]
+    try:
+        from aiogram.types import BufferedInputFile
+
+        bot = await get_notify_bot()
+        sent = await bot.send_photo(
+            chat_id,
+            BufferedInputFile(blob, filename=f"machine-{machine_id}.jpg"),
+            caption=f"#{machine_id} {machine.get('vin') or ''} {caption}".strip()[:1024],
+        )
+    except Exception as e:
+        logger.warning("Не удалось загрузить фото машины #%s: %s", machine_id, redact_token(repr(e)))
+        raise HTTPException(status_code=502, detail="Telegram не принял фото, попробуйте ещё раз")
+
+    # Берём самый крупный размер: Telegram отдаёт лесенку превью, и первый
+    # элемент — миниатюра ~90px, из которой карточку не рассмотреть.
+    best = max(sent.photo or [], key=lambda p: (p.width or 0) * (p.height or 0), default=None)
+    if best is None:
+        raise HTTPException(status_code=502, detail="Telegram не вернул файл")
+    res = await machines.add_photo(
+        machine_id,
+        tg_file_id=best.file_id,
+        file_unique_id=best.file_unique_id,
+        uploaded_by=user["id"],
+        caption=caption or None,
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/machines/photo_delete")
+async def api_machines_photo_delete(request: Request):
+    """Открепить фотографию от машины. Только admin/boss.
+
+    Из Telegram файл не удаляем — там он и не мешает, а вот восстановить
+    случайно снятый снимок иначе было бы нечем.
+    """
+    from services import machines
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_photo_delete"
+    )
+    machine_id = _machine_id_arg(data)
+    photo_id = _machine_id_arg(data, "photo_id")
+    photos = await machines.list_photos(machine_id)
+    if not any(int(p["id"]) == photo_id for p in photos):
+        raise HTTPException(status_code=404, detail="Фото не найдено")
+    res = await machines.delete_photo(photo_id)
+    if not res.get("ok"):
+        raise HTTPException(status_code=404, detail="Фото не найдено")
+    return JSONResponse({"ok": True, "photo_id": photo_id})
+
+
+# ─── API: контейнеры ─────────────────────────────────────────────────────────
+# Что едет, что уже здесь и сошёлся ли состав. Роли те же, что у техники:
+# заводит и принимает менеджер, удаляет руководство.
+
+_CONTAINER_ROLES = ("admin", "boss", "manager")
+
+
+@app.post("/api/containers/list")
+async def api_containers_list(request: Request):
+    """Список контейнеров + счётчики. Payload: {"status": "in_transit"?}."""
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_list"
+    )
+    status = (data.get("status") or "").strip() or None
+    if status and status not in containers.STATUSES:
+        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+    search = (data.get("search") or "").strip()[:64] or None
+
+    # Сводку и окно правки считает сервис одним проходом — раньше здесь был
+    # запрос состава на КАЖДЫЙ контейнер, то есть N+1 на список.
+    rows = await containers.list_containers(status, search=search)
+    for row in rows:
+        row["diff"] = row.pop("summary", None)
+    return JSONResponse(
+        {
+            "ok": True,
+            "containers": rows,
+            "counts": await containers.count_by_status(),
+            "status": status or "all",
+            "can_manage": get_role(user["id"]) in _MACHINE_BOSS,
+            "status_labels": containers.STATUS_LABELS,
+        }
+    )
+
+
+@app.post("/api/containers/card")
+async def api_containers_card(request: Request):
+    """Карточка контейнера: состав с расхождениями «заявлено → прибыло»."""
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_card"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    container = await containers.get_container(container_id)
+    if not container:
+        raise HTTPException(status_code=404, detail="Контейнер не найден")
+
+    from services import container_receipt
+
+    items = containers.diff(await containers.list_items(container_id))
+    return JSONResponse(
+        {
+            "ok": True,
+            "container": container,
+            "items": items,
+            "diff": containers.diff_summary(items),
+            # Окно правки: фронт по нему решает, показывать ли кнопки, а не
+            # выясняет это отказом ручки после нажатия.
+            "edit_window": containers.edit_window(container),
+            "receipt": await container_receipt.get_link(container_id),
+            "can_manage": get_role(user["id"]) in _MACHINE_BOSS,
+            "status_labels": containers.STATUS_LABELS,
+        }
+    )
+
+
+@app.post("/api/containers/create")
+async def api_containers_create(request: Request):
+    from services import async_db as adb
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_create",
+        rate_limit_max=20,
+    )
+    idem = _Idem(adb, "container_create", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await containers.create_container(
+            number=(data.get("number") or "").strip()[:32],
+            created_by=user["id"],
+            creator_name=_actor_name(user),
+            eta_date=_machine_text(data, "eta_date", 20),
+            notes=_machine_text(data, "notes", 1000),
+        )
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/containers/update")
+async def api_containers_update(request: Request):
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_update"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    raw = data.get("fields")
+    if not isinstance(raw, dict) or not raw:
+        raise HTTPException(status_code=400, detail="Нечего менять")
+    fields = {
+        k: (str(v).strip()[:1000] or None) if v is not None else None for k, v in raw.items()
+    }
+    res = await containers.update_container(
+        container_id, user_id=user["id"], full_name=_actor_name(user), **fields
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/containers/item_add")
+async def api_containers_item_add(request: Request):
+    """Добавить позицию в состав.
+
+    `arrived_qty` задают, когда позицию нашли в прибывшем контейнере, а в
+    заявленном составе её не было — то есть для излишка.
+    """
+    from services import containers
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_item_add",
+        rate_limit_max=120,  # состав заполняют подряд, позиция за позицией
+    )
+    container_id = _machine_id_arg(data, "container_id")
+
+    def _num(key):
+        value = data.get(key)
+        if value is None or str(value).strip() == "":
+            return None
+        try:
+            return float(str(value).replace(",", "."))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{key}: не число")
+
+    res = await containers.add_item(
+        container_id,
+        name=(data.get("name") or "").strip()[:200],
+        expected_qty=_num("expected_qty") or 0,
+        arrived_qty=_num("arrived_qty"),
+        unit=(data.get("unit") or "шт").strip()[:16],
+        note=_machine_text(data, "note", 500),
+        # Товар выбран из каталога — приёмка попадёт ровно на эту карточку,
+        # без угадывания по названию.
+        product_id=_optional_id(data, "product_id"),
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/containers/item_link")
+async def api_containers_item_link(request: Request):
+    """Привязать позицию состава к карточке номенклатуры.
+
+    Нужна и постфактум: состав часто заводят до того, как товар появился в
+    каталоге, а несопоставленная позиция — это остаток, которого нет.
+    """
+    from services import containers
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_item_link",
+        rate_limit_max=120,
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    item_id = _machine_id_arg(data, "item_id")
+    res = await containers.link_item(
+        container_id, item_id, product_id=_optional_id(data, "product_id") or 0
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/containers/item_create_product")
+async def api_containers_item_create_product(request: Request):
+    """Завести карточку товара в номенклатуре по названию позиции и привязать её.
+
+    Заводит ЧЕЛОВЕК кнопкой: автосоздание из приёмки превратило бы каждую
+    опечатку в новую позицию справочника.
+    """
+    from services import container_receipt, containers
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES,
+        rate_limit_scope="api_containers_item_create_product", rate_limit_max=30,
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    item_id = _machine_id_arg(data, "item_id")
+    # Позицию ищем ВНУТРИ заявленного контейнера — гейт от подстановки чужого id,
+    # и заодно название берём наше, а не присланное клиентом.
+    item = next(
+        (i for i in await containers.list_items(container_id) if int(i["id"]) == item_id), None
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
+
+    created = await container_receipt.create_product(
+        str(item["name"]), unit=str(item.get("unit") or "шт")
+    )
+    if not created.get("ok"):
+        return _machine_response(created)
+    res = await containers.link_item(
+        container_id, item_id, product_id=int(created["product_id"])
+    )
+    if not res.get("ok"):
+        return _machine_response(res)
+    return JSONResponse({**res, "name": created.get("name"), "existed": created.get("existed")})
+
+
+@app.post("/api/containers/item_delete")
+async def api_containers_item_delete(request: Request):
+    from services import containers
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_item_delete"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    item_id = _machine_id_arg(data, "item_id")
+    # Позицию ищем ВНУТРИ заявленного контейнера — гейт от подстановки чужого id.
+    res = await containers.delete_item(container_id, item_id)
+    return _machine_response(res)
+
+
+@app.post("/api/containers/check")
+async def api_containers_check(request: Request):
+    """Проставить фактические количества по позициям приёмки.
+
+    Payload: {"container_id": N, "quantities": {"<item_id>": 18, ...}}.
+    Пустое значение сбрасывает факт в «ещё не считали»: приёмщик должен иметь
+    возможность отменить свою же опечатку, а не только записать ноль.
+    """
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_check"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    raw = data.get("quantities")
+    if not isinstance(raw, dict) or not raw:
+        raise HTTPException(status_code=400, detail="Нечего сохранять")
+    quantities: dict[int, object] = {}
+    for key, value in raw.items():
+        try:
+            quantities[int(key)] = value
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="item_id: не число")
+
+    res = await containers.set_arrived_quantities(
+        container_id, quantities, user_id=user["id"], full_name=_actor_name(user)
+    )
+    if not res.get("ok"):
+        return _machine_response(res)
+
+    # Остаток пополняем сразу после сохранения — ради этого приёмку и считают.
+    # Best-effort: сверка уже сохранена, и отказ прихода не должен выглядеть как
+    # «ничего не записалось». Что не прошло — возвращаем текстом, чтобы это
+    # можно было починить, а не узнать через неделю по остаткам.
+    from services import container_receipt
+
+    res["receipt"] = await container_receipt.receive(container_id, user_id=user["id"])
+    return JSONResponse(res)
+
+
+@app.post("/api/containers/supplier")
+async def api_containers_supplier(request: Request):
+    """Задать поставщика контейнера.
+
+    Приёмку он не держит — локальной приходной накладной контрагент не
+    обязателен. Но «от кого пришло» потом некому восстановить, поэтому поле
+    спрашиваем заранее, а не в момент приёмки: когда считают коробки, о
+    поставщике не думают.
+    """
+    from services import container_receipt
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_supplier"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    supplier_id = _optional_id(data, "supplier_id")
+    name = (data.get("supplier_name") or "").strip()[:200] or None
+    if supplier_id is None:
+        raise HTTPException(status_code=400, detail="Выберите поставщика из справочника")
+    res = await container_receipt.set_supplier(container_id, supplier_id=supplier_id, name=name)
+    return _machine_response(res)
+
+
+@app.post("/api/containers/supply")
+async def api_containers_supply(request: Request):
+    """Оприходовать контейнер вручную — повтор после сбоя или после того, как
+    недостающий товар завели в номенклатуре.
+
+    Повторный вызов ПЕРЕОПРИХОДУЕТ: прежний приход отменяется, новый создаётся
+    с актуальными количествами.
+    """
+    from services import container_receipt
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_supply",
+        rate_limit_max=20,
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    res = await container_receipt.receive(container_id, user_id=user["id"])
+    return _machine_response(res)
+
+
+@app.post("/api/containers/arrive")
+async def api_containers_arrive(request: Request):
+    """Отметить контейнер прибывшим."""
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_CONTAINER_ROLES, rate_limit_scope="api_containers_arrive"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    res = await containers.mark_arrived(
+        container_id, user_id=user["id"], full_name=_actor_name(user)
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/containers/delete")
+async def api_containers_delete(request: Request):
+    """Удалить контейнер. Только admin/boss и пока открыто окно правки."""
+    from services import containers
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_containers_delete"
+    )
+    container_id = _machine_id_arg(data, "container_id")
+    res = await containers.delete_container(
+        container_id, user_id=user["id"], full_name=_actor_name(user)
+    )
+    return _machine_response(res)
 
 
 @app.post("/api/users/deactivate")
@@ -2457,14 +4425,18 @@ async def api_deposits_confirm(request: Request):
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"deposit_confirm:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
+    idem = _Idem(adb, "deposit_confirm", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
     dep = await adb.get_cash_deposit(deposit_id)
-    res = await adb.confirm_cash_deposit(deposit_id, user["id"], name)
+    try:
+        res = await adb.confirm_cash_deposit(deposit_id, user["id"], name)
+    except Exception:
+        await idem.release()
+        raise
     if not res.get("ok"):
+        await idem.release()
         raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
 
     if dep and dep.get("manager_id"):
@@ -2478,8 +4450,7 @@ async def api_deposits_confirm(request: Request):
         except Exception:
             logger.warning("deposit confirm notify failed", exc_info=True)
     resp = {"ok": True, "deposit_id": deposit_id, "closed_orders": res.get("closed_orders", [])}
-    if idem_key:
-        _idem_set(f"deposit_confirm:{user['id']}:{idem_key}", resp)
+    await idem.store(resp)
     return JSONResponse(resp)
 
 
@@ -2645,25 +4616,21 @@ async def api_returns_confirm(request: Request):
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"return_confirm:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
-    res = await adb.confirm_return(return_id, user["id"], name)
+    idem = _Idem(adb, "return_confirm", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await adb.confirm_return(return_id, user["id"], name)
+    except Exception:
+        await idem.release()
+        raise
     if not res.get("ok"):
+        await idem.release()
         raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
 
-    # Best-effort: создать «Возврат покупателя» в МойСклад (no-op без MS-контекста).
-    from services import ms_returns
-
-    try:
-        await ms_returns.create_salesreturn(return_id)
-    except Exception:
-        logger.warning("MS salesreturn create failed", exc_info=True)
     resp = {"ok": True, "return_id": return_id, "order_status": res.get("order_status")}
-    if idem_key:
-        _idem_set(f"return_confirm:{user['id']}:{idem_key}", resp)
+    await idem.store(resp)
     return JSONResponse(resp)
 
 
@@ -2682,18 +4649,85 @@ async def api_returns_goods_received(request: Request):
         return_id = int(data.get("return_id"))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="return_id обязателен")
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"return_goods:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
-    res = await adb.mark_return_goods_received(return_id, user["id"])
+    idem = _Idem(adb, "return_goods", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await adb.mark_return_goods_received(return_id, user["id"])
+    except Exception:
+        await idem.release()
+        raise
     if not res.get("ok"):
+        await idem.release()
         raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
     resp = {"ok": True, "return_id": return_id}
-    if idem_key:
-        _idem_set(f"return_goods:{user['id']}:{idem_key}", resp)
+    await idem.store(resp)
     return JSONResponse(resp)
+
+
+@app.post("/api/returns/positions")
+async def api_returns_positions(request: Request):
+    """Позиции заказа, доступные к возврату (T3.1).
+
+    Нужен фронту, чтобы собрать ЧАСТИЧНЫЙ возврат: в /api/orders позиции
+    приходят без id и без returned_qty, поэтому выбрать «вернуть 2 из 5»
+    было не из чего — частичный возврат существовал только в боте (§5.2.6).
+
+    Доступное = quantity − returned_qty. Гейты (роль, владелец, статус
+    заказа) — те же, что в /api/returns/create: экран не должен показывать
+    то, что потом отвергнет создание.
+    """
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "warehouse_keeper", "manager"),
+        rate_limit_scope="api_returns_positions",
+    )
+    try:
+        order_id = int(data.get("order_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="order_id обязателен")
+
+    order = await adb.get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    if order.get("status") not in ("shipped", "paid", "partially_returned") and not order.get(
+        "paid_confirmed_at"
+    ):
+        raise HTTPException(
+            status_code=409, detail="Возврат доступен только для отгруженных/оплаченных"
+        )
+    privileged = get_role(user["id"]) in ("admin", "boss", "warehouse_keeper")
+    if not privileged and order.get("user_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Возврат только по своим заказам")
+
+    from config import BASE_CURRENCY
+
+    positions = []
+    for it in await adb.get_order_items(order_id):
+        avail = float(it.get("quantity", 0) or 0) - float(it.get("returned_qty", 0) or 0)
+        if avail <= 0:
+            continue
+        positions.append(
+            {
+                "item_id": it["id"],
+                "name": it.get("product_name") or "—",
+                "unit": it.get("unit") or "шт",
+                "available": avail,
+                "price": float(it.get("price", 0) or 0),
+            }
+        )
+    return JSONResponse(
+        {
+            "ok": True,
+            "order_id": order_id,
+            "currency": order.get("currency") or BASE_CURRENCY,
+            "positions": positions,
+        }
+    )
 
 
 @app.post("/api/returns/create")
@@ -2747,19 +4781,74 @@ async def api_returns_create(request: Request):
     if not privileged and order.get("user_id") != user["id"]:
         raise HTTPException(status_code=403, detail="Возврат только по своим заказам")
 
+    # T3.1: частичный возврат. Раньше эндпоинт жёстко слал "full" и возвращал
+    # ВСЕ позиции целиком — частичный возврат существовал только в боте
+    # (§5.2.6). Теперь фронт может прислать items: [{item_id, quantity}].
+    #
+    # Доступное к возврату = quantity − returned_qty (как в боте): позиция,
+    # уже возвращённая прошлым возвратом, второй раз не отдаётся.
     items = await adb.get_order_items(order_id)
-    ret_items = [
-        (
-            it["id"],
-            float(it.get("quantity", 0)),
-            round(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0), 2),
-        )
+    avail_by_id = {
+        it["id"]: float(it.get("quantity", 0) or 0) - float(it.get("returned_qty", 0) or 0)
         for it in items
-    ]
+    }
+    price_by_id = {it["id"]: float(it.get("price", 0) or 0) for it in items}
+    returnable = {iid: a for iid, a in avail_by_id.items() if a > 0}
+    if not returnable:
+        if full_key:
+            await adb.idem_release(full_key)
+        raise HTTPException(status_code=409, detail="Нет позиций, доступных к возврату")
+
+    raw_items = data.get("items")
+    if raw_items is None:
+        # Полный возврат — всё доступное (поведение по умолчанию, как было).
+        ret_items = [
+            (iid, avail, round(avail * price_by_id[iid], 2)) for iid, avail in returnable.items()
+        ]
+        return_type = "full"
+    else:
+        if not isinstance(raw_items, list) or not raw_items:
+            if full_key:
+                await adb.idem_release(full_key)
+            raise HTTPException(status_code=400, detail="Выберите хотя бы одну позицию")
+        ret_items = []
+        for row in raw_items:
+            try:
+                iid = int(str((row or {}).get("item_id")))
+                qty = float(str((row or {}).get("quantity")))
+            except (TypeError, ValueError, AttributeError):
+                if full_key:
+                    await adb.idem_release(full_key)
+                raise HTTPException(status_code=400, detail="Позиция: нужны item_id и quantity")
+            if iid not in returnable:
+                if full_key:
+                    await adb.idem_release(full_key)
+                raise HTTPException(
+                    status_code=400, detail=f"Позиция {iid} недоступна к возврату"
+                )
+            if not (math.isfinite(qty) and 0 < qty <= returnable[iid] + 1e-9):
+                if full_key:
+                    await adb.idem_release(full_key)
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Позиция {iid}: количество должно быть от 0 до "
+                        f"{returnable[iid]:g}"
+                    ),
+                )
+            qty = min(qty, returnable[iid])
+            ret_items.append((iid, qty, round(qty * price_by_id[iid], 2)))
+        # Выбраны все позиции в полном объёме — это фактически полный возврат
+        # (та же логика, что в боте: от типа зависит статус заказа).
+        is_full = len(ret_items) == len(returnable) and all(
+            abs(qty - returnable[iid]) < 1e-9 for iid, qty, _ in ret_items
+        )
+        return_type = "full" if is_full else "partial"
+
     try:
         res = await adb.create_return(
             order_id,
-            "full",
+            return_type,
             reason,
             ret_items,
             refund_method=refund,
@@ -2808,7 +4897,12 @@ async def api_create_order(request: Request):
     full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
-    order_id = await adb.create_order(user["id"], full_name, data.get("comment", ""))
+    # T3.2: тот же дефект, что у бот-кнопки «Новый заказ» — openOrderEditor(null)
+    # создаёт черновик на КАЖДОЕ открытие редактора, так что выход назад и
+    # повторный вход плодят пустые заказы. Переиспользуем пустой черновик.
+    order_id, _created = await adb.get_or_create_draft(
+        user["id"], full_name, data.get("comment", "")
+    )
     return JSONResponse({"order_id": order_id})
 
 
@@ -2833,13 +4927,17 @@ async def api_orders_ship(request: Request):
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"order_ship:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
-    res = await adb.mark_order_shipped(order_id, user["id"], name)
+    idem = _Idem(adb, "order_ship", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await adb.mark_order_shipped(order_id, user["id"], name)
+    except Exception:
+        await idem.release()
+        raise
     if not res.get("ok"):
+        await idem.release()
         raise HTTPException(status_code=409, detail=res.get("error", "не удалось отгрузить"))
 
     creator = order.get("user_id") if order else None
@@ -2850,8 +4948,7 @@ async def api_orders_ship(request: Request):
         except Exception:
             logger.warning("order ship notify failed", exc_info=True)
     resp = {"ok": True, "order_id": order_id}
-    if idem_key:
-        _idem_set(f"order_ship:{user['id']}:{idem_key}", resp)
+    await idem.store(resp)
     return JSONResponse(resp)
 
 
@@ -2880,7 +4977,13 @@ async def api_orders_cancel(request: Request):
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
-    res = await adb.cancel_order(order_id, user["id"], name, reason)
+    # T2.6: тот же код, что и в боте — с реверсом customerorder в МойСклад.
+    # Раньше здесь реверса НЕ было: заказ, отменённый из WebApp, оставался
+    # в МС живым документом с резервом товара навсегда, и реконсиляция его
+    # уже не подбирала (§5.2.2).
+    from services.order_workflow import cancel_order_full
+
+    res = await cancel_order_full(order_id, user["id"], name, reason)
     if not res.get("ok"):
         raise HTTPException(status_code=409, detail=res.get("error", "не удалось отменить"))
 
@@ -2914,7 +5017,6 @@ async def api_add_item(request: Request):
     )
 
     from services import async_db as adb
-    from utils.helpers import extract_id_from_href
 
     order = await adb.get_order(data["order_id"])
     if not order or order["user_id"] != user["id"]:
@@ -2930,14 +5032,13 @@ async def api_add_item(request: Request):
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Неверная цена")
 
-    # PR C: минимальная цена продажи, заданная руководством. По product_href
-    # → ms_id → product_prices.sale_price. Если задана:
+    # PR C: минимальная цена продажи, заданная руководством. По карточке
+    # товара → product_prices.sale_price. Если задана:
     #   • price не передан/0 → префилл sale_price (дефолт)
     #   • price < sale_price → 400 (нельзя продать ниже минимума)
-    product_href = data.get("product_href", "")
-    ms_id = extract_id_from_href(product_href) if product_href else ""
-    if ms_id:
-        pp = await adb.get_product_price(ms_id)
+    product_ref = _product_ref(data)
+    if product_ref:
+        pp = await adb.get_product_price(product_ref)
         sale_min = pp.get("sale_price") if pp else None
         if sale_min is not None:
             if price <= 0:
@@ -2960,11 +5061,12 @@ async def api_add_item(request: Request):
     item_id = await adb.add_order_item(
         order_id=data["order_id"],
         product_name=data["product_name"],
-        product_href=product_href,
+        product_href="",
         quantity=quantity,
         unit=data.get("unit", "шт"),
         price=price,
         note=data.get("note", ""),
+        product_id=int(product_ref) if product_ref.isdigit() else None,
     )
     return JSONResponse({"item_id": item_id})
 
@@ -3035,63 +5137,34 @@ async def api_submit_order(request: Request):
     order = await adb.get_order(order_id)
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
-    # Idempotency: двойной сабмит мог создать две shipment_request до того, как
-    # статус заказа уйдёт из draft. Кэшируем финальный {req_id}.
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"order_submit:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
-    from services.order_workflow import validate_transition
-
-    err = validate_transition(order, "pending")
-    if err:
-        raise HTTPException(status_code=400, detail=err)
-    if order.get("frozen"):
-        raise HTTPException(
-            status_code=409,
-            detail="Заказ заморожен после серии отклонений — обратитесь к администратору",
-        )
-
-    items = await adb.get_order_items(order_id)
-    if not items:
-        raise HTTPException(status_code=400, detail="Добавьте товары")
-    if not order.get("agent_name"):
-        raise HTTPException(status_code=400, detail="Выберите клиента")
-
-    # ─── Тип оплаты ─────────────────────────────────────────────
-    # payment_type: 'paid' (по умолчанию, оплачено сразу) или 'credit'.
-    # Для credit обязателен due_date в формате YYYY-MM-DD и не раньше
-    # сегодняшнего дня (нельзя задать долг с прошедшей датой).
-    payment_type = (data.get("payment_type") or "paid").lower()
-    due_date = (data.get("due_date") or "").strip() or None
-    if payment_type not in ("paid", "credit"):
-        raise HTTPException(status_code=400, detail="Неверный тип оплаты")
-    if payment_type == "credit":
-        if not due_date:
-            raise HTTPException(status_code=400, detail="Укажите дату возврата долга")
-        try:
-            from datetime import date
-
-            parsed = date.fromisoformat(due_date)
-            if parsed < date.today():
-                raise HTTPException(
-                    status_code=400,
-                    detail="Дата возврата не может быть в прошлом",
-                )
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Неверный формат даты (нужно YYYY-MM-DD)")
-    # Фиксируем на заказе ДО создания shipment_request, чтобы апрув
-    # босса видел уже актуальный тип оплаты.
-    await adb.set_order_payment(order_id, payment_type, due_date)
-    # Перечитаем — нужно для уведомления
-    order = await adb.get_order(order_id)
 
     full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
-    req_id = await adb.create_shipment_request(order_id, user["id"], full_name)
-    await adb.update_order_status(order_id, "pending")
+
+    # T2.3: весь сабмит — в одной транзакции внутри order_workflow.submit_order
+    # (CAS на draft, тип оплаты, submitted_at, вставка заявки). Здесь остаются
+    # только HTTP-специфика: коды ответов и уведомления.
+    from services.order_workflow import submit_order
+
+    idem_key = data.get("idempotency_key")
+    res = await submit_order(
+        order_id,
+        user["id"],
+        full_name,
+        payment_type=data.get("payment_type"),
+        due_date=data.get("due_date"),
+        idem_key=f"order_submit:{user['id']}:{idem_key}" if idem_key else None,
+    )
+    if not res.get("ok"):
+        # 409 — состояние заказа (уже отправлен / заморожен), 400 — данные.
+        detail = res.get("error") or "Не удалось отправить заявку"
+        conflict = res.get("status") is not None or "уже отправлен" in detail or "заморожен" in detail
+        raise HTTPException(status_code=409 if conflict else 400, detail=detail)
+
+    req_id = res["req_id"]
+    order = await adb.get_order(order_id)  # перечитываем: нужен для уведомления
+    items = await adb.get_order_items(order_id)
     await adb.add_audit_log(
         user["id"],
         full_name,
@@ -3118,18 +5191,18 @@ async def api_submit_order(request: Request):
     for uid in await aget_notify_recipients():
         await tg_send_message(uid, notify_text, reply_markup=keyboard)
 
-    resp = {"req_id": req_id}
-    if idem_key:
-        _idem_set(f"order_submit:{user['id']}:{idem_key}", resp)
-    return JSONResponse(resp)
+    return JSONResponse({"req_id": req_id})
 
 
 @app.post("/api/agents")
 async def api_agents(request: Request):
-    """Список клиентов (контрагентов). Сначала из локального snapshot,
-    если он пуст — fallback на live API."""
-    from services import snapshot
-    from services.moysklad import ms_get
+    """Список клиентов (контрагентов) для подстановки в заказ.
+
+    Справочник наш, поэтому ни снапшота, ни live-fallback'а больше нет.
+    Санитизация строки поиска (SECURITY.md H11) осталась: она ограничивает
+    длину и набор символов, то есть стоимость LIKE-запроса.
+    """
+    from services import counterparties as cp_service
 
     data = await request.json()
     _authorize(
@@ -3140,39 +5213,22 @@ async def api_agents(request: Request):
         rate_limit_window=60.0,
     )
 
-    # Санитизация search (SECURITY.md H11): без неё manager мог через
-    # подобранные search-запросы устроить пачку дорогих запросов в
-    # МойСклад. Длина ≤ 50, только буквы/цифры/обычные знаки —
-    # без специальных символов, которые МойСклад может интерпретировать.
-    raw_search = (data.get("search", "") or "").strip()
-    if len(raw_search) > 50:
-        raw_search = raw_search[:50]
+    raw_search = (data.get("search", "") or "").strip()[:50]
     # Whitelist: буквы (любые юникодные), цифры, пробелы, основные знаки
     import re as _re
 
     search = _re.sub(r"[^\w\s\-\.,'@+()/]", "", raw_search, flags=_re.UNICODE)
-    rows = snapshot.get_counterparties(search=search if search else None, limit=50)
-    if rows:
-        return JSONResponse(
-            {
-                "agents": [
-                    {"id": r["ms_id"], "name": r.get("name", "—"), "phone": r.get("phone", "")}
-                    for r in rows
-                ]
-            }
-        )
-
-    # Snapshot пуст — live fallback + триггер первичного рефреша
-    params = {"limit": 50, "order": "name"}
-    if search:
-        params["search"] = search
-    result = await ms_get("entity/counterparty", params=params)
-    _spawn_bg(snapshot.refresh_counterparties(), "refresh_counterparties")
+    rows = await cp_service.search(search or None, 50)
     return JSONResponse(
         {
             "agents": [
-                {"id": a.get("id", ""), "name": a.get("name", "—"), "phone": a.get("phone", "")}
-                for a in result.get("rows", [])
+                {
+                    "id": str(r["id"]),
+                    "name": r.get("name", "—"),
+                    "phone": r.get("phone") or "",
+                    "type": r.get("type") or "customer",
+                }
+                for r in rows
             ]
         }
     )
@@ -3219,46 +5275,26 @@ async def api_debts(request: Request):
         due_through=due_through,
     )
 
-    # Батчем: позиции для total + платежи + возвраты + сдачи. Остаток считаем по
-    # ТОЙ ЖЕ формуле, что get_agent_current_debt / кредит-чек: total − платежи −
-    # подтверждённые сдачи − возвраты (WP-06). Раньше возвраты и сдачи не
-    # вычитались → «Долги» и «Клиенты» показывали разный долг одного клиента.
+    # T2.1: остаток считает services.debts — тот же код, что в карточке заказа
+    # и в утреннем напоминании о долгах. Батчем (пять запросов на любое число
+    # заказов), поэтому N+1 не появляется. items тянем отдельно только ради
+    # items_count в ответе.
+    from services.debts import calc_order_balances
+
     debt_ids = [d["id"] for d in debts]
     items_by_order = await adb.get_order_items_by_ids(debt_ids) if debt_ids else {}
-    payments_by_order = await adb.get_payments_for_orders(debt_ids) if debt_ids else {}
-    returns_cents_by_order = (
-        await adb.get_confirmed_returns_cents_for_orders(debt_ids) if debt_ids else {}
-    )
-    deposits_cents_by_order = (
-        await adb.get_confirmed_deposit_cents_for_orders(debt_ids) if debt_ids else {}
-    )
+    balances = await calc_order_balances(debt_ids) if debt_ids else {}
 
     result = []
     for o in debts:
         items = items_by_order.get(o["id"], [])
-        payments = payments_by_order.get(o["id"], [])
-        # T1.3: считаем строго в копейках — из price_cents/amount_cents, без
-        # float-сложения REAL-колонок. Наружу (JSON) отдаём мажорные единицы,
-        # контракт фронта не меняется.
-        total_cents = sum(
-            money.mul_qty(int(it.get("price_cents") or 0), it.get("quantity", 0) or 0)
-            for it in items
-        )
-        confirmed_cents = sum(
-            int(p.get("amount_cents") or 0) for p in payments if p["status"] == "confirmed"
-        )
-        pending_cents = sum(
-            int(p.get("amount_cents") or 0) for p in payments if p["status"] == "pending"
-        )
-        deposits_cents = deposits_cents_by_order.get(o["id"], 0)
-        returns_cents = returns_cents_by_order.get(o["id"], 0)
-        remaining_cents = max(
-            0, total_cents - confirmed_cents - deposits_cents - returns_cents
-        )
-        total = float(money.from_cents(total_cents))
-        confirmed = float(money.from_cents(confirmed_cents))
-        pending = float(money.from_cents(pending_cents))
-        remaining = float(money.from_cents(remaining_cents))
+        bal = balances.get(o["id"])
+        if bal is None:
+            continue
+        total = float(money.from_cents(bal.total_cents))
+        confirmed = float(money.from_cents(bal.confirmed_cents))
+        pending = float(money.from_cents(bal.pending_cents))
+        remaining = float(money.from_cents(bal.remaining_cents))
         due = o.get("due_date")
         # State:
         #  - awaiting_confirmation — есть pending payments (boss решает)
@@ -3323,9 +5359,34 @@ async def api_debts(request: Request):
         for k, v in sorted(rem_by_cur.items(), key=lambda kv: kv[1], reverse=True)
     ]
 
+    # Рассрочки по технике — второй поток тех же денег. Отдаём той же ручкой:
+    # экран один, и второй запрос за тем же экраном не нужен. В кредитный лимит
+    # контрагента они НЕ входят — покупатель техники это имя и паспорт, а не
+    # контрагент МойСклад.
+    machine_debts: list[dict] = []
+    totals = None
+    if is_boss:
+        from services import receivables
+
+        machine_debts = await receivables.machine_debt_rows(today)
+        # Итог «нам должны: заказы / техника / всего» — по тем же строкам, что
+        # уже посчитаны выше, без второго прохода по БД.
+        order_items = [
+            receivables.Receivable(
+                "order", int(r["id"]), f"#{r['id']}", r["agent_name"], r["user_id"],
+                r["due_date"], money.to_cents(r["remaining"]), r["currency"],
+            )
+            for r in result if r["remaining"] > 0
+        ]
+        totals = receivables.totals_by_source(
+            order_items + await receivables.machine_receivables()
+        )
+
     return JSONResponse(
         {
             "debts": result,
+            "machine_debts": machine_debts,
+            "totals": totals,
             "role": role,
             "scope": "company" if is_boss else "personal",
             "today": today,
@@ -3411,12 +5472,12 @@ async def api_mark_paid(request: Request):
         raise HTTPException(status_code=400, detail="order_id должен быть числом")
 
     # Idempotency: double-click по «Оплачено» частичной суммой мог создать две
-    # строки платежа. Если фронт прислал ключ — отдаём кэшированный результат.
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"mark_paid:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
+    # строки платежа. Ключ — в общей БД (T2.5), поэтому защита переживает
+    # рестарт и работает между воркерами.
+    idem = _Idem(adb, "mark_paid", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
 
     order = await adb.get_order(order_id)
     if not order:
@@ -3444,14 +5505,19 @@ async def api_mark_paid(request: Request):
     if amount_raw is not None and amount_raw != "":
         amount = _validate_payment_amount(amount_raw)
 
-    ok, payment_id = await adb.mark_order_paid(
-        order_id,
-        user_id,
-        full_name,
-        amount=amount,
-        username=username,
-    )
+    try:
+        ok, payment_id = await adb.mark_order_paid(
+            order_id,
+            user_id,
+            full_name,
+            amount=amount,
+            username=username,
+        )
+    except Exception:
+        await idem.release()  # упало до store — ретрай должен быть возможен
+        raise
     if not ok:
+        await idem.release()
         raise HTTPException(
             status_code=400,
             detail="Не удалось создать платёж (возможно, заказ уже полностью оплачен)",
@@ -3461,8 +5527,7 @@ async def api_mark_paid(request: Request):
     await _notify_bosses_payment_pending(order_id, full_name, payment_id)
 
     result = {"ok": True, "payment_id": payment_id}
-    if idem_key:
-        _idem_set(f"mark_paid:{user['id']}:{idem_key}", result)
+    await idem.store(result)
     return JSONResponse(result)
 
 
@@ -3565,13 +5630,12 @@ async def api_confirm_payment(request: Request):
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="order_id обязателен")
 
-    # Idempotency: если фронт прислал ключ (uuid от клиента) — пробуем
-    # вернуть кэшированный результат на случай double-click.
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"confirm:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
+    # Idempotency: ключ в общей БД (T2.5) — двойной клик «Подтвердить» не
+    # подтвердит платежи дважды даже после рестарта или в другом воркере.
+    idem = _Idem(adb, "confirm_payment", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
 
     full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
@@ -3584,7 +5648,11 @@ async def api_confirm_payment(request: Request):
         p for p in await adb.get_payments_for_order(order_id) if p["status"] == "pending"
     ]
 
-    n = await adb.confirm_all_pending_payments_for_order(order_id, user["id"], full_name)
+    try:
+        n = await adb.confirm_all_pending_payments_for_order(order_id, user["id"], full_name)
+    except Exception:
+        await idem.release()
+        raise
 
     # Уведомляем менеджеров о подтверждённых платежах. Если race с другим
     # боссом — count меньше длины pending_before, берём первые n.
@@ -3608,8 +5676,7 @@ async def api_confirm_payment(request: Request):
                 )
 
     result = {"ok": True, "confirmed_count": n}
-    if idem_key:
-        _idem_set(f"confirm:{user['id']}:{idem_key}", result)
+    await idem.store(result)
     return JSONResponse(result)
 
 
@@ -3635,11 +5702,11 @@ async def api_reject_payment(request: Request):
 
     # Idempotency: double-click reject не должен слать менеджеру два
     # уведомления об отклонении (сам UPDATE атомарен и второй раз даёт n=0).
-    idem_key = data.get("idempotency_key")
-    if idem_key:
-        cached = _idem_get(f"reject:{user['id']}:{idem_key}")
-        if cached is not None:
-            return JSONResponse(cached)
+    # Ключ в общей БД (T2.5).
+    idem = _Idem(adb, "reject_payment", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
 
     full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
@@ -3652,7 +5719,11 @@ async def api_reject_payment(request: Request):
         p for p in await adb.get_payments_for_order(order_id) if p["status"] == "pending"
     ]
 
-    n = await adb.reject_all_pending_payments_for_order(order_id, user["id"], full_name)
+    try:
+        n = await adb.reject_all_pending_payments_for_order(order_id, user["id"], full_name)
+    except Exception:
+        await idem.release()
+        raise
 
     if n > 0:
         from services.notifier import tg_send_message
@@ -3674,10 +5745,9 @@ async def api_reject_payment(request: Request):
                 )
 
     result = {"ok": True, "rejected_count": n}
-    # #37 (F5): фиксируем результат под ключом — раньше только _idem_get без
-    # _idem_set, поэтому ретрай с тем же ключом слал повторное уведомление.
-    if idem_key:
-        _idem_set(f"reject:{user['id']}:{idem_key}", result)
+    # #37 (F5): фиксируем результат под ключом — когда-то здесь был только
+    # claim без store, поэтому ретрай тем же ключом слал повторное уведомление.
+    await idem.store(result)
     return JSONResponse(result)
 
 
@@ -3709,6 +5779,293 @@ async def api_delete_draft(request: Request):
             detail="Нельзя удалить (не свой / уже не черновик / не существует)",
         )
     return JSONResponse({"ok": True})
+
+
+# ─── API: локальный складской учёт ───────────────────────────────────────────
+#
+# Остатки и накладные ведутся в собственных таблицах (services/warehouse.py),
+# МойСклад здесь не участвует вообще. Права по ТЗ: создание — менеджер и выше,
+# отмена — только босс/админ (отмена двигает остатки назад и правит историю).
+
+
+@app.post("/api/wh/stock")
+async def api_wh_stock(request: Request):
+    """Текущие остатки локального склада."""
+    from services import warehouse
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_wh_stock",
+        rate_limit_max=120,
+    )
+    warehouse_id = data.get("warehouse_id")
+    rows = await warehouse.get_stock(
+        warehouse_id=int(warehouse_id) if warehouse_id else None,
+        only_positive=bool(data.get("only_positive")),
+    )
+    return JSONResponse(
+        {
+            "products": [
+                {
+                    "product_id": r["product_id"],
+                    "name": r["name"],
+                    "category": r["category"],
+                    "sku": r["sku"],
+                    "unit": r["unit"],
+                    "quantity": float(r["quantity"] or 0),
+                }
+                for r in rows
+            ]
+        }
+    )
+
+
+@app.post("/api/wh/counterparties")
+async def api_wh_counterparties(request: Request):
+    """Справочник контрагентов для подстановки в накладную."""
+    from services import adb_core
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_wh_counterparties",
+        rate_limit_max=120,
+    )
+    search = (data.get("search") or "").strip()
+    if search:
+        # Поиск по кириллице — через lower() с обеих сторон. Встроенный SQLite
+        # LOWER() ASCII-only, но adb_core._register_sqlite_functions
+        # переопределяет его Unicode-aware, как и синхронный слой, — поэтому
+        # запрос ведёт себя одинаково на проде и локально (CLAUDE.md).
+        rows = await adb_core.fetch(
+            "SELECT id, name, type, phone, telegram_id FROM counterparties "
+            "WHERE lower(name) LIKE $1 ORDER BY name LIMIT 100",
+            f"%{search.lower()}%",
+        )
+    else:
+        rows = await adb_core.fetch(
+            "SELECT id, name, type, phone, telegram_id FROM counterparties "
+            "ORDER BY name LIMIT 100"
+        )
+    return JSONResponse({"counterparties": rows})
+
+
+@app.post("/api/wh/invoices")
+async def api_wh_invoices(request: Request):
+    """Список накладных, новые сверху."""
+    from services import warehouse
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_wh_invoices",
+        rate_limit_max=120,
+    )
+    inv_type = data.get("type")
+    if inv_type not in (None, "", "incoming", "outgoing"):
+        raise HTTPException(status_code=400, detail="Неизвестный тип накладной")
+    try:
+        limit = min(int(data.get("limit") or 50), 200)
+        offset = max(int(data.get("offset") or 0), 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="limit/offset должны быть числами")
+
+    rows = await warehouse.list_invoices(
+        invoice_type=inv_type or None, limit=limit, offset=offset
+    )
+    return JSONResponse({"invoices": rows})
+
+
+@app.post("/api/wh/invoices/get")
+async def api_wh_invoice_get(request: Request):
+    """Одна накладная с позициями."""
+    from services import warehouse
+
+    data = await request.json()
+    _authorize(data, allowed_roles=("admin", "boss", "manager"))
+    try:
+        invoice_id = int(data.get("invoice_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invoice_id обязателен")
+
+    inv = await warehouse.get_invoice(invoice_id)
+    if inv is None:
+        raise HTTPException(status_code=404, detail="Накладная не найдена")
+    return JSONResponse({"invoice": inv})
+
+
+@app.post("/api/wh/invoices/create")
+async def api_wh_invoice_create(request: Request):
+    """Провести накладную. Остатки двигаются сразу — draft'а нет.
+
+    Идемпотентность обязательна: накладная меняет остатки, и повторно
+    отправленная форма (дрогнула связь, юзер нажал дважды) без ключа
+    списала бы товар второй раз.
+    """
+    from config import BASE_CURRENCY
+    from services import async_db as adb
+    from services import warehouse
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_wh_invoice_create",
+        rate_limit_max=30,
+    )
+
+    inv_type = data.get("type")
+    if inv_type not in ("incoming", "outgoing"):
+        raise HTTPException(status_code=400, detail="type: incoming или outgoing")
+
+    raw_items = data.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        raise HTTPException(status_code=400, detail="Добавьте хотя бы одну позицию")
+
+    counterparty_id = data.get("counterparty_id")
+    if inv_type == "outgoing" and not counterparty_id:
+        raise HTTPException(status_code=400, detail="Для расхода нужен контрагент")
+
+    idem = _Idem(adb, "wh_invoice_create", user["id"], data.get("idempotency_key"))
+    prev = await idem.claim()
+    if prev is not None:
+        return JSONResponse(prev)
+
+    try:
+        result = await warehouse.create_invoice(
+            invoice_type=inv_type,
+            warehouse_id=int(data.get("warehouse_id") or 1),
+            counterparty_id=int(counterparty_id) if counterparty_id else None,
+            items=raw_items,
+            currency=(data.get("currency") or BASE_CURRENCY),
+            invoice_date=(data.get("invoice_date") or None),
+            comment=(data.get("comment") or None),
+            created_by=user["id"],
+        )
+    except Exception:
+        # Ключ освобождаем только на НЕОЖИДАННОМ сбое: отказ по бизнес-правилу
+        # (нехватка остатка) — это законный результат, и он ниже сохраняется
+        # под ключом, чтобы ретрай той же формы отдал тот же ответ.
+        await idem.release()
+        raise
+
+    if not result.get("ok"):
+        await idem.store(result)
+        return JSONResponse(result, status_code=409)
+
+    await adb.add_audit_log(
+        user["id"],
+        user.get("first_name", ""),
+        get_role(user["id"]),
+        "wh_invoice_create",
+        f"Накладная {result['invoice_number']} ({inv_type}), "
+        f"позиций {result['positions']}, сумма {result['total_amount_cents']} коп.",
+    )
+
+    # PDF клиенту — только по расходу и только после успешного проведения.
+    # Сбой доставки не откатывает накладную: она проведена, остатки списаны.
+    # Отправляем ДО idem.store, чтобы ретрай той же формы отдал сохранённый
+    # ответ и не прислал клиенту второй экземпляр документа.
+    if inv_type == "outgoing":
+        from services.invoice_delivery import REASON_TEXT, deliver_invoice_pdf
+
+        try:
+            invoice = await warehouse.get_invoice(result["invoice_id"])
+            if invoice is None:
+                # Накладную только что создали в этой же транзакции; None здесь
+                # означал бы, что её кто-то успел удалить в обход приложения.
+                raise RuntimeError(f"накладная {result['invoice_id']} исчезла после создания")
+            bot = await get_notify_bot()
+            delivery = await deliver_invoice_pdf(invoice, bot)
+        except Exception:
+            logger.exception("Доставка PDF накладной %s упала", result["invoice_number"])
+            delivery = {"sent": False, "reason": "send_failed"}
+        result["pdf_sent"] = delivery["sent"]
+        if not delivery["sent"]:
+            result["pdf_warning"] = REASON_TEXT.get(delivery["reason"], "PDF не отправлен")
+
+    await idem.store(result)
+    return JSONResponse(result)
+
+
+@app.post("/api/wh/invoices/send")
+async def api_wh_invoice_send(request: Request):
+    """Отправить (или переотправить) PDF накладной клиенту вручную.
+
+    Нужен для случая из ТЗ, когда у контрагента не был привязан telegram_id
+    в момент проведения: накладная сохранена, остатки списаны, отправка
+    делается позже — этой кнопкой.
+    """
+    from services import warehouse
+    from services.invoice_delivery import REASON_TEXT, deliver_invoice_pdf
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_wh_invoice_send",
+        rate_limit_max=20,
+    )
+    try:
+        invoice_id = int(data.get("invoice_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invoice_id обязателен")
+
+    invoice = await warehouse.get_invoice(invoice_id)
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="Накладная не найдена")
+
+    bot = await get_notify_bot()
+    delivery = await deliver_invoice_pdf(invoice, bot, force=bool(data.get("force")))
+    if not delivery["sent"]:
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": delivery["reason"],
+                "reason": REASON_TEXT.get(delivery["reason"], "PDF не отправлен"),
+            },
+            status_code=409,
+        )
+    logger.info(
+        "PDF накладной #%s отправлен вручную пользователем %s", invoice_id, user["id"]
+    )
+    return JSONResponse({"ok": True, "sent": True})
+
+
+@app.post("/api/wh/invoices/cancel")
+async def api_wh_invoice_cancel(request: Request):
+    """Отменить накладную. Только босс/админ — откат двигает остатки назад."""
+    from services import async_db as adb
+    from services import warehouse
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_wh_invoice_cancel",
+        rate_limit_max=20,
+    )
+    try:
+        invoice_id = int(data.get("invoice_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invoice_id обязателен")
+
+    result = await warehouse.cancel_invoice(invoice_id, cancelled_by=user["id"])
+    if not result.get("ok"):
+        return JSONResponse(result, status_code=409)
+
+    await adb.add_audit_log(
+        user["id"],
+        user.get("first_name", ""),
+        get_role(user["id"]),
+        "wh_invoice_cancel",
+        f"Отменена накладная #{invoice_id}, остатки откачены",
+    )
+    return JSONResponse(result)
 
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────

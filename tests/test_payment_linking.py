@@ -78,26 +78,6 @@ def test_link_pending_payment_happy_path(isolated_db):
     assert asyncio.run(db.get_payment(pid))["order_id"] == oid
 
 
-def test_link_confirmed_payment_triggers_ms_sync(isolated_db, monkeypatch):
-    """Confirmed standalone payment → link → MS sync ставится в очередь."""
-    db = isolated_db
-    oid = _setup_order(db, total=100.0)
-    pid = db.add_payment(100, "@m", "M", 50.0, "USD", "x")
-    # Подтверждаем БЕЗ order_id — это standalone confirmed
-    asyncio.run(db.confirm_payment(pid, 99, "Boss"))
-    assert asyncio.run(db.get_payment(pid))["status"] == "confirmed"
-
-    sync_called = []
-    monkeypatch.setattr(
-        db, "_trigger_ms_paymentin_sync", lambda pid_: sync_called.append(pid_)
-    )
-
-    res = asyncio.run(db.link_payment_to_order(pid, oid, linked_by=99, linked_name="Boss"))
-    assert res["ok"] is True
-    assert res["ms_sync_triggered"] is True
-    assert sync_called == [pid]
-    # Заказ ещё не закрыт (50 < 100)
-    assert res["order_closed"] is False
 
 
 def test_link_confirmed_payment_closes_order_if_total_reached(isolated_db, monkeypatch):
@@ -107,7 +87,6 @@ def test_link_confirmed_payment_closes_order_if_total_reached(isolated_db, monke
     pid = db.add_payment(100, "@m", "M", 100.0, "USD", "x")
     asyncio.run(db.confirm_payment(pid, 99, "Boss"))
 
-    monkeypatch.setattr(db, "_trigger_ms_paymentin_sync", lambda _: None)
     res = asyncio.run(db.link_payment_to_order(pid, oid, linked_by=99, linked_name="Boss"))
     assert res["ok"] is True
     assert res["order_closed"] is True
@@ -130,7 +109,6 @@ def test_close_ignores_foreign_currency_payment(isolated_db, monkeypatch):
     """WP-04: confirmed-платёж в валюте, отличной от валюты заказа, НЕ закрывает
     заказ (раньше 5 000 000 UZS в копейках перекрывали USD-заказ)."""
     db = isolated_db
-    monkeypatch.setattr(db, "_trigger_ms_paymentin_sync", lambda _: None)
     oid = _setup_order(db, total=100.0)
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)
@@ -264,11 +242,8 @@ def test_link_endpoint_forbidden_for_manager(client_env):
     assert resp.status_code == 403
 
 
-def test_link_endpoint_happy_path(client_env, monkeypatch):
+def test_link_endpoint_happy_path(client_env):
     """Boss линкует confirmed payment → 200 + DB обновлена."""
-    import services.database as db_mod
-
-    monkeypatch.setattr(db_mod, "_trigger_ms_paymentin_sync", lambda _: None)
     client, db, ids = client_env
     oid = _setup_order(db, manager_id=ids["mgr"], total=100.0)
     pid = db.add_payment(ids["mgr"], "@m", "M", 100.0, "USD", "x")

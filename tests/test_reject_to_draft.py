@@ -6,7 +6,7 @@
 переотправка блокируется до разморозки админом.
 
 Конвенция CLAUDE.md: настоящая БД (isolated_db), мок только границы — Telegram
-(_FakeBot) и get_notify_bot/ms_demand. Сервис + БД + переходы статусов — реальные.
+(_FakeBot) и get_notify_bot. Сервис + БД + переходы статусов — реальные.
 """
 
 import asyncio
@@ -154,7 +154,6 @@ def client_env(isolated_db, monkeypatch):
     """webapp + БД с боссом/менеджером/админом и pending-заявкой."""
     import importlib
     import services.roles as roles
-    import services.ms_demand as ms_demand
     import webapp.server as server
 
     importlib.reload(roles)  # сбросить in-memory role-cache между тестами
@@ -177,7 +176,6 @@ def client_env(isolated_db, monkeypatch):
         return fake_bot
 
     monkeypatch.setattr(server, "get_notify_bot", _fake_get_bot)
-    monkeypatch.setattr(ms_demand, "is_ready", lambda: False)
 
     _by_id = {
         boss_id: ("Boss", "boss_user"),

@@ -1,0 +1,45 @@
+# Контекст сборки: всё, что не нужно образу. Без этого в него уезжают .git
+# (десятки мегабайт истории) и node_modules фронт-тестов.
+
+.git
+.gitignore
+.github
+
+# Тесты и их окружение — в проде не исполняются.
+tests/
+webapp/static/__tests__/
+node_modules/
+package.json
+package-lock.json
+vitest.config.mjs
+.tools/
+scripts/setup-node.ps1
+scripts/test-js.ps1
+scripts/test-js.cmd
+
+# Кэши инструментов.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Локальные БД и секреты. .env НИКОГДА не должен попасть в образ:
+# переменные передаются рантаймом (env_file/environment в compose).
+*.db
+.env
+.env.*
+config_local.py
+
+# Локальное окружение разработчика.
+.venv/
+venv/
+.idea/
+.vscode/
+.claude/
+
+# Артефакты сборки образа.
+Dockerfile
+.dockerignore

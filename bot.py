@@ -31,12 +31,7 @@ from services.rate_limit import acquire as rate_limit_acquire
 
 # Сервисы и задачи
 from services.database import init_db
-from services.moysklad import get_session, close_session
-from services.notifier import shipment_notifier, close_tg_session
-from services import snapshot
-from services.ms_webhooks import ensure_subscriptions
-from services.ms_demand import init_demand_context
-from tasks.scheduled import snapshot_refresh_task
+from services.notifier import close_tg_session
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,29 +40,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Сильные ссылки на фоновые задачи. asyncio держит на Task только СЛАБУЮ
-# ссылку — задача без внешней strong-ref может быть собрана GC ещё до
-# завершения (CPython, документировано). Стартовые fire-and-forget таски
-# (init_demand/initial_snapshot/register_webhooks) попадают сюда, иначе
-# рискуют молча умереть на полпути.
-_startup_tasks: set[asyncio.Task] = set()
-
-
 def _log_task_exception(task: asyncio.Task) -> None:
     """done-callback: логирует необработанное исключение фоновой задачи.
     Раньше упавшая задача (вне held-ссылки) исчезала без следа."""
     if not task.cancelled() and task.exception() is not None:
         logger.error("Фоновая задача %s упала", task.get_name(), exc_info=task.exception())
-
-
-def _spawn_startup(coro, name: str) -> asyncio.Task:
-    """create_task с удержанием сильной ссылки (страховка от GC) + логом
-    исключения через done-callback."""
-    task = asyncio.create_task(coro, name=name)
-    _startup_tasks.add(task)
-    task.add_done_callback(_startup_tasks.discard)
-    task.add_done_callback(_log_task_exception)
-    return task
 
 
 class RateLimitMiddleware(BaseMiddleware):
@@ -103,8 +80,13 @@ class RateLimitMiddleware(BaseMiddleware):
                 elif isinstance(event, Message):
                     try:
                         await event.answer("⏳ Слишком много сообщений — подождите минуту.")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # Не молчим: если предупреждения о лимите не доходят,
+                        # юзер видит «бот не отвечает» без объяснений (§2.16).
+                        logger.warning(
+                            "Не удалось предупредить user_id=%s о рейт-лимите: %s",
+                            user.id, e,
+                        )
                 return
         return await handler(event, data)
 
@@ -138,48 +120,55 @@ async def set_global_menu_button(bot: Bot) -> None:
         try:
             await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
             logger.info("Global Menu Button сброшен (WEBAPP_URL пуст)")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Не удалось сбросить Menu Button: %s", e)
 
 
 def register_routers(dp: Dispatcher):
     """Подключить все роутеры."""
+    # T3.3: каталог/остатки, аналитика, кредит-лимиты, курсы и цены, экран
+    # долгов вырезаны из бота — они есть в WebApp. Остались решения по
+    # push-карточкам, ops/admin-команды без аналога в WebApp и /find.
     from handlers import (
         start,
         users,
-        stock,
         shipments,
-        analytics,
         payments,
         audit,
         log,
         orders,
-        debts,
         deposits,
         returns,
-        credit,
         order_cancel,
         order_ship,
-        pricing,
+        machines,
+        business,
+        printing,
     )
 
     routers = [
         start.router,
         users.router,
-        stock.router,
         shipments.router,
-        analytics.router,
         payments.router,
         audit.router,
         log.router,
         orders.router,
-        debts.router,
         deposits.router,
         returns.router,
-        credit.router,
         order_cancel.router,
         order_ship.router,
-        pricing.router,
+        # Техника: раздел в WebApp, здесь — быстрый просмотр и моточасы,
+        # которые снимают с площадки телефоном.
+        machines.router,
+        # Наблюдатель переписок менеджеров (Telegram Business). Ничего не
+        # отправляет — только пишет факты в воронку. Регистрация роутера сама
+        # добавляет business-апдейты в allowed_updates:
+        # `dp.resolve_used_update_types()` выводит их из хендлеров.
+        business.router,
+        # Печать документов на офисный принтер (CUPS). Кнопка под печатной
+        # формой + /printer; аналога в WebApp нет — действие физическое.
+        printing.router,
     ]
     for r in routers:
         dp.include_router(r)
@@ -203,28 +192,15 @@ def build_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
 def start_background_tasks(bot: Bot) -> list[asyncio.Task]:
     """Запустить фоновые задачи. Возвращает список созданных Task'ов.
 
-    Отчётные циклы (продажи/склад) убраны: отчёты и аналитику смотрят в WebApp,
-    а бот шлёт лишь дневной пинг (`tasks.run_ops_monitor` через Railway Cron).
-    Snapshot и notifier остаются всегда — они нужны 24/7 и под cron не подходят
-    (snapshot реагирует на webhook'и в реальном времени, notifier проверяет
-    новые отгрузки каждые CHECK_INTERVAL_SEC секунд).
+    Сейчас их нет. Раньше здесь крутились три цикла интеграции с МойСклад:
+    поллер новых отгрузок, ночное обновление снапшота справочников и
+    debounce-рефреш остатков по вебхукам. Учёт локальный — зеркалить нечего,
+    а об отгрузке, которую провёл сам бот, некому рассказывать.
+
+    Функция оставлена точкой расширения: следующая долгоживущая задача
+    добавляется сюда, и `_shutdown` уже умеет её гасить.
     """
-    coros = [
-        shipment_notifier(bot),
-        snapshot_refresh_task(bot),
-        snapshot._stock_debounce_loop(),
-    ]
-    tasks = [
-        asyncio.create_task(
-            c, name=getattr(c, "__qualname__", None) or getattr(c, "__name__", "task")
-        )
-        for c in coros
-    ]
-    # Лог необработанного исключения: упавший loop (notifier/snapshot) раньше
-    # затихал молча, хотя ссылку держит caller (bg_tasks).
-    for t in tasks:
-        t.add_done_callback(_log_task_exception)
-    return tasks
+    return []
 
 
 async def _close_db_pool() -> None:
@@ -245,7 +221,6 @@ async def _shutdown(tasks: list[asyncio.Task]) -> None:
             t.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
-    await close_session()
     await close_tg_session()
     await _close_db_pool()
     # В BOT_MODE=all webapp поднят в этом же процессе и мог создать
@@ -255,8 +230,10 @@ async def _shutdown(tasks: list[asyncio.Task]) -> None:
             from webapp import server as webapp_server
 
             await webapp_server.close_notify_bot()
-        except Exception:
-            pass
+        except Exception as e:
+            # Шатдаун: не роняем процесс, но незакрытая сессия — утечка
+            # сокета, о ней надо знать (§2.16).
+            logger.warning("Не удалось закрыть notify-bot webapp: %s", e)
 
 
 def _build_fsm_storage():
@@ -337,8 +314,6 @@ async def _run_webapp_only():
     if TG_USE_WEBHOOK and TG_WEBHOOK_SECRET and WEBAPP_URL:
         bot, dp = build_bot_and_dispatcher()
         webapp_server.set_telegram_dispatcher(bot, dp)
-        # Прогрев МС-сессии (handlers будут её использовать)
-        await get_session()
         webhook_url = f"{WEBAPP_URL}/tg/{TG_WEBHOOK_SECRET}"
         try:
             await bot.set_webhook(
@@ -360,32 +335,16 @@ async def _run_webapp_only():
             "(включите TG_USE_WEBHOOK=1 или используйте парный сервис с BOT_MODE=bot)"
         )
 
-    # Прогрев МС-сессии — нужна для approve-флоу (создание customerorder/
-    # demand) при одобрении заявок через /api/requests/approve.
-    await get_session()
-
-    # КРИТИЧНО: webapp-процесс тоже одобряет заявки (через WebApp), а значит
-    # создаёт документы в МойСклад. Без demand-контекста (org/store/attrs)
-    # ms_ready()=False → PDF и demand не создаются. main() инициализирует
-    # его для bot-процесса; здесь делаем то же для webapp-процесса.
-    async def _init_demand():
-        try:
-            result = await init_demand_context()
-            logger.info("ms_demand.init_demand_context: %s", result)
-        except Exception:
-            logger.exception("init_demand_context failed")
-
-    _spawn_startup(_init_demand(), "init_demand")
-
     try:
         await webapp_server.start_webapp()
     finally:
         if bot is not None:
             try:
                 await bot.delete_webhook(drop_pending_updates=False)
-            except Exception:
-                pass
-        await close_session()
+            except Exception as e:
+                # Шатдаун: процесс не роняем, но неснятый webhook означает, что
+                # Telegram продолжит слать апдейты в мёртвый URL (§2.16).
+                logger.warning("Не удалось снять webhook при остановке: %s", e)
         await close_tg_session()
         await webapp_server.close_notify_bot()
         await _close_db_pool()
@@ -411,52 +370,6 @@ async def main():
     dp.callback_query.middleware(rate_mw)
 
     register_routers(dp)
-
-    # Предварительно прогреваем общую aiohttp-сессию для МойСклад
-    await get_session()
-
-    # Первичный snapshot МойСклад. Делаем fire-and-forget, чтобы не
-    # задерживать старт бота — пока заливается snapshot, hot-path функции
-    # автоматически работают через live API fallback.
-    async def _initial_snapshot():
-        try:
-            stats = snapshot.stats()
-            if stats.get("ms_stock", 0) == 0:
-                logger.info("snapshot пуст — делаю первичный refresh_all")
-                await snapshot.refresh_all()
-            else:
-                logger.info(
-                    "snapshot уже инициализирован: products=%d, stock=%d",
-                    stats.get("ms_products", 0),
-                    stats.get("ms_stock", 0),
-                )
-        except Exception:
-            logger.exception("initial snapshot failed")
-
-    _spawn_startup(_initial_snapshot(), "initial_snapshot")
-
-    # Регистрируем webhook-подписки в МойСклад (идемпотентно).
-    # При смене WEBAPP_URL или ротации MS_WEBHOOK_SECRET — старые подписки
-    # удаляются, новые ставятся.
-    async def _register_webhooks():
-        try:
-            result = await ensure_subscriptions()
-            logger.info("ms_webhooks.ensure_subscriptions: %s", result)
-        except Exception:
-            logger.exception("ensure_subscriptions failed")
-
-    _spawn_startup(_register_webhooks(), "register_webhooks")
-
-    # Готовим контекст для push-а отгрузок в МойСклад (org/store/attribute).
-    # Без него cb_approve_request не сможет создавать demand-документы.
-    async def _init_demand():
-        try:
-            result = await init_demand_context()
-            logger.info("ms_demand.init_demand_context: %s", result)
-        except Exception:
-            logger.exception("init_demand_context failed")
-
-    _spawn_startup(_init_demand(), "init_demand")
 
     # Закрепляем кнопку «Открыть» в композере чата, если задан WEBAPP_URL.
     # Это делает WebApp доступным в один тап рядом с полем ввода.

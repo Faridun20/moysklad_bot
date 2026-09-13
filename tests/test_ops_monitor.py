@@ -8,10 +8,8 @@ notifier'а; здесь — формирование текста.
 import asyncio
 
 from tasks.run_ops_monitor import (
-    assemble_digest,
     build_cron_health_block,
-    build_digest_keyboard,
-    build_ms_sync_block,
+    build_shipment_failed_block,
     build_overdue_undeposited_block,
     build_pending_deposits_block,
     build_pending_returns_block,
@@ -63,133 +61,28 @@ def test_returns_block_shows_order():
     assert "#5" in block and "#42" in block and "200" in block
 
 
-def test_assemble_skips_empty_blocks():
-    digest = assemble_digest("T", [None, "БЛОК-A", None, "БЛОК-B"])
-    assert "БЛОК-A" in digest and "БЛОК-B" in digest
-    assert assemble_digest("T", [None, None]) is None
+# ─── Блок «остаток не списан» ─────────────────────────────────────────────────
 
 
-def test_assemble_none_when_all_empty():
-    assert assemble_digest("Заголовок", []) is None
+def test_shipment_failed_block_none_when_empty():
+    assert build_shipment_failed_block([]) is None
 
 
-# ─── Этап 4: блок рассинхрона с МойСклад ──────────────────────────────────────
-
-
-def test_ms_sync_block_none_when_no_anomalies():
-    assert build_ms_sync_block({"drift": [], "deleted": []}) is None
-    assert build_ms_sync_block({}) is None
-
-
-def test_ms_sync_block_shows_drift_and_deleted():
-    block = build_ms_sync_block(
-        {
-            "drift": [{"id": 1, "agent_name": "ACME", "status": "approved"}],
-            "deleted": [{"id": 2, "agent_name": "Beta", "status": "shipped"}],
-        }
-    )
-    assert block is not None
-    assert "#1" in block and "ACME" in block        # drift
-    assert "#2" in block and "Beta" in block          # deleted
-    assert "shipped" in block
-
-
-def test_ms_sync_block_truncates_long_lists():
-    drift = [{"id": i, "agent_name": f"A{i}", "status": "approved"} for i in range(15)]
-    block = build_ms_sync_block({"drift": drift, "deleted": []})
-    assert "15" in block
-    assert "и ещё 5" in block  # показываем 10, остальные свёрнуты
-
-
-def test_ms_sync_block_shows_demand_failed():
-    """R4: блок показывает заказы с неудавшейся отгрузкой (demand-fail)."""
-    block = build_ms_sync_block(
-        {"drift": [], "deleted": [],
-         "demand_failed": [{"id": 7, "agent_name": "Gamma", "status": "approved"}]}
+def test_shipment_failed_block_shows_order_and_error():
+    block = build_shipment_failed_block(
+        [{"order_id": 7, "agent_name": "Gamma", "error": "Не хватает остатка: #3"}]
     )
     assert block is not None
     assert "#7" in block and "Gamma" in block
-    assert "доделка" in block.lower() or "отгрузка не создана" in block.lower()
+    assert "Не хватает остатка" in block
+    assert "доделка" in block.lower()
 
 
-def test_get_ms_sync_anomalies_collects_demand_failed(isolated_db):
-    """R4: get_ms_sync_anomalies возвращает заказы с ms_demand_failed_at в окне."""
-    db = isolated_db
-    db.set_role(1, "m", "M", "manager")
-    oid = db.create_order(1, "M", "")
-    db.update_order_agent(oid, "A", "Client")
-    db.update_order_status(oid, "approved")
-    assert asyncio.run(db.set_order_ms_demand_failed(oid)) is True
-    # Идемпотентно.
-    assert asyncio.run(db.set_order_ms_demand_failed(oid)) is False
-
-    res = asyncio.run(db.get_ms_sync_anomalies("2000-01-01 00:00:00"))
-    assert {o["id"] for o in res["demand_failed"]} == {oid}
-
-    # Снятие флага (отгрузка доделана) — уходит из набора.
-    assert asyncio.run(db.clear_order_ms_demand_failed(oid)) is True
-    res2 = asyncio.run(db.get_ms_sync_anomalies("2000-01-01 00:00:00"))
-    assert res2["demand_failed"] == []
-
-
-def test_get_ms_sync_anomalies_collects_drift_and_deleted(isolated_db):
-    """get_ms_sync_anomalies возвращает заказы с ms_drift_at / ms_deleted_at
-    в окне since_iso; старое (до окна) и soft-deleted исключены."""
-    db = isolated_db
-    db.set_role(1, "m", "M", "manager")
-
-    def _mk(status, **flags):
-        oid = db.create_order(1, "M", "")
-        db.update_order_agent(oid, "A", "Client")
-        sets = ", ".join(f"{k}=?" for k in ({"status": status} | flags))
-        vals = [status, *flags.values(), oid]
-        with db.get_conn() as conn:
-            cur = db.get_cursor(conn)
-            cur.execute(db.q(f"UPDATE orders SET {sets} WHERE id=?"), vals)
-            conn.commit()
-        return oid
-
-    drift_oid = _mk("approved", ms_drift_at="2026-06-01 10:00:00")
-    del_oid = _mk("shipped", ms_deleted_at="2026-06-01 10:00:00")
-    # Старое (до окна) — не попадает.
-    _mk("shipped", ms_deleted_at="2020-01-01 00:00:00")
-
-    res = asyncio.run(db.get_ms_sync_anomalies("2026-05-30 00:00:00"))
-    drift_ids = {o["id"] for o in res["drift"]}
-    deleted_ids = {o["id"] for o in res["deleted"]}
-    assert drift_ids == {drift_oid}
-    assert deleted_ids == {del_oid}
-
-
-# ─── #23: интерактивная клавиатура дайджеста ──────────────────────────────────
-
-
-def test_digest_keyboard_none_when_no_actions():
-    assert build_digest_keyboard() is None
-    assert build_digest_keyboard(stale=[], deposits=[], returns=[]) is None
-
-
-def test_digest_keyboard_order_buttons_capped():
-    stale = [{"id": i} for i in range(10)]
-    kb = build_digest_keyboard(stale=stale, max_orders=5)
-    cbs = _all_cb(kb)
-    assert cbs == [f"ord_view:{i}" for i in range(5)]  # первые 5, deep-link к просмотру
-
-
-def test_digest_keyboard_nav_buttons():
-    kb = build_digest_keyboard(deposits=[{"id": 1}], returns=[{"id": 2}, {"id": 3}])
-    cbs = _all_cb(kb)
-    assert "dep_pending" in cbs
-    assert "ret_pending" in cbs
-    # счётчики в подписи
-    labels = [b["text"] for row in kb["inline_keyboard"] for b in row]
-    assert any("(1)" in t for t in labels)  # 1 сдача
-    assert any("(2)" in t for t in labels)  # 2 возврата
-
-
-def test_digest_keyboard_warehouse_only_returns():
-    kb = build_digest_keyboard(returns=[{"id": 9}])
-    assert _all_cb(kb) == ["ret_pending"]
+def test_shipment_failed_block_truncates_long_list():
+    rows = [{"order_id": i, "agent_name": f"A{i}", "error": ""} for i in range(15)]
+    block = build_shipment_failed_block(rows)
+    assert "15" in block
+    assert "и ещё 5" in block  # показываем 10, остальные свёрнуты
 
 
 # ─── #5 ops hardening: cron-health block ──────────────────────────────────────

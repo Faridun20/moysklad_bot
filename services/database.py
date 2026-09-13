@@ -8,10 +8,22 @@ import time
 import logging
 from datetime import datetime, timedelta
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, NamedTuple
 
 from services import money  # канонические деньги (копейки); leaf-модуль, без циклов
 from services import adb_core  # async DB-слой (asyncpg/aiosqlite); leaf-модуль, без циклов
+
+# SQL-фрагменты денежных сумм и формула остатка живут в services.debts —
+# единственный источник истины (T2.1). Импортируем под старыми именами,
+# чтобы не трогать десяток call-сайтов. debts зависит только от adb_core,
+# цикла нет.
+from services.debts import (
+    RETURN_OWED_FILTER as _RETURN_OWED_FILTER,
+    SUM_ALLOC_CENTS as _SUM_ALLOC_CENTS,
+    SUM_ORDER_TOTAL_CENTS as _SUM_ORDER_TOTAL_CENTS,
+    SUM_PAYMENTS_CENTS as _SUM_PAYMENTS_CENTS,
+    SUM_RETURNS_CENTS as _SUM_RETURNS_CENTS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,9 +209,14 @@ def _invalidate_role_cache(user_id: int) -> None:
         invalidate_role(user_id)
         invalidate_deactivated(user_id)
     except Exception:
-        # Кэш — мягкий, рассинхрон протухнет через TTL.
-        # Не валим write-операцию из-за проблем с кэшем.
-        pass
+        # Кэш — мягкий, рассинхрон протухнет через TTL, поэтому write-операцию
+        # из-за него не валим. Но и молчать нельзя: при поломке импорта роль
+        # остаётся закэшированной, а значит повышение/понижение НЕ применяется —
+        # и раньше об этом не было ни строчки в логах (§2.16).
+        logger.warning(
+            "Не удалось сбросить кэш роли user_id=%s — роль может остаться "
+            "прежней до истечения TTL", user_id, exc_info=True,
+        )
 
 
 # ─── Инициализация ────────────────────────────────────────────────────────────
@@ -266,6 +283,10 @@ def _create_tables():
     with get_conn() as conn:
         cur = get_cursor(conn)
         id_type = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        # Количества складского учёта: на Postgres NUMERIC (точная десятичная
+        # арифметика — остаток не накапливает дрейф при дробных отгрузках),
+        # на SQLite REAL (NUMERIC там всё равно сводится к REAL-аффинности).
+        qty_type = "NUMERIC" if USE_POSTGRES else "REAL"
 
         tables = [
             # deactivated_at/_by — «увольнение»: get_role отдаёт guest, пока стоит.
@@ -384,66 +405,6 @@ def _create_tables():
                 created_at       TEXT NOT NULL,
                 approved_at      TEXT
             )""",
-            # ─── Snapshot МойСклад (локальная копия справочников + остатков) ──
-            # Идея: справочники качаем раз в день, остатки — каждые 2 часа
-            # как safety-net + точечная инвалидация через вебхуки.
-            # Поле ms_id хранит UUID из МойСклад (PRIMARY KEY).
-            """CREATE TABLE IF NOT EXISTS ms_products (
-                ms_id      TEXT PRIMARY KEY,
-                name       TEXT,
-                folder_id  TEXT,
-                code       TEXT,
-                unit       TEXT,
-                href       TEXT,
-                updated_at TEXT
-            )""",
-            """CREATE TABLE IF NOT EXISTS ms_categories (
-                ms_id      TEXT PRIMARY KEY,
-                name       TEXT,
-                parent_id  TEXT,
-                href       TEXT,
-                updated_at TEXT
-            )""",
-            """CREATE TABLE IF NOT EXISTS ms_counterparties (
-                ms_id        TEXT PRIMARY KEY,
-                name         TEXT,
-                phone        TEXT,
-                href         TEXT,
-                balance_cents BIGINT,
-                updated_at   TEXT
-            )""",
-            """CREATE TABLE IF NOT EXISTS ms_employees (
-                ms_id      TEXT PRIMARY KEY,
-                name       TEXT,
-                href       TEXT,
-                updated_at TEXT
-            )""",
-            """CREATE TABLE IF NOT EXISTS ms_stock (
-                ms_id       TEXT PRIMARY KEY,
-                name        TEXT,
-                folder_id   TEXT,
-                folder_name TEXT,
-                unit        TEXT,
-                stock       REAL DEFAULT 0,
-                reserve     REAL DEFAULT 0,
-                updated_at  TEXT
-            )""",
-            """CREATE TABLE IF NOT EXISTS ms_snapshot_meta (
-                dataset           TEXT PRIMARY KEY,
-                last_refresh      TEXT,
-                last_full_refresh TEXT,
-                last_webhook_at   TEXT,
-                rows_count        INTEGER DEFAULT 0,
-                status            TEXT
-            )""",
-            # Дедуп уведомлений об отгрузках: и MS-вебхук (webapp-процесс), и
-            # поллер (bot-процесс) пишут сюда demand_id перед отправкой. PRIMARY
-            # KEY + INSERT-if-absent гарантируют ровно одно уведомление на demand
-            # независимо от того, какой процесс успел первым.
-            """CREATE TABLE IF NOT EXISTS notified_shipments (
-                demand_id   TEXT PRIMARY KEY,
-                notified_at TEXT
-            )""",
             # Round 6 RACE-4: idempotency-guard для ops_monitor cron.
             # PRIMARY KEY (run_date) + INSERT-if-absent через `claim_ops_monitor_run`
             # — параллельный/повторный запуск за тот же день делает noop.
@@ -549,23 +510,57 @@ def _create_tables():
                 error_message TEXT,
                 metadata    TEXT
             )""",
-            # Курсы валют → к BASE_CURRENCY (USD по умолчанию). Записываются
-            # вручную через /api/currency/rates админом. Историю изменений
-            # не храним (rate_at_payment-точность — отдельная задача), здесь
-            # «текущий рыночный курс» для UI-сводок.
+            # Курсы валют → к BASE_CURRENCY (USD по умолчанию). «Текущий»
+            # рыночный курс: обновляется авто-задачей tasks/run_fx_sync (ЦБ РУз)
+            # или вручную боссом через /api/currency/rates. Используется для
+            # UI-сводок и как fallback, когда у строки нет снимка курса.
             """CREATE TABLE IF NOT EXISTS currency_rates (
                 currency_code TEXT PRIMARY KEY,
                 rate_to_base  REAL NOT NULL,
                 updated_at    TEXT,
                 updated_by    BIGINT
             )""",
+            # Дневной архив курсов (история). Пишется tasks/run_fx_sync из CBU
+            # (source='cbu') либо вручную (source='manual'). Нужен для:
+            #   - точки-во-времени конвертации (get_currency_rate_asof) и
+            #     бэкфилла снимков прошлым заказам/платежам;
+            #   - аудита движения курса.
+            # PK (currency_code, rate_date) — один курс на валюту в день.
+            """CREATE TABLE IF NOT EXISTS currency_rate_daily (
+                currency_code TEXT NOT NULL,
+                rate_date     TEXT NOT NULL,
+                rate_to_base  REAL NOT NULL,
+                source        TEXT,
+                created_at    TEXT NOT NULL,
+                PRIMARY KEY (currency_code, rate_date)
+            )""",
+            # Per-user overrides прав (PR #44 / tech debt #3c).
+            # Существующий enum-based system (admin/boss/manager/...) остаётся
+            # как «дефолт по роли» — см. services.roles.ROLE_DEFAULTS. Эта
+            # таблица позволяет админу точечно выдать или отозвать право
+            # конкретному юзеру, не создавая новую роль. has_permission()
+            # сначала смотрит сюда, потом falls back к ROLE_DEFAULTS.
+            # granted: 1 = explicit grant (даже если роль не имеет),
+            #          0 = explicit revoke (даже если роль имеет по дефолту).
+            """CREATE TABLE IF NOT EXISTS user_permissions (
+                user_id         BIGINT NOT NULL,
+                permission_code TEXT NOT NULL,
+                granted         INTEGER NOT NULL DEFAULT 1,
+                updated_at      TEXT,
+                updated_by      BIGINT,
+                PRIMARY KEY (user_id, permission_code)
+            )""",
             # Цены товаров, выставленные руководством (PR C).
             # sale_price — минимальная цена продажи: при добавлении товара
             #   в заказ менеджер может поднять, но не опустить ниже.
             # cost_price — себестоимость: видна ТОЛЬКО boss/admin, нужна
             #   для расчёта прибыли. Может быть NULL (не задана).
-            # Источник истины — руководство (не МС): задаётся через
+            # Источник истины — руководство: задаётся через
             #   /api/products/prices/set.
+            # `ms_id` — исторически UUID МойСклад, после перехода там лежит id
+            # НАШЕЙ карточки строкой (`backfill_local_identifiers`).
+            # Переименовать колонку нечем: инкрементальных миграций в проекте
+            # нет, а заводить таблицу-двойник ради имени поля — хуже.
             """CREATE TABLE IF NOT EXISTS product_prices (
                 ms_id         TEXT PRIMARY KEY,
                 product_name  TEXT,
@@ -575,6 +570,473 @@ def _create_tables():
                 updated_by    BIGINT,
                 updated_at    TEXT
             )""",
+            # ═══════════════════════════════════════════════════════════════
+            # Локальный складской учёт — замена МойСклад.
+            #
+            # Идентичность: id — SERIAL (pg) / AUTOINCREMENT (sqlite).
+            # legacy_ms_id хранит UUID из МойСклад только для миграции и
+            # последующей сверки; на него нет ни одного рантайм-пути — новый
+            # код ходит исключительно по числовому id.
+            #
+            # Деньги — BIGINT в минорных единицах (копейки/центы), как везде
+            # в проекте (services/money.py). Схема из ТЗ предлагала NUMERIC;
+            # отклонились сознательно, чтобы в одной БД не оказалось двух
+            # денежных конвенций и конвертации на каждом стыке
+            # накладная↔заказ↔платёж.
+            #
+            # Количества — NUMERIC на Postgres (точная арифметика, остаток не
+            # накапливает дрейф при дробных отгрузках) / REAL на SQLite,
+            # где NUMERIC всё равно имеет REAL-аффинность.
+            #
+            # Время — TEXT в локальной TZ через now_str(), как остальные
+            # таблицы. TIMESTAMPTZ DEFAULT now() из ТЗ не берём: он пишет UTC,
+            # а весь проект сравнивает с local-TZ строками (CLAUDE.md про
+            # silent-false при сравнении TZ'ов).
+            # ═══════════════════════════════════════════════════════════════
+            f"""CREATE TABLE IF NOT EXISTS counterparties (
+                id           {id_type},
+                name         TEXT NOT NULL,
+                type         TEXT NOT NULL DEFAULT 'customer'
+                             CHECK (type IN ('supplier', 'customer')),
+                phone        TEXT,
+                telegram_id  BIGINT,
+                notes        TEXT,
+                legacy_ms_id TEXT,
+                created_at   TEXT NOT NULL
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS products (
+                id           {id_type},
+                name         TEXT NOT NULL,
+                category     TEXT,
+                sku          TEXT,
+                unit         TEXT NOT NULL DEFAULT 'шт',
+                legacy_ms_id TEXT,
+                created_at   TEXT NOT NULL
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS warehouses (
+                id   {id_type},
+                name TEXT NOT NULL
+            )""",
+            # Остаток по (товар, склад). Отрицательным не бывает: движение,
+            # уводящее в минус, откатывает всю накладную целиком.
+            f"""CREATE TABLE IF NOT EXISTS stock (
+                product_id   BIGINT NOT NULL,
+                warehouse_id BIGINT NOT NULL,
+                quantity     {qty_type} NOT NULL DEFAULT 0,
+                PRIMARY KEY (product_id, warehouse_id)
+            )""",
+            # Накладная. Промежуточного draft нет — сразу confirmed, остатки
+            # двигаются в той же транзакции, что и вставка строк.
+            f"""CREATE TABLE IF NOT EXISTS invoices (
+                id                 {id_type},
+                type               TEXT NOT NULL
+                                   CHECK (type IN ('incoming', 'outgoing')),
+                counterparty_id    BIGINT,
+                warehouse_id       BIGINT NOT NULL,
+                invoice_number     TEXT NOT NULL,
+                invoice_date       TEXT NOT NULL,
+                status             TEXT NOT NULL DEFAULT 'confirmed'
+                                   CHECK (status IN ('confirmed', 'cancelled')),
+                currency           TEXT NOT NULL DEFAULT 'USD',
+                total_amount_cents BIGINT NOT NULL DEFAULT 0,
+                comment            TEXT,
+                created_by         BIGINT,
+                created_at         TEXT NOT NULL,
+                cancelled_by       BIGINT,
+                cancelled_at       TEXT,
+                telegram_sent      INTEGER NOT NULL DEFAULT 0,
+                telegram_sent_at   TEXT
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS invoice_items (
+                id          {id_type},
+                invoice_id  BIGINT NOT NULL,
+                product_id  BIGINT NOT NULL,
+                quantity    {qty_type} NOT NULL,
+                price_cents BIGINT
+            )""",
+            # Счётчик номеров накладных. Инкремент — атомарный UPSERT
+            # ... ON CONFLICT DO UPDATE ... RETURNING в транзакции накладной.
+            """CREATE TABLE IF NOT EXISTS invoice_counters (
+                type        TEXT NOT NULL,
+                year        INTEGER NOT NULL,
+                last_number INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (type, year)
+            )""",
+            # ─── Генерация юридических документов (docxtpl + LibreOffice) ───
+            f"""CREATE TABLE IF NOT EXISTS document_templates (
+                id         {id_type},
+                type       TEXT NOT NULL,
+                file_path  TEXT NOT NULL,
+                is_active  INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS generated_documents (
+                id                 {id_type},
+                template_id        BIGINT,
+                counterparty_id    BIGINT,
+                client_name        TEXT,
+                passport_data      TEXT,
+                product_name       TEXT NOT NULL,
+                total_amount_cents BIGINT NOT NULL,
+                currency           TEXT NOT NULL DEFAULT 'USD',
+                start_date         TEXT NOT NULL,
+                term_months        INTEGER NOT NULL,
+                payment_type       TEXT NOT NULL
+                                   CHECK (payment_type IN ('single', 'installment')),
+                installments_count INTEGER,
+                file_path          TEXT,
+                created_by         BIGINT,
+                created_at         TEXT NOT NULL
+            )""",
+            # Соответствие «UUID МойСклад → локальный id». Артефакт миграции,
+            # а не рантайм-путь: заполняется scripts/migrate_from_moysklad.py
+            # и читается сверкой + будущим переводом orders/order_items/
+            # credit_limits/product_prices на числовые ключи (шаг 4 плана).
+            #
+            # Почему отдельной таблицей, а не колонками counterparty_id/
+            # product_id в существующих таблицах: добавить колонку в уже
+            # развёрнутую боевую БД можно только ALTER'ом, а он в проекте
+            # запрещён (T1.1, tests/test_schema_single_pass.py) — схема
+            # создаётся одним проходом CREATE TABLE. Таблица соответствий
+            # новая, поэтому создаётся штатно и на шаге 1 переключения не
+            # трогает денежные таблицы вообще.
+            # Соответствие «UUID МойСклад → наш id». Рабочий артефакт миграции
+            # (`scripts/migrate_from_moysklad.py`): по нему сверялись данные и
+            # по нему `backfill_local_identifiers` перевёл старые ссылки на
+            # числовые ключи. Держим, пока живёт аккаунт МС — это единственное,
+            # чем можно доказать, что и откуда приехало.
+            """CREATE TABLE IF NOT EXISTS ms_id_map (
+                entity_type TEXT NOT NULL,
+                ms_id       TEXT NOT NULL,
+                local_id    BIGINT NOT NULL,
+                migrated_at TEXT NOT NULL,
+                PRIMARY KEY (entity_type, ms_id)
+            )""",
+            # ── Учёт экскаваторов (волна 4, T4.1) ────────────────────────────
+            #
+            # Отличие от остальной схемы: здесь есть FOREIGN KEY. Связи строго
+            # иерархические (часы/фото/сделки не существуют без машины), каскад
+            # избавляет от ручной уборки. На SQLite (тесты) FK по умолчанию не
+            # энфорсятся, поэтому сервис всё равно чистит детей явно — иначе
+            # поведение разъезжалось бы между тестами и продом.
+            #
+            # cost_cents (себестоимость) видит только boss/admin — срез делает
+            # слой сервиса, не фронт.
+            f"""CREATE TABLE IF NOT EXISTS machines (
+                id               {id_type},
+                vin              TEXT NOT NULL UNIQUE,
+                name             TEXT NOT NULL,
+                brand            TEXT,
+                model            TEXT,
+                year             INTEGER,
+                hours            INTEGER,
+                hours_updated_at TEXT,
+                price_cents      BIGINT,
+                cost_cents       BIGINT,
+                currency         TEXT NOT NULL DEFAULT 'USD',
+                status           TEXT NOT NULL DEFAULT 'in_transit',
+                eta_date         TEXT,
+                container_no     TEXT,
+                location         TEXT,
+                notes            TEXT,
+                ms_product_id    TEXT,
+                created_by       BIGINT NOT NULL,
+                created_at       TEXT,
+                updated_at       TEXT,
+                CONSTRAINT machines_status_chk CHECK (status IN
+                    ('in_transit','in_stock','reserved','sold','on_credit','archived'))
+            )""",
+            # Каждое показание моточасов — отдельной строкой (видна динамика и
+            # ловятся опечатки); в machines.hours дублируется последнее.
+            f"""CREATE TABLE IF NOT EXISTS machine_hours (
+                id          {id_type},
+                machine_id  INTEGER NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+                hours       INTEGER NOT NULL CHECK (hours >= 0),
+                recorded_by BIGINT NOT NULL,
+                recorded_at TEXT
+            )""",
+            # Файлы не скачиваем — на Railway эфемерная ФС; храним tg_file_id.
+            # file_unique_id обязателен (волна 7): tg_file_id привязан к паре
+            # «бот + сервер Bot API», и переезд на локальный Bot API server его
+            # обнулит. file_unique_id переживает переезд и показывает, какие
+            # записи осиротели, — поэтому NOT NULL, а не опционально.
+            f"""CREATE TABLE IF NOT EXISTS machine_photos (
+                id             {id_type},
+                machine_id     INTEGER NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+                tg_file_id     TEXT NOT NULL,
+                file_unique_id TEXT NOT NULL,
+                caption        TEXT,
+                sort_order     INTEGER NOT NULL DEFAULT 0,
+                uploaded_by    BIGINT NOT NULL,
+                uploaded_at    TEXT,
+                UNIQUE (machine_id, file_unique_id)
+            )""",
+            # Сделка по машине. order_id/agent_ms_id — необязательная связь с
+            # заказом и контрагентом МС: продажа техники может идти и мимо них.
+            f"""CREATE TABLE IF NOT EXISTS machine_deals (
+                id             {id_type},
+                machine_id     INTEGER NOT NULL REFERENCES machines(id),
+                kind           TEXT NOT NULL CHECK (kind IN ('sale','credit')),
+                price_cents    BIGINT NOT NULL,
+                currency       TEXT NOT NULL DEFAULT 'USD',
+                buyer_name     TEXT NOT NULL,
+                buyer_phone    TEXT,
+                buyer_passport TEXT,
+                buyer_note     TEXT,
+                order_id       BIGINT,
+                agent_ms_id    TEXT,
+                sold_at        TEXT,
+                due_date       TEXT,
+                closed_at      TEXT,
+                created_by     BIGINT NOT NULL
+            )""",
+            # График рассрочки. Первоначальный взнос — та же таблица, `seq = 0`
+            # и `paid_at` сразу: деньги уже получены, и отдельная колонка в
+            # `machine_deals` описывала бы ровно то же самое вторым способом
+            # (а заодно не доехала бы до существующей таблицы на проде —
+            # инкрементальных миграций в проекте нет).
+            f"""CREATE TABLE IF NOT EXISTS machine_deal_payments (
+                id            {id_type},
+                deal_id       INTEGER NOT NULL REFERENCES machine_deals(id),
+                seq           INTEGER NOT NULL,
+                due_date      TEXT NOT NULL,
+                amount_cents  BIGINT NOT NULL,
+                paid_at       TEXT,
+                paid_by       BIGINT,
+                notified_at   TEXT,
+                created_at    TEXT,
+                UNIQUE (deal_id, seq)
+            )""",
+            # Фактические поступления по рассрочке. Отдельно от графика, потому
+            # что клиент платит не «платёж №3», а деньги: в один месяц больше,
+            # в другой меньше. График — план, поступления — факт, и один к
+            # одному они не ложатся. Покрытие графика считается распределением
+            # поступлений по порядку (`services.machines.allocate_receipts`).
+            f"""CREATE TABLE IF NOT EXISTS machine_payment_receipts (
+                id            {id_type},
+                deal_id       INTEGER NOT NULL REFERENCES machine_deals(id),
+                amount_cents  BIGINT NOT NULL,
+                received_at   TEXT NOT NULL,
+                received_by   BIGINT,
+                note          TEXT,
+                created_at    TEXT
+            )""",
+            # История публикаций в канал. Нужна, чтобы один и тот же контейнер
+            # не ушёл в канал дважды — второй раз обычно потому, что первый
+            # забыли.
+            f"""CREATE TABLE IF NOT EXISTS channel_posts (
+                id         {id_type},
+                kind       TEXT NOT NULL,
+                ref        TEXT,
+                message_id BIGINT,
+                posted_by  BIGINT,
+                posted_at  TEXT,
+                created_at TEXT
+            )""",
+            # Фотографии товаров каталога. Как у техники: храним только
+            # идентификаторы Telegram, файл живёт там. `file_unique_id`
+            # обязателен — он переживает смену сервера Bot API.
+            f"""CREATE TABLE IF NOT EXISTS product_photos (
+                id             {id_type},
+                ms_id          TEXT NOT NULL,
+                tg_file_id     TEXT NOT NULL,
+                file_unique_id TEXT NOT NULL,
+                caption        TEXT,
+                uploaded_by    BIGINT,
+                uploaded_at    TEXT,
+                UNIQUE (ms_id, file_unique_id)
+            )""",
+            # Подключение бота к личному аккаунту менеджера (Telegram Business).
+            # Нужно, чтобы по `business_connection_id` из апдейта понять, чей
+            # это чат: сам апдейт менеджера не называет.
+            """CREATE TABLE IF NOT EXISTS business_connections (
+                connection_id TEXT PRIMARY KEY,
+                manager_id    BIGINT NOT NULL,
+                user_chat_id  BIGINT,
+                is_enabled    INTEGER NOT NULL DEFAULT 1,
+                can_read      INTEGER NOT NULL DEFAULT 0,
+                connected_at  TEXT,
+                updated_at    TEXT
+            )""",
+            # Клиент, написавший менеджеру. Один ряд на человека, а не на
+            # переписку: вопрос «сколько клиентов написали» иначе двоился бы,
+            # если тот же человек написал двум менеджерам.
+            #
+            # ТЕКСТОВ СООБЩЕНИЙ ЗДЕСЬ НЕТ И НЕ ДОЛЖНО БЫТЬ. Для воронки нужны
+            # только «кто, когда, в какую сторону»; хранить переписку клиентов —
+            # ответственность без выгоды.
+            f"""CREATE TABLE IF NOT EXISTS leads (
+                id              {id_type},
+                tg_user_id      BIGINT NOT NULL UNIQUE,
+                manager_id      BIGINT,
+                username        TEXT,
+                display_name    TEXT,
+                status          TEXT NOT NULL DEFAULT 'new'
+                                CHECK (status IN ('new','won','lost')),
+                agent_ms_id     TEXT,
+                first_seen_at   TEXT,
+                last_inbound_at TEXT,
+                last_outbound_at TEXT,
+                first_reply_at  TEXT,
+                created_at      TEXT,
+                updated_at      TEXT
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS lead_events (
+                id         {id_type},
+                lead_id    INTEGER NOT NULL REFERENCES leads(id),
+                kind       TEXT NOT NULL,
+                manager_id BIGINT,
+                at         TEXT NOT NULL,
+                created_at TEXT
+            )""",
+            # Звонки. Отдельная таблица, а не колонки в `leads`: у позвонившего
+            # клиента нет `tg_user_id`, а он там NOT NULL UNIQUE — и ослабить
+            # его на проде нельзя (инкрементальных миграций нет).
+            #
+            # `lead_id` НЕОБЯЗАТЕЛЕН — это и есть решение. Звонок от человека,
+            # которого нет в Telegram, — законное самостоятельное состояние:
+            # он живёт в списке «перезвонить», а не притворяется перепиской.
+            # Привязка ставится руками, когда клиент напишет.
+            #
+            # `note` здесь ЗАКОНЕН, в отличие от `leads`: это заметка менеджера
+            # о собственном звонке, а не сохранённое чужое сообщение. Разница
+            # принципиальная — не переносить это послабление на переписку.
+            f"""CREATE TABLE IF NOT EXISTS lead_calls (
+                id           {id_type},
+                lead_id      INTEGER REFERENCES leads(id),
+                phone        TEXT,
+                phone_key    TEXT,
+                display_name TEXT,
+                direction    TEXT NOT NULL DEFAULT 'in'
+                             CHECK (direction IN ('in','out')),
+                source       TEXT,
+                interest     TEXT,
+                manager_id   BIGINT,
+                at           TEXT NOT NULL,
+                note         TEXT,
+                created_at   TEXT
+            )""",
+            # Причина отказа. Sidecar по образцу `container_supply`: в
+            # `lead_events` колонки под текст нет и появиться не может.
+            # Причина НЕОБЯЗАТЕЛЬНА — кнопку «Не купил» и так нажимают редко,
+            # и обязательное поле привело бы к тому, что её перестанут нажимать
+            # вовсе. Потерять сам факт отказа хуже, чем отказ без причины.
+            """CREATE TABLE IF NOT EXISTS lead_lost (
+                lead_id  INTEGER PRIMARY KEY REFERENCES leads(id),
+                reason   TEXT NOT NULL
+                         CHECK (reason IN ('price','no_stock','competitor',
+                                           'postponed','wrong_fit','no_answer','other')),
+                note     TEXT,
+                at       TEXT,
+                set_by   BIGINT
+            )""",
+            # Контейнеры в пути. Состав заводят при отправке («ожидалось»), при
+            # прибытии проставляют факт — расхождение видно сразу, а не после
+            # ручной сверки с накладной.
+            f"""CREATE TABLE IF NOT EXISTS containers (
+                id           {id_type},
+                number       TEXT NOT NULL UNIQUE,
+                status       TEXT NOT NULL DEFAULT 'in_transit'
+                             CHECK (status IN ('in_transit','arrived')),
+                eta_date     TEXT,
+                arrived_at   TEXT,
+                notes        TEXT,
+                created_by   BIGINT NOT NULL,
+                created_at   TEXT,
+                updated_at   TEXT
+            )""",
+            # Связь контейнера с МойСклад: поставщик (нужен «Приёмке») и id
+            # созданного документа. Отдельной таблицей, а не колонками в
+            # `containers`: инкрементальных миграций в проекте нет, и новая
+            # колонка не доехала бы до уже существующей таблицы на проде.
+            """CREATE TABLE IF NOT EXISTS container_supply (
+                container_id   INTEGER PRIMARY KEY REFERENCES containers(id),
+                supplier_ms_id TEXT,
+                supplier_name  TEXT,
+                ms_supply_id   TEXT,
+                synced_at      TEXT,
+                unmatched      TEXT,
+                updated_at     TEXT
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS container_items (
+                id            {id_type},
+                container_id  INTEGER NOT NULL REFERENCES containers(id),
+                name          TEXT NOT NULL,
+                unit          TEXT NOT NULL DEFAULT 'шт',
+                expected_qty  REAL NOT NULL DEFAULT 0,
+                arrived_qty   REAL,
+                note          TEXT,
+                created_at    TEXT
+            )""",
+            # Позиция приёмки ↔ карточка номенклатуры МойСклад. Пока связи не
+            # было, оприходование угадывало товар по названию — и «Кабель PV
+            # 0.6» из накладной не находил «Кабель PV 0,6» из каталога.
+            # Отдельная таблица, а не колонка в `container_items`:
+            # инкрементальных миграций в проекте нет, и колонка в уже
+            # существующую на проде таблицу просто не доехала бы.
+            # `container_id` дублируется намеренно — по нему состав чистится
+            # одним DELETE и его же видит сторож сирот (containers.CHILD_TABLES).
+            """CREATE TABLE IF NOT EXISTS container_item_links (
+                item_id      INTEGER PRIMARY KEY REFERENCES container_items(id),
+                container_id INTEGER NOT NULL REFERENCES containers(id),
+                ms_id        TEXT NOT NULL,
+                ms_name      TEXT,
+                created_at   TEXT
+            )""",
+            # Приёмка контейнера в ЛОКАЛЬНЫЙ склад. Отдельная таблица, а не
+            # новые колонки в `container_supply`: там лежат идентификаторы
+            # МойСклад (TEXT-uuid), а здесь — id наших `counterparties` и
+            # `invoices` (BIGINT). Класть целое в колонку с именем
+            # `supplier_ms_id` значит завести поле, смысл которого зависит от
+            # эпохи записи; такие поля разъезжаются молча.
+            """CREATE TABLE IF NOT EXISTS container_receipt (
+                container_id  INTEGER PRIMARY KEY REFERENCES containers(id),
+                supplier_id   BIGINT,
+                supplier_name TEXT,
+                invoice_id    BIGINT,
+                received_at   TEXT,
+                unmatched     TEXT,
+                updated_at    TEXT
+            )""",
+            # Позиция приёмки ↔ карточка локальной номенклатуры. Замена
+            # `container_item_links` (там `ms_id` — uuid МойСклад): та таблица
+            # остаётся только источником для backfill'а, новые связи пишутся
+            # сюда. `container_id` дублируется намеренно — по нему состав
+            # чистится одним DELETE, и его же видит сторож сирот.
+            """CREATE TABLE IF NOT EXISTS container_item_products (
+                item_id      INTEGER PRIMARY KEY REFERENCES container_items(id),
+                container_id INTEGER NOT NULL REFERENCES containers(id),
+                product_id   BIGINT NOT NULL,
+                created_at   TEXT
+            )""",
+            # Позиция заказа ↔ карточка локальной номенклатуры. Отдельная
+            # таблица, а не значение в `order_items.product_href`: там лежит
+            # ССЫЛКА на документ МойСклад, и класть в колонку с таким именем
+            # целочисленный id значит завести поле, смысл которого зависит от
+            # эпохи записи. Заполняется при добавлении позиции; у строк,
+            # заведённых до перехода, — backfill'ом через `products.legacy_ms_id`.
+            """CREATE TABLE IF NOT EXISTS order_item_products (
+                item_id    INTEGER PRIMARY KEY REFERENCES order_items(id),
+                order_id   BIGINT NOT NULL,
+                product_id BIGINT NOT NULL,
+                created_at TEXT
+            )""",
+            # Отгрузка заказа = расходная накладная локального склада. Раньше
+            # это был demand в МойСклад, и его id лежал в `orders.ms_demand_id`;
+            # держать там теперь номер нашей накладной значило бы оставить в
+            # схеме колонку, название которой врёт про содержимое.
+            #
+            # `failed_at`/`error` — замена флагу `ms_demand_failed_at`: заявка
+            # одобрена, а списать остаток не вышло (не хватило товара, позиции
+            # не сопоставлены). Такой заказ обязан попасть в дайджест «нужна
+            # доделка», иначе он выглядит отгруженным, а склад с ним не сошёлся.
+            """CREATE TABLE IF NOT EXISTS order_shipment (
+                order_id   BIGINT PRIMARY KEY,
+                invoice_id BIGINT,
+                shipped_at TEXT,
+                failed_at  TEXT,
+                error      TEXT
+            )""",
         ]
 
         # Создаём каждую таблицу в отдельной транзакции
@@ -582,9 +1044,14 @@ def _create_tables():
             try:
                 cur.execute(sql)
                 conn.commit()
-            except Exception as e:
+            except Exception:
                 conn.rollback()
-                logger.warning("Таблица уже существует или ошибка: %s", e)
+                # Раньше ЛЮБАЯ ошибка логировалась как «таблица уже существует».
+                # Нет прав, кривой тип, опечатка в DDL — всё выглядело безобидно,
+                # а узнавали об этом по 500-й в рантайме (§2.16). CREATE TABLE
+                # IF NOT EXISTS на существующей таблице не бросает вовсе, значит
+                # исключение здесь — всегда НАСТОЯЩАЯ проблема.
+                logger.exception("CREATE TABLE не выполнен — схема неполная")
 
 
 def _create_indexes():
@@ -593,9 +1060,33 @@ def _create_indexes():
     with get_conn() as conn:
         cur = get_cursor(conn)
         snapshot_indexes = [
-            "CREATE INDEX IF NOT EXISTS idx_ms_products_folder ON ms_products(folder_id)",
-            "CREATE INDEX IF NOT EXISTS idx_ms_stock_folder ON ms_stock(folder_id)",
-            "CREATE INDEX IF NOT EXISTS idx_ms_categories_parent ON ms_categories(parent_id)",
+            # ─── Локальный складской учёт ────────────────────────────
+            # Номер накладной — бизнес-ключ. UNIQUE ловит гонку двух
+            # параллельных создающих транзакций: счётчик инкрементится
+            # атомарно, но индекс — последний рубеж, если кто-то вставит
+            # номер в обход счётчика (импорт, ручной фикс).
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_number "
+            "ON invoices(invoice_number)",
+            # Партиальные UNIQUE по legacy_ms_id: сверка миграции требует
+            # ровно одну локальную строку на UUID МойСклад. NULL (товары,
+            # заведённые уже после перехода) не конфликтуют.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_products_legacy_ms "
+            "ON products(legacy_ms_id) WHERE legacy_ms_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_counterparties_legacy_ms "
+            "ON counterparties(legacy_ms_id) WHERE legacy_ms_id IS NOT NULL",
+            # SKU уникален, но только среди заполненных — в МойСклад код
+            # товара необязателен, и после миграции часть строк будет с NULL.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_products_sku "
+            "ON products(sku) WHERE sku IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_invoice_items_invoice "
+            "ON invoice_items(invoice_id)",
+            "CREATE INDEX IF NOT EXISTS idx_invoices_counterparty "
+            "ON invoices(counterparty_id)",
+            # Список накладных в WebApp: сортировка по дате, фильтр по типу.
+            "CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(invoice_date)",
+            # Обратный поиск «локальный id → ms_id» при сверке миграции.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ms_id_map_local "
+            "ON ms_id_map(entity_type, local_id)",
             # Уникальность paymentin'ов в МойСклад. Спасает от race condition
             # между cron-retry и confirm-hook: если оба попробуют создать
             # paymentin для одного платежа, второй INSERT упадёт на UNIQUE
@@ -670,6 +1161,51 @@ def _create_indexes():
             # (payment_type, paid_at, due_date) — запрос им не покрывался.
             "CREATE INDEX IF NOT EXISTS idx_orders_debt_lookup "
             "ON orders(payment_type, status, paid_confirmed_at)",
+            # ── Машины (T4.1) ────────────────────────────────────────────────
+            # Список машин всегда фильтруется по статусу (витрина «в наличии»,
+            # «в пути», архив).
+            "CREATE INDEX IF NOT EXISTS idx_machines_status ON machines(status)",
+            # История моточасов и сделок читается «последние сверху» по машине.
+            "CREATE INDEX IF NOT EXISTS idx_machine_hours_machine "
+            "ON machine_hours(machine_id, recorded_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_machine_deals_machine "
+            "ON machine_deals(machine_id, sold_at DESC)",
+            # График читается по сделке (карточка) и по сроку (ежедневный
+            # обход неоплаченных платежей в напоминалке).
+            "CREATE INDEX IF NOT EXISTS idx_machine_deal_payments_deal "
+            "ON machine_deal_payments(deal_id, seq)",
+            "CREATE INDEX IF NOT EXISTS idx_machine_deal_payments_due "
+            "ON machine_deal_payments(due_date)",
+            "CREATE INDEX IF NOT EXISTS idx_machine_receipts_deal "
+            "ON machine_payment_receipts(deal_id, received_at)",
+            # ── Контейнеры ───────────────────────────────────────────────────
+            # Воронка: список фильтруется по менеджеру и по последней
+            # активности, события читаются по лиду.
+            "CREATE INDEX IF NOT EXISTS idx_channel_posts_ref ON channel_posts(kind, ref)",
+            "CREATE INDEX IF NOT EXISTS idx_product_photos_ms ON product_photos(ms_id)",
+            "CREATE INDEX IF NOT EXISTS idx_leads_manager ON leads(manager_id)",
+            "CREATE INDEX IF NOT EXISTS idx_leads_last_inbound ON leads(last_inbound_at)",
+            "CREATE INDEX IF NOT EXISTS idx_lead_events_lead ON lead_events(lead_id, at)",
+            "CREATE INDEX IF NOT EXISTS idx_lead_events_at ON lead_events(at)",
+            # Непривязанные звонки — самый частый запрос экрана («кому
+            # перезвонить»), поэтому индекс именно по нему, а не по дате.
+            "CREATE INDEX IF NOT EXISTS idx_lead_calls_lead ON lead_calls(lead_id, at)",
+            "CREATE INDEX IF NOT EXISTS idx_lead_calls_at ON lead_calls(at)",
+            "CREATE INDEX IF NOT EXISTS idx_lead_calls_phone ON lead_calls(phone_key)",
+            "CREATE INDEX IF NOT EXISTS idx_containers_status ON containers(status)",
+            "CREATE INDEX IF NOT EXISTS idx_container_items_container "
+            "ON container_items(container_id, id)",
+            # Связки чистятся и читаются по контейнеру (удаление состава,
+            # сторож сирот), а PK стоит на item_id — без этого индекса каждая
+            # такая операция читала бы таблицу целиком.
+            "CREATE INDEX IF NOT EXISTS idx_container_item_products_container "
+            "ON container_item_products(container_id)",
+            "CREATE INDEX IF NOT EXISTS idx_order_item_products_order "
+            "ON order_item_products(order_id)",
+            "CREATE INDEX IF NOT EXISTS idx_order_item_products_product "
+            "ON order_item_products(product_id)",
+            "CREATE INDEX IF NOT EXISTS idx_order_shipment_failed "
+            "ON order_shipment(failed_at) WHERE failed_at IS NOT NULL",
         ]
         for sql in snapshot_indexes:
             try:
@@ -678,6 +1214,413 @@ def _create_indexes():
             except Exception as e:
                 conn.rollback()
                 logger.debug("Индекс не создан: %s", e)
+
+
+def seed_warehouses() -> int:
+    """Засеять склад по умолчанию. Идемпотентно — сеем только в пустую
+    таблицу, чтобы переименованный вручную склад не продублировался."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute("SELECT COUNT(*) AS c FROM warehouses")
+        row = cur.fetchone()
+        count = (row["c"] if isinstance(row, dict) else row[0]) or 0
+        if count:
+            return 0
+        cur.execute(q("INSERT INTO warehouses (name) VALUES (?)"), ("Основной склад",))
+        conn.commit()
+        logger.info("Засеян склад по умолчанию «Основной склад»")
+        return 1
+
+
+def backfill_container_receipts() -> dict:
+    """Перенести связки приёмки контейнеров со старых MS-таблиц на локальные.
+
+    Что переносим:
+      • `container_item_links.ms_id` (uuid карточки МойСклад) → `product_id`
+        нашей номенклатуры, через `products.legacy_ms_id`, который проставила
+        миграция каталога;
+      • `container_supply` (поставщик + отметка синхронизации) →
+        `container_receipt` с локальным `supplier_id`.
+
+    **`invoice_id` намеренно остаётся пустым.** Приход по таким контейнерам
+    делал МойСклад, и его результат приехал к нам остатками — миграцией
+    каталога и склада. Завести здесь локальную накладную значило бы прибавить
+    тот же товар второй раз. Поэтому `received_at` переносится (контейнер
+    считается оприходованным и кнопка не предлагается), а `invoice_id` пуст;
+    `container_receipt.receive` такое сочетание распознаёт и отказывает явным
+    текстом, а не заводит дубль.
+
+    Идемпотентно: строки, которые уже есть, не трогаем.
+    """
+    stamp = now_str()
+    stats = {"items": 0, "containers": 0}
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        try:
+            cur.execute(
+                q(
+                    "INSERT INTO container_item_products "
+                    "    (item_id, container_id, product_id, created_at) "
+                    "SELECT l.item_id, l.container_id, p.id, ? "
+                    "FROM container_item_links l "
+                    "JOIN products p ON p.legacy_ms_id = l.ms_id "
+                    "WHERE NOT EXISTS ("
+                    "    SELECT 1 FROM container_item_products cp WHERE cp.item_id = l.item_id"
+                    ")"
+                ),
+                (stamp,),
+            )
+            stats["items"] = max(cur.rowcount, 0)
+            cur.execute(
+                q(
+                    "INSERT INTO container_receipt "
+                    "    (container_id, supplier_id, supplier_name, received_at, "
+                    "     unmatched, updated_at) "
+                    "SELECT s.container_id, c.id, s.supplier_name, s.synced_at, "
+                    "       s.unmatched, ? "
+                    "FROM container_supply s "
+                    "LEFT JOIN counterparties c ON c.legacy_ms_id = s.supplier_ms_id "
+                    "WHERE NOT EXISTS ("
+                    "    SELECT 1 FROM container_receipt r WHERE r.container_id = s.container_id"
+                    ")"
+                ),
+                (stamp,),
+            )
+            stats["containers"] = max(cur.rowcount, 0)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.warning("Backfill приёмки контейнеров: %s", e)
+            return {"items": 0, "containers": 0}
+    if stats["items"] or stats["containers"]:
+        logger.info(
+            "Backfill приёмки контейнеров: позиций %d, контейнеров %d",
+            stats["items"], stats["containers"],
+        )
+    return stats
+
+
+def backfill_local_identifiers() -> dict:
+    """Переписать ссылки на МойСклад на наши собственные id.
+
+    После переноса каталога и справочника контрагентов (`legacy_ms_id` у
+    `products`/`counterparties`) в старых строках всё ещё лежат UUID МойСклад:
+    `orders.agent_id`, `credit_limits.agent_id`, `machine_deals.agent_ms_id`,
+    `leads.agent_ms_id`, `product_photos.ms_id`, `order_items.product_href`.
+    Пока они там, один и тот же клиент существует под двумя ключами — старые
+    заказы под UUID, новые под нашим id, — и долг по нему считается дважды по
+    половинке.
+
+    Колонки НЕ переименовываем и не добавляем: инкрементальных миграций в
+    проекте нет. `agent_id` — имя нейтральное («идентификатор контрагента»), и
+    после этого прогона в нём лежит наш id строкой. Там, где имя колонки
+    говорит про МойСклад по существу (`order_items.product_href` — это ссылка
+    на документ), связь уезжает в отдельную таблицу `order_item_products`.
+
+    Идемпотентно: строка, у которой уже стоит локальный id, под условие
+    `legacy_ms_id = <значение>` больше не попадает.
+    """
+    stats: dict[str, int] = {}
+    # (метка, SQL). Каждый шаг — своей транзакцией: упавший не должен уносить
+    # остальные, а частично переписанные ссылки чинятся повторным прогоном.
+    steps = [
+        (
+            "orders",
+            "UPDATE orders SET agent_id = ("
+            "    SELECT CAST(c.id AS TEXT) FROM counterparties c "
+            "    WHERE c.legacy_ms_id = orders.agent_id) "
+            "WHERE agent_id IS NOT NULL AND EXISTS ("
+            "    SELECT 1 FROM counterparties c WHERE c.legacy_ms_id = orders.agent_id)",
+        ),
+        (
+            "credit_limits",
+            "UPDATE credit_limits SET agent_id = ("
+            "    SELECT CAST(c.id AS TEXT) FROM counterparties c "
+            "    WHERE c.legacy_ms_id = credit_limits.agent_id) "
+            "WHERE EXISTS ("
+            "    SELECT 1 FROM counterparties c WHERE c.legacy_ms_id = credit_limits.agent_id)",
+        ),
+        (
+            "machine_deals",
+            "UPDATE machine_deals SET agent_ms_id = ("
+            "    SELECT CAST(c.id AS TEXT) FROM counterparties c "
+            "    WHERE c.legacy_ms_id = machine_deals.agent_ms_id) "
+            "WHERE agent_ms_id IS NOT NULL AND EXISTS ("
+            "    SELECT 1 FROM counterparties c WHERE c.legacy_ms_id = machine_deals.agent_ms_id)",
+        ),
+        (
+            "leads",
+            "UPDATE leads SET agent_ms_id = ("
+            "    SELECT CAST(c.id AS TEXT) FROM counterparties c "
+            "    WHERE c.legacy_ms_id = leads.agent_ms_id) "
+            "WHERE agent_ms_id IS NOT NULL AND EXISTS ("
+            "    SELECT 1 FROM counterparties c WHERE c.legacy_ms_id = leads.agent_ms_id)",
+        ),
+        (
+            "product_prices",
+            "UPDATE product_prices SET ms_id = ("
+            "    SELECT CAST(p.id AS TEXT) FROM products p "
+            "    WHERE p.legacy_ms_id = product_prices.ms_id) "
+            "WHERE EXISTS ("
+            "    SELECT 1 FROM products p WHERE p.legacy_ms_id = product_prices.ms_id)",
+        ),
+        (
+            "product_photos",
+            "UPDATE product_photos SET ms_id = ("
+            "    SELECT CAST(p.id AS TEXT) FROM products p "
+            "    WHERE p.legacy_ms_id = product_photos.ms_id) "
+            "WHERE EXISTS ("
+            "    SELECT 1 FROM products p WHERE p.legacy_ms_id = product_photos.ms_id)",
+        ),
+    ]
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        for label, sql in steps:
+        migrations = [
+            ("user_roles", "moysklad_employee_id", "TEXT"),
+            ("user_roles", "ms_sync_status", "TEXT DEFAULT 'pending'"),
+            ("user_roles", "created_at", "TEXT"),
+            # Цена за единицу для позиции заказа (в основной валюте,
+            # т.е. как пользователь ввёл — например 150.50 USD).
+            # При создании demand в МойСклад умножаем на 100 (минорные единицы).
+            ("order_items", "price", "REAL DEFAULT 0"),
+            # Валюта заказа (USD/UZS/RUB/EUR). По умолчанию BASE_CURRENCY.
+            # Хранится на уровне ордера, чтобы все позиции одного заказа
+            # были в одной валюте.
+            ("orders", "currency", "TEXT"),
+            # Тип оплаты: 'paid' (оплачено сразу) или 'credit' (в долг).
+            # Default 'paid' — все старые заказы считаем как оплаченные,
+            # чтобы миграция была безопасной (не объявить вдруг весь
+            # архив должниками).
+            ("orders", "payment_type", "TEXT NOT NULL DEFAULT 'paid'"),
+            # Дата к которой клиент обязался погасить долг (ISO YYYY-MM-DD).
+            # Заполняется только когда payment_type='credit', NULL иначе.
+            ("orders", "due_date", "TEXT"),
+            # Когда долг был погашен (ISO YYYY-MM-DD HH:MM:SS). NULL пока
+            # не погашен. Для 'paid' заказов также NULL — там оплата
+            # сразу, отдельный timestamp не нужен (есть created_at).
+            ("orders", "paid_at", "TEXT"),
+            # Двухступенчатое подтверждение оплаты:
+            #  - paid_at:           менеджер отметил «деньги получил»
+            #  - paid_confirmed_*:  босс/админ подтвердил «да, в кассе»
+            # Заказ считается реально оплаченным ТОЛЬКО когда оба поля
+            # заполнены. Если босс отклонил — paid_at обнуляется (см.
+            # reject_payment_received), цикл начинается заново.
+            ("orders", "paid_confirmed_at", "TEXT"),
+            ("orders", "paid_confirmed_by", "BIGINT"),
+            ("orders", "paid_confirmed_by_name", "TEXT"),
+            # Связь платежа с заказом. Если payment.order_id IS NOT NULL —
+            # это «частичная оплата по заказу N», а не самостоятельный платёж
+            # в кассу. У одного заказа может быть несколько payments
+            # (клиент платит частями). Когда суммa confirmed payments >=
+            # order.total, заказ автоматически считается закрытым.
+            ("payments", "order_id", "BIGINT"),
+            # ID документа Demand в МойСклад, созданного при approve
+            # отгрузки. Нужен чтобы paymentin привязывался к конкретной
+            # отгрузке (operations field в API МойСклад). NULL если
+            # отгрузка ещё не отправлена или create_demand упал.
+            # LEGACY: новые заказы используют ms_customerorder_id ниже.
+            ("orders", "ms_demand_id", "TEXT"),
+            # ID «Заказа покупателя» (customerorder) в МойСклад.
+            # Новый workflow — бот создаёт именно customerorder, а не
+            # demand. paymentin привязывается сюда через operations
+            # вместо ms_demand_id для новых заказов.
+            ("orders", "ms_customerorder_id", "TEXT"),
+            # ID входящего платежа (paymentin) в МойСклад. Заполняется
+            # после успешного create_paymentin. Защищает от дубликатов:
+            # повторный confirm не плодит новые paymentin'ы в МойСклад.
+            ("payments", "ms_paymentin_id", "TEXT"),
+            # Статус синхронизации с МойСклад: NULL (ещё не пробовали),
+            # 'synced', 'failed' (с описанием в ms_sync_error).
+            ("payments", "ms_sync_status", "TEXT"),
+            ("payments", "ms_sync_error", "TEXT"),
+            # ─── IMPLEMENTATION.md Фаза 2 (адаптировано: BOOLEAN→INTEGER 0/1,
+            #     JSONB→TEXT, NUMERIC→REAL, без FK). Все колонки аддитивны. ──────
+            # users → у нас user_roles (telegram-id как PK).
+            ("user_roles", "active", "INTEGER NOT NULL DEFAULT 1"),
+            ("user_roles", "email", "TEXT"),
+            ("user_roles", "phone", "TEXT"),
+            ("user_roles", "deactivated_at", "TEXT"),
+            ("user_roles", "deactivated_by", "BIGINT"),
+            # orders
+            ("orders", "deleted_at", "TEXT"),
+            ("orders", "rejection_comment", "TEXT"),
+            ("orders", "rejection_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "frozen", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "cancelled_at", "TEXT"),
+            ("orders", "cancelled_by", "BIGINT"),
+            ("orders", "cancellation_reason", "TEXT"),
+            # Когда отмена была отражена в МойСклад (реверс customerorder).
+            # NULL = ещё не синхронизировано; идемпотентность ms_cancel.
+            ("orders", "ms_cancel_synced_at", "TEXT"),
+            # Когда документ заказа был обнаружен УДАЛЁННЫМ в МойСклад (вебхук
+            # customerorder.DELETE / cron-реконсиляция). Помечает «фантомные»
+            # заказы (особенно shipped/paid, чей статус мы не трогаем) — они
+            # исключаются из аналитики менеджеров, но остаются в учёте долгов
+            # для ручной разборки. NULL = в МС ещё существует.
+            ("orders", "ms_deleted_at", "TEXT"),
+            # Когда обнаружено расхождение суммы заказа с документом в МойСклад
+            # (кто-то отредактировал позиции/цены в МС). Это СИГНАЛ для ручной
+            # проверки (флаг + уведомление), деньги/статус НЕ меняем молча.
+            # NULL = расхождений не зафиксировано.
+            ("orders", "ms_drift_at", "TEXT"),
+            # Когда МойСклад сообщил статус, нелегальный для локальной машины
+            # состояний (напр. approved→rejected): отгрузка/остаток в МС двинулись,
+            # локально применить нельзя без отката. Отдельный флаг (НЕ ms_drift_at),
+            # чтобы дедуп этого алерта не глушился правкой суммы и наоборот.
+            # NULL = заблокированных переходов нет.
+            ("orders", "ms_transition_blocked_at", "TEXT"),
+            # R4: customerorder создан в МС, но demand (отгрузка) упал — заказ
+            # approved с CO, но без списания остатков. Флаг для ночного дайджеста
+            # «нужна доделка demand вручную». Снимается при успешном set_order_ms_demand_id.
+            # NULL = проблемы нет.
+            ("orders", "ms_demand_failed_at", "TEXT"),
+            ("orders", "credit_limit_override", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "credit_limit_override_by", "BIGINT"),
+            ("orders", "price_check_warnings", "TEXT"),
+            ("orders", "payment_confirmed", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "payment_confirmed_at", "TEXT"),
+            ("orders", "client_notification_sent", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "return_status", "TEXT"),
+            ("orders", "submitted_at", "TEXT"),
+            ("orders", "approved_by", "BIGINT"),
+            ("orders", "approved_at", "TEXT"),
+            ("orders", "shipped_at", "TEXT"),
+            ("orders", "shipped_by", "BIGINT"),
+            # Баланс контрагента (взаиморасчёты) из МойСклад report/counterparty,
+            # в копейках, как отдаёт МС. balance<0 — клиент должен нам; >0 —
+            # аванс/переплата (интерпретация — на фронте «Клиенты»).
+            # Синкается ночным refresh_counterparties. NULL = ещё не синкнут.
+            ("ms_counterparties", "balance_cents", "BIGINT"),
+            # order_items
+            ("order_items", "stock_snap", "REAL"),
+            ("order_items", "price_at_submit", "REAL"),
+            ("order_items", "batch_id", "TEXT"),
+            ("order_items", "returned_qty", "REAL NOT NULL DEFAULT 0"),
+            # ─── Деньги в копейках (минорные единицы) — канон вместо float.
+            #     Аддитивные BIGINT-колонки рядом со старыми REAL; backfill
+            #     в run_backfills (x_cents = round(x*100)). Старые REAL пока
+            #     остаются для безопасного rolling-деплоя. См. services/money.py.
+            ("payments", "amount_cents", "BIGINT"),
+            # Время claim'а платежа для MS-синка (WP-10). Reaper orphan'ов судит
+            # устаревание по нему, а не по confirmed_at: иначе любой платёж,
+            # подтверждённый >30 мин назад, мог быть сброшен reaper'ом ПРЯМО во
+            # время in-flight POST → второй paymentin в МС (дубль).
+            ("payments", "ms_sync_claimed_at", "TEXT"),
+            ("order_items", "price_cents", "BIGINT"),
+            ("order_items", "price_at_submit_cents", "BIGINT"),
+            ("credit_limits", "limit_amount_cents", "BIGINT"),
+            ("cash_deposits", "amount_cents", "BIGINT"),
+            ("cash_deposit_orders", "amount_allocated_cents", "BIGINT"),
+            ("returns", "total_amount_cents", "BIGINT"),
+            ("return_items", "amount_cents", "BIGINT"),
+            ("product_prices", "sale_price_cents", "BIGINT"),
+            ("product_prices", "cost_price_cents", "BIGINT"),
+            # Снимок курса валюты к BASE_CURRENCY на момент завершения операции
+            # (заказ → отгрузка, платёж → подтверждение). Заморозка точки-во-
+            # времени: общий итог в USD по прошлым сделкам не «плывёт» при
+            # последующем движении курса. NULL = снимок не снят (старые строки
+            # / валюта была неизвестна) → пересчёт fallback'ит на текущий курс.
+            ("orders", "fx_rate_to_base", "REAL"),
+            ("payments", "fx_rate_to_base", "REAL"),
+        ]
+        applied = 0
+        for table, column, col_type in migrations:
+
+            try:
+                cur.execute(sql)
+                stats[label] = max(cur.rowcount, 0)
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.warning("Backfill ссылок (%s): %s", label, e)
+                stats[label] = 0
+
+        # Позиции заказов: в `product_href` лежит ССЫЛКА, id из неё надо
+        # выкусить — в SQL это делается по-разному на двух движках, поэтому
+        # разбираем в Python. Строк немного (только те, что ещё не связаны).
+        try:
+            cur.execute(
+                "SELECT oi.id, oi.order_id, oi.product_href FROM order_items oi "
+                "WHERE oi.product_href IS NOT NULL AND oi.product_href <> '' "
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM order_item_products op WHERE op.item_id = oi.id)"
+            )
+            pending = [dict(r) for r in cur.fetchall()]
+        except Exception as e:
+            logger.warning("Backfill позиций заказов (чтение): %s", e)
+            pending = []
+
+        linked = 0
+        if pending:
+            from utils.helpers import extract_id_from_href
+
+            cur.execute(
+                "SELECT id, legacy_ms_id FROM products WHERE legacy_ms_id IS NOT NULL"
+            )
+            by_ms = {
+                str(r["legacy_ms_id"] if isinstance(r, dict) else r[1]): int(
+                    r["id"] if isinstance(r, dict) else r[0]
+                )
+                for r in cur.fetchall()
+            }
+            stamp = now_str()
+            for row in pending:
+                ms_id = extract_id_from_href(str(row["product_href"] or ""))
+                product_id = by_ms.get(ms_id)
+                if not product_id:
+                    continue
+                try:
+                    cur.execute(
+                        q(
+                            "INSERT INTO order_item_products "
+                            "(item_id, order_id, product_id, created_at) VALUES (?, ?, ?, ?)"
+                        ),
+                        (int(row["id"]), int(row["order_id"]), product_id, stamp),
+                    )
+                    linked += 1
+                except Exception as e:
+                    conn.rollback()
+                    logger.warning("Backfill позиции заказа #%s: %s", row["id"], e)
+            conn.commit()
+        stats["order_items"] = linked
+
+    if any(stats.values()):
+        logger.info("Backfill локальных id: %s", stats)
+    return stats
+
+
+def seed_document_templates() -> int:
+    """Засеять шаблоны юридических документов. Идемпотентно по типу.
+
+    file_path кладём ОТНОСИТЕЛЬНЫЙ (templates/legal/…): шаблон лежит в
+    репозитории и едет с образом. Заменить его своим можно, прописав в этой
+    строке абсолютный путь в томе /app/data — `legal_docs.template_path`
+    предпочитает значение из БД, когда оно задано.
+    """
+    from services.legal_docs import TEMPLATES
+
+    inserted = 0
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        for doc_type, (filename, _lang) in TEMPLATES.items():
+            cur.execute(
+                q("SELECT id FROM document_templates WHERE type = ?"), (doc_type,)
+            )
+            if cur.fetchone():
+                continue
+            cur.execute(
+                q(
+                    "INSERT INTO document_templates (type, file_path, is_active, created_at) "
+                    "VALUES (?, ?, 1, ?)"
+                ),
+                (doc_type, f"templates/legal/{filename}", now_str()),
+            )
+            inserted += 1
+        conn.commit()
+    if inserted:
+        logger.info("Засеяно шаблонов документов: %d", inserted)
+    return inserted
 
 
 def run_backfills():
@@ -720,6 +1663,14 @@ def run_backfills():
 
     # ── Сидинг app_settings (идемпотентно) ───────────────────────────
     seed_app_settings()
+    # ── Склад по умолчанию для локального учёта (идемпотентно) ───────
+    seed_warehouses()
+    # ── Шаблоны юридических документов (идемпотентно) ────────────────
+    seed_document_templates()
+    # ── Приёмка контейнеров: MS-связки → локальные (идемпотентно) ────
+    backfill_container_receipts()
+    # ── UUID МойСклад → наши id в старых строках (идемпотентно) ───────
+    backfill_local_identifiers()
 
 
 # ─── Настройки приложения (app_settings) ──────────────────────────────────────
@@ -748,6 +1699,7 @@ _DEFAULT_SETTINGS: dict[str, tuple] = {
     "return_deadline_days": (90, "Лимит на оформление возврата (дней с отгрузки)"),
     "auto_create_demand_on_approve": (True, "Создавать demand в МойСклад при approve"),
     "auto_ship_on_approve": (True, "Авто-переход в shipped сразу после approve"),
+    "machines_archive_days": (90, "Через сколько дней проданная техника уходит в архив"),
 }
 
 
@@ -960,6 +1912,55 @@ async def get_confirmed_deposit_cents_for_orders(order_ids: list[int]) -> dict[i
         *order_ids,
     )
     return {r["oid"]: int(r["dc"] or 0) for r in rows}
+
+
+async def get_allocated_deposit_cents_for_orders(
+    order_ids: list[int], conn=None
+) -> dict[int, int]:
+    """Распределено на заказы сдачами pending+confirmed, в копейках, батчем.
+
+    В отличие от get_confirmed_deposit_cents_for_orders учитывает и pending:
+    неподтверждённая сдача уже «застолбила» остаток, второй раз распределять
+    его нельзя. `conn` — чтобы считать внутри транзакции под advisory-lock'ом.
+    """
+    if not order_ids:
+        return {}
+    db = conn if conn is not None else adb_core
+    ph = ", ".join(f"${i + 1}" for i in range(len(order_ids)))
+    rows = await db.fetch(
+        f"SELECT cdo.order_id AS oid, {_SUM_ALLOC_CENTS} AS dc "
+        "FROM cash_deposit_orders cdo JOIN cash_deposits d ON d.id = cdo.deposit_id "
+        f"WHERE cdo.order_id IN ({ph}) AND d.status IN ('pending', 'confirmed') "
+        "GROUP BY cdo.order_id",
+        *order_ids,
+    )
+    return {r["oid"]: int(r["dc"] or 0) for r in rows}
+
+
+async def deposit_remaining_cents_for_orders(
+    order_ids: list[int], conn=None
+) -> dict[int, int]:
+    """Сколько ещё можно покрыть сдачей по каждому заказу, в копейках.
+
+    total − возвраты − подтверждённые платежи − распределённое сдачами
+    (pending+confirmed). Отличается от services.debts.calc_remaining_cents
+    последним слагаемым: там учитываются только ПОДТВЕРЖДЁННЫЕ сдачи, а для
+    распределения новой сдачи надо видеть и застолблённое pending'ом.
+
+    Два запроса на любое число заказов. `conn` — для расчёта внутри транзакции.
+    """
+    from services.debts import calc_order_balances
+
+    if not order_ids:
+        return {}
+    balances = await calc_order_balances(order_ids, conn=conn)
+    allocated = await get_allocated_deposit_cents_for_orders(order_ids, conn=conn)
+    out: dict[int, int] = {}
+    for oid, bal in balances.items():
+        out[oid] = (
+            bal.total_cents - bal.returns_cents - bal.confirmed_cents - allocated.get(oid, 0)
+        )
+    return out
 
 
 async def get_agent_current_debt(agent_id: str) -> float:
@@ -1205,42 +2206,131 @@ async def get_orders_by_agent(agent_id: str, limit: int = 50) -> list[dict[str, 
                 "currency": r["currency"],
                 "created_at": r["created_at"],
                 "total_cents": int(total_cents),
+                # Состав заказа. Позиции уже загружены ради суммы — отдать их
+                # даром дешевле, чем заводить отдельную ручку: карточка клиента
+                # показывала «заказ на 25 000», но не ЧТО в нём, и ответить на
+                # «что он у нас берёт» было нечем.
+                "items": [
+                    {
+                        "name": it.get("product_name") or "—",
+                        "quantity": float(it.get("quantity", 0) or 0),
+                        "unit": it.get("unit") or "шт",
+                        "price_cents": _price_cents(it),
+                    }
+                    for it in items
+                ],
             }
         )
     return out
 
 
+async def get_agent_money_history(agent_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    """Движение денег ПО КОНКРЕТНОМУ клиенту: платежи, сдачи и возвраты.
+
+    Формат строки намеренно совпадает с `get_cash_history` (kind/amount/
+    currency/status/who/order_id/note/created_at) — карточка клиента рисует
+    ленту тем же фронтовым кодом, что и экран «Деньги», и добавление нового
+    вида движения не придётся делать дважды.
+
+    Что считается «платежом клиента»:
+      • payments по его заказам;
+      • сдачи наличных — в той части, что распределена на его заказы
+        (`cash_deposit_orders`): сдача может закрывать заказы разных клиентов,
+        и показывать её полную сумму в карточке одного было бы враньём;
+      • возвраты по его заказам — деньги, ушедшие обратно.
+
+    Заказы-фантомы (удалённые в МойСклад) исключены, как и в общей ленте:
+    иначе платёж виден в истории клиента, но не входит ни в один итог.
+    """
+    if not agent_id:
+        return []
+
+    pays = await adb_core.fetch(
+        "SELECT p.id, p.user_id, p.amount_cents, p.currency, p.status, p.comment, "
+        "p.order_id, p.created_at "
+        "FROM payments p JOIN orders o ON o.id = p.order_id "
+        "WHERE o.agent_id = $1 AND (o.ms_deleted_at IS NULL) "
+        "ORDER BY p.created_at DESC LIMIT $2",
+        agent_id, limit,
+    )
+    # Сумма — ровно та часть сдачи, что пришлась на заказы этого клиента.
+    deps = await adb_core.fetch(
+        "SELECT d.id, d.manager_id, d.status, d.reject_reason, d.created_at, "
+        "SUM(cdo.amount_allocated_cents) AS amount_cents "
+        "FROM cash_deposits d "
+        "JOIN cash_deposit_orders cdo ON cdo.deposit_id = d.id "
+        "JOIN orders o ON o.id = cdo.order_id "
+        "WHERE o.agent_id = $1 AND (o.ms_deleted_at IS NULL) "
+        "GROUP BY d.id, d.manager_id, d.status, d.reject_reason, d.created_at "
+        "ORDER BY d.created_at DESC LIMIT $2",
+        agent_id, limit,
+    )
+    rets = await adb_core.fetch(
+        "SELECT r.id, r.order_id, r.created_by, r.total_amount_cents, r.status, "
+        "r.reason, r.created_at, o.currency AS order_currency "
+        "FROM returns r JOIN orders o ON o.id = r.order_id "
+        "WHERE o.agent_id = $1 AND (o.ms_deleted_at IS NULL) "
+        "ORDER BY r.created_at DESC LIMIT $2",
+        agent_id, limit,
+    )
+
+    # get_all_users синхронный — через to_thread, чтобы не блокировать loop
+    # (тот же урок, что в get_cash_history, WP-25).
+    users = await asyncio.to_thread(get_all_users)
+    names = {u["user_id"]: u.get("full_name") or str(u["user_id"]) for u in users}
+
+    from config import BASE_CURRENCY
+
+    base_cur = (BASE_CURRENCY or "USD").upper()
+
+    rows: list[dict[str, Any]] = []
+    for p in pays:
+        rows.append({
+            "kind": "payment", "id": p["id"],
+            "amount": float(money.from_cents(int(p["amount_cents"] or 0))),
+            "currency": p.get("currency") or base_cur, "status": p["status"],
+            "who": names.get(p["user_id"], str(p["user_id"])),
+            "order_id": p.get("order_id"), "note": p.get("comment") or "",
+            "created_at": (p.get("created_at") or "")[:16],
+        })
+    for d in deps:
+        rows.append({
+            "kind": "deposit", "id": d["id"],
+            "amount": float(money.from_cents(int(d["amount_cents"] or 0))),
+            "currency": base_cur, "status": d["status"],
+            "who": names.get(d["manager_id"], str(d["manager_id"])),
+            "order_id": None, "note": d.get("reject_reason") or "",
+            "created_at": (d.get("created_at") or "")[:16],
+        })
+    for r in rets:
+        rows.append({
+            "kind": "return", "id": r["id"],
+            "amount": float(money.from_cents(int(r["total_amount_cents"] or 0))),
+            "currency": (r.get("order_currency") or base_cur), "status": r["status"],
+            "who": names.get(r["created_by"], str(r["created_by"])),
+            "order_id": r.get("order_id"), "note": r.get("reason") or "",
+            "created_at": (r.get("created_at") or "")[:16],
+        })
+    rows.sort(key=lambda x: x["created_at"], reverse=True)
+    return rows[:limit]
+
+
 async def get_clients_overview() -> list[dict[str, Any]]:
-    """Список «Клиенты»: кредит-overview (долг/лимит/over_limit) + МС-баланс
-    (взаиморасчёты) и телефон из снапшота. Плюс контрагенты с ненулевым
-    МС-балансом, но без заказов/лимита — чтобы их тоже было видно."""
+    """Список «Клиенты»: кредит-overview (долг/лимит/over_limit) + телефон.
+
+    Раньше сюда подмешивался баланс взаиморасчётов МойСклад и добавлялись
+    контрагенты, у которых баланс есть, а заказов нет. Баланса больше нет:
+    «сколько должен» считается по нашим же заказам (`get_credit_overview`),
+    и второй ответ на тот же вопрос с ним бы расходился. Клиенты без заказов
+    из списка «Долги» выпадают — их и не за что там показывать; весь
+    справочник смотрят через `/api/agents`.
+    """
     rows = await get_credit_overview()
-    cp = await adb_core.fetch("SELECT ms_id, name, phone, balance_cents FROM ms_counterparties")
-    cp_by_id = {c["ms_id"]: c for c in cp}
-    seen = set()
+    cp = await adb_core.fetch("SELECT id, name, phone FROM counterparties")
+    cp_by_id = {str(c["id"]): c for c in cp}
     for r in rows:
-        c = cp_by_id.get(r["agent_id"])
-        bc = c.get("balance_cents") if c else None
-        r["balance_cents"] = int(bc) if bc is not None else None
+        c = cp_by_id.get(str(r["agent_id"]))
         r["phone"] = (c or {}).get("phone") or ""
-        seen.add(r["agent_id"])
-    default_limit = float(await asyncio.to_thread(get_setting, "credit_limit_default", 2000.0))
-    for c in cp:
-        bc = c.get("balance_cents")
-        if c["ms_id"] not in seen and bc:
-            rows.append(
-                {
-                    "agent_id": c["ms_id"],
-                    "agent_name": c["name"] or c["ms_id"],
-                    "limit": default_limit,
-                    "debt": 0.0,
-                    "debt_by_currency": [],
-                    "free": default_limit,
-                    "over_limit": False,
-                    "balance_cents": int(bc),
-                    "phone": c.get("phone") or "",
-                }
-            )
     return rows
 
 
@@ -1463,6 +2553,9 @@ async def mark_order_shipped(order_id: int, shipped_by: int, shipped_name: str) 
     if not updated:
         return {"ok": False, "error": "Заказ уже обработан"}
 
+    # Заморозить курс заказа на момент отгрузки (best-effort, sync money-core).
+    await asyncio.to_thread(_snapshot_order_fx, order_id)
+
     already_in_ms = bool(order.get("ms_demand_id"))
     await asyncio.to_thread(
         add_audit_log,
@@ -1550,10 +2643,6 @@ async def _order_total_cents(order_id: int) -> int:
     return int(summary["total_cents"])
 
 
-# SQL-фрагмент «распределено на заказ в копейках». Без placeholder'ов.
-_SUM_ALLOC_CENTS = "COALESCE(SUM(cdo.amount_allocated_cents), 0)"
-
-
 async def _order_confirmed_deposit_cents(order_id: int) -> int:
     """Распределено на заказ ПОДТВЕРЖДЁННЫМИ сдачами, в копейках.
 
@@ -1581,21 +2670,6 @@ async def _order_confirmed_returns_cents(order_id: int) -> int:
         await adb_core.fetchval(
             f"SELECT {_SUM_RETURNS_CENTS} FROM returns "
             f"WHERE order_id = $1 AND {_RETURN_OWED_FILTER}",
-            order_id,
-        )
-        or 0
-    )
-
-
-async def _order_allocated_deposit_cents(order_id: int) -> int:
-    """Распределено на заказ pending+confirmed сдачами, в копейках (M3).
-
-    asyncpg Stage 17 (#21): native async через adb_core (fetchval)."""
-    return int(
-        await adb_core.fetchval(
-            f"SELECT {_SUM_ALLOC_CENTS} FROM cash_deposit_orders cdo "
-            "JOIN cash_deposits d ON d.id = cdo.deposit_id "
-            "WHERE cdo.order_id = $1 AND d.status IN ('pending', 'confirmed')",
             order_id,
         )
         or 0
@@ -1633,7 +2707,13 @@ def _is_base_currency(currency: str | None) -> bool:
     return (currency or base).upper() == base
 
 
-async def get_manager_open_orders_for_deposit(manager_id: int) -> list[dict]:
+async def _calc_balances(order_ids: list[int], conn=None):
+    from services.debts import calc_order_balances
+
+    return await calc_order_balances(order_ids, conn=conn)
+
+
+async def get_manager_open_orders_for_deposit(manager_id: int, conn=None) -> list[dict]:
     """Отгруженные неоплаченные заказы менеджера В БАЗОВОЙ ВАЛЮТЕ (для распределения
     сдачи). Возвращает [{id, total, covered, remaining}] по возрастанию created_at.
     remaining = total − возвраты − подтверждённые платежи − распределённое
@@ -1645,31 +2725,39 @@ async def get_manager_open_orders_for_deposit(manager_id: int) -> list[dict]:
 
     Остаток считаем в копейках (без float-эпсилона 0.01) — заказ попадает
     в список, только если непокрытый остаток ≥ 1 копейки."""
-    rows = await adb_core.fetch(
+    db = conn if conn is not None else adb_core
+    rows = await db.fetch(
         "SELECT id, currency FROM orders WHERE user_id = $1 AND status = 'shipped' "
         "AND payment_confirmed = 0 ORDER BY created_at ASC",
         manager_id,
     )
+    # Заказы в не-базовой валюте отсеиваем сразу: сдача в базовой их не покрывает.
+    ordered_ids = [r["id"] for r in rows if _is_base_currency(r["currency"])]
+    if not ordered_ids:
+        return []
+
+    # T2.11: раньше здесь было 4 запроса НА КАЖДЫЙ заказ, и каждый брал свой
+    # коннект из пула — при вызове изнутри транзакции это выедало пул и
+    # вставало намертво. Теперь два запроса на любое число заказов.
+    remaining_by_id = await deposit_remaining_cents_for_orders(ordered_ids, conn=conn)
+    balances = await _calc_balances(ordered_ids, conn=conn)
+
     out = []
-    for r in rows:
-        if not _is_base_currency(r["currency"]):
-            continue  # сдача в базовой валюте не покрывает заказ в иной валюте
-        oid = r["id"]
-        total_cents = await _order_total_cents(oid)
-        returns_cents = await _order_confirmed_returns_cents(oid)
-        paid_cents = await _order_confirmed_payment_cents(oid)
-        alloc_cents = await _order_allocated_deposit_cents(oid)
-        covered_cents = returns_cents + paid_cents + alloc_cents
-        remaining_cents = total_cents - covered_cents
-        if remaining_cents > 0:
-            out.append(
-                {
-                    "id": oid,
-                    "total": float(money.from_cents(total_cents)),
-                    "covered": float(money.from_cents(covered_cents)),
-                    "remaining": float(money.from_cents(remaining_cents)),
-                }
-            )
+    for oid in ordered_ids:  # порядок FIFO — по created_at, как в SELECT выше
+        remaining_cents = remaining_by_id.get(oid, 0)
+        if remaining_cents <= 0:
+            continue
+        bal = balances.get(oid)
+        total_cents = bal.total_cents if bal else 0
+        out.append(
+            {
+                "id": oid,
+                "total": float(money.from_cents(total_cents)),
+                "covered": float(money.from_cents(total_cents - remaining_cents)),
+                "remaining": float(money.from_cents(remaining_cents)),
+                "remaining_cents": remaining_cents,
+            }
+        )
     return out
 
 
@@ -1838,6 +2926,181 @@ def _invalidate_currency_rates_cache() -> None:
         _CURRENCY_RATES_CACHE.clear()
 
 
+def convert_to_base_at(
+    amount: float, from_currency: str | None, rate_to_base: float | None
+) -> float | None:
+    """Перевести amount в BASE_CURRENCY по ПЕРЕДАННОМУ курсу (снимок).
+
+    В отличие от convert_to_base (берёт ТЕКУЩИЙ курс из БД), считает по
+    `rate_to_base`, замороженному на момент операции. Если валюта = базовой
+    (или None) — возвращает amount как есть. Если курс не передан/невалиден —
+    None (caller решает: fallback на convert_to_base или показать «—»).
+    """
+    from config import BASE_CURRENCY
+
+    if amount is None:
+        return None
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return None
+    code = (from_currency or BASE_CURRENCY).upper()
+    base = (BASE_CURRENCY or "USD").upper()
+    if code == base:
+        return amount
+    if rate_to_base is None:
+        return None
+    try:
+        rate = float(rate_to_base)
+    except (TypeError, ValueError):
+        return None
+    if rate <= 0:
+        return None
+    return float(money.from_cents(money.convert_cents(money.to_cents(amount), rate)))
+
+
+def set_currency_rate_daily(
+    currency_code: str, rate_date: str, rate_to_base: float, source: str = "cbu"
+) -> tuple[bool, str | None]:
+    """UPSERT курса в дневной архив (currency_rate_daily). Один курс на день.
+
+    `rate_date` — 'YYYY-MM-DD'. Возвращает (ok, error_msg). Валидирует rate
+    как amount (> 0, конечное). currency_code нормализуется UPPER.
+    """
+    code = (currency_code or "").upper().strip()
+    if not code:
+        return False, "currency_code пустой"
+    if not rate_date:
+        return False, "rate_date пустой"
+    ok, err = _validate_amount(rate_to_base)
+    if not ok:
+        return False, f"rate_to_base: {err}"
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        if USE_POSTGRES:
+            cur.execute(
+                q(
+                    "INSERT INTO currency_rate_daily "
+                    "(currency_code, rate_date, rate_to_base, source, created_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT (currency_code, rate_date) DO UPDATE SET "
+                    "rate_to_base = EXCLUDED.rate_to_base, source = EXCLUDED.source"
+                ),
+                (code, rate_date, float(rate_to_base), source, now_str()),
+            )
+        else:
+            cur.execute(
+                q(
+                    "INSERT OR REPLACE INTO currency_rate_daily "
+                    "(currency_code, rate_date, rate_to_base, source, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)"
+                ),
+                (code, rate_date, float(rate_to_base), source, now_str()),
+            )
+        conn.commit()
+    return True, None
+
+
+def get_currency_rate_asof(currency_code: str, date_str: str) -> float | None:
+    """Курс валюты к BASE_CURRENCY на дату `date_str` (самый свежий день ≤ date).
+
+    Выходные/пропуски в архиве → берём ближайший ранний день. Базовая валюта
+    → 1.0 без обращения к БД. None если в архиве нет ни одной подходящей записи.
+    `date_str` сравнивается лексикографически — формат строго 'YYYY-MM-DD'
+    (или с временем; берётся первые 10 символов).
+    """
+    from config import BASE_CURRENCY
+
+    if not currency_code:
+        return None
+    code = currency_code.upper()
+    base = (BASE_CURRENCY or "USD").upper()
+    if code == base:
+        return 1.0
+    day = (date_str or "")[:10]
+    if not day:
+        return None
+    try:
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q(
+                    "SELECT rate_to_base FROM currency_rate_daily "
+                    "WHERE currency_code = ? AND rate_date <= ? "
+                    "ORDER BY rate_date DESC LIMIT 1"
+                ),
+                (code, day),
+            )
+            row = cur.fetchone()
+    except Exception:
+        logger.exception("get_currency_rate_asof(%s, %s) failed", code, day)
+        return None
+    if row is None:
+        return None
+    return float(row["rate_to_base"]) if hasattr(row, "keys") else float(row[0])
+
+
+def backfill_fx_rate_snapshots() -> dict:
+    """Проставить fx_rate_to_base прошлым orders/payments без снимка — по дате
+    операции через дневной архив (get_currency_rate_asof). Идемпотентно
+    (UPDATE ... WHERE fx_rate_to_base IS NULL). Возвращает {orders, payments}.
+
+    Дата операции: orders → shipped_at/approved_at/created_at (что раньше есть),
+    payments → confirmed_at/created_at. Если архив на ту дату пуст → строку
+    пропускаем (останется NULL → пересчёт fallback'нет на текущий курс).
+    """
+    o_count = 0
+    p_count = 0
+
+    def _rows(sql: str) -> list:
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(q(sql))
+            return cur.fetchall()
+
+    def _val(row, key, idx):
+        return row[key] if hasattr(row, "keys") else row[idx]
+
+    order_rows = _rows(
+        "SELECT id, currency, "
+        "COALESCE(shipped_at, approved_at, created_at) AS op_date "
+        "FROM orders WHERE fx_rate_to_base IS NULL AND currency IS NOT NULL "
+        "AND status IN ('approved','shipped','paid','partially_returned','returned')"
+    )
+    for row in order_rows:
+        rate = get_currency_rate_asof(_val(row, "currency", 1), _val(row, "op_date", 2) or "")
+        if rate is None:
+            continue
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q("UPDATE orders SET fx_rate_to_base = ? WHERE id = ? AND fx_rate_to_base IS NULL"),
+                (float(rate), _val(row, "id", 0)),
+            )
+            conn.commit()
+        o_count += 1
+
+    payment_rows = _rows(
+        "SELECT id, currency, COALESCE(confirmed_at, created_at) AS op_date "
+        "FROM payments WHERE fx_rate_to_base IS NULL AND currency IS NOT NULL "
+        "AND status = 'confirmed'"
+    )
+    for row in payment_rows:
+        rate = get_currency_rate_asof(_val(row, "currency", 1), _val(row, "op_date", 2) or "")
+        if rate is None:
+            continue
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q("UPDATE payments SET fx_rate_to_base = ? WHERE id = ? AND fx_rate_to_base IS NULL"),
+                (float(rate), _val(row, "id", 0)),
+            )
+            conn.commit()
+        p_count += 1
+
+    return {"orders": o_count, "payments": p_count}
+
+
 # ─── Product prices (PR C: управление ценами руководством) ───────────────────
 #
 # Руководство (boss/admin) задаёт на товар:
@@ -2000,21 +3263,6 @@ async def get_product_prices_by_ids(ms_ids: list[str]) -> dict[str, dict]:
     return {r["ms_id"]: _price_row_major(r) for r in rows}
 
 
-async def get_existing_ms_product_ids(ms_ids: list[str]) -> set[str]:
-    """Подмножество ms_ids, которые ещё ЕСТЬ в снапшоте ms_products (т.е. НЕ
-    удалены в МойСклад). Аналитика использует это, чтобы прятать из топа
-    товары, удалённые в МС (иначе менеджер видит непонятные позиции).
-
-    asyncpg Stage 12 (#21): native async; IN-список — $1..$N."""
-    ids = [str(x).strip() for x in (ms_ids or []) if str(x).strip()]
-    if not ids:
-        return set()
-    placeholders = ", ".join(f"${i + 1}" for i in range(len(ids)))
-    rows = await adb_core.fetch(
-        f"SELECT ms_id FROM ms_products WHERE ms_id IN ({placeholders})",
-        *ids,
-    )
-    return {r["ms_id"] for r in rows}
 
 
 async def get_all_product_prices() -> list[dict]:
@@ -2063,23 +3311,42 @@ async def create_cash_deposit(
     is_manual = allocations is not None
     allocs: list[tuple] = list(allocations) if allocations is not None else []
 
+    # T2.11: FIFO-расчёт — ДО захвата коннекта под транзакцию.
+    # Раньше он шёл внутри `async with transaction()`, а
+    # get_manager_open_orders_for_deposit делала 4 запроса на каждый заказ,
+    # и каждый брал СВОЙ коннект из того же пула. При PG_POOL_MAX=10
+    # одновременных сдачах все коннекты держали транзакции, а внутренние
+    # запросы ждали свободного — asyncpg.Pool.acquire() без таймаута ждёт
+    # вечно, процесс вставал до рестарта (§2.13).
+    candidates: list[dict] = []
+    if not is_manual:
+        candidates = await get_manager_open_orders_for_deposit(manager_id)
+
     async with adb_core.transaction() as txn:
         if USE_POSTGRES:
-            # Сериализуем FIFO-расчёт + INSERT по manager_id. pg_advisory_xact_lock
-            # держится до конца транзакции, второй параллельный вызов ждёт.
+            # Сериализуем перепроверку + INSERT по manager_id.
+            # pg_advisory_xact_lock держится до конца транзакции, второй
+            # параллельный вызов ждёт.
             await txn.execute(
                 "SELECT pg_advisory_xact_lock(hashtext($1))",
                 f"cash_deposit:manager:{manager_id}",
             )
         if not is_manual:
-            left = amount
-            for o in await get_manager_open_orders_for_deposit(manager_id):
-                if left <= 0:
+            # Перепроверка ПОД ЛОКОМ: между расчётом и этим моментом другой
+            # вызов мог распределить часть остатка. Читаем свежие остатки тем
+            # же коннектом (conn=txn) — новых захватов из пула не делаем.
+            fresh = await deposit_remaining_cents_for_orders(
+                [o["id"] for o in candidates], conn=txn
+            )
+            left_cents = money.to_cents(amount)
+            for o in candidates:
+                if left_cents <= 0:
                     break
-                take = min(o["remaining"], left)
-                if take > 0:
-                    allocs.append((o["id"], round(take, 2)))
-                    left -= take
+                available = min(int(o.get("remaining_cents") or 0), fresh.get(o["id"], 0))
+                take_cents = min(available, left_cents)
+                if take_cents > 0:
+                    allocs.append((o["id"], float(money.from_cents(take_cents))))
+                    left_cents -= take_cents
 
         amount_cents = money.to_cents(amount)
         if USE_POSTGRES:
@@ -2457,12 +3724,31 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
     # завышалась без возможности reconcile. Теперь либо всё, либо ничего.
     try:
         async with adb_core.transaction() as txn:
+            # T2.8: подтвердить возврат можно только если товар ПРИНЯТ.
+            # goods_received писался (mark_return_goods_received), но никогда не
+            # проверялся: босс подтверждал возврат → returned_qty рос, заказ
+            # уходил в returned, а при refund_method='cash' деньги выдавались из
+            # кассы (отрицательная сдача) — за товар, который физически мог не
+            # приехать (§2.12).
+            #
+            # Проверка — частью того же CAS-UPDATE, а не отдельным SELECT'ом:
+            # иначе между проверкой и записью флаг мог смениться.
             rc = await txn.execute(
                 "UPDATE returns SET status = 'confirmed', confirmed_by = $1, confirmed_at = $2 "
-                "WHERE id = $3 AND status = 'pending'",
+                "WHERE id = $3 AND status = 'pending' AND goods_received = 1",
                 confirmed_by, now_str(), return_id,
             )
             if rc == 0:
+                # Различаем причины: «уже обработан» и «товар не принят» — иначе
+                # кладовщик получит непонятное сообщение и пойдёт к админу.
+                row = await txn.fetchrow(
+                    "SELECT status, goods_received FROM returns WHERE id = $1", return_id
+                )
+                if row and row["status"] == "pending" and not row["goods_received"]:
+                    raise _TxnAbort(
+                        "Сначала отметьте, что товар принят "
+                        "(кнопка «Товар получен» в карточке возврата)"
+                    )
                 raise _TxnAbort("Возврат уже обработан")
             ritems = await txn.fetch(
                 "SELECT order_item_id, qty FROM return_items WHERE return_id = $1", return_id
@@ -2590,8 +3876,7 @@ def claim_ops_monitor_run(run_date: str) -> bool:
     False если уже запускался. `tasks/run_ops_monitor.main()` должен exit 0
     при False.
 
-    Использует ту же таблицу `notified_shipments`-style паттерн с PRIMARY
-    KEY-based atomic INSERT-if-absent. CREATE TABLE в init_db; run_date —
+    Атомарный INSERT-if-absent по PRIMARY KEY. CREATE TABLE в init_db; run_date —
     'YYYY-MM-DD' строка (по local TZ через now_str()).
     """
     with get_conn() as conn:
@@ -2617,26 +3902,6 @@ def claim_ops_monitor_run(run_date: str) -> bool:
     return claimed
 
 
-async def set_return_ms_id(return_id: int, ms_id: str) -> bool:
-    """Сохранить id документа «Возврат покупателя» из МойСклад (идемпотентность
-    повторной отправки).
-
-    Round 6 (RACE-3): conditional UPDATE — если ms_id уже стоит, не
-    перезаписываем. Защищает от race'а двух параллельных create_salesreturn:
-    оба прочли NULL, оба POST в МС, оба зовут set_return_ms_id — без guard'а
-    второй перетёр бы первый id, первый salesreturn в МС становится orphan'ом.
-    Возвращаемый bool теперь говорит «выиграл ли я гонку» — caller может,
-    если хочет, попытаться удалить только что созданный orphan-doc в МС.
-
-    asyncpg #21: native async через adb_core (rowcount-guard сохранён)."""
-    return (
-        await adb_core.execute(
-            "UPDATE returns SET moysklad_return_id = $1 "
-            "WHERE id = $2 AND moysklad_return_id IS NULL",
-            ms_id, return_id,
-        )
-        > 0
-    )
 
 
 # ─── Роли ────────────────────────────────────────────────────────────────────
@@ -2762,8 +4027,12 @@ def set_role(user_id: int, username: str, full_name: str, role: str) -> bool:
                 INSERT INTO user_roles (user_id, username, full_name, role, created_at)
                 VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT(user_id) DO UPDATE SET
-                    username = EXCLUDED.username,
-                    full_name = EXCLUDED.full_name,
+                -- T2.13 (§2.8): NULLIF+COALESCE. /addrole зовёт set_role с
+                -- пустыми username/full_name (у админа их нет), и безусловный
+                -- EXCLUDED затирал реальное имя — /users показывал голый ID
+                -- до следующего /start пользователя.
+                    username = COALESCE(NULLIF(EXCLUDED.username, ''), user_roles.username),
+                    full_name = COALESCE(NULLIF(EXCLUDED.full_name, ''), user_roles.full_name),
                     role = EXCLUDED.role
             """,
                 (user_id, username, full_name, role, now_str()),
@@ -2774,8 +4043,12 @@ def set_role(user_id: int, username: str, full_name: str, role: str) -> bool:
                 INSERT INTO user_roles (user_id, username, full_name, role, created_at)
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
-                    username = excluded.username,
-                    full_name = excluded.full_name,
+                -- T2.13 (§2.8): NULLIF+COALESCE. /addrole зовёт set_role с
+                -- пустыми username/full_name (у админа их нет), и безусловный
+                -- EXCLUDED затирал реальное имя — /users показывал голый ID
+                -- до следующего /start пользователя.
+                    username = COALESCE(NULLIF(excluded.username, ''), user_roles.username),
+                    full_name = COALESCE(NULLIF(excluded.full_name, ''), user_roles.full_name),
                     role = excluded.role
             """,
                 (user_id, username, full_name, role, now_str()),
@@ -2882,28 +4155,8 @@ def ensure_user(user_id: int, username: str, full_name: str, admin_ids: list[int
     _invalidate_role_cache(user_id)
 
 
-def set_moysklad_employee(user_id: int, ms_employee_id: str, status: str = "linked") -> bool:
-    """Привязать Telegram пользователя к сотруднику МойСклад."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "UPDATE user_roles SET moysklad_employee_id = ?, ms_sync_status = ? WHERE user_id = ?"
-            ),
-            (ms_employee_id, status, user_id),
-        )
-        updated = cur.rowcount > 0
-        conn.commit()
-    return updated
 
 
-async def get_moysklad_employee_id(user_id: int) -> str | None:
-    """Получить ID сотрудника МойСклад для Telegram пользователя.
-
-    asyncpg Stage 13 (#21): native async через adb_core (fetchval)."""
-    return await adb_core.fetchval(
-        "SELECT moysklad_employee_id FROM user_roles WHERE user_id = $1", user_id
-    )
 
 
 # ─── Платежи ─────────────────────────────────────────────────────────────────
@@ -2995,13 +4248,6 @@ def _amount_cents(payment: dict) -> int:
     return int(payment.get("amount_cents") or 0)
 
 
-# SQL-фрагменты «сумма денег в копейках». Без placeholder'ов, безопасно
-# встраивать в f-string. Работают и в SQLite, и в Postgres. Суммы и сравнения —
-# в целых копейках, без float и без epsilon.
-_SUM_PAYMENTS_CENTS = "COALESCE(SUM(amount_cents), 0)"
-_SUM_ORDER_TOTAL_CENTS = "COALESCE(SUM(CAST(round(quantity * price_cents) AS INTEGER)), 0)"
-
-
 async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
     """Аналитика по менеджерам (boss) из ЛОКАЛЬНЫХ orders, GROUP BY user_id за
     период [since_iso, until_iso] по created_at. Надёжный источник (в отличие от
@@ -3054,6 +4300,15 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
                 # Выручка/долг РАЗДЕЛЬНО по валютам (не складываем разные валюты).
                 "revenue_cents_cur": {},
                 "debt_cents_cur": {},
+                # Сводный итог в BASE_CURRENCY (по снимку курса заказа; fallback —
+                # текущий курс). *_any: хоть что-то сконвертировано; *_missing:
+                # часть валют без курса (итог приблизительный).
+                "revenue_base_sum": 0.0,
+                "revenue_base_any": False,
+                "revenue_base_missing": False,
+                "debt_base_sum": 0.0,
+                "debt_base_any": False,
+                "debt_base_missing": False,
                 "returns_count": 0,
             },
         )
@@ -3067,13 +4322,27 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
         elif status == "shipped":
             m["shipped"] += 1
         ocur = (o.get("currency") or base_cur).upper()
+        snap = o.get("fx_rate_to_base")
         items = items_by_order.get(o["id"], [])
         total_cents = sum(
             money.mul_qty(_price_cents(it), it.get("quantity", 0) or 0) for it in items
         )
+
+        def _accum_base(major: float, kind: str) -> None:
+            # Снимок курса заказа, иначе текущий курс. None → валюта без курса.
+            base_val = convert_to_base_at(major, ocur, snap)
+            if base_val is None:
+                base_val = convert_to_base(major, ocur)
+            if base_val is None:
+                m[f"{kind}_base_missing"] = True
+            else:
+                m[f"{kind}_base_sum"] += base_val
+                m[f"{kind}_base_any"] = True
+
         if status in revenue_statuses:
             m["revenue_cents"] += total_cents
             m["revenue_cents_cur"][ocur] = m["revenue_cents_cur"].get(ocur, 0) + total_cents
+            _accum_base(float(money.from_cents(total_cents)), "revenue")
         if status in debt_statuses and not o.get("payment_confirmed"):
             confirmed = sum(
                 _amount_cents(p)
@@ -3083,6 +4352,8 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
             net = max(0, total_cents - confirmed)
             m["debt_cents"] += net
             m["debt_cents_cur"][ocur] = m["debt_cents_cur"].get(ocur, 0) + net
+            if net > 0:
+                _accum_base(float(money.from_cents(net)), "debt")
         m["returns_count"] += returns_by_order.get(o["id"], 0)
 
     users = {u["user_id"]: u for u in await asyncio.to_thread(get_all_users)}
@@ -3116,7 +4387,7 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
         )
     result.sort(key=lambda x: x["revenue"], reverse=True)
     return result
-_SUM_RETURNS_CENTS = "COALESCE(SUM(total_amount_cents), 0)"
+
 
 # «Живой заказ» для денежных агрегатов: платёж учитываем, только если его заказа
 # нет (standalone, order_id IS NULL) ИЛИ заказ не удалён ни в МС, ни локально.
@@ -3129,14 +4400,6 @@ _LIVE_ORDER_PAYMENT_FILTER = (
     "(o.id IS NULL OR o.ms_deleted_at IS NULL)"
 )
 
-# Возвраты, уменьшающие «к оплате» по заказу: ТОЛЬКО не-cash (debt_reduction /
-# no_refund / без метода). Cash-возврат физически отдаёт деньги (отрицательная
-# сдача в кассе) — он не должен ещё и уменьшать долг по заказу, иначе клиента
-# кредитуют дважды (вернули товар, отдали деньги — и заказ закрылся как оплаченный).
-_RETURN_OWED_FILTER = (
-    "status = 'confirmed' "
-    "AND (refund_method IS NULL OR refund_method != 'cash')"
-)
 
 
 async def get_order_payment_summary(order_id: int) -> dict:
@@ -3155,19 +4418,21 @@ async def get_order_payment_summary(order_id: int) -> dict:
     """
     from config import BASE_CURRENCY
 
+    from services.debts import calc_order_balance
+
     order = await get_order(order_id)
     if not order:
         return {"total": 0.0, "confirmed": 0.0, "pending": 0.0, "remaining": 0.0}
-    items = await get_order_items(order_id)
-    # Считаем в копейках (точно), с фолбэком на старый REAL для не-забэкфилленных строк.
-    total_cents = sum(money.mul_qty(_price_cents(it), it.get("quantity", 0) or 0) for it in items)
-    payments = await get_payments_for_order(order_id)
-    confirmed_cents = sum(_amount_cents(p) for p in payments if p["status"] == "confirmed")
-    pending_cents = sum(_amount_cents(p) for p in payments if p["status"] == "pending")
-    # Возвраты уменьшают «к оплате» (как в get_agent_current_debt). Без этого
-    # возвращённый-и-доплаченный заказ показывал завышенный остаток и не закрывался.
-    returns_cents = await _order_confirmed_returns_cents(order_id)
-    remaining_cents = max(0, total_cents - confirmed_cents - returns_cents)
+    # T2.1: остаток считает services.debts — единственный источник истины.
+    # Раньше здесь была своя формула БЕЗ сдач наличных, поэтому заказ, закрытый
+    # сдачей, показывал долг в карточке и в пуше боссу (§2.10).
+    bal = await calc_order_balance(order_id)
+    total_cents = bal.total_cents
+    confirmed_cents = bal.confirmed_cents
+    pending_cents = bal.pending_cents
+    returns_cents = bal.returns_cents
+    deposits_cents = bal.deposits_cents
+    remaining_cents = bal.remaining_cents
 
     total = float(money.from_cents(total_cents))
     confirmed = float(money.from_cents(confirmed_cents))
@@ -3182,11 +4447,13 @@ async def get_order_payment_summary(order_id: int) -> dict:
         "pending": pending,
         "remaining": remaining,
         "returns": returns_amount,
+        "deposits": float(money.from_cents(deposits_cents)),
         "total_cents": total_cents,
         "confirmed_cents": confirmed_cents,
         "pending_cents": pending_cents,
         "remaining_cents": remaining_cents,
         "returns_cents": returns_cents,
+        "deposits_cents": deposits_cents,
         "currency": currency,
         # *_base — None если convert_to_base не смог (курс не задан админом).
         "total_base": convert_to_base(total, currency),
@@ -3197,69 +4464,43 @@ async def get_order_payment_summary(order_id: int) -> dict:
     }
 
 
-def mark_shipment_notified(demand_id: str) -> bool:
-    """Атомарно «застолбить» отправку уведомления об отгрузке.
 
-    Возвращает True, если demand_id записан впервые (т.е. уведомлять НАДО),
-    и False, если уже был (другой процесс/проход опередил — не дублируем).
 
-    Используется и MS-вебхуком (webapp), и поллером (bot) — общий Postgres
-    обеспечивает дедуп между процессами. INSERT-if-absent атомарен, гонка
-    двух процессов разрешается на уровне PRIMARY KEY.
+
+
+
+
+def prune_idempotency_keys() -> int:
+    """Удалить протухшие ключи идемпотентности (expires_at < сейчас).
+
+    T2.13 (§3.5): expires_at писался, но НИКОГДА не читался — таблица росла
+    вечно. Порог считаем в Python и передаём параметром: created_at/expires_at
+    пишутся в локальной TZ через now_str(), а SQL-функции текущего времени
+    (NOW() / datetime('now')) отдают UTC — лексикографическое сравнение строк
+    в разных TZ молча всегда даёт False (CLAUDE.md).
     """
-    if not demand_id:
-        return False
+    # У таблицы PK — `key` (TEXT), поэтому _batched_delete (он ходит по `id`)
+    # тут не подходит; порции режем по самому ключу.
+    cutoff = now_str()
+    total = 0
     with get_conn() as conn:
         cur = get_cursor(conn)
-        if USE_POSTGRES:
+        while True:
             cur.execute(
-                "INSERT INTO notified_shipments (demand_id, notified_at) "
-                "VALUES (%s, %s) ON CONFLICT (demand_id) DO NOTHING",
-                (demand_id, now_str()),
+                q(
+                    "DELETE FROM idempotency_keys WHERE key IN ("
+                    "SELECT key FROM idempotency_keys "
+                    "WHERE expires_at IS NOT NULL AND expires_at < ? "
+                    "ORDER BY key LIMIT ?)"
+                ),
+                (cutoff, 5000),
             )
-        else:
-            cur.execute(
-                "INSERT OR IGNORE INTO notified_shipments (demand_id, notified_at) VALUES (?, ?)",
-                (demand_id, now_str()),
-            )
-        inserted = cur.rowcount > 0
-        conn.commit()
-    return inserted
-
-
-def unmark_shipment_notified(demand_id: str) -> bool:
-    """Освободить дедуп-слот отгрузки (R5): если ВСЕ отправки уведомления упали
-    (Telegram 5xx), слот нужно снять, чтобы резервный поллер повторил позже —
-    иначе уведомление потеряно навсегда. Возвращает True, если строка удалена."""
-    if not demand_id:
-        return False
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q("DELETE FROM notified_shipments WHERE demand_id = ?"), (demand_id,))
-        deleted = cur.rowcount > 0
-        conn.commit()
-    return deleted
-
-
-def prune_notified_shipments(older_than_days: int = 30) -> int:
-    """Удалить старые записи дедупа отгрузок (таблица иначе растёт без предела).
-
-    demand_id уникален и больше не «всплывёт» спустя месяцы, поэтому хранить
-    их вечно незачем. Возвращает число удалённых строк. now_str() формата
-    'YYYY-MM-DD HH:MM:SS' лексикографически сортируется — сравнение строкой ок.
-    """
-    from datetime import timedelta
-
-    cutoff = (datetime.now() - timedelta(days=older_than_days)).strftime("%Y-%m-%d %H:%M:%S")
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("DELETE FROM notified_shipments WHERE notified_at < ?"),
-            (cutoff,),
-        )
-        deleted = cur.rowcount
-        conn.commit()
-    return deleted
+            n = cur.rowcount or 0
+            conn.commit()
+            total += n
+            if n <= 0:
+                break
+    return total
 
 
 def prune_audit_log(retention_months: int = 6) -> int:
@@ -3294,118 +4535,20 @@ def _batched_delete(table: str, where: str, params: tuple, batch: int = 5000) ->
     return total
 
 
-def set_order_ms_demand_id(order_id: int, ms_demand_id: str) -> bool:
-    """Сохранить id демэнд-документа МойСклад на заказе. Legacy: новые
-    заказы используют set_order_ms_customerorder_id."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("UPDATE orders SET ms_demand_id = ?, updated_at = ? WHERE id = ?"),
-            (ms_demand_id, now_str(), order_id),
-        )
-        updated = cur.rowcount > 0
-        conn.commit()
-    return updated
 
 
-def set_order_ms_customerorder_id(order_id: int, co_id: str) -> bool:
-    """Сохранить id customerorder МойСклад на заказе. Используется
-    после успешного create_customerorder_from_request — нужно чтобы
-    paymentin привязался к этому заказу через operations."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("UPDATE orders SET ms_customerorder_id = ?, updated_at = ? WHERE id = ?"),
-            (co_id, now_str(), order_id),
-        )
-        updated = cur.rowcount > 0
-        conn.commit()
-    return updated
 
 
-async def set_order_ms_cancel_synced(order_id: int) -> bool:
-    """Отметить, что отмена заказа отражена в МойСклад (реверс customerorder).
-    Идемпотентность ms_cancel: повторный реверс пропускается по этому полю.
-
-    asyncpg #21: native async через adb_core."""
-    return (
-        await adb_core.execute(
-            "UPDATE orders SET ms_cancel_synced_at = $1, updated_at = $2 WHERE id = $3",
-            now_str(), now_str(), order_id,
-        )
-        > 0
-    )
 
 
-async def set_order_ms_deleted(order_id: int) -> bool:
-    """Пометить, что документ заказа удалён в МойСклад (вебхук CO.DELETE /
-    cron-реконсиляция). Идемпотентно (ставим только если ещё не стоит). Заказ
-    исключается из аналитики менеджеров (фантомная выручка), но остаётся в учёте
-    долгов для ручной разборки.
-
-    asyncpg #21: native async через adb_core."""
-    return (
-        await adb_core.execute(
-            "UPDATE orders SET ms_deleted_at = $1, updated_at = $2 "
-            "WHERE id = $3 AND ms_deleted_at IS NULL",
-            now_str(), now_str(), order_id,
-        )
-        > 0
-    )
 
 
-async def set_order_ms_drift(order_id: int) -> bool:
-    """Пометить расхождение суммы заказа с документом в МойСклад (ручное
-    редактирование позиций/цен в МС). Идемпотентно (ставим только если ещё не
-    стоит) → одно уведомление на заказ. Деньги/статус НЕ меняем — это сигнал."""
-    return (
-        await adb_core.execute(
-            "UPDATE orders SET ms_drift_at = $1, updated_at = $2 "
-            "WHERE id = $3 AND ms_drift_at IS NULL",
-            now_str(), now_str(), order_id,
-        )
-        > 0
-    )
 
 
-async def set_order_ms_transition_blocked(order_id: int) -> bool:
-    """Пометить, что МойСклад сообщил нелегальный для локальной машины состояний
-    статус (напр. approved→rejected). Идемпотентно (только если флаг ещё не стоит)
-    → один алерт на заказ. Деньги/статус НЕ трогаем — это сигнал на ручную
-    разборку. Отдельный флаг от ms_drift_at: их дедупы не должны глушить друг друга."""
-    return (
-        await adb_core.execute(
-            "UPDATE orders SET ms_transition_blocked_at = $1, updated_at = $2 "
-            "WHERE id = $3 AND ms_transition_blocked_at IS NULL",
-            now_str(), now_str(), order_id,
-        )
-        > 0
-    )
 
 
-async def set_order_ms_demand_failed(order_id: int) -> bool:
-    """R4: пометить «CO создан, demand упал» — заказ ждёт ручной доделки отгрузки.
-    Идемпотентно (только если флаг ещё не стоит). Попадает в ночной дайджест."""
-    return (
-        await adb_core.execute(
-            "UPDATE orders SET ms_demand_failed_at = $1, updated_at = $2 "
-            "WHERE id = $3 AND ms_demand_failed_at IS NULL",
-            now_str(), now_str(), order_id,
-        )
-        > 0
-    )
 
 
-async def clear_order_ms_demand_failed(order_id: int) -> bool:
-    """Снять флаг demand-fail (отгрузка наконец создана — вручную или ретраем)."""
-    return (
-        await adb_core.execute(
-            "UPDATE orders SET ms_demand_failed_at = NULL, updated_at = $1 "
-            "WHERE id = $2 AND ms_demand_failed_at IS NOT NULL",
-            now_str(), order_id,
-        )
-        > 0
-    )
 
 
 async def get_order_total_cents(order_id: int) -> int:
@@ -3432,78 +4575,10 @@ async def set_order_credit_override(order_id: int, by: int) -> bool:
     )
 
 
-def get_payments_needing_ms_sync(limit: int = 100) -> list[dict]:
-    """Confirmed-платежи, привязанные к заказу, которые ещё НЕ улетели
-    в МойСклад (либо upload не сработал, либо ещё не пробовали).
-
-    Используется и cron-retry'ем, и /sync_payments командой.
-    Включает:
-      - 'failed' — предыдущая попытка упала (MS_TOKEN, 429, 5xx и т.п.)
-      - NULL    — confirmed до того как фича была деплоена, или
-                  fire-and-forget hook не успел отработать (event loop
-                  закрылся)
-    Исключает уже синхронизированные (ms_paymentin_id IS NOT NULL).
-    """
-    query = (
-        "SELECT * FROM payments "
-        "WHERE status = 'confirmed' "
-        "  AND order_id IS NOT NULL "
-        "  AND ms_paymentin_id IS NULL "
-        "ORDER BY confirmed_at ASC LIMIT ?"
-    )
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q(query), (limit,))
-        return [_with_major(r, ("amount", "amount_cents")) for r in cur.fetchall()]
 
 
-async def get_ms_sync_stats() -> dict:
-    """Сводка статуса синхронизации платежей с МойСклад.
-    Для /sync_payments команды — показывает админу что в каком состоянии.
-
-    asyncpg Stage 13 (#21): native async через adb_core (fetchrow). Обе
-    ветки алиасят колонки одинаково (synced/failed/never_tried) — доступ
-    по имени единый.
-    """
-    query = (
-        "SELECT "
-        "  COUNT(*) FILTER (WHERE ms_paymentin_id IS NOT NULL) AS synced, "
-        "  COUNT(*) FILTER (WHERE ms_sync_status = 'failed') AS failed, "
-        "  COUNT(*) FILTER (WHERE status = 'confirmed' AND order_id IS NOT NULL "
-        "                    AND ms_paymentin_id IS NULL "
-        "                    AND (ms_sync_status IS NULL OR ms_sync_status != 'failed')) "
-        "    AS never_tried "
-        "FROM payments"
-        if USE_POSTGRES
-        # SQLite не поддерживает FILTER — используем SUM(CASE...)
-        else "SELECT "
-        "  SUM(CASE WHEN ms_paymentin_id IS NOT NULL THEN 1 ELSE 0 END) AS synced, "
-        "  SUM(CASE WHEN ms_sync_status = 'failed' THEN 1 ELSE 0 END) AS failed, "
-        "  SUM(CASE WHEN status = 'confirmed' AND order_id IS NOT NULL "
-        "                AND ms_paymentin_id IS NULL "
-        "                AND (ms_sync_status IS NULL OR ms_sync_status != 'failed') "
-        "           THEN 1 ELSE 0 END) AS never_tried "
-        "FROM payments"
-    )
-    row = await adb_core.fetchrow(query)
-    if not row:
-        return {"synced": 0, "failed": 0, "never_tried": 0}
-    return {
-        "synced": int(row["synced"] or 0),
-        "failed": int(row["failed"] or 0),
-        "never_tried": int(row["never_tried"] or 0),
-    }
 
 
-async def get_recent_ms_sync_failures(limit: int = 5) -> list[dict]:
-    """Последние failed-синхронизации с текстом ошибки. asyncpg Stage 8 (#21)."""
-    rows = await adb_core.fetch(
-        "SELECT id, amount_cents, currency, order_id, ms_sync_error "
-        "FROM payments WHERE ms_sync_status = 'failed' "
-        "ORDER BY id DESC LIMIT $1",
-        limit,
-    )
-    return _with_major(rows, ("amount", "amount_cents"))
 
 
 def get_pool_stats() -> dict:
@@ -3668,287 +4743,85 @@ async def get_stale_crons(thresholds_hours: dict[str, float]) -> list[dict]:
     return stale
 
 
-def reset_stale_in_progress_payments(older_than_minutes: int = 30) -> int:
-    """Сбросить ms_sync_status='in_progress' у платежей, застрявших дольше N минут.
 
-    Защита от orphan'ов: claim_payment_for_ms_sync ставит 'in_progress'
-    ДО HTTP-POST в МойСклад. Если процесс убили mid-claim (Railway SIGTERM,
-    OOM, увеличенное окно из-за init_demand_context), строка навсегда
-    залипает — claim-UPDATE отвергает 'in_progress', retry никогда её не
-    возьмёт.
 
-    Вызывается из tasks/run_ms_sync_retry.main() в самом начале, до
-    основной логики. Возвращает количество сброшенных строк.
 
-    Порог — по ВРЕМЕНИ CLAIM'а (ms_sync_claimed_at), а НЕ confirmed_at (WP-10):
-    confirmed_at — время подтверждения платежа, не начала синка; платёж,
-    подтверждённый >30 мин назад и синкаемый сейчас, имеет старый confirmed_at,
-    и reaper сбрасывал его ПРЯМО во время in-flight POST → второй paymentin в МС.
-    COALESCE с confirmed_at — для легаси-строк без claimed_at.
 
-    Порог вычисляем в Python через тот же `now_str()` (local TZ через
-    `datetime.now()`), что и при записи времён — иначе бы SQLite/Postgres-side
-    функции `datetime('now',...)`/`NOW()` вернули UTC, и сравнение строк в
-    разных TZ всегда было бы False (тихий баг).
+
+
+def _reconcile_window() -> tuple[str, int]:
+    """(порог даты, LIMIT) для cron-реконсиляции МС — из env, с дефолтами."""
+    from datetime import timedelta
+
+    try:
+        days = int(os.environ.get("MS_RECONCILE_WINDOW_DAYS", "30"))
+    except ValueError:
+        days = 30
+    try:
+        limit = int(os.environ.get("MS_RECONCILE_LIMIT", "500"))
+    except ValueError:
+        limit = 500
+    cutoff = (datetime.now() - timedelta(days=max(1, days))).strftime("%Y-%m-%d %H:%M:%S")
+    return cutoff, max(1, limit)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+async def count_boss_attention() -> dict[str, int]:
+    """Счётчики для блока «Требует внимания» на главной — одними COUNT(*).
+
+    T2.13 (§3.8): /api/home делал четыре полных `SELECT *`
+    (get_pending_cash_deposits, get_pending_returns,
+    get_paid_orders_awaiting_confirmation, get_open_debts) ТОЛЬКО ради len().
+    Строки сериализовались из БД и выбрасывались; при rate-limit 120/мин на
+    эндпоинте это заметная нагрузка, растущая с размером базы.
     """
-    threshold = (datetime.now() - timedelta(minutes=older_than_minutes)).strftime(
-        "%Y-%m-%d %H:%M:%S"
+    deposits = await adb_core.fetchval(
+        "SELECT COUNT(*) FROM cash_deposits WHERE status = 'pending'"
     )
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "UPDATE payments "
-                "SET ms_sync_status = NULL "
-                "WHERE ms_sync_status = 'in_progress' "
-                "  AND ms_paymentin_id IS NULL "
-                "  AND COALESCE(ms_sync_claimed_at, confirmed_at) < ?"
-            ),
-            (threshold,),
-        )
-        reset = cur.rowcount or 0
-        conn.commit()
-    if reset > 0:
-        logger.warning(
-            "reset_stale_in_progress_payments: сброшено %d orphan-строк "
-            "(старше %d мин)",
-            reset,
-            older_than_minutes,
-        )
-    return reset
-
-
-def claim_payment_for_ms_sync(payment_id: int) -> bool:
-    """Атомарно «застолбить» платёж для синхронизации с МойСклад.
-
-    Защита от race condition между cron-retry и in-process confirm-hook:
-    оба могут одновременно решить «надо синкать» и оба вызовут POST в
-    МойСклад → дубль paymentin.
-
-    Логика: атомарный UPDATE-WHERE-status-not-in-progress. Только тот,
-    кто выиграл гонку (rowcount == 1), идёт в МойСклад. Остальные
-    видят False и тихо пропускают.
-
-    Returns True если этот вызов застолбил; False если уже застолбили,
-    уже syncнули или платежа нет.
-    """
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        # Не используем NOT IN потому что SQLite не любит NULL-сравнения
-        # таким способом. Явные проверки IS NULL OR != 'in_progress'.
-        cur.execute(
-            q(
-                "UPDATE payments "
-                "SET ms_sync_status = 'in_progress', ms_sync_claimed_at = ? "
-                "WHERE id = ? "
-                "  AND ms_paymentin_id IS NULL "
-                "  AND (ms_sync_status IS NULL OR ms_sync_status != 'in_progress')"
-            ),
-            (now_str(), payment_id),
-        )
-        claimed = cur.rowcount > 0
-        conn.commit()
-    return claimed
-
-
-def set_payment_ms_sync(
-    payment_id: int,
-    *,
-    paymentin_id: str | None = None,
-    status: str | None = None,
-    error: str | None = None,
-) -> bool:
-    """Обновить состояние синхронизации платежа с МойСклад.
-    status: 'synced' | 'failed' | None (не менять)."""
-    fields = []
-    params: list = []
-    if paymentin_id is not None:
-        fields.append("ms_paymentin_id = ?")
-        params.append(paymentin_id)
-    if status is not None:
-        fields.append("ms_sync_status = ?")
-        params.append(status)
-    if error is not None:
-        fields.append("ms_sync_error = ?")
-        params.append(error[:500])  # обрезаем чтоб не раздуть row
-    if not fields:
-        return False
-    params.append(payment_id)
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(f"UPDATE payments SET {', '.join(fields)} WHERE id = ?"),
-            params,
-        )
-        updated = cur.rowcount > 0
-        conn.commit()
-    return updated
-
-
-async def get_payments_with_ms_paymentin() -> list[dict]:
-    """Подтверждённые платежи со ссылкой на paymentin в МС — для cron-
-    реконсиляции удалённых входящих платежей (WP-17, страховка от пропущенных
-    paymentin.DELETE-вебхуков: иначе платёж навсегда «synced» на мёртвый
-    документ, retry его пропускает, деньги молча исчезают из МС)."""
-    return await adb_core.fetch(
-        "SELECT id, ms_paymentin_id FROM payments "
-        "WHERE ms_paymentin_id IS NOT NULL AND status = 'confirmed'"
+    returns_ = await adb_core.fetchval(
+        "SELECT COUNT(*) FROM returns WHERE status = 'pending'"
     )
-
-
-def find_payment_by_ms_paymentin_id(paymentin_id: str) -> dict | None:
-    """Найти локальный платёж по ID paymentin в МойСклад.
-    Используется когда МойСклад присылает webhook о удалении/изменении paymentin."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("SELECT * FROM payments WHERE ms_paymentin_id = ? LIMIT 1"),
-            (paymentin_id,),
-        )
-        row = cur.fetchone()
-    return _with_major(row, ("amount", "amount_cents")) if row else None
-
-
-def reset_payment_ms_sync(payment_id: int) -> bool:
-    """Сбросить привязку к paymentin (он удалён в МойСклад).
-
-    ms_paymentin_id → NULL, ms_sync_status → 'deleted_in_ms'.
-    Существующий cron run_ms_sync_retry подберёт платёж при следующем
-    запуске (условие: ms_paymentin_id IS NULL AND status='confirmed')
-    и создаст новый paymentin автоматически.
-    """
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q(
-                "UPDATE payments "
-                "SET ms_paymentin_id = NULL, ms_sync_status = 'deleted_in_ms' "
-                "WHERE id = ?"
-            ),
-            (payment_id,),
-        )
-        updated = cur.rowcount > 0
-        conn.commit()
-    return updated
-
-
-def find_order_by_ms_customerorder_id(co_id: str) -> dict | None:
-    """Найти локальный заказ по ID customerorder в МойСклад.
-    Используется для обработки webhook-событий customerorder."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("SELECT * FROM orders WHERE ms_customerorder_id = ? LIMIT 1"),
-            (co_id,),
-        )
-        row = cur.fetchone()
-    return dict(row) if row else None
-
-
-def find_order_by_ms_demand_id(demand_id: str) -> dict | None:
-    """Найти локальный заказ по ID demand (отгрузки) в МойСклад.
-    Используется для обработки webhook-события demand.DELETE — бот-созданная
-    отгрузка удалена в МС → помечаем заказ фантомом (ms_deleted_at)."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("SELECT * FROM orders WHERE ms_demand_id = ? LIMIT 1"),
-            (demand_id,),
-        )
-        row = cur.fetchone()
-    return dict(row) if row else None
-
-
-async def get_orders_with_ms_customerorder() -> list[dict]:
-    """Заказы со ссылкой на customerorder в МС — для cron-реконсиляции удалённых
-    документов (tasks/run_ms_reconcile, страховка от пропущенных DELETE-вебхуков).
-
-    Раньше брали только approved → пропущенный вебхук для shipped/paid оставлял
-    «фантом» (CO удалён в МС, но локально висит, ms_deleted_at=NULL, и попадает в
-    выручку аналитики). Теперь — все активные статусы. Обработанный заказ уходит
-    из набора (apply_ms_customerorder_delete ставит ms_deleted_at + снимает ссылку).
-    Терминально-неактивные cancelled/rejected исключаем: revenue=0, перепроверять
-    их в МС незачем. Native async через adb_core."""
-    return await adb_core.fetch(
-        "SELECT * FROM orders WHERE ms_customerorder_id IS NOT NULL "
-        "AND (ms_deleted_at IS NULL) "
-        "AND status NOT IN ('cancelled', 'rejected')"
+    # Зеркалит get_paid_orders_awaiting_confirmation: ТОЛЬКО payment_type='paid'
+    # в approved/shipped (credit-долги считаются отдельно, в debts) и без
+    # фантомов. Расхождение фильтров здесь давало бы боссу счётчик, не
+    # совпадающий с содержимым таба «Платежи».
+    payments = await adb_core.fetchval(
+        "SELECT COUNT(*) FROM orders o "
+        "WHERE o.payment_type = 'paid' "
+        "AND o.status IN ('approved', 'shipped') "
+        "AND (o.ms_deleted_at IS NULL) "
+        "AND EXISTS (SELECT 1 FROM payments p "
+        "            WHERE p.order_id = o.id AND p.status = 'pending')"
     )
-
-
-async def get_orders_with_ms_demand() -> list[dict]:
-    """Заказы со ссылкой на demand (отгрузку) в МС — для cron-реконсиляции
-    удалённых отгрузок (страховка от пропущенных demand.DELETE-вебхуков).
-
-    Если пользователь удаляет в МС именно отгрузку (а не заказ покупателя),
-    customerorder остаётся жив → reconcile по CO такой заказ не ловит. Этот
-    набор закрывает дыру: проверяем существование demand-документа. Уже
-    помеченные ms_deleted_at и терминальные cancelled/rejected исключаем.
-    Native async через adb_core."""
-    return await adb_core.fetch(
-        "SELECT * FROM orders WHERE ms_demand_id IS NOT NULL "
-        "AND (ms_deleted_at IS NULL) "
-        "AND status NOT IN ('cancelled', 'rejected')"
-    )
-
-
-async def get_ms_sync_anomalies(since_iso: str) -> dict[str, list[dict]]:
-    """Заказы, требующие ручной разборки из-за рассинхрона с МойСклад (для
-    ночного дайджеста ops_monitor). Два набора, помеченные с `since_iso`:
-      • drift   — сумма в МС ≠ локальной (ms_drift_at): отредактированы в МС;
-      • deleted — документ удалён в МС, но статус shipped/paid (ms_deleted_at):
-                  «фантом», деньги/остатки двигались;
-      • transition_blocked — МС сообщил нелегальный статус (ms_transition_blocked_at):
-                  отгрузка/остаток в МС двинулись, локально не применить.
-    Окно since_iso ограничивает свежими — старое уже разобрали. soft-deleted
-    исключаем. Native async через adb_core."""
-    drift = await adb_core.fetch(
-        "SELECT id, agent_name, full_name, status, ms_drift_at FROM orders "
-        "WHERE ms_drift_at IS NOT NULL AND ms_drift_at >= $1 "
-        "ORDER BY ms_drift_at DESC",
-        since_iso,
-    )
-    transition_blocked = await adb_core.fetch(
-        "SELECT id, agent_name, full_name, status, ms_transition_blocked_at FROM orders "
-        "WHERE ms_transition_blocked_at IS NOT NULL AND ms_transition_blocked_at >= $1 "
-        "ORDER BY ms_transition_blocked_at DESC",
-        since_iso,
-    )
-    deleted = await adb_core.fetch(
-        "SELECT id, agent_name, full_name, status, ms_deleted_at FROM orders "
-        "WHERE ms_deleted_at IS NOT NULL AND ms_deleted_at >= $1 "
-        "AND status IN ('shipped', 'paid', 'partially_returned', 'returned') "
-        "ORDER BY ms_deleted_at DESC",
-        since_iso,
-    )
-    # R4: customerorder создан, demand упал — отгрузка не проведена, остатки не
-    # списаны. Ждёт ручной доделки demand в МС.
-    demand_failed = await adb_core.fetch(
-        "SELECT id, agent_name, full_name, status, ms_demand_failed_at FROM orders "
-        "WHERE ms_demand_failed_at IS NOT NULL AND ms_demand_failed_at >= $1 "
-        "ORDER BY ms_demand_failed_at DESC",
-        since_iso,
+    debts = await adb_core.fetchval(
+        "SELECT COUNT(*) FROM orders "
+        "WHERE payment_type = 'credit' AND paid_confirmed_at IS NULL "
+        "AND status IN ('approved', 'shipped', 'partially_returned') "
+        "AND (ms_deleted_at IS NULL)"
     )
     return {
-        "drift": list(drift),
-        "deleted": list(deleted),
-        "demand_failed": list(demand_failed),
-        "transition_blocked": list(transition_blocked),
+        "deposits": int(deposits or 0),
+        "returns": int(returns_ or 0),
+        "payments": int(payments or 0),
+        "debts": int(debts or 0),
     }
 
 
-def clear_order_ms_customerorder_id(order_id: int) -> bool:
-    """Снять ссылку на customerorder (документ удалён в МойСклад).
-    После сброса повторный approve заявки создаст новый customerorder."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(
-            q("UPDATE orders SET ms_customerorder_id = NULL, updated_at = ? WHERE id = ?"),
-            (now_str(), order_id),
-        )
-        updated = cur.rowcount > 0
-        conn.commit()
-    return updated
+
+
 
 
 async def delete_order(order_id: int, requested_by: int) -> bool:
@@ -3977,7 +4850,10 @@ async def delete_order(order_id: int, requested_by: int) -> bool:
         if await txn.fetchval("SELECT 1 FROM payments WHERE order_id = $1 LIMIT 1", order_id):
             return False
 
-        # Каскад вручную, чтобы работало и в SQLite (FK off by default)
+        # Каскад вручную, чтобы работало и в SQLite (FK off by default).
+        # Связь с номенклатурой ссылается на позицию — её первой, иначе на
+        # Postgres DELETE по order_items отвергнется живым FK.
+        await txn.execute("DELETE FROM order_item_products WHERE order_id = $1", order_id)
         await txn.execute("DELETE FROM order_items WHERE order_id = $1", order_id)
         deleted = await txn.execute("DELETE FROM orders WHERE id = $1", order_id) > 0
     if deleted:
@@ -4011,6 +4887,8 @@ async def confirm_payment(
     )
     if rc <= 0:
         return False
+    # Заморозить курс платежа на момент подтверждения (best-effort, sync core).
+    await asyncio.to_thread(_snapshot_payment_fx, payment_id)
     payment = await get_payment(payment_id)
     if confirmed_by and payment:
         await asyncio.to_thread(
@@ -4033,7 +4911,6 @@ async def confirm_payment(
         # MS-API не должна откатывать подтверждение. Статус синхрона
         # пишется в payments.ms_sync_status; failed можно ретраить
         # вручную или фоновой задачей.
-        _trigger_ms_paymentin_sync(payment_id)
     return True
 
 
@@ -4131,7 +5008,6 @@ async def link_payment_to_order(
         updated_order = await get_order(order_id)
         if updated_order and updated_order.get("paid_confirmed_at"):
             result["order_closed"] = True
-        _trigger_ms_paymentin_sync(payment_id)
         result["ms_sync_triggered"] = True
 
     return result
@@ -4161,71 +5037,6 @@ async def get_unlinked_payments(limit: int = 100) -> list[dict]:
     return _with_major(rows, ("amount", "amount_cents"))
 
 
-def _trigger_ms_paymentin_sync(payment_id: int) -> None:
-    """Запустить async create_paymentin_for_payment в фоне.
-
-    Три контекста вызова:
-      1. Внутри активного event loop (редко: код уже в loop'е) —
-         loop.create_task, fire-and-forget.
-      2. В to_thread-воркере (типичный путь: confirm_payment вызывается
-         через services.async_db → asyncio.to_thread из bot/webapp).
-         В воркере НЕТ running loop, а MS-сессия привязана к ГЛАВНОМУ
-         loop'у. Раньше тут делался asyncio.run(), который поднимал НОВЫЙ
-         loop и дёргал сессию чужого loop'а → RuntimeError "Timeout
-         context manager should be used inside a task" — синк молча падал
-         на каждом подтверждении, и спасал только cron-retry. Теперь
-         планируем корутину на loop сессии через run_coroutine_threadsafe.
-      3. Истинно sync-контекст (cron-скрипт, главного loop'а нет) —
-         asyncio.run поднимает свой loop и создаёт в нём свежую сессию.
-
-    БД-confirm уже закоммичен к моменту вызова; ошибки синка некритичны
-    (cron-retry добирает), поэтому всё best-effort.
-    """
-    try:
-        from services.ms_payments import create_paymentin_for_payment
-    except Exception:
-        return  # окружение без MS_TOKEN
-
-    # (1) Уже внутри running loop'а — просто планируем задачу.
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    if loop is not None:
-        task = loop.create_task(create_paymentin_for_payment(payment_id))
-
-        def _log_exc(t: asyncio.Task) -> None:
-            if not t.cancelled() and (exc := t.exception()):
-                logger.exception("ms_paymentin_sync payment #%d failed: %s", payment_id, exc)
-
-        task.add_done_callback(_log_exc)
-        return
-
-    # (2) Воркер-тред: если главный loop с MS-сессией ещё жив — планируем
-    # корутину НА НЕГО (там валидна сессия), не поднимая чужой loop.
-    try:
-        from services.moysklad import get_session_loop
-
-        main_loop = get_session_loop()
-    except Exception:
-        main_loop = None
-    if main_loop is not None and main_loop.is_running():
-        try:
-            asyncio.run_coroutine_threadsafe(
-                create_paymentin_for_payment(payment_id), main_loop
-            )
-        except Exception:
-            logger.exception("ms_paymentin_sync payment #%d: schedule failed", payment_id)
-        return
-
-    # (3) Нет главного loop'а (cron) — свой короткий loop + свежая сессия.
-    try:
-        asyncio.run(create_paymentin_for_payment(payment_id))
-    except Exception:
-        # Статус failed уже записан внутри ms_payments — молча
-        pass
-
-
 async def _maybe_close_order_after_payment(
     order_id: int,
     confirmed_by: int | None,
@@ -4249,7 +5060,7 @@ async def _maybe_close_order_after_payment(
     пути (commit ≡ rollback, lock освобождён). add_audit_log/get_role (sync) —
     мостим через to_thread после транзакции.
     """
-    from config import BASE_CURRENCY
+    from services.debts import calc_order_balance
 
     closed = False
     confirmed_cents = 0
@@ -4268,61 +5079,23 @@ async def _maybe_close_order_after_payment(
         if row["paid_confirmed_at"] is not None:
             return  # already closed
 
-        # Валюта заказа: платежи к заказу должны быть в ней же. Суммируем ТОЛЬКО
-        # платежи в валюте заказа (NULL-валюту платежа трактуем как валюту заказа,
-        # легаси-safe). Иначе платёж в «дорогой» валюте (напр. UZS) в копейках
-        # ложно перекрывал заказ в USD и закрывал его как оплаченный (WP-04).
-        order_cur = (row["currency"] or BASE_CURRENCY or "USD").upper()
+        # Пересчёт ВНУТРИ транзакции (conn=txn) — видим актуальные суммы под тем
+        # же FOR UPDATE, под которым потом закрываем заказ.
+        #
+        # T2.1: формула — из services.debts, а не своя копия. Она учитывает
+        # платежи ТОЛЬКО в валюте заказа (иначе платёж в «дешёвой» валюте вроде
+        # UZS в копейках ложно перекрывал USD-заказ, WP-04) и подтверждённые
+        # сдачи наличных (иначе заказ, оплаченный наполовину сдачей, не
+        # закрывался, WP-05).
+        bal = await calc_order_balance(order_id, conn=txn)
+        confirmed_cents = bal.confirmed_cents
 
-        # Пересчёт ВНУТРИ транзакции — видим актуальную сумму confirmed.
-        # Считаем в копейках (точное сравнение) — без epsilon-костыля.
-        confirmed_cents = int(
-            await txn.fetchval(
-                f"SELECT {_SUM_PAYMENTS_CENTS} FROM payments "
-                "WHERE order_id = $1 AND status = 'confirmed' "
-                "AND COALESCE(UPPER(currency), $2) = $2",
-                order_id,
-                order_cur,
-            )
-            or 0
-        )
-        total_cents = int(
-            await txn.fetchval(
-                f"SELECT {_SUM_ORDER_TOTAL_CENTS} FROM order_items WHERE order_id = $1",
-                order_id,
-            )
-            or 0
-        )
-        # Возвраты уменьшают сумму «к оплате»: заказ закрыт, когда платежи
-        # покрывают total − confirmed-возвраты. net<=0 (напр. полный возврат) —
-        # это не «оплата», закрытием здесь не занимаемся (статус ведёт confirm_return).
-        returns_cents = int(
-            await txn.fetchval(
-                f"SELECT {_SUM_RETURNS_CENTS} FROM returns "
-                f"WHERE order_id = $1 AND {_RETURN_OWED_FILTER}",
-                order_id,
-            )
-            or 0
-        )
-        # Подтверждённые сдачи наличных, распределённые на заказ, тоже покрывают
-        # долг — иначе заказ, оплаченный наполовину сдачей + наполовину платежом,
-        # не закрывался (WP-05). Сдачи в базовой валюте, заказ при наличии сдач
-        # тоже базовый (см. _is_base_currency).
-        deposit_cents = int(
-            await txn.fetchval(
-                f"SELECT {_SUM_ALLOC_CENTS} FROM cash_deposit_orders cdo "
-                "JOIN cash_deposits d ON d.id = cdo.deposit_id "
-                "WHERE cdo.order_id = $1 AND d.status = 'confirmed'",
-                order_id,
-            )
-            or 0
-        )
-        covered_cents = confirmed_cents + deposit_cents
-
-        net_cents = total_cents - returns_cents
+        # net <= 0 (напр. полный возврат) — это не «оплата», закрытием здесь не
+        # занимаемся: статус ведёт confirm_return.
+        net_cents = bal.total_cents - bal.returns_cents
         if net_cents <= 0:
             return
-        if covered_cents < net_cents:
+        if bal.remaining_cents > 0:
             return  # ещё не полностью оплачен (платежи + сдачи, с учётом возвратов)
 
         # Закрываем
@@ -4669,6 +5442,31 @@ async def get_audit_log(limit: int = 50, user_id: int | None = None) -> list[dic
 # ─── Заказы ───────────────────────────────────────────────────────────────────
 
 
+async def get_or_create_draft(user_id: int, full_name: str, comment: str = "") -> tuple[int, bool]:
+    """Черновик для «создать заказ»: переиспользуем пустой, иначе создаём.
+
+    T3.2: кнопка «Новый заказ» создавала черновик на КАЖДОЕ нажатие. Тапнул
+    трижды — три пустых заказа в /myorders, и непонятно, в каком из них ты
+    сейчас работаешь. Пустой = без позиций, без клиента и без комментария:
+    в такой заказ пользователь ещё ничего не вложил, поэтому вернуть его
+    безопасно.
+
+    Возвращает (order_id, created) — created=False, если переиспользовали.
+    """
+    row = await adb_core.fetchrow(
+        "SELECT o.id FROM orders o "
+        "WHERE o.user_id = $1 AND o.status = 'draft' "
+        "  AND (o.agent_id IS NULL OR o.agent_id = '') "
+        "  AND (o.comment IS NULL OR o.comment = '') "
+        "  AND NOT EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = o.id) "
+        "ORDER BY o.id DESC LIMIT 1",
+        user_id,
+    )
+    if row and not comment:
+        return int(row["id"]), False
+    return await asyncio.to_thread(create_order, user_id, full_name, comment), True
+
+
 def create_order(user_id: int, full_name: str, comment: str = "") -> int:
     with get_conn() as conn:
         cur = get_cursor(conn)
@@ -4716,8 +5514,15 @@ async def get_orders_by_ids(order_ids: list[int]) -> dict[int, dict]:
     return {r["id"]: r for r in rows}
 
 
-async def get_user_orders(user_id: int, status: str | None = None) -> list[dict]:
-    """Заказы менеджера (опц. фильтр по статусу).
+async def get_user_orders(
+    user_id: int, status: str | None = None, limit: int = 200
+) -> list[dict]:
+    """Заказы менеджера (опц. фильтр по статусу), свежие первыми.
+
+    T2.13 (§3.8): добавлен LIMIT. Выборка была без границ, а /api/home зовёт её
+    на каждое открытие главной (rate-limit 120/мин) — у менеджера с историей
+    в тысячи заказов это полный скан и сериализация всего архива ради
+    счётчиков и пяти последних.
 
     asyncpg Stage 12 (#21): native async через adb_core."""
     params: list = [user_id]
@@ -4728,7 +5533,8 @@ async def get_user_orders(user_id: int, status: str | None = None) -> list[dict]
     if status:
         params.append(status)
         query += f" AND status = ${len(params)}"
-    query += " ORDER BY created_at DESC"
+    params.append(max(1, int(limit)))
+    query += f" ORDER BY created_at DESC LIMIT ${len(params)}"
     return await adb_core.fetch(query, *params)
 
 
@@ -5163,16 +5969,136 @@ def update_order_currency(order_id: int, currency: str) -> bool:
         conn.commit()
     return updated
 
+def legal_sources_for(target_status: str) -> tuple[str, ...]:
+    """Из каких статусов переход в `target_status` легален — по TRANSITIONS.
+
+    Второй список легальных переходов не заводим: машина состояний одна, она
+    в services.order_workflow. Импорт ленивый — order_workflow тянет database
+    внутри функций, module-level импорт в обе стороны дал бы цикл."""
+    from services.order_workflow import TRANSITIONS
+
+    return tuple(src for src, targets in TRANSITIONS.items() if target_status in targets)
+
+
+def _status_cas_sql(expected_status: str | tuple[str, ...] | None) -> tuple[str, list]:
+    """WHERE-хвост и параметры для compare-and-set статуса заказа."""
+    if expected_status is None:
+        return "", []
+    expected = (expected_status,) if isinstance(expected_status, str) else tuple(expected_status)
+    if not expected:
+        # Пустой набор = переход нелегален ни из какого статуса. Ставим заведомо
+        # ложное условие, а не «без guard'а» — иначе опечатка в target_status
+        # молча превратилась бы в безусловный UPDATE.
+        return " AND 1 = 0", []
+    ph = ", ".join("?" for _ in expected)
+    return f" AND status IN ({ph})", list(expected)
+
+
+def update_order_status(
+    order_id: int,
+    status: str,
+    expected_status: str | tuple[str, ...] | None = None,
+) -> bool:
+    """Перевести заказ в статус. Возвращает True, если строка реально изменилась.
+
+    `expected_status` — compare-and-set: UPDATE применяется, только если текущий
+    статус входит в набор. Без него UPDATE безусловный (легаси-вызовы; они
+    закрываются в T2.3/T2.7).
+
+    Зачем CAS: МойСклад мог прислать `Unsuccessful` и перевести заказ
+    pending→rejected, а заявка при этом осталась `pending`. Босс открывал старое
+    сообщение в чате, жал «Одобрить» — и заказ ВОСКРЕСАЛ из rejected в approved
+    с новыми документами в МС (§2.2)."""
+    tail, extra = _status_cas_sql(expected_status)
+def _snapshot_order_fx(order_id: int) -> None:
+    """Заморозить курс валюты заказа к BASE_CURRENCY (orders.fx_rate_to_base).
+
+    Идемпотентно: ставит ТОЛЬКО если снимка ещё нет и валюта известна. Берёт
+    текущий курс (get_currency_rate, кэш TTL) — для базовой валюты это 1.0
+    (засеяно). Вызывается при первом «реализующем» переходе заказа (approved/
+    shipped), чтобы итог в USD по этому заказу не «плыл» при движении курса.
+    """
+    try:
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q("SELECT currency, fx_rate_to_base FROM orders WHERE id = ?"),
+                (order_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return
+        currency = row["currency"] if hasattr(row, "keys") else row[0]
+        existing = row["fx_rate_to_base"] if hasattr(row, "keys") else row[1]
+        if existing is not None or not currency:
+            return
+        rate = get_currency_rate(currency)
+        if rate is None:
+            return
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q(
+                    "UPDATE orders SET fx_rate_to_base = ? "
+                    "WHERE id = ? AND fx_rate_to_base IS NULL"
+                ),
+                (float(rate), order_id),
+            )
+            conn.commit()
+    except Exception:
+        # Снимок курса — best-effort: его отсутствие не должно ронять смену
+        # статуса (пересчёт упадёт обратно на текущий курс).
+        logger.exception("_snapshot_order_fx(%s) failed", order_id)
+
+
+def _snapshot_payment_fx(payment_id: int) -> None:
+    """Заморозить курс валюты платежа к BASE_CURRENCY (payments.fx_rate_to_base).
+
+    Идемпотентно: ставит ТОЛЬКО если снимка ещё нет. Вызывается при
+    подтверждении платежа — момент, когда деньги реально зачтены.
+    """
+    try:
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q("SELECT currency, fx_rate_to_base FROM payments WHERE id = ?"),
+                (payment_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return
+        currency = row["currency"] if hasattr(row, "keys") else row[0]
+        existing = row["fx_rate_to_base"] if hasattr(row, "keys") else row[1]
+        if existing is not None or not currency:
+            return
+        rate = get_currency_rate(currency)
+        if rate is None:
+            return
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q(
+                    "UPDATE payments SET fx_rate_to_base = ? "
+                    "WHERE id = ? AND fx_rate_to_base IS NULL"
+                ),
+                (float(rate), payment_id),
+            )
+            conn.commit()
+    except Exception:
+        logger.exception("_snapshot_payment_fx(%s) failed", payment_id)
+
 
 def update_order_status(order_id: int, status: str) -> bool:
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
-            q("UPDATE orders SET status = ?, updated_at = ? WHERE id = ?"),
-            (status, now_str(), order_id),
+            q(f"UPDATE orders SET status = ?, updated_at = ? WHERE id = ?{tail}"),
+            (status, now_str(), order_id, *extra),
         )
         updated = cur.rowcount > 0
         conn.commit()
+    if updated and status in ("approved", "shipped"):
+        _snapshot_order_fx(order_id)
     return updated
 
 
@@ -5197,7 +6123,14 @@ def add_order_item(
     unit: str,
     price: float = 0.0,
     note: str = "",
+    product_id: int | None = None,
 ) -> int:
+    """Добавить позицию заказа.
+
+    `product_id` — карточка нашей номенклатуры; по ней позиция спишется со
+    склада при отгрузке. Связь пишется в `order_item_products` (отдельная
+    таблица, см. схему), `product_href` остаётся у legacy-строк.
+    """
     price_cents = money.to_cents(price or 0)
     with get_conn() as conn:
         cur = get_cursor(conn)
@@ -5221,13 +6154,27 @@ def add_order_item(
                 (order_id, product_name, product_href, quantity, unit, price_cents, note),
             )
             item_id = cur.lastrowid
+        if product_id:
+            cur.execute(
+                q(
+                    "INSERT INTO order_item_products (item_id, order_id, product_id, "
+                    "created_at) VALUES (?, ?, ?, ?)"
+                ),
+                (int(item_id), order_id, int(product_id), now_str()),
+            )
         conn.commit()
     return item_id
 
 
+_ORDER_ITEMS_SELECT = (
+    "SELECT oi.*, op.product_id AS product_id FROM order_items oi "
+    "LEFT JOIN order_item_products op ON op.item_id = oi.id"
+)
+
+
 async def get_order_items(order_id: int) -> list[dict]:
     """asyncpg Stage 19 (#21): native async (fetch)."""
-    rows = await adb_core.fetch("SELECT * FROM order_items WHERE order_id = $1", order_id)
+    rows = await adb_core.fetch(f"{_ORDER_ITEMS_SELECT} WHERE oi.order_id = $1", order_id)
     return _with_major(rows, ("price", "price_cents"))
 
 
@@ -5242,7 +6189,7 @@ async def get_order_items_by_ids(order_ids: list[int]) -> dict[int, list[dict]]:
     unique_ids = list(set(order_ids))
     placeholders = ", ".join(f"${i + 1}" for i in range(len(unique_ids)))
     rows = await adb_core.fetch(
-        f"SELECT * FROM order_items WHERE order_id IN ({placeholders})",
+        f"{_ORDER_ITEMS_SELECT} WHERE oi.order_id IN ({placeholders})",
         *unique_ids,
     )
     grouped: dict[int, list[dict]] = {}
@@ -5256,13 +6203,14 @@ async def get_order_items_by_ids(order_ids: list[int]) -> dict[int, list[dict]]:
 async def get_order_item(item_id: int) -> dict | None:
     """asyncpg Stage 11 (#21): native async. Leaf — внутри database.py
     не вызывается (есть get_order_items / get_order_items_by_ids)."""
-    row = await adb_core.fetchrow("SELECT * FROM order_items WHERE id = $1", item_id)
+    row = await adb_core.fetchrow(f"{_ORDER_ITEMS_SELECT} WHERE oi.id = $1", item_id)
     return _with_major(row, ("price", "price_cents"))
 
 
 def remove_order_item(item_id: int) -> bool:
     with get_conn() as conn:
         cur = get_cursor(conn)
+        cur.execute(q("DELETE FROM order_item_products WHERE item_id = ?"), (item_id,))
         cur.execute(q("DELETE FROM order_items WHERE id = ?"), (item_id,))
         deleted = cur.rowcount > 0
         conn.commit()
@@ -5317,54 +6265,113 @@ async def get_pending_requests() -> list[dict]:
     )
 
 
-def approve_shipment_request(req_id: int, approved_by: int, approved_name: str) -> bool:
+class ShipmentDecision(NamedTuple):
+    """Итог решения по заявке. `applied` — заявка И заказ реально переведены.
+
+    `reason` при отказе:
+      • 'request_taken' — заявку уже обработал кто-то другой;
+      • 'order_moved'   — заявка была pending, но заказ успел уйти в другой
+                          статус (напр. МС прислал Unsuccessful → rejected).
+    `order_status` — фактический статус заказа на момент отказа, для сообщения.
+    """
+
+    applied: bool
+    reason: str | None = None
+    order_status: str | None = None
+    order_id: int | None = None
+
+
+def _decide_shipment_request(
+    req_id: int,
+    by: int,
+    by_name: str,
+    *,
+    req_status: str,
+    order_status: str,
+    audit_action: str,
+    audit_text: str,
+) -> ShipmentDecision:
+    """Атомарно перевести заявку И заказ. Либо оба, либо ни одного.
+
+    Раньше это были две отдельные транзакции, и апдейт заказа шёл БЕЗ guard'а:
+    заявка становилась approved, а заказ продавливался в approved из любого
+    статуса — отклонённый заказ воскресал и получал новые документы в МС (§2.2).
+    Теперь заказ переводится compare-and-set в той же транзакции: не прошёл CAS
+    — откатывается и заявка.
+    """
+    allowed = legal_sources_for(order_status)
+    tail, extra = _status_cas_sql(allowed)
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
             q("""UPDATE shipment_requests
-               SET status = 'approved', approved_by = ?, approved_by_name = ?, approved_at = ?
+               SET status = ?, approved_by = ?, approved_by_name = ?, approved_at = ?
                WHERE id = ? AND status = 'pending'"""),
-            (approved_by, approved_name, now_str(), req_id),
+            (req_status, by, by_name, now_str(), req_id),
         )
-        updated = cur.rowcount > 0
-        conn.commit()
-    if updated:
-        req = get_shipment_request(req_id)
-        if req is not None:
-            update_order_status(req["order_id"], "approved")
-            add_audit_log(
-                approved_by,
-                approved_name,
-                get_role(approved_by),
-                "shipment_approved",
-                f"Заявка #{req_id} одобрена (заказ #{req['order_id']} от {req['full_name']})",
-            )
-    return updated
+        if (cur.rowcount or 0) == 0:
+            conn.rollback()
+            return ShipmentDecision(False, "request_taken")
 
+        cur.execute(q("SELECT order_id FROM shipment_requests WHERE id = ?"), (req_id,))
+        row = cur.fetchone()
+        order_id = (row["order_id"] if USE_POSTGRES else row[0]) if row else None
+        if order_id is None:
+            conn.rollback()
+            return ShipmentDecision(False, "request_taken")
 
-def reject_shipment_request(req_id: int, rejected_by: int, rejected_name: str) -> bool:
-    with get_conn() as conn:
-        cur = get_cursor(conn)
         cur.execute(
-            q("""UPDATE shipment_requests
-               SET status = 'rejected', approved_by = ?, approved_by_name = ?, approved_at = ?
-               WHERE id = ? AND status = 'pending'"""),
-            (rejected_by, rejected_name, now_str(), req_id),
+            q(f"UPDATE orders SET status = ?, updated_at = ? WHERE id = ?{tail}"),
+            (order_status, now_str(), order_id, *extra),
         )
-        updated = cur.rowcount > 0
+        if (cur.rowcount or 0) == 0:
+            # Заказ ушёл из допустимого статуса — откатываем И заявку, иначе
+            # останется одобренная заявка при отклонённом заказе.
+            cur.execute(q("SELECT status FROM orders WHERE id = ?"), (order_id,))
+            r = cur.fetchone()
+            actual = (r["status"] if USE_POSTGRES else r[0]) if r else None
+            conn.rollback()
+            return ShipmentDecision(False, "order_moved", actual, order_id)
         conn.commit()
-    if updated:
-        req = get_shipment_request(req_id)
-        if req is not None:
-            update_order_status(req["order_id"], "rejected")
-            add_audit_log(
-                rejected_by,
-                rejected_name,
-                get_role(rejected_by),
-                "shipment_rejected",
-                f"Заявка #{req_id} отклонена (заказ #{req['order_id']} от {req['full_name']})",
-            )
-    return updated
+
+    req = get_shipment_request(req_id)
+    if req is not None:
+        add_audit_log(by, by_name, get_role(by), audit_action, audit_text.format(req=req))
+    return ShipmentDecision(True, None, order_status, order_id)
+
+
+def approve_shipment_request(
+    req_id: int, approved_by: int, approved_name: str
+) -> ShipmentDecision:
+    return _decide_shipment_request(
+        req_id,
+        approved_by,
+        approved_name,
+        req_status="approved",
+        order_status="approved",
+        audit_action="shipment_approved",
+        audit_text=(
+            f"Заявка #{req_id} одобрена "
+            "(заказ #{req[order_id]} от {req[full_name]})"
+        ),
+    )
+
+
+def reject_shipment_request(
+    req_id: int, rejected_by: int, rejected_name: str
+) -> ShipmentDecision:
+    return _decide_shipment_request(
+        req_id,
+        rejected_by,
+        rejected_name,
+        req_status="rejected",
+        order_status="rejected",
+        audit_action="shipment_rejected",
+        audit_text=(
+            f"Заявка #{req_id} отклонена "
+            "(заказ #{req[order_id]} от {req[full_name]})"
+        ),
+    )
 
 
 def mark_shipment_request_returned(req_id: int, returned_by: int, returned_name: str) -> bool:

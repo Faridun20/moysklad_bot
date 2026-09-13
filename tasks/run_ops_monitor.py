@@ -29,7 +29,6 @@ from services.database import (
     get_all_users,
     init_db,
 )
-from services.moysklad import close_session
 from services.notifier import close_tg_session, tg_send_message
 from services.ops_summary import gather_ops_summary
 from utils.helpers import esc as _esc
@@ -42,6 +41,13 @@ DIV = "─" * 16
 
 def _fmt_amount(n: float) -> str:
     return f"{int(round(n)):,}".replace(",", " ")
+
+
+def _base_cur() -> str:
+    """Валюта кассы — из BASE_CURRENCY, а не литерал «USD» (T2.13, §3.7)."""
+    from config import BASE_CURRENCY
+
+    return (BASE_CURRENCY or "USD").upper()
 
 
 def _fmt_cents(cents: int) -> str:
@@ -71,9 +77,9 @@ def build_pending_deposits_block(deposits: list[dict]) -> str | None:
     if not deposits:
         return None
     total_cents = sum(int(d.get("amount_cents") or 0) for d in deposits)
-    lines = [f"💵 <b>Сдачи на подтверждении: {len(deposits)}</b> (на {_fmt_cents(total_cents)} USD)"]
+    lines = [f"💵 <b>Сдачи на подтверждении: {len(deposits)}</b> (на {_fmt_cents(total_cents)} {_base_cur()})"]
     for d in deposits[:15]:
-        lines.append(f"  • сдача #{d['id']} — {_fmt_cents(d.get('amount_cents'))} USD")
+        lines.append(f"  • сдача #{d['id']} — {_fmt_cents(d.get('amount_cents'))} {_base_cur()}")
     if len(deposits) > 15:
         lines.append(f"  …и ещё {len(deposits) - 15}")
     return "\n".join(lines)
@@ -85,7 +91,7 @@ def build_pending_returns_block(returns: list[dict]) -> str | None:
     lines = [f"↩️ <b>Возвраты на подтверждении: {len(returns)}</b>"]
     for r in returns[:15]:
         amt = _fmt_cents(r.get("total_amount_cents"))
-        lines.append(f"  • возврат #{r['id']} · заказ #{r.get('order_id', '?')} — {amt} USD")
+        lines.append(f"  • возврат #{r['id']} · заказ #{r.get('order_id', '?')} — {amt} {_base_cur()}")
     if len(returns) > 15:
         lines.append(f"  …и ещё {len(returns) - 15}")
     return "\n".join(lines)
@@ -105,13 +111,13 @@ def build_overdue_undeposited_block(orders: list[dict], days: int) -> str | None
 
 
 def build_low_stock_block(rows: list[dict], threshold: float) -> str | None:
-    """Алерт о низком доступном остатке. rows из snapshot.get_low_stock."""
+    """Алерт о низком доступном остатке. rows из warehouse.get_low_stock."""
     if not rows:
         return None
     lines = [f"📉 <b>Низкий остаток (≤{_fmt_amount(threshold)}): {len(rows)}</b>"]
     for r in rows[:15]:
         name = _esc(r.get("name") or "—")
-        avail = float(r.get("stock", 0) or 0) - float(r.get("reserve", 0) or 0)
+        avail = float(r.get("available", 0) or 0)
         unit = _esc(r.get("unit") or "шт")
         lines.append(f"  • {name} · {_fmt_amount(avail)} {unit}")
     if len(rows) > 15:
@@ -138,9 +144,11 @@ def build_dead_stock_block(rows: list[dict], days: int) -> str | None:
 def diff_dead_stock(in_stock: list[dict], sold_names: set[str]) -> list[dict]:
     """Чистая функция (тестируемая): из остатков убрать то, что продавалось.
 
-    Матч по нормализованному имени (lower/strip) — у нас нет product_id
-    в shipment positions, только assortment.name. Возвращает позиции
-    в наличии (stock>0), которых нет в sold_names.
+    Матч по нормализованному имени (lower/strip). Осталось от эпохи, когда
+    проданное приезжало позициями отгрузок МойСклад, где был только
+    `assortment.name`; сейчас имена приходят из наших же накладных и совпадают
+    буквально, но сравнение по нормализованному имени безобиднее строгого.
+    Возвращает позиции в наличии (stock>0), которых нет в sold_names.
     """
     sold_norm = {(s or "").strip().lower() for s in sold_names}
     dead = []
@@ -156,35 +164,21 @@ def diff_dead_stock(in_stock: list[dict], sold_names: set[str]) -> list[dict]:
 async def collect_dead_stock(days: int) -> list[dict]:
     """Собрать «мёртвый» склад: остатки минус то, что продавалось за `days`.
 
-    Тяжёлая по МС-вызовам (shipments + positions) — вызывается только из
-    cron (1×/день). Имена проданных собираем из позиций отгрузок за период.
+    Раньше это была самая дорогая операция дня: список отгрузок МойСклад плюс
+    отдельный запрос позиций на каждую. Теперь всё считается по нашим же
+    накладным, но функция остаётся cron-only — ей всё равно незачем бежать по
+    запросу из webapp.
     """
     from datetime import timedelta
 
-    from services.moysklad import get_shipments, get_shipment_positions
-    from services.snapshot import get_stock
-    from utils.helpers import extract_id_from_href
+    from services.warehouse import get_catalog, sales_stats
 
     since = datetime.now() - timedelta(days=days)
-    sold_names: set[str] = set()
-    try:
-        shipments = await get_shipments(since)
-    except Exception:
-        logger.exception("collect_dead_stock: get_shipments failed")
-        return []
-    for s in shipments:
-        demand_id = extract_id_from_href(s.get("meta", {}).get("href", ""))
-        if not demand_id:
-            continue
-        try:
-            positions = await get_shipment_positions(demand_id)
-        except Exception:
-            continue
-        for p in positions:
-            name = (p.get("assortment") or {}).get("name") or p.get("name")
-            if name:
-                sold_names.add(name)
-    in_stock = get_stock(only_positive=True)
+    stats = await sales_stats(since)
+    sold_names = {name for name, _d in stats.get("top_products") or []}
+    rows = await get_catalog(only_positive=True)
+    # `diff_dead_stock` читает поле `stock` — имя осталось с прежнего формата.
+    in_stock = [{**r, "stock": r["quantity"]} for r in rows]
     return diff_dead_stock(in_stock, sold_names)
 
 
@@ -214,77 +208,24 @@ def build_cron_health_block(stale_crons: list[dict]) -> str | None:
     return "\n".join(lines)
 
 
-def build_ms_sync_block(anomalies: dict[str, list[dict]]) -> str | None:
-    """Этап 4: рассинхрон с МойСклад, требующий ручной разборки.
-    anomalies из services.database.get_ms_sync_anomalies (drift + deleted)."""
-    drift = anomalies.get("drift") or []
-    deleted = anomalies.get("deleted") or []
-    demand_failed = anomalies.get("demand_failed") or []
-    if not drift and not deleted and not demand_failed:
-        return None
-    lines = ["🔄 <b>Рассинхрон с МойСклад</b>"]
-    if demand_failed:
-        lines.append(f"  📦 Отгрузка не создана (нужна доделка): {len(demand_failed)}")
-        for o in demand_failed[:10]:
-            agent = _esc(o.get("agent_name") or "—")
-            lines.append(f"    • #{o['id']} · {agent}")
-        if len(demand_failed) > 10:
-            lines.append(f"    …и ещё {len(demand_failed) - 10}")
-    if drift:
-        lines.append(f"  ✏️ Изменены в МС (сумма ≠): {len(drift)}")
-        for o in drift[:10]:
-            agent = _esc(o.get("agent_name") or "—")
-            lines.append(f"    • #{o['id']} · {agent}")
-        if len(drift) > 10:
-            lines.append(f"    …и ещё {len(drift) - 10}")
-    if deleted:
-        lines.append(f"  🗑 Удалены в МС (фантом {len(deleted)}):")
-        for o in deleted[:10]:
-            agent = _esc(o.get("agent_name") or "—")
-            lines.append(f"    • #{o['id']} · {agent} · {_esc(o.get('status') or '')}")
-        if len(deleted) > 10:
-            lines.append(f"    …и ещё {len(deleted) - 10}")
-    return "\n".join(lines)
+def build_shipment_failed_block(rows: list[dict]) -> str | None:
+    """Заказы, которые одобрили, а со склада не списали.
 
-
-def assemble_digest(title: str, blocks: list[str | None]) -> str | None:
-    """Склеить непустые блоки в одну сводку. None — если всё пусто."""
-    present = [b for b in blocks if b]
-    if not present:
-        return None
-    return f"{DIV}\n{title}\n\n" + "\n\n".join(present)
-
-
-def build_digest_keyboard(
-    stale: list[dict] | None = None,
-    deposits: list[dict] | None = None,
-    returns: list[dict] | None = None,
-    max_orders: int = 5,
-) -> dict | None:
-    """Инлайн-клавиатура к дайджесту: deep-link кнопки к УЖЕ существующим
-    обработчикам бота — `ord_view:{id}` (просмотр заказа), `dep_pending`
-    (список сдач), `ret_pending` (список возвратов). Возвращает dict в формате
-    Telegram Bot API (reply_markup для tg_send_message) или None, если действий нет.
-
-    Кнопки-заказы — по первым `max_orders` зависшим (по 3 в ряд); сдачи/возвраты —
-    один вход в соответствующий список. Сами обработчики живут в bot-процессе
-    (cron только отправляет сообщение, callback'и обрабатывает бот).
+    Раньше этот блок назывался «рассинхрон с МойСклад» и собирал документы,
+    которых МС не принял или которые в нём удалили. Расхождение осталось тем
+    же по смыслу: заказ выглядит отгруженным, а остаток с ним не сошёлся.
     """
-    rows: list[list[dict]] = []
-    order_btns = [
-        {"text": f"⏳ #{o['id']}", "callback_data": f"ord_view:{o['id']}"}
-        for o in (stale or [])[:max_orders]
-    ]
-    for i in range(0, len(order_btns), 3):
-        rows.append(order_btns[i : i + 3])
-    nav: list[dict] = []
-    if deposits:
-        nav.append({"text": f"💵 Сдачи ({len(deposits)})", "callback_data": "dep_pending"})
-    if returns:
-        nav.append({"text": f"↩️ Возвраты ({len(returns)})", "callback_data": "ret_pending"})
-    if nav:
-        rows.append(nav)
-    return {"inline_keyboard": rows} if rows else None
+    if not rows:
+        return None
+    lines = [f"📦 <b>Остаток не списан (нужна доделка): {len(rows)}</b>"]
+    for r in rows[:10]:
+        agent = _esc(r.get("agent_name") or "—")
+        err = _esc(str(r.get("error") or "")[:120])
+        suffix = f" · {err}" if err else ""
+        lines.append(f"  • #{r['order_id']} · {agent}{suffix}")
+    if len(rows) > 10:
+        lines.append(f"  …и ещё {len(rows) - 10}")
+    return "\n".join(lines)
 
 
 # ─── Дневной пинг (короткое уведомление → смотри в WebApp) ────────────────────
@@ -296,14 +237,19 @@ def build_digest_keyboard(
 # в боте без изменений — это срочные действия, а не сводка.
 
 # Какие секции gather_ops_summary показываем в пинге каждой роли.
+#
+# `stale_crons` — только админу. Руководителю «cron не отчитались» ничего не
+# говорит и ничего от него не требует: это здоровье инфраструктуры, а не
+# состояние дел. Строка в сводке, по которой нельзя принять решение, приучает
+# не читать сводку целиком.
 _PING_ROLE_SECTIONS: dict[str, list[str]] = {
     "admin": [
         "stale_orders", "overdue_undeposited", "deposits", "returns",
-        "low_stock", "stale_crons", "ms_anomalies",
+        "low_stock", "stale_crons", "shipment_failed",
     ],
     "boss": [
         "stale_orders", "overdue_undeposited", "deposits", "returns",
-        "low_stock", "stale_crons", "ms_anomalies",
+        "low_stock", "shipment_failed",
     ],
     "bookkeeper": ["deposits"],
     "warehouse_keeper": ["returns", "low_stock"],
@@ -316,7 +262,7 @@ _PING_SECTION_LABELS: dict[str, str] = {
     "returns": "↩️ Возвраты на подтверждении",
     "low_stock": "📉 Низкий остаток",
     "stale_crons": "🛑 Cron не отчитались",
-    "ms_anomalies": "🔄 Рассинхрон с МС",
+    "shipment_failed": "📦 Остаток не списан",
 }
 
 _PING_HEADERS: dict[str, tuple[str, str]] = {
@@ -329,12 +275,6 @@ _PING_HEADERS: dict[str, tuple[str, str]] = {
 
 def _section_count(summary: dict, key: str) -> int:
     sec = summary.get(key) or {}
-    if key == "ms_anomalies":
-        return (
-            int(sec.get("drift") or 0)
-            + int(sec.get("deleted") or 0)
-            + int(sec.get("demand_failed") or 0)
-        )
     return int(sec.get("count") or 0)
 
 
@@ -397,8 +337,6 @@ async def main() -> int:
     except Exception:
         logger.exception("ops_monitor: ошибка")
         return 1
-    finally:
-        await close_session()
         await close_tg_session()
 
 

@@ -20,7 +20,7 @@ import logging
 from decimal import Decimal
 from typing import Any
 
-from services import money
+from services import adb_core, money
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +97,58 @@ def validate_transition(order: dict, new_status: str) -> str | None:
 
 
 def _items_key(item: dict) -> str:
-    """Ключ позиции для diff'а: предпочитаем product_href, иначе имя."""
+    """Ключ позиции для diff'а: предпочитаем карточку товара, иначе имя.
+
+    `product_id` — привязка к нашей номенклатуре, `product_href` остался у
+    позиций, заведённых до перехода со МойСклад: оба однозначно опознают товар,
+    имя — уже нет («Кабель PV 0.6» и «Кабель PV 0,6» это одна позиция, которую
+    переименовали, а не добавленная и удалённая).
+    """
+    pid = item.get("product_id")
+    if pid:
+        return f"p:{pid}"
     return str(item.get("product_href") or item.get("product_name") or "")
+
+
+def _print_keyboard(invoice_id: int | None):
+    """Кнопка «Распечатать» под печатной формой. `None` — печать недоступна.
+
+    Кнопки нет, если в контейнере не стоит клиент CUPS: обещать действие,
+    которое гарантированно ответит отказом, хуже, чем не предлагать его.
+    """
+    from services import printing
+
+    if not invoice_id or not printing.is_available():
+        return None
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🖨 Распечатать", callback_data=printing.invoice_callback(int(invoice_id)))
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def _build_invoice_pdf(invoice_id: int | None, order_id: int) -> tuple[bytes, str] | None:
+    """Печатная форма накладной: (bytes, имя файла) или None.
+
+    Best-effort: заказ уже одобрен и склад списан, и отсутствие PDF не повод
+    ронять весь апрув. WeasyPrint синхронный и тяжёлый — уводим в поток, иначе
+    он держит event loop на время рендера.
+    """
+    if not invoice_id:
+        return None
+    try:
+        from services import warehouse
+        from services.invoice_pdf import invoice_filename, render_invoice_pdf
+
+        invoice = await warehouse.get_invoice(int(invoice_id))
+        if not invoice:
+            return None
+        pdf = await asyncio.to_thread(render_invoice_pdf, invoice)
+        return pdf, invoice_filename(invoice)
+    except Exception:
+        logger.exception("PDF накладной по заказу #%s не собран", order_id)
+        return None
 
 
 def compute_resubmit_summary(
@@ -217,6 +267,255 @@ async def resubmit_diff_line(order_id: int, items: list[dict]) -> str:
 # Теперь — один сервис, который вызывают и Telegram callback, и /api/.
 
 
+
+# Человекочитаемые названия статусов — для объяснения боссу, почему кнопка
+# из старого сообщения больше не срабатывает.
+
+# ─── Submit заявки на отгрузку ───────────────────────────────────────────────
+
+
+class _SubmitAbort(Exception):
+    """Откат транзакции сабмита с сообщением пользователю."""
+
+    def __init__(self, message: str, status: str | None = None):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+
+def validate_payment_terms(
+    payment_type: str | None, due_date: str | None
+) -> tuple[str, str | None, str | None]:
+    """Нормализовать и проверить условия оплаты. → (payment_type, due_date, error).
+
+    Единая валидация для обоих входов. Раньше она была только в WebApp, а бот
+    сабмитил вообще не трогая payment_type — заказ оставался на схемном
+    дефолте 'paid', и рассрочка молча учитывалась как оплаченная (§5.2.3).
+    """
+    from datetime import date
+
+    ptype = (payment_type or "paid").lower()
+    due = (due_date or "").strip() or None
+    if ptype not in ("paid", "credit"):
+        return ptype, due, "Неверный тип оплаты"
+    if ptype != "credit":
+        # Для paid срок долга не имеет смысла — обнуляем, чтобы не тащить
+        # хвост от прошлого credit-состояния заказа.
+        return ptype, None, None
+    if not due:
+        return ptype, due, "Укажите дату возврата долга"
+    try:
+        parsed = date.fromisoformat(due)
+    except ValueError:
+        return ptype, due, "Неверный формат даты (нужно YYYY-MM-DD)"
+    if parsed < date.today():
+        return ptype, due, "Дата возврата не может быть в прошлом"
+    return ptype, due, None
+
+
+def _is_unique_violation(exc: BaseException) -> bool:
+    """Нарушение UNIQUE — на обоих бэкендах (sqlite3.IntegrityError /
+    asyncpg.UniqueViolationError). Ловим по типу и по тексту, чтобы не тащить
+    в импорты драйвер, которого может не быть."""
+    name = type(exc).__name__
+    if name in ("IntegrityError", "UniqueViolationError"):
+        return True
+    text = str(exc).lower()
+    return "unique" in text and "constraint" in text
+
+
+async def submit_order(
+    order_id: int,
+    user_id: int,
+    full_name: str,
+    *,
+    payment_type: str | None = None,
+    due_date: str | None = None,
+    comment: str = "",
+    idem_key: str | None = None,
+) -> dict:
+    """Отправить заказ на согласование. ЕДИНСТВЕННЫЙ путь сабмита (T2.3).
+
+    Всё в одной транзакции: SELECT ... FOR UPDATE на заказе, проверка
+    status='draft', запись типа оплаты, перевод в 'pending' с submitted_at,
+    вставка заявки. Либо всё, либо ничего.
+
+    Что чинится:
+      • бот не записывал payment_type — рассрочка учитывалась как оплаченная
+        (§5.2.3, схемный дефолт 'paid');
+      • create_shipment_request и update_order_status шли двумя транзакциями:
+        краш между ними оставлял заявку 'pending' при заказе 'draft', а двойной
+        тап успевал создать ДВЕ заявки (§2.1) — теперь CAS на draft отсекает
+        второй сабмит, а уникальный индекс из T1.8 страхует на уровне БД;
+      • submitted_at не записывался вовсе (§2.11), из-за чего переотправленный
+        заказ немедленно объявлялся «зависшей заявкой» по старому created_at.
+
+    submitted_at пишем `now_str()` — в ОДНОМ кадре с created_at (локальное
+    наивное время). get_stale_pending_orders сравнивает
+    COALESCE(submitted_at, created_at) с порогом, посчитанным в Python через
+    datetime.now(); UTC здесь разъехался бы с локальным на величину смещения
+    и досрочно помечал заявки зависшими.
+
+    Возвращает {"ok": True, "req_id": N, "payment_type", "due_date"} либо
+    {"ok": False, "error": "...", "status": <текущий статус>}.
+    """
+    from services import async_db as adb
+    from services.database import USE_POSTGRES, now_str
+
+    ptype, due, err = validate_payment_terms(payment_type, due_date)
+    if err:
+        return {"ok": False, "error": err}
+
+    if idem_key:
+        cached = await adb.idem_claim(idem_key, "order_submit", user_id)
+        if cached is not None:
+            # Ключ уже застолблён — повторная отправка того же запроса.
+            return cached or {"ok": False, "error": "Заявка уже отправлена"}
+
+    result: dict
+    try:
+        async with adb_core.transaction() as txn:
+            lock = " FOR UPDATE" if USE_POSTGRES else ""
+            order = await txn.fetchrow(
+                f"SELECT id, status, agent_name, frozen FROM orders WHERE id = $1{lock}",
+                order_id,
+            )
+            if not order:
+                raise _SubmitAbort("Заказ не найден")
+            if order["status"] != "draft":
+                raise _SubmitAbort(
+                    "Заказ уже отправлен — повторная отправка не нужна",
+                    status=order["status"],
+                )
+            if order.get("frozen"):
+                raise _SubmitAbort(
+                    "Заказ заморожен после серии отклонений — обратитесь к администратору"
+                )
+            if not (order.get("agent_name") or "").strip():
+                raise _SubmitAbort("Выберите клиента")
+
+            n_items = int(
+                await txn.fetchval(
+                    "SELECT COUNT(*) FROM order_items WHERE order_id = $1", order_id
+                )
+                or 0
+            )
+            if n_items == 0:
+                raise _SubmitAbort("Добавьте товары")
+
+            stamp = now_str()
+            moved = await txn.execute(
+                "UPDATE orders SET status = 'pending', payment_type = $1, due_date = $2, "
+                "submitted_at = $3, updated_at = $4 WHERE id = $5 AND status = 'draft'",
+                ptype, due, stamp, stamp, order_id,
+            )
+            if not moved:
+                # Кто-то успел между SELECT и UPDATE (на SQLite нет FOR UPDATE).
+                raise _SubmitAbort("Заказ уже отправлен — повторная отправка не нужна")
+
+            await txn.execute(
+                "INSERT INTO shipment_requests "
+                "(order_id, user_id, full_name, status, comment, created_at) "
+                "VALUES ($1, $2, $3, 'pending', $4, $5)",
+                order_id, user_id, full_name, comment, stamp,
+            )
+            req_id = int(
+                await txn.fetchval(
+                    "SELECT id FROM shipment_requests WHERE order_id = $1 "
+                    "AND status = 'pending'",
+                    order_id,
+                )
+                or 0
+            )
+            result = {"ok": True, "req_id": req_id, "payment_type": ptype, "due_date": due}
+    except _SubmitAbort as e:
+        result = {"ok": False, "error": e.message, "status": e.status}
+    except Exception as e:  # noqa: BLE001 — нужен именно разбор причины
+        if not _is_unique_violation(e):
+            raise
+        # Уникальный индекс из T1.8: вторая pending-заявка по тому же заказу.
+        # Это не 500, а «уже отправлено».
+        logger.info("submit_order: заявка по заказу #%s уже существует", order_id)
+        result = {"ok": False, "error": "Заявка уже отправлена"}
+
+    if idem_key:
+        await adb.idem_store(idem_key, result)
+    return result
+
+
+
+
+# ─── Отмена заказа ───────────────────────────────────────────────────────────
+
+
+async def cancel_order_full(
+    order_id: int, user_id: int, user_name: str, reason: str
+) -> dict:
+    """Отменить заказ и вернуть списанный товар на склад. Общий код для обоих
+    входов — бота и `/api/orders/cancel` (T2.6).
+
+    Раньше откат делал только бот, а WebApp — нет, и отменённый оттуда заказ
+    оставлял в МойСклад живой customerorder с резервом товара НАВСЕГДА (§5.2.2).
+    Теперь откатывать нужно СВОЮ расходную накладную, и забыть про это стоило бы
+    ещё дороже: товар остался бы списанным по отменённому заказу.
+
+    Возврат остатка — best-effort и намеренно ПОСЛЕ локальной отмены: ошибка
+    склада не должна откатывать то, что оператор уже подтвердил. Отмена
+    накладной идемпотентна (повторный вызов вернёт `already_cancelled`).
+
+    Возвращает результат `cancel_order` плюс `stock_reverse` — что вышло со
+    складом (для логов и текста оператору).
+    """
+    from services import async_db as adb
+
+    res = await adb.cancel_order(order_id, user_id, user_name, reason)
+    if not res.get("ok"):
+        return res
+
+    from services import order_shipment
+
+    try:
+        rev = await order_shipment.cancel_shipment(order_id, user_id=user_id)
+    except Exception as e:  # noqa: BLE001 — отмена уже применена, склад догоним
+        logger.warning("Возврат остатка по заказу #%s не прошёл", order_id, exc_info=True)
+        rev = {"ok": False, "reason": type(e).__name__}
+    if not rev.get("ok"):
+        logger.warning(
+            "Заказ #%s отменён, но остаток не вернулся на склад: %s",
+            order_id, rev.get("reason"),
+        )
+    return {**res, "stock_reverse": rev}
+
+
+_STATUS_RU: dict[str, str] = {
+    "draft": "черновик",
+    "pending": "на согласовании",
+    "approved": "одобрен",
+    "shipped": "отгружен",
+    "paid": "оплачен",
+    "rejected": "отклонён",
+    "cancelled": "отменён",
+    "partially_returned": "частично возвращён",
+    "returned": "возвращён",
+}
+
+
+def _decision_error(decision, order_id) -> str:
+    """Сообщение боссу по отказу CAS (T2.2).
+
+    Различаем два случая: заявку разобрал другой человек — или заказ уехал в
+    другой статус (напр. МойСклад прислал Unsuccessful и заказ стал rejected),
+    а кнопка осталась в старом сообщении чата.
+    """
+    if decision.reason == "order_moved":
+        human = _STATUS_RU.get(decision.order_status or "", decision.order_status or "?")
+        return (
+            f"Заказ #{order_id} уже в статусе «{human}» — решение по заявке "
+            f"больше не применимо. Откройте заказ и посмотрите актуальное состояние."
+        )
+    return "Заявка уже обработана другим пользователем"
+
+
 async def approve_shipment_request(
     req_id: int,
     boss_user_id: int,
@@ -242,8 +541,8 @@ async def approve_shipment_request(
           "order_id": int | None,
           "now": str,            # local_now() — для UI handler'а
           "demand_line": str,    # текст для concat в Telegram-сообщение
-          "ms_co_id": str | None,
-          "ms_demand_id": str | None,
+          "invoice_id": int | None,      # расходная накладная склада
+          "invoice_number": str | None,
         }
     """
     from services import async_db as adb
@@ -301,11 +600,11 @@ async def approve_shipment_request(
     # Атомарный UPDATE ... WHERE status='pending' — защита от race condition,
     # когда два босса одновременно жмут «Одобрить». Только один из них
     # получит rowcount==1, остальные — False.
-    ok = await adb.approve_shipment_request(req_id, boss_user_id, boss_name)
-    if not ok:
+    decision = await adb.approve_shipment_request(req_id, boss_user_id, boss_name)
+    if not decision.applied:
         return {
             "ok": False,
-            "error": "Заявка уже обработана другим пользователем",
+            "error": _decision_error(decision, req.get("order_id")),
             "req_id": req_id,
             "order_id": req.get("order_id"),
         }
@@ -330,179 +629,89 @@ async def approve_shipment_request(
         )
     items = await adb.get_order_items(req["order_id"]) if order else []
     manager_name = (order or {}).get("full_name") or req.get("full_name") or "—"
-    manager_user_id = (order or {}).get("user_id") or req.get("user_id")
 
-    # Цепочка в МойСклад:
-    #   1) customerorder — для PDF печатной формы
-    #   2) demand линкованный с customerorder — чтобы СРАЗУ списать остатки
-    # Backend URL'ы в чат не отправляем — только PDF файлом.
-    from services.ms_demand import is_ready as ms_ready, create_demand_from_request
-    from services.ms_customerorder import create_customerorder_from_request
+    # Отгрузка — расходная накладная нашего склада. Раньше здесь создавалась
+    # пара документов в МойСклад: customerorder (ради печатной формы) и
+    # связанный с ним demand (ради списания остатка). Оба документа теперь
+    # наши, и пары не нужно: локальная накладная и печатается, и двигает склад.
+    from services import order_shipment
 
     demand_line = ""
     pdf_to_send: tuple[bytes, str] | None = None
-    co_id: str | None = None
-    demand_id: str | None = None
-    # Этап 1a: позиции без product_href молча выпадали из МС-документа (в МС
-    # заказ меньше локального). Собираем их и показываем боссу предупреждением.
+    invoice_id: int | None = None
+    invoice_number: str | None = None
+    # Позиции без карточки номенклатуры в накладную не попадают. Молчать об
+    # этом нельзя: недосписанный заказ — это расхождение склада.
     skipped_names: list[str] = []
 
-    if order and items and ms_ready():
-        co_result = await create_customerorder_from_request(
-            order,
-            items,
-            manager_name,
-            telegram_user_id=manager_user_id,
-        )
-        for nm in co_result.get("skipped") or []:
-            if nm not in skipped_names:
-                skipped_names.append(nm)
-        if co_result.get("ok"):
-            co_id = co_result.get("customerorder_id")
-            # Audit СРАЗУ после успешного POST в МойСклад — до того
-            # как пытаемся сохранить co_id в БД (см. SECURITY.md H6).
-            if co_id:
-                await asyncio.gather(
-                    adb.add_audit_log(
-                        boss_user_id,
-                        boss_name,
-                        boss_role,
-                        "ms_co_created",
-                        f"Заявка #{req_id} → customerorder {co_id} (до db-write)",
-                    ),
-                    adb.set_order_ms_customerorder_id(order["id"], co_id),
-                )
+    if order and items:
+        # Идемпотентно по `order_shipment.order_id`: повторное одобрение (два
+        # босса, ретрай, старая кнопка) не спишет товар второй раз.
+        ship = await order_shipment.ship_order(order, items, user_id=boss_user_id)
+        skipped_names = list(ship.get("skipped") or [])
 
-            if co_result.get("pdf_bytes"):
-                pdf_to_send = (
-                    co_result["pdf_bytes"],
-                    co_result.get("pdf_filename") or f"order_{order['id']}.pdf",
-                )
-
-            from services.moysklad import MS_BASE
-
-            co_href = f"{MS_BASE}/entity/customerorder/{co_id}" if co_id else None
-            demand_result = await create_demand_from_request(
-                order,
-                items,
-                manager_name,
-                telegram_user_id=manager_user_id,
-                customerorder_href=co_href,
-            )
-            for nm in demand_result.get("skipped") or []:
-                if nm not in skipped_names:
-                    skipped_names.append(nm)
-            if demand_result.get("ok"):
-                demand_id = demand_result.get("demand_id")
-                if demand_id:
-                    await asyncio.gather(
-                        adb.add_audit_log(
-                            boss_user_id,
-                            boss_name,
-                            boss_role,
-                            "ms_demand_created",
-                            f"Заявка #{req_id} → demand {demand_id} (до db-write)",
-                        ),
-                        adb.set_order_ms_demand_id(order["id"], demand_id),
-                    )
-                # R4: отгрузка прошла — снимаем флаг «нужна доделка», если стоял
-                # (напр. demand упал на прошлой попытке, эта — успешна).
-                await adb.clear_order_ms_demand_failed(order["id"])
-                demand_line = (
-                    "\n📄 Заказ покупателя создан в МойСклад"
-                    "\n📦 Отгрузка проведена, остатки списаны"
-                )
-                if pdf_to_send:
-                    demand_line += " — печатная форма ниже 👇"
-                await adb.add_audit_log(
-                    boss_user_id,
-                    boss_name,
-                    boss_role,
-                    "ms_co_and_demand_created",
-                    f"Заявка #{req_id} → customerorder {co_id} + demand {demand_id}",
+        if ship.get("ok"):
+            invoice_id = ship.get("invoice_id")
+            invoice_number = ship.get("invoice_number")
+            if ship.get("already_shipped"):
+                logger.info(
+                    "Заявка #%s: накладная по заказу уже есть — повторно не списываем", req_id
                 )
             else:
-                reason = demand_result.get("reason", "неизвестная ошибка")
-                logger.warning(
-                    "Customerorder создан, но demand упал для #%s: %s",
-                    req_id,
-                    reason,
-                )
-                demand_line = (
-                    f"\n📄 Заказ покупателя создан в МойСклад"
-                    f"\n⚠️ <b>Отгрузка НЕ создана автоматически:</b>\n"
-                    f"<code>{esc(reason[:200])}</code>\n"
-                    f"Остатки не списались — создайте demand вручную в МойСклад "
-                    f"(или из карточки этого заказа покупателя)."
-                )
-                if pdf_to_send:
-                    demand_line += "\nПечатная форма ниже 👇"
                 await adb.add_audit_log(
                     boss_user_id,
                     boss_name,
                     boss_role,
-                    "ms_demand_failed",
-                    f"Заявка #{req_id} → CO {co_id} ok, demand fail: {reason[:200]}",
+                    "order_shipped",
+                    f"Заявка #{req_id} → накладная {invoice_number} (#{invoice_id})",
                 )
-                # R4: персистентный флаг — заказ попадёт в ночной дайджест
-                # «нужна доделка demand», даже если уведомление боссу потеряется.
-                await adb.set_order_ms_demand_failed(order["id"])
-                if bot is not None:
-                    try:
-                        await bot.send_message(
-                            boss_user_id,
-                            f"⚠️ MS demand fail для заявки #{req_id} "
-                            f"(customerorder {(co_id or '')[:8]} создан):\n"
-                            f"<code>{esc(reason[:500])}</code>",
-                            parse_mode="HTML",
-                        )
-                    except Exception:
-                        pass
+                demand_line = (
+                    f"\n📦 Накладная {esc(str(invoice_number))} проведена, остатки списаны"
+                )
+                pdf_to_send = await _build_invoice_pdf(invoice_id, order["id"])
+                if pdf_to_send:
+                    demand_line += " — печатная форма ниже 👇"
         else:
-            reason = co_result.get("reason", "неизвестная ошибка")
-            logger.warning(
-                "Не удалось создать customerorder для заявки #%s: %s",
-                req_id,
-                reason,
-            )
+            reason = ship.get("reason", "неизвестная ошибка")
+            logger.warning("Заявка #%s одобрена, но склад не списан: %s", req_id, reason)
             demand_line = (
-                f"\n⚠️ <b>Не удалось создать заказ в МойСклад:</b>\n"
+                f"\n⚠️ <b>Остатки НЕ списаны:</b>\n"
                 f"<code>{esc(reason[:300])}</code>\n"
-                f"Заявка в боте одобрена — заказ нужно завести вручную."
+                f"Заявка одобрена — накладную нужно провести вручную."
+            )
+            await adb.add_audit_log(
+                boss_user_id,
+                boss_name,
+                boss_role,
+                "order_shipment_failed",
+                f"Заявка #{req_id}: {reason[:200]}",
             )
             if bot is not None:
                 try:
                     await bot.send_message(
                         boss_user_id,
-                        f"⚠️ MS customerorder fail для заявки #{req_id}:\n"
+                        f"⚠️ Склад не списан по заявке #{req_id}:\n"
                         f"<code>{esc(reason[:500])}</code>",
                         parse_mode="HTML",
                     )
                 except Exception:
                     pass
-    elif not ms_ready():
-        logger.info(
-            "MS context не готов — не создаём документы для заявки #%s",
-            req_id,
-        )
 
-    # Этап 1a: если часть позиций не попала в МС-документ (нет product_href) —
-    # предупреждаем явно, иначе расхождение «локальный заказ > МС» молчит.
-    if skipped_names and co_id:
+    if skipped_names:
         preview = ", ".join(esc(n) for n in skipped_names[:5])
         more = f" +{len(skipped_names) - 5}" if len(skipped_names) > 5 else ""
         demand_line += (
-            f"\n⚠️ <b>{len(skipped_names)} поз. не попали в МойСклад</b> "
-            f"(нет привязки к товару МС): {preview}{more}.\n"
-            f"Добавьте их в документ вручную."
+            f"\n⚠️ <b>{len(skipped_names)} поз. не списано</b> "
+            f"(нет карточки в номенклатуре): {preview}{more}.\n"
+            f"Заведите товар и проведите накладную вручную."
         )
         await adb.add_audit_log(
             boss_user_id,
             boss_name,
             boss_role,
-            "ms_positions_skipped",
-            f"Заявка #{req_id} → CO {co_id}: пропущено {len(skipped_names)} поз. "
-            f"без product_href: {', '.join(skipped_names[:10])}",
+            "shipment_positions_skipped",
+            f"Заявка #{req_id}: пропущено {len(skipped_names)} поз. без карточки: "
+            f"{', '.join(skipped_names[:10])}",
         )
 
     # Уведомляем менеджера
@@ -528,12 +737,19 @@ async def approve_shipment_request(
 
             pdf_bytes, pdf_name = pdf_to_send
             caption = f"📄 Печатная форма — заявка #{req_id}"
+            # Печать — ПО КНОПКЕ, а не автоматически: половина печатных форм
+            # уходит на проверку перед отправкой клиенту, и печатать их все
+            # значит переводить бумагу. Клавиатуру собираем здесь же, рядом с
+            # отправкой; формат callback_data — в services.printing, чтобы
+            # producer и хендлер не разъехались.
+            markup = _print_keyboard(invoice_id)
             try:
                 file1 = BufferedInputFile(pdf_bytes, filename=pdf_name)
                 await bot.send_document(
                     chat_id=req["user_id"],
                     document=file1,
                     caption=caption,
+                    reply_markup=markup,
                 )
             except Exception:
                 logger.exception("Не удалось отправить PDF менеджеру")
@@ -544,6 +760,7 @@ async def approve_shipment_request(
                         chat_id=boss_user_id,
                         document=file2,
                         caption=caption,
+                        reply_markup=markup,
                     )
                 except Exception:
                     logger.exception("Не удалось отправить PDF боссу")
@@ -573,9 +790,9 @@ async def approve_shipment_request(
                         order_id=order["id"],
                     )
                     if bot is not None:
-                        from handlers.debts import _push_payment_confirmation
+                        from services.notify import notify_payment_confirmation_needed
 
-                        await _push_payment_confirmation(
+                        await notify_payment_confirmation_needed(
                             bot,
                             order["id"],
                             manager_name,
@@ -594,8 +811,8 @@ async def approve_shipment_request(
         "order_id": req.get("order_id"),
         "now": now_str,
         "demand_line": demand_line,
-        "ms_co_id": co_id,
-        "ms_demand_id": demand_id,
+        "invoice_id": invoice_id,
+        "invoice_number": invoice_number,
     }
 
 
@@ -623,11 +840,11 @@ async def reject_shipment_request(
             "order_id": req.get("order_id"),
         }
 
-    ok = await adb.reject_shipment_request(req_id, boss_user_id, boss_name)
-    if not ok:
+    decision = await adb.reject_shipment_request(req_id, boss_user_id, boss_name)
+    if not decision.applied:
         return {
             "ok": False,
-            "error": "Заявка уже обработана другим пользователем",
+            "error": _decision_error(decision, req.get("order_id")),
             "req_id": req_id,
             "order_id": req.get("order_id"),
         }
