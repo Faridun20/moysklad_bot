@@ -19,6 +19,8 @@ powershell -ExecutionPolicy Bypass -File scripts/test-js.ps1      # npm install 
 
 python bot.py                              # локально: без Postgres → SQLite, без Redis → MemoryStorage
 python -m tasks.migrate                    # schema + data миграции, ДО старта сервисов на проде
+python -m scripts.apply_legacy_columns --dry-run   # РАЗОВО: догнать существующую базу
+                                           # до текущей схемы (--apply). Не из migrate.
 
 # Cron CLIs (Railway Cron Jobs)
 python -m tasks.run_debts_notify
@@ -65,7 +67,24 @@ Variable: новые сервисы (cron'ы) переменную не насл
 ## Conventions (нетривиальные)
 
 **DB:**
-- `init_db()` делает ТОЛЬКО `CREATE TABLE IF NOT EXISTS`. **Инкрементальных миграций в проекте НЕТ вообще**: `ALTER TABLE` запрещён во всех `.py` (`tests/test_schema_single_pass.py::test_no_alter_table_anywhere_in_project`), `run_migrations()` не существует и его отсутствие тоже под тестом. Нужна новая колонка в таблице, которая уже на проде, — заводи ОТДЕЛЬНУЮ таблицу (прецеденты: `container_supply`, `container_item_links`, `machine_deal_payments`). Data-миграции и сидинг настроек — в `run_backfills()`, вызывается из `tasks/migrate.py`.
+- `init_db()` делает ТОЛЬКО `CREATE TABLE IF NOT EXISTS`. **Инкрементальных
+  миграций в РАБОЧЕМ коде нет**: `ALTER TABLE` запрещён везде, кроме
+  `scripts/` (`tests/test_schema_single_pass.py::test_no_alter_table_anywhere_in_project`),
+  `run_migrations()` в `services/database.py` не существует и его отсутствие
+  тоже под тестом. Нужна новая колонка в таблице, которая уже на проде, —
+  два законных пути:
+  - **отдельная таблица-sidecar** (прецеденты: `container_supply`,
+    `container_item_links`, `machine_deal_payments`) — по-прежнему первый
+    выбор, если колонка логически отделима;
+  - **колонка в `_create_tables` + разовый `python -m scripts.apply_legacy_columns
+    --apply`** — когда поле принадлежит самой сущности и sidecar ради имени
+    хуже (так приехали `orders.fx_rate_to_base` / `payments.fx_rate_to_base`).
+    Свежая база берёт колонку из определения таблицы, существующую догоняет
+    скрипт; он РУЧНОЙ и со старта не вызывается — стережёт
+    `test_alter_script_is_not_wired_into_startup`. Хвост до T1.1 у него под
+    отдельным `--legacy`: там колонки-призраки, вычищенные в T1.2.
+  Data-миграции и сидинг настроек — в `run_backfills()`, вызывается из
+  `tasks/migrate.py`.
 - Webapp endpoint'ы: `services.async_db as adb` (`await adb.get_user(uid)`) — обёртка через `asyncio.to_thread`. В bot handlers — то же или явный `asyncio.to_thread`.
 - Роль читай через `services.roles.cached_role(user_id)` (TTL 60s) и предикаты `is_boss / can_create_orders / ...`. НЕ через `services.database.get_role` напрямую — обойдёшь кэш. **Деактивация:** `get_role` отдаёт `guest` если `user_roles.deactivated_at` стоит → деактивированный теряет ВСЕ права. `deactivate_user/reactivate_user` (адмін, `/deactivate`/`/reactivate` + webapp `/api/users/deactivate`).
 - Race-чувствительные операции (`mark_order_paid`, `confirm_payment`, `confirm_cash_deposit`) используют `SELECT ... FOR UPDATE` / advisory-lock — сохраняй паттерн.

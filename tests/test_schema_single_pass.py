@@ -27,6 +27,7 @@ FOLDED_COLUMNS = {
         "ms_sync_error",
         "ms_sync_claimed_at",
         "amount_cents",
+        "fx_rate_to_base",
     },
     "orders": {
         "currency",
@@ -57,6 +58,7 @@ FOLDED_COLUMNS = {
         "ms_drift_at",
         "ms_transition_blocked_at",
         "ms_demand_failed_at",
+        "fx_rate_to_base",
     },
     "order_items": {"price_cents", "returned_qty"},
     "credit_limits": {"limit_amount_cents"},
@@ -122,11 +124,19 @@ def test_shipment_requests_keeps_its_approval_columns(isolated_db):
 
 
 def test_no_alter_table_anywhere_in_project():
-    """Инкрементальных миграций в проекте нет. Схема — один CREATE TABLE."""
+    """Инкрементальных миграций в РАБОЧЕМ коде нет. Схема — один CREATE TABLE.
+
+    `scripts/` исключён сознательно и ровно на один файл:
+    `apply_legacy_columns.py` — одноразовый ALTER-скрипт для базы, которая уже
+    развёрнута. Колонка, дописанная в определение таблицы, до прода не доедет
+    (`CREATE TABLE IF NOT EXISTS` существующую таблицу не трогает), и без
+    такого скрипта единственным выходом был бы возврат ALTER'ов в рабочий код.
+    Запускается руками, ничем не импортируется — см. test_alter_script_is_not_wired_into_startup.
+    """
     offenders = []
     for path in PROJECT_ROOT.rglob("*.py"):
         rel = path.relative_to(PROJECT_ROOT)
-        if rel.parts[0] in {".git", ".tools", "node_modules"} or rel.name == pathlib.Path(__file__).name:
+        if rel.parts[0] in {".git", ".tools", "node_modules", "scripts"} or rel.name == pathlib.Path(__file__).name:
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         for lineno, line in enumerate(text.splitlines(), 1):
@@ -136,7 +146,27 @@ def test_no_alter_table_anywhere_in_project():
 
 
 def test_run_migrations_is_gone():
-    """Символа run_migrations больше нет — чтобы его не начали звать заново."""
+    """Символа run_migrations в рабочем коде нет — чтобы его не начали звать заново."""
     import services.database as db
 
     assert not hasattr(db, "run_migrations")
+
+
+def test_alter_script_is_not_wired_into_startup():
+    """ALTER-скрипт остаётся РУЧНЫМ: старт сервисов его не зовёт.
+
+    Смысл выноса в scripts/ ровно в этом. Стоит `tasks/migrate.py` или bot.py
+    его импортировать — и мы снова гоняем DDL на каждом старте каждого
+    процесса, то есть вернулись к тому, что убрали в T1.1 (и к race'у
+    из SECURITY.md H4 при rolling deploy).
+    """
+    startup = [PROJECT_ROOT / "bot.py"] + sorted((PROJECT_ROOT / "tasks").glob("*.py"))
+    offenders = []
+    for path in startup:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if "apply_legacy_columns" in line or "run_migrations" in line:
+                offenders.append(f"{path.relative_to(PROJECT_ROOT)}:{lineno}: {line.strip()}")
+    assert not offenders, (
+        "ALTER-скрипт зовут со старта — он одноразовый и ручной:\n" + "\n".join(offenders)
+    )
