@@ -85,10 +85,44 @@ def _paymentin(ms_id="pay-1", sum_minor=300000, op=("customerorder", "ord-1")):
     return doc
 
 
+def _supply(ms_id="sup-1", name="S001", sum_minor=200000, positions=None, agent=CP_MS):
+    return {
+        "id": ms_id,
+        "name": name,
+        "moment": "2026-02-01 08:00:00.000",
+        "agent": {"meta": {"href": f"https://x/entity/counterparty/{agent}"}, "name": "ООО Ромашка"},
+        "sum": sum_minor,
+        "rate": {"currency": {"name": "USD"}},
+        "description": "",
+        "positions": {
+            "meta": {"size": len(positions or [])},
+            "rows": positions if positions is not None else [_pos(P1_MS, "Труба", 4, 50000)],
+        },
+    }
+
+
+def _paymentout(ms_id="po-1", sum_minor=200000, agent=CP_MS, op=("supply", "sup-1")):
+    doc = {
+        "id": ms_id,
+        "name": "PO001",
+        "moment": "2026-02-02 09:00:00.000",
+        "agent": {"meta": {"href": f"https://x/entity/counterparty/{agent}"}, "name": "ООО Ромашка"},
+        "sum": sum_minor,
+        "rate": {"currency": {"name": "USD"}},
+        "paymentPurpose": "оплата поставщику",
+    }
+    if op:
+        doc["operations"] = [{"meta": {"href": f"https://x/entity/{op[0]}/{op[1]}", "type": op[0]}}]
+    return doc
+
+
 @pytest.fixture
 def ms_api(monkeypatch):
     """Мок HTTP-границы: путь → список строк. Пагинация исполняется настоящая."""
-    state = {"customerorder": [], "demand": [], "paymentin": [], "extra": {}}
+    state = {
+        "customerorder": [], "demand": [], "paymentin": [],
+        "supply": [], "paymentout": [], "extra": {},
+    }
 
     async def fake_ms_get(path, params=None):
         params = params or {}
@@ -139,7 +173,11 @@ def _run(ms_api, *, dry_run=False):
     orders = asyncio.run(mig.pull_orders())
     demands = asyncio.run(mig.pull_demands())
     payments = asyncio.run(mig.pull_payments())
-    return asyncio.run(mig.write_history(orders, demands, payments, dry_run=dry_run))
+    supplies = asyncio.run(mig.pull_supplies())
+    payments_out = asyncio.run(mig.pull_payments_out())
+    return asyncio.run(
+        mig.write_history(orders, demands, payments, supplies, payments_out, dry_run=dry_run)
+    )
 
 
 def _rows(db, sql, params=()):
@@ -438,3 +476,111 @@ def test_truncated_positions_are_refetched(seeded, ms_api):
     stats, _, _ = _run(ms_api)
 
     assert stats["order_items"] == 2, "хвост позиций должен быть дотянут"
+
+
+# ─── Закупочная сторона ──────────────────────────────────────────────────────
+
+
+def test_supply_becomes_incoming_invoice_without_moving_stock(seeded, ms_api):
+    """Приход — тот же принцип, что расход: документ переносим, остаток нет.
+
+    Приход уже сидит в снимке `stock`; повторное оприходование удвоило бы
+    его на весь закупочный оборот.
+    """
+    before = _rows(seeded, "SELECT product_id, quantity FROM stock ORDER BY product_id")
+    ms_api["supply"] = [_supply()]
+
+    stats, _, problems = _run(ms_api)
+
+    assert stats["supplies"] == 1
+    assert problems == []
+    inv = _rows(seeded, "SELECT * FROM invoices")[0]
+    assert inv["type"] == "incoming"
+    assert inv["invoice_number"] == "MS-S-S001", "своя серия для прихода"
+    assert len(_rows(seeded, "SELECT * FROM invoice_items")) == 1
+    assert _rows(seeded, "SELECT product_id, quantity FROM stock ORDER BY product_id") == before
+
+
+def test_payment_out_goes_to_supplier_payments_not_payments(seeded, ms_api):
+    """Платёж поставщику НЕ должен попадать в `payments`.
+
+    Там деньги ОТ клиентов, и на них считается вся дебиторка: исходящий
+    платёж уменьшил бы долг клиента на сумму, выплаченную поставщику.
+    """
+    ms_api["supply"] = [_supply()]
+    ms_api["paymentout"] = [_paymentout()]
+
+    stats, _, _ = _run(ms_api)
+
+    assert stats["payments_out"] == 1
+    assert _rows(seeded, "SELECT * FROM payments") == [], "в payments ничего исходящего"
+    sp = _rows(seeded, "SELECT * FROM supplier_payments")[0]
+    assert sp["amount_cents"] == 200000
+    assert sp["ms_paymentout_id"] == "po-1"
+    cp_id = _rows(seeded, "SELECT id FROM counterparties")[0]["id"]
+    assert sp["counterparty_id"] == cp_id
+    # Платёж привязан к поступлению, на которое ссылается в МС.
+    inv_id = _rows(seeded, "SELECT id FROM invoices WHERE type = 'incoming'")[0]["id"]
+    assert sp["invoice_id"] == inv_id
+
+
+def test_payment_out_without_supplier_is_reported(seeded, ms_api):
+    ms_api["paymentout"] = [_paymentout(ms_id="po-x", agent="cp-UNKNOWN", op=None)]
+
+    stats, unmatched, _ = _run(ms_api)
+
+    assert stats["payments_out_unlinked"] == 1
+    assert stats.get("payments_out", 0) == 0
+    assert any("поставщика нет в справочнике" in k for k in unmatched.buckets)
+    assert _rows(seeded, "SELECT * FROM supplier_payments") == []
+
+
+def test_supply_and_sales_do_not_collide_on_invoice_numbers(seeded, ms_api):
+    """Отгрузка и поступление с ОДИНАКОВЫМ номером документа в МС — законно
+    (нумерация там своя на каждый тип), а `invoices.invoice_number` UNIQUE.
+    Разные префиксы разводят их."""
+    ms_api["customerorder"] = [_order()]
+    ms_api["demand"] = [_demand(name="X1")]
+    ms_api["supply"] = [_supply(name="X1")]
+
+    stats, _, _ = _run(ms_api)
+
+    numbers = {r["invoice_number"] for r in _rows(seeded, "SELECT invoice_number FROM invoices")}
+    assert numbers == {"MS-D-X1", "MS-S-X1"}
+    assert stats["demands"] == 1 and stats["supplies"] == 1
+
+
+def test_supply_rerun_is_idempotent(seeded, ms_api):
+    ms_api["supply"] = [_supply()]
+    ms_api["paymentout"] = [_paymentout()]
+
+    _run(ms_api)
+    _run(ms_api)
+
+    assert len(_rows(seeded, "SELECT * FROM invoices WHERE type = 'incoming'")) == 1
+    assert len(_rows(seeded, "SELECT * FROM invoice_items")) == 1
+    assert len(_rows(seeded, "SELECT * FROM supplier_payments")) == 1
+
+
+def test_supply_positions_mismatch_is_flagged(seeded, ms_api):
+    ms_api["supply"] = [_supply(sum_minor=999999,
+                                positions=[_pos(P1_MS, "Труба", 1, 50000)])]
+
+    _, _, problems = _run(ms_api)
+
+    assert any("поступление" in p and "расходится" in p for p in problems)
+
+
+def test_advance_to_supplier_is_not_an_error(seeded, ms_api):
+    """Выплачено больше, чем поставлено, — это аванс, а не ошибка переноса.
+
+    Помечать его расхождением значило бы утопить настоящие проблемы в шуме.
+    """
+    ms_api["supply"] = [_supply(sum_minor=200000,
+                                positions=[_pos(P1_MS, "Труба", 4, 50000)])]
+    ms_api["paymentout"] = [_paymentout(sum_minor=900000)]
+
+    stats, _, problems = _run(ms_api)
+
+    assert problems == []
+    assert stats["payments_out"] == 1

@@ -313,6 +313,63 @@ async def pull_payments() -> list[dict]:
     return out
 
 
+async def pull_supplies() -> list[dict]:
+    """Поступления от поставщиков (закупки)."""
+    logger.info("Выгружаю поступления (вся история)…")
+    rows = await fetch_paged(
+        "entity/supply",
+        {"expand": "agent,positions.assortment", "order": "moment,asc"},
+    )
+    out = []
+    for sp in rows:
+        out.append(
+            {
+                "ms_id": sp["id"],
+                "name": sp.get("name") or "",
+                "moment": sp.get("moment") or "",
+                "agent_ms_id": _href_id(sp.get("agent")),
+                "agent_name": ((sp.get("agent") or {}).get("name")) or "",
+                "sum_minor": int(sp.get("sum") or 0),
+                "currency": ((sp.get("rate") or {}).get("currency") or {}).get("name") or "",
+                "description": sp.get("description") or "",
+                "positions": await _positions_of("supply", sp),
+            }
+        )
+    logger.info("Поступлений: %d", len(out))
+    return out
+
+
+async def pull_payments_out() -> list[dict]:
+    """Исходящие платежи — расчёты с поставщиками."""
+    logger.info("Выгружаю исходящие платежи (вся история)…")
+    rows = await fetch_paged(
+        "entity/paymentout", {"expand": "agent,operations", "order": "moment,asc"}
+    )
+    out = []
+    for p in rows:
+        op_ids: list[tuple[str, str]] = []
+        for op in p.get("operations") or []:
+            meta = op.get("meta") or {}
+            oid = _href_id(op)
+            if oid:
+                op_ids.append((meta.get("type") or "", oid))
+        out.append(
+            {
+                "ms_id": p["id"],
+                "name": p.get("name") or "",
+                "moment": p.get("moment") or "",
+                "agent_ms_id": _href_id(p.get("agent")),
+                "agent_name": ((p.get("agent") or {}).get("name")) or "",
+                "sum_minor": int(p.get("sum") or 0),
+                "currency": ((p.get("rate") or {}).get("currency") or {}).get("name") or "",
+                "purpose": p.get("paymentPurpose") or "",
+                "operations": op_ids,
+            }
+        )
+    logger.info("Исходящих платежей: %d", len(out))
+    return out
+
+
 # ─── Сопоставление с уже перенесёнными справочниками ──────────────────────────
 
 
@@ -438,6 +495,8 @@ async def write_history(
     orders: list[dict],
     demands: list[dict],
     payments: list[dict],
+    supplies: list[dict] | None = None,
+    payments_out: list[dict] | None = None,
     *,
     dry_run: bool,
 ) -> tuple[dict, Unmatched, list[str]]:
@@ -621,8 +680,73 @@ async def write_history(
                 paid_cents[target] += p["sum_minor"]
                 stats["payments"] += 1
 
+            # ── Поступления (закупки) ────────────────────────────────
+            # Тот же принцип, что у отгрузок: документ переносим, ОСТАТОК НЕ
+            # ТРОГАЕМ. Приход уже сидит в снимке `stock`, и повторное
+            # оприходование удвоило бы его на весь закупочный оборот.
+            supplied_cents: dict[str, int] = defaultdict(int)
+            supply_total_cents: dict[str, int] = {}
+            supply_invoice: dict[str, int] = {}
+            for sp in supplies or []:
+                label = f"поступление {sp['name'] or sp['ms_id']}"
+                cp_id = cp_map.get(sp["agent_ms_id"])
+                if not cp_id:
+                    unmatched.add(
+                        "поступление: поставщика нет в справочнике",
+                        f"{label} — «{sp['agent_name'] or '—'}» "
+                        f"({sp['agent_ms_id'] or 'без agent'})",
+                    )
+                rows = _position_rows(sp["positions"], product_map, label, unmatched)
+                invoice_id = await _write_invoice(
+                    txn, sp, rows,
+                    counterparty_id=cp_id,
+                    order_id=None,
+                    base_cur=base_cur,
+                    now=now,
+                    kind="incoming",
+                )
+                supply_invoice[sp["ms_id"]] = invoice_id
+                doc_total = sum(mul_qty(r["price_cents"], r["quantity"]) for r in rows)
+                supply_total_cents[sp["ms_id"]] = doc_total
+                if cp_id:
+                    supplied_cents[str(cp_id)] += doc_total
+                stats["supplies"] += 1
+                stats["supply_items"] += len(rows)
+
+            # ── Платежи поставщикам ──────────────────────────────────
+            paid_out_cents: dict[str, int] = defaultdict(int)
+            for p in payments_out or []:
+                label = f"исходящий платёж {p['name'] or p['ms_id']} от {p['moment'][:10]}"
+                cp_id = cp_map.get(p["agent_ms_id"])
+                if not cp_id:
+                    # Поставщик обязателен: платёж без него не отнести ни к
+                    # чьим расчётам, и «общая сумма выплат» без разреза по
+                    # контрагенту не отвечает ни на один вопрос.
+                    unmatched.add(
+                        "исходящий платёж: поставщика нет в справочнике",
+                        f"{label} — «{p['agent_name'] or '—'}», "
+                        f"сумма {p['sum_minor'] / 100:.2f}",
+                    )
+                    stats["payments_out_unlinked"] += 1
+                    continue
+                invoice_id = None
+                for op_type, op_id in p["operations"]:
+                    if op_type == "supply" and op_id in supply_invoice:
+                        invoice_id = supply_invoice[op_id]
+                        break
+                await _upsert_payment_out(
+                    txn, p, counterparty_id=cp_id, invoice_id=invoice_id,
+                    base_cur=base_cur, now=now,
+                )
+                paid_out_cents[str(cp_id)] += p["sum_minor"]
+                stats["payments_out"] += 1
+
             problems = _check_consistency(
                 orders, order_total_cents, shipped_cents, paid_cents, order_local
+            )
+            problems += _check_supplier_consistency(supplies or [], supply_total_cents)
+            stats["supplier_debt_agents"] = len(
+                {a for a in supplied_cents if supplied_cents[a] > paid_out_cents.get(a, 0)}
             )
             if dry_run:
                 raise _Rollback
@@ -686,20 +810,29 @@ async def _upsert_order(
 
 async def _write_invoice(
     txn, d: dict, rows: list[dict], *, counterparty_id: int | None,
-    order_id: int, base_cur: str, now: str,
+    order_id: int | None, base_cur: str, now: str, kind: str = "outgoing",
 ) -> int:
-    """Историческая расходная накладная. ОСТАТОК НЕ ДВИГАЕТ.
+    """Историческая накладная (расходная или приходная). ОСТАТОК НЕ ДВИГАЕТ.
 
     Пишем напрямую, минуя `services/warehouse.py`: там каждая проведённая
     накладная сдвигает `stock`, а он уже перенесён снимком на сегодня и все
     эти отгрузки в себя включает. Повторное списание увело бы остаток в минус
     на весь исторический оборот.
 
-    Номер — своей серией `MS-D-<номер в МС>`, `invoice_counters` не трогаем.
+    Номер — своей серией `MS-D-*` (отгрузка) / `MS-S-*` (поступление),
+    `invoice_counters` не трогаем: иначе перенос съел бы номера у живой
+    нумерации, и следующая накладная, выписанная людьми, получила бы номер
+    из середины истории.
     """
     from services.money import mul_qty
 
-    number = f"MS-D-{d['name'] or d['ms_id'][:8]}"
+    prefix = "MS-D" if kind == "outgoing" else "MS-S"
+    number = f"{prefix}-{d['name'] or d['ms_id'][:8]}"
+    comment = (
+        f"Перенос из МойСклад · заказ #{order_id}"
+        if order_id
+        else "Перенос из МойСклад · поступление"
+    )
     existing = await txn.fetchval("SELECT id FROM invoices WHERE invoice_number = $1", number)
     if existing is not None:
         await txn.execute("DELETE FROM invoice_items WHERE invoice_id = $1", int(existing))
@@ -711,7 +844,7 @@ async def _write_invoice(
             _ms_moment_to_local(d["moment"])[:10],
             (d["currency"] or base_cur).upper(),
             sum(mul_qty(r["price_cents"], r["quantity"]) for r in rows),
-            f"Перенос из МойСклад · заказ #{order_id}",
+            comment,
             invoice_id,
         )
     else:
@@ -721,14 +854,14 @@ async def _write_invoice(
         await txn.execute(
             "INSERT INTO invoices (type, counterparty_id, warehouse_id, invoice_number, "
             "invoice_date, status, currency, total_amount_cents, comment, created_by, created_at) "
-            "VALUES ('outgoing', $1, $2, $3, $4, 'confirmed', $5, $6, $7, 0, $8)",
+            f"VALUES ('{kind}', $1, $2, $3, $4, 'confirmed', $5, $6, $7, 0, $8)",
             counterparty_id,
             int(warehouse_id),
             number,
             _ms_moment_to_local(d["moment"])[:10],
             (d["currency"] or base_cur).upper(),
             sum(mul_qty(r["price_cents"], r["quantity"]) for r in rows),
-            f"Перенос из МойСклад · заказ #{order_id}",
+            comment,
             _ms_moment_to_local(d["moment"]) or now,
         )
         invoice_id = int(
@@ -776,6 +909,71 @@ async def _upsert_payment(txn, p: dict, *, order_id: int, base_cur: str, now: st
         "VALUES (0, '', 'Перенос из МойСклад', $1, $2, $3, 'confirmed', $4, $5, $6, $7, $8)",
         p["sum_minor"], currency, comment, order_id, p["ms_id"], fx, moment or now, moment,
     )
+
+
+async def _upsert_payment_out(
+    txn, p: dict, *, counterparty_id: int, invoice_id: int | None,
+    base_cur: str, now: str,
+) -> None:
+    """Платёж поставщику по `ms_paymentout_id` (партиальный UNIQUE в схеме).
+
+    Пишется в `supplier_payments`, а НЕ в `payments`: там деньги ОТ клиентов,
+    на которых считается вся дебиторка. Исходящий платёж, попавший туда,
+    уменьшил бы долг клиента на сумму, выплаченную поставщику.
+    """
+    moment = _ms_moment_to_local(p["moment"])
+    currency = (p["currency"] or base_cur).upper()
+    fx = 1.0 if currency == base_cur else None
+    comment = (
+        f"Перенос из МойСклад · {p['purpose']}" if p["purpose"] else "Перенос из МойСклад"
+    )[:500]
+    existing = await txn.fetchval(
+        "SELECT id FROM supplier_payments WHERE ms_paymentout_id = $1", p["ms_id"]
+    )
+    if existing is not None:
+        await txn.execute(
+            "UPDATE supplier_payments SET counterparty_id = $1, supplier_name = $2, "
+            "amount_cents = $3, currency = $4, comment = $5, invoice_id = $6, "
+            "fx_rate_to_base = $7, paid_at = $8 WHERE id = $9",
+            counterparty_id, p["agent_name"] or None, p["sum_minor"], currency,
+            comment, invoice_id, fx, moment, int(existing),
+        )
+        return
+    await txn.execute(
+        "INSERT INTO supplier_payments (counterparty_id, supplier_name, amount_cents, "
+        "currency, comment, invoice_id, ms_paymentout_id, fx_rate_to_base, paid_at, created_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        counterparty_id, p["agent_name"] or None, p["sum_minor"], currency,
+        comment, invoice_id, p["ms_id"], fx, moment, moment or now,
+    )
+
+
+def _check_supplier_consistency(
+    supplies: list[dict], supply_total_cents: dict[str, int]
+) -> list[str]:
+    """Проверки закупочной стороны.
+
+    Проверяем ровно одно: сумма позиций сошлась с суммой документа МС. Это тот
+    же признак обрезанного состава, что и у продаж — вложенный `positions`
+    молча обрывается на сотой строке.
+
+    Сверки «оплачено ≤ поставлено» здесь НЕТ, и это осознанно: аванс
+    поставщику — обычная практика, выплата вперёд поставки ошибкой переноса не
+    является. Пометить её расхождением значило бы утопить настоящие проблемы
+    в шуме. Разрез по поставщикам отчёт показывает как есть — решение, что с
+    ним делать, за человеком.
+    """
+    problems: list[str] = []
+    for sp in supplies:
+        ms_sum = int(sp.get("sum_minor") or 0)
+        rows_sum = supply_total_cents.get(sp["ms_id"], 0)
+        if ms_sum and abs(ms_sum - rows_sum) > 1:
+            problems.append(
+                f"поступление {sp['name'] or sp['ms_id']}: сумма позиций "
+                f"{rows_sum / 100:.2f} расходится с суммой документа в МС "
+                f"{ms_sum / 100:.2f}"
+            )
+    return problems
 
 
 # ─── Сверка ───────────────────────────────────────────────────────────────────
@@ -828,6 +1026,7 @@ def _money(minor: int) -> str:
 
 def print_report(
     orders: list[dict], demands: list[dict], payments: list[dict],
+    supplies: list[dict], payments_out: list[dict],
     stats: dict, unmatched: Unmatched, problems: list[str], *, dry_run: bool,
 ) -> None:
     head = "ПРЕДПРОСМОТР (в базу НЕ записано)" if dry_run else "ПЕРЕНЕСЕНО"
@@ -841,6 +1040,10 @@ def print_report(
     logger.info("  заказов покупателей : %5d  на %s", len(orders), _money(ms_orders_sum))
     logger.info("  отгрузок            : %5d  на %s", len(demands), _money(ms_demands_sum))
     logger.info("  входящих платежей   : %5d  на %s", len(payments), _money(ms_payments_sum))
+    logger.info("  поступлений (закупки): %4d  на %s",
+                len(supplies), _money(sum(int(x["sum_minor"]) for x in supplies)))
+    logger.info("  исходящих платежей  : %5d  на %s",
+                len(payments_out), _money(sum(int(x["sum_minor"]) for x in payments_out)))
     logger.info("")
     logger.info("Записано в локальные таблицы:")
     logger.info("  orders              : %5d  (оплачено %d · в долг %d)",
@@ -851,6 +1054,10 @@ def print_report(
                 stats.get("demands", 0), stats.get("demand_items", 0))
     logger.info("  payments            : %5d  (не привязано %d)",
                 stats.get("payments", 0), stats.get("payments_unlinked", 0))
+    logger.info("  invoices (приход)   : %5d  (позиций %d)",
+                stats.get("supplies", 0), stats.get("supply_items", 0))
+    logger.info("  supplier_payments   : %5d  (не привязано %d)",
+                stats.get("payments_out", 0), stats.get("payments_out_unlinked", 0))
     if stats.get("multi_demand_orders"):
         logger.info("")
         logger.info("  ⚠ заказов с НЕСКОЛЬКИМИ отгрузками: %d", stats["multi_demand_orders"])
@@ -922,6 +1129,44 @@ async def show_debtors() -> None:
         logger.info("  %s: %s", cur or "—", _money(total))
 
 
+async def show_supplier_balance() -> None:
+    """Расчёты с поставщиками: приход минус выплаты, по контрагентам.
+
+    Долг ПЕРЕД поставщиком и аванс ЕМУ ЖЕ — это одно и то же число с разным
+    знаком, и показывать надо оба: «мы должны» и «мы переплатили» одинаково
+    важны при разговоре с поставщиком.
+    """
+    from services import adb_core
+
+    rows = await adb_core.fetch(
+        "SELECT c.id, c.name, "
+        "  (SELECT COALESCE(SUM(total_amount_cents), 0) FROM invoices "
+        "     WHERE counterparty_id = c.id AND type = 'incoming' "
+        "       AND status = 'confirmed') AS supplied_cents, "
+        "  (SELECT COALESCE(SUM(amount_cents), 0) FROM supplier_payments "
+        "     WHERE counterparty_id = c.id) AS paid_cents "
+        "FROM counterparties c ORDER BY c.name"
+    )
+    interesting = [
+        r for r in rows
+        if int(r["supplied_cents"] or 0) or int(r["paid_cents"] or 0)
+    ]
+    logger.info("")
+    logger.info("═══ РАСЧЁТЫ С ПОСТАВЩИКАМИ ═══")
+    if not interesting:
+        logger.info("  (пусто)")
+        return
+    for r in interesting:
+        supplied = int(r["supplied_cents"] or 0)
+        paid = int(r["paid_cents"] or 0)
+        diff = supplied - paid
+        verdict = "мы должны" if diff > 0 else ("аванс у поставщика" if diff < 0 else "закрыто")
+        logger.info(
+            "  %-32s приход %12s  выплачено %12s  →  %s %s",
+            str(r["name"])[:32], _money(supplied), _money(paid), verdict, _money(abs(diff)),
+        )
+
+
 async def show_totals() -> None:
     """Сводка по типам оплаты. Суммы — из позиций, не из несуществующей колонки."""
     from services import adb_core
@@ -947,12 +1192,16 @@ async def main(mode: str) -> int:
         orders = await pull_orders()
         demands = await pull_demands()
         payments = await pull_payments()
+        supplies = await pull_supplies()
+        payments_out = await pull_payments_out()
 
         stats, unmatched, problems = await write_history(
-            orders, demands, payments, dry_run=(mode == "dry-run")
+            orders, demands, payments, supplies, payments_out,
+            dry_run=(mode == "dry-run"),
         )
         print_report(
-            orders, demands, payments, stats, unmatched, problems,
+            orders, demands, payments, supplies, payments_out,
+            stats, unmatched, problems,
             dry_run=(mode == "dry-run"),
         )
 
@@ -963,6 +1212,7 @@ async def main(mode: str) -> int:
 
         await show_totals()
         await show_debtors()
+        await show_supplier_balance()
         if problems:
             logger.error("")
             logger.error("Перенос ВЫПОЛНЕН, но сверка нашла расхождения — разберите список выше.")
