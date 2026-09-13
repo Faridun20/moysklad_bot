@@ -3259,57 +3259,67 @@ async def create_cash_deposit(
 
 
 async def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_name: str = "") -> dict:
-    """Подтвердить сдачу (атомарно). Каждый покрытый заказ → 'paid'.
+    """Подтвердить сдачу и закрыть покрытые ею заказы — ОДНОЙ транзакцией.
+
     Возвращает {ok, closed_orders}.
 
-    asyncpg Stage 17 (#21): native async. UPDATE статуса сдачи + чтение
-    order_ids — adb_core (как раньше: коммит между ними). Per-order close —
-    своя adb_core.transaction() с SELECT ... FOR UPDATE и guard'ом
-    payment_confirmed=0 (паттерн как в mark_order_paid; параллельные confirm'ы
-    одного заказа не закроют дважды). Helpers/add_audit_log — await/to_thread."""
-    updated = (
-        await adb_core.execute(
+    Раньше статус сдачи коммитился первым, а заказы закрывались потом, каждый
+    своей транзакцией. Падение между ними оставляло сдачу `confirmed` с
+    незакрытыми заказами — и без пути повтора: `status = 'pending'` уже нет,
+    второй вызов отвечал «уже обработана». Теперь либо всё, либо ничего.
+
+    Покрытие считает `services.debts.calc_order_balances(conn=txn)` — тем же
+    правилом, что и `_maybe_close_order_after_payment`: подтверждённые платежи
+    плюс подтверждённые сдачи против суммы за вычетом возвратов. Внутри той же
+    транзакции она видит только что подтверждённую сдачу.
+
+    Замки: advisory-lock по сдаче сериализует два одновременных подтверждения
+    одной и той же; FOR UPDATE на заказах — в порядке id, как и остатки в
+    warehouse: две сдачи по одним заказам в разном порядке иначе получают
+    взаимный deadlock. Guard `payment_confirmed = 0` — последний рубеж.
+    """
+    from services.debts import calc_order_balances
+
+    closed: list[int] = []
+    async with adb_core.transaction() as txn:
+        if USE_POSTGRES:
+            await txn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1))", f"cash_deposit:confirm:{deposit_id}"
+            )
+        rc = await txn.execute(
             "UPDATE cash_deposits SET status = 'confirmed', confirmed_by = $1, confirmed_at = $2 "
             "WHERE id = $3 AND status = 'pending'",
             confirmed_by, now_str(), deposit_id,
         )
-        > 0
-    )
-    if not updated:
-        return {"ok": False, "error": "Сдача уже обработана"}
-    rows = await adb_core.fetch(
-        "SELECT order_id FROM cash_deposit_orders WHERE deposit_id = $1", deposit_id
-    )
-    order_ids = [r["order_id"] for r in rows]
+        if rc <= 0:
+            return {"ok": False, "error": "Сдача уже обработана"}
 
-    closed = []
-    for oid in order_ids:
-        # Покрытие считаем в копейках (без float-эпсилона +0.01). Строку заказа
-        # блокируем FOR UPDATE и закрываем тем же атомарным UPDATE с guard'ом
-        # payment_confirmed=0 — параллельные подтверждения сдач по одному заказу
-        # не закроют его дважды (паттерн как в mark_order_paid).
-        # Покрытие — против суммы за вычетом подтверждённых возвратов (net owed).
-        # net<=0 (полный возврат) не закрываем как «оплачено» — статус ведёт
-        # confirm_return.
-        # Покрытие = подтверждённые сдачи + подтверждённые платежи (в валюте
-        # заказа = базовой; сдачи распределяются только на базовые заказы). Раньше
-        # учитывались только сдачи → заказ, оплаченный наполовину платежом +
-        # наполовину сдачей, не закрывался (WP-05).
-        net_owed_cents = await _order_total_cents(oid) - await _order_confirmed_returns_cents(oid)
-        covered_cents = await _order_confirmed_deposit_cents(
-            oid
-        ) + await _order_confirmed_payment_cents(oid)
-        if net_owed_cents > 0 and covered_cents >= net_owed_cents:
-            async with adb_core.transaction() as txn:
-                if USE_POSTGRES:
-                    await txn.fetchrow("SELECT payment_confirmed FROM orders WHERE id = $1 FOR UPDATE", oid)
-                rc = await txn.execute(
-                    "UPDATE orders SET payment_confirmed = 1, payment_confirmed_at = $1, "
-                    "status = 'paid', updated_at = $2 WHERE id = $3 AND payment_confirmed = 0",
-                    now_str(), now_str(), oid,
-                )
-                if rc > 0:
-                    closed.append(oid)
+        rows = await txn.fetch(
+            "SELECT order_id FROM cash_deposit_orders WHERE deposit_id = $1", deposit_id
+        )
+        order_ids = sorted({int(r["order_id"]) for r in rows})
+        if USE_POSTGRES:
+            for oid in order_ids:
+                await txn.fetchrow("SELECT payment_confirmed FROM orders WHERE id = $1 FOR UPDATE", oid)
+
+        balances = await calc_order_balances(order_ids, conn=txn)
+        for oid in order_ids:
+            bal = balances.get(oid)
+            if bal is None:
+                continue
+            # net <= 0 (полный возврат) — это не «оплачено», статус ведёт
+            # confirm_return.
+            net_owed_cents = bal.total_cents - bal.returns_cents
+            if net_owed_cents <= 0 or bal.remaining_cents > 0:
+                continue
+            rc = await txn.execute(
+                "UPDATE orders SET payment_confirmed = 1, payment_confirmed_at = $1, "
+                "status = 'paid', updated_at = $2 WHERE id = $3 AND payment_confirmed = 0",
+                now_str(), now_str(), oid,
+            )
+            if rc > 0:
+                closed.append(oid)
+
     await asyncio.to_thread(
         add_audit_log,
         confirmed_by,
@@ -3823,6 +3833,34 @@ def get_role(user_id: int) -> str:
         # Деактивированный пользователь теряет все права (#32).
         return "guest"
     return row["role"] if USE_POSTGRES else row[0]
+
+
+def get_role_and_deactivation(user_id: int) -> tuple[str, bool]:
+    """Роль И флаг деактивации одним SELECT'ом — для общего кэша `services.roles`.
+
+    Раньше это были два запроса и два кэша с РАЗНЫМ TTL (роль 60 с,
+    деактивация 30 с), и понижение роли из бота доезжало до webapp позже,
+    чем деактивация. Один запрос, один TTL — и роль, и блок применяются
+    кросс-процессно за одно и то же окно.
+
+    Возвращает ('guest', False) для отсутствующей строки: нет записи — нет
+    прав, а деактивировать нечего.
+    """
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return "guest", False
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q("SELECT role, deactivated_at FROM user_roles WHERE user_id = ?"), (uid,)
+        )
+        row = cur.fetchone()
+    if not row:
+        return "guest", False
+    role = row["role"] if USE_POSTGRES else row[0]
+    deactivated = bool(row["deactivated_at"] if USE_POSTGRES else row[1])
+    return (str(role or "guest"), deactivated)
 
 
 def is_user_deactivated(user_id: int) -> bool:

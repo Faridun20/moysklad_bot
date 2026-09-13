@@ -366,7 +366,9 @@ function sectionTabsFor(section) {
       isBoss: boss,
       isConfirmer: ['admin', 'boss', 'bookkeeper', 'warehouse_keeper'].includes(r),
       canSeeDebts: ['admin', 'boss', 'manager'].includes(r),
-      hasOps: ['admin', 'boss', 'manager', 'warehouse_keeper'].includes(r),
+      // Касса — сдачи наличных, их создают менеджеры: /api/deposits/my и
+      // /create кладовщику не отвечают, и вкладка у него возвращала 403.
+      hasOps: ['admin', 'boss', 'manager'].includes(r),
     });
   }
   return clientsTabs({ isBoss: boss });
@@ -3293,7 +3295,7 @@ function renderOrderEditor() {
     <div class="section-label">Клиент</div>
     <div class="agent-selector" id="agent-selector">
       ${order.agent_name
-        ? `<div class="agent-selected">${icon('building')} ${order.agent_name} <button id="change-agent">Изменить</button></div>`
+        ? `<div class="agent-selected">${icon('building')} ${escapeHtml(order.agent_name)} <button id="change-agent">Изменить</button></div>`
         : `<button class="btn-agent" id="choose-agent">${icon('user')} Выбрать клиента</button>`
       }
     </div>
@@ -3792,16 +3794,19 @@ async function renderPendingRequests() {
       `;
       return;
     }
+    // Имя менеджера, клиент и названия позиций — ввод ДРУГИХ людей, а экран —
+    // босса: без escapeHtml это stored-XSS в сессии, у которой есть
+    // initData и право одобрять заявки с превышением лимита.
     const items = data.requests.map(r => `
       <div class="order-card" data-status="pending">
         <div class="order-header">
           <div>
             <div class="order-title">${icon('clock')} Заявка #${r.id}</div>
-            <div class="order-manager">${icon('user')} ${r.full_name}</div>
+            <div class="order-manager">${icon('user')} ${escapeHtml(r.full_name)}</div>
           </div>
           <span class="order-status c-badge">Ожидает</span>
         </div>
-        ${r.agent_name ? `<div class="order-agent">${icon('building')} ${r.agent_name}</div>` : ''}
+        ${r.agent_name ? `<div class="order-agent">${icon('building')} ${escapeHtml(r.agent_name)}</div>` : ''}
         <div class="order-meta"><span>${r.created_at}</span></div>
         ${(() => {
           const bits = [];
@@ -3822,7 +3827,7 @@ async function renderPendingRequests() {
           </div>` : ''}
         <div class="order-items">
           ${r.items.slice(0, 5).map(it =>
-            `<div class="order-item">• ${it.name}: <b>${it.quantity} ${it.unit}</b></div>`
+            `<div class="order-item">• ${escapeHtml(it.name)}: <b>${Number(it.quantity) || 0} ${escapeHtml(it.unit)}</b></div>`
           ).join('')}
         </div>
         <div class="req-actions">
@@ -5267,7 +5272,7 @@ async function renderCashbox(container, section) {
   const role = currentUser && currentUser.role;
   // Наличные сдаёт тот, кто их физически принимает от клиента (менеджер,
   // кладовщик). Начальство/бухгалтер только ПОДТВЕРЖДАЮТ.
-  const canDeposit = role === 'manager' || role === 'warehouse_keeper';
+  const canDeposit = role === 'manager';
   const isBoss = role === 'admin' || role === 'boss';
 
   // Тянем ТОЛЬКО то, что нужно активной секции (раньше грузилось всё сразу).
@@ -6566,12 +6571,20 @@ async function renderWhInvoiceNew() {
     return;
   }
 
+  // Расход проводит руководство: отгрузка клиенту идёт через заявку и
+  // одобрение, и ручка отвечает менеджеру 403. Переключатель, который
+  // гарантированно ответит отказом, хуже отсутствующего.
+  const canOut = whIsBoss();
+  if (!canOut && whDraft.type === 'outgoing') whDraft.type = 'incoming';
   const isOut = whDraft.type === 'outgoing';
-  content.innerHTML = `
+  const typeSeg = canOut ? `
     <div class="seg-row"><div class="seg">
       <button class="seg-item ${!isOut ? 'active' : ''}" data-whtype="incoming">${icon('box')} Приход</button>
       <button class="seg-item ${isOut ? 'active' : ''}" data-whtype="outgoing">${icon('truck')} Расход</button>
-    </div></div>
+    </div></div>` : `
+    <div class="section-label">${icon('box')} Приход на склад</div>`;
+  content.innerHTML = `
+    ${typeSeg}
 
     <div class="form-row">
       <label class="form-label" for="wh-cp">Контрагент${isOut ? ' *' : ''}</label>

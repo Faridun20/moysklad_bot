@@ -17,26 +17,41 @@ import time
 from config import ADMIN_IDS
 from services.database import (
     VALID_ROLES,
-    get_role as _db_get_role,
-    is_user_deactivated as _db_is_deactivated,
+    get_role_and_deactivation as _db_role_and_deactivation,
 )
 
 # Re-export единого whitelist ролей (определён в services.database, чтобы не
 # было циклического импорта). Используется и в handlers/users для валидации.
 __all__ = ["VALID_ROLES"]
 
-_ROLE_TTL = 60.0  # сек
-_role_cache: dict[int, tuple[float, str]] = {}
+# ─── Один кэш на роль и деактивацию ──────────────────────────────────────────
+#
+# Кэш живёт в памяти КАЖДОГО процесса отдельно: bot и webapp его не делят, и
+# инвалидация из одного процесса до другого не доходит. Единственная гарантия
+# кросс-процессной свежести — TTL. Раньше их было два (роль 60 с, деактивация
+# 30 с) и два запроса: понижение роли из бота доезжало до webapp вдвое позже
+# блокировки. Теперь запись одна — (роль, деактивирован) одним SELECT'ом — и
+# окно одно, 30 с. `_authorize` дёргает оба факта на каждый /api/* запрос, так
+# что объединение ещё и вдвое дешевле по БД.
+_AUTH_TTL = 30.0  # сек
+_ROLE_TTL = _AUTH_TTL  # прежнее имя — на него ссылаются комментарии и доки
+_auth_cache: dict[int, tuple[float, str, bool]] = {}
+
+
+def _auth_entry(user_id: int) -> tuple[str, bool]:
+    entry = _auth_cache.get(user_id)
+    now = time.monotonic()
+    if entry is not None and now - entry[0] < _AUTH_TTL:
+        return entry[1], entry[2]
+    role, deactivated = _db_role_and_deactivation(user_id)
+    _auth_cache[user_id] = (now, role, deactivated)
+    return role, deactivated
 
 
 def _cached_role(user_id: int) -> str:
-    entry = _role_cache.get(user_id)
-    now = time.monotonic()
-    if entry is not None and now - entry[0] < _ROLE_TTL:
-        return entry[1]
-    role = _db_get_role(user_id)
-    _role_cache[user_id] = (now, role)
-    return role
+    role, deactivated = _auth_entry(user_id)
+    # Деактивированный теряет ВСЕ права (#32) — как и get_role в database.
+    return "guest" if deactivated else role
 
 
 # Публичный алиас — для прямого использования в webapp/handlers,
@@ -49,38 +64,26 @@ def cached_role(user_id: int) -> str:
 
 def invalidate_role(user_id: int) -> None:
     """Сбросить кэш роли (вызывать после set_role/delete_user)."""
-    _role_cache.pop(user_id, None)
+    _auth_cache.pop(user_id, None)
 
 
 def invalidate_all_roles() -> None:
-    _role_cache.clear()
-
-
-# ─── Кэш флага деактивации ────────────────────────────────────────────────────
-#
-# `_authorize` в webapp проверяет деактивацию на КАЖДЫЙ /api/* запрос (R1: чтобы
-# уволенный мгновенно терял доступ во всех процессах, минуя 60с-кэш ролей). Без
-# кэша это некэшированный SELECT на каждый запрос — заметная латентность под
-# нагрузкой. Кэшируем на короткий TTL: в процессе-инициаторе деактивация
-# мгновенна (инвалидация ниже), кросс-процессно задержка ≤ _DEACT_TTL — короче
-# прежнего 60с-окна ролевого пути.
-_DEACT_TTL = 30.0  # сек
-_deact_cache: dict[int, tuple[float, bool]] = {}
+    _auth_cache.clear()
 
 
 def cached_is_deactivated(user_id: int) -> bool:
-    entry = _deact_cache.get(user_id)
-    now = time.monotonic()
-    if entry is not None and now - entry[0] < _DEACT_TTL:
-        return entry[1]
-    flag = bool(_db_is_deactivated(user_id))
-    _deact_cache[user_id] = (now, flag)
-    return flag
+    """Флаг деактивации — из того же кэша, что и роль."""
+    return _auth_entry(user_id)[1]
 
 
 def invalidate_deactivated(user_id: int) -> None:
-    """Сбросить кэш флага деактивации (вызывать после deactivate/reactivate)."""
-    _deact_cache.pop(user_id, None)
+    """Сбросить кэш флага деактивации (вызывать после deactivate/reactivate).
+
+    Запись общая с ролью, так что это то же, что invalidate_role, — оставлено
+    отдельным именем: его зовёт database._invalidate_role_cache.
+    """
+    _auth_cache.pop(user_id, None)
+
 
 
 def _has_role(user_id: int, *roles: str) -> bool:

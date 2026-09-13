@@ -30,6 +30,22 @@ def _autosize(ws, max_width: int = 50) -> None:
         ws.column_dimensions[letter].width = min(max(length + 2, 10), max_width)
 
 
+# Символы, с которых Excel начинает ФОРМУЛУ. openpyxl хранит строку с ведущим
+# «=» как формулу (data_type 'f'), и контрагент, названный
+# «=HYPERLINK("http://…","Клиент")», выполнится у босса при открытии файла.
+# Имена приходят от менеджеров, поэтому текстовые ячейки экранируются
+# апострофом — Excel показывает его как обычный текст. Числа не трогаем.
+_FORMULA_LEADERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _text(value) -> str:
+    """Текстовая ячейка без риска стать формулой."""
+    text = "—" if value is None else str(value)
+    if text[:1] in _FORMULA_LEADERS:
+        return "'" + text
+    return text
+
+
 def build_analytics_xlsx(data: dict[str, Any]) -> bytes:
     """Собрать .xlsx из dict аналитики. Возвращает bytes (для send_document).
 
@@ -49,7 +65,7 @@ def build_analytics_xlsx(data: dict[str, Any]) -> bytes:
     ws.append(["Показатель", "Значение"])
     for c in ws[1]:
         c.font = bold
-    ws.append(["Период", data.get("label", "")])
+    ws.append(["Период", _text(data.get("label", ""))])
     ws.append(["Выручка", round(float(data.get("total", 0) or 0), 2)])
     ws.append(["Заказов", data.get("count", 0)])
     ws.append(["Клиентов", data.get("clients", 0)])
@@ -64,7 +80,7 @@ def build_analytics_xlsx(data: dict[str, Any]) -> bytes:
         c.font = bold
     for row in data.get("top_clients", []) or []:
         ws_c.append(
-            [row.get("name", "—"), round(float(row.get("revenue", 0) or 0), 2), row.get("count", 0)]
+            [_text(row.get("name")), round(float(row.get("revenue", 0) or 0), 2), row.get("count", 0)]
         )
     _autosize(ws_c)
 
@@ -75,7 +91,7 @@ def build_analytics_xlsx(data: dict[str, Any]) -> bytes:
         c.font = bold
     for row in data.get("top_managers", []) or []:
         ws_m.append(
-            [row.get("name", "—"), round(float(row.get("revenue", 0) or 0), 2), row.get("count", 0)]
+            [_text(row.get("name")), round(float(row.get("revenue", 0) or 0), 2), row.get("count", 0)]
         )
     _autosize(ws_m)
 
@@ -88,7 +104,7 @@ def build_analytics_xlsx(data: dict[str, Any]) -> bytes:
         profit = row.get("profit")
         ws_p.append(
             [
-                row.get("name", "—"),
+                _text(row.get("name")),
                 row.get("qty", 0),
                 round(float(row.get("sum", 0) or 0), 2),
                 round(float(profit), 2) if profit is not None else "н/д",

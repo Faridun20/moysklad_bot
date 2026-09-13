@@ -200,6 +200,22 @@ def _safe_name(value: str) -> str:
     return keep.replace(" ", "_") or "document"
 
 
+def fill_template(tpl: Path, context: dict, dst: Path) -> None:
+    """Заполнить .docx-шаблон значениями контекста.
+
+    autoescape обязателен: без него «&» или «<» в ФИО должника ломают XML
+    документа (LibreOffice его не откроет), а разметка WordprocessingML в поле
+    формы прошла бы внутрь как есть. Вынесено из `render_pdf` ради теста —
+    LibreOffice для проверки экранирования не нужен, а закрытая в замыкании
+    функция тестируется только через него.
+    """
+    from docxtpl import DocxTemplate
+
+    doc = DocxTemplate(str(tpl))
+    doc.render(context, autoescape=True)
+    doc.save(str(dst))
+
+
 async def render_pdf(doc_type: str, context: dict, out_dir: Path,
                      template_override: str | None = None) -> Path:
     """Заполнить шаблон и сконвертировать в PDF. Возвращает путь к PDF."""
@@ -209,18 +225,11 @@ async def render_pdf(doc_type: str, context: dict, out_dir: Path,
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    def _fill(dst: Path) -> None:
-        from docxtpl import DocxTemplate
-
-        doc = DocxTemplate(str(tpl))
-        doc.render(context)
-        doc.save(str(dst))
-
     with tempfile.TemporaryDirectory() as tmp_name:
         tmp = Path(tmp_name)
         docx_path = tmp / "document.docx"
         # docxtpl синхронный и читает/пишет файлы — уводим с event loop.
-        await asyncio.to_thread(_fill, docx_path)
+        await asyncio.to_thread(fill_template, tpl, context, docx_path)
 
         # -env:UserInstallation обязателен: без него параллельные вызовы
         # soffice дерутся за общий профиль пользователя и виснут.
