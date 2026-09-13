@@ -1376,6 +1376,116 @@ def backfill_local_identifiers() -> dict:
     with get_conn() as conn:
         cur = get_cursor(conn)
         for label, sql in steps:
+            try:
+                cur.execute(sql)
+                stats[label] = max(cur.rowcount, 0)
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.warning("Backfill ссылок (%s): %s", label, e)
+                stats[label] = 0
+
+        # Позиции заказов: в `product_href` лежит ССЫЛКА, id из неё надо
+        # выкусить — в SQL это делается по-разному на двух движках, поэтому
+        # разбираем в Python. Строк немного (только те, что ещё не связаны).
+        try:
+            cur.execute(
+                "SELECT oi.id, oi.order_id, oi.product_href FROM order_items oi "
+                "WHERE oi.product_href IS NOT NULL AND oi.product_href <> '' "
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM order_item_products op WHERE op.item_id = oi.id)"
+            )
+            pending = [dict(r) for r in cur.fetchall()]
+        except Exception as e:
+            logger.warning("Backfill позиций заказов (чтение): %s", e)
+            pending = []
+
+        linked = 0
+        if pending:
+            from utils.helpers import extract_id_from_href
+
+            cur.execute(
+                "SELECT id, legacy_ms_id FROM products WHERE legacy_ms_id IS NOT NULL"
+            )
+            by_ms = {
+                str(r["legacy_ms_id"] if isinstance(r, dict) else r[1]): int(
+                    r["id"] if isinstance(r, dict) else r[0]
+                )
+                for r in cur.fetchall()
+            }
+            stamp = now_str()
+            for row in pending:
+                ms_id = extract_id_from_href(str(row["product_href"] or ""))
+                product_id = by_ms.get(ms_id)
+                if not product_id:
+                    continue
+                try:
+                    cur.execute(
+                        q(
+                            "INSERT INTO order_item_products "
+                            "(item_id, order_id, product_id, created_at) VALUES (?, ?, ?, ?)"
+                        ),
+                        (int(row["id"]), int(row["order_id"]), product_id, stamp),
+                    )
+                    linked += 1
+                except Exception as e:
+                    conn.rollback()
+                    logger.warning("Backfill позиции заказа #%s: %s", row["id"], e)
+            conn.commit()
+        stats["order_items"] = linked
+
+    if any(stats.values()):
+        logger.info("Backfill локальных id: %s", stats)
+    return stats
+
+
+def seed_document_templates() -> int:
+    """Засеять шаблоны юридических документов. Идемпотентно по типу.
+
+    file_path кладём ОТНОСИТЕЛЬНЫЙ (templates/legal/…): шаблон лежит в
+    репозитории и едет с образом. Заменить его своим можно, прописав в этой
+    строке абсолютный путь в томе /app/data — `legal_docs.template_path`
+    предпочитает значение из БД, когда оно задано.
+    """
+    from services.legal_docs import TEMPLATES
+
+    inserted = 0
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        for doc_type, (filename, _lang) in TEMPLATES.items():
+            cur.execute(
+                q("SELECT id FROM document_templates WHERE type = ?"), (doc_type,)
+            )
+            if cur.fetchone():
+                continue
+            cur.execute(
+                q(
+                    "INSERT INTO document_templates (type, file_path, is_active, created_at) "
+                    "VALUES (?, ?, 1, ?)"
+                ),
+                (doc_type, f"templates/legal/{filename}", now_str()),
+            )
+            inserted += 1
+        conn.commit()
+    if inserted:
+        logger.info("Засеяно шаблонов документов: %d", inserted)
+    return inserted
+
+
+def run_migrations():
+    """ALTER TABLE ADD COLUMN — догоняем старые БД до текущей схемы.
+
+    ВЫНЕСЕНО ИЗ init_db (SECURITY.md H4): раньше эти ALTER гонялись на
+    каждом старте каждого процесса. При rolling deploy bot+webapp одно-
+    временные DDL вступали в race с UPDATE-запросами от уже работающих
+    транзакций. Теперь: вызывается явно из `tasks/migrate.py` перед
+    стартом сервисов.
+
+    Идемпотентно: ADD COLUMN если колонка уже есть → SQL ошибка,
+    мы её ловим и идём дальше.
+    """
+    with get_conn() as conn:
+        cur = get_cursor(conn)
         migrations = [
             ("user_roles", "moysklad_employee_id", "TEXT"),
             ("user_roles", "ms_sync_status", "TEXT DEFAULT 'pending'"),
@@ -1526,101 +1636,13 @@ def backfill_local_identifiers() -> dict:
         ]
         applied = 0
         for table, column, col_type in migrations:
-
             try:
-                cur.execute(sql)
-                stats[label] = max(cur.rowcount, 0)
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
                 conn.commit()
-            except Exception as e:
-                conn.rollback()
-                logger.warning("Backfill ссылок (%s): %s", label, e)
-                stats[label] = 0
-
-        # Позиции заказов: в `product_href` лежит ССЫЛКА, id из неё надо
-        # выкусить — в SQL это делается по-разному на двух движках, поэтому
-        # разбираем в Python. Строк немного (только те, что ещё не связаны).
-        try:
-            cur.execute(
-                "SELECT oi.id, oi.order_id, oi.product_href FROM order_items oi "
-                "WHERE oi.product_href IS NOT NULL AND oi.product_href <> '' "
-                "  AND NOT EXISTS ("
-                "    SELECT 1 FROM order_item_products op WHERE op.item_id = oi.id)"
-            )
-            pending = [dict(r) for r in cur.fetchall()]
-        except Exception as e:
-            logger.warning("Backfill позиций заказов (чтение): %s", e)
-            pending = []
-
-        linked = 0
-        if pending:
-            from utils.helpers import extract_id_from_href
-
-            cur.execute(
-                "SELECT id, legacy_ms_id FROM products WHERE legacy_ms_id IS NOT NULL"
-            )
-            by_ms = {
-                str(r["legacy_ms_id"] if isinstance(r, dict) else r[1]): int(
-                    r["id"] if isinstance(r, dict) else r[0]
-                )
-                for r in cur.fetchall()
-            }
-            stamp = now_str()
-            for row in pending:
-                ms_id = extract_id_from_href(str(row["product_href"] or ""))
-                product_id = by_ms.get(ms_id)
-                if not product_id:
-                    continue
-                try:
-                    cur.execute(
-                        q(
-                            "INSERT INTO order_item_products "
-                            "(item_id, order_id, product_id, created_at) VALUES (?, ?, ?, ?)"
-                        ),
-                        (int(row["id"]), int(row["order_id"]), product_id, stamp),
-                    )
-                    linked += 1
-                except Exception as e:
-                    conn.rollback()
-                    logger.warning("Backfill позиции заказа #%s: %s", row["id"], e)
-            conn.commit()
-        stats["order_items"] = linked
-
-    if any(stats.values()):
-        logger.info("Backfill локальных id: %s", stats)
-    return stats
-
-
-def seed_document_templates() -> int:
-    """Засеять шаблоны юридических документов. Идемпотентно по типу.
-
-    file_path кладём ОТНОСИТЕЛЬНЫЙ (templates/legal/…): шаблон лежит в
-    репозитории и едет с образом. Заменить его своим можно, прописав в этой
-    строке абсолютный путь в томе /app/data — `legal_docs.template_path`
-    предпочитает значение из БД, когда оно задано.
-    """
-    from services.legal_docs import TEMPLATES
-
-    inserted = 0
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        for doc_type, (filename, _lang) in TEMPLATES.items():
-            cur.execute(
-                q("SELECT id FROM document_templates WHERE type = ?"), (doc_type,)
-            )
-            if cur.fetchone():
-                continue
-            cur.execute(
-                q(
-                    "INSERT INTO document_templates (type, file_path, is_active, created_at) "
-                    "VALUES (?, ?, 1, ?)"
-                ),
-                (doc_type, f"templates/legal/{filename}", now_str()),
-            )
-            inserted += 1
-        conn.commit()
-    if inserted:
-        logger.info("Засеяно шаблонов документов: %d", inserted)
-    return inserted
+                applied += 1
+            except Exception:
+                conn.rollback()  # Колонка уже существует — норм
+        logger.info("run_migrations: применено %d из %d", applied, len(migrations))
 
 
 def run_backfills():
@@ -4328,7 +4350,11 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
             money.mul_qty(_price_cents(it), it.get("quantity", 0) or 0) for it in items
         )
 
-        def _accum_base(major: float, kind: str) -> None:
+        # m/ocur/snap связываем аргументами по умолчанию: замыкание внутри
+        # цикла иначе смотрит на переменные ПОСЛЕДНЕЙ итерации (ruff B023).
+        # Сейчас функция вызывается тут же, в своей итерации, и поведение
+        # совпадает — но первый же отложенный вызов считал бы чужой заказ.
+        def _accum_base(major: float, kind: str, *, m=m, ocur=ocur, snap=snap) -> None:
             # Снимок курса заказа, иначе текущий курс. None → валюта без курса.
             base_val = convert_to_base_at(major, ocur, snap)
             if base_val is None:
@@ -5994,22 +6020,6 @@ def _status_cas_sql(expected_status: str | tuple[str, ...] | None) -> tuple[str,
     return f" AND status IN ({ph})", list(expected)
 
 
-def update_order_status(
-    order_id: int,
-    status: str,
-    expected_status: str | tuple[str, ...] | None = None,
-) -> bool:
-    """Перевести заказ в статус. Возвращает True, если строка реально изменилась.
-
-    `expected_status` — compare-and-set: UPDATE применяется, только если текущий
-    статус входит в набор. Без него UPDATE безусловный (легаси-вызовы; они
-    закрываются в T2.3/T2.7).
-
-    Зачем CAS: МойСклад мог прислать `Unsuccessful` и перевести заказ
-    pending→rejected, а заявка при этом осталась `pending`. Босс открывал старое
-    сообщение в чате, жал «Одобрить» — и заказ ВОСКРЕСАЛ из rejected в approved
-    с новыми документами в МС (§2.2)."""
-    tail, extra = _status_cas_sql(expected_status)
 def _snapshot_order_fx(order_id: int) -> None:
     """Заморозить курс валюты заказа к BASE_CURRENCY (orders.fx_rate_to_base).
 
@@ -6088,7 +6098,22 @@ def _snapshot_payment_fx(payment_id: int) -> None:
         logger.exception("_snapshot_payment_fx(%s) failed", payment_id)
 
 
-def update_order_status(order_id: int, status: str) -> bool:
+def update_order_status(
+    order_id: int,
+    status: str,
+    expected_status: str | tuple[str, ...] | None = None,
+) -> bool:
+    """Перевести заказ в статус. Возвращает True, если строка реально изменилась.
+
+    `expected_status` — compare-and-set: UPDATE применяется, только если текущий
+    статус входит в набор. Без него UPDATE безусловный (легаси-вызовы; они
+    закрываются в T2.3/T2.7).
+
+    Зачем CAS: МойСклад мог прислать `Unsuccessful` и перевести заказ
+    pending→rejected, а заявка при этом осталась `pending`. Босс открывал старое
+    сообщение в чате, жал «Одобрить» — и заказ ВОСКРЕСАЛ из rejected в approved
+    с новыми документами в МС (§2.2)."""
+    tail, extra = _status_cas_sql(expected_status)
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
