@@ -34,7 +34,7 @@ import json
 import logging
 
 from services import adb_core, warehouse
-from services.database import now_str
+from services.database import USE_POSTGRES, now_str
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +146,17 @@ async def create_product(name: str, *, unit: str = "шт") -> dict:
         # заводят кнопкой, а кнопку можно нажать дважды. Перепроверяем внутри
         # транзакции — UNIQUE на имени нет и быть не должно (тёзки в каталоге
         # законны), поэтому гонку ловим здесь.
+        # Тёзку ловим замком, а не только SELECT'ом: на Postgres (READ
+        # COMMITTED) две одновременные транзакции обе не видят дубля и обе
+        # вставляют — проверка внутри транзакции сама по себе гонку не
+        # закрывает. Advisory-lock по нормализованному имени сериализует
+        # именно тёзок, а не все вставки подряд. UNIQUE на имени по-прежнему
+        # нет и быть не должно: тёзки в каталоге законны.
+        if USE_POSTGRES:
+            await txn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1))",
+                f"product:name:{clean.lower()}",
+            )
         dup = await txn.fetchrow(
             "SELECT id, name FROM products WHERE lower(name) = $1", clean.lower()
         )

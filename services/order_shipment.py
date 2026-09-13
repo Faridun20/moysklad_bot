@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 
 from services import adb_core, warehouse
-from services.database import now_str
+from services.database import USE_POSTGRES, now_str
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +139,24 @@ async def ship_order(order: dict, items: list[dict], *, user_id: int | None = No
 
     try:
         async with adb_core.transaction() as txn:
+            # Идемпотентность — ПОД замком, а не только проверкой выше: два
+            # одновременных вызова (два босса, ретрай на середине) оба видят
+            # «накладной нет» и оба её проводят. Проверка выше остаётся как
+            # дешёвый ранний выход, решает — эта.
+            if USE_POSTGRES:
+                await txn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))", f"ship:order:{order_id}"
+                )
+            locked = await txn.fetchrow(
+                "SELECT invoice_id FROM order_shipment WHERE order_id = $1", order_id
+            )
+            if locked and locked.get("invoice_id"):
+                return {
+                    "ok": True,
+                    "invoice_id": int(locked["invoice_id"]),
+                    "already_shipped": True,
+                    "skipped": [],
+                }
             created = await warehouse.create_invoice_in(
                 txn,
                 invoice_type="outgoing",
@@ -150,9 +168,12 @@ async def ship_order(order: dict, items: list[dict], *, user_id: int | None = No
                 created_by=user_id,
             )
             stamp = now_str()
+            # `AND invoice_id IS NULL` — второй рубеж: строка с прежней
+            # неудачей (failed_at) обновляется, строка с накладной — никогда.
             updated = await txn.execute(
                 "UPDATE order_shipment SET invoice_id = $1, shipped_at = $2, "
-                "failed_at = NULL, error = NULL WHERE order_id = $3",
+                "failed_at = NULL, error = NULL "
+                "WHERE order_id = $3 AND invoice_id IS NULL",
                 int(created["invoice_id"]),
                 stamp,
                 order_id,

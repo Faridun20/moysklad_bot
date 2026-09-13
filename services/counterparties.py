@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 
 from services import adb_core
-from services.database import now_str
+from services.database import USE_POSTGRES, now_str
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +104,17 @@ async def create(
         # Проверка тёзки внутри транзакции: карточку заводят кнопкой, а кнопку
         # можно нажать дважды — и без этого в справочнике оказались бы два
         # одинаковых клиента, между которыми разъехались бы заказы.
+        # Тёзку ловим замком, а не только SELECT'ом: на Postgres (READ
+        # COMMITTED) две одновременные транзакции обе не видят дубля и обе
+        # вставляют — проверка внутри транзакции сама по себе гонку не
+        # закрывает. Advisory-lock по нормализованному имени сериализует
+        # именно тёзок, а не все вставки подряд. UNIQUE на имени по-прежнему
+        # нет и быть не должно: справочник приехал из МойСклад с тёзками.
+        if USE_POSTGRES:
+            await txn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1))",
+                f"counterparty:name:{clean.lower()}",
+            )
         dup = await txn.fetchrow(
             "SELECT id, name FROM counterparties WHERE lower(name) = $1", clean.lower()
         )

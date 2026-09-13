@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from utils.helpers import local_now, redact_token
+from utils.helpers import esc, local_now, redact_token
 from webapp.auth import verify_init_data
 
 # Берём роль из in-memory кэша (TTL 60s) вместо SELECT'а на каждый API-запрос.
@@ -5553,9 +5553,13 @@ async def _notify_bosses_payment_pending(
         summary = await adb.get_order_payment_summary(order_id)
         from config import BASE_CURRENCY
 
-        currency = order.get("currency") or BASE_CURRENCY
-        agent = order.get("agent_name") or "—"
-        due = order.get("due_date") or "—"
+        # Имя клиента и менеджера — пользовательский ввод, а сообщение идёт с
+        # parse_mode=HTML: «ООО <Строй>» иначе ломает разметку, и босс НЕ
+        # получает пуш о платеже, который ждёт его подтверждения.
+        currency = esc(order.get("currency") or BASE_CURRENCY)
+        agent = esc(order.get("agent_name") or "—")
+        due = esc(order.get("due_date") or "—")
+        manager_name = esc(manager_name)
         amount = float(payment.get("amount") or 0)
         fmt = lambda n: f"{int(round(n)):,}".replace(",", " ")
         # summary["remaining"] = total - confirmed (без учёта pending).
@@ -5784,8 +5788,9 @@ async def api_delete_draft(request: Request):
 # ─── API: локальный складской учёт ───────────────────────────────────────────
 #
 # Остатки и накладные ведутся в собственных таблицах (services/warehouse.py),
-# МойСклад здесь не участвует вообще. Права по ТЗ: создание — менеджер и выше,
-# отмена — только босс/админ (отмена двигает остатки назад и правит историю).
+# МойСклад здесь не участвует вообще. Права: приход — менеджер и выше, расход
+# и отмена — только босс/админ. Расход клиенту идёт через заявку и одобрение;
+# прямая расходная накладная обходила бы кредит-лимиты и решение босса.
 
 
 @app.post("/api/wh/stock")
@@ -5921,6 +5926,34 @@ async def api_wh_invoice_create(request: Request):
     inv_type = data.get("type")
     if inv_type not in ("incoming", "outgoing"):
         raise HTTPException(status_code=400, detail="type: incoming или outgoing")
+    # Расход — только руководство. Отгрузка клиенту идёт через заявку и
+    # одобрение (кредит-лимит, override, аудит); прямая расходная накладная
+    # менеджером обходила бы весь этот контур: товар уезжал бы без заказа,
+    # без долга и без решения босса. Приход менеджеру оставлен — приёмка
+    # контейнера это его работа, и остаток от неё только растёт.
+    if inv_type == "outgoing" and get_role(user["id"]) not in ("admin", "boss"):
+        raise HTTPException(
+            status_code=403,
+            detail="Расходную накладную проводит руководство — отгрузка клиенту идёт "
+            "через заявку на отгрузку и её одобрение",
+        )
+
+    invoice_date = str(data.get("invoice_date") or "").strip() or None
+    if invoice_date:
+        from datetime import datetime as _dt
+
+        try:
+            _dt.strptime(invoice_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invoice_date: ожидается YYYY-MM-DD")
+    raw_wh = data.get("warehouse_id")
+    try:
+        # Склад по умолчанию — из справочника, а не «1»: на базе, где первый
+        # склад создан не первым, захардкоженная единица отвергала бы каждую
+        # накладную «склад не найден».
+        warehouse_id = int(raw_wh) if raw_wh else await warehouse.default_warehouse_id()
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="warehouse_id должен быть числом")
 
     raw_items = data.get("items")
     if not isinstance(raw_items, list) or not raw_items:
@@ -5938,11 +5971,11 @@ async def api_wh_invoice_create(request: Request):
     try:
         result = await warehouse.create_invoice(
             invoice_type=inv_type,
-            warehouse_id=int(data.get("warehouse_id") or 1),
+            warehouse_id=warehouse_id,
             counterparty_id=int(counterparty_id) if counterparty_id else None,
             items=raw_items,
             currency=(data.get("currency") or BASE_CURRENCY),
-            invoice_date=(data.get("invoice_date") or None),
+            invoice_date=invoice_date,
             comment=(data.get("comment") or None),
             created_by=user["id"],
         )

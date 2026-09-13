@@ -88,7 +88,7 @@ Variable: новые сервисы (cron'ы) переменную не насл
   Data-миграции и сидинг настроек — в `run_backfills()`, вызывается из
   `tasks/migrate.py`.
 - Webapp endpoint'ы: `services.async_db as adb` (`await adb.get_user(uid)`) — обёртка через `asyncio.to_thread`. В bot handlers — то же или явный `asyncio.to_thread`.
-- Роль читай через `services.roles.cached_role(user_id)` (TTL 60s) и предикаты `is_boss / can_create_orders / ...`. НЕ через `services.database.get_role` напрямую — обойдёшь кэш. **Деактивация:** `get_role` отдаёт `guest` если `user_roles.deactivated_at` стоит → деактивированный теряет ВСЕ права. `deactivate_user/reactivate_user` (адмін, `/deactivate`/`/reactivate` + webapp `/api/users/deactivate`).
+- Роль читай через `services.roles.cached_role(user_id)` (TTL 30s, одна запись кэша с флагом деактивации — один SELECT на оба факта) и предикаты `is_boss / can_create_orders / ...`. НЕ через `services.database.get_role` напрямую — обойдёшь кэш. **Деактивация:** `get_role` отдаёт `guest` если `user_roles.deactivated_at` стоит → деактивированный теряет ВСЕ права. `deactivate_user/reactivate_user` (адмін, `/deactivate`/`/reactivate` + webapp `/api/users/deactivate`).
 - Race-чувствительные операции (`mark_order_paid`, `confirm_payment`, `confirm_cash_deposit`) используют `SELECT ... FOR UPDATE` / advisory-lock — сохраняй паттерн.
 
 **LIKE-поиск по кириллице — только через `lower()`, и он переопределён В ОБОИХ
@@ -110,12 +110,28 @@ Variable: новые сервисы (cron'ы) переменную не насл
 
 **Telegram + WebApp:**
 - Пользовательский ввод в HTML → `utils.helpers.esc()`. Никогда не интерполируй `full_name` / `comment` / `agent_name` / `details` напрямую в `parse_mode="HTML"`.
+- Во фронте то же правило: любое поле, которое ввёл ДРУГОЙ человек
+  (`full_name`, `agent_name`, `product_name`, `unit`, `comment`), в `innerHTML`
+  только через `escapeHtml`. Экран заявок босса рендерит ввод менеджеров —
+  без экранирования это stored-XSS в сессии с правом одобрять; сторож —
+  `app-load.smoke.test.js` («заявки босса: пользовательский текст экранируется»).
+- Excel-выгрузка (`services/excel_export.py`): текстовые ячейки — через
+  `_text()`. openpyxl хранит строку с ведущим `=` как ФОРМУЛУ, и контрагент
+  `=HYPERLINK(...)` выполнится у босса при открытии файла.
 - Каждый `/api/*` endpoint → `_authorize(data, allowed_roles=..., rate_limit_scope=...)`. Default role для новых юзеров — `guest` (нулевые права).
 - Telegram WebApp initData валидируется в `webapp/auth.py` через `hmac.compare_digest`.
 
 **Локальный складской учёт (МойСклад удалён).** Остатки, каталог, контрагенты,
 приход и расход — наши таблицы; интеграции с МойСклад в коде нет вовсе, и
 возвращать её не надо. Что помнить:
+- **Расходную накладную проводит только руководство** (`/api/wh/invoices/create`,
+  `type=outgoing` → admin/boss). Отгрузка клиенту идёт через заявку и
+  одобрение: кредит-лимит, override, аудит. Прямой расход менеджером обходил
+  весь контур — товар уезжал без заказа, без долга и без решения босса. Приход
+  менеджеру оставлен (приёмка — его работа). Фронт переключатель «Расход» не
+  показывает: вкладка/кнопка, которая гарантированно ответит 403, хуже
+  отсутствующей — это же правило держит `clientsTabs` («Воронка» только
+  руководству) и `moneyTabs` («Касса» без кладовщика).
 - **Движение склада — только через `services/warehouse.py`.** Номер, шапка,
   строки и остатки пишутся ОДНОЙ транзакцией; остаток не уходит в минус;
   параллельные накладные по одному товару сериализуются `FOR UPDATE`, а

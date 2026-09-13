@@ -42,6 +42,7 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("backup")
@@ -99,6 +100,24 @@ def _create_backup_postgres(db_url: str, out_path: Path) -> int:
         return _pg_dump_pure_python(db_url, out_path)
 
 
+def _split_password(db_url: str) -> tuple[str, str | None]:
+    """URL без пароля + сам пароль.
+
+    Пароль в argv виден любому пользователю хоста через `ps`, а cron с
+    pg_dump крутится каждую ночь. libpq читает пароль из PGPASSWORD — туда
+    его и отдаём. `unquote`: в URL пароль закодирован (в нём бывает `/`),
+    а в переменной окружения он нужен как есть.
+    """
+    u = urlsplit(db_url)
+    if not u.password:
+        return db_url, None
+    host = u.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"  # IPv6 — обратно в скобки, urlsplit их снимает
+    netloc = f"{u.username or ''}@{host}" + (f":{u.port}" if u.port else "")
+    return urlunsplit(u._replace(netloc=netloc)), unquote(u.password)
+
+
 def _pg_dump_native(db_url: str, out_path: Path) -> int:
     """pg_dump → gzip. Бросает FileNotFoundError если бинарь отсутствует.
 
@@ -106,13 +125,17 @@ def _pg_dump_native(db_url: str, out_path: Path) -> int:
       --no-owner / --no-acl — restore в любую учётную запись
       --clean --if-exists — DROP IF EXISTS перед CREATE (idempotent restore)
     """
-    cmd = ["pg_dump", "--no-owner", "--no-acl", "--clean", "--if-exists", db_url]
+    url_no_pw, password = _split_password(db_url)
+    cmd = ["pg_dump", "--no-owner", "--no-acl", "--clean", "--if-exists", url_no_pw]
+    env = dict(os.environ)
+    if password is not None:
+        env["PGPASSWORD"] = password
     with open(out_path, "wb") as fout:
         gz = gzip.GzipFile(fileobj=fout, mode="wb")
         try:
             # Popen бросит FileNotFoundError если pg_dump нет в PATH —
             # ловим выше для fallback.
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, env=env)
             assert proc.stdout is not None
             while True:
                 chunk = proc.stdout.read(64 * 1024)

@@ -1,8 +1,8 @@
 """WebApp API локального складского учёта: права, идемпотентность, отказы.
 
 FastAPI TestClient; мокаем только границу verify_init_data — БД, роли и
-движение остатков настоящие. Права по ТЗ: создание — менеджер и выше,
-отмена — только босс/админ.
+движение остатков настоящие. Права: приход — менеджер и выше, расход и отмена
+— только босс/админ (расход клиенту идёт через заявку и одобрение).
 """
 
 import asyncio
@@ -165,7 +165,7 @@ def test_outgoing_requires_counterparty(api):
     r = client.post(
         "/api/wh/invoices/create",
         json={
-            "initData": str(ids["mgr"]),
+            "initData": str(ids["boss"]),
             "type": "outgoing",
             "warehouse_id": 1,
             "items": [{"product_id": 1, "quantity": 1, "price_cents": 100}],
@@ -177,7 +177,7 @@ def test_outgoing_requires_counterparty(api):
 def test_insufficient_stock_returns_409_with_code(api):
     """Отказ по остатку — 409 с машиночитаемым кодом, а не 500."""
     client, _db, ids = api
-    r = _outgoing(client, ids["mgr"], qty=5)
+    r = _outgoing(client, ids["boss"], qty=5)
     assert r.status_code == 409, r.text
     body = r.json()
     assert body["ok"] is False
@@ -196,9 +196,9 @@ def test_repeated_create_with_same_key_does_not_double_stock(api):
     client, _db, ids = api
     _incoming(client, ids["mgr"], qty=10)
 
-    first = _outgoing(client, ids["mgr"], qty=3, idempotency_key="form-abc")
+    first = _outgoing(client, ids["boss"], qty=3, idempotency_key="form-abc")
     assert first.status_code == 200, first.text
-    second = _outgoing(client, ids["mgr"], qty=3, idempotency_key="form-abc")
+    second = _outgoing(client, ids["boss"], qty=3, idempotency_key="form-abc")
     assert second.status_code == 200, second.text
     assert second.json()["invoice_id"] == first.json()["invoice_id"]
 
@@ -214,8 +214,8 @@ def test_repeated_create_with_same_key_does_not_double_stock(api):
 def test_different_keys_create_separate_invoices(api):
     client, _db, ids = api
     _incoming(client, ids["mgr"], qty=10)
-    a = _outgoing(client, ids["mgr"], qty=2, idempotency_key="k1")
-    b = _outgoing(client, ids["mgr"], qty=2, idempotency_key="k2")
+    a = _outgoing(client, ids["boss"], qty=2, idempotency_key="k1")
+    b = _outgoing(client, ids["boss"], qty=2, idempotency_key="k2")
     assert a.json()["invoice_id"] != b.json()["invoice_id"]
     stock = client.post("/api/wh/stock", json={"initData": str(ids["mgr"])}).json()
     assert {p["name"]: p["quantity"] for p in stock["products"]}["Болт М8"] == 6.0
@@ -225,9 +225,9 @@ def test_business_refusal_is_replayed_under_same_key(api):
     """Отказ по остатку тоже сохраняется под ключом: ретрай той же формы
     отдаёт тот же ответ, а не пробует списать ещё раз."""
     client, _db, ids = api
-    first = _outgoing(client, ids["mgr"], qty=5, idempotency_key="nope")
+    first = _outgoing(client, ids["boss"], qty=5, idempotency_key="nope")
     assert first.status_code == 409
-    second = _outgoing(client, ids["mgr"], qty=5, idempotency_key="nope")
+    second = _outgoing(client, ids["boss"], qty=5, idempotency_key="nope")
     assert second.json()["code"] == "insufficient_stock"
 
 
@@ -322,7 +322,7 @@ def test_outgoing_sends_pdf_to_linked_client(api):
     _link_telegram(db)
     _incoming(client, ids["mgr"], qty=10)
 
-    r = _outgoing(client, ids["mgr"], qty=2)
+    r = _outgoing(client, ids["boss"], qty=2)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["pdf_sent"] is True
@@ -344,7 +344,7 @@ def test_outgoing_without_telegram_id_saves_and_warns(api):
     client, _db, ids = api
     _incoming(client, ids["mgr"], qty=10)
 
-    r = _outgoing(client, ids["mgr"], qty=2)
+    r = _outgoing(client, ids["boss"], qty=2)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is True
@@ -376,7 +376,7 @@ def test_pdf_send_failure_does_not_roll_back_invoice(api, monkeypatch):
     client, db, ids = api
     _link_telegram(db)
     _incoming(client, ids["mgr"], qty=10)
-    r = _outgoing(client, ids["mgr"], qty=2)
+    r = _outgoing(client, ids["boss"], qty=2)
     assert r.status_code == 200, r.text
     assert r.json()["pdf_sent"] is False
 
@@ -389,7 +389,7 @@ def test_manual_send_after_linking_telegram(api):
     pytest.importorskip("weasyprint", reason="нет weasyprint/системных pango")
     client, db, ids = api
     _incoming(client, ids["mgr"], qty=10)
-    out = _outgoing(client, ids["mgr"], qty=2).json()
+    out = _outgoing(client, ids["boss"], qty=2).json()
     assert out["pdf_sent"] is False
 
     _link_telegram(db)
@@ -406,7 +406,7 @@ def test_manual_send_twice_blocked_without_force(api):
     client, db, ids = api
     _link_telegram(db)
     _incoming(client, ids["mgr"], qty=10)
-    out = _outgoing(client, ids["mgr"], qty=2).json()
+    out = _outgoing(client, ids["boss"], qty=2).json()
     assert out["pdf_sent"] is True
 
     body = {"initData": str(ids["mgr"]), "invoice_id": out["invoice_id"]}
@@ -434,8 +434,74 @@ def test_retry_with_same_key_does_not_resend_pdf(api):
     _link_telegram(db)
     _incoming(client, ids["mgr"], qty=10)
 
-    first = _outgoing(client, ids["mgr"], qty=2, idempotency_key="form-1")
-    second = _outgoing(client, ids["mgr"], qty=2, idempotency_key="form-1")
+    first = _outgoing(client, ids["boss"], qty=2, idempotency_key="form-1")
+    second = _outgoing(client, ids["boss"], qty=2, idempotency_key="form-1")
     assert first.status_code == 200, (first.status_code, first.json())
     assert first.json()["invoice_id"] == second.json()["invoice_id"]
     assert len(ids["bot"].docs) == 1
+
+
+# ─── Расход — только руководству (аудит, п.5) ─────────────────────────────────
+
+
+def test_manager_cannot_create_outgoing_invoice(api):
+    """Прямая расходная накладная менеджером обходила бы заявку, одобрение
+    босса и кредит-лимит: товар уезжал бы клиенту без заказа и без долга."""
+    client, db, ids = api
+    _incoming(client, ids["boss"], qty=10)
+    r = _outgoing(client, ids["mgr"], qty=1)
+    assert r.status_code == 403
+    assert "через заявку" in r.json()["detail"]
+    # Остаток не тронут.
+    stock = client.post("/api/wh/stock", json={"initData": str(ids["mgr"])}).json()
+    assert stock["products"][0]["quantity"] == 10
+
+
+def test_manager_can_still_create_incoming_invoice(api):
+    """Приход менеджеру оставлен: приёмка контейнера — его работа."""
+    client, _db, ids = api
+    assert _incoming(client, ids["mgr"], qty=3).status_code == 200
+
+
+# ─── Валидация даты и склад по умолчанию (аудит, п.11) ────────────────────────
+
+
+def test_bad_invoice_date_is_400_not_500(api):
+    """Раньше `int(date_str[:4])` в warehouse падал ValueError → 500."""
+    client, _db, ids = api
+    r = _incoming(client, ids["mgr"], invoice_date="вчера")
+    assert r.status_code == 400
+    assert "YYYY-MM-DD" in r.json()["detail"]
+
+
+def test_invoice_date_accepted_when_iso(api):
+    client, _db, ids = api
+    r = _incoming(client, ids["mgr"], invoice_date="2026-03-14")
+    assert r.status_code == 200, r.json()
+
+
+def test_missing_warehouse_id_uses_default_not_hardcoded_one(api):
+    """Склад по умолчанию — из справочника, а не «1»."""
+    client, db, ids = api
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        # Единственный склад с id, отличным от 1: захардкоженная единица
+        # отвергла бы накладную «склад не найден».
+        cur.execute(db.q("DELETE FROM warehouses"))
+        cur.execute(db.q("INSERT INTO warehouses (id, name) VALUES (?, ?)"), (7, "Дальний"))
+        conn.commit()
+    body = {
+        "initData": str(ids["mgr"]),
+        "type": "incoming",
+        "items": [{"product_id": 1, "quantity": 2, "price_cents": 100}],
+    }
+    r = client.post("/api/wh/invoices/create", json=body)
+    assert r.status_code == 200, r.json()
+    inv = asyncio.run(_get_invoice(r.json()["invoice_id"]))
+    assert inv["warehouse_id"] == 7
+
+
+async def _get_invoice(invoice_id):
+    from services import warehouse
+
+    return await warehouse.get_invoice(invoice_id)
