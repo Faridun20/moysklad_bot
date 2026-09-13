@@ -21,6 +21,8 @@ python bot.py                              # локально: без Postgres �
 python -m tasks.migrate                    # schema + data миграции, ДО старта сервисов на проде
 python -m scripts.apply_legacy_columns --dry-run   # РАЗОВО: догнать существующую базу
                                            # до текущей схемы (--apply). Не из migrate.
+python -m scripts.migrate_history_from_moysklad --dry-run   # РАЗОВО: история МС
+                                           # (заказы/отгрузки/платежи). Остатки не двигает.
 
 # Cron CLIs (Railway Cron Jobs)
 python -m tasks.run_debts_notify
@@ -149,6 +151,18 @@ Variable: новые сервисы (cron'ы) переменную не насл
   таблица-двойник ради имени поля хуже. Там, где имя врало по существу
   (`order_items.product_href` — это ссылка на документ), связь уехала в
   отдельную таблицу: `order_item_products`, `container_item_products`.
+- **Перенос ИСТОРИИ — `scripts/migrate_history_from_moysklad.py`**, отдельно от
+  переноса справочников. Главное про него: он **НЕ ДВИГАЕТ ОСТАТКИ**. `stock`
+  приехал снимком на сегодня и все исторические отгрузки уже включает, поэтому
+  строки `invoices`/`invoice_items` пишутся НАПРЯМУЮ, мимо
+  `services/warehouse.py` — единственное такое место в проекте. Провести их
+  через warehouse значит списать весь оборот компании второй раз. Сторож —
+  `tests/test_migrate_history.py::test_migration_never_moves_stock`.
+  Идемпотентность — по родным `orders.ms_customerorder_id` /
+  `payments.ms_paymentin_id`, номера накладных — своей серией `MS-D-*` мимо
+  `invoice_counters`. Несопоставленное (отгрузка без заказа, платёж без
+  основания, позиция без карточки) не угадывается и не пропускается молча —
+  уходит в отчёт категорией для ручного разбора.
 - **`scripts/migrate_from_moysklad.py` живёт со СВОИМ клиентом МС.** Он обязан
   пережить удаление интеграции — иначе перенос перестанет воспроизводиться
   ровно тогда, когда ещё может понадобиться (аккаунт МС живёт месяц-другой
