@@ -66,34 +66,12 @@ x-app: &app
   extra_hosts:
     - "host.docker.internal:host-gateway"
   depends_on:
-    postgres: {condition: service_healthy}
     redis: {condition: service_healthy}
   restart: unless-stopped
+  networks:
+    - backend
 
 services:
-  # ─── Хранилища ────────────────────────────────────────────────────────────
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-bot}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD обязателен}
-      POSTGRES_DB: ${POSTGRES_DB:-moysklad_bot}
-      TZ: ${TZ:-Asia/Tashkent}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      # Без healthcheck migrate стартует раньше, чем Postgres примет коннекты,
-      # и падает на первом же запросе.
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bot} -d ${POSTGRES_DB:-moysklad_bot}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    restart: unless-stopped
-    # Наружу не публикуем: к БД ходят только контейнеры этой сети. Нужен
-    # доступ с хоста для psql — раскомментируйте, но лучше через
-    # `docker compose exec postgres psql`.
-    # ports: ["5432:5432"]
-
   redis:
     image: redis:7-alpine
     # appendonly: FSM-состояния (черновики заказов) переживают рестарт.
@@ -133,7 +111,6 @@ services:
       PRINTER_NAME: ${PRINTER_NAME:-Canon_MF272dw}
       BOT_MODE: bot
     depends_on:
-      postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
       migrate: {condition: service_completed_successfully}
 
@@ -149,7 +126,6 @@ services:
       BOT_MODE: webapp
       PORT: "8080"
     depends_on:
-      postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
       migrate: {condition: service_completed_successfully}
     ports:
@@ -197,9 +173,12 @@ services:
     restart: "no"
 
 volumes:
-  pgdata:
   redisdata:
   appdata:
+
+networks:
+  backend:
+    external: true
 
 # ─── crontab хоста ───────────────────────────────────────────────────────────
 # Подставьте свой путь к проекту. `--rm` обязателен, иначе остановленные
