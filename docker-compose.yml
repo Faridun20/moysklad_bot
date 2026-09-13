@@ -24,7 +24,7 @@ x-app: &app
   image: moysklad-bot:local
   env_file: [.env]
   environment:
-    DATABASE_URL: postgresql://${POSTGRES_USER:-bot}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD обязателен}@postgres:5432/${POSTGRES_DB:-moysklad_bot}
+    DATABASE_URL: postgresql://${POSTGRES_USER:-bot}:${POSTGRES_PASSWORD_URLENC:?POSTGRES_PASSWORD_URLENC обязателен}@postgres:5432/${POSTGRES_DB:-moysklad_bot}
     REDIS_URL: redis://redis:6379/0
     # Бизнес-зона. КРИТИЧНО: created_at пишется в кадре контейнера
     # (utils.helpers.local_now), и «сегодня» в аналитике считается в нём же.
@@ -102,7 +102,7 @@ services:
     environment:
       # YAML-мердж не объединяет вложенные мапы: повторяем блок целиком,
       # иначе environment якоря затрётся, а не дополнится.
-      DATABASE_URL: postgresql://${POSTGRES_USER:-bot}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD обязателен}@postgres:5432/${POSTGRES_DB:-moysklad_bot}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-bot}:${POSTGRES_PASSWORD_URLENC:?POSTGRES_PASSWORD_URLENC обязателен}@postgres:5432/${POSTGRES_DB:-moysklad_bot}
       REDIS_URL: redis://redis:6379/0
       TZ: ${TZ:-Asia/Tashkent}
       INVOICE_LOGO_PATH: ${INVOICE_LOGO_PATH:-/app/data/logo.png}
@@ -117,7 +117,7 @@ services:
   webapp:
     <<: *app
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-bot}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD обязателен}@postgres:5432/${POSTGRES_DB:-moysklad_bot}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-bot}:${POSTGRES_PASSWORD_URLENC:?POSTGRES_PASSWORD_URLENC обязателен}@postgres:5432/${POSTGRES_DB:-moysklad_bot}
       REDIS_URL: redis://redis:6379/0
       TZ: ${TZ:-Asia/Tashkent}
       INVOICE_LOGO_PATH: ${INVOICE_LOGO_PATH:-/app/data/logo.png}
