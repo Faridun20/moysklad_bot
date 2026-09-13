@@ -339,27 +339,142 @@ def test_due_date_is_not_invented(seeded, ms_api):
 # ─── «Не удалось сопоставить» вместо угадывания ──────────────────────────────
 
 
-def test_demand_without_order_is_reported_not_guessed(seeded, ms_api):
-    ms_api["customerorder"] = [_order()]
+def test_demand_without_order_becomes_a_sale(seeded, ms_api):
+    """Отгрузка без заказа-основания СТАНОВИТСЯ продажей, а не выбрасывается.
+
+    В этом аккаунте так оформляют почти все продажи (26 заказов против 421
+    отгрузки). Прежнее поведение — «в отчёт и мимо» — теряло 94% истории.
+    Догадки тут нет: у отгрузки свой контрагент, дата, позиции и сумма.
+    """
     ms_api["demand"] = [_demand(ms_id="dem-x", name="D009", order_ms_id=None)]
 
     stats, unmatched, _ = _run(ms_api)
 
-    assert stats.get("demands", 0) == 0, "отгрузка без основания не привязывается наугад"
-    assert any("без заказа" in k for k in unmatched.buckets)
-    assert _rows(seeded, "SELECT * FROM order_shipment") == []
+    assert stats["orders_from_demand"] == 1
+    assert stats["demands"] == 1
+    order = _rows(seeded, "SELECT * FROM orders")[0]
+    assert order["ms_demand_id"] == "dem-x"
+    assert order["ms_customerorder_id"] is None
+    assert order["status"] == "shipped"
+    assert "продажа по отгрузке D009" in order["comment"]
+    assert len(_rows(seeded, "SELECT * FROM order_items")) == 1
+    assert len(_rows(seeded, "SELECT * FROM invoices")) == 1
+    assert len(_rows(seeded, "SELECT * FROM order_shipment")) == 1
+    assert not any("без заказа" in k for k in unmatched.buckets)
 
 
-def test_payment_without_operations_is_reported(seeded, ms_api):
-    ms_api["customerorder"] = [_order()]
+def test_sale_from_demand_is_idempotent(seeded, ms_api):
+    ms_api["demand"] = [_demand(ms_id="dem-x", name="D009", order_ms_id=None)]
+    _run(ms_api)
+    _run(ms_api)
+    assert len(_rows(seeded, "SELECT * FROM orders")) == 1
+    assert len(_rows(seeded, "SELECT * FROM order_items")) == 1
+    assert len(_rows(seeded, "SELECT * FROM invoices")) == 1
+
+
+def test_payment_without_basis_is_allocated_fifo(seeded, ms_api):
+    """Платёж без документа-основания гасит долг СВОЕГО контрагента по FIFO.
+
+    Соглашение, а не факт из МС, — поэтому оно помечено в комментарии строки.
+    Без него 243 платежа не гасили бы ничего, и клиенты выглядели бы
+    должниками на всю сумму отгрузок.
+    """
+    ms_api["customerorder"] = [_order(sum_minor=300000)]
     ms_api["paymentin"] = [_paymentin(ms_id="pay-x", op=None)]
+
+    stats, _, _ = _run(ms_api)
+
+    assert stats["payments_fifo"] == 1
+    assert stats.get("payments_unlinked", 0) == 0
+    pay = _rows(seeded, "SELECT * FROM payments")[0]
+    order_id = _rows(seeded, "SELECT id FROM orders")[0]["id"]
+    assert pay["order_id"] == order_id
+    assert "FIFO" in pay["comment"], "происхождение привязки обязано быть видно"
+
+
+def test_fifo_pays_oldest_order_first(seeded, ms_api):
+    """Порядок гашения — от старых заказов к новым."""
+    old = _order(ms_id="ord-old", name="001", sum_minor=100000,
+                 positions=[_pos(P1_MS, "Труба", 1, 100000)])
+    old["moment"] = "2026-01-01 10:00:00.000"
+    new = _order(ms_id="ord-new", name="002", sum_minor=100000,
+                 positions=[_pos(P1_MS, "Труба", 1, 100000)])
+    new["moment"] = "2026-05-01 10:00:00.000"
+    ms_api["customerorder"] = [new, old]  # порядок выгрузки намеренно обратный
+    ms_api["paymentin"] = [_paymentin(ms_id="pay-x", sum_minor=100000, op=None)]
+
+    _run(ms_api)
+
+    paid = _rows(seeded, "SELECT o.ms_customerorder_id FROM payments p "
+                         "JOIN orders o ON o.id = p.order_id")
+    assert paid[0]["ms_customerorder_id"] == "ord-old"
+
+
+def test_fifo_splits_one_payment_across_orders(seeded, ms_api):
+    """Платёж больше одного заказа гасит следующий: order_id — одно поле на
+    строку, поэтому части пишутся отдельными строками с суффиксом в ms-id."""
+    a = _order(ms_id="ord-a", name="001", sum_minor=100000,
+               positions=[_pos(P1_MS, "Труба", 1, 100000)])
+    a["moment"] = "2026-01-01 10:00:00.000"
+    b = _order(ms_id="ord-b", name="002", sum_minor=100000,
+               positions=[_pos(P1_MS, "Труба", 1, 100000)])
+    b["moment"] = "2026-02-01 10:00:00.000"
+    ms_api["customerorder"] = [a, b]
+    ms_api["paymentin"] = [_paymentin(ms_id="pay-x", sum_minor=150000, op=None)]
+
+    stats, _, _ = _run(ms_api)
+
+    assert stats["payments_fifo_parts"] == 2
+    rows = _rows(seeded, "SELECT amount_cents, ms_paymentin_id FROM payments "
+                         "ORDER BY ms_paymentin_id")
+    assert [r["amount_cents"] for r in rows] == [100000, 50000]
+    assert [r["ms_paymentin_id"] for r in rows] == ["pay-x", "pay-x#2"]
+    assert sum(r["amount_cents"] for r in rows) == 150000, "сумма частей = сумме платежа"
+
+
+def test_split_payment_rerun_does_not_duplicate(seeded, ms_api):
+    a = _order(ms_id="ord-a", name="001", sum_minor=100000,
+               positions=[_pos(P1_MS, "Труба", 1, 100000)])
+    b = _order(ms_id="ord-b", name="002", sum_minor=100000,
+               positions=[_pos(P1_MS, "Труба", 1, 100000)])
+    b["moment"] = "2026-02-01 10:00:00.000"
+    ms_api["customerorder"] = [a, b]
+    ms_api["paymentin"] = [_paymentin(ms_id="pay-x", sum_minor=150000, op=None)]
+
+    _run(ms_api)
+    _run(ms_api)
+
+    rows = _rows(seeded, "SELECT amount_cents FROM payments")
+    assert len(rows) == 2
+    assert sum(r["amount_cents"] for r in rows) == 150000
+
+
+def test_payment_from_unknown_counterparty_is_reported(seeded, ms_api):
+    """Контрагента не угадываем: привязать платёж не к чему."""
+    ms_api["customerorder"] = [_order()]
+    p = _paymentin(ms_id="pay-x", op=None)
+    p["agent"] = {"meta": {"href": "https://x/entity/counterparty/cp-UNKNOWN"}, "name": "Кто-то"}
+    ms_api["paymentin"] = [p]
 
     stats, unmatched, _ = _run(ms_api)
 
     assert stats["payments_unlinked"] == 1
-    assert stats.get("payments", 0) == 0
-    assert any("без документа-основания" in k for k in unmatched.buckets)
+    assert any("контрагента нет в справочнике" in k for k in unmatched.buckets)
     assert _rows(seeded, "SELECT * FROM payments") == []
+
+
+def test_payment_currency_must_match_the_order(seeded, ms_api):
+    """Кросс-валютное гашение запрещено: конверсии при закрытии заказа нет,
+    и UZS-платёж закрыл бы USD-заказ по номиналу копеек."""
+    ms_api["customerorder"] = [_order(sum_minor=300000)]
+    p = _paymentin(ms_id="pay-x", sum_minor=300000, op=None)
+    p["rate"] = {"currency": {"name": "UZS"}}
+    ms_api["paymentin"] = [p]
+
+    stats, unmatched, _ = _run(ms_api)
+
+    assert stats["payments_unlinked"] == 1
+    assert any("непогашенных заказов в этой валюте" in k for k in unmatched.buckets)
 
 
 def test_payment_linked_through_demand(seeded, ms_api):
@@ -442,14 +557,41 @@ def test_overshipment_is_flagged(seeded, ms_api):
     assert any("отгружено" in p for p in problems)
 
 
-def test_overpayment_is_flagged(seeded, ms_api):
+def test_overpayment_leaves_remainder_reported_not_written(seeded, ms_api):
+    """Денег больше, чем выставлено контрагенту: остаток НЕ пишется никуда и
+    уходит в отчёт. Раздать его несуществующим заказам было бы выдумкой."""
     ms_api["customerorder"] = [_order(sum_minor=100000,
                                       positions=[_pos(P1_MS, "Труба", 1, 100000)])]
-    ms_api["paymentin"] = [_paymentin(sum_minor=500000)]
+    ms_api["paymentin"] = [_paymentin(ms_id="pay-x", sum_minor=500000, op=None)]
 
-    _, _, problems = _run(ms_api)
+    stats, unmatched, problems = _run(ms_api)
 
-    assert any("оплачено" in p for p in problems)
+    assert problems == [], "переплата — не расхождение переноса"
+    assert stats["payments_overflow_cents"] == 400000
+    assert any("переплата" in k for k in unmatched.buckets)
+    assert sum(r["amount_cents"] for r in _rows(seeded, "SELECT amount_cents FROM payments")) \
+        == 100000, "записано ровно столько, сколько было на что отнести"
+
+
+def test_fifo_closes_order_and_marks_it_paid(seeded, ms_api):
+    """Полностью покрытый заказ закрывается, недопокрытый остаётся долгом."""
+    full = _order(ms_id="ord-a", name="001", sum_minor=100000,
+                  positions=[_pos(P1_MS, "Труба", 1, 100000)])
+    full["moment"] = "2026-01-01 10:00:00.000"   # старше — гасится первым
+    part = _order(ms_id="ord-b", name="002", sum_minor=100000,
+                  positions=[_pos(P1_MS, "Труба", 1, 100000)])
+    part["moment"] = "2026-02-01 10:00:00.000"
+    ms_api["customerorder"] = [full, part]
+    ms_api["paymentin"] = [_paymentin(ms_id="pay-x", sum_minor=130000, op=None)]
+
+    _run(ms_api)
+
+    closed = _rows(seeded, "SELECT ms_customerorder_id FROM orders "
+                           "WHERE payment_type = 'paid' AND paid_confirmed_at IS NOT NULL")
+    debt = _rows(seeded, "SELECT ms_customerorder_id FROM orders "
+                         "WHERE payment_type = 'credit' AND paid_confirmed_at IS NULL")
+    assert [r["ms_customerorder_id"] for r in closed] == ["ord-a"]
+    assert [r["ms_customerorder_id"] for r in debt] == ["ord-b"]
 
 
 def test_positions_sum_mismatch_with_ms_document_is_flagged(seeded, ms_api):
