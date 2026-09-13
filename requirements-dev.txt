@@ -17,3 +17,8 @@ pytest-cov==7.1.0
 mypy==2.1.0
 # Чтение сгенерированных PDF в тестах юридических документов.
 pypdf==6.18.1
+# E2E (tests/e2e): Chromium грузит WebApp с живого uvicorn, fetch настоящие.
+# Браузер ставится отдельно: `python -m playwright install chromium`; в
+# окружениях с готовым бинарём — PW_CHROMIUM_PATH. Без пакета/браузера e2e
+# пропускаются, остальные тесты этого не замечают.
+playwright==1.62.0

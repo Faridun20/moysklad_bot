@@ -3679,7 +3679,13 @@ function openQuantityInput(name, unit, maxStock, productId) {
       });
       // За время сетевого запроса пользователь мог уйти с экрана / сменить
       // черновик — не пишем результат в чужой DOM (ghost-контент).
-      if (!currentDraftOrder || currentDraftOrder.id !== draftId || currentScreen !== 'orders') {
+      //
+      // Раздел заказов называется 'sales' ('orders' — только алиас в
+      // LEGACY_SCREENS). После переезда на разделы здесь стояло 'orders', и
+      // защита срабатывала ВСЕГДА: позиция уходила на сервер, а в редактор не
+      // попадала, «Отправить заявку» не включалась. Нашёл E2E-сценарий
+      // test_manager_order_to_boss_approval_moves_stock.
+      if (!currentDraftOrder || currentDraftOrder.id !== draftId || currentScreen !== 'sales') {
         clearMainButton();
         return;
       }

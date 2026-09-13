@@ -31,6 +31,9 @@ ignore = ["E501", "B904", "SIM105", "SIM102", "SIM103", "SIM108"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "e2e: настоящий браузер (Playwright/Chromium) против живого uvicorn — медленно, отдельный job в CI",
+]
 
 [tool.coverage.run]
 # Покрытие как искатель дыр (см. CI). Меряем рантайм-код, не тесты.

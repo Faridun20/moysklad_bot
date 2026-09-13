@@ -6,6 +6,8 @@
 pip install -r requirements.txt -r requirements-dev.txt   # dev-зависимости запинены
 
 pytest tests/                              # тесты (SQLite в /tmp, isolated_db fixture; env-дефолты в conftest)
+pytest tests/e2e -m e2e                    # E2E: Chromium против живого uvicorn (playwright из requirements-dev;
+                                           # браузер: python -m playwright install chromium ИЛИ PW_CHROMIUM_PATH)
 ruff check .                               # полный набор из pyproject.toml (E9,F,B,ASYNC,UP,SIM)
 ruff check --select=E9,F63,F7,F82 .        # строгий минимум-гейт (как блокирующий шаг CI)
 mypy                                       # точечно по order_workflow/database/warehouse/order_shipment/
@@ -506,6 +508,22 @@ Telegram это законное самостоятельное состояни
 Мокай ГРАНИЦУ с внешним миром, а не свой код. Урок: баг в `tg_send_message` пережил CI, потому что тесты мокали саму `tg_send_message`. Для исходящих HTTP — `aioresponses` (мок транспорта, реально исполняется сборка URL/payload). БД — настоящая (`isolated_db`), не мок.
 
 Если добавляешь module-level `asyncio.Semaphore`/`Lock` — добавь регресс-тест с 2× `asyncio.run` и contention >cap (см. `tests/test_analytics_parallel.py::test_positions_semaphore_survives_multiple_asyncio_run_with_contention`). Без waiter'а в очереди loop-binding не воспроизводится и landmine ждёт первого «толстого» теста.
+
+**E2E (`tests/e2e/`, маркер `e2e`, отдельный job в CI).** Настоящий Chromium
+(Playwright, sync API) грузит WebApp с живого uvicorn в том же процессе, fetch
+настоящие, БД — `isolated_db`. Закрывает дыру между API-тестами (фронта нет) и
+jsdom-смоуком (сервера нет): первый же прогон нашёл, что диалог количества
+сравнивал `currentScreen` с несуществующим `'orders'` и позиция никогда не
+попадала в редактор — ни один слой ниже этого не видел. Мокается только граница:
+подпись initData (`verify_init_data` → initData = user_id), SDK Telegram
+(`page.route` подменяет `telegram-web-app.js` заглушкой с настоящей по форме
+`MainButton`; жмётся `window.__tgMainClick()`), исходящие в Telegram. Роли —
+настоящие, из `user_roles`. `asyncio.run` из теста нельзя: sync-API Playwright
+держит в потоке работающий loop, поэтому корутины гоняет `e2e.run()` в отдельном
+потоке. Без Playwright/Chromium пакет пропускается; `E2E_REQUIRED=1` (CI)
+превращает пропуск в падение. Бинарь без установки — `PW_CHROMIUM_PATH`.
+Найденный E2E баг закрепляй ещё и быстрым jsdom-регрессом в
+`app-load.smoke.test.js`: он идёт в frontend-job за секунду.
 
 **Фронт — дизайн-система (UI_REBUILD_PLAN, S0–S6).** Поверхности и строки
 списков: `.c-surface` / `.c-surface--list` / `.c-surface--pad` / `.c-row`
