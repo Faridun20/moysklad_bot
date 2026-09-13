@@ -38,6 +38,7 @@
 - **PostgreSQL**: денежное ядро (заказы/платежи/кредит/сдачи/возвраты) — на **`asyncpg`** (native async, `services/adb_core.py`; в тестах `aiosqlite`). Остальное — `psycopg2-binary` + `ThreadedConnectionPool`, обёрнут в `asyncio.to_thread`.
 - **Redis** (опционально) — FSM storage и кэши
 - **WeasyPrint** — печатные формы накладных; **docxtpl + LibreOffice** — расписки
+- **CUPS** (`cups-client`) — печать документов на офисный принтер по кнопке
 - **Деплой**: [Railway](https://railway.app), **Railpack** билд (`railpack.json`) — пошагово в [DEPLOY.md](DEPLOY.md)
 
 ## Быстрый старт
@@ -199,6 +200,7 @@ psql $DATABASE_URL < moysklad-bot-postgres-YYYYMMDD-HHMMSS.sql
 - `/start` — главное меню (кнопка входа в WebApp)
 - `/pay` — платёж в кассу (не привязан к заказу)
 - `/find` — поиск (заказ / платёж / клиент)
+- `/printer` — статус очереди печати (если настроен CUPS)
 
 ### Босс
 - Всё выше +
@@ -247,6 +249,7 @@ psql $DATABASE_URL < moysklad-bot-postgres-YYYYMMDD-HHMMSS.sql
 │   ├── container_receipt.py  Приёмка контейнера приходной накладной
 │   ├── counterparties.py     Справочник контрагентов (поиск по имени и телефону)
 │   ├── invoice_pdf.py        Печатная форма накладной (WeasyPrint)
+│   ├── printing.py           Печать на офисный принтер через CUPS (lp/lpstat)
 │   ├── legal_docs.py         Расписки (docxtpl → LibreOffice → PDF)
 │   ├── order_workflow.py     Машина состояний заказа + апрув/реджект заявки
 │   ├── notifier.py           Отправка в Telegram из любого процесса + TG-сессия
@@ -310,9 +313,8 @@ payment (status=pending)  →  push боссу
 Найденные при последнем аудите вопросы (Critical / High / Medium / Low) —
 см. **[SECURITY.md](SECURITY.md)**. Там же лежит приоритизированный
 top-5 «что чинить первым» и таблица **Closed** с ссылками на коммиты.
-Последние раунды (4-5, май 2026) закрыли cron-стабильность
-(`run_ms_sync_retry` orphan-reaper + init-context + early-noop), MS
-`/positions` pagination и race в `_ms_ttl_cache.cache_clear`.
+Раунды 4-5 (май 2026) закрывали стабильность крон-задач и кэшей интеграции
+с МойСклад — сама интеграция с тех пор удалена, учёт локальный.
 
 ## Документация
 

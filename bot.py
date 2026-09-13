@@ -143,6 +143,7 @@ def register_routers(dp: Dispatcher):
         order_ship,
         machines,
         business,
+        printing,
     )
 
     routers = [
@@ -165,6 +166,9 @@ def register_routers(dp: Dispatcher):
         # добавляет business-апдейты в allowed_updates:
         # `dp.resolve_used_update_types()` выводит их из хендлеров.
         business.router,
+        # Печать документов на офисный принтер (CUPS). Кнопка под печатной
+        # формой + /printer; аналога в WebApp нет — действие физическое.
+        printing.router,
     ]
     for r in routers:
         dp.include_router(r)
