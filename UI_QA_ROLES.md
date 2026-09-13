@@ -23,10 +23,10 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 112._
+_Всего эндпоинтов: 118._
 
 
-### Админ (`admin`) — 105 эндпоинтов
+### Админ (`admin`) — 112 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -135,11 +135,18 @@ _Всего эндпоинтов: 112._
 - `/api/stock`
 - `/api/today`
 - `/api/users/deactivate`
+- `/api/wh/counterparties`
+- `/api/wh/invoices`
+- `/api/wh/invoices/cancel`
+- `/api/wh/invoices/create`
+- `/api/wh/invoices/get`
+- `/api/wh/invoices/send`
+- `/api/wh/stock`
 
 </details>
 
 
-### Руководитель (`boss`) — 102 эндпоинтов
+### Руководитель (`boss`) — 109 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -245,11 +252,18 @@ _Всего эндпоинтов: 112._
 - `/api/search`
 - `/api/stock`
 - `/api/today`
+- `/api/wh/counterparties`
+- `/api/wh/invoices`
+- `/api/wh/invoices/cancel`
+- `/api/wh/invoices/create`
+- `/api/wh/invoices/get`
+- `/api/wh/invoices/send`
+- `/api/wh/stock`
 
 </details>
 
 
-### Менеджер (`manager`) — 52 эндпоинтов
+### Менеджер (`manager`) — 58 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -305,6 +319,12 @@ _Всего эндпоинтов: 112._
 - `/api/search`
 - `/api/stock`
 - `/api/today`
+- `/api/wh/counterparties`
+- `/api/wh/invoices`
+- `/api/wh/invoices/create`
+- `/api/wh/invoices/get`
+- `/api/wh/invoices/send`
+- `/api/wh/stock`
 
 </details>
 
@@ -349,7 +369,6 @@ _Всего эндпоинтов: 112._
 ### Без авторизации
 
 - `/`
-- `/api/ms-webhook/{secret}`
 - `/healthz`
 - `/tg/{secret}`
 
