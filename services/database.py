@@ -662,6 +662,29 @@ def _create_tables():
                 quantity    {qty_type} NOT NULL,
                 price_cents BIGINT
             )""",
+            # Платежи ПОСТАВЩИКАМ (исходящие). Отдельная таблица, а не строка
+            # в `payments`: там лежат деньги ОТ клиентов, и на них считается
+            # вся дебиторка (`services/debts`, `receivables`). Одна запись
+            # исходящего платежа в `payments` уменьшила бы долг клиента на
+            # сумму, которую мы заплатили поставщику, — и расхождение всплыло
+            # бы не в отчёте, а в разговоре с клиентом.
+            #
+            # Заполняется переносом истории из МойСклад
+            # (`scripts/migrate_history_from_moysklad.py`, entity/paymentout).
+            # Долг ПЕРЕД поставщиком = приходные накладные минус эти платежи.
+            f"""CREATE TABLE IF NOT EXISTS supplier_payments (
+                id               {id_type},
+                counterparty_id  BIGINT,
+                supplier_name    TEXT,
+                amount_cents     BIGINT NOT NULL,
+                currency         TEXT NOT NULL DEFAULT 'USD',
+                comment          TEXT,
+                invoice_id       BIGINT,
+                ms_paymentout_id TEXT,
+                fx_rate_to_base  REAL,
+                paid_at          TEXT,
+                created_at       TEXT NOT NULL
+            )""",
             # Счётчик номеров накладных. Инкремент — атомарный UPSERT
             # ... ON CONFLICT DO UPDATE ... RETURNING в транзакции накладной.
             """CREATE TABLE IF NOT EXISTS invoice_counters (
@@ -1088,6 +1111,13 @@ def _create_indexes():
             "ON products(sku) WHERE sku IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_invoice_items_invoice "
             "ON invoice_items(invoice_id)",
+            # Идемпотентность переноса истории: повторный прогон находит
+            # платёж по родному id МойСклад и обновляет, а не создаёт второй.
+            # Партиальный — платежи, заведённые не переносом, не конфликтуют.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_supplier_payments_ms_unique "
+            "ON supplier_payments(ms_paymentout_id) WHERE ms_paymentout_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_supplier_payments_cp "
+            "ON supplier_payments(counterparty_id)",
             "CREATE INDEX IF NOT EXISTS idx_invoices_counterparty "
             "ON invoices(counterparty_id)",
             # Список накладных в WebApp: сортировка по дате, фильтр по типу.
