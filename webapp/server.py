@@ -2538,6 +2538,15 @@ async def api_orders(request: Request):
 
     if role in ("admin", "boss"):
         orders = await adb.get_all_orders()
+    elif role == "warehouse_keeper":
+        # Кладовщик заказов не создаёт — его список это то, что он отгружает:
+        # одобренные (ждут его) и уже отгруженные. «Свои заказы» у него пусты,
+        # и кнопка «Отгрузить» в WebApp никогда не появлялась (нашёл E2E
+        # test_keeper_marks_approved_order_shipped); отгружать он мог только
+        # командой /ship в боте.
+        orders = [
+            o for o in await adb.get_all_orders() if o.get("status") in ("approved", "shipped")
+        ]
     else:
         orders = await adb.get_user_orders(user["id"])
 
@@ -2638,11 +2647,25 @@ async def api_pending_requests(request: Request):
     order_ids = [r["order_id"] for r in requests]
     orders_by_id = await adb.get_orders_by_ids(order_ids) if order_ids else {}
     items_by_order = await adb.get_order_items_by_ids(order_ids) if order_ids else {}
+    # Кредит-контекст (долг + лимит контрагента) — тоже батчем, а не по одной
+    # заявке: по 6 запросов на строку, 60 заявок = 360 запросов. Сторож —
+    # tests/perf/test_query_counts.py::test_pending_requests_are_batched.
+    from services.order_workflow import orders_credit_context
+
+    totals: dict[int, float] = {}
+    for r in requests:
+        items = items_by_order.get(r["order_id"], [])
+        totals[r["order_id"]] = sum(
+            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items
+        )
+    credit_ctx = await orders_credit_context(
+        [(orders_by_id[oid], totals[oid]) for oid in order_ids if oid in orders_by_id]
+    )
     result = []
     for r in requests:
         order = orders_by_id.get(r["order_id"])
         items = items_by_order.get(r["order_id"], []) if order else []
-        total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
+        total = totals[r["order_id"]] if order else 0.0
         ptype = (order.get("payment_type") or "paid") if order else "paid"
         entry = {
             "id": r["id"],
@@ -2664,14 +2687,9 @@ async def api_pending_requests(request: Request):
                 for it in items
             ],
         }
-        # Кредит-контекст для credit-заявок — босс видит долг/лимит ПЕРЕД апрувом,
-        # не уходя в «Лимиты». Общий helper (без double-count, как в боте).
-        if order and order.get("agent_id") and ptype == "credit":
-            from services.order_workflow import order_credit_context
-
-            ctx = await order_credit_context(order, total)
-            if ctx:
-                entry["credit"] = ctx
+        ctx = credit_ctx.get(r["order_id"])
+        if ctx:
+            entry["credit"] = ctx
         result.append(entry)
 
     return JSONResponse({"requests": result})

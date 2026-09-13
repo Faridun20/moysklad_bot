@@ -2143,3 +2143,61 @@ describe('диалог количества дописывает позицию 
     expect(window.__rendered).toBeUndefined();
   });
 });
+
+describe('одобрение заявки при превышении кредитного лимита', () => {
+  // Регресс, найденный E2E (test_over_limit_request_is_approved_only_with_override):
+  // сервер отвечает 200 с needs_override — это вопрос, а не успех. Фронт
+  // показывал «Заявка одобрена», заявка оставалась висеть, а пути «одобрить с
+  // превышением» в WebApp не было вовсе.
+  const driver = (answer) => `
+    currentUser = { role: 'boss', base_currency: 'USD' };
+    window.__calls = [];
+    api = async (path, body) => {
+      window.__calls.push([path, body]);
+      if (body.override) return { ok: true, req_id: body.req_id };
+      return { ok: false, needs_override: true, over: { limit: 100, projected: 300 }, req_id: body.req_id };
+    };
+    renderPendingRequests = async () => { window.__rerendered = true; };
+    window.__alerts = [];
+    window.Telegram.WebApp.showAlert = (m) => window.__alerts.push(m);
+    window.Telegram.WebApp.showConfirm = (m, cb) => { window.__confirmMsg = m; cb(${answer}); };
+    window.__done = handleRequest(7, 'approve');
+  `;
+
+  it('показывает цифры лимита и повторяет запрос с override тем же ключом', async () => {
+    const window = boot(driver(true));
+    await window.__done;
+    expect(window.__confirmMsg).toContain('лимит');
+    expect(window.__confirmMsg).toContain('100');
+    expect(window.__confirmMsg).toContain('300');
+    expect(window.__calls.length).toBe(2);
+    expect(window.__calls[1][1].override).toBe(true);
+    expect(window.__calls[1][1].idempotency_key).toBe(window.__calls[0][1].idempotency_key);
+    expect(window.__alerts.some(a => a.includes('одобрена'))).toBe(true);
+  });
+
+  it('отказ босса не одобряет и не рапортует об успехе', async () => {
+    const window = boot(driver(false));
+    await window.__done;
+    expect(window.__calls.length).toBe(1);
+    expect(window.__alerts).toEqual([]);
+    expect(window.__rerendered).toBeUndefined();
+  });
+});
+
+describe('вход: 403 от /api/me', () => {
+  // Деактивированный сотрудник получал «Нет связи · Ошибка сервера (403)» с
+  // кнопкой «Повторить» — как будто проблема в интернете. Это отказ в
+  // доступе, и говорить надо прямо (нашёл E2E test_deactivated_manager_loses_access).
+  it('рисует экран «доступ не выдан», а не «нет связи»', async () => {
+    const window = makeWindow();
+    window.fetch = async () => ({ ok: false, status: 403, json: async () => ({ detail: 'deactivated' }) });
+    window.eval(read('helpers.js'));
+    window.eval(read('app.js'));
+    await new Promise(r => setTimeout(r, 0));
+    const text = window.document.getElementById('content').textContent;
+    expect(text).toContain('Доступ не выдан');
+    expect(text).toContain('отключён');
+    expect(text).not.toContain('Нет связи');
+  });
+});

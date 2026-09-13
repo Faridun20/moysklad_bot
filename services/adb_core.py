@@ -49,6 +49,13 @@ def _use_postgres() -> bool:
     return bool(os.environ.get("DATABASE_URL", ""))
 
 
+# Сколько секунд ждать чужую пишущую транзакцию SQLite. По умолчанию у
+# sqlite3 это 5 с; под параллельной нагрузкой (tests/perf: восемь одобрений
+# разом, каждое с PDF внутри транзакции) очередь писателей длиннее, и
+# одиночные запросы падали «database is locked». На Postgres не влияет.
+_SQLITE_TIMEOUT = 30
+
+
 def _db_path() -> str:
     return os.environ.get("DB_PATH", os.path.join(tempfile.gettempdir(), "payments.db"))
 
@@ -162,7 +169,7 @@ async def fetch(query: str, *args: Any) -> list[dict]:
     import aiosqlite
 
     sql, params = _to_sqlite(query, args)
-    async with aiosqlite.connect(_db_path()) as conn:
+    async with aiosqlite.connect(_db_path(), timeout=_SQLITE_TIMEOUT) as conn:
         await _register_sqlite_functions(conn)
         conn.row_factory = aiosqlite.Row
         async with conn.execute(sql, params) as cur:
@@ -181,7 +188,7 @@ async def fetchrow(query: str, *args: Any) -> dict | None:
     import aiosqlite
 
     sql, params = _to_sqlite(query, args)
-    async with aiosqlite.connect(_db_path()) as conn:
+    async with aiosqlite.connect(_db_path(), timeout=_SQLITE_TIMEOUT) as conn:
         await _register_sqlite_functions(conn)
         conn.row_factory = aiosqlite.Row
         async with conn.execute(sql, params) as cur:
@@ -199,7 +206,7 @@ async def fetchval(query: str, *args: Any) -> Any:
     import aiosqlite
 
     sql, params = _to_sqlite(query, args)
-    async with aiosqlite.connect(_db_path()) as conn:
+    async with aiosqlite.connect(_db_path(), timeout=_SQLITE_TIMEOUT) as conn:
         await _register_sqlite_functions(conn)
         async with conn.execute(sql, params) as cur:
             row = await cur.fetchone()
@@ -218,7 +225,7 @@ async def execute(query: str, *args: Any) -> int:
     import aiosqlite
 
     sql, params = _to_sqlite(query, args)
-    async with aiosqlite.connect(_db_path()) as conn:
+    async with aiosqlite.connect(_db_path(), timeout=_SQLITE_TIMEOUT) as conn:
         cur = await conn.execute(sql, params)
         await conn.commit()
         return cur.rowcount
@@ -244,9 +251,19 @@ async def transaction():
 
     import aiosqlite
 
-    conn = await aiosqlite.connect(_db_path())
+    conn = await aiosqlite.connect(_db_path(), timeout=_SQLITE_TIMEOUT)
     await _register_sqlite_functions(conn)
     conn.row_factory = aiosqlite.Row
+    # BEGIN IMMEDIATE, а не отложенная транзакция по умолчанию. Транзакция
+    # здесь почти всегда «прочитать остаток → записать»: с DEFERRED чтение
+    # берёт SHARED, запись просит RESERVED, и при втором таком же соседе SQLite
+    # отвечает «database is locked» СРАЗУ, не дожидаясь timeout (апгрейд
+    # блокировки под busy-handler не попадает). А два читателя, прошедшие
+    # проверку остатка одновременно, списывали его дважды — на Postgres от
+    # этого держит FOR UPDATE, на SQLite его нет. IMMEDIATE берёт пишущую
+    # блокировку на входе: писатели выстраиваются в очередь, как на проде.
+    # Нашли нагрузочные тесты (tests/perf/test_load.py).
+    await conn.execute("BEGIN IMMEDIATE")
     try:
         yield _SqliteTxn(conn)
         await conn.commit()

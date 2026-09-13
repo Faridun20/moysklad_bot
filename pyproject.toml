@@ -33,6 +33,7 @@ testpaths = ["tests"]
 addopts = "-ra"
 markers = [
     "e2e: настоящий браузер (Playwright/Chromium) против живого uvicorn — медленно, отдельный job в CI",
+    "perf: счётчики SQL, бенчмарки, нагрузка на живой сервер — отдельный job в CI",
 ]
 
 [tool.coverage.run]
