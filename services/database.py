@@ -167,7 +167,9 @@ def get_conn():
         finally:
             pool.putconn(conn)
     else:
-        conn = sqlite3.connect(DB_PATH)
+        # timeout — ждать чужую пишущую транзакцию (по умолчанию 5 с; под
+        # параллельной нагрузкой tests/perf не хватало).
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         conn.row_factory = sqlite3.Row
         # SQLite встроенный LOWER() — ASCII-only: 'Иванов'→'Иванов' (кириллица
         # не лоуэркейсится). Postgres LOWER() — Unicode-aware. Чтобы LIKE-поиск
@@ -238,11 +240,33 @@ def init_db():
     `python bot.py`. На Railway: `tasks/migrate.py` в pre-start
     команде сервиса, или отдельный Cron Job «one-shot».
     """
+    if not USE_POSTGRES:
+        _enable_sqlite_wal()
     _create_tables()
     _create_indexes()
     _seed_currency_rates()
     _load_predefined_users()
     logger.info("База данных инициализирована (CREATE TABLE only)")
+
+
+def _enable_sqlite_wal() -> None:
+    """SQLite: журнал WAL — читатели не ждут писателя, писатель — читателей.
+
+    В режиме по умолчанию (rollback journal) коммит берёт EXCLUSIVE и на это
+    время останавливает все чтения, а читающая транзакция не даёт писателю
+    закоммитить. Под параллельной нагрузкой (tests/perf: восемь одобрений
+    разом) одиночные SELECT'ы отваливались «database is locked», хотя ждать
+    им было всего сотни миллисекунд. WAL убирает оба ожидания. Настройка
+    хранится В ФАЙЛЕ базы — достаточно выставить один раз при старте.
+    Postgres это не касается: там свой MVCC.
+    """
+    try:
+        with get_conn() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        # Файловая система без поддержки WAL (сетевой диск) — остаёмся на
+        # rollback journal, это не повод не стартовать.
+        logger.warning("SQLite: не удалось включить WAL, остаёмся на rollback journal")
 
 
 def _seed_currency_rates():
@@ -1850,47 +1874,46 @@ async def deposit_remaining_cents_for_orders(
     return out
 
 
-async def get_agent_current_debt(agent_id: str) -> float:
-    """Текущий долг контрагента: сумма непогашенных остатков по его открытым
-    заказам минус подтверждённые возвраты. Открытые = не draft/rejected/
-    cancelled.
+async def get_agents_current_debt(agent_ids: list[str]) -> dict[str, float]:
+    """Текущий долг КАЖДОГО из контрагентов одним проходом: {agent_id: долг}.
 
-    asyncpg #21: native async. #37 (F3): убран N+1 — раньше на каждый заказ
-    звался get_order_payment_summary + отдельный returns-fetchval (горячий путь
-    из-за энфорса лимитов #29). Теперь items/payments/returns берутся батчем,
-    остаток считается в Python (та же формула, что в get_order_payment_summary)."""
-    if not agent_id:
-        return 0.0
-    # Исключаем неактуальные: черновики/отклонённые/отменённые, полностью
-    # оплаченные (в т.ч. через cash deposit → payment_confirmed=1 /
-    # status='paid') и полностью возвращённые.
+    Долг — сумма непогашенных остатков по открытым заказам минус подтверждённые
+    возвраты, в базовой валюте. Открытые = не draft/rejected/cancelled/paid/
+    returned. Заказы всех агентов читаются одним SELECT, позиции/платежи/
+    возвраты/сдачи — батчем по всем заказам, остаток считается в Python (та же
+    формула, что в get_order_payment_summary).
+
+    Ради чего батч: список заявок босса звал долг по каждой заявке отдельно —
+    по 6 запросов на строку, 60 заявок = 360 запросов (нашёл
+    tests/perf/test_query_counts.py::test_pending_requests_are_batched).
+    Контрагенты без открытых заказов в результат не попадают — вызывающий
+    трактует отсутствие как 0.0.
+    """
+    ids = sorted({str(a) for a in agent_ids if a})
+    if not ids:
+        return {}
     from config import BASE_CURRENCY
 
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(ids)))
     rows = await adb_core.fetch(
-        "SELECT id, currency FROM orders WHERE agent_id = $1 "
+        f"SELECT id, currency, agent_id FROM orders WHERE agent_id IN ({placeholders}) "
         "AND status NOT IN ('draft', 'rejected', 'cancelled', 'paid', 'returned') "
         "AND payment_confirmed = 0 AND (ms_deleted_at IS NULL)",
-        agent_id,
+        *ids,
     )
     order_ids = [r["id"] for r in rows]
     if not order_ids:
-        return 0.0
+        return {}
     base_cur = (BASE_CURRENCY or "USD").upper()
     currency_by_order = {r["id"]: (r["currency"] or base_cur) for r in rows}
+    agent_by_order = {r["id"]: str(r["agent_id"]) for r in rows}
 
     items_by_order = await get_order_items_by_ids(order_ids)
     payments_by_order = await get_payments_for_orders(order_ids)
-    # Возвраты и подтверждённые сдачи гасят долг — батч-хелперы (единый источник
-    # с /api/debts, WP-05/06). Сдачи распределяются только на базовые заказы.
     returns_by_order = await get_confirmed_returns_cents_for_orders(order_ids)
     deposits_by_order = await get_confirmed_deposit_cents_for_orders(order_ids)
 
-    # Долг считаем в БАЗОВОЙ валюте: у заказов может быть разная currency, а лимит
-    # один (в базовой). Без конвертации «5 000 000 UZS» и «2000 USD» складывались
-    # как одно число → бессмысленное over/under-limit. convert_to_base кэширован;
-    # если курс валюты не задан — считаем сумму как есть (консервативно, не теряем
-    # долг), как и раньше.
-    debt_base = 0.0
+    debt_base: dict[str, float] = {}
     for oid in order_ids:
         total = sum(
             money.mul_qty(_price_cents(it), it.get("quantity", 0) or 0)
@@ -1905,8 +1928,32 @@ async def get_agent_current_debt(agent_id: str) -> float:
         net_cents = max(0, max(0, total - paid) - returns_by_order.get(oid, 0))
         net_major = float(money.from_cents(net_cents))
         base = convert_to_base(net_major, currency_by_order[oid])
-        debt_base += base if base is not None else net_major
-    return round(debt_base, 2)
+        agent = agent_by_order[oid]
+        debt_base[agent] = debt_base.get(agent, 0.0) + (base if base is not None else net_major)
+    return {a: round(v, 2) for a, v in debt_base.items()}
+
+
+async def get_agent_current_debt(agent_id: str) -> float:
+    """Текущий долг контрагента в базовой валюте. Обёртка над батчем
+    `get_agents_current_debt` — формула долга живёт в одном месте."""
+    if not agent_id:
+        return 0.0
+    return (await get_agents_current_debt([str(agent_id)])).get(str(agent_id), 0.0)
+
+
+async def get_credit_limits(agent_ids: list[str]) -> dict[str, float]:
+    """Лимиты по списку контрагентов одним SELECT; без строки — дефолт из настроек."""
+    ids = sorted({str(a) for a in agent_ids if a})
+    default = float(await asyncio.to_thread(get_setting, "credit_limit_default", 2000.0))
+    if not ids:
+        return {}
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(ids)))
+    rows = await adb_core.fetch(
+        f"SELECT agent_id, limit_amount_cents FROM credit_limits WHERE agent_id IN ({placeholders})",
+        *ids,
+    )
+    found = {str(r["agent_id"]): float(money.from_cents(r["limit_amount_cents"])) for r in rows}
+    return {a: found.get(a, default) for a in ids}
 
 
 async def check_credit_limit(agent_id: str, order_total: float, currency: str | None = None) -> dict:

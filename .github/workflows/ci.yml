@@ -56,9 +56,37 @@ jobs:
         # аналитики, списков), поэтому прежний порог 35 стал бессмысленным.
         # Буфер ~12% защищает от шума метрики и оставляет место рефакторам,
         # но не даёт «забыть» дописать тесты к большим PR'ам.
-        # `-m "not e2e"`: браузерные сценарии идут отдельным job'ом ниже —
-        # здесь Chromium не ставится, и они бы просто пропустились.
-        run: pytest tests/ -m "not e2e" -v --tb=short --cov --cov-report=term-missing --cov-fail-under=55
+        # `-m "not e2e and not perf"`: браузерные сценарии и perf-слой идут
+        # отдельными job'ами ниже — здесь Chromium не ставится, а бенчмарки
+        # с покрытием мерить бессмысленно.
+        run: pytest tests/ -m "not e2e and not perf" -v --tb=short --cov --cov-report=term-missing --cov-fail-under=55
+
+  # Perf (tests/perf): счётчики SQL на горячих ручках (N+1 по масштабированию),
+  # размер/время ответа на больших объёмах, нагрузка на живой сервер
+  # (параллельные заявки и одобрения — гонки, идемпотентность, остаток) и
+  # бенчмарки чистых функций. Порогов по времени у бенчмарков нет — цифры в
+  # лог; блокируют счётчики запросов и инварианты под параллельностью.
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run perf suite
+        env:
+          TELEGRAM_TOKEN: "0:fake-ci-token"
+        run: >-
+          pytest tests/perf -m perf -v --tb=short -s
+          --benchmark-min-rounds=3 --benchmark-columns=min,mean,max,rounds
+          --benchmark-sort=mean
 
   # E2E (tests/e2e): настоящий Chromium грузит WebApp с живого uvicorn,
   # fetch настоящие, БД настоящая (SQLite). Ловит то, до чего не дотягиваются

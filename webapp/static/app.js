@@ -279,6 +279,20 @@ async function showScreen(screen) {
     if (tab) setSectionTab(target, tab);
   }
   currentScreen = screen;
+  // Поколение экрана. Рендер — асинхронный: «Сегодня» ждёт /api/home, список
+  // заказов — /api/orders. Если человек ушёл в другой раздел раньше, чем
+  // пришёл ответ, старый рендер дописывал СВОЙ экран поверх нового: нажал
+  // «Деньги» — увидел главную. Два предохранителя: (1) узел #content
+  // подменяется свежим, и рендер, державший ссылку на старый, пишет в
+  // отсоединённый элемент; (2) рендеры, которые ищут #content заново после
+  // await, сверяют поколение (`screenGen`) и молча выходят. Нашёл E2E
+  // (test_navigating_away_during_load_does_not_bring_old_screen_back).
+  bumpScreenGen();
+  const staleContent = document.getElementById('content');
+  if (staleContent) {
+    const freshContent = staleContent.cloneNode(false);
+    staleContent.replaceWith(freshContent);
+  }
   // Уходя с любого экрана через нав — снимаем «подтвердить закрытие» (его ставит
   // редактор заказа, пока есть несохранённый черновик).
   tg.disableClosingConfirmation && tg.disableClosingConfirmation();
@@ -346,7 +360,15 @@ let stockTab = 'catalog';    // catalog | containers | machines
 let moneyTab = 'confirm';    // confirm | debts | ops | report
 let clientsTab = 'funnel';   // funnel | limits | channel
 
+// Поколение экрана — см. showScreen. Смена вкладки внутри раздела тоже
+// «новый экран»: список заказов, догрузившийся после перехода на «Отчёт»,
+// не должен его затереть.
+let _screenGen = 0;
+function bumpScreenGen() { _screenGen += 1; return _screenGen; }
+function screenGen() { return _screenGen; }
+
 function setSectionTab(section, tab) {
+  bumpScreenGen();
   if (section === 'sales') salesTab = tab;
   else if (section === 'stock') stockTab = tab;
   else if (section === 'money') moneyTab = tab;
@@ -671,6 +693,7 @@ async function renderStock() {
   const content = document.getElementById('content');
   content.innerHTML = stockShellHtml() + loading('Загружаю остатки…');
   wireSectionNav(content, 'stock', renderStockScreen);
+  const gen = screenGen();
 
   if (!stockData) {
     try {
@@ -691,6 +714,8 @@ async function renderStock() {
     }
   }
 
+  // renderStockContent ищет #content заново — не затираем чужой экран.
+  if (gen !== screenGen()) return;
   renderStockContent();
 }
 
@@ -2925,6 +2950,7 @@ function orderDateLabel(key) {
 
 async function renderOrders() {
   const content = document.getElementById('content');
+  const gen = screenGen();
   // Кэш заказов: переключение вкладок (Заказы↔Каталог↔Финансы) не должно
   // каждый раз дёргать /api/orders. Мутации (delete/ship/cancel) ставят
   // ordersData = null — это форсит свежую загрузку ниже.
@@ -2940,6 +2966,9 @@ async function renderOrders() {
       return;
     }
   }
+  // Пока грузились, человек ушёл (другой раздел или вкладка «Отчёт») —
+  // renderOrdersMain ищет #content заново и затёр бы чужой экран.
+  if (gen !== screenGen()) return;
   renderOrdersMain();
 }
 
@@ -4019,6 +4048,7 @@ async function renderSalesReport() {
   // (UI-BUG-04).
   content.innerHTML = salesShellHtml() + loading('Считаю статистику…');
   wireSectionNav(content, 'sales', renderSalesScreen);
+  const gen = screenGen();
   try {
     const body = custom
       ? { initData: _initData, since: analyticsSince, until: _nextDay(analyticsUntil) }
@@ -4035,6 +4065,8 @@ async function renderSalesReport() {
     const data = await response.json();
     analyticsCache[cacheKey] = { ts: Date.now(), data };
     lastAnalyticsData = data;
+    // renderAnalyticsContent ищет #content заново — не пишем в чужой экран.
+    if (gen !== screenGen()) return;
     renderAnalyticsContent(data);
   } catch (e) {
     content.innerHTML = salesShellHtml() + errorBox(e.message);

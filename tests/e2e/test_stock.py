@@ -119,6 +119,8 @@ def test_container_lifecycle_moves_stock_once(open_app, e2e):
     boss.wait_for_selector("#ms-f-name")
     boss.type("#ms-f-name", "Кабель")
     boss.click(f'.c-overlay [data-product="{e2e.ids["product"]}"]')
+    boss.wait_for_selector(f'.c-overlay [data-product="{e2e.ids["product"]}"].picked')
+    boss.wait_for_function("() => document.querySelector('#ms-f-name').value === 'Кабель ВВГ 3x2.5'")
     boss.fill("#ms-f-expected_qty", "10")
     boss.click("#ms-submit")
     boss.wait_for_selector("#cont-arrive")

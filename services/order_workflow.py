@@ -228,6 +228,48 @@ async def order_credit_context(order: dict, total: float) -> dict | None:
     }
 
 
+async def orders_credit_context(orders: list[tuple[dict, float]]) -> dict[int, dict]:
+    """То же, что `order_credit_context`, но для СПИСКА заказов двумя запросами.
+
+    Список заявок босса считал контекст по каждой заявке отдельно — долг
+    контрагента и лимит, по 6 запросов на строку. Здесь долги и лимиты всех
+    контрагентов берутся батчем (`get_agents_current_debt`, `get_credit_limits`),
+    а формула — та же, что в одиночной версии. Ключ результата — order id;
+    paid-заказы и заказы без agent_id в него не попадают.
+    """
+    from services import async_db as adb
+    from services.database import convert_to_base
+
+    credit = [
+        (o, total) for o, total in orders
+        if (o.get("payment_type") or "paid") == "credit" and o.get("agent_id")
+    ]
+    if not credit:
+        return {}
+    agent_ids = [str(o["agent_id"]) for o, _ in credit]
+    debts = await adb.get_agents_current_debt(agent_ids)
+    limits = await adb.get_credit_limits(agent_ids)
+    out: dict[int, dict] = {}
+    for o, total in credit:
+        agent = str(o["agent_id"])
+        debt = float(debts.get(agent, 0.0))
+        limit = float(limits.get(agent, 0.0))
+        total_base = total
+        if o.get("currency"):
+            conv = convert_to_base(total, o["currency"])
+            if conv is not None:
+                total_base = conv
+        counted = o.get("status") in {"pending", "approved", "shipped", "partially_returned"}
+        effective = debt if counted else debt + total_base
+        out[int(o["id"])] = {
+            "current_debt": debt,
+            "limit": limit,
+            "effective_debt": effective,
+            "over_limit": effective > limit,
+        }
+    return out
+
+
 async def resubmit_diff_line(order_id: int, items: list[dict]) -> str:
     """Строка-сводка изменений с момента прошлого reject→draft (#30). Возвращает
     '' если заказ не реджектился ранее. Показывается боссу в уведомлении о

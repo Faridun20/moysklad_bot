@@ -176,3 +176,57 @@ def test_boss_invoice_form_has_both_types(open_app, e2e):
     _open_invoice_form(boss)
     assert boss.locator('[data-whtype="outgoing"]').count() == 1
     assert boss.locator('[data-whtype="incoming"]').count() == 1
+
+
+# ─── Гонка рендеров: ушёл с экрана раньше, чем он загрузился ─────────────────
+
+
+def test_navigating_away_during_load_does_not_bring_old_screen_back(open_app, e2e, monkeypatch):
+    """«Сегодня» грузится полторы секунды; человек уже нажал «Деньги».
+
+    Старый рендер, закончивший после перехода, дописывал свой экран поверх
+    нового: нажал «Деньги» — увидел главную. Ловилось только под нагрузкой
+    (E2E-прогон целиком), здесь задержка сделана явной.
+    """
+    import asyncio
+
+    from services import async_db, database
+
+    orig = database.get_user_orders
+
+    async def slow(*a, **kw):
+        await asyncio.sleep(1.5)
+        return await orig(*a, **kw)
+
+    monkeypatch.setattr(async_db, "get_user_orders", slow, raising=False)
+
+    boss = open_app(e2e.ids["boss"])  # стартует на «Сегодня», /api/home ещё в полёте
+    go(boss, "money")
+    boss.wait_for_selector('.seg-item[data-sect="confirm"]')
+    boss.wait_for_timeout(2500)  # даём старому рендеру шанс «вернуться»
+    assert boss.locator('.seg-item[data-sect="confirm"]').count() == 1
+    assert boss.locator("#content .hero, #content .greeting").count() == 0
+    assert boss.evaluate("document.querySelector('#bottom-nav .nav-item.active')?.dataset.screen") == "money"
+
+
+def test_switching_tab_during_orders_load_keeps_report(open_app, e2e, monkeypatch):
+    """Список заказов ещё грузится, а человек уже открыл «Отчёт» — отчёт остаётся."""
+    import asyncio
+
+    from services import async_db, database
+
+    orig = database.get_all_orders
+
+    async def slow(*a, **kw):
+        await asyncio.sleep(1.5)
+        return await orig(*a, **kw)
+
+    monkeypatch.setattr(async_db, "get_all_orders", slow, raising=False)
+
+    boss = open_app(e2e.ids["boss"])
+    go(boss, "sales")
+    boss.click('.seg-item[data-sect="report"]')
+    boss.wait_for_selector("[data-period]")
+    boss.wait_for_timeout(2500)
+    assert boss.locator("[data-period]").count() > 0, "заказы, догрузившись, затёрли отчёт"
+    assert boss.locator("#btn-new-order, #show-requests").count() == 0
