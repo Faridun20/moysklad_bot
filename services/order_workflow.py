@@ -110,6 +110,24 @@ def _items_key(item: dict) -> str:
     return str(item.get("product_href") or item.get("product_name") or "")
 
 
+def _print_keyboard(invoice_id: int | None):
+    """Кнопка «Распечатать» под печатной формой. `None` — печать недоступна.
+
+    Кнопки нет, если в контейнере не стоит клиент CUPS: обещать действие,
+    которое гарантированно ответит отказом, хуже, чем не предлагать его.
+    """
+    from services import printing
+
+    if not invoice_id or not printing.is_available():
+        return None
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🖨 Распечатать", callback_data=printing.invoice_callback(int(invoice_id)))
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 async def _build_invoice_pdf(invoice_id: int | None, order_id: int) -> tuple[bytes, str] | None:
     """Печатная форма накладной: (bytes, имя файла) или None.
 
@@ -719,12 +737,19 @@ async def approve_shipment_request(
 
             pdf_bytes, pdf_name = pdf_to_send
             caption = f"📄 Печатная форма — заявка #{req_id}"
+            # Печать — ПО КНОПКЕ, а не автоматически: половина печатных форм
+            # уходит на проверку перед отправкой клиенту, и печатать их все
+            # значит переводить бумагу. Клавиатуру собираем здесь же, рядом с
+            # отправкой; формат callback_data — в services.printing, чтобы
+            # producer и хендлер не разъехались.
+            markup = _print_keyboard(invoice_id)
             try:
                 file1 = BufferedInputFile(pdf_bytes, filename=pdf_name)
                 await bot.send_document(
                     chat_id=req["user_id"],
                     document=file1,
                     caption=caption,
+                    reply_markup=markup,
                 )
             except Exception:
                 logger.exception("Не удалось отправить PDF менеджеру")
@@ -735,6 +760,7 @@ async def approve_shipment_request(
                         chat_id=boss_user_id,
                         document=file2,
                         caption=caption,
+                        reply_markup=markup,
                     )
                 except Exception:
                     logger.exception("Не удалось отправить PDF боссу")

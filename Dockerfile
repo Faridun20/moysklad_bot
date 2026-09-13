@@ -44,6 +44,13 @@ FROM python:3.11.9-slim-bookworm
 #       Для полноценного pg_dump подключите репозиторий PGDG и поставьте
 #       postgresql-client-<версия вашего сервера>.
 #
+#   cups-client
+#       `lp` и `lpstat` для печати документов на офисный принтер
+#       (services/printing.py). Это КЛИЕНТ: демона cupsd в контейнере нет и
+#       не нужно — сервер CUPS стоит на хосте, адрес задаётся переменной
+#       CUPS_SERVER (см. docker-compose.yml). ~1 МБ; без пакета печать
+#       выключается сама (printing.is_available), кнопка не рисуется.
+#
 #   tzdata
 #       Контейнер ОБЯЗАН работать в бизнес-зоне: utils.helpers.local_now()
 #       возвращает datetime.now(), и в этом же кадре пишется created_at —
@@ -68,6 +75,7 @@ RUN set -eux; \
         fonts-dejavu-core \
         fonts-liberation \
         postgresql-client \
+        cups-client \
         tzdata \
         ca-certificates; \
     if [ "$WITH_LIBREOFFICE" = "1" ]; then \

@@ -657,6 +657,7 @@ psycopg2 + threadpool + кэш ролей закрывает реальные п
 | Добавить новое поле в заказ | `services/database.py:init_db` (тут CREATE TABLE + migrations) + использовать в `webapp/server.py` API endpoints |
 | Добавить экран в WebApp | `webapp/static/index.html` (nav button), `webapp/static/app.js` (`case '...':` + `render*()`), `webapp/static/style.css` |
 | Добавить команду в боте | новый файл в `handlers/`, зарегистрировать в `bot.py:register_routers` |
+| Изменить печать документов | `services/printing.py` (CUPS) + `handlers/printing.py` (кнопка и `/printer`) |
 | Изменить движение остатка | `services/warehouse.py` (накладные), `services/order_shipment.py` (отгрузка заказа), `services/container_receipt.py` (приёмка) |
 | Изменить дневной пинг / операционную сводку | `tasks/run_ops_monitor.py` (пинг) + `services/ops_summary.py` (сбор) + `webapp/server.py:/api/ops-summary` |
 | Найти ошибку в проде | Railway Logs у нужного сервиса. Долгие SQL логируются как `SQL slow ...` через `SQL_SLOW_MS` (default 200мс) |

@@ -108,6 +108,9 @@ _COMMANDS_MANAGER = [
     # где открыть WebApp дольше, чем набрать два числа.
     BotCommand(command="machines", description="🚜 Машины"),
     BotCommand(command="hours", description="⏱ Моточасы: /hours 12 15200"),
+    # Печать доступна тем же ролям, что получают печатную форму
+    # (can_view_stock: admin/boss/manager) — значит и в автокомплите у них.
+    BotCommand(command="printer", description="🖨 Статус принтера"),
 ]
 _COMMANDS_BOSS = _COMMANDS_MANAGER + [
     BotCommand(command="machine_deals", description="💳 Рассрочки по технике"),
