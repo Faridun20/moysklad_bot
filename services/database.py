@@ -510,15 +510,45 @@ def _create_tables():
                 error_message TEXT,
                 metadata    TEXT
             )""",
-            # Курсы валют → к BASE_CURRENCY (USD по умолчанию). Записываются
-            # вручную через /api/currency/rates админом. Историю изменений
-            # не храним (rate_at_payment-точность — отдельная задача), здесь
-            # «текущий рыночный курс» для UI-сводок.
+            # Курсы валют → к BASE_CURRENCY (USD по умолчанию). «Текущий»
+            # рыночный курс: обновляется авто-задачей tasks/run_fx_sync (ЦБ РУз)
+            # или вручную боссом через /api/currency/rates. Используется для
+            # UI-сводок и как fallback, когда у строки нет снимка курса.
             """CREATE TABLE IF NOT EXISTS currency_rates (
                 currency_code TEXT PRIMARY KEY,
                 rate_to_base  REAL NOT NULL,
                 updated_at    TEXT,
                 updated_by    BIGINT
+            )""",
+            # Дневной архив курсов (история). Пишется tasks/run_fx_sync из CBU
+            # (source='cbu') либо вручную (source='manual'). Нужен для:
+            #   - точки-во-времени конвертации (get_currency_rate_asof) и
+            #     бэкфилла снимков прошлым заказам/платежам;
+            #   - аудита движения курса.
+            # PK (currency_code, rate_date) — один курс на валюту в день.
+            """CREATE TABLE IF NOT EXISTS currency_rate_daily (
+                currency_code TEXT NOT NULL,
+                rate_date     TEXT NOT NULL,
+                rate_to_base  REAL NOT NULL,
+                source        TEXT,
+                created_at    TEXT NOT NULL,
+                PRIMARY KEY (currency_code, rate_date)
+            )""",
+            # Per-user overrides прав (PR #44 / tech debt #3c).
+            # Существующий enum-based system (admin/boss/manager/...) остаётся
+            # как «дефолт по роли» — см. services.roles.ROLE_DEFAULTS. Эта
+            # таблица позволяет админу точечно выдать или отозвать право
+            # конкретному юзеру, не создавая новую роль. has_permission()
+            # сначала смотрит сюда, потом falls back к ROLE_DEFAULTS.
+            # granted: 1 = explicit grant (даже если роль не имеет),
+            #          0 = explicit revoke (даже если роль имеет по дефолту).
+            """CREATE TABLE IF NOT EXISTS user_permissions (
+                user_id         BIGINT NOT NULL,
+                permission_code TEXT NOT NULL,
+                granted         INTEGER NOT NULL DEFAULT 1,
+                updated_at      TEXT,
+                updated_by      BIGINT,
+                PRIMARY KEY (user_id, permission_code)
             )""",
             # Цены товаров, выставленные руководством (PR C).
             # sale_price — минимальная цена продажи: при добавлении товара
@@ -1346,6 +1376,157 @@ def backfill_local_identifiers() -> dict:
     with get_conn() as conn:
         cur = get_cursor(conn)
         for label, sql in steps:
+        migrations = [
+            ("user_roles", "moysklad_employee_id", "TEXT"),
+            ("user_roles", "ms_sync_status", "TEXT DEFAULT 'pending'"),
+            ("user_roles", "created_at", "TEXT"),
+            # Цена за единицу для позиции заказа (в основной валюте,
+            # т.е. как пользователь ввёл — например 150.50 USD).
+            # При создании demand в МойСклад умножаем на 100 (минорные единицы).
+            ("order_items", "price", "REAL DEFAULT 0"),
+            # Валюта заказа (USD/UZS/RUB/EUR). По умолчанию BASE_CURRENCY.
+            # Хранится на уровне ордера, чтобы все позиции одного заказа
+            # были в одной валюте.
+            ("orders", "currency", "TEXT"),
+            # Тип оплаты: 'paid' (оплачено сразу) или 'credit' (в долг).
+            # Default 'paid' — все старые заказы считаем как оплаченные,
+            # чтобы миграция была безопасной (не объявить вдруг весь
+            # архив должниками).
+            ("orders", "payment_type", "TEXT NOT NULL DEFAULT 'paid'"),
+            # Дата к которой клиент обязался погасить долг (ISO YYYY-MM-DD).
+            # Заполняется только когда payment_type='credit', NULL иначе.
+            ("orders", "due_date", "TEXT"),
+            # Когда долг был погашен (ISO YYYY-MM-DD HH:MM:SS). NULL пока
+            # не погашен. Для 'paid' заказов также NULL — там оплата
+            # сразу, отдельный timestamp не нужен (есть created_at).
+            ("orders", "paid_at", "TEXT"),
+            # Двухступенчатое подтверждение оплаты:
+            #  - paid_at:           менеджер отметил «деньги получил»
+            #  - paid_confirmed_*:  босс/админ подтвердил «да, в кассе»
+            # Заказ считается реально оплаченным ТОЛЬКО когда оба поля
+            # заполнены. Если босс отклонил — paid_at обнуляется (см.
+            # reject_payment_received), цикл начинается заново.
+            ("orders", "paid_confirmed_at", "TEXT"),
+            ("orders", "paid_confirmed_by", "BIGINT"),
+            ("orders", "paid_confirmed_by_name", "TEXT"),
+            # Связь платежа с заказом. Если payment.order_id IS NOT NULL —
+            # это «частичная оплата по заказу N», а не самостоятельный платёж
+            # в кассу. У одного заказа может быть несколько payments
+            # (клиент платит частями). Когда суммa confirmed payments >=
+            # order.total, заказ автоматически считается закрытым.
+            ("payments", "order_id", "BIGINT"),
+            # ID документа Demand в МойСклад, созданного при approve
+            # отгрузки. Нужен чтобы paymentin привязывался к конкретной
+            # отгрузке (operations field в API МойСклад). NULL если
+            # отгрузка ещё не отправлена или create_demand упал.
+            # LEGACY: новые заказы используют ms_customerorder_id ниже.
+            ("orders", "ms_demand_id", "TEXT"),
+            # ID «Заказа покупателя» (customerorder) в МойСклад.
+            # Новый workflow — бот создаёт именно customerorder, а не
+            # demand. paymentin привязывается сюда через operations
+            # вместо ms_demand_id для новых заказов.
+            ("orders", "ms_customerorder_id", "TEXT"),
+            # ID входящего платежа (paymentin) в МойСклад. Заполняется
+            # после успешного create_paymentin. Защищает от дубликатов:
+            # повторный confirm не плодит новые paymentin'ы в МойСклад.
+            ("payments", "ms_paymentin_id", "TEXT"),
+            # Статус синхронизации с МойСклад: NULL (ещё не пробовали),
+            # 'synced', 'failed' (с описанием в ms_sync_error).
+            ("payments", "ms_sync_status", "TEXT"),
+            ("payments", "ms_sync_error", "TEXT"),
+            # ─── IMPLEMENTATION.md Фаза 2 (адаптировано: BOOLEAN→INTEGER 0/1,
+            #     JSONB→TEXT, NUMERIC→REAL, без FK). Все колонки аддитивны. ──────
+            # users → у нас user_roles (telegram-id как PK).
+            ("user_roles", "active", "INTEGER NOT NULL DEFAULT 1"),
+            ("user_roles", "email", "TEXT"),
+            ("user_roles", "phone", "TEXT"),
+            ("user_roles", "deactivated_at", "TEXT"),
+            ("user_roles", "deactivated_by", "BIGINT"),
+            # orders
+            ("orders", "deleted_at", "TEXT"),
+            ("orders", "rejection_comment", "TEXT"),
+            ("orders", "rejection_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "frozen", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "cancelled_at", "TEXT"),
+            ("orders", "cancelled_by", "BIGINT"),
+            ("orders", "cancellation_reason", "TEXT"),
+            # Когда отмена была отражена в МойСклад (реверс customerorder).
+            # NULL = ещё не синхронизировано; идемпотентность ms_cancel.
+            ("orders", "ms_cancel_synced_at", "TEXT"),
+            # Когда документ заказа был обнаружен УДАЛЁННЫМ в МойСклад (вебхук
+            # customerorder.DELETE / cron-реконсиляция). Помечает «фантомные»
+            # заказы (особенно shipped/paid, чей статус мы не трогаем) — они
+            # исключаются из аналитики менеджеров, но остаются в учёте долгов
+            # для ручной разборки. NULL = в МС ещё существует.
+            ("orders", "ms_deleted_at", "TEXT"),
+            # Когда обнаружено расхождение суммы заказа с документом в МойСклад
+            # (кто-то отредактировал позиции/цены в МС). Это СИГНАЛ для ручной
+            # проверки (флаг + уведомление), деньги/статус НЕ меняем молча.
+            # NULL = расхождений не зафиксировано.
+            ("orders", "ms_drift_at", "TEXT"),
+            # Когда МойСклад сообщил статус, нелегальный для локальной машины
+            # состояний (напр. approved→rejected): отгрузка/остаток в МС двинулись,
+            # локально применить нельзя без отката. Отдельный флаг (НЕ ms_drift_at),
+            # чтобы дедуп этого алерта не глушился правкой суммы и наоборот.
+            # NULL = заблокированных переходов нет.
+            ("orders", "ms_transition_blocked_at", "TEXT"),
+            # R4: customerorder создан в МС, но demand (отгрузка) упал — заказ
+            # approved с CO, но без списания остатков. Флаг для ночного дайджеста
+            # «нужна доделка demand вручную». Снимается при успешном set_order_ms_demand_id.
+            # NULL = проблемы нет.
+            ("orders", "ms_demand_failed_at", "TEXT"),
+            ("orders", "credit_limit_override", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "credit_limit_override_by", "BIGINT"),
+            ("orders", "price_check_warnings", "TEXT"),
+            ("orders", "payment_confirmed", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "payment_confirmed_at", "TEXT"),
+            ("orders", "client_notification_sent", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "return_status", "TEXT"),
+            ("orders", "submitted_at", "TEXT"),
+            ("orders", "approved_by", "BIGINT"),
+            ("orders", "approved_at", "TEXT"),
+            ("orders", "shipped_at", "TEXT"),
+            ("orders", "shipped_by", "BIGINT"),
+            # Баланс контрагента (взаиморасчёты) из МойСклад report/counterparty,
+            # в копейках, как отдаёт МС. balance<0 — клиент должен нам; >0 —
+            # аванс/переплата (интерпретация — на фронте «Клиенты»).
+            # Синкается ночным refresh_counterparties. NULL = ещё не синкнут.
+            ("ms_counterparties", "balance_cents", "BIGINT"),
+            # order_items
+            ("order_items", "stock_snap", "REAL"),
+            ("order_items", "price_at_submit", "REAL"),
+            ("order_items", "batch_id", "TEXT"),
+            ("order_items", "returned_qty", "REAL NOT NULL DEFAULT 0"),
+            # ─── Деньги в копейках (минорные единицы) — канон вместо float.
+            #     Аддитивные BIGINT-колонки рядом со старыми REAL; backfill
+            #     в run_backfills (x_cents = round(x*100)). Старые REAL пока
+            #     остаются для безопасного rolling-деплоя. См. services/money.py.
+            ("payments", "amount_cents", "BIGINT"),
+            # Время claim'а платежа для MS-синка (WP-10). Reaper orphan'ов судит
+            # устаревание по нему, а не по confirmed_at: иначе любой платёж,
+            # подтверждённый >30 мин назад, мог быть сброшен reaper'ом ПРЯМО во
+            # время in-flight POST → второй paymentin в МС (дубль).
+            ("payments", "ms_sync_claimed_at", "TEXT"),
+            ("order_items", "price_cents", "BIGINT"),
+            ("order_items", "price_at_submit_cents", "BIGINT"),
+            ("credit_limits", "limit_amount_cents", "BIGINT"),
+            ("cash_deposits", "amount_cents", "BIGINT"),
+            ("cash_deposit_orders", "amount_allocated_cents", "BIGINT"),
+            ("returns", "total_amount_cents", "BIGINT"),
+            ("return_items", "amount_cents", "BIGINT"),
+            ("product_prices", "sale_price_cents", "BIGINT"),
+            ("product_prices", "cost_price_cents", "BIGINT"),
+            # Снимок курса валюты к BASE_CURRENCY на момент завершения операции
+            # (заказ → отгрузка, платёж → подтверждение). Заморозка точки-во-
+            # времени: общий итог в USD по прошлым сделкам не «плывёт» при
+            # последующем движении курса. NULL = снимок не снят (старые строки
+            # / валюта была неизвестна) → пересчёт fallback'ит на текущий курс.
+            ("orders", "fx_rate_to_base", "REAL"),
+            ("payments", "fx_rate_to_base", "REAL"),
+        ]
+        applied = 0
+        for table, column, col_type in migrations:
+
             try:
                 cur.execute(sql)
                 stats[label] = max(cur.rowcount, 0)
@@ -2372,6 +2553,9 @@ async def mark_order_shipped(order_id: int, shipped_by: int, shipped_name: str) 
     if not updated:
         return {"ok": False, "error": "Заказ уже обработан"}
 
+    # Заморозить курс заказа на момент отгрузки (best-effort, sync money-core).
+    await asyncio.to_thread(_snapshot_order_fx, order_id)
+
     already_in_ms = bool(order.get("ms_demand_id"))
     await asyncio.to_thread(
         add_audit_log,
@@ -2740,6 +2924,181 @@ def _invalidate_currency_rates_cache() -> None:
     """Сбросить весь кэш (для тестов и admin-debug endpoint'а)."""
     with _currency_rates_lock:
         _CURRENCY_RATES_CACHE.clear()
+
+
+def convert_to_base_at(
+    amount: float, from_currency: str | None, rate_to_base: float | None
+) -> float | None:
+    """Перевести amount в BASE_CURRENCY по ПЕРЕДАННОМУ курсу (снимок).
+
+    В отличие от convert_to_base (берёт ТЕКУЩИЙ курс из БД), считает по
+    `rate_to_base`, замороженному на момент операции. Если валюта = базовой
+    (или None) — возвращает amount как есть. Если курс не передан/невалиден —
+    None (caller решает: fallback на convert_to_base или показать «—»).
+    """
+    from config import BASE_CURRENCY
+
+    if amount is None:
+        return None
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return None
+    code = (from_currency or BASE_CURRENCY).upper()
+    base = (BASE_CURRENCY or "USD").upper()
+    if code == base:
+        return amount
+    if rate_to_base is None:
+        return None
+    try:
+        rate = float(rate_to_base)
+    except (TypeError, ValueError):
+        return None
+    if rate <= 0:
+        return None
+    return float(money.from_cents(money.convert_cents(money.to_cents(amount), rate)))
+
+
+def set_currency_rate_daily(
+    currency_code: str, rate_date: str, rate_to_base: float, source: str = "cbu"
+) -> tuple[bool, str | None]:
+    """UPSERT курса в дневной архив (currency_rate_daily). Один курс на день.
+
+    `rate_date` — 'YYYY-MM-DD'. Возвращает (ok, error_msg). Валидирует rate
+    как amount (> 0, конечное). currency_code нормализуется UPPER.
+    """
+    code = (currency_code or "").upper().strip()
+    if not code:
+        return False, "currency_code пустой"
+    if not rate_date:
+        return False, "rate_date пустой"
+    ok, err = _validate_amount(rate_to_base)
+    if not ok:
+        return False, f"rate_to_base: {err}"
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        if USE_POSTGRES:
+            cur.execute(
+                q(
+                    "INSERT INTO currency_rate_daily "
+                    "(currency_code, rate_date, rate_to_base, source, created_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT (currency_code, rate_date) DO UPDATE SET "
+                    "rate_to_base = EXCLUDED.rate_to_base, source = EXCLUDED.source"
+                ),
+                (code, rate_date, float(rate_to_base), source, now_str()),
+            )
+        else:
+            cur.execute(
+                q(
+                    "INSERT OR REPLACE INTO currency_rate_daily "
+                    "(currency_code, rate_date, rate_to_base, source, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)"
+                ),
+                (code, rate_date, float(rate_to_base), source, now_str()),
+            )
+        conn.commit()
+    return True, None
+
+
+def get_currency_rate_asof(currency_code: str, date_str: str) -> float | None:
+    """Курс валюты к BASE_CURRENCY на дату `date_str` (самый свежий день ≤ date).
+
+    Выходные/пропуски в архиве → берём ближайший ранний день. Базовая валюта
+    → 1.0 без обращения к БД. None если в архиве нет ни одной подходящей записи.
+    `date_str` сравнивается лексикографически — формат строго 'YYYY-MM-DD'
+    (или с временем; берётся первые 10 символов).
+    """
+    from config import BASE_CURRENCY
+
+    if not currency_code:
+        return None
+    code = currency_code.upper()
+    base = (BASE_CURRENCY or "USD").upper()
+    if code == base:
+        return 1.0
+    day = (date_str or "")[:10]
+    if not day:
+        return None
+    try:
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q(
+                    "SELECT rate_to_base FROM currency_rate_daily "
+                    "WHERE currency_code = ? AND rate_date <= ? "
+                    "ORDER BY rate_date DESC LIMIT 1"
+                ),
+                (code, day),
+            )
+            row = cur.fetchone()
+    except Exception:
+        logger.exception("get_currency_rate_asof(%s, %s) failed", code, day)
+        return None
+    if row is None:
+        return None
+    return float(row["rate_to_base"]) if hasattr(row, "keys") else float(row[0])
+
+
+def backfill_fx_rate_snapshots() -> dict:
+    """Проставить fx_rate_to_base прошлым orders/payments без снимка — по дате
+    операции через дневной архив (get_currency_rate_asof). Идемпотентно
+    (UPDATE ... WHERE fx_rate_to_base IS NULL). Возвращает {orders, payments}.
+
+    Дата операции: orders → shipped_at/approved_at/created_at (что раньше есть),
+    payments → confirmed_at/created_at. Если архив на ту дату пуст → строку
+    пропускаем (останется NULL → пересчёт fallback'нет на текущий курс).
+    """
+    o_count = 0
+    p_count = 0
+
+    def _rows(sql: str) -> list:
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(q(sql))
+            return cur.fetchall()
+
+    def _val(row, key, idx):
+        return row[key] if hasattr(row, "keys") else row[idx]
+
+    order_rows = _rows(
+        "SELECT id, currency, "
+        "COALESCE(shipped_at, approved_at, created_at) AS op_date "
+        "FROM orders WHERE fx_rate_to_base IS NULL AND currency IS NOT NULL "
+        "AND status IN ('approved','shipped','paid','partially_returned','returned')"
+    )
+    for row in order_rows:
+        rate = get_currency_rate_asof(_val(row, "currency", 1), _val(row, "op_date", 2) or "")
+        if rate is None:
+            continue
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q("UPDATE orders SET fx_rate_to_base = ? WHERE id = ? AND fx_rate_to_base IS NULL"),
+                (float(rate), _val(row, "id", 0)),
+            )
+            conn.commit()
+        o_count += 1
+
+    payment_rows = _rows(
+        "SELECT id, currency, COALESCE(confirmed_at, created_at) AS op_date "
+        "FROM payments WHERE fx_rate_to_base IS NULL AND currency IS NOT NULL "
+        "AND status = 'confirmed'"
+    )
+    for row in payment_rows:
+        rate = get_currency_rate_asof(_val(row, "currency", 1), _val(row, "op_date", 2) or "")
+        if rate is None:
+            continue
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q("UPDATE payments SET fx_rate_to_base = ? WHERE id = ? AND fx_rate_to_base IS NULL"),
+                (float(rate), _val(row, "id", 0)),
+            )
+            conn.commit()
+        p_count += 1
+
+    return {"orders": o_count, "payments": p_count}
 
 
 # ─── Product prices (PR C: управление ценами руководством) ───────────────────
@@ -3941,6 +4300,15 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
                 # Выручка/долг РАЗДЕЛЬНО по валютам (не складываем разные валюты).
                 "revenue_cents_cur": {},
                 "debt_cents_cur": {},
+                # Сводный итог в BASE_CURRENCY (по снимку курса заказа; fallback —
+                # текущий курс). *_any: хоть что-то сконвертировано; *_missing:
+                # часть валют без курса (итог приблизительный).
+                "revenue_base_sum": 0.0,
+                "revenue_base_any": False,
+                "revenue_base_missing": False,
+                "debt_base_sum": 0.0,
+                "debt_base_any": False,
+                "debt_base_missing": False,
                 "returns_count": 0,
             },
         )
@@ -3954,13 +4322,27 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
         elif status == "shipped":
             m["shipped"] += 1
         ocur = (o.get("currency") or base_cur).upper()
+        snap = o.get("fx_rate_to_base")
         items = items_by_order.get(o["id"], [])
         total_cents = sum(
             money.mul_qty(_price_cents(it), it.get("quantity", 0) or 0) for it in items
         )
+
+        def _accum_base(major: float, kind: str) -> None:
+            # Снимок курса заказа, иначе текущий курс. None → валюта без курса.
+            base_val = convert_to_base_at(major, ocur, snap)
+            if base_val is None:
+                base_val = convert_to_base(major, ocur)
+            if base_val is None:
+                m[f"{kind}_base_missing"] = True
+            else:
+                m[f"{kind}_base_sum"] += base_val
+                m[f"{kind}_base_any"] = True
+
         if status in revenue_statuses:
             m["revenue_cents"] += total_cents
             m["revenue_cents_cur"][ocur] = m["revenue_cents_cur"].get(ocur, 0) + total_cents
+            _accum_base(float(money.from_cents(total_cents)), "revenue")
         if status in debt_statuses and not o.get("payment_confirmed"):
             confirmed = sum(
                 _amount_cents(p)
@@ -3970,6 +4352,8 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
             net = max(0, total_cents - confirmed)
             m["debt_cents"] += net
             m["debt_cents_cur"][ocur] = m["debt_cents_cur"].get(ocur, 0) + net
+            if net > 0:
+                _accum_base(float(money.from_cents(net)), "debt")
         m["returns_count"] += returns_by_order.get(o["id"], 0)
 
     users = {u["user_id"]: u for u in await asyncio.to_thread(get_all_users)}
@@ -4503,6 +4887,8 @@ async def confirm_payment(
     )
     if rc <= 0:
         return False
+    # Заморозить курс платежа на момент подтверждения (best-effort, sync core).
+    await asyncio.to_thread(_snapshot_payment_fx, payment_id)
     payment = await get_payment(payment_id)
     if confirmed_by and payment:
         await asyncio.to_thread(
@@ -5583,7 +5969,6 @@ def update_order_currency(order_id: int, currency: str) -> bool:
         conn.commit()
     return updated
 
-
 def legal_sources_for(target_status: str) -> tuple[str, ...]:
     """Из каких статусов переход в `target_status` легален — по TRANSITIONS.
 
@@ -5625,6 +6010,85 @@ def update_order_status(
     сообщение в чате, жал «Одобрить» — и заказ ВОСКРЕСАЛ из rejected в approved
     с новыми документами в МС (§2.2)."""
     tail, extra = _status_cas_sql(expected_status)
+def _snapshot_order_fx(order_id: int) -> None:
+    """Заморозить курс валюты заказа к BASE_CURRENCY (orders.fx_rate_to_base).
+
+    Идемпотентно: ставит ТОЛЬКО если снимка ещё нет и валюта известна. Берёт
+    текущий курс (get_currency_rate, кэш TTL) — для базовой валюты это 1.0
+    (засеяно). Вызывается при первом «реализующем» переходе заказа (approved/
+    shipped), чтобы итог в USD по этому заказу не «плыл» при движении курса.
+    """
+    try:
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q("SELECT currency, fx_rate_to_base FROM orders WHERE id = ?"),
+                (order_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return
+        currency = row["currency"] if hasattr(row, "keys") else row[0]
+        existing = row["fx_rate_to_base"] if hasattr(row, "keys") else row[1]
+        if existing is not None or not currency:
+            return
+        rate = get_currency_rate(currency)
+        if rate is None:
+            return
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q(
+                    "UPDATE orders SET fx_rate_to_base = ? "
+                    "WHERE id = ? AND fx_rate_to_base IS NULL"
+                ),
+                (float(rate), order_id),
+            )
+            conn.commit()
+    except Exception:
+        # Снимок курса — best-effort: его отсутствие не должно ронять смену
+        # статуса (пересчёт упадёт обратно на текущий курс).
+        logger.exception("_snapshot_order_fx(%s) failed", order_id)
+
+
+def _snapshot_payment_fx(payment_id: int) -> None:
+    """Заморозить курс валюты платежа к BASE_CURRENCY (payments.fx_rate_to_base).
+
+    Идемпотентно: ставит ТОЛЬКО если снимка ещё нет. Вызывается при
+    подтверждении платежа — момент, когда деньги реально зачтены.
+    """
+    try:
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q("SELECT currency, fx_rate_to_base FROM payments WHERE id = ?"),
+                (payment_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return
+        currency = row["currency"] if hasattr(row, "keys") else row[0]
+        existing = row["fx_rate_to_base"] if hasattr(row, "keys") else row[1]
+        if existing is not None or not currency:
+            return
+        rate = get_currency_rate(currency)
+        if rate is None:
+            return
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            cur.execute(
+                q(
+                    "UPDATE payments SET fx_rate_to_base = ? "
+                    "WHERE id = ? AND fx_rate_to_base IS NULL"
+                ),
+                (float(rate), payment_id),
+            )
+            conn.commit()
+    except Exception:
+        logger.exception("_snapshot_payment_fx(%s) failed", payment_id)
+
+
+def update_order_status(order_id: int, status: str) -> bool:
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
@@ -5633,6 +6097,8 @@ def update_order_status(
         )
         updated = cur.rowcount > 0
         conn.commit()
+    if updated and status in ("approved", "shipped"):
+        _snapshot_order_fx(order_id)
     return updated
 
 
