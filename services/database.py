@@ -319,6 +319,11 @@ def _create_tables():
                 ms_sync_status     TEXT,
                 ms_sync_error      TEXT,
                 ms_sync_claimed_at TEXT,
+                -- Курс валюты платежа к BASE_CURRENCY, замороженный в момент
+                -- подтверждения (_snapshot_payment_fx). Пересчёт «в долларах»
+                -- обязан опираться на курс того дня, а не сегодняшний: иначе
+                -- выручка прошлого месяца меняется от движения курса.
+                fx_rate_to_base    REAL,
                 created_at         TEXT NOT NULL,
                 confirmed_at       TEXT
             )""",
@@ -377,6 +382,9 @@ def _create_tables():
                 ms_drift_at              TEXT,
                 ms_transition_blocked_at TEXT,
                 ms_demand_failed_at      TEXT,
+                -- Курс валюты заказа к BASE_CURRENCY, замороженный при первом
+                -- «реализующем» переходе (approved/shipped, _snapshot_order_fx).
+                fx_rate_to_base          REAL,
                 created_at               TEXT NOT NULL,
                 updated_at               TEXT NOT NULL
             )""",
@@ -1376,157 +1384,6 @@ def backfill_local_identifiers() -> dict:
     with get_conn() as conn:
         cur = get_cursor(conn)
         for label, sql in steps:
-        migrations = [
-            ("user_roles", "moysklad_employee_id", "TEXT"),
-            ("user_roles", "ms_sync_status", "TEXT DEFAULT 'pending'"),
-            ("user_roles", "created_at", "TEXT"),
-            # Цена за единицу для позиции заказа (в основной валюте,
-            # т.е. как пользователь ввёл — например 150.50 USD).
-            # При создании demand в МойСклад умножаем на 100 (минорные единицы).
-            ("order_items", "price", "REAL DEFAULT 0"),
-            # Валюта заказа (USD/UZS/RUB/EUR). По умолчанию BASE_CURRENCY.
-            # Хранится на уровне ордера, чтобы все позиции одного заказа
-            # были в одной валюте.
-            ("orders", "currency", "TEXT"),
-            # Тип оплаты: 'paid' (оплачено сразу) или 'credit' (в долг).
-            # Default 'paid' — все старые заказы считаем как оплаченные,
-            # чтобы миграция была безопасной (не объявить вдруг весь
-            # архив должниками).
-            ("orders", "payment_type", "TEXT NOT NULL DEFAULT 'paid'"),
-            # Дата к которой клиент обязался погасить долг (ISO YYYY-MM-DD).
-            # Заполняется только когда payment_type='credit', NULL иначе.
-            ("orders", "due_date", "TEXT"),
-            # Когда долг был погашен (ISO YYYY-MM-DD HH:MM:SS). NULL пока
-            # не погашен. Для 'paid' заказов также NULL — там оплата
-            # сразу, отдельный timestamp не нужен (есть created_at).
-            ("orders", "paid_at", "TEXT"),
-            # Двухступенчатое подтверждение оплаты:
-            #  - paid_at:           менеджер отметил «деньги получил»
-            #  - paid_confirmed_*:  босс/админ подтвердил «да, в кассе»
-            # Заказ считается реально оплаченным ТОЛЬКО когда оба поля
-            # заполнены. Если босс отклонил — paid_at обнуляется (см.
-            # reject_payment_received), цикл начинается заново.
-            ("orders", "paid_confirmed_at", "TEXT"),
-            ("orders", "paid_confirmed_by", "BIGINT"),
-            ("orders", "paid_confirmed_by_name", "TEXT"),
-            # Связь платежа с заказом. Если payment.order_id IS NOT NULL —
-            # это «частичная оплата по заказу N», а не самостоятельный платёж
-            # в кассу. У одного заказа может быть несколько payments
-            # (клиент платит частями). Когда суммa confirmed payments >=
-            # order.total, заказ автоматически считается закрытым.
-            ("payments", "order_id", "BIGINT"),
-            # ID документа Demand в МойСклад, созданного при approve
-            # отгрузки. Нужен чтобы paymentin привязывался к конкретной
-            # отгрузке (operations field в API МойСклад). NULL если
-            # отгрузка ещё не отправлена или create_demand упал.
-            # LEGACY: новые заказы используют ms_customerorder_id ниже.
-            ("orders", "ms_demand_id", "TEXT"),
-            # ID «Заказа покупателя» (customerorder) в МойСклад.
-            # Новый workflow — бот создаёт именно customerorder, а не
-            # demand. paymentin привязывается сюда через operations
-            # вместо ms_demand_id для новых заказов.
-            ("orders", "ms_customerorder_id", "TEXT"),
-            # ID входящего платежа (paymentin) в МойСклад. Заполняется
-            # после успешного create_paymentin. Защищает от дубликатов:
-            # повторный confirm не плодит новые paymentin'ы в МойСклад.
-            ("payments", "ms_paymentin_id", "TEXT"),
-            # Статус синхронизации с МойСклад: NULL (ещё не пробовали),
-            # 'synced', 'failed' (с описанием в ms_sync_error).
-            ("payments", "ms_sync_status", "TEXT"),
-            ("payments", "ms_sync_error", "TEXT"),
-            # ─── IMPLEMENTATION.md Фаза 2 (адаптировано: BOOLEAN→INTEGER 0/1,
-            #     JSONB→TEXT, NUMERIC→REAL, без FK). Все колонки аддитивны. ──────
-            # users → у нас user_roles (telegram-id как PK).
-            ("user_roles", "active", "INTEGER NOT NULL DEFAULT 1"),
-            ("user_roles", "email", "TEXT"),
-            ("user_roles", "phone", "TEXT"),
-            ("user_roles", "deactivated_at", "TEXT"),
-            ("user_roles", "deactivated_by", "BIGINT"),
-            # orders
-            ("orders", "deleted_at", "TEXT"),
-            ("orders", "rejection_comment", "TEXT"),
-            ("orders", "rejection_count", "INTEGER NOT NULL DEFAULT 0"),
-            ("orders", "frozen", "INTEGER NOT NULL DEFAULT 0"),
-            ("orders", "cancelled_at", "TEXT"),
-            ("orders", "cancelled_by", "BIGINT"),
-            ("orders", "cancellation_reason", "TEXT"),
-            # Когда отмена была отражена в МойСклад (реверс customerorder).
-            # NULL = ещё не синхронизировано; идемпотентность ms_cancel.
-            ("orders", "ms_cancel_synced_at", "TEXT"),
-            # Когда документ заказа был обнаружен УДАЛЁННЫМ в МойСклад (вебхук
-            # customerorder.DELETE / cron-реконсиляция). Помечает «фантомные»
-            # заказы (особенно shipped/paid, чей статус мы не трогаем) — они
-            # исключаются из аналитики менеджеров, но остаются в учёте долгов
-            # для ручной разборки. NULL = в МС ещё существует.
-            ("orders", "ms_deleted_at", "TEXT"),
-            # Когда обнаружено расхождение суммы заказа с документом в МойСклад
-            # (кто-то отредактировал позиции/цены в МС). Это СИГНАЛ для ручной
-            # проверки (флаг + уведомление), деньги/статус НЕ меняем молча.
-            # NULL = расхождений не зафиксировано.
-            ("orders", "ms_drift_at", "TEXT"),
-            # Когда МойСклад сообщил статус, нелегальный для локальной машины
-            # состояний (напр. approved→rejected): отгрузка/остаток в МС двинулись,
-            # локально применить нельзя без отката. Отдельный флаг (НЕ ms_drift_at),
-            # чтобы дедуп этого алерта не глушился правкой суммы и наоборот.
-            # NULL = заблокированных переходов нет.
-            ("orders", "ms_transition_blocked_at", "TEXT"),
-            # R4: customerorder создан в МС, но demand (отгрузка) упал — заказ
-            # approved с CO, но без списания остатков. Флаг для ночного дайджеста
-            # «нужна доделка demand вручную». Снимается при успешном set_order_ms_demand_id.
-            # NULL = проблемы нет.
-            ("orders", "ms_demand_failed_at", "TEXT"),
-            ("orders", "credit_limit_override", "INTEGER NOT NULL DEFAULT 0"),
-            ("orders", "credit_limit_override_by", "BIGINT"),
-            ("orders", "price_check_warnings", "TEXT"),
-            ("orders", "payment_confirmed", "INTEGER NOT NULL DEFAULT 0"),
-            ("orders", "payment_confirmed_at", "TEXT"),
-            ("orders", "client_notification_sent", "INTEGER NOT NULL DEFAULT 0"),
-            ("orders", "return_status", "TEXT"),
-            ("orders", "submitted_at", "TEXT"),
-            ("orders", "approved_by", "BIGINT"),
-            ("orders", "approved_at", "TEXT"),
-            ("orders", "shipped_at", "TEXT"),
-            ("orders", "shipped_by", "BIGINT"),
-            # Баланс контрагента (взаиморасчёты) из МойСклад report/counterparty,
-            # в копейках, как отдаёт МС. balance<0 — клиент должен нам; >0 —
-            # аванс/переплата (интерпретация — на фронте «Клиенты»).
-            # Синкается ночным refresh_counterparties. NULL = ещё не синкнут.
-            ("ms_counterparties", "balance_cents", "BIGINT"),
-            # order_items
-            ("order_items", "stock_snap", "REAL"),
-            ("order_items", "price_at_submit", "REAL"),
-            ("order_items", "batch_id", "TEXT"),
-            ("order_items", "returned_qty", "REAL NOT NULL DEFAULT 0"),
-            # ─── Деньги в копейках (минорные единицы) — канон вместо float.
-            #     Аддитивные BIGINT-колонки рядом со старыми REAL; backfill
-            #     в run_backfills (x_cents = round(x*100)). Старые REAL пока
-            #     остаются для безопасного rolling-деплоя. См. services/money.py.
-            ("payments", "amount_cents", "BIGINT"),
-            # Время claim'а платежа для MS-синка (WP-10). Reaper orphan'ов судит
-            # устаревание по нему, а не по confirmed_at: иначе любой платёж,
-            # подтверждённый >30 мин назад, мог быть сброшен reaper'ом ПРЯМО во
-            # время in-flight POST → второй paymentin в МС (дубль).
-            ("payments", "ms_sync_claimed_at", "TEXT"),
-            ("order_items", "price_cents", "BIGINT"),
-            ("order_items", "price_at_submit_cents", "BIGINT"),
-            ("credit_limits", "limit_amount_cents", "BIGINT"),
-            ("cash_deposits", "amount_cents", "BIGINT"),
-            ("cash_deposit_orders", "amount_allocated_cents", "BIGINT"),
-            ("returns", "total_amount_cents", "BIGINT"),
-            ("return_items", "amount_cents", "BIGINT"),
-            ("product_prices", "sale_price_cents", "BIGINT"),
-            ("product_prices", "cost_price_cents", "BIGINT"),
-            # Снимок курса валюты к BASE_CURRENCY на момент завершения операции
-            # (заказ → отгрузка, платёж → подтверждение). Заморозка точки-во-
-            # времени: общий итог в USD по прошлым сделкам не «плывёт» при
-            # последующем движении курса. NULL = снимок не снят (старые строки
-            # / валюта была неизвестна) → пересчёт fallback'ит на текущий курс.
-            ("orders", "fx_rate_to_base", "REAL"),
-            ("payments", "fx_rate_to_base", "REAL"),
-        ]
-        applied = 0
-        for table, column, col_type in migrations:
-
             try:
                 cur.execute(sql)
                 stats[label] = max(cur.rowcount, 0)
@@ -4328,7 +4185,11 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
             money.mul_qty(_price_cents(it), it.get("quantity", 0) or 0) for it in items
         )
 
-        def _accum_base(major: float, kind: str) -> None:
+        # m/ocur/snap связываем аргументами по умолчанию: замыкание внутри
+        # цикла иначе смотрит на переменные ПОСЛЕДНЕЙ итерации (ruff B023).
+        # Сейчас функция вызывается тут же, в своей итерации, и поведение
+        # совпадает — но первый же отложенный вызов считал бы чужой заказ.
+        def _accum_base(major: float, kind: str, *, m=m, ocur=ocur, snap=snap) -> None:
             # Снимок курса заказа, иначе текущий курс. None → валюта без курса.
             base_val = convert_to_base_at(major, ocur, snap)
             if base_val is None:
@@ -5994,22 +5855,6 @@ def _status_cas_sql(expected_status: str | tuple[str, ...] | None) -> tuple[str,
     return f" AND status IN ({ph})", list(expected)
 
 
-def update_order_status(
-    order_id: int,
-    status: str,
-    expected_status: str | tuple[str, ...] | None = None,
-) -> bool:
-    """Перевести заказ в статус. Возвращает True, если строка реально изменилась.
-
-    `expected_status` — compare-and-set: UPDATE применяется, только если текущий
-    статус входит в набор. Без него UPDATE безусловный (легаси-вызовы; они
-    закрываются в T2.3/T2.7).
-
-    Зачем CAS: МойСклад мог прислать `Unsuccessful` и перевести заказ
-    pending→rejected, а заявка при этом осталась `pending`. Босс открывал старое
-    сообщение в чате, жал «Одобрить» — и заказ ВОСКРЕСАЛ из rejected в approved
-    с новыми документами в МС (§2.2)."""
-    tail, extra = _status_cas_sql(expected_status)
 def _snapshot_order_fx(order_id: int) -> None:
     """Заморозить курс валюты заказа к BASE_CURRENCY (orders.fx_rate_to_base).
 
@@ -6088,7 +5933,22 @@ def _snapshot_payment_fx(payment_id: int) -> None:
         logger.exception("_snapshot_payment_fx(%s) failed", payment_id)
 
 
-def update_order_status(order_id: int, status: str) -> bool:
+def update_order_status(
+    order_id: int,
+    status: str,
+    expected_status: str | tuple[str, ...] | None = None,
+) -> bool:
+    """Перевести заказ в статус. Возвращает True, если строка реально изменилась.
+
+    `expected_status` — compare-and-set: UPDATE применяется, только если текущий
+    статус входит в набор. Без него UPDATE безусловный (легаси-вызовы; они
+    закрываются в T2.3/T2.7).
+
+    Зачем CAS: МойСклад мог прислать `Unsuccessful` и перевести заказ
+    pending→rejected, а заявка при этом осталась `pending`. Босс открывал старое
+    сообщение в чате, жал «Одобрить» — и заказ ВОСКРЕСАЛ из rejected в approved
+    с новыми документами в МС (§2.2)."""
+    tail, extra = _status_cas_sql(expected_status)
     with get_conn() as conn:
         cur = get_cursor(conn)
         cur.execute(
