@@ -56,7 +56,41 @@ jobs:
         # аналитики, списков), поэтому прежний порог 35 стал бессмысленным.
         # Буфер ~12% защищает от шума метрики и оставляет место рефакторам,
         # но не даёт «забыть» дописать тесты к большим PR'ам.
-        run: pytest tests/ -v --tb=short --cov --cov-report=term-missing --cov-fail-under=55
+        # `-m "not e2e"`: браузерные сценарии идут отдельным job'ом ниже —
+        # здесь Chromium не ставится, и они бы просто пропустились.
+        run: pytest tests/ -m "not e2e" -v --tb=short --cov --cov-report=term-missing --cov-fail-under=55
+
+  # E2E (tests/e2e): настоящий Chromium грузит WebApp с живого uvicorn,
+  # fetch настоящие, БД настоящая (SQLite). Ловит то, до чего не дотягиваются
+  # ни API-тесты (фронта нет), ни jsdom-смоук (сервера нет): контракт
+  # «что фронт шлёт ↔ что сервер ждёт ↔ что фронт рисует из ответа».
+  # Отдельный job: медленнее pytest-гейта и требует браузера.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      # --with-deps ставит системные библиотеки Chromium (apt) — без них
+      # браузер не стартует на чистом ubuntu-latest.
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run E2E
+        env:
+          TELEGRAM_TOKEN: "0:fake-ci-token"
+          # Без браузера e2e пропускаются (удобно локально); в CI пропуск —
+          # это зелёная галочка над непрогнанными тестами, поэтому падаем.
+          E2E_REQUIRED: "1"
+        run: pytest tests/e2e -m e2e -v --tb=short
 
   # Фронт WebApp (webapp/static) теста-харнесса в Python нет — vitest гоняет
   # чистые хелперы (helpers.js) + jsdom-смоук, что app.js грузится без ошибок.

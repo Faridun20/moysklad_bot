@@ -2091,3 +2091,55 @@ describe('вкладки под роль совпадают с тем, кому 
     expect(window.__tabs).toContain('confirm');
   });
 });
+
+describe('диалог количества дописывает позицию в черновик', () => {
+  // Регресс, найденный E2E (test_manager_order_to_boss_approval_moves_stock):
+  // после переезда на разделы защита «пользователь ушёл с экрана» сравнивала
+  // currentScreen с 'orders', а раздел зовётся 'sales'. Позиция уходила на
+  // сервер и там оставалась, а редактор её не показывал — «Отправить заявку»
+  // не включалась ни у кого и никогда. Здесь — быстрый jsdom-вариант того же
+  // сценария: подтверждение MainButton при живом черновике обязано дописать
+  // позицию в currentDraftOrder и перерисовать редактор.
+  const driver = (screen) => `
+    currentUser = { role: 'manager' };
+    currentScreen = ${JSON.stringify(screen)};
+    currentDraftOrder = { id: 5, items: [], currency: null };
+    window.__calls = [];
+    api = async (path, body) => { window.__calls.push([path, body]); return { ok: true, item_id: 9 }; };
+    renderOrderEditor = () => { window.__rendered = (window.__rendered || 0) + 1; };
+    toast = () => {};
+    window.Telegram.WebApp.MainButton.onClick = (f) => { window.__confirm = f; };
+    openQuantityInput('Кабель ВВГ 3x2.5', 'м', 20, 'p1');
+    window.__items = () => currentDraftOrder.items;
+    window.__currency = () => currentDraftOrder.currency;
+  `;
+
+  async function confirm(window, qty, price) {
+    const doc = window.document;
+    doc.querySelector('#qty-input').value = qty;
+    doc.querySelector('#price-input').value = price;
+    await window.__confirm();
+    await new Promise(r => setTimeout(r, 0));
+  }
+
+  it('в разделе «Продажи» позиция попадает в черновик и редактор перерисовывается', async () => {
+    const window = boot(driver('sales'));
+    await confirm(window, '2', '100');
+    expect(window.__calls[0][0]).toBe('/api/orders/add_item');
+    expect(window.__calls[0][1]).toMatchObject({ order_id: 5, quantity: 2, price: 100, product_id: 'p1' });
+    expect(window.__items()).toEqual([
+      { name: 'Кабель ВВГ 3x2.5', quantity: 2, unit: 'м', price: 100, item_id: 9 },
+    ]);
+    expect(window.__currency()).toBe('USD');
+    expect(window.__rendered).toBe(1);
+  });
+
+  it('если пользователь ушёл из раздела, ответ сервера не пишется в чужой DOM', async () => {
+    // Сама защита нужна: ответ пришёл, а на экране уже «Деньги».
+    const window = boot(driver('money'));
+    await confirm(window, '2', '100');
+    expect(window.__calls.length).toBe(1);
+    expect(window.__items()).toEqual([]);
+    expect(window.__rendered).toBeUndefined();
+  });
+});
