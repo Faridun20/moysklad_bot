@@ -279,12 +279,13 @@ def open_app(browser, e2e):
     """`open_app(user_id)` → страница WebApp, залогиненная этим пользователем."""
     contexts = []
 
-    def _open(user_id: int) -> Page:
+    def _open(user_id: int, init_data: str | None = None) -> Page:
+        """`init_data` — подменить подпись (для сценария «initData не прошла»)."""
         ctx = browser.new_context(viewport={"width": 390, "height": 844})
         contexts.append(ctx)
         page = ctx.new_page()
         page.set_default_timeout(E2E_TIMEOUT_MS)
-        stub = _TG_STUB % {"init_data": repr(str(user_id))}
+        stub = _TG_STUB % {"init_data": repr(str(user_id) if init_data is None else init_data)}
         page.route(
             "https://telegram.org/js/telegram-web-app.js",
             lambda route: route.fulfill(status=200, content_type="application/javascript", body=stub),
@@ -309,3 +310,54 @@ def go(page: Page, screen: str) -> None:
     page.wait_for_function(
         "(s) => document.querySelector('#bottom-nav .nav-item.active')?.dataset.screen === s", arg=screen
     )
+
+
+def tab(page: Page, key: str) -> None:
+    """Нажать вкладку раздела (`.seg-item[data-sect]`) и дождаться подсветки."""
+    page.click(f'.seg-item[data-sect="{key}"]')
+    page.wait_for_function(
+        "(k) => document.querySelector('.seg-item.active[data-sect]')?.dataset.sect === k", arg=key
+    )
+
+
+def settled(page: Page) -> None:
+    """Дождаться, пока с экрана уйдут скелетоны и индикаторы загрузки."""
+    page.wait_for_function(
+        "() => !document.querySelector('#content .sk-card, #content .sk-hero, #content .sk-label')"
+        " && !Array.from(document.querySelectorAll('#content .loader'))"
+        "        .some(el => /загру|ищу|счита/i.test(el.textContent || ''))"
+    )
+
+
+def toast_text(page: Page) -> str:
+    return " | ".join(page.eval_on_selector_all(".toast", "els => els.map(e => e.textContent)"))
+
+
+def sheet_fill(page: Page, values: dict) -> None:
+    """Заполнить поля шторки `openMachineSheet` (id = ms-f-<key>)."""
+    for key, val in values.items():
+        page.fill(f"#ms-f-{key}", str(val))
+
+
+def seed_order(e2e: E2E, *, payment_type: str = "credit", due_date: str | None = "2030-01-15",
+               qty: float = 2, price: float = 100.0, approve: bool = True) -> dict:
+    """Заказ менеджера на «Ромашку» через сервисы (не через браузер).
+
+    Нужен сценариям, которые начинаются ПОСЛЕ продажи: оплата, сдача, возврат,
+    долги. Путь через редактор уже покрыт своим тестом, повторять его в каждом
+    из них — оплачивать полминуты браузера за то, что и так проверено.
+    Возвращает {order_id, req_id, counterparty_id}.
+    """
+    from services.order_workflow import approve_shipment_request, submit_order
+
+    db, ids = e2e.db, e2e.ids
+    cp = e2e.rows("SELECT id FROM counterparties ORDER BY id LIMIT 1")[0]["id"]
+    oid = db.create_order(ids["mgr"], "Manager", "")
+    db.update_order_agent(oid, str(cp), "ООО Ромашка")
+    db.add_order_item(oid, "Кабель ВВГ 3x2.5", "", qty, "м", price, product_id=ids["product"])
+    res = e2e.run(submit_order(oid, ids["mgr"], "Manager", payment_type=payment_type, due_date=due_date))
+    assert res.get("ok"), res
+    if approve:
+        ap = e2e.run(approve_shipment_request(res["req_id"], ids["boss"], "Boss", e2e.bot))
+        assert ap.get("ok"), ap
+    return {"order_id": oid, "req_id": res["req_id"], "counterparty_id": cp}

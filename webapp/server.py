@@ -2538,6 +2538,15 @@ async def api_orders(request: Request):
 
     if role in ("admin", "boss"):
         orders = await adb.get_all_orders()
+    elif role == "warehouse_keeper":
+        # Кладовщик заказов не создаёт — его список это то, что он отгружает:
+        # одобренные (ждут его) и уже отгруженные. «Свои заказы» у него пусты,
+        # и кнопка «Отгрузить» в WebApp никогда не появлялась (нашёл E2E
+        # test_keeper_marks_approved_order_shipped); отгружать он мог только
+        # командой /ship в боте.
+        orders = [
+            o for o in await adb.get_all_orders() if o.get("status") in ("approved", "shipped")
+        ]
     else:
         orders = await adb.get_user_orders(user["id"])
 

@@ -110,7 +110,7 @@ const ROLE_NAMES = {
 
 // Экран «нет прав»: новый/деактивированный юзер (роль guest — нулевые права).
 // Раньше он падал на главную с нерабочими кнопками/403. Прячем нав и поиск.
-function renderNoAccess() {
+function renderNoAccess(hint) {
   const nav = document.querySelector('.bottom-nav');
   if (nav) nav.classList.add('hidden');
   const sb = document.getElementById('search-btn');
@@ -119,7 +119,7 @@ function renderNoAccess() {
   content.innerHTML = emptyState({
     icon: 'lock',
     title: 'Доступ не выдан',
-    hint: 'Ваш аккаунт пока без прав. Попросите администратора назначить роль — затем откройте приложение снова.',
+    hint: hint || 'Ваш аккаунт пока без прав. Попросите администратора назначить роль — затем откройте приложение снова.',
     action: { label: 'Обновить', onclick: 'location.reload()' },
   });
 }
@@ -155,6 +155,12 @@ async function init() {
           }</div>
           <button class="btn-primary" onclick="location.reload()">Повторить</button>
         </div>`;
+      return;
+    }
+    // 403 — подпись верна, но доступ отключён (деактивированный сотрудник).
+    // Это не «нет связи» и не повод жать «Повторить»: говорим прямо.
+    if (response.status === 403) {
+      renderNoAccess('Доступ отключён. Если это ошибка — обратитесь к администратору.');
       return;
     }
     if (!response.ok) {
@@ -3915,8 +3921,29 @@ async function handleRequest(reqId, action) {
   const path = action === 'approve' ? '/api/requests/approve' : '/api/requests/reject';
   // Блокируем повторные клики, пока запрос в полёте.
   document.querySelectorAll('.btn-approve, .btn-reject').forEach(b => (b.disabled = true));
+  // Один ключ на обе попытки: повтор с override=true — та же операция, и
+  // сервер освобождает ключ на needs_override именно ради этого повтора.
+  const key = idemKey();
   try {
-    await api(path, { req_id: Number(reqId), idempotency_key: idemKey() });
+    let res = await api(path, { req_id: Number(reqId), idempotency_key: key });
+    // Превышение кредитного лимита — не ошибка, а вопрос. Сервер отвечает
+    // 200 с needs_override, и молча счесть это успехом значит показать
+    // «одобрена» над заявкой, которая так и висит (нашёл E2E-сценарий
+    // test_over_limit_request_is_approved_only_with_override).
+    if (action === 'approve' && res && res.needs_override) {
+      const over = res.over || {};
+      const cur = baseCur();
+      const msg = 'Кредитный лимит превышен.\n' +
+        `Лимит: ${formatMoney(over.limit || 0)} ${cur}\n` +
+        `Долг с этим заказом: ${formatMoney(over.projected || 0)} ${cur}\n\n` +
+        'Одобрить с превышением?';
+      if (!await confirmDialog(msg)) {
+        document.querySelectorAll('.btn-approve, .btn-reject').forEach(b => (b.disabled = false));
+        return;
+      }
+      res = await api(path, { req_id: Number(reqId), idempotency_key: key, override: true });
+    }
+    if (res && res.ok === false) throw new Error(res.error || 'Не удалось выполнить');
     tg.showAlert(action === 'approve' ? '✅ Заявка одобрена' : '❌ Заявка отклонена');
   } catch (e) {
     tg.showAlert(`❌ ${e.message}`);
