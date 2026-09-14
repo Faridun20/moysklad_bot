@@ -4389,6 +4389,7 @@ async def api_containers_supply(request: Request):
     Повторный вызов ПЕРЕОПРИХОДУЕТ: прежний приход отменяется, новый создаётся
     с актуальными количествами.
     """
+    from services import async_db as adb
     from services import container_receipt
 
     data = await request.json()
@@ -4397,7 +4398,22 @@ async def api_containers_supply(request: Request):
         rate_limit_max=20,
     )
     container_id = _machine_id_arg(data, "container_id")
-    res = await container_receipt.receive(container_id, user_id=user["id"])
+    # Двойной тап с одним ключом отдаёт итог первой приёмки, а не переоприходует
+    # второй раз (лишняя отменённая накладная в истории). Параллельные приёмки
+    # без ключа сериализует сам сервис.
+    idem = _Idem(adb, "container_supply", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await container_receipt.receive(container_id, user_id=user["id"])
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
     return _machine_response(res)
 
 

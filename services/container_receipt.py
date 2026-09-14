@@ -296,7 +296,6 @@ async def receive(container_id: int, *, user_id: int | None = None) -> dict:
         }
 
     warehouse_id = await warehouse.default_warehouse_id()
-    existing_invoice = link.get("invoice_id")
     positions = [
         # Цену не выдумываем: её впишут, когда будут считать деньги.
         {"product_id": m["product_id"], "quantity": m["quantity"], "price_cents": None}
@@ -305,8 +304,37 @@ async def receive(container_id: int, *, user_id: int | None = None) -> dict:
 
     try:
         async with adb_core.transaction() as txn:
+            # Две приёмки одного контейнера сериализуются: двойной тап
+            # «Оприходовать» или сверка с двух телефонов раньше обе читали
+            # «накладной ещё нет» и проводили ДВЕ приходные — товар удваивался.
+            # Под замком перечитываем строку приёмки: вторая приёмка видит
+            # накладную первой и переоприходует (отмена + новая), а не
+            # добавляет к ней. На SQLite пишущая транзакция и так одна.
+            if USE_POSTGRES:
+                await txn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    f"container:receive:{container_id}",
+                )
+            fresh = await txn.fetchrow(
+                "SELECT invoice_id, received_at FROM container_receipt WHERE container_id = $1",
+                container_id,
+            )
+            existing_invoice = (fresh or {}).get("invoice_id")
+            if fresh and fresh.get("received_at") and not existing_invoice:
+                return {
+                    "ok": False,
+                    "error": "Контейнер оприходован ещё в МойСклад — его остаток перенесён "
+                    "миграцией. Повторный приход прибавил бы товар второй раз.",
+                    "legacy": True,
+                }
             if existing_invoice:
-                await warehouse.cancel_invoice_in(txn, int(existing_invoice), user_id)
+                status = await txn.fetchval(
+                    "SELECT status FROM invoices WHERE id = $1", int(existing_invoice)
+                )
+                # Уже отменённую накладную второй раз не откатываем: её остаток
+                # ушёл вместе с отменой.
+                if status is not None and status != "cancelled":
+                    await warehouse.cancel_invoice_in(txn, int(existing_invoice), user_id)
             created = await warehouse.create_invoice_in(
                 txn,
                 invoice_type="incoming",

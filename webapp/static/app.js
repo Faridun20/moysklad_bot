@@ -2167,8 +2167,21 @@ async function renderContainerCard(containerId) {
   content.querySelector('#cont-post')?.addEventListener('click', () =>
     openChannelComposer('arrival', { container_id: containerId }));
 
-  content.querySelector('#cont-supply')?.addEventListener('click', async () => {
-    const res = await apiResult('/api/containers/supply', { container_id: containerId });
+  // Ключ — на отрисованную карточку, а не на клик: двойной тап отдаёт итог
+  // первой приёмки, а не проводит вторую. Кнопка гаснет до ответа.
+  const supplyKey = idemKey();
+  content.querySelector('#cont-supply')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    if (btn.disabled) return;
+    btn.disabled = true;
+    let res;
+    try {
+      res = await apiResult('/api/containers/supply', {
+        container_id: containerId, idempotency_key: supplyKey,
+      });
+    } finally {
+      btn.disabled = false;
+    }
     if (!res.ok) {
       tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
       return;
