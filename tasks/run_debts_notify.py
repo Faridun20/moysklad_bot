@@ -2,7 +2,8 @@
 CLI: ежедневное напоминание о долгах. Запускается из Railway Cron.
 
 Что делает:
-  1. Берёт все открытые долги (credit + paid_at IS NULL) с due_date <= сегодня.
+  1. Берёт все открытые долги (credit/paid + paid_confirmed_at IS NULL) со
+     сроком <= сегодня (у «оплаты сразу» срок — день заказа).
   2. Группирует:
      - Каждому МЕНЕДЖЕРУ — его собственные долги.
      - Каждому boss/admin — сводку по всей компании.
@@ -25,6 +26,7 @@ from datetime import date
 
 from config import BASE_CURRENCY
 from services.database import (
+    debt_due_date,
     init_db,
     get_open_debts,
     get_payments_for_orders,
@@ -70,8 +72,11 @@ def _format_message(
     сдачи, ни возвраты не вычитались — клиент внёс 80%, а в утреннем
     напоминании всё равно висело 100%, при том что WebApp показывал 20%.
     """
-    overdue = [d for d in debts if d.get("due_date") and d["due_date"] < today_str]
-    today = [d for d in debts if d.get("due_date") == today_str]
+    # Срок — database.debt_due_date: у «оплаты сразу» своего due_date нет, и
+    # без этого такой долг приходил в выборке, но не попадал ни в один блок —
+    # менеджер получал пустое «Напоминание о долгах».
+    overdue = [d for d in debts if (debt_due_date(d) or "9999") < today_str]
+    today = [d for d in debts if debt_due_date(d) == today_str]
 
     def _row(d: dict) -> str:
         bal = balances.get(d["id"])
@@ -79,7 +84,7 @@ def _format_message(
         currency = (bal.currency if bal is not None else None) or d.get("currency") or BASE_CURRENCY
         agent = _esc(d.get("agent_name") or "—")
         owner_part = f" — {_esc(d.get('full_name') or '—')}" if is_boss_view else ""
-        due_human = _to_ru(d.get("due_date") or "")
+        due_human = _to_ru(debt_due_date(d) or "")
         return (
             f"  • #{d['id']} · {agent} · "
             f"<b>{_fmt_cents(remaining_cents)} {_esc(currency)}</b> "
@@ -166,7 +171,7 @@ async def main() -> int:
         if u["role"] in ("admin", "boss") and not u.get("deactivated_at")
     ]
 
-    # get_open_debts возвращает все credit+paid_confirmed_at IS NULL.
+    # get_open_debts возвращает все credit/paid с paid_confirmed_at IS NULL.
     # Делим по платежам:
     #   - менеджеру нужно действие, если по долгу НЕТ pending payments
     #     (он ещё ничего не отмечал или босс отклонил всё)

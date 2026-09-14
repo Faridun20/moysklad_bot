@@ -639,7 +639,6 @@ def test_return_refused_for_unshipped_and_foreign_order(open_app, e2e):
     assert e2e.rows("SELECT COUNT(*) AS n FROM returns")[0]["n"] == 0
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: cash-возврат по UZS-заказу без курса пишется в кассу как USD")
 def test_cash_refund_for_uzs_order_without_rate_is_not_booked_as_usd(open_app, e2e):
     """Возврат 1 250 000 сумов наличными при незаданном курсе UZS.
 
@@ -936,7 +935,6 @@ def test_machine_installment_row_opens_buyer_card_and_payments_close_deal(open_a
     assert boss.locator("text=По технике").count() == 0
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: карточка покупателя пишет «Получено 0» — не видит взнос и отмеченные платежи")
 def test_buyer_card_progress_counts_down_payment_and_paid_installments(open_app, e2e):
     _credit_machine(e2e)
     boss = open_app(e2e.ids["boss"])
@@ -952,7 +950,6 @@ def test_buyer_card_progress_counts_down_payment_and_paid_installments(open_app,
     assert "осталось10000USD" in progress, progress
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: «Внести оплату» в карточке покупателя не привязана к обработчику")
 def test_buyer_card_add_receipt_button_opens_form(open_app, e2e):
     _credit_machine(e2e)
     boss = open_app(e2e.ids["boss"])
@@ -963,7 +960,6 @@ def test_buyer_card_add_receipt_button_opens_form(open_app, e2e):
     boss.wait_for_selector(".c-overlay #ms-f-amount", timeout=3000)
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: частичное поступление по рассрочке не уменьшает долг в «Долгах»")
 def test_partial_machine_receipt_reduces_debt_row(open_app, e2e):
     from services import machines
 
@@ -1102,8 +1098,6 @@ def test_money_report_where_money_aging_top_debtors_forecast_discipline(open_app
         == "10200USD"
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: «Деньги → Отчёт» пересчитывает прошлые поступления по текущему курсу, "
-                                       "игнорируя payments.fx_rate_to_base")
 def test_money_report_uses_rate_frozen_at_confirmation(open_app, e2e):
     _set_rate(e2e, "UZS", 0.00008)   # 12 500 сум за доллар в день платежа
     pid = _standalone_payment(e2e, 1_250_000.0, "UZS")
@@ -1204,8 +1198,6 @@ def test_end_to_end_credit_order_payments_shrink_debt_and_match_report(open_app,
 # ─── Расхождения в деньгах: сдача ↔ отметка оплаты ───────────────────────────
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: mark_paid «весь остаток» не вычитает подтверждённую сдачу — "
-                                       "по заказу 100 создаётся платёж 100 при остатке 40")
 def test_mark_full_remaining_after_partial_deposit_charges_only_rest(open_app, e2e):
     oid = _order(e2e, price=100.0, ship=True)
     _deposit(e2e, 60.0, confirm=True)
@@ -1219,8 +1211,6 @@ def test_mark_full_remaining_after_partial_deposit_charges_only_rest(open_app, e
     assert e2e.rows("SELECT amount_cents FROM payments WHERE order_id = ?", (oid,)) == [{"amount_cents": 4000}]
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: сдача распределяется поверх ожидающей оплаты — "
-                                       "по заказу 200 собирается 350")
 def test_deposit_does_not_cover_amount_already_marked_paid(open_app, e2e):
     from services.database import mark_order_paid
 

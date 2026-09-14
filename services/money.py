@@ -17,11 +17,19 @@ from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
 
-# Зеркалит services.database._AMOUNT_MAX (10_000_000.0 мажорных единиц).
-# Держим локально, чтобы money.py не импортировал database (там обратный
-# импорт money → цикл). 1e7 единиц = 1e9 копеек — влезает в Postgres INT4,
-# но _cents-колонки объявлены BIGINT с запасом.
-MAX_CENTS = 1_000_000_000
+# Потолок одной суммы (платёж, сдача, цена техники) — в ЭКВИВАЛЕНТЕ базовой
+# валюты, а не «10 000 000 в любой валюте». Прежний потолок в единицах
+# валюты для сумов означал ≈ $800: заказ техники в UZS нельзя было оплатить
+# одним платежом. Сторож от опечаток и `1e308`, а не бизнес-лимит, поэтому
+# в базовой валюте он прежний — 10 000 000 (MAX_CENTS), старые USD-суммы
+# ведут себя как раньше.
+MAX_BASE_CENTS = 1_000_000_000
+MAX_CENTS = MAX_BASE_CENTS  # имя из прежнего API: потолок в базовой валюте
+
+# Технический потолок в ЛЮБОЙ валюте — для валюты без курса (пересчитать
+# потолок не во что) и как верхняя граница пересчёта. 1e15 копеек < 2**53:
+# сумма точно переживает float в JSON и Number во фронте, и далеко до BIGINT.
+HARD_MAX_CENTS = 10**15
 
 _ONE = Decimal("1")
 
@@ -107,10 +115,40 @@ def sub(a: int, b: int) -> int:
     return int(a) - int(b)
 
 
-def validate_cents(cents: int) -> tuple[bool, str]:
-    """Проверка диапазона суммы (зеркалит database.validate_amount, но в копейках)."""
+def max_cents_for_rate(rate_to_base: float | int | str | Decimal | None) -> int:
+    """Потолок суммы в копейках валюты с курсом `rate_to_base` (мажор/мажор).
+
+    MAX_BASE_CENTS в пересчёте: при курсе 0.00008 (12 500 сум за доллар)
+    это 12 500 × 10 000 000 сум. Курса нет или он негодный — HARD_MAX_CENTS:
+    отказывать в платеже из-за незаданного курса нельзя, а технический
+    потолок всё равно режет `1e308`.
+    """
+    if rate_to_base is None:
+        return HARD_MAX_CENTS
+    try:
+        rate = Decimal(str(rate_to_base))
+    except (ArithmeticError, ValueError):
+        return HARD_MAX_CENTS
+    if not rate.is_finite() or rate <= 0:
+        return HARD_MAX_CENTS
+    limit = (Decimal(MAX_BASE_CENTS) / rate).to_integral_value(rounding=ROUND_HALF_UP)
+    return int(min(Decimal(HARD_MAX_CENTS), limit))
+
+
+def validate_cents(
+    cents: int, rate_to_base: float | int | str | Decimal | None = 1
+) -> tuple[bool, str]:
+    """Проверка диапазона суммы в копейках.
+
+    `rate_to_base` — курс валюты суммы к базовой; по умолчанию 1 (сумма в
+    базовой валюте). Текст отказа называет потолок в базовой валюте — именно
+    так он и задан.
+    """
     if cents < 0:
         return False, "Сумма не может быть отрицательной"
-    if cents > MAX_CENTS:
-        return False, f"Сумма превышает лимит ({MAX_CENTS // 100:.0f})"
+    if cents > max_cents_for_rate(rate_to_base):
+        return False, (
+            f"Сумма превышает лимит (эквивалент {MAX_BASE_CENTS // 100:,} в базовой валюте)"
+            .replace(",", " ")
+        )
     return True, ""

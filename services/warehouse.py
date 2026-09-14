@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 
@@ -39,6 +40,13 @@ from services import database as _db
 # импорте имя осталось бы навсегда прежним.
 
 logger = logging.getLogger(__name__)
+
+
+def _base_currency() -> str:
+    from config import BASE_CURRENCY
+
+    return (BASE_CURRENCY or "USD").upper()
+
 
 INVOICE_TYPES = ("incoming", "outgoing")
 
@@ -725,10 +733,23 @@ async def list_shipments(since, until=None, limit: int = 1000) -> list[dict]:
 async def sales_stats(since, until=None) -> dict:
     """Выручка, число отгрузок, клиентов, топ товаров и клиентов за период.
 
-    `total` — в копейках, как отдавал МойСклад. Валюты НЕ складываем молча:
-    рядом едет `by_currency`, и экран обязан его показывать, если валют больше
-    одной (правило слоя дебиторки, CLAUDE.md).
+    Валюты НЕ складываем молча (правило слоя дебиторки, CLAUDE.md). Отчёт
+    продаж складывал USD и UZS в одно число: 1 000 USD + 12 500 000 UZS
+    выглядели как «12 501 000» выручки, и по этой цифре считались тренд и
+    средний чек. Поэтому:
+
+    * `by_currency` — {валюта: копейки}, по отгрузкам как есть;
+    * `base_total` — итог в копейках БАЗОВОЙ валюты по текущему курсу, только
+      то, что пересчитать удалось; `base_count` — сколько отгрузок в него
+      вошло (для среднего чека); `missing` — {валюта: копейки} без курса,
+      `base_partial` — часть выручки в итог не вошла. Снимка курса у
+      накладной нет, поэтому курс текущий — как в «Долгах»;
+    * топ товаров и клиентов — раздельно по валютам (`currency` в строке), а
+      порядок — по эквиваленту в базовой валюте;
+    * `total` — прежняя сумма копеек всех валют, оставлена для совместимости;
+      показывать её человеку нельзя.
     """
+    base = _base_currency()
     shipments = await list_shipments(since, until)
     if not shipments:
         return {
@@ -738,38 +759,78 @@ async def sales_stats(since, until=None) -> dict:
             "top_products": [],
             "top_clients": [],
             "by_currency": {},
+            "base_currency": base,
+            "base_total": 0,
+            "base_count": 0,
+            "base_partial": False,
+            "missing": {},
         }
+
+    # Курс — синхронное чтение с кэшем; один раз на валюту и в потоке, чтобы
+    # промах кэша не держал event loop.
+    rates: dict[str, float | None] = {}
+    for cur in {(s.get("currency") or base).upper() for s in shipments}:
+        rates[cur] = await asyncio.to_thread(_db.current_rate_to_base, cur)
+
+    def _rate(cur: str) -> float | None:
+        return rates.get(cur)
 
     total = sum(int(s["total_amount_cents"] or 0) for s in shipments)
     by_currency: dict[str, int] = {}
-    by_client: dict[str, dict] = {}
+    by_client: dict[tuple[str, str], dict] = {}
+    base_total = 0
+    base_count = 0
+    missing: dict[str, int] = {}
     for s in shipments:
-        cur = s.get("currency") or "?"
-        by_currency[cur] = by_currency.get(cur, 0) + int(s["total_amount_cents"] or 0)
+        cur = (s.get("currency") or base).upper()
+        cents = int(s["total_amount_cents"] or 0)
+        by_currency[cur] = by_currency.get(cur, 0) + cents
+        rate = _rate(cur)
+        if rate is None or rate <= 0:
+            missing[cur] = missing.get(cur, 0) + cents
+        else:
+            base_total += money.convert_cents(cents, rate)
+            base_count += 1
         cname = s.get("counterparty_name") or "—"
-        c = by_client.setdefault(cname, {"sum": 0, "count": 0})
-        c["sum"] += int(s["total_amount_cents"] or 0)
+        c = by_client.setdefault((cname, cur), {"sum": 0, "count": 0, "currency": cur})
+        c["sum"] += cents
         c["count"] += 1
     clients = len({s.get("counterparty_id") for s in shipments if s.get("counterparty_id")})
+    currency_by_invoice = {int(s["id"]): (s.get("currency") or base).upper() for s in shipments}
 
     ids = [int(s["id"]) for s in shipments]
     placeholders = ", ".join(f"${i + 1}" for i in range(len(ids)))
     positions = await adb_core.fetch(
-        f"SELECT ii.product_id, p.name, ii.quantity, ii.price_cents "
+        f"SELECT ii.invoice_id, ii.product_id, p.name, ii.quantity, ii.price_cents "
         f"FROM invoice_items ii JOIN products p ON p.id = ii.product_id "
         f"WHERE ii.invoice_id IN ({placeholders})",
         *ids,
     )
-    product_sums: dict[str, dict] = {}
+    product_sums: dict[tuple[str, str], dict] = {}
     for pos in positions:
         name = pos["name"] or "—"
-        d = product_sums.setdefault(name, {"sum": 0, "qty": 0.0, "product_id": None})
+        cur = currency_by_invoice.get(int(pos["invoice_id"]), base)
+        d = product_sums.setdefault(
+            (name, cur), {"sum": 0, "qty": 0.0, "product_id": None, "currency": cur}
+        )
         d["sum"] += money.mul_qty(int(pos["price_cents"] or 0), float(pos["quantity"] or 0))
         d["qty"] += float(pos["quantity"] or 0)
         d["product_id"] = int(pos["product_id"])
 
-    top_products = sorted(product_sums.items(), key=lambda kv: kv[1]["sum"], reverse=True)
-    top_clients = sorted(by_client.items(), key=lambda kv: kv[1]["sum"], reverse=True)
+    def _order_key(d: dict) -> tuple[bool, int]:
+        # По эквиваленту в базовой валюте; строки без курса — в конец, но не
+        # выбрасываем: продажа существует и без курса.
+        rate = _rate(d["currency"])
+        if rate is None or rate <= 0:
+            return (True, -d["sum"])
+        return (False, -money.convert_cents(d["sum"], rate))
+
+    top_products = sorted(
+        ((name, d) for (name, _cur), d in product_sums.items()), key=lambda kv: _order_key(kv[1])
+    )
+    top_clients = sorted(
+        ((name, d) for (name, _cur), d in by_client.items()), key=lambda kv: _order_key(kv[1])
+    )
     return {
         "total": total,
         "count": len(shipments),
@@ -777,6 +838,11 @@ async def sales_stats(since, until=None) -> dict:
         "top_products": top_products[:20],
         "top_clients": top_clients[:20],
         "by_currency": by_currency,
+        "base_currency": base,
+        "base_total": base_total,
+        "base_count": base_count,
+        "base_partial": bool(missing),
+        "missing": missing,
     }
 
 

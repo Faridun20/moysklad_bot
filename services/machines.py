@@ -36,7 +36,13 @@ from datetime import date, timedelta
 from typing import Any
 
 from services import adb_core, money
-from services.database import USE_POSTGRES, add_audit_log, get_role, now_str
+from services.database import (
+    USE_POSTGRES,
+    add_audit_log,
+    current_rate_to_base,
+    get_role,
+    now_str,
+)
 from utils.helpers import local_now
 
 logger = logging.getLogger(__name__)
@@ -167,12 +173,19 @@ async def _audit(user_id: int, full_name: str, action: str, details: str) -> Non
     await asyncio.to_thread(add_audit_log, user_id, full_name, role, action, details)
 
 
-def _validate_cents(value: int | None, label: str) -> tuple[bool, str]:
+async def _validate_cents(
+    value: int | None, label: str, currency: str | None = None
+) -> tuple[bool, str]:
+    """Сумма в копейках валюты `currency`. Потолок — в эквиваленте базовой
+    валюты: «10 000 000 в любой валюте» для сумов означал ≈ $800, и технику,
+    проданную в UZS, нельзя было ни оценить, ни оплатить."""
     if value is None:
         return True, ""
     if not isinstance(value, int):
         return False, f"{label}: сумма должна быть в копейках (целое число)"
-    ok, err = money.validate_cents(value)
+    # Курс — синхронное чтение (кэш 5 мин), поэтому в поток, как get_role.
+    rate = await asyncio.to_thread(current_rate_to_base, currency)
+    ok, err = money.validate_cents(value, rate)
     return ok, (f"{label}: {err}" if not ok else "")
 
 
@@ -207,7 +220,7 @@ async def create_machine(
     if status not in STATUSES:
         return {"ok": False, "error": f"Неизвестный статус: {status}"}
     for value, label in ((price_cents, "Цена"), (cost_cents, "Себестоимость")):
-        ok, err = _validate_cents(value, label)
+        ok, err = await _validate_cents(value, label, currency)
         if not ok:
             return {"ok": False, "error": err}
     if hours is not None and hours < 0:
@@ -326,11 +339,18 @@ async def update_machine_fields(
         return {"ok": False, "error": f"Нельзя менять поля: {', '.join(sorted(unknown))}"}
     if not fields:
         return {"ok": False, "error": "Нечего менять"}
-    for key in ("price_cents", "cost_cents"):
-        if key in fields:
-            ok, err = _validate_cents(fields[key], "Цена" if key == "price_cents" else "Себестоимость")
-            if not ok:
-                return {"ok": False, "error": err}
+    money_keys = [k for k in ("price_cents", "cost_cents") if k in fields]
+    currency = fields.get("currency")
+    if money_keys and not currency:
+        currency = await adb_core.fetchval(
+            "SELECT currency FROM machines WHERE id = $1", machine_id
+        )
+    for key in money_keys:
+        ok, err = await _validate_cents(
+            fields[key], "Цена" if key == "price_cents" else "Себестоимость", currency
+        )
+        if not ok:
+            return {"ok": False, "error": err}
 
     keys = sorted(fields)
     assignments = ", ".join(f"{k} = ${i + 1}" for i, k in enumerate(keys))
@@ -697,14 +717,14 @@ async def add_receipt(
     """
     if not isinstance(amount_cents, int) or amount_cents <= 0:
         return {"ok": False, "error": "Сумма должна быть больше нуля"}
-    ok, err = _validate_cents(amount_cents, "Сумма")
-    if not ok:
-        return {"ok": False, "error": err}
     deal = await adb_core.fetchrow(
         "SELECT id, closed_at, currency, price_cents FROM machine_deals WHERE id = $1", deal_id
     )
     if not deal:
         return {"ok": False, "error": "Сделка не найдена"}
+    ok, err = await _validate_cents(amount_cents, "Сумма", deal["currency"])
+    if not ok:
+        return {"ok": False, "error": err}
     if deal["closed_at"]:
         return {"ok": False, "error": "Рассрочка уже закрыта", "current": "closed"}
 
@@ -900,7 +920,7 @@ async def create_deal(
     """
     if kind not in DEAL_KINDS:
         return {"ok": False, "error": f"Тип сделки: {' / '.join(DEAL_KINDS)}"}
-    ok, err = _validate_cents(price_cents, "Цена")
+    ok, err = await _validate_cents(price_cents, "Цена", currency)
     if not ok:
         return {"ok": False, "error": err}
     if not price_cents:

@@ -212,6 +212,14 @@
       head =
         `<div class="money-total">≈ ${opsAmount(summary.base_total)} ` +
         `${escapeHtml(baseCurrency)}${partial}</div>`;
+      // Пересчёт идёт по курсу дня подтверждения (снимок), а не по сегодняшнему:
+      // иначе прошлые поступления «плыли» бы вместе с курсом. Говорим об этом,
+      // только когда пересчитывать есть что — одна валюта в пояснении не нуждается.
+      if (pays.some((p) => p.currency && p.currency !== baseCurrency)) {
+        head +=
+          `<div class="money-total-hint">В ${escapeHtml(baseCurrency)} — ` +
+          `по курсу на день поступления.</div>`;
+      }
     }
     if (missing.length) {
       const list = missing.map((m) => `${m.currency} ${opsAmount(m.amount)}`).join(', ');

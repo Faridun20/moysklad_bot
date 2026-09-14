@@ -1371,7 +1371,9 @@ function machineReceiptsHtml(deal) {
       </div>`).join('')}</div>`;
 }
 
-function openReceiptForm(machineId, deal) {
+// `refresh` — чем перерисовать экран после записи: форма открывается и из
+// карточки машины, и из карточки покупателя, и каждая перерисовывает себя.
+function openReceiptForm(deal, refresh) {
   const key = idemKey();
   openMachineSheet({
     title: 'Оплата по рассрочке',
@@ -1388,7 +1390,7 @@ function openReceiptForm(machineId, deal) {
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
       toast(res.body.deal_closed ? 'Рассрочка закрыта — всё получено' : 'Оплата записана');
-      renderMachineCard(machineId);
+      refresh();
       return true;
     },
   });
@@ -2488,10 +2490,18 @@ async function renderMachineCard(machineId) {
       toggleMachinePayment(m.id, Number(btn.dataset.payment), btn.dataset.paid === '1');
     });
   });
+  wireDealReceipts(content, card.deals, () => renderMachineCard(machineId));
+}
+
+// «Внести оплату» и удаление поступления под графиком рассрочки. График
+// рисует один machineScheduleHtml и в карточке машины, и в карточке
+// покупателя — обработчики тоже одни: карточка покупателя вешала только
+// [data-payment], и «Внести оплату» там молча не нажималась.
+function wireDealReceipts(content, deals, refresh) {
   content.querySelectorAll('[data-receipt-add]').forEach(btn => {
     btn.addEventListener('click', () => {
-      const deal = (card.deals || []).find(x => String(x.id) === btn.dataset.receiptAdd);
-      if (deal) openReceiptForm(machineId, deal);
+      const deal = (deals || []).find(x => String(x.id) === btn.dataset.receiptAdd);
+      if (deal) openReceiptForm(deal, refresh);
     });
   });
   content.querySelectorAll('[data-receipt-del]').forEach(btn => {
@@ -2506,7 +2516,7 @@ async function renderMachineCard(machineId) {
       }
       haptic('success');
       toast(res.body.deal_reopened ? 'Поступление удалено, рассрочка снова открыта' : 'Удалено');
-      renderMachineCard(machineId);
+      refresh();
     });
   });
 }
@@ -4400,7 +4410,7 @@ function renderAnalyticsContent(data) {
       <span class="top-medal rank-chip">${i + 1}</span>
       <div class="top-info">
         <div class="top-name">${escapeHtml(c.name)}</div>
-        <div class="top-sub">${formatMoney(c.revenue, cur)} · ${plural(c.count, ['отгрузка', 'отгрузки', 'отгрузок'])}</div>
+        <div class="top-sub">${formatMoney(c.revenue, c.currency || cur)} · ${plural(c.count, ['отгрузка', 'отгрузки', 'отгрузок'])}</div>
       </div>
     </div>`).join('');
   // Выручка/долг менеджера — РАЗДЕЛЬНО по валютам (не складываем); fallback на
@@ -4474,20 +4484,42 @@ function renderAnalyticsContent(data) {
   };
 
   // Руководство: четыре агрегата в базовой валюте, сетка 2×2 (UI-бриф п.8а).
-  const companyStatsHtml = () => `
+  // Выручка в разных валютах НЕ складывается: сервер отдаёт итог в базовой по
+  // курсу (`total`), разбивку `total_by_currency` и флаг `base_partial`. Одна
+  // валюта, совпадающая с базовой, — число как есть; иначе «≈» и строки по
+  // валютам под сеткой, а без курса — пометка, как в «Деньги → Отчёт».
+  const companyStatsHtml = () => {
+    const byCur = data.total_by_currency || [];
+    const converted = byCur.length > 1 || (byCur.length === 1 && byCur[0].currency !== cur);
+    const nothingConverted = data.base_partial && !data.total;
+    const partialMark = data.base_partial
+      ? ' <span class="money-placeholder">(часть без курса)</span>' : '';
+    const revenueValue = nothingConverted
+      ? byCur.map(r => escapeHtml(formatMoney(r.total, r.currency))).join(' · ')
+      : `${converted ? '≈ ' : ''}${formatMoney(data.total, cur)}${partialMark}`;
+    const byCurLines = converted && byCur.length
+      ? `<div class="section-label">Выручка по валютам</div>
+         <div class="c-surface c-surface--pad">${byCur.map(r => `
+           <div class="rev-row">
+             <span class="rev-amount">${fmt(r.total)} ${escapeHtml(r.currency)}</span>
+           </div>`).join('')}</div>`
+      : '';
+    return `
     <div class="stat-grid">
       <div class="stat">
-        <div class="stat-value">${formatMoney(data.total, cur)}</div>
+        <div class="stat-value">${revenueValue}</div>
         <div class="stat-label">Выручка</div>
         ${trendStr ? `<div class="${trendClass} u-fs-11 u-mt-1">${trendStr}</div>` : ''}
       </div>
       ${countStat(data.count, ['отгрузка', 'отгрузки', 'отгрузок'])}
       ${countStat(data.clients, ['клиент', 'клиента', 'клиентов'])}
       <div class="stat">
-        <div class="stat-value">${formatMoney(data.avg_check, cur)}</div>
+        <div class="stat-value">${converted ? '≈ ' : ''}${formatMoney(data.avg_check, cur)}</div>
         <div class="stat-label">Средний чек</div>
       </div>
-    </div>`;
+    </div>
+    ${byCurLines}`;
+  };
 
   const isPersonal = data.scope === 'personal' && Array.isArray(data.revenue);
   const statsBlock = isPersonal ? personalStatsHtml() : companyStatsHtml();
@@ -5460,6 +5492,7 @@ async function renderBuyerCard(buyer) {
       await toggleMachinePaymentFromBuyer(buyer, Number(btn.dataset.payment), btn.dataset.paid === '1');
     });
   });
+  wireDealReceipts(content, card.deals, () => renderBuyerCard(buyer));
 }
 
 async function toggleMachinePaymentFromBuyer(buyer, paymentId, wasPaid) {

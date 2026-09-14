@@ -103,7 +103,7 @@ def _money_block(items: list[Receivable]) -> dict:
 
 
 async def _order_receivables(user_id: int | None) -> list[Receivable]:
-    from services.database import get_open_debts
+    from services.database import debt_due_date, get_open_debts
     from services.debts import calc_order_balances
 
     orders = await get_open_debts(user_id=user_id)
@@ -122,7 +122,8 @@ async def _order_receivables(user_id: int | None) -> list[Receivable]:
                 title=f"#{o['id']}",
                 counterparty=o.get("agent_name") or "—",
                 owner_id=o.get("user_id"),
-                due_date=(o.get("due_date") or None),
+                # «Оплата сразу» причиталась в день заказа — стареет с него.
+                due_date=debt_due_date(o),
                 amount_cents=bal.remaining_cents,
                 currency=bal.currency,
             )
@@ -130,14 +131,60 @@ async def _order_receivables(user_id: int | None) -> list[Receivable]:
     return out
 
 
+async def schedule_coverage(deal_ids: list[int]) -> dict[int, int]:
+    """Сколько уже внесено в счёт каждого платежа графика: {payment_id: копейки}.
+
+    График — план, поступления — факт (`machine_payment_receipts`), и гасят они
+    график по порядку (`machines.allocate_receipts`). `paid_at` ставится только
+    платежу, покрытому ЦЕЛИКОМ, поэтому сумма неоплаченных строк не видела
+    частичных поступлений: клиент внёс 1 500 из 5 000, а в «Долгах» и
+    «Нам должны» висело всё те же 15 000. Раскладку делаем тем же
+    `allocate_receipts`, что карточка сделки, — второй формулы покрытия нет.
+
+    Два запроса на любое число сделок.
+    """
+    from services.machines import allocate_receipts
+
+    ids = [int(d) for d in dict.fromkeys(deal_ids or [])]
+    if not ids:
+        return {}
+    ph = ", ".join(f"${i + 1}" for i in range(len(ids)))
+    schedule_rows = await adb_core.fetch(
+        f"SELECT id, deal_id, seq, amount_cents FROM machine_deal_payments "
+        f"WHERE deal_id IN ({ph}) ORDER BY deal_id, seq",
+        *ids,
+    )
+    receipt_rows = await adb_core.fetch(
+        f"SELECT deal_id, COALESCE(SUM(amount_cents), 0) AS s "
+        f"FROM machine_payment_receipts WHERE deal_id IN ({ph}) GROUP BY deal_id",
+        *ids,
+    )
+    received = {int(r["deal_id"]): int(r["s"] or 0) for r in receipt_rows}
+    by_deal: dict[int, list[dict]] = {}
+    for r in schedule_rows:
+        by_deal.setdefault(int(r["deal_id"]), []).append(dict(r))
+    out: dict[int, int] = {}
+    for deal_id, rows in by_deal.items():
+        for item in allocate_receipts(rows, received.get(deal_id, 0)):
+            out[int(item["id"])] = int(item["covered_cents"])
+    return out
+
+
+def _uncovered(amount_cents: int, covered_cents: int) -> int:
+    """Остаток неоплаченного платежа графика. Ноль снизу — на случай
+    легаси-строк, где отметка и поступления разошлись."""
+    return max(0, int(amount_cents) - int(covered_cents))
+
+
 async def machine_receivables() -> list[Receivable]:
-    """Неоплаченные платежи графиков по незакрытым рассрочкам.
+    """Неоплаченные платежи графиков по незакрытым рассрочкам — за вычетом
+    частичных поступлений (`schedule_coverage`).
 
     Взнос (`seq = 0`) отмечен оплаченным в момент сделки, поэтому сюда не
     попадает сам собой — отдельного условия не нужно.
     """
     rows = await adb_core.fetch(
-        "SELECT p.id, p.due_date, p.amount_cents, d.currency, d.buyer_name, "
+        "SELECT p.id, p.deal_id, p.due_date, p.amount_cents, d.currency, d.buyer_name, "
         "       m.name AS machine_name, m.vin "
         "FROM machine_deal_payments p "
         "JOIN machine_deals d ON d.id = p.deal_id "
@@ -145,19 +192,25 @@ async def machine_receivables() -> list[Receivable]:
         "WHERE p.paid_at IS NULL AND d.closed_at IS NULL "
         "ORDER BY p.due_date"
     )
-    return [
-        Receivable(
-            source="machine",
-            ref_id=int(r["id"]),
-            title=r["machine_name"] or r["vin"] or "—",
-            counterparty=r["buyer_name"] or "—",
-            owner_id=None,
-            due_date=(r["due_date"] or None),
-            amount_cents=int(r["amount_cents"] or 0),
-            currency=(r["currency"] or _base_currency()).upper(),
+    covered = await schedule_coverage([int(r["deal_id"]) for r in rows])
+    out = []
+    for r in rows:
+        left = _uncovered(int(r["amount_cents"] or 0), covered.get(int(r["id"]), 0))
+        if left <= 0:
+            continue
+        out.append(
+            Receivable(
+                source="machine",
+                ref_id=int(r["id"]),
+                title=r["machine_name"] or r["vin"] or "—",
+                counterparty=r["buyer_name"] or "—",
+                owner_id=None,
+                due_date=(r["due_date"] or None),
+                amount_cents=left,
+                currency=(r["currency"] or _base_currency()).upper(),
+            )
         )
-        for r in rows
-    ]
+    return out
 
 
 async def collect(user_id: int | None = None, *, include_machines: bool = True) -> list[Receivable]:
@@ -371,23 +424,36 @@ async def buyer_card(name: str) -> dict:
     if not mine:
         return {}
 
-    schedules = await asyncio.gather(
-        *(_schedule_for(int(d["id"])) for d in mine)
-    )
+    # График отдаём так же, как карточка машины: платежи с покрытием,
+    # прогресс (взнос + поступления) и лента поступлений. Без них фронт считал
+    # «Получено» по пустому `covered_cents` и писал «Получено 0 из …», хотя
+    # взнос и отмеченные платежи уже лежали в базе.
+    progresses = await asyncio.gather(*(_progress_for(int(d["id"])) for d in mine))
+    receipts = await asyncio.gather(*(_receipts_for(int(d["id"])) for d in mine))
     outstanding: list[Receivable] = []
-    for deal, rows in zip(mine, schedules, strict=True):
+    for deal, progress, deal_receipts in zip(mine, progresses, receipts, strict=True):
+        rows = progress["payments"]
         deal["payments"] = rows
+        if rows:
+            deal["progress"] = {k: v for k, v in progress.items() if k != "payments"}
+            deal["receipts"] = deal_receipts
         if deal.get("closed_at"):
             continue
-        outstanding.extend(
-            Receivable(
-                "machine", int(p["id"]), deal["machine_name"] or "—",
-                deal["buyer_name"] or "—", None, p["due_date"],
-                int(p["amount_cents"] or 0),
-                (deal["currency"] or _base_currency()).upper(),
+        # Остаток — за вычетом частичных поступлений: «Всего по рассрочкам»
+        # обязано совпасть с «осталось» в прогрессе ниже.
+        for p in rows:
+            if p["paid_at"] or int(p["seq"]) <= 0:
+                continue
+            left = _uncovered(int(p["amount_cents"] or 0), int(p.get("covered_cents") or 0))
+            if left <= 0:
+                continue
+            outstanding.append(
+                Receivable(
+                    "machine", int(p["id"]), deal["machine_name"] or "—",
+                    deal["buyer_name"] or "—", None, p["due_date"], left,
+                    (deal["currency"] or _base_currency()).upper(),
+                )
             )
-            for p in rows if not p["paid_at"] and int(p["seq"]) > 0
-        )
     return {
         "buyer": mine[0]["buyer_name"],
         "deals": mine,
@@ -396,10 +462,16 @@ async def buyer_card(name: str) -> dict:
     }
 
 
-async def _schedule_for(deal_id: int) -> list[dict]:
+async def _progress_for(deal_id: int) -> dict:
     from services import machines
 
-    return await machines.get_schedule(deal_id)
+    return await machines.deal_progress(deal_id)
+
+
+async def _receipts_for(deal_id: int) -> list[dict]:
+    from services import machines
+
+    return await machines.list_receipts(deal_id)
 
 
 async def machine_debt_rows(today: str) -> list[dict]:
@@ -416,12 +488,21 @@ async def machine_debt_rows(today: str) -> list[dict]:
     )
     if not deals:
         return []
-    rest_rows = await adb_core.fetch(
-        "SELECT deal_id, COALESCE(SUM(amount_cents), 0) AS rest "
-        "FROM machine_deal_payments WHERE paid_at IS NULL AND seq > 0 GROUP BY deal_id"
+    deal_ids = [int(d["id"]) for d in deals]
+    ph = ", ".join(f"${i + 1}" for i in range(len(deal_ids)))
+    unpaid = await adb_core.fetch(
+        f"SELECT id, deal_id, amount_cents FROM machine_deal_payments "
+        f"WHERE paid_at IS NULL AND seq > 0 AND deal_id IN ({ph})",
+        *deal_ids,
     )
-    rest_by_deal = {int(r["deal_id"]): int(r["rest"] or 0) for r in rest_rows}
-    next_due = await next_due_by_deal([int(d["id"]) for d in deals])
+    # Остаток — сумма неоплаченных строк МИНУС частичные поступления по ним:
+    # клиент внёс 1 500 из 5 000 — должен 13 500, а не 15 000.
+    covered = await schedule_coverage(deal_ids)
+    rest_by_deal: dict[int, int] = {}
+    for r in unpaid:
+        left = _uncovered(int(r["amount_cents"] or 0), covered.get(int(r["id"]), 0))
+        rest_by_deal[int(r["deal_id"])] = rest_by_deal.get(int(r["deal_id"]), 0) + left
+    next_due = await next_due_by_deal(deal_ids)
 
     out = []
     for d in deals:
@@ -438,7 +519,14 @@ async def machine_debt_rows(today: str) -> list[dict]:
             "currency": (d["currency"] or _base_currency()).upper(),
             "remaining": float(money.from_cents(rest)),
             "next_due": due,
-            "next_amount": float(money.from_cents(int(nxt["amount_cents"]))) if nxt else None,
+            # Следующий платёж — сколько по нему осталось внести, а не плановая
+            # сумма: частично внесённый платёж иначе звучал бы как не начатый.
+            "next_amount": (
+                float(money.from_cents(
+                    _uncovered(int(nxt["amount_cents"]), covered.get(int(nxt["id"]), 0))
+                ))
+                if nxt else None
+            ),
             "state": (
                 "overdue" if due and due < today
                 else ("due_today" if due == today else "upcoming")
