@@ -143,6 +143,11 @@ Start Command. Расписания в UTC.
 | `cron-backup` | `python -m tasks.run_backup` | `20 3 * * *` | дамп БД → gzip → приватный канал |
 | `cron-machines-archive` | `python -m tasks.run_machines_archive` | `40 3 * * *` | проданная техника старше 90 дней → архив |
 | `cron-money-report` | `python -m tasks.run_money_report` | `0 6 * * 1` | «Где деньги» руководству: дебиторка, прогноз, дисциплина |
+| `cron-fx-sync` | `python -m tasks.run_fx_sync` | `30 5 * * *` | курс USD↔UZS от ЦБ РУз — до долгов и отчётов |
+
+Свой сервер (docker compose) — те же задачи сервисами `cron-*` в
+`docker-compose.yml`, запускает их crontab хоста через `scripts/cron.sh`
+(готовый crontab — комментарием внизу compose-файла).
 
 Ночные разнесены по 20 минут намеренно: `run_backup` держит соединение под
 дамп, а `run_maintenance` в это же время удаляет строки — пересекать их не надо.

@@ -36,13 +36,14 @@ FROM python:3.11.9-slim-bookworm
 #       документов. Проверено: покрывает узбекскую кириллицу (ў, қ, ғ, ҳ)
 #       полностью, как и DejaVu.
 #
-#   postgresql-client
-#       pg_dump для tasks/run_backup. ВНИМАНИЕ: в bookworm это клиент 15.
-#       Если сервер Postgres новее, pg_dump откажет с «server version
-#       mismatch» — run_backup это ловит и переключается на
-#       version-independent дамп на чистом Python, бэкап не теряется.
-#       Для полноценного pg_dump подключите репозиторий PGDG и поставьте
-#       postgresql-client-<версия вашего сервера>.
+#   postgresql-client-${PG_CLIENT_VERSION} (из репозитория PGDG)
+#       pg_dump для tasks/run_backup. В bookworm штатный клиент — 15, а
+#       pg_dump отказывается дампить сервер новее себя («server version
+#       mismatch»). run_backup тогда откатывается на Python-дамп, но тот
+#       data-only: без схемы, восстановление требует `tasks.migrate`. Поэтому
+#       ставим клиент из PGDG под версию сервера (postgres:16 в compose).
+#       Сервер обновили — поднимите PG_CLIENT_VERSION: клиент может быть
+#       новее сервера, но не старее.
 #
 #   cups-client
 #       `lp` и `lpstat` для печати документов на офисный принтер
@@ -67,14 +68,21 @@ FROM python:3.11.9-slim-bookworm
 #       Это ~400 МБ к образу. Собрать без юр. документов (расписки перестанут
 #       формироваться, остальное работает): --build-arg WITH_LIBREOFFICE=0.
 ARG WITH_LIBREOFFICE=1
+ARG PG_CLIENT_VERSION=16
+# Ключ PGDG через ADD: в slim-образе нет ни curl, ни gnupg, а apt принимает
+# armored-ключ (.asc) в signed-by как есть.
+ADD https://www.postgresql.org/media/keys/ACCC4CF8.asc /usr/share/keyrings/pgdg.asc
 RUN set -eux; \
+    chmod 644 /usr/share/keyrings/pgdg.asc; \
+    echo "deb [signed-by=/usr/share/keyrings/pgdg.asc] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         libpango-1.0-0 \
         libpangoft2-1.0-0 \
         fonts-dejavu-core \
         fonts-liberation \
-        postgresql-client \
+        "postgresql-client-${PG_CLIENT_VERSION}" \
         cups-client \
         tzdata \
         ca-certificates; \

@@ -182,24 +182,6 @@ services:
     command: ["python", "-m", "tasks.run_ops_monitor"]
     restart: "no"
 
-  cron-machines-archive:
-    <<: *app
-    profiles: ["cron"]
-    command: ["python", "-m", "tasks.run_machines_archive"]
-    restart: "no"
-
-  cron-money-report:
-    <<: *app
-    profiles: ["cron"]
-    command: ["python", "-m", "tasks.run_money_report"]
-    restart: "no"
-
-  cron-fx-sync:
-    <<: *app
-    profiles: ["cron"]
-    command: ["python", "-m", "tasks.run_fx_sync"]
-    restart: "no"
-
 volumes:
   redisdata:
   appdata:
@@ -209,17 +191,15 @@ networks:
     external: true
 
 # ─── crontab хоста ───────────────────────────────────────────────────────────
-# Запуск — через scripts/cron.sh: он делает `docker compose run --rm -T`,
-# не даёт одной задаче наложиться на саму себя (flock) и пишет лог в
-# logs/cron-<сервис>.log. Установленный на этом сервере crontab (хост в +05):
+# Подставьте свой путь к проекту. `--rm` обязателен, иначе остановленные
+# контейнеры копятся. Логи — в файл: у одноразовых контейнеров их иначе
+# негде смотреть после выхода.
 #
-#   0 3 * * *     /srv/docker/moysklad_bot/scripts/cron.sh cron-maintenance
-#   20 3 * * *    /srv/docker/moysklad_bot/scripts/cron.sh cron-backup
-#   40 3 * * *    /srv/docker/moysklad_bot/scripts/cron.sh cron-machines-archive
-#   30 10 * * *   /srv/docker/moysklad_bot/scripts/cron.sh cron-fx-sync
-#   0 11 * * *    /srv/docker/moysklad_bot/scripts/cron.sh cron-debts-notify
-#   30 11 * * *   /srv/docker/moysklad_bot/scripts/cron.sh cron-ops-monitor
-#   15 11 * * 1   /srv/docker/moysklad_bot/scripts/cron.sh cron-money-report
+#   cd /opt/moysklad_bot
+#   0 9 * * *     docker compose run --rm cron-debts-notify    >> /var/log/msbot-debts.log 2>&1
+#   0 18 * * *    docker compose run --rm cron-ops-monitor     >> /var/log/msbot-ops.log 2>&1
+#   30 2 * * *    docker compose run --rm cron-maintenance     >> /var/log/msbot-maint.log 2>&1
+#   0 3 * * *     docker compose run --rm cron-backup          >> /var/log/msbot-backup.log 2>&1
 #
 # Время в crontab — в зоне ХОСТА, а не в TZ из .env. Если они разные,
 # пересчитайте часы.

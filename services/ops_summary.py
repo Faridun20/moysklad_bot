@@ -24,13 +24,18 @@ from services.database import (
 
 # Cron-пороги — те же, что проверял ops_monitor, но БЕЗ report_daily/weekly/monthly:
 # отчёты из бота убраны (смотрим в WebApp Аналитике), их cron'ов больше нет —
-# иначе был бы ложный алерт «cron не запускался».
+# иначе был бы ложный алерт «cron не запускался». По той же причине здесь нет
+# ms_sync_retry: задачу убрали вместе с синхронизацией в МС, а порог остался и
+# каждый день поднимал «ни разу не запускался».
+# Список обязан совпадать с cron-сервисами в docker-compose.yml.
 CRON_THRESHOLDS_HOURS: dict[str, float] = {
-    "ms_sync_retry": 1.0,  # */15 минут → ≤1ч назад
     "ops_monitor": 26.0,  # 1×/день → 26ч с запасом
     "maintenance": 26.0,
     "debts_notify": 26.0,
     "backup": 26.0,
+    "machines_archive": 26.0,
+    "fx_sync": 26.0,
+    "money_report": 170.0,  # 1×/неделю → 7 суток + 2ч
 }
 
 _ITEM_CAP = 15

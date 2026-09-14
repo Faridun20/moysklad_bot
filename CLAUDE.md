@@ -35,6 +35,7 @@ python -m tasks.run_maintenance          # janitor: чистка дедупа/а
 python -m tasks.run_backup               # дамп БД → gzip → приватный TG-канал (ночью)
 python -m tasks.run_machines_archive     # техника: проданное >90 дней назад → archived (ночью, T4.3)
 python -m tasks.run_money_report         # «Где деньги» руководству Rich Message'ом (понедельник)
+python -m tasks.run_fx_sync              # курс USD↔UZS от ЦБ РУз (раз в сутки, до долгов и отчётов)
 ```
 
 **Сборка/деплой:** Railway **Railpack** (не Nixpacks) — `railpack.json`

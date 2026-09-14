@@ -35,3 +35,6 @@ venv/
 
 # Локально скачанный Railway CLI (для проверки прод-логов)
 .railway-cli/
+
+# Логи cron-обёртки (scripts/cron.sh)
+logs/

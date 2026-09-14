@@ -43,3 +43,6 @@ venv/
 # Артефакты сборки образа.
 Dockerfile
 .dockerignore
+
+# Логи cron-обёртки (scripts/cron.sh)
+logs/
