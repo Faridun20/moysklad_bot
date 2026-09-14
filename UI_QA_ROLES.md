@@ -23,10 +23,10 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 125._
+_Всего эндпоинтов: 126._
 
 
-### Админ (`admin`) — 119 эндпоинтов
+### Админ (`admin`) — 120 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -142,6 +142,7 @@ _Всего эндпоинтов: 125._
 - `/api/today`
 - `/api/users/deactivate`
 - `/api/wh/counterparties`
+- `/api/wh/counterparties/create`
 - `/api/wh/invoices`
 - `/api/wh/invoices/cancel`
 - `/api/wh/invoices/create`
@@ -153,7 +154,7 @@ _Всего эндпоинтов: 125._
 </details>
 
 
-### Руководитель (`boss`) — 116 эндпоинтов
+### Руководитель (`boss`) — 117 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -266,6 +267,7 @@ _Всего эндпоинтов: 125._
 - `/api/stock`
 - `/api/today`
 - `/api/wh/counterparties`
+- `/api/wh/counterparties/create`
 - `/api/wh/invoices`
 - `/api/wh/invoices/cancel`
 - `/api/wh/invoices/create`
@@ -277,7 +279,7 @@ _Всего эндпоинтов: 125._
 </details>
 
 
-### Менеджер (`manager`) — 64 эндпоинтов
+### Менеджер (`manager`) — 65 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -339,6 +341,7 @@ _Всего эндпоинтов: 125._
 - `/api/stock`
 - `/api/today`
 - `/api/wh/counterparties`
+- `/api/wh/counterparties/create`
 - `/api/wh/invoices`
 - `/api/wh/invoices/create`
 - `/api/wh/invoices/get`
