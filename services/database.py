@@ -1268,6 +1268,12 @@ def _create_indexes():
             "ON order_item_products(product_id)",
             "CREATE INDEX IF NOT EXISTS idx_order_shipment_failed "
             "ON order_shipment(failed_at) WHERE failed_at IS NOT NULL",
+            # Позиции заказа и возврата читаются ТОЛЬКО по родителю: карточка
+            # заказа, долг агента (батч по order_id), отгрузка, возврат. PK стоит
+            # на id, и без этих индексов каждый такой запрос читал таблицу
+            # целиком — самую длинную в схеме.
+            "CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id)",
+            "CREATE INDEX IF NOT EXISTS idx_return_items_return ON return_items(return_id)",
         ]
         for sql in snapshot_indexes:
             try:

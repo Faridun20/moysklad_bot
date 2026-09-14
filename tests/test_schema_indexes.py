@@ -35,6 +35,8 @@ EXPECTED_INDEXES = [
     "idx_payments_pending",
     "idx_user_roles_role",
     "idx_orders_debt_lookup",
+    "idx_order_items_order",
+    "idx_return_items_return",
 ]
 
 
@@ -161,3 +163,12 @@ def test_null_ms_ids_do_not_collide(isolated_db):
         cur = isolated_db.get_cursor(conn)
         cur.execute("SELECT COUNT(*) FROM orders WHERE ms_customerorder_id IS NULL")
         assert cur.fetchone()[0] == 3
+
+
+def test_items_by_parent_use_index(isolated_db):
+    """Позиции заказа и возврата читаются по родителю — без индекса это full
+    scan самой длинной таблицы на каждой карточке и расчёте долга."""
+    plan = _plan(isolated_db, "SELECT * FROM order_items WHERE order_id = 1")
+    assert "idx_order_items_order" in plan, plan
+    plan = _plan(isolated_db, "SELECT * FROM return_items WHERE return_id = 1")
+    assert "idx_return_items_return" in plan, plan

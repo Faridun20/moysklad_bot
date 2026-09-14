@@ -87,6 +87,37 @@ def _rowcount_from_status(status: str) -> int:
 # ─── lifecycle ────────────────────────────────────────────────────────────────
 
 
+# Таймауты сессии asyncpg-пула. Без них один зависший запрос (или транзакция,
+# ждущая чужой FOR UPDATE / advisory-lock) держал соединение пула бесконечно, и
+# после десятка таких WebApp вставал целиком: новые запросы ждали свободного
+# соединения, которого не будет. statement_timeout — на ОДИН запрос, а не на
+# транзакцию: длинная пачка коротких INSERT (перенос истории) его не задевает.
+# Самые тяжёлые запросы пула — агрегаты аналитики и отчёта — укладываются в
+# секунды. Схему и backfill'ы (`tasks.migrate`) гоняет синхронный слой
+# (psycopg2), таймауты пула их не касаются. Разовому скрипту, которому нужно
+# больше, — env: PG_STATEMENT_TIMEOUT_MS=0 снимает ограничение.
+_DEFAULT_STATEMENT_TIMEOUT_MS = 30_000
+_DEFAULT_LOCK_TIMEOUT_MS = 10_000
+
+
+def _env_ms(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return max(0, value)
+
+
+def pg_server_settings() -> dict[str, str]:
+    """server_settings для asyncpg: таймауты запроса и ожидания блокировки."""
+    return {
+        "statement_timeout": str(_env_ms("PG_STATEMENT_TIMEOUT_MS", _DEFAULT_STATEMENT_TIMEOUT_MS)),
+        # lock_timeout ограничивает и ожидание pg_advisory_xact_lock: очередь
+        # на один заказ дольше 10 с — это зависание, а не нагрузка.
+        "lock_timeout": str(_env_ms("PG_LOCK_TIMEOUT_MS", _DEFAULT_LOCK_TIMEOUT_MS)),
+    }
+
+
 async def init_pool() -> Any:
     """Создать/вернуть asyncpg-пул для ТЕКУЩЕГО event loop'а. Для SQLite — None.
 
@@ -118,6 +149,7 @@ async def init_pool() -> Any:
         os.environ["DATABASE_URL"],
         min_size=int(os.environ.get("PG_POOL_MIN", "1")),
         max_size=int(os.environ.get("PG_POOL_MAX", "10")),
+        server_settings=pg_server_settings(),
     )
     _pg_pool_loop = loop
     return _pg_pool

@@ -164,3 +164,39 @@ def test_transaction_commit_and_rollback(sqlite_env):
         assert await adb_core.fetchval("SELECT COUNT(*) FROM t") == 2
 
     asyncio.run(scenario())
+
+
+def test_pool_sets_statement_and_lock_timeouts(monkeypatch):
+    """Пул asyncpg без таймаутов: один зависший запрос или ожидание чужого
+    FOR UPDATE держало соединение вечно, и пул кончался. Таймауты едут в
+    server_settings каждого соединения."""
+    import sys
+    import types
+
+    seen = {}
+
+    class FakePool:
+        def terminate(self):
+            pass
+
+    async def fake_create_pool(*a, **k):
+        seen.update(k)
+        return FakePool()
+
+    fake_asyncpg = types.ModuleType("asyncpg")
+    fake_asyncpg.create_pool = fake_create_pool
+    monkeypatch.setitem(sys.modules, "asyncpg", fake_asyncpg)
+    monkeypatch.setenv("DATABASE_URL", "postgres://fake/db")
+    monkeypatch.delenv("PG_STATEMENT_TIMEOUT_MS", raising=False)
+    monkeypatch.delenv("PG_LOCK_TIMEOUT_MS", raising=False)
+    monkeypatch.setattr(adb_core, "_pg_pool", None)
+    monkeypatch.setattr(adb_core, "_pg_pool_loop", None)
+
+    asyncio.run(adb_core.init_pool())
+    assert seen["server_settings"] == {"statement_timeout": "30000", "lock_timeout": "10000"}
+
+
+def test_timeouts_are_overridable_for_one_off_scripts(monkeypatch):
+    monkeypatch.setenv("PG_STATEMENT_TIMEOUT_MS", "0")
+    monkeypatch.setenv("PG_LOCK_TIMEOUT_MS", "мусор")
+    assert adb_core.pg_server_settings() == {"statement_timeout": "0", "lock_timeout": "10000"}
