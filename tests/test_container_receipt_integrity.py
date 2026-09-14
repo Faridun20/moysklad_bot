@@ -156,3 +156,64 @@ def test_deleting_not_received_container_still_works(isolated_db, monkeypatch):
     res = _post(_client(monkeypatch), "/api/containers/delete", 2, container_id=cid)
     assert res.status_code == 200, res.text
     assert res.json()["invoice_cancelled"] is None
+
+
+# ─── п.7: накладная заказа/контейнера отменяется через них ────────────────────
+
+
+def test_invoice_of_a_shipped_order_cannot_be_cancelled_directly(isolated_db, monkeypatch):
+    from services import adb_core, container_receipt, order_shipment, warehouse
+
+    db = isolated_db
+    _setup(db)
+    pid = _run(container_receipt.create_product("Кабель"))["product_id"]
+    wid = _run(warehouse.default_warehouse_id())
+    _run(warehouse.create_invoice(
+        invoice_type="incoming", warehouse_id=wid,
+        items=[{"product_id": pid, "quantity": 20, "price_cents": None}],
+    ))
+    oid = db.create_order(1, "Mgr", "")
+    db.add_order_item(oid, "Кабель", "", 5, "шт", 10.0, product_id=pid)
+    db.update_order_status(oid, "approved")
+    shipped = _run(order_shipment.ship_order(_run(db.get_order(oid)), _run(db.get_order_items(oid)), user_id=1))
+    assert shipped["ok"]
+    assert _stock(pid) == 15
+
+    res = _post(_client(monkeypatch), "/api/wh/invoices/cancel", 2, invoice_id=shipped["invoice_id"])
+    assert res.status_code == 409
+    body = res.json()
+    assert body["code"] == "linked_order" and f"#{oid}" in body["reason"]
+    assert "Отмените заказ" in body["reason"]
+    assert _stock(pid) == 15
+    assert _run(adb_core.fetchval("SELECT status FROM invoices WHERE id = $1", shipped["invoice_id"])) != "cancelled"
+
+
+def test_invoice_of_a_container_cannot_be_cancelled_directly(isolated_db, monkeypatch):
+    from services import adb_core, container_receipt
+
+    _setup(isolated_db)
+    cid, pid = _arrived_container(qty=8, number="MSKU-7777777")
+    invoice_id = _run(container_receipt.receive(cid, user_id=2))["invoice_id"]
+
+    res = _post(_client(monkeypatch), "/api/wh/invoices/cancel", 2, invoice_id=invoice_id)
+    assert res.status_code == 409
+    body = res.json()
+    assert body["code"] == "linked_container" and "MSKU7777777" in body["reason"]
+    assert "Отмените контейнер" in body["reason"]
+    assert _stock(pid) == 8
+    assert _run(adb_core.fetchval("SELECT status FROM invoices WHERE id = $1", invoice_id)) == "confirmed"
+
+
+def test_plain_invoice_is_still_cancellable(isolated_db, monkeypatch):
+    from services import container_receipt, warehouse
+
+    _setup(isolated_db)
+    pid = _run(container_receipt.create_product("Труба"))["product_id"]
+    wid = _run(warehouse.default_warehouse_id())
+    inv = _run(warehouse.create_invoice(
+        invoice_type="incoming", warehouse_id=wid,
+        items=[{"product_id": pid, "quantity": 4, "price_cents": None}],
+    ))
+    res = _post(_client(monkeypatch), "/api/wh/invoices/cancel", 2, invoice_id=inv["invoice_id"])
+    assert res.status_code == 200, res.text
+    assert _stock(pid) == 0

@@ -6398,6 +6398,37 @@ async def api_wh_invoice_send(request: Request):
     return JSONResponse({"ok": True, "sent": True})
 
 
+async def _invoice_owner_refusal(invoice_id: int) -> dict | None:
+    """Отказ для накладной, привязанной к заказу/контейнеру; None — отменять можно."""
+    from services import adb_core
+
+    order_id = await adb_core.fetchval(
+        "SELECT order_id FROM order_shipment WHERE invoice_id = $1", invoice_id
+    )
+    if order_id is not None:
+        reason = (
+            f"Эта накладная — отгрузка заказа #{order_id}. Отмените заказ: "
+            "отмена заказа сама вернёт товар на склад и закроет долг."
+        )
+        return {"ok": False, "code": "linked_order", "order_id": int(order_id),
+                "reason": reason, "detail": reason}
+    container = await adb_core.fetchrow(
+        "SELECT r.container_id, c.number FROM container_receipt r "
+        "LEFT JOIN containers c ON c.id = r.container_id WHERE r.invoice_id = $1",
+        invoice_id,
+    )
+    if container is not None:
+        label = container.get("number") or f"#{container['container_id']}"
+        reason = (
+            f"Эта накладная — приход контейнера {label}. Отмените контейнер "
+            "(удалите его или переоприходуйте), а не накладную."
+        )
+        return {"ok": False, "code": "linked_container",
+                "container_id": int(container["container_id"]),
+                "reason": reason, "detail": reason}
+    return None
+
+
 @app.post("/api/wh/invoices/cancel")
 async def api_wh_invoice_cancel(request: Request):
     """Отменить накладную. Только босс/админ — откат двигает остатки назад."""
@@ -6415,6 +6446,15 @@ async def api_wh_invoice_cancel(request: Request):
         invoice_id = int(data.get("invoice_id"))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="invoice_id обязателен")
+
+    # Накладная, которую провёл заказ или контейнер, отменяется ЧЕРЕЗ них.
+    # Прямая отмена возвращала остаток, но заказ оставался «отгружен» с долгом
+    # за товар, который вернулся на склад, а контейнер — «оприходован» со
+    # ссылкой на отменённый приход (переоприходовать его после этого было
+    # нельзя, удалить — тоже без ошибки).
+    linked = await _invoice_owner_refusal(invoice_id)
+    if linked:
+        return JSONResponse(linked, status_code=409)
 
     result = await warehouse.cancel_invoice(invoice_id, cancelled_by=user["id"])
     if not result.get("ok"):
