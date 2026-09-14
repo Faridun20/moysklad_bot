@@ -6084,9 +6084,22 @@ async def api_docs_list(request: Request):
     from services import documents, printing
 
     data = await request.json()
-    _authorize(data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_list", rate_limit_max=120)
-    rows = await documents.list_documents(limit=100)
+    user = _authorize(data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_list", rate_limit_max=120)
+    # Менеджер видит только свои документы (в них паспорт и адрес должника).
+    own = None if get_role(user["id"]) in documents.DOC_ADMIN_ROLES else user["id"]
+    rows = await documents.list_documents(limit=100, created_by=own)
     return JSONResponse({"documents": rows, "can_print": printing.is_available()})
+
+
+async def _doc_for_user(data: dict, user: dict) -> dict:
+    """Документ по `doc_id` с проверкой владельца. Чужой отвечает тем же 404,
+    что и несуществующий: перебором id не узнать, какие документы есть."""
+    from services import documents
+
+    doc = await documents.get_document(_doc_id_arg(data))
+    if doc is None or not documents.can_access(doc, user["id"], get_role(user["id"])):
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    return doc
 
 
 def _doc_id_arg(data: dict) -> int:
@@ -6106,9 +6119,7 @@ async def api_docs_send(request: Request):
 
     data = await request.json()
     user = _authorize(data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_send", rate_limit_max=30)
-    doc = await documents.get_document(_doc_id_arg(data))
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Документ не найден")
+    doc = await _doc_for_user(data, user)
     delivery = await documents.send_to_chat(await get_notify_bot(), doc, user["id"])
     if not delivery.get("sent"):
         return JSONResponse({"ok": False, "error": delivery.get("reason")})
@@ -6122,9 +6133,7 @@ async def api_docs_print(request: Request):
 
     data = await request.json()
     user = _authorize(data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_print", rate_limit_max=30)
-    doc = await documents.get_document(_doc_id_arg(data))
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Документ не найден")
+    doc = await _doc_for_user(data, user)
     if not printing.is_available():
         return JSONResponse({"ok": False, "error": "Печать не настроена на этом сервере"})
     found = await asyncio.to_thread(documents.read_pdf, doc)

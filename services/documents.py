@@ -340,14 +340,34 @@ def _label(row: dict) -> str:
     return DOC_TYPES.get(tpl, "Документ")
 
 
-async def list_documents(limit: int = 50) -> list[dict]:
+# Кто видит ЛЮБОЙ документ. Остальные роли — только составленные собой: в
+# расписке паспортные данные и адрес должника, и менеджеру чужие клиенты не
+# нужны ни в списке, ни в повторной отправке, ни на принтере.
+DOC_ADMIN_ROLES = ("admin", "boss")
+
+
+def can_access(doc: dict, user_id: int, role: str) -> bool:
+    """Документ доступен руководству целиком, остальным — только свой."""
+    if role in DOC_ADMIN_ROLES:
+        return True
+    try:
+        return int(doc.get("created_by") or 0) == int(user_id)
+    except (TypeError, ValueError):
+        return False
+
+
+async def list_documents(limit: int = 50, *, created_by: int | None = None) -> list[dict]:
+    """Последние документы; `created_by` — только составленные этим человеком."""
+    where, args = "", [int(limit)]
+    if created_by is not None:
+        where, args = "WHERE g.created_by = $2 ", [int(limit), int(created_by)]
     rows = await adb_core.fetch(
         "SELECT g.id, g.client_name, g.product_name, g.total_amount_cents, g.currency, g.start_date, "
         "       g.term_months, g.payment_type, g.installments_count, g.file_path, g.created_by, "
         "       g.created_at, t.type AS doc_type "
         "FROM generated_documents g LEFT JOIN document_templates t ON t.id = g.template_id "
-        "ORDER BY g.id DESC LIMIT $1",
-        int(limit),
+        + where + "ORDER BY g.id DESC LIMIT $1",
+        *args,
     )
     import asyncio
 
