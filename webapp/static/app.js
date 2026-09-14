@@ -3287,20 +3287,25 @@ function renderOrdersMain() {
   // заменяем на «отгружено». Менеджеру черновики нужны (свои незаконченные).
   // Короткие подписи вместо одних иконок (UI-бриф п.5): часы/галочка/грузовик
   // без слов приходилось расшифровывать. Ряд скроллится, если не влезает.
+  // «Отменены» — это оба исхода «продажа не состоялась»: заявку отклонили
+  // (rejected) или одобренный заказ отменили (cancelled). Фильтр искал только
+  // rejected, и отменённый боссом заказ не находился ни под одной кнопкой,
+  // кроме «Все». Какой именно исход — видно по бейджу статуса на карточке.
+  const CANCELLED_STATUSES = ['rejected', 'cancelled'];
   const filters = isBoss
     ? [
         { id: 'all', label: 'Все', ic: '' },
         { id: 'pending', label: 'Ждут', ic: 'clock' },
         { id: 'approved', label: 'Одобрены', ic: 'check' },
         { id: 'shipped', label: 'Отгружены', ic: 'truck' },
-        { id: 'rejected', label: 'Отменены', ic: 'close' },
+        { id: 'rejected', label: 'Отменены', ic: 'close', statuses: CANCELLED_STATUSES },
       ]
     : [
         { id: 'all', label: 'Все', ic: '' },
         { id: 'draft', label: 'Черновики', ic: 'edit' },
         { id: 'pending', label: 'Ждут', ic: 'clock' },
         { id: 'approved', label: 'Одобрены', ic: 'check' },
-        { id: 'rejected', label: 'Отменены', ic: 'close' },
+        { id: 'rejected', label: 'Отменены', ic: 'close', statuses: CANCELLED_STATUSES },
       ];
 
   // Единый язык навигации со всеми экранами: статус и период — сегменты
@@ -3332,8 +3337,10 @@ function renderOrdersMain() {
   // откатываем на 'all', чтобы не показать пусто из-за исчезнувшего фильтра.
   if (!filters.some(f => f.id === currentOrderFilter)) currentOrderFilter = 'all';
 
+  const activeFilter = filters.find(f => f.id === currentOrderFilter);
+  const filterStatuses = (activeFilter && activeFilter.statuses) || [currentOrderFilter];
   const filtered = orders.filter(o =>
-    (currentOrderFilter === 'all' || o.status === currentOrderFilter) &&
+    (currentOrderFilter === 'all' || filterStatuses.includes(o.status)) &&
     orderInPeriod(o.created_at, currentOrderPeriod)
   );
 
@@ -3597,8 +3604,21 @@ async function openOrderEditor(orderId) {
   if (ordersData) {
     const existing = ordersData.orders.find(o => o.id === orderId);
     if (existing) {
-      currentDraftOrder.items = existing.items.map((it, i) => ({ ...it, item_id: i }));
+      // item_id — id ПОЗИЦИИ с сервера. Здесь стоял порядковый номер строки:
+      // у первой позиции 0 (крестик не слал запрос вовсе), у второй 1 — id
+      // чужой позиции (403, ошибка глоталась). С экрана позиция уходила, а в
+      // заявку боссу — нет.
+      currentDraftOrder.items = existing.items.map(it => ({ ...it, item_id: it.id }));
       currentDraftOrder.agent_name = existing.agent_name;
+      // Валюта фиксируется первой позицией. Список отдаёт базовую валюту и
+      // пустому черновику, поэтому переносим её, только если позиции есть:
+      // иначе повторно открытый черновик позволял выбрать UZS, сервер оставлял
+      // заказ в USD, и цена «в сумах» ложилась долларами.
+      currentDraftOrder.currency = existing.items.length ? existing.currency : null;
+      // Черновик после «На доработку» помнит условия оплаты. Без переноса
+      // «Отправить» уводило заявку «в долг» как «оплачено сразу».
+      currentDraftOrder.payment_type = existing.payment_type || 'paid';
+      currentDraftOrder.due_date = existing.due_date || null;
     }
   }
 
@@ -3697,14 +3717,32 @@ function renderOrderEditor() {
   document.getElementById('btn-add-product').addEventListener('click', openProductPicker);
 
   // Удалить товар
+  // С экрана позиция уходит только ПОСЛЕ ответа сервера: иначе на экране
+  // одно, а в заявку боссу уходит другое. Ошибку показываем, а не глотаем.
   document.querySelectorAll('.editor-item-del').forEach(btn => {
     btn.addEventListener('click', async () => {
       const idx = parseInt(btn.dataset.idx);
-      const item = currentDraftOrder.items[idx];
-      if (item.item_id) {
-        try { await api('/api/orders/remove_item', { item_id: item.item_id }); } catch {}
+      const draft = currentDraftOrder;
+      const item = draft && draft.items[idx];
+      if (!item) return;
+      if (item.item_id == null) {
+        tg.showAlert('❌ Позиция не найдена на сервере — откройте заказ заново');
+        return;
       }
-      currentDraftOrder.items.splice(idx, 1);
+      btn.disabled = true;
+      try {
+        await api('/api/orders/remove_item', { item_id: item.item_id });
+      } catch (e) {
+        tg.HapticFeedback?.notificationOccurred('error');
+        tg.showAlert('❌ Позиция не удалена: ' + e.message);
+        btn.disabled = false;
+        return;
+      }
+      if (currentDraftOrder !== draft) return;
+      const at = draft.items.indexOf(item);
+      if (at >= 0) draft.items.splice(at, 1);
+      // Позиций не осталось — валюта снова свободна (сервер это разрешает).
+      if (draft.items.length === 0) draft.currency = null;
       renderOrderEditor();
     });
   });
@@ -3782,15 +3820,22 @@ async function loadAgents(search) {
     document.querySelectorAll('.agent-row').forEach(row => {
       row.addEventListener('click', async () => {
         haptic('light');
-        currentDraftOrder.agent_id = row.dataset.id;
-        currentDraftOrder.agent_name = row.dataset.name;
+        // Клиент ставится в редактор только после ответа сервера: проглоченная
+        // ошибка показывала выбранного клиента, а заявка уходила без него.
         try {
           await api('/api/orders/set_agent', {
             order_id: currentDraftOrder.id,
-            agent_id: currentDraftOrder.agent_id,
-            agent_name: currentDraftOrder.agent_name,
+            agent_id: row.dataset.id,
+            agent_name: row.dataset.name,
           });
-        } catch {}
+        } catch (e) {
+          tg.HapticFeedback?.notificationOccurred('error');
+          tg.showAlert('❌ Клиент не выбран: ' + e.message);
+          return;
+        }
+        if (!currentDraftOrder) return;
+        currentDraftOrder.agent_id = row.dataset.id;
+        currentDraftOrder.agent_name = row.dataset.name;
         renderOrderEditor();
       });
     });

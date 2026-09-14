@@ -546,10 +546,16 @@ async def mark_telegram_sent(invoice_id: int) -> bool:
 # `search_products`, `get_categories`, `get_low_stock`). Источник — наши
 # `products` + `stock`, промежуточного зеркала больше нет: зеркалить нечего.
 
-# «Резерв» локально — это одобренные, но ещё не отгруженные заказы. В МойСклад
+# «Резерв» локально — это одобренные, но ещё не СПИСАННЫЕ заказы. В МойСклад
 # им соответствовал customerorder, который держал товар; у нас заказ живёт в
 # своей таблице, и доступный остаток обязан его учитывать — иначе один и тот же
 # ящик пообещают двум клиентам.
+#
+# Списанное — не резерв. Одобрение сразу проводит расходную накладную
+# (`order_shipment.invoice_id`), и остаток уже уменьшен; считать тот же заказ
+# ещё и резервом значит вычесть его дважды («на складе 18, доступно 16», пока
+# кладовщик не нажмёт «Отгрузить»). В резерве остаются одобренные заказы, по
+# которым накладной нет: отгрузка не прошла (failed_at) или ещё не дошла.
 _RESERVED_STATUSES = ("approved",)
 
 
@@ -559,7 +565,10 @@ async def _reserved_by_product() -> dict[int, float]:
         "FROM order_item_products op "
         "JOIN order_items oi ON oi.id = op.item_id "
         "JOIN orders o ON o.id = op.order_id "
-        "WHERE o.status = $1 GROUP BY op.product_id",
+        "WHERE o.status = $1 "
+        "AND NOT EXISTS (SELECT 1 FROM order_shipment s "
+        "                WHERE s.order_id = o.id AND s.invoice_id IS NOT NULL) "
+        "GROUP BY op.product_id",
         _RESERVED_STATUSES[0],
     )
     return {int(r["product_id"]): float(r["qty"] or 0) for r in rows}
