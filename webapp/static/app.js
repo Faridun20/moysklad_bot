@@ -865,7 +865,7 @@ function renderStockList() {
           ${check}
           <div class="stock-info">
             <div class="stock-name">${escapeHtml(p.name)}</div>
-            <div class="stock-folder">${escapeHtml(p.folder_name || '—')} · ${p.unit}${
+            <div class="stock-folder">${escapeHtml(p.folder_name || '—')} · ${escapeHtml(p.unit || 'шт')}${
               p.reserve > 0 ? ` · в резерве ${whQty(p.reserve)}` : ''}</div>
             ${priceHtml}
           </div>
@@ -3374,7 +3374,7 @@ function renderOrdersMain() {
           const priceStr = (it.price && it.price > 0)
             ? ` × ${formatMoney(it.price)} = <b>${formatMoney(sub)}${cur}</b>`
             : '';
-          return `<div class="order-item-preview">• ${escapeHtml(it.name)} — ${it.quantity} ${it.unit}${priceStr}</div>`;
+          return `<div class="order-item-preview">• ${escapeHtml(it.name)} — ${it.quantity} ${escapeHtml(it.unit || 'шт')}${priceStr}</div>`;
         }).join('')}
         ${o.status === 'draft' && !isBoss ? `
           <div class="draft-actions">
@@ -3605,7 +3605,7 @@ function renderOrderEditor() {
           <div class="c-row editor-item">
             <div class="editor-item-info">
               <div class="editor-item-name">${escapeHtml(it.name)}</div>
-              <div class="editor-item-qty">${it.quantity} ${it.unit || 'шт'}${subStr}</div>
+              <div class="editor-item-qty">${it.quantity} ${escapeHtml(it.unit || 'шт')}${subStr}</div>
             </div>
             <button class="editor-item-del" data-idx="${i}" aria-label="Удалить позицию">${icon('close')}</button>
           </div>
@@ -3904,6 +3904,9 @@ async function openProductPicker() {
 
 function openQuantityInput(name, unit, maxStock, productId) {
   const content = document.getElementById('content');
+  // Единица приходит из карточки товара (data-unit) — это ввод другого
+  // человека, в разметку только экранированной. maxStock — число.
+  const unitHtml = escapeHtml(unit || 'шт');
   const currencies = ['USD', 'UZS'];
   // Если у заказа уже была валюта (после первой позиции) — берём её и
   // блокируем переключение. Все позиции одного ордера в одной валюте.
@@ -3921,10 +3924,10 @@ function openQuantityInput(name, unit, maxStock, productId) {
     </div>
     <div class="qty-screen">
       <div class="qty-product-name">${escapeHtml(name)}</div>
-      <div class="qty-stock">На складе: ${maxStock} ${unit}</div>
+      <div class="qty-stock">На складе: ${maxStock} ${unitHtml}</div>
 
       <div class="form-row u-mt-3">
-        <label class="form-label">Количество (${unit})</label>
+        <label class="form-label">Количество (${unitHtml})</label>
         <input type="number" id="qty-input" class="form-input"
           placeholder="0" inputmode="decimal" min="0.1" step="0.1">
       </div>
@@ -3938,7 +3941,7 @@ function openQuantityInput(name, unit, maxStock, productId) {
       </div>
 
       <div class="form-row">
-        <label class="form-label">Цена за ${unit}</label>
+        <label class="form-label">Цена за ${unitHtml}</label>
         <input type="number" id="price-input" class="form-input"
           placeholder="0" inputmode="decimal" min="0" step="0.01">
       </div>

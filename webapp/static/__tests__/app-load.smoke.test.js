@@ -2451,3 +2451,65 @@ describe('вход: 403 от /api/me', () => {
     expect(text).not.toContain('Нет связи');
   });
 });
+
+// ─── Безопасность, п.1: единица позиции — ввод другого человека ─────────────
+//
+// `unit` приходил в /api/orders/add_item как есть и выводился в списке
+// заказов, в редакторе черновика, на экране количества и в каталоге склада
+// БЕЗ escapeHtml. Руководство открывает эти экраны со своим initData — stored-XSS.
+
+describe('единица позиции (unit) не становится разметкой', () => {
+  const evil = '<img src=x onerror="window.__pwned=1">';
+  const J = JSON.stringify(evil);
+
+  function expectInert(window, root) {
+    expect(root.querySelector('img')).toBeNull();
+    expect(window.__pwned).toBeUndefined();
+    expect(root.textContent).toContain('<img src=x');
+  }
+
+  it('список заказов', () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      ordersData = { role: 'boss', orders: [{
+        id: 5, status: 'pending', created_at: '2026-03-14', total: 0, currency: 'USD',
+        agent_name: 'Клиент', payment_type: 'paid',
+        items: [{ name: 'Труба', quantity: 2, unit: ${J}, price: 1 }],
+      }] };
+      renderOrdersMain();
+    `);
+    expectInert(window, window.document.getElementById('content'));
+  });
+
+  it('редактор черновика', () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      currentDraftOrder = { order_id: 5, agent_name: '', items: [
+        { name: 'Труба', quantity: 2, unit: ${J}, price: 1, item_id: 0 },
+      ] };
+      renderOrderEditor();
+    `);
+    expectInert(window, window.document.getElementById('content'));
+  });
+
+  it('экран количества', () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      currentDraftOrder = { order_id: 5, items: [] };
+      openQuantityInput('Труба', ${J}, 10, '1');
+    `);
+    expectInert(window, window.document.getElementById('content'));
+  });
+
+  it('каталог склада', () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      document.getElementById('content').innerHTML = '<div id="stock-list"></div>';
+      stockData = { products: [
+        { product_id: 1, name: 'Труба', folder_name: 'Трубы', unit: ${J}, stock: 3, reserve: 0 },
+      ], categories: [] };
+      renderStockList();
+    `);
+    expectInert(window, window.document.getElementById('content'));
+  });
+});

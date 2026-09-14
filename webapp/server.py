@@ -9,6 +9,7 @@ import binascii
 import logging
 import math
 import os
+import re
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -1431,6 +1432,23 @@ def _validate_quantity(raw) -> float:
     if not (math.isfinite(qty) and 0 < qty < 1_000_000):
         raise HTTPException(status_code=400, detail="Неверное количество")
     return qty
+
+
+_UNIT_MAX = 16
+# Единица измерения — короткое слово («шт», «кг», «м²», «уп.»): буквы, цифры,
+# пробел и немного пунктуации. Остальное (в т.ч. `<`, `>`, кавычки) выкидываем.
+_UNIT_JUNK = re.compile(r"[^\w .,/%²³-]", re.UNICODE)
+
+
+def _clean_unit(raw) -> str:
+    """Единица позиции заказа: белый список символов и потолок длины.
+
+    Поле уходит в интерфейс руководства и в печатную форму; без проверки в
+    нём приезжала разметка любой длины (stored-XSS, если где-то забыли
+    экранирование). Фронт экранирует и сам — это второй рубеж, а не первый.
+    """
+    unit = _UNIT_JUNK.sub("", str(raw or "")).strip()[:_UNIT_MAX].strip()
+    return unit or "шт"
 
 
 def _require_draft_order(order) -> None:
@@ -5077,7 +5095,7 @@ async def api_add_item(request: Request):
         product_name=data["product_name"],
         product_href="",
         quantity=quantity,
-        unit=data.get("unit", "шт"),
+        unit=_clean_unit(data.get("unit")),
         price=price,
         note=data.get("note", ""),
         product_id=int(product_ref) if product_ref.isdigit() else None,
