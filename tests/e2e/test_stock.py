@@ -190,7 +190,10 @@ def test_container_list_shows_mismatch_summary(open_app, e2e):
     boss.wait_for_selector(f'[data-container="{cid}"]')
     row = boss.locator(f'[data-container="{cid}"]')
     assert row.get_attribute("data-status") == "rejected", "расхождение подсвечено"
-    assert "3" in row.inner_text()
+    # Сводка расхождений — в самой строке списка, чтобы не открывать каждый
+    # контейнер по очереди. Проверялось «3» (недостача) — и совпадало с цифрой
+    # в дате: тест был зелёным ровно до 14-го числа.
+    assert "расхождений: 1" in row.inner_text()
 
 
 # ─── Техника: карточка → моточасы → рассрочка → платёж ───────────────────────
