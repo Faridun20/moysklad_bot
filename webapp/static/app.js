@@ -4110,13 +4110,17 @@ async function submitOrder() {
     return;
   }
 
+  // Ключ живёт с черновиком, а не с кликом: повтор после обрыва связи (заявка
+  // уже ушла, ответ потерялся) не упирается в «уже отправлен» и не шлёт
+  // вторую. Отказ сервер не запоминает — после исправления ключ тот же.
+  if (!currentDraftOrder.submitKey) currentDraftOrder.submitKey = idemKey();
   if (btn) btn.disabled = true;
   try {
     const result = await api('/api/orders/submit', {
       order_id: currentDraftOrder.id,
       payment_type: paymentType,
       due_date: dueDate || null,
-      idempotency_key: idemKey(),
+      idempotency_key: currentDraftOrder.submitKey,
     });
     tg.HapticFeedback?.notificationOccurred('success');
     tg.showAlert(`✅ Заявка #${result.req_id} отправлена руководителю!`);
@@ -5984,6 +5988,10 @@ async function renderCashbox(container, section) {
       wireRows();
     });
   }
+  // Ключ идемпотентности — на открытую форму, а не на клик: повторное нажатие
+  // после обрыва связи (ответ потерялся, платёж уже записан) отдаёт тот же
+  // результат, а не второй платёж. Новый ключ — только после успеха.
+  let payKey = idemKey();
   const paySubmit = container.querySelector('#pay-submit');
   if (paySubmit) {
     paySubmit.addEventListener('click', async () => {
@@ -5999,7 +6007,8 @@ async function renderCashbox(container, section) {
       paySubmit.disabled = true;
       status.textContent = '⏳ Отправка…'; status.className = 'pay-status';
       try {
-        await api('/api/payments/send', { items: parsed.items, comment, idempotency_key: idemKey() });
+        await api('/api/payments/send', { items: parsed.items, comment, idempotency_key: payKey });
+        payKey = idemKey();
         tg.HapticFeedback?.notificationOccurred('success');
         renderMoneyScreen();
       } catch (e) {
@@ -6011,6 +6020,7 @@ async function renderCashbox(container, section) {
 
   // Создание сдачи (менеджер).
   const createBtn = container.querySelector('#dep-create');
+  let depKey = idemKey();  // на форму, как у платежа: ретрай не создаёт вторую сдачу
   if (createBtn) {
     createBtn.addEventListener('click', () => {
       const raw = container.querySelector('#dep-amount').value;
@@ -6018,8 +6028,8 @@ async function renderCashbox(container, section) {
       if (isNaN(amount) || amount <= 0) { tg.showAlert('❌ Введите положительную сумму'); return; }
       haptic('light');
       createBtn.disabled = true;
-      api('/api/deposits/create', { amount, idempotency_key: idemKey() })
-        .then(r => { tg.showAlert(`✅ Сдача #${r.deposit_id} отправлена на подтверждение`); renderMoneyScreen(); })
+      api('/api/deposits/create', { amount, idempotency_key: depKey })
+        .then(r => { depKey = idemKey(); tg.showAlert(`✅ Сдача #${r.deposit_id} отправлена на подтверждение`); renderMoneyScreen(); })
         .catch(e => { tg.showAlert('❌ ' + e.message); createBtn.disabled = false; });
     });
   }
@@ -7482,6 +7492,11 @@ async function renderWhInvoiceNew() {
 
     btn.disabled = true;
     haptic('medium');
+    // Ключ — на черновик формы: ретрай после обрыва не проведёт вторую
+    // накладную. Сбрасывается после проведения (whDraft = null) и после
+    // отказа по существу — отказ сервер хранит под ключом, и исправленная
+    // форма со старым ключом получила бы тот же отказ.
+    if (!whDraft.idemKey) whDraft.idemKey = idemKey();
     try {
       const r = await apiResult('/api/wh/invoices/create', {
         type: whDraft.type,
@@ -7492,11 +7507,15 @@ async function renderWhInvoiceNew() {
           quantity: Number(it.quantity),
           price_cents: Number(it.price_cents) || null,
         })),
-        // Ключ на попытку сохранения: повтор той же формы не проведёт вторую
-        // накладную и не пришлёт клиенту второй экземпляр PDF.
-        idempotency_key: idemKey(),
+        // Повтор той же формы не проведёт вторую накладную и не пришлёт
+        // клиенту второй экземпляр PDF.
+        idempotency_key: whDraft.idemKey,
       });
       if (!r.ok) {
+        // Отказ по существу (нехватка остатка, 400 формы) ничего не записал —
+        // следующая попытка с исправленной формой идёт новым ключом. «Запрос
+        // уже обрабатывается» и обрыв связи ключ сохраняют.
+        if (r.status === 400 || (r.body && r.body.code)) whDraft.idemKey = null;
         // Сервер посчитал причину отказа и вернул её (нехватка остатка — с
         // разбором по позициям). Показываем ЕЁ, а не «ошибку сервера»:
         // менеджеру надо понять, что править в форме. Черновик остаётся.

@@ -2551,3 +2551,123 @@ describe('отметка платежа рассрочки: двойной та�
     expect(window.__btn.disabled).toBe(false);
   });
 });
+
+// ─── Безопасность, п.8: ключ идемпотентности — на форму, а не на клик ───────
+//
+// Ключ генерировался в обработчике клика: повтор после обрыва связи (запрос
+// дошёл, ответ потерялся) уходил С НОВЫМ ключом и создавал второй платёж,
+// вторую сдачу, вторую накладную. Теперь ключ живёт с формой и меняется
+// только после успеха.
+
+describe('ключ идемпотентности живёт с формой', () => {
+  const flush = () => new Promise(r => setTimeout(r, 0));
+
+  it('платёж и сдача: обрыв → тот же ключ, успех → новый', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      window.__calls = [];
+      let fail = true;
+      renderMoneyScreen = async () => {};
+      tg.showAlert = () => {};
+      api = async (path, body) => {
+        if (path === '/api/deposits/my') return { deposits: [] };
+        if (path === '/api/payments/send' || path === '/api/deposits/create') {
+          window.__calls.push([path, body.idempotency_key]);
+          if (fail) throw new Error('Нет подключения к интернету');
+          return { deposit_id: 1, payment_ids: [1] };
+        }
+        return {};
+      };
+      window.__setFail = (v) => { fail = v; };
+      window.__ready = renderCashbox(document.getElementById('content'), 'ops');
+    `);
+    await window.__ready;
+    const doc = window.document;
+    doc.querySelector('.pay-row-amount').value = '100';
+    doc.querySelector('#pay-comment').value = 'аренда';
+    doc.querySelector('#dep-amount').value = '50';
+
+    const clickPay = async () => { doc.querySelector('#pay-submit').disabled = false; doc.querySelector('#pay-submit').click(); await flush(); };
+    const clickDep = async () => { doc.querySelector('#dep-create').disabled = false; doc.querySelector('#dep-create').click(); await flush(); };
+
+    await clickPay(); await clickPay();
+    await clickDep(); await clickDep();
+    window.__setFail(false);
+    await clickPay(); await clickPay();
+    await clickDep(); await clickDep();
+
+    const keys = (p) => window.__calls.filter(c => c[0] === p).map(c => c[1]);
+    for (const p of ['/api/payments/send', '/api/deposits/create']) {
+      const k = keys(p);
+      expect(k).toHaveLength(4);
+      expect(k[0]).toBeTruthy();
+      expect(k[1]).toBe(k[0]);   // ретрай после обрыва
+      expect(k[2]).toBe(k[0]);   // успех — тем же ключом
+      expect(k[3]).not.toBe(k[0]); // следующий — уже новым
+    }
+  });
+
+  it('отправка заказа: ключ черновика переживает отказ', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      window.__keys = [];
+      let fail = true;
+      tg.showAlert = () => {};
+      renderOrders = async () => {};
+      api = async (path, body) => {
+        window.__keys.push(body.idempotency_key);
+        if (fail) throw new Error('Нет подключения к интернету');
+        return { req_id: 1 };
+      };
+      currentDraftOrder = { id: 5, items: [], payment_type: 'paid' };
+      window.__ready = (async () => {
+        await submitOrder();
+        await submitOrder();
+        fail = false;
+        await submitOrder();
+      })();
+    `);
+    await window.__ready;
+    expect(window.__keys).toHaveLength(3);
+    expect(window.__keys[0]).toBeTruthy();
+    expect(new Set(window.__keys).size).toBe(1);
+  });
+
+  it('накладная: обрыв → тот же ключ, отказ по существу → новый', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__keys = [];
+      const answers = [
+        { ok: false, status: 0, body: {}, error: 'Нет подключения к интернету' },
+        { ok: false, status: 409, body: { ok: false, code: 'insufficient_stock', reason: 'мало' }, error: '' },
+        { ok: true, status: 200, body: { invoice_number: 'П-1' }, error: '' },
+      ];
+      toast = () => {};
+      renderWhInvoicesTab = () => {};
+      api = async (p) => {
+        if (p === '/api/wh/stock') return { products: [
+          { product_id: 1, name: 'Болт М8', sku: 'B8', unit: 'шт', quantity: 100 } ]};
+        if (p === '/api/wh/counterparties') return { counterparties: [] };
+        return {};
+      };
+      apiResult = async (path, body) => { window.__keys.push(body.idempotency_key); return answers.shift(); };
+      window.__ready = (async () => {
+        whView = 'new';
+        whDraft = { type: 'incoming', counterparty_id: '', comment: '',
+                    items: [{ product_id: 1, quantity: 2, price_cents: null }] };
+        await renderWhInvoiceNew();
+        for (let i = 0; i < 3; i++) {
+          document.getElementById('wh-save').disabled = false;
+          document.getElementById('wh-save').click();
+          await new Promise(r => setTimeout(r, 0));
+        }
+      })();
+    `);
+    await window.__ready;
+    const k = window.__keys;
+    expect(k).toHaveLength(3);
+    expect(k[0]).toBeTruthy();
+    expect(k[1]).toBe(k[0]);
+    expect(k[2]).not.toBe(k[0]);
+  });
+});

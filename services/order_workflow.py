@@ -529,6 +529,8 @@ async def submit_order(
         result = {"ok": False, "error": e.message, "status": e.status}
     except Exception as e:  # noqa: BLE001 — нужен именно разбор причины
         if not _is_unique_violation(e):
+            if idem_key:
+                await adb.idem_release(idem_key)  # сбой до записи — ретрай возможен
             raise
         # Уникальный индекс из T1.8: вторая pending-заявка по тому же заказу.
         # Это не 500, а «уже отправлено».
@@ -536,7 +538,13 @@ async def submit_order(
         result = {"ok": False, "error": "Заявка уже отправлена"}
 
     if idem_key:
-        await adb.idem_store(idem_key, result)
+        if result.get("ok"):
+            await adb.idem_store(idem_key, result)
+        else:
+            # Отказ ничего не записал — ключ освобождаем. Иначе ключ формы (он
+            # живёт с черновиком) навсегда отдавал бы «Выберите клиента», даже
+            # когда клиента уже выбрали.
+            await adb.idem_release(idem_key)
     return result
 
 
