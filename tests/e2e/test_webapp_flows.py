@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import time
+
 from tests.e2e.conftest import go
 
 
@@ -97,6 +99,12 @@ def test_manager_order_to_boss_approval_moves_stock(open_app, e2e):
     assert inv["type"] == "outgoing" and inv["total_amount_cents"] == 20000
     stock = e2e.rows("SELECT quantity FROM stock WHERE product_id = ?", (ids["product"],))[0]["quantity"]
     assert stock == 18, "20 на приходе минус 2 в заявке"
+    # Печатная форма приходит СЛЕДОМ, фоновой задачей: ответ боссу её не ждёт.
+    boss.wait_for_function("() => true")
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline and len(e2e.bot.documents) < 2:
+        time.sleep(0.2)
+    assert sorted(d["chat_id"] for d in e2e.bot.documents) == sorted([ids["mgr"], ids["boss"]])
 
 
 # ─── Аудит п.1 через настоящий браузер ───────────────────────────────────────

@@ -32,9 +32,24 @@ def run_async(coro):
     """
     box: dict = {}
 
+    async def _main():
+        result = await coro
+        # Фоновые задачи (печатная форма после одобрения) — дождаться ДО
+        # закрытия loop. Отменённая на середине `aiosqlite.connect` задача
+        # оставляет незакрытый поток соединения, и интерпретатор не может
+        # завершиться: pytest «зависал» после зелёного прогона. Заодно сиды
+        # становятся детерминированными — PDF уже доставлен, когда seed
+        # вернул управление.
+        from utils.background import pending
+
+        left = pending()
+        if left:
+            await asyncio.gather(*left, return_exceptions=True)
+        return result
+
     def _target():
         try:
-            box["v"] = asyncio.run(coro)
+            box["v"] = asyncio.run(_main())
         except BaseException as e:  # noqa: BLE001 — пробрасываем как есть
             box["e"] = e
 

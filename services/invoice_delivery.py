@@ -13,6 +13,7 @@ Telegram лежит, weasyprint не собрался) обязана дегра
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from services import warehouse
@@ -60,7 +61,9 @@ async def deliver_invoice_pdf(invoice: dict, bot, *, force: bool = False) -> dic
     from services.invoice_pdf import invoice_filename, render_invoice_pdf
 
     try:
-        pdf_bytes = render_invoice_pdf(invoice)
+        # WeasyPrint синхронный и тяжёлый (сотни миллисекунд CPU): в потоке,
+        # иначе на время рендера встаёт весь event loop — и чужие запросы.
+        pdf_bytes = await asyncio.to_thread(render_invoice_pdf, invoice)
         filename = invoice_filename(invoice)
     except Exception:
         logger.exception("Не удалось собрать PDF накладной #%s", invoice_id)

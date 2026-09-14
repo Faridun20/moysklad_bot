@@ -29,24 +29,8 @@ from services.rate_limit import acquire as rate_limit_acquire
 from services import money
 
 
-# Хранилище фоновых задач — предотвращает преждевременный GC до завершения.
-_background_tasks: set[asyncio.Task] = set()
-
-
-def _spawn_bg(coro, name: str) -> asyncio.Task:
-    """Запустить фоновую задачу: держим сильную ссылку (иначе GC может убить
-    её до завершения) + логируем необработанное исключение (раньше fire-and-
-    forget create_task падал молча)."""
-    task = asyncio.create_task(coro, name=name)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-
-    def _log_exc(t: asyncio.Task) -> None:
-        if not t.cancelled() and t.exception() is not None:
-            logger.error("Фоновая задача %s упала", name, exc_info=t.exception())
-
-    task.add_done_callback(_log_exc)
-    return task
+# Фоновые задачи — общий хелпер бота и WebApp: utils/background.py
+# (сильная ссылка до завершения + лог необработанного исключения).
 
 
 # ─── Идемпотентность мутаций ─────────────────────────────────────────
@@ -227,7 +211,26 @@ if _dev_bypass_user() is not None:
         "отладка). НЕ для прода: при DATABASE_URL обход сам себя глушит."
     )
 
-app = FastAPI(title="МойСклад WebApp")
+app = FastAPI(title="Склад WebApp")
+
+
+@app.on_event("shutdown")
+async def _drain_background_tasks() -> None:
+    """Дождаться фоновых задач (печатная форма после одобрения) перед остановкой.
+
+    Рестарт при деплое не должен терять PDF, который уже обещан менеджеру;
+    ждём ограниченно — зависшая задача не имеет права держать процесс.
+    """
+    from utils.background import pending
+
+    left = pending()
+    if not left:
+        return
+    logger.info("Останавливаемся: ждём %d фоновых задач", len(left))
+    try:
+        await asyncio.wait_for(asyncio.gather(*left, return_exceptions=True), timeout=20)
+    except TimeoutError:
+        logger.warning("Фоновые задачи не завершились за 20 с — выходим без них")
 
 # Gzip: статика (app.js ~141KB, style.css ~59KB) и крупные JSON-ответы
 # (/api/orders, /api/stock, /api/analytics) отдавались несжатыми — заметно на
