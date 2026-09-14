@@ -55,15 +55,9 @@ CLICKABLE = "button, [role=button], .c-row--tap, .cat-btn, .seg-item"
 # тест-репро). Исключение точечное — по роли, кнопке и тексту ошибки; всё
 # остальное ловится как было. Починили баг — репро станет XPASS(strict) и
 # упадёт: тогда убрать и его, и строку отсюда.
-BUG_NEW_ORDER_NO_ACCESS = (
-    "BUG: кладовщику и бухгалтеру в «Продажах» видна кнопка «Новый заказ», а "
-    "/api/orders/create им отвечает 403 — вместо редактора экран «Не удалось "
-    "загрузить / Нет доступа» (app.js renderOrders: условие `!isBoss`; "
-    "server.py api_create_order: allowed_roles admin/boss/manager)"
-)
 KNOWN_BUGS: list[tuple[tuple[str, ...], tuple[str, ...], str, str]] = [
-    (("keeper", "book"), ("кнопка «Новый заказ» (button#btn-new-order", "Нет доступа"),
-     BUG_NEW_ORDER_NO_ACCESS, "test_bug_new_order_button_for_role_without_orders"),
+    # Пусто. Первый найденный баг («Новый заказ» у кладовщика и бухгалтера вёл в
+    # «Нет доступа») починен — регресс держит test_new_order_button_for_role_without_orders.
 ]
 
 
@@ -579,9 +573,8 @@ def test_click_everything(open_app, e2e, role, tmp_path, printer, no_rate_limit,
 # ─── Репро найденных багов ───────────────────────────────────────────────────
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=BUG_NEW_ORDER_NO_ACCESS)
 @pytest.mark.parametrize("role", ["keeper", "book"])
-def test_bug_new_order_button_for_role_without_orders(open_app, e2e, role):
+def test_new_order_button_for_role_without_orders(open_app, e2e, role):
     """Кнопка, которая гарантированно ведёт в «Нет доступа», — дверь, которая не открывается.
 
     Правильно — либо кнопки нет, либо она открывает редактор. Нашёл обходчик
