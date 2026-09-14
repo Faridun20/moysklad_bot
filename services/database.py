@@ -1833,19 +1833,11 @@ async def get_allocated_deposit_cents_for_orders(
     В отличие от get_confirmed_deposit_cents_for_orders учитывает и pending:
     неподтверждённая сдача уже «застолбила» остаток, второй раз распределять
     его нельзя. `conn` — чтобы считать внутри транзакции под advisory-lock'ом.
+    Определение — в services.debts (одно на сдачу и на отметку оплаты).
     """
-    if not order_ids:
-        return {}
-    db = conn if conn is not None else adb_core
-    ph = ", ".join(f"${i + 1}" for i in range(len(order_ids)))
-    rows = await db.fetch(
-        f"SELECT cdo.order_id AS oid, {_SUM_ALLOC_CENTS} AS dc "
-        "FROM cash_deposit_orders cdo JOIN cash_deposits d ON d.id = cdo.deposit_id "
-        f"WHERE cdo.order_id IN ({ph}) AND d.status IN ('pending', 'confirmed') "
-        "GROUP BY cdo.order_id",
-        *order_ids,
-    )
-    return {r["oid"]: int(r["dc"] or 0) for r in rows}
+    from services.debts import calc_allocated_deposit_cents
+
+    return await calc_allocated_deposit_cents(order_ids, conn=conn)
 
 
 async def deposit_remaining_cents_for_orders(
@@ -1853,25 +1845,18 @@ async def deposit_remaining_cents_for_orders(
 ) -> dict[int, int]:
     """Сколько ещё можно покрыть сдачей по каждому заказу, в копейках.
 
-    total − возвраты − подтверждённые платежи − распределённое сдачами
-    (pending+confirmed). Отличается от services.debts.calc_remaining_cents
-    последним слагаемым: там учитываются только ПОДТВЕРЖДЁННЫЕ сдачи, а для
-    распределения новой сдачи надо видеть и застолблённое pending'ом.
+    total − возвраты − платежи (confirmed + PENDING) − распределённое сдачами
+    (pending+confirmed). Отличается от services.debts.calc_remaining_cents тем,
+    что видит и заявленное, но не подтверждённое: ожидающая отметка оплаты уже
+    обещает эти деньги, и сдача поверх неё собирала по заказу больше его суммы
+    (заказ 200, отмечено 150, сдача 200 → «получено» 350).
 
-    Два запроса на любое число заказов. `conn` — для расчёта внутри транзакции.
+    Формула — services.debts.calc_claimable_cents, та же, что у mark_order_paid.
+    `conn` — для расчёта внутри транзакции.
     """
-    from services.debts import calc_order_balances
+    from services.debts import calc_claimable_cents
 
-    if not order_ids:
-        return {}
-    balances = await calc_order_balances(order_ids, conn=conn)
-    allocated = await get_allocated_deposit_cents_for_orders(order_ids, conn=conn)
-    out: dict[int, int] = {}
-    for oid, bal in balances.items():
-        out[oid] = (
-            bal.total_cents - bal.returns_cents - bal.confirmed_cents - allocated.get(oid, 0)
-        )
-    return out
+    return await calc_claimable_cents(order_ids, conn=conn)
 
 
 async def get_agents_current_debt(agent_ids: list[str]) -> dict[str, float]:
@@ -2722,6 +2707,51 @@ def _validate_amount(amount: float | None) -> tuple[bool, str | None]:
     return True, None
 
 
+def current_rate_to_base(currency: str | None) -> float | None:
+    """Текущий курс валюты к базовой (потолок суммы, пересчёт выручки).
+    Базовая — 1.0 без обращения к БД (строки курса для неё может не быть);
+    неизвестная — None."""
+    from config import BASE_CURRENCY
+
+    base = (BASE_CURRENCY or "USD").upper()
+    code = (currency or base).upper()
+    if code == base:
+        return 1.0
+    return get_currency_rate(code)
+
+
+def validate_amount_in_currency(
+    amount: float | None, currency: str | None
+) -> tuple[bool, str | None]:
+    """Сумма денег в валюте `currency`: конечная, > 0 и не выше потолка в
+    ЭКВИВАЛЕНТЕ базовой валюты (money.MAX_BASE_CENTS).
+
+    `_validate_amount` с его «10 000 000 в любой валюте» для сумов означал
+    потолок ≈ $800 — ни технику, ни крупный заказ в UZS одним платежом не
+    провести. Курс берём текущий (кэш 5 мин): это сторож от опечаток, а не
+    учёт. Без курса действует технический потолок money.HARD_MAX_CENTS —
+    отказать в платеже из-за незаданного курса нельзя.
+    """
+    import math
+
+    if amount is None:
+        return False, "Сумма не задана"
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        return False, "Сумма должна быть числом"
+    if math.isnan(value) or math.isinf(value):
+        return False, "Сумма должна быть числом"
+    if value <= 0:
+        return False, "Сумма должна быть > 0"
+    try:
+        cents = money.to_cents(amount)
+    except (ArithmeticError, ValueError):
+        return False, "Сумма должна быть числом"
+    ok, err = money.validate_cents(cents, current_rate_to_base(currency))
+    return ok, (err or None)
+
+
 # ─── Currency rates (PR #42: tech debt #3a) ──────────────────────────────────
 #
 # Простая модель: один курс на валюту относительно BASE_CURRENCY (USD).
@@ -3059,7 +3089,8 @@ def set_product_price(
     """UPSERT цены товара. Возвращает (ok, error_msg).
 
     sale_price и cost_price — опциональны (None = не задано), но если
-    заданы — валидируются через `_validate_amount` (>0, конечные, ≤10М).
+    заданы — валидируются через `validate_amount_in_currency` (>0, конечные,
+    потолок в эквиваленте базовой валюты).
     currency дефолтится в BASE_CURRENCY.
     """
     from config import BASE_CURRENCY
@@ -3069,7 +3100,7 @@ def set_product_price(
         return False, "ms_id обязателен"
     for label, val in (("sale_price", sale_price), ("cost_price", cost_price)):
         if val is not None:
-            ok, err = _validate_amount(val)
+            ok, err = validate_amount_in_currency(val, currency)
             if not ok:
                 return False, f"{label}: {err}"
     cur_code = (currency or BASE_CURRENCY or "USD").upper()
@@ -3236,9 +3267,10 @@ async def create_cash_deposit(
     (await get_manager_open_orders_for_deposit, читает на отдельных connection'ах,
     как и в sync-версии) + INSERT cash_deposits/cash_deposit_orders — в одной
     adb_core.transaction(). INSERT-id: RETURNING (pg) / last_insert_rowid()
-    (sqlite). _validate_amount — pure (без DB), зовём напрямую.
+    (sqlite). validate_amount_in_currency для базовой валюты в БД не ходит.
     """
-    ok, err = _validate_amount(amount)
+    # Сдача — в базовой валюте (у cash_deposits нет колонки валюты).
+    ok, err = validate_amount_in_currency(amount, None)
     if not ok:
         return {"ok": False, "error": err}
 
@@ -3661,6 +3693,33 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
     ritems: list[dict] = []
     new_status = "partially_returned"
     return_status = "partial"
+
+    # Выдача наличными: касса ведётся в БАЗОВОЙ валюте (у cash_deposits нет
+    # колонки валюты), поэтому сумму возврата надо перевести по курсу. Считаем
+    # ДО транзакции: без курса возврат не проводим вовсе. Раньше при
+    # незаданном курсе сумма писалась «как есть» — возврат 1 250 000 сум
+    # выдавал из кассы 1 250 000 ДОЛЛАРОВ, и касса уходила в минус на
+    # несуществующие деньги. Понятный отказ лучше неверной суммы: курс задают
+    # за минуту, а испорченную кассу потом не сверить.
+    refund_base_cents: int | None = None
+    if ret.get("refund_method") == "cash":
+        order_cur = (
+            await adb_core.fetchval("SELECT currency FROM orders WHERE id = $1", order_id)
+            or BASE_CURRENCY
+            or "USD"
+        ).upper()
+        refund_major = float(money.from_cents(int(ret.get("total_amount_cents") or 0)))
+        refund_base = await asyncio.to_thread(convert_to_base, refund_major, order_cur)
+        if refund_base is None:
+            return {
+                "ok": False,
+                "error": (
+                    f"Нет курса {order_cur} к {(BASE_CURRENCY or 'USD').upper()}: "
+                    "выдачу из кассы не пересчитать. Задайте курс валют и "
+                    "подтвердите возврат снова."
+                ),
+            }
+        refund_base_cents = money.to_cents(refund_base)
     # Атомарная секция (WP-08): подтверждение возврата + overshoot-guard + СТАТУС
     # ЗАКАЗА + денежный refund — в ОДНОЙ транзакции. Раньше статус и cash-выплата
     # писались ПОСЛЕ коммита подтверждения → крах между ними оставлял возврат
@@ -3730,28 +3789,17 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
             )
 
             # Refund: cash → отрицательная подтверждённая сдача (выдача из кассы).
-            if ret.get("refund_method") == "cash":
+            if refund_base_cents is not None:
                 order = await txn.fetchrow(
-                    "SELECT user_id, currency FROM orders WHERE id = $1", order_id
+                    "SELECT user_id FROM orders WHERE id = $1", order_id
                 )
-                # Касса ведётся в БАЗОВОЙ валюте (у cash_deposits нет колонки валюты).
-                # Сумму берём из total_amount_cents (точно), конвертируем в базовую —
-                # иначе возврат по UZS-заказу вычел бы «5 000 000 USD» из кассы.
-                order_cur = ((order or {}).get("currency") or BASE_CURRENCY or "USD").upper()
-                refund_major = float(money.from_cents(int(ret.get("total_amount_cents") or 0)))
-                refund_base = convert_to_base(refund_major, order_cur)
-                if refund_base is None:
-                    refund_base = refund_major  # курс не задан — пишем как есть
-                    logger.warning(
-                        "confirm_return #%s: нет курса %s→базовая, refund в кассу "
-                        "записан без конвертации", return_id, order_cur,
-                    )
+                # Сумма уже в базовой валюте (пересчитана до транзакции).
                 await txn.execute(
                     "INSERT INTO cash_deposits (manager_id, amount_cents, deposited_at, "
                     "status, confirmed_by, confirmed_at, notes, created_at) "
                     "VALUES ($1, $2, $3, 'confirmed', $4, $5, $6, $7)",
                     (order or {}).get("user_id") or confirmed_by,
-                    -money.to_cents(refund_base),  # выдача из кассы — отрицательная сдача
+                    -refund_base_cents,  # выдача из кассы — отрицательная сдача
                     now_str(), confirmed_by, now_str(),
                     f"refund возврат #{return_id}", now_str(),
                 )
@@ -4782,12 +4830,8 @@ async def count_boss_attention() -> dict[str, int]:
         "AND EXISTS (SELECT 1 FROM payments p "
         "            WHERE p.order_id = o.id AND p.status = 'pending')"
     )
-    debts = await adb_core.fetchval(
-        "SELECT COUNT(*) FROM orders "
-        "WHERE payment_type = 'credit' AND paid_confirmed_at IS NULL "
-        "AND status IN ('approved', 'shipped', 'partially_returned') "
-        "AND (ms_deleted_at IS NULL)"
-    )
+    # Зеркалит get_open_debts — фильтр один (_OPEN_DEBT_FILTER).
+    debts = await adb_core.fetchval(f"SELECT COUNT(*) FROM orders WHERE {_OPEN_DEBT_FILTER}")
     return {
         "deposits": int(deposits or 0),
         "returns": int(returns_ or 0),
@@ -5330,8 +5374,31 @@ async def get_money_totals(since: str | None = None, until: str | None = None) -
     if until:
         pay_params.append(until)
         pay_sql += f" AND COALESCE(p.confirmed_at, p.created_at) <= ${len(pay_params)}"
-    pay_sql += " GROUP BY p.currency ORDER BY total_cents DESC"
+    # Группа — ещё и по снимку курса: пересчёт в базовую валюту обязан идти по
+    # курсу дня подтверждения (payments.fx_rate_to_base), а не по сегодняшнему.
+    # Разбивка по валютам собирается из тех же строк в Python.
+    pay_sql = pay_sql.replace(
+        "SELECT p.currency AS currency,",
+        "SELECT p.currency AS currency, p.fx_rate_to_base AS fx_rate_to_base,",
+        1,
+    )
+    pay_sql += " GROUP BY p.currency, p.fx_rate_to_base"
     pay_rows = await adb_core.fetch(pay_sql, *pay_params)
+    by_currency: dict[str, dict] = {}
+    by_rate: list[dict] = []
+    for r in pay_rows:
+        cur_code = r.get("currency") or "—"
+        cents = int(r["total_cents"] or 0)
+        cnt = int(r["cnt"] or 0)
+        agg = by_currency.setdefault(cur_code, {"currency": cur_code, "total_cents": 0, "count": 0})
+        agg["total_cents"] += cents
+        agg["count"] += cnt
+        snap = r.get("fx_rate_to_base")
+        by_rate.append({
+            "currency": cur_code,
+            "fx_rate_to_base": float(snap) if snap is not None else None,
+            "total_cents": cents,
+        })
 
     dep_sql = (
         "SELECT COUNT(*) AS cnt, "
@@ -5348,14 +5415,9 @@ async def get_money_totals(since: str | None = None, until: str | None = None) -
     dep_row = await adb_core.fetchrow(dep_sql, *dep_params)
 
     return {
-        "payments": [
-            {
-                "currency": r.get("currency") or "—",
-                "total_cents": int(r["total_cents"] or 0),
-                "count": int(r["cnt"] or 0),
-            }
-            for r in pay_rows
-        ],
+        "payments": sorted(by_currency.values(), key=lambda p: p["total_cents"], reverse=True),
+        # Те же деньги, разложенные по снимку курса — для итога в базовой валюте.
+        "payments_by_rate": by_rate,
         "deposits": {
             "total_cents": int((dep_row or {}).get("total_cents") or 0),
             "count": int((dep_row or {}).get("cnt") or 0),
@@ -5705,7 +5767,10 @@ async def mark_order_paid(
         agent_name = row["agent_name"]
         already_closed = row["paid_confirmed_at"] is not None
 
-        if payment_type != "credit":
+        # «Оплата сразу» тоже принимается: её автоплатёж могли отклонить (денег
+        # не было), и заявить оплату повторно было бы нечем — заказ так и висел
+        # бы неоплаченным без единой кнопки. Долгом он виден в get_open_debts.
+        if payment_type not in ("credit", "paid"):
             return (False, None)
         if already_closed:
             return (False, None)
@@ -5718,32 +5783,17 @@ async def mark_order_paid(
 
         # Под locком считаем суммы — гарантия что между recompute и
         # INSERT никто другой не добавит payment. Считаем в копейках (точно).
-        used_cents = int(
-            await txn.fetchval(
-                f"SELECT {_SUM_PAYMENTS_CENTS} FROM payments "
-                "WHERE order_id = $1 AND status IN ('pending', 'confirmed')",
-                order_id,
-            )
-            or 0
-        )
-        total_cents = int(
-            await txn.fetchval(
-                f"SELECT {_SUM_ORDER_TOTAL_CENTS} FROM order_items WHERE order_id = $1",
-                order_id,
-            )
-            or 0
-        )
-        # Возвраты уменьшают остаток к доплате (иначе «оплатить остаток» предлагал
-        # переплату на сумму возврата).
-        returns_cents = int(
-            await txn.fetchval(
-                f"SELECT {_SUM_RETURNS_CENTS} FROM returns "
-                f"WHERE order_id = $1 AND {_RETURN_OWED_FILTER}",
-                order_id,
-            )
-            or 0
-        )
-        remaining_cents = max(0, total_cents - used_cents - returns_cents)
+        #
+        # Сколько ещё можно заявить — services.debts.calc_claimable_cents:
+        # total − возвраты − платежи (confirmed+pending, в валюте заказа) −
+        # сдачи (confirmed+pending). Своя копия формулы здесь забывала сдачи:
+        # заказ 100, сдача 60 подтверждена, экран честно показывал остаток 40,
+        # а «весь остаток» создавал платёж на 100. Та же функция решает, сколько
+        # можно распределить сдачей, — два пути заявить одни и те же деньги
+        # больше не складываются поверх друг друга.
+        from services.debts import calc_claimable_cents
+
+        remaining_cents = (await calc_claimable_cents([order_id], conn=txn)).get(order_id, 0)
 
         # Если amount не задан — берём остаток (полная доплата)
         if amount is None:
@@ -5850,11 +5900,50 @@ async def reject_all_pending_payments_for_order(
     return n
 
 
+# Какие заказы — открытый долг. Одно определение на список долгов и на счётчик
+# «Требует внимания» (count_boss_attention): разъехавшись, они показывали бы
+# боссу число, не совпадающее со списком.
+#
+# «Оплата сразу» (paid) — тоже долг, пока деньги не подтверждены. Раньше фильтр
+# брал только credit, а очередь «Подтвердить» — только paid с ОЖИДАЮЩИМ
+# платежом: заказ, чей автоплатёж отклонили (или он не создался), не попадал
+# никуда — ни в «Долги», ни в «Нам должны», ни в очередь. Товар уехал, денег
+# нет, и нигде этого не видно.
+_OPEN_DEBT_FILTER = (
+    "payment_type IN ('credit', 'paid') AND paid_confirmed_at IS NULL "
+    # partially_returned тоже несёт остаток долга (частичный возврат не
+    # закрыл заказ) — иначе он исчезал из «Долги», но висел в «Клиенты»/
+    # кредит-чеке (WP-06, согласовано с get_agent_current_debt).
+    "AND status IN ('approved', 'shipped', 'partially_returned') "
+    # Заказ удалён в МойСклад (фантом) → долга по нему быть не должно.
+    "AND (ms_deleted_at IS NULL)"
+)
+
+# Срок оплаты для фильтра «к оплате сейчас». У «оплаты сразу» своего due_date
+# нет — деньги причитались в день заказа, поэтому срок = дата создания (первые
+# 10 символов локальной строки created_at; SUBSTR одинаков в SQLite и Postgres).
+_DEBT_DUE_SQL = (
+    "COALESCE(due_date, CASE WHEN payment_type = 'paid' "
+    "THEN SUBSTR(created_at, 1, 10) END)"
+)
+
+
+def debt_due_date(order: dict) -> str | None:
+    """Срок оплаты долга в Python — зеркало _DEBT_DUE_SQL для раскраски
+    просрочки на экране."""
+    due = order.get("due_date")
+    if due:
+        return str(due)[:10]
+    if order.get("payment_type") == "paid" and order.get("created_at"):
+        return str(order["created_at"])[:10]
+    return None
+
+
 async def get_open_debts(
     user_id: int | None = None,
     due_through: str | None = None,
 ) -> list[dict]:
-    """Список открытых долгов (credit + paid_at IS NULL).
+    """Список открытых долгов (credit/paid + paid_confirmed_at IS NULL).
 
     Параметры:
       user_id      — если указан, отдаём только долги этого менеджера;
@@ -5876,13 +5965,7 @@ async def get_open_debts(
     """
     query = (
         "SELECT * FROM orders "
-        "WHERE payment_type = 'credit' AND paid_confirmed_at IS NULL "
-        # partially_returned тоже несёт остаток долга (частичный возврат не
-        # закрыл заказ) — иначе он исчезал из «Долги», но висел в «Клиенты»/
-        # кредит-чеке (WP-06, согласовано с get_agent_current_debt).
-        "AND status IN ('approved', 'shipped', 'partially_returned') "
-        # Заказ удалён в МойСклад (фантом) → долга по нему быть не должно.
-        "AND (ms_deleted_at IS NULL)"
+        f"WHERE {_OPEN_DEBT_FILTER}"
     )
     params: list = []
     if user_id is not None:
@@ -5890,7 +5973,7 @@ async def get_open_debts(
         query += f" AND user_id = ${len(params)}"
     if due_through is not None:
         params.append(due_through)
-        query += f" AND due_date IS NOT NULL AND due_date <= ${len(params)}"
+        query += f" AND {_DEBT_DUE_SQL} IS NOT NULL AND {_DEBT_DUE_SQL} <= ${len(params)}"
     query += (
         " ORDER BY due_date ASC NULLS LAST, id ASC"
         if USE_POSTGRES

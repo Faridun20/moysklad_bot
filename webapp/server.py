@@ -630,7 +630,8 @@ async def api_home(request: Request):
             logger.warning("home: failed to load today stats: %s", e)
             today_stats = {"total": 0, "count": 0, "clients": 0, "top_products": []}
         today = {
-            "revenue": today_stats["total"] / 100,
+            # В базовой валюте по курсу: сумма копеек USD и UZS — не выручка.
+            "revenue": today_stats.get("base_total", today_stats["total"]) / 100,
             "shipments": today_stats["count"],
             "clients": today_stats["clients"],
             "scope": "company",
@@ -883,7 +884,10 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
     from services import async_db as adb
     from services.warehouse import list_shipments, sales_stats
 
-    _empty_stats: dict = {"total": 0, "count": 0, "clients": 0, "top_products": []}
+    _empty_stats: dict = {
+        "total": 0, "count": 0, "clients": 0, "top_products": [],
+        "base_total": 0, "base_count": 0, "base_partial": False, "missing": {},
+    }
     _state = {"ok": True}
 
     async def _safe_call(coro, default, label):
@@ -911,22 +915,35 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
         except Exception:
             pass
 
-    trend = 0
-    if prev["total"] > 0:
-        trend = round((current["total"] - prev["total"]) / prev["total"] * 100)
+    from config import BASE_CURRENCY
 
-    # Маржа по топ-товарам. Выручка — в копейках (÷100); cost — мажорные
-    # (как ввело руководство). cost None → profit не считаем.
+    base_cur = (BASE_CURRENCY or "USD").upper()
+    # Выручка — в БАЗОВОЙ валюте по курсу (sales_stats.base_total), а не сумма
+    # копеек всех валют: USD и UZS складывались в одно число, и от него же
+    # считались тренд и средний чек. Что без курса — отдаётся отдельно
+    # (`missing_rates`, `base_partial`), как в «Деньги → Отчёт».
+    cur_base = int(current.get("base_total", current["total"]) or 0)
+    prev_base = int(prev.get("base_total", prev["total"]) or 0)
+    trend = 0
+    if prev_base > 0:
+        trend = round((cur_base - prev_base) / prev_base * 100)
+    base_count = int(current.get("base_count", current["count"]) or 0)
+
+    # Маржа по топ-товарам. Выручка — в копейках (÷100) в валюте накладной;
+    # cost — мажорные (как ввело руководство) в валюте цены. cost None или
+    # валюты разные → profit не считаем: сумы минус доллары — не прибыль.
     top_products = current["top_products"][:5]
     prod_ids = [str(d["product_id"]) for _n, d in top_products if d.get("product_id")]
     costs = await adb.get_product_prices_by_ids(prod_ids) if prod_ids else {}
     top = []
     for name, d in top_products:
         revenue = d["sum"] / 100
-        item = {"name": name, "sum": revenue, "qty": d["qty"]}
+        item_cur = (d.get("currency") or base_cur).upper()
+        item = {"name": name, "sum": revenue, "qty": d["qty"], "currency": item_cur}
         cost_row = costs.get(str(d.get("product_id") or ""))
         cost = cost_row.get("cost_price") if cost_row else None
-        if cost is not None:
+        cost_cur = ((cost_row or {}).get("currency") or base_cur).upper()
+        if cost is not None and cost_cur == item_cur:
             item["profit"] = round(revenue - float(cost) * d["qty"], 2)
             item["margin_known"] = True
         else:
@@ -934,7 +951,12 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
         top.append(item)
 
     top_clients = [
-        {"name": name, "revenue": d["sum"] / 100, "count": d["count"]}
+        {
+            "name": name,
+            "revenue": d["sum"] / 100,
+            "count": d["count"],
+            "currency": (d.get("currency") or base_cur).upper(),
+        }
         for name, d in current.get("top_clients", [])[:10]
     ]
     # Топ менеджеров — из ЛОКАЛЬНЫХ orders (надёжно), а не из МС-атрибута
@@ -957,13 +979,27 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
         for m in perf[:10]
     ]
 
+    by_cur = current.get("by_currency") or {}
     return {
         "label": label,
         "scope": "company",
-        "total": current["total"] / 100,
+        # Итог в базовой валюте — только то, что пересчитано по курсу.
+        "total": cur_base / 100,
+        "base_currency": base_cur,
+        "base_partial": bool(current.get("base_partial")),
+        "total_by_currency": [
+            {"currency": c, "total": v / 100}
+            for c, v in sorted(by_cur.items(), key=lambda kv: kv[1], reverse=True)
+        ],
+        "missing_rates": [
+            {"currency": c, "amount": v / 100}
+            for c, v in sorted((current.get("missing") or {}).items())
+        ],
         "count": current["count"],
         "clients": current["clients"],
-        "avg_check": (current["total"] / current["count"] / 100) if current["count"] else 0,
+        # Средний чек — по отгрузкам, вошедшим в итог: делить пересчитанную
+        # часть на все отгрузки значит занизить его на долю «без курса».
+        "avg_check": (cur_base / base_count / 100) if base_count else 0,
         "trend": trend,
         "by_day": [{"day": days_ru[i], "count": by_day[i]} for i in range(7)],
         "top_products": top,
@@ -1414,16 +1450,25 @@ def _payment_identity(user: dict) -> tuple[int, str, str]:
     return user_id, full_name, username
 
 
-def _validate_payment_amount(raw) -> float:
-    """0 < amount < 10M, конечное. Иначе HTTP 400 (S3: nan/inf отравляют FIFO)."""
-    import math
+def _validate_payment_amount(raw, currency: str | None = None) -> float:
+    """Сумма платежа в валюте `currency` (None — базовая): конечная, > 0 и не
+    выше потолка в ЭКВИВАЛЕНТЕ базовой валюты. Иначе HTTP 400 (S3: nan/inf
+    отравляют FIFO).
+
+    Потолок «< 10 000 000 в любой валюте» для сумов означал ≈ $800 — оплату
+    техники в UZS нельзя было провести вовсе. Правило одно на все ручки —
+    `database.validate_amount_in_currency`.
+    """
+    from services.database import validate_amount_in_currency
 
     try:
         amount = float(raw)
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Неверная сумма")
-    if not (math.isfinite(amount) and 0 < amount < 10_000_000):
-        raise HTTPException(status_code=400, detail="Неверная сумма")
+    ok, err = validate_amount_in_currency(amount, currency)
+    if not ok:
+        detail = err if err and "лимит" in err else "Неверная сумма"
+        raise HTTPException(status_code=400, detail=detail)
     return amount
 
 
@@ -1497,10 +1542,11 @@ async def _send_payments_batch(user: dict, items: list, comment_raw: str, idem_k
 
     parsed: list[tuple[float, str]] = []
     for it in items:
-        amount = _validate_payment_amount((it or {}).get("amount", 0))
         currency = (it or {}).get("currency", "USD")
         if currency not in ALLOWED_CURRENCIES:
             raise HTTPException(status_code=400, detail="Неверная валюта")
+        # Валюта — ДО суммы: потолок суммы задан в эквиваленте базовой валюты.
+        amount = _validate_payment_amount((it or {}).get("amount", 0), currency)
         parsed.append((amount, currency))
 
     user_id, full_name, username = _payment_identity(user)
@@ -1581,22 +1627,16 @@ async def api_payments_send(request: Request):
     if isinstance(items, list) and items:
         return await _send_payments_batch(user, items, data.get("comment", ""), idem_key=idem_key)
 
-    # Round 6 (S3): isnan/isinf + верхний лимит — float('1e308') проходит
-    # `> 0`, отравляет FIFO-математику в БД, отдаёт `nan USD` боссу в UI.
-    import math
-
-    try:
-        amount = float(data.get("amount", 0))
-        if not (math.isfinite(amount) and 0 < amount < 10_000_000):
-            raise ValueError
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Неверная сумма")
-
     from config import ALLOWED_CURRENCIES
 
     currency = data.get("currency", "USD")
     if currency not in ALLOWED_CURRENCIES:
         raise HTTPException(status_code=400, detail="Неверная валюта")
+
+    # Round 6 (S3): isnan/isinf + верхний лимит — float('1e308') проходит
+    # `> 0`, отравляет FIFO-математику в БД, отдаёт `nan USD` боссу в UI.
+    # Потолок — в эквиваленте базовой валюты, поэтому валюта проверяется первой.
+    amount = _validate_payment_amount(data.get("amount", 0), currency)
 
     # Round 6 (S7): cap 1000 — DB-колонка TEXT (unbounded), идёт в Telegram-
     # уведомление и в audit_log. Без cap'а — DB-bloat + риск >4096 char для
@@ -1694,26 +1734,35 @@ async def api_money_summary(request: Request):
     totals = await adb.get_money_totals(since_s, until_s)
     totals["period"] = {"label": label, "since": since_s[:10], "until": until_s[:10]}
 
-    # Единый итог в базовой валюте (через курсы, как в долгах): платежи по валютам
-    # + сдачи (база). convert_to_base → None, если курс не задан. Раньше такие
-    # суммы МОЛЧА выпадали из «≈ …» (был баг «не считает суммы >999»: крупные
-    # UZS-суммы без курса исчезали из итога). Теперь возвращаем их явным списком
-    # `missing_rates`, чтобы UI показал «без курса не учтено: …», а не терял молча.
+    # Единый итог в базовой валюте: платежи + сдачи (база). Валюты без курса НЕ
+    # выпадают молча (был баг «не считает суммы >999»: крупные UZS-суммы без
+    # курса исчезали из итога) — они уходят явным списком `missing_rates`, и UI
+    # пишет «без курса не учтено: …».
+    #
+    # Курс — СНИМОК на момент подтверждения (payments.fx_rate_to_base), как в
+    # отчёте продаж (get_manager_performance): деньги, пришедшие, когда
+    # 1 250 000 сум стоили 100 USD, не становятся 125 USD оттого, что сум
+    # укрепился. Снимка нет (легаси-строка) — текущий курс.
     from config import BASE_CURRENCY
-    from services.database import convert_to_base
+    from services.database import convert_to_base, convert_to_base_at
 
     base_cur = (BASE_CURRENCY or "USD").upper()
-    # (сумма в мажорных единицах, валюта): платежи по валютам + сдачи (в базовой).
-    parts = [(p["total_cents"] / 100, p["currency"]) for p in totals["payments"]]
-    parts.append((totals["deposits"]["total_cents"] / 100, base_cur))
+    # (сумма в мажорных единицах, валюта, снимок курса): платежи + сдачи.
+    parts = [
+        (p["total_cents"] / 100, p["currency"], p["fx_rate_to_base"])
+        for p in totals.pop("payments_by_rate", [])
+    ]
+    parts.append((totals["deposits"]["total_cents"] / 100, base_cur, None))
     known_sum = 0.0
     known_any = False
     missing: dict[str, float] = {}  # валюта → сумма (мажор), не вошедшая в итог
-    for amt, cur in parts:
+    for amt, cur, snap in parts:
         # amt != 0 (не > 0): нетто-сдачи бывают отрицательными (cash-возвраты).
         if not amt:
             continue
-        conv = convert_to_base(amt, cur)
+        conv = convert_to_base_at(amt, cur, snap)
+        if conv is None:
+            conv = convert_to_base(amt, cur)
         if conv is None:
             missing[cur] = missing.get(cur, 0.0) + amt
         else:
@@ -4536,15 +4585,20 @@ async def api_deposits_create(request: Request):
         rate_limit_max=10,
     )
     # Round 6 (S3): isnan/isinf + верхний лимит — `1e308` отравляет FIFO.
-    import math
+    # Сдача — в базовой валюте; потолок тот же, что у платежей
+    # (database.validate_amount_in_currency), а не своя константа.
+    from services.database import validate_amount_in_currency
 
+    raw_amount = data.get("amount")
     try:
-        amount = float(data.get("amount"))
-        if not (math.isfinite(amount) and 0 < amount < 10_000_000):
-            raise ValueError
+        amount = float(raw_amount)
     except (TypeError, ValueError):
+        amount = float("nan")
+    ok, err = validate_amount_in_currency(amount, None)
+    if not ok:
         raise HTTPException(
-            status_code=400, detail="Сумма должна быть положительным числом до 10М"
+            status_code=400,
+            detail=err if err and "лимит" in err else "Сумма должна быть положительным числом",
         )
 
     # R2: DB-уровневая идемпотентность. create_cash_deposit не защищён claim'ом —
@@ -5308,6 +5362,8 @@ async def api_debts(request: Request):
         due_through=due_through,
     )
 
+    from services.database import debt_due_date
+
     # T2.1: остаток считает services.debts — тот же код, что в карточке заказа
     # и в утреннем напоминании о долгах. Батчем (пять запросов на любое число
     # заказов), поэтому N+1 не появляется. items тянем отдельно только ради
@@ -5328,7 +5384,9 @@ async def api_debts(request: Request):
         confirmed = float(money.from_cents(bal.confirmed_cents))
         pending = float(money.from_cents(bal.pending_cents))
         remaining = float(money.from_cents(bal.remaining_cents))
-        due = o.get("due_date")
+        # У «оплаты сразу» своего срока нет — деньги причитались в день заказа
+        # (database.debt_due_date, то же правило, что в фильтре «сейчас»).
+        due = debt_due_date(o)
         # State:
         #  - awaiting_confirmation — есть pending payments (boss решает)
         #  - partial — есть confirmed, но ещё не всё (pending=0)
@@ -5523,7 +5581,9 @@ async def api_mark_paid(request: Request):
     if not (is_owner or is_boss):
         raise HTTPException(status_code=403, detail="Нет доступа")
 
-    if order.get("payment_type") != "credit":
+    # «Оплата сразу» принимается тоже: отклонённый автоплатёж иначе не
+    # заявить повторно, и заказ висел бы неоплаченным без единой кнопки.
+    if order.get("payment_type") not in ("credit", "paid"):
         raise HTTPException(status_code=400, detail="Это не кредитный заказ")
 
     full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
@@ -5536,7 +5596,7 @@ async def api_mark_paid(request: Request):
     amount_raw = data.get("amount")
     amount = None
     if amount_raw is not None and amount_raw != "":
-        amount = _validate_payment_amount(amount_raw)
+        amount = _validate_payment_amount(amount_raw, order.get("currency"))
 
     try:
         ok, payment_id = await adb.mark_order_paid(

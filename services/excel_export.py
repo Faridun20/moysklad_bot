@@ -66,7 +66,17 @@ def build_analytics_xlsx(data: dict[str, Any]) -> bytes:
     for c in ws[1]:
         c.font = bold
     ws.append(["Период", _text(data.get("label", ""))])
-    ws.append(["Выручка", round(float(data.get("total", 0) or 0), 2)])
+    # Выручка — итог в базовой валюте по курсу; разные валюты в одно число не
+    # складываются, поэтому ниже — строки по валютам и что осталось без курса.
+    base_cur = _text(data.get("base_currency") or "USD")
+    ws.append([f"Выручка, ≈ {base_cur}", round(float(data.get("total", 0) or 0), 2)])
+    for row in data.get("total_by_currency", []) or []:
+        ws.append([f"  в т.ч. {_text(row.get('currency'))}", round(float(row.get("total", 0) or 0), 2)])
+    for row in data.get("missing_rates", []) or []:
+        ws.append([
+            f"  без курса не учтено, {_text(row.get('currency'))}",
+            round(float(row.get("amount", 0) or 0), 2),
+        ])
     ws.append(["Заказов", data.get("count", 0)])
     ws.append(["Клиентов", data.get("clients", 0)])
     ws.append(["Средний чек", round(float(data.get("avg_check", 0) or 0), 2)])
@@ -75,12 +85,15 @@ def build_analytics_xlsx(data: dict[str, Any]) -> bytes:
 
     # ─── Лист «Клиенты» ───
     ws_c = wb.create_sheet("Клиенты")
-    ws_c.append(["Клиент", "Выручка", "Заказов"])
+    # Валюта — отдельной колонкой: топ клиентов и товаров считается раздельно
+    # по валютам, и «Выручка» без неё не читается.
+    ws_c.append(["Клиент", "Выручка", "Заказов", "Валюта"])
     for c in ws_c[1]:
         c.font = bold
     for row in data.get("top_clients", []) or []:
         ws_c.append(
-            [_text(row.get("name")), round(float(row.get("revenue", 0) or 0), 2), row.get("count", 0)]
+            [_text(row.get("name")), round(float(row.get("revenue", 0) or 0), 2), row.get("count", 0),
+             _text(row.get("currency") or base_cur)]
         )
     _autosize(ws_c)
 
@@ -97,7 +110,7 @@ def build_analytics_xlsx(data: dict[str, Any]) -> bytes:
 
     # ─── Лист «Товары» (+ прибыль где известна) ───
     ws_p = wb.create_sheet("Товары")
-    ws_p.append(["Товар", "Кол-во", "Выручка", "Прибыль"])
+    ws_p.append(["Товар", "Кол-во", "Выручка", "Прибыль", "Валюта"])
     for c in ws_p[1]:
         c.font = bold
     for row in data.get("top_products", []) or []:
@@ -108,6 +121,7 @@ def build_analytics_xlsx(data: dict[str, Any]) -> bytes:
                 row.get("qty", 0),
                 round(float(row.get("sum", 0) or 0), 2),
                 round(float(profit), 2) if profit is not None else "н/д",
+                _text(row.get("currency") or base_cur),
             ]
         )
     _autosize(ws_p)

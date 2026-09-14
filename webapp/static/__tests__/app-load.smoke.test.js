@@ -2466,3 +2466,61 @@ describe('вход: 403 от /api/me', () => {
     expect(text).not.toContain('Нет связи');
   });
 });
+
+describe('карточка покупателя техники', () => {
+  // E2E (test_cov_money): «Внести оплату» в карточке покупателя не нажималась —
+  // renderBuyerCard вешал обработчик только на [data-payment], а кнопка
+  // поступления жила лишь в карточке машины. И «Получено» считалось по
+  // пустому covered_cents: «Получено 0 USD из 20 000 USD».
+  const CARD = {
+    ok: true, buyer: 'Азиз Рахимов',
+    outstanding: { count: 2, by_currency: [{ currency: 'USD', total: 10000 }], base_total: 10000, base_currency: 'USD', partial: false },
+    aging: { buckets: [] },
+    deals: [{
+      id: 5, kind: 'credit', currency: 'USD', machine_name: 'JCB 3CX', sold_at: '2026-06-30',
+      payments: [
+        { id: 10, seq: 0, due_date: '2026-06-30', amount_cents: 500000, paid_at: '2026-06-30', covered_cents: 500000 },
+        { id: 11, seq: 1, due_date: '2026-07-30', amount_cents: 500000, paid_at: '2026-07-29', covered_cents: 500000 },
+        { id: 12, seq: 2, due_date: '2026-08-30', amount_cents: 500000, paid_at: null, covered_cents: 0 },
+        { id: 13, seq: 3, due_date: '2026-09-30', amount_cents: 500000, paid_at: null, covered_cents: 0 },
+      ],
+      progress: { received_cents: 500000, down_payment_cents: 500000, paid_cents: 1000000, planned_cents: 2000000, left_cents: 1000000 },
+      receipts: [{ id: 3, amount_cents: 500000, received_at: '2026-07-29 10:00:00', note: 'платёж 1' }],
+    }],
+  };
+  const bootBuyer = () => boot(`
+    currentUser = { role: 'boss' };
+    window.__writes = [];
+    window.__renders = 0;
+    api = async (path) => { window.__renders += 1; return ${JSON.stringify(CARD)}; };
+    apiResult = async (path, body) => {
+      window.__writes.push([path, body]);
+      return { ok: true, status: 200, body: { ok: true }, error: '' };
+    };
+    window.__ready = renderBuyerCard('Азиз Рахимов');
+  `);
+
+  it('«Получено» берёт прогресс сервера: взнос + поступления', async () => {
+    const window = bootBuyer();
+    await window.__ready;
+    const total = window.document.querySelector('.schedule-total').textContent.replace(/\s+/g, '');
+    expect(total).toContain('Получено10000USDиз20000USD');
+    expect(total).toContain('осталось10000USD');
+  });
+
+  it('«Внести оплату» открывает форму и после записи перерисовывает карточку', async () => {
+    const window = bootBuyer();
+    await window.__ready;
+    window.document.querySelector('[data-receipt-add="5"]').click();
+    const amount = window.document.querySelector('.c-overlay #ms-f-amount');
+    expect(amount).not.toBeNull();
+    amount.value = '1500';
+    const before = window.__renders;
+    window.document.querySelector('#ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__writes[0][0]).toBe('/api/machines/receipt');
+    expect(window.__writes[0][1].deal_id).toBe(5);
+    expect(window.__renders).toBeGreaterThan(before);
+  });
+});

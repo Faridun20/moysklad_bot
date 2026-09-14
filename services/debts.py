@@ -49,7 +49,12 @@ from services import adb_core
 # `services.database` импортирует их отсюда, чтобы определение было одно.
 
 SUM_PAYMENTS_CENTS = "COALESCE(SUM(amount_cents), 0)"
-SUM_ORDER_TOTAL_CENTS = "COALESCE(SUM(CAST(round(quantity * price_cents) AS INTEGER)), 0)"
+# BIGINT, а НЕ INTEGER: на Postgres INTEGER — 32 бита, и строка дороже
+# 21 474 836.47 (заказ в сумах ≈ $1 800) роняла запрос «integer out of range» —
+# вместе с ним падали «Долги», закрытие заказа, дебиторка и отчёт. SQLite
+# хранит целые в 64 битах при любом имени типа, поэтому тесты на нём этого не
+# видели (сторож на настоящем Postgres — tests/test_money_bigint_pg.py).
+SUM_ORDER_TOTAL_CENTS = "COALESCE(SUM(CAST(round(quantity * price_cents) AS BIGINT)), 0)"
 SUM_RETURNS_CENTS = "COALESCE(SUM(total_amount_cents), 0)"
 SUM_ALLOC_CENTS = "COALESCE(SUM(cdo.amount_allocated_cents), 0)"
 
@@ -179,6 +184,62 @@ async def calc_order_balances(
             remaining_cents=_remaining(total_c, conf_c, dep_c, ret_c),
         )
     return out
+
+
+async def calc_allocated_deposit_cents(order_ids: list[int], conn: Any = None) -> dict[int, int]:
+    """Распределено на заказы сдачами pending+confirmed, в копейках, батчем.
+
+    Pending-сдача деньги ещё не принесла, но уже «застолбила» часть остатка:
+    второй раз ни сдачей, ни отметкой оплаты его заявлять нельзя.
+    """
+    db = conn if conn is not None else adb_core
+    ids = [int(o) for o in dict.fromkeys(order_ids or [])]
+    if not ids:
+        return {}
+    ph = ", ".join(f"${i + 1}" for i in range(len(ids)))
+    rows = await db.fetch(
+        f"SELECT cdo.order_id AS oid, {SUM_ALLOC_CENTS} AS dc "
+        "FROM cash_deposit_orders cdo JOIN cash_deposits d ON d.id = cdo.deposit_id "
+        f"WHERE cdo.order_id IN ({ph}) AND d.status IN ('pending', 'confirmed') "
+        "GROUP BY cdo.order_id",
+        *ids,
+    )
+    return {int(r["oid"]): int(r["dc"] or 0) for r in rows}
+
+
+async def calc_claimable_cents(order_ids: list[int], conn: Any = None) -> dict[int, int]:
+    """Сколько по заказу ещё МОЖНО заявить новой оплатой или сдачей, в копейках.
+
+    Отличается от `remaining_cents` тем, что вычитает и то, что уже заявлено,
+    но не подтверждено:
+
+        claimable = total − возвраты − платежи (confirmed + pending)
+                    − сдачи (confirmed + pending)
+
+    «Отметить оплату» и распределение сдачи — два способа заявить одни и те же
+    деньги. Пока каждый смотрел только на свои записи, они складывались поверх
+    друг друга: сдача 60 подтверждена, а «весь остаток» создавал платёж на все
+    100; отмечено 150 из 200, а сдача 200 ложилась целиком — и по заказу
+    собиралось 350. Формула одна на оба пути, поэтому живёт здесь.
+
+    Ноль снизу: переплата не делает «можно заявить» отрицательным.
+    """
+    ids = [int(o) for o in dict.fromkeys(order_ids or [])]
+    if not ids:
+        return {}
+    balances = await calc_order_balances(ids, conn=conn)
+    allocated = await calc_allocated_deposit_cents(ids, conn=conn)
+    return {
+        oid: max(
+            0,
+            bal.total_cents
+            - bal.returns_cents
+            - bal.confirmed_cents
+            - bal.pending_cents
+            - allocated.get(oid, 0),
+        )
+        for oid, bal in balances.items()
+    }
 
 
 async def calc_order_balance(order_id: int, conn: Any = None) -> OrderBalance:

@@ -285,6 +285,23 @@ describe('renderMoneyTotalsHtml', () => {
     expect(html).toContain('Без курса не учтено');
     expect(html).toContain('UZS 5 000 000');  // крупная сумма видна, не потеряна
   });
+  it('пересчёт чужой валюты подписан: по курсу на день поступления', () => {
+    // Итог в базовой считается по снимку курса подтверждения, а не по
+    // сегодняшнему — иначе прошлые деньги «плыли» бы вместе с курсом.
+    const withUzs = renderMoneyTotalsHtml({
+      payments: [{ currency: 'UZS', total_cents: 125000000, count: 1 }],
+      deposits: { total_cents: 0, count: 0 },
+      base_total: 100, base_currency: 'USD', missing_rates: [],
+    });
+    expect(withUzs).toContain('по курсу на день поступления');
+    expect(withUzs).not.toContain('money-total-note');
+    const onlyUsd = renderMoneyTotalsHtml({
+      payments: [{ currency: 'USD', total_cents: 10000, count: 1 }],
+      deposits: { total_cents: 0, count: 0 },
+      base_total: 100, base_currency: 'USD', missing_rates: [],
+    });
+    expect(onlyUsd).not.toContain('по курсу');
+  });
   it('без base_total — баннера итога нет', () => {
     const html = renderMoneyTotalsHtml({ payments: [{ currency: 'USD', total_cents: 100, count: 1 }], deposits: { count: 0 } });
     expect(html).not.toContain('money-total');
