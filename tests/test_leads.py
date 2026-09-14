@@ -440,7 +440,9 @@ def test_direction_is_taken_from_the_first_message_not_the_last(isolated_db):
     _run(leads.record_message(tg_user_id=100, manager_id=1, inbound=False, at=_ago(hours=4)))
     _run(leads.record_message(tg_user_id=100, manager_id=1, inbound=True, at=_ago(hours=3)))
 
-    f = _run(leads.funnel(_today(), _today()))
+    # Окно — со вчера: «5 часов назад» между полуночью и пятью утра — это уже
+    # вчерашняя дата, и период «только сегодня» терял первое сообщение.
+    f = _run(leads.funnel(_ago(days=1)[:10], _today()))
     assert f["by_direction"]["inbound"]["contacted"] == 1
     assert f["by_direction"]["outbound"]["contacted"] == 0
 
