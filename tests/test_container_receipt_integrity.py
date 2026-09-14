@@ -107,3 +107,52 @@ def test_supply_endpoint_replays_same_idempotency_key(isolated_db, monkeypatch):
 
     # Повтор с тем же ключом не переоприходовал: в истории одна накладная, без отменённой.
     assert int(_run(adb_core.fetchval("SELECT COUNT(*) FROM invoices WHERE type = 'incoming'"))) == 1
+
+
+# ─── п.6: удаление оприходованного контейнера ─────────────────────────────────
+
+
+def test_deleting_received_container_cancels_its_invoice(isolated_db, monkeypatch):
+    from services import adb_core, container_receipt
+
+    _setup(isolated_db)
+    cid, pid = _arrived_container(qty=8)
+    link_invoice = _run(container_receipt.receive(cid, user_id=2))["invoice_id"]
+    assert _stock(pid) == 8
+
+    res = _post(_client(monkeypatch), "/api/containers/delete", 2, container_id=cid)
+    assert res.status_code == 200, res.text
+    assert res.json()["invoice_cancelled"] == link_invoice
+    assert _stock(pid) == 0
+    assert _run(adb_core.fetchval("SELECT status FROM invoices WHERE id = $1", link_invoice)) == "cancelled"
+    assert int(_run(adb_core.fetchval("SELECT COUNT(*) FROM containers"))) == 0
+
+
+def test_deleting_container_whose_goods_are_gone_is_refused(isolated_db, monkeypatch):
+    from services import adb_core, container_receipt, warehouse
+
+    _setup(isolated_db)
+    cid, pid = _arrived_container(qty=8)
+    _run(container_receipt.receive(cid, user_id=2))
+    wid = _run(warehouse.default_warehouse_id())
+    out = _run(warehouse.create_invoice(
+        invoice_type="outgoing", warehouse_id=wid,
+        items=[{"product_id": pid, "quantity": 5, "price_cents": 100}],
+    ))
+    assert out["ok"], out
+
+    res = _post(_client(monkeypatch), "/api/containers/delete", 2, container_id=cid)
+    assert res.status_code in (400, 409)
+    assert "уже отгружен" in res.json()["detail"]
+    # Ничего не тронуто: контейнер, его приёмка и остаток на месте.
+    assert int(_run(adb_core.fetchval("SELECT COUNT(*) FROM containers"))) == 1
+    assert _run(container_receipt.get_link(cid))["invoice_id"]
+    assert _stock(pid) == 3
+
+
+def test_deleting_not_received_container_still_works(isolated_db, monkeypatch):
+    _setup(isolated_db)
+    cid, _pid = _arrived_container(qty=3)
+    res = _post(_client(monkeypatch), "/api/containers/delete", 2, container_id=cid)
+    assert res.status_code == 200, res.text
+    assert res.json()["invoice_cancelled"] is None
