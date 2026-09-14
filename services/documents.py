@@ -68,7 +68,11 @@ def company_requisites() -> dict[str, str]:
         val = get_setting(key, "")
         out[key] = str(val or "")
     if not out["company_name"]:
-        out["company_name"] = os.environ.get("COMPANY_NAME", "")
+        # Тот же источник, что у накладной: название компании — одно на проект,
+        # и требовать вписать его заново только ради расписки незачем.
+        from services.invoice_pdf import COMPANY_NAME
+
+        out["company_name"] = COMPANY_NAME
     return out
 
 
@@ -135,7 +139,14 @@ def form_to_context(data: dict[str, Any]) -> tuple[dict, dict]:
         "representative": _clean(data.get("company_representative")) or company["company_representative"],
     }
     if not creditor["name"]:
-        raise DocumentError("Укажите название компании (кредитора) — в форме или в настройках")
+        # Формулировка важна: менеджеры читали это как «впишите компанию
+        # КЛИЕНТА» и вставали в тупик, когда товар берёт физлицо. Компания
+        # тут наша, а должником может быть кто угодно — ему компания не нужна.
+        raise DocumentError(
+            "Не заполнены реквизиты вашей компании (кредитора) — "
+            "откройте «Реквизиты компании». К должнику это не относится: "
+            "им может быть и физлицо без компании."
+        )
     city = _clean(data.get("city"), 80) or company["company_city"]
     if not city:
         raise DocumentError("Укажите город")
@@ -155,10 +166,23 @@ def form_to_context(data: dict[str, Any]) -> tuple[dict, dict]:
 
     start_date = _parse_date(data.get("start_date") or date.today().isoformat())
     term_months = _parse_int(data.get("term_months"), "Срок (месяцев)", minimum=1)
-    payment_type = _clean(data.get("payment_type")) or "single"
-    installments = None
-    if payment_type == "installment":
-        installments = _parse_int(data.get("installments_count"), "Число платежей", minimum=2)
+    # Порядок оплаты ВЫВОДИТСЯ из числа платежей, а не спрашивается вторым
+    # полем. Два поля противоречили друг другу: менеджер вписывал 6 платежей,
+    # забывал переключить «Разовый платёж» — и расписка молча выходила с ОДНОЙ
+    # строкой графика на всю сумму и остатком 0. Молча получить не тот
+    # документ хуже, чем получить ошибку, поэтому источник истины один.
+    raw_count = str(data.get("installments_count") or "").strip()
+    installments_raw = _parse_int(raw_count, "Число платежей", minimum=1) if raw_count else 1
+    payment_type = _clean(data.get("payment_type"))
+    if installments_raw >= 2:
+        payment_type = "installment"
+    elif payment_type != "installment":
+        payment_type = "single"
+    if payment_type == "installment" and installments_raw < 2:
+        # Рассрочку заказали явно (старый вызов API), а платёж один — это
+        # противоречие в запросе, а не повод тихо выписать разовый платёж.
+        raise DocumentError("Для рассрочки нужно не меньше двух платежей")
+    installments = installments_raw if payment_type == "installment" else None
     penalty_rate = _clean(data.get("penalty_rate"), 16) or DEFAULT_PENALTY_RATE
     grace_days = _parse_int(data.get("grace_days") or DEFAULT_GRACE_DAYS, "Льготные дни")
     witness_name = _clean(data.get("witness_name"))

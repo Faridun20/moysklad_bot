@@ -70,6 +70,93 @@ def test_incoming_invoice_form_rejects_zero_quantity(open_app, e2e):
     assert boss.locator("#wh-save").count() == 1, "форма осталась, черновик не потерян"
 
 
+def _pick_counterparty(page, name: str = ""):
+    """Контрагента выбирают листом с поиском, а не нативным `<select>`.
+
+    Системный список Telegram-WebView разворачивал сотню строк без поиска —
+    отсюда пикер (openListPicker) и этот хелпер: открыть, выбрать, применить.
+    """
+    page.click("#wh-cp")
+    page.wait_for_selector(".picker-list [data-pick]")
+    if name:
+        page.fill("#ms-f-search", name)
+        page.wait_for_selector(f".picker-list [data-pick]:has-text('{name}')")
+    page.locator(".picker-list [data-pick]").first.click()
+    page.click("#ms-submit")
+    page.wait_for_selector(".c-overlay", state="detached")
+
+
+def test_counterparty_picker_searches_instead_of_native_select(open_app, e2e):
+    """Жалоба с площадки: «уродское меню выбора контрагентов».
+
+    Нативного `<select>` в форме больше нет вовсе — вместо него кнопка,
+    открывающая лист с поиском; выбранное имя остаётся на кнопке.
+    """
+    boss = open_app(e2e.ids["boss"])
+    go(boss, "stock")
+    tab(boss, "invoices")
+    boss.click("#wh-new")
+    boss.wait_for_selector("#wh-cp")
+    assert boss.locator("select#wh-cp").count() == 0, "нативный select остался"
+
+    boss.click("#wh-cp")
+    boss.wait_for_selector(".picker-list [data-pick]")
+    boss.fill("#ms-f-search", "неттакого")
+    boss.wait_for_selector(".picker-list:has-text('не найдены')")
+    boss.fill("#ms-f-search", "")
+    boss.wait_for_selector(".picker-list [data-pick]")
+    picked = boss.locator(".picker-list [data-pick] .card-row-title").first.inner_text().strip()
+    boss.locator(".picker-list [data-pick]").first.click()
+    boss.click("#ms-submit")
+    boss.wait_for_selector(".c-overlay", state="detached")
+    assert picked in boss.locator("#wh-cp").inner_text()
+
+
+def test_product_in_position_is_picked_from_a_searchable_list(open_app, e2e):
+    """Товар в позиции — тот же лист с поиском: в каталоге сотня наименований."""
+    boss = open_app(e2e.ids["boss"])
+    go(boss, "stock")
+    tab(boss, "invoices")
+    boss.click("#wh-new")
+    boss.wait_for_selector("#wh-add")
+    boss.click("#wh-add")
+    boss.wait_for_selector("[data-pick-product]")
+    assert boss.locator('.wh-pos select[data-f="product_id"]').count() == 0
+    boss.click("[data-pick-product]")
+    boss.wait_for_selector(".picker-list [data-pick]")
+    name = boss.locator(".picker-list [data-pick] .card-row-title").first.inner_text().strip()
+    boss.locator(".picker-list [data-pick]").first.click()
+    boss.click("#ms-submit")
+    boss.wait_for_selector(".c-overlay", state="detached")
+    assert name in boss.locator("[data-pick-product]").inner_text()
+
+
+def test_tab_row_shows_that_it_scrolls(open_app, e2e):
+    """Жалоба с площадки: «непонятно, что там ещё что-то есть».
+
+    У босса в «Складе» четыре вкладки, последняя («Накладные») на 390dp не
+    влезает и обрывается ровно по краю — без затенения это читается как «так и
+    задумано». Признак прокрутки ставит refreshScrollHints по ФАКТУ
+    переполнения, поэтому проверяем наблюдаемое: атрибут у ряда и то, что он
+    снимается, когда ряд долистали до конца.
+    """
+    boss = open_app(e2e.ids["boss"])
+    go(boss, "stock")
+    row = boss.locator(".seg-row.scroll-hint").first
+    boss.wait_for_function(
+        "() => (document.querySelector('.seg-row.scroll-hint')?.dataset.more || '').includes('end')"
+    )
+    assert "end" in row.get_attribute("data-more")
+    assert "start" not in row.get_attribute("data-more"), "в начале ряда тени слева быть не должно"
+
+    # Долистали вправо — подсказка переезжает на левый край.
+    boss.eval_on_selector(".seg-row.scroll-hint .seg", "el => el.scrollLeft = el.scrollWidth")
+    boss.wait_for_function(
+        "() => (document.querySelector('.seg-row.scroll-hint')?.dataset.more || '').includes('start')"
+    )
+    assert "end" not in row.get_attribute("data-more")
+
+
 def test_outgoing_invoice_requires_counterparty_and_price(open_app, e2e):
     # Расход: без контрагента и без цены кнопка неактивна; с ними — активна.
     boss = open_app(e2e.ids["boss"])
@@ -82,7 +169,7 @@ def test_outgoing_invoice_requires_counterparty_and_price(open_app, e2e):
     boss.click("#wh-add")
     boss.wait_for_selector('.wh-pos [data-f="price"]')
     assert boss.locator("#wh-save").is_disabled(), "нет контрагента и цены"
-    boss.select_option("#wh-cp", index=1)
+    _pick_counterparty(boss)
     assert boss.locator("#wh-save").is_disabled(), "цена по-прежнему не задана"
     boss.fill('.wh-pos [data-f="price"]', "0")
     boss.locator('.wh-pos [data-f="price"]').dispatch_event("change")

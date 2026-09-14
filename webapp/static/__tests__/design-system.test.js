@@ -227,6 +227,45 @@ describe('дизайн-система: скругления', () => {
   });
 });
 
+describe('целостность файла стилей', () => {
+  it('нет обрывков селекторов — они молча глушат следующее правило', () => {
+    // Одинокая `.` — остаток удалённого правила. Парсер CSS склеивает её со
+    // СЛЕДУЮЩИМ селектором (`. .stat-grid`), и то правило перестаёт
+    // применяться целиком. Так умерла сетка показателей: `.stat-grid` с
+    // `display:grid` в файле был, а плитки отчёта вставали в столбик и
+    // «налезали друг на друга» — жалоба с площадки. Ни ruff, ни vitest, ни
+    // глаз в диффе этого не ловят: файл остаётся валидным CSS.
+    const code = css.replace(/\/\*[\s\S]*?\*\//g, '');
+    const broken = [];
+    for (const m of code.matchAll(/([^{}]+)\{/g)) {
+      const sel = m[1].trim();
+      if (/(^|[\s,>+~])\.(?![-_a-zA-Z\\])/.test(sel)) {
+        broken.push(sel.replace(/\s+/g, ' ').slice(0, 80));
+      }
+    }
+    expect(broken).toEqual([]);
+  });
+
+  it('правила, на которые опираются экраны, реально объявлены', () => {
+    // Обратная сторона того же бага: класс есть в разметке, правило «есть» в
+    // файле, но не применяется. Проверяем сам факт объявления для тех, чью
+    // пропажу видно глазом на экране.
+    for (const cls of ['.stat-grid', '.order-meta', '.debts-summary', '.debt-hint',
+      '.due-date-wrap', '.u-fs-11']) {
+      const re = new RegExp(`(^|[\\s,}])\\${cls}\\s*[,{]`, 'm');
+      expect(re.test(css), `правило ${cls} не объявлено`).toBe(true);
+    }
+  });
+
+  it('сетка показателей — именно сетка 2×2', () => {
+    const at = css.indexOf('.stat-grid {');
+    const body = css.slice(at, css.indexOf('}', at));
+    expect(body).toMatch(/display:\s*grid/);
+    expect(body).toMatch(/grid-template-columns:\s*1fr 1fr/);
+    expect(body).toMatch(/gap:\s*8px/);
+  });
+});
+
 describe('дизайн-система: цвета', () => {
   const code = css.replace(/\/\*[\s\S]*?\*\//g, '');
 

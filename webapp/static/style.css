@@ -190,12 +190,37 @@
 /* Утилита: скрыть элемент без инлайн-стилей в JS. */
 .hidden { display: none !important; }
 
+/* ─── Подсказка прокрутки у горизонтальных рядов ──────────────────────────
+   Ряд вкладок или чипов, который не влез, обрывается ровно по краю экрана —
+   и обрезанная подпись читается как «так и задумано», а не как «листай
+   дальше». Затеняем край: видно, что за ним что-то есть.
+
+   Рисуем на ОБЁРТКЕ (.scroll-hint), а не на самом скроллере: псевдоэлемент
+   внутри прокручиваемого блока уезжает вместе с содержимым. Сторона зависит
+   от фактической позиции прокрутки (data-more ставит refreshScrollHints в
+   app.js), поэтому у начала ряда лишней тени нет. */
+.scroll-hint { position: relative; }
+.scroll-hint::before,
+.scroll-hint::after {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 24px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  z-index: 1;
+}
+.scroll-hint::before { left: 0;  background: linear-gradient(90deg, var(--bg-page), transparent); }
+.scroll-hint::after  { right: 0; background: linear-gradient(270deg, var(--bg-page), transparent); }
+.scroll-hint[data-more~="start"]::before { opacity: 1; }
+.scroll-hint[data-more~="end"]::after    { opacity: 1; }
+
 /* Точечные утилиты отступа/кегля — заменяют разрозненные инлайн-стили в
    JS-шаблонах (единый шаг 4px и две ступени мелкого кегля). */
 .u-mt-1 { margin-top: 4px; }
 .u-mt-2 { margin-top: 8px; }
 .u-mt-3 { margin-top: 12px; }
-.
 .u-fs-11 { font-size: 11px; }
 .u-fs-12 { font-size: 12px; }
 
@@ -529,7 +554,6 @@ body {
   margin: 16px 0 8px;
 }
 
-.
 
 .action-btn:active {
   transform: scale(0.96);
@@ -742,7 +766,6 @@ body {
   white-space: nowrap;
 }
 
-.
 
 /* ─── Stat-grid (компактная статистика) ───────────────────────── */
 .stat-grid {
@@ -1317,14 +1340,6 @@ body {
   font-weight: 600;
 }
 
-/* Переходный период (UI-WP-02): экраны, ещё не переведённые на data-status,
-   продолжают работать со старыми классами. Удалить, когда их не останется. */
-.status-draft    { background: var(--neutral-bg); color: var(--neutral); }
-.s
-.
-.
-.s
-
 .order-meta {
   display: flex; justify-content: space-between;
   font-size: 12px; color: var(--text-mute);
@@ -1462,6 +1477,20 @@ body {
   box-shadow: var(--shadow-card);
   font-family: inherit;
 }
+
+/* Кнопка выбора из справочника (контрагент, товар) — она же плейсхолдер,
+   пока ничего не выбрано. Заменила нативный <select>: тот в Telegram-WebView
+   разворачивается системным списком без поиска. */
+.btn-agent {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  min-height: 44px;
+}
+.btn-agent--empty { color: var(--text-mute); }
+/* Остаток товара в строке позиции — вторично к названию. */
+.wh-pos-have { font-size: 12px; color: var(--text-mute); white-space: nowrap; }
+/* Список выбора внутри диалога-пикера: та же высота, что у поставщика. */
+.picker-list { max-height: 46vh; overflow-y: auto; margin-bottom: 12px; }
+.picker-list .picked { background: var(--success-bg); }
 
 .agent-selected {
   display: flex; justify-content: space-between; align-items: center;
@@ -1652,7 +1681,6 @@ body {
   box-shadow: var(--shadow-card);
 }
 
-.
 
 /* ─── Тип оплаты в редакторе заказа ─────────────────────────────── */
 /* UI-WP-04: тип оплаты переехал на .seg — «выбери один из двух» больше не
@@ -1684,7 +1712,6 @@ body {
 .debts-header {
   padding: 16px; display: flex; flex-direction: column; gap: 8px;
 }
-.
 /* Фильтр «Все / К оплате сейчас» — тот же сегмент-язык, что .seg
    (трек-подложка + активный сегмент как приподнятая карточка). */
 /* UI-WP-22: .debts-tabs/.debts-tab были дословным клоном .seg/.seg-item —
@@ -1812,7 +1839,6 @@ body {
 }
 .limit-edit { margin-top: 8px; display: grid; gap: 8px; }
 .limit-edit[hidden] { display: none; }
-.
 .debt-hint {
   text-align: center; font-size: 13px; color: var(--text-mute);
   font-style: italic;

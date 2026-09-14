@@ -353,6 +353,46 @@ let clientsTab = 'funnel';   // funnel | limits | channel
 // «новый экран»: список заказов, догрузившийся после перехода на «Отчёт»,
 // не должен его затереть.
 let _screenGen = 0;
+// Подсказка прокрутки: у ряда, который не влез, темнеет край — иначе
+// обрезанная вкладка читается как «так и задумано» (жалоба с площадки:
+// «непонятно, что там ещё что-то есть»). Состояние считается по факту
+// переполнения, а не по числу пунктов: подпись бывает длинной, экран узким.
+//
+// Навешивается наблюдателем за #content, а не вызовом из каждого рендера:
+// рядов много, и забытый вызов в одной ветке — это потерянная подсказка
+// ровно там, где её не видно. Атрибуты мы не наблюдаем, поэтому собственная
+// правка data-more цикла не создаёт.
+let _scrollHintTimer = null;
+function refreshScrollHints() {
+  document.querySelectorAll('.scroll-hint').forEach(box => {
+    const sc = box.querySelector('.seg, .cat-row') || box.firstElementChild;
+    if (!sc) return;
+    const more = [];
+    if (sc.scrollLeft > 2) more.push('start');
+    if (sc.scrollWidth - sc.clientWidth - sc.scrollLeft > 2) more.push('end');
+    box.dataset.more = more.join(' ');
+    if (!sc.dataset.hintWired) {
+      sc.dataset.hintWired = '1';
+      sc.addEventListener('scroll', refreshScrollHints, { passive: true });
+    }
+  });
+}
+
+function watchScrollHints() {
+  if (typeof MutationObserver === 'undefined') return;
+  const obs = new MutationObserver(() => {
+    clearTimeout(_scrollHintTimer);
+    _scrollHintTimer = setTimeout(refreshScrollHints, 60);
+  });
+  // Наблюдаем ТЕЛО, а не #content: showScreen подменяет узел #content свежим
+  // (предохранитель от дописывания старого экрана поверх нового), и
+  // наблюдатель, повешенный на него, после первого же перехода сидел бы на
+  // отсоединённом узле. Заодно ловятся ряды внутри диалогов — они в body.
+  obs.observe(document.body, { childList: true, subtree: true });
+  window.addEventListener('resize', refreshScrollHints, { passive: true });
+  refreshScrollHints();
+}
+
 function bumpScreenGen() { _screenGen += 1; return _screenGen; }
 function screenGen() { return _screenGen; }
 
@@ -955,7 +995,7 @@ function renderStockContent() {
   const subRow = () => {
     const r = tree.find(x => x.key === stockCurrentCat);
     if (!r || !r.children.length) return '';
-    return `<div class="cat-row cat-row--sub" id="stock-subcats">`
+    return `<div class="cat-row cat-row--sub scroll-hint" id="stock-subcats">`
       + chip('data-subcat', '', 'Все', !stockCurrentSub)
       + r.children.map(c => chip('data-subcat', c.key, escapeHtml(c.name), stockCurrentSub === c.key)).join('')
       + `</div>`;
@@ -964,7 +1004,7 @@ function renderStockContent() {
   // Фильтры наличия — рядом с поиском, а не в самом низу за панелью.
   // «Залежалось» — только руководству: ручка /api/channel/stale отвечает admin/boss.
   const filterRow = `
-    <div class="cat-row" id="stock-filters">
+    <div class="cat-row scroll-hint" id="stock-filters">
       <button class="cat-btn ${!stockInStockOnly && !stockStaleOnly ? 'active' : ''}" data-instock="0" aria-pressed="${!stockInStockOnly && !stockStaleOnly}">Все</button>
       <button class="cat-btn ${stockInStockOnly ? 'active' : ''}" data-instock="1" aria-pressed="${stockInStockOnly}">${icon('box')} В наличии</button>
       ${isBoss ? `<button class="cat-btn ${stockStaleOnly ? 'active' : ''}" data-stale="1" aria-pressed="${stockStaleOnly}">${icon('clock')} Залежалось</button>` : ''}
@@ -980,7 +1020,7 @@ function renderStockContent() {
     </div>
     ${filterRow}
     <div class="section-label">Категории</div>
-    <div class="cat-row">${catBtns}</div>
+    <div class="cat-row scroll-hint">${catBtns}</div>
     ${subRow()}
     <div class="section-label" id="stock-list-label">${staleLabel}</div>
     <div class="stock-list" id="stock-list"></div>
@@ -1443,7 +1483,7 @@ async function renderContainers() {
     }).join('');
 
   content.innerHTML = stockShellHtml()
-    + `<div class="seg-row"><div class="seg seg--scroll">${seg}</div></div>`
+    + `<div class="seg-row scroll-hint"><div class="seg seg--scroll">${seg}</div></div>`
     + `<div class="search-wrap"><input type="search" id="container-search" class="search-input"
          placeholder="Номер или заметка…" value="${escapeHtml(containersSearch)}"
          autocomplete="off"></div>`
@@ -1764,6 +1804,73 @@ function containerItemsHtml(items, arrived, canManage) {
 
 // Выбор поставщика контейнера. Контрагентов берём той же ручкой, что и клиентов
 // заказа: справочник один, и второй поиск по нему был бы дублем.
+// Выбор из длинного справочника (контрагенты, товары) листом с поиском.
+//
+// Нативный `<select>` в Telegram-WebView разворачивается СИСТЕМНЫМ списком во
+// весь экран: без поиска, без подстрочника, с обрезанными именами — на сотне
+// контрагентов это пролистывание вслепую. Здесь тот же лист, что у поставщика
+// контейнера: поиск сверху, строки с подстрочником, выбранное подсвечено.
+//
+// items — [{id, name, sub}]; фильтрация локальная, справочник уже в памяти,
+// и дёргать сеть на каждую букву незачем.
+function openListPicker({ title, hint, items, selectedId, emptyText, onPick }) {
+  let picked = selectedId == null || selectedId === '' ? null : String(selectedId);
+  const all = items || [];
+  const sheet = openMachineSheet({
+    title,
+    hint,
+    fields: [{ key: 'search', label: 'Поиск', placeholder: 'Введите название' }],
+    submitLabel: 'Выбрать',
+    onSubmit: async (_data, { showErr }) => {
+      if (picked == null) { showErr('Выберите из списка'); return false; }
+      const item = all.find(i => String(i.id) === picked);
+      if (!item) { showErr('Выберите из списка'); return false; }
+      await onPick(item);
+      return true;
+    },
+  });
+
+  const ov = document.querySelector('.c-overlay');
+  const input = ov?.querySelector('#ms-f-search');
+  const list = document.createElement('div');
+  list.className = 'c-surface c-surface--list picker-list';
+  input?.parentElement?.after(list);
+
+  const draw = (query) => {
+    const q = String(query || '').trim().toLowerCase();
+    const rows = q ? all.filter(i => String(i.name || '').toLowerCase().includes(q)) : all;
+    list.innerHTML = rows.length
+      ? rows.slice(0, 200).map(i => `
+        <div class="c-row c-row--tap${String(i.id) === picked ? ' picked' : ''}"
+             data-pick="${escapeHtml(String(i.id))}" role="button" tabindex="0">
+          <div class="card-row-info">
+            <div class="card-row-title">${escapeHtml(i.name || '')}</div>
+            ${i.sub ? `<div class="card-row-sub">${escapeHtml(i.sub)}</div>` : ''}
+          </div>
+        </div>`).join('')
+      : `<div class="loader">${escapeHtml(emptyText || 'Ничего не найдено')}</div>`;
+    list.querySelectorAll('[data-pick]').forEach(row => {
+      row.addEventListener('click', () => {
+        haptic('light');
+        picked = row.dataset.pick;
+        list.querySelectorAll('[data-pick]').forEach(r => r.classList.remove('picked'));
+        row.classList.add('picked');
+        sheet.showErr('');
+      });
+    });
+  };
+
+  let timer;
+  input?.addEventListener('input', () => {
+    // Фильтр локальный, но на каждое нажатие перестраивать две сотни строк
+    // незачем — ждём паузу в наборе, как в поиске по складу.
+    clearTimeout(timer);
+    timer = setTimeout(() => draw(input.value), 120);
+  });
+  draw('');
+  return sheet;
+}
+
 function openSupplierPicker(containerId) {
   let picked = null;
   const sheet = openMachineSheet({
@@ -3151,7 +3258,7 @@ function renderOrdersMain() {
 
   content.innerHTML = `
     ${salesShellHtml()}
-    <div class="seg-row"><div class="seg seg--scroll">${statusSeg}</div></div>
+    <div class="seg-row scroll-hint"><div class="seg seg--scroll">${statusSeg}</div></div>
     ${periodRow}
     ${periodPanel}
     ${!isBoss ? `<button class="btn-new-order" id="btn-new-order">${icon('plus')} Новый заказ</button>` : ''}
@@ -4447,7 +4554,7 @@ async function renderLeadsList(container) {
   }
   const labels = data.status_labels || {};
   const filters = [['all', 'Все'], ['new', 'В работе'], ['won', 'Купили'], ['lost', 'Не купили']];
-  const chips = '<div class="seg-row"><div class="seg seg--scroll">'
+  const chips = '<div class="seg-row scroll-hint"><div class="seg seg--scroll">'
     + filters.map(([k, l]) =>
         `<button class="seg-item ${leadsFilter === k ? 'active' : ''}" data-lfilter="${k}" `
         + `aria-pressed="${leadsFilter === k}">${l}</button>`).join('')
@@ -4460,7 +4567,7 @@ async function renderLeadsList(container) {
     ['never_answered', 'Без ответа'],
     ['silent', 'Замолчали'],
   ];
-  const stateChips = '<div class="seg-row"><div class="seg seg--scroll">'
+  const stateChips = '<div class="seg-row scroll-hint"><div class="seg seg--scroll">'
     + states.map(([k, l]) =>
         `<button class="seg-item ${leadsState === k ? 'active' : ''}" data-lstate="${k}" `
         + `aria-pressed="${leadsState === k}">${l}</button>`).join('')
@@ -5127,7 +5234,7 @@ function openCallForm({ leadId = null, onDone } = {}) {
         + `aria-pressed="${k === 'in'}">${label}</button>`).join('')
     + '</div></div>'
     + '<div class="section-label">Откуда узнал</div>'
-    + '<div class="seg-row"><div class="seg seg--scroll">'
+    + '<div class="seg-row scroll-hint"><div class="seg seg--scroll">'
     + SOURCES.map(([k, label]) =>
         `<button class="seg-item ${k === '' ? 'active' : ''}" data-src="${k}" `
         + `aria-pressed="${k === ''}">${escapeHtml(label)}</button>`).join('')
@@ -5261,6 +5368,9 @@ function initNav() {
   if (searchBtn) {
     searchBtn.addEventListener('click', openSearch);
   }
+  // Подсказки прокрутки — один наблюдатель на всё приложение (см.
+  // refreshScrollHints), а не вызов из каждого рендера.
+  watchScrollHints();
 }
 
 
@@ -6767,10 +6877,12 @@ function openDocumentForm(meta) {
         options: [['USD', 'USD'], ['UZS', 'UZS']] },
       { key: 'start_date', label: 'Дата начала', type: 'date', value: today, required: true },
       { key: 'term_months', label: 'Срок, месяцев', type: 'number', required: true },
-      { key: 'payment_type', label: 'Порядок оплаты', type: 'select', value: 'single',
-        options: [['single', 'Разовый платёж'], ['installment', 'Рассрочка по графику']] },
-      { key: 'installments_count', label: 'Число платежей (для рассрочки)', type: 'number',
-        hint: 'Не больше, чем месяцев срока' },
+      // ОДНО поле вместо двух: раньше рядом стояли «Порядок оплаты» и «Число
+      // платежей», и они противоречили друг другу — менеджер вписывал 6
+      // платежей, забывал переключить «Разовый платёж», и расписка молча
+      // выходила с одной строкой графика и остатком 0.
+      { key: 'installments_count', label: 'Число платежей', type: 'number', value: 1,
+        hint: '1 — разовый платёж; 2 и больше — рассрочка, график построится сам' },
       { key: 'penalty_rate', label: 'Пеня, % в день', value: defaults.penalty_rate || '0.1' },
       { key: 'grace_days', label: 'Льготных дней', type: 'number', value: defaults.grace_days ?? 3 },
       { key: 'witness_name', label: 'Свидетель (ФИО)', hint: 'Можно оставить пустым' },
@@ -6834,21 +6946,18 @@ async function renderWhInvoiceNew() {
       <button class="seg-item ${isOut ? 'active' : ''}" data-whtype="outgoing">${icon('truck')} Расход</button>
     </div></div>` : `
     <div class="section-label">${icon('box')} Приход на склад</div>`;
-  // Плейсхолдер у select — как у остальных полей: hint-цветом, пока пусто.
-  const cpEmpty = !whDraft.counterparty_id;
+  // Контрагента выбирают листом с поиском (openListPicker), а не нативным
+  // `<select>`: в нём сотня строк «Имя · без Telegram» без поиска.
+  const cpPicked = whCounterparties.find(c => String(c.id) === String(whDraft.counterparty_id));
   content.innerHTML = `
     ${stockShellHtml()}
     ${typeSeg}
 
     <div class="form-row">
       <label class="form-label" for="wh-cp">Контрагент${isOut ? ' *' : ''}</label>
-      <select id="wh-cp" class="form-input ${cpEmpty ? 'form-input--placeholder' : ''}">
-        <option value="">Выберите контрагента</option>
-        ${whCounterparties.map(c => `
-          <option value="${c.id}" ${String(whDraft.counterparty_id) === String(c.id) ? 'selected' : ''}>
-            ${escapeHtml(c.name)}${c.telegram_id ? '' : ' · без Telegram'}
-          </option>`).join('')}
-      </select>
+      <button type="button" id="wh-cp" class="btn-agent${cpPicked ? '' : ' btn-agent--empty'}">
+        ${cpPicked ? escapeHtml(cpPicked.name) : 'Выберите контрагента'}
+      </button>
     </div>
 
     <div class="form-row">
@@ -6925,6 +7034,7 @@ async function renderWhInvoiceNew() {
     itemsEl.innerHTML = whDraft.items.map((it, i) => {
       const pr = itemProblems(it);
       const have = pr.have;
+      const p = byId.get(Number(it.product_id));
       // Подсветка нехватки — подсказка, а не защита: решение всё равно за
       // сервером, он держит блокировку остатка и проверяет под ней.
       const short = pr.short;
@@ -6932,12 +7042,10 @@ async function renderWhInvoiceNew() {
       const priceBad = pr.price && it.price_cents != null && it.priceTouched;
       return `
       <div class="wh-pos" data-i="${i}">
-        <select class="form-input" data-f="product_id" aria-label="Товар">
-          ${products.map(pp => `<option value="${pp.product_id}"
-            ${Number(it.product_id) === pp.product_id ? 'selected' : ''}>
-            ${escapeHtml(pp.name)} · ${whQty(pp.quantity)} ${escapeHtml(pp.unit || '')}
-          </option>`).join('')}
-        </select>
+        <button type="button" class="btn-agent" data-pick-product="${i}" aria-label="Товар">
+          ${escapeHtml(p ? p.name : 'Выберите товар')}
+          ${p ? `<span class="wh-pos-have">${whQty(p.quantity)} ${escapeHtml(p.unit || '')}</span>` : ''}
+        </button>
         <div class="wh-pos-row">
           <input class="form-input ${short || qtyBad ? 'wh-input-bad' : ''}" data-f="quantity"
                  type="number" min="0" step="any" inputmode="decimal"
@@ -6952,6 +7060,23 @@ async function renderWhInvoiceNew() {
         ${priceBad ? `<div class="wh-pos-warn">Для расхода укажите цену</div>` : ''}
       </div>`;
     }).join('');
+
+    itemsEl.querySelectorAll('[data-pick-product]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const i = Number(btn.dataset.pickProduct);
+        openListPicker({
+          title: 'Товар',
+          hint: 'Показан остаток на складе',
+          items: products.map(pp => ({
+            id: pp.product_id, name: pp.name,
+            sub: `${whQty(pp.quantity)} ${pp.unit || ''}`.trim(),
+          })),
+          selectedId: whDraft.items[i].product_id,
+          emptyText: 'Товары не найдены',
+          onPick: (item) => { whDraft.items[i].product_id = Number(item.id); drawItems(); },
+        });
+      });
+    });
 
     itemsEl.querySelectorAll('.wh-pos').forEach(el => {
       const i = Number(el.dataset.i);
@@ -6988,10 +7113,23 @@ async function renderWhInvoiceNew() {
       renderWhInvoiceNew();
     });
   });
-  document.getElementById('wh-cp').addEventListener('change', e => {
-    whDraft.counterparty_id = e.target.value;
-    e.target.classList.toggle('form-input--placeholder', !e.target.value);
-    syncSave();
+  document.getElementById('wh-cp').addEventListener('click', () => {
+    openListPicker({
+      title: 'Контрагент',
+      hint: isOut ? 'Для расхода обязателен — на него выписывается накладная' : 'Необязательно',
+      items: whCounterparties.map(c => ({
+        id: c.id, name: c.name,
+        sub: c.telegram_id ? '' : 'без Telegram — PDF не отправить',
+      })),
+      selectedId: whDraft.counterparty_id,
+      emptyText: 'Контрагенты не найдены',
+      onPick: (item) => {
+        whDraft.counterparty_id = item.id;
+        const btn = document.getElementById('wh-cp');
+        if (btn) { btn.textContent = item.name; btn.classList.remove('btn-agent--empty'); }
+        syncSave();
+      },
+    });
   });
   document.getElementById('wh-comment').addEventListener('input', e => {
     whDraft.comment = e.target.value;
