@@ -405,6 +405,17 @@ function setSectionTab(section, tab) {
 }
 
 function role() { return (currentUser && currentUser.role) || 'guest'; }
+// Версия сборки мелкой строкой внизу главной — только руководству.
+//
+// «Выкатилось ли моё исправление» проверяют с телефона на площадке, а не
+// curl'ом из терминала: без этой строки единственным ответом было «вроде
+// по-прежнему не работает», неотличимое от «деплой не прошёл». Кладовщику
+// номер сборки не нужен, поэтому строка под ролью, а не под всеми.
+function versionFooterHtml() {
+  const v = currentUser && currentUser.version;
+  if (!v || !isBossRole()) return '';
+  return `<div class="build-version">сборка ${escapeHtml(String(v))}</div>`;
+}
 function isBossRole() { return ['admin', 'boss'].includes(role()); }
 // Техника, контейнеры и каталог — та же тройка ролей, что у их ручек.
 function canSeeMachines() { return ['admin', 'boss', 'manager'].includes(role()); }
@@ -680,7 +691,8 @@ async function renderHome() {
   const managerHome = () => myOrdersHtml();
 
   content.innerHTML =
-    hero + workQueueHtml(queue) + linkWarning + (isBoss ? bossHome() : managerHome());
+    hero + workQueueHtml(queue) + linkWarning + (isBoss ? bossHome() : managerHome())
+    + versionFooterHtml();
 
   wireWorkQueue(content);
 

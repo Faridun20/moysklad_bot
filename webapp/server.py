@@ -9,7 +9,6 @@ import binascii
 import logging
 import math
 import os
-import subprocess
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -27,6 +26,7 @@ from webapp.auth import verify_init_data
 from services.roles import cached_role as get_role
 from services.rate_limit import acquire as rate_limit_acquire
 from services import money
+from services import version as app_version
 
 
 # Фоновые задачи — общий хелпер бота и WebApp: utils/background.py
@@ -177,32 +177,11 @@ logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 
 
-def _compute_app_version() -> str:
-    """
-    Версия для cache-busting статики WebApp.
-    Берём в порядке надёжности:
-      1) Railway-переменная с SHA коммита (RAILWAY_GIT_COMMIT_SHA)
-      2) короткий git SHA, если доступен .git
-      3) unix-таймстамп старта процесса — гарантирует уникальность
-         для каждого нового запуска даже без git.
-    """
-    sha = os.environ.get("RAILWAY_GIT_COMMIT_SHA") or os.environ.get("GIT_COMMIT_SHA")
-    if sha:
-        return sha[:8]
-    try:
-        out = subprocess.check_output(
-            ["git", "rev-parse", "--short=8", "HEAD"],
-            cwd=Path(__file__).parent.parent,
-            stderr=subprocess.DEVNULL,
-            timeout=2,
-        )
-        return out.decode().strip() or str(int(time.time()))
-    except Exception:
-        return str(int(time.time()))
-
-
-APP_VERSION = _compute_app_version()
-logger.info("WebApp version: %s", APP_VERSION)
+# Версия считается в `services/version.py` — одним и тем же кодом для бота и
+# WebApp. Два сервиса Railway деплоятся отдельно и разъезжаются штатно, а
+# сравнить их SHA можно только если оба считают его одинаково.
+APP_VERSION = app_version.APP_VERSION
+logger.info("WebApp %s", app_version.startup_line())
 
 # Однократное предупреждение, если активен локальный обход авторизации.
 if _dev_bypass_user() is not None:
@@ -406,7 +385,16 @@ async def healthz():
     чтобы внешний мониторинг видел: HTTP-слой жив, паника не общая."""
     import time as _t
 
-    return JSONResponse({"ok": True, "version": APP_VERSION, "ts": int(_t.time())})
+    # Версия и uptime — чтобы «выкатилось ли» и «перезапускался ли» проверялись
+    # одним curl'ом, без входа в панель Railway. Ручка открытая: SHA коммита и
+    # заголовок сами по себе ничего не открывают, а закрытый healthcheck не
+    # годится внешнему мониторингу.
+    return JSONResponse({
+        "ok": True,
+        "version": APP_VERSION,
+        "ts": int(_t.time()),
+        **app_version.info().as_dict(),
+    })
 
 
 @app.post("/api/metrics")
@@ -505,6 +493,11 @@ async def get_me(request: Request):
             # Касса/сдачи хранятся в базовой валюте (нет currency-колонки) —
             # фронт показывает её код, а не хардкод «USD».
             "base_currency": (BASE_CURRENCY or "USD").upper(),
+            # Версия едет вместе с ролью: «выкатилось ли» проверяют с телефона,
+            # а не из терминала, и отдельный запрос ради восьми знаков — это
+            # запрос, который забудут сделать. Показывает её только руководство
+            # (см. фронт): кладовщику номер сборки не нужен.
+            "version": APP_VERSION,
         }
     )
 

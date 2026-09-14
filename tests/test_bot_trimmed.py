@@ -165,6 +165,9 @@ def test_surviving_commands_are_registered():
         "start", "pay", "find", "ship", "cancel", "shipments", "sync_payments",
         "frozen", "users", "addrole", "deactivate", "reactivate", "audit", "log",
         "refresh", "snapshot", "syncms", "msstaff",
+        # Версия на проде: аналога в WebApp нет — там видна только версия
+        # самого WebApp, а вопрос ровно в том, совпадает ли она с ботом.
+        "version", "printer",
     ):
         assert cmd in registered, cmd
 

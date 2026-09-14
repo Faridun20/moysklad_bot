@@ -1392,6 +1392,16 @@ body {
 /* Список выбора внутри диалога-пикера: та же высота, что у поставщика. */
 .picker-list { max-height: 46vh; overflow-y: auto; margin-bottom: 12px; }
 .picker-list .picked { background: var(--success-bg); }
+
+/* Номер сборки внизу главной: служебная подпись, а не элемент экрана —
+   поэтому мельче hint'а и по центру, чтобы не читалась как строка списка. */
+.build-version {
+  margin: var(--sp-4) 0 0;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-mute);
+  opacity: 0.7;
+}
 /* «Завести» под списком: тот, кого ищут и не находят, заводится здесь же. */
 .picker-add {
   width: 100%;
