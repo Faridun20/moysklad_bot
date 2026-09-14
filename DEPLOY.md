@@ -190,6 +190,29 @@ Start Command. Расписания в UTC.
 
 ---
 
+## Свой сервер: автодеплой через Forgejo
+
+На self-hosted выкат — это `git push` в `main` локального Forgejo
+(`faridun/moysklad_bot`). Дальше без рук:
+
+1. Хук `hooks/post-receive.d/zz-deploy` в репозитории Forgejo раскладывает
+   коммит в `/srv/docker/moysklad_bot` (`checkout -f`, `.env` и прочие
+   неотслеживаемые файлы не трогаются).
+2. Собирает образ с `GIT_COMMIT_SHA`/`GIT_COMMIT_MESSAGE`/`GIT_BRANCH` — от них
+   зависят `/version` в боте и `/healthz`.
+3. `docker compose up -d`: `migrate` → `bot` + `webapp`. Сборка упала — старые
+   контейнеры продолжают работать.
+4. Forgejo зеркалит репозиторий на GitHub.
+
+Журнал — `/srv/docker/moysklad_bot_deploy.log`. Проверка:
+`curl -s localhost:8080/healthz` — поле `version` должно совпасть с коммитом.
+
+Хук работает в контейнере `forgejo` от пользователя `git`, поэтому образ
+Forgejo свой (`/srv/docker/forgejo/docker-compose.yml`, `dockerfile_inline`):
+docker CLI и `git` в группе docker хоста. Хук лежит именно в
+`post-receive.d/`: сам `hooks/post-receive` — обёртка Forgejo, без неё не
+обновляется репозиторий в Forgejo и не срабатывает зеркало.
+
 ## Грабли, на которые легко наступить
 
 ### Polling и webhook несовместимы в двухсервисной топологии
