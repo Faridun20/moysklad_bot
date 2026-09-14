@@ -450,6 +450,20 @@ describe('техника: формы', () => {
     expect(window.document.querySelector('.c-overlay')).toBeNull();
     expect(window.__writes).toHaveLength(0);
   });
+
+  it('тап мимо полей форму не закрывает — набранное не теряется', async () => {
+    // Форма теперь страница целиком: «клик по фону закрывает» превратился бы
+    // в потерю всего набранного от промаха пальцем между полями.
+    const window = boot7('boss', []);
+    await window.__ready;
+    window.document.querySelector('[data-mact="hours"]').click();
+    const ov = window.document.querySelector('.c-overlay');
+    ov.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+    expect(window.document.querySelector('.c-overlay')).not.toBeNull();
+    expect(window.document.body.classList.contains('page-sheet-open')).toBe(true);
+    window.document.querySelector('#ms-cancel').click();
+    expect(window.document.body.classList.contains('page-sheet-open')).toBe(false);
+  });
 });
 
 describe('карточка клиента: состав отгрузки', () => {
@@ -833,17 +847,27 @@ describe('курсы валют: «Сохранить» действительн
     expect(content.querySelector('.rate-save').dataset.code).toBe('UZS');
   });
 
+  it('мелкий курс показан и вводится перевёрнутым: «сум за 1 USD»', async () => {
+    // 0.00008 USD за сум человек не читает и не введёт без ошибки в нулях.
+    const window = boot(driver);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toMatch(/1 USD = 12\s?500,00 сум/);
+    expect(content.querySelector('.rate-input').value).toBe('12500');
+  });
+
   it('клик по «Сохранить» отправляет новое значение из поля рядом', async () => {
     const window = boot(driver);
     await window.__ready;
     const content = window.document.getElementById('content');
-    content.querySelector('.rate-input').value = '0.00009';
+    // В поле — сумы за 1 USD; в базу уходит rate_to_base = 1 / значение.
+    content.querySelector('.rate-input').value = '10000';
     content.querySelector('.rate-save').click();
     await new Promise(r => setTimeout(r, 0));
 
     const set = window.__calls.filter(([p]) => p === '/api/currency/rates/set');
     expect(set).toHaveLength(1);
-    expect(set[0][1]).toEqual({ currency_code: 'UZS', rate_to_base: 0.00009 });
+    expect(set[0][1]).toEqual({ currency_code: 'UZS', rate_to_base: 0.0001 });
   });
 
   it('нечисловой курс отсекается до запроса', async () => {

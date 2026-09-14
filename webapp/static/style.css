@@ -559,6 +559,14 @@ body {
    лежат внутри flex-списков с `gap` и получили бы двойной зазор. */
 .c-surface { margin-bottom: var(--sp-2); }
 
+/* Те же карточки, положенные прямо в экран, а не во flex-список с gap
+   (накладные, часть списков долгов): зазора не было вовсе, соседние карточки
+   стыковались тенями и скруглениями и читались как наехавшие друг на друга.
+   Правило только для прямых детей .content — во flex-списках зазор даёт gap,
+   и двойного отступа там не появится. */
+.content > .order-card,
+.content > .debt-card { margin-bottom: var(--sp-3); }
+
 /* Контейнер списка строк: собственных отступов нет, скругление режет углы
    первой и последней строки. */
 .c-surface--list {
@@ -2000,74 +2008,96 @@ body {
   opacity: 0.5;
   margin-left: 8px;
 }
-/* ─── Оверлей (UI-WP-10) ──────────────────────────────────────────────────
-   Затемнение и центрирование были описаны прямо в .price-overlay, поэтому
-   следующий оверлей (их сейчас два — редактор цены и календарь) начинался бы
-   с копирования position/inset/z-index. Выносим в примитив; постоянную
-   навигацию на модалки НЕ переводим — это ограничение плана. */
+/* ─── Формы поверх экрана: страницей, как форма накладной ────────────────
+   Раньше .c-overlay был окном по центру с затемнением (max-width 360px,
+   max-height 82vh). На телефоне клавиатура поднималась и закрывала само окно:
+   поле в фокусе и «Сохранить» уходили под неё, а прокручивать приходилось
+   маленький ящик внутри затемнения. Форма накладной этим не страдала — она
+   обычная страница.
+
+   Теперь оверлей — это страница целиком: фон экрана, прокрутка у самого
+   оверлея, поля и кнопки в тех же размерах, что .form-input и .btn-primary
+   у накладной. Нижний запас (30vh) нужен, чтобы последнее поле можно было
+   докрутить выше клавиатуры там, где WebView не уменьшает высоту под неё
+   (iOS). Фокус и докрутку делает mountPageSheet в app.js. */
 .c-overlay,
 .price-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0,0,0,0.45);
-  display: flex;
-  align-items: center;
-  justify-content: center;
   z-index: 100;
-  padding: var(--sp-5);
+  display: block;
+  background: var(--bg-page);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  padding: calc(8px + env(safe-area-inset-top)) 16px calc(30vh + env(safe-area-inset-bottom));
+  animation: fadeUp 0.18s ease both;
 }
+/* Экран под формой не прокручивается вместе с ней. */
+body.page-sheet-open { overflow: hidden; }
 
 .c-sheet,
 .price-modal {
-  background: var(--bg-card);
-  border-radius: var(--radius);
-  padding: var(--sp-5);
   width: 100%;
-  max-width: 360px;
-  box-shadow: var(--shadow-modal);
-  /* Форма техники — до десяти полей: без прокрутки нижние кнопки уезжают за
-     край экрана вместе с «Сохранить». */
-  max-height: 82vh;
-  overflow-y: auto;
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 0;
+  background: transparent;
+  /* Скругление без фона не видно, но токен общий у панелей (design-system.test). */
+  border-radius: var(--radius);
+  box-shadow: none;
 }
 .c-sheet-title,
 .price-modal-title {
-  font-size: 16px;
-  font-weight: 600;
-  margin-bottom: 16px;
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.25;
+  margin: var(--sp-3) var(--sp-1) var(--sp-5);
 }
+.c-sheet > .c-field-hint { margin: -12px 4px 16px; }
 /* Поле формы и ряд кнопок — примитивы: сейчас ими пользуются редактор цены и
    формы техники, дальше — всё остальное. Имена `.price-*` остаются алиасами
-   на переходный период (см. конвенции дизайн-системы в CLAUDE.md). */
+   на переходный период (см. конвенции дизайн-системы в CLAUDE.md).
+   Размеры и цвета — один в один с .form-label/.form-input накладной. */
 .c-field,
 .price-field {
   display: block;
-  margin-bottom: 16px;
+  margin-bottom: 12px;
 }
-.c-field span,
-.price-field span {
+.c-field > span:first-child,
+.price-field > span:first-child {
   display: block;
-  font-size: 13px;
+  font-size: 12px;
+  font-weight: 500;
   color: var(--text-mute);
-  margin-bottom: 4px;
+  margin: 0 0 8px 4px;
 }
 .c-field input,
 .c-field textarea,
 .c-field select,
 .price-field input {
   width: 100%;
-  padding: 12px 12px;
+  padding: 16px;
   font-size: 16px;
   border: 1px solid var(--divider);
   border-radius: var(--radius-sm);
-  background: var(--bg-page);
+  background: var(--bg-card);
+  box-shadow: var(--shadow-card);
   color: var(--text);
   outline: none;
   font-family: inherit;
+  -webkit-appearance: none;
 }
+.c-field input::placeholder,
+.c-field textarea::placeholder { color: var(--text-mute); opacity: 0.7; }
+.c-field textarea { min-height: 88px; resize: vertical; }
+.c-sheet > .c-actions--stack { margin-top: var(--sp-5); }
 .c-field input:focus,
 .c-field textarea:focus,
-.price-field input:focus { border-color: var(--accent); }
+.price-field input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+}
 .c-field-hint {
   display: block;
   margin-top: 4px;
@@ -2321,3 +2351,9 @@ body {
     width: 600px;
   }
 }
+
+/* Редактор курса: поле с подписью и кнопка в одну строку, кнопка по низу поля. */
+.rate-edit { display: flex; align-items: flex-end; gap: var(--sp-2); }
+.rate-edit .rate-field { flex: 1; min-width: 0; margin-bottom: 0; }
+.rate-edit .rate-save { flex: 0 0 auto; min-height: 52px; }
+.rates-note { margin: var(--sp-2) 4px 0; }

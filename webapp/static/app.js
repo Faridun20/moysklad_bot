@@ -365,7 +365,11 @@ let _screenGen = 0;
 let _scrollHintTimer = null;
 function refreshScrollHints() {
   document.querySelectorAll('.scroll-hint').forEach(box => {
-    const sc = box.querySelector('.seg, .cat-row') || box.firstElementChild;
+    // Обёртка бывает самим рядом (`.cat-row.scroll-hint` у подкатегорий):
+    // querySelector ищет только потомков, и раньше «рядом» считалась первая
+    // кнопка — подсказка на втором ряду не работала вовсе.
+    const sc = box.matches('.seg, .cat-row') ? box
+      : (box.querySelector('.seg, .cat-row') || box.firstElementChild);
     if (!sc) return;
     const more = [];
     if (sc.scrollLeft > 2) more.push('start');
@@ -378,9 +382,42 @@ function refreshScrollHints() {
   });
 }
 
+// Горизонтальные ряды (вкладки раздела, категории, фильтры) не прыгают в
+// начало после перерисовки.
+//
+// Выбор чипа почти везде перерисовывает экран целиком (innerHTML), и ряд
+// рождается заново со scrollLeft = 0. Жалоба с площадки: выбрал последнюю
+// категорию — ряд уехал к «Все», выбранную не видно, листай снова. Поэтому
+// новый ряд получает прокрутку своего предшественника (узнаём его по id или
+// составу подписей), а если выбранный пункт всё равно за краем — доезжает
+// до него. Делается в колбэке MutationObserver: он срабатывает до отрисовки,
+// так что прыжка «в начало и обратно» глазом не видно.
+const _rowScrollMemo = new Map();
+function _rowKey(sc) {
+  return sc.id || (sc.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+}
+function keepRowScroll(root) {
+  (root || document).querySelectorAll('.seg--scroll, .cat-row').forEach(sc => {
+    if (sc.dataset.rowWired) return;
+    sc.dataset.rowWired = '1';
+    const key = _rowKey(sc);
+    if (_rowScrollMemo.has(key)) sc.scrollLeft = _rowScrollMemo.get(key);
+    const active = sc.querySelector('.active, [aria-pressed="true"]');
+    if (active && sc.scrollWidth > sc.clientWidth) {
+      const a = active.getBoundingClientRect();
+      const b = sc.getBoundingClientRect();
+      if (a.left < b.left || a.right > b.right) {
+        sc.scrollLeft += (a.left + a.width / 2) - (b.left + b.width / 2);
+      }
+    }
+    sc.addEventListener('scroll', () => _rowScrollMemo.set(key, sc.scrollLeft), { passive: true });
+  });
+}
+
 function watchScrollHints() {
   if (typeof MutationObserver === 'undefined') return;
   const obs = new MutationObserver(() => {
+    keepRowScroll();
     clearTimeout(_scrollHintTimer);
     _scrollHintTimer = setTimeout(refreshScrollHints, 60);
   });
@@ -691,10 +728,12 @@ async function renderHome() {
   const managerHome = () => myOrdersHtml();
 
   content.innerHTML =
-    hero + workQueueHtml(queue) + linkWarning + (isBoss ? bossHome() : managerHome())
+    hero + '<div id="home-fx"></div>' + workQueueHtml(queue) + linkWarning
+    + (isBoss ? bossHome() : managerHome())
     + versionFooterHtml();
 
   wireWorkQueue(content);
+  fillHomeFx(document.getElementById('home-fx'));
 
   // Клик по строке недавнего заказа → Заказы
   document.querySelectorAll('[data-order-id]').forEach(row => {
@@ -892,7 +931,7 @@ function openPriceEditor(product) {
   ov.className = 'c-overlay price-overlay';
   ov.innerHTML = `
     <div class="c-sheet price-modal" role="dialog" aria-modal="true" aria-labelledby="pe-title">
-      <div class="price-modal-title" id="pe-title">${escapeHtml(product.name)}</div>
+      <div class="c-sheet-title price-modal-title" id="pe-title">${escapeHtml(product.name)}</div>
       <label class="price-field">
         <span>Цена продажи (минимум)</span>
         <input type="number" inputmode="decimal" id="pe-sale" value="${product.sale_price ?? ''}" placeholder="—">
@@ -906,12 +945,13 @@ function openPriceEditor(product) {
         <button class="btn-secondary" id="pe-photo-add">${icon('plus')} Фото</button>
         <button class="btn-secondary" id="pe-post">${icon('cart')} Пост в канал</button>
       </div>
-      <div class="price-actions">
-        <button class="btn-secondary" id="pe-cancel">Отмена</button>
+      <div class="c-actions c-actions--stack price-actions">
         <button class="btn-primary" id="pe-save">Сохранить</button>
+        <button class="btn-secondary" id="pe-cancel">Отмена</button>
       </div>
     </div>`;
   document.body.appendChild(ov);
+  const releasePage = mountPageSheet(ov);
 
   // Фото товара — тем же механизмом, что у техники: файл живёт в Telegram, у
   // нас идентификаторы. Из МойСклад картинки не тянем — их там нет.
@@ -938,6 +978,7 @@ function openPriceEditor(product) {
     openChannelComposer('showcase', { product_id: productId }));
   const close = () => {
     ov.remove();
+    releasePage();
     document.removeEventListener('keydown', onKey, true);
     // Восстанавливаем back-кнопку экрана и фокус на инициатора.
     if (prevBack) showBack(prevBack); else hideBack();
@@ -955,7 +996,8 @@ function openPriceEditor(product) {
   }
   document.addEventListener('keydown', onKey, true);
   showBack(close);                         // аппаратная «назад» закрывает модалку
-  ov.addEventListener('click', e => { if (e.target === ov) close(); });
+  // Тап по пустому месту форму НЕ закрывает: теперь это целая страница, и
+  // промах мимо поля стирал бы всё набранное. Выход — «Отмена» или «Назад».
   document.getElementById('pe-cancel').addEventListener('click', close);
   const saleEl = document.getElementById('pe-sale');
   if (saleEl && saleEl.focus) saleEl.focus();   // фокус внутрь при открытии
@@ -2469,6 +2511,36 @@ async function renderMachineCard(machineId) {
   });
 }
 
+// Форма поверх экрана — страницей, а не всплывающим окном.
+//
+// Раньше формы были окошком по центру с затемнением: на телефоне клавиатура
+// поднималась и закрывала само окно, нижние поля и «Сохранить» уезжали под неё.
+// Форма накладной этим не страдает — она обычная страница, которую можно
+// листать. Теперь так же выглядят и ведут себя все формы: оверлей занимает
+// экран целиком и прокручивается сам, а поле в фокусе доезжает до середины
+// видимой области, когда клавиатура уже открылась.
+//
+// Разметку (.c-overlay > .c-sheet > label.c-field) не меняем: формы-наследники
+// (поиск товара, выбор контрагента, причины) дописывают в неё свои блоки.
+function mountPageSheet(ov) {
+  document.body.classList.add('page-sheet-open');
+  const onFocus = (e) => {
+    const el = e.target;
+    if (!el || !el.matches || !el.matches('input, textarea')) return;
+    // Клавиатура открывается анимацией ~250мс: раньше скроллить бессмысленно —
+    // видимая область ещё не уменьшилась.
+    setTimeout(() => {
+      if (!el.isConnected || !el.scrollIntoView) return;
+      try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (_e) { el.scrollIntoView(); }
+    }, 300);
+  };
+  ov.addEventListener('focusin', onFocus);
+  return () => {
+    ov.removeEventListener('focusin', onFocus);
+    if (!document.querySelector('.c-overlay')) document.body.classList.remove('page-sheet-open');
+  };
+}
+
 // Модалка-форма для техники. Одна на все четыре случая (машина, моточасы,
 // сделка, подтверждение): поведение оболочки — Esc, ловушка Tab, аппаратная
 // «назад», возврат фокуса — писать четыре раза значит забыть его в одном месте.
@@ -2516,15 +2588,17 @@ function openMachineSheet({ title, fields, submitLabel, hint, onSubmit }) {
       ${hint ? `<div class="c-field-hint">${escapeHtml(hint)}</div>` : ''}
       ${(fields || []).map(fieldHtml).join('')}
       <div class="c-error" id="ms-error" hidden></div>
-      <div class="c-actions">
-        <button class="btn-secondary" id="ms-cancel">Отмена</button>
+      <div class="c-actions c-actions--stack">
         <button class="btn-primary" id="ms-submit">${escapeHtml(submitLabel || 'Сохранить')}</button>
+        <button class="btn-secondary" id="ms-cancel">Отмена</button>
       </div>
     </div>`;
   document.body.appendChild(ov);
+  const releasePage = mountPageSheet(ov);
 
   const close = () => {
     ov.remove();
+    releasePage();
     document.removeEventListener('keydown', onKey, true);
     if (prevBack) showBack(prevBack); else hideBack();
     if (trigger && trigger.focus) { try { trigger.focus(); } catch (_e) {} }
@@ -2540,7 +2614,8 @@ function openMachineSheet({ title, fields, submitLabel, hint, onSubmit }) {
   }
   document.addEventListener('keydown', onKey, true);
   showBack(close);
-  ov.addEventListener('click', e => { if (e.target === ov) close(); });
+  // Тап по пустому месту форму НЕ закрывает: теперь это целая страница, и
+  // промах мимо поля стирал бы всё набранное. Выход — «Отмена» или «Назад».
   ov.querySelector('#ms-cancel').addEventListener('click', close);
   const firstInput = ov.querySelector('input, textarea');
   if (firstInput && firstInput.focus) firstInput.focus();
@@ -6059,17 +6134,77 @@ async function renderCreditLimits(container) {
   });
 }
 
-// Экран курсов валют (T3.1). Открывается из «Финансы → Клиенты».
+// Экран курсов валют (T3.1). Открывается с главной (строка «Курс ЦБ») и из
+// «Клиенты → Лимиты».
 //
 // Семантика rate_to_base: 1 единица валюты = rate_to_base единиц базовой.
-// Например при базовой USD: 1 UZS ≈ 0.0000794 USD. Курс задают вручную —
-// автоподтяжки нет, поэтому показываем, когда его обновляли в последний раз:
-// протухший курс молча искажает все сводки в базовой валюте.
-async function renderCurrencyRates() {
+// При базовой USD это 1 UZS ≈ 0.000085 USD — число, которое человек не читает
+// и не может ввести без ошибки в нулях. Поэтому мелкие курсы показываются и
+// вводятся перевёрнутыми: «1 USD = 11 765,76 сум», а в базу по-прежнему уходит
+// rate_to_base. Курс UZS обновляет задача ЦБ РУз раз в сутки (tasks/run_fx_sync);
+// дата обновления на виду — протухший курс молча искажает сводки.
+const FX_UNIT = { UZS: 'сум' };
+function fxView(code, rateToBase, base) {
+  const rate = Number(rateToBase);
+  const unit = FX_UNIT[code] || code;
+  if (!(rate > 0)) return { inverted: false, value: 0, text: '—', label: `${code} к ${base}` };
+  // Меньше единицы — переворачиваем: сколько этой валюты за 1 базовую.
+  if (rate < 1) {
+    const per = 1 / rate;
+    return {
+      inverted: true, value: per,
+      text: `1 ${base} = ${fxNum(per)} ${unit}`,
+      label: `Сколько ${unit} за 1 ${base}`,
+    };
+  }
+  return { inverted: false, value: rate, text: `1 ${code} = ${fxNum(rate)} ${base}`, label: `Сколько ${base} за 1 ${code}` };
+}
+function fxNum(n) {
+  return Number(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function fxUpdated(raw) {
+  if (!raw) return '—';
+  const str = String(raw);
+  return `${formatDateRU(str)}${str.length >= 16 ? ' ' + str.slice(11, 16) : ''}`;
+}
+
+// Строка «Курс ЦБ» на главной. Грузится отдельно и не держит экран: курс —
+// справка, а не причина ждать сводку.
+async function fillHomeFx(box) {
+  if (!box) return;
+  let data;
+  try { data = await api('/api/currency/rates', {}); } catch (_e) { box.remove(); return; }
+  if (!box.isConnected) return;
+  const base = String(data.base || baseCur()).toUpperCase();
+  const rows = (data.rates || []).filter(r => String(r.currency_code || '').toUpperCase() !== base);
+  if (!rows.length) { box.remove(); return; }
+  box.innerHTML = `
+    <div class="c-surface c-surface--list">
+      ${rows.map(r => {
+        const code = String(r.currency_code).toUpperCase();
+        const v = fxView(code, r.rate_to_base, base);
+        return `
+        <div class="c-row c-row--tap" data-open-rates role="button" tabindex="0">
+          <div class="card-row-icon">${icon('cash')}</div>
+          <div class="card-row-info">
+            <div class="card-row-title">Курс ${escapeHtml(v.inverted ? base : code)}</div>
+            <div class="card-row-sub">обновлён ${escapeHtml(fxUpdated(r.updated_at))}</div>
+          </div>
+          <div class="card-row-value">${escapeHtml(v.text)}</div>
+        </div>`;
+      }).join('')}
+    </div>`;
+  box.querySelectorAll('[data-open-rates]').forEach(row => row.addEventListener('click', () => {
+    haptic('light');
+    renderCurrencyRates(() => showScreen('today'));
+  }));
+}
+
+async function renderCurrencyRates(onBack) {
   const content = document.getElementById('content');
   content.innerHTML = loading('Загрузка курсов…');
-  setScreenContext('Финансы · Курсы валют');
-  showBack(() => { clientsTab = 'limits'; showScreen('clients'); });
+  setScreenContext('Курсы валют');
+  showBack(onBack || (() => { clientsTab = 'limits'; showScreen('clients'); }));
 
   let data;
   try {
@@ -6085,21 +6220,24 @@ async function renderCurrencyRates() {
   const rows = rates.map(r => {
     const code = String(r.currency_code || '').toUpperCase();
     const isBase = code === base;
-    const upd = r.updated_at ? String(r.updated_at).slice(0, 16) : '—';
+    const v = fxView(code, r.rate_to_base, base);
     // Строка курса + (для админа/босса) редактор под ней в той же поверхности.
     return `
       <div class="c-row" data-rate="${escapeHtml(code)}">
         <div class="card-row-info">
           <div class="card-row-title">${escapeHtml(code)}</div>
-          <div class="card-row-sub">1 ${escapeHtml(code)} = ${escapeHtml(String(r.rate_to_base))} ${escapeHtml(base)} · обновлён ${escapeHtml(upd)}</div>
+          <div class="card-row-sub">${isBase ? 'базовая валюта' : `обновлён ${escapeHtml(fxUpdated(r.updated_at))}`}</div>
         </div>
-        <div class="card-row-value">${isBase ? 'базовая' : escapeHtml(String(r.rate_to_base))}</div>
+        <div class="card-row-value">${isBase ? 'базовая' : escapeHtml(v.text)}</div>
       </div>
       ${canEdit && !isBase ? `
-        <div class="c-row">
-          <input type="number" step="any" class="form-input rate-input"
-                 value="${escapeHtml(String(r.rate_to_base))}" inputmode="decimal"
-                 aria-label="Курс ${escapeHtml(code)}">
+        <div class="c-row rate-edit">
+          <label class="c-field rate-field">
+            <span>${escapeHtml(v.label)}</span>
+            <input type="number" step="any" class="rate-input" data-inverted="${v.inverted ? '1' : '0'}"
+                   value="${escapeHtml(String(Math.round(v.value * 100) / 100))}" inputmode="decimal"
+                   aria-label="Курс ${escapeHtml(code)}">
+          </label>
           <button class="btn-confirm-pay rate-save" data-code="${escapeHtml(code)}">Сохранить</button>
         </div>` : ''}`;
   }).join('');
@@ -6109,7 +6247,8 @@ async function renderCurrencyRates() {
     ${rows
       ? `<div class="c-surface c-surface--list">${rows}</div>`
       : emptyState({ icon: 'card', title: 'Курсы не заданы', hint: 'Добавьте курс — сводки в разных валютах считаются через него.' })}
-    ${canEdit ? '' : '<div class="debt-meta">Изменять курсы может админ или руководитель.</div>'}
+    <div class="c-field-hint rates-note">Курс сума обновляется автоматически раз в сутки по данным ЦБ РУз.
+      ${canEdit ? 'Поправить вручную можно здесь — до следующего обновления.' : 'Изменять курсы может админ или руководитель.'}</div>
   `;
 
   content.querySelectorAll('.rate-save').forEach(btn => {
@@ -6119,12 +6258,15 @@ async function renderCurrencyRates() {
       // `.debt-card`, но после пересборки на дизайн-систему такого класса в
       // разметке курсов нет — closest отдавал null и «Сохранить» падала.
       const row = b.closest('.c-row');
-      const raw = row.querySelector('.rate-input').value;
-      const rate = parseFloat(raw);
-      if (!isFinite(rate) || rate <= 0) {
+      const input = row.querySelector('.rate-input');
+      const entered = parseFloat(String(input.value).replace(',', '.'));
+      if (!isFinite(entered) || entered <= 0) {
         tg.showAlert('❌ Курс должен быть положительным числом');
         return;
       }
+      // Поле показывает перевёрнутый курс («сум за 1 USD») — в базу уходит
+      // rate_to_base, как и раньше.
+      const rate = input.dataset.inverted === '1' ? 1 / entered : entered;
       if (b.disabled) return;
       b.disabled = true;
       haptic('light');
@@ -6134,7 +6276,7 @@ async function renderCurrencyRates() {
           rate_to_base: rate,
         });
         tg.showAlert(`✅ Курс ${b.dataset.code} обновлён`);
-        await renderCurrencyRates();
+        await renderCurrencyRates(onBack);
       } catch (e) {
         b.disabled = false;
         tg.showAlert('❌ ' + e.message);
