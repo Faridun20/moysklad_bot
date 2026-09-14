@@ -22,8 +22,6 @@ import re
 from datetime import date, timedelta
 from pathlib import Path
 
-import pytest
-
 from tests.e2e.conftest import go, seed_order, settled, tab
 
 # ─── Хелперы ─────────────────────────────────────────────────────────────────
