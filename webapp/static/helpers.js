@@ -49,81 +49,6 @@
     return String(v).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
   }
 
-  // Рендер операционной сводки (данные /api/ops-summary, см. services/ops_summary).
-  // Чистая функция (тестируется в Vitest): принимает dict секций, возвращает HTML.
-  // Показываем только непустые секции; если всё пусто — «всё спокойно».
-  function renderOpsSummaryHtml(summary) {
-    summary = summary || {};
-    const blocks = [];
-    // UI-WP-29: секции сводки — общие примитивы поверхности и строки.
-    // `tone` — критичность алерта в языке общей статус-системы: просроченные
-    // деньги и рассинхрон с МС не должны выглядеть так же, как «низкий
-    // остаток», а раньше все счётчики были одинаково жёлтыми.
-    const section = (title, count, rowsHtml, tone) => {
-      blocks.push(
-        `<div class="section-label">${escapeHtml(title)} ` +
-        `<span class="stock-badge" data-status="${tone || 'low'}">${count}</span></div>` +
-        `<div class="c-surface c-surface--list">${rowsHtml}</div>`
-      );
-    };
-    const row = (title, sub, ic) =>
-      `<div class="c-row">` +
-      `<div class="card-row-info"><div class="card-row-title">${ic ? icon(ic) + ' ' : ''}${escapeHtml(title)}</div>` +
-      (sub ? `<div class="card-row-sub">${escapeHtml(sub)}</div>` : '') +
-      `</div></div>`;
-
-    const so = summary.stale_orders || {};
-    if (so.count > 0) {
-      section(`Зависшие заявки (>${so.threshold_hours}ч)`, so.count,
-        (so.items || []).map(o => row(`#${o.id} · ${o.agent_name}`, o.full_name)).join(''));
-    }
-    const ov = summary.overdue_undeposited || {};
-    if (ov.count > 0) {
-      section(`Отгружено, деньги не сданы (>${ov.threshold_days}д)`, ov.count,
-        (ov.items || []).map(o => row(`#${o.id} · ${o.agent_name}`, o.full_name)).join(''), 'out');
-    }
-    const dep = summary.deposits || {};
-    if (dep.count > 0) {
-      section(`Сдачи на подтверждении · ${opsAmount(dep.total)} USD`, dep.count,
-        (dep.items || []).map(d => row(`Сдача #${d.id}`, `${opsAmount(d.amount)} USD`)).join(''));
-    }
-    const ret = summary.returns || {};
-    if (ret.count > 0) {
-      section('Возвраты на подтверждении', ret.count,
-        (ret.items || []).map(r =>
-          row(`Возврат #${r.id} · заказ #${r.order_id != null ? r.order_id : '?'}`,
-            `${opsAmount(r.total_amount)} USD`)).join(''));
-    }
-    const low = summary.low_stock || {};
-    if (low.count > 0) {
-      section(`Низкий остаток (≤${opsAmount(low.threshold)})`, low.count,
-        (low.items || []).map(r => row(`${r.name}`, `${opsAmount(r.available)} ${r.unit}`)).join(''));
-    }
-    const cr = summary.stale_crons || {};
-    if (cr.count > 0) {
-      section('Cron: не отчитались', cr.count,
-        (cr.items || []).map(c => row(c.task_name,
-          c.never_ran ? `ни разу не запускался (порог ${c.threshold_hours}ч)`
-                      : `${c.hours_ago}ч назад · ${c.last_status} (порог ${c.threshold_hours}ч)`)).join(''), 'out');
-    }
-    const ms = summary.ms_anomalies || {};
-    const msTotal = (ms.drift || 0) + (ms.deleted || 0) + (ms.demand_failed || 0) + (ms.transition_blocked || 0);
-    if (msTotal > 0) {
-      const items = ms.items || {};
-      const rows = []
-        .concat((items.demand_failed || []).map(o => row(`Отгрузка не создана · #${o.id}`, o.agent_name, 'box')))
-        .concat((items.transition_blocked || []).map(o => row(`Статус застрял · #${o.id}`, `${o.agent_name} · ${o.status}`, 'ban')))
-        .concat((items.drift || []).map(o => row(`Изменён в МС · #${o.id}`, o.agent_name, 'edit')))
-        .concat((items.deleted || []).map(o => row(`Удалён в МС · #${o.id}`, `${o.agent_name} · ${o.status}`, 'trash')));
-      section('Рассинхрон с МойСклад', msTotal, rows.join(''), 'out');
-    }
-
-    if (!blocks.length) {
-      return `<div class="loader">${icon('check')} Всё спокойно — нет требующих внимания позиций.</div>`;
-    }
-    return blocks.join('');
-  }
-
   // Парсинг строк мульти-валютной формы платежа в payload для /api/payments/send.
   // Чистая функция (тестируется): принимает [{amount, currency}] как ввёл юзер
   // (amount — строка/число), возвращает {items:[{amount:Number, currency}]} или
@@ -197,9 +122,11 @@
       tabs.push({ key: 'containers', label: 'Контейнеры' });
       tabs.push({ key: 'machines', label: 'Техника' });
     }
-    // «Что лежит без движения» — вопрос про склад, а не про отчёт, поэтому
-    // вкладка здесь. Ручка отвечает только руководству, у остальных её нет.
-    if (f.isBoss) tabs.push({ key: 'stale', label: 'Залежалось' });
+    // Накладные — самостоятельный список со своим действием «создать», поэтому
+    // вкладка, а не кнопка между табами и поиском. «Залежалось» стало фильтром
+    // каталога (только руководству — ручка /api/channel/stale отвечает
+    // admin/boss): это срез того же списка товаров, а не другой экран.
+    if (f.canSeeGoods) tabs.push({ key: 'invoices', label: 'Накладные' });
     return tabs;
   }
 
@@ -290,11 +217,12 @@
         `${escapeHtml(list)} — задайте курс валют.</div>`;
     }
     const rows = pays
-      .map((p) => row(`${p.currency} · ${fmtC(p.total_cents)}`, `${p.count} платеж.`))
+      .map((p) => row(`${p.currency} · ${fmtC(p.total_cents)}`,
+        plural(p.count, ['платёж', 'платежа', 'платежей'])))
       .join('');
     const depRow = row(
       `Наличные (сдачи) · ${fmtC(dep.total_cents)} ${baseCurrency}`,
-      `${dep.count || 0} сдач.`
+      plural(dep.count || 0, ['сдача', 'сдачи', 'сдач'])
     );
     return `${head}<div class="stock-list">${rows}${depRow}</div>`;
   }
@@ -376,6 +304,62 @@
     return currency ? `${text} ${currency}` : text;
   }
 
+  // Склонение по числу: plural(1, ['клиент', 'клиента', 'клиентов']) → «1 клиент».
+  // «1 клиентов» на главной и «отгр.» в отчёте — один и тот же класс ошибки,
+  // поэтому форма выбирается в одном месте. Правило русское: 11–14 — всегда
+  // родительный множественного, дальше по последней цифре. Число печатается
+  // с разделением разрядов, как деньги, чтобы «12 345 позиций» читалось.
+  function plural(n, forms) {
+    const num = Math.abs(Math.round(Number(n) || 0));
+    const f = forms || [];
+    const one = f[0] || '', few = f[1] || one, many = f[2] || few;
+    const mod10 = num % 10, mod100 = num % 100;
+    let word = many;
+    if (mod100 < 11 || mod100 > 14) {
+      if (mod10 === 1) word = one;
+      else if (mod10 >= 2 && mod10 <= 4) word = few;
+    }
+    return `${num.toLocaleString('ru-RU')} ${word}`;
+  }
+
+  // ─── Категории каталога: два уровня из строки «Запчасти/Адаптер» ────────
+  // В базе категория — одна строка с «/», и на экране она была плоским
+  // облаком чипов разной ширины. Дерево строится на клиенте, названия НЕ
+  // меняются (владелец переименует их сам после переноса базы). Первый «/»
+  // делит уровень 1 и уровень 2; всё после второго слэша остаётся в имени
+  // второго уровня — глубже двух уровней экран не показывает.
+  function categoryTree(categories) {
+    const roots = [];
+    const byName = new Map();
+    for (const c of categories || []) {
+      const id = c && c.id != null ? String(c.id) : '';
+      const full = String((c && c.name) || id).trim();
+      if (!full) continue;
+      const slash = full.indexOf('/');
+      const top = (slash === -1 ? full : full.slice(0, slash)).trim();
+      const sub = slash === -1 ? '' : full.slice(slash + 1).trim();
+      let root = byName.get(top);
+      if (!root) {
+        root = { key: top, name: top, ids: [], children: [] };
+        byName.set(top, root);
+        roots.push(root);
+      }
+      root.ids.push(id);
+      if (sub) root.children.push({ key: id, name: sub });
+      else root.key = id;   // категория без «/» — сама себе первый уровень
+    }
+    return roots;
+  }
+
+  // Товар попадает в уровень 1, если его категория — одна из вошедших в
+  // корень строк; уровень 2 — точное совпадение.
+  function categoryMatches(folderId, root, subKey) {
+    if (!root) return true;
+    const id = folderId == null ? '' : String(folderId);
+    if (subKey) return id === String(subKey);
+    return root.ids.indexOf(id) !== -1;
+  }
+
 
   // Короткая подпись диапазона (UI-BUG-02). Полные даты «01.07.2026—31.07.2026»
   // — это ~150px, из-за которых ряд с сегментом гарантированно переполнялся и
@@ -396,31 +380,24 @@
       : `${short(from)}.${year.slice(2)}—${short(to)}.${yearTo.slice(2)}`;
   }
 
-  // Единый период-сегмент (WP-29): пресеты .seg-item + доп-кнопка «Период…»
-  // (произвольный диапазон). Раньше разметка дублировалась в analyticsHeaderHtml
-  // (data-period) и renderOrdersMain (data-operiod) и уже разъехалась — в Заказах
-  // кнопка не показывала выбранный диапазон. attr — имя data-атрибута
-  // ('data-period'|'data-operiod'); customLabel — подпись доп-кнопки (даты или
-  // «Период…»). Возвращает .seg-row (seg + aux).
+  // Единый период-сегмент (WP-29): пресеты + «Период…» (произвольный диапазон)
+  // ОДНИМ рядом. Раньше произвольный период был иконкой часов справа от группы,
+  // без подписи — вне группы она читалась как «что-то ещё» и была непонятна.
+  // Теперь это последний пункт того же сегмента: с подписью «Период…», а при
+  // выбранном диапазоне — с самим диапазоном. attr — имя data-атрибута
+  // ('data-period'|'data-operiod'). Возвращает .seg-row (seg--scroll: пять
+  // пунктов на 360dp не влезают, ряд листается).
   function periodSegHtml(presets, activeId, attr, customActive, customLabel) {
     const seg = (presets || []).map((p) =>
       `<button class="seg-item ${activeId === p.id ? 'active' : ''}" ${attr}="${p.id}" ` +
       `aria-pressed="${activeId === p.id}">${escapeHtml(p.label)}</button>`
     ).join('');
-    return (
-      // UI-BUG-01: именно `seg--scroll` — у периода четыре пункта плюс
-      // доп-кнопка справа, и на 360dp они не влезают. Без варианта подписи
-      // резались.
-      `<div class="seg-row"><div class="seg seg--scroll">${seg}</div>` +
-      // UI-BUG-02: пока активен пресет, кнопка — только иконка с aria-label.
-      // Подпись «Период…» занимала ~62px, из-за которых ряд и рушился; текст
-      // нужен лишь когда выбран произвольный диапазон и его надо показать.
-      `<button class="seg-aux ${customActive ? 'active' : ''}" ${attr}="custom" ` +
-      `aria-pressed="${customActive}" aria-label="Выбрать период"` +
-      `${customActive ? '' : ' title="Выбрать период"'}>` +
-      `${icon('clock')}${customActive && customLabel ? ' ' + escapeHtml(customLabel) : ''}` +
-      `</button></div>`
-    );
+    const label = customActive && customLabel ? escapeHtml(customLabel) : 'Период…';
+    const custom =
+      `<button class="seg-item seg-item--custom ${customActive ? 'active' : ''}" ${attr}="custom" ` +
+      `aria-pressed="${customActive ? 'true' : 'false'}" aria-label="Выбрать период">` +
+      `${icon('calendar')} ${label}</button>`;
+    return `<div class="seg-row"><div class="seg seg--scroll">${seg}${custom}</div></div>`;
   }
 
   // ─── Склад ────────────────────────────────────────────────────────────
@@ -533,7 +510,7 @@
             <span class="aging-sum">${escapeHtml(moneyBlockLabel(b))}</span>
           </div>
           <div class="aging-track"><div class="aging-bar" data-status="${state}" style="width:${pct}%"></div></div>
-          <div class="aging-count">${b.count} ${b.count === 1 ? 'документ' : 'документов'}</div>
+          <div class="aging-count">${plural(b.count, ['документ', 'документа', 'документов'])}</div>
         </div>`;
     }).join('')}</div>`;
   }
@@ -559,7 +536,7 @@
             <span class="aging-sum">${escapeHtml(moneyBlockLabel(m))}</span>
           </div>
           <div class="aging-track"><div class="aging-bar" data-status="approved" style="width:${pct}%"></div></div>
-          <div class="aging-count">${m.count} ${m.count === 1 ? 'платёж' : 'платежей'}${share}</div>
+          <div class="aging-count">${plural(m.count, ['платёж', 'платежа', 'платежей'])}${share}</div>
         </div>`;
     }).join('')}</div>`;
   }
@@ -681,12 +658,12 @@
     const window = Number(effect.window_hours) || 24;
     if (!after && !base) return '';
     const baseText = String(base).replace('.', ',');
-    return `за ${window} ч после поста — ${after} обращ. · обычно ${baseText}/день`;
+    return `за ${window} ч после поста — ${plural(after, ['обращение', 'обращения', 'обращений'])} · обычно ${baseText}/день`;
   }
 
   return {
-    escapeHtml, idemKey, formatDateRU, icon, opsAmount,
-    renderOpsSummaryHtml, parsePaymentItems, renderMoneyTotalsHtml,
+    escapeHtml, idemKey, formatDateRU, icon, opsAmount, plural,
+    parsePaymentItems, renderMoneyTotalsHtml, categoryTree, categoryMatches,
     NAV_SECTIONS, navSections, defaultSection, sectionNavHtml,
     salesTabs, stockTabs, moneyTabs, clientsTabs,
     periodSegHtml, rangeLabel, formatMoney,

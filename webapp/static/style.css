@@ -1,10 +1,15 @@
 /*
-  МойСклад WebApp — визуальный стиль в духе Telegram Wallet:
-  светло-серый фон, белые карточки 16px-радиус, hero-typography,
-  action-grid 4x для быстрых действий, плавающие нижние табы.
+  WebApp «Склад» — визуальный стиль в духе Telegram Wallet: ровный фон темы,
+  карточки 12px-радиус, hero-выручка, плавающие нижние табы.
 
-  Все цвета — через CSS-переменные Telegram, чтобы работала и тёмная
-  тема. Где переменной может не быть (Web), есть fallback.
+  Дизайн-система (UI-бриф, сторож — __tests__/design-system.test.js):
+  • отступы (padding/margin/gap) — только шкала 4 / 8 / 12 / 16 / 24 / 32;
+  • скругления — два: --radius-sm (8px: поля, кнопки, чипы) и --radius
+    (12px: карточки, панели); круглые элементы — 50%;
+  • цвета — переменные темы Telegram (--tg-theme-*) с фолбэком; семантика
+    (успех/опасность/предупреждение/инфо) — токены :root с тёмным вариантом;
+  • всё кликабельное — не ниже 44px;
+  • заголовок секции — один класс .section-label (капс, 12px, hint-цвет).
 */
 
 * {
@@ -29,11 +34,8 @@
   --accent:     var(--tg-theme-button-color, #007aff);
   --accent-fg:  var(--tg-theme-button-text-color, #ffffff);
   --divider:    rgba(0, 0, 0, 0.08);
-  --radius-sm:  10px;   /* компактные контролы, инпуты, кнопки-в-ряд */
-  --radius:     16px;   /* карточки */
-  --radius-lg:  20px;
-  --radius-chip: 12px;  /* бейджи/чипы */
-  --radius-pill: 999px; /* пилюли, role-badge */
+  --radius-sm:  8px;    /* поля, кнопки, чипы, бейджи */
+  --radius:     12px;   /* карточки, панели, диалоги */
   --disabled-opacity: 0.5;   /* единое затемнение disabled (было вперемешку 0.4/0.5) */
   /* Шкала теней (одна на всё): карточка / плавающее / модалка. */
   --shadow-card:  0 1px 2px rgba(0,0,0,0.04);
@@ -42,19 +44,16 @@
   --fill-neutral: rgba(127,127,127,0.12);  /* нейтральная заливка, ок на обеих темах */
   --sk-highlight: rgba(0,0,0,0.07);        /* «блик» шиммера скелетона (тёмный на свете) */
 
-  /* ── Шкалы отступов и типографики (UI-WP-03) ────────────────────────────
-     Значения НЕ новые: это те же 4/8/12/16/20/24 и 10..24, что уже стояли
-     инлайн по всему файлу. Токенизация нужна, чтобы новые компоненты (S2+)
-     не изобретали шестой промежуточный размер: раньше в файле встречались
-     и 13px, и 14px, и 15px подряд без причины.
-     Нечётные разовые значения (2px, 6px, 10px, 14px) остаются инлайн —
-     токен заводим только когда значение переиспользуется трижды. */
+  /* ── Шкалы отступов и типографики (UI-WP-03, UI-бриф п.1) ───────────────
+     Отступы — ТОЛЬКО шкала 4 / 8 / 12 / 16 / 24 / 32. Значения вне шкалы
+     (6, 10, 14, 20) в padding/margin/gap запрещены и ловятся тестом:
+     раньше в файле встречались и 13px, и 14px, и 15px подряд без причины. */
   --sp-1: 4px;
   --sp-2: 8px;
   --sp-3: 12px;
   --sp-4: 16px;
-  --sp-5: 20px;
-  --sp-6: 24px;
+  --sp-5: 24px;
+  --sp-6: 32px;
 
   --text-2xs: 10px;   /* мелкие подписи в бейджах */
   --text-xs:  11px;   /* section-label, вторичные подписи */
@@ -95,31 +94,15 @@
   --glass-blur:  saturate(180%) blur(20px);
   --glass-spec:  rgba(255, 255, 255, 0.9);   /* блик по верхней кромке */
 
-  /* Подложка под стекло. В Telegram фон задаёт тема пользователя и он часто
-     плоский — размывать нечего, и «стекло» выродилось бы в мутно-белый
-     прямоугольник. Поэтому страница рисует собственное поле: две мягкие
-     диагональные полосы и точечная сетка накладной. Всё производное от
-     --accent, чтобы поле не спорило с темой. */
-  --field-1:     rgba(0, 122, 255, 0.11);
-  --field-2:     rgba(30, 142, 62, 0.09);
-  --field-dot:   rgba(0, 0, 0, 0.045);
-
   /* Отступ плавающей панели от низа экрана. БОЛЬШЕЕ из двух, а не сумма:
      `12px + env(safe-area-inset-bottom)` складывал собственный зазор с высотой
      жестовой полосы Android, и панель зависала заметно выше края. Жестовая
      полоса уже и есть тот отступ, ради которого зазор задавался. */
-  --nav-gap: max(10px, env(safe-area-inset-bottom));
-}
-
-/* Поле выводим из акцента ТЕМЫ, но только там, где color-mix поддержан.
-   Без @supports невалидное значение делает custom property «guaranteed-invalid»,
-   и `background` со ссылкой на него отваливается ЦЕЛИКОМ — вместе с
-   var(--bg-page). Старый WebView остался бы с прозрачной страницей. */
-@supports (color: color-mix(in srgb, red 50%, blue)) {
-  :root {
-    --field-1: color-mix(in srgb, var(--accent) 14%, transparent);
-    --field-2: color-mix(in srgb, var(--success) 11%, transparent);
-  }
+  --nav-gap: max(8px, env(safe-area-inset-bottom));
+  /* Высота нижней панели: padding 8+8, кнопка 48, рамка 1+1. Контент и
+     плавающие элементы отступают от неё через этот токен, а не через числа,
+     которые разъезжаются при первой правке панели. */
+  --nav-h: 66px;
 }
 
 /* Тёмная тема Telegram (data-theme выставляет applyTelegramTheme в app.js).
@@ -147,11 +130,6 @@
   --glass-bg:    rgba(28, 30, 36, 0.68);
   --glass-edge:  rgba(150, 175, 195, 0.20);
   --glass-spec:  rgba(170, 200, 225, 0.28);
-  /* На тёмном фоне точка контрастнее, чем на светлом при той же альфе —
-     поле начинало читаться шумом поверх текста. */
-  --field-dot:   rgba(255, 255, 255, 0.028);
-  --field-1:     rgba(90, 169, 240, 0.09);
-  --field-2:     rgba(74, 222, 128, 0.06);
 }
 
 /* Тёмная тема ВНЕ Telegram (обычный браузер): applyTelegramTheme ставит
@@ -175,9 +153,6 @@
     --glass-bg:   rgba(28, 30, 36, 0.68);
     --glass-edge: rgba(150, 175, 195, 0.20);
     --glass-spec: rgba(170, 200, 225, 0.28);
-    --field-dot:  rgba(255, 255, 255, 0.028);
-    --field-1:    rgba(90, 169, 240, 0.09);
-    --field-2:    rgba(74, 222, 128, 0.06);
   }
 }
 
@@ -235,6 +210,12 @@
   outline-offset: 2px;
 }
 
+/* Тап-цель: всё кликабельное — не ниже 44px (UI-бриф п.1). Правило общее,
+   чтобы новая кнопка не могла родиться мельче пальца; классы ниже задают
+   свои значения только там, где нужно больше. */
+button,
+[role="button"] { min-height: 44px; }
+
 /* Hover-отклик для указательных устройств (десктоп-браузер). На тач-экранах
    правило не активируется → не остаётся «залипшего» hover после тапа. */
 @media (hover: hover) {
@@ -291,7 +272,7 @@
 .btn-approve, .btn-reject,
 .btn-confirm-pay, .btn-reject-pay,
 .btn-edit-order, .btn-delete-draft, .btn-edit-limit {
-  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
 }
 .btn-approve .ic, .btn-reject .ic,
 .btn-confirm-pay .ic, .btn-reject-pay .ic,
@@ -306,17 +287,14 @@
 .search-group-title .ic { --ic-size: 14px; }
 .section-label .ic { --ic-size: 13px; }
 .debt-agent .ic { --ic-size: 15px; }
-.cat-btn .ic,
-.requests-btn .ic { --ic-size: 16px; }
-/* Кнопка «Заявки на рассмотрении»: иконка + подпись по центру. */
-.requests-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+.cat-btn .ic { --ic-size: 16px; }
 .warn-card .ic { --ic-size: 16px; color: var(--warn); }
 .order-title .ic { --ic-size: 16px; vertical-align: -0.16em; }
 
 /* Крупные иллюстративные иконки состояний (бывшие большие эмодзи). */
 .error-card .error-icon { color: var(--text-mute); }
 .error-card .error-icon .ic { --ic-size: 46px; }
-.empty-state-icon .ic { --ic-size: 44px; }
+.empty-state-icon .ic { --ic-size: 32px; }
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
@@ -328,31 +306,9 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* Собственное поле под стеклом: точечная сетка накладной + две мягкие
-   диагональные полосы. Без него размывать нечего — в Telegram фон задаёт тема
-   пользователя и он часто плоский, панель выглядела бы мутно-белой.
-
-   Рисуем ФИКСИРОВАННЫМ ПСЕВДОЭЛЕМЕНТОМ, а не `background-attachment: fixed` на
-   body. Последний уводит Chromium/WebView на медленный путь композитинга, и
-   `position: sticky` шапка на прокрутке начинает рисоваться со смещением —
-   заголовок уезжает под шапку Telegram. Псевдоэлемент даёт тот же
-   привязанный к экрану фон без этой цены. */
-body::before {
-  content: '';
-  position: fixed;
-  inset: 0;
-  z-index: -1;
-  pointer-events: none;
-  background:
-    radial-gradient(circle at 1px 1px, var(--field-dot) 1px, transparent 0) 0 0 / 14px 14px,
-    linear-gradient(118deg, var(--field-1) 0%, transparent 46%),
-    linear-gradient(296deg, var(--field-2) 0%, transparent 48%);
-}
-
-/* Поле — украшение. Кому важен контраст, тому важнее ровный фон. */
-@media (prefers-contrast: more) {
-  body::before { display: none; }
-}
+/* Фон — ровный цвет темы (UI-бриф п.1). Точечная сетка и диагональные
+   полосы под стеклом убраны: на площадке они читались шумом, а стекло на
+   плоском фоне остаётся тинтом панели — этого достаточно. */
 
 .app {
   display: flex;
@@ -363,9 +319,11 @@ body::before {
      видимой области: WebView не знает про нативную шапку, и низ приложения
      уходит за край. Вне Telegram переменной нет и остаётся 100dvh. */
   min-height: var(--tg-viewport, 100dvh);
-  /* запас под плавающее нижнее меню: его высота (66px) + зазор до контента */
-  padding-bottom: calc(84px + env(safe-area-inset-bottom));   /* фолбэк без max() */
-  padding-bottom: calc(76px + var(--nav-gap));
+  /* Запас под плавающее нижнее меню: высота панели + 16px + safe-area.
+     Без него последняя строка любого списка (фильтры каталога, график по
+     дням) пряталась за панелью. */
+  padding-bottom: calc(82px + env(safe-area-inset-bottom));   /* фолбэк без max() */
+  padding-bottom: calc(var(--nav-h) + var(--sp-4) + var(--nav-gap));
 }
 
 /* ─── Topbar ──────────────────────────────────────────────────── */
@@ -397,7 +355,7 @@ body::before {
 .subtitle {
   font-size: 13px;
   color: var(--text-mute);
-  margin-top: 1px;
+  margin-top: 0;
 }
 
 /* UI-WP-07: раньше это был единственный залитый акцентом пилл на экране
@@ -406,8 +364,8 @@ body::before {
    мельче: роль остаётся читаемой подписью, а не вторым главным элементом. */
 .role-badge {
   font-size: var(--text-xs);
-  padding: var(--sp-1) 10px;
-  border-radius: var(--radius-pill);
+  padding: var(--sp-1) 8px;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--accent);
   border: 1px solid var(--accent);
@@ -422,7 +380,7 @@ body::before {
 
 .loader {
   text-align: center;
-  padding: 40px 16px;
+  padding: 32px 16px;
   color: var(--text-mute);
   font-size: 14px;
 }
@@ -445,8 +403,8 @@ body::before {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 10px;
-  padding: 48px 16px;
+  gap: 8px;
+  padding: 32px 16px;
   color: var(--text-mute);
   font-size: 13px;
 }
@@ -464,28 +422,24 @@ body::before {
    подпись на 30px от края, тогда как карточки и сегменты стоят на 16px —
    на экране получались две левые линии вместо одной. Боковой отступ даёт
    контейнер, подписи он не нужен. */
+/* Заголовок секции — ОДИН класс на всё приложение (UI-бриф п.1):
+   капс, 12px, hint-цвет, letter-spacing 0.5px, снизу 8px. «Категории»,
+   «Статус», «Позиции», «Топ товаров» — всё им. */
 .section-label {
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   color: var(--text-mute);
   margin: var(--sp-5) 0 var(--sp-2);
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.6px;
+  letter-spacing: 0.5px;
 }
-
-/* Приветствие по времени суток над hero. */
-.home-greeting {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text);
-  margin: 2px 2px 10px;
-}
+.section-label:first-child { margin-top: var(--sp-2); }
 
 /* ─── Hero balance (Home) ─────────────────────────────────────── */
 .hero {
   background: var(--accent);
-  border-radius: var(--radius-lg);
-  padding: 24px 20px 20px;
+  border-radius: var(--radius);
+  padding: 24px 24px 24px;
   margin-bottom: 8px;
   box-shadow: var(--shadow-float);
   text-align: center;
@@ -551,11 +505,11 @@ body::before {
   gap: 4px;
   font-size: 13px;
   padding: 4px 12px;
-  border-radius: var(--radius-chip);
+  border-radius: var(--radius-sm);
   background: var(--fill-neutral);
   color: var(--accent-fg);
   opacity: 0.92;
-  margin-top: 10px;
+  margin-top: 8px;
 }
 .hero-delta .ic { --ic-size: 15px; vertical-align: 0; }
 
@@ -668,7 +622,7 @@ body::before {
 /* Самодостаточная карточка. */
 .c-surface--pad,
 .card {
-  padding: 14px var(--sp-4);
+  padding: 16px var(--sp-4);
 }
 
 /* Строка внутри списочной поверхности. */
@@ -738,8 +692,8 @@ body::before {
   flex: none;
   min-width: 34px;
   height: 34px;
-  padding: 0 6px;
-  border-radius: 10px;
+  padding: 0 8px;
+  border-radius: var(--radius-sm);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -778,7 +732,7 @@ body::before {
 .card-row-sub {
   font-size: 12px;
   color: var(--text-mute);
-  margin-top: 2px;
+  margin-top: 4px;
 }
 
 .card-row-value {
@@ -803,18 +757,22 @@ body::before {
 /* Выручка по валютам (личная аналитика): по строке на валюту, без сложения. */
 .rev-row {
   display: flex; align-items: baseline; justify-content: space-between;
-  gap: 10px; padding: 8px 0; border-bottom: 0.5px solid var(--divider);
+  gap: 8px; padding: 8px 0; border-bottom: 0.5px solid var(--divider);
 }
 .rev-row:last-child { border-bottom: none; }
 .rev-amount { font-size: 20px; font-weight: 700; letter-spacing: -0.3px; }
-.rev-meta { font-size: 12px; color: var(--text-mute); display: inline-flex; align-items: center; gap: 6px; }
+.rev-meta { font-size: 12px; color: var(--text-mute); display: inline-flex; align-items: center; gap: 8px; }
 
-.stat { padding: 14px; }
+/* Плитка показателя: число крупно, подпись hint-цветом под ним. Сетка 2×2
+   (UI-бриф п.8а) — четыре числа не должны занимать половину экрана. */
+.stat { padding: 16px; min-width: 0; }
 
 .stat-value {
   font-size: 20px;
   font-weight: 600;
   letter-spacing: -0.3px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
 }
 
 .stat-label {
@@ -838,7 +796,7 @@ body::before {
   grid-auto-columns: 1fr;
   background: var(--bg-card);
   border: 1px solid var(--divider);
-  border-radius: 24px;
+  border-radius: var(--radius);
   padding: 8px;
   box-shadow: var(--shadow-float);
   /* position здесь БОЛЬШЕ НЕ ОБЪЯВЛЯТЬ. `fixed` стоит в начале правила и сам
@@ -872,16 +830,16 @@ body::before {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 3px;
+  gap: 4px;
   background: none;
   border: none;
   color: var(--text-mute);
   font-size: 10px;
   cursor: pointer;
   min-width: 0;             /* подпись ужимается, а не распирает ряд из пяти */
-  padding: 8px 2px;
+  padding: 8px 4px;
   min-height: 48px;       /* комфортная зона тапа на телефоне */
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   transition: background 0.15s ease, color 0.15s ease;
 }
 
@@ -905,7 +863,7 @@ body::before {
 .error {
   background: var(--danger-bg);
   color: var(--danger);
-  padding: 14px 16px;
+  padding: 16px 16px;
   border-radius: var(--radius);
   margin: 16px 0;
   font-size: 14px;
@@ -915,8 +873,8 @@ body::before {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 10px;
-  padding: 48px 24px 32px;
+  gap: 8px;
+  padding: 32px 24px 32px;
   text-align: center;
 }
 .error-card .error-icon { line-height: 1; }
@@ -928,7 +886,7 @@ body::before {
   background: var(--warn-bg);
   color: var(--warn);
   border-radius: var(--radius);
-  padding: 12px 14px;
+  padding: 12px 16px;
   margin-bottom: 8px;
   font-size: 13px;
 }
@@ -940,7 +898,7 @@ body::before {
   overflow-x: auto;
   /* UI-BUG-05: боковой отступ даёт `.content`; здесь остаётся только нижний.
      Отрицательные поля не ставим — chip-scroll намеренно живёт в сетке. */
-  padding: 0 0 10px;
+  padding: 0 0 8px;
   margin-top: 12px;          /* воздух от поля поиска сверху */
   margin-bottom: 8px;
   scrollbar-width: none;
@@ -948,7 +906,7 @@ body::before {
 .cat-scroll::-webkit-scrollbar { display: none; }
 
 /* ─── Календарь выбора диапазона дат (заказы + аналитика) ──────────── */
-.cal-host { margin: 0 14px 10px; }
+.cal-host { margin: 0 16px 8px; }
 .cal {
   background: var(--bg-card);
   border-radius: var(--radius);
@@ -957,7 +915,7 @@ body::before {
 }
 .cal-head {
   display: flex; align-items: center; justify-content: space-between;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 .cal-title { font-size: 15px; font-weight: 600; }
 .cal-nav {
@@ -965,42 +923,49 @@ body::before {
   border: none; background: var(--bg-soft); color: var(--text);
   border-radius: var(--radius-sm); font-size: 20px; line-height: 1; cursor: pointer;
 }
-.cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
-.cal-wd { margin-bottom: 2px; }
-.cal-wd-cell { text-align: center; font-size: 11px; color: var(--text-mute); padding: 2px 0; }
+.cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+.cal-wd { margin-bottom: 4px; }
+.cal-wd-cell { text-align: center; font-size: 11px; color: var(--text-mute); padding: 4px 0; }
 .cal-cell { aspect-ratio: 1 / 1; }
 .cal-day {
   width: 100%; height: 100%;
   border: none; background: none; color: var(--text);
-  font-size: 14px; cursor: pointer; border-radius: 8px;
+  font-size: 14px; cursor: pointer; border-radius: var(--radius-sm);
   font-family: inherit;
 }
 .cal-today { box-shadow: inset 0 0 0 1.5px var(--accent); }
 .cal-in-range { background: color-mix(in srgb, var(--accent) 16%, transparent); border-radius: 0; }
 .cal-sel { background: var(--accent); color: var(--accent-fg); font-weight: 600; }
-.cal-sel-start { border-radius: 8px 0 0 8px; }
-.cal-sel-end { border-radius: 0 8px 8px 0; }
+.cal-sel-start { border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
+.cal-sel-end { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
 .cal-foot {
   display: flex; align-items: center; justify-content: space-between;
-  gap: 10px; margin-top: 12px;
+  gap: 8px; margin-top: 12px;
 }
 .cal-range { font-size: 13px; color: var(--text-mute); flex: 1; min-width: 0; }
-.cal-foot .cal-apply { width: auto; flex-shrink: 0; padding: 10px 18px; }
+.cal-foot .cal-apply { width: auto; flex-shrink: 0; padding: 8px 16px; }
 .cal-apply:disabled { opacity: var(--disabled-opacity); cursor: not-allowed; }
 
+/* Ряд чипов — горизонтальная строка со скроллом (UI-бриф п.4): облако
+   переносов разной ширины читалось хуже, чем ряд, который листается.
+   Второй уровень категорий — такой же ряд строкой ниже. */
 .cat-row {
   display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
+  gap: 8px;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
   margin: 8px 0;
 }
+.cat-row::-webkit-scrollbar { display: none; }
 
 .cat-btn {
   flex-shrink: 0;
-  padding: 10px 14px;
-  min-height: 40px;  /* комфортный тач-таргет в скролл-ряду (было ~33px) */
+  padding: 8px 16px;
+  min-height: 44px;  /* тач-цель (UI-бриф п.1) */
   display: inline-flex; align-items: center;
-  border-radius: var(--radius-pill);
+  border-radius: var(--radius-sm);
   background: var(--bg-card);
   color: var(--text);
   border: 1px solid var(--divider);
@@ -1022,7 +987,7 @@ body::before {
 .orders-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
 .stock-row,
@@ -1031,7 +996,7 @@ body::before {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: var(--sp-3) 14px;
+  padding: var(--sp-3) 16px;
   min-height: 44px;
   cursor: pointer;
   transition: opacity 0.1s ease, transform 0.08s ease;
@@ -1055,14 +1020,14 @@ body::before {
 .stock-folder, .prod-folder, .agent-phone {
   font-size: 12px;
   color: var(--text-mute);
-  margin-top: 2px;
+  margin-top: 4px;
 }
 
 .stock-badge {
   font-size: 13px;
   font-weight: 600;
   padding: 4px 12px;
-  border-radius: var(--radius-chip);
+  border-radius: var(--radius-sm);
   white-space: nowrap;
   margin-left: 8px;
 }
@@ -1085,7 +1050,7 @@ body::before {
 .trend-dn { color: var(--danger); }
 
 .bar-row {
-  display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
+  display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
 }
 .bar-row:last-child { margin-bottom: 0; }
 .bar-day {
@@ -1093,10 +1058,10 @@ body::before {
 }
 .bar-bg {
   flex: 1; height: 8px; background: var(--bg-soft);
-  border-radius: 4px; overflow: hidden;
+  border-radius: var(--radius-sm); overflow: hidden;
 }
 .bar-fill {
-  height: 100%; background: var(--accent); border-radius: 4px;
+  height: 100%; background: var(--accent); border-radius: var(--radius-sm);
   transition: width 0.55s cubic-bezier(0.4, 0, 0.2, 1);
 }
 .bar-val {
@@ -1105,7 +1070,7 @@ body::before {
 
 .top-row {
   display: flex; align-items: center; gap: 12px;
-  padding: 10px 0; border-bottom: 0.5px solid var(--divider);
+  padding: 8px 0; border-bottom: 0.5px solid var(--divider);
 }
 .top-row:last-child { border-bottom: none; }
 .top-info { flex: 1; min-width: 0; }
@@ -1113,7 +1078,7 @@ body::before {
   font-size: 14px; font-weight: 500;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.top-sub { font-size: 12px; color: var(--text-mute); margin-top: 2px; }
+.top-sub { font-size: 12px; color: var(--text-mute); margin-top: 4px; }
 .top-profit { color: var(--success); font-weight: 600; }
 
 /* ─── Формы ───────────────────────────────────────────────────── */
@@ -1123,20 +1088,20 @@ body::before {
   display: block;
   font-size: 12px;
   color: var(--text-mute);
-  margin-bottom: 6px;
+  margin-bottom: 8px;
   margin-left: 4px;
   font-weight: 500;
 }
 
 .form-input {
   width: 100%;
-  padding: 14px;
+  padding: 16px;
   /* В тёмной теме --bg-card и --bg-page часто оказываются почти
      одного оттенка → инпут визуально сливается с фоном. Добавляем
      явную границу из переменной --divider, она лёгкая и не ломает
      светлую тему. */
   border: 1px solid var(--divider);
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   background: var(--bg-card);
   color: var(--text);
   font-size: 16px;
@@ -1157,7 +1122,7 @@ body::before {
 }
 
 .cur-row {
-  display: flex; gap: 6px;
+  display: flex; gap: 8px;
 }
 
 /* Выбор значения (валюта / тип возврата) — accent-fill при выборе; единый
@@ -1166,10 +1131,10 @@ body::before {
    в S4 вместе с пересборкой форм кассы. */
 .cur-btn {
   flex: 1;
-  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
   padding: 12px;
   border: none;
-  border-radius: var(--radius-chip);
+  border-radius: var(--radius-sm);
   background: var(--bg-card);
   color: var(--text);
   font-size: 13px;
@@ -1190,7 +1155,7 @@ body::before {
   background: var(--accent);
   color: var(--accent-fg);
   border: none;
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   font-size: 16px;
   font-weight: 600;
   cursor: pointer;
@@ -1207,11 +1172,11 @@ body::before {
 
 .btn-secondary {
   width: 100%;
-  padding: 14px;
+  padding: 16px;
   background: var(--bg-card);
   color: var(--text);
   border: none;
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   font-size: 15px;
   font-weight: 500;
   cursor: pointer;
@@ -1226,7 +1191,7 @@ body::before {
 }
 
 .pay-status {
-  margin-top: 10px; text-align: center;
+  margin-top: 8px; text-align: center;
   font-size: 13px; color: var(--text-mute);
 }
 .pay-status.pay-ok    { color: var(--success); }
@@ -1234,7 +1199,7 @@ body::before {
 
 /* ─── Заказы (карточки) ──────────────────────────────────────── */
 .order-card {
-  padding: 14px;
+  padding: 16px;
   border-left: 3px solid transparent;
 }
 
@@ -1284,7 +1249,7 @@ body::before {
   position: absolute;
   left: 0; top: 8px; bottom: 8px;
   width: 3px;
-  border-radius: 0 3px 3px 0;
+  border-radius: 0;
   background: var(--status-c);
   pointer-events: none;
 }
@@ -1293,8 +1258,8 @@ body::before {
 [data-status] .c-badge {
   background: var(--status-bg);
   color: var(--status-c);
-  padding: var(--sp-1) 10px;
-  border-radius: var(--radius-chip);
+  padding: var(--sp-1) 8px;
+  border-radius: var(--radius-sm);
   font-size: var(--text-sm);
   white-space: nowrap;
 }
@@ -1309,7 +1274,7 @@ body::before {
 
 .order-header {
   display: flex; justify-content: space-between;
-  align-items: flex-start; margin-bottom: 6px;
+  align-items: flex-start; margin-bottom: 8px;
 }
 
 /* Левая часть шапки тянется и сжимается, чтобы длинное имя клиента
@@ -1329,7 +1294,7 @@ body::before {
 .order-manager {
   font-size: 12px;
   color: var(--text-mute);
-  margin-top: 2px;
+  margin-top: 4px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1343,7 +1308,7 @@ body::before {
 
 /* Заголовок-дата над группой заказов: не uppercase (даты/«Сегодня» читабельнее). */
 .order-date-label { text-transform: none; letter-spacing: 0; margin-top: 16px; }
-.orders-list > .order-date-label:first-child { margin-top: 2px; }
+.orders-list > .order-date-label:first-child { margin-top: 4px; }
 
 /* Бейдж статуса в карточке заказа: цвет приходит от data-status родителя
    (.c-badge), здесь — только размер и вес. */
@@ -1363,16 +1328,16 @@ body::before {
 .order-meta {
   display: flex; justify-content: space-between;
   font-size: 12px; color: var(--text-mute);
-  margin-bottom: 6px; gap: 8px;
+  margin-bottom: 8px; gap: 8px;
 }
 
 .order-total { color: var(--text); font-weight: 600; }
 
 /* Самодостаточная карточка заказа: тип оплаты / статус / заморозка инлайн. */
-.order-pay-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.order-pay-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
 .order-pay {
   font-size: 11px; font-weight: 600;
-  padding: 2px 8px; border-radius: var(--radius-chip);
+  padding: 4px 8px; border-radius: var(--radius-sm);
   background: var(--fill-neutral); color: var(--text-mute);
   white-space: nowrap;
 }
@@ -1385,19 +1350,19 @@ body::before {
 
 /* Кредит-контекст клиента в заявке (босс решает об апруве не уходя в Лимиты). */
 .credit-ctx {
-  margin: 4px 0 6px; padding: 8px 10px;
+  margin: 4px 0 8px; padding: 8px 8px;
   border-radius: var(--radius-sm); font-size: 12px; line-height: 1.4;
 }
 .credit-ctx--ok  { background: var(--success-bg); color: var(--text); }
 .credit-ctx--bad { background: var(--danger-bg);  color: var(--text); }
 
 /* Превью позиций в карточке подтверждения оплаты — что именно подтверждаешь. */
-.debt-items-preview { font-size: 12px; color: var(--text-mute); margin: 2px 0 6px; }
+.debt-items-preview { font-size: 12px; color: var(--text-mute); margin: 4px 0 8px; }
 
 .order-item, .order-item-preview {
   font-size: 12px;
   color: var(--text-mute);
-  padding: 2px 0;
+  padding: 4px 0;
 }
 
 /* ─── Раскрытый состав (заказ, отгрузка) ─────────────────────────────────────
@@ -1421,7 +1386,7 @@ body::before {
   font-size: var(--text-sm); color: var(--text);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.items-meta { font-size: var(--text-xs); color: var(--text-mute); margin-top: 1px; }
+.items-meta { font-size: var(--text-xs); color: var(--text-mute); margin-top: 0; }
 .items-sum {
   flex-shrink: 0; font-size: var(--text-sm); font-weight: 600;
   color: var(--text); white-space: nowrap;
@@ -1440,32 +1405,19 @@ body::before {
   padding: var(--sp-2) 0; font-size: var(--text-sm); color: var(--text-mute);
 }
 
-.requests-btn {
-  width: 100%;
-  padding: 12px;
-  background: var(--warn-bg);
-  color: var(--warn);
-  border: none;
-  border-radius: var(--radius);
-  font-size: 14px;
-  font-weight: 600;
-  margin-bottom: 12px;
-  cursor: pointer;
-}
-
 .req-actions {
   display: flex; gap: 8px; margin-top: 8px;
 }
 
 .btn-approve {
-  flex: 1; padding: 10px;
+  flex: 1; padding: 8px;
   background: var(--success-bg); color: var(--success);
   border: none; border-radius: var(--radius-sm);
   font-size: 13px; font-weight: 600; cursor: pointer;
 }
 
 .btn-reject {
-  flex: 1; padding: 10px;
+  flex: 1; padding: 8px;
   background: var(--danger-bg); color: var(--danger);
   border: none; border-radius: var(--radius-sm);
   font-size: 13px; font-weight: 600; cursor: pointer;
@@ -1474,24 +1426,24 @@ body::before {
 /* ─── Editor (формы создания заказа) ─────────────────────────── */
 .btn-new-order {
   width: 100%; margin-bottom: 12px;
-  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-  padding: 13px 16px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 12px 16px;
   background: var(--accent); color: var(--accent-fg);
-  border: none; border-radius: var(--radius);
+  border: none; border-radius: var(--radius-sm);
   font-size: 15px; font-weight: 600; cursor: pointer;
   white-space: nowrap;
 }
 .btn-new-order .ic { --ic-size: 18px; }
 
 .editor-header {
-  display: flex; align-items: center; gap: 10px;
-  padding: 8px 0 14px; margin-bottom: 8px;
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 0 16px; margin-bottom: 8px;
 }
 
 .editor-header button {
   background: none; border: none;
   font-size: 20px; cursor: pointer;
-  padding: 8px; min-width: 40px; min-height: 40px;
+  padding: 8px; min-width: 44px; min-height: 44px;
   color: var(--accent);
 }
 
@@ -1499,10 +1451,10 @@ body::before {
 
 .btn-agent {
   width: 100%;
-  padding: 14px;
+  padding: 16px;
   background: var(--bg-card);
   border: none;
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   font-size: 14px;
   cursor: pointer;
   color: var(--accent);
@@ -1513,7 +1465,7 @@ body::before {
 
 .agent-selected {
   display: flex; justify-content: space-between; align-items: center;
-  padding: 14px;
+  padding: 16px;
   background: var(--bg-card);
   border-radius: var(--radius);
   font-size: 14px;
@@ -1526,39 +1478,43 @@ body::before {
 }
 
 .editor-items {
-  display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px;
+  display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px;
 }
 
 .editor-item { justify-content: space-between; }
 
-/* Строка «Итого» в редакторе — выделена мягкой заливкой (заменяет inline-стиль
-   с хардкод-фоллбэком #f5f5f5, ломавшимся на светлой теме в браузере). */
+/* Строка «Итого» в редакторе заказа — выделена мягкой заливкой. */
 .editor-item--total { background: var(--bg-soft); font-weight: 600; }
+
+/* Итог накладной — карточка в общем стиле (UI-бриф п.8а): «Итого» слева,
+   сумма справа крупно и с валютой. Плоская полоса без скругления читалась
+   как недоделанный экран. */
+.wh-total {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  background: var(--bg-card);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-card);
+}
+.wh-total-label { font-size: var(--text-md); color: var(--text-mute); }
+.wh-total-sum {
+  font-size: var(--text-xl); font-weight: 700;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+/* Плейсхолдер у select: пока значение пустое, текст hint-цветом, как у
+   остальных полей. */
+.form-input--placeholder { color: var(--text-mute); }
 .editor-item-info { flex: 1; }
 .editor-item-name { font-size: 14px; font-weight: 500; }
-.editor-item-qty  { font-size: 12px; color: var(--text-mute); margin-top: 2px; }
-
-/* Вход в локальный складской учёт с вкладки «Каталог». Кнопки в ряд,
-   на узком экране переносятся. */
-.wh-entry {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 4px;
-}
-
-.wh-entry .btn-secondary {
-  flex: 1;
-  min-width: 150px;
-  margin: 0;
-}
+.editor-item-qty  { font-size: 12px; color: var(--text-mute); margin-top: 4px; }
 
 /* ─── Склад: форма позиций накладной ─────────────────────────────────────
    Своя разметка, потому что строка редактора заказа (.editor-item) —
    готовая позиция с суммой, а здесь вводятся три поля сразу: товар,
    количество и цена. */
 .wh-pos {
-  padding: 12px 14px;
+  padding: 12px 16px;
   background: var(--bg-card);
   border-radius: var(--radius);
   box-shadow: var(--shadow-card);
@@ -1591,7 +1547,7 @@ body::before {
 .wh-actions {
   display: flex;
   gap: 8px;
-  margin-top: 10px;
+  margin-top: 8px;
   flex-wrap: wrap;
 }
 
@@ -1612,18 +1568,18 @@ body::before {
 .editor-item-del .ic { --ic-size: 18px; }
 
 .editor-empty {
-  text-align: center; padding: 20px;
+  text-align: center; padding: 24px;
   color: var(--text-mute); font-size: 14px;
-  background: var(--bg-card); border-radius: var(--radius);
+  background: var(--bg-card); border-radius: var(--radius-sm);
   margin-bottom: 8px;
 }
 
 .btn-add-product {
   width: 100%;
-  padding: 14px;
+  padding: 16px;
   background: var(--bg-card);
   border: 1.5px dashed var(--accent);
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   color: var(--accent);
   font-size: 14px;
   font-weight: 500;
@@ -1634,30 +1590,30 @@ body::before {
 
 .editor-footer {
   position: sticky;
-  bottom: calc(84px + env(safe-area-inset-bottom));   /* фолбэк без max() */
-  bottom: calc(76px + var(--nav-gap));
+  bottom: calc(74px + env(safe-area-inset-bottom));   /* фолбэк без max() */
+  bottom: calc(var(--nav-h) + var(--sp-2) + var(--nav-gap));
   padding: 12px 0 0;
 }
 
 .editor-hint {
   text-align: center; font-size: 12px;
-  color: var(--text-mute); margin-top: 6px;
+  color: var(--text-mute); margin-top: 8px;
 }
 
 .btn-submit-order {
   width: 100%; padding: 16px;
   background: var(--accent); color: var(--accent-fg);
-  border: none; border-radius: var(--radius);
+  border: none; border-radius: var(--radius-sm);
   font-size: 16px; font-weight: 600; cursor: pointer;
   font-family: inherit;
-  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
 }
 .btn-submit-order .ic { --ic-size: 18px; vertical-align: 0; }
 
 .btn-submit-order:disabled { opacity: var(--disabled-opacity); cursor: not-allowed; }
 
 .btn-edit-order {
-  width: 100%; margin-top: 10px; padding: 9px;
+  width: 100%; margin-top: 8px; padding: 8px;
   background: var(--bg-soft); border: none;
   border-radius: var(--radius-sm);
   color: var(--accent); font-size: 13px;
@@ -1683,14 +1639,14 @@ body::before {
   text-align: center;
 }
 /* Итог строки: нижний отступ резервирует место под плавающей MainButton. */
-.qty-line-total { margin: 8px 0 80px; }
+.qty-line-total { margin: 8px 0 calc(var(--nav-h) + var(--sp-4)); }
 
 .qty-input {
   width: 100%; text-align: center;
   font-size: 28px; font-weight: 700;
-  padding: 18px;
+  padding: 16px;
   border: none;
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   background: var(--bg-card);
   color: var(--text);
   box-shadow: var(--shadow-card);
@@ -1706,7 +1662,7 @@ body::before {
   padding: 0 0 12px;   /* UI-BUG-05: боковой отступ — у .content */
 }
 .due-date-label {
-  display: block; font-size: 13px; color: var(--text-mute); margin-bottom: 6px;
+  display: block; font-size: 13px; color: var(--text-mute); margin-bottom: 8px;
 }
 .due-date-input {
   width: 100%; padding: 12px; font-size: 15px;
@@ -1726,7 +1682,7 @@ body::before {
 
 /* ─── Экран «Долги» ──────────────────────────────────────────────── */
 .debts-header {
-  padding: 14px; display: flex; flex-direction: column; gap: 10px;
+  padding: 16px; display: flex; flex-direction: column; gap: 8px;
 }
 .
 /* Фильтр «Все / К оплате сейчас» — тот же сегмент-язык, что .seg
@@ -1738,34 +1694,34 @@ body::before {
   padding: 0;                 /* UI-BUG-05 */
   margin-top: 12px;           /* воздух от money-summary сверху */
   display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
-  gap: 10px;
+  gap: 8px;
 }
 /* UI-WP-22: плитка сводки — та же карточная поверхность, что у .stat;
    собственными остаются только выравнивание и цвет цифры по срочности. */
 .debt-stat {
-  padding: 14px var(--sp-2);
-  border-radius: var(--radius-chip);
+  padding: 16px var(--sp-2);
+  border-radius: var(--radius-sm);
   text-align: center;
 }
 .debt-stat-num { font-size: 24px; font-weight: 700; line-height: 1.1; }
-.debt-stat-label { font-size: 12px; color: var(--text-mute); margin: 6px 0 4px; }
+.debt-stat-label { font-size: 12px; color: var(--text-mute); margin: 8px 0 4px; }
 .debt-stat-sum { font-size: 14px; font-weight: 600; }
 .debt-stat-overdue .debt-stat-num { color: var(--danger); }
 .debt-stat-today .debt-stat-num   { color: var(--warn-strong); }
 .debt-stat-upcoming .debt-stat-num{ color: var(--info); }
 
 .debts-list {
-  padding: 14px; display: flex; flex-direction: column; gap: 10px;
+  padding: 16px; display: flex; flex-direction: column; gap: 8px;
 }
 .debt-card {
-  padding: 14px var(--sp-4); border-left: 4px solid transparent;
+  padding: 16px var(--sp-4); border-left: 4px solid transparent;
 }
 .debt-card.debt-overdue   { border-left-color: var(--danger); }
 .debt-card.debt-due_today { border-left-color: var(--warn-strong); }
 .debt-card.debt-upcoming  { border-left-color: var(--info); }
 .debt-card-top {
   display: flex; justify-content: space-between; align-items: flex-start;
-  gap: 10px; margin-bottom: 8px;
+  gap: 8px; margin-bottom: 8px;
 }
 .debt-agent {
   font-size: 16px; font-weight: 600; flex: 1; min-width: 0;
@@ -1776,34 +1732,34 @@ body::before {
 }
 .debt-card-mid {
   display: flex; justify-content: space-between; align-items: center;
-  font-size: 13px; color: var(--text-mute); margin-bottom: 10px;
-  flex-wrap: wrap; gap: 6px;
+  font-size: 13px; color: var(--text-mute); margin-bottom: 8px;
+  flex-wrap: wrap; gap: 8px;
 }
 .debt-state b { color: var(--text); }
 .debt-owner { opacity: 0.7; }
 .btn-mark-paid {
-  width: 100%; padding: 10px; border: 0; border-radius: var(--radius-sm);
+  width: 100%; padding: 8px; border: 0; border-radius: var(--radius-sm);
   background: var(--accent);
   color: var(--accent-fg);
   font-size: 14px; font-weight: 600; cursor: pointer;
-  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
 }
 .btn-mark-paid .ic { --ic-size: 16px; }
 .btn-mark-paid:disabled { opacity: var(--disabled-opacity); cursor: default; }
 
 /* ─── Сводка «получено / ожидает» ─────────────────────────────── */
 .money-summary {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
   padding: 0; margin-top: 12px;   /* UI-BUG-05 */
 }
 /* Единый остаток к получению в базовой валюте (объединяет валюты). */
 .money-base-total {
-  margin: 10px 14px 0; padding: 10px 14px;
-  border-radius: var(--radius-chip); background: var(--info-bg);
+  margin: 8px 16px 0; padding: 8px 16px;
+  border-radius: var(--radius-sm); background: var(--info-bg);
   font-size: 14px; color: var(--text);
 }
 .money-block {
-  padding: 14px;
+  padding: 16px;
   min-height: 92px;             /* выравниваем высоту даже если содержимое разной длины */
   display: flex; flex-direction: column; justify-content: space-between;
   border-radius: var(--radius);
@@ -1829,33 +1785,6 @@ body::before {
 }
 .money-block.money-empty .money-value { color: var(--text-mute); }
 
-/* ─── Полностью пустое состояние финансов ──────────────────────── */
-.finance-empty {
-  margin: 40px 20px;
-  padding: 28px 20px;
-  text-align: center;
-  background: var(--bg-card);
-  border-radius: var(--radius);
-}
-.finance-empty-icon {
-  margin-bottom: 12px;
-  opacity: 0.45;
-  color: var(--text-mute);
-}
-.finance-empty-icon .ic { --ic-size: 44px; }
-.finance-empty-title {
-  font-size: 17px;
-  font-weight: 600;
-  margin-bottom: 8px;
-}
-.finance-empty-hint {
-  font-size: 14px;
-  color: var(--text-mute);
-  line-height: 1.4;
-  max-width: 320px;
-  margin: 0 auto;
-}
-
 /* ─── Awaiting + actions ─────────────────────────────────────── */
 .section-awaiting { color: var(--warn-strong) !important; font-weight: 700; }
 .debt-awaiting { border-left-color: var(--warn-strong) !important; }
@@ -1863,7 +1792,7 @@ body::before {
   display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
 }
 .btn-confirm-pay, .btn-reject-pay {
-  padding: 10px; border: 0; border-radius: var(--radius-sm);
+  padding: 8px; border: 0; border-radius: var(--radius-sm);
   font-size: 14px; font-weight: 600; cursor: pointer;
 }
 .btn-confirm-pay {
@@ -1877,7 +1806,7 @@ body::before {
 .btn-confirm-pay:disabled, .btn-reject-pay:disabled { opacity: var(--disabled-opacity); cursor: default; }
 .btn-edit-limit {
   grid-column: 1 / -1;
-  padding: 10px; border: 1px solid var(--accent); border-radius: var(--radius-sm);
+  padding: 8px; border: 1px solid var(--accent); border-radius: var(--radius-sm);
   background: var(--bg-card); color: var(--accent);
   font-size: 14px; font-weight: 600; cursor: pointer;
 }
@@ -1903,7 +1832,7 @@ body::before {
    переключателей: фильтр долгов, выбор валюты) на всех экранах. */
 .seg {
   display: flex; gap: 4px; flex: 1; min-width: 0;
-  background: var(--bg-soft); border-radius: 14px; padding: 4px;
+  background: var(--bg-soft); border-radius: var(--radius); padding: 4px;
 }
 @supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
   .seg {
@@ -1920,7 +1849,7 @@ body::before {
   flex: 1; min-width: 0; padding: 12px 8px; min-height: 44px; border: 0;
   border-radius: var(--radius-sm); background: transparent; color: var(--text-mute);
   font-size: 14px; font-weight: 600; font-family: inherit; cursor: pointer;
-  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   transition: background 0.15s ease, color 0.15s ease;
 }
@@ -1944,27 +1873,19 @@ body::before {
    При переполнении свободного места нет, grow не срабатывает, shrink:0
    запрещает сжатие — и работает горизонтальный скролл, ради которого
    модификатор и вводился. */
-.seg--scroll .seg-item { flex: 1 0 auto; min-width: 44px; }
+/* Не больше трёх пунктов в ряд (UI-бриф п.4): четвёртый заведомо выходит за
+   край и обрезается — так видно, что ряд листается. Три и меньше растут до
+   полной ширины. */
+.seg--scroll .seg-item { flex: 1 0 auto; min-width: 29%; }
 
-/* Доп-ссылка справа от сегмента (напр. «Лимиты» — read-only надстройка для
-   босса): намеренно НЕ pill, чтобы не путалась с разделами уровня 1. */
-.seg-aux {
-  /* UI-BUG-02: без потолка ширины подпись диапазона выталкивала кнопку за
-     вьюпорт — flex-shrink:0 запрещал ей ужиматься, а боковых отступов у ряда
-     нет. Половину ряда доп-кнопка занимать не должна: её роль вспомогательная. */
-  flex-shrink: 0; max-width: 42%; overflow: hidden; text-overflow: ellipsis;
-  min-height: 44px;
-  padding: 11px 10px; border: 0; border-radius: var(--radius-chip);
-  background: transparent; color: var(--text-mute);
-  font-size: 13px; font-weight: 600; font-family: inherit; cursor: pointer;
-  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
-}
-.seg-aux .ic { --ic-size: 17px; }
-.seg-aux.active { color: var(--accent); }
+/* «Период…» — последний пункт сегмента периода, а не кнопка справа от него
+   (UI-бриф п.5). Подпись живёт внутри пункта, ширина по содержимому. */
+.seg-item--custom { flex: 0 0 auto; }
+.seg-item--custom .ic { --ic-size: 16px; }
 
 /* Уровень 2: компактные underline-вкладки. */
 .subseg {
-  display: flex; gap: 4px; padding: 6px 0 0;
+  display: flex; gap: 4px; padding: 8px 0 0;
   border-bottom: 0.5px solid var(--divider); margin-bottom: 8px;
   /* Много под-вкладок (Подтверждения\Операции\Итоги\История) не должны ломать
      ряд: при переполнении — горизонтальный скролл, а не «съехавшие» кнопки. */
@@ -1974,30 +1895,30 @@ body::before {
 .subseg::-webkit-scrollbar { display: none; }
 .subseg-item {
   flex-shrink: 0;   /* не сжимать — иначе подписи наезжают друг на друга */
-  padding: 8px 10px 10px; border: 0; background: none; cursor: pointer;
+  padding: 8px 8px 8px; border: 0; background: none; cursor: pointer;
   color: var(--text-mute); font-size: 13px; font-weight: 600; font-family: inherit;
-  display: inline-flex; align-items: center; gap: 5px;
-  border-bottom: 2px solid transparent; margin-bottom: -1px;
+  display: inline-flex; align-items: center; gap: 4px;
+  border-bottom: 2px solid transparent;
   white-space: nowrap;
 }
 .subseg-item .ic { --ic-size: 16px; }
 .subseg-item.active { color: var(--accent); border-bottom-color: var(--accent); }
 /* .subseg как top-level навигация Финансов: комфортный тач-таргет + бейдж счётчика. */
 .subseg-item { min-height: 44px; }
-.subseg-item .stock-badge { margin-left: 6px; }
+.subseg-item .stock-badge { margin-left: 8px; }
 
 /* Карточка контрагента («Клиенты»): строка баланса МойСклад. */
-.agent-bal { font-size: 16px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
-.agent-phone { padding: 0 2px 8px; }
+.agent-bal { font-size: 16px; font-weight: 700; color: var(--text); margin-bottom: 8px; }
+.agent-phone { padding: 0 4px 8px; }
 .bal-owe { color: var(--danger); font-weight: 600; }   /* клиент должен нам */
 .bal-adv { color: var(--success); font-weight: 600; }  /* аванс/переплата */
 
 /* Итог поступлений в базовой валюте (вкладка «Обзор» раздела «Деньги»). */
 .money-total {
   font-size: 26px; font-weight: 800; color: var(--text);
-  margin: 8px 2px 2px; letter-spacing: -0.5px;
+  margin: 8px 4px 4px; letter-spacing: -0.5px;
 }
-.money-total-note { font-size: 12px; color: var(--text-mute); margin: 0 2px 8px; }
+.money-total-note { font-size: 12px; color: var(--text-mute); margin: 0 4px 8px; }
 
 /* ─── Partial-оплата (input + кнопка в ряд) ────────────────────── */
 .pay-input-row {
@@ -2005,7 +1926,7 @@ body::before {
 }
 .pay-amount-input {
   flex: 1; min-width: 0;
-  padding: 10px 12px; font-size: 14px;
+  padding: 8px 12px; font-size: 14px;
   /* Единый рецепт через токены (как .form-input), а не dark-only фоллбэки —
      иначе в светлом браузере поле рендерилось чёрным. */
   border: 1px solid var(--divider);
@@ -2022,12 +1943,12 @@ body::before {
   border-color: var(--accent);
 }
 .pay-input-row .btn-mark-paid {
-  flex-shrink: 0; width: auto; padding: 10px 14px;
+  flex-shrink: 0; width: auto; padding: 8px 16px;
 }
 .debt-breakdown {
-  display: flex; flex-wrap: wrap; gap: 10px;
+  display: flex; flex-wrap: wrap; gap: 8px;
   font-size: 13px; color: var(--text-mute);
-  padding: 6px 0; margin-bottom: 6px;
+  padding: 8px 0; margin-bottom: 8px;
 }
 .debt-breakdown b { color: var(--text); }
 
@@ -2052,10 +1973,10 @@ body::before {
   border-radius: var(--radius-sm);
 }
 
-.sk-hero   { height: 132px; border-radius: var(--radius-lg); margin-bottom: 16px; }
+.sk-hero   { height: 132px; border-radius: var(--radius); margin-bottom: 16px; }
 .sk-grid   { display: grid; grid-template-columns: repeat(4,1fr); gap: 8px; margin-bottom: 16px; }
 .sk-action { height: 76px; border-radius: var(--radius); }
-.sk-label  { height: 11px; width: 100px; margin: 20px 14px 8px; }
+.sk-label  { height: 11px; width: 100px; margin: 24px 16px 8px; }
 .sk-card   { height: 64px; border-radius: var(--radius); margin-bottom: 8px; }
 
 /* ─── Empty state ────────────────────────────────────────────────── */
@@ -2068,13 +1989,16 @@ body::before {
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 52px 24px;
+  padding: 32px 24px;
   text-align: center;
   gap: 8px;
 }
 
-.empty-state-icon  { opacity: 0.45; margin-bottom: 4px; color: var(--text-mute); }
-.empty-state-title { font-size: 17px; font-weight: 600; color: var(--text); }
+/* Один компонент пустого состояния на все экраны (UI-бриф п.8): иконка
+   32px hint-цветом, заголовок 16px основным, подзаголовок 14px hint-цветом,
+   опционально кнопка. Разметку собирает emptyState() в helpers.js. */
+.empty-state-icon  { opacity: 0.6; margin-bottom: 4px; color: var(--text-mute); }
+.empty-state-title { font-size: 16px; font-weight: 600; color: var(--text); }
 .empty-state-hint  { font-size: 14px; color: var(--text-mute); max-width: 260px; line-height: 1.45; }
 .empty-state .btn-primary { margin-top: 8px; max-width: 220px; }
 
@@ -2084,7 +2008,7 @@ body::before {
 }
 .draft-actions .btn-edit-order { flex: 1; }
 .btn-delete-draft {
-  flex-shrink: 0; padding: 8px 14px;
+  flex-shrink: 0; padding: 8px 16px;
   background: transparent; border: 1px solid var(--danger);
   color: var(--danger); border-radius: var(--radius-sm);
   font-size: 13px; font-weight: 600; cursor: pointer;
@@ -2095,7 +2019,7 @@ body::before {
 .topbar-right {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
 .search-btn {
   background: var(--bg-soft);
@@ -2113,7 +2037,7 @@ body::before {
 .search-wrap { padding: 4px 0 12px; }
 .search-input {
   width: 100%;
-  padding: 12px 14px;
+  padding: 12px 16px;
   font-size: 16px;
   border: 1px solid var(--divider);
   border-radius: var(--radius-sm);
@@ -2122,16 +2046,16 @@ body::before {
   outline: none;
 }
 .search-input:focus { border-color: var(--accent); }
-.search-results { display: flex; flex-direction: column; gap: 4px; }
+.search-results { display: flex; flex-direction: column; gap: 8px; }
 .search-group-title {
   font-size: 13px;
   font-weight: 600;
   color: var(--text-mute);
-  margin: 12px 2px 4px;
+  margin: 12px 4px 4px;
 }
 .search-item {
   border-radius: var(--radius-sm);   /* мельче карточки: это строка выдачи */
-  padding: 10px var(--sp-3);
+  padding: 8px var(--sp-3);
   font-size: 14px;
   cursor: pointer;
 }
@@ -2140,7 +2064,7 @@ body::before {
   display: block;
   font-size: 12px;
   color: var(--text-mute);
-  margin-top: 2px;
+  margin-top: 4px;
 }
 .empty-hint {
   text-align: center;
@@ -2152,13 +2076,13 @@ body::before {
 .stock-price {
   font-size: 12px;
   color: var(--accent);
-  margin-top: 2px;
+  margin-top: 4px;
   font-weight: 500;
 }
 .stock-edit-hint {
   font-size: 13px;
   opacity: 0.5;
-  margin-left: 6px;
+  margin-left: 8px;
 }
 /* ─── Оверлей (UI-WP-10) ──────────────────────────────────────────────────
    Затемнение и центрирование были описаны прямо в .price-overlay, поэтому
@@ -2202,21 +2126,21 @@ body::before {
 .c-field,
 .price-field {
   display: block;
-  margin-bottom: 14px;
+  margin-bottom: 16px;
 }
 .c-field span,
 .price-field span {
   display: block;
   font-size: 13px;
   color: var(--text-mute);
-  margin-bottom: 5px;
+  margin-bottom: 4px;
 }
 .c-field input,
 .c-field textarea,
 .c-field select,
 .price-field input {
   width: 100%;
-  padding: 11px 13px;
+  padding: 12px 12px;
   font-size: 16px;
   border: 1px solid var(--divider);
   border-radius: var(--radius-sm);
@@ -2230,7 +2154,7 @@ body::before {
 .price-field input:focus { border-color: var(--accent); }
 .c-field-hint {
   display: block;
-  margin-top: 5px;
+  margin-top: 4px;
   font-size: var(--text-xs);
   color: var(--text-mute);
 }
@@ -2238,7 +2162,7 @@ body::before {
    при опечатке в одном поле остальные пришлось бы набирать заново. */
 .c-error {
   margin-bottom: var(--sp-3);
-  padding: var(--sp-2) 10px;
+  padding: var(--sp-2) 8px;
   border-radius: var(--radius-sm);
   background: var(--danger-bg);
   color: var(--danger);
@@ -2248,11 +2172,15 @@ body::before {
 .c-actions,
 .price-actions {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   margin-top: 8px;
 }
 .c-actions button,
 .price-actions button { flex: 1; }
+/* Кнопки столбиком (форма накладной: «Сохранить» над «Отмена»). */
+.c-actions--stack { flex-direction: column; }
+/* Второй уровень категорий — тот же ряд чипов, чуть отступает от первого. */
+.cat-row--sub { margin-top: 0; }
 /* Ряд действий в карточке: кнопки переносятся, а не сплющиваются до нечитаемой
    ширины — их бывает до пяти (моточасы, правка, статус, продажа, рассрочка). */
 .c-actions--wrap { flex-wrap: wrap; margin-bottom: var(--sp-3); }
@@ -2283,7 +2211,7 @@ body::before {
    подряд и не должен открывать диалог на каждую позицию. */
 .qty-input {
   flex-shrink: 0; width: 76px; min-height: 44px;
-  padding: 8px 10px; font-size: 16px; text-align: right;
+  padding: 8px 8px; font-size: 16px; text-align: right;
   border: 1px solid var(--divider); border-radius: var(--radius-sm);
   background: var(--bg-page); color: var(--text);
   outline: none; font-family: inherit;
@@ -2294,7 +2222,7 @@ body::before {
 /* Заметка контейнера в строке списка: третья строка мельче и приглушённее —
    она отвечает на «что внутри», но не спорит за внимание с номером. */
 .card-row-note {
-  margin-top: 2px;
+  margin-top: 4px;
   font-size: var(--text-xs);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
@@ -2324,10 +2252,10 @@ body::before {
   white-space: nowrap; font-variant-numeric: tabular-nums;
 }
 .aging-track {
-  height: 8px; border-radius: 4px; background: var(--bg-soft); overflow: hidden;
+  height: 8px; border-radius: var(--radius-sm); background: var(--bg-soft); overflow: hidden;
 }
 .aging-bar {
-  height: 100%; border-radius: 4px; background: var(--status-c);
+  height: 100%; border-radius: var(--radius-sm); background: var(--status-c);
   /* Нулевая корзина не рисует полоску вовсе: подтёкшая полоска в 1px читается
      как «немного есть». */
   min-width: 0;
@@ -2364,7 +2292,7 @@ body::before {
   /* Крестик визуально 26px, но зона нажатия дотянута до 44px прозрачным
      полем — иначе промах по нему на телефоне стоит попадания по снимку. */
   width: 44px; height: 44px;
-  padding: 9px;
+  padding: 8px;
   border: none;
   background: none;
   color: var(--danger);
@@ -2378,7 +2306,7 @@ body::before {
   background: var(--bg-card);
   border: 1px solid var(--divider);
   border-radius: 50%;
-  padding: 5px;
+  padding: 4px;
   box-shadow: var(--shadow-card);
 }
 .machine-photo {
@@ -2403,8 +2331,8 @@ body::before {
 .toast-host {
   position: fixed;
   left: 0; right: 0;
-  bottom: calc(96px + env(safe-area-inset-bottom));   /* фолбэк без max() */
-  bottom: calc(88px + var(--nav-gap));
+  bottom: calc(82px + env(safe-area-inset-bottom));   /* фолбэк без max() */
+  bottom: calc(var(--nav-h) + var(--sp-4) + var(--nav-gap));
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -2416,9 +2344,9 @@ body::before {
 .toast {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 8px;
   max-width: 92%;
-  padding: 11px 12px 11px 16px;
+  padding: 12px 12px 12px 16px;
   border-radius: var(--radius);
   background: var(--bg-card);
   color: var(--text);
@@ -2436,10 +2364,10 @@ body::before {
 .toast-close {
   flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
-  width: 28px; height: 28px;
-  margin: -4px -2px -4px 0;
+  width: 44px; height: 44px;
+  margin: -12px -12px -12px 0;
   background: none; border: none; cursor: pointer;
-  color: var(--text-mute); border-radius: 8px;
+  color: var(--text-mute); border-radius: var(--radius-sm);
 }
 .toast-close .ic { --ic-size: 16px; }
 .toast--success .toast-ic { color: var(--success); }

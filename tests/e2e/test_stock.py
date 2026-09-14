@@ -1,7 +1,7 @@
 """E2E, вторая волна: склад.
 
 Накладная руками, каталог и цена, контейнер от заведения до оприходования,
-техника от карточки до рассрочки, «Залежалось». Везде проверяем не экран, а
+техника от карточки до рассрочки, фильтр «Залежалось». Везде проверяем не экран, а
 последствия: остаток, накладную, график платежей.
 """
 
@@ -20,7 +20,7 @@ def _stock(e2e) -> float:
 def test_boss_posts_incoming_invoice_and_cancels_it(open_app, e2e):
     boss = open_app(e2e.ids["boss"])
     go(boss, "stock")
-    boss.click('[data-wh-go="whinvoices"]')
+    tab(boss, "invoices")
     boss.click("#wh-new")
     boss.wait_for_selector('[data-whtype="incoming"]')
     boss.click('[data-whtype="incoming"]')
@@ -49,19 +49,49 @@ def test_boss_posts_incoming_invoice_and_cancels_it(open_app, e2e):
 
 
 def test_incoming_invoice_form_rejects_zero_quantity(open_app, e2e):
+    # UI-бриф п.8а: невалидная форма держит «Сохранить» неактивной, а ошибка
+    # показывается под полем — не тостом после нажатия.
     boss = open_app(e2e.ids["boss"])
     go(boss, "stock")
-    boss.click('[data-wh-go="whinvoices"]')
+    tab(boss, "invoices")
     boss.click("#wh-new")
     boss.wait_for_selector('[data-whtype="incoming"]')
     boss.click('[data-whtype="incoming"]')
     boss.wait_for_selector('[data-whtype="incoming"].active')
+    assert boss.locator("#wh-save").is_disabled(), "без позиций сохранять нечего"
     boss.click("#wh-add")
+    boss.wait_for_selector('.wh-pos [data-f="quantity"]')
+    assert boss.locator("#wh-save").is_enabled(), "приход с одной позицией ×1 — валиден"
     boss.fill('.wh-pos [data-f="quantity"]', "0")
-    boss.click("#wh-save")
-    boss.wait_for_selector(".toast:has-text('больше нуля')")
+    boss.locator('.wh-pos [data-f="quantity"]').dispatch_event("change")
+    boss.wait_for_selector(".wh-pos-warn:has-text('больше нуля')")
+    assert boss.locator("#wh-save").is_disabled()
     assert _stock(e2e) == 20
     assert boss.locator("#wh-save").count() == 1, "форма осталась, черновик не потерян"
+
+
+def test_outgoing_invoice_requires_counterparty_and_price(open_app, e2e):
+    # Расход: без контрагента и без цены кнопка неактивна; с ними — активна.
+    boss = open_app(e2e.ids["boss"])
+    go(boss, "stock")
+    tab(boss, "invoices")
+    boss.click("#wh-new")
+    boss.wait_for_selector('[data-whtype="outgoing"]')
+    boss.click('[data-whtype="outgoing"]')
+    boss.wait_for_selector('[data-whtype="outgoing"].active')
+    boss.click("#wh-add")
+    boss.wait_for_selector('.wh-pos [data-f="price"]')
+    assert boss.locator("#wh-save").is_disabled(), "нет контрагента и цены"
+    boss.select_option("#wh-cp", index=1)
+    assert boss.locator("#wh-save").is_disabled(), "цена по-прежнему не задана"
+    boss.fill('.wh-pos [data-f="price"]', "0")
+    boss.locator('.wh-pos [data-f="price"]').dispatch_event("change")
+    boss.wait_for_selector(".wh-pos-warn:has-text('укажите цену')")
+    boss.fill('.wh-pos [data-f="price"]', "15")
+    boss.locator('.wh-pos [data-f="price"]').dispatch_event("change")
+    boss.wait_for_function("() => !document.querySelector('#wh-save').disabled")
+    # Итог — карточкой с валютой.
+    assert "USD" in boss.locator(".wh-total").inner_text()
 
 
 # ─── Каталог: поиск и цена ───────────────────────────────────────────────────
@@ -193,7 +223,8 @@ def test_container_list_shows_mismatch_summary(open_app, e2e):
     # Сводка расхождений — в самой строке списка, чтобы не открывать каждый
     # контейнер по очереди. Проверялось «3» (недостача) — и совпадало с цифрой
     # в дате: тест был зелёным ровно до 14-го числа.
-    assert "расхождений: 1" in row.inner_text()
+    text = row.inner_text()
+    assert "расхождений: 1" in text and "1 позиция" in text
 
 
 # ─── Техника: карточка → моточасы → рассрочка → платёж ───────────────────────
@@ -296,15 +327,23 @@ def test_manager_sees_machine_without_cost_and_passport(open_app, e2e):
 # ─── «Залежалось» — только руководству, с остатком на экране ─────────────────
 
 
-def test_stale_tab_is_internal_and_shows_stock(open_app, e2e):
+def test_stale_filter_is_internal_and_shows_stock(open_app, e2e):
+    # «Залежалось» — фильтр каталога (UI-бриф п.4), а не вкладка; ручка
+    # отвечает только руководству, поэтому у менеджера чипа нет.
     boss = open_app(e2e.ids["boss"])
     go(boss, "stock")
-    assert boss.locator('.seg-item[data-sect="stale"]').count() == 1
-    tab(boss, "stale")
+    boss.wait_for_selector("[data-stale]")
+    assert boss.locator('.seg-item[data-sect="stale"]').count() == 0
+    boss.click("[data-stale]")
+    boss.wait_for_selector("[data-stale].active")
     settled(boss)
     text = boss.locator("#content").inner_text()
     assert "Ошибка" not in text and "Нет доступа" not in text
+    # Заголовок секции рендерится капсом (CSS), inner_text отдаёт как на экране.
+    assert "без продаж больше" in text.lower() or "всё продаётся" in text.lower()
 
     mgr = open_app(e2e.ids["mgr"])
     go(mgr, "stock")
+    mgr.wait_for_selector("#stock-filters")
+    assert mgr.locator("[data-stale]").count() == 0
     assert mgr.locator('.seg-item[data-sect="stale"]').count() == 0

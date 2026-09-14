@@ -153,6 +153,163 @@ describe('токены шкал (UI-WP-03)', () => {
   });
 });
 
+// ─── UI-бриф п.1: единые правила для всего ─────────────────────────────────
+// Правила проверяются по ФАЙЛУ, а не по списку известных классов: новая
+// строка CSS с «padding: 10px» или «border-radius: 14px» валит CI сама.
+describe('дизайн-система: шкала отступов', () => {
+  const code = css.replace(/\/\*[\s\S]*?\*\//g, '');
+  const SCALE = new Set([0, 4, 8, 12, 16, 24, 32]);
+
+  it('шкала объявлена токенами 4 / 8 / 12 / 16 / 24 / 32', () => {
+    const tokens = [...code.matchAll(/--sp-(\d):\s*(\d+)px/g)].map((m) => Number(m[2]));
+    expect(tokens).toEqual([4, 8, 12, 16, 24, 32]);
+  });
+
+  it('padding / margin / gap — только из шкалы', () => {
+    const bad = [];
+    const re = /(?:^|[\s;{])((?:padding|margin|gap|row-gap|column-gap)(?:-(?:top|right|bottom|left|block|inline))?):([^;{}]*);/g;
+    for (const m of code.matchAll(re)) {
+      const value = m[2];
+      if (value.includes('calc(')) continue;   // формулы с токенами/env() — свои
+      for (const px of value.matchAll(/(-?)(\d+(?:\.\d+)?)px/g)) {
+        const n = Number(px[2]);
+        if (!SCALE.has(n)) bad.push(`${m[1]}: ${value.trim()}`);
+      }
+    }
+    expect(bad).toEqual([]);
+  });
+});
+
+describe('дизайн-система: скругления', () => {
+  const code = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  it('два значения: 8px (поля, кнопки, чипы) и 12px (карточки, панели)', () => {
+    expect(code).toMatch(/--radius-sm:\s*8px/);
+    expect(code).toMatch(/--radius:\s*12px/);
+    // Старые промежуточные токены (10 / 16 / 20 / pill) удалены.
+    for (const t of ['--radius-lg', '--radius-chip', '--radius-pill']) {
+      expect(code.includes(t), `лишний токен ${t}`).toBe(false);
+    }
+  });
+
+  it('литеральных радиусов нет — только токены, 50% для кругов и 0', () => {
+    const bad = [];
+    for (const m of code.matchAll(/border-radius:\s*([^;]+);/g)) {
+      const parts = m[1].trim().split(/\s+/);
+      for (const part of parts) {
+        const ok = part === '0' || part === '50%' || /^var\(--radius(-sm)?\)$/.test(part);
+        if (!ok) bad.push(m[1].trim());
+      }
+    }
+    expect(bad).toEqual([]);
+  });
+
+  it('поля и кнопки — 8px, карточки и панели — 12px', () => {
+    const radiusOf = (sel) => {
+      const at = code.indexOf(sel);
+      expect(at, `правило ${sel} пропало`).toBeGreaterThan(-1);
+      const body = code.slice(at, code.indexOf('}', at));
+      const m = body.match(/border-radius:\s*([^;]+);/);
+      return m ? m[1].trim() : null;
+    };
+    // Селектор ищется с начала строки: `.c-row > .form-input {` и
+    // `.error-card .btn-primary {` стоят в файле раньше самих правил.
+    for (const sel of ['.form-input', '.btn-primary', '.btn-secondary', '.cat-btn', '.seg-item',
+      '.stock-badge', '.search-input']) {
+      expect(radiusOf(`\n${sel} {`), sel).toBe('var(--radius-sm)');
+    }
+    for (const sel of ['.hero {', '.bottom-nav {', '.seg {', '.c-sheet,', '.toast {', '.wh-total {']) {
+      expect(radiusOf(`\n${sel}`), sel).toBe('var(--radius)');
+    }
+    // Общая поверхность (.c-surface и алиасы) — карточка.
+    const surface = code.slice(code.indexOf('.c-surface,'), code.indexOf('}', code.indexOf('.c-surface,')));
+    expect(surface).toMatch(/border-radius:\s*var\(--radius\)/);
+  });
+});
+
+describe('дизайн-система: цвета', () => {
+  const code = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  it('hex-цвета живут только в блоках токенов (:root и тёмные варианты)', () => {
+    // Захардкоженный цвет вне токенов не переключится вместе с темой Telegram.
+    // Разрешены: :root, [data-theme="dark"], @media (prefers-color-scheme).
+    const blocks = [];
+    for (const m of code.matchAll(/(:root|\[data-theme="dark"\]|:root:not\(\[data-theme="light"\]\))\s*\{[^}]*\}/g)) {
+      blocks.push([m.index, m.index + m[0].length]);
+    }
+    const bad = [];
+    for (const m of code.matchAll(/#[0-9a-fA-F]{3,8}\b/g)) {
+      const inside = blocks.some(([a, b]) => m.index >= a && m.index < b);
+      // color-mix с #000 в hero — затемнение АКЦЕНТА темы, а не свой цвет.
+      const line = code.slice(code.lastIndexOf('\n', m.index) + 1, code.indexOf('\n', m.index));
+      if (!inside && !/color-mix\(/.test(line)) bad.push(line.trim());
+    }
+    expect(bad).toEqual([]);
+  });
+
+  it('базовые цвета — из темы Telegram, с фолбэком', () => {
+    for (const [token, tg] of [
+      ['--bg-page', '--tg-theme-secondary-bg-color'],
+      ['--bg-card', '--tg-theme-bg-color'],
+      ['--text', '--tg-theme-text-color'],
+      ['--text-mute', '--tg-theme-hint-color'],
+      ['--accent', '--tg-theme-button-color'],
+      ['--accent-fg', '--tg-theme-button-text-color'],
+    ]) {
+      const decl = code.match(new RegExp(`${token}:\\s*([^;]+);`));
+      expect(decl, `нет токена ${token}`).not.toBeNull();
+      expect(decl[1]).toContain(`var(${tg}`);
+    }
+  });
+
+  it('жёлтая плашка заявок ушла — цвет предупреждения только для семантики', () => {
+    expect(code).not.toMatch(/\.requests-btn/);
+  });
+});
+
+describe('дизайн-система: заголовки секций и тап-цели', () => {
+  const code = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  it('.section-label — капс, 12px, hint-цвет, letter-spacing 0.5px, снизу 8px', () => {
+    const at = code.indexOf('.section-label {');
+    const body = code.slice(at, code.indexOf('}', at));
+    expect(body).toMatch(/text-transform:\s*uppercase/);
+    expect(body).toMatch(/font-size:\s*var\(--text-sm\)/);
+    expect(code).toMatch(/--text-sm:\s*12px/);
+    expect(body).toMatch(/color:\s*var\(--text-mute\)/);
+    expect(body).toMatch(/letter-spacing:\s*0\.5px/);
+    expect(body).toMatch(/margin:\s*var\(--sp-5\) 0 var\(--sp-2\)/);
+  });
+
+  it('всё кликабельное — не ниже 44px: общее правило на button и [role=button]', () => {
+    expect(code).toMatch(/button,\s*\[role="button"\]\s*\{\s*min-height:\s*44px/);
+  });
+
+  it('ни одно правило не занижает тап-цель ниже 44px', () => {
+    // min-height у кликабельного класса меньше 44 перекрыл бы общее правило.
+    const bad = [];
+    for (const m of code.matchAll(/([^{}]+)\{([^}]*)\}/g)) {
+      const sel = m[1].trim();
+      if (!/\.(btn|cat-btn|seg-item|subseg-item|nav-item|c-row--tap|card-row|search-item|toast-close|cal-nav|cal-day|editor-header button|pay-toggle|photo-del)/.test(sel)) continue;
+      for (const mh of m[2].matchAll(/min-height:\s*(\d+)px/g)) {
+        if (Number(mh[1]) < 44) bad.push(`${sel}: ${mh[0]}`);
+      }
+    }
+    expect(bad).toEqual([]);
+  });
+
+  it('скруглённые элементы в списках не стоят вплотную: зазор 8px', () => {
+    for (const sel of ['.stock-list,', '.editor-items {', '.debts-list {', '.stat-grid {', '.cat-row {', '.search-results {']) {
+      const at = code.indexOf(sel);
+      expect(at, `правило ${sel} пропало`).toBeGreaterThan(-1);
+      const body = code.slice(at, code.indexOf('}', at));
+      expect(body, sel).toMatch(/gap:\s*8px/);
+    }
+    const grid = code.slice(code.indexOf('.stat-grid {'), code.indexOf('}', code.indexOf('.stat-grid {')));
+    expect(grid).toMatch(/grid-template-columns:\s*1fr 1fr/);
+  });
+});
+
 describe('стекло (S7)', () => {
   const withoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
@@ -193,18 +350,9 @@ describe('стекло (S7)', () => {
     const darkBlock = withoutComments.slice(
       darkStart, withoutComments.indexOf('}', darkStart) + 1,
     );
-    for (const token of ['--glass-bg', '--glass-edge', '--glass-spec', '--field-dot']) {
+    for (const token of ['--glass-bg', '--glass-edge', '--glass-spec']) {
       expect(darkBlock.includes(`${token}:`), `нет тёмного варианта: ${token}`).toBe(true);
     }
-  });
-
-  it('поле под стеклом производно от темы, а не второй набор цветов', () => {
-    // Иначе подложка спорит с темой пользователя: у него зелёный акцент, а
-    // страница синеет. Вывод из темы живёт внутри @supports (color-mix), а
-    // первое объявление — фолбэк для WebView без него.
-    const declarations = [...withoutComments.matchAll(/--field-1:\s*([^;]+);/g)].map(m => m[1]);
-    expect(declarations.length).toBeGreaterThan(1);
-    expect(declarations.some(v => /var\(--accent\)/.test(v))).toBe(true);
   });
 
   it('у color-mix есть фолбэк — иначе фон отваливается целиком', () => {
@@ -246,12 +394,14 @@ describe('фон не мешает sticky-шапке', () => {
     expect(code).not.toMatch(/background-attachment:\s*fixed/);
   });
 
-  it('поле лежит за контентом и не ловит нажатия', () => {
-    const rule = css.match(/body::before\s*\{([^}]*)\}/);
-    expect(rule, 'поле под стеклом пропало').not.toBeNull();
-    expect(rule[1]).toMatch(/position:\s*fixed/);
-    expect(rule[1]).toMatch(/z-index:\s*-1/);
-    expect(rule[1]).toMatch(/pointer-events:\s*none/);
+  it('фона-текстуры нет: страница — ровный цвет темы (UI-бриф п.1)', () => {
+    // Точечная сетка рисовалась псевдоэлементом body::before; на площадке она
+    // читалась шумом. Сторож — чтобы украшение не вернулось под другим именем.
+    const code = css.replace(/\/\*[\s\S]*?\*\//g, '');
+    expect(code).not.toMatch(/body::before/);
+    expect(code).not.toMatch(/radial-gradient\(circle at 1px 1px/);
+    const body = code.match(/\nbody\s*\{([^}]*)\}/)[1];
+    expect(body).toMatch(/background:\s*var\(--bg-page\)/);
   });
 });
 
@@ -276,11 +426,19 @@ describe('плавающие элементы у нижнего края', () =>
     }
   });
 
-  it('запас под панель считается тем же токеном, что и её отступ', () => {
-    // Иначе контент прячется под меню или под ним остаётся дыра.
+  it('запас под панель = высота панели + 16px + safe-area (UI-бриф п.1)', () => {
+    // Иначе контент прячется под меню или под ним остаётся дыра: последняя
+    // строка фильтров каталога и график по дням прятались за панелью.
     const at = code.indexOf('.app {');
     const body = code.slice(at, code.indexOf('}', at));
     expect(body).toMatch(/padding-bottom:[^;]*var\(--nav-gap\)/);
+    expect(body).toMatch(/padding-bottom:\s*calc\(var\(--nav-h\) \+ var\(--sp-4\) \+ var\(--nav-gap\)\)/);
+    expect(code).toMatch(/--nav-h:\s*66px/);
+    // Высота панели — из её же правил: padding 8+8, кнопка 48, рамка 1+1.
+    const nav = code.slice(code.indexOf('.bottom-nav {'), code.indexOf('}', code.indexOf('.bottom-nav {')));
+    expect(nav).toMatch(/padding:\s*8px/);
+    const item = code.slice(code.indexOf('.nav-item {'), code.indexOf('}', code.indexOf('.nav-item {')));
+    expect(item).toMatch(/min-height:\s*48px/);
   });
 });
 

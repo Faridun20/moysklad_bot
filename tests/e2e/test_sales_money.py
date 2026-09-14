@@ -464,7 +464,7 @@ def test_boss_prints_invoice_from_list(open_app, e2e, monkeypatch):
 
     boss = open_app(e2e.ids["boss"])
     go(boss, "stock")
-    boss.click('[data-wh-go="whinvoices"]')
+    tab(boss, "invoices")
     boss.wait_for_selector("[data-wh-print]")  # сид-приход на 20 шт.
     boss.click("[data-wh-print]")
     boss.wait_for_selector(".toast:has-text('задание 12')")
@@ -477,6 +477,6 @@ def test_invoice_list_has_no_print_button_without_cups(open_app, e2e, monkeypatc
     monkeypatch.setattr(printing, "is_available", lambda: False)
     boss = open_app(e2e.ids["boss"])
     go(boss, "stock")
-    boss.click('[data-wh-go="whinvoices"]')
+    tab(boss, "invoices")
     boss.wait_for_selector("[data-wh-cancel]")
     assert boss.locator("[data-wh-print]").count() == 0

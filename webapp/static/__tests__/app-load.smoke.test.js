@@ -513,7 +513,7 @@ describe('карточка клиента: состав отгрузки', () =>
     expect(html).toContain('items-box');
     expect((html.match(/items-row/g) || []).length).toBe(2);
     expect(html).toContain('items-sum');
-    expect(html).toContain('Итого · 2 поз.');
+    expect(html).toContain('Итого · 2 позиции');
   });
 
   it('под единственной позицией итог не печатается — он её повторяет', () => {
@@ -1180,16 +1180,19 @@ describe('пять разделов вместо четырёх', () => {
     expect((await window.__go('limits'))[4]).toBe('limits');
   });
 
-  it('подсветка таба переживает вложенный экран', async () => {
+  it('старый адрес «Накладные» ведёт во вкладку «Склада», таб подсвечен', async () => {
+    // Накладные стали вкладкой раздела (UI-бриф п.4); ссылки из бота и пушей
+    // на прежний экран `whinvoices` продолжают работать через алиас.
     const window = boot(`
       currentUser = { role: 'boss' };
       buildNav();
-      renderOpsSummary = async () => {};
-      window.__ready = showScreen('ops');
+      api = async () => ({ invoices: [] });
+      window.__ready = showScreen('whinvoices');
     `);
     await window.__ready;
     const active = window.document.querySelector('#bottom-nav .nav-item.active');
-    expect(active.dataset.screen).toBe('today');
+    expect(active.dataset.screen).toBe('stock');
+    expect(window.document.querySelector('.seg-item[data-sect="invoices"].active')).not.toBeNull();
   });
 
   it('воронка обращений живёт в «Клиентах», а не в отчёте о деньгах', async () => {
@@ -1697,7 +1700,7 @@ describe('снятие фото', () => {
   });
 });
 
-describe('«Залежалось»', () => {
+describe('«Залежалось» — фильтр каталога (UI-бриф п.4)', () => {
   const STALE = {
     ok: true,
     days: 60,
@@ -1706,41 +1709,53 @@ describe('«Залежалось»', () => {
       { name: 'Штекер тип C', stock: 90, unit: 'шт' },
     ],
   };
+  const STOCK = { categories: [], products: [
+    { product_id: 1, name: 'Кабель PV 0.6', unit: 'м', stock: 480, available: 480, folder_id: '' },
+    { product_id: 2, name: 'Штекер тип C', unit: 'шт', stock: 90, available: 90, folder_id: '' },
+    { product_id: 3, name: 'Болт М8', unit: 'шт', stock: 12, available: 12, folder_id: '' },
+  ]};
 
-  it('вкладка есть у руководства и нет у менеджера', () => {
+  it('вкладки больше нет: у руководства это чип в фильтрах, у менеджера его нет', () => {
     // Ручка отвечает только admin/boss — у менеджера это была бы дверь,
     // которая гарантированно вернёт отказ.
-    expect(boot("currentUser = { role: 'boss' };").stockShellHtml())
-      .toContain('data-sect="stale"');
-    expect(boot("currentUser = { role: 'manager' };").stockShellHtml())
-      .not.toContain('data-sect="stale"');
+    expect(boot("currentUser = { role: 'boss' };").stockShellHtml()).not.toContain('data-sect="stale"');
+    const boss = boot(`currentUser = { role: 'boss' }; stockData = ${JSON.stringify(STOCK)}; renderStockContent();`);
+    expect(boss.document.querySelector('[data-stale]')).not.toBeNull();
+    const mgr = boot(`currentUser = { role: 'manager' }; stockData = ${JSON.stringify(STOCK)}; renderStockContent();`);
+    expect(mgr.document.querySelector('[data-stale]')).toBeNull();
   });
 
+  const bootStale = (extra = '') => boot(`
+    currentUser = { role: 'boss' };
+    window.__composer = null;
+    window.__alerts = [];
+    tg.showAlert = (m) => { window.__alerts.push(m); };
+    api = async () => (${JSON.stringify(STALE)});
+    openChannelComposer = (kind, params) => { window.__composer = [kind, params]; };
+    stockData = ${JSON.stringify(STOCK)};
+    ${extra}
+    renderStockContent();
+    window.__ready = (async () => {
+      document.querySelector('[data-stale]').click();
+      await new Promise(r => setTimeout(r, 0));
+    })();
+  `);
+
   it('остаток на экране виден — по нему и решают, что выносить', async () => {
-    const window = boot(`
-      currentUser = { role: 'boss' };
-      api = async () => (${JSON.stringify(STALE)});
-      stockTab = 'stale';
-      window.__ready = renderStockScreen();
-    `);
+    const window = await bootStale();
     await window.__ready;
     const content = window.document.getElementById('content');
     expect(content.textContent).toContain('Кабель PV 0.6');
     expect(content.textContent).toContain('480');
     expect(content.textContent).toContain('Без продаж больше 60 дней');
+    // Не залежавшийся товар из списка ушёл.
+    expect(content.textContent).not.toContain('Болт М8');
     // Шелл раздела на месте (UI-BUG-04).
     expect(content.querySelector('[data-sect="catalog"]')).not.toBeNull();
   });
 
   it('в пост уходят только отмеченные и только названия', async () => {
-    const window = boot(`
-      currentUser = { role: 'boss' };
-      window.__composer = null;
-      api = async () => (${JSON.stringify(STALE)});
-      openChannelComposer = (kind, params) => { window.__composer = [kind, params]; };
-      stockTab = 'stale';
-      window.__ready = renderStockScreen();
-    `);
+    const window = await bootStale();
     await window.__ready;
     const doc = window.document;
     doc.querySelector('.stale-check[value="Кабель PV 0.6"]').click();
@@ -1753,16 +1768,7 @@ describe('«Залежалось»', () => {
   });
 
   it('без отметок пост не собирается', async () => {
-    const window = boot(`
-      currentUser = { role: 'boss' };
-      window.__composer = null;
-      window.__alerts = [];
-      tg.showAlert = (m) => { window.__alerts.push(m); };
-      api = async () => (${JSON.stringify(STALE)});
-      openChannelComposer = (kind, params) => { window.__composer = [kind, params]; };
-      stockTab = 'stale';
-      window.__ready = renderStockScreen();
-    `);
+    const window = await bootStale();
     await window.__ready;
     window.document.querySelector('#stale-post').click();
     expect(window.__composer).toBeNull();
@@ -1773,26 +1779,82 @@ describe('«Залежалось»', () => {
     const window = boot(`
       currentUser = { role: 'boss' };
       api = async () => ({ ok: true, days: 60, items: [] });
-      stockTab = 'stale';
-      window.__ready = renderStockScreen();
+      stockData = ${JSON.stringify(STOCK)};
+      renderStockContent();
+      window.__ready = (async () => {
+        document.querySelector('[data-stale]').click();
+        await new Promise(r => setTimeout(r, 0));
+      })();
     `);
     await window.__ready;
     const content = window.document.getElementById('content');
     expect(content.textContent).toContain('Всё продаётся');
-    expect(content.querySelector('[data-sect="stale"]')).not.toBeNull();
+    expect(content.querySelector('#stale-post')).toBeNull();
   });
 
-  it('вкладки остаются, когда МойСклад не ответил', async () => {
+  it('отказ ручки не ломает каталог: фильтр откатывается, список на месте', async () => {
     const window = boot(`
       currentUser = { role: 'boss' };
-      api = async () => { throw new Error('МойСклад не ответил'); };
-      stockTab = 'stale';
-      window.__ready = renderStockScreen();
+      window.__toasts = [];
+      toast = (m) => window.__toasts.push(String(m));
+      api = async () => { throw new Error('сервер не ответил'); };
+      stockData = ${JSON.stringify(STOCK)};
+      renderStockContent();
+      window.__ready = (async () => {
+        document.querySelector('[data-stale]').click();
+        await new Promise(r => setTimeout(r, 0));
+      })();
     `);
     await window.__ready;
     const content = window.document.getElementById('content');
-    expect(content.textContent).toContain('МойСклад не ответил');
+    expect(window.__toasts.join(' ')).toContain('сервер не ответил');
+    expect(content.textContent).toContain('Болт М8');
     expect(content.querySelector('[data-sect="catalog"]')).not.toBeNull();
+  });
+});
+
+describe('каталог: категории в два уровня (UI-бриф п.4)', () => {
+  const STOCK = {
+    categories: [
+      { id: 'Запчасти Экскаватор/Адаптер', name: 'Запчасти Экскаватор/Адаптер' },
+      { id: 'Запчасти Экскаватор/Ковш', name: 'Запчасти Экскаватор/Ковш' },
+      { id: 'Масло', name: 'Масло' },
+    ],
+    products: [
+      { product_id: 1, name: 'Адаптер 20', unit: 'шт', stock: 5, available: 5, folder_id: 'Запчасти Экскаватор/Адаптер' },
+      { product_id: 2, name: 'Ковш 0.8', unit: 'шт', stock: 2, available: 2, folder_id: 'Запчасти Экскаватор/Ковш' },
+      { product_id: 3, name: 'Масло 10W', unit: 'л', stock: 40, available: 40, folder_id: 'Масло' },
+    ],
+  };
+
+  it('первый ряд — корни без счётчиков, счётчик только у «Все»', () => {
+    const window = boot(`currentUser = { role: 'manager' }; stockData = ${JSON.stringify(STOCK)}; renderStockContent();`);
+    const chips = [...window.document.querySelectorAll('[data-cat]')].map(b => b.textContent.trim());
+    expect(chips).toEqual(['Все (3)', 'Запчасти Экскаватор', 'Масло']);
+    expect(window.document.querySelector('#stock-subcats')).toBeNull();
+  });
+
+  it('выбор корня открывает второй ряд и фильтрует; подкатегория — точное совпадение', () => {
+    const window = boot(`currentUser = { role: 'manager' }; stockData = ${JSON.stringify(STOCK)}; renderStockContent();`);
+    const doc = window.document;
+    doc.querySelector('[data-cat="Запчасти Экскаватор"]').click();
+    const subs = [...doc.querySelectorAll('[data-subcat]')].map(b => b.textContent.trim());
+    expect(subs).toEqual(['Все', 'Адаптер', 'Ковш']);
+    let text = doc.getElementById('stock-list').textContent;
+    expect(text).toContain('Адаптер 20');
+    expect(text).toContain('Ковш 0.8');
+    expect(text).not.toContain('Масло 10W');
+    doc.querySelector('[data-subcat="Запчасти Экскаватор/Ковш"]').click();
+    text = doc.getElementById('stock-list').textContent;
+    expect(text).toContain('Ковш 0.8');
+    expect(text).not.toContain('Адаптер 20');
+  });
+
+  it('фильтры наличия стоят рядом с поиском, а не под списком', () => {
+    const window = boot(`currentUser = { role: 'manager' }; stockData = ${JSON.stringify(STOCK)}; renderStockContent();`);
+    const content = window.document.getElementById('content');
+    const order = [...content.querySelectorAll('#stock-search, #stock-filters, #stock-list')].map(e => e.id);
+    expect(order).toEqual(['stock-search', 'stock-filters', 'stock-list']);
   });
 });
 
@@ -1857,35 +1919,32 @@ describe('правка контейнера', () => {
 });
 
 describe('склад: остатки в «Каталоге» и накладные', () => {
-  // Накладные живут не вкладкой, а дочерним экраном раздела «Склад»: у босса
-  // раздел уже занимает все четыре слота (инвариант «не больше 4 вкладок»).
-  // Регресс, который тут стережётся: после переезда на разделы main экран
-  // остался в коде, но кнопки, ведущей к нему, не было — он был недостижим.
+  // Накладные — четвёртая вкладка раздела «Склад» (UI-бриф п.4). Раньше это
+  // был дочерний экран с кнопкой между табами и поиском.
 
-  it('на дочернем экране подсвечен таб «Склад», а не пустота', async () => {
-    // Проверяем наблюдаемое: экран не имеет своей кнопки в наве, и без
-    // NAV_PARENT ни один таб не был бы активен — пользователь терял бы
-    // ориентир, где находится.
+  it('список накладных рисуется с шеллом раздела (UI-BUG-04)', async () => {
     const window = boot(`
       currentUser = { role: 'boss' };
       buildNav();
       api = async () => ({ invoices: [] });
-      window.__ready = showScreen('whinvoices');
+      stockTab = 'invoices';
+      window.__ready = renderStockScreen();
     `);
     await window.__ready;
-    const active = window.document.querySelector('.nav-item.active');
-    expect(active).not.toBeNull();
-    expect(active.dataset.screen).toBe('stock');
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('.seg-item[data-sect="invoices"].active')).not.toBeNull();
+    expect(content.querySelector('#wh-new')).not.toBeNull();
   });
 
-  it('на вкладке «Каталог» есть вход в накладные', () => {
+  it('«Накладные» — вкладка раздела «Склад», кнопки между табами и поиском нет', () => {
     const window = boot(`
       currentUser = { role: 'boss' };
       stockData = { products: [], categories: [] };
       renderStockContent();
     `);
     const content = window.document.getElementById('content');
-    expect(content.querySelector('[data-wh-go="whinvoices"]')).not.toBeNull();
+    expect(content.querySelector('[data-wh-go]')).toBeNull();
+    expect(content.querySelector('.seg-item[data-sect="invoices"]')).not.toBeNull();
   });
 
   it('«Каталог» показывает доступный остаток и резерв', () => {
@@ -1961,8 +2020,10 @@ describe('склад: отказ сервера доходит до менедж
     window.__toasts = [];
     toast = (m) => window.__toasts.push(String(m));
     api = async (p) => {
+      // Остатка на клиенте хватает (форма валидна, кнопка активна) — отказ
+      // 409 моделирует гонку: кто-то списал товар, пока форму заполняли.
       if (p === '/api/wh/stock') return { products: [
-        { product_id: 1, name: 'Болт М8', sku: 'B8', unit: 'шт', quantity: 3 } ]};
+        { product_id: 1, name: 'Болт М8', sku: 'B8', unit: 'шт', quantity: 100 } ]};
       if (p === '/api/wh/counterparties') return { counterparties: [
         { id: 1, name: 'ООО Ромашка', telegram_id: 555 } ]};
       return {};
@@ -1975,6 +2036,7 @@ describe('склад: отказ сервера доходит до менедж
       whDraft = { type: 'outgoing', counterparty_id: '1', comment: '',
                   items: [{ product_id: 1, quantity: 99, price_cents: 100 }] };
       await renderWhInvoiceNew();
+      if (document.getElementById('wh-save').disabled) throw new Error('форма валидна, кнопка должна быть активна');
       document.getElementById('wh-save').click();
       await new Promise(r => setTimeout(r, 0));
     })();

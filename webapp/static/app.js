@@ -194,7 +194,9 @@ function renderHeader() {
   const greeting = document.getElementById('greeting');
   const badge = document.getElementById('role-badge');
   const name = currentUser.first_name || '';
-  _greetingText = name ? `Привет, ${name}!` : 'Добро пожаловать!';
+  // Одно приветствие на экран (UI-бриф п.3): раньше «Привет, …!» в шапке
+  // дублировался заголовком «Добрый вечер, …» под ней.
+  _greetingText = name ? `${greetWord()}, ${name}` : greetWord();
   greeting.textContent = _greetingText;
   badge.textContent = ROLE_NAMES[currentUser.role] || currentUser.role;
 }
@@ -234,12 +236,14 @@ const LEGACY_SCREENS = {
   cashbox: 'money:ops',
   limits: 'clients:limits',
   leads: 'clients:funnel',
+  // «Накладные» стали вкладкой «Склада» (UI-бриф п.4); старый адрес экрана
+  // ведёт туда же.
+  whinvoices: 'stock:invoices',
 };
 
 const SCREEN_TITLES = {
   today: null, sales: 'Продажи', stock: 'Склад', money: 'Деньги',
-  clients: 'Клиенты', ops: 'Требует внимания',
-  whinvoices: 'Накладные',
+  clients: 'Клиенты',
 };
 
 // Нижняя панель строится из таблицы разделов: набор кнопок зависит от роли.
@@ -259,15 +263,7 @@ function buildNav() {
   });
 }
 
-// Экраны, у которых нет своей кнопки, всё равно принадлежат разделу — иначе
-// при заходе в них ни один таб не подсвечивался.
-// «Накладные» живут отдельным экраном, а не пятой вкладкой: у босса раздел
-// «Склад» уже занимает все четыре слота, а пятая уезжает в невидимый скролл на
-// 360dp (инвариант под тестом в helpers.test.js). Вход — кнопкой из «Каталога».
-// Отдельного экрана «Остатки» больше нет: «Каталог» и ЕСТЬ остатки нашего
-// склада — после ухода МойСклад это один и тот же список, и держать два было
-// бы просто двумя дорогами к одной таблице.
-const NAV_PARENT = { ops: 'today', whinvoices: 'stock' };
+
 
 async function showScreen(screen) {
   // Алиас может нести и вкладку: 'sales:report' — раздел «Продажи», вкладка
@@ -297,9 +293,8 @@ async function showScreen(screen) {
   // редактор заказа, пока есть несохранённый черновик).
   tg.disableClosingConfirmation && tg.disableClosingConfirmation();
 
-  const navScreen = NAV_PARENT[screen] || screen;
   document.querySelectorAll('.nav-item').forEach(btn => {
-    const isActive = btn.dataset.screen === navScreen;
+    const isActive = btn.dataset.screen === screen;
     btn.classList.toggle('active', isActive);
     // aria-current — активный таб для скринридера (визуально это только цвет).
     if (isActive) btn.setAttribute('aria-current', 'page');
@@ -334,12 +329,6 @@ async function showScreen(screen) {
       case 'clients':
         await renderClientsScreen();
         break;
-      case 'ops':
-        await renderOpsSummary();
-        break;
-      case 'whinvoices':
-        await renderWhInvoicesTab();
-        break;
       default:
         content.innerHTML = `<div class="error">Неизвестный экран: ${escapeHtml(screen)}</div>`;
     }
@@ -356,7 +345,7 @@ async function showScreen(screen) {
 // первый же ре-рендер внутри вкладки уносит переключатель вместе с
 // обработчиками (UI-BUG-04).
 let salesTab = 'orders';     // orders | report
-let stockTab = 'catalog';    // catalog | containers | machines
+let stockTab = 'catalog';    // catalog | containers | machines | invoices
 let moneyTab = 'confirm';    // confirm | debts | ops | report
 let clientsTab = 'funnel';   // funnel | limits | channel
 
@@ -442,11 +431,12 @@ async function renderStockScreen() {
   stockTab = sectionShell('stock', stockTab).active;
   if (stockTab === 'machines') await renderMachines();
   else if (stockTab === 'containers') await renderContainers();
-  else if (stockTab === 'stale') await renderStale();
-
+  else if (stockTab === 'invoices') await renderWhInvoicesTab();
   else {
-    // Фильтр категории не тащим из прошлого захода в каталог.
+    // Фильтры не тащим из прошлого захода в каталог.
     stockCurrentCat = 'all';
+    stockCurrentSub = '';
+    stockStaleOnly = false;
     await renderStock();
   }
 }
@@ -544,11 +534,9 @@ async function renderHome() {
   const queue = (await queuePromise).queue || [];
 
   if (!data) {
-    // Роль без сводки: экран — это очередь и ничего больше.
-    const uname0 = (currentUser && currentUser.first_name) || '';
-    content.innerHTML =
-      `<div class="home-greeting">${greetWord()}${uname0 ? ', ' + escapeHtml(uname0) : ''}</div>`
-      + workQueueHtml(queue);
+    // Роль без сводки: экран — это очередь и ничего больше. Приветствие
+    // одно — в шапке (renderHeader), отдельным заголовком не дублируем.
+    content.innerHTML = workQueueHtml(queue);
     wireWorkQueue(content);
     return;
   }
@@ -559,19 +547,16 @@ async function renderHome() {
   const isBoss = data.role === 'admin' || data.role === 'boss';
   const mo = data.my_orders;
 
-  // ─── Приветствие по времени суток ───────────────────
-  const uname = (currentUser && (currentUser.first_name || currentUser.full_name || currentUser.name)) || '';
-  const greeting = `<div class="home-greeting">${greetWord()}${uname ? ', ' + escapeHtml(uname) : ''}</div>`;
-
   // ─── Hero: выручка за сегодня + тренд к вчера ────────
   const todayLabel = data.today.scope === 'personal' ? 'Моя выручка сегодня' : 'Выручка компании сегодня';
   const prevRev = data.today.prev_revenue || 0;
-  let heroDelta = `<div class="hero-delta">${data.today.shipments} отгр. · ${data.today.clients} клиентов</div>`;
+  const shipmentsLabel = plural(data.today.shipments, ['отгрузка', 'отгрузки', 'отгрузок']);
+  let heroDelta = `<div class="hero-delta">${shipmentsLabel} · ${plural(data.today.clients, ['клиент', 'клиента', 'клиентов'])}</div>`;
   if (prevRev > 0) {
     const pct = Math.round((data.today.revenue - prevRev) / prevRev * 100);
     const dir = pct > 0 ? 'up' : pct < 0 ? 'down' : 'flat';
     const arrow = pct > 0 ? icon('trend-up') : pct < 0 ? icon('trend-down') : '';
-    heroDelta = `<div class="hero-delta" data-trend="${dir}">${arrow} ${pct > 0 ? '+' : ''}${pct}% к вчера · ${data.today.shipments} отгр.</div>`;
+    heroDelta = `<div class="hero-delta" data-trend="${dir}">${arrow} ${pct > 0 ? '+' : ''}${pct}% к вчера · ${shipmentsLabel}</div>`;
   }
   const hero = `
     <div class="hero">
@@ -592,21 +577,6 @@ async function renderHome() {
   // одной разметкой с if-ами внутри, и по коду не было видно, какой экран
   // получится. Теперь это отдельные функции: читаешь ту, чью роль отлаживаешь.
 
-  // Вход в полную операционную сводку — отдельный экран (раньше уходило
-  // дайджестом в Telegram).
-  const monitoringHtml = () => `
-    <div class="section-label">Мониторинг</div>
-    <div class="c-surface c-surface--list">
-      <div class="c-row c-row--tap" data-att="ops" role="button" tabindex="0">
-        <div class="card-row-icon">${icon('clock')}</div>
-        <div class="card-row-info">
-          <div class="card-row-title">Операционная сводка</div>
-          <div class="card-row-sub">Зависшие заявки · склад · синхронизация</div>
-        </div>
-      </div>
-    </div>
-  `;
-
   const leaderboardHtml = () => {
     const top = data.top_employees || [];
     if (!top.length) return '';
@@ -618,7 +588,7 @@ async function renderHome() {
             <div class="card-row-icon rank-chip">${i + 1}</div>
             <div class="card-row-info">
               <div class="card-row-title">${escapeHtml(e.name)}</div>
-              <div class="card-row-sub">${e.count} отгрузок</div>
+              <div class="card-row-sub">${plural(e.count, ['отгрузка', 'отгрузки', 'отгрузок'])}</div>
             </div>
             <div><div class="card-row-value">${fmtCur(e.revenue)}</div></div>
           </div>
@@ -663,18 +633,16 @@ async function renderHome() {
     return `<div class="section-label">Мои заказы</div>${statsRow}${recentList}`;
   };
 
-  const bossHome = () => monitoringHtml() + leaderboardHtml() + myOrdersHtml();
+  // Блока «Мониторинг → Операционная сводка» больше нет (UI-бриф п.3): всё,
+  // что требует решения, уже лежит в очереди дел выше, а сводку по-прежнему
+  // отдаёт /api/ops-summary для дневного пинга из бота.
+  const bossHome = () => leaderboardHtml() + myOrdersHtml();
   const managerHome = () => myOrdersHtml();
 
   content.innerHTML =
-    greeting + hero + workQueueHtml(queue) + linkWarning + (isBoss ? bossHome() : managerHome());
+    hero + workQueueHtml(queue) + linkWarning + (isBoss ? bossHome() : managerHome());
 
   wireWorkQueue(content);
-
-  // Вход в операционную сводку — единственная оставшаяся строка-переход.
-  document.querySelectorAll('[data-att="ops"]').forEach(row => {
-    row.addEventListener('click', () => { haptic(); showScreen('ops'); });
-  });
 
   // Клик по строке недавнего заказа → Заказы
   document.querySelectorAll('[data-order-id]').forEach(row => {
@@ -685,9 +653,16 @@ async function renderHome() {
 // ─── Экран: Склад ───────────────────────────────────
 
 let stockData = null;          // { products, categories }
-let stockCurrentCat = 'all';   // id выбранной категории или 'all'
+let stockCurrentCat = 'all';   // ключ корня дерева категорий или 'all'
+let stockCurrentSub = '';      // ключ подкатегории (уровень 2) или ''
 let stockSearch = '';
 let stockInStockOnly = false;  // фильтр «только в наличии»
+// «Залежалось» — фильтр каталога, а не вкладка (UI-бриф п.4): срез того же
+// списка по ответу /api/channel/stale (только руководству). Данные тянем при
+// первом включении и держим на сессию экрана.
+let stockStaleOnly = false;
+let stockStaleData = null;     // { days, items:[{name, stock, unit}] } | null
+let staleChecked = new Set();  // что отмечено для поста в канал
 let stockLimit = 200;          // сколько товаров показываем («Показать ещё» +200)
 let _stockSearchTimer = null;  // дебаунс ввода в поиске по складу
 
@@ -736,13 +711,22 @@ function _stockBadge(stock) {
   return `<span class="stock-badge" data-status="${state}">${text}</span>`;
 }
 
+function _stockTree() {
+  return categoryTree((stockData && stockData.categories) || []);
+}
+
 function _stockFiltered() {
   const { products } = stockData;
   const search = stockSearch.toLowerCase();
+  const root = stockCurrentCat === 'all' ? null
+    : _stockTree().find(r => r.key === stockCurrentCat) || null;
+  const staleNames = stockStaleOnly && stockStaleData
+    ? new Set((stockStaleData.items || []).map(i => i.name)) : null;
   return products.filter(p => {
-    if (stockCurrentCat !== 'all' && p.folder_id !== stockCurrentCat) return false;
+    if (stockCurrentCat !== 'all' && !categoryMatches(p.folder_id, root, stockCurrentSub)) return false;
     if (search && !p.name.toLowerCase().includes(search)) return false;
     if (stockInStockOnly && !(p.stock > 0)) return false;
+    if (staleNames && !staleNames.has(p.name)) return false;
     return true;
   });
 }
@@ -756,11 +740,18 @@ function renderStockList() {
   const filtered = _stockFiltered();
   const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
 
+  const staleMode = stockStaleOnly && stockStaleData;
+  // Выбор для поста храним по названию: в пост уходят именно названия, а id
+  // у позиции отчёта нет — он считается из отгрузок, где товар опознан по имени.
+  if (staleMode) staleChecked = new Set([...staleChecked].filter(n => filtered.some(p => p.name === n)));
+
   listEl.innerHTML = filtered.length === 0
     ? emptyState({
-        icon: 'box',
-        title: 'Товары не найдены',
-        hint: 'Попробуйте изменить категорию или поисковый запрос',
+        icon: staleMode ? 'check' : 'box',
+        title: staleMode ? 'Всё продаётся' : 'Товары не найдены',
+        hint: staleMode
+          ? `За последние ${plural(stockStaleData.days, ['день', 'дня', 'дней'])} двигался весь товар, который есть на складе.`
+          : 'Попробуйте изменить категорию или поисковый запрос',
       })
     : filtered.slice(0, stockLimit).map((p, i) => {
         // PR C: цена продажи (минимум) — всем; себестоимость — только boss.
@@ -770,10 +761,17 @@ function renderStockList() {
         const priceHtml = priceLines.length
           ? `<div class="stock-price">${escapeHtml(priceLines.join(' · '))}</div>` : '';
         // Boss может тапнуть товар → редактор цен.
-        const editAttr = isBoss ? ` data-price-idx="${i}" role="button" tabindex="0" aria-label="Изменить цену: ${escapeHtml(p.name)}"` : '';
-        const editHint = isBoss ? `<span class="stock-edit-hint">${icon('edit')}</span>` : '';
+        // В режиме «залежалось» строка — метка чекбокса для поста в канал,
+        // а не переход в редактор цены.
+        const editAttr = isBoss && !staleMode ? ` data-price-idx="${i}" role="button" tabindex="0" aria-label="Изменить цену: ${escapeHtml(p.name)}"` : '';
+        const editHint = isBoss && !staleMode ? `<span class="stock-edit-hint">${icon('edit')}</span>` : '';
+        const check = staleMode
+          ? `<input type="checkbox" class="stale-check" value="${escapeHtml(p.name)}" ${staleChecked.has(p.name) ? 'checked' : ''} aria-label="В пост: ${escapeHtml(p.name)}">`
+          : '';
+        const tag = staleMode ? 'label' : 'div';
         return `
-        <div class="c-row stock-row"${editAttr}>
+        <${tag} class="c-row stock-row${staleMode ? ' stale-row' : ''}"${editAttr}>
+          ${check}
           <div class="stock-info">
             <div class="stock-name">${escapeHtml(p.name)}</div>
             <div class="stock-folder">${escapeHtml(p.folder_name || '—')} · ${p.unit}${
@@ -781,12 +779,38 @@ function renderStockList() {
             ${priceHtml}
           </div>
           ${_stockBadge(p.available != null ? p.available : p.stock)}${editHint}
-        </div>`;
+        </${tag}>`;
       }).join('');
+
+  if (staleMode) {
+    listEl.querySelectorAll('.stale-check').forEach(box => {
+      box.addEventListener('change', () => {
+        if (box.checked) staleChecked.add(box.value);
+        else staleChecked.delete(box.value);
+      });
+    });
+  }
 
   // Boss: тап по строке → редактор цены. Слушатель НЕ вешаем здесь (был бы
   // re-attach N строк на каждое нажатие в поиске) — делегирование на #stock-list
   // навешено один раз в renderStockContent.
+
+  // Кнопка «Собрать пост» — только в режиме «залежалось» и только когда есть
+  // из чего собирать. В пост уходят одни названия: остатки наружу не выходят.
+  const postEl = document.getElementById('stock-stale-post');
+  if (postEl) {
+    postEl.innerHTML = staleMode && filtered.length
+      ? `<div class="c-actions"><button class="btn-primary" id="stale-post">${icon('cart')} Собрать пост</button></div>`
+        + `<div class="card-row-sub">В пост уйдут только названия — остатки наружу не выходят.</div>`
+      : '';
+    postEl.querySelector('#stale-post')?.addEventListener('click', () => {
+      if (!staleChecked.size) {
+        tg.showAlert ? tg.showAlert('Отметьте, что выносить в канал') : alert('Отметьте товары');
+        return;
+      }
+      openChannelComposer('stale', { names: [...staleChecked] });
+    });
+  }
 
   const truncEl = document.getElementById('stock-trunc');
   if (truncEl) {
@@ -913,31 +937,54 @@ function openPriceEditor(product) {
 
 function renderStockContent() {
   const content = document.getElementById('content');
-  const { products, categories } = stockData;
+  const { products } = stockData;
   stockLimit = 200;   // новый рендер каркаса — сбрасываем «показать ещё»
+  const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
 
-  // Категории — таблетки сверху
-  const catBtns = [{ id: 'all', name: `Все (${products.length})` }, ...categories]
-    .map(c =>
-      `<button class="cat-btn ${stockCurrentCat === c.id ? 'active' : ''}" data-cat="${c.id}" aria-pressed="${stockCurrentCat === c.id}">${c.name}</button>`
-    ).join('');
+  // Категории — два уровня из строки «Запчасти/Адаптер» (UI-бриф п.4):
+  // ряд корней, при выборе корня с детьми — ряд подкатегорий строкой ниже.
+  // Счётчик — только у «Все»: у остальных он загромождал ряд.
+  const tree = _stockTree();
+  const root = tree.find(r => r.key === stockCurrentCat);
+  if (stockCurrentCat !== 'all' && !root) { stockCurrentCat = 'all'; stockCurrentSub = ''; }
+  const chip = (attr, key, label, on) =>
+    `<button class="cat-btn ${on ? 'active' : ''}" ${attr}="${escapeHtml(key)}" aria-pressed="${on}">${label}</button>`;
+  const catBtns = [chip('data-cat', 'all', `Все (${products.length})`, stockCurrentCat === 'all')]
+    .concat(tree.map(r => chip('data-cat', r.key, escapeHtml(r.name), stockCurrentCat === r.key)))
+    .join('');
+  const subRow = () => {
+    const r = tree.find(x => x.key === stockCurrentCat);
+    if (!r || !r.children.length) return '';
+    return `<div class="cat-row cat-row--sub" id="stock-subcats">`
+      + chip('data-subcat', '', 'Все', !stockCurrentSub)
+      + r.children.map(c => chip('data-subcat', c.key, escapeHtml(c.name), stockCurrentSub === c.key)).join('')
+      + `</div>`;
+  };
+
+  // Фильтры наличия — рядом с поиском, а не в самом низу за панелью.
+  // «Залежалось» — только руководству: ручка /api/channel/stale отвечает admin/boss.
+  const filterRow = `
+    <div class="cat-row" id="stock-filters">
+      <button class="cat-btn ${!stockInStockOnly && !stockStaleOnly ? 'active' : ''}" data-instock="0" aria-pressed="${!stockInStockOnly && !stockStaleOnly}">Все</button>
+      <button class="cat-btn ${stockInStockOnly ? 'active' : ''}" data-instock="1" aria-pressed="${stockInStockOnly}">${icon('box')} В наличии</button>
+      ${isBoss ? `<button class="cat-btn ${stockStaleOnly ? 'active' : ''}" data-stale="1" aria-pressed="${stockStaleOnly}">${icon('clock')} Залежалось</button>` : ''}
+    </div>`;
+
+  const staleLabel = stockStaleOnly && stockStaleData
+    ? `Без продаж больше ${plural(stockStaleData.days, ['дня', 'дней', 'дней'])}` : 'Товары';
 
   content.innerHTML = `
     ${stockShellHtml()}
-    <div class="wh-entry">
-      <button class="btn-secondary" data-wh-go="whinvoices">${icon('list')} Накладные</button>
-    </div>
     <div class="form-row">
       <input id="stock-search" class="form-input" placeholder="Поиск товара…" value="${escapeHtml(stockSearch)}">
     </div>
+    ${filterRow}
     <div class="section-label">Категории</div>
     <div class="cat-row">${catBtns}</div>
-    <div class="cat-row">
-      <button class="cat-btn ${!stockInStockOnly ? 'active' : ''}" data-instock="0" aria-pressed="${!stockInStockOnly}">Все</button>
-      <button class="cat-btn ${stockInStockOnly ? 'active' : ''}" data-instock="1" aria-pressed="${stockInStockOnly}">${icon('box')} В наличии</button>
-    </div>
-    <div class="section-label">Товары</div>
+    ${subRow()}
+    <div class="section-label" id="stock-list-label">${staleLabel}</div>
     <div class="stock-list" id="stock-list"></div>
+    <div id="stock-stale-post"></div>
     <div id="stock-trunc"></div>
   `;
   wireSectionNav(content, 'stock', renderStockScreen);   // UI-BUG-04
@@ -946,7 +993,6 @@ function renderStockContent() {
   // Boss: делегированный клик по строке товара → редактор цены. Вешаем ОДИН
   // раз на контейнер (строки пересоздаются в renderStockList — индивидуальные
   // слушатели пришлось бы перевешивать на каждое нажатие в поиске).
-  const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
   if (isBoss) {
     const listEl = document.getElementById('stock-list');
     if (listEl) {
@@ -959,25 +1005,29 @@ function renderStockContent() {
     }
   }
 
-  // Локальный складской учёт: отдельные экраны раздела (см. NAV_PARENT).
-  document.querySelectorAll('[data-wh-go]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      haptic('light');
-      showScreen(btn.dataset.whGo);
-    });
+  const setPressed = (sel, isOn) => document.querySelectorAll(sel).forEach(b => {
+    const on = isOn(b);
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-pressed', String(on));
   });
 
   document.querySelectorAll('[data-cat]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
       stockCurrentCat = btn.dataset.cat;
+      stockCurrentSub = '';
       stockLimit = 200;   // смена категории — список с начала
-      // Подсветить активную таблетку без полного ре-рендера каркаса.
-      document.querySelectorAll('[data-cat]').forEach(b => {
-        const on = b.dataset.cat === stockCurrentCat;
-        b.classList.toggle('active', on);
-        b.setAttribute('aria-pressed', String(on));
-      });
+      // Второй уровень зависит от выбранного корня — перерисовываем каркас;
+      // поиск при этом не в фокусе, значит клавиатура не пострадает.
+      renderStockContent();
+    });
+  });
+  document.querySelectorAll('[data-subcat]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('light');
+      stockCurrentSub = btn.dataset.subcat;
+      stockLimit = 200;
+      setPressed('[data-subcat]', b => b.dataset.subcat === stockCurrentSub);
       renderStockList();
     });
   });
@@ -993,17 +1043,40 @@ function renderStockContent() {
     });
     // не дёргаем фокус, чтобы не открывать клавиатуру при первом рендере
   }
+  const applyAvailability = () => {
+    setPressed('[data-instock]', b => b.dataset.instock === (stockInStockOnly ? '1' : '0') && !stockStaleOnly);
+    setPressed('[data-stale]', () => stockStaleOnly);
+    const label = document.getElementById('stock-list-label');
+    if (label) {
+      label.textContent = stockStaleOnly && stockStaleData
+        ? `Без продаж больше ${plural(stockStaleData.days, ['дня', 'дней', 'дней'])}` : 'Товары';
+    }
+    stockLimit = 200;
+    renderStockList();
+  };
   document.querySelectorAll('[data-instock]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
       stockInStockOnly = btn.dataset.instock === '1';
-      stockLimit = 200;
-      document.querySelectorAll('[data-instock]').forEach(b => {
-        const on = b.dataset.instock === (stockInStockOnly ? '1' : '0');
-        b.classList.toggle('active', on);
-        b.setAttribute('aria-pressed', String(on));
-      });
-      renderStockList();
+      stockStaleOnly = false;
+      applyAvailability();
+    });
+  });
+  document.querySelectorAll('[data-stale]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      haptic('light');
+      stockInStockOnly = false;
+      stockStaleOnly = true;
+      if (!stockStaleData) {
+        try {
+          stockStaleData = await api('/api/channel/stale', {});
+        } catch (e) {
+          stockStaleOnly = false;
+          toast(e.message || 'Не удалось получить список', 'error');
+          return;
+        }
+      }
+      applyAvailability();
     });
   });
 }
@@ -1316,73 +1389,6 @@ let containersFilter = 'all';
 let containersSearch = '';
 let _containersSearchTimer = null;
 
-// «Залежалось» — что лежит на складе и не продаётся. Внутренний экран, поэтому
-// остаток здесь ВИДЕН: по нему и решают, что выносить. В пост из этого списка
-// уходят только названия — правило «наружу не уходит ни одна цифра количества»
-// держит сборщик на сервере, а не эта галочка.
-let staleChecked = new Set();
-
-async function renderStale() {
-  const content = document.getElementById('content');
-  content.innerHTML = stockShellHtml() + skeleton('label') + skeleton('list', 5);
-  wireSectionNav(content, 'stock', renderStockScreen);
-
-  let data;
-  try {
-    data = await api('/api/channel/stale', {});
-  } catch (e) {
-    content.innerHTML = stockShellHtml() + errorBox(e.message);
-    wireSectionNav(content, 'stock', renderStockScreen);
-    return;
-  }
-
-  const items = data.items || [];
-  if (!items.length) {
-    content.innerHTML = stockShellHtml() + emptyState({
-      icon: 'check',
-      title: 'Всё продаётся',
-      hint: `За последние ${data.days} дней двигался весь товар, который есть на складе.`,
-    });
-    wireSectionNav(content, 'stock', renderStockScreen);
-    return;
-  }
-
-  // Выбор храним по названию: в пост уходят именно названия, а id у позиции
-  // отчёта нет — он считается из отгрузок, где товар опознан по имени.
-  staleChecked = new Set([...staleChecked].filter(n => items.some(i => i.name === n)));
-  const rows = items.map(i => `
-    <label class="c-row c-row--tap stale-row">
-      <input type="checkbox" class="stale-check" value="${escapeHtml(i.name)}"
-             ${staleChecked.has(i.name) ? 'checked' : ''}>
-      <div class="card-row-info">
-        <div class="card-row-title">${escapeHtml(i.name)}</div>
-        <div class="card-row-sub">лежит ${formatMoney(i.stock)} ${escapeHtml(i.unit)}</div>
-      </div>
-    </label>`).join('');
-
-  content.innerHTML = stockShellHtml()
-    + `<div class="section-label">Без продаж больше ${data.days} дней · ${items.length}</div>`
-    + `<div class="c-surface c-surface--list">${rows}</div>`
-    + `<div class="c-actions"><button class="btn-primary" id="stale-post">`
-    + `${icon('cart')} Собрать пост</button></div>`
-    + `<div class="card-row-sub">В пост уйдут только названия — остатки наружу не выходят.</div>`;
-  wireSectionNav(content, 'stock', renderStockScreen);
-
-  content.querySelectorAll('.stale-check').forEach(box => {
-    box.addEventListener('change', () => {
-      if (box.checked) staleChecked.add(box.value);
-      else staleChecked.delete(box.value);
-    });
-  });
-  content.querySelector('#stale-post')?.addEventListener('click', () => {
-    if (!staleChecked.size) {
-      tg.showAlert ? tg.showAlert('Отметьте, что выносить в канал') : alert('Отметьте товары');
-      return;
-    }
-    openChannelComposer('stale', { names: [...staleChecked] });
-  });
-}
-
 async function renderContainers() {
   const content = document.getElementById('content');
   content.innerHTML = stockShellHtml() + skeleton('label') + skeleton('list', 3);
@@ -1407,7 +1413,7 @@ async function renderContainers() {
     const parts = [];
     if (c.status === 'arrived' && c.arrived_at) parts.push(`прибыл ${String(c.arrived_at).slice(0, 10)}`);
     else if (c.eta_date) parts.push(`ожидается ${c.eta_date}`);
-    if (d.total) parts.push(`${d.total} поз.`);
+    if (d.total) parts.push(plural(d.total, ['позиция', 'позиции', 'позиций']));
     if (d.mismatch) parts.push(`расхождений: ${d.mismatch}`);
     else if (d.unchecked && c.status === 'arrived') parts.push('не сверен');
     // Заметка — прямо в списке: «что в этом контейнере» спрашивают чаще, чем
@@ -1855,7 +1861,7 @@ async function renderContainerCard(containerId) {
       ? `<div class="c-error">Расхождений: ${d.mismatch} (недостача ${d.short}, лишнее ${d.extra})</div>`
       : d.unchecked
         ? `<div class="items-total schedule-total"><span>Не сверено позиций</span><b>${d.unchecked}</b></div>`
-        : `<div class="items-total schedule-total"><span>Состав сошёлся</span><b>${d.total} поз.</b></div>`;
+        : `<div class="items-total schedule-total"><span>Состав сошёлся</span><b>${plural(d.total, ['позиция', 'позиции', 'позиций'])}</b></div>`;
 
   // Что попало на склад и что не прошло. Несопоставленное показываем явно:
   // молча пропущенная позиция — это остаток, которого нет на складе, но
@@ -1865,7 +1871,7 @@ async function renderContainerCard(containerId) {
     const unmatched = receipt.unmatched || [];
     const received = Boolean(receipt.invoice_id) || receipt.legacy;
     const receivedSub = receipt.legacy
-      ? 'Оприходован ещё в МойСклад — остаток перенесён миграцией'
+      ? 'Оприходован до перехода на свой склад — остаток перенесён миграцией'
       : (receipt.received_at
           ? escapeHtml(String(receipt.received_at).slice(0, 16))
           : 'Закупочные цены впишете в накладной, когда будет удобно');
@@ -1936,7 +1942,7 @@ async function renderContainerCard(containerId) {
       return;
     }
     haptic('success');
-    toast(`Оприходовано позиций: ${res.body.matched} · ${res.body.invoice_number || ''}`.trim());
+    toast(`Оприходовано: ${plural(res.body.matched, ['позиция', 'позиции', 'позиций'])} · ${res.body.invoice_number || ''}`.trim());
     renderContainerCard(containerId);
   });
 
@@ -2496,7 +2502,7 @@ function openDealForm(machine, kind) {
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
       toast(credit
-        ? `Рассрочка оформлена · ${res.body.payments} платежей`
+        ? `Рассрочка оформлена · ${plural(res.body.payments, ['платёж', 'платежа', 'платежей'])}`
         : 'Машина продана');
       renderMachineCard(machine.id);
       return true;
@@ -2990,27 +2996,29 @@ function renderOrdersMain() {
 
   // Боссу фильтр «черновики» бесполезен (это незавершённые заявки менеджеров) —
   // заменяем на «отгружено». Менеджеру черновики нужны (свои незаконченные).
+  // Короткие подписи вместо одних иконок (UI-бриф п.5): часы/галочка/грузовик
+  // без слов приходилось расшифровывать. Ряд скроллится, если не влезает.
   const filters = isBoss
     ? [
-        { id: 'all', label: 'Все', name: 'Все' },
-        { id: 'pending', label: icon('clock'), name: STATUS_NAME.pending },
-        { id: 'approved', label: icon('check'), name: STATUS_NAME.approved },
-        { id: 'shipped', label: icon('truck'), name: STATUS_NAME.shipped },
-        { id: 'rejected', label: icon('close'), name: STATUS_NAME.rejected },
+        { id: 'all', label: 'Все', ic: '' },
+        { id: 'pending', label: 'Ждут', ic: 'clock' },
+        { id: 'approved', label: 'Одобрены', ic: 'check' },
+        { id: 'shipped', label: 'Отгружены', ic: 'truck' },
+        { id: 'rejected', label: 'Отменены', ic: 'close' },
       ]
     : [
-        { id: 'all', label: 'Все', name: 'Все' },
-        { id: 'draft', label: icon('edit'), name: STATUS_NAME.draft },
-        { id: 'pending', label: icon('clock'), name: STATUS_NAME.pending },
-        { id: 'approved', label: icon('check'), name: STATUS_NAME.approved },
-        { id: 'rejected', label: icon('close'), name: STATUS_NAME.rejected },
+        { id: 'all', label: 'Все', ic: '' },
+        { id: 'draft', label: 'Черновики', ic: 'edit' },
+        { id: 'pending', label: 'Ждут', ic: 'clock' },
+        { id: 'approved', label: 'Одобрены', ic: 'check' },
+        { id: 'rejected', label: 'Отменены', ic: 'close' },
       ];
 
-  // Единый язык навигации со всеми экранами (база — Аналитика): статус и период
-  // — iOS-сегменты .seg / .seg-item с подписью-секцией сверху, а не разнородные
-  // пилюли + select + кнопка в один ряд (раньше «кнопки смешаны»).
+  // Единый язык навигации со всеми экранами: статус и период — сегменты
+  // .seg / .seg-item по одной строке каждый, без заголовков «СТАТУС»/«ПЕРИОД»
+  // над ними (группы самоочевидны, а заголовки отодвигали список на полэкрана).
   const statusSeg = filters.map(f =>
-    `<button class="seg-item ${currentOrderFilter === f.id ? 'active' : ''}" data-filter="${f.id}" aria-pressed="${currentOrderFilter === f.id}" aria-label="${escapeHtml(f.name)}" title="${escapeHtml(f.name)}">${f.label}</button>`
+    `<button class="seg-item ${currentOrderFilter === f.id ? 'active' : ''}" data-filter="${f.id}" aria-pressed="${currentOrderFilter === f.id}">${f.ic ? icon(f.ic) + ' ' : ''}${f.label}</button>`
   ).join('');
 
   // Фильтр по периоду — для навигации, когда заказов много. Пресеты — сегмент,
@@ -3041,14 +3049,13 @@ function renderOrdersMain() {
   );
 
   const list = filtered.length === 0
-    ? `<div class="empty-state">
-        <div class="empty-state-icon">${icon('list')}</div>
-        <div class="empty-state-title">Нет заказов</div>
-        <div class="empty-state-hint">${(currentOrderFilter !== 'all' || currentOrderPeriod !== 'all')
+    ? emptyState({
+        icon: 'list',
+        title: 'Нет заказов',
+        hint: (currentOrderFilter !== 'all' || currentOrderPeriod !== 'all')
           ? 'Нет заказов по выбранным фильтрам'
-          : isBoss ? 'Менеджеры ещё не создавали заказов' : 'Нажмите «+ Новый заказ» чтобы начать'
-        }</div>
-      </div>`
+          : isBoss ? 'Менеджеры ещё не создавали заказов' : 'Нажмите «+ Новый заказ» чтобы начать',
+      })
     : (() => {
         // Группируем по дате (created_at='YYYY-MM-DD HH:MM') и выводим клиента
         // заголовком: легче ориентироваться, когда не помнишь ни номер, ни имя.
@@ -3069,7 +3076,7 @@ function renderOrdersMain() {
           <span class="order-status c-badge">${STATUS_NAME[o.status] || o.status}</span>
         </div>
         <div class="order-meta">
-          <span>${icon('box')} ${o.items_count} тов.</span>
+          <span>${icon('box')} ${plural(o.items_count, ['товар', 'товара', 'товаров'])}</span>
           <span>${(o.created_at || '').slice(11, 16)}</span>
           ${o.total > 0 ? `<span class="order-total">${icon('cash')} ${formatMoney(o.total, escapeHtml(o.currency || ''))}</span>` : ''}
         </div>
@@ -3126,17 +3133,29 @@ function renderOrdersMain() {
         `).join('');
       })();
 
+  // Заявки на рассмотрении — обычная строка-ссылка с бейджем-счётчиком, и
+  // только когда заявки есть (UI-бриф п.5): жёлтая плашка была единственным
+  // жёлтым элементом приложения и читалась как предупреждение.
+  const pendingCount = isBoss ? orders.filter(o => o.status === 'pending').length : 0;
+  const requestsRow = pendingCount ? `
+    <div class="c-surface c-surface--list">
+      <div class="c-row c-row--tap" id="show-requests" role="button" tabindex="0" data-status="pending">
+        <div class="card-row-icon icon-pending">${icon('clock')}</div>
+        <div class="card-row-info">
+          <div class="card-row-title">Заявки на рассмотрении</div>
+          <div class="card-row-sub">Одобрить или вернуть менеджеру</div>
+        </div>
+        <span class="queue-count">${pendingCount}</span>
+      </div>
+    </div>` : '';
+
   content.innerHTML = `
     ${salesShellHtml()}
-    <div class="section-label">Статус</div>
     <div class="seg-row"><div class="seg seg--scroll">${statusSeg}</div></div>
-    <div class="section-label">Период</div>
     ${periodRow}
     ${periodPanel}
     ${!isBoss ? `<button class="btn-new-order" id="btn-new-order">${icon('plus')} Новый заказ</button>` : ''}
-
-    ${isBoss ? `<button class="requests-btn" id="show-requests">${icon('clock')} Заявки на рассмотрении</button>` : ''}
-
+    ${requestsRow}
     <div class="orders-list">${list}</div>
   `;
   wireSectionNav(content, 'sales', renderSalesScreen);   // UI-BUG-04: шелл — часть шаблона, значит и проводка тоже
@@ -3803,23 +3822,6 @@ async function submitOrder() {
 }
 
 
-async function renderOpsSummary() {
-  // Операционная сводка (boss/admin): зависшие заявки, несданные деньги,
-  // складские алерты, здоровье cron, рассинхрон с МС. Раньше уходило большим
-  // дайджестом в Telegram — теперь смотрим тут, бот шлёт лишь дневной пинг.
-  const content = document.getElementById('content');
-  content.innerHTML = loading('Загружаю сводку…');
-  try {
-    const data = await api('/api/ops-summary', {});
-    showBack(() => showScreen('today'));
-    content.innerHTML =
-      `<div class="editor-header"><div class="editor-title">Операционная сводка</div></div>` +
-      renderOpsSummaryHtml(data);
-  } catch (e) {
-    content.innerHTML = errorBox(e.message || String(e));
-  }
-}
-
 async function renderPendingRequests() {
   const content = document.getElementById('content');
   // fmt был локальным в других рендерах, но не здесь → кредит-блок заявки
@@ -4000,6 +4002,7 @@ const ANALYTICS_TTL_MS = 60 * 1000;
 // местом, где непонятно, что где. Теперь отчёт лежит вкладкой внутри своего
 // раздела, а период у них общий — одна переменная на оба.
 function reportHeaderHtml() {
+  // Без заголовка «ПЕРИОД» над сегментом: группа самоочевидна (UI-бриф п.5).
   const presets = [
     { id: 'week', label: 'Неделя' }, { id: 'month', label: 'Месяц' },
     { id: '3month', label: 'Квартал' }, { id: 'year', label: 'Год' },
@@ -4011,7 +4014,7 @@ function reportHeaderHtml() {
     presets, analyticsPeriod, 'data-period', analyticsPeriod === 'custom', customLabel
   );
   const periodPanel = analyticsPeriod === 'custom' ? dateRangeHost() : '';
-  return `<div class="section-label">Период</div>${periodBar}${periodPanel}`;
+  return `${periodBar}${periodPanel}`;
 }
 
 // Обработчики периода/календаря. `rerender` — чей это отчёт: у «Продаж» и
@@ -4084,6 +4087,9 @@ async function renderSalesReport() {
 function renderAnalyticsContent(data) {
   const content = document.getElementById('content');
   const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
+  // Валюта — кодом (USD/UZS), а не «$»: валют несколько, и знак неоднозначен.
+  // Один формат на всё приложение — formatMoney(amount, currency).
+  const cur = data.currency || data.base_currency || baseCur();
   const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
 
   const trendIcon = data.trend > 0 ? icon('trend-up') : data.trend < 0 ? icon('trend-down') : '';
@@ -4103,15 +4109,15 @@ function renderAnalyticsContent(data) {
     ? '<div class="loader">Нет данных</div>'
     : data.top_products.map((p, i) => {
         // PR D: прибыль по товару (если задана себестоимость) — boss/admin.
+        const unit = p.currency ? escapeHtml(p.currency) : escapeHtml(cur);
         const profitStr = (p.margin_known && p.profit != null)
-          ? ` · <span class="top-profit">прибыль ${fmt(p.profit)} $</span>` : '';
-        const unit = p.currency ? escapeHtml(p.currency) : '$';
+          ? ` · <span class="top-profit">прибыль ${formatMoney(p.profit, unit)}</span>` : '';
         return `
           <div class="top-row">
             <span class="top-medal rank-chip">${i + 1}</span>
             <div class="top-info">
               <div class="top-name">${escapeHtml(p.name)}</div>
-              <div class="top-sub">${fmt(p.qty)} шт · ${fmt(p.sum)} ${unit}${profitStr}</div>
+              <div class="top-sub">${fmt(p.qty)} шт. · ${formatMoney(p.sum, unit)}${profitStr}</div>
             </div>
           </div>
         `;
@@ -4123,7 +4129,7 @@ function renderAnalyticsContent(data) {
       <span class="top-medal rank-chip">${i + 1}</span>
       <div class="top-info">
         <div class="top-name">${escapeHtml(c.name)}</div>
-        <div class="top-sub">${fmt(c.revenue)} $ · ${c.count} отгр.</div>
+        <div class="top-sub">${formatMoney(c.revenue, cur)} · ${plural(c.count, ['отгрузка', 'отгрузки', 'отгрузок'])}</div>
       </div>
     </div>`).join('');
   // Выручка/долг менеджера — РАЗДЕЛЬНО по валютам (не складываем); fallback на
@@ -4134,14 +4140,14 @@ function renderAnalyticsContent(data) {
     return fallback ? `${fmt(fallback)} ${suffix}` : '';
   };
   const managerItems = (data.top_managers || []).map((m, i) => {
-    const rev = curList(m.revenue_by_currency, m.revenue, '$');
+    const rev = curList(m.revenue_by_currency, m.revenue, cur);
     const debt = curList(m.debt_by_currency, 0, '');
     return `
     <div class="top-row">
       <span class="top-medal rank-chip">${i + 1}</span>
       <div class="top-info">
         <div class="top-name">${escapeHtml(m.name)}</div>
-        <div class="top-sub">${rev} · ${m.count} отгр.${m.orders != null ? ` · ${m.orders} зак.` : ''}${debt ? ` · долг ${debt}` : ''}</div>
+        <div class="top-sub">${rev} · ${plural(m.count, ['отгрузка', 'отгрузки', 'отгрузок'])}${m.orders != null ? ` · ${plural(m.orders, ['заказ', 'заказа', 'заказов'])}` : ''}${debt ? ` · долг ${debt}` : ''}</div>
       </div>
     </div>`;
   }).join('');
@@ -4172,7 +4178,7 @@ function renderAnalyticsContent(data) {
           const tS = r.trend ? `<span class="${tC} u-fs-11">${tI} ${r.trend > 0 ? '+' : ''}${r.trend}%</span>` : '';
           return `<div class="rev-row">
             <span class="rev-amount">${fmt(r.total)} ${escapeHtml(r.currency)}</span>
-            <span class="rev-meta">${r.count} отгр. ${tS}</span>
+            <span class="rev-meta">${plural(r.count, ['отгрузка', 'отгрузки', 'отгрузок'])} ${tS}</span>
           </div>`;
         }).join('')
       : '';
@@ -4184,29 +4190,30 @@ function renderAnalyticsContent(data) {
         ? `<div class="c-surface c-surface--pad">${revLines}</div>`
         : '<div class="loader">Нет продаж за период</div>'}
       <div class="stat-grid">
-        <div class="stat"><div class="stat-value">${data.count}</div><div class="stat-label">Отгрузок</div></div>
-        <div class="stat"><div class="stat-value">${data.clients}</div><div class="stat-label">Клиентов</div></div>
+        ${countStat(data.count, ['отгрузка', 'отгрузки', 'отгрузок'])}
+        ${countStat(data.clients, ['клиент', 'клиента', 'клиентов'])}
       </div>`;
   };
 
-  // Руководство: четыре агрегата в базовой валюте.
+  // Счётчик: число крупно, склонённое слово подписью («1 отгрузка», «5 клиентов»)
+  // — подписи «Выручка / Отгрузок / Клиентов» стояли в разных падежах.
+  const countStat = (n, forms) => {
+    const [num, ...word] = plural(n, forms).split(' ');
+    return `<div class="stat"><div class="stat-value">${num}</div><div class="stat-label">${word.join(' ')}</div></div>`;
+  };
+
+  // Руководство: четыре агрегата в базовой валюте, сетка 2×2 (UI-бриф п.8а).
   const companyStatsHtml = () => `
     <div class="stat-grid">
       <div class="stat">
-        <div class="stat-value">${fmt(data.total)} $</div>
+        <div class="stat-value">${formatMoney(data.total, cur)}</div>
         <div class="stat-label">Выручка</div>
         ${trendStr ? `<div class="${trendClass} u-fs-11 u-mt-1">${trendStr}</div>` : ''}
       </div>
+      ${countStat(data.count, ['отгрузка', 'отгрузки', 'отгрузок'])}
+      ${countStat(data.clients, ['клиент', 'клиента', 'клиентов'])}
       <div class="stat">
-        <div class="stat-value">${data.count}</div>
-        <div class="stat-label">Отгрузок</div>
-      </div>
-      <div class="stat">
-        <div class="stat-value">${data.clients}</div>
-        <div class="stat-label">Клиентов</div>
-      </div>
-      <div class="stat">
-        <div class="stat-value">${fmt(data.avg_check)} $</div>
+        <div class="stat-value">${formatMoney(data.avg_check, cur)}</div>
         <div class="stat-label">Средний чек</div>
       </div>
     </div>`;
@@ -5169,7 +5176,7 @@ async function renderBuyerCard(buyer) {
     <div class="c-surface c-surface--list">
       <div class="c-row">
         <div class="card-row-info"><div class="card-row-title">Всего по рассрочкам</div>
-          <div class="card-row-sub">${card.outstanding.count} ${card.outstanding.count === 1 ? 'платёж' : 'платежей'}</div></div>
+          <div class="card-row-sub">${plural(card.outstanding.count, ['платёж', 'платежа', 'платежей'])}</div></div>
         <div class="card-row-value"><b>${escapeHtml(moneyBlockLabel(card.outstanding))}</b></div>
       </div>
     </div>
@@ -5533,10 +5540,12 @@ async function renderCashbox(container, section) {
   let bodyHtml;
   if (section === 'ops') {
     bodyHtml = (createBlock + payFormBlock + returnBlock + myBlock)
-      || '<div class="loader">Нет доступных операций</div>';
+      || emptyState({ icon: 'cashbox', title: 'Нет доступных операций',
+                      hint: 'Сдачи и платежи оформляют менеджеры по своим заказам.' });
   } else {
     bodyHtml = (payBlock + depBlock + retBlock)
-      || '<div class="loader">Нет записей на подтверждении</div>';
+      || emptyState({ icon: 'check', title: 'Нет записей на подтверждении',
+                      hint: 'Сдачи, платежи и возвраты появятся здесь, как только их оформят.' });
   }
   container.innerHTML = bodyHtml;
 
@@ -5795,11 +5804,10 @@ async function renderCreditLimits(container) {
   const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   const fmtCents = c => opsAmount((Number(c) || 0) / 100);
   if (!clients.length) {
-    container.innerHTML = `<div class="empty-state">
-      <div class="empty-state-icon">${icon('user')}</div>
-      <div class="empty-state-title">Пока нет клиентов</div>
-      <div class="empty-state-hint">Контрагенты появятся после первого заказа или когда их заведут в справочнике.</div>
-    </div>`;
+    container.innerHTML = emptyState({
+      icon: 'user', title: 'Пока нет клиентов',
+      hint: 'Контрагенты появятся после первого заказа или когда их заведут в справочнике.',
+    });
     return;
   }
   // Сверху — кто больше должен. Раньше сортировали по сальдо взаиморасчётов
@@ -5966,7 +5974,7 @@ function itemsBoxHtml(items, currency, opts) {
     0,
   );
   const totalRow = items.length > 1 && total
-    ? `<div class="items-total"><span>Итого · ${items.length} поз.</span><b>${money(total)} ${cur}</b></div>`
+    ? `<div class="items-total"><span>Итого · ${plural(items.length, ['позиция', 'позиции', 'позиций'])}</span><b>${money(total)} ${cur}</b></div>`
     : '';
   return `<div class="items-box">${rows}${totalRow}</div>`;
 }
@@ -5997,7 +6005,7 @@ async function renderAgentDetail(agentId) {
   const pur = d.purchases || {};
   const topRows = (pur.top_products || []).map(p =>
     `<div class="c-row"><div class="card-row-info"><div class="card-row-title">${escapeHtml(p.name)}</div>` +
-    `<div class="card-row-sub">${fmt(p.qty)} шт · ${fmtCents(p.sum_cents)} ${escapeHtml(baseC)}</div></div></div>`
+    `<div class="card-row-sub">${fmt(p.qty)} шт. · ${fmtCents(p.sum_cents)} ${escapeHtml(baseC)}</div></div></div>`
   ).join('');
   // Отгрузка раскрывается в состав. Позиции тянем по первому тапу, а не сразу
   // все десять: чаще всего их никто не откроет.
@@ -6008,7 +6016,7 @@ async function renderAgentDetail(agentId) {
     (r.id ? `<div class="order-items" id="shipment-${escapeHtml(r.id)}" hidden></div>` : '')
   ).join('');
   const purBlock = pur.count
-    ? `<div class="section-label">Покупки · ${pur.count} отгр. · ${fmtCents(pur.total_cents)} ${escapeHtml(baseC)}</div>`
+    ? `<div class="section-label">Покупки · ${plural(pur.count, ['отгрузка', 'отгрузки', 'отгрузок'])} · ${fmtCents(pur.total_cents)} ${escapeHtml(baseC)}</div>`
       + (topRows ? `<div class="c-surface c-surface--list">${topRows}</div>` : '')
       + (recentRows ? `<div class="section-label">Последние отгрузки</div><div class="c-surface c-surface--list">${recentRows}</div>` : '')
     : '<div class="section-label">Покупки</div><div class="loader">Отгрузок ещё не было</div>';
@@ -6023,7 +6031,7 @@ async function renderAgentDetail(agentId) {
     `<div class="c-row c-row--tap" data-order-open="${o.id}" data-status="${escapeHtml(o.status || '')}" role="button" tabindex="0" aria-expanded="false">` +
     `<div class="card-row-info">` +
     `<div class="card-row-title">#${o.id} · ${fmtCents(o.total_cents)} ${escapeHtml(o.currency || baseC)}</div>` +
-    `<div class="card-row-sub">${escapeHtml(o.status || '')} · ${escapeHtml((o.created_at || '').slice(0, 16))} · ${(o.items || []).length} поз.</div>` +
+    `<div class="card-row-sub">${escapeHtml(o.status || '')} · ${escapeHtml((o.created_at || '').slice(0, 16))} · ${plural((o.items || []).length, ['позиция', 'позиции', 'позиций'])}</div>` +
     `</div>${icon('list')}</div>` +
     `<div class="order-items" id="agent-order-${o.id}" hidden>${orderItemsHtml(o)}</div>`
   ).join('');
@@ -6192,16 +6200,11 @@ async function renderDebts(container) {
     html += receivableTotalsHtml(data.totals);
 
     if (totalEmpty) {
-      html += `
-        <div class="finance-empty">
-          <div class="finance-empty-icon">${icon('card')}</div>
-          <div class="finance-empty-title">Долгов и платежей пока нет</div>
-          <div class="finance-empty-hint">
-            Когда менеджер оформит заказ «в долг» — он появится здесь.
-            А подтверждённые поступления попадут в сводку.
-          </div>
-        </div>
-      `;
+      html += emptyState({
+        icon: 'card',
+        title: 'Долгов и платежей пока нет',
+        hint: 'Когда менеджер оформит заказ «в долг» — он появится здесь. Подтверждённые поступления попадут в сводку.',
+      });
     } else {
       // Если есть хоть что-то — показываем money-блоки, но компактно.
       html += `
@@ -6281,7 +6284,7 @@ async function renderDebts(container) {
               </div>
               ${breakdown}
               <div class="debt-card-mid">
-                <span class="debt-meta">#${d.id} · ${d.items_count} поз.${ownerStr}</span>
+                <span class="debt-meta">#${d.id} · ${plural(d.items_count, ['позиция', 'позиции', 'позиций'])}${ownerStr}</span>
               </div>
               ${isBoss ? `
                 <div class="debt-actions">
@@ -6300,11 +6303,7 @@ async function renderDebts(container) {
     // ─── Открытые долги (с partial — частично оплаченные тоже здесь) ─
     if (open.length === 0 && awaiting.length === 0 && !totalEmpty) {
       // Долгов нет, но есть деньги получено/ожидается — отдельно скажем
-      html += `<div class="empty-state">
-        <div class="empty-state-icon">${icon('check')}</div>
-        <div class="empty-state-title">Открытых долгов нет</div>
-        <div class="empty-state-hint">Все деньги собраны.</div>
-      </div>`;
+      html += emptyState({ icon: 'check', title: 'Открытых долгов нет', hint: 'Все деньги собраны.' });
     } else if (open.length > 0) {
       html += `<div class="section-label">${icon('card')} Открытые (${open.length})</div>`;
       html += '<div class="debts-list">' + open.map(d => {
@@ -6331,7 +6330,7 @@ async function renderDebts(container) {
             ${breakdown}
             <div class="debt-card-mid">
               <span class="debt-state">${stateLabel}: <b>${dueStr}</b></span>
-              <span class="debt-meta">#${d.id} · ${d.items_count} поз.${ownerStr}</span>
+              <span class="debt-meta">#${d.id} · ${plural(d.items_count, ['позиция', 'позиции', 'позиций'])}${ownerStr}</span>
             </div>
             ${d.is_mine || isBoss ? `
               <div class="pay-input-row">
@@ -6488,7 +6487,9 @@ function whIsBoss() {
 
 // whMoney / whQty / whStockBadge — в helpers.js (глобалы). Юнит-тестируются.
 
-// ─── Вкладка «Накладные» ───────────────────────────────────────────────
+// ─── Вкладка «Накладные» (раздел «Склад») ─────────────────────────────────
+// Список — корневой вид вкладки, форма создания — вложенный (с «Назад»).
+// Шелл раздела входит в КАЖДЫЙ innerHTML ветки (UI-BUG-04).
 
 async function renderWhInvoicesTab() {
   if (whView === 'new') return renderWhInvoiceNew();
@@ -6497,16 +6498,20 @@ async function renderWhInvoicesTab() {
 
 async function renderWhInvoiceList() {
   const content = document.getElementById('content');
-  showBack(() => showScreen('stock'));
-  content.innerHTML = skeleton('list', 5);
+  hideBack();
+  content.innerHTML = stockShellHtml() + skeleton('list', 5);
+  wireSectionNav(content, 'stock', renderStockScreen);
+  const gen = screenGen();
 
   let data;
   try {
     data = await api('/api/wh/invoices', { limit: 100 });
   } catch (e) {
-    content.innerHTML = errorBox(e.message || String(e));
+    content.innerHTML = stockShellHtml() + errorBox(e.message || String(e));
+    wireSectionNav(content, 'stock', renderStockScreen);
     return;
   }
+  if (gen !== screenGen()) return;
   const rows = data.invoices || [];
 
   // Кнопка создания — над списком: это главное действие вкладки.
@@ -6519,17 +6524,18 @@ async function renderWhInvoiceList() {
   };
 
   if (!rows.length) {
-    content.innerHTML = newBtn + emptyState({
+    content.innerHTML = stockShellHtml() + newBtn + emptyState({
       icon: 'list', title: 'Накладных пока нет',
       hint: 'Оформите первую — приход или расход',
     });
+    wireSectionNav(content, 'stock', renderStockScreen);
     wireNew();
     return;
   }
 
   const canCancel = whIsBoss();
   const canPrint = !!data.can_print;
-  content.innerHTML = newBtn + rows.map(inv => {
+  content.innerHTML = stockShellHtml() + newBtn + rows.map(inv => {
     const cancelled = inv.status === 'cancelled';
     const isOut = inv.type === 'outgoing';
     // Статус отправки — только у расхода: приход клиенту не отсылается.
@@ -6572,6 +6578,7 @@ async function renderWhInvoiceList() {
       </div>`;
   }).join('');
 
+  wireSectionNav(content, 'stock', renderStockScreen);
   wireNew();
 
   content.querySelectorAll('[data-wh-send]').forEach(btn => {
@@ -6788,6 +6795,12 @@ function openDocumentForm(meta) {
 async function renderWhInvoiceNew() {
   const content = document.getElementById('content');
   if (!whDraft) whDraft = { type: 'outgoing', counterparty_id: '', items: [], comment: '' };
+  // Форма — вложенный вид вкладки: «Назад» возвращает в список, черновик
+  // при этом остаётся (whDraft живёт между перерисовками).
+  showBack(() => { whView = 'list'; renderWhInvoicesTab(); });
+  content.innerHTML = stockShellHtml() + loading('Загружаю справочники…');
+  wireSectionNav(content, 'stock', renderStockScreen);
+  const gen = screenGen();
 
   // Справочники параллельно: без них форма бесполезна.
   const [stock, cps] = await Promise.all([
@@ -6798,12 +6811,14 @@ async function renderWhInvoiceNew() {
   whStockCache = stock.products || [];
   const products = whStockCache;
   const byId = new Map(products.map(p => [p.product_id, p]));
+  if (gen !== screenGen()) return;
 
   if (!products.length) {
-    content.innerHTML = emptyState({
+    content.innerHTML = stockShellHtml() + emptyState({
       icon: 'box', title: 'Нет номенклатуры',
       hint: 'Заведите товар в каталоге или перенесите справочник скриптом миграции',
     });
+    wireSectionNav(content, 'stock', renderStockScreen);
     return;
   }
 
@@ -6819,13 +6834,16 @@ async function renderWhInvoiceNew() {
       <button class="seg-item ${isOut ? 'active' : ''}" data-whtype="outgoing">${icon('truck')} Расход</button>
     </div></div>` : `
     <div class="section-label">${icon('box')} Приход на склад</div>`;
+  // Плейсхолдер у select — как у остальных полей: hint-цветом, пока пусто.
+  const cpEmpty = !whDraft.counterparty_id;
   content.innerHTML = `
+    ${stockShellHtml()}
     ${typeSeg}
 
     <div class="form-row">
       <label class="form-label" for="wh-cp">Контрагент${isOut ? ' *' : ''}</label>
-      <select id="wh-cp" class="form-input">
-        <option value="">— не указан —</option>
+      <select id="wh-cp" class="form-input ${cpEmpty ? 'form-input--placeholder' : ''}">
+        <option value="">Выберите контрагента</option>
         ${whCounterparties.map(c => `
           <option value="${c.id}" ${String(whDraft.counterparty_id) === String(c.id) ? 'selected' : ''}>
             ${escapeHtml(c.name)}${c.telegram_id ? '' : ' · без Telegram'}
@@ -6844,8 +6862,12 @@ async function renderWhInvoiceNew() {
     <div class="form-row">
       <button class="btn-secondary" id="wh-add">${icon('plus')} Добавить позицию</button>
     </div>
-    <button class="btn-primary" id="wh-save">Сохранить накладную</button>
-    <button class="btn-secondary" id="wh-cancel-form">Отмена</button>`;
+    <div id="wh-total"></div>
+    <div class="c-actions c-actions--stack">
+      <button class="btn-primary" id="wh-save" disabled>Сохранить накладную</button>
+      <button class="btn-secondary" id="wh-cancel-form">Отмена</button>
+    </div>`;
+  wireSectionNav(content, 'stock', renderStockScreen);
 
   document.getElementById('wh-cancel-form').addEventListener('click', () => {
     haptic('light');
@@ -6855,21 +6877,59 @@ async function renderWhInvoiceNew() {
   });
 
   const itemsEl = document.getElementById('wh-items');
+  const totalEl = document.getElementById('wh-total');
+
+  // Валидность формы (UI-бриф п.8а): кнопка «Сохранить» неактивна, пока не
+  // выполнены все обязательные условия — контрагент у расхода, хотя бы одна
+  // позиция, количество больше нуля, остаток не превышен, цена у расхода.
+  // Причину под кнопкой не пишем: ошибки видны у самих полей. Проверка
+  // сервера остаётся решающей — остаток мог измениться, пока форму заполняли.
+  function itemProblems(it) {
+    const p = byId.get(Number(it.product_id));
+    const have = p ? Number(p.quantity) : 0;
+    const out = whDraft.type === 'outgoing';
+    return {
+      qty: !(Number(it.quantity) > 0),
+      short: out && Number(it.quantity) > have,
+      price: out && !(Number(it.price_cents) > 0),
+      have,
+    };
+  }
+  function formValid() {
+    if (!whDraft.items.length) return false;
+    if (whDraft.type === 'outgoing' && !whDraft.counterparty_id) return false;
+    return whDraft.items.every(it => {
+      const pr = itemProblems(it);
+      return !pr.qty && !pr.short && !pr.price;
+    });
+  }
+  function syncSave() {
+    const b = document.getElementById('wh-save');
+    if (b) b.disabled = !formValid();
+  }
 
   function drawItems() {
+    const totalCents = whDraft.items.reduce(
+      (acc, it) => acc + Math.round((Number(it.price_cents) || 0) * (Number(it.quantity) || 0)), 0);
+    // Итог — карточка в общем стиле: «Итого» слева, сумма справа с валютой.
+    totalEl.innerHTML = whDraft.items.length
+      ? `<div class="wh-total"><span class="wh-total-label">Итого</span>` +
+        `<span class="wh-total-sum">${whMoney(totalCents, baseCur())}</span></div>`
+      : '';
+    syncSave();
     if (!whDraft.items.length) {
       itemsEl.innerHTML = '<div class="editor-empty">Позиций нет — добавьте хотя бы одну.</div>';
       return;
     }
-    const totalCents = whDraft.items.reduce(
-      (acc, it) => acc + Math.round((Number(it.price_cents) || 0) * (Number(it.quantity) || 0)), 0);
 
     itemsEl.innerHTML = whDraft.items.map((it, i) => {
-      const p = byId.get(Number(it.product_id));
-      const have = p ? Number(p.quantity) : 0;
+      const pr = itemProblems(it);
+      const have = pr.have;
       // Подсветка нехватки — подсказка, а не защита: решение всё равно за
       // сервером, он держит блокировку остатка и проверяет под ней.
-      const short = whDraft.type === 'outgoing' && Number(it.quantity) > have;
+      const short = pr.short;
+      const qtyBad = pr.qty && it.quantity !== 1;   // свежедобавленную строку не красним
+      const priceBad = pr.price && it.price_cents != null && it.priceTouched;
       return `
       <div class="wh-pos" data-i="${i}">
         <select class="form-input" data-f="product_id" aria-label="Товар">
@@ -6879,21 +6939,19 @@ async function renderWhInvoiceNew() {
           </option>`).join('')}
         </select>
         <div class="wh-pos-row">
-          <input class="form-input ${short ? 'wh-input-bad' : ''}" data-f="quantity"
+          <input class="form-input ${short || qtyBad ? 'wh-input-bad' : ''}" data-f="quantity"
                  type="number" min="0" step="any" inputmode="decimal"
                  value="${it.quantity}" placeholder="Кол-во" aria-label="Количество">
-          <input class="form-input" data-f="price" type="number" min="0" step="0.01"
+          <input class="form-input ${priceBad ? 'wh-input-bad' : ''}" data-f="price" type="number" min="0" step="0.01"
                  inputmode="decimal" value="${(Number(it.price_cents) || 0) / 100}"
                  placeholder="Цена" aria-label="Цена за единицу">
           <button class="editor-item-del" data-del="${i}" aria-label="Удалить позицию">${icon('trash')}</button>
         </div>
         ${short ? `<div class="wh-pos-warn">На складе только ${whQty(have)}</div>` : ''}
+        ${qtyBad ? `<div class="wh-pos-warn">Количество должно быть больше нуля</div>` : ''}
+        ${priceBad ? `<div class="wh-pos-warn">Для расхода укажите цену</div>` : ''}
       </div>`;
-    }).join('')
-      + `<div class="editor-item editor-item--total">
-           <div class="editor-item-info"><div class="editor-item-name">Итого</div></div>
-           <div>${whMoney(totalCents, '')}</div>
-         </div>`;
+    }).join('');
 
     itemsEl.querySelectorAll('.wh-pos').forEach(el => {
       const i = Number(el.dataset.i);
@@ -6903,6 +6961,7 @@ async function renderWhInvoiceNew() {
           if (f === 'price') {
             // Цену вводят в деньгах, хранится и уходит на сервер в копейках.
             whDraft.items[i].price_cents = Math.round((Number(inp.value) || 0) * 100);
+            whDraft.items[i].priceTouched = true;
           } else if (f === 'quantity') {
             whDraft.items[i].quantity = Number(inp.value) || 0;
           } else {
@@ -6931,30 +6990,27 @@ async function renderWhInvoiceNew() {
   });
   document.getElementById('wh-cp').addEventListener('change', e => {
     whDraft.counterparty_id = e.target.value;
+    e.target.classList.toggle('form-input--placeholder', !e.target.value);
+    syncSave();
   });
   document.getElementById('wh-comment').addEventListener('input', e => {
     whDraft.comment = e.target.value;
   });
   document.getElementById('wh-add').addEventListener('click', () => {
     haptic('light');
-    whDraft.items.push({ product_id: products[0].product_id, quantity: 1, price_cents: 0 });
+    // Цена у расхода обязательна, поэтому новая строка начинается БЕЗ цены и
+    // держит кнопку неактивной, пока её не введут.
+    whDraft.items.push({ product_id: products[0].product_id, quantity: 1,
+                         price_cents: whDraft.type === 'outgoing' ? 0 : null, priceTouched: false });
     drawItems();
   });
 
   document.getElementById('wh-save').addEventListener('click', async () => {
     const btn = document.getElementById('wh-save');
-    // Валидация на фронте строгая: промежуточного draft'а нет, остатки
-    // двигаются сразу, и «откатить» можно только отменой накладной.
-    if (!whDraft.items.length) return toast('Добавьте хотя бы одну позицию', 'error');
-    if (whDraft.type === 'outgoing' && !whDraft.counterparty_id) {
-      return toast('Для расхода укажите контрагента', 'error');
-    }
-    for (const it of whDraft.items) {
-      if (!(Number(it.quantity) > 0)) return toast('Количество должно быть больше нуля', 'error');
-      if (whDraft.type === 'outgoing' && !(Number(it.price_cents) > 0)) {
-        return toast('Для расхода укажите цену каждой позиции', 'error');
-      }
-    }
+    // Кнопка неактивна, пока форма невалидна (formValid); повторная проверка
+    // здесь — на случай клика, успевшего до пересчёта. Промежуточного
+    // draft'а нет, остатки двигаются сразу, «откатить» можно только отменой.
+    if (!formValid()) { drawItems(); return; }
 
     btn.disabled = true;
     haptic('medium');
@@ -6977,7 +7033,7 @@ async function renderWhInvoiceNew() {
         // разбором по позициям). Показываем ЕЁ, а не «ошибку сервера»:
         // менеджеру надо понять, что править в форме. Черновик остаётся.
         toast(r.body.reason || r.error, 'error', { duration: 6000 });
-        btn.disabled = false;
+        syncSave();
         return;
       }
       const res = r.body;
@@ -6990,7 +7046,7 @@ async function renderWhInvoiceNew() {
       renderWhInvoicesTab();
     } catch (e) {
       toast(e.message || 'Не удалось сохранить', 'error');
-      btn.disabled = false;
+      syncSave();
     }
   });
 }
