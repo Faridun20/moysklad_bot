@@ -147,18 +147,28 @@ async def link_call(call_id: int, lead_id: int, *, user_id: int) -> dict:
     return {"ok": True, "call_id": call_id, "lead_id": lead_id}
 
 
+async def get_call(call_id: int) -> dict | None:
+    row = await adb_core.fetchrow("SELECT * FROM lead_calls WHERE id = $1", call_id)
+    return dict(row) if row else None
+
+
 async def delete_call(call_id: int) -> dict:
     rows = await adb_core.execute("DELETE FROM lead_calls WHERE id = $1", call_id)
     return {"ok": True} if rows else {"ok": False, "error": "Звонок не найден"}
 
 
 async def list_calls(
-    *, lead_id: int | None = None, unlinked: bool = False, limit: int = 100
+    *, lead_id: int | None = None, unlinked: bool = False, limit: int = 100,
+    manager_id: int | None = None,
 ) -> list[dict]:
-    """Журнал. `unlinked` — только те, кого ещё не нашли в Telegram."""
+    """Журнал. `unlinked` — только те, кого ещё не нашли в Telegram;
+    `manager_id` — только звонки этого менеджера (чужие ему не показываем)."""
     query = "SELECT * FROM lead_calls"
     params: list[Any] = []
     where = []
+    if manager_id is not None:
+        params.append(int(manager_id))
+        where.append(f"manager_id = ${len(params)}")
     if lead_id is not None:
         params.append(lead_id)
         where.append(f"lead_id = ${len(params)}")

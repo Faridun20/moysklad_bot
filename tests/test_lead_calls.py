@@ -441,6 +441,57 @@ def test_call_link_refuses_someone_elses_lead(isolated_db, monkeypatch):
     assert len(_run(lead_calls.list_calls(unlinked=True))) == 1
 
 
+def test_manager_touches_only_own_calls(isolated_db, monkeypatch):
+    """IDOR: звонок — телефон и заметка менеджера о разговоре. Менеджер видит,
+    связывает и удаляет только свои звонки и лиды; руководство — все."""
+    from services import lead_calls
+
+    db = isolated_db
+    _setup(db)
+    db.set_role(5, "mgr2", "Other", "manager")
+    client = _client(monkeypatch)
+    mine = _run(lead_calls.add_call(manager_id=1, phone="901111111"))["call_id"]
+    theirs = _run(lead_calls.add_call(manager_id=5, phone="905555555"))["call_id"]
+    my_lead = _lead(uid=100, manager_id=1)
+    their_lead = _lead(uid=200, manager_id=5)
+    _run(lead_calls.add_call(manager_id=5, lead_id=their_lead, note="чужой разговор"))
+
+    def ids(rows):
+        return {r["id"] for r in rows}
+
+    # Список «кому перезвонить» — только свои; руководству — все.
+    assert ids(client.post("/api/leads/list", json={"initData": "1"}).json()["unlinked_calls"]) == {mine}
+    assert ids(client.post("/api/leads/calls", json={"initData": "1"}).json()["calls"]) == {mine}
+    assert ids(client.post("/api/leads/list", json={"initData": "2"}).json()["unlinked_calls"]) == {mine, theirs}
+    assert ids(client.post("/api/leads/calls", json={"initData": "2"}).json()["calls"]) == {mine, theirs}
+
+    # Звонки по чужому лиду — нет.
+    res = client.post("/api/leads/calls", json={"initData": "1", "lead_id": their_lead})
+    assert res.status_code == 403
+    assert len(client.post("/api/leads/calls", json={"initData": "2", "lead_id": their_lead}).json()["calls"]) == 1
+
+    # Удалить чужой — нет, запись на месте.
+    res = client.post("/api/leads/call_delete", json={"initData": "1", "call_id": theirs})
+    assert res.status_code == 403
+    assert _run(lead_calls.get_call(theirs)) is not None
+
+    # Подшить чужой звонок к своему лиду — нет.
+    res = client.post("/api/leads/call_link", json={"initData": "1", "call_id": theirs, "lead_id": my_lead})
+    assert res.status_code == 403
+    assert _run(lead_calls.get_call(theirs))["lead_id"] is None
+
+    # Записать звонок в карточку чужого лида — нет.
+    res = client.post("/api/leads/call_add", json={"initData": "1", "lead_id": their_lead})
+    assert res.status_code == 403
+
+    # Свои — можно; руководство — любой.
+    assert client.post("/api/leads/call_link", json={
+        "initData": "1", "call_id": mine, "lead_id": my_lead}).status_code == 200
+    assert client.post("/api/leads/call_delete", json={"initData": "2", "call_id": theirs}).status_code == 200
+    assert _run(lead_calls.get_call(theirs)) is None
+    assert client.post("/api/leads/call_delete", json={"initData": "1", "call_id": 9999}).status_code == 404
+
+
 def test_call_link_on_a_missing_lead_is_404(isolated_db, monkeypatch):
     from services import lead_calls
 

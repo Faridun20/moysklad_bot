@@ -2278,7 +2278,10 @@ async def api_leads_list(request: Request):
         # Звонки без переписки — люди, которых в Telegram ещё нет. Отдаём вместе
         # со списком: это один экран «с кем сегодня работать», и второй запрос
         # ради него был бы лишним.
-        "unlinked_calls": await lead_calls.list_calls(unlinked=True, limit=50),
+        # Менеджеру — только свои: в звонке телефон и заметка чужого разговора.
+        "unlinked_calls": await lead_calls.list_calls(
+            unlinked=True, limit=50, manager_id=None if is_boss else user["id"],
+        ),
     })
 
 
@@ -2391,18 +2394,53 @@ async def api_leads_create_agent(request: Request):
     return JSONResponse({**res, "name": created["name"], "existed": created["existed"]})
 
 
+def _is_lead_boss(user: dict) -> bool:
+    return get_role(user["id"]) in ("admin", "boss")
+
+
+async def _require_own_lead(lead_id: int, user: dict) -> dict:
+    """Лид, к которому у пользователя есть доступ: руководству любой,
+    менеджеру — только свой (тот же гейт, что у карточки и статуса)."""
+    from services import leads
+
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if not _is_lead_boss(user) and lead.get("manager_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+    return lead
+
+
+async def _require_own_call(call_id: int, user: dict) -> dict:
+    """Звонок, который пользователь вправе трогать: руководству любой,
+    менеджеру — только записанный им самим."""
+    from services import lead_calls
+
+    call = await lead_calls.get_call(call_id)
+    if not call:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    if not _is_lead_boss(user) and call.get("manager_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Это не ваш звонок")
+    return call
+
+
 @app.post("/api/leads/calls")
 async def api_leads_calls(request: Request):
     """Журнал звонков. Без `lead_id` отдаёт непривязанные — тех, кого ещё не
-    нашли в Telegram; это и есть список «кому перезвонить»."""
+    нашли в Telegram; это и есть список «кому перезвонить».
+
+    Менеджер: по лиду — только по своему лиду; непривязанные — только свои."""
     from services import lead_calls
 
     data = await request.json()
-    _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_calls")
-    lead_id = data.get("lead_id")
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_calls")
+    lead_id = _machine_id_arg(data, "lead_id") if data.get("lead_id") else None
+    if lead_id is not None:
+        await _require_own_lead(lead_id, user)
     rows = await lead_calls.list_calls(
-        lead_id=_machine_id_arg(data, "lead_id") if lead_id else None,
-        unlinked=not lead_id,
+        lead_id=lead_id,
+        unlinked=lead_id is None,
+        manager_id=None if (lead_id is not None or _is_lead_boss(user)) else user["id"],
     )
     return JSONResponse({
         "ok": True,
@@ -2426,6 +2464,9 @@ async def api_leads_call_add(request: Request):
         rate_limit_max=120,
     )
     lead_id = data.get("lead_id")
+    if lead_id:
+        # Свой звонок к чужому клиенту не подшивается — как и в call_link.
+        await _require_own_lead(_machine_id_arg(data, "lead_id"), user)
     res = await lead_calls.add_call(
         manager_id=user["id"],
         phone=_machine_text(data, "phone", 64),
@@ -2447,24 +2488,18 @@ async def api_leads_call_link(request: Request):
     from services import lead_calls
 
     data = await request.json()
-    from services import leads
-
     data_user = _authorize(
         data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_link"
     )
     lead_id = _machine_id_arg(data, "lead_id")
+    call_id = _machine_id_arg(data, "call_id")
     # Тот же гейт, что у карточки и статуса: менеджер, который не может даже
-    # открыть чужого клиента, не должен подшивать к нему свой звонок.
-    lead = await leads.get_lead(lead_id)
-    if not lead:
-        raise HTTPException(status_code=404, detail="Лид не найден")
-    if (get_role(data_user["id"]) not in ("admin", "boss")
-            and lead.get("manager_id") != data_user["id"]):
-        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+    # открыть чужого клиента, не должен подшивать к нему свой звонок. И звонок
+    # тоже должен быть его: иначе чужой звонок уезжает в его карточку.
+    await _require_own_lead(lead_id, data_user)
+    await _require_own_call(call_id, data_user)
 
-    res = await lead_calls.link_call(
-        _machine_id_arg(data, "call_id"), lead_id, user_id=data_user["id"],
-    )
+    res = await lead_calls.link_call(call_id, lead_id, user_id=data_user["id"])
     return _machine_response(res)
 
 
@@ -2475,8 +2510,10 @@ async def api_leads_call_delete(request: Request):
     from services import lead_calls
 
     data = await request.json()
-    _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_delete")
-    res = await lead_calls.delete_call(_machine_id_arg(data, "call_id"))
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_delete")
+    call_id = _machine_id_arg(data, "call_id")
+    await _require_own_call(call_id, user)
+    res = await lead_calls.delete_call(call_id)
     return _machine_response(res)
 
 
