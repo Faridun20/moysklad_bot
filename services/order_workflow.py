@@ -748,6 +748,8 @@ async def approve_shipment_request(
     # Позиции без карточки номенклатуры в накладную не попадают. Молчать об
     # этом нельзя: недосписанный заказ — это расхождение склада.
     skipped_names: list[str] = []
+    # Заказ отменили между одобрением и списанием — ни накладной, ни автоплатежа.
+    order_moved = False
 
     if order and items:
         # Идемпотентно по `order_shipment.order_id`: повторное одобрение (два
@@ -790,6 +792,13 @@ async def approve_shipment_request(
                         name=f"shipment-pdf-{req_id}",
                     )
                     demand_line += " — печатная форма придёт следом 👇"
+        elif ship.get("code") == "order_moved":
+            order_moved = True
+            # Заказ успели отменить между одобрением и списанием (проверено под
+            # замком строки заказа). Списывать отменённое нельзя, и «нужна
+            # доделка» тут нет — докладываем как есть.
+            logger.info("Заявка #%s: %s — склад не списываем", req_id, ship.get("reason"))
+            demand_line = f"\n⚠️ {esc(str(ship.get('reason') or 'Заказ уже не одобрен'))} — остатки не списаны"
         else:
             reason = ship.get("reason", "неизвестная ошибка")
             logger.warning("Заявка #%s одобрена, но склад не списан: %s", req_id, reason)
@@ -858,9 +867,16 @@ async def approve_shipment_request(
 
     # Для paid-заказов автоматически создаём payment-pending,
     # чтобы босс одной кнопкой зафиксировал реальное получение денег.
-    if order and (order.get("payment_type") or "paid") == "paid":
-        total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
-        if total > 0.01:
+    if order and not order_moved and (order.get("payment_type") or "paid") == "paid":
+        # Сумма — в копейках, построчно через mul_qty: ровно так её считает
+        # закрытие заказа (get_order_payment_summary). Float-сумма дробных
+        # количеств расходилась с ней на копейку (2 × 1,5 × 0,33 = 0,99 против
+        # 1,00), платёж «на всю сумму» оставлял долг 0,01, и заказ не закрывался.
+        total_cents = money.add(
+            *(money.mul_qty(int(it.get("price_cents") or 0), it.get("quantity") or 0) for it in items)
+        )
+        if total_cents > 0:
+            total_major = money.from_cents(total_cents)
             currency = order.get("currency") or "USD"
             try:
                 existing = [
@@ -873,7 +889,7 @@ async def approve_shipment_request(
                         user_id=order["user_id"],
                         username="",
                         full_name=manager_name,
-                        amount=total,
+                        amount=total_major,
                         currency=currency,
                         comment=f"Оплата по заказу #{order['id']} (отгрузка одобрена)",
                         order_id=order["id"],

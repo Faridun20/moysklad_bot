@@ -495,23 +495,28 @@ def test_product_picker_categories_search_and_show_more(open_app, e2e):
     assert mgr.locator('.cat-btn[data-cat="all"]').get_attribute("aria-pressed") == "false"
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: одобренный заказ дважды вычитается из доступного остатка — "
-                                       "его списывает накладная и он же считается резервом")
 def test_product_picker_available_counts_approved_order_once(open_app, e2e):
     """На приходе 20, одобрен заказ на 2. Одобрение уже провело расходную
-    накладную (stock = 18), но `_reserved_by_product` ещё раз резервирует те
-    же 2 штуки по статусу approved — менеджер видит «доступно 16», и два ящика
-    нельзя продать, пока кладовщик не нажмёт «Отгрузить»."""
+    накладную (stock = 18). Раньше `_reserved_by_product` ещё раз резервировал
+    те же 2 штуки по статусу approved — менеджер видел «доступно 16», и два
+    ящика нельзя было продать, пока кладовщик не нажмёт «Отгрузить». Резерв —
+    только то, что ещё не списано: одобренная заявка на 3 без накладной
+    (отгрузка не прошла) из доступного вычитается."""
+    from services import order_shipment
+
     ids = e2e.ids
     seed_order(e2e)
     assert _stock(e2e) == 18
+    unshipped = seed_order(e2e, approve=False, qty=3)["order_id"]
+    e2e.exec("UPDATE orders SET status = 'approved' WHERE id = ?", (unshipped,))
+    e2e.run(order_shipment._remember_failure(unshipped, "не хватило"))
     mgr = open_app(ids["mgr"])
     _orders(mgr)
     mgr.click("#btn-new-order")
     mgr.click("#btn-add-product")
     row = mgr.locator(f'.prod-row[data-product="{ids["product"]}"]')
     row.wait_for()
-    assert float(row.get_attribute("data-stock")) == 18
+    assert float(row.get_attribute("data-stock")) == 15, "18 на складе − 3 в резерве; списанные 2 — не резерв"
 
 
 def test_new_order_reuses_empty_draft_and_back_returns_to_list(open_app, e2e):
@@ -535,36 +540,48 @@ def test_new_order_reuses_empty_draft_and_back_returns_to_list(open_app, e2e):
     assert e2e.rows("SELECT COUNT(*) AS n FROM orders WHERE user_id = ?", (e2e.ids["mgr"],))[0]["n"] == 1
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: в открытом повторно черновике «×» у позиции не удаляет её "
-                                       "на сервере (item_id = индекс строки, а не id позиции)")
 def test_reopened_draft_item_removal_reaches_server(open_app, e2e):
     """Черновик открыт из списка («Редактировать»), позицию удалили крестиком.
 
-    openOrderEditor подставляет позициям `item_id: i` — порядковый номер: у
-    первой это 0, и `if (item.item_id)` запрос не шлёт вовсе; у второй — 1,
-    то есть id ЧУЖОЙ позиции (сервер отвечает 403, ошибка проглатывается).
-    На экране позиции нет, а в заявку боссу она уходит.
+    openOrderEditor подставлял позициям `item_id: i` — порядковый номер: у
+    первой это 0, и `if (item.item_id)` запрос не слал вовсе; у второй — 1,
+    то есть id ЧУЖОЙ позиции (сервер отвечал 403, ошибка проглатывалась).
+    На экране позиции не было, а в заявку боссу она уходила. Теперь позиция
+    удаляется по своему id, а отказ сервера виден и строку не убирает.
     """
-    oid = _seed_draft(e2e, 1, 3)
+    other = _seed_draft(e2e, 7)  # позиции чужого заказа занимают младшие id
+    oid = _seed_draft(e2e, 1, 3, 5)
     mgr = open_app(e2e.ids["mgr"])
     _orders(mgr)
     mgr.click(f'.btn-edit-order[data-id="{oid}"]')
-    mgr.wait_for_function("() => document.querySelectorAll('.editor-item-del').length === 2")
+    mgr.wait_for_function("() => document.querySelectorAll('.editor-item-del').length === 3")
     mgr.click('.editor-item-del[data-idx="0"]')
+    mgr.wait_for_function("() => document.querySelectorAll('.editor-item-del').length === 2")
+    mgr.click('.editor-item-del[data-idx="1"]')
     mgr.wait_for_function("() => document.querySelectorAll('.editor-item-del').length === 1")
+    assert e2e.rows("SELECT quantity FROM order_items WHERE order_id = ?", (other,)) == [{"quantity": 7}]
+
+    # Отказ сервера (позицию уже удалили в другой вкладке) — сообщение, а
+    # строка остаётся: экран не должен расходиться с заявкой молча.
+    e2e.exec("DELETE FROM order_items WHERE order_id = ?", (oid,))
+    mgr.click('.editor-item-del[data-idx="0"]')
+    _wait_alert(mgr, "Позиция не удалена")
+    assert mgr.locator(".editor-item-del").count() == 1
+    e2e.db.add_order_item(oid, "Кабель ВВГ 3x2.5", "", 3, "м", 100.0, product_id=e2e.ids["product"])
+
     mgr.click("#btn-submit")
     _wait_alert(mgr, "отправлена")
     items = e2e.rows("SELECT quantity FROM order_items WHERE order_id = ?", (oid,))
     assert items == [{"quantity": 3}], "в заявке ровно то, что осталось на экране"
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: в открытом повторно черновике валюта не зафиксирована — "
-                                       "можно выбрать UZS, а сервер оставит заказ в USD")
 def test_reopened_draft_keeps_currency_locked(open_app, e2e):
     """Все позиции заказа — в одной валюте; фронт фиксирует её после первой
-    позиции. Но openOrderEditor не переносит `currency` из списка, и в
-    повторно открытом черновике переключатель снова свободен: цена 250 000
-    «в сумах» ляжет в долларовый заказ как 250 000 USD."""
+    позиции. openOrderEditor не переносил `currency` из списка, и в повторно
+    открытом черновике переключатель был снова свободен, а сервер молча
+    оставлял прежнюю валюту: цена 250 000 «в сумах» ложилась в долларовый
+    заказ как 250 000 USD. Теперь валюта зафиксирована и на экране, и на
+    сервере (другая валюта в заказе с позициями — отказ)."""
     oid = _seed_draft(e2e, 1, currency="USD")
     ids = e2e.ids
     mgr = open_app(ids["mgr"])
@@ -575,14 +592,22 @@ def test_reopened_draft_keeps_currency_locked(open_app, e2e):
     mgr.click(f'.prod-row[data-product="{ids["product"]}"]')
     mgr.wait_for_selector("#qty-input")
     assert mgr.locator('.cur-btn[data-cur="UZS"]').is_disabled(), "валюта заказа уже USD"
+    assert mgr.locator('.cur-btn.active[data-cur="USD"]').count() == 1
+
+    # Мимо экрана (старый клиент, ретрай) — сервер отказывает, а не пишет доллары.
+    res = _api(mgr, "/api/orders/add_item", {
+        "order_id": oid, "product_name": "Кабель ВВГ 3x2.5", "product_id": str(ids["product"]),
+        "quantity": 1, "unit": "м", "price": 250000, "currency": "UZS",
+    })
+    assert res["status"] == 409 and "USD" in res["body"]["detail"], res
+    assert _order(e2e, oid)["currency"] == "USD"
+    assert e2e.rows("SELECT COUNT(*) AS n FROM order_items WHERE order_id = ?", (oid,))[0]["n"] == 1
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: черновик после доработки открывается с «Оплачено сразу» — "
-                                       "переотправка молча превращает долг в оплату")
 def test_reopened_draft_keeps_payment_type(open_app, e2e):
     """Заявку «в долг» вернули на доработку. Менеджер открыл черновик и нажал
-    «Отправить» — редактор не взял `payment_type`/`due_date` из заказа, и
-    заявка ушла как «оплачено сразу» (после одобрения — ожидающий платёж на
+    «Отправить» — редактор не брал `payment_type`/`due_date` из заказа, и
+    заявка уходила как «оплачено сразу» (после одобрения — ожидающий платёж на
     всю сумму вместо долга)."""
     from services.order_workflow import return_order_to_draft
 
@@ -594,6 +619,8 @@ def test_reopened_draft_keeps_payment_type(open_app, e2e):
     _orders(mgr)
     mgr.click(f'.btn-edit-order[data-id="{seeded["order_id"]}"]')
     mgr.wait_for_selector("#btn-submit:not([disabled])")
+    assert mgr.locator('.seg-item.active[data-pay="credit"]').count() == 1
+    assert mgr.input_value("#due-date-input") == "2030-01-15"
     mgr.click("#btn-submit")
     mgr.wait_for_function("() => window.__tgAlerts.some(a => a.includes('отправлена') || a.startsWith('⚠️'))")
     o = _order(e2e, seeded["order_id"])
@@ -881,18 +908,31 @@ def test_boss_cancels_approved_order_and_stock_returns(open_app, e2e):
     assert card.locator(".btn-cancel-order, .btn-ship-order").count() == 0
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: отменённый заказ (status=cancelled) не попадает в фильтр "
-                                       "«Отменены» — тот ищет только rejected")
 def test_cancelled_order_is_listed_under_cancelled_filter(open_app, e2e):
-    from services.order_workflow import cancel_order_full
+    """«Отменены» — оба исхода «продажа не состоялась»: отклонённая заявка
+    (rejected) и отменённый после одобрения заказ (cancelled). Фильтр искал
+    только rejected, и отменённый заказ находился лишь во «Всех». Какой из
+    двух исходов — говорит бейдж на карточке."""
+    from services.order_workflow import cancel_order_full, reject_shipment_request
 
     ids = e2e.ids
     oid = seed_order(e2e)["order_id"]
     assert e2e.run(cancel_order_full(oid, ids["boss"], "Boss", "Клиент передумал"))["ok"]
-    boss = open_app(ids["boss"])
-    _orders(boss)
-    _filter(boss, "rejected")  # подпись кнопки — «Отменены»
-    assert oid in _card_ids(boss)
+    rej = seed_order(e2e, payment_type="paid", due_date=None, approve=False, qty=1)
+    assert e2e.run(reject_shipment_request(rej["req_id"], ids["boss"], "Boss", e2e.bot))["ok"]
+    live = seed_order(e2e, qty=1)["order_id"]
+
+    for role in ("boss", "mgr"):
+        page = open_app(ids[role])
+        _orders(page)
+        label = page.locator('.seg-item[data-filter="rejected"]').inner_text()
+        assert "Отменены" in label, role
+        _filter(page, "rejected")
+        assert _card_ids(page) == {oid, rej["order_id"]}, role
+        assert live not in _card_ids(page), role
+        badges = {page.locator(f'.order-card[data-id="{i}"] .order-status').text_content().strip()
+                  for i in (oid, rej["order_id"])}
+        assert badges == {"Отменён", "Отклонено"}, (role, badges)
 
 
 def test_boss_ships_order_notifies_manager_and_cancel_is_closed(open_app, e2e):
@@ -1038,13 +1078,11 @@ def test_manager_report_is_personal_without_export(open_app, e2e):
     mgr.wait_for_selector(".rev-row")
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: личный отчёт менеджера считает только approved/shipped — "
-                                       "оплаченный заказ (status=paid) пропадает из его выручки")
 def test_manager_report_keeps_sale_after_it_is_paid(open_app, e2e):
     """Клиент рассчитался, сдача подтверждена — заказ стал `paid`. Продажа от
-    этого не перестала быть продажей, но `_personal_analytics` фильтрует
+    этого не перестала быть продажей, но `_personal_analytics` фильтровал
     `status in ("approved", "shipped")`, и выручка менеджера за период
-    обнуляется (в отчёте руководства та же продажа остаётся)."""
+    обнулялась (в отчёте руководства та же продажа оставалась)."""
     from services.database import confirm_cash_deposit, create_cash_deposit, mark_order_shipped
 
     ids = e2e.ids

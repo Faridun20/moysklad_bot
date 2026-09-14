@@ -643,7 +643,7 @@ async def api_home(request: Request):
         relevant_today = [
             o
             for o in my_orders
-            if o["status"] in ("approved", "shipped")
+            if o["status"] in _PERSONAL_SALE_STATUSES
             and (o.get("updated_at") or o.get("created_at") or "")[:10] == today_iso
         ]
         items_by_order = (
@@ -1072,6 +1072,14 @@ def _resolve_analytics_period(data: dict, now):
     return since, now, prev_since, label
 
 
+# Статусы, в которых заказ — состоявшаяся продажа менеджера (личный отчёт и
+# «Сегодня»). Оплата и частичный возврат продажу не отменяют: после
+# подтверждённой сдачи заказ становится `paid`, и фильтр по approved/shipped
+# молча выкидывал его из выручки. Полный возврат (`returned`) и отмена — не
+# продажа.
+_PERSONAL_SALE_STATUSES = ("approved", "shipped", "paid", "partially_returned")
+
+
 def _ts(o: dict) -> str:
     """Достать timestamp заказа как строку YYYY-MM-DD HH:MM:SS.
     Защищаемся от случаев когда updated_at — datetime-объект (Postgres),
@@ -1111,7 +1119,7 @@ async def _personal_analytics(
     relevant = [
         o
         for o in orders
-        if o["status"] in ("approved", "shipped") and prev_since_iso <= _ts(o) <= until_iso
+        if o["status"] in _PERSONAL_SALE_STATUSES and prev_since_iso <= _ts(o) <= until_iso
     ]
 
     # Диагностический лог — увидим в Railway почему аналитика пуста,
@@ -1121,7 +1129,7 @@ async def _personal_analytics(
         "period=[%s..%s] (prev_since=%s)",
         user_id,
         len(orders),
-        sum(1 for o in orders if o["status"] in ("approved", "shipped")),
+        sum(1 for o in orders if o["status"] in _PERSONAL_SALE_STATUSES),
         len(relevant),
         since_iso,
         until_iso,
@@ -2599,6 +2607,9 @@ async def api_orders(request: Request):
             "rejection_comment": o.get("rejection_comment") or "",
             "items": [
                 {
+                    # id позиции — им редактор удаляет строку (`/api/orders/remove_item`).
+                    # Без него фронт подставлял порядковый номер и бил в чужую позицию.
+                    "id": it["id"],
                     "name": it["product_name"],
                     "quantity": it["quantity"],
                     "unit": it["unit"],
@@ -5063,13 +5074,21 @@ async def api_add_item(request: Request):
                     detail=f"Цена ниже минимальной ({sale_min:g})",
                 )
 
-    # Если в payload пришла валюта и она ещё не зафиксирована на ордере —
-    # сохраняем. Все позиции одного ордера должны быть в одной валюте.
+    # Все позиции одного ордера — в одной валюте. Пустой заказ валюту берёт
+    # из позиции (и может сменить, если позиции удалили). Заказ с позициями
+    # другую валюту ОТВЕРГАЕТ: раньше сервер молча оставлял прежнюю, и цена,
+    # введённая в сумах, ложилась в долларовый заказ как доллары.
     from config import ALLOWED_CURRENCIES
 
     requested_currency = (data.get("currency") or "").upper()
     if requested_currency and requested_currency in ALLOWED_CURRENCIES:
-        if not order.get("currency"):
+        current_currency = (order.get("currency") or "").upper()
+        if current_currency != requested_currency:
+            if current_currency and await adb.get_order_items(data["order_id"]):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Валюта заказа — {current_currency}: все позиции в одной валюте",
+                )
             await adb.update_order_currency(data["order_id"], requested_currency)
 
     item_id = await adb.add_order_item(
