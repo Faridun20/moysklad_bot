@@ -820,8 +820,6 @@ def test_boss_deletes_container_with_its_items(open_app, e2e):
     assert any("Удалить контейнер DELE0000001" in a for a in alerts(boss))
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: удаление оприходованного контейнера оставляет его "
-                   "приходную накладную проведённой — остаток не откатывается (services/containers.py:256)")
 def test_deleting_received_container_rolls_back_its_stock(open_app, e2e):
     from services import container_receipt, containers
 

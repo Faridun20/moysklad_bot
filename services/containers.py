@@ -267,23 +267,64 @@ async def delete_container(container_id: int, *, user_id: int, full_name: str = 
     Дочерние таблицы перечислены одним списком, чтобы следующую было видно куда
     добавлять.
     """
-    async with adb_core.transaction() as txn:
-        row = await txn.fetchrow(
-            "SELECT number, status, arrived_at FROM containers WHERE id = $1", container_id
-        )
-        if not row:
-            return {"ok": False, "error": "Контейнер не найден"}
-        window = edit_window(dict(row))
-        if not window["open"]:
-            return {
-                "ok": False,
-                "error": f"Приёмка закрыта — правки принимались {EDIT_WINDOW_HOURS} ч после прибытия",
-            }
-        for child in CHILD_TABLES:
-            await txn.execute(f"DELETE FROM {child} WHERE container_id = $1", container_id)
-        await txn.execute("DELETE FROM containers WHERE id = $1", container_id)
-    await _audit(user_id, full_name, "container_deleted", f"#{container_id} · {row['number']}")
-    return {"ok": True}
+    from services import warehouse
+
+    cancelled_invoice = None
+    try:
+        async with adb_core.transaction() as txn:
+            if USE_POSTGRES:
+                # Тот же замок, что у приёмки: удаление не должно разминуться с
+                # приёмкой, которая как раз проводит накладную этого контейнера.
+                await txn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    f"container:receive:{container_id}",
+                )
+            row = await txn.fetchrow(
+                "SELECT number, status, arrived_at FROM containers WHERE id = $1", container_id
+            )
+            if not row:
+                return {"ok": False, "error": "Контейнер не найден"}
+            window = edit_window(dict(row))
+            if not window["open"]:
+                return {
+                    "ok": False,
+                    "error": f"Приёмка закрыта — правки принимались {EDIT_WINDOW_HOURS} ч после прибытия",
+                }
+            # Оприходованный контейнер уносит с собой свою приходную накладную.
+            # Иначе строка container_receipt исчезала, а накладная оставалась
+            # проведённой: товар «ошибочного» контейнера навсегда оставался на
+            # складе, и отменить его было не из чего. Отмена — той же
+            # транзакцией и через warehouse (остаток не уходит в минус); товар
+            # уже отгружен — удаление отказывает целиком.
+            receipt = await txn.fetchrow(
+                "SELECT invoice_id FROM container_receipt WHERE container_id = $1", container_id
+            )
+            invoice_id = (receipt or {}).get("invoice_id")
+            if invoice_id:
+                status = await txn.fetchval(
+                    "SELECT status FROM invoices WHERE id = $1", int(invoice_id)
+                )
+                if status is not None and status != "cancelled":
+                    await warehouse.cancel_invoice_in(txn, int(invoice_id), user_id)
+                    cancelled_invoice = int(invoice_id)
+            for child in CHILD_TABLES:
+                await txn.execute(f"DELETE FROM {child} WHERE container_id = $1", container_id)
+            await txn.execute("DELETE FROM containers WHERE id = $1", container_id)
+    except warehouse.InvoiceError as e:
+        logger.info("Удаление контейнера #%s отклонено (%s): %s", container_id, e.code, e.message)
+        if e.code == "insufficient_stock":
+            error = (
+                "Нельзя удалить: товар из этого контейнера уже отгружен, и отмена его "
+                "прихода увела бы остаток в минус. Сначала отмените расходные накладные."
+            )
+        else:
+            error = f"Нельзя удалить: не удалось отменить приход контейнера — {e.message}"
+        return {"ok": False, "code": e.code, "error": error, "details": e.details}
+    details = f"#{container_id} · {row['number']}"
+    if cancelled_invoice:
+        details += f" · приход (накладная #{cancelled_invoice}) отменён"
+    await _audit(user_id, full_name, "container_deleted", details)
+    return {"ok": True, "invoice_cancelled": cancelled_invoice}
 
 
 # ─── Состав ──────────────────────────────────────────────────────────────────

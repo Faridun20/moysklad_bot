@@ -1259,9 +1259,12 @@ def test_document_list_resend_print_error_and_missing_file(open_app, e2e, monkey
         e2e.db.set_setting(key, value, e2e.ids["boss"])
     base = {"doc_type": "raspiska_ru", "product_name": "Кран", "total_amount": "5000",
             "term_months": "5", "installments_count": "5", "city": "Самарканд"}
-    kept = e2e.run(documents.create_document({**base, "debtor_full_name": "Живой Файл"}, created_by=e2e.ids["boss"]))
-    lost = e2e.run(documents.create_document({**base, "debtor_full_name": "Пропал Файл"}, created_by=e2e.ids["boss"]))
-    assert kept["ok"] and lost["ok"]
+    # Менеджер видит только свои документы (в расписке паспорт должника),
+    # поэтому составитель — он; чужой документ руководства в списке не появится.
+    kept = e2e.run(documents.create_document({**base, "debtor_full_name": "Живой Файл"}, created_by=e2e.ids["mgr"]))
+    lost = e2e.run(documents.create_document({**base, "debtor_full_name": "Пропал Файл"}, created_by=e2e.ids["mgr"]))
+    foreign = e2e.run(documents.create_document({**base, "debtor_full_name": "Чужой Должник"}, created_by=e2e.ids["boss"]))
+    assert kept["ok"] and lost["ok"] and foreign["ok"]
     Path(lost["file"]).unlink()
 
     printed: list[str] = []
@@ -1280,6 +1283,7 @@ def test_document_list_resend_print_error_and_missing_file(open_app, e2e, monkey
     assert gone.get_attribute("data-status") == "rejected"
     assert "файл не найден" in gone.inner_text()
     assert gone.locator("[data-doc-send], [data-doc-print]").count() == 0
+    assert mgr.locator(f'[data-doc="{foreign["id"]}"]').count() == 0
 
     mgr.click(f'[data-doc-send="{kept["id"]}"]')
     mgr.wait_for_selector(".toast:has-text('Документ отправлен вам в Telegram')")

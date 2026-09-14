@@ -9,6 +9,7 @@ import binascii
 import logging
 import math
 import os
+import re
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -193,6 +194,22 @@ if _dev_bypass_user() is not None:
 app = FastAPI(title="Склад WebApp")
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception(request: Request, exc: Exception):
+    """Необработанная ошибка ручки: клиенту — короткий текст без внутренностей
+    (раньше в detail уезжал `str(e)` вплоть до текста SQL), в лог — трасса,
+    админам — алерт в Telegram с дросселем (`services.error_alerts`). Алерт
+    уходит фоном: ответ не ждёт сети до Telegram."""
+    from services import error_alerts
+    from utils.background import spawn
+
+    spawn(
+        error_alerts.report_exception(exc, where=f"webapp {request.method} {request.url.path}"),
+        name="error-alert",
+    )
+    return JSONResponse({"detail": error_alerts.USER_MESSAGE}, status_code=500)
+
+
 @app.on_event("shutdown")
 async def _drain_background_tasks() -> None:
     """Дождаться фоновых задач (печатная форма после одобрения) перед остановкой.
@@ -217,6 +234,82 @@ async def _drain_background_tasks() -> None:
 from starlette.middleware.gzip import GZipMiddleware  # noqa: E402
 
 app.add_middleware(GZipMiddleware, minimum_size=500)
+
+
+# ─── Потолок размера тела запроса ─────────────────────────────────────────────
+#
+# Все ручки читают `await request.json()` ДО `_authorize`: тело любого размера
+# от кого угодно (даже без initData) целиком ложилось в память и парсилось.
+# Потолок режет это на входе. Самый крупный законный запрос — фото base64 в
+# JSON: до 5 МБ байтов (`_PHOTO_MAX_BYTES`) → ~6,7 МБ base64 + поля; фронт при
+# этом ещё и ужимает снимок (`shrinkImage`). 8 МБ оставляют запас.
+MAX_BODY_BYTES = 8 * 1024 * 1024
+_BODY_TOO_LARGE = "Слишком большой запрос"
+
+
+class _BodyTooLarge(Exception):
+    """Тело перевалило потолок посреди чтения (chunked без Content-Length)."""
+
+
+def _is_body_too_large(exc: BaseException) -> bool:
+    if isinstance(exc, _BodyTooLarge):
+        return True
+    # BaseHTTPMiddleware (метрики) гоняет приложение в task group — исключение
+    # может приехать завёрнутым в ExceptionGroup.
+    return isinstance(exc, BaseExceptionGroup) and any(
+        _is_body_too_large(e) for e in exc.exceptions
+    )
+
+
+class _BodySizeLimitMiddleware:
+    """Чистый ASGI: считает байты ПО МЕРЕ чтения, а не только Content-Length —
+    chunked-запрос без заголовка иначе прошёл бы мимо."""
+
+    def __init__(self, app, max_bytes: int = MAX_BODY_BYTES):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def _reject(self, scope, receive, send) -> None:
+        response = JSONResponse({"detail": _BODY_TOO_LARGE}, status_code=413)
+        await response(scope, receive, send)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        for name, value in scope.get("headers") or ():
+            if name == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = 0
+                if declared > self.max_bytes:
+                    return await self._reject(scope, receive, send)
+                break
+
+        received = 0
+        started = False
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body") or b"")
+                if received > self.max_bytes:
+                    raise _BodyTooLarge()
+            return message
+
+        async def tracking_send(message):
+            nonlocal started
+            if message.get("type") == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracking_send)
+        except BaseException as exc:
+            if not _is_body_too_large(exc) or started:
+                raise
+            await self._reject(scope, receive, send)
 
 
 # ─── Metrics middleware: латентность + status-code counters для /api/* ─────
@@ -255,6 +348,11 @@ async def _metrics_middleware(request: Request, call_next):
         raise
     finally:
         _metrics.record_timing(metric_name, (_time.perf_counter() - start) * 1000.0)
+
+
+# Последним — значит самым внешним из пользовательских: лишнее тело режется
+# раньше метрик и gzip.
+app.add_middleware(_BodySizeLimitMiddleware, max_bytes=MAX_BODY_BYTES)
 
 
 class CachedStaticFiles(StaticFiles):
@@ -1022,10 +1120,8 @@ async def api_analytics_export(request: Request):
     )
     now = datetime.now()
     since, until, prev_since, label = _resolve_analytics_period(data, now)
-    try:
-        payload = await _company_analytics_payload(since, until, prev_since, label)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # Сбой сборки — в общий обработчик: трасса в лог, клиенту без внутренностей.
+    payload = await _company_analytics_payload(since, until, prev_since, label)
 
     xlsx_bytes = await asyncio.to_thread(build_analytics_xlsx, payload)
     fname = f"analytics-{(label or 'report').replace(' ', '_').replace('—', '-')[:40]}.xlsx"
@@ -1291,9 +1387,9 @@ async def api_payments_history(request: Request):
         # to_thread не блокирует event loop, пока psycopg2 ждёт ответа БД
         rows = await asyncio.to_thread(_load)
         return JSONResponse({"payments": rows})
-    except Exception as e:
-        logger.exception("payments/history failed for user_id=%s", user_id)
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.error("payments/history failed for user_id=%s", user_id)
+        raise  # общий обработчик: трасса в лог, клиенту без str(e)
 
 
 @app.post("/api/cash/history")
@@ -1484,6 +1580,23 @@ def _validate_quantity(raw) -> float:
     if not (math.isfinite(qty) and 0 < qty < 1_000_000):
         raise HTTPException(status_code=400, detail="Неверное количество")
     return qty
+
+
+_UNIT_MAX = 16
+# Единица измерения — короткое слово («шт», «кг», «м²», «уп.»): буквы, цифры,
+# пробел и немного пунктуации. Остальное (в т.ч. `<`, `>`, кавычки) выкидываем.
+_UNIT_JUNK = re.compile(r"[^\w .,/%²³-]", re.UNICODE)
+
+
+def _clean_unit(raw) -> str:
+    """Единица позиции заказа: белый список символов и потолок длины.
+
+    Поле уходит в интерфейс руководства и в печатную форму; без проверки в
+    нём приезжала разметка любой длины (stored-XSS, если где-то забыли
+    экранирование). Фронт экранирует и сам — это второй рубеж, а не первый.
+    """
+    unit = _UNIT_JUNK.sub("", str(raw or "")).strip()[:_UNIT_MAX].strip()
+    return unit or "шт"
 
 
 def _require_draft_order(order) -> None:
@@ -2317,7 +2430,10 @@ async def api_leads_list(request: Request):
         # Звонки без переписки — люди, которых в Telegram ещё нет. Отдаём вместе
         # со списком: это один экран «с кем сегодня работать», и второй запрос
         # ради него был бы лишним.
-        "unlinked_calls": await lead_calls.list_calls(unlinked=True, limit=50),
+        # Менеджеру — только свои: в звонке телефон и заметка чужого разговора.
+        "unlinked_calls": await lead_calls.list_calls(
+            unlinked=True, limit=50, manager_id=None if is_boss else user["id"],
+        ),
     })
 
 
@@ -2430,18 +2546,53 @@ async def api_leads_create_agent(request: Request):
     return JSONResponse({**res, "name": created["name"], "existed": created["existed"]})
 
 
+def _is_lead_boss(user: dict) -> bool:
+    return get_role(user["id"]) in ("admin", "boss")
+
+
+async def _require_own_lead(lead_id: int, user: dict) -> dict:
+    """Лид, к которому у пользователя есть доступ: руководству любой,
+    менеджеру — только свой (тот же гейт, что у карточки и статуса)."""
+    from services import leads
+
+    lead = await leads.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Лид не найден")
+    if not _is_lead_boss(user) and lead.get("manager_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+    return lead
+
+
+async def _require_own_call(call_id: int, user: dict) -> dict:
+    """Звонок, который пользователь вправе трогать: руководству любой,
+    менеджеру — только записанный им самим."""
+    from services import lead_calls
+
+    call = await lead_calls.get_call(call_id)
+    if not call:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    if not _is_lead_boss(user) and call.get("manager_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Это не ваш звонок")
+    return call
+
+
 @app.post("/api/leads/calls")
 async def api_leads_calls(request: Request):
     """Журнал звонков. Без `lead_id` отдаёт непривязанные — тех, кого ещё не
-    нашли в Telegram; это и есть список «кому перезвонить»."""
+    нашли в Telegram; это и есть список «кому перезвонить».
+
+    Менеджер: по лиду — только по своему лиду; непривязанные — только свои."""
     from services import lead_calls
 
     data = await request.json()
-    _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_calls")
-    lead_id = data.get("lead_id")
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_calls")
+    lead_id = _machine_id_arg(data, "lead_id") if data.get("lead_id") else None
+    if lead_id is not None:
+        await _require_own_lead(lead_id, user)
     rows = await lead_calls.list_calls(
-        lead_id=_machine_id_arg(data, "lead_id") if lead_id else None,
-        unlinked=not lead_id,
+        lead_id=lead_id,
+        unlinked=lead_id is None,
+        manager_id=None if (lead_id is not None or _is_lead_boss(user)) else user["id"],
     )
     return JSONResponse({
         "ok": True,
@@ -2465,6 +2616,9 @@ async def api_leads_call_add(request: Request):
         rate_limit_max=120,
     )
     lead_id = data.get("lead_id")
+    if lead_id:
+        # Свой звонок к чужому клиенту не подшивается — как и в call_link.
+        await _require_own_lead(_machine_id_arg(data, "lead_id"), user)
     res = await lead_calls.add_call(
         manager_id=user["id"],
         phone=_machine_text(data, "phone", 64),
@@ -2486,24 +2640,18 @@ async def api_leads_call_link(request: Request):
     from services import lead_calls
 
     data = await request.json()
-    from services import leads
-
     data_user = _authorize(
         data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_link"
     )
     lead_id = _machine_id_arg(data, "lead_id")
+    call_id = _machine_id_arg(data, "call_id")
     # Тот же гейт, что у карточки и статуса: менеджер, который не может даже
-    # открыть чужого клиента, не должен подшивать к нему свой звонок.
-    lead = await leads.get_lead(lead_id)
-    if not lead:
-        raise HTTPException(status_code=404, detail="Лид не найден")
-    if (get_role(data_user["id"]) not in ("admin", "boss")
-            and lead.get("manager_id") != data_user["id"]):
-        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+    # открыть чужого клиента, не должен подшивать к нему свой звонок. И звонок
+    # тоже должен быть его: иначе чужой звонок уезжает в его карточку.
+    await _require_own_lead(lead_id, data_user)
+    await _require_own_call(call_id, data_user)
 
-    res = await lead_calls.link_call(
-        _machine_id_arg(data, "call_id"), lead_id, user_id=data_user["id"],
-    )
+    res = await lead_calls.link_call(call_id, lead_id, user_id=data_user["id"])
     return _machine_response(res)
 
 
@@ -2514,8 +2662,10 @@ async def api_leads_call_delete(request: Request):
     from services import lead_calls
 
     data = await request.json()
-    _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_delete")
-    res = await lead_calls.delete_call(_machine_id_arg(data, "call_id"))
+    user = _authorize(data, allowed_roles=_LEAD_ROLES, rate_limit_scope="api_leads_call_delete")
+    call_id = _machine_id_arg(data, "call_id")
+    await _require_own_call(call_id, user)
+    res = await lead_calls.delete_call(call_id)
     return _machine_response(res)
 
 
@@ -3732,6 +3882,7 @@ async def api_machines_payment(request: Request):
     в «Продана» сам: закрывать руками после последнего платежа значит однажды
     забыть это сделать.
     """
+    from services import async_db as adb
     from services import machines
 
     data = await request.json()
@@ -3740,9 +3891,23 @@ async def api_machines_payment(request: Request):
     )
     payment_id = _machine_id_arg(data, "payment_id")
     paid = data.get("paid", True)
-    res = await machines.pay_installment(
-        payment_id, user_id=user["id"], full_name=_actor_name(user), paid=bool(paid)
-    )
+    # Двойной тап «оплачен» с тем же ключом отдаёт результат первого, а не
+    # второе поступление. Сервис дополнительно сериализует записи по сделке.
+    idem = _Idem(adb, "machine_payment", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await machines.pay_installment(
+            payment_id, user_id=user["id"], full_name=_actor_name(user), paid=bool(paid)
+        )
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
     return _machine_response(res)
 
 
@@ -4379,6 +4544,7 @@ async def api_containers_supply(request: Request):
     Повторный вызов ПЕРЕОПРИХОДУЕТ: прежний приход отменяется, новый создаётся
     с актуальными количествами.
     """
+    from services import async_db as adb
     from services import container_receipt
 
     data = await request.json()
@@ -4387,7 +4553,22 @@ async def api_containers_supply(request: Request):
         rate_limit_max=20,
     )
     container_id = _machine_id_arg(data, "container_id")
-    res = await container_receipt.receive(container_id, user_id=user["id"])
+    # Двойной тап с одним ключом отдаёт итог первой приёмки, а не переоприходует
+    # второй раз (лишняя отменённая накладная в истории). Параллельные приёмки
+    # без ключа сериализует сам сервис.
+    idem = _Idem(adb, "container_supply", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await container_receipt.receive(container_id, user_id=user["id"])
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
     return _machine_response(res)
 
 
@@ -5150,7 +5331,7 @@ async def api_add_item(request: Request):
         product_name=data["product_name"],
         product_href="",
         quantity=quantity,
-        unit=data.get("unit", "шт"),
+        unit=_clean_unit(data.get("unit")),
         price=price,
         note=data.get("note", ""),
         product_id=int(product_ref) if product_ref.isdigit() else None,
@@ -6145,9 +6326,22 @@ async def api_docs_list(request: Request):
     from services import documents, printing
 
     data = await request.json()
-    _authorize(data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_list", rate_limit_max=120)
-    rows = await documents.list_documents(limit=100)
+    user = _authorize(data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_list", rate_limit_max=120)
+    # Менеджер видит только свои документы (в них паспорт и адрес должника).
+    own = None if get_role(user["id"]) in documents.DOC_ADMIN_ROLES else user["id"]
+    rows = await documents.list_documents(limit=100, created_by=own)
     return JSONResponse({"documents": rows, "can_print": printing.is_available()})
+
+
+async def _doc_for_user(data: dict, user: dict) -> dict:
+    """Документ по `doc_id` с проверкой владельца. Чужой отвечает тем же 404,
+    что и несуществующий: перебором id не узнать, какие документы есть."""
+    from services import documents
+
+    doc = await documents.get_document(_doc_id_arg(data))
+    if doc is None or not documents.can_access(doc, user["id"], get_role(user["id"])):
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    return doc
 
 
 def _doc_id_arg(data: dict) -> int:
@@ -6167,9 +6361,7 @@ async def api_docs_send(request: Request):
 
     data = await request.json()
     user = _authorize(data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_send", rate_limit_max=30)
-    doc = await documents.get_document(_doc_id_arg(data))
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Документ не найден")
+    doc = await _doc_for_user(data, user)
     delivery = await documents.send_to_chat(await get_notify_bot(), doc, user["id"])
     if not delivery.get("sent"):
         return JSONResponse({"ok": False, "error": delivery.get("reason")})
@@ -6183,9 +6375,7 @@ async def api_docs_print(request: Request):
 
     data = await request.json()
     user = _authorize(data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_print", rate_limit_max=30)
-    doc = await documents.get_document(_doc_id_arg(data))
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Документ не найден")
+    doc = await _doc_for_user(data, user)
     if not printing.is_available():
         return JSONResponse({"ok": False, "error": "Печать не настроена на этом сервере"})
     found = await asyncio.to_thread(documents.read_pdf, doc)
@@ -6382,6 +6572,37 @@ async def api_wh_invoice_send(request: Request):
     return JSONResponse({"ok": True, "sent": True})
 
 
+async def _invoice_owner_refusal(invoice_id: int) -> dict | None:
+    """Отказ для накладной, привязанной к заказу/контейнеру; None — отменять можно."""
+    from services import adb_core
+
+    order_id = await adb_core.fetchval(
+        "SELECT order_id FROM order_shipment WHERE invoice_id = $1", invoice_id
+    )
+    if order_id is not None:
+        reason = (
+            f"Эта накладная — отгрузка заказа #{order_id}. Отмените заказ: "
+            "отмена заказа сама вернёт товар на склад и закроет долг."
+        )
+        return {"ok": False, "code": "linked_order", "order_id": int(order_id),
+                "reason": reason, "detail": reason}
+    container = await adb_core.fetchrow(
+        "SELECT r.container_id, c.number FROM container_receipt r "
+        "LEFT JOIN containers c ON c.id = r.container_id WHERE r.invoice_id = $1",
+        invoice_id,
+    )
+    if container is not None:
+        label = container.get("number") or f"#{container['container_id']}"
+        reason = (
+            f"Эта накладная — приход контейнера {label}. Отмените контейнер "
+            "(удалите его или переоприходуйте), а не накладную."
+        )
+        return {"ok": False, "code": "linked_container",
+                "container_id": int(container["container_id"]),
+                "reason": reason, "detail": reason}
+    return None
+
+
 @app.post("/api/wh/invoices/cancel")
 async def api_wh_invoice_cancel(request: Request):
     """Отменить накладную. Только босс/админ — откат двигает остатки назад."""
@@ -6399,6 +6620,15 @@ async def api_wh_invoice_cancel(request: Request):
         invoice_id = int(data.get("invoice_id"))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="invoice_id обязателен")
+
+    # Накладная, которую провёл заказ или контейнер, отменяется ЧЕРЕЗ них.
+    # Прямая отмена возвращала остаток, но заказ оставался «отгружен» с долгом
+    # за товар, который вернулся на склад, а контейнер — «оприходован» со
+    # ссылкой на отменённый приход (переоприходовать его после этого было
+    # нельзя, удалить — тоже без ошибки).
+    linked = await _invoice_owner_refusal(invoice_id)
+    if linked:
+        return JSONResponse(linked, status_code=409)
 
     result = await warehouse.cancel_invoice(invoice_id, cancelled_by=user["id"])
     if not result.get("ok"):

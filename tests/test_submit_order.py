@@ -258,3 +258,26 @@ def test_submit_rejects_credit_without_due_date(isolated_db):
     assert res["ok"] is False
     assert "дату возврата" in res["error"].lower()
     assert _order(db, oid)["status"] == "draft"
+
+
+# ─── Ключ идемпотентности живёт с черновиком (п.8 аудита) ───────────────────
+
+
+def test_refusal_does_not_poison_the_form_key(isolated_db):
+    """Фронт шлёт ОДИН ключ на черновик. Отказ («Выберите клиента») раньше
+    сохранялся под ключом, и исправленная форма получала тот же отказ."""
+    db = isolated_db
+    oid = _draft(db, with_agent=False)
+    key = "order_submit:1:form-1"
+
+    first = asyncio.run(submit_order(oid, 1, "Manager", payment_type="paid", idem_key=key))
+    assert first["ok"] is False and "клиента" in first["error"]
+
+    db.update_order_agent(oid, "A-1", "Клиент")
+    second = asyncio.run(submit_order(oid, 1, "Manager", payment_type="paid", idem_key=key))
+    assert second["ok"] is True, second
+
+    # Повтор после успеха (ответ потерялся) — тот же результат, без второй заявки.
+    third = asyncio.run(submit_order(oid, 1, "Manager", payment_type="paid", idem_key=key))
+    assert third == second
+    assert len(_requests(db, oid)) == 1

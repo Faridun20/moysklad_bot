@@ -314,6 +314,69 @@ def test_bot_print_callback_handles_documents(api, monkeypatch):
     assert reports and "печать" in reports[-1].lower()
 
 
+def test_manager_sees_and_touches_only_own_documents(api, monkeypatch):
+    """IDOR: в расписке паспорт и адрес должника. Менеджер — только свои
+    документы (список, повторная отправка, печать, кнопка в боте); чужой id
+    отвечает как несуществующий. Руководство — все."""
+    from handlers import printing as h
+    from services import printing
+
+    client, db, ids, bot = api
+    other = 300
+    db.set_role(other, "mgr2", "Manager2", "manager")
+    _post(client, "/api/docs/company/set", ids["boss"], company={"company_name": "ООО Ромашка"})
+    mine = _post(client, "/api/docs/create", ids["mgr"], **FORM).json()["id"]
+    theirs = _post(client, "/api/docs/create", other, **dict(FORM, debtor_full_name="Петров Пётр")).json()["id"]
+    bot.documents.clear()
+
+    listed = [d["id"] for d in _post(client, "/api/docs/list", ids["mgr"]).json()["documents"]]
+    assert listed == [mine]
+    boss_listed = {d["id"] for d in _post(client, "/api/docs/list", ids["boss"]).json()["documents"]}
+    assert boss_listed == {mine, theirs}
+
+    r = _post(client, "/api/docs/send", ids["mgr"], doc_id=theirs)
+    assert r.status_code == 404
+    assert bot.documents == [], "чужой документ не ушёл в чат"
+
+    printed: list[str] = []
+
+    async def fake_print(pdf_bytes, *, filename="", printer_name="", label=""):
+        printed.append(label)
+        return PrintResult(True, job="1")
+
+    monkeypatch.setattr(printing, "is_available", lambda: True)
+    monkeypatch.setattr(printing, "print_pdf_bytes", fake_print)
+    assert _post(client, "/api/docs/print", ids["mgr"], doc_id=theirs).status_code == 404
+    assert printed == []
+
+    # Свой — можно; руководству — любой.
+    assert _post(client, "/api/docs/send", ids["mgr"], doc_id=mine).json()["ok"] is True
+    assert _post(client, "/api/docs/print", ids["boss"], doc_id=theirs).json()["ok"] is True
+    assert _post(client, "/api/docs/send", ids["boss"], doc_id=theirs).json()["ok"] is True
+
+    # Бот: подделанный callback prn:doc:<чужой id> от менеджера не печатает.
+    printed.clear()
+    reports = []
+
+    class _Msg:
+        async def reply(self, text, **kw):
+            reports.append(text)
+
+    class _Call:
+        data = printing.document_callback(theirs)
+        message = _Msg()
+
+        class from_user:
+            id = ids["mgr"]
+            full_name = "Mgr"
+
+        async def answer(self, *a, **k):
+            pass
+
+    asyncio.run(h.cb_print(_Call()))
+    assert printed == [] and reports and "не найден" in reports[-1]
+
+
 @pytest.mark.skipif(not HAS_SOFFICE, reason="нет LibreOffice (в образе он есть)")
 def test_real_render_produces_pdf(isolated_db, tmp_path, monkeypatch):
     """Настоящий LibreOffice: форма → PDF с текстом должника."""

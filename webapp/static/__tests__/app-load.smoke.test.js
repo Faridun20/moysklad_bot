@@ -396,7 +396,9 @@ describe('техника: формы', () => {
     window.document.querySelector('[data-payment="11"]').click();
     await new Promise(r => setTimeout(r, 0));
 
-    expect(window.__writes[0]).toEqual(['/api/machines/payment', { payment_id: 11, paid: true }]);
+    expect(window.__writes[0]).toEqual(['/api/machines/payment', {
+      payment_id: 11, paid: true, idempotency_key: expect.any(String),
+    }]);
   });
 
   it('у машины со сделкой кнопки удаления нет', async () => {
@@ -2522,5 +2524,225 @@ describe('карточка покупателя техники', () => {
     expect(window.__writes[0][0]).toBe('/api/machines/receipt');
     expect(window.__writes[0][1].deal_id).toBe(5);
     expect(window.__renders).toBeGreaterThan(before);
+  });
+});
+
+// ─── Безопасность, п.1: единица позиции — ввод другого человека ─────────────
+//
+// `unit` приходил в /api/orders/add_item как есть и выводился в списке
+// заказов, в редакторе черновика, на экране количества и в каталоге склада
+// БЕЗ escapeHtml. Руководство открывает эти экраны со своим initData — stored-XSS.
+
+describe('единица позиции (unit) не становится разметкой', () => {
+  const evil = '<img src=x onerror="window.__pwned=1">';
+  const J = JSON.stringify(evil);
+
+  function expectInert(window, root) {
+    expect(root.querySelector('img')).toBeNull();
+    expect(window.__pwned).toBeUndefined();
+    expect(root.textContent).toContain('<img src=x');
+  }
+
+  it('список заказов', () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      ordersData = { role: 'boss', orders: [{
+        id: 5, status: 'pending', created_at: '2026-03-14', total: 0, currency: 'USD',
+        agent_name: 'Клиент', payment_type: 'paid',
+        items: [{ name: 'Труба', quantity: 2, unit: ${J}, price: 1 }],
+      }] };
+      renderOrdersMain();
+    `);
+    expectInert(window, window.document.getElementById('content'));
+  });
+
+  it('редактор черновика', () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      currentDraftOrder = { order_id: 5, agent_name: '', items: [
+        { name: 'Труба', quantity: 2, unit: ${J}, price: 1, item_id: 0 },
+      ] };
+      renderOrderEditor();
+    `);
+    expectInert(window, window.document.getElementById('content'));
+  });
+
+  it('экран количества', () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      currentDraftOrder = { order_id: 5, items: [] };
+      openQuantityInput('Труба', ${J}, 10, '1');
+    `);
+    expectInert(window, window.document.getElementById('content'));
+  });
+
+  it('каталог склада', () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      document.getElementById('content').innerHTML = '<div id="stock-list"></div>';
+      stockData = { products: [
+        { product_id: 1, name: 'Труба', folder_name: 'Трубы', unit: ${J}, stock: 3, reserve: 0 },
+      ], categories: [] };
+      renderStockList();
+    `);
+    expectInert(window, window.document.getElementById('content'));
+  });
+});
+
+// ─── Безопасность, п.4: «оплачен» по рассрочке — один тап, одно поступление ──
+
+describe('отметка платежа рассрочки: двойной тап не шлёт второй запрос', () => {
+  it('пока запрос в полёте, повтор игнорируется; ключ живёт до успеха', async () => {
+    const window = boot(`
+      window.__calls = [];
+      let fail = true;
+      apiResult = (path, body) => new Promise(resolve => {
+        window.__calls.push(body);
+        setTimeout(() => {
+          resolve(fail ? { ok: false, status: 500, error: 'сеть' } : { ok: true, status: 200, body: {} });
+        }, 5);
+      });
+      window.__btn = document.createElement('button');
+      window.__run = async () => {
+        const p1 = sendMachinePayment(7, false, window.__btn);
+        window.__disabledDuring = window.__btn.disabled;
+        const p2 = sendMachinePayment(7, false, window.__btn);
+        const [r1, r2] = await Promise.all([p1, p2]);
+        window.__second = r2;
+        fail = false;
+        await sendMachinePayment(7, false, window.__btn);   // ретрай после отказа
+        await sendMachinePayment(7, false, window.__btn);   // новая отметка после успеха
+        return r1;
+      };
+    `);
+    await window.__run();
+    const calls = window.__calls;
+    expect(window.__disabledDuring).toBe(true);
+    expect(window.__second).toBeNull();
+    expect(calls).toHaveLength(3);
+    expect(calls[0].idempotency_key).toBeTruthy();
+    expect(calls[1].idempotency_key).toBe(calls[0].idempotency_key);
+    expect(calls[2].idempotency_key).not.toBe(calls[0].idempotency_key);
+    expect(window.__btn.disabled).toBe(false);
+  });
+});
+
+// ─── Безопасность, п.8: ключ идемпотентности — на форму, а не на клик ───────
+//
+// Ключ генерировался в обработчике клика: повтор после обрыва связи (запрос
+// дошёл, ответ потерялся) уходил С НОВЫМ ключом и создавал второй платёж,
+// вторую сдачу, вторую накладную. Теперь ключ живёт с формой и меняется
+// только после успеха.
+
+describe('ключ идемпотентности живёт с формой', () => {
+  const flush = () => new Promise(r => setTimeout(r, 0));
+
+  it('платёж и сдача: обрыв → тот же ключ, успех → новый', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      window.__calls = [];
+      let fail = true;
+      renderMoneyScreen = async () => {};
+      tg.showAlert = () => {};
+      api = async (path, body) => {
+        if (path === '/api/deposits/my') return { deposits: [] };
+        if (path === '/api/payments/send' || path === '/api/deposits/create') {
+          window.__calls.push([path, body.idempotency_key]);
+          if (fail) throw new Error('Нет подключения к интернету');
+          return { deposit_id: 1, payment_ids: [1] };
+        }
+        return {};
+      };
+      window.__setFail = (v) => { fail = v; };
+      window.__ready = renderCashbox(document.getElementById('content'), 'ops');
+    `);
+    await window.__ready;
+    const doc = window.document;
+    doc.querySelector('.pay-row-amount').value = '100';
+    doc.querySelector('#pay-comment').value = 'аренда';
+    doc.querySelector('#dep-amount').value = '50';
+
+    const clickPay = async () => { doc.querySelector('#pay-submit').disabled = false; doc.querySelector('#pay-submit').click(); await flush(); };
+    const clickDep = async () => { doc.querySelector('#dep-create').disabled = false; doc.querySelector('#dep-create').click(); await flush(); };
+
+    await clickPay(); await clickPay();
+    await clickDep(); await clickDep();
+    window.__setFail(false);
+    await clickPay(); await clickPay();
+    await clickDep(); await clickDep();
+
+    const keys = (p) => window.__calls.filter(c => c[0] === p).map(c => c[1]);
+    for (const p of ['/api/payments/send', '/api/deposits/create']) {
+      const k = keys(p);
+      expect(k).toHaveLength(4);
+      expect(k[0]).toBeTruthy();
+      expect(k[1]).toBe(k[0]);   // ретрай после обрыва
+      expect(k[2]).toBe(k[0]);   // успех — тем же ключом
+      expect(k[3]).not.toBe(k[0]); // следующий — уже новым
+    }
+  });
+
+  it('отправка заказа: ключ черновика переживает отказ', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      window.__keys = [];
+      let fail = true;
+      tg.showAlert = () => {};
+      renderOrders = async () => {};
+      api = async (path, body) => {
+        window.__keys.push(body.idempotency_key);
+        if (fail) throw new Error('Нет подключения к интернету');
+        return { req_id: 1 };
+      };
+      currentDraftOrder = { id: 5, items: [], payment_type: 'paid' };
+      window.__ready = (async () => {
+        await submitOrder();
+        await submitOrder();
+        fail = false;
+        await submitOrder();
+      })();
+    `);
+    await window.__ready;
+    expect(window.__keys).toHaveLength(3);
+    expect(window.__keys[0]).toBeTruthy();
+    expect(new Set(window.__keys).size).toBe(1);
+  });
+
+  it('накладная: обрыв → тот же ключ, отказ по существу → новый', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__keys = [];
+      const answers = [
+        { ok: false, status: 0, body: {}, error: 'Нет подключения к интернету' },
+        { ok: false, status: 409, body: { ok: false, code: 'insufficient_stock', reason: 'мало' }, error: '' },
+        { ok: true, status: 200, body: { invoice_number: 'П-1' }, error: '' },
+      ];
+      toast = () => {};
+      renderWhInvoicesTab = () => {};
+      api = async (p) => {
+        if (p === '/api/wh/stock') return { products: [
+          { product_id: 1, name: 'Болт М8', sku: 'B8', unit: 'шт', quantity: 100 } ]};
+        if (p === '/api/wh/counterparties') return { counterparties: [] };
+        return {};
+      };
+      apiResult = async (path, body) => { window.__keys.push(body.idempotency_key); return answers.shift(); };
+      window.__ready = (async () => {
+        whView = 'new';
+        whDraft = { type: 'incoming', counterparty_id: '', comment: '',
+                    items: [{ product_id: 1, quantity: 2, price_cents: null }] };
+        await renderWhInvoiceNew();
+        for (let i = 0; i < 3; i++) {
+          document.getElementById('wh-save').disabled = false;
+          document.getElementById('wh-save').click();
+          await new Promise(r => setTimeout(r, 0));
+        }
+      })();
+    `);
+    await window.__ready;
+    const k = window.__keys;
+    expect(k).toHaveLength(3);
+    expect(k[0]).toBeTruthy();
+    expect(k[1]).toBe(k[0]);
+    expect(k[2]).not.toBe(k[0]);
   });
 });

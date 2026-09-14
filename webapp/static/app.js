@@ -876,7 +876,7 @@ function renderStockList() {
           ${check}
           <div class="stock-info">
             <div class="stock-name">${escapeHtml(p.name)}</div>
-            <div class="stock-folder">${escapeHtml(p.folder_name || '—')} · ${p.unit}${
+            <div class="stock-folder">${escapeHtml(p.folder_name || '—')} · ${escapeHtml(p.unit || 'шт')}${
               p.reserve > 0 ? ` · в резерве ${whQty(p.reserve)}` : ''}</div>
             ${priceHtml}
           </div>
@@ -1430,10 +1430,34 @@ function machineDealsHtml(deals, today) {
   }).join('');
 }
 
-async function toggleMachinePayment(machineId, paymentId, wasPaid) {
-  const res = await apiResult('/api/machines/payment', {
-    payment_id: paymentId, paid: !wasPaid,
-  });
+// «Оплачен» по плановому платежу: одна отметка — один запрос. Кнопка гаснет на
+// время запроса, а ключ идемпотентности живёт до успеха, а не на клик: двойной
+// тап (или ретрай после обрыва) отдаёт результат первого, а не второе
+// поступление денег. Ключ привязан к паре «платёж + направление».
+const _machinePayKeys = new Map();
+const _machinePayBusy = new Set();
+
+async function sendMachinePayment(paymentId, wasPaid, btn) {
+  const slot = `${paymentId}:${wasPaid ? 1 : 0}`;
+  if (_machinePayBusy.has(slot)) return null;
+  if (!_machinePayKeys.has(slot)) _machinePayKeys.set(slot, idemKey());
+  _machinePayBusy.add(slot);
+  if (btn) btn.disabled = true;
+  try {
+    const res = await apiResult('/api/machines/payment', {
+      payment_id: paymentId, paid: !wasPaid, idempotency_key: _machinePayKeys.get(slot),
+    });
+    if (res.ok) _machinePayKeys.delete(slot);
+    return res;
+  } finally {
+    _machinePayBusy.delete(slot);
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function toggleMachinePayment(machineId, paymentId, wasPaid, btn) {
+  const res = await sendMachinePayment(paymentId, wasPaid, btn);
+  if (!res) return;
   if (!res.ok) {
     tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
     // 409 значит «на сервере уже другое» — перечитываем, а не спорим с экраном.
@@ -2156,8 +2180,21 @@ async function renderContainerCard(containerId) {
   content.querySelector('#cont-post')?.addEventListener('click', () =>
     openChannelComposer('arrival', { container_id: containerId }));
 
-  content.querySelector('#cont-supply')?.addEventListener('click', async () => {
-    const res = await apiResult('/api/containers/supply', { container_id: containerId });
+  // Ключ — на отрисованную карточку, а не на клик: двойной тап отдаёт итог
+  // первой приёмки, а не проводит вторую. Кнопка гаснет до ответа.
+  const supplyKey = idemKey();
+  content.querySelector('#cont-supply')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    if (btn.disabled) return;
+    btn.disabled = true;
+    let res;
+    try {
+      res = await apiResult('/api/containers/supply', {
+        container_id: containerId, idempotency_key: supplyKey,
+      });
+    } finally {
+      btn.disabled = false;
+    }
     if (!res.ok) {
       tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
       return;
@@ -2498,7 +2535,7 @@ async function renderMachineCard(machineId) {
   content.querySelectorAll('[data-payment]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
-      toggleMachinePayment(m.id, Number(btn.dataset.payment), btn.dataset.paid === '1');
+      toggleMachinePayment(m.id, Number(btn.dataset.payment), btn.dataset.paid === '1', btn);
     });
   });
   wireDealReceipts(content, card.deals, () => renderMachineCard(machineId));
@@ -3409,7 +3446,7 @@ function renderOrdersMain() {
           const priceStr = (it.price && it.price > 0)
             ? ` × ${formatMoney(it.price)} = <b>${formatMoney(sub)}${cur}</b>`
             : '';
-          return `<div class="order-item-preview">• ${escapeHtml(it.name)} — ${it.quantity} ${it.unit}${priceStr}</div>`;
+          return `<div class="order-item-preview">• ${escapeHtml(it.name)} — ${it.quantity} ${escapeHtml(it.unit || 'шт')}${priceStr}</div>`;
         }).join('')}
         ${o.status === 'draft' && !isBoss ? `
           <div class="draft-actions">
@@ -3653,7 +3690,7 @@ function renderOrderEditor() {
           <div class="c-row editor-item">
             <div class="editor-item-info">
               <div class="editor-item-name">${escapeHtml(it.name)}</div>
-              <div class="editor-item-qty">${it.quantity} ${it.unit || 'шт'}${subStr}</div>
+              <div class="editor-item-qty">${it.quantity} ${escapeHtml(it.unit || 'шт')}${subStr}</div>
             </div>
             <button class="editor-item-del" data-idx="${i}" aria-label="Удалить позицию">${icon('close')}</button>
           </div>
@@ -3977,6 +4014,9 @@ async function openProductPicker() {
 
 function openQuantityInput(name, unit, maxStock, productId) {
   const content = document.getElementById('content');
+  // Единица приходит из карточки товара (data-unit) — это ввод другого
+  // человека, в разметку только экранированной. maxStock — число.
+  const unitHtml = escapeHtml(unit || 'шт');
   const currencies = ['USD', 'UZS'];
   // Если у заказа уже была валюта (после первой позиции) — берём её и
   // блокируем переключение. Все позиции одного ордера в одной валюте.
@@ -3994,10 +4034,10 @@ function openQuantityInput(name, unit, maxStock, productId) {
     </div>
     <div class="qty-screen">
       <div class="qty-product-name">${escapeHtml(name)}</div>
-      <div class="qty-stock">На складе: ${maxStock} ${unit}</div>
+      <div class="qty-stock">На складе: ${maxStock} ${unitHtml}</div>
 
       <div class="form-row u-mt-3">
-        <label class="form-label">Количество (${unit})</label>
+        <label class="form-label">Количество (${unitHtml})</label>
         <input type="number" id="qty-input" class="form-input"
           placeholder="0" inputmode="decimal" min="0.1" step="0.1">
       </div>
@@ -4011,7 +4051,7 @@ function openQuantityInput(name, unit, maxStock, productId) {
       </div>
 
       <div class="form-row">
-        <label class="form-label">Цена за ${unit}</label>
+        <label class="form-label">Цена за ${unitHtml}</label>
         <input type="number" id="price-input" class="form-input"
           placeholder="0" inputmode="decimal" min="0" step="0.01">
       </div>
@@ -4143,13 +4183,17 @@ async function submitOrder() {
     return;
   }
 
+  // Ключ живёт с черновиком, а не с кликом: повтор после обрыва связи (заявка
+  // уже ушла, ответ потерялся) не упирается в «уже отправлен» и не шлёт
+  // вторую. Отказ сервер не запоминает — после исправления ключ тот же.
+  if (!currentDraftOrder.submitKey) currentDraftOrder.submitKey = idemKey();
   if (btn) btn.disabled = true;
   try {
     const result = await api('/api/orders/submit', {
       order_id: currentDraftOrder.id,
       payment_type: paymentType,
       due_date: dueDate || null,
-      idempotency_key: idemKey(),
+      idempotency_key: currentDraftOrder.submitKey,
     });
     tg.HapticFeedback?.notificationOccurred('success');
     tg.showAlert(`✅ Заявка #${result.req_id} отправлена руководителю!`);
@@ -5562,14 +5606,15 @@ async function renderBuyerCard(buyer) {
 
   content.querySelectorAll('[data-payment]').forEach(btn => {
     btn.addEventListener('click', async () => {
-      await toggleMachinePaymentFromBuyer(buyer, Number(btn.dataset.payment), btn.dataset.paid === '1');
+      await toggleMachinePaymentFromBuyer(buyer, Number(btn.dataset.payment), btn.dataset.paid === '1', btn);
     });
   });
   wireDealReceipts(content, card.deals, () => renderBuyerCard(buyer));
 }
 
-async function toggleMachinePaymentFromBuyer(buyer, paymentId, wasPaid) {
-  const res = await apiResult('/api/machines/payment', { payment_id: paymentId, paid: !wasPaid });
+async function toggleMachinePaymentFromBuyer(buyer, paymentId, wasPaid, btn) {
+  const res = await sendMachinePayment(paymentId, wasPaid, btn);
+  if (!res) return;
   if (!res.ok) {
     tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
     if (res.status === 409) renderBuyerCard(buyer);
@@ -6053,6 +6098,10 @@ async function renderCashbox(container, section) {
       wireRows();
     });
   }
+  // Ключ идемпотентности — на открытую форму, а не на клик: повторное нажатие
+  // после обрыва связи (ответ потерялся, платёж уже записан) отдаёт тот же
+  // результат, а не второй платёж. Новый ключ — только после успеха.
+  let payKey = idemKey();
   const paySubmit = container.querySelector('#pay-submit');
   if (paySubmit) {
     paySubmit.addEventListener('click', async () => {
@@ -6068,7 +6117,8 @@ async function renderCashbox(container, section) {
       paySubmit.disabled = true;
       status.textContent = '⏳ Отправка…'; status.className = 'pay-status';
       try {
-        await api('/api/payments/send', { items: parsed.items, comment, idempotency_key: idemKey() });
+        await api('/api/payments/send', { items: parsed.items, comment, idempotency_key: payKey });
+        payKey = idemKey();
         tg.HapticFeedback?.notificationOccurred('success');
         renderMoneyScreen();
       } catch (e) {
@@ -6080,6 +6130,7 @@ async function renderCashbox(container, section) {
 
   // Создание сдачи (менеджер).
   const createBtn = container.querySelector('#dep-create');
+  let depKey = idemKey();  // на форму, как у платежа: ретрай не создаёт вторую сдачу
   if (createBtn) {
     createBtn.addEventListener('click', () => {
       const raw = container.querySelector('#dep-amount').value;
@@ -6087,8 +6138,8 @@ async function renderCashbox(container, section) {
       if (isNaN(amount) || amount <= 0) { tg.showAlert('❌ Введите положительную сумму'); return; }
       haptic('light');
       createBtn.disabled = true;
-      api('/api/deposits/create', { amount, idempotency_key: idemKey() })
-        .then(r => { tg.showAlert(`✅ Сдача #${r.deposit_id} отправлена на подтверждение`); renderMoneyScreen(); })
+      api('/api/deposits/create', { amount, idempotency_key: depKey })
+        .then(r => { depKey = idemKey(); tg.showAlert(`✅ Сдача #${r.deposit_id} отправлена на подтверждение`); renderMoneyScreen(); })
         .catch(e => { tg.showAlert('❌ ' + e.message); createBtn.disabled = false; });
     });
   }
@@ -7553,6 +7604,11 @@ async function renderWhInvoiceNew() {
 
     btn.disabled = true;
     haptic('medium');
+    // Ключ — на черновик формы: ретрай после обрыва не проведёт вторую
+    // накладную. Сбрасывается после проведения (whDraft = null) и после
+    // отказа по существу — отказ сервер хранит под ключом, и исправленная
+    // форма со старым ключом получила бы тот же отказ.
+    if (!whDraft.idemKey) whDraft.idemKey = idemKey();
     try {
       const r = await apiResult('/api/wh/invoices/create', {
         type: whDraft.type,
@@ -7563,11 +7619,15 @@ async function renderWhInvoiceNew() {
           quantity: Number(it.quantity),
           price_cents: Number(it.price_cents) || null,
         })),
-        // Ключ на попытку сохранения: повтор той же формы не проведёт вторую
-        // накладную и не пришлёт клиенту второй экземпляр PDF.
-        idempotency_key: idemKey(),
+        // Повтор той же формы не проведёт вторую накладную и не пришлёт
+        // клиенту второй экземпляр PDF.
+        idempotency_key: whDraft.idemKey,
       });
       if (!r.ok) {
+        // Отказ по существу (нехватка остатка, 400 формы) ничего не записал —
+        // следующая попытка с исправленной формой идёт новым ключом. «Запрос
+        // уже обрабатывается» и обрыв связи ключ сохраняют.
+        if (r.status === 400 || (r.body && r.body.code)) whDraft.idemKey = null;
         // Сервер посчитал причину отказа и вернул её (нехватка остатка — с
         // разбором по позициям). Показываем ЕЁ, а не «ошибку сервера»:
         // менеджеру надо понять, что править в форме. Черновик остаётся.

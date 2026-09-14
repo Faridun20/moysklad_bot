@@ -49,15 +49,19 @@ async def _invoice_pdf(invoice_id: int) -> tuple[bytes, str, str] | None:
     return pdf, invoice_filename(invoice), f"Накладная {number}"
 
 
-async def _document_pdf(doc_id: int) -> tuple[bytes, str, str] | None:
+async def _document_pdf(doc_id: int, user_id: int) -> tuple[bytes, str, str] | None:
     """Юридический документ → (pdf, имя файла, подпись). Читается из файла:
-    расписка подписана один раз, пересобирать её с новой датой нельзя."""
+    расписка подписана один раз, пересобирать её с новой датой нельзя.
+
+    Чужой документ (не руководству) — как несуществующий: callback_data
+    подделывается клиентом, а в расписке паспорт должника."""
     import asyncio
 
     from services import documents
+    from services.roles import cached_role
 
     doc = await documents.get_document(doc_id)
-    if doc is None:
+    if doc is None or not documents.can_access(doc, user_id, cached_role(user_id)):
         return None
     found = await asyncio.to_thread(documents.read_pdf, doc)
     if found is None:
@@ -86,7 +90,7 @@ async def cb_print(call: CallbackQuery):
     await call.answer("Отправляю на печать…")
 
     try:
-        doc = await (_invoice_pdf(ref) if kind == "inv" else _document_pdf(ref))
+        doc = await (_invoice_pdf(ref) if kind == "inv" else _document_pdf(ref, call.from_user.id))
     except Exception:
         logger.exception("Печать: не удалось собрать PDF (%s #%s)", kind, ref)
         return await _report(call, "❌ Не удалось собрать документ для печати")
