@@ -220,6 +220,82 @@ from starlette.middleware.gzip import GZipMiddleware  # noqa: E402
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
+# ─── Потолок размера тела запроса ─────────────────────────────────────────────
+#
+# Все ручки читают `await request.json()` ДО `_authorize`: тело любого размера
+# от кого угодно (даже без initData) целиком ложилось в память и парсилось.
+# Потолок режет это на входе. Самый крупный законный запрос — фото base64 в
+# JSON: до 5 МБ байтов (`_PHOTO_MAX_BYTES`) → ~6,7 МБ base64 + поля; фронт при
+# этом ещё и ужимает снимок (`shrinkImage`). 8 МБ оставляют запас.
+MAX_BODY_BYTES = 8 * 1024 * 1024
+_BODY_TOO_LARGE = "Слишком большой запрос"
+
+
+class _BodyTooLarge(Exception):
+    """Тело перевалило потолок посреди чтения (chunked без Content-Length)."""
+
+
+def _is_body_too_large(exc: BaseException) -> bool:
+    if isinstance(exc, _BodyTooLarge):
+        return True
+    # BaseHTTPMiddleware (метрики) гоняет приложение в task group — исключение
+    # может приехать завёрнутым в ExceptionGroup.
+    return isinstance(exc, BaseExceptionGroup) and any(
+        _is_body_too_large(e) for e in exc.exceptions
+    )
+
+
+class _BodySizeLimitMiddleware:
+    """Чистый ASGI: считает байты ПО МЕРЕ чтения, а не только Content-Length —
+    chunked-запрос без заголовка иначе прошёл бы мимо."""
+
+    def __init__(self, app, max_bytes: int = MAX_BODY_BYTES):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def _reject(self, scope, receive, send) -> None:
+        response = JSONResponse({"detail": _BODY_TOO_LARGE}, status_code=413)
+        await response(scope, receive, send)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        for name, value in scope.get("headers") or ():
+            if name == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = 0
+                if declared > self.max_bytes:
+                    return await self._reject(scope, receive, send)
+                break
+
+        received = 0
+        started = False
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body") or b"")
+                if received > self.max_bytes:
+                    raise _BodyTooLarge()
+            return message
+
+        async def tracking_send(message):
+            nonlocal started
+            if message.get("type") == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracking_send)
+        except BaseException as exc:
+            if not _is_body_too_large(exc) or started:
+                raise
+            await self._reject(scope, receive, send)
+
+
 # ─── Metrics middleware: латентность + status-code counters для /api/* ─────
 #
 # Цель — за ровно один хук покрыть все 50+ /api/* endpoint'ов. Раньше
@@ -256,6 +332,11 @@ async def _metrics_middleware(request: Request, call_next):
         raise
     finally:
         _metrics.record_timing(metric_name, (_time.perf_counter() - start) * 1000.0)
+
+
+# Последним — значит самым внешним из пользовательских: лишнее тело режется
+# раньше метрик и gzip.
+app.add_middleware(_BodySizeLimitMiddleware, max_bytes=MAX_BODY_BYTES)
 
 
 class CachedStaticFiles(StaticFiles):
