@@ -194,6 +194,22 @@ if _dev_bypass_user() is not None:
 app = FastAPI(title="Склад WebApp")
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception(request: Request, exc: Exception):
+    """Необработанная ошибка ручки: клиенту — короткий текст без внутренностей
+    (раньше в detail уезжал `str(e)` вплоть до текста SQL), в лог — трасса,
+    админам — алерт в Telegram с дросселем (`services.error_alerts`). Алерт
+    уходит фоном: ответ не ждёт сети до Telegram."""
+    from services import error_alerts
+    from utils.background import spawn
+
+    spawn(
+        error_alerts.report_exception(exc, where=f"webapp {request.method} {request.url.path}"),
+        name="error-alert",
+    )
+    return JSONResponse({"detail": error_alerts.USER_MESSAGE}, status_code=500)
+
+
 @app.on_event("shutdown")
 async def _drain_background_tasks() -> None:
     """Дождаться фоновых задач (печатная форма после одобрения) перед остановкой.
@@ -1068,10 +1084,8 @@ async def api_analytics_export(request: Request):
     )
     now = datetime.now()
     since, until, prev_since, label = _resolve_analytics_period(data, now)
-    try:
-        payload = await _company_analytics_payload(since, until, prev_since, label)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # Сбой сборки — в общий обработчик: трасса в лог, клиенту без внутренностей.
+    payload = await _company_analytics_payload(since, until, prev_since, label)
 
     xlsx_bytes = await asyncio.to_thread(build_analytics_xlsx, payload)
     fname = f"analytics-{(label or 'report').replace(' ', '_').replace('—', '-')[:40]}.xlsx"
@@ -1329,9 +1343,9 @@ async def api_payments_history(request: Request):
         # to_thread не блокирует event loop, пока psycopg2 ждёт ответа БД
         rows = await asyncio.to_thread(_load)
         return JSONResponse({"payments": rows})
-    except Exception as e:
-        logger.exception("payments/history failed for user_id=%s", user_id)
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.error("payments/history failed for user_id=%s", user_id)
+        raise  # общий обработчик: трасса в лог, клиенту без str(e)
 
 
 @app.post("/api/cash/history")

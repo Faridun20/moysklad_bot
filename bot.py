@@ -177,6 +177,12 @@ def register_routers(dp: Dispatcher):
     ]
     for r in routers:
         dp.include_router(r)
+    # Необработанная ошибка любого хендлера: человеку — «что-то пошло не так»
+    # вместо тишины, в лог — трасса, админам — алерт с дросселем. Здесь, а не
+    # в build_bot_and_dispatcher: polling-путь main() собирает dispatcher сам.
+    from handlers.errors import on_error
+
+    dp.errors.register(on_error)
 
 
 def build_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
