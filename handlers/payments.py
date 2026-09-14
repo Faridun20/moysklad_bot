@@ -149,8 +149,24 @@ async def process_input(message: Message, state: FSMContext, bot: Bot):
 @router.callback_query(F.data.startswith("pay_cur:"), PaymentState.waiting_for_currency)
 async def process_currency(call: CallbackQuery, state: FSMContext, bot: Bot):
     currency = call.data.split(":")[1]
+    if currency not in CURRENCIES:
+        # callback_data подделывается клиентом — валюту берём только из списка.
+        return await call.answer("Неизвестная валюта", show_alert=True)
+
+    # Двойной тап по валюте: aiogram обрабатывает апдейты параллельно, и оба
+    # колбэка проходили фильтр состояния раньше, чем первый успевал его
+    # сбросить, — уходило ДВА платежа. Одна клавиатура = один платёж: ключ по
+    # сообщению с кнопками столбится в общей БД (переживает и второй процесс).
+    key = f"bot_pay_currency:{call.from_user.id}:{call.message.chat.id}:{call.message.message_id}"
+    prev = await adb.idem_claim(key, "bot_pay_currency", call.from_user.id)
+    if prev is not None:
+        return await call.answer("Платёж уже отправлен" if prev else "Платёж уже отправляется…")
+
     data = await state.get_data()
     await state.clear()
+    if "amount" not in data:
+        await adb.idem_release(key)
+        return await call.answer("Ввод устарел — начните заново: /pay", show_alert=True)
     await call.answer()
     try:
         await call.message.edit_text(
@@ -158,6 +174,8 @@ async def process_currency(call: CallbackQuery, state: FSMContext, bot: Bot):
         )
     except Exception:
         pass
+    # Сбой внутри не освобождает ключ: платёж мог уже записаться, и второй тап
+    # по той же клавиатуре не должен создать ещё один. Новый ввод — /pay.
     await _finalize_payment(
         call.message,
         call.from_user,
@@ -166,6 +184,7 @@ async def process_currency(call: CallbackQuery, state: FSMContext, bot: Bot):
         currency,
         data.get("comment", ""),
     )
+    await adb.idem_store(key, {"ok": True})
 
 
 @router.callback_query(F.data == "pay_cancel")
