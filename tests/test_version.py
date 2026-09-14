@@ -33,10 +33,25 @@ def version_mod(monkeypatch):
     importlib.reload(mod)
 
 
-def test_railway_sha_wins_over_git(version_mod):
-    """В контейнере `.git` нет — источник истины это переменная платформы."""
-    mod = version_mod(RAILWAY_GIT_COMMIT_SHA="abcdef1234567890")
+def test_build_arg_sha_is_the_source_of_truth(version_mod):
+    """В образе `.git` нет (`.dockerignore`) — источник это аргумент сборки.
+
+    Порядок важен: свой `GIT_COMMIT_SHA` бьёт платформенный `RAILWAY_*`.
+    Развёртывание у нас своё (`docker-compose.yml`), и если где-то остался
+    залипший `RAILWAY_GIT_COMMIT_SHA`, версия обязана показывать то, что
+    реально собрано, а не то, что осталось от прежней площадки.
+    """
+    mod = version_mod(
+        GIT_COMMIT_SHA="abcdef1234567890",
+        RAILWAY_GIT_COMMIT_SHA="0000000000000000",
+    )
     assert mod.APP_VERSION == "abcdef12"
+
+
+def test_railway_vars_still_work_as_a_fallback(version_mod):
+    """Проект жил на Railway — ломать тот путь ради переименования незачем."""
+    mod = version_mod(RAILWAY_GIT_COMMIT_SHA="feedface12345678")
+    assert mod.APP_VERSION == "feedface"
 
 
 def test_version_falls_back_when_platform_is_silent(version_mod):
@@ -53,8 +68,8 @@ def test_commit_subject_is_the_first_line_only(version_mod):
     """Заголовок коммита, а не всё тело: восемь знаков SHA человек с GitHub не
     сверит, а «Пикеры вместо нативных меню…» сверяется с первого взгляда."""
     mod = version_mod(
-        RAILWAY_GIT_COMMIT_SHA="f" * 40,
-        RAILWAY_GIT_COMMIT_MESSAGE="Заголовок правки\n\nДлинное тело\nи ещё строка",
+        GIT_COMMIT_SHA="f" * 40,
+        GIT_COMMIT_MESSAGE="Заголовок правки\n\nДлинное тело\nи ещё строка",
     )
     assert mod.commit_subject() == "Заголовок правки"
 
@@ -235,3 +250,42 @@ def test_command_is_in_the_autocomplete(cmd):
     # Менеджеру и кладовщику номер сборки не нужен — как и доступ к команде.
     assert "version" not in {c.command for c in _COMMANDS_MANAGER}
     assert "version" not in {c.command for c in _COMMANDS_WAREHOUSE}
+
+
+# ─── Сборка обязана донести версию до контейнера ─────────────────────────────
+
+
+def test_build_passes_the_version_into_the_image():
+    """`Dockerfile` и `docker-compose.yml` обязаны пробрасывать версию.
+
+    В образе `.git` нет (`.dockerignore`), поэтому аргумент сборки — ЕДИНСТВЕННЫЙ
+    источник. Пропадёт он из любого из двух файлов — версия молча скатится к
+    таймстампу старта: `/version` перестанет отвечать «какой коммит», а кэш
+    статики начнёт слетать у всех на каждом рестарте. Ни один тест приложения
+    этого не заметит, потому что код при этом исправен.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+    compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+
+    for name in ("GIT_COMMIT_SHA", "GIT_COMMIT_MESSAGE"):
+        assert f"ARG {name}" in dockerfile, f"Dockerfile не принимает {name}"
+        assert f"ENV {name}=${name}" in dockerfile, f"Dockerfile не пробрасывает {name}"
+        assert f"{name}: ${{{name}:-}}" in compose, f"compose не передаёт {name} в сборку"
+
+
+def test_deploy_script_fills_the_version_in():
+    """Подставляет их скрипт выката, а не человек: руками это забывают."""
+    from pathlib import Path
+
+    script = (Path(__file__).resolve().parent.parent / "scripts" / "deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "git rev-parse HEAD" in script
+    assert "git log -1 --pretty=%s" in script
+    assert "export GIT_COMMIT_SHA" in script
+    # Пересоздаём ОБА контейнера: поднять один из двух — это и есть то
+    # расхождение, которое потом ловит /version.
+    assert "docker compose up -d\n" in script

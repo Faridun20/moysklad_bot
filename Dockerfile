@@ -111,13 +111,26 @@ COPY --chown=app:app . .
 # сгенерированные документы. Монтируйте сюда том.
 RUN mkdir -p /app/data && chown app:app /app/data
 
-# Версия статики для cache-busting. webapp/server._compute_app_version читает
-# GIT_COMMIT_SHA, иначе пробует git (в образе .git нет — см. .dockerignore) и
-# скатывается к таймстампу старта. Тот меняется на каждом рестарте и сбрасывает
-# кэш браузера всем пользователям на ровном месте.
-#   docker build --build-arg GIT_COMMIT_SHA="$(git rev-parse HEAD)" .
+# Версия работающего кода: её читает services/version.py — и для cache-busting
+# статики, и для `/version` в боте, и для `/healthz`. В образе .git нет (см.
+# .dockerignore), поэтому единственный источник — эти аргументы сборки; без них
+# версия скатывается к таймстампу старта. Тот меняется на каждом рестарте:
+# кэш браузера сбрасывается всем на ровном месте, а на вопрос «какой коммит
+# работает» ответа по-прежнему нет.
+#
+# Заголовок коммита едет рядом с SHA не для красоты: восемь шестнадцатеричных
+# знаков с GitHub по памяти не сверить, а «Пикеры вместо нативных меню…» —
+# сверяется сразу.
+#
+# Проставляет их `scripts/deploy.sh`; вручную это выглядит так:
+#   docker build --build-arg GIT_COMMIT_SHA="$(git rev-parse HEAD)" \
+#                --build-arg GIT_COMMIT_MESSAGE="$(git log -1 --pretty=%s)" .
 ARG GIT_COMMIT_SHA=""
 ENV GIT_COMMIT_SHA=$GIT_COMMIT_SHA
+ARG GIT_COMMIT_MESSAGE=""
+ENV GIT_COMMIT_MESSAGE=$GIT_COMMIT_MESSAGE
+ARG GIT_BRANCH=""
+ENV GIT_BRANCH=$GIT_BRANCH
 
 USER app
 
