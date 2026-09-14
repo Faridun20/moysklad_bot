@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 
-from tests.e2e.conftest import go
+from tests.e2e.conftest import go, tab
 
 
 def _nav_screens(page) -> list[str]:
@@ -165,7 +165,7 @@ def test_keeper_money_section_has_no_cash_tab(open_app, e2e):
 
 def _open_invoice_form(page):
     go(page, "stock")
-    page.click('[data-wh-go="whinvoices"]')
+    tab(page, "invoices")
     page.wait_for_selector("#wh-new")
     page.click("#wh-new")
     page.wait_for_selector("#wh-cp")

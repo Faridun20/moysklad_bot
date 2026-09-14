@@ -7,7 +7,7 @@ import { describe, it, expect } from 'vitest';
 import helpers from '../helpers.js';
 
 const {
-  escapeHtml, idemKey, formatDateRU, icon, opsAmount, renderOpsSummaryHtml,
+  escapeHtml, idemKey, formatDateRU, icon, opsAmount, plural, categoryTree, categoryMatches,
   parsePaymentItems, renderMoneyTotalsHtml, periodSegHtml, rangeLabel,
   navSections, defaultSection, sectionNavHtml, salesTabs, stockTabs, moneyTabs, clientsTabs,
   formatMoney, emptyState, skeleton, errorBoxHtml,
@@ -37,11 +37,80 @@ describe('periodSegHtml (WP-29)', () => {
     expect(html).toContain('data-period="month" aria-pressed="false"');
   });
 
-  it('custom активен → подпись диапазона на доп-кнопке', () => {
+  it('«Период…» — последний пункт ТОГО ЖЕ сегмента, с подписью', () => {
+    // Иконка часов справа от группы, без подписи, была непонятна (UI-бриф п.5):
+    // вне группы она читалась как «что-то ещё». Теперь это пункт группы.
+    const html = periodSegHtml(presets, 'month', 'data-period', false, '');
+    expect(html).not.toContain('seg-aux');
+    const items = [...html.matchAll(/class="seg-item[^"]*"/g)];
+    expect(items.length).toBe(3);
+    expect(html).toContain('Период…');
+    // Один .seg-row — доп-кнопки за пределами трека нет.
+    expect(html.match(/<button/g).length).toBe(3);
+  });
+
+  it('custom активен → пункт подсвечен и показывает выбранный диапазон', () => {
     const html = periodSegHtml(presets, 'custom', 'data-operiod', true, '01.06—12.06');
     expect(html).toContain('data-operiod="custom"');
     expect(html).toContain('01.06—12.06');  // показывает выбранный диапазон
-    expect(html).toMatch(/seg-aux active/);
+    expect(html).toMatch(/seg-item seg-item--custom active/);
+    expect(html).not.toContain('Период…');
+  });
+});
+
+describe('plural — склонение числительных (UI-бриф п.8)', () => {
+  const f = ['клиент', 'клиента', 'клиентов'];
+  it('1 / 2 / 5 / 11 / 21', () => {
+    expect(plural(1, f)).toBe('1 клиент');
+    expect(plural(2, f)).toBe('2 клиента');
+    expect(plural(5, f)).toBe('5 клиентов');
+    expect(plural(11, f)).toBe('11 клиентов');
+    expect(plural(21, f)).toBe('21 клиент');
+  });
+  it('12–14 и 111–114 — родительный множественного, 22/23/24 — единственного', () => {
+    expect(plural(12, f)).toBe('12 клиентов');
+    expect(plural(14, f)).toBe('14 клиентов');
+    expect(plural(112, f)).toBe('112 клиентов');
+    expect(plural(22, f)).toBe('22 клиента');
+    expect(plural(0, f)).toBe('0 клиентов');
+  });
+  it('мусор на входе — ноль, а не NaN; крупные числа с разрядами', () => {
+    expect(plural(null, f)).toBe('0 клиентов');
+    expect(plural('7', f)).toBe('7 клиентов');
+    expect(plural(1234, ['позиция', 'позиции', 'позиций'])).toBe('1\u00a0234 позиции');
+  });
+});
+
+describe('categoryTree — два уровня из «Запчасти/Адаптер» (UI-бриф п.4)', () => {
+  const cats = [
+    { id: 'Запчасти Экскаватор/Адаптер', name: 'Запчасти Экскаватор/Адаптер' },
+    { id: 'Запчасти Экскаватор/Ковш', name: 'Запчасти Экскаватор/Ковш' },
+    { id: 'Масло', name: 'Масло' },
+    { id: 'Солнечные панели', name: 'Солнечные панели' },
+  ];
+  it('первый уровень — до первого «/», второй — после', () => {
+    const tree = categoryTree(cats);
+    expect(tree.map(r => r.name)).toEqual(['Запчасти Экскаватор', 'Масло', 'Солнечные панели']);
+    expect(tree[0].children.map(c => c.name)).toEqual(['Адаптер', 'Ковш']);
+    expect(tree[1].children).toEqual([]);
+  });
+  it('названия не переписываются — ключи второго уровня равны исходным id', () => {
+    const tree = categoryTree(cats);
+    expect(tree[0].children[0].key).toBe('Запчасти Экскаватор/Адаптер');
+    // Категория без «/» — сама себе первый уровень, её id и есть ключ.
+    expect(tree[1].key).toBe('Масло');
+  });
+  it('фильтр: корень собирает все свои подкатегории, подуровень — точное совпадение', () => {
+    const tree = categoryTree(cats);
+    expect(categoryMatches('Запчасти Экскаватор/Ковш', tree[0], '')).toBe(true);
+    expect(categoryMatches('Масло', tree[0], '')).toBe(false);
+    expect(categoryMatches('Запчасти Экскаватор/Ковш', tree[0], 'Запчасти Экскаватор/Адаптер')).toBe(false);
+    expect(categoryMatches('anything', null, '')).toBe(true);  // «Все»
+  });
+  it('пусто и мусор', () => {
+    expect(categoryTree([])).toEqual([]);
+    expect(categoryTree(null)).toEqual([]);
+    expect(categoryTree([{ id: '', name: '' }])).toEqual([]);
   });
 });
 
@@ -143,52 +212,6 @@ describe('opsAmount', () => {
   });
 });
 
-describe('renderOpsSummaryHtml', () => {
-  it('пустая/нулевая сводка → «всё спокойно»', () => {
-    expect(renderOpsSummaryHtml({})).toContain('Всё спокойно');
-    expect(renderOpsSummaryHtml(null)).toContain('Всё спокойно');
-  });
-
-  it('показывает только непустые секции с их счётчиком', () => {
-    const html = renderOpsSummaryHtml({
-      stale_orders: { count: 2, threshold_hours: 48, items: [
-        { id: 7, agent_name: 'Acme', full_name: 'Mgr' },
-      ] },
-      deposits: { count: 0, total: 0, items: [] },
-    });
-    expect(html).toContain('Зависшие заявки');
-    expect(html).toContain('#7');
-    expect(html).toContain('Acme');
-    expect(html).toContain('data-status="low">2<');  // UI-WP-29: критичность атрибутом
-    expect(html).not.toContain('Сдачи'); // count 0 — секции нет
-  });
-
-  it('экранирует пользовательские строки (агент/товар)', () => {
-    const html = renderOpsSummaryHtml({
-      stale_orders: { count: 1, threshold_hours: 48, items: [
-        { id: 1, agent_name: '<b>x', full_name: 'M' },
-      ] },
-    });
-    expect(html).toContain('&lt;b&gt;x');
-    expect(html).not.toContain('<b>x');
-  });
-
-  it('суммирует рассинхрон МС (drift+deleted+demand_failed+transition_blocked)', () => {
-    const html = renderOpsSummaryHtml({
-      ms_anomalies: { drift: 1, deleted: 2, demand_failed: 0, transition_blocked: 1, items: {
-        drift: [{ id: 3, agent_name: 'A' }],
-        deleted: [{ id: 4, agent_name: 'B', status: 'shipped' }],
-        demand_failed: [],
-        transition_blocked: [{ id: 5, agent_name: 'C', status: 'approved' }],
-      } },
-    });
-    expect(html).toContain('Рассинхрон с МойСклад');
-    // Рассинхрон с МС — «плохо», а не «внимание»: учёт разошёлся с реальностью.
-    expect(html).toContain('data-status="out">4<'); // 1 + 2 + 1
-    expect(html).toContain('Статус застрял · #5');
-  });
-});
-
 describe('parsePaymentItems', () => {
   it('парсит строки в items с числовыми суммами', () => {
     const r = parsePaymentItems([
@@ -227,9 +250,9 @@ describe('renderMoneyTotalsHtml', () => {
       deposits: { total_cents: 50000, count: 2 },
     });
     expect(html).toContain('USD · 12 345');
-    expect(html).toContain('3 платеж.');
+    expect(html).toContain('3 платежа');
     expect(html).toContain('Наличные (сдачи) · 500 USD');
-    expect(html).toContain('2 сдач.');
+    expect(html).toContain('2 сдачи');
   });
   it('экранирует валюту', () => {
     const html = renderMoneyTotalsHtml({ payments: [{ currency: '<x>', total_cents: 100, count: 1 }], deposits: { count: 0 } });
@@ -298,18 +321,16 @@ describe('вкладки разделов', () => {
     expect(keys(salesTabs, { canSeeReport: false, canDocs: false })).toEqual(['orders']);
   });
 
-  it('Склад: контейнеры и техника — та же тройка ролей, что у их ручек', () => {
-    expect(keys(stockTabs, { canSeeGoods: true })).toEqual(['catalog', 'containers', 'machines']);
+  it('Склад: контейнеры, техника и накладные — та же тройка ролей, что у их ручек', () => {
+    expect(keys(stockTabs, { canSeeGoods: true }))
+      .toEqual(['catalog', 'containers', 'machines', 'invoices']);
     expect(keys(stockTabs, { canSeeGoods: false })).toEqual(['catalog']);
   });
 
-  it('Склад: «Залежалось» — только руководству', () => {
-    // /api/channel/stale отвечает admin/boss; у менеджера это была бы вкладка,
-    // которая гарантированно вернёт отказ.
-    expect(keys(stockTabs, { canSeeGoods: true, isBoss: true }))
-      .toEqual(['catalog', 'containers', 'machines', 'stale']);
-    expect(keys(stockTabs, { canSeeGoods: true, isBoss: false }))
-      .not.toContain('stale');
+  it('Склад: «Залежалось» — не вкладка, а фильтр каталога (UI-бриф п.4)', () => {
+    // Вкладкой был четвёртый пункт, упиравшийся в край; накладным место
+    // нужнее — у них своё действие «создать». Залежалое — срез того же списка.
+    expect(keys(stockTabs, { canSeeGoods: true, isBoss: true })).not.toContain('stale');
   });
 
   it('Клиенты: лиды всем, воронка, лимиты и канал — руководству', () => {
@@ -504,13 +525,13 @@ describe('rangeLabel (UI-BUG-02)', () => {
   });
 });
 
-describe('доп-кнопка периода (UI-BUG-02)', () => {
+describe('пункт «Период…» (UI-BUG-02 → UI-бриф п.5)', () => {
   const presets = [{ id: 'week', label: 'Неделя' }];
 
-  it('при выбранном пресете — только иконка с доступной подписью', () => {
+  it('при выбранном пресете — подпись «Период…», доступная и глазу, и скринридеру', () => {
     const html = periodSegHtml(presets, 'week', 'data-period', false, '');
     expect(html).toContain('aria-label="Выбрать период"');
-    expect(html).not.toContain('Период…');
+    expect(html).toContain('Период…');
   });
 
   it('в режиме custom показывает выбранный диапазон', () => {
