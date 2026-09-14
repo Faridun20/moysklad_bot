@@ -396,7 +396,9 @@ describe('техника: формы', () => {
     window.document.querySelector('[data-payment="11"]').click();
     await new Promise(r => setTimeout(r, 0));
 
-    expect(window.__writes[0]).toEqual(['/api/machines/payment', { payment_id: 11, paid: true }]);
+    expect(window.__writes[0]).toEqual(['/api/machines/payment', {
+      payment_id: 11, paid: true, idempotency_key: expect.any(String),
+    }]);
   });
 
   it('у машины со сделкой кнопки удаления нет', async () => {
