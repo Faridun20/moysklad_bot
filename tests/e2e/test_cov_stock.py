@@ -19,8 +19,6 @@ import struct
 import zlib
 from types import SimpleNamespace
 
-import pytest
-
 from tests.e2e.conftest import alerts, go, settled, sheet_fill, tab
 
 # ─── Хелперы ─────────────────────────────────────────────────────────────────
