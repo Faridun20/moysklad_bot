@@ -221,7 +221,8 @@ def test_container_list_shows_mismatch_summary(open_app, e2e):
     row = boss.locator(f'[data-container="{cid}"]')
     assert row.get_attribute("data-status") == "rejected", "расхождение подсвечено"
     # Сводка расхождений — в самой строке списка, чтобы не открывать каждый
-    # контейнер. (Раньше проверялось «3» — и совпадало с датой 2026-09-13.)
+    # контейнер по очереди. Проверялось «3» (недостача) — и совпадало с цифрой
+    # в дате: тест был зелёным ровно до 14-го числа.
     text = row.inner_text()
     assert "расхождений: 1" in text and "1 позиция" in text
 

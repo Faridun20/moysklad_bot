@@ -40,9 +40,16 @@ def run_async(coro):
         # завершиться: pytest «зависал» после зелёного прогона. Заодно сиды
         # становятся детерминированными — PDF уже доставлен, когда seed
         # вернул управление.
+        # Ждём ТОЛЬКО СВОИ задачи. Живой uvicorn крутит собственный loop в
+        # отдельном потоке, и порождённые ИМ фоновые задачи лежат в том же
+        # множестве `_tasks`. `gather` по задаче чужого loop'а падает
+        # «got Future attached to a different loop» — ровно это валило
+        # нагрузочные тесты, где одобрение через HTTP спавнит PDF на сервере.
+        # Серверные задачи дренирует его собственный shutdown-хук.
         from utils.background import pending
 
-        left = pending()
+        loop = asyncio.get_running_loop()
+        left = [t for t in pending() if t.get_loop() is loop]
         if left:
             await asyncio.gather(*left, return_exceptions=True)
         return result
