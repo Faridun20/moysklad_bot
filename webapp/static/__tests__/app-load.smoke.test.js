@@ -1918,6 +1918,170 @@ describe('правка контейнера', () => {
   });
 });
 
+describe('выбор из справочника листом с поиском', () => {
+  // Нативный <select> в Telegram-WebView разворачивается системным списком во
+  // весь экран: без поиска, с обрезанными именами. На сотне контрагентов это
+  // пролистывание вслепую — отсюда openListPicker.
+  const boot4 = (extra = '') => boot(`
+    currentUser = { role: 'boss' };
+    window.__picked = null;
+    ${extra}
+    openListPicker({
+      title: 'Контрагент',
+      items: [
+        { id: 1, name: 'ООО Ромашка', sub: 'без Telegram — PDF не отправить' },
+        { id: 2, name: 'Джони Ака' },
+        { id: 3, name: 'Голиб Ака' },
+      ],
+      selectedId: 2,
+      emptyText: 'Контрагенты не найдены',
+      onPick: (item) => { window.__picked = item; },
+    });
+  `);
+
+  it('показывает весь справочник и помечает уже выбранное', () => {
+    const doc = boot4().document;
+    const rows = [...doc.querySelectorAll('.picker-list [data-pick]')];
+    expect(rows.map(r => r.querySelector('.card-row-title').textContent.trim()))
+      .toEqual(['ООО Ромашка', 'Джони Ака', 'Голиб Ака']);
+    expect(doc.querySelector('[data-pick="2"]').className).toContain('picked');
+    // Подстрочник несёт то, что решает выбор: без Telegram PDF не уйдёт.
+    expect(doc.querySelector('[data-pick="1"]').textContent).toContain('без Telegram');
+  });
+
+  it('поиск фильтрует по названию, пустой результат — текстом', async () => {
+    const window = boot4();
+    const doc = window.document;
+    const input = doc.querySelector('#ms-f-search');
+    input.value = 'ака';
+    input.dispatchEvent(new window.Event('input'));
+    await new Promise(r => setTimeout(r, 200));
+    expect([...doc.querySelectorAll('[data-pick]')].map(r => r.dataset.pick)).toEqual(['2', '3']);
+
+    input.value = 'нет такого';
+    input.dispatchEvent(new window.Event('input'));
+    await new Promise(r => setTimeout(r, 200));
+    expect(doc.querySelectorAll('[data-pick]').length).toBe(0);
+    expect(doc.querySelector('.picker-list').textContent).toContain('не найдены');
+  });
+
+  it('выбор уходит в onPick только после подтверждения', async () => {
+    const window = boot4();
+    const doc = window.document;
+    doc.querySelector('[data-pick="3"]').click();
+    expect(window.__picked).toBeNull();          // клик по строке — ещё не выбор
+    doc.querySelector('#ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__picked).toEqual({ id: 3, name: 'Голиб Ака' });
+  });
+
+  it('без выбранной строки подтверждение показывает ошибку в форме', async () => {
+    const window = boot4('');
+    const doc = window.document;
+    // Снимаем предвыбор, как если бы форма открылась пустой.
+    doc.querySelector('[data-pick="2"]').classList.remove('picked');
+    const w2 = boot(`
+      currentUser = { role: 'boss' };
+      window.__picked = null;
+      openListPicker({ title: 'Товар', items: [{ id: 7, name: 'Болт' }],
+                       onPick: (i) => { window.__picked = i; } });
+      document.querySelector('#ms-submit').click();
+    `);
+    await new Promise(r => setTimeout(r, 0));
+    expect(w2.__picked).toBeNull();
+    expect(w2.document.querySelector('#ms-error').textContent).toContain('Выберите');
+  });
+});
+
+describe('сегмент вместо нативного списка в форме', () => {
+  // Нативный `<select>` всегда стоял на первом пункте; сегмент рисует кнопки
+  // невыбранными, и обязательное поле уходило пустым — форма отвечала
+  // «Заполните: Тип документа», хотя варианты лежали перед человеком.
+  it('первый вариант выбран сразу, если значение не задано', () => {
+    const doc = boot(`
+      currentUser = { role: 'boss' };
+      openMachineSheet({
+        title: 'Документ',
+        fields: [{ key: 'doc_type', label: 'Тип документа', type: 'select',
+                   required: true,
+                   options: [['raspiska_ru', 'Расписка'], ['tilxat_uz', 'Тилхат']] }],
+        onSubmit: () => true,
+      });
+    `).document;
+    expect(doc.querySelector('#ms-f-doc_type').value).toBe('raspiska_ru');
+    expect(doc.querySelector('[data-opt="raspiska_ru"]').className).toContain('active');
+    expect(doc.querySelectorAll('.c-sheet select').length).toBe(0);
+  });
+
+  it('заданное значение не перебивается первым вариантом', () => {
+    const doc = boot(`
+      currentUser = { role: 'boss' };
+      openMachineSheet({
+        title: 'Документ',
+        fields: [{ key: 'doc_type', label: 'Тип', type: 'select', value: 'tilxat_uz',
+                   options: [['raspiska_ru', 'Расписка'], ['tilxat_uz', 'Тилхат']] }],
+        onSubmit: () => true,
+      });
+    `).document;
+    expect(doc.querySelector('#ms-f-doc_type').value).toBe('tilxat_uz');
+    expect(doc.querySelector('[data-opt="tilxat_uz"]').className).toContain('active');
+  });
+
+  it('клик по варианту кладёт значение в скрытое поле', () => {
+    const doc = boot(`
+      currentUser = { role: 'boss' };
+      openMachineSheet({
+        title: 'Документ',
+        fields: [{ key: 'doc_type', label: 'Тип', type: 'select',
+                   options: [['raspiska_ru', 'Расписка'], ['tilxat_uz', 'Тилхат']] }],
+        onSubmit: () => true,
+      });
+    `).document;
+    doc.querySelector('[data-opt="tilxat_uz"]').click();
+    expect(doc.querySelector('#ms-f-doc_type').value).toBe('tilxat_uz');
+    expect(doc.querySelector('[data-opt="raspiska_ru"]').className).not.toContain('active');
+  });
+});
+
+describe('контрагента заводят, не выходя из накладной', () => {
+  // Справочник пополнялся только из карточки клиента в «Воронке»: приезжал
+  // новый покупатель — выписать на него расход было не на кого, и отгрузка
+  // вставала. Кнопка стоит ПОД списком: её находят там, где ищут и не находят.
+  it('кнопка отдаёт набранное в поиске как название', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__added = null;
+      openListPicker({
+        title: 'Контрагент',
+        items: [{ id: 1, name: 'ООО Ромашка' }],
+        emptyText: 'Контрагенты не найдены',
+        addLabel: 'Новый контрагент',
+        onAdd: (typed) => { window.__added = typed; },
+        onPick: () => {},
+      });
+    `);
+    const doc = window.document;
+    const input = doc.querySelector('#ms-f-search');
+    input.value = 'ООО Бахор Савдо';
+    input.dispatchEvent(new window.Event('input'));
+    await new Promise(r => setTimeout(r, 200));
+    expect(doc.querySelector('.picker-list').textContent).toContain('не найдены');
+
+    doc.querySelector('.picker-add').click();
+    expect(window.__added).toBe('ООО Бахор Савдо');
+    // Пикер закрылся: форма заведения открывается на его месте, а не поверх.
+    expect(doc.querySelector('.c-overlay')).toBeNull();
+  });
+
+  it('без onAdd кнопки нет — там, где заводить нечего', () => {
+    const doc = boot(`
+      currentUser = { role: 'boss' };
+      openListPicker({ title: 'Товар', items: [{ id: 7, name: 'Болт' }], onPick: () => {} });
+    `).document;
+    expect(doc.querySelector('.picker-add')).toBeNull();
+  });
+});
+
 describe('склад: остатки в «Каталоге» и накладные', () => {
   // Накладные — четвёртая вкладка раздела «Склад» (UI-бриф п.4). Раньше это
   // был дочерний экран с кнопкой между табами и поиском.

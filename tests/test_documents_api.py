@@ -162,11 +162,70 @@ def test_create_validation_errors_are_400_with_text(api):
     assert r.status_code == 403
 
 
-def test_create_without_company_requisites_is_refused(api):
+def test_creditor_falls_back_to_project_company_name(api):
+    """Реквизиты не заполнены — берём то же название, что печатает накладная.
+
+    Менеджер читал отказ «укажите название компании» как «впишите компанию
+    КЛИЕНТА» и вставал в тупик, когда товар берёт физлицо. Название компании
+    в проекте одно (`invoice_pdf.COMPANY_NAME`), и спрашивать его второй раз
+    ради расписки незачем.
+    """
+    from services import documents, invoice_pdf
+
+    client, _db, ids, _bot = api
+    r = _post(client, "/api/docs/create", ids["mgr"], **FORM)
+    assert r.status_code == 200, r.text
+    assert documents.company_requisites()["company_name"] == invoice_pdf.COMPANY_NAME
+
+
+def test_create_is_refused_when_company_name_is_empty_everywhere(api, monkeypatch):
+    """Отказ остаётся там, где имени кредитора нет ВООБЩЕ — и говорит, чьё оно."""
+    from services import documents
+
+    monkeypatch.setattr(documents, "company_requisites", lambda: dict.fromkeys(
+        (k for k, _ in documents.COMPANY_FIELDS), ""
+    ))
     client, _db, ids, _bot = api
     r = _post(client, "/api/docs/create", ids["mgr"], **FORM)
     assert r.status_code == 400
-    assert "компани" in r.json()["detail"].lower()
+    detail = r.json()["detail"]
+    assert "кредитор" in detail.lower() and "физлицо" in detail.lower()
+
+
+def test_payment_type_follows_the_number_of_payments(api):
+    """График строится по ЧИСЛУ платежей, а не по забытому переключателю.
+
+    Раньше рядом стояли «Порядок оплаты» и «Число платежей»: менеджер вписывал
+    шесть платежей, оставлял «Разовый платёж» — и расписка молча выходила с
+    одной строкой на всю сумму и остатком 0 (жалоба с площадки).
+    """
+    from services import documents
+
+    _client, _db, _ids, _bot = api
+    bare = {k: v for k, v in FORM.items() if k != "payment_type"}
+
+    # Ровно тот случай, на который жаловались: шесть платежей вписаны,
+    # переключатель остался на «Разовый платёж».
+    ctx, record = documents.form_to_context(dict(bare, payment_type="single", installments_count="6"))
+    assert record["payment_type"] == "installment"
+    assert record["installments_count"] == 6
+    assert len(ctx["schedule"]) == 6
+    # Остаток нулевой ТОЛЬКО у последнего платежа — иначе график бессмысленен.
+    assert ctx["schedule"][-1]["balance"].startswith("0")
+    assert not ctx["schedule"][0]["balance"].startswith("0")
+
+    # Форма без переключателя вообще (новая) — тот же результат.
+    _ctx, rec = documents.form_to_context(dict(bare, installments_count="6"))
+    assert rec["payment_type"] == "installment"
+
+    # Один платёж и пустое поле — разовый, без графика.
+    for count in ("1", ""):
+        _ctx, rec = documents.form_to_context(dict(bare, installments_count=count))
+        assert rec["payment_type"] == "single" and rec["installments_count"] is None
+
+    # Явная рассрочка с одним платежом — противоречие, а не тихий разовый.
+    with pytest.raises(documents.DocumentError):
+        documents.form_to_context(dict(FORM, payment_type="installment", installments_count="1"))
 
 
 def test_send_and_print(api, monkeypatch):

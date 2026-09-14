@@ -180,7 +180,10 @@
       return `<button class="seg-item ${on ? 'active' : ''}" data-sect="${escapeHtml(t.key)}" ` +
              `aria-pressed="${on}">${escapeHtml(t.label)}${badge}</button>`;
     }).join('');
-    return `<div class="seg-row"><div class="seg${scroll}">${items}</div></div>`;
+    // `scroll-hint` — обёртка, на которой рисуется затенение края (CSS), когда
+    // ряд не влез. Ставим только скроллящемуся: у трёх вкладок края нет.
+    const hint = scroll ? ' scroll-hint' : '';
+    return `<div class="seg-row${hint}"><div class="seg${scroll}">${items}</div></div>`;
   }
 
   // Рендер блока «Итоги» раздела «Деньги» (данные /api/money/summary):
@@ -397,7 +400,7 @@
       `<button class="seg-item seg-item--custom ${customActive ? 'active' : ''}" ${attr}="custom" ` +
       `aria-pressed="${customActive ? 'true' : 'false'}" aria-label="Выбрать период">` +
       `${icon('calendar')} ${label}</button>`;
-    return `<div class="seg-row"><div class="seg seg--scroll">${seg}${custom}</div></div>`;
+    return `<div class="seg-row scroll-hint"><div class="seg seg--scroll">${seg}${custom}</div></div>`;
   }
 
   // ─── Склад ────────────────────────────────────────────────────────────
@@ -471,7 +474,7 @@
       .filter((s) => Number(c[s] || 0) > 0)
       .map((s) => pill(s, machineStatusLabel(s, labels), Number(c[s])))
       .join('');
-    return `<div class="seg-row"><div class="seg seg--scroll">` +
+    return `<div class="seg-row scroll-hint"><div class="seg seg--scroll">` +
       `${pill('all', 'Все', Number(c.all || 0))}${pills}</div></div>`;
   }
 

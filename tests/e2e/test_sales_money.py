@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from tests.e2e.conftest import go, seed_order, settled, tab
 
@@ -226,6 +227,37 @@ def test_cash_deposit_is_confirmed_and_closes_debt_fifo(open_app, e2e):
     assert boss.locator(f".debt-card:has-text('#{oid}')").count() == 0
 
 
+def test_manual_payment_currency_is_picked_by_a_segment(open_app, e2e):
+    """Валюта строки платежа — сегмент, а не нативный `<select>`.
+
+    Системный список Telegram-WebView открывается во весь экран даже ради двух
+    пунктов. Проверяем не разметку, а результат: выбранная валюта обязана
+    доехать до записи в БД — выбор живёт в data-атрибуте, и без обработчика
+    клика строка молча ушла бы с USD по умолчанию.
+    """
+    mgr = open_app(e2e.ids["mgr"])
+    go(mgr, "money")
+    tab(mgr, "ops")
+    mgr.wait_for_selector(".pay-row-cur [data-cur-opt='UZS']")
+    assert mgr.locator("#pay-rows select").count() == 0, "нативный select остался"
+
+    mgr.fill(".pay-row-amount", "250000")
+    mgr.click(".pay-row-cur [data-cur-opt='UZS']")
+    mgr.wait_for_selector(".pay-row-cur [data-cur-opt='UZS'].active")
+    mgr.fill("#pay-comment", "Аренда за май")
+    mgr.click("#pay-submit")
+
+    for _ in range(50):
+        rows = e2e.rows("SELECT amount_cents, currency, comment FROM payments")
+        if rows:
+            break
+        time.sleep(0.2)
+    status = mgr.locator("#pay-status")
+    assert status.count() == 0 or "❌" not in status.inner_text(), status.inner_text()
+    assert rows == [{"amount_cents": 25000000, "currency": "UZS",
+                     "comment": "Аренда за май"}]
+
+
 # ─── Возврат: менеджер оформляет, босс принимает товар и подтверждает ────────
 
 
@@ -339,6 +371,40 @@ def test_sales_and_money_reports_render_for_boss(open_app, e2e):
     assert "Ошибка" not in text and "Нет доступа" not in text
 
 
+def test_report_cards_do_not_overlap(open_app, e2e):
+    """Жалоба с площадки: карточки отчёта «налезают друг на друга».
+
+    Проверяем не CSS, а наблюдаемое: реальные прямоугольники плиток в браузере
+    не пересекаются и стоят сеткой 2×2 (две в ряд), с зазором между рядами.
+    Скруглённые карточки вплотную дают «выемки» на стыке — это и видно глазом.
+    """
+    seed_order(e2e)
+    boss = open_app(e2e.ids["boss"])
+    go(boss, "sales")
+    boss.wait_for_selector(".order-card")
+    tab(boss, "report")
+    settled(boss)
+    boss.wait_for_selector(".stat-grid .stat")
+
+    boxes = boss.eval_on_selector_all(
+        ".stat-grid .stat",
+        "els => els.map(e => { const r = e.getBoundingClientRect();"
+        " return {x: r.x, y: r.y, w: r.width, h: r.height}; })",
+    )
+    assert len(boxes) >= 4, f"у руководства четыре показателя, получено {len(boxes)}"
+
+    for i, a in enumerate(boxes):
+        for b in boxes[i + 1:]:
+            overlap_x = min(a["x"] + a["w"], b["x"] + b["w"]) - max(a["x"], b["x"])
+            overlap_y = min(a["y"] + a["h"], b["y"] + b["h"]) - max(a["y"], b["y"])
+            assert overlap_x <= 0 or overlap_y <= 0, f"плитки пересекаются: {a} и {b}"
+
+    # Сетка именно 2×2: первые две плитки в одном ряду, третья — ниже.
+    assert abs(boxes[0]["y"] - boxes[1]["y"]) < 1, "первые две плитки должны стоять в ряд"
+    assert boxes[2]["y"] > boxes[0]["y"] + boxes[0]["h"] - 1, "третья плитка — новый ряд"
+    assert boxes[2]["y"] - (boxes[0]["y"] + boxes[0]["h"]) >= 4, "между рядами нужен зазор"
+
+
 def test_manager_sales_report_renders_own_scope(open_app, e2e):
     seed_order(e2e)
     mgr = open_app(e2e.ids["mgr"])
@@ -412,20 +478,32 @@ def test_manager_creates_raspiska_and_prints_it(open_app, e2e, monkeypatch, tmp_
     mgr.wait_for_selector("#doc-new")
     assert mgr.locator("#doc-company").count() == 0, "реквизиты правит только руководство"
     mgr.click("#doc-new")
-    mgr.select_option("#ms-f-doc_type", "raspiska_ru")
+    # Тип документа — сегмент, а не нативный `<select>`: значение держит
+    # скрытое поле, которое читает общий сбор формы.
+    mgr.click('[data-opt="raspiska_ru"]')
+    mgr.wait_for_function(
+        "() => document.querySelector('#ms-f-doc_type').value === 'raspiska_ru'"
+    )
     mgr.fill("#ms-f-debtor_full_name", "Иванов Иван Иванович")
     mgr.fill("#ms-f-product_name", "Экскаватор JCB 3CX")
     mgr.fill("#ms-f-total_amount", "25000")
     mgr.fill("#ms-f-term_months", "6")
-    mgr.select_option("#ms-f-payment_type", "installment")
+    # Переключателя «Порядок оплаты» больше нет: рассрочку задаёт само число
+    # платежей. Два поля противоречили друг другу — менеджер вписывал шесть
+    # платежей, забывал переключить «Разовый», и расписка выходила с одной
+    # строкой графика и остатком 0.
+    assert mgr.locator("#ms-f-payment_type").count() == 0
     mgr.fill("#ms-f-installments_count", "6")
     mgr.click("#ms-submit")
     mgr.wait_for_selector(".toast:has-text('сформирован')")
     mgr.wait_for_selector("[data-doc-print]")
 
-    docs = e2e.rows("SELECT client_name, total_amount_cents, installments_count FROM generated_documents")
+    docs = e2e.rows(
+        "SELECT client_name, total_amount_cents, payment_type, installments_count "
+        "FROM generated_documents"
+    )
     assert docs == [{"client_name": "Иванов Иван Иванович", "total_amount_cents": 2_500_000,
-                     "installments_count": 6}]
+                     "payment_type": "installment", "installments_count": 6}]
     # PDF ушёл составителю с кнопкой «Распечатать» (prn:doc:<id>).
     assert [d["chat_id"] for d in e2e.bot.documents] == [e2e.ids["mgr"]]
     markup = e2e.bot.documents[0].get("reply_markup")
@@ -441,7 +519,6 @@ def test_manager_creates_raspiska_and_prints_it(open_app, e2e, monkeypatch, tmp_
     mgr.fill("#ms-f-product_name", "Ковш")
     mgr.fill("#ms-f-total_amount", "100")
     mgr.fill("#ms-f-term_months", "2")
-    mgr.select_option("#ms-f-payment_type", "installment")
     mgr.fill("#ms-f-installments_count", "5")
     mgr.click("#ms-submit")
     mgr.wait_for_selector("#ms-error:not([hidden])")
