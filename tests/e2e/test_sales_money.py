@@ -515,6 +515,7 @@ def test_manager_creates_raspiska_and_prints_it(open_app, e2e, monkeypatch, tmp_
 
     # Ошибка формы остаётся В форме, а не закрывает её.
     mgr.click("#doc-new")
+    mgr.click('[data-opt="raspiska_ru"]')  # по умолчанию — RU+UZ, ей нужны полные реквизиты
     mgr.fill("#ms-f-debtor_full_name", "Петров")
     mgr.fill("#ms-f-product_name", "Ковш")
     mgr.fill("#ms-f-total_amount", "100")
@@ -557,3 +558,46 @@ def test_invoice_list_has_no_print_button_without_cups(open_app, e2e, monkeypatc
     tab(boss, "invoices")
     boss.wait_for_selector("[data-wh-cancel]")
     assert boss.locator("[data-wh-print]").count() == 0
+
+
+def test_ru_uz_receipt_form_hides_handwritten_fields(open_app, e2e):
+    """Расписка RU+UZ: паспорт, адрес, пеню и валюту в неё не печатают —
+    Должник пишет данные от руки, условия зашиты в текст юриста. Форма их
+    прячет и возвращает при переключении на обычную расписку."""
+    for key, value in {
+        "company_name": "ООО Ромашка", "company_tin": "123456789", "company_address": "Ташкент",
+        "company_representative": "Петров Пётр", "company_position": "Директор",
+        "company_position_uz": "Директор", "company_representative_gen": "директора Петрова Петра",
+        "company_city": "Ташкент", "company_city_uz": "Тошкент",
+    }.items():
+        e2e.db.set_setting(key, value, e2e.ids["boss"])
+
+    mgr = open_app(e2e.ids["mgr"])
+    go(mgr, "sales")
+    tab(mgr, "docs")
+    mgr.click("#doc-new")
+    mgr.wait_for_selector("#ms-f-doc_type", state="attached")  # скрытое поле сегмента
+    assert mgr.input_value("#ms-f-doc_type") == "raspiska_ru_uz", "новый формат — по умолчанию"
+    for key in ("debtor_passport", "debtor_address", "penalty_rate", "currency", "witness_name"):
+        assert not mgr.locator(f"#ms-f-{key}").is_visible(), f"{key} не печатается в RU+UZ"
+    assert mgr.locator("text=Должник впишет сам").is_visible()
+
+    mgr.click('[data-opt="raspiska_ru"]')
+    assert mgr.locator("#ms-f-debtor_passport").is_visible()
+    mgr.click('[data-opt="raspiska_ru_uz"]')
+    assert not mgr.locator("#ms-f-debtor_passport").is_visible()
+
+    mgr.fill("#ms-f-debtor_full_name", "Иванов Иван Иванович")
+    mgr.fill("#ms-f-product_name", "Экскаватор JCB 3CX")
+    mgr.fill("#ms-f-total_amount", "24000")
+    mgr.fill("#ms-f-term_months", "12")
+    mgr.fill("#ms-f-installments_count", "12")
+    mgr.click("#ms-submit")
+    mgr.wait_for_selector(".toast:has-text('сформирован')")
+
+    docs = e2e.rows(
+        "SELECT g.client_name, g.currency, g.installments_count, t.type FROM generated_documents g "
+        "JOIN document_templates t ON t.id = g.template_id"
+    )
+    assert docs == [{"client_name": "Иванов Иван Иванович", "currency": "USD",
+                     "installments_count": 12, "type": "raspiska_ru_uz"}]

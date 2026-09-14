@@ -5987,7 +5987,7 @@ _DOC_ROLES = ("admin", "boss", "manager")
 @app.post("/api/docs/types")
 async def api_docs_types(request: Request):
     """Справочник для формы: типы документов, реквизиты компании, что доступно."""
-    from services import documents, printing
+    from services import documents, legal_docs, printing
 
     data = await request.json()
     user = _authorize(data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_types")
@@ -5995,6 +5995,9 @@ async def api_docs_types(request: Request):
     company = await asyncio.to_thread(documents.company_requisites)
     return JSONResponse({
         "types": [{"key": k, "label": v} for k, v in documents.DOC_TYPES.items()],
+        # Типы, где данные должника и сумму Должник пишет от руки: форма прячет
+        # поля, которые в такой документ не попадают.
+        "handwritten_types": sorted(legal_docs.HANDWRITTEN_TYPES),
         "company": company,
         "company_fields": [{"key": k, "label": v} for k, v in documents.COMPANY_FIELDS],
         "can_edit_company": role in ("admin", "boss"),

@@ -112,11 +112,19 @@ def test_schedule_rejects_nonsense(count, total):
 # ─── Контекст ─────────────────────────────────────────────────────────────────
 
 
+# Реквизиты, без которых расписка RU+UZ не собирается (см. _HANDWRITTEN_REQUIRED).
+FULL_CREDITOR = {
+    "name": "FARID IMPEKS LLC", "tin": "309876543", "address": "г. Ташкент, ул. Амира Темура, 107Б",
+    "representative": "Масуджанов Фаридун", "position": "Директор", "position_uz": "Директор",
+    "representative_gen": "директора Масуджанова Фаридуна",
+}
+
+
 def _ctx(**over):
     base = dict(
         doc_type="raspiska_ru", city="Ташкент",
         debtor={"full_name": "Иванов Иван Иванович", "passport": "AA1234567"},
-        creditor={"name": "FARID IMPEKS LLC"},
+        creditor=dict(FULL_CREDITOR),
         product_name="Экскаватор JCB 3CX", total_cents=2_500_000, currency="USD",
         start_date=date(2026, 9, 12), term_months=6,
         payment_type="installment", installments_count=6,
@@ -293,3 +301,94 @@ def test_template_keeps_the_look_of_the_sample():
              and p._element.find(qn("w:pPr")).find(qn("w:pBdr")) is not None]
     assert len(ruled) == 3, "линейка под подпись: должник, кредитор, свидетель"
     assert sum("(подпись, фамилия" in p.text for p in pars) == 3
+
+
+# ─── Расписка RU+UZ (бланк юриста, данные должника — от руки) ─────────────────
+
+
+def test_ru_uz_only_in_dollars():
+    """Текст бланка: «стоимость определена в долларах США». Сумовая расписка
+    с этим текстом противоречила бы сама себе."""
+    with pytest.raises(ld.DocumentError, match="долларах США"):
+        _ctx(doc_type="raspiska_ru_uz", currency="UZS")
+
+
+def test_ru_uz_requires_signatory_requisites():
+    with pytest.raises(ld.DocumentError, match="должность подписанта.*ИНН|ИНН.*должность"):
+        _ctx(doc_type="raspiska_ru_uz", creditor={"name": "X", "representative": "Петров"})
+
+
+def test_ru_uz_basis_is_charter_or_power_of_attorney():
+    charter = _ctx(doc_type="raspiska_ru_uz")
+    assert (charter["creditor_basis_ru"], charter["creditor_basis_uz"]) == ("Устава", "Устав")
+
+    poa = _ctx(doc_type="raspiska_ru_uz",
+               creditor={**FULL_CREDITOR, "poa_number": "12", "poa_date": "01.02.2026"})
+    assert poa["creditor_basis_ru"] == "доверенности № 12 от 01.02.2026"
+    assert poa["creditor_basis_uz"] == "01.02.2026 йилдаги № 12 ишончнома"
+
+
+def test_ru_uz_genitive_signatory_falls_back_without_inventing_endings():
+    """Родительный падеж — из реквизитов как есть; нет его — должность и ФИО
+    без выдуманных окончаний."""
+    assert _ctx(doc_type="raspiska_ru_uz")["creditor_representative_gen"] == "директора Масуджанова Фаридуна"
+    plain = {k: v for k, v in FULL_CREDITOR.items() if k != "representative_gen"}
+    assert _ctx(doc_type="raspiska_ru_uz", creditor=plain)["creditor_representative_gen"] == (
+        "Директор Масуджанов Фаридун"
+    )
+
+
+def test_ru_uz_uzbek_city_falls_back_to_city():
+    assert _ctx(doc_type="raspiska_ru_uz")["city_uz"] == "Ташкент"
+    assert _ctx(doc_type="raspiska_ru_uz", creditor={**FULL_CREDITOR, "city_uz": "Тошкент"})["city_uz"] == "Тошкент"
+
+
+def test_ru_uz_template_matches_the_lawyer_source(tmp_path):
+    """Шаблон — результат `scripts/build_raspiska_ru_uz` над бланком юриста.
+
+    Правка .docx руками разошлась бы со скриптом и молча пропала при
+    следующей сборке. Заодно: ни одной [скобки] бланка не осталось.
+    """
+    from scripts import build_raspiska_ru_uz as gen
+
+    fresh = tmp_path / "raspiska_ru_uz.docx"
+    gen.build().save(str(fresh))
+    committed = _docx_paragraphs(ld.template_path("raspiska_ru_uz"))
+    assert _docx_paragraphs(fresh) == committed, (
+        "шаблон разошёлся со скриптом — пересоберите `python -m scripts.build_raspiska_ru_uz`"
+    )
+    assert not [t for t in committed if "[" in t]
+
+
+def test_ru_uz_keeps_handwritten_lines_and_layout():
+    """Данные должника и сумма остаются чертой «от руки»; город и дата — одной
+    строкой через табуляцию (в бланке пробелы, и дата уезжала на вторую строку);
+    заголовок графика не отрывается от таблицы."""
+    from docx import Document
+
+    doc = Document(str(ld.template_path("raspiska_ru_uz")))
+    texts = [p.text for p in doc.paragraphs]
+    assert sum(t.startswith("Сумма цифрами: ____") for t in texts) == 1
+    assert sum(t.startswith("Рақамда: ____") for t in texts) == 1
+    assert "г. {{ city }}\t«___» _______________ 20__ г." in texts
+    assert "{{ city_uz }} ш.\t«___» _______________ 20__ й." in texts
+    headings = [p for p in doc.paragraphs if p.text in ("3. График платежей:", "3. Тўлов жадвали:")]
+    assert len(headings) == 2 and all(p.paragraph_format.keep_with_next for p in headings)
+
+
+@pytest.mark.skipif(not HAS_SOFFICE, reason="нет LibreOffice (в образе он есть)")
+def test_render_ru_uz_pdf(tmp_path):
+    import asyncio
+
+    from pypdf import PdfReader
+
+    ctx = _ctx(doc_type="raspiska_ru_uz", creditor={**FULL_CREDITOR, "city_uz": "Тошкент"})
+    pdf = asyncio.run(ld.render_pdf("raspiska_ru_uz", ctx, tmp_path))
+    text = " ".join(" ".join(p.extract_text() for p in PdfReader(str(pdf)).pages).split())
+    assert "{{" not in text and "{%" not in text and "[" not in text
+    assert text.count("Экскаватор JCB 3CX") == 2, "товар — в русской и узбекской части"
+    assert "в лице директора Масуджанова Фаридуна, действующего на основании Устава" in text
+    # График из шести платежей — в обеих таблицах.
+    assert text.count("4 166.66 USD") == 10
+    # ФИО должника в документ не печатается: его пишут от руки.
+    assert "Иванов" not in text

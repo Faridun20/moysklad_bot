@@ -97,7 +97,8 @@ def test_types_and_company_requisites(api):
     r = _post(client, "/api/docs/types", ids["mgr"])
     assert r.status_code == 200, r.text
     body = r.json()
-    assert [t["key"] for t in body["types"]] == ["raspiska_ru", "tilxat_uz"]
+    assert [t["key"] for t in body["types"]] == ["raspiska_ru_uz", "raspiska_ru", "tilxat_uz"]
+    assert body["handwritten_types"] == ["raspiska_ru_uz"]
     assert body["can_edit_company"] is False
     assert "can_print" in body
 
@@ -355,3 +356,37 @@ def test_invoice_print_endpoint(api, monkeypatch):
     assert r.json()["ok"] is False and "Принтер" in r.json()["error"]
     assert printed and inv["invoice_number"] in printed[0]
     assert _post(client, "/api/wh/invoices/print", ids["keeper"], invoice_id=inv["invoice_id"]).status_code == 403
+
+
+def test_ru_uz_uses_signatory_from_requisites(api):
+    """Расписка RU+UZ берёт подписанта и основание из реквизитов; без них —
+    понятный отказ с перечнем того, что заполнить, а не документ с дырами."""
+    client, _db, ids, _bot = api
+    form = {**FORM, "doc_type": "raspiska_ru_uz"}
+    _post(client, "/api/docs/company/set", ids["boss"], company={"company_name": "ООО Ромашка"})
+    r = _post(client, "/api/docs/create", ids["mgr"], **form)
+    assert r.status_code == 400
+    assert "Реквизитах компании" in r.json()["detail"] and "должность подписанта" in r.json()["detail"]
+
+    _post(client, "/api/docs/company/set", ids["boss"], company={
+        "company_name": "ООО Ромашка", "company_tin": "123456789", "company_address": "Ташкент",
+        "company_representative": "Петров Пётр", "company_position": "Директор",
+        "company_position_uz": "Директор", "company_representative_gen": "директора Петрова Петра",
+        "company_poa_number": "7", "company_poa_date": "01.09.2026",
+        "company_city": "Ташкент", "company_city_uz": "Тошкент",
+    })
+    r = _post(client, "/api/docs/create", ids["mgr"], **form)
+    assert r.status_code == 200, r.text
+    pdf = _bot.documents[-1]["document"] if _bot.documents and "document" in _bot.documents[-1] else None
+    from services import documents
+    import asyncio
+    doc = asyncio.run(documents.get_document(r.json()["id"]))
+    data, _name = documents.read_pdf(doc)
+    body = data.decode("utf-8", "replace")
+    assert "директора Петрова Петра" in body
+    assert "доверенности № 7 от 01.09.2026" in body
+    assert "'city_uz': 'Тошкент'" in body
+
+    r = _post(client, "/api/docs/create", ids["mgr"], **{**form, "currency": "UZS"})
+    assert r.status_code == 400 and "долларах США" in r.json()["detail"]
+    del pdf

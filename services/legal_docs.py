@@ -37,9 +37,27 @@ TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates" / "legal"
 # документ подставляется целое предложение о порядке оплаты, и по-русски
 # оно должно быть по-русски.
 TEMPLATES: dict[str, tuple[str, str]] = {
+    "raspiska_ru_uz": ("raspiska_ru_uz.docx", "ru"),
     "raspiska_ru": ("raspiska_ru.docx", "ru"),
     "tilxat_uz": ("tilxat_uz.docx", "uz"),
 }
+
+# Двуязычная расписка юриста (templates/legal/src, scripts/build_raspiska_ru_uz):
+# данные должника и сумму Должник пишет ОТ РУКИ, система подставляет только
+# реквизиты кредитора, товар, сроки и график. Стоимость в ней зашита в
+# долларах США («подлежит уплате в сумах по курсу ЦБ»), пеня и условия
+# досрочного взыскания — тоже в тексте, полями формы не меняются.
+HANDWRITTEN_TYPES = frozenset({"raspiska_ru_uz"})
+
+# Реквизиты, которые печатаются в двуязычной расписке. Пустое поле ушло бы в
+# документ дырой посреди фразы «в лице …, действующего на основании …».
+_HANDWRITTEN_REQUIRED = (
+    ("tin", "ИНН"),
+    ("address", "адрес"),
+    ("representative", "представитель (ФИО)"),
+    ("position", "должность подписанта"),
+    ("position_uz", "должность подписанта по-узбекски"),
+)
 
 # Пункт о порядке оплаты — на языке документа. В черновике эта строка была
 # зашита по-узбекски для обоих шаблонов, и русская расписка получала бы
@@ -136,6 +154,14 @@ def build_context(
         raise DocumentError("Срок должен быть не меньше месяца")
 
     lang = TEMPLATES[doc_type][1]
+    if doc_type in HANDWRITTEN_TYPES:
+        if currency != "USD":
+            raise DocumentError("Расписка RU+UZ составляется только в долларах США")
+        missing = [label for key, label in _HANDWRITTEN_REQUIRED if not creditor.get(key)]
+        if missing:
+            raise DocumentError(
+                "Для расписки RU+UZ заполните в «Реквизитах компании»: " + ", ".join(missing)
+            )
 
     if payment_type == "single":
         count = 1
@@ -167,6 +193,8 @@ def build_context(
         "creditor_tin": creditor.get("tin", ""),
         "creditor_address": creditor.get("address", ""),
         "creditor_representative": creditor.get("representative", ""),
+        **_signatory(creditor),
+        "city_uz": creditor.get("city_uz") or city,
         "product_name": product_name,
         "total_amount": _money(total_cents),
         "total_amount_words": amount_in_words(money.from_cents(total_cents), lang),
@@ -180,6 +208,37 @@ def build_context(
         "penalty_rate": penalty_rate,
         "grace_days": grace_days,
         "witness_name": witness_name,
+    }
+
+
+def _signatory(creditor: dict) -> dict:
+    """Подписант кредитора для фраз «в лице …» и «на основании …».
+
+    «В лице» требует родительного падежа («директора Иванова И. И.»), а
+    склонять ФИО программно — значит однажды просклонять неправильно. Поэтому
+    форма берётся из реквизитов как есть; не заполнена — должность и ФИО в
+    именительном: грамматически хуже, но без выдуманных окончаний.
+    Основание — доверенность, если указан её номер, иначе Устав.
+    """
+    position = creditor.get("position", "")
+    representative = creditor.get("representative", "")
+    poa_number = creditor.get("poa_number", "")
+    poa_date = creditor.get("poa_date", "")
+    if poa_number:
+        date_ru = f" от {poa_date}" if poa_date else ""
+        date_uz = f"{poa_date} йилдаги " if poa_date else ""
+        basis_ru = f"доверенности № {poa_number}{date_ru}"
+        basis_uz = f"{date_uz}№ {poa_number} ишончнома"
+    else:
+        basis_ru, basis_uz = "Устава", "Устав"
+    return {
+        "creditor_position": position,
+        "creditor_position_uz": creditor.get("position_uz", ""),
+        "creditor_representative_gen": (
+            creditor.get("representative_gen") or f"{position} {representative}".strip()
+        ),
+        "creditor_basis_ru": basis_ru,
+        "creditor_basis_uz": basis_uz,
     }
 
 

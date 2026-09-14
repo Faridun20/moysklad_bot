@@ -7140,6 +7140,47 @@ function openDocumentForm(meta) {
       return true;
     },
   });
+  wireHandwrittenDocFields(meta);
+}
+
+// Расписка RU+UZ: паспорт, адрес, телефон и сумму прописью Должник пишет от
+// руки, пеня и валюта зашиты в текст юриста. Поля, которые в такой документ
+// не попадут, прячем — иначе менеджер старательно заполняет их и ищет в PDF.
+const HANDWRITTEN_HIDDEN = ['debtor_passport', 'debtor_pinfl', 'debtor_birth_date', 'debtor_address',
+  'debtor_phone', 'currency', 'penalty_rate', 'grace_days', 'witness_name', 'company_representative'];
+function wireHandwrittenDocFields(meta) {
+  const ov = document.querySelector('.c-overlay');
+  const typeInput = ov && ov.querySelector('#ms-f-doc_type');
+  if (!typeInput) return;
+  const handwritten = new Set(meta.handwritten_types || []);
+  const nameField = ov.querySelector('#ms-f-debtor_full_name');
+  const nameHint = document.createElement('span');
+  nameHint.className = 'c-field-hint';
+  nameHint.textContent = 'В документ не печатается — Должник впишет сам. Нужно для списка документов.';
+  const sync = () => {
+    const on = handwritten.has(typeInput.value);
+    HANDWRITTEN_HIDDEN.forEach(k => {
+      const label = ov.querySelector(`#ms-f-${k}`)?.closest('.c-field');
+      if (label) label.style.display = on ? 'none' : '';
+    });
+    if (on) {
+      // Расписка RU+UZ — только в долларах: сервер другую валюту отклонит.
+      const cur = ov.querySelector('#ms-f-currency');
+      if (cur) {
+        cur.value = 'USD';
+        cur.closest('.seg-row')?.querySelectorAll('.seg-item[data-opt]').forEach(b => {
+          b.classList.toggle('active', b.dataset.opt === 'USD');
+          b.setAttribute('aria-pressed', String(b.dataset.opt === 'USD'));
+        });
+      }
+    }
+    if (nameField) {
+      if (on) nameField.after(nameHint); else nameHint.remove();
+    }
+  };
+  typeInput.closest('.seg-row')?.querySelectorAll('.seg-item[data-opt]').forEach(btn =>
+    btn.addEventListener('click', sync));
+  sync();
 }
 
 async function renderWhInvoiceNew() {

@@ -31,6 +31,7 @@ from services.database import now_str
 logger = logging.getLogger(__name__)
 
 DOC_TYPES: dict[str, str] = {
+    "raspiska_ru_uz": "Расписка RU+UZ",
     "raspiska_ru": "Расписка (рус.)",
     "tilxat_uz": "Тилхат (ўзб.)",
 }
@@ -42,6 +43,13 @@ COMPANY_FIELDS: tuple[tuple[str, str], ...] = (
     ("company_address", "Адрес"),
     ("company_representative", "Представитель (ФИО)"),
     ("company_city", "Город"),
+    # Для расписки RU+UZ: «в лице …, действующего на основании …».
+    ("company_position", "Должность подписанта (например: Директор)"),
+    ("company_representative_gen", "Подписант в родительном падеже (директора Иванова Ивана Ивановича)"),
+    ("company_position_uz", "Лавозими — должность по-узбекски (Директор)"),
+    ("company_poa_number", "Доверенность № (пусто — действует на основании Устава)"),
+    ("company_poa_date", "Дата доверенности (ДД.ММ.ГГГГ)"),
+    ("company_city_uz", "Город по-узбекски (Тошкент)"),
 )
 
 DEFAULT_PENALTY_RATE = "0.1"
@@ -137,7 +145,15 @@ def form_to_context(data: dict[str, Any]) -> tuple[dict, dict]:
         "tin": _clean(data.get("company_tin"), 32) or company["company_tin"],
         "address": _clean(data.get("company_address"), 300) or company["company_address"],
         "representative": _clean(data.get("company_representative")) or company["company_representative"],
+        "position": company["company_position"],
+        "position_uz": company["company_position_uz"],
+        "poa_number": company["company_poa_number"],
+        "poa_date": company["company_poa_date"],
     }
+    # Родительный падеж пишется под конкретного человека: подписывает другой
+    # представитель — готовая форма из реквизитов про него врёт.
+    if creditor["representative"] == company["company_representative"]:
+        creditor["representative_gen"] = company["company_representative_gen"]
     if not creditor["name"]:
         # Формулировка важна: менеджеры читали это как «впишите компанию
         # КЛИЕНТА» и вставали в тупик, когда товар берёт физлицо. Компания
@@ -150,6 +166,10 @@ def form_to_context(data: dict[str, Any]) -> tuple[dict, dict]:
     city = _clean(data.get("city"), 80) or company["company_city"]
     if not city:
         raise DocumentError("Укажите город")
+    # Узбекское название — только к городу из реквизитов: для другого города
+    # в форме оно было бы чужим («Тошкент» при городе «Самарканд»).
+    if city == company["company_city"]:
+        creditor["city_uz"] = company["company_city_uz"]
 
     product_name = _clean(data.get("product_name"), 300)
     if not product_name:
