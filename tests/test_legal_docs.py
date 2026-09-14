@@ -231,3 +231,65 @@ def test_render_reports_missing_template():
 
     with pytest.raises(ld.DocumentError, match="Шаблон не найден"):
         asyncio.run(ld.render_pdf("raspiska_ru", _ctx(), "/tmp", template_override="/nope.docx"))
+
+
+def _docx_paragraphs(path) -> list[str]:
+    from docx import Document
+
+    doc = Document(str(path))
+    rows = [p.text for p in doc.paragraphs]
+    for table in doc.tables:
+        for row in table.rows:
+            rows.extend(cell.text for cell in row.cells)
+    return rows
+
+
+def test_committed_templates_match_the_generator(tmp_path):
+    """Шаблон в репозитории — результат прогона `scripts/build_legal_templates`.
+
+    .docx двоичный: правку в нём не видно в диффе и не отревьюить. Исходник —
+    скрипт, а расхождение между ним и файлом означает, что кто-то поправил
+    шаблон в Word и следующий прогон скрипта эту правку молча затрёт.
+    """
+    from scripts import build_legal_templates as gen
+
+    for doc_type, builder in (("raspiska_ru", gen.build_ru), ("tilxat_uz", gen.build_uz)):
+        fresh = tmp_path / f"{doc_type}.docx"
+        builder().save(str(fresh))
+        assert _docx_paragraphs(fresh) == _docx_paragraphs(ld.template_path(doc_type)), (
+            f"{doc_type}: шаблон разошёлся со скриптом — "
+            "пересоберите `python -m scripts.build_legal_templates`"
+        )
+
+
+def test_template_keeps_the_look_of_the_sample():
+    """Вид расписки взят с образца руководства — проверяем его приметы.
+
+    Заголовок обычным начертанием (не капсом), город и дата ОДНОЙ строкой,
+    сумма — отдельным жирным абзацем, подпись — линейкой во всю ширину с
+    мелкой подписью под ней. Всё это легко потерять при следующей правке
+    текста, а заметно только на распечатанном документе.
+    """
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+
+    doc = Document(str(ld.template_path("raspiska_ru")))
+    pars = doc.paragraphs
+
+    assert pars[0].text == "Расписка"
+    assert pars[0].alignment == WD_ALIGN_PARAGRAPH.CENTER
+
+    # Город и дата — один абзац с табуляцией, а не два выключенных по краям.
+    assert pars[1].text == "г. {{ city }}\t{{ document_date }} г."
+
+    amount = next(p for p in pars if p.text.startswith("{{ total_amount }}"))
+    assert all(run.bold for run in amount.runs), "сумма должна быть жирной"
+
+    consent = next(p for p in pars if p.text.startswith("Содержание настоящей расписки"))
+    assert all(run.bold for run in consent.runs)
+
+    ruled = [p for p in pars if p._element.find(qn("w:pPr")) is not None
+             and p._element.find(qn("w:pPr")).find(qn("w:pBdr")) is not None]
+    assert len(ruled) == 3, "линейка под подпись: должник, кредитор, свидетель"
+    assert sum("(подпись, фамилия" in p.text for p in pars) == 3

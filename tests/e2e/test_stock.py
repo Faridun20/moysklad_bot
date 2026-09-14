@@ -112,6 +112,42 @@ def test_counterparty_picker_searches_instead_of_native_select(open_app, e2e):
     assert picked in boss.locator("#wh-cp").inner_text()
 
 
+def test_new_counterparty_is_created_without_leaving_the_invoice(open_app, e2e):
+    """Жалоба с площадки: приехал новый покупатель — завести его негде.
+
+    Кнопка стоит ПОД списком пикера: её находят ровно тогда, когда ищут и не
+    находят. Набранное в поиске уезжает в название, а заведённый сразу
+    оказывается выбранным — накладную продолжают заполнять, а не начинают
+    заново.
+    """
+    boss = open_app(e2e.ids["boss"])
+    go(boss, "stock")
+    tab(boss, "invoices")
+    boss.click("#wh-new")
+    boss.wait_for_selector("#wh-cp")
+
+    boss.click("#wh-cp")
+    boss.wait_for_selector(".picker-add")
+    boss.fill("#ms-f-search", "ООО Бахор Савдо")
+    boss.wait_for_selector(".picker-list:has-text('не найдены')")
+    boss.click(".picker-add")
+
+    # Название подставлено из поиска — набирать заново не нужно.
+    boss.wait_for_selector("#ms-f-name")
+    assert boss.input_value("#ms-f-name") == "ООО Бахор Савдо"
+    boss.fill("#ms-f-phone", "+998 90 123-45-67")
+    boss.click("#ms-submit")
+    boss.wait_for_selector(".c-overlay", state="detached")
+
+    assert "ООО Бахор Савдо" in boss.locator("#wh-cp").inner_text()
+
+    # И он попал в справочник: следующий выбор его показывает.
+    boss.click("#wh-cp")
+    boss.wait_for_selector(".picker-list [data-pick]")
+    boss.fill("#ms-f-search", "Бахор")
+    boss.wait_for_selector(".picker-list [data-pick]:has-text('Бахор')")
+
+
 def test_product_in_position_is_picked_from_a_searchable_list(open_app, e2e):
     """Товар в позиции — тот же лист с поиском: в каталоге сотня наименований."""
     boss = open_app(e2e.ids["boss"])

@@ -1993,6 +1993,95 @@ describe('выбор из справочника листом с поиском'
   });
 });
 
+describe('сегмент вместо нативного списка в форме', () => {
+  // Нативный `<select>` всегда стоял на первом пункте; сегмент рисует кнопки
+  // невыбранными, и обязательное поле уходило пустым — форма отвечала
+  // «Заполните: Тип документа», хотя варианты лежали перед человеком.
+  it('первый вариант выбран сразу, если значение не задано', () => {
+    const doc = boot(`
+      currentUser = { role: 'boss' };
+      openMachineSheet({
+        title: 'Документ',
+        fields: [{ key: 'doc_type', label: 'Тип документа', type: 'select',
+                   required: true,
+                   options: [['raspiska_ru', 'Расписка'], ['tilxat_uz', 'Тилхат']] }],
+        onSubmit: () => true,
+      });
+    `).document;
+    expect(doc.querySelector('#ms-f-doc_type').value).toBe('raspiska_ru');
+    expect(doc.querySelector('[data-opt="raspiska_ru"]').className).toContain('active');
+    expect(doc.querySelectorAll('.c-sheet select').length).toBe(0);
+  });
+
+  it('заданное значение не перебивается первым вариантом', () => {
+    const doc = boot(`
+      currentUser = { role: 'boss' };
+      openMachineSheet({
+        title: 'Документ',
+        fields: [{ key: 'doc_type', label: 'Тип', type: 'select', value: 'tilxat_uz',
+                   options: [['raspiska_ru', 'Расписка'], ['tilxat_uz', 'Тилхат']] }],
+        onSubmit: () => true,
+      });
+    `).document;
+    expect(doc.querySelector('#ms-f-doc_type').value).toBe('tilxat_uz');
+    expect(doc.querySelector('[data-opt="tilxat_uz"]').className).toContain('active');
+  });
+
+  it('клик по варианту кладёт значение в скрытое поле', () => {
+    const doc = boot(`
+      currentUser = { role: 'boss' };
+      openMachineSheet({
+        title: 'Документ',
+        fields: [{ key: 'doc_type', label: 'Тип', type: 'select',
+                   options: [['raspiska_ru', 'Расписка'], ['tilxat_uz', 'Тилхат']] }],
+        onSubmit: () => true,
+      });
+    `).document;
+    doc.querySelector('[data-opt="tilxat_uz"]').click();
+    expect(doc.querySelector('#ms-f-doc_type').value).toBe('tilxat_uz');
+    expect(doc.querySelector('[data-opt="raspiska_ru"]').className).not.toContain('active');
+  });
+});
+
+describe('контрагента заводят, не выходя из накладной', () => {
+  // Справочник пополнялся только из карточки клиента в «Воронке»: приезжал
+  // новый покупатель — выписать на него расход было не на кого, и отгрузка
+  // вставала. Кнопка стоит ПОД списком: её находят там, где ищут и не находят.
+  it('кнопка отдаёт набранное в поиске как название', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      window.__added = null;
+      openListPicker({
+        title: 'Контрагент',
+        items: [{ id: 1, name: 'ООО Ромашка' }],
+        emptyText: 'Контрагенты не найдены',
+        addLabel: 'Новый контрагент',
+        onAdd: (typed) => { window.__added = typed; },
+        onPick: () => {},
+      });
+    `);
+    const doc = window.document;
+    const input = doc.querySelector('#ms-f-search');
+    input.value = 'ООО Бахор Савдо';
+    input.dispatchEvent(new window.Event('input'));
+    await new Promise(r => setTimeout(r, 200));
+    expect(doc.querySelector('.picker-list').textContent).toContain('не найдены');
+
+    doc.querySelector('.picker-add').click();
+    expect(window.__added).toBe('ООО Бахор Савдо');
+    // Пикер закрылся: форма заведения открывается на его месте, а не поверх.
+    expect(doc.querySelector('.c-overlay')).toBeNull();
+  });
+
+  it('без onAdd кнопки нет — там, где заводить нечего', () => {
+    const doc = boot(`
+      currentUser = { role: 'boss' };
+      openListPicker({ title: 'Товар', items: [{ id: 7, name: 'Болт' }], onPick: () => {} });
+    `).document;
+    expect(doc.querySelector('.picker-add')).toBeNull();
+  });
+});
+
 describe('склад: остатки в «Каталоге» и накладные', () => {
   // Накладные — четвёртая вкладка раздела «Склад» (UI-бриф п.4). Раньше это
   // был дочерний экран с кнопкой между табами и поиском.

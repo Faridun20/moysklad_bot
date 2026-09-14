@@ -286,6 +286,65 @@ def test_counterparties_search_is_case_insensitive_for_cyrillic(api, query):
     assert empty["counterparties"] == []
 
 
+def test_counterparty_can_be_created_from_the_invoice_form(api):
+    """Новый контрагент заводится прямо из накладной.
+
+    До этого справочник пополнялся только из карточки клиента в «Воронке»:
+    приезжал новый покупатель — выписать на него расход было не на кого, и
+    отгрузка вставала. Проверяем, что заведённый сразу виден в справочнике,
+    который подставляется в форму.
+    """
+    client, _db, ids = api
+    r = client.post(
+        "/api/wh/counterparties/create",
+        json={"initData": str(ids["mgr"]), "name": "  ООО Бахор Савдо ",
+              "phone": "+998 90 123-45-67"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] and body["existed"] is False
+    assert body["name"] == "ООО Бахор Савдо"
+
+    listed = client.post(
+        "/api/wh/counterparties",
+        json={"initData": str(ids["mgr"]), "search": "бахор"},
+    ).json()["counterparties"]
+    assert [c["name"] for c in listed] == ["ООО Бахор Савдо"]
+
+
+def test_creating_the_same_counterparty_twice_returns_the_first(api):
+    """Кнопку можно нажать дважды — второй карточки быть не должно.
+
+    Два одноимённых контрагента разводят заказы одного клиента по двум
+    карточкам, а склеить их потом нечем.
+    """
+    client, _db, ids = api
+    body = {"initData": str(ids["mgr"]), "name": "ООО Бахор Савдо"}
+    first = client.post("/api/wh/counterparties/create", json=body).json()
+    second = client.post("/api/wh/counterparties/create", json=body).json()
+    assert second["existed"] is True
+    assert second["counterparty_id"] == first["counterparty_id"]
+
+
+def test_counterparty_create_needs_a_name(api):
+    client, _db, ids = api
+    r = client.post(
+        "/api/wh/counterparties/create", json={"initData": str(ids["mgr"]), "name": "   "}
+    )
+    assert r.status_code == 400
+    assert "азвание" in r.json()["detail"]
+
+
+def test_counterparty_create_is_closed_to_outsiders(api):
+    """Роли — как у самой формы накладной: кто выписывает, тот и заводит."""
+    client, _db, ids = api
+    r = client.post(
+        "/api/wh/counterparties/create",
+        json={"initData": str(ids["guest"]), "name": "ООО Левое"},
+    )
+    assert r.status_code == 403
+
+
 def test_cancel_twice_returns_409(api):
     client, _db, ids = api
     inv = _incoming(client, ids["mgr"]).json()

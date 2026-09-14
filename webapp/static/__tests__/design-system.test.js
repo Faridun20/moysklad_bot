@@ -115,7 +115,7 @@ describe('тач-таргеты и фокус (UI-WP-31)', () => {
     return out.join('\n');
   };
 
-  it.each(['.c-row--tap', '.card-row', '.seg-item', '.subseg-item'])(
+  it.each(['.c-row--tap', '.seg-item', '.cat-btn', '.btn-agent'])(
     'интерактивный примитив %s не мельче 44px',
     (cls) => {
       expect(bodiesFor(cls)).toMatch(/min-height:\s*44px/);
@@ -228,6 +228,28 @@ describe('дизайн-система: скругления', () => {
 });
 
 describe('целостность файла стилей', () => {
+  // Тело @media/@supports смотрим отдельно: там переопределение — это и есть
+  // задача блока, и считать его столкновением имён нельзя.
+  const stripAtRules = (src) => {
+    let out = '';
+    let i = 0;
+    while (i < src.length) {
+      const at = src.indexOf('@', i);
+      if (at < 0) { out += src.slice(i); break; }
+      const open = src.indexOf('{', at);
+      if (open < 0) { out += src.slice(i); break; }
+      out += src.slice(i, at);
+      let depth = 0;
+      let j = open;
+      for (; j < src.length; j++) {
+        if (src[j] === '{') depth++;
+        else if (src[j] === '}') { depth--; if (!depth) { j++; break; } }
+      }
+      i = j;
+    }
+    return out;
+  };
+
   it('нет обрывков селекторов — они молча глушат следующее правило', () => {
     // Одинокая `.` — остаток удалённого правила. Парсер CSS склеивает её со
     // СЛЕДУЮЩИМ селектором (`. .stat-grid`), и то правило перестаёт
@@ -255,6 +277,39 @@ describe('целостность файла стилей', () => {
       const re = new RegExp(`(^|[\\s,}])\\${cls}\\s*[,{]`, 'm');
       expect(re.test(css), `правило ${cls} не объявлено`).toBe(true);
     }
+  });
+
+  it('одно имя класса — один компонент', () => {
+    // `.qty-input` был объявлен дважды: сверху — крупное поле диалога
+    // количества, ниже — узкое поле в строке приёмки контейнера. Второе
+    // правило переопределяло у первого ВОСЕМЬ свойств (ширину, размер, рамку,
+    // выравнивание) — то есть это было не уточнение, а другой компонент,
+    // случайно занявший то же имя. Файл при этом валиден, и увидеть такое
+    // можно только открыв оба экрана.
+    //
+    // Уточнять базовое правило законно (`.search-item` мельчает в выдаче,
+    // `.debt-stat` берёт свой радиус) — там переопределяется одно свойство.
+    // Порог в три и означает «переписали компонент целиком».
+    const code = css.replace(/\/\*[\s\S]*?\*\//g, '');
+    const topLevel = stripAtRules(code);
+    const seen = new Map();
+    const clashes = [];
+    for (const m of topLevel.matchAll(/([^{}]+)\{([^}]*)\}/g)) {
+      const props = m[2].split(';')
+        .map((d) => (d.split(':')[0] || '').trim())
+        .filter((d) => /^[-a-z]+$/.test(d));
+      for (const part of m[1].split(',')) {
+        const sel = part.trim();
+        if (!/^\.[-_a-zA-Z0-9]+$/.test(sel)) continue;
+        const before = seen.get(sel);
+        if (before) {
+          const again = props.filter((p) => before.has(p));
+          if (again.length > 2) clashes.push(`${sel}: ${again.join(', ')}`);
+        }
+        seen.set(sel, new Set([...(before || []), ...props]));
+      }
+    }
+    expect(clashes).toEqual([]);
   });
 
   it('сетка показателей — именно сетка 2×2', () => {
@@ -364,7 +419,9 @@ describe('стекло (S7)', () => {
   it('размытие стоит только на неподвижном', () => {
     // backdrop-filter на строках списка роняет прокрутку в WebView, а текст на
     // полупрозрачном фоне теряет контраст. Карточки остаются плотными.
-    const allowed = ['.u-glass', '.bottom-nav', '.seg'];
+    // `.u-glass` убран: утилита без потребителей. Стекло живёт там, где оно
+    // и нужно — на неподвижной панели и на треке вкладок.
+    const allowed = ['.bottom-nav', '.seg'];
     const seen = [];
     for (const m of withoutComments.matchAll(/backdrop-filter:/g)) {
       const sel = selectorBefore(m.index);
@@ -376,10 +433,10 @@ describe('стекло (S7)', () => {
 
   it('без поддержки backdrop-filter остаётся плотный фон', () => {
     // Полупрозрачный тинт без размытия нечитаем, поэтому базовое правило
-    // .u-glass красится непрозрачной поверхностью, а стекло включается
-    // только внутри @supports.
-    const base = withoutComments.match(/\.u-glass\s*\{([^}]*)\}/);
-    expect(base, 'базовое правило .u-glass пропало').not.toBeNull();
+    // красится непрозрачной поверхностью, а стекло включается только внутри
+    // @supports. Проверяем на реальном потребителе — нижней панели.
+    const base = withoutComments.match(/\n\.bottom-nav\s*\{([^}]*)\}/);
+    expect(base, 'базовое правило .bottom-nav пропало').not.toBeNull();
     expect(base[1]).toMatch(/background:\s*var\(--bg-card\)/);
     expect(base[1]).not.toMatch(/backdrop-filter/);
   });

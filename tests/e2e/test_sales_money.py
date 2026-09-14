@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from tests.e2e.conftest import go, seed_order, settled, tab
 
@@ -224,6 +225,37 @@ def test_cash_deposit_is_confirmed_and_closes_debt_fifo(open_app, e2e):
     tab(boss, "debts")
     settled(boss)
     assert boss.locator(f".debt-card:has-text('#{oid}')").count() == 0
+
+
+def test_manual_payment_currency_is_picked_by_a_segment(open_app, e2e):
+    """Валюта строки платежа — сегмент, а не нативный `<select>`.
+
+    Системный список Telegram-WebView открывается во весь экран даже ради двух
+    пунктов. Проверяем не разметку, а результат: выбранная валюта обязана
+    доехать до записи в БД — выбор живёт в data-атрибуте, и без обработчика
+    клика строка молча ушла бы с USD по умолчанию.
+    """
+    mgr = open_app(e2e.ids["mgr"])
+    go(mgr, "money")
+    tab(mgr, "ops")
+    mgr.wait_for_selector(".pay-row-cur [data-cur-opt='UZS']")
+    assert mgr.locator("#pay-rows select").count() == 0, "нативный select остался"
+
+    mgr.fill(".pay-row-amount", "250000")
+    mgr.click(".pay-row-cur [data-cur-opt='UZS']")
+    mgr.wait_for_selector(".pay-row-cur [data-cur-opt='UZS'].active")
+    mgr.fill("#pay-comment", "Аренда за май")
+    mgr.click("#pay-submit")
+
+    for _ in range(50):
+        rows = e2e.rows("SELECT amount_cents, currency, comment FROM payments")
+        if rows:
+            break
+        time.sleep(0.2)
+    status = mgr.locator("#pay-status")
+    assert status.count() == 0 or "❌" not in status.inner_text(), status.inner_text()
+    assert rows == [{"amount_cents": 25000000, "currency": "UZS",
+                     "comment": "Аренда за май"}]
 
 
 # ─── Возврат: менеджер оформляет, босс принимает товар и подтверждает ────────
@@ -446,7 +478,12 @@ def test_manager_creates_raspiska_and_prints_it(open_app, e2e, monkeypatch, tmp_
     mgr.wait_for_selector("#doc-new")
     assert mgr.locator("#doc-company").count() == 0, "реквизиты правит только руководство"
     mgr.click("#doc-new")
-    mgr.select_option("#ms-f-doc_type", "raspiska_ru")
+    # Тип документа — сегмент, а не нативный `<select>`: значение держит
+    # скрытое поле, которое читает общий сбор формы.
+    mgr.click('[data-opt="raspiska_ru"]')
+    mgr.wait_for_function(
+        "() => document.querySelector('#ms-f-doc_type').value === 'raspiska_ru'"
+    )
     mgr.fill("#ms-f-debtor_full_name", "Иванов Иван Иванович")
     mgr.fill("#ms-f-product_name", "Экскаватор JCB 3CX")
     mgr.fill("#ms-f-total_amount", "25000")

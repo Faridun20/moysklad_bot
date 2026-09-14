@@ -5879,6 +5879,46 @@ async def api_wh_counterparties(request: Request):
     return JSONResponse({"counterparties": rows})
 
 
+@app.post("/api/wh/counterparties/create")
+async def api_wh_counterparties_create(request: Request):
+    """Завести контрагента прямо из формы накладной.
+
+    До этого справочник пополнялся только из карточки клиента в «Воронке», а
+    накладную выписывают на склад'е: новый покупатель приезжал, а выбрать его
+    в форме было не из чего — работа вставала на ровном месте. Ручка та же
+    `counterparties.create`: тёзка не заводится, и повторное нажатие кнопки
+    вернёт уже заведённого (`existed`), а не второго такого же.
+
+    Роли — как у самой формы накладной: кто выписывает документ, тот и заводит
+    в нём контрагента.
+    """
+    from services import async_db as adb
+    from services import counterparties as cp_service
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_wh_counterparties_create",
+        rate_limit_max=30,
+    )
+    cp_type = (data.get("type") or "customer").strip()
+    created = await cp_service.create(
+        (data.get("name") or "").strip()[:255],
+        phone=(data.get("phone") or "").strip()[:64] or None,
+        cp_type=cp_type,
+    )
+    if not created.get("ok"):
+        raise HTTPException(status_code=400, detail=created.get("error", "Не удалось завести"))
+    if not created["existed"]:
+        await adb.add_audit_log(
+            user["id"], _actor_name(user), get_role(user["id"]),
+            "counterparty_create",
+            f"#{created['counterparty_id']} {created['name']}",
+        )
+    return JSONResponse(created)
+
+
 @app.post("/api/wh/invoices")
 async def api_wh_invoices(request: Request):
     """Список накладных, новые сверху."""

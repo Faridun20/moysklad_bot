@@ -156,37 +156,6 @@
   }
 }
 
-/* ─── Стекло ──────────────────────────────────────────────────────────────
-   Один примитив на всё стеклянное, чтобы поверхности не разъехались при
-   первой же правке. Без поддержки backdrop-filter (старые WebView) остаётся
-   плотный фон: полупрозрачная панель без размытия нечитаема. */
-.u-glass {
-  background: var(--bg-card);
-  border: 1px solid var(--divider);
-  position: relative;
-}
-@supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
-  .u-glass {
-    background: var(--glass-bg);
-    border-color: var(--glass-edge);
-    -webkit-backdrop-filter: var(--glass-blur);
-    backdrop-filter: var(--glass-blur);
-  }
-  /* Блик по верхней кромке — то, что отличает стекло от полупрозрачного
-     прямоугольника. Гасим для prefers-contrast: там важнее граница. */
-  .u-glass::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 14%; right: 14%; height: 1px;
-    background: linear-gradient(90deg, transparent, var(--glass-spec), transparent);
-    pointer-events: none;
-  }
-}
-@media (prefers-contrast: more) {
-  .u-glass { background: var(--bg-card); border-color: var(--text-mute); }
-  .u-glass::before { display: none; }
-}
-
 /* Утилита: скрыть элемент без инлайн-стилей в JS. */
 .hidden { display: none !important; }
 
@@ -222,11 +191,10 @@
 .u-mt-2 { margin-top: 8px; }
 .u-mt-3 { margin-top: 12px; }
 .u-fs-11 { font-size: 11px; }
-.u-fs-12 { font-size: 12px; }
 
 /* ─── Доступность ─────────────────────────────────────────────────
    Видимый фокус для навигации с клавиатуры (в браузере вне Telegram).
-   Кнопки (.nav-item/.action-btn/.cat-btn/.btn-*) раньше не давали никакого
+   Кнопки (.nav-item/.cat-btn/.btn-*) раньше не давали никакого
    индикатора фокуса. У инпутов свой ring (.form-input:focus, выше по
    специфичности) — он сохраняется. :focus-visible не срабатывает на тапы,
    поэтому мобильный UX не меняется. */
@@ -244,14 +212,11 @@ button,
 /* Hover-отклик для указательных устройств (десктоп-браузер). На тач-экранах
    правило не активируется → не остаётся «залипшего» hover после тапа. */
 @media (hover: hover) {
-  .action-btn:hover,
-  .card-row:hover,
   .c-row--tap:hover,
   .btn-secondary:hover,
   .search-item:hover { background: var(--bg-soft); }
   .nav-item:hover:not(.active),
-  .seg-item:hover:not(.active),
-  .subseg-item:hover:not(.active) { color: var(--text); }
+  .seg-item:hover:not(.active) { color: var(--text); }
   .cat-btn:hover:not(.active) { border-color: var(--accent); }
   .btn-primary:hover:not(:disabled),
   .btn-new-order:hover,
@@ -308,7 +273,6 @@ button,
    уменьшаем под кегль строки, чтобы не доминировали. */
 .stat-label .ic,
 .order-pay .ic,
-.debt-items-preview .ic,
 .search-group-title .ic { --ic-size: 14px; }
 .section-label .ic { --ic-size: 13px; }
 .debt-agent .ic { --ic-size: 15px; }
@@ -546,42 +510,6 @@ body {
 .hero-delta[data-trend="down"],
 .hero-delta.down { background: rgba(0,0,0,0.15); }
 
-/* ─── Action grid (4 кнопки в ряд, как у Wallet) ──────────────── */
-.action-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 8px;
-  margin: 16px 0 8px;
-}
-
-
-.action-btn:active {
-  transform: scale(0.96);
-  background: var(--bg-soft);
-}
-
-/* UI-WP-12: 40 → 44px. Кнопка целиком и так ≥44px, но САМА иконка была
-   заметно меньше пальца, и промах по краю попадал в подпись. Подпись на
-   clamp() — вертикально место есть, перенос строки ей не грозит. */
-.action-btn-icon {
-  width: 44px;
-  height: 44px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 22px;
-  border-radius: 50%;
-  color: var(--accent);
-}
-.action-btn-icon .ic { --ic-size: 22px; vertical-align: 0; }
-
-/* ─── Иконки быстрых действий ──────────────────────────────
-   Единый вид: акцент на мягкой подложке (как все иконки приложения). Цвет=смысл
-   оставляем только СТАТУСАМ (ниже). Раньше было 5 разных хардкод-палитр. */
-.icon-orange, .icon-blue, .icon-purple, .icon-green, .icon-amber {
-  background: var(--bg-soft); color: var(--accent);
-}
-
 /* ─── Иконки статуса заказов ──────────────────────────────
    color → стрелка SVG (currentColor) красится семантикой; переменные
    --warn-strong/--success/--danger/--info уже имеют dark-варианты. */
@@ -596,7 +524,7 @@ body {
 
 /* ─── Примитивы поверхностей (UI-WP-01) ───────────────────────────────────
    Одна идея — белая поверхность с radius=16 и --shadow-card — была
-   переизобретена десять раз: .card, .card-list+.card-row, .stock-row,
+   переизобретена десять раз: .card, .stock-row,
    .agent-row, .prod-row, .order-card, .debt-card, .stat, .editor-item,
    .search-item. Каждая со своим padding и своим :active, поэтому «поправить
    тень у карточек» означало найти десять мест и три из них забыть.
@@ -606,7 +534,6 @@ body {
    нужно, новые экраны (S2+) пишут .c-surface/.c-row напрямую. */
 .c-surface,
 .card,
-.card-list,
 .prod-row,
 .stock-row,
 .agent-row,
@@ -634,14 +561,10 @@ body {
 
 /* Контейнер списка строк: собственных отступов нет, скругление режет углы
    первой и последней строки. */
-.c-surface--list,
-.card-list {
+.c-surface--list {
   padding: 0;
   overflow: hidden;
 }
-
-/* Legacy-алиас без `.c-surface`: отступ ему нужен свой. */
-.card-list { margin-bottom: var(--sp-2); }
 
 /* Самодостаточная карточка. */
 .c-surface--pad,
@@ -658,8 +581,7 @@ body {
   transition: background 0.1s ease;
 }
 
-.c-row + .c-row,
-.card-row + .card-row { border-top: 0.5px solid var(--divider); }
+.c-row + .c-row { border-top: 0.5px solid var(--divider); }
 
 /* Кликабельная строка: тач-таргет ≥44px даже в плотных списках (WCAG,
    UI-WP-31) и явная реакция на нажатие. */
@@ -680,18 +602,6 @@ body {
   margin-bottom: var(--sp-2);
 }
 
-.card-row {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-3);
-  padding: var(--sp-3) var(--sp-4);
-  min-height: 44px;          /* тач-таргет: было визуально ~40px в плотных списках */
-  cursor: pointer;
-  transition: background 0.1s ease;
-}
-
-.card-row:active { background: var(--bg-soft); }
-
 .card-row-icon {
   width: 36px;
   height: 36px;
@@ -704,9 +614,7 @@ body {
   flex-shrink: 0;
 }
 /* Информационная строка без перехода (топ-сотрудники) — заменяет inline cursor. */
-.card-row--static { cursor: default; }
 /* Иконка-кружок с предупреждающим тоном (блок «Требует внимания» на главной). */
-.card-row-icon--warn { background: var(--warn-bg); color: var(--warn); }
 
 /* Счётчик в очереди дел на «Сегодня». Число вместо иконки: у всех пунктов
    очереди вопрос один и тот же — «сколько», — и цифра отвечает на него быстрее,
@@ -1217,7 +1125,6 @@ body {
   margin-top: 8px; text-align: center;
   font-size: 13px; color: var(--text-mute);
 }
-.pay-status.pay-ok    { color: var(--success); }
 .pay-status.pay-error { color: var(--danger); }
 
 /* ─── Заказы (карточки) ──────────────────────────────────────── */
@@ -1289,11 +1196,6 @@ body {
 
 /* Переходный период: старые классы отдают тот же цвет, что и data-status,
    чтобы экраны можно было переводить по одному (S2+), а не все разом. */
-.order-card--draft    { border-left-color: var(--neutral); }
-.order-card--pending  { border-left-color: var(--warn-strong); }
-.order-card--approved { border-left-color: var(--success); }
-.order-card--rejected { border-left-color: var(--danger); }
-.order-card--shipped  { border-left-color: var(--info); }
 
 .order-header {
   display: flex; justify-content: space-between;
@@ -1372,7 +1274,6 @@ body {
 .credit-ctx--bad { background: var(--danger-bg);  color: var(--text); }
 
 /* Превью позиций в карточке подтверждения оплаты — что именно подтверждаешь. */
-.debt-items-preview { font-size: 12px; color: var(--text-mute); margin: 4px 0 8px; }
 
 .order-item, .order-item-preview {
   font-size: 12px;
@@ -1491,6 +1392,13 @@ body {
 /* Список выбора внутри диалога-пикера: та же высота, что у поставщика. */
 .picker-list { max-height: 46vh; overflow-y: auto; margin-bottom: 12px; }
 .picker-list .picked { background: var(--success-bg); }
+/* «Завести» под списком: тот, кого ищут и не находят, заводится здесь же. */
+.picker-add {
+  width: 100%;
+  display: inline-flex; align-items: center; justify-content: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
 
 .agent-selected {
   display: flex; justify-content: space-between; align-items: center;
@@ -1533,7 +1441,6 @@ body {
 }
 /* Плейсхолдер у select: пока значение пустое, текст hint-цветом, как у
    остальных полей. */
-.form-input--placeholder { color: var(--text-mute); }
 .editor-item-info { flex: 1; }
 .editor-item-name { font-size: 14px; font-weight: 500; }
 .editor-item-qty  { font-size: 12px; color: var(--text-mute); margin-top: 4px; }
@@ -1670,17 +1577,6 @@ body {
 /* Итог строки: нижний отступ резервирует место под плавающей MainButton. */
 .qty-line-total { margin: 8px 0 calc(var(--nav-h) + var(--sp-4)); }
 
-.qty-input {
-  width: 100%; text-align: center;
-  font-size: 28px; font-weight: 700;
-  padding: 16px;
-  border: none;
-  border-radius: var(--radius-sm);
-  background: var(--bg-card);
-  color: var(--text);
-  box-shadow: var(--shadow-card);
-}
-
 
 /* ─── Тип оплаты в редакторе заказа ─────────────────────────────── */
 /* UI-WP-04: тип оплаты переехал на .seg — «выбери один из двух» больше не
@@ -1743,9 +1639,6 @@ body {
 .debt-card {
   padding: 16px var(--sp-4); border-left: 4px solid transparent;
 }
-.debt-card.debt-overdue   { border-left-color: var(--danger); }
-.debt-card.debt-due_today { border-left-color: var(--warn-strong); }
-.debt-card.debt-upcoming  { border-left-color: var(--info); }
 .debt-card-top {
   display: flex; justify-content: space-between; align-items: flex-start;
   gap: 8px; margin-bottom: 8px;
@@ -1909,35 +1802,6 @@ body {
 .seg-item--custom { flex: 0 0 auto; }
 .seg-item--custom .ic { --ic-size: 16px; }
 
-/* Уровень 2: компактные underline-вкладки. */
-.subseg {
-  display: flex; gap: 4px; padding: 8px 0 0;
-  border-bottom: 0.5px solid var(--divider); margin-bottom: 8px;
-  /* Много под-вкладок (Подтверждения\Операции\Итоги\История) не должны ломать
-     ряд: при переполнении — горизонтальный скролл, а не «съехавшие» кнопки. */
-  overflow-x: auto; flex-wrap: nowrap;
-  -webkit-overflow-scrolling: touch; scrollbar-width: none;
-}
-.subseg::-webkit-scrollbar { display: none; }
-.subseg-item {
-  flex-shrink: 0;   /* не сжимать — иначе подписи наезжают друг на друга */
-  padding: 8px 8px 8px; border: 0; background: none; cursor: pointer;
-  color: var(--text-mute); font-size: 13px; font-weight: 600; font-family: inherit;
-  display: inline-flex; align-items: center; gap: 4px;
-  border-bottom: 2px solid transparent;
-  white-space: nowrap;
-}
-.subseg-item .ic { --ic-size: 16px; }
-.subseg-item.active { color: var(--accent); border-bottom-color: var(--accent); }
-/* .subseg как top-level навигация Финансов: комфортный тач-таргет + бейдж счётчика. */
-.subseg-item { min-height: 44px; }
-.subseg-item .stock-badge { margin-left: 8px; }
-
-/* Карточка контрагента («Клиенты»): строка баланса МойСклад. */
-.agent-bal { font-size: 16px; font-weight: 700; color: var(--text); margin-bottom: 8px; }
-.agent-phone { padding: 0 4px 8px; }
-.bal-owe { color: var(--danger); font-weight: 600; }   /* клиент должен нам */
-.bal-adv { color: var(--success); font-weight: 600; }  /* аванс/переплата */
 
 /* Итог поступлений в базовой валюте (вкладка «Обзор» раздела «Деньги»). */
 .money-total {
@@ -1945,6 +1809,21 @@ body {
   margin: 8px 4px 4px; letter-spacing: -0.5px;
 }
 .money-total-note { font-size: 12px; color: var(--text-mute); margin: 0 4px 8px; }
+
+/* Строка платежа: сумма, валюта и «убрать» — ОДНОЙ строкой. Класс в разметке
+   был, правила не было вовсе: `.form-input` растягивается на всю ширину, и
+   три элемента вставали друг под другом столбиком. */
+.pay-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pay-row .pay-row-amount { flex: 1; min-width: 0; }
+.pay-row .pay-row-del { flex: none; width: 44px; padding: 0; }
+
+/* Подпись под строкой долга/сдачи/возврата: «Заказ #12 · 3 позиции». Тоже
+   была без правила и печаталась основным кеглем, наравне с суммой. */
+.debt-meta { font-size: var(--text-sm); color: var(--text-mute); }
 
 /* ─── Partial-оплата (input + кнопка в ряд) ────────────────────── */
 .pay-input-row {
@@ -1979,7 +1858,6 @@ body {
 .debt-breakdown b { color: var(--text); }
 
 /* Жёлтая полоска для partial-state */
-.debt-card.debt-partial { border-left-color: var(--warn-strong); }
 
 /* ─── Skeleton loading ───────────────────────────────────────────── */
 @keyframes shimmer {
@@ -2001,6 +1879,8 @@ body {
 
 .sk-hero   { height: 132px; border-radius: var(--radius); margin-bottom: 16px; }
 .sk-grid   { display: grid; grid-template-columns: repeat(4,1fr); gap: 8px; margin-bottom: 16px; }
+/* Скелетон под сетку показателей: у неё три колонки, а не четыре. */
+.sk-grid--3 { grid-template-columns: repeat(3,1fr); }
 .sk-action { height: 76px; border-radius: var(--radius); }
 .sk-label  { height: 11px; width: 100px; margin: 24px 16px 8px; }
 .sk-card   { height: 64px; border-radius: var(--radius); margin-bottom: 8px; }
@@ -2408,8 +2288,8 @@ body {
 
 /* ─── Адаптив: широкий экран (планшет/десктоп-браузер) ─────────────
    Приложение рассчитано на узкий телефонный столбец. Вне Telegram (web)
-   на широком вьюпорте всё растягивалось во всю ширину — hero и action-grid
-   разъезжались. Ограничиваем контент центрированной колонкой; фиксированные
+   на широком вьюпорте всё растягивалось во всю ширину — hero и плитки
+   показателей разъезжались. Ограничиваем контент центрированной колонкой; фиксированные
    слои (нижнее меню, тосты) выравниваем по той же оси. На телефоне (и в
    Telegram, где webview узкий) правило не активируется. */
 @media (min-width: 600px) {
