@@ -31,6 +31,7 @@ from services.rate_limit import acquire as rate_limit_acquire
 
 # Сервисы и задачи
 from services.database import init_db
+from services import version as app_version
 from services.notifier import close_tg_session
 
 logging.basicConfig(
@@ -144,6 +145,7 @@ def register_routers(dp: Dispatcher):
         machines,
         business,
         printing,
+        version,
     )
 
     routers = [
@@ -169,6 +171,9 @@ def register_routers(dp: Dispatcher):
         # Печать документов на офисный принтер (CUPS). Кнопка под печатной
         # формой + /printer; аналога в WebApp нет — действие физическое.
         printing.router,
+        # /version: версия бота и WebApp с вердиктом «совпадают/разъехались».
+        # Два сервиса Railway деплоятся отдельно, и сверить их больше нечем.
+        version.router,
     ]
     for r in routers:
         dp.include_router(r)
@@ -286,6 +291,8 @@ async def _startup_selfcheck():
     Не роняем процесс — только громкий error, чтобы было заметно.
     """
     logger.info("Старт в режиме BOT_MODE=%s", BOT_MODE or "all")
+    # Первое, что ищут в логах Railway после выката: та ли это версия.
+    logger.info("Версия: %s", app_version.startup_line())
     if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
         logger.error(
             "TELEGRAM_TOKEN пуст или не вида '<id>:<secret>' — бот и уведомления работать не будут",

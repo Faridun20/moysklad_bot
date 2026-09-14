@@ -113,6 +113,8 @@ _COMMANDS_MANAGER = [
     BotCommand(command="printer", description="🖨 Статус принтера"),
 ]
 _COMMANDS_BOSS = _COMMANDS_MANAGER + [
+    # «Выкатилось ли» — вопрос того, кто просил правку, поэтому у босса тоже.
+    BotCommand(command="version", description="📦 Версия на проде"),
     BotCommand(command="machine_deals", description="💳 Рассрочки по технике"),
     BotCommand(command="ship", description="🚚 Отгрузить заказ"),
     BotCommand(command="shipments", description="🚚 Последние отгрузки"),

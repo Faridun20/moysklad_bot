@@ -15,9 +15,13 @@ x-app: &app
   build:
     context: .
     args:
-      # Версия статики для cache-busting. Без неё webapp скатывается к
-      # таймстампу старта и сбрасывает кэш браузера на каждом рестарте.
+      # Версия работающего кода: cache-busting статики, `/healthz`, `/version`
+      # в боте. Без неё всё это скатывается к таймстампу старта — кэш браузера
+      # слетает на каждом рестарте, а «какой коммит работает» остаётся без
+      # ответа. Подставляет их `scripts/deploy.sh`: руками забывают.
       GIT_COMMIT_SHA: ${GIT_COMMIT_SHA:-}
+      GIT_COMMIT_MESSAGE: ${GIT_COMMIT_MESSAGE:-}
+      GIT_BRANCH: ${GIT_BRANCH:-}
       # LibreOffice нужен юр. документам (расписки, services/legal_docs.py).
       # Не печатаете расписки — 0 экономит ~400 МБ образа.
       WITH_LIBREOFFICE: ${WITH_LIBREOFFICE:-1}
