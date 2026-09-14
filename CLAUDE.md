@@ -241,6 +241,27 @@ CUPS стоит на хосте, в контейнере только КЛИЕН
 - **Асинхронно.** `subprocess.run` заблокировал бы event loop на время
   разговора с CUPS (а он идёт по сети), поэтому
   `asyncio.create_subprocess_exec`, как у LibreOffice в `legal_docs`.
+- **Печать есть и в WebApp** (`/api/wh/invoices/print`, `/api/docs/print`):
+  список накладных и документов отдаёт `can_print`, и без `cups-client`
+  кнопки в интерфейсе нет — правило то же, что у бота. Ручка отвечает
+  `PrintResult.message`/`error` текстом, фронт показывает его тостом.
+
+**Юридические документы в WebApp (`services/documents.py`, «Продажи →
+Документы»).** Движок `legal_docs` (docxtpl → LibreOffice) был без входа: ни
+команды, ни ручки — расписку негде было составить. Теперь форма в WebApp
+(`/api/docs/create`, роли admin/boss/manager) → PDF → Telegram составителю с
+кнопкой «Распечатать» (`prn:doc:<id>`) → печать из WebApp или бота. Что помнить:
+- **Реквизиты компании — в `app_settings` (`company_*`)**, ставит руководство
+  (`/api/docs/company/set`); форма показывает их и даёт поправить для одного
+  документа, а без `company_name` создание отвечает 400 текстом.
+- **Файл хранится** (`DOCUMENTS_DIR`, том `/app/data`), печать и повторная
+  отправка ЧИТАЮТ его, а не пересобирают: расписка подписана один раз, второй
+  рендер с новой датой — другой документ. Файл пропал — ручка говорит об этом
+  текстом, а не рендерит молча заново. Путь наружу не выходит (`file_exists`).
+- Доставка и печать НИКОГДА не откатывают созданный документ — как у накладной.
+- Ошибки формы — `DocumentError` → 400 с текстом, показывается внутри формы.
+- Рендер мокается на границе: `documents.render_pdf` (LibreOffice), тест с
+  настоящим `soffice` пропускается без бинаря (`tests/test_documents_api.py`).
 
 **Кредит-лимиты (энфорс):** при одобрении credit-заявки `approve_shipment_request(..., override)` считает `check_credit_limit`; при превышении возвращает `needs_override` и НЕ одобряет → босс жмёт «Одобрить с превышением» (`req_ovr:` / webapp `override=true`), это ставит `orders.credit_limit_override` + audit. `get_agent_current_debt` считает долг батчем (items/payments/returns), без N+1.
 

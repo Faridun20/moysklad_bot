@@ -5903,7 +5903,184 @@ async def api_wh_invoices(request: Request):
     rows = await warehouse.list_invoices(
         invoice_type=inv_type or None, limit=limit, offset=offset
     )
-    return JSONResponse({"invoices": rows})
+    from services import printing
+
+    # Кнопка «Распечатать» рисуется, только если в контейнере есть клиент CUPS:
+    # кнопка, которая гарантированно ответит отказом, хуже отсутствующей.
+    return JSONResponse({"invoices": rows, "can_print": printing.is_available()})
+
+
+@app.post("/api/wh/invoices/print")
+async def api_wh_invoice_print(request: Request):
+    """Напечатать накладную на офисный принтер (CUPS). ok = принято очередью."""
+    import asyncio
+
+    from services import printing, warehouse
+    from services.invoice_pdf import invoice_filename, render_invoice_pdf
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_wh_invoice_print", rate_limit_max=30,
+    )
+    try:
+        invoice_id = int(data.get("invoice_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invoice_id обязателен")
+    inv = await warehouse.get_invoice(invoice_id)
+    if inv is None:
+        raise HTTPException(status_code=404, detail="Накладная не найдена")
+    if not printing.is_available():
+        return JSONResponse({"ok": False, "error": "Печать не настроена на этом сервере"})
+    try:
+        pdf = await asyncio.to_thread(render_invoice_pdf, inv)
+    except Exception:
+        logger.exception("Печать: не собран PDF накладной #%s", invoice_id)
+        return JSONResponse({"ok": False, "error": "Не удалось собрать PDF накладной"})
+    result = await printing.print_pdf_bytes(
+        pdf, filename=invoice_filename(inv),
+        label=f"Накладная {inv.get('invoice_number') or invoice_id} · {_actor_name(user)}",
+    )
+    return JSONResponse({"ok": result.ok, "message": result.message, "error": result.error})
+
+
+# ─── Юридические документы (расписка, тилхат) ────────────────────────────────
+#
+# Форма в WebApp → services.documents → legal_docs (docxtpl → LibreOffice) →
+# PDF в чат составителя с кнопкой «Распечатать» → печать из WebApp или бота.
+_DOC_ROLES = ("admin", "boss", "manager")
+
+
+@app.post("/api/docs/types")
+async def api_docs_types(request: Request):
+    """Справочник для формы: типы документов, реквизиты компании, что доступно."""
+    from services import documents, printing
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_types")
+    role = get_role(user["id"])
+    company = await asyncio.to_thread(documents.company_requisites)
+    return JSONResponse({
+        "types": [{"key": k, "label": v} for k, v in documents.DOC_TYPES.items()],
+        "company": company,
+        "company_fields": [{"key": k, "label": v} for k, v in documents.COMPANY_FIELDS],
+        "can_edit_company": role in ("admin", "boss"),
+        "can_print": printing.is_available(),
+        "defaults": {
+            "penalty_rate": documents.DEFAULT_PENALTY_RATE,
+            "grace_days": documents.DEFAULT_GRACE_DAYS,
+            "currency": "USD",
+        },
+    })
+
+
+@app.post("/api/docs/company/set")
+async def api_docs_company_set(request: Request):
+    """Реквизиты компании (кредитор в расписке) — задаёт руководство один раз."""
+    from services import documents
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=("admin", "boss"), rate_limit_scope="api_docs_company_set"
+    )
+    values = data.get("company")
+    if not isinstance(values, dict):
+        raise HTTPException(status_code=400, detail="company: ожидается объект")
+    saved = await asyncio.to_thread(documents.save_company_requisites, values, user["id"])
+    from services import async_db as adb
+
+    await adb.add_audit_log(
+        user["id"], _actor_name(user), get_role(user["id"]),
+        "company_requisites", ", ".join(f"{k}={v}" for k, v in saved.items())[:500],
+    )
+    return JSONResponse({"ok": True, "company": await asyncio.to_thread(documents.company_requisites)})
+
+
+@app.post("/api/docs/create")
+async def api_docs_create(request: Request):
+    """Собрать документ по форме, сохранить, отправить составителю в Telegram."""
+    from services import documents, printing
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_create",
+        rate_limit_max=20, rate_limit_window=60.0,
+    )
+    res = await documents.create_document(data, created_by=user["id"])
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", "Не удалось собрать документ"))
+    from services import async_db as adb
+
+    await adb.add_audit_log(
+        user["id"], _actor_name(user), get_role(user["id"]),
+        "document_created", f"#{res['id']} {res['doc_type']}: {res['client_name']}"[:500],
+    )
+    doc = await documents.get_document(res["id"])
+    bot = await get_notify_bot()
+    delivery = await documents.send_to_chat(bot, doc, user["id"]) if doc else {"sent": False}
+    return JSONResponse({
+        "ok": True, "id": res["id"], "filename": res["filename"],
+        "sent": bool(delivery.get("sent")), "send_reason": delivery.get("reason"),
+        "can_print": printing.is_available(),
+    })
+
+
+@app.post("/api/docs/list")
+async def api_docs_list(request: Request):
+    from services import documents, printing
+
+    data = await request.json()
+    _authorize(data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_list", rate_limit_max=120)
+    rows = await documents.list_documents(limit=100)
+    return JSONResponse({"documents": rows, "can_print": printing.is_available()})
+
+
+def _doc_id_arg(data: dict) -> int:
+    try:
+        value = int(data.get("doc_id") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="doc_id: не число")
+    if value <= 0:
+        raise HTTPException(status_code=400, detail="doc_id обязателен")
+    return value
+
+
+@app.post("/api/docs/send")
+async def api_docs_send(request: Request):
+    """Прислать PDF документа себе в Telegram ещё раз."""
+    from services import documents
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_send", rate_limit_max=30)
+    doc = await documents.get_document(_doc_id_arg(data))
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    delivery = await documents.send_to_chat(await get_notify_bot(), doc, user["id"])
+    if not delivery.get("sent"):
+        return JSONResponse({"ok": False, "error": delivery.get("reason")})
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/docs/print")
+async def api_docs_print(request: Request):
+    """Напечатать документ из сохранённого файла (CUPS). ok = принято очередью."""
+    from services import documents, printing
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_print", rate_limit_max=30)
+    doc = await documents.get_document(_doc_id_arg(data))
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    if not printing.is_available():
+        return JSONResponse({"ok": False, "error": "Печать не настроена на этом сервере"})
+    found = await asyncio.to_thread(documents.read_pdf, doc)
+    if found is None:
+        return JSONResponse({"ok": False, "error": "Файл документа не найден — сформируйте заново"})
+    pdf, filename = found
+    result = await printing.print_pdf_bytes(
+        pdf, filename=filename, label=f"{documents.caption_for(doc)} · {_actor_name(user)}"
+    )
+    return JSONResponse({"ok": result.ok, "message": result.message, "error": result.error})
 
 
 @app.post("/api/wh/invoices/get")

@@ -23,10 +23,10 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 118._
+_Всего эндпоинтов: 125._
 
 
-### Админ (`admin`) — 112 эндпоинтов
+### Админ (`admin`) — 119 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -64,6 +64,12 @@ _Всего эндпоинтов: 118._
 - `/api/deposits/my`
 - `/api/deposits/pending`
 - `/api/deposits/reject`
+- `/api/docs/company/set`
+- `/api/docs/create`
+- `/api/docs/list`
+- `/api/docs/print`
+- `/api/docs/send`
+- `/api/docs/types`
 - `/api/home`
 - `/api/leads/agents`
 - `/api/leads/call_add`
@@ -140,13 +146,14 @@ _Всего эндпоинтов: 118._
 - `/api/wh/invoices/cancel`
 - `/api/wh/invoices/create`
 - `/api/wh/invoices/get`
+- `/api/wh/invoices/print`
 - `/api/wh/invoices/send`
 - `/api/wh/stock`
 
 </details>
 
 
-### Руководитель (`boss`) — 109 эндпоинтов
+### Руководитель (`boss`) — 116 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -184,6 +191,12 @@ _Всего эндпоинтов: 118._
 - `/api/deposits/my`
 - `/api/deposits/pending`
 - `/api/deposits/reject`
+- `/api/docs/company/set`
+- `/api/docs/create`
+- `/api/docs/list`
+- `/api/docs/print`
+- `/api/docs/send`
+- `/api/docs/types`
 - `/api/home`
 - `/api/leads/agents`
 - `/api/leads/call_add`
@@ -257,13 +270,14 @@ _Всего эндпоинтов: 118._
 - `/api/wh/invoices/cancel`
 - `/api/wh/invoices/create`
 - `/api/wh/invoices/get`
+- `/api/wh/invoices/print`
 - `/api/wh/invoices/send`
 - `/api/wh/stock`
 
 </details>
 
 
-### Менеджер (`manager`) — 58 эндпоинтов
+### Менеджер (`manager`) — 64 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -285,6 +299,11 @@ _Всего эндпоинтов: 118._
 - `/api/debts`
 - `/api/deposits/create`
 - `/api/deposits/my`
+- `/api/docs/create`
+- `/api/docs/list`
+- `/api/docs/print`
+- `/api/docs/send`
+- `/api/docs/types`
 - `/api/home`
 - `/api/leads/agents`
 - `/api/leads/call_add`
@@ -323,6 +342,7 @@ _Всего эндпоинтов: 118._
 - `/api/wh/invoices`
 - `/api/wh/invoices/create`
 - `/api/wh/invoices/get`
+- `/api/wh/invoices/print`
 - `/api/wh/invoices/send`
 - `/api/wh/stock`
 
