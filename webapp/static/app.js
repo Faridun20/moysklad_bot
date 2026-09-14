@@ -384,7 +384,8 @@ function sectionTabsFor(section) {
   const r = role();
   const boss = isBossRole();
   if (section === 'sales') {
-    return salesTabs({ canSeeReport: ['admin', 'boss', 'manager'].includes(r) });
+    const working = ['admin', 'boss', 'manager'].includes(r);
+    return salesTabs({ canSeeReport: working, canDocs: working });
   }
   if (section === 'stock') {
     return stockTabs({ canSeeGoods: canSeeMachines(), isBoss: boss });
@@ -433,6 +434,7 @@ function stockShellHtml() { return sectionShell('stock', stockTab).html; }
 async function renderSalesScreen() {
   salesTab = sectionShell('sales', salesTab).active;
   if (salesTab === 'report') await renderSalesReport();
+  else if (salesTab === 'docs') await renderDocsTab();
   else await renderOrders();
 }
 
@@ -2309,10 +2311,15 @@ function openMachineSheet({ title, fields, submitLabel, hint, onSubmit }) {
     const id = `ms-f-${f.key}`;
     const common = `id="${id}" name="${escapeHtml(f.key)}"`;
     const value = f.value == null ? '' : String(f.value);
+    // options: [[value, label], …] — выпадающий список; иначе поле ввода.
     const input = f.type === 'textarea'
       ? `<textarea ${common} rows="2" placeholder="${escapeHtml(f.placeholder || '')}">${escapeHtml(value)}</textarea>`
-      : `<input ${common} type="${f.type || 'text'}"${f.type === 'number' ? ' inputmode="decimal"' : ''} ` +
-        `value="${escapeHtml(value)}" placeholder="${escapeHtml(f.placeholder || '')}">`;
+      : f.type === 'select'
+        ? `<select ${common}>${(f.options || []).map(([v, l]) =>
+            `<option value="${escapeHtml(String(v))}"${String(v) === value ? ' selected' : ''}>${escapeHtml(l)}</option>`
+          ).join('')}</select>`
+        : `<input ${common} type="${f.type || 'text'}"${f.type === 'number' ? ' inputmode="decimal"' : ''} ` +
+          `value="${escapeHtml(value)}" placeholder="${escapeHtml(f.placeholder || '')}">`;
     return `<label class="c-field"><span>${escapeHtml(f.label)}${f.required ? ' *' : ''}</span>${input}` +
       `${f.hint ? `<span class="c-field-hint">${escapeHtml(f.hint)}</span>` : ''}</label>`;
   };
@@ -6521,6 +6528,7 @@ async function renderWhInvoiceList() {
   }
 
   const canCancel = whIsBoss();
+  const canPrint = !!data.can_print;
   content.innerHTML = newBtn + rows.map(inv => {
     const cancelled = inv.status === 'cancelled';
     const isOut = inv.type === 'outgoing';
@@ -6533,6 +6541,11 @@ async function renderWhInvoiceList() {
     const actions = [];
     if (isOut && !cancelled) {
       actions.push(`<button class="btn-secondary" data-wh-send="${inv.id}">${icon('phone')} Отправить PDF</button>`);
+    }
+    // Печать — по кнопке и только там, где есть принтер (can_print с сервера):
+    // кнопка, которая гарантированно ответит отказом, хуже отсутствующей.
+    if (canPrint && !cancelled) {
+      actions.push(`<button class="btn-secondary" data-wh-print="${inv.id}">${icon('list')} Распечатать</button>`);
     }
     if (canCancel && !cancelled) {
       actions.push(`<button class="btn-secondary" data-wh-cancel="${inv.id}">${icon('ban')} Отменить</button>`);
@@ -6585,6 +6598,11 @@ async function renderWhInvoiceList() {
     });
   });
 
+  content.querySelectorAll('[data-wh-print]').forEach(btn => {
+    btn.addEventListener('click', () => printViaCups('/api/wh/invoices/print',
+      { invoice_id: Number(btn.dataset.whPrint) }, btn));
+  });
+
   content.querySelectorAll('[data-wh-cancel]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('warning');
@@ -6613,6 +6631,159 @@ async function renderWhInvoiceList() {
 }
 
 // ─── Форма новой накладной (внутри вкладки «Накладные») ─────────────────────────────────────────
+
+// ─── Печать через CUPS: одна кнопка, один ответ ──────────────────────────────
+// `ok` от сервера значит «задание принято очередью», не «бумага вышла» — так и
+// говорим. Причина отказа приходит текстом и показывается как есть.
+async function printViaCups(path, body, btn) {
+  haptic('light');
+  if (btn) btn.disabled = true;
+  const r = await apiResult(path, body);
+  if (btn) btn.disabled = false;
+  if (!r.ok) { toast(r.error, 'error'); return; }
+  if (r.body.ok) toast(r.body.message || 'Отправлено на печать');
+  else toast(r.body.error || 'Не удалось отправить на печать', 'error', { duration: 6000 });
+}
+
+// ─── Продажи → Документы: расписка / тилхат ──────────────────────────────────
+//
+// Движок (docxtpl → LibreOffice) жил в проекте без входа: расписку было негде
+// составить. Форма — здесь; PDF собирает сервер, шлёт составителю в Telegram
+// (с кнопкой «Распечатать») и хранит файл, чтобы печатать и пересылать без
+// пересборки: подписанная расписка с новой датой — уже другой документ.
+let docsMeta = null;   // /api/docs/types — типы, реквизиты компании, права
+
+async function renderDocsTab() {
+  const content = document.getElementById('content');
+  content.innerHTML = salesShellHtml() + loading('Загружаю документы…');
+  wireSectionNav(content, 'sales', renderSalesScreen);
+  const gen = screenGen();
+  let meta, list;
+  try {
+    [meta, list] = await Promise.all([api('/api/docs/types', {}), api('/api/docs/list', {})]);
+  } catch (e) {
+    content.innerHTML = salesShellHtml() + errorBox(e.message);
+    wireSectionNav(content, 'sales', renderSalesScreen);
+    return;
+  }
+  if (gen !== screenGen()) return;
+  docsMeta = meta;
+  const rows = list.documents || [];
+  const canPrint = !!list.can_print;
+
+  const company = meta.company || {};
+  const companyLine = company.company_name
+    ? `${escapeHtml(company.company_name)}${company.company_city ? ' · ' + escapeHtml(company.company_city) : ''}`
+    : 'Реквизиты компании не заполнены';
+  const head = `
+    <div class="c-actions">
+      <button class="btn-primary" id="doc-new">${icon('plus')} Новый документ</button>
+      ${meta.can_edit_company ? `<button class="btn-secondary" id="doc-company">${icon('building')} Реквизиты</button>` : ''}
+    </div>
+    <div class="c-field-hint" id="doc-company-line">${companyLine}</div>`;
+
+  const items = rows.length ? rows.map(d => `
+    <div class="c-row" data-doc="${d.id}" data-status="${d.file_exists ? 'approved' : 'rejected'}">
+      <div class="card-row-info">
+        <div class="card-row-title">${escapeHtml(d.type_label)} · ${escapeHtml(d.client_name || '')}</div>
+        <div class="card-row-sub">${escapeHtml(d.product_name || '')} · ${formatMoney((d.total_amount_cents || 0) / 100)} ${escapeHtml(d.currency || '')}
+          · ${d.payment_type === 'installment' ? `рассрочка ${d.installments_count} пл.` : 'разовый платёж'} · ${formatDateRU(d.start_date)}</div>
+        <div class="c-actions c-actions--wrap">
+          ${d.file_exists ? `<button class="btn-secondary" data-doc-send="${d.id}">${icon('phone')} В Telegram</button>` : '<span class="c-field-hint">файл не найден — сформируйте заново</span>'}
+          ${d.file_exists && canPrint ? `<button class="btn-secondary" data-doc-print="${d.id}">${icon('list')} Распечатать</button>` : ''}
+        </div>
+      </div>
+    </div>`).join('') : emptyState({
+      icon: 'list', title: 'Документов пока нет',
+      hint: 'Расписка или тилхат по продаже в долг — нажмите «Новый документ»',
+    });
+
+  content.innerHTML = salesShellHtml() + head +
+    (rows.length ? `<div class="c-surface c-surface--list">${items}</div>` : items);
+  wireSectionNav(content, 'sales', renderSalesScreen);
+
+  content.querySelector('#doc-new')?.addEventListener('click', () => openDocumentForm(meta));
+  content.querySelector('#doc-company')?.addEventListener('click', () => openCompanyForm(meta));
+  content.querySelectorAll('[data-doc-send]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      haptic('light');
+      btn.disabled = true;
+      const r = await apiResult('/api/docs/send', { doc_id: Number(btn.dataset.docSend) });
+      btn.disabled = false;
+      if (r.ok && r.body.ok) toast('Документ отправлен вам в Telegram');
+      else toast((r.body && r.body.error) || r.error, 'error');
+    });
+  });
+  content.querySelectorAll('[data-doc-print]').forEach(btn => {
+    btn.addEventListener('click', () => printViaCups('/api/docs/print', { doc_id: Number(btn.dataset.docPrint) }, btn));
+  });
+}
+
+function openCompanyForm(meta) {
+  const company = meta.company || {};
+  openMachineSheet({
+    title: 'Реквизиты компании',
+    hint: 'Кредитор в расписке. Заполняется один раз, форма документа подставит их сама.',
+    fields: (meta.company_fields || []).map(f => ({ key: f.key, label: f.label, value: company[f.key] || '' })),
+    submitLabel: 'Сохранить',
+    onSubmit: async (data, { showErr }) => {
+      const res = await apiResult('/api/docs/company/set', { company: data });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      toast('Реквизиты сохранены');
+      renderDocsTab();
+      return true;
+    },
+  });
+}
+
+function openDocumentForm(meta) {
+  const company = meta.company || {};
+  const defaults = meta.defaults || {};
+  const today = new Date().toISOString().slice(0, 10);
+  const types = (meta.types || []).map(t => [t.key, t.label]);
+  const key = idemKey();
+  openMachineSheet({
+    title: 'Новый документ',
+    hint: 'Поля со звёздочкой обязательны. PDF придёт вам в Telegram.',
+    fields: [
+      { key: 'doc_type', label: 'Тип документа', type: 'select', options: types, required: true },
+      { key: 'debtor_full_name', label: 'Должник — ФИО', required: true },
+      { key: 'debtor_passport', label: 'Паспорт (серия, номер, кем выдан)' },
+      { key: 'debtor_pinfl', label: 'ПИНФЛ' },
+      { key: 'debtor_birth_date', label: 'Дата рождения', type: 'date' },
+      { key: 'debtor_address', label: 'Адрес' },
+      { key: 'debtor_phone', label: 'Телефон', type: 'tel' },
+      { key: 'product_name', label: 'Что передаётся (товар, техника)', required: true },
+      { key: 'total_amount', label: `Сумма, ${defaults.currency || 'USD'}`, type: 'number', required: true },
+      { key: 'currency', label: 'Валюта', type: 'select', value: defaults.currency || 'USD',
+        options: [['USD', 'USD'], ['UZS', 'UZS']] },
+      { key: 'start_date', label: 'Дата начала', type: 'date', value: today, required: true },
+      { key: 'term_months', label: 'Срок, месяцев', type: 'number', required: true },
+      { key: 'payment_type', label: 'Порядок оплаты', type: 'select', value: 'single',
+        options: [['single', 'Разовый платёж'], ['installment', 'Рассрочка по графику']] },
+      { key: 'installments_count', label: 'Число платежей (для рассрочки)', type: 'number',
+        hint: 'Не больше, чем месяцев срока' },
+      { key: 'penalty_rate', label: 'Пеня, % в день', value: defaults.penalty_rate || '0.1' },
+      { key: 'grace_days', label: 'Льготных дней', type: 'number', value: defaults.grace_days ?? 3 },
+      { key: 'witness_name', label: 'Свидетель (ФИО)', hint: 'Можно оставить пустым' },
+      { key: 'city', label: 'Город', value: company.company_city || '', required: true },
+      { key: 'company_representative', label: 'Подписывает от компании',
+        value: company.company_representative || '', hint: 'По умолчанию — из реквизитов' },
+    ],
+    submitLabel: 'Сформировать PDF',
+    onSubmit: async (data, { showErr }) => {
+      const res = await apiResult('/api/docs/create', { ...data, idempotency_key: key });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      toast(res.body.sent ? 'Документ сформирован и отправлен вам в Telegram'
+                          : `Документ сформирован. ${res.body.send_reason || ''}`.trim(),
+            res.body.sent ? 'success' : 'info', { duration: 5000 });
+      renderDocsTab();
+      return true;
+    },
+  });
+}
 
 async function renderWhInvoiceNew() {
   const content = document.getElementById('content');

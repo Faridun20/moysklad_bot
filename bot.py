@@ -216,6 +216,17 @@ async def _close_db_pool() -> None:
 
 async def _shutdown(tasks: list[asyncio.Task]) -> None:
     """Аккуратно отменить фоновые задачи и дождаться их завершения."""
+    # Короткие фоновые задачи (печатная форма после одобрения — utils/background)
+    # не отменяем, а ДОЖИДАЕМСЯ ограниченно: PDF уже обещан менеджеру, а
+    # рестарт при деплое не повод его потерять.
+    from utils.background import pending
+
+    left = pending()
+    if left:
+        try:
+            await asyncio.wait_for(asyncio.gather(*left, return_exceptions=True), timeout=20)
+        except TimeoutError:
+            logger.warning("Фоновые задачи не завершились за 20 с — выходим без них")
     for t in tasks:
         if not t.done():
             t.cancel()

@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from tests.e2e.conftest import go, seed_order, settled, tab
 
 
@@ -363,3 +365,118 @@ def test_manager_deletes_own_draft(open_app, e2e):
         "(id) => !document.querySelector(`.order-card[data-id=\"${id}\"]`)", arg=oid
     )
     assert e2e.rows("SELECT COUNT(*) AS n FROM orders WHERE id = ?", (oid,))[0]["n"] == 0
+
+
+# ─── Документы: расписка из формы → PDF в Telegram → печать ──────────────────
+
+
+def test_manager_creates_raspiska_and_prints_it(open_app, e2e, monkeypatch, tmp_path):
+    """Расписку раньше было негде составить: движок был, входа не было.
+
+    Границы подменены: LibreOffice пишет файл-заглушку, «принтер» отвечает
+    «принято». Всё остальное настоящее: форма, ручки, запись, доставка в
+    Telegram с кнопкой печати, кнопка печати в WebApp.
+    """
+    from pathlib import Path
+
+    from services import documents, printing
+    from services.printing import PrintResult
+
+    monkeypatch.setenv("DOCUMENTS_DIR", str(tmp_path / "docs"))
+
+    def _write(doc_type, context, out_dir):
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        p = out / f"{doc_type}.pdf"
+        p.write_bytes(b"%PDF-1.4\n" + context["debtor_full_name"].encode())
+        return p
+
+    async def fake_render(doc_type, context, out_dir, template_override=None):
+        return await asyncio.to_thread(_write, doc_type, context, out_dir)
+
+    printed: list[str] = []
+
+    async def fake_print(pdf_bytes, *, filename="", printer_name="", label=""):
+        printed.append(label)
+        return PrintResult(True, job="Canon-1")
+
+    monkeypatch.setattr(documents, "render_pdf", fake_render)
+    monkeypatch.setattr(printing, "is_available", lambda: True)
+    monkeypatch.setattr(printing, "print_pdf_bytes", fake_print)
+    e2e.db.set_setting("company_name", "ООО Ромашка", e2e.ids["boss"])
+    e2e.db.set_setting("company_city", "Ташкент", e2e.ids["boss"])
+
+    mgr = open_app(e2e.ids["mgr"])
+    go(mgr, "sales")
+    tab(mgr, "docs")
+    mgr.wait_for_selector("#doc-new")
+    assert mgr.locator("#doc-company").count() == 0, "реквизиты правит только руководство"
+    mgr.click("#doc-new")
+    mgr.select_option("#ms-f-doc_type", "raspiska_ru")
+    mgr.fill("#ms-f-debtor_full_name", "Иванов Иван Иванович")
+    mgr.fill("#ms-f-product_name", "Экскаватор JCB 3CX")
+    mgr.fill("#ms-f-total_amount", "25000")
+    mgr.fill("#ms-f-term_months", "6")
+    mgr.select_option("#ms-f-payment_type", "installment")
+    mgr.fill("#ms-f-installments_count", "6")
+    mgr.click("#ms-submit")
+    mgr.wait_for_selector(".toast:has-text('сформирован')")
+    mgr.wait_for_selector("[data-doc-print]")
+
+    docs = e2e.rows("SELECT client_name, total_amount_cents, installments_count FROM generated_documents")
+    assert docs == [{"client_name": "Иванов Иван Иванович", "total_amount_cents": 2_500_000,
+                     "installments_count": 6}]
+    # PDF ушёл составителю с кнопкой «Распечатать» (prn:doc:<id>).
+    assert [d["chat_id"] for d in e2e.bot.documents] == [e2e.ids["mgr"]]
+    markup = e2e.bot.documents[0].get("reply_markup")
+    assert markup and "prn:doc:" in str(markup.inline_keyboard[0][0].callback_data)
+
+    mgr.click("[data-doc-print]")
+    mgr.wait_for_selector(".toast:has-text('Отправлено на печать')")
+    assert printed and "Иванов" in printed[0]
+
+    # Ошибка формы остаётся В форме, а не закрывает её.
+    mgr.click("#doc-new")
+    mgr.fill("#ms-f-debtor_full_name", "Петров")
+    mgr.fill("#ms-f-product_name", "Ковш")
+    mgr.fill("#ms-f-total_amount", "100")
+    mgr.fill("#ms-f-term_months", "2")
+    mgr.select_option("#ms-f-payment_type", "installment")
+    mgr.fill("#ms-f-installments_count", "5")
+    mgr.click("#ms-submit")
+    mgr.wait_for_selector("#ms-error:not([hidden])")
+    assert "позже срока" in mgr.locator("#ms-error").inner_text()
+    assert mgr.locator("#ms-f-debtor_full_name").input_value() == "Петров"
+
+
+def test_boss_prints_invoice_from_list(open_app, e2e, monkeypatch):
+    from services import printing
+    from services.printing import PrintResult
+
+    printed: list[str] = []
+
+    async def fake_print(pdf_bytes, *, filename="", printer_name="", label=""):
+        printed.append(label)
+        return PrintResult(True, job="12")
+
+    monkeypatch.setattr(printing, "is_available", lambda: True)
+    monkeypatch.setattr(printing, "print_pdf_bytes", fake_print)
+
+    boss = open_app(e2e.ids["boss"])
+    go(boss, "stock")
+    boss.click('[data-wh-go="whinvoices"]')
+    boss.wait_for_selector("[data-wh-print]")  # сид-приход на 20 шт.
+    boss.click("[data-wh-print]")
+    boss.wait_for_selector(".toast:has-text('задание 12')")
+    assert printed and "Накладная" in printed[0]
+
+
+def test_invoice_list_has_no_print_button_without_cups(open_app, e2e, monkeypatch):
+    from services import printing
+
+    monkeypatch.setattr(printing, "is_available", lambda: False)
+    boss = open_app(e2e.ids["boss"])
+    go(boss, "stock")
+    boss.click('[data-wh-go="whinvoices"]')
+    boss.wait_for_selector("[data-wh-cancel]")
+    assert boss.locator("[data-wh-print]").count() == 0

@@ -292,6 +292,12 @@ describe('вкладки разделов', () => {
     expect(keys(salesTabs, { canSeeReport: false })).toEqual(['orders']);
   });
 
+  it('Продажи: «Документы» — тем же ролям, что создают заказы (/api/docs/*)', () => {
+    expect(keys(salesTabs, { canSeeReport: true, canDocs: true })).toEqual(['orders', 'report', 'docs']);
+    // Кладовщик: ручка ответила бы 403 — вкладки нет.
+    expect(keys(salesTabs, { canSeeReport: false, canDocs: false })).toEqual(['orders']);
+  });
+
   it('Склад: контейнеры и техника — та же тройка ролей, что у их ручек', () => {
     expect(keys(stockTabs, { canSeeGoods: true })).toEqual(['catalog', 'containers', 'machines']);
     expect(keys(stockTabs, { canSeeGoods: false })).toEqual(['catalog']);
@@ -317,7 +323,7 @@ describe('вкладки разделов', () => {
     // Пятая не влезает в ряд на 360dp и уезжает в скролл, который не виден.
     const all = [
       moneyTabs({ isBoss: true, isConfirmer: true, canSeeDebts: true, hasOps: true }),
-      salesTabs({ canSeeReport: true }),
+      salesTabs({ canSeeReport: true, canDocs: true }),
       stockTabs({ canSeeGoods: true, isBoss: true }),
       clientsTabs({ isBoss: true }),
     ];

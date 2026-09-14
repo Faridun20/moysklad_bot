@@ -128,6 +128,61 @@ def _print_keyboard(invoice_id: int | None):
     return kb.as_markup()
 
 
+async def deliver_shipment_pdf(
+    bot: Any, *, invoice_id: int, order_id: int, req_id: int, manager_id: int | None, boss_id: int
+) -> dict:
+    """Собрать печатную форму накладной и разослать менеджеру и боссу.
+
+    Работа ПОСЛЕ коммита отгрузки и ВНЕ ответа на одобрение: накладная уже
+    проведена, остатки списаны, и ждать рендера weasyprint (сотни миллисекунд
+    CPU) плюс двух отправок в Telegram боссу незачем — он видит «одобрено»
+    сразу, PDF догоняет следом. Никогда не бросает: отказ PDF — не откат
+    одобрения. Возвращает {built, sent_to} для логов и тестов.
+    """
+    pdf = await _build_invoice_pdf(invoice_id, order_id)
+    if not pdf or bot is None:
+        return {"built": bool(pdf), "sent_to": []}
+    sent_to = await _send_shipment_pdf(
+        bot, pdf, invoice_id=invoice_id, req_id=req_id, manager_id=manager_id, boss_id=boss_id
+    )
+    return {"built": True, "sent_to": sent_to}
+
+
+async def _send_shipment_pdf(
+    bot: Any, pdf: tuple[bytes, str], *, invoice_id: int, req_id: int,
+    manager_id: int | None, boss_id: int,
+) -> list[int]:
+    """Разослать собранный PDF менеджеру и боссу. Не бросает."""
+    sent_to: list[int] = []
+    try:
+        from aiogram.types import BufferedInputFile
+
+        pdf_bytes, pdf_name = pdf
+        caption = f"📄 Печатная форма — заявка #{req_id}"
+        # Печать — ПО КНОПКЕ, а не автоматически: половина печатных форм
+        # уходит на проверку перед отправкой клиенту, и печатать их все
+        # значит переводить бумагу. Формат callback_data — в services.printing,
+        # чтобы producer и хендлер не разъехались.
+        markup = _print_keyboard(invoice_id)
+        recipients = [r for r in (manager_id, boss_id) if r]
+        if boss_id == manager_id:
+            recipients = [boss_id]
+        for chat_id in recipients:
+            try:
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=BufferedInputFile(pdf_bytes, filename=pdf_name),
+                    caption=caption,
+                    reply_markup=markup,
+                )
+                sent_to.append(chat_id)
+            except Exception:
+                logger.exception("Не удалось отправить PDF по заявке #%s в чат %s", req_id, chat_id)
+    except Exception:
+        logger.exception("PDF dispatch failed for req #%s", req_id)
+    return sent_to
+
+
 async def _build_invoice_pdf(invoice_id: int | None, order_id: int) -> tuple[bytes, str] | None:
     """Печатная форма накладной: (bytes, имя файла) или None.
 
@@ -564,8 +619,10 @@ async def approve_shipment_request(
     boss_name: str,
     bot: Any,
     override: bool = False,
+    *,
+    pdf_delivery: str = "background",
 ) -> dict:
-    """Полный апрув заявки: DB, МойСклад, уведомления, PDF, авто-payment.
+    """Полный апрув заявки: DB, склад, уведомления, PDF, авто-payment.
 
     Параметры:
         req_id        — id заявки в shipment_requests
@@ -574,6 +631,11 @@ async def approve_shipment_request(
         bot           — aiogram.Bot (или совместимый, у которого есть
                         send_message/send_document). Может быть None,
                         тогда уведомления и PDF не отправляются.
+        pdf_delivery  — "background": печатная форма собирается и
+                        рассылается фоновой задачей ПОСЛЕ ответа (в
+                        результате — `pdf_task`, его можно дождаться);
+                        "inline": как раньше, внутри вызова. Отгрузка и
+                        одобрение от режима не зависят.
 
     Возвращает dict:
         {
@@ -680,6 +742,7 @@ async def approve_shipment_request(
 
     demand_line = ""
     pdf_to_send: tuple[bytes, str] | None = None
+    pdf_task: Any = None
     invoice_id: int | None = None
     invoice_number: str | None = None
     # Позиции без карточки номенклатуры в накладную не попадают. Молчать об
@@ -710,9 +773,23 @@ async def approve_shipment_request(
                 demand_line = (
                     f"\n📦 Накладная {esc(str(invoice_number))} проведена, остатки списаны"
                 )
-                pdf_to_send = await _build_invoice_pdf(invoice_id, order["id"])
-                if pdf_to_send:
-                    demand_line += " — печатная форма ниже 👇"
+                if pdf_delivery == "inline":
+                    pdf_to_send = await _build_invoice_pdf(invoice_id, order["id"])
+                    if pdf_to_send:
+                        demand_line += " — печатная форма ниже 👇"
+                elif bot is not None and invoice_id:
+                    # Рендер и рассылка — фоном: одобрение уже состоялось, и
+                    # боссу незачем ждать weasyprint и два вызова Telegram.
+                    from utils.background import spawn
+
+                    pdf_task = spawn(
+                        deliver_shipment_pdf(
+                            bot, invoice_id=int(invoice_id), order_id=int(order["id"]),
+                            req_id=req_id, manager_id=req.get("user_id"), boss_id=boss_user_id,
+                        ),
+                        name=f"shipment-pdf-{req_id}",
+                    )
+                    demand_line += " — печатная форма придёт следом 👇"
         else:
             reason = ship.get("reason", "неизвестная ошибка")
             logger.warning("Заявка #%s одобрена, но склад не списан: %s", req_id, reason)
@@ -772,42 +849,12 @@ async def approve_shipment_request(
         except Exception:
             logger.exception("notify_order_approved failed for req #%s", req_id)
 
-    # PDF менеджеру и боссу (одной и той же сборкой)
-    if pdf_to_send and bot is not None:
-        try:
-            from aiogram.types import BufferedInputFile
-
-            pdf_bytes, pdf_name = pdf_to_send
-            caption = f"📄 Печатная форма — заявка #{req_id}"
-            # Печать — ПО КНОПКЕ, а не автоматически: половина печатных форм
-            # уходит на проверку перед отправкой клиенту, и печатать их все
-            # значит переводить бумагу. Клавиатуру собираем здесь же, рядом с
-            # отправкой; формат callback_data — в services.printing, чтобы
-            # producer и хендлер не разъехались.
-            markup = _print_keyboard(invoice_id)
-            try:
-                file1 = BufferedInputFile(pdf_bytes, filename=pdf_name)
-                await bot.send_document(
-                    chat_id=req["user_id"],
-                    document=file1,
-                    caption=caption,
-                    reply_markup=markup,
-                )
-            except Exception:
-                logger.exception("Не удалось отправить PDF менеджеру")
-            if boss_user_id != req["user_id"]:
-                try:
-                    file2 = BufferedInputFile(pdf_bytes, filename=pdf_name)
-                    await bot.send_document(
-                        chat_id=boss_user_id,
-                        document=file2,
-                        caption=caption,
-                        reply_markup=markup,
-                    )
-                except Exception:
-                    logger.exception("Не удалось отправить PDF боссу")
-        except Exception:
-            logger.exception("PDF dispatch failed for req #%s", req_id)
+    # PDF менеджеру и боссу (inline-режим; в background его шлёт задача).
+    if pdf_to_send and bot is not None and invoice_id:
+        await _send_shipment_pdf(
+            bot, pdf_to_send, invoice_id=int(invoice_id), req_id=req_id,
+            manager_id=req.get("user_id"), boss_id=boss_user_id,
+        )
 
     # Для paid-заказов автоматически создаём payment-pending,
     # чтобы босс одной кнопкой зафиксировал реальное получение денег.
@@ -855,6 +902,7 @@ async def approve_shipment_request(
         "demand_line": demand_line,
         "invoice_id": invoice_id,
         "invoice_number": invoice_number,
+        "pdf_task": pdf_task,
     }
 
 

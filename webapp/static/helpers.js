@@ -182,6 +182,9 @@
     f = f || {};
     const tabs = [{ key: 'orders', label: 'Заказы' }];
     if (f.canSeeReport) tabs.push({ key: 'report', label: 'Отчёт' });
+    // Расписка/тилхат по продаже в долг: /api/docs/* отвечает тем же ролям,
+    // что и создание заказов. Кладовщику вкладку не рисуем — ручка ответит 403.
+    if (f.canDocs) tabs.push({ key: 'docs', label: 'Документы' });
     return tabs;
   }
 

@@ -111,6 +111,11 @@ def invoice_callback(invoice_id: int) -> str:
     return f"{CALLBACK_PREFIX}inv:{invoice_id}"
 
 
+def document_callback(doc_id: int) -> str:
+    """Юридический документ (generated_documents) — печатается из файла."""
+    return f"{CALLBACK_PREFIX}doc:{doc_id}"
+
+
 def parse_callback(data: str) -> tuple[str, int] | None:
     """`prn:inv:42` → `("inv", 42)`. `None` — чужой или битый callback."""
     if not data.startswith(CALLBACK_PREFIX):

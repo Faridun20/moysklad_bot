@@ -49,6 +49,23 @@ async def _invoice_pdf(invoice_id: int) -> tuple[bytes, str, str] | None:
     return pdf, invoice_filename(invoice), f"Накладная {number}"
 
 
+async def _document_pdf(doc_id: int) -> tuple[bytes, str, str] | None:
+    """Юридический документ → (pdf, имя файла, подпись). Читается из файла:
+    расписка подписана один раз, пересобирать её с новой датой нельзя."""
+    import asyncio
+
+    from services import documents
+
+    doc = await documents.get_document(doc_id)
+    if doc is None:
+        return None
+    found = await asyncio.to_thread(documents.read_pdf, doc)
+    if found is None:
+        return None
+    pdf, filename = found
+    return pdf, filename, documents.caption_for(doc)
+
+
 @router.callback_query(F.data.startswith(printing.CALLBACK_PREFIX))
 async def cb_print(call: CallbackQuery):
     """«🖨 Распечатать» под документом."""
@@ -59,7 +76,7 @@ async def cb_print(call: CallbackQuery):
     if parsed is None:
         return await call.answer("Кнопка устарела", show_alert=True)
     kind, ref = parsed
-    if kind != "inv":
+    if kind not in ("inv", "doc"):
         logger.warning("Печать: неизвестный тип документа %r", kind)
         return await call.answer("Неизвестный тип документа", show_alert=True)
 
@@ -69,13 +86,15 @@ async def cb_print(call: CallbackQuery):
     await call.answer("Отправляю на печать…")
 
     try:
-        doc = await _invoice_pdf(ref)
+        doc = await (_invoice_pdf(ref) if kind == "inv" else _document_pdf(ref))
     except Exception:
-        logger.exception("Печать: не удалось собрать PDF накладной #%s", ref)
+        logger.exception("Печать: не удалось собрать PDF (%s #%s)", kind, ref)
         return await _report(call, "❌ Не удалось собрать документ для печати")
 
     if doc is None:
-        return await _report(call, "❌ Накладная не найдена")
+        return await _report(
+            call, "❌ Накладная не найдена" if kind == "inv" else "❌ Файл документа не найден — сформируйте заново"
+        )
 
     pdf_bytes, filename, label = doc
     result = await printing.print_pdf_bytes(
