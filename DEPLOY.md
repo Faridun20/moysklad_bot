@@ -190,28 +190,36 @@ Start Command. Расписания в UTC.
 
 ---
 
-## Свой сервер: автодеплой через Forgejo
+## Свой сервер: автодеплой с GitHub
 
-На self-hosted выкат — это `git push` в `main` локального Forgejo
-(`faridun/moysklad_bot`). Дальше без рук:
+Главный репозиторий — GitHub (`Faridun20/moysklad_bot`). Выкат на свой
+сервер — это попадание коммита в `main` (merge PR или push). Дальше без рук:
 
-1. Хук `hooks/post-receive.d/zz-deploy` в репозитории Forgejo раскладывает
-   коммит в `/srv/docker/moysklad_bot` (`checkout -f`, `.env` и прочие
+1. crontab пользователя `fara` раз в 2 минуты запускает
+   `/srv/docker/moysklad_bot_autodeploy.sh`. Он сверяет `main` на GitHub с
+   последним выкаченным коммитом (`/srv/docker/moysklad_bot_deployed_sha`) и,
+   если ничего не поменялось, выходит.
+2. Новый коммит забирается в bare-клон `/srv/docker/moysklad_bot_src.git` и
+   раскладывается в `/srv/docker/moysklad_bot` (`checkout -f`; `.env` и прочие
    неотслеживаемые файлы не трогаются).
-2. Собирает образ с `GIT_COMMIT_SHA`/`GIT_COMMIT_MESSAGE`/`GIT_BRANCH` — от них
-   зависят `/version` в боте и `/healthz`.
-3. `docker compose up -d`: `migrate` → `bot` + `webapp`. Сборка упала — старые
-   контейнеры продолжают работать.
-4. Forgejo зеркалит репозиторий на GitHub.
+3. Образ собирается с `GIT_COMMIT_SHA`/`GIT_COMMIT_MESSAGE`/`GIT_BRANCH` — от
+   них зависят `/version` в боте и `/healthz`.
+4. `docker compose up -d`: `migrate` → `bot` + `webapp`.
+
+Сборка или перезапуск упали — работает прежняя версия, SHA упавшего коммита
+пишется в `/srv/docker/moysklad_bot_failed_sha`, и каждые 2 минуты он не
+пересобирается: следующая попытка — на новом коммите или вручную
+`bash /srv/docker/moysklad_bot_autodeploy.sh --force`.
 
 Журнал — `/srv/docker/moysklad_bot_deploy.log`. Проверка:
-`curl -s localhost:8080/healthz` — поле `version` должно совпасть с коммитом.
+`curl -s localhost:8080/healthz` — поле `version` совпадает с коммитом.
 
-Хук работает в контейнере `forgejo` от пользователя `git`, поэтому образ
-Forgejo свой (`/srv/docker/forgejo/docker-compose.yml`, `dockerfile_inline`):
-docker CLI и `git` в группе docker хоста. Хук лежит именно в
-`post-receive.d/`: сам `hooks/post-receive` — обёртка Forgejo, без неё не
-обновляется репозиторий в Forgejo и не срабатывает зеркало.
+Скрипт лежит вне рабочей копии намеренно: коммит, сломавший скрипт выката, не
+должен сам отключить выкат своего исправления.
+
+Forgejo на сервере держит зеркало GitHub только для чтения (pull mirror,
+10 минут). Пушить в Forgejo не нужно: у него нет доступа к Docker и хуков
+выката — старая схема «push в Forgejo → хук» убрана 14.09.2026.
 
 ## Грабли, на которые легко наступить
 
