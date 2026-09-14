@@ -489,8 +489,6 @@ def test_showcase_post_is_published_with_product_photo(open_app, e2e, monkeypatc
     assert post == [{"kind": "showcase", "ref": pid, "posted_by": e2e.ids["boss"]}]
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: предупреждения предпросмотра поста вставляются в "
-                   "закрывающуюся шторку черновика и не видны (app.js:4991)")
 def test_post_preview_warns_that_channel_is_not_configured(open_app, e2e, monkeypatch):
     monkeypatch.delenv("CHANNEL_ID", raising=False)
     boss = open_app(e2e.ids["boss"])
@@ -543,8 +541,6 @@ def test_stale_post_needs_selection_and_publishes_names_only(open_app, e2e, monk
     assert boss.locator(".stale-check").count() == 0
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: каталог кэширует /api/stock на всю сессию (stockData "
-                   "не сбрасывается, app.js:766) — после накладной остатки на экране старые")
 def test_catalog_shows_fresh_stock_after_invoice(open_app, e2e):
     boss = open_app(e2e.ids["boss"])
     go(boss, "stock")
@@ -1055,9 +1051,6 @@ def test_machine_without_deals_is_deleted_with_history(open_app, e2e, monkeypatc
     assert e2e.rows("SELECT COUNT(*) AS n FROM machine_hours WHERE machine_id = ?", (mid,))[0]["n"] == 0
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: showScreen('stock') через LEGACY_SCREENS всегда "
-                   "сбрасывает вкладку на «Каталог» (app.js:231) — после удаления машины/контейнера "
-                   "(app.js:1474, 2206) и по «Назад» из карточки (app.js:2040, 2444) человек не в своём списке")
 def test_after_delete_user_returns_to_the_same_tab(open_app, e2e):
     mid = _machine(e2e, "BACK-1", "Удаляемая машина")
     keep = _machine(e2e, "BACK-2", "Остаётся")

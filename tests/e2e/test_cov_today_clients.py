@@ -235,12 +235,11 @@ def test_queue_is_sorted_by_urgency(open_app, e2e):
     assert "Контейнеры не сверены" in boss.inner_text('[data-queue="stock:containers"]')
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: строка «Контейнеры не сверены» открывает «Каталог», а не «Контейнеры»")
 def test_queue_container_row_opens_containers_tab(open_app, e2e):
-    """wireWorkQueue ставит вкладку (app.js:576) и зовёт showScreen('stock'), а
-    showScreen разворачивает 'stock' как старый адрес → 'stock:catalog'
-    (LEGACY_SCREENS, app.js:231) и затирает выбранную вкладку. Человек видит
-    каталог и ищет контейнер руками — ровно то, от чего очередь и спасала.
+    """wireWorkQueue ставит вкладку и зовёт showScreen('stock'), а showScreen
+    разворачивал 'stock' как старый адрес → 'stock:catalog' (LEGACY_SCREENS) и
+    затирал выбранную вкладку. Человек видел каталог и искал контейнер руками —
+    ровно то, от чего очередь и спасала.
     """
     _arrived_unchecked_container(e2e)
     boss = open_app(e2e.ids["boss"])
@@ -445,9 +444,8 @@ def test_manager_search_sees_only_own_orders_and_no_client_card(open_app, e2e):
     assert f"#{mine}" in text and f"#{other}" in text
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: кнопка поиска у кладовщика ведёт в 403 «Нет доступа»")
 def test_keeper_search_button_is_not_a_dead_end(open_app, e2e):
-    """/api/search отвечает только admin/boss/manager, а лупа в шапке есть у всех.
+    """/api/search отвечает только admin/boss/manager, а лупа в шапке была у всех.
 
     Правило приложения — «таб, который гарантированно ответит 403, это дверь,
     которая не открывается»: либо кнопки нет, либо поиск работает.
@@ -773,12 +771,11 @@ def test_create_new_counterparty_from_lead_and_empty_name_error(open_app, e2e):
     assert e2e.rows("SELECT agent_ms_id FROM leads WHERE id = ?", (nameless,))[0]["agent_ms_id"] is None
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: «Назад» из карточки лида, открытой из «Лидов», уводит в «Воронку»")
 def test_back_from_lead_card_opened_from_list_returns_to_list(open_app, e2e):
-    """renderLeadCard жёстко ставит clientsTab = 'funnel' (app.js:5001).
+    """renderLeadCard жёстко ставил clientsTab = 'funnel'.
 
     Руководитель отобрал «Не купили», открыл клиента, нажал «Назад» — и
-    оказался в воронке: отбор и место в списке потеряны.
+    оказывался в воронке: отбор и место в списке терялись.
     """
     lead_id = _lead(e2e, 695_001, "Из списка")
     boss = open_app(e2e.ids["boss"])
@@ -828,12 +825,11 @@ def test_limits_sorted_by_debt_with_over_limit_badge_and_rates_back(open_app, e2
     boss.wait_for_selector(f'#clients-body [data-agent="{arslan}"]')
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: без клиентов с заказами вход в «Курсы валют» пропадает")
 def test_rates_entry_available_without_clients(open_app, e2e):
-    """renderCreditLimits выходит на пустом списке ДО строки #open-rates (app.js:6087).
+    """renderCreditLimits выходил на пустом списке ДО строки #open-rates.
 
     На свежей базе (заказов нет, курс сума ещё не синхронизирован) строки курса
-    на «Сегодня» тоже нет — руководителю негде задать курс вовсе.
+    на «Сегодня» тоже нет — руководителю было негде задать курс вовсе.
     """
     boss = open_app(e2e.ids["boss"])
     _open_home(boss)

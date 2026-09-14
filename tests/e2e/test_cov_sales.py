@@ -206,11 +206,9 @@ def test_sales_tabs_and_controls_follow_role(open_app, e2e):
         assert "Нет доступа" not in text and "Ошибка" not in text, role
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: кладовщику и бухгалтеру показана «Новый заказ», "
-                                       "а /api/orders/create им отвечает 403")
 def test_new_order_button_hidden_for_roles_that_cannot_create(open_app, e2e):
     """Кнопка, которая гарантированно упрётся в 403, — дверь, которая не
-    открывается (правило из helpers.js NAV_SECTIONS). «Новый заказ» рисуется
+    открывается (правило из helpers.js NAV_SECTIONS). «Новый заказ» рисовался
     по условию `!isBoss`, то есть и кладовщику, и бухгалтеру."""
     for role in ("keeper", "book"):
         page = open_app(e2e.ids[role])

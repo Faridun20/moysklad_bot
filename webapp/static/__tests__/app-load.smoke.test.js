@@ -1183,6 +1183,18 @@ describe('пять разделов вместо четырёх', () => {
     expect(nav(window)).toEqual(['today', 'sales', 'money']);
   });
 
+  it('лупа поиска — только ролям, которым отвечает /api/search', () => {
+    // Каркас makeWindow без шапки — кнопку кладём, как она стоит в index.html.
+    const hidden = (r) => boot(`currentUser = { role: '${r}' };
+      document.body.insertAdjacentHTML('afterbegin', '<button id="search-btn"></button>');
+      initNav();`)
+      .document.getElementById('search-btn').classList.contains('hidden');
+    expect(hidden('warehouse_keeper')).toBe(true);
+    expect(hidden('bookkeeper')).toBe(true);
+    expect(hidden('manager')).toBe(false);
+    expect(hidden('boss')).toBe(false);
+  });
+
   it('старые адреса экранов продолжают работать', async () => {
     // Ссылки из бота, пушей и закладок ведут на прежние имена. Алиас обязан
     // перевести и на раздел, и на вкладку, куда содержимое переехало.
@@ -1199,6 +1211,9 @@ describe('пять разделов вместо четырёх', () => {
     expect((await window.__go('stock'))[0]).toBe('stock');
     expect((await window.__go('stock'))[2]).toBe('catalog');
     expect((await window.__go('containers'))[2]).toBe('containers');
+    // Имя раздела — не старый адрес: вкладка, выбранная до перехода, остаётся
+    // (очередь «Контейнеры не сверены», «Назад» из карточки контейнера).
+    expect((await window.__go('stock'))[2]).toBe('containers');
     expect((await window.__go('debts')).slice(0, 1)).toEqual(['money']);
     expect((await window.__go('debts'))[3]).toBe('debts');
     expect((await window.__go('limits'))[4]).toBe('limits');

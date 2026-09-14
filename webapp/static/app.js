@@ -228,7 +228,13 @@ const LEGACY_SCREENS = {
   orders: 'sales',
   finance: 'money',
   analytics: 'sales:report',
-  stock: 'stock:catalog',
+  // `stock` здесь НЕТ, хотя старый экран «Склад» был каталогом: имя совпало с
+  // новым разделом, и алиас 'stock:catalog' срабатывал на КАЖДЫЙ
+  // showScreen('stock') — затирал вкладку, поставленную перед переходом.
+  // Строка очереди «Контейнеры не сверены», «Назад» из карточки машины или
+  // контейнера, возврат после удаления открывали каталог, а тап «Склад» в
+  // панели не помнил вкладку, как остальные разделы. Старая ссылка на `stock`
+  // приходит при запуске, когда вкладка ещё по умолчанию — каталог.
   machines: 'stock:machines',
   containers: 'stock:containers',
   debts: 'money:debts',
@@ -525,6 +531,7 @@ async function renderStockScreen() {
     stockCurrentCat = 'all';
     stockCurrentSub = '';
     stockStaleOnly = false;
+    stockStaleData = null;   // «Залежалось» — тоже срез остатков: перечитать при включении
     await renderStock();
   }
 }
@@ -763,23 +770,27 @@ async function renderStock() {
   wireSectionNav(content, 'stock', renderStockScreen);
   const gen = screenGen();
 
-  if (!stockData) {
-    try {
-      const r = await fetch('/api/stock', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ initData: _initData }),
-      });
-      if (!r.ok) {
-        const err = await r.json().catch(() => ({}));
-        throw new Error(err.detail || 'Ошибка загрузки склада');
-      }
-      stockData = await r.json();
-    } catch (e) {
-      content.innerHTML = stockShellHtml() + errorBox(e.message);
-      wireSectionNav(content, 'stock', renderStockScreen);
-      return;
+  // Остатки перечитываем при КАЖДОМ входе во вкладку. Раньше /api/stock
+  // грузился раз за сессию (`if (!stockData)`): провёл накладную в соседней
+  // вкладке, вернулся в каталог — там прежние числа, и по ним обещали клиенту
+  // товар, которого уже нет. Кэш stockData остаётся для перерисовок внутри
+  // вкладки (категория, поиск, «Показать ещё») — они в сеть не ходят и не
+  // мигают загрузкой.
+  try {
+    const r = await fetch('/api/stock', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: _initData }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.detail || 'Ошибка загрузки склада');
     }
+    stockData = await r.json();
+  } catch (e) {
+    content.innerHTML = stockShellHtml() + errorBox(e.message);
+    wireSectionNav(content, 'stock', renderStockScreen);
+    return;
   }
 
   // renderStockContent ищет #content заново — не затираем чужой экран.
@@ -2665,7 +2676,9 @@ function openMachineSheet({ title, fields, submitLabel, hint, onSubmit }) {
       submitBtn.disabled = false;
     }
   });
-  return { close, showErr };
+  // sheet — сама шторка: дописать в НЕЁ, а не в первую попавшуюся .c-overlay
+  // (под ней может лежать другая форма — см. showChannelPreview).
+  return { close, showErr, sheet: ov };
 }
 
 function isMachineBoss() {
@@ -3264,6 +3277,11 @@ function renderOrdersMain() {
   const { orders, role } = ordersData;
   const isBoss = role === 'admin' || role === 'boss';
   const canShip = isBoss || role === 'warehouse_keeper';
+  // «Новый заказ» — только менеджеру. Было `!isBoss`, то есть и кладовщику с
+  // бухгалтером, а /api/orders/create им отвечает 403 (can_create_orders:
+  // admin/boss/manager). Руководству кнопку не рисуем и раньше: заказы
+  // заводят менеджеры, руководство их разбирает.
+  const canCreate = role === 'manager';
 
   // Боссу фильтр «черновики» бесполезен (это незавершённые заявки менеджеров) —
   // заменяем на «отгружено». Менеджеру черновики нужны (свои незаконченные).
@@ -3325,7 +3343,7 @@ function renderOrdersMain() {
         title: 'Нет заказов',
         hint: (currentOrderFilter !== 'all' || currentOrderPeriod !== 'all')
           ? 'Нет заказов по выбранным фильтрам'
-          : isBoss ? 'Менеджеры ещё не создавали заказов' : 'Нажмите «+ Новый заказ» чтобы начать',
+          : canCreate ? 'Нажмите «+ Новый заказ» чтобы начать' : 'Менеджеры ещё не создавали заказов',
       })
     : (() => {
         // Группируем по дате (created_at='YYYY-MM-DD HH:MM') и выводим клиента
@@ -3425,7 +3443,7 @@ function renderOrdersMain() {
     <div class="seg-row scroll-hint"><div class="seg seg--scroll">${statusSeg}</div></div>
     ${periodRow}
     ${periodPanel}
-    ${!isBoss ? `<button class="btn-new-order" id="btn-new-order">${icon('plus')} Новый заказ</button>` : ''}
+    ${canCreate ? `<button class="btn-new-order" id="btn-new-order">${icon('plus')} Новый заказ</button>` : ''}
     ${requestsRow}
     <div class="orders-list">${list}</div>
   `;
@@ -4971,7 +4989,7 @@ function showChannelPreview(kind, params, draft) {
     : '';
   const blocked = draft.can_publish ? '' :
     '<div class="c-error">Канал не настроен: нет CHANNEL_ID</div>';
-  openMachineSheet({
+  const preview = openMachineSheet({
     title: 'Предпросмотр',
     fields: [{ key: 'text', label: 'Текст поста', type: 'textarea', value: draft.text }],
     submitLabel: draft.can_publish ? 'Опубликовать' : 'Нельзя опубликовать',
@@ -4988,8 +5006,12 @@ function showChannelPreview(kind, params, draft) {
       return true;
     },
   });
-  const ov = document.querySelector('.c-overlay .c-sheet');
-  if (ov) ov.insertAdjacentHTML('afterbegin', warn + blocked);
+  // Предупреждения — в СВОЮ шторку. Раньше искали первую `.c-overlay`: это
+  // шторка черновика, которая закрывается сразу после onSubmit (и «нет
+  // CHANNEL_ID» пропадал вместе с ней), или редактор цены, лежащий под
+  // предпросмотром. Причина «Нельзя опубликовать» должна быть видна до нажатия.
+  const title = preview.sheet.querySelector('.c-sheet-title');
+  if (title) title.insertAdjacentHTML('afterend', warn + blocked);
 }
 
 // Карточка обращения. Переписки здесь нет и не будет — мы её не храним;
@@ -4998,7 +5020,13 @@ async function renderLeadCard(leadId) {
   const content = document.getElementById('content');
   content.innerHTML = skeleton('label') + skeleton('list', 4);
   setScreenContext('Обращение клиента');
-  showBack(() => { clientsTab = 'funnel'; showScreen('clients'); });
+  // «Назад» — туда, откуда открыли: карточка открывается из «Воронки», из
+  // «Лидов» и из «Деньги → Отчёт». Раньше здесь стояло clientsTab = 'funnel',
+  // и отобравший «Не купили» в «Лидах» возвращался в воронку. Раздел помнит
+  // свою вкладку, а отборы списка (leadsFilter/leadsState) живут на уровне
+  // модуля — повторный showScreen рисует тот же отобранный список.
+  const backScreen = currentScreen;
+  showBack(() => showScreen(backScreen));
 
   let card;
   try {
@@ -5527,10 +5555,14 @@ function initNav() {
   // Кнопки строит buildNav из таблицы разделов — их набор зависит от роли,
   // поэтому статикой в разметке они быть не могут.
   buildNav();
-  // Поиск в топбаре — доступен с любого экрана.
+  // Поиск в топбаре — доступен с любого экрана, но не любой роли: /api/search
+  // отвечает только admin/boss/manager, и лупа у кладовщика с бухгалтером
+  // вела в «Нет доступа» — дверь, которая не открывается (как таб в buildNav).
   const searchBtn = document.getElementById('search-btn');
   if (searchBtn) {
-    searchBtn.addEventListener('click', openSearch);
+    const canSearch = ['admin', 'boss', 'manager'].includes(role());
+    searchBtn.classList.toggle('hidden', !canSearch);
+    if (canSearch) searchBtn.addEventListener('click', openSearch);
   }
   // Подсказки прокрутки — один наблюдатель на всё приложение (см.
   // refreshScrollHints), а не вызов из каждого рендера.
@@ -6084,13 +6116,6 @@ async function renderCreditLimits(container) {
   }
   const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   const fmtCents = c => opsAmount((Number(c) || 0) / 100);
-  if (!clients.length) {
-    container.innerHTML = emptyState({
-      icon: 'user', title: 'Пока нет клиентов',
-      hint: 'Контрагенты появятся после первого заказа или когда их заведут в справочнике.',
-    });
-    return;
-  }
   // Сверху — кто больше должен. Раньше сортировали по сальдо взаиморасчётов
   // МойСклад; его больше нет, и «сколько должен» считается по нашим заказам —
   // это тот же вопрос, но с ответом, который мы можем показать построчно.
@@ -6124,7 +6149,16 @@ async function renderCreditLimits(container) {
         </div>
       </div>
     </div>`;
-  container.innerHTML = `${ratesEntry}<div class="section-label">Клиенты (${clients.length})</div><div class="c-surface c-surface--list">${cards}</div>`;
+  // Вход в курсы — при любом списке, в том числе пустом. Раньше пустой список
+  // выходил раньше этой строки, и на свежей базе (заказов нет, курс сума ещё
+  // не пришёл — строки «Курс ЦБ» на «Сегодня» тоже нет) задать курс было негде.
+  const list = clients.length
+    ? `<div class="section-label">Клиенты (${clients.length})</div><div class="c-surface c-surface--list">${cards}</div>`
+    : emptyState({
+        icon: 'user', title: 'Пока нет клиентов',
+        hint: 'Контрагенты появятся после первого заказа или когда их заведут в справочнике.',
+      });
+  container.innerHTML = ratesEntry + list;
   container.querySelector('#open-rates')?.addEventListener('click', () => {
     haptic('light');
     renderCurrencyRates();
