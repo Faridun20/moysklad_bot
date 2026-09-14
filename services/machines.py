@@ -617,8 +617,10 @@ def validate_installment(price_cents: int, down_payment_cents: int, months: int)
     return ""
 
 
-async def get_schedule(deal_id: int) -> list[dict]:
-    rows = await adb_core.fetch(
+async def get_schedule(deal_id: int, *, db: Any = None) -> list[dict]:
+    """График сделки. `db` — открытая транзакция (`adb_core.transaction()`),
+    если читать надо под её блокировкой; по умолчанию — пул."""
+    rows = await (db or adb_core).fetch(
         "SELECT * FROM machine_deal_payments WHERE deal_id = $1 ORDER BY seq", deal_id
     )
     return [dict(r) for r in rows]
@@ -653,36 +655,83 @@ def allocate_receipts(schedule: list[dict], received_cents: int) -> list[dict]:
     return out
 
 
-async def _sync_schedule_state(deal_id: int, *, user_id: int) -> bool:
+async def _sync_schedule_state(deal_id: int, *, user_id: int, db: Any = None) -> bool:
     """Пересчитать покрытие графика по поступлениям. True — сделка закрыта.
 
     `paid_at` остаётся в таблице графика как производная отметка: на неё
     опираются напоминания и дебиторка, и переписывать их ради нового источника
-    правды незачем.
+    правды незачем. `db` — транзакция, в которой записали/удалили поступление.
     """
-    total = int(await adb_core.fetchval(
+    db = db or adb_core
+    total = int(await db.fetchval(
         "SELECT COALESCE(SUM(amount_cents), 0) FROM machine_payment_receipts WHERE deal_id = $1",
         deal_id,
     ) or 0)
-    schedule = await get_schedule(deal_id)
+    schedule = await get_schedule(deal_id, db=db)
     stamp = now_str()
     allocated = allocate_receipts(schedule, total)
     for row in allocated:
         if int(row.get("seq") or 0) == 0:
             continue
         if row["is_paid"] and not row["paid_at"]:
-            await adb_core.execute(
+            await db.execute(
                 "UPDATE machine_deal_payments SET paid_at = $1, paid_by = $2 WHERE id = $3",
                 stamp, user_id, row["id"],
             )
         elif not row["is_paid"] and row["paid_at"]:
             # Поступление отменили — отметка «оплачен» обязана уйти вместе с
             # деньгами, иначе платёж пропадёт из напоминаний навсегда.
-            await adb_core.execute(
+            await db.execute(
                 "UPDATE machine_deal_payments SET paid_at = NULL, paid_by = NULL WHERE id = $1",
                 row["id"],
             )
     return all(r["is_paid"] for r in allocated)
+
+
+async def _lock_deal(txn: Any, deal_id: int) -> dict | None:
+    """Строка сделки под блокировкой до конца транзакции.
+
+    Все записи денег по одной рассрочке (поступление, «оплачен», снятие отметки,
+    удаление поступления) идут через неё. Без блокировки двойной тап «оплачен»
+    давал два запроса, оба видели `paid_at IS NULL` и оба писали поступление —
+    долг гасился дважды. На Postgres — `FOR UPDATE`, на SQLite пишущая
+    транзакция и так одна (`BEGIN IMMEDIATE`).
+    """
+    sql = "SELECT id, closed_at, currency, price_cents FROM machine_deals WHERE id = $1"
+    if USE_POSTGRES:
+        sql += " FOR UPDATE"
+    return await txn.fetchrow(sql, deal_id)
+
+
+async def _insert_receipt_locked(
+    txn: Any, deal: dict, amount_cents: int, *, user_id: int,
+    note: str | None, received_at: str | None,
+) -> bool:
+    """Записать поступление ВНУТРИ транзакции под `_lock_deal`. True — график
+    покрыт целиком (сделку пора закрыть)."""
+    stamp = now_str()
+    await txn.execute(
+        "INSERT INTO machine_payment_receipts (deal_id, amount_cents, received_at, "
+        "received_by, note, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+        deal["id"], amount_cents, received_at or stamp, user_id, note, stamp,
+    )
+    return await _sync_schedule_state(int(deal["id"]), user_id=user_id, db=txn)
+
+
+async def _after_receipt_added(
+    deal_id: int, amount_cents: int, currency: str, closed: bool, *,
+    user_id: int, full_name: str,
+) -> dict:
+    """Аудит и закрытие сделки — ПОСЛЕ коммита: аудит пишет синхронный слой,
+    и на SQLite он ждал бы нашу же пишущую транзакцию. `close_deal` — CAS по
+    `closed_at IS NULL`, повторный вызов безвреден."""
+    await _audit(
+        user_id, full_name, "machine_receipt_added",
+        f"сделка #{deal_id} · {money.format_cents(amount_cents)} {currency}",
+    )
+    if closed:
+        await close_deal(deal_id, user_id=user_id, full_name=full_name)
+    return {"ok": True, "deal_closed": closed}
 
 
 async def add_receipt(
@@ -700,44 +749,40 @@ async def add_receipt(
     ok, err = _validate_cents(amount_cents, "Сумма")
     if not ok:
         return {"ok": False, "error": err}
-    deal = await adb_core.fetchrow(
-        "SELECT id, closed_at, currency, price_cents FROM machine_deals WHERE id = $1", deal_id
+    async with adb_core.transaction() as txn:
+        deal = await _lock_deal(txn, deal_id)
+        if not deal:
+            return {"ok": False, "error": "Сделка не найдена"}
+        if deal["closed_at"]:
+            return {"ok": False, "error": "Рассрочка уже закрыта", "current": "closed"}
+        closed = await _insert_receipt_locked(
+            txn, deal, amount_cents, user_id=user_id, note=note, received_at=received_at,
+        )
+    return await _after_receipt_added(
+        deal_id, amount_cents, str(deal["currency"]), closed,
+        user_id=user_id, full_name=full_name,
     )
-    if not deal:
-        return {"ok": False, "error": "Сделка не найдена"}
-    if deal["closed_at"]:
-        return {"ok": False, "error": "Рассрочка уже закрыта", "current": "closed"}
-
-    stamp = now_str()
-    await adb_core.execute(
-        "INSERT INTO machine_payment_receipts (deal_id, amount_cents, received_at, "
-        "received_by, note, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
-        deal_id, amount_cents, received_at or stamp, user_id, note, stamp,
-    )
-    await _audit(
-        user_id, full_name, "machine_receipt_added",
-        f"сделка #{deal_id} · {money.format_cents(amount_cents)} {deal['currency']}",
-    )
-    closed = await _sync_schedule_state(deal_id, user_id=user_id)
-    if closed:
-        await close_deal(deal_id, user_id=user_id, full_name=full_name)
-    return {"ok": True, "deal_closed": closed}
 
 
-async def delete_receipt(receipt_id: int, *, user_id: int, full_name: str = "") -> dict:
-    """Удалить ошибочно внесённое поступление и пересчитать график."""
-    row = await adb_core.fetchrow(
+async def _delete_receipt_locked(txn: Any, receipt_id: int, *, user_id: int) -> tuple[int, int, bool]:
+    """Удалить поступление внутри транзакции под `_lock_deal`.
+    → (deal_id, amount_cents, график всё ещё покрыт)."""
+    row = await txn.fetchrow(
         "SELECT deal_id, amount_cents FROM machine_payment_receipts WHERE id = $1", receipt_id
     )
-    if not row:
-        return {"ok": False, "error": "Поступление не найдено"}
     deal_id = int(row["deal_id"])
-    await adb_core.execute("DELETE FROM machine_payment_receipts WHERE id = $1", receipt_id)
+    await txn.execute("DELETE FROM machine_payment_receipts WHERE id = $1", receipt_id)
+    covered = await _sync_schedule_state(deal_id, user_id=user_id, db=txn)
+    return deal_id, int(row["amount_cents"]), covered
+
+
+async def _after_receipt_deleted(
+    deal_id: int, amount_cents: int, covered: bool, *, user_id: int, full_name: str,
+) -> dict:
     await _audit(
         user_id, full_name, "machine_receipt_deleted",
-        f"сделка #{deal_id} · {money.format_cents(int(row['amount_cents']))}",
+        f"сделка #{deal_id} · {money.format_cents(amount_cents)}",
     )
-    covered = await _sync_schedule_state(deal_id, user_id=user_id)
     if not covered:
         # Сделку могли закрыть этим самым поступлением. Убрали деньги — рассрочка
         # снова открыта, иначе долг исчезает из напоминаний и дебиторки, хотя
@@ -745,6 +790,24 @@ async def delete_receipt(receipt_id: int, *, user_id: int, full_name: str = "") 
         reopened = await _reopen_deal(deal_id, user_id=user_id, full_name=full_name)
         return {"ok": True, "deal_reopened": reopened}
     return {"ok": True, "deal_reopened": False}
+
+
+async def delete_receipt(receipt_id: int, *, user_id: int, full_name: str = "") -> dict:
+    """Удалить ошибочно внесённое поступление и пересчитать график."""
+    row = await adb_core.fetchrow(
+        "SELECT deal_id FROM machine_payment_receipts WHERE id = $1", receipt_id
+    )
+    if not row:
+        return {"ok": False, "error": "Поступление не найдено"}
+    async with adb_core.transaction() as txn:
+        await _lock_deal(txn, int(row["deal_id"]))
+        # Перечитываем под блокировкой: параллельный запрос мог удалить его первым.
+        if not await txn.fetchrow("SELECT id FROM machine_payment_receipts WHERE id = $1", receipt_id):
+            return {"ok": False, "error": "Поступление не найдено"}
+        deal_id, amount, covered = await _delete_receipt_locked(txn, receipt_id, user_id=user_id)
+    return await _after_receipt_deleted(
+        deal_id, amount, covered, user_id=user_id, full_name=full_name,
+    )
 
 
 async def _reopen_deal(deal_id: int, *, user_id: int, full_name: str = "") -> bool:
@@ -803,39 +866,56 @@ async def pay_installment(
     Обёртка над поступлением: кнопка «оплачен» — частый случай «принёс ровно
     столько, сколько по графику», и заставлять вводить сумму ради него незачем.
     Снятие отметки удаляет последнее поступление на ту же сумму.
+
+    Проверка отметки и запись — под блокировкой сделки в одной транзакции:
+    иначе двойной тап писал два поступления (оба запроса видели «не оплачен»).
     """
-    row = await adb_core.fetchrow(
-        "SELECT p.*, d.machine_id FROM machine_deal_payments p "
-        "JOIN machine_deals d ON d.id = p.deal_id WHERE p.id = $1",
-        payment_id,
+    head = await adb_core.fetchrow(
+        "SELECT deal_id FROM machine_deal_payments WHERE id = $1", payment_id
     )
-    if not row:
+    if not head:
         return {"ok": False, "error": "Платёж не найден"}
-    if int(row["seq"]) == 0:
-        return {"ok": False, "error": "Первоначальный взнос уже получен"}
+    deal_id = int(head["deal_id"])
 
-    amount = int(row["amount_cents"])
+    async with adb_core.transaction() as txn:
+        deal = await _lock_deal(txn, deal_id)
+        row = await txn.fetchrow("SELECT * FROM machine_deal_payments WHERE id = $1", payment_id)
+        if not deal or not row:
+            return {"ok": False, "error": "Платёж не найден"}
+        if int(row["seq"]) == 0:
+            return {"ok": False, "error": "Первоначальный взнос уже получен"}
+        amount = int(row["amount_cents"])
+
+        if paid:
+            if row["paid_at"]:
+                return {"ok": False, "error": "Платёж уже отмечен оплаченным", "current": "paid"}
+            if deal["closed_at"]:
+                return {"ok": False, "error": "Рассрочка уже закрыта", "current": "closed"}
+            closed = await _insert_receipt_locked(
+                txn, deal, amount, user_id=user_id, note=f"платёж {row['seq']}", received_at=None,
+            )
+        else:
+            if not row["paid_at"]:
+                return {"ok": False, "error": "Платёж и так не отмечен", "current": "unpaid"}
+            last = await txn.fetchrow(
+                "SELECT id FROM machine_payment_receipts WHERE deal_id = $1 AND amount_cents = $2 "
+                "ORDER BY received_at DESC, id DESC LIMIT 1",
+                deal_id, amount,
+            )
+            if not last:
+                return {
+                    "ok": False,
+                    "error": "Платёж покрыт поступлениями другого размера — удалите нужное вручную",
+                }
+            _, _, covered = await _delete_receipt_locked(txn, int(last["id"]), user_id=user_id)
+
     if paid:
-        if row["paid_at"]:
-            return {"ok": False, "error": "Платёж уже отмечен оплаченным", "current": "paid"}
-        return await add_receipt(
-            int(row["deal_id"]), amount, user_id=user_id, full_name=full_name,
-            note=f"платёж {row['seq']}",
+        return await _after_receipt_added(
+            deal_id, amount, str(deal["currency"]), closed, user_id=user_id, full_name=full_name,
         )
-
-    if not row["paid_at"]:
-        return {"ok": False, "error": "Платёж и так не отмечен", "current": "unpaid"}
-    last = await adb_core.fetchrow(
-        "SELECT id FROM machine_payment_receipts WHERE deal_id = $1 AND amount_cents = $2 "
-        "ORDER BY received_at DESC, id DESC LIMIT 1",
-        row["deal_id"], amount,
+    return await _after_receipt_deleted(
+        deal_id, amount, covered, user_id=user_id, full_name=full_name,
     )
-    if not last:
-        return {
-            "ok": False,
-            "error": "Платёж покрыт поступлениями другого размера — удалите нужное вручную",
-        }
-    return await delete_receipt(int(last["id"]), user_id=user_id, full_name=full_name)
 
 
 async def due_installments(today: str) -> list[dict]:

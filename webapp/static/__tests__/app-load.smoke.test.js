@@ -2513,3 +2513,41 @@ describe('единица позиции (unit) не становится раз�
     expectInert(window, window.document.getElementById('content'));
   });
 });
+
+// ─── Безопасность, п.4: «оплачен» по рассрочке — один тап, одно поступление ──
+
+describe('отметка платежа рассрочки: двойной тап не шлёт второй запрос', () => {
+  it('пока запрос в полёте, повтор игнорируется; ключ живёт до успеха', async () => {
+    const window = boot(`
+      window.__calls = [];
+      let fail = true;
+      apiResult = (path, body) => new Promise(resolve => {
+        window.__calls.push(body);
+        setTimeout(() => {
+          resolve(fail ? { ok: false, status: 500, error: 'сеть' } : { ok: true, status: 200, body: {} });
+        }, 5);
+      });
+      window.__btn = document.createElement('button');
+      window.__run = async () => {
+        const p1 = sendMachinePayment(7, false, window.__btn);
+        window.__disabledDuring = window.__btn.disabled;
+        const p2 = sendMachinePayment(7, false, window.__btn);
+        const [r1, r2] = await Promise.all([p1, p2]);
+        window.__second = r2;
+        fail = false;
+        await sendMachinePayment(7, false, window.__btn);   // ретрай после отказа
+        await sendMachinePayment(7, false, window.__btn);   // новая отметка после успеха
+        return r1;
+      };
+    `);
+    await window.__run();
+    const calls = window.__calls;
+    expect(window.__disabledDuring).toBe(true);
+    expect(window.__second).toBeNull();
+    expect(calls).toHaveLength(3);
+    expect(calls[0].idempotency_key).toBeTruthy();
+    expect(calls[1].idempotency_key).toBe(calls[0].idempotency_key);
+    expect(calls[2].idempotency_key).not.toBe(calls[0].idempotency_key);
+    expect(window.__btn.disabled).toBe(false);
+  });
+});

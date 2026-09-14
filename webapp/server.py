@@ -3727,6 +3727,7 @@ async def api_machines_payment(request: Request):
     в «Продана» сам: закрывать руками после последнего платежа значит однажды
     забыть это сделать.
     """
+    from services import async_db as adb
     from services import machines
 
     data = await request.json()
@@ -3735,9 +3736,23 @@ async def api_machines_payment(request: Request):
     )
     payment_id = _machine_id_arg(data, "payment_id")
     paid = data.get("paid", True)
-    res = await machines.pay_installment(
-        payment_id, user_id=user["id"], full_name=_actor_name(user), paid=bool(paid)
-    )
+    # Двойной тап «оплачен» с тем же ключом отдаёт результат первого, а не
+    # второе поступление. Сервис дополнительно сериализует записи по сделке.
+    idem = _Idem(adb, "machine_payment", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await machines.pay_installment(
+            payment_id, user_id=user["id"], full_name=_actor_name(user), paid=bool(paid)
+        )
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
     return _machine_response(res)
 
 

@@ -1417,10 +1417,34 @@ function machineDealsHtml(deals, today) {
   }).join('');
 }
 
-async function toggleMachinePayment(machineId, paymentId, wasPaid) {
-  const res = await apiResult('/api/machines/payment', {
-    payment_id: paymentId, paid: !wasPaid,
-  });
+// «Оплачен» по плановому платежу: одна отметка — один запрос. Кнопка гаснет на
+// время запроса, а ключ идемпотентности живёт до успеха, а не на клик: двойной
+// тап (или ретрай после обрыва) отдаёт результат первого, а не второе
+// поступление денег. Ключ привязан к паре «платёж + направление».
+const _machinePayKeys = new Map();
+const _machinePayBusy = new Set();
+
+async function sendMachinePayment(paymentId, wasPaid, btn) {
+  const slot = `${paymentId}:${wasPaid ? 1 : 0}`;
+  if (_machinePayBusy.has(slot)) return null;
+  if (!_machinePayKeys.has(slot)) _machinePayKeys.set(slot, idemKey());
+  _machinePayBusy.add(slot);
+  if (btn) btn.disabled = true;
+  try {
+    const res = await apiResult('/api/machines/payment', {
+      payment_id: paymentId, paid: !wasPaid, idempotency_key: _machinePayKeys.get(slot),
+    });
+    if (res.ok) _machinePayKeys.delete(slot);
+    return res;
+  } finally {
+    _machinePayBusy.delete(slot);
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function toggleMachinePayment(machineId, paymentId, wasPaid, btn) {
+  const res = await sendMachinePayment(paymentId, wasPaid, btn);
+  if (!res) return;
   if (!res.ok) {
     tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
     // 409 значит «на сервере уже другое» — перечитываем, а не спорим с экраном.
@@ -2485,7 +2509,7 @@ async function renderMachineCard(machineId) {
   content.querySelectorAll('[data-payment]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
-      toggleMachinePayment(m.id, Number(btn.dataset.payment), btn.dataset.paid === '1');
+      toggleMachinePayment(m.id, Number(btn.dataset.payment), btn.dataset.paid === '1', btn);
     });
   });
   content.querySelectorAll('[data-receipt-add]').forEach(btn => {
@@ -5460,13 +5484,14 @@ async function renderBuyerCard(buyer) {
 
   content.querySelectorAll('[data-payment]').forEach(btn => {
     btn.addEventListener('click', async () => {
-      await toggleMachinePaymentFromBuyer(buyer, Number(btn.dataset.payment), btn.dataset.paid === '1');
+      await toggleMachinePaymentFromBuyer(buyer, Number(btn.dataset.payment), btn.dataset.paid === '1', btn);
     });
   });
 }
 
-async function toggleMachinePaymentFromBuyer(buyer, paymentId, wasPaid) {
-  const res = await apiResult('/api/machines/payment', { payment_id: paymentId, paid: !wasPaid });
+async function toggleMachinePaymentFromBuyer(buyer, paymentId, wasPaid, btn) {
+  const res = await sendMachinePayment(paymentId, wasPaid, btn);
+  if (!res) return;
   if (!res.ok) {
     tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
     if (res.status === 409) renderBuyerCard(buyer);

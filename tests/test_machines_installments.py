@@ -189,6 +189,74 @@ def test_double_paid_is_rejected(isolated_db):
     assert second["current"] == "paid"
 
 
+def _receipts_count(deal_id):
+    from services import machines
+
+    return len(_run(machines.list_receipts(deal_id)))
+
+
+def test_concurrent_paid_taps_write_one_receipt(isolated_db):
+    """Двойной тап «оплачен»: два запроса одновременно. Раньше оба видели
+    `paid_at IS NULL` и оба писали поступление — долг гасился дважды."""
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine()
+    deal = _credit(mid)
+    pid = [r for r in _run(machines.get_schedule(deal["deal_id"])) if r["seq"] == 1][0]["id"]
+
+    async def both():
+        return await asyncio.gather(*(machines.pay_installment(pid, user_id=2) for _ in range(4)))
+
+    results = _run(both())
+    assert sum(1 for r in results if r["ok"]) == 1, results
+    assert _receipts_count(deal["deal_id"]) == 1
+    progress = _run(machines.deal_progress(deal["deal_id"]))
+    assert progress["received_cents"] == 400_000
+
+
+def test_concurrent_unpaid_taps_delete_one_receipt(isolated_db):
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine()
+    deal = _credit(mid)
+    rows = [r for r in _run(machines.get_schedule(deal["deal_id"])) if r["seq"] in (1, 2)]
+    for r in rows:
+        assert _run(machines.pay_installment(r["id"], user_id=2))["ok"]
+    assert _receipts_count(deal["deal_id"]) == 2
+
+    async def both():
+        return await asyncio.gather(
+            *(machines.pay_installment(rows[1]["id"], user_id=2, paid=False) for _ in range(3))
+        )
+
+    results = _run(both())
+    assert sum(1 for r in results if r["ok"]) == 1, results
+    assert _receipts_count(deal["deal_id"]) == 1
+
+
+def test_payment_endpoint_replays_same_idempotency_key(isolated_db, monkeypatch):
+    """Ретрай «оплачен» с тем же ключом отдаёт результат первого, а не 409 и
+    не второе поступление."""
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine()
+    deal = _credit(mid)
+    pid = [r for r in _run(machines.get_schedule(deal["deal_id"])) if r["seq"] == 1][0]["id"]
+    client = _client(monkeypatch)
+
+    first = _post(client, "/api/machines/payment", 2, payment_id=pid, idempotency_key="k-1")
+    again = _post(client, "/api/machines/payment", 2, payment_id=pid, idempotency_key="k-1")
+    assert first.status_code == 200 and again.status_code == 200
+    assert again.json() == first.json()
+    assert _receipts_count(deal["deal_id"]) == 1
+
+
 def test_paid_mark_can_be_taken_back(isolated_db):
     from services import machines
 
