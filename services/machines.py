@@ -882,13 +882,22 @@ async def _after_receipt_added(
 async def add_receipt(
     deal_id: int, amount_cents: int, *, user_id: int, full_name: str = "",
     note: str | None = None, received_at: str | None = None, method: str | None = None,
+    idem_key: str | None = None,
 ) -> dict:
     """Записать полученные деньги по рассрочке.
 
     Сумма любая: клиент вносит сколько принёс, а не ровно плановый платёж.
     Покрытие графика пересчитывается сразу, и последний закрытый платёж
     закрывает сделку.
+
+    `idem_key` — ключ идемпотентности ручки (`_Idem(..., atomic=True)`):
+    результат пишется в него ТОЙ ЖЕ транзакцией, что и поступление, поэтому
+    ретрай после обрыва связи получает готовый ответ, а не второе поступление.
+    Аудит после коммита — best-effort: деньги уже записаны, и сбой журнала не
+    должен превращать успех в 500 (ретрай тогда повторил бы запрос).
     """
+    from services.database import idem_store_in
+
     if not isinstance(amount_cents, int) or amount_cents <= 0:
         return {"ok": False, "error": "Сумма должна быть больше нуля"}
     if method is not None and method not in RECEIPT_METHODS:
@@ -912,10 +921,16 @@ async def add_receipt(
             txn, deal, amount_cents, user_id=user_id, note=note, received_at=received_at,
             method=method,
         )
-    return await _after_receipt_added(
-        deal_id, amount_cents, str(deal["currency"]), closed,
-        user_id=user_id, full_name=full_name, method=method,
-    )
+        result = {"ok": True, "deal_closed": bool(closed)}
+        await idem_store_in(txn, idem_key, result)
+    try:
+        return await _after_receipt_added(
+            deal_id, amount_cents, str(deal["currency"]), closed,
+            user_id=user_id, full_name=full_name, method=method,
+        )
+    except Exception:
+        logger.exception("machines: аудит поступления по сделке #%s не записан", deal_id)
+        return result
 
 
 async def _delete_receipt_locked(

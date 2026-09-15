@@ -4782,14 +4782,18 @@ async def api_machines_receipt(request: Request):
     if not data.get("idempotency_key"):
         raise HTTPException(status_code=400, detail="idempotency_key обязателен")
 
-    idem = _Idem(adb, "machine_receipt", user["id"], data.get("idempotency_key"))
+    # atomic: результат пишет само поступление своей транзакцией
+    # (`idem_store_in`). Ключ без результата значит «не закоммитилось» и
+    # переиспользуется ретраем; release() удаляет только ключ без результата,
+    # так что сбой ПОСЛЕ коммита ключ не освобождает и дубля денег не будет.
+    idem = _Idem(adb, "machine_receipt", user["id"], data.get("idempotency_key"), atomic=True)
     cached = await idem.claim()
     if cached is not None:
         return JSONResponse(cached)
     try:
         res = await machines.add_receipt(
             deal_id, amount_cents, user_id=user["id"], full_name=_actor_name(user),
-            note=_machine_text(data, "note", 200), method=method,
+            note=_machine_text(data, "note", 200), method=method, idem_key=idem.key,
         )
     except Exception:
         await idem.release()
@@ -4797,7 +4801,6 @@ async def api_machines_receipt(request: Request):
     if not res.get("ok"):
         await idem.release()
         return _machine_response(res)
-    await idem.store(res)
     return JSONResponse(res)
 
 

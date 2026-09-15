@@ -13,6 +13,7 @@ import asyncio
 import importlib
 from datetime import date
 
+import pytest
 from fastapi.testclient import TestClient
 
 import services.roles as roles
@@ -613,3 +614,72 @@ def test_allocation_is_pure_and_testable():
     assert rows[0]["is_paid"] is True          # взнос вне распределения
     assert rows[1]["is_paid"] is True
     assert rows[2]["covered_cents"] == 100
+
+
+# ─── Идемпотентность поступления: результат в транзакции записи ──────────────
+
+
+def _receipt_key_row(db, key):
+    from services import adb_core
+
+    rows = _run(adb_core.fetch("SELECT key, result FROM idempotency_keys WHERE key = $1", key))
+    return [dict(r) for r in rows]
+
+
+def test_receipt_result_is_stored_inside_the_receipt_transaction(isolated_db):
+    from services import database, machines
+
+    db = isolated_db
+    _setup(db)
+    deal = _credit(_machine(), months=5)
+    key = "machine_receipt:2:k-in-txn"
+    assert _run(database.idem_claim(key, "machine_receipt", 2)) is None
+    res = _run(machines.add_receipt(deal["deal_id"], 400_000, user_id=2, idem_key=key))
+    assert res == {"ok": True, "deal_closed": False}
+    rows = _receipt_key_row(db, key)
+    assert rows and rows[0]["result"], "результат должен лечь в ключ той же транзакцией"
+    # release после коммита (как делает ручка на исключении) ключ не трогает.
+    _run(database.idem_release(key))
+    assert _receipt_key_row(db, key)[0]["result"]
+
+
+def test_receipt_endpoint_audit_failure_keeps_key_and_no_duplicate(isolated_db, monkeypatch):
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    deal = _credit(_machine(), months=5)
+    client = _client(monkeypatch)
+
+    async def audit_down(*a, **kw):
+        raise RuntimeError("журнал недоступен")
+
+    monkeypatch.setattr(machines, "_audit", audit_down)
+    body = dict(deal_id=deal["deal_id"], amount="4000", method="cash", idempotency_key="rk-1")
+    r1 = _post(client, "/api/machines/receipt", 1, **body)
+    assert r1.status_code == 200, r1.text
+    r2 = _post(client, "/api/machines/receipt", 1, **body)
+    assert r2.status_code == 200 and r2.json() == r1.json()
+    assert len(_run(machines.list_receipts(deal["deal_id"]))) == 1
+
+
+def test_receipt_endpoint_failure_before_commit_frees_the_key(isolated_db, monkeypatch):
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    deal = _credit(_machine(), months=5)
+    client = _client(monkeypatch)
+    real = machines._insert_receipt_locked
+
+    async def boom(*a, **kw):
+        raise RuntimeError("упало до коммита")
+
+    monkeypatch.setattr(machines, "_insert_receipt_locked", boom)
+    body = dict(deal_id=deal["deal_id"], amount="4000", method="card", idempotency_key="rk-2")
+    with pytest.raises(RuntimeError):
+        _post(client, "/api/machines/receipt", 1, **body)
+    monkeypatch.setattr(machines, "_insert_receipt_locked", real)
+    r = _post(client, "/api/machines/receipt", 1, **body)
+    assert r.status_code == 200, r.text
+    assert len(_run(machines.list_receipts(deal["deal_id"]))) == 1

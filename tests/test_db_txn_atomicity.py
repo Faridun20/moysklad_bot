@@ -306,8 +306,8 @@ def test_installment_closure_commits_with_the_receipt(isolated_db, monkeypatch):
 
     real_audit = machines._audit
     monkeypatch.setattr(machines, "_audit", audit_down)
-    with pytest.raises(RuntimeError):
-        _run(machines.add_receipt(deal_id, 100_000, user_id=2))
+    # Аудит после коммита best-effort: деньги записаны — ответ успешный.
+    assert _run(machines.add_receipt(deal_id, 100_000, user_id=2)) == {"ok": True, "deal_closed": True}
     # Закрытие уже в той же транзакции: сделка закрыта, машина продана,
     # и лишнее поступление сверх цены больше не принимается.
     head = _run(machines.adb_core.fetchrow("SELECT closed_at FROM machine_deals WHERE id = $1", deal_id))
