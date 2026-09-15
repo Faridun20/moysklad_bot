@@ -60,6 +60,10 @@ NEW_INDEXES = [
     "idx_container_receipt_invoice",
     "idx_return_items_return_item",
     "idx_acc_day_closes_doc",
+    # Сверка кассы: один пересчёт — одна строка на валюту (идемпотентность
+    # записи и склейка строк одного пересчёта в истории).
+    "idx_daily_cash_counts_key",
+    "idx_daily_cash_counts_user",
 ]
 
 

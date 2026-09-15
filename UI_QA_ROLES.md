@@ -25,13 +25,13 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 164._
+_Всего эндпоинтов: 167._
 
 
 > **Временное совмещение ролей** (`services/roles.py::ROLE_ALSO_ACTS_AS`): `manager` = + `warehouse_keeper`, `bookkeeper`. Кладовщика и бухгалтера в штате пока нет, их работу делает менеджер; списки ниже уже учитывают это. Роли `warehouse_keeper`/`bookkeeper` через `/addrole` не назначаются. `*` в таблице экранов — доступ через совмещение.
 
 
-### Админ (`admin`) — 143 эндпоинтов
+### Админ (`admin`) — 146 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -39,6 +39,9 @@ _Всего эндпоинтов: 164._
 - `/api/analytics`
 - `/api/analytics/export`
 - `/api/cash/history`
+- `/api/cash/reconcile`
+- `/api/cash/reconcile/context`
+- `/api/cash/reconcile/history`
 - `/api/channel/draft`
 - `/api/channel/history`
 - `/api/channel/publish`
@@ -182,7 +185,7 @@ _Всего эндпоинтов: 164._
 </details>
 
 
-### Руководитель (`boss`) — 140 эндпоинтов
+### Руководитель (`boss`) — 143 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -190,6 +193,9 @@ _Всего эндпоинтов: 164._
 - `/api/analytics`
 - `/api/analytics/export`
 - `/api/cash/history`
+- `/api/cash/reconcile`
+- `/api/cash/reconcile/context`
+- `/api/cash/reconcile/history`
 - `/api/channel/draft`
 - `/api/channel/history`
 - `/api/channel/publish`
@@ -330,14 +336,15 @@ _Всего эндпоинтов: 164._
 </details>
 
 
-### Менеджер (`manager`) — 98 эндпоинтов
+### Менеджер (`manager`) — 99 эндпоинтов
 
 <details><summary>Показать список</summary>
 
 - `/api/agents`
 - `/api/analytics`
-- `/api/clients/detail`
-- `/api/clients/shipment`
+- `/api/cash/reconcile`
+- `/api/cash/reconcile/context`
+- `/api/cash/reconcile/history`
 - `/api/containers/arrive`
 - `/api/containers/card`
 - `/api/containers/check`
@@ -522,5 +529,6 @@ _Всего эндпоинтов: 164._
 | Техника → карточка | admin, boss, manager | `/api/machines/card` |
 | Техника → сделки | admin, boss | `/api/machines/deal` |
 | Оплата → «Куда поступили»; Настройки → Карты и счета | admin, boss, manager (правка и архив — руководство) | `/api/pay_accounts` |
+| Деньги → Сверка кассы | admin, boss, manager (чужую историю видит только руководство) | `/api/cash/reconcile` |
 
 Таблица экранов ручная (какой экран какой эндпоинт зовёт — это знание фронта), списки выше машинные. При расхождении верить спискам.

@@ -139,6 +139,7 @@ _WORK_ENDPOINTS = [
     "/api/deposits/confirm", "/api/returns/create", "/api/returns/confirm", "/api/containers/list",
     "/api/containers/create", "/api/machines/list", "/api/machines/create", "/api/machines/deal",
     "/api/money/summary", "/api/analytics",
+    "/api/cash/reconcile", "/api/cash/reconcile/context", "/api/cash/reconcile/history",
 ]
 
 # Только руководство (менеджеру — 403, совмещение ролей этого не даёт).

@@ -250,6 +250,22 @@ def _checks() -> list[Check]:
               "статус пересчёта"),
         Check("stock_count_lines_qty_chk", "stock_count_lines", "counted_qty >= 0",
               ("id", "count_id", "counted_qty"), "посчитанное количество ≥ 0"),
+        # ── Ежедневная сверка кассы (services.cash_reconciliation) ──
+        # Пересчитать можно ноль, но не минус: отрицательной пачки денег не
+        # бывает, а минус означал бы перепутанные местами колонки.
+        Check("daily_cash_counts_counted_chk", "daily_cash_counts",
+              "counted_cents >= 0", ("id", "counted_by", "counted_cents"),
+              "пересчитанная сумма ≥ 0"),
+        # Расхождение хранится рядом (по нему идёт выборка руководителя), но
+        # соврать им нельзя: оно обязано быть разностью тех же двух чисел —
+        # иначе строка «всё сошлось» с непустой недостачей не всплыла бы нигде.
+        Check("daily_cash_counts_diff_chk", "daily_cash_counts",
+              "diff_cents = counted_cents - system_cents",
+              ("id", "counted_cents", "system_cents", "diff_cents"),
+              "разница = пересчёт − по системе"),
+        Check("daily_cash_counts_currency_chk", "daily_cash_counts",
+              "currency ~ '^[A-Z]{3}$'", ("id", "currency"),
+              "валюта — трёхбуквенный код в верхнем регистре"),
     ]
 
 
@@ -356,6 +372,10 @@ UNIQUE_KEYS: dict[str, tuple[str, tuple[str, ...], str]] = {
     ),
     "idx_stock_writeoffs_invoice": ("stock_writeoffs", ("invoice_id",), "invoice_id IS NOT NULL"),
     "idx_stock_count_lines_product": ("stock_count_lines", ("count_id", "product_id"), "TRUE"),
+    # Один пересчёт — одна строка на валюту: ключ делят строки ОДНОГО пересчёта.
+    "idx_daily_cash_counts_key": (
+        "daily_cash_counts", ("request_key", "currency"), "request_key IS NOT NULL"
+    ),
 }
 
 

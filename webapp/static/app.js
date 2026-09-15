@@ -8163,6 +8163,10 @@ async function renderMoneyScreen() {
   const body = document.getElementById('money-body');
   if (moneyTab === 'debts') await renderDebts(body);
   else if (moneyTab === 'report') await renderMoneyReport(body);
+  // Сверка кассы (cash_reconcile.js): пересчёт наличных руками и его история.
+  // От `accounting_enabled` не зависит — ожидаемое считает
+  // `order_payments.cash_on_hand`, а не журнал бухгалтерии.
+  else if (moneyTab === 'reconcile' && typeof reconRenderTab === 'function') await reconRenderTab(body);
   // Бухгалтерия включена — «Касса» показывает счета, журнал и старые формы
   // (accounting.js). Выключена — всё как раньше, руководителю внизу кнопка.
   else if (moneyTab === 'ops' && typeof accEnabled === 'function' && accEnabled()) await renderAccTab(body);

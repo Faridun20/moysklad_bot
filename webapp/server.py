@@ -6660,6 +6660,91 @@ async def api_deposits_on_hand(request: Request):
     })
 
 
+# ─── API: ежедневная сверка кассы (services/cash_reconciliation.py) ───────────
+#
+# Пересчитали наличные руками — записали, что вышло, и сравнили с тем, что
+# система считает «на руках» (`order_payments.cash_on_hand`). Ручки НИЧЕГО не
+# двигают: ни платежа, ни сдачи, ни долга по ним не создаётся — это запись
+# наблюдения. Подтверждения у неё нет: ждать одобрения на пересчёт значит не
+# записать сверку вовсе.
+
+
+def _cash_recon_actor(user: dict):
+    from services import cash_reconciliation as recon
+
+    return recon.Actor(
+        user_id=int(user["id"]),
+        name=_actor_name(user) or user.get("username") or str(user["id"]),
+        role=get_role(user["id"]),
+    )
+
+
+@app.post("/api/cash/reconcile/context")
+async def api_cash_reconcile_context(request: Request):
+    """Форма сверки: сколько наличных должно быть по системе, по валютам."""
+    from services import cash_reconciliation as recon
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_cash_reconcile_context",
+        rate_limit_max=60,
+    )
+    return JSONResponse(await recon.context(_cash_recon_actor(user)))
+
+
+@app.post("/api/cash/reconcile")
+async def api_cash_reconcile(request: Request):
+    """Записать пересчёт кассы. Пишется и когда всё сошлось."""
+    from services import cash_reconciliation as recon
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_cash_reconcile",
+    )
+    try:
+        res = await recon.record(
+            _cash_recon_actor(user),
+            data.get("counts"),
+            data.get("note"),
+            request_key=data.get("idempotency_key"),
+        )
+    except recon.CashCountError as e:
+        return JSONResponse({"detail": e.message, "code": e.code}, status_code=e.status)
+    return JSONResponse(res)
+
+
+@app.post("/api/cash/reconcile/history")
+async def api_cash_reconcile_history(request: Request):
+    """История пересчётов. Менеджеру — своя, руководству — все.
+
+    `only_diff` — только расхождения: за ними руководитель сюда и заходит,
+    остальные записи подтверждают, что сверку вообще делают.
+    """
+    from services import cash_reconciliation as recon
+    from services.roles import role_allowed
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_cash_reconcile_history",
+        rate_limit_max=60,
+    )
+    see_all = role_allowed(get_role(user["id"]), recon.ROLES_SEE_ALL)
+    # Чужие пересчёты — только руководству. Менеджер не расширит выборку флагом
+    # в теле запроса: охват решает роль, а не форма.
+    rows = await recon.history(
+        user_id=None if see_all else int(user["id"]),
+        only_diff=bool(data.get("only_diff")),
+        limit=int(data.get("limit") or recon.HISTORY_LIMIT),
+    )
+    return JSONResponse({"ok": True, "items": rows, "scope": "all" if see_all else "mine"})
+
+
 # ─── API: возвраты (IMPLEMENTATION.md §8) ─────────────────────────────────────
 
 

@@ -194,12 +194,16 @@ def _add_manager2(e2e) -> None:
 
 @pytest.mark.parametrize(("who", "tabs", "active"), [
     # Подтверждения руководства — в «Решениях» (test_boss_ui.py); «Касса» —
-    # с «Рабочими действиями» (boss_work_actions этого модуля).
-    ("boss", ["debts", "ops", "report"], "debts"),
-    ("admin", ["debts", "ops", "report"], "debts"),
+    # с «Рабочими действиями» (boss_work_actions этого модуля). «Сверка» —
+    # ежедневный пересчёт наличных: она у всех, кому отвечает
+    # /api/cash/reconcile (admin/boss/manager), и от «Рабочих действий» не
+    # зависит — руководителю это контроль, а не работа склада.
+    ("boss", ["debts", "ops", "reconcile", "report"], "debts"),
+    ("admin", ["debts", "ops", "reconcile", "report"], "debts"),
     # «Подтвердить» у менеджера — пока он замещает кладовщика и бухгалтера
-    # (services.roles.ROLE_ALSO_ACTS_AS); при откате — ["debts", "ops"].
-    ("mgr", ["confirm", "debts", "ops"], "confirm"),
+    # (services.roles.ROLE_ALSO_ACTS_AS); при откате — ["debts", "ops",
+    # "reconcile"].
+    ("mgr", ["confirm", "debts", "ops", "reconcile"], "confirm"),
     ("keeper", [], None),
     ("book", [], None),
 ])
@@ -215,8 +219,12 @@ def test_money_tabs_match_role(open_app, e2e, who, tabs, active):
     # Каждая доступная вкладка открывается без ошибки и с честным пустым
     # состоянием (данных ещё нет). У кладовщика и бухгалтера вкладка одна —
     # «Подтвердить», и переключатель из одного пункта не рисуется.
+    # На «Сверке» пустого списка нет: содержимое вкладки — сама форма пересчёта,
+    # и она появляется только после ответа /api/cash/reconcile/context, то есть
+    # проверяет ровно то же — что ручка роли отвечает.
     empty = {"confirm": "Нет записей на подтверждении", "debts": "Долгов и платежей пока нет",
-             "report": "За период поступлений нет", "ops": "Оформить возврат"}
+             "report": "За период поступлений нет", "ops": "Оформить возврат",
+             "reconcile": "Сверка кассы за"}
     for key in tabs or ["confirm"]:
         if tabs:
             tab(page, key)

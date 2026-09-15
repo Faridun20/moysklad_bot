@@ -64,7 +64,9 @@ describe('менеджер в интерфейсе', () => {
       currentUser = { role: 'manager' };
       window.__tabs = sectionTabsFor('money').map(t => t.key);
     `);
-    expect(window.__tabs).toEqual(['confirm', 'debts', 'ops']);
+    // «Сверка» — ежедневный пересчёт кассы: её записывает тот, у кого касса на
+    // руках, то есть менеджер (/api/cash/reconcile).
+    expect(window.__tabs).toEqual(['confirm', 'debts', 'ops', 'reconcile']);
   });
 
   it('у одобренного заказа есть «Отгрузить», «Отменить» — нет', () => {

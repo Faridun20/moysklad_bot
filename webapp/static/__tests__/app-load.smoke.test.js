@@ -1508,7 +1508,9 @@ describe('пять разделов вместо четырёх', () => {
     const tabsOf = (sec) => Array.from(
       window.document.querySelectorAll(`#nav-drawer .nav-link--tab[data-screen="${sec}"]`),
     ).map(b => b.dataset.tab);
-    expect(tabsOf('money')).toEqual(['debts', 'report']);
+    // «Сверка» (ежедневный пересчёт кассы) остаётся и с выключенными «Рабочими
+    // действиями»: руководителю это контроль, а не работа склада (moneyTabs).
+    expect(tabsOf('money')).toEqual(['debts', 'reconcile', 'report']);
     expect(tabsOf('sales')).toEqual(['orders', 'report']);
     expect(tabsOf('stock')).toEqual(['catalog', 'containers', 'machines']);
     expect(tabsOf('clients')).toEqual(['funnel', 'limits']);
