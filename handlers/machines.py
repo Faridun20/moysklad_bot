@@ -61,7 +61,7 @@ router = Router()
 def _money(cents: int | None, currency: str = "USD") -> str:
     if not cents:
         return "—"
-    return f"{money.format_cents(int(cents), decimals=0, sep=' ')} {currency}"
+    return f"{money.format_cents(int(cents), decimals=0, sep=' ')} {esc(currency)}"
 
 
 def format_machine(m: dict, *, photos: int = 0) -> str:

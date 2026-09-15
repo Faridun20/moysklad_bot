@@ -179,6 +179,19 @@ async def _audit(user_id: int, full_name: str, action: str, details: str) -> Non
     await asyncio.to_thread(add_audit_log, user_id, full_name, role, action, details)
 
 
+def currency_error(currency: Any) -> str:
+    """Валюта техники — только из `config.ALLOWED_CURRENCIES`. Пустая строка — ок.
+
+    Без белого списка в карточку/сделку уезжала любая строка (в том числе
+    разметка), а курс для неё не находился и потолок суммы не проверялся."""
+    from config import ALLOWED_CURRENCIES
+
+    allowed = [c.upper() for c in ALLOWED_CURRENCIES]
+    if str(currency or "").strip().upper() in allowed:
+        return ""
+    return f"Валюта не поддерживается — выберите {' или '.join(allowed)}"
+
+
 async def _validate_cents(
     value: int | None, label: str, currency: str | None = None
 ) -> tuple[bool, str]:
@@ -225,6 +238,9 @@ async def create_machine(
         return {"ok": False, "error": "Название обязательно"}
     if status not in STATUSES:
         return {"ok": False, "error": f"Неизвестный статус: {status}"}
+    cur_err = currency_error(currency)
+    if cur_err:
+        return {"ok": False, "error": cur_err}
     for value, label in ((price_cents, "Цена"), (cost_cents, "Себестоимость")):
         ok, err = await _validate_cents(value, label, currency)
         if not ok:
@@ -345,6 +361,11 @@ async def update_machine_fields(
         return {"ok": False, "error": f"Нельзя менять поля: {', '.join(sorted(unknown))}"}
     if not fields:
         return {"ok": False, "error": "Нечего менять"}
+    if "currency" in fields:
+        cur_err = currency_error(fields["currency"])
+        if cur_err:
+            return {"ok": False, "error": cur_err}
+        fields["currency"] = str(fields["currency"]).strip().upper()
     money_keys = [k for k in ("price_cents", "cost_cents") if k in fields]
     currency = fields.get("currency")
     if money_keys and not currency:
@@ -1200,6 +1221,9 @@ async def prepare_deal(
     строка — всё в порядке."""
     if kind not in DEAL_KINDS:
         return f"Тип сделки: {' / '.join(DEAL_KINDS)}"
+    cur_err = currency_error(currency)
+    if cur_err:
+        return cur_err
     ok, err = await _validate_cents(price_cents, "Цена", currency)
     if not ok:
         return err

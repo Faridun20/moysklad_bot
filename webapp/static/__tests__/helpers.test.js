@@ -452,6 +452,11 @@ describe('formatMoney (UI-WP-05)', () => {
   // Нам важна группировка, а не кодпойнт пробела, — нормализуем.
   const norm = (s) => String(s).replace(/[  ]/g, ' ');
 
+  it('валюту экранирует: результат вставляют в innerHTML, а строка пришла с сервера', () => {
+    expect(norm(formatMoney(5, '<img src=x onerror=alert(1)>'))).toBe('5 &lt;img src=x onerror=alert(1)&gt;');
+    expect(norm(formatMoney(5, 'UZS'))).toBe('5 UZS');
+  });
+
   it('форматирует тысячи по-русски и клеит валюту через пробел', () => {
     expect(norm(formatMoney(1234567, 'USD'))).toBe('1 234 567 USD');
   });

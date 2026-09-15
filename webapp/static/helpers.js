@@ -559,7 +559,8 @@
     const text = whole
       ? Math.round(cents / 100).toLocaleString('ru-RU')
       : (cents / 100).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    return currency ? `${text} ${currency}` : text;
+    // Валюта — строка с сервера, а результат вставляют в innerHTML: экранируем.
+    return currency ? `${text} ${escapeHtml(String(currency))}` : text;
   }
 
   // Склонение по числу: plural(1, ['клиент', 'клиента', 'клиентов']) → «1 клиент».

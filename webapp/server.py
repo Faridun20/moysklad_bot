@@ -4200,6 +4200,10 @@ async def api_machines_update(request: Request):
     # VIN правится отдельной функцией сервиса: у него нормализация и проверка
     # уникальности, которых нет у остальных полей. Делаем это ДО прочих правок —
     # если серийник занят, карточка не должна остаться частично изменённой.
+    # Валюту проверяем ДО смены VIN: иначе отказ по валюте оставил бы карточку
+    # изменённой наполовину (сервис повторит проверку сам).
+    if "currency" in raw and machines.currency_error(raw.get("currency")):
+        raise HTTPException(status_code=400, detail=machines.currency_error(raw.get("currency")))
     if "vin" in raw:
         vin_res = await machines.change_vin(
             machine_id, str(raw.pop("vin") or ""),
@@ -7692,6 +7696,9 @@ async def api_wh_invoice_create(request: Request):
     counterparty_id = data.get("counterparty_id")
     if inv_type == "outgoing" and not counterparty_id:
         raise HTTPException(status_code=400, detail="Для расхода нужен контрагент")
+    currency_err = warehouse.invoice_currency_error(data.get("currency") or BASE_CURRENCY)
+    if currency_err:
+        raise HTTPException(status_code=400, detail=currency_err)
 
     # Цена прихода = закупочная = себестоимость (`costing.COST_ROLES`). Кто её
     # не видит, тот её и не задаёт: иначе менеджер вписал бы цену партии, и

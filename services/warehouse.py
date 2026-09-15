@@ -371,6 +371,19 @@ async def create_invoice_in(
     }
 
 
+def invoice_currency_error(currency: str | None) -> str:
+    """Валюта накладной из формы — только `config.ALLOWED_CURRENCIES`. Пусто — ок.
+
+    Внутренние проводки (`create_invoice_in`: отгрузка, контейнер) берут валюту
+    из своих документов и сюда не ходят."""
+    from config import ALLOWED_CURRENCIES
+
+    allowed = [c.upper() for c in ALLOWED_CURRENCIES]
+    if str(currency or "").strip().upper() in allowed:
+        return ""
+    return f"Валюта не поддерживается — выберите {' или '.join(allowed)}"
+
+
 async def create_invoice(
     *,
     invoice_type: str,
@@ -390,6 +403,10 @@ async def create_invoice(
     либо {"ok": False, "code", "reason"} — во втором случае в БД не изменилось
     ничего, включая счётчик номеров.
     """
+    currency_err = invoice_currency_error(currency)
+    if currency_err:
+        return {"ok": False, "code": "bad_currency", "reason": currency_err, "details": {}}
+    currency = str(currency).strip().upper()
     try:
         async with adb_core.transaction() as txn:
             return await create_invoice_in(

@@ -243,6 +243,9 @@ async def _validate(
     if not (buyer_name or "").strip():
         return "Покупатель обязателен"
     if kind == "reserve":
+        cur_err = machines.currency_error(currency)
+        if cur_err:
+            return cur_err
         # Цена у брони необязательна: бронируют машину, а не условия.
         ok, err = await machines._validate_cents(price_cents, "Цена", currency)
         return "" if ok else err
