@@ -479,6 +479,24 @@ def test_reserve_pdf_path_is_unique_within_one_second(tmp_path, monkeypatch):
     assert paths[1].name == "tilxat_uz_X_2026-09-15_100000_2.pdf"
 
 
+def test_reserve_pdf_path_long_cyrillic_name_fits_255_bytes(tmp_path):
+    """Длинное ФИО кириллицей (2 байта на букву) давало ENAMETOOLONG вместо
+    документа. Имя режется по байтам, символ пополам не рвётся."""
+    long_name = ld._safe_name("Ёлкина-Абдурахмановна " * 30)
+    paths = [ld._reserve_pdf_path(tmp_path, "raspiska_ru_uz", long_name) for _ in range(2)]
+    for p in paths:
+        assert p.is_file()
+        assert len(p.name.encode("utf-8")) <= 255
+        p.name.encode("utf-8").decode("utf-8")  # целые символы
+    assert paths[0].name.startswith("raspiska_ru_uz_Ёлкина")
+    assert paths[0] != paths[1]
+
+
+def test_truncate_utf8_does_not_split_a_character():
+    assert ld._truncate_utf8("ЖЖЖ", 5) == "ЖЖ"
+    assert ld._truncate_utf8("abc", 10) == "abc"
+
+
 def test_libreoffice_stderr_goes_to_log_not_to_user(tmp_path, monkeypatch, caplog):
     """stderr LibreOffice уезжал в текст ошибки формы — пути /tmp и английская
     диагностика. Теперь он в логе, человеку — короткая фраза."""

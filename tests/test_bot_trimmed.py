@@ -365,3 +365,13 @@ def test_webapp_keyboard_opens_screen(monkeypatch):
     assert markup.inline_keyboard[0][0].web_app.url == "https://app.example.org/?startapp=decisions"
     plain = ui.webapp_keyboard(menu=False)
     assert plain.inline_keyboard[0][0].web_app.url == "https://app.example.org/"
+
+
+def test_welcome_text_escapes_first_name():
+    """Имя в Telegram задаёт сам пользователь — в HTML-приветствие только через esc."""
+    from handlers.start import get_welcome_text
+
+    for role in ("guest", "manager"):
+        text = get_welcome_text(role, "<b>Ali</b> & <i>")
+        assert "&lt;b&gt;Ali&lt;/b&gt; &amp; &lt;i&gt;" in text
+        assert "<i>Ali" not in text

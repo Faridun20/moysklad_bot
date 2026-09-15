@@ -241,6 +241,17 @@ def _safe_name(value: str) -> str:
     return keep.replace(" ", "_") or "document"
 
 
+_NAME_MAX_BYTES = 255
+
+
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    """Строка не длиннее `max_bytes` байт UTF-8, без обрезанного символа."""
+    raw = value.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return value
+    return raw[:max_bytes].decode("utf-8", errors="ignore")
+
+
 def _reserve_pdf_path(out_dir: Path, doc_type: str, name: str) -> Path:
     """Занять уникальное имя файла PDF и вернуть путь.
 
@@ -252,7 +263,13 @@ def _reserve_pdf_path(out_dir: Path, doc_type: str, name: str) -> Path:
     даже в одну и ту же секунду. Имя остаётся читаемым: его видит человек в
     Telegram (read_pdf отдаёт path.name).
     """
-    base = f"{doc_type}_{name}_{datetime.now():%Y-%m-%d_%H%M%S}"
+    stamp = f"{datetime.now():%Y-%m-%d_%H%M%S}"
+    # Имя файла в ext4/overlayfs — не больше 255 БАЙТ. Кириллица — 2 байта на
+    # букву, и длинное ФИО давало OSError(ENAMETOOLONG) вместо документа.
+    # Режем ФИО по байтам UTF-8 (не посреди символа), запас — под суффикс «_999.pdf».
+    budget = _NAME_MAX_BYTES - len(f"{doc_type}__{stamp}_999.pdf".encode())
+    name = _truncate_utf8(name, max(budget, 0)).rstrip("_") or "document"
+    base = f"{doc_type}_{name}_{stamp}"
     for n in range(1, 1000):
         candidate = out_dir / (f"{base}.pdf" if n == 1 else f"{base}_{n}.pdf")
         try:

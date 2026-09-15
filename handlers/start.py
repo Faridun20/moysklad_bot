@@ -184,8 +184,12 @@ def get_welcome_text(role: str, first_name: str = "") -> str:
     для срочного/admin-only. Без длинного списка команд (он висит
     в /-автокомплите Telegram через set_my_commands).
     """
+    from utils.helpers import esc
+
     role_name = ROLE_NAMES.get(role, "👤 Сотрудник")
-    name_part = f", <b>{first_name}</b>" if first_name else ""
+    # Имя задаёт сам пользователь Telegram: «<b>» в нём ломал разметку
+    # приветствия (parse_mode=HTML), а сообщение не уходило вовсе.
+    name_part = f", <b>{esc(first_name)}</b>" if first_name else ""
     if role == "guest":
         return (
             f"👋 Здравствуйте{name_part}!\n\n"
