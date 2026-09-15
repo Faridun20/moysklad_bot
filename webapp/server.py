@@ -355,20 +355,36 @@ async def _metrics_middleware(request: Request, call_next):
 app.add_middleware(_BodySizeLimitMiddleware, max_bytes=MAX_BODY_BYTES)
 
 
+# Версионированный ассет (`?v=<SHA>` из index.html) неизменен по построению:
+# новая сборка — новый URL. Его можно хранить год и не перепроверять
+# (`immutable` снимает даже revalidate при pull-to-refresh). Прежний
+# `max-age=86400` без immutable заставлял WebView раз в сутки тянуть app.js
+# (~140 КБ) заново при том же коммите.
+STATIC_IMMUTABLE = "public, max-age=31536000, immutable"
+# Всё, что без версии или с ЧУЖОЙ версией, — только с проверкой свежести.
+# Чужая версия — это старая вкладка после деплоя: ей отдаётся уже НОВЫЙ файл,
+# и закрепить его на год под старым URL значит отравить кэш на случай отката
+# на тот коммит. Сам index.html (и по «/», и по /static/index.html) — тоже
+# no-cache: он и есть носитель версии.
+STATIC_REVALIDATE = "no-cache"
+
+
 class CachedStaticFiles(StaticFiles):
-    """StaticFiles + Cache-Control: пусть браузер хранит CSS/JS сутки."""
+    """StaticFiles + Cache-Control по версии в query (`?v=`)."""
 
-    def __init__(self, *args, max_age: int = 86400, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._cache_header = f"public, max-age={max_age}"
+    def file_response(self, full_path, stat_result, scope, status_code=200):
+        resp = super().file_response(full_path, stat_result, scope, status_code)
+        from urllib.parse import parse_qs
 
-    def file_response(self, *args, **kwargs):
-        resp = super().file_response(*args, **kwargs)
-        resp.headers.setdefault("Cache-Control", self._cache_header)
+        query = parse_qs((scope.get("query_string") or b"").decode("latin-1"))
+        versioned = bool(APP_VERSION) and APP_VERSION in query.get("v", [])
+        is_html = str(full_path).endswith(".html")
+        resp.headers["Cache-Control"] = (
+            STATIC_IMMUTABLE if versioned and not is_html else STATIC_REVALIDATE
+        )
         return resp
 
 
-# Раздаём статику (CSS, JS) с кэшированием на сутки
 app.mount("/static", CachedStaticFiles(directory=STATIC_DIR), name="static")
 
 
