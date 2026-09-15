@@ -264,7 +264,11 @@ Y» (`remaining_after_pending` = остаток − ждущее; `overpending` 
   курса → считаем «сразу», а не молчим). Единая точка решения —
   `services.notify_policy.should_notify_now(kind, amount, currency)`: КАЖДОЕ
   место, которое шлёт боссу пуш (`services/notify.py`, `handlers/returns.py`,
-  `handlers/deposits.py`, `webapp/server.py`), проверяет её ПЕРЕД отправкой.
+  `handlers/deposits.py`, `webapp/server.py`, карточка сделки по технике
+  `machine_deal_requests.notify_decision_card` — `MACHINE_DEAL_APPROVAL`, всегда
+  «сразу»), проверяет её ПЕРЕД отправкой. У возврата и сдачи получателей двое:
+  кладовщик/бухгалтер (или менеджер-заместитель) получают карточку ВСЕГДА, копия
+  admin/boss — по порогу.
   Событие ниже порога карточкой не идёт — остаётся `pending` в своей таблице
   (`payments`/`cash_deposits`/`returns`) и попадает в вечерний дайджест
   (`services.boss_digest`, cron `tasks/run_boss_digest.py`, время —
@@ -274,8 +278,10 @@ Y» (`remaining_after_pending` = остаток − ждущее; `overpending` 
   из выборки. Идемпотентность самого дайджеста (не более раза в день) —
   метка `app_settings.boss_digest_last_run_at`, пишется ПОСЛЕ отправки (как у
   `cash_deposit_reminder_time`: пропущенный прогон не «съедает» дайджест дня,
-  ретрай может продублировать). Менеджерские уведомления (об исходе СВОЕЙ
-  заявки/платежа) политика не трогает.
+  ретрай может продублировать). Кнопка дайджеста — канонический deep link
+  «Решений» (`utils.keyboards.webapp_screen_url(DECISIONS_SCREEN)`,
+  `?startapp=decisions`), своих адресов не собирать. Менеджерские уведомления
+  (об исходе СВОЕЙ заявки/платежа) политика не трогает.
 
 **Telegram + WebApp:**
 - Пользовательский ввод в HTML → `utils.helpers.esc()`. Никогда не интерполируй `full_name` / `comment` / `agent_name` / `details` напрямую в `parse_mode="HTML"`.
@@ -553,15 +559,24 @@ tg_file_id — нет). VIN нормализуется (upper, без пробе
   следующую.
 - CHECK вида/статуса/режима и «одобренная продажа ссылается на сделку» —
   `scripts/apply_constraints` (значения из модуля), FK — в DDL, как у всей
-  техники. Группа решений во фронте — `renderMachineDealDecisions(container)`.
+  техники. Во фронте заявки — группа `machine_deals` экрана «Решения»
+  (`registerDecisionGroup`, карточки `machineRequestCardHtml`/
+  `wireMachineRequestActions`), пункт `machine_deals` очереди «Сегодня»
+  руководителя (`work_queue`, адрес `decisions` → общий бейдж) и список над
+  «Складом → Техникой» (`renderMachineDealDecisions`). Кнопки решения
+  (одобрить/отклонить/на доработку) — по `can_decide` и за «Рабочие действия»
+  НЕ прячутся; оформление брони/продажи/рассрочки, поступления и снятие брони —
+  работа, у руководства за выключателем.
 
 **Удаление — выключатель `app_settings.delete_requires_boss`** (по умолчанию
 выкл.: «пока может и менеджер, в будущем только руководитель»). Одна проверка
 `server._require_delete_right` на все ручки удаления (`/api/machines/delete`,
-отмена накладной `/api/wh/invoices/cancel`); флаг едет в `/api/me`, фронт
-прячет кнопки через `canDeleteRecords()`/`can_delete`. Переключает руководство
-(`/api/settings/delete_requires_boss`, аудит `setting_changed`; кнопка — внизу
-«Склад → Техника»). Ручки удаления ТОВАРА в проекте нет — появится, звать тот
+отмена накладной `/api/wh/invoices/cancel`); флаг едет в `/api/me` (один
+источник — `server._delete_requires_boss`), фронт прячет кнопки ОДНИМ
+`deleteActionsVisible()` (+ `can_delete` карточки / `canCall` ручки).
+Переключает руководство выключателем «Удаление — только руководитель» в
+«Настройках» рядом с «Рабочими действиями» (`deleteSwitchHtml`,
+`/api/settings/delete_requires_boss`, аудит `setting_changed`). Ручки удаления ТОВАРА в проекте нет — появится, звать тот
 же `_require_delete_right`.
 
 **Рассрочка: план и факт — разные вещи.** График (`machine_deal_payments`) это
@@ -1268,16 +1283,19 @@ admin/boss порядок разделов свой (`BOSS_NAV_ORDER`): пане
 `user_prefs` (`services/user_prefs.py`), `/api/me → prefs`, `/api/prefs/set`
 (admin/boss, аудит `pref_set`); ручки её не читают. Удаление — контроль:
 `deleteActionsVisible()` — руководству всегда, менеджеру пока
-`delete_requires_boss` (из `/api/me`, нет поля — выкл.) не включена; кнопка
-удаления машины/контейнера смотрит `can_delete` карточки, пока его нет —
-`can_manage`. **«Решения»** (`renderDecisionsScreen`) — все подтверждения
+`delete_requires_boss` (из `/api/me`, нет поля — выкл.; выключатель — в
+«Настройках») не включена; кнопка удаления машины/контейнера смотрит
+`can_delete` карточки, пока его нет — `can_manage`. Решение по чужой заявке
+(сделка по технике: одобрить/отклонить/на доработку) — тоже не работа, видно
+всегда. **«Решения»** (`renderDecisionsScreen`) — все подтверждения
 руководства одним экраном с общим бейджем на панели (`setDecisionsBadge`;
 «Сегодня» считает его по пунктам очереди с `screen: "decisions"`). Экран
 собирается из провайдеров `DECISION_GROUPS` — новый вид решения подключается
 `registerDecisionGroup({key, title, icon, path+listKey | load, html, wire})`,
 сам экран не правится; карточки и проводка подтверждений общие с «Деньги →
 Подтвердить» (`depositCardsHtml`/`returnCardsHtml`/`paymentCardsHtml`/
-`wireConfirmCards`, заявки — `requestCardsHtml`/`wireRequestCards`). Старые
+`wireConfirmCards`, заявки — `requestCardsHtml`/`wireRequestCards`; сделки по
+технике — группа `machine_deals`, см. «Сделки по технике — через одобрение»). Старые
 адреса `money:confirm` и `requests` у руководства ведёт в «Решения»
 `resolveScreen`, у остальных `decisions` — в «Подтвердить». **Deep link:**
 `?startapp=decisions` (web_app-кнопка — `utils.keyboards.webapp_screen_url` /
