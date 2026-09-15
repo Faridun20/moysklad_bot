@@ -487,7 +487,7 @@ def test_archive_cli_reads_setting_and_reports(isolated_db, monkeypatch):
 
     db = isolated_db
     _setup_roles(db)
-    monkeypatch.setattr(run_machines_archive, "init_db", lambda: None)
+    monkeypatch.setattr(run_machines_archive, "ensure_schema", lambda: None)
 
     captured = {}
 
@@ -509,7 +509,7 @@ def test_archive_cli_returns_nonzero_on_failure(isolated_db, monkeypatch):
     """Cron-раннер должен увидеть провал: молчаливый успех спрячет поломку."""
     from tasks import run_machines_archive
 
-    monkeypatch.setattr(run_machines_archive, "init_db", lambda: None)
+    monkeypatch.setattr(run_machines_archive, "ensure_schema", lambda: None)
     monkeypatch.setattr(run_machines_archive, "get_setting", lambda *_a: 90)
 
     async def _boom(days=90):

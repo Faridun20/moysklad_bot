@@ -16,7 +16,7 @@ import sys
 
 from services.database import (
     get_setting,
-    init_db,
+    ensure_schema,
     prune_audit_log,
     prune_idempotency_keys,
 )
@@ -26,7 +26,7 @@ logger = logging.getLogger("maintenance")
 
 
 def main() -> int:
-    init_db()
+    ensure_schema()
     try:
         audit_months = int(get_setting("audit_log_retention_months", 6))
 

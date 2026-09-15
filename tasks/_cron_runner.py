@@ -45,7 +45,7 @@ def run_cron(task_name: str, main: CronMain, *args: Any, **kwargs: Any) -> int:
     # Импортируем тут, не на module-level: tasks/_cron_runner.py может
     # быть импортирован в тестах ДО init_db, не хочется тащить тяжёлые
     # зависимости (psycopg2 pool init) если cron не запускается.
-    from services.database import init_db, record_cron_run
+    from services.database import ensure_schema, record_cron_run
 
     started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     t0 = time.monotonic()
@@ -62,12 +62,16 @@ def run_cron(task_name: str, main: CronMain, *args: Any, **kwargs: Any) -> int:
         err = f"{type(e).__name__}: {e}"[:1000]
         rc = 1
     finally:
-        # Гарантируем init_db перед записью — main() мог упасть ДО своего
+        # Гарантируем схему перед записью — main() мог упасть ДО своего
         # init_db, или его вообще не делать (некоторые CLI полагаются на
-        # уже-проинициализированную БД). Если init_db сам бросает —
-        # глотаем, чтобы не маскировать оригинальный exception.
+        # уже-проинициализированную БД). `ensure_schema()`, а не голый
+        # `init_db()`: схему на проде поднимает `python -m tasks.migrate`
+        # ДО старта, и гонять ~100 `CREATE INDEX IF NOT EXISTS` на каждый
+        # cron-тик просто «на всякий случай» — лишние SHARE-локи (см.
+        # `database.ensure_schema`). Если проверка сама бросает — глотаем,
+        # чтобы не маскировать оригинальный exception.
         try:
-            init_db()
+            ensure_schema()
             record_cron_run(
                 task_name=task_name,
                 status="ok" if rc == 0 else "failed",

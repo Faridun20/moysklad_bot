@@ -73,12 +73,41 @@ def webapp_reply_markup() -> dict | None:
 _LAST_RUN_KEY = "boss_digest_last_run_at"
 
 
+_DEFAULT_DIGEST_TIME = (19, 0)
+
+
 def _parse_hhmm(raw: str) -> tuple[int, int]:
+    """Разобрать «HH:MM» → (час, минута), с фолбэком на дефолт 19:00.
+
+    Отклоняем и логируем WARNING:
+      * мусор, который не разбирается на два int'а («не время», «10:-5» —
+        `int("-5")` парсится, но час/минута ниже проверяются на диапазон);
+      * час/минуту вне суток (»25:00» — `is_due()` сравнивает
+        `(now.hour, now.minute) < (hh, mm)`: у суток нет часа 25, сравнение
+        истинно всегда, и дайджест не выходит НИКОГДА);
+      * время позже 23:45 — крон тикает по :00/:15/:30/:45
+        (`docker-compose.yml`, «каждые 15 минут»), и позже 23:45 нет ни
+        одного тика в пределах ТОГО ЖЕ дня: `is_due()` либо не сработает
+        вовсе (следующий тик — уже полночь следующих суток), либо сработает
+        помеченным неверной датой.
+    """
     try:
-        h, m = str(raw or "19:00").split(":")
-        return int(h), int(m)
+        h_str, m_str = str(raw or "19:00").split(":")
+        h, m = int(h_str), int(m_str)
     except (TypeError, ValueError):
-        return 19, 0
+        logger.warning(
+            "boss_digest_time=%r — не HH:MM, использую дефолт %02d:%02d",
+            raw, *_DEFAULT_DIGEST_TIME,
+        )
+        return _DEFAULT_DIGEST_TIME
+    if not (0 <= h <= 23 and 0 <= m <= 59) or (h, m) > (23, 45):
+        logger.warning(
+            "boss_digest_time=%r — вне суток или позже 23:45 (крон тикает по "
+            ":00/:15/:30/:45), использую дефолт %02d:%02d",
+            raw, *_DEFAULT_DIGEST_TIME,
+        )
+        return _DEFAULT_DIGEST_TIME
+    return h, m
 
 
 def digest_time_hhmm() -> tuple[int, int]:
@@ -147,7 +176,9 @@ async def gather() -> dict:
     confirmed_recent = await db.get_confirmed_payments_since(since)
 
     dep_currency = await order_payments.deposit_currency([int(d["id"]) for d in deposits_all])
-    parts = await order_payments.parts_by_payment([int(p["id"]) for p in payments_all])
+    parts = await order_payments.parts_by_payment(
+        [int(p["id"]) for p in payments_all] + [int(p["id"]) for p in confirmed_recent]
+    )
 
     def _payment_currency(row: dict) -> str:
         return (row.get("currency") or "USD").upper()
@@ -155,58 +186,95 @@ async def gather() -> dict:
     def _deposit_currency(row: dict) -> str:
         return dep_currency.get(int(row["id"]), "USD")
 
+    def _return_currency(row: dict) -> str:
+        # total_amount — в валюте ЗАКАЗА (order_items.price_cents), не всегда
+        # USD: get_pending_returns() отдаёт её LEFT JOIN'ом (WP-07-style).
+        return (row.get("order_currency") or "USD").upper()
+
+    def _is_cash_part(payment_id) -> bool:
+        part = parts.get(int(payment_id))
+        return bool(part) and part.get("method") == "cash"
+
+    # Наличная строка разбивки подтверждается СДАЧЕЙ, а не кнопкой
+    # подтверждения (см. CLAUDE.md, «Оплата заказа», п.5) — эти деньги
+    # считаются в блоке «Сдачи», как и в `services.database.get_money_totals`
+    # (тот же `NOT EXISTS (... method = 'cash')`). Не отфильтровать её здесь
+    # значило бы посчитать одни и те же наличные дважды: и «Платежи на
+    # подтверждение»/«Получено», и «Сдачи».
+    payments_all = [p for p in payments_all if not _is_cash_part(p["id"])]
+    confirmed_recent = [p for p in confirmed_recent if not _is_cash_part(p["id"])]
+
     def _digest_only(rows: list[dict], kind: str, cur_of, amount_key: str = "amount") -> list[dict]:
         return [
             r for r in rows
             if not policy.should_notify_now(kind, r.get(amount_key), cur_of(r))
         ]
 
-    payments_digest = _digest_only(payments_all, policy.PAYMENT, _payment_currency)
-    deposits_digest = _digest_only(deposits_all, policy.CASH_DEPOSIT, _deposit_currency)
-    returns_digest = _digest_only(
-        returns_all, policy.RETURN, lambda r: "USD", amount_key="total_amount"
-    )
+    def _marked(rows: list[dict], kind: str, cur_of, amount_key: str = "amount") -> list[tuple]:
+        """Не фильтруем «ниже порога», а ПОМЕЧАЕМ (финдинг #6, аудит).
+
+        Раньше дайджест держал только то, для чего ТЕКУЩИЙ (на момент
+        прогона) порог/курс говорит «ниже» — остальное считалось «уже ушло
+        мгновенной карточкой» и молча выбрасывалось. Но решение «слать
+        сразу» принимается ОДИН раз, в момент события, по порогу/курсу ТОГО
+        момента. Владелец может поменять `boss_instant_threshold_usd` (или
+        курс валюты) ПОСЛЕ того, как событие осталось pending ниже старого
+        порога, но ДО прогона дайджеста — событие тогда не уходило карточкой
+        (порог был выше на момент создания) и пере-фильтровкой по новому
+        порогу выпадало из дайджеста тоже: пропадало насовсем, не карточкой,
+        не сводкой. Простое и надёжное правило — показывать ВСЁ ждущее,
+        помечая «уже приходило» то, что СЕЙЧАС выглядит выше порога (в
+        обычном случае это и есть уже отправленное; ложная метка — не
+        потеря, просто лишнее «уже видели» в сообщении)."""
+        return [
+            (r, policy.should_notify_now(kind, r.get(amount_key), cur_of(r)))
+            for r in rows
+        ]
+
+    payments_marked = _marked(payments_all, policy.PAYMENT, _payment_currency)
+    deposits_marked = _marked(deposits_all, policy.CASH_DEPOSIT, _deposit_currency)
+    returns_marked = _marked(returns_all, policy.RETURN, _return_currency, amount_key="total_amount")
     received_digest = _digest_only(confirmed_recent, policy.PAYMENT, _payment_currency)
 
-    def _payment_line(p: dict) -> str:
+    def _payment_line(p: dict, already: bool = False) -> str:
         part = parts.get(int(p["id"]))
         # Карта/счёт — «на карту •••• 1234 (Фаридун М.)»: руководитель сверяет
         # банк по этой строке, способ без получателя ему ничего не говорит.
         method = (part.get("account_label") or order_payments.METHODS.get(part["method"], "—")) \
             if part else "без способа"
         order = f" · заказ #{p['order_id']}" if p.get("order_id") else ""
+        tail = " · уже приходило" if already else ""
         return (
             f"{p.get('full_name') or p.get('user_id')} — "
-            f"{p['amount']:,.0f} {_payment_currency(p)} ({method}){order}"
+            f"{p['amount']:,.0f} {_payment_currency(p)} ({method}){order}{tail}"
         ).replace(",", " ")
 
-    def _deposit_line(d: dict) -> str:
-        return f"#{d['id']} — {d['amount']:,.0f} {_deposit_currency(d)}".replace(",", " ")
+    def _deposit_line(d: dict, already: bool = False) -> str:
+        tail = " · уже приходило" if already else ""
+        return f"#{d['id']} — {d['amount']:,.0f} {_deposit_currency(d)}{tail}".replace(",", " ")
 
-    def _return_line(r: dict) -> str:
-        return f"#{r['id']} · заказ #{r['order_id']} — {r['total_amount']:,.0f} USD".replace(",", " ")
+    def _return_line(r: dict, already: bool = False) -> str:
+        tail = " · уже приходило" if already else ""
+        return (
+            f"#{r['id']} · заказ #{r['order_id']} — {r['total_amount']:,.0f} "
+            f"{_return_currency(r)}{tail}"
+        ).replace(",", " ")
+
+    def _block(marked: list[tuple], line_fn) -> dict:
+        n = len(marked)
+        return {
+            "count": n,
+            "waiting_total": n,
+            "lines": [line_fn(row, already) for row, already in marked[:_ITEM_CAP]],
+            "rest": max(0, n - _ITEM_CAP),
+        }
 
     return {
         "since": since,
         "until": now.strftime("%Y-%m-%d %H:%M"),
-        "payments": {
-            "count": len(payments_digest),
-            "waiting_total": len(payments_all),
-            "lines": [_payment_line(p) for p in payments_digest[:_ITEM_CAP]],
-            "rest": max(0, len(payments_digest) - _ITEM_CAP),
-        },
-        "deposits": {
-            "count": len(deposits_digest),
-            "waiting_total": len(deposits_all),
-            "lines": [_deposit_line(d) for d in deposits_digest[:_ITEM_CAP]],
-            "rest": max(0, len(deposits_digest) - _ITEM_CAP),
-        },
-        "returns": {
-            "count": len(returns_digest),
-            "waiting_total": len(returns_all),
-            "lines": [_return_line(r) for r in returns_digest[:_ITEM_CAP]],
-            "rest": max(0, len(returns_digest) - _ITEM_CAP),
-        },
+        "payments": _block(payments_marked, _payment_line),
+        "deposits": _block(deposits_marked, _deposit_line),
+        "returns": _block(returns_marked, _return_line),
         "received": {
             "count": len(received_digest),
             "by_currency": _sum_by_currency(received_digest),
@@ -329,9 +397,13 @@ def build_text(data: dict) -> str:
 
 
 async def send_report(chat_id: int, data: dict) -> str:
-    """Отправить дайджест. Возвращает «rich» или «text» — что реально ушло.
+    """Отправить дайджест. Возвращает «rich»/«text» — что реально ушло, или
+    «failed» — ни один канал не доставил сообщение (Rich упал, а текстовый
+    фолбэк `tg_send_message` вернул False — Telegram недоступен целиком).
     Тот же фолбэк-контракт, что у `money_report.send_report`: Rich Message —
-    надстройка, при любой ошибке уходим на текст."""
+    надстройка, при любой ошибке уходим на текст. Вызывающий (`tasks.
+    run_boss_digest`) обязан отметить `mark_run` только при реальной
+    доставке — «failed» здесь не должно приводить к «дайджест дня ушёл»."""
     from webapp.server import get_notify_bot
 
     try:
@@ -352,5 +424,8 @@ async def send_report(chat_id: int, data: dict) -> str:
 
     from services.notifier import tg_send_message
 
-    await tg_send_message(chat_id, build_text(data), reply_markup=webapp_reply_markup())
+    ok = await tg_send_message(chat_id, build_text(data), reply_markup=webapp_reply_markup())
+    if not ok:
+        logger.error("boss_digest: текстовый фолбэк тоже не доставлен chat_id=%s", chat_id)
+        return "failed"
     return "text"

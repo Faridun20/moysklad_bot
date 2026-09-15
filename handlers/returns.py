@@ -101,18 +101,24 @@ async def _notify_confirmers(bot: Bot, return_id, order_id, total, refund):
     карточка не идёт, возврат остаётся pending и попадает в вечерний
     дайджест (services.boss_digest) — решение по-прежнему видно в WebApp.
     """
+    # `total` — сумма возврата в валюте ЗАКАЗА (services.database.create_return
+    # считает её из order_items.price_cents), а не всегда USD: хардкод "USD"
+    # здесь сравнивал бы курицу с яйцами — 6000 сум мимо порога считались бы
+    # как $6000 и улетали боссу мгновенной карточкой вместо ~$0.47.
+    order = await adb.get_order(order_id)
+    currency = (order or {}).get("currency") or "USD"
+
     users = await adb.get_all_users()
     warehouse_recipients = notify_recipients(users, ("warehouse_keeper",))
     recipients = list(warehouse_recipients)
-    # Сумма отображается в USD (см. _fmt ниже) — той же валюты держится порог.
-    if should_notify_now(RETURN, total, "USD"):
+    if should_notify_now(RETURN, total, currency):
         boss_recipients = notify_recipients(users, ("admin", "boss"))
         recipients += [uid for uid in boss_recipients if uid not in recipients]
     if not recipients:
         return
     text = (
         f"{DIV}\n↩️ <b>Возврат #{return_id}</b> · заказ #{order_id}\n"
-        f"💰 {_fmt(total)} USD · {_REFUND_LABELS.get(refund, refund)}"
+        f"💰 {_fmt(total)} {currency} · {_REFUND_LABELS.get(refund, refund)}"
     )
     for uid in recipients:
         try:

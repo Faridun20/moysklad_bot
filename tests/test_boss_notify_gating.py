@@ -126,6 +126,37 @@ def test_return_confirmers_fires_at_or_above_threshold(isolated_db):
     assert sorted(bot.sent) == [1, 2]
 
 
+def test_return_confirmers_uses_order_currency_for_threshold(isolated_db):
+    """Сумма возврата отображается и сравнивается с порогом в валюте ЗАКАЗА,
+    а не всегда как USD (аудит, финдинг #5): хардкод "USD" считал 6000 сум
+    как $6000 (порог $5000 — «сразу»), хотя реально это ~$0.47 — боссу
+    улетала мгновенная карточка по возврату на копейки, вместо того чтобы
+    тихо остаться pending и попасть в вечерний дайджест."""
+    from handlers.returns import _notify_confirmers
+
+    db = isolated_db
+    db.set_role(1, "b", "Boss", "boss")
+    db.set_role(2, "m", "Manager", "manager")
+    assert db.set_currency_rate("UZS", 1 / 12700, updated_by=1)[0]
+
+    oid = db.create_order(2, "Manager", "")
+    assert db.update_order_currency(oid, "UZS", require_draft=True)
+    db.update_order_agent(oid, "A-1", "Клиент")
+    db.add_order_item(oid, "Товар", "", 1, "шт", 6000.0)
+    db.update_order_status(oid, "shipped")
+    items = _run(db.get_order_items(oid))
+    r = _run(db.create_return(
+        oid, "full", "брак", [(items[0]["id"], 1, 6000.0)],
+        refund_method="no_refund", created_by=2,
+    ))
+
+    bot = _Bot()
+    _run(_notify_confirmers(bot, r["return_id"], oid, 6000.0, "no_refund"))
+    # 6000 сум ≈ $0.47 — далеко ниже порога: боссу пуш НЕ идёт, только
+    # менеджер-заместитель кладовщика (кладовщика нет — ROLE_ALSO_ACTS_AS).
+    assert bot.sent == [2]
+
+
 def test_return_confirmers_no_recipients_sends_nothing(isolated_db):
     """Нет ни склада, ни его заместителя, сумма ниже порога — рассылать
     некому: функция не падает и ничего не шлёт."""

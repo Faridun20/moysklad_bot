@@ -183,6 +183,12 @@ def _authorize(
     Используйте вместо того, чтобы дублировать verify_init_data +
     get_role + role-check + rate-limit в каждом endpoint'е (легко забыть).
     """
+    if not isinstance(data, dict):
+        # Тело — валидный JSON, но не объект (`[]`, `"x"`, `42`, `null`):
+        # `.get("initData", ...)` ниже уронил бы AttributeError → общий
+        # 500-обработчик и алерт админам на банально кривой клиент/скан.
+        # Та же причина, что у отсутствующей/просроченной подписи, — 401.
+        raise HTTPException(status_code=401, detail=SESSION_EXPIRED_DETAIL)
     user = _dev_bypass_user() or verify_init_data(data.get("initData", ""))
     if not user:
         # Подпись initData живёт час (webapp/auth.py MAX_INIT_DATA_AGE): чаще
@@ -266,12 +272,23 @@ async def _lifespan(_app):
 app = FastAPI(title="Склад WebApp", lifespan=_lifespan)
 
 
+_BAD_JSON_DETAIL = "Некорректный JSON"
+
+
 @app.exception_handler(Exception)
 async def _unhandled_exception(request: Request, exc: Exception):
     """Необработанная ошибка ручки: клиенту — короткий текст без внутренностей
     (раньше в detail уезжал `str(e)` вплоть до текста SQL), в лог — трасса,
     админам — алерт в Telegram с дросселем (`services.error_alerts`). Алерт
-    уходит фоном: ответ не ждёт сети до Telegram."""
+    уходит фоном: ответ не ждёт сети до Telegram.
+
+    Битое тело запроса (`await request.json()` до `_authorize` — см. ручки)
+    не парсится как JSON и раньше улетало сюда же: 500 клиенту и алерт
+    админам на банально кривой клиент/скан, а не поломку сервиса. Отвечаем
+    400 БЕЗ алерта — единая точка, а не правка всех ручек по отдельности."""
+    if isinstance(exc, json.JSONDecodeError):
+        return JSONResponse({"detail": _BAD_JSON_DETAIL}, status_code=400)
+
     from services import error_alerts
     from utils.background import spawn
 
@@ -479,6 +496,85 @@ app.add_middleware(_AuthCacheWarmMiddleware)
 # Последним — значит самым внешним из пользовательских: лишнее тело режется
 # раньше метрик и gzip.
 app.add_middleware(_BodySizeLimitMiddleware, max_bytes=MAX_BODY_BYTES)
+
+
+# ─── Заголовки безопасности ────────────────────────────────────────────────
+#
+# X-Content-Type-Options/Referrer-Policy — стандартная гигиена. CSP собран под
+# конкретный фронт (index.html + webapp/static/*.js), а не скопирован из
+# шаблона:
+#   * script-src 'unsafe-inline' — ПРОВЕРЕНО НА ЖИВОМ E2E: без него ломаются
+#     все `onclick="…"` (и прочие on*=) в разметке, которую JS-шаблоны
+#     (app.js/helpers.js) вставляют через innerHTML — их в проекте сотни, это
+#     основной способ навешивать обработчики на сгенерированные карточки.
+#     CSP считает атрибут-обработчик «инлайн-скриптом» наравне с <script>, и
+#     без unsafe-inline браузер молча глотает клик — ни ошибки, ни исключения,
+#     только предупреждение в консоли (нашлось на test_hanging_request_ends_
+#     with_retry_instead_of_endless_spinner: «Повторить» переставал работать).
+#     Настоящий инлайн-<script> в проекте действительно не используется — но
+#     unsafe-inline тут защищает не от него, а от чужого <script src=…> с
+#     произвольного хоста, что и остаётся главной целью script-src;
+#     telegram-web-app.js — единственный внешний хост, свои скрипты — 'self';
+#   * style-src 'unsafe-inline' — та же причина: JS-шаблоны вставляют
+#     `style="…"` в innerHTML (не статичная разметка, но те же правила CSP);
+#   * img-src data:/blob: — превью фото (canvas.toDataURL перед base64-
+#     загрузкой) и просмотр фото техники (URL.createObjectURL — файл идёт
+#     через нашу ручку, <img src> с прямой ссылкой Telegram содержал бы токен
+#     бота, см. app.js);
+#   * frame-ancestors — Telegram-клиенты (web.telegram.org и поддомены)
+#     встраивают WebApp в iframe: классический X-Frame-Options: DENY сломал
+#     бы вход целиком, а frame-ancestors — его CSP-замена с точечным списком
+#     разрешённых хостов вместо «вообще никому».
+_CSP = (
+    b"default-src 'self'; "
+    b"script-src 'self' 'unsafe-inline' https://telegram.org; "
+    b"style-src 'self' 'unsafe-inline'; "
+    b"img-src 'self' data: blob:; "
+    b"font-src 'self'; "
+    b"connect-src 'self'; "
+    b"base-uri 'self'; "
+    b"form-action 'self'; "
+    b"frame-ancestors https://web.telegram.org https://*.telegram.org"
+)
+
+_SECURITY_HEADERS = (
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"strict-origin-when-cross-origin"),
+    (b"content-security-policy", _CSP),
+)
+
+
+class _SecurityHeadersMiddleware:
+    """Добавляет заголовки безопасности к КАЖДОМУ HTTP-ответу WebApp.
+
+    Пишем как чистый ASGI (не BaseHTTPMiddleware): только оборачиваем
+    `send`, ничего не читаем и не буферизуем — не мешает стримингу/gzip и не
+    завязано на особенности `call_next` (см. `_BodySizeLimitMiddleware`
+    рядом). НЕ добавляет X-Frame-Options — см. докстринг CSP выше.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers") or [])
+                # Не дублировать: пара ручек (фото техники, кэш статики) уже
+                # ставит X-Content-Type-Options сама — вторая копия склеилась
+                # бы в "nosniff, nosniff" при чтении через httpx/requests.
+                present = {k.lower() for k, _ in headers}
+                headers.extend(h for h in _SECURITY_HEADERS if h[0] not in present)
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
+app.add_middleware(_SecurityHeadersMiddleware)
 
 
 # Версионированный ассет (`?v=<SHA>` из index.html) неизменен по построению:
@@ -6903,9 +6999,20 @@ async def _record_order_payment(data: dict, user: dict, op: str) -> JSONResponse
 
     # Карта и перечисление — карточка подтверждающим с кнопками pay_ok/pay_no:
     # их сверяют с банком. Наличные подтверждаются сдачей — кнопок под ними нет.
+    # Фоном (utils.background.spawn), а не await: несколько admin/boss
+    # получателей — несколько последовательных вызовов Bot API на
+    # критическом пути ответа менеджеру, деградация/недоступность Telegram
+    # держала бы «оплата принята» неоправданно долго. Платёж уже
+    # закоммичен — уведомление ПОСЛЕ ответа ничего не теряет (как печатная
+    # форма после одобрения, см. CLAUDE.md).
+    from utils.background import spawn
+
     for part in res["parts"]:
         if part["method"] in order_payments.NONCASH_METHODS:
-            await _notify_bosses_payment_pending(order_id, full_name, part["payment_id"])
+            spawn(
+                _notify_bosses_payment_pending(order_id, full_name, part["payment_id"]),
+                name="boss-payment-pending-notify",
+            )
     await idem.store(res)
     return JSONResponse(res)
 

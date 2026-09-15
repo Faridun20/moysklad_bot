@@ -32,7 +32,7 @@ from datetime import date, timedelta
 from services.database import (
     backfill_fx_rate_snapshots,
     get_currency_rate_daily_source,
-    init_db,
+    ensure_schema,
     set_currency_rate,
     set_currency_rate_daily,
     set_setting,
@@ -62,7 +62,7 @@ def _store_day(day: date, uzs_rate_to_base: float) -> None:
 
 
 async def main(backfill_days: int = 0) -> int:
-    init_db()
+    ensure_schema()
 
     # 1. Сегодняшний курс — основной результат прогона.
     usd_per_uzs = await fetch_cbu_usd_per_uzs()

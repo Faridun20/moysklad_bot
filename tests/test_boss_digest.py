@@ -61,9 +61,12 @@ def test_payment_below_threshold_shows_in_digest(isolated_db):
     assert "Иван" in data["payments"]["lines"][0]
 
 
-def test_payment_at_or_above_threshold_is_excluded(isolated_db):
+def test_payment_at_or_above_threshold_is_marked_not_dropped(isolated_db):
     """Крупный платёж уже ушёл немедленным пушем (notify_policy) — дайджест
-    его не дублирует, но считает в «сколько всего ждёт»."""
+    его не дублирует свежим пунктом, но и не выбрасывает молча: финдинг #6
+    (аудит) — событие может провалиться между мгновенной карточкой и
+    дайджестом, если порог/курс сменился ПОСЛЕ создания. Показываем ВСЁ
+    ждущее, крупное — с пометкой «уже приходило»."""
     from services import boss_digest as bd
 
     db = isolated_db
@@ -71,9 +74,29 @@ def test_payment_at_or_above_threshold_is_excluded(isolated_db):
     db.add_payment(10, "u", "Крупный", 9000.0, "USD", "c")
 
     data = _run(bd.gather())
-    assert data["payments"]["count"] == 1
-    assert "Крупный" not in " ".join(data["payments"]["lines"])
+    assert data["payments"]["count"] == 2
+    small_line = next(line for line in data["payments"]["lines"] if "Мелкий" in line)
+    big_line = next(line for line in data["payments"]["lines"] if "Крупный" in line)
+    assert "уже приходило" not in small_line
+    assert "уже приходило" in big_line
     assert data["payments"]["waiting_total"] == 2
+
+
+def test_threshold_change_after_creation_does_not_drop_pending_payment(isolated_db):
+    """Финдинг #6 сценарий: платёж создан ниже старого порога (остался
+    pending, мгновенная карточка не уходила), владелец ПОНИЗИЛ порог до
+    дайджеста — раньше платёж перефильтровывался ТЕКУЩИМ порогом, «выглядел»
+    уже отправленным и пропадал из дайджеста НАСОВСЕМ (ни карточкой, ни
+    сводкой). Теперь он всё равно виден — с пометкой «уже приходило»."""
+    from services import boss_digest as bd
+
+    db = isolated_db
+    db.add_payment(10, "u", "Иван", 100.0, "USD", "c")  # порог 5000 по умолчанию — pending
+    db.set_setting("boss_instant_threshold_usd", 10.0)  # понизили уже ПОСЛЕ создания
+
+    data = _run(bd.gather())
+    assert data["payments"]["count"] == 1
+    assert "Иван" in data["payments"]["lines"][0]
 
 
 def test_pending_cash_deposit_below_threshold_shows_in_digest(isolated_db):
@@ -110,6 +133,84 @@ def test_pending_return_below_threshold_shows_in_digest(isolated_db):
     assert f"заказ #{oid}" in data["returns"]["lines"][0]
 
 
+def test_pending_cash_payment_part_excluded_from_payments_block(isolated_db):
+    """Наличная строка разбивки подтверждается СДАЧЕЙ, а не кнопкой
+    подтверждения — как и `get_money_totals`, дайджест не должен показывать
+    её в «Платежах на подтверждение»: иначе она дублирует «Сдачи» (одни и те
+    же наличные посчитаны и там, и там)."""
+    from services import boss_digest as bd
+    from services import order_payments
+
+    db = isolated_db
+    db.set_role(10, "u", "Manager", "manager")
+    oid = db.create_order(10, "Manager", "")
+    db.update_order_agent(oid, "A-1", "Клиент")
+    db.add_order_item(oid, "Товар", "", 1, "шт", 100.0)
+    db.update_order_status(oid, "approved")
+    actor = order_payments.Actor(user_id=10, name="Manager", role="manager")
+    _run(order_payments.record_payment_parts(
+        oid, actor, [{"method": "cash", "currency": "USD", "amount": "100"}]
+    ))
+
+    data = _run(bd.gather())
+    assert data["payments"]["count"] == 0
+    assert bd.is_empty(data) is True
+
+
+def test_confirmed_cash_deposit_part_excluded_from_received(isolated_db):
+    """Подтверждённая наличная строка разбивки не считается в «Получено» —
+    эти деньги уже посчитаны в «Сдачах» (`get_money_totals` не считает
+    наличные строки платежами по той же причине)."""
+    from services import boss_digest as bd
+    from services import order_payments
+
+    db = isolated_db
+    db.set_role(10, "u", "Manager", "manager")
+    db.set_role(1, "b", "Boss", "boss")
+    oid = db.create_order(10, "Manager", "")
+    db.update_order_agent(oid, "A-1", "Клиент")
+    db.add_order_item(oid, "Товар", "", 1, "шт", 100.0)
+    db.update_order_status(oid, "approved")
+    actor = order_payments.Actor(user_id=10, name="Manager", role="manager")
+    _run(order_payments.record_payment_parts(
+        oid, actor, [{"method": "cash", "currency": "USD", "amount": "100"}]
+    ))
+    dep = _run(db.create_cash_deposit(10, 100.0))
+    assert _run(db.confirm_cash_deposit(dep["deposit_id"], 1, "Boss"))["ok"]
+
+    data = _run(bd.gather())
+    assert data["received"]["count"] == 0
+
+
+def test_pending_return_uses_order_currency_not_hardcoded_usd(isolated_db):
+    """Сумма возврата в дайджесте — в валюте ЗАКАЗА (аудит, финдинг #5), а не
+    всегда USD: хардкод "USD" считал 6000 сум (~$0.47) как $6000 (выше порога
+    $5000) и молча исключал возврат из дайджеста, думая, что он уже ушёл
+    мгновенной карточкой — хотя на самом деле он не ушёл никуда."""
+    from services import boss_digest as bd
+
+    db = isolated_db
+    db.set_role(10, "u", "Manager", "manager")
+    assert db.set_currency_rate("UZS", 1 / 12700, updated_by=1)[0]
+    oid = db.create_order(10, "Manager", "")
+    assert db.update_order_currency(oid, "UZS", require_draft=True)
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q(
+                "INSERT INTO returns (order_id, return_type, reason, total_amount_cents, "
+                "created_by, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)"
+            ),
+            (oid, "full", "брак", 600000, 10, db.now_str()),  # 6000.00 UZS
+        )
+        conn.commit()
+
+    data = _run(bd.gather())
+    assert data["returns"]["count"] == 1
+    assert "UZS" in data["returns"]["lines"][0]
+    assert "USD" not in data["returns"]["lines"][0]
+
+
 def test_confirmed_small_payment_counts_as_received(isolated_db):
     from services import boss_digest as bd
 
@@ -141,6 +242,58 @@ def test_received_respects_since_last_run(isolated_db):
     data = _run(bd.gather())
     assert data["received"]["count"] == 1
     assert data["received"]["by_currency"] == [{"currency": "USD", "total": 150.0}]
+
+
+# ─── boss_digest_time: валидация HH:MM ──────────────────────────────────────
+
+
+def test_invalid_digest_time_falls_back_to_default_with_warning(isolated_db, caplog):
+    """«25:00» не парсится в разумные часы/минуты — дайджест обязан упасть на
+    дефолт 19:00 (иначе `is_due()` навсегда считает «ещё не время»: у суток
+    нет часа 25, (now.hour, now.minute) < (25, 0) истинно всегда)."""
+    from services import boss_digest as bd
+
+    isolated_db.set_setting("boss_digest_time", "25:00")
+    with caplog.at_level(logging.WARNING):
+        assert bd.digest_time_hhmm() == (19, 0)
+    assert "boss_digest_time" in caplog.text
+
+
+def test_digest_time_after_2345_falls_back_to_default_with_warning(isolated_db, caplog):
+    """Крон тикает по :00/:15/:30/:45 — время дайджеста позже 23:45 не
+    гарантирует ни одного тика в пределах того же дня до полуночи, и
+    is_due() либо никогда не сработает в свой день, либо сработает уже
+    следующим числом. Падаем на дефолт."""
+    from services import boss_digest as bd
+
+    isolated_db.set_setting("boss_digest_time", "23:50")
+    with caplog.at_level(logging.WARNING):
+        assert bd.digest_time_hhmm() == (19, 0)
+    assert "boss_digest_time" in caplog.text
+
+
+def test_digest_time_exactly_2345_is_accepted(isolated_db):
+    """Граница включительно — 23:45 совпадает с последним тиком дня."""
+    from services import boss_digest as bd
+
+    isolated_db.set_setting("boss_digest_time", "23:45")
+    assert bd.digest_time_hhmm() == (23, 45)
+
+
+def test_garbage_digest_time_falls_back_to_default(isolated_db, caplog):
+    from services import boss_digest as bd
+
+    isolated_db.set_setting("boss_digest_time", "не время")
+    with caplog.at_level(logging.WARNING):
+        assert bd.digest_time_hhmm() == (19, 0)
+    assert "boss_digest_time" in caplog.text
+
+
+def test_negative_minutes_fall_back_to_default(isolated_db):
+    from services import boss_digest as bd
+
+    isolated_db.set_setting("boss_digest_time", "10:-5")
+    assert bd.digest_time_hhmm() == (19, 0)
 
 
 # ─── is_due / идемпотентность ───────────────────────────────────────────────
@@ -269,6 +422,26 @@ def test_falls_back_to_text_when_rich_fails(isolated_db, monkeypatch):
     assert "Решения за день" in sent[0][1]
 
 
+def test_send_report_returns_failed_when_both_channels_fail(isolated_db, monkeypatch):
+    """Rich упал, а текстовый фолбэк `tg_send_message` тоже вернул False
+    (Telegram недоступен целиком) — send_report обязан сказать об этом
+    вызывающему, а не притвориться, что дайджест ушёл текстом."""
+    db = isolated_db
+    db.add_payment(10, "u", "Иван", 100.0, "USD", "c")
+    bot = _FakeBot(rich_error=RuntimeError("METHOD_NOT_AVAILABLE"))
+    bd = _patch_bot(monkeypatch, bot)
+
+    async def _send(chat_id, text, **kw):
+        return False
+
+    import services.notifier as notifier
+
+    monkeypatch.setattr(notifier, "tg_send_message", _send)
+
+    data = _run(bd.gather())
+    assert _run(bd.send_report(2, data)) == "failed"
+
+
 def test_fallback_never_logs_the_token(isolated_db, monkeypatch, caplog):
     import config
 
@@ -359,6 +532,38 @@ def test_cron_sends_once_and_is_idempotent_on_retry(isolated_db, monkeypatch):
     # Ретрай того же 15-минутного тика — дайджест уже отмечен сегодняшним.
     assert _run(task.main()) == 0
     assert len(bot.rich_calls) == 1
+
+
+def test_cron_does_not_mark_run_when_delivery_fails_everywhere(isolated_db, monkeypatch):
+    """День потерян, если дайджест «отправлен» отметкой, хотя ни один босс
+    его не получил (Rich упал, текстовый фолбэк тоже вернул False). rc=1,
+    last_run_at не тронут — следующий 15-минутный тик обязан попробовать
+    снова, а не молчать до завтра (is_due() всё ещё True)."""
+    from datetime import datetime
+
+    import tasks.run_boss_digest as task
+
+    db = isolated_db
+    db.set_role(1, "b", "Boss", "boss")
+    db.add_payment(10, "u", "Иван", 100.0, "USD", "c")
+    db.set_setting("boss_digest_time", "19:00")
+    monkeypatch.setattr("utils.helpers.local_now", lambda: datetime(2026, 9, 15, 19, 5))
+    bot = _FakeBot(rich_error=RuntimeError("METHOD_NOT_AVAILABLE"))
+    _patch_bot(monkeypatch, bot)
+
+    async def _send(chat_id, text, **kw):
+        return False
+
+    import services.notifier as notifier
+
+    monkeypatch.setattr(notifier, "tg_send_message", _send)
+
+    rc = _run(task.main())
+    assert rc == 1
+
+    from services import boss_digest as bd
+
+    assert bd.is_due() is True
 
 
 def test_cron_skips_when_nothing_to_report(isolated_db, monkeypatch):

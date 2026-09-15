@@ -312,6 +312,55 @@ def init_db():
     logger.info("База данных инициализирована (CREATE TABLE only)")
 
 
+def schema_ready() -> bool:
+    """Дешёвая проверка «схема уже поднята» — один SELECT без блокировок, в
+    отличие от `_create_indexes` (~100 `CREATE INDEX IF NOT EXISTS`, каждый
+    берёт SHARE-лок на время выполнения даже когда индекс уже есть).
+
+    Смотрим на одну опорную таблицу (`app_settings` — создаётся в
+    `_create_tables` и читается почти на каждом старте/cron-тике). Ошибка
+    проверки (БД недоступна) — трактуем как «схемы нет», пусть решает
+    вызывающий (обычно это ведёт к полному `init_db()`, который сам упадёт
+    внятно, если БД правда недоступна)."""
+    try:
+        with get_conn() as conn:
+            cur = get_cursor(conn)
+            if USE_POSTGRES:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema = current_schema() AND table_name = 'app_settings'"
+                )
+            else:
+                cur.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'app_settings'"
+                )
+            return cur.fetchone() is not None
+    except Exception:
+        logger.warning("schema_ready: проверка не удалась — считаем схему отсутствующей", exc_info=True)
+        return False
+
+
+def ensure_schema() -> None:
+    """`init_db()`, но пропускает DDL, если схема уже поднята.
+
+    Прод разворачивает схему ОДИН раз `python -m tasks.migrate` до старта
+    сервисов (CLAUDE.md, «DB»). Cron-задачи (`tasks/run_*.py`) тем не менее
+    гоняли полный `init_db()` на КАЖДЫЙ тик «на всякий случай» — а у
+    вечернего дайджеста это каждые 15 минут, да ещё и дважды за прогон
+    (сам `main()` и `tasks._cron_runner.run_cron` в `finally`). Каждый вызов
+    — это ~100 `CREATE INDEX IF NOT EXISTS`: индекс уже есть, но Postgres
+    всё равно берёт SHARE-лок на время выполнения инструкции, и это может
+    выстроиться в очередь за долгой idle-в-транзакции WebApp-сессией —
+    500-е на записи, у которых с дайджестом нет ничего общего.
+
+    Свежая база (тесты, локальный запуск без предварительного `migrate`)
+    по-прежнему получает полный `init_db()` — `schema_ready()` находит её
+    отсутствующей и не пропускает ни одного шага."""
+    if schema_ready():
+        return
+    init_db()
+
+
 def _enable_sqlite_wal() -> None:
     """SQLite: журнал WAL — читатели не ждут писателя, писатель — читателей.
 
@@ -4901,10 +4950,18 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
 async def get_pending_returns() -> list[dict]:
     """Возвраты, ждущие подтверждения. asyncpg-миграция Stage 5 (задача #21):
     нативный async через adb_core. Вызовы: handlers/webapp (`await adb.…`),
-    async-cron run_ops_monitor (`await`), тесты (`asyncio.run`)."""
+    async-cron run_ops_monitor (`await`), тесты (`asyncio.run`).
+
+    `order_currency` — валюта ЗАКАЗА (LEFT JOIN, как в `list_ledger_entries`,
+    WP-07): `total_amount`/`total_amount_cents` считаются из
+    `order_items.price_cents`, т.е. в валюте заказа, а не всегда USD.
+    Потребители (`services.boss_digest`) сравнивают сумму с порогом и
+    подписывают её этой валютой, а не хардкодят "USD"."""
     rows = await adb_core.fetch(
-        "SELECT * FROM returns WHERE status = 'pending' "
-        "ORDER BY created_at ASC"
+        "SELECT r.*, o.currency AS order_currency FROM returns r "
+        "LEFT JOIN orders o ON o.id = r.order_id "
+        "WHERE r.status = 'pending' "
+        "ORDER BY r.created_at ASC"
     )
     return _with_major(rows, ("total_amount", "total_amount_cents"))
 

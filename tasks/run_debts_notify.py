@@ -27,7 +27,7 @@ from datetime import date
 from config import BASE_CURRENCY
 from services.database import (
     debt_due_date,
-    init_db,
+    ensure_schema,
     get_open_debts,
     get_payments_for_orders,
     get_all_users,
@@ -158,7 +158,7 @@ async def _notify_machine_installments(bosses: list[dict], today_str: str) -> in
 
 
 async def main() -> int:
-    init_db()
+    ensure_schema()
 
     today_str = date.today().isoformat()
 
