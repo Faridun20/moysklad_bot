@@ -21,7 +21,17 @@ from config import BASE_CURRENCY as _BASE_CURRENCY
 
 # Единая реализация в utils.helpers.esc — оставлен _esc-алиас чтобы
 # не править каждый callsite в этом большом файле.
-from handlers._ui import drop_keyboard, finish_card, finish_message, webapp_keyboard
+from handlers._ui import (
+    drop_keyboard,
+    finish_card,
+    finish_message,
+    outcome_label,
+    prompt_keyboard,
+    set_message_markup,
+    settle_card,
+    settle_markup,
+    webapp_keyboard,
+)
 from utils.helpers import esc as _esc  # noqa: E402
 
 
@@ -33,7 +43,7 @@ def _cur(amount: float, currency: str | None = None) -> str:
 
 from aiogram import Bot, Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -261,6 +271,37 @@ def request_approve_keyboard(req_id: int):
     return kb.as_markup()
 
 
+def _request_callbacks(req_id: int) -> set[str]:
+    """Все кнопки решения по заявке — и с карточки бота, и из WebApp (там
+    строка короче: без «На доработку»), и «Одобрить с превышением»."""
+    return {f"req_ok:{req_id}", f"req_no:{req_id}", f"req_draft:{req_id}", f"req_ovr:{req_id}"}
+
+
+# Исход заявки, решённой где-то ещё (WebApp, второй руководитель), — для
+# неактивной кнопки на устаревшей карточке. Статусы shipment_requests.
+_REQUEST_SETTLED = {
+    "approved": "✅ Заявка уже одобрена",
+    "rejected": "❌ Заявка уже отклонена",
+    "returned": "↩️ Заявка уже на доработке",
+}
+
+
+async def _settle_stale_request(call: CallbackQuery, req_id: int) -> bool:
+    """Заявка уже не ждёт решения — погасить кнопки карточки исходом.
+
+    Возвращает True, если карточка погашена (заявка решена). Заявка ещё
+    pending (отказ по другой причине, например лимит) — кнопки не трогаем.
+    """
+    req = await adb.get_shipment_request(req_id)
+    if not req or req.get("status") == "pending":
+        return False
+    label = _REQUEST_SETTLED.get(req.get("status") or "", "ℹ️ Заявка уже решена")
+    await settle_card(
+        call, _request_callbacks(req_id), label, tail=webapp_keyboard("🌐 Заявки — в WebApp")
+    )
+    return True
+
+
 @router.callback_query(F.data.startswith("ord_view:"))
 async def cb_view_order(call: CallbackQuery):
     await call.answer()
@@ -322,8 +363,13 @@ async def _approve_flow(call: CallbackQuery, bot: Bot, req_id: int, override: bo
             # T3.2: снимаем кнопки заявки. Решение теперь принимается ТОЛЬКО
             # через «Одобрить с превышением» в следующем сообщении — иначе
             # босс мог обойти явное подтверждение, повторно нажав «Одобрить»
-            # на старой карточке.
-            await finish_card(call, "⚠️ Превышение лимита — нужно подтверждение")
+            # на старой карточке. Вместо кнопок — неактивная подсказка, где
+            # решение.
+            await finish_card(
+                call,
+                "⚠️ Превышение лимита — нужно подтверждение",
+                outcome="⚠️ Превышение лимита — решение ниже ⬇️",
+            )
             return await call.message.answer(
                 f"⚠️ <b>Превышение кредитного лимита</b>\n"
                 f"Текущий долг: <b>{_fmt_num(over['current_debt'])}</b>\n"
@@ -333,16 +379,24 @@ async def _approve_flow(call: CallbackQuery, bot: Bot, req_id: int, override: bo
                 parse_mode="HTML",
                 reply_markup=kb.as_markup(),
             )
-        return await call.answer(f"⚠️ {result['error']}", show_alert=True)
+        await call.answer(f"⚠️ {result['error']}", show_alert=True)
+        await _settle_stale_request(call, req_id)
+        return
 
     await call.answer("✅ Заявка одобрена")
     suffix = " (с превышением лимита)" if override else ""
     base = getattr(call.message, "html_text", None) or call.message.text or ""
+    verb = "✅ Одобрено с превышением" if override else "✅ Одобрено"
     await call.message.edit_text(
         base
         + f"\n\n{DIV}\n✅ <b>Одобрено{suffix}</b>  <code>{result['now']}</code>  — {_esc(boss_name)}",
         parse_mode="HTML",
-        reply_markup=webapp_keyboard("🌐 Ещё заявки — в WebApp"),
+        reply_markup=settle_markup(
+            getattr(call.message, "reply_markup", None),
+            _request_callbacks(req_id),
+            outcome_label(verb, call.from_user),
+            tail=webapp_keyboard("🌐 Ещё заявки — в WebApp"),
+        ),
     )
 
 
@@ -375,7 +429,9 @@ async def cb_reject_request(call: CallbackQuery, bot: Bot):
     result = await reject_shipment_request(req_id, call.from_user.id, boss_name, bot)
 
     if not result["ok"]:
-        return await call.answer(f"⚠️ {result['error']}", show_alert=True)
+        await call.answer(f"⚠️ {result['error']}", show_alert=True)
+        await _settle_stale_request(call, req_id)
+        return
 
     await call.answer("❌ Заявка отклонена")
     base = getattr(call.message, "html_text", None) or call.message.text or ""
@@ -383,7 +439,12 @@ async def cb_reject_request(call: CallbackQuery, bot: Bot):
         base
         + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{result['now']}</code>  — {_esc(boss_name)}",
         parse_mode="HTML",
-        reply_markup=webapp_keyboard("🌐 Ещё заявки — в WebApp"),
+        reply_markup=settle_markup(
+            getattr(call.message, "reply_markup", None),
+            _request_callbacks(req_id),
+            outcome_label("❌ Отклонено", call.from_user),
+            tail=webapp_keyboard("🌐 Ещё заявки — в WebApp"),
+        ),
     )
 
 
@@ -393,6 +454,13 @@ async def cb_return_to_draft(call: CallbackQuery, state: FSMContext):
     if not is_boss(call.from_user.id):
         return await call.answer("Нет доступа", show_alert=True)
     req_id = int(call.data.split(":")[1])
+    # Устаревшая карточка (заявку уже решили в WebApp): не заводим ввод
+    # причины, который закончится «заявка уже обработана» после набора текста.
+    req = await adb.get_shipment_request(req_id)
+    if req and req.get("status") != "pending":
+        await call.answer("⚠️ Заявка уже обработана", show_alert=True)
+        await _settle_stale_request(call, req_id)
+        return
     await state.set_state(ReturnToDraft.waiting_for_reason)
     await state.update_data(
         req_id=req_id, msg_chat=call.message.chat.id, msg_id=call.message.message_id
@@ -400,10 +468,49 @@ async def cb_return_to_draft(call: CallbackQuery, state: FSMContext):
     await call.answer()
     # T3.2: снимаем кнопки заявки на время ввода причины — иначе ту же заявку
     # можно одобрить, пока босс печатает, что доработать.
-    await drop_keyboard(call)
-    await call.message.answer(
-        "✍️ Укажите, что нужно доработать (одним сообщением) — менеджер увидит причину:"
+    await drop_keyboard(call, status="✍️ Ждём причину доработки…")
+    prompt = await call.message.answer(
+        "✍️ Укажите, что нужно доработать (одним сообщением) — менеджер увидит причину:",
+        reply_markup=prompt_keyboard(
+            InlineKeyboardButton(text="✖️ Не возвращать", callback_data="req_draft_abort")
+        ),
     )
+    if prompt is not None:
+        await state.update_data(
+            prompt_chat=prompt.chat.id, prompt_id=prompt.message_id
+        )
+
+
+@router.callback_query(F.data == "req_draft_abort")
+async def cb_return_to_draft_abort(call: CallbackQuery, state: FSMContext, bot: Bot):
+    """«Не возвращать»: нажали «На доработку» по ошибке.
+
+    Раньше выхода не было: кнопки заявки сняты, бот ждёт текст, и любое
+    сообщение становилось причиной возврата. Теперь ввод отменяется, а карточке
+    возвращаются кнопки решения — если заявка всё ещё ждёт.
+    """
+    if not is_boss(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    data = await state.get_data()
+    req_id = data.get("req_id")
+    if await state.get_state() != ReturnToDraft.waiting_for_reason.state or not req_id:
+        # Вопрос устарел: причину уже приняли или ввод сбросили.
+        await call.answer("Уже неактуально")
+        await set_message_markup(bot, call.message.chat.id, call.message.message_id, None)
+        return
+    await state.clear()
+    await call.answer("Возврат отменён")
+    req = await adb.get_shipment_request(int(req_id))
+    if req and req.get("status") == "pending":
+        await set_message_markup(
+            bot, data.get("msg_chat"), data.get("msg_id"), request_approve_keyboard(int(req_id))
+        )
+    try:
+        await call.message.edit_text(
+            f"↩️ Возврат заявки #{int(req_id)} на доработку отменён — кнопки решения снова на карточке."
+        )
+    except Exception:
+        logger.debug("req_draft_abort: вопрос не отредактирован", exc_info=True)
 
 
 @router.message(ReturnToDraft.waiting_for_reason)
@@ -434,7 +541,11 @@ async def process_return_to_draft_reason(message: Message, state: FSMContext, bo
     )
     # T3.2: помечаем саму карточку заявки (её кнопки сняты на входе в FSM) —
     # иначе в истории она остаётся «на согласовании» без следа решения.
-    if not await finish_message(bot, data.get("msg_chat"), data.get("msg_id"), note):
+    await set_message_markup(bot, data.get("prompt_chat"), data.get("prompt_id"), None)
+    if not await finish_message(
+        bot, data.get("msg_chat"), data.get("msg_id"), note,
+        outcome=outcome_label("↩️ На доработку", message.from_user),
+    ):
         await message.answer(note, parse_mode="HTML")
 
 
@@ -472,9 +583,17 @@ async def cb_unfreeze_order(call: CallbackQuery, bot: Bot):
         return await call.answer(f"⚠️ {result.get('error')}", show_alert=True)
     await call.answer("🔓 Разморожен")
     base = getattr(call.message, "html_text", None) or call.message.text or ""
+    # В списке /frozen кнопка на каждый заказ: гасим ТОЛЬКО эту, остальные
+    # заказы размораживаются дальше с того же сообщения (раньше правка текста
+    # снимала всю клавиатуру).
     await call.message.edit_text(
         base + f"\n\n{DIV}\n🔓 <b>Заказ #{order_id} разморожен</b> — {_esc(name)}",
         parse_mode="HTML",
+        reply_markup=settle_markup(
+            getattr(call.message, "reply_markup", None),
+            {f"unfreeze:{order_id}"},
+            outcome_label(f"🔓 #{order_id} разморожен", call.from_user),
+        ),
     )
     # Best-effort: сообщаем менеджеру, что можно переотправить.
     order = await adb.get_order(order_id)

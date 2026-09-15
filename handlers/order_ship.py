@@ -40,10 +40,20 @@ async def cmd_ship(message: Message, bot: Bot):
         if res.get("code") == "payment_required":
             # Разбивка оплаты вводится в WebApp (строки, валюты, курс) — в чате
             # её не набрать. Правило то же, что у кнопки «Отгрузить» в WebApp.
-            from handlers._ui import webapp_keyboard
+            from aiogram.types import InlineKeyboardMarkup
 
+            from handlers._ui import disabled_button, webapp_keyboard
+
+            # Порядок шагов виден кнопками: живая «Внести оплату» и под ней
+            # неактивная (Bot API 10.3) отгрузка с причиной — как в
+            # уведомлении об одобрении (services.notify.approved_order_keyboard).
+            pay = webapp_keyboard("💳 Внести оплату в WebApp")
+            rows = [
+                *(pay.inline_keyboard if pay else []),
+                [disabled_button("🚚 Отгрузка — после ввода оплаты")],
+            ]
             return await message.answer(
-                f"⚠️ {res['error']}", reply_markup=webapp_keyboard("💳 Внести оплату в WebApp")
+                f"⚠️ {res['error']}", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
             )
         return await message.answer(f"⚠️ {res.get('error', 'не удалось отгрузить')}")
 

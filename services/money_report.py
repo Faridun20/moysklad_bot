@@ -13,6 +13,11 @@
 * **Фолбэк обязателен.** Если `sendRichMessage` не прошёл (старый клиент,
   изменение API, отключённая фича), шлём тот же отчёт простым текстом через
   `tg_send_message`. Отчёт, который не дошёл, хуже некрасивого.
+* **Кнопка и сворачиваемый список (Bot API 10.3).** Внутри статьи —
+  кнопка в WebApp (`InputRichBlockButtons`) и полный список просроченных
+  должников в сворачиваемой цитате: в чате он занимает одну строку, пока его
+  не развернули. Текстовый фолбэк несёт то же самое своими средствами:
+  `<blockquote expandable>` и web_app-кнопку в reply_markup.
 * **Пустой отчёт не отправляется.** Еженедельное «долгов нет» превращает
   сводку в шум, который перестают читать — а вместе с ней перестают читать и
   ту неделю, когда цифры важны.
@@ -21,7 +26,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import date, timedelta
 
 from services import money, receivables
 from utils.helpers import esc, local_now, redact_token
@@ -46,6 +51,39 @@ def _fmt(block: dict) -> str:
     return f"≈ {base} {block.get('base_currency', 'USD')}{tail}"
 
 
+# Сколько просроченных должников показывать в сворачиваемом списке. Больше —
+# «…и ещё N»: развёрнутая цитата на сотню строк снова становится простынёй.
+OVERDUE_LIST_MAX = 30
+
+WEBAPP_BUTTON_TEXT = "💰 Долги — в WebApp"
+
+
+def _webapp_url() -> str | None:
+    """https-адрес WebApp или None: web_app-кнопку с другим URL Telegram
+    отвергает вместе со всем сообщением."""
+    import config
+
+    url = config.WEBAPP_URL or ""
+    return url if url.startswith("https://") else None
+
+
+def overdue_debtors(items: list, today: date) -> dict:
+    """Просроченные должники: имя, сумма, сколько дней самый старый срок.
+
+    Порядок — по сумме (как «кто должен больше всех»), дни рядом: долг на
+    5 дней и на 5 месяцев выглядят в списке одинаково, если их не подписать.
+    """
+    late = [r for r in items if receivables.bucket_of(r.due_date, today) != "not_due"]
+    rows = receivables.by_counterparty(late, limit=len(late) or 1) if late else []
+    oldest: dict[str, int] = {}
+    for r in late:
+        days = (today - date.fromisoformat(str(r.due_date)[:10])).days
+        oldest[r.counterparty] = max(oldest.get(r.counterparty, 0), days)
+    for row in rows:
+        row["days"] = oldest.get(row["name"], 0)
+    return {"rows": rows[:OVERDUE_LIST_MAX], "total": len(rows)}
+
+
 async def gather(period_days: int = 7) -> dict:
     """Данные отчёта. Отдельно от рендера — так их можно проверить тестом, не
     собирая Telegram-разметку."""
@@ -61,6 +99,7 @@ async def gather(period_days: int = 7) -> dict:
         "forecast": receivables.forecast(items, months=3, today=today),
         "discipline": stats,
         "top": receivables.by_counterparty(items, limit=5),
+        "overdue": overdue_debtors(items, today),
     }
 
 
@@ -78,15 +117,20 @@ def _period_label(data: dict) -> str:
 
 
 def build_blocks(data: dict) -> list:
-    """Rich-блоки отчёта: заголовок, таблица сроков, дисциплина, должники."""
+    """Rich-блоки отчёта: заголовок, таблица сроков, просроченные, дисциплина,
+    должники, кнопка в WebApp."""
     from aiogram.types import (
+        InputRichBlockButtons,
         InputRichBlockDivider,
+        InputRichBlockExpandableBlockQuotation,
         InputRichBlockList,
         InputRichBlockListItem,
         InputRichBlockParagraph,
         InputRichBlockSectionHeading,
         InputRichBlockTable,
         RichBlockTableCell,
+        RichMessageButton,
+        WebAppInfo,
     )
 
     def cell(text: str, *, header: bool = False, right: bool = False) -> RichBlockTableCell:
@@ -118,7 +162,20 @@ def build_blocks(data: dict) -> list:
             continue
         rows.append([cell(b["label"]), cell(_fmt(b), right=True), cell(str(b["count"]), right=True)])
     if len(rows) > 1:
-        blocks.append(InputRichBlockTable(cells=rows, is_bordered=True, is_striped=True))
+        # is_compact (10.3): три узкие колонки — без него таблица на телефоне
+        # занимала пол-экрана полями ячеек.
+        blocks.append(InputRichBlockTable(
+            cells=rows, is_bordered=True, is_striped=True, is_compact=True,
+        ))
+
+    overdue_lines = _overdue_lines(data)
+    if overdue_lines:
+        # Полный список — в СВОРАЧИВАЕМОЙ цитате (10.3): свёрнутый он не
+        # отодвигает остальной отчёт, а за именами не надо идти в WebApp.
+        blocks.append(InputRichBlockSectionHeading(
+            text=f"Просрочено — кто ({data['overdue']['total']})", size=3,
+        ))
+        blocks.append(InputRichBlockExpandableBlockQuotation(text="\n".join(overdue_lines)))
 
     disc = data["discipline"]
     if disc["expected_count"]:
@@ -160,7 +217,35 @@ def build_blocks(data: dict) -> list:
             )])
             for t in data["top"]
         ]))
+
+    url = _webapp_url()
+    if url:
+        blocks.append(InputRichBlockButtons(buttons=[
+            RichMessageButton(text=WEBAPP_BUTTON_TEXT, web_app=WebAppInfo(url=url)),
+        ]))
     return blocks
+
+
+def _overdue_lines(data: dict) -> list[str]:
+    """Строки списка просроченных — общие для Rich и текста (без HTML)."""
+    block = data.get("overdue") or {}
+    lines = [
+        f"{row['name']} — {_fmt(row)} · {row['days']} дн."
+        for row in block.get("rows") or []
+    ]
+    rest = int(block.get("total") or 0) - len(lines)
+    if lines and rest > 0:
+        lines.append(f"…и ещё {rest}")
+    return lines
+
+
+def webapp_reply_markup() -> dict | None:
+    """Кнопка в WebApp для текстового фолбэка (Bot API JSON: его шлёт
+    `tg_send_message`, не aiogram)."""
+    url = _webapp_url()
+    if not url:
+        return None
+    return {"inline_keyboard": [[{"text": WEBAPP_BUTTON_TEXT, "web_app": {"url": url}}]]}
 
 
 def build_text(data: dict) -> str:
@@ -181,6 +266,13 @@ def build_text(data: dict) -> str:
         lines.append("")
         for b in buckets:
             lines.append(f"  {esc(b['label'])}: <b>{esc(_fmt(b))}</b> ({b['count']})")
+
+    overdue_lines = _overdue_lines(data)
+    if overdue_lines:
+        lines.append("")
+        lines.append(f"<b>Просрочено — кто ({data['overdue']['total']})</b>")
+        body = "\n".join(esc(line) for line in overdue_lines)
+        lines.append(f"<blockquote expandable>{body}</blockquote>")
 
     disc = data["discipline"]
     if disc["expected_count"]:
@@ -207,7 +299,7 @@ def build_text(data: dict) -> str:
             lines.append(f"  {esc(t['name'])} — {esc(_fmt(t))}")
 
     lines.append("")
-    lines.append("<i>Подробнее — WebApp → «Аналитика» → «Деньги».</i>")
+    lines.append("<i>Подробнее — WebApp → «Деньги» → «Долги».</i>")
     return "\n".join(lines)
 
 
@@ -235,5 +327,5 @@ async def send_report(chat_id: int, data: dict) -> str:
 
     from services.notifier import tg_send_message
 
-    await tg_send_message(chat_id, build_text(data))
+    await tg_send_message(chat_id, build_text(data), reply_markup=webapp_reply_markup())
     return "text"

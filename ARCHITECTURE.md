@@ -542,7 +542,10 @@ T3.3: бот срезан до того, чего нет в WebApp. Экраны
 - `handlers/audit.py` — `/audit`, просмотр аудит-лога.
 - `handlers/log.py` — `/log`, последние записи логов.
 - `handlers/_ui.py` — общие приёмы работы с inline-клавиатурами (T3.2) и
-  кнопка входа в WebApp.
+  кнопка входа в WebApp; сборщики без Telegram-вызовов (неактивные кнопки
+  исхода, `settle_markup`, `prompt_keyboard` с force_reply — Bot API 10.3) —
+  в `utils/keyboards.py`, их зовут и сервисы. Правила — CLAUDE.md, «Кнопки
+  карточек».
 
 ### 7.2 Middlewares
 

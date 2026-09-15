@@ -14,16 +14,16 @@ from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
+
+from handlers._ui import finish_message, prompt_keyboard
 
 
 def _abort_keyboard():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="❌ Отмена", callback_data="cancel_abort")
-    return kb.as_markup()
+    """«❌ Отмена» под вопросом о причине + force_reply (Bot API 10.3): поле
+    ввода открывается ответом на вопрос сразу."""
+    return prompt_keyboard(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_abort"))
 
-from handlers._ui import finish_message
 from services import async_db as adb
 from services.roles import _has_role
 from utils.formatters import DIV
@@ -78,6 +78,15 @@ async def cmd_cancel(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "cancel_abort")
 async def cb_cancel_abort(call: CallbackQuery, state: FSMContext):
+    if await state.get_state() != CancelFlow.waiting_reason.state:
+        # Кнопка со старого вопроса (заказ уже отменён или ввод сброшен):
+        # «отмена прервана» было бы неправдой.
+        await call.answer("Уже неактуально")
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
     await state.clear()
     await call.answer("Отменено")
     try:
@@ -112,7 +121,9 @@ async def process_cancel_reason(message: Message, state: FSMContext, bot: Bot):
         return await message.answer(f"⚠️ {res.get('error', 'не удалось отменить')}")
 
     note = f"🚫 Заказ #{order_id} отменён.\nПричина: {esc(reason)}"
-    if not await finish_message(bot, data.get("msg_chat"), data.get("msg_id"), note):
+    if not await finish_message(
+        bot, data.get("msg_chat"), data.get("msg_id"), note, outcome="🚫 Заказ отменён"
+    ):
         await message.answer(note, parse_mode="HTML")
     # Уведомить создателя заказа (если это не сам отменяющий).
     creator = order.get("user_id") if order else None
