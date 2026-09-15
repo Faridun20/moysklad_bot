@@ -2358,3 +2358,25 @@ body.page-sheet-open { overflow: hidden; }
 .rate-edit .rate-field { flex: 1; min-width: 0; margin-bottom: 0; }
 .rate-edit .rate-save { flex: 0 0 auto; min-height: 52px; }
 .rates-note { margin: var(--sp-2) 4px 0; }
+
+/* ─── Бухгалтерия (accounting.js) ────────────────────────────────────────────
+   Строка «счёт + сумма» в форме «Получил деньги»: сумму вводят прямо в строке,
+   как количество в приёмке контейнера, — частей обычно две-три, и открывать
+   отдельный диалог на каждую значит потерять из виду итог. Поле шире, чем
+   `.qty-input`: суммы в сумах семизначные. */
+.acc-line-amount {
+  flex-shrink: 0; width: 132px; min-height: 44px;
+  margin-left: var(--sp-2);
+  padding: 8px; font-size: 16px; text-align: right;
+  border: 1px solid var(--divider); border-radius: var(--radius-sm);
+  background: var(--bg-page); color: var(--text);
+  outline: none; font-family: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.acc-line-amount:focus { border-color: var(--accent); }
+.acc-line-account { cursor: pointer; }
+.acc-receipt .wh-total { margin-block: var(--sp-3); }
+/* Предупреждение в итоге (переплата, расхождение кассы) — цветом и текстом. */
+.acc-warn { color: var(--danger); }
+/* Селектор классом, а не #id: «#acc…» сторож дизайн-системы читает как hex-цвет. */
+.acc-receipt .acc-add-line { margin-bottom: var(--sp-4); }
