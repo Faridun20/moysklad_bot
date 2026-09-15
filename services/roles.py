@@ -12,6 +12,8 @@ allowed_roles в `_authorize` каждого /api/*. Другого источн
 авторизации, а UI при этом рапортовал «право выдано».
 """
 
+import asyncio
+import logging
 import time
 
 from config import ADMIN_IDS
@@ -46,6 +48,43 @@ def _auth_entry(user_id: int) -> tuple[str, bool]:
     role, deactivated = _db_role_and_deactivation(user_id)
     _auth_cache[user_id] = (now, role, deactivated)
     return role, deactivated
+
+
+logger = logging.getLogger(__name__)
+
+# За сколько секунд до истечения TTL прогрев уже обновляет запись. Без запаса
+# запись 29,9 с «свежая» для прогрева, но протухает к моменту `_authorize`
+# двумя миллисекундами позже — и SELECT снова идёт в потоке loop'а.
+_WARM_MARGIN = 5.0
+
+
+async def warm_auth_cache(user_id: int) -> None:
+    """Прогреть кэш роли/деактивации В ПОТОКЕ, не блокируя event loop.
+
+    Предикаты (`is_boss`, `cached_role`, `_authorize` в WebApp) синхронные и
+    зовутся из async-кода: при промахе кэша SELECT шёл прямо в потоке loop'а —
+    на это время вставали все запросы WebApp и апдейты бота, а при исчерпанном
+    пуле Postgres ещё и с ожиданием коннекта. Middleware бота и WebApp зовут
+    прогрев ДО хендлера, и синхронный путь дальше попадает в тёплую запись.
+    Сбой прогрева не роняет запрос: синхронный путь повторит чтение сам и
+    ответит своей ошибкой, как раньше.
+    """
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return
+    entry = _auth_cache.get(uid)
+    started = time.monotonic()
+    if entry is not None and started - entry[0] < _AUTH_TTL - _WARM_MARGIN:
+        return
+    try:
+        role, deactivated = await asyncio.to_thread(_db_role_and_deactivation, uid)
+    except Exception:  # noqa: BLE001 — прогрев best-effort, см. докстринг
+        logger.warning("Прогрев кэша роли user_id=%s не удался", uid, exc_info=True)
+        return
+    # Метка — момент НАЧАЛА чтения: запись не должна жить дольше TTL от
+    # момента, когда данные реально были прочитаны.
+    _auth_cache[uid] = (started, role, deactivated)
 
 
 def _cached_role(user_id: int) -> str:

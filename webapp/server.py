@@ -6,6 +6,7 @@ FastAPI сервер для WebApp.
 import asyncio
 import base64
 import binascii
+import json
 import logging
 import math
 import os
@@ -349,6 +350,78 @@ async def _metrics_middleware(request: Request, call_next):
     finally:
         _metrics.record_timing(metric_name, (_time.perf_counter() - start) * 1000.0)
 
+
+class _AuthCacheWarmMiddleware:
+    """Прогреть кэш роли В ПОТОКЕ до того, как ручка вызовет `_authorize`.
+
+    `_authorize` и `get_role` синхронные и зовутся из async-ручек (их 120+,
+    переписывать каждую на await — огромный дифф поперёк всех `allowed_roles`).
+    При промахе кэша (раз в 30 с на пользователя) SELECT шёл прямо в потоке
+    event loop'а: все остальные запросы стояли, пока он идёт, а при
+    исчерпанном пуле Postgres — ещё и с ожиданием коннекта. Здесь тело
+    читается один раз (и отдаётся ручке как есть), `initData` проверяется той
+    же `verify_init_data`, и роль дочитывается через `asyncio.to_thread`.
+    Невалидная подпись кэш не трогает — иначе чужие id засоряли бы его.
+    """
+
+    # Крупнее — только загрузка фото (base64): второй разбор JSON там дороже
+    # сэкономленного SELECT'а, такой запрос идёт старым путём.
+    MAX_PARSE_BYTES = 256 * 1024
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or scope.get("method") != "POST"
+            or not str(scope.get("path") or "").startswith("/api/")
+        ):
+            return await self.app(scope, receive, send)
+
+        messages: list = []
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message.get("type") != "http.request":
+                break
+            body = message.get("body") or b""
+            size += len(body)
+            chunks.append(body)
+            if not message.get("more_body"):
+                break
+        if size <= self.MAX_PARSE_BYTES:
+            await _warm_auth_from_body(b"".join(chunks))
+
+        async def replay():
+            if messages:
+                return messages.pop(0)
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+
+async def _warm_auth_from_body(body: bytes) -> None:
+    try:
+        data = json.loads(body) if body else None
+        if not isinstance(data, dict):
+            return
+        init_data = data.get("initData")
+        user = _dev_bypass_user() or (
+            verify_init_data(init_data) if isinstance(init_data, str) and init_data else None
+        )
+        if not user or "id" not in user:
+            return
+        from services.roles import warm_auth_cache
+
+        await warm_auth_cache(user["id"])
+    except Exception:  # noqa: BLE001 — прогрев best-effort: ручка всё проверит сама
+        logger.debug("Прогрев кэша роли пропущен", exc_info=True)
+
+
+app.add_middleware(_AuthCacheWarmMiddleware)
 
 # Последним — значит самым внешним из пользовательских: лишнее тело режется
 # раньше метрик и gzip.

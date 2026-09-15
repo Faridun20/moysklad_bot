@@ -89,6 +89,11 @@ class RateLimitMiddleware(BaseMiddleware):
                             user.id, e,
                         )
                 return
+            # Роль читают синхронные предикаты (is_boss/…) прямо в хендлерах.
+            # Прогрев кэша в потоке — чтобы промах не делал SELECT в event loop.
+            from services.roles import warm_auth_cache
+
+            await warm_auth_cache(user.id)
         return await handler(event, data)
 
 

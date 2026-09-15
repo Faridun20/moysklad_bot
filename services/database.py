@@ -38,27 +38,28 @@ USE_POSTGRES = bool(DATABASE_URL)
 # 0 — выключено. Управляется переменной окружения SQL_SLOW_MS.
 SQL_SLOW_MS = float(os.environ.get("SQL_SLOW_MS", "200"))
 
+# Размер пула. Минимум 1 коннект всегда держим открытым, максимум
+# PG_POOL_MAX — это потолок одновременно открытых коннектов от этого
+# процесса. Railway Postgres даёт ~50-100 коннектов на инстанс; 10
+# достаточно для бота на сотни юзеров и оставляет запас другим
+# сервисам (webapp как отдельный процесс, миграции и т.п.).
+_PG_POOL_MIN = int(os.environ.get("PG_POOL_MIN", "1"))
+_PG_POOL_MAX = int(os.environ.get("PG_POOL_MAX", "10"))
+# Сколько ждать свободный коннект при временно исчерпанном пуле, прежде чем
+# сдаться. asyncio.to_thread (через который идут все adb.* вызовы) может
+# запустить больше DB-потоков, чем коннектов в пуле — размер дефолтного
+# executor'а зависит от числа CPU хоста и обычно > PG_POOL_MAX. При всплеске
+# параллельных запросов с фронта getconn() моментально кидал PoolError → 500.
+# Теперь ждём освобождения (запросы выстраиваются в очередь к пулу).
+_PG_POOL_ACQUIRE_TIMEOUT = float(os.environ.get("PG_POOL_ACQUIRE_TIMEOUT", "10"))
+_PG_POOL_ACQUIRE_INTERVAL = 0.05
+
 if USE_POSTGRES:
     from psycopg2 import pool as _pg_pool
     from psycopg2.extras import RealDictCursor
 
     logger.info("Используется PostgreSQL")
 
-    # Размер пула. Минимум 1 коннект всегда держим открытым, максимум
-    # PG_POOL_MAX — это потолок одновременно открытых коннектов от этого
-    # процесса. Railway Postgres даёт ~50-100 коннектов на инстанс; 10
-    # достаточно для бота на сотни юзеров и оставляет запас другим
-    # сервисам (webapp как отдельный процесс, миграции и т.п.).
-    _PG_POOL_MIN = int(os.environ.get("PG_POOL_MIN", "1"))
-    _PG_POOL_MAX = int(os.environ.get("PG_POOL_MAX", "10"))
-    # Сколько ждать свободный коннект при временно исчерпанном пуле, прежде чем
-    # сдаться. asyncio.to_thread (через который идут все adb.* вызовы) может
-    # запустить больше DB-потоков, чем коннектов в пуле — размер дефолтного
-    # executor'а зависит от числа CPU хоста и обычно > PG_POOL_MAX. При всплеске
-    # параллельных запросов с фронта getconn() моментально кидал PoolError → 500.
-    # Теперь ждём освобождения (запросы выстраиваются в очередь к пулу).
-    _PG_POOL_ACQUIRE_TIMEOUT = float(os.environ.get("PG_POOL_ACQUIRE_TIMEOUT", "10"))
-    _PG_POOL_ACQUIRE_INTERVAL = 0.05
     _pg_connection_pool: _pg_pool.ThreadedConnectionPool | None = None
 
     def _get_pool() -> _pg_pool.ThreadedConnectionPool:
@@ -77,36 +78,67 @@ if USE_POSTGRES:
         return _pg_connection_pool
 
     def _pool_getconn():
-        """getconn с ожиданием: при исчерпании пула ждём до
-        _PG_POOL_ACQUIRE_TIMEOUT сек, опрашивая раз в _PG_POOL_ACQUIRE_INTERVAL,
-        вместо мгновенного PoolError → 500. Выполняется в worker-потоке
-        (asyncio.to_thread), поэтому time.sleep не блокирует event loop.
-        По истечении таймаута пробрасываем PoolError."""
-        pool = _get_pool()
-        deadline = time.monotonic() + _PG_POOL_ACQUIRE_TIMEOUT
-        waited = False
-        while True:
-            try:
-                return pool.getconn()
-            except _pg_pool.PoolError:
-                if time.monotonic() >= deadline:
-                    logger.error(
-                        "Postgres pool исчерпан: ждали %.1fs (max=%d) — сдаёмся",
-                        _PG_POOL_ACQUIRE_TIMEOUT,
-                        _PG_POOL_MAX,
-                    )
-                    raise
-                if not waited:
-                    waited = True
-                    logger.warning(
-                        "Postgres pool исчерпан (max=%d) — ждём свободный коннект…",
-                        _PG_POOL_MAX,
-                    )
-                time.sleep(_PG_POOL_ACQUIRE_INTERVAL)
+        return _acquire_pooled_conn(_get_pool())
+
 else:
     import sqlite3
 
     logger.info("Используется SQLite: %s", DB_PATH)
+
+
+def _in_event_loop_thread() -> bool:
+    """Идёт ли вызов в потоке, где крутится asyncio-loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _acquire_pooled_conn(pool):
+    """getconn с ожиданием: при исчерпании пула ждём до
+    _PG_POOL_ACQUIRE_TIMEOUT сек, опрашивая раз в _PG_POOL_ACQUIRE_INTERVAL,
+    вместо мгновенного PoolError → 500. По истечении — пробрасываем PoolError.
+
+    Ждать (`time.sleep`) можно только в worker-потоке (`asyncio.to_thread`).
+    Синхронный вызов БД прямо из event loop (кэш роли при промахе, забытый
+    `to_thread`) при исчерпанном пуле усыплял бы ВЕСЬ процесс на секунды:
+    все запросы WebApp и апдейты бота стоят, пока один ждёт коннект. Поэтому
+    из потока loop'а — одна попытка и громкий отказ: одна 500-я лучше
+    замороженного сервиса, а лог показывает место, которое надо увести в поток.
+    """
+    from psycopg2 import pool as _pg_pool_mod
+
+    if _in_event_loop_thread():
+        try:
+            return pool.getconn()
+        except _pg_pool_mod.PoolError:
+            logger.error(
+                "Postgres pool исчерпан, а вызов идёт прямо из event loop — не ждём "
+                "(time.sleep заморозил бы весь процесс). Уведите вызов в asyncio.to_thread.",
+                stack_info=True,
+            )
+            raise
+    deadline = time.monotonic() + _PG_POOL_ACQUIRE_TIMEOUT
+    waited = False
+    while True:
+        try:
+            return pool.getconn()
+        except _pg_pool_mod.PoolError:
+            if time.monotonic() >= deadline:
+                logger.error(
+                    "Postgres pool исчерпан: ждали %.1fs (max=%d) — сдаёмся",
+                    _PG_POOL_ACQUIRE_TIMEOUT,
+                    _PG_POOL_MAX,
+                )
+                raise
+            if not waited:
+                waited = True
+                logger.warning(
+                    "Postgres pool исчерпан (max=%d) — ждём свободный коннект…",
+                    _PG_POOL_MAX,
+                )
+            time.sleep(_PG_POOL_ACQUIRE_INTERVAL)
 
 
 class _TimedCursor:
