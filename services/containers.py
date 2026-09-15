@@ -162,7 +162,7 @@ async def list_containers(status: str | None = None, search: str | None = None) 
     )
     by_container: dict[int, list[dict]] = {}
     for it in items:
-        by_container.setdefault(int(it["container_id"]), []).append(dict(it))
+        by_container.setdefault(int(it["container_id"]), []).append(_qty_floats(dict(it)))
     for row in rows:
         row["summary"] = diff_summary(diff(by_container.get(int(row["id"]), [])))
         row["edit_window"] = edit_window(row)
@@ -471,7 +471,20 @@ async def list_items(container_id: int) -> list[dict]:
         "WHERE i.container_id = $1 ORDER BY i.id",
         container_id,
     )
-    return [dict(r) for r in rows]
+    return [_qty_floats(dict(r)) for r in rows]
+
+
+def _qty_floats(row: dict) -> dict:
+    """`expected_qty`/`arrived_qty` → float, NULL оставляем NULL.
+
+    На Postgres колонки NUMERIC и приходят Decimal: `json.dumps` на нём падает,
+    а сравнение с float в сверке — TypeError. «Не считали» (`arrived_qty IS
+    NULL`) обязано доехать как None, а не как 0 — см. шапку модуля.
+    """
+    for key in ("expected_qty", "arrived_qty"):
+        if row.get(key) is not None:
+            row[key] = float(row[key])
+    return row
 
 
 def diff(items: list[dict]) -> list[dict]:

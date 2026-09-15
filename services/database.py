@@ -7,6 +7,7 @@ import os
 import time
 import logging
 from datetime import datetime, timedelta
+from decimal import Decimal
 from contextlib import contextmanager
 from typing import Any, NamedTuple
 
@@ -54,6 +55,35 @@ _PG_POOL_MAX = int(os.environ.get("PG_POOL_MAX", "10"))
 _PG_POOL_ACQUIRE_TIMEOUT = float(os.environ.get("PG_POOL_ACQUIRE_TIMEOUT", "10"))
 _PG_POOL_ACQUIRE_INTERVAL = 0.05
 
+# Сколько синхронное соединение может простоять ВНУТРИ открытой транзакции, пока
+# сервер его не оборвёт. psycopg2 открывает транзакцию первым же SELECT'ом, и
+# `with get_conn()`, внутри которого случился сетевой вызов или зависший поток,
+# держал бы снимок и блокировки часами: VACUUM не чистит, `FOR UPDATE` соседа
+# ждёт, пул теряет соединение. 5 минут — на порядок больше любой рабочей
+# транзакции. Активно работающую сессию таймаут не трогает (он про простой
+# между командами), поэтому длинные прогоны `tasks.migrate` и разовых скриптов
+# ему не мешают; скрипт, которому нужно думать между запросами дольше,
+# снимает ограничение: PG_IDLE_IN_TX_TIMEOUT_MS=0. asyncpg-пул это не
+# касается — у него свои таймауты (`adb_core.pg_server_settings`).
+_DEFAULT_IDLE_IN_TX_TIMEOUT_MS = 300_000
+
+
+def pg_session_options() -> dict[str, str]:
+    """kwargs для psycopg2.connect: `options=-c idle_in_transaction_session_timeout=…`.
+
+    Env читается при создании пула, а не при импорте: скрипт может выставить
+    значение до первого обращения к базе. 0 — ограничение снято (опции нет).
+    """
+    try:
+        ms = max(0, int(os.environ.get("PG_IDLE_IN_TX_TIMEOUT_MS", _DEFAULT_IDLE_IN_TX_TIMEOUT_MS)))
+    except (TypeError, ValueError):
+        ms = _DEFAULT_IDLE_IN_TX_TIMEOUT_MS
+    if ms == 0 or "options=" in DATABASE_URL:
+        # Свои `options` в URL уже заданы — kwargs их ПЕРЕЗАПИСАЛИ бы целиком
+        # (psycopg2.extensions.make_dsn), и чужая настройка молча пропала бы.
+        return {}
+    return {"options": f"-c idle_in_transaction_session_timeout={ms}"}
+
 if USE_POSTGRES:
     from psycopg2 import pool as _pg_pool
     from psycopg2.extras import RealDictCursor
@@ -67,8 +97,9 @@ if USE_POSTGRES:
         в окружениях без DATABASE_URL (тесты, миграции) без падения."""
         global _pg_connection_pool
         if _pg_connection_pool is None:
+            kwargs = pg_session_options()
             _pg_connection_pool = _pg_pool.ThreadedConnectionPool(
-                _PG_POOL_MIN, _PG_POOL_MAX, DATABASE_URL
+                _PG_POOL_MIN, _PG_POOL_MAX, DATABASE_URL, **kwargs
             )
             logger.info(
                 "Postgres pool создан: min=%d, max=%d",
@@ -338,9 +369,14 @@ def _table_ddls() -> list[str]:
     сверки схемы при старте (`services.schema_check`): ожидаемые колонки
     берутся отсюда же, иначе список для сверки разъехался бы с определением."""
     id_type = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
-    # Количества складского учёта: на Postgres NUMERIC (точная десятичная
-    # арифметика — остаток не накапливает дрейф при дробных отгрузках),
-    # на SQLite REAL (NUMERIC там всё равно сводится к REAL-аффинности).
+    # ВСЕ количества (склад, позиции заказа и возврата, состав контейнера): на
+    # Postgres NUMERIC — точная десятичная арифметика; на SQLite REAL (NUMERIC
+    # там всё равно сводится к REAL-аффинности). REAL на Postgres — это float4:
+    # 2.3 хранится как 2.2999999523, дробные возвраты не сходились с
+    # количеством, и заказ не становился «возвращён полностью». Базы, где
+    # колонки уже созданы REAL, догоняет разовый scripts/apply_constraints.
+    # Читающий код получает Decimal (asyncpg/psycopg2) и приводит к float на
+    # границе — как у stock/invoice_items.
     qty_type = "NUMERIC" if USE_POSTGRES else "REAL"
 
     # Элементы списка оставлены с прежним отступом (внутри скобок он не
@@ -453,10 +489,10 @@ def _table_ddls() -> list[str]:
                 order_id             BIGINT NOT NULL,
                 product_name         TEXT NOT NULL,
                 product_href         TEXT,
-                quantity             REAL NOT NULL DEFAULT 1,
+                quantity             {qty_type} NOT NULL DEFAULT 1,
                 unit                 TEXT DEFAULT 'шт',
                 price_cents          BIGINT NOT NULL DEFAULT 0,
-                returned_qty         REAL NOT NULL DEFAULT 0,
+                returned_qty         {qty_type} NOT NULL DEFAULT 0,
                 note                 TEXT
             )""",
             f"""CREATE TABLE IF NOT EXISTS shipment_requests (
@@ -480,7 +516,7 @@ def _table_ddls() -> list[str]:
             )""",
             # ─── IMPLEMENTATION.md Фаза 1–2 (адаптировано под dual-DB) ──────────
             # Конвенции проекта: TEXT для JSON/UUID/timestamp, BIGINT-копейки
-            # для денег (REAL — только количества/остатки/курсы),
+            # для денег (количества — qty_type, см. выше; REAL — курсы),
             # INTEGER 0/1 для boolean, BIGINT — telegram user_id, без FK
             # (как и остальные таблицы здесь). Postgres-специфику (JSONB,
             # gen_random_uuid, NUMERIC) НЕ используем — иначе ломается SQLite.
@@ -535,7 +571,7 @@ def _table_ddls() -> list[str]:
                 id            {id_type},
                 return_id     BIGINT NOT NULL,
                 order_item_id BIGINT NOT NULL,
-                qty           REAL NOT NULL,
+                qty           {qty_type} NOT NULL,
                 amount_cents  BIGINT NOT NULL
             )""",
             # Журнал изменений заказа (before/after/summary как JSON-текст).
@@ -1052,8 +1088,8 @@ def _table_ddls() -> list[str]:
                 container_id  INTEGER NOT NULL REFERENCES containers(id),
                 name          TEXT NOT NULL,
                 unit          TEXT NOT NULL DEFAULT 'шт',
-                expected_qty  REAL NOT NULL DEFAULT 0,
-                arrived_qty   REAL,
+                expected_qty  {qty_type} NOT NULL DEFAULT 0,
+                arrived_qty   {qty_type},
                 note          TEXT,
                 created_at    TEXT
             )""",
@@ -1239,12 +1275,12 @@ def _create_tables():
                 logger.exception("CREATE TABLE не выполнен — схема неполная")
 
 
-def _create_indexes():
-    """CREATE INDEX IF NOT EXISTS — idempotent. Можно гонять при каждом
-    старте, postgres и sqlite оба корректно работают."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        snapshot_indexes = [
+def _index_ddls() -> list[str]:
+    """Определения всех индексов — ОДИН источник и для `_create_indexes`, и
+    для сверки при старте (`startup_checks.check_indexes`): индекс, который
+    молча не создался, виден только так."""
+    # Элементы списка оставлены с прежним отступом — см. _table_ddls.
+    snapshot_indexes = [
             # ─── Локальный складской учёт ────────────────────────────
             # Номер накладной — бизнес-ключ. UNIQUE ловит гонку двух
             # параллельных создающих транзакций: счётчик инкрементится
@@ -1276,6 +1312,12 @@ def _create_indexes():
             "ON invoices(counterparty_id)",
             # Список накладных в WebApp: сортировка по дате, фильтр по типу.
             "CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(invoice_date)",
+            # Отгрузки за период (warehouse.list_shipments → отчёт продаж,
+            # аналитика): type = 'outgoing' AND status = 'confirmed' AND
+            # invoice_date в диапазоне ORDER BY invoice_date DESC, id DESC —
+            # индекс отдаёт строки уже в нужном порядке.
+            "CREATE INDEX IF NOT EXISTS idx_invoices_type_status_date "
+            "ON invoices(type, status, invoice_date, id)",
             # Обратный поиск «локальный id → ms_id» при сверке миграции.
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_ms_id_map_local "
             "ON ms_id_map(entity_type, local_id)",
@@ -1296,7 +1338,6 @@ def _create_indexes():
             "CREATE INDEX IF NOT EXISTS idx_returns_order ON returns(order_id)",
             "CREATE INDEX IF NOT EXISTS idx_returns_status ON returns(status)",
             "CREATE INDEX IF NOT EXISTS idx_change_log_order ON order_change_log(order_id, created_at)",
-            "CREATE INDEX IF NOT EXISTS idx_credit_limits_updated_at ON credit_limits(updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_idempotency_expires ON idempotency_keys(expires_at)",
             "CREATE INDEX IF NOT EXISTS idx_cron_runs_task_started ON cron_runs(task_name, started_at)",
             # Долг агента (get_agent_current_debt) и check_credit_limit (на каждом
@@ -1305,6 +1346,11 @@ def _create_indexes():
             "CREATE INDEX IF NOT EXISTS idx_orders_agent_id ON orders(agent_id)",
             # Заказы менеджера (get_user_orders, аналитика) — фильтр+сортировка.
             "CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at)",
+            # Все заказы свежими вперёд (get_all_orders → /api/orders босса и
+            # кладовщика; страница `limit`): ORDER BY created_at DESC без
+            # фильтра по менеджеру. id — развязка одинаковых секунд, иначе
+            # страницы на границе теряют или дублируют строку.
+            "CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at, id)",
             # Аудит: get_audit_log сортирует по created_at, prune_audit_log
             # фильтрует по нему.
             "CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at)",
@@ -1312,6 +1358,16 @@ def _create_indexes():
             # делают ORDER BY created_at DESC LIMIT / range по created_at на этих
             # трёх таблицах — без индекса full scan + sort, дорожает с ростом БД.
             "CREATE INDEX IF NOT EXISTS idx_payments_created ON payments(created_at)",
+            # «Мои платежи» менеджера (/api/payments/my): WHERE user_id ORDER BY
+            # created_at DESC LIMIT 50 — без пары колонок это скан всех платежей.
+            "CREATE INDEX IF NOT EXISTS idx_payments_user_created ON payments(user_id, created_at)",
+            # Итог «Деньги» и лента движения денег (get_money_totals,
+            # get_cash_history) режут период по COALESCE(confirmed_at,
+            # created_at) среди подтверждённых. Индекс по выражению, частичный:
+            # pending/rejected в итог не входят. SQLite умеет и то и другое
+            # (3.9+), поэтому определение общее.
+            "CREATE INDEX IF NOT EXISTS idx_payments_confirmed_period "
+            "ON payments((COALESCE(confirmed_at, created_at))) WHERE status = 'confirmed'",
             "CREATE INDEX IF NOT EXISTS idx_cash_deposits_created ON cash_deposits(created_at)",
             "CREATE INDEX IF NOT EXISTS idx_returns_created ON returns(created_at)",
             # ── Уникальность (§2.1, §3.4) ────────────────────────────────────
@@ -1343,11 +1399,6 @@ def _create_indexes():
             # удорожал бы каждую вставку платежа.
             "CREATE INDEX IF NOT EXISTS idx_payments_order_status "
             "ON payments(order_id, status)",
-            "CREATE INDEX IF NOT EXISTS idx_payments_pending "
-            "ON payments(status) WHERE status = 'pending'",
-            # get_all_users() — полный скан с сортировкой на КАЖДОЕ уведомление
-            # (через get_notify_recipients).
-            "CREATE INDEX IF NOT EXISTS idx_user_roles_role ON user_roles(role)",
             # get_open_debts: payment_type='credit' + status IN (...) +
             # paid_confirmed_at IS NULL. Прежний idx_orders_credit_due был
             # (payment_type, paid_at, due_date) — запрос им не покрывался.
@@ -1362,10 +1413,9 @@ def _create_indexes():
             "ON machine_hours(machine_id, recorded_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_machine_deals_machine "
             "ON machine_deals(machine_id, sold_at DESC)",
-            # График читается по сделке (карточка) и по сроку (ежедневный
+            # График читается по сделке (карточка — её покрывает UNIQUE
+            # (deal_id, seq) из определения таблицы) и по сроку (ежедневный
             # обход неоплаченных платежей в напоминалке).
-            "CREATE INDEX IF NOT EXISTS idx_machine_deal_payments_deal "
-            "ON machine_deal_payments(deal_id, seq)",
             "CREATE INDEX IF NOT EXISTS idx_machine_deal_payments_due "
             "ON machine_deal_payments(due_date)",
             "CREATE INDEX IF NOT EXISTS idx_machine_receipts_deal "
@@ -1374,7 +1424,6 @@ def _create_indexes():
             # Воронка: список фильтруется по менеджеру и по последней
             # активности, события читаются по лиду.
             "CREATE INDEX IF NOT EXISTS idx_channel_posts_ref ON channel_posts(kind, ref)",
-            "CREATE INDEX IF NOT EXISTS idx_product_photos_ms ON product_photos(ms_id)",
             "CREATE INDEX IF NOT EXISTS idx_leads_manager ON leads(manager_id)",
             "CREATE INDEX IF NOT EXISTS idx_leads_last_inbound ON leads(last_inbound_at)",
             "CREATE INDEX IF NOT EXISTS idx_lead_events_lead ON lead_events(lead_id, at)",
@@ -1383,7 +1432,6 @@ def _create_indexes():
             # перезвонить»), поэтому индекс именно по нему, а не по дате.
             "CREATE INDEX IF NOT EXISTS idx_lead_calls_lead ON lead_calls(lead_id, at)",
             "CREATE INDEX IF NOT EXISTS idx_lead_calls_at ON lead_calls(at)",
-            "CREATE INDEX IF NOT EXISTS idx_lead_calls_phone ON lead_calls(phone_key)",
             "CREATE INDEX IF NOT EXISTS idx_containers_status ON containers(status)",
             "CREATE INDEX IF NOT EXISTS idx_container_items_container "
             "ON container_items(container_id, id)",
@@ -1412,23 +1460,84 @@ def _create_indexes():
             "ON order_item_products(product_id)",
             "CREATE INDEX IF NOT EXISTS idx_order_shipment_failed "
             "ON order_shipment(failed_at) WHERE failed_at IS NOT NULL",
+            # ── Одна накладная — один владелец ───────────────────────────────
+            # Отгрузка заказа, приход возврата и приёмка контейнера ссылаются на
+            # накладную, и каждая такая накладная принадлежит ровно одному
+            # документу: отмена отгрузки одного заказа иначе отменила бы
+            # списание другого, а сверка «остаток не списан» считала бы товар
+            # дважды. Код дублей не пишет (повторная приёмка ОТМЕНЯЕТ старую
+            # накладную и заводит новую, отмена отгрузки обнуляет ссылку), так
+            # что индекс — последний рубеж от ручной правки и импорта.
+            # Частичные: пустая ссылка (отгрузка не прошла, склад не двигали,
+            # контейнер оприходован ещё в МС) законна у любого числа строк.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_order_shipment_invoice "
+            "ON order_shipment(invoice_id) WHERE invoice_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_return_receipt_invoice "
+            "ON return_receipt(invoice_id) WHERE invoice_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_container_receipt_invoice "
+            "ON container_receipt(invoice_id) WHERE invoice_id IS NOT NULL",
             # Позиции заказа и возврата читаются ТОЛЬКО по родителю: карточка
             # заказа, долг агента (батч по order_id), отгрузка, возврат. PK стоит
             # на id, и без этих индексов каждый такой запрос читал таблицу
             # целиком — самую длинную в схеме.
             "CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id)",
             "CREATE INDEX IF NOT EXISTS idx_return_items_return ON return_items(return_id)",
+            # Одна позиция заказа — одна строка в возврате. Две строки на одну
+            # позицию проходят проверку «не больше доступного» каждая по
+            # отдельности, и подтверждение возврата упиралось в overshoot уже
+            # после того, как деньги посчитаны. Ручка отвергает повтор позиции
+            # раньше (400), индекс — рубеж для любого другого пути.
+            # idx_return_items_return выше НЕ убираем, хотя он префикс этого:
+            # не создайся UNIQUE из-за дублей в данных — чтение позиций по
+            # возврату осталось бы без индекса вовсе.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_return_items_return_item "
+            "ON return_items(return_id, order_item_id)",
         ]
-        from services.accounting_schema import INDEXES as _accounting_indexes
+    from services.accounting_schema import INDEXES as _accounting_indexes
 
-        snapshot_indexes.extend(_accounting_indexes)
-        for sql in snapshot_indexes:
+    snapshot_indexes.extend(_accounting_indexes)
+    return snapshot_indexes
+
+
+# Индексы, убранные из `_index_ddls` как лишние. Удаление строки из списка
+# индекс на существующей базе НЕ удаляет — это делает разовый
+# `scripts/apply_constraints --apply` (DROP INDEX IF EXISTS). Список здесь, а не
+# в скрипте, чтобы сторож (`tests/test_db_constraints.py`) видел, что убранный
+# индекс не вернулся в определения.
+DROPPED_INDEXES: dict[str, str] = {
+    "idx_machine_deal_payments_deal": "дубль UNIQUE (deal_id, seq) из определения таблицы",
+    "idx_product_photos_ms": "префикс UNIQUE (ms_id, file_unique_id)",
+    "idx_credit_limits_updated_at": "ни один запрос не фильтрует и не сортирует по updated_at",
+    "idx_payments_pending": (
+        "платежи по статусу ищутся только вместе с order_id — это idx_payments_order_status"
+    ),
+    "idx_user_roles_role": "таблица на десятки строк; get_all_users сортирует её целиком",
+    "idx_lead_calls_phone": "по phone_key нет ни одного запроса",
+}
+
+
+def _create_indexes() -> list[str]:
+    """CREATE INDEX IF NOT EXISTS — idempotent, гоняется при каждом старте.
+
+    Возвращает список индексов, которые создать НЕ удалось. Раньше отказ
+    уходил в DEBUG, и индекс, не созданный из-за дублей в данных (UNIQUE) или
+    опечатки, было не увидеть ничем, кроме медленного запроса. Теперь ERROR в
+    лог; алерт админам поднимает `startup_checks` — он сверяет имена индексов
+    живой базы с `_index_ddls` (здесь async-алертам взяться неоткуда: init_db
+    синхронный и зовётся и из cron-CLI).
+    """
+    failed: list[str] = []
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        for sql in _index_ddls():
             try:
                 cur.execute(sql)
                 conn.commit()
             except Exception as e:
                 conn.rollback()
-                logger.debug("Индекс не создан: %s", e)
+                failed.append(sql)
+                logger.error("Индекс не создан: %s — %s: %s", sql, type(e).__name__, e)
+    return failed
 
 
 def seed_warehouses() -> int:
@@ -3995,8 +4104,13 @@ async def create_return(
         oi = oitems.get(oitem_id)
         if not oi:
             continue
-        available = float(oi.get("quantity", 0) or 0) - float(oi.get("returned_qty", 0) or 0)
-        take = min(float(qty), available)
+        # Десятичной арифметикой, а не float: 1.1 − 0.9 во float даёт
+        # 0.20000000000000007, и такой «остаток» при подтверждении не пролезал
+        # в `returned_qty + qty <= quantity` на NUMERIC-колонке (overshoot).
+        available = Decimal(str(oi.get("quantity", 0) or 0)) - Decimal(
+            str(oi.get("returned_qty", 0) or 0)
+        )
+        take = float(min(Decimal(str(qty)), available))
         if take <= 0:
             continue
         clamped.append((oitem_id, take, money.mul_qty(_price_cents(oi), take)))
@@ -6998,10 +7112,26 @@ _ORDER_ITEMS_SELECT = (
 )
 
 
+def _item_row(row):
+    """Строка позиции заказа: мажорная цена + количества float'ом.
+
+    `quantity`/`returned_qty` на Postgres — NUMERIC, и драйвер отдаёт Decimal:
+    `json.dumps` на нём падает (500 в любой ручке с позициями), а `Decimal *
+    float` в расчётах — TypeError. Приводим на границе чтения, как остатки
+    склада; точность хранения остаётся за NUMERIC.
+    """
+    d = _with_major(row, ("price", "price_cents"))
+    if d is not None:
+        for key in ("quantity", "returned_qty"):
+            if d.get(key) is not None:
+                d[key] = float(d[key])
+    return d
+
+
 async def get_order_items(order_id: int) -> list[dict]:
     """asyncpg Stage 19 (#21): native async (fetch)."""
     rows = await adb_core.fetch(f"{_ORDER_ITEMS_SELECT} WHERE oi.order_id = $1", order_id)
-    return _with_major(rows, ("price", "price_cents"))
+    return [_item_row(r) for r in rows]
 
 
 async def get_order_items_by_ids(order_ids: list[int]) -> dict[int, list[dict]]:
@@ -7027,9 +7157,7 @@ async def get_order_items_by_ids(order_ids: list[int]) -> dict[int, list[dict]]:
         )
     grouped: dict[int, list[dict]] = {}
     for r in rows:
-        grouped.setdefault(r["order_id"], []).append(
-            _with_major(r, ("price", "price_cents"))
-        )
+        grouped.setdefault(r["order_id"], []).append(_item_row(r))
     return grouped
 
 
@@ -7037,7 +7165,7 @@ async def get_order_item(item_id: int) -> dict | None:
     """asyncpg Stage 11 (#21): native async. Leaf — внутри database.py
     не вызывается (есть get_order_items / get_order_items_by_ids)."""
     row = await adb_core.fetchrow(f"{_ORDER_ITEMS_SELECT} WHERE oi.id = $1", item_id)
-    return _with_major(row, ("price", "price_cents"))
+    return _item_row(row)
 
 
 def remove_order_item(item_id: int, *, require_draft: bool = False) -> bool:

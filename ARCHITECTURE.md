@@ -315,12 +315,26 @@ status='pending'`, `idx_orders_ms_customerorder` / `idx_orders_ms_demand`
 paid_confirmed_at)` — под `get_open_debts`; `idx_orders_status`,
 `idx_orders_agent_id`, `idx_orders_user_created`; `idx_payments_order_status
 (order_id, status)` — он же покрывает «все платежи по заказу» как префикс;
-`idx_payments_pending (status) WHERE status='pending'`;
 `idx_cash_deposit_orders_order (order_id)` — PK `(deposit_id, order_id)` для
-поиска по `order_id` не работает; `idx_user_roles_role (role)`;
-`idx_shipment_requests_status`, индексы `created_at` денежных лент,
+поиска по `order_id` не работает; `idx_shipment_requests_status`, индексы
+`created_at` денежных лент, `idx_orders_created (created_at, id)` (все заказы
+свежими вперёд), `idx_payments_user_created`, частичный
+`idx_payments_confirmed_period` по `COALESCE(confirmed_at, created_at)` (итог
+«Деньги» и лента), `idx_invoices_type_status_date` (отгрузки за период),
 `idx_order_item_products_*` и `idx_order_shipment_failed` (дайджест «остаток не
 списан»).
+
+**Одна накладная — один владелец:** частичные UNIQUE по `invoice_id` у
+`order_shipment`, `return_receipt`, `container_receipt`; UNIQUE `return_items
+(return_id, order_item_id)`, `acc_day_closes(doc_id)` (на `(account_id,
+close_date)` — нет: пересчёт кассы дважды за день законен).
+
+Убранные индексы (`database.DROPPED_INDEXES`: дубли UNIQUE и индексы без
+запросов) на существующей базе снимает разовый `scripts/apply_constraints
+--apply`; он же переводит количества REAL→NUMERIC и ставит FK/CHECK. Индекс,
+который не создался, `_create_indexes` пишет ERROR, а сверка старта
+(`startup_checks`) называет его в алерте — вместе с типами колонок
+(NUMERIC/BIGINT) и ICU-коллацией.
 
 ---
 

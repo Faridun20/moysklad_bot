@@ -116,4 +116,11 @@ INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_acc_entries_doc ON acc_entries(doc_id)",
     "CREATE INDEX IF NOT EXISTS idx_acc_entries_account ON acc_entries(account_id)",
     "CREATE INDEX IF NOT EXISTS idx_acc_day_closes_account ON acc_day_closes(account_id, close_date)",
+    # Закрытие дня — строка при документе сверки, одна на документ: результат
+    # повтора читается по doc_id (`_close_result`), и вторая строка сделала бы
+    # ответ произвольным. UNIQUE на (account_id, close_date) НЕ ставим
+    # сознательно: пересчитать кассу дважды за день законно (утром нашли
+    # расхождение, вечером пересчитали снова) — каждая сверка своим документом.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_acc_day_closes_doc "
+    "ON acc_day_closes(doc_id) WHERE doc_id IS NOT NULL",
 ]

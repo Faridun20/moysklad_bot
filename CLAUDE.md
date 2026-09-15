@@ -25,6 +25,9 @@ python bot.py                              # локально: без Postgres �
 python -m tasks.migrate                    # schema + data миграции, ДО старта сервисов на проде
 python -m scripts.apply_legacy_columns --dry-run   # РАЗОВО: догнать существующую базу
                                            # до текущей схемы (--apply). Не из migrate.
+python -m scripts.apply_constraints          # РАЗОВО (по умолчанию dry-run): количества
+                                           # REAL→NUMERIC, FK/CHECK (NOT VALID+VALIDATE,
+                                           # нарушители — в отчёт), снять лишние индексы (--apply)
 python -m scripts.migrate_history_from_moysklad --dry-run   # РАЗОВО: история МС —
                                            # продажи И закупки. Остатки не двигает.
 
@@ -97,6 +100,34 @@ Variable: новые сервисы (cron'ы) переменную не насл
   `python -m tasks.migrate --rerun-backfill <имя>|all`. Каждый старт гоняется
   лишь сидинг, который вставляет отсутствующее. Новую data-миграцию, которая
   МЕНЯЕТ строки (особенно деньги), — только в `ONE_TIME_BACKFILLS` или в `scripts/`.
+- **Количества — `qty_type` (NUMERIC на Postgres) во ВСЕХ таблицах**, не REAL:
+  REAL там float4, 2.3 хранится как 2.2999999523, и дробный возврат не
+  закрывал заказ. Драйверы отдают Decimal — приводи к float на границе чтения
+  (`database._item_row`, `containers._qty_floats`, как у `stock`), иначе
+  `json.dumps` даёт 500. asyncpg кладёт Python float в NUMERIC двоичным хвостом
+  (2.29999999999999982…) — `adb_core._pg_args` переводит float-параметры в
+  `Decimal(repr)`, не обходи его прямым `conn.execute`.
+- **Индексы — `database._index_ddls()`**, один источник для `_create_indexes` и
+  сверки старта. Отказ создания — ERROR в лог, а `startup_checks` сверяет имена
+  индексов, типы NUMERIC/BIGINT и ICU-коллацию и шлёт алерт. Убираешь индекс —
+  имя в `DROPPED_INDEXES` (на базе его снимет `scripts/apply_constraints`).
+  UNIQUE на `(acc_day_closes.account_id, close_date)` нет намеренно: сверка
+  кассы дважды за день законна.
+- **FK/CHECK денежных и складских таблиц живут только на проде** (ставит
+  `scripts/apply_constraints`, в DDL их нет — SQLite не добавит их к
+  существующей таблице). Значит: удаляй детей ДО родителя, статусы — только из
+  списка в скрипте (граф заказа берётся из `order_workflow.TRANSITIONS`), и
+  проверяй новый путь записи `tests/test_db_constraints_postgres.py::
+  test_constraints_hold_for_real_service_flows`. Postgres проверяет CHECK у
+  вставляемой строки UPSERT'а ДО конфликта — поэтому списание остатка идёт
+  UPDATE'ом (`warehouse._apply_stock_delta`), а не `INSERT … ON CONFLICT`.
+- **Сортировка и поиск по названию:** `ORDER BY {adb_core.order_by_name('name')}`
+  (ICU `ru-RU-x-icu` на Postgres — Alpine/musl иначе сортирует по кодам:
+  «Zeta, alfa, Ёлка, Абрикос»), LIKE — `adb_core.name_search_sql/
+  name_search_param` (нижний регистр и ё→е с обеих сторон).
+- Синхронный пул ставит `idle_in_transaction_session_timeout` (5 мин,
+  `PG_IDLE_IN_TX_TIMEOUT_MS`, 0 — снять): `with get_conn()` с сетевым вызовом
+  внутри больше не держит снимок и блокировки часами.
 - Webapp endpoint'ы: `services.async_db as adb` (`await adb.get_user(uid)`) — обёртка через `asyncio.to_thread`. В bot handlers — то же или явный `asyncio.to_thread`.
 - Роль читай через `services.roles.cached_role(user_id)` (TTL 30s, одна запись кэша с флагом деактивации — один SELECT на оба факта) и предикаты `is_boss / can_create_orders / ...`. НЕ через `services.database.get_role` напрямую — обойдёшь кэш. **Деактивация:** `get_role` отдаёт `guest` если `user_roles.deactivated_at` стоит → деактивированный теряет ВСЕ права. `deactivate_user/reactivate_user` (адмін, `/deactivate`/`/reactivate` + webapp `/api/users/deactivate`).
 - **Временно: менеджер = + кладовщик + бухгалтер** (решение владельца: отдельных сотрудников пока нет, босс проверяет работу). Совмещение — одна таблица `services.roles.ROLE_ALSO_ACTS_AS` (зеркало `ROLE_ALSO_ACTS_AS` в `helpers.js`, сверяет `tests/test_roles_manager_acts_as.py`), а НЕ правка кортежей `allowed_roles`. Поэтому сверка «роль ∈ разрешённых» — только через `role_allowed` (`_authorize`, `_has_role`, `can_transition`, очередь «Сегодня», ops-пинг) и `roleIn` во фронте; голый `role in (...)` с `warehouse_keeper`/`bookkeeper` обойдёт совмещение. Admin/boss-only права (себестоимость, прибыль, одобрение, подтверждение возврата) оно не даёт. Карточки «подтвердить сдачу/возврат» менеджер получает, только если активного носителя роли нет (`notify_recipients`). `/addrole` роли из `PAUSED_ROLES` не назначает; уже назначенные работают. **Откат** — очистить `ROLE_ALSO_ACTS_AS` (в обоих местах) и `PAUSED_ROLES`.

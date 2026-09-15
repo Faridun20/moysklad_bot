@@ -150,7 +150,14 @@ def actual_schema() -> dict[str, set[str]]:
 def check_schema(
     expected: dict[str, set[str]] | None = None, actual: dict[str, set[str]] | None = None
 ) -> list[str]:
-    """Список расхождений человеческим текстом; пусто — схема сходится."""
+    """Список расхождений человеческим текстом; пусто — схема сходится.
+
+    Без аргументов сверяет живую базу целиком: таблицы и колонки, индексы
+    (`check_indexes`), типы денег и количеств (`check_column_types`) и
+    коллацию сортировки по-русски. С явными `expected`/`actual` — только
+    колонки: так её зовут тесты разбора.
+    """
+    live = expected is None and actual is None
     if expected is None:
         from services import database as db
 
@@ -165,7 +172,170 @@ def check_schema(
         missing = sorted(expected[table] - actual[table])
         if missing:
             problems.append(f"{table}: нет колонок {', '.join(missing)}")
+    if live:
+        problems += check_indexes()
+        problems += check_column_types()
+        problems += check_collation()
     return problems
+
+
+# ─── Индексы ──────────────────────────────────────────────────────────────────
+
+_INDEX_RE = re.compile(
+    r"^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)", re.IGNORECASE
+)
+
+
+def expected_indexes(ddls: list[str]) -> set[str]:
+    """Имена индексов из текстов CREATE [UNIQUE] INDEX IF NOT EXISTS."""
+    return {m.group(1).lower() for sql in ddls if (m := _INDEX_RE.match(sql))}
+
+
+def actual_indexes() -> set[str]:
+    """Имена индексов живой базы: pg_indexes текущей схемы / sqlite_master."""
+    from services import database as db
+
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        if db.USE_POSTGRES:
+            cur.execute("SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()")
+            return {str(r["indexname"]).lower() for r in cur.fetchall()}
+        cur.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        return {str(r[0]).lower() for r in cur.fetchall()}
+
+
+def check_indexes(expected: set[str] | None = None, actual: set[str] | None = None) -> list[str]:
+    """Индексы из `_index_ddls`, которых в базе нет.
+
+    `_create_indexes` не падает на отказе (старт важнее индекса), поэтому
+    UNIQUE, не созданный из-за дублей в данных, иначе молчал бы: инвариант
+    «одна накладная — один владелец» просто не действует, и никто не знает.
+    Лишние индексы не тревога — их убирает разовый scripts/apply_constraints.
+    """
+    if expected is None:
+        from services import database as db
+
+        expected = expected_indexes(db._index_ddls())
+    if actual is None:
+        actual = actual_indexes()
+    missing = sorted(expected - actual)
+    if not missing:
+        return []
+    return [f"нет индексов: {', '.join(missing)}"]
+
+
+# ─── Типы колонок ─────────────────────────────────────────────────────────────
+
+# Семейства типов, расхождение в которых портит данные МОЛЧА: количество в
+# REAL (float4 на Postgres — 2.3 хранится как 2.2999999523, возврат «полностью»
+# не сходится) и деньги не в BIGINT (INTEGER переполняется на суммах в сумах).
+# Остальные типы не сверяем: исторические TEXT/INTEGER эпохи МойСклад законны,
+# а тревога на каждом старте из-за них научила бы тревоги игнорировать.
+_WATCHED_FAMILIES = {"numeric", "bigint"}
+
+
+def _type_family(declared: str) -> str:
+    t = declared.strip().lower()
+    if t.startswith(("numeric", "decimal")):
+        return "numeric"
+    if t in {"real", "float4", "double precision", "float8", "float"}:
+        return "float"
+    if t in {"bigint", "int8"}:
+        return "bigint"
+    if t.startswith(("int", "serial", "smallint")):
+        return "integer"
+    return t
+
+
+def expected_column_types(ddls: list[str]) -> dict[tuple[str, str], str]:
+    """{(таблица, колонка): семейство} для колонок NUMERIC/BIGINT из DDL."""
+    out: dict[tuple[str, str], str] = {}
+    for sql in ddls:
+        m = _CREATE_RE.match(sql)
+        if not m:
+            continue
+        table = m.group(1).lower()
+        for part in _split_top_level(_strip_sql_comments(m.group(2))):
+            tokens = part.split()
+            if len(tokens) < 2 or tokens[0].upper() in _CONSTRAINT_WORDS:
+                continue
+            family = _type_family(tokens[1])
+            if family in _WATCHED_FAMILIES:
+                out[(table, tokens[0].strip('"').lower())] = family
+    return out
+
+
+def actual_column_types() -> dict[tuple[str, str], str]:
+    """{(таблица, колонка): семейство} живой базы."""
+    from services import database as db
+
+    out: dict[tuple[str, str], str] = {}
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        if db.USE_POSTGRES:
+            cur.execute(
+                "SELECT table_name, column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema = current_schema()"
+            )
+            for r in cur.fetchall():
+                out[(str(r["table_name"]).lower(), str(r["column_name"]).lower())] = _type_family(
+                    str(r["data_type"])
+                )
+        else:
+            cur.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            for (t,) in [tuple(r) for r in cur.fetchall()]:
+                cur.execute(f'PRAGMA table_info("{t}")')
+                for r in cur.fetchall():
+                    out[(str(t).lower(), str(r[1]).lower())] = _type_family(str(r[2] or ""))
+    return out
+
+
+def check_column_types(
+    expected: dict[tuple[str, str], str] | None = None,
+    actual: dict[tuple[str, str], str] | None = None,
+) -> list[str]:
+    """Колонки, у которых в базе не тот тип, что в определении (NUMERIC/BIGINT).
+
+    Отсутствующую колонку здесь не повторяем — о ней уже сказала сверка колонок.
+    """
+    if expected is None:
+        from services import database as db
+
+        expected = expected_column_types(db._table_ddls())
+    if actual is None:
+        actual = actual_column_types()
+    wrong = [
+        f"{t}.{c} {actual[(t, c)]} вместо {fam}"
+        for (t, c), fam in sorted(expected.items())
+        if (t, c) in actual and actual[(t, c)] != fam
+    ]
+    if not wrong:
+        return []
+    return [f"тип колонок разошёлся с определением: {', '.join(wrong)}"]
+
+
+def check_collation() -> list[str]:
+    """На Postgres должна быть ICU-коллация, по которой сортируются названия.
+
+    Без неё каталог и справочник контрагентов отвечают ошибкой SQL целиком,
+    а не просто сортируют криво — поэтому это тревога старта, а не мелочь.
+    """
+    from services import adb_core
+    from services import database as db
+
+    if not db.USE_POSTGRES:
+        return []
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            "SELECT 1 AS ok FROM pg_collation WHERE collname = %s", (adb_core.NAME_COLLATION,)
+        )
+        if cur.fetchone():
+            return []
+    return [
+        f"нет коллации {adb_core.NAME_COLLATION} (Postgres собран без ICU?) — "
+        "сортировка каталога и контрагентов упадёт"
+    ]
 
 
 # ─── Часовой пояс ─────────────────────────────────────────────────────────────
@@ -239,8 +409,9 @@ async def run_startup_checks(process: str = "") -> dict[str, list[str]]:
             f"Схема БД отстаёт от кода{where}",
             result["schema"]
             + [
-                "Существующую базу догоняет разовый scripts/apply_legacy_columns: "
-                "колонка должна быть в его списке, прогон --dry-run, затем --apply"
+                "Недостающие колонки догоняет разовый scripts/apply_legacy_columns, "
+                "типы и лишние индексы — scripts/apply_constraints: прогон "
+                "--dry-run, затем --apply"
             ],
             key="startup-schema",
         )

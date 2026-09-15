@@ -32,9 +32,72 @@ import os
 import re
 import tempfile
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from typing import Any
 
 _PARAM_RE = re.compile(r"\$(\d+)")
+
+
+def _pg_args(args: tuple) -> tuple:
+    """float-параметры → Decimal по КРАТЧАЙШЕЙ записи числа (`repr`).
+
+    asyncpg кладёт Python float в NUMERIC-колонку двоичным значением целиком:
+    2.3 уезжает как 2.29999999999999982236431605997495353221893310546875.
+    Количества склада и заказов ради того и переведены в NUMERIC, чтобы не
+    копить хвосты float, — а драйвер приносил их обратно на входе, и сумма
+    дробных отгрузок снова не сходилась с «возвращено полностью». psycopg2
+    (синхронный слой) пишет float литералом `2.3`, поэтому расходился только
+    асинхронный путь. Decimal принимают и NUMERIC, и REAL/DOUBLE-параметры
+    (через __float__), так что замена безопасна для любого типа параметра.
+    `type(a) is float`, а не isinstance: bool и прочие подклассы не трогаем.
+    """
+    if not any(type(a) is float for a in args):
+        return args
+    return tuple(Decimal(repr(a)) if type(a) is float else a for a in args)
+
+
+# ─── Сортировка и поиск по названию ────────────────────────────────────────────
+
+# ICU-правило сравнения для русского. Postgres в образе на Alpine (musl) не
+# умеет libc-локалей: `ORDER BY name` там сортирует по кодам символов —
+# «Zeta, alfa, Ёлка, Абрикос». ICU-коллации в образ входят (initdb заводит их в
+# pg_collation), и `ru-RU-x-icu` даёт «Абрикос, Ёлка, alfa, Zeta» без смены
+# локали всей базы. Наличие коллации сверяет `startup_checks`.
+NAME_COLLATION = "ru-RU-x-icu"
+
+
+def order_by_name(column: str) -> str:
+    """`column COLLATE "ru-RU-x-icu"` на Postgres, голая колонка на SQLite.
+
+    SQLite ICU не несёт и неизвестный COLLATE отвергает запросом целиком,
+    поэтому там сортировка остаётся бинарной — порядок проверяется на
+    Postgres (TEST_PG_URL). Имя колонки приходит из кода, не от пользователя.
+    """
+    if _use_postgres():
+        return f'{column} COLLATE "{NAME_COLLATION}"'
+    return column
+
+
+def name_search_sql(column: str) -> str:
+    """Выражение для LIKE-поиска по названию: нижний регистр и ё→е.
+
+    «Ёлка» в справочнике и «елка» в поиске (или наоборот) — одно слово: на
+    телефоне «ё» набирают долгим нажатием и чаще не набирают вовсе.
+    Нормализуются ОБЕ стороны — колонка здесь, ввод в `name_search_param`.
+    `lower()` на SQLite переопределён Unicode-версией в обоих слоях,
+    `replace()` встроенный в обеих базах.
+    """
+    return f"replace(lower({column}), 'ё', 'е')"
+
+
+def normalize_search(text: str | None) -> str:
+    """Пользовательский ввод к виду `name_search_sql`: нижний регистр, ё→е."""
+    return (text or "").strip().lower().replace("ё", "е")
+
+
+def name_search_param(text: str | None) -> str:
+    """`%ввод%` для LIKE против `name_search_sql`."""
+    return f"%{normalize_search(text)}%"
 
 # asyncpg-пул (ленивая инициализация). Размеры — как у psycopg2-пула.
 # Пул привязан к event loop'у, на котором создан. Храним этот loop, чтобы
@@ -195,7 +258,7 @@ async def fetch(query: str, *args: Any) -> list[dict]:
     if _use_postgres():
         pool = await init_pool()
         async with pool.acquire() as conn:
-            rows = await conn.fetch(query, *args)
+            rows = await conn.fetch(query, *_pg_args(args))
         return [dict(r) for r in rows]
 
     import aiosqlite
@@ -214,7 +277,7 @@ async def fetchrow(query: str, *args: Any) -> dict | None:
     if _use_postgres():
         pool = await init_pool()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(query, *args)
+            row = await conn.fetchrow(query, *_pg_args(args))
         return dict(row) if row is not None else None
 
     import aiosqlite
@@ -233,7 +296,7 @@ async def fetchval(query: str, *args: Any) -> Any:
     if _use_postgres():
         pool = await init_pool()
         async with pool.acquire() as conn:
-            return await conn.fetchval(query, *args)
+            return await conn.fetchval(query, *_pg_args(args))
 
     import aiosqlite
 
@@ -251,7 +314,7 @@ async def execute(query: str, *args: Any) -> int:
     if _use_postgres():
         pool = await init_pool()
         async with pool.acquire() as conn:
-            status = await conn.execute(query, *args)
+            status = await conn.execute(query, *_pg_args(args))
         return _rowcount_from_status(status)
 
     import aiosqlite
@@ -313,17 +376,17 @@ class _PgTxn:
         self._c = conn
 
     async def fetch(self, q: str, *a: Any) -> list[dict]:
-        return [dict(r) for r in await self._c.fetch(q, *a)]
+        return [dict(r) for r in await self._c.fetch(q, *_pg_args(a))]
 
     async def fetchrow(self, q: str, *a: Any) -> dict | None:
-        r = await self._c.fetchrow(q, *a)
+        r = await self._c.fetchrow(q, *_pg_args(a))
         return dict(r) if r is not None else None
 
     async def fetchval(self, q: str, *a: Any) -> Any:
-        return await self._c.fetchval(q, *a)
+        return await self._c.fetchval(q, *_pg_args(a))
 
     async def execute(self, q: str, *a: Any) -> int:
-        return _rowcount_from_status(await self._c.execute(q, *a))
+        return _rowcount_from_status(await self._c.execute(q, *_pg_args(a)))
 
     async def executemany(self, q: str, rows: list[tuple]) -> int:
         """Батч-INSERT/UPDATE одним prepared-statement'ом (asyncpg.executemany).
@@ -331,7 +394,7 @@ class _PgTxn:
         statement. Возвращает число переданных строк."""
         if not rows:
             return 0
-        await self._c.executemany(q, rows)
+        await self._c.executemany(q, [_pg_args(tuple(r)) for r in rows])
         return len(rows)
 
 

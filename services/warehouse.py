@@ -199,7 +199,23 @@ async def _apply_stock_delta(txn, product_id: int, warehouse_id: int, delta: flo
 
     Обычный UPDATE на товаре, которого ещё нет в `stock`, молча затрагивает
     0 строк — приход нового товара терялся бы без единой ошибки.
+
+    Списание (delta < 0) — сначала UPDATE. Postgres проверяет CHECK у
+    ВСТАВЛЯЕМОЙ строки UPSERT'а до разрешения конфликта, и `quantity >= 0`
+    (`scripts/apply_constraints`) отверг бы любую расходную накладную: строка
+    (товар, склад, −2.5) не проходит проверку ещё до того, как превратится в
+    UPDATE существующего остатка. Строки нет — вставляем как раньше.
     """
+    if delta < 0:
+        updated = await txn.execute(
+            "UPDATE stock SET quantity = quantity + $3 "
+            "WHERE product_id = $1 AND warehouse_id = $2",
+            product_id,
+            warehouse_id,
+            delta,
+        )
+        if updated:
+            return
     await txn.execute(
         "INSERT INTO stock (product_id, warehouse_id, quantity) VALUES ($1, $2, $3) "
         "ON CONFLICT (product_id, warehouse_id) "
@@ -570,7 +586,7 @@ async def get_stock(warehouse_id: int | None = None, only_positive: bool = False
         where.append("COALESCE(s.quantity, 0) > 0")
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY p.name"
+    sql += f" ORDER BY {adb_core.order_by_name('p.name')}, p.id"
     return await adb_core.fetch(sql, *args)
 
 
@@ -666,14 +682,15 @@ async def _reserved_by_product() -> dict[int, float]:
 
 
 async def search_products(query: str, limit: int = 20) -> list[dict]:
-    """Поиск по номенклатуре. Кириллица — через `lower()` с обеих сторон."""
+    """Поиск по номенклатуре. Кириллица — через `lower()` с обеих сторон, ё = е."""
     text = (query or "").strip()
     if not text:
         return []
     return await adb_core.fetch(
         "SELECT id AS product_id, name, unit, category, sku FROM products "
-        "WHERE lower(name) LIKE $1 ORDER BY name LIMIT $2",
-        f"%{text.lower()}%",
+        f"WHERE {adb_core.name_search_sql('name')} LIKE $1 "
+        f"ORDER BY {adb_core.order_by_name('name')}, id LIMIT $2",
+        adb_core.name_search_param(text),
         max(1, min(int(limit or 20), 100)),
     )
 
@@ -698,9 +715,13 @@ async def get_categories() -> list[dict]:
     папка номенклатуры, и переносить дерево ради фильтра в одну кнопку незачем.
     Поэтому id категории — само её название.
     """
+    # GROUP BY, а не DISTINCT: Postgres не пускает в ORDER BY при DISTINCT
+    # выражение, которого нет в списке выборки, а `category COLLATE …` для него
+    # уже другое выражение.
     rows = await adb_core.fetch(
-        "SELECT DISTINCT category FROM products "
-        "WHERE category IS NOT NULL AND category <> '' ORDER BY category"
+        "SELECT category FROM products "
+        "WHERE category IS NOT NULL AND category <> '' GROUP BY category "
+        f"ORDER BY {adb_core.order_by_name('category')}"
     )
     return [{"id": r["category"], "name": r["category"]} for r in rows]
 
@@ -721,7 +742,10 @@ async def get_catalog(category: str | None = None, only_positive: bool = False) 
     if category and category != "all":
         args.append(category)
         sql += f" WHERE p.category = ${len(args)}"
-    sql += " GROUP BY p.id, p.name, p.unit, p.category, p.sku ORDER BY p.name"
+    sql += (
+        " GROUP BY p.id, p.name, p.unit, p.category, p.sku "
+        f"ORDER BY {adb_core.order_by_name('p.name')}, p.id"
+    )
     rows = await adb_core.fetch(sql, *args)
 
     reserved = await _reserved_by_product()

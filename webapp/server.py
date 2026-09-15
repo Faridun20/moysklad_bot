@@ -2229,8 +2229,9 @@ async def api_products_search(request: Request):
         return JSONResponse({"ok": True, "products": [], "query": query})
     rows = await adb_core.fetch(
         "SELECT id AS product_id, name, unit, category, sku FROM products "
-        "WHERE lower(name) LIKE $1 ORDER BY name LIMIT 20",
-        f"%{query.lower()}%",
+        f"WHERE {adb_core.name_search_sql('name')} LIKE $1 "
+        f"ORDER BY {adb_core.order_by_name('name')}, id LIMIT 20",
+        adb_core.name_search_param(query),
     )
     return JSONResponse({"ok": True, "products": rows, "query": query})
 
@@ -5395,6 +5396,11 @@ async def api_returns_create(request: Request):
                     raise HTTPException(
                         status_code=400, detail=f"Позиция {iid} недоступна к возврату"
                     )
+                if any(prev == iid for prev, _, _ in ret_items):
+                    # Две строки на одну позицию проходят «не больше доступного»
+                    # каждая по отдельности; в базе это ещё и нарушение UNIQUE
+                    # (return_id, order_item_id) — отвечаем текстом, а не 500-й.
+                    raise HTTPException(status_code=400, detail=f"Позиция {iid} указана дважды")
                 if not (math.isfinite(qty) and 0 < qty <= returnable[iid] + 1e-9):
                     raise HTTPException(
                         status_code=400,
@@ -6446,13 +6452,14 @@ async def api_wh_counterparties(request: Request):
         # запрос ведёт себя одинаково на проде и локально (CLAUDE.md).
         rows = await adb_core.fetch(
             "SELECT id, name, type, phone, telegram_id FROM counterparties "
-            "WHERE lower(name) LIKE $1 ORDER BY name LIMIT 100",
-            f"%{search.lower()}%",
+            f"WHERE {adb_core.name_search_sql('name')} LIKE $1 "
+            f"ORDER BY {adb_core.order_by_name('name')}, id LIMIT 100",
+            adb_core.name_search_param(search),
         )
     else:
         rows = await adb_core.fetch(
             "SELECT id, name, type, phone, telegram_id FROM counterparties "
-            "ORDER BY name LIMIT 100"
+            f"ORDER BY {adb_core.order_by_name('name')}, id LIMIT 100"
         )
     return JSONResponse({"counterparties": rows})
 
