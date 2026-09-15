@@ -786,7 +786,7 @@
   }
 
   // ─── «Как получены деньги» (payments.js, services/order_payments.py) ───
-  const PAY_METHODS = [['cash', 'Наличные'], ['card', 'Карта'], ['bank', 'Перечисление']];
+  const PAY_METHODS = [['cash', 'Наличные'], ['card', 'Карта'], ['bank', 'На счёт']];
   const PAY_METHOD_LABEL = { cash: 'наличные', card: 'на карту', bank: 'перечислением' };
 
   // ─── Чистые хелперы (тесты — __tests__/payments.test.js) ───────────────────

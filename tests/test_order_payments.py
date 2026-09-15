@@ -272,7 +272,7 @@ def test_cancel_rejects_pending_breakdown_but_not_accepted_money(db):
     rec2 = _record(oid2, [_card(12130)])
     assert _run(db.confirm_payment(rec2["payment_id"], BOSS, "Boss"))
     res2 = _run(db.cancel_order(oid2, BOSS, "Boss", "клиент передумал"))
-    assert res2["ok"] is False and "уже принята оплата" in res2["error"]
+    assert res2["ok"] is False and "подтверждена оплата 12 130 USD" in res2["error"]
 
 
 # ─── Долг: отгружен без денег, оплачен разбивкой ─────────────────────────────
@@ -382,7 +382,7 @@ def test_confirming_handover_confirms_cash_payments_and_closes_order(db):
     assert _run(db.get_open_debts()) == []
 
 
-def test_handover_confirmed_last_closes_order_as_paid(db):
+def test_handover_confirmed_last_closes_order(db):
     oid = _order(db, status="shipped")
     rec = _record(oid, [_cash(5000), _card(7130)])
     assert _run(db.confirm_payment(rec["parts"][1]["payment_id"], BOSS, "Boss"))
@@ -390,7 +390,8 @@ def test_handover_confirmed_last_closes_order_as_paid(db):
     res = _run(db.confirm_cash_deposit(dep["deposit_id"], MGR, "Manager"))  # сам — бухгалтера нет
     assert res["closed_orders"] == [oid] and res["self_confirmed"] is True
     order = _run(db.get_order(oid))
-    assert order["status"] == "paid" and order["paid_confirmed_at"]
+    # Закрытие — как у подтверждения платежа: отметка оплаты, статус не прыгает.
+    assert order["status"] == "shipped" and order["paid_confirmed_at"]
     audit = _rows(db, "SELECT details FROM audit_log WHERE action = 'cash_deposit_confirmed'")[-1]["details"]
     assert f"#{oid}" in audit and "подтверждено самим сдающим" in audit
 
@@ -541,8 +542,17 @@ def test_api_debts_wording_numbers_in_every_state(db, client):
     assert (d[uzs]["pending"], d[uzs]["remaining_after_pending"], d[uzs]["currency"]) == (12_700_000.0, 12_700_000.0, "UZS")
     assert (d[ret]["remaining"], d[ret]["pending"], d[ret]["overpending"], d[ret]["remaining_after_pending"]) == (
         600.0, 1000.0, 400.0, 0.0)
-    # Кто подтверждает, когда руководителя нет: менеджер как бухгалтер — и это сказано.
-    assert body["can_confirm"] is True and "руководителя и бухгалтера в системе нет" in body["confirm_hint"]
+    # Руководитель есть — менеджеру кнопки нет, экран называет, кто подтвердит.
+    assert body["can_confirm"] is False and body["confirm_hint"] == "подтвердит Boss"
+    # Руководителя нет (как на проде сейчас): менеджер подтверждает сам, и это сказано.
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("UPDATE user_roles SET role = 'guest' WHERE user_id = ?"), (BOSS,))
+        conn.commit()
+    roles.invalidate_all_roles()
+    alone = _post(client, MGR, "/api/debts").json()
+    assert alone["can_confirm"] is True
+    assert "руководителя и бухгалтера в системе нет" in alone["confirm_hint"]
 
 
 def test_api_mark_paid_requires_method(db, client):
@@ -598,3 +608,91 @@ def test_bot_pay_ok_refuses_cash(db, monkeypatch):
     _run(hp.confirm_pay(Call(), bot=None))
     assert "сдачей в кассу" in answers[0]
     assert _run(db.get_payment(rec["payment_id"]))["status"] == "pending"
+
+
+# ─── Баги из сценариев (agent/scenario-tests) ────────────────────────────────
+
+
+def test_cancel_voids_legacy_pending_payment_and_confirm_refuses_cancelled_order(db, client):
+    """Отмена одобренной «оплаты сразу» снимала только… ничего: автоплатёж
+    оставался pending, и «Подтвердить» по отменённому заказу засчитывал деньги."""
+    oid = _order(db)
+    legacy = db.add_payment(MGR, "", "Manager", 12130.0, "USD",
+                            f"Оплата по заказу #{oid} (отгрузка одобрена)", order_id=oid)
+    res = _run(db.cancel_order(oid, BOSS, "Boss", "передумал"))
+    assert res["ok"], res
+    assert _run(db.get_payment(legacy))["status"] == "rejected"
+    r = _post(client, BOSS, "/api/orders/confirm_payment", order_id=oid)
+    assert r.status_code == 200 and r.json()["confirmed_count"] == 0
+    assert _rows(db, "SELECT 1 FROM payments WHERE order_id = ? AND status = 'confirmed'", (oid,)) == []
+
+    # Рубеж в самом подтверждении: платёж, оставшийся pending у отменённого заказа.
+    stale = db.add_payment(MGR, "", "Manager", 1.0, "USD", "старый", order_id=oid)
+    assert _run(db.confirm_payment(stale, BOSS, "Boss")) is False
+
+
+def test_cancel_refuses_when_money_already_confirmed(db):
+    oid = _order(db, payment_type="credit")
+    rec = _record(oid, [_card(100)])
+    assert _run(db.confirm_payment(rec["payment_id"], BOSS, "Boss"))
+    res = _run(db.cancel_order(oid, BOSS, "Boss", "передумал"))
+    assert res["ok"] is False and res["code"] == "money_received"
+    assert "подтверждена оплата 100 USD" in res["error"] and "возврат" in res["error"]
+    assert _run(db.get_order(oid))["status"] == "approved"
+
+
+def test_ship_refuses_when_write_off_failed_and_retries_when_stock_arrives(db, client):
+    from services import container_receipt, order_shipment, warehouse
+
+    pid = _run(container_receipt.create_product("Кабель"))["product_id"]
+    wid = _run(warehouse.default_warehouse_id())
+    assert _run(warehouse.create_invoice(invoice_type="incoming", warehouse_id=wid,
+                                         items=[{"product_id": pid, "quantity": 5, "price_cents": None}]))["ok"]
+    oid = db.create_order(MGR, "Manager", "")
+    db.update_order_agent(oid, "A-1", "Клиент")
+    db.add_order_item(oid, "Кабель", "", 7, "м", 10.0, product_id=pid)
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("UPDATE orders SET payment_type='credit', due_date='2030-01-15', currency='USD' WHERE id=?"), (oid,))
+        conn.commit()
+    db.update_order_status(oid, "approved")
+    order = _run(db.get_order(oid))
+    failed = _run(order_shipment.ship_order(order, _run(db.get_order_items(oid)), user_id=BOSS))
+    assert failed["ok"] is False and _run(order_shipment.get_shipment(oid))["failed_at"]
+
+    r = _post(client, BOSS, "/api/orders/ship", order_id=oid)
+    assert r.status_code == 409 and "не списан" in r.json()["detail"]
+    assert _run(db.get_order(oid))["status"] == "approved"
+
+    # Довезли товар — повторное «Отгрузить» списывает и отгружает.
+    assert _run(warehouse.create_invoice(invoice_type="incoming", warehouse_id=wid,
+                                         items=[{"product_id": pid, "quantity": 5, "price_cents": None}]))["ok"]
+    r = _post(client, BOSS, "/api/orders/ship", order_id=oid)
+    assert r.status_code == 200, r.text
+    assert _run(order_shipment.get_shipment(oid))["invoice_id"]
+    assert _run(db.get_order(oid))["status"] == "shipped"
+
+
+def test_debt_reduction_return_on_paid_order_is_refused_cash_is_fine(db):
+    oid = _order(db, total=500.0, payment_type="credit", status="shipped")
+    item = _run(db.get_order_items(oid))[0]["id"]
+    rec = _record(oid, [_card(500)])
+    assert _run(db.confirm_payment(rec["payment_id"], BOSS, "Boss"))
+
+    res = _run(db.create_return(oid, "partial", "брак", [(item, 0.4, 0)], "debt_reduction", MGR))
+    assert res["ok"] is False and res["code"] == "no_debt_to_reduce"
+    assert "Долга по заказу нет" in res["error"] and "Наличными" in res["error"]
+    assert _run(db.create_return(oid, "partial", "брак", [(item, 0.4, 0)], "cash", MGR))["ok"]
+
+
+def test_debt_reduction_return_within_debt_still_works_and_is_rechecked_on_confirm(db):
+    oid = _order(db, total=500.0, payment_type="credit", status="shipped")
+    item = _run(db.get_order_items(oid))[0]["id"]
+    res = _run(db.create_return(oid, "partial", "брак", [(item, 0.4, 0)], "debt_reduction", MGR))
+    assert res["ok"], res  # 200 из 500 долга
+    # Клиент доплатил всё до подтверждения возврата — подтверждать «в счёт долга» нечего.
+    rec = _record(oid, [_card(500)])
+    assert _run(db.confirm_payment(rec["payment_id"], BOSS, "Boss"))
+    assert _run(db.mark_return_goods_received(res["return_id"], BOSS))["ok"]
+    conf = _run(db.confirm_return(res["return_id"], BOSS, "Boss"))
+    assert conf["ok"] is False and "Долга по заказу нет" in conf["error"]

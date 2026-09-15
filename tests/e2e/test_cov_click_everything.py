@@ -114,7 +114,7 @@ def _seed_rich(e2e, tmp_path: Path) -> dict:
     e2e.run(confirm_all_pending_payments_for_order(ret["order_id"], ids["boss"], "Boss"))
     item = e2e.rows("SELECT id FROM order_items WHERE order_id = ?", (ret["order_id"],))[0]["id"]
     r = e2e.run(create_return(ret["order_id"], "full", "Брак", [(item, 1, 60.0)],
-                              "debt_reduction", ids["mgr"]))
+                              "no_refund", ids["mgr"]))  # оплаченный заказ: «в счёт долга» вычитать не из чего (_debt_reduction_refusal)
     assert r.get("ok"), r
     # Сдача наличных — ждёт подтверждения.
     r = e2e.run(create_cash_deposit(ids["mgr"], 50.0))

@@ -264,7 +264,7 @@ def test_warehouse_keeper_confirms_goods_received_only(open_app, e2e):
     e2e.run(confirm_all_pending_payments_for_order(seeded["order_id"], e2e.ids["boss"], "Boss"))
     item = e2e.rows("SELECT id FROM order_items WHERE order_id = ?", (seeded["order_id"],))[0]["id"]
     r = e2e.run(create_return(seeded["order_id"], "full", "Брак", [(item, 2, 200.0)],
-                              "debt_reduction", e2e.ids["mgr"]))
+                              "no_refund", e2e.ids["mgr"]))  # оплаченный заказ: «в счёт долга» вычитать не из чего (_debt_reduction_refusal)
     assert r.get("ok"), r
 
     keeper = open_app(e2e.ids["keeper"])

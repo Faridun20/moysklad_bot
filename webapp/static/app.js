@@ -6254,7 +6254,13 @@ async function renderCashbox(container, section) {
   let returns = [];
   let myDeposits = [];
   let payPending = [];   // paid-заказы с pending-оплатой (подтверждает босс)
-  const _grab = (path, key) => api(path, {}).then(r => r[key] || []);
+  // Есть ли в системе руководитель/бухгалтер: пока нет, менеджер подтверждает
+  // сам, и карточки говорят об этом прямо (server._money_confirmers).
+  let confirmersExist = true;
+  const _grab = (path, key) => api(path, {}).then(r => {
+    if (r && r.confirmers_exist === false) confirmersExist = false;
+    return r[key] || [];
+  });
   const tasks = [];
   if (section === 'confirm') {
     const want = new Set(pendingListsFor(role).map(l => l.path));
@@ -6288,7 +6294,8 @@ async function renderCashbox(container, section) {
         </div>
         <div class="debt-card-mid"><span class="debt-meta">Заказы: ${escapeHtml(orders)}${d.manager_name ? ' · ' + escapeHtml(d.manager_name) : ''}</span></div>
         ${Number(d.unallocated) > 0 ? `<div class="debt-card-mid"><span class="debt-meta">Не распределено по заказам: ${formatMoney(d.unallocated, escapeHtml(dcur))}</span></div>` : ''}
-        ${d.is_own && !isBoss ? `<div class="debt-hint">Это ваша сдача: руководителя и бухгалтера в системе нет, поэтому подтверждаете вы — это попадёт в журнал.</div>` : ''}
+        ${d.is_own && !isBoss && !confirmersExist ? `<div class="debt-hint">Это ваша сдача: руководителя и бухгалтера в системе нет, поэтому подтверждаете вы — это попадёт в журнал.</div>` : ''}
+        ${d.is_own && !isBoss && confirmersExist ? `<div class="debt-hint">Это ваша сдача — её подтверждает руководитель или бухгалтер.</div>` : ''}
         <div class="debt-actions">
           <button class="btn-confirm-pay dep-confirm">${icon('check')} Подтвердить</button>
           <button class="btn-reject-pay dep-reject">${icon('close')} Отклонить</button>
@@ -6346,7 +6353,7 @@ async function renderCashbox(container, section) {
           <div class="debt-breakdown">${d.parts.filter(p => p.state !== 'rejected')
             .map(p => `<span>• ${escapeHtml(payPartLine(p))}</span>`).join('')}</div>` : `
           <div class="debt-hint">Способ оплаты не указан (запись до разбивки)</div>`}
-        ${d.recorded_by_me && !isBoss ? `<div class="debt-hint">Оплату вносили вы: руководителя и бухгалтера в системе нет, поэтому подтверждаете вы — это попадёт в журнал.</div>` : ''}
+        ${d.recorded_by_me && !isBoss && !confirmersExist ? `<div class="debt-hint">Оплату вносили вы: руководителя и бухгалтера в системе нет, поэтому подтверждаете вы — это попадёт в журнал.</div>` : ''}
         <div class="debt-actions">
           <button class="btn-confirm-pay pay-confirm" data-id="${d.order_id}">${icon('check')} Подтвердить ${fmt(d.confirmable != null ? d.confirmable : d.pending)} ${escapeHtml(d.currency || 'USD')}</button>
           <button class="btn-reject-pay pay-reject" data-id="${d.order_id}">${icon('close')} Отклонить</button>

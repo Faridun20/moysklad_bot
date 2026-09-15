@@ -474,11 +474,17 @@ def _now() -> str:
 
 
 async def record_payment_parts(order_id: int, actor: Actor, raw_parts: Any, *,
-                               idem_key: str | None = None) -> dict:
+                               idem_key: str | None = None,
+                               supersede_payment_ids: list[int] | None = None) -> dict:
     """Записать, как получены деньги по заказу. Одна транзакция на всё.
 
     Возвращает {ok, order_id, payments: [...], parts: [...], total_cents,
     currency, superseded: [payment_id], gap_cents}. Ошибки — `PaymentError`.
+
+    `supersede_payment_ids` — явная замена ожидающих платежей без способа
+    (разовый `scripts/migrate_payment_breakdown`: старая отметка оплаты по
+    заказу «в долг» раскладывается на строки). У «оплаты сразу» такие платежи
+    заменяются всегда.
     """
     from services.database import idem_store_in
     from services.debts import calc_claimable_cents, lock_orders
@@ -515,6 +521,19 @@ async def record_payment_parts(order_id: int, actor: Actor, raw_parts: Any, *,
             raise PaymentError("Оплату вносят по одобренному заказу", status=409, code="status")
 
         superseded: list[int] = []
+        for pid in supersede_payment_ids or []:
+            row = await txn.fetchrow(
+                "SELECT p.status, p.order_id, (SELECT COUNT(*) FROM payment_parts pp "
+                "WHERE pp.payment_id = p.id) AS parts FROM payments p WHERE p.id = $1", int(pid),
+            )
+            if row is None or int(row["order_id"] or 0) != int(order_id):
+                raise PaymentError(f"Платёж #{pid} не относится к заказу #{order_id}", status=409)
+            if row["status"] != "pending" or int(row["parts"] or 0):
+                raise PaymentError(f"Платёж #{pid} уже не ожидающий или уже разложен", status=409)
+            await txn.execute(
+                "UPDATE payments SET status = 'rejected' WHERE id = $1 AND status = 'pending'", int(pid)
+            )
+            superseded.append(int(pid))
         if ptype == "paid":
             # Старый автоплатёж одобрения (и любая ожидающая отметка без
             # способа) — это «деньги неизвестно как». Разбивка их заменяет:
@@ -528,8 +547,9 @@ async def record_payment_parts(order_id: int, actor: Actor, raw_parts: Any, *,
                 "AND ad.status = 'posted')",
                 int(order_id),
             )
-            superseded = [int(r["id"]) for r in rows]
-            for pid in superseded:
+            auto = [int(r["id"]) for r in rows if int(r["id"]) not in superseded]
+            superseded.extend(auto)
+            for pid in auto:
                 await txn.execute(
                     "UPDATE payments SET status = 'rejected' WHERE id = $1 AND status = 'pending'", pid
                 )
@@ -802,6 +822,75 @@ async def deposit_part_orders(deposit_id: int, conn: Any = None) -> tuple[list[i
         int(deposit_id),
     )
     return sorted({int(r["order_id"]) for r in rows}), {str(r["currency"] or "").upper() for r in rows}
+
+
+async def attach_deposit_to_parts(deposit_id: int, *, dry_run: bool = True) -> dict:
+    """Разово: сдача без распределения (как прод-сдачи #1/#2, «Заказы: —»)
+    ложится FIFO на наличные строки разбивки своего менеджера в своей валюте.
+    Подтверждённая сдача сразу подтверждает платежи строк и закрывает покрытые
+    заказы — как если бы её подтвердили после разбивки. Для
+    `scripts/migrate_payment_breakdown`; в рабочем коде не зовётся.
+
+    → {ok, deposit_id, status, currency, parts: [...], unallocated_cents, closed}.
+    """
+    from services import database as db
+    from services.debts import lock_orders
+
+    dep = await adb_core.fetchrow("SELECT * FROM cash_deposits WHERE id = $1", int(deposit_id))
+    if dep is None:
+        return {"ok": False, "error": f"Сдача #{deposit_id} не найдена"}
+    if dep["status"] not in ("pending", "confirmed") or int(dep["amount_cents"]) <= 0:
+        return {"ok": False, "error": f"Сдача #{deposit_id}: статус {dep['status']}, сумма {dep['amount_cents']} — не распределяется"}
+    has_alloc = await adb_core.fetchval(
+        "SELECT (SELECT COUNT(*) FROM cash_deposit_orders WHERE deposit_id = $1) + "
+        "(SELECT COUNT(*) FROM cash_deposit_parts WHERE deposit_id = $1)", int(deposit_id),
+    )
+    if int(has_alloc or 0):
+        return {"ok": False, "error": f"Сдача #{deposit_id} уже распределена — не трогаю"}
+    currency = (await deposit_currency([int(deposit_id)]))[int(deposit_id)]
+    rows = await cash_on_hand(int(dep["manager_id"]), currency)
+    if dry_run:
+        left = int(dep["amount_cents"])
+        plan = []
+        for r in rows:
+            if left <= 0:
+                break
+            take = min(left, int(r["amount_cents"]))
+            plan.append({"order_id": int(r["order_id"]), "part_id": int(r["id"]), "amount_cents": take})
+            left -= take
+        return {"ok": True, "dry_run": True, "deposit_id": int(deposit_id), "status": dep["status"],
+                "currency": currency, "parts": plan, "unallocated_cents": left, "closed": []}
+
+    rates = {}
+    for r in rows:
+        cur = str(r.get("order_currency") or "").upper()
+        if cur and cur not in rates:
+            rates[cur] = await asyncio.to_thread(db.get_currency_rate, cur)
+    closed: list[int] = []
+    async with adb_core.transaction() as txn:
+        await lock_orders(txn, [int(r["order_id"]) for r in rows])
+        taken, left = await allocate_deposit_to_parts_locked(
+            txn, int(dep["manager_id"]), currency, int(dep["amount_cents"]),
+            sorted({int(r["order_id"]) for r in rows}),
+        )
+        await txn.execute(
+            "INSERT INTO cash_deposit_currency (deposit_id, currency) VALUES ($1, $2) "
+            "ON CONFLICT (deposit_id) DO NOTHING", int(deposit_id), currency,
+        )
+        for p in taken:
+            await txn.execute(
+                "INSERT INTO cash_deposit_parts (deposit_id, part_id, order_id, amount_cents) "
+                "VALUES ($1, $2, $3, $4)", int(deposit_id), p["part_id"], p["order_id"], p["amount_cents"],
+            )
+        if dep["status"] == "confirmed":
+            for oid in await confirm_deposit_parts_locked(txn, int(deposit_id), rates):
+                done, _c = await db._close_order_if_covered_locked(
+                    txn, oid, dep["confirmed_by"], "перенос разбивки оплаты"
+                )
+                if done:
+                    closed.append(oid)
+    return {"ok": True, "dry_run": False, "deposit_id": int(deposit_id), "status": dep["status"],
+            "currency": currency, "parts": taken, "unallocated_cents": left, "closed": closed}
 
 
 # ─── Кто подтверждает ────────────────────────────────────────────────────────

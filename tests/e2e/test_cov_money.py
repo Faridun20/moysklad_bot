@@ -24,7 +24,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
-from tests.e2e.conftest import go, tab
+from tests.e2e.conftest import go, pay_form, pay_order, tab
 
 # ─── Хелперы ─────────────────────────────────────────────────────────────────
 
@@ -80,7 +80,7 @@ def _texts(page, selector: str) -> list[str]:
 
 def _order(e2e, *, qty: float = 1, price: float = 100.0, payment_type: str = "credit",
            due: str | None = "2030-01-15", currency: str | None = None, owner: int | None = None,
-           approve: bool = True, ship: bool = False) -> int:
+           approve: bool = True, ship: bool = False, pay: str | None = "card") -> int:
     """Заказ через сервисы: сабмит → одобрение боссом → (отгрузка)."""
     from services.database import mark_order_shipped
     from services.order_workflow import approve_shipment_request, submit_order
@@ -100,6 +100,10 @@ def _order(e2e, *, qty: float = 1, price: float = 100.0, payment_type: str = "cr
     if approve:
         ap = e2e.run(approve_shipment_request(res["req_id"], ids["boss"], "Boss", e2e.bot, override=True))
         assert ap.get("ok"), ap
+        if payment_type == "paid" and pay:
+            # «Оплата сразу»: менеджер перед отгрузкой вносит, как получил деньги
+            # (по умолчанию картой — платёж ждёт подтверждения руководителя).
+            pay_order(e2e, oid, [(pay, qty * price)], uid=uid)
     if ship:
         assert e2e.run(mark_order_shipped(oid, ids["keeper"], "Keeper")).get("ok")
     return oid
@@ -215,10 +219,9 @@ FORBIDDEN = {
     "mgr": [
         ("/api/money/summary", {"period": "month"}), ("/api/cash/history", {}),
         ("/api/money/forecast", {}), ("/api/money/discipline", {}),
-        ("/api/payments/pending", {}), ("/api/orders/confirm_payment", {"order_id": "PAID"}),
-        ("/api/orders/reject_payment", {"order_id": "PAID"}),
-        # Сдачи и приёмка возврата менеджеру пока открыты — он замещает бухгалтера
-        # и кладовщика (ROLE_ALSO_ACTS_AS, tests/e2e/test_manager_acts_as.py).
+        # Сдачи, приёмка возврата и подтверждение карты/перечисления менеджеру
+        # пока открыты — он замещает бухгалтера и кладовщика (ROLE_ALSO_ACTS_AS,
+        # tests/e2e/test_manager_acts_as.py, services/order_payments.py).
         # Подтверждение возврата остаётся руководству.
         ("/api/returns/confirm", {"return_id": 1}),
     ],
@@ -232,7 +235,7 @@ FORBIDDEN = {
     ],
     "book": [
         ("/api/debts", {}), ("/api/orders/mark_paid", {"order_id": "CREDIT", "amount": 10}),
-        ("/api/orders/confirm_payment", {"order_id": "PAID"}), ("/api/returns/pending", {}),
+        ("/api/returns/pending", {}),
         ("/api/returns/goods_received", {"return_id": 1}), ("/api/returns/confirm", {"return_id": 1}),
         ("/api/deposits/create", {"amount": 50}),
         ("/api/payments/send", {"amount": 10, "currency": "USD", "comment": "x"}),
@@ -277,7 +280,7 @@ def test_manager_sees_only_own_debts_boss_sees_all_with_owner(open_app, e2e):
     _money(mgr, "debts")
     assert mgr.locator(".debt-card").count() == 1
     assert f"#{mine}" in _text(mgr, ".debt-card")
-    assert mgr.locator(f'.btn-mark-paid[data-id="{foreign}"]').count() == 0
+    assert mgr.locator(f'.btn-pay-debt[data-id="{foreign}"]').count() == 0
     assert mgr.locator("text=Нам должны").count() == 0, "итог «нам должны» — только руководству"
     # Чужой долг не отметить и в обход экрана.
     res = _api(mgr, "/api/orders/mark_paid", {"order_id": foreign, "amount": 10})
@@ -289,9 +292,9 @@ def test_manager_sees_only_own_debts_boss_sees_all_with_owner(open_app, e2e):
     boss = open_app(e2e.ids["boss"])
     _money(boss, "debts")
     assert boss.locator(".debt-card").count() == 2
-    foreign_card = boss.locator(f'.debt-card:has(.btn-mark-paid[data-id="{foreign}"])')
+    foreign_card = boss.locator(f'.debt-card:has(.btn-pay-debt[data-id="{foreign}"])')
     assert "Manager2" in foreign_card.locator(".debt-owner").text_content()
-    assert boss.locator(f'.debt-card:has(.btn-mark-paid[data-id="{mine}"]) .debt-owner').count() == 1
+    assert boss.locator(f'.debt-card:has(.btn-pay-debt[data-id="{mine}"]) .debt-owner').count() == 1
     assert "350USD" in _norm(_text(boss, ".money-base-total"))
 
 
@@ -321,8 +324,8 @@ def test_confirm_badge_counts_payment_deposit_and_return(open_app, e2e):
     returned = _order(e2e, payment_type="paid", price=90.0)
     _confirm_order_payments(e2e, returned)
     item = e2e.rows("SELECT id FROM order_items WHERE order_id = ?", (returned,))[0]["id"]
-    assert e2e.run(create_return(returned, "full", "Брак", [(item, 1, 90.0)], "debt_reduction",
-                                 e2e.ids["mgr"])).get("ok")
+    assert e2e.run(create_return(returned, "full", "Брак", [(item, 1, 90.0)], "no_refund",
+                                 e2e.ids["mgr"])).get("ok")  # оплаченный заказ: «в счёт долга» вычитать не из чего (_debt_reduction_refusal)
 
     boss = open_app(e2e.ids["boss"])
     _money(boss, "confirm")
@@ -419,9 +422,8 @@ def test_deposit_reject_needs_reason_notifies_manager_and_frees_orders(open_app,
     new = e2e.rows("SELECT id FROM cash_deposits WHERE status = 'pending'")[0]["id"]
     assert e2e.rows("SELECT order_id, amount_allocated_cents FROM cash_deposit_orders WHERE deposit_id = ?",
                     (new,)) == [{"order_id": oid, "amount_allocated_cents": 8000}]
-    assert _api(boss, "/api/money/summary", {"period": "month"})["body"]["deposits"] == {
-        "total_cents": 0, "count": 0,
-    }
+    deps = _api(boss, "/api/money/summary", {"period": "month"})["body"]["deposits"]
+    assert (deps["total_cents"], deps["count"], deps["by_currency"]) == (0, 0, [])
 
 
 def test_deposit_validation_rejects_non_positive_amounts(open_app, e2e):
@@ -489,9 +491,9 @@ def test_cash_deposit_fifo_across_orders_confirmed_lands_in_cash_report(open_app
 
     # «Долги»: первый ушёл, по второму осталось 80 − 50 = 30.
     _money(boss, "debts")
-    assert boss.locator(f'.btn-mark-paid[data-id="{first}"]').count() == 0
-    placeholder = boss.get_attribute(f'.pay-amount-input[data-id="{second}"]', "placeholder")
-    assert "30USD" in _norm(placeholder), placeholder
+    assert boss.locator(f'.btn-pay-debt[data-id="{first}"]').count() == 0
+    button = _text(boss, f'.btn-pay-debt[data-id="{second}"]')
+    assert "ост.30USD" in _norm(button), button
     assert "30USD" in _norm(_text(boss, ".money-base-total"))
     debt = [d for d in _api(boss, "/api/debts")["body"]["debts"] if d["id"] == second][0]
     assert (debt["total"], debt["confirmed"], debt["remaining"]) == (80.0, 0.0, 30.0)
@@ -623,7 +625,8 @@ def test_partial_return_with_cash_refund_reduces_cash_in_report(open_app, e2e):
     ribbon = _norm(" ".join(_texts(boss, "#money-body .c-row:has(.card-row-icon)")))
     assert "Возврат·100USD" in ribbon and f"заказ#{oid}" in ribbon
     summary = _api(boss, "/api/money/summary", {"period": "month"})["body"]
-    assert summary["base_total"] == 200.0 and summary["deposits"] == {"total_cents": -10000, "count": 1}
+    assert summary["base_total"] == 200.0
+    assert (summary["deposits"]["total_cents"], summary["deposits"]["count"]) == (-10000, 1)
 
 
 def test_return_refused_for_unshipped_and_foreign_order(open_app, e2e):
@@ -703,7 +706,7 @@ def test_debts_buckets_sums_and_due_now_filter(open_app, e2e):
     boss.click('.seg-item[data-f="today"]')
     _idle(boss)
     assert boss.get_attribute('.seg-item[data-f="today"]', "aria-pressed") == "true"
-    ids = sorted(int(x) for x in boss.eval_on_selector_all(".btn-mark-paid", "els => els.map(e => e.dataset.id)"))
+    ids = sorted(int(x) for x in boss.eval_on_selector_all(".btn-pay-debt", "els => els.map(e => e.dataset.id)"))
     assert ids == sorted([overdue, today_]), "будущий срок в «К оплате сейчас» не попадает"
     assert boss.locator(".debt-stat-upcoming").count() == 0
     assert "300USD" in _norm(_text(boss, ".money-base-total"))
@@ -712,41 +715,48 @@ def test_debts_buckets_sums_and_due_now_filter(open_app, e2e):
     ]
     boss.click('.seg-item[data-f="all"]')
     _idle(boss)
-    assert boss.locator(".btn-mark-paid").count() == 3
-    assert future in [int(x) for x in boss.eval_on_selector_all(".btn-mark-paid", "els => els.map(e => e.dataset.id)")]
+    assert boss.locator(".btn-pay-debt").count() == 3
+    assert future in [int(x) for x in boss.eval_on_selector_all(".btn-pay-debt", "els => els.map(e => e.dataset.id)")]
 
 
-def test_mark_paid_rejects_non_positive_and_clamps_to_remaining(open_app, e2e):
+def test_debt_payment_form_validates_amounts_and_refuses_overpayment(open_app, e2e):
+    """Оплата долга — форма «как получены деньги»: ноль и минус не отправить,
+    переплату не срезаем молча, а показываем и не пускаем (сервер — тоже)."""
     oid = _order(e2e, qty=2, price=100.0)  # 200 USD
     mgr = open_app(e2e.ids["mgr"])
     _money(mgr, "debts")
-    field = f'.pay-amount-input[data-id="{oid}"]'
-    assert "200USD" in _norm(mgr.get_attribute(field, "placeholder"))
-    for raw in ("0", "-5"):
-        mgr.evaluate("window.__tgAlerts.length = 0")
-        mgr.fill(field, raw)
-        mgr.click(f'.btn-mark-paid[data-id="{oid}"]')
-        _alert(mgr, "Сумма должна быть больше нуля")
-        assert not any(a.startswith("confirm:") for a in mgr.evaluate("window.__tgAlerts"))
+    btn = f'.btn-pay-debt[data-id="{oid}"]'
+    assert "ост.200USD" in _norm(_text(mgr, btn))
+    pay_form(mgr, btn, [("card", "0")], submit=False)
+    assert mgr.locator(".c-overlay #ms-submit").is_disabled()
+    mgr.fill(".c-overlay .pay-part-amount", "-5")
+    assert mgr.locator(".c-overlay #ms-submit").is_disabled()
+    mgr.fill(".c-overlay .pay-part-amount", "999")
+    assert "Большенужногона799USD" in _norm(_text(mgr, ".c-overlay .pay-total"))
+    assert mgr.locator(".c-overlay #ms-submit").is_disabled()
     assert e2e.rows("SELECT COUNT(*) AS n FROM payments")[0]["n"] == 0
+    res = _api(mgr, "/api/orders/payment", {"order_id": oid, "parts": [
+        {"method": "card", "currency": "USD", "amount": "999"}]})
+    assert res["status"] == 400 and res["body"]["code"] == "over"
 
-    mgr.fill(field, "999")
-    mgr.click(f'.btn-mark-paid[data-id="{oid}"]')
-    mgr.wait_for_selector(".toast:has-text('ждёт подтверждения')")
-    # В подтверждении — сумма И валюта: у долгов их несколько.
-    assert any("Отметить получение 999 USD?" in a for a in mgr.evaluate("window.__tgAlerts"))
+    mgr.fill(".c-overlay .pay-part-amount", "200")
+    mgr.click(".c-overlay #ms-submit")
+    mgr.wait_for_selector(".toast:has-text('записана')")
     assert e2e.rows("SELECT amount_cents, currency, status FROM payments") == [
         {"amount_cents": 20000, "currency": "USD", "status": "pending"},
-    ], "переплата срезается до остатка"
+    ]
     push = [p for p in e2e.pushes if "Требуется подтверждение оплаты" in p["text"]]
     assert push and "закрывает долг полностью" in push[0]["text"]
-    assert "200 USD" in push[0]["text"]
-    # Больше отметить нечего: остаток уже заявлен.
-    res = _api(mgr, "/api/orders/mark_paid", {"order_id": oid, "amount": 1})
-    assert res["status"] == 400 and "полностью оплачен" in res["body"]["detail"]
+    assert "на карту 200 USD" in push[0]["text"]
+    # Больше вносить нечего: остаток уже заявлен.
+    res = _api(mgr, "/api/orders/payment", {"order_id": oid, "parts": [
+        {"method": "cash", "currency": "USD", "amount": "1"}]})
+    assert res["status"] == 400 and "нечего вносить" in res["body"]["detail"]
     _idle(mgr)
-    assert mgr.locator(f'.btn-mark-paid[data-id="{oid}"]').count() == 0
-    assert "Босс должен подтвердить" in _text(mgr, ".debt-awaiting")
+    assert mgr.locator(btn).count() == 0
+    text = _norm(_text(mgr, ".debt-awaiting"))
+    assert _norm("Оплата 200 USD ждёт подтверждения · после подтверждения долг: 0 USD") in text
+    assert "подтвердит" in text, "руководитель в системе есть — менеджеру кнопки нет, сказано, кто"
 
 
 def test_boss_rejects_marked_payment_in_debts_and_debt_returns(open_app, e2e):
@@ -759,8 +769,8 @@ def test_boss_rejects_marked_payment_in_debts_and_debt_returns(open_app, e2e):
     boss = open_app(e2e.ids["boss"])
     _money(boss, "debts")
     awaiting = boss.locator(".debt-awaiting")
-    assert _norm("Ждёт: 80 USD") in _norm(awaiting.text_content())
-    assert _norm("Останется: 120 USD") in _norm(awaiting.text_content())
+    assert _norm("Оплата 80 USD ждёт подтверждения · после подтверждения долг: 120 USD") in _norm(
+        awaiting.text_content())
     assert "80USD" in _norm(_text(boss, ".money-pending .money-value"))
     boss.click(f'.debt-awaiting .btn-reject-pay[data-id="{oid}"]')
     boss.wait_for_selector(".debt-awaiting", state="detached")
@@ -768,9 +778,9 @@ def test_boss_rejects_marked_payment_in_debts_and_debt_returns(open_app, e2e):
     _idle(boss)
 
     assert e2e.rows("SELECT id, status FROM payments") == [{"id": pid, "status": "rejected"}]
-    card = boss.locator(f'.debt-card:has(.btn-mark-paid[data-id="{oid}"])')
+    card = boss.locator(f'.debt-card:has(.btn-pay-debt[data-id="{oid}"])')
     assert card.get_attribute("data-status") == "upcoming"
-    assert "200USD" in _norm(boss.get_attribute(f'.pay-amount-input[data-id="{oid}"]', "placeholder"))
+    assert "ост.200USD" in _norm(_text(boss, f'.btn-pay-debt[data-id="{oid}"]'))
     assert "пусто" in _text(boss, ".money-pending .money-value")
     to_mgr = [p["text"] for p in e2e.pushes if p["uid"] == e2e.ids["mgr"]]
     assert any("Платёж отклонён" in t and "80 USD" in t for t in to_mgr), to_mgr
@@ -842,8 +852,9 @@ def test_debt_reduction_return_shrinks_debt_and_full_remaining_payment(open_app,
     assert (debt["confirmed"], debt["remaining"]) == (120.0, 80.0)
 
     _money(mgr, "debts")
-    mgr.click(f'.btn-mark-paid-all[data-id="{oid}"]')  # явная кнопка «Весь остаток»
-    mgr.wait_for_selector(".toast:has-text('ждёт подтверждения')")
+    # Форма предзаполнена всем остатком (80) — способ и «Записать».
+    pay_form(mgr, f'.btn-pay-debt[data-id="{oid}"]', [("bank", "80")])
+    mgr.wait_for_selector(".toast:has-text('записана')")
     assert e2e.rows("SELECT amount_cents FROM payments WHERE status = 'pending'") == [{"amount_cents": 8000}]
     _redraw_debts(boss)
     boss.click(f'.debt-awaiting .btn-confirm-pay[data-id="{oid}"]')
@@ -857,10 +868,9 @@ def test_uzs_credit_order_is_paid_in_its_currency_and_converted_in_report(open_a
 
     mgr = open_app(e2e.ids["mgr"])
     _money(mgr, "debts")
-    assert "1250000UZS" in _norm(mgr.get_attribute(f'.pay-amount-input[data-id="{oid}"]', "placeholder"))
-    mgr.fill(f'.pay-amount-input[data-id="{oid}"]', "500000")
-    mgr.click(f'.btn-mark-paid[data-id="{oid}"]')
-    mgr.wait_for_selector(".toast:has-text('ждёт подтверждения')")
+    assert "ост.1250000UZS" in _norm(_text(mgr, f'.btn-pay-debt[data-id="{oid}"]'))
+    pay_form(mgr, f'.btn-pay-debt[data-id="{oid}"]', [("card", "500000")])
+    mgr.wait_for_selector(".toast:has-text('записана')")
     assert e2e.rows("SELECT amount_cents, currency FROM payments") == [{"amount_cents": 50_000_000, "currency": "UZS"}]
     push = [p for p in e2e.pushes if "Требуется подтверждение оплаты" in p["text"]][-1]
     assert "500 000 UZS" in push["text"] and "≈ <b>100 USD</b>" in push["text"], push["text"]
@@ -1135,14 +1145,14 @@ def test_end_to_end_credit_order_payments_shrink_debt_and_match_report(open_app,
     mgr = open_app(e2e.ids["mgr"])
     boss = open_app(e2e.ids["boss"])
 
-    # 1) Менеджер отмечает 120.
+    # 1) Менеджер вносит 120 переводом на карту.
     _money(mgr, "debts")
-    mgr.fill(f'.pay-amount-input[data-id="{oid}"]', "120")
-    mgr.click(f'.btn-mark-paid[data-id="{oid}"]')
-    mgr.wait_for_selector(".toast:has-text('ждёт подтверждения')")
+    pay_form(mgr, f'.btn-pay-debt[data-id="{oid}"]', [("card", "120")])
+    mgr.wait_for_selector(".toast:has-text('записана')")
     _idle(mgr)
     card = _norm(_text(mgr, ".debt-awaiting"))
-    assert "Ждёт:120USD" in card and "Останется:180USD" in card and "Боссдолженподтвердить" in card
+    assert _norm("Оплата 120 USD ждёт подтверждения · после подтверждения долг: 180 USD") in card
+    assert "накарту120USD—ждётпроверкибанка" in card and "подтвердит" in card
     push = [p for p in e2e.pushes if "Требуется подтверждение оплаты" in p["text"]][-1]
     assert "120 USD" in push["text"] and "Останется к получению: <b>180 USD</b>" in push["text"]
     p1 = e2e.rows("SELECT id FROM payments")[0]["id"]
@@ -1166,23 +1176,25 @@ def test_end_to_end_credit_order_payments_shrink_debt_and_match_report(open_app,
 
     # 3) Ещё 100 — видно разложение «подтверждено / ждёт / останется».
     _redraw_debts(mgr)
-    assert "180USD" in _norm(mgr.get_attribute(f'.pay-amount-input[data-id="{oid}"]', "placeholder"))
-    mgr.fill(f'.pay-amount-input[data-id="{oid}"]', "100")
-    mgr.click(f'.btn-mark-paid[data-id="{oid}"]')
+    assert "ост.180USD" in _norm(_text(mgr, f'.btn-pay-debt[data-id="{oid}"]'))
+    pay_form(mgr, f'.btn-pay-debt[data-id="{oid}"]', [("bank", "100")])
     mgr.wait_for_function("() => document.querySelector('.debt-awaiting')")
     _idle(mgr)
     card = _norm(_text(mgr, ".debt-awaiting"))
-    assert "Подтверждено:120USD" in card and "Ждёт:100USD" in card and "Останется:80USD" in card
+    assert "Ужеподтверждено:120USD" in card
+    assert _norm("Оплата 100 USD ждёт подтверждения · после подтверждения долг: 80 USD") in card
     _redraw_debts(boss)
     boss.click(f'.debt-awaiting .btn-confirm-pay[data-id="{oid}"]')
     boss.wait_for_selector(".debt-awaiting", state="detached")
     _idle(boss)
 
-    # 4) «Весь остаток» — отдельной кнопкой: ровно 80, не больше.
+    # 4) Остаток — «Внести ещё оплату» на карточке ждущей оплаты: форма
+    # предзаполнена ровно 80, не больше.
     _redraw_debts(mgr)
-    mgr.click(f'.btn-mark-paid-all[data-id="{oid}"]')
-    mgr.wait_for_function("() => document.querySelector('.debt-awaiting')")
-    assert any(a.startswith("confirm:Отметить оплату всего остатка — 80 USD?") for a in mgr.evaluate("window.__tgAlerts"))
+    pay_form(mgr, f'.btn-pay-debt[data-id="{oid}"]', [("card", "80")], submit=False)
+    assert mgr.locator(".c-overlay #ms-submit").is_enabled()
+    mgr.click(".c-overlay #ms-submit")
+    mgr.wait_for_selector(".toast:has-text('Оплата 80 USD записана')")
     assert e2e.rows("SELECT amount_cents FROM payments ORDER BY id DESC LIMIT 1")[0]["amount_cents"] == 8000
     _redraw_debts(boss)
     boss.click(f'.debt-awaiting .btn-confirm-pay[data-id="{oid}"]')
@@ -1220,10 +1232,13 @@ def test_mark_full_remaining_after_partial_deposit_charges_only_rest(open_app, e
 
     mgr = open_app(e2e.ids["mgr"])
     _money(mgr, "debts")
-    field = f'.pay-amount-input[data-id="{oid}"]'
-    assert "40USD" in _norm(mgr.get_attribute(field, "placeholder")), "экран честно показывает остаток 40"
-    mgr.click(f'.btn-mark-paid-all[data-id="{oid}"]')  # «Весь остаток»
-    mgr.wait_for_selector(".toast:has-text('ждёт подтверждения')")
+    btn = f'.btn-pay-debt[data-id="{oid}"]'
+    assert "ост.40USD" in _norm(_text(mgr, btn)), "экран честно показывает остаток 40"
+    mgr.click(btn)
+    mgr.wait_for_selector(".c-overlay .pay-part")
+    assert mgr.input_value(".c-overlay .pay-part-amount") == "40", "форма предзаполнена остатком"
+    mgr.click(".c-overlay #ms-submit")
+    mgr.wait_for_selector(".toast:has-text('записана')")
     assert e2e.rows("SELECT amount_cents FROM payments WHERE order_id = ?", (oid,)) == [{"amount_cents": 4000}]
 
 

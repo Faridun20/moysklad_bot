@@ -1644,7 +1644,10 @@ async def api_payments_pending(request: Request):
             }
         )
 
-    return JSONResponse({"pending": result, "role": get_role(user["id"])})
+    confirmers = await _money_confirmers(user["id"])
+    return JSONResponse({
+        "pending": result, "role": get_role(user["id"]), "confirmers_exist": confirmers["exist"],
+    })
 
 
 @app.post("/api/payments/unlinked")
@@ -5014,7 +5017,37 @@ async def api_deposits_pending(request: Request):
     )
     deposits = await adb.get_pending_cash_deposits()
     await _decorate_deposits(deposits, user["id"])
-    return JSONResponse({"ok": True, "deposits": deposits})
+    confirmers = await _money_confirmers(user["id"])
+    return JSONResponse({"ok": True, "deposits": deposits, "confirmers_exist": confirmers["exist"]})
+
+
+async def _money_confirmers(viewer_id: int) -> dict:
+    """Кто в системе подтверждает деньги (руководитель/бухгалтер/админ).
+
+    Менеджер проходит ручки подтверждения совмещением ролей (он временно
+    бухгалтер), но экран обязан сказать, КОГДА это законно: пока ни одного
+    активного руководителя/бухгалтера нет. Иначе он молча подтверждал бы
+    собственные деньги в обход живого руководителя.
+    """
+    from services import async_db as adb
+    from services import order_payments
+
+    users = await adb.get_all_users()
+    holders = [
+        u for u in users
+        if not u.get("deactivated_at") and u.get("role") in order_payments.ROLES_CONFIRM
+    ]
+    role = get_role(viewer_id)
+    is_holder = role in order_payments.ROLES_CONFIRM
+    exist = bool(holders)
+    return {
+        "exist": exist,
+        "names": [u.get("full_name") or str(u["user_id"]) for u in holders][:3],
+        # Кнопку подтверждения рисуем тому, кто её законно жмёт: носителю роли
+        # или менеджеру, когда носителей нет вовсе.
+        "can_confirm": is_holder or (role == "manager" and not exist),
+        "viewer_is_holder": is_holder,
+    }
 
 
 async def _decorate_deposits(deposits: list[dict], viewer_id: int) -> None:
@@ -6015,11 +6048,12 @@ async def api_debts(request: Request):
     # Кто подтверждает карту/перечисление: руководитель или бухгалтер. Менеджер
     # попадает сюда совмещением ролей (бухгалтера нет) — экран говорит об этом
     # прямо, а не молча даёт ему подтвердить собственные деньги.
-    can_confirm = role_allowed(role, order_payments.ROLES_CONFIRM)
+    confirmers = await _money_confirmers(user_id)
+    can_confirm = role_allowed(role, order_payments.ROLES_CONFIRM) and confirmers["can_confirm"]
     confirm_hint = (
-        None if is_boss
+        None if confirmers["viewer_is_holder"]
         else "подтверждаете вы — руководителя и бухгалтера в системе нет" if can_confirm
-        else "подтвердит руководитель или бухгалтер"
+        else "подтвердит " + (", ".join(confirmers["names"]) or "руководитель или бухгалтер")
     )
 
     result = []
@@ -6211,6 +6245,15 @@ async def _record_order_payment(data: dict, user: dict, op: str) -> JSONResponse
         order_id = int(data.get("order_id") or "")
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="order_id обязателен")
+    # Чужой заказ — 403 раньше разбора формы: посторонний не должен узнавать,
+    # чего не хватает в запросе к заказу, который ему не принадлежит.
+    head = await adb.get_order(order_id)
+    if not head:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    from services.roles import role_allowed
+
+    if head["user_id"] != user["id"] and not role_allowed(get_role(user["id"]), order_payments.ROLES_RECORD_ANY):
+        raise HTTPException(status_code=403, detail="Нет доступа")
     if not data.get("parts"):
         # Сумма без способа больше не принимается: ради этого разбивка и
         # заведена («чтобы потом не возникало вопросов»).

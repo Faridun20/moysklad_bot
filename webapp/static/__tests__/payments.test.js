@@ -330,7 +330,7 @@ describe('«Касса»: сдача наличных по заказам', () =
     const w = boot(`
       currentUser = { role: 'manager', user_id: 42 };
       api = async (p) => {
-        if (p === '/api/deposits/pending') return { deposits: [{ id: 3, amount: 5000, currency: 'USD', is_own: true,
+        if (p === '/api/deposits/pending') return { confirmers_exist: false, deposits: [{ id: 3, amount: 5000, currency: 'USD', is_own: true,
           orders: [{ order_id: 27, amount_allocated: 5000, currency: 'USD' }], manager_name: 'М' }] };
         return { returns: [], pending: [] };
       };

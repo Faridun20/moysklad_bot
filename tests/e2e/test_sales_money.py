@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from tests.e2e.conftest import go, seed_order, settled, tab
+from tests.e2e.conftest import go, pay_form, seed_order, settled, tab
 
 
 # ─── Кредитный лимит: одобрение с превышением ────────────────────────────────
@@ -124,11 +124,10 @@ def test_manager_marks_paid_and_boss_confirms(open_app, e2e):
     mgr = open_app(e2e.ids["mgr"])
     go(mgr, "money")
     tab(mgr, "debts")
-    mgr.wait_for_selector(f'.btn-mark-paid[data-id="{oid}"]')
+    mgr.wait_for_selector(f'.btn-pay-debt[data-id="{oid}"]')
     assert "Ромашка" in mgr.locator("#content").inner_text()
-    mgr.fill(f'.pay-amount-input[data-id="{oid}"]', "150")
-    mgr.click(f'.btn-mark-paid[data-id="{oid}"]')
-    mgr.wait_for_selector(".toast:has-text('ждёт подтверждения')")
+    pay_form(mgr, f'.btn-pay-debt[data-id="{oid}"]', [("card", "150")])
+    mgr.wait_for_selector(".toast:has-text('записана')")
 
     pays = e2e.rows("SELECT amount_cents, status FROM payments WHERE order_id = ?", (oid,))
     assert pays == [{"amount_cents": 15000, "status": "pending"}]
@@ -152,7 +151,7 @@ def test_manager_marks_paid_and_boss_confirms(open_app, e2e):
 
 
 def test_paid_order_payment_is_confirmed_by_boss(open_app, e2e):
-    """«Оплачено сразу»: одобрение создаёт ожидающий платёж, босс подтверждает его в «Подтвердить»."""
+    """«Оплачено сразу»: менеджер внёс оплату картой (seed_order), босс подтверждает её в «Подтвердить»."""
     seeded = seed_order(e2e, payment_type="paid", due_date=None)
     oid = seeded["order_id"]
     pays = e2e.rows("SELECT amount_cents, status FROM payments WHERE order_id = ?", (oid,))
@@ -275,6 +274,8 @@ def test_return_flow_needs_goods_received_before_confirm(open_app, e2e):
     mgr.wait_for_selector("#ret-order")
     mgr.fill("#ret-order", str(oid))
     mgr.fill("#ret-reason", "Брак партии")
+    # Заказ оплачен — «в счёт долга» вычитать не из чего, сервер откажет.
+    mgr.click('[data-refund="no_refund"]')
     mgr.click("#ret-create")  # позиции не подгружали → полный возврат
     mgr.wait_for_selector(".toast:has-text('Возврат #')")
     ret = e2e.rows("SELECT id, status, goods_received, return_type FROM returns")[0]

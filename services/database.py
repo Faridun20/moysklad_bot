@@ -2820,8 +2820,40 @@ async def mark_order_shipped(order_id: int, shipped_by: int, shipped_name: str) 
     if order.get("status") != "approved":
         return {"ok": False, "error": "Отгрузить можно только одобренный заказ"}
 
-    from services import order_payments
+    from services import order_payments, order_shipment
     from services.debts import lock_orders
+
+    if (order.get("payment_type") or "paid") == "paid":
+        # Ранний отказ ДО повторного списания: без оплаты склад не трогаем.
+        early_gap = (await order_payments.payment_gap_cents([order_id])).get(order_id, 0)
+        if early_gap > 0:
+            cur = (order.get("currency") or "").upper()
+            return {
+                "ok": False, "code": "payment_required", "gap_cents": early_gap,
+                "error": (
+                    f"Заказ #{order_id} «оплата сразу»: сначала введите, как клиент "
+                    f"заплатил (наличные, карта, перечисление). Не внесено: "
+                    f"{order_payments.fmt_cents(early_gap, cur)}"
+                ),
+            }
+    # Списание при одобрении не прошло (не хватило остатка, позиции без карточек —
+    # order_shipment.failed_at): «отгружен» поставил бы товар в дорогу, а остаток
+    # остался бы на полке. Пробуем списать ещё раз (остаток могли довезти) и без
+    # накладной не отгружаем. Заказы без строки order_shipment (эпоха МойСклад,
+    # ручные статусы) — как раньше.
+    shipment = await order_shipment.get_shipment(order_id)
+    if shipment is not None and not shipment.get("invoice_id"):
+        retry = await order_shipment.ship_order(order, await get_order_items(order_id), user_id=shipped_by)
+        if not retry.get("ok"):
+            return {
+                "ok": False,
+                "code": "stock_not_written_off",
+                "error": (
+                    f"Склад по заказу #{order_id} не списан: {retry.get('reason') or 'ошибка склада'}. "
+                    "Отгрузить нельзя — товар уехал бы, а остаток остался на полке. Оформите "
+                    "приход недостающего или поправьте позиции и нажмите «Отгрузить» ещё раз."
+                ),
+            }
 
     async with adb_core.transaction() as txn:
         # «Оплата сразу» не уезжает, пока не введено, как получены деньги
@@ -2908,12 +2940,26 @@ async def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, re
         from services import order_payments
 
         parts = (await order_payments.parts_for_orders([order_id], conn=txn)).get(order_id, [])
-        blocking = [p for p in parts if p["state"] in ("confirmed", "in_deposit")]
-        if blocking:
+        confirmed_c = int(await txn.fetchval(
+            "SELECT COALESCE(SUM(amount_cents), 0) FROM payments WHERE order_id = $1 "
+            "AND status = 'confirmed'", order_id,
+        ) or 0)
+        in_deposit = [p for p in parts if p["state"] == "in_deposit"]
+        if confirmed_c > 0 or in_deposit:
+            cur = (await txn.fetchval("SELECT currency FROM orders WHERE id = $1", order_id)) or ""
+            what = (
+                f"подтверждена оплата {order_payments.fmt_cents(confirmed_c, cur)}"
+                if confirmed_c else "наличные уже сданы в кассу (сдача ждёт подтверждения)"
+            )
             return {
                 "ok": False,
-                "error": "По заказу уже принята оплата (подтверждена или сдана в кассу) — "
-                "сначала отклоните сдачу/платёж, потом отменяйте заказ",
+                "code": "money_received",
+                "error": (
+                    f"По заказу #{order_id} {what} — отмена потеряла бы эти деньги. "
+                    + ("Отклоните сдачу, потом отменяйте заказ."
+                       if not confirmed_c else
+                       "Отгрузите заказ и оформите возврат «Наличными» — деньги выдадут из кассы с записью.")
+                ),
             }
         # Сначала склад: его отказ случается ДО первой записи, и тогда
         # транзакция не пишет ничего — заказ остаётся одобренным.
@@ -2935,12 +2981,17 @@ async def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, re
         )
         if not updated:  # под замком недостижимо; страховка на SQLite-ручные правки
             raise RuntimeError(f"cancel_order: заказ #{order_id} ушёл из approved под замком")
-        for p in parts:
-            if p["state"] in ("on_hand", "awaiting_bank"):
-                await txn.execute(
-                    "UPDATE payments SET status = 'rejected' WHERE id = $1 AND status = 'pending'",
-                    p["payment_id"],
-                )
+        # Все ожидающие платежи отменённого заказа снимаются вместе с ним: и
+        # строки разбивки, и старый автоплатёж одобрения без способа. Иначе
+        # «Подтвердить» по отменённому заказу засчитывал деньги за продажу,
+        # которой нет (сценарий test_cancelling_paid_order_voids_its_pending_payment).
+        voided = await txn.fetch(
+            "SELECT id FROM payments WHERE order_id = $1 AND status = 'pending'", order_id
+        )
+        await txn.execute(
+            "UPDATE payments SET status = 'rejected' WHERE order_id = $1 AND status = 'pending'",
+            order_id,
+        )
 
     await asyncio.to_thread(
         add_audit_log,
@@ -2948,7 +2999,8 @@ async def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, re
         cancelled_name,
         await asyncio.to_thread(get_role, cancelled_by),
         "order_cancelled",
-        f"Заказ #{order_id} отменён: {reason[:200]}",
+        f"Заказ #{order_id} отменён: {reason[:200]}"
+        + (f"; сняты ожидающие платежи #{', #'.join(str(r['id']) for r in voided)}" if voided else ""),
     )
     if rev.get("invoice_id"):
         logger.info("Заказ #%s отменён, отгрузка откачена, остаток возвращён", order_id)
@@ -3984,14 +4036,11 @@ async def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_nam
 
         paid_by_parts = await order_payments.confirm_deposit_parts_locked(txn, deposit_id, rates)
         for oid in paid_by_parts:
+            # Строки разбивки — это платежи: заказ закрывается ровно как при
+            # подтверждении платежа (paid_confirmed_at), какой бы из путей —
+            # сдача или кнопка «Подтвердить» по карте — ни оказался последним.
             done, _cents = await _close_order_if_covered_locked(txn, oid, confirmed_by, confirmed_name)
             if done:
-                await txn.execute(
-                    "UPDATE orders SET payment_confirmed = 1, payment_confirmed_at = $1, "
-                    "status = CASE WHEN status = 'shipped' THEN 'paid' ELSE status END, updated_at = $2 "
-                    "WHERE id = $3 AND payment_confirmed = 0",
-                    now_str(), now_str(), oid,
-                )
                 closed.append(oid)
 
         balances = await calc_order_balances(legacy_ids, conn=txn)
@@ -4153,6 +4202,8 @@ async def get_overdue_undeposited_orders(days: int = 2) -> list[dict]:
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     return await adb_core.fetch(
         "SELECT * FROM orders WHERE status = 'shipped' AND payment_confirmed = 0 "
+        # Закрытый платежами (разбивка/карта) заказ сдавать уже нечего.
+        "AND paid_confirmed_at IS NULL "
         "AND COALESCE(shipped_at, created_at) < $1 "
         "ORDER BY user_id, created_at",
         cutoff,
@@ -4262,6 +4313,9 @@ async def create_return(
         )
         if int(cnt or 0) > 0:
             return {"ok": False, "error": "По заказу уже есть возврат на рассмотрении"}
+        refusal = await _debt_reduction_refusal(txn, order_id, refund_method, total_cents)
+        if refusal:
+            return {"ok": False, "error": refusal, "code": "no_debt_to_reduce"}
 
         if USE_POSTGRES:
             return_id = await txn.fetchval(
@@ -4288,6 +4342,41 @@ async def create_return(
             txn, idem_key, {"ok": True, "return_id": return_id, "total_amount": total_amount}
         )
     return {"ok": True, "return_id": return_id, "total_amount": total_amount}
+
+
+async def _debt_reduction_refusal(txn, order_id: int, refund_method: str | None,
+                                  amount_cents: int) -> str | None:
+    """Возврат «в счёт долга» больше долга — отказ текстом, иначе None.
+
+    Возврат «в счёт долга» уменьшает остаток к оплате. Если клиент уже заплатил
+    (долга нет или он меньше суммы возврата), вычитать не из чего: сумма
+    возврата — его переплата, и она молча исчезала бы — ни в долгах, ни в
+    выдаче из кассы. Долг = то, что по заказу ещё можно заявить
+    (`calc_claimable_cents`): ожидающие оплаты и сдачи считаются уже
+    заплаченными — после их подтверждения переплата была бы та же. Замок
+    заказа берётся здесь же (`lock_orders`), как у всех «заявлено по заказу».
+    """
+    if refund_method != "debt_reduction":
+        return None
+    from services.debts import calc_claimable_cents, lock_orders
+
+    await lock_orders(txn, [order_id])
+    debt = (await calc_claimable_cents([order_id], conn=txn)).get(order_id, 0)
+    if amount_cents <= debt:
+        return None
+    from services.order_payments import fmt_cents
+
+    cur = (await txn.fetchval("SELECT currency FROM orders WHERE id = $1", order_id)) or ""
+    head = (
+        "Долга по заказу нет — клиент уже заплатил"
+        if debt <= 0
+        else f"Долг по заказу {fmt_cents(debt, cur)} меньше возврата"
+    )
+    return (
+        f"{head}: вернуть {fmt_cents(amount_cents, cur)} «в счёт долга» "
+        "нельзя — переплата клиента пропала бы. Выберите «Наличными» (деньги выдадут из "
+        "кассы) или «Без возврата»."
+    )
 
 
 async def mark_return_goods_received(return_id: int, by: int) -> dict:
@@ -4463,6 +4552,14 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
             # тот же, что у отметки оплаты и сдачи (services.debts.lock_orders):
             # иначе параллельная отметка оплаты считала остаток ещё без возврата.
             await lock_orders(txn, [order_id])
+            # Между оформлением и подтверждением клиент мог доплатить: «в счёт
+            # долга» сверх долга не подтверждаем по той же причине, что и не
+            # оформляем (_debt_reduction_refusal).
+            refusal = await _debt_reduction_refusal(
+                txn, order_id, ret.get("refund_method"), int(ret.get("total_amount_cents") or 0)
+            )
+            if refusal:
+                raise _TxnAbort(refusal)
             # T2.8: подтвердить возврат можно только если товар ПРИНЯТ.
             # goods_received писался (mark_return_goods_received), но никогда не
             # проверялся: босс подтверждал возврат → returned_qty рос, заказ
@@ -5827,6 +5924,12 @@ async def confirm_payment(
         order_id = head.get("order_id")
         if order_id:
             await lock_orders(txn, [int(order_id)])
+            # Деньги по отменённой/отклонённой продаже не засчитываются: платёж
+            # такого заказа — ошибка, а не поступление (cancel_order их снимает;
+            # здесь — рубеж для старых строк и гонки «отменить против подтвердить»).
+            st = await txn.fetchval("SELECT status FROM orders WHERE id = $1", int(order_id))
+            if st in ("cancelled", "rejected", "draft"):
+                return False
         rc = await txn.execute(
             "UPDATE payments SET status = 'confirmed', confirmed_at = $1 "
             "WHERE id = $2 AND status = 'pending'",

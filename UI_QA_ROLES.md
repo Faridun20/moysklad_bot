@@ -23,13 +23,13 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 147._
+_Всего эндпоинтов: 150._
 
 
 > **Временное совмещение ролей** (`services/roles.py::ROLE_ALSO_ACTS_AS`): `manager` = + `warehouse_keeper`, `bookkeeper`. Кладовщика и бухгалтера в штате пока нет, их работу делает менеджер; списки ниже уже учитывают это. Роли `warehouse_keeper`/`bookkeeper` через `/addrole` не назначаются. `*` в таблице экранов — доступ через совмещение.
 
 
-### Админ (`admin`) — 126 эндпоинтов
+### Админ (`admin`) — 129 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -71,6 +71,7 @@ _Всего эндпоинтов: 147._
 - `/api/deposits/confirm`
 - `/api/deposits/create`
 - `/api/deposits/my`
+- `/api/deposits/on_hand`
 - `/api/deposits/pending`
 - `/api/deposits/reject`
 - `/api/docs/company/set`
@@ -120,6 +121,8 @@ _Всего эндпоинтов: 147._
 - `/api/orders/create`
 - `/api/orders/delete_draft`
 - `/api/orders/mark_paid`
+- `/api/orders/payment`
+- `/api/orders/payment_context`
 - `/api/orders/reject_payment`
 - `/api/orders/remove_item`
 - `/api/orders/requests`
@@ -163,7 +166,7 @@ _Всего эндпоинтов: 147._
 </details>
 
 
-### Руководитель (`boss`) — 123 эндпоинтов
+### Руководитель (`boss`) — 126 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -205,6 +208,7 @@ _Всего эндпоинтов: 147._
 - `/api/deposits/confirm`
 - `/api/deposits/create`
 - `/api/deposits/my`
+- `/api/deposits/on_hand`
 - `/api/deposits/pending`
 - `/api/deposits/reject`
 - `/api/docs/company/set`
@@ -254,6 +258,8 @@ _Всего эндпоинтов: 147._
 - `/api/orders/create`
 - `/api/orders/delete_draft`
 - `/api/orders/mark_paid`
+- `/api/orders/payment`
+- `/api/orders/payment_context`
 - `/api/orders/reject_payment`
 - `/api/orders/remove_item`
 - `/api/orders/requests`
@@ -294,7 +300,7 @@ _Всего эндпоинтов: 147._
 </details>
 
 
-### Менеджер (`manager`) — 72 эндпоинтов
+### Менеджер (`manager`) — 78 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -317,6 +323,7 @@ _Всего эндпоинтов: 147._
 - `/api/deposits/confirm`
 - `/api/deposits/create`
 - `/api/deposits/my`
+- `/api/deposits/on_hand`
 - `/api/deposits/pending`
 - `/api/deposits/reject`
 - `/api/docs/create`
@@ -343,13 +350,18 @@ _Всего эндпоинтов: 147._
 - `/api/machines/photo_upload`
 - `/api/money/receivables`
 - `/api/orders/add_item`
+- `/api/orders/confirm_payment`
 - `/api/orders/create`
 - `/api/orders/delete_draft`
 - `/api/orders/mark_paid`
+- `/api/orders/payment`
+- `/api/orders/payment_context`
+- `/api/orders/reject_payment`
 - `/api/orders/remove_item`
 - `/api/orders/set_agent`
 - `/api/orders/ship`
 - `/api/orders/submit`
+- `/api/payments/pending`
 - `/api/payments/send`
 - `/api/payments/unlinked`
 - `/api/products/photo`
@@ -389,7 +401,7 @@ _Всего эндпоинтов: 147._
 </details>
 
 
-### Бухгалтер (сейчас не назначается) (`bookkeeper`) — 6 эндпоинтов
+### Бухгалтер (сейчас не назначается) (`bookkeeper`) — 9 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -397,6 +409,9 @@ _Всего эндпоинтов: 147._
 - `/api/deposits/confirm`
 - `/api/deposits/pending`
 - `/api/deposits/reject`
+- `/api/orders/confirm_payment`
+- `/api/orders/reject_payment`
+- `/api/payments/pending`
 - `/api/payments/unlinked`
 - `/api/today`
 

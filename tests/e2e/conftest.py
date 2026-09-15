@@ -240,13 +240,56 @@ def sheet_fill(page: Page, values: dict) -> None:
         page.fill(f"#ms-f-{key}", str(val))
 
 
+def pay_order(e2e: E2E, order_id: int, parts: list[tuple] | None = None, *, uid: int | None = None) -> dict:
+    """Разбивка «как получены деньги» через сервис (services.order_payments).
+
+    `parts` — [(способ, сумма[, валюта])]; по умолчанию вся сумма к оплате
+    картой (ожидающий платёж, который подтверждает руководитель — ровно то, что
+    раньше делал автоплатёж одобрения «оплаты сразу»).
+    """
+    from services import order_payments
+
+    uid = uid or e2e.ids["mgr"]
+    order = e2e.rows("SELECT currency, payment_type FROM orders WHERE id = ?", (order_id,))[0]
+    cur = order["currency"] or "USD"
+    if parts is None:
+        gap = e2e.run(order_payments.payment_gap_cents([order_id]))[order_id]
+        parts = [("card", gap / 100)]
+    rows = [{"method": p[0], "amount": str(p[1]), "currency": p[2] if len(p) > 2 else cur} for p in parts]
+    actor = order_payments.Actor(user_id=uid, name="Manager", role="manager")
+    return e2e.run(order_payments.record_payment_parts(order_id, actor, rows))
+
+
+def pay_form(page: Page, open_selector: str, rows: list[tuple], *, submit: bool = True) -> None:
+    """Форма «Как получены деньги» в браузере: открыть кнопкой, заполнить строки
+    [(способ, сумма[, валюта[, курс]])], отправить."""
+    page.click(open_selector)
+    page.wait_for_selector(".c-overlay .pay-part")
+    for i, row in enumerate(rows):
+        if i > 0:
+            page.click(".c-overlay .pay-add-part")
+        part = page.locator(".c-overlay .pay-part").nth(i)
+        part.locator(f'[data-pay-method="{row[0]}"]').click()
+        if len(row) > 2 and row[2]:
+            page.locator(".c-overlay .pay-part").nth(i).locator(f'[data-pay-cur="{row[2]}"]').click()
+        part = page.locator(".c-overlay .pay-part").nth(i)
+        part.locator(".pay-part-amount").fill(str(row[1]))
+        if len(row) > 3 and row[3]:
+            part.locator(".pay-part-rate").fill(str(row[3]))
+    if submit:
+        page.click(".c-overlay #ms-submit")
+
+
 def seed_order(e2e: E2E, *, payment_type: str = "credit", due_date: str | None = "2030-01-15",
-               qty: float = 2, price: float = 100.0, approve: bool = True) -> dict:
+               qty: float = 2, price: float = 100.0, approve: bool = True,
+               pay: str | None = "card") -> dict:
     """Заказ менеджера на «Ромашку» через сервисы (не через браузер).
 
     Нужен сценариям, которые начинаются ПОСЛЕ продажи: оплата, сдача, возврат,
     долги. Путь через редактор уже покрыт своим тестом, повторять его в каждом
     из них — оплачивать полминуты браузера за то, что и так проверено.
+    «Оплата сразу» после одобрения получает разбивку `pay` на всю сумму (как
+    сделал бы менеджер перед отгрузкой); `pay=None` — без неё (форма в тесте).
     Возвращает {order_id, req_id, counterparty_id}.
     """
     from services.order_workflow import approve_shipment_request, submit_order
@@ -261,4 +304,6 @@ def seed_order(e2e: E2E, *, payment_type: str = "credit", due_date: str | None =
     if approve:
         ap = e2e.run(approve_shipment_request(res["req_id"], ids["boss"], "Boss", e2e.bot))
         assert ap.get("ok"), ap
+        if payment_type == "paid" and pay:
+            pay_order(e2e, oid, [(pay, qty * price)])
     return {"order_id": oid, "req_id": res["req_id"], "counterparty_id": cp}
