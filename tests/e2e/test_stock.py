@@ -493,3 +493,111 @@ def test_stale_filter_is_internal_and_shows_stock(open_app, e2e):
     mgr.wait_for_selector("#stock-filters")
     assert mgr.locator("[data-stale]").count() == 0
     assert mgr.locator('.seg-item[data-sect="stale"]').count() == 0
+
+
+# ─── Списание с причиной и инвентаризация ────────────────────────────────────
+
+
+def _open_writeoffs(page) -> None:
+    """«Склад → Накладные → Списания». Пятой вкладкой раздела это быть не может
+    (их потолок — четыре), поэтому второй уровень внутри вкладки."""
+    go(page, "stock")
+    tab(page, "invoices")
+    page.click('[data-whsub="writeoffs"]')
+    page.wait_for_selector("#wo-new")
+    settled(page)
+
+
+def _pick_product(page, product_id: int) -> None:
+    """Товар начинают с ВЫБОРА из каталога — как позицию контейнера."""
+    page.wait_for_selector(f'.picker-list [data-product="{product_id}"]')
+    page.click(f'.picker-list [data-product="{product_id}"]')
+    page.click("#ms-submit")
+
+
+def test_manager_writes_off_two_units_with_a_reason(open_app, e2e):
+    """Сценарий владельца: «разбилось — убрать со склада с причиной»."""
+    mgr = open_app(e2e.ids["mgr"])
+    _open_writeoffs(mgr)
+    mgr.click("#wo-new")
+    _pick_product(mgr, e2e.ids["product"])
+    mgr.wait_for_selector("#ms-f-quantity")
+    mgr.fill("#ms-f-quantity", "2")
+    mgr.click('.c-overlay .seg-item[data-opt="бой"]')
+    mgr.fill("#ms-f-note", "уронили при разгрузке")
+    mgr.click("#ms-submit")
+    mgr.wait_for_selector(".toast:has-text('Списано')")
+
+    assert _stock(e2e) == 18, "остаток уменьшился ровно на списанное"
+    row = e2e.rows("SELECT kind, reason, created_by FROM stock_writeoffs ORDER BY id DESC")[0]
+    assert row["kind"] == "writeoff" and row["created_by"] == e2e.ids["mgr"]
+    assert "бой" in row["reason"] and "разгрузке" in row["reason"]
+    # Причина видна в журнале — ради неё всё и затевалось.
+    mgr.wait_for_selector("#content:has-text('уронили при разгрузке')")
+    # Движение прошло обычной расходной накладной, но продажей не стало.
+    inv = e2e.rows(
+        "SELECT i.type, i.total_amount_cents FROM invoices i "
+        "JOIN stock_writeoffs w ON w.invoice_id = i.id ORDER BY i.id DESC"
+    )[0]
+    assert inv["type"] == "outgoing" and inv["total_amount_cents"] == 0
+
+
+def test_writeoff_over_stock_is_refused_inside_the_form(open_app, e2e):
+    """Отказ читается в форме вместе с набранным, а не системным алертом."""
+    mgr = open_app(e2e.ids["mgr"])
+    _open_writeoffs(mgr)
+    mgr.click("#wo-new")
+    _pick_product(mgr, e2e.ids["product"])
+    mgr.wait_for_selector("#ms-f-quantity")
+    mgr.fill("#ms-f-quantity", "999")
+    mgr.click("#ms-submit")
+    mgr.wait_for_selector("#ms-error:has-text('Не хватает остатка')")
+    assert _stock(e2e) == 20
+    assert mgr.locator("#ms-f-quantity").input_value() == "999", "набранное осталось в форме"
+
+
+def test_manager_runs_a_count_and_applies_deltas(open_app, e2e):
+    """Пересчёт трёх товаров: недостача, излишек и «сходится» — одной проводкой."""
+    from services import container_receipt, warehouse
+
+    ids = e2e.ids
+    extra = e2e.run(container_receipt.create_product("Гофра 20"))["product_id"]
+    same = e2e.run(container_receipt.create_product("Хомут 20"))["product_id"]
+    for pid in (extra, same):
+        assert e2e.run(warehouse.create_invoice(
+            invoice_type="incoming", warehouse_id=ids["warehouse"],
+            items=[{"product_id": pid, "quantity": 5, "price_cents": None}],
+        ))["ok"]
+
+    mgr = open_app(ids["mgr"])
+    _open_writeoffs(mgr)
+    mgr.click("#wo-count")
+    mgr.wait_for_selector("#ms-f-note")
+    mgr.fill("#ms-f-note", "ряд А")
+    mgr.click("#ms-submit")
+    mgr.wait_for_selector("#wo-line-add")
+
+    for pid, counted in ((ids["product"], "17"), (extra, "7"), (same, "5")):
+        mgr.click("#wo-line-add")
+        _pick_product(mgr, pid)
+        mgr.wait_for_selector("#ms-f-counted")
+        mgr.fill("#ms-f-counted", counted)
+        mgr.click("#ms-submit")
+        mgr.wait_for_selector(f'[data-wo-line="{pid}"]')
+
+    # Сводка расхождений видна ДО проведения — «применить вслепую» тут нет.
+    text = mgr.locator("#content").inner_text()
+    assert "недостача 1" in text and "излишек 1" in text and "сходится 1" in text
+
+    mgr.click("#wo-apply")
+    mgr.wait_for_selector(".toast:has-text('проведён')")
+
+    def qty(pid):
+        return e2e.rows("SELECT quantity FROM stock WHERE product_id = ?", (pid,))[0]["quantity"]
+
+    assert qty(ids["product"]) == 17 and qty(extra) == 7 and qty(same) == 5
+    kinds = {r["kind"]: r for r in e2e.rows(
+        "SELECT kind, reason, count_id FROM stock_writeoffs WHERE count_id IS NOT NULL")}
+    assert set(kinds) == {"writeoff", "surplus"}
+    assert all(r["reason"] == "инвентаризация" for r in kinds.values())
+    assert e2e.rows("SELECT status FROM stock_counts ORDER BY id DESC")[0]["status"] == "applied"

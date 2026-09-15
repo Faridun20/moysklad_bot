@@ -164,6 +164,43 @@ def api_stock(w: World, uid: int, product_id: int) -> float:
     return 0.0
 
 
+# ─── Списание и пересчёт ─────────────────────────────────────────────────────
+
+
+def write_off(w: World, uid: int, product_id: int, qty: float, reason: str, *,
+              expect: int = 200) -> dict:
+    """«Разбилось/пропало»: товар уходит со склада с причиной."""
+    return w.call(uid, "/api/stock/writeoffs/create", expect=expect, product_id=product_id,
+                  quantity=qty, reason=reason, idempotency_key=key())
+
+
+def void_write_off(w: World, uid: int, writeoff_id: int, *, expect: int = 200) -> dict:
+    return w.call(uid, "/api/stock/writeoffs/void", expect=expect, writeoff_id=writeoff_id)
+
+
+def writeoffs(w: World, uid: int) -> list[dict]:
+    return w.call(uid, "/api/stock/writeoffs")["writeoffs"]
+
+
+def start_count(w: World, uid: int, note: str = "", *, expect: int = 200) -> dict:
+    return w.call(uid, "/api/stock/counts/start", expect=expect, note=note)
+
+
+def count_line(w: World, uid: int, count_id: int, product_id: int, counted: float, *,
+               expect: int = 200) -> dict:
+    return w.call(uid, "/api/stock/counts/line", expect=expect, count_id=count_id,
+                  product_id=product_id, counted_qty=counted)
+
+
+def count_card(w: World, uid: int, count_id: int) -> dict:
+    return w.call(uid, "/api/stock/counts/card", count_id=count_id)
+
+
+def apply_count(w: World, uid: int, count_id: int, *, expect: int = 200) -> dict:
+    return w.call(uid, "/api/stock/counts/confirm", expect=expect, count_id=count_id,
+                  idempotency_key=key())
+
+
 # ─── Контейнер ───────────────────────────────────────────────────────────────
 
 

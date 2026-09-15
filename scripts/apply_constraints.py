@@ -102,6 +102,7 @@ def _checks() -> list[Check]:
     (`order_workflow.TRANSITIONS`), виды документов бухгалтерии
     (`accounting.DOC_KINDS`, `ACCOUNT_KINDS`). Правка там без правки здесь
     ловится тестом (`test_check_values_follow_the_code`)."""
+    from services import inventory as inv
     from services import machine_deal_requests as mdr
     from services.accounting import ACCOUNT_KINDS, DOC_KINDS
     from services.order_payments import METHODS, RATE_SOURCES
@@ -227,6 +228,22 @@ def _checks() -> list[Check]:
         Check("acc_account_details_number_chk", "acc_account_details",
               "account_number IS NULL OR account_number ~ '^[0-9]{20}$'",
               ("account_id", "account_number"), "расчётный счёт — 20 цифр"),
+        # ── Списание с причиной и пересчёт (services.inventory) ──
+        # Виды и статусы — из кода (`test_check_values_follow_the_code`).
+        # Причина непустая: списание без причины — дыра в остатке, о которой
+        # через месяц никто ничего не скажет.
+        Check("stock_writeoffs_kind_chk", "stock_writeoffs", f"kind IN {_in(list(inv.KINDS))}",
+              ("id", "kind"), "вид записи склада (списание/излишек)"),
+        Check("stock_writeoffs_reason_chk", "stock_writeoffs", "length(trim(reason)) > 0",
+              ("id", "reason"), "причина списания заполнена"),
+        Check("stock_writeoffs_cost_chk", "stock_writeoffs",
+              "cost_cents IS NULL OR cost_cents >= 0", ("id", "cost_cents"),
+              "себестоимость списания ≥ 0"),
+        Check("stock_counts_status_chk", "stock_counts",
+              f"status IN {_in(list(inv.COUNT_STATUSES))}", ("id", "status"),
+              "статус пересчёта"),
+        Check("stock_count_lines_qty_chk", "stock_count_lines", "counted_qty >= 0",
+              ("id", "count_id", "counted_qty"), "посчитанное количество ≥ 0"),
     ]
 
 
@@ -299,6 +316,14 @@ FOREIGN_KEYS: list[ForeignKey] = [
     ForeignKey("machine_receipt_accounts_account_fk", "machine_receipt_accounts", "account_id",
                "acc_accounts"),
     ForeignKey("acc_account_details_account_fk", "acc_account_details", "account_id", "acc_accounts"),
+    # Списание и пересчёт. Записи списания не удаляются (сторно — это отмена
+    # накладной плюс `cancelled_at`), строки пересчёта уходят раньше сессии.
+    ForeignKey("stock_writeoffs_invoice_fk", "stock_writeoffs", "invoice_id", "invoices"),
+    ForeignKey("stock_writeoffs_warehouse_fk", "stock_writeoffs", "warehouse_id", "warehouses"),
+    ForeignKey("stock_writeoffs_count_fk", "stock_writeoffs", "count_id", "stock_counts"),
+    ForeignKey("stock_counts_warehouse_fk", "stock_counts", "warehouse_id", "warehouses"),
+    ForeignKey("stock_count_lines_count_fk", "stock_count_lines", "count_id", "stock_counts"),
+    ForeignKey("stock_count_lines_product_fk", "stock_count_lines", "product_id", "products"),
 ]
 
 # UNIQUE-индексы из `_index_ddls`, под которые заранее ищутся дубли:
@@ -315,6 +340,8 @@ UNIQUE_KEYS: dict[str, tuple[str, tuple[str, ...], str]] = {
     "idx_acc_account_details_number": (
         "acc_account_details", ("account_number",), "account_number IS NOT NULL"
     ),
+    "idx_stock_writeoffs_invoice": ("stock_writeoffs", ("invoice_id",), "invoice_id IS NOT NULL"),
+    "idx_stock_count_lines_product": ("stock_count_lines", ("count_id", "product_id"), "TRUE"),
 }
 
 

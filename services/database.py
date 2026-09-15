@@ -1317,6 +1317,56 @@ def _table_ddls() -> list[str]:
                 unmatched      TEXT,
                 created_at     TEXT
             )""",
+            # Списание и излишек («пересчитали — не сходится», «бой/порча»).
+            # Сам ТОВАР двигает обычная накладная склада (расходная у списания,
+            # приходная у излишка) — как у приёмки контейнера: отдельного вида
+            # движения нет, иначе остаток начал бы зависеть от того, каким
+            # путём товар ушёл, а инвариант «остаток = приходы − расходы по
+            # действующим накладным» перестал бы держаться. Здесь — только то,
+            # чего в накладной нет: ПРИЧИНА, фото и сессия пересчёта.
+            # `kind='surplus'` — та же лента: излишек это тот же результат
+            # пересчёта, и смотреть его надо рядом со списанием.
+            # `cost_cents` — себестоимость ушедшего (сумма фиксаций
+            # `sale_costs` этой накладной), только при включённом учёте;
+            # выключен — NULL, и списание работает как раньше.
+            f"""CREATE TABLE IF NOT EXISTS stock_writeoffs (
+                id            {id_type},
+                kind          TEXT NOT NULL DEFAULT 'writeoff',
+                invoice_id    BIGINT,
+                warehouse_id  BIGINT NOT NULL,
+                reason        TEXT NOT NULL,
+                photo_file_id TEXT,
+                count_id      BIGINT,
+                cost_cents    BIGINT,
+                created_by    BIGINT,
+                created_at    TEXT NOT NULL,
+                cancelled_by  BIGINT,
+                cancelled_at  TEXT
+            )""",
+            # Сессия пересчёта: шапка и строки. Строки живут ДО проведения —
+            # человек считает склад не за одну минуту, и набранное обязано
+            # пережить закрытие приложения. Дельта не хранится: она считается
+            # от ЖИВОГО остатка в момент проведения, иначе параллельная
+            # отгрузка молча превратилась бы в недостачу.
+            f"""CREATE TABLE IF NOT EXISTS stock_counts (
+                id           {id_type},
+                warehouse_id BIGINT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'open',
+                note         TEXT,
+                started_by   BIGINT,
+                started_at   TEXT NOT NULL,
+                finished_by  BIGINT,
+                finished_at  TEXT
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS stock_count_lines (
+                id           {id_type},
+                count_id     BIGINT NOT NULL,
+                product_id   BIGINT NOT NULL,
+                counted_qty  {qty_type} NOT NULL,
+                expected_qty {qty_type},
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT
+            )""",
         ]
     # Бухгалтерия (счета, журнал денег) — схема в leaf-модуле: сервис
     # импортирует database, и объявление здесь дало бы цикл импортов.
@@ -1394,6 +1444,27 @@ def _index_ddls() -> list[str]:
             # индекс отдаёт строки уже в нужном порядке.
             "CREATE INDEX IF NOT EXISTS idx_invoices_type_status_date "
             "ON invoices(type, status, invoice_date, id)",
+            # Списания и пересчёт. UNIQUE по накладной — «одна накладная, один
+            # владелец», как у order_shipment/return_receipt/container_receipt:
+            # второе списание по той же накладной означало бы, что остаток
+            # двинули дважды, а причина у него одна. Частичный — у сторнированной
+            # записи накладная остаётся, а NULL не бывает вовсе (оставлен на
+            # случай ручной правки).
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_writeoffs_invoice "
+            "ON stock_writeoffs(invoice_id) WHERE invoice_id IS NOT NULL",
+            # Строки одной сессии пересчёта: карточка и проведение читают их
+            # по count_id; лента списаний фильтруется по нему же.
+            "CREATE INDEX IF NOT EXISTS idx_stock_writeoffs_count "
+            "ON stock_writeoffs(count_id) WHERE count_id IS NOT NULL",
+            # Один товар — одна строка пересчёта: повторный ввод количества по
+            # тому же товару правит строку, а не добавляет вторую (иначе дельта
+            # применилась бы дважды).
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_count_lines_product "
+            "ON stock_count_lines(count_id, product_id)",
+            # Открытая сессия пересчёта ищется по статусу (их единицы, но
+            # список «продолжить пересчёт» дёргается на каждом входе во вкладку).
+            "CREATE INDEX IF NOT EXISTS idx_stock_counts_status "
+            "ON stock_counts(status, id)",
             # Обратный поиск «локальный id → ms_id» при сверке миграции.
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_ms_id_map_local "
             "ON ms_id_map(entity_type, local_id)",

@@ -212,6 +212,11 @@
     '/api/cash/history': ['admin', 'boss'],
     '/api/money/summary': ['admin', 'boss'],
     '/api/wh/invoices/cancel': ['admin', 'boss', 'manager'],
+    // Списание и пересчёт — физическая работа со складом: менеджеру открыта
+    // (он же кладовщик), сторно — под тем же `delete_requires_boss`.
+    '/api/stock/writeoffs/create': ['admin', 'boss', 'manager'],
+    '/api/stock/writeoffs/void': ['admin', 'boss', 'manager'],
+    '/api/stock/counts/confirm': ['admin', 'boss', 'manager'],
     '/api/machines/delete': ['admin', 'boss', 'manager'],
     '/api/machines/deal': ['admin', 'boss', 'manager'],
     '/api/machines/deals/pending': ['admin', 'boss', 'manager'],

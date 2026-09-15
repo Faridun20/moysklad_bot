@@ -409,6 +409,30 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
     if page.locator('.seg-item[data-sect="invoices"]').count():
         tab(page, "invoices")
         audit.idle()
+        # Списания и пересчёт — второй уровень той же вкладки: журнал, выбор
+        # товара, форма причины и карточка пересчёта. Раньше формы накладной:
+        # она остаётся открытым видом вкладки (черновик не теряем), и вернуться
+        # к переключателю можно только его же кнопкой.
+        page.click('[data-whsub="writeoffs"]')
+        page.wait_for_selector("#wo-new")
+        audit.check("stock-writeoffs")
+        page.click("#wo-new")
+        page.wait_for_selector(".c-overlay .picker-list [data-product]")
+        audit.check("writeoff-picker", ".c-overlay")
+        page.locator(".c-overlay .picker-list [data-product]").first.click()
+        page.click(".c-overlay #ms-submit")
+        page.wait_for_selector(".c-overlay #ms-f-quantity")
+        audit.check("writeoff-form", ".c-overlay")
+        while page.locator(".c-overlay").count():
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(50)
+        page.click("#wo-count")
+        page.wait_for_selector(".c-overlay #ms-f-note")
+        page.click(".c-overlay #ms-submit")
+        page.wait_for_selector("#wo-line-add")
+        audit.check("stock-count")
+        page.click('[data-whsub="invoices"]')
+        page.wait_for_selector("#wh-new")
         page.click("#wh-new")
         audit.check("invoice-form")
         audit.overlay("#wh-cp", "counterparty-picker")

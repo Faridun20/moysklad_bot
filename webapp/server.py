@@ -7984,6 +7984,20 @@ async def _invoice_owner_refusal(invoice_id: int) -> dict | None:
     historical = await warehouse.historical_invoice_refusal(invoice_id)
     if historical:
         return {"ok": False, "code": "historical", "reason": historical, "detail": historical}
+    # Списание/излишек: отмена накладной вернула бы товар, а запись о списании
+    # осталась бы жить с причиной и себестоимостью потери. Сторно у него своё —
+    # «Склад → Списания», там же окно суток и правило «чужое — руководителю».
+    wo = await adb_core.fetchrow(
+        "SELECT id, kind FROM stock_writeoffs WHERE invoice_id = $1", invoice_id
+    )
+    if wo is not None:
+        what = "списание" if wo["kind"] == "writeoff" else "оприходование излишка"
+        reason = (
+            f"Эта накладная — {what} #{wo['id']}. Отмените его в «Склад → Списания»: "
+            "там сторно снимет и запись, и движение товара разом."
+        )
+        return {"ok": False, "code": "linked_writeoff", "writeoff_id": int(wo["id"]),
+                "reason": reason, "detail": reason}
     # Приход по возврату: отмена накладной забрала бы товар со склада, а
     # возврат остался бы подтверждённым — с returned_qty и деньгами клиенту.
     ret = await adb_core.fetchrow(
@@ -8081,6 +8095,434 @@ async def api_wh_invoice_cancel(request: Request):
         get_role(user["id"]),
         "wh_invoice_cancel",
         f"Отменена накладная #{invoice_id}, остатки откачены",
+    )
+    return JSONResponse(result)
+
+
+# ─── Списание с причиной и инвентаризация (services/inventory.py) ────────────
+#
+# Права: это ФИЗИЧЕСКАЯ работа со складом, как приёмка контейнера, — менеджеру
+# она открыта (он же кладовщик, `ROLE_ALSO_ACTS_AS`). Отличие от расходной
+# накладной, которую проводит только руководство: там товар уезжает КЛИЕНТУ и
+# обязан пройти заявку, лимит и решение; здесь товара просто нет физически, и
+# запрет означал бы, что менеджер обязан держать в системе остаток, которого на
+# полке не видит. Контроль — не запрет, а лента: у каждой записи причина, автор
+# и время, и руководитель видит их в «Списаниях».
+_WRITEOFF_ROLES = ("admin", "boss", "manager")
+
+
+def _inventory_refusal(exc) -> JSONResponse:
+    """Отказ по бизнес-правилу — телом с `code`, как у накладных: фронту нужен
+    и текст человеку, и код для решения."""
+    return JSONResponse(
+        {"ok": False, "code": exc.code, "reason": exc.message, "detail": exc.message},
+        status_code=409,
+    )
+
+
+@app.post("/api/stock/writeoffs")
+async def api_stock_writeoffs(request: Request):
+    """Лента списаний и излишков + быстрые причины для формы."""
+    from services import inventory
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_WRITEOFF_ROLES,
+        rate_limit_scope="api_stock_writeoffs",
+        rate_limit_max=120,
+    )
+    try:
+        limit = min(int(data.get("limit") or 50), 200)
+        offset = max(int(data.get("offset") or 0), 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="limit/offset должны быть числами")
+    count_id = data.get("count_id")
+    rows = await inventory.list_writeoffs(
+        limit=limit, offset=offset, count_id=int(count_id) if count_id else None
+    )
+    # Себестоимость потери — это закупочная цена: режем В ОТВЕТЕ, а не во
+    # фронте (`costing.COST_ROLES`, то же правило, что у `redact_invoice`).
+    from services.costing import can_see_cost
+
+    if not can_see_cost(get_role(user["id"])):
+        rows = [{**r, "cost_cents": None} for r in rows]
+    return JSONResponse(
+        {
+            "writeoffs": rows,
+            "quick_reasons": list(inventory.QUICK_REASONS),
+            "void_window_hours": inventory.VOID_WINDOW_HOURS,
+            # Кнопку «Добавить фото» рисуем, только если снимку есть куда лечь:
+            # иначе она гарантированно отвечала бы 503.
+            "can_photo": _machine_photos_chat_id() is not None,
+        }
+    )
+
+
+@app.post("/api/stock/writeoffs/photo")
+async def api_stock_writeoff_photo(request: Request):
+    """Прикрепить снимок к списанию — ДО его проведения.
+
+    Поэтому ручка отдаёт `photo_file_id`, а не пишет запись: записи ещё нет,
+    человек только заполняет форму и может её бросить. Своей таблицы снимков у
+    списания тоже нет — фото здесь одно («вот что разбилось»), и оно живёт
+    полем самой записи. Файл кладём в тот же приватный канал, что фото техники
+    и товаров: своего стореджа у проекта нет.
+    """
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=_WRITEOFF_ROLES,
+        rate_limit_scope="api_stock_writeoff_photo",
+        rate_limit_max=30,
+    )
+    chat_id = _machine_photos_chat_id()
+    if chat_id is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Загрузка фото не настроена: нет PHOTOS_TG_CHAT_ID",
+        )
+    blob = _decode_photo(data.get("data_url"))
+    try:
+        from aiogram.types import BufferedInputFile
+
+        bot = await get_notify_bot()
+        sent = await bot.send_photo(
+            chat_id, BufferedInputFile(blob, filename="writeoff.jpg"), caption="Списание"
+        )
+    except Exception as e:
+        logger.warning("Фото списания не загружено: %s", redact_token(repr(e)))
+        raise HTTPException(status_code=502, detail="Telegram не принял фото")
+    best = max(sent.photo or [], key=lambda p: (p.width or 0) * (p.height or 0), default=None)
+    if best is None:
+        raise HTTPException(status_code=502, detail="Telegram не вернул файл")
+    return JSONResponse({"ok": True, "photo_file_id": best.file_id})
+
+
+@app.post("/api/stock/writeoffs/photo_view")
+async def api_stock_writeoff_photo_view(request: Request):
+    """Отдать снимок списания байтами.
+
+    Скоуп — номер ЗАПИСИ, а не `file_id` из тела: сырой идентификатор от
+    клиента вытянул бы из канала любой чужой файл. Прямую ссылку Telegram
+    отдавать нельзя — в ней токен бота.
+    """
+    from services import adb_core
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=_WRITEOFF_ROLES,
+        rate_limit_scope="api_stock_writeoff_photo_view",
+        rate_limit_max=120,
+    )
+    try:
+        writeoff_id = int(data.get("writeoff_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="writeoff_id обязателен")
+    row = await adb_core.fetchrow(
+        "SELECT photo_file_id FROM stock_writeoffs WHERE id = $1", writeoff_id
+    )
+    if row is None or not row["photo_file_id"]:
+        raise HTTPException(status_code=404, detail="Фото не найдено")
+    file_id = str(row["photo_file_id"])
+    blob = await _photo_bytes(file_id, f"writeoff:{file_id}")
+    if blob is None:
+        raise HTTPException(status_code=404, detail="Фото недоступно")
+    return Response(
+        blob, media_type=_photo_media_type(blob) or "image/jpeg",
+        headers={"Cache-Control": "private, max-age=600", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.post("/api/stock/writeoffs/create")
+async def api_stock_writeoff_create(request: Request):
+    """Списать товар с причиной. Остаток уходит сразу, как по накладной.
+
+    Идемпотентность обязательна по той же причине, что у накладной: повторно
+    отправленная форма списала бы товар второй раз.
+    """
+    from services import async_db as adb
+    from services import inventory
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_WRITEOFF_ROLES,
+        rate_limit_scope="api_stock_writeoff_create",
+        rate_limit_max=30,
+    )
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        # Форма списывает ОДИН товар (человек смотрит на полку и на карточку);
+        # список принимаем для проведения пересчёта и массовых форм.
+        if data.get("product_id") is None:
+            raise HTTPException(status_code=400, detail="Выберите товар")
+        items = [{"product_id": data.get("product_id"), "quantity": data.get("quantity")}]
+    raw_wh = data.get("warehouse_id")
+    try:
+        warehouse_id = int(raw_wh) if raw_wh else None
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="warehouse_id должен быть числом")
+
+    idem = _Idem(adb, "stock_writeoff_create", user["id"], data.get("idempotency_key"))
+    prev = await idem.claim()
+    if prev is not None:
+        return JSONResponse(prev)
+    try:
+        async with idem.released_on_reject():
+            try:
+                inventory.clean_reason(data.get("reason"))
+            except inventory.InventoryError as e:
+                raise HTTPException(status_code=400, detail=e.message)
+        result = await inventory.create_writeoff(
+            warehouse_id=warehouse_id,
+            items=items,
+            reason=data.get("reason"),
+            photo_file_id=(data.get("photo_file_id") or None),
+            created_by=user["id"],
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        await idem.release()
+        raise
+
+    if not result.get("ok"):
+        # Отказ по бизнес-правилу (не хватает остатка) — законный результат:
+        # сохраняем под ключом, чтобы ретрай той же формы отдал тот же ответ.
+        await idem.store(result)
+        return JSONResponse(result, status_code=409)
+
+    await adb.add_audit_log(
+        user["id"],
+        user.get("first_name", ""),
+        get_role(user["id"]),
+        "stock_writeoff",
+        f"Списание {result['invoice_number']}: {result['reason']}, "
+        f"позиций {result['positions']}",
+    )
+    await idem.store(result)
+    return JSONResponse(result)
+
+
+@app.post("/api/stock/writeoffs/void")
+async def api_stock_writeoff_void(request: Request):
+    """Сторнировать списание — товар вернётся на остаток.
+
+    Выключатель `delete_requires_boss` действует и здесь (одна дверь на все
+    отмены), а сверх него — окно суток у автора: дальше решает руководитель.
+    """
+    from services import async_db as adb
+    from services import inventory
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_WRITEOFF_ROLES,
+        rate_limit_scope="api_stock_writeoff_void",
+        rate_limit_max=20,
+    )
+    role = get_role(user["id"])
+    await _require_delete_right(role)
+    try:
+        writeoff_id = int(data.get("writeoff_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="writeoff_id обязателен")
+
+    result = await inventory.void_writeoff(
+        writeoff_id, user_id=user["id"], is_boss=role in ("admin", "boss")
+    )
+    if not result.get("ok"):
+        return JSONResponse(result, status_code=409)
+    await adb.add_audit_log(
+        user["id"],
+        user.get("first_name", ""),
+        role,
+        "stock_writeoff_void",
+        f"Сторнировано списание #{writeoff_id}, остаток возвращён",
+    )
+    return JSONResponse(result)
+
+
+@app.post("/api/stock/counts")
+async def api_stock_counts(request: Request):
+    """Сессии пересчёта, новые сверху; `open` — та, которую надо продолжить."""
+    from services import inventory
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_WRITEOFF_ROLES, rate_limit_scope="api_stock_counts",
+        rate_limit_max=120,
+    )
+    rows = await inventory.list_counts(limit=int(data.get("limit") or 20))
+    open_row = next((r for r in rows if r["status"] == "open"), None)
+    return JSONResponse({"counts": rows, "open": open_row})
+
+
+@app.post("/api/stock/counts/start")
+async def api_stock_count_start(request: Request):
+    """Открыть пересчёт. Уже открытый по складу — не второй, а тот же."""
+    from services import async_db as adb
+    from services import inventory
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_WRITEOFF_ROLES, rate_limit_scope="api_stock_count_start",
+        rate_limit_max=20,
+    )
+    raw_wh = data.get("warehouse_id")
+    try:
+        warehouse_id = int(raw_wh) if raw_wh else None
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="warehouse_id должен быть числом")
+    result = await inventory.start_count(
+        warehouse_id=warehouse_id, note=data.get("note"), started_by=user["id"]
+    )
+    if not result.get("ok"):
+        return JSONResponse(result, status_code=409)
+    await adb.add_audit_log(
+        user["id"], user.get("first_name", ""), get_role(user["id"]),
+        "stock_count_start", f"Открыт пересчёт #{result['count_id']}",
+    )
+    return JSONResponse(result)
+
+
+@app.post("/api/stock/counts/card")
+async def api_stock_count_card(request: Request):
+    """Карточка пересчёта: строки с живым остатком, дельтой и сводкой."""
+    from services import inventory
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_WRITEOFF_ROLES, rate_limit_scope="api_stock_count_card",
+        rate_limit_max=120,
+    )
+    try:
+        count_id = int(data.get("count_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="count_id обязателен")
+    card = await inventory.count_card(count_id)
+    if card is None:
+        raise HTTPException(status_code=404, detail="Пересчёт не найден")
+    return JSONResponse(card)
+
+
+@app.post("/api/stock/counts/line")
+async def api_stock_count_line(request: Request):
+    """Записать посчитанное количество по товару (повтор правит строку)."""
+    from services import inventory
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_WRITEOFF_ROLES, rate_limit_scope="api_stock_count_line",
+        rate_limit_max=120,
+    )
+    try:
+        count_id = int(data.get("count_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="count_id обязателен")
+    try:
+        return JSONResponse(
+            await inventory.set_count_line(
+                count_id, data.get("product_id"), data.get("counted_qty")
+            )
+        )
+    except inventory.InventoryError as e:
+        return _inventory_refusal(e)
+
+
+@app.post("/api/stock/counts/line_remove")
+async def api_stock_count_line_remove(request: Request):
+    """Убрать строку пересчёта (ошиблись товаром)."""
+    from services import inventory
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=_WRITEOFF_ROLES, rate_limit_scope="api_stock_count_line",
+        rate_limit_max=120,
+    )
+    try:
+        count_id = int(data.get("count_id"))
+        product_id = int(data.get("product_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="count_id и product_id обязательны")
+    try:
+        return JSONResponse(await inventory.remove_count_line(count_id, product_id))
+    except inventory.InventoryError as e:
+        return _inventory_refusal(e)
+
+
+@app.post("/api/stock/counts/confirm")
+async def api_stock_count_confirm(request: Request):
+    """Провести пересчёт: недостача — списанием, излишек — приходом, одной
+    транзакцией. Полупроведённая инвентаризация хуже непроведённой."""
+    from services import async_db as adb
+    from services import inventory, warehouse
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_WRITEOFF_ROLES, rate_limit_scope="api_stock_count_confirm",
+        rate_limit_max=20,
+    )
+    try:
+        count_id = int(data.get("count_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="count_id обязателен")
+
+    # atomic: результат пишется ТОЙ ЖЕ транзакцией, что и накладные
+    # (`inventory.apply_count` → `database.idem_store_in`), поэтому ключ без
+    # результата значит «не закоммитилось» и переиспользуется ретраем.
+    idem = _Idem(adb, "stock_count_confirm", user["id"], data.get("idempotency_key"), atomic=True)
+    prev = await idem.claim()
+    if prev is not None:
+        return JSONResponse(prev)
+    try:
+        result = await inventory.apply_count(count_id, user_id=user["id"], idem_key=idem.key)
+    # Класс ошибки — через модуль: фикстуры тестов перезагружают `warehouse`,
+    # и имя, связанное на импорте, указывало бы на старый класс.
+    except (inventory.InventoryError, warehouse.InvoiceError) as e:
+        await idem.release()
+        return _inventory_refusal(e)
+    except Exception:
+        await idem.release()
+        raise
+
+    parts = []
+    if result.get("writeoff"):
+        parts.append(f"списано позиций {result['writeoff']['positions']}")
+    if result.get("surplus"):
+        parts.append(f"оприходовано позиций {result['surplus']['positions']}")
+    await adb.add_audit_log(
+        user["id"], user.get("first_name", ""), get_role(user["id"]),
+        "stock_count_apply",
+        f"Пересчёт #{count_id} проведён: {', '.join(parts) or 'расхождений нет'}",
+    )
+    return JSONResponse(result)
+
+
+@app.post("/api/stock/counts/cancel")
+async def api_stock_count_cancel(request: Request):
+    """Закрыть пересчёт, ничего не применяя."""
+    from services import async_db as adb
+    from services import inventory
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_WRITEOFF_ROLES, rate_limit_scope="api_stock_count_cancel",
+        rate_limit_max=20,
+    )
+    try:
+        count_id = int(data.get("count_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="count_id обязателен")
+    try:
+        result = await inventory.cancel_count(count_id, user_id=user["id"])
+    except inventory.InventoryError as e:
+        return _inventory_refusal(e)
+    await adb.add_audit_log(
+        user["id"], user.get("first_name", ""), get_role(user["id"]),
+        "stock_count_cancel", f"Пересчёт #{count_id} отменён",
     )
     return JSONResponse(result)
 

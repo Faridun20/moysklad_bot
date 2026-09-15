@@ -8799,6 +8799,9 @@ async function renderDebts(container) {
 // Внутреннее состояние вкладки «Накладные»: список или форма создания.
 // Вкладками раздела они не являются — создание это действие, а не раздел.
 let whView = 'list';            // 'list' | 'new'
+let whSub = 'invoices';         // 'invoices' | 'writeoffs' — второй уровень вкладки
+let woView = 'list';            // 'list' | 'count' — лента списаний или карточка пересчёта
+let woCountId = null;           // открытый пересчёт, который сейчас ведём
 let whDraft = null;             // черновик формы (живёт между перерисовками вкладки)
 let whCounterparties = [];      // справочник, тянем один раз на сессию экрана
 let whStockCache = [];          // остатки для подстановки в позиции
@@ -8832,22 +8835,57 @@ function whIsBoss() {
 
 async function renderWhInvoicesTab() {
   if (whView === 'new') return renderWhInvoiceNew();
+  if (whSub === 'writeoffs') return renderWriteoffsView();
   return renderWhInvoiceList();
+}
+
+// Второй уровень внутри вкладки: документы прихода-расхода и документы
+// «товара нет». Пятой вкладкой раздела это быть не может (их потолок — четыре,
+// `helpers.test.js`), а отдельного раздела списание не заслуживает: смотрят
+// его там же, где накладные. Фильтр-ряд `.seg` внутри вкладки — тот же приём,
+// что у фильтра долгов.
+function whSubHtml() {
+  const item = (key, label) =>
+    `<button class="seg-item ${whSub === key ? 'active' : ''}" data-whsub="${key}" ` +
+    `aria-pressed="${whSub === key}">${label}</button>`;
+  return `<div class="seg-row"><div class="seg">`
+    + item('invoices', 'Накладные') + item('writeoffs', 'Списания')
+    + `</div></div>`;
+}
+
+function whShellHtml() { return stockShellHtml() + whSubHtml(); }
+
+function wireWhSub(root) {
+  (root || document).querySelectorAll('[data-whsub]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('light');
+      whSub = btn.dataset.whsub;
+      whView = 'list';
+      woView = 'list';
+      renderWhInvoicesTab();
+    });
+  });
+}
+
+// Каркас вкладки — в КАЖДУЮ ветку (скелетон, ошибка, список): без этого
+// первый же ре-рендер уносит переключатель (UI-BUG-04).
+function whFrame(content, html) {
+  content.innerHTML = whShellHtml() + html;
+  wireSectionNav(content, 'stock', renderStockScreen);
+  wireWhSub(content);
 }
 
 async function renderWhInvoiceList() {
   const content = document.getElementById('content');
   hideBack();
-  content.innerHTML = stockShellHtml() + skeleton('list', 5);
-  wireSectionNav(content, 'stock', renderStockScreen);
+  whFrame(content, skeleton('list', 5));
   const gen = screenGen();
 
   let data;
   try {
     data = await api('/api/wh/invoices', { limit: 100 });
   } catch (e) {
-    content.innerHTML = stockShellHtml() + errorBox(e.message || String(e));
-    wireSectionNav(content, 'stock', renderStockScreen);
+    whFrame(content, errorBox(e.message || String(e)));
     return;
   }
   if (gen !== screenGen()) return;
@@ -8866,11 +8904,10 @@ async function renderWhInvoiceList() {
   };
 
   if (!rows.length) {
-    content.innerHTML = stockShellHtml() + newBtn + emptyState({
+    whFrame(content, newBtn + emptyState({
       icon: 'list', title: 'Накладных пока нет',
       hint: 'Оформите первую — приход или расход',
-    });
-    wireSectionNav(content, 'stock', renderStockScreen);
+    }));
     wireNew();
     return;
   }
@@ -8879,17 +8916,20 @@ async function renderWhInvoiceList() {
   // его пустит и `delete_requires_boss` выключена (сервер: `_require_delete_right`).
   const canCancel = canCall('/api/wh/invoices/cancel', role()) && deleteActionsVisible();
   const canPrint = !!data.can_print;
-  content.innerHTML = stockShellHtml() + newBtn + rows.map(inv => {
+  whFrame(content, newBtn + rows.map(inv => {
     const cancelled = inv.status === 'cancelled';
     const isOut = inv.type === 'outgoing';
     // Статус отправки — только у расхода: приход клиенту не отсылается.
-    const sent = isOut
+    const sent = isOut && !inv.writeoff
       ? (inv.telegram_sent
           ? `<span class="order-pay order-pay--ok">${icon('check')} PDF отправлен</span>`
           : `<span class="order-pay order-pay--wait">PDF не отправлен</span>`)
       : '';
+    // Списание — тоже накладная, но клиенту её не шлют и «расходом» не зовут:
+    // строка помечена явно, а сторнируют её в «Списаниях» (там причина и окно).
+    const isWriteoff = !!inv.writeoff;
     const actions = [];
-    if (isOut && !cancelled) {
+    if (isOut && !cancelled && !isWriteoff) {
       actions.push(`<button class="btn-secondary" data-wh-send="${inv.id}">${icon('phone')} Отправить PDF</button>`);
     }
     // Печать — по кнопке и только там, где есть принтер (can_print с сервера):
@@ -8900,7 +8940,7 @@ async function renderWhInvoiceList() {
     // Накладная из переноса МойСклад (inv.historical) не отменяется: склад по
     // ней не двигался, и сервер гарантированно откажет — кнопку не рисуем.
     // `can_cancel` — сервер: менеджеру только свой приход, расход — руководству.
-    if (canCancel && inv.can_cancel !== false && !cancelled && !inv.historical) {
+    if (canCancel && inv.can_cancel !== false && !cancelled && !inv.historical && !isWriteoff) {
       actions.push(`<button class="btn-secondary" data-wh-cancel="${inv.id}">${icon('ban')} Отменить</button>`);
     }
     return `
@@ -8912,8 +8952,8 @@ async function renderWhInvoiceList() {
             </div>
             <div class="order-sub">${escapeHtml(inv.counterparty_name || 'Без контрагента')}</div>
           </div>
-          <span class="order-status" data-status="${cancelled ? 'rejected' : 'approved'}">
-            ${cancelled ? 'отменена' : (isOut ? 'расход' : 'приход')}
+          <span class="order-status" data-status="${cancelled ? 'rejected' : (isWriteoff ? 'pending' : 'approved')}">
+            ${cancelled ? 'отменена' : (isWriteoff ? (isOut ? 'списание' : 'излишек') : (isOut ? 'расход' : 'приход'))}
           </span>
         </div>
         <div class="order-meta">
@@ -8924,9 +8964,7 @@ async function renderWhInvoiceList() {
         ${sent ? `<div class="order-pay-row">${sent}</div>` : ''}
         ${actions.length ? `<div class="wh-actions">${actions.join('')}</div>` : ''}
       </div>`;
-  }).join('');
-
-  wireSectionNav(content, 'stock', renderStockScreen);
+  }).join(''));
   wireNew();
 
   content.querySelectorAll('[data-wh-send]').forEach(btn => {
@@ -8981,6 +9019,392 @@ async function renderWhInvoiceList() {
           btn.disabled = false;
         }
       });
+    });
+  });
+}
+
+// ─── Списания и инвентаризация (второй уровень вкладки «Накладные») ─────────
+//
+// Два действия и одна лента. Действие начинается с ВЫБОРА товара из каталога
+// (`openCatalogPicker`), а не с ввода названия: то же правило, что у позиции
+// контейнера — вписанное руками имя превращало опечатку в новую карточку.
+
+let woQuickReasons = ['бой', 'порча', 'недостача', 'пересортица'];
+let woCanPhoto = false;         // снимку есть куда лечь (PHOTOS_TG_CHAT_ID)
+
+function woKindLabel(kind) { return kind === 'surplus' ? 'излишек' : 'списание'; }
+
+// Форма причины. Быстрые причины — сегментом, «Другое» открывает своё поле:
+// список закрытым быть не должен (с площадки приходит то, чего в нём нет),
+// но и заставлять набирать «бой» каждый раз незачем.
+//
+// Снимок необязателен и уезжает СРАЗУ, ещё до проведения: ручка отдаёт
+// file_id, форма несёт его в создание. Иначе пришлось бы либо держать
+// мегабайты base64 в теле списания, либо заводить снимку свою запись раньше,
+// чем появилась запись о списании.
+function openWriteoffSheet(product, onDone) {
+  const options = woQuickReasons.map(r => [r, r]).concat([['other', 'Другое']]);
+  let photoFileId = null;
+  const sheet = openMachineSheet({
+    title: `Списать: ${product.name}`,
+    hint: `Остаток: ${whQty(product.quantity)} ${product.unit || 'шт'}. `
+      + 'Товар уйдёт со склада сразу — причина попадёт в журнал.',
+    fields: [
+      { key: 'quantity', label: 'Сколько списать', type: 'number', required: true,
+        placeholder: '0' },
+      { key: 'reason', label: 'Причина', type: 'select', options },
+      { key: 'note', label: 'Своя причина / комментарий', type: 'text',
+        placeholder: 'например: упало при разгрузке' },
+    ],
+    submitLabel: 'Списать',
+    onSubmit: async (data, ctx) => {
+      const qty = parseAmount(data.quantity);
+      if (!(qty > 0)) { ctx.showErr('Количество должно быть больше нуля'); return false; }
+      const picked = data.reason === 'other' ? '' : data.reason;
+      const reason = [picked, (data.note || '').trim()].filter(Boolean).join(' — ');
+      if (!reason) { ctx.showErr('Опишите причину — без неё списание не проводим'); return false; }
+      const r = await apiResult('/api/stock/writeoffs/create', {
+        product_id: product.product_id, quantity: qty, reason,
+        photo_file_id: photoFileId, idempotency_key: idemKey(),
+      });
+      if (!r.ok) {
+        // «Не хватает остатка» — это ответ, а не сбой: человек читает его в
+        // форме и правит количество, не набирая всё заново.
+        ctx.showErr((r.body && (r.body.reason || r.body.detail)) || r.error);
+        return false;
+      }
+      toast('Списано');
+      ctx.close();
+      await onDone();
+      return false;
+    },
+  });
+  if (woCanPhoto) {
+    const box = document.createElement('div');
+    box.className = 'c-actions';
+    box.innerHTML = `<button class="btn-secondary" type="button" id="wo-photo">`
+      + `${icon('plus')} Добавить фото</button>`
+      + `<span class="c-field-hint" id="wo-photo-state">Необязательно</span>`;
+    sheet.sheet.querySelector('#ms-error').before(box);
+    const state = box.querySelector('#wo-photo-state');
+    box.querySelector('#wo-photo').addEventListener('click', () => {
+      pickOnePhoto('/api/stock/writeoffs/photo', {}, (fileId, err) => {
+        if (!fileId) { state.textContent = err || 'Фото не загрузилось'; return; }
+        photoFileId = fileId;
+        state.textContent = 'Фото прикреплено';
+      });
+    });
+  }
+  return sheet;
+}
+
+// Один снимок и сразу ответ вызывающему — в отличие от `pickPhotos`, который
+// грузит пачку в уже существующую карточку и только рапортует тостом. Здесь
+// карточки ещё нет, и форме нужен именно идентификатор файла.
+function pickOnePhoto(endpoint, body, onDone) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/*';
+  input.addEventListener('change', async () => {
+    const file = (input.files || [])[0];
+    if (!file) return;
+    let dataUrl;
+    try {
+      dataUrl = await shrinkImage(file);
+    } catch (e) {
+      onDone(null, e.message);
+      return;
+    }
+    const progress = toast('Загружаю фото…', 'info', { sticky: true });
+    // Снимок по мобильной сети — 20 секунд на него мало (как у фото техники).
+    const res = await apiResult(endpoint, { ...body, data_url: dataUrl }, { timeoutMs: 90000 });
+    progress.dismiss();
+    haptic(res.ok ? 'success' : 'error');
+    onDone(res.ok ? res.body.photo_file_id : null, res.ok ? '' : res.error);
+  });
+  input.click();
+}
+
+// Выбор товара → форма. Один вход и у списания, и у строки пересчёта.
+function woPickProduct(title, onPick) {
+  openCatalogPicker({
+    title,
+    hint: 'Выберите товар из каталога',
+    onPick: async (product, ctx) => { ctx.close(); onPick(product); },
+  });
+}
+
+async function renderWriteoffsView() {
+  if (woView === 'count' && woCountId) return renderCountCard();
+  return renderWriteoffsList();
+}
+
+async function renderWriteoffsList() {
+  const content = document.getElementById('content');
+  hideBack();
+  whFrame(content, skeleton('list', 4));
+  const gen = screenGen();
+
+  let data, counts;
+  try {
+    [data, counts] = await Promise.all([
+      api('/api/stock/writeoffs', { limit: 50 }),
+      api('/api/stock/counts', { limit: 10 }),
+    ]);
+  } catch (e) {
+    whFrame(content, errorBox(e.message || String(e)));
+    return;
+  }
+  if (gen !== screenGen()) return;
+  if (data.quick_reasons && data.quick_reasons.length) woQuickReasons = data.quick_reasons;
+  woCanPhoto = !!data.can_photo;
+  // Прошлые снимки больше не на экране — их blob-URL'ы держат память WebView.
+  revokePhotoUrls();
+
+  const open = counts.open;
+  const actions = `<div class="c-actions c-actions--wrap">
+      <button class="btn-primary" id="wo-new">${icon('ban')} Списать товар</button>
+      <button class="btn-secondary" id="wo-count">${icon('list')} ${
+        open ? 'Продолжить пересчёт' : 'Инвентаризация'}</button>
+    </div>`;
+
+  const rows = data.writeoffs || [];
+  const canVoid = canCall('/api/stock/writeoffs/void', role()) && deleteActionsVisible();
+  const list = !rows.length
+    ? emptyState({
+        icon: 'check', title: 'Списаний нет',
+        hint: 'Здесь будет всё, что ушло со склада не продажей: бой, порча, недостача.',
+      })
+    : rows.map(w => {
+        const items = (w.items || []).map(it =>
+          `<div class="card-row-sub">${escapeHtml(it.name)} · ${whQty(it.quantity)} ${escapeHtml(it.unit)}</div>`
+        ).join('');
+        const cancelled = !!w.cancelled_at;
+        // Себестоимость потери — только руководству: цена прихода = закупочная
+        // (`costing.COST_ROLES`), и менеджеру её нигде не показывают.
+        const cost = w.cost_cents != null && isBossRole()
+          ? `<span class="order-total">${icon('cash')} ${whMoney(w.cost_cents, baseCur())}</span>` : '';
+        // Снимок тянем той же дорогой, что фото техники (`loadPhotos`): прямая
+        // ссылка Telegram содержит токен бота, поэтому байты идут через нашу
+        // ручку, а `data-photo` здесь — номер ЗАПИСИ списания.
+        const photo = w.photo_file_id
+          ? `<div class="machine-photos"><div class="machine-photo-wrap">`
+            + `<button class="machine-photo" data-photo="${w.id}" aria-label="Фото списания">`
+            + `<img alt="" loading="lazy"></button></div></div>`
+          : '';
+        return `
+      <div class="order-card">
+        <div class="order-header">
+          <div class="order-head-main">
+            <div class="order-title">${icon(w.kind === 'surplus' ? 'box' : 'ban')} ${escapeHtml(w.reason)}</div>
+            <div class="order-sub">${escapeHtml(w.author_name || '—')}${
+              w.count_id ? ` · пересчёт #${w.count_id}` : ''}</div>
+          </div>
+          <span class="order-status" data-status="${cancelled ? 'rejected' : (w.kind === 'surplus' ? 'approved' : 'pending')}">
+            ${cancelled ? 'сторно' : woKindLabel(w.kind)}
+          </span>
+        </div>
+        ${items}
+        ${photo}
+        <div class="order-meta">
+          <span>${icon('calendar')} ${formatDateRU(w.invoice_date || w.created_at)}</span>
+          ${w.invoice_number ? `<span>${escapeHtml(w.invoice_number)}</span>` : ''}
+          ${cost}
+        </div>
+        ${canVoid && !cancelled
+          ? `<div class="wh-actions"><button class="btn-secondary" data-wo-void="${w.id}">${icon('ban')} Сторно</button></div>`
+          : ''}
+      </div>`;
+      }).join('');
+
+  whFrame(content, actions + `<div class="section-label">Журнал</div>` + list);
+  loadPhotos(content, '/api/stock/writeoffs/photo_view', (id) => ({ writeoff_id: id }));
+
+  document.getElementById('wo-new').addEventListener('click', () => {
+    haptic('light');
+    woPickProduct('Что списать', (product) => openWriteoffSheet(product, renderWriteoffsList));
+  });
+  document.getElementById('wo-count').addEventListener('click', async () => {
+    haptic('light');
+    if (open) { woCountId = open.count_id; woView = 'count'; return renderWriteoffsView(); }
+    openMachineSheet({
+      title: 'Инвентаризация',
+      hint: 'Вводите ПОСЧИТАННОЕ количество по каждому товару. Разницу с остатком '
+        + 'система посчитает сама и покажет списком перед проведением.',
+      fields: [{ key: 'note', label: 'Заметка', type: 'text', placeholder: 'например: склад №1, ряд А' }],
+      submitLabel: 'Начать',
+      onSubmit: async (d, ctx) => {
+        const r = await apiResult('/api/stock/counts/start', { note: d.note, idempotency_key: idemKey() });
+        if (!r.ok) { ctx.showErr((r.body && r.body.reason) || r.error); return false; }
+        woCountId = r.body.count_id;
+        woView = 'count';
+        ctx.close();
+        await renderWriteoffsView();
+        return false;
+      },
+    });
+  });
+  content.querySelectorAll('[data-wo-void]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('warning');
+      tg.showConfirm('Сторнировать списание? Товар вернётся на остаток.', async ok => {
+        if (!ok) return;
+        btn.disabled = true;
+        const r = await apiResult('/api/stock/writeoffs/void', {
+          writeoff_id: Number(btn.dataset.woVoid),
+        });
+        if (!r.ok) {
+          toast((r.body && r.body.reason) || r.error, 'error', { duration: 6000 });
+          btn.disabled = false;
+          return;
+        }
+        toast('Сторнировано');
+        renderWriteoffsList();
+      });
+    });
+  });
+}
+
+// Карточка пересчёта: что посчитали, что на складе, что изменится. Итог виден
+// ДО проведения — «применить вслепую» тут быть не должно.
+async function renderCountCard() {
+  const content = document.getElementById('content');
+  whFrame(content, skeleton('list', 4));
+  showBack(() => { woView = 'list'; woCountId = null; renderWriteoffsView(); });
+  const gen = screenGen();
+
+  let card;
+  try {
+    card = await api('/api/stock/counts/card', { count_id: woCountId });
+  } catch (e) {
+    whFrame(content, errorBox(e.message || String(e)));
+    return;
+  }
+  if (gen !== screenGen()) return;
+
+  const s = card.summary || {};
+  const lines = (card.lines || []).map(ln => {
+    const delta = Number(ln.delta || 0);
+    // Словарь бейджа ОСТАТКА (`_stockBadge`), а не общий статус-набор: цвет у
+    // `.stock-badge` дают только in_stock/low/out, с draft/approved бейдж вышел
+    // бы прозрачным. Сходится — зелёный, излишек — жёлтый (расхождение, но не
+    // потеря), недостача — красный.
+    const state = delta < 0 ? 'out' : (delta > 0 ? 'low' : 'in_stock');
+    const sign = delta > 0 ? '+' : '';
+    return `
+      <div class="c-row c-row--tap" data-wo-line="${ln.product_id}" role="button" tabindex="0">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(ln.name)}</div>
+          <div class="card-row-sub">посчитано ${whQty(ln.counted_qty)} · в системе ${whQty(ln.expected_qty)} ${escapeHtml(ln.unit)}</div>
+        </div>
+        <span class="stock-badge" data-status="${state}">${delta === 0 ? 'сходится' : sign + whQty(delta)}</span>
+      </div>`;
+  }).join('');
+
+  const head = `
+    <div class="c-surface c-surface--pad">
+      <div class="card-row-title">Пересчёт #${card.count_id}${card.note ? ' · ' + escapeHtml(card.note) : ''}</div>
+      <div class="card-row-sub">${escapeHtml(card.started_by_name || '')} · ${escapeHtml(card.started_at || '')}</div>
+      <div class="card-row-sub">${plural(s.lines || 0, ['позиция', 'позиции', 'позиций'])}: `
+    + `недостача ${s.short || 0}, излишек ${s.surplus || 0}, сходится ${s.match || 0}</div>
+    </div>`;
+
+  const actions = `<div class="c-actions c-actions--wrap">
+      <button class="btn-primary" id="wo-line-add">${icon('plus')} Добавить товар</button>
+      ${(card.lines || []).length ? `<button class="btn-primary" id="wo-apply">${icon('check')} Провести</button>` : ''}
+      <button class="btn-secondary" id="wo-count-cancel">${icon('ban')} Отменить пересчёт</button>
+    </div>`;
+
+  whFrame(content, head + actions + (lines
+    ? `<div class="section-label">Посчитано</div><div class="c-surface c-surface--list">${lines}</div>`
+    : emptyState({ icon: 'box', title: 'Пока ничего не посчитано',
+                   hint: 'Добавьте товар и введите, сколько его на полке' })));
+  showBack(() => { woView = 'list'; woCountId = null; renderWriteoffsView(); });
+
+  const addLine = (product, current) => {
+    openMachineSheet({
+      title: product.name,
+      hint: `В системе: ${whQty(current)} ${product.unit || 'шт'}. Введите, сколько НА ПОЛКЕ.`,
+      fields: [{ key: 'counted', label: 'Посчитано', type: 'number', required: true, value: '' }],
+      submitLabel: 'Записать',
+      onSubmit: async (d, ctx) => {
+        const qty = parseAmount(d.counted);
+        if (!(qty >= 0)) { ctx.showErr('Введите количество (0 — если товара нет)'); return false; }
+        const r = await apiResult('/api/stock/counts/line', {
+          count_id: woCountId, product_id: product.product_id, counted_qty: qty,
+        });
+        if (!r.ok) { ctx.showErr((r.body && r.body.reason) || r.error); return false; }
+        ctx.close();
+        await renderCountCard();
+        return false;
+      },
+    });
+  };
+
+  document.getElementById('wo-line-add').addEventListener('click', () => {
+    haptic('light');
+    woPickProduct('Что посчитали', (product) => addLine(product, product.quantity));
+  });
+  content.querySelectorAll('[data-wo-line]').forEach(row => {
+    row.addEventListener('click', () => {
+      const pid = Number(row.dataset.woLine);
+      const ln = (card.lines || []).find(x => x.product_id === pid);
+      if (!ln) return;
+      haptic('light');
+      openMachineSheet({
+        title: ln.name,
+        hint: `В системе: ${whQty(ln.expected_qty)} ${ln.unit}. Пустое поле — убрать строку.`,
+        fields: [{ key: 'counted', label: 'Посчитано', type: 'number', value: ln.counted_qty }],
+        submitLabel: 'Сохранить',
+        onSubmit: async (d, ctx) => {
+          const raw = (d.counted || '').trim();
+          const r = raw === ''
+            ? await apiResult('/api/stock/counts/line_remove', { count_id: woCountId, product_id: pid })
+            : await apiResult('/api/stock/counts/line',
+                              { count_id: woCountId, product_id: pid, counted_qty: parseAmount(raw) });
+          if (!r.ok) { ctx.showErr((r.body && r.body.reason) || r.error); return false; }
+          ctx.close();
+          await renderCountCard();
+          return false;
+        },
+      });
+    });
+  });
+
+  const applyBtn = document.getElementById('wo-apply');
+  if (applyBtn) {
+    applyBtn.addEventListener('click', () => {
+      haptic('warning');
+      const text = `Провести пересчёт? Списать ${whQty(s.short_qty || 0)}, `
+        + `оприходовать ${whQty(s.surplus_qty || 0)}. Остатки изменятся сразу.`;
+      tg.showConfirm(text, async ok => {
+        if (!ok) return;
+        applyBtn.disabled = true;
+        const r = await apiResult('/api/stock/counts/confirm', {
+          count_id: woCountId, idempotency_key: idemKey(),
+        });
+        if (!r.ok) {
+          toast((r.body && r.body.reason) || r.error, 'error', { duration: 6000 });
+          applyBtn.disabled = false;
+          return;
+        }
+        toast('Пересчёт проведён');
+        woView = 'list';
+        woCountId = null;
+        renderWriteoffsView();
+      });
+    });
+  }
+  document.getElementById('wo-count-cancel').addEventListener('click', () => {
+    haptic('warning');
+    tg.showConfirm('Отменить пересчёт? Остатки не изменятся.', async ok => {
+      if (!ok) return;
+      const r = await apiResult('/api/stock/counts/cancel', { count_id: woCountId });
+      if (!r.ok) { toast((r.body && r.body.reason) || r.error, 'error'); return; }
+      toast('Пересчёт отменён');
+      woView = 'list';
+      woCountId = null;
+      renderWriteoffsView();
     });
   });
 }

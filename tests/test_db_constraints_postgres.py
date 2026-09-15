@@ -446,6 +446,30 @@ def _service_flows(db, tag: str) -> None:
     assert _one(db, "SELECT COUNT(*) AS n FROM products WHERE replace(lower(name), 'ё', 'е') LIKE %s",
                 (f"%ерш%трубный {tag.lower()}%",))["n"] == 1
 
+    # Списание с причиной и пересчёт: своя накладная (расход и приход), запись
+    # причины, сторно и сессия инвентаризации — всё под FK/CHECK новых таблиц.
+    from services import inventory
+
+    broke = _run(inventory.create_writeoff(
+        items=[{"product_id": pid, "quantity": 1}], reason="бой при разгрузке", created_by=MGR))
+    assert broke["ok"], broke
+    voided = _run(inventory.create_writeoff(
+        items=[{"product_id": pid, "quantity": 0.5}], reason="порча", created_by=MGR))
+    assert _run(inventory.void_writeoff(voided["writeoff_id"], user_id=BOSS, is_boss=True))["ok"]
+    cnt = _run(inventory.start_count(note=f"пересчёт {tag}", started_by=MGR))
+    assert cnt["ok"], cnt
+    stock_now = _one(db, "SELECT quantity FROM stock WHERE product_id = %s", (pid,))["quantity"]
+    # Одна недостача и один излишек в одной сессии: обе накладные — одной
+    # транзакцией, обе записи ссылаются на сессию.
+    other = _run(container_receipt.create_product(f"Хомут {tag}"))["product_id"]
+    assert _run(warehouse.create_invoice(
+        invoice_type="incoming", warehouse_id=wid,
+        items=[{"product_id": other, "quantity": 4, "price_cents": 1000}]))["ok"]
+    _run(inventory.set_count_line(cnt["count_id"], pid, float(stock_now) - 1))
+    _run(inventory.set_count_line(cnt["count_id"], other, 6))
+    applied = _run(inventory.apply_count(cnt["count_id"], user_id=MGR))
+    assert applied["ok"] and applied["writeoff"] and applied["surplus"], applied
+
     # Техника: прибытие менеджером (статус под CHECK, локация тем же UPDATE).
     from services import machines
 
@@ -514,6 +538,11 @@ def test_constraints_hold_for_real_service_flows(pg_db):
         ("machine_deal_requests", "status = 'rejected'"),
         ("payment_part_accounts", "TRUE"), ("machine_receipt_accounts", "TRUE"),
         ("acc_account_details", "account_number IS NOT NULL"),
+        ("stock_writeoffs", "kind = 'writeoff' AND count_id IS NULL"),
+        ("stock_writeoffs", "kind = 'surplus'"),
+        ("stock_writeoffs", "cancelled_at IS NOT NULL"),
+        ("stock_writeoffs", "count_id IS NOT NULL"),
+        ("stock_counts", "status = 'applied'"), ("stock_count_lines", "TRUE"),
     ):
         n = _one(db, f"SELECT COUNT(*) AS n FROM {table} WHERE {where}")["n"]
         assert n > 0, table
