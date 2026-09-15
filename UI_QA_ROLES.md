@@ -23,7 +23,7 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 132._
+_Всего эндпоинтов: 147._
 
 
 > **Временное совмещение ролей** (`services/roles.py::ROLE_ALSO_ACTS_AS`): `manager` = + `warehouse_keeper`, `bookkeeper`. Кладовщика и бухгалтера в штате пока нет, их работу делает менеджер; списки ниже уже учитывают это. Роли `warehouse_keeper`/`bookkeeper` через `/addrole` не назначаются. `*` в таблице экранов — доступ через совмещение.
@@ -414,6 +414,21 @@ _Всего эндпоинтов: 132._
 ### Без авторизации
 
 - `/`
+- `/api/acc/accounts`
+- `/api/acc/accounts/archive`
+- `/api/acc/accounts/save`
+- `/api/acc/balances`
+- `/api/acc/close_day`
+- `/api/acc/doc`
+- `/api/acc/expense`
+- `/api/acc/journal`
+- `/api/acc/rates`
+- `/api/acc/receipt`
+- `/api/acc/receipt_targets`
+- `/api/acc/settings`
+- `/api/acc/state`
+- `/api/acc/transfer`
+- `/api/acc/void`
 - `/healthz`
 - `/tg/{secret}`
 

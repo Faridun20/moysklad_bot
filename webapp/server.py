@@ -672,6 +672,7 @@ async def get_me(request: Request):
     user_id = user["id"]
     role = get_role(user_id)
     from config import BASE_CURRENCY
+    from services.database import get_setting
 
     return JSONResponse(
         {
@@ -687,6 +688,11 @@ async def get_me(request: Request):
             # запрос, который забудут сделать. Показывает её только руководство
             # (см. фронт): кладовщику номер сборки не нужен.
             "version": APP_VERSION,
+            # Бухгалтерия (счета, журнал денег) включена руководителем — по
+            # флагу фронт меняет вкладку «Касса» на «Счета» и кнопку оплаты.
+            "accounting_enabled": bool(
+                await asyncio.to_thread(get_setting, "accounting_enabled", False)
+            ),
         }
     )
 
@@ -6814,6 +6820,14 @@ async def api_wh_invoice_cancel(request: Request):
 from webapp.costing_api import router as _costing_router  # noqa: E402
 
 app.include_router(_costing_router)
+
+# ─── Бухгалтерия (/api/acc/*) ─────────────────────────────────────────────────
+# Отдельный роутер: счета, журнал денег, «Деньги сейчас». Всё за выключателем
+# `accounting_enabled` — пока он выключен, ручки отвечают 409, а старые потоки
+# не меняются.
+from webapp.routes_accounting import router as _accounting_router  # noqa: E402
+
+app.include_router(_accounting_router)
 
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────

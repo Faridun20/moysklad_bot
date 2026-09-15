@@ -21,7 +21,7 @@ SERVER = ROOT / "webapp" / "server.py"
 ROLES = ROOT / "services" / "roles.py"
 # Роутеры, подключённые в server.py отдельными файлами (чтобы параллельные
 # ветки не правили одну середину server.py). Роли у них в том же формате.
-ROUTERS = [ROOT / "webapp" / "costing_api.py"]
+ROUTERS = [ROOT / "webapp" / "costing_api.py", ROOT / "webapp" / "routes_accounting.py"]
 OUT = ROOT / "UI_QA_ROLES.md"
 
 ROLE_TITLES = {

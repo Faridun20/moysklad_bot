@@ -1623,6 +1623,12 @@ function machineReceiptsHtml(deal) {
 // `refresh` — чем перерисовать экран после записи: форма открывается и из
 // карточки машины, и из карточки покупателя, и каждая перерисовывает себя.
 function openReceiptForm(deal, refresh) {
+  // Бухгалтерия включена — деньги записываются на счёт (accounting.js), а
+  // поступление по рассрочке создаёт тот же сервис.
+  if (typeof accEnabled === 'function' && accEnabled()) {
+    accOpenReceipt({ dealId: deal.id, refresh });
+    return;
+  }
   const key = idemKey();
   openMachineSheet({
     title: 'Оплата по рассрочке',
@@ -2159,7 +2165,9 @@ function openListPicker({ title, hint, items, selectedId, emptyText, onPick, add
     },
   });
 
-  const ov = document.querySelector('.c-overlay');
+  // Своя шторка, а не первая `.c-overlay` в документе: пикер открывают и
+  // поверх другой формы (счёт в «Получил деньги»), и список иначе уезжал в неё.
+  const ov = sheet.sheet;
   const input = ov?.querySelector('#ms-f-search');
   const list = document.createElement('div');
   list.className = 'c-surface c-surface--list picker-list';
@@ -6013,7 +6021,13 @@ async function renderMoneyScreen() {
   const body = document.getElementById('money-body');
   if (moneyTab === 'debts') await renderDebts(body);
   else if (moneyTab === 'report') await renderMoneyReport(body);
-  else await renderCashbox(body, moneyTab);  // confirm | ops
+  // Бухгалтерия включена — «Касса» показывает счета, журнал и старые формы
+  // (accounting.js). Выключена — всё как раньше, руководителю внизу кнопка.
+  else if (moneyTab === 'ops' && typeof accEnabled === 'function' && accEnabled()) await renderAccTab(body);
+  else {
+    await renderCashbox(body, moneyTab);  // confirm | ops
+    if (moneyTab === 'ops' && typeof accMountToggle === 'function') accMountToggle(body);
+  }
 }
 
 async function renderCashbox(container, section) {
@@ -7129,6 +7143,8 @@ async function renderDebts(container) {
     }
 
     container.innerHTML = html;
+    // Бухгалтерия: «Отметить» → «Получил деньги» (счёт, валюта, курс).
+    if (typeof accDecorateDebts === 'function') accDecorateDebts(container);
 
     // Tabs (фильтр all/today)
     container.querySelectorAll('.seg-item[data-f]').forEach(t => {
