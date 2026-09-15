@@ -908,6 +908,7 @@ LibreOffice и боевой образ, шардами в одноразовых
 ## Тесты (конвенция)
 
 Мокай ГРАНИЦУ с внешним миром, а не свой код. Урок: баг в `tg_send_message` пережил CI, потому что тесты мокали саму `tg_send_message`. Для исходящих HTTP — `aioresponses` (мок транспорта, реально исполняется сборка URL/payload). БД — настоящая (`isolated_db`), не мок.
+У best-effort функций (глотают исключения) проверяй ВОЗВРАТ, а не только «запрос ушёл»: на aiohttp 3.14 aioresponses 0.7.9 не собирал ответ (TypeError), `tg_send_message` это глотал, и тест URL оставался зелёным. Шим для aioresponses — в `tests/conftest.py`, сам отключается на исправленном релизе.
 
 Если добавляешь module-level `asyncio.Semaphore`/`Lock` — добавь регресс-тест с 2× `asyncio.run` и contention >cap (см. `tests/test_analytics_parallel.py::test_positions_semaphore_survives_multiple_asyncio_run_with_contention`). Без waiter'а в очереди loop-binding не воспроизводится и landmine ждёт первого «толстого» теста.
 

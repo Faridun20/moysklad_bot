@@ -36,9 +36,10 @@ _tg_session_lock = asyncio.Lock()
 async def get_tg_session() -> aiohttp.ClientSession:
     """Вернуть общую сессию для запросов в api.telegram.org.
 
-    base_url держит ТОЛЬКО origin (`https://api.telegram.org`) — aiohttp
-    запрещает path-часть в base_url (ValueError / AssertionError на
-    sess.post), поэтому токен идёт в относительном пути запроса.
+    base_url держит ТОЛЬКО origin (`https://api.telegram.org`), токен идёт в
+    пути запроса. Path-часть в base_url не работает: aiohttp 3.9 её запрещал
+    (ValueError / AssertionError на sess.post), а с 3.10 требует `/` на конце
+    и всё равно ОТБРАСЫВАЕТ её, если путь запроса начинается с `/`.
 
     SECURITY.md H8: чтобы TELEGRAM_TOKEN не утёк в Railway logs через
     repr(exception), в except'е tg_send_message строка ошибки

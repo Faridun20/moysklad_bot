@@ -10,7 +10,10 @@ ruff==0.15.13
 httpx==0.28.1
 # aioresponses — мок aiohttp-ТРАНСПОРТА (не наших обёрток), чтобы реально
 # исполнялась сборка URL/payload в исходящих запросах (tests/test_notifier_send.py).
-aioresponses==0.7.8
+# 0.7.9 (последний релиз) не знает обязательный `stream_writer` у ClientResponse
+# из aiohttp 3.14 — подпёрт шимом в tests/conftest.py до выхода исправления
+# (pnuckowski/aioresponses#288); шим сам отключается на исправленной версии.
+aioresponses==0.7.9
 # Покрытие — как искатель неисполняемых веток, без жёсткого порога.
 pytest-cov==7.1.0
 # Точечный статический разбор «денежных»/API-модулей (non-blocking в CI).

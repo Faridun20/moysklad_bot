@@ -44,7 +44,10 @@ def test_tg_send_message_hits_correct_url_and_payload():
     async def scenario():
         with aioresponses() as m:
             m.post(_expected_url(), payload={"ok": True})
-            await notifier.tg_send_message(12345, "привет")
+            # True обязателен: tg_send_message глотает любые исключения, и без
+            # этой проверки тест зеленел, даже когда ответ не собирался вовсе
+            # (aioresponses 0.7.9 на aiohttp 3.14, см. tests/conftest.py).
+            assert await notifier.tg_send_message(12345, "привет") is True
 
             # Запрос реально ушёл по корректному URL (на старом base_url
             # с path он падал ещё до сети).
@@ -65,7 +68,7 @@ def test_tg_send_message_includes_reply_markup():
         with aioresponses() as m:
             m.post(_expected_url(), payload={"ok": True})
             kb = {"inline_keyboard": [[{"text": "ok", "callback_data": "x"}]]}
-            await notifier.tg_send_message(7, "t", reply_markup=kb)
+            assert await notifier.tg_send_message(7, "t", reply_markup=kb) is True
 
             call = m.requests[("POST", URL(_expected_url()))][0]
             assert call.kwargs["json"]["reply_markup"] == kb
@@ -80,7 +83,7 @@ def test_tg_send_message_swallows_http_error():
         with aioresponses() as m:
             m.post(_expected_url(), status=400, payload={"ok": False})
             # Не должно бросить — иначе единичный сбой уронил бы хендлер.
-            await notifier.tg_send_message(1, "t")
+            assert await notifier.tg_send_message(1, "t") is False
 
     _run(scenario)
 
@@ -113,7 +116,7 @@ def test_success_resets_failure_streak():
     async def scenario():
         with aioresponses() as m:
             m.post(_expected_url(), payload={"ok": True})
-            await notifier.tg_send_message(1, "t")
+            assert await notifier.tg_send_message(1, "t") is True
 
     _run(scenario)
     assert notifier._send_fail_streak == 0
