@@ -22,6 +22,12 @@ from types import SimpleNamespace
 
 from tests.e2e.conftest import alerts, go, nav_screens, settled, sheet_fill, tab
 
+import pytest
+
+# Руководитель здесь делает работу менеджера — с «Рабочими действиями»
+# (conftest.boss_work_actions). Вид по умолчанию — test_boss_ui.py.
+pytestmark = pytest.mark.usefixtures("boss_work_actions")
+
 # ─── Хелперы ─────────────────────────────────────────────────────────────────
 
 
@@ -839,7 +845,7 @@ def test_boss_deletes_container_with_its_items(open_app, e2e):
     _open_container(boss, cid)
     boss.click("#cont-del")
     boss.wait_for_selector(".toast:has-text('Контейнер удалён')")
-    boss.wait_for_selector("#bottom-nav .nav-item.active[data-screen='stock']")
+    boss.wait_for_function("() => document.getElementById('bottom-nav')?.dataset.current === 'stock'")
     assert [r["id"] for r in e2e.rows("SELECT id FROM containers")] == [keep]
     tab(boss, "containers")
     boss.wait_for_selector(f'[data-container="{keep}"]')

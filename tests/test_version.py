@@ -269,10 +269,18 @@ def test_command_is_in_the_autocomplete(cmd):
     даёт подключить один и тот же Router ко второму Dispatcher, поэтому
     `register_routers` за прогон зовётся ровно один раз — там, где кэш.
     """
-    from handlers.start import _COMMANDS_BOSS, _COMMANDS_MANAGER, _COMMANDS_WAREHOUSE
+    from handlers.start import (
+        _COMMANDS_ADMIN,
+        _COMMANDS_BOSS,
+        _COMMANDS_MANAGER,
+        _COMMANDS_WAREHOUSE,
+    )
 
-    assert "version" in {c.command for c in _COMMANDS_BOSS}
-    # Менеджеру и кладовщику номер сборки не нужен — как и доступ к команде.
+    assert "version" in {c.command for c in _COMMANDS_ADMIN}
+    # Руководитель смотрит версию внизу «Сегодня» в WebApp; в его автокомплите
+    # только решения и контроль (решение владельца). Менеджеру и кладовщику
+    # номер сборки не нужен — как и доступ к команде.
+    assert "version" not in {c.command for c in _COMMANDS_BOSS}
     assert "version" not in {c.command for c in _COMMANDS_MANAGER}
     assert "version" not in {c.command for c in _COMMANDS_WAREHOUSE}
 

@@ -652,6 +652,17 @@ def _table_ddls() -> list[str]:
                 updated_by      BIGINT,
                 PRIMARY KEY (user_id, permission_code)
             )""",
+            # Личные настройки ИНТЕРФЕЙСА (services/user_prefs.py): например,
+            # «Рабочие действия» у руководителя. Это предпочтение вида, а НЕ
+            # права — ручки их не читают. В БД, а не в localStorage: WebView
+            # Telegram хранилище теряет. value — JSON-текст, как у app_settings.
+            """CREATE TABLE IF NOT EXISTS user_prefs (
+                user_id    BIGINT NOT NULL,
+                pref_key   TEXT NOT NULL,
+                value      TEXT NOT NULL,
+                updated_at TEXT,
+                PRIMARY KEY (user_id, pref_key)
+            )""",
             # Цены товаров, выставленные руководством (PR C).
             # sale_price — минимальная цена продажи: при добавлении товара
             #   в заказ менеджер может поднять, но не опустить ниже.

@@ -26,6 +26,10 @@ import pytest
 
 from tests.e2e.conftest import go, pay_form, pay_order, tab
 
+# Руководитель здесь делает работу менеджера — с «Рабочими действиями»
+# (conftest.boss_work_actions). Вид по умолчанию — test_boss_ui.py.
+pytestmark = pytest.mark.usefixtures("boss_work_actions")
+
 # ─── Хелперы ─────────────────────────────────────────────────────────────────
 
 CP_NAME = "ООО Ромашка"
@@ -161,7 +165,12 @@ def _credit_machine(e2e, *, buyer: str = "Азиз Рахимов", price_cents:
 
 
 def _money(page, key: str) -> None:
-    """Открыть «Деньги» и вкладку `key`, дождаться отрисовки."""
+    """Открыть «Деньги» и вкладку `key`, дождаться отрисовки. «Подтвердить»
+    руководства — экран «Решения»."""
+    if key == "confirm" and page.locator('#bottom-nav .nav-item[data-screen="decisions"]').count():
+        go(page, "decisions")
+        _idle(page)
+        return
     go(page, "money")
     _idle(page)
     if page.locator(f'.seg-item[data-sect="{key}"]').count():
@@ -184,8 +193,10 @@ def _add_manager2(e2e) -> None:
 
 
 @pytest.mark.parametrize(("who", "tabs", "active"), [
-    ("boss", ["confirm", "debts", "ops", "report"], "confirm"),
-    ("admin", ["confirm", "debts", "ops", "report"], "confirm"),
+    # Подтверждения руководства — в «Решениях» (test_boss_ui.py); «Касса» —
+    # с «Рабочими действиями» (boss_work_actions этого модуля).
+    ("boss", ["debts", "ops", "report"], "debts"),
+    ("admin", ["debts", "ops", "report"], "debts"),
     # «Подтвердить» у менеджера — пока он замещает кладовщика и бухгалтера
     # (services.roles.ROLE_ALSO_ACTS_AS); при откате — ["debts", "ops"].
     ("mgr", ["confirm", "debts", "ops"], "confirm"),
@@ -329,21 +340,18 @@ def test_confirm_badge_counts_payment_deposit_and_return(open_app, e2e):
 
     boss = open_app(e2e.ids["boss"])
     _money(boss, "confirm")
-    boss.wait_for_selector('.seg-item[data-sect="confirm"] .stock-badge')
-    boss.wait_for_function(
-        "() => document.querySelector('.seg-item[data-sect=\"confirm\"] .stock-badge')?.textContent === '3'"
-    )
-    labels = _norm(" ".join(_texts(boss, "#money-body .section-label")))
-    assert "Оплатынаподтверждении(1)" in labels
-    assert "Сдачинаподтверждении(1)" in labels
-    assert "Возвратынаподтверждении(1)" in labels
+    # Руководство: общий бейдж «Решений» на панели, секции по видам.
+    badge = "() => document.querySelector('#bottom-nav [data-decisions-badge]')?.textContent"
+    boss.wait_for_function(f"{badge} === '3'")
+    labels = _norm(" ".join(_texts(boss, "#content .section-label")))
+    assert "Оплатыкартойиперечислением(1)" in labels
+    assert "Сдачиналичных(1)" in labels
+    assert "Возвраты(1)" in labels
 
     boss.click(".dep-confirm")
     _alert(boss, "Сдача подтверждена")
     _idle(boss)
-    boss.wait_for_function(
-        "() => document.querySelector('.seg-item[data-sect=\"confirm\"] .stock-badge')?.textContent === '2'"
-    )
+    boss.wait_for_function(f"{badge} === '2'")
 
 
 def test_boss_rejects_paid_order_payment_from_confirm_tab(open_app, e2e):
@@ -360,7 +368,7 @@ def test_boss_rejects_paid_order_payment_from_confirm_tab(open_app, e2e):
     boss.wait_for_selector(f'.pay-reject[data-id="{oid}"]', state="detached")
     assert f"confirm:Отклонить оплату по заказу #{oid}?" in boss.evaluate("window.__tgAlerts")
     _idle(boss)
-    assert "Нет записей на подтверждении" in boss.locator("#content").inner_text()
+    assert "Решений не ждёт" in boss.locator("#content").inner_text()
 
     assert e2e.rows("SELECT amount_cents, status FROM payments WHERE order_id = ?", (oid,)) == [
         {"amount_cents": 20000, "status": "rejected"},
@@ -617,7 +625,7 @@ def test_partial_return_with_cash_refund_reduces_cash_in_report(open_app, e2e):
         {"amount_cents": -10000, "status": "confirmed"},
     ]
 
-    tab(boss, "report")
+    _money(boss, "report")
     _idle(boss)
     names = _norm(" ".join(_texts(boss, ".stock-name")))
     assert "USD·300" in names and "Наличные(сдачи)·-100USD" in names
@@ -843,7 +851,7 @@ def test_debt_reduction_return_shrinks_debt_and_full_remaining_payment(open_app,
     _alert(boss, "Возврат подтверждён")
     assert e2e.rows("SELECT COUNT(*) AS n FROM cash_deposits")[0]["n"] == 0, "касса не выдаёт денег"
 
-    tab(boss, "debts")
+    _money(boss, "debts")
     _idle(boss)
     # 300 − 120 оплачено − 100 возвращено = 80.
     card = boss.locator('.debt-card[data-status="partial"]')

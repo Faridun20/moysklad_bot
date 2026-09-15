@@ -387,8 +387,17 @@ describe('вкладки разделов', () => {
 });
 
 describe('разделы нижней панели', () => {
-  it('руководитель видит все пять', () => {
-    expect(navSections('boss').map(s => s.key))
+  it('руководитель: сначала «смотреть и решать», склад и клиенты — дальше', () => {
+    // Решение владельца: панель руководителя — «Сегодня · Решения · Деньги ·
+    // Продажи · Меню»; навBarLayout берёт первые четыре.
+    for (const r of ['boss', 'admin']) {
+      expect(navSections(r).map(s => s.key))
+        .toEqual(['today', 'decisions', 'money', 'sales', 'stock', 'clients', 'settings']);
+    }
+  });
+
+  it('менеджер: порядок и состав разделов не менялись', () => {
+    expect(navSections('manager').map(s => s.key))
       .toEqual(['today', 'sales', 'stock', 'money', 'clients']);
   });
 
@@ -990,5 +999,112 @@ describe('navBarLayout / navDrawerHtml (шторка «Меню»)', () => {
     const html = navDrawerHtml([{ key: 'x', label: '<b>', icon: 'box', tabs: [] }], {}, { subtitle: '<i>' });
     expect(html).not.toContain('<b>');
     expect(html).not.toContain('<i>');
+  });
+});
+
+
+describe('руководитель: «Рабочие действия» (решение владельца)', () => {
+  const {
+    roleSectionTabs, workActionsOn, deleteActionsOn, resolveScreen, navBarLayout,
+    navDrawerHtml, workSwitchHtml, isBossLike,
+  } = helpers;
+  const tabs = (section, role, work) => roleSectionTabs(section, role, { work }).map(t => t.key);
+  const SECTIONS = ['sales', 'stock', 'money', 'clients'];
+
+  it('выключатель — только у руководства, по умолчанию выключен', () => {
+    expect(workActionsOn('boss', undefined)).toBe(false);
+    expect(workActionsOn('boss', { work_actions: false })).toBe(false);
+    expect(workActionsOn('boss', { work_actions: true })).toBe(true);
+    expect(workActionsOn('admin', {})).toBe(false);
+    // Остальным ролям кнопки видны всегда: их интерфейс не менялся.
+    for (const r of ['manager', 'warehouse_keeper', 'bookkeeper']) {
+      expect(workActionsOn(r, undefined)).toBe(true);
+      expect(workActionsOn(r, { work_actions: false })).toBe(true);
+    }
+    expect(isBossLike('admin')).toBe(true);
+    expect(isBossLike('manager')).toBe(false);
+  });
+
+  it('выключено: только смотреть, решать, контролировать', () => {
+    for (const r of ['boss', 'admin']) {
+      expect(tabs('sales', r, false)).toEqual(['orders', 'report']);
+      expect(tabs('stock', r, false)).toEqual(['catalog', 'containers', 'machines']);
+      expect(tabs('money', r, false)).toEqual(['debts', 'report']);
+      expect(tabs('clients', r, false)).toEqual(['funnel', 'limits']);
+    }
+  });
+
+  it('включено: работа менеджера возвращается, подтверждения остаются в «Решениях»', () => {
+    expect(tabs('sales', 'boss', true)).toEqual(['orders', 'report', 'docs']);
+    expect(tabs('stock', 'boss', true)).toEqual(['catalog', 'containers', 'machines', 'invoices']);
+    expect(tabs('money', 'boss', true)).toEqual(['debts', 'ops', 'report']);
+    expect(tabs('clients', 'boss', true)).toEqual(['funnel', 'list', 'limits', 'channel']);
+  });
+
+  it('менеджер и склад: вкладки те же при любом значении выключателя', () => {
+    const expected = {
+      manager: {
+        sales: ['orders', 'report', 'docs'],
+        stock: ['catalog', 'containers', 'machines', 'invoices'],
+        money: ['confirm', 'debts', 'ops'],
+        clients: ['list'],
+      },
+      warehouse_keeper: { sales: ['orders'], stock: ['catalog'], money: ['confirm'], clients: ['list'] },
+      bookkeeper: { sales: ['orders'], stock: ['catalog'], money: ['confirm'], clients: ['list'] },
+    };
+    for (const [r, bySection] of Object.entries(expected)) {
+      for (const sec of SECTIONS) {
+        expect(tabs(sec, r, false), `${r}/${sec}`).toEqual(bySection[sec]);
+        expect(tabs(sec, r, true), `${r}/${sec}`).toEqual(bySection[sec]);
+      }
+    }
+  });
+
+  it('панель руководителя: Сегодня · Решения · Деньги · Продажи · Меню', () => {
+    for (const work of [false, true]) {
+      const layout = navBarLayout(helpers.navSections('boss'),
+        (k) => roleSectionTabs(k, 'boss', { work }).length);
+      expect(layout.bar.map(s => s.key)).toEqual(['today', 'decisions', 'money', 'sales']);
+      expect(layout.menu).toBe(true);
+    }
+    // Менеджер — как было.
+    const mgr = navBarLayout(helpers.navSections('manager'),
+      (k) => roleSectionTabs(k, 'manager', {}).length);
+    expect(mgr.bar.map(s => s.key)).toEqual(['today', 'sales', 'stock', 'money']);
+  });
+
+  it('удаление: руководству всегда, менеджеру — пока не требуется руководитель', () => {
+    expect(deleteActionsOn('boss', {})).toBe(true);
+    expect(deleteActionsOn('boss', { delete_requires_boss: true })).toBe(true);
+    expect(deleteActionsOn('admin', null)).toBe(true);
+    expect(deleteActionsOn('manager', undefined)).toBe(true);      // поля нет — выключено
+    expect(deleteActionsOn('manager', { delete_requires_boss: false })).toBe(true);
+    expect(deleteActionsOn('manager', { delete_requires_boss: true })).toBe(false);
+  });
+
+  it('старые адреса подтверждений ведут руководителя в «Решения», остальных — на место', () => {
+    expect(resolveScreen('boss', 'money', 'confirm')).toEqual({ screen: 'decisions', tab: '' });
+    expect(resolveScreen('admin', 'requests', '')).toEqual({ screen: 'decisions', tab: '' });
+    expect(resolveScreen('boss', 'money', 'debts')).toEqual({ screen: 'money', tab: 'debts' });
+    expect(resolveScreen('manager', 'money', 'confirm')).toEqual({ screen: 'money', tab: 'confirm' });
+    expect(resolveScreen('manager', 'decisions', '')).toEqual({ screen: 'money', tab: 'confirm' });
+    expect(resolveScreen('bookkeeper', 'settings', '')).toEqual({ screen: 'money', tab: 'confirm' });
+  });
+
+  it('шторка: бейдж «Решений» и выключатель с состоянием словами', () => {
+    const groups = [
+      { key: 'today', label: 'Сегодня', icon: 'home', tabs: [] },
+      { key: 'decisions', label: 'Решения', icon: 'decide', tabs: [], badge: 3 },
+    ];
+    const off = navDrawerHtml(groups, { screen: 'today' }, { workSwitch: { on: false } });
+    expect(off).toMatch(/data-screen="decisions"[^>]*>.*Решения.*<span class="stock-badge badge-yellow">3<\/span>/);
+    expect(off).toContain('role="switch" aria-checked="false"');
+    expect(off).toContain('только решения и контроль');
+    const on = navDrawerHtml(groups, { screen: 'today' }, { workSwitch: { on: true } });
+    expect(on).toContain('aria-checked="true"');
+    expect(on).toContain('видны кнопки менеджера');
+    // Без opts.workSwitch (менеджер) выключателя нет.
+    expect(navDrawerHtml(groups, { screen: 'today' }, {})).not.toContain('data-work-switch');
+    expect(workSwitchHtml(true, 'c-row" onclick="x')).not.toContain('" onclick');
   });
 });

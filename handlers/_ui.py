@@ -41,13 +41,14 @@ from utils.keyboards import (  # noqa: F401 — реэкспорт для хен
     prompt_keyboard,
     settle_markup,
     status_keyboard,
+    webapp_screen_url,
 )
 
 logger = logging.getLogger(__name__)
 
 
 def webapp_keyboard(
-    text: str = "🌐 Открыть WebApp", *, menu: bool = True
+    text: str = "🌐 Открыть WebApp", *, menu: bool = True, screen: str | None = None
 ) -> InlineKeyboardMarkup | None:
     """Кнопка входа в WebApp (+ «🏠 Меню»).
 
@@ -59,10 +60,14 @@ def webapp_keyboard(
     web_app-кнопку Telegram принимает только с https-URL, поэтому при пустом
     или локальном WEBAPP_URL остаётся одно «Меню» (а если и его не просят —
     None: пустой markup Bot API отвергает).
+
+    `screen` — открыть сразу нужный экран (`"decisions"` — «Решения»
+    руководителя), см. `utils.keyboards.webapp_screen_url`.
     """
     kb = InlineKeyboardBuilder()
     if WEBAPP_URL and WEBAPP_URL.startswith("https://"):
-        kb.button(text=text, web_app=WebAppInfo(url=WEBAPP_URL))
+        url = webapp_screen_url(screen, base=WEBAPP_URL) if screen else WEBAPP_URL
+        kb.button(text=text, web_app=WebAppInfo(url=url))
     if menu:
         kb.button(text="🏠 Меню", callback_data="menu")
     markup = kb.as_markup()

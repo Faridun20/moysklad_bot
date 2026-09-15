@@ -12,14 +12,20 @@ import time
 
 from tests.e2e.conftest import go, nav_screens, tab
 
+import pytest
+
+# Руководитель здесь делает работу менеджера — с «Рабочими действиями»
+# (conftest.boss_work_actions). Вид по умолчанию — test_boss_ui.py.
+pytestmark = pytest.mark.usefixtures("boss_work_actions")
+
 
 # ─── Навигация по ролям ──────────────────────────────────────────────────────
 
 
 def test_nav_sections_follow_role(open_app, e2e):
-    """Пять разделов у босса; у кладовщика нет «Склада» — ручки ему не отвечают."""
+    """У руководства — «Решения» и «Настройки»; у кладовщика нет «Склада» — ручки ему не отвечают."""
     boss = open_app(e2e.ids["boss"])
-    assert nav_screens(boss) == ["today", "sales", "stock", "money", "clients"]
+    assert nav_screens(boss) == ["today", "decisions", "money", "sales", "stock", "clients", "settings"]
     # В панели четыре — пятый слот у «Меню» (шторка разделов и вкладок).
     assert boss.locator("#bottom-nav .nav-item[data-screen]").count() == 4
 
@@ -208,9 +214,9 @@ def test_navigating_away_during_load_does_not_bring_old_screen_back(open_app, e2
 
     boss = open_app(e2e.ids["boss"])  # стартует на «Сегодня», /api/home ещё в полёте
     go(boss, "money")
-    boss.wait_for_selector('.seg-item[data-sect="confirm"]')
+    boss.wait_for_selector('.seg-item[data-sect="debts"]')
     boss.wait_for_timeout(2500)  # даём старому рендеру шанс «вернуться»
-    assert boss.locator('.seg-item[data-sect="confirm"]').count() == 1
+    assert boss.locator('.seg-item[data-sect="debts"]').count() == 1
     assert boss.locator("#content .hero, #content .greeting").count() == 0
     assert boss.evaluate("document.querySelector('#bottom-nav .nav-item.active')?.dataset.screen") == "money"
 

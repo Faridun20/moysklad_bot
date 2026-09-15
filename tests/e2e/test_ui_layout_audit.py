@@ -32,7 +32,16 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page
 
-from tests.e2e.conftest import _TG_STUB, E2E_TIMEOUT_MS, go, seed_order, settled, tab
+from tests.e2e.conftest import (
+    _TG_STUB,
+    E2E_TIMEOUT_MS,
+    go,
+    nav_screens,
+    seed_order,
+    settled,
+    tab,
+    work_actions,
+)
 from tests.e2e.test_cov_click_everything import _INFLIGHT_JS, _seed_rich
 
 AUDIT_JS = (Path(__file__).parent / "layout_audit.js").read_text(encoding="utf-8")
@@ -190,9 +199,10 @@ class Audit:
         _shot(self.page, f"{self.label}-{name}", full_page=root == "#content")
 
     def sections(self) -> None:
+        # Все разделы роли: панель и «Меню» (у руководителя — ещё «Решения» и
+        # «Настройки», склад и клиенты — в шторке).
         p = self.page
-        screens = p.eval_on_selector_all("#bottom-nav .nav-item[data-screen]", "els => els.map(e => e.dataset.screen)")
-        for screen in [*screens, "clients"]:
+        for screen in nav_screens(p):
             go(p, screen)
             self.idle()
             tabs = p.eval_on_selector_all("#content .seg-item[data-sect]", "els => els.map(e => e.dataset.sect)")
@@ -263,20 +273,25 @@ class Audit:
 
 
 @pytest.mark.parametrize(
-    ("role", "theme", "width", "accounting"),
+    ("role", "theme", "width", "accounting", "work"),
     [
-        ("boss", "dark", 390, False),
-        ("mgr", "dark", 360, False),
+        # Руководитель как есть: «Сегодня · Решения · Деньги · Продажи · Меню»,
+        # без работы менеджера.
+        ("boss", "dark", 390, False, False),
+        ("mgr", "dark", 360, False, True),
         # Бухгалтерия включена: «Касса» — счета и журнал, в долгах «Получил деньги».
-        ("boss", "light", 360, True),
-        ("mgr", "light", 412, True),
+        # Руководитель с «Рабочими действиями» — экраны менеджера под ним.
+        ("boss", "light", 360, True, True),
+        ("mgr", "light", 412, True, True),
     ],
-    ids=["boss-dark-390", "mgr-dark-360", "boss-light-360-acc", "mgr-light-412-acc"],
+    ids=["boss-dark-390", "mgr-dark-360", "boss-light-360-acc-work", "mgr-light-412-acc"],
 )
-def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, theme, width, accounting):
+def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, theme, width, accounting, work):
     _seed_layout(e2e, tmp_path, accounting=accounting)
+    if role == "boss" and work:
+        work_actions(e2e)
     page = phone(e2e.ids[role], theme=theme, width=width, height=800)
-    audit = Audit(page, f"{role}-{theme}-{width}{'-acc' if accounting else ''}")
+    audit = Audit(page, f"{role}-{theme}-{width}{'-acc' if accounting else ''}{'-work' if role == 'boss' and work else ''}")
 
     audit.sections()
     # Деньги → Долги с фильтром «К оплате сейчас».
@@ -287,7 +302,7 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
     audit.check("money-debts-today")
     page.click('.seg-item[data-f="all"]')
     audit.idle()
-    if not accounting:
+    if not accounting and work:
         # Оплата долга — форма разбивки (при бухгалтерии её заменяет «Получил деньги»).
         audit.payment_form("#content .btn-pay-debt", "debt-payment-form")
         # «Оплата сразу» перед отгрузкой: карточка «Внесите оплату» и форма.
@@ -345,17 +360,19 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
     tab(page, "containers")
     audit.idle()
     audit.overlay("#container-new", "container-form")
-    tab(page, "invoices")
-    audit.idle()
-    page.click("#wh-new")
-    audit.check("invoice-form")
-    audit.overlay("#wh-cp", "counterparty-picker")
+    if page.locator('.seg-item[data-sect="invoices"]').count():
+        tab(page, "invoices")
+        audit.idle()
+        page.click("#wh-new")
+        audit.check("invoice-form")
+        audit.overlay("#wh-cp", "counterparty-picker")
 
     go(page, "stock")
     tab(page, "machines")
     audit.idle()
     page.locator("#content [data-machine]").first.click()
-    page.wait_for_selector("#content [data-mact]")
+    page.wait_for_selector("#content .section-label")
+    audit.idle()
     audit.overlay('[data-mact="hours"]', "machine-hours-form")
 
     go(page, "sales")
@@ -365,6 +382,15 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
         audit.overlay("#doc-new", "doc-form")
 
     if role == "boss":
+        # «Настройки»: реквизиты компании и курсы.
+        go(page, "settings")
+        audit.idle()
+        audit.overlay("#set-company", "company-form")
+        go(page, "settings")
+        audit.idle()
+        page.click("#set-rates")
+        page.wait_for_selector(".rate-input")
+        audit.check("settings-rates")
         go(page, "clients")
         tab(page, "limits")
         audit.idle()
@@ -491,7 +517,8 @@ def test_new_view_starts_at_top_not_under_header(phone, e2e, tmp_path, no_rate_l
     прокрутка сама в ноль не сбрасывается.
     """
     _seed_layout(e2e, tmp_path)
-    page = phone(e2e.ids["boss"], height=520, tg_extra_height=80)
+    # Менеджер: у него «Подтвердить» — вкладка «Денег» (у руководства — «Решения»).
+    page = phone(e2e.ids["mgr"], height=520, tg_extra_height=80)
     go(page, "money")
     tab(page, "confirm")
     settled(page)

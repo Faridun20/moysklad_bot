@@ -9,6 +9,12 @@ from __future__ import annotations
 
 from tests.e2e.conftest import go, settled, sheet_fill, tab
 
+import pytest
+
+# Руководитель здесь делает работу менеджера — с «Рабочими действиями»
+# (conftest.boss_work_actions). Вид по умолчанию — test_boss_ui.py.
+pytestmark = pytest.mark.usefixtures("boss_work_actions")
+
 
 def _stock(e2e) -> float:
     return e2e.rows("SELECT quantity FROM stock WHERE product_id = ?", (e2e.ids["product"],))[0]["quantity"]

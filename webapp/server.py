@@ -30,6 +30,7 @@ from services.roles import cached_role as get_role
 from services.rate_limit import acquire as rate_limit_acquire
 from services import money
 from services import version as app_version
+from services import user_prefs
 
 
 # Фоновые задачи — общий хелпер бота и WebApp: utils/background.py
@@ -743,8 +744,46 @@ async def get_me(request: Request):
             "accounting_enabled": bool(
                 await asyncio.to_thread(get_setting, "accounting_enabled", False)
             ),
+            # Личные настройки вида (services/user_prefs): «Рабочие действия»
+            # руководителя. НЕ права — только что рисовать.
+            "prefs": await asyncio.to_thread(user_prefs.get_prefs, user_id),
+            # Удаление техники/товаров/накладных — только руководителю
+            # (app_settings, по умолчанию выкл.). Фронт прячет кнопки удаления у
+            # менеджера, когда включено; права режет сервер.
+            "delete_requires_boss": bool(
+                await asyncio.to_thread(get_setting, "delete_requires_boss", False)
+            ),
         }
     )
+
+
+@app.post("/api/prefs/set")
+async def api_prefs_set(request: Request):
+    """Личная настройка интерфейса (services/user_prefs): {key, value}.
+
+    Сейчас одна — `work_actions`, выключатель «Рабочие действия» в «Меню»
+    руководителя. Меняет только ВИД (какие кнопки рисовать), права ручек не
+    трогает. Каждое переключение — в аудит: «кто и когда включил себе работу
+    менеджера» — вопрос, который задают после разбора.
+    """
+    from services import async_db as adb
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=("admin", "boss"), rate_limit_scope="api_prefs_set"
+    )
+    key = str(data.get("key") or "").strip()
+    role = get_role(user["id"])
+    if key not in user_prefs.PREFS or not user_prefs.applies_to(key, role):
+        raise HTTPException(status_code=400, detail="Неизвестная настройка")
+    value = data.get("value")
+    if not isinstance(value, bool):
+        raise HTTPException(status_code=400, detail="value: true или false")
+    prefs = await asyncio.to_thread(user_prefs.set_pref, user["id"], key, value)
+    await adb.add_audit_log(
+        user["id"], _actor_name(user), role, "pref_set", f"{key}={'on' if value else 'off'}"
+    )
+    return JSONResponse({"ok": True, "prefs": prefs})
 
 
 @app.post("/api/search")

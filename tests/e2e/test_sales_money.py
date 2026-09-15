@@ -12,7 +12,13 @@ from __future__ import annotations
 import asyncio
 import time
 
-from tests.e2e.conftest import go, pay_form, seed_order, settled, tab
+from tests.e2e.conftest import go, pay_form, seed_order, settled, tab, open_confirmations
+
+import pytest
+
+# Руководитель здесь делает работу менеджера — с «Рабочими действиями»
+# (conftest.boss_work_actions). Вид по умолчанию — test_boss_ui.py.
+pytestmark = pytest.mark.usefixtures("boss_work_actions")
 
 
 # ─── Кредитный лимит: одобрение с превышением ────────────────────────────────
@@ -158,8 +164,7 @@ def test_paid_order_payment_is_confirmed_by_boss(open_app, e2e):
     assert pays == [{"amount_cents": 20000, "status": "pending"}]
 
     boss = open_app(e2e.ids["boss"])
-    go(boss, "money")
-    tab(boss, "confirm")
+    open_confirmations(boss)
     boss.wait_for_selector(f'.pay-confirm[data-id="{oid}"]')
     assert "Ромашка" in boss.locator(f'.debt-card[data-pay="{oid}"]').inner_text()
     boss.click(f'.pay-confirm[data-id="{oid}"]')  # showConfirm → «да»
@@ -208,8 +213,7 @@ def test_cash_deposit_is_confirmed_and_closes_debt_fifo(open_app, e2e):
     mgr.wait_for_selector(f".stock-row:has-text('#{dep['id']}')")
 
     boss = open_app(e2e.ids["boss"])
-    go(boss, "money")
-    tab(boss, "confirm")
+    open_confirmations(boss)
     boss.wait_for_selector(f'.debt-card[data-dep="{dep["id"]}"] .dep-confirm')
     boss.click(f'.debt-card[data-dep="{dep["id"]}"] .dep-confirm')
     boss.wait_for_selector(".toast:has-text('Сдача подтверждена')")
@@ -221,6 +225,7 @@ def test_cash_deposit_is_confirmed_and_closes_debt_fifo(open_app, e2e):
     order = e2e.rows("SELECT payment_confirmed, status FROM orders WHERE id = ?", (oid,))[0]
     assert order["payment_confirmed"] and order["status"] == "paid", "заказ закрыт полностью"
     # И из «Долгов» босса он ушёл.
+    go(boss, "money")
     tab(boss, "debts")
     settled(boss)
     assert boss.locator(f".debt-card:has-text('#{oid}')").count() == 0
@@ -282,8 +287,7 @@ def test_return_flow_needs_goods_received_before_confirm(open_app, e2e):
     assert ret["status"] == "pending" and not ret["goods_received"] and ret["return_type"] == "full"
 
     boss = open_app(e2e.ids["boss"])
-    go(boss, "money")
-    tab(boss, "confirm")
+    open_confirmations(boss)
     card = f'.debt-card[data-ret="{ret["id"]}"]'
     boss.wait_for_selector(card)
     # Пока товар не принят, «Подтвердить» выключена — подтвердить возврат
@@ -334,8 +338,9 @@ def test_today_queue_leads_boss_to_pending_requests(open_app, e2e):
     seed_order(e2e, payment_type="paid", due_date=None, approve=False)
     boss = open_app(e2e.ids["boss"])
     go(boss, "today")
-    boss.wait_for_selector('[data-queue="requests"]')
-    row = boss.locator('[data-queue="requests"]')
+    # Заявки руководителя — часть «Решений».
+    boss.wait_for_selector('[data-queue="decisions"]')
+    row = boss.locator('[data-queue="decisions"]')
     assert "1" in row.inner_text()
     row.click()
     boss.wait_for_selector(".btn-approve")

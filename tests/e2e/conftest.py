@@ -307,3 +307,39 @@ def seed_order(e2e: E2E, *, payment_type: str = "credit", due_date: str | None =
         if payment_type == "paid" and pay:
             pay_order(e2e, oid, [(pay, qty * price)])
     return {"order_id": oid, "req_id": res["req_id"], "counterparty_id": cp}
+
+
+def work_actions(e2e: E2E, user_id: int | None = None, on: bool = True) -> None:
+    """Включить руководителю «Рабочие действия» (services.user_prefs) ДО открытия
+    страницы. Решение владельца: работа менеджера (накладные, отгрузка, касса,
+    лиды, моточасы, приёмка) у руководителя за этим выключателем. Сценарии,
+    где руководитель делает работу менеджера, включают его явно — как человек
+    включил бы в «Меню»; права ручек от него не зависят."""
+    from services import user_prefs
+
+    user_prefs.set_pref(user_id or e2e.ids["boss"], "work_actions", on)
+
+
+@pytest.fixture
+def boss_work_actions(e2e):
+    """«Рабочие действия» включены у руководителя и админа.
+
+    Модули со сценариями работы менеджера, которые исторически проходил
+    руководитель (накладные, приёмка, касса, техника, канал), подключают это
+    через `pytestmark = pytest.mark.usefixtures("boss_work_actions")`: с
+    выключателем он делает их как раньше, права ручек те же. Вид руководителя
+    по умолчанию (выключено) проверяют test_boss_ui.py и обход вёрстки."""
+    work_actions(e2e, e2e.ids["boss"])
+    work_actions(e2e, e2e.ids["admin"])
+
+
+def open_confirmations(page: Page) -> None:
+    """Где роль подтверждает оплаты, сдачи и возвраты: у руководства — экран
+    «Решения», у остальных — «Деньги → Подтвердить»."""
+    if page.locator('#bottom-nav .nav-item[data-screen="decisions"]').count():
+        go(page, "decisions")
+    else:
+        go(page, "money")
+        if page.locator('.seg-item[data-sect="confirm"]').count():
+            tab(page, "confirm")
+    settled(page)

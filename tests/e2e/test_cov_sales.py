@@ -24,6 +24,12 @@ from pathlib import Path
 
 from tests.e2e.conftest import go, seed_order, settled, tab
 
+import pytest
+
+# Руководитель здесь делает работу менеджера — с «Рабочими действиями»
+# (conftest.boss_work_actions). Вид по умолчанию — test_boss_ui.py.
+pytestmark = pytest.mark.usefixtures("boss_work_actions")
+
 # ─── Хелперы ─────────────────────────────────────────────────────────────────
 
 
@@ -800,7 +806,7 @@ def test_boss_request_credit_context_and_cancel_dialogs(open_app, e2e):
 
     boss.click(".btn-approve")
     _wait_alert(boss, "Заявка одобрена")
-    boss.wait_for_selector(".empty-state-title:has-text('Нет заявок')")
+    boss.wait_for_selector(".empty-state-title:has-text('Решений не ждёт')")
     o = _order(e2e, first["order_id"])
     assert o["status"] == "approved" and not o["credit_limit_override"]
     assert _stock(e2e) == 18
@@ -843,7 +849,7 @@ def test_return_to_draft_freezes_order_until_admin_unfreezes(open_app, e2e):
     boss.fill(".draft-box .draft-comment", "Цена ниже прайса")
     boss.click(".draft-send")
     _wait_alert(boss, "возвращена на доработку")
-    boss.wait_for_selector(".empty-state-title:has-text('Нет заявок')")
+    boss.wait_for_selector(".empty-state-title:has-text('Решений не ждёт')")
     o = _order(e2e, oid)
     assert (o["status"], o["frozen"], o["rejection_count"]) == ("draft", 1, 1)
     assert e2e.rows("SELECT status FROM shipment_requests WHERE id = ?", (seeded["req_id"],))[0]["status"] == "returned"

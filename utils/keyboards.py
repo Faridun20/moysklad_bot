@@ -10,8 +10,46 @@ Bot API 10.3: неактивные кнопки и force_reply у inline-кла�
 `prompt_keyboard`). Правила применения — handlers/_ui.py и CLAUDE.md.
 """
 
+import re
+from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
+
 from aiogram.types import DisabledButton, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+# Экран руководителя «Решения» (webapp: раздел `decisions`). Кнопка «Открыть
+# решения» в уведомлениях — `webapp_screen_url(DECISIONS_SCREEN)`.
+DECISIONS_SCREEN = "decisions"
+
+_SCREEN_RE = re.compile(r"^[a-z_]{2,32}$")
+
+
+def webapp_screen_url(screen: str | None = None, *, base: str | None = None) -> str | None:
+    """https-адрес WebApp, открывающий нужный экран, или None.
+
+    web_app-кнопка передаёт WebView адрес как есть, поэтому экран едет
+    параметром `startapp` (его же имя у ссылки t.me/<бот>?startapp=…, где он
+    приходит в `initDataUnsafe.start_param`) — фронт читает оба
+    (`launchScreen` в app.js). Имена — разделы и LEGACY_SCREENS фронта
+    (`decisions`, `debts`, `limits`…); неизвестное фронт молча заменит экраном
+    по умолчанию. None — WEBAPP_URL не https: такую web_app-кнопку Bot API
+    отвергает вместе со всем сообщением. `base` — адрес WebApp, если он уже
+    прочитан вызывающим (по умолчанию `config.WEBAPP_URL`).
+    """
+    if base is None:
+        import config
+
+        base = config.WEBAPP_URL
+    url = base or ""
+    if not url.startswith("https://"):
+        return None
+    if not screen:
+        return url
+    if not _SCREEN_RE.match(screen):
+        raise ValueError(f"недопустимое имя экрана: {screen!r}")
+    parts = urlsplit(url)
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "startapp"]
+    query.append(("startapp", screen))
+    return urlunsplit(parts._replace(query=urlencode(query)))
 
 
 def _shipment_period_chips(kb: InlineKeyboardBuilder) -> None:
