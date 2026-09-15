@@ -554,7 +554,11 @@ class _SecurityHeadersMiddleware:
         async def send_with_headers(message):
             if message["type"] == "http.response.start":
                 headers = list(message.get("headers") or [])
-                headers.extend(_SECURITY_HEADERS)
+                # Не дублировать: пара ручек (фото техники, кэш статики) уже
+                # ставит X-Content-Type-Options сама — вторая копия склеилась
+                # бы в "nosniff, nosniff" при чтении через httpx/requests.
+                present = {k.lower() for k, _ in headers}
+                headers.extend(h for h in _SECURITY_HEADERS if h[0] not in present)
                 message = {**message, "headers": headers}
             await send(message)
 

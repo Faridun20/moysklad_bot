@@ -457,9 +457,13 @@ def client(db, monkeypatch):
     monkeypatch.setattr(notifier, "aget_notify_recipients", _recips)
     monkeypatch.setattr(notifier, "tg_send_message", _send)
     monkeypatch.setattr(server, "get_notify_bot", _bot)
-    c = TestClient(server.app)
-    c.pushes = pushes
-    return c
+    # `with` — постоянный портал на весь тест (не пересоздаётся на каждый
+    # request): без него фоновая задача уведомления боссу
+    # (utils.background.spawn, webapp/server.py) не успевала бы выполниться —
+    # анонимный портал закрывается сразу после ответа, унося с собой её loop.
+    with TestClient(server.app) as c:
+        c.pushes = pushes
+        yield c
 
 
 def _post(client, uid, path, **body):
@@ -474,7 +478,12 @@ def test_api_double_submit_with_same_key_records_once(db, client):
     assert r1.status_code == 200 and r2.status_code == 200, (r1.text, r2.text)
     assert r1.json()["payments"] == r2.json()["payments"]
     assert len(_rows(db, "SELECT id FROM payment_parts")) == 2
-    # Карта ушла подтверждающим с кнопками, наличные — нет.
+    # Карта ушла подтверждающим с кнопками, наличные — нет. Уведомление теперь
+    # фоновая задача (utils.background.spawn): дожидаемся её на портале
+    # клиента, а не проверяем сразу же после ответа.
+    from webapp.server import _drain_background_tasks
+
+    client.portal.call(_drain_background_tasks)
     cards = [p for p in client.pushes if "pay_ok" in str(p[2])]
     assert len(cards) == 1 and "на карту 7 130 USD" in cards[0][1]
 

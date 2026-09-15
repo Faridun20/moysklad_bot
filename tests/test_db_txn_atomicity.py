@@ -362,14 +362,27 @@ def test_rejected_mark_paid_releases_its_key(api):
 
 def test_mark_paid_result_is_stored_with_the_payment(api, monkeypatch):
     """Процесс умер после коммита платежа, до записи ответа: ретрай получает
-    записанный платёж, а не 409 и не второй платёж."""
+    записанный платёж, а не 409 и не второй платёж.
+
+    Точка сбоя — `idem.store()` (webapp/server.py, после коммита разбивки),
+    а не уведомление боссу: оно теперь фоновая задача (utils.background.spawn)
+    и не блокирует ответ, поэтому его падение здесь не смоделирует «умер
+    после коммита, до ответа»."""
     db, server, client = api
     oid = _credit_order(db, owner=200)
 
-    async def crash(*a, **kw):
-        raise RuntimeError("упали после коммита")
+    from services import database
 
-    monkeypatch.setattr(server, "_notify_bosses_payment_pending", crash)
+    calls = {"n": 0}
+    orig_idem_store = database.idem_store
+
+    async def crash_once(key, result):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("упали после коммита")
+        return await orig_idem_store(key, result)
+
+    monkeypatch.setattr(database, "idem_store", crash_once)
     body = {"initData": "200", "order_id": oid, "parts": [{"method": "card", "currency": "USD", "amount": 10}], "idempotency_key": "k-crash"}
     assert client.post("/api/orders/mark_paid", json=body).status_code == 500
     r = client.post("/api/orders/mark_paid", json=body)
