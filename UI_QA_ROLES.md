@@ -23,13 +23,13 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 151._
+_Всего эндпоинтов: 158._
 
 
 > **Временное совмещение ролей** (`services/roles.py::ROLE_ALSO_ACTS_AS`): `manager` = + `warehouse_keeper`, `bookkeeper`. Кладовщика и бухгалтера в штате пока нет, их работу делает менеджер; списки ниже уже учитывают это. Роли `warehouse_keeper`/`bookkeeper` через `/addrole` не назначаются. `*` в таблице экранов — доступ через совмещение.
 
 
-### Админ (`admin`) — 130 эндпоинтов
+### Админ (`admin`) — 137 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -98,6 +98,12 @@ _Всего эндпоинтов: 151._
 - `/api/machines/create`
 - `/api/machines/deal`
 - `/api/machines/deal_close`
+- `/api/machines/deals/approve`
+- `/api/machines/deals/cancel`
+- `/api/machines/deals/pending`
+- `/api/machines/deals/reject`
+- `/api/machines/deals/resubmit`
+- `/api/machines/deals/rework`
 - `/api/machines/deals_open`
 - `/api/machines/delete`
 - `/api/machines/hours`
@@ -151,6 +157,7 @@ _Всего эндпоинтов: 151._
 - `/api/returns/pending`
 - `/api/returns/positions`
 - `/api/search`
+- `/api/settings/delete_requires_boss`
 - `/api/stock`
 - `/api/today`
 - `/api/users/deactivate`
@@ -167,7 +174,7 @@ _Всего эндпоинтов: 151._
 </details>
 
 
-### Руководитель (`boss`) — 127 эндпоинтов
+### Руководитель (`boss`) — 134 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -236,6 +243,12 @@ _Всего эндпоинтов: 151._
 - `/api/machines/create`
 - `/api/machines/deal`
 - `/api/machines/deal_close`
+- `/api/machines/deals/approve`
+- `/api/machines/deals/cancel`
+- `/api/machines/deals/pending`
+- `/api/machines/deals/reject`
+- `/api/machines/deals/resubmit`
+- `/api/machines/deals/rework`
 - `/api/machines/deals_open`
 - `/api/machines/delete`
 - `/api/machines/hours`
@@ -287,6 +300,7 @@ _Всего эндпоинтов: 151._
 - `/api/returns/pending`
 - `/api/returns/positions`
 - `/api/search`
+- `/api/settings/delete_requires_boss`
 - `/api/stock`
 - `/api/today`
 - `/api/wh/counterparties`
@@ -302,7 +316,7 @@ _Всего эндпоинтов: 151._
 </details>
 
 
-### Менеджер (`manager`) — 79 эндпоинтов
+### Менеджер (`manager`) — 88 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -347,6 +361,14 @@ _Всего эндпоинтов: 151._
 - `/api/machines/arrive`
 - `/api/machines/card`
 - `/api/machines/create`
+- `/api/machines/deal`
+- `/api/machines/deals/approve`
+- `/api/machines/deals/cancel`
+- `/api/machines/deals/pending`
+- `/api/machines/deals/reject`
+- `/api/machines/deals/resubmit`
+- `/api/machines/deals/rework`
+- `/api/machines/delete`
 - `/api/machines/hours`
 - `/api/machines/list`
 - `/api/machines/photo`
@@ -380,6 +402,7 @@ _Всего эндпоинтов: 151._
 - `/api/wh/counterparties`
 - `/api/wh/counterparties/create`
 - `/api/wh/invoices`
+- `/api/wh/invoices/cancel`
 - `/api/wh/invoices/create`
 - `/api/wh/invoices/get`
 - `/api/wh/invoices/print`

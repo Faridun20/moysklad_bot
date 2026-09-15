@@ -616,7 +616,10 @@ T3.3: бот срезан до того, чего нет в WebApp. Экраны
 | `/api/payments/pending` | POST | paid-заказы, ждущие подтверждения оплаты (boss) |
 | `/api/debts` | POST | список долгов + суммы получено/ожидает |
 | `/api/agents` | POST | поиск контрагентов |
-| `/api/wh/invoices` | POST | список накладных; `/api/wh/invoices/{get,create,cancel,send}` — карточка, проведение, отмена, PDF клиенту |
+| `/api/wh/invoices` | POST | список накладных; `/api/wh/invoices/{get,create,cancel,send}` — карточка, проведение, отмена (менеджеру — пока выключен `delete_requires_boss`), PDF клиенту |
+| `/api/machines/deal` | POST | бронь/продажа/рассрочка: менеджер → заявка на одобрение, руководство → сразу |
+| `/api/machines/deals/{pending,approve,rework,reject,resubmit,cancel}` | POST | заявки на сделки по технике: список и решения (`services/machine_deal_requests.py`) |
+| `/api/settings/delete_requires_boss` | POST | руководство: удаление техники/товаров/накладных — только руководителю |
 | `/tg/{secret}` | POST | вебхук от Telegram (только если включён режим) |
 
 ### 8.3 Фронт
