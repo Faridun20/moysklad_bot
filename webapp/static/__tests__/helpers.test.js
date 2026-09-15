@@ -1123,3 +1123,56 @@ describe('руководитель: «Рабочие действия» (реш�
     expect(deleteSwitchHtml(true, 'c-row" onclick="x')).not.toContain('" onclick');
   });
 });
+
+describe('скидка к прайсу (C2/C5)', () => {
+  const {
+    discountPctLabel, discountLineSuffix, discountSummaryText, discountBlockHtml,
+    discountPendingNote,
+  } = helpers;
+
+  it('подпись процента — как в карточке сделки по технике', () => {
+    expect(discountPctLabel(4)).toBe('скидка 4%');
+    expect(discountPctLabel(-4)).toBe('выше прайса на 4%');
+    expect(discountPctLabel(0)).toBe('по прайсу');
+    expect(discountPctLabel(null)).toBe('—');
+    expect(discountPctLabel(undefined)).toBe('—');
+  });
+
+  it('хвост строки: прайс и скидка; без прайса хвоста нет', () => {
+    expect(discountLineSuffix({ ref_price: 100, discount_pct: 30 }, 'USD'))
+      .toBe(' · прайс 100 USD · скидка 30%');
+    // Новый товар без прайса: «скидка 0%» соврала бы, поэтому пусто.
+    expect(discountLineSuffix({ ref_price: null, discount_pct: null }, 'USD')).toBe('');
+    expect(discountLineSuffix(null, 'USD')).toBe('');
+  });
+
+  it('сводка по заказу: средняя, максимум и позиции без прайса', () => {
+    expect(discountSummaryText({ avg_pct: 29.7, max_pct: 30, covered_lines: 2, total_lines: 2 }))
+      .toBe('Скидка по заказу: скидка 29.7% · максимум по позиции 30%');
+    expect(discountSummaryText({ avg_pct: 4, max_pct: 4, covered_lines: 1, total_lines: 2 }))
+      .toBe('Скидка по заказу: скидка 4% · без прайса: 1');
+    // Сравнивать не с чем — блока нет вовсе.
+    expect(discountSummaryText({ covered_lines: 0, total_lines: 3 })).toBe('');
+    expect(discountBlockHtml({ covered_lines: 0 })).toBe('');
+  });
+
+  it('помеченная скидка красится тем же credit-ctx--bad, что превышение лимита', () => {
+    const bad = discountBlockHtml({
+      avg_pct: 30, max_pct: 30, covered_lines: 1, total_lines: 1, flagged: true, threshold_pct: 15,
+    });
+    expect(bad).toContain('credit-ctx--bad');
+    expect(bad).toContain('порог 15% — нужно явное решение');
+    const ok = discountBlockHtml({
+      avg_pct: 4, max_pct: 4, covered_lines: 1, total_lines: 1, flagged: false, threshold_pct: 15,
+    });
+    expect(ok).toContain('credit-ctx--ok');
+    expect(ok).not.toContain('нужно явное решение');
+  });
+
+  it('менеджеру — почему заявка ждёт; ниже порога строки нет', () => {
+    expect(discountPendingNote({ flagged: true, max_pct: 30, threshold_pct: 15 }))
+      .toBe('Ждёт одобрения из-за скидки 30% (порог 15%) — решение принимает руководитель.');
+    expect(discountPendingNote({ flagged: false, max_pct: 4, threshold_pct: 15 })).toBe('');
+    expect(discountPendingNote(null)).toBe('');
+  });
+});

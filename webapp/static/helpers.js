@@ -1209,6 +1209,59 @@
     return list.length ? list.join(', ') : '—';
   }
 
+  // ─── Скидка к прайсу (services/order_discounts.py) ────────────────────────
+  // Проценты и прайс считает СЕРВЕР (он знает валюту прайса и порог), фронт
+  // только подписывает: вторая формула скидки разошлась бы с карточкой бота.
+
+  // «скидка 4%» / «выше прайса на 4%» / «—» — как в карточке сделки по технике.
+  function discountPctLabel(pct) {
+    if (pct === null || pct === undefined || pct === '') return '—';
+    const n = Number(pct);
+    if (!isFinite(n)) return '—';
+    if (n > 0) return `скидка ${n}%`;
+    if (n < 0) return `выше прайса на ${Math.abs(n)}%`;
+    return 'по прайсу';
+  }
+
+  // Хвост строки позиции: « · прайс 125 USD · скидка 20%». '' — прайса нет
+  // (новый товар, цену которому не задавали): «скидка 0%» на нём соврала бы.
+  function discountLineSuffix(item, currency) {
+    if (!item || item.ref_price == null || item.discount_pct == null) return '';
+    return ` · прайс ${formatMoney(item.ref_price, currency || '')} · ${discountPctLabel(item.discount_pct)}`;
+  }
+
+  // Сводка по заказу для карточки решения. '' — сравнивать не с чем.
+  function discountSummaryText(d) {
+    if (!d || !d.covered_lines) return '';
+    let text = `Скидка по заказу: ${discountPctLabel(d.avg_pct)}`;
+    if (d.max_pct != null && d.avg_pct != null && Math.abs(Number(d.max_pct) - Number(d.avg_pct)) >= 0.1) {
+      text += ` · максимум по позиции ${Number(d.max_pct)}%`;
+    }
+    const missing = Number(d.total_lines || 0) - Number(d.covered_lines || 0);
+    if (missing > 0) text += ` · без прайса: ${missing}`;
+    return text;
+  }
+
+  // Блок скидки на карточке заявки. Помеченная скидка красится тем же
+  // `credit-ctx--bad`, что и превышение лимита: состояние одно — «нужно
+  // решение руководителя», и второго языка предупреждений заводить незачем.
+  function discountBlockHtml(d) {
+    const text = discountSummaryText(d);
+    if (!text) return '';
+    const flagged = !!(d && d.flagged);
+    const tail = flagged
+      ? ` ${icon('alert')} порог ${Number(d.threshold_pct)}% — нужно явное решение`
+      : '';
+    return `<div class="credit-ctx ${flagged ? 'credit-ctx--bad' : 'credit-ctx--ok'}">`
+      + `${icon('chart')} ${escapeHtml(text)}${tail}</div>`;
+  }
+
+  // Что видит МЕНЕДЖЕР по своей заявке: почему она ждёт руководителя.
+  function discountPendingNote(d) {
+    if (!d || !d.flagged) return '';
+    return `Ждёт одобрения из-за скидки ${Number(d.max_pct)}% (порог ${Number(d.threshold_pct)}%) — решение принимает руководитель.`;
+  }
+
   return {
     escapeHtml, idemKey, formatDateRU, icon, opsAmount, plural,
     ROLE_ALSO_ACTS_AS, roleIn,
@@ -1228,5 +1281,7 @@
     PAY_ACCOUNT_KIND, payAccountItems, payDefaultAccountId, payAccountPrefill, payAccountFormError,
     payAccountFieldHtml, payMissingAccount, payAccountsManagerHtml,
     payHandoverPicked, payDepositOrdersText,
+    discountPctLabel, discountLineSuffix, discountSummaryText, discountBlockHtml,
+    discountPendingNote,
   };
 });

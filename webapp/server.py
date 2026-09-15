@@ -3365,6 +3365,35 @@ def _page_meta(*, total: int, offset: int, limit: int, returned: int, pending_co
     }
 
 
+def _discount_view(summary: dict | None) -> dict | None:
+    """Сводка скидки к прайсу для фронта (`services.order_discounts`).
+
+    Наружу идут проценты и счётчики, копейки строк — отдельными полями
+    позиции (`ref_price`/`discount_pct`), в мажорных единицах: фронт
+    форматирует деньги одним `formatMoney`, а не вторым делением на 100.
+    """
+    if not summary:
+        return None
+    return {
+        "avg_pct": summary.get("avg_pct"),
+        "max_pct": summary.get("max_pct"),
+        "flagged": bool(summary.get("flagged")),
+        "threshold_pct": summary.get("threshold_pct"),
+        "covered_lines": summary.get("covered_lines"),
+        "total_lines": summary.get("total_lines"),
+    }
+
+
+def _discount_item_fields(line: dict | None) -> dict:
+    """Поля позиции: прайс в мажорных единицах и процент (None — прайса нет)."""
+    if not line or line.get("ref_price_cents") is None:
+        return {"ref_price": None, "discount_pct": None}
+    return {
+        "ref_price": float(money.from_cents(int(line["ref_price_cents"]))),
+        "discount_pct": line.get("discount_pct"),
+    }
+
+
 @app.post("/api/orders")
 async def api_orders(request: Request):
     """Список заказов текущего пользователя."""
@@ -3455,15 +3484,21 @@ async def api_orders(request: Request):
     # product_prices (батч по всем товарам позиций). profit = Σ (price−cost)×qty.
     # Если у позиции cost неизвестна — заказ помечается profit_partial=True
     # (не врём нулём). Менеджеру profit/cost не отдаём вообще.
+    # Прайсы товаров нужны обеим сторонам: себестоимость — прибыли босса,
+    # продажная цена — скидке (её видят все, цены прайса и так в каталоге).
+    # Выборка одна и батчем: N+1 здесь уже чинили.
+    from services import order_discounts
+
+    all_product_ids = {
+        str(it["product_id"])
+        for items in items_by_order.values()
+        for it in items
+        if it.get("product_id")
+    }
+    prices = await adb.get_product_prices_by_ids(sorted(all_product_ids)) if all_product_ids else {}
+    discount_threshold = await order_discounts.current_threshold_pct()
     cost_by_product: dict = {}
     if is_boss:
-        all_product_ids = {
-            str(it["product_id"])
-            for items in items_by_order.values()
-            for it in items
-            if it.get("product_id")
-        }
-        prices = await adb.get_product_prices_by_ids(sorted(all_product_ids))
         cost_by_product = {
             k: v.get("cost_price") for k, v in prices.items() if v.get("cost_price") is not None
         }
@@ -3496,6 +3531,10 @@ async def api_orders(request: Request):
     for o in orders:
         items = items_by_order.get(o["id"], [])
         total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
+        discount = order_discounts.summarize(
+            items, prices, o.get("currency"), threshold=discount_threshold
+        )
+        discount_lines = discount["lines"]
         entry = {
             "id": o["id"],
             "status": o["status"],
@@ -3533,6 +3572,12 @@ async def api_orders(request: Request):
                 }
                 for p in photos_by_order.get(o["id"], [])
             ],
+            # Скидка к прайсу: сводка по заказу + строка состояния менеджеру,
+            # пока заявка ждёт решения из-за скидки (services/order_discounts.py).
+            "discount": _discount_view(discount),
+            "discount_note": (
+                order_discounts.pending_note(discount) if o["status"] == "pending" else ""
+            ),
             "items": [
                 {
                     # id позиции — им редактор удаляет строку (`/api/orders/remove_item`).
@@ -3542,8 +3587,9 @@ async def api_orders(request: Request):
                     "quantity": it["quantity"],
                     "unit": it["unit"],
                     "price": float(it.get("price", 0) or 0),
+                    **_discount_item_fields(discount_lines[i] if i < len(discount_lines) else None),
                 }
-                for it in items
+                for i, it in enumerate(items)
             ],
         }
         if is_boss and o["id"] in shipped_profit:
@@ -3646,12 +3692,22 @@ async def api_pending_requests(request: Request):
     credit_ctx = await orders_credit_context(
         [(orders_by_id[oid], totals[oid]) for oid in order_ids if oid in orders_by_id]
     )
+    # Скидка к прайсу (C2) — прайсы всех позиций ОДНИМ запросом на весь список:
+    # по запросу на заявку это тот же N+1, что уже чинили в кредит-контексте.
+    from services import order_discounts
+
+    prices = await order_discounts.load_reference_prices(*items_by_order.values())
+    discount_threshold = await order_discounts.current_threshold_pct()
     result = []
     for r in requests:
         order = orders_by_id.get(r["order_id"])
         items = items_by_order.get(r["order_id"], []) if order else []
         total = totals[r["order_id"]] if order else 0.0
         ptype = (order.get("payment_type") or "paid") if order else "paid"
+        discount = order_discounts.summarize(
+            items, prices, (order.get("currency") if order else None), threshold=discount_threshold
+        )
+        discount_lines = discount["lines"]
         entry = {
             "id": r["id"],
             "order_id": r["order_id"],
@@ -3663,14 +3719,16 @@ async def api_pending_requests(request: Request):
             "due_date": order.get("due_date") if order else None,
             "currency": (order.get("currency") if order else None) or BASE_CURRENCY,
             "total": total,
+            "discount": _discount_view(discount),
             "items": [
                 {
                     "name": it["product_name"],
                     "quantity": it["quantity"],
                     "unit": it["unit"],
                     "price": float(it.get("price", 0) or 0),
+                    **_discount_item_fields(discount_lines[i] if i < len(discount_lines) else None),
                 }
-                for it in items
+                for i, it in enumerate(items)
             ],
         }
         ctx = credit_ctx.get(r["order_id"])
@@ -3709,6 +3767,10 @@ async def api_approve_request(request: Request):
         "username", str(user["id"])
     )
     override = bool(data.get("override"))
+    # Скидка выше порога — второе подтверждение, как у превышения лимита
+    # (services/order_discounts.py). Одобряющий тут admin/boss по `_authorize`:
+    # «пересилить» пометку может только он, менеджер сюда не доходит.
+    discount_ack = bool(data.get("discount_ack"))
     # Idempotency: повторный тап «Одобрить» (или ретрай по таймауту) не должен
     # повторно дёргать approve — это двойное уведомление, второй PDF и, до T2.4,
     # второй комплект документов в МойСклад. Ключ в общей БД (T2.5).
@@ -3725,7 +3787,7 @@ async def api_approve_request(request: Request):
     bot = await get_notify_bot()
     try:
         result = await approve_shipment_request(
-            req_id, user["id"], boss_name, bot, override=override
+            req_id, user["id"], boss_name, bot, override=override, discount_ack=discount_ack
         )
     except Exception:
         await idem.release()
@@ -3737,6 +3799,17 @@ async def api_approve_request(request: Request):
         if result.get("needs_override"):
             return JSONResponse(
                 {"ok": False, "needs_override": True, "over": result.get("over"), "req_id": req_id}
+            )
+        # Скидка выше порога — тот же приём: цифры и повтор с discount_ack=true.
+        if result.get("needs_discount_ack"):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "needs_discount_ack": True,
+                    "discount": _discount_view(result.get("discount")),
+                    "detail": result.get("error"),
+                    "req_id": req_id,
+                }
             )
         raise HTTPException(status_code=409, detail=result["error"])
     resp = {"ok": True, "req_id": req_id}
@@ -6846,8 +6919,14 @@ async def api_submit_order(request: Request):
     from services.order_workflow import resubmit_diff_line
     from handlers.orders import build_credit_context
 
+    # Скидка к прайсу (C2): руководителю — в карточку решения, менеджеру —
+    # строкой «ждёт одобрения из-за скидки», если она выше порога (C5).
+    from services import order_discounts
+
+    discount = await order_discounts.order_discount(items, order.get("currency"))
+
     if should_notify_now(ORDER_REQUEST):
-        notify_text = format_request_notify(order, items, req_id)
+        notify_text = format_request_notify(order, items, req_id, discount)
         notify_text += await build_credit_context(order, items)  # UX: долг/лимит клиента инлайн
         notify_text += await resubmit_diff_line(order_id, items)  # #30: diff после доработки
         keyboard = {
@@ -6861,7 +6940,13 @@ async def api_submit_order(request: Request):
         for uid in await aget_notify_recipients():
             await tg_send_message(uid, notify_text, reply_markup=keyboard)
 
-    return JSONResponse({"req_id": req_id})
+    return JSONResponse(
+        {
+            "req_id": req_id,
+            "discount": _discount_view(discount),
+            "discount_note": order_discounts.pending_note(discount),
+        }
+    )
 
 
 @app.post("/api/agents")

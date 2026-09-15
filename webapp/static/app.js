@@ -4841,6 +4841,11 @@ function renderOrdersMain(opts = {}) {
           else if (o.needs_payment) bits.push(`<span class="order-pay order-pay--wait">${icon('alert')} Внесите оплату · ${formatMoney(o.payment_gap, escapeHtml(o.currency || ''))}</span>`);
           else if (o.paid_at) bits.push(`<span class="order-pay order-pay--wait">${icon('clock')} На подтверждении</span>`);
           if (o.frozen) bits.push(`<span class="order-pay order-pay--bad">${icon('snow')} Заморожен</span>`);
+          // Скидка выше порога: менеджеру — чем занята заявка, в том же ряду
+          // состояний, что «Внесите оплату» (services/order_discounts.py).
+          const dnote = o.discount_note || discountPendingNote(o.discount);
+          if (o.status === 'pending' && dnote)
+            bits.push(`<span class="order-pay order-pay--wait">${icon('alert')} ${escapeHtml(dnote)}</span>`);
           if (o.status === 'draft' && o.rejection_comment)
             bits.push(`<span class="order-pay order-pay--bad">${icon('return')} ${escapeHtml(o.rejection_comment)}</span>`);
           return bits.length ? `<div class="order-pay-row">${bits.join('')}</div>` : '';
@@ -4855,7 +4860,11 @@ function renderOrdersMain(opts = {}) {
           const priceStr = (it.price && it.price > 0)
             ? ` × ${formatMoney(it.price)} = <b>${formatMoney(sub)}${cur}</b>`
             : '';
-          return `<div class="order-item-preview">• ${escapeHtml(it.name)} — ${it.quantity} ${escapeHtml(it.unit || 'шт')}${priceStr}</div>`;
+          // Скидка к прайсу — тем же хвостом, что в карточке решения: строка
+          // в списке и строка в «Решениях» должны читаться одинаково.
+          const discStr = (it.price && it.price > 0)
+            ? escapeHtml(discountLineSuffix(it, o.currency || '')) : '';
+          return `<div class="order-item-preview">• ${escapeHtml(it.name)} — ${it.quantity} ${escapeHtml(it.unit || 'шт')}${priceStr}${discStr}</div>`;
         }).join('')}
         ${orderPhotosHtml(o, isBoss)}
         <button type="button" class="order-timeline-toggle" data-timeline-toggle="${o.id}">${icon('clock')} История</button>
@@ -5746,7 +5755,11 @@ async function submitOrder() {
       idempotency_key: currentDraftOrder.submitKey,
     });
     tg.HapticFeedback?.notificationOccurred('success');
-    tg.showAlert(`✅ Заявка #${result.req_id} отправлена руководителю!`);
+    // Скидка выше порога — говорим об этом сразу: заявка не «зависла», её
+    // держит решение руководителя (services/order_discounts.py).
+    const dnote = result.discount_note || discountPendingNote(result.discount);
+    tg.showAlert(`✅ Заявка #${result.req_id} отправлена руководителю!`
+      + (dnote ? `\n⚠️ ${dnote}` : ''));
     ordersData = null;
     currentDraftOrder = null;
     // Черновик отправлен — снимаем подтверждение закрытия.
@@ -5827,15 +5840,21 @@ function requestCardsHtml(requests) {
             / лимит <b>${fmt(r.credit.limit)}</b>
             ${r.credit.over_limit ? `${icon('alert')} превышение` : `${icon('check')} в пределах`}
           </div>` : ''}
+        ${discountBlockHtml(r.discount)}
         <div class="order-items">
           ${r.items.slice(0, 5).map(it => {
             // Руководитель сверяет ЦЕНУ и тип денег (требование владельца) —
-            // цена и сумма строки видны прямо в заявке.
+            // цена и сумма строки видны прямо в заявке. Рядом со строкой —
+            // прайс и скидка (C2), как в карточке сделки по технике.
             const qty = Number(it.quantity) || 0;
             const price = Number(it.price) || 0;
             const cur = escapeHtml(r.currency || '');
+            // Валюта тут СЫРАЯ: хвост скидки экранируется целиком ниже, а
+            // уже экранированный `cur` дал бы второй проход по амперсандам.
+            const disc = discountLineSuffix(it, r.currency || '');
             return `<div class="order-item">• ${escapeHtml(it.name)}: <b>${qty} ${escapeHtml(it.unit)}</b>`
               + (price > 0 ? ` × ${formatMoney(price, cur)} = <b>${formatMoney(qty * price, cur)}</b>` : ' · <b>без цены</b>')
+              + (price > 0 ? escapeHtml(disc) : '')
               + '</div>';
           }).join('')}
           ${r.items.length > 5 ? `<div class="order-item">… и ещё ${plural(r.items.length - 5, ['позиция', 'позиции', 'позиций'])}</div>` : ''}
@@ -5915,6 +5934,7 @@ async function handleRequest(reqId, action, refresh = renderPendingRequests) {
   // Один ключ на обе попытки: повтор с override=true — та же операция, и
   // сервер освобождает ключ на needs_override именно ради этого повтора.
   const key = idemKey();
+  let override = false;
   try {
     let res = await api(path, { req_id: Number(reqId), idempotency_key: key });
     // Превышение кредитного лимита — не ошибка, а вопрос. Сервер отвечает
@@ -5933,8 +5953,25 @@ async function handleRequest(reqId, action, refresh = renderPendingRequests) {
         return;
       }
       res = await api(path, { req_id: Number(reqId), idempotency_key: key, override: true });
+      override = true;
     }
-    if (res && res.ok === false) throw new Error(res.error || 'Не удалось выполнить');
+    // Скидка выше порога — такой же вопрос, а не отказ: руководитель и есть
+    // тот, кто вправе её пропустить (services/order_discounts.py). Флаг
+    // лимита тащим с собой: заявка может пробить оба порога сразу, и второй
+    // вызов без него упёрся бы обратно в вопрос про лимит.
+    if (action === 'approve' && res && res.needs_discount_ack) {
+      const d = res.discount || {};
+      const msg = `${discountSummaryText(d) || 'Скидка выше порога'}\n`
+        + `Порог: ${Number(d.threshold_pct)}%\n\nОдобрить со скидкой?`;
+      if (!await confirmDialog(msg)) {
+        document.querySelectorAll('.btn-approve, .btn-reject').forEach(b => (b.disabled = false));
+        return;
+      }
+      res = await api(path, {
+        req_id: Number(reqId), idempotency_key: key, override, discount_ack: true,
+      });
+    }
+    if (res && res.ok === false) throw new Error(res.error || res.detail || 'Не удалось выполнить');
     tg.showAlert(action === 'approve' ? '✅ Заявка одобрена' : '❌ Заявка отклонена');
   } catch (e) {
     tg.showAlert(`❌ ${e.message}`);
