@@ -330,12 +330,14 @@ _Всего эндпоинтов: 164._
 </details>
 
 
-### Менеджер (`manager`) — 96 эндпоинтов
+### Менеджер (`manager`) — 98 эндпоинтов
 
 <details><summary>Показать список</summary>
 
 - `/api/agents`
 - `/api/analytics`
+- `/api/clients/detail`
+- `/api/clients/shipment`
 - `/api/containers/arrive`
 - `/api/containers/card`
 - `/api/containers/check`

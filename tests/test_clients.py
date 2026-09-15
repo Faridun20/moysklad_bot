@@ -94,10 +94,54 @@ def test_clients_detail_boss(isolated_db, monkeypatch):
     assert body["purchases"]["total_cents"] == 50000
 
 
-def test_clients_detail_forbidden_for_manager(isolated_db, monkeypatch):
+def test_clients_detail_allowed_for_manager(isolated_db, monkeypatch):
+    """A3: карточка контрагента — тоже менеджеру, на чтение (не новая утечка:
+    заказы и контрагентов он и так видит по отдельности)."""
     db = isolated_db
+    agent_id = _counterparty("Client A", "+7")
+    _shipped_order(db, agent_id, "Client A", 100.0, 2)
+
     client = _client(db, monkeypatch, 701, "manager")
-    r = client.post("/api/clients/detail", json={"initData": "701", "agent_id": "A1"})
+    r = client.post("/api/clients/detail", json={"initData": "701", "agent_id": agent_id})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] and body["name"] == "Client A"
+    assert len(body["orders"]) == 1
+
+
+def test_clients_detail_forbidden_for_warehouse_keeper(isolated_db, monkeypatch):
+    """Запись (карточка — не про склад) остаётся закрытой ролям вне
+    admin/boss/manager — та же тройка, что у /api/search."""
+    db = isolated_db
+    client = _client(db, monkeypatch, 702, "warehouse_keeper")
+    r = client.post("/api/clients/detail", json={"initData": "702", "agent_id": "A1"})
     assert r.status_code == 403
+
+
+def test_clients_shipment_allowed_for_manager(isolated_db, monkeypatch):
+    """Состав отгрузки раскрывается из карточки клиента (A3) — та же роль."""
+    from services import container_receipt, warehouse
+
+    db = isolated_db
+    agent_id = _counterparty("Client B", "+998")
+    pid = asyncio.run(container_receipt.create_product("Товар Б"))["product_id"]
+    wid = asyncio.run(warehouse.default_warehouse_id())
+    # Расходная накладная без остатка отказала бы («не хватает на складе») —
+    # сначала приходуем товар, как и в test_clients_detail_boss.
+    asyncio.run(warehouse.create_invoice(
+        invoice_type="incoming", warehouse_id=wid,
+        items=[{"product_id": pid, "quantity": 2, "price_cents": None}],
+    ))
+    inv = asyncio.run(warehouse.create_invoice(
+        invoice_type="outgoing", warehouse_id=wid, counterparty_id=int(agent_id),
+        items=[{"product_id": pid, "quantity": 2, "price_cents": 5000}],
+    ))
+    assert inv["ok"], inv
+    invoice_id = inv["invoice_id"]
+
+    client = _client(db, monkeypatch, 703, "manager")
+    r = client.post("/api/clients/shipment", json={"initData": "703", "invoice_id": invoice_id})
+    assert r.status_code == 200
+    assert r.json()["ok"] and r.json()["positions"][0]["name"] == "Товар Б"
 
 

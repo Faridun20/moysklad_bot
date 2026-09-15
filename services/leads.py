@@ -320,6 +320,62 @@ async def list_leads(
     return rows
 
 
+async def search_leads(query: str, *, manager_id: int | None = None, limit: int = 8) -> list[dict]:
+    """Лиды для глобального поиска (A2): по имени/нику (как `list_leads`) и
+    по телефону.
+
+    Телефон живёт не в `leads`, а в привязанном звонке (`lead_calls.phone_key`,
+    см. модуль `services.lead_calls`) — если запрос похож на номер, добираем
+    лиды через звонок с таким номером. `manager_id` — та же скоуп-логика, что
+    у `/api/leads/list`: менеджер видит только своих.
+    """
+    needle = (query or "").strip()
+    if not needle:
+        return []
+    limit = max(1, min(int(limit or 8), 50))
+    out = await list_leads(manager_id=manager_id, search=needle, limit=limit)
+    seen_ids = {r["id"] for r in out}
+    if len(out) >= limit:
+        return out[:limit]
+
+    # Хвост как в `lead_calls.phone_key`: номер приходит то с кодом страны, то
+    # без — сравнивать нужно то же самое представление, иначе «+998901234567»
+    # (12 цифр) никогда не совпадёт LIKE'ом с девятизначным сохранённым ключом.
+    from services.lead_calls import phone_key
+
+    digits = phone_key(needle)
+    if len(digits) < 3:
+        return out
+
+    params: list[Any] = [f"%{digits}%"]
+    where = ["lead_id IS NOT NULL", "phone_key LIKE $1"]
+    if manager_id is not None:
+        params.append(manager_id)
+        where.append(f"manager_id = ${len(params)}")
+    params.append(limit)
+    call_rows = await adb_core.fetch(
+        f"SELECT DISTINCT lead_id FROM lead_calls WHERE {' AND '.join(where)} "
+        f"ORDER BY lead_id DESC LIMIT ${len(params)}",
+        *params,
+    )
+    extra_ids = [int(r["lead_id"]) for r in call_rows if int(r["lead_id"]) not in seen_ids]
+    if not extra_ids:
+        return out
+
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(extra_ids)))
+    lead_rows = await adb_core.fetch(
+        f"SELECT * FROM leads WHERE id IN ({placeholders}) "
+        f"ORDER BY COALESCE(last_inbound_at, first_seen_at) DESC",
+        *extra_ids,
+    )
+    now = local_now().replace(tzinfo=None)
+    for r in lead_rows:
+        if len(out) >= limit:
+            break
+        out.append(visible_lead(dict(r), now))
+    return out[:limit]
+
+
 async def get_lead(lead_id: int) -> dict | None:
     row = await adb_core.fetchrow("SELECT * FROM leads WHERE id = $1", lead_id)
     if not row:

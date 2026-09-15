@@ -259,21 +259,42 @@ def test_shipment_refuses_an_incoming_invoice(isolated_db, monkeypatch):
     assert r.status_code == 404
 
 
-def test_shipment_is_boss_only(isolated_db, monkeypatch):
+def test_shipment_allowed_for_manager(isolated_db, monkeypatch):
+    """A3: карточка клиента (и раскрытие состава отгрузки в ней) открыта на
+    чтение и менеджеру — не только admin/boss."""
     db = isolated_db
     _setup(db)
     client = _client(db, monkeypatch, 3, role="manager")
     r = client.post("/api/clients/shipment", json={"initData": "3", "invoice_id": 1})
+    assert r.status_code == 404  # роль пройдена — упёрлись в несуществующую накладную
+
+
+def test_shipment_forbidden_for_warehouse_keeper(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+    client = _client(db, monkeypatch, 4, role="warehouse_keeper")
+    r = client.post("/api/clients/shipment", json={"initData": "4", "invoice_id": 1})
     assert r.status_code == 403
 
 
-def test_detail_stays_boss_only(isolated_db, monkeypatch):
-    """История платежей клиента — чувствительные данные; ручка как была
-    admin/boss, так и остаётся."""
+def test_detail_allowed_for_manager(isolated_db, monkeypatch):
+    """A3: карточка контрагента (баланс + история покупок) — тоже менеджеру,
+    на чтение. Не новая утечка: заказы и контрагентов он и так видит по
+    отдельности, карточка лишь агрегирует уже доступное."""
     db = isolated_db
     _setup(db)
     _order(db, "AG-1")
 
     client = _client(db, monkeypatch, 3, role="manager")
     r = client.post("/api/clients/detail", json={"initData": "3", "agent_id": "AG-1"})
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+
+def test_detail_forbidden_for_warehouse_keeper(isolated_db, monkeypatch):
+    """Роль вне admin/boss/manager по-прежнему без доступа."""
+    db = isolated_db
+    _setup(db)
+    client = _client(db, monkeypatch, 4, role="warehouse_keeper")
+    r = client.post("/api/clients/detail", json={"initData": "4", "agent_id": "AG-1"})
     assert r.status_code == 403

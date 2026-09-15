@@ -423,7 +423,7 @@ def test_search_hints_and_order_payment_items_navigate(open_app, e2e):
     _wait_screen(boss, "money")
 
 
-def test_manager_search_sees_only_own_orders_and_no_client_card(open_app, e2e):
+def test_manager_search_sees_only_own_orders_and_can_open_client_card(open_app, e2e):
     _add_manager2(e2e)
     mine = seed_order(e2e, approve=False, payment_type="paid", due_date=None)["order_id"]
     cp = e2e.rows("SELECT id FROM counterparties")[0]["id"]
@@ -436,9 +436,13 @@ def test_manager_search_sees_only_own_orders_and_no_client_card(open_app, e2e):
     mgr.wait_for_selector(".search-group-title:has-text('Клиенты')")
     text = mgr.inner_text("#search-results")
     assert f"#{mine}" in text and f"#{other}" not in text
-    # Карточка контрагента — только руководству: строка клиента не кликабельна.
-    assert mgr.locator(".search-item[data-agent]").count() == 0
-    assert mgr.locator(".search-item:has-text('+998901234567')").count() == 1
+    # A3: карточка контрагента — тоже менеджеру (агрегированный вид, не новая
+    # утечка — заказы и контрагентов он и так видит по отдельности).
+    assert mgr.locator(".search-item[data-agent]").count() == 1
+    mgr.click(".search-item[data-agent]")
+    mgr.wait_for_selector(".editor-title:has-text('ООО Ромашка')")
+    # Правка лимита — по-прежнему не менеджеру: кнопки в карточке нет.
+    assert mgr.locator("#cl-edit").count() == 0
 
     boss = open_app(e2e.ids["boss"])
     boss.click("#search-btn")

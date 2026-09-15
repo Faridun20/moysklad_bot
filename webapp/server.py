@@ -1059,14 +1059,24 @@ async def api_audit_log(request: Request):
 
 @app.post("/api/search")
 async def api_search(request: Request):
-    """Глобальный поиск по заказам / платежам / контрагентам.
+    """Глобальный поиск по заказам / платежам / контрагентам / каталогу /
+    контейнерам / технике / лидам (A2).
 
-    Менеджер видит только свои заказы и платежи (user_id-скоуп);
-    boss/admin — все. Контрагенты — общий справочник (видны всем,
-    они и так нужны для создания заказов).
+    Менеджер видит только свои заказы, платежи и лиды (user_id/manager_id-
+    скоуп) — та же логика, что у соответствующих экранов
+    (`/api/orders`, `/api/payments/pending`, `/api/leads/list`). Контрагенты,
+    каталог и контейнеры — общие справочники (видны всем трём ролям и так,
+    они нужны для оформления заказов и сверки склада). Техника скрывает
+    себестоимость не-начальству — как и везде (`machines.visible_machine`).
+    Новые группы урезаны до 8 строк каждая: это подсказки, а не список для
+    дальнейшей фильтрации на месте (для неё есть свои экраны).
     """
     from services import async_db as adb
+    from services import containers as containers_service
     from services import counterparties as cp_service
+    from services import leads as leads_service
+    from services import machines as machines_service
+    from services import warehouse
 
     data = await request.json()
     user = _authorize(
@@ -1075,16 +1085,37 @@ async def api_search(request: Request):
         rate_limit_scope="api_search",
     )
     query = (data.get("query") or "").strip()[:100]
+    # Подписи статусов — с сервера (как у /api/containers/list, /api/machines/list,
+    # /api/leads/list): фронт их не дублирует, см. `helpers.js machineStatusLabel`.
+    labels = {
+        "container_status_labels": containers_service.STATUS_LABELS,
+        "machine_status_labels": machines_service.STATUS_LABELS,
+        "lead_status_labels": leads_service.STATUS_LABELS,
+    }
     if not query:
-        return JSONResponse({"ok": True, "orders": [], "payments": [], "agents": []})
+        return JSONResponse(
+            {
+                "ok": True, "orders": [], "payments": [], "agents": [],
+                "products": [], "containers": [], "machines": [], "leads": [],
+                **labels,
+            }
+        )
 
     role = get_role(user["id"])
     # Менеджер — только свои; начальство — всё.
     scope_uid = user["id"] if role == "manager" else None
+    GROUP_LIMIT = 8
 
-    orders = await adb.search_orders(query, user_id=scope_uid, limit=20)
-    payments = await adb.search_payments(query, user_id=scope_uid, limit=20)
-    agents = await cp_service.search(query, 20)
+    orders, payments, agents, products, machines_rows, leads_rows = await asyncio.gather(
+        adb.search_orders(query, user_id=scope_uid, limit=20),
+        adb.search_payments(query, user_id=scope_uid, limit=20),
+        cp_service.search(query, 20),
+        warehouse.search_products(query, GROUP_LIMIT),
+        machines_service.search_machines(query, role=role, limit=GROUP_LIMIT),
+        leads_service.search_leads(query, manager_id=scope_uid, limit=GROUP_LIMIT),
+    )
+    # Контейнеры — своей функции для лимита нет (список маленький), режем сами.
+    containers_rows = (await containers_service.list_containers(search=query))[:GROUP_LIMIT]
 
     # Урезаем заказы/платежи до полезного для UI набора полей.
     orders_out = [
@@ -1110,8 +1141,56 @@ async def api_search(request: Request):
         }
         for p in payments
     ]
+    products_out = [
+        {
+            "id": p.get("product_id"),
+            "name": p.get("name") or "—",
+            "sku": p.get("sku") or "",
+            "unit": p.get("unit") or "шт",
+            "quantity": p.get("quantity") or 0,
+        }
+        for p in products
+    ]
+    containers_out = [
+        {
+            "id": c.get("id"),
+            "number": c.get("number") or "—",
+            "status": c.get("status"),
+            "eta_date": c.get("eta_date"),
+            "arrived_at": c.get("arrived_at"),
+        }
+        for c in containers_rows
+    ]
+    machines_out = [
+        {
+            "id": m.get("id"),
+            "vin": m.get("vin") or "",
+            "name": m.get("name") or "—",
+            "status": m.get("status"),
+        }
+        for m in machines_rows
+    ]
+    leads_out = [
+        {
+            "id": lead.get("id"),
+            "display_name": lead.get("display_name") or "",
+            "username": lead.get("username") or "",
+            "status": lead.get("status"),
+        }
+        for lead in leads_rows
+    ]
     return JSONResponse(
-        {"ok": True, "orders": orders_out, "payments": payments_out, "agents": agents}
+        {
+            "ok": True,
+            "orders": orders_out,
+            "payments": payments_out,
+            "agents": agents,
+            "products": products_out,
+            "containers": containers_out,
+            "machines": machines_out,
+            "leads": leads_out,
+            **labels,
+        }
     )
 
 
@@ -4002,7 +4081,10 @@ async def api_clients_overview(request: Request):
 @app.post("/api/clients/detail")
 async def api_clients_detail(request: Request):
     """Карточка контрагента: имя/телефон + долг/лимит + заказы в боте +
-    покупки (расходные накладные склада). Только начальство.
+    покупки (расходные накладные склада). Читать может и менеджер (A3) —
+    те же заказы/контрагенты он и так видит по отдельности (свои заказы,
+    справочник контрагентов), карточка лишь агрегирует это в одном месте;
+    правка лимита (`/api/credit/set`) остаётся admin/boss.
 
     Баланса взаиморасчётов МойСклад здесь больше нет: «сколько должен»
     считает `get_agent_current_debt` по нашим же заказам, и второй ответ на
@@ -4015,7 +4097,7 @@ async def api_clients_detail(request: Request):
     data = await request.json()
     _authorize(
         data,
-        allowed_roles=("admin", "boss"),
+        allowed_roles=("admin", "boss", "manager"),
         rate_limit_scope="api_clients_detail",
         rate_limit_max=30,
         rate_limit_window=60.0,
@@ -4059,13 +4141,15 @@ async def api_clients_shipment(request: Request):
 
     В карточке клиента отгрузки показывались одной суммой и датой — увидеть,
     ЧТО именно уехало, было нельзя, хотя это первый вопрос при разборе долга.
+
+    Раскрывается из карточки клиента (A3) — те же роли, что и `/api/clients/detail`.
     """
     from services import warehouse
 
     data = await request.json()
     _authorize(
         data,
-        allowed_roles=("admin", "boss"),
+        allowed_roles=("admin", "boss", "manager"),
         rate_limit_scope="api_clients_shipment",
         rate_limit_max=60,
     )
