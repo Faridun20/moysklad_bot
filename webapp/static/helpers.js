@@ -1001,9 +1001,138 @@
     rejected: 'отклонено',
   };
 
+  // «наличные 5 000 USD — …» / «на карту •••• 1234 (Фаридун М.) · 7 130 USD — …».
+  // Подпись «куда» считает сервер (account_label) — та же, что в пуше и дайджесте.
   function payPartLine(p) {
-    const what = `${PAY_METHOD_LABEL[p.method] || p.method} ${payMoney(p.amount_cents, p.currency)}`;
+    const money = payMoney(p.amount_cents, p.currency);
+    const what = p.account_label ? `${p.account_label} · ${money}` : `${PAY_METHOD_LABEL[p.method] || p.method} ${money}`;
     return `${what} — ${PAY_STATE_LABEL[p.state] || p.state}`;
+  }
+
+  // ─── Куда поступили: карты и счета (services/pay_accounts.py) ────────────
+  const PAY_ACCOUNT_KIND = {
+    card: { title: 'На какую карту', add: 'Новая карта', empty: 'Карт пока нет — добавьте новую',
+      choose: 'Куда поступили — выберите карту', hint: 'Последние 4 цифры и владелец карты', icon: 'card' },
+    bank: { title: 'На какой счёт', add: 'Новый счёт', empty: 'Счетов пока нет — добавьте новый',
+      choose: 'Куда поступили — выберите счёт', hint: 'Фирма или владелец и номер счёта', icon: 'building' },
+  };
+
+  function payNorm(text) {
+    return String(text == null ? '' : text).toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+  }
+
+  // Строки пикера: только нужного вида и не в архиве; счета в валюте строки —
+  // первыми (клиент чаще платит в валюту самой карты). Поиск — по владельцу,
+  // фирме, банку, хвосту карты и номеру счёта.
+  function payAccountItems(accounts, kind, currency) {
+    const list = (accounts || []).filter(a => a.kind === kind && !a.archived);
+    const rank = a => (currency && a.currency === currency ? 0 : 1);
+    return list
+      .map((a, i) => ({ a, i }))
+      .sort((x, y) => rank(x.a) - rank(y.a) || x.i - y.i)
+      .map(({ a }) => ({
+        id: a.id,
+        name: a.title,
+        sub: a.sub,
+        search: payNorm([a.title, a.holder, a.bank, a.card_last4, a.account_number, a.company_tin].join(' ')),
+        account: a,
+      }));
+  }
+
+  // Что предложить по умолчанию: последний выбор человека, если запись жива.
+  function payDefaultAccountId(state, kind) {
+    const id = state && state.last_used ? state.last_used[kind] : null;
+    if (!id) return null;
+    const a = (state.accounts || []).find(x => Number(x.id) === Number(id));
+    return a && !a.archived && a.kind === kind ? a.id : null;
+  }
+
+  // Набранное в поиске уезжает в форму: 4 цифры — хвост карты, 20 — номер
+  // счёта, остальное — владелец/фирма.
+  function payAccountPrefill(kind, typed) {
+    const t = String(typed || '').trim();
+    const digits = t.replace(/\D/g, '');
+    if (!t) return {};
+    if (kind === 'card' && /^[\d\s•*]+$/.test(t) && digits.length === 4) return { card_last4: digits };
+    if (kind === 'bank' && /^[\d\s-]+$/.test(t) && digits.length === 20) return { account_number: digits };
+    if (/^[\d\s•*-]+$/.test(t)) return {};
+    return { holder: t };
+  }
+
+  // Та же проверка, что на сервере (pay_accounts.validate), — ошибка в форме
+  // сразу, без круга до сервера. '' — всё верно.
+  function payAccountFormError(kind, data) {
+    const d = data || {};
+    const holder = String(d.holder || '').trim();
+    if (kind === 'card') {
+      if (!holder) return 'Укажите владельца карты — например, «Фаридун М.»';
+      const raw = String(d.card_last4 || '').trim();
+      const digits = raw.replace(/\D/g, '');
+      if (digits.length > 4) return 'Нужны только последние 4 цифры карты — полный номер карты не храним';
+      if (digits.length !== 4 || !/^[\d\s•*.·-]*$/.test(raw)) return 'Последние цифры карты — ровно 4 цифры';
+      return '';
+    }
+    if (!holder) return 'Укажите фирму или владельца счёта — например, «ООО Farid Impeks»';
+    const raw = String(d.account_number || '').trim();
+    if (raw.replace(/\D/g, '').length !== 20 || /[^\d\s-]/.test(raw)) return 'Номер расчётного счёта — 20 цифр';
+    const tin = String(d.company_tin || '').replace(/\D/g, '');
+    if (String(d.company_tin || '').trim() && tin.length !== 9 && tin.length !== 14) return 'ИНН — 9 цифр (ПИНФЛ — 14)';
+    const mfo = String(d.mfo || '').replace(/\D/g, '');
+    if (String(d.mfo || '').trim() && mfo.length !== 5) return 'МФО банка — 5 цифр';
+    return '';
+  }
+
+  // Строка «Куда поступили» в строке оплаты: выбранная карта/счёт или приглашение.
+  function payAccountFieldHtml(account, kind, rowNo) {
+    const meta = PAY_ACCOUNT_KIND[kind] || PAY_ACCOUNT_KIND.card;
+    const id = account ? String(account.id) : '';
+    return `
+      <div class="c-surface c-surface--list pay-account-box">
+        <div class="c-row c-row--tap pay-part-account${account ? '' : ' pay-account--empty'}" role="button" tabindex="0"
+             data-account-id="${escapeHtml(id)}" data-kind="${escapeHtml(kind)}"
+             aria-label="Куда поступили${rowNo ? ', строка ' + Number(rowNo) : ''}">
+          <div class="card-row-icon">${icon(meta.icon)}</div>
+          <div class="card-row-info">
+            <div class="card-row-title">${escapeHtml(account ? account.title : meta.choose)}</div>
+            <div class="card-row-sub">${escapeHtml(account ? (account.sub || account.label || '') : meta.hint)}</div>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  // Первая строка карты/перечисления с суммой, но без «куда»; -1 — все указаны.
+  function payMissingAccount(rows) {
+    return (rows || []).findIndex(r => (r.method === 'card' || r.method === 'bank') && payCents(r.amount) && !r.account_id);
+  }
+
+  // «Карты и счета»: список по видам, архив — по переключателю. canManage —
+  // правка и архив (руководство; менеджер — пока руководителя нет).
+  function payAccountsManagerHtml(accounts, opts) {
+    const o = opts || {};
+    const all = accounts || [];
+    const group = (kind, title) => {
+      const rows = all.filter(a => a.kind === kind && (o.showArchived || !a.archived));
+      const body = rows.length ? rows.map(a => `
+          <div class="c-row${o.canManage ? ' c-row--tap' : ''}" data-pay-account="${Number(a.id)}"${o.canManage ? ' role="button" tabindex="0"' : ''}${a.archived ? ' data-status="rejected"' : ''}>
+            <div class="card-row-icon">${icon(kind === 'card' ? 'card' : 'building')}</div>
+            <div class="card-row-info">
+              <div class="card-row-title">${escapeHtml(a.title)}</div>
+              <div class="card-row-sub">${escapeHtml([a.sub, a.archived ? 'в архиве' : ''].filter(Boolean).join(' · ') || a.label || '')}</div>
+            </div>
+          </div>`).join('')
+        : `<div class="c-row"><div class="card-row-info"><div class="card-row-sub">${escapeHtml(PAY_ACCOUNT_KIND[kind].empty)}</div></div></div>`;
+      return `<div class="section-label">${escapeHtml(title)}</div><div class="c-surface c-surface--list">${body}</div>`;
+    };
+    const archived = all.filter(a => a.archived).length;
+    return `
+      ${group('card', 'Карты')}
+      ${group('bank', 'Расчётные счета')}
+      ${o.canAdd !== false ? `<div class="c-actions">
+        <button type="button" class="btn-secondary" data-pay-account-add="card">${icon('plus')} Новая карта</button>
+        <button type="button" class="btn-secondary" data-pay-account-add="bank">${icon('plus')} Новый счёт</button>
+      </div>` : ''}
+      ${o.canManage && archived ? `<button type="button" class="btn-secondary" data-pay-accounts-archived="${o.showArchived ? '0' : '1'}">${o.showArchived ? 'Скрыть архив' : `Показать архив · ${archived}`}</button>` : ''}
+      ${o.hint ? `<div class="c-field-hint">${escapeHtml(o.hint)}</div>` : ''}`;
   }
 
   // Карточка долга «ждёт подтверждения»: одна фраза без двусмысленности.
@@ -1095,6 +1224,8 @@
     whMoney, whQty, whStockBadge,
     PAY_METHODS, PAY_METHOD_LABEL, PAY_STATE_LABEL, payCents, payRate, payRateCurrency, payConvert,
     payMoney, payPreview, payPartLine, payAwaitingText, payHandoverHtml, payHandoverOrdersHtml,
+    PAY_ACCOUNT_KIND, payAccountItems, payDefaultAccountId, payAccountPrefill, payAccountFormError,
+    payAccountFieldHtml, payMissingAccount, payAccountsManagerHtml,
     payHandoverPicked, payDepositOrdersText,
   };
 });

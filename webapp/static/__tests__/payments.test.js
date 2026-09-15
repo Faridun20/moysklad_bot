@@ -211,13 +211,20 @@ describe('форма перед отгрузкой «оплаты сразу»',
     cbu: { UZS: '12700' }, parts: [], open: true,
   };
 
-  it('5 000 наличными + 7 130 картой → запись разбивки, затем отгрузка', async () => {
+  const CARD = {
+    id: 5, kind: 'card', title: '•••• 1234 · Фаридун М.', sub: 'Kapitalbank · USD', holder: 'Фаридун М.',
+    card_last4: '1234', bank: 'Kapitalbank', currency: 'USD', archived: false,
+    label: 'на карту •••• 1234 (Фаридун М.)', account_number: '',
+  };
+
+  it('5 000 наличными + 7 130 на новую карту «Фаридун М. •••• 1234» → запись разбивки, затем отгрузка', async () => {
     const w = boot(`
       currentUser = { role: 'manager', user_id: 42 };
       window.__calls = [];
       const answer = async (p, b) => {
         window.__calls.push([p, b]);
-        if (p === '/api/orders/payment_context') return ${JSON.stringify(CTX)};
+        if (p === '/api/orders/payment_context') return ${JSON.stringify({ ...CTX, pay_accounts: { accounts: [], last_used: {}, can_add: true, can_manage: false, currencies: ['USD', 'UZS'] } })};
+        if (p === '/api/pay_accounts/create') return { ok: true, existed: false, account: ${JSON.stringify(CARD)} };
         if (p === '/api/orders/payment') return { ok: true, total_cents: 1213000, parts: [] };
         if (p === '/api/orders/ship') return { ok: true };
         return {};
@@ -230,6 +237,8 @@ describe('форма перед отгрузкой «оплаты сразу»',
     await w.__ready;
     const doc = w.document;
     const amount = () => doc.querySelectorAll('.pay-part-amount');
+    // Наличные «куда» не спрашивают.
+    expect(doc.querySelector('.pay-part-account')).toBeNull();
     amount()[0].value = '5000';
     amount()[0].dispatchEvent(new w.Event('input'));
     expect(doc.querySelector('#ms-submit').disabled).toBe(true);  // не хватает 7 130
@@ -237,17 +246,85 @@ describe('форма перед отгрузкой «оплаты сразу»',
     doc.querySelector('.pay-add-part').click();
     expect(amount()[1].value).toBe('7130');                        // остаток подставлен
     expect(doc.querySelectorAll('.pay-part')[1].querySelector('[data-pay-method="card"]').classList.contains('active')).toBe(true);
+    // Карта без «куда» — записать нельзя, и итог говорит почему.
+    expect(doc.querySelector('#ms-submit').disabled).toBe(true);
+    expect(norm(doc.querySelector('.pay-total').textContent)).toContain('Строка 2: выберите, на какую карту пришли деньги');
+    const field = doc.querySelector('.pay-part-account');
+    expect(norm(field.textContent)).toContain('Куда поступили — выберите карту');
+    field.click();
+    let picker = [...doc.querySelectorAll('.c-overlay')].pop();
+    expect(norm(picker.textContent)).toContain('На какую карту');
+    expect(norm(picker.textContent)).toContain('Карт пока нет');
+    picker.querySelector('.picker-add').click();
+    const form = [...doc.querySelectorAll('.c-overlay')].pop();
+    expect(norm(form.querySelector('.c-sheet-title').textContent)).toBe('Новая карта');
+    form.querySelector('#ms-f-holder').value = 'Фаридун М.';
+    form.querySelector('#ms-f-card_last4').value = '8600 1234 5678 1234';
+    form.querySelector('#ms-submit').click();
+    await flush();
+    // Полный номер карты не уходит на сервер вовсе.
+    expect(norm(form.querySelector('#ms-error').textContent)).toContain('только последние 4 цифры');
+    expect(w.__calls.some(c => c[0] === '/api/pay_accounts/create')).toBe(false);
+    form.querySelector('#ms-f-card_last4').value = '1234';
+    form.querySelector('#ms-submit').click();
+    await flush(); await flush();
+    const created = w.__calls.find(c => c[0] === '/api/pay_accounts/create');
+    expect(created[1]).toMatchObject({ kind: 'card', holder: 'Фаридун М.', card_last4: '1234', currency: 'USD' });
+    expect(norm(doc.querySelector('.pay-part-account').textContent)).toContain('•••• 1234 · Фаридун М.');
+    expect(doc.querySelector('#ms-submit').disabled).toBe(false);
     doc.querySelector('#ms-submit').click();
     await flush(); await flush(); await flush();
     const pay = w.__calls.find(c => c[0] === '/api/orders/payment');
     expect(pay[1].parts).toEqual([
       { method: 'cash', currency: 'USD', amount: '5000' },
-      { method: 'card', currency: 'USD', amount: '7130' },
+      { method: 'card', currency: 'USD', amount: '7130', account_id: 5 },
     ]);
     expect(pay[1].idempotency_key).toBeTruthy();
     expect(w.__calls.some(c => c[0] === '/api/orders/ship')).toBe(true);
     expect(w.__alerts.some(a => a.includes('отгружен'))).toBe(true);
     expect(w.__done).toBe(1);
+  });
+
+  it('по умолчанию — последняя карта человека; «На счёт» — свой выбор, поиск по номеру', async () => {
+    const BANK = { id: 9, kind: 'bank', title: 'ООО Farid Impeks · …6789', sub: 'Kapitalbank · USD', holder: 'ООО Farid Impeks',
+      bank: 'Kapitalbank', account_number: '20208840900112236789', currency: 'USD', archived: false,
+      label: 'на счёт ООО Farid Impeks (…6789)', card_last4: '' };
+    const OLD = { ...CARD, id: 6, title: '•••• 9999 · Али', holder: 'Али', card_last4: '9999', archived: true };
+    const w = boot(`
+      currentUser = { role: 'manager', user_id: 42 };
+      window.__calls = [];
+      api = async () => (${JSON.stringify({ ...CTX, pay_accounts: { accounts: [], last_used: {}, can_add: true } })});
+      apiResult = async (p, b) => { window.__calls.push([p, b]); return { ok: true, status: 200, body: { ok: true, total_cents: 1213000 } }; };
+      payAccountsRemember({ accounts: [${JSON.stringify(CARD)}, ${JSON.stringify(BANK)}, ${JSON.stringify(OLD)}], last_used: { card: 5, bank: null }, can_add: true });
+      const realApi = api;
+      api = async (p, b) => { const ctx = await realApi(p, b); ctx.pay_accounts = payAccountsState; return ctx; };
+      window.__ready = payOpenForm({ orderId: 27 });
+    `);
+    await w.__ready;
+    const doc = w.document;
+    doc.querySelector('[data-pay-method="card"]').click();
+    expect(norm(doc.querySelector('.pay-part-account').textContent)).toContain('•••• 1234 · Фаридун М.');
+    doc.querySelector('[data-pay-method="bank"]').click();
+    expect(norm(doc.querySelector('.pay-part-account').textContent)).toContain('Куда поступили — выберите счёт');
+    doc.querySelector('.pay-part-account').click();
+    const picker = [...doc.querySelectorAll('.c-overlay')].pop();
+    const search = picker.querySelector('#ms-f-search');
+    search.value = '6789';
+    search.dispatchEvent(new w.Event('input'));
+    await new Promise(r => setTimeout(r, 150));
+    const rows = picker.querySelectorAll('[data-pick]');
+    expect(rows.length).toBe(1);
+    expect(norm(rows[0].textContent)).toContain('ООО Farid Impeks');
+    rows[0].click();
+    picker.querySelector('#ms-submit').click();
+    await flush(); await flush();
+    expect(norm(doc.querySelector('.pay-part-account').textContent)).toContain('ООО Farid Impeks · …6789');
+    doc.querySelector('#ms-submit').click();
+    await flush(); await flush();
+    const [, body] = w.__calls.find(c => c[0] === '/api/orders/payment');
+    expect(body.parts).toEqual([{ method: 'bank', currency: 'USD', amount: '12130', account_id: 9 }]);
+    // Архивная карта в выбор не попадает.
+    expect(H.payAccountItems([CARD, OLD], 'card', 'USD').map(i => i.id)).toEqual([5]);
   });
 
   it('строка в сумах показывает курс ЦБ и отправляет его', async () => {
@@ -340,5 +417,89 @@ describe('«Касса»: сдача наличных по заказам', () =
     const text = norm(w.document.getElementById('content').textContent);
     expect(text).toContain('Заказы: #27 — 5 000 USD');
     expect(text).toContain('Это ваша сдача');
+  });
+});
+
+describe('«куда поступили»: чистые хелперы карт и счетов', () => {
+  it('строка разбивки называет карту и владельца; без записи — прежняя подпись', () => {
+    const base = { method: 'card', amount_cents: 713000, currency: 'USD', state: 'awaiting_bank' };
+    expect(norm(H.payPartLine({ ...base, account_label: 'на карту •••• 1234 (Фаридун М.)' })))
+      .toBe('на карту •••• 1234 (Фаридун М.) · 7 130 USD — ждёт проверки банка');
+    expect(norm(H.payPartLine(base))).toBe('на карту 7 130 USD — ждёт проверки банка');
+    expect(norm(H.payPartLine({ method: 'cash', amount_cents: 500000, currency: 'USD', state: 'on_hand' })))
+      .toBe('наличные 5 000 USD — у менеджера, ждут сдачи в кассу');
+  });
+
+  it('проверка формы — те же правила, что на сервере', () => {
+    expect(H.payAccountFormError('card', { holder: '', card_last4: '1234' })).toContain('владельца карты');
+    expect(H.payAccountFormError('card', { holder: 'Фаридун М.', card_last4: '8600123456781234' })).toContain('полный номер карты не храним');
+    expect(H.payAccountFormError('card', { holder: 'Фаридун М.', card_last4: '12a4' })).toContain('ровно 4 цифры');
+    expect(H.payAccountFormError('card', { holder: 'Фаридун М.', card_last4: '•••• 1234' })).toBe('');
+    expect(H.payAccountFormError('bank', { holder: 'ООО Farid Impeks', account_number: '2020884090011223678' })).toContain('20 цифр');
+    expect(H.payAccountFormError('bank', { holder: '', account_number: '20208840900112236789' })).toContain('фирму');
+    expect(H.payAccountFormError('bank', { holder: 'ООО Farid Impeks', account_number: '2020 8840 9001 1223 6789' })).toBe('');
+    expect(H.payAccountFormError('bank', { holder: 'ООО', account_number: '20208840900112236789', mfo: '123' })).toContain('МФО');
+    expect(H.payAccountFormError('bank', { holder: 'ООО', account_number: '20208840900112236789', company_tin: '12' })).toContain('ИНН');
+  });
+
+  it('набранное в поиске уезжает в нужное поле новой записи', () => {
+    expect(H.payAccountPrefill('card', '1234')).toEqual({ card_last4: '1234' });
+    expect(H.payAccountPrefill('card', 'Фаридун')).toEqual({ holder: 'Фаридун' });
+    expect(H.payAccountPrefill('bank', '20208840900112236789')).toEqual({ account_number: '20208840900112236789' });
+    expect(H.payAccountPrefill('bank', '123')).toEqual({});
+  });
+
+  it('последний выбор предлагается, только пока запись жива и того же вида', () => {
+    const st = { accounts: [{ id: 1, kind: 'card', archived: false }, { id: 2, kind: 'card', archived: true }], last_used: { card: 1, bank: 1 } };
+    expect(H.payDefaultAccountId(st, 'card')).toBe(1);
+    expect(H.payDefaultAccountId(st, 'bank')).toBeNull();
+    expect(H.payDefaultAccountId({ ...st, last_used: { card: 2 } }, 'card')).toBeNull();
+    expect(H.payMissingAccount([{ method: 'cash', amount: '5' }, { method: 'bank', amount: '7' }])).toBe(1);
+    expect(H.payMissingAccount([{ method: 'card', amount: '', account_id: '' }])).toBe(-1);
+  });
+
+  it('«Карты и счета»: имена экранируются, архив — по переключателю, правка — только с правом', () => {
+    const accounts = [
+      { id: 1, kind: 'card', title: '•••• 1234 · <b>Али</b>', sub: 'Humo', archived: false },
+      { id: 2, kind: 'bank', title: 'ООО Старое · …0001', sub: '', archived: true },
+    ];
+    const html = H.payAccountsManagerHtml(accounts, { canManage: true, showArchived: false });
+    expect(html).not.toContain('<b>Али</b>');
+    expect(html).toContain('&lt;b&gt;Али&lt;/b&gt;');
+    expect(html).not.toContain('ООО Старое');
+    expect(html).toContain('Показать архив · 1');
+    expect(H.payAccountsManagerHtml(accounts, { canManage: true, showArchived: true })).toContain('в архиве');
+    const view = H.payAccountsManagerHtml(accounts, { canManage: false });
+    expect(view).not.toContain('role="button"');
+    expect(view).not.toContain('Показать архив');
+  });
+});
+
+describe('поступление по рассрочке: «куда» у карты и перечисления', () => {
+  it('наличные — без строки выбора; «На карту» — последняя карта, и она уходит в запрос', async () => {
+    const w = boot(`
+      currentUser = { role: 'manager', user_id: 42 };
+      window.__calls = [];
+      api = async (p) => (p === '/api/pay_accounts' ? {
+        accounts: [{ id: 5, kind: 'card', title: '•••• 1234 · Фаридун М.', sub: 'USD', archived: false, label: 'на карту •••• 1234 (Фаридун М.)' }],
+        last_used: { card: 5 }, can_add: true, can_manage: false, currencies: ['USD'],
+      } : {});
+      apiResult = async (p, b) => { window.__calls.push([p, b]); return { ok: true, status: 200, body: { ok: true } }; };
+      window.__ready = openReceiptForm({ id: 3, currency: 'USD' }, () => {});
+    `);
+    await w.__ready;
+    await flush(); await flush();
+    const doc = w.document;
+    const field = doc.querySelector('#ms-f-account_id').closest('.c-field');
+    expect(field.hidden).toBe(true);
+    doc.querySelector('.seg-item[data-opt="card"]').click();
+    await flush();
+    expect(field.hidden).toBe(false);
+    expect(norm(field.textContent)).toContain('•••• 1234 · Фаридун М.');
+    doc.querySelector('#ms-f-amount').value = '500';
+    doc.querySelector('#ms-submit').click();
+    await flush(); await flush();
+    const [, body] = w.__calls.find(c => c[0] === '/api/machines/receipt');
+    expect(body).toMatchObject({ deal_id: 3, method: 'card', account_id: 5 });
   });
 });

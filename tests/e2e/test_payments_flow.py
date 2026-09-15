@@ -94,7 +94,7 @@ def test_paid_order_split_payment_handover_and_confirmation_close_the_debt(open_
     mgr.wait_for_selector(f'.order-card[data-id="{oid}"] .order-parts')
     parts = _norm(mgr.locator(f'.order-card[data-id="{oid}"] .order-parts').inner_text())
     assert "наличные 5 000 USD — у менеджера, ждут сдачи в кассу" in parts
-    assert "на карту 7 130 USD — ждёт проверки банка" in parts
+    assert "на карту •••• 1234 (Фаридун М.) · 7 130 USD — ждёт проверки банка" in parts
     _shot(mgr, "04-order-card-breakdown")
 
     # ── Сдача наличных: на руках 5 000 по заказу #N.
@@ -116,7 +116,7 @@ def test_paid_order_split_payment_handover_and_confirmation_close_the_debt(open_
     boss.wait_for_selector(dep_card)
     assert f"Заказы: #{oid} — 5 000 USD" in _norm(boss.locator(dep_card).inner_text())
     pay_card = boss.locator(f'.debt-card[data-pay="{oid}"]')
-    assert "на карту 7 130 USD — ждёт проверки банка" in _norm(pay_card.inner_text())
+    assert "на карту •••• 1234 (Фаридун М.) · 7 130 USD — ждёт проверки банка" in _norm(pay_card.inner_text())
     assert "Подтвердить 7 130 USD" in _norm(pay_card.locator(".pay-confirm").inner_text())
     _shot(boss, "06-boss-confirm-tab")
     boss.click(f"{dep_card} .dep-confirm")

@@ -1948,7 +1948,7 @@ function machineReceiptsHtml(deal) {
         <div class="card-row-info">
           <div class="card-row-title">${formatMoney(Number(r.amount_cents || 0) / 100, cur)}</div>
           <div class="card-row-sub">${escapeHtml(String(r.received_at || '').slice(0, 16))}${
-            r.method ? ' · ' + escapeHtml(methods[r.method] || r.method) : ''}${
+            r.method ? ' · ' + escapeHtml(r.account_label || methods[r.method] || r.method) : ''}${
             r.note ? ' · ' + escapeHtml(r.note) : ''}</div>
         </div>
         ${canUndo ? `<button class="pay-toggle" data-receipt-del="${r.id}"
@@ -1966,7 +1966,7 @@ function openReceiptForm(deal, refresh) {
     return;
   }
   const key = idemKey();
-  openMachineSheet({
+  const sheet = openMachineSheet({
     title: 'Оплата по рассрочке',
     hint: 'Сумма любая — поступления гасят график по порядку',
     fields: [
@@ -1975,12 +1975,19 @@ function openReceiptForm(deal, refresh) {
       // нему сверяют кассу и банк.
       { key: 'method', label: 'Как получены', type: 'select', required: true,
         options: [['cash', 'Наличные'], ['card', 'На карту'], ['bank', 'Перечисление']] },
+      // Карта/перечисление — КУДА пришли деньги (карта или счёт справочника).
+      { key: 'account_id', label: 'Куда поступили', type: 'hidden' },
       { key: 'note', label: 'Комментарий' },
     ],
     submitLabel: 'Записать',
     onSubmit: async (data, { showErr }) => {
+      if (data.method !== 'cash' && !data.account_id) {
+        showErr(data.method === 'card' ? 'Выберите, на какую карту пришли деньги' : 'Выберите, на какой счёт пришли деньги');
+        return false;
+      }
       const res = await apiResult('/api/machines/receipt', {
         deal_id: deal.id, amount: data.amount, method: data.method, note: data.note, idempotency_key: key,
+        ...(data.method !== 'cash' && data.account_id ? { account_id: Number(data.account_id) } : {}),
       });
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
@@ -1989,6 +1996,10 @@ function openReceiptForm(deal, refresh) {
       return true;
     },
   });
+  // Строка «Куда поступили» появляется у карты и перечисления (payments.js).
+  if (typeof payMountAccountField === 'function') {
+    payMountAccountField(sheet.sheet, { methodKey: 'method', key: 'account_id', currency: deal.currency || 'USD' });
+  }
 }
 
 function machineDealsHtml(deals, today) {
@@ -3023,7 +3034,9 @@ function openListPicker({ title, hint, items, selectedId, emptyText, onPick, add
 
   const draw = (query) => {
     const q = String(query || '').trim().toLowerCase();
-    const rows = q ? all.filter(i => String(i.name || '').toLowerCase().includes(q)) : all;
+    // `search` — строка поиска, если справочник ищется не только по названию
+    // (карта — по владельцу и последним цифрам, счёт — по фирме и номеру).
+    const rows = q ? all.filter(i => String(i.search || i.name || '').toLowerCase().includes(q)) : all;
     list.innerHTML = rows.length
       ? rows.slice(0, 200).map(i => `
         <div class="c-row c-row--tap${String(i.id) === picked ? ' picked' : ''}"
@@ -3801,7 +3814,9 @@ function openMachineSheet({ title, fields, submitLabel, hint, onSubmit }) {
             `data-opt="${escapeHtml(String(v))}" aria-pressed="${String(v) === value}">${escapeHtml(l)}</button>`
           ).join('') +
           `</div><input type="hidden" ${common} value="${escapeHtml(value)}"></div>`
-        : `<input ${common} type="${f.type || 'text'}"${f.type === 'number' ? ' inputmode="decimal"' : ''} ` +
+        : `<input ${common} type="${f.type || 'text'}"${f.type === 'number' ? ' inputmode="decimal"' : ''}` +
+          `${f.inputmode ? ` inputmode="${escapeHtml(f.inputmode)}"` : ''}${f.maxlength ? ` maxlength="${Number(f.maxlength)}"` : ''}` +
+          `${f.autocomplete ? ` autocomplete="${escapeHtml(f.autocomplete)}"` : ''} ` +
           `value="${escapeHtml(value)}" placeholder="${escapeHtml(f.placeholder || '')}">`;
     return `<label class="c-field"><span>${escapeHtml(f.label)}${f.required ? ' *' : ''}</span>${input}` +
       `${f.hint ? `<span class="c-field-hint">${escapeHtml(f.hint)}</span>` : ''}</label>`;
@@ -5905,6 +5920,9 @@ async function renderSettingsScreen() {
     <div class="c-surface c-surface--list">
       ${meta && meta.can_edit_company ? row('set-company', 'building', 'Реквизиты компании', companySub) : ''}
       ${row('set-rates', 'cash', 'Курсы валют', 'Курс к базовой валюте — для сводок и оплат')}
+      ${typeof payRenderAccountsScreen === 'function'
+        ? row('set-pay-accounts', 'card', 'Карты и счета', 'Куда клиенты платят картой и перечислением')
+        : ''}
     </div>
     <div class="section-label">Сотрудники</div>
     <div class="c-surface c-surface--list">
@@ -5926,6 +5944,10 @@ async function renderSettingsScreen() {
   box.querySelector('#set-rates')?.addEventListener('click', () => {
     haptic('light');
     renderCurrencyRates(() => showScreen('settings'));
+  });
+  box.querySelector('#set-pay-accounts')?.addEventListener('click', () => {
+    haptic('light');
+    payRenderAccountsScreen(() => showScreen('settings'));
   });
 }
 // ─── Экран: Аналитика ───────────────────────────────
@@ -7216,7 +7238,7 @@ function cashHistoryHtml(history) {
       <div class="c-row">
         <div class="card-row-icon">${icon(m.ic)}</div>
         <div class="card-row-info">
-          <div class="card-row-title">${m.label} · ${fmt(h.amount)} ${escapeHtml(h.currency || baseCur())}${h.method_label ? ` · ${escapeHtml(h.method_label)}${h.part_currency && h.part_currency !== h.currency ? ` ${formatMoney(h.part_amount, escapeHtml(h.part_currency))}` : ''}` : ''}</div>
+          <div class="card-row-title">${m.label} · ${fmt(h.amount)} ${escapeHtml(h.currency || baseCur())}${h.method_label ? ` · ${escapeHtml(h.account_label || h.method_label)}${h.part_currency && h.part_currency !== h.currency ? ` ${formatMoney(h.part_amount, escapeHtml(h.part_currency))}` : ''}` : ''}</div>
           <div class="card-row-sub">${escapeHtml(h.who || '')}${time ? ' · ' + escapeHtml(time) : ''}${ord}</div>
         </div>
         ${histStatus(h.status)}

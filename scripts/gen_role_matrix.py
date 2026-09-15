@@ -56,6 +56,8 @@ SCREEN_MAP = [
     ("Заказы → Техника", "admin, boss, manager", "/api/machines/list"),
     ("Техника → карточка", "admin, boss, manager", "/api/machines/card"),
     ("Техника → сделки", "admin, boss", "/api/machines/deal"),
+    ("Оплата → «Куда поступили»; Настройки → Карты и счета", "admin, boss, manager (правка и архив — руководство)",
+     "/api/pay_accounts"),
 ]
 
 # Роли часто перечислены константой, а не литералом на месте: один и тот же

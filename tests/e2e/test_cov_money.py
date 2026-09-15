@@ -743,8 +743,12 @@ def test_debt_payment_form_validates_amounts_and_refuses_overpayment(open_app, e
     assert "Большенужногона799USD" in _norm(_text(mgr, ".c-overlay .pay-total"))
     assert mgr.locator(".c-overlay #ms-submit").is_disabled()
     assert e2e.rows("SELECT COUNT(*) AS n FROM payments")[0]["n"] == 0
+    card_id = e2e.rows("SELECT id FROM acc_accounts WHERE kind = 'card'")[0]["id"]
     res = _api(mgr, "/api/orders/payment", {"order_id": oid, "parts": [
         {"method": "card", "currency": "USD", "amount": "999"}]})
+    assert res["status"] == 400 and res["body"]["code"] == "account_required", "карта без «куда» — отказ"
+    res = _api(mgr, "/api/orders/payment", {"order_id": oid, "parts": [
+        {"method": "card", "currency": "USD", "amount": "999", "account_id": card_id}]})
     assert res["status"] == 400 and res["body"]["code"] == "over"
 
     mgr.fill(".c-overlay .pay-part-amount", "200")
@@ -755,7 +759,7 @@ def test_debt_payment_form_validates_amounts_and_refuses_overpayment(open_app, e
     ]
     push = [p for p in e2e.pushes if "Требуется подтверждение оплаты" in p["text"]]
     assert push and "закрывает долг полностью" in push[0]["text"]
-    assert "на карту 200 USD" in push[0]["text"]
+    assert "на карту •••• 1234 (Фаридун М.) · 200 USD" in push[0]["text"]
     # Больше вносить нечего: остаток уже заявлен.
     res = _api(mgr, "/api/orders/payment", {"order_id": oid, "parts": [
         {"method": "cash", "currency": "USD", "amount": "1"}]})
@@ -1160,7 +1164,7 @@ def test_end_to_end_credit_order_payments_shrink_debt_and_match_report(open_app,
     _idle(mgr)
     card = _norm(_text(mgr, ".debt-awaiting"))
     assert _norm("Оплата 120 USD ждёт подтверждения · после подтверждения долг: 180 USD") in card
-    assert "накарту120USD—ждётпроверкибанка" in card and "подтвердит" in card
+    assert "накарту••••1234(ФаридунМ.)·120USD—ждётпроверкибанка" in card and "подтвердит" in card
     push = [p for p in e2e.pushes if "Требуется подтверждение оплаты" in p["text"]][-1]
     assert "120 USD" in push["text"] and "Останется к получению: <b>180 USD</b>" in push["text"]
     p1 = e2e.rows("SELECT id FROM payments")[0]["id"]
