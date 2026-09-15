@@ -43,6 +43,7 @@
   --shadow-modal: 0 8px 40px rgba(0,0,0,0.22);
   --fill-neutral: rgba(127,127,127,0.12);  /* нейтральная заливка, ок на обеих темах */
   --sk-highlight: rgba(0,0,0,0.07);        /* «блик» шиммера скелетона (тёмный на свете) */
+  --scrim:      rgba(0, 0, 0, 0.36);       /* затемнение под шторкой «Меню» */
 
   /* ── Шкалы отступов и типографики (UI-WP-03, UI-бриф п.1) ───────────────
      Отступы — ТОЛЬКО шкала 4 / 8 / 12 / 16 / 24 / 32. Значения вне шкалы
@@ -113,6 +114,7 @@
   --bg-soft:     rgba(255, 255, 255, 0.08);
   --divider:     rgba(255, 255, 255, 0.12);
   --sk-highlight: rgba(255, 255, 255, 0.09);  /* на тёмной теме блик светлый, иначе невидим */
+  --scrim:       rgba(0, 0, 0, 0.56);          /* на тёмном фоне лёгкое затемнение не видно */
   --success:     #4ade80;
   --success-bg:  rgba(74, 222, 128, 0.16);
   --success-fg:  #06230f;             /* тёмный текст на ярко-зелёной кнопке */
@@ -145,6 +147,7 @@
     --divider:    rgba(255, 255, 255, 0.12);
     --bg-soft:    rgba(255, 255, 255, 0.08);
     --sk-highlight: rgba(255, 255, 255, 0.09);
+    --scrim:      rgba(0, 0, 0, 0.56);
     --success:    #4ade80;  --success-bg: rgba(74, 222, 128, 0.16); --success-fg: #06230f;
     --danger:     #ff6b6b;  --danger-bg:  rgba(255, 107, 107, 0.16);
     --warn:       #f5c451;  --warn-strong: #f9b542; --warn-bg: rgba(249, 168, 37, 0.16);
@@ -217,6 +220,7 @@ button,
   .search-item:hover { background: var(--bg-soft); }
   .nav-item:hover:not(.active),
   .seg-item:hover:not(.active) { color: var(--text); }
+  .nav-link:hover:not(.is-current) { background: var(--bg-soft); }
   .cat-btn:hover:not(.active) { border-color: var(--accent); }
   .btn-primary:hover:not(:disabled),
   .btn-new-order:hover,
@@ -797,6 +801,149 @@ body {
   /* «Клиенты» на 320dp в ряду из пяти иначе ломается пополам. */
   max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+
+/* ─── Шторка «Меню»: все разделы роли и их вкладки ──────────────────────────
+   Открывает кнопка «Меню» в нижней панели (openNavDrawer в app.js). Выезжает
+   СПРАВА — со стороны кнопки и большого пальца; бургер в шапке слева был бы
+   дальше всего от пальца и под самым «Закрыть» клиента Telegram.
+
+   Анимируются только transform и opacity — их WebView считает на композиторе,
+   без пересчёта раскладки, поэтому выезд не дёргается даже на слабом Android.
+   Узел живёт всё время (создаётся при первом открытии): `visibility` гасится
+   с задержкой в длительность перехода, чтобы закрытие успело доиграть.
+   Свайп ведёт шторку за пальцем через --drawer-dx / --drawer-p (класс
+   .is-dragging снимает переход на время жеста). Без размытия: стекло —
+   только у неподвижной панели и трека вкладок (design-system.test.js). */
+.nav-drawer {
+  position: fixed;
+  inset: 0;
+  z-index: 90;              /* над панелью и шапкой, под формами (100) и тостами (200) */
+  visibility: hidden;
+  pointer-events: none;
+  transition: visibility 0s linear 0.3s;
+}
+.nav-drawer.is-open {
+  visibility: visible;
+  pointer-events: auto;
+  transition-delay: 0s;
+}
+.nav-drawer-scrim {
+  position: absolute;
+  inset: 0;
+  background: var(--scrim);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+.nav-drawer.is-open .nav-drawer-scrim { opacity: calc(1 - var(--drawer-p, 0)); }
+.nav-drawer-panel {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(320px, 86vw);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-page);
+  color: var(--text);
+  border-radius: var(--radius) 0 0 var(--radius);
+  box-shadow: var(--shadow-modal);
+  /* Чёлка и боковой вырез в ландшафте: содержимое не уходит под них. */
+  padding-top: env(safe-area-inset-top);
+  padding-right: env(safe-area-inset-right);
+  /* Вертикаль — прокрутке списка, горизонталь — свайпу закрытия. */
+  touch-action: pan-y;
+  /* Тень на 24px шире, чтобы в закрытом положении не торчала из-за края. */
+  transform: translateX(calc(100% + 24px));
+  transition: transform 0.3s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.nav-drawer.is-open .nav-drawer-panel { transform: translateX(var(--drawer-dx, 0px)); }
+.nav-drawer.is-dragging .nav-drawer-panel,
+.nav-drawer.is-dragging .nav-drawer-scrim { transition: none; }
+body.nav-drawer-open { overflow: hidden; }
+
+.nav-drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-3) var(--sp-2) var(--sp-4);
+}
+.nav-drawer-title { font-size: var(--text-lg); font-weight: 600; }
+.nav-drawer-sub { font-size: var(--text-base); color: var(--text-mute); }
+.nav-drawer-close {
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  border: none;
+  border-radius: 50%;
+  background: var(--bg-soft);
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.nav-drawer-close:active { opacity: 0.6; }
+.nav-drawer-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+  /* Жестовая полоса снизу: последний пункт докручивается выше неё. */
+  padding: var(--sp-1) var(--sp-2) calc(var(--sp-4) + env(safe-area-inset-bottom));
+}
+.nav-tree,
+.nav-sub { list-style: none; }
+.nav-group + .nav-group {
+  margin-top: var(--sp-1);
+  padding-top: var(--sp-1);
+  border-top: 0.5px solid var(--divider);
+}
+/* Строка шторки. Подпись раздела начинается на 44px (12 + иконка 20 + 12);
+   вкладки выровнены по ней же, линия слева — по центру иконки раздела. */
+.nav-link {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  min-height: 44px;
+  padding: var(--sp-2) var(--sp-3);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--text-md);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.nav-link .ic { --ic-size: 20px; color: var(--text-mute); }
+.nav-link:active { background: var(--bg-soft); }
+.nav-link-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nav-link--section { font-weight: 600; }
+.nav-link--section.is-within .ic { color: var(--accent); }
+.nav-sub {
+  margin-left: calc(var(--sp-3) + 9px);
+  border-left: 2px solid var(--divider);
+}
+.nav-link--tab {
+  width: calc(100% - var(--sp-2));
+  margin-left: var(--sp-2);
+  padding-left: calc(var(--sp-3) + 1px);
+}
+.nav-link.is-current {
+  background: var(--bg-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+@supports (color: color-mix(in srgb, red, blue)) {
+  .nav-link.is-current { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+}
+.nav-link.is-current .ic { color: var(--accent); }
+.nav-link .nav-link-check { --ic-size: 18px; }
 
 /* ─── Error & status ──────────────────────────────────────────── */
 .error {

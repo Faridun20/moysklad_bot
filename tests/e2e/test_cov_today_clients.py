@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from tests.e2e.conftest import alerts, go, seed_order, settled, sheet_fill, tab
+from tests.e2e.conftest import alerts, current_screen, go, nav_screens, seed_order, settled, sheet_fill, tab
 
 MGR2 = 201  # второй менеджер — для проверок «видит только своё»
 
@@ -85,7 +85,7 @@ def _text(page, selector: str = "#content") -> str:
 
 
 def _nav(page) -> list[str]:
-    return page.eval_on_selector_all("#bottom-nav .nav-item", "els => els.map(e => e.dataset.screen)")
+    return nav_screens(page)
 
 
 def _sect_tabs(page) -> list[str]:
@@ -93,12 +93,12 @@ def _sect_tabs(page) -> list[str]:
 
 
 def _active_screen(page) -> str | None:
-    return page.evaluate("document.querySelector('#bottom-nav .nav-item.active')?.dataset.screen")
+    return current_screen(page)
 
 
 def _wait_screen(page, screen: str, sect: str | None = None) -> None:
     page.wait_for_function(
-        "(s) => document.querySelector('#bottom-nav .nav-item.active')?.dataset.screen === s", arg=screen
+        "(s) => document.getElementById('bottom-nav')?.dataset.current === s", arg=screen
     )
     if sect:
         page.wait_for_function(

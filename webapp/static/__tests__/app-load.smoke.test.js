@@ -1171,18 +1171,27 @@ describe('позиция контейнера: товар выбирают из 
 
 describe('пять разделов вместо четырёх', () => {
   const nav = (window) => Array.from(
-    window.document.querySelectorAll('#bottom-nav .nav-item')
+    window.document.querySelectorAll('#bottom-nav .nav-item[data-screen]')
   ).map(b => b.dataset.screen);
 
-  it('нижняя панель строится под роль', () => {
-    const window = boot("currentUser = { role: 'boss' }; buildNav();");
-    expect(nav(window)).toEqual(['today', 'sales', 'stock', 'money', 'clients']);
+  it('нижняя панель строится под роль: четыре раздела и «Меню» со всеми пятью', () => {
+    // Пятый раздел ушёл из панели в шторку — пятый слот занимает «Меню»
+    // (см. navBarLayout): вкладки и будущие разделы растут там, а не в ряду.
+    const window = boot("currentUser = { role: 'boss' }; buildNav(); openNavDrawer();");
+    expect(nav(window)).toEqual(['today', 'sales', 'stock', 'money']);
+    expect(window.document.querySelector('#bottom-nav [data-action="menu"]')).not.toBeNull();
+    const drawer = Array.from(
+      window.document.querySelectorAll('#nav-drawer .nav-link--section'),
+    ).map(b => b.dataset.screen);
+    expect(drawer).toEqual(['today', 'sales', 'stock', 'money', 'clients']);
   });
 
   it('кладовщику не рисуют дверь, которая не открывается', () => {
-    // «Склад» и «Клиенты» ответят ему 403 по всем вкладкам.
+    // «Склад» и «Клиенты» ответят ему 403 по всем вкладкам. Вкладок у его
+    // разделов по одной — шторка повторила бы панель, «Меню» нет.
     const window = boot("currentUser = { role: 'warehouse_keeper' }; buildNav();");
     expect(nav(window)).toEqual(['today', 'sales', 'money']);
+    expect(window.document.querySelector('#bottom-nav [data-action="menu"]')).toBeNull();
   });
 
   it('лупа поиска — только ролям, которым отвечает /api/search', () => {
@@ -2744,5 +2753,108 @@ describe('ключ идемпотентности живёт с формой', (
     expect(k[0]).toBeTruthy();
     expect(k[1]).toBe(k[0]);
     expect(k[2]).not.toBe(k[0]);
+  });
+});
+
+describe('шторка «Меню»', () => {
+  // Экраны заглушены: проверяется навигация (куда ведёт пункт, что с «Назад»,
+  // фокусом и inert), а не рендеры разделов — их покрывают свои тесты.
+  const bootDrawer = (role) => {
+    const window = boot(`
+      currentUser = { role: '${role}' };
+      renderHome = async () => {}; renderSalesScreen = async () => {};
+      renderStockScreen = async () => { stockTab = sectionShell('stock', stockTab).active; };
+      renderMoneyScreen = async () => {}; renderClientsScreen = async () => {
+        clientsTab = sectionShell('clients', clientsTab).active; };
+      buildNav();
+      window.__state = () => ({ screen: currentScreen, stockTab, clientsTab, open: !!_navDrawer });
+    `);
+    const back = { visible: false, handler: null };
+    window.Telegram.WebApp.BackButton = {
+      show() { back.visible = true; }, hide() { back.visible = false; },
+      onClick(f) { back.handler = f; }, offClick() { back.handler = null; },
+    };
+    return { window, back, doc: window.document };
+  };
+  const tick = () => new Promise(r => setTimeout(r, 0));
+
+  it('пункт-вкладка ведёт в раздел и вкладку, шторка закрывается', async () => {
+    const { window, doc } = bootDrawer('manager');
+    await window.showScreen('today');
+    doc.getElementById('nav-menu-btn').click();
+    expect(doc.getElementById('nav-drawer').classList.contains('is-open')).toBe(true);
+    expect(doc.getElementById('nav-menu-btn').getAttribute('aria-expanded')).toBe('true');
+    // Текущий раздел без вкладок подсвечен сам.
+    expect(doc.querySelector('#nav-drawer [aria-current="page"]').dataset.screen).toBe('today');
+
+    doc.querySelector('#nav-drawer .nav-link[data-screen="stock"][data-tab="invoices"]').click();
+    await tick();
+    expect(window.__state()).toMatchObject({ screen: 'stock', stockTab: 'invoices', open: false });
+    expect(doc.getElementById('nav-drawer').classList.contains('is-open')).toBe(false);
+    expect(doc.getElementById('nav-drawer').hasAttribute('inert')).toBe(true);
+    expect(doc.getElementById('bottom-nav').dataset.current).toBe('stock');
+
+    // При следующем открытии подсвечена именно вкладка, раздел — «внутри».
+    window.openNavDrawer();
+    const cur = doc.querySelectorAll('#nav-drawer [aria-current="page"]');
+    expect(cur.length).toBe(1);
+    expect(cur[0].dataset.tab).toBe('invoices');
+    expect(doc.querySelector('#nav-drawer .nav-link--section[data-screen="stock"]').classList
+      .contains('is-within')).toBe(true);
+  });
+
+  it('раздел, которого нет в панели, подсвечивает «Меню»', async () => {
+    const { window, doc } = bootDrawer('boss');
+    window.openNavDrawer();
+    doc.querySelector('#nav-drawer .nav-link--section[data-screen="clients"]').click();
+    await tick();
+    expect(window.__state().screen).toBe('clients');
+    expect(doc.getElementById('nav-menu-btn').classList.contains('active')).toBe(true);
+    expect(doc.querySelector('#bottom-nav .nav-item[data-screen].active')).toBeNull();
+    // У менеджера нет «Воронки» — в шторке её тоже нет (403 не рисуем).
+    const mgr = bootDrawer('manager');
+    mgr.window.openNavDrawer();
+    expect(mgr.doc.querySelector('#nav-drawer [data-tab="funnel"]')).toBeNull();
+    expect(mgr.doc.querySelector('#nav-drawer [data-tab="invoices"]')).not.toBeNull();
+  });
+
+  it('«Назад» Telegram закрывает шторку и возвращает «Назад» экрана', () => {
+    const { window, back } = bootDrawer('boss');
+    const screenBack = () => {};
+    window.showBack(screenBack);
+    window.openNavDrawer();
+    expect(back.visible).toBe(true);
+    expect(back.handler).not.toBe(screenBack);
+    back.handler();
+    expect(window.__state().open).toBe(false);
+    expect(back.visible).toBe(true);
+    expect(back.handler).toBe(screenBack);
+  });
+
+  it('без «Назад» экрана закрытие её прячет; Esc, фон и крестик закрывают', () => {
+    const { window, back, doc } = bootDrawer('boss');
+    const esc = () => doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape' }));
+    for (const close of [
+      esc,
+      () => doc.querySelector('#nav-drawer .nav-drawer-scrim').click(),
+      () => doc.querySelector('#nav-drawer .nav-drawer-close').click(),
+    ]) {
+      doc.getElementById('nav-menu-btn').click();
+      expect(window.__state().open).toBe(true);
+      close();
+      expect(window.__state().open).toBe(false);
+      expect(back.visible).toBe(false);
+      expect(doc.getElementById('nav-menu-btn').getAttribute('aria-expanded')).toBe('false');
+    }
+  });
+
+  it('тот же пункт из вложенного экрана ведёт к списку раздела', async () => {
+    const { window, doc } = bootDrawer('boss');
+    await window.showScreen('stock');
+    window.showBack(() => {});        // открыта, например, карточка машины
+    window.openNavDrawer();
+    doc.querySelector('#nav-drawer .nav-link[data-tab="catalog"]').click();
+    await tick();
+    expect(window.__state()).toMatchObject({ screen: 'stock', stockTab: 'catalog', open: false });
   });
 });

@@ -11,8 +11,8 @@
 * ответ сервера со статусом >= 500;
 * экран без содержимого или с `.error-card` («Не удалось загрузить»).
 
-Как устроен обход. Разделы — из нижней панели, вкладки — из переключателя
-раздела; на каждом экране собираются видимые кликабельные элементы `#content`
+Как устроен обход. Разделы — из нижней панели и шторки «Меню», вкладки — из
+переключателя раздела; на каждом экране собираются видимые кликабельные элементы `#content`
 и нажимаются по одному (дедупликация по тексту без цифр + id + data-атрибутам,
 не больше MAX_CLICKS_PER_SCREEN). После нажатия: открылась форма — закрываем
 её «Отменой» или Escape, НЕ отправляя; ушли на другой экран или карточку —
@@ -39,7 +39,7 @@ import pytest
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page
 
-from tests.e2e.conftest import go, seed_order, settled, tab
+from tests.e2e.conftest import go, nav_screens, seed_order, settled, tab
 
 ROLES = ["boss", "admin", "mgr", "keeper", "book"]
 MAX_CLICKS_PER_SCREEN = 40
@@ -307,7 +307,7 @@ class Crawl:
 
     def state(self) -> tuple[str, str]:
         return tuple(self.page.evaluate(
-            "() => [document.querySelector('#bottom-nav .nav-item.active')?.dataset.screen || '',"
+            "() => [document.getElementById('bottom-nav')?.dataset.current || '',"
             " document.querySelector('#content .seg-item.active[data-sect]')?.dataset.sect || '']"
         ))
 
@@ -440,9 +440,9 @@ class Crawl:
         # Слушатели навешаны после open_app — перезагрузка, чтобы и старт
         # приложения прошёл под ними.
         self.restart()
-        sections = self.page.eval_on_selector_all(
-            "#bottom-nav .nav-item[data-screen]", "els => els.map(e => e.dataset.screen)"
-        )
+        # Все разделы роли — и из панели, и из шторки «Меню» («Клиенты» у
+        # руководства и менеджера в панель не влезли); go() сам ходит через шторку.
+        sections = nav_screens(self.page)
         assert sections, f"[{self.role}] нижняя панель пуста"
         for section in sections:
             self.where = f"экран {section}"

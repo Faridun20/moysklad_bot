@@ -19,7 +19,7 @@ import struct
 import zlib
 from types import SimpleNamespace
 
-from tests.e2e.conftest import alerts, go, settled, sheet_fill, tab
+from tests.e2e.conftest import alerts, go, nav_screens, settled, sheet_fill, tab
 
 # ─── Хелперы ─────────────────────────────────────────────────────────────────
 
@@ -200,7 +200,7 @@ def test_stock_tabs_follow_role(open_app, e2e):
 
     for who in ("keeper", "book"):
         page = open_app(e2e.ids[who])
-        screens = page.eval_on_selector_all("#bottom-nav .nav-item", "els => els.map(e => e.dataset.screen)")
+        screens = nav_screens(page)
         assert "stock" not in screens, (who, screens)
 
 

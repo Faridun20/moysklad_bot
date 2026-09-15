@@ -914,3 +914,47 @@ describe('склад: форматирование', () => {
     expect(whStockBadge(2.5)).toContain('2,5');
   });
 });
+
+describe('navBarLayout / navDrawerHtml (шторка «Меню»)', () => {
+  const { navBarLayout, navDrawerHtml, NAV_BAR_MAX } = helpers;
+  const S = (keys) => keys.map((key) => ({ key, label: key, icon: 'box' }));
+
+  it('пять разделов с вкладками — четыре в панели и «Меню»', () => {
+    const l = navBarLayout(S(['a', 'b', 'c', 'd', 'e']), (k) => (k === 'c' ? 4 : 1));
+    expect(NAV_BAR_MAX).toBe(4);
+    expect(l.menu).toBe(true);
+    expect(l.bar.map((s) => s.key)).toEqual(['a', 'b', 'c', 'd']);
+  });
+
+  it('шторка, повторяющая панель, не нужна', () => {
+    const l = navBarLayout(S(['a', 'b', 'c']), () => 1);
+    expect(l).toEqual({ bar: S(['a', 'b', 'c']), menu: false });
+    // Разделов больше пяти — «Меню» даже без вкладок: панель не резиновая.
+    expect(navBarLayout(S(['a', 'b', 'c', 'd', 'e', 'f']), () => 0).bar.length).toBe(4);
+    expect(navBarLayout(S(['a', 'b']), (k) => (k === 'b' ? 2 : 0)).bar.length).toBe(2);
+  });
+
+  it('дерево «раздел → вкладки», подсвечен ровно один пункт', () => {
+    const groups = [
+      { key: 'today', label: 'Сегодня', icon: 'home', tabs: [] },
+      { key: 'stock', label: 'Склад', icon: 'box',
+        tabs: [{ key: 'catalog', label: 'Каталог' }, { key: 'invoices', label: 'Накладные' }] },
+      { key: 'sales', label: 'Продажи', icon: 'cart', tabs: [{ key: 'orders', label: 'Заказы' }] },
+    ];
+    const html = navDrawerHtml(groups, { screen: 'stock', tab: 'invoices' }, { subtitle: 'Менеджер' });
+    expect(html.match(/aria-current="page"/g)).toHaveLength(1);
+    expect(html).toMatch(/is-current" aria-current="page" data-screen="stock" data-tab="invoices"/);
+    expect(html).toContain('nav-link--section is-within" data-screen="stock"');
+    // Одна вкладка — подпунктов нет, как и ряда .seg.
+    expect(html).not.toContain('data-tab="orders"');
+    expect(html).toContain('id="nav-drawer-title"');
+    expect(html).toContain('Менеджер');
+    expect(navDrawerHtml(groups, { screen: 'today' })).toMatch(/is-current" aria-current="page" data-screen="today"/);
+  });
+
+  it('подписи экранируются', () => {
+    const html = navDrawerHtml([{ key: 'x', label: '<b>', icon: 'box', tabs: [] }], {}, { subtitle: '<i>' });
+    expect(html).not.toContain('<b>');
+    expect(html).not.toContain('<i>');
+  });
+});
