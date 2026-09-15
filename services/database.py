@@ -1093,6 +1093,11 @@ def _create_tables():
                 error      TEXT
             )""",
         ]
+        # Бухгалтерия (счета, журнал денег) — схема в leaf-модуле: сервис
+        # импортирует database, и объявление здесь дало бы цикл импортов.
+        from services.accounting_schema import tables as _accounting_tables
+
+        tables.extend(_accounting_tables(id_type))
 
         # Создаём каждую таблицу в отдельной транзакции
         for sql in tables:
@@ -1275,6 +1280,9 @@ def _create_indexes():
             "CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id)",
             "CREATE INDEX IF NOT EXISTS idx_return_items_return ON return_items(return_id)",
         ]
+        from services.accounting_schema import INDEXES as _accounting_indexes
+
+        snapshot_indexes.extend(_accounting_indexes)
         for sql in snapshot_indexes:
             try:
                 cur.execute(sql)
