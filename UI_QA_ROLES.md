@@ -25,23 +25,27 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 167._
+_Всего эндпоинтов: 207._
 
 
 > **Временное совмещение ролей** (`services/roles.py::ROLE_ALSO_ACTS_AS`): `manager` = + `warehouse_keeper`, `bookkeeper`. Кладовщика и бухгалтера в штате пока нет, их работу делает менеджер; списки ниже уже учитывают это. Роли `warehouse_keeper`/`bookkeeper` через `/addrole` не назначаются. `*` в таблице экранов — доступ через совмещение.
 
 
-### Админ (`admin`) — 146 эндпоинтов
+### Админ (`admin`) — 183 эндпоинтов
 
 <details><summary>Показать список</summary>
 
 - `/api/agents`
 - `/api/analytics`
 - `/api/analytics/export`
+- `/api/audit_log`
 - `/api/cash/history`
 - `/api/cash/reconcile`
 - `/api/cash/reconcile/context`
 - `/api/cash/reconcile/history`
+- `/api/catalog_import/commit`
+- `/api/catalog_import/preview`
+- `/api/catalog_import/template`
 - `/api/channel/draft`
 - `/api/channel/history`
 - `/api/channel/publish`
@@ -73,6 +77,7 @@ _Всего эндпоинтов: 167._
 - `/api/currency/rates`
 - `/api/currency/rates/set`
 - `/api/debts`
+- `/api/debts/export`
 - `/api/deposits/confirm`
 - `/api/deposits/create`
 - `/api/deposits/my`
@@ -136,10 +141,13 @@ _Всего эндпоинтов: 167._
 - `/api/orders/mark_paid`
 - `/api/orders/payment`
 - `/api/orders/payment_context`
+- `/api/orders/photo_delete`
+- `/api/orders/photo_upload`
 - `/api/orders/reject_payment`
 - `/api/orders/remove_item`
 - `/api/orders/requests`
 - `/api/orders/set_agent`
+- `/api/orders/set_warehouse`
 - `/api/orders/ship`
 - `/api/orders/submit`
 - `/api/orders/unfreeze`
@@ -156,6 +164,7 @@ _Всего эндпоинтов: 167._
 - `/api/products/photo_delete`
 - `/api/products/photo_upload`
 - `/api/products/photos`
+- `/api/products/picker_hints`
 - `/api/products/prices`
 - `/api/products/prices/set`
 - `/api/products/search`
@@ -168,18 +177,43 @@ _Всего эндпоинтов: 167._
 - `/api/returns/pending`
 - `/api/returns/positions`
 - `/api/search`
+- `/api/settings/backup_status`
+- `/api/settings/client_debt_reminders`
 - `/api/settings/delete_requires_boss`
 - `/api/stock`
+- `/api/stock/counts`
+- `/api/stock/counts/cancel`
+- `/api/stock/counts/card`
+- `/api/stock/counts/confirm`
+- `/api/stock/counts/line`
+- `/api/stock/counts/line_remove`
+- `/api/stock/counts/start`
+- `/api/stock/export`
+- `/api/stock/transfer`
+- `/api/stock/transfers`
+- `/api/stock/writeoffs`
+- `/api/stock/writeoffs/create`
+- `/api/stock/writeoffs/photo`
+- `/api/stock/writeoffs/photo_view`
+- `/api/stock/writeoffs/void`
 - `/api/suppliers/debts`
 - `/api/suppliers/payment`
 - `/api/suppliers/terms`
 - `/api/today`
 - `/api/users/deactivate`
+- `/api/warehouses/active`
+- `/api/warehouses/archive`
+- `/api/warehouses/create`
+- `/api/warehouses/list`
+- `/api/warehouses/rename`
+- `/api/warehouses/unarchive`
 - `/api/wh/counterparties`
 - `/api/wh/counterparties/create`
+- `/api/wh/counterparties/export`
 - `/api/wh/invoices`
 - `/api/wh/invoices/cancel`
 - `/api/wh/invoices/create`
+- `/api/wh/invoices/export`
 - `/api/wh/invoices/get`
 - `/api/wh/invoices/print`
 - `/api/wh/invoices/send`
@@ -188,17 +222,21 @@ _Всего эндпоинтов: 167._
 </details>
 
 
-### Руководитель (`boss`) — 143 эндпоинтов
+### Руководитель (`boss`) — 180 эндпоинтов
 
 <details><summary>Показать список</summary>
 
 - `/api/agents`
 - `/api/analytics`
 - `/api/analytics/export`
+- `/api/audit_log`
 - `/api/cash/history`
 - `/api/cash/reconcile`
 - `/api/cash/reconcile/context`
 - `/api/cash/reconcile/history`
+- `/api/catalog_import/commit`
+- `/api/catalog_import/preview`
+- `/api/catalog_import/template`
 - `/api/channel/draft`
 - `/api/channel/history`
 - `/api/channel/publish`
@@ -230,6 +268,7 @@ _Всего эндпоинтов: 167._
 - `/api/currency/rates`
 - `/api/currency/rates/set`
 - `/api/debts`
+- `/api/debts/export`
 - `/api/deposits/confirm`
 - `/api/deposits/create`
 - `/api/deposits/my`
@@ -293,10 +332,13 @@ _Всего эндпоинтов: 167._
 - `/api/orders/mark_paid`
 - `/api/orders/payment`
 - `/api/orders/payment_context`
+- `/api/orders/photo_delete`
+- `/api/orders/photo_upload`
 - `/api/orders/reject_payment`
 - `/api/orders/remove_item`
 - `/api/orders/requests`
 - `/api/orders/set_agent`
+- `/api/orders/set_warehouse`
 - `/api/orders/ship`
 - `/api/orders/submit`
 - `/api/pay_accounts`
@@ -311,6 +353,7 @@ _Всего эндпоинтов: 167._
 - `/api/products/photo_delete`
 - `/api/products/photo_upload`
 - `/api/products/photos`
+- `/api/products/picker_hints`
 - `/api/products/prices`
 - `/api/products/prices/set`
 - `/api/products/search`
@@ -323,17 +366,42 @@ _Всего эндпоинтов: 167._
 - `/api/returns/pending`
 - `/api/returns/positions`
 - `/api/search`
+- `/api/settings/backup_status`
+- `/api/settings/client_debt_reminders`
 - `/api/settings/delete_requires_boss`
 - `/api/stock`
+- `/api/stock/counts`
+- `/api/stock/counts/cancel`
+- `/api/stock/counts/card`
+- `/api/stock/counts/confirm`
+- `/api/stock/counts/line`
+- `/api/stock/counts/line_remove`
+- `/api/stock/counts/start`
+- `/api/stock/export`
+- `/api/stock/transfer`
+- `/api/stock/transfers`
+- `/api/stock/writeoffs`
+- `/api/stock/writeoffs/create`
+- `/api/stock/writeoffs/photo`
+- `/api/stock/writeoffs/photo_view`
+- `/api/stock/writeoffs/void`
 - `/api/suppliers/debts`
 - `/api/suppliers/payment`
 - `/api/suppliers/terms`
 - `/api/today`
+- `/api/warehouses/active`
+- `/api/warehouses/archive`
+- `/api/warehouses/create`
+- `/api/warehouses/list`
+- `/api/warehouses/rename`
+- `/api/warehouses/unarchive`
 - `/api/wh/counterparties`
 - `/api/wh/counterparties/create`
+- `/api/wh/counterparties/export`
 - `/api/wh/invoices`
 - `/api/wh/invoices/cancel`
 - `/api/wh/invoices/create`
+- `/api/wh/invoices/export`
 - `/api/wh/invoices/get`
 - `/api/wh/invoices/print`
 - `/api/wh/invoices/send`
@@ -342,7 +410,7 @@ _Всего эндпоинтов: 167._
 </details>
 
 
-### Менеджер (`manager`) — 99 эндпоинтов
+### Менеджер (`manager`) — 126 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -351,6 +419,11 @@ _Всего эндпоинтов: 167._
 - `/api/cash/reconcile`
 - `/api/cash/reconcile/context`
 - `/api/cash/reconcile/history`
+- `/api/catalog_import/commit`
+- `/api/catalog_import/preview`
+- `/api/catalog_import/template`
+- `/api/clients/detail`
+- `/api/clients/shipment`
 - `/api/containers/arrive`
 - `/api/containers/card`
 - `/api/containers/check`
@@ -365,6 +438,7 @@ _Всего эндпоинтов: 167._
 - `/api/containers/update`
 - `/api/currency/rates`
 - `/api/debts`
+- `/api/debts/export`
 - `/api/deposits/confirm`
 - `/api/deposits/create`
 - `/api/deposits/my`
@@ -414,9 +488,12 @@ _Всего эндпоинтов: 167._
 - `/api/orders/mark_paid`
 - `/api/orders/payment`
 - `/api/orders/payment_context`
+- `/api/orders/photo_delete`
+- `/api/orders/photo_upload`
 - `/api/orders/reject_payment`
 - `/api/orders/remove_item`
 - `/api/orders/set_agent`
+- `/api/orders/set_warehouse`
 - `/api/orders/ship`
 - `/api/orders/submit`
 - `/api/pay_accounts`
@@ -428,6 +505,7 @@ _Всего эндпоинтов: 167._
 - `/api/payments/unlinked`
 - `/api/products/photo`
 - `/api/products/photos`
+- `/api/products/picker_hints`
 - `/api/products/search`
 - `/api/returns/create`
 - `/api/returns/goods_received`
@@ -435,12 +513,29 @@ _Всего эндпоинтов: 167._
 - `/api/returns/positions`
 - `/api/search`
 - `/api/stock`
+- `/api/stock/counts`
+- `/api/stock/counts/cancel`
+- `/api/stock/counts/card`
+- `/api/stock/counts/confirm`
+- `/api/stock/counts/line`
+- `/api/stock/counts/line_remove`
+- `/api/stock/counts/start`
+- `/api/stock/export`
+- `/api/stock/transfer`
+- `/api/stock/writeoffs`
+- `/api/stock/writeoffs/create`
+- `/api/stock/writeoffs/photo`
+- `/api/stock/writeoffs/photo_view`
+- `/api/stock/writeoffs/void`
 - `/api/today`
+- `/api/warehouses/active`
 - `/api/wh/counterparties`
 - `/api/wh/counterparties/create`
+- `/api/wh/counterparties/export`
 - `/api/wh/invoices`
 - `/api/wh/invoices/cancel`
 - `/api/wh/invoices/create`
+- `/api/wh/invoices/export`
 - `/api/wh/invoices/get`
 - `/api/wh/invoices/print`
 - `/api/wh/invoices/send`
@@ -485,6 +580,9 @@ _Всего эндпоинтов: 167._
 
 - `/api/me`
 - `/api/orders`
+- `/api/orders/photo`
+- `/api/orders/photos`
+- `/api/orders/timeline`
 - `/api/payments/history`
 
 
