@@ -90,7 +90,10 @@
 
      Тинт задаётся своим токеном, а не прозрачностью --bg-card: тема Telegram
      отдаёт непрозрачный цвет, и «полупрозрачным» его сделать нельзя. */
-  --glass-bg:    rgba(255, 255, 255, 0.72);
+  /* Плотность тинта — почти непрозрачная (0.9): при 0.7 карточки под
+     панелью читались сквозь неё, и прокрученный список выглядел «наехавшим»
+     на меню (жалоба с площадки). Размытие остаётся — как мягкий край. */
+  --glass-bg:    rgba(255, 255, 255, 0.9);
   --glass-edge:  rgba(255, 255, 255, 0.66);
   --glass-blur:  saturate(180%) blur(20px);
   --glass-spec:  rgba(255, 255, 255, 0.9);   /* блик по верхней кромке */
@@ -104,13 +107,35 @@
      плавающие элементы отступают от неё через этот токен, а не через числа,
      которые разъезжаются при первой правке панели. */
   --nav-h: 66px;
+  /* Запас под панель снизу — один на каркас, прокрутку к полю и тосты. */
+  --nav-reserve: calc(var(--nav-h) + var(--sp-4) + var(--nav-gap));
+  /* Высота липкой шапки. Точное значение ставит JS (syncTopbarHeight) —
+     шапка растёт с safe-area и крупным шрифтом; здесь фолбэк. */
+  --topbar-h: calc(73px + env(safe-area-inset-top));
 }
+
+/* Прокрутка к элементу (фокус поля, scrollIntoView) учитывает плавающие
+   слои: без запаса поле «докручивалось» ровно под нижнюю панель или под
+   шапку и оставалось закрытым. Клавиатура прячет панель — запас снизу
+   сжимается до зазора. */
+html {
+  scroll-padding-top: var(--topbar-h);
+  scroll-padding-bottom: var(--nav-reserve);
+}
+html.kb-open { scroll-padding-bottom: var(--sp-2); }
 
 /* Тёмная тема Telegram (data-theme выставляет applyTelegramTheme в app.js).
    Базовые поверхности тянутся из var(--tg-theme-*), а семантические цвета
    переопределяем здесь: яркие читаемые foreground'ы + полупрозрачные
    подложки, чтобы бейджи/статусы не «резали глаз» светлыми пятнами. */
 [data-theme="dark"] {
+  /* Базовые поверхности — с ТЁМНЫМ фолбэком. Старые клиенты Telegram не
+     присылают secondary_bg_color, и без этого страница и шапка в тёмной теме
+     оставались светлыми (#f2f2f7), а белый текст темы ложился на них. */
+  --bg-page:     var(--tg-theme-secondary-bg-color, #1c1c1e);
+  --bg-card:     var(--tg-theme-bg-color, #2c2c2e);
+  --text:        var(--tg-theme-text-color, #ffffff);
+  --text-mute:   var(--tg-theme-hint-color, #9e9ea3);
   --bg-soft:     rgba(255, 255, 255, 0.08);
   --divider:     rgba(255, 255, 255, 0.12);
   --sk-highlight: rgba(255, 255, 255, 0.09);  /* на тёмной теме блик светлый, иначе невидим */
@@ -129,7 +154,7 @@
   --neutral-bg:  rgba(255, 255, 255, 0.12);
   /* Стекло на тёмной теме — не инверсия светлого: тинт уходит в холодный
      графит, блик слабее (яркая кромка на тёмном читается как царапина). */
-  --glass-bg:    rgba(28, 30, 36, 0.68);
+  --glass-bg:    rgba(28, 30, 36, 0.92);
   --glass-edge:  rgba(150, 175, 195, 0.20);
   --glass-spec:  rgba(170, 200, 225, 0.28);
 }
@@ -153,7 +178,7 @@
     --warn:       #f5c451;  --warn-strong: #f9b542; --warn-bg: rgba(249, 168, 37, 0.16);
     --info:       #5aa9f0;  --info-bg:    rgba(90, 169, 240, 0.16);
     --neutral:    #c2c2c8;  --neutral-bg: rgba(255, 255, 255, 0.12);
-    --glass-bg:   rgba(28, 30, 36, 0.68);
+    --glass-bg:   rgba(28, 30, 36, 0.92);
     --glass-edge: rgba(150, 175, 195, 0.20);
     --glass-spec: rgba(170, 200, 225, 0.28);
   }
@@ -312,6 +337,11 @@ body {
      видимой области: WebView не знает про нативную шапку, и низ приложения
      уходит за край. Вне Telegram переменной нет и остаётся 100dvh. */
   min-height: var(--tg-viewport, 100dvh);
+  /* …но не выше самого окна. Клиент бывает сообщает высоту БОЛЬШЕ окна
+     WebView (считает область под своей нижней панелью), и каркас становился
+     выше экрана: страница всегда прокручивалась на эту разницу, прокрутка не
+     сбрасывалась в ноль при смене вкладки, и ряд вкладок уезжал под шапку. */
+  min-height: min(var(--tg-viewport, 100dvh), 100dvh);
   /* Запас под плавающее нижнее меню: высота панели + 16px + safe-area.
      Без него последняя строка любого списка (фильтры каталога, график по
      дням) пряталась за панелью. */
@@ -330,6 +360,8 @@ body {
   /* viewport-fit=cover (index.html) обрезает контент под чёлку/Dynamic Island —
      добавляем верхний safe-area inset, чтобы заголовок не уезжал под статус-бар. */
   padding: calc(14px + env(safe-area-inset-top)) 16px 14px;
+  /* Плотный фон ОБЯЗАТЕЛЕН: шапка липкая, и прокрученное содержимое уходит
+     под неё (сторож — e2e test_ui_layout_audit, проверка «header»). */
   background: var(--bg-page);
   border-bottom: 0.5px solid var(--divider);
   transition: box-shadow 0.2s ease;
@@ -583,6 +615,9 @@ body {
 .card {
   padding: 16px var(--sp-4);
 }
+/* Кнопки подряд внутри карточки-формы не стыкуются вплотную («Выбрать
+   позиции» над «Оформить возврат» читались одной плашкой). */
+.c-surface--pad > button:not(:first-child) { margin-top: var(--sp-2); }
 
 /* Строка внутри списочной поверхности. */
 .c-row {
@@ -766,6 +801,16 @@ body {
 @media (prefers-contrast: more) {
   .bottom-nav { background: var(--bg-card); }
   .bottom-nav::before { display: none; }
+}
+/* Клавиатура открыта (html.kb-open ставит syncKeyboard в app.js): панель
+   прячется. В Android WebView окно под клавиатуру сжимается, и `fixed`-панель
+   поднималась вместе с его низом прямо на форму — закрывала переключатель
+   валюты под полем количества и соседние поля. Навигация во время набора не
+   нужна, а место под полем нужно. */
+.kb-open .bottom-nav {
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .nav-item {
@@ -992,7 +1037,7 @@ body.nav-drawer-open { overflow: hidden; }
 .cat-scroll::-webkit-scrollbar { display: none; }
 
 /* ─── Календарь выбора диапазона дат (заказы + аналитика) ──────────── */
-.cal-host { margin: 0 16px 8px; }
+.cal-host { margin: 0 0 8px; }
 .cal {
   background: var(--bg-card);
   border-radius: var(--radius);
@@ -1207,8 +1252,10 @@ body.nav-drawer-open { overflow: hidden; }
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
 }
 
+/* Ряд вариантов переносится, когда подписи не влезают: «В счёт долга /
+   Наличными / Без возврата» на 360px вылезали за край карточки и экрана. */
 .cur-row {
-  display: flex; gap: 8px;
+  display: flex; flex-wrap: wrap; gap: 8px;
 }
 
 /* Выбор значения (валюта / тип возврата) — accent-fill при выборе; единый
@@ -1216,7 +1263,7 @@ body.nav-drawer-open { overflow: hidden; }
    ряд карточками с иконкой, .seg — компактный pill-track навигации. Свести их
    в S4 вместе с пересборкой форм кассы. */
 .cur-btn {
-  flex: 1;
+  flex: 1 1 auto;
   display: inline-flex; align-items: center; justify-content: center; gap: 8px;
   padding: 12px;
   border: none;
@@ -1472,6 +1519,12 @@ body.nav-drawer-open { overflow: hidden; }
   font-size: var(--text-sm); color: var(--text-mute);
 }
 .items-total b { color: var(--text); font-variant-numeric: tabular-nums; }
+/* Итог в узкой строке («Получено 4 000 USD из 24 000 USD · осталось 20 000
+   USD»): сумма справа не рвётся посередине, а при нехватке места уходит на
+   свою строку целиком — иначе две половины переносились навстречу друг другу
+   и читались одной кашей. */
+.items-total { flex-wrap: wrap; }
+.items-total > b { white-space: nowrap; margin-left: auto; }
 .items-empty {
   padding: var(--sp-2) 0; font-size: var(--text-sm); color: var(--text-mute);
 }
@@ -1564,6 +1617,19 @@ body.nav-drawer-open { overflow: hidden; }
   gap: var(--sp-2);
   margin-bottom: var(--sp-3);
 }
+
+/* Выбор клиента: поле поиска не стыкуется с первой карточкой, строка — имя
+   над телефоном (рядом телефон съедал половину длинного названия), без
+   разделителя сверху: каждая строка — отдельная карточка с зазором. */
+.agent-search-wrap { margin-bottom: var(--sp-3); }
+.c-row.agent-row {
+  flex-direction: column; align-items: stretch; justify-content: center;
+  gap: 4px;
+}
+.agent-row .agent-name .ic { --ic-size: 16px; margin-right: 4px; vertical-align: -0.2em; }
+.agent-row .agent-phone { margin-top: 0; }
+.orders-list > .c-row + .c-row,
+.stock-list > .c-row + .c-row { border-top: 0; }
 
 .agent-selected {
   display: flex; justify-content: space-between; align-items: center;
@@ -1696,6 +1762,8 @@ body.nav-drawer-open { overflow: hidden; }
   padding: 12px 0 0;
 }
 
+.kb-open .editor-footer { bottom: var(--nav-gap); }
+
 .editor-hint {
   text-align: center; font-size: 12px;
   color: var(--text-mute); margin-top: 8px;
@@ -1725,7 +1793,7 @@ body.nav-drawer-open { overflow: hidden; }
 /* ─── Ввод количества/цены ───────────────────────────────────── */
 .qty-screen {
   display: flex; flex-direction: column;
-  padding: 16px; gap: 12px;
+  padding: 0; gap: 12px;
 }
 
 .qty-product-name {
@@ -1771,7 +1839,9 @@ body.nav-drawer-open { overflow: hidden; }
 
 /* ─── Экран «Долги» ──────────────────────────────────────────────── */
 .debts-header {
-  padding: 16px; display: flex; flex-direction: column; gap: 8px;
+  /* Боковой отступ даёт .content (UI-BUG-05): свои 16px уводили фильтр и
+     карточки долгов на 32px от края, мимо линии остальных блоков. */
+  padding: 0; display: flex; flex-direction: column; gap: 8px;
 }
 /* Фильтр «Все / К оплате сейчас» — тот же сегмент-язык, что .seg
    (трек-подложка + активный сегмент как приподнятая карточка). */
@@ -1799,7 +1869,7 @@ body.nav-drawer-open { overflow: hidden; }
 .debt-stat-upcoming .debt-stat-num{ color: var(--info); }
 
 .debts-list {
-  padding: 16px; display: flex; flex-direction: column; gap: 8px;
+  padding: 0; display: flex; flex-direction: column; gap: 8px;
 }
 .debt-card {
   padding: 16px var(--sp-4); border-left: 4px solid transparent;
@@ -1839,7 +1909,7 @@ body.nav-drawer-open { overflow: hidden; }
 }
 /* Единый остаток к получению в базовой валюте (объединяет валюты). */
 .money-base-total {
-  margin: 8px 16px 0; padding: 8px 16px;
+  margin: 8px 0 0; padding: 8px 16px;
   border-radius: var(--radius-sm); background: var(--info-bg);
   font-size: 14px; color: var(--text);
 }
@@ -1896,6 +1966,10 @@ body.nav-drawer-open { overflow: hidden; }
   font-size: 14px; font-weight: 600; cursor: pointer;
 }
 .limit-edit { margin-top: 8px; display: grid; gap: 8px; }
+/* Пояснение ПОД кнопками карточки (возврат: «Сначала отметьте приёмку…») —
+   с зазором: вплотную к кнопкам оно читалось их подписью. */
+.debt-actions + .debt-card-mid,
+.debt-actions + .debt-hint { margin: var(--sp-2) 0 0; }
 .limit-edit[hidden] { display: none; }
 .debt-hint {
   text-align: center; font-size: 13px; color: var(--text-mute);
@@ -1915,7 +1989,10 @@ body.nav-drawer-open { overflow: hidden; }
    Единый язык верхнеуровневой навигации (и любых 2–4-позиционных
    переключателей: фильтр долгов, выбор валюты) на всех экранах. */
 .seg {
-  display: flex; gap: 4px; flex: 1; min-width: 0;
+  /* Перенос строк: вкладка не уже подписи (.seg-item), и три длинных варианта
+     («Расписка RU+UZ / Расписка (рус.) / Тилхат (ўзб.)») на 360px переносятся
+     вторым рядом, а не вылезают за карточку. Листающийся ряд — без переноса. */
+  display: flex; flex-wrap: wrap; gap: 4px; flex: 1; min-width: 0;
   background: var(--bg-soft); border-radius: var(--radius); padding: 4px;
 }
 @supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
@@ -1930,7 +2007,11 @@ body.nav-drawer-open { overflow: hidden; }
   .seg { background: var(--bg-soft); border-color: var(--divider); }
 }
 .seg-item {
-  flex: 1; min-width: 0; padding: 12px 8px; min-height: 44px; border: 0;
+  /* Ширина — не меньше подписи (min-width: max-content). Было `min-width: 0`:
+     на трёх вкладках «Подтвердить» с бейджем получала треть ряда, и подпись
+     резалась с обеих сторон («одтвердить»). Равные доли остаются, пока
+     подписи влезают; длинная берёт своё, остальные делят остаток. */
+  flex: 1 1 0; min-width: max-content; padding: 12px 8px; min-height: 44px; border: 0;
   border-radius: var(--radius-sm); background: transparent; color: var(--text-mute);
   font-size: 14px; font-weight: 600; font-family: inherit; cursor: pointer;
   display: inline-flex; align-items: center; justify-content: center; gap: 8px;
@@ -1938,6 +2019,9 @@ body.nav-drawer-open { overflow: hidden; }
   transition: background 0.15s ease, color 0.15s ease;
 }
 .seg-item .ic { --ic-size: 18px; }
+/* Счётчик во вкладке — компактный: у бейджа склада свои поля (12px) и отступ
+   слева, а внутри вкладки зазор уже даёт gap. */
+.seg-item .stock-badge { margin-left: 0; padding: 0 8px; line-height: 20px; }
 .seg-item.active {
   background: var(--bg-card); color: var(--text); box-shadow: var(--shadow-card);
 }
@@ -1948,7 +2032,7 @@ body.nav-drawer-open { overflow: hidden; }
    На 360dp под текст оставалось ~33px, «Всё время» обрезалось с ДВУХ сторон
    и без многоточия (режется центрированный flex-элемент, а не текстовый блок).
    `0 0 auto` даёт ширину по содержимому — тогда скролл начинает работать. */
-.seg--scroll { overflow-x: auto; scrollbar-width: none; justify-content: flex-start; }
+.seg--scroll { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; justify-content: flex-start; }
 .seg--scroll::-webkit-scrollbar { display: none; }
 /* `1 0 auto`, а не `0 0 auto`: базис по содержимому (это и чинило UI-BUG-01 —
    подписи не сплющиваются), но свободное место пункты РАЗБИРАЮТ. Иначе трек
@@ -1960,7 +2044,7 @@ body.nav-drawer-open { overflow: hidden; }
 /* Не больше трёх пунктов в ряд (UI-бриф п.4): четвёртый заведомо выходит за
    край и обрезается — так видно, что ряд листается. Три и меньше растут до
    полной ширины. */
-.seg--scroll .seg-item { flex: 1 0 auto; min-width: 29%; }
+.seg--scroll .seg-item { flex: 1 0 auto; font-size: var(--text-base); }
 
 /* «Период…» — последний пункт сегмента периода, а не кнопка справа от него
    (UI-бриф п.5). Подпись живёт внутри пункта, ширина по содержимому. */
@@ -2023,12 +2107,22 @@ body.nav-drawer-open { overflow: hidden; }
   margin-top: 8px; padding: 8px 16px;
   border: 1px solid var(--divider);
 }
+/* Разбивка «Подтверждено / Ждёт / Останется» — строками «подпись … сумма».
+   Была строкой с переносом: на телефоне «Ждёт: 12 130 USD» и «Останется:
+   0 USD» переносились посреди пары и налезали друг на друга. */
 .debt-breakdown {
-  display: flex; flex-wrap: wrap; gap: 8px;
+  display: flex; flex-direction: column; gap: 4px;
   font-size: 13px; color: var(--text-mute);
   padding: 8px 0; margin-bottom: 8px;
 }
-.debt-breakdown b { color: var(--text); }
+.debt-breakdown > span {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px; min-width: 0;
+}
+.debt-breakdown .ic { --ic-size: 15px; }
+.debt-breakdown b {
+  color: var(--text); margin-left: auto; white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
 
 /* Жёлтая полоска для partial-state */
 
@@ -2259,6 +2353,9 @@ body.page-sheet-open { overflow: hidden; }
   font-size: var(--text-xs);
   color: var(--text-mute);
 }
+/* Подпись под рядом кнопок экрана («Документы»: название компании) — отдельно
+   и от кнопок, и от карточки ниже. */
+.c-actions + .c-field-hint { margin: var(--sp-2) var(--sp-1) var(--sp-3); }
 /* Ошибка внутри формы, а не поверх неё: системный алерт закрывает диалог, и
    при опечатке в одном поле остальные пришлось бы набирать заново. */
 .c-error {
@@ -2471,6 +2568,9 @@ body.page-sheet-open { overflow: hidden; }
   color: var(--text-mute); border-radius: var(--radius-sm);
 }
 .toast-close .ic { --ic-size: 16px; }
+/* Панель спрятана клавиатурой — тост опускается к низу окна, а не висит
+   над пустым местом посреди формы. */
+.kb-open .toast-host { bottom: var(--nav-gap); }
 .toast--success .toast-ic { color: var(--success); }
 .toast--error   .toast-ic { color: var(--danger); }
 .toast--info    .toast-ic { color: var(--info); }

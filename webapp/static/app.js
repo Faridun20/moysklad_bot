@@ -48,7 +48,107 @@ function syncViewport() {
   document.documentElement.style.setProperty('--tg-viewport', `${h}px`);
 }
 syncViewport();
-tg.onEvent && tg.onEvent('viewportChanged', syncViewport);
+
+// ─── Клавиатура ─────────────────────────────────────────────────────
+// Нижняя панель `position: fixed` стоит у низа ОКНА. В Android WebView окно
+// под клавиатуру сжимается, и панель поднималась вместе с ним прямо на форму:
+// на «Количество и цена» она закрывала переключатель USD/UZS под полем, а
+// кнопка «Добавить в заявку» стояла сразу под ней. Пока человек набирает
+// текст, панель прячется (`html.kb-open`, CSS), а поле в фокусе докручивается
+// в видимую часть окна над клавиатурой.
+//
+// Нужны ОБА признака: в фокусе поле ввода И видимая область заметно (>20%)
+// ниже самой высокой при той же ширине. Одного фокуса мало: поиск и
+// количество ставят фокус сами, а программный фокус клавиатуру открывает не
+// везде — панель пропала бы на экране, где клавиатуры нет, и уйти было бы
+// некуда. Одной высоты тоже мало: её меняет и свёрнутая шторка Telegram.
+// Сменилась ширина (поворот) — «самая высокая» считается заново. Где окно под
+// клавиатуру не сжимается (adjustPan), панель и так остаётся под клавиатурой.
+const KB_EDITABLE = 'input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit])'
+  + ':not([type=range]):not([type=file]):not([type=color]):not([type=hidden]), textarea, [contenteditable="true"]';
+let _kbMaxH = 0;
+let _kbWidth = 0;
+let _kbTimer = null;
+function _visibleHeight() {
+  const vv = window.visualViewport;
+  return (vv && vv.height) || window.innerHeight || 0;
+}
+function _typingIn() {
+  const el = document.activeElement;
+  return el && el.matches && el.matches(KB_EDITABLE) && !el.disabled && !el.readOnly ? el : null;
+}
+function syncKeyboard() {
+  const w = window.innerWidth || 0;
+  const h = _visibleHeight();
+  if (w !== _kbWidth) { _kbWidth = w; _kbMaxH = 0; }
+  // «Полную» высоту запоминаем, только пока никто не печатает: иначе первое
+  // же измерение с открытой клавиатурой стало бы высотой без неё.
+  if (!_typingIn()) _kbMaxH = Math.max(_kbMaxH, h);
+  const shrunk = _kbMaxH > 0 && h < _kbMaxH * 0.8;
+  const open = Boolean(_typingIn()) && shrunk;
+  document.documentElement.classList.toggle('kb-open', open);
+  return open;
+}
+// Поле в фокусе — в видимую часть окна: ниже шапки и выше клавиатуры.
+// Формы-оверлеи докручивают свои поля сами (mountPageSheet).
+function revealFocusedField() {
+  const el = _typingIn();
+  if (!el || !el.closest || el.closest('.c-overlay, .price-overlay, .nav-drawer')) return;
+  const r = el.getBoundingClientRect();
+  const vv = window.visualViewport;
+  const off = vv ? vv.offsetTop : 0;
+  const bar = document.querySelector('.topbar');
+  const top = Math.max(off, bar ? bar.getBoundingClientRect().bottom : 0);
+  const bottom = off + _visibleHeight();
+  if (r.top >= top && r.bottom <= bottom - 8) return;
+  try { el.scrollIntoView({ block: 'center' }); } catch (_e) { /* старый WebView */ }
+}
+function _onKeyboardChange() {
+  syncKeyboard();
+  clearTimeout(_kbTimer);
+  // Клавиатура выезжает анимацией ~250 мс: докручиваем, когда окно уже
+  // сжалось, а не в момент фокуса.
+  _kbTimer = setTimeout(() => { syncKeyboard(); revealFocusedField(); }, 300);
+}
+document.addEventListener('focusin', _onKeyboardChange);
+// Фокус переходит между полями через `body` — даём ему доехать до нового поля.
+document.addEventListener('focusout', () => setTimeout(syncKeyboard, 50));
+if (window.visualViewport) window.visualViewport.addEventListener('resize', _onKeyboardChange);
+window.addEventListener('resize', _onKeyboardChange);
+// Один обработчик на событие клиента: и высота каркаса, и клавиатура.
+tg.onEvent && tg.onEvent('viewportChanged', () => { syncViewport(); _onKeyboardChange(); });
+syncKeyboard();
+
+// Высота липкой шапки → `--topbar-h`: по ней прокрутка к полю не прячет его
+// под шапку (`scroll-padding-top` в style.css). Шапка растёт с safe-area и
+// крупным системным шрифтом — число в CSS было бы угадыванием.
+function syncTopbarHeight() {
+  const bar = document.querySelector('.topbar');
+  if (!bar) return;
+  const h = Math.ceil(bar.getBoundingClientRect().height);
+  if (h > 0) document.documentElement.style.setProperty('--topbar-h', `${h}px`);
+}
+syncTopbarHeight();
+if (typeof ResizeObserver !== 'undefined' && document.querySelector('.topbar')) {
+  new ResizeObserver(syncTopbarHeight).observe(document.querySelector('.topbar'));
+}
+
+// ─── Прокрутка при смене экрана ─────────────────────────────────────
+// Экран, вкладка и карточка рисуются в тот же документ, и прокрутка прежнего
+// списка переезжала на новый вид: открыл контейнер из пролистанного списка —
+// верх карточки («Состав сошёлся») сидит под шапкой; переключил «Подтвердить»
+// → «Долги» — фильтр долгов наполовину под шапкой. Новый вид начинается
+// сверху. Вид узнаём по ключу: раздел+вкладка или обработчик «Назад»
+// подэкрана (исходник у перерисовки той же карточки тот же, и обновление после
+// действия не бросает человека в начало). Шторка и формы-оверлеи ставят свою
+// «Назад» поверх экрана — прокрутку под ними не трогаем.
+let _viewKey = '';
+function noteView(key) {
+  if (_navDrawer || document.querySelector('.c-overlay, .price-overlay')) return;
+  if (key === _viewKey) return;
+  _viewKey = key;
+  try { window.scrollTo(0, 0); } catch (_e) { /* jsdom: scrollTo не реализован */ }
+}
 
 // Клавиатурная активация tap-строк: строки-карточки — это div role="button"
 // tabindex="0" (не нативные кнопки, чтобы не ломать вёрстку), поэтому Enter/Space
@@ -722,11 +822,14 @@ function keepRowScroll(root) {
     if (_rowScrollMemo.has(key)) sc.scrollLeft = _rowScrollMemo.get(key);
     const active = sc.querySelector('.active, [aria-pressed="true"]');
     if (active && sc.scrollWidth > sc.clientWidth) {
+      // Докручиваем НА МИНИМУМ, с запасом под затенение края (.scroll-hint,
+      // 24px): центрирование уводило соседей за край, и подпись первой
+      // вкладки читалась обрезанной («одтвердить»).
+      const EDGE = 32;
       const a = active.getBoundingClientRect();
       const b = sc.getBoundingClientRect();
-      if (a.left < b.left || a.right > b.right) {
-        sc.scrollLeft += (a.left + a.width / 2) - (b.left + b.width / 2);
-      }
+      if (a.left < b.left + EDGE) sc.scrollLeft -= (b.left + EDGE) - a.left;
+      else if (a.right > b.right - EDGE) sc.scrollLeft += a.right - (b.right - EDGE);
     }
     sc.addEventListener('scroll', () => _rowScrollMemo.set(key, sc.scrollLeft), { passive: true });
   });
@@ -757,6 +860,10 @@ function setSectionTab(section, tab) {
   else if (section === 'stock') stockTab = tab;
   else if (section === 'money') moneyTab = tab;
   else if (section === 'clients') clientsTab = tab;
+  noteView(`screen:${section}:${tab}`);
+}
+function sectionTabOf(section) {
+  return { sales: salesTab, stock: stockTab, money: moneyTab, clients: clientsTab }[section] || '';
 }
 
 function role() { return (currentUser && currentUser.role) || 'guest'; }
@@ -3278,6 +3385,7 @@ function showBack(handler) {
     tg.BackButton.onClick(handler);
     tg.BackButton.show();
   } catch {}
+  noteView(`sub:${String(handler)}`);
 }
 function hideBack() {
   try {
@@ -3285,6 +3393,7 @@ function hideBack() {
     _backHandler = null;
     tg.BackButton.hide();
   } catch {}
+  noteView(`screen:${currentScreen}:${sectionTabOf(currentScreen)}`);
 }
 
 // ─── Очистка зависшей MainButton ────────────────────
@@ -6138,11 +6247,9 @@ async function renderMoneyScreen() {
   content.innerHTML = sectionNavHtml(tabs, moneyTab) + '<div id="money-body"></div>';
   wireSectionNav(content, 'money', renderMoneyScreen);
 
-  // Активную вкладку подтягиваем в зону видимости, если ряд скроллится.
-  const activeSeg = content.querySelector('.seg-item.active');
-  if (activeSeg && activeSeg.scrollIntoView) {
-    try { activeSeg.scrollIntoView({ inline: 'center', block: 'nearest' }); } catch (e) { /* старый WebView */ }
-  }
+  // Активную вкладку в зону видимости подтягивает keepRowScroll (общий для
+  // всех рядов). Здесь стоял scrollIntoView({ inline: 'center' }): он двигал
+  // и саму страницу, и ряд — «Подтвердить» уезжала за левый край («одтвердить»).
 
   // Бейдж ожидающих подтверждений — освежаем АСИНХРОННО, чтобы зависший запрос
   // не блокировал появление вкладок. На самой вкладке «Подтвердить» отдельного
