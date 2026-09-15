@@ -91,11 +91,44 @@ Variable: новые сервисы (cron'ы) переменную не насл
     `test_alter_script_is_not_wired_into_startup`. Хвост до T1.1 у него под
     отдельным `--legacy`: там колонки-призраки, вычищенные в T1.2.
   Data-миграции и сидинг настроек — в `run_backfills()`, вызывается из
-  `tasks/migrate.py`.
+  `tasks/migrate.py` — а он идёт на КАЖДОМ `docker compose up`. Поэтому разовые
+  миграции (`ONE_TIME_BACKFILLS`) выполняются один раз на базу — отметка
+  `backfill_done:<имя>` в `app_settings`, повтор только явно:
+  `python -m tasks.migrate --rerun-backfill <имя>|all`. Каждый старт гоняется
+  лишь сидинг, который вставляет отсутствующее. Новую data-миграцию, которая
+  МЕНЯЕТ строки (особенно деньги), — только в `ONE_TIME_BACKFILLS` или в `scripts/`.
 - Webapp endpoint'ы: `services.async_db as adb` (`await adb.get_user(uid)`) — обёртка через `asyncio.to_thread`. В bot handlers — то же или явный `asyncio.to_thread`.
 - Роль читай через `services.roles.cached_role(user_id)` (TTL 30s, одна запись кэша с флагом деактивации — один SELECT на оба факта) и предикаты `is_boss / can_create_orders / ...`. НЕ через `services.database.get_role` напрямую — обойдёшь кэш. **Деактивация:** `get_role` отдаёт `guest` если `user_roles.deactivated_at` стоит → деактивированный теряет ВСЕ права. `deactivate_user/reactivate_user` (адмін, `/deactivate`/`/reactivate` + webapp `/api/users/deactivate`).
 - **Временно: менеджер = + кладовщик + бухгалтер** (решение владельца: отдельных сотрудников пока нет, босс проверяет работу). Совмещение — одна таблица `services.roles.ROLE_ALSO_ACTS_AS` (зеркало `ROLE_ALSO_ACTS_AS` в `helpers.js`, сверяет `tests/test_roles_manager_acts_as.py`), а НЕ правка кортежей `allowed_roles`. Поэтому сверка «роль ∈ разрешённых» — только через `role_allowed` (`_authorize`, `_has_role`, `can_transition`, очередь «Сегодня», ops-пинг) и `roleIn` во фронте; голый `role in (...)` с `warehouse_keeper`/`bookkeeper` обойдёт совмещение. Admin/boss-only права (себестоимость, прибыль, одобрение, подтверждение возврата) оно не даёт. Карточки «подтвердить сдачу/возврат» менеджер получает, только если активного носителя роли нет (`notify_recipients`). `/addrole` роли из `PAUSED_ROLES` не назначает; уже назначенные работают. **Откат** — очистить `ROLE_ALSO_ACTS_AS` (в обоих местах) и `PAUSED_ROLES`.
 - Race-чувствительные операции (`mark_order_paid`, `confirm_payment`, `confirm_cash_deposit`) используют `SELECT ... FOR UPDATE` / advisory-lock — сохраняй паттерн.
+- **«Заявлено по заказу» — ОДИН замок: строки заказов** (`services.debts.lock_orders`,
+  по возрастанию id). Любая операция, которая меняет, сколько по заказу заявлено
+  или зачтено (отметка оплаты, «Получил деньги», сдача и её подтверждение,
+  подтверждение/сторно платежа, подтверждение возврата, автоплатёж одобрения),
+  берёт его ДО `calc_claimable_cents`/`calc_order_balances` в той же транзакции.
+  Свой advisory-lock у пути не годится: сдача сериализовалась «по менеджеру»,
+  отметка оплаты — строкой заказа, разные замки друг друга не ждали, и одни
+  деньги заявлялись дважды. Порядок замков — «заказ → платёж/строки склада»;
+  отгрузка и отмена — advisory `ship:order` → строка заказа → склад.
+- **Переход + его последствия — одной транзакцией.** Подтверждение платежа
+  закрывает заказ в своей транзакции (`_close_order_if_covered_locked`),
+  отмена заказа возвращает остаток в своей (`database.cancel_order` →
+  `order_shipment.cancel_shipment_locked`; отказ склада — отказ отмены),
+  возврат на доработку переводит заказ И заявку вместе
+  (`reject_order_to_draft(..., req_id=)`), поступление по рассрочке закрывает
+  сделку в своей (`machines._set_deal_closed_locked`). После коммита — только
+  аудит и уведомления. Правка черновика перепроверяет `draft` в транзакции
+  записи (`require_draft=True` у `add_order_item`/`remove_order_item`/
+  `update_order_agent`/`update_order_currency`).
+- **Тяжёлые списки — страницей в SQL.** `/api/orders` с `limit` читает
+  `database.get_orders_page` (фильтры, LIMIT/OFFSET, total, pending_count —
+  SQL; `_paginate_orders` — эталон семантики для тестов). Итоги продаж —
+  агрегатами (`warehouse.sales_stats`, `shipment_counts_by_day`), а не по
+  `list_shipments` (он обрезан). `IN (...)` по произвольному числу id — только
+  пачками (`_IN_CHUNK`): у asyncpg предел 32 767 параметров. Период по
+  `orders.created_at` пиши диапазоном по самой колонке, платежи за период —
+  `status = 'confirmed' AND COALESCE(confirmed_at, created_at) …`: это формы
+  индексов.
 
 **LIKE-поиск по кириллице — только через `lower()`, и он переопределён В ОБОИХ
 слоях.** Встроенный SQLite `LOWER()` ASCII-only («Иванов» так и остаётся
@@ -319,9 +352,11 @@ tg_file_id — нет). VIN нормализуется (upper, без пробе
 Переплата уходит в следующие месяцы, недоплата оставляет платёж покрытым
 частично (`covered_cents`). `paid_at` в графике остаётся ПРОИЗВОДНОЙ отметкой —
 на неё опираются напоминания и дебиторка, и переписывать их незачем; пересчёт
-делает `_sync_schedule_state`. Удаление поступления, которым сделка была
-закрыта, ОТКРЫВАЕТ её обратно (`_reopen_deal`): иначе долг исчезает из
-напоминаний, хотя денег нет. Кнопка «оплачен» — обёртка над поступлением на
+делает `_sync_schedule_state`. Закрытие сделки последним поступлением и
+переоткрытие при удалении поступления — В ТОЙ ЖЕ транзакции под `_lock_deal`
+(`_set_deal_closed_locked`): отдельным шагом после коммита сбой оставлял
+покрытую сделку открытой, а удаление между коммитом и закрытием давало
+закрытую сделку без денег. Кнопка «оплачен» — обёртка над поступлением на
 плановую сумму.
 
 **Приёмка контейнера (`services/container_receipt.py`).** Приход — обычная
@@ -621,6 +656,13 @@ SHA одинаково, поэтому `webapp/server.py` больше не сч
 - В SQL **не** сравнивай `confirmed_at`/`created_at` (local TZ string) с `datetime('now',...)` SQLite (UTC) или `NOW()` Postgres — лекс-сравнение в разных TZ молча всегда False (silent bug). Вычисляй порог в Python через `datetime.now() - timedelta(...)` и передавай параметром. Пример — `services/database.reset_stale_in_progress_payments`.
 
 **Idempotency:** `/api/orders/{confirm_payment,mark_paid,reject_payment}` принимают `idempotency_key` через `_idem_get/_idem_set`. ВАЖНО: всегда вызывай `_idem_set` ПОСЛЕ успеха (был баг — `reject_payment` делал только `_idem_get` → ретрай слал дубль-уведомление). Применяй паттерн для новых write-endpoint'ов.
+Денежные create-ручки (`mark_paid`, сдача, возврат) — `_Idem(..., atomic=True)`:
+операция пишет результат в ключ СВОЕЙ транзакцией (`database.idem_store_in`,
+ей передаётся `idem.key`), поэтому ключ без результата старше
+`IDEM_RECLAIM_AFTER_S` значит «не закоммитилось» и переиспользуется. У
+неатомарных ручек пустой ключ может скрывать проведённую операцию — там
+только 409. Проверки между `claim()` и операцией — внутри
+`async with idem.released_on_reject():`, иначе 4xx держит ключ сутки.
 
 **Logging:**
 - НЕ дёргай root logger (`logging.warning(...)`/`logging.info(...)`) на module-import time. Первый же вызов авто-триггерит `basicConfig(level=WARNING)` с дефолт-форматтером, и любой последующий `logging.basicConfig(level=INFO, ...)` в bot.py/tasks/run_*.py становится no-op → ВСЕ INFO глушатся на проде. Используй `logger = logging.getLogger(__name__)` — propagation идёт через `lastResort`, root остаётся чист.
@@ -941,7 +983,7 @@ app.js).** `api()`/`apiResult()` — тонкие обёртки над `createN
 поле суммы — `type="text" inputmode="decimal"`: `type=number` отдаёт пустую
 строку на «1 500». `formatMoney` показывает копейки, когда они есть (UZS —
 всегда целым). `/api/orders` с `limit` отдаёт страницу (`statuses`,
-`date_from`/`date_to` применяются ДО нарезки; `pending_count` — по всем
-заказам роли); без `limit` — прежний ответ целиком.
+`date_from`/`date_to` применяются ДО нарезки, всё в SQL — `get_orders_page`;
+`pending_count` — по всем заказам роли); без `limit` — прежний ответ целиком.
 
 **Фронт (Vitest):** чистые хелперы `webapp/static/helpers.js` + jsdom-смоук загрузки `app.js` — в `webapp/static/__tests__/`. Гоняет CI (`npm test`). Локально Node нет → `scripts/setup-node.ps1` ставит portable Node в `.tools/node` (gitignore, ~35MB zip с nodejs.org, без admin), `scripts/test-js.ps1` делает `npm install` (1×) + `vitest run`. Скрипты — UTF-8 **с BOM** (иначе PowerShell 5.1 читает их как ANSI и кириллица в Write-Host превращается в кракозябры).
