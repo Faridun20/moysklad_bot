@@ -88,15 +88,16 @@ def test_manager_opens_menu_and_goes_to_stock_invoices(open_app, e2e):
 def test_boss_reaches_section_outside_the_bar(open_app, e2e):
     boss = open_app(e2e.ids["boss"])
     _open_menu(boss)
-    assert boss.locator("#nav-drawer .nav-link--section").count() == 5
+    # Руководство: семь разделов, в панели — «Сегодня · Решения · Деньги · Продажи».
+    assert boss.locator("#nav-drawer .nav-link--section").count() == 7
     boss.click('#nav-drawer .nav-link[data-screen="clients"][data-tab="limits"]')
     boss.wait_for_selector('.seg-item.active[data-sect="limits"]')
     # «Клиентов» в панели нет — подсвечена «Меню», чтобы было видно, где ты.
     assert boss.locator('#bottom-nav [data-action="menu"].active').count() == 1
     assert boss.locator("#bottom-nav .nav-item[data-screen].active").count() == 0
     # Ряд вкладок раздела на месте и работает как раньше.
-    boss.click('.seg-item[data-sect="list"]')
-    boss.wait_for_selector('.seg-item.active[data-sect="list"]')
+    boss.click('.seg-item[data-sect="funnel"]')
+    boss.wait_for_selector('.seg-item.active[data-sect="funnel"]')
 
 
 def test_drawer_closes_by_scrim_escape_back_and_swipe(open_app, e2e):

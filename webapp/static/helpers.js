@@ -103,6 +103,13 @@
   const NAV_SECTIONS = [
     { key: 'today',   label: 'Сегодня',  icon: 'home',
       roles: ['admin', 'boss', 'manager', 'warehouse_keeper', 'bookkeeper'] },
+    // «Решения» — всё, что ждёт слова руководителя, в одном месте с общим
+    // бейджем: заявки, оплаты картой/перечислением, сдачи, возвраты (и что
+    // допишут провайдерами — DECISION_GROUPS в app.js). Менеджеру не рисуем:
+    // /api/orders/requests ему отвечает 403, а его подтверждения — «Деньги →
+    // Подтвердить», как и раньше.
+    { key: 'decisions', label: 'Решения', icon: 'decide',
+      roles: ['admin', 'boss'] },
     { key: 'sales',   label: 'Продажи',  icon: 'cart',
       roles: ['admin', 'boss', 'manager', 'warehouse_keeper', 'bookkeeper'] },
     { key: 'stock',   label: 'Склад',    icon: 'box',
@@ -111,10 +118,27 @@
       roles: ['admin', 'boss', 'manager', 'warehouse_keeper', 'bookkeeper'] },
     { key: 'clients', label: 'Клиенты',  icon: 'user',
       roles: ['admin', 'boss', 'manager'] },
+    // Реквизиты компании, курсы, выключатель «Рабочие действия». Только в
+    // «Меню»: в панель не попадает (последний в порядке руководителя).
+    { key: 'settings', label: 'Настройки', icon: 'settings',
+      roles: ['admin', 'boss'] },
   ];
 
+  // Руководитель смотрит, решает и контролирует (решение владельца), поэтому
+  // его панель — «Сегодня · Решения · Деньги · Продажи · Меню», а склад,
+  // клиенты и настройки — через «Меню». Порядок остальных ролей — порядок
+  // таблицы: их интерфейс не менялся.
+  const BOSS_ROLES = ['admin', 'boss'];
+  const BOSS_NAV_ORDER = ['today', 'decisions', 'money', 'sales', 'stock', 'clients', 'settings'];
+
+  function isBossLike(role) {
+    return BOSS_ROLES.indexOf(role) !== -1;
+  }
+
   function navSections(role) {
-    return NAV_SECTIONS.filter((s) => s.roles.indexOf(role) !== -1);
+    const list = NAV_SECTIONS.filter((s) => s.roles.indexOf(role) !== -1);
+    if (!isBossLike(role)) return list;
+    return list.slice().sort((a, b) => BOSS_NAV_ORDER.indexOf(a.key) - BOSS_NAV_ORDER.indexOf(b.key));
   }
 
   // Экран по умолчанию для роли: первый доступный ей раздел. У кладовщика нет
@@ -123,6 +147,27 @@
   function defaultSection(role) {
     const list = navSections(role);
     return list.length ? list[0].key : null;
+  }
+
+  // ─── «Рабочие действия» руководителя ──────────────────────────────────────
+  // Работа менеджера (накладные, отгрузка, касса, документы, лиды, канал,
+  // моточасы, приёмка контейнера…) у руководителя спрятана за выключателем в
+  // «Меню» — на экстренный день, когда менеджер заболел. Выключатель — личная
+  // настройка ВИДА (`/api/me → prefs.work_actions`, хранит сервер), а не права:
+  // ручки пускают руководителя туда же, куда и раньше. У остальных ролей
+  // выключателя нет, и их кнопки видны всегда — интерфейс не менялся.
+  function workActionsOn(role, prefs) {
+    if (!isBossLike(role)) return true;
+    return !!(prefs && prefs.work_actions);
+  }
+
+  // Удаление (техника, товары, накладные) — контроль, а не работа: у
+  // руководителя видно всегда, за выключатель не прячется. Менеджеру — пока
+  // настройка `delete_requires_boss` (app_settings, по умолчанию выкл.) не
+  // включена. Права при этом режет сервер; поля нет — считаем выключенной.
+  function deleteActionsOn(role, flags) {
+    if (isBossLike(role)) return true;
+    return !(flags && flags.delete_requires_boss);
   }
 
   // Продажи: заказы и отчёт по ним. Каталог отсюда уехал на «Склад» — как
@@ -150,7 +195,9 @@
     // вкладка, а не кнопка между табами и поиском. «Залежалось» стало фильтром
     // каталога (только руководству — ручка /api/channel/stale отвечает
     // admin/boss): это срез того же списка товаров, а не другой экран.
-    if (f.canSeeGoods) tabs.push({ key: 'invoices', label: 'Накладные' });
+    // `canInvoices: false` — руководитель без «Рабочих действий»: накладные —
+    // работа склада.
+    if (f.canSeeGoods && f.canInvoices !== false) tabs.push({ key: 'invoices', label: 'Накладные' });
     return tabs;
   }
 
@@ -179,14 +226,62 @@
     // и у менеджера это была вкладка, которая гарантированно возвращала 403.
     // Первой она стояла потому, что раздел рисовали под босса; менеджер
     // открывал «Клиенты» и видел ошибку вместо своих лидов.
+    //
+    // `work: false` — руководитель без «Рабочих действий»: лиды и звонки,
+    // канал — работа менеджера; воронка и лимиты — контроль, остаются.
+    const work = f.work !== false;
     const tabs = [];
     if (f.isBoss) tabs.push({ key: 'funnel', label: 'Воронка' });
-    tabs.push({ key: 'list', label: 'Лиды' });
+    if (!f.isBoss || work) tabs.push({ key: 'list', label: 'Лиды' });
     if (f.isBoss) {
       tabs.push({ key: 'limits', label: 'Лимиты' });
-      tabs.push({ key: 'channel', label: 'Канал' });
+      if (work) tabs.push({ key: 'channel', label: 'Канал' });
     }
     return tabs;
+  }
+
+  // Вкладки раздела под роль — одна таблица на панель, шторку и ряд .seg
+  // (app.js sectionTabsFor). opts.work — «Рабочие действия» (workActionsOn);
+  // у ролей, кроме руководства, не влияет ни на что.
+  function roleSectionTabs(section, role, opts) {
+    const o = opts || {};
+    const boss = isBossLike(role);
+    const work = boss ? !!o.work : true;
+    const working = ['admin', 'boss', 'manager'].indexOf(role) !== -1;
+    if (section === 'sales') {
+      return salesTabs({ canSeeReport: working, canDocs: working && work });
+    }
+    if (section === 'stock') {
+      return stockTabs({ canSeeGoods: working, canInvoices: working && work });
+    }
+    if (section === 'money') {
+      return moneyTabs({
+        isBoss: boss,
+        // У руководства подтверждения — в «Решениях», не второй дверью здесь.
+        isConfirmer: !boss && roleIn(role, ['admin', 'boss', 'bookkeeper', 'warehouse_keeper']),
+        canSeeDebts: working,
+        // Касса — сдачи наличных, их создают менеджеры: /api/deposits/my и
+        // /create кладовщику не отвечают, и вкладка у него возвращала 403.
+        hasOps: working && work,
+      });
+    }
+    if (section === 'clients') return clientsTabs({ isBoss: boss, work });
+    return [];
+  }
+
+  // Куда на самом деле ведёт адрес. Руководителю «Деньги → Подтвердить» и
+  // «Заявки» больше не отдельные места — они в «Решениях»; старые ссылки из
+  // бота и пушей (`money:confirm`, `requests`) приводим туда. Остальным
+  // «Решения» недоступны — ведём в их прежнее место подтверждений.
+  function resolveScreen(role, screen, tab) {
+    const boss = isBossLike(role);
+    if (boss && (screen === 'requests' || (screen === 'money' && tab === 'confirm'))) {
+      return { screen: 'decisions', tab: '' };
+    }
+    if (!boss && (screen === 'decisions' || screen === 'settings')) {
+      return { screen: 'money', tab: 'confirm' };
+    }
+    return { screen, tab: tab || '' };
   }
 
   // Под-навигация раздела — ОДИН вид на все пять разделов. Раньше «Заказы»
@@ -256,11 +351,14 @@
     const group = (g) => {
       const tabs = (g.tabs || []).length >= 2 ? g.tabs : [];
       const here = g.key === current.screen;
+      // Бейдж раздела без вкладок («Решения»: сколько ждёт) — рядом с подписью.
+      const headBadge = g.badge
+        ? `<span class="stock-badge badge-yellow">${escapeHtml(String(g.badge))}</span>` : '';
       const head = link({
         cls: 'nav-link--section' + (here && tabs.length ? ' is-within' : ''),
         on: here && !tabs.length,
         screen: g.key,
-        inner: `${icon(g.icon)}<span class="nav-link-label">${escapeHtml(g.label)}</span>`,
+        inner: `${icon(g.icon)}<span class="nav-link-label">${escapeHtml(g.label)}</span>${headBadge}`,
       });
       const sub = tabs.map((t) => {
         const badge = t.badge
@@ -277,12 +375,31 @@
     };
     const subtitle = opts.subtitle
       ? `<div class="nav-drawer-sub">${escapeHtml(opts.subtitle)}</div>` : '';
+    // Выключатель «Рабочие действия» (только руководству): под деревом, в
+    // той же прокрутке — он про то, ЧТО показывать в разделах выше.
+    const foot = opts.workSwitch ? workSwitchHtml(!!opts.workSwitch.on, 'nav-switch') : '';
     return '<div class="nav-drawer-head">' +
       `<div><div class="nav-drawer-title" id="nav-drawer-title">Меню</div>${subtitle}</div>` +
       `<button type="button" class="nav-drawer-close" data-drawer-close aria-label="Закрыть меню">${icon('close')}</button>` +
       '</div>' +
       '<nav class="nav-drawer-body" aria-label="Разделы и вкладки">' +
-      `<ul class="nav-tree">${groups.map(group).join('')}</ul></nav>`;
+      `<ul class="nav-tree">${groups.map(group).join('')}</ul>${foot}</nav>`;
+  }
+
+  // Выключатель «Рабочие действия»: кнопка role="switch" — состояние читается
+  // и скринридером (aria-checked), и глазами: подпись под названием говорит,
+  // что именно сейчас видно, а не только положение бегунка (на солнце цвет
+  // теряется первым). Одна разметка на шторку и экран «Настройки».
+  function workSwitchHtml(on, extraClass) {
+    const hint = on
+      ? 'Включено: видны кнопки менеджера — накладные, отгрузка, касса, лиды'
+      : 'Выключено: только решения и контроль. Включите, если менеджера нет';
+    const cls = extraClass ? ` ${String(extraClass).replace(/[^a-z0-9 _-]/g, '')}` : '';
+    return `<button type="button" class="work-switch${cls}" role="switch" aria-checked="${on ? 'true' : 'false'}" data-work-switch>` +
+      `<span class="work-switch-text"><span class="work-switch-title">Рабочие действия</span>` +
+      `<span class="work-switch-hint">${escapeHtml(hint)}</span></span>` +
+      '<span class="work-switch-track" aria-hidden="true"><span class="work-switch-thumb"></span></span>' +
+      '</button>';
   }
 
   // Рендер блока «Итоги» раздела «Деньги» (данные /api/money/summary):
@@ -952,6 +1069,7 @@
     NAV_SECTIONS, navSections, defaultSection, sectionNavHtml,
     NAV_BAR_MAX, navBarLayout, navDrawerHtml,
     salesTabs, stockTabs, moneyTabs, clientsTabs,
+    BOSS_NAV_ORDER, isBossLike, workActionsOn, deleteActionsOn, roleSectionTabs, resolveScreen, workSwitchHtml,
     periodSegHtml, rangeLabel, formatMoney,
     emptyState, skeleton, errorBoxHtml,
     machineStatusLabel, machineSubtitle, machineStatusSegHtml,

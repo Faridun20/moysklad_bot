@@ -10,8 +10,14 @@ invariants.py`): склад сходится с накладными, деньг
 
 from __future__ import annotations
 
-from tests.e2e.conftest import go, pay_form, settled, tab
+from tests.e2e.conftest import go, pay_form, settled, tab, open_confirmations
 from tests.scenarios import invariants
+
+import pytest
+
+# Руководитель здесь делает работу менеджера — с «Рабочими действиями»
+# (conftest.boss_work_actions). Вид по умолчанию — test_boss_ui.py.
+pytestmark = pytest.mark.usefixtures("boss_work_actions")
 
 
 def _invariants(e2e) -> None:
@@ -99,13 +105,14 @@ def test_credit_day_from_order_to_closed_debt(open_app, e2e):
     mgr.wait_for_selector(".toast:has-text('Сдача #')")
     dep = e2e.rows("SELECT id FROM cash_deposits")[0]["id"]
 
-    tab(boss, "confirm")
+    open_confirmations(boss)
     boss.wait_for_selector(f'.debt-card[data-dep="{dep}"] .dep-confirm')
     boss.click(f'.debt-card[data-dep="{dep}"] .dep-confirm')
     boss.wait_for_selector(".toast:has-text('Сдача подтверждена')")
 
     order = e2e.rows("SELECT status, payment_confirmed FROM orders WHERE id = ?", (oid,))[0]
     assert order == {"status": "paid", "payment_confirmed": 1}
+    go(boss, "money")
     tab(boss, "debts")
     settled(boss)
     assert boss.locator(f".debt-card:has-text('#{oid}')").count() == 0

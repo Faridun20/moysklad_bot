@@ -207,7 +207,7 @@ describe('техника: формы', () => {
   // `responses` — очередь ответов apiResult по порядку вызовов.
   const boot7 = (role, responses) => {
     const window = boot(`
-      currentUser = { role: '${role}' };
+      currentUser = { role: '${role}', prefs: { work_actions: true } };
       tg.showConfirm = (text, cb) => { window.__confirmed = text; cb(true); };
       tg.showAlert = (text) => { window.__alerted = text; };
       window.__writes = [];
@@ -335,7 +335,7 @@ describe('техника: формы', () => {
     // По графику решают, звонить ли клиенту — прятать его за ещё одним тапом
     // значит не показывать вовсе.
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       api = async () => (${JSON.stringify({
         ...CARD,
         machine: { ...CARD.machine, status: 'on_credit' },
@@ -384,7 +384,7 @@ describe('техника: формы', () => {
 
   it('отметка платежа уходит с новым состоянием', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       window.__writes = [];
       tg.showAlert = (t) => { window.__alerted = t; };
       api = async () => (${JSON.stringify({
@@ -412,7 +412,7 @@ describe('техника: формы', () => {
 
   it('у машины со сделкой кнопки удаления нет', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       api = async () => (${JSON.stringify({
         ...CARD,
         deals: [{ id: 1, kind: 'sale', price_cents: 100, sold_at: '2026-01-01', buyer_name: 'A' }],
@@ -716,7 +716,7 @@ describe('контейнеры', () => {
 
   it('расхождение видно в списке — открывать каждый контейнер не нужно', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       api = async () => (${JSON.stringify(LIST)});
       stockTab = 'containers';
       window.__ready = renderStockScreen();
@@ -733,7 +733,7 @@ describe('контейнеры', () => {
 
   it('не сверенный прибывший контейнер так и подписан', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       api = async () => (${JSON.stringify({
         ...LIST,
         containers: [{ id: 5, number: 'X', status: 'arrived', arrived_at: '2026-08-12',
@@ -748,7 +748,7 @@ describe('контейнеры', () => {
 
   it('в карточке прибывшего есть поля факта и итог сверки', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       api = async () => (${JSON.stringify(CARD())});
       window.__ready = renderContainerCard(3);
     `);
@@ -763,7 +763,7 @@ describe('контейнеры', () => {
 
   it('пока контейнер в пути, полей факта нет — заполнять их нечем', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       api = async () => (${JSON.stringify(CARD({
         container: { id: 4, number: 'TCLU7654321', status: 'in_transit', eta_date: '2026-09-01' },
         items: [{ id: 12, name: 'Кабель', unit: 'шт', expected_qty: 500, arrived_qty: null,
@@ -785,7 +785,7 @@ describe('контейнеры', () => {
   it('сверка уходит одним запросом на весь состав', async () => {
     // Приёмщик считает подряд и не должен ждать сети после каждой позиции.
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       window.__writes = [];
       api = async () => (${JSON.stringify(CARD({ items: LINKED() }))});
       apiResult = async (path, body) => { window.__writes.push([path, body]); return { ok: true, status: 200, body: { ok: true }, error: '' }; };
@@ -899,7 +899,7 @@ describe('контейнеры', () => {
     // Приёмку могли завести не на тот контейнер — запрет означал бы вечную
     // неверную строку в списке.
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       api = async () => (${JSON.stringify(CARD())});
       window.__ready = renderContainerCard(3);
     `);
@@ -910,7 +910,7 @@ describe('контейнеры', () => {
   it('после закрытия окна карточка только читается', async () => {
     const closed = { ...CARD(), edit_window: { open: false, hours_left: 0 } };
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       api = async () => (${JSON.stringify({ ...CARD(), edit_window: { open: false, hours_left: 0 } })});
       window.__ready = renderContainerCard(3);
     `);
@@ -1011,7 +1011,7 @@ describe('деньги: рассрочки в долгах и карточка �
 
   it('блок рассрочек виден и красится по ближайшему платежу', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       api = async () => (${JSON.stringify(DEBTS)});
       window.__ready = renderDebts(document.getElementById('content'));
     `);
@@ -1025,7 +1025,7 @@ describe('деньги: рассрочки в долгах и карточка �
 
   it('итог «нам должны» разложен по источникам', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       api = async () => (${JSON.stringify(DEBTS)});
       window.__ready = renderDebts(document.getElementById('content'));
     `);
@@ -1066,7 +1066,7 @@ describe('деньги: рассрочки в долгах и карточка �
       }],
     };
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       api = async () => (${JSON.stringify(CARD)});
       window.__ready = renderBuyerCard('Иванов П.');
     `);
@@ -1107,7 +1107,7 @@ describe('рассрочка: частичные поступления', () => 
     ...over,
   });
   const boot7 = (card) => boot(`
-    currentUser = { role: 'boss' };
+    currentUser = { role: 'boss', prefs: { work_actions: true } };
     tg.showConfirm = (t, cb) => cb(true);
     window.__writes = [];
     api = async () => (${JSON.stringify(card)});
@@ -1307,7 +1307,7 @@ describe('техника: «Прибыла»', () => {
     ...over,
   });
   const bootCard = (role, card) => boot(`
-    currentUser = { role: '${role}' };
+    currentUser = { role: '${role}', prefs: { work_actions: true } };
     window.__writes = [];
     api = async () => (${JSON.stringify(card)});
     apiResult = async (path, body) => { window.__writes.push([path, body]); return { ok: true, status: 200, body: { ok: true }, error: '' }; };
@@ -1355,16 +1355,37 @@ describe('пять разделов вместо четырёх', () => {
     window.document.querySelectorAll('#bottom-nav .nav-item[data-screen]')
   ).map(b => b.dataset.screen);
 
-  it('нижняя панель строится под роль: четыре раздела и «Меню» со всеми пятью', () => {
+  it('нижняя панель строится под роль: четыре раздела и «Меню» со всеми остальными', () => {
     // Пятый раздел ушёл из панели в шторку — пятый слот занимает «Меню»
     // (см. navBarLayout): вкладки и будущие разделы растут там, а не в ряду.
-    const window = boot("currentUser = { role: 'boss' }; buildNav(); openNavDrawer();");
+    const window = boot("currentUser = { role: 'manager' }; buildNav(); openNavDrawer();");
     expect(nav(window)).toEqual(['today', 'sales', 'stock', 'money']);
     expect(window.document.querySelector('#bottom-nav [data-action="menu"]')).not.toBeNull();
     const drawer = Array.from(
       window.document.querySelectorAll('#nav-drawer .nav-link--section'),
     ).map(b => b.dataset.screen);
     expect(drawer).toEqual(['today', 'sales', 'stock', 'money', 'clients']);
+    // Выключатель «Рабочие действия» менеджеру не рисуется.
+    expect(window.document.querySelector('#nav-drawer [data-work-switch]')).toBeNull();
+  });
+
+  it('руководитель: «Сегодня · Решения · Деньги · Продажи · Меню», остальное — в шторке', () => {
+    const window = boot("currentUser = { role: 'boss' }; buildNav(); openNavDrawer();");
+    expect(nav(window)).toEqual(['today', 'decisions', 'money', 'sales']);
+    const drawer = Array.from(
+      window.document.querySelectorAll('#nav-drawer .nav-link--section'),
+    ).map(b => b.dataset.screen);
+    expect(drawer).toEqual(['today', 'decisions', 'money', 'sales', 'stock', 'clients', 'settings']);
+    const tabsOf = (sec) => Array.from(
+      window.document.querySelectorAll(`#nav-drawer .nav-link--tab[data-screen="${sec}"]`),
+    ).map(b => b.dataset.tab);
+    expect(tabsOf('money')).toEqual(['debts', 'report']);
+    expect(tabsOf('sales')).toEqual(['orders', 'report']);
+    expect(tabsOf('stock')).toEqual(['catalog', 'containers', 'machines']);
+    expect(tabsOf('clients')).toEqual(['funnel', 'limits']);
+    const sw = window.document.querySelector('#nav-drawer [data-work-switch]');
+    expect(sw).not.toBeNull();
+    expect(sw.getAttribute('aria-checked')).toBe('false');
   });
 
   it('кладовщику не рисуют дверь, которая не открывается', () => {
@@ -1415,14 +1436,14 @@ describe('пять разделов вместо четырёх', () => {
     // Накладные стали вкладкой раздела (UI-бриф п.4); ссылки из бота и пушей
     // на прежний экран `whinvoices` продолжают работать через алиас.
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       buildNav();
       api = async () => ({ invoices: [] });
       window.__ready = showScreen('whinvoices');
     `);
     await window.__ready;
-    const active = window.document.querySelector('#bottom-nav .nav-item.active');
-    expect(active.dataset.screen).toBe('stock');
+    // «Склада» в панели руководителя нет — раздел из «Меню» (data-current).
+    expect(window.document.getElementById('bottom-nav').dataset.current).toBe('stock');
     expect(window.document.querySelector('.seg-item[data-sect="invoices"].active')).not.toBeNull();
   });
 
@@ -1601,7 +1622,7 @@ describe('звонки и причина отказа', () => {
     // Это люди, которых в Telegram ещё нет. Показать их вперемешку с перепиской
     // значит выдать за клиентов, которым можно написать.
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       api = async () => (${JSON.stringify(LIST)});
       clientsTab = 'list';
       window.__ready = renderClientsScreen();
@@ -1616,7 +1637,7 @@ describe('звонки и причина отказа', () => {
   it('форма звонка не требует ничего, кроме нажатия', async () => {
     // Половину звонков заносят постфактум, когда номера уже нет под рукой.
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       window.__sent = null;
       api = async () => (${JSON.stringify(LIST)});
       apiResult = async (path, body) => { window.__sent = [path, body]; return { ok: true, body: {} }; };
@@ -1632,7 +1653,7 @@ describe('звонки и причина отказа', () => {
 
   it('направление и источник уезжают выбранными', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       window.__sent = null;
       apiResult = async (path, body) => { window.__sent = body; return { ok: true, body: {} }; };
       openCallForm({});
@@ -1658,7 +1679,7 @@ describe('звонки и причина отказа', () => {
     // Обязательное поле на редко нажимаемой кнопке приводит к тому, что её
     // перестают нажимать вовсе — и теряется сам факт отказа.
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       window.__sent = null;
       apiResult = async (path, body) => { window.__sent = body; return { ok: true, body: {} }; };
       renderLeadCard = async () => {};
@@ -1678,7 +1699,7 @@ describe('звонки и причина отказа', () => {
 
   it('выбранная причина уезжает вместе с уточнением', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       window.__sent = null;
       apiResult = async (path, body) => { window.__sent = body; return { ok: true, body: {} }; };
       renderLeadCard = async () => {};
@@ -1695,7 +1716,7 @@ describe('звонки и причина отказа', () => {
 
   it('без выбора и без «Без причины» форма не отправляется молча', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       window.__sent = null;
       apiResult = async (path, body) => { window.__sent = body; return { ok: true, body: {} }; };
       renderLeadCard = async () => {};
@@ -1952,15 +1973,15 @@ describe('«Залежалось» — фильтр каталога (UI-бри�
   it('вкладки больше нет: у руководства это чип в фильтрах, у менеджера его нет', () => {
     // Ручка отвечает только admin/boss — у менеджера это была бы дверь,
     // которая гарантированно вернёт отказ.
-    expect(boot("currentUser = { role: 'boss' };").stockShellHtml()).not.toContain('data-sect="stale"');
-    const boss = boot(`currentUser = { role: 'boss' }; stockData = ${JSON.stringify(STOCK)}; renderStockContent();`);
+    expect(boot("currentUser = { role: 'boss', prefs: { work_actions: true } };").stockShellHtml()).not.toContain('data-sect="stale"');
+    const boss = boot(`currentUser = { role: 'boss', prefs: { work_actions: true } }; stockData = ${JSON.stringify(STOCK)}; renderStockContent();`);
     expect(boss.document.querySelector('[data-stale]')).not.toBeNull();
     const mgr = boot(`currentUser = { role: 'manager' }; stockData = ${JSON.stringify(STOCK)}; renderStockContent();`);
     expect(mgr.document.querySelector('[data-stale]')).toBeNull();
   });
 
   const bootStale = (extra = '') => boot(`
-    currentUser = { role: 'boss' };
+    currentUser = { role: 'boss', prefs: { work_actions: true } };
     window.__composer = null;
     window.__alerts = [];
     tg.showAlert = (m) => { window.__alerts.push(m); };
@@ -2011,7 +2032,7 @@ describe('«Залежалось» — фильтр каталога (UI-бри�
 
   it('пустой список — это ответ «всё продаётся», а не ошибка', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       api = async () => ({ ok: true, days: 60, items: [] });
       stockData = ${JSON.stringify(STOCK)};
       renderStockContent();
@@ -2028,7 +2049,7 @@ describe('«Залежалось» — фильтр каталога (UI-бри�
 
   it('отказ ручки не ломает каталог: фильтр откатывается, список на месте', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       window.__toasts = [];
       toast = (m) => window.__toasts.push(String(m));
       api = async () => { throw new Error('сервер не ответил'); };
@@ -2097,7 +2118,7 @@ describe('правка контейнера', () => {
 
   it('форма открывается заполненной тем, что есть', () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       openContainerEditForm(7, ${JSON.stringify(CARD)});
     `);
     const doc = window.document;
@@ -2108,7 +2129,7 @@ describe('правка контейнера', () => {
   it('номер не правится — по нему контейнер ищут', () => {
     // Ошиблись номером — это другой контейнер, а не опечатка в этом.
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       openContainerEditForm(7, ${JSON.stringify(CARD)});
     `);
     expect(window.document.querySelector('#ms-f-number')).toBeNull();
@@ -2117,7 +2138,7 @@ describe('правка контейнера', () => {
 
   it('правка уходит на сервер и перерисовывает карточку', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       window.__sent = null;
       window.__redrawn = 0;
       apiResult = async (path, body) => { window.__sent = [path, body]; return { ok: true, body: {} }; };
@@ -2137,7 +2158,7 @@ describe('правка контейнера', () => {
 
   it('отказ ручки остаётся в форме, а не закрывает её с потерей ввода', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       apiResult = async () => ({ ok: false, error: 'Приёмка закрыта' });
       renderContainerCard = async () => {};
       openContainerEditForm(7, ${JSON.stringify(CARD)});
@@ -2322,7 +2343,7 @@ describe('склад: остатки в «Каталоге» и накладны
 
   it('список накладных рисуется с шеллом раздела (UI-BUG-04)', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       buildNav();
       api = async () => ({ invoices: [] });
       stockTab = 'invoices';
@@ -2336,7 +2357,7 @@ describe('склад: остатки в «Каталоге» и накладны
 
   it('«Накладные» — вкладка раздела «Склад», кнопки между табами и поиском нет', () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       stockData = { products: [], categories: [] };
       renderStockContent();
     `);
@@ -2350,7 +2371,7 @@ describe('склад: остатки в «Каталоге» и накладны
     // клиенту то, что уже обещано другому, нельзя — поэтому в строке
     // доступное, а не полный остаток.
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       stockData = { categories: [], products: [
         { product_id: 1, name: 'Болт М8', unit: 'шт', stock: 12, reserve: 4, available: 8,
           folder_name: 'Крепёж' },
@@ -2370,7 +2391,7 @@ describe('склад: остатки в «Каталоге» и накладны
 
   it('список накладных показывает номер, сумму и статус отправки', async () => {
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       api = async () => ({ invoices: [
         { id: 5, type: 'outgoing', invoice_number: 'OUT-2026-0001', invoice_date: '2026-09-11',
           status: 'confirmed', currency: 'USD', total_amount_cents: 75000,
@@ -2409,7 +2430,7 @@ describe('склад: остатки в «Каталоге» и накладны
     // Склад по исторической накладной не двигался — сервер отмену отвергнет
     // (warehouse.historical_invoice_refusal), и кнопка была бы ложным обещанием.
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       api = async () => ({ invoices: [
         { id: 7, type: 'outgoing', invoice_number: 'MS-D-00042', invoice_date: '2025-03-11',
           status: 'confirmed', currency: 'UZS', total_amount_cents: 1265000000,
@@ -2707,7 +2728,7 @@ describe('карточка покупателя техники', () => {
     }],
   };
   const bootBuyer = () => boot(`
-    currentUser = { role: 'boss' };
+    currentUser = { role: 'boss', prefs: { work_actions: true } };
     window.__writes = [];
     window.__renders = 0;
     api = async (path) => { window.__renders += 1; return ${JSON.stringify(CARD)}; };
@@ -3112,5 +3133,405 @@ describe('клавиатура и прокрутка при смене вида 
     expect(window.__scrolls).toBe(2);
     window.eval("setSectionTab('money', 'debts')");
     expect(window.__scrolls).toBe(2);
+  });
+});
+
+// ─── Руководитель: «смотреть, решать, контролировать» (решение владельца) ────
+//
+// Работа менеджера у руководителя — за выключателем «Рабочие действия» в
+// «Меню». Выключатель — вид, а не права: хранит сервер (/api/prefs/set),
+// ручки не меняются. Удаление — контроль, у руководителя видно всегда.
+describe('руководитель без «Рабочих действий»', () => {
+  const tick = () => new Promise(r => setTimeout(r, 0));
+  const ORDER = (over = {}) => ({
+    id: 41, status: 'approved', agent_name: 'ООО Ромашка', full_name: 'Менеджер',
+    items_count: 1, created_at: '2026-08-01 10:00', total: 100, currency: 'USD',
+    payment_type: 'credit', items: [], ...over,
+  });
+
+  it('на заказе одно действие — «Отменить»; включил — вернулись «Отгрузить» и оплата', () => {
+    const orders = [ORDER(), ORDER({ id: 42, needs_payment: true, payment_type: 'paid', payment_gap: 100 })];
+    const render = (prefs) => boot(`
+      currentUser = { role: 'boss', prefs: ${JSON.stringify(prefs)} };
+      ordersData = { orders: ${JSON.stringify(orders)}, role: 'boss', pending_count: 2 };
+      renderOrdersMain();
+    `).document.getElementById('content');
+    const off = render({ work_actions: false });
+    expect(off.querySelector('.btn-ship-order')).toBeNull();
+    expect(off.querySelector('.btn-pay-order')).toBeNull();
+    expect(off.querySelectorAll('.btn-cancel-order')).toHaveLength(2);
+    expect(off.querySelector('#btn-new-order')).toBeNull();
+    const on = render({ work_actions: true });
+    expect(on.querySelector('.btn-ship-order')).not.toBeNull();
+    expect(on.querySelector('.btn-pay-order')).not.toBeNull();
+    // Менеджер — как было.
+    const mgr = boot(`
+      currentUser = { role: 'manager' };
+      ordersData = { orders: ${JSON.stringify(orders.map(o => ({ ...o, is_mine: true })))}, role: 'manager' };
+      renderOrdersMain();
+    `).document.getElementById('content');
+    expect(mgr.querySelector('.btn-ship-order')).not.toBeNull();
+    expect(mgr.querySelector('.btn-cancel-order')).toBeNull();
+  });
+
+  it('строка «Заявки на рассмотрении» ведёт в «Решения»', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      buildNav();
+      window.__shown = [];
+      const _show = showScreen;
+      showScreen = async (s, o) => { window.__shown.push(s); };
+      ordersData = { orders: [], role: 'boss', pending_count: 3 };
+      renderOrdersMain();
+    `);
+    window.document.getElementById('show-requests').click();
+    await tick();
+    expect(window.__shown).toEqual(['decisions']);
+  });
+
+  it('карточка машины — просмотр; удаление — всегда', async () => {
+    const CARD = {
+      ok: true,
+      machine: { id: 7, name: 'JCB 3CX', vin: 'JCB7788', status: 'in_transit', hours: 15200,
+                 price_cents: 2500000, cost_cents: 2000000, currency: 'USD' },
+      photos: [], hours: [], deals: [],
+      next_statuses: [{ status: 'reserved', label: '🔒 Забронировать' }],
+      can_manage: true, can_arrive: true, can_upload_photo: true,
+      status_labels: { in_transit: '🚢 В пути' },
+    };
+    const card = async (prefs, role = 'boss', over = {}) => {
+      const window = boot(`
+        currentUser = { role: '${role}', prefs: ${JSON.stringify(prefs)}, ...${JSON.stringify(over)} };
+        api = async () => (${JSON.stringify(CARD)});
+        window.__ready = renderMachineCard(7);
+      `);
+      await window.__ready;
+      return window.document.getElementById('content');
+    };
+    const off = await card({});
+    for (const act of ['hours', 'edit', 'sale', 'credit', 'arrive']) {
+      expect(off.querySelector(`[data-mact="${act}"]`), act).toBeNull();
+    }
+    expect(off.querySelector('[data-mstatus-to]')).toBeNull();
+    expect(off.querySelector('#machine-photo-add')).toBeNull();
+    expect(off.querySelector('[data-mact="delete"]')).not.toBeNull();
+    expect(off.textContent).toContain('Себестоимость');
+    expect(off.textContent).toMatch(/25\s000 USD/);
+
+    const on = await card({ work_actions: true });
+    for (const act of ['hours', 'edit', 'sale', 'credit', 'arrive', 'delete']) {
+      expect(on.querySelector(`[data-mact="${act}"]`), act).not.toBeNull();
+    }
+    // Менеджер: удаление гаснет при delete_requires_boss, если сервер его пустит.
+    const mgrOpen = await card({}, 'manager', {});
+    expect(mgrOpen.querySelector('[data-mact="hours"]')).not.toBeNull();
+    const mgrAllowed = await card({}, 'manager', { delete_requires_boss: false });
+    expect(mgrAllowed.querySelector('[data-mact="delete"]')).not.toBeNull();   // can_manage в стабе
+    const mgrLocked = await card({}, 'manager', { delete_requires_boss: true });
+    expect(mgrLocked.querySelector('[data-mact="delete"]')).toBeNull();
+  });
+
+  it('карточка контейнера — себестоимость и удаление, без приёмки', async () => {
+    const CARD = {
+      ok: true,
+      container: { id: 3, number: 'MSKU1', status: 'arrived', arrived_at: '2026-08-12' },
+      items: [{ id: 10, name: 'Кабель', unit: 'шт', expected_qty: 5, arrived_qty: null, state: 'unchecked' }],
+      diff: { total: 1, unchecked: 1, short: 0, extra: 0, mismatch: 0 },
+      can_manage: true, edit_window: { open: true, hours_left: 10 },
+      receipt: {}, status_labels: { arrived: '📦 Прибыл' },
+    };
+    const card = async (prefs) => {
+      const window = boot(`
+        currentUser = { role: 'boss', prefs: ${JSON.stringify(prefs)} };
+        window.mountContainerCosting = () => { window.__costing = 1; };
+        api = async () => (${JSON.stringify(CARD)});
+        window.__ready = renderContainerCard(3);
+      `);
+      await window.__ready;
+      return window;
+    };
+    const off = await card({});
+    const c = off.document.getElementById('content');
+    for (const id of ['#cont-edit', '#cont-supplier', '#cont-item-add', '#cont-save', '#cont-supply', '#cont-post']) {
+      expect(c.querySelector(id), id).toBeNull();
+    }
+    expect(c.querySelector('.qty-input')).toBeNull();
+    expect(c.querySelector('[data-item-del]')).toBeNull();
+    expect(c.querySelector('#cont-del')).not.toBeNull();
+    expect(off.__costing).toBe(1);
+    const on = (await card({ work_actions: true })).document.getElementById('content');
+    for (const id of ['#cont-edit', '#cont-item-add', '#cont-save', '#cont-supply', '#cont-post', '#cont-del']) {
+      expect(on.querySelector(id), id).not.toBeNull();
+    }
+  });
+
+  it('каталог: «Залежалось» есть, «Собрать пост» и «Пост в канал» — нет', async () => {
+    const STOCK = { categories: [], products: [
+      { product_id: 1, name: 'Кабель', unit: 'м', stock: 480, available: 480, folder_id: '' },
+    ] };
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => ({ ok: true, days: 60, items: [{ name: 'Кабель', stock: 480, unit: 'м' }] });
+      apiResult = async () => ({ ok: true, body: { photos: [] } });
+      stockData = ${JSON.stringify(STOCK)};
+      renderStockContent();
+    `);
+    const doc = window.document;
+    doc.querySelector('[data-stale]').click();
+    await tick(); await tick();
+    expect(doc.querySelector('.stale-check')).toBeNull();
+    expect(doc.querySelector('#stale-post')).toBeNull();
+    // Строка открывает цену — это контроль руководителя.
+    doc.querySelector('[data-price-idx]').click();
+    expect(doc.querySelector('#pe-save')).not.toBeNull();
+    expect(doc.querySelector('#pe-post')).toBeNull();
+    expect(doc.querySelector('#pe-photo-add')).toBeNull();
+  });
+
+  it('«Долги» — просмотр: без «Внести оплату» и без подтверждения', async () => {
+    const DEBTS = {
+      role: 'boss', scope: 'company', today: '2026-08-01', can_confirm: true,
+      debts: [
+        { id: 5, state: 'overdue', agent_name: 'А', full_name: 'М', total: 100, remaining: 100,
+          currency: 'USD', due_date: '2026-07-01', items_count: 1 },
+        { id: 6, state: 'awaiting_confirmation', agent_name: 'Б', full_name: 'М', total: 50,
+          pending: 50, pending_confirmable: 50, claimable: 10, currency: 'USD', items_count: 1,
+          parts: [{ method: 'card', amount_cents: 5000, currency: 'USD', state: 'awaiting_bank' },
+                  { method: 'cash', amount_cents: 1000, currency: 'USD', state: 'on_hand' }] },
+      ],
+    };
+    const render = async (prefs) => {
+      const window = boot(`
+        currentUser = { role: 'boss', prefs: ${JSON.stringify(prefs)} };
+        api = async () => (${JSON.stringify(DEBTS)});
+        window.__ready = renderDebts(document.getElementById('content'));
+      `);
+      await window.__ready;
+      return window.document.getElementById('content');
+    };
+    const off = await render({});
+    expect(off.querySelector('.btn-pay-debt')).toBeNull();
+    expect(off.querySelector('.btn-confirm-pay')).toBeNull();
+    // Разбивка «наличные у менеджера / карта» — на месте.
+    expect(off.textContent).toContain('у менеджера');
+    expect(off.textContent).toContain('на карту');
+    const on = await render({ work_actions: true });
+    expect(on.querySelector('.btn-pay-debt')).not.toBeNull();
+    expect(on.querySelector('.btn-confirm-pay')).not.toBeNull();
+  });
+
+  it('возврат без приёмки: «Товар получен» — работа склада, руководитель ждёт', () => {
+    const html = (prefs) => boot(`currentUser = { role: 'boss', prefs: ${JSON.stringify(prefs)} };`)
+      .returnCardsHtml([{ id: 9, order_id: 5, total_amount: 20, reason: 'брак', goods_received: 0 }],
+        { role: 'boss', isBoss: true, confirmersExist: true });
+    expect(html({})).not.toContain('ret-goods');
+    expect(html({})).toContain('Ждёт отметки склада');
+    expect(html({ work_actions: true })).toContain('ret-goods');
+  });
+
+  it('«Воронка» без переходов в карточку лида', async () => {
+    const FUNNEL = {
+      ok: true, funnel: { contacted: 3, replied: 1, won: 0 },
+      awaiting: [{ id: 3, display_name: 'Азиз', last_inbound_at: '2026-08-01 18:40:00' }], by_manager: [],
+    };
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => (${JSON.stringify(FUNNEL)});
+      clientsTab = 'funnel';
+      window.__ready = renderClientsScreen();
+    `);
+    await window.__ready;
+    const c = window.document.getElementById('content');
+    expect(c.textContent).toContain('Азиз');
+    expect(c.querySelector('[data-lead]')).toBeNull();
+    expect(c.querySelector('[data-sect="list"]')).toBeNull();
+    expect(c.querySelector('[data-sect="channel"]')).toBeNull();
+  });
+});
+
+describe('экран «Решения»', () => {
+  const tick = () => new Promise(r => setTimeout(r, 0));
+  const LISTS = {
+    '/api/orders/requests': { requests: [{
+      id: 7, full_name: 'Менеджер', agent_name: 'ООО Ромашка', created_at: '2026-08-01',
+      payment_type: 'credit', due_date: '2026-09-01', total: 120, currency: 'USD',
+      items: [{ name: 'Кабель', quantity: 2, unit: 'шт', price: 60 }],
+    }] },
+    '/api/payments/pending': { pending: [{ order_id: 11, agent_name: 'Б', total: 50, pending: 50,
+      confirmable: 50, currency: 'USD', parts: [] }] },
+    '/api/deposits/pending': { deposits: [{ id: 3, amount: 10, orders: [] }] },
+    '/api/returns/pending': { returns: [{ id: 9, order_id: 5, total_amount: 20, reason: 'брак', goods_received: 1 }] },
+  };
+  const bootDecisions = (extra = '') => boot(`
+    currentUser = { role: 'boss' };
+    buildNav();
+    window.__calls = [];
+    window.__lists = ${JSON.stringify(LISTS)};
+    api = async (p, body) => {
+      window.__calls.push([p, body]);
+      if (window.__lists[p]) return window.__lists[p];
+      return { ok: true };
+    };
+    tg.showConfirm = (t, cb) => cb(true);
+    tg.showAlert = () => {};
+    ${extra}
+    window.__ready = showScreen('decisions');
+  `);
+
+  it('все виды решений — одним экраном, с общим бейджем в панели', async () => {
+    const window = bootDecisions();
+    await window.__ready;
+    const doc = window.document;
+    const groups = Array.from(doc.querySelectorAll('[data-decision-group]')).map(g => g.dataset.decisionGroup);
+    expect(groups).toEqual(['requests', 'payments', 'deposits', 'returns']);
+    expect(doc.querySelector('.btn-approve[data-req="7"]')).not.toBeNull();
+    expect(doc.querySelector('.pay-confirm[data-id="11"]')).not.toBeNull();
+    expect(doc.querySelector('.debt-card[data-dep="3"] .dep-confirm')).not.toBeNull();
+    expect(doc.querySelector('.debt-card[data-ret="9"] .ret-confirm')).not.toBeNull();
+    const badge = doc.querySelector('#bottom-nav .nav-item[data-screen="decisions"] [data-decisions-badge]');
+    expect(badge.hidden).toBe(false);
+    expect(badge.textContent).toBe('4');
+    expect(doc.getElementById('bottom-nav').dataset.current).toBe('decisions');
+  });
+
+  it('решение уходит в ручку и экран перечитывается', async () => {
+    const window = bootDecisions();
+    await window.__ready;
+    window.__calls.length = 0;
+    window.document.querySelector('.debt-card[data-dep="3"] .dep-confirm').click();
+    await tick(); await tick();
+    const paths = window.__calls.map(c => c[0]);
+    expect(paths[0]).toBe('/api/deposits/confirm');
+    expect(paths).toContain('/api/orders/requests');   // перерисовка «Решений», не «Денег»
+  });
+
+  it('пусто — «Решений не ждёт», бейдж гаснет', async () => {
+    const window = bootDecisions(`
+      window.__lists = { '/api/orders/requests': { requests: [] }, '/api/payments/pending': { pending: [] },
+        '/api/deposits/pending': { deposits: [] }, '/api/returns/pending': { returns: [] } };
+      setDecisionsBadge(5);
+    `);
+    await window.__ready;
+    expect(window.document.getElementById('content').textContent).toContain('Решений не ждёт');
+    expect(window.document.querySelector('[data-decisions-badge]').hidden).toBe(true);
+  });
+
+  it('новый вид решения подключается провайдером без правки экрана', async () => {
+    const window = bootDecisions(`
+      registerDecisionGroup({
+        key: 'machine_deals', title: 'Сделки по технике', icon: 'truck',
+        load: async () => [{ id: 1 }, { id: 2 }],
+        html: (items) => items.map(i => '<div class="md" data-md="' + i.id + '">x</div>').join(''),
+        wire: (root, items, ctx) => { window.__wired = root.querySelectorAll('.md').length; },
+      }, 'payments');
+    `);
+    await window.__ready;
+    const groups = Array.from(window.document.querySelectorAll('[data-decision-group]')).map(g => g.dataset.decisionGroup);
+    expect(groups).toEqual(['requests', 'machine_deals', 'payments', 'deposits', 'returns']);
+    expect(window.__wired).toBe(2);
+    expect(window.document.querySelector('[data-decisions-badge]').textContent).toBe('6');
+  });
+
+  it('сбой одной группы — ошибка в её секции, остальные на месте', async () => {
+    const window = bootDecisions(`
+      const _api = api;
+      api = async (p, b) => { if (p === '/api/returns/pending') throw new Error('Сломалось'); return _api(p, b); };
+    `);
+    await window.__ready;
+    const doc = window.document;
+    expect(doc.querySelector('[data-decision-group="returns"] .error-card')).not.toBeNull();
+    expect(doc.querySelector('.btn-approve[data-req="7"]')).not.toBeNull();
+  });
+
+  it('старые адреса подтверждений у руководителя открывают «Решения», у менеджера — «Подтвердить»', async () => {
+    const go = (role, screen, tab) => {
+      const window = boot(`
+        currentUser = { role: '${role}' };
+        buildNav();
+        renderDecisionsScreen = async () => {}; renderMoneyScreen = async () => {};
+        renderSalesScreen = async () => {};
+        window.__ready = showScreen('${screen}'${tab ? `, { tab: '${tab}' }` : ''}).then(() => [currentScreen, moneyTab]);
+      `);
+      return window.__ready;
+    };
+    expect(await go('boss', 'money', 'confirm')).toEqual(['decisions', 'confirm']);
+    expect((await go('boss', 'requests'))[0]).toBe('decisions');
+    expect(await go('manager', 'decisions')).toEqual(['money', 'confirm']);
+  });
+});
+
+describe('выключатель «Рабочие действия» и «Настройки»', () => {
+  const tick = () => new Promise(r => setTimeout(r, 0));
+
+  it('переключение из шторки — запрос на сервер, вкладки в шторке сразу меняются', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss', prefs: { work_actions: false } };
+      buildNav();
+      window.__calls = [];
+      api = async (p, body) => { window.__calls.push([p, body]); return { ok: true, prefs: { work_actions: body.value } }; };
+      toast = () => {};
+      openNavDrawer();
+    `);
+    const doc = window.document;
+    expect(doc.querySelector('#nav-drawer [data-tab="invoices"]')).toBeNull();
+    doc.querySelector('#nav-drawer [data-work-switch]').click();
+    await tick(); await tick();
+    expect(window.__calls[0]).toEqual(['/api/prefs/set', { key: 'work_actions', value: true }]);
+    expect(window.eval('workActionsVisible()')).toBe(true);
+    expect(doc.querySelector('#nav-drawer [data-work-switch]').getAttribute('aria-checked')).toBe('true');
+    expect(doc.querySelector('#nav-drawer [data-tab="invoices"]')).not.toBeNull();
+    expect(doc.querySelector('#nav-drawer [data-tab="channel"]')).not.toBeNull();
+  });
+
+  it('отказ сервера возвращает бегунок на место', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss', prefs: { work_actions: false } };
+      buildNav();
+      api = async () => { throw new Error('Нет связи'); };
+      window.__toasts = [];
+      toast = (m) => window.__toasts.push(m);
+      openNavDrawer();
+    `);
+    const doc = window.document;
+    doc.querySelector('#nav-drawer [data-work-switch]').click();
+    await tick(); await tick();
+    expect(doc.querySelector('#nav-drawer [data-work-switch]').getAttribute('aria-checked')).toBe('false');
+    expect(window.eval('workActionsVisible()')).toBe(false);
+    expect(window.__toasts).toContain('Нет связи');
+  });
+
+  it('«Настройки»: выключатель, реквизиты, курсы, сотрудники', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss', version: 'abc' };
+      buildNav();
+      api = async (p) => (p === '/api/docs/types'
+        ? { company: { company_name: 'Импекс', company_city: 'Ташкент' }, can_edit_company: true, company_fields: [] }
+        : {});
+      window.__ready = showScreen('settings');
+    `);
+    await window.__ready;
+    const c = window.document.getElementById('content');
+    expect(c.querySelector('[data-work-switch]')).not.toBeNull();
+    expect(c.querySelector('#set-company').textContent).toContain('Импекс');
+    expect(c.querySelector('#set-rates')).not.toBeNull();
+    expect(c.textContent).toContain('Сотрудники и роли');
+  });
+
+  it('deep link: ?startapp=decisions открывает «Решения», чужой адрес — нет', () => {
+    const at = (role, url, startParam) => {
+      const window = boot(`currentUser = { role: '${role}' };`);
+      window.Telegram.WebApp.initDataUnsafe = startParam ? { start_param: startParam } : {};
+      window.history.replaceState(null, '', url);
+      return window.eval('launchScreen()');
+    };
+    expect(at('boss', '/?startapp=decisions')).toBe('decisions');
+    expect(at('boss', '/', 'decisions')).toBe('decisions');
+    expect(at('admin', '/#decisions')).toBe('decisions');
+    expect(at('boss', '/?startapp=requests')).toBe('requests');
+    expect(at('boss', '/?startapp=nope')).toBe('');
+    expect(at('boss', '/?startapp=<script>')).toBe('');
+    // Менеджеру «Решения» ведут в его «Подтвердить» — раздел «Деньги» у него есть.
+    expect(at('manager', '/?startapp=decisions')).toBe('decisions');
+    expect(at('warehouse_keeper', '/?startapp=stock')).toBe('');
   });
 });

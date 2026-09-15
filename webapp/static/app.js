@@ -355,7 +355,7 @@ async function init() {
       return;
     }
     initNav();
-    showScreen(defaultSection(role()) || 'today');
+    showScreen(launchScreen() || defaultSection(role()) || 'today');
   } catch (e) {
     document.getElementById('content').innerHTML = `
       <div class="error-card">
@@ -426,11 +426,41 @@ const LEGACY_SCREENS = {
   // «Накладные» стали вкладкой «Склада» (UI-бриф п.4); старый адрес экрана
   // ведёт туда же.
   whinvoices: 'stock:invoices',
+  // Заявки руководителя — часть «Решений» (resolveScreen в helpers.js уводит
+  // сюда и `money:confirm`). Остальным ролям тот же адрес ведёт в их прежнее
+  // место подтверждений.
+  requests: 'decisions',
+  approvals: 'decisions',
 };
+
+// Экран при запуске по ссылке. Deep link из уведомлений — `decisions`
+// («Открыть решения»): кнопка web_app несёт его в адресе (`?startapp=decisions`,
+// handlers._ui.webapp_url), ссылка t.me/<бот>?startapp=decisions — в
+// `initDataUnsafe.start_param`. Принимаем только известные адреса (разделы и
+// LEGACY_SCREENS) и только доступные роли: чужой или битый адрес — обычный
+// экран по умолчанию, а не «Неизвестный экран».
+function launchScreen() {
+  let raw = '';
+  try { raw = (tg.initDataUnsafe && tg.initDataUnsafe.start_param) || ''; } catch (_e) { /* нет SDK */ }
+  if (!raw) {
+    try {
+      const params = new URLSearchParams(location.search || '');
+      raw = params.get('startapp') || params.get('screen') || '';
+    } catch (_e) { /* старый WebView без URLSearchParams */ }
+  }
+  if (!raw && location.hash) raw = location.hash.slice(1);
+  const key = String(raw || '').trim().toLowerCase();
+  if (!/^[a-z_]{2,32}$/.test(key)) return '';
+  const alias = LEGACY_SCREENS[key];
+  const [target, tab] = (alias || key).split(':');
+  const res = resolveScreen(role(), target, tab || '');
+  if (!navSections(role()).some(sec => sec.key === res.screen)) return '';
+  return key;
+}
 
 const SCREEN_TITLES = {
   today: null, sales: 'Продажи', stock: 'Склад', money: 'Деньги',
-  clients: 'Клиенты',
+  clients: 'Клиенты', decisions: 'Решения', settings: 'Настройки',
 };
 
 // Нижняя панель строится из таблицы разделов: набор кнопок зависит от роли.
@@ -445,9 +475,11 @@ function buildNav() {
   const nav = document.getElementById('bottom-nav');
   if (!nav) return;
   const layout = navBarLayout(navSections(role()), (k) => navTabsFor(k).length);
+  // «Решения» несут общий бейдж: сколько ждёт слова руководителя.
   const item = (s) => `
     <button class="nav-item" data-screen="${s.key}">
-      <span class="nav-icon">${icon(s.icon)}</span>
+      <span class="nav-icon">${icon(s.icon)}${s.key === 'decisions'
+        ? `<span class="nav-badge" data-decisions-badge${decisionsCount ? '' : ' hidden'}>${decisionsCount || ''}</span>` : ''}</span>
       <span class="nav-label">${escapeHtml(s.label)}</span>
     </button>`;
   // «Меню» — не data-screen: это не раздел, и списки разделов панели
@@ -512,6 +544,21 @@ function sectionTabOf(section) {
   return { sales: salesTab, stock: stockTab, money: moneyTab, clients: clientsTab }[section] || '';
 }
 
+// Содержимое шторки: разделы роли, вкладки, бейдж «Решений» и — у
+// руководства — выключатель «Рабочие действия».
+function fillNavDrawer(panel) {
+  const groups = navSections(role()).map(s => ({
+    key: s.key, label: s.label, icon: s.icon, tabs: navTabsFor(s.key),
+    badge: s.key === 'decisions' ? decisionsCount : 0,
+  }));
+  panel.innerHTML = navDrawerHtml(groups,
+    { screen: currentScreen, tab: sectionTabOf(currentScreen) },
+    {
+      subtitle: ROLE_NAMES[role()] || '',
+      workSwitch: isBossRole() ? { on: workActionsVisible() } : null,
+    });
+}
+
 function ensureNavDrawer() {
   let root = document.getElementById('nav-drawer');
   if (root) return root;
@@ -526,6 +573,8 @@ function ensureNavDrawer() {
   root.addEventListener('click', (e) => {
     if (Date.now() < _drawerClickMuteUntil) { e.preventDefault(); return; }
     if (e.target.closest('[data-drawer-close]')) { closeNavDrawer(); return; }
+    const sw = e.target.closest('[data-work-switch]');
+    if (sw) { toggleWorkActions(sw); return; }
     const link = e.target.closest('.nav-link[data-screen]');
     if (link) navigateFromDrawer(link.dataset.screen, link.dataset.tab || '');
   });
@@ -537,12 +586,7 @@ function openNavDrawer() {
   if (_navDrawer) return;
   const root = ensureNavDrawer();
   const panel = root.querySelector('.nav-drawer-panel');
-  const groups = navSections(role()).map(s => ({
-    key: s.key, label: s.label, icon: s.icon, tabs: navTabsFor(s.key),
-  }));
-  panel.innerHTML = navDrawerHtml(groups,
-    { screen: currentScreen, tab: sectionTabOf(currentScreen) },
-    { subtitle: ROLE_NAMES[role()] || '' });
+  fillNavDrawer(panel);
   haptic('light');
 
   _navDrawer = {
@@ -606,6 +650,64 @@ function closeNavDrawer({ restoreBack = true } = {}) {
   }
   const back = st.trigger && st.trigger.isConnected ? st.trigger : menuBtn;
   if (back && back.focus) { try { back.focus({ preventScroll: true }); } catch (_e) {} }
+  // Пока шторка была открыта, переключили «Рабочие действия» — экран под ней
+  // нарисован со старым набором кнопок. Переход из шторки перерисует сам.
+  if (st.dirty && restoreBack) showScreen(currentScreen);
+}
+
+// ─── «Рабочие действия» руководителя ────────────────────────────────────────
+// Личная настройка вида (сервер: /api/prefs/set → user_prefs), НЕ права: ручки
+// пускают руководителя туда же, куда и раньше, выключатель решает только,
+// рисовать ли кнопки работы менеджера. Хранит сервер — WebView теряет
+// localStorage, и выключатель, гаснущий сам собой, хуже отсутствующего.
+function workActionsVisible() {
+  return workActionsOn(role(), currentUser && currentUser.prefs);
+}
+// Удаление (техника, товары, накладные) — контроль: у руководства видно всегда,
+// менеджеру — пока `delete_requires_boss` выключена. Права режет сервер.
+function deleteActionsVisible() {
+  return deleteActionsOn(role(), currentUser);
+}
+
+let _workSwitchBusy = false;
+async function toggleWorkActions(btn) {
+  if (_workSwitchBusy || !isBossRole()) return;
+  const next = !workActionsVisible();
+  _workSwitchBusy = true;
+  haptic('light');
+  // Сразу показываем новое положение: ответ сервера — подтверждение, а не
+  // повод держать палец на застывшем бегунке.
+  document.querySelectorAll('[data-work-switch]').forEach(el => el.setAttribute('aria-checked', String(next)));
+  try {
+    const res = await api('/api/prefs/set', { key: 'work_actions', value: next });
+    currentUser.prefs = res.prefs || { ...(currentUser.prefs || {}), work_actions: next };
+    toast(next ? 'Рабочие действия включены' : 'Рабочие действия скрыты', 'info');
+    const panel = _navDrawer && document.querySelector('#nav-drawer .nav-drawer-panel');
+    if (panel) {
+      _navDrawer.dirty = true;
+      fillNavDrawer(panel);
+      const again = panel.querySelector('[data-work-switch]');
+      if (again) { try { again.focus({ preventScroll: true }); } catch (_e) {} }
+    } else {
+      showScreen(currentScreen);
+    }
+  } catch (e) {
+    document.querySelectorAll('[data-work-switch]').forEach(el => el.setAttribute('aria-checked', String(!next)));
+    toast(e.message, 'error');
+  } finally {
+    _workSwitchBusy = false;
+  }
+}
+
+// Общий бейдж «Решений» — в панели и шторке. Считают экран «Решения» (по
+// своим спискам) и «Сегодня» (по пунктам очереди с адресом `decisions`).
+let decisionsCount = 0;
+function setDecisionsBadge(n) {
+  decisionsCount = Math.max(0, Number(n) || 0);
+  document.querySelectorAll('[data-decisions-badge]').forEach(el => {
+    el.textContent = decisionsCount ? String(decisionsCount) : '';
+    el.hidden = !decisionsCount;
+  });
 }
 
 function onNavDrawerKey(e) {
@@ -686,15 +788,19 @@ async function showScreen(screen, opts) {
   // Алиас может нести и вкладку: 'sales:report' — раздел «Продажи», вкладка
   // «Отчёт». Разбираем ДО всего остального, чтобы дальше работать с новым.
   const alias = LEGACY_SCREENS[screen];
+  let aliasTab = '';
   if (alias) {
     const [target, tab] = alias.split(':');
     screen = target;
-    if (tab) setSectionTab(target, tab);
+    aliasTab = tab || '';
   }
   // Явная вкладка (шторка «Меню») — ПОСЛЕ алиаса: алиас несёт свою вкладку,
   // и поставленная до него явная молча затиралась бы (так было со старым
   // `stock` → 'stock:catalog', пока его не убрали из LEGACY_SCREENS).
-  if (opts && opts.tab) setSectionTab(screen, opts.tab);
+  // resolveScreen: у руководства «Подтвердить» и «Заявки» — это «Решения».
+  const resolved = resolveScreen(role(), screen, (opts && opts.tab) || aliasTab);
+  screen = resolved.screen;
+  if (resolved.tab) setSectionTab(screen, resolved.tab);
   currentScreen = screen;
   // Поколение экрана. Рендер — асинхронный: «Сегодня» ждёт /api/home, список
   // заказов — /api/orders. Если человек ушёл в другой раздел раньше, чем
@@ -746,6 +852,12 @@ async function showScreen(screen, opts) {
         break;
       case 'clients':
         await renderClientsScreen();
+        break;
+      case 'decisions':
+        await renderDecisionsScreen();
+        break;
+      case 'settings':
+        await renderSettingsScreen();
         break;
       default:
         content.innerHTML = `<div class="error">Неизвестный экран: ${escapeHtml(screen)}</div>`;
@@ -882,27 +994,11 @@ function isBossRole() { return ['admin', 'boss'].includes(role()); }
 // Техника, контейнеры и каталог — та же тройка ролей, что у их ручек.
 function canSeeMachines() { return ['admin', 'boss', 'manager'].includes(role()); }
 
+// Вкладки раздела под роль — одна таблица в helpers.js (roleSectionTabs): её же
+// видят панель, шторка и vitest. У руководства набор зависит от «Рабочих
+// действий»; у остальных ролей не меняется.
 function sectionTabsFor(section) {
-  const r = role();
-  const boss = isBossRole();
-  if (section === 'sales') {
-    const working = ['admin', 'boss', 'manager'].includes(r);
-    return salesTabs({ canSeeReport: working, canDocs: working });
-  }
-  if (section === 'stock') {
-    return stockTabs({ canSeeGoods: canSeeMachines(), isBoss: boss });
-  }
-  if (section === 'money') {
-    return moneyTabs({
-      isBoss: boss,
-      isConfirmer: roleIn(r, ['admin', 'boss', 'bookkeeper', 'warehouse_keeper']),
-      canSeeDebts: ['admin', 'boss', 'manager'].includes(r),
-      // Касса — сдачи наличных, их создают менеджеры: /api/deposits/my и
-      // /create кладовщику не отвечают, и вкладка у него возвращала 403.
-      hasOps: ['admin', 'boss', 'manager'].includes(r),
-    });
-  }
-  return clientsTabs({ isBoss: boss });
+  return roleSectionTabs(section, role(), { work: workActionsVisible() });
 }
 
 // Шелл раздела: переключатель вкладок + подпись в шапке. Возвращает HTML;
@@ -993,14 +1089,10 @@ function wireWorkQueue(root) {
     row.addEventListener('click', () => {
       haptic();
       const target = row.dataset.queue;
-      if (target === 'requests') {
-        showScreen('sales');
-        if (typeof renderPendingRequests === 'function') setTimeout(renderPendingRequests, 50);
-        return;
-      }
+      // `requests` и `money:confirm` у руководства ведут в «Решения»
+      // (LEGACY_SCREENS + resolveScreen) — отдельной ветки здесь не нужно.
       const [screen, tab] = target.split(':');
-      if (tab) setSectionTab(screen, tab);
-      showScreen(screen);
+      showScreen(screen, tab ? { tab } : undefined);
     });
   });
 }
@@ -1029,7 +1121,7 @@ async function renderHome() {
   // У кладовщика и бухгалтера очередь и есть весь экран — там сбой показываем
   // ошибкой (ниже), иначе без сети он читался бы как «дел нет».
   const queuePromise = api('/api/today', {}).then(
-    d => d, e => (canSeeHome ? { queue: [] } : { error: e }));
+    d => d, e => (canSeeHome ? { queue: [], failed: true } : { error: e }));
 
   let data = null;
   if (canSeeHome) {
@@ -1042,6 +1134,13 @@ async function renderHome() {
   }
   const queueRes = await queuePromise;
   const queue = queueRes.queue || [];
+  // Бейдж «Решений» — по пунктам очереди, ведущим туда: новый вид решения на
+  // сервере с тем же адресом попадает в счётчик сам.
+  if (isBossRole() && !queueRes.error && !queueRes.failed) {
+    setDecisionsBadge(queue
+      .filter(i => ['decisions', 'requests'].includes(String(i.screen || '').split(':')[0]))
+      .reduce((a, i) => a + (Number(i.count) || 0), 0));
+  }
 
   if (!data) {
     if (queueRes.error) {
@@ -1253,6 +1352,9 @@ function renderStockList() {
   const isBoss = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
 
   const staleMode = stockStaleOnly && stockStaleData;
+  // Отметки «в пост» — работа с каналом (менеджер): у руководства без «Рабочих
+  // действий» «Залежалось» — просто срез каталога, строки открывают цену.
+  const postMode = staleMode && workActionsVisible();
   // Выбор для поста храним по названию: в пост уходят именно названия, а id
   // у позиции отчёта нет — он считается из отгрузок, где товар опознан по имени.
   if (staleMode) staleChecked = new Set([...staleChecked].filter(n => filtered.some(p => p.name === n)));
@@ -1278,14 +1380,14 @@ function renderStockList() {
         // Boss может тапнуть товар → редактор цен.
         // В режиме «залежалось» строка — метка чекбокса для поста в канал,
         // а не переход в редактор цены.
-        const editAttr = isBoss && !staleMode ? ` data-price-idx="${i}" role="button" tabindex="0" aria-label="Изменить цену: ${escapeHtml(p.name)}"` : '';
-        const editHint = isBoss && !staleMode ? `<span class="stock-edit-hint">${icon('edit')}</span>` : '';
-        const check = staleMode
+        const editAttr = isBoss && !postMode ? ` data-price-idx="${i}" role="button" tabindex="0" aria-label="Изменить цену: ${escapeHtml(p.name)}"` : '';
+        const editHint = isBoss && !postMode ? `<span class="stock-edit-hint">${icon('edit')}</span>` : '';
+        const check = postMode
           ? `<input type="checkbox" class="stale-check" value="${escapeHtml(p.name)}" ${staleChecked.has(p.name) ? 'checked' : ''} aria-label="В пост: ${escapeHtml(p.name)}">`
           : '';
-        const tag = staleMode ? 'label' : 'div';
+        const tag = postMode ? 'label' : 'div';
         return `
-        <${tag} class="c-row stock-row${staleMode ? ' stale-row' : ''}"${editAttr}>
+        <${tag} class="c-row stock-row${postMode ? ' stale-row' : ''}"${editAttr}>
           ${check}
           <div class="stock-info">
             <div class="stock-name">${escapeHtml(p.name)}</div>
@@ -1297,7 +1399,7 @@ function renderStockList() {
         </${tag}>`;
       }).join('');
 
-  if (staleMode) {
+  if (postMode) {
     listEl.querySelectorAll('.stale-check').forEach(box => {
       box.addEventListener('change', () => {
         if (box.checked) staleChecked.add(box.value);
@@ -1314,7 +1416,7 @@ function renderStockList() {
   // из чего собирать. В пост уходят одни названия: остатки наружу не выходят.
   const postEl = document.getElementById('stock-stale-post');
   if (postEl) {
-    postEl.innerHTML = staleMode && filtered.length
+    postEl.innerHTML = postMode && filtered.length
       ? `<div class="c-actions"><button class="btn-primary" id="stale-post">${icon('cart')} Собрать пост</button></div>`
         + `<div class="card-row-sub">В пост уйдут только названия — остатки наружу не выходят.</div>`
       : '';
@@ -1366,10 +1468,10 @@ function openPriceEditor(product) {
       </label>
       <div id="pe-cost-history"></div>
       <div id="pe-photos"></div>
-      <div class="c-actions c-actions--wrap">
+      ${workActionsVisible() ? `<div class="c-actions c-actions--wrap">
         <button class="btn-secondary" id="pe-photo-add">${icon('plus')} Фото</button>
         <button class="btn-secondary" id="pe-post">${icon('cart')} Пост в канал</button>
-      </div>
+      </div>` : ''}
       <div class="c-actions c-actions--stack price-actions">
         <button class="btn-primary" id="pe-save">Сохранить</button>
         <button class="btn-secondary" id="pe-cancel">Отмена</button>
@@ -1400,9 +1502,9 @@ function openPriceEditor(product) {
     window.mountProductCostHistory(ov.querySelector('#pe-cost-history'), productId);
   }
 
-  ov.querySelector('#pe-photo-add').addEventListener('click', () =>
+  ov.querySelector('#pe-photo-add')?.addEventListener('click', () =>
     pickPhotos('/api/products/photo_upload', { product_id: productId }, reloadPhotos));
-  ov.querySelector('#pe-post').addEventListener('click', () =>
+  ov.querySelector('#pe-post')?.addEventListener('click', () =>
     openChannelComposer('showcase', { product_id: productId }));
   const close = () => {
     ov.remove();
@@ -1654,7 +1756,9 @@ async function renderMachines() {
             ? 'Здесь появятся экскаваторы: в пути, на складе и проданные.'
             : 'В этом статусе машин нет — выберите другой фильтр.',
         }))
-    + `<div class="c-actions"><button class="btn-secondary" id="machine-new">${icon('plus')} Завести машину</button></div>`;
+    + (workActionsVisible()
+      ? `<div class="c-actions"><button class="btn-secondary" id="machine-new">${icon('plus')} Завести машину</button></div>`
+      : '');
   wireSectionNav(content, 'stock', renderStockScreen);
 
   content.querySelector('#machine-new')?.addEventListener('click', () => openMachineForm(null));
@@ -1722,7 +1826,9 @@ function machineScheduleHtml(deal, today) {
   const cur = deal.currency || 'USD';
   const paidCents = rows.filter(p => p.paid_at).reduce((s, p) => s + Number(p.amount_cents || 0), 0);
   const totalCents = rows.reduce((s, p) => s + Number(p.amount_cents || 0), 0);
-  const boss = isMachineBoss();
+  // Отметки и поступления по рассрочке — денежная работа менеджера: у
+  // руководства только с «Рабочими действиями». График виден всегда.
+  const boss = isMachineBoss() && workActionsVisible();
 
   const items = rows.map(p => {
     const due = String(p.due_date || '').slice(0, 10);
@@ -1785,7 +1891,7 @@ function machineReceiptsHtml(deal) {
   const rows = deal.receipts || [];
   if (!rows.length) return '';
   const cur = deal.currency || 'USD';
-  const boss = isMachineBoss();
+  const boss = isMachineBoss() && workActionsVisible();
   return `<div class="section-label">Поступления · ${rows.length}</div>
     <div class="c-surface c-surface--list">${rows.map(r => `
       <div class="c-row">
@@ -1836,7 +1942,7 @@ function machineDealsHtml(deals, today) {
     const kind = d.kind === 'credit' ? 'Рассрочка' : 'Продажа';
     const state = d.closed_at ? 'Закрыта' : (d.kind === 'credit' ? `до ${d.due_date || '—'}` : '');
     const meta = [d.buyer_name, d.buyer_phone, d.buyer_passport, state].filter(Boolean).join(' · ');
-    const canClose = d.kind === 'credit' && !d.closed_at && isMachineBoss();
+    const canClose = d.kind === 'credit' && !d.closed_at && isMachineBoss() && workActionsVisible();
     return `
       <div class="section-label">${kind} · ${escapeHtml(String(d.sold_at || '').slice(0, 10))}</div>
       <div class="c-surface c-surface--list">
@@ -1897,16 +2003,20 @@ async function toggleMachinePayment(machineId, paymentId, wasPaid, btn) {
 // действие, которого у него нет.
 function machineActionsHtml(m, card) {
   const buttons = [];
+  // Руководству без «Рабочих действий» карточка — просмотр (цена,
+  // себестоимость, сделки): моточасы, правка, статусы, продажа и рассрочка —
+  // работа менеджера. Удаление — контроль, оно видно всегда (ниже).
+  const work = workActionsVisible();
   // «Прибыла» — работа приёмки, её делает и менеджер (`can_arrive`, ручка
   // /api/machines/arrive). Раньше переход «В пути → На складе» был только в
   // графе руководства, и у менеджера на машине в пути не было ни одной кнопки,
   // кроме моточасов.
-  const arrive = m.status === 'in_transit' && card.can_arrive;
+  const arrive = work && m.status === 'in_transit' && card.can_arrive;
   if (arrive) {
     buttons.push(`<button class="btn-primary" data-mact="arrive">${icon('check')} Прибыла</button>`);
   }
-  buttons.push(`<button class="btn-secondary" data-mact="hours">${icon('gauge')} Моточасы</button>`);
-  if (card.can_manage) {
+  if (work) buttons.push(`<button class="btn-secondary" data-mact="hours">${icon('gauge')} Моточасы</button>`);
+  if (card.can_manage && work) {
     buttons.push(`<button class="btn-secondary" data-mact="edit">${icon('edit')} Изменить</button>`);
     for (const opt of card.next_statuses || []) {
       // Тот же переход, что «Прибыла», — второй кнопкой он был бы дублем.
@@ -1921,14 +2031,17 @@ function machineActionsHtml(m, card) {
       buttons.push('<button class="btn-secondary" data-mact="sale">Продажа</button>');
       buttons.push('<button class="btn-secondary" data-mact="credit">Рассрочка</button>');
     }
-    // Удаление только у машины без сделок: продажа — денежный факт, стирать
-    // его вместе с карточкой нельзя, такие уводят в архив. Сервер это тоже
-    // проверяет, здесь просто не показываем заведомо отказную кнопку.
-    if (!(card.deals || []).length) {
-      buttons.push(`<button class="btn-secondary btn-danger" data-mact="delete">${icon('trash')} Удалить</button>`);
-    }
   }
-  return `<div class="c-actions c-actions--wrap">${buttons.join('')}</div>`;
+  // Удаление только у машины без сделок: продажа — денежный факт, стирать
+  // его вместе с карточкой нельзя, такие уводят в архив. Сервер это тоже
+  // проверяет, здесь просто не показываем заведомо отказную кнопку.
+  // Кто удаляет — сервер (`can_delete`, пока его нет — `can_manage`);
+  // менеджеру кнопка гаснет при `delete_requires_boss` (deleteActionsVisible).
+  const canDelete = ('can_delete' in card ? card.can_delete : card.can_manage) && deleteActionsVisible();
+  if (canDelete && !(card.deals || []).length) {
+    buttons.push(`<button class="btn-secondary btn-danger" data-mact="delete">${icon('trash')} Удалить</button>`);
+  }
+  return buttons.length ? `<div class="c-actions c-actions--wrap">${buttons.join('')}</div>` : '';
 }
 
 async function deleteMachine(machine) {
@@ -2021,7 +2134,9 @@ async function renderContainers() {
             ? 'Проверьте номер или поищите по слову из заметки.'
             : 'Заведите контейнер, когда он выйдет в путь — и будет видно, чего ждать.',
         }))
-    + `<div class="c-actions"><button class="btn-secondary" id="container-new">${icon('plus')} Новый контейнер</button></div>`;
+    + (workActionsVisible()
+      ? `<div class="c-actions"><button class="btn-secondary" id="container-new">${icon('plus')} Новый контейнер</button></div>`
+      : '');
   wireSectionNav(content, 'stock', renderStockScreen);
 
   content.querySelector('#container-new')?.addEventListener('click', () => openContainerForm());
@@ -2770,7 +2885,10 @@ async function renderContainerCard(containerId) {
   const arrived = c.status === 'arrived';
   const receipt = card.receipt || {};
   const win = card.edit_window || { open: true };
-  const canEdit = win.open;
+  // Состав, сверка, прибытие и приход — работа приёмки: у руководства только
+  // с «Рабочими действиями». Себестоимость (costing) и удаление — контроль.
+  const work = workActionsVisible();
+  const canEdit = win.open && work;
   const canManage = canEdit;   // ручки состава открыты всем трём ролям
 
   const facts = [
@@ -2823,9 +2941,9 @@ async function renderContainerCard(containerId) {
       </div>`;
   }
 
-  const closedNote = arrived && !canEdit
+  const closedNote = arrived && !win.open
     ? '<div class="items-total schedule-total"><span>Приёмка закрыта</span><b>правки больше не принимаются</b></div>'
-    : arrived && win.hours_left != null
+    : arrived && work && win.hours_left != null
       ? `<div class="card-row-sub">Правки принимаются ещё ${Math.ceil(win.hours_left)} ч</div>`
       : '';
 
@@ -2844,9 +2962,9 @@ async function renderContainerCard(containerId) {
       ${canEdit ? `<button class="btn-secondary" id="cont-item-add">${icon('plus')} ${arrived ? 'Лишняя позиция' : 'Позиция'}</button>` : ''}
       ${canEdit && arrived ? '<button class="btn-primary" id="cont-save">Сохранить сверку</button>' : ''}
       ${canEdit && !arrived ? '<button class="btn-primary" id="cont-arrive">Отметить прибытие</button>' : ''}
-      ${arrived && !receipt.legacy ? `<button class="btn-secondary" id="cont-supply">${icon('box')} ${receipt.invoice_id ? 'Переоприходовать' : 'Оприходовать'}</button>` : ''}
-      ${arrived && card.can_manage ? `<button class="btn-secondary" id="cont-post">${icon('cart')} Пост в канал</button>` : ''}
-      ${canEdit && card.can_manage ? `<button class="btn-secondary btn-danger" id="cont-del">${icon('trash')} Удалить</button>` : ''}
+      ${arrived && work && !receipt.legacy ? `<button class="btn-secondary" id="cont-supply">${icon('box')} ${receipt.invoice_id ? 'Переоприходовать' : 'Оприходовать'}</button>` : ''}
+      ${arrived && work && card.can_manage ? `<button class="btn-secondary" id="cont-post">${icon('cart')} Пост в канал</button>` : ''}
+      ${win.open && ('can_delete' in card ? card.can_delete : card.can_manage) && deleteActionsVisible() ? `<button class="btn-secondary btn-danger" id="cont-del">${icon('trash')} Удалить</button>` : ''}
     </div>
     ${supplyBlock}
     <div id="costing-host"></div>
@@ -3133,10 +3251,11 @@ async function loadPhotos(root, endpoint, bodyFor) {
 function machinePhotosHtml(card) {
   return photoStripHtml(card.photos, {
     addId: 'machine-photo-add',
-    canUpload: card.can_upload_photo,
+    // Фото заводит менеджер: у руководства — с «Рабочими действиями».
+    canUpload: card.can_upload_photo && workActionsVisible(),
     // Ручка удаления отвечает только admin/boss — крестик у остальных был бы
     // кнопкой, которая гарантированно отвечает отказом.
-    canDelete: isMachineBoss(),
+    canDelete: isMachineBoss() && workActionsVisible(),
     alt: 'Фото машины',
   });
 }
@@ -4201,7 +4320,9 @@ function renderOrdersMain(opts = {}) {
   const { orders, role } = ordersData;
   const isBoss = role === 'admin' || role === 'boss';
   // roleIn: менеджер пока отгружает за кладовщика (ROLE_ALSO_ACTS_AS).
-  const canShip = isBoss || roleIn(role, ['warehouse_keeper']);
+  // Руководству «Отгрузить» и «Внести оплату» — только с «Рабочими
+  // действиями»: у него на заказе одно действие — «Отменить».
+  const canShip = (isBoss && workActionsVisible()) || roleIn(role, ['warehouse_keeper']);
   // «Новый заказ» — только менеджеру. Было `!isBoss`, то есть и кладовщику с
   // бухгалтером, а /api/orders/create им отвечает 403 (can_create_orders:
   // admin/boss/manager). Руководству кнопку не рисуем и раньше: заказы
@@ -4515,8 +4636,8 @@ function renderOrdersMain(opts = {}) {
     });
   });
 
-  // Заявки для босса
-  document.getElementById('show-requests')?.addEventListener('click', renderPendingRequests);
+  // Заявки для руководства — часть «Решений».
+  document.getElementById('show-requests')?.addEventListener('click', () => showScreen('decisions'));
 }
 
 
@@ -5113,9 +5234,6 @@ async function submitOrder() {
 
 async function renderPendingRequests() {
   const content = document.getElementById('content');
-  // fmt был локальным в других рендерах, но не здесь → кредит-блок заявки
-  // (fmt(...)) кидал ReferenceError, и весь экран заявок падал в errorBox.
-  const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
   content.innerHTML = loading('Загружаю заявки…');
   try {
     const data = await api('/api/orders/requests', {});
@@ -5133,11 +5251,28 @@ async function renderPendingRequests() {
       `;
       return;
     }
-    // Имя менеджера, клиент и названия позиций — ввод ДРУГИХ людей, а экран —
-    // босса: без escapeHtml это stored-XSS в сессии, у которой есть
-    // initData и право одобрять заявки с превышением лимита.
-    const items = data.requests.map(r => `
-      <div class="order-card" data-status="pending">
+    content.innerHTML = `
+      <div class="editor-header">
+        <div class="editor-title">Заявки (${data.requests.length})</div>
+      </div>
+      <div class="orders-list">${requestCardsHtml(data.requests)}</div>
+    `;
+    wireRequestCards(content, renderPendingRequests);
+  } catch (e) {
+    content.innerHTML = errorBox(e.message);
+  }
+}
+
+// Карточки заявок на одобрение — в «Заявках» и в «Решениях» руководителя.
+// Имя менеджера, клиент и названия позиций — ввод ДРУГИХ людей, а экран —
+// босса: без escapeHtml это stored-XSS в сессии, у которой есть
+// initData и право одобрять заявки с превышением лимита.
+function requestCardsHtml(requests) {
+  // fmt был локальным в других рендерах, но не здесь → кредит-блок заявки
+  // (fmt(...)) кидал ReferenceError, и весь экран заявок падал в errorBox.
+  const fmt = n => formatMoney(n);  // UI-WP-05: один формат на весь фронт
+  return requests.map(r => `
+      <div class="order-card" data-status="pending" data-request="${r.id}">
         <div class="order-header">
           <div>
             <div class="order-title">${icon('clock')} Заявка #${r.id}</div>
@@ -5188,45 +5323,38 @@ async function renderPendingRequests() {
         </div>
       </div>
     `).join('');
-
-    content.innerHTML = `
-      <div class="editor-header">
-        <div class="editor-title">Заявки (${data.requests.length})</div>
-      </div>
-      <div class="orders-list">${items}</div>
-    `;
-
-    document.querySelectorAll('.btn-approve').forEach(btn =>
-      btn.addEventListener('click', () => handleRequest(btn.dataset.req, 'approve'))
-    );
-    document.querySelectorAll('.btn-reject').forEach(btn =>
-      btn.addEventListener('click', () => {
-        // Отклонение заявки — консеквентно (менеджер переделывает): подтверждаем.
-        tg.showConfirm('Отклонить заявку? Менеджеру придётся создать её заново.', ok => {
-          if (ok) handleRequest(btn.dataset.req, 'reject');
-        });
-      })
-    );
-    // T3.1: «На доработку» — мягкая альтернатива отклонению: заказ возвращается
-    // в черновик, менеджер правит и переотправляет ту же заявку. Эндпоинт был,
-    // кнопки не было, поэтому босс мог только «Одобрить» или «Отклонить».
-    // Причина обязательна (сервер требует ≥3 символов) — раскрываем поле,
-    // как в отмене заказа.
-    document.querySelectorAll('.btn-draft').forEach(btn =>
-      btn.addEventListener('click', () => {
-        const box = document.querySelector(`.draft-box[data-req="${btn.dataset.req}"]`);
-        if (box) box.hidden = !box.hidden;
-      })
-    );
-    document.querySelectorAll('.draft-send').forEach(btn =>
-      btn.addEventListener('click', () => returnRequestToDraft(btn.dataset.req))
-    );
-  } catch (e) {
-    content.innerHTML = errorBox(e.message);
-  }
 }
 
-async function returnRequestToDraft(reqId) {
+// `refresh` — чем перерисоваться после решения (список заявок или «Решения»).
+function wireRequestCards(root, refresh) {
+  root.querySelectorAll('.btn-approve').forEach(btn =>
+    btn.addEventListener('click', () => handleRequest(btn.dataset.req, 'approve', refresh))
+  );
+  root.querySelectorAll('.btn-reject').forEach(btn =>
+    btn.addEventListener('click', () => {
+      // Отклонение заявки — консеквентно (менеджер переделывает): подтверждаем.
+      tg.showConfirm('Отклонить заявку? Менеджеру придётся создать её заново.', ok => {
+        if (ok) handleRequest(btn.dataset.req, 'reject', refresh);
+      });
+    })
+  );
+  // T3.1: «На доработку» — мягкая альтернатива отклонению: заказ возвращается
+  // в черновик, менеджер правит и переотправляет ту же заявку. Эндпоинт был,
+  // кнопки не было, поэтому босс мог только «Одобрить» или «Отклонить».
+  // Причина обязательна (сервер требует ≥3 символов) — раскрываем поле,
+  // как в отмене заказа.
+  root.querySelectorAll('.btn-draft').forEach(btn =>
+    btn.addEventListener('click', () => {
+      const box = root.querySelector(`.draft-box[data-req="${btn.dataset.req}"]`);
+      if (box) box.hidden = !box.hidden;
+    })
+  );
+  root.querySelectorAll('.draft-send').forEach(btn =>
+    btn.addEventListener('click', () => returnRequestToDraft(btn.dataset.req, refresh))
+  );
+}
+
+async function returnRequestToDraft(reqId, refresh = renderPendingRequests) {
   const box = document.querySelector(`.draft-box[data-req="${reqId}"]`);
   const comment = (box?.querySelector('.draft-comment')?.value || '').trim();
   if (comment.length < 3) {
@@ -5245,10 +5373,10 @@ async function returnRequestToDraft(reqId) {
   } catch (e) {
     tg.showAlert(`❌ ${e.message}`);
   }
-  await renderPendingRequests();
+  await refresh();
 }
 
-async function handleRequest(reqId, action) {
+async function handleRequest(reqId, action, refresh = renderPendingRequests) {
   // Раньше тут был tg.sendData() — он работает ТОЛЬКО когда WebApp
   // открыт из ReplyKeyboardButton. У нас WebApp открывается из меню,
   // поэтому sendData молча игнорировался и кнопка «не работала».
@@ -5283,7 +5411,181 @@ async function handleRequest(reqId, action) {
   } catch (e) {
     tg.showAlert(`❌ ${e.message}`);
   }
-  await renderPendingRequests();
+  await refresh();
+}
+
+// ─── Экран: Решения (руководитель) ──────────────────────────────────────────
+//
+// Всё, что ждёт слова руководителя, — в одном месте с общим бейджем (решение
+// владельца: «смотреть, решать, контролировать»). Раньше заявки жили строкой
+// в «Заказах», оплаты, сдачи и возвраты — вкладкой «Деньги → Подтвердить», и
+// решение приходилось искать по двум разделам.
+//
+// Экран собирается из ПРОВАЙДЕРОВ — `DECISION_GROUPS`. Новый вид решения
+// (например, сделки по технике на одобрение) добавляется одной записью через
+// `registerDecisionGroup({...})`, без правки самого экрана:
+//   key     — уникальное имя группы (data-decision-group);
+//   title   — подпись секции; icon — иконка из спрайта;
+//   path + listKey — список ручкой (api(path)[listKey]); или своя
+//   load(ctx) → Promise<массив>; canLoad(role) — не звать ручку, которая
+//   гарантированно ответит 403 (по умолчанию canCall(path, role));
+//   html(items, ctx) → разметка карточек; wire(root, items, ctx) — проводка
+//   внутри СВОЕЙ секции; ctx.refresh() перерисовывает экран после решения;
+//   listClass — обёртка списка (по умолчанию .debts-list).
+// Сбой одной группы — ошибка с «Повторить» в её секции, остальные на месте.
+const DECISION_GROUPS = [
+  {
+    key: 'requests', title: 'Заявки на отгрузку', icon: 'clock',
+    path: '/api/orders/requests', listKey: 'requests', listClass: 'orders-list',
+    html: (items) => requestCardsHtml(items),
+    wire: (root, _items, ctx) => wireRequestCards(root, ctx.refresh),
+  },
+  {
+    key: 'payments', title: 'Оплаты картой и перечислением', icon: 'card',
+    path: '/api/payments/pending', listKey: 'pending',
+    html: (items, ctx) => paymentCardsHtml(items, ctx),
+    wire: (root, _items, ctx) => wireConfirmCards(root, ctx.refresh),
+  },
+  {
+    key: 'deposits', title: 'Сдачи наличных', icon: 'cash',
+    path: '/api/deposits/pending', listKey: 'deposits',
+    html: (items, ctx) => depositCardsHtml(items, ctx),
+    wire: (root, _items, ctx) => wireConfirmCards(root, ctx.refresh),
+  },
+  {
+    key: 'returns', title: 'Возвраты', icon: 'return',
+    path: '/api/returns/pending', listKey: 'returns',
+    html: (items, ctx) => returnCardsHtml(items, ctx),
+    wire: (root, _items, ctx) => wireConfirmCards(root, ctx.refresh),
+  },
+];
+
+// Точка расширения для других модулей: заменяет группу с тем же key или
+// добавляет новую. `before` — ключ группы, перед которой встать.
+function registerDecisionGroup(group, before) {
+  if (!group || !group.key) return;
+  const at = DECISION_GROUPS.findIndex(g => g.key === group.key);
+  if (at !== -1) { DECISION_GROUPS[at] = group; return; }
+  const pos = before ? DECISION_GROUPS.findIndex(g => g.key === before) : -1;
+  if (pos === -1) DECISION_GROUPS.push(group); else DECISION_GROUPS.splice(pos, 0, group);
+}
+
+async function loadDecisionGroup(g, ctx) {
+  if (typeof g.load === 'function') return (await g.load(ctx)) || [];
+  const res = await api(g.path, {});
+  if (res && res.confirmers_exist === false) ctx.confirmersExist = false;
+  return (res && res[g.listKey]) || [];
+}
+
+async function renderDecisionsScreen() {
+  const content = document.getElementById('content');
+  const gen = screenGen();
+  setScreenContext('Решения');
+  content.innerHTML = skeleton('label') + skeleton('list', 3);
+  const r = role();
+  const ctx = {
+    role: r, isBoss: isBossRole(), confirmersExist: true,
+    refresh: () => renderDecisionsScreen(),
+  };
+  const groups = DECISION_GROUPS.filter(g =>
+    (typeof g.canLoad === 'function' ? g.canLoad(r) : (!g.path || canCall(g.path, r))));
+  const results = await Promise.all(groups.map(g =>
+    loadDecisionGroup(g, ctx).then(items => ({ g, items }), error => ({ g, error }))));
+  // Человек ушёл, пока грузились списки, — чужой экран не затираем.
+  if (gen !== screenGen()) return;
+  const box = document.getElementById('content');
+
+  const total = results.reduce((a, x) => a + (x.items ? x.items.length : 0), 0);
+  // Счётчик — только когда все группы ответили: частичный занизил бы бейдж.
+  if (!results.some(x => x.error)) setDecisionsBadge(total);
+
+  const sections = results.map(({ g, items, error }) => {
+    if (error) {
+      return `<div class="decision-group" data-decision-group="${escapeHtml(g.key)}">`
+        + `<div class="section-label">${icon(g.icon || 'clock')} ${escapeHtml(g.title)}</div>`
+        + errorBoxHtml(error.message, { retryAttr: 'data-decisions-retry="1"' }) + '</div>';
+    }
+    if (!items.length) return '';
+    return `<div class="decision-group" data-decision-group="${escapeHtml(g.key)}">`
+      + `<div class="section-label">${icon(g.icon || 'clock')} ${escapeHtml(g.title)} (${items.length})</div>`
+      + `<div class="${escapeHtml(g.listClass || 'debts-list')}">${g.html(items, ctx)}</div></div>`;
+  }).join('');
+
+  box.innerHTML = sections || emptyState({
+    icon: 'check',
+    title: 'Решений не ждёт',
+    hint: 'Заявки, оплаты картой, сдачи наличных и возвраты появятся здесь, как только их оформят.',
+  });
+  box.querySelectorAll('[data-decisions-retry]').forEach(b =>
+    b.addEventListener('click', () => renderDecisionsScreen()));
+  results.forEach(({ g, items, error }) => {
+    if (error || !items.length || typeof g.wire !== 'function') return;
+    const root = Array.from(box.querySelectorAll('[data-decision-group]'))
+      .find(el => el.dataset.decisionGroup === g.key);
+    if (root) g.wire(root, items, ctx);
+  });
+}
+
+// ─── Экран: Настройки (руководитель) ────────────────────────────────────────
+// Реквизиты компании, курсы валют, выключатель «Рабочие действия». Раньше
+// реквизиты жили кнопкой во вкладке «Документы», курсы — строкой в «Лимитах»:
+// руководитель без «Рабочих действий» до них бы не дошёл.
+async function renderSettingsScreen() {
+  const content = document.getElementById('content');
+  const gen = screenGen();
+  setScreenContext('Настройки');
+  content.innerHTML = skeleton('list', 3);
+  let meta = null;
+  try {
+    meta = await api('/api/docs/types', {});
+  } catch (_e) {
+    meta = null;   // реквизиты недоступны — остальные настройки всё равно нужны
+  }
+  if (gen !== screenGen()) return;
+  const box = document.getElementById('content');
+  const company = (meta && meta.company) || {};
+  const companySub = company.company_name
+    ? `${company.company_name}${company.company_city ? ' · ' + company.company_city : ''}`
+    : 'Не заполнены — нужны для расписок';
+  const row = (id, ic, title, sub) => `
+      <div class="c-row c-row--tap" id="${id}" role="button" tabindex="0">
+        <div class="card-row-icon">${icon(ic)}</div>
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(title)}</div>
+          <div class="card-row-sub">${escapeHtml(sub)}</div>
+        </div>
+      </div>`;
+  const staffSub = role() === 'admin'
+    ? 'Роли и доступ — в боте: /users, /addrole, /deactivate'
+    : 'Роли назначает администратор (в боте: /users, /addrole)';
+  box.innerHTML = `
+    <div class="section-label">Интерфейс</div>
+    <div class="c-surface c-surface--list">${workSwitchHtml(workActionsVisible(), 'c-row')}</div>
+    <div class="section-label">Компания</div>
+    <div class="c-surface c-surface--list">
+      ${meta && meta.can_edit_company ? row('set-company', 'building', 'Реквизиты компании', companySub) : ''}
+      ${row('set-rates', 'cash', 'Курсы валют', 'Курс к базовой валюте — для сводок и оплат')}
+    </div>
+    <div class="section-label">Сотрудники</div>
+    <div class="c-surface c-surface--list">
+      <div class="c-row">
+        <div class="card-row-icon">${icon('user')}</div>
+        <div class="card-row-info">
+          <div class="card-row-title">Сотрудники и роли</div>
+          <div class="card-row-sub">${escapeHtml(staffSub)}</div>
+        </div>
+      </div>
+    </div>
+    ${versionFooterHtml()}`;
+  box.querySelector('[data-work-switch]')?.addEventListener('click', (ev) => toggleWorkActions(ev.currentTarget));
+  box.querySelector('#set-company')?.addEventListener('click', () => {
+    haptic('light');
+    openCompanyForm(meta, () => showScreen('settings'));
+  });
+  box.querySelector('#set-rates')?.addEventListener('click', () => {
+    haptic('light');
+    renderCurrencyRates(() => showScreen('settings'));
+  });
 }
 // ─── Экран: Аналитика ───────────────────────────────
 
@@ -5929,8 +6231,11 @@ async function renderLeadsFunnel(container) {
   if (speed) html += '<div class="section-label">Скорость ответа</div>' + speed;
   if ((lead.awaiting || []).length) {
     html += `<div class="section-label">Ждут ответа · ${lead.awaiting.length}</div>`;
+    // Карточка клиента (звонки, исход) — работа менеджера: у руководства без
+    // «Рабочих действий» строка без перехода.
+    const leadTap = workActionsVisible();
     html += '<div class="c-surface c-surface--list">' + lead.awaiting.map(l => `
-      <div class="c-row c-row--tap" data-lead="${l.id}" data-status="overdue" role="button" tabindex="0">
+      <div class="c-row${leadTap ? ' c-row--tap' : ''}" ${leadTap ? `data-lead="${l.id}" role="button" tabindex="0"` : ''} data-status="overdue">
         <div class="card-row-info">
           <div class="card-row-title">${escapeHtml(l.display_name || l.username || '—')}</div>
           <div class="card-row-sub">написал ${escapeHtml(String(l.last_inbound_at || '').slice(0, 16))}</div>
@@ -6636,7 +6941,8 @@ async function renderMoneyScreen() {
   const content = document.getElementById('content');
   const r = role();
   const boss = isBossRole();
-  const isConfirmer = roleIn(r, ['admin', 'boss', 'bookkeeper', 'warehouse_keeper']);
+  // Руководство подтверждает в «Решениях» — вкладки «Подтвердить» у него нет.
+  const isConfirmer = !boss && roleIn(r, ['admin', 'boss', 'bookkeeper', 'warehouse_keeper']);
 
   // Миграция старых/внешних ключей вкладок на текущий набор.
   if (['payments', 'cashbox', 'my'].includes(moneyTab)) moneyTab = isConfirmer ? 'confirm' : 'ops';
@@ -6763,83 +7069,10 @@ async function renderCashbox(container, section) {
   }
   if (section === 'confirm') setConfirmBadge(null, deposits.length + returns.length + payPending.length);
 
-  const depCards = deposits.map(d => {
-    const dcur = d.currency || baseCur();
-    const orders = payDepositOrdersText(d.orders);
-    return `
-      <div class="debt-card" data-dep="${d.id}">
-        <div class="debt-card-top">
-          <div class="debt-agent">${icon('cash')} Сдача #${d.id}</div>
-          <div class="debt-amount">${fmt(d.amount)} ${escapeHtml(dcur)}</div>
-        </div>
-        <div class="debt-card-mid"><span class="debt-meta">Заказы: ${escapeHtml(orders)}${d.manager_name ? ' · ' + escapeHtml(d.manager_name) : ''}</span></div>
-        ${Number(d.unallocated) > 0 ? `<div class="debt-card-mid"><span class="debt-meta">Не распределено по заказам: ${formatMoney(d.unallocated, escapeHtml(dcur))}</span></div>` : ''}
-        ${d.is_own && !isBoss && !confirmersExist ? `<div class="debt-hint">Это ваша сдача: руководителя и бухгалтера в системе нет, поэтому подтверждаете вы — это попадёт в журнал.</div>` : ''}
-        ${d.is_own && !isBoss && confirmersExist ? `<div class="debt-hint">Это ваша сдача — её подтверждает руководитель или бухгалтер.</div>` : ''}
-        <div class="debt-actions">
-          <button class="btn-confirm-pay dep-confirm">${icon('check')} Подтвердить</button>
-          <button class="btn-reject-pay dep-reject">${icon('close')} Отклонить</button>
-        </div>
-        <div class="limit-edit dep-reject-box" hidden>
-          <input type="text" class="form-input dep-reason" placeholder="Причина отклонения">
-          <button class="btn-reject-pay dep-reject-send">Отклонить сдачу</button>
-        </div>
-      </div>
-    `;
-  }).join('');
-
-  // Приёмку товара отмечает склад, а деньги по возврату подтверждает только
-  // руководство (/api/returns/confirm — admin/boss). Кладовщику кнопка
-  // «Подтвердить возврат» раньше рисовалась и отвечала 403.
-  const canConfirmReturn = canCall('/api/returns/confirm', role);
-  const canMarkGoods = canCall('/api/returns/goods_received', role);
-  const retCards = returns.map(r => `
-      <div class="debt-card" data-ret="${r.id}">
-        <div class="debt-card-top">
-          <div class="debt-agent">${icon('return')} Возврат #${r.id}</div>
-          <div class="debt-amount">${fmt(r.total_amount)} ${baseCur()}</div>
-        </div>
-        <div class="debt-card-mid">
-          <span class="debt-meta">Заказ #${r.order_id} · ${escapeHtml(r.reason || '')}</span>
-        </div>
-        <div class="debt-actions">
-          ${r.goods_received
-            ? `<span class="debt-meta">${icon('check')} Товар принят</span>`
-            : canMarkGoods ? `<button class="btn-reject-pay ret-goods">${icon('box')} Товар получен</button>` : ''}
-          ${canConfirmReturn ? `<button class="btn-confirm-pay ret-confirm" ${r.goods_received ? '' : 'disabled'}>
-            ${icon('check')} Подтвердить возврат
-          </button>` : `<span class="debt-meta">Деньги подтверждает руководитель</span>`}
-        </div>
-        ${r.goods_received || !canConfirmReturn ? '' : `
-          <div class="debt-card-mid">
-            <span class="debt-meta">Сначала отметьте приёмку товара — иначе деньги
-            уйдут из кассы за непривезённый товар.</span>
-          </div>`}
-      </div>
-  `).join('');
-
-  // Платежи по paid-заказам, ждущие подтверждения боссом (раньше — вкладка
-  // «Платежи»; теперь часть «Подтверждений» кассы).
-  const payCards = payPending.map(d => `
-      <div class="debt-card debt-awaiting" data-pay="${d.order_id}">
-        <div class="debt-card-top">
-          <div class="debt-agent">${icon('building')} ${escapeHtml(d.agent_name || '—')}</div>
-          <div class="debt-amount">${fmt(d.confirmable != null ? d.confirmable : d.pending)} ${escapeHtml(d.currency || 'USD')}</div>
-        </div>
-        <div class="debt-card-mid">
-          <span class="debt-meta">Заказ #${d.order_id} · из ${fmt(d.total)} ${escapeHtml(d.currency || 'USD')} · ${escapeHtml(d.full_name || '')}</span>
-        </div>
-        ${(d.parts || []).filter(p => p.state !== 'rejected').length ? `
-          <div class="debt-breakdown">${d.parts.filter(p => p.state !== 'rejected')
-            .map(p => `<span>• ${escapeHtml(payPartLine(p))}</span>`).join('')}</div>` : `
-          <div class="debt-hint">Способ оплаты не указан (запись до разбивки)</div>`}
-        ${d.recorded_by_me && !isBoss && !confirmersExist ? `<div class="debt-hint">Оплату вносили вы: руководителя и бухгалтера в системе нет, поэтому подтверждаете вы — это попадёт в журнал.</div>` : ''}
-        <div class="debt-actions">
-          <button class="btn-confirm-pay pay-confirm" data-id="${d.order_id}">${icon('check')} Подтвердить ${fmt(d.confirmable != null ? d.confirmable : d.pending)} ${escapeHtml(d.currency || 'USD')}</button>
-          <button class="btn-reject-pay pay-reject" data-id="${d.order_id}">${icon('close')} Отклонить</button>
-        </div>
-      </div>
-  `).join('');
+  const cardCtx = { isBoss, confirmersExist, role };
+  const depCards = depositCardsHtml(deposits, cardCtx);
+  const retCards = returnCardsHtml(returns, cardCtx);
+  const payCards = paymentCardsHtml(payPending, cardCtx);
 
   const payBlock = payPending.length
     ? `<div class="section-label section-awaiting">${icon('clock')} Оплаты на подтверждении (${payPending.length})</div><div class="debts-list">${payCards}</div>`
@@ -7214,96 +7447,8 @@ async function renderCashbox(container, section) {
     });
   }
 
-  // Сдачи: подтвердить / отклонить (причина — inline).
-  container.querySelectorAll('.debt-card[data-dep]').forEach(card => {
-    const id = card.dataset.dep;
-    card.querySelector('.dep-confirm').addEventListener('click', (ev) => {
-      const b = ev.currentTarget;
-      if (b.disabled) return;
-      b.disabled = true;  // защита от двойного тапа (сервер идемпотентен, UX — нет)
-      haptic('light');
-      api('/api/deposits/confirm', { deposit_id: Number(id), idempotency_key: idemKey() })
-        .then((r) => {
-          haptic('success');
-          const closed = (r && r.closed_orders || []).map(o => '#' + o).join(', ');
-          toast(`Сдача подтверждена${closed ? ' · закрыты заказы ' + closed : ''}${r && r.self_confirmed ? ' · подтверждено вами — руководителя нет' : ''}`);
-          renderMoneyScreen();
-        })
-        .catch(e => { b.disabled = false; toast(e.message, 'error'); });
-    });
-    const box = card.querySelector('.dep-reject-box');
-    card.querySelector('.dep-reject').addEventListener('click', () => { box.hidden = !box.hidden; });
-    card.querySelector('.dep-reject-send').addEventListener('click', (ev) => {
-      const b = ev.currentTarget;
-      const reason = card.querySelector('.dep-reason').value.trim();
-      if (reason.length < 3) { tg.showAlert('❌ Укажите причину'); return; }
-      if (b.disabled) return;
-      b.disabled = true;
-      api('/api/deposits/reject', { deposit_id: Number(id), reason })
-        .then(() => { toast('Сдача отклонена', 'info'); renderMoneyScreen(); })
-        .catch(e => { b.disabled = false; toast(e.message, 'error'); });
-    });
-  });
-
-  // Возвраты: отметить приёмку товара, затем подтвердить.
-  container.querySelectorAll('.debt-card[data-ret]').forEach(card => {
-    // T3.1: кнопка «Товар получен». Эндпоинт был, кнопки не было — после T2.8
-    // (подтверждение требует приёмки) отметить её можно было только из бота.
-    card.querySelector('.ret-goods')?.addEventListener('click', (ev) => {
-      const b = ev.currentTarget;
-      if (b.disabled) return;
-      b.disabled = true;
-      haptic('light');
-      api('/api/returns/goods_received', {
-        return_id: Number(card.dataset.ret),
-        idempotency_key: idemKey(),
-      })
-        .then(() => { haptic('success'); toast('Товар отмечен как принятый'); renderMoneyScreen(); })
-        .catch(e => { b.disabled = false; toast(e.message, 'error'); });
-    });
-    card.querySelector('.ret-confirm')?.addEventListener('click', (ev) => {
-      const b = ev.currentTarget;
-      if (b.disabled) return;
-      b.disabled = true;  // защита от двойного тапа
-      haptic('light');
-      api('/api/returns/confirm', { return_id: Number(card.dataset.ret), idempotency_key: idemKey() })
-        .then(() => { haptic('success'); toast('Возврат подтверждён'); renderMoneyScreen(); })
-        .catch(e => { b.disabled = false; toast(e.message, 'error'); });
-    });
-  });
-
-  // Оплаты по paid-заказам: подтвердить / отклонить (перенесено из «Платежей»).
-  container.querySelectorAll('.pay-confirm').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const id = parseInt(btn.dataset.id, 10);
-      tg.showConfirm('Подтверждаете поступление оплаты по заказу #' + id + '?', async ok => {
-        if (!ok) return;
-        btn.disabled = true;
-        try {
-          const r = await api('/api/orders/confirm_payment', { order_id: id, idempotency_key: idemKey() });
-          tg.HapticFeedback?.notificationOccurred('success');
-          // Карточка просто исчезала из списка — без слова, прошло ли.
-          toast(`Оплата по заказу #${id} подтверждена${r && r.self_note ? ' · ' + r.self_note : ''}`);
-          renderMoneyScreen();
-        } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
-      });
-    });
-  });
-  container.querySelectorAll('.pay-reject').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const id = parseInt(btn.dataset.id, 10);
-      tg.showConfirm('Отклонить оплату по заказу #' + id + '?', async ok => {
-        if (!ok) return;
-        btn.disabled = true;
-        try {
-          await api('/api/orders/reject_payment', { order_id: id, idempotency_key: idemKey() });
-          tg.HapticFeedback?.notificationOccurred('warning');
-          toast(`Оплата по заказу #${id} отклонена`, 'info');
-          renderMoneyScreen();
-        } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
-      });
-    });
-  });
+  // Подтверждения сдач, возвратов и оплат — общая проводка с экраном «Решения».
+  wireConfirmCards(container, renderMoneyScreen);
 
   // Черновик — восстанавливаем через те же кнопки, что нажимает человек
   // («Ещё валюта», валюта строки, способ возврата): проводка остаётся одна.
@@ -7333,6 +7478,198 @@ async function renderCashbox(container, section) {
     container.addEventListener('input', saveCash);
     container.addEventListener('click', saveCash);
   }
+}
+
+// ─── Карточки подтверждений: сдачи, возвраты, оплаты ────────────────────────
+// Одни и те же в «Деньги → Подтвердить» (менеджер, бухгалтер, кладовщик) и в
+// «Решениях» руководителя: разметка и проводка — здесь, экран передаёт только,
+// чем перерисоваться после решения.
+function depositCardsHtml(deposits, ctx) {
+  const { isBoss, confirmersExist } = ctx;
+  const fmt = n => formatMoney(n);
+  return deposits.map(d => {
+    const dcur = d.currency || baseCur();
+    const orders = payDepositOrdersText(d.orders);
+    return `
+      <div class="debt-card" data-dep="${d.id}">
+        <div class="debt-card-top">
+          <div class="debt-agent">${icon('cash')} Сдача #${d.id}</div>
+          <div class="debt-amount">${fmt(d.amount)} ${escapeHtml(dcur)}</div>
+        </div>
+        <div class="debt-card-mid"><span class="debt-meta">Заказы: ${escapeHtml(orders)}${d.manager_name ? ' · ' + escapeHtml(d.manager_name) : ''}</span></div>
+        ${Number(d.unallocated) > 0 ? `<div class="debt-card-mid"><span class="debt-meta">Не распределено по заказам: ${formatMoney(d.unallocated, escapeHtml(dcur))}</span></div>` : ''}
+        ${d.is_own && !isBoss && !confirmersExist ? `<div class="debt-hint">Это ваша сдача: руководителя и бухгалтера в системе нет, поэтому подтверждаете вы — это попадёт в журнал.</div>` : ''}
+        ${d.is_own && !isBoss && confirmersExist ? `<div class="debt-hint">Это ваша сдача — её подтверждает руководитель или бухгалтер.</div>` : ''}
+        <div class="debt-actions">
+          <button class="btn-confirm-pay dep-confirm">${icon('check')} Подтвердить</button>
+          <button class="btn-reject-pay dep-reject">${icon('close')} Отклонить</button>
+        </div>
+        <div class="limit-edit dep-reject-box" hidden>
+          <input type="text" class="form-input dep-reason" placeholder="Причина отклонения">
+          <button class="btn-reject-pay dep-reject-send">Отклонить сдачу</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function returnCardsHtml(returns, ctx) {
+  const role = ctx.role;
+  const fmt = n => formatMoney(n);
+  // Приёмку товара отмечает склад, а деньги по возврату подтверждает только
+  // руководство (/api/returns/confirm — admin/boss). Кладовщику кнопка
+  // «Подтвердить возврат» раньше рисовалась и отвечала 403.
+  const canConfirmReturn = canCall('/api/returns/confirm', role);
+  // «Товар получен» — работа склада: у руководства она за «Рабочими действиями».
+  const canMarkGoods = canCall('/api/returns/goods_received', role) && workActionsVisible();
+  return returns.map(r => `
+      <div class="debt-card" data-ret="${r.id}">
+        <div class="debt-card-top">
+          <div class="debt-agent">${icon('return')} Возврат #${r.id}</div>
+          <div class="debt-amount">${fmt(r.total_amount)} ${baseCur()}</div>
+        </div>
+        <div class="debt-card-mid">
+          <span class="debt-meta">Заказ #${r.order_id} · ${escapeHtml(r.reason || '')}</span>
+        </div>
+        <div class="debt-actions">
+          ${r.goods_received
+            ? `<span class="debt-meta">${icon('check')} Товар принят</span>`
+            : canMarkGoods ? `<button class="btn-reject-pay ret-goods">${icon('box')} Товар получен</button>` : ''}
+          ${canConfirmReturn ? `<button class="btn-confirm-pay ret-confirm" ${r.goods_received ? '' : 'disabled'}>
+            ${icon('check')} Подтвердить возврат
+          </button>` : `<span class="debt-meta">Деньги подтверждает руководитель</span>`}
+        </div>
+        ${r.goods_received || !canConfirmReturn ? '' : canMarkGoods ? `
+          <div class="debt-card-mid">
+            <span class="debt-meta">Сначала отметьте приёмку товара — иначе деньги
+            уйдут из кассы за непривезённый товар.</span>
+          </div>` : `
+          <div class="debt-card-mid">
+            <span class="debt-meta">Ждёт отметки склада о приёмке товара — без неё
+            деньги ушли бы из кассы за непривезённый товар.</span>
+          </div>`}
+      </div>
+  `).join('');
+}
+
+function paymentCardsHtml(payPending, ctx) {
+  const { isBoss, confirmersExist } = ctx;
+  const fmt = n => formatMoney(n);
+  // Платежи по paid-заказам, ждущие подтверждения боссом (раньше — вкладка
+  // «Платежи»; теперь часть «Подтверждений» кассы).
+  return payPending.map(d => `
+      <div class="debt-card debt-awaiting" data-pay="${d.order_id}">
+        <div class="debt-card-top">
+          <div class="debt-agent">${icon('building')} ${escapeHtml(d.agent_name || '—')}</div>
+          <div class="debt-amount">${fmt(d.confirmable != null ? d.confirmable : d.pending)} ${escapeHtml(d.currency || 'USD')}</div>
+        </div>
+        <div class="debt-card-mid">
+          <span class="debt-meta">Заказ #${d.order_id} · из ${fmt(d.total)} ${escapeHtml(d.currency || 'USD')} · ${escapeHtml(d.full_name || '')}</span>
+        </div>
+        ${(d.parts || []).filter(p => p.state !== 'rejected').length ? `
+          <div class="debt-breakdown">${d.parts.filter(p => p.state !== 'rejected')
+            .map(p => `<span>• ${escapeHtml(payPartLine(p))}</span>`).join('')}</div>` : `
+          <div class="debt-hint">Способ оплаты не указан (запись до разбивки)</div>`}
+        ${d.recorded_by_me && !isBoss && !confirmersExist ? `<div class="debt-hint">Оплату вносили вы: руководителя и бухгалтера в системе нет, поэтому подтверждаете вы — это попадёт в журнал.</div>` : ''}
+        <div class="debt-actions">
+          <button class="btn-confirm-pay pay-confirm" data-id="${d.order_id}">${icon('check')} Подтвердить ${fmt(d.confirmable != null ? d.confirmable : d.pending)} ${escapeHtml(d.currency || 'USD')}</button>
+          <button class="btn-reject-pay pay-reject" data-id="${d.order_id}">${icon('close')} Отклонить</button>
+        </div>
+      </div>
+  `).join('');
+}
+
+function wireConfirmCards(container, refresh) {
+  // Сдачи: подтвердить / отклонить (причина — inline).
+  container.querySelectorAll('.debt-card[data-dep]').forEach(card => {
+    const id = card.dataset.dep;
+    card.querySelector('.dep-confirm').addEventListener('click', (ev) => {
+      const b = ev.currentTarget;
+      if (b.disabled) return;
+      b.disabled = true;  // защита от двойного тапа (сервер идемпотентен, UX — нет)
+      haptic('light');
+      api('/api/deposits/confirm', { deposit_id: Number(id), idempotency_key: idemKey() })
+        .then((r) => {
+          haptic('success');
+          const closed = (r && r.closed_orders || []).map(o => '#' + o).join(', ');
+          toast(`Сдача подтверждена${closed ? ' · закрыты заказы ' + closed : ''}${r && r.self_confirmed ? ' · подтверждено вами — руководителя нет' : ''}`);
+          refresh();
+        })
+        .catch(e => { b.disabled = false; toast(e.message, 'error'); });
+    });
+    const box = card.querySelector('.dep-reject-box');
+    card.querySelector('.dep-reject').addEventListener('click', () => { box.hidden = !box.hidden; });
+    card.querySelector('.dep-reject-send').addEventListener('click', (ev) => {
+      const b = ev.currentTarget;
+      const reason = card.querySelector('.dep-reason').value.trim();
+      if (reason.length < 3) { tg.showAlert('❌ Укажите причину'); return; }
+      if (b.disabled) return;
+      b.disabled = true;
+      api('/api/deposits/reject', { deposit_id: Number(id), reason })
+        .then(() => { toast('Сдача отклонена', 'info'); refresh(); })
+        .catch(e => { b.disabled = false; toast(e.message, 'error'); });
+    });
+  });
+
+  // Возвраты: отметить приёмку товара, затем подтвердить.
+  container.querySelectorAll('.debt-card[data-ret]').forEach(card => {
+    // T3.1: кнопка «Товар получен». Эндпоинт был, кнопки не было — после T2.8
+    // (подтверждение требует приёмки) отметить её можно было только из бота.
+    card.querySelector('.ret-goods')?.addEventListener('click', (ev) => {
+      const b = ev.currentTarget;
+      if (b.disabled) return;
+      b.disabled = true;
+      haptic('light');
+      api('/api/returns/goods_received', {
+        return_id: Number(card.dataset.ret),
+        idempotency_key: idemKey(),
+      })
+        .then(() => { haptic('success'); toast('Товар отмечен как принятый'); refresh(); })
+        .catch(e => { b.disabled = false; toast(e.message, 'error'); });
+    });
+    card.querySelector('.ret-confirm')?.addEventListener('click', (ev) => {
+      const b = ev.currentTarget;
+      if (b.disabled) return;
+      b.disabled = true;  // защита от двойного тапа
+      haptic('light');
+      api('/api/returns/confirm', { return_id: Number(card.dataset.ret), idempotency_key: idemKey() })
+        .then(() => { haptic('success'); toast('Возврат подтверждён'); refresh(); })
+        .catch(e => { b.disabled = false; toast(e.message, 'error'); });
+    });
+  });
+
+  // Оплаты по paid-заказам: подтвердить / отклонить (перенесено из «Платежей»).
+  container.querySelectorAll('.pay-confirm').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = parseInt(btn.dataset.id, 10);
+      tg.showConfirm('Подтверждаете поступление оплаты по заказу #' + id + '?', async ok => {
+        if (!ok) return;
+        btn.disabled = true;
+        try {
+          const r = await api('/api/orders/confirm_payment', { order_id: id, idempotency_key: idemKey() });
+          tg.HapticFeedback?.notificationOccurred('success');
+          // Карточка просто исчезала из списка — без слова, прошло ли.
+          toast(`Оплата по заказу #${id} подтверждена${r && r.self_note ? ' · ' + r.self_note : ''}`);
+          refresh();
+        } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
+      });
+    });
+  });
+  container.querySelectorAll('.pay-reject').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = parseInt(btn.dataset.id, 10);
+      tg.showConfirm('Отклонить оплату по заказу #' + id + '?', async ok => {
+        if (!ok) return;
+        btn.disabled = true;
+        try {
+          await api('/api/orders/reject_payment', { order_id: id, idempotency_key: idemKey() });
+          tg.HapticFeedback?.notificationOccurred('warning');
+          toast(`Оплата по заказу #${id} отклонена`, 'info');
+          refresh();
+        } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
+      });
+    });
+  });
 }
 
 // Список «Клиенты» (boss/admin): контрагенты с МС-балансом + локальным долгом/
@@ -7890,7 +8227,9 @@ async function renderDebts(container) {
           // («ждут 12к, а осталось 0?»). Теперь одна фраза с причиной.
           const dcur = escapeHtml(d.currency || '');
           const parts = (d.parts || []).filter(p => p.state !== 'confirmed' && p.state !== 'rejected');
-          const canConfirmHere = !!data.can_confirm && Number(d.pending_confirmable) > 0;
+          // Руководство подтверждает в «Решениях»; «Долги» у него — просмотр.
+          const canConfirmHere = !!data.can_confirm && Number(d.pending_confirmable) > 0
+            && (!isBoss || workActionsVisible());
           const breakdown = `
             <div class="debt-breakdown">
               ${d.confirmed > 0 ? `<span>${icon('check')} Уже подтверждено: <b>${fmt(d.confirmed)} ${dcur}</b></span>` : ''}
@@ -7918,7 +8257,7 @@ async function renderDebts(container) {
                 </div>
               ` : ''}
               ${who ? `<div class="debt-hint">${who}</div>` : ''}
-              ${(d.is_mine || isBoss) && Number(d.claimable) > 0 ? `
+              ${(d.is_mine || (isBoss && workActionsVisible())) && Number(d.claimable) > 0 ? `
                 <div class="pay-input-row">
                   <input type="hidden" class="pay-amount-input" data-id="${d.id}">
                   <button class="btn-secondary btn-pay-debt" data-id="${d.id}">${icon('cash')} Внести ещё оплату</button>
@@ -7961,7 +8300,7 @@ async function renderDebts(container) {
               <span class="debt-state">${stateLabel}: <b>${dueStr}</b></span>
               <span class="debt-meta">#${d.id} · ${plural(d.items_count, ['позиция', 'позиции', 'позиций'])}${ownerStr}</span>
             </div>
-            ${d.is_mine || isBoss ? `
+            ${d.is_mine || (isBoss && workActionsVisible()) ? `
               <div class="pay-input-row">
                 <input type="hidden" class="pay-amount-input" data-id="${d.id}">
                 <button class="btn-primary btn-pay-debt" data-id="${d.id}">${icon('cash')} Внести оплату · ост. ${fmt(d.remaining)} ${escapeHtml(d.currency || '')}</button>
@@ -8160,7 +8499,9 @@ async function renderWhInvoiceList() {
     return;
   }
 
-  const canCancel = whIsBoss();
+  // Отмена накладной — контроль: руководству всегда, менеджеру — если ручка
+  // его пустит и `delete_requires_boss` выключена.
+  const canCancel = canCall('/api/wh/invoices/cancel', role()) && deleteActionsVisible();
   const canPrint = !!data.can_print;
   content.innerHTML = stockShellHtml() + newBtn + rows.map(inv => {
     const cancelled = inv.status === 'cancelled';
@@ -8357,7 +8698,7 @@ async function renderDocsTab() {
   });
 }
 
-function openCompanyForm(meta) {
+function openCompanyForm(meta, onDone) {
   const company = meta.company || {};
   openMachineSheet({
     title: 'Реквизиты компании',
@@ -8369,7 +8710,7 @@ function openCompanyForm(meta) {
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
       toast('Реквизиты сохранены');
-      renderDocsTab();
+      if (typeof onDone === 'function') onDone(); else renderDocsTab();
       return true;
     },
   });

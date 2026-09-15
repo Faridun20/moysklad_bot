@@ -11,6 +11,10 @@ import pytest
 
 from tests.e2e.conftest import go, seed_order, settled, sheet_fill, tab
 
+# Руководитель здесь делает работу менеджера — с «Рабочими действиями»
+# (conftest.boss_work_actions). Вид по умолчанию — test_boss_ui.py.
+pytestmark = pytest.mark.usefixtures("boss_work_actions")
+
 
 def _seed_lead(e2e, *, tg_user_id: int = 555_001, name: str = "Азиз Р.") -> int:
     from services import leads

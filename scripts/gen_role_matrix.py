@@ -40,7 +40,8 @@ NO_AUTH = "без авторизации"
 SCREEN_MAP = [
     ("Главная", "все активные", "/api/home"),
     ("Заказы (список)", "admin, boss, manager", "/api/orders"),
-    ("Заявки на апрув", "admin, boss", "/api/orders/requests"),
+    ("Решения (заявки, оплаты, сдачи, возвраты)", "admin, boss", "/api/orders/requests"),
+    ("Меню → «Рабочие действия» (вид, не права)", "admin, boss", "/api/prefs/set"),
     ("Редактор заказа", "admin, boss, manager", "/api/orders/create"),
     ("Каталог/Склад", "admin, boss, manager, warehouse_keeper", "/api/stock"),
     ("Деньги → Подтвердить", "admin, boss, bookkeeper, manager*", "/api/deposits/pending"),
@@ -51,7 +52,7 @@ SCREEN_MAP = [
     ("Деньги (лента)", "admin, boss", "/api/money/summary"),
     ("Операционная сводка", "admin, boss", "/api/ops-summary"),
     ("Возвраты (приёмка)", "admin, boss, warehouse_keeper, manager*", "/api/returns/pending"),
-    ("Заказы → «Отгрузить»", "admin, boss, warehouse_keeper, manager*", "/api/orders/ship"),
+    ("Заказы → «Отгрузить» (руководство — с «Рабочими действиями»)", "admin, boss, warehouse_keeper, manager*", "/api/orders/ship"),
     ("Заказы → Техника", "admin, boss, manager", "/api/machines/list"),
     ("Техника → карточка", "admin, boss, manager", "/api/machines/card"),
     ("Техника → сделки", "admin, boss", "/api/machines/deal"),
@@ -73,7 +74,9 @@ HEADER = """# QA-чеклист WebApp по ролям (UI-WP-33)
 ## Как проверять
 
 Под каждой ролью пройти все её разделы (Сегодня → Продажи → Склад → Деньги →
-Клиенты; набор зависит от роли) и убедиться, что:
+Клиенты; у руководства ещё Решения и Настройки, а работа менеджера — за
+выключателем «Рабочие действия» в «Меню», проверить в обоих положениях; набор
+зависит от роли) и убедиться, что:
 
 1. экран открывается и не показывает `errorBox` вместо данных;
 2. чего роли не положено — не отрисовано (кнопки/секции нет, а не «нажимается

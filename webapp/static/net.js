@@ -213,6 +213,7 @@
     '/api/money/summary': ['admin', 'boss'],
     '/api/wh/invoices/cancel': ['admin', 'boss'],
     '/api/currency/rates/set': ['admin', 'boss'],
+    '/api/prefs/set': ['admin', 'boss'],
   };
 
   function canCall(path, role) {

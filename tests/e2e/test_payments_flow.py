@@ -16,7 +16,13 @@ from __future__ import annotations
 
 import os
 
-from tests.e2e.conftest import go, pay_form, pay_order, seed_order, settled, tab
+from tests.e2e.conftest import go, pay_form, pay_order, seed_order, settled, tab, open_confirmations
+
+import pytest
+
+# Руководитель здесь делает работу менеджера — с «Рабочими действиями»
+# (conftest.boss_work_actions). Вид по умолчанию — test_boss_ui.py.
+pytestmark = pytest.mark.usefixtures("boss_work_actions")
 
 
 def _shot(page, name: str) -> None:
@@ -105,8 +111,7 @@ def test_paid_order_split_payment_handover_and_confirmation_close_the_debt(open_
     ]
 
     # ── Руководитель: «Заказы: #N — 5 000 USD», сдача и карта подтверждены.
-    go(boss, "money")
-    tab(boss, "confirm")
+    open_confirmations(boss)
     dep_card = f'.debt-card[data-dep="{dep}"]'
     boss.wait_for_selector(dep_card)
     assert f"Заказы: #{oid} — 5 000 USD" in _norm(boss.locator(dep_card).inner_text())
@@ -186,8 +191,7 @@ def test_debt_order_ships_without_money_and_is_paid_by_breakdown(open_app, e2e):
     _toast(mgr, "Сдача #")
     dep = e2e.rows("SELECT d.id, c.currency FROM cash_deposits d JOIN cash_deposit_currency c ON c.deposit_id = d.id")
     assert [r["currency"] for r in dep] == ["UZS"]
-    go(boss, "money")
-    tab(boss, "confirm")
+    open_confirmations(boss)
     dep_card = f'.debt-card[data-dep="{dep[0]["id"]}"]'
     boss.wait_for_selector(dep_card)
     assert f"#{oid} — 1 270 000 UZS" in _norm(boss.locator(dep_card).inner_text())

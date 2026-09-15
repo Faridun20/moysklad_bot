@@ -12,6 +12,12 @@ from __future__ import annotations
 
 from tests.e2e.conftest import go, seed_order, settled, tab, pay_form
 
+import pytest
+
+# Руководитель здесь делает работу менеджера — с «Рабочими действиями»
+# (conftest.boss_work_actions). Вид по умолчанию — test_boss_ui.py.
+pytestmark = pytest.mark.usefixtures("boss_work_actions")
+
 
 def _add_position(page, product_id: int) -> None:
     page.click("#wh-add")

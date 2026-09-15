@@ -66,7 +66,8 @@ Variable: новые сервисы (cron'ы) переменную не насл
 `dep_*`, `ret_*`, `unfreeze:`), ops/admin-команды без API-аналога (`/audit`,
 `/log`, `/users`, `/addrole`, `/deactivate`, `/reactivate`,
 `/frozen`, `/printer`),
-`/find`, `/ship`, `/cancel`, `/shipments`, `/pay`, а из техники — только
+`/find`, `/ship`, `/cancel`, `/shipments`, `/pay` (в автокомплите руководителя —
+только `/start`, `/find`, `/machine_deals`, `/cancel`), а из техники — только
 просмотр (`/machines`, карточка, `/machine_deals`) и `/hours <id> <часы>`
 (показание снимают с площадки, где открыть WebApp дольше, чем набрать два
 числа).
@@ -1174,6 +1175,36 @@ Telegram-WebView он разворачивается системным спис
 `nav_screens(page)` (панель + шторка), текущий раздел — `current_screen(page)`;
 `.nav-item.active` для раздела из шторки пуст.
 Шторка берёт «Назад» Telegram и при закрытии возвращает «Назад» экрана под ней.
+**Руководитель: «смотреть, решать, контролировать» (решение владельца).** У
+admin/boss порядок разделов свой (`BOSS_NAV_ORDER`): панель «Сегодня · Решения ·
+Деньги · Продажи · Меню», склад, клиенты и «Настройки» — в шторке. Вкладки
+под роль — одна чистая функция `roleSectionTabs(section, role, {work})` в
+`helpers.js` (app.js `sectionTabsFor` — обёртка). Работа менеджера (накладные,
+«Отгрузить»/«Внести оплату», «Касса», «Документы», «Лиды», «Канал», моточасы,
+правка/статусы/продажа техники, приёмка контейнера, «Товар получен», отметки
+рассрочки, фото) у руководства — за выключателем **«Рабочие действия»** в
+«Меню» и «Настройках»: `workActionsVisible()` (у остальных ролей всегда true —
+их интерфейс не менялся). Это личная настройка ВИДА, а не права: таблица
+`user_prefs` (`services/user_prefs.py`), `/api/me → prefs`, `/api/prefs/set`
+(admin/boss, аудит `pref_set`); ручки её не читают. Удаление — контроль:
+`deleteActionsVisible()` — руководству всегда, менеджеру пока
+`delete_requires_boss` (из `/api/me`, нет поля — выкл.) не включена; кнопка
+удаления машины/контейнера смотрит `can_delete` карточки, пока его нет —
+`can_manage`. **«Решения»** (`renderDecisionsScreen`) — все подтверждения
+руководства одним экраном с общим бейджем на панели (`setDecisionsBadge`;
+«Сегодня» считает его по пунктам очереди с `screen: "decisions"`). Экран
+собирается из провайдеров `DECISION_GROUPS` — новый вид решения подключается
+`registerDecisionGroup({key, title, icon, path+listKey | load, html, wire})`,
+сам экран не правится; карточки и проводка подтверждений общие с «Деньги →
+Подтвердить» (`depositCardsHtml`/`returnCardsHtml`/`paymentCardsHtml`/
+`wireConfirmCards`, заявки — `requestCardsHtml`/`wireRequestCards`). Старые
+адреса `money:confirm` и `requests` у руководства ведёт в «Решения»
+`resolveScreen`, у остальных `decisions` — в «Подтвердить». **Deep link:**
+`?startapp=decisions` (web_app-кнопка — `utils.keyboards.webapp_screen_url` /
+`webapp_keyboard(screen=…)`) или `start_param` у t.me-ссылки — `launchScreen`
+в app.js. В e2e модули, где руководитель делает работу менеджера, подключают
+`boss_work_actions`; вид по умолчанию — `tests/e2e/test_boss_ui.py`.
+
 **Поколение экрана (`screenGen`/`bumpScreenGen`).** Рендер асинхронный, и
 человек уходит раньше, чем пришёл ответ: «Сегодня» ждала `/api/home`, он нажал
 «Деньги» — и главная дописалась поверх «Денег». `showScreen` подменяет узел

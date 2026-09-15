@@ -8,7 +8,9 @@
 ## Как проверять
 
 Под каждой ролью пройти все её разделы (Сегодня → Продажи → Склад → Деньги →
-Клиенты; набор зависит от роли) и убедиться, что:
+Клиенты; у руководства ещё Решения и Настройки, а работа менеджера — за
+выключателем «Рабочие действия» в «Меню», проверить в обоих положениях; набор
+зависит от роли) и убедиться, что:
 
 1. экран открывается и не показывает `errorBox` вместо данных;
 2. чего роли не положено — не отрисовано (кнопки/секции нет, а не «нажимается
@@ -23,13 +25,13 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 151._
+_Всего эндпоинтов: 152._
 
 
 > **Временное совмещение ролей** (`services/roles.py::ROLE_ALSO_ACTS_AS`): `manager` = + `warehouse_keeper`, `bookkeeper`. Кладовщика и бухгалтера в штате пока нет, их работу делает менеджер; списки ниже уже учитывают это. Роли `warehouse_keeper`/`bookkeeper` через `/addrole` не назначаются. `*` в таблице экранов — доступ через совмещение.
 
 
-### Админ (`admin`) — 130 эндпоинтов
+### Админ (`admin`) — 131 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -135,6 +137,7 @@ _Всего эндпоинтов: 151._
 - `/api/payments/pending`
 - `/api/payments/send`
 - `/api/payments/unlinked`
+- `/api/prefs/set`
 - `/api/products/photo`
 - `/api/products/photo_delete`
 - `/api/products/photo_upload`
@@ -167,7 +170,7 @@ _Всего эндпоинтов: 151._
 </details>
 
 
-### Руководитель (`boss`) — 127 эндпоинтов
+### Руководитель (`boss`) — 128 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -271,6 +274,7 @@ _Всего эндпоинтов: 151._
 - `/api/payments/link`
 - `/api/payments/pending`
 - `/api/payments/unlinked`
+- `/api/prefs/set`
 - `/api/products/photo`
 - `/api/products/photo_delete`
 - `/api/products/photo_upload`
@@ -458,7 +462,8 @@ _Всего эндпоинтов: 151._
 |---|---|---|
 | Главная | все активные | `/api/home` |
 | Заказы (список) | admin, boss, manager | `/api/orders` |
-| Заявки на апрув | admin, boss | `/api/orders/requests` |
+| Решения (заявки, оплаты, сдачи, возвраты) | admin, boss | `/api/orders/requests` |
+| Меню → «Рабочие действия» (вид, не права) | admin, boss | `/api/prefs/set` |
 | Редактор заказа | admin, boss, manager | `/api/orders/create` |
 | Каталог/Склад | admin, boss, manager, warehouse_keeper | `/api/stock` |
 | Деньги → Подтвердить | admin, boss, bookkeeper, manager* | `/api/deposits/pending` |
@@ -469,7 +474,7 @@ _Всего эндпоинтов: 151._
 | Деньги (лента) | admin, boss | `/api/money/summary` |
 | Операционная сводка | admin, boss | `/api/ops-summary` |
 | Возвраты (приёмка) | admin, boss, warehouse_keeper, manager* | `/api/returns/pending` |
-| Заказы → «Отгрузить» | admin, boss, warehouse_keeper, manager* | `/api/orders/ship` |
+| Заказы → «Отгрузить» (руководство — с «Рабочими действиями») | admin, boss, warehouse_keeper, manager* | `/api/orders/ship` |
 | Заказы → Техника | admin, boss, manager | `/api/machines/list` |
 | Техника → карточка | admin, boss, manager | `/api/machines/card` |
 | Техника → сделки | admin, boss | `/api/machines/deal` |

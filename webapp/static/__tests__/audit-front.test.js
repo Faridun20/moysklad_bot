@@ -162,8 +162,10 @@ describe('«Деньги → Подтвердить»', () => {
   });
 
   it('вкладка «Подтвердить» не грузит списки дважды (счётчик берётся из тела)', async () => {
+    // Менеджер (совмещает кладовщика и бухгалтера) — у руководства этой
+    // вкладки нет, его подтверждения в «Решениях».
     const window = boot(`
-      currentUser = { role: 'boss', user_id: 1 };
+      currentUser = { role: 'manager', user_id: 1 };
       currentScreen = 'money';
       moneyTab = 'confirm';
       window.__calls = [];

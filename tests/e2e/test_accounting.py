@@ -17,6 +17,10 @@ import pytest
 from tests.e2e import test_cov_click_everything as _crawler
 from tests.e2e.conftest import go, seed_order, settled, tab
 
+# Руководитель здесь делает работу менеджера — с «Рабочими действиями»
+# (conftest.boss_work_actions). Вид по умолчанию — test_boss_ui.py.
+pytestmark = pytest.mark.usefixtures("boss_work_actions")
+
 # Фикстуры обходчика (принтер-заглушка, лимитер выключен) — присваиванием, а не
 # импортом имён: pytest находит фикстуру по имени в модуле, а импорт того же
 # имени, затенённый параметром теста, линтер считает переопределением.

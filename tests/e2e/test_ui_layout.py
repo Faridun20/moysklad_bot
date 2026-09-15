@@ -13,6 +13,12 @@ from __future__ import annotations
 
 from tests.e2e.conftest import go, settled, tab
 
+import pytest
+
+# Руководитель здесь делает работу менеджера — с «Рабочими действиями»
+# (conftest.boss_work_actions). Вид по умолчанию — test_boss_ui.py.
+pytestmark = pytest.mark.usefixtures("boss_work_actions")
+
 
 def _seed_categories(e2e, names):
     from services import container_receipt, warehouse

@@ -22,6 +22,10 @@ import pytest
 
 from tests.e2e.conftest import alerts, current_screen, go, nav_screens, seed_order, settled, sheet_fill, tab
 
+# Руководитель здесь делает работу менеджера — с «Рабочими действиями»
+# (conftest.boss_work_actions). Вид по умолчанию — test_boss_ui.py.
+pytestmark = pytest.mark.usefixtures("boss_work_actions")
+
 MGR2 = 201  # второй менеджер — для проверок «видит только своё»
 
 
@@ -228,7 +232,7 @@ def test_queue_is_sorted_by_urgency(open_app, e2e):
     boss = open_app(e2e.ids["boss"])
     boss.wait_for_selector('[data-queue="stock:containers"]')
     order = boss.eval_on_selector_all("[data-queue]", "els => els.map(e => e.dataset.queue)")
-    assert order == ["money:debts", "requests", "stock:containers"], order
+    assert order == ["money:debts", "decisions", "stock:containers"], order
     counts = boss.eval_on_selector_all("[data-queue] .queue-count", "els => els.map(e => +e.textContent)")
     assert counts == [1, 1, 1]
     assert "требует вас · 3" in _text(boss).lower()  # подписи разделов — капсом (CSS)
@@ -255,11 +259,11 @@ def test_queue_container_row_opens_containers_tab(open_app, e2e):
 def test_queue_payments_row_opens_confirm_tab_for_boss(open_app, e2e):
     seeded = seed_order(e2e, payment_type="paid", due_date=None)  # платёж ждёт подтверждения
     boss = open_app(e2e.ids["boss"])
-    row = boss.locator('[data-queue="money:confirm"]:has-text("Платежи на подтверждение")')
+    row = boss.locator('[data-queue="decisions"]:has-text("Платежи на подтверждение")')
     row.wait_for()
     assert row.locator(".queue-count").inner_text() == "1"
     row.click()
-    _wait_screen(boss, "money", "confirm")
+    _wait_screen(boss, "decisions")
     boss.wait_for_selector(f'.pay-confirm[data-id="{seeded["order_id"]}"]')
 
 

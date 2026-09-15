@@ -16,6 +16,12 @@ from datetime import date
 
 from tests.e2e.conftest import go, settled, tab
 
+import pytest
+
+# Руководитель здесь делает работу менеджера — с «Рабочими действиями»
+# (conftest.boss_work_actions). Вид по умолчанию — test_boss_ui.py.
+pytestmark = pytest.mark.usefixtures("boss_work_actions")
+
 UZS_ARRIVAL = 12500  # курс, который босс впишет на карточке
 UZS_TODAY = 13000    # курс дня продажи
 
