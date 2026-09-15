@@ -55,6 +55,35 @@ _PG_POOL_MAX = int(os.environ.get("PG_POOL_MAX", "10"))
 _PG_POOL_ACQUIRE_TIMEOUT = float(os.environ.get("PG_POOL_ACQUIRE_TIMEOUT", "10"))
 _PG_POOL_ACQUIRE_INTERVAL = 0.05
 
+# Сколько синхронное соединение может простоять ВНУТРИ открытой транзакции, пока
+# сервер его не оборвёт. psycopg2 открывает транзакцию первым же SELECT'ом, и
+# `with get_conn()`, внутри которого случился сетевой вызов или зависший поток,
+# держал бы снимок и блокировки часами: VACUUM не чистит, `FOR UPDATE` соседа
+# ждёт, пул теряет соединение. 5 минут — на порядок больше любой рабочей
+# транзакции. Активно работающую сессию таймаут не трогает (он про простой
+# между командами), поэтому длинные прогоны `tasks.migrate` и разовых скриптов
+# ему не мешают; скрипт, которому нужно думать между запросами дольше,
+# снимает ограничение: PG_IDLE_IN_TX_TIMEOUT_MS=0. asyncpg-пул это не
+# касается — у него свои таймауты (`adb_core.pg_server_settings`).
+_DEFAULT_IDLE_IN_TX_TIMEOUT_MS = 300_000
+
+
+def pg_session_options() -> dict[str, str]:
+    """kwargs для psycopg2.connect: `options=-c idle_in_transaction_session_timeout=…`.
+
+    Env читается при создании пула, а не при импорте: скрипт может выставить
+    значение до первого обращения к базе. 0 — ограничение снято (опции нет).
+    """
+    try:
+        ms = max(0, int(os.environ.get("PG_IDLE_IN_TX_TIMEOUT_MS", _DEFAULT_IDLE_IN_TX_TIMEOUT_MS)))
+    except (TypeError, ValueError):
+        ms = _DEFAULT_IDLE_IN_TX_TIMEOUT_MS
+    if ms == 0 or "options=" in DATABASE_URL:
+        # Свои `options` в URL уже заданы — kwargs их ПЕРЕЗАПИСАЛИ бы целиком
+        # (psycopg2.extensions.make_dsn), и чужая настройка молча пропала бы.
+        return {}
+    return {"options": f"-c idle_in_transaction_session_timeout={ms}"}
+
 if USE_POSTGRES:
     from psycopg2 import pool as _pg_pool
     from psycopg2.extras import RealDictCursor
@@ -68,8 +97,9 @@ if USE_POSTGRES:
         в окружениях без DATABASE_URL (тесты, миграции) без падения."""
         global _pg_connection_pool
         if _pg_connection_pool is None:
+            kwargs = pg_session_options()
             _pg_connection_pool = _pg_pool.ThreadedConnectionPool(
-                _PG_POOL_MIN, _PG_POOL_MAX, DATABASE_URL
+                _PG_POOL_MIN, _PG_POOL_MAX, DATABASE_URL, **kwargs
             )
             logger.info(
                 "Postgres pool создан: min=%d, max=%d",

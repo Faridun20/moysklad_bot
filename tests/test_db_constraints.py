@@ -322,6 +322,21 @@ def test_float_params_become_exact_decimals_for_asyncpg():
     assert adb_core._pg_args(plain) is plain
 
 
+def test_idle_in_transaction_timeout_option(isolated_db, monkeypatch):
+    db = isolated_db
+    monkeypatch.delenv("PG_IDLE_IN_TX_TIMEOUT_MS", raising=False)
+    assert db.pg_session_options() == {
+        "options": "-c idle_in_transaction_session_timeout=300000"
+    }
+    monkeypatch.setenv("PG_IDLE_IN_TX_TIMEOUT_MS", "0")
+    assert db.pg_session_options() == {}
+    monkeypatch.setenv("PG_IDLE_IN_TX_TIMEOUT_MS", "60000")
+    assert db.pg_session_options()["options"].endswith("=60000")
+    # Свои options в URL не перетираем.
+    monkeypatch.setattr(db, "DATABASE_URL", "postgresql://u@h/db?options=-c%20search_path%3Dx")
+    assert db.pg_session_options() == {}
+
+
 # ─── Скрипт ──────────────────────────────────────────────────────────────────
 
 
