@@ -110,6 +110,55 @@ def test_pending_return_below_threshold_shows_in_digest(isolated_db):
     assert f"заказ #{oid}" in data["returns"]["lines"][0]
 
 
+def test_pending_cash_payment_part_excluded_from_payments_block(isolated_db):
+    """Наличная строка разбивки подтверждается СДАЧЕЙ, а не кнопкой
+    подтверждения — как и `get_money_totals`, дайджест не должен показывать
+    её в «Платежах на подтверждение»: иначе она дублирует «Сдачи» (одни и те
+    же наличные посчитаны и там, и там)."""
+    from services import boss_digest as bd
+    from services import order_payments
+
+    db = isolated_db
+    db.set_role(10, "u", "Manager", "manager")
+    oid = db.create_order(10, "Manager", "")
+    db.update_order_agent(oid, "A-1", "Клиент")
+    db.add_order_item(oid, "Товар", "", 1, "шт", 100.0)
+    db.update_order_status(oid, "approved")
+    actor = order_payments.Actor(user_id=10, name="Manager", role="manager")
+    _run(order_payments.record_payment_parts(
+        oid, actor, [{"method": "cash", "currency": "USD", "amount": "100"}]
+    ))
+
+    data = _run(bd.gather())
+    assert data["payments"]["count"] == 0
+    assert bd.is_empty(data) is True
+
+
+def test_confirmed_cash_deposit_part_excluded_from_received(isolated_db):
+    """Подтверждённая наличная строка разбивки не считается в «Получено» —
+    эти деньги уже посчитаны в «Сдачах» (`get_money_totals` не считает
+    наличные строки платежами по той же причине)."""
+    from services import boss_digest as bd
+    from services import order_payments
+
+    db = isolated_db
+    db.set_role(10, "u", "Manager", "manager")
+    db.set_role(1, "b", "Boss", "boss")
+    oid = db.create_order(10, "Manager", "")
+    db.update_order_agent(oid, "A-1", "Клиент")
+    db.add_order_item(oid, "Товар", "", 1, "шт", 100.0)
+    db.update_order_status(oid, "approved")
+    actor = order_payments.Actor(user_id=10, name="Manager", role="manager")
+    _run(order_payments.record_payment_parts(
+        oid, actor, [{"method": "cash", "currency": "USD", "amount": "100"}]
+    ))
+    dep = _run(db.create_cash_deposit(10, 100.0))
+    assert _run(db.confirm_cash_deposit(dep["deposit_id"], 1, "Boss"))["ok"]
+
+    data = _run(bd.gather())
+    assert data["received"]["count"] == 0
+
+
 def test_confirmed_small_payment_counts_as_received(isolated_db):
     from services import boss_digest as bd
 

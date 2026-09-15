@@ -147,13 +147,28 @@ async def gather() -> dict:
     confirmed_recent = await db.get_confirmed_payments_since(since)
 
     dep_currency = await order_payments.deposit_currency([int(d["id"]) for d in deposits_all])
-    parts = await order_payments.parts_by_payment([int(p["id"]) for p in payments_all])
+    parts = await order_payments.parts_by_payment(
+        [int(p["id"]) for p in payments_all] + [int(p["id"]) for p in confirmed_recent]
+    )
 
     def _payment_currency(row: dict) -> str:
         return (row.get("currency") or "USD").upper()
 
     def _deposit_currency(row: dict) -> str:
         return dep_currency.get(int(row["id"]), "USD")
+
+    def _is_cash_part(payment_id) -> bool:
+        part = parts.get(int(payment_id))
+        return bool(part) and part.get("method") == "cash"
+
+    # Наличная строка разбивки подтверждается СДАЧЕЙ, а не кнопкой
+    # подтверждения (см. CLAUDE.md, «Оплата заказа», п.5) — эти деньги
+    # считаются в блоке «Сдачи», как и в `services.database.get_money_totals`
+    # (тот же `NOT EXISTS (... method = 'cash')`). Не отфильтровать её здесь
+    # значило бы посчитать одни и те же наличные дважды: и «Платежи на
+    # подтверждение»/«Получено», и «Сдачи».
+    payments_all = [p for p in payments_all if not _is_cash_part(p["id"])]
+    confirmed_recent = [p for p in confirmed_recent if not _is_cash_part(p["id"])]
 
     def _digest_only(rows: list[dict], kind: str, cur_of, amount_key: str = "amount") -> list[dict]:
         return [
