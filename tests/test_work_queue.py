@@ -221,3 +221,30 @@ def test_endpoint_total_matches_the_items(isolated_db, monkeypatch):
     body = _client(monkeypatch).post("/api/today", json={"initData": "2"}).json()
     assert body["total"] == sum(i["count"] for i in body["queue"])
     assert body["total"] > 0
+
+
+def test_boss_decisions_lead_to_one_decisions_screen(isolated_db, monkeypatch):
+    """Всё, что ждёт решения руководителя, ведёт в один экран «Решения» — там
+    общий бейдж. Менеджер (подтверждает за бухгалтера/кладовщика) — прежнее
+    `money:confirm`: его интерфейс не меняли."""
+    from services import work_queue
+
+    db = isolated_db
+    _setup(db)
+
+    async def counts():
+        return {"payments": 2, "deposits": 1, "returns": 3}
+
+    async def pending():
+        return [{"id": 1}, {"id": 2}]
+
+    monkeypatch.setattr(db, "count_boss_attention", counts)
+    monkeypatch.setattr(db, "get_pending_requests", pending)
+
+    boss = {i["key"]: i for i in _run(work_queue.gather(2, "boss"))}
+    for key in ("requests", "payments", "deposits", "returns"):
+        assert boss[key]["screen"] == work_queue.DECISIONS_SCREEN == "decisions", key
+
+    mgr = {i["key"]: i for i in _run(work_queue.gather(1, "manager"))}
+    assert mgr["deposits"]["screen"] == "money:confirm"
+    assert mgr["returns"]["screen"] == "money:confirm"

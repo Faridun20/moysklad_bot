@@ -15,6 +15,7 @@ T3.3 — бот урезан до того, чего нет в WebApp.
 """
 
 import asyncio
+import pytest
 
 from aiogram.filters import Command
 from aiogram.types import BotCommand
@@ -294,3 +295,73 @@ def test_start_still_greets_manager(isolated_db, monkeypatch):
     assert len(msg.answers) == 1  # приветствие одним сообщением, без досылки сводки
     assert "Привет" in msg.answers[0][0]
     assert calls["commands"] == 1
+
+
+def test_boss_autocomplete_is_decisions_and_control_only():
+    """Руководитель смотрит, решает и контролирует (решение владельца): в его
+    автокомплите нет рабочих команд менеджера и склада. Админ сохраняет свои."""
+    from handlers.start import _COMMANDS_ADMIN, _COMMANDS_BOSS, _COMMANDS_MANAGER
+
+    boss = [c.command for c in _COMMANDS_BOSS]
+    assert boss == ["start", "find", "machine_deals", "cancel"]
+    for worker in ("pay", "hours", "printer", "ship", "shipments", "version"):
+        assert worker not in boss, worker
+
+    admin = {c.command for c in _COMMANDS_ADMIN}
+    assert set(boss) <= admin
+    assert {"users", "addrole", "deactivate", "audit", "frozen", "version"} <= admin
+    # Менеджеру набор не меняли.
+    assert {"pay", "hours", "printer", "find", "machines"} <= {c.command for c in _COMMANDS_MANAGER}
+
+
+def test_boss_commands_via_set_commands_for_user():
+    import asyncio
+
+    from handlers.start import set_commands_for_user
+
+    class _CmdBot:
+        async def set_my_commands(self, commands, scope):
+            self.commands = [c.command for c in commands]
+
+    bot = _CmdBot()
+    asyncio.run(set_commands_for_user(bot, 1, "boss"))
+    assert bot.commands == ["start", "find", "machine_deals", "cancel"]
+
+
+def test_boss_menu_has_no_shipments_button():
+    from handlers.start import get_keyboard_for_role
+
+    for role, expected in (("boss", False), ("admin", True), ("manager", True)):
+        markup = get_keyboard_for_role(role)
+        callbacks = (
+            [b.callback_data for row in markup.inline_keyboard for b in row if b.callback_data]
+            if markup else []
+        )
+        assert ("sh:today" in callbacks) is expected, role
+
+
+def test_webapp_screen_url_deep_link(monkeypatch):
+    """«Открыть решения» из уведомлений: адрес WebApp с `startapp=decisions`."""
+    import config
+    from utils.keyboards import DECISIONS_SCREEN, webapp_screen_url
+
+    monkeypatch.setattr(config, "WEBAPP_URL", "https://app.example.org/?v=1")
+    assert webapp_screen_url() == "https://app.example.org/?v=1"
+    assert webapp_screen_url(DECISIONS_SCREEN) == "https://app.example.org/?v=1&startapp=decisions"
+    assert webapp_screen_url("debts", base="https://x.org/") == "https://x.org/?startapp=debts"
+    # Повтор не копит параметры.
+    assert webapp_screen_url("decisions", base="https://x.org/?startapp=old") == "https://x.org/?startapp=decisions"
+    with pytest.raises(ValueError):
+        webapp_screen_url("decisions&x=<b>")
+    monkeypatch.setattr(config, "WEBAPP_URL", "http://localhost:8000/")
+    assert webapp_screen_url(DECISIONS_SCREEN) is None
+
+
+def test_webapp_keyboard_opens_screen(monkeypatch):
+    import handlers._ui as ui
+
+    monkeypatch.setattr(ui, "WEBAPP_URL", "https://app.example.org/")
+    markup = ui.webapp_keyboard("📋 Открыть решения", screen="decisions", menu=False)
+    assert markup.inline_keyboard[0][0].web_app.url == "https://app.example.org/?startapp=decisions"
+    plain = ui.webapp_keyboard(menu=False)
+    assert plain.inline_keyboard[0][0].web_app.url == "https://app.example.org/"

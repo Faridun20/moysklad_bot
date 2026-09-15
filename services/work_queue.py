@@ -76,6 +76,11 @@ async def _awaiting_reply(user_id: int | None) -> int:
     return sum(1 for r in rows if r.get("manager_id") == user_id)
 
 
+# Экран руководителя «Решения» (webapp: раздел `decisions`). Тот же адрес —
+# у deep link из уведомлений (`?startapp=decisions`).
+DECISIONS_SCREEN = "decisions"
+
+
 async def gather(user_id: int, role: str) -> list[dict]:
     """Очередь дел для пользователя. Пустой список — «всё разобрано».
 
@@ -107,14 +112,18 @@ async def gather(user_id: int, role: str) -> list[dict]:
         try:
             counts = await count_boss_attention()
             pending = await get_pending_requests()
+            # Всё, что ждёт решения руководителя, — в одном экране «Решения»
+            # (`DECISIONS_SCREEN`): там общий бейдж, и считает его фронт по
+            # пунктам с этим адресом — новый вид решения, добавленный сюда с тем
+            # же `screen`, попадёт в бейдж сам.
             add("requests", len(pending), "Заявки ждут решения",
-                "отгрузка не поедет, пока не одобрите", "warn", "requests")
+                "отгрузка не поедет, пока не одобрите", "warn", DECISIONS_SCREEN)
             add("payments", counts["payments"], "Платежи на подтверждение",
-                "менеджер отметил оплату", "warn", "money:confirm")
+                "менеджер отметил оплату", "warn", DECISIONS_SCREEN)
             add("deposits", counts["deposits"], "Сдачи наличных",
-                "деньги приняты, но не подтверждены", "warn", "money:confirm")
+                "деньги приняты, но не подтверждены", "warn", DECISIONS_SCREEN)
             add("returns", counts["returns"], "Возвраты на подтверждение",
-                "товар вернулся, решение за вами", "warn", "money:confirm")
+                "товар вернулся, решение за вами", "warn", DECISIONS_SCREEN)
         except Exception:
             logger.warning("work_queue: счётчики руководителя не посчитаны", exc_info=True)
     else:

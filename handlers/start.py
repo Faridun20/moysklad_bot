@@ -60,8 +60,9 @@ def get_keyboard_for_role(role: str):
         kb.button(text="🌐 Открыть WebApp", web_app=WebAppInfo(url=WEBAPP_URL))
         rows += [1]
 
-    # Отгрузки — единственный список, которого нет в WebApp.
-    if role in ("admin", "boss", "manager", "warehouse_keeper"):
+    # Отгрузки — единственный список, которого нет в WebApp. Руководителю
+    # не рисуем: отгрузка — работа склада, у него в меню только решения.
+    if role in ("admin", "manager", "warehouse_keeper"):
         kb.button(text="🚚 Отгрузки", callback_data="sh:today")
         rows += [1]
 
@@ -112,15 +113,19 @@ _COMMANDS_MANAGER = [
     # (can_view_stock: admin/boss/manager) — значит и в автокомплите у них.
     BotCommand(command="printer", description="🖨 Статус принтера"),
 ]
-_COMMANDS_BOSS = _COMMANDS_MANAGER + [
-    # «Выкатилось ли» — вопрос того, кто просил правку, поэтому у босса тоже.
-    BotCommand(command="version", description="📦 Версия на проде"),
+# Руководитель смотрит, решает и контролирует — рабочие команды менеджера
+# (/pay, /hours, /printer) и склада (/ship, /shipments) в его автокомплите не
+# нужны (решение владельца). Сервер их по-прежнему пускает: это набор подсказок,
+# а не права, — в экстренном случае набранная по памяти команда сработает.
+_COMMANDS_BOSS = [
+    BotCommand(command="start", description="🏠 Главное меню"),
+    BotCommand(command="find", description="🔍 Поиск (заказ/платёж/клиент)"),
     BotCommand(command="machine_deals", description="💳 Рассрочки по технике"),
-    BotCommand(command="ship", description="🚚 Отгрузить заказ"),
-    BotCommand(command="shipments", description="🚚 Последние отгрузки"),
     BotCommand(command="cancel", description="🚫 Отменить заказ"),
 ]
 _COMMANDS_ADMIN = _COMMANDS_BOSS + [
+    # «Выкатилось ли» — вопрос того, кто сопровождает прод.
+    BotCommand(command="version", description="📦 Версия на проде"),
     BotCommand(command="users", description="👥 Пользователи"),
     BotCommand(command="addrole", description="🔧 Сменить роль"),
     BotCommand(command="deactivate", description="🚫 Деактивировать пользователя"),
@@ -190,7 +195,10 @@ def get_welcome_text(role: str, first_name: str = "") -> str:
 
     hints = {
         "admin": "Полный доступ. Управление пользователями и аудит — кнопками ниже.",
-        "boss": "Заявки на одобрение и подтверждение платежей — приходят push'ами.",
+        "boss": (
+            "Заявки на одобрение и подтверждение платежей — приходят push'ами; "
+            "всё, что ждёт решения, собрано в WebApp → «Решения»."
+        ),
         "manager": (
             "Создавайте заказы и вносите оплату (наличные / карта / счёт) — всё в WebApp; "
             "«оплату сразу» без внесённой оплаты не отгрузить. "
