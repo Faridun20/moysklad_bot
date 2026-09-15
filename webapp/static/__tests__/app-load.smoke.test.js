@@ -202,17 +202,20 @@ describe('техника: формы', () => {
     photos: [], hours: [], deals: [],
     next_statuses: [{ status: 'reserved', label: '🔒 Забронировать' }],
     can_manage: true,
+    can_request: ['reserve', 'sale', 'credit'],
+    can_delete: true,
+    request: null,
     status_labels: { in_stock: '🏗 На складе', reserved: '🔒 Забронирована' },
   };
   // `responses` — очередь ответов apiResult по порядку вызовов.
-  const boot7 = (role, responses) => {
+  const boot7 = (role, responses, card) => {
     const window = boot(`
       currentUser = { role: '${role}' };
       tg.showConfirm = (text, cb) => { window.__confirmed = text; cb(true); };
       tg.showAlert = (text) => { window.__alerted = text; };
       window.__writes = [];
       const queue = ${JSON.stringify(responses || [])};
-      api = async () => (${JSON.stringify(CARD)});
+      api = async () => (${JSON.stringify(card || CARD)});
       apiResult = async (path, body) => {
         window.__writes.push([path, body]);
         return queue.shift() || { ok: true, status: 200, body: { ok: true }, error: '' };
@@ -225,7 +228,7 @@ describe('техника: формы', () => {
   it('менеджер не видит кнопок, которых ему не разрешит сервер', async () => {
     const window = boot(`
       currentUser = { role: 'manager' };
-      api = async () => (${JSON.stringify({ ...CARD, can_manage: false, next_statuses: [] })});
+      api = async () => (${JSON.stringify({ ...CARD, can_manage: false, next_statuses: [], can_request: [], can_delete: false })});
       window.__ready = renderMachineCard(7);
     `);
     await window.__ready;
@@ -233,7 +236,98 @@ describe('техника: формы', () => {
     expect(content.querySelector('[data-mact="hours"]')).not.toBeNull();   // моточасы — можно
     expect(content.querySelector('[data-mact="edit"]')).toBeNull();
     expect(content.querySelector('[data-mact="sale"]')).toBeNull();
+    expect(content.querySelector('[data-mact="delete"]')).toBeNull();
     expect(content.querySelector('[data-mstatus-to]')).toBeNull();
+  });
+
+  it('менеджер оформляет бронь, продажу и рассрочку — заявкой руководителю', async () => {
+    const window = boot7('manager', [
+      { ok: true, status: 200, body: { ok: true, pending: true, request_id: 3 }, error: '' },
+    ], { ...CARD, can_manage: false, next_statuses: [] });
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('[data-mact="reserve"]')).not.toBeNull();
+    expect(content.querySelector('[data-mact="sale"]')).not.toBeNull();
+    content.querySelector('[data-mact="credit"]').click();
+    expect(window.document.querySelector('#ms-submit').textContent).toContain('на одобрение');
+    window.document.querySelector('#ms-f-price').value = '24000';
+    window.document.querySelector('#ms-f-down_payment').value = '0';
+    window.document.querySelector('#ms-f-months').value = '6';
+    window.document.querySelector('#ms-f-buyer_name').value = 'Азиз';
+    window.document.querySelector('#ms-f-buyer_passport').value = 'AA1';
+    window.document.querySelector('#ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__writes[0][0]).toBe('/api/machines/deal');
+    expect(window.__writes[0][1]).toMatchObject({ machine_id: 7, kind: 'credit', down_payment: '0', months: '6' });
+    expect(window.document.querySelector('.toast').textContent).toContain('руководителю');
+  });
+
+  it('заявка на одобрении: руководитель видит условия и кнопки решения, пользовательский текст экранируется', async () => {
+    const request = {
+      id: 3, machine_id: 7, kind: 'credit', kind_label: 'Рассрочка', status: 'pending',
+      status_label: '⏳ Ждёт одобрения', price_cents: 2400000, list_price_cents: 2500000,
+      currency: 'USD', discount_pct: 4, buyer_name: '<img src=x onerror=alert(1)>',
+      buyer_passport: 'AA1', created_by: 1, creator_name: 'Manager', attempts: 1,
+      schedule_preview: { down_payment_cents: 0, months: 6, monthly_cents: 400000, first_due: '2026-10-15', last_due: '2027-03-15' },
+    };
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      tg.showConfirm = (text, cb) => cb(true);
+      window.__writes = [];
+      api = async () => (${JSON.stringify({ ...CARD, request, can_request: [], next_statuses: [], can_decide: true, viewer_id: 2 })});
+      apiResult = async (path, body) => { window.__writes.push([path, body]); return { ok: true, status: 200, body: { ok: true }, error: '' }; };
+      window.__ready = renderMachineCard(7);
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toContain('скидка 4%');
+    expect(content.textContent).toContain('6 месяцев');
+    expect(content.querySelector('img')).toBeNull();
+    expect(content.querySelector('[data-mact="sale"]')).toBeNull();
+    expect(content.querySelector('[data-mact="delete"]')).toBeNull();
+    content.querySelector('[data-mreq-approve="3"]').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__writes[0][0]).toBe('/api/machines/deals/approve');
+    expect(window.__writes[0][1].request_id).toBe(3);
+    expect(window.__writes[0][1].idempotency_key).toBeTruthy();
+  });
+
+  it('менеджер без права решать видит «ждёт решения» и может отозвать свою заявку', async () => {
+    const request = {
+      id: 4, machine_id: 7, kind: 'sale', kind_label: 'Продажа', status: 'pending',
+      status_label: '⏳ Ждёт одобрения', price_cents: 2400000, currency: 'USD',
+      buyer_name: 'ООО Карьер', created_by: 1, creator_name: 'Manager',
+    };
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      api = async () => (${JSON.stringify({ ...CARD, request, can_manage: false, can_request: [], next_statuses: [], can_decide: false, decide_hint: 'решит Boss', viewer_id: 1 })});
+      window.__ready = renderMachineCard(7);
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('[data-mreq-approve]')).toBeNull();
+    expect(content.querySelector('[data-mreq-cancel="4"]')).not.toBeNull();
+    expect(content.textContent).toContain('решит Boss');
+  });
+
+  it('группа решений рендерится в любой контейнер и возвращает число заявок', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async (path) => path === '/api/machines/deals/pending'
+        ? { ok: true, can_decide: true, viewer_id: 2, my_rework: [], requests: [
+            { id: 9, machine_id: 7, machine_name: 'CAT 320', kind: 'sale', kind_label: 'Продажа',
+              status: 'pending', status_label: '⏳ Ждёт одобрения', price_cents: 100, currency: 'USD',
+              buyer_name: 'Покупатель', created_by: 1 } ] }
+        : {};
+      const box = document.createElement('div');
+      document.body.appendChild(box);
+      window.__box = box;
+      window.__ready = renderMachineDealDecisions(box);
+    `);
+    const n = await window.__ready;
+    expect(n).toBe(1);
+    expect(window.__box.textContent).toContain('CAT 320');
+    expect(window.__box.querySelector('[data-mreq-reject="9"]')).not.toBeNull();
   });
 
   it('обязательное поле не пускает запрос на сервер', async () => {
@@ -2389,9 +2483,9 @@ describe('склад: остатки в «Каталоге» и накладны
     expect(content.querySelector('#wh-new')).not.toBeNull();
   });
 
-  it('менеджеру кнопку отмены не показывают', async () => {
+  it('менеджеру кнопку отмены не показывают, когда удаление оставлено руководителю', async () => {
     const window = boot(`
-      currentUser = { role: 'manager' };
+      currentUser = { role: 'manager', delete_requires_boss: true };
       api = async () => ({ invoices: [
         { id: 5, type: 'outgoing', invoice_number: 'OUT-2026-0001', invoice_date: '2026-09-11',
           status: 'confirmed', currency: 'USD', total_amount_cents: 75000,
@@ -2403,6 +2497,20 @@ describe('склад: остатки в «Каталоге» и накладны
     const content = window.document.getElementById('content');
     expect(content.querySelector('[data-wh-cancel="5"]')).toBeNull();
     expect(content.textContent).toContain('PDF отправлен');
+  });
+
+  it('менеджеру отмена накладной доступна, пока руководитель не оставил удаление себе', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager', delete_requires_boss: false };
+      api = async () => ({ invoices: [
+        { id: 5, type: 'incoming', invoice_number: 'IN-2026-0001', invoice_date: '2026-09-11',
+          status: 'confirmed', currency: 'USD', total_amount_cents: 75000,
+          telegram_sent: 0, counterparty_name: 'Поставщик' },
+      ]});
+      window.__ready = renderWhInvoiceList();
+    `);
+    await window.__ready;
+    expect(window.document.getElementById('content').querySelector('[data-wh-cancel="5"]')).not.toBeNull();
   });
 
   it('у накладной из переноса МойСклад кнопки отмены нет даже у босса', async () => {

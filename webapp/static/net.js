@@ -211,7 +211,12 @@
     '/api/debts': ['admin', 'boss', 'manager'],
     '/api/cash/history': ['admin', 'boss'],
     '/api/money/summary': ['admin', 'boss'],
-    '/api/wh/invoices/cancel': ['admin', 'boss'],
+    '/api/wh/invoices/cancel': ['admin', 'boss', 'manager'],
+    '/api/machines/delete': ['admin', 'boss', 'manager'],
+    '/api/machines/deal': ['admin', 'boss', 'manager'],
+    '/api/machines/deals/pending': ['admin', 'boss', 'manager'],
+    '/api/machines/deals/approve': ['admin', 'boss', 'manager'],
+    '/api/settings/delete_requires_boss': ['admin', 'boss'],
     '/api/currency/rates/set': ['admin', 'boss'],
   };
 

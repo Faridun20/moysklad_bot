@@ -236,15 +236,11 @@ def test_manager_is_refused_boss_only_stock_actions(open_app, e2e):
     mgr = open_app(ids["mgr"])
     for path, body in [
         ("/api/products/prices/set", {"product_id": ids["product"], "sale_price": 1}),
-        ("/api/wh/invoices/cancel", {"invoice_id": inv}),
         ("/api/wh/invoices/create", {"type": "outgoing", "counterparty_id": _cp_id(e2e),
                                      "items": [{"product_id": ids["product"], "quantity": 1,
                                                 "price_cents": 100}]}),
         ("/api/machines/status", {"machine_id": mid, "status": "reserved", "expected": "in_stock"}),
         ("/api/machines/update", {"machine_id": mid, "fields": {"name": "Взлом"}}),
-        ("/api/machines/deal", {"machine_id": mid, "kind": "sale", "price": "1",
-                                "buyer_name": "X", "idempotency_key": "k1"}),
-        ("/api/machines/delete", {"machine_id": mid}),
         ("/api/machines/payment", {"payment_id": pay, "paid": True}),
         ("/api/machines/receipt", {"deal_id": deal, "amount": "10", "idempotency_key": "k2"}),
         ("/api/machines/deal_close", {"deal_id": deal}),
@@ -264,6 +260,18 @@ def test_manager_is_refused_boss_only_stock_actions(open_app, e2e):
     assert e2e.rows("SELECT COUNT(*) AS n FROM machine_payment_receipts")[0]["n"] == 0
     assert e2e.rows("SELECT closed_at FROM machine_deals WHERE id = ?", (deal,))[0]["closed_at"] is None
     assert e2e.rows("SELECT COUNT(*) AS n FROM containers WHERE id = ?", (cid,))[0]["n"] == 1
+
+    # Удаление и отмену накладной руководитель оставил себе — менеджеру 403.
+    from services.database import set_setting
+
+    set_setting("delete_requires_boss", True, ids["boss"])
+    for path, body in [
+        ("/api/wh/invoices/cancel", {"invoice_id": inv}),
+        ("/api/machines/delete", {"machine_id": mid}),
+    ]:
+        assert _post(mgr, path, body) == 403, path
+    assert e2e.rows("SELECT cancelled_at FROM invoices WHERE id = ?", (inv,))[0]["cancelled_at"] is None
+    assert e2e.rows("SELECT COUNT(*) AS n FROM machines WHERE id = ?", (mid,))[0]["n"] == 1
 
 
 def test_admin_has_boss_controls_in_stock(open_app, e2e):
@@ -948,10 +956,13 @@ def test_machine_hours_increase_and_manager_cannot_roll_back(open_app, e2e):
     assert e2e.rows("SELECT hours FROM machines WHERE id = ?", (mid,))[0]["hours"] == 1620
     hist = e2e.rows("SELECT hours, recorded_by FROM machine_hours WHERE machine_id = ? ORDER BY id DESC", (mid,))
     assert hist[0] == {"hours": 1620, "recorded_by": e2e.ids["mgr"]}
-    # Остальное на карточке — руководству.
-    for sel in ('[data-mact="edit"]', "[data-mstatus-to]", '[data-mact="sale"]', '[data-mact="credit"]',
-                '[data-mact="delete"]'):
+    # Правка и ручные переходы — руководству; бронь, продажа и рассрочка —
+    # заявками на одобрение, удаление — пока руководитель не оставил его себе.
+    for sel in ('[data-mact="edit"]', "[data-mstatus-to]"):
         assert mgr.locator(sel).count() == 0, sel
+    for sel in ('[data-mact="reserve"]', '[data-mact="sale"]', '[data-mact="credit"]',
+                '[data-mact="delete"]'):
+        assert mgr.locator(sel).count() == 1, sel
 
 
 def test_manager_creates_machine_without_cost_and_sees_schedule_read_only(open_app, e2e):
@@ -1429,7 +1440,13 @@ def test_counterparty_from_picker_reuses_namesake_and_keeps_supplier_type(open_a
 
 
 def test_manager_posts_incoming_but_cannot_cancel(open_app, e2e):
+    """Приход менеджеру — да; отмена — нет, когда руководитель оставил удаление
+    себе (`delete_requires_boss`). Без флага отмену видит и менеджер —
+    `test_manager_cancels_invoice_while_deletion_is_open`."""
     from services import warehouse
+    from services.database import set_setting
+
+    set_setting("delete_requires_boss", True, e2e.ids["boss"])
 
     e2e.run(warehouse.create_invoice(
         invoice_type="outgoing", warehouse_id=e2e.ids["warehouse"], counterparty_id=_cp_id(e2e),
@@ -1453,6 +1470,18 @@ def test_manager_posts_incoming_but_cannot_cancel(open_app, e2e):
     assert inv == {"type": "incoming", "created_by": e2e.ids["mgr"]}
     assert _stock(e2e) == 23
     assert mgr.locator("[data-wh-cancel]").count() == 0
+
+
+def test_manager_cancels_invoice_while_deletion_is_open(open_app, e2e):
+    """Решение владельца: пока менеджер один, отменять накладные может и он."""
+    mgr = open_app(e2e.ids["mgr"])
+    go(mgr, "stock")
+    tab(mgr, "invoices")
+    inv = e2e.rows("SELECT id FROM invoices")[0]["id"]
+    mgr.wait_for_selector(f'[data-wh-cancel="{inv}"]')
+    mgr.click(f'[data-wh-cancel="{inv}"]')
+    mgr.wait_for_selector(".toast:has-text('Накладная отменена')")
+    assert e2e.rows("SELECT status FROM invoices WHERE id = ?", (inv,))[0]["status"] == "cancelled"
 
 
 def test_print_failure_is_shown_not_swallowed(open_app, e2e, monkeypatch):

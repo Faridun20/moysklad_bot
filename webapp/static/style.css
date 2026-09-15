@@ -721,6 +721,9 @@ body {
   white-space: nowrap;
 }
 
+/* Заявка на сделку по технике: длинные условия переносятся, а не режутся. */
+.mreq-fact .card-row-title { white-space: normal; overflow-wrap: anywhere; }
+
 
 /* ─── Stat-grid (компактная статистика) ───────────────────────── */
 .stat-grid {

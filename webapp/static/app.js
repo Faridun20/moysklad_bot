@@ -1633,17 +1633,26 @@ async function renderMachines() {
   }
   machinesData = data;
   const labels = data.status_labels || {};
-  const rows = (data.machines || []).map(m => `
-    <div class="c-row c-row--tap" data-machine="${m.id}" data-status="${escapeHtml(m.status || '')}"
+  const rows = (data.machines || []).map(m => {
+    // «Ждёт одобрения» — живая заявка на сделку; статус машины меняет только
+    // одобрение, поэтому бейдж говорит о заявке, а подстрочник — о статусе.
+    const req = m.pending_request;
+    const badge = req
+      ? `${req.status === 'rework' ? 'На доработке' : 'Ждёт одобрения'} · ${req.kind_label || ''}`
+      : machineStatusLabel(m.status, labels);
+    return `
+    <div class="c-row c-row--tap" data-machine="${m.id}" data-status="${escapeHtml(req ? (req.status === 'rework' ? 'partial' : 'pending') : (m.status || ''))}"
          role="button" tabindex="0">
       <div class="card-row-info">
         <div class="card-row-title">${escapeHtml(m.name || '—')}</div>
-        <div class="card-row-sub">${machineSubtitle(m)}</div>
+        <div class="card-row-sub">${machineSubtitle(m)}${req ? ' · ' + escapeHtml(machineStatusLabel(m.status, labels)) : ''}</div>
       </div>
-      <span class="c-badge">${escapeHtml(machineStatusLabel(m.status, labels))}</span>
-    </div>`).join('');
+      <span class="c-badge">${escapeHtml(badge)}</span>
+    </div>`;
+  }).join('');
 
   content.innerHTML = stockShellHtml()
+    + (Number(data.pending_requests || 0) > 0 ? '<div id="machine-decisions"></div>' : '')
     + machineStatusSegHtml(data.counts, machinesFilter, labels)
     + (rows
       ? `<div class="c-surface c-surface--list">${rows}</div>`
@@ -1654,8 +1663,12 @@ async function renderMachines() {
             ? 'Здесь появятся экскаваторы: в пути, на складе и проданные.'
             : 'В этом статусе машин нет — выберите другой фильтр.',
         }))
-    + `<div class="c-actions"><button class="btn-secondary" id="machine-new">${icon('plus')} Завести машину</button></div>`;
+    + `<div class="c-actions"><button class="btn-secondary" id="machine-new">${icon('plus')} Завести машину</button></div>`
+    + (isMachineBoss() ? deleteSettingHtml(data.delete_requires_boss) : '');
   wireSectionNav(content, 'stock', renderStockScreen);
+  const decisions = content.querySelector('#machine-decisions');
+  if (decisions) renderMachineDealDecisions(decisions, { onChange: () => renderMachines() });
+  wireDeleteSetting(content, () => renderMachines());
 
   content.querySelector('#machine-new')?.addEventListener('click', () => openMachineForm(null));
 
@@ -1892,9 +1905,9 @@ async function toggleMachinePayment(machineId, paymentId, wasPaid, btn) {
   renderMachineCard(machineId);
 }
 
-// Кнопки карточки. Что можно — решает сервер (`can_manage`, `next_statuses`):
-// рисовать кнопку, на которую ручка ответит 403, значит обещать пользователю
-// действие, которого у него нет.
+// Кнопки карточки. Что можно — решает сервер (`can_manage`, `next_statuses`,
+// `can_request`, `can_delete`): рисовать кнопку, на которую ручка ответит 403,
+// значит обещать пользователю действие, которого у него нет.
 function machineActionsHtml(m, card) {
   const buttons = [];
   // «Прибыла» — работа приёмки, её делает и менеджер (`can_arrive`, ручка
@@ -1906,6 +1919,7 @@ function machineActionsHtml(m, card) {
     buttons.push(`<button class="btn-primary" data-mact="arrive">${icon('check')} Прибыла</button>`);
   }
   buttons.push(`<button class="btn-secondary" data-mact="hours">${icon('gauge')} Моточасы</button>`);
+  const kinds = card.can_request || [];
   if (card.can_manage) {
     buttons.push(`<button class="btn-secondary" data-mact="edit">${icon('edit')} Изменить</button>`);
     for (const opt of card.next_statuses || []) {
@@ -1916,19 +1930,263 @@ function machineActionsHtml(m, card) {
         `data-mstatus-label="${escapeHtml(opt.label)}">${escapeHtml(opt.label)}</button>`
       );
     }
-    // Продажа и рассрочка — не переход статуса: им нужны цена и покупатель.
-    if (['in_transit', 'in_stock', 'reserved'].includes(m.status)) {
-      buttons.push('<button class="btn-secondary" data-mact="sale">Продажа</button>');
-      buttons.push('<button class="btn-secondary" data-mact="credit">Рассрочка</button>');
-    }
-    // Удаление только у машины без сделок: продажа — денежный факт, стирать
-    // его вместе с карточкой нельзя, такие уводят в архив. Сервер это тоже
-    // проверяет, здесь просто не показываем заведомо отказную кнопку.
-    if (!(card.deals || []).length) {
-      buttons.push(`<button class="btn-secondary btn-danger" data-mact="delete">${icon('trash')} Удалить</button>`);
-    }
+  }
+  // Бронь, продажа и рассрочка — заявки (`/api/machines/deal`): у менеджера
+  // они уходят руководителю на одобрение, у руководства проводятся сразу.
+  // Руководству бронь без покупателя остаётся переходом «Забронировать».
+  if (kinds.includes('reserve') && !card.can_manage) {
+    buttons.push(`<button class="btn-secondary" data-mact="reserve">${icon('lock')} Бронь</button>`);
+  }
+  if (kinds.includes('sale')) {
+    buttons.push(`<button class="btn-secondary" data-mact="sale">${icon('check')} Продажа</button>`);
+  }
+  if (kinds.includes('credit')) {
+    buttons.push(`<button class="btn-secondary" data-mact="credit">${icon('calendar')} Рассрочка</button>`);
+  }
+  // Удаление только у машины без сделок и живой заявки: продажа — денежный
+  // факт, такие уводят в архив. Сервер это тоже проверяет, здесь просто не
+  // показываем заведомо отказную кнопку; `can_delete` — настройка руководителя.
+  if (card.can_delete && !(card.deals || []).length && !card.request) {
+    buttons.push(`<button class="btn-secondary btn-danger" data-mact="delete">${icon('trash')} Удалить</button>`);
   }
   return `<div class="c-actions c-actions--wrap">${buttons.join('')}</div>`;
+}
+
+// ─── Заявки на сделки по технике (одобрение руководителем) ─────────────────
+// Правила — services/machine_deal_requests.py. Одна разметка на карточку
+// машины и на список решений (`renderMachineDealDecisions`): кнопки решения
+// рисуются, только если сервер сказал `can_decide` (руководитель, или менеджер,
+// пока руководителя в системе нет — тогда с подписью об этом).
+
+function machineRequestTermsRows(req) {
+  const cur = req.currency || 'USD';
+  const money = (c) => formatMoney(Number(c || 0) / 100, cur);
+  const rows = [];
+  if (req.price_cents) {
+    let price = money(req.price_cents);
+    if (req.list_price_cents) price += ` · прайс ${money(req.list_price_cents)}`;
+    if (req.discount_pct != null && Number(req.discount_pct) > 0) price += ` · скидка ${req.discount_pct}%`;
+    rows.push(['Цена', price]);
+  }
+  rows.push(['Покупатель', [req.buyer_name, req.buyer_phone].filter(Boolean).join(' · ') || '—']);
+  if (req.buyer_passport) rows.push(['Паспорт', req.buyer_passport]);
+  else if (req.kind === 'credit') rows.push(['Паспорт', req.has_passport ? 'вписан · виден руководству' : '—']);
+  const sch = req.schedule_preview;
+  if (req.kind === 'credit' && sch) {
+    rows.push(['Условия', `взнос ${money(sch.down_payment_cents)} · ${plural(sch.months, ['месяц', 'месяца', 'месяцев'])} по ${money(sch.monthly_cents)}`]);
+    rows.push(['График', `с ${sch.first_due} по ${sch.last_due} · от дня одобрения`]);
+  }
+  if (req.buyer_note) rows.push(['Комментарий', req.buyer_note]);
+  rows.push(['Оформил', `${req.creator_name || req.created_by} · ${String(req.submitted_at || '').slice(0, 16)}`
+    + (Number(req.attempts || 1) > 1 ? ` · попытка ${req.attempts}` : '')]);
+  return rows;
+}
+
+function machineRequestCardHtml(req, ctx) {
+  const pending = req.status === 'pending';
+  const mine = ctx.viewerId != null && Number(req.created_by) === Number(ctx.viewerId);
+  const title = `${req.kind_label || req.kind} · заявка #${req.id}`
+    + (ctx.showMachine ? ` · ${req.machine_name || ''}` : '');
+  // Условия длинные («24 000 USD · прайс 25 000 USD · скидка 4%»): подпись
+  // сверху, значение под ней с переносом — в строку «подпись | значение» на
+  // 360–390px они наезжали друг на друга.
+  const facts = machineRequestTermsRows(req).map(([k, v]) => `
+    <div class="c-row mreq-fact">
+      <div class="card-row-info">
+        <div class="card-row-sub">${escapeHtml(k)}</div>
+        <div class="card-row-title">${escapeHtml(String(v))}</div>
+      </div>
+    </div>`).join('');
+  const actions = [];
+  if (pending && ctx.canDecide) {
+    actions.push(`<button class="btn-primary" data-mreq-approve="${req.id}">${icon('check')} Одобрить</button>`);
+    actions.push(`<button class="btn-secondary" data-mreq-rework="${req.id}">${icon('edit')} На доработку</button>`);
+    actions.push(`<button class="btn-secondary btn-danger" data-mreq-reject="${req.id}">${icon('close')} Отклонить</button>`);
+  }
+  if (req.status === 'rework' && mine) {
+    actions.push(`<button class="btn-primary" data-mreq-resubmit="${req.id}">${icon('edit')} Исправить и отправить</button>`);
+  }
+  if (mine && !ctx.canDecide) {
+    actions.push(`<button class="btn-secondary" data-mreq-cancel="${req.id}">${icon('ban')} Отозвать</button>`);
+  }
+  const hint = pending
+    ? (ctx.canDecide ? (ctx.decideHint ? `Решение за вами: ${ctx.decideHint}. Это попадёт в журнал.` : '')
+      : `Ждёт решения · ${ctx.decideHint || 'решит руководитель'}. Машина закреплена за заявкой.`)
+    : `Возвращена на доработку${req.decider_name ? ' · ' + req.decider_name : ''}: ${req.decision_note || '—'}`;
+  return `
+    <div class="section-label">${escapeHtml(title)}</div>
+    <div class="c-surface c-surface--list" data-mreq="${req.id}">
+      <div class="c-row" data-status="${pending ? 'pending' : 'partial'}">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(req.status_label || req.status)}</div>
+          ${hint ? `<div class="card-row-sub">${escapeHtml(hint)}</div>` : ''}
+        </div>
+      </div>
+      ${facts}
+    </div>
+    ${actions.length ? `<div class="c-actions c-actions--wrap">${actions.join('')}</div>` : ''}`;
+}
+
+function wireMachineRequestActions(root, requests, refresh) {
+  const byId = (id) => (requests || []).find(r => String(r.id) === String(id));
+  const send = async (path, body, okText) => {
+    const res = await apiResult(path, { ...body, idempotency_key: idemKey() });
+    if (!res.ok) {
+      tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+      // 409 — заявку уже решили (другой руководитель, бот): перечитываем.
+      if (res.status === 409) refresh();
+      return false;
+    }
+    haptic('success');
+    toast(okText + (res.body && res.body.self_approved ? ' · одобрено вами — руководителя нет' : ''));
+    refresh();
+    return true;
+  };
+  root.querySelectorAll('[data-mreq-approve]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const req = byId(btn.dataset.mreqApprove);
+      if (!req) return;
+      if (!await confirmDialog(`Одобрить: ${req.kind_label} «${req.machine_name || ''}» — ${req.buyer_name}?`)) return;
+      btn.disabled = true;
+      try {
+        await send('/api/machines/deals/approve', { request_id: req.id },
+          req.kind === 'reserve' ? 'Бронь одобрена' : req.kind === 'sale' ? 'Продажа одобрена' : 'Рассрочка одобрена');
+      } finally { btn.disabled = false; }
+    });
+  });
+  root.querySelectorAll('[data-mreq-rework]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const req = byId(btn.dataset.mreqRework);
+      if (!req) return;
+      openMachineSheet({
+        title: 'На доработку',
+        hint: 'Менеджер увидит причину и исправит условия',
+        fields: [{ key: 'reason', label: 'Что доработать', type: 'textarea', required: true }],
+        submitLabel: 'Вернуть на доработку',
+        onSubmit: async (data, { showErr }) => {
+          const res = await apiResult('/api/machines/deals/rework', {
+            request_id: req.id, reason: data.reason, idempotency_key: idemKey(),
+          });
+          if (!res.ok) { showErr(res.error); if (res.status === 409) refresh(); return res.status === 409; }
+          haptic('success');
+          toast('Заявка возвращена на доработку');
+          refresh();
+          return true;
+        },
+      });
+    });
+  });
+  root.querySelectorAll('[data-mreq-reject]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const req = byId(btn.dataset.mreqReject);
+      if (!req) return;
+      openMachineSheet({
+        title: 'Отклонить заявку',
+        hint: 'Машина останется в прежнем статусе',
+        fields: [{ key: 'reason', label: 'Причина', type: 'textarea', hint: 'Необязательно' }],
+        submitLabel: 'Отклонить',
+        onSubmit: async (data, { showErr }) => {
+          const res = await apiResult('/api/machines/deals/reject', {
+            request_id: req.id, reason: data.reason, idempotency_key: idemKey(),
+          });
+          if (!res.ok) { showErr(res.error); if (res.status === 409) refresh(); return res.status === 409; }
+          haptic('success');
+          toast('Заявка отклонена');
+          refresh();
+          return true;
+        },
+      });
+    });
+  });
+  root.querySelectorAll('[data-mreq-resubmit]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const req = byId(btn.dataset.mreqResubmit);
+      if (req) openDealForm({ id: req.machine_id, price_cents: req.list_price_cents, currency: req.currency }, req.kind, { request: req, refresh });
+    });
+  });
+  root.querySelectorAll('[data-mreq-cancel]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const req = byId(btn.dataset.mreqCancel);
+      if (!req || !await confirmDialog(`Отозвать заявку #${req.id}? Машина освободится.`)) return;
+      await send('/api/machines/deals/cancel', { request_id: req.id }, 'Заявка отозвана');
+    });
+  });
+}
+
+// Группа решений «Сделки по технике» — самостоятельный рендер в контейнер.
+// Экран «Решения» руководителя подключает её сам (см. DECISION_GROUPS в
+// ветке boss-ui): renderMachineDealDecisions(container, { onChange }) →
+// Promise<число заявок на одобрении>. Пустой список — пустой контейнер.
+async function renderMachineDealDecisions(container, opts = {}) {
+  if (!container) return 0;
+  const refresh = () => {
+    if (typeof opts.onChange === 'function') opts.onChange();
+    else renderMachineDealDecisions(container, opts);
+  };
+  container.innerHTML = skeleton('list', 1);
+  let data;
+  try {
+    data = await api('/api/machines/deals/pending', {});
+  } catch (e) {
+    container.innerHTML = errorBoxHtml(e.message);
+    return 0;
+  }
+  const reqs = [...(data.requests || []), ...(data.my_rework || [])];
+  if (!reqs.length) {
+    container.innerHTML = '';
+    return 0;
+  }
+  const ctx = {
+    canDecide: !!data.can_decide, decideHint: data.decide_hint, viewerId: data.viewer_id,
+    showMachine: true,
+  };
+  container.innerHTML = `<div class="machine-decisions">`
+    + reqs.map(r => machineRequestCardHtml(r, ctx)).join('') + `</div>`;
+  wireMachineRequestActions(container, reqs, refresh);
+  return (data.requests || []).length;
+}
+
+// Настройка руководителя «удалять может только руководитель» — снизу списка
+// техники: удаление карточек техники и накладных живёт в «Складе».
+function deleteSettingHtml(enabled) {
+  return `
+    <div class="section-label">Удаление</div>
+    <div class="c-surface c-surface--list">
+      <div class="c-row mreq-fact">
+        <div class="card-row-info">
+          <div class="card-row-title">${enabled ? 'Удаляет только руководитель' : 'Удалять может и менеджер'}</div>
+          <div class="card-row-sub">Удаление техники и товаров, отмена накладных</div>
+        </div>
+      </div>
+    </div>
+    <div class="c-actions">
+      <button class="btn-secondary" id="delete-setting-toggle" data-enabled="${enabled ? '1' : '0'}">
+        ${enabled ? 'Разрешить и менеджеру' : 'Оставить только руководителю'}</button>
+    </div>`;
+}
+
+function wireDeleteSetting(root, refresh) {
+  const btn = root.querySelector('#delete-setting-toggle');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    const enabled = btn.dataset.enabled !== '1';
+    const res = await apiResult('/api/settings/delete_requires_boss', { enabled });
+    btn.disabled = false;
+    if (!res.ok) { tg.showAlert ? tg.showAlert(res.error) : alert(res.error); return; }
+    if (currentUser) currentUser.delete_requires_boss = !!res.body.delete_requires_boss;
+    haptic('success');
+    toast(enabled ? 'Удаление — только руководитель' : 'Удалять может и менеджер');
+    refresh();
+  });
+}
+
+// Можно ли этой роли удалять технику/товары и отменять накладные: руководству
+// всегда, менеджеру — пока руководитель не включил `delete_requires_boss`.
+function canDeleteRecords() {
+  const r = role();
+  if (r === 'admin' || r === 'boss') return true;
+  return r === 'manager' && !(currentUser && currentUser.delete_requires_boss);
 }
 
 async function deleteMachine(machine) {
@@ -3267,6 +3525,7 @@ async function renderMachineCard(machineId) {
   content.innerHTML = `
     <div class="section-label">${escapeHtml(m.name || 'Машина')}</div>
     ${machineFactsHtml(m, card)}
+    ${card.request ? machineRequestCardHtml(card.request, { canDecide: card.can_decide, decideHint: card.decide_hint, viewerId: card.viewer_id }) : ''}
     ${machineActionsHtml(m, card)}
     ${machinePhotosHtml(card)}
     ${machineHoursHtml(card.hours)}
@@ -3303,6 +3562,7 @@ async function renderMachineCard(machineId) {
     });
   });
   wireDealReceipts(content, card.deals, () => renderMachineCard(machineId));
+  if (card.request) wireMachineRequestActions(content, [{ ...card.request, machine_name: m.name }], () => renderMachineCard(machineId));
 }
 
 // «Внести оплату» и удаление поступления под графиком рассрочки. График
@@ -3568,38 +3828,71 @@ function openHoursForm(machine) {
   });
 }
 
-function openDealForm(machine, kind) {
+// Бронь, продажа или рассрочка. Менеджеру ответ — «заявка ушла руководителю»
+// (машина пока в прежнем статусе), руководству — проведено сразу. С `opts.request`
+// та же форма правит заявку, возвращённую на доработку (`/deals/resubmit`).
+function openDealForm(machine, kind, opts = {}) {
   const credit = kind === 'credit';
+  const reserve = kind === 'reserve';
+  const req = opts.request || null;
+  const refresh = opts.refresh || (() => renderMachineCard(machine.id));
   const key = idemKey();
+  const cur = (req && req.currency) || machine.currency || 'USD';
+  const cents = (v) => (v ? String(Number(v) / 100) : '');
+  const title = reserve ? 'Бронь' : credit ? 'Рассрочка' : 'Продажа';
+  const boss = isMachineBoss();
   openMachineSheet({
-    title: credit ? 'Рассрочка' : 'Продажа',
-    hint: credit ? 'График платежей построится сам: остаток разделится поровну по месяцам.' : '',
+    title: req ? `${title} · доработка заявки #${req.id}` : title,
+    hint: req
+      ? `Причина: ${req.decision_note || '—'}`
+      : (boss ? '' : 'Уйдёт руководителю на одобрение. До решения машина закреплена за заявкой.')
+        + (credit ? ' График платежей построится сам от дня одобрения.' : ''),
     fields: [
-      { key: 'price', label: 'Цена, USD', type: 'number', required: true,
-        value: machine.price_cents ? String(machine.price_cents / 100) : '' },
+      { key: 'price', label: `Цена, ${cur}`, type: 'number', required: !reserve,
+        value: req ? cents(req.price_cents) : (reserve ? '' : cents(machine.price_cents)),
+        hint: reserve ? 'Необязательно' : '' },
       // Взнос и срок вместо даты последнего платежа: дату считает сервер по
       // графику — введённая руками, она рано или поздно разошлась бы с ним.
       ...(credit ? [
-        { key: 'down_payment', label: 'Первоначальный взнос, USD', type: 'number',
-          hint: 'Сколько клиент уже заплатил. Можно оставить пустым' },
-        { key: 'months', label: 'Срок, месяцев', type: 'number', required: true },
+        { key: 'down_payment', label: `Первоначальный взнос, ${cur}`, type: 'number',
+          value: req ? cents(req.down_payment_cents) || '0' : '',
+          hint: 'Сколько клиент платит сразу. Можно 0' },
+        { key: 'months', label: 'Срок, месяцев', type: 'number', required: true,
+          value: req ? String(req.months || '') : '' },
       ] : []),
-      { key: 'buyer_name', label: 'Покупатель', required: true },
-      { key: 'buyer_phone', label: 'Телефон', type: 'tel' },
-      { key: 'buyer_passport', label: 'Паспорт', hint: 'Виден только руководству' },
-      { key: 'buyer_note', label: 'Комментарий', type: 'textarea' },
+      { key: 'buyer_name', label: 'Покупатель', required: true, value: req ? req.buyer_name : '' },
+      { key: 'buyer_phone', label: 'Телефон', type: 'tel', value: req ? req.buyer_phone || '' : '' },
+      ...(reserve ? [] : [{
+        key: 'buyer_passport', label: 'Паспорт', required: credit && !(req && req.has_passport),
+        hint: req && req.has_passport ? 'Уже вписан — оставьте пустым, чтобы не менять' : 'Виден только руководству',
+      }]),
+      { key: 'buyer_note', label: 'Комментарий', type: 'textarea', value: req ? req.buyer_note || '' : '' },
     ],
-    submitLabel: credit ? 'Оформить рассрочку' : 'Оформить продажу',
+    submitLabel: req ? 'Отправить снова' : boss
+      ? (reserve ? 'Забронировать' : credit ? 'Оформить рассрочку' : 'Оформить продажу')
+      : 'Отправить на одобрение',
     onSubmit: async (data, { showErr }) => {
-      const res = await apiResult('/api/machines/deal', {
-        machine_id: machine.id, kind, ...data, idempotency_key: key,
-      });
-      if (!res.ok) { showErr(res.error); return false; }
+      const res = req
+        ? await apiResult('/api/machines/deals/resubmit', { request_id: req.id, ...data, currency: cur, idempotency_key: key })
+        : await apiResult('/api/machines/deal', { machine_id: machine.id, kind, currency: cur, ...data, idempotency_key: key });
+      if (!res.ok) {
+        showErr(res.error);
+        // 409 — машина уже занята заявкой или продана: карточка устарела.
+        if (res.status === 409) refresh();
+        return false;
+      }
       haptic('success');
-      toast(credit
-        ? `Рассрочка оформлена · ${plural(res.body.payments, ['платёж', 'платежа', 'платежей'])}`
-        : 'Машина продана');
-      renderMachineCard(machine.id);
+      const body = res.body || {};
+      if (body.pending && body.self_decide) {
+        toast('Заявка создана · руководителя в системе нет — одобрите её сами');
+      } else if (body.pending) {
+        toast(req ? 'Заявка снова у руководителя' : 'Заявка отправлена руководителю на одобрение');
+      } else {
+        toast(reserve ? 'Машина забронирована' : credit
+          ? `Рассрочка оформлена · ${plural(body.payments, ['платёж', 'платежа', 'платежей'])}`
+          : 'Машина продана');
+      }
+      refresh();
       return true;
     },
   });
@@ -8160,7 +8453,9 @@ async function renderWhInvoiceList() {
     return;
   }
 
-  const canCancel = whIsBoss();
+  // Отмена накладной — руководству и менеджеру, пока руководитель не оставил
+  // удаление себе (`delete_requires_boss`, сервер: `_require_delete_right`).
+  const canCancel = canDeleteRecords();
   const canPrint = !!data.can_print;
   content.innerHTML = stockShellHtml() + newBtn + rows.map(inv => {
     const cancelled = inv.status === 'cancelled';
