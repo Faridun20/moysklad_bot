@@ -905,6 +905,13 @@ async def api_stock(request: Request):
     # раскрываем менеджерам).
     is_boss = role in ("admin", "boss")
     prices = await adb.get_product_prices_by_ids([str(r["product_id"]) for r in rows])
+    from services import costing
+
+    fifo: dict = {}
+    cost_cur = None
+    if costing.can_see_cost(role) and await costing.is_enabled():
+        fifo = await costing.current_costs()
+        cost_cur = costing.base_currency()
 
     products = []
     for r in rows:
@@ -922,9 +929,14 @@ async def api_stock(request: Request):
         }
         if is_boss and pp:
             item["cost_price"] = pp.get("cost_price")
+        if is_boss and fifo and r["product_id"] in fifo:
+            # Учёт включён и у товара есть партии с ценой: средняя по остатку.
+            # Ручная `cost_price` остаётся рядом — у товара без партий она
+            # по-прежнему единственный ответ.
+            item["cost_batches"] = fifo[r["product_id"]]["unit_cost_cents"] / 100
         products.append(item)
 
-    return JSONResponse({"products": products, "categories": cats})
+    return JSONResponse({"products": products, "categories": cats, "cost_currency": cost_cur})
 
 
 # ─── API: аналитика продаж ───────────────────────────────────────────────────
@@ -1033,6 +1045,13 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
     top_products = current["top_products"][:5]
     prod_ids = [str(d["product_id"]) for _n, d in top_products if d.get("product_id")]
     costs = await adb.get_product_prices_by_ids(prod_ids) if prod_ids else {}
+    from services import costing
+
+    if await costing.is_enabled():
+        # Учёт себестоимости включён: прибыль считает блок «Прибыль» по
+        # партиям. Прикидка по ручной себестоимости здесь дала бы второй,
+        # расходящийся ответ на тот же вопрос — не показываем её вовсе.
+        costs = {}
     top = []
     for name, d in top_products:
         revenue = d["sum"] / 100
@@ -2776,6 +2795,14 @@ async def api_orders(request: Request):
         cost_by_product = {
             k: v.get("cost_price") for k, v in prices.items() if v.get("cost_price") is not None
         }
+    # Учёт себестоимости включён: у ОТГРУЖЕННОГО заказа прибыль берётся из
+    # себестоимости, зафиксированной при отгрузке (партии), а не из ручной.
+    shipped_profit: dict = {}
+    if is_boss:
+        from services import costing
+
+        if await costing.is_enabled():
+            shipped_profit = await costing.order_profits()
 
     result = []
     for o in orders:
@@ -2817,7 +2844,11 @@ async def api_orders(request: Request):
                 for it in items
             ],
         }
-        if is_boss:
+        if is_boss and o["id"] in shipped_profit:
+            entry["profit"] = shipped_profit[o["id"]]["profit"]
+            entry["profit_partial"] = shipped_profit[o["id"]]["partial"]
+            entry["profit_source"] = "batches"
+        elif is_boss:
             profit = 0.0
             partial = False
             for it in items:
@@ -6178,7 +6209,7 @@ async def api_wh_invoices(request: Request):
     from services import warehouse
 
     data = await request.json()
-    _authorize(
+    user = _authorize(
         data,
         allowed_roles=("admin", "boss", "manager"),
         rate_limit_scope="api_wh_invoices",
@@ -6196,6 +6227,12 @@ async def api_wh_invoices(request: Request):
     rows = await warehouse.list_invoices(
         invoice_type=inv_type or None, limit=limit, offset=offset
     )
+    # Сумма ПРИХОДА — закупочная цена, то есть себестоимость: не руководству
+    # её не отдаём (services.costing.redact_invoice).
+    from services.costing import redact_invoice
+
+    role = get_role(user["id"])
+    rows = [redact_invoice(r, role) for r in rows]
     from services import printing
 
     # Кнопка «Распечатать» рисуется, только если в контейнере есть клиент CUPS:
@@ -6223,6 +6260,11 @@ async def api_wh_invoice_print(request: Request):
     inv = await warehouse.get_invoice(invoice_id)
     if inv is None:
         raise HTTPException(status_code=404, detail="Накладная не найдена")
+    from services.costing import redact_invoice
+
+    # Печать — тот же вывод наружу: закупочные цены прихода не руководству
+    # не печатаем.
+    inv = redact_invoice(inv, get_role(user["id"]))
     if not printing.is_available():
         return JSONResponse({"ok": False, "error": "Печать не настроена на этом сервере"})
     try:
@@ -6394,7 +6436,7 @@ async def api_wh_invoice_get(request: Request):
     from services import warehouse
 
     data = await request.json()
-    _authorize(data, allowed_roles=("admin", "boss", "manager"))
+    user = _authorize(data, allowed_roles=("admin", "boss", "manager"))
     try:
         invoice_id = int(data.get("invoice_id"))
     except (TypeError, ValueError):
@@ -6403,7 +6445,9 @@ async def api_wh_invoice_get(request: Request):
     inv = await warehouse.get_invoice(invoice_id)
     if inv is None:
         raise HTTPException(status_code=404, detail="Накладная не найдена")
-    return JSONResponse({"invoice": inv})
+    from services.costing import redact_invoice
+
+    return JSONResponse({"invoice": redact_invoice(inv, get_role(user["id"]))})
 
 
 @app.post("/api/wh/invoices/create")
@@ -6642,6 +6686,13 @@ async def api_wh_invoice_cancel(request: Request):
         f"Отменена накладная #{invoice_id}, остатки откачены",
     )
     return JSONResponse(result)
+
+
+# ─── Себестоимость: ручки отдельным роутером (webapp/costing_api.py) ─────────
+# Подключаем в конце: роутер берёт `_authorize` и помощники отсюда.
+from webapp.costing_api import router as _costing_router  # noqa: E402
+
+app.include_router(_costing_router)
 
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────

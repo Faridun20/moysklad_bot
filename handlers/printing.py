@@ -32,16 +32,21 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
-async def _invoice_pdf(invoice_id: int) -> tuple[bytes, str, str] | None:
+async def _invoice_pdf(invoice_id: int, user_id: int | None = None) -> tuple[bytes, str, str] | None:
     """Накладная → (pdf, имя файла, подпись для очереди). `None` — не нашли."""
     import asyncio
 
     from services import warehouse
+    from services.costing import redact_invoice
     from services.invoice_pdf import invoice_filename, render_invoice_pdf
+    from services.roles import cached_role
 
     invoice = await warehouse.get_invoice(invoice_id)
     if invoice is None:
         return None
+    # callback_data подделывается клиентом: закупочные цены прихода печатаем
+    # только руководству — как и в WebApp (services.costing.redact_invoice).
+    invoice = redact_invoice(invoice, cached_role(user_id) if user_id is not None else None)
     # WeasyPrint синхронный и небыстрый — уводим с event loop, как это делает
     # order_workflow._build_invoice_pdf.
     pdf = await asyncio.to_thread(render_invoice_pdf, invoice)
@@ -90,7 +95,7 @@ async def cb_print(call: CallbackQuery):
     await call.answer("Отправляю на печать…")
 
     try:
-        doc = await (_invoice_pdf(ref) if kind == "inv" else _document_pdf(ref, call.from_user.id))
+        doc = await (_invoice_pdf(ref, call.from_user.id) if kind == "inv" else _document_pdf(ref, call.from_user.id))
     except Exception:
         logger.exception("Печать: не удалось собрать PDF (%s #%s)", kind, ref)
         return await _report(call, "❌ Не удалось собрать документ для печати")
