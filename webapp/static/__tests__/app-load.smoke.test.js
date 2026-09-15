@@ -2893,3 +2893,52 @@ describe('шторка «Меню»', () => {
     expect(window.__state()).toMatchObject({ screen: 'stock', stockTab: 'catalog', open: false });
   });
 });
+
+describe('клавиатура и прокрутка при смене вида (вёрстка на телефоне)', () => {
+  function loaded() {
+    const window = makeWindow();
+    window.document.body.insertAdjacentHTML('afterbegin', '<input id="kb-field" type="text">');
+    window.scrollTo = () => { window.__scrolls = (window.__scrolls || 0) + 1; };
+    window.eval(read('helpers.js'));
+    window.eval(read('net.js'));
+    window.eval(read('app.js'));
+    return window;
+  }
+  const setHeight = (window, h) => {
+    Object.defineProperty(window, 'innerHeight', { value: h, configurable: true });
+    window.dispatchEvent(new window.Event('resize'));
+  };
+
+  it('панель прячется, только когда поле в фокусе И окно сжато клавиатурой', () => {
+    // Android WebView сжимает окно под клавиатуру, и fixed-панель садилась на
+    // форму «Количество и цена» поверх переключателя валюты.
+    const window = loaded();
+    const html = window.document.documentElement;
+    setHeight(window, 800);
+    const field = window.document.getElementById('kb-field');
+    field.focus();
+    expect(html.classList.contains('kb-open'), 'фокус без клавиатуры панель не прячет').toBe(false);
+    setHeight(window, 430);
+    expect(html.classList.contains('kb-open')).toBe(true);
+    field.blur();
+    window.eval('syncKeyboard()');
+    expect(html.classList.contains('kb-open'), 'поле ушло из фокуса — панель вернулась').toBe(false);
+    setHeight(window, 800);
+    expect(html.classList.contains('kb-open')).toBe(false);
+  });
+
+  it('новый вид начинается сверху, перерисовка того же — нет', () => {
+    // Прокрутка пролистанного списка переезжала на открытую карточку, и её
+    // верх оставался под липкой шапкой.
+    const window = loaded();
+    window.__scrolls = 0;
+    window.eval("showBack(() => { stockTab = 'containers'; showScreen('stock'); })");
+    expect(window.__scrolls).toBe(1);
+    window.eval("showBack(() => { stockTab = 'containers'; showScreen('stock'); })");
+    expect(window.__scrolls, 'перерисовка карточки после действия не прыгает в начало').toBe(1);
+    window.eval("setSectionTab('money', 'debts')");
+    expect(window.__scrolls).toBe(2);
+    window.eval("setSectionTab('money', 'debts')");
+    expect(window.__scrolls).toBe(2);
+  });
+});

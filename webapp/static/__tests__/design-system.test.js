@@ -566,3 +566,28 @@ describe('одно правило — одно значение свойства
     expect(body).not.toMatch(/position:\s*(relative|static)/);
   });
 });
+
+describe('вёрстка на телефоне: ничего не закрывает поля и подписи', () => {
+  const code = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  it('открытая клавиатура прячет нижнюю панель', () => {
+    const at = code.indexOf('.kb-open .bottom-nav {');
+    expect(at, 'правило .kb-open .bottom-nav пропало').toBeGreaterThan(-1);
+    expect(code.slice(at, code.indexOf('}', at))).toMatch(/visibility:\s*hidden/);
+  });
+
+  it('прокрутка к полю учитывает шапку и нижнюю панель', () => {
+    const at = code.indexOf('\nhtml {');
+    expect(at, 'правило html { scroll-padding } пропало').toBeGreaterThan(-1);
+    const body = code.slice(at, code.indexOf('}', at));
+    expect(body).toMatch(/scroll-padding-top:\s*var\(--topbar-h\)/);
+    expect(body).toMatch(/scroll-padding-bottom:\s*var\(--nav-reserve\)/);
+  });
+
+  it('вкладка не уже своей подписи («одтвердить»)', () => {
+    const at = code.indexOf('\n.seg-item {');
+    const body = code.slice(at, code.indexOf('}', at));
+    expect(body).toMatch(/min-width:\s*max-content/);
+    expect(body).not.toMatch(/min-width:\s*0/);
+  });
+});
