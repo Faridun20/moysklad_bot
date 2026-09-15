@@ -24,6 +24,39 @@ CP_MS = "cp-uuid-1"
 P1_MS = "prod-uuid-1"
 P2_MS = "prod-uuid-2"
 
+_MS = "https://api.moysklad.ru/api/remap/1.2"
+
+
+def _currency(ms_id, name, iso, code, *, default, rate, indirect=False, multiplicity=1):
+    """Валюта так, как её отдаёт МС (entity/currency и expand=rate.currency).
+
+    `name` у МС — краткое наименование («сум», «доллар»), НЕ ISO-код: код
+    лежит в `isoCode`. Прежние фикстуры подставляли {"name": "USD"} и потому
+    не ловили, что скрипт читал ISO из `name`.
+    """
+    return {
+        "meta": {"href": f"{_MS}/entity/currency/{ms_id}", "type": "currency",
+                 "mediaType": "application/json"},
+        "id": ms_id, "name": name, "fullName": name, "code": code, "isoCode": iso,
+        "default": default, "rate": rate, "multiplicity": multiplicity,
+        "indirect": indirect, "archived": False, "system": True,
+        "rateUpdateType": "manual", "margin": 0.0,
+    }
+
+
+# Учётная валюта аккаунта — доллар; сум заведён с обратным курсом («1 USD =
+# 12 700 сум»), как его заводят в аккаунтах с долларовым учётом.
+USD_CUR = _currency("cur-usd", "доллар", "USD", "840", default=True, rate=1.0)
+UZS_CUR = _currency("cur-uzs", "сум", "UZS", "860", default=False, rate=12700.0, indirect=True)
+
+
+def _rate(cur: dict, value: float | None = None) -> dict:
+    """`rate` документа с раскрытой валютой. `value` МС отдаёт, только если ≠ 1."""
+    r: dict = {"currency": dict(cur)}
+    if value is not None:
+        r["value"] = value
+    return r
+
 
 def _pos(ms_id: str, name: str, qty: float, price_minor: int) -> dict:
     return {
@@ -43,7 +76,7 @@ def _order(ms_id="ord-1", name="00001", sum_minor=300000, payed_minor=0, positio
         "sum": sum_minor,
         "payedSum": payed_minor,
         "shippedSum": 0,
-        "rate": {"currency": {"name": "USD"}},
+        "rate": _rate(USD_CUR),
         "description": "",
         "positions": {
             "meta": {"size": len(positions or [])},
@@ -59,7 +92,7 @@ def _demand(ms_id="dem-1", name="D001", order_ms_id="ord-1", sum_minor=300000, p
         "moment": "2026-03-15 10:00:00.000",
         "agent": {"meta": {"href": f"https://x/entity/counterparty/{CP_MS}"}, "name": "ООО Ромашка"},
         "sum": sum_minor,
-        "rate": {"currency": {"name": "USD"}},
+        "rate": _rate(USD_CUR),
         "positions": {
             "meta": {"size": len(positions or [])},
             "rows": positions if positions is not None else [_pos(P1_MS, "Труба", 3, 100000)],
@@ -77,7 +110,7 @@ def _paymentin(ms_id="pay-1", sum_minor=300000, op=("customerorder", "ord-1")):
         "moment": "2026-03-16 11:00:00.000",
         "agent": {"meta": {"href": f"https://x/entity/counterparty/{CP_MS}"}, "name": "ООО Ромашка"},
         "sum": sum_minor,
-        "rate": {"currency": {"name": "USD"}},
+        "rate": _rate(USD_CUR),
         "paymentPurpose": "оплата по счёту",
     }
     if op:
@@ -92,7 +125,7 @@ def _supply(ms_id="sup-1", name="S001", sum_minor=200000, positions=None, agent=
         "moment": "2026-02-01 08:00:00.000",
         "agent": {"meta": {"href": f"https://x/entity/counterparty/{agent}"}, "name": "ООО Ромашка"},
         "sum": sum_minor,
-        "rate": {"currency": {"name": "USD"}},
+        "rate": _rate(USD_CUR),
         "description": "",
         "positions": {
             "meta": {"size": len(positions or [])},
@@ -108,7 +141,7 @@ def _paymentout(ms_id="po-1", sum_minor=200000, agent=CP_MS, op=("supply", "sup-
         "moment": "2026-02-02 09:00:00.000",
         "agent": {"meta": {"href": f"https://x/entity/counterparty/{agent}"}, "name": "ООО Ромашка"},
         "sum": sum_minor,
-        "rate": {"currency": {"name": "USD"}},
+        "rate": _rate(USD_CUR),
         "paymentPurpose": "оплата поставщику",
     }
     if op:
@@ -122,6 +155,7 @@ def ms_api(monkeypatch):
     state = {
         "customerorder": [], "demand": [], "paymentin": [],
         "supply": [], "paymentout": [], "extra": {},
+        "currency": [USD_CUR, UZS_CUR],
     }
 
     async def fake_ms_get(path, params=None):
@@ -175,8 +209,12 @@ def _run(ms_api, *, dry_run=False):
     payments = asyncio.run(mig.pull_payments())
     supplies = asyncio.run(mig.pull_supplies())
     payments_out = asyncio.run(mig.pull_payments_out())
+    currencies = asyncio.run(mig.pull_currencies())
     return asyncio.run(
-        mig.write_history(orders, demands, payments, supplies, payments_out, dry_run=dry_run)
+        mig.write_history(
+            orders, demands, payments, supplies, payments_out,
+            currencies=currencies, dry_run=dry_run,
+        )
     )
 
 
@@ -468,7 +506,7 @@ def test_payment_currency_must_match_the_order(seeded, ms_api):
     и UZS-платёж закрыл бы USD-заказ по номиналу копеек."""
     ms_api["customerorder"] = [_order(sum_minor=300000)]
     p = _paymentin(ms_id="pay-x", sum_minor=300000, op=None)
-    p["rate"] = {"currency": {"name": "UZS"}}
+    p["rate"] = _rate(UZS_CUR, 12700.0)
     ms_api["paymentin"] = [p]
 
     stats, unmatched, _ = _run(ms_api)
@@ -768,3 +806,288 @@ def test_explain_writes_nothing(seeded, ms_api):
     asyncio.run(mig.explain_order("00003"))
     assert _rows(seeded, "SELECT * FROM orders") == []
     assert _rows(seeded, "SELECT * FROM invoices") == []
+
+
+# ─── Валюта и исторический курс (P0-1) ───────────────────────────────────────
+
+
+def _uzs_sale(ms_id="dem-uzs", name="D-UZS", moment="2026-03-10 12:00:00.000", value=12650.0):
+    """Продажа в сумах в аккаунте с долларовым учётом: 10 шт по 12 650.00 сум."""
+    d = _demand(ms_id=ms_id, name=name, order_ms_id=None, sum_minor=12650000,
+                positions=[_pos(P1_MS, "Труба", 10, 1265000)])
+    d["moment"] = moment
+    d["rate"] = _rate(UZS_CUR, value)
+    return d
+
+
+def test_uzs_document_keeps_iso_currency_and_its_own_rate(seeded, ms_api):
+    """Сумовая отгрузка пишется в UZS с курсом ДОКУМЕНТА, а не как доллары.
+
+    Раньше валюта читалась из `rate.currency.name` («сум» или пусто без
+    expand) → подставлялась база USD, и 126 500 сум превращались в 126 500 $.
+    Курс `rate.value` игнорировался, пересчёт шёл по сегодняшнему.
+    """
+    ms_api["demand"] = [_uzs_sale()]
+    p = _paymentin(ms_id="pay-uzs", sum_minor=12650000, op=("demand", "dem-uzs"))
+    p["rate"] = _rate(UZS_CUR, 12600.0)
+    ms_api["paymentin"] = [p]
+
+    stats, _, problems = _run(ms_api)
+
+    assert problems == []
+    order = _rows(seeded, "SELECT * FROM orders")[0]
+    assert order["currency"] == "UZS"
+    # Семантика проекта: 1 сум = fx долларов. Обратный курс МС 12 650 → 1/12 650.
+    assert order["fx_rate_to_base"] == pytest.approx(1 / 12650.0, rel=1e-9)
+    inv = _rows(seeded, "SELECT * FROM invoices")[0]
+    assert inv["currency"] == "UZS"
+    assert inv["total_amount_cents"] == 12650000
+    pay = _rows(seeded, "SELECT * FROM payments")[0]
+    assert (pay["currency"], pay["amount_cents"]) == ("UZS", 12650000)
+    assert pay["fx_rate_to_base"] == pytest.approx(1 / 12600.0, rel=1e-9)
+
+    # И пересчёт в доллары даёт ровно то, что было в тот день: 126 500 сум / 12 650.
+    from services.database import convert_to_base_at
+
+    assert convert_to_base_at(126500.0, "UZS", order["fx_rate_to_base"]) == pytest.approx(10.0)
+
+
+def test_currency_is_resolved_by_dictionary_without_expand(seeded, ms_api):
+    """Если expand не раскрыл валюту (только meta), ISO берётся из справочника
+    по UUID — а не пустая строка, которая раньше означала «база USD»."""
+    d = _uzs_sale()
+    d["rate"] = {"currency": {"meta": {"href": f"{_MS}/entity/currency/cur-uzs",
+                                       "type": "currency"}}, "value": 12650.0}
+    ms_api["demand"] = [d]
+
+    _run(ms_api)
+
+    assert _rows(seeded, "SELECT currency FROM invoices")[0]["currency"] == "UZS"
+
+
+def test_misread_rate_semantics_stops_even_dry_run(seeded, ms_api):
+    """Курс, расходящийся со справочником на порядки, — неверно понятая
+    семантика (например, МС отдал уже нормированный курс). Не пишем и не
+    показываем «успешный» предпросмотр: останавливаемся с объяснением."""
+    ms_api["demand"] = [_uzs_sale(value=0.0000790)]
+
+    with pytest.raises(mig.MigrationStop, match="расходится со справочником"):
+        _run(ms_api, dry_run=True)
+    with pytest.raises(mig.MigrationStop):
+        _run(ms_api)
+    assert _rows(seeded, "SELECT * FROM orders") == []
+    assert _rows(seeded, "SELECT * FROM invoices") == []
+
+
+def test_unknown_currency_stops(seeded, ms_api):
+    d = _uzs_sale()
+    d["rate"] = {"currency": {"meta": {"href": f"{_MS}/entity/currency/cur-eur"}}}
+    ms_api["demand"] = [d]
+
+    with pytest.raises(mig.MigrationStop, match="не найдена в справочнике"):
+        _run(ms_api)
+    assert _rows(seeded, "SELECT * FROM orders") == []
+
+
+def _uzs_account(ms_api):
+    """Аккаунт с учётом в сумах: курс документа приведён к сумам, а база
+    проекта — доллар, и звено «сум → доллар» берётся из архива курсов."""
+    ms_api["currency"] = [
+        _currency("cur-uzs", "сум", "UZS", "860", default=True, rate=1.0),
+        _currency("cur-usd", "доллар", "USD", "840", default=False, rate=12700.0),
+    ]
+
+
+def test_account_in_uzs_uses_rate_archive_for_base(seeded, ms_api):
+    _uzs_account(ms_api)
+    uzs = _demand(ms_id="dem-uzs", name="D1", order_ms_id=None, sum_minor=12600000,
+                  positions=[_pos(P1_MS, "Труба", 10, 1260000)])
+    uzs["moment"] = "2026-03-12 12:00:00.000"
+    uzs["rate"] = {"currency": dict(ms_api["currency"][0])}  # учётная: value нет
+    usd = _demand(ms_id="dem-usd", name="D2", order_ms_id=None)
+    usd["rate"] = {"currency": dict(ms_api["currency"][1]), "value": 12650.0}
+    ms_api["demand"] = [uzs, usd]
+    with seeded.get_conn() as conn:
+        cur = seeded.get_cursor(conn)
+        cur.execute(
+            seeded.q("INSERT INTO currency_rate_daily (currency_code, rate_date, rate_to_base, "
+                     "source, created_at) VALUES ('UZS', '2026-03-10', ?, 'cbu', ?)"),
+            (1 / 12600.0, seeded.now_str()),
+        )
+        conn.commit()
+
+    _run(ms_api)
+
+    fx = {r["ms_demand_id"]: (r["currency"], r["fx_rate_to_base"])
+          for r in _rows(seeded, "SELECT ms_demand_id, currency, fx_rate_to_base FROM orders")}
+    assert fx["dem-usd"] == ("USD", 1.0)
+    assert fx["dem-uzs"][0] == "UZS"
+    assert fx["dem-uzs"][1] == pytest.approx(1 / 12600.0), "курс ближайшего раннего дня архива"
+
+
+def test_account_in_uzs_without_archive_stops(seeded, ms_api):
+    _uzs_account(ms_api)
+    d = _demand(ms_id="dem-uzs", name="D1", order_ms_id=None)
+    d["rate"] = {"currency": dict(ms_api["currency"][0])}
+    ms_api["demand"] = [d]
+
+    with pytest.raises(mig.MigrationStop, match="currency_rate_daily"):
+        _run(ms_api, dry_run=True)
+
+
+def test_dry_run_prints_currency_and_month_breakdown(seeded, ms_api, caplog):
+    import logging
+
+    ms_api["demand"] = [
+        _demand(ms_id="dem-a", name="A", order_ms_id=None),
+        _uzs_sale(ms_id="dem-b", name="B", moment="2026-03-31 23:30:00.000"),
+    ]
+    with caplog.at_level(logging.INFO, logger="ms_history"):
+        rc = asyncio.run(mig.main("dry-run"))
+
+    assert rc == 0
+    text = caplog.text
+    assert "Распределение по валютам" in text
+    assert "UZS: 1 на 126 500.00" in text and "USD: 1 на 3 000.00" in text
+    # Вечерняя московская отгрузка 31 марта — это уже апрель по Ташкенту.
+    assert "2026-04  отгрузки: UZS 1" in text
+    assert "2026-03  отгрузки: USD 1" in text
+    assert _rows(seeded, "SELECT * FROM orders") == []
+
+
+def test_dry_run_with_unconfirmed_rate_fails_loudly(seeded, ms_api, caplog):
+    import logging
+
+    ms_api["demand"] = [_uzs_sale(value=0.0000790)]
+    with caplog.at_level(logging.INFO, logger="ms_history"):
+        rc = asyncio.run(mig.main("dry-run"))
+
+    assert rc == 1
+    assert "ВАЛЮТА/КУРС НЕ ПОДТВЕРЖДЕНЫ" in caplog.text
+    assert "ПЕРЕНОС ОСТАНОВЛЕН" in caplog.text
+
+
+# ─── Ключ накладной — UUID, а не имя (P0-2) ─────────────────────────────────
+
+
+def test_duplicate_demand_names_do_not_overwrite_each_other(seeded, ms_api):
+    """Две отгрузки с одним именем в МС — две накладные, а не одна перезаписанная."""
+    ms_api["demand"] = [
+        _demand(ms_id="dem-1", name="D001", order_ms_id=None,
+                positions=[_pos(P1_MS, "Труба", 3, 100000)]),
+        _demand(ms_id="dem-2", name="D001", order_ms_id=None, sum_minor=40000,
+                positions=[_pos(P2_MS, "Уголок", 2, 20000)]),
+    ]
+
+    stats, _, _ = _run(ms_api)
+
+    invs = _rows(seeded, "SELECT id, invoice_number, total_amount_cents, comment "
+                         "FROM invoices ORDER BY id")
+    assert [i["invoice_number"] for i in invs] == ["MS-D-D001", "MS-D-D001-2"]
+    assert [i["total_amount_cents"] for i in invs] == [300000, 40000]
+    assert all("отгрузка D001" in i["comment"] for i in invs), "исходное имя видно"
+    assert len(_rows(seeded, "SELECT * FROM invoice_items")) == 2
+    assert stats["invoice_numbers_suffixed"] == 1
+    keys = _rows(seeded, "SELECT ms_id, local_id FROM ms_id_map WHERE entity_type = 'demand' "
+                         "ORDER BY ms_id")
+    assert [(k["ms_id"], k["local_id"]) for k in keys] == [
+        ("dem-1", invs[0]["id"]), ("dem-2", invs[1]["id"])
+    ]
+
+    _run(ms_api)  # повторный прогон: ни дублей, ни смены номеров
+    again = _rows(seeded, "SELECT id, invoice_number FROM invoices ORDER BY id")
+    assert again == [{"id": i["id"], "invoice_number": i["invoice_number"]} for i in invs]
+    assert len(_rows(seeded, "SELECT * FROM invoice_items")) == 2
+
+
+def test_duplicate_names_are_counted_for_preview():
+    docs = [{"name": "D1", "ms_id": "a"}, {"name": "D1", "ms_id": "b"},
+            {"name": "D2", "ms_id": "c"}]
+    assert mig.duplicate_names(docs) == {"D1": 2}
+
+
+def test_invoice_written_by_old_version_is_adopted_not_duplicated(seeded, ms_api):
+    """Прежняя версия писала накладную без ms_id_map (ключом был номер).
+    Повторный прогон обязан подхватить её, а не завести вторую рядом."""
+    with seeded.get_conn() as conn:
+        cur = seeded.get_cursor(conn)
+        cur.execute(
+            seeded.q("INSERT INTO invoices (type, warehouse_id, invoice_number, invoice_date, "
+                     "status, currency, total_amount_cents, created_by, created_at) "
+                     "VALUES ('outgoing', 1, 'MS-D-D001', '2026-03-15', 'confirmed', 'USD', "
+                     "1, 0, '2026-03-15 10:00:00')"),
+        )
+        conn.commit()
+    ms_api["demand"] = [_demand(ms_id="dem-1", name="D001", order_ms_id=None)]
+
+    _run(ms_api)
+
+    invs = _rows(seeded, "SELECT * FROM invoices")
+    assert len(invs) == 1
+    assert invs[0]["total_amount_cents"] == 300000
+    assert _rows(seeded, "SELECT local_id FROM ms_id_map WHERE ms_id = 'dem-1'")[0][
+        "local_id"] == invs[0]["id"]
+
+
+# ─── Время МС — московское (P1-5) ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "moment, expected",
+    [
+        ("2026-03-14 09:20:00.000", "2026-03-14 11:20:00"),
+        # Вечер после 22:00 МСК — в Ташкенте уже следующий день…
+        ("2026-03-14 22:30:00.000", "2026-03-15 00:30:00"),
+        # …и следующий месяц, и следующий год.
+        ("2026-03-31 23:30:00.000", "2026-04-01 01:30:00"),
+        ("2025-12-31 22:00:00.000", "2026-01-01 00:00:00"),
+        # 2012: Москва жила по UTC+4 — сдвиг +1 ч, а не +2. Константа ошиблась бы.
+        ("2012-06-01 23:30:00.000", "2012-06-02 00:30:00"),
+        ("2026-03-14 09:20", "2026-03-14 11:20:00"),
+        ("", ""),
+    ],
+)
+def test_ms_moment_is_moscow_time(moment, expected):
+    assert mig._ms_moment_to_local(moment) == expected
+
+
+def test_evening_document_lands_on_next_day_and_month(seeded, ms_api):
+    d = _demand(ms_id="dem-late", name="D-LATE", order_ms_id=None)
+    d["moment"] = "2026-03-31 23:30:00.000"
+    ms_api["demand"] = [d]
+    p = _paymentin(ms_id="pay-late", op=("demand", "dem-late"))
+    p["moment"] = "2026-03-31 22:15:00.000"
+    ms_api["paymentin"] = [p]
+
+    _run(ms_api)
+
+    assert _rows(seeded, "SELECT invoice_date FROM invoices")[0]["invoice_date"] == "2026-04-01"
+    order = _rows(seeded, "SELECT submitted_at, shipped_at FROM orders")[0]
+    assert order == {"submitted_at": "2026-04-01 01:30:00", "shipped_at": "2026-04-01 01:30:00"}
+    assert _rows(seeded, "SELECT confirmed_at FROM payments")[0]["confirmed_at"] \
+        == "2026-04-01 00:15:00"
+
+
+# ─── Поставщики (P2-6) ───────────────────────────────────────────────────────
+
+
+def test_counterparty_with_only_purchases_becomes_supplier(seeded, ms_api):
+    with seeded.get_conn() as conn:
+        cur = seeded.get_cursor(conn)
+        cur.execute(
+            seeded.q("INSERT INTO counterparties (name, type, legacy_ms_id, created_at) "
+                     "VALUES ('Завод', 'customer', 'cp-supplier', ?)"),
+            (seeded.now_str(),),
+        )
+        conn.commit()
+    ms_api["demand"] = [_demand(order_ms_id=None)]  # Ромашка покупает…
+    ms_api["supply"] = [_supply(), _supply(ms_id="sup-2", name="S2", agent="cp-supplier")]
+    ms_api["paymentout"] = [_paymentout(ms_id="po-2", agent="cp-supplier", op=None)]
+
+    stats, _, _ = _run(ms_api)
+
+    types = {r["legacy_ms_id"]: r["type"]
+             for r in _rows(seeded, "SELECT legacy_ms_id, type FROM counterparties")}
+    assert types == {CP_MS: "customer", "cp-supplier": "supplier"}
+    assert stats["counterparties_to_supplier"] == 1
+    assert stats["counterparties_both"] == 1, "Ромашка и продаёт, и покупает — остаётся клиентом"
