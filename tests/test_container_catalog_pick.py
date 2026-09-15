@@ -361,3 +361,77 @@ def test_resolve_is_refused_after_the_edit_window_closes(isolated_db):
 
     res = _run(cr.resolve_items(cid, {items["namesake"]: {"product_id": _pids["bracket"]}}))
     assert res["ok"] is False and res.get("window_closed") is True
+
+
+# ─── Сверка: факт и остаток сходятся ─────────────────────────────────────────
+
+
+def test_failed_re_receipt_reverts_quantities_and_is_not_ok(isolated_db, monkeypatch):
+    """Товар прежнего прихода уже отгружен — отмена накладной увела бы остаток в
+    минус, и переоприходование отказывает. Раньше ручка отвечала «ок»: карточка
+    показывала новый факт, остаток стоял по старому, причина лежала в `receipt`."""
+    from services import containers, warehouse
+
+    db = isolated_db
+    _setup(db)
+    client = _client(monkeypatch)
+    pid = _product("Кабель ВВГ")
+    cid = _container()
+    item = _item(cid, "Кабель ВВГ", 100, product_id=pid)
+    _run(containers.mark_arrived(cid, user_id=2))
+
+    first = _post(client, "/api/containers/check", 1, container_id=cid, quantities={str(item): 100})
+    assert first.status_code == 200 and first.json()["receipt"]["ok"], first.text
+    assert _stock(db, pid) == 100
+    wid = _run(warehouse.default_warehouse_id())
+    shipped = _run(warehouse.create_invoice(
+        invoice_type="outgoing", warehouse_id=wid,
+        items=[{"product_id": pid, "quantity": 60, "price_cents": 100}],
+    ))
+    assert shipped["ok"], shipped
+    assert _stock(db, pid) == 40
+
+    r = _post(client, "/api/containers/check", 1, container_id=cid, quantities={str(item): 50})
+    assert r.status_code == 409, r.text
+    body = r.json()
+    assert body["ok"] is False and body["reverted"] is True
+    assert "уже отгружен" in body["detail"] and "прежними" in body["detail"]
+    assert body["receipt"]["code"] == "insufficient_stock"
+
+    card = _post(client, "/api/containers/card", 1, container_id=cid).json()
+    assert card["items"][0]["arrived_qty"] == 100, "факт вернулся к проведённому"
+    assert _stock(db, pid) == 40
+    assert _count(db, "SELECT COUNT(*) FROM invoices WHERE type = 'incoming' AND status <> 'cancelled'") == 1
+    assert _count(db, "SELECT COUNT(*) FROM audit_log WHERE action = 'container_checked'") == 1
+
+
+def test_first_receipt_with_nothing_to_receive_keeps_the_count(isolated_db, monkeypatch):
+    """Первый приход, которому нечего проводить (факт пустой), — не откат:
+    остаток и не должен был двигаться. Причина — в `receipt`."""
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    client = _client(monkeypatch)
+    pid = _product("Кабель ВВГ")
+    cid = _container()
+    item = _item(cid, "Кабель ВВГ", 10, product_id=pid)
+    _run(containers.mark_arrived(cid, user_id=2))
+
+    r = _post(client, "/api/containers/check", 1, container_id=cid, quantities={str(item): "0"})
+    assert r.status_code == 200, r.text
+    assert r.json()["receipt"]["ok"] is False
+    assert _run(containers.list_items(cid))[0]["arrived_qty"] == 0
+
+
+def test_check_with_bad_resolve_saves_nothing(isolated_db, monkeypatch):
+    from services import containers
+
+    db = isolated_db
+    _setup(db)
+    client = _client(monkeypatch)
+    cid, _pids, items = _arrived_container(db, client)
+    r = _post(client, "/api/containers/check", 1, container_id=cid,
+              quantities={str(items["new"]): 5}, resolve={str(items["new"]): {"product_id": 999}})
+    assert r.status_code == 404
+    assert all(i["arrived_qty"] is None for i in _run(containers.list_items(cid)))

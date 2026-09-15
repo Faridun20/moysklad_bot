@@ -808,3 +808,35 @@ def test_arrive_is_closed_to_roles_without_machines(isolated_db, monkeypatch):
     # Остальные переходы графа — по-прежнему руководству.
     assert _post(client, "/api/machines/status", 1, machine_id=mid,
                  status="in_stock", expected="in_transit").status_code == 403
+
+
+def test_installment_without_down_payment_accepts_zero(isolated_db, monkeypatch):
+    """Взнос «0» — законная рассрочка без первоначального взноса, а не «не число».
+    Ноль отвергать только там, где он опечатка (цена, платёж)."""
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    client = _client(monkeypatch)
+    for i, zero in enumerate(("0", "0,00", " 0 ", 0)):
+        mid = _machine(f"Z-{i}")
+        r = _post(client, "/api/machines/deal", 2, machine_id=mid, kind="credit",
+                  price="12 000", down_payment=zero, months=4, buyer_name="Азиз",
+                  idempotency_key=f"zero-{i}")
+        assert r.status_code == 200, (zero, r.text)
+        deal = _run(machines.list_deals(mid, role="boss"))[0]
+        progress = _run(machines.deal_progress(int(deal["id"])))
+        seqs = [p["seq"] for p in progress["payments"]]
+        assert seqs == [1, 2, 3, 4], "без взноса — без строки взноса в графике"
+        assert sum(p["amount_cents"] for p in progress["payments"]) == 1_200_000
+
+    for bad in ("abc", "-5"):
+        mid = _machine(f"B-{bad}")
+        r = _post(client, "/api/machines/deal", 2, machine_id=mid, kind="credit",
+                  price="12 000", down_payment=bad, months=4, buyer_name="Азиз",
+                  idempotency_key=f"bad-{bad}")
+        assert r.status_code == 400, (bad, r.text)
+    # Цена ноль по-прежнему отказ.
+    r = _post(client, "/api/machines/deal", 2, machine_id=_machine("P-0"), kind="sale",
+              price="0", buyer_name="Азиз", idempotency_key="price-0")
+    assert r.status_code == 400

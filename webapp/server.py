@@ -3866,18 +3866,35 @@ def _optional_id(data: dict, key: str) -> int | None:
     return value
 
 
-def _machine_money(raw, label: str) -> int | None:
+def _machine_money(raw, label: str, *, allow_zero: bool = False) -> int | None:
     """Сумма из формы («25 000», «25000.50») → копейки.
 
     Граница системы: наружу и внутрь ходят копейки, парсинг человеческой записи
     живёт ровно здесь. Пустое поле — это «не задано», а не ноль.
+
+    `allow_zero` — поле, где ноль законен: рассрочка без первоначального взноса.
+    `parse_amount` ноль отвергает (цена или платёж в ноль — опечатка), и взнос
+    «0» получал отказ «не число», хотя клиент просто ничего не внёс.
     """
     if raw is None or str(raw).strip() == "":
         return None
     cents = money.parse_amount(raw)
+    if cents is None and allow_zero:
+        from decimal import Decimal
+
+        try:
+            if Decimal(_normalized_amount(raw)) == 0:
+                return 0
+        except (ArithmeticError, ValueError):
+            pass
     if cents is None:
         raise HTTPException(status_code=400, detail=f"{label}: не число или не больше нуля")
     return cents
+
+
+def _normalized_amount(raw) -> str:
+    """Запись суммы без пробелов-разделителей и с точкой — как её читает `parse_amount`."""
+    return str(raw).strip().replace(" ", "").replace("\u00a0", "").replace(",", ".")
 
 
 def _machine_text(data: dict, key: str, limit: int = 200) -> str | None:
@@ -4159,7 +4176,9 @@ async def api_machines_deal(request: Request):
 
     # Рассрочка: взнос и срок в месяцах. Дату последнего платежа считает сервис
     # по графику — введённая руками, она рано или поздно разошлась бы с ним.
-    down_payment_cents = _machine_money(data.get("down_payment"), "Первоначальный взнос") or 0
+    down_payment_cents = _machine_money(
+        data.get("down_payment"), "Первоначальный взнос", allow_zero=True
+    ) or 0
     months = 0
     if kind == "credit":
         try:
@@ -4883,24 +4902,54 @@ async def api_containers_check(request: Request):
     from services import container_receipt
 
     resolutions = _container_resolutions(data)
-
-    res = await containers.set_arrived_quantities(
-        container_id, quantities, user_id=user["id"], full_name=_actor_name(user)
-    )
-    if not res.get("ok"):
-        return _machine_response(res)
-    # Выбор товара по непривязанным позициям — после сохранения количеств и ДО
-    # прихода: иначе накладная ушла бы без них, и её пришлось бы переоприходовать.
+    # Выбор товара по непривязанным позициям — ДО сохранения количеств и прихода:
+    # отказ выбора (чужая позиция, нет товара) не должен оставлять сохранённый
+    # факт без прихода, а без привязки накладная ушла бы без этих позиций.
     resolved = await container_receipt.resolve_items(container_id, resolutions)
     if not resolved.get("ok"):
         return _machine_response(resolved)
+
+    # Что было до сохранения: откатить факт, если приход за ним не поехал.
+    before = {int(i["id"]): i.get("arrived_qty") for i in await containers.list_items(container_id)}
+    had_invoice = bool((await container_receipt.get_link(container_id)).get("invoice_id"))
+
+    res = await containers.set_arrived_quantities(
+        container_id, quantities, user_id=user["id"], full_name=_actor_name(user), audit=False
+    )
+    if not res.get("ok"):
+        return _machine_response(res)
     res["resolved"] = resolved
 
     # Остаток пополняем сразу после сохранения — ради этого приёмку и считают.
-    # Best-effort: сверка уже сохранена, и отказ прихода не должен выглядеть как
-    # «ничего не записалось». Что не прошло — возвращаем текстом, чтобы это
-    # можно было починить, а не узнать через неделю по остаткам.
-    res["receipt"] = await container_receipt.receive(container_id, user_id=user["id"])
+    receipt = await container_receipt.receive(container_id, user_id=user["id"])
+    res["receipt"] = receipt
+    if not receipt.get("ok") and (had_invoice or receipt.get("code")):
+        # Переоприходование не прошло (чаще всего товар прежнего прихода уже
+        # отгружен, и отмена накладной увела бы остаток в минус). Раньше ручка
+        # отвечала «ок»: карточка показывала новый факт, остаток стоял по
+        # старому, а причина лежала в поле `receipt`, которое экран не читал.
+        # Факт и остаток обязаны сходиться — возвращаем прежние количества и
+        # отказываем целиком.
+        await containers.set_arrived_quantities(
+            container_id,
+            {item_id: before.get(item_id) for item_id in quantities},
+            user_id=user["id"], full_name=_actor_name(user), audit=False,
+        )
+        reason = str(receipt.get("error") or "приход не проведён")
+        if receipt.get("code") == "insufficient_stock":
+            reason = ("товар из прежнего прихода уже отгружен, и отмена прихода увела бы "
+                      f"остаток в минус ({reason})")
+        detail = f"Сверка не сохранена: {reason}. Количества оставлены прежними."
+        return JSONResponse(
+            {"ok": False, "reverted": True, "receipt": receipt, "detail": detail},
+            status_code=409,
+        )
+    # Первый приход, которому нечего проводить (всё пусто, позиции без карточки
+    # по старому API), — не откат: остаток и не должен был двигаться. Причина —
+    # в `receipt`, экран показывает её отдельным сообщением.
+    await containers.audit_checked(
+        container_id, len(quantities), user_id=user["id"], full_name=_actor_name(user)
+    )
     return JSONResponse(res)
 
 

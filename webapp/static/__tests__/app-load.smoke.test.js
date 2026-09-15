@@ -801,6 +801,41 @@ describe('контейнеры', () => {
     expect(window.__writes[0][1].quantities).toEqual({ 10: '500', 11: '19' });
   });
 
+  it('переоприходование не прошло (409): текст сервера виден, карточка перечитана', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      window.__cards = 0;
+      api = async () => { window.__cards++; return ${JSON.stringify(CARD({ items: LINKED() }))}; };
+      tg.showAlert = (text) => { window.__alerted = text; };
+      apiResult = async () => ({ ok: false, status: 409,
+        error: 'Сверка не сохранена: товар из прежнего прихода уже отгружен. Количества оставлены прежними.',
+        body: { ok: false, reverted: true } });
+      window.__ready = renderContainerCard(3);
+    `);
+    await window.__ready;
+    window.document.querySelector('.qty-input[data-item="11"]').value = '5';
+    window.document.querySelector('#cont-save').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__alerted).toContain('уже отгружен');
+    expect(window.__cards).toBe(2);
+    expect(window.document.body.textContent).not.toContain('Сверка сохранена');
+  });
+
+  it('сверка сохранена, а приход не проведён — это сказано красным, а не «сохранено»', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      api = async () => (${JSON.stringify(CARD({ items: LINKED() }))});
+      apiResult = async () => ({ ok: true, status: 200, error: '',
+        body: { ok: true, receipt: { ok: false, error: 'Нечего оприходовать' } } });
+      window.__ready = renderContainerCard(3);
+    `);
+    await window.__ready;
+    window.document.querySelector('#cont-save').click();
+    await new Promise(r => setTimeout(r, 0));
+    const toasts = Array.from(window.document.querySelectorAll('.toast')).map(t => t.textContent).join(' | ');
+    expect(toasts).toContain('на склад не пошло: Нечего оприходовать');
+  });
+
   it('позиции без карточки: сверка сначала спрашивает, что это за товар', async () => {
     // Сверка сразу проводит приход. Раньше непривязанная позиция молча
     // выпадала из накладной — теперь выбор делается ДО неё и едет тем же запросом.

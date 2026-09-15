@@ -2854,9 +2854,20 @@ async function renderContainerCard(containerId) {
         btn.disabled = false;
       }
     };
-    const savedText = (body) => {
+    // Сверка сохранена, а приход — нет (первый приход, которому нечего
+    // проводить): говорим это отдельно и красным. Раньше экран писал «Сверка
+    // сохранена», а причина лежала в `receipt`, который никто не читал.
+    // Неудачное ПЕРЕоприходование сервер отвергает целиком (409) — его текст
+    // показывает обычная ветка ошибки.
+    const toastSaved = (body) => {
+      const r = body.receipt || {};
+      if (r.ok === false && !r.legacy) {
+        toast(`Сверка сохранена, на склад не пошло: ${r.error || 'приход не проведён'}`, 'error',
+              { duration: 6000 });
+        return;
+      }
       const created = ((body.resolved || {}).created || []).length;
-      return created ? `Сверка сохранена · новых товаров в каталоге: ${created}` : 'Сверка сохранена';
+      toast(created ? `Сверка сохранена · новых товаров в каталоге: ${created}` : 'Сверка сохранена');
     };
     // Сверка сразу проводит приход — позиции без карточки выбираем ДО него.
     const qtyOf = it => quantities[String(it.id)] ?? it.arrived_qty;
@@ -2870,7 +2881,7 @@ async function renderContainerCard(containerId) {
           const res = await save(resolve);
           if (!res.ok) { showErr(res.error); return false; }
           haptic('success');
-          toast(savedText(res.body));
+          toastSaved(res.body);
           renderContainerCard(containerId);
           return true;
         },
@@ -2880,10 +2891,12 @@ async function renderContainerCard(containerId) {
     const res = await save({});
     if (!res.ok) {
       tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+      // 409 — сервер вернул прежние количества: поля на экране устарели.
+      if (res.status === 409) renderContainerCard(containerId);
       return;
     }
     haptic('success');
-    toast(savedText(res.body));
+    toastSaved(res.body);
     renderContainerCard(containerId);
   });
 
