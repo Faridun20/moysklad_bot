@@ -183,6 +183,12 @@ def _authorize(
     Используйте вместо того, чтобы дублировать verify_init_data +
     get_role + role-check + rate-limit в каждом endpoint'е (легко забыть).
     """
+    if not isinstance(data, dict):
+        # Тело — валидный JSON, но не объект (`[]`, `"x"`, `42`, `null`):
+        # `.get("initData", ...)` ниже уронил бы AttributeError → общий
+        # 500-обработчик и алерт админам на банально кривой клиент/скан.
+        # Та же причина, что у отсутствующей/просроченной подписи, — 401.
+        raise HTTPException(status_code=401, detail=SESSION_EXPIRED_DETAIL)
     user = _dev_bypass_user() or verify_init_data(data.get("initData", ""))
     if not user:
         # Подпись initData живёт час (webapp/auth.py MAX_INIT_DATA_AGE): чаще
@@ -266,12 +272,23 @@ async def _lifespan(_app):
 app = FastAPI(title="Склад WebApp", lifespan=_lifespan)
 
 
+_BAD_JSON_DETAIL = "Некорректный JSON"
+
+
 @app.exception_handler(Exception)
 async def _unhandled_exception(request: Request, exc: Exception):
     """Необработанная ошибка ручки: клиенту — короткий текст без внутренностей
     (раньше в detail уезжал `str(e)` вплоть до текста SQL), в лог — трасса,
     админам — алерт в Telegram с дросселем (`services.error_alerts`). Алерт
-    уходит фоном: ответ не ждёт сети до Telegram."""
+    уходит фоном: ответ не ждёт сети до Telegram.
+
+    Битое тело запроса (`await request.json()` до `_authorize` — см. ручки)
+    не парсится как JSON и раньше улетало сюда же: 500 клиенту и алерт
+    админам на банально кривой клиент/скан, а не поломку сервиса. Отвечаем
+    400 БЕЗ алерта — единая точка, а не правка всех ручек по отдельности."""
+    if isinstance(exc, json.JSONDecodeError):
+        return JSONResponse({"detail": _BAD_JSON_DETAIL}, status_code=400)
+
     from services import error_alerts
     from utils.background import spawn
 
