@@ -128,6 +128,14 @@ def seed_basic(db) -> dict[str, Any]:
     db.set_role(ids["keeper"], "keeper_user", "Keeper", "warehouse_keeper")
     db.set_role(ids["book"], "book_user", "Book", "bookkeeper")
 
+    # E2E/perf сценарии проверяют денежные потоки (подтверждение платежа,
+    # сдачи, возврата) на суммах бытового масштаба — они не про
+    # notify_policy/boss_digest (порог «боссу сразу», см. CLAUDE.md
+    # «Уведомления»). Нулевой порог держит прежнее поведение «пуш уходит
+    # всегда», как до дайджеста; сам порог проверяют отдельные unit-тесты
+    # (test_notify_policy.py, test_boss_notify_gating.py, test_boss_digest.py).
+    db.set_setting("boss_instant_threshold_usd", 0)
+
     pid = run_async(container_receipt.create_product("Кабель ВВГ 3x2.5"))["product_id"]
     wid = run_async(warehouse.default_warehouse_id())
     run_async(warehouse.create_invoice(

@@ -21,6 +21,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services import async_db as adb
+from services.notify_policy import CASH_DEPOSIT, should_notify_now
 from services.roles import can_confirm_deposit
 from handlers._ui import (
     drop_keyboard,
@@ -108,9 +109,14 @@ async def _notify_confirmers(
     Что закрывает сдача — наличные строки разбивки по заказам и прежнее
     распределение по долгам (`order_payments.deposit_orders_view`), каждая
     строка в своей валюте."""
+    cur = (currency or _base_cur()).upper()
+    # Денежное событие — ниже boss_instant_threshold_usd карточку не шлём:
+    # сдача остаётся pending в БД и попадёт в вечерний дайджест боссу
+    # (services.boss_digest), а не потеряется.
+    if not should_notify_now(CASH_DEPOSIT, amount, cur):
+        return
     from services import order_payments
 
-    cur = (currency or _base_cur()).upper()
     view = (await order_payments.deposit_orders_view([deposit_id])).get(deposit_id, [])
     orders_line = (
         "\n".join(

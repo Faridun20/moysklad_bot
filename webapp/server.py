@@ -1799,10 +1799,18 @@ def _require_draft_order(order) -> None:
 
 async def _notify_batch_payments(full_name, username, comment, created):
     """Одно уведомление боссу по созданным платежам (кнопка ✅/❌ на каждый).
-    Best-effort: ошибка отправки не должна терять уже созданные платежи."""
+    Best-effort: ошибка отправки не должна терять уже созданные платежи.
+
+    Денежное событие — по КАЖДОЙ строке отдельно: платежи ниже
+    `boss_instant_threshold_usd` не пушим, они остаются pending и уходят в
+    вечерний дайджест (`services.boss_digest`); карточкой сразу идут только
+    строки ≥ порога. Пустой отфильтрованный список — сообщение не шлём вовсе.
+    """
     from services.notifier import aget_notify_recipients, tg_send_message
+    from services.notify_policy import PAYMENT, should_notify_now
     from utils.helpers import esc
 
+    created = [c for c in created if should_notify_now(PAYMENT, c[1], c[2])]
     if not created:
         return
     lines = "\n".join(f"• {a:,.0f} {c}" for _, a, c in created)
@@ -1982,25 +1990,32 @@ async def api_payments_send(request: Request):
         f"Платёж #{payment_id}: {amount:,.0f} {currency} — {comment}",
     )
 
-    # Уведомляем админов через Telegram API напрямую
-    notify_text = format_payment_notify(payment_id, full_name, username, amount, currency, comment)
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "✅ Принять", "callback_data": f"pay_ok:{payment_id}"},
-                {"text": "❌ Отклонить", "callback_data": f"pay_no:{payment_id}"},
+    # Уведомляем админов через Telegram API напрямую — только если сумма не
+    # ниже boss_instant_threshold_usd (services.notify_policy): меньшие суммы
+    # остаются pending и попадают в вечерний дайджест, а не в отдельный пуш.
+    from services.notify_policy import PAYMENT, should_notify_now
+
+    if should_notify_now(PAYMENT, amount, currency):
+        notify_text = format_payment_notify(
+            payment_id, full_name, username, amount, currency, comment
+        )
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Принять", "callback_data": f"pay_ok:{payment_id}"},
+                    {"text": "❌ Отклонить", "callback_data": f"pay_no:{payment_id}"},
+                ]
             ]
-        ]
-    }
+        }
 
-    from services.notifier import aget_notify_recipients
+        from services.notifier import aget_notify_recipients
 
-    recipients = await aget_notify_recipients()
+        recipients = await aget_notify_recipients()
 
-    # tg_send_message переиспользует общую ClientSession — никакого
-    # TCP+TLS-рукопожатия на каждое уведомление.
-    for uid in recipients:
-        await tg_send_message(uid, notify_text, reply_markup=keyboard)
+        # tg_send_message переиспользует общую ClientSession — никакого
+        # TCP+TLS-рукопожатия на каждое уведомление.
+        for uid in recipients:
+            await tg_send_message(uid, notify_text, reply_markup=keyboard)
 
     result = {"payment_id": payment_id, "payment_ids": [payment_id], "status": "pending"}
     if full_idem:
@@ -6088,23 +6103,26 @@ async def api_submit_order(request: Request):
         f"Заявка #{req_id} (заказ #{order_id}) через WebApp",
     )
 
-    # Уведомляем руководителей
+    # Уведомляем руководителей — заявка блокирует работу менеджера, поэтому
+    # notify_policy.ORDER_REQUEST всегда «сразу» (см. services/notify_policy.py).
+    from services.notify_policy import ORDER_REQUEST, should_notify_now
     from services.order_workflow import resubmit_diff_line
     from handlers.orders import build_credit_context
 
-    notify_text = format_request_notify(order, items, req_id)
-    notify_text += await build_credit_context(order, items)  # UX: долг/лимит клиента инлайн
-    notify_text += await resubmit_diff_line(order_id, items)  # #30: diff после доработки
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "✅ Одобрить", "callback_data": f"req_ok:{req_id}"},
-                {"text": "❌ Отклонить", "callback_data": f"req_no:{req_id}"},
+    if should_notify_now(ORDER_REQUEST):
+        notify_text = format_request_notify(order, items, req_id)
+        notify_text += await build_credit_context(order, items)  # UX: долг/лимит клиента инлайн
+        notify_text += await resubmit_diff_line(order_id, items)  # #30: diff после доработки
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Одобрить", "callback_data": f"req_ok:{req_id}"},
+                    {"text": "❌ Отклонить", "callback_data": f"req_no:{req_id}"},
+                ]
             ]
-        ]
-    }
-    for uid in await aget_notify_recipients():
-        await tg_send_message(uid, notify_text, reply_markup=keyboard)
+        }
+        for uid in await aget_notify_recipients():
+            await tg_send_message(uid, notify_text, reply_markup=keyboard)
 
     return JSONResponse({"req_id": req_id})
 
@@ -6556,9 +6574,13 @@ async def _notify_bosses_payment_pending(
     """Когда менеджер отметил частичную/полную оплату по credit-заказу —
     шлём push'ы всем boss/admin с кнопками confirm/reject через
     стандартный payment-approval flow (pay_ok/pay_no callbacks).
-    Best-effort, тихо ловим ошибки."""
+    Best-effort, тихо ловим ошибки.
+
+    Денежное событие — ниже `boss_instant_threshold_usd` пуш не шлём, платёж
+    остаётся pending и попадает в вечерний дайджест (services.boss_digest)."""
     from services import async_db as adb
     from services.notifier import aget_notify_recipients, tg_send_message
+    from services.notify_policy import PAYMENT, should_notify_now
 
     try:
         order = await adb.get_order(order_id)
@@ -6578,6 +6600,8 @@ async def _notify_bosses_payment_pending(
         due = esc(order.get("due_date") or "—")
         manager_name = esc(manager_name)
         amount = float(payment.get("amount") or 0)
+        if not should_notify_now(PAYMENT, amount, currency):
+            return
         fmt = lambda n: f"{int(round(n)):,}".replace(",", " ")
         # summary["remaining"] = total - confirmed (без учёта pending).
         # «Останется после подтверждения ЭТОГО платежа» =

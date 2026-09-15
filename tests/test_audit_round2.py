@@ -29,6 +29,9 @@ def test_payment_pending_push_escapes_user_names(isolated_db, monkeypatch):
     db = isolated_db
     db.set_role(1, "b", "Boss", "boss")
     db.set_role(200, "m", "Mgr", "manager")
+    # Тест — про экранирование, а не про notify_policy: платёж на $50 ниже
+    # дефолтного порога (5000 USD) теперь ушёл бы в дайджест, а не пушем.
+    db.set_setting("boss_instant_threshold_usd", 0)
     oid = db.create_order(200, "Менеджер <script>", "")
     db.update_order_agent(oid, "1", "ООО <Строй> & Ко")
     db.add_order_item(oid, "Труба", "", 1, "шт", 100.0)

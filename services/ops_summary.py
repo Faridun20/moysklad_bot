@@ -36,6 +36,7 @@ CRON_THRESHOLDS_HOURS: dict[str, float] = {
     "machines_archive": 26.0,
     "fx_sync": 26.0,
     "money_report": 170.0,  # 1×/неделю → 7 суток + 2ч
+    "boss_digest": 2.0,  # каждые 15 мин (тик может ничего не послать, но ЗАПУСК есть всегда) → 2ч с большим запасом
 }
 
 _ITEM_CAP = 15

@@ -14,6 +14,11 @@ from typing import Any
 from aiogram import Bot
 
 from services.notifier import get_notify_recipients
+from services.notify_policy import (
+    ORDER_REQUEST,
+    PAYMENT,
+    should_notify_now,
+)
 from utils.formatters import (
     format_payment_notify,
     format_payment_confirmed,
@@ -49,7 +54,14 @@ async def notify_shipment_request(
     *,
     approve_keyboard: Any,
 ) -> None:
-    """Уведомить руководителей о новой заявке на отгрузку."""
+    """Уведомить руководителей о новой заявке на отгрузку.
+
+    Заявка блокирует работу менеджера до решения — `notify_policy.
+    ORDER_REQUEST` всегда «сразу» (не режется дайджестом), но проверяем через
+    неё же, а не литералом True: один источник правды на все точки входа.
+    """
+    if not should_notify_now(ORDER_REQUEST):
+        return
     recipients = get_notify_recipients()
     for uid in recipients:
         try:
@@ -190,7 +202,16 @@ async def notify_payment_sent(
     comment: str,
     confirm_keyboard: Any,
 ) -> None:
-    """Уведомить руководителей о новом платеже (ожидает подтверждения)."""
+    """Уведомить руководителей о новом платеже (ожидает подтверждения).
+
+    Денежное событие — режется порогом `boss_instant_threshold_usd`
+    (`notify_policy.should_notify_now`). Ниже порога карточку боссу НЕ шлём:
+    платёж остаётся pending в БД и попадёт в вечерний дайджест
+    (`services.boss_digest`) — само создание платежа это уже сделало, здесь
+    только решаем, пушим ли отдельно СЕЙЧАС.
+    """
+    if not should_notify_now(PAYMENT, amount, currency):
+        return
     text = format_payment_notify(payment_id, full_name, username, amount, currency, comment)
     recipients = get_notify_recipients()
     for uid in recipients:
@@ -247,9 +268,11 @@ async def notify_payment_confirmation_needed(
     if not payment:
         return
     currency = order.get("currency") or BASE_CURRENCY
+    amount = float(payment.get("amount") or 0)
+    if not should_notify_now(PAYMENT, amount, currency):
+        return
     agent = esc(order.get("agent_name") or "—")
     due = order.get("due_date") or "—"
-    amount = float(payment.get("amount") or 0)
     confirmed_before = max(0.0, summary["confirmed"])
     # summary["remaining"] = total - confirmed (без учёта pending).
     # «Останется после подтверждения ЭТОГО платежа» — отнимаем amount.

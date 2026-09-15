@@ -41,6 +41,7 @@ python -m tasks.run_backup               # дамп БД → gzip → прива
 python -m tasks.run_machines_archive     # техника: проданное >90 дней назад → archived (ночью, T4.3)
 python -m tasks.run_money_report         # «Где деньги» руководству Rich Message'ом (понедельник)
 python -m tasks.run_fx_sync              # курс USD↔UZS от ЦБ РУз (раз в сутки, до долгов и отчётов)
+python -m tasks.run_boss_digest          # вечерний дайджест боссу: мелкие платежи/сдачи/возвраты ниже boss_instant_threshold_usd (см. «Уведомления»); гонять каждые 15 минут — время дайджеста настройка, is_due() сам решает, пора ли
 ```
 
 **Сборка/деплой:** Railway **Railpack** (не Nixpacks) — `railpack.json`
@@ -254,6 +255,26 @@ Y» (`remaining_after_pending` = остаток − ждущее; `overpending` 
 **Уведомления:**
 - Шлём через `services.notifier.tg_send_message` (работает в любом процессе; токен не светится — `_redact_token`).
 - Поллера новых отгрузок больше НЕТ: отгрузку проводит сам бот, и рассказывать себе о собственном действии незачем. Вместе с ним ушли дедуп `notified_shipments` и `CHECK_INTERVAL_SEC`.
+- **Боссу — меньше пингов (решение владельца, сентябрь 2026).** Раньше каждая
+  заявка/платёж/сдача/возврат уходили боссу отдельной карточкой. Теперь
+  немедленно — только то, что блокирует работу (заявка на отгрузку, одобрение
+  сделки по технике) и денежные события ≥ `app_settings.
+  boss_instant_threshold_usd` (курс — ТЕКУЩИЙ из `currency_rates`; валюта без
+  курса → считаем «сразу», а не молчим). Единая точка решения —
+  `services.notify_policy.should_notify_now(kind, amount, currency)`: КАЖДОЕ
+  место, которое шлёт боссу пуш (`services/notify.py`, `handlers/returns.py`,
+  `handlers/deposits.py`, `webapp/server.py`), проверяет её ПЕРЕД отправкой.
+  Событие ниже порога карточкой не идёт — остаётся `pending` в своей таблице
+  (`payments`/`cash_deposits`/`returns`) и попадает в вечерний дайджест
+  (`services.boss_digest`, cron `tasks/run_boss_digest.py`, время —
+  настройка `boss_digest_time`, крон каждые 15 минут проверяет `is_due()`).
+  **Без отдельной очереди**: дайджест каждый раз вычисляется из текущего
+  состояния БД + того же `should_notify_now` — что уже решено, само выпадает
+  из выборки. Идемпотентность самого дайджеста (не более раза в день) —
+  метка `app_settings.boss_digest_last_run_at`, пишется ПОСЛЕ отправки (как у
+  `cash_deposit_reminder_time`: пропущенный прогон не «съедает» дайджест дня,
+  ретрай может продублировать). Менеджерские уведомления (об исходе СВОЕЙ
+  заявки/платежа) политика не трогает.
 
 **Telegram + WebApp:**
 - Пользовательский ввод в HTML → `utils.helpers.esc()`. Никогда не интерполируй `full_name` / `comment` / `agent_name` / `details` напрямую в `parse_mode="HTML"`.

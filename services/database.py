@@ -1941,6 +1941,14 @@ _DEFAULT_SETTINGS: dict[str, tuple] = {
     "auto_create_demand_on_approve": (True, "Создавать demand в МойСклад при approve"),
     "auto_ship_on_approve": (True, "Авто-переход в shipped сразу после approve"),
     "machines_archive_days": (90, "Через сколько дней проданная техника уходит в архив"),
+    "boss_instant_threshold_usd": (
+        5000.0,
+        "Денежное событие ≥ этой суммы (USD) — боссу пуш сразу, не в дайджест",
+    ),
+    "boss_digest_time": (
+        "19:00",
+        "Время вечернего дайджеста решений боссу (Asia/Tashkent)",
+    ),
 }
 
 
@@ -4186,6 +4194,41 @@ async def get_pending_cash_deposits() -> list[dict]:
     rows = await adb_core.fetch(
         "SELECT * FROM cash_deposits WHERE status = 'pending' "
         "ORDER BY deposited_at ASC"
+    )
+    return _with_major(rows, ("amount", "amount_cents"))
+
+
+async def get_pending_payments() -> list[dict]:
+    """Платежи, ждущие подтверждения (карта/перечисление — руководитель или
+    бухгалтер; наличные тоже приходят сюда со статусом pending, хоть и
+    подтверждаются только сдачей — способ смотри в `order_payments.
+    parts_by_payment`, «нет строки» = старый платёж без разбивки).
+
+    Источник для `services.notify_policy`/`services.boss_digest`: то, что не
+    ушло боссу немедленным пушем (сумма ниже `boss_instant_threshold_usd»),
+    должно быть видно в вечернем дайджесте — без отдельной очереди, прямо из
+    текущего состояния `payments`. Живой заказ (WP-11) — платёж по удалённому
+    заказу не в счёт, как и в `get_cash_history`."""
+    rows = await adb_core.fetch(
+        f"SELECT p.* FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
+        f"WHERE p.status = 'pending' AND {_LIVE_ORDER_PAYMENT_FILTER} "
+        "ORDER BY p.created_at ASC"
+    )
+    return _with_major(rows, ("amount", "amount_cents"))
+
+
+async def get_confirmed_payments_since(since_iso: str) -> list[dict]:
+    """Платежи, подтверждённые с момента `since_iso` (для вечернего дайджеста
+    боссу — раздел «мелкие поступления»: то, что ушло без немедленного пуша,
+    но уже реально пришло). Граница — по `COALESCE(confirmed_at, created_at)`,
+    как в `get_cash_history`/итоге «Деньги» — платёж без confirmed_at
+    (мигрированная история) считается по дате записи."""
+    rows = await adb_core.fetch(
+        f"SELECT p.* FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
+        f"WHERE p.status = 'confirmed' AND {_LIVE_ORDER_PAYMENT_FILTER} "
+        "AND COALESCE(p.confirmed_at, p.created_at) >= $1 "
+        "ORDER BY p.created_at ASC",
+        since_iso,
     )
     return _with_major(rows, ("amount", "amount_cents"))
 

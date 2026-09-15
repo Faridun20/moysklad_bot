@@ -38,6 +38,9 @@ def client_env(isolated_db, monkeypatch):
     db.update_order_agent(oid, "agent-uuid", "Client X")
     db.add_order_item(oid, "Product A", "", 1, "шт", 250.0)
     db.update_order_status(oid, "shipped")
+    # Тесты — про доставку карточки как таковой, не про notify_policy: суммы
+    # здесь (250) ниже дефолтного порога (5000 USD) и ушли бы в дайджест.
+    db.set_setting("boss_instant_threshold_usd", 0)
 
     fake_bot = _FakeBot()
 

@@ -19,6 +19,7 @@ from aiogram.types import CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services import async_db as adb
+from services.notify_policy import RETURN, should_notify_now
 from services.roles import can_confirm_return, can_mark_return_goods_received, notify_recipients
 from utils.formatters import DIV
 from handlers._ui import (
@@ -88,6 +89,12 @@ async def _settle_stale_return(call: CallbackQuery, return_id: int) -> bool:
 
 
 async def _notify_confirmers(bot: Bot, return_id, order_id, total, refund):
+    # Денежное событие — ниже boss_instant_threshold_usd карточку НЕ шлём:
+    # возврат остаётся pending в БД и попадёт в вечерний дайджест боссу
+    # (services.boss_digest). Сумма отображается в USD (см. _fmt ниже) — той
+    # же валюты держится и порог.
+    if not should_notify_now(RETURN, total, "USD"):
+        return
     users = await adb.get_all_users()
     # Пока кладовщика нет, приёмку возврата делает менеджер (совмещение ролей,
     # services.roles.ROLE_ALSO_ACTS_AS) — без карточки он о возврате не узнает.
