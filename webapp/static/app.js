@@ -4272,6 +4272,16 @@ const STATUS_NAME = {
   cancelled: 'Отменён',
 };
 
+// Статус платежа (payments.status: pending/confirmed/rejected) — та же
+// терминология, что и в ленте «Деньги» (см. histStatus/cashHistoryHtml) и на
+// экране «Подтвердить» («Ждёт подтверждения»). Раньше глобальный поиск
+// печатал сырой код статуса вместо этих слов (A1).
+const PAYMENT_STATUS_NAME = {
+  pending:   'Ожидает подтверждения',
+  confirmed: 'Подтверждён',
+  rejected:  'Отклонён',
+};
+
 // Запрос с разбором ошибок в исключение. Таймаут, «нет связи» и истёкшая
 // сессия — в сетевом слое (net.js); здесь только форма результата.
 // `opts.timeoutMs` — для заведомо долгих ручек (выгрузка Excel, фото).
@@ -4350,7 +4360,7 @@ async function runSearch(query) {
     parts.push(`<div class="search-group-title">${icon('box')} Заказы</div>`);
     parts.push(data.orders.map(o => `
       <div class="search-item" role="button" tabindex="0" onclick="showScreen('sales')">
-        <b>#${o.id}</b> · ${escapeHtml(o.agent_name)} · ${escapeHtml(o.status || '')}
+        <b>#${o.id}</b> · ${escapeHtml(o.agent_name)} · ${escapeHtml(STATUS_NAME[o.status] || o.status || '')}
         <span class="search-meta">${escapeHtml(o.full_name)}</span>
       </div>`).join(''));
   }
@@ -4358,13 +4368,16 @@ async function runSearch(query) {
     parts.push(`<div class="search-group-title">${icon('cash')} Платежи</div>`);
     parts.push(data.payments.map(p => `
       <div class="search-item" role="button" tabindex="0" onclick="showScreen('money')">
-        <b>#${p.id}</b> · ${p.amount} ${escapeHtml(p.currency)} · ${escapeHtml(p.status || '')}
+        <b>#${p.id}</b> · ${p.amount} ${escapeHtml(p.currency)} · ${escapeHtml(PAYMENT_STATUS_NAME[p.status] || p.status || '')}
         <span class="search-meta">${escapeHtml(p.full_name)}${p.comment ? ' · ' + escapeHtml(p.comment) : ''}</span>
       </div>`).join(''));
   }
   if (data.agents && data.agents.length) {
-    // Карточка контрагента — только начальству (эндпоинт detail boss/admin).
-    const canCard = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
+    // Карточка контрагента (A3) — начальству и менеджеру (эндпоинт detail
+    // открыт им обоим на чтение); остальным ролям, кому доступен поиск в
+    // принципе (их тут больше не бывает), — просто строка без перехода.
+    const canCard = currentUser
+      && (currentUser.role === 'admin' || currentUser.role === 'boss' || currentUser.role === 'manager');
     parts.push(`<div class="search-group-title">${icon('user')} Клиенты</div>`);
     parts.push(data.agents.map(a => {
       const label = `${escapeHtml(a.name || '—')}${a.phone ? ' · ' + escapeHtml(a.phone) : ''}`;
@@ -4372,6 +4385,40 @@ async function runSearch(query) {
         ? `<div class="search-item" role="button" tabindex="0" data-agent="${escapeHtml(String(a.id || ''))}">${label}</div>`
         : `<div class="search-item">${label}</div>`;
     }).join(''));
+  }
+  if (data.products && data.products.length) {
+    parts.push(`<div class="search-group-title">${icon('box')} Каталог</div>`);
+    parts.push(data.products.map(p => `
+      <div class="search-item" role="button" tabindex="0" onclick="showScreen('stock', {tab: 'catalog'})">
+        ${escapeHtml(p.name)}${p.sku ? ' · ' + escapeHtml(p.sku) : ''}
+        <span class="search-meta">остаток ${whQty(p.quantity)} ${escapeHtml(p.unit || 'шт')}</span>
+      </div>`).join(''));
+  }
+  if (data.containers && data.containers.length) {
+    // Подписи статусов — с сервера (data.container_status_labels), не свои:
+    // тот же принцип, что у /api/containers/list (см. helpers.js machineStatusLabel).
+    parts.push(`<div class="search-group-title">${icon('list')} Контейнеры</div>`);
+    parts.push(data.containers.map(c => `
+      <div class="search-item" role="button" tabindex="0" onclick="showScreen('stock', {tab: 'containers'})">
+        <b>${escapeHtml(c.number)}</b>
+        <span class="search-meta">${escapeHtml(machineStatusLabel(c.status, data.container_status_labels))}${c.eta_date ? ' · ETA ' + escapeHtml(c.eta_date) : ''}</span>
+      </div>`).join(''));
+  }
+  if (data.machines && data.machines.length) {
+    parts.push(`<div class="search-group-title">${icon('truck')} Техника</div>`);
+    parts.push(data.machines.map(m => `
+      <div class="search-item" role="button" tabindex="0" onclick="showScreen('stock', {tab: 'machines'})">
+        <b>${escapeHtml(m.name)}</b>${m.vin ? ' · ' + escapeHtml(m.vin) : ''}
+        <span class="search-meta">${escapeHtml(machineStatusLabel(m.status, data.machine_status_labels))}</span>
+      </div>`).join(''));
+  }
+  if (data.leads && data.leads.length) {
+    parts.push(`<div class="search-group-title">${icon('user')} Лиды</div>`);
+    parts.push(data.leads.map(l => `
+      <div class="search-item" role="button" tabindex="0" onclick="showScreen('clients', {tab: 'list'})">
+        ${escapeHtml(l.display_name || l.username || '—')}${l.username && l.display_name ? ' · @' + escapeHtml(l.username) : ''}
+        <span class="search-meta">${escapeHtml(machineStatusLabel(l.status, data.lead_status_labels))}</span>
+      </div>`).join(''));
   }
   box.innerHTML = parts.length
     ? parts.join('')
@@ -8377,8 +8424,12 @@ async function renderAgentDetail(agentId) {
     ? `<div class="section-label">Платежи · ${history.length}</div>${cashHistoryHtml(history)}`
     : `<div class="section-label">Платежи</div><div class="loader">Движений денег не было</div>`;
 
-  // Лимит правится только у контрагента с заказами (эндпоинт credit/set это гейтит).
-  const limitBlock = orders.length ? `
+  // Лимит правится только у контрагента с заказами (эндпоинт credit/set это гейтит)
+  // и только начальством — менеджеру карточка открыта на чтение (A3), запись
+  // лимита остаётся admin/boss (сервер это и так проверяет, но кнопку прячем,
+  // чтобы не звать ручку, которая всё равно ответит 403).
+  const canEditLimit = currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
+  const limitBlock = orders.length && canEditLimit ? `
       <div class="debt-actions"><button class="btn-edit-limit" id="cl-edit">${icon('edit')} Изменить лимит</button></div>
       <div class="limit-edit" id="cl-box" hidden>
         <input type="number" class="form-input" id="cl-input" inputmode="decimal" value="${d.limit}">
@@ -8436,7 +8487,7 @@ async function renderAgentDetail(agentId) {
     });
   });
 
-  if (orders.length) {
+  if (orders.length && canEditLimit) {
     const box = content.querySelector('#cl-box');
     content.querySelector('#cl-edit').addEventListener('click', () => { haptic('light'); box.hidden = !box.hidden; });
     content.querySelector('#cl-cancel').addEventListener('click', () => { box.hidden = true; });

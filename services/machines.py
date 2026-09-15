@@ -327,6 +327,28 @@ async def list_machines(*, role: str | None = None, status: str | None = None) -
     return [visible_machine(r, role) or {} for r in rows]
 
 
+async def search_machines(query: str, *, role: str | None = None, limit: int = 8) -> list[dict]:
+    """Машины по VIN/названию для глобального поиска (A2).
+
+    Парк маленький (10–25 единиц, см. `list_machines`) — фильтруем уже
+    загруженный список в Python, а не заводим отдельный SQL-путь ради него.
+    Архив не ищем: `list_machines()` без статуса его и так не отдаёт.
+    """
+    needle = (query or "").strip().lower()
+    if not needle:
+        return []
+    vin_needle = normalize_vin(query)
+    rows = await list_machines(role=role)
+    out = [
+        r for r in rows
+        if (vin_needle and vin_needle in str(r.get("vin") or ""))
+        or needle in str(r.get("name") or "").lower()
+        or needle in str(r.get("brand") or "").lower()
+        or needle in str(r.get("model") or "").lower()
+    ]
+    return out[: max(1, min(int(limit or 8), 50))]
+
+
 async def count_by_status() -> dict[str, int]:
     """Сколько машин в каждом статусе — для счётчиков в фильтре.
 

@@ -158,3 +158,112 @@ def test_search_endpoint_forbidden_for_guest(client_env):
     db.set_role(999, "g", "Guest", "guest")
     resp = client.post("/api/search", json={"initData": "999", "query": "что-то"})
     assert resp.status_code == 403
+
+
+def test_search_endpoint_forbidden_for_bookkeeper(client_env):
+    """Бухгалтер видит каталог/склад своими ручками, но не через /api/search —
+    он и раньше не входил в allowed_roles (не новая дыра из-за A2)."""
+    client, db, ids = client_env
+    db.set_role(998, "acc", "Acc", "bookkeeper")
+    resp = client.post("/api/search", json={"initData": "998", "query": "что-то"})
+    assert resp.status_code == 403
+
+
+# ─── A2: новые группы результатов ───────────────────────────────────────────
+
+
+def _run(coro):
+    import asyncio
+    return asyncio.run(coro)
+
+
+def test_search_endpoint_finds_product(client_env):
+    from services import container_receipt
+
+    client, _db, ids = client_env
+    _run(container_receipt.create_product("Кабель ВВГ 3х2.5", unit="м"))
+    resp = client.post("/api/search", json={"initData": str(ids["boss"]), "query": "кабель ввг"})
+    assert resp.status_code == 200
+    names = {p["name"] for p in resp.json()["products"]}
+    assert "Кабель ВВГ 3х2.5" in names
+
+
+def test_search_endpoint_finds_container_by_number(client_env):
+    from services import containers
+
+    client, _db, ids = client_env
+    _run(containers.create_container(number="MSCU1234567", created_by=ids["boss"]))
+    resp = client.post("/api/search", json={"initData": str(ids["boss"]), "query": "MSCU1234567"})
+    assert resp.status_code == 200
+    numbers = {c["number"] for c in resp.json()["containers"]}
+    assert "MSCU1234567" in numbers
+
+
+def test_search_endpoint_finds_machine_by_vin_and_name(client_env):
+    from services import machines
+
+    client, _db, ids = client_env
+    res = _run(machines.create_machine(
+        vin="JCB3CX0012345", name="Экскаватор-погрузчик JCB", created_by=ids["boss"],
+    ))
+    assert res["ok"]
+    resp_vin = client.post("/api/search", json={"initData": str(ids["boss"]), "query": "JCB3CX0012345"})
+    assert {m["vin"] for m in resp_vin.json()["machines"]} == {"JCB3CX0012345"}
+    resp_name = client.post("/api/search", json={"initData": str(ids["boss"]), "query": "погрузчик"})
+    assert res["machine_id"] in {m["id"] for m in resp_name.json()["machines"]}
+
+
+def test_search_endpoint_finds_lead_by_name_and_scopes_by_manager(client_env):
+    from services import leads
+
+    client, db, ids = client_env
+    _run(leads.record_message(
+        tg_user_id=555, manager_id=ids["mgr"], inbound=True,
+        username="aziz01", display_name="Азизбек",
+    ))
+    _run(leads.record_message(
+        tg_user_id=556, manager_id=ids["other"], inbound=True,
+        username="azizjon", display_name="Азизжон",
+    ))
+    # У обоих есть "Ази" в имени — общий кусок запроса.
+    resp_mgr = client.post("/api/search", json={"initData": str(ids["mgr"]), "query": "ази"})
+    names_mgr = {l["display_name"] for l in resp_mgr.json()["leads"]}
+    assert names_mgr == {"Азизбек"}  # только свой лид
+    resp_boss = client.post("/api/search", json={"initData": str(ids["boss"]), "query": "ази"})
+    names_boss = {l["display_name"] for l in resp_boss.json()["leads"]}
+    assert names_boss == {"Азизбек", "Азизжон"}  # начальству — оба
+
+
+def test_search_endpoint_finds_lead_by_phone(client_env):
+    """Телефон живёт в lead_calls, не в leads — поиск обязан найти лид через
+    привязанный звонок."""
+    from services import lead_calls, leads
+
+    client, _db, ids = client_env
+    res = _run(leads.record_message(
+        tg_user_id=777, manager_id=ids["mgr"], inbound=True,
+        username="bek", display_name="Бекзод",
+    ))
+    lead_id = res["lead_id"]
+    _run(lead_calls.add_call(
+        manager_id=ids["mgr"], phone="+998 90 123-45-67", lead_id=lead_id,
+    ))
+    resp = client.post("/api/search", json={"initData": str(ids["mgr"]), "query": "901234567"})
+    assert lead_id in {l["id"] for l in resp.json()["leads"]}
+    # Чужому менеджеру звонок не виден.
+    resp_other = client.post("/api/search", json={"initData": str(ids["other"]), "query": "901234567"})
+    assert lead_id not in {l["id"] for l in resp_other.json()["leads"]}
+
+
+def test_search_endpoint_status_labels_come_from_server(client_env):
+    """Подписи статусов контейнера/техники/лида — те же словари, что и у
+    их собственных ручек (containers/machines/leads.STATUS_LABELS), не
+    захардкожены во фронте."""
+    from services import containers, leads, machines
+
+    client, _db, ids = client_env
+    resp = client.post("/api/search", json={"initData": str(ids["boss"]), "query": "x"})
+    data = resp.json()
+    assert data["container_status_labels"] == containers.STATUS_LABELS
+    assert data["machine_status_labels"] == machines.STATUS_LABELS
+    assert data["lead_status_labels"] == leads.STATUS_LABELS
