@@ -38,27 +38,28 @@ USE_POSTGRES = bool(DATABASE_URL)
 # 0 — выключено. Управляется переменной окружения SQL_SLOW_MS.
 SQL_SLOW_MS = float(os.environ.get("SQL_SLOW_MS", "200"))
 
+# Размер пула. Минимум 1 коннект всегда держим открытым, максимум
+# PG_POOL_MAX — это потолок одновременно открытых коннектов от этого
+# процесса. Railway Postgres даёт ~50-100 коннектов на инстанс; 10
+# достаточно для бота на сотни юзеров и оставляет запас другим
+# сервисам (webapp как отдельный процесс, миграции и т.п.).
+_PG_POOL_MIN = int(os.environ.get("PG_POOL_MIN", "1"))
+_PG_POOL_MAX = int(os.environ.get("PG_POOL_MAX", "10"))
+# Сколько ждать свободный коннект при временно исчерпанном пуле, прежде чем
+# сдаться. asyncio.to_thread (через который идут все adb.* вызовы) может
+# запустить больше DB-потоков, чем коннектов в пуле — размер дефолтного
+# executor'а зависит от числа CPU хоста и обычно > PG_POOL_MAX. При всплеске
+# параллельных запросов с фронта getconn() моментально кидал PoolError → 500.
+# Теперь ждём освобождения (запросы выстраиваются в очередь к пулу).
+_PG_POOL_ACQUIRE_TIMEOUT = float(os.environ.get("PG_POOL_ACQUIRE_TIMEOUT", "10"))
+_PG_POOL_ACQUIRE_INTERVAL = 0.05
+
 if USE_POSTGRES:
     from psycopg2 import pool as _pg_pool
     from psycopg2.extras import RealDictCursor
 
     logger.info("Используется PostgreSQL")
 
-    # Размер пула. Минимум 1 коннект всегда держим открытым, максимум
-    # PG_POOL_MAX — это потолок одновременно открытых коннектов от этого
-    # процесса. Railway Postgres даёт ~50-100 коннектов на инстанс; 10
-    # достаточно для бота на сотни юзеров и оставляет запас другим
-    # сервисам (webapp как отдельный процесс, миграции и т.п.).
-    _PG_POOL_MIN = int(os.environ.get("PG_POOL_MIN", "1"))
-    _PG_POOL_MAX = int(os.environ.get("PG_POOL_MAX", "10"))
-    # Сколько ждать свободный коннект при временно исчерпанном пуле, прежде чем
-    # сдаться. asyncio.to_thread (через который идут все adb.* вызовы) может
-    # запустить больше DB-потоков, чем коннектов в пуле — размер дефолтного
-    # executor'а зависит от числа CPU хоста и обычно > PG_POOL_MAX. При всплеске
-    # параллельных запросов с фронта getconn() моментально кидал PoolError → 500.
-    # Теперь ждём освобождения (запросы выстраиваются в очередь к пулу).
-    _PG_POOL_ACQUIRE_TIMEOUT = float(os.environ.get("PG_POOL_ACQUIRE_TIMEOUT", "10"))
-    _PG_POOL_ACQUIRE_INTERVAL = 0.05
     _pg_connection_pool: _pg_pool.ThreadedConnectionPool | None = None
 
     def _get_pool() -> _pg_pool.ThreadedConnectionPool:
@@ -77,36 +78,67 @@ if USE_POSTGRES:
         return _pg_connection_pool
 
     def _pool_getconn():
-        """getconn с ожиданием: при исчерпании пула ждём до
-        _PG_POOL_ACQUIRE_TIMEOUT сек, опрашивая раз в _PG_POOL_ACQUIRE_INTERVAL,
-        вместо мгновенного PoolError → 500. Выполняется в worker-потоке
-        (asyncio.to_thread), поэтому time.sleep не блокирует event loop.
-        По истечении таймаута пробрасываем PoolError."""
-        pool = _get_pool()
-        deadline = time.monotonic() + _PG_POOL_ACQUIRE_TIMEOUT
-        waited = False
-        while True:
-            try:
-                return pool.getconn()
-            except _pg_pool.PoolError:
-                if time.monotonic() >= deadline:
-                    logger.error(
-                        "Postgres pool исчерпан: ждали %.1fs (max=%d) — сдаёмся",
-                        _PG_POOL_ACQUIRE_TIMEOUT,
-                        _PG_POOL_MAX,
-                    )
-                    raise
-                if not waited:
-                    waited = True
-                    logger.warning(
-                        "Postgres pool исчерпан (max=%d) — ждём свободный коннект…",
-                        _PG_POOL_MAX,
-                    )
-                time.sleep(_PG_POOL_ACQUIRE_INTERVAL)
+        return _acquire_pooled_conn(_get_pool())
+
 else:
     import sqlite3
 
     logger.info("Используется SQLite: %s", DB_PATH)
+
+
+def _in_event_loop_thread() -> bool:
+    """Идёт ли вызов в потоке, где крутится asyncio-loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _acquire_pooled_conn(pool):
+    """getconn с ожиданием: при исчерпании пула ждём до
+    _PG_POOL_ACQUIRE_TIMEOUT сек, опрашивая раз в _PG_POOL_ACQUIRE_INTERVAL,
+    вместо мгновенного PoolError → 500. По истечении — пробрасываем PoolError.
+
+    Ждать (`time.sleep`) можно только в worker-потоке (`asyncio.to_thread`).
+    Синхронный вызов БД прямо из event loop (кэш роли при промахе, забытый
+    `to_thread`) при исчерпанном пуле усыплял бы ВЕСЬ процесс на секунды:
+    все запросы WebApp и апдейты бота стоят, пока один ждёт коннект. Поэтому
+    из потока loop'а — одна попытка и громкий отказ: одна 500-я лучше
+    замороженного сервиса, а лог показывает место, которое надо увести в поток.
+    """
+    from psycopg2 import pool as _pg_pool_mod
+
+    if _in_event_loop_thread():
+        try:
+            return pool.getconn()
+        except _pg_pool_mod.PoolError:
+            logger.error(
+                "Postgres pool исчерпан, а вызов идёт прямо из event loop — не ждём "
+                "(time.sleep заморозил бы весь процесс). Уведите вызов в asyncio.to_thread.",
+                stack_info=True,
+            )
+            raise
+    deadline = time.monotonic() + _PG_POOL_ACQUIRE_TIMEOUT
+    waited = False
+    while True:
+        try:
+            return pool.getconn()
+        except _pg_pool_mod.PoolError:
+            if time.monotonic() >= deadline:
+                logger.error(
+                    "Postgres pool исчерпан: ждали %.1fs (max=%d) — сдаёмся",
+                    _PG_POOL_ACQUIRE_TIMEOUT,
+                    _PG_POOL_MAX,
+                )
+                raise
+            if not waited:
+                waited = True
+                logger.warning(
+                    "Postgres pool исчерпан (max=%d) — ждём свободный коннект…",
+                    _PG_POOL_MAX,
+                )
+            time.sleep(_PG_POOL_ACQUIRE_INTERVAL)
 
 
 class _TimedCursor:
@@ -301,18 +333,20 @@ def _seed_currency_rates():
             logger.debug("seed currency_rates skipped (likely table not yet created)")
 
 
-def _create_tables():
-    """Только CREATE TABLE IF NOT EXISTS. Idempotent, безопасен
-    при concurrent старте."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        id_type = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
-        # Количества складского учёта: на Postgres NUMERIC (точная десятичная
-        # арифметика — остаток не накапливает дрейф при дробных отгрузках),
-        # на SQLite REAL (NUMERIC там всё равно сводится к REAL-аффинности).
-        qty_type = "NUMERIC" if USE_POSTGRES else "REAL"
+def _table_ddls() -> list[str]:
+    """Определения всех таблиц — ОДИН источник и для `_create_tables`, и для
+    сверки схемы при старте (`services.schema_check`): ожидаемые колонки
+    берутся отсюда же, иначе список для сверки разъехался бы с определением."""
+    id_type = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    # Количества складского учёта: на Postgres NUMERIC (точная десятичная
+    # арифметика — остаток не накапливает дрейф при дробных отгрузках),
+    # на SQLite REAL (NUMERIC там всё равно сводится к REAL-аффинности).
+    qty_type = "NUMERIC" if USE_POSTGRES else "REAL"
 
-        tables = [
+    # Элементы списка оставлены с прежним отступом (внутри скобок он не
+    # значим): определения таблиц правят параллельные ветки, и сдвиг всего
+    # списка превратил бы каждую их правку в конфликт слияния.
+    tables = [
             # deactivated_at/_by — «увольнение»: get_role отдаёт guest, пока стоит.
             """CREATE TABLE IF NOT EXISTS user_roles (
                 user_id              BIGINT PRIMARY KEY,
@@ -1092,10 +1126,34 @@ def _create_tables():
                 failed_at  TEXT,
                 error      TEXT
             )""",
+            # Возврат товара = приходная накладная. Раньше остаток на склад
+            # возвращал МойСклад документом «Возврат покупателя»; после его
+            # удаления подтверждённый возврат менял только деньги и returned_qty,
+            # а товар на складе не появлялся. Отдельная таблица, а не колонка в
+            # `returns` (та уже на проде). PRIMARY KEY по return_id — второй
+            # рубеж идемпотентности после CAS статуса: один возврат — одна
+            # накладная. `invoice_id IS NULL` + `skipped_reason` — возврат
+            # подтверждён, но склад сознательно не двигали (см. confirm_return).
+            """CREATE TABLE IF NOT EXISTS return_receipt (
+                return_id      BIGINT PRIMARY KEY,
+                order_id       BIGINT NOT NULL,
+                invoice_id     BIGINT,
+                skipped_reason TEXT,
+                unmatched      TEXT,
+                created_at     TEXT
+            )""",
         ]
 
+    return tables
+
+
+def _create_tables():
+    """Только CREATE TABLE IF NOT EXISTS. Idempotent, безопасен
+    при concurrent старте."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
         # Создаём каждую таблицу в отдельной транзакции
-        for sql in tables:
+        for sql in _table_ddls():
             try:
                 cur.execute(sql)
                 conn.commit()
@@ -2810,50 +2868,173 @@ def get_currency_rate(currency_code: str) -> float | None:
     return rate
 
 
+# Коридор курса сума к доллару для ТЕКУЩЕГО курса. Не прогноз, а сторож от
+# опечаток: поле формы показывает «сум за 1 USD», а в базу уходит обратное
+# число, и лишний/пропущенный ноль или перевёрнутый курс (12 600 вместо
+# 1/12 600) молча пересчитывал все сводки «в долларах» в тысячи раз. За
+# 2017–2026 сум ходил в пределах ~8 000–13 000 — у коридора запас в разы в обе
+# стороны, при этом ошибка на порядок в него уже не попадает. Дневной архив
+# коридором НЕ режется: история за годы назад законно бывает вне его.
+UZS_PER_USD_MIN = 5_000.0
+UZS_PER_USD_MAX = 50_000.0
+
+
+def _fmt_rate_num(value: float) -> str:
+    return f"{value:,.2f}".replace(",", " ").removesuffix(".00")
+
+
+def validate_rate_to_base(code: str, rate: float) -> tuple[bool, str | None]:
+    """Курс `1 code = rate BASE` в разумных границах. (ok, понятная ошибка).
+
+    Базовая валюта — строго 1 (иначе все пересчёты «в базовую» перекошены).
+    Пара сум/доллар — коридор UZS_PER_USD_*. Прочие пары (если список валют
+    расширят) — только общая проверка `_validate_amount` у вызывающего.
+    """
+    from config import BASE_CURRENCY
+
+    base = (BASE_CURRENCY or "USD").upper()
+    value = float(rate)
+    if code == base:
+        if abs(value - 1.0) > 1e-12:
+            return False, f"Курс базовой валюты {base} всегда 1 — менять его нельзя"
+        return True, None
+    if {code, base} == {"UZS", "USD"}:
+        uzs_per_usd = 1.0 / value if code == "UZS" else value
+        if not (UZS_PER_USD_MIN <= uzs_per_usd <= UZS_PER_USD_MAX):
+            return False, (
+                f"Курс вне разумных границ: получилось 1 USD = "
+                f"{_fmt_rate_num(uzs_per_usd)} сум. Ожидается от "
+                f"{_fmt_rate_num(UZS_PER_USD_MIN)} до {_fmt_rate_num(UZS_PER_USD_MAX)} "
+                "сум за доллар — проверьте нули и направление курса."
+            )
+    return True, None
+
+
 def set_currency_rate(currency_code: str, rate: float, updated_by: int) -> tuple[bool, str | None]:
     """Установить/обновить rate. UPSERT с автоинвалидацией кэша.
 
-    Возвращает (ok, error_msg). Валидирует rate как amount (> 0, конечное).
+    Возвращает (ok, error_msg). Валидирует rate как amount (> 0, конечное) и
+    по коридору пары (`validate_rate_to_base`) — это касается и ЦБ-синка:
+    аномальный ответ источника лучше громкого отказа, чем молчаливой записи.
     `currency_code` — нормализуется UPPER, должен быть в ALLOWED_CURRENCIES."""
-    from config import ALLOWED_CURRENCIES
-
-    code = (currency_code or "").upper().strip()
-    if not code:
-        return False, "currency_code пустой"
-    if code not in ALLOWED_CURRENCIES:
-        return False, f"currency_code должен быть из {list(ALLOWED_CURRENCIES)}"
-    ok, err = _validate_amount(rate)
-    if not ok:
-        return False, f"rate: {err}"
+    code, err = _check_rate_input(currency_code, rate)
+    if err:
+        return False, err
     with get_conn() as conn:
         cur = get_cursor(conn)
-        if USE_POSTGRES:
-            cur.execute(
-                q(
-                    "INSERT INTO currency_rates "
-                    "(currency_code, rate_to_base, updated_at, updated_by) "
-                    "VALUES (?, ?, ?, ?) "
-                    "ON CONFLICT (currency_code) DO UPDATE SET "
-                    "rate_to_base = EXCLUDED.rate_to_base, "
-                    "updated_at = EXCLUDED.updated_at, "
-                    "updated_by = EXCLUDED.updated_by"
-                ),
-                (code, float(rate), now_str(), updated_by),
-            )
-        else:
-            cur.execute(
-                q(
-                    "INSERT OR REPLACE INTO currency_rates "
-                    "(currency_code, rate_to_base, updated_at, updated_by) "
-                    "VALUES (?, ?, ?, ?)"
-                ),
-                (code, float(rate), now_str(), updated_by),
-            )
+        _upsert_current_rate(cur, code, rate, updated_by)
         conn.commit()
     # Инвалидируем кэш именно этой валюты, остальные не трогаем.
     with _currency_rates_lock:
         _CURRENCY_RATES_CACHE.pop(code, None)
     return True, None
+
+
+def _check_rate_input(currency_code: str, rate: float) -> tuple[str, str | None]:
+    """Нормализованный код и ошибка (None — всё в порядке)."""
+    from config import ALLOWED_CURRENCIES
+
+    code = (currency_code or "").upper().strip()
+    if not code:
+        return code, "currency_code пустой"
+    if code not in ALLOWED_CURRENCIES:
+        return code, f"currency_code должен быть из {list(ALLOWED_CURRENCIES)}"
+    ok, err = _validate_amount(rate)
+    if not ok:
+        return code, f"rate: {err}"
+    ok, err = validate_rate_to_base(code, rate)
+    if not ok:
+        return code, err
+    return code, None
+
+
+def set_currency_rate_manual(
+    currency_code: str, rate: float, updated_by: int
+) -> tuple[bool, str | None]:
+    """Ручная правка курса из WebApp: текущий курс + дневной архив source='manual'.
+
+    Обе записи — одним коммитом. Метка 'manual' в архиве за СЕГОДНЯ — то, по
+    чему ночной `run_fx_sync` понимает, что курс этого дня поправил человек, и
+    не перезаписывает его ни в `currency_rates`, ни в архиве. Раньше правка
+    держалась до ближайшего прогона синка и исчезала без следа, а снимки
+    `fx_rate_to_base` операций того дня уезжали по курсу ЦБ, который босс
+    сознательно исправил. Следующий день синк пишет как обычно.
+    """
+    code, err = _check_rate_input(currency_code, rate)
+    if err:
+        return False, err
+    day = now_str()[:10]  # бизнес-дата — в кадре процесса, как created_at
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        _upsert_current_rate(cur, code, rate, updated_by)
+        _upsert_daily_rate(cur, code, day, rate, "manual")
+        conn.commit()
+    with _currency_rates_lock:
+        _CURRENCY_RATES_CACHE.pop(code, None)
+    logger.info("Курс %s задан вручную (user_id=%s): %s на %s", code, updated_by, rate, day)
+    return True, None
+
+
+def get_currency_rate_daily_source(currency_code: str, rate_date: str) -> str | None:
+    """Источник курса в дневном архиве за день ('cbu' | 'manual' | None — записи нет)."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "SELECT source FROM currency_rate_daily "
+                "WHERE currency_code = ? AND rate_date = ?"
+            ),
+            ((currency_code or "").upper(), (rate_date or "")[:10]),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return row["source"] if hasattr(row, "keys") else row[0]
+
+
+def _upsert_current_rate(cur, code: str, rate: float, updated_by: int) -> None:
+    if USE_POSTGRES:
+        cur.execute(
+            q(
+                "INSERT INTO currency_rates "
+                "(currency_code, rate_to_base, updated_at, updated_by) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (currency_code) DO UPDATE SET "
+                "rate_to_base = EXCLUDED.rate_to_base, "
+                "updated_at = EXCLUDED.updated_at, "
+                "updated_by = EXCLUDED.updated_by"
+            ),
+            (code, float(rate), now_str(), updated_by),
+        )
+    else:
+        cur.execute(
+            q(
+                "INSERT OR REPLACE INTO currency_rates "
+                "(currency_code, rate_to_base, updated_at, updated_by) "
+                "VALUES (?, ?, ?, ?)"
+            ),
+            (code, float(rate), now_str(), updated_by),
+        )
+
+
+def _upsert_daily_rate(cur, code: str, day: str, rate: float, source: str) -> None:
+    """UPSERT дневного архива. Ручную запись дня перезаписывает только ручная.
+
+    Условие — в самом UPSERT (одинаково на Postgres и SQLite ≥ 3.24), а не
+    отдельной проверкой: синк и правка не разойдутся между SELECT и записью.
+    """
+    cur.execute(
+        q(
+            "INSERT INTO currency_rate_daily "
+            "(currency_code, rate_date, rate_to_base, source, created_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT (currency_code, rate_date) DO UPDATE SET "
+            "rate_to_base = excluded.rate_to_base, source = excluded.source "
+            "WHERE COALESCE(currency_rate_daily.source, '') <> 'manual' "
+            "OR excluded.source = 'manual'"
+        ),
+        (code, day, float(rate), source, now_str()),
+    )
 
 
 async def get_all_currency_rates() -> list[dict]:
@@ -2932,7 +3113,8 @@ def convert_to_base_at(
 def set_currency_rate_daily(
     currency_code: str, rate_date: str, rate_to_base: float, source: str = "cbu"
 ) -> tuple[bool, str | None]:
-    """UPSERT курса в дневной архив (currency_rate_daily). Один курс на день.
+    """UPSERT курса в дневной архив (currency_rate_daily). Один курс на день;
+    запись дня с source='manual' перезаписывает только другая ручная.
 
     `rate_date` — 'YYYY-MM-DD'. Возвращает (ok, error_msg). Валидирует rate
     как amount (> 0, конечное). currency_code нормализуется UPPER.
@@ -2947,26 +3129,9 @@ def set_currency_rate_daily(
         return False, f"rate_to_base: {err}"
     with get_conn() as conn:
         cur = get_cursor(conn)
-        if USE_POSTGRES:
-            cur.execute(
-                q(
-                    "INSERT INTO currency_rate_daily "
-                    "(currency_code, rate_date, rate_to_base, source, created_at) "
-                    "VALUES (?, ?, ?, ?, ?) "
-                    "ON CONFLICT (currency_code, rate_date) DO UPDATE SET "
-                    "rate_to_base = EXCLUDED.rate_to_base, source = EXCLUDED.source"
-                ),
-                (code, rate_date, float(rate_to_base), source, now_str()),
-            )
-        else:
-            cur.execute(
-                q(
-                    "INSERT OR REPLACE INTO currency_rate_daily "
-                    "(currency_code, rate_date, rate_to_base, source, created_at) "
-                    "VALUES (?, ?, ?, ?, ?)"
-                ),
-                (code, rate_date, float(rate_to_base), source, now_str()),
-            )
+        # Ручную запись дня (source='manual') автоматический источник не
+        # затирает — см. set_currency_rate_manual.
+        _upsert_daily_rate(cur, code, rate_date, rate_to_base, source)
         conn.commit()
     return True, None
 
@@ -3678,11 +3843,67 @@ async def mark_return_goods_received(return_id: int, by: int) -> dict:
     return {"ok": rc > 0}
 
 
+async def _plan_return_stock(return_id: int, order_id: int) -> dict:
+    """Что приходовать на склад по возврату. Только чтение, ДО транзакции.
+
+    Возвращает {positions, unmatched, skipped_reason}. `positions` — строки
+    приходной накладной (только ВОЗВРАЩЁННЫЕ позиции и их количества из
+    return_items, а не весь заказ).
+
+    Приходуем, только если товар по заказу действительно СПИСЫВАЛСЯ со склада:
+    есть расходная накладная отгрузки (`order_shipment.invoice_id`) или заказ
+    эпохи МойСклад (списан там, и снимок остатков уже это учёл — так же судит
+    `order_shipment.list_failed`). Локальный заказ, по которому накладная не
+    провелась (failed_at, позиции без карточек), остаток не уменьшал — приход
+    по его возврату прибавил бы товар, которого склад не терял.
+
+    Сопоставление с номенклатурой — тем же `_resolve_products`, что у отгрузки:
+    возврат обязан попасть на ту же карточку, с которой товар списали.
+    """
+    from services import order_shipment
+
+    order = await adb_core.fetchrow(
+        "SELECT o.ms_demand_id, o.ms_customerorder_id, s.invoice_id AS ship_invoice_id "
+        "FROM orders o LEFT JOIN order_shipment s ON s.order_id = o.id WHERE o.id = $1",
+        order_id,
+    )
+    written_off = bool(
+        order
+        and (
+            order.get("ship_invoice_id")
+            or str(order.get("ms_demand_id") or "").strip()
+            or str(order.get("ms_customerorder_id") or "").strip()
+        )
+    )
+    if not written_off:
+        return {
+            "positions": [],
+            "unmatched": [],
+            "skipped_reason": "по заказу не было расходной накладной — остаток не списывался",
+        }
+    rows = await adb_core.fetch(
+        "SELECT ri.qty AS quantity, oi.product_name, op.product_id "
+        "FROM return_items ri JOIN order_items oi ON oi.id = ri.order_item_id "
+        "LEFT JOIN order_item_products op ON op.item_id = oi.id "
+        "WHERE ri.return_id = $1 ORDER BY ri.id",
+        return_id,
+    )
+    positions, unmatched = await order_shipment._resolve_products(rows)
+    for p in positions:
+        # Цену в приход НЕ пишем: возвращённый товар не закупка, а цена в
+        # приходной накладной читается как закупочная — цена продажи исказила
+        # бы себестоимость. Деньги возврата живут в returns/cash_deposits.
+        p["price_cents"] = None
+    reason = None if positions else "ни одна позиция возврата не сопоставлена с номенклатурой"
+    return {"positions": positions, "unmatched": unmatched, "skipped_reason": reason}
+
+
 async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str = "") -> dict:
     """Подтвердить возврат: returned_qty += по позициям, статус заказа
     (returned|partially_returned), обработка refund (cash → отрицательная
-    сдача; debt_reduction/no_refund — учёт в долге).
-    Возвращает {ok, order_status}.
+    сдача; debt_reduction/no_refund — учёт в долге), ПРИХОД товара на склад
+    приходной накладной «Возврат по заказу #N» — всё одной транзакцией.
+    Возвращает {ok, order_status, invoice_id, invoice_number, stock_skipped}.
 
     asyncpg Stage 14 (#21): native async. Транзакционные границы сохранены как в
     sync-версии — критическая секция (confirm + overshoot-guard) одна транзакция
@@ -3732,6 +3953,21 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
                 ),
             }
         refund_base_cents = money.to_cents(refund_base)
+
+    # План прихода — до транзакции: сопоставление читает справочник через
+    # adb_core напрямую, а на SQLite чтение мимо открытой BEGIN IMMEDIATE
+    # транзакции ждало бы её же. Позиции возврата после создания не меняются,
+    # так что план не устаревает к моменту записи.
+    from services import warehouse
+
+    stock_plan = await _plan_return_stock(return_id, order_id)
+    order_head = await adb_core.fetchrow(
+        "SELECT agent_id, currency FROM orders WHERE id = $1", order_id
+    ) or {}
+    stock_warehouse_id = (
+        await warehouse.default_warehouse_id() if stock_plan["positions"] else None
+    )
+    receipt: dict | None = None
     # Атомарная секция (WP-08): подтверждение возврата + overshoot-guard + СТАТУС
     # ЗАКАЗА + денежный refund — в ОДНОЙ транзакции. Раньше статус и cash-выплата
     # писались ПОСЛЕ коммита подтверждения → крах между ними оставлял возврат
@@ -3780,6 +4016,51 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
                         "Превышен доступный остаток к возврату (другой возврат "
                         "уже учтён). Перепроверьте и создайте новый."
                     )
+
+            # Товар — обратно на склад, в ЭТОЙ ЖЕ транзакции: подтверждённый
+            # возврат без прихода — это деньги клиенту за товар, которого в
+            # остатках нет, и его уже не продать. Повторное подтверждение сюда
+            # не доходит (CAS статуса выше), а PK return_receipt — второй рубеж
+            # на случай, если статус вернут в pending руками.
+            if await txn.fetchval(
+                "SELECT return_id FROM return_receipt WHERE return_id = $1", return_id
+            ) is not None:
+                raise _TxnAbort("Возврат уже оприходован")
+            invoice_id = None
+            if stock_plan["positions"]:
+                counterparty_id: int | None
+                try:
+                    counterparty_id = int(str(order_head.get("agent_id") or "").strip())
+                except (TypeError, ValueError):
+                    counterparty_id = None
+                if counterparty_id is not None and await txn.fetchval(
+                    "SELECT id FROM counterparties WHERE id = $1", counterparty_id
+                ) is None:
+                    # Устаревший id в заказе не повод держать возврат: приход
+                    # проводим без контрагента, как и отгрузку legacy-заказа.
+                    counterparty_id = None
+                try:
+                    receipt = await warehouse.create_invoice_in(
+                        txn,
+                        invoice_type="incoming",
+                        warehouse_id=int(stock_warehouse_id or 1),
+                        items=stock_plan["positions"],
+                        counterparty_id=counterparty_id,
+                        currency=str(order_head.get("currency") or BASE_CURRENCY or "USD"),
+                        comment=f"Возврат по заказу #{order_id} (возврат #{return_id})",
+                        created_by=confirmed_by,
+                    )
+                except warehouse.InvoiceError as e:
+                    # Приход не прошёл — не подтверждаем и деньги: иначе
+                    # возврат закрыт, а товара на складе нет (ровно исходный баг).
+                    raise _TxnAbort(f"Товар не оприходован: {e.message}")
+                invoice_id = int(receipt["invoice_id"])
+            await txn.execute(
+                "INSERT INTO return_receipt (return_id, order_id, invoice_id, "
+                "skipped_reason, unmatched, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+                return_id, order_id, invoice_id, stock_plan["skipped_reason"],
+                ", ".join(stock_plan["unmatched"]) or None, now_str(),
+            )
 
             # Полностью ли возвращён заказ? (returned_qty уже обновлён в этой txn.)
             items = await txn.fetch(
@@ -3837,7 +4118,31 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
         f"{money.format_cents(int(ret.get('total_amount_cents') or 0))} USD, "
         f"{ret.get('refund_method')})",
     )
-    return {"ok": True, "order_status": new_status}
+    stock_skipped = stock_plan["skipped_reason"]
+    if receipt is not None:
+        logger.info(
+            "Возврат #%s по заказу #%s оприходован накладной %s",
+            return_id, order_id, receipt["invoice_number"],
+        )
+    else:
+        # Не ошибка, но расхождение склада, о котором надо знать сразу.
+        logger.warning(
+            "Возврат #%s по заказу #%s подтверждён БЕЗ прихода на склад: %s",
+            return_id, order_id, stock_skipped,
+        )
+    if stock_plan["unmatched"]:
+        logger.warning(
+            "Возврат #%s: позиции без карточки номенклатуры не оприходованы: %s",
+            return_id, stock_plan["unmatched"],
+        )
+    return {
+        "ok": True,
+        "order_status": new_status,
+        "invoice_id": int(receipt["invoice_id"]) if receipt else None,
+        "invoice_number": receipt["invoice_number"] if receipt else None,
+        "stock_skipped": stock_skipped,
+        "unmatched": list(stock_plan["unmatched"]),
+    }
 
 
 async def get_pending_returns() -> list[dict]:
@@ -5191,25 +5496,6 @@ async def get_payment(payment_id: int) -> dict | None:
     return _with_major(row, ("amount", "amount_cents"))
 
 
-async def get_payments_report(since: str | None = None, until: str | None = None) -> list[dict]:
-    """Подтверждённые платежи за период. asyncpg-миграция Stage 7 (задача #21):
-    нативный async через adb_core. Вызов — только handlers/payments (`await adb`)."""
-    query = (
-        f"SELECT p.* FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
-        f"WHERE p.status = 'confirmed' AND {_LIVE_ORDER_PAYMENT_FILTER}"
-    )
-    params: list = []
-    if since:
-        params.append(since)
-        query += f" AND p.created_at >= ${len(params)}"
-    if until:
-        params.append(until)
-        query += f" AND p.created_at <= ${len(params)}"
-    query += " ORDER BY p.created_at DESC"
-    rows = await adb_core.fetch(query, *params)
-    return _with_major(rows, ("amount", "amount_cents"))
-
-
 async def get_cash_history(
     limit: int = 80, since: str | None = None, until: str | None = None
 ) -> list[dict]:
@@ -5318,43 +5604,6 @@ async def get_cash_history(
     return rows[:limit]
 
 
-def get_cashbox_stats(since: str | None = None, until: str | None = None) -> dict:
-    """Касса: подтверждённые поступления денег за период.
-
-    Сумма CONFIRMED платежей по `created_at` в [since, until] — «сколько
-    реально получили». Группируем по валюте (платежи бывают в разных
-    валютах); `total_cents` — суммарно в копейках по всем валютам, а
-    `by_currency` даёт разбивку, если валют больше одной.
-
-    since/until — ISO-строки 'YYYY-MM-DD HH:MM:SS' в локальной TZ (как
-    `created_at` пишется через now_str()), поэтому лексикографическое
-    сравнение строк корректно. Порог считаем в Python и передаём
-    параметром — НЕ сравниваем с SQL NOW()/datetime('now') (разные TZ,
-    silent-bug; см. CLAUDE.md).
-    """
-    query = (
-        f"SELECT p.currency AS currency, COUNT(*) AS cnt, {_SUM_PAYMENTS_CENTS} AS total_cents "
-        f"FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
-        f"WHERE p.status = 'confirmed' AND {_LIVE_ORDER_PAYMENT_FILTER}"
-    )
-    params: list = []
-    if since:
-        query += " AND p.created_at >= ?"
-        params.append(since)
-    if until:
-        query += " AND p.created_at <= ?"
-        params.append(until)
-    query += " GROUP BY p.currency"
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q(query), params)
-        rows = [dict(r) for r in cur.fetchall()]
-    total_cents = sum(int(r["total_cents"] or 0) for r in rows)
-    count = sum(int(r["cnt"] or 0) for r in rows)
-    by_currency = {(r.get("currency") or "—"): int(r["total_cents"] or 0) for r in rows}
-    return {"total_cents": total_cents, "count": count, "by_currency": by_currency}
-
-
 async def get_money_totals(since: str | None = None, until: str | None = None) -> dict:
     """Поступления компании за период (раздел «Деньги», boss/admin).
 
@@ -5435,28 +5684,6 @@ async def get_money_totals(since: str | None = None, until: str | None = None) -
             "count": int((dep_row or {}).get("cnt") or 0),
         },
     }
-
-
-async def get_summary_by_employee(
-    since: str | None = None, until: str | None = None
-) -> list[dict]:
-    """Платежи по сотрудникам (confirmed). asyncpg Stage 8 (#21)."""
-    query = (
-        "SELECT p.full_name, p.currency, "
-        "COALESCE(SUM(p.amount_cents), 0) as total_cents, COUNT(*) as count "
-        f"FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
-        f"WHERE p.status = 'confirmed' AND {_LIVE_ORDER_PAYMENT_FILTER}"
-    )
-    params: list = []
-    if since:
-        params.append(since)
-        query += f" AND p.created_at >= ${len(params)}"
-    if until:
-        params.append(until)
-        query += f" AND p.created_at <= ${len(params)}"
-    query += " GROUP BY p.full_name, p.currency ORDER BY total_cents DESC"
-    rows = await adb_core.fetch(query, *params)
-    return _with_major(rows, ("total", "total_cents"))
 
 
 # ─── Аудит лог ────────────────────────────────────────────────────────────────

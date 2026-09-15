@@ -5,6 +5,7 @@
 нет LibreOffice (в CI его нет, в образе есть).
 """
 
+import os
 import shutil
 from datetime import date
 from decimal import Decimal
@@ -392,3 +393,88 @@ def test_render_ru_uz_pdf(tmp_path):
     assert text.count("4 166.66 USD") == 10
     # ФИО должника в документ не печатается: его пишут от руки.
     assert "Иванов" not in text
+
+
+# ─── Имя файла и ошибки LibreOffice (без бинаря: мок границы subprocess) ──────
+
+
+class _FakeSoffice:
+    """Подменяет запуск LibreOffice: пишет PDF в --outdir (или не пишет) и
+    отдаёт заданный stderr. Всё остальное — шаблон, docxtpl, копирование в
+    каталог документов — настоящее."""
+
+    def __init__(self, *, make_pdf=True, stderr=b""):
+        self.make_pdf = make_pdf
+        self.stderr = stderr
+
+    async def __call__(self, *args, **kwargs):
+        from pathlib import Path
+
+        outdir = Path(args[list(args).index("--outdir") + 1])
+        fake = self
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self):
+                if fake.make_pdf:
+                    (outdir / "document.pdf").write_bytes(b"%PDF-1.4 " + os.urandom(8))
+                return b"", fake.stderr
+
+        return _Proc()
+
+
+def test_second_document_same_day_does_not_overwrite_first(tmp_path, monkeypatch):
+    """Имя было {тип}_{ФИО}_{дата}: вторая расписка тому же должнику за день
+    затирала первую, и запись первой отдавала чужой PDF."""
+    import asyncio
+
+    monkeypatch.setattr(ld.asyncio, "create_subprocess_exec", _FakeSoffice())
+    ctx = _ctx()
+    first = asyncio.run(ld.render_pdf("raspiska_ru", ctx, tmp_path))
+    first_bytes = first.read_bytes()
+    second = asyncio.run(ld.render_pdf("raspiska_ru", ctx, tmp_path))
+
+    assert first != second
+    assert first.is_file() and second.is_file()
+    assert first.read_bytes() == first_bytes, "первый документ перезаписан"
+    assert first.name.startswith("raspiska_ru_Иванов_Иван_Иванович_")
+    assert len(list(tmp_path.glob("*.pdf"))) == 2
+
+
+def test_reserve_pdf_path_is_unique_within_one_second(tmp_path, monkeypatch):
+    """Два документа в одну секунду (двойное нажатие) — разные файлы."""
+    from datetime import datetime as real_dt
+
+    class _Frozen(real_dt):
+        @classmethod
+        def now(cls, tz=None):
+            return real_dt(2026, 9, 15, 10, 0, 0)
+
+    monkeypatch.setattr(ld, "datetime", _Frozen)
+    paths = [ld._reserve_pdf_path(tmp_path, "tilxat_uz", "X") for _ in range(3)]
+    assert len({p.name for p in paths}) == 3
+    assert paths[0].name == "tilxat_uz_X_2026-09-15_100000.pdf"
+    assert paths[1].name == "tilxat_uz_X_2026-09-15_100000_2.pdf"
+
+
+def test_libreoffice_stderr_goes_to_log_not_to_user(tmp_path, monkeypatch, caplog):
+    """stderr LibreOffice уезжал в текст ошибки формы — пути /tmp и английская
+    диагностика. Теперь он в логе, человеку — короткая фраза."""
+    import asyncio
+    import logging
+
+    raw = b"Error: source file could not be loaded /tmp/tmpabc123/document.docx"
+    monkeypatch.setattr(
+        ld.asyncio, "create_subprocess_exec", _FakeSoffice(make_pdf=False, stderr=raw)
+    )
+    with caplog.at_level(logging.ERROR, logger=ld.logger.name), pytest.raises(
+        ld.DocumentError
+    ) as exc:
+        asyncio.run(ld.render_pdf("raspiska_ru", _ctx(), tmp_path))
+
+    message = str(exc.value)
+    assert "source file" not in message and "/tmp" not in message
+    assert "Не удалось сформировать PDF" in message
+    assert "source file could not be loaded" in caplog.text
+    assert list(tmp_path.glob("*.pdf")) == []

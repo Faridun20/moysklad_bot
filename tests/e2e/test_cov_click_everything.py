@@ -87,7 +87,7 @@ def _seed_rich(e2e, tmp_path: Path) -> dict:
         invoice_type="incoming", warehouse_id=ids["warehouse"],
         items=[{"product_id": ids["product"], "quantity": 50, "price_cents": 900}],
     ))
-    ok, err = set_currency_rate("UZS", 12500.0, ids["admin"])
+    ok, err = set_currency_rate("UZS", 1 / 12500, ids["admin"])
     assert ok, err
 
     # Долг в срок, отгружен — «Долги», сдача наличных гасит его FIFO.

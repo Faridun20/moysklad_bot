@@ -106,9 +106,10 @@ def test_get_money_totals_by_currency_excludes_deleted(isolated_db):
 
 
 def test_deleted_order_payments_excluded_from_all_money_surfaces(isolated_db):
-    """WP-03: платёж по удалённому заказу исключён из ВСЕХ денежных поверхностей
-    (итог, касса, отчёт по оплатам, по сотрудникам) — иначе бот и WebApp
-    расходятся в сумме. standalone и платёж по живому заказу учитываются."""
+    """WP-03: платёж по удалённому заказу исключён из денежных поверхностей —
+    иначе бот и WebApp расходятся в сумме. (Касса/отчёт по оплатам/по
+    сотрудникам бота удалены вместе с командами: они складывали копейки
+    разных валют в один итог.) standalone и платёж по живому заказу учитываются."""
     db = isolated_db
     db.set_role(1, "m", "M", "manager")
     live = _credit_shipped(db, 1, 100.0, "USD", "A-live")
@@ -124,16 +125,6 @@ def test_deleted_order_payments_excluded_from_all_money_surfaces(isolated_db):
 
     totals = asyncio.run(db.get_money_totals())
     assert {p["currency"]: p["total_cents"] for p in totals["payments"]}["USD"] == 10000
-
-    cb = db.get_cashbox_stats()  # sync, бот /cashbox
-    assert cb["total_cents"] == 10000  # 100, не 130
-
-    rep = asyncio.run(db.get_payments_report())  # бот /payreport
-    order_ids = {r["order_id"] for r in rep}
-    assert live in order_ids and phantom not in order_ids
-
-    emp = asyncio.run(db.get_summary_by_employee())  # бот /payreport (по сотрудникам)
-    assert sum(float(r["total"]) for r in emp) == 100.0
 
 
 def test_get_money_totals_period_filter(isolated_db):
@@ -376,3 +367,13 @@ def test_payments_send_batch_idempotent(isolated_db, monkeypatch):
         count = cur.fetchone()[0]
     assert count == 1  # ровно один платёж, дубля нет
     assert len(sent) == 1  # уведомление ушло один раз
+
+
+def test_dead_cross_currency_reports_stay_removed(isolated_db):
+    """Касса/отчёт по оплатам/по сотрудникам бота (`/cashbox`, `/payreport`)
+    вырезаны в T3.3, а их функции остались: `get_cashbox_stats` складывал
+    копейки USD и UZS в один `total_cents`. Вызывающих не было — удалены,
+    чтобы следующая ручка не взяла готовую неверную сумму."""
+    db = isolated_db
+    for name in ("get_cashbox_stats", "get_payments_report", "get_summary_by_employee"):
+        assert not hasattr(db, name), f"{name} вернулся — итог по разным валютам"

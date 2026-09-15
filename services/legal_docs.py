@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import tempfile
 from dataclasses import dataclass, asdict
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from dateutil.relativedelta import relativedelta
@@ -259,6 +260,29 @@ def _safe_name(value: str) -> str:
     return keep.replace(" ", "_") or "document"
 
 
+def _reserve_pdf_path(out_dir: Path, doc_type: str, name: str) -> Path:
+    """Занять уникальное имя файла PDF и вернуть путь.
+
+    Имя было `{тип}_{ФИО}_{дата}`: второй документ тому же должнику за день
+    молча ЗАТИРАЛ первый, и запись первого в generated_documents начинала
+    отдавать чужой PDF (подписанная расписка подменялась новой). Теперь в
+    имени время до секунды, а совпадение внутри секунды разводит суффикс.
+    Файл создаётся через O_EXCL — два параллельных рендера не займут одно имя
+    даже в одну и ту же секунду. Имя остаётся читаемым: его видит человек в
+    Telegram (read_pdf отдаёт path.name).
+    """
+    base = f"{doc_type}_{name}_{datetime.now():%Y-%m-%d_%H%M%S}"
+    for n in range(1, 1000):
+        candidate = out_dir / (f"{base}.pdf" if n == 1 else f"{base}_{n}.pdf")
+        try:
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return candidate
+    raise DocumentError("Не удалось подобрать имя файла документа")
+
+
 def fill_template(tpl: Path, context: dict, dst: Path) -> None:
     """Заполнить .docx-шаблон значениями контекста.
 
@@ -315,12 +339,22 @@ async def render_pdf(doc_type: str, context: dict, out_dir: Path,
         # loaded» при отсутствующем libreoffice-writer). Код возврата тут
         # ничего не гарантирует.
         if not pdf_src.is_file():
-            tail = (stderr or b"").decode(errors="replace")[-300:]
-            raise DocumentError(f"PDF не создан. LibreOffice: {tail or 'без сообщения'}")
+            # Сырой stderr — в лог, человеку — короткий текст. Раньше хвост
+            # stderr уезжал в ответ формы: менеджер видел пути /tmp, имя
+            # профиля и английскую диагностику LibreOffice, с которой ему
+            # делать нечего, а в логе причины не оставалось вовсе.
+            tail = (stderr or b"").decode(errors="replace")[-2000:]
+            logger.error(
+                "LibreOffice не создал PDF (%s, код %s): %s",
+                doc_type, proc.returncode, tail.strip() or "без сообщения",
+            )
+            raise DocumentError(
+                "Не удалось сформировать PDF. Попробуйте ещё раз; если повторится — "
+                "сообщите администратору."
+            )
 
-        stamp = date.today().isoformat()
         name = _safe_name(str(context.get("debtor_full_name") or ""))
-        pdf_dst = out_dir / f"{doc_type}_{name}_{stamp}.pdf"
-        shutil.copy2(pdf_src, pdf_dst)
+        pdf_dst = _reserve_pdf_path(out_dir, doc_type, name)
+        shutil.copyfile(pdf_src, pdf_dst)
         logger.info("Документ %s сформирован: %s", doc_type, pdf_dst.name)
         return pdf_dst

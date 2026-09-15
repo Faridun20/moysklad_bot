@@ -6,6 +6,7 @@ FastAPI сервер для WebApp.
 import asyncio
 import base64
 import binascii
+import json
 import logging
 import math
 import os
@@ -352,25 +353,113 @@ async def _metrics_middleware(request: Request, call_next):
         _metrics.record_timing(metric_name, (_time.perf_counter() - start) * 1000.0)
 
 
+class _AuthCacheWarmMiddleware:
+    """Прогреть кэш роли В ПОТОКЕ до того, как ручка вызовет `_authorize`.
+
+    `_authorize` и `get_role` синхронные и зовутся из async-ручек (их 120+,
+    переписывать каждую на await — огромный дифф поперёк всех `allowed_roles`).
+    При промахе кэша (раз в 30 с на пользователя) SELECT шёл прямо в потоке
+    event loop'а: все остальные запросы стояли, пока он идёт, а при
+    исчерпанном пуле Postgres — ещё и с ожиданием коннекта. Здесь тело
+    читается один раз (и отдаётся ручке как есть), `initData` проверяется той
+    же `verify_init_data`, и роль дочитывается через `asyncio.to_thread`.
+    Невалидная подпись кэш не трогает — иначе чужие id засоряли бы его.
+    """
+
+    # Крупнее — только загрузка фото (base64): второй разбор JSON там дороже
+    # сэкономленного SELECT'а, такой запрос идёт старым путём.
+    MAX_PARSE_BYTES = 256 * 1024
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or scope.get("method") != "POST"
+            or not str(scope.get("path") or "").startswith("/api/")
+        ):
+            return await self.app(scope, receive, send)
+
+        messages: list = []
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message.get("type") != "http.request":
+                break
+            body = message.get("body") or b""
+            size += len(body)
+            chunks.append(body)
+            if not message.get("more_body"):
+                break
+        if size <= self.MAX_PARSE_BYTES:
+            await _warm_auth_from_body(b"".join(chunks))
+
+        async def replay():
+            if messages:
+                return messages.pop(0)
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+
+async def _warm_auth_from_body(body: bytes) -> None:
+    try:
+        data = json.loads(body) if body else None
+        if not isinstance(data, dict):
+            return
+        init_data = data.get("initData")
+        user = _dev_bypass_user() or (
+            verify_init_data(init_data) if isinstance(init_data, str) and init_data else None
+        )
+        if not user or "id" not in user:
+            return
+        from services.roles import warm_auth_cache
+
+        await warm_auth_cache(user["id"])
+    except Exception:  # noqa: BLE001 — прогрев best-effort: ручка всё проверит сама
+        logger.debug("Прогрев кэша роли пропущен", exc_info=True)
+
+
+app.add_middleware(_AuthCacheWarmMiddleware)
+
 # Последним — значит самым внешним из пользовательских: лишнее тело режется
 # раньше метрик и gzip.
 app.add_middleware(_BodySizeLimitMiddleware, max_bytes=MAX_BODY_BYTES)
 
 
+# Версионированный ассет (`?v=<SHA>` из index.html) неизменен по построению:
+# новая сборка — новый URL. Его можно хранить год и не перепроверять
+# (`immutable` снимает даже revalidate при pull-to-refresh). Прежний
+# `max-age=86400` без immutable заставлял WebView раз в сутки тянуть app.js
+# (~140 КБ) заново при том же коммите.
+STATIC_IMMUTABLE = "public, max-age=31536000, immutable"
+# Всё, что без версии или с ЧУЖОЙ версией, — только с проверкой свежести.
+# Чужая версия — это старая вкладка после деплоя: ей отдаётся уже НОВЫЙ файл,
+# и закрепить его на год под старым URL значит отравить кэш на случай отката
+# на тот коммит. Сам index.html (и по «/», и по /static/index.html) — тоже
+# no-cache: он и есть носитель версии.
+STATIC_REVALIDATE = "no-cache"
+
+
 class CachedStaticFiles(StaticFiles):
-    """StaticFiles + Cache-Control: пусть браузер хранит CSS/JS сутки."""
+    """StaticFiles + Cache-Control по версии в query (`?v=`)."""
 
-    def __init__(self, *args, max_age: int = 86400, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._cache_header = f"public, max-age={max_age}"
+    def file_response(self, full_path, stat_result, scope, status_code=200):
+        resp = super().file_response(full_path, stat_result, scope, status_code)
+        from urllib.parse import parse_qs
 
-    def file_response(self, *args, **kwargs):
-        resp = super().file_response(*args, **kwargs)
-        resp.headers.setdefault("Cache-Control", self._cache_header)
+        query = parse_qs((scope.get("query_string") or b"").decode("latin-1"))
+        versioned = bool(APP_VERSION) and APP_VERSION in query.get("v", [])
+        is_html = str(full_path).endswith(".html")
+        resp.headers["Cache-Control"] = (
+            STATIC_IMMUTABLE if versioned and not is_html else STATIC_REVALIDATE
+        )
         return resp
 
 
-# Раздаём статику (CSS, JS) с кэшированием на сутки
 app.mount("/static", CachedStaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -3308,7 +3397,12 @@ async def api_currency_rates_set(request: Request):
     )
     code = (data.get("currency_code") or "").strip()
     rate = data.get("rate_to_base")
-    ok, err = await adb.set_currency_rate(code, rate, user["id"])
+    if isinstance(rate, bool):
+        # JSON true/false — float(True) == 1.0 прошёл бы как «курс 1».
+        raise HTTPException(status_code=400, detail="Курс должен быть числом")
+    # Ручная правка: границы пары + метка 'manual' в дневном архиве, чтобы
+    # ночной синк с ЦБ не перезаписал её в тот же день.
+    ok, err = await adb.set_currency_rate_manual(code, rate, user["id"])
     if not ok:
         raise HTTPException(status_code=400, detail=err)
     return JSONResponse({"ok": True, "currency_code": code.upper(), "rate_to_base": float(rate)})
@@ -4905,7 +4999,15 @@ async def api_returns_confirm(request: Request):
         await idem.release()
         raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
 
-    resp = {"ok": True, "return_id": return_id, "order_status": res.get("order_status")}
+    resp = {
+        "ok": True,
+        "return_id": return_id,
+        "order_status": res.get("order_status"),
+        # Приход товара по возврату: номер накладной или причина, почему склад
+        # не двигали, — чтобы расхождение было видно в ответе, а не в логах.
+        "invoice_number": res.get("invoice_number"),
+        "stock_skipped": res.get("stock_skipped"),
+    }
     await idem.store(resp)
     return JSONResponse(resp)
 
