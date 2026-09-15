@@ -4123,3 +4123,66 @@ describe('«Склад» → «Накладные» → «Списания»', (
     expect(window.__woCanPhoto()).toBe(false);
   });
 });
+
+// ─── «Деньги → Долги»: второй уровень «Клиенты · Поставщикам» ────────────────
+//
+// Ряд вкладок раздела упёрся в потолок (четыре), поэтому «мы должны» —
+// не пятая вкладка, а переключатель внутри «Долгов» (moneyDebtsSubHtml).
+// Здесь проверяется ровно стык: переключатель рисуется только тому, кому
+// отвечает ручка, живёт в ШЕЛЛЕ раздела (ре-рендер тела его не уносит,
+// UI-BUG-04) и старый адрес `money:suppliers` из очереди «Сегодня» приводит
+// в него, а не в несуществующую вкладку.
+describe('«Деньги → Долги» → «Поставщикам»', () => {
+  const bootMoney = (role, tab = 'debts') => boot(`
+    currentUser = { role: '${role}', prefs: { work_actions: true } };
+    window.__seen = [];
+    api = async (path) => {
+      window.__seen.push(path);
+      if (path === '/api/debts') return { debts: [], role: '${role}', today: '2026-09-16' };
+      if (path === '/api/suppliers/debts') return { debts: [], suppliers: [], total: { count: 0 } };
+      return {};
+    };
+    moneyTab = '${tab}';
+    window.__sub = () => debtsSub;
+    window.__ready = renderMoneyScreen();
+  `);
+
+  it('руководителю — переключатель, менеджеру его нет вовсе', async () => {
+    const boss = bootMoney('boss');
+    await boss.__ready;
+    const content = boss.document.getElementById('content');
+    // Пятой вкладки в ряду не появилось.
+    expect(content.querySelector('.seg-item[data-sect="suppliers"]')).toBeNull();
+    expect(content.querySelectorAll('[data-debtsub]').length).toBe(2);
+    expect(content.querySelector('[data-debtsub="clients"]').classList.contains('active')).toBe(true);
+
+    const mgr = bootMoney('manager');
+    await mgr.__ready;
+    // /api/suppliers/debts менеджеру отвечает 403 — двери, которая не
+    // открывается, не рисуем.
+    expect(mgr.document.querySelectorAll('[data-debtsub]').length).toBe(0);
+    expect(mgr.__seen).not.toContain('/api/suppliers/debts');
+  });
+
+  it('переключение тянет «мы должны» и оставляет вкладку «Долги»', async () => {
+    const window = bootMoney('boss');
+    await window.__ready;
+    window.document.querySelector('[data-debtsub="suppliers"]').click();
+    await new Promise(r => setTimeout(r, 0));
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__sub()).toBe('suppliers');
+    expect(window.__seen).toContain('/api/suppliers/debts');
+    const content = window.document.getElementById('content');
+    // Ряд вкладок раздела не поехал: «Долги» так и осталась активной.
+    expect(content.querySelector('.seg-item.active[data-sect]').dataset.sect).toBe('debts');
+    // Переключатель пережил перерисовку тела — он лежит в шелле раздела.
+    expect(content.querySelector('[data-debtsub="suppliers"]').classList.contains('active')).toBe(true);
+  });
+
+  it('старый адрес money:suppliers ведёт во второй уровень «Долгов»', async () => {
+    const window = bootMoney('boss', 'suppliers');
+    await window.__ready;
+    expect(window.__sub()).toBe('suppliers');
+    expect(window.document.querySelector('.seg-item.active[data-sect]').dataset.sect).toBe('debts');
+  });
+});

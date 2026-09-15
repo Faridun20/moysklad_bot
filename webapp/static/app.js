@@ -8119,6 +8119,36 @@ function initNav() {
 let debtsFilter = 'all';   // 'all' | 'today'
 let cashboxSubTab = null;  // последняя секция кассы (confirm|ops) — фолбэк
 let financePendCache = 0;  // последний счётчик подтверждений (мгновенный бейдж)
+let debtsSub = 'clients';  // 'clients' | 'suppliers' — второй уровень вкладки «Долги»
+
+// Второй уровень вкладки «Долги»: нам должны клиенты («Клиенты») и должны мы
+// («Поставщикам»). Пятой вкладкой раздела это быть не может — их потолок
+// четыре (`helpers.test.js`), а вопрос один и тот же («кто кому должен»),
+// просто с двух сторон: разносить его по двум местам значило бы требовать
+// помнить, в каком именно лежит нужная половина. Приём тот же, что у
+// «Склад → Накладные → Списания» (`whSubHtml`), но ряд живёт В ШЕЛЛЕ раздела,
+// рядом с `sectionNavHtml`, а не внутри `#money-body`: тело перерисовывают
+// сами экраны, и переключатель оттуда унесло бы первым же ре-рендером
+// (UI-BUG-04).
+function moneyDebtsSubHtml() {
+  const item = (key, label) =>
+    `<button class="seg-item ${debtsSub === key ? 'active' : ''}" data-debtsub="${key}" ` +
+    `aria-pressed="${debtsSub === key}">${label}</button>`;
+  return `<div class="seg-row"><div class="seg">`
+    + item('clients', 'Клиенты') + item('suppliers', 'Поставщикам')
+    + `</div></div>`;
+}
+
+function wireMoneyDebtsSub(root) {
+  (root || document).querySelectorAll('[data-debtsub]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (btn.dataset.debtsub === debtsSub) return;
+      haptic('light');
+      debtsSub = btn.dataset.debtsub;
+      renderMoneyScreen();
+    });
+  });
+}
 
 async function renderMoneyScreen() {
   const content = document.getElementById('content');
@@ -8131,6 +8161,9 @@ async function renderMoneyScreen() {
   if (['payments', 'cashbox', 'my'].includes(moneyTab)) moneyTab = isConfirmer ? 'confirm' : 'ops';
   if (moneyTab === 'overview') moneyTab = 'report';
   if (moneyTab === 'limits') { clientsTab = 'limits'; return showScreen('clients'); }
+  // Адрес «Деньги → Поставщикам» (очередь «Сегодня», `work_queue` —
+  // `money:suppliers`) ведёт во второй уровень «Долгов», а не в свою вкладку.
+  if (moneyTab === 'suppliers') { moneyTab = 'debts'; debtsSub = 'suppliers'; }
 
   // ВАЖНО: вкладки рисуем СРАЗУ (синхронно). Раньше рендер ждал сетевой подсчёт
   // бейджа (await) — при зависшем запросе вкладки не появлялись до перезагрузки
@@ -8140,8 +8173,16 @@ async function renderMoneyScreen() {
   const tabs = shell.tabs.map(t =>
     (t.key === 'confirm' && isConfirmer && financePendCache)
       ? { ...t, badge: financePendCache } : t);
-  content.innerHTML = sectionNavHtml(tabs, moneyTab) + '<div id="money-body"></div>';
+  // «Поставщикам» — только руководству: сумма прихода это закупочная цена, и
+  // `/api/suppliers/debts` отвечает admin/boss. Нет права — нет и второго
+  // уровня, вкладка «Долги» выглядит ровно как раньше.
+  const canSuppliers = canCall('/api/suppliers/debts', r);
+  if (!canSuppliers) debtsSub = 'clients';
+  content.innerHTML = sectionNavHtml(tabs, moneyTab)
+    + (moneyTab === 'debts' && canSuppliers ? moneyDebtsSubHtml() : '')
+    + '<div id="money-body"></div>';
   wireSectionNav(content, 'money', renderMoneyScreen);
+  wireMoneyDebtsSub(content);
 
   // Активную вкладку в зону видимости подтягивает keepRowScroll (общий для
   // всех рядов). Здесь стоял scrollIntoView({ inline: 'center' }): он двигал
@@ -8161,8 +8202,10 @@ async function renderMoneyScreen() {
   }
 
   const body = document.getElementById('money-body');
-  if (moneyTab === 'debts') await renderDebts(body);
-  else if (moneyTab === 'suppliers') await renderSupplierDebts(body);
+  if (moneyTab === 'debts') {
+    if (debtsSub === 'suppliers') await renderSupplierDebts(body);
+    else await renderDebts(body);
+  }
   else if (moneyTab === 'report') await renderMoneyReport(body);
   // Сверка кассы (cash_reconcile.js): пересчёт наличных руками и его история.
   // От `accounting_enabled` не зависит — ожидаемое считает

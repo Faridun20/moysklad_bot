@@ -358,6 +358,16 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
     audit.check("money-debts-today")
     page.click('.seg-item[data-f="all"]')
     audit.idle()
+    # «Поставщикам» («мы должны») — ВТОРОЙ УРОВЕНЬ «Долгов», а не пятая вкладка
+    # раздела: ряд «Денег» упёрся в потолок в четыре пункта. Меряем и его — два
+    # ряда переключателей подряд (вкладки раздела + «Клиенты · Поставщикам»)
+    # не должны ни наезжать друг на друга, ни резать подписи на 360/390/412.
+    if page.locator('#content [data-debtsub="suppliers"]').count():
+        audit.check("money-debts-clients-sub")
+        page.click('#content [data-debtsub="suppliers"]')
+        audit.check("money-debts-suppliers")
+        page.click('#content [data-debtsub="clients"]')
+        audit.idle()
     if not accounting and work:
         # Оплата долга — форма разбивки (при бухгалтерии её заменяет «Получил деньги»).
         audit.payment_form("#content .btn-pay-debt", "debt-payment-form", accounts=True)

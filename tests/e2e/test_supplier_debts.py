@@ -3,9 +3,12 @@ E2E «Деньги → Поставщикам»: приход от постав�
 формой → остаток уменьшился → выплата видна в истории.
 
 Настоящий Chromium против живого uvicorn. Проверяется ровно то, чего не видят
-слои ниже: вкладка появляется у руководителя и её нет у менеджера, форма
-собирает выплату из сегментов и листа выбора счёта, а число на экране меняется
-после записи.
+слои ниже: второй уровень «Долгов» появляется у руководителя и его нет у
+менеджера, форма собирает выплату из сегментов и листа выбора счёта, а число на
+экране меняется после записи.
+
+«Поставщикам» — не вкладка раздела (их потолок четыре), а переключатель внутри
+вкладки «Долги»: `[data-debtsub="suppliers"]`.
 """
 
 from __future__ import annotations
@@ -42,7 +45,8 @@ def _incoming(e2e, supplier_id: int, *, price_cents: int = 500_000, qty: float =
 
 def _open_suppliers(page: Page) -> None:
     go(page, "money")
-    tab(page, "suppliers")
+    tab(page, "debts")
+    page.click('#content [data-debtsub="suppliers"]')
     _loaded(page)
 
 
@@ -59,19 +63,29 @@ def _loaded(page: Page) -> None:
     settled(page)
 
 
-def test_supplier_tab_is_boss_only(open_app, e2e):
-    """Сумма прихода — закупочная цена: у менеджера вкладки нет вовсе."""
+def test_supplier_view_is_boss_only(open_app, e2e):
+    """Сумма прихода — закупочная цена: у менеджера переключателя нет вовсе."""
     _incoming(e2e, _supplier(e2e))
 
     mgr = open_app(e2e.ids["mgr"])
     go(mgr, "money")
+    tab(mgr, "debts")
+    settled(mgr)
     assert mgr.locator('.seg-item[data-sect="suppliers"]').count() == 0
+    assert mgr.locator('[data-debtsub]').count() == 0
 
     boss = open_app(e2e.ids["boss"])
     assert "money" in nav_screens(boss)
+    # Пятой вкладки в ряду нет — «Поставщикам» второй уровень «Долгов».
+    go(boss, "money")
+    assert boss.locator('.seg-item[data-sect="suppliers"]').count() == 0
     _open_suppliers(boss)
-    assert boss.locator('.seg-item[data-sect="suppliers"]').count() == 1
+    assert boss.locator('[data-debtsub="suppliers"].active').count() == 1
     assert "shandong machinery" in _text(boss)
+    # Обратно к клиентам — тем же переключателем, вкладка раздела не меняется.
+    boss.click('#content [data-debtsub="clients"]')
+    _loaded(boss)
+    assert boss.get_attribute(".seg-item.active[data-sect]", "data-sect") == "debts"
 
 
 def test_receipt_becomes_debt_and_payment_reduces_it(open_app, e2e):

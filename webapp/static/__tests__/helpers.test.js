@@ -348,20 +348,24 @@ describe('вкладки разделов', () => {
       .toEqual(['debts', 'ops', 'reconcile']);
   });
 
-  it('«Поставщикам» — только руководству: сумма прихода это закупочная цена', () => {
-    // /api/suppliers/debts отвечает admin/boss; у менеджера вкладка вернула бы
-    // 403, а заодно показала бы ему себестоимость.
-    expect(keys(moneyTabs, { canSeeDebts: true, canSeeSuppliers: false })).toEqual(['debts']);
-    expect(keys(moneyTabs, { canSeeDebts: true, canSeeSuppliers: true }))
-      .toEqual(['debts', 'suppliers']);
-    expect(roleSectionTabs('money', 'manager', { work: true }).map(t => t.key))
-      .not.toContain('suppliers');
+  it('«Поставщикам» вкладкой не выходит — это второй уровень «Долгов»', () => {
+    // Потолок ряда — четыре пункта, и пятой вкладке в «Деньгах» места нет:
+    // «мы должны» живёт переключателем внутри «Долгов» (app.js
+    // `moneyDebtsSubHtml`), а право на него режет ручка `/api/suppliers/debts`
+    // (admin/boss — сумма прихода это закупочная цена).
+    expect(keys(moneyTabs, { canSeeDebts: true })).toEqual(['debts']);
+    for (const r of ['boss', 'admin', 'manager']) {
+      for (const work of [true, false]) {
+        expect(roleSectionTabs('money', r, { work }).map(t => t.key))
+          .not.toContain('suppliers');
+      }
+    }
     for (const r of ['boss', 'admin']) {
       expect(roleSectionTabs('money', r, { work: true }).map(t => t.key))
-        .toEqual(['debts', 'suppliers', 'ops', 'report']);
+        .toEqual(['debts', 'ops', 'reconcile', 'report']);
       // «Рабочие действия» выключены — контроль остаётся, работа уходит.
       expect(roleSectionTabs('money', r, { work: false }).map(t => t.key))
-        .toEqual(['debts', 'suppliers', 'report']);
+        .toEqual(['debts', 'reconcile', 'report']);
     }
   });
 
