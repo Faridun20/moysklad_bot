@@ -262,6 +262,7 @@ FOREIGN_KEYS: list[ForeignKey] = [
     ForeignKey("return_receipt_return_fk", "return_receipt", "return_id", "returns"),
     ForeignKey("return_receipt_order_fk", "return_receipt", "order_id", "orders"),
     ForeignKey("return_receipt_invoice_fk", "return_receipt", "invoice_id", "invoices"),
+    ForeignKey("order_photos_order_fk", "order_photos", "order_id", "orders"),
     # Склад
     ForeignKey("invoices_warehouse_fk", "invoices", "warehouse_id", "warehouses"),
     ForeignKey("invoices_counterparty_fk", "invoices", "counterparty_id", "counterparties"),
