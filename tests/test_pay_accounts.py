@@ -214,7 +214,12 @@ def test_api_card_without_account_is_400_cash_is_unaffected(db, client):
     })
     assert again.json()["payments"] == r.json()["payments"]
     assert _rows(db, "SELECT COUNT(*) AS n FROM payment_part_accounts")[0]["n"] == 1
-    # Пуш руководителю называет карту — по ней он сверяет банк.
+    # Пуш руководителю называет карту — по ней он сверяет банк. Уведомление —
+    # фоновая задача (utils.background.spawn); `client` держит постоянный
+    # портал (tests/test_order_payments.py::client), поэтому дожидаемся её.
+    from webapp.server import _drain_background_tasks
+
+    client.portal.call(_drain_background_tasks)
     pushes = [p for p in client.pushes if "pay_ok" in str(p[2])]
     assert len(pushes) == 1 and "на карту •••• 1234 (Фаридун М.) · 7 130 USD" in pushes[0][1]
     audit = _rows(db, "SELECT details FROM audit_log WHERE action = 'order_payment_recorded'")
