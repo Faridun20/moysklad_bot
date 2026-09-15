@@ -722,3 +722,121 @@ def test_error_body_keeps_fields_the_form_needs():
     assert body["detail"].startswith("Показание меньше")
     assert body["needs_force"] is True
     assert body["previous"] == 1500
+
+
+# ─── «Прибыла»: работа приёмки, открыта менеджеру ─────────────────────────────
+
+
+def test_manager_marks_machine_arrived_with_location(isolated_db, monkeypatch):
+    """Жалоба с площадки: у машины «в пути» у менеджера была одна кнопка —
+    моточасы. Прибытие отмечает тот, кто встречает технику."""
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    mid = _machine("A-1", location="Порт Бандар-Аббас")  # in_transit
+    client = _client(monkeypatch)
+
+    card = _post(client, "/api/machines/card", 1, machine_id=mid).json()
+    assert card["can_arrive"] is True
+    assert card["can_manage"] is False
+    assert card["next_statuses"][0]["label"] == "✅ Прибыла"
+
+    r = _post(client, "/api/machines/arrive", 1, machine_id=mid,
+              location="Склад Сергели", idempotency_key="arr-1")
+    assert r.status_code == 200, r.text
+    m = _run(machines.get_machine(mid, role="manager"))
+    assert m["status"] == "in_stock" and m["location"] == "Склад Сергели"
+
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("SELECT user_id, action, details FROM audit_log WHERE action = ?"),
+                    ("machine_arrived",))
+        rows = [tuple(r) for r in cur.fetchall()]
+    assert len(rows) == 1 and rows[0][0] == 1 and "Склад Сергели" in rows[0][2], rows
+
+    assert _post(client, "/api/machines/card", 1, machine_id=mid).json()["can_arrive"] is False
+
+
+def test_arrive_double_tap_returns_first_result_and_stale_card_gets_409(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+    mid = _machine("A-1")
+    client = _client(monkeypatch)
+
+    first = _post(client, "/api/machines/arrive", 1, machine_id=mid, idempotency_key="k")
+    again = _post(client, "/api/machines/arrive", 1, machine_id=mid, idempotency_key="k")
+    assert first.status_code == again.status_code == 200
+    assert again.json() == first.json()
+
+    # Другой телефон с устаревшей карточкой (свой ключ) — 409 с текущим статусом.
+    stale = _post(client, "/api/machines/arrive", 2, machine_id=mid, idempotency_key="other")
+    assert stale.status_code == 409
+    assert stale.json()["current"] == "in_stock"
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("SELECT COUNT(*) FROM audit_log WHERE action = ?"), ("machine_arrived",))
+        assert cur.fetchone()[0] == 1
+
+
+def test_arrive_keeps_location_when_left_empty_and_refuses_sold_machine(isolated_db, monkeypatch):
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    kept = _machine("A-1", location="Порт")
+    sold = _machine("A-2")
+    assert _run(machines.set_status(sold, "sold", user_id=2, expected="in_transit"))["ok"]
+    client = _client(monkeypatch)
+
+    assert _post(client, "/api/machines/arrive", 1, machine_id=kept, location="").status_code == 200
+    assert _run(machines.get_machine(kept, role="boss"))["location"] == "Порт"
+
+    r = _post(client, "/api/machines/arrive", 1, machine_id=sold)
+    assert r.status_code == 409
+    assert _run(machines.get_machine(sold, role="boss"))["status"] == "sold"
+    assert _post(client, "/api/machines/arrive", 1, machine_id=99999).status_code == 404
+
+
+def test_arrive_is_closed_to_roles_without_machines(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+    mid = _machine("A-1")
+    client = _client(monkeypatch)
+    for uid in (3, 4):  # бухгалтер, кладовщик — техники у них нет вовсе
+        assert _post(client, "/api/machines/arrive", uid, machine_id=mid).status_code == 403
+    # Остальные переходы графа — по-прежнему руководству.
+    assert _post(client, "/api/machines/status", 1, machine_id=mid,
+                 status="in_stock", expected="in_transit").status_code == 403
+
+
+def test_installment_without_down_payment_accepts_zero(isolated_db, monkeypatch):
+    """Взнос «0» — законная рассрочка без первоначального взноса, а не «не число».
+    Ноль отвергать только там, где он опечатка (цена, платёж)."""
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    client = _client(monkeypatch)
+    for i, zero in enumerate(("0", "0,00", " 0 ", 0)):
+        mid = _machine(f"Z-{i}")
+        r = _post(client, "/api/machines/deal", 2, machine_id=mid, kind="credit",
+                  price="12 000", down_payment=zero, months=4, buyer_name="Азиз",
+                  idempotency_key=f"zero-{i}")
+        assert r.status_code == 200, (zero, r.text)
+        deal = _run(machines.list_deals(mid, role="boss"))[0]
+        progress = _run(machines.deal_progress(int(deal["id"])))
+        seqs = [p["seq"] for p in progress["payments"]]
+        assert seqs == [1, 2, 3, 4], "без взноса — без строки взноса в графике"
+        assert sum(p["amount_cents"] for p in progress["payments"]) == 1_200_000
+
+    for bad in ("abc", "-5"):
+        mid = _machine(f"B-{bad}")
+        r = _post(client, "/api/machines/deal", 2, machine_id=mid, kind="credit",
+                  price="12 000", down_payment=bad, months=4, buyer_name="Азиз",
+                  idempotency_key=f"bad-{bad}")
+        assert r.status_code == 400, (bad, r.text)
+    # Цена ноль по-прежнему отказ.
+    r = _post(client, "/api/machines/deal", 2, machine_id=_machine("P-0"), kind="sale",
+              price="0", buyer_name="Азиз", idempotency_key="price-0")
+    assert r.status_code == 400

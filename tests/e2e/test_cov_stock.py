@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import io
+import json
 import struct
 import zlib
 from types import SimpleNamespace
@@ -664,17 +665,22 @@ def test_container_supplier_becomes_receipt_invoice_counterparty(open_app, e2e):
     assert "Переоприходовать" in boss.inner_text("#cont-supply")
 
 
-def test_container_unmatched_item_gets_a_catalog_card_and_is_resupplied(open_app, e2e):
+def test_container_new_product_is_confirmed_at_receipt_and_legacy_unmatched_is_linked(open_app, e2e):
+    from services import container_receipt, containers
+
     cid = _container(e2e, "UNMT0000001")
     cable = _item(e2e, cid, "Кабель ВВГ 3x2.5", 10, product_id=e2e.ids["product"])
     boss = open_app(e2e.ids["boss"])
     _open_container(boss, cid)
 
-    # Позиция свободным текстом — товара в каталоге нет.
+    # Товара в каталоге нет — «Новый товар» под списком, название из поиска.
     boss.click("#cont-item-add")
+    boss.wait_for_selector("#ms-f-search")
+    boss.fill("#ms-f-search", "Фильтр масляный JCB")
+    boss.wait_for_selector(".picker-list:has-text('В каталоге не найдено')")
+    boss.click("#picker-new-product")
     boss.wait_for_selector("#ms-f-name")
-    boss.fill("#ms-f-name", "Фильтр масляный JCB")
-    boss.wait_for_selector(".product-suggest:has-text('В каталоге не найдено')")
+    assert boss.input_value("#ms-f-name") == "Фильтр масляный JCB"
     boss.fill("#ms-f-expected_qty", "5")
     boss.click("#ms-submit")
     boss.wait_for_function("() => document.querySelectorAll('[data-item-del]').length === 2")
@@ -682,34 +688,52 @@ def test_container_unmatched_item_gets_a_catalog_card_and_is_resupplied(open_app
     assert "нет в каталоге" in boss.inner_text(".c-row:has-text('Фильтр масляный JCB')")
     filt = e2e.rows("SELECT id FROM container_items WHERE name = 'Фильтр масляный JCB'")[0]["id"]
     assert e2e.rows("SELECT COUNT(*) AS n FROM container_item_products WHERE item_id = ?", (filt,))[0]["n"] == 0
+    assert e2e.rows("SELECT COUNT(*) AS n FROM products WHERE name = 'Фильтр масляный JCB'")[0]["n"] == 0
 
     boss.click("#cont-arrive")
     boss.wait_for_selector(".qty-input[data-item]")
-    assert e2e.rows("SELECT status FROM containers WHERE id = ?", (cid,))[0]["status"] == "arrived"
     boss.fill(f'.qty-input[data-item="{cable}"]', "10")
     boss.fill(f'.qty-input[data-item="{filt}"]', "5")
+    # Сверка сразу проводит приход — позицию без карточки подтверждают ДО него.
     boss.click("#cont-save")
-    boss.wait_for_selector(f'[data-unmatched="{filt}"]')
-    assert _stock(e2e) == 30, "привязанная позиция оприходована, непривязанная — нет"
-
-    boss.click(f'[data-unmatched="{filt}"]')
-    boss.wait_for_selector(".c-overlay button:has-text('в каталоге')")
-    boss.click(".c-overlay button:has-text('в каталоге')")
-    boss.wait_for_selector(".toast:has-text('Товар заведён')")
+    boss.wait_for_selector(f'#receipt-review [data-review="{filt}"]')
+    assert _stock(e2e) == 20, "до подтверждения ничего не записано"
+    boss.click(f'[data-review-new="{filt}"]')
+    boss.wait_for_selector(f'#receipt-review [data-review="{filt}"]:has-text("новый товар")')
+    boss.click(".c-overlay #ms-submit")
+    boss.wait_for_selector(".toast:has-text('новых товаров в каталоге: 1')")
     _no_overlay(boss)
     new_pid = e2e.rows("SELECT id FROM products WHERE name = 'Фильтр масляный JCB'")[0]["id"]
+    assert _stock(e2e, new_pid) == 5
+    assert _stock(e2e) == 30
     assert e2e.rows("SELECT product_id FROM container_item_products WHERE item_id = ?", (filt,)) == [
         {"product_id": new_pid}
     ]
 
+    # Старый контейнер: позиция текстом уже выпала из прихода (так было до
+    # выбора из каталога). Чинится прямо из строки «не найден в номенклатуре».
+    old = _container(e2e, "OLDU0000001")
+    belt = _item(e2e, old, "Ремень генератора", 2)
+    e2e.run(containers.mark_arrived(old, user_id=e2e.ids["boss"]))
+    e2e.run(containers.set_arrived_quantities(old, {belt: 2}, user_id=e2e.ids["boss"]))
+    e2e.run(container_receipt.set_supplier(old, supplier_id=None, name=None))
+    e2e.exec("UPDATE container_receipt SET unmatched = ? WHERE container_id = ?",
+             (json.dumps([{"item_id": belt, "name": "Ремень генератора", "quantity": 2,
+                          "reason": "не найден в номенклатуре"}], ensure_ascii=False), old))
+    _open_container(boss, old)
+    boss.click(f'[data-unmatched="{belt}"]')
+    boss.wait_for_selector("#picker-new-product:has-text('Ремень генератора')")
+    boss.click("#picker-new-product")
+    boss.wait_for_selector(".toast:has-text('Товар заведён')")
+    belt_pid = e2e.rows("SELECT id FROM products WHERE name = 'Ремень генератора'")[0]["id"]
+    assert e2e.rows("SELECT product_id FROM container_item_products WHERE item_id = ?", (belt,)) == [
+        {"product_id": belt_pid}
+    ]
     boss.wait_for_selector("#cont-supply")
     boss.click("#cont-supply")
-    boss.wait_for_selector(".toast:has-text('Оприходовано: 2 позиции')")
-    boss.wait_for_function("() => !document.querySelector('[data-unmatched]')")
-    assert _stock(e2e, new_pid) == 5
-    assert _stock(e2e) == 30, "переоприходование не удвоило кабель"
-    live = e2e.rows("SELECT COUNT(*) AS n FROM invoices WHERE status = 'confirmed' AND comment LIKE 'Контейнер%'")
-    assert live[0]["n"] == 1
+    boss.wait_for_selector(".toast:has-text('Оприходовано: 1 позиция')")
+    assert _stock(e2e, belt_pid) == 2
+    assert _stock(e2e) == 30, "переоприходование не трогало чужой контейнер"
 
 
 def test_container_item_is_linked_to_existing_product_and_deleted(open_app, e2e):
@@ -754,9 +778,12 @@ def test_extra_item_in_arrived_container_is_recorded_as_arrived(open_app, e2e):
     assert mgr.locator("#cont-arrive").count() == 0 and mgr.locator("#cont-post").count() == 0
     assert "Лишняя позиция" in mgr.inner_text("#cont-item-add")
     mgr.click("#cont-item-add")
+    mgr.wait_for_selector("#picker-new-product")
+    mgr.fill("#ms-f-search", "Ремень генератора")
+    mgr.click("#picker-new-product")
     mgr.wait_for_selector("#ms-f-arrived_qty")
     assert mgr.locator("#ms-f-expected_qty").count() == 0
-    mgr.fill("#ms-f-name", "Ремень генератора")
+    assert mgr.input_value("#ms-f-name") == "Ремень генератора"
     mgr.fill("#ms-f-arrived_qty", "3")
     mgr.click("#ms-submit")
     mgr.wait_for_function("() => document.querySelectorAll('.qty-input[data-item]').length === 2")
@@ -767,12 +794,17 @@ def test_extra_item_in_arrived_container_is_recorded_as_arrived(open_app, e2e):
     assert "заявлено 0 шт" in extra.inner_text()
     assert "Расхождений" not in mgr.inner_text("#content")
 
-    # Оприходовать нечего: кабель не посчитан, ремня нет в каталоге — отказ
-    # текстом, остаток не тронут.
+    # Ремня нет в каталоге: «Оприходовать» сначала спрашивает, что это за
+    # товар. Передумали — ничего не записано, остаток не тронут.
     mgr.click("#cont-supply")
-    mgr.wait_for_function("() => window.__tgAlerts.some(a => a.includes('Нечего оприходовать'))")
+    mgr.wait_for_selector("#receipt-review:has-text('Ремень генератора')")
+    mgr.click(".c-overlay #ms-submit")
+    mgr.wait_for_selector(".c-overlay #ms-error:has-text('Выберите товар')")
+    mgr.click(".c-overlay #ms-cancel")
+    _no_overlay(mgr)
     assert _stock(e2e) == 20
     assert e2e.rows("SELECT COUNT(*) AS n FROM invoices")[0]["n"] == 1
+    assert e2e.rows("SELECT COUNT(*) AS n FROM products WHERE name = 'Ремень генератора'")[0]["n"] == 0
 
 
 def test_arrival_post_to_channel_lists_names_without_quantities(open_app, e2e, monkeypatch):

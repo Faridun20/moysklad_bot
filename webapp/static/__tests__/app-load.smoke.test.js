@@ -779,12 +779,15 @@ describe('контейнеры', () => {
     expect(content.querySelector('#cont-del')).not.toBeNull();
   });
 
+  // Состав, привязанный к каталогу: сверка идёт сразу, без формы выбора товара.
+  const LINKED = () => CARD().items.map((it, i) => ({ ...it, product_id: 70 + i }));
+
   it('сверка уходит одним запросом на весь состав', async () => {
     // Приёмщик считает подряд и не должен ждать сети после каждой позиции.
     const window = boot(`
       currentUser = { role: 'boss' };
       window.__writes = [];
-      api = async () => (${JSON.stringify(CARD())});
+      api = async () => (${JSON.stringify(CARD({ items: LINKED() }))});
       apiResult = async (path, body) => { window.__writes.push([path, body]); return { ok: true, status: 200, body: { ok: true }, error: '' }; };
       window.__ready = renderContainerCard(3);
     `);
@@ -796,6 +799,100 @@ describe('контейнеры', () => {
     expect(window.__writes).toHaveLength(1);
     expect(window.__writes[0][0]).toBe('/api/containers/check');
     expect(window.__writes[0][1].quantities).toEqual({ 10: '500', 11: '19' });
+  });
+
+  it('переоприходование не прошло (409): текст сервера виден, карточка перечитана', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      window.__cards = 0;
+      api = async () => { window.__cards++; return ${JSON.stringify(CARD({ items: LINKED() }))}; };
+      tg.showAlert = (text) => { window.__alerted = text; };
+      apiResult = async () => ({ ok: false, status: 409,
+        error: 'Сверка не сохранена: товар из прежнего прихода уже отгружен. Количества оставлены прежними.',
+        body: { ok: false, reverted: true } });
+      window.__ready = renderContainerCard(3);
+    `);
+    await window.__ready;
+    window.document.querySelector('.qty-input[data-item="11"]').value = '5';
+    window.document.querySelector('#cont-save').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__alerted).toContain('уже отгружен');
+    expect(window.__cards).toBe(2);
+    expect(window.document.body.textContent).not.toContain('Сверка сохранена');
+  });
+
+  it('сверка сохранена, а приход не проведён — это сказано красным, а не «сохранено»', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      api = async () => (${JSON.stringify(CARD({ items: LINKED() }))});
+      apiResult = async () => ({ ok: true, status: 200, error: '',
+        body: { ok: true, receipt: { ok: false, error: 'Нечего оприходовать' } } });
+      window.__ready = renderContainerCard(3);
+    `);
+    await window.__ready;
+    window.document.querySelector('#cont-save').click();
+    await new Promise(r => setTimeout(r, 0));
+    const toasts = Array.from(window.document.querySelectorAll('.toast')).map(t => t.textContent).join(' | ');
+    expect(toasts).toContain('на склад не пошло: Нечего оприходовать');
+  });
+
+  it('позиции без карточки: сверка сначала спрашивает, что это за товар', async () => {
+    // Сверка сразу проводит приход. Раньше непривязанная позиция молча
+    // выпадала из накладной — теперь выбор делается ДО неё и едет тем же запросом.
+    const items = CARD().items;
+    items[0].catalog_matches = [{ product_id: 5, name: 'Кабель PV 0.6', unit: 'шт' }];
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      window.__writes = [];
+      api = async () => (${JSON.stringify(CARD({ items }))});
+      apiResult = async (path, body) => { window.__writes.push([path, body]); return { ok: true, status: 200, body: { ok: true }, error: '' }; };
+      window.__ready = renderContainerCard(3);
+    `);
+    await window.__ready;
+    const doc = window.document;
+    doc.querySelector('#cont-save').click();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(window.__writes).toHaveLength(0);
+    const review = doc.querySelector('#receipt-review');
+    expect(review).not.toBeNull();
+    // Совпадение по названию предвыбрано и названо; без совпадения — выбор обязателен.
+    expect(review.querySelector('[data-review="10"]').textContent).toContain('из каталога');
+    expect(review.querySelector('[data-review-new="10"]')).toBeNull();
+    doc.querySelector('.c-overlay #ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__writes).toHaveLength(0);
+    expect(doc.querySelector('.c-overlay #ms-error').textContent).toContain('ThinkPower 6kw');
+
+    review.querySelector('[data-review-new="11"]').click();
+    expect(review.querySelector('[data-review="11"]').textContent).toContain('новый товар');
+    doc.querySelector('.c-overlay #ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__writes).toHaveLength(1);
+    expect(window.__writes[0][0]).toBe('/api/containers/check');
+    expect(window.__writes[0][1].resolve).toEqual({ 10: { product_id: 5 }, 11: { new: true } });
+  });
+
+  it('«Оприходовать» с непривязанными позициями — через ту же форму выбора', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      window.__writes = [];
+      api = async () => (${JSON.stringify(CARD())});
+      apiResult = async (path, body) => { window.__writes.push([path, body]); return { ok: true, status: 200, body: { ok: true, matched: 2 }, error: '' }; };
+      window.__ready = renderContainerCard(3);
+    `);
+    await window.__ready;
+    const doc = window.document;
+    doc.querySelector('#cont-supply').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__writes).toHaveLength(0);
+    doc.querySelector('[data-review-new="10"]').click();
+    doc.querySelector('[data-review-new="11"]').click();
+    doc.querySelector('.c-overlay #ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__writes[0][0]).toBe('/api/containers/supply');
+    expect(window.__writes[0][1].resolve).toEqual({ 10: { new: true }, 11: { new: true } });
+    expect(window.__writes[0][1].idempotency_key).toBeTruthy();
   });
 
   it('прибывший контейнер удаляется, пока открыто окно правки', async () => {
@@ -1100,81 +1197,156 @@ describe('позиция контейнера: товар выбирают из 
     expect(box.querySelector('[data-item-link]')).toBeNull();
   });
 
-  const formDriver = `
+  it('позиция с совпадением по названию в каталоге так и подписана', () => {
+    const window = boot();
+    const box = window.document.createElement('div');
+    box.innerHTML = window.containerItemsHtml([
+      { ...ITEMS[0], catalog_matches: [{ product_id: 9, name: 'Штекер тип C' }] },
+    ], false, true);
+    expect(box.textContent).toContain('в каталоге по названию');
+    expect(box.textContent).not.toContain('нет в каталоге');
+  });
+
+  const formDriver = (result = "{ ok: true, body: {} }") => `
     currentUser = { role: 'manager' };
     window.__sent = null;
-    api = async () => ({ ok: true, products: [
-      { product_id: 11, name: 'Кабель PV 0.6', unit: 'м' },
-    ] });
-    apiResult = async (path, body) => { window.__sent = body; return { ok: true, body: {} }; };
+    window.__queries = [];
+    api = async (path, body) => { window.__queries.push(body); return { ok: true, products: [
+      { product_id: 11, name: 'Кабель PV 0.6', unit: 'м', quantity: 40, sku: 'PV06' },
+    ] }; };
+    apiResult = async (path, body) => { window.__sent = body; return ${result}; };
     renderContainerCard = async () => {};
     openContainerItemForm(7, false);
   `;
 
-  // Подсказка приходит по debounce'у — ждём его и микротаск ответа.
+  // Список приходит по debounce'у — ждём его и микротаск ответа.
   const settle = () => new Promise(r => setTimeout(r, 400));
 
-  it('выбор из каталога подставляет название, единицу и уезжает с позицией', async () => {
-    const window = boot(formDriver);
-    const doc = window.document;
-    const name = doc.querySelector('#ms-f-name');
-    name.value = 'кабель';
-    name.dispatchEvent(new window.Event('input'));
+  it('список каталога виден сразу, до первой буквы, с остатком и единицей', async () => {
+    const window = boot(formDriver());
     await settle();
+    const row = window.document.querySelector('.picker-list [data-product="11"]');
+    expect(row).not.toBeNull();
+    expect(row.textContent).toContain('остаток 40 м');
+    expect(row.textContent).toContain('PV06');
+    expect(window.__queries[0]).toEqual({ query: '', browse: true, limit: 50 });
+    // Ввод новой позиции — отдельной кнопкой, а не поведением по умолчанию.
+    expect(window.document.querySelector('#picker-new-product')).not.toBeNull();
+  });
 
-    doc.querySelector('.product-suggest [data-product="11"]').click();
-    expect(name.value).toBe('Кабель PV 0.6');
-    expect(doc.querySelector('#ms-f-unit').value).toBe('м');
+  it('выбор из каталога: количество — и позиция уезжает с карточкой товара', async () => {
+    const window = boot(formDriver());
+    const doc = window.document;
+    await settle();
+    doc.querySelector('#ms-submit').click();   // без выбора — не уходит
+    await new Promise(r => setTimeout(r, 0));
+    expect(doc.querySelector('#ms-error').textContent).toContain('Выберите товар');
+
+    doc.querySelector('.picker-list [data-product="11"]').click();
+    doc.querySelector('#ms-submit').click();
+    await settle();
+    expect(doc.querySelectorAll('.c-overlay')).toHaveLength(1);
+    expect(doc.querySelector('#cont-item-product').textContent).toContain('Кабель PV 0.6');
+    expect(doc.querySelector('#ms-f-name')).toBeNull();   // название не вписывают
 
     doc.querySelector('#ms-f-expected_qty').value = '500';
     doc.querySelector('#ms-submit').click();
     await settle();
     expect(window.__sent.product_id).toBe(11);
     expect(window.__sent.name).toBe('Кабель PV 0.6');
+    expect(window.__sent.unit).toBe('м');
+    expect(window.__sent.expected_qty).toBe('500');
   });
 
-  it('правка названия после выбора отвязывает товар', async () => {
-    // Иначе человек уверен, что вписал новую позицию, а приход уйдёт на
-    // прежнюю карточку — молча и не туда.
-    const window = boot(formDriver);
+  it('новый товар: набранное в поиске уезжает в название, без карточки', async () => {
+    const window = boot(formDriver());
     const doc = window.document;
-    const name = doc.querySelector('#ms-f-name');
-    name.value = 'кабель';
-    name.dispatchEvent(new window.Event('input'));
     await settle();
-    doc.querySelector('.product-suggest [data-product="11"]').click();
-
-    name.value = 'Кабель PV 0.6 чёрный';
-    name.dispatchEvent(new window.Event('input'));
-    await settle();
-
-    doc.querySelector('#ms-f-expected_qty').value = '10';
-    doc.querySelector('#ms-submit').click();
-    await settle();
-    expect(window.__sent.product_id).toBe('');
-    expect(window.__sent.name).toBe('Кабель PV 0.6 чёрный');
-  });
-
-  it('свободный ввод остаётся законным: товара может ещё не быть', async () => {
-    const window = boot(`
-      currentUser = { role: 'manager' };
-      window.__sent = null;
-      api = async () => ({ ok: true, products: [] });
-      apiResult = async (path, body) => { window.__sent = body; return { ok: true, body: {} }; };
-      renderContainerCard = async () => {};
-      openContainerItemForm(7, false);
-    `);
-    const doc = window.document;
-    doc.querySelector('#ms-f-name').value = 'Штекер тип C';
-    doc.querySelector('#ms-f-name').dispatchEvent(new window.Event('input'));
-    await settle();
-    expect(doc.querySelector('.product-suggest').textContent).toContain('вписать своё название');
+    doc.querySelector('#ms-f-search').value = 'Штекер тип C';
+    doc.querySelector('#picker-new-product').click();
+    expect(doc.querySelectorAll('.c-overlay')).toHaveLength(1);
+    expect(doc.querySelector('#ms-f-name').value).toBe('Штекер тип C');
 
     doc.querySelector('#ms-f-expected_qty').value = '5';
     doc.querySelector('#ms-submit').click();
     await settle();
     expect(window.__sent.name).toBe('Штекер тип C');
-    expect(window.__sent.product_id).toBe('');
+    expect(window.__sent.product_id).toBeUndefined();
+  });
+
+  it('тёзка в каталоге: сервер предлагает существующую карточку, её выбирают', async () => {
+    const conflict = JSON.stringify({
+      ok: false, status: 409, error: 'В каталоге уже есть «Кабель PV 0.6» — выберите его',
+      body: { needs_choice: true, existing: [{ product_id: 11, name: 'Кабель PV 0.6', unit: 'м' }] },
+    });
+    const window = boot(formDriver(conflict));
+    const doc = window.document;
+    await settle();
+    doc.querySelector('#ms-f-search').value = 'кабель  pv 0.6';
+    doc.querySelector('#picker-new-product').click();
+    doc.querySelector('#ms-f-expected_qty').value = '7';
+    doc.querySelector('#ms-submit').click();
+    await settle();
+    expect(doc.querySelector('#ms-error').textContent).toContain('уже есть');
+
+    doc.querySelector('[data-existing="11"]').click();
+    expect(doc.querySelectorAll('.c-overlay')).toHaveLength(1);
+    expect(doc.querySelector('#cont-item-product').textContent).toContain('Кабель PV 0.6');
+    expect(doc.querySelector('#ms-f-expected_qty').value).toBe('7');   // количество не потерялось
+  });
+});
+
+describe('техника: «Прибыла»', () => {
+  const CARD = (over = {}) => ({
+    ok: true,
+    machine: { id: 9, name: 'CAT 320D', vin: 'CAT123', status: 'in_transit', location: 'Порт' },
+    photos: [], hours: [], deals: [],
+    next_statuses: [{ status: 'in_stock', label: '✅ Прибыла' }],
+    can_manage: false, can_arrive: true,
+    status_labels: { in_transit: '🚢 В пути', in_stock: '🏗 На складе' },
+    ...over,
+  });
+  const bootCard = (role, card) => boot(`
+    currentUser = { role: '${role}' };
+    window.__writes = [];
+    api = async () => (${JSON.stringify(card)});
+    apiResult = async (path, body) => { window.__writes.push([path, body]); return { ok: true, status: 200, body: { ok: true }, error: '' }; };
+    window.__ready = renderMachineCard(9);
+  `);
+
+  it('менеджер отмечает прибытие машины в пути — с локацией и ключом', async () => {
+    const window = bootCard('manager', CARD());
+    await window.__ready;
+    const doc = window.document;
+    const btn = doc.querySelector('[data-mact="arrive"]');
+    expect(btn).not.toBeNull();
+    expect(btn.textContent).toContain('Прибыла');
+    btn.click();
+    expect(doc.querySelector('#ms-f-location').value).toBe('Порт');
+    doc.querySelector('#ms-f-location').value = 'Склад Сергели';
+    doc.querySelector('#ms-submit').click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(window.__writes[0][0]).toBe('/api/machines/arrive');
+    expect(window.__writes[0][1].machine_id).toBe(9);
+    expect(window.__writes[0][1].location).toBe('Склад Сергели');
+    expect(window.__writes[0][1].idempotency_key).toBeTruthy();
+  });
+
+  it('у руководства тот же переход не дублируется второй кнопкой', async () => {
+    const window = bootCard('boss', CARD({ can_manage: true }));
+    await window.__ready;
+    const doc = window.document;
+    expect(doc.querySelectorAll('[data-mact="arrive"]')).toHaveLength(1);
+    expect(doc.querySelector('[data-mstatus-to="in_stock"]')).toBeNull();
+  });
+
+  it('у машины на складе «Прибыла» нет', async () => {
+    const window = bootCard('manager', CARD({
+      machine: { id: 9, name: 'CAT 320D', vin: 'CAT123', status: 'in_stock' },
+      can_arrive: false, next_statuses: [],
+    }));
+    await window.__ready;
+    expect(window.document.querySelector('[data-mact="arrive"]')).toBeNull();
   });
 });
 

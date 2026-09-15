@@ -542,12 +542,19 @@ def diff_summary(rows: list[dict]) -> dict:
 
 
 async def set_arrived_quantities(
-    container_id: int, quantities: dict[int, Any], *, user_id: int, full_name: str = ""
+    container_id: int,
+    quantities: dict[int, Any],
+    *,
+    user_id: int,
+    full_name: str = "",
+    audit: bool = True,
 ) -> dict:
     """Проставить фактические количества по позициям приёмки.
 
     Пустое значение сбрасывает факт в «ещё не считали» — приёмщик должен иметь
     возможность отменить свою же опечатку, а не только записать ноль.
+    `audit=False` — запись журнала делает вызывающий (`audit_checked`), когда
+    знает, что сверка устояла.
     """
     if not quantities:
         return {"ok": False, "error": "Нечего сохранять"}
@@ -573,10 +580,16 @@ async def set_arrived_quantities(
         await txn.execute(
             "UPDATE containers SET updated_at = $1 WHERE id = $2", stamp, container_id
         )
-    await _audit(
-        user_id, full_name, "container_checked", f"#{container_id}: {len(quantities)} позиций"
-    )
+    if audit:
+        await audit_checked(container_id, len(quantities), user_id=user_id, full_name=full_name)
     return {"ok": True}
+
+
+async def audit_checked(container_id: int, count: int, *, user_id: int, full_name: str = "") -> None:
+    """Запись «сверка сохранена» в журнал. Отдельно — для ручки, которая пишет
+    её только после того, как за количествами поехал приход (иначе в журнале
+    осталась бы сверка, которую откатили)."""
+    await _audit(user_id, full_name, "container_checked", f"#{container_id}: {count} позиций")
 
 
 async def mark_arrived(container_id: int, *, user_id: int, full_name: str = "") -> dict:

@@ -2212,27 +2212,28 @@ async def api_products_search(request: Request):
     """Поиск товара в номенклатуре — для подсказок при вводе позиции.
 
     Читаем свою таблицу `products`: каталог теперь наш, и подсказка стоит один
-    локальный запрос. Поиск по кириллице — через `lower()` с обеих сторон
-    (CLAUDE.md: встроенный SQLite LOWER() ASCII-only, `adb_core` переопределяет
-    его Unicode-aware).
+    локальный запрос (`warehouse.search_products`: название или артикул, ё = е,
+    с остатком).
     """
-    from services import adb_core
-
     data = await request.json()
     _authorize(
         data, allowed_roles=("admin", "boss", "manager"),
         rate_limit_scope="api_products_search", rate_limit_max=240,
     )
     query = (data.get("query") or "").strip()[:100]
-    if len(query) < 2:
-        # Пустой ввод — не повод отдавать первые 20 товаров каталога наугад.
+    # `browse` — выбор из списка (шторка товара): список виден сразу, до первой
+    # буквы, и сужается по мере ввода. Без него — подсказка под полем ввода,
+    # где одна буква ещё не запрос и первые товары каталога наугад не нужны.
+    browse = bool(data.get("browse"))
+    if len(query) < 2 and not browse:
         return JSONResponse({"ok": True, "products": [], "query": query})
-    rows = await adb_core.fetch(
-        "SELECT id AS product_id, name, unit, category, sku FROM products "
-        f"WHERE {adb_core.name_search_sql('name')} LIKE $1 "
-        f"ORDER BY {adb_core.order_by_name('name')}, id LIMIT 20",
-        adb_core.name_search_param(query),
-    )
+    try:
+        limit = int(data.get("limit") or 20)
+    except (TypeError, ValueError):
+        limit = 20
+    from services import warehouse
+
+    rows = await warehouse.search_products(query, limit, browse=browse)
     return JSONResponse({"ok": True, "products": rows, "query": query})
 
 
@@ -3806,6 +3807,9 @@ async def api_machines_card(request: Request):
             # Граф переходов приходит с сервера: рисовать его копию на фронте
             # значит завести второй источник правды о жизненном цикле машины.
             "next_statuses": machines.next_status_options(machine.get("status")),
+            # «Прибыла» — работа приёмки, её делает и менеджер (ручка
+            # /api/machines/arrive), в отличие от остальных переходов графа.
+            "can_arrive": machine.get("status") == "in_transit",
             "can_manage": role in _MACHINE_BOSS,
             # Без канала-хранилища загрузка не работает — кнопку рисовать нельзя.
             "can_upload_photo": _machine_photos_chat_id() is not None,
@@ -3862,18 +3866,35 @@ def _optional_id(data: dict, key: str) -> int | None:
     return value
 
 
-def _machine_money(raw, label: str) -> int | None:
+def _machine_money(raw, label: str, *, allow_zero: bool = False) -> int | None:
     """Сумма из формы («25 000», «25000.50») → копейки.
 
     Граница системы: наружу и внутрь ходят копейки, парсинг человеческой записи
     живёт ровно здесь. Пустое поле — это «не задано», а не ноль.
+
+    `allow_zero` — поле, где ноль законен: рассрочка без первоначального взноса.
+    `parse_amount` ноль отвергает (цена или платёж в ноль — опечатка), и взнос
+    «0» получал отказ «не число», хотя клиент просто ничего не внёс.
     """
     if raw is None or str(raw).strip() == "":
         return None
     cents = money.parse_amount(raw)
+    if cents is None and allow_zero:
+        from decimal import Decimal
+
+        try:
+            if Decimal(_normalized_amount(raw)) == 0:
+                return 0
+        except (ArithmeticError, ValueError):
+            pass
     if cents is None:
         raise HTTPException(status_code=400, detail=f"{label}: не число или не больше нуля")
     return cents
+
+
+def _normalized_amount(raw) -> str:
+    """Запись суммы без пробелов-разделителей и с точкой — как её читает `parse_amount`."""
+    return str(raw).strip().replace(" ", "").replace("\u00a0", "").replace(",", ".")
 
 
 def _machine_text(data: dict, key: str, limit: int = 200) -> str | None:
@@ -4088,6 +4109,44 @@ async def api_machines_status(request: Request):
     return _machine_response(res)
 
 
+@app.post("/api/machines/arrive")
+async def api_machines_arrive(request: Request):
+    """Машина прибыла: «В пути» → «На складе» (+ где стоит).
+
+    Открыта менеджеру, в отличие от `/api/machines/status`: встречает технику
+    он, и без этой ручки у менеджера на карточке машины «в пути» не было
+    ни одной кнопки, кроме моточасов. CAS по статусу — в сервисе; ключ
+    идемпотентности отдаёт двойному тапу итог первого нажатия, а не 409.
+    """
+    from services import async_db as adb
+    from services import machines
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_ROLES, rate_limit_scope="api_machines_arrive"
+    )
+    machine_id = _machine_id_arg(data)
+    idem = _Idem(adb, "machine_arrive", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await machines.mark_arrived(
+            machine_id,
+            user_id=user["id"],
+            full_name=_actor_name(user),
+            location=_machine_text(data, "location", 200),
+        )
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_response(res)
+    await idem.store(res)
+    return JSONResponse(res)
+
+
 @app.post("/api/machines/deal")
 async def api_machines_deal(request: Request):
     """Оформить продажу или рассрочку. Только admin/boss.
@@ -4117,7 +4176,9 @@ async def api_machines_deal(request: Request):
 
     # Рассрочка: взнос и срок в месяцах. Дату последнего платежа считает сервис
     # по графику — введённая руками, она рано или поздно разошлась бы с ним.
-    down_payment_cents = _machine_money(data.get("down_payment"), "Первоначальный взнос") or 0
+    down_payment_cents = _machine_money(
+        data.get("down_payment"), "Первоначальный взнос", allow_zero=True
+    ) or 0
     months = 0
     if kind == "credit":
         try:
@@ -4602,6 +4663,12 @@ async def api_containers_card(request: Request):
     from services import container_receipt
 
     items = containers.diff(await containers.list_items(container_id))
+    # Позиции, заведённые свободным текстом: если в каталоге есть карточка с тем
+    # же названием, показываем её сразу — приход по имени уйдёт именно туда, и
+    # человек должен видеть это до оприходования, а не после.
+    matches = await container_receipt.catalog_matches(items)
+    for item in items:
+        item["catalog_matches"] = matches.get(int(item["id"]), [])
     return JSONResponse(
         {
             "ok": True,
@@ -4686,6 +4753,8 @@ async def api_containers_item_add(request: Request):
         rate_limit_max=120,  # состав заполняют подряд, позиция за позицией
     )
     container_id = _machine_id_arg(data, "container_id")
+    name = (data.get("name") or "").strip()[:200]
+    product_id = _optional_id(data, "product_id")
 
     def _num(key):
         value = data.get(key)
@@ -4696,16 +4765,38 @@ async def api_containers_item_add(request: Request):
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail=f"{key}: не число")
 
+    if product_id is None and name:
+        # «Новый товар» с именем, которое в каталоге уже есть (регистр, пробелы
+        # и ё не в счёт), — это не новый товар, а мимо нажатый поиск. Молча
+        # принять значит завести при приёмке вторую карточку и развести остаток
+        # по двум. Отказ несёт найденные карточки: форма предлагает выбрать.
+        from services import container_receipt
+
+        same = await container_receipt.same_name_products(name)
+        if same:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "needs_choice": True,
+                    "existing": [
+                        {"product_id": int(p["id"]), "name": p["name"], "unit": p.get("unit")}
+                        for p in same[:5]
+                    ],
+                    "detail": f"В каталоге уже есть «{same[0]['name']}» — выберите его",
+                },
+                status_code=409,
+            )
+
     res = await containers.add_item(
         container_id,
-        name=(data.get("name") or "").strip()[:200],
+        name=name,
         expected_qty=_num("expected_qty") or 0,
         arrived_qty=_num("arrived_qty"),
         unit=(data.get("unit") or "шт").strip()[:16],
         note=_machine_text(data, "note", 500),
         # Товар выбран из каталога — приёмка попадёт ровно на эту карточку,
         # без угадывания по названию.
-        product_id=_optional_id(data, "product_id"),
+        product_id=product_id,
     )
     return _machine_response(res)
 
@@ -4808,21 +4899,71 @@ async def api_containers_check(request: Request):
             quantities[int(key)] = value
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="item_id: не число")
+    from services import container_receipt
+
+    resolutions = _container_resolutions(data)
+    # Выбор товара по непривязанным позициям — ДО сохранения количеств и прихода:
+    # отказ выбора (чужая позиция, нет товара) не должен оставлять сохранённый
+    # факт без прихода, а без привязки накладная ушла бы без этих позиций.
+    resolved = await container_receipt.resolve_items(container_id, resolutions)
+    if not resolved.get("ok"):
+        return _machine_response(resolved)
+
+    # Что было до сохранения: откатить факт, если приход за ним не поехал.
+    before = {int(i["id"]): i.get("arrived_qty") for i in await containers.list_items(container_id)}
+    had_invoice = bool((await container_receipt.get_link(container_id)).get("invoice_id"))
 
     res = await containers.set_arrived_quantities(
-        container_id, quantities, user_id=user["id"], full_name=_actor_name(user)
+        container_id, quantities, user_id=user["id"], full_name=_actor_name(user), audit=False
     )
     if not res.get("ok"):
         return _machine_response(res)
+    res["resolved"] = resolved
 
     # Остаток пополняем сразу после сохранения — ради этого приёмку и считают.
-    # Best-effort: сверка уже сохранена, и отказ прихода не должен выглядеть как
-    # «ничего не записалось». Что не прошло — возвращаем текстом, чтобы это
-    # можно было починить, а не узнать через неделю по остаткам.
+    receipt = await container_receipt.receive(container_id, user_id=user["id"])
+    res["receipt"] = receipt
+    if not receipt.get("ok") and (had_invoice or receipt.get("code")):
+        # Переоприходование не прошло (чаще всего товар прежнего прихода уже
+        # отгружен, и отмена накладной увела бы остаток в минус). Раньше ручка
+        # отвечала «ок»: карточка показывала новый факт, остаток стоял по
+        # старому, а причина лежала в поле `receipt`, которое экран не читал.
+        # Факт и остаток обязаны сходиться — возвращаем прежние количества и
+        # отказываем целиком.
+        await containers.set_arrived_quantities(
+            container_id,
+            {item_id: before.get(item_id) for item_id in quantities},
+            user_id=user["id"], full_name=_actor_name(user), audit=False,
+        )
+        reason = str(receipt.get("error") or "приход не проведён")
+        if receipt.get("code") == "insufficient_stock":
+            reason = ("товар из прежнего прихода уже отгружен, и отмена прихода увела бы "
+                      f"остаток в минус ({reason})")
+        detail = f"Сверка не сохранена: {reason}. Количества оставлены прежними."
+        return JSONResponse(
+            {"ok": False, "reverted": True, "receipt": receipt, "detail": detail},
+            status_code=409,
+        )
+    # Первый приход, которому нечего проводить (всё пусто, позиции без карточки
+    # по старому API), — не откат: остаток и не должен был двигаться. Причина —
+    # в `receipt`, экран показывает её отдельным сообщением.
+    await containers.audit_checked(
+        container_id, len(quantities), user_id=user["id"], full_name=_actor_name(user)
+    )
+    return JSONResponse(res)
+
+
+def _container_resolutions(data: dict) -> dict[int, dict]:
+    """`resolve` из тела запроса приёмки: выбор товара по непривязанным позициям."""
     from services import container_receipt
 
-    res["receipt"] = await container_receipt.receive(container_id, user_id=user["id"])
-    return JSONResponse(res)
+    parsed = container_receipt.parse_resolutions(data.get("resolve"))
+    if parsed is None:
+        raise HTTPException(
+            status_code=400,
+            detail="resolve: {item_id: {product_id: N} | {new: true}}",
+        )
+    return parsed
 
 
 @app.post("/api/containers/supplier")
@@ -4866,6 +5007,7 @@ async def api_containers_supply(request: Request):
         rate_limit_max=20,
     )
     container_id = _machine_id_arg(data, "container_id")
+    resolutions = _container_resolutions(data)
     # Двойной тап с одним ключом отдаёт итог первой приёмки, а не переоприходует
     # второй раз (лишняя отменённая накладная в истории). Параллельные приёмки
     # без ключа сериализует сам сервис.
@@ -4874,7 +5016,15 @@ async def api_containers_supply(request: Request):
     if cached is not None:
         return JSONResponse(cached)
     try:
+        # Сначала выбор товара по непривязанным позициям (форма оприходования
+        # показала их человеку), потом приход — иначе они в накладную не попадут.
+        resolved = await container_receipt.resolve_items(container_id, resolutions)
+        if not resolved.get("ok"):
+            await idem.release()
+            return _machine_response(resolved)
         res = await container_receipt.receive(container_id, user_id=user["id"])
+        if resolutions:
+            res["resolved"] = resolved
     except Exception:
         await idem.release()
         raise

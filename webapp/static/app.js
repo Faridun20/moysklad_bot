@@ -1896,10 +1896,21 @@ async function toggleMachinePayment(machineId, paymentId, wasPaid, btn) {
 // рисовать кнопку, на которую ручка ответит 403, значит обещать пользователю
 // действие, которого у него нет.
 function machineActionsHtml(m, card) {
-  const buttons = [`<button class="btn-secondary" data-mact="hours">${icon('gauge')} Моточасы</button>`];
+  const buttons = [];
+  // «Прибыла» — работа приёмки, её делает и менеджер (`can_arrive`, ручка
+  // /api/machines/arrive). Раньше переход «В пути → На складе» был только в
+  // графе руководства, и у менеджера на машине в пути не было ни одной кнопки,
+  // кроме моточасов.
+  const arrive = m.status === 'in_transit' && card.can_arrive;
+  if (arrive) {
+    buttons.push(`<button class="btn-primary" data-mact="arrive">${icon('check')} Прибыла</button>`);
+  }
+  buttons.push(`<button class="btn-secondary" data-mact="hours">${icon('gauge')} Моточасы</button>`);
   if (card.can_manage) {
     buttons.push(`<button class="btn-secondary" data-mact="edit">${icon('edit')} Изменить</button>`);
     for (const opt of card.next_statuses || []) {
+      // Тот же переход, что «Прибыла», — второй кнопкой он был бы дублем.
+      if (arrive && opt.status === 'in_stock') continue;
       buttons.push(
         `<button class="btn-secondary" data-mstatus-to="${escapeHtml(opt.status)}" ` +
         `data-mstatus-label="${escapeHtml(opt.label)}">${escapeHtml(opt.label)}</button>`
@@ -2070,8 +2081,8 @@ function openContainerForm() {
   });
 }
 
-// Живой поиск по номенклатуре под текстовым полем. Отдельной функцией, потому
-// что нужен дважды: при вводе новой позиции и при исправлении уже заведённой.
+// Живой поиск по номенклатуре под текстовым полем: «похожие в каталоге» под
+// названием НОВОГО товара — последний шанс заметить, что он там уже есть.
 // Ходит в нашу номенклатуру (`/api/products/search`) — подсказка дёргается на
 // каждое нажатие, и запрос обязан быть локальным.
 function attachProductSearch(anchor, { onPick }) {
@@ -2097,7 +2108,7 @@ function attachProductSearch(anchor, { onPick }) {
       return;
     }
     if (!rows.length) {
-      list.innerHTML = '<div class="loader">В каталоге не найдено — можно вписать своё название</div>';
+      list.innerHTML = '<div class="c-row"><div class="card-row-sub">Похожих товаров в каталоге нет</div></div>';
       return;
     }
     list.innerHTML = rows.map(p => `
@@ -2163,115 +2174,357 @@ function openContainerEditForm(containerId, container) {
   });
 }
 
-function openContainerItemForm(containerId, arrived) {
-  // Выбранный товар держим здесь, а не в поле формы: в накладной регулярно едет
-  // то, чего в номенклатуре ещё нет, и свободный ввод обязан оставаться
-  // законным — иначе приёмка встаёт до заведения карточки.
+// Выбор товара из каталога — шторкой со списком и поиском, как товар в
+// накладной. Раньше позицию контейнера ВПИСЫВАЛИ, а каталог лишь подсказывал
+// под полем после второй буквы: подсказка выглядела ещё одним полем, её не
+// замечали, и позиция уезжала свободным текстом — с опечаткой, которая при
+// оприходовании становилась второй карточкой товара («менеджер может ошибиться
+// в названии» с площадки). Теперь список виден сразу, сужается по мере ввода
+// (сервер: ё = е, регистр, артикул), у строки — остаток и единица.
+//
+// Список серверный, а не локальный фильтр справочника: каталог в тысячи строк
+// тянуть в WebView ради одной позиции незачем. `onPick(product, {close,
+// showErr})` решает сам, закрывать ли шторку: привязка может получить отказ,
+// и он должен остаться в форме. `onNew(typed)` — «Новый товар» под списком:
+// набранное в поиске уезжает в название.
+function openCatalogPicker({ title, hint, query, selectedId, onPick, newLabel, onNew }) {
   let picked = null;
   const sheet = openMachineSheet({
+    title: title || 'Товар из каталога',
+    hint,
+    fields: [{ key: 'search', label: 'Поиск по каталогу', value: query || '',
+               placeholder: 'Название или артикул' }],
+    submitLabel: 'Выбрать',
+    onSubmit: async (_data, ctx) => {
+      if (!picked) { ctx.showErr('Выберите товар из списка'); return false; }
+      await onPick(picked, ctx);
+      // Закрывает onPick: второй close вернул бы «Назад» экрана поверх формы,
+      // которую он мог открыть следующей.
+      return false;
+    },
+  });
+  const ov = sheet.sheet;
+  const input = ov.querySelector('#ms-f-search');
+  const list = document.createElement('div');
+  list.className = 'c-surface c-surface--list picker-list';
+  input.parentElement.after(list);
+
+  if (onNew) {
+    const add = document.createElement('button');
+    add.type = 'button';
+    add.className = 'btn-secondary picker-add';
+    add.id = 'picker-new-product';
+    add.innerHTML = `${icon('plus')} ${escapeHtml(newLabel || 'Новый товар')}`;
+    list.after(add);
+    add.addEventListener('click', () => {
+      const typed = (input.value || '').trim();
+      sheet.close();
+      onNew(typed);
+    });
+  }
+
+  let seq = 0;
+  const load = async (q, { fallback = false } = {}) => {
+    const my = ++seq;
+    list.innerHTML = loading('Ищу в каталоге…');
+    let rows;
+    try {
+      rows = (await api('/api/products/search', { query: q, browse: true, limit: 50 })).products || [];
+    } catch (e) {
+      if (my === seq) list.innerHTML = `<div class="loader">${escapeHtml(e.message)}</div>`;
+      return;
+    }
+    if (my !== seq) return;   // пока летел ответ, человек допечатал
+    // Название позиции с опечаткой ничего не находит — показываем весь
+    // каталог, а не пустоту: выбирать всё равно из него.
+    if (!rows.length && fallback && q) {
+      await load('');
+      if (seq === my + 1) {
+        list.insertAdjacentHTML('afterbegin',
+          `<div class="loader">По «${escapeHtml(q)}» ничего — показан весь каталог</div>`);
+      }
+      return;
+    }
+    if (!rows.length) {
+      list.innerHTML = `<div class="loader">${q
+        ? `В каталоге не найдено${onNew ? ' — если товар новый, заведите его кнопкой ниже' : ''}`
+        : 'Каталог пуст'}</div>`;
+      return;
+    }
+    const want = picked ? picked.product_id : (selectedId ? Number(selectedId) : null);
+    list.innerHTML = rows.map(p => {
+      const stock = `остаток ${whQty(p.quantity)} ${p.unit || 'шт'}`;
+      const sub = p.sku ? `${stock} · арт. ${p.sku}` : stock;
+      return `
+      <div class="c-row c-row--tap${Number(p.product_id) === want ? ' picked' : ''}"
+           data-product="${Number(p.product_id)}" role="button" tabindex="0">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(p.name || '')}</div>
+          <div class="card-row-sub">${escapeHtml(sub)}</div>
+        </div>
+      </div>`;
+    }).join('');
+    const byId = new Map(rows.map(p => [String(p.product_id), p]));
+    list.querySelectorAll('[data-product]').forEach(row => {
+      row.addEventListener('click', () => {
+        haptic('light');
+        const p = byId.get(row.dataset.product);
+        picked = { product_id: Number(p.product_id), name: p.name, unit: p.unit || 'шт',
+                   quantity: p.quantity };
+        list.querySelectorAll('[data-product]').forEach(r => r.classList.remove('picked'));
+        row.classList.add('picked');
+        sheet.showErr('');
+      });
+    });
+  };
+
+  let timer;
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => load(input.value.trim()), 250);
+  });
+  load((query || '').trim(), { fallback: true });
+  return sheet;
+}
+
+// Позиция контейнера: сначала ТОВАР из каталога, потом количество. Свободный
+// ввод остался — в контейнере регулярно едет то, чего в номенклатуре ещё нет, —
+// но это отдельный явный шаг «Новый товар», а не поведение по умолчанию.
+function openContainerItemForm(containerId, arrived) {
+  openCatalogPicker({
     title: arrived ? 'Позиция сверх заявленного' : 'Позиция в контейнере',
-    hint: arrived
-      ? 'Товар, которого не было в заявленном составе. Начните вводить название — подскажем из каталога.'
-      : 'Начните вводить название — подскажем товар из каталога. Нет такого — впишите своё.',
-    fields: [
-      { key: 'name', label: 'Наименование', required: true },
-      arrived
-        ? { key: 'arrived_qty', label: 'Прибыло', type: 'number', required: true }
-        : { key: 'expected_qty', label: 'Заявлено', type: 'number', required: true },
-      { key: 'unit', label: 'Единица', value: 'шт' },
-    ],
+    hint: 'Выберите товар из каталога. Нет в каталоге — «Новый товар» под списком.',
+    newLabel: 'Новый товар — нет в каталоге',
+    onPick: (product, { close }) => {
+      close();
+      openContainerItemQtyForm(containerId, arrived, { product });
+    },
+    onNew: (typed) => openContainerItemQtyForm(containerId, arrived, { name: typed }),
+  });
+}
+
+// Вторая половина: количество (и для нового товара — название с единицей).
+// `product` — выбран из каталога; иначе новый товар с названием `name`.
+function openContainerItemQtyForm(containerId, arrived, { product = null, name = '', qty = '' } = {}) {
+  const qtyField = arrived
+    ? { key: 'arrived_qty', label: 'Прибыло', type: 'number', required: true, value: qty }
+    : { key: 'expected_qty', label: 'Заявлено', type: 'number', required: true, value: qty };
+  const qtyKey = qtyField.key;
+  const title = arrived ? 'Позиция сверх заявленного' : 'Позиция в контейнере';
+  const fields = product
+    ? [{ ...qtyField, label: `${qtyField.label}, ${product.unit || 'шт'}` }]
+    : [{ key: 'name', label: 'Название нового товара', required: true, value: name },
+       qtyField,
+       { key: 'unit', label: 'Единица', value: 'шт' }];
+  const sheet = openMachineSheet({
+    title,
+    hint: product ? '' : 'Товара нет в каталоге: карточку заведёте при оприходовании. '
+      + 'Если он есть под другим названием — выберите его из подсказок под полем.',
+    fields,
     submitLabel: 'Добавить',
     onSubmit: async (data, { showErr }) => {
-      const res = await apiResult('/api/containers/item_add', {
-        container_id: containerId, ...data,
-        product_id: picked ? picked.product_id : '',
-      });
-      if (!res.ok) { showErr(res.error); return false; }
+      const body = { container_id: containerId, ...data };
+      if (product) {
+        body.product_id = product.product_id;
+        body.name = product.name;
+        body.unit = product.unit || 'шт';
+      }
+      const res = await apiResult('/api/containers/item_add', body);
+      if (!res.ok) {
+        // Такое название в каталоге уже есть: предлагаем карточку, а не
+        // заводим позицию, из которой при приёмке вырос бы дубль.
+        if (res.body && res.body.needs_choice) showExisting(res.body.existing || []);
+        showErr(res.error);
+        return false;
+      }
       haptic('success');
+      toast(product ? 'Позиция добавлена' : 'Новый товар добавлен в состав');
       renderContainerCard(containerId);
       return true;
     },
   });
+  const ov = sheet.sheet;
+  const currentQty = () => (ov.querySelector(`#ms-f-${qtyKey}`)?.value || '').trim();
+  const switchTo = (p) => {
+    sheet.close();
+    openContainerItemQtyForm(containerId, arrived, { product: p, qty: currentQty() });
+  };
 
-  const ov = document.querySelector('.c-overlay');
-  const nameInput = ov?.querySelector('#ms-f-name');
-  const unitInput = ov?.querySelector('#ms-f-unit');
-  if (!nameInput) return;
-  const suggest = attachProductSearch(nameInput.parentElement, {
-    onPick: (p) => {
-      picked = p;
-      nameInput.value = p.name;
-      if (unitInput) unitInput.value = p.unit || 'шт';
-      sheet.showErr('');
-    },
-  });
-  nameInput.addEventListener('input', () => {
-    // Правка названия после выбора отвязывает товар: иначе человек уверен, что
-    // вписал новую позицию, а приход уйдёт на прежнюю карточку.
-    if (picked && nameInput.value.trim() !== picked.name) {
-      picked = null;
-      suggest.clearPicked();
-    }
-    suggest.search(nameInput.value);
-  });
+  if (product) {
+    // Выбранный товар — кнопкой над количеством: ошиблись строкой — выбрать
+    // заново, не закрывая форму вслепую.
+    const box = document.createElement('div');
+    box.className = 'c-field';
+    const have = product.quantity == null ? ''
+      : `<span class="wh-pos-have">остаток ${whQty(product.quantity)} ${escapeHtml(product.unit || 'шт')}</span>`;
+    box.innerHTML = `<span>Товар из каталога</span>
+      <button type="button" class="btn-agent" id="cont-item-product">${escapeHtml(product.name)}${have}</button>`;
+    ov.querySelector('.c-field').before(box);
+    box.querySelector('#cont-item-product').addEventListener('click', () => {
+      sheet.close();
+      openContainerItemForm(containerId, arrived);
+    });
+    return;
+  }
+
+  const nameInput = ov.querySelector('#ms-f-name');
+  const suggest = attachProductSearch(nameInput.parentElement, { onPick: switchTo });
+  nameInput.addEventListener('input', () => suggest.search(nameInput.value));
+  if ((name || '').trim().length >= 2) suggest.now(name);
+
+  function showExisting(rows) {
+    suggest.listEl.innerHTML = `<div class="c-row"><div class="card-row-sub">Уже есть в каталоге — нажмите, чтобы выбрать:</div></div>` +
+      rows.map(p => `
+      <div class="c-row c-row--tap" data-existing="${Number(p.product_id)}" role="button" tabindex="0">
+        <div class="card-row-info"><div class="card-row-title">${escapeHtml(p.name || '')}</div></div>
+        <div class="card-row-value">${escapeHtml(p.unit || 'шт')}</div>
+      </div>`).join('');
+    suggest.listEl.querySelectorAll('[data-existing]').forEach(row => {
+      row.addEventListener('click', () => {
+        haptic('light');
+        const p = rows.find(r => String(r.product_id) === row.dataset.existing);
+        if (p) switchTo({ product_id: Number(p.product_id), name: p.name, unit: p.unit || 'шт' });
+      });
+    });
+  }
 }
 
 // Исправление привязки уже заведённой позиции: выбрать товар из каталога или
 // завести карточку по её названию. Нужно постфактум, потому что состав часто
-// заводят раньше, чем товар появляется в номенклатуре.
+// заводят раньше, чем товар появляется в номенклатуре, и позиции, вписанные
+// текстом до выбора из списка, всё ещё лежат в старых контейнерах.
 function openItemLinkSheet(containerId, item) {
-  let picked = null;
-  const sheet = openMachineSheet({
+  openCatalogPicker({
     title: 'Товар в каталоге',
     hint: item.product_id
-      ? `Сейчас: ${item.product_name || item.name}`
-      : 'Позиция ни с чем не связана — приход по ней не пройдёт',
-    fields: [{ key: 'search', label: 'Поиск по каталогу', value: item.name }],
-    submitLabel: 'Привязать',
-    onSubmit: async (_data, { showErr }) => {
-      if (!picked) { showErr('Выберите товар из списка'); return false; }
+      ? `Позиция «${item.name}» сейчас связана с «${item.product_name || item.name}»`
+      : `Позиция «${item.name}» ни с чем не связана — приход по ней не пройдёт`,
+    query: item.name,
+    selectedId: item.product_id,
+    newLabel: `Завести «${item.name}» в каталоге`,
+    onPick: async (product, { close, showErr }) => {
       const res = await apiResult('/api/containers/item_link', {
-        container_id: containerId, item_id: item.id, product_id: picked.product_id,
+        container_id: containerId, item_id: item.id, product_id: product.product_id,
       });
-      if (!res.ok) { showErr(res.error); return false; }
+      if (!res.ok) { showErr(res.error); return; }
+      close();
       haptic('success');
       toast('Товар привязан');
       renderContainerCard(containerId);
-      return true;
+    },
+    // Карточку заводит ЧЕЛОВЕК кнопкой: автосоздание из приёмки превратило бы
+    // каждую опечатку в новый товар справочника. Тёзку сервис не заводит —
+    // привязывает уже существующую карточку (`existed`).
+    onNew: async () => {
+      const res = await apiResult('/api/containers/item_create_product', {
+        container_id: containerId, item_id: item.id,
+      });
+      if (!res.ok) { tg.showAlert ? tg.showAlert(res.error) : alert(res.error); return; }
+      haptic('success');
+      toast(res.body.existed ? 'Товар уже был в каталоге — привязали' : 'Товар заведён');
+      renderContainerCard(containerId);
     },
   });
+}
 
-  const ov = document.querySelector('.c-overlay');
-  const input = ov?.querySelector('#ms-f-search');
-  if (!input) return;
-  const suggest = attachProductSearch(input.parentElement, {
-    onPick: (p) => { picked = p; sheet.showErr(''); },
+// Позиции, которые уйдут в приход без карточки каталога: есть факт, нет
+// привязки. `qtyOf(item)` — сколько прибыло (из полей сверки или из карточки).
+function unlinkedArrived(items, qtyOf) {
+  return (items || []).filter(it => {
+    if (it.product_id) return false;
+    const q = parseAmount(String(qtyOf(it) ?? ''));
+    return !Number.isNaN(q) && q > 0;
   });
-  input.addEventListener('input', () => {
-    if (picked) { picked = null; suggest.clearPicked(); }
-    suggest.search(input.value);
-  });
-  suggest.now(item.name);
+}
 
-  // Карточку заводит ЧЕЛОВЕК кнопкой: автосоздание из приёмки превратило бы
-  // каждую опечатку в новый товар справочника.
-  const create = document.createElement('button');
-  create.className = 'btn-secondary';
-  create.innerHTML = `${icon('plus')} Завести «${escapeHtml(item.name)}» в каталоге`;
-  suggest.listEl.after(create);
-  create.addEventListener('click', async () => {
-    if (create.disabled) return;
-    create.disabled = true;
-    const res = await apiResult('/api/containers/item_create_product', {
-      container_id: containerId, item_id: item.id,
+// Проверка перед оприходованием: каждая позиция без карточки получает явный
+// выбор — товар из каталога или новая карточка по её названию. Раньше такие
+// позиции молча выпадали из прихода (или ловились по точному имени), и
+// «оприходовано» не означало «всё на складе». Совпадение по названию
+// предвыбрано и видно; без совпадения выбор обязателен — «новым товаром»
+// опечатка не станет сама.
+function openReceiptReview({ items, qtyOf, submitLabel, onConfirm }) {
+  const choice = new Map();
+  for (const it of items) {
+    const m = it.catalog_matches || [];
+    choice.set(String(it.id), m.length === 1
+      ? { product_id: Number(m[0].product_id), name: m[0].name } : null);
+  }
+  const sheet = openMachineSheet({
+    title: 'Товары без карточки',
+    hint: `${plural(items.length, ['позиция не связана', 'позиции не связаны', 'позиций не связаны'])} `
+      + 'с каталогом. Укажите, что это, — иначе они не попадут на склад.',
+    fields: [],
+    submitLabel: submitLabel || 'Оприходовать',
+    onSubmit: async (_data, ctx) => {
+      const missing = items.filter(it => !choice.get(String(it.id)));
+      if (missing.length) {
+        ctx.showErr(`Выберите товар: ${missing.map(it => it.name).join(', ')}`);
+        return false;
+      }
+      const resolve = {};
+      for (const [id, c] of choice) {
+        resolve[id] = c.new ? { new: true } : { product_id: c.product_id };
+      }
+      return onConfirm(resolve, ctx);
+    },
+  });
+  const ov = sheet.sheet;
+  const box = document.createElement('div');
+  box.id = 'receipt-review';
+  ov.querySelector('#ms-error').before(box);
+
+  const draw = () => {
+    box.innerHTML = items.map(it => {
+      const c = choice.get(String(it.id));
+      const qty = `${formatMoney(parseAmount(String(qtyOf(it))))} ${it.unit || 'шт'}`;
+      const where = !c ? 'выберите: товар из каталога или новый'
+        : c.new ? `→ новый товар «${it.name}» в каталоге`
+        : `→ «${c.name}» из каталога`;
+      const matches = it.catalog_matches || [];
+      return `
+      <div class="c-surface c-surface--list">
+        <div class="c-row" data-review="${Number(it.id)}" data-status="${c ? 'approved' : 'pending'}">
+          <div class="card-row-info">
+            <div class="card-row-title">${escapeHtml(it.name)}</div>
+            <div class="card-row-sub">${escapeHtml(qty)} · ${escapeHtml(where)}</div>
+          </div>
+        </div>
+      </div>
+      <div class="c-actions c-actions--wrap">
+        <button type="button" class="btn-secondary" data-review-pick="${Number(it.id)}">${icon('search')} Из каталога</button>
+        ${matches.length ? '' : `<button type="button" class="btn-secondary" data-review-new="${Number(it.id)}">${icon('plus')} Новый товар</button>`}
+      </div>`;
+    }).join('');
+    box.querySelectorAll('[data-review-pick]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const it = items.find(x => String(x.id) === btn.dataset.reviewPick);
+        const c = choice.get(btn.dataset.reviewPick);
+        openCatalogPicker({
+          title: it.name,
+          hint: 'Что это за товар в каталоге?',
+          query: it.name,
+          selectedId: c && c.product_id,
+          onPick: (p, { close }) => {
+            choice.set(String(it.id), { product_id: p.product_id, name: p.name });
+            close();
+            sheet.showErr('');
+            draw();
+          },
+        });
+      });
     });
-    create.disabled = false;
-    if (!res.ok) { sheet.showErr(res.error); return; }
-    haptic('success');
-    toast(res.body.existed ? 'Товар уже был в каталоге — привязали' : 'Товар заведён');
-    sheet.close();
-    renderContainerCard(containerId);
-  });
+    box.querySelectorAll('[data-review-new]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        haptic('light');
+        choice.set(btn.dataset.reviewNew, { new: true });
+        sheet.showErr('');
+        draw();
+      });
+    });
+  };
+  draw();
+  return sheet;
 }
 
 // Строка состава: заявлено → прибыло и расхождение. Пока контейнер в пути,
@@ -2285,7 +2538,11 @@ function containerItemsHtml(items, arrived, canManage) {
     // Про каталог говорим сразу, а не в момент оприходования: непривязанная
     // позиция — это остаток, который не доедет до склада, и узнать об этом
     // лучше пока контейнер грузят, а не когда его уже посчитали.
-    const link = it.product_id ? '' : ' · нет в каталоге';
+    // Совпадение по названию показываем словами: приход уйдёт на ту карточку,
+    // и подтверждают это при оприходовании.
+    const link = it.product_id ? ''
+      : (it.catalog_matches || []).length ? ' · в каталоге по названию, не выбран'
+      : ' · нет в каталоге';
     const sub = (arrived
       ? (it.state === 'unchecked'
           ? `заявлено ${qty} · не сверено`
@@ -2613,24 +2870,58 @@ async function renderContainerCard(containerId) {
   // Ключ — на отрисованную карточку, а не на клик: двойной тап отдаёт итог
   // первой приёмки, а не проводит вторую. Кнопка гаснет до ответа.
   const supplyKey = idemKey();
+  // Итог прихода словами: сколько позиций и сколько карточек завели по пути.
+  const suppliedText = (body) => {
+    const created = ((body.resolved || {}).created || []).length;
+    return [
+      `Оприходовано: ${plural(body.matched, ['позиция', 'позиции', 'позиций'])}`,
+      body.invoice_number || '',
+      created ? `новых товаров в каталоге: ${created}` : '',
+    ].filter(Boolean).join(' · ');
+  };
+  const items = card.items || [];
   content.querySelector('#cont-supply')?.addEventListener('click', async (ev) => {
     const btn = ev.currentTarget;
     if (btn.disabled) return;
-    btn.disabled = true;
-    let res;
-    try {
-      res = await apiResult('/api/containers/supply', {
-        container_id: containerId, idempotency_key: supplyKey,
+    const supply = async (resolve, key) => {
+      btn.disabled = true;
+      try {
+        return await apiResult('/api/containers/supply', {
+          container_id: containerId, idempotency_key: key, resolve,
+        });
+      } finally {
+        btn.disabled = false;
+      }
+    };
+    // Позиции без карточки — сначала выбор, потом приход: иначе они молча
+    // выпали бы из накладной.
+    const pending = unlinkedArrived(items, it => it.arrived_qty);
+    if (pending.length) {
+      // Свой ключ на форму выбора: решение по позициям — часть запроса, и
+      // повтор со старым ключом отдал бы итог прихода без них.
+      const key = idemKey();
+      openReceiptReview({
+        items: pending,
+        qtyOf: it => it.arrived_qty,
+        submitLabel: receipt.invoice_id ? 'Переоприходовать' : 'Оприходовать',
+        onConfirm: async (resolve, { showErr }) => {
+          const res = await supply(resolve, key);
+          if (!res.ok) { showErr(res.error); return false; }
+          haptic('success');
+          toast(suppliedText(res.body));
+          renderContainerCard(containerId);
+          return true;
+        },
       });
-    } finally {
-      btn.disabled = false;
+      return;
     }
+    const res = await supply({}, supplyKey);
     if (!res.ok) {
       tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
       return;
     }
     haptic('success');
-    toast(`Оприходовано: ${plural(res.body.matched, ['позиция', 'позиции', 'позиций'])} · ${res.body.invoice_number || ''}`.trim());
+    toast(suppliedText(res.body));
     renderContainerCard(containerId);
   });
 
@@ -2660,17 +2951,59 @@ async function renderContainerCard(containerId) {
       quantities[el.dataset.item] = el.value.trim();
     });
     if (!Object.keys(quantities).length) return;
-    btn.disabled = true;
-    const res = await apiResult('/api/containers/check', {
-      container_id: containerId, quantities,
-    });
-    btn.disabled = false;
+    const save = async (resolve) => {
+      btn.disabled = true;
+      try {
+        return await apiResult('/api/containers/check', {
+          container_id: containerId, quantities, resolve,
+        });
+      } finally {
+        btn.disabled = false;
+      }
+    };
+    // Сверка сохранена, а приход — нет (первый приход, которому нечего
+    // проводить): говорим это отдельно и красным. Раньше экран писал «Сверка
+    // сохранена», а причина лежала в `receipt`, который никто не читал.
+    // Неудачное ПЕРЕоприходование сервер отвергает целиком (409) — его текст
+    // показывает обычная ветка ошибки.
+    const toastSaved = (body) => {
+      const r = body.receipt || {};
+      if (r.ok === false && !r.legacy) {
+        toast(`Сверка сохранена, на склад не пошло: ${r.error || 'приход не проведён'}`, 'error',
+              { duration: 6000 });
+        return;
+      }
+      const created = ((body.resolved || {}).created || []).length;
+      toast(created ? `Сверка сохранена · новых товаров в каталоге: ${created}` : 'Сверка сохранена');
+    };
+    // Сверка сразу проводит приход — позиции без карточки выбираем ДО него.
+    const qtyOf = it => quantities[String(it.id)] ?? it.arrived_qty;
+    const pending = unlinkedArrived(items, qtyOf);
+    if (pending.length) {
+      openReceiptReview({
+        items: pending,
+        qtyOf,
+        submitLabel: 'Сохранить сверку',
+        onConfirm: async (resolve, { showErr }) => {
+          const res = await save(resolve);
+          if (!res.ok) { showErr(res.error); return false; }
+          haptic('success');
+          toastSaved(res.body);
+          renderContainerCard(containerId);
+          return true;
+        },
+      });
+      return;
+    }
+    const res = await save({});
     if (!res.ok) {
       tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+      // 409 — сервер вернул прежние количества: поля на экране устарели.
+      if (res.status === 409) renderContainerCard(containerId);
       return;
     }
     haptic('success');
-    toast('Сверка сохранена');
+    toastSaved(res.body);
     renderContainerCard(containerId);
   });
 
@@ -2950,6 +3283,7 @@ async function renderMachineCard(machineId) {
     btn.addEventListener('click', () => {
       const act = btn.dataset.mact;
       if (act === 'hours') openHoursForm(m);
+      else if (act === 'arrive') openMachineArriveForm(m);
       else if (act === 'edit') openMachineForm(m);
       else if (act === 'delete') deleteMachine(m);
       else openDealForm(m, act);
@@ -3279,6 +3613,40 @@ function confirmDialog(text) {
       if (tg && tg.showConfirm) { tg.showConfirm(text, ok => resolve(!!ok)); return; }
     } catch { /* вне Telegram */ }
     resolve(typeof confirm === 'function' ? confirm(text) : true);
+  });
+}
+
+// Машина прибыла: статус и, если знают, где она стоит, — одной формой.
+// Локацию спрашиваем именно здесь: в момент прибытия её знают точно, а потом
+// её никто не вписывает.
+function openMachineArriveForm(machine) {
+  const key = idemKey();
+  openMachineSheet({
+    title: 'Машина прибыла',
+    hint: `«${machine.name || machine.vin}» перейдёт из «В пути» в «На складе»`,
+    fields: [{ key: 'location', label: 'Где стоит', value: machine.location || '',
+               placeholder: 'Площадка, склад, адрес', hint: 'Необязательно' }],
+    submitLabel: 'Прибыла',
+    onSubmit: async (data, { showErr }) => {
+      const res = await apiResult('/api/machines/arrive', {
+        machine_id: machine.id, location: data.location, idempotency_key: key,
+      });
+      if (!res.ok) {
+        // 409 — машина уже не в пути (отметил другой, продали): карточка
+        // устарела, перечитываем её, а не держим форму.
+        if (res.status === 409) {
+          tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+          renderMachineCard(machine.id);
+          return true;
+        }
+        showErr(res.error);
+        return false;
+      }
+      haptic('success');
+      toast('Машина на складе');
+      renderMachineCard(machine.id);
+      return true;
+    },
   });
 }
 

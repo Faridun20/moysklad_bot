@@ -279,9 +279,10 @@ def test_container_lifecycle_moves_stock_once(open_app, e2e):
     assert cont["status"] == "in_transit"
     assert cont["number"] == "MSKU123456", "номер нормализован"
 
-    # Позиция: товар выбирается из каталога, а не угадывается по имени.
+    # Позиция: товар выбирается из каталога (список виден сразу), а не
+    # вписывается и не угадывается по имени.
     boss.click("#cont-item-add")
-    boss.wait_for_selector("#ms-f-name")
+    boss.wait_for_selector("#ms-f-search")
     # Что фронт реально отправил: спор «потерял выбор фронт или сервер»
     # решается по телу запроса, а не по догадкам.
     sent: list[dict] = []
@@ -290,10 +291,10 @@ def test_container_lifecycle_moves_stock_once(open_app, e2e):
             if r.url.endswith("/api/containers/item_add") else None)
     boss.on("response", lambda r: got.append(f"{r.status} {r.text()[:200]}")
             if r.url.endswith("/api/containers/item_add") else None)
-    boss.fill("#ms-f-name", "Кабель")  # одно событие input → один запрос подсказки
-    boss.click(f'.c-overlay [data-product="{e2e.ids["product"]}"]')
-    boss.wait_for_selector(f'.c-overlay [data-product="{e2e.ids["product"]}"].picked')
-    boss.wait_for_function("() => document.querySelector('#ms-f-name').value === 'Кабель ВВГ 3x2.5'")
+    boss.click(f'.picker-list [data-product="{e2e.ids["product"]}"]')
+    boss.wait_for_selector(f'.picker-list [data-product="{e2e.ids["product"]}"].picked')
+    boss.click("#ms-submit")
+    boss.wait_for_selector("#cont-item-product:has-text('Кабель ВВГ 3x2.5')")
     boss.fill("#ms-f-expected_qty", "10")
     boss.click("#ms-submit")
     # Ждём СЛЕДСТВИЕ этого действия — строку позиции на карточке, — а не
@@ -391,10 +392,14 @@ def test_machine_from_card_to_installment(open_app, e2e):
     assert e2e.rows("SELECT hours FROM machines")[0]["hours"] == 1400
     assert e2e.rows("SELECT COUNT(*) AS n FROM machine_hours")[0]["n"] == 2
 
-    # На склад → бронь → снять бронь: граф переходов один, подписи зависят от пары.
+    # «Прибыла» (тот же переход графа «В пути → На складе», одной кнопкой с
+    # локацией) → дальше бронь по графу руководства.
     boss.wait_for_function("() => !document.querySelector('.toast')")
-    boss.click('[data-mstatus-to="in_stock"]')
-    boss.wait_for_selector(".toast:has-text('Статус изменён')")
+    assert boss.locator('[data-mstatus-to="in_stock"]').count() == 0, "без дубля «Прибыла»"
+    boss.click('[data-mact="arrive"]')
+    boss.wait_for_selector("#ms-f-location")
+    boss.click("#ms-submit")
+    boss.wait_for_selector(".toast:has-text('Машина на складе')")
     boss.wait_for_selector('[data-mstatus-to="reserved"]')
     assert e2e.rows("SELECT status FROM machines")[0]["status"] == "in_stock"
 
