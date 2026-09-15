@@ -113,6 +113,25 @@ class LiveServer:
     def run(self, coro):
         return run_async(coro)
 
+    def wait_for_push(self, predicate, timeout: float = 5.0) -> list:
+        """Дождаться пуша, отвечающего `predicate(push) -> bool`.
+
+        Уведомление боссу об оплате картой/переводом теперь фоновая задача
+        (utils.background.spawn, webapp/server.py) — сервер уже ответил
+        браузеру, а задача ещё дорабатывает на СВОЁМ (постоянно живущем)
+        loop'е сервера. Короткий пуллинг вместо мгновенной проверки.
+        """
+        import time
+
+        deadline = time.monotonic() + timeout
+        matches: list = []
+        while time.monotonic() < deadline:
+            matches = [p for p in self.pushes if predicate(p)]
+            if matches:
+                return matches
+            time.sleep(0.05)
+        return matches
+
 
 ROLE_IDS = {"admin": 1, "boss": 100, "mgr": 200, "keeper": 400, "book": 500}
 

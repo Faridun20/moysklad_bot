@@ -753,7 +753,7 @@ def test_debt_payment_form_validates_amounts_and_refuses_overpayment(open_app, e
     assert e2e.rows("SELECT amount_cents, currency, status FROM payments") == [
         {"amount_cents": 20000, "currency": "USD", "status": "pending"},
     ]
-    push = [p for p in e2e.pushes if "Требуется подтверждение оплаты" in p["text"]]
+    push = e2e.wait_for_push(lambda p: "Требуется подтверждение оплаты" in p["text"])
     assert push and "закрывает долг полностью" in push[0]["text"]
     assert "на карту 200 USD" in push[0]["text"]
     # Больше вносить нечего: остаток уже заявлен.
@@ -880,7 +880,7 @@ def test_uzs_credit_order_is_paid_in_its_currency_and_converted_in_report(open_a
     pay_form(mgr, f'.btn-pay-debt[data-id="{oid}"]', [("card", "500000")])
     mgr.wait_for_selector(".toast:has-text('записана')")
     assert e2e.rows("SELECT amount_cents, currency FROM payments") == [{"amount_cents": 50_000_000, "currency": "UZS"}]
-    push = [p for p in e2e.pushes if "Требуется подтверждение оплаты" in p["text"]][-1]
+    push = e2e.wait_for_push(lambda p: "Требуется подтверждение оплаты" in p["text"])[-1]
     assert "500 000 UZS" in push["text"] and "≈ <b>100 USD</b>" in push["text"], push["text"]
 
     boss = open_app(e2e.ids["boss"])
@@ -1161,7 +1161,7 @@ def test_end_to_end_credit_order_payments_shrink_debt_and_match_report(open_app,
     card = _norm(_text(mgr, ".debt-awaiting"))
     assert _norm("Оплата 120 USD ждёт подтверждения · после подтверждения долг: 180 USD") in card
     assert "накарту120USD—ждётпроверкибанка" in card and "подтвердит" in card
-    push = [p for p in e2e.pushes if "Требуется подтверждение оплаты" in p["text"]][-1]
+    push = e2e.wait_for_push(lambda p: "Требуется подтверждение оплаты" in p["text"])[-1]
     assert "120 USD" in push["text"] and "Останется к получению: <b>180 USD</b>" in push["text"]
     p1 = e2e.rows("SELECT id FROM payments")[0]["id"]
     assert push["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == f"pay_ok:{p1}"

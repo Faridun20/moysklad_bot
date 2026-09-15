@@ -503,10 +503,19 @@ app.add_middleware(_BodySizeLimitMiddleware, max_bytes=MAX_BODY_BYTES)
 # X-Content-Type-Options/Referrer-Policy — стандартная гигиена. CSP собран под
 # конкретный фронт (index.html + webapp/static/*.js), а не скопирован из
 # шаблона:
-#   * script-src — telegram-web-app.js грузится с telegram.org (единственный
-#     внешний хост, index.html), свои скрипты — 'self'; инлайн-<script> в
-#     проекте нет, unsafe-inline не нужен;
-#   * style-src 'unsafe-inline' — JS-шаблоны (helpers.js/app.js) вставляют
+#   * script-src 'unsafe-inline' — ПРОВЕРЕНО НА ЖИВОМ E2E: без него ломаются
+#     все `onclick="…"` (и прочие on*=) в разметке, которую JS-шаблоны
+#     (app.js/helpers.js) вставляют через innerHTML — их в проекте сотни, это
+#     основной способ навешивать обработчики на сгенерированные карточки.
+#     CSP считает атрибут-обработчик «инлайн-скриптом» наравне с <script>, и
+#     без unsafe-inline браузер молча глотает клик — ни ошибки, ни исключения,
+#     только предупреждение в консоли (нашлось на test_hanging_request_ends_
+#     with_retry_instead_of_endless_spinner: «Повторить» переставал работать).
+#     Настоящий инлайн-<script> в проекте действительно не используется — но
+#     unsafe-inline тут защищает не от него, а от чужого <script src=…> с
+#     произвольного хоста, что и остаётся главной целью script-src;
+#     telegram-web-app.js — единственный внешний хост, свои скрипты — 'self';
+#   * style-src 'unsafe-inline' — та же причина: JS-шаблоны вставляют
 #     `style="…"` в innerHTML (не статичная разметка, но те же правила CSP);
 #   * img-src data:/blob: — превью фото (canvas.toDataURL перед base64-
 #     загрузкой) и просмотр фото техники (URL.createObjectURL — файл идёт
@@ -518,7 +527,7 @@ app.add_middleware(_BodySizeLimitMiddleware, max_bytes=MAX_BODY_BYTES)
 #     разрешённых хостов вместо «вообще никому».
 _CSP = (
     b"default-src 'self'; "
-    b"script-src 'self' https://telegram.org; "
+    b"script-src 'self' 'unsafe-inline' https://telegram.org; "
     b"style-src 'self' 'unsafe-inline'; "
     b"img-src 'self' data: blob:; "
     b"font-src 'self'; "

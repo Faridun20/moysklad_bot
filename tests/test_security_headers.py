@@ -11,6 +11,16 @@ data:/blob:`.
 WebApp в iframe, DENY сломал бы вход целиком. Изоляция от постороннего
 встраивания — через CSP `frame-ancestors` (заменяет X-Frame-Options и
 позволяет точечно разрешить нужные хосты).
+
+`script-src` тоже с `'unsafe-inline'` — без него молча отваливаются все
+`onclick="…"` в разметке, которую те же шаблоны вставляют через innerHTML
+(их сотни): CSP расценивает атрибут-обработчик как инлайн-скрипт наравне с
+`<script>`, а браузер просто не выполняет клик, без ошибки в JS. Поймано
+живым e2e (test_hanging_request_ends_with_retry_instead_of_endless_spinner:
+кнопка «Повторить» переставала работать), не юнитом на сам заголовок —
+дальше в файле только это и добавили как отдельную проверку.
+Настоящего инлайн-<script> в проекте нет — unsafe-inline здесь не открывает
+внедрение постороннего <script src=…>, script-src по-прежнему это блокирует.
 """
 
 from __future__ import annotations
@@ -58,6 +68,16 @@ def test_index_page_csp_allows_telegram_script_and_frame_embedding(client):
     assert "https://*.telegram.org" in csp
     # frame-ancestors — НЕ x-frame-options: страница по-прежнему встраиваема.
     assert "'none'" not in csp.split("frame-ancestors", 1)[1].split(";", 1)[0]
+
+
+def test_csp_allows_inline_onclick_handlers_injected_by_frontend_js(client):
+    """helpers.js/app.js вставляют `onclick="…"` в innerHTML (JS-шаблоны) —
+    без 'unsafe-inline' в script-src такие обработчики не выполнялись бы:
+    браузер молча глотает клик, без исключения (см. докстринг файла)."""
+    r = client.get("/")
+    csp = _headers(r).get("content-security-policy", "")
+    script_src = next((d for d in csp.split(";") if d.strip().startswith("script-src")), "")
+    assert "'unsafe-inline'" in script_src
 
 
 def test_csp_allows_inline_styles_injected_by_frontend_js(client):

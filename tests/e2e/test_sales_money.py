@@ -137,7 +137,7 @@ def test_manager_marks_paid_and_boss_confirms(open_app, e2e):
 
     pays = e2e.rows("SELECT amount_cents, status FROM payments WHERE order_id = ?", (oid,))
     assert pays == [{"amount_cents": 15000, "status": "pending"}]
-    assert any("оплат" in p["text"].lower() for p in e2e.pushes), "боссу ушёл пуш об оплате"
+    assert e2e.wait_for_push(lambda p: "оплат" in p["text"].lower()), "боссу ушёл пуш об оплате"
 
     # Кредитный долг босс подтверждает там же, где он виден, — в «Долгах».
     boss = open_app(e2e.ids["boss"])
