@@ -243,6 +243,51 @@ def debts_api_matches_money(w) -> None:
             assert oid in api, f"заказ #{oid} ({o['status']}) должен {o['remaining']} коп., но его нет в «Долгах»"
 
 
+def supplier_money_is_consistent(db) -> None:
+    """Расчёты с поставщиками не путаются с деньгами клиентов.
+
+    Три свойства, из-за которых кредиторка врала бы молча:
+    (1) выплата поставщику НИКОГДА не лежит в `payments` — там деньги ОТ
+        клиентов, и на них считается вся дебиторка (одна такая строка уменьшила
+        бы долг клиента на сумму, выплаченную поставщику);
+    (2) у выплаты есть поставщик и сумма больше нуля — «кому и сколько» это и
+        есть весь платёж;
+    (3) выплата, привязанная к приходу, не больше суммы этого прихода: сверх
+        неё — это аванс, и он вносится выплатой БЕЗ привязки.
+    """
+    parts = {int(p["payment_id"]): p for p in _rows(
+        db, "SELECT payment_id, debt_currency, debt_amount_cents FROM supplier_payment_parts")}
+    per_invoice: dict[int, int] = {}
+    for p in _rows(db, "SELECT id, counterparty_id, invoice_id, currency, amount_cents "
+                       "FROM supplier_payments"):
+        assert p["counterparty_id"] is not None, f"выплата #{p['id']} без поставщика"
+        assert int(p["amount_cents"]) > 0, f"выплата #{p['id']} на {p['amount_cents']} коп."
+        part = parts.get(int(p["id"]))
+        cur = str((part or {}).get("debt_currency") or p["currency"]).upper()
+        cents = int((part or {}).get("debt_amount_cents") or p["amount_cents"])
+        if p["invoice_id"] is None:
+            continue
+        inv = _rows(db, "SELECT currency, total_amount_cents FROM invoices WHERE id = ?",
+                    (p["invoice_id"],))
+        assert inv, f"выплата #{p['id']} ссылается на несуществующий приход"
+        if str(inv[0]["currency"] or "").upper() == cur:
+            per_invoice[int(p["invoice_id"])] = per_invoice.get(int(p["invoice_id"]), 0) + cents
+
+    for inv_id, paid in per_invoice.items():
+        total = int(_rows(db, "SELECT total_amount_cents FROM invoices WHERE id = ?",
+                          (inv_id,))[0]["total_amount_cents"] or 0)
+        # Допуск в 1 единицу базовой валюты — на округление пересчёта строки в
+        # другой валюте (`order_payments.tolerance_cents`).
+        assert paid <= total + 100, (
+            f"по приходу #{inv_id} выплачено {paid} коп. при сумме {total} коп."
+        )
+
+    for p in _rows(db, "SELECT id, comment FROM payments"):
+        assert "поставщик" not in str(p["comment"] or "").lower(), (
+            f"платёж #{p['id']} клиента выглядит выплатой поставщику: {p['comment']!r}"
+        )
+
+
 def audit_is_written(db) -> None:
     rows = _rows(db, "SELECT user_id, action FROM audit_log")
     assert rows, "аудит пуст: ни одно действие сценария не записано"
@@ -267,6 +312,7 @@ def check_all(w, *, error_records: list[logging.LogRecord] | None = None) -> Non
     payment_breakdown_is_consistent(w.db)
     orders_follow_their_status(w.db)
     debts_api_matches_money(w)
+    supplier_money_is_consistent(w.db)
     if w.wrote_something():
         audit_is_written(w.db)
     no_server_errors(w, error_records or [])

@@ -25,13 +25,13 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 164._
+_Всего эндпоинтов: 167._
 
 
 > **Временное совмещение ролей** (`services/roles.py::ROLE_ALSO_ACTS_AS`): `manager` = + `warehouse_keeper`, `bookkeeper`. Кладовщика и бухгалтера в штате пока нет, их работу делает менеджер; списки ниже уже учитывают это. Роли `warehouse_keeper`/`bookkeeper` через `/addrole` не назначаются. `*` в таблице экранов — доступ через совмещение.
 
 
-### Админ (`admin`) — 143 эндпоинтов
+### Админ (`admin`) — 146 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -167,6 +167,9 @@ _Всего эндпоинтов: 164._
 - `/api/search`
 - `/api/settings/delete_requires_boss`
 - `/api/stock`
+- `/api/suppliers/debts`
+- `/api/suppliers/payment`
+- `/api/suppliers/terms`
 - `/api/today`
 - `/api/users/deactivate`
 - `/api/wh/counterparties`
@@ -182,7 +185,7 @@ _Всего эндпоинтов: 164._
 </details>
 
 
-### Руководитель (`boss`) — 140 эндпоинтов
+### Руководитель (`boss`) — 143 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -316,6 +319,9 @@ _Всего эндпоинтов: 164._
 - `/api/search`
 - `/api/settings/delete_requires_boss`
 - `/api/stock`
+- `/api/suppliers/debts`
+- `/api/suppliers/payment`
+- `/api/suppliers/terms`
 - `/api/today`
 - `/api/wh/counterparties`
 - `/api/wh/counterparties/create`
@@ -509,6 +515,7 @@ _Всего эндпоинтов: 164._
 | Каталог/Склад | admin, boss, manager, warehouse_keeper | `/api/stock` |
 | Деньги → Подтвердить | admin, boss, bookkeeper, manager* | `/api/deposits/pending` |
 | Финансы → Долги | admin, boss, manager | `/api/debts` |
+| Деньги → Поставщикам («мы должны») | admin, boss | `/api/suppliers/debts` |
 | Финансы → Клиенты | admin, boss | `/api/clients/overview` |
 | Курсы валют | admin, boss (правка) | `/api/currency/rates` |
 | Аналитика | admin, boss, manager | `/api/analytics` |

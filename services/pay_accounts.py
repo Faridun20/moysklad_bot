@@ -182,6 +182,23 @@ def display_name(a: dict) -> str:
     return f"{head} · …{tail}" if tail else head
 
 
+def _account_body(kind: str | None, a: dict) -> str:
+    """Сама запись без предлога: «•••• 1234 (Фаридун М.)» / «ООО … (…6789)».
+
+    Один текст на оба направления денег: «на карту …» у поступления и
+    «с карты …» у выплаты поставщику обязаны называть карту одинаково —
+    иначе один и тот же счёт в двух лентах читается как два разных.
+    """
+    holder = (a.get("holder") or "").strip()
+    if kind == "card":
+        if a.get("card_last4"):
+            return f"•••• {a['card_last4']}" + (f" ({holder})" if holder else "")
+        return f"«{a.get('name') or holder or '—'}»"
+    tail = _tail(a.get("account_number"))
+    who = holder or (a.get("bank") or "") or (a.get("name") or "—")
+    return who + (f" (…{tail})" if tail else "")
+
+
 def destination_label(kind: str | None, a: dict | None) -> str | None:
     """«на карту •••• 1234 (Фаридун М.)» / «на счёт ООО Farid Impeks (…6789)».
 
@@ -191,14 +208,20 @@ def destination_label(kind: str | None, a: dict | None) -> str | None:
     if not a:
         return None
     kind = a.get("kind") or kind
-    holder = (a.get("holder") or "").strip()
-    if kind == "card":
-        if a.get("card_last4"):
-            return f"на карту •••• {a['card_last4']}" + (f" ({holder})" if holder else "")
-        return f"на карту «{a.get('name') or holder or '—'}»"
-    tail = _tail(a.get("account_number"))
-    who = holder or (a.get("bank") or "") or (a.get("name") or "—")
-    return f"на счёт {who}" + (f" (…{tail})" if tail else "")
+    return ("на карту " if kind == "card" else "на счёт ") + _account_body(kind, a)
+
+
+def source_label(kind: str | None, a: dict | None) -> str | None:
+    """«с карты •••• 1234 (Фаридун М.)» / «со счёта ООО Farid Impeks (…6789)».
+
+    Деньги, ушедшие поставщику: та же запись справочника, другой предлог.
+    Отдельная функция, а не флаг у `destination_label`, — чтобы вызывающий не
+    мог случайно подписать выплату как поступление.
+    """
+    if not a:
+        return None
+    kind = a.get("kind") or kind
+    return ("с карты " if kind == "card" else "со счёта ") + _account_body(kind, a)
 
 
 def from_prefixed(row: dict) -> dict | None:
@@ -309,6 +332,13 @@ async def last_used(user_id: int, conn: Any = None) -> dict[str, int | None]:
         "WHERE r.received_by = $1 AND a.archived_at IS NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 40",
         int(user_id),
     )]
+    rows += [dict(r) for r in await db.fetch(
+        "SELECT a.kind, spp.account_id, spp.created_at AS at FROM supplier_payment_parts spp "
+        "JOIN acc_accounts a ON a.id = spp.account_id "
+        "WHERE spp.created_by = $1 AND a.archived_at IS NULL "
+        "ORDER BY spp.created_at DESC, spp.payment_id DESC LIMIT 40",
+        int(user_id),
+    )]
     rows.sort(key=lambda r: str(r.get("at") or ""), reverse=True)
     out: dict[str, int | None] = {k: None for k in KINDS}
     for r in rows:
@@ -322,6 +352,9 @@ async def usage_count(account_id: int, conn: Any = None) -> int:
     n = await db.fetchval(
         "SELECT (SELECT COUNT(*) FROM payment_part_accounts WHERE account_id = $1) + "
         "(SELECT COUNT(*) FROM machine_receipt_accounts WHERE account_id = $1) + "
+        # Выплаты поставщикам — те же деньги на том же счёте: без них хвост
+        # карты, с которой платили полгода, «переехал» бы на другую карту.
+        "(SELECT COUNT(*) FROM supplier_payment_parts WHERE account_id = $1) + "
         "(SELECT COUNT(*) FROM acc_entries WHERE account_id = $1)",
         int(account_id),
     )

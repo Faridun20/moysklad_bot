@@ -146,6 +146,61 @@ def test_manager_sees_his_own_overdue_not_everyones(isolated_db):
     assert boss_n == 2
 
 
+def _overdue_supplier_invoice(db, day="2020-01-01"):
+    """Приход от поставщика с суммой и давно прошедшей датой — долг перед ним."""
+    from services import warehouse
+
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("INSERT INTO counterparties (name, type, created_at) VALUES (?, ?, ?)"),
+                    ("Shandong Machinery", "supplier", db.now_str()))
+        cur.execute(db.q("INSERT INTO products (name, unit, created_at) VALUES (?, ?, ?)"),
+                    ("Гидронасос", "шт", db.now_str()))
+        conn.commit()
+        cur.execute(db.q("SELECT MAX(id) AS id FROM counterparties"))
+        sup = int(cur.fetchone()["id"])
+        cur.execute(db.q("SELECT MAX(id) AS id FROM products"))
+        pid = int(cur.fetchone()["id"])
+    res = _run(warehouse.create_invoice(
+        invoice_type="incoming", warehouse_id=_run(warehouse.default_warehouse_id()),
+        counterparty_id=sup, items=[{"product_id": pid, "quantity": 1, "price_cents": 100_000}],
+        invoice_date=day, created_by=2,
+    ))
+    assert res["ok"], res
+    return int(res["invoice_id"])
+
+
+def test_overdue_supplier_debt_is_a_boss_item(isolated_db):
+    """Долг ПЕРЕД поставщиком просрочен так же, как долг клиента, — и стоит
+    рядом с ним. Менеджеру пункт не показываем: ручка ответит ему 403."""
+    from services import work_queue
+
+    db = isolated_db
+    _setup(db)
+    _overdue_supplier_invoice(db)
+
+    boss = _run(work_queue.gather(2, "boss"))
+    item = next(i for i in boss if i["key"] == "supplier_debts")
+    assert item["count"] == 1 and item["severity"] == "crit"
+    assert item["screen"] == "money:suppliers"
+
+    mgr_keys = [i["key"] for i in _run(work_queue.gather(1, "manager"))]
+    assert "supplier_debts" not in mgr_keys
+
+
+def test_paid_supplier_invoice_leaves_the_queue(isolated_db):
+    from services import supplier_debts, work_queue
+    from services.order_payments import Actor
+
+    db = isolated_db
+    _setup(db)
+    inv = _overdue_supplier_invoice(db)
+    _run(supplier_debts.set_terms(Actor(2, "Boss", "boss"), inv, "paid"))
+
+    keys = [i["key"] for i in _run(work_queue.gather(2, "boss"))]
+    assert "supplier_debts" not in keys
+
+
 def test_unchecked_container_counts_once_per_container(isolated_db):
     """Три непосчитанные позиции в одном контейнере — это один контейнер."""
     from services import containers, work_queue

@@ -422,3 +422,56 @@ def machine_receipt(w: World, uid: int, deal_id: int, amount: float, *, expect: 
 def unreserve_machine(w: World, uid: int, machine_id: int, *, expect: int = 200) -> dict:
     return w.call(uid, "/api/machines/unreserve", expect=expect, machine_id=machine_id,
                   idempotency_key=key())
+
+
+# ─── Расчёты с поставщиками ──────────────────────────────────────────────────
+
+
+def container_supplier(w: World, uid: int, container_id: int, supplier_id: int,
+                       name: str, *, expect: int = 200) -> dict:
+    return w.call(uid, "/api/containers/supplier", expect=expect, container_id=container_id,
+                  supplier_id=supplier_id, supplier_name=name)
+
+
+def costing_enabled(w: World, uid: int, on: bool = True) -> dict:
+    """Учёт себестоимости: без него закупочная цена в приход не уезжает, и долг
+    перед поставщиком по контейнеру считать не из чего."""
+    return w.call(uid, "/api/costing/settings/set", enabled=on)
+
+
+def container_prices(w: World, uid: int, container_id: int, prices: dict[int, float], *,
+                     currency: str = "USD", uzs_per_usd: str = "12700",
+                     expect: int = 200) -> dict:
+    """«Закупка и себестоимость» на карточке контейнера — цена за единицу."""
+    return w.call(uid, "/api/costing/container/save", expect=expect, container_id=container_id,
+                  currency=currency, uzs_per_usd=uzs_per_usd, rate_source="manual",
+                  prices={str(k): str(v) for k, v in prices.items()})
+
+
+def supplier_debts(w: World, uid: int, *, expect: int = 200) -> dict:
+    return w.call(uid, "/api/suppliers/debts", expect=expect)
+
+
+def supplier_terms(w: World, uid: int, invoice_id: int, payment_type: str = "credit",
+                   due_date: str | None = None, *, expect: int = 200) -> dict:
+    return w.call(uid, "/api/suppliers/terms", expect=expect, invoice_id=invoice_id,
+                  payment_type=payment_type, due_date=due_date)
+
+
+def supplier_payment(w: World, uid: int, supplier_id: int, amount: float, *,
+                     invoice_id: int | None = None, method: str = "bank",
+                     currency: str = "USD", rate: str | None = None,
+                     account_id: int | None = None, expect: int = 200) -> dict:
+    """Выплата поставщику той же формой, что и на экране: одна строка «как
+    заплатили». Карта и перечисление указывают счёт, С КОТОРОГО ушли деньги."""
+    row: dict[str, Any] = {"method": method, "currency": currency, "amount": amount}
+    if method in ("card", "bank"):
+        row["account_id"] = account_id or receiving_account(w, uid, method)
+    if rate:
+        row["rate"] = rate
+    body: dict[str, Any] = {"supplier_id": supplier_id, "parts": [row], "idempotency_key": key()}
+    if invoice_id:
+        body["invoice_id"] = invoice_id
+    else:
+        body["currency"] = currency
+    return w.call(uid, "/api/suppliers/payment", expect=expect, **body)
