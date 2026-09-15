@@ -716,7 +716,9 @@ async def approve_shipment_request(
     # Атомарный UPDATE ... WHERE status='pending' — защита от race condition,
     # когда два босса одновременно жмут «Одобрить». Только один из них
     # получит rowcount==1, остальные — False.
-    decision = await adb.approve_shipment_request(req_id, boss_user_id, boss_name)
+    decision = await adb.approve_shipment_request(
+        req_id, boss_user_id, boss_name, credit_override=bool(override and over_info)
+    )
     if not decision.applied:
         return {
             "ok": False,
@@ -731,9 +733,9 @@ async def approve_shipment_request(
         adb.get_order(req["order_id"]),
         adb.get_role(boss_user_id),
     )
-    # Одобрено с превышением лимита → фиксируем override + аудит.
+    # Одобрено с превышением лимита: отметку override поставило само одобрение
+    # (тем же UPDATE'ом заказа), здесь — только аудит.
     if override and over_info:
-        await adb.set_order_credit_override(req["order_id"], boss_user_id)
         await adb.add_audit_log(
             boss_user_id,
             boss_name,
@@ -879,47 +881,26 @@ async def approve_shipment_request(
 
     # Для paid-заказов автоматически создаём payment-pending,
     # чтобы босс одной кнопкой зафиксировал реальное получение денег.
+    # Проверка «денег по заказу ещё не заявляли» и вставка — под замком заказа
+    # в одной транзакции (create_approval_auto_payment): параллельная отметка
+    # оплаты менеджером больше не складывается с автоплатежом.
     if order and not order_moved and (order.get("payment_type") or "paid") == "paid":
-        # Сумма — в копейках, построчно через mul_qty: ровно так её считает
-        # закрытие заказа (get_order_payment_summary). Float-сумма дробных
-        # количеств расходилась с ней на копейку (2 × 1,5 × 0,33 = 0,99 против
-        # 1,00), платёж «на всю сумму» оставлял долг 0,01, и заказ не закрывался.
-        total_cents = money.add(
-            *(money.mul_qty(int(it.get("price_cents") or 0), it.get("quantity") or 0) for it in items)
-        )
-        if total_cents > 0:
-            total_major = money.from_cents(total_cents)
-            currency = order.get("currency") or "USD"
-            try:
-                existing = [
-                    p
-                    for p in await adb.get_payments_for_order(order["id"])
-                    if p["status"] in ("pending", "confirmed")
-                ]
-                if not existing:
-                    payment_id = await adb.add_payment(
-                        user_id=order["user_id"],
-                        username="",
-                        full_name=manager_name,
-                        amount=total_major,
-                        currency=currency,
-                        comment=f"Оплата по заказу #{order['id']} (отгрузка одобрена)",
-                        order_id=order["id"],
-                    )
-                    if bot is not None:
-                        from services.notify import notify_payment_confirmation_needed
+        try:
+            payment_id = await adb.create_approval_auto_payment(order["id"], manager_name)
+            if payment_id and bot is not None:
+                from services.notify import notify_payment_confirmation_needed
 
-                        await notify_payment_confirmation_needed(
-                            bot,
-                            order["id"],
-                            manager_name,
-                            payment_id,
-                        )
-            except Exception:
-                logger.exception(
-                    "Не удалось создать auto-payment для paid-заказа #%s",
+                await notify_payment_confirmation_needed(
+                    bot,
                     order["id"],
+                    manager_name,
+                    payment_id,
                 )
+        except Exception:
+            logger.exception(
+                "Не удалось создать auto-payment для paid-заказа #%s",
+                order["id"],
+            )
 
     return {
         "ok": True,

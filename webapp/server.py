@@ -13,6 +13,7 @@ import os
 import re
 import time
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -67,25 +68,54 @@ class _Idem:
     store), поднимаем 409: безопаснее отказать, чем рискнуть дублем денег.
 
     Без ключа от клиента все методы — no-op, поведение как раньше.
+
+    `atomic=True` — операция сама пишет результат в ключ своей транзакцией
+    (`database.idem_store_in`, ей передаётся `idem.key`). Тогда ключ без
+    результата старше `IDEM_RECLAIM_AFTER_S` значит «не закоммитилось», и ретрай
+    его переиспользует, а не получает 409 сутки.
     """
 
-    __slots__ = ("_adb", "_key", "_op", "_uid")
+    __slots__ = ("_adb", "_atomic", "_key", "_op", "_uid")
 
-    def __init__(self, adb, operation: str, user_id: int, raw_key):
+    def __init__(self, adb, operation: str, user_id: int, raw_key, *, atomic: bool = False):
         capped = _cap_idem_key(raw_key)
         self._adb = adb
         self._op = operation
         self._uid = user_id
+        self._atomic = atomic
         self._key = f"{operation}:{user_id}:{capped}" if capped else None
 
     @property
     def active(self) -> bool:
         return self._key is not None
 
+    @property
+    def key(self) -> str | None:
+        return self._key
+
+    @asynccontextmanager
+    async def released_on_reject(self):
+        """Отказ ручки (HTTPException) до операции освобождает ключ.
+
+        Проверки между claim и операцией (заказ не найден, чужой заказ, неверная
+        сумма) бросали 4xx, не освободив ключ: ретрай с тем же ключом после
+        исправления сутки получал «Запрос уже обрабатывается», хотя не было
+        сделано ничего."""
+        try:
+            yield
+        except HTTPException:
+            await self.release()
+            raise
+
     async def claim(self) -> dict | None:
         if not self._key:
             return None
-        prev = await self._adb.idem_claim(self._key, self._op, self._uid)
+        from services.database import IDEM_RECLAIM_AFTER_S
+
+        prev = await self._adb.idem_claim(
+            self._key, self._op, self._uid,
+            reclaim_after_s=IDEM_RECLAIM_AFTER_S if self._atomic else None,
+        )
         if prev is None:
             return None  # ключ наш
         if prev:
@@ -5038,25 +5068,20 @@ async def api_deposits_create(request: Request):
     # двойной POST (ретрай клиента после рестарта webapp/мультиворкер) создаёт две
     # сдачи. idem_claim атомарно столбит ключ в общей БД (in-mem кэш не переживал
     # рестарт). Если ключ уже был — отдаём сохранённый результат, не повторяем.
-    idem_key = _cap_idem_key(data.get("idempotency_key"))
-    full_key = f"deposit_create:{user['id']}:{idem_key}" if idem_key else None
-    if full_key:
-        prev = await adb.idem_claim(full_key, "deposit_create", user["id"])
-        if prev is not None:
-            if prev.get("deposit_id"):
-                return JSONResponse(prev)
-            # Ключ занят, но результата нет (операция в полёте/упала до store) —
-            # безопаснее отказать, чем рискнуть дублем.
-            raise HTTPException(status_code=409, detail="Запрос уже обрабатывается")
+    # Ключ занят, но результата нет (операция в полёте) — 409: безопаснее
+    # отказать, чем рискнуть дублем. Результат пишет сама сдача в своей
+    # транзакции (atomic), поэтому брошенный ключ переиспользуется.
+    idem = _Idem(adb, "deposit_create", user["id"], data.get("idempotency_key"), atomic=True)
+    prev = await idem.claim()
+    if prev is not None:
+        return JSONResponse(prev)
     try:
-        res = await adb.create_cash_deposit(user["id"], amount)
+        res = await adb.create_cash_deposit(user["id"], amount, idem_key=idem.key)
     except Exception:
-        if full_key:
-            await adb.idem_release(full_key)  # упало до store — освободить ретраю
+        await idem.release()  # упало до коммита — освободить ретраю
         raise
     if not res.get("ok"):
-        if full_key:
-            await adb.idem_release(full_key)
+        await idem.release()
         raise HTTPException(status_code=400, detail=res.get("error", "не удалось создать сдачу"))
 
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
@@ -5071,8 +5096,7 @@ async def api_deposits_create(request: Request):
     except Exception:
         logger.warning("deposit create notify failed", exc_info=True)
     resp = {"ok": True, "deposit_id": res["deposit_id"]}
-    if full_key:
-        await adb.idem_store(full_key, resp)
+    await idem.store(resp)
     return JSONResponse(resp)
 
 
@@ -5276,97 +5300,87 @@ async def api_returns_create(request: Request):
         raise HTTPException(status_code=400, detail="Некорректный способ возврата денег")
 
     # R2: DB-уровневая идемпотентность (двойной POST создавал два возврата —
-    # двойной refund/занижение долга). idem_claim столбит ключ в общей БД.
-    idem_key = _cap_idem_key(data.get("idempotency_key"))
-    full_key = f"return_create:{user['id']}:{idem_key}" if idem_key else None
-    if full_key:
-        prev = await adb.idem_claim(full_key, "return_create", user["id"])
-        if prev is not None:
-            if prev.get("return_id"):
-                return JSONResponse(prev)
-            raise HTTPException(status_code=409, detail="Запрос уже обрабатывается")
+    # двойной refund/занижение долга). Ключ столбится в общей БД, результат
+    # пишет сам возврат в своей транзакции (atomic). Любой отказ проверок ниже
+    # освобождает ключ (released_on_reject) — раньше 404/403/409 оставляли его
+    # занятым на сутки.
+    idem = _Idem(adb, "return_create", user["id"], data.get("idempotency_key"), atomic=True)
+    prev = await idem.claim()
+    if prev is not None:
+        return JSONResponse(prev)
 
-    order = await adb.get_order(order_id)
-    if not order:
-        raise HTTPException(status_code=404, detail="Заказ не найден")
-    # Отгружен/оплачен/частично-возвращён ИЛИ оплачен по легаси (paid_confirmed_at).
-    if order.get("status") not in ("shipped", "paid", "partially_returned") and not order.get(
-        "paid_confirmed_at"
-    ):
-        raise HTTPException(
-            status_code=409, detail="Возврат доступен только для отгруженных/оплаченных"
-        )
-    # H2: менеджер вправе вернуть только свой заказ; начальство/склад — любой.
-    # Сознательно `in`, а не role_allowed: совмещение ролей (менеджер замещает
-    # кладовщика) НЕ снимает H2 — возврат чужого заказа двигает чужой долг, и
-    # принимать товар за кладовщика для этого не нужно.
-    privileged = get_role(user["id"]) in ("admin", "boss", "warehouse_keeper")
-    if not privileged and order.get("user_id") != user["id"]:
-        raise HTTPException(status_code=403, detail="Возврат только по своим заказам")
+    async with idem.released_on_reject():
+        order = await adb.get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="Заказ не найден")
+        # Отгружен/оплачен/частично-возвращён ИЛИ оплачен по легаси (paid_confirmed_at).
+        if order.get("status") not in ("shipped", "paid", "partially_returned") and not order.get(
+            "paid_confirmed_at"
+        ):
+            raise HTTPException(
+                status_code=409, detail="Возврат доступен только для отгруженных/оплаченных"
+            )
+        # H2: менеджер вправе вернуть только свой заказ; начальство/склад — любой.
+        # Сознательно `in`, а не role_allowed: совмещение ролей (менеджер замещает
+        # кладовщика) НЕ снимает H2 — возврат чужого заказа двигает чужой долг, и
+        # принимать товар за кладовщика для этого не нужно.
+        privileged = get_role(user["id"]) in ("admin", "boss", "warehouse_keeper")
+        if not privileged and order.get("user_id") != user["id"]:
+            raise HTTPException(status_code=403, detail="Возврат только по своим заказам")
 
-    # T3.1: частичный возврат. Раньше эндпоинт жёстко слал "full" и возвращал
-    # ВСЕ позиции целиком — частичный возврат существовал только в боте
-    # (§5.2.6). Теперь фронт может прислать items: [{item_id, quantity}].
-    #
-    # Доступное к возврату = quantity − returned_qty (как в боте): позиция,
-    # уже возвращённая прошлым возвратом, второй раз не отдаётся.
-    items = await adb.get_order_items(order_id)
-    avail_by_id = {
-        it["id"]: float(it.get("quantity", 0) or 0) - float(it.get("returned_qty", 0) or 0)
-        for it in items
-    }
-    price_by_id = {it["id"]: float(it.get("price", 0) or 0) for it in items}
-    returnable = {iid: a for iid, a in avail_by_id.items() if a > 0}
-    if not returnable:
-        if full_key:
-            await adb.idem_release(full_key)
-        raise HTTPException(status_code=409, detail="Нет позиций, доступных к возврату")
+        # T3.1: частичный возврат. Раньше эндпоинт жёстко слал "full" и возвращал
+        # ВСЕ позиции целиком — частичный возврат существовал только в боте
+        # (§5.2.6). Теперь фронт может прислать items: [{item_id, quantity}].
+        #
+        # Доступное к возврату = quantity − returned_qty (как в боте): позиция,
+        # уже возвращённая прошлым возвратом, второй раз не отдаётся.
+        items = await adb.get_order_items(order_id)
+        avail_by_id = {
+            it["id"]: float(it.get("quantity", 0) or 0) - float(it.get("returned_qty", 0) or 0)
+            for it in items
+        }
+        price_by_id = {it["id"]: float(it.get("price", 0) or 0) for it in items}
+        returnable = {iid: a for iid, a in avail_by_id.items() if a > 0}
+        if not returnable:
+            raise HTTPException(status_code=409, detail="Нет позиций, доступных к возврату")
 
-    raw_items = data.get("items")
-    if raw_items is None:
-        # Полный возврат — всё доступное (поведение по умолчанию, как было).
-        ret_items = [
-            (iid, avail, round(avail * price_by_id[iid], 2)) for iid, avail in returnable.items()
-        ]
-        return_type = "full"
-    else:
-        if not isinstance(raw_items, list) or not raw_items:
-            if full_key:
-                await adb.idem_release(full_key)
-            raise HTTPException(status_code=400, detail="Выберите хотя бы одну позицию")
-        ret_items = []
-        for row in raw_items:
-            try:
-                iid = int(str((row or {}).get("item_id")))
-                qty = float(str((row or {}).get("quantity")))
-            except (TypeError, ValueError, AttributeError):
-                if full_key:
-                    await adb.idem_release(full_key)
-                raise HTTPException(status_code=400, detail="Позиция: нужны item_id и quantity")
-            if iid not in returnable:
-                if full_key:
-                    await adb.idem_release(full_key)
-                raise HTTPException(
-                    status_code=400, detail=f"Позиция {iid} недоступна к возврату"
-                )
-            if not (math.isfinite(qty) and 0 < qty <= returnable[iid] + 1e-9):
-                if full_key:
-                    await adb.idem_release(full_key)
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Позиция {iid}: количество должно быть от 0 до "
-                        f"{returnable[iid]:g}"
-                    ),
-                )
-            qty = min(qty, returnable[iid])
-            ret_items.append((iid, qty, round(qty * price_by_id[iid], 2)))
-        # Выбраны все позиции в полном объёме — это фактически полный возврат
-        # (та же логика, что в боте: от типа зависит статус заказа).
-        is_full = len(ret_items) == len(returnable) and all(
-            abs(qty - returnable[iid]) < 1e-9 for iid, qty, _ in ret_items
-        )
-        return_type = "full" if is_full else "partial"
+        raw_items = data.get("items")
+        if raw_items is None:
+            # Полный возврат — всё доступное (поведение по умолчанию, как было).
+            ret_items = [
+                (iid, avail, round(avail * price_by_id[iid], 2)) for iid, avail in returnable.items()
+            ]
+            return_type = "full"
+        else:
+            if not isinstance(raw_items, list) or not raw_items:
+                raise HTTPException(status_code=400, detail="Выберите хотя бы одну позицию")
+            ret_items = []
+            for row in raw_items:
+                try:
+                    iid = int(str((row or {}).get("item_id")))
+                    qty = float(str((row or {}).get("quantity")))
+                except (TypeError, ValueError, AttributeError):
+                    raise HTTPException(status_code=400, detail="Позиция: нужны item_id и quantity")
+                if iid not in returnable:
+                    raise HTTPException(
+                        status_code=400, detail=f"Позиция {iid} недоступна к возврату"
+                    )
+                if not (math.isfinite(qty) and 0 < qty <= returnable[iid] + 1e-9):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Позиция {iid}: количество должно быть от 0 до "
+                            f"{returnable[iid]:g}"
+                        ),
+                    )
+                qty = min(qty, returnable[iid])
+                ret_items.append((iid, qty, round(qty * price_by_id[iid], 2)))
+            # Выбраны все позиции в полном объёме — это фактически полный возврат
+            # (та же логика, что в боте: от типа зависит статус заказа).
+            is_full = len(ret_items) == len(returnable) and all(
+                abs(qty - returnable[iid]) < 1e-9 for iid, qty, _ in ret_items
+            )
+            return_type = "full" if is_full else "partial"
 
     try:
         res = await adb.create_return(
@@ -5377,14 +5391,13 @@ async def api_returns_create(request: Request):
             refund_method=refund,
             created_by=user["id"],
             force=privileged,
+            idem_key=idem.key,
         )
     except Exception:
-        if full_key:
-            await adb.idem_release(full_key)  # упало до store — освободить ретраю
+        await idem.release()  # упало до коммита — освободить ретраю
         raise
     if not res.get("ok"):
-        if full_key:
-            await adb.idem_release(full_key)
+        await idem.release()
         raise HTTPException(status_code=409, detail=res.get("error", "не удалось"))
 
     # То же уведомление с кнопками, что и бот-команда /return.
@@ -5396,8 +5409,7 @@ async def api_returns_create(request: Request):
     except Exception:
         logger.warning("return create notify failed", exc_info=True)
     resp = {"ok": True, "return_id": res["return_id"], "total_amount": res["total_amount"]}
-    if full_key:
-        await adb.idem_store(full_key, resp)
+    await idem.store(resp)
     return JSONResponse(resp)
 
 
@@ -6009,46 +6021,49 @@ async def api_mark_paid(request: Request):
     # Idempotency: double-click по «Оплачено» частичной суммой мог создать две
     # строки платежа. Ключ — в общей БД (T2.5), поэтому защита переживает
     # рестарт и работает между воркерами.
-    idem = _Idem(adb, "mark_paid", user["id"], data.get("idempotency_key"))
+    idem = _Idem(adb, "mark_paid", user["id"], data.get("idempotency_key"), atomic=True)
     cached = await idem.claim()
     if cached is not None:
         return JSONResponse(cached)
 
-    order = await adb.get_order(order_id)
-    if not order:
-        raise HTTPException(status_code=404, detail="Заказ не найден")
+    async with idem.released_on_reject():
+        order = await adb.get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="Заказ не найден")
 
-    user_id = user["id"]
-    role = get_role(user_id)
-    is_owner = order["user_id"] == user_id
-    is_boss = role in ("admin", "boss")
-    if not (is_owner or is_boss):
-        raise HTTPException(status_code=403, detail="Нет доступа")
+        user_id = user["id"]
+        role = get_role(user_id)
+        is_owner = order["user_id"] == user_id
+        is_boss = role in ("admin", "boss")
+        if not (is_owner or is_boss):
+            raise HTTPException(status_code=403, detail="Нет доступа")
 
-    # «Оплата сразу» принимается тоже: отклонённый автоплатёж иначе не
-    # заявить повторно, и заказ висел бы неоплаченным без единой кнопки.
-    if order.get("payment_type") not in ("credit", "paid"):
-        raise HTTPException(status_code=400, detail="Это не кредитный заказ")
+        # «Оплата сразу» принимается тоже: отклонённый автоплатёж иначе не
+        # заявить повторно, и заказ висел бы неоплаченным без единой кнопки.
+        if order.get("payment_type") not in ("credit", "paid"):
+            raise HTTPException(status_code=400, detail="Это не кредитный заказ")
+
+        # amount: если передан и валиден — частичная оплата; иначе закроет остаток.
+        # Через общий валидатор (isfinite + потолок) — inf/nan/огромное не пройдут.
+        amount_raw = data.get("amount")
+        amount = None
+        if amount_raw is not None and amount_raw != "":
+            amount = _validate_payment_amount(amount_raw, order.get("currency"))
 
     full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user_id)
     )
     username = f"@{user['username']}" if user.get("username") else ""
 
-    # amount: если передан и валиден — частичная оплата; иначе закроет остаток.
-    # Через общий валидатор (isfinite + потолок) — inf/nan/огромное не пройдут.
-    amount_raw = data.get("amount")
-    amount = None
-    if amount_raw is not None and amount_raw != "":
-        amount = _validate_payment_amount(amount_raw, order.get("currency"))
-
     try:
+        # Результат ложится в ключ той же транзакцией, что и платёж.
         ok, payment_id = await adb.mark_order_paid(
             order_id,
             user_id,
             full_name,
             amount=amount,
             username=username,
+            idem_key=idem.key,
         )
     except Exception:
         await idem.release()  # упало до store — ретрай должен быть возможен

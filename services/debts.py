@@ -207,6 +207,32 @@ async def calc_allocated_deposit_cents(order_ids: list[int], conn: Any = None) -
     return {int(r["oid"]): int(r["dc"] or 0) for r in rows}
 
 
+async def lock_orders(txn: Any, order_ids: list[int]) -> None:
+    """Взять `FOR UPDATE` строк заказов — ЕДИНЫЙ замок на «заявлено по заказу».
+
+    Правило: любая операция, которая меняет, сколько по заказу заявлено или
+    зачтено (отметка оплаты, «Получил деньги», сдача наличных, её
+    подтверждение, подтверждение и сторно платежа, автоплатёж при одобрении),
+    берёт этот замок ДО `calc_claimable_cents`/`calc_order_balances` и
+    держит его до коммита.
+
+    Почему именно строка заказа, а не свой advisory-lock у каждого пути: сдача
+    раньше сериализовалась замком «по менеджеру», а отметка оплаты — строкой
+    заказа. Разные замки друг друга не ждут, и параллельные сдача и «оплачено»
+    по одному заказу обе видели одинаковый остаток и обе его заявляли — одни и
+    те же деньги дважды.
+
+    Порядок — по возрастанию id: две операции над [A, B] и [B, A] иначе берут
+    строки навстречу друг другу и получают взаимную блокировку. На SQLite
+    замков строк нет, а пишущая транзакция одна (`BEGIN IMMEDIATE`) — no-op.
+    """
+    ids = sorted({int(o) for o in order_ids or []})
+    if not ids or not adb_core._use_postgres():
+        return
+    # ORDER BY выполняется ДО LockRows, поэтому строки берутся по возрастанию id.
+    await txn.fetch("SELECT id FROM orders WHERE id = ANY($1::bigint[]) ORDER BY id FOR UPDATE", ids)
+
+
 async def calc_claimable_cents(order_ids: list[int], conn: Any = None) -> dict[int, int]:
     """Сколько по заказу ещё МОЖНО заявить новой оплатой или сдачей, в копейках.
 

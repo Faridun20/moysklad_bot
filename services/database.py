@@ -378,7 +378,7 @@ def _table_ddls() -> list[str]:
                 ms_sync_error      TEXT,
                 ms_sync_claimed_at TEXT,
                 -- Курс валюты платежа к BASE_CURRENCY, замороженный в момент
-                -- подтверждения (_snapshot_payment_fx). Пересчёт «в долларах»
+                -- подтверждения (confirm_payment). Пересчёт «в долларах»
                 -- обязан опираться на курс того дня, а не сегодняшний: иначе
                 -- выручка прошлого месяца меняется от движения курса.
                 fx_rate_to_base    REAL,
@@ -3508,26 +3508,25 @@ async def create_cash_deposit(
     manager_id: int,
     amount: float,
     allocations: list[tuple] | None = None,
+    idem_key: str | None = None,
 ) -> dict:
     """Создать сдачу (status=pending) + распределение по заказам.
+
+    `idem_key` — результат пишется в ключ идемпотентности той же транзакцией.
 
     allocations: список (order_id, amount) для ручного режима; если None —
     авто-FIFO по открытым заказам менеджера. Возвращает {ok, deposit_id,
     allocations}.
 
-    Конкурентность (Round 6 RACE-1): в Postgres берём advisory-lock на
-    (manager_id), чтобы 2 параллельных /deposit от одного менеджера не
-    переаллоцировали один и тот же остаток заказа дважды. Без локa
-    `get_manager_open_orders_for_deposit` читает pending+confirmed
-    распределения вне транзакции — два вызова видят одинаковый `remaining`,
-    распределяют сверх лимита, аналитика по cash-flow завышается. На
-    SQLite (локалка) advisory-lock'а нет, но там один-процессный сценарий.
+    Конкурентность: `get_manager_open_orders_for_deposit` читает остатки вне
+    транзакции, поэтому под транзакцией строки заказов-кандидатов берутся
+    `FOR UPDATE` (services.debts.lock_orders — тот же замок, что у отметки
+    оплаты и «Получил деньги») и остаток перечитывается. Раньше здесь был
+    advisory-lock по менеджеру: две сдачи одного менеджера он сериализовал, а
+    сдачу и параллельную отметку оплаты того же заказа — нет.
 
-    asyncpg Stage 17 (#21): native async. advisory-lock + FIFO-расчёт
-    (await get_manager_open_orders_for_deposit, читает на отдельных connection'ах,
-    как и в sync-версии) + INSERT cash_deposits/cash_deposit_orders — в одной
-    adb_core.transaction(). INSERT-id: RETURNING (pg) / last_insert_rowid()
-    (sqlite). validate_amount_in_currency для базовой валюты в БД не ходит.
+    INSERT-id: RETURNING (pg) / last_insert_rowid() (sqlite).
+    validate_amount_in_currency для базовой валюты в БД не ходит.
     """
     # Сдача — в базовой валюте (у cash_deposits нет колонки валюты).
     ok, err = validate_amount_in_currency(amount, None)
@@ -3548,22 +3547,20 @@ async def create_cash_deposit(
     if not is_manual:
         candidates = await get_manager_open_orders_for_deposit(manager_id)
 
+    from services.debts import lock_orders
+
     async with adb_core.transaction() as txn:
-        if USE_POSTGRES:
-            # Сериализуем перепроверку + INSERT по manager_id.
-            # pg_advisory_xact_lock держится до конца транзакции, второй
-            # параллельный вызов ждёт.
-            await txn.execute(
-                "SELECT pg_advisory_xact_lock(hashtext($1))",
-                f"cash_deposit:manager:{manager_id}",
-            )
+        # Замок — строки заказов (services.debts.lock_orders), а НЕ advisory по
+        # менеджеру, как было: отметка оплаты и «Получил деньги» берут строку
+        # заказа, и разные замки друг друга не ждали — параллельные сдача и
+        # «оплачено» по одному заказу обе проходили проверку остатка.
+        target_ids = [o["id"] for o in candidates] if not is_manual else [a[0] for a in allocs]
+        await lock_orders(txn, target_ids)
+        # Перепроверка ПОД ЗАМКОМ: между расчётом и этим моментом другой вызов
+        # мог заявить часть остатка. Читаем тем же коннектом (conn=txn) — новых
+        # захватов из пула не делаем.
+        fresh = await deposit_remaining_cents_for_orders(target_ids, conn=txn)
         if not is_manual:
-            # Перепроверка ПОД ЛОКОМ: между расчётом и этим моментом другой
-            # вызов мог распределить часть остатка. Читаем свежие остатки тем
-            # же коннектом (conn=txn) — новых захватов из пула не делаем.
-            fresh = await deposit_remaining_cents_for_orders(
-                [o["id"] for o in candidates], conn=txn
-            )
             left_cents = money.to_cents(amount)
             for o in candidates:
                 if left_cents <= 0:
@@ -3573,6 +3570,19 @@ async def create_cash_deposit(
                 if take_cents > 0:
                     allocs.append((o["id"], float(money.from_cents(take_cents))))
                     left_cents -= take_cents
+        else:
+            # Ручное распределение проверяется той же формулой: иначе оно было
+            # третьим путём заявить уже заявленные деньги.
+            wanted: dict[int, int] = {}
+            for order_id, alloc in allocs:
+                wanted[int(order_id)] = wanted.get(int(order_id), 0) + money.to_cents(alloc)
+            for order_id, cents in wanted.items():
+                if cents > fresh.get(order_id, 0):
+                    return {
+                        "ok": False,
+                        "error": f"По заказу #{order_id} столько заявить нельзя: "
+                        f"доступно {money.format_cents(fresh.get(order_id, 0), decimals=2)}",
+                    }
 
         amount_cents = money.to_cents(amount)
         if USE_POSTGRES:
@@ -3594,6 +3604,7 @@ async def create_cash_deposit(
                 "VALUES ($1, $2, $3, $4)",
                 deposit_id, order_id, money.to_cents(alloc), 1 if is_manual else 0,
             )
+        await idem_store_in(txn, idem_key, {"ok": True, "deposit_id": deposit_id})
     return {"ok": True, "deposit_id": deposit_id, "allocations": allocs}
 
 
@@ -3830,8 +3841,10 @@ async def create_return(
     refund_method: str | None,
     created_by: int,
     force: bool = False,
+    idem_key: str | None = None,
 ) -> dict:
     """Создать возврат (status=pending) + позиции. items = [(order_item_id, qty, amount)].
+    `idem_key` — результат пишется в ключ идемпотентности той же транзакцией.
     return_type: 'partial'|'full'. refund_method: 'cash'|'debt_reduction'|'no_refund'.
     Доступно для shipped/paid/partially_returned. Дедлайн (return_deadline_days)
     блокирует, если не force (вызывающий решает по роли). Возвращает {ok, return_id}.
@@ -3918,6 +3931,9 @@ async def create_return(
                 "VALUES ($1, $2, $3, $4)",
                 return_id, oitem_id, qty, line_cents,
             )
+        await idem_store_in(
+            txn, idem_key, {"ok": True, "return_id": return_id, "total_amount": total_amount}
+        )
     return {"ok": True, "return_id": return_id, "total_amount": total_amount}
 
 
@@ -4084,8 +4100,16 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
     # писались ПОСЛЕ коммита подтверждения → крах между ними оставлял возврат
     # «confirmed» (товар оприходован), а выплату из кассы незаписанной → касса
     # завышалась без возможности reconcile. Теперь либо всё, либо ничего.
+    from services.debts import lock_orders
+
+    closed_by_return = False
+    closed_cents = 0
     try:
         async with adb_core.transaction() as txn:
+            # Подтверждённый возврат уменьшает «можно заявить» — замок заказа
+            # тот же, что у отметки оплаты и сдачи (services.debts.lock_orders):
+            # иначе параллельная отметка оплаты считала остаток ещё без возврата.
+            await lock_orders(txn, [order_id])
             # T2.8: подтвердить возврат можно только если товар ПРИНЯТ.
             # goods_received писался (mark_return_goods_received), но никогда не
             # проверялся: босс подтверждал возврат → returned_qty рос, заказ
@@ -4213,14 +4237,21 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
                 )
             # debt_reduction / no_refund — отдельной записи не требуют (долг учитывает
             # подтверждённые возвраты в get_agent_current_debt).
+
+            # Частичный возврат мог обнулить остаток к оплате (платежи уже
+            # покрыли total − возврат) → закрываем заказ ТОЙ ЖЕ транзакцией:
+            # отдельным коммитом сбой между ними оставлял покрытый заказ
+            # открытым без пути повтора. Полный возврат (status='returned') —
+            # терминальный, «оплатой» его не закрываем.
+            if new_status == "partially_returned":
+                closed_by_return, closed_cents = await _close_order_if_covered_locked(
+                    txn, order_id, confirmed_by, confirmed_name
+                )
     except _TxnAbort as e:
         return {"ok": False, "error": e.message}
 
-    # Частичный возврат мог обнулить остаток к оплате (платежи уже покрыли
-    # total − возврат) → закрываем заказ. Полный возврат (status='returned') —
-    # терминальный, «оплатой» его не закрываем.
-    if new_status == "partially_returned":
-        await _maybe_close_order_after_payment(order_id, confirmed_by, confirmed_name)
+    if closed_by_return:
+        await _audit_order_fully_paid(order_id, confirmed_by, confirmed_name, closed_cents)
 
     role = await asyncio.to_thread(get_role, confirmed_by)
     await asyncio.to_thread(
@@ -4414,7 +4445,19 @@ def is_user_deactivated(user_id: int) -> bool:
     return bool(deactivated)
 
 
-async def idem_claim(key: str, operation: str, user_id: int) -> dict | None:
+# Через сколько секунд застолблённый ключ БЕЗ результата считается брошенным.
+# Только для операций, которые пишут результат ключа В СВОЕЙ транзакции
+# (`idem_store_in`): у них «ключ есть, результата нет» после этого срока значит
+# «транзакция не закоммитилась» — таймауты сессии пула (30 с на запрос, 10 с на
+# ожидание замка) не дают ей жить так долго. У остальных результат пишется
+# после коммита, и пустой ключ может скрывать уже проведённую операцию —
+# их не переиспользуем никогда.
+IDEM_RECLAIM_AFTER_S = 600
+
+
+async def idem_claim(
+    key: str, operation: str, user_id: int, *, reclaim_after_s: int | None = None
+) -> dict | None:
     """DB-уровневая идемпотентность для денежных create-эндпоинтов (R2).
 
     Атомарно «застолбить» ключ: INSERT-if-absent. Возвращает:
@@ -4437,6 +4480,21 @@ async def idem_claim(key: str, operation: str, user_id: int) -> dict | None:
     )
     if rc > 0:
         return None  # ключ наш — выполняем операцию
+    if reclaim_after_s is not None:
+        # Ключ без результата старше срока — транзакция операции так и не
+        # закоммитилась (результат пишется в ней же). Раньше такой ключ сутки
+        # отвечал «уже обрабатывается», и повторить сдачу/оплату было нельзя.
+        # CAS по created_at: из двух одновременных ретраев ключ получит один.
+        cutoff = (datetime.now() - timedelta(seconds=reclaim_after_s)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        taken = await adb_core.execute(
+            "UPDATE idempotency_keys SET created_at = $1, expires_at = $2 "
+            "WHERE key = $3 AND result IS NULL AND created_at < $4",
+            now_str(), expires, key, cutoff,
+        )
+        if taken > 0:
+            return None
     row = await adb_core.fetchrow(
         "SELECT result FROM idempotency_keys WHERE key = $1", key
     )
@@ -4455,6 +4513,22 @@ async def idem_store(key: str, result: dict) -> None:
     await adb_core.execute(
         "UPDATE idempotency_keys SET result = $1 WHERE key = $2",
         json.dumps(result), key,
+    )
+
+
+async def idem_store_in(txn, key: str | None, result: dict) -> None:
+    """Записать результат под ключом ВНУТРИ транзакции самой операции.
+
+    `idem_store` после коммита оставлял окно: операция проведена, а процесс
+    умер до записи результата — ключ оставался пустым, и ретрай сутки получал
+    «уже обрабатывается», не узнав, что деньги уже записаны. Результат в той же
+    транзакции появляется ровно тогда же, когда и сама запись."""
+    if not key:
+        return
+    import json
+
+    await txn.execute(
+        "UPDATE idempotency_keys SET result = $1 WHERE key = $2", json.dumps(result), key
     )
 
 
@@ -4652,6 +4726,71 @@ def add_payment(
             payment_id = cur.lastrowid
         conn.commit()
     return payment_id
+
+
+async def create_approval_auto_payment(order_id: int, full_name: str) -> int | None:
+    """Автоплатёж «оплата сразу» после одобрения: pending на сумму заказа.
+
+    Возвращает id платежа или None, если создавать нечего (заказ не «оплата
+    сразу», уже не одобрен, закрыт, по нему уже есть заявленные деньги).
+
+    Проверка и вставка — одной транзакцией ПОД ЗАМКОМ заказа
+    (services.debts.lock_orders). Раньше одобрение проверяло «платежей нет»
+    чтением без замка и вставляло отдельным коммитом: параллельная отметка
+    оплаты менеджером (или «Получил деньги») проходила ту же проверку, и по
+    заказу оказывалось заявлено две суммы заказа. Повторный вызов безвреден:
+    второй раз он видит уже созданный платёж. Сумма не больше того, что по
+    заказу ещё можно заявить (`calc_claimable_cents`).
+    """
+    from config import BASE_CURRENCY
+
+    from services.debts import calc_claimable_cents, lock_orders
+
+    async with adb_core.transaction() as txn:
+        await lock_orders(txn, [order_id])
+        row = await txn.fetchrow(
+            "SELECT user_id, currency, payment_type, status, paid_confirmed_at "
+            "FROM orders WHERE id = $1",
+            order_id,
+        )
+        if (
+            not row
+            or (row["payment_type"] or "paid") != "paid"
+            or row["status"] not in ("approved", "shipped", "partially_returned")
+            or row["paid_confirmed_at"] is not None
+        ):
+            return None
+        if await txn.fetchval(
+            "SELECT 1 FROM payments WHERE order_id = $1 AND status IN ('pending', 'confirmed') LIMIT 1",
+            order_id,
+        ):
+            return None
+        items = await txn.fetch(
+            "SELECT quantity, price_cents FROM order_items WHERE order_id = $1", order_id
+        )
+        # Сумма — в копейках, построчно через mul_qty: ровно так её считает
+        # закрытие заказа. Float-сумма дробных количеств расходилась на копейку
+        # (2 × 1,5 × 0,33 = 0,99 против 1,00), и заказ не закрывался.
+        total_cents = money.add(
+            *(money.mul_qty(int(it["price_cents"] or 0), it["quantity"] or 0) for it in items)
+        )
+        claimable = (await calc_claimable_cents([order_id], conn=txn)).get(order_id, 0)
+        amount_cents = min(total_cents, claimable)
+        if amount_cents <= 0:
+            return None
+        values = (
+            row["user_id"], "", full_name, amount_cents, row["currency"] or BASE_CURRENCY,
+            f"Оплата по заказу #{order_id} (отгрузка одобрена)", now_str(), order_id,
+        )
+        sql = (
+            "INSERT INTO payments (user_id, username, full_name, amount_cents, currency, "
+            "comment, status, created_at, order_id) "
+            "VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)"
+        )
+        if USE_POSTGRES:
+            return int(await txn.fetchval(sql + " RETURNING id", *values))
+        await txn.execute(sql, *values)
+        return int(await txn.fetchval("SELECT last_insert_rowid()"))
 
 
 async def get_payments_for_order(order_id: int) -> list[dict]:
@@ -5324,23 +5463,63 @@ async def confirm_payment(
     payment_id: int, confirmed_by: int | None = None, confirmed_name: str = ""
 ) -> bool:
     """Подтвердить платёж. Если платёж привязан к заказу (order_id) —
-    проверяем суммарно, не закрыли ли мы тем самым заказ полностью.
-    Полностью означает: SUM(amount where status='confirmed') >= order.total.
-    Тогда автоматически проставляем order.paid_confirmed_at.
+    проверяем суммарно, не закрыли ли мы тем самым заказ полностью, и если да —
+    проставляем order.paid_confirmed_at.
 
-    asyncpg Stage 15 (#21): native async. get_payment/add_audit_log/get_role
-    (sync money-core) — мост через to_thread; _maybe_close_order_after_payment
-    теперь async (await); _trigger_ms_paymentin_sync зовём напрямую — он видит
-    running loop и делает create_task (fire-and-forget)."""
-    rc = await adb_core.execute(
-        "UPDATE payments SET status = 'confirmed', confirmed_at = $1 WHERE id = $2 AND status = 'pending'",
-        now_str(),
-        payment_id,
+    ВСЁ — одной транзакцией: CAS статуса платежа, снимок курса и закрытие
+    заказа. Раньше это были три коммита: платёж становился `confirmed`, а сбой
+    до закрытия оставлял покрытый заказ открытым НАВСЕГДА — повторное
+    подтверждение отвечало «уже подтверждён» (CAS не проходил), и другого пути
+    закрыть заказ не было. Снимок курса тем же манером мог не записаться, и
+    итог «в долларах» по такому платежу плыл с курсом.
+
+    Замки: сначала строка заказа (services.debts.lock_orders — общий замок на
+    «заявлено по заказу», в том же порядке «заказ → платёж», что и сторно
+    в accounting), потом CAS платежа. Аудит — после коммита: его пишет
+    синхронный слой, и на SQLite он ждал бы нашу же пишущую транзакцию.
+    """
+    from services.debts import lock_orders
+
+    head = await adb_core.fetchrow(
+        "SELECT order_id, currency, fx_rate_to_base FROM payments WHERE id = $1", payment_id
     )
-    if rc <= 0:
+    if head is None:
         return False
-    # Заморозить курс платежа на момент подтверждения (best-effort, sync core).
-    await asyncio.to_thread(_snapshot_payment_fx, payment_id)
+    # Курс — ДО транзакции: get_currency_rate синхронный (кэш + чтение БД), и
+    # внутри пишущей транзакции SQLite он ждал бы её же.
+    rate = None
+    if head.get("fx_rate_to_base") is None and head.get("currency"):
+        rate = await asyncio.to_thread(get_currency_rate, head["currency"])
+
+    closed_order: int | None = None
+    confirmed_cents = 0
+    async with adb_core.transaction() as txn:
+        order_id = head.get("order_id")
+        if order_id:
+            await lock_orders(txn, [int(order_id)])
+        rc = await txn.execute(
+            "UPDATE payments SET status = 'confirmed', confirmed_at = $1 "
+            "WHERE id = $2 AND status = 'pending'",
+            now_str(), payment_id,
+        )
+        if rc <= 0:
+            return False
+        if rate is not None:
+            await txn.execute(
+                "UPDATE payments SET fx_rate_to_base = $1 WHERE id = $2 AND fx_rate_to_base IS NULL",
+                float(rate), payment_id,
+            )
+        # Привязку могли поменять между чтением и замком (link_payment_to_order
+        # ставит order_id платежу без заказа) — берём фактическую.
+        actual = await txn.fetchval("SELECT order_id FROM payments WHERE id = $1", payment_id)
+        if actual and actual != order_id:
+            await lock_orders(txn, [int(actual)])
+        if actual:
+            closed, confirmed_cents = await _close_order_if_covered_locked(
+                txn, int(actual), confirmed_by, confirmed_name
+            )
+            closed_order = int(actual) if closed else None
+
     payment = await get_payment(payment_id)
     if confirmed_by and payment:
         await asyncio.to_thread(
@@ -5351,18 +5530,8 @@ async def confirm_payment(
             "payment_confirmed",
             f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
         )
-    # Если платёж был привязан к заказу — проверяем не закрылся ли заказ.
-    if payment and payment.get("order_id"):
-        await _maybe_close_order_after_payment(
-            payment["order_id"],
-            confirmed_by,
-            confirmed_name,
-        )
-        # Best-effort: синхронизируем входящий платёж в МойСклад.
-        # Делаем fire-and-forget — БД-операция уже коммитнута, ошибка
-        # MS-API не должна откатывать подтверждение. Статус синхрона
-        # пишется в payments.ms_sync_status; failed можно ретраить
-        # вручную или фоновой задачей.
+    if closed_order is not None:
+        await _audit_order_fully_paid(closed_order, confirmed_by, confirmed_name, confirmed_cents)
     return True
 
 
@@ -5489,95 +5658,83 @@ async def get_unlinked_payments(limit: int = 100) -> list[dict]:
     return _with_major(rows, ("amount", "amount_cents"))
 
 
+async def _close_order_if_covered_locked(
+    txn, order_id: int, confirmed_by: int | None, confirmed_name: str
+) -> tuple[bool, int]:
+    """Закрыть заказ, если он покрыт, — ВНУТРИ транзакции под замком заказа.
+
+    Вызывающий обязан уже держать строку заказа (`services.debts.lock_orders`):
+    пересчёт и закрытие идут под тем же замком, иначе параллельное
+    подтверждение двух платежей одного заказа видело бы `remaining > 0` у обоих
+    и оба пропускали закрытие. → (закрыт сейчас, подтверждённые копейки).
+    """
+    from services.debts import calc_order_balance
+
+    row = await txn.fetchrow("SELECT paid_confirmed_at FROM orders WHERE id = $1", order_id)
+    if not row or row["paid_confirmed_at"] is not None:
+        return False, 0
+    # T2.1: формула — из services.debts, а не своя копия. Она учитывает
+    # платежи ТОЛЬКО в валюте заказа (иначе платёж в «дешёвой» валюте вроде
+    # UZS в копейках ложно перекрывал USD-заказ, WP-04) и подтверждённые
+    # сдачи наличных (иначе заказ, оплаченный наполовину сдачей, не
+    # закрывался, WP-05).
+    bal = await calc_order_balance(order_id, conn=txn)
+    # net <= 0 (напр. полный возврат) — это не «оплата», закрытием здесь не
+    # занимаемся: статус ведёт confirm_return.
+    if bal.total_cents - bal.returns_cents <= 0 or bal.remaining_cents > 0:
+        return False, bal.confirmed_cents
+    rc = await txn.execute(
+        "UPDATE orders "
+        "SET paid_confirmed_at = $1, paid_confirmed_by = $2, "
+        "    paid_confirmed_by_name = $3, "
+        "    paid_at = COALESCE(paid_at, $4), "
+        "    updated_at = $5 "
+        "WHERE id = $6 AND paid_confirmed_at IS NULL",
+        now_str(),
+        confirmed_by or 0,
+        confirmed_name or "",
+        now_str(),
+        now_str(),
+        order_id,
+    )
+    return rc > 0, bal.confirmed_cents
+
+
+async def _audit_order_fully_paid(
+    order_id: int, confirmed_by: int | None, confirmed_name: str, confirmed_cents: int
+) -> None:
+    role = await asyncio.to_thread(get_role, confirmed_by) if confirmed_by else ""
+    await asyncio.to_thread(
+        add_audit_log,
+        confirmed_by or 0,
+        confirmed_name,
+        role,
+        "order_fully_paid",
+        f"Заказ #{order_id} полностью оплачен "
+        f"(сумма подтверждённых платежей: {money.format_cents(confirmed_cents)})",
+    )
+
+
 async def _maybe_close_order_after_payment(
     order_id: int,
     confirmed_by: int | None,
     confirmed_name: str,
 ) -> None:
-    """Атомарно проверить, закрыт ли заказ суммой confirmed-платежей,
-    и проставить paid_confirmed_at если да.
+    """Отдельной транзакцией: взять замок заказа, закрыть его, если покрыт.
 
-    Параллельный confirm двух платежей одного заказа без блокировки приводил
-    к гонке: каждый вызов видел `remaining > 0` (потому что второй платёж
-    ещё не был зафиксирован для текущей транзакции) и оба пропускали
-    закрытие. Решение — `SELECT ... FOR UPDATE` на orders в начале
-    транзакции: пока первый confirm считает summary и UPDATE'ит заказ,
-    второй ждёт на lock'е и затем видит уже актуальные данные.
-
-    Для SQLite (локальная разработка) FOR UPDATE не поддерживается, но
-    там и нет конкуренции — один процесс. Условный SQL.
-
-    asyncpg Stage 15 (#21): native async. FOR UPDATE-секция (lock → пересчёт
-    сумм → закрытие) в одной adb_core.transaction(); ранние return — read-only
-    пути (commit ≡ rollback, lock освобождён). add_audit_log/get_role (sync) —
-    мостим через to_thread после транзакции.
+    Для путей, где деньги уже зачтены раньше (привязка подтверждённого платежа
+    к заказу). Подтверждение платежа закрывает заказ в СВОЕЙ транзакции —
+    `confirm_payment`.
     """
-    from services.debts import calc_order_balance
+    from services.debts import lock_orders
 
-    closed = False
-    confirmed_cents = 0
     async with adb_core.transaction() as txn:
-        # Lock: для Постгреса эта строка блокирует order до конца транзакции.
-        if USE_POSTGRES:
-            row = await txn.fetchrow(
-                "SELECT paid_confirmed_at, currency FROM orders WHERE id = $1 FOR UPDATE", order_id
-            )
-        else:
-            row = await txn.fetchrow(
-                "SELECT paid_confirmed_at, currency FROM orders WHERE id = $1", order_id
-            )
-        if not row:
-            return
-        if row["paid_confirmed_at"] is not None:
-            return  # already closed
-
-        # Пересчёт ВНУТРИ транзакции (conn=txn) — видим актуальные суммы под тем
-        # же FOR UPDATE, под которым потом закрываем заказ.
-        #
-        # T2.1: формула — из services.debts, а не своя копия. Она учитывает
-        # платежи ТОЛЬКО в валюте заказа (иначе платёж в «дешёвой» валюте вроде
-        # UZS в копейках ложно перекрывал USD-заказ, WP-04) и подтверждённые
-        # сдачи наличных (иначе заказ, оплаченный наполовину сдачей, не
-        # закрывался, WP-05).
-        bal = await calc_order_balance(order_id, conn=txn)
-        confirmed_cents = bal.confirmed_cents
-
-        # net <= 0 (напр. полный возврат) — это не «оплата», закрытием здесь не
-        # занимаемся: статус ведёт confirm_return.
-        net_cents = bal.total_cents - bal.returns_cents
-        if net_cents <= 0:
-            return
-        if bal.remaining_cents > 0:
-            return  # ещё не полностью оплачен (платежи + сдачи, с учётом возвратов)
-
-        # Закрываем
-        rc = await txn.execute(
-            "UPDATE orders "
-            "SET paid_confirmed_at = $1, paid_confirmed_by = $2, "
-            "    paid_confirmed_by_name = $3, "
-            "    paid_at = COALESCE(paid_at, $4), "
-            "    updated_at = $5 "
-            "WHERE id = $6 AND paid_confirmed_at IS NULL",
-            now_str(),
-            confirmed_by or 0,
-            confirmed_name or "",
-            now_str(),
-            now_str(),
-            order_id,
+        await lock_orders(txn, [order_id])
+        closed, confirmed_cents = await _close_order_if_covered_locked(
+            txn, order_id, confirmed_by, confirmed_name
         )
-        closed = rc > 0
-
     if closed:
-        role = await asyncio.to_thread(get_role, confirmed_by) if confirmed_by else ""
-        await asyncio.to_thread(
-            add_audit_log,
-            confirmed_by or 0,
-            confirmed_name,
-            role,
-            "order_fully_paid",
-            f"Заказ #{order_id} полностью оплачен "
-            f"(сумма подтверждённых платежей: {money.format_cents(confirmed_cents)})",
-        )
+        await _audit_order_fully_paid(order_id, confirmed_by, confirmed_name, confirmed_cents)
 
 
 async def reject_payment(
@@ -6067,8 +6224,12 @@ async def mark_order_paid(
     marked_by_name: str,
     amount: float | None = None,
     username: str = "",
+    idem_key: str | None = None,
 ) -> tuple[bool, int | None]:
     """Менеджер отмечает поступление денег по заказу.
+
+    `idem_key` — застолблённый ключ идемпотентности: результат пишется в него
+    той же транзакцией, что и платёж (`idem_store_in`).
 
     Поведение:
       1. Создаёт payment-запись в таблице payments с order_id=N и
@@ -6195,6 +6356,7 @@ async def mark_order_paid(
             "UPDATE orders SET paid_at = COALESCE(paid_at, $1), updated_at = $2 WHERE id = $3",
             now_str(), now_str(), order_id,
         )
+        await idem_store_in(txn, idem_key, {"ok": True, "payment_id": payment_id})
 
     remaining_after = float(money.from_cents(max(0, remaining_cents - amount_cents)))
     await asyncio.to_thread(
@@ -6448,43 +6610,6 @@ def _snapshot_order_fx(order_id: int) -> None:
         logger.exception("_snapshot_order_fx(%s) failed", order_id)
 
 
-def _snapshot_payment_fx(payment_id: int) -> None:
-    """Заморозить курс валюты платежа к BASE_CURRENCY (payments.fx_rate_to_base).
-
-    Идемпотентно: ставит ТОЛЬКО если снимка ещё нет. Вызывается при
-    подтверждении платежа — момент, когда деньги реально зачтены.
-    """
-    try:
-        with get_conn() as conn:
-            cur = get_cursor(conn)
-            cur.execute(
-                q("SELECT currency, fx_rate_to_base FROM payments WHERE id = ?"),
-                (payment_id,),
-            )
-            row = cur.fetchone()
-        if row is None:
-            return
-        currency = row["currency"] if hasattr(row, "keys") else row[0]
-        existing = row["fx_rate_to_base"] if hasattr(row, "keys") else row[1]
-        if existing is not None or not currency:
-            return
-        rate = get_currency_rate(currency)
-        if rate is None:
-            return
-        with get_conn() as conn:
-            cur = get_cursor(conn)
-            cur.execute(
-                q(
-                    "UPDATE payments SET fx_rate_to_base = ? "
-                    "WHERE id = ? AND fx_rate_to_base IS NULL"
-                ),
-                (float(rate), payment_id),
-            )
-            conn.commit()
-    except Exception:
-        logger.exception("_snapshot_payment_fx(%s) failed", payment_id)
-
-
 def update_order_status(
     order_id: int,
     status: str,
@@ -6702,8 +6827,14 @@ def _decide_shipment_request(
     order_status: str,
     audit_action: str,
     audit_text: str,
+    credit_override_by: int | None = None,
 ) -> ShipmentDecision:
     """Атомарно перевести заявку И заказ. Либо оба, либо ни одного.
+
+    `credit_override_by` — одобрение с превышением кредитного лимита: отметка
+    `credit_limit_override` ставится ТЕМ ЖЕ UPDATE'ом заказа. Отдельным
+    коммитом после одобрения сбой между ними оставлял одобренный сверх лимита
+    заказ без отметки, кто и почему это разрешил.
 
     Раньше это были две отдельные транзакции, и апдейт заказа шёл БЕЗ guard'а:
     заявка становилась approved, а заказ продавливался в approved из любого
@@ -6732,9 +6863,13 @@ def _decide_shipment_request(
             conn.rollback()
             return ShipmentDecision(False, "request_taken")
 
+        override_sql, override_args = "", []
+        if credit_override_by is not None:
+            override_sql = ", credit_limit_override = 1, credit_limit_override_by = ?"
+            override_args = [credit_override_by]
         cur.execute(
-            q(f"UPDATE orders SET status = ?, updated_at = ? WHERE id = ?{tail}"),
-            (order_status, now_str(), order_id, *extra),
+            q(f"UPDATE orders SET status = ?, updated_at = ?{override_sql} WHERE id = ?{tail}"),
+            (order_status, now_str(), *override_args, order_id, *extra),
         )
         if (cur.rowcount or 0) == 0:
             # Заказ ушёл из допустимого статуса — откатываем И заявку, иначе
@@ -6753,12 +6888,13 @@ def _decide_shipment_request(
 
 
 def approve_shipment_request(
-    req_id: int, approved_by: int, approved_name: str
+    req_id: int, approved_by: int, approved_name: str, *, credit_override: bool = False
 ) -> ShipmentDecision:
     return _decide_shipment_request(
         req_id,
         approved_by,
         approved_name,
+        credit_override_by=approved_by if credit_override else None,
         req_status="approved",
         order_status="approved",
         audit_action="shipment_approved",

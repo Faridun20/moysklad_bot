@@ -189,9 +189,9 @@ def test_close_order_delegates_to_shared_formula():
     """
     import inspect
 
-    from services.database import _maybe_close_order_after_payment
+    from services.database import _close_order_if_covered_locked
 
-    src = inspect.getsource(_maybe_close_order_after_payment)
+    src = inspect.getsource(_close_order_if_covered_locked)
     assert "calc_order_balance(order_id, conn=txn)" in src
     # Никаких собственных SUM'ов по денежным таблицам.
     for fragment in ("FROM payments", "FROM order_items", "FROM returns", "cash_deposit_orders"):
