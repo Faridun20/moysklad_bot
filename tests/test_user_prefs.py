@@ -42,7 +42,7 @@ def test_me_carries_prefs_with_defaults_off(env):
     client, _db, ids = env
     for who in ("boss", "admin", "mgr"):
         me = _post(client, "/api/me", ids[who]).json()
-        assert me["prefs"] == {"work_actions": False}, who
+        assert me["prefs"] == {"work_actions": False, "work_actions_hint_shown": 0}, who
         # Настройки удаления нет — значит «менеджеру можно» (по умолчанию выкл.).
         assert me["delete_requires_boss"] is False
 
@@ -105,8 +105,48 @@ def test_service_rejects_unknown_key(isolated_db):
 
     with pytest.raises(ValueError):
         user_prefs.set_pref(1, "anything", True)
-    assert user_prefs.get_prefs(1) == {"work_actions": False}
-    assert user_prefs.set_pref(1, "work_actions", 1) == {"work_actions": True}
+    assert user_prefs.get_prefs(1) == {"work_actions": False, "work_actions_hint_shown": 0}
+    assert user_prefs.set_pref(1, "work_actions", 1) == {
+        "work_actions": True, "work_actions_hint_shown": 0,
+    }
+
+
+def test_work_actions_hint_shown_counter(env):
+    """D2 продуктового аудита: счётчик показов подсказки «Работаете один?».
+
+    Это int, а не bool — фронт шлёт очередное значение (текущее + 1) каждый
+    раз, когда подсказку реально нарисовал; сервер только валидирует диапазон
+    и роль (та же, что у `work_actions` — подсказка о нём и есть)."""
+    client, db, ids = env
+    r = _post(client, "/api/prefs/set", ids["boss"], key="work_actions_hint_shown", value=1)
+    assert r.status_code == 200, r.text
+    assert r.json()["prefs"]["work_actions_hint_shown"] == 1
+    r = _post(client, "/api/prefs/set", ids["boss"], key="work_actions_hint_shown", value=3)
+    assert r.json()["prefs"]["work_actions_hint_shown"] == 3
+    # Персистентность — новый /api/me видит то же значение.
+    assert _post(client, "/api/me", ids["boss"]).json()["prefs"]["work_actions_hint_shown"] == 3
+    # Только admin/boss — как у самого work_actions.
+    assert _post(
+        client, "/api/prefs/set", ids["mgr"], key="work_actions_hint_shown", value=1
+    ).status_code == 403
+    # Булево на счётчик — отказ (иначе True/False молча стали бы 1/0).
+    assert _post(
+        client, "/api/prefs/set", ids["boss"], key="work_actions_hint_shown", value=True
+    ).status_code == 400
+    assert _post(
+        client, "/api/prefs/set", ids["boss"], key="work_actions_hint_shown", value="1"
+    ).status_code == 400
+    # Отрицательное/за потолком — обрезается, не отказ (это телеметрия показа,
+    # а не решение пользователя — нет причины ронять запрос фронта из-за гонки).
+    r = _post(client, "/api/prefs/set", ids["boss"], key="work_actions_hint_shown", value=-5)
+    assert r.json()["prefs"]["work_actions_hint_shown"] == 0
+    r = _post(client, "/api/prefs/set", ids["boss"], key="work_actions_hint_shown", value=999999)
+    assert r.json()["prefs"]["work_actions_hint_shown"] == 1000
+    # Счётчик — не решение, поэтому в аудит не идёт (в отличие от work_actions).
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute("SELECT action FROM audit_log WHERE action = 'pref_set'")
+        assert cur.fetchall() == []
 
 
 def test_delete_requires_boss_setting_reaches_me(env):
