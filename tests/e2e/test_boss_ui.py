@@ -85,7 +85,9 @@ def test_boss_sees_exactly_the_new_bar_drawer_and_no_worker_buttons(open_app, e2
     _shot(boss, "boss-today")
 
     _open_menu(boss)
-    assert _drawer_tabs(boss, "money") == ["debts", "report"]
+    # «Поставщикам» («мы должны») — контроль, а не работа менеджера:
+    # за выключателем «Рабочие действия» вкладка не прячется.
+    assert _drawer_tabs(boss, "money") == ["debts", "suppliers", "report"]
     assert _drawer_tabs(boss, "sales") == ["orders", "report"]
     assert _drawer_tabs(boss, "stock") == ["catalog", "containers", "machines"]
     assert _drawer_tabs(boss, "clients") == ["funnel", "limits"]
@@ -107,7 +109,7 @@ def test_boss_sees_exactly_the_new_bar_drawer_and_no_worker_buttons(open_app, e2
 
     go(boss, "money")
     settled(boss)
-    assert _seg_tabs(boss) == ["debts", "report"]
+    assert _seg_tabs(boss) == ["debts", "suppliers", "report"]
     assert boss.locator("#content .btn-pay-debt, #content .btn-confirm-pay").count() == 0
     _shot(boss, "boss-money-debts")
 
@@ -143,7 +145,7 @@ def test_switch_on_shows_worker_actions_and_survives_reopen(open_app, e2e):
     )
     # Вкладки в шторке сразу поменялись.
     boss.wait_for_selector('#nav-drawer .nav-link--tab[data-screen="stock"][data-tab="invoices"]')
-    assert _drawer_tabs(boss, "money") == ["debts", "ops", "report"]
+    assert _drawer_tabs(boss, "money") == ["debts", "suppliers", "ops", "report"]
     assert _drawer_tabs(boss, "clients") == ["funnel", "list", "limits", "channel"]
     assert _drawer_tabs(boss, "sales") == ["orders", "report", "docs"]
     boss.wait_for_timeout(350)
@@ -166,7 +168,7 @@ def test_switch_on_shows_worker_actions_and_survives_reopen(open_app, e2e):
     settled(again)
     go(again, "money")
     settled(again)
-    assert _seg_tabs(again) == ["debts", "ops", "report"]
+    assert _seg_tabs(again) == ["debts", "suppliers", "ops", "report"]
 
     # Выключил — работа менеджера снова спрятана.
     _open_menu(again)

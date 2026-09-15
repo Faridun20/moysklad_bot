@@ -10,6 +10,7 @@ const {
   escapeHtml, idemKey, formatDateRU, icon, opsAmount, plural, categoryTree, categoryMatches,
   parseAmount, parsePaymentItems, renderMoneyTotalsHtml, periodSegHtml, rangeLabel,
   navSections, defaultSection, sectionNavHtml, salesTabs, stockTabs, moneyTabs, clientsTabs,
+  roleSectionTabs,
   formatMoney, emptyState, skeleton, errorBoxHtml,
   machineStatusLabel, machineSubtitle, machineStatusSegHtml,
   moneyBlockLabel, agingBarsHtml, forecastRowsHtml, buyerKey, leadFunnelHtml,
@@ -344,6 +345,23 @@ describe('вкладки разделов', () => {
       .toEqual(['debts', 'ops']);
   });
 
+  it('«Поставщикам» — только руководству: сумма прихода это закупочная цена', () => {
+    // /api/suppliers/debts отвечает admin/boss; у менеджера вкладка вернула бы
+    // 403, а заодно показала бы ему себестоимость.
+    expect(keys(moneyTabs, { canSeeDebts: true, canSeeSuppliers: false })).toEqual(['debts']);
+    expect(keys(moneyTabs, { canSeeDebts: true, canSeeSuppliers: true }))
+      .toEqual(['debts', 'suppliers']);
+    expect(roleSectionTabs('money', 'manager', { work: true }).map(t => t.key))
+      .not.toContain('suppliers');
+    for (const r of ['boss', 'admin']) {
+      expect(roleSectionTabs('money', r, { work: true }).map(t => t.key))
+        .toEqual(['debts', 'suppliers', 'ops', 'report']);
+      // «Рабочие действия» выключены — контроль остаётся, работа уходит.
+      expect(roleSectionTabs('money', r, { work: false }).map(t => t.key))
+        .toEqual(['debts', 'suppliers', 'report']);
+    }
+  });
+
   it('Продажи: отчёт только тем, кому отвечает /api/analytics', () => {
     expect(keys(salesTabs, { canSeeReport: true })).toEqual(['orders', 'report']);
     expect(keys(salesTabs, { canSeeReport: false })).toEqual(['orders']);
@@ -377,6 +395,10 @@ describe('вкладки разделов', () => {
   it('ни один раздел не даёт больше 4 вкладок', () => {
     // Пятая не влезает в ряд на 360dp и уезжает в скролл, который не виден.
     const all = [
+      // Реальные наборы флагов, а не любая их комбинация: у руководителя
+      // подтверждения живут в «Решениях», и вкладки `confirm` у него нет.
+      roleSectionTabs('money', 'boss', { work: true }),
+      roleSectionTabs('money', 'manager', { work: true }),
       moneyTabs({ isBoss: true, isConfirmer: true, canSeeDebts: true, hasOps: true }),
       salesTabs({ canSeeReport: true, canDocs: true }),
       stockTabs({ canSeeGoods: true, isBoss: true }),
@@ -1034,7 +1056,8 @@ describe('руководитель: «Рабочие действия» (реш�
     for (const r of ['boss', 'admin']) {
       expect(tabs('sales', r, false)).toEqual(['orders', 'report']);
       expect(tabs('stock', r, false)).toEqual(['catalog', 'containers', 'machines']);
-      expect(tabs('money', r, false)).toEqual(['debts', 'report']);
+      // «Поставщикам» — контроль, а не работа: за выключателем не прячется.
+      expect(tabs('money', r, false)).toEqual(['debts', 'suppliers', 'report']);
       expect(tabs('clients', r, false)).toEqual(['funnel', 'limits']);
     }
   });
@@ -1042,7 +1065,7 @@ describe('руководитель: «Рабочие действия» (реш�
   it('включено: работа менеджера возвращается, подтверждения остаются в «Решениях»', () => {
     expect(tabs('sales', 'boss', true)).toEqual(['orders', 'report', 'docs']);
     expect(tabs('stock', 'boss', true)).toEqual(['catalog', 'containers', 'machines', 'invoices']);
-    expect(tabs('money', 'boss', true)).toEqual(['debts', 'ops', 'report']);
+    expect(tabs('money', 'boss', true)).toEqual(['debts', 'suppliers', 'ops', 'report']);
     expect(tabs('clients', 'boss', true)).toEqual(['funnel', 'list', 'limits', 'channel']);
   });
 

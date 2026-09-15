@@ -195,8 +195,10 @@ def _add_manager2(e2e) -> None:
 @pytest.mark.parametrize(("who", "tabs", "active"), [
     # Подтверждения руководства — в «Решениях» (test_boss_ui.py); «Касса» —
     # с «Рабочими действиями» (boss_work_actions этого модуля).
-    ("boss", ["debts", "ops", "report"], "debts"),
-    ("admin", ["debts", "ops", "report"], "debts"),
+    # «Поставщикам» («мы должны») — зеркало «Долгов» и только руководству:
+    # сумма прихода это закупочная цена, `/api/suppliers/debts` — admin/boss.
+    ("boss", ["debts", "suppliers", "ops", "report"], "debts"),
+    ("admin", ["debts", "suppliers", "ops", "report"], "debts"),
     # «Подтвердить» у менеджера — пока он замещает кладовщика и бухгалтера
     # (services.roles.ROLE_ALSO_ACTS_AS); при откате — ["debts", "ops"].
     ("mgr", ["confirm", "debts", "ops"], "confirm"),
@@ -216,7 +218,8 @@ def test_money_tabs_match_role(open_app, e2e, who, tabs, active):
     # состоянием (данных ещё нет). У кладовщика и бухгалтера вкладка одна —
     # «Подтвердить», и переключатель из одного пункта не рисуется.
     empty = {"confirm": "Нет записей на подтверждении", "debts": "Долгов и платежей пока нет",
-             "report": "За период поступлений нет", "ops": "Оформить возврат"}
+             "report": "За период поступлений нет", "ops": "Оформить возврат",
+             "suppliers": "Долгов перед поставщиками нет"}
     for key in tabs or ["confirm"]:
         if tabs:
             tab(page, key)
