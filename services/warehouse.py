@@ -647,9 +647,12 @@ async def get_categories() -> list[dict]:
     папка номенклатуры, и переносить дерево ради фильтра в одну кнопку незачем.
     Поэтому id категории — само её название.
     """
+    # GROUP BY, а не DISTINCT: Postgres не пускает в ORDER BY при DISTINCT
+    # выражение, которого нет в списке выборки, а `category COLLATE …` для него
+    # уже другое выражение.
     rows = await adb_core.fetch(
-        "SELECT DISTINCT category FROM products "
-        "WHERE category IS NOT NULL AND category <> '' "
+        "SELECT category FROM products "
+        "WHERE category IS NOT NULL AND category <> '' GROUP BY category "
         f"ORDER BY {adb_core.order_by_name('category')}"
     )
     return [{"id": r["category"], "name": r["category"]} for r in rows]

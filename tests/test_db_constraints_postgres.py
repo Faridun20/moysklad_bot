@@ -155,7 +155,19 @@ def test_names_sort_in_russian_on_postgres(pg_db):
     assert got == ["Абрикос", "Елена", "Ёлка", "яблоко", "alfa", "Zeta"], got
     assert [r["name"] for r in _run(warehouse.get_catalog())] == got
     assert [r["name"] for r in _run(counterparties.search("ЁЛ"))] == ["Елена", "Ёлка"]
+    assert [r["name"] for r in _run(warehouse.get_stock())] == got
+    assert [r["name"] for r in _run(warehouse.search_products("е"))][:2] == ["Елена", "Ёлка"]
     assert startup_checks.check_collation() == []
+
+
+def test_categories_sort_in_russian_on_postgres(pg_db):
+    """DISTINCT + ORDER BY … COLLATE Postgres отвергает — категории через GROUP BY."""
+    from services import container_receipt, warehouse
+
+    for n, cat in (("a", "Трубы"), ("b", "Арматура"), ("c", "Трубы"), ("d", "cable")):
+        pid = _run(container_receipt.create_product(n))["product_id"]
+        _exec(pg_db, "UPDATE products SET category = %s WHERE id = %s", (cat, pid))
+    assert [c["name"] for c in _run(warehouse.get_categories())] == ["Арматура", "Трубы", "cable"]
 
 
 # ─── Разовый скрипт на базе «как на проде» ───────────────────────────────────

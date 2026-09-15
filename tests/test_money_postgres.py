@@ -48,6 +48,17 @@ def _reload_modules():
     # machines копирует USE_POSTGRES при импорте — без перезагрузки он остался
     # бы в режиме той базы, с которой модуль импортировали первым.
     importlib.reload(machines)
+    # То же у остальных сервисов с `from services.database import USE_POSTGRES`
+    # (counterparties, containers, container_receipt, leads…): модуль,
+    # импортированный в SQLite-тесте, внутри Postgres-теста звал бы
+    # last_insert_rowid(), а после него SQLite-тест — hashtext(). Флаг
+    # выставляем, а не перезагружаем модуль: reload подменил бы классы
+    # исключений, которые ловят другие модули.
+    import sys
+
+    for name, mod in list(sys.modules.items()):
+        if name.startswith("services.") and mod is not db and hasattr(mod, "USE_POSTGRES"):
+            mod.USE_POSTGRES = db.USE_POSTGRES
     return db
 
 
