@@ -5341,25 +5341,6 @@ async def get_payment(payment_id: int) -> dict | None:
     return _with_major(row, ("amount", "amount_cents"))
 
 
-async def get_payments_report(since: str | None = None, until: str | None = None) -> list[dict]:
-    """Подтверждённые платежи за период. asyncpg-миграция Stage 7 (задача #21):
-    нативный async через adb_core. Вызов — только handlers/payments (`await adb`)."""
-    query = (
-        f"SELECT p.* FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
-        f"WHERE p.status = 'confirmed' AND {_LIVE_ORDER_PAYMENT_FILTER}"
-    )
-    params: list = []
-    if since:
-        params.append(since)
-        query += f" AND p.created_at >= ${len(params)}"
-    if until:
-        params.append(until)
-        query += f" AND p.created_at <= ${len(params)}"
-    query += " ORDER BY p.created_at DESC"
-    rows = await adb_core.fetch(query, *params)
-    return _with_major(rows, ("amount", "amount_cents"))
-
-
 async def get_cash_history(
     limit: int = 80, since: str | None = None, until: str | None = None
 ) -> list[dict]:
@@ -5468,43 +5449,6 @@ async def get_cash_history(
     return rows[:limit]
 
 
-def get_cashbox_stats(since: str | None = None, until: str | None = None) -> dict:
-    """Касса: подтверждённые поступления денег за период.
-
-    Сумма CONFIRMED платежей по `created_at` в [since, until] — «сколько
-    реально получили». Группируем по валюте (платежи бывают в разных
-    валютах); `total_cents` — суммарно в копейках по всем валютам, а
-    `by_currency` даёт разбивку, если валют больше одной.
-
-    since/until — ISO-строки 'YYYY-MM-DD HH:MM:SS' в локальной TZ (как
-    `created_at` пишется через now_str()), поэтому лексикографическое
-    сравнение строк корректно. Порог считаем в Python и передаём
-    параметром — НЕ сравниваем с SQL NOW()/datetime('now') (разные TZ,
-    silent-bug; см. CLAUDE.md).
-    """
-    query = (
-        f"SELECT p.currency AS currency, COUNT(*) AS cnt, {_SUM_PAYMENTS_CENTS} AS total_cents "
-        f"FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
-        f"WHERE p.status = 'confirmed' AND {_LIVE_ORDER_PAYMENT_FILTER}"
-    )
-    params: list = []
-    if since:
-        query += " AND p.created_at >= ?"
-        params.append(since)
-    if until:
-        query += " AND p.created_at <= ?"
-        params.append(until)
-    query += " GROUP BY p.currency"
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        cur.execute(q(query), params)
-        rows = [dict(r) for r in cur.fetchall()]
-    total_cents = sum(int(r["total_cents"] or 0) for r in rows)
-    count = sum(int(r["cnt"] or 0) for r in rows)
-    by_currency = {(r.get("currency") or "—"): int(r["total_cents"] or 0) for r in rows}
-    return {"total_cents": total_cents, "count": count, "by_currency": by_currency}
-
-
 async def get_money_totals(since: str | None = None, until: str | None = None) -> dict:
     """Поступления компании за период (раздел «Деньги», boss/admin).
 
@@ -5585,28 +5529,6 @@ async def get_money_totals(since: str | None = None, until: str | None = None) -
             "count": int((dep_row or {}).get("cnt") or 0),
         },
     }
-
-
-async def get_summary_by_employee(
-    since: str | None = None, until: str | None = None
-) -> list[dict]:
-    """Платежи по сотрудникам (confirmed). asyncpg Stage 8 (#21)."""
-    query = (
-        "SELECT p.full_name, p.currency, "
-        "COALESCE(SUM(p.amount_cents), 0) as total_cents, COUNT(*) as count "
-        f"FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
-        f"WHERE p.status = 'confirmed' AND {_LIVE_ORDER_PAYMENT_FILTER}"
-    )
-    params: list = []
-    if since:
-        params.append(since)
-        query += f" AND p.created_at >= ${len(params)}"
-    if until:
-        params.append(until)
-        query += f" AND p.created_at <= ${len(params)}"
-    query += " GROUP BY p.full_name, p.currency ORDER BY total_cents DESC"
-    rows = await adb_core.fetch(query, *params)
-    return _with_major(rows, ("total", "total_cents"))
 
 
 # ─── Аудит лог ────────────────────────────────────────────────────────────────

@@ -115,21 +115,10 @@ def test_get_all_orders_async(isolated_db):
 
 
 
-# ─── Stage 7: get_payments_report, get_overdue_undeposited_orders ────────────────
+# ─── Stage 7: get_overdue_undeposited_orders ─────────────────────────────────
+# get_payments_report удалён: вызывающих не осталось (бот /payreport вырезан).
 
 
-def test_get_payments_report_async(isolated_db):
+def test_get_overdue_undeposited_orders_async(isolated_db):
     db = isolated_db
-    assert inspect.iscoroutinefunction(db.get_payments_report)
     assert inspect.iscoroutinefunction(db.get_overdue_undeposited_orders)
-
-    pid = db.add_payment(400, "m", "M", 123.0, "USD", "за товар")
-    with db.get_conn() as conn:
-        cur = db.get_cursor(conn)
-        cur.execute(db.q("UPDATE payments SET status = 'confirmed' WHERE id = ?"), (pid,))
-        conn.commit()
-
-    rows = asyncio.run(db.get_payments_report())
-    assert any(r["id"] == pid for r in rows)
-    # все строки отчёта — только confirmed
-    assert all(r["status"] == "confirmed" for r in rows)
