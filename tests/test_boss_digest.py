@@ -159,6 +159,35 @@ def test_confirmed_cash_deposit_part_excluded_from_received(isolated_db):
     assert data["received"]["count"] == 0
 
 
+def test_pending_return_uses_order_currency_not_hardcoded_usd(isolated_db):
+    """Сумма возврата в дайджесте — в валюте ЗАКАЗА (аудит, финдинг #5), а не
+    всегда USD: хардкод "USD" считал 6000 сум (~$0.47) как $6000 (выше порога
+    $5000) и молча исключал возврат из дайджеста, думая, что он уже ушёл
+    мгновенной карточкой — хотя на самом деле он не ушёл никуда."""
+    from services import boss_digest as bd
+
+    db = isolated_db
+    db.set_role(10, "u", "Manager", "manager")
+    assert db.set_currency_rate("UZS", 1 / 12700, updated_by=1)[0]
+    oid = db.create_order(10, "Manager", "")
+    assert db.update_order_currency(oid, "UZS", require_draft=True)
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q(
+                "INSERT INTO returns (order_id, return_type, reason, total_amount_cents, "
+                "created_by, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)"
+            ),
+            (oid, "full", "брак", 600000, 10, db.now_str()),  # 6000.00 UZS
+        )
+        conn.commit()
+
+    data = _run(bd.gather())
+    assert data["returns"]["count"] == 1
+    assert "UZS" in data["returns"]["lines"][0]
+    assert "USD" not in data["returns"]["lines"][0]
+
+
 def test_confirmed_small_payment_counts_as_received(isolated_db):
     from services import boss_digest as bd
 

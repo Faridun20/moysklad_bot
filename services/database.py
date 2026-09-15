@@ -4911,10 +4911,18 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
 async def get_pending_returns() -> list[dict]:
     """Возвраты, ждущие подтверждения. asyncpg-миграция Stage 5 (задача #21):
     нативный async через adb_core. Вызовы: handlers/webapp (`await adb.…`),
-    async-cron run_ops_monitor (`await`), тесты (`asyncio.run`)."""
+    async-cron run_ops_monitor (`await`), тесты (`asyncio.run`).
+
+    `order_currency` — валюта ЗАКАЗА (LEFT JOIN, как в `list_ledger_entries`,
+    WP-07): `total_amount`/`total_amount_cents` считаются из
+    `order_items.price_cents`, т.е. в валюте заказа, а не всегда USD.
+    Потребители (`services.boss_digest`) сравнивают сумму с порогом и
+    подписывают её этой валютой, а не хардкодят "USD"."""
     rows = await adb_core.fetch(
-        "SELECT * FROM returns WHERE status = 'pending' "
-        "ORDER BY created_at ASC"
+        "SELECT r.*, o.currency AS order_currency FROM returns r "
+        "LEFT JOIN orders o ON o.id = r.order_id "
+        "WHERE r.status = 'pending' "
+        "ORDER BY r.created_at ASC"
     )
     return _with_major(rows, ("total_amount", "total_amount_cents"))
 

@@ -157,6 +157,11 @@ async def gather() -> dict:
     def _deposit_currency(row: dict) -> str:
         return dep_currency.get(int(row["id"]), "USD")
 
+    def _return_currency(row: dict) -> str:
+        # total_amount — в валюте ЗАКАЗА (order_items.price_cents), не всегда
+        # USD: get_pending_returns() отдаёт её LEFT JOIN'ом (WP-07-style).
+        return (row.get("order_currency") or "USD").upper()
+
     def _is_cash_part(payment_id) -> bool:
         part = parts.get(int(payment_id))
         return bool(part) and part.get("method") == "cash"
@@ -179,7 +184,7 @@ async def gather() -> dict:
     payments_digest = _digest_only(payments_all, policy.PAYMENT, _payment_currency)
     deposits_digest = _digest_only(deposits_all, policy.CASH_DEPOSIT, _deposit_currency)
     returns_digest = _digest_only(
-        returns_all, policy.RETURN, lambda r: "USD", amount_key="total_amount"
+        returns_all, policy.RETURN, _return_currency, amount_key="total_amount"
     )
     received_digest = _digest_only(confirmed_recent, policy.PAYMENT, _payment_currency)
 
@@ -196,7 +201,10 @@ async def gather() -> dict:
         return f"#{d['id']} — {d['amount']:,.0f} {_deposit_currency(d)}".replace(",", " ")
 
     def _return_line(r: dict) -> str:
-        return f"#{r['id']} · заказ #{r['order_id']} — {r['total_amount']:,.0f} USD".replace(",", " ")
+        return (
+            f"#{r['id']} · заказ #{r['order_id']} — {r['total_amount']:,.0f} "
+            f"{_return_currency(r)}"
+        ).replace(",", " ")
 
     return {
         "since": since,
