@@ -323,6 +323,21 @@ async def create_invoice_in(
         )
         await _apply_stock_delta(txn, p["product_id"], warehouse_id, sign * p["quantity"])
 
+    # Себестоимость: приход заводит партии, расход фиксирует, из каких партий
+    # ушёл товар. Той же транзакцией — полу-учёт хуже отказа. При выключенном
+    # учёте (app_settings.accounting_enabled) — ничего. Стоит ПОСЛЕ движения
+    # остатка: FIFO читает остаток «после» и знает, сколько было «до».
+    from services import costing
+
+    await costing.record_invoice_in(
+        txn,
+        invoice_id=int(invoice_id),
+        invoice_type=invoice_type,
+        invoice_date=date_str,
+        currency=currency,
+        positions=positions,
+    )
+
     logger.info(
         "Накладная %s проведена: id=%s, позиций=%d, сумма=%d коп.",
         number,

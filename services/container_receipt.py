@@ -13,7 +13,9 @@
 * **Цены не спрашиваем.** Человек в этот момент считает коробки, а не
   деньги: позиции уходят без цены, закупочную вписывают позже. Пустая цена
   в приходе лучше, чем выдуманная. (`warehouse` требует цену только для
-  расхода — из неё считается сумма в PDF клиенту.)
+  расхода — из неё считается сумма в PDF клиенту.) Цены закупки вписывает
+  руководство отдельно (`services/costing.py`), и при включённом учёте они
+  доезжают в накладную и партии той же транзакцией приёмки.
 * **Поставщик необязателен.** МойСклад требовал контрагента для «Приёмки»,
   и его приходилось задавать заранее. Локальной накладной он не нужен, и
   выдумывать блокировку, которой больше нет, незачем: поле осталось — его
@@ -347,6 +349,18 @@ async def receive(container_id: int, *, user_id: int | None = None) -> dict:
                 created_by=user_id,
             )
             await _store_result(txn, container_id, int(created["invoice_id"]), unmatched)
+            # Цены закупки и курс прибытия (если учёт включён и их вписали) —
+            # в партии и в саму накладную. Переоприходование переносит уже
+            # проданное со старых партий на новые.
+            from services import costing
+
+            await costing.after_container_receipt_in(
+                txn,
+                container_id=container_id,
+                invoice_id=int(created["invoice_id"]),
+                previous_invoice_id=int(existing_invoice) if existing_invoice else None,
+                matched=matched,
+            )
     except warehouse.InvoiceError as e:
         logger.info("Приёмка контейнера #%s отклонена (%s): %s", container_id, e.code, e.message)
         return {"ok": False, "code": e.code, "error": e.message, "details": e.details}

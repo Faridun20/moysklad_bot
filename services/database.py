@@ -1064,6 +1064,73 @@ def _create_tables():
                 product_id   BIGINT NOT NULL,
                 created_at   TEXT
             )""",
+            # ─── Себестоимость (services/costing.py) ─────────────────────
+            # Всё за выключателем app_settings.accounting_enabled. Новые
+            # таблицы, а не колонки в `containers`/`invoice_items`: колонка в
+            # существующую на проде таблицу не доехала бы (ALTER запрещён).
+            #
+            # Курсы — TEXT (Decimal строкой), а не REAL: REAL на Postgres это
+            # float4, и курс сума к доллару (0.000079…) терял бы знаки ровно
+            # там, где из него считается себестоимость партии.
+            #
+            # Шапка закупки контейнера: валюта и курс НА ДАТУ ПРИБЫТИЯ. Курс
+            # хранится так, как его знают на площадке, — «сум за 1 USD» и
+            # «сум за 1 единицу валюты закупки»; курс к базовой выводится.
+            """CREATE TABLE IF NOT EXISTS container_costing (
+                container_id INTEGER PRIMARY KEY REFERENCES containers(id),
+                currency     TEXT NOT NULL,
+                uzs_per_usd  TEXT NOT NULL,
+                uzs_per_unit TEXT NOT NULL,
+                rate_source  TEXT,
+                rate_date    TEXT,
+                updated_by   BIGINT,
+                updated_at   TEXT
+            )""",
+            # Цена закупки за единицу по позиции контейнера, в валюте шапки.
+            """CREATE TABLE IF NOT EXISTS container_item_costs (
+                item_id          INTEGER PRIMARY KEY REFERENCES container_items(id),
+                container_id     INTEGER NOT NULL REFERENCES containers(id),
+                unit_price_cents BIGINT NOT NULL,
+                updated_by       BIGINT,
+                updated_at       TEXT
+            )""",
+            # Партия = строка приходной накладной с ценой и курсом. FIFO берёт
+            # из партий по порядку; `total_cost_base_cents` NULL — цену ещё не
+            # вписали (партия всё равно занимает место в очереди). Остаток
+            # партии не хранится — выводится из `sale_costs`, иначе отмена
+            # отгрузки должна была бы помнить, что вернуть.
+            f"""CREATE TABLE IF NOT EXISTS cost_batches (
+                id                    {id_type},
+                invoice_id            BIGINT NOT NULL,
+                product_id            BIGINT NOT NULL,
+                container_id          BIGINT,
+                batch_date            TEXT NOT NULL,
+                quantity              {qty_type} NOT NULL,
+                unit_price_cents      BIGINT,
+                currency              TEXT NOT NULL,
+                rate_to_base          TEXT,
+                total_cost_base_cents BIGINT,
+                ref_rates             TEXT,
+                created_at            TEXT NOT NULL
+            )""",
+            # Себестоимость, ЗАФИКСИРОВАННАЯ при отгрузке: сколько из какой
+            # партии ушло и почём. Прибыль прошлых продаж читается отсюда и не
+            # «плывёт» от новых закупок. batch_id NULL — товар старше учёта
+            # (остаток до включения): себестоимость ручная или неизвестна.
+            f"""CREATE TABLE IF NOT EXISTS sale_costs (
+                id                {id_type},
+                invoice_id        BIGINT NOT NULL,
+                product_id        BIGINT NOT NULL,
+                batch_id          BIGINT,
+                quantity          {qty_type} NOT NULL,
+                cost_base_cents   BIGINT,
+                cost_source       TEXT NOT NULL,
+                sale_price_cents  BIGINT NOT NULL,
+                currency          TEXT NOT NULL,
+                sale_rate_to_base TEXT,
+                ref_rate_to_base  TEXT,
+                created_at        TEXT NOT NULL
+            )""",
             # Позиция заказа ↔ карточка локальной номенклатуры. Отдельная
             # таблица, а не значение в `order_items.product_href`: там лежит
             # ССЫЛКА на документ МойСклад, и класть в колонку с таким именем
@@ -1262,6 +1329,20 @@ def _create_indexes():
             # такая операция читала бы таблицу целиком.
             "CREATE INDEX IF NOT EXISTS idx_container_item_products_container "
             "ON container_item_products(container_id)",
+            # Себестоимость: одна партия на (накладная, товар) — повторный
+            # хук не заведёт вторую; FIFO читает партии по товару, отчёт —
+            # фиксации по накладной и по партии.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_cost_batches_invoice_product "
+            "ON cost_batches(invoice_id, product_id)",
+            "CREATE INDEX IF NOT EXISTS idx_cost_batches_product "
+            "ON cost_batches(product_id, batch_date)",
+            "CREATE INDEX IF NOT EXISTS idx_cost_batches_container "
+            "ON cost_batches(container_id)",
+            "CREATE INDEX IF NOT EXISTS idx_container_item_costs_container "
+            "ON container_item_costs(container_id)",
+            "CREATE INDEX IF NOT EXISTS idx_sale_costs_invoice ON sale_costs(invoice_id)",
+            "CREATE INDEX IF NOT EXISTS idx_sale_costs_batch ON sale_costs(batch_id)",
+            "CREATE INDEX IF NOT EXISTS idx_sale_costs_product ON sale_costs(product_id)",
             "CREATE INDEX IF NOT EXISTS idx_order_item_products_order "
             "ON order_item_products(order_id)",
             "CREATE INDEX IF NOT EXISTS idx_order_item_products_product "
