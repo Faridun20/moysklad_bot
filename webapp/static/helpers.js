@@ -402,6 +402,23 @@
       '</button>';
   }
 
+  // Выключатель «Удаление — только руководитель» (экран «Настройки»). Это НЕ
+  // личный вид, а общая настройка компании (`app_settings.delete_requires_boss`,
+  // ручка /api/settings/delete_requires_boss): включена — менеджер больше не
+  // удаляет технику и товары и не отменяет накладные. Тот же бегунок, что у
+  // «Рабочих действий», — чтобы две настройки рядом читались одинаково.
+  function deleteSwitchHtml(on, extraClass) {
+    const hint = on
+      ? 'Включено: удаляет технику и товары, отменяет накладные только руководитель'
+      : 'Выключено: удалять и отменять накладные может и менеджер';
+    const cls = extraClass ? ` ${String(extraClass).replace(/[^a-z0-9 _-]/g, '')}` : '';
+    return `<button type="button" class="work-switch${cls}" role="switch" aria-checked="${on ? 'true' : 'false'}" data-delete-switch>` +
+      `<span class="work-switch-text"><span class="work-switch-title">Удаление — только руководитель</span>` +
+      `<span class="work-switch-hint">${escapeHtml(hint)}</span></span>` +
+      '<span class="work-switch-track" aria-hidden="true"><span class="work-switch-thumb"></span></span>' +
+      '</button>';
+  }
+
   // Рендер блока «Итоги» раздела «Деньги» (данные /api/money/summary):
   // подтверждённые платежи по валютам + сдачи наличных. Чистая функция.
   function renderMoneyTotalsHtml(summary) {
@@ -1069,7 +1086,7 @@
     NAV_SECTIONS, navSections, defaultSection, sectionNavHtml,
     NAV_BAR_MAX, navBarLayout, navDrawerHtml,
     salesTabs, stockTabs, moneyTabs, clientsTabs,
-    BOSS_NAV_ORDER, isBossLike, workActionsOn, deleteActionsOn, roleSectionTabs, resolveScreen, workSwitchHtml,
+    BOSS_NAV_ORDER, isBossLike, workActionsOn, deleteActionsOn, roleSectionTabs, resolveScreen, workSwitchHtml, deleteSwitchHtml,
     periodSegHtml, rangeLabel, formatMoney,
     emptyState, skeleton, errorBoxHtml,
     machineStatusLabel, machineSubtitle, machineStatusSegHtml,

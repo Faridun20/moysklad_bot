@@ -102,6 +102,7 @@ def _checks() -> list[Check]:
     (`order_workflow.TRANSITIONS`), виды документов бухгалтерии
     (`accounting.DOC_KINDS`, `ACCOUNT_KINDS`). Правка там без правки здесь
     ловится тестом (`test_check_values_follow_the_code`)."""
+    from services import machine_deal_requests as mdr
     from services.accounting import ACCOUNT_KINDS, DOC_KINDS
     from services.order_payments import METHODS, RATE_SOURCES
     from services.order_workflow import TRANSITIONS
@@ -180,6 +181,27 @@ def _checks() -> list[Check]:
         Check("sale_costs_source_chk", "sale_costs",
               "cost_source IN ('batch', 'manual', 'unknown')",
               ("id", "cost_source"), "источник себестоимости"),
+        # ── Техника: заявки на сделки (services.machine_deal_requests) ──
+        # FK заявки → машина/сделка стоят в DDL, как у всей техники; здесь —
+        # значения из кода и денежные инварианты.
+        Check("machine_deal_requests_kind_chk", "machine_deal_requests",
+              f"kind IN {_in(list(mdr.KINDS))}", ("id", "kind"), "вид заявки на сделку"),
+        Check("machine_deal_requests_status_chk", "machine_deal_requests",
+              f"status IN {_in(list(mdr.STATUSES))}", ("id", "status"), "статус заявки на сделку"),
+        Check("machine_deal_requests_mode_chk", "machine_deal_requests",
+              f"approval_mode IS NULL OR approval_mode IN {_in(list(mdr.APPROVAL_MODES))}",
+              ("id", "approval_mode"), "кто одобрил заявку"),
+        Check("machine_deal_requests_amounts_chk", "machine_deal_requests",
+              "(price_cents IS NULL OR price_cents > 0) AND down_payment_cents >= 0 "
+              "AND months >= 0", ("id", "price_cents", "down_payment_cents", "months"),
+              "цена > 0, взнос и срок ≥ 0"),
+        Check("machine_receipt_methods_method_chk", "machine_receipt_methods",
+              f"method IN {_in(sorted(METHODS))}", ("receipt_id", "method"),
+              "способ поступления по рассрочке"),
+        Check("machine_deal_requests_deal_chk", "machine_deal_requests",
+              "status <> 'approved' OR kind = 'reserve' OR deal_id IS NOT NULL",
+              ("id", "kind", "status", "deal_id"),
+              "одобренная продажа/рассрочка ссылается на сделку"),
         # ── Бухгалтерия ──
         Check("acc_accounts_kind_chk", "acc_accounts", f"kind IN {_in(sorted(ACCOUNT_KINDS))}",
               ("id", "kind"), "вид счёта"),

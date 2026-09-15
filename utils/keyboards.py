@@ -168,3 +168,28 @@ def prompt_keyboard(*buttons: InlineKeyboardButton) -> InlineKeyboardMarkup:
     смотрел на чат, не понимая, что бот ждёт текст.
     """
     return InlineKeyboardMarkup(inline_keyboard=[[b] for b in buttons], force_reply=True)
+
+
+# ─── Заявка на сделку по технике ─────────────────────────────────────────────
+
+
+def machine_request_callbacks(request_id: int) -> set[str]:
+    """Все кнопки решения по заявке на сделку — для `settle_markup`."""
+    rid = int(request_id)
+    return {f"mdr_ok:{rid}", f"mdr_no:{rid}", f"mdr_rw:{rid}"}
+
+
+def machine_request_keyboard(request_id: int) -> InlineKeyboardMarkup:
+    """Карточка руководителю: одобрить / на доработку (причина) / отклонить.
+
+    Строит сервис (`services.machine_deal_requests`), а не хендлер: карточка
+    уходит из процесса WebApp через `tg_send_message`, импортировать handlers
+    сервису нельзя. Хендлеры — `handlers/machines.py`.
+    """
+    rid = int(request_id)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Одобрить", callback_data=f"mdr_ok:{rid}")
+    kb.button(text="❌ Отклонить", callback_data=f"mdr_no:{rid}")
+    kb.button(text="✏️ На доработку", callback_data=f"mdr_rw:{rid}")
+    kb.adjust(2, 1)
+    return kb.as_markup()

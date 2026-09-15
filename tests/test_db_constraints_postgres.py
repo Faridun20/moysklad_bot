@@ -440,6 +440,40 @@ def _service_flows(db, tag: str) -> None:
     arrived = _run(machines.mark_arrived(made["machine_id"], user_id=MGR, location="Сергели"))
     assert arrived["ok"], arrived
 
+    # Техника: заявки менеджера через одобрение (вид/статус/режим под CHECK,
+    # FK заявки → машина и → сделка). Бронь отклонена, рассрочка — доработка,
+    # повторная отправка, одобрение и поступление; продажа руководства — сразу.
+    from services import machine_deal_requests as mdr
+
+    mid = made["machine_id"]
+    mgr = {"actor_id": MGR, "actor_name": "Manager", "actor_role": "manager"}
+    bs = {"actor_id": BOSS, "actor_name": "Boss", "actor_role": "boss"}
+    booking = _run(mdr.submit(mid, kind="reserve", buyer_name="Покупатель", notify=False, **mgr))
+    assert booking["ok"] and booking["pending"], booking
+    assert _run(mdr.reject(booking["request_id"], reason="клиент не внёс задаток", **bs))["ok"]
+    credit = _run(mdr.submit(mid, kind="credit", price_cents=1_200_000, buyer_name="Иванов",
+                             buyer_passport="AA1234567", down_payment_cents=0, months=3,
+                             notify=False, **mgr))
+    assert credit["ok"] and credit["pending"], credit
+    rid = credit["request_id"]
+    assert _run(mdr.return_for_rework(rid, reason="взнос хотя бы 10%", **bs))["ok"]
+    again = _run(mdr.resubmit(rid, down_payment_cents=120_000, notify=False, **mgr))
+    assert again["ok"], again
+    done = _run(mdr.approve(rid, **bs))
+    assert done["ok"] and done["deal_id"] and done["status"] == "on_credit", done
+    assert _run(machines.add_receipt(done["deal_id"], 360_000, user_id=BOSS))["ok"]
+    other = _run(machines.create_machine(vin=f"PGSALE{tag}", name="JCB 3CX", created_by=BOSS,
+                                         status="in_stock"))
+    sold = _run(mdr.submit(other["machine_id"], kind="sale", price_cents=500_000,
+                           buyer_name="ООО Стройка", **bs))
+    assert sold["ok"] and not sold["pending"] and sold["deal_id"], sold
+    third = _run(machines.create_machine(vin=f"PGCANC{tag}", name="XCMG", created_by=BOSS,
+                                         status="in_stock"))
+    gone_req = _run(mdr.submit(third["machine_id"], kind="sale", price_cents=10_000,
+                               buyer_name="Передумал", notify=False, **mgr))
+    assert _run(mdr.cancel(gone_req["request_id"], **mgr))["ok"]
+    assert _run(machines.delete_machine(third["machine_id"], user_id=BOSS))["ok"]
+
 
 def test_constraints_hold_for_real_service_flows(pg_db):
     from scripts import apply_constraints
@@ -461,6 +495,9 @@ def test_constraints_hold_for_real_service_flows(pg_db):
         ("container_receipt", "invoice_id IS NOT NULL"), ("sale_costs", "TRUE"),
         ("cost_batches", "TRUE"), ("payment_parts", "split_from IS NOT NULL"),
         ("cash_deposit_parts", "TRUE"), ("cash_deposit_currency", "TRUE"),
+        ("machine_deal_requests", "status = 'approved' AND approval_mode = 'boss'"),
+        ("machine_deal_requests", "status = 'approved' AND approval_mode = 'auto'"),
+        ("machine_deal_requests", "status = 'rejected'"),
     ):
         n = _one(db, f"SELECT COUNT(*) AS n FROM {table} WHERE {where}")["n"]
         assert n > 0, table

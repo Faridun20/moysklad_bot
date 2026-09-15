@@ -341,18 +341,62 @@ def machine_card(w: World, uid: int, machine_id: int) -> dict:
     return w.call(uid, "/api/machines/card", machine_id=machine_id)
 
 
-def machine_deal(w: World, uid: int, machine_id: int, *, kind: str, price: float, buyer: str,
-                 down_payment: float = 0, months: int = 0, expect: int = 200) -> dict:
+def machine_deal(w: World, uid: int, machine_id: int, *, kind: str, price: float | None, buyer: str,
+                 down_payment: float = 0, months: int = 0, expect: int = 200,
+                 approve_by: int | None = None) -> dict:
+    """Бронь / продажа / рассрочка через `/api/machines/deal`.
+
+    Менеджер получает заявку на одобрении (`pending`); `approve_by` — кто её
+    сразу одобряет (шаг решения руководителя), ответ тогда — ответ одобрения
+    (`deal_id`, `status`, `payments`). Руководство проводит сделку сразу.
+    """
     payload: dict[str, Any] = {"machine_id": machine_id, "kind": kind, "price": price,
                                "buyer_name": buyer, "buyer_phone": "+998901112233",
                                "buyer_passport": "AA1234567", "currency": "USD",
                                "idempotency_key": key()}
     if kind == "credit":
-        # Форма шлёт взнос и срок только у рассрочки; ноль ручка отвергает как «не число».
-        payload.update(down_payment=down_payment or None, months=months)
-    return w.call(uid, "/api/machines/deal", expect=expect, **payload)
+        # Взнос «0» законен (рассрочка без первоначального взноса).
+        payload.update(down_payment=down_payment, months=months)
+    res = w.call(uid, "/api/machines/deal", expect=expect, **payload)
+    if expect == 200 and approve_by is not None and res.get("pending"):
+        return approve_machine_deal(w, approve_by, res["request_id"])
+    return res
 
 
-def machine_receipt(w: World, uid: int, deal_id: int, amount: float, *, expect: int = 200) -> dict:
+def machine_requests(w: World, uid: int) -> dict:
+    return w.call(uid, "/api/machines/deals/pending")
+
+
+def approve_machine_deal(w: World, uid: int, request_id: int, *, expect: int = 200) -> dict:
+    return w.call(uid, "/api/machines/deals/approve", expect=expect, request_id=request_id,
+                  idempotency_key=key())
+
+
+def rework_machine_deal(w: World, uid: int, request_id: int, reason: str, *,
+                        expect: int = 200) -> dict:
+    return w.call(uid, "/api/machines/deals/rework", expect=expect, request_id=request_id,
+                  reason=reason, idempotency_key=key())
+
+
+def reject_machine_deal(w: World, uid: int, request_id: int, reason: str | None = None, *,
+                        expect: int = 200) -> dict:
+    return w.call(uid, "/api/machines/deals/reject", expect=expect, request_id=request_id,
+                  reason=reason, idempotency_key=key())
+
+
+def resubmit_machine_deal(w: World, uid: int, request_id: int, *, expect: int = 200,
+                          **fields: Any) -> dict:
+    return w.call(uid, "/api/machines/deals/resubmit", expect=expect, request_id=request_id,
+                  idempotency_key=key(), **fields)
+
+
+def machine_receipt(w: World, uid: int, deal_id: int, amount: float, *, expect: int = 200,
+                    method: str = "cash") -> dict:
+    """Поступление по рассрочке — со способом, как разбивка оплаты заказа."""
     return w.call(uid, "/api/machines/receipt", expect=expect, deal_id=deal_id, amount=amount,
+                  method=method, idempotency_key=key())
+
+
+def unreserve_machine(w: World, uid: int, machine_id: int, *, expect: int = 200) -> dict:
+    return w.call(uid, "/api/machines/unreserve", expect=expect, machine_id=machine_id,
                   idempotency_key=key())

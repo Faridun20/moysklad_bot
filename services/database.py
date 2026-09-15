@@ -957,6 +957,58 @@ def _table_ddls() -> list[str]:
                 note          TEXT,
                 created_at    TEXT
             )""",
+            # Заявка на сделку по машине: бронь, продажа или рассрочка, которую
+            # оформил менеджер и которая ждёт решения руководителя. Отдельная
+            # таблица, а не статус в `machine_deals`: сделка — денежный факт, на
+            # неё смотрят дебиторка, напоминания, бухгалтерия и архив, и каждый
+            # из них пришлось бы учить пропускать «ещё не одобренные». Строка в
+            # `machine_deals` появляется только при одобрении (`deal_id`), поэтому
+            # все старые сделки — одобренные по построению. Машина на время
+            # заявки статуса НЕ меняет (CHECK `machines_status_chk` на проде без
+            # ALTER не расширить): «ждёт одобрения» выводится из живой заявки, а
+            # вторую заявку на ту же машину держит частичный UNIQUE
+            # `idx_machine_deal_requests_active`. CHECK на kind/status/
+            # approval_mode ставит `scripts/apply_constraints` (значения — из
+            # `services.machine_deal_requests`), FK — здесь, как у всей техники.
+            f"""CREATE TABLE IF NOT EXISTS machine_deal_requests (
+                id                 {id_type},
+                machine_id         INTEGER NOT NULL REFERENCES machines(id),
+                kind               TEXT NOT NULL,
+                status             TEXT NOT NULL DEFAULT 'pending',
+                price_cents        BIGINT,
+                list_price_cents   BIGINT,
+                currency           TEXT NOT NULL DEFAULT 'USD',
+                down_payment_cents BIGINT NOT NULL DEFAULT 0,
+                months             INTEGER NOT NULL DEFAULT 0,
+                buyer_name         TEXT NOT NULL,
+                buyer_phone        TEXT,
+                buyer_passport     TEXT,
+                buyer_note         TEXT,
+                agent_ms_id        TEXT,
+                machine_status     TEXT NOT NULL,
+                attempts           INTEGER NOT NULL DEFAULT 1,
+                created_by         BIGINT NOT NULL,
+                creator_name       TEXT,
+                created_at         TEXT NOT NULL,
+                submitted_at       TEXT NOT NULL,
+                updated_at         TEXT NOT NULL,
+                decided_by         BIGINT,
+                decider_name       TEXT,
+                decided_at         TEXT,
+                decision_note      TEXT,
+                approval_mode      TEXT,
+                deal_id            INTEGER REFERENCES machine_deals(id)
+            )""",
+            # Способ, которым получено поступление по рассрочке (наличные /
+            # карта / перечисление — те же слова, что у разбивки оплаты заказа,
+            # `order_payments.METHODS`). Sidecar, а не колонка: таблица
+            # поступлений уже на проде. Нет строки — способ не указан (старые
+            # поступления, кнопка «оплачен» без формы, бухгалтерия — там счёт).
+            """CREATE TABLE IF NOT EXISTS machine_receipt_methods (
+                receipt_id INTEGER PRIMARY KEY REFERENCES machine_payment_receipts(id),
+                method     TEXT NOT NULL,
+                created_at TEXT
+            )""",
             # История публикаций в канал. Нужна, чтобы один и тот же контейнер
             # не ушёл в канал дважды — второй раз обычно потому, что первый
             # забыли.
@@ -1435,6 +1487,15 @@ def _index_ddls() -> list[str]:
             "ON machine_deal_payments(due_date)",
             "CREATE INDEX IF NOT EXISTS idx_machine_receipts_deal "
             "ON machine_payment_receipts(deal_id, received_at)",
+            # Одна живая заявка на машину — инвариант, а не оптимизация: две
+            # одновременные «продажи» одной машины от двух менеджеров иначе обе
+            # дошли бы до руководителя. Сервис проверяет это под блокировкой
+            # машины, индекс — последний рубеж.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_machine_deal_requests_active "
+            "ON machine_deal_requests(machine_id) WHERE status IN ('pending', 'rework')",
+            # Очередь решений руководителя — по статусу, старые сверху.
+            "CREATE INDEX IF NOT EXISTS idx_machine_deal_requests_status "
+            "ON machine_deal_requests(status, submitted_at)",
             # ── Контейнеры ───────────────────────────────────────────────────
             # Воронка: список фильтруется по менеджеру и по последней
             # активности, события читаются по лиду.
@@ -1960,6 +2021,9 @@ _DEFAULT_SETTINGS: dict[str, tuple] = {
         "19:00",
         "Время вечернего дайджеста решений боссу (Asia/Tashkent)",
     ),
+    # Решение владельца: пока менеджер один, удалять технику, товары и
+    # накладные может и он; включённый флаг оставляет это руководству.
+    "delete_requires_boss": (False, "Удаление техники, товаров и накладных — только руководитель"),
 }
 
 

@@ -377,11 +377,16 @@ def test_machine_installment_receipt_and_void(env):
     deal_id = deal["deal_id"]
     targets = _run(e.acc.receipt_targets(actor(e.acc, BOSS)))
     assert targets["deals"][0]["remaining_cents"] == 2_000_000
-    # Менеджеру рассрочки не показываются и не записываются.
-    assert _run(e.acc.receipt_targets(actor(e.acc, MGR)))["deals"] == []
+    # Рассрочки ведёт менеджер (решение владельца): видит и записывает сам.
+    assert [d["deal_id"] for d in _run(e.acc.receipt_targets(actor(e.acc, MGR)))["deals"]] == [deal_id]
+    mine = _run(e.acc.record_receipt(actor(e.acc, MGR), {
+        "deal_id": deal_id, "lines": [{"account_id": card, "amount": "12700"}],
+        "rates": {"UZS": "12700"}, "idempotency_key": "m"}))
+    assert mine["credited_cents"] == 100
+    # Стирает деньги по рассрочке руководитель — как удаление поступления в ручке.
     with pytest.raises(e.acc.AccountingError):
-        _run(e.acc.record_receipt(actor(e.acc, MGR), {
-            "deal_id": deal_id, "lines": [{"account_id": card, "amount": "1"}], "idempotency_key": "m"}))
+        _run(e.acc.void_doc(actor(e.acc, MGR), {"doc_id": mine["doc_id"], "reason": "проверка"}))
+    _run(e.acc.void_doc(actor(e.acc, BOSS), {"doc_id": mine["doc_id"], "reason": "проверка"}))
 
     res = _run(e.acc.record_receipt(actor(e.acc, BOSS), {
         "deal_id": deal_id, "lines": [{"account_id": card, "amount": "63 500 000"}],
