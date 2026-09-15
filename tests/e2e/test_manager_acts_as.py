@@ -32,7 +32,8 @@ def test_manager_confirms_deposit_and_sees_it_in_today(open_app, e2e):
     # Руководские оплаты по заказам ему не показываем.
     assert mgr.locator(".pay-confirm").count() == 0
     mgr.click(".dep-confirm")
-    mgr.wait_for_function("() => window.__tgAlerts.some(a => a.includes('Сдача подтверждена'))")
+    # Итог действия — тостом (аудит фронта заменил блокирующие алерты).
+    mgr.wait_for_selector(".toast:has-text('Сдача подтверждена')")
     assert e2e.rows("SELECT status, confirmed_by FROM cash_deposits")[0] == {
         "status": "confirmed", "confirmed_by": e2e.ids["mgr"],
     }
@@ -53,7 +54,7 @@ def test_manager_marks_return_goods_received_but_boss_confirms(open_app, e2e):
     tab(mgr, "confirm")
     mgr.wait_for_selector(".ret-goods")
     mgr.click(".ret-goods")
-    mgr.wait_for_function("() => window.__tgAlerts.some(a => a.includes('принят'))")
+    mgr.wait_for_selector(".toast:has-text('принят')")
     assert e2e.rows("SELECT goods_received, status FROM returns")[0] == {
         "goods_received": 1, "status": "pending",
     }
