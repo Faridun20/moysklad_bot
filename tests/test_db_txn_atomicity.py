@@ -99,30 +99,6 @@ def test_manual_deposit_allocation_cannot_exceed_claimable(isolated_db):
     assert _run(db.create_cash_deposit(1, 40.0, allocations=[(oid, 40.0)]))["ok"]
 
 
-def test_approval_auto_payment_is_idempotent_and_respects_existing_claim(isolated_db):
-    db = isolated_db
-    db.set_role(1, "m", "Manager", "manager")
-    first = _credit_order(db, total=250.0, status="approved", payment_type="paid")
-    pid = _run(db.create_approval_auto_payment(first, "Manager"))
-    assert pid
-    assert _run(db.create_approval_auto_payment(first, "Manager")) is None, "повтор не дублирует"
-    pays = _run(db.get_payments_for_order(first))
-    assert [(p["amount"], p["status"]) for p in pays] == [(250.0, "pending")]
-
-    # Менеджер успел отметить оплату — автоплатёж поверх неё не заводится.
-    second = _credit_order(db, total=90.0, status="approved", payment_type="paid")
-    assert _run(db.mark_order_paid(second, 1, "Manager", amount=30.0))[0]
-    assert _run(db.create_approval_auto_payment(second, "Manager")) is None
-    assert len(_run(db.get_payments_for_order(second))) == 1
-
-    # Заказ, который уже не одобрен (отменили между одобрением и автоплатежом).
-    third = _credit_order(db, total=10.0, status="cancelled", payment_type="paid")
-    assert _run(db.create_approval_auto_payment(third, "Manager")) is None
-    # И «в долг» автоплатежа не получает.
-    credit = _credit_order(db, total=10.0, status="approved", payment_type="credit")
-    assert _run(db.create_approval_auto_payment(credit, "Manager")) is None
-
-
 # ─── Отмена заказа: статус и склад вместе ────────────────────────────────────
 
 
@@ -376,7 +352,7 @@ def api(isolated_db, monkeypatch):
 
 def test_rejected_mark_paid_releases_its_key(api):
     db, _server, client = api
-    body = {"initData": "200", "idempotency_key": "k-404", "amount": 10}
+    body = {"initData": "200", "idempotency_key": "k-404", "parts": [{"method": "card", "currency": "USD", "amount": 10}]}
     r = client.post("/api/orders/mark_paid", json={**body, "order_id": 999_999})
     assert r.status_code == 404
     oid = _credit_order(db, owner=200)
@@ -394,12 +370,12 @@ def test_mark_paid_result_is_stored_with_the_payment(api, monkeypatch):
         raise RuntimeError("упали после коммита")
 
     monkeypatch.setattr(server, "_notify_bosses_payment_pending", crash)
-    body = {"initData": "200", "order_id": oid, "amount": 10, "idempotency_key": "k-crash"}
+    body = {"initData": "200", "order_id": oid, "parts": [{"method": "card", "currency": "USD", "amount": 10}], "idempotency_key": "k-crash"}
     assert client.post("/api/orders/mark_paid", json=body).status_code == 500
     r = client.post("/api/orders/mark_paid", json=body)
     assert r.status_code == 200, r.text
     pays = _run(db.get_payments_for_order(oid))
-    assert len(pays) == 1 and r.json() == {"ok": True, "payment_id": pays[0]["id"]}
+    assert len(pays) == 1 and r.json()["ok"] and r.json()["payment_id"] == pays[0]["id"]
 
 
 def test_abandoned_key_is_reclaimed_only_for_atomic_operations(api):
@@ -414,7 +390,7 @@ def test_abandoned_key_is_reclaimed_only_for_atomic_operations(api):
             (key, op, 200, old, "2999-01-01 00:00:00"),
         )
     r = client.post("/api/orders/mark_paid", json={
-        "initData": "200", "order_id": oid, "amount": 10, "idempotency_key": "k-old",
+        "initData": "200", "order_id": oid, "parts": [{"method": "card", "currency": "USD", "amount": 10}], "idempotency_key": "k-old",
     })
     assert r.status_code == 200, r.text
     # Не атомарная операция: пустой ключ мог скрывать проведённое — только 409.

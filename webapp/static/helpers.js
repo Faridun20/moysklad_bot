@@ -785,6 +785,166 @@
     return `за ${window} ч после поста — ${plural(after, ['обращение', 'обращения', 'обращений'])} · обычно ${baseText}/день`;
   }
 
+  // ─── «Как получены деньги» (payments.js, services/order_payments.py) ───
+  const PAY_METHODS = [['cash', 'Наличные'], ['card', 'Карта'], ['bank', 'Перечисление']];
+  const PAY_METHOD_LABEL = { cash: 'наличные', card: 'на карту', bank: 'перечислением' };
+
+  // ─── Чистые хелперы (тесты — __tests__/payments.test.js) ───────────────────
+
+  // Ввод суммы → копейки, как services.money.parse_amount: «1 500,50» → 150050.
+  function payCents(raw) {
+    const t = String(raw == null ? '' : raw).replace(/[\s  ]/g, '').replace(',', '.');
+    if (!/^\d+(\.\d+)?$/.test(t)) return null;
+    const cents = Math.round(parseFloat(t) * 100);
+    return isFinite(cents) && cents > 0 ? cents : null;
+  }
+
+  function payRate(raw) {
+    const t = String(raw == null ? '' : raw).replace(/[\s  ]/g, '').replace(',', '.');
+    if (!/^\d+(\.\d+)?$/.test(t)) return null;
+    const v = parseFloat(t);
+    return v > 0 && isFinite(v) ? v : null;
+  }
+
+  // Чей курс нужен строке: небазовая валюта пары; null — пересчёта нет.
+  function payRateCurrency(partCur, orderCur, base) {
+    if (!partCur || partCur === orderCur) return null;
+    return partCur !== base ? partCur : orderCur;
+  }
+
+  // Сумма строки в валюте заказа — та же формула, что convert_to_order на сервере.
+  function payConvert(cents, partCur, orderCur, base, quote) {
+    if (partCur === orderCur) return cents;
+    if (!(quote > 0)) return null;
+    return orderCur === base ? Math.round(cents / quote) : Math.round(cents * quote);
+  }
+
+  function payMoney(cents, currency) {
+    return formatMoney((Number(cents) || 0) / 100, currency);
+  }
+
+  // Итог формы: rows [{method, currency, amount, rate}], ctx {currency, base_currency,
+  // due_cents, exact, cbu}. → {total, left, over, short, missingRate, valid, tolerance}
+  function payPreview(rows, ctx) {
+    const base = ctx.base_currency;
+    let total = 0;
+    let any = false;
+    let converted = false;
+    let missingRate = false;
+    let maxQuote = 0;
+    for (const r of rows || []) {
+      const cents = payCents(r.amount);
+      if (!cents || !r.currency) continue;
+      any = true;
+      const rc = payRateCurrency(r.currency, ctx.currency, base);
+      let quote = null;
+      if (rc) {
+        converted = true;
+        quote = payRate(r.rate != null && r.rate !== '' ? r.rate : (ctx.cbu || {})[rc]);
+        if (!quote) { missingRate = true; continue; }
+        if (rc === ctx.currency) maxQuote = Math.max(maxQuote, quote);
+      }
+      total += payConvert(cents, r.currency, ctx.currency, base, quote);
+    }
+    // Допуск на округление пересчёта — как tolerance_cents на сервере.
+    const tolerance = !converted ? 0 : (ctx.currency === base ? 100 : Math.max(100, Math.round(100 * maxQuote)));
+    const due = Number(ctx.due_cents) || 0;
+    const over = total > due + tolerance;
+    const short = !!ctx.exact && total < due - tolerance;
+    return {
+      any, total, missingRate, over, short, tolerance,
+      left: Math.max(0, due - total),
+      valid: any && !missingRate && total > 0 && !over && !short && due > 0,
+    };
+  }
+
+  // Подпись состояния строки разбивки для карточек.
+  const PAY_STATE_LABEL = {
+    on_hand: 'у менеджера, ждут сдачи в кассу',
+    in_deposit: 'сданы в кассу, ждут подтверждения',
+    awaiting_bank: 'ждёт проверки банка',
+    confirmed: 'подтверждено',
+    rejected: 'отклонено',
+  };
+
+  function payPartLine(p) {
+    const what = `${PAY_METHOD_LABEL[p.method] || p.method} ${payMoney(p.amount_cents, p.currency)}`;
+    return `${what} — ${PAY_STATE_LABEL[p.state] || p.state}`;
+  }
+
+  // Карточка долга «ждёт подтверждения»: одна фраза без двусмысленности.
+  // Было «Ждёт: 12 130 USD · Останется: 0 USD» — читалось как «ждём 12к, а
+  // осталось 0?». Смысл: оплата 12 130 ждёт подтверждения, ПОСЛЕ него долг 0.
+  function payAwaitingText(d) {
+    const cur = d.currency || '';
+    const after = Number(d.remaining_after_pending != null
+      ? d.remaining_after_pending : Math.max(0, (d.remaining || 0) - (d.pending || 0)));
+    let text = `Оплата ${formatMoney(d.pending, cur)} ждёт подтверждения · после подтверждения долг: ${formatMoney(after, cur)}`;
+    if (Number(d.overpending) > 0) {
+      text += ` (из них ${formatMoney(d.overpending, cur)} сверх долга — был возврат)`;
+    }
+    return text;
+  }
+
+  // Форма «Сдать наличные»: валюта (с суммой на руках), список наличных по
+  // заказам с отметками и сумма. Разметка — здесь, проводка — renderCashbox.
+  function payHandoverHtml(onHand, baseCurrency) {
+    const byCur = {};
+    (onHand.by_currency || []).forEach(x => { byCur[x.currency] = x.amount_cents; });
+    const currencies = onHand.currencies || [baseCurrency];
+    const cur = (onHand.by_currency || []).length ? onHand.by_currency[0].currency : baseCurrency;
+    return `
+      <div class="section-label">Сдать наличные</div>
+      <div class="card pay-handover" data-cur="${escapeHtml(cur)}">
+        <div class="form-row">
+          <span class="form-label">Валюта</span>
+          <div class="seg">${currencies.map(c =>
+            `<button type="button" class="seg-item ${c === cur ? 'active' : ''}" data-dep-cur="${escapeHtml(c)}" aria-pressed="${c === cur}">${escapeHtml(c)}${byCur[c] ? ' · ' + escapeHtml(payMoney(byCur[c], c)) : ''}</button>`
+          ).join('')}</div>
+        </div>
+        <div class="dep-onhand"></div>
+        <div class="form-row">
+          <label class="form-label" for="dep-amount">Сумма (<span class="dep-cur-label">${escapeHtml(cur)}</span>)</label>
+          <input type="text" id="dep-amount" class="form-input" placeholder="500" inputmode="decimal" autocomplete="off">
+        </div>
+        <button id="dep-create" class="btn-primary">${icon('cash')} Сдать в кассу</button>
+        <div class="debt-hint dep-hint">Закроет наличные по отмеченным заказам — старые первыми.</div>
+      </div>`;
+  }
+
+  // Наличные на руках по заказам в валюте `cur` — строки с отметкой (все отмечены).
+  function payHandoverOrdersHtml(onHand, cur) {
+    const orders = (onHand.orders || []).filter(o => o.currency === cur);
+    if (!orders.length) {
+      return `<div class="debt-hint">Наличных по заказам в ${escapeHtml(cur)} на руках нет${cur === onHand.base_currency ? ' — сдача уйдёт в счёт старых долгов без разбивки, если они есть' : ''}.</div>`;
+    }
+    return `
+      <div class="form-label">На руках по заказам</div>
+      <div class="c-surface c-surface--list">${orders.map(o => `
+        <div class="c-row c-row--tap dep-order" role="checkbox" aria-checked="true" tabindex="0" data-order="${Number(o.order_id)}" data-cents="${Number(o.amount_cents)}" data-status="approved">
+          <div class="card-row-icon">${icon('check')}</div>
+          <div class="card-row-info">
+            <div class="card-row-title">Заказ #${Number(o.order_id)}${o.agent_name ? ' · ' + escapeHtml(o.agent_name) : ''}</div>
+            <div class="card-row-sub">с ${escapeHtml(o.since || '')}</div>
+          </div>
+          <div class="card-row-value">${escapeHtml(payMoney(o.amount_cents, o.currency))}</div>
+        </div>`).join('')}
+      </div>`;
+  }
+
+  // Какие заказы отмечены. Отмечены все — null: ручного выбора нет, FIFO сервера.
+  function payHandoverPicked(box) {
+    const all = Array.from(box.querySelectorAll('.dep-order'));
+    const picked = all.filter(el => el.getAttribute('aria-checked') === 'true').map(el => Number(el.dataset.order));
+    return picked.length && picked.length < all.length ? picked : null;
+  }
+
+  // Что закрывает сдача — для карточек: «#27 — 5 000 USD, #30 — 1 000 USD».
+  function payDepositOrdersText(orders) {
+    const list = (orders || []).map(o => `#${o.order_id} — ${formatMoney(o.amount_allocated != null ? o.amount_allocated : o.amount, o.currency)}`);
+    return list.length ? list.join(', ') : '—';
+  }
+
   return {
     escapeHtml, idemKey, formatDateRU, icon, opsAmount, plural,
     ROLE_ALSO_ACTS_AS, roleIn,
@@ -798,5 +958,8 @@
     moneyBlockLabel, agingBarsHtml, forecastRowsHtml, buyerKey,
     leadFunnelHtml, firstTouchHtml, replySpeedHtml, durationLabel, postEffectLabel,
     whMoney, whQty, whStockBadge,
+    PAY_METHODS, PAY_METHOD_LABEL, PAY_STATE_LABEL, payCents, payRate, payRateCurrency, payConvert,
+    payMoney, payPreview, payPartLine, payAwaitingText, payHandoverHtml, payHandoverOrdersHtml,
+    payHandoverPicked, payDepositOrdersText,
   };
 });

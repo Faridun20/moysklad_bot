@@ -741,7 +741,6 @@ async def approve_shipment_request(
             f"проекция {over_info['projected']:.0f})",
         )
     items = await adb.get_order_items(req["order_id"]) if order else []
-    manager_name = (order or {}).get("full_name") or req.get("full_name") or "—"
 
     # Отгрузка — расходная накладная нашего склада. Раньше здесь создавалась
     # пара документов в МойСклад: customerorder (ради печатной формы) и
@@ -851,6 +850,18 @@ async def approve_shipment_request(
             f"{', '.join(skipped_names[:10])}",
         )
 
+    # «Оплата сразу»: автоплатежа на всю сумму при одобрении БОЛЬШЕ НЕТ. Он
+    # заявлял деньги без способа («неизвестно как»), закрывал весь остаток для
+    # сдачи наличных (сдачи уходили «Заказы: —») и позволял отгрузить заказ, не
+    # сказав, как клиент заплатил. Теперь заказ ждёт в «одобрен — к отгрузке»,
+    # пока менеджер не введёт разбивку (services.order_payments), и только
+    # после неё отгрузка (`mark_order_shipped`) проходит.
+    if order and not order_moved and (order.get("payment_type") or "paid") == "paid":
+        demand_line += (
+            "\n💳 <b>Оплата сразу:</b> перед отгрузкой внесите в WebApp, как клиент "
+            "заплатил — наличные, карта или перечисление (Продажи → заказ → «Внести оплату»)."
+        )
+
     # Уведомляем менеджера
     if bot is not None and req.get("user_id"):
         from services.notify import notify_order_approved
@@ -873,29 +884,6 @@ async def approve_shipment_request(
             bot, pdf_to_send, invoice_id=int(invoice_id), req_id=req_id,
             manager_id=req.get("user_id"), boss_id=boss_user_id,
         )
-
-    # Для paid-заказов автоматически создаём payment-pending,
-    # чтобы босс одной кнопкой зафиксировал реальное получение денег.
-    # Проверка «денег по заказу ещё не заявляли» и вставка — под замком заказа
-    # в одной транзакции (create_approval_auto_payment): параллельная отметка
-    # оплаты менеджером больше не складывается с автоплатежом.
-    if order and not order_moved and (order.get("payment_type") or "paid") == "paid":
-        try:
-            payment_id = await adb.create_approval_auto_payment(order["id"], manager_name)
-            if payment_id and bot is not None:
-                from services.notify import notify_payment_confirmation_needed
-
-                await notify_payment_confirmation_needed(
-                    bot,
-                    order["id"],
-                    manager_name,
-                    payment_id,
-                )
-        except Exception:
-            logger.exception(
-                "Не удалось создать auto-payment для paid-заказа #%s",
-                order["id"],
-            )
 
     return {
         "ok": True,

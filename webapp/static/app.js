@@ -3812,12 +3812,17 @@ function renderOrdersMain(opts = {}) {
             bits.push(`<span class="order-pay">${icon('cash')} Оплата сразу</span>`);
           }
           if (o.paid_confirmed_at) bits.push(`<span class="order-pay order-pay--ok">${icon('check')} Оплачен</span>`);
+          else if (o.needs_payment) bits.push(`<span class="order-pay order-pay--wait">${icon('alert')} Внесите оплату · ${formatMoney(o.payment_gap, escapeHtml(o.currency || ''))}</span>`);
           else if (o.paid_at) bits.push(`<span class="order-pay order-pay--wait">${icon('clock')} На подтверждении</span>`);
           if (o.frozen) bits.push(`<span class="order-pay order-pay--bad">${icon('snow')} Заморожен</span>`);
           if (o.status === 'draft' && o.rejection_comment)
             bits.push(`<span class="order-pay order-pay--bad">${icon('return')} ${escapeHtml(o.rejection_comment)}</span>`);
           return bits.length ? `<div class="order-pay-row">${bits.join('')}</div>` : '';
         })()}
+        ${(o.payment_parts || []).length ? `
+          <div class="debt-breakdown order-parts">${o.payment_parts
+            .filter(p => p.state !== 'rejected')
+            .map(p => `<span>${icon(p.method === 'cash' ? 'cash' : 'card')} ${escapeHtml(payPartLine(p))}</span>`).join('')}</div>` : ''}
         ${o.items.slice(0, 2).map(it => {
           const sub = (it.quantity || 0) * (it.price || 0);
           const cur = o.currency ? ' ' + escapeHtml(o.currency) : '';
@@ -3832,7 +3837,12 @@ function renderOrdersMain(opts = {}) {
             <button class="btn-delete-draft" data-id="${o.id}">${icon('trash')} Удалить</button>
           </div>
         ` : ''}
-        ${o.status === 'approved' && canShip ? `
+        ${o.status === 'approved' && o.needs_payment && (canShip || o.is_mine) ? `
+          <div class="draft-actions">
+            <button class="btn-confirm-pay btn-pay-order" data-id="${o.id}" data-ship="${canShip ? '1' : ''}">${icon('cash')} ${canShip ? 'Внести оплату и отгрузить' : 'Внести оплату'}</button>
+          </div>
+        ` : ''}
+        ${o.status === 'approved' && canShip && !o.needs_payment ? `
           <div class="draft-actions">
             <button class="btn-confirm-pay btn-ship-order" data-id="${o.id}">${icon('truck')} Отгрузить</button>
           </div>
@@ -3962,17 +3972,33 @@ function renderOrdersMain(opts = {}) {
       tg.showConfirm(`Отметить заказ #${id} отгруженным?`, async ok => {
         if (!ok) return;
         btn.disabled = true;
-        try {
-          await api('/api/orders/ship', { order_id: id, idempotency_key: idemKey() });
-          tg.HapticFeedback?.notificationOccurred('success');
-          tg.showAlert(`🚚 Заказ #${id} отгружен`);
-          ordersData = null;
-          await renderOrders();
-        } catch (err) {
-          tg.HapticFeedback?.notificationOccurred('error');
-          tg.showAlert('❌ ' + err.message);
-          btn.disabled = false;
+        // Сервер отказал «сначала оплата» (заказ «оплата сразу», разбивку не
+        // внесли или её отклонили) — открываем форму, а не голую ошибку.
+        const refresh = () => { ordersData = null; renderOrders(); };
+        if (typeof payShipOrOpenForm === 'function') {
+          await payShipOrOpenForm(id, refresh);
+        } else {
+          try {
+            await api('/api/orders/ship', { order_id: id, idempotency_key: idemKey() });
+            tg.showAlert(`🚚 Заказ #${id} отгружен`);
+            refresh();
+          } catch (err) { tg.showAlert('❌ ' + err.message); }
         }
+        btn.disabled = false;
+      });
+    });
+  });
+
+  // «Внести оплату» / «Внести оплату и отгрузить» по «оплате сразу».
+  document.querySelectorAll('.btn-pay-order').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      haptic('light');
+      if (typeof payOpenForm !== 'function') return;
+      payOpenForm({
+        orderId: parseInt(btn.dataset.id, 10),
+        ship: btn.dataset.ship === '1',
+        onDone: () => { ordersData = null; renderOrders(); },
       });
     });
   });
@@ -4657,9 +4683,17 @@ async function renderPendingRequests() {
             ${r.credit.over_limit ? `${icon('alert')} превышение` : `${icon('check')} в пределах`}
           </div>` : ''}
         <div class="order-items">
-          ${r.items.slice(0, 5).map(it =>
-            `<div class="order-item">• ${escapeHtml(it.name)}: <b>${Number(it.quantity) || 0} ${escapeHtml(it.unit)}</b></div>`
-          ).join('')}
+          ${r.items.slice(0, 5).map(it => {
+            // Руководитель сверяет ЦЕНУ и тип денег (требование владельца) —
+            // цена и сумма строки видны прямо в заявке.
+            const qty = Number(it.quantity) || 0;
+            const price = Number(it.price) || 0;
+            const cur = escapeHtml(r.currency || '');
+            return `<div class="order-item">• ${escapeHtml(it.name)}: <b>${qty} ${escapeHtml(it.unit)}</b>`
+              + (price > 0 ? ` × ${formatMoney(price, cur)} = <b>${formatMoney(qty * price, cur)}</b>` : ' · <b>без цены</b>')
+              + '</div>';
+          }).join('')}
+          ${r.items.length > 5 ? `<div class="order-item">… и ещё ${plural(r.items.length - 5, ['позиция', 'позиции', 'позиций'])}</div>` : ''}
         </div>
         <div class="req-actions">
           <button class="btn-approve" data-req="${r.id}">${icon('check')} Одобрить</button>
@@ -6054,7 +6088,7 @@ function cashHistoryHtml(history) {
       <div class="c-row">
         <div class="card-row-icon">${icon(m.ic)}</div>
         <div class="card-row-info">
-          <div class="card-row-title">${m.label} · ${fmt(h.amount)} ${escapeHtml(h.currency || baseCur())}</div>
+          <div class="card-row-title">${m.label} · ${fmt(h.amount)} ${escapeHtml(h.currency || baseCur())}${h.method_label ? ` · ${escapeHtml(h.method_label)}${h.part_currency && h.part_currency !== h.currency ? ` ${formatMoney(h.part_amount, escapeHtml(h.part_currency))}` : ''}` : ''}</div>
           <div class="card-row-sub">${escapeHtml(h.who || '')}${time ? ' · ' + escapeHtml(time) : ''}${ord}</div>
         </div>
         ${histStatus(h.status)}
@@ -6229,8 +6263,10 @@ async function renderCashbox(container, section) {
     if (want.has('/api/payments/pending')) tasks.push(_grab('/api/payments/pending', 'pending').then(v => { payPending = v; }));
   }
   // «Мои сдачи» — секция внутри «Платежи и сдачи» (ops) для тех, кто сдаёт.
+  let onHand = null;     // наличные по заказам на руках — форма «Сдать наличные»
   if (section === 'ops' && canDeposit) {
     tasks.push(_grab('/api/deposits/my', 'deposits').then(v => { myDeposits = v; }));
+    tasks.push(api('/api/deposits/on_hand', {}).then(v => { onHand = v; }));
   }
   try {
     await Promise.all(tasks);
@@ -6242,15 +6278,17 @@ async function renderCashbox(container, section) {
   if (section === 'confirm') setConfirmBadge(null, deposits.length + returns.length + payPending.length);
 
   const depCards = deposits.map(d => {
-    const orders = (d.orders || [])
-      .map(o => `#${o.order_id} — ${fmt(o.amount_allocated)} ${baseCur()}`).join(', ') || '—';
+    const dcur = d.currency || baseCur();
+    const orders = payDepositOrdersText(d.orders);
     return `
       <div class="debt-card" data-dep="${d.id}">
         <div class="debt-card-top">
           <div class="debt-agent">${icon('cash')} Сдача #${d.id}</div>
-          <div class="debt-amount">${fmt(d.amount)} ${baseCur()}</div>
+          <div class="debt-amount">${fmt(d.amount)} ${escapeHtml(dcur)}</div>
         </div>
-        <div class="debt-card-mid"><span class="debt-meta">Заказы: ${escapeHtml(orders)}</span></div>
+        <div class="debt-card-mid"><span class="debt-meta">Заказы: ${escapeHtml(orders)}${d.manager_name ? ' · ' + escapeHtml(d.manager_name) : ''}</span></div>
+        ${Number(d.unallocated) > 0 ? `<div class="debt-card-mid"><span class="debt-meta">Не распределено по заказам: ${formatMoney(d.unallocated, escapeHtml(dcur))}</span></div>` : ''}
+        ${d.is_own && !isBoss ? `<div class="debt-hint">Это ваша сдача: руководителя и бухгалтера в системе нет, поэтому подтверждаете вы — это попадёт в журнал.</div>` : ''}
         <div class="debt-actions">
           <button class="btn-confirm-pay dep-confirm">${icon('check')} Подтвердить</button>
           <button class="btn-reject-pay dep-reject">${icon('close')} Отклонить</button>
@@ -6299,13 +6337,18 @@ async function renderCashbox(container, section) {
       <div class="debt-card debt-awaiting" data-pay="${d.order_id}">
         <div class="debt-card-top">
           <div class="debt-agent">${icon('building')} ${escapeHtml(d.agent_name || '—')}</div>
-          <div class="debt-amount">${fmt(d.pending)} ${escapeHtml(d.currency || 'USD')}</div>
+          <div class="debt-amount">${fmt(d.confirmable != null ? d.confirmable : d.pending)} ${escapeHtml(d.currency || 'USD')}</div>
         </div>
         <div class="debt-card-mid">
           <span class="debt-meta">Заказ #${d.order_id} · из ${fmt(d.total)} ${escapeHtml(d.currency || 'USD')} · ${escapeHtml(d.full_name || '')}</span>
         </div>
+        ${(d.parts || []).filter(p => p.state !== 'rejected').length ? `
+          <div class="debt-breakdown">${d.parts.filter(p => p.state !== 'rejected')
+            .map(p => `<span>• ${escapeHtml(payPartLine(p))}</span>`).join('')}</div>` : `
+          <div class="debt-hint">Способ оплаты не указан (запись до разбивки)</div>`}
+        ${d.recorded_by_me && !isBoss ? `<div class="debt-hint">Оплату вносили вы: руководителя и бухгалтера в системе нет, поэтому подтверждаете вы — это попадёт в журнал.</div>` : ''}
         <div class="debt-actions">
-          <button class="btn-confirm-pay pay-confirm" data-id="${d.order_id}">${icon('check')} Подтвердить оплату</button>
+          <button class="btn-confirm-pay pay-confirm" data-id="${d.order_id}">${icon('check')} Подтвердить ${fmt(d.confirmable != null ? d.confirmable : d.pending)} ${escapeHtml(d.currency || 'USD')}</button>
           <button class="btn-reject-pay pay-reject" data-id="${d.order_id}">${icon('close')} Отклонить</button>
         </div>
       </div>
@@ -6329,23 +6372,15 @@ async function renderCashbox(container, section) {
   let createBlock = '';
   let myBlock = '';
   if (canDeposit) {
-    createBlock = `
-      <div class="section-label">Сдать наличные</div>
-      <div class="card">
-        <div class="form-row">
-          <label class="form-label" for="dep-amount">Сумма (${baseCur()})</label>
-          <input type="text" id="dep-amount" class="form-input" placeholder="500" inputmode="decimal" autocomplete="off">
-        </div>
-        <button id="dep-create" class="btn-primary">${icon('cash')} Сдать в кассу</button>
-        <div class="debt-hint">Распределится по вашим открытым заказам автоматически.</div>
-      </div>
-    `;
+    // Форма сдачи — payments.js: валюта, наличные по заказам на руках с
+    // отметками, сумма (по умолчанию — всё отмеченное).
+    createBlock = payHandoverHtml(onHand || {}, baseCur());
     const stIcon = { pending: 'clock', confirmed: 'check', rejected: 'close' };
     const rows = myDeposits.map(d => `
       <div class="stock-row">
         <div class="stock-info">
-          <div class="stock-name">${icon(stIcon[d.status] || 'cash')} #${d.id} — ${fmt(d.amount)} ${baseCur()}</div>
-          <div class="stock-folder">${(d.created_at || '').slice(0, 16)}${d.status === 'rejected' && d.reject_reason ? ' · ' + escapeHtml(d.reject_reason) : ''}</div>
+          <div class="stock-name">${icon(stIcon[d.status] || 'cash')} #${d.id} — ${fmt(d.amount)} ${escapeHtml(d.currency || baseCur())}</div>
+          <div class="stock-folder">${(d.created_at || '').slice(0, 16)} · Заказы: ${escapeHtml(payDepositOrdersText(d.orders))}${d.status === 'rejected' && d.reject_reason ? ' · ' + escapeHtml(d.reject_reason) : ''}${d.status === 'confirmed' && d.self_confirmed ? ' · подтверждено вами — руководителя нет' : d.status === 'confirmed' && d.confirmed_by_name ? ' · подтвердил ' + escapeHtml(d.confirmed_by_name) : ''}</div>
         </div>
       </div>
     `).join('');
@@ -6630,22 +6665,62 @@ async function renderCashbox(container, section) {
     });
   }
 
-  // Создание сдачи (менеджер).
+  // Создание сдачи (менеджер): валюта, отмеченные заказы, сумма.
   const createBtn = container.querySelector('#dep-create');
+  const handover = container.querySelector('.pay-handover');
+  // Отметки заказов: снял — сумма пересчитывается по отмеченным.
+  const drawOnHand = () => {
+    const list = handover.querySelector('.dep-onhand');
+    list.innerHTML = payHandoverOrdersHtml(onHand, handover.dataset.cur);
+    const sync = () => {
+      const sum = Array.from(list.querySelectorAll('.dep-order[aria-checked="true"]'))
+        .reduce((a, el) => a + (Number(el.dataset.cents) || 0), 0);
+      const input = handover.querySelector('#dep-amount');
+      if (input) input.value = sum ? String(sum / 100) : '';
+    };
+    list.querySelectorAll('.dep-order').forEach(el => el.addEventListener('click', () => {
+      haptic('light');
+      const on = el.getAttribute('aria-checked') !== 'true';
+      el.setAttribute('aria-checked', String(on));
+      if (on) el.dataset.status = 'approved'; else delete el.dataset.status;
+      sync();
+    }));
+    if (list.querySelector('.dep-order')) sync();
+  };
+  if (handover && onHand) {
+    drawOnHand();
+    handover.querySelectorAll('[data-dep-cur]').forEach(b => b.addEventListener('click', () => {
+      haptic('light');
+      handover.dataset.cur = b.dataset.depCur;
+      handover.querySelectorAll('[data-dep-cur]').forEach(x => {
+        const on = x === b;
+        x.classList.toggle('active', on);
+        x.setAttribute('aria-pressed', String(on));
+      });
+      handover.querySelector('.dep-cur-label').textContent = b.dataset.depCur;
+      drawOnHand();
+    }));
+  }
   let depKey = idemKey();  // на форму, как у платежа: ретрай не создаёт вторую сдачу
   if (createBtn) {
     createBtn.addEventListener('click', () => {
       const raw = container.querySelector('#dep-amount').value;
       const amount = parseAmount(raw);
       if (!(amount > 0)) { tg.showAlert('❌ Введите положительную сумму — например 1 500 или 12,50'); return; }
+      const cur = (handover && handover.dataset.cur) || baseCur();
+      const body = { amount, currency: cur, idempotency_key: depKey };
+      const picked = handover ? payHandoverPicked(handover) : null;
+      if (picked) body.order_ids = picked;
       haptic('light');
       createBtn.disabled = true;
-      api('/api/deposits/create', { amount, idempotency_key: depKey })
+      api('/api/deposits/create', body)
         .then(r => {
           depKey = idemKey();
           forgetCash('dep');
           haptic('success');
-          toast(`Сдача #${r.deposit_id} на ${formatMoney(amount, baseCur())} отправлена на подтверждение`);
+          const where = (r.orders || []).length ? ` · заказы: ${payDepositOrdersText(r.orders)}` : '';
+          const rest = Number(r.unallocated) > 0 ? ` · не распределено ${formatMoney(r.unallocated, cur)}` : '';
+          toast(`Сдача #${r.deposit_id} на ${formatMoney(amount, cur)} отправлена на подтверждение${where}${rest}`);
           renderMoneyScreen();
         })
         .catch(e => { toast(e.message, 'error'); createBtn.disabled = false; });
@@ -6661,7 +6736,12 @@ async function renderCashbox(container, section) {
       b.disabled = true;  // защита от двойного тапа (сервер идемпотентен, UX — нет)
       haptic('light');
       api('/api/deposits/confirm', { deposit_id: Number(id), idempotency_key: idemKey() })
-        .then(() => { haptic('success'); toast('Сдача подтверждена'); renderMoneyScreen(); })
+        .then((r) => {
+          haptic('success');
+          const closed = (r && r.closed_orders || []).map(o => '#' + o).join(', ');
+          toast(`Сдача подтверждена${closed ? ' · закрыты заказы ' + closed : ''}${r && r.self_confirmed ? ' · подтверждено вами — руководителя нет' : ''}`);
+          renderMoneyScreen();
+        })
         .catch(e => { b.disabled = false; toast(e.message, 'error'); });
     });
     const box = card.querySelector('.dep-reject-box');
@@ -6713,10 +6793,10 @@ async function renderCashbox(container, section) {
         if (!ok) return;
         btn.disabled = true;
         try {
-          await api('/api/orders/confirm_payment', { order_id: id, idempotency_key: idemKey() });
+          const r = await api('/api/orders/confirm_payment', { order_id: id, idempotency_key: idemKey() });
           tg.HapticFeedback?.notificationOccurred('success');
           // Карточка просто исчезала из списка — без слова, прошло ли.
-          toast(`Оплата по заказу #${id} подтверждена`);
+          toast(`Оплата по заказу #${id} подтверждена${r && r.self_note ? ' · ' + r.self_note : ''}`);
           renderMoneyScreen();
         } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
       });
@@ -7318,15 +7398,22 @@ async function renderDebts(container) {
         <div class="section-label section-awaiting">${icon('clock')} Ожидают подтверждения (${awaiting.length})</div>
         <div class="debts-list">${awaiting.map(d => {
           const ownerStr = d.is_mine ? '' : ` <span class="debt-owner">· ${escapeHtml(d.full_name)}</span>`;
-          // Покажем разбиение: оплачено / в подтверждении / остаток
+          // Разбиение: подтверждено / ждёт / что будет после подтверждения.
+          // Было «Ждёт: 12 130 · Останется: 0» — читалось как противоречие
+          // («ждут 12к, а осталось 0?»). Теперь одна фраза с причиной.
           const dcur = escapeHtml(d.currency || '');
+          const parts = (d.parts || []).filter(p => p.state !== 'confirmed' && p.state !== 'rejected');
+          const canConfirmHere = !!data.can_confirm && Number(d.pending_confirmable) > 0;
           const breakdown = `
             <div class="debt-breakdown">
-              ${d.confirmed > 0 ? `<span>${icon('check')} Подтверждено: <b>${fmt(d.confirmed)} ${dcur}</b></span>` : ''}
-              <span>${icon('clock')} Ждёт: <b>${fmt(d.pending)} ${dcur}</b></span>
-              ${d.remaining > 0 ? `<span>Останется: <b>${fmt(d.remaining - d.pending > 0 ? d.remaining - d.pending : 0)} ${dcur}</b></span>` : ''}
+              ${d.confirmed > 0 ? `<span>${icon('check')} Уже подтверждено: <b>${fmt(d.confirmed)} ${dcur}</b></span>` : ''}
+              <span>${icon('clock')} ${escapeHtml(payAwaitingText(d))}</span>
+              ${parts.map(p => `<span>• ${escapeHtml(payPartLine(p))}</span>`).join('')}
             </div>
           `;
+          const who = Number(d.pending_confirmable) > 0
+            ? (isBoss ? '' : (data.confirm_hint ? `Карту/перечисление ${escapeHtml(data.confirm_hint)}` : ''))
+            : 'Наличные подтверждаются сдачей в кассу (Деньги → Касса)';
           return `
             <div class="debt-card debt-awaiting">
               <div class="debt-card-top">
@@ -7337,14 +7424,18 @@ async function renderDebts(container) {
               <div class="debt-card-mid">
                 <span class="debt-meta">#${d.id} · ${plural(d.items_count, ['позиция', 'позиции', 'позиций'])}${ownerStr}</span>
               </div>
-              ${isBoss ? `
+              ${canConfirmHere ? `
                 <div class="debt-actions">
-                  <button class="btn-confirm-pay" data-id="${d.id}">${icon('check')} Подтвердить</button>
+                  <button class="btn-confirm-pay" data-id="${d.id}">${icon('check')} Подтвердить ${fmt(d.pending_confirmable)} ${dcur}</button>
                   <button class="btn-reject-pay"  data-id="${d.id}">${icon('close')} Отклонить</button>
                 </div>
-              ` : `
-                <div class="debt-hint">Босс должен подтвердить</div>
-              `}
+              ` : ''}
+              ${who ? `<div class="debt-hint">${who}</div>` : ''}
+              ${(d.is_mine || isBoss) && Number(d.claimable) > 0 ? `
+                <div class="pay-input-row">
+                  <input type="hidden" class="pay-amount-input" data-id="${d.id}">
+                  <button class="btn-secondary btn-pay-debt" data-id="${d.id}">${icon('cash')} Внести ещё оплату</button>
+                </div>` : ''}
             </div>
           `;
         }).join('')}</div>
@@ -7385,14 +7476,9 @@ async function renderDebts(container) {
             </div>
             ${d.is_mine || isBoss ? `
               <div class="pay-input-row">
-                <input type="text" class="pay-amount-input" data-id="${d.id}"
-                       placeholder="Сумма · ост. ${fmt(d.remaining)} ${escapeHtml(d.currency || '')}"
-                       inputmode="decimal" autocomplete="off">
-                <button class="btn-mark-paid" data-id="${d.id}"
-                        data-remaining="${Number(d.remaining) || 0}" data-cur="${escapeHtml(d.currency || '')}">${icon('check')} Отметить</button>
+                <input type="hidden" class="pay-amount-input" data-id="${d.id}">
+                <button class="btn-primary btn-pay-debt" data-id="${d.id}">${icon('cash')} Внести оплату · ост. ${fmt(d.remaining)} ${escapeHtml(d.currency || '')}</button>
               </div>
-              <button class="btn-secondary btn-mark-paid-all" data-id="${d.id}"
-                      data-remaining="${Number(d.remaining) || 0}" data-cur="${escapeHtml(d.currency || '')}">Весь остаток · ${fmt(d.remaining)} ${escapeHtml(d.currency || '')}</button>
             ` : ''}
           </div>
         `;
@@ -7441,68 +7527,28 @@ async function renderDebts(container) {
       });
     });
 
-    // Отметка оплаты долга. Поле было type=number: «1 500» и «1,5» браузер
-    // считал невалидными и отдавал пустую строку, а пустая сумма означала
-    // «закрыть весь остаток» — частичная оплата молча превращалась в полную.
-    // Теперь поле текстовое (parseNum понимает пробелы и запятую), пустое или
-    // нечисловое — ошибка, а «весь остаток» — отдельная явная кнопка.
-    // В подтверждении — сумма И валюта: у долгов их несколько.
-    const markPaid = (btn, amount) => {
-      const id = parseInt(btn.dataset.id, 10);
-      const cur = btn.dataset.cur || '';
-      const remaining = Number(btn.dataset.remaining) || 0;
-      const msg = amount === null
-        ? `Отметить оплату всего остатка — ${formatMoney(remaining, cur)}?\nРуководитель должен будет подтвердить.`
-        : `Отметить получение ${formatMoney(amount, cur)}?\nРуководитель должен будет подтвердить.`;
-      tg.showConfirm(msg, async ok => {
-        if (!ok) return;
-        btn.disabled = true;
-        try {
-          const payload = { order_id: id, idempotency_key: idemKey() };
-          if (amount !== null) payload.amount = amount;
-          await api('/api/orders/mark_paid', payload);
-          tg.HapticFeedback?.notificationOccurred('success');
-          toast(`Оплата ${formatMoney(amount === null ? remaining : amount, cur)} отмечена, ждёт подтверждения`);
-          await renderDebts(container);
-        } catch (e) {
-          tg.HapticFeedback?.notificationOccurred('error');
-          toast(e.message, 'error');
-          btn.disabled = false;
-        }
-      });
-    };
-    container.querySelectorAll('.btn-mark-paid').forEach(btn => {
+    // Оплата долга — разбивкой «как получены деньги» (payments.js): способ,
+    // валюта, сумма и курс. Сумма без способа сервером не принимается.
+    container.querySelectorAll('.btn-pay-debt').forEach(btn => {
       btn.addEventListener('click', () => {
-        const input = container.querySelector(`.pay-amount-input[data-id="${btn.dataset.id}"]`);
-        const raw = (input && input.value || '').trim();
-        const amount = parseAmount(raw);
-        if (!raw) {
-          toast('Введите сумму или нажмите «Весь остаток»', 'error');
-          input && input.focus();
-          return;
+        haptic('light');
+        if (typeof payOpenForm === 'function') {
+          payOpenForm({ orderId: parseInt(btn.dataset.id, 10), onDone: () => renderDebts(container) });
         }
-        if (!(amount > 0)) {
-          toast('Сумма должна быть больше нуля — например 1 500 или 12,50', 'error');
-          input && input.focus();
-          return;
-        }
-        markPaid(btn, amount);
       });
-    });
-    container.querySelectorAll('.btn-mark-paid-all').forEach(btn => {
-      btn.addEventListener('click', () => markPaid(btn, null));
     });
 
     // Confirm-payment (босс подтверждает все pending по заказу)
     container.querySelectorAll('.btn-confirm-pay').forEach(btn => {
       btn.addEventListener('click', async () => {
         const id = parseInt(btn.dataset.id);
-        tg.showConfirm('Подтверждаете все ожидающие платежи по этому заказу?', async ok => {
+        tg.showConfirm('Подтверждаете оплату картой/перечислением по этому заказу? Наличные подтверждаются сдачей в кассу.', async ok => {
           if (!ok) return;
           btn.disabled = true;
           try {
-            await api('/api/orders/confirm_payment', { order_id: id, idempotency_key: idemKey() });
+            const r = await api('/api/orders/confirm_payment', { order_id: id, idempotency_key: idemKey() });
             tg.HapticFeedback?.notificationOccurred('success');
+            if (r && r.self_note) toast(`Подтверждено · ${r.self_note}`, 'info');
             await renderDebts(container);
           } catch (e) {
             tg.HapticFeedback?.notificationOccurred('error');

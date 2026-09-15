@@ -156,7 +156,8 @@ describe('«Деньги → Подтвердить»', () => {
       return window.__calls.sort();
     };
     expect(await run('warehouse_keeper')).toEqual(['/api/returns/pending']);
-    expect(await run('bookkeeper')).toEqual(['/api/deposits/pending']);
+    // Бухгалтер сверяет и карту/перечисление по заказам (services.order_payments).
+    expect(await run('bookkeeper')).toEqual(['/api/deposits/pending', '/api/payments/pending']);
     expect(await run('boss')).toEqual(['/api/deposits/pending', '/api/payments/pending', '/api/returns/pending']);
   });
 
@@ -229,74 +230,8 @@ describe('«Сегодня» кладовщика: очередь без сет�
 
 // ─── 4. Отметка оплаты долга ────────────────────────────────────────────────
 
-describe('отметка оплаты долга', () => {
-  const DEBTS = {
-    role: 'manager', scope: 'personal', today: '2026-09-15',
-    debts: [{
-      id: 77, state: 'upcoming', agent_name: 'ООО Ромашка', total: 3000, remaining: 3000,
-      confirmed: 0, pending: 0, currency: 'USD', due_date: '2026-10-01', items_count: 1,
-      is_mine: true, full_name: 'М',
-    }],
-    money_received: [], money_pending: [], remaining_by_currency: [], machine_debts: [], totals: null,
-  };
-  const bootDebts = () => boot(`
-    currentUser = { role: 'manager', user_id: 1 };
-    window.__calls = [];
-    api = async (p, b) => { window.__calls.push([p, b]); return p === '/api/debts' ? (${JSON.stringify(DEBTS)}) : { ok: true }; };
-    window.__ready = renderDebts(document.getElementById('content'));
-  `);
-  const marks = (window) => window.__calls.filter(c => c[0] === '/api/orders/mark_paid').map(c => c[1]);
-
-  it('поле текстовое с inputmode=decimal: «1 500» не превращается в пусто', async () => {
-    const window = bootDebts();
-    await window.__ready;
-    const input = window.document.querySelector('.pay-amount-input');
-    expect(input.getAttribute('type')).toBe('text');
-    expect(input.getAttribute('inputmode')).toBe('decimal');
-    input.value = '1 500';
-    window.document.querySelector('.btn-mark-paid').click();
-    await flush();
-    expect(marks(window)).toHaveLength(1);
-    expect(marks(window)[0].amount).toBe(1500);
-    const confirm = window.__alerts.find(a => a.startsWith('confirm:'));
-    expect(confirm.replace(/\s/g, ' ')).toContain('1 500 USD');
-  });
-
-  it('«1,5» — полтора, а не весь остаток', async () => {
-    const window = bootDebts();
-    await window.__ready;
-    window.document.querySelector('.pay-amount-input').value = '1,5';
-    window.document.querySelector('.btn-mark-paid').click();
-    await flush();
-    expect(marks(window)[0].amount).toBe(1.5);
-  });
-
-  it('пустая или нечисловая сумма — ошибка, запрос не уходит', async () => {
-    const window = bootDebts();
-    await window.__ready;
-    for (const raw of ['', '12abc', '0']) {
-      window.document.querySelector('.pay-amount-input').value = raw;
-      window.document.querySelector('.btn-mark-paid').click();
-      await flush();
-    }
-    expect(marks(window)).toHaveLength(0);
-    expect(window.__alerts.some(a => a.startsWith('confirm:'))).toBe(false);
-    expect(toastsOf(window).join(' ')).toContain('Весь остаток');
-  });
-
-  it('«Весь остаток» — явная кнопка: без amount, в подтверждении сумма и валюта', async () => {
-    const window = bootDebts();
-    await window.__ready;
-    const all = window.document.querySelector('.btn-mark-paid-all');
-    expect(all.textContent.replace(/\s/g, ' ')).toContain('3 000 USD');
-    all.click();
-    await flush();
-    expect(marks(window)).toHaveLength(1);
-    expect('amount' in marks(window)[0]).toBe(false);
-    const confirm = window.__alerts.find(a => a.startsWith('confirm:'));
-    expect(confirm.replace(/\s/g, ' ')).toContain('всего остатка — 3 000 USD');
-  });
-});
+// Отметка оплаты долга суммой без способа удалена: оплата вносится разбивкой
+// «как получены деньги» — тесты в payments.test.js.
 
 // ─── 6. Форма накладной ─────────────────────────────────────────────────────
 

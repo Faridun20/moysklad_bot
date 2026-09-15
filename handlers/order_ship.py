@@ -37,6 +37,14 @@ async def cmd_ship(message: Message, bot: Bot):
     name = message.from_user.full_name or str(message.from_user.id)
     res = await adb.mark_order_shipped(order_id, message.from_user.id, name)
     if not res.get("ok"):
+        if res.get("code") == "payment_required":
+            # Разбивка оплаты вводится в WebApp (строки, валюты, курс) — в чате
+            # её не набрать. Правило то же, что у кнопки «Отгрузить» в WebApp.
+            from handlers._ui import webapp_keyboard
+
+            return await message.answer(
+                f"⚠️ {res['error']}", reply_markup=webapp_keyboard("💳 Внести оплату в WebApp")
+            )
         return await message.answer(f"⚠️ {res.get('error', 'не удалось отгрузить')}")
 
     await message.answer(f"🚚 Заказ #{order_id} отмечен <b>отгруженным</b>.", parse_mode="HTML")

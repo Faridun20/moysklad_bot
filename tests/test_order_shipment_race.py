@@ -85,12 +85,14 @@ def _active_outgoing(db) -> int:
     return int(row["n"] if hasattr(row, "keys") else row[0])
 
 
-# ─── Автоплатёж «оплата сразу» — в копейках ──────────────────────────────────
+# ─── «Оплата сразу» — в копейках, без автоплатежа ────────────────────────────
 
 
-def test_auto_payment_equals_order_total_in_cents_and_closes_order(env):
+def test_paid_order_breakdown_equals_total_in_cents_and_closes_order(env):
     """2 строки × 1,5 шт × 0,33: построчно 50 + 50 = 100 копеек, float-сумма
-    давала 0,99. Платёж обязан совпасть с суммой, по которой закрывается заказ."""
+    давала 0,99. Одобрение платежа больше не создаёт (автоплатежа нет); сумма к
+    оплате, которую требует разбивка, совпадает с суммой закрытия заказа."""
+    from services import order_payments
     from services.database import confirm_payment, get_order_payment_summary, get_payments_for_order
     from services.order_workflow import approve_shipment_request
 
@@ -98,12 +100,16 @@ def test_auto_payment_equals_order_total_in_cents_and_closes_order(env):
     oid, req_id = request(lines=((1.5, 0.33), (1.5, 0.33)))
     res = _run(approve_shipment_request(req_id, 100, "Boss", None))
     assert res["ok"], res
+    assert _run(get_payments_for_order(oid)) == [], "одобрение деньги не заявляет"
+    assert _run(order_payments.payment_gap_cents([oid]))[oid] == 100
 
+    actor = order_payments.Actor(user_id=100, name="Boss", role="boss")
+    rec = _run(order_payments.record_payment_parts(
+        oid, actor, [{"method": "card", "currency": "USD", "amount": "1"}]))
     payments = _run(get_payments_for_order(oid))
-    assert len(payments) == 1
     summary = _run(get_order_payment_summary(oid))
     assert summary["total_cents"] == 100
-    assert payments[0]["amount_cents"] == summary["total_cents"]
+    assert [p["amount_cents"] for p in payments] == [100] == [rec["total_cents"]]
 
     assert _run(confirm_payment(payments[0]["id"], 100, "Boss"))
     summary = _run(get_order_payment_summary(oid))

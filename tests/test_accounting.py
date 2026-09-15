@@ -129,9 +129,11 @@ def test_disabled_by_default_new_endpoints_refuse_and_old_flow_untouched(env):
     r = post(e, "/api/acc/receipt", MGR, order_id=1, lines=[], idempotency_key="k")
     assert r.status_code == 409
 
-    # Старый поток: «Отметить оплату» → pending-платёж в валюте заказа, как раньше.
+    # Без бухгалтерии оплата вносится разбивкой «как получены деньги» →
+    # pending-платёж в валюте заказа, журнал денег не трогается.
     oid = make_order(e.db)
-    r = post(e, "/api/orders/mark_paid", MGR, order_id=oid, amount=300, idempotency_key="old-1")
+    r = post(e, "/api/orders/mark_paid", MGR, order_id=oid,
+             parts=[{"method": "bank", "currency": "USD", "amount": 300}], idempotency_key="old-1")
     assert r.status_code == 200, r.text
     pays = _run(e.db.get_payments_for_order(oid))
     assert [(p["amount_cents"], p["status"]) for p in pays] == [(30000, "pending")]

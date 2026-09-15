@@ -370,6 +370,12 @@ def test_check_values_follow_the_code():
         assert f"'{kind}'" in checks["acc_docs_kind_chk"]
     for kind in ACCOUNT_KINDS:
         assert f"'{kind}'" in checks["acc_accounts_kind_chk"]
+    from services.order_payments import METHODS, RATE_SOURCES
+
+    for method in METHODS:
+        assert f"'{method}'" in checks["payment_parts_method_chk"]
+    for source in RATE_SOURCES:
+        assert f"'{source}'" in checks["payment_parts_rate_source_chk"]
     names = [c.name for c in apply_constraints._checks()]
     names += [fk.name for fk in apply_constraints.FOREIGN_KEYS]
     assert len(names) == len(set(names))

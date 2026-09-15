@@ -69,7 +69,12 @@ def test_manager_gains_exactly_keeper_and_bookkeeper_endpoints():
         "/api/deposits/confirm",
         "/api/deposits/pending",
         "/api/deposits/reject",
+        # Карту/перечисление по заказу сверяет бухгалтер (services.order_payments);
+        # менеджер пока бухгалтер — экран и журнал помечают «подтвердил сам».
+        "/api/orders/confirm_payment",
+        "/api/orders/reject_payment",
         "/api/orders/ship",
+        "/api/payments/pending",
         "/api/payments/unlinked",
         "/api/returns/goods_received",
         "/api/returns/pending",

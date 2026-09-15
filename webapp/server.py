@@ -1591,7 +1591,7 @@ async def api_payments_pending(request: Request):
     data = await request.json()
     user = _authorize(
         data,
-        allowed_roles=("admin", "boss"),  # подтверждает только начальство
+        allowed_roles=("admin", "boss", "bookkeeper"),  # как confirm_payment
         rate_limit_scope="api_payments_pending",
         rate_limit_max=30,
         rate_limit_window=60.0,
@@ -1601,6 +1601,9 @@ async def api_payments_pending(request: Request):
     order_ids = [o["id"] for o in orders]
     items_by_order = await adb.get_order_items_by_ids(order_ids) if order_ids else {}
     payments_by_order = await adb.get_payments_for_orders(order_ids) if order_ids else {}
+    from services import order_payments
+
+    parts_by_order = await order_payments.parts_for_orders(order_ids) if order_ids else {}
 
     result = []
     for o in orders:
@@ -1608,6 +1611,14 @@ async def api_payments_pending(request: Request):
         total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
         payments = payments_by_order.get(o["id"], [])
         pending = sum(float(p["amount"]) for p in payments if p["status"] == "pending")
+        parts = parts_by_order.get(o["id"], [])
+        cash_pending_ids = {
+            pt["payment_id"] for pt in parts if pt["method"] == "cash" and pt["state"] in ("on_hand", "in_deposit")
+        }
+        confirmable = sum(
+            float(p["amount"]) for p in payments
+            if p["status"] == "pending" and int(p["id"]) not in cash_pending_ids
+        )
         result.append(
             {
                 "order_id": o["id"],
@@ -1623,6 +1634,13 @@ async def api_payments_pending(request: Request):
                     for it in items[:3]
                 ],
                 "created_at": (o.get("created_at") or "")[:16],
+                # Как получены деньги: карта/счёт — подтверждаются этой
+                # карточкой, наличные — сдачей в кассу (не этой кнопкой).
+                "parts": parts,
+                "confirmable": confirmable,
+                "cash_pending": pending - confirmable,
+                "recorded_by_me": any(int(p["user_id"]) == int(user["id"]) for p in payments
+                                      if p["status"] == "pending"),
             }
         )
 
@@ -2019,7 +2037,11 @@ async def api_money_summary(request: Request):
         (p["total_cents"] / 100, p["currency"], p["fx_rate_to_base"])
         for p in totals.pop("payments_by_rate", [])
     ]
-    parts.append((totals["deposits"]["total_cents"] / 100, base_cur, None))
+    # Сдачи — в своей валюте (наличные сумы в кассе — сумы, cash_deposit_currency).
+    for dep in totals["deposits"].get("by_currency") or [
+        {"currency": base_cur, "total_cents": totals["deposits"]["total_cents"]}
+    ]:
+        parts.append((dep["total_cents"] / 100, dep["currency"], None))
     known_sum = 0.0
     known_any = False
     missing: dict[str, float] = {}  # валюта → сумма (мажор), не вошедшая в итог
@@ -3079,6 +3101,22 @@ async def api_orders(request: Request):
         if await costing.is_enabled():
             shipped_profit = await costing.order_profits([o["id"] for o in orders])
 
+    # Как получены деньги по заказу (разбивка) и сколько по «оплате сразу» ещё
+    # не внесено — батчем: без разбивки такой заказ не отгрузить, и карточка
+    # показывает «Внести оплату» вместо голой ошибки на «Отгрузить».
+    from services import order_payments
+
+    money_ids = [
+        o["id"] for o in orders
+        if o.get("status") in ("approved", "shipped", "paid", "partially_returned", "returned")
+    ]
+    parts_by_order = await order_payments.parts_for_orders(money_ids) if money_ids else {}
+    gap_ids = [
+        o["id"] for o in orders
+        if o.get("status") == "approved" and (o.get("payment_type") or "paid") == "paid"
+    ]
+    gaps = await order_payments.payment_gap_cents(gap_ids) if gap_ids else {}
+
     result = []
     for o in orders:
         items = items_by_order.get(o["id"], [])
@@ -3106,6 +3144,12 @@ async def api_orders(request: Request):
             "frozen": bool(o.get("frozen")),
             "rejection_count": int(o.get("rejection_count") or 0),
             "rejection_comment": o.get("rejection_comment") or "",
+            "payment_parts": parts_by_order.get(o["id"], []),
+            # «Оплата сразу», одобрен, а оплата внесена не вся — отгрузка
+            # откажет (mark_order_shipped), пока менеджер не внесёт разбивку.
+            "payment_gap": float(money.from_cents(gaps.get(o["id"], 0))),
+            "needs_payment": gaps.get(o["id"], 0) > 0,
+            "is_mine": o["user_id"] == user["id"],
             "items": [
                 {
                     # id позиции — им редактор удаляет строку (`/api/orders/remove_item`).
@@ -3154,6 +3198,7 @@ async def api_pending_requests(request: Request):
         rate_limit_max=120,
     )
 
+    from config import BASE_CURRENCY
     from services import async_db as adb
 
     requests = await adb.get_pending_requests()
@@ -3190,6 +3235,7 @@ async def api_pending_requests(request: Request):
             "agent_name": order.get("agent_name", "") if order else "",
             "payment_type": ptype,
             "due_date": order.get("due_date") if order else None,
+            "currency": (order.get("currency") if order else None) or BASE_CURRENCY,
             "total": total,
             "items": [
                 {
@@ -4961,17 +5007,38 @@ async def api_deposits_pending(request: Request):
     from services import async_db as adb
 
     data = await request.json()
-    _authorize(
+    user = _authorize(
         data,
         allowed_roles=("admin", "boss", "bookkeeper"),
         rate_limit_scope="api_deposits_pending",
     )
     deposits = await adb.get_pending_cash_deposits()
-    # Батч вместо N+1: одним запросом тянем заказы всех сдач сразу.
-    orders_by_deposit = await adb.get_cash_deposit_orders_batch([d["id"] for d in deposits])
-    for d in deposits:
-        d["orders"] = orders_by_deposit.get(d["id"], [])
+    await _decorate_deposits(deposits, user["id"])
     return JSONResponse({"ok": True, "deposits": deposits})
+
+
+async def _decorate_deposits(deposits: list[dict], viewer_id: int) -> None:
+    """Валюта сдачи, что она закрывает («Заказы: #27 …») и чья она — батчем."""
+    from services import async_db as adb
+    from services import order_payments
+
+    ids = [int(d["id"]) for d in deposits]
+    if not ids:
+        return
+    orders_by_deposit = await order_payments.deposit_orders_view(ids)
+    currencies = await order_payments.deposit_currency(ids)
+    users = await adb.get_all_users()
+    names = {int(u["user_id"]): u.get("full_name") or str(u["user_id"]) for u in users}
+    for d in deposits:
+        did = int(d["id"])
+        d["orders"] = orders_by_deposit.get(did, [])
+        d["currency"] = currencies.get(did)
+        allocated = sum(o["amount_cents"] for o in d["orders"] if o["currency"] == d["currency"])
+        d["unallocated"] = float(money.from_cents(max(0, int(d.get("amount_cents") or 0) - allocated)))
+        d["manager_name"] = names.get(int(d["manager_id"]), str(d["manager_id"]))
+        d["is_own"] = int(d["manager_id"]) == int(viewer_id)
+        d["confirmed_by_name"] = names.get(int(d["confirmed_by"])) if d.get("confirmed_by") else None
+        d["self_confirmed"] = bool(d.get("confirmed_by")) and int(d["confirmed_by"]) == int(d["manager_id"])
 
 
 @app.post("/api/deposits/confirm")
@@ -5017,7 +5084,10 @@ async def api_deposits_confirm(request: Request):
             )
         except Exception:
             logger.warning("deposit confirm notify failed", exc_info=True)
-    resp = {"ok": True, "deposit_id": deposit_id, "closed_orders": res.get("closed_orders", [])}
+    resp = {
+        "ok": True, "deposit_id": deposit_id, "closed_orders": res.get("closed_orders", []),
+        "self_confirmed": bool(res.get("self_confirmed")),
+    }
     await idem.store(resp)
     return JSONResponse(resp)
 
@@ -5083,12 +5153,24 @@ async def api_deposits_create(request: Request):
     # (database.validate_amount_in_currency), а не своя константа.
     from services.database import validate_amount_in_currency
 
+    from config import ALLOWED_CURRENCIES, BASE_CURRENCY
+
+    currency = str(data.get("currency") or BASE_CURRENCY or "USD").upper()
+    if currency not in {c.upper() for c in ALLOWED_CURRENCIES}:
+        raise HTTPException(status_code=400, detail=f"Валюта {currency} не поддерживается")
+    raw_ids = data.get("order_ids")
+    order_ids: list[int] | None = None
+    if raw_ids:
+        try:
+            order_ids = [int(x) for x in raw_ids][:200]
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="order_ids — список номеров заказов")
     raw_amount = data.get("amount")
     try:
         amount = float(raw_amount)
     except (TypeError, ValueError):
         amount = float("nan")
-    ok, err = validate_amount_in_currency(amount, None)
+    ok, err = validate_amount_in_currency(amount, currency)
     if not ok:
         raise HTTPException(
             status_code=400,
@@ -5107,7 +5189,9 @@ async def api_deposits_create(request: Request):
     if prev is not None:
         return JSONResponse(prev)
     try:
-        res = await adb.create_cash_deposit(user["id"], amount, idem_key=idem.key)
+        res = await adb.create_cash_deposit(
+            user["id"], amount, idem_key=idem.key, currency=currency, order_ids=order_ids
+        )
     except Exception:
         await idem.release()  # упало до коммита — освободить ретраю
         raise
@@ -5123,10 +5207,16 @@ async def api_deposits_create(request: Request):
 
     bot = await get_notify_bot()
     try:
-        await _notify_confirmers(bot, res["deposit_id"], name, amount)
+        await _notify_confirmers(bot, res["deposit_id"], name, amount, currency=currency)
     except Exception:
         logger.warning("deposit create notify failed", exc_info=True)
-    resp = {"ok": True, "deposit_id": res["deposit_id"]}
+    from services import order_payments
+
+    view = (await order_payments.deposit_orders_view([res["deposit_id"]])).get(res["deposit_id"], [])
+    resp = {
+        "ok": True, "deposit_id": res["deposit_id"], "currency": currency, "orders": view,
+        "unallocated": float(money.from_cents(int(res.get("unallocated_cents") or 0))),
+    }
     await idem.store(resp)
     return JSONResponse(resp)
 
@@ -5143,7 +5233,34 @@ async def api_deposits_my(request: Request):
         rate_limit_scope="api_deposits_my",
     )
     deposits = await adb.get_manager_cash_deposits(user["id"])
+    await _decorate_deposits(deposits, user["id"])
     return JSONResponse({"ok": True, "deposits": deposits})
+
+
+@app.post("/api/deposits/on_hand")
+async def api_deposits_on_hand(request: Request):
+    """Наличные, которые менеджер получил по заказам и ещё не сдал в кассу, —
+    для формы «Сдать наличные»: сколько и по каким заказам, по валютам."""
+    from services import order_payments
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_deposits_on_hand",
+        rate_limit_max=60,
+    )
+    rows = await order_payments.cash_on_hand(user["id"])
+    summary = order_payments.cash_on_hand_summary(rows)
+    for item in summary["by_currency"] + summary["orders"]:
+        item["amount"] = float(money.from_cents(item["amount_cents"]))
+    from config import ALLOWED_CURRENCIES, BASE_CURRENCY
+
+    return JSONResponse({
+        "ok": True, **summary,
+        "currencies": [c.upper() for c in ALLOWED_CURRENCIES],
+        "base_currency": (BASE_CURRENCY or "USD").upper(),
+    })
 
 
 # ─── API: возвраты (IMPLEMENTATION.md §8) ─────────────────────────────────────
@@ -5509,6 +5626,13 @@ async def api_orders_ship(request: Request):
         raise
     if not res.get("ok"):
         await idem.release()
+        if res.get("code") == "payment_required":
+            # Отдельный код: фронт по нему открывает форму «как получены деньги»,
+            # а не показывает голую ошибку.
+            return JSONResponse(
+                {"detail": res["error"], "code": res["code"], "gap_cents": res.get("gap_cents")},
+                status_code=409,
+            )
         raise HTTPException(status_code=409, detail=res.get("error", "не удалось отгрузить"))
 
     creator = order.get("user_id") if order else None
@@ -5882,6 +6006,21 @@ async def api_debts(request: Request):
     debt_ids = [d["id"] for d in debts]
     items_by_order = await adb.get_order_items_by_ids(debt_ids) if debt_ids else {}
     balances = await calc_order_balances(debt_ids) if debt_ids else {}
+    from services import order_payments
+    from services.debts import calc_claimable_cents
+    from services.roles import role_allowed
+
+    parts_by_order = await order_payments.parts_for_orders(debt_ids) if debt_ids else {}
+    claimable = await calc_claimable_cents(debt_ids) if debt_ids else {}
+    # Кто подтверждает карту/перечисление: руководитель или бухгалтер. Менеджер
+    # попадает сюда совмещением ролей (бухгалтера нет) — экран говорит об этом
+    # прямо, а не молча даёт ему подтвердить собственные деньги.
+    can_confirm = role_allowed(role, order_payments.ROLES_CONFIRM)
+    confirm_hint = (
+        None if is_boss
+        else "подтверждаете вы — руководителя и бухгалтера в системе нет" if can_confirm
+        else "подтвердит руководитель или бухгалтер"
+    )
 
     result = []
     for o in debts:
@@ -5908,10 +6047,26 @@ async def api_debts(request: Request):
             state = "overdue" if due < today else ("due_today" if due == today else "upcoming")
         else:
             state = "upcoming"
+        parts = parts_by_order.get(o["id"], [])
+        cash_pending_c = sum(
+            p["order_amount_cents"] for p in parts if p["state"] in ("on_hand", "in_deposit")
+        )
+        # Ждёт = всё неподтверждённое; «после подтверждения» = остаток минус
+        # ждущее. Наличные на руках подтверждаются сдачей, остальное — кнопкой.
+        pending_c = bal.pending_cents
+        remaining_after_c = max(0, bal.remaining_cents - pending_c)
         result.append(
             {
                 "id": o["id"],
                 "user_id": o["user_id"],
+                "payment_type": o.get("payment_type") or "paid",
+                "status": o.get("status"),
+                "parts": parts,
+                "pending_cash": float(money.from_cents(cash_pending_c)),
+                "pending_confirmable": float(money.from_cents(max(0, pending_c - cash_pending_c))),
+                "remaining_after_pending": float(money.from_cents(remaining_after_c)),
+                "overpending": float(money.from_cents(max(0, pending_c - bal.remaining_cents))),
+                "claimable": float(money.from_cents(claimable.get(o["id"], 0))),
                 "agent_name": o.get("agent_name") or "—",
                 "full_name": o.get("full_name") or "—",
                 "due_date": due,
@@ -5988,6 +6143,8 @@ async def api_debts(request: Request):
             "machine_debts": machine_debts,
             "totals": totals,
             "role": role,
+            "can_confirm": can_confirm,
+            "confirm_hint": confirm_hint,
             "scope": "company" if is_boss else "personal",
             "today": today,
             "money_received": [{"currency": k, "total": v} for k, v in summary["received"].items()],
@@ -6044,16 +6201,137 @@ async def _money_summary(adb, user_id: int | None) -> dict:
     return {"received": received, "pending": pending}
 
 
+async def _record_order_payment(data: dict, user: dict, op: str) -> JSONResponse:
+    """Общее тело `/api/orders/payment` и `/api/orders/mark_paid`: разбивка
+    «как получены деньги» (services.order_payments). Авторизация — в ручках."""
+    from services import async_db as adb
+    from services import order_payments
+
+    try:
+        order_id = int(data.get("order_id") or "")
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="order_id обязателен")
+    if not data.get("parts"):
+        # Сумма без способа больше не принимается: ради этого разбивка и
+        # заведена («чтобы потом не возникало вопросов»).
+        raise HTTPException(
+            status_code=400,
+            detail="Укажите, как получены деньги: наличные, карта или перечисление на счёт",
+        )
+
+    idem = _Idem(adb, op, user["id"], data.get("idempotency_key"), atomic=True)
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    full_name = _actor_name(user) or user.get("username") or str(user["id"])
+    actor = order_payments.Actor(
+        user_id=int(user["id"]), name=full_name, role=get_role(user["id"]),
+        username=f"@{user['username']}" if user.get("username") else "",
+    )
+    try:
+        res = await order_payments.record_payment_parts(
+            order_id, actor, data.get("parts"), idem_key=idem.key
+        )
+    except order_payments.PaymentError as e:
+        await idem.release()
+        return JSONResponse({"detail": e.message, "code": e.code}, status_code=e.status)
+    except Exception:
+        await idem.release()  # упало до коммита — ретрай должен быть возможен
+        raise
+
+    # Карта и перечисление — карточка подтверждающим с кнопками pay_ok/pay_no:
+    # их сверяют с банком. Наличные подтверждаются сдачей — кнопок под ними нет.
+    for part in res["parts"]:
+        if part["method"] in order_payments.NONCASH_METHODS:
+            await _notify_bosses_payment_pending(order_id, full_name, part["payment_id"])
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/orders/payment_context")
+async def api_order_payment_context(request: Request):
+    """Данные формы «Как получены деньги»: сколько внести, валюта заказа,
+    тип оплаты, курсы ЦБ на сегодня и уже внесённые строки."""
+    from services import async_db as adb
+    from services import order_payments
+    from services.accounting import cbu_quotes, fmt_rate, today_str
+    from services.debts import calc_claimable_cents
+    from services.roles import role_allowed
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_order_payment_context",
+        rate_limit_max=60,
+    )
+    try:
+        order_id = int(data.get("order_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="order_id обязателен")
+    order = await adb.get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    role = get_role(user["id"])
+    if order["user_id"] != user["id"] and not role_allowed(role, order_payments.ROLES_RECORD_ANY):
+        raise HTTPException(status_code=403, detail="Оплату по чужому заказу вносит руководитель")
+    from config import ALLOWED_CURRENCIES, BASE_CURRENCY
+
+    base = (BASE_CURRENCY or "USD").upper()
+    ptype = order.get("payment_type") or "paid"
+    currency = (order.get("currency") or base).upper()
+    if ptype == "paid":
+        due = (await order_payments.payment_gap_cents([order_id])).get(order_id, 0)
+    else:
+        due = (await calc_claimable_cents([order_id])).get(order_id, 0)
+    from services.debts import calc_order_balance
+
+    bal = await calc_order_balance(order_id)
+    currencies = [c.upper() for c in ALLOWED_CURRENCIES]
+    quotes = await cbu_quotes([c for c in currencies if c != base], today_str())
+    parts = (await order_payments.parts_for_orders([order_id])).get(order_id, [])
+    return JSONResponse({
+        "order_id": order_id,
+        "agent_name": order.get("agent_name") or "",
+        "status": order.get("status"),
+        "payment_type": ptype,
+        "currency": currency,
+        "total_cents": bal.total_cents,
+        "due_cents": due,
+        "exact": ptype == "paid",
+        "base_currency": base,
+        "currencies": currencies,
+        "cbu": {c: fmt_rate(q) for c, q in quotes.items()},
+        "methods": [[k, v] for k, v in order_payments.METHODS.items()],
+        "parts": parts,
+        "open": order.get("status") in ("approved", "shipped", "partially_returned")
+        and not order.get("paid_confirmed_at"),
+    })
+
+
+@app.post("/api/orders/payment")
+async def api_order_payment(request: Request):
+    """Как клиент заплатил по заказу: строки {method, currency, amount, rate?}.
+
+    «Оплата сразу» — сумма строк равна тому, что причитается (без неё заказ не
+    отгрузить); «в долг» — любая часть остатка. Право: автор заказа или
+    руководство. Идемпотентно по `idempotency_key` (атомарно с записью).
+    """
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_order_payment",
+        rate_limit_max=20,
+        rate_limit_window=60.0,
+    )
+    return await _record_order_payment(data, user, "order_payment")
+
+
 @app.post("/api/orders/mark_paid")
 async def api_mark_paid(request: Request):
-    """Закрыть долг по конкретному заказу.
-
-    Право: автор заказа (тот менеджер, который его создал) ИЛИ
-    boss/admin (override на случай если менеджер недоступен).
-    Идемпотентно — повторный клик ничего не ломает.
-    """
-    from services import async_db as adb
-
+    """Прежнее имя ручки «отметить оплату» — теперь та же разбивка, что
+    `/api/orders/payment`. Сумма без способа отвергается (400)."""
     data = await request.json()
     user = _authorize(
         data,
@@ -6062,78 +6340,7 @@ async def api_mark_paid(request: Request):
         rate_limit_max=20,
         rate_limit_window=60.0,
     )
-
-    order_id = data.get("order_id")
-    if not order_id:
-        raise HTTPException(status_code=400, detail="order_id обязателен")
-    try:
-        order_id = int(order_id)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="order_id должен быть числом")
-
-    # Idempotency: double-click по «Оплачено» частичной суммой мог создать две
-    # строки платежа. Ключ — в общей БД (T2.5), поэтому защита переживает
-    # рестарт и работает между воркерами.
-    idem = _Idem(adb, "mark_paid", user["id"], data.get("idempotency_key"), atomic=True)
-    cached = await idem.claim()
-    if cached is not None:
-        return JSONResponse(cached)
-
-    async with idem.released_on_reject():
-        order = await adb.get_order(order_id)
-        if not order:
-            raise HTTPException(status_code=404, detail="Заказ не найден")
-
-        user_id = user["id"]
-        role = get_role(user_id)
-        is_owner = order["user_id"] == user_id
-        is_boss = role in ("admin", "boss")
-        if not (is_owner or is_boss):
-            raise HTTPException(status_code=403, detail="Нет доступа")
-
-        # «Оплата сразу» принимается тоже: отклонённый автоплатёж иначе не
-        # заявить повторно, и заказ висел бы неоплаченным без единой кнопки.
-        if order.get("payment_type") not in ("credit", "paid"):
-            raise HTTPException(status_code=400, detail="Это не кредитный заказ")
-
-        # amount: если передан и валиден — частичная оплата; иначе закроет остаток.
-        # Через общий валидатор (isfinite + потолок) — inf/nan/огромное не пройдут.
-        amount_raw = data.get("amount")
-        amount = None
-        if amount_raw is not None and amount_raw != "":
-            amount = _validate_payment_amount(amount_raw, order.get("currency"))
-
-    full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
-        "username", str(user_id)
-    )
-    username = f"@{user['username']}" if user.get("username") else ""
-
-    try:
-        # Результат ложится в ключ той же транзакцией, что и платёж.
-        ok, payment_id = await adb.mark_order_paid(
-            order_id,
-            user_id,
-            full_name,
-            amount=amount,
-            username=username,
-            idem_key=idem.key,
-        )
-    except Exception:
-        await idem.release()  # упало до store — ретрай должен быть возможен
-        raise
-    if not ok:
-        await idem.release()
-        raise HTTPException(
-            status_code=400,
-            detail="Не удалось создать платёж (возможно, заказ уже полностью оплачен)",
-        )
-
-    # Сразу шлём боссу push с inline-кнопками для approve.
-    await _notify_bosses_payment_pending(order_id, full_name, payment_id)
-
-    result = {"ok": True, "payment_id": payment_id}
-    await idem.store(result)
-    return JSONResponse(result)
+    return await _record_order_payment(data, user, "mark_paid")
 
 
 async def _notify_bosses_payment_pending(
@@ -6183,6 +6390,17 @@ async def _notify_bosses_payment_pending(
             f"💵 Сумма платежа: <b>{fmt(amount)} {currency}</b>",
             f"📦 По заказу всего: <b>{fmt(total)} {currency}</b>",
         ]
+        from services import order_payments
+
+        part = (await order_payments.parts_by_payment([int(payment_id)])).get(int(payment_id))
+        if part:
+            lines.insert(
+                5,
+                "💳 Как получено: <b>"
+                + esc(order_payments.part_label(part["method"], int(part["amount_cents"]), part["currency"]))
+                + "</b>" + (f" (курс {esc(part.get('rate') or part.get('order_rate') or '')})"
+                            if part.get("rate_source") != "same" else ""),
+            )
         if summary.get("total_base") is not None and currency != summary.get("base_currency"):
             lines.append(
                 f"   ≈ <b>{fmt(summary['total_base'])} {summary['base_currency']}</b>"
@@ -6195,7 +6413,11 @@ async def _notify_bosses_payment_pending(
             lines.append(f"📎 Останется к получению: <b>{fmt(remaining_after)} {currency}</b>")
         lines.append(f"📅 Срок: {due}")
         lines.append("")
-        lines.append("Подтвердите, что эта сумма реально пришла в кассу.")
+        lines.append(
+            "Проверьте банк и подтвердите, что деньги пришли."
+            if part and part["method"] in order_payments.NONCASH_METHODS
+            else "Подтвердите, что эта сумма реально пришла в кассу."
+        )
         text = "\n".join(lines)
         # Используем СУЩЕСТВУЮЩИЕ pay_ok/pay_no callbacks — это
         # стандартный payment-approval flow в handlers/payments.py.
@@ -6226,9 +6448,12 @@ async def api_confirm_payment(request: Request):
     from services import async_db as adb
 
     data = await request.json()
+    # Карту и перечисление сверяет с банком руководитель или бухгалтер
+    # (менеджер — через совмещение ролей, пока бухгалтера нет; экран и аудит
+    # помечают, когда человек подтверждает свои же деньги).
     user = _authorize(
         data,
-        allowed_roles=("admin", "boss"),  # только начальство
+        allowed_roles=("admin", "boss", "bookkeeper"),
         rate_limit_scope="api_confirm_payment",
         rate_limit_max=30,
         rate_limit_window=60.0,
@@ -6253,9 +6478,17 @@ async def api_confirm_payment(request: Request):
     # Берём список pending до confirm — после атомарного UPDATE мы не
     # знаем, КОГО именно нужно уведомить (только количество). Сохраняем
     # копии payment-dict'ов и шлём уведомления каждому владельцу.
-    pending_before = [
+    from services import order_payments
+
+    all_pending = [
         p for p in await adb.get_payments_for_order(order_id) if p["status"] == "pending"
     ]
+    methods = await order_payments.parts_by_payment([int(p["id"]) for p in all_pending])
+    # Наличные на руках подтверждаются сдачей — эта кнопка их не трогает.
+    pending_before = [
+        p for p in all_pending if (methods.get(int(p["id"])) or {}).get("method") != "cash"
+    ]
+    skipped_cash = len(all_pending) - len(pending_before)
 
     try:
         n = await adb.confirm_all_pending_payments_for_order(order_id, user["id"], full_name)
@@ -6284,7 +6517,10 @@ async def api_confirm_payment(request: Request):
                     p.get("id"),
                 )
 
-    result = {"ok": True, "confirmed_count": n}
+    self_note = None
+    if n > 0 and any(int(p["user_id"]) == int(user["id"]) for p in pending_before[:n]):
+        self_note = order_payments.self_confirm_note(user["id"], user["id"], get_role(user["id"]))
+    result = {"ok": True, "confirmed_count": n, "skipped_cash": skipped_cash, "self_note": self_note}
     await idem.store(result)
     return JSONResponse(result)
 
@@ -6298,7 +6534,7 @@ async def api_reject_payment(request: Request):
     data = await request.json()
     user = _authorize(
         data,
-        allowed_roles=("admin", "boss"),
+        allowed_roles=("admin", "boss", "bookkeeper"),
         rate_limit_scope="api_reject_payment",
         rate_limit_max=30,
         rate_limit_window=60.0,
@@ -6324,8 +6560,11 @@ async def api_reject_payment(request: Request):
     # Аналогично confirm: сохраняем pending до UPDATE, чтобы знать кого
     # уведомить персонально (не только владельцу заказа — у каждого
     # платежа может быть свой user_id).
+    from services import order_payments
+
     pending_before = [
-        p for p in await adb.get_payments_for_order(order_id) if p["status"] == "pending"
+        p for p in await adb.get_payments_for_order(order_id)
+        if p["status"] == "pending" and not await order_payments.payment_in_active_deposit(p["id"])
     ]
 
     try:

@@ -65,22 +65,32 @@ def _fmt_cents(cents: int) -> str:
     return money.format_cents(int(cents or 0), decimals=2, sep=" ")
 
 
-async def _notify_confirmers(bot: Bot, deposit_id: int, manager_name: str, amount: float):
-    """Отправить боссам/бухгалтерам карточку сдачи с кнопками."""
-    allocations = await adb.get_cash_deposit_orders(deposit_id)
+async def _notify_confirmers(
+    bot: Bot, deposit_id: int, manager_name: str, amount: float, *, currency: str | None = None
+):
+    """Отправить боссам/бухгалтерам карточку сдачи с кнопками.
+
+    Что закрывает сдача — наличные строки разбивки по заказам и прежнее
+    распределение по долгам (`order_payments.deposit_orders_view`), каждая
+    строка в своей валюте."""
+    from services import order_payments
+
+    cur = (currency or _base_cur()).upper()
+    view = (await order_payments.deposit_orders_view([deposit_id])).get(deposit_id, [])
     orders_line = (
         "\n".join(
-            f"  • заказ #{a['order_id']} — {_fmt_cents(a['amount_allocated_cents'])} {_base_cur()}"
-            for a in allocations
+            f"  • заказ #{a['order_id']} — {_fmt_cents(a['amount_cents'])} {esc(a['currency'])}"
+            + (" (наличные по разбивке)" if a.get("kind") == "cash_part" else " (в счёт долга)")
+            for a in view
         )
-        or "  <i>нет открытых заказов для привязки</i>"
+        or "  <i>не распределена: наличных по заказам на руках нет</i>"
     )
     text = (
         f"{DIV}\n"
         f"💵 <b>Сдача наличных #{deposit_id}</b>\n\n"
         f"👨‍💼 Менеджер: <b>{esc(manager_name)}</b>\n"
-        f"💰 Сумма: <b>{_fmt_amount(amount)} {_base_cur()}</b>\n"
-        f"📦 Закрывает заказы:\n{orders_line}"
+        f"💰 Сумма: <b>{_fmt_amount(amount)} {esc(cur)}</b>\n"
+        f"📦 Заказы:\n{orders_line}"
     )
     recipients = await adb.get_deposit_confirmers()
     for uid in recipients:
@@ -116,6 +126,11 @@ async def cb_deposit_confirm(call: CallbackQuery, bot: Bot):
         parse_mode="HTML",
         reply_markup=webapp_keyboard("🌐 Ещё сдачи — в WebApp"),
     )
+    if res.get("self_confirmed"):
+        await call.message.answer(
+            "ℹ️ Вы подтвердили собственную сдачу: руководителя и бухгалтера в системе нет. "
+            "Это отмечено в журнале действий."
+        )
     if dep and dep.get("manager_id"):
         closed = res.get("closed_orders") or []
         extra = f" Закрыты заказы: {', '.join('#' + str(o) for o in closed)}." if closed else ""
