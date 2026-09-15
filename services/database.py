@@ -2038,6 +2038,15 @@ _DEFAULT_SETTINGS: dict[str, tuple] = {
     # Свой курс в оплате/документе бухгалтерии — не дальше X% от курса ЦБ
     # (services.accounting.manual_rate_refusal).
     "manual_rate_max_deviation_pct": (10, "Свой курс валюты — не дальше стольких % от курса ЦБ"),
+    # Скидка к прайсу (`product_prices.sale_price_cents`) ≥ X% хотя бы по одной
+    # позиции или в среднем по заказу: заявка помечается в очереди решений, а
+    # одобрение требует явного подтверждения (services/order_discounts.py).
+    # 0 — пометка выключена. Соседний `price_check_threshold_percent` остался
+    # от старого плана и кодом НЕ читается.
+    "order_discount_requires_approval_pct": (
+        15,
+        "Скидка от прайса ≥ X% — пометка в заявке и явное одобрение (0 — выкл.)",
+    ),
 }
 
 

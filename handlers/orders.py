@@ -188,20 +188,36 @@ def format_order(order: dict, items: list[dict], summary: dict | None = None) ->
     return "\n".join(lines)
 
 
-def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
-    """Сообщение боссу о новой заявке. Видны цены — нужны для апрува."""
+def format_request_notify(
+    order: dict, items: list[dict], req_id: int, discount: dict | None = None
+) -> str:
+    """Сообщение боссу о новой заявке. Видны цены — нужны для апрува.
+
+    `discount` — сводка `services.order_discounts.summarize` (её считает
+    вызывающий: прайсы лежат в БД, а форматтер синхронный). Подпись у строки
+    та же, что в карточке сделки по технике: «× 100 USD = 300 USD · прайс
+    125 USD · скидка 20%». Нет прайса — хвоста нет вовсе: «скидка 0%» на
+    товаре без цены соврала бы, что продали ровно по прайсу.
+    """
+    from services import order_discounts
+
     currency = order.get("currency") or _BASE_CURRENCY
+    dlines = (discount or {}).get("lines") or []
     lines = []
-    for it in items[:10]:
+    for idx, it in enumerate(items[:10]):
         qty = float(it.get("quantity", 0))
         price = float(it.get("price", 0) or 0)
         sub = qty * price
         name = _esc(it["product_name"])
         unit = _esc(it.get("unit") or "шт")
+        dline = dlines[idx] if idx < len(dlines) else {}
+        tail = order_discounts.line_label(dline, currency) if dline else ""
+        if tail:
+            tail = f" · {_esc(tail)}" if not dline.get("flagged") else f" · <b>{_esc(tail)}</b>"
         if price > 0:
             lines.append(
                 f"  • {name}: {_fmt_num(qty)} {unit} "
-                f"× {_cur(price, currency)} = <b>{_cur(sub, currency)}</b>"
+                f"× {_cur(price, currency)} = <b>{_cur(sub, currency)}</b>{tail}"
             )
         else:
             lines.append(f"  • {name}: {_fmt_num(qty)} {unit} <i>(цена не указана)</i>")
@@ -226,6 +242,13 @@ def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
     else:
         payment_str = "\n💵 Оплата сразу"
 
+    # Скидка к прайсу — руководитель решает, зная, сколько уступили (C2).
+    summary_line = order_discounts.summary_label(discount or {})
+    discount_str = f"\n\n📉 <b>{_esc(summary_line)}</b>" if summary_line else ""
+    flag_line = order_discounts.flag_label(discount or {})
+    if flag_line:
+        discount_str += f"\n🔴 <b>{_esc(flag_line)}</b>"
+
     return (
         f"{DIV}\n"
         f"🔔 <b>Новая заявка на отгрузку #{req_id}</b>\n"
@@ -235,6 +258,7 @@ def format_request_notify(order: dict, items: list[dict], req_id: int) -> str:
         f"\n"
         f"<b>📦 Товары:</b>\n{items_text}"
         f"{total_str}"
+        f"{discount_str}"
     )
 
 
@@ -273,8 +297,15 @@ def request_approve_keyboard(req_id: int):
 
 def _request_callbacks(req_id: int) -> set[str]:
     """Все кнопки решения по заявке — и с карточки бота, и из WebApp (там
-    строка короче: без «На доработку»), и «Одобрить с превышением»."""
-    return {f"req_ok:{req_id}", f"req_no:{req_id}", f"req_draft:{req_id}", f"req_ovr:{req_id}"}
+    строка короче: без «На доработку»), «Одобрить с превышением» и «Одобрить
+    со скидкой»."""
+    return {
+        f"req_ok:{req_id}",
+        f"req_no:{req_id}",
+        f"req_draft:{req_id}",
+        f"req_ovr:{req_id}",
+        f"req_dsc:{req_id}",
+    }
 
 
 # Исход заявки, решённой где-то ещё (WebApp, второй руководитель), — для
@@ -342,14 +373,25 @@ async def cb_view_order(call: CallbackQuery):
 # ─── Callback: одобрение/отклонение заявки ────────────────────────────────────
 
 
-async def _approve_flow(call: CallbackQuery, bot: Bot, req_id: int, override: bool) -> None:
-    """Общий путь одобрения заявки (обычное / с превышением лимита)."""
+async def _approve_flow(
+    call: CallbackQuery, bot: Bot, req_id: int, override: bool, discount_ack: bool = False
+) -> None:
+    """Общий путь одобрения заявки (обычное / с превышением лимита / со скидкой
+    выше порога).
+
+    Порядок подтверждений: сначала кредит-лимит, потом скидка. Кнопка
+    «Одобрить со скидкой» (`req_dsc:`) передаёт ОБА флага: до неё доходят
+    только тогда, когда лимит либо в порядке (тогда `override` ни на что не
+    влияет — `credit_override` ставится лишь при фактическом превышении),
+    либо уже подтверждён нажатием «Одобрить с превышением». Иначе два
+    подтверждения гасили бы друг друга по кругу.
+    """
     boss_name = call.from_user.full_name or str(call.from_user.id)
     # Вся логика (DB, МойСклад, уведомления, PDF, авто-payment) — в сервисе.
     from services.order_workflow import approve_shipment_request
 
     result = await approve_shipment_request(
-        req_id, call.from_user.id, boss_name, bot, override=override
+        req_id, call.from_user.id, boss_name, bot, override=override, discount_ack=discount_ack
     )
 
     if not result["ok"]:
@@ -379,14 +421,44 @@ async def _approve_flow(call: CallbackQuery, bot: Bot, req_id: int, override: bo
                 parse_mode="HTML",
                 reply_markup=kb.as_markup(),
             )
+        # Скидка выше порога — то же явное подтверждение отдельным сообщением.
+        if result.get("needs_discount_ack"):
+            from services import order_discounts
+
+            summary = result.get("discount") or {}
+            kb = InlineKeyboardBuilder()
+            kb.button(text="✅ Одобрить со скидкой", callback_data=f"req_dsc:{req_id}")
+            kb.adjust(1)
+            await call.answer("⚠️ Скидка выше порога", show_alert=True)
+            await finish_card(
+                call,
+                "⚠️ Скидка выше порога — нужно подтверждение",
+                outcome="⚠️ Скидка выше порога — решение ниже ⬇️",
+            )
+            body = order_discounts.summary_label(summary)
+            return await call.message.answer(
+                "⚠️ <b>Скидка выше порога</b>\n"
+                + (f"{_esc(body)}\n" if body else "")
+                + f"{_esc(order_discounts.flag_label(summary))}\n\n"
+                "Одобрить всё равно?",
+                parse_mode="HTML",
+                reply_markup=kb.as_markup(),
+            )
         await call.answer(f"⚠️ {result['error']}", show_alert=True)
         await _settle_stale_request(call, req_id)
         return
 
     await call.answer("✅ Заявка одобрена")
-    suffix = " (с превышением лимита)" if override else ""
+    if discount_ack:
+        suffix = " (со скидкой выше порога)"
+        verb = "✅ Одобрено со скидкой"
+    elif override:
+        suffix = " (с превышением лимита)"
+        verb = "✅ Одобрено с превышением"
+    else:
+        suffix = ""
+        verb = "✅ Одобрено"
     base = getattr(call.message, "html_text", None) or call.message.text or ""
-    verb = "✅ Одобрено с превышением" if override else "✅ Одобрено"
     await call.message.edit_text(
         base
         + f"\n\n{DIV}\n✅ <b>Одобрено{suffix}</b>  <code>{result['now']}</code>  — {_esc(boss_name)}",
@@ -414,6 +486,15 @@ async def cb_approve_request_override(call: CallbackQuery, bot: Bot):
         return await call.answer("Нет доступа", show_alert=True)
     req_id = int(call.data.split(":")[1])
     await _approve_flow(call, bot, req_id, override=True)
+
+
+@router.callback_query(F.data.startswith("req_dsc:"))
+async def cb_approve_request_discount(call: CallbackQuery, bot: Bot):
+    """«Одобрить со скидкой» — явное решение по заявке со скидкой выше порога."""
+    if not is_boss(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    req_id = int(call.data.split(":")[1])
+    await _approve_flow(call, bot, req_id, override=True, discount_ack=True)
 
 
 @router.callback_query(F.data.startswith("req_no:"))

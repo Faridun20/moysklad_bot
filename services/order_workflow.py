@@ -627,6 +627,7 @@ async def approve_shipment_request(
     bot: Any,
     override: bool = False,
     *,
+    discount_ack: bool = False,
     pdf_delivery: str = "background",
 ) -> dict:
     """Полный апрув заявки: DB, склад, уведомления, PDF, авто-payment.
@@ -638,6 +639,13 @@ async def approve_shipment_request(
         bot           — aiogram.Bot (или совместимый, у которого есть
                         send_message/send_document). Может быть None,
                         тогда уведомления и PDF не отправляются.
+        override      — одобрить, несмотря на превышение кредит-лимита
+        discount_ack  — одобрить, несмотря на скидку выше порога
+                        (`app_settings.order_discount_requires_approval_pct`,
+                        services/order_discounts.py). Как и `override`, это
+                        ЯВНОЕ второе нажатие одобряющего, а не новый статус:
+                        нового «нельзя отгрузить» скидка не создаёт —
+                        заказ и так проходит одобрение.
         pdf_delivery  — "background": печатная форма собирается и
                         рассылается фоновой задачей ПОСЛЕ ответа (в
                         результате — `pdf_task`, его можно дождаться);
@@ -675,13 +683,15 @@ async def approve_shipment_request(
     # (наименее разрушительный дефолт). Уже-override'нутый заказ не перепроверяем.
     over_info = None
     order_pre = await adb.get_order(req["order_id"])
+    # Позиции нужны обеим проверкам до одобрения — сумме для кредит-лимита и
+    # скидке к прайсу, — поэтому читаются ОДИН раз.
+    pre_items = await adb.get_order_items(req["order_id"]) if order_pre else []
     if (
         order_pre
         and order_pre.get("agent_id")
         and (order_pre.get("payment_type") or "paid") == "credit"
         and not order_pre.get("credit_limit_override")
     ):
-        pre_items = await adb.get_order_items(req["order_id"])
         total = sum(
             float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in pre_items
         )
@@ -707,6 +717,23 @@ async def approve_shipment_request(
                     "req_id": req_id,
                     "order_id": req["order_id"],
                 }
+
+    # Скидка к прайсу выше порога — второе, ЯВНОЕ нажатие одобряющего (C5).
+    # Порядок с кредит-лимитом: сначала лимит, потом скидка; заявку, где
+    # пробито и то и другое, одобряют двумя подтверждениями подряд, и оба
+    # факта уходят в аудит. Нового «нельзя отгрузить» тут не появляется —
+    # состояние остаётся одно: заявка ждёт решения руководителя.
+    from services import order_discounts
+
+    discount_info: dict | None = None
+    if order_pre:
+        discount_info = await order_discounts.order_discount(
+            pre_items, order_pre.get("currency")
+        )
+        if discount_info.get("flagged") and not discount_ack:
+            refusal = order_discounts.refusal(discount_info, req["order_id"])
+            refusal.update({"req_id": req_id, "order_id": req["order_id"]})
+            return refusal
 
     # Атомарный UPDATE ... WHERE status='pending' — защита от race condition,
     # когда два босса одновременно жмут «Одобрить». Только один из них
@@ -739,6 +766,19 @@ async def approve_shipment_request(
             f"Заявка #{req_id}: одобрено с превышением лимита "
             f"(долг {over_info['current_debt']:.0f}, лимит {over_info['limit']:.0f}, "
             f"проекция {over_info['projected']:.0f})",
+        )
+    # Скидка выше порога: процент НЕ храним колонкой (устареет при первой же
+    # правке прайса) — фиксируем в аудите то, что было в момент решения.
+    if discount_info and discount_info.get("flagged"):
+        await adb.add_audit_log(
+            boss_user_id,
+            boss_name,
+            boss_role,
+            "discount_approved",
+            f"Заявка #{req_id} (заказ #{req['order_id']}): одобрено со скидкой "
+            f"{discount_info.get('max_pct')}% по позиции, средняя "
+            f"{discount_info.get('avg_pct')}% при пороге "
+            f"{discount_info.get('threshold_pct')}%",
         )
     items = await adb.get_order_items(req["order_id"]) if order else []
 

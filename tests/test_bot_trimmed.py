@@ -176,7 +176,9 @@ def test_surviving_commands_are_registered():
 def test_decision_callbacks_survive():
     """Решения приходят кнопками в push-уведомлении — они и есть смысл бота."""
     for cb in (
-        "req_ok:7", "req_no:7", "req_draft:7", "req_ovr:7",  # заявка на отгрузку
+        # заявка на отгрузку: обычное решение, превышение лимита и скидка
+        # выше порога (services/order_discounts.py) — у каждого своя кнопка.
+        "req_ok:7", "req_no:7", "req_draft:7", "req_ovr:7", "req_dsc:7",
         "pay_ok:7", "pay_no:7",  # платёж
         "dep_ok:7", "dep_no:7",  # сдача наличных
         "ret_ok:7", "ret_got:7",  # возврат: подтверждение и приёмка

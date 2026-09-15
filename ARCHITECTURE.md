@@ -363,7 +363,9 @@ shipment_request: status=pending
 order: status=pending
 push → все boss/admin
    │
-   ├─ [boss] одобрил (видит цены, сумму и тип оплаты)
+   ├─ [boss] одобрил (видит цены, сумму, тип оплаты и скидку к прайсу;
+   │     скидка ≥ app_settings.order_discount_requires_approval_pct помечена
+   │     и требует ВТОРОГО, явного нажатия — services/order_discounts.py)
    │     shipment_request: status=approved
    │     order: status=approved («к отгрузке»), платежей не создаётся
    │     order_shipment.ship_order → расходная накладная, остаток списан

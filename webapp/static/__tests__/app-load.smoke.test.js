@@ -71,6 +71,13 @@ describe('загрузка фронта (helpers.js + app.js)', () => {
     expect(() => window.eval(read('app.js'))).not.toThrow();
     // escapeHtml вынесён в helpers.js — без него глобал не определён.
     expect(window.escapeHtml).toBeUndefined();
+    // init() остался висеть на fetch, который никогда не резолвится, а net.js
+    // через 20 с отменяет запрос по сроку. На загруженной машине файл идёт
+    // дольше — таймер срабатывал уже ПОСЛЕ теста, init уходил в catch и рисовал
+    // ошибку через icon(), которого без helpers.js нет, и «unhandled rejection»
+    // валил весь прогон vitest. Закрываем окно: с ним останавливаются и его
+    // таймеры (проверки выше к этому моменту уже сделаны).
+    window.close();
   });
 });
 
@@ -3826,5 +3833,79 @@ describe('выключатель «Рабочие действия» и «Нас
     // Менеджеру «Решения» ведут в его «Подтвердить» — раздел «Деньги» у него есть.
     expect(at('manager', '/?startapp=decisions')).toBe('decisions');
     expect(at('warehouse_keeper', '/?startapp=stock')).toBe('');
+  });
+});
+
+// ─── Скидка к прайсу в списках (C2/C5) ──────────────────────────────────────
+//
+// Проценты считает сервер (services/order_discounts.py), фронт только
+// подписывает. Здесь проверяется, что подпись доезжает до обоих экранов:
+// «Решения» руководителя и список заказов менеджера.
+describe('скидка к прайсу на экранах', () => {
+  const REQ = (over = {}) => ({
+    id: 5, order_id: 41, full_name: 'Менеджер', agent_name: 'ООО Ромашка',
+    payment_type: 'paid', currency: 'USD', total: 210, created_at: '2026-08-01 10:00',
+    items: [{ name: 'Кабель ВВГ', quantity: 3, unit: 'м', price: 70,
+              ref_price: 100, discount_pct: 30 }],
+    discount: { avg_pct: 30, max_pct: 30, flagged: true, threshold_pct: 15,
+                covered_lines: 1, total_lines: 1 },
+    ...over,
+  });
+
+  it('«Решения»: строка со скидкой и пометка порога', () => {
+    const window = boot(`currentUser = { role: 'boss' };
+      window.__html = requestCardsHtml(${JSON.stringify([REQ()])});`);
+    const html = window.__html;
+    expect(html).toContain('прайс 100 USD · скидка 30%');
+    expect(html).toContain('Скидка по заказу: скидка 30%');
+    expect(html).toContain('credit-ctx--bad');
+    expect(html).toContain('нужно явное решение');
+  });
+
+  it('«Решения»: скидка ниже порога видна, но не помечена', () => {
+    const ok = REQ({ items: [{ name: 'Кабель ВВГ', quantity: 1, unit: 'м', price: 96,
+                              ref_price: 100, discount_pct: 4 }],
+                     discount: { avg_pct: 4, max_pct: 4, flagged: false, threshold_pct: 15,
+                                 covered_lines: 1, total_lines: 1 } });
+    const window = boot(`currentUser = { role: 'boss' };
+      window.__html = requestCardsHtml(${JSON.stringify([ok])});`);
+    expect(window.__html).toContain('credit-ctx--ok');
+    expect(window.__html).not.toContain('нужно явное решение');
+  });
+
+  it('«Решения»: товар без прайса — без хвоста, а не «скидка 0%»', () => {
+    const none = REQ({ items: [{ name: 'Новый товар', quantity: 1, unit: 'шт', price: 5,
+                                ref_price: null, discount_pct: null }],
+                       discount: { avg_pct: null, max_pct: null, flagged: false,
+                                   threshold_pct: 15, covered_lines: 0, total_lines: 1 } });
+    const window = boot(`currentUser = { role: 'boss' };
+      window.__html = requestCardsHtml(${JSON.stringify([none])});`);
+    expect(window.__html).not.toContain('скидка');
+    expect(window.__html).not.toContain('credit-ctx--bad');
+  });
+
+  it('свой заказ менеджера: почему ждёт + прайс в строке', () => {
+    const order = {
+      id: 41, status: 'pending', agent_name: 'ООО Ромашка', full_name: 'Менеджер',
+      items_count: 1, created_at: '2026-08-01 10:00', total: 210, currency: 'USD',
+      payment_type: 'paid', is_mine: true,
+      discount: { avg_pct: 30, max_pct: 30, flagged: true, threshold_pct: 15,
+                  covered_lines: 1, total_lines: 1 },
+      discount_note: 'Ждёт одобрения из-за скидки 30% (порог 15%) — решение принимает руководитель.',
+      items: [{ id: 1, name: 'Кабель ВВГ', quantity: 3, unit: 'м', price: 70,
+                ref_price: 100, discount_pct: 30 }],
+    };
+    const content = boot(`currentUser = { role: 'manager' };
+      ordersData = { orders: ${JSON.stringify([order])}, role: 'manager' };
+      renderOrdersMain();`).document.getElementById('content');
+    const text = content.textContent;
+    expect(text).toContain('Ждёт одобрения из-за скидки 30%');
+    expect(text).toContain('прайс 100 USD · скидка 30%');
+    // Одобренный заказ ничего не ждёт — строки состояния нет.
+    const done = boot(`currentUser = { role: 'manager' };
+      ordersData = { orders: ${JSON.stringify([{ ...order, status: 'approved', discount_note: '' }])}, role: 'manager' };
+      renderOrdersMain();`).document.getElementById('content');
+    expect(done.textContent).not.toContain('Ждёт одобрения из-за скидки');
+    expect(done.textContent).toContain('прайс 100 USD · скидка 30%');
   });
 });
