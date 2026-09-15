@@ -52,25 +52,27 @@ async def search(query: str | None = None, limit: int = 50) -> list[dict]:
     limit = max(1, min(int(limit or 50), 200))
     text = (query or "").strip()
     digits = "".join(ch for ch in text if ch.isdigit())
+    # Порядок — по-русски (ICU на Postgres, см. adb_core.order_by_name), id —
+    # развязка тёзок, чтобы LIMIT отдавал одну и ту же выборку.
+    order = f"ORDER BY {adb_core.order_by_name('name')}, id"
+    name_like = adb_core.name_search_sql("name")
     if text and len(digits) >= 4:
         return await adb_core.fetch(
             f"SELECT {_COLS} FROM counterparties "
-            f"WHERE {_PHONE_DIGITS} LIKE $1 OR lower(name) LIKE $2 "
-            f"ORDER BY name LIMIT $3",
+            f"WHERE {_PHONE_DIGITS} LIKE $1 OR {name_like} LIKE $2 "
+            f"{order} LIMIT $3",
             f"%{digits}%",
-            f"%{text.lower()}%",
+            adb_core.name_search_param(text),
             limit,
         )
     if text:
         return await adb_core.fetch(
-            f"SELECT {_COLS} FROM counterparties WHERE lower(name) LIKE $1 "
-            f"ORDER BY name LIMIT $2",
-            f"%{text.lower()}%",
+            f"SELECT {_COLS} FROM counterparties WHERE {name_like} LIKE $1 "
+            f"{order} LIMIT $2",
+            adb_core.name_search_param(text),
             limit,
         )
-    return await adb_core.fetch(
-        f"SELECT {_COLS} FROM counterparties ORDER BY name LIMIT $1", limit
-    )
+    return await adb_core.fetch(f"SELECT {_COLS} FROM counterparties {order} LIMIT $1", limit)
 
 
 async def get(counterparty_id: int | str | None) -> dict | None:

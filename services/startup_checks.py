@@ -153,7 +153,8 @@ def check_schema(
     """Список расхождений человеческим текстом; пусто — схема сходится.
 
     Без аргументов сверяет живую базу целиком: таблицы и колонки, индексы
-    (`check_indexes`) и типы денег и количеств (`check_column_types`). С явными `expected`/`actual` — только
+    (`check_indexes`), типы денег и количеств (`check_column_types`) и
+    коллацию сортировки по-русски. С явными `expected`/`actual` — только
     колонки: так её зовут тесты разбора.
     """
     live = expected is None and actual is None
@@ -174,6 +175,7 @@ def check_schema(
     if live:
         problems += check_indexes()
         problems += check_column_types()
+        problems += check_collation()
     return problems
 
 
@@ -310,6 +312,30 @@ def check_column_types(
     if not wrong:
         return []
     return [f"тип колонок разошёлся с определением: {', '.join(wrong)}"]
+
+
+def check_collation() -> list[str]:
+    """На Postgres должна быть ICU-коллация, по которой сортируются названия.
+
+    Без неё каталог и справочник контрагентов отвечают ошибкой SQL целиком,
+    а не просто сортируют криво — поэтому это тревога старта, а не мелочь.
+    """
+    from services import adb_core
+    from services import database as db
+
+    if not db.USE_POSTGRES:
+        return []
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            "SELECT 1 AS ok FROM pg_collation WHERE collname = %s", (adb_core.NAME_COLLATION,)
+        )
+        if cur.fetchone():
+            return []
+    return [
+        f"нет коллации {adb_core.NAME_COLLATION} (Postgres собран без ICU?) — "
+        "сортировка каталога и контрагентов упадёт"
+    ]
 
 
 # ─── Часовой пояс ─────────────────────────────────────────────────────────────

@@ -523,7 +523,7 @@ async def get_stock(warehouse_id: int | None = None, only_positive: bool = False
         where.append("COALESCE(s.quantity, 0) > 0")
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY p.name"
+    sql += f" ORDER BY {adb_core.order_by_name('p.name')}, p.id"
     return await adb_core.fetch(sql, *args)
 
 
@@ -614,14 +614,15 @@ async def _reserved_by_product() -> dict[int, float]:
 
 
 async def search_products(query: str, limit: int = 20) -> list[dict]:
-    """Поиск по номенклатуре. Кириллица — через `lower()` с обеих сторон."""
+    """Поиск по номенклатуре. Кириллица — через `lower()` с обеих сторон, ё = е."""
     text = (query or "").strip()
     if not text:
         return []
     return await adb_core.fetch(
         "SELECT id AS product_id, name, unit, category, sku FROM products "
-        "WHERE lower(name) LIKE $1 ORDER BY name LIMIT $2",
-        f"%{text.lower()}%",
+        f"WHERE {adb_core.name_search_sql('name')} LIKE $1 "
+        f"ORDER BY {adb_core.order_by_name('name')}, id LIMIT $2",
+        adb_core.name_search_param(text),
         max(1, min(int(limit or 20), 100)),
     )
 
@@ -648,7 +649,8 @@ async def get_categories() -> list[dict]:
     """
     rows = await adb_core.fetch(
         "SELECT DISTINCT category FROM products "
-        "WHERE category IS NOT NULL AND category <> '' ORDER BY category"
+        "WHERE category IS NOT NULL AND category <> '' "
+        f"ORDER BY {adb_core.order_by_name('category')}"
     )
     return [{"id": r["category"], "name": r["category"]} for r in rows]
 
@@ -669,7 +671,10 @@ async def get_catalog(category: str | None = None, only_positive: bool = False) 
     if category and category != "all":
         args.append(category)
         sql += f" WHERE p.category = ${len(args)}"
-    sql += " GROUP BY p.id, p.name, p.unit, p.category, p.sku ORDER BY p.name"
+    sql += (
+        " GROUP BY p.id, p.name, p.unit, p.category, p.sku "
+        f"ORDER BY {adb_core.order_by_name('p.name')}, p.id"
+    )
     rows = await adb_core.fetch(sql, *args)
 
     reserved = await _reserved_by_product()

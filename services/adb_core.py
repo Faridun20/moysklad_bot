@@ -56,6 +56,49 @@ def _pg_args(args: tuple) -> tuple:
     return tuple(Decimal(repr(a)) if type(a) is float else a for a in args)
 
 
+# ─── Сортировка и поиск по названию ────────────────────────────────────────────
+
+# ICU-правило сравнения для русского. Postgres в образе на Alpine (musl) не
+# умеет libc-локалей: `ORDER BY name` там сортирует по кодам символов —
+# «Zeta, alfa, Ёлка, Абрикос». ICU-коллации в образ входят (initdb заводит их в
+# pg_collation), и `ru-RU-x-icu` даёт «Абрикос, Ёлка, alfa, Zeta» без смены
+# локали всей базы. Наличие коллации сверяет `startup_checks`.
+NAME_COLLATION = "ru-RU-x-icu"
+
+
+def order_by_name(column: str) -> str:
+    """`column COLLATE "ru-RU-x-icu"` на Postgres, голая колонка на SQLite.
+
+    SQLite ICU не несёт и неизвестный COLLATE отвергает запросом целиком,
+    поэтому там сортировка остаётся бинарной — порядок проверяется на
+    Postgres (TEST_PG_URL). Имя колонки приходит из кода, не от пользователя.
+    """
+    if _use_postgres():
+        return f'{column} COLLATE "{NAME_COLLATION}"'
+    return column
+
+
+def name_search_sql(column: str) -> str:
+    """Выражение для LIKE-поиска по названию: нижний регистр и ё→е.
+
+    «Ёлка» в справочнике и «елка» в поиске (или наоборот) — одно слово: на
+    телефоне «ё» набирают долгим нажатием и чаще не набирают вовсе.
+    Нормализуются ОБЕ стороны — колонка здесь, ввод в `name_search_param`.
+    `lower()` на SQLite переопределён Unicode-версией в обоих слоях,
+    `replace()` встроенный в обеих базах.
+    """
+    return f"replace(lower({column}), 'ё', 'е')"
+
+
+def normalize_search(text: str | None) -> str:
+    """Пользовательский ввод к виду `name_search_sql`: нижний регистр, ё→е."""
+    return (text or "").strip().lower().replace("ё", "е")
+
+
+def name_search_param(text: str | None) -> str:
+    """`%ввод%` для LIKE против `name_search_sql`."""
+    return f"%{normalize_search(text)}%"
+
 # asyncpg-пул (ленивая инициализация). Размеры — как у psycopg2-пула.
 # Пул привязан к event loop'у, на котором создан. Храним этот loop, чтобы
 # пересоздавать пул при смене loop'а (cron делает несколько asyncio.run;

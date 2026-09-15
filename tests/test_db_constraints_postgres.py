@@ -138,6 +138,26 @@ def test_container_items_come_back_as_floats(pg_db):
     json.dumps(listed, default=str)
 
 
+# ─── Сортировка и поиск ──────────────────────────────────────────────────────
+
+
+def test_names_sort_in_russian_on_postgres(pg_db):
+    from services import container_receipt, counterparties, startup_checks, warehouse
+
+    names = ["Zeta", "alfa", "Ёлка", "Абрикос", "Елена", "яблоко"]
+    for n in names:
+        _run(counterparties.create(n))
+        _run(container_receipt.create_product(n))
+    got = [r["name"] for r in _run(counterparties.search())]
+    # Кириллица — по алфавиту без учёта регистра (Ё — буквой после Е, как в
+    # алфавите), латиница отдельным блоком и тоже без учёта регистра. Порядок
+    # кодов символов дал бы «Zeta, alfa, Ёлка, Абрикос, Елена, яблоко».
+    assert got == ["Абрикос", "Елена", "Ёлка", "яблоко", "alfa", "Zeta"], got
+    assert [r["name"] for r in _run(warehouse.get_catalog())] == got
+    assert [r["name"] for r in _run(counterparties.search("ЁЛ"))] == ["Елена", "Ёлка"]
+    assert startup_checks.check_collation() == []
+
+
 # ─── Разовый скрипт на базе «как на проде» ───────────────────────────────────
 
 

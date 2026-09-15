@@ -275,6 +275,40 @@ def test_order_items_quantities_are_json_floats(isolated_db):
     json.dumps(items)
 
 
+# ─── Поиск и сортировка по названию ──────────────────────────────────────────
+
+
+def test_order_by_name_is_plain_on_sqlite(isolated_db):
+    from services import adb_core
+
+    assert adb_core.order_by_name("p.name") == "p.name"
+
+
+def test_search_treats_yo_as_ye_both_ways(isolated_db):
+    from services import container_receipt, counterparties, warehouse
+
+    _run(counterparties.create("Ёлкин Азиз"))
+    _run(counterparties.create("Елена Савдо"))
+    found = {r["name"] for r in _run(counterparties.search("ЕЛК"))}
+    assert found == {"Ёлкин Азиз"}
+    found = {r["name"] for r in _run(counterparties.search("ёлена"))}
+    assert found == {"Елена Савдо"}
+
+    _run(container_receipt.create_product("Ёрш трубный"))
+    assert [r["name"] for r in _run(warehouse.search_products("ерш"))] == ["Ёрш трубный"]
+
+
+def test_wh_counterparties_endpoint_searches_yo(api):
+    from services import counterparties
+
+    client, db = api
+    db.set_role(900, "boss", "Boss", "boss")
+    _run(counterparties.create("Сёмга ООО"))
+    r = client.post("/api/wh/counterparties", json={"initData": "900", "search": "семга"})
+    assert r.status_code == 200, r.text
+    assert [c["name"] for c in r.json()["counterparties"]] == ["Сёмга ООО"]
+
+
 # ─── Параметры драйвера и пула ───────────────────────────────────────────────
 
 
