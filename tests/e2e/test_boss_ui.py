@@ -85,7 +85,9 @@ def test_boss_sees_exactly_the_new_bar_drawer_and_no_worker_buttons(open_app, e2
     _shot(boss, "boss-today")
 
     _open_menu(boss)
-    assert _drawer_tabs(boss, "money") == ["debts", "report"]
+    # «Сверка» остаётся и без «Рабочих действий»: ежедневный пересчёт кассы для
+    # руководителя — контроль, а не работа склада (helpers.js moneyTabs).
+    assert _drawer_tabs(boss, "money") == ["debts", "reconcile", "report"]
     assert _drawer_tabs(boss, "sales") == ["orders", "report"]
     assert _drawer_tabs(boss, "stock") == ["catalog", "containers", "machines"]
     assert _drawer_tabs(boss, "clients") == ["funnel", "limits"]
@@ -107,7 +109,7 @@ def test_boss_sees_exactly_the_new_bar_drawer_and_no_worker_buttons(open_app, e2
 
     go(boss, "money")
     settled(boss)
-    assert _seg_tabs(boss) == ["debts", "report"]
+    assert _seg_tabs(boss) == ["debts", "reconcile", "report"]
     assert boss.locator("#content .btn-pay-debt, #content .btn-confirm-pay").count() == 0
     _shot(boss, "boss-money-debts")
 
@@ -143,7 +145,7 @@ def test_switch_on_shows_worker_actions_and_survives_reopen(open_app, e2e):
     )
     # Вкладки в шторке сразу поменялись.
     boss.wait_for_selector('#nav-drawer .nav-link--tab[data-screen="stock"][data-tab="invoices"]')
-    assert _drawer_tabs(boss, "money") == ["debts", "ops", "report"]
+    assert _drawer_tabs(boss, "money") == ["debts", "ops", "reconcile", "report"]
     assert _drawer_tabs(boss, "clients") == ["funnel", "list", "limits", "channel"]
     assert _drawer_tabs(boss, "sales") == ["orders", "report", "docs"]
     boss.wait_for_timeout(350)
@@ -166,7 +168,7 @@ def test_switch_on_shows_worker_actions_and_survives_reopen(open_app, e2e):
     settled(again)
     go(again, "money")
     settled(again)
-    assert _seg_tabs(again) == ["debts", "ops", "report"]
+    assert _seg_tabs(again) == ["debts", "ops", "reconcile", "report"]
 
     # Выключил — работа менеджера снова спрятана.
     _open_menu(again)
@@ -290,7 +292,7 @@ def test_manager_ui_is_unchanged(open_app, e2e):
     assert nav_screens(mgr) == ["today", "sales", "stock", "money", "clients"]
     _open_menu(mgr)
     assert mgr.locator("#nav-drawer [data-work-switch]").count() == 0
-    assert _drawer_tabs(mgr, "money") == ["confirm", "debts", "ops"]
+    assert _drawer_tabs(mgr, "money") == ["confirm", "debts", "ops", "reconcile"]
     assert _drawer_tabs(mgr, "stock") == ["catalog", "containers", "machines", "invoices"]
     assert _drawer_tabs(mgr, "sales") == ["orders", "report", "docs"]
     mgr.click("#nav-drawer .nav-drawer-close")

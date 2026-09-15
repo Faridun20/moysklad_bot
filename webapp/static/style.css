@@ -2714,3 +2714,24 @@ body.page-sheet-open { overflow: hidden; }
 .c-field[hidden] { display: none; }
 .pay-account-box { margin-block: var(--sp-2); }
 .pay-account--empty .card-row-title { color: var(--accent); }
+
+/* ─── Сверка кассы (cash_reconcile.js) ───────────────────────────────────────
+   Разница под полем ввода — главное, ради чего открывают экран, поэтому она
+   ЦВЕТОМ и текстом сразу: сошлось — зелёным «сходится», разошлось — тревожным
+   с точной суммой. Цветом одним не ограничиваемся (дальтонизм, чёрно-белый
+   скриншот в переписке): подпись называет исход словом. */
+.recon-cur { margin-bottom: var(--sp-3); }
+.recon-diff {
+  margin: calc(-1 * var(--sp-2)) 4px var(--sp-1);
+  font-size: 13px; font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.recon-diff:empty { display: none; }
+.recon-diff.recon-ok { color: var(--success); }
+.recon-diff.recon-warn { color: var(--danger); }
+/* Карточка пересчёта в истории: полоса слева — тот же признак, что и цвет
+   подписи, но виден при беглом просмотре списка. */
+.recon-row { border-left: 3px solid transparent; }
+.recon-row.recon-ok { border-left-color: var(--success); }
+.recon-row.recon-warn { border-left-color: var(--danger); }
+.recon-note { font-style: italic; }

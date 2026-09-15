@@ -210,6 +210,12 @@
     if (f.isConfirmer) tabs.push({ key: 'confirm', label: 'Подтвердить' });
     if (f.canSeeDebts) tabs.push({ key: 'debts', label: 'Долги' });
     if (f.hasOps) tabs.push({ key: 'ops', label: 'Касса' });
+    // Сверка кассы — у всех, кто её записывает (менеджер), и у руководства,
+    // которое её читает. НЕ за «Рабочими действиями», в отличие от «Кассы»:
+    // руководителю это контроль, а не работа склада, и спрятать список
+    // расхождений за переключатель значило бы не показать его ровно тому,
+    // ради кого он и заводился.
+    if (f.canReconcile) tabs.push({ key: 'reconcile', label: 'Сверка' });
     if (f.isBoss) tabs.push({ key: 'report', label: 'Отчёт' });
     return tabs;
   }
@@ -263,6 +269,8 @@
         // Касса — сдачи наличных, их создают менеджеры: /api/deposits/my и
         // /create кладовщику не отвечают, и вкладка у него возвращала 403.
         hasOps: working && work,
+        // Сверку записывают и читают те же роли, что и `/api/cash/reconcile*`.
+        canReconcile: working,
       });
     }
     if (section === 'clients') return clientsTabs({ isBoss: boss, work });
@@ -1209,6 +1217,114 @@
     return list.length ? list.join(', ') : '—';
   }
 
+  // ─── Сверка кассы (services/cash_reconciliation.py) ──────────────────────
+  //
+  // Пересчёт наличных руками против того, что система считает «на руках».
+  // Здесь только чистые функции — разметка и проводка в cash_reconcile.js.
+
+  // Ввод формы {валюта: строка} + ожидаемое [{currency, amount_cents}] →
+  // строки сверки. Валюта без введённой суммы в пересчёт НЕ попадает: «не
+  // считал сумы» и «сумов ноль» — разные утверждения, второе вводят явно.
+  // Зеркало `cash_reconciliation.build_lines`; сервер считает заново и
+  // остаётся единственным источником истины — здесь это только предпросмотр.
+  function reconLines(input, system) {
+    const sys = {};
+    (system || []).forEach(s => { sys[String(s.currency).toUpperCase()] = Number(s.amount_cents) || 0; });
+    const out = [];
+    Object.keys(input || {}).sort().forEach(rawCur => {
+      const cur = String(rawCur).toUpperCase();
+      const raw = String(input[rawCur] == null ? '' : input[rawCur]).trim();
+      if (raw === '') return;
+      // Свой разбор, а не payCents: тот отдаёт null и на «0», и на мусоре, а
+      // пересчитанный НОЛЬ — законный результат («в кассе пусто»), и путать
+      // его с опечаткой «12о» нельзя.
+      const t = raw.replace(/[\s  ]/g, '').replace(',', '.');
+      const valid = /^\d+(\.\d{1,2})?$/.test(t);
+      const counted = valid ? Math.round(parseFloat(t) * 100) : null;
+      const expected = sys[cur] || 0;
+      out.push({
+        currency: cur,
+        counted_cents: counted,
+        system_cents: expected,
+        diff_cents: counted == null ? null : counted - expected,
+        invalid: !valid,
+      });
+    });
+    return out;
+  }
+
+  // Итог предпросмотра: можно ли отправлять и что сказать про расхождение.
+  function reconPreview(lines) {
+    const rows = lines || [];
+    const bad = rows.some(r => r.invalid);
+    const filled = rows.filter(r => !r.invalid && r.counted_cents != null);
+    const mismatched = filled.filter(r => r.diff_cents !== 0);
+    return {
+      valid: !bad && filled.length > 0,
+      empty: filled.length === 0,
+      invalid: bad,
+      matched: filled.length > 0 && mismatched.length === 0,
+      mismatched,
+    };
+  }
+
+  // Подпись расхождения. Ноль — это результат, а не пустота: так и пишем.
+  function reconDiffLabel(diff, cur) {
+    const n = Number(diff) || 0;
+    if (n === 0) return 'сходится';
+    return (n > 0 ? 'излишек ' : 'недостача ') + payMoney(Math.abs(n), cur);
+  }
+
+  // Класс строки: сошлось — зелёная, разошлось — тревожная.
+  function reconDiffClass(diff) {
+    return (Number(diff) || 0) === 0 ? 'recon-ok' : 'recon-warn';
+  }
+
+  // Строки истории (сервер отдаёт по строке на валюту) → карточки пересчётов:
+  // строки одного пересчёта склеены ключом, как их и писали.
+  function reconGroupHistory(items) {
+    const groups = [];
+    const byKey = {};
+    (items || []).forEach(r => {
+      const key = r.request_key ? 'k:' + r.request_key
+        : 'u:' + r.counted_by + '|' + (r.created_at || r.count_date || '');
+      let g = byKey[key];
+      if (!g) {
+        g = {
+          key, date: r.count_date, created_at: r.created_at,
+          who: r.counted_by_name || '', by: r.counted_by, note: r.note || '', lines: [],
+        };
+        byKey[key] = g;
+        groups.push(g);
+      }
+      if (!g.note && r.note) g.note = r.note;
+      g.lines.push(r);
+    });
+    groups.forEach(g => {
+      g.lines.sort((a, b) => String(a.currency).localeCompare(String(b.currency)));
+      g.matched = g.lines.every(l => Number(l.diff_cents) === 0);
+    });
+    return groups;
+  }
+
+  function reconHistoryHtml(items, opts) {
+    const o = opts || {};
+    const groups = reconGroupHistory(items);
+    if (!groups.length) {
+      return `<div class="debt-hint">${escapeHtml(o.emptyText || 'Пересчётов пока нет.')}</div>`;
+    }
+    return `<div class="c-surface c-surface--list">${groups.map(g => `
+      <div class="c-row recon-row ${g.matched ? 'recon-ok' : 'recon-warn'}">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(formatDateRU(g.date || ''))}${o.showWho && g.who ? ' · ' + escapeHtml(g.who) : ''}</div>
+          <div class="card-row-sub">${g.lines.map(l =>
+            `${escapeHtml(String(l.currency))}: ${escapeHtml(payMoney(l.counted_cents, l.currency))} · ${escapeHtml(reconDiffLabel(l.diff_cents, l.currency))}`
+          ).join(' · ')}</div>
+          ${g.note ? `<div class="card-row-sub recon-note">${escapeHtml(g.note)}</div>` : ''}
+        </div>
+      </div>`).join('')}</div>`;
+  }
+
   return {
     escapeHtml, idemKey, formatDateRU, icon, opsAmount, plural,
     ROLE_ALSO_ACTS_AS, roleIn,
@@ -1228,5 +1344,6 @@
     PAY_ACCOUNT_KIND, payAccountItems, payDefaultAccountId, payAccountPrefill, payAccountFormError,
     payAccountFieldHtml, payMissingAccount, payAccountsManagerHtml,
     payHandoverPicked, payDepositOrdersText,
+    reconLines, reconPreview, reconDiffLabel, reconDiffClass, reconGroupHistory, reconHistoryHtml,
   };
 });

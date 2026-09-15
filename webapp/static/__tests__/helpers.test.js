@@ -10,6 +10,7 @@ const {
   escapeHtml, idemKey, formatDateRU, icon, opsAmount, plural, categoryTree, categoryMatches,
   parseAmount, parsePaymentItems, renderMoneyTotalsHtml, periodSegHtml, rangeLabel,
   navSections, defaultSection, sectionNavHtml, salesTabs, stockTabs, moneyTabs, clientsTabs,
+  roleSectionTabs,
   formatMoney, emptyState, skeleton, errorBoxHtml,
   machineStatusLabel, machineSubtitle, machineStatusSegHtml,
   moneyBlockLabel, agingBarsHtml, forecastRowsHtml, buyerKey, leadFunnelHtml,
@@ -328,20 +329,23 @@ describe('renderMoneyTotalsHtml', () => {
 describe('вкладки разделов', () => {
   const keys = (fn, f) => fn(f).map(t => t.key);
 
-  it('Деньги у руководителя: подтвердить/долги/касса/отчёт', () => {
-    expect(keys(moneyTabs, { isBoss: true, isConfirmer: true, canSeeDebts: true, hasOps: true }))
-      .toEqual(['confirm', 'debts', 'ops', 'report']);
+  it('Деньги у руководителя: подтвердить/долги/касса/сверка/отчёт', () => {
+    expect(keys(moneyTabs, { isBoss: true, isConfirmer: true, canSeeDebts: true, hasOps: true,
+                             canReconcile: true }))
+      .toEqual(['confirm', 'debts', 'ops', 'reconcile', 'report']);
   });
 
   it('бухгалтер видит только то, на что у него есть ручки', () => {
-    // /api/deposits/* ему отвечают, /api/debts и /api/money/summary — нет.
+    // /api/deposits/* ему отвечают, /api/debts, /api/money/summary и
+    // /api/cash/reconcile* — нет.
     expect(keys(moneyTabs, { isBoss: false, isConfirmer: true, canSeeDebts: false, hasOps: false }))
       .toEqual(['confirm']);
   });
 
-  it('менеджер: долги и касса, без подтверждений и отчёта', () => {
-    expect(keys(moneyTabs, { isBoss: false, isConfirmer: false, canSeeDebts: true, hasOps: true }))
-      .toEqual(['debts', 'ops']);
+  it('менеджер: долги, касса и сверка, без подтверждений и отчёта', () => {
+    expect(keys(moneyTabs, { isBoss: false, isConfirmer: false, canSeeDebts: true, hasOps: true,
+                             canReconcile: true }))
+      .toEqual(['debts', 'ops', 'reconcile']);
   });
 
   it('Продажи: отчёт только тем, кому отвечает /api/analytics', () => {
@@ -374,15 +378,20 @@ describe('вкладки разделов', () => {
     expect(keys(clientsTabs, { isBoss: false })).toEqual(['list']);
   });
 
-  it('ни один раздел не даёт больше 4 вкладок', () => {
+  it('ни одна РОЛЬ не получает больше 4 вкладок в разделе', () => {
     // Пятая не влезает в ряд на 360dp и уезжает в скролл, который не виден.
-    const all = [
-      moneyTabs({ isBoss: true, isConfirmer: true, canSeeDebts: true, hasOps: true }),
-      salesTabs({ canSeeReport: true, canDocs: true }),
-      stockTabs({ canSeeGoods: true, isBoss: true }),
-      clientsTabs({ isBoss: true }),
-    ];
-    for (const t of all) expect(t.length).toBeLessThanOrEqual(4);
+    // Считаем по НАСТОЯЩИМ сочетаниям ролей (`roleSectionTabs`), а не по набору
+    // флагов «все сразу»: у руководителя `isConfirmer` не бывает (он
+    // подтверждает в «Решениях»), и придуманный худший случай заставлял бы
+    // вырезать вкладку, которой ни у кого на экране нет.
+    for (const role of ['admin', 'boss', 'manager', 'warehouse_keeper', 'bookkeeper']) {
+      for (const section of ['money', 'sales', 'stock', 'clients']) {
+        for (const work of [true, false]) {
+          const tabs = roleSectionTabs(section, role, { work });
+          expect(tabs.length, `${role}/${section}/work=${work}`).toBeLessThanOrEqual(4);
+        }
+      }
+    }
   });
 });
 
@@ -1034,7 +1043,9 @@ describe('руководитель: «Рабочие действия» (реш�
     for (const r of ['boss', 'admin']) {
       expect(tabs('sales', r, false)).toEqual(['orders', 'report']);
       expect(tabs('stock', r, false)).toEqual(['catalog', 'containers', 'machines']);
-      expect(tabs('money', r, false)).toEqual(['debts', 'report']);
+      // «Сверка кассы» остаётся и без «Рабочих действий»: для руководителя
+      // это контроль, а не работа склада (см. moneyTabs).
+      expect(tabs('money', r, false)).toEqual(['debts', 'reconcile', 'report']);
       expect(tabs('clients', r, false)).toEqual(['funnel', 'limits']);
     }
   });
@@ -1042,7 +1053,7 @@ describe('руководитель: «Рабочие действия» (реш�
   it('включено: работа менеджера возвращается, подтверждения остаются в «Решениях»', () => {
     expect(tabs('sales', 'boss', true)).toEqual(['orders', 'report', 'docs']);
     expect(tabs('stock', 'boss', true)).toEqual(['catalog', 'containers', 'machines', 'invoices']);
-    expect(tabs('money', 'boss', true)).toEqual(['debts', 'ops', 'report']);
+    expect(tabs('money', 'boss', true)).toEqual(['debts', 'ops', 'reconcile', 'report']);
     expect(tabs('clients', 'boss', true)).toEqual(['funnel', 'list', 'limits', 'channel']);
   });
 
@@ -1051,7 +1062,7 @@ describe('руководитель: «Рабочие действия» (реш�
       manager: {
         sales: ['orders', 'report', 'docs'],
         stock: ['catalog', 'containers', 'machines', 'invoices'],
-        money: ['confirm', 'debts', 'ops'],
+        money: ['confirm', 'debts', 'ops', 'reconcile'],
         clients: ['list'],
       },
       warehouse_keeper: { sales: ['orders'], stock: ['catalog'], money: ['confirm'], clients: ['list'] },
