@@ -244,6 +244,58 @@ def test_received_respects_since_last_run(isolated_db):
     assert data["received"]["by_currency"] == [{"currency": "USD", "total": 150.0}]
 
 
+# ─── boss_digest_time: валидация HH:MM ──────────────────────────────────────
+
+
+def test_invalid_digest_time_falls_back_to_default_with_warning(isolated_db, caplog):
+    """«25:00» не парсится в разумные часы/минуты — дайджест обязан упасть на
+    дефолт 19:00 (иначе `is_due()` навсегда считает «ещё не время»: у суток
+    нет часа 25, (now.hour, now.minute) < (25, 0) истинно всегда)."""
+    from services import boss_digest as bd
+
+    isolated_db.set_setting("boss_digest_time", "25:00")
+    with caplog.at_level(logging.WARNING):
+        assert bd.digest_time_hhmm() == (19, 0)
+    assert "boss_digest_time" in caplog.text
+
+
+def test_digest_time_after_2345_falls_back_to_default_with_warning(isolated_db, caplog):
+    """Крон тикает по :00/:15/:30/:45 — время дайджеста позже 23:45 не
+    гарантирует ни одного тика в пределах того же дня до полуночи, и
+    is_due() либо никогда не сработает в свой день, либо сработает уже
+    следующим числом. Падаем на дефолт."""
+    from services import boss_digest as bd
+
+    isolated_db.set_setting("boss_digest_time", "23:50")
+    with caplog.at_level(logging.WARNING):
+        assert bd.digest_time_hhmm() == (19, 0)
+    assert "boss_digest_time" in caplog.text
+
+
+def test_digest_time_exactly_2345_is_accepted(isolated_db):
+    """Граница включительно — 23:45 совпадает с последним тиком дня."""
+    from services import boss_digest as bd
+
+    isolated_db.set_setting("boss_digest_time", "23:45")
+    assert bd.digest_time_hhmm() == (23, 45)
+
+
+def test_garbage_digest_time_falls_back_to_default(isolated_db, caplog):
+    from services import boss_digest as bd
+
+    isolated_db.set_setting("boss_digest_time", "не время")
+    with caplog.at_level(logging.WARNING):
+        assert bd.digest_time_hhmm() == (19, 0)
+    assert "boss_digest_time" in caplog.text
+
+
+def test_negative_minutes_fall_back_to_default(isolated_db):
+    from services import boss_digest as bd
+
+    isolated_db.set_setting("boss_digest_time", "10:-5")
+    assert bd.digest_time_hhmm() == (19, 0)
+
+
 # ─── is_due / идемпотентность ───────────────────────────────────────────────
 
 

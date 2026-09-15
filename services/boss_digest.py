@@ -73,12 +73,41 @@ def webapp_reply_markup() -> dict | None:
 _LAST_RUN_KEY = "boss_digest_last_run_at"
 
 
+_DEFAULT_DIGEST_TIME = (19, 0)
+
+
 def _parse_hhmm(raw: str) -> tuple[int, int]:
+    """Разобрать «HH:MM» → (час, минута), с фолбэком на дефолт 19:00.
+
+    Отклоняем и логируем WARNING:
+      * мусор, который не разбирается на два int'а («не время», «10:-5» —
+        `int("-5")` парсится, но час/минута ниже проверяются на диапазон);
+      * час/минуту вне суток (»25:00» — `is_due()` сравнивает
+        `(now.hour, now.minute) < (hh, mm)`: у суток нет часа 25, сравнение
+        истинно всегда, и дайджест не выходит НИКОГДА);
+      * время позже 23:45 — крон тикает по :00/:15/:30/:45
+        (`docker-compose.yml`, «каждые 15 минут»), и позже 23:45 нет ни
+        одного тика в пределах ТОГО ЖЕ дня: `is_due()` либо не сработает
+        вовсе (следующий тик — уже полночь следующих суток), либо сработает
+        помеченным неверной датой.
+    """
     try:
-        h, m = str(raw or "19:00").split(":")
-        return int(h), int(m)
+        h_str, m_str = str(raw or "19:00").split(":")
+        h, m = int(h_str), int(m_str)
     except (TypeError, ValueError):
-        return 19, 0
+        logger.warning(
+            "boss_digest_time=%r — не HH:MM, использую дефолт %02d:%02d",
+            raw, *_DEFAULT_DIGEST_TIME,
+        )
+        return _DEFAULT_DIGEST_TIME
+    if not (0 <= h <= 23 and 0 <= m <= 59) or (h, m) > (23, 45):
+        logger.warning(
+            "boss_digest_time=%r — вне суток или позже 23:45 (крон тикает по "
+            ":00/:15/:30/:45), использую дефолт %02d:%02d",
+            raw, *_DEFAULT_DIGEST_TIME,
+        )
+        return _DEFAULT_DIGEST_TIME
+    return h, m
 
 
 def digest_time_hhmm() -> tuple[int, int]:
