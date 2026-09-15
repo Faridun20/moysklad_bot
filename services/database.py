@@ -2826,50 +2826,173 @@ def get_currency_rate(currency_code: str) -> float | None:
     return rate
 
 
+# Коридор курса сума к доллару для ТЕКУЩЕГО курса. Не прогноз, а сторож от
+# опечаток: поле формы показывает «сум за 1 USD», а в базу уходит обратное
+# число, и лишний/пропущенный ноль или перевёрнутый курс (12 600 вместо
+# 1/12 600) молча пересчитывал все сводки «в долларах» в тысячи раз. За
+# 2017–2026 сум ходил в пределах ~8 000–13 000 — у коридора запас в разы в обе
+# стороны, при этом ошибка на порядок в него уже не попадает. Дневной архив
+# коридором НЕ режется: история за годы назад законно бывает вне его.
+UZS_PER_USD_MIN = 5_000.0
+UZS_PER_USD_MAX = 50_000.0
+
+
+def _fmt_rate_num(value: float) -> str:
+    return f"{value:,.2f}".replace(",", " ").removesuffix(".00")
+
+
+def validate_rate_to_base(code: str, rate: float) -> tuple[bool, str | None]:
+    """Курс `1 code = rate BASE` в разумных границах. (ok, понятная ошибка).
+
+    Базовая валюта — строго 1 (иначе все пересчёты «в базовую» перекошены).
+    Пара сум/доллар — коридор UZS_PER_USD_*. Прочие пары (если список валют
+    расширят) — только общая проверка `_validate_amount` у вызывающего.
+    """
+    from config import BASE_CURRENCY
+
+    base = (BASE_CURRENCY or "USD").upper()
+    value = float(rate)
+    if code == base:
+        if abs(value - 1.0) > 1e-12:
+            return False, f"Курс базовой валюты {base} всегда 1 — менять его нельзя"
+        return True, None
+    if {code, base} == {"UZS", "USD"}:
+        uzs_per_usd = 1.0 / value if code == "UZS" else value
+        if not (UZS_PER_USD_MIN <= uzs_per_usd <= UZS_PER_USD_MAX):
+            return False, (
+                f"Курс вне разумных границ: получилось 1 USD = "
+                f"{_fmt_rate_num(uzs_per_usd)} сум. Ожидается от "
+                f"{_fmt_rate_num(UZS_PER_USD_MIN)} до {_fmt_rate_num(UZS_PER_USD_MAX)} "
+                "сум за доллар — проверьте нули и направление курса."
+            )
+    return True, None
+
+
 def set_currency_rate(currency_code: str, rate: float, updated_by: int) -> tuple[bool, str | None]:
     """Установить/обновить rate. UPSERT с автоинвалидацией кэша.
 
-    Возвращает (ok, error_msg). Валидирует rate как amount (> 0, конечное).
+    Возвращает (ok, error_msg). Валидирует rate как amount (> 0, конечное) и
+    по коридору пары (`validate_rate_to_base`) — это касается и ЦБ-синка:
+    аномальный ответ источника лучше громкого отказа, чем молчаливой записи.
     `currency_code` — нормализуется UPPER, должен быть в ALLOWED_CURRENCIES."""
-    from config import ALLOWED_CURRENCIES
-
-    code = (currency_code or "").upper().strip()
-    if not code:
-        return False, "currency_code пустой"
-    if code not in ALLOWED_CURRENCIES:
-        return False, f"currency_code должен быть из {list(ALLOWED_CURRENCIES)}"
-    ok, err = _validate_amount(rate)
-    if not ok:
-        return False, f"rate: {err}"
+    code, err = _check_rate_input(currency_code, rate)
+    if err:
+        return False, err
     with get_conn() as conn:
         cur = get_cursor(conn)
-        if USE_POSTGRES:
-            cur.execute(
-                q(
-                    "INSERT INTO currency_rates "
-                    "(currency_code, rate_to_base, updated_at, updated_by) "
-                    "VALUES (?, ?, ?, ?) "
-                    "ON CONFLICT (currency_code) DO UPDATE SET "
-                    "rate_to_base = EXCLUDED.rate_to_base, "
-                    "updated_at = EXCLUDED.updated_at, "
-                    "updated_by = EXCLUDED.updated_by"
-                ),
-                (code, float(rate), now_str(), updated_by),
-            )
-        else:
-            cur.execute(
-                q(
-                    "INSERT OR REPLACE INTO currency_rates "
-                    "(currency_code, rate_to_base, updated_at, updated_by) "
-                    "VALUES (?, ?, ?, ?)"
-                ),
-                (code, float(rate), now_str(), updated_by),
-            )
+        _upsert_current_rate(cur, code, rate, updated_by)
         conn.commit()
     # Инвалидируем кэш именно этой валюты, остальные не трогаем.
     with _currency_rates_lock:
         _CURRENCY_RATES_CACHE.pop(code, None)
     return True, None
+
+
+def _check_rate_input(currency_code: str, rate: float) -> tuple[str, str | None]:
+    """Нормализованный код и ошибка (None — всё в порядке)."""
+    from config import ALLOWED_CURRENCIES
+
+    code = (currency_code or "").upper().strip()
+    if not code:
+        return code, "currency_code пустой"
+    if code not in ALLOWED_CURRENCIES:
+        return code, f"currency_code должен быть из {list(ALLOWED_CURRENCIES)}"
+    ok, err = _validate_amount(rate)
+    if not ok:
+        return code, f"rate: {err}"
+    ok, err = validate_rate_to_base(code, rate)
+    if not ok:
+        return code, err
+    return code, None
+
+
+def set_currency_rate_manual(
+    currency_code: str, rate: float, updated_by: int
+) -> tuple[bool, str | None]:
+    """Ручная правка курса из WebApp: текущий курс + дневной архив source='manual'.
+
+    Обе записи — одним коммитом. Метка 'manual' в архиве за СЕГОДНЯ — то, по
+    чему ночной `run_fx_sync` понимает, что курс этого дня поправил человек, и
+    не перезаписывает его ни в `currency_rates`, ни в архиве. Раньше правка
+    держалась до ближайшего прогона синка и исчезала без следа, а снимки
+    `fx_rate_to_base` операций того дня уезжали по курсу ЦБ, который босс
+    сознательно исправил. Следующий день синк пишет как обычно.
+    """
+    code, err = _check_rate_input(currency_code, rate)
+    if err:
+        return False, err
+    day = now_str()[:10]  # бизнес-дата — в кадре процесса, как created_at
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        _upsert_current_rate(cur, code, rate, updated_by)
+        _upsert_daily_rate(cur, code, day, rate, "manual")
+        conn.commit()
+    with _currency_rates_lock:
+        _CURRENCY_RATES_CACHE.pop(code, None)
+    logger.info("Курс %s задан вручную (user_id=%s): %s на %s", code, updated_by, rate, day)
+    return True, None
+
+
+def get_currency_rate_daily_source(currency_code: str, rate_date: str) -> str | None:
+    """Источник курса в дневном архиве за день ('cbu' | 'manual' | None — записи нет)."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(
+            q(
+                "SELECT source FROM currency_rate_daily "
+                "WHERE currency_code = ? AND rate_date = ?"
+            ),
+            ((currency_code or "").upper(), (rate_date or "")[:10]),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return row["source"] if hasattr(row, "keys") else row[0]
+
+
+def _upsert_current_rate(cur, code: str, rate: float, updated_by: int) -> None:
+    if USE_POSTGRES:
+        cur.execute(
+            q(
+                "INSERT INTO currency_rates "
+                "(currency_code, rate_to_base, updated_at, updated_by) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (currency_code) DO UPDATE SET "
+                "rate_to_base = EXCLUDED.rate_to_base, "
+                "updated_at = EXCLUDED.updated_at, "
+                "updated_by = EXCLUDED.updated_by"
+            ),
+            (code, float(rate), now_str(), updated_by),
+        )
+    else:
+        cur.execute(
+            q(
+                "INSERT OR REPLACE INTO currency_rates "
+                "(currency_code, rate_to_base, updated_at, updated_by) "
+                "VALUES (?, ?, ?, ?)"
+            ),
+            (code, float(rate), now_str(), updated_by),
+        )
+
+
+def _upsert_daily_rate(cur, code: str, day: str, rate: float, source: str) -> None:
+    """UPSERT дневного архива. Ручную запись дня перезаписывает только ручная.
+
+    Условие — в самом UPSERT (одинаково на Postgres и SQLite ≥ 3.24), а не
+    отдельной проверкой: синк и правка не разойдутся между SELECT и записью.
+    """
+    cur.execute(
+        q(
+            "INSERT INTO currency_rate_daily "
+            "(currency_code, rate_date, rate_to_base, source, created_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT (currency_code, rate_date) DO UPDATE SET "
+            "rate_to_base = excluded.rate_to_base, source = excluded.source "
+            "WHERE COALESCE(currency_rate_daily.source, '') <> 'manual' "
+            "OR excluded.source = 'manual'"
+        ),
+        (code, day, float(rate), source, now_str()),
+    )
 
 
 async def get_all_currency_rates() -> list[dict]:
@@ -2948,7 +3071,8 @@ def convert_to_base_at(
 def set_currency_rate_daily(
     currency_code: str, rate_date: str, rate_to_base: float, source: str = "cbu"
 ) -> tuple[bool, str | None]:
-    """UPSERT курса в дневной архив (currency_rate_daily). Один курс на день.
+    """UPSERT курса в дневной архив (currency_rate_daily). Один курс на день;
+    запись дня с source='manual' перезаписывает только другая ручная.
 
     `rate_date` — 'YYYY-MM-DD'. Возвращает (ok, error_msg). Валидирует rate
     как amount (> 0, конечное). currency_code нормализуется UPPER.
@@ -2963,26 +3087,9 @@ def set_currency_rate_daily(
         return False, f"rate_to_base: {err}"
     with get_conn() as conn:
         cur = get_cursor(conn)
-        if USE_POSTGRES:
-            cur.execute(
-                q(
-                    "INSERT INTO currency_rate_daily "
-                    "(currency_code, rate_date, rate_to_base, source, created_at) "
-                    "VALUES (?, ?, ?, ?, ?) "
-                    "ON CONFLICT (currency_code, rate_date) DO UPDATE SET "
-                    "rate_to_base = EXCLUDED.rate_to_base, source = EXCLUDED.source"
-                ),
-                (code, rate_date, float(rate_to_base), source, now_str()),
-            )
-        else:
-            cur.execute(
-                q(
-                    "INSERT OR REPLACE INTO currency_rate_daily "
-                    "(currency_code, rate_date, rate_to_base, source, created_at) "
-                    "VALUES (?, ?, ?, ?, ?)"
-                ),
-                (code, rate_date, float(rate_to_base), source, now_str()),
-            )
+        # Ручную запись дня (source='manual') автоматический источник не
+        # затирает — см. set_currency_rate_manual.
+        _upsert_daily_rate(cur, code, rate_date, rate_to_base, source)
         conn.commit()
     return True, None
 

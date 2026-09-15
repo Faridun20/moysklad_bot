@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from tests.e2e.conftest import go, seed_order, settled, sheet_fill, tab
 
 
@@ -124,7 +126,8 @@ def test_boss_updates_currency_rate(open_app, e2e):
     seed_order(e2e)  # без клиентов экран лимитов пуст, а курсы открываются с него
     from services.database import set_currency_rate
 
-    ok, err = set_currency_rate("UZS", 12500.0, e2e.ids["admin"])
+    # Курс хранится как «1 UZS = X USD»; форма показывает обратное — сум за доллар.
+    ok, err = set_currency_rate("UZS", 1 / 12500, e2e.ids["admin"])
     assert ok, err
     boss = open_app(e2e.ids["boss"])
     go(boss, "clients")
@@ -137,7 +140,7 @@ def test_boss_updates_currency_rate(open_app, e2e):
     boss.wait_for_function("() => window.__tgAlerts.some(a => a.includes('Курс'))")
     code = boss.locator(".rate-save").first.get_attribute("data-code")
     rate = e2e.rows("SELECT rate_to_base FROM currency_rates WHERE currency_code = ?", (code,))[0]
-    assert float(rate["rate_to_base"]) == 12700.0
+    assert float(rate["rate_to_base"]) == pytest.approx(1 / 12700)
 
 
 # ─── Канал ───────────────────────────────────────────────────────────────────

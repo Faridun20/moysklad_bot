@@ -3308,7 +3308,12 @@ async def api_currency_rates_set(request: Request):
     )
     code = (data.get("currency_code") or "").strip()
     rate = data.get("rate_to_base")
-    ok, err = await adb.set_currency_rate(code, rate, user["id"])
+    if isinstance(rate, bool):
+        # JSON true/false — float(True) == 1.0 прошёл бы как «курс 1».
+        raise HTTPException(status_code=400, detail="Курс должен быть числом")
+    # Ручная правка: границы пары + метка 'manual' в дневном архиве, чтобы
+    # ночной синк с ЦБ не перезаписал её в тот же день.
+    ok, err = await adb.set_currency_rate_manual(code, rate, user["id"])
     if not ok:
         raise HTTPException(status_code=400, detail=err)
     return JSONResponse({"ok": True, "currency_code": code.upper(), "rate_to_base": float(rate)})

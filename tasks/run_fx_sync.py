@@ -31,6 +31,7 @@ from datetime import date, timedelta
 
 from services.database import (
     backfill_fx_rate_snapshots,
+    get_currency_rate_daily_source,
     init_db,
     set_currency_rate,
     set_currency_rate_daily,
@@ -66,17 +67,27 @@ async def main(backfill_days: int = 0) -> int:
     # 1. Сегодняшний курс — основной результат прогона.
     usd_per_uzs = await fetch_cbu_usd_per_uzs()
     uzs_rate = usd_uzs_to_rate_to_base(usd_per_uzs)
-    ok, err = set_currency_rate("UZS", uzs_rate, updated_by=_SYSTEM_UID)
-    if not ok:
-        logger.error("set_currency_rate(UZS) отклонён: %s", err)
-        return 1
     today = date.today()
+    if get_currency_rate_daily_source("UZS", today.strftime("%Y-%m-%d")) == "manual":
+        # Курс на сегодня поправил человек (WebApp → «Курсы валют»). Синк его
+        # не трогает ни в текущем курсе, ни в архиве дня: раньше ручная правка
+        # молча исчезала при ближайшем прогоне. Завтра синк пишет как обычно.
+        logger.warning(
+            "fx_sync: курс UZS на %s задан вручную — не перезаписываем "
+            "(ЦБ: 1 USD = %.2f сум)", today, usd_per_uzs,
+        )
+    else:
+        ok, err = set_currency_rate("UZS", uzs_rate, updated_by=_SYSTEM_UID)
+        if not ok:
+            logger.error("set_currency_rate(UZS) отклонён: %s", err)
+            return 1
+        logger.info(
+            "fx_sync: UZS обновлён — 1 USD = %.2f сум (rate_to_base=%.10f)",
+            usd_per_uzs, uzs_rate,
+        )
+    # Архив: ручную запись дня set_currency_rate_daily сама не затирает.
     _store_day(today, uzs_rate)
     set_setting("fx_sync_last_run", utc_now().isoformat(), updated_by=_SYSTEM_UID)
-    logger.info(
-        "fx_sync: UZS обновлён — 1 USD = %.2f сум (rate_to_base=%.10f)",
-        usd_per_uzs, uzs_rate,
-    )
 
     # 2. Опциональный бэкфилл истории + снимков прошлым строкам.
     if backfill_days and backfill_days > 0:
