@@ -186,6 +186,20 @@ async def gather() -> dict:
     def _return_line(r: dict) -> str:
         return f"#{r['id']} · заказ #{r['order_id']} — {r['total_amount']:,.0f} USD".replace(",", " ")
 
+    # Расхождения ежедневной сверки кассы. Порог `should_notify_now` сюда НЕ
+    # применяется намеренно: недостача в кассе — не «мелкое событие, которое
+    # подождёт», а признак, что деньги ходят мимо системы, и её размер тут ни
+    # при чём. Своего пуша у сверки нет вовсе (пересчёт — не решение, решать по
+    # нему нечего), поэтому дайджест — единственное место, где руководитель
+    # узнаёт о расхождении, не открывая WebApp сам.
+    recon_rows: list[dict] = []
+    try:
+        from services import cash_reconciliation as recon
+
+        recon_rows = await recon.mismatches_since(str(since)[:10])
+    except Exception:
+        logger.warning("boss_digest: расхождения сверки кассы не собраны", exc_info=True)
+
     return {
         "since": since,
         "until": now.strftime("%Y-%m-%d %H:%M"),
@@ -211,7 +225,29 @@ async def gather() -> dict:
             "count": len(received_digest),
             "by_currency": _sum_by_currency(received_digest),
         },
+        "cash_counts": {
+            "count": len(recon_rows),
+            "waiting_total": len(recon_rows),
+            "lines": [_recon_line(r) for r in recon_rows[:_ITEM_CAP]],
+            "rest": max(0, len(recon_rows) - _ITEM_CAP),
+        },
     }
+
+
+def _recon_line(row: dict) -> str:
+    from services import money
+
+    diff = int(row.get("diff_cents") or 0)
+    sign = "излишек" if diff > 0 else "недостача"
+    who = row.get("counted_by_name") or "—"
+    note = f" · {row['note']}" if row.get("note") else ""
+    cur = row.get("currency") or ""
+    return (
+        f"{str(row.get('count_date') or '')[5:]} {who} — {sign} "
+        f"{money.format_cents(abs(diff), sep=' ')} {cur} "
+        f"(пересчёт {money.format_cents(int(row.get('counted_cents') or 0), sep=' ')}, "
+        f"по системе {money.format_cents(int(row.get('system_cents') or 0), sep=' ')}){note}"
+    )
 
 
 def is_empty(data: dict) -> bool:
@@ -219,11 +255,14 @@ def is_empty(data: dict) -> bool:
     порога. «Что ещё ждёт крупного» в дайджест НЕ входит (оно уже ушло
     немедленным пушем) — пустой дайджест это буквально «ничего нового
     маленького с прошлого раза»."""
+    # `.get` у новых блоков: дайджест собирают и тесты, и старые снимки данных,
+    # а отсутствующий раздел — это «нечего показать», а не KeyError на отправке.
     return not (
         data["payments"]["count"]
         or data["deposits"]["count"]
         or data["returns"]["count"]
         or data["received"]["count"]
+        or data.get("cash_counts", {}).get("count")
     )
 
 
@@ -284,6 +323,19 @@ def build_blocks(data: dict) -> list:
     _section("💵 Сдачи наличных", data["deposits"])
     _section("↩️ Возвраты", data["returns"])
 
+    recon = data.get("cash_counts") or {}
+    if recon.get("count"):
+        blocks.append(InputRichBlockDivider())
+        blocks.append(InputRichBlockSectionHeading(
+            text=f"⚖️ Сверка кассы: расхождения ({recon['count']})", size=2,
+        ))
+        blocks.append(InputRichBlockList(items=[
+            InputRichBlockListItem(blocks=[InputRichBlockParagraph(text=line)])
+            for line in recon["lines"]
+        ]))
+        if recon.get("rest"):
+            blocks.append(InputRichBlockParagraph(text=f"…и ещё {recon['rest']}"))
+
     received = _received_line(data)
     if received:
         blocks.append(InputRichBlockDivider())
@@ -318,6 +370,15 @@ def build_text(data: dict) -> str:
     _section("💳 Платежи на подтверждение", data["payments"])
     _section("💵 Сдачи наличных", data["deposits"])
     _section("↩️ Возвраты", data["returns"])
+
+    recon = data.get("cash_counts") or {}
+    if recon.get("count"):
+        lines.append(f"<b>{esc('⚖️ Сверка кассы: расхождения')}</b> ({recon['count']})")
+        for line in recon["lines"]:
+            lines.append(f"  • {esc(line)}")
+        if recon.get("rest"):
+            lines.append(f"  …и ещё {recon['rest']}")
+        lines.append("")
 
     received = _received_line(data)
     if received:

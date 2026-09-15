@@ -227,6 +227,22 @@ def _checks() -> list[Check]:
         Check("acc_account_details_number_chk", "acc_account_details",
               "account_number IS NULL OR account_number ~ '^[0-9]{20}$'",
               ("account_id", "account_number"), "расчётный счёт — 20 цифр"),
+        # ── Ежедневная сверка кассы (services.cash_reconciliation) ──
+        # Пересчитать можно ноль, но не минус: отрицательной пачки денег не
+        # бывает, а минус означал бы перепутанные местами колонки.
+        Check("daily_cash_counts_counted_chk", "daily_cash_counts",
+              "counted_cents >= 0", ("id", "counted_by", "counted_cents"),
+              "пересчитанная сумма ≥ 0"),
+        # Расхождение хранится рядом (по нему идёт выборка руководителя), но
+        # соврать им нельзя: оно обязано быть разностью тех же двух чисел —
+        # иначе строка «всё сошлось» с непустой недостачей не всплыла бы нигде.
+        Check("daily_cash_counts_diff_chk", "daily_cash_counts",
+              "diff_cents = counted_cents - system_cents",
+              ("id", "counted_cents", "system_cents", "diff_cents"),
+              "разница = пересчёт − по системе"),
+        Check("daily_cash_counts_currency_chk", "daily_cash_counts",
+              "currency ~ '^[A-Z]{3}$'", ("id", "currency"),
+              "валюта — трёхбуквенный код в верхнем регистре"),
     ]
 
 
@@ -314,6 +330,10 @@ UNIQUE_KEYS: dict[str, tuple[str, tuple[str, ...], str]] = {
     "idx_payment_parts_payment": ("payment_parts", ("payment_id",), "TRUE"),
     "idx_acc_account_details_number": (
         "acc_account_details", ("account_number",), "account_number IS NOT NULL"
+    ),
+    # Один пересчёт — одна строка на валюту: ключ делят строки ОДНОГО пересчёта.
+    "idx_daily_cash_counts_key": (
+        "daily_cash_counts", ("request_key", "currency"), "request_key IS NOT NULL"
     ),
 }
 

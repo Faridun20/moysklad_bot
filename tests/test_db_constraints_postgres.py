@@ -409,6 +409,20 @@ def _service_flows(db, tag: str) -> None:
     _run(acc.close_day(boss, {"account_id": cash, "counted": "84", "note": "мелочь",
                               "idempotency_key": f"c2-{tag}"}))
 
+    # Ежедневная сверка кассы (работает и при выключенной бухгалтерии):
+    # пересчёт, который сошёлся, и пересчёт с расхождением. Проверяются CHECK
+    # «разница = пересчёт − по системе» и партиальный UNIQUE по
+    # (request_key, currency) — настоящей записью, а не INSERT'ом мимо сервиса.
+    from services import cash_reconciliation as recon
+
+    recon_actor = recon.Actor(MGR, "Manager", "manager")
+    on_hand = _run(recon.system_on_hand(MGR))
+    usd_on_hand = int(on_hand.get("USD", 0))
+    _run(recon.record(recon_actor, {"USD": str(usd_on_hand / 100)},
+                      request_key=f"rec-ok-{tag}"))
+    _run(recon.record(recon_actor, {"USD": str(usd_on_hand / 100 + 7)}, "нашёл лишнюю пачку",
+                      request_key=f"rec-diff-{tag}"))
+
     # Контейнер: заведён и удалён; второй — принят на склад и принят повторно.
     gone = _run(containers.create_container(number=f"TMPU{tag}0001", created_by=BOSS))
     gone_id = gone.get("container_id") or gone.get("id")
@@ -514,6 +528,7 @@ def test_constraints_hold_for_real_service_flows(pg_db):
         ("machine_deal_requests", "status = 'rejected'"),
         ("payment_part_accounts", "TRUE"), ("machine_receipt_accounts", "TRUE"),
         ("acc_account_details", "account_number IS NOT NULL"),
+        ("daily_cash_counts", "diff_cents = 0"), ("daily_cash_counts", "diff_cents <> 0"),
     ):
         n = _one(db, f"SELECT COUNT(*) AS n FROM {table} WHERE {where}")["n"]
         assert n > 0, table

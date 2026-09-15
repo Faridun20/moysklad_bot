@@ -1327,6 +1327,12 @@ def _table_ddls() -> list[str]:
     from services.order_payments_schema import tables as _order_payments_tables
 
     tables.extend(_order_payments_tables(id_type))
+    # Ежедневная сверка кассы (пересчёт наличных руками) — тоже leaf. От
+    # бухгалтерии не зависит: «сколько должно быть» берётся из живого
+    # `order_payments.cash_on_hand`, а не из журнала.
+    from services.cash_reconciliation_schema import tables as _cash_recon_tables
+
+    tables.extend(_cash_recon_tables(id_type))
 
     return tables
 
@@ -1586,6 +1592,9 @@ def _index_ddls() -> list[str]:
     from services.order_payments_schema import INDEXES as _order_payments_indexes
 
     snapshot_indexes.extend(_order_payments_indexes)
+    from services.cash_reconciliation_schema import INDEXES as _cash_recon_indexes
+
+    snapshot_indexes.extend(_cash_recon_indexes)
     return snapshot_indexes
 
 
@@ -2008,6 +2017,18 @@ _DEFAULT_SETTINGS: dict[str, tuple] = {
     "cancellation_window_hours": (4, "Окно отмены одобренного заказа (часов)"),
     "cash_deposit_reminder_time": ("18:00", "Время напоминания о сдаче налички (Asia/Tashkent)"),
     "cash_deposit_escalation_days": (2, "Через сколько дней без сдачи — алерт боссам"),
+    # Ежедневная сверка кассы (services.cash_reconciliation): с этого часа
+    # «Сегодня» показывает пункт «Пересчитайте кассу», если сегодня ещё не
+    # пересчитывали. Напоминание — пункт очереди дел, а не пуш: сверка это
+    # просьба, а не блокирующее решение.
+    # ПУСТО = не напоминать, и это значение по умолчанию. Экран и сама запись
+    # сверки работают всегда; напоминание владелец включает, поставив час, —
+    # когда решит, что привычка нужна. Само по себе оно приехало бы вместе с
+    # выкатом и каждый вечер добавляло пункт всем, кто про сверку ещё не слышал,
+    # а очередь дел тем и ценна, что в ней нет ничего лишнего.
+    "cash_reconciliation_reminder_time": (
+        "", "С какого часа напоминать о сверке кассы (Asia/Tashkent); пусто — не напоминать",
+    ),
     "stale_pending_hours": (48, "Через сколько часов pending-заявка считается зависшей"),
     "stale_pending_escalation_days": (5, "Через сколько дней — алерт-эскалация админу"),
     "reject_max_cycles": (3, "Максимум циклов reject→resubmit перед freeze"),

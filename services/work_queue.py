@@ -172,6 +172,19 @@ async def gather(user_id: int, role: str) -> list[dict]:
                 "stock:containers")
         except Exception:
             logger.warning("work_queue: несверенные контейнеры не посчитаны", exc_info=True)
+        # Мягкое напоминание о ежедневной сверке кассы: не пуш и не блокировка,
+        # а пункт в самом низу очереди («info»), который исчезает, как только
+        # пересчёт за сегодня записан. Час — настройка
+        # `cash_reconciliation_reminder_time`; до него пункта нет вовсе, иначе
+        # он висел бы с утра, когда сверять ещё нечего.
+        try:
+            from services import cash_reconciliation as recon
+
+            if await recon.reminder_due(user_id, role):
+                add("cash_reconciliation", 1, "Пересчитайте кассу",
+                    "сверку за сегодня ещё не записывали", "info", recon.SCREEN)
+        except Exception:
+            logger.warning("work_queue: сверка кассы не проверена", exc_info=True)
 
     # Один сбойный счётчик не должен уносить всю очередь — поэтому каждый блок
     # выше падает молча, в лог. Экран с четырьмя пунктами из пяти полезнее, чем
