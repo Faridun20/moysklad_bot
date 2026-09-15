@@ -101,8 +101,17 @@ async def cb_return_confirm(call: CallbackQuery, bot: Bot):
     await call.answer("✅ Возврат подтверждён")
     # Round 6 (S1): html_text сохраняет HTML-entities. См. handlers/deposits.py.
     original = getattr(call.message, "html_text", None) or call.message.text or ""
+    # Куда делся товар — видно сразу: без строки о накладной кладовщик не
+    # знает, вернулся ли остаток, и идёт проверять склад руками.
+    stock_line = (
+        f"\n📦 Оприходовано накладной {esc(str(res['invoice_number']))}"
+        if res.get("invoice_number")
+        else f"\n⚠️ На склад не оприходовано: {esc(str(res.get('stock_skipped') or '—'))}"
+    )
     await call.message.edit_text(
-        original + f"\n\n{DIV}\n✅ <b>Подтверждено</b> ({res['order_status']}) — {esc(name)}",
+        original
+        + f"\n\n{DIV}\n✅ <b>Подтверждено</b> ({res['order_status']}) — {esc(name)}"
+        + stock_line,
         parse_mode="HTML",
         reply_markup=webapp_keyboard("🌐 Ещё возвраты — в WebApp"),
     )

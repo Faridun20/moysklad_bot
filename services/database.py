@@ -1092,6 +1092,22 @@ def _create_tables():
                 failed_at  TEXT,
                 error      TEXT
             )""",
+            # Возврат товара = приходная накладная. Раньше остаток на склад
+            # возвращал МойСклад документом «Возврат покупателя»; после его
+            # удаления подтверждённый возврат менял только деньги и returned_qty,
+            # а товар на складе не появлялся. Отдельная таблица, а не колонка в
+            # `returns` (та уже на проде). PRIMARY KEY по return_id — второй
+            # рубеж идемпотентности после CAS статуса: один возврат — одна
+            # накладная. `invoice_id IS NULL` + `skipped_reason` — возврат
+            # подтверждён, но склад сознательно не двигали (см. confirm_return).
+            """CREATE TABLE IF NOT EXISTS return_receipt (
+                return_id      BIGINT PRIMARY KEY,
+                order_id       BIGINT NOT NULL,
+                invoice_id     BIGINT,
+                skipped_reason TEXT,
+                unmatched      TEXT,
+                created_at     TEXT
+            )""",
         ]
 
         # Создаём каждую таблицу в отдельной транзакции
@@ -3672,11 +3688,67 @@ async def mark_return_goods_received(return_id: int, by: int) -> dict:
     return {"ok": rc > 0}
 
 
+async def _plan_return_stock(return_id: int, order_id: int) -> dict:
+    """Что приходовать на склад по возврату. Только чтение, ДО транзакции.
+
+    Возвращает {positions, unmatched, skipped_reason}. `positions` — строки
+    приходной накладной (только ВОЗВРАЩЁННЫЕ позиции и их количества из
+    return_items, а не весь заказ).
+
+    Приходуем, только если товар по заказу действительно СПИСЫВАЛСЯ со склада:
+    есть расходная накладная отгрузки (`order_shipment.invoice_id`) или заказ
+    эпохи МойСклад (списан там, и снимок остатков уже это учёл — так же судит
+    `order_shipment.list_failed`). Локальный заказ, по которому накладная не
+    провелась (failed_at, позиции без карточек), остаток не уменьшал — приход
+    по его возврату прибавил бы товар, которого склад не терял.
+
+    Сопоставление с номенклатурой — тем же `_resolve_products`, что у отгрузки:
+    возврат обязан попасть на ту же карточку, с которой товар списали.
+    """
+    from services import order_shipment
+
+    order = await adb_core.fetchrow(
+        "SELECT o.ms_demand_id, o.ms_customerorder_id, s.invoice_id AS ship_invoice_id "
+        "FROM orders o LEFT JOIN order_shipment s ON s.order_id = o.id WHERE o.id = $1",
+        order_id,
+    )
+    written_off = bool(
+        order
+        and (
+            order.get("ship_invoice_id")
+            or str(order.get("ms_demand_id") or "").strip()
+            or str(order.get("ms_customerorder_id") or "").strip()
+        )
+    )
+    if not written_off:
+        return {
+            "positions": [],
+            "unmatched": [],
+            "skipped_reason": "по заказу не было расходной накладной — остаток не списывался",
+        }
+    rows = await adb_core.fetch(
+        "SELECT ri.qty AS quantity, oi.product_name, op.product_id "
+        "FROM return_items ri JOIN order_items oi ON oi.id = ri.order_item_id "
+        "LEFT JOIN order_item_products op ON op.item_id = oi.id "
+        "WHERE ri.return_id = $1 ORDER BY ri.id",
+        return_id,
+    )
+    positions, unmatched = await order_shipment._resolve_products(rows)
+    for p in positions:
+        # Цену в приход НЕ пишем: возвращённый товар не закупка, а цена в
+        # приходной накладной читается как закупочная — цена продажи исказила
+        # бы себестоимость. Деньги возврата живут в returns/cash_deposits.
+        p["price_cents"] = None
+    reason = None if positions else "ни одна позиция возврата не сопоставлена с номенклатурой"
+    return {"positions": positions, "unmatched": unmatched, "skipped_reason": reason}
+
+
 async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str = "") -> dict:
     """Подтвердить возврат: returned_qty += по позициям, статус заказа
     (returned|partially_returned), обработка refund (cash → отрицательная
-    сдача; debt_reduction/no_refund — учёт в долге).
-    Возвращает {ok, order_status}.
+    сдача; debt_reduction/no_refund — учёт в долге), ПРИХОД товара на склад
+    приходной накладной «Возврат по заказу #N» — всё одной транзакцией.
+    Возвращает {ok, order_status, invoice_id, invoice_number, stock_skipped}.
 
     asyncpg Stage 14 (#21): native async. Транзакционные границы сохранены как в
     sync-версии — критическая секция (confirm + overshoot-guard) одна транзакция
@@ -3726,6 +3798,21 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
                 ),
             }
         refund_base_cents = money.to_cents(refund_base)
+
+    # План прихода — до транзакции: сопоставление читает справочник через
+    # adb_core напрямую, а на SQLite чтение мимо открытой BEGIN IMMEDIATE
+    # транзакции ждало бы её же. Позиции возврата после создания не меняются,
+    # так что план не устаревает к моменту записи.
+    from services import warehouse
+
+    stock_plan = await _plan_return_stock(return_id, order_id)
+    order_head = await adb_core.fetchrow(
+        "SELECT agent_id, currency FROM orders WHERE id = $1", order_id
+    ) or {}
+    stock_warehouse_id = (
+        await warehouse.default_warehouse_id() if stock_plan["positions"] else None
+    )
+    receipt: dict | None = None
     # Атомарная секция (WP-08): подтверждение возврата + overshoot-guard + СТАТУС
     # ЗАКАЗА + денежный refund — в ОДНОЙ транзакции. Раньше статус и cash-выплата
     # писались ПОСЛЕ коммита подтверждения → крах между ними оставлял возврат
@@ -3774,6 +3861,51 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
                         "Превышен доступный остаток к возврату (другой возврат "
                         "уже учтён). Перепроверьте и создайте новый."
                     )
+
+            # Товар — обратно на склад, в ЭТОЙ ЖЕ транзакции: подтверждённый
+            # возврат без прихода — это деньги клиенту за товар, которого в
+            # остатках нет, и его уже не продать. Повторное подтверждение сюда
+            # не доходит (CAS статуса выше), а PK return_receipt — второй рубеж
+            # на случай, если статус вернут в pending руками.
+            if await txn.fetchval(
+                "SELECT return_id FROM return_receipt WHERE return_id = $1", return_id
+            ) is not None:
+                raise _TxnAbort("Возврат уже оприходован")
+            invoice_id = None
+            if stock_plan["positions"]:
+                counterparty_id: int | None
+                try:
+                    counterparty_id = int(str(order_head.get("agent_id") or "").strip())
+                except (TypeError, ValueError):
+                    counterparty_id = None
+                if counterparty_id is not None and await txn.fetchval(
+                    "SELECT id FROM counterparties WHERE id = $1", counterparty_id
+                ) is None:
+                    # Устаревший id в заказе не повод держать возврат: приход
+                    # проводим без контрагента, как и отгрузку legacy-заказа.
+                    counterparty_id = None
+                try:
+                    receipt = await warehouse.create_invoice_in(
+                        txn,
+                        invoice_type="incoming",
+                        warehouse_id=int(stock_warehouse_id or 1),
+                        items=stock_plan["positions"],
+                        counterparty_id=counterparty_id,
+                        currency=str(order_head.get("currency") or BASE_CURRENCY or "USD"),
+                        comment=f"Возврат по заказу #{order_id} (возврат #{return_id})",
+                        created_by=confirmed_by,
+                    )
+                except warehouse.InvoiceError as e:
+                    # Приход не прошёл — не подтверждаем и деньги: иначе
+                    # возврат закрыт, а товара на складе нет (ровно исходный баг).
+                    raise _TxnAbort(f"Товар не оприходован: {e.message}")
+                invoice_id = int(receipt["invoice_id"])
+            await txn.execute(
+                "INSERT INTO return_receipt (return_id, order_id, invoice_id, "
+                "skipped_reason, unmatched, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+                return_id, order_id, invoice_id, stock_plan["skipped_reason"],
+                ", ".join(stock_plan["unmatched"]) or None, now_str(),
+            )
 
             # Полностью ли возвращён заказ? (returned_qty уже обновлён в этой txn.)
             items = await txn.fetch(
@@ -3831,7 +3963,31 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
         f"{money.format_cents(int(ret.get('total_amount_cents') or 0))} USD, "
         f"{ret.get('refund_method')})",
     )
-    return {"ok": True, "order_status": new_status}
+    stock_skipped = stock_plan["skipped_reason"]
+    if receipt is not None:
+        logger.info(
+            "Возврат #%s по заказу #%s оприходован накладной %s",
+            return_id, order_id, receipt["invoice_number"],
+        )
+    else:
+        # Не ошибка, но расхождение склада, о котором надо знать сразу.
+        logger.warning(
+            "Возврат #%s по заказу #%s подтверждён БЕЗ прихода на склад: %s",
+            return_id, order_id, stock_skipped,
+        )
+    if stock_plan["unmatched"]:
+        logger.warning(
+            "Возврат #%s: позиции без карточки номенклатуры не оприходованы: %s",
+            return_id, stock_plan["unmatched"],
+        )
+    return {
+        "ok": True,
+        "order_status": new_status,
+        "invoice_id": int(receipt["invoice_id"]) if receipt else None,
+        "invoice_number": receipt["invoice_number"] if receipt else None,
+        "stock_skipped": stock_skipped,
+        "unmatched": list(stock_plan["unmatched"]),
+    }
 
 
 async def get_pending_returns() -> list[dict]:

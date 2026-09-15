@@ -4889,7 +4889,15 @@ async def api_returns_confirm(request: Request):
         await idem.release()
         raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
 
-    resp = {"ok": True, "return_id": return_id, "order_status": res.get("order_status")}
+    resp = {
+        "ok": True,
+        "return_id": return_id,
+        "order_status": res.get("order_status"),
+        # Приход товара по возврату: номер накладной или причина, почему склад
+        # не двигали, — чтобы расхождение было видно в ответе, а не в логах.
+        "invoice_number": res.get("invoice_number"),
+        "stock_skipped": res.get("stock_skipped"),
+    }
     await idem.store(resp)
     return JSONResponse(resp)
 
