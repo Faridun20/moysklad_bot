@@ -354,6 +354,8 @@ def _service_flows(db, tag: str) -> None:
     assert _run(db.mark_order_shipped(paid, BOSS, "Boss"))["code"] == "payment_required"
     db.add_payment(MGR, "", "Manager", 200.0, "USD", "Оплата по заказу (отгрузка одобрена)", order_id=paid)
     mgr_actor = order_payments.Actor(MGR, "Manager", "manager")
+    # Свой курс менеджеру — только рядом с курсом ЦБ (manual_rate_refusal).
+    assert db.set_currency_rate("UZS", 1 / 12700, BOSS)[0]
     rec = _run(order_payments.record_payment_parts(paid, mgr_actor, [
         {"method": "cash", "currency": "USD", "amount": "120"},
         {"method": "card", "currency": "UZS", "amount": "1016000", "rate": "12700"},

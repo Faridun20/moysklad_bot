@@ -387,7 +387,13 @@ def test_handover_confirmed_last_closes_order(db):
     rec = _record(oid, [_cash(5000), _card(7130)])
     assert _run(db.confirm_payment(rec["parts"][1]["payment_id"], BOSS, "Boss"))
     dep = _run(db.create_cash_deposit(MGR, 5000.0))
-    res = _run(db.confirm_cash_deposit(dep["deposit_id"], MGR, "Manager"))  # сам — бухгалтера нет
+    # Сам — только когда руководителя и бухгалтера в системе нет (confirm_rights).
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("UPDATE user_roles SET role = 'guest' WHERE user_id = ?"), (BOSS,))
+        conn.commit()
+    roles.invalidate_all_roles()
+    res = _run(db.confirm_cash_deposit(dep["deposit_id"], MGR, "Manager"))
     assert res["closed_orders"] == [oid] and res["self_confirmed"] is True
     order = _run(db.get_order(oid))
     # Закрытие — как у подтверждения платежа: отметка оплаты, статус не прыгает.

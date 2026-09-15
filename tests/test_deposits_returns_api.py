@@ -89,14 +89,22 @@ def test_deposit_reject_requires_reason(client_env):
 
 
 def test_deposit_confirm_allowed_for_manager_acting_as_bookkeeper(client_env):
-    """Пока бухгалтера нет, сдачи подтверждает менеджер (services.roles.
-    ROLE_ALSO_ACTS_AS). Раньше здесь был 403 — при откате совмещения тест
-    возвращается к нему."""
+    """Пока бухгалтера и руководителя нет, сдачи подтверждает менеджер
+    (services.roles.ROLE_ALSO_ACTS_AS). При живом руководителе — 403
+    (order_payments.confirm_rights)."""
     client, db, ids, _ = client_env
     dep = asyncio.run(db.create_cash_deposit(ids["mgr"], 250.0))
     resp = client.post("/api/deposits/pending", json={"initData": str(ids["mgr"])})
     assert resp.status_code == 200, resp.text
     assert any(d["id"] == dep["deposit_id"] for d in resp.json()["deposits"])
+    resp = client.post(
+        "/api/deposits/confirm",
+        json={"initData": str(ids["mgr"]), "deposit_id": dep["deposit_id"]},
+    )
+    assert resp.status_code == 403, resp.text
+    for u in db.get_all_users():
+        if u["role"] in ("admin", "boss", "bookkeeper"):
+            asyncio.run(db.deactivate_user(u["user_id"], ids["mgr"]))
     resp = client.post(
         "/api/deposits/confirm",
         json={"initData": str(ids["mgr"]), "deposit_id": dep["deposit_id"]},

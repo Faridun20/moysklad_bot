@@ -18,10 +18,17 @@ pytestmark = pytest.mark.e2e
 
 
 def test_manager_confirms_deposit_and_sees_it_in_today(open_app, e2e):
+    """Руководителя и бухгалтера в системе нет (как на проде сейчас) — менеджер
+    подтверждает сдачу сам."""
+    import services.roles as roles
+
     seed_order(e2e, qty=1, price=30.0)
     from services.database import create_cash_deposit
 
     assert e2e.run(create_cash_deposit(e2e.ids["mgr"], 30.0)).get("ok")
+    ids = e2e.ids
+    e2e.exec("UPDATE user_roles SET role = 'guest' WHERE user_id IN (?, ?, ?)", (ids["boss"], ids["admin"], ids["book"]))
+    roles.invalidate_all_roles()
 
     mgr = open_app(e2e.ids["mgr"])
     # «Сегодня»: пункт бухгалтера появился и у менеджера.
@@ -37,6 +44,21 @@ def test_manager_confirms_deposit_and_sees_it_in_today(open_app, e2e):
     assert e2e.rows("SELECT status, confirmed_by FROM cash_deposits")[0] == {
         "status": "confirmed", "confirmed_by": e2e.ids["mgr"],
     }
+
+
+def test_manager_has_no_confirm_button_while_boss_is_active(open_app, e2e):
+    """Руководитель активен — кнопки «Подтвердить» у менеджера нет, подсказка
+    говорит, кто подтвердит (сервер всё равно ответил бы 403)."""
+    seed_order(e2e, qty=1, price=30.0)
+    from services.database import create_cash_deposit
+
+    assert e2e.run(create_cash_deposit(e2e.ids["mgr"], 30.0)).get("ok")
+    mgr = open_app(e2e.ids["mgr"])
+    go(mgr, "money")
+    tab(mgr, "confirm")
+    mgr.wait_for_selector(".debt-card[data-dep]")
+    assert mgr.locator(".dep-confirm").count() == 0
+    assert "подтверждает руководитель или бухгалтер" in mgr.locator(".debt-card[data-dep]").inner_text()
 
 
 def test_manager_marks_return_goods_received_but_boss_confirms(open_app, e2e):

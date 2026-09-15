@@ -5684,7 +5684,8 @@ async def api_deposits_confirm(request: Request):
         raise
     if not res.get("ok"):
         await idem.release()
-        raise HTTPException(status_code=409, detail=res.get("error", "уже обработано"))
+        raise HTTPException(status_code=int(res.get("status") or 409),
+                            detail=res.get("error", "уже обработано"))
 
     if dep and dep.get("manager_id"):
         closed = res.get("closed_orders") or []
@@ -5698,7 +5699,8 @@ async def api_deposits_confirm(request: Request):
             logger.warning("deposit confirm notify failed", exc_info=True)
     resp = {
         "ok": True, "deposit_id": deposit_id, "closed_orders": res.get("closed_orders", []),
-        "self_confirmed": bool(res.get("self_confirmed")),
+        "self_confirmed": bool(res.get("self_confirmed")), "self_note": res.get("self_note"),
+        "approval_mode": res.get("approval_mode"),
     }
     await idem.store(resp)
     return JSONResponse(resp)
@@ -7123,6 +7125,10 @@ async def api_confirm_payment(request: Request):
 
     try:
         n = await adb.confirm_all_pending_payments_for_order(order_id, user["id"], full_name)
+    except order_payments.PaymentError as e:
+        # Отказ по правам (confirm_rights): менеджер при живом руководителе.
+        await idem.release()
+        return JSONResponse({"detail": e.message, "code": e.code}, status_code=e.status)
     except Exception:
         await idem.release()
         raise
@@ -7149,8 +7155,13 @@ async def api_confirm_payment(request: Request):
                 )
 
     self_note = None
-    if n > 0 and any(int(p["user_id"]) == int(user["id"]) for p in pending_before[:n]):
-        self_note = order_payments.self_confirm_note(user["id"], user["id"], get_role(user["id"]))
+    if n > 0:
+        # Пометка — из фактического наличия подтверждающих (confirm_rights), а не
+        # из роли: «руководителя нет» говорим, только когда его правда нет.
+        rights = await order_payments.confirm_rights(
+            user["id"], [p["user_id"] for p in pending_before[:n]]
+        )
+        self_note = rights["note"]
     result = {"ok": True, "confirmed_count": n, "skipped_cash": skipped_cash, "self_note": self_note}
     await idem.store(result)
     return JSONResponse(result)

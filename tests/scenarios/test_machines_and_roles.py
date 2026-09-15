@@ -178,8 +178,9 @@ def test_manager_is_refused_boss_actions(world):
 
 
 def test_manager_confirms_card_only_as_acting_bookkeeper(world):
-    """Кладовщик и гость оплату по заказу не подтверждают; менеджер — да (он
-    пока бухгалтер), но наличные этой кнопкой не подтверждаются никем."""
+    """Кладовщик и гость оплату по заказу не подтверждают; менеджер — только
+    пока руководителя/бухгалтера в системе нет (он пока бухгалтер), при живом
+    руководителе — 403; наличные этой кнопкой не подтверждаются никем."""
     w = world
     pid = f.create_product(w, "Кабель")
     f.incoming_invoice(w, f.MGR, [(pid, 10, None)])
@@ -191,8 +192,18 @@ def test_manager_confirms_card_only_as_acting_bookkeeper(world):
     f.record_payment(w, f.MGR, oid, {"card": 60, "cash": 40})
     for uid in (f.KEEPER, f.GUEST):
         assert w.status(uid, "/api/orders/confirm_payment", order_id=oid, idempotency_key=f.key()) == 403
+    # Руководитель, админ и бухгалтер активны — менеджер свои деньги не подтверждает.
+    refused = w.call(f.MGR, "/api/orders/confirm_payment", expect=403, order_id=oid,
+                     idempotency_key=f.key())
+    assert refused["code"] == "confirm_forbidden"
+    assert w.one("SELECT status FROM payments WHERE id = (SELECT MIN(payment_id) FROM payment_parts "
+                 "WHERE method = 'card')")["status"] == "pending"
+    # Руководство ушло (как на проде сейчас) — менеджер подтверждает сам, и это сказано.
+    w.exec("UPDATE user_roles SET deactivated_at = '2030-01-01 00:00:00' "
+           "WHERE role IN ('admin', 'boss', 'bookkeeper')")
     res = f.confirm_payments(w, f.MGR, oid)
     assert res["confirmed_count"] == 1 and res["skipped_cash"] == 1
+    assert "руководителя/бухгалтера в системе нет" in res["self_note"]
     assert w.rows("SELECT p.status, pp.method FROM payments p JOIN payment_parts pp ON pp.payment_id = p.id "
                   "ORDER BY pp.id") == [{"status": "confirmed", "method": "card"},
                                          {"status": "pending", "method": "cash"}]

@@ -171,6 +171,57 @@ def parse_rate(raw: Any) -> Decimal | None:
     return q.quantize(_RATE_Q, rounding=ROUND_HALF_UP)
 
 
+# ─── Свой курс: насколько можно отойти от ЦБ ─────────────────────────────────
+#
+# Курс, введённый руками, раньше ничем не ограничивался: «12 130 сум по курсу 1»
+# закрывали долларовый заказ на 12 130 USD карманной мелочью. Теперь свой курс
+# не дальше `app_settings.manual_rate_max_deviation_pct` процентов от курса ЦБ
+# (для всех ролей), а без курса ЦБ свой ставит только руководство — сверить
+# его не с чем. Одна проверка на разбивку оплаты (`order_payments.compute_parts`)
+# и документы бухгалтерии (`resolve_rates`).
+MANUAL_RATE_MAX_DEVIATION_PCT_DEFAULT = Decimal(10)
+MANUAL_RATE_WITHOUT_CBU_ROLES = ("admin", "boss")
+
+
+def manual_rate_max_deviation_pct() -> Decimal:
+    from services.database import get_setting
+
+    raw = get_setting("manual_rate_max_deviation_pct", float(MANUAL_RATE_MAX_DEVIATION_PCT_DEFAULT))
+    try:
+        pct = Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        return MANUAL_RATE_MAX_DEVIATION_PCT_DEFAULT
+    if not pct.is_finite() or pct < 0:
+        return MANUAL_RATE_MAX_DEVIATION_PCT_DEFAULT
+    return pct
+
+
+def manual_rate_refusal(currency: str, manual: Decimal | None, cbu: Decimal | None,
+                        role: str | None) -> str | None:
+    """Текст отказа своему курсу или None, если курс допустим.
+
+    `role` — НАСТОЯЩАЯ роль (совмещение ролей права руководителя не даёт);
+    None — считаем не руководителем.
+    """
+    if manual is None:
+        return None
+    cur = (currency or "").upper()
+    if cbu is None or cbu <= 0:
+        if role in MANUAL_RATE_WITHOUT_CBU_ROLES:
+            return None
+        return (f"Курса ЦБ для {cur} на эту дату нет — свой курс может поставить только "
+                "руководитель. Попросите руководителя внести оплату или повторите, когда появится курс ЦБ")
+    if manual == cbu:
+        return None
+    limit = manual_rate_max_deviation_pct()
+    deviation = abs(manual - cbu) * 100 / cbu
+    if deviation <= limit:
+        return None
+    return (f"Курс {cur} {fmt_rate(manual)} отличается от курса ЦБ {fmt_rate(cbu)} на "
+            f"{deviation.quantize(Decimal('0.1'), rounding=ROUND_HALF_UP)}% — допустимо не больше "
+            f"{fmt_rate(limit)}%. Проверьте курс: это {cur} за 1 {base_currency()}")
+
+
 def parse_cents(raw: Any, *, allow_zero: bool = False) -> int | None:
     """Сумма из ввода в минорных единицах. `allow_zero` — для пересчёта кассы,
     где «0» — законный ответ (касса пустая)."""
@@ -320,12 +371,14 @@ async def rates_view(day: str | None = None) -> dict:
 
 
 async def resolve_rates(
-    currencies: set[str], client_rates: dict | None, day: str
+    currencies: set[str], client_rates: dict | None, day: str, role: str | None = None
 ) -> dict[str, RateInfo]:
     """Курс по каждой не-базовой валюте документа.
 
     По умолчанию — ЦБ на дату документа. Менеджер может поставить свой: тогда
-    источник `manual`, а курс ЦБ всё равно сохраняется рядом. Своего курса нет и
+    источник `manual`, а курс ЦБ всё равно сохраняется рядом (свой курс — не
+    дальше допуска от ЦБ, без ЦБ — только руководство: `manual_rate_refusal`,
+    `role` — настоящая роль автора документа). Своего курса нет и
     ЦБ не знает валюту — отказ с просьбой указать курс: молча посчитать по
     единице значило бы записать сумы долларами.
     """
@@ -343,6 +396,9 @@ async def resolve_rates(
             raise AccountingError(f"Курс {cur}: введите положительное число")
         cbu_q = cbu.get(cur)
         if manual is not None:
+            refusal = manual_rate_refusal(cur, manual, cbu_q, role)
+            if refusal:
+                raise AccountingError(refusal)
             source = "cbu" if cbu_q is not None and manual == cbu_q else "manual"
             out[cur] = RateInfo(manual, source, cbu_q)
         elif cbu_q is not None:
@@ -875,7 +931,7 @@ async def record_receipt(actor: Actor, data: dict) -> dict:
         counterparty = head["buyer_name"] or None
 
     currencies = {str(accounts[a]["currency"]).upper() for a, _ in lines} | {target_cur}
-    rates = await resolve_rates(currencies, data.get("rates"), doc_date)
+    rates = await resolve_rates(currencies, data.get("rates"), doc_date, actor.role)
     computed = []
     for acc_id, cents in lines:
         cur = str(accounts[acc_id]["currency"]).upper()
@@ -1076,7 +1132,7 @@ async def record_expense(actor: Actor, data: dict) -> dict:
     category = _text(data.get("category"), 40) or None
     doc_date = _parse_date(data.get("doc_date"), default=today_str())
     cur = str(acc["currency"]).upper()
-    rates = await resolve_rates({cur}, data.get("rates"), doc_date)
+    rates = await resolve_rates({cur}, data.get("rates"), doc_date, actor.role)
     _check_ceiling(cents, cur, rates)
     now = _now_str()
 

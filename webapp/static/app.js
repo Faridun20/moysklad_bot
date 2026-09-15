@@ -7827,6 +7827,10 @@ async function renderCashbox(container, section) {
 // чем перерисоваться после решения.
 function depositCardsHtml(deposits, ctx) {
   const { isBoss, confirmersExist } = ctx;
+  // Менеджер (бухгалтер только совмещением ролей) при живом руководителе/бухгалтере
+  // сдачи не подтверждает — сервер ответит 403 (order_payments.confirm_rights),
+  // поэтому кнопки нет, а подсказка говорит, кто подтвердит.
+  const substitute = !isBoss && confirmersExist && ctx.role === 'manager';
   const fmt = n => formatMoney(n);
   return deposits.map(d => {
     const dcur = d.currency || baseCur();
@@ -7841,8 +7845,9 @@ function depositCardsHtml(deposits, ctx) {
         ${Number(d.unallocated) > 0 ? `<div class="debt-card-mid"><span class="debt-meta">Не распределено по заказам: ${formatMoney(d.unallocated, escapeHtml(dcur))}</span></div>` : ''}
         ${d.is_own && !isBoss && !confirmersExist ? `<div class="debt-hint">Это ваша сдача: руководителя и бухгалтера в системе нет, поэтому подтверждаете вы — это попадёт в журнал.</div>` : ''}
         ${d.is_own && !isBoss && confirmersExist ? `<div class="debt-hint">Это ваша сдача — её подтверждает руководитель или бухгалтер.</div>` : ''}
+        ${!d.is_own && substitute ? `<div class="debt-hint">Сдачу подтверждает руководитель или бухгалтер.</div>` : ''}
         <div class="debt-actions">
-          <button class="btn-confirm-pay dep-confirm">${icon('check')} Подтвердить</button>
+          ${substitute ? '' : `<button class="btn-confirm-pay dep-confirm">${icon('check')} Подтвердить</button>`}
           <button class="btn-reject-pay dep-reject">${icon('close')} Отклонить</button>
         </div>
         <div class="limit-edit dep-reject-box" hidden>
@@ -7924,7 +7929,7 @@ function wireConfirmCards(container, refresh) {
   // Сдачи: подтвердить / отклонить (причина — inline).
   container.querySelectorAll('.debt-card[data-dep]').forEach(card => {
     const id = card.dataset.dep;
-    card.querySelector('.dep-confirm').addEventListener('click', (ev) => {
+    card.querySelector('.dep-confirm')?.addEventListener('click', (ev) => {
       const b = ev.currentTarget;
       if (b.disabled) return;
       b.disabled = true;  // защита от двойного тапа (сервер идемпотентен, UX — нет)
@@ -7933,7 +7938,7 @@ function wireConfirmCards(container, refresh) {
         .then((r) => {
           haptic('success');
           const closed = (r && r.closed_orders || []).map(o => '#' + o).join(', ');
-          toast(`Сдача подтверждена${closed ? ' · закрыты заказы ' + closed : ''}${r && r.self_confirmed ? ' · подтверждено вами — руководителя нет' : ''}`);
+          toast(`Сдача подтверждена${closed ? ' · закрыты заказы ' + closed : ''}${r && r.self_confirmed ? ' · ' + (r.self_note || 'подтверждено вами') : ''}`);
           refresh();
         })
         .catch(e => { b.disabled = false; toast(e.message, 'error'); });

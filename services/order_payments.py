@@ -62,7 +62,8 @@ MAX_PARTS = 10
 ROLES_RECORD_ANY = ("admin", "boss")
 # Кто подтверждает карту/перечисление (сверяет банк) и сдачу наличных.
 # Менеджер попадает сюда через совмещение ролей (services.roles.ROLE_ALSO_ACTS_AS:
-# он временно бухгалтер) — см. `self_confirm_note`.
+# он временно бухгалтер) только пока активных admin/boss/bookkeeper нет — см.
+# `confirm_rights` (сервисный рубеж для HTTP и кнопок бота).
 ROLES_CONFIRM = ("admin", "boss", "bookkeeper")
 
 # Статусы заказа, в которых по нему принимают деньги (как у mark_order_paid).
@@ -190,12 +191,17 @@ def convert_to_order(amount_cents: int, part_cur: str, order_cur: str, base: str
 
 
 def compute_parts(inputs: list[PartInput], order_currency: str, base: str,
-                  cbu: dict[str, Decimal | None]) -> list[PartCalc]:
+                  cbu: dict[str, Decimal | None], role: str | None = None) -> list[PartCalc]:
     """Курс и сумма в валюте заказа по каждой строке.
 
     Курс по умолчанию — ЦБ (`cbu`, «сум за доллар»); введённый человеком
-    выигрывает, и тогда источник `manual`, а ЦБ сохраняется рядом.
+    выигрывает, и тогда источник `manual`, а ЦБ сохраняется рядом. Свой курс —
+    не дальше допуска от ЦБ, без курса ЦБ — только руководству
+    (`accounting.manual_rate_refusal`; `role` — настоящая роль вносящего,
+    None — как не руководитель).
     """
+    from services.accounting import manual_rate_refusal
+
     order_cur = order_currency.upper()
     out: list[PartCalc] = []
     for n, inp in enumerate(inputs, start=1):
@@ -211,6 +217,9 @@ def compute_parts(inputs: list[PartInput], order_currency: str, base: str,
                                 "same", None, inp.amount_cents))
             continue
         cbu_q = cbu.get(rc)
+        refusal = manual_rate_refusal(rc, inp.rate, cbu_q, role)
+        if refusal:
+            raise PaymentError(f"Строка {n}: {refusal}", code="manual_rate")
         quote = inp.rate if inp.rate is not None else cbu_q
         if quote is None:
             raise PaymentError(f"Строка {n}: нет курса ЦБ для {rc} — укажите курс")
@@ -502,7 +511,7 @@ async def record_payment_parts(order_id: int, actor: Actor, raw_parts: Any, *,
     base = _base()
     order_cur = (head["currency"] or base).upper()
     cbu = await _cbu_for({i.currency for i in inputs} | {order_cur})
-    calcs = compute_parts(inputs, order_cur, base, cbu)
+    calcs = compute_parts(inputs, order_cur, base, cbu, role=actor.role)
     now = _now()
     result: dict[str, Any] = {}
 
@@ -896,16 +905,69 @@ async def attach_deposit_to_parts(deposit_id: int, *, dry_run: bool = True) -> d
 # ─── Кто подтверждает ────────────────────────────────────────────────────────
 
 
-def self_confirm_note(actor_id: int, owner_id: int | None, actor_role: str) -> str | None:
-    """Пометка «подтвердил сам» — когда подтверждает тот же человек, что внёс деньги.
+CONFIRM_FORBIDDEN = "confirm_forbidden"
+NO_CONFIRMERS_NOTE = "руководителя/бухгалтера в системе нет"
 
-    Это законно только потому, что бухгалтера и руководителя в штате пока нет и
-    менеджер замещает бухгалтера (`ROLE_ALSO_ACTS_AS`). Не запрещаем (иначе
-    деньги висели бы неподтверждёнными вечно), но и не прячем — пометка идёт в
-    аудит и на экран.
+
+def _active_confirmers() -> list[dict]:
+    from services.database import get_all_users
+
+    return [
+        u for u in get_all_users()
+        if not u.get("deactivated_at") and u.get("role") in ROLES_CONFIRM
+    ]
+
+
+async def confirm_rights(actor_id: int, owner_ids: Any, actor_role: str | None = None) -> dict:
+    """Может ли `actor_id` подтвердить деньги, внесённые `owner_ids`. СЕРВИСНЫЙ рубеж
+    для сдачи и платежа (HTTP, кнопки бота, любые будущие пути).
+
+    * носитель роли (admin/boss/bookkeeper) — да; но бухгалтер не подтверждает
+      СВОИ деньги, пока в системе есть другой активный подтверждающий;
+      руководитель, внёсший сам, — да (как «Получил деньги» в бухгалтерии);
+    * менеджер (бухгалтер только через `ROLE_ALSO_ACTS_AS`) и любой другой —
+      только пока активных admin/boss/bookkeeper нет вовсе (`mode='no_boss'`).
+      Совмещение ролей не даёт права подтверждать свои или чужие деньги в
+      обход живого руководителя.
+
+    → {allowed, mode ('holder'|'no_boss'|None), own, confirmers_exist, names,
+       error, note}. `note` — пометка для аудита/экрана («подтвердил сам…»),
+    выводится из ФАКТИЧЕСКОГО наличия подтверждающих, а не из роли.
     """
-    if owner_id is None or int(owner_id) != int(actor_id):
-        return None
-    if actor_role in ("admin", "boss"):
-        return "внёс и подтвердил руководитель"
-    return "подтверждено самим сдающим — руководителя/бухгалтера в системе нет"
+    from services.database import get_role
+
+    uid = int(actor_id)
+    role = actor_role if actor_role is not None else await asyncio.to_thread(get_role, uid)
+    holders = await asyncio.to_thread(_active_confirmers)
+    others = [u for u in holders if int(u["user_id"]) != uid]
+    names = [u.get("full_name") or str(u["user_id"]) for u in others][:3]
+    owners = {int(o) for o in (owner_ids or []) if o is not None}
+    own = uid in owners
+    who = ", ".join(names) or "руководитель или бухгалтер"
+    out = {"allowed": True, "mode": "holder", "own": own, "confirmers_exist": bool(holders),
+           "names": names, "error": None, "note": None}
+    if role in ROLES_CONFIRM:
+        if own and role not in ("admin", "boss") and others:
+            out.update(allowed=False, mode=None,
+                       error=f"Свои деньги не подтверждают сами: подтвердит {who}")
+        elif own:
+            out["note"] = ("внёс и подтвердил руководитель" if role in ("admin", "boss")
+                           else "внёс и подтвердил сам — другого подтверждающего в системе нет")
+        return out
+    if others:
+        out.update(allowed=False, mode=None,
+                   error=f"Подтверждает {who}: пока в системе есть руководитель или бухгалтер, "
+                         "менеджер деньги не подтверждает")
+        return out
+    out["mode"] = "no_boss"
+    out["note"] = (f"подтверждено самим сдающим — {NO_CONFIRMERS_NOTE}" if own
+                   else f"подтвердил {role or 'сотрудник'} — {NO_CONFIRMERS_NOTE}")
+    return out
+
+
+async def require_confirm_rights(actor_id: int, owner_ids: Any, actor_role: str | None = None) -> dict:
+    """`confirm_rights` или `PaymentError(403, code=confirm_forbidden)`."""
+    rights = await confirm_rights(actor_id, owner_ids, actor_role)
+    if not rights["allowed"]:
+        raise PaymentError(rights["error"], status=403, code=CONFIRM_FORBIDDEN)
+    return rights

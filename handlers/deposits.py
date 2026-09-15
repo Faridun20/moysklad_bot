@@ -185,9 +185,10 @@ async def cb_deposit_confirm(call: CallbackQuery, bot: Bot):
             tail=webapp_keyboard("🌐 Ещё сдачи — в WebApp"),
         ),
     )
-    if res.get("self_confirmed"):
+    if res.get("self_confirmed") and res.get("self_note"):
+        # Текст пометки — из фактического наличия подтверждающих (confirm_rights).
         await call.message.answer(
-            "ℹ️ Вы подтвердили собственную сдачу: руководителя и бухгалтера в системе нет. "
+            f"ℹ️ Вы подтвердили собственную сдачу: {esc(res['self_note'])}. "
             "Это отмечено в журнале действий."
         )
     if dep and dep.get("manager_id"):

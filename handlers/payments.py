@@ -386,7 +386,13 @@ async def confirm_pay(call: CallbackQuery, bot: Bot):
         return
 
     admin_name = call.from_user.full_name or str(call.from_user.id)
-    if not await adb.confirm_payment(payment_id, call.from_user.id, admin_name):
+    try:
+        confirmed = await adb.confirm_payment(payment_id, call.from_user.id, admin_name)
+    except order_payments.PaymentError as e:
+        # Отказ по правам (confirm_rights) — платёж ждёт другого подтверждающего,
+        # кнопки карточки не трогаем.
+        return await call.answer(f"⛔ {e.message}"[:200], show_alert=True)
+    if not confirmed:
         await call.answer("⚠️ Уже обработан", show_alert=True)
         return await _settle_stale_payment(call, payment_id, await adb.get_payment(payment_id))
 

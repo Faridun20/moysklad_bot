@@ -131,6 +131,11 @@ def test_manager_confirms_payment_only_as_acting_bookkeeper(pay_env, monkeypatch
     assert statuses == ["pending", "pending"]
 
     monkeypatch.setattr(server, "verify_init_data", lambda init_data: {"id": ids["mgr"], "first_name": "Manager"})
+    # Руководитель активен — менеджер свои деньги не подтверждает (confirm_rights).
+    resp = client.post("/api/orders/confirm_payment", json={"initData": "x", "order_id": ids["order"]})
+    assert resp.status_code == 403 and resp.json()["code"] == "confirm_forbidden", resp.text
+    # Руководителя нет — подтверждает сам.
+    asyncio.run(db.deactivate_user(ids["boss"], ids["mgr"]))
     resp = client.post("/api/orders/confirm_payment", json={"initData": "x", "order_id": ids["order"]})
     assert resp.status_code == 200, resp.text
     # Менеджер подтвердил СВОИ платежи — ответ это называет, а не молчит.

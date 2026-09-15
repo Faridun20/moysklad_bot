@@ -2024,6 +2024,9 @@ _DEFAULT_SETTINGS: dict[str, tuple] = {
     # Решение владельца: пока менеджер один, удалять технику, товары и
     # накладные может и он; включённый флаг оставляет это руководству.
     "delete_requires_boss": (False, "Удаление техники, товаров и накладных — только руководитель"),
+    # Свой курс в оплате/документе бухгалтерии — не дальше X% от курса ЦБ
+    # (services.accounting.manual_rate_refusal).
+    "manual_rate_max_deviation_pct": (10, "Свой курс валюты — не дальше стольких % от курса ЦБ"),
 }
 
 
@@ -4068,7 +4071,9 @@ async def create_cash_deposit(
 async def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_name: str = "") -> dict:
     """Подтвердить сдачу и закрыть покрытые ею заказы — ОДНОЙ транзакцией.
 
-    Возвращает {ok, closed_orders, self_confirmed}.
+    Возвращает {ok, closed_orders, self_confirmed, self_note, approval_mode}.
+    Отказ по правам (`order_payments.confirm_rights`) — {ok: False, error,
+    code: 'confirm_forbidden', status: 403}.
 
     Раньше статус сдачи коммитился первым, а заказы закрывались потом, каждый
     своей транзакцией. Падение между ними оставляло сдачу `confirmed` с
@@ -4091,11 +4096,19 @@ async def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_nam
     from services import order_payments
     from services.debts import calc_order_balances, lock_orders
 
+    dep_head = await adb_core.fetchrow("SELECT manager_id FROM cash_deposits WHERE id = $1", deposit_id)
+    # Кто вправе подтвердить — сервисный рубеж (HTTP и кнопка dep_ok): менеджер
+    # не подтверждает сдачи, пока в системе есть руководитель/бухгалтер.
+    rights = await order_payments.confirm_rights(
+        confirmed_by, [dep_head["manager_id"]] if dep_head else []
+    )
+    if not rights["allowed"]:
+        return {"ok": False, "error": rights["error"], "code": order_payments.CONFIRM_FORBIDDEN,
+                "status": 403}
     part_orders, part_currencies = await order_payments.deposit_part_orders(deposit_id)
     # Курс для снимка fx_rate_to_base — ДО транзакции (sync-чтение на SQLite
     # ждало бы нашу же пишущую транзакцию), как в confirm_payment.
     rates = {c: await asyncio.to_thread(get_currency_rate, c) for c in part_currencies if c}
-    dep_head = await adb_core.fetchrow("SELECT manager_id FROM cash_deposits WHERE id = $1", deposit_id)
 
     closed: list[int] = []
     async with adb_core.transaction() as txn:
@@ -4145,9 +4158,7 @@ async def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_nam
                 closed.append(oid)
 
     role = await asyncio.to_thread(get_role, confirmed_by)
-    note = order_payments.self_confirm_note(
-        confirmed_by, dep_head["manager_id"] if dep_head else None, role
-    )
+    note = rights["note"]
     await asyncio.to_thread(
         add_audit_log,
         confirmed_by,
@@ -4158,7 +4169,8 @@ async def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_nam
         f"{', '.join('#' + str(o) for o in part_orders) or '—'}; закрыты заказы: {closed or '—'}"
         + (f" ({note})" if note else ""),
     )
-    return {"ok": True, "closed_orders": sorted(closed), "self_confirmed": bool(note)}
+    return {"ok": True, "closed_orders": sorted(closed), "self_confirmed": bool(rights["own"]),
+            "self_note": note, "approval_mode": rights["mode"]}
 
 
 async def reject_cash_deposit(
@@ -6019,7 +6031,7 @@ async def confirm_payment(
     from services.debts import lock_orders
 
     head = await adb_core.fetchrow(
-        "SELECT order_id, currency, fx_rate_to_base FROM payments WHERE id = $1", payment_id
+        "SELECT order_id, currency, fx_rate_to_base, user_id FROM payments WHERE id = $1", payment_id
     )
     if head is None:
         return False
@@ -6030,6 +6042,11 @@ async def confirm_payment(
 
     if await order_payments.payment_method(payment_id) == "cash":
         return False
+    # Сервисный рубеж прав (HTTP, pay_ok, пачка по заказу): свои деньги и деньги
+    # при живом руководителе менеджер не подтверждает → PaymentError(403).
+    rights = None
+    if confirmed_by is not None:
+        rights = await order_payments.require_confirm_rights(confirmed_by, [head.get("user_id")])
     # Курс — ДО транзакции: get_currency_rate синхронный (кэш + чтение БД), и
     # внутри пишущей транзакции SQLite он ждал бы её же.
     rate = None
@@ -6079,7 +6096,8 @@ async def confirm_payment(
             confirmed_name,
             await asyncio.to_thread(get_role, confirmed_by),
             "payment_confirmed",
-            f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}",
+            f"Платёж #{payment_id}: {payment['amount']:,.0f} {payment['currency']} от {payment['full_name']}"
+            + (f" ({rights['note']})" if rights and rights.get("note") else ""),
         )
     if closed_order is not None:
         await _audit_order_fully_paid(closed_order, confirmed_by, confirmed_name, confirmed_cents)
@@ -7109,8 +7127,14 @@ async def confirm_all_pending_payments_for_order(
     asyncpg Stage 15 (#21): native async; confirm_payment теперь async (await);
     get_payments_for_order (sync read) — мост через to_thread.
     """
+    from services import order_payments
+
     payments = await get_payments_for_order(order_id)
     pending = [p for p in payments if p["status"] == "pending"]
+    # Права — по всей пачке ДО первого подтверждения: иначе отказ на середине
+    # оставил бы заказ подтверждённым наполовину.
+    if pending:
+        await order_payments.require_confirm_rights(confirmed_by, [p.get("user_id") for p in pending])
     n = 0
     for p in pending:
         if await confirm_payment(p["id"], confirmed_by, confirmed_by_name):
