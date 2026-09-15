@@ -250,11 +250,43 @@ async def ship_order(order: dict, items: list[dict], *, user_id: int | None = No
     }
 
 
+async def cancel_shipment_locked(txn, order_id: int, *, user_id: int | None = None) -> dict:
+    """Откатить отгрузку ВНУТРИ транзакции, которая уже держит замок отгрузки
+    (`_lock_order_for_shipment`). Для отмены заказа: статус и возврат остатка
+    обязаны коммититься вместе.
+
+    Отказ склада возвращается словарём `{ok: False, ...}` ДО любой записи
+    (все отказы `cancel_invoice_in` случаются до первой записи), и вызывающий
+    сам решает — откатить свою транзакцию или нет.
+    """
+    row = await txn.fetchrow(
+        "SELECT invoice_id FROM order_shipment WHERE order_id = $1", order_id
+    )
+    if not row or not row.get("invoice_id"):
+        return {"ok": True, "skipped": "no-shipment"}
+    invoice_id = int(row["invoice_id"])
+    try:
+        await warehouse.cancel_invoice_in(txn, invoice_id, user_id)
+    except warehouse.InvoiceError as e:
+        if e.code != "already_cancelled":
+            logger.info(
+                "Отмена накладной #%s по заказу #%s отклонена (%s): %s",
+                invoice_id, order_id, e.code, e.message,
+            )
+            return {"ok": False, "code": e.code, "reason": e.message, "details": e.details}
+    await txn.execute(
+        "UPDATE order_shipment SET invoice_id = NULL, shipped_at = NULL WHERE order_id = $1",
+        order_id,
+    )
+    return {"ok": True, "invoice_id": invoice_id}
+
+
 async def cancel_shipment(order_id: int, *, user_id: int | None = None) -> dict:
     """Откатить отгрузку заказа: отменить накладную, вернуть остаток.
 
-    Зовётся при отмене заказа. Если накладной нет — делать нечего, это не
-    ошибка: заказ могли отменить до одобрения.
+    Если накладной нет — делать нечего, это не ошибка: заказ могли отменить до
+    одобрения. Отмена ЗАКАЗА зовёт `cancel_shipment_locked` внутри своей
+    транзакции (database.cancel_order).
     """
     order_id = int(order_id)
     # Под тем же замком, что и ship_order: иначе отмена читает «накладной нет»,
@@ -262,29 +294,10 @@ async def cancel_shipment(order_id: int, *, user_id: int | None = None) -> dict:
     # отменённом заказе. Накладная и строка отгрузки меняются одной транзакцией.
     async with adb_core.transaction() as txn:
         await _lock_order_for_shipment(txn, order_id)
-        row = await txn.fetchrow(
-            "SELECT invoice_id FROM order_shipment WHERE order_id = $1", order_id
-        )
-        if not row or not row.get("invoice_id"):
-            return {"ok": True, "skipped": "no-shipment"}
-        invoice_id = int(row["invoice_id"])
-        try:
-            # Все отказы cancel_invoice_in случаются ДО первой записи, поэтому
-            # транзакцию после них можно продолжать.
-            await warehouse.cancel_invoice_in(txn, invoice_id, user_id)
-        except warehouse.InvoiceError as e:
-            if e.code != "already_cancelled":
-                logger.info(
-                    "Отмена накладной #%s по заказу #%s отклонена (%s): %s",
-                    invoice_id, order_id, e.code, e.message,
-                )
-                return {"ok": False, "code": e.code, "reason": e.message, "details": e.details}
-        await txn.execute(
-            "UPDATE order_shipment SET invoice_id = NULL, shipped_at = NULL WHERE order_id = $1",
-            order_id,
-        )
-    logger.info("Заказ #%s: отгрузка откачена, остаток возвращён", order_id)
-    return {"ok": True, "invoice_id": invoice_id}
+        res = await cancel_shipment_locked(txn, order_id, user_id=user_id)
+    if res.get("ok") and res.get("invoice_id"):
+        logger.info("Заказ #%s: отгрузка откачена, остаток возвращён", order_id)
+    return res
 
 
 async def list_failed(limit: int = 50) -> list[dict]:

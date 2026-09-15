@@ -563,37 +563,23 @@ async def cancel_order_full(
     """Отменить заказ и вернуть списанный товар на склад. Общий код для обоих
     входов — бота и `/api/orders/cancel` (T2.6).
 
-    Раньше откат делал только бот, а WebApp — нет, и отменённый оттуда заказ
-    оставлял в МойСклад живой customerorder с резервом товара НАВСЕГДА (§5.2.2).
-    Теперь откатывать нужно СВОЮ расходную накладную, и забыть про это стоило бы
-    ещё дороже: товар остался бы списанным по отменённому заказу.
+    Статус и возврат остатка — одна транзакция (`database.cancel_order`):
+    раньше отмена коммитилась первой, а накладная откатывалась «best-effort»
+    потом, и сбой между ними оставлял отменённый заказ со списанным навсегда
+    товаром. Отказ склада теперь отменяет и саму отмену — текстом оператору.
 
-    Возврат остатка — best-effort и намеренно ПОСЛЕ локальной отмены: ошибка
-    склада не должна откатывать то, что оператор уже подтвердил. Отмена
-    накладной идемпотентна (повторный вызов вернёт `already_cancelled`).
-
-    Возвращает результат `cancel_order` плюс `stock_reverse` — что вышло со
-    складом (для логов и текста оператору).
+    Возвращает `{ok, error, stock_reverse}` — что вышло со складом (для логов
+    и текста оператору).
     """
     from services import async_db as adb
 
     res = await adb.cancel_order(order_id, user_id, user_name, reason)
-    if not res.get("ok"):
-        return res
-
-    from services import order_shipment
-
-    try:
-        rev = await order_shipment.cancel_shipment(order_id, user_id=user_id)
-    except Exception as e:  # noqa: BLE001 — отмена уже применена, склад догоним
-        logger.warning("Возврат остатка по заказу #%s не прошёл", order_id, exc_info=True)
-        rev = {"ok": False, "reason": type(e).__name__}
-    if not rev.get("ok"):
+    if not res.get("ok") and res.get("stock_reverse"):
         logger.warning(
-            "Заказ #%s отменён, но остаток не вернулся на склад: %s",
-            order_id, rev.get("reason"),
+            "Заказ #%s не отменён — склад отказал: %s",
+            order_id, res["stock_reverse"].get("reason"),
         )
-    return {**res, "stock_reverse": rev}
+    return res
 
 
 _STATUS_RU: dict[str, str] = {
@@ -986,9 +972,9 @@ async def return_order_to_draft(
     заказ возвращается в 'draft' с причиной и счётчиком; после reject_max_cycles
     заказ замораживается. Менеджер правит черновик и отправляет заново.
 
-    Порядок: сперва атомарный reject_order_to_draft (race-guard на orders), и
-    только при успехе помечаем заявку 'returned'. Если другой босс уже обработал
-    заказ — reject_order_to_draft вернёт ошибку, заявку не трогаем.
+    Заказ и заявка переводятся одной транзакцией в `reject_order_to_draft`
+    (FOR UPDATE заказа, CAS обоих статусов). Если другой босс уже обработал
+    заказ или заявку — не меняется ничего.
 
     Возвращает {ok, error, req_id, order_id, now, frozen, rejection_count}.
     """
@@ -1008,7 +994,11 @@ async def return_order_to_draft(
         }
 
     order_id = req["order_id"]
-    res = await db.reject_order_to_draft(order_id, boss_user_id, boss_name, comment)
+    # Заказ → draft и заявка → returned — одной транзакцией (req_id передаём
+    # внутрь): иначе сбой между ними оставлял pending-заявку при черновике.
+    res = await db.reject_order_to_draft(
+        order_id, boss_user_id, boss_name, comment, req_id=req_id
+    )
     if not res.get("ok"):
         return {
             "ok": False,
@@ -1016,11 +1006,6 @@ async def return_order_to_draft(
             "req_id": req_id,
             "order_id": order_id,
         }
-
-    # Заказ уже в 'draft' — снимаем заявку с pending-очереди (статус заказа не трогаем).
-    await asyncio.to_thread(
-        db.mark_shipment_request_returned, req_id, boss_user_id, boss_name
-    )
 
     now_str = local_now().strftime("%d.%m.%Y %H:%M")
     frozen = bool(res.get("frozen"))

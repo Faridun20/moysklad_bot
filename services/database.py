@@ -2444,44 +2444,91 @@ def log_order_change(
 # ─── IMPLEMENTATION.md Фаза 3: reject→draft + freeze, cancel, stale ───────────
 
 
+class _DraftAbort(Exception):
+    """Откат reject→draft с текстом для босса."""
+
+
 async def reject_order_to_draft(
     order_id: int,
     rejected_by: int,
     rejected_name: str,
     comment: str,
+    *,
+    req_id: int | None = None,
 ) -> dict:
     """Reject заявки по модели IMPLEMENTATION.md §6.4: заказ возвращается в
     draft с комментарием, счётчик отклонений растёт, после reject_max_cycles
     заказ замораживается (frozen=1, resubmit запрещён до разморозки админом).
 
-    Атомарный UPDATE ... WHERE status='pending' — защита от гонки.
+    `req_id` — заявка, которую этим решением снимаем с очереди (`returned`).
+    Заказ, заявка и снимок состава для diff при переотправке пишутся ОДНОЙ
+    транзакцией под FOR UPDATE заказа. Раньше заказ уходил в draft одним
+    коммитом (asyncpg), а заявка помечалась другим драйвером (psycopg2): сбой
+    между ними оставлял pending-заявку при заказе-черновике, и переотправка
+    упиралась в уникальный индекс «одна pending-заявка на заказ» — заказ
+    вставал без кнопки, которая бы его сдвинула.
+
     Возвращает {ok, error, frozen, rejection_count}.
-
-    asyncpg Stage 16 (#21): native async. get_order/get_setting/add_audit_log/
-    get_role (sync money-core) — мост через to_thread; атомарный UPDATE —
-    adb_core.execute (rowcount-guard сохранён).
     """
-    order = await get_order(order_id)
-    if not order:
-        return {"ok": False, "error": "Заказ не найден"}
-    if order.get("status") != "pending":
-        return {"ok": False, "error": "Заказ не в статусе pending"}
+    import json as _json
 
-    rc = int(order.get("rejection_count") or 0) + 1
     max_cycles = int(await asyncio.to_thread(get_setting, "reject_max_cycles", 3))
-    frozen = 1 if rc >= max_cycles else 0
-
-    updated = (
-        await adb_core.execute(
-            "UPDATE orders SET status = 'draft', rejection_comment = $1, "
-            "rejection_count = $2, frozen = $3, updated_at = $4 "
-            "WHERE id = $5 AND status = 'pending'",
-            comment, rc, frozen, now_str(), order_id,
-        )
-        > 0
-    )
-    if not updated:
-        return {"ok": False, "error": "Заказ уже обработан"}
+    lock = " FOR UPDATE" if USE_POSTGRES else ""
+    try:
+        async with adb_core.transaction() as txn:
+            order = await txn.fetchrow(
+                f"SELECT status, rejection_count FROM orders WHERE id = $1{lock}", order_id
+            )
+            if not order:
+                raise _DraftAbort("Заказ не найден")
+            if order["status"] != "pending":
+                raise _DraftAbort("Заказ не в статусе pending")
+            rc = int(order.get("rejection_count") or 0) + 1
+            frozen = 1 if rc >= max_cycles else 0
+            stamp = now_str()
+            await txn.execute(
+                "UPDATE orders SET status = 'draft', rejection_comment = $1, "
+                "rejection_count = $2, frozen = $3, updated_at = $4 "
+                "WHERE id = $5 AND status = 'pending'",
+                comment, rc, frozen, stamp, order_id,
+            )
+            if req_id is not None:
+                moved = await txn.execute(
+                    "UPDATE shipment_requests SET status = 'returned', approved_by = $1, "
+                    "approved_by_name = $2, approved_at = $3 "
+                    "WHERE id = $4 AND order_id = $5 AND status = 'pending'",
+                    rejected_by, rejected_name, stamp, req_id, order_id,
+                )
+                if not moved:
+                    raise _DraftAbort("Заявка уже обработана")
+            # Снапшот состояния на момент reject — для diff при переотправке (#30).
+            snap_items = await txn.fetch(
+                "SELECT product_href, product_name, quantity, price_cents "
+                "FROM order_items WHERE order_id = $1",
+                order_id,
+            )
+            snap_rows = [
+                {
+                    "product_href": it.get("product_href") or "",
+                    "product_name": it.get("product_name") or "",
+                    "quantity": float(it.get("quantity", 0) or 0),
+                    "price": float(money.from_cents(int(it.get("price_cents") or 0))),
+                }
+                for it in snap_items
+            ]
+            before_snapshot = {
+                "items": snap_rows,
+                "total": sum(float(r["quantity"]) * float(r["price"]) for r in snap_rows),
+            }
+            await txn.execute(
+                "INSERT INTO order_change_log (order_id, changed_by, change_type, "
+                "before_snapshot, after_snapshot, summary, created_at) "
+                "VALUES ($1, $2, 'reject', $3, NULL, $4, $5)",
+                order_id, rejected_by, _json.dumps(before_snapshot),
+                _json.dumps({"rejection_count": rc}), stamp,
+            )
+    except _DraftAbort as e:
+        return {"ok": False, "error": str(e)}
 
     await asyncio.to_thread(
         add_audit_log,
@@ -2492,33 +2539,15 @@ async def reject_order_to_draft(
         f"Заказ #{order_id} → draft (попытка {rc}/{max_cycles})"
         + (" — ЗАМОРОЖЕН" if frozen else ""),
     )
-
-    # Снапшот состояния на момент reject — для diff при переотправке (#30).
-    snap_items = await get_order_items(order_id)
-    before_snapshot = {
-        "items": [
-            {
-                "product_href": it.get("product_href") or "",
-                "product_name": it.get("product_name") or "",
-                "quantity": float(it.get("quantity", 0) or 0),
-                "price": float(it.get("price", 0) or 0),
-            }
-            for it in snap_items
-        ],
-        "total": sum(
-            float(it.get("quantity", 0) or 0) * float(it.get("price", 0) or 0)
-            for it in snap_items
-        ),
-    }
-    await asyncio.to_thread(
-        log_order_change,
-        order_id,
-        rejected_by,
-        "reject",
-        before_snapshot,
-        None,
-        {"rejection_count": rc},
-    )
+    if req_id is not None:
+        await asyncio.to_thread(
+            add_audit_log,
+            rejected_by,
+            rejected_name,
+            await asyncio.to_thread(get_role, rejected_by),
+            "shipment_returned",
+            f"Заявка #{req_id} возвращена на доработку (заказ #{order_id})",
+        )
     return {"ok": True, "error": None, "frozen": bool(frozen), "rejection_count": rc}
 
 
@@ -2645,33 +2674,53 @@ async def mark_order_shipped(order_id: int, shipped_by: int, shipped_name: str) 
 
 
 async def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, reason: str) -> dict:
-    """Отмена заказа (IMPLEMENTATION.md §6.7), DB-часть. Reverse-demand в
-    МойСклад — отдельной фазой. Отмена доступна для approved; shipped по спеке
-    требует возврата на 100% — здесь не пропускаем (нужен return-флоу).
+    """Отмена одобренного заказа (IMPLEMENTATION.md §6.7): статус И возврат
+    списанного товара — ОДНОЙ транзакцией. Shipped по спеке требует возврата на
+    100% — здесь не пропускаем (нужен return-флоу).
 
-    asyncpg #21: native async; add_audit_log/get_role (sync) — мост через
-    to_thread; атомарный UPDATE — adb_core.execute."""
-    order = await get_order(order_id)
-    if not order:
-        return {"ok": False, "error": "Заказ не найден"}
-    status = order.get("status")
-    if status != "approved":
-        return {
-            "ok": False,
-            "error": "Отмена доступна только для approved (shipped → через возврат)",
-        }
+    Раньше статус коммитился первым, а накладная отменялась потом, отдельной
+    транзакцией «best-effort»: сбой между ними оставлял заказ отменённым, а
+    товар — списанным навсегда. Повторить было нечем: второй вызов отвечал
+    «доступна только для approved». Теперь либо заказ отменён и остаток
+    вернулся, либо не изменилось ничего и оператор видит причину.
 
-    updated = (
-        await adb_core.execute(
-            "UPDATE orders SET status = 'cancelled', cancelled_at = $1, "
-            "cancelled_by = $2, cancellation_reason = $3, updated_at = $4 "
-            "WHERE id = $5 AND status = 'approved'",
-            now_str(), cancelled_by, reason, now_str(), order_id,
+    Замок — тот же, что у списания (`order_shipment._lock_order_for_shipment`:
+    advisory по заказу + FOR UPDATE строки), поэтому «одобрить против
+    отменить» по-прежнему сериализуются. Возвращает {ok, error, stock_reverse}.
+    """
+    from services import order_shipment
+
+    async with adb_core.transaction() as txn:
+        status = await order_shipment._lock_order_for_shipment(txn, order_id)
+        if status is None:
+            return {"ok": False, "error": "Заказ не найден"}
+        if status != "approved":
+            if status == "cancelled":
+                return {"ok": False, "error": "Заказ уже обработан"}
+            return {
+                "ok": False,
+                "error": "Отмена доступна только для approved (shipped → через возврат)",
+            }
+        # Сначала склад: его отказ случается ДО первой записи, и тогда
+        # транзакция не пишет ничего — заказ остаётся одобренным.
+        rev = await order_shipment.cancel_shipment_locked(txn, order_id, user_id=cancelled_by)
+        if not rev.get("ok"):
+            return {
+                "ok": False,
+                "error": f"Товар не вернуть на склад: {rev.get('reason') or rev.get('code')}",
+                "stock_reverse": rev,
+            }
+        updated = (
+            await txn.execute(
+                "UPDATE orders SET status = 'cancelled', cancelled_at = $1, "
+                "cancelled_by = $2, cancellation_reason = $3, updated_at = $4 "
+                "WHERE id = $5 AND status = 'approved'",
+                now_str(), cancelled_by, reason, now_str(), order_id,
+            )
+            > 0
         )
-        > 0
-    )
-    if not updated:
-        return {"ok": False, "error": "Заказ уже обработан"}
+        if not updated:  # под замком недостижимо; страховка на SQLite-ручные правки
+            raise RuntimeError(f"cancel_order: заказ #{order_id} ушёл из approved под замком")
 
     await asyncio.to_thread(
         add_audit_log,
@@ -2681,7 +2730,9 @@ async def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, re
         "order_cancelled",
         f"Заказ #{order_id} отменён: {reason[:200]}",
     )
-    return {"ok": True, "error": None}
+    if rev.get("invoice_id"):
+        logger.info("Заказ #%s отменён, отгрузка откачена, остаток возвращён", order_id)
+    return {"ok": True, "error": None, "stock_reverse": rev}
 
 
 async def get_stale_pending_orders(hours: int = 48) -> list[dict]:
@@ -5429,8 +5480,13 @@ async def delete_order(order_id: int, requested_by: int) -> bool:
     """
     deleted = False
     async with adb_core.transaction() as txn:
-        # Проверяем, что заказ существует, draft и принадлежит юзеру
-        row = await txn.fetchrow("SELECT user_id, status FROM orders WHERE id = $1", order_id)
+        # Проверяем, что заказ существует, draft и принадлежит юзеру — ПОД
+        # замком строки. Без него проверка и удаление расходились: сабмит
+        # (draft→pending, тоже FOR UPDATE) успевал между ними, и удалялся уже
+        # отправленный заказ вместе с позициями, а pending-заявка оставалась
+        # сиротой в очереди босса.
+        lock = " FOR UPDATE" if USE_POSTGRES else ""
+        row = await txn.fetchrow(f"SELECT user_id, status FROM orders WHERE id = $1{lock}", order_id)
         if not row:
             return False
         if row["user_id"] != requested_by or row["status"] != "draft":
@@ -5446,7 +5502,14 @@ async def delete_order(order_id: int, requested_by: int) -> bool:
         # Postgres DELETE по order_items отвергнется живым FK.
         await txn.execute("DELETE FROM order_item_products WHERE order_id = $1", order_id)
         await txn.execute("DELETE FROM order_items WHERE order_id = $1", order_id)
-        deleted = await txn.execute("DELETE FROM orders WHERE id = $1", order_id) > 0
+        # Условие статуса повторено в самом DELETE — последний рубеж.
+        deleted = (
+            await txn.execute(
+                "DELETE FROM orders WHERE id = $1 AND status = 'draft' AND user_id = $2",
+                order_id, requested_by,
+            )
+            > 0
+        )
     if deleted:
         await asyncio.to_thread(
             add_audit_log,
@@ -6173,9 +6236,33 @@ def search_payments(query: str, user_id: int | None = None, limit: int = 20) -> 
         return [_with_major(r, ("amount", "amount_cents")) for r in cur.fetchall()]
 
 
-def update_order_agent(order_id: int, agent_id: str, agent_name: str) -> bool:
+def _draft_locked(cur, order_id: int) -> bool:
+    """Заказ — черновик? Под `FOR UPDATE` строки, в транзакции вызывающего.
+
+    Правка состава/клиента/валюты проверялась в ручке ОТДЕЛЬНЫМ чтением, а
+    запись шла следующим коммитом. Сабмит (draft→pending под FOR UPDATE)
+    успевал между ними, и позиция ложилась в уже отправленный заказ: босс
+    одобрял одну сумму, кредит-лимит проверялся по ней, а отгружалась другая.
+    Здесь запись ждёт сабмит на замке и видит его результат.
+    """
+    lock = " FOR UPDATE" if USE_POSTGRES else ""
+    cur.execute(q(f"SELECT status FROM orders WHERE id = ?{lock}"), (order_id,))
+    row = cur.fetchone()
+    if row is None:
+        return False
+    status = row["status"] if hasattr(row, "keys") else row[0]
+    return status == "draft"
+
+
+def update_order_agent(
+    order_id: int, agent_id: str, agent_name: str, *, require_draft: bool = False
+) -> bool:
+    """`require_draft` — менять только черновик, проверка в той же транзакции."""
     with get_conn() as conn:
         cur = get_cursor(conn)
+        if require_draft and not _draft_locked(cur, order_id):
+            conn.rollback()
+            return False
         cur.execute(
             q("UPDATE orders SET agent_id = ?, agent_name = ?, updated_at = ? WHERE id = ?"),
             (agent_id, agent_name, now_str(), order_id),
@@ -6531,11 +6618,15 @@ async def get_paid_orders_awaiting_confirmation(user_id: int | None = None) -> l
     return await adb_core.fetch(query, *params)
 
 
-def update_order_currency(order_id: int, currency: str) -> bool:
+def update_order_currency(order_id: int, currency: str, *, require_draft: bool = False) -> bool:
     """Установить валюту заказа. Применяется ко всем позициям одного
-    ордера — менять между позициями не имеет смысла."""
+    ордера — менять между позициями не имеет смысла. `require_draft` — только
+    у черновика, проверка в той же транзакции (`_draft_locked`)."""
     with get_conn() as conn:
         cur = get_cursor(conn)
+        if require_draft and not _draft_locked(cur, order_id):
+            conn.rollback()
+            return False
         cur.execute(
             q("UPDATE orders SET currency = ?, updated_at = ? WHERE id = ?"),
             (currency, now_str(), order_id),
@@ -6661,16 +6752,24 @@ def add_order_item(
     price: float = 0.0,
     note: str = "",
     product_id: int | None = None,
-) -> int:
+    *,
+    require_draft: bool = False,
+) -> int | None:
     """Добавить позицию заказа.
 
     `product_id` — карточка нашей номенклатуры; по ней позиция спишется со
     склада при отгрузке. Связь пишется в `order_item_products` (отдельная
     таблица, см. схему), `product_href` остаётся у legacy-строк.
+
+    `require_draft` — только в черновик, проверка статуса в той же транзакции
+    (`_draft_locked`); не черновик → None.
     """
     price_cents = money.to_cents(price or 0)
     with get_conn() as conn:
         cur = get_cursor(conn)
+        if require_draft and not _draft_locked(cur, order_id):
+            conn.rollback()
+            return None
         if USE_POSTGRES:
             cur.execute(
                 """
@@ -6744,9 +6843,17 @@ async def get_order_item(item_id: int) -> dict | None:
     return _with_major(row, ("price", "price_cents"))
 
 
-def remove_order_item(item_id: int) -> bool:
+def remove_order_item(item_id: int, *, require_draft: bool = False) -> bool:
+    """`require_draft` — удалять только из черновика (`_draft_locked`)."""
     with get_conn() as conn:
         cur = get_cursor(conn)
+        if require_draft:
+            cur.execute(q("SELECT order_id FROM order_items WHERE id = ?"), (item_id,))
+            row = cur.fetchone()
+            order_id = (row["order_id"] if hasattr(row, "keys") else row[0]) if row else None
+            if order_id is None or not _draft_locked(cur, int(order_id)):
+                conn.rollback()
+                return False
         cur.execute(q("DELETE FROM order_item_products WHERE item_id = ?"), (item_id,))
         cur.execute(q("DELETE FROM order_items WHERE id = ?"), (item_id,))
         deleted = cur.rowcount > 0

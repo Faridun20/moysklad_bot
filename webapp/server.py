@@ -5599,8 +5599,14 @@ async def api_add_item(request: Request):
                     status_code=409,
                     detail=f"Валюта заказа — {current_currency}: все позиции в одной валюте",
                 )
-            await adb.update_order_currency(data["order_id"], requested_currency)
+            if not await adb.update_order_currency(
+                data["order_id"], requested_currency, require_draft=True
+            ):
+                _require_draft_order(None)
 
+    # Статус перепроверяется в транзакции записи (require_draft): проверка
+    # выше — ранний понятный ответ, решает эта. Иначе сабмит между ними
+    # получал позицию в уже отправленный заказ.
     item_id = await adb.add_order_item(
         order_id=data["order_id"],
         product_name=data["product_name"],
@@ -5610,7 +5616,10 @@ async def api_add_item(request: Request):
         price=price,
         note=data.get("note", ""),
         product_id=int(product_ref) if product_ref.isdigit() else None,
+        require_draft=True,
     )
+    if item_id is None:
+        _require_draft_order(None)
     return JSONResponse({"item_id": item_id})
 
 
@@ -5633,7 +5642,12 @@ async def api_remove_item(request: Request):
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
     _require_draft_order(order)
-    await adb.remove_order_item(data["item_id"])
+    # Статус — ещё раз в транзакции удаления (см. add_item).
+    if not await adb.remove_order_item(data["item_id"], require_draft=True):
+        # Позиция на месте — значит, заказ успели отправить; иначе её удалили.
+        if await adb.get_order_item(data["item_id"]):
+            _require_draft_order(None)
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
     return JSONResponse({"ok": True})
 
 
@@ -5656,7 +5670,10 @@ async def api_set_agent(request: Request):
 
     agent_id = (data.get("agent_id") or "").strip()[:64]
     agent_name = (data.get("agent_name") or "").strip()[:200]
-    await adb.update_order_agent(data["order_id"], agent_id, agent_name)
+    if not await adb.update_order_agent(
+        data["order_id"], agent_id, agent_name, require_draft=True
+    ):
+        _require_draft_order(None)
     return JSONResponse({"ok": True})
 
 

@@ -731,6 +731,13 @@ async def _run_idempotent(key: str | None, work) -> tuple[dict, bool]:
 _ORDER_OPEN_STATUSES = ("approved", "shipped", "partially_returned")
 
 
+async def _lock_account(txn: Any, account_id: int) -> None:
+    """Строка счёта под `FOR UPDATE` до конца транзакции (Postgres). На SQLite
+    пишущая транзакция и так одна (`BEGIN IMMEDIATE`)."""
+    if _pg():
+        await txn.fetchrow("SELECT id FROM acc_accounts WHERE id = $1 FOR UPDATE", account_id)
+
+
 async def _lock_order(txn: Any, order_id: int) -> dict | None:
     sql = (
         "SELECT id, user_id, payment_type, currency, agent_name, paid_confirmed_at, status "
@@ -1207,14 +1214,25 @@ async def close_day(actor: Actor, data: dict) -> dict:
 
     async def work() -> int:
         async with adb_core.transaction() as txn:
-            # Сначала документ: он занимает ключ идемпотентности. Остаток
-            # считаем уже внутри транзакции — на SQLite это BEGIN IMMEDIATE,
-            # на Postgres — снимок после вставки, параллельная запись по тому
-            # же счёту в пересчёт не попадёт наполовину.
+            # Сначала документ: он занимает ключ идемпотентности.
             doc_id = await _insert_doc(
                 txn, actor, kind="reconcile", doc_date=day, now=now, request_key=key,
                 note=note or None,
             )
+            # Замок счёта ДО расчёта остатка. Без него два пересчёта одной кассы
+            # (два человека, двойной тап с разными ключами) на Postgres
+            # читали один и тот же остаток — каждый не видел незакоммиченную
+            # сверку соседа — и оба проводили разницу: расхождение удваивалось,
+            # и остаток уезжал от пересчитанного на ту же сумму в другую
+            # сторону. Под замком второй ждёт первого и считает остаток уже
+            # после его сверки.
+            #
+            # Повторный пересчёт за тот же день — законное действие («вечером
+            # пересчитали ещё раз»), а не ошибка: он сверяется с остатком ПОСЛЕ
+            # прошлой сверки, поэтому проводит только новое расхождение (при
+            # том же счёте — ноль) и пишет ещё одну строку закрытия. Отказывать
+            # в нём значило бы не дать поправить опечатку в пересчёте.
+            await _lock_account(txn, account_id)
             expected = await account_balance(account_id, conn=txn)
             diff = counted - expected
             if diff and not note:
