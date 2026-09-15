@@ -22,7 +22,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services import async_db as adb
 from services.notify_policy import CASH_DEPOSIT, should_notify_now
-from services.roles import can_confirm_deposit
+from services.roles import can_confirm_deposit, notify_recipients
 from handlers._ui import (
     drop_keyboard,
     finish_message,
@@ -108,12 +108,24 @@ async def _notify_confirmers(
 
     Что закрывает сдача — наличные строки разбивки по заказам и прежнее
     распределение по долгам (`order_payments.deposit_orders_view`), каждая
-    строка в своей валюте."""
+    строка в своей валюте.
+
+    ДВА получателя с разной логикой отправки (как у возврата,
+    `handlers.returns._notify_confirmers`): бухгалтер (а без него —
+    менеджер-заместитель, `services.roles.ROLE_ALSO_ACTS_AS`) сверяет кассу
+    каждый день и получает карточку ВСЕГДА, вне зависимости от суммы. Босс/
+    админ — режется порогом `boss_instant_threshold_usd`
+    (`services.notify_policy`): ниже порога карточка боссу не идёт, сдача
+    остаётся pending и попадает в вечерний дайджест (`services.boss_digest`).
+    """
     cur = (currency or _base_cur()).upper()
-    # Денежное событие — ниже boss_instant_threshold_usd карточку не шлём:
-    # сдача остаётся pending в БД и попадёт в вечерний дайджест боссу
-    # (services.boss_digest), а не потеряется.
-    if not should_notify_now(CASH_DEPOSIT, amount, cur):
+    users = await adb.get_all_users()
+    bookkeeper_recipients = notify_recipients(users, ("bookkeeper",))
+    recipients = list(bookkeeper_recipients)
+    if should_notify_now(CASH_DEPOSIT, amount, cur):
+        boss_recipients = notify_recipients(users, ("admin", "boss"))
+        recipients += [uid for uid in boss_recipients if uid not in recipients]
+    if not recipients:
         return
     from services import order_payments
 
@@ -133,7 +145,6 @@ async def _notify_confirmers(
         f"💰 Сумма: <b>{_fmt_amount(amount)} {esc(cur)}</b>\n"
         f"📦 Заказы:\n{orders_line}"
     )
-    recipients = await adb.get_deposit_confirmers()
     for uid in recipients:
         try:
             await bot.send_message(

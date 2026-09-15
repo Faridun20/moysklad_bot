@@ -82,7 +82,25 @@ def _shipped_order_with_return(db, mgr, total_per_unit=100.0, qty=2):
     return r["return_id"]
 
 
-def test_return_confirmers_skips_below_threshold(isolated_db):
+def test_return_confirmers_below_threshold_warehouse_notified_boss_not(isolated_db):
+    """«Товар получен» — физическая приёмка, не зависит от суммы: склад
+    получает карточку ВСЕГДА. Ниже порога — боссу пуш не идёт (в дайджест)."""
+    from handlers.returns import _notify_confirmers
+
+    db = isolated_db
+    db.set_role(1, "b", "Boss", "boss")
+    db.set_role(2, "m", "Manager", "manager")
+    db.set_role(3, "w", "Keeper", "warehouse_keeper")
+    ret_id = _shipped_order_with_return(db, 2, total_per_unit=100.0, qty=2)  # $200
+
+    bot = _Bot()
+    _run(_notify_confirmers(bot, ret_id, 1, 200.0, "no_refund"))
+    assert bot.sent == [3]
+
+
+def test_return_confirmers_below_threshold_manager_fallback_notified_boss_not(isolated_db):
+    """Кладовщика нет — менеджер замещает его (ROLE_ALSO_ACTS_AS) и получает
+    карточку всегда; боссу ниже порога она не идёт."""
     from handlers.returns import _notify_confirmers
 
     db = isolated_db
@@ -92,7 +110,7 @@ def test_return_confirmers_skips_below_threshold(isolated_db):
 
     bot = _Bot()
     _run(_notify_confirmers(bot, ret_id, 1, 200.0, "no_refund"))
-    assert bot.sent == []
+    assert bot.sent == [2]
 
 
 def test_return_confirmers_fires_at_or_above_threshold(isolated_db):
@@ -108,12 +126,53 @@ def test_return_confirmers_fires_at_or_above_threshold(isolated_db):
     assert sorted(bot.sent) == [1, 2]
 
 
-def test_deposit_confirmers_skips_below_threshold(isolated_db):
+def test_return_confirmers_no_recipients_sends_nothing(isolated_db):
+    """Нет ни склада, ни его заместителя, сумма ниже порога — рассылать
+    некому: функция не падает и ничего не шлёт."""
+    from handlers.returns import _notify_confirmers
+
+    db = isolated_db
+    db.set_role(1, "b", "Boss", "boss")
+    ret_id = _shipped_order_with_return(db, 1, total_per_unit=100.0, qty=2)  # $200
+
+    bot = _Bot()
+    _run(_notify_confirmers(bot, ret_id, 1, 200.0, "no_refund"))
+    assert bot.sent == []
+
+
+def test_deposit_confirmers_below_threshold_bookkeeper_notified_boss_not(isolated_db):
+    """Бухгалтер сверяет кассу каждый день — получает карточку ВСЕГДА.
+    Ниже порога боссу она не идёт (в дайджест)."""
+    from handlers.deposits import _notify_confirmers
+
+    db = isolated_db
+    db.set_role(1, "b", "Boss", "boss")
+    db.set_role(5, "k", "Book", "bookkeeper")
+
+    bot = _Bot()
+    _run(_notify_confirmers(bot, 1, "Manager", 300.0, currency="USD"))
+    assert bot.sent == [5]
+
+
+def test_deposit_confirmers_below_threshold_manager_fallback_notified_boss_not(isolated_db):
+    """Бухгалтера нет — менеджер замещает его и получает карточку всегда;
+    боссу ниже порога она не идёт."""
     from handlers.deposits import _notify_confirmers
 
     db = isolated_db
     db.set_role(1, "b", "Boss", "boss")
     db.set_role(10, "m", "Manager", "manager")
+
+    bot = _Bot()
+    _run(_notify_confirmers(bot, 1, "Manager", 300.0, currency="USD"))
+    assert bot.sent == [10]
+
+
+def test_deposit_confirmers_no_recipients_sends_nothing(isolated_db):
+    from handlers.deposits import _notify_confirmers
+
+    db = isolated_db
+    db.set_role(1, "b", "Boss", "boss")
 
     bot = _Bot()
     _run(_notify_confirmers(bot, 1, "Manager", 300.0, currency="USD"))
