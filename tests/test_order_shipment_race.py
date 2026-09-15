@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from tests.conftest import pay_account_id
 
 
 def _run(coro):
@@ -105,7 +106,7 @@ def test_paid_order_breakdown_equals_total_in_cents_and_closes_order(env):
 
     actor = order_payments.Actor(user_id=100, name="Boss", role="boss")
     rec = _run(order_payments.record_payment_parts(
-        oid, actor, [{"method": "card", "currency": "USD", "amount": "1"}]))
+        oid, actor, [{"method": "card", "currency": "USD", "amount": "1", "account_id": pay_account_id("card")}]))
     payments = _run(get_payments_for_order(oid))
     summary = _run(get_order_payment_summary(oid))
     assert summary["total_cents"] == 100

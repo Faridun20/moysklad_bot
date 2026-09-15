@@ -1009,6 +1009,15 @@ def _table_ddls() -> list[str]:
                 method     TEXT NOT NULL,
                 created_at TEXT
             )""",
+            # Куда поступили деньги по рассрочке «на карту»/«на счёт» — запись
+            # справочника `acc_accounts` (как у разбивки оплаты заказа,
+            # `payment_part_accounts`). FK на поступление — здесь, как у всей
+            # техники; на счёт — `scripts/apply_constraints`.
+            """CREATE TABLE IF NOT EXISTS machine_receipt_accounts (
+                receipt_id INTEGER PRIMARY KEY REFERENCES machine_payment_receipts(id),
+                account_id BIGINT NOT NULL,
+                created_at TEXT
+            )""",
             # История публикаций в канал. Нужна, чтобы один и тот же контейнер
             # не ушёл в канал дважды — второй раз обычно потому, что первый
             # забыли.
@@ -1487,6 +1496,8 @@ def _index_ddls() -> list[str]:
             "ON machine_deal_payments(due_date)",
             "CREATE INDEX IF NOT EXISTS idx_machine_receipts_deal "
             "ON machine_payment_receipts(deal_id, received_at)",
+            "CREATE INDEX IF NOT EXISTS idx_machine_receipt_accounts_account "
+            "ON machine_receipt_accounts(account_id)",
             # Одна живая заявка на машину — инвариант, а не оптимизация: две
             # одновременные «продажи» одной машины от двух менеджеров иначе обе
             # дошли бы до руководителя. Сервис проверяет это под блокировкой
@@ -6514,6 +6525,8 @@ async def get_cash_history(
             # которую отдал клиент. Нет — старый платёж без способа.
             "method": part["method"] if part else None,
             "method_label": order_payments.METHODS.get(part["method"]) if part else None,
+            # Куда пришли деньги (карта/счёт справочника) — «на карту •••• 1234 (…)».
+            "account_label": part.get("account_label") if part else None,
             "part_amount": float(money.from_cents(int(part["amount_cents"]))) if part else None,
             "part_currency": part["currency"] if part else None,
         })

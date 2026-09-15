@@ -261,6 +261,51 @@ Y» (`remaining_after_pending` = остаток − ждущее; `overpending` 
 `seed_order(payment_type="paid")` вносит разбивку картой сам (`pay=None` — нет),
 форма — `conftest.pay_form`, сервисом — `conftest.pay_order`.
 
+**«Куда поступили деньги» — карты и счета (`services/pay_accounts.py`, ручки
+`/api/pay_accounts{,/create,/update,/archive}`, фронт — `payments.js` + чистые
+`payAccount*` в `helpers.js`).** Требование владельца: выбрав «Карта» или «На
+счёт», менеджер указывает, ЧЬЯ это карта / ЧЕЙ счёт; руководитель сверяет банк
+по строке «на карту •••• 1234 (Фаридун М.)» / «на счёт ООО Farid Impeks (…6789)».
+Что помнить:
+- **Справочник — `acc_accounts` бухгалтерии** (вид card/bank, `holder`, `bank`,
+  `card_last4`), реквизиты счёта — sidecar `acc_account_details` (20 цифр,
+  ИНН, МФО; UNIQUE по номеру). От `accounting_enabled` НЕ зависит: включат учёт —
+  поступления уже указывают на свои счета. **Номер карты целиком не хранится
+  нигде** — только 4 цифры; полный номер форма и сервер отвергают ТЕКСТОМ, а не
+  обрезают. Валюта расчётного счёта — по коду в номере (000 — UZS, 840 — USD).
+- **Ссылка — таблицами**: `payment_part_accounts(part_id PK → payment_parts,
+  account_id)` и `machine_receipt_accounts(receipt_id PK → machine_payment_receipts,
+  account_id)`; FK на `acc_accounts`, CHECK 4/20 цифр — `scripts/apply_constraints`.
+  Удаление поступления чистит ссылку ПЕРВОЙ (`machines._delete_receipt_locked`).
+- **Карта/перечисление без записи — 400** (`code=account_required`, «Строка N:
+  укажите, на какую карту…»; вид не тот/нет записи — `account_invalid`, архив —
+  `account_archived`). Проверка — в `order_payments.parse_parts`/`record_payment_parts`
+  и `server._machine_receipt_account` (форма рассрочки и «оплачен» со способом).
+  Старые строки без ссылки законны и подписываются как раньше;
+  `require_account=False` — только разовый `scripts/migrate_payment_breakdown`.
+- **Подпись одна** — `pay_accounts.destination_label` → `order_payments.part_label`
+  («на карту •••• 1234 (Фаридун М.) · 7 130 USD»), `part_view.account_label`,
+  `parts_by_payment[...]["label"]`; её берут карточки (payPartLine), «Решения»,
+  «Долги», лента денег, пуш руководителю, дайджест, аудит, поступления рассрочки.
+- **Тёзка не заводится**: та же карта (4 цифры + владелец без учёта регистра/точек/ё)
+  или тот же номер счёта → `existed` с уже заведённой; архивная — 409 с текстом.
+  Хвост карты/номер счёта у записи с деньгами не правится (`in_use`) — иначе
+  старые платежи «переехали» бы на другую карту; владельца поправить можно.
+- **Права**: завести — admin/boss/manager (из листа выбора, кнопкой под
+  списком); править/архив — руководство, менеджер только без руководителя
+  (`machine_deal_requests.decision_rights`, аудит «руководителя в системе нет»).
+  У руководства — «Настройки → Карты и счета» (`payRenderAccountsScreen`), у
+  менеджера-заместителя — кнопкой в листе выбора. Архивная запись в выбор не
+  попадает, на старых платежах остаётся.
+- **По умолчанию — последний выбор человека** (`pay_accounts.last_used`,
+  выводится из его строк оплаты и поступлений; отдельной настройки нет).
+- Бота не касается выбор: в боте нет потока, где выбирают карту/перечисление
+  (`/pay` — платёж в кассу без способа), он только показывает подпись в карточке.
+- Тесты: `tests/test_pay_accounts.py`, `tests/e2e/test_pay_accounts.py`; хелперы —
+  `tests.conftest.pay_account_id/with_pay_accounts`, e2e `pick_account` /
+  `pay_form(accounts=)`, сценарии `flows.receiving_account` (инвариант: у каждой
+  карты/перечисления есть запись того же вида).
+
 **Уведомления:**
 - Шлём через `services.notifier.tg_send_message` (работает в любом процессе; токен не светится — `_redact_token`).
 - Поллера новых отгрузок больше НЕТ: отгрузку проводит сам бот, и рассказывать себе о собственном действии незачем. Вместе с ним ушли дедуп `notified_shipments` и `CHECK_INTERVAL_SEC`.

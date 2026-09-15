@@ -22,6 +22,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 import services.roles as roles
+from tests.conftest import pay_account_id
 
 
 def _run(coro):
@@ -330,7 +331,7 @@ def test_uzs_order_mark_paid_above_old_ceiling(isolated_db, monkeypatch):
     client = _client(db, monkeypatch, 1)
     r = client.post("/api/orders/mark_paid",
                     json={"initData": "1", "order_id": oid,
-                          "parts": [{"method": "bank", "currency": "UZS", "amount": 600_000_000}]})
+                          "parts": [{"method": "bank", "currency": "UZS", "amount": 600_000_000, "account_id": pay_account_id("bank")}]})
     assert r.status_code == 200, r.text
     assert _rows(db, "SELECT amount_cents FROM payments") == [{"amount_cents": 60_000_000_000}]
 
@@ -426,7 +427,7 @@ def test_paid_order_with_rejected_auto_payment_is_a_debt(isolated_db, monkeypatc
     mgr = _client(db, monkeypatch, 1)
     r = mgr.post("/api/orders/mark_paid", json={
         "initData": "1", "order_id": oid,
-        "parts": [{"method": "card", "currency": "USD", "amount": 250}],
+        "parts": [{"method": "card", "currency": "USD", "amount": 250, "account_id": pay_account_id("card")}],
     })
     assert r.status_code == 200, r.text
     new_pid = r.json()["payment_id"]

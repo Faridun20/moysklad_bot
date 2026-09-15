@@ -93,3 +93,33 @@ def isolated_db(monkeypatch, tmp_path):
     # падала бы на инфраструктуре, а не на проверяемом поведении.
     db.seed_warehouses()
     return db
+
+
+# ─── Карты и счета «куда поступили» (services/pay_accounts.py) ───────────────
+# Карта и перечисление в разбивке оплаты обязаны указать запись справочника.
+# Тесты, которым неважно, ЧЬЯ карта, берут эти две: заводятся через сервис
+# (тот же путь, что у формы), повтор отдаёт уже заведённую.
+
+TEST_CARD = {"kind": "card", "holder": "Фаридун М.", "card_last4": "1234", "bank": "Kapitalbank"}
+TEST_BANK = {"kind": "bank", "holder": "ООО Farid Impeks", "account_number": "20208840900112236789",
+             "bank": "Kapitalbank", "mfo": "01158"}
+
+
+def pay_account_id(kind: str = "card", run=None, **override) -> int:
+    import asyncio
+
+    from services import pay_accounts
+
+    data = {**(TEST_CARD if kind == "card" else TEST_BANK), **override}
+    res = (run or asyncio.run)(pay_accounts.create_account(pay_accounts.Actor(0, "Tests", "boss"), data))
+    return int(res["account"]["id"])
+
+
+def with_pay_accounts(parts: list[dict], run=None) -> list[dict]:
+    """Строкам карта/перечисление без `account_id` — тестовая карта/счёт."""
+    out = []
+    for p in parts:
+        if p.get("method") in ("card", "bank") and not p.get("account_id"):
+            p = {**p, "account_id": pay_account_id(p["method"], run)}
+        out.append(p)
+    return out

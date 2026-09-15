@@ -2706,3 +2706,11 @@ body.page-sheet-open { overflow: hidden; }
 .acc-warn { color: var(--danger); }
 /* Селектор классом, а не #id: «#acc…» сторож дизайн-системы читает как hex-цвет. */
 .acc-receipt .acc-add-line { margin-bottom: var(--sp-4); }
+
+/* «Куда поступили» (payments.js): строка выбора карты/счёта в строке оплаты и
+   в форме поступления по рассрочке. Поле с сегментом способа прячется у
+   наличных — `.c-field` объявлен блоком, и атрибут hidden без правила не
+   сработал бы. */
+.c-field[hidden] { display: none; }
+.pay-account-box { margin-block: var(--sp-2); }
+.pay-account--empty .card-row-title { color: var(--accent); }

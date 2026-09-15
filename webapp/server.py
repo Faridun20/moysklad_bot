@@ -4704,6 +4704,7 @@ async def api_machines_payment(request: Request):
     payment_id = _machine_id_arg(data, "payment_id")
     paid = data.get("paid", True)
     method = _machine_receipt_method(data, required=False)
+    account_id = await _machine_receipt_account(data, method) if paid else None
     # Снять отметку = удалить поступление: как удаление денег — руководству,
     # менеджеру только пока руководителя в системе нет.
     undo_mode = None if paid else await _machine_money_undo_mode(user["id"])
@@ -4716,7 +4717,7 @@ async def api_machines_payment(request: Request):
     try:
         res = await machines.pay_installment(
             payment_id, user_id=user["id"], full_name=_actor_name(user), paid=bool(paid),
-            method=method,
+            method=method, account_id=account_id,
         )
     except Exception:
         await idem.release()
@@ -4743,6 +4744,25 @@ def _machine_receipt_method(data: dict, *, required: bool) -> str | None:
     if raw not in machines.RECEIPT_METHODS:
         raise HTTPException(status_code=400, detail="Способ оплаты: наличные, карта или перечисление")
     return raw
+
+
+async def _machine_receipt_account(data: dict, method: str | None) -> int | None:
+    """Куда пришли деньги по рассрочке «на карту»/«на счёт» — как у разбивки
+    оплаты заказа: карта или счёт из справочника обязательны (тот же отказ
+    текстом), у наличных и без способа не читается."""
+    from services import pay_accounts
+
+    if method not in pay_accounts.METHOD_KIND:
+        return None
+    raw = data.get("account_id")
+    if raw in (None, ""):
+        text = pay_accounts.required_text(method)
+        raise HTTPException(status_code=400, detail=text[:1].upper() + text[1:])
+    try:
+        acc = await pay_accounts.check_for_method(raw, method)
+    except pay_accounts.AccountError as e:
+        raise HTTPException(status_code=e.status, detail=e.message[:1].upper() + e.message[1:])
+    return int(acc["id"])
 
 
 async def _machine_money_undo_mode(user_id: int) -> str:
@@ -4789,6 +4809,7 @@ async def api_machines_receipt(request: Request):
     if not amount_cents:
         raise HTTPException(status_code=400, detail="Сумма обязательна")
     method = _machine_receipt_method(data, required=True)
+    account_id = await _machine_receipt_account(data, method)
     if not data.get("idempotency_key"):
         raise HTTPException(status_code=400, detail="idempotency_key обязателен")
 
@@ -4804,7 +4825,7 @@ async def api_machines_receipt(request: Request):
         res = await machines.add_receipt(
             deal_id, amount_cents, user_id=user["id"], full_name=_actor_name(user),
             note=_machine_text(data, "note", 200), method=method, idem_key=idem.key,
-            allow_overpay=bool(data.get("overpay")),
+            allow_overpay=bool(data.get("overpay")), account_id=account_id,
         )
     except Exception:
         await idem.release()
@@ -6889,6 +6910,123 @@ async def _record_order_payment(data: dict, user: dict, op: str) -> JSONResponse
     return JSONResponse(res)
 
 
+# ─── Карты и счета «куда поступили деньги» (services/pay_accounts.py) ────────
+# Справочник общий с бухгалтерией (`acc_accounts`), но от её выключателя НЕ
+# зависит: без него форма оплаты не записала бы карту. Завести — менеджер и
+# руководство; изменить и убрать в архив — руководство, менеджер только пока
+# руководителя в системе нет (как удаление поступлений по рассрочке).
+
+_PAY_ACCOUNT_ROLES = ("admin", "boss", "manager")
+
+
+async def _pay_accounts_payload(user_id: int, role: str, *, include_archived: bool = False) -> dict:
+    from services import machine_deal_requests as mdr
+    from services import pay_accounts
+    from services.roles import role_allowed
+
+    rights = await mdr.decision_rights(user_id, role)
+    return {
+        "accounts": await pay_accounts.list_accounts(include_archived=include_archived and rights["can_decide"]),
+        "last_used": await pay_accounts.last_used(user_id),
+        "currencies": pay_accounts._currencies()[0],
+        "can_add": role_allowed(role, pay_accounts.ROLES_ADD),
+        "can_manage": bool(rights["can_decide"]),
+        "manage_hint": (None if rights["viewer_is_holder"]
+                        else "меняете вы — руководителя в системе нет" if rights["can_decide"]
+                        else "изменить или убрать в архив может руководитель"),
+    }
+
+
+def _pay_account_actor(user: dict):
+    from services import pay_accounts
+
+    return pay_accounts.Actor(user_id=int(user["id"]), name=_actor_name(user) or user.get("username")
+                              or str(user["id"]), role=get_role(user["id"]))
+
+
+def _pay_account_fail(e) -> JSONResponse:
+    return JSONResponse({"detail": e.message, "code": e.code}, status_code=e.status)
+
+
+async def _pay_account_manage_mode(user_id: int) -> str:
+    from services import machine_deal_requests as mdr
+
+    rights = await mdr.decision_rights(user_id, get_role(user_id))
+    if not rights["can_decide"]:
+        raise HTTPException(status_code=403, detail="Изменить или убрать в архив может руководитель")
+    return "boss" if rights["viewer_is_holder"] else "no_boss"
+
+
+@app.post("/api/pay_accounts")
+async def api_pay_accounts(request: Request):
+    """Карты и счета для выбора «куда поступили» + последний выбор человека.
+    Архив — тому, кто им управляет (`include_archived`)."""
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_PAY_ACCOUNT_ROLES, rate_limit_scope="api_pay_accounts",
+                      rate_limit_max=60)
+    return JSONResponse(await _pay_accounts_payload(
+        user["id"], get_role(user["id"]), include_archived=bool(data.get("include_archived"))))
+
+
+@app.post("/api/pay_accounts/create")
+async def api_pay_accounts_create(request: Request):
+    """Новая карта (последние 4 цифры + владелец) или счёт (фирма + 20 цифр).
+    Та же запись второй раз не заводится — ответ `existed` с уже заведённой."""
+    from services import async_db as adb
+    from services import pay_accounts
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_PAY_ACCOUNT_ROLES, rate_limit_scope="api_pay_accounts_create",
+                      rate_limit_max=20)
+    idem = _Idem(adb, "pay_account_create", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await pay_accounts.create_account(_pay_account_actor(user), data)
+    except pay_accounts.AccountError as e:
+        await idem.release()
+        return _pay_account_fail(e)
+    except Exception:
+        await idem.release()
+        raise
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/pay_accounts/update")
+async def api_pay_accounts_update(request: Request):
+    from services import pay_accounts
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_PAY_ACCOUNT_ROLES, rate_limit_scope="api_pay_accounts_update",
+                      rate_limit_max=20)
+    mode = await _pay_account_manage_mode(user["id"])
+    try:
+        res = await pay_accounts.update_account(_pay_account_actor(user), data.get("account_id"), data, mode=mode)
+    except pay_accounts.AccountError as e:
+        return _pay_account_fail(e)
+    return JSONResponse(res)
+
+
+@app.post("/api/pay_accounts/archive")
+async def api_pay_accounts_archive(request: Request):
+    """В архив (или обратно). Архивная запись не предлагается при выборе, но на
+    старых платежах показывается как была."""
+    from services import pay_accounts
+
+    data = await request.json()
+    user = _authorize(data, allowed_roles=_PAY_ACCOUNT_ROLES, rate_limit_scope="api_pay_accounts_archive",
+                      rate_limit_max=20)
+    mode = await _pay_account_manage_mode(user["id"])
+    try:
+        res = await pay_accounts.set_archived(_pay_account_actor(user), data.get("account_id"),
+                                              bool(data.get("archived", True)), mode=mode)
+    except pay_accounts.AccountError as e:
+        return _pay_account_fail(e)
+    return JSONResponse(res)
+
+
 @app.post("/api/orders/payment_context")
 async def api_order_payment_context(request: Request):
     """Данные формы «Как получены деньги»: сколько внести, валюта заказа,
@@ -6932,6 +7070,9 @@ async def api_order_payment_context(request: Request):
     quotes = await cbu_quotes([c for c in currencies if c != base], today_str())
     parts = (await order_payments.parts_for_orders([order_id])).get(order_id, [])
     return JSONResponse({
+        # Карты и счета «куда поступили» — тем же ответом: форма без них не
+        # запишет карту/перечисление, а второй запрос за тем же экраном не нужен.
+        "pay_accounts": await _pay_accounts_payload(user["id"], role),
         "order_id": order_id,
         "agent_name": order.get("agent_name") or "",
         "status": order.get("status"),
@@ -7044,7 +7185,8 @@ async def _notify_bosses_payment_pending(
             lines.insert(
                 5,
                 "💳 Как получено: <b>"
-                + esc(order_payments.part_label(part["method"], int(part["amount_cents"]), part["currency"]))
+                + esc(part.get("label") or order_payments.part_label(
+                    part["method"], int(part["amount_cents"]), part["currency"]))
                 + "</b>" + (f" (курс {esc(part.get('rate') or part.get('order_rate') or '')})"
                             if part.get("rate_source") != "same" else ""),
             )

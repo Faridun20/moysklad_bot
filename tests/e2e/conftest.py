@@ -256,13 +256,64 @@ def pay_order(e2e: E2E, order_id: int, parts: list[tuple] | None = None, *, uid:
         gap = e2e.run(order_payments.payment_gap_cents([order_id]))[order_id]
         parts = [("card", gap / 100)]
     rows = [{"method": p[0], "amount": str(p[1]), "currency": p[2] if len(p) > 2 else cur} for p in parts]
+    # Карта/перечисление — с тестовой картой/счётом «куда поступили».
+    from tests.conftest import with_pay_accounts
+
+    rows = with_pay_accounts(rows, run=e2e.run)
     actor = order_payments.Actor(user_id=uid, name="Manager", role="manager")
     return e2e.run(order_payments.record_payment_parts(order_id, actor, rows))
 
 
-def pay_form(page: Page, open_selector: str, rows: list[tuple], *, submit: bool = True) -> None:
+def pick_account(page: Page, trigger, kind: str, spec: dict | None = None) -> None:
+    """Лист «На какую карту / На какой счёт», открытый кнопкой `trigger`: найти
+    запись по последним цифрам и владельцу, нет — завести кнопкой «Новая
+    карта/счёт» (`spec` — поля формы; по умолчанию тестовые из tests/conftest)."""
+    from tests.conftest import TEST_BANK, TEST_CARD
+
+    spec = dict(spec or (TEST_CARD if kind == "card" else TEST_BANK))
+    spec.pop("kind", None)
+    trigger.click()
+    picker = page.locator(".c-overlay.pay-account-picker").last
+    picker.wait_for()
+    tail = spec.get("card_last4") or str(spec.get("account_number", ""))[-4:]
+    picker.locator("#ms-f-search").fill(tail)
+    page.wait_for_timeout(200)  # фильтр пикера ждёт паузу в наборе
+    holder = spec.get("holder", "")
+    match = picker.locator("[data-pick]", has_text=holder) if holder else picker.locator("[data-pick]")
+    if match.count():
+        match.first.click()
+        picker.locator("#ms-submit").click()
+    else:
+        picker.locator(".picker-add").click()
+        form = page.locator(".c-overlay.pay-account-form").last
+        form.wait_for()
+        for key, value in spec.items():
+            field = form.locator(f"#ms-f-{key}")
+            if field.count() and field.get_attribute("type") != "hidden":
+                field.fill(str(value))
+        form.locator("#ms-submit").click()
+    page.wait_for_function(
+        "() => !document.querySelector('.c-overlay.pay-account-picker, .c-overlay.pay-account-form')"
+    )
+
+
+def choose_pay_account(page: Page, part_index: int, kind: str, spec: dict | None = None) -> None:
+    """«Куда поступили» в строке `part_index` формы оплаты."""
+    part = page.locator(".c-overlay .pay-part").nth(part_index)
+    pick_account(page, part.locator(".pay-part-account"), kind, spec)
+    page.wait_for_function(
+        "(i) => { const p = document.querySelectorAll('.c-overlay .pay-part')[i];"
+        " const a = p && p.querySelector('.pay-part-account'); return !!a && a.dataset.accountId !== ''; }",
+        arg=part_index,
+    )
+
+
+def pay_form(page: Page, open_selector: str, rows: list[tuple], *, submit: bool = True,
+             accounts: dict[str, dict] | None = None) -> None:
     """Форма «Как получены деньги» в браузере: открыть кнопкой, заполнить строки
-    [(способ, сумма[, валюта[, курс]])], отправить."""
+    [(способ, сумма[, валюта[, курс]])], отправить. Карта/перечисление без
+    предложенной по умолчанию записи получают карту/счёт через лист выбора
+    (`accounts` — {способ: поля формы}, иначе тестовые)."""
     page.click(open_selector)
     page.wait_for_selector(".c-overlay .pay-part")
     for i, row in enumerate(rows):
@@ -276,6 +327,11 @@ def pay_form(page: Page, open_selector: str, rows: list[tuple], *, submit: bool 
         part.locator(".pay-part-amount").fill(str(row[1]))
         if len(row) > 3 and row[3]:
             part.locator(".pay-part-rate").fill(str(row[3]))
+        if row[0] in ("card", "bank"):
+            chosen = part.locator(".pay-part-account").get_attribute("data-account-id")
+            wanted = (accounts or {}).get(row[0])
+            if not chosen or wanted:
+                choose_pay_account(page, i, row[0], wanted)
     if submit:
         page.click(".c-overlay #ms-submit")
 

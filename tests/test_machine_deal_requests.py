@@ -423,22 +423,37 @@ def test_manager_records_installment_money_with_method(isolated_db, monkeypatch,
     assert _post(client, "/api/machines/receipt", KEEPER, deal_id=deal_id, amount="5000",
                  method="cash", idempotency_key="rk").status_code == 403
 
+    # «На карту» — только с картой справочника: чья карта, руководитель сверяет банк.
+    no_account = _post(client, "/api/machines/receipt", MGR, deal_id=deal_id, amount="5000",
+                       method="card", idempotency_key="r01")
+    assert no_account.status_code == 400 and "на какую карту" in no_account.json()["detail"]
+    from tests.conftest import pay_account_id
+
+    bank_id = pay_account_id("bank")
+    wrong = _post(client, "/api/machines/receipt", MGR, deal_id=deal_id, amount="5000",
+                  method="card", account_id=bank_id, idempotency_key="r02")
+    assert wrong.status_code == 400 and "выберите карту" in wrong.json()["detail"]
     ok = _post(client, "/api/machines/receipt", MGR, deal_id=deal_id, amount="5000",
-               method="card", idempotency_key="r1")
+               method="card", account_id=pay_account_id("card"), idempotency_key="r1")
     assert ok.status_code == 200, ok.text
     card = _post(client, "/api/machines/card", MGR, machine_id=mid).json()
     deal = card["deals"][0]
     assert deal["can_record"] is True and deal["can_undo"] is False
     assert [r["method"] for r in deal["receipts"]] == ["card"]
+    assert deal["receipts"][0]["account_label"] == "на карту •••• 1234 (Фаридун М.)"
+    assert not any(k.startswith("acc_") for k in deal["receipts"][0])
     assert deal["progress"]["left_cents"] == 1_500_000
 
     # Плановый платёж «оплачен» кнопкой — тоже менеджер; способ необязателен.
     second = [p for p in deal["payments"] if p["seq"] == 2][0]
+    no_bank = _post(client, "/api/machines/payment", MGR, payment_id=second["id"], paid=True,
+                    method="bank", idempotency_key="p0")
+    assert no_bank.status_code == 400 and "на какой счёт" in no_bank.json()["detail"]
     paid = _post(client, "/api/machines/payment", MGR, payment_id=second["id"], paid=True,
                  method="cash", idempotency_key="p1")
     assert paid.status_code == 200, paid.text
     audit = [a["details"] for a in _run(db.get_audit_log(limit=50)) if a["action"] == "machine_receipt_added"]
-    assert any("на карту" in d for d in audit) and any("наличные" in d for d in audit)
+    assert any("на карту •••• 1234 (Фаридун М.)" in d for d in audit) and any("наличные" in d for d in audit)
 
     # Стереть деньги при живом руководителе менеджер не может — ни удалением, ни снятием отметки.
     receipt_id = deal["receipts"][0]["id"]
@@ -447,6 +462,8 @@ def test_manager_records_installment_money_with_method(isolated_db, monkeypatch,
                  idempotency_key="p2").status_code == 403
     assert _post(client, "/api/machines/receipt_delete", BOSS, receipt_id=receipt_id).status_code == 200
     assert _rows(db, "SELECT COUNT(*) AS n FROM machine_receipt_methods WHERE receipt_id = ?",
+                 (receipt_id,))[0]["n"] == 0
+    assert _rows(db, "SELECT COUNT(*) AS n FROM machine_receipt_accounts WHERE receipt_id = ?",
                  (receipt_id,))[0]["n"] == 0
 
 

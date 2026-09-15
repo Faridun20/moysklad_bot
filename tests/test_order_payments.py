@@ -76,10 +76,22 @@ def _actor(uid=MGR, role="manager"):
     return order_payments.Actor(user_id=uid, name=f"U{uid}", role=role)
 
 
+# Заглушка «куда поступили» в строках карты/перечисления: чистым функциям
+# хватает числа, записи (`_record`, `_post`) подставляют настоящую карту/счёт.
+_ACC = 77
+
+
+def _real(parts):
+    from tests.conftest import with_pay_accounts
+
+    return with_pay_accounts([{k: v for k, v in p.items() if not (k == "account_id" and v == _ACC)}
+                              for p in parts])
+
+
 def _record(oid, parts, uid=MGR, role="manager", key=None):
     from services import order_payments
 
-    return _run(order_payments.record_payment_parts(oid, _actor(uid, role), parts, idem_key=key))
+    return _run(order_payments.record_payment_parts(oid, _actor(uid, role), _real(parts), idem_key=key))
 
 
 def _cash(amount, cur="USD"):
@@ -87,7 +99,7 @@ def _cash(amount, cur="USD"):
 
 
 def _card(amount, cur="USD", rate=None):
-    d = {"method": "card", "currency": cur, "amount": str(amount)}
+    d = {"method": "card", "currency": cur, "amount": str(amount), "account_id": _ACC}
     if rate:
         d["rate"] = rate
     return d
@@ -195,7 +207,8 @@ def test_paid_order_is_not_shipped_until_breakdown_covers_total(db):
     pays = _run(db.get_payments_for_order(oid))
     assert sorted((p["amount_cents"], p["status"]) for p in pays) == [(500_000, "pending"), (713_000, "pending")]
     audit = _rows(db, "SELECT details FROM audit_log WHERE action = 'order_payment_recorded'")
-    assert "наличные 5 000 USD" in audit[0]["details"] and "на карту 7 130 USD" in audit[0]["details"]
+    assert "наличные 5 000 USD" in audit[0]["details"]
+    assert "на карту •••• 1234 (Фаридун М.) · 7 130 USD" in audit[0]["details"]
 
 
 def test_paid_order_partial_breakdown_is_refused_with_clear_text(db):
@@ -469,6 +482,8 @@ def client(db, monkeypatch):
 
 
 def _post(client, uid, path, **body):
+    if isinstance(body.get("parts"), list):
+        body["parts"] = _real(body["parts"])
     return client.post(path, json={"initData": str(uid), **body})
 
 
@@ -482,7 +497,7 @@ def test_api_double_submit_with_same_key_records_once(db, client):
     assert len(_rows(db, "SELECT id FROM payment_parts")) == 2
     # Карта ушла подтверждающим с кнопками, наличные — нет.
     cards = [p for p in client.pushes if "pay_ok" in str(p[2])]
-    assert len(cards) == 1 and "на карту 7 130 USD" in cards[0][1]
+    assert len(cards) == 1 and "на карту •••• 1234 (Фаридун М.) · 7 130 USD" in cards[0][1]
 
 
 def test_api_refusal_releases_key_and_returns_code(db, client):

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 
-from tests.e2e.conftest import go, sheet_fill, tab
+from tests.e2e.conftest import go, pick_account, sheet_fill, tab
 
 
 def _shot(page, name: str) -> None:
@@ -124,13 +124,20 @@ def test_manager_installment_is_approved_by_boss_in_webapp(open_app, e2e):
     mgr.wait_for_selector("#ms-f-amount")
     mgr.fill("#ms-f-amount", "6000")
     mgr.click('.seg-item[data-opt="card"]')
+    # «На карту» — чья карта: лист выбора, новой нет — заводится тут же.
+    mgr.click("#ms-submit")
+    mgr.wait_for_selector("#ms-error:has-text('на какую карту')")
+    pick_account(mgr, mgr.locator(".c-overlay .pay-part-account"), "card")
+    mgr.wait_for_selector(".c-overlay .pay-part-account:has-text('Фаридун М.')")
     _shot(mgr, "11-manager-receipt-method")
     mgr.click("#ms-submit")
     mgr.wait_for_selector(".toast:has-text('Оплата записана')")
-    mgr.wait_for_selector("#content:has-text('на карту')")
-    assert e2e.rows("SELECT r.amount_cents, m.method, r.received_by FROM machine_payment_receipts r "
-                    "JOIN machine_receipt_methods m ON m.receipt_id = r.id") == [
-        {"amount_cents": 600_000, "method": "card", "received_by": e2e.ids["mgr"]}]
+    mgr.wait_for_selector("#content:has-text('на карту •••• 1234 (Фаридун М.)')")
+    assert e2e.rows("SELECT r.amount_cents, m.method, r.received_by, a.card_last4 FROM machine_payment_receipts r "
+                    "JOIN machine_receipt_methods m ON m.receipt_id = r.id "
+                    "JOIN machine_receipt_accounts ra ON ra.receipt_id = r.id "
+                    "JOIN acc_accounts a ON a.id = ra.account_id") == [
+        {"amount_cents": 600_000, "method": "card", "received_by": e2e.ids["mgr"], "card_last4": "1234"}]
     assert mgr.locator("[data-receipt-del]").count() == 0, "стирает деньги руководитель"
     _no_toast(mgr)
     _shot(mgr, "12-manager-receipts")

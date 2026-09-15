@@ -145,7 +145,9 @@ async def convert_payment(payment_id: int, parts: list[dict], *, apply: bool) ->
     )
     if not apply:
         base = order_payments._base()
-        inputs = order_payments.parse_parts(rows)
+        # Разовый перенос старых отметок: чья была карта, уже не восстановить —
+        # «куда поступили» у таких строк не требуется (require_account=False).
+        inputs = order_payments.parse_parts(rows, require_account=False)
         cbu = await order_payments._cbu_for({i.currency for i in inputs} | {order_cur})
         calcs = order_payments.compute_parts(inputs, order_cur, base, cbu)
         total = sum(c.order_amount_cents for c in calcs)
@@ -153,7 +155,7 @@ async def convert_payment(payment_id: int, parts: list[dict], *, apply: bool) ->
                 "payment_cents": int(pay["amount_cents"]), "parts_cents": total,
                 "text": order_payments.recorded_text(int(order["id"]), order_cur, calcs, [int(payment_id)])}
     res = await order_payments.record_payment_parts(
-        int(order["id"]), actor, rows, supersede_payment_ids=[int(payment_id)]
+        int(order["id"]), actor, rows, supersede_payment_ids=[int(payment_id)], require_account=False,
     )
     return {"ok": True, "dry_run": False, **res}
 

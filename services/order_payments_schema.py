@@ -28,6 +28,16 @@ Leaf-модуль, как `accounting_schema`: сервис `services.order_paym
                          подтверждение сдачи просто подтверждает платежи этих
                          строк. Строки отклонённой сдачи снова «на руках» —
                          привязка действует, пока сдача pending/confirmed.
+  payment_part_accounts — КУДА поступили деньги строки «карта»/«на счёт»:
+                         ссылка на запись справочника `acc_accounts` (тот же
+                         справочник, что у бухгалтерии: включат учёт — поступления
+                         уже указывают на свои счета). Отдельная таблица, а не
+                         колонка: `payment_parts` уже на проде. Нет строки —
+                         наличные или запись до справочника (законно).
+  acc_account_details  — реквизиты счёта, которых нет в `acc_accounts`: номер
+                         расчётного счёта (20 цифр, хранится целиком — это не
+                         номер карты), ИНН и МФО. Номер карты НЕ хранится нигде:
+                         только последние 4 цифры в `acc_accounts.card_last4`.
 """
 
 from __future__ import annotations
@@ -66,6 +76,19 @@ def tables(id_type: str) -> list[str]:
             amount_cents BIGINT NOT NULL,
             PRIMARY KEY (deposit_id, part_id)
         )""",
+        """CREATE TABLE IF NOT EXISTS payment_part_accounts (
+            part_id    BIGINT PRIMARY KEY,
+            account_id BIGINT NOT NULL,
+            created_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS acc_account_details (
+            account_id     BIGINT PRIMARY KEY,
+            account_number TEXT,
+            company_tin    TEXT,
+            mfo            TEXT,
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT
+        )""",
     ]
 
 
@@ -78,4 +101,11 @@ INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_payment_parts_creator ON payment_parts(created_by, method)",
     "CREATE INDEX IF NOT EXISTS idx_cash_deposit_parts_part ON cash_deposit_parts(part_id)",
     "CREATE INDEX IF NOT EXISTS idx_cash_deposit_parts_order ON cash_deposit_parts(order_id)",
+    # «Куда поступили»: платежи по счёту (правка номера у счёта с платежами —
+    # отказ) и последний выбранный счёт менеджера.
+    "CREATE INDEX IF NOT EXISTS idx_payment_part_accounts_account ON payment_part_accounts(account_id)",
+    # Один расчётный счёт — одна запись справочника: второй «такой же» счёт
+    # развёл бы поступления одного счёта по двум строкам сверки.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_acc_account_details_number "
+    "ON acc_account_details(account_number) WHERE account_number IS NOT NULL",
 ]

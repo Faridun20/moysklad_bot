@@ -23,6 +23,7 @@ from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
+from tests.conftest import pay_account_id
 
 BOSS, MGR, MGR2, BOOK = 100, 200, 300, 500
 CBU_UZS = 12650.5  # сум за доллар по ЦБ на сегодня
@@ -136,7 +137,7 @@ def test_disabled_by_default_new_endpoints_refuse_and_old_flow_untouched(env):
     # pending-платёж в валюте заказа, журнал денег не трогается.
     oid = make_order(e.db)
     r = post(e, "/api/orders/mark_paid", MGR, order_id=oid,
-             parts=[{"method": "bank", "currency": "USD", "amount": 300}], idempotency_key="old-1")
+             parts=[{"method": "bank", "currency": "USD", "amount": 300, "account_id": pay_account_id("bank")}], idempotency_key="old-1")
     assert r.status_code == 200, r.text
     pays = _run(e.db.get_payments_for_order(oid))
     assert [(p["amount_cents"], p["status"]) for p in pays] == [(30000, "pending")]

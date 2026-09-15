@@ -251,8 +251,10 @@ class Audit:
             p.keyboard.press("Escape")
             p.wait_for_timeout(50)
 
-    def payment_form(self, opener: str, name: str) -> None:
-        """Форма «Как получены деньги»: две строки, вторая — в сумах с курсом."""
+    def payment_form(self, opener: str, name: str, *, accounts: bool = False) -> None:
+        """Форма «Как получены деньги»: две строки, вторая — картой в сумах с
+        курсом и строкой «Куда поступили». `accounts` — ещё лист выбора карты
+        и форма новой карты/счёта поверх оплаты."""
         p = self.page
         if not p.locator(opener).count():
             return
@@ -261,7 +263,26 @@ class Audit:
         p.click(".c-overlay .pay-add-part")
         p.locator(".c-overlay .pay-part").nth(1).locator('[data-pay-cur="UZS"]').click()
         p.wait_for_selector(".c-overlay .pay-part-rate")
+        p.wait_for_selector(".c-overlay .pay-part-account")
         self.check(name, ".c-overlay")
+        if accounts:
+            p.locator(".c-overlay .pay-part-account").last.click()
+            p.wait_for_selector(".c-overlay.pay-account-picker")
+            self.check(f"{name}-card-picker", ".c-overlay.pay-account-picker")
+            p.click(".c-overlay.pay-account-picker .picker-add")
+            p.wait_for_selector(".c-overlay.pay-account-form")
+            self.check(f"{name}-new-card", ".c-overlay.pay-account-form")
+            while p.locator(".c-overlay").count():
+                p.keyboard.press("Escape")
+                p.wait_for_timeout(50)
+            p.locator(opener).first.click()
+            p.wait_for_selector(".c-overlay .pay-part")
+            p.locator(".c-overlay .pay-part").first.locator('[data-pay-method="bank"]').click()
+            p.locator(".c-overlay .pay-part-account").first.click()
+            p.wait_for_selector(".c-overlay.pay-account-picker")
+            p.click(".c-overlay.pay-account-picker .picker-add")
+            p.wait_for_selector(".c-overlay.pay-account-form #ms-f-account_number")
+            self.check(f"{name}-new-bank-account", ".c-overlay.pay-account-form")
         while p.locator(".c-overlay").count():
             p.keyboard.press("Escape")
             p.wait_for_timeout(50)
@@ -329,7 +350,7 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
     audit.idle()
     if not accounting and work:
         # Оплата долга — форма разбивки (при бухгалтерии её заменяет «Получил деньги»).
-        audit.payment_form("#content .btn-pay-debt", "debt-payment-form")
+        audit.payment_form("#content .btn-pay-debt", "debt-payment-form", accounts=True)
         # «Оплата сразу» перед отгрузкой: карточка «Внесите оплату» и форма.
         go(page, "sales")
         tab(page, "orders")
@@ -416,6 +437,14 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
         page.click("#set-rates")
         page.wait_for_selector(".rate-input")
         audit.check("settings-rates")
+        # «Карты и счета»: список, новая запись, правка с архивом.
+        go(page, "settings")
+        audit.idle()
+        page.click("#set-pay-accounts")
+        page.wait_for_selector("#content [data-pay-account]")
+        audit.check("settings-pay-accounts")
+        audit.overlay('#content [data-pay-account-add="bank"]', "settings-pay-account-new-bank")
+        audit.overlay("#content [data-pay-account]", "settings-pay-account-edit")
         go(page, "clients")
         tab(page, "limits")
         audit.idle()

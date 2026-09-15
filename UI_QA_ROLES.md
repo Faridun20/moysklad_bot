@@ -25,13 +25,13 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 160._
+_Всего эндпоинтов: 164._
 
 
 > **Временное совмещение ролей** (`services/roles.py::ROLE_ALSO_ACTS_AS`): `manager` = + `warehouse_keeper`, `bookkeeper`. Кладовщика и бухгалтера в штате пока нет, их работу делает менеджер; списки ниже уже учитывают это. Роли `warehouse_keeper`/`bookkeeper` через `/addrole` не назначаются. `*` в таблице экранов — доступ через совмещение.
 
 
-### Админ (`admin`) — 139 эндпоинтов
+### Админ (`admin`) — 143 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -140,6 +140,10 @@ _Всего эндпоинтов: 160._
 - `/api/orders/ship`
 - `/api/orders/submit`
 - `/api/orders/unfreeze`
+- `/api/pay_accounts`
+- `/api/pay_accounts/archive`
+- `/api/pay_accounts/create`
+- `/api/pay_accounts/update`
 - `/api/payments/link`
 - `/api/payments/pending`
 - `/api/payments/send`
@@ -178,7 +182,7 @@ _Всего эндпоинтов: 160._
 </details>
 
 
-### Руководитель (`boss`) — 136 эндпоинтов
+### Руководитель (`boss`) — 140 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -286,6 +290,10 @@ _Всего эндпоинтов: 160._
 - `/api/orders/set_agent`
 - `/api/orders/ship`
 - `/api/orders/submit`
+- `/api/pay_accounts`
+- `/api/pay_accounts/archive`
+- `/api/pay_accounts/create`
+- `/api/pay_accounts/update`
 - `/api/payments/link`
 - `/api/payments/pending`
 - `/api/payments/unlinked`
@@ -322,7 +330,7 @@ _Всего эндпоинтов: 160._
 </details>
 
 
-### Менеджер (`manager`) — 92 эндпоинтов
+### Менеджер (`manager`) — 96 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -396,6 +404,10 @@ _Всего эндпоинтов: 160._
 - `/api/orders/set_agent`
 - `/api/orders/ship`
 - `/api/orders/submit`
+- `/api/pay_accounts`
+- `/api/pay_accounts/archive`
+- `/api/pay_accounts/create`
+- `/api/pay_accounts/update`
 - `/api/payments/pending`
 - `/api/payments/send`
 - `/api/payments/unlinked`
@@ -507,5 +519,6 @@ _Всего эндпоинтов: 160._
 | Заказы → Техника | admin, boss, manager | `/api/machines/list` |
 | Техника → карточка | admin, boss, manager | `/api/machines/card` |
 | Техника → сделки | admin, boss | `/api/machines/deal` |
+| Оплата → «Куда поступили»; Настройки → Карты и счета | admin, boss, manager (правка и архив — руководство) | `/api/pay_accounts` |
 
 Таблица экранов ручная (какой экран какой эндпоинт зовёт — это знание фронта), списки выше машинные. При расхождении верить спискам.

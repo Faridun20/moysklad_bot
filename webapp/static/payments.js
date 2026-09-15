@@ -11,6 +11,12 @@
 // отгрузкой вносит строки «способ · валюта · сумма (· курс)», итог обязан
 // совпасть с суммой к оплате → только тогда «Отгрузить». Наличные остаются у
 // менеджера до сдачи в кассу, карта и перечисление ждут проверки банка.
+//
+// Карта и перечисление указывают, КУДА пришли деньги: карта (последние 4 цифры
+// и владелец) или расчётный счёт (фирма и номер) из справочника «Карты и счета»
+// (services/pay_accounts.py, `/api/pay_accounts*`). Выбор — лист с поиском
+// (openListPicker), новую запись заводят тут же кнопкой под списком. По
+// умолчанию предлагается последняя выбранная человеком карта/счёт.
 
 // ─── Форма «Как получены деньги» ───────────────────────────────────────────
 
@@ -30,7 +36,8 @@ async function payOpenForm({ orderId, ship = false, onDone }) {
     return;
   }
   const base = ctx.base_currency;
-  const rows = [{ method: 'cash', currency: ctx.currency, amount: '', rate: '' }];
+  payAccountsRemember(ctx.pay_accounts);
+  const rows = [{ method: 'cash', currency: ctx.currency, amount: '', rate: '', account_id: '' }];
   const key = idemKey();
   const title = ship ? 'Оплата перед отгрузкой' : 'Как получены деньги';
   const hint = `Заказ #${ctx.order_id}${ctx.agent_name ? ' · ' + ctx.agent_name : ''} · `
@@ -49,9 +56,12 @@ async function payOpenForm({ orderId, ship = false, onDone }) {
           : 'Заполните суммы');
         return false;
       }
+      const missing = payMissingAccount(rows);
+      if (missing >= 0) { showErr(payMissingAccountText(rows, missing)); return false; }
       const parts = rows.filter(r => payCents(r.amount)).map(r => {
         const out = { method: r.method, currency: r.currency, amount: r.amount };
         if (payRateCurrency(r.currency, ctx.currency, base) && r.rate) out.rate = r.rate;
+        if (r.method !== 'cash' && r.account_id) out.account_id = Number(r.account_id);
         return out;
       });
       const res = await apiResult('/api/orders/payment', { order_id: ctx.order_id, parts, idempotency_key: key });
@@ -76,15 +86,18 @@ async function payOpenForm({ orderId, ship = false, onDone }) {
   function drawTotal() {
     const box = block.querySelector('.pay-total');
     const pv = payPreview(rows, ctx);
+    const missing = payMissingAccount(rows);
     let sub;
     if (pv.missingRate) sub = 'Укажите курс';
     else if (pv.over) sub = `Больше нужного на ${payMoney(pv.total - ctx.due_cents, ctx.currency)}`;
+    else if (missing >= 0) sub = payMissingAccountText(rows, missing);
     else if (pv.left > pv.tolerance) sub = `Осталось внести: ${payMoney(pv.left, ctx.currency)}`;
     else sub = 'Сумма сходится';
+    const warn = pv.over || pv.missingRate || pv.short || missing >= 0;
     box.innerHTML = `
-      <span class="wh-total-label">Внесено из ${escapeHtml(payMoney(ctx.due_cents, ctx.currency))}<br><span class="c-field-hint${pv.over || pv.missingRate || pv.short ? ' acc-warn' : ''}">${escapeHtml(sub)}</span></span>
+      <span class="wh-total-label">Внесено из ${escapeHtml(payMoney(ctx.due_cents, ctx.currency))}<br><span class="c-field-hint${warn ? ' acc-warn' : ''}">${escapeHtml(sub)}</span></span>
       <span class="wh-total-sum">${escapeHtml(payMoney(pv.total, ctx.currency))}</span>`;
-    submitBtn.disabled = !pv.valid;
+    submitBtn.disabled = !pv.valid || missing >= 0;
   }
 
   function rowHtml(r, i) {
@@ -100,6 +113,7 @@ async function payOpenForm({ orderId, ship = false, onDone }) {
           ${seg(ctx.currencies.map(c => [c, c]), r.currency, 'data-pay-cur')}
           ${rows.length > 1 ? `<button type="button" class="pay-toggle pay-part-del" aria-label="Убрать строку">${icon('trash')}</button>` : ''}
         </div>
+        ${r.method !== 'cash' ? payAccountFieldHtml(payAccountFor(r.account_id, r.method), r.method, i + 1) : ''}
         <input class="form-input pay-part-amount" type="text" inputmode="decimal" autocomplete="off"
                placeholder="Сумма, ${escapeHtml(r.currency)}" aria-label="Сумма, строка ${i + 1}" value="${escapeHtml(r.amount)}">
         ${rc ? `
@@ -117,7 +131,7 @@ async function payOpenForm({ orderId, ship = false, onDone }) {
       <div class="debts-list">${rows.map(rowHtml).join('')}</div>
       <button type="button" class="btn-secondary acc-add-line pay-add-part">${icon('plus')} Ещё способ или валюта</button>
       <div class="wh-total pay-total"></div>
-      <div class="c-field-hint">Наличные остаются у вас до сдачи в кассу. Карту и перечисление подтвердит руководитель или бухгалтер, сверив банк.</div>`;
+      <div class="c-field-hint">Наличные остаются у вас до сдачи в кассу. Карту и перечисление подтвердит руководитель или бухгалтер, сверив банк по выбранной карте или счёту.</div>`;
     block.querySelectorAll('.pay-part').forEach(el => {
       const i = Number(el.dataset.part);
       el.querySelector('.pay-part-amount').addEventListener('input', ev => { rows[i].amount = ev.target.value; drawTotal(); });
@@ -127,7 +141,12 @@ async function payOpenForm({ orderId, ship = false, onDone }) {
         rate.addEventListener('input', ev => { rows[i].rate = ev.target.value; drawTotal(); });
       }
       el.querySelectorAll('[data-pay-method]').forEach(b => b.addEventListener('click', () => {
-        haptic('light'); rows[i].method = b.dataset.payMethod; draw();
+        haptic('light'); payRowSetMethod(rows[i], b.dataset.payMethod); draw();
+      }));
+      payOnTap(el.querySelector('.pay-part-account'), () => payOpenAccountPicker({
+        kind: rows[i].method, currency: rows[i].currency, currencies: ctx.currencies,
+        selectedId: rows[i].account_id,
+        onPick: (a) => { rows[i].account_id = a.id; draw(); },
       }));
       el.querySelectorAll('[data-pay-cur]').forEach(b => b.addEventListener('click', () => {
         haptic('light'); rows[i].currency = b.dataset.payCur; rows[i].rate = ''; draw();
@@ -137,8 +156,10 @@ async function payOpenForm({ orderId, ship = false, onDone }) {
     block.querySelector('.pay-add-part').addEventListener('click', () => {
       // Вторая строка — обычно другой способ: карта после наличных.
       const pv = payPreview(rows, ctx);
-      rows.push({ method: rows.length ? 'card' : 'cash', currency: ctx.currency,
-        amount: pv.left > 0 ? String(pv.left / 100) : '', rate: '' });
+      const row = { method: 'cash', currency: ctx.currency,
+        amount: pv.left > 0 ? String(pv.left / 100) : '', rate: '', account_id: '' };
+      payRowSetMethod(row, rows.length ? 'card' : 'cash');
+      rows.push(row);
       draw();
     });
     drawTotal();
@@ -172,4 +193,279 @@ async function payShipOrOpenForm(orderId, onDone) {
     return payOpenForm({ orderId, ship: true, onDone });
   }
   tg.showAlert('❌ ' + res.error);
+}
+
+// ─── Куда поступили: карты и счета ─────────────────────────────────────────
+
+// Справочник на сессию: приходит с контекстом формы (`pay_accounts`) или
+// отдельной ручкой; заведённая/исправленная запись дописывается сюда же, иначе
+// следующий выбор её не покажет.
+let payAccountsState = null;
+
+function payAccountsRemember(data) {
+  if (data) payAccountsState = { accounts: [], last_used: {}, ...data, accounts: [...(data.accounts || [])] };
+  return payAccountsState;
+}
+
+async function payAccountsLoad(opts) {
+  const { force = false } = opts || {};
+  if (!force && payAccountsState) return payAccountsState;
+  return payAccountsRemember(await api('/api/pay_accounts', {}));
+}
+
+function payAccountsUpsert(account) {
+  if (!account) return;
+  if (!payAccountsState) payAccountsState = { accounts: [], last_used: {} };
+  const list = payAccountsState.accounts;
+  const at = list.findIndex(a => Number(a.id) === Number(account.id));
+  if (at >= 0) list[at] = account; else list.push(account);
+}
+
+// Запись по id — только если того же вида, что способ строки.
+function payAccountFor(id, kind) {
+  if (!id || !payAccountsState) return null;
+  const a = (payAccountsState.accounts || []).find(x => Number(x.id) === Number(id));
+  return a && (!kind || a.kind === kind) ? a : null;
+}
+
+// Смена способа строки: у карты/счёта — последний выбор человека, у наличных «куда» нет.
+function payRowSetMethod(row, method) {
+  row.method = method;
+  if (method === 'cash') { row.account_id = ''; return; }
+  if (!payAccountFor(row.account_id, method)) row.account_id = payDefaultAccountId(payAccountsState, method) || '';
+}
+
+function payMissingAccountText(rows, index) {
+  const r = rows[index] || {};
+  const what = r.method === 'card' ? 'на какую карту' : 'на какой счёт';
+  return `${rows.length > 1 ? `Строка ${index + 1}: в` : 'В'}ыберите, ${what} пришли деньги`;
+}
+
+function payOnTap(el, fn) {
+  if (!el) return;
+  el.addEventListener('click', (ev) => { ev.preventDefault(); haptic('light'); fn(); });
+  el.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); fn(); }
+  });
+}
+
+// Лист выбора карты/счёта. Новая запись — кнопкой под списком: карту находят
+// ровно тогда, когда клиент на неё заплатил, и уводить из формы оплаты нельзя.
+function payOpenAccountPicker({ kind, currency, currencies, selectedId, onPick }) {
+  const st = payAccountsState || { accounts: [] };
+  const meta = PAY_ACCOUNT_KIND[kind] || PAY_ACCOUNT_KIND.card;
+  const reopen = () => payOpenAccountPicker({ kind, currency, currencies, selectedId, onPick });
+  const sheet = openListPicker({
+    title: meta.title,
+    hint: kind === 'card' ? 'По этой карте руководитель сверит поступление' : 'По этому счёту руководитель сверит поступление',
+    items: payAccountItems(st.accounts, kind, currency),
+    selectedId,
+    emptyText: meta.empty,
+    onPick: (item) => onPick(item.account),
+    addLabel: meta.add,
+    onAdd: st.can_add === false ? null : (typed) => payOpenAccountForm({
+      kind, currency, currencies, prefill: payAccountPrefill(kind, typed), onDone: onPick,
+    }),
+  });
+  const ov = sheet.sheet;
+  ov.classList.add('pay-account-picker');
+  const input = ov.querySelector('#ms-f-search');
+  if (input) input.placeholder = kind === 'card' ? 'Владелец или последние 4 цифры' : 'Фирма, банк или номер счёта';
+  // Правка и архив: у руководства — «Настройки → Карты и счета», у менеджера
+  // (когда руководителя нет) — отсюда же.
+  if (st.can_manage && (st.accounts || []).some(a => a.kind === kind)) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn-secondary picker-add pay-accounts-manage';
+    btn.innerHTML = `${icon('edit')} Изменить или убрать в архив`;
+    (ov.querySelector('.picker-add') || ov.querySelector('.picker-list')).after(btn);
+    btn.addEventListener('click', () => { sheet.close(); payOpenAccountsManager({ onClose: reopen }); });
+  }
+  return sheet;
+}
+
+function payAccountFields(kind, account, prefill, currency, currencies) {
+  const v = (k) => (account ? account[k] : prefill && prefill[k]) || '';
+  if (kind === 'card') {
+    const curs = (currencies && currencies.length ? currencies : [currency || 'USD']).map(c => [c, c]);
+    return [
+      { key: 'holder', label: 'Владелец карты', required: true, value: v('holder'), placeholder: 'Фаридун М.',
+        autocomplete: 'off' },
+      { key: 'card_last4', label: 'Последние 4 цифры карты', required: true, value: v('card_last4'),
+        placeholder: '1234', inputmode: 'numeric', autocomplete: 'off',
+        hint: 'Полный номер карты не храним — только последние 4 цифры' },
+      { key: 'bank', label: 'Банк', value: v('bank'), placeholder: 'Kapitalbank, Humo, Uzcard' },
+      { key: 'currency', label: 'Валюта карты', type: 'select',
+        value: (account && account.currency) || currency || '', options: curs },
+    ];
+  }
+  return [
+    { key: 'holder', label: 'Фирма или владелец счёта', required: true, value: v('holder'),
+      placeholder: 'ООО Farid Impeks' },
+    { key: 'account_number', label: 'Номер расчётного счёта', required: true, value: v('account_number'),
+      placeholder: '20 цифр', inputmode: 'numeric', maxlength: 24, autocomplete: 'off',
+      hint: 'Валюта счёта — по коду в номере (000 — сумы, 840 — доллары)' },
+    { key: 'bank', label: 'Банк', value: v('bank'), placeholder: 'Kapitalbank' },
+    { key: 'mfo', label: 'МФО банка', value: v('mfo'), placeholder: '01158', inputmode: 'numeric', maxlength: 5 },
+    { key: 'company_tin', label: 'ИНН', value: v('company_tin'), placeholder: '301234567', inputmode: 'numeric',
+      maxlength: 14 },
+  ];
+}
+
+// Новая карта/счёт или правка. Ошибка — внутри формы, набранное не теряется.
+function payOpenAccountForm({ kind, account = null, currency, currencies, prefill, onDone }) {
+  const edit = !!account;
+  const key = idemKey();
+  const meta = PAY_ACCOUNT_KIND[kind] || PAY_ACCOUNT_KIND.card;
+  const sheet = openMachineSheet({
+    title: edit ? (kind === 'card' ? 'Карта' : 'Расчётный счёт') : meta.add,
+    hint: kind === 'card' ? 'Чья карта — по ней руководитель сверит поступление'
+      : 'Чей счёт — по нему руководитель сверит поступление',
+    fields: payAccountFields(kind, account, prefill, currency, currencies || (payAccountsState || {}).currencies),
+    submitLabel: edit ? 'Сохранить' : 'Добавить',
+    onSubmit: async (data, { showErr }) => {
+      const err = payAccountFormError(kind, data);
+      if (err) { showErr(err); return false; }
+      const res = edit
+        ? await apiResult('/api/pay_accounts/update', { account_id: account.id, ...data })
+        : await apiResult('/api/pay_accounts/create', { kind, ...data, idempotency_key: key });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      payAccountsUpsert(res.body.account);
+      toast(edit ? 'Сохранено'
+        : res.body.existed ? (kind === 'card' ? 'Такая карта уже есть — выбрана она' : 'Такой счёт уже есть — выбран он')
+        : (kind === 'card' ? 'Карта добавлена' : 'Счёт добавлен'));
+      if (onDone) onDone(res.body.account);
+      return true;
+    },
+  });
+  sheet.sheet.classList.add('pay-account-form');
+  if (edit && (payAccountsState || {}).can_manage) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn-secondary pay-account-archive';
+    btn.textContent = account.archived ? 'Вернуть из архива' : 'Убрать в архив';
+    sheet.sheet.querySelector('.c-actions').appendChild(btn);
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      const res = await apiResult('/api/pay_accounts/archive', { account_id: account.id, archived: !account.archived });
+      btn.disabled = false;
+      if (!res.ok) { sheet.showErr(res.error); return; }
+      haptic('success');
+      payAccountsUpsert(res.body.account);
+      toast(account.archived ? 'Возвращено из архива' : 'Убрано в архив — на старых платежах останется');
+      sheet.close();
+      if (onDone) onDone(res.body.account);
+    });
+  }
+  return sheet;
+}
+
+function payWireAccountsManager(root, data, { redraw, toggleArchived }) {
+  root.querySelectorAll('[data-pay-account-add]').forEach(b => payOnTap(b, () => payOpenAccountForm({
+    kind: b.dataset.payAccountAdd, currencies: data.currencies, onDone: redraw,
+  })));
+  payOnTap(root.querySelector('[data-pay-accounts-archived]'), toggleArchived);
+  if (!data.can_manage) return;
+  root.querySelectorAll('[data-pay-account]').forEach(row => payOnTap(row, () => {
+    const a = (data.accounts || []).find(x => Number(x.id) === Number(row.dataset.payAccount));
+    if (a) payOpenAccountForm({ kind: a.kind, account: a, currencies: data.currencies, onDone: redraw });
+  }));
+}
+
+// «Настройки → Карты и счета» (руководство): список, новая запись, правка, архив.
+async function payRenderAccountsScreen(onBack) {
+  const gen = screenGen();
+  setScreenContext('Карты и счета');
+  showBack(onBack || (() => showScreen('settings')));
+  document.getElementById('content').innerHTML = skeleton('list', 3);
+  let showArchived = false;
+  let data = null;
+  const paint = () => {
+    const box = document.getElementById('content');
+    box.innerHTML = `<div class="pay-accounts-screen">${payAccountsManagerHtml(data.accounts, {
+      canManage: data.can_manage, canAdd: data.can_add, showArchived,
+      hint: 'Сюда клиенты платят картой и перечислением. Архивная запись не предлагается при оплате, но остаётся на старых платежах.',
+    })}</div>`;
+    payWireAccountsManager(box, data, {
+      redraw: load,
+      toggleArchived: () => { showArchived = !showArchived; paint(); },
+    });
+  };
+  async function load() {
+    try {
+      const got = await api('/api/pay_accounts', { include_archived: true });
+      if (gen !== screenGen()) return;
+      data = got;
+      payAccountsRemember(got);
+    } catch (e) {
+      if (gen !== screenGen()) return;
+      document.getElementById('content').innerHTML = errorBoxHtml(e.message);
+      return;
+    }
+    paint();
+  }
+  await load();
+}
+
+// То же из листа выбора (менеджер без руководителя): шторка поверх формы.
+async function payOpenAccountsManager({ onClose }) {
+  let data;
+  try {
+    data = await api('/api/pay_accounts', { include_archived: true });
+  } catch (e) {
+    toast(e.message, 'error');
+    return;
+  }
+  payAccountsRemember(data);
+  let showArchived = false;
+  const sheet = openMachineSheet({
+    title: 'Карты и счета', hint: data.manage_hint || '', fields: [], submitLabel: 'Готово',
+    onSubmit: async () => { if (onClose) setTimeout(onClose, 0); return true; },
+  });
+  const block = document.createElement('div');
+  block.className = 'pay-accounts-sheet';
+  sheet.sheet.querySelector('#ms-error').before(block);
+  const paint = () => {
+    block.innerHTML = payAccountsManagerHtml(data.accounts, { canManage: data.can_manage, canAdd: data.can_add, showArchived });
+    payWireAccountsManager(block, data, {
+      redraw: async () => {
+        try { data = await api('/api/pay_accounts', { include_archived: true }); payAccountsRemember(data); } catch (_e) { /* покажем прежний список */ }
+        paint();
+      },
+      toggleArchived: () => { showArchived = !showArchived; paint(); },
+    });
+  };
+  paint();
+}
+
+// Строка «Куда поступили» в форме с сегментом способа (поступление по
+// рассрочке): видна у карты и перечисления, значение — в скрытом поле формы.
+async function payMountAccountField(sheetEl, { methodKey, key, currency }) {
+  const hidden = sheetEl.querySelector(`#ms-f-${key}`);
+  const method = sheetEl.querySelector(`#ms-f-${methodKey}`);
+  if (!hidden || !method) return;
+  const field = hidden.closest('.c-field');
+  const box = document.createElement('div');
+  hidden.after(box);
+  if (field) field.hidden = true;
+  try {
+    await payAccountsLoad({ force: true });
+  } catch (_e) {
+    // Список не пришёл — выбор покажет пусто, сервер всё равно проверит.
+  }
+  const draw = () => {
+    const m = method.value;
+    const noncash = m === 'card' || m === 'bank';
+    if (field) field.hidden = !noncash;
+    if (!noncash) { hidden.value = ''; box.innerHTML = ''; return; }
+    if (!payAccountFor(hidden.value, m)) hidden.value = String(payDefaultAccountId(payAccountsState, m) || '');
+    box.innerHTML = payAccountFieldHtml(payAccountFor(hidden.value, m), m, 0);
+    payOnTap(box.querySelector('.pay-part-account'), () => payOpenAccountPicker({
+      kind: m, currency, currencies: (payAccountsState || {}).currencies, selectedId: hidden.value,
+      onPick: (a) => { hidden.value = String(a.id); draw(); },
+    }));
+  };
+  sheetEl.querySelectorAll('.seg-item[data-opt]').forEach(b => b.addEventListener('click', () => setTimeout(draw, 0)));
+  draw();
 }

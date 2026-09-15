@@ -356,9 +356,20 @@ def _service_flows(db, tag: str) -> None:
     mgr_actor = order_payments.Actor(MGR, "Manager", "manager")
     # Свой курс менеджеру — только рядом с курсом ЦБ (manual_rate_refusal).
     assert db.set_currency_rate("UZS", 1 / 12700, BOSS)[0]
+    # Куда поступили карта и перечисление — записи справочника (FK на acc_accounts,
+    # CHECK хвоста карты и 20 цифр счёта); архив и правка владельца — тоже здесь.
+    from services import pay_accounts
+
+    boss_pa = pay_accounts.Actor(BOSS, "Boss", "boss")
+    bank_acc = _run(pay_accounts.create_account(boss_pa, {
+        "kind": "bank", "holder": f"ООО Farid {tag}", "account_number": "20208840900112230001",
+        "mfo": "01158", "company_tin": "301234567"}))["account"]
+    _run(pay_accounts.update_account(boss_pa, bank_acc["id"], {"bank": "Kapitalbank"}))
     rec = _run(order_payments.record_payment_parts(paid, mgr_actor, [
         {"method": "cash", "currency": "USD", "amount": "120"},
-        {"method": "card", "currency": "UZS", "amount": "1016000", "rate": "12700"},
+        {"method": "card", "currency": "UZS", "amount": "1016000", "rate": "12700",
+         "account_id": _run(pay_accounts.create_account(boss_pa, {
+             "kind": "card", "holder": f"Фаридун {tag}", "card_last4": "1234"}))["account"]["id"]},
     ]))
     assert rec["superseded"] and rec["total_cents"] == 20_000, rec
     assert _run(db.mark_order_shipped(paid, BOSS, "Boss"))["ok"]
@@ -463,7 +474,8 @@ def _service_flows(db, tag: str) -> None:
     assert again["ok"], again
     done = _run(mdr.approve(rid, **bs))
     assert done["ok"] and done["deal_id"] and done["status"] == "on_credit", done
-    assert _run(machines.add_receipt(done["deal_id"], 360_000, user_id=BOSS))["ok"]
+    assert _run(machines.add_receipt(done["deal_id"], 360_000, user_id=BOSS, method="bank",
+                                     account_id=bank_acc["id"]))["ok"]
     other = _run(machines.create_machine(vin=f"PGSALE{tag}", name="JCB 3CX", created_by=BOSS,
                                          status="in_stock"))
     sold = _run(mdr.submit(other["machine_id"], kind="sale", price_cents=500_000,
@@ -500,6 +512,8 @@ def test_constraints_hold_for_real_service_flows(pg_db):
         ("machine_deal_requests", "status = 'approved' AND approval_mode = 'boss'"),
         ("machine_deal_requests", "status = 'approved' AND approval_mode = 'auto'"),
         ("machine_deal_requests", "status = 'rejected'"),
+        ("payment_part_accounts", "TRUE"), ("machine_receipt_accounts", "TRUE"),
+        ("acc_account_details", "account_number IS NOT NULL"),
     ):
         n = _one(db, f"SELECT COUNT(*) AS n FROM {table} WHERE {where}")["n"]
         assert n > 0, table

@@ -170,7 +170,10 @@ async def gather() -> dict:
 
     def _payment_line(p: dict) -> str:
         part = parts.get(int(p["id"]))
-        method = order_payments.METHODS.get(part["method"], "—") if part else "без способа"
+        # Карта/счёт — «на карту •••• 1234 (Фаридун М.)»: руководитель сверяет
+        # банк по этой строке, способ без получателя ему ничего не говорит.
+        method = (part.get("account_label") or order_payments.METHODS.get(part["method"], "—")) \
+            if part else "без способа"
         order = f" · заказ #{p['order_id']}" if p.get("order_id") else ""
         return (
             f"{p.get('full_name') or p.get('user_id')} — "

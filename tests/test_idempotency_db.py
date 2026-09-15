@@ -17,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import webapp.server as server
+from tests.conftest import pay_account_id
 
 
 @pytest.fixture
@@ -77,7 +78,7 @@ def test_mark_paid_same_key_creates_one_payment(client_env):
     body = {
         "initData": str(ids["mgr"]),
         "order_id": oid,
-        "parts": [{"method": "card", "currency": "USD", "amount": 100}],
+        "parts": [{"method": "card", "currency": "USD", "amount": 100, "account_id": pay_account_id("card")}],
         "idempotency_key": "same-key",
     }
 
@@ -103,7 +104,7 @@ def test_mark_paid_distinct_keys_create_two_payments(client_env):
             json={
                 "initData": str(ids["mgr"]),
                 "order_id": oid,
-                "parts": [{"method": "card", "currency": "USD", "amount": 100}],
+                "parts": [{"method": "card", "currency": "USD", "amount": 100, "account_id": pay_account_id("card")}],
                 "idempotency_key": key,
             },
         )
@@ -117,7 +118,7 @@ def test_confirm_payment_same_key_confirms_once(client_env):
     oid = _credit_order(db, ids["mgr"])
     client.post(
         "/api/orders/mark_paid",
-        json={"initData": str(ids["mgr"]), "order_id": oid, "parts": [{"method": "card", "currency": "USD", "amount": 100}]},
+        json={"initData": str(ids["mgr"]), "order_id": oid, "parts": [{"method": "card", "currency": "USD", "amount": 100, "account_id": pay_account_id("card")}]},
     )
     body = {"initData": str(ids["boss"]), "order_id": oid, "idempotency_key": "confirm-1"}
 
@@ -142,7 +143,7 @@ def test_key_is_scoped_per_user(client_env):
         json={
             "initData": str(ids["mgr"]),
             "order_id": o1,
-            "parts": [{"method": "card", "currency": "USD", "amount": 10}],
+            "parts": [{"method": "card", "currency": "USD", "amount": 10, "account_id": pay_account_id("card")}],
             "idempotency_key": "shared",
         },
     )
@@ -151,7 +152,7 @@ def test_key_is_scoped_per_user(client_env):
         json={
             "initData": str(ids["boss"]),
             "order_id": o2,
-            "parts": [{"method": "card", "currency": "USD", "amount": 10}],
+            "parts": [{"method": "card", "currency": "USD", "amount": 10, "account_id": pay_account_id("card")}],
             "idempotency_key": "shared",
         },
     )
@@ -170,7 +171,7 @@ def test_key_survives_process_restart(client_env):
     body = {
         "initData": str(ids["mgr"]),
         "order_id": oid,
-        "parts": [{"method": "card", "currency": "USD", "amount": 100}],
+        "parts": [{"method": "card", "currency": "USD", "amount": 100, "account_id": pay_account_id("card")}],
         "idempotency_key": "survives",
     }
 
@@ -233,7 +234,7 @@ def test_in_flight_key_conflicts(client_env):
         json={
             "initData": str(ids["mgr"]),
             "order_id": oid,
-            "parts": [{"method": "card", "currency": "USD", "amount": 100}],
+            "parts": [{"method": "card", "currency": "USD", "amount": 100, "account_id": pay_account_id("card")}],
             "idempotency_key": "in-flight",
         },
     )

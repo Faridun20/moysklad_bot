@@ -676,7 +676,10 @@ def test_receipt_endpoint_failure_before_commit_frees_the_key(isolated_db, monke
         raise RuntimeError("упало до коммита")
 
     monkeypatch.setattr(machines, "_insert_receipt_locked", boom)
-    body = dict(deal_id=deal["deal_id"], amount="4000", method="card", idempotency_key="rk-2")
+    from tests.conftest import pay_account_id
+
+    body = dict(deal_id=deal["deal_id"], amount="4000", method="card", account_id=pay_account_id("card"),
+                idempotency_key="rk-2")
     with pytest.raises(RuntimeError):
         _post(client, "/api/machines/receipt", 1, **body)
     monkeypatch.setattr(machines, "_insert_receipt_locked", real)
@@ -744,3 +747,34 @@ def test_receipt_endpoint_overpay_codes(isolated_db, monkeypatch):
     r = _post(client, "/api/machines/receipt", 2, overpay=True, **body)
     assert r.status_code == 200 and r.json()["deal_closed"] is True
     assert len(_run(machines.list_receipts(deal["deal_id"]))) == 1
+
+
+def test_receipt_to_card_with_overpay_and_retry_keeps_one_account_link(isolated_db, monkeypatch):
+    """«Куда поступили» (карта справочника) вместе с переплатой руководства и
+    идемпотентностью ручки: отказ needs_force ключ и ссылку не оставляет,
+    подтверждённая переплата пишет одну ссылку, ретрай с тем же ключом —
+    тот же ответ без второго поступления."""
+    from services import machines
+    from tests.conftest import pay_account_id
+
+    db = isolated_db
+    _setup(db)
+    deal = _credit(_machine(), months=5)          # остаток 20 000
+    client = _client(monkeypatch)
+    card = pay_account_id("card")
+    body = dict(deal_id=deal["deal_id"], amount="21000", method="card", account_id=card, idempotency_key="ov-1")
+    r = _post(client, "/api/machines/receipt", 2, **body)
+    assert r.status_code == 409 and r.json().get("needs_force"), r.text
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute("SELECT COUNT(*) FROM machine_receipt_accounts")
+        assert cur.fetchone()[0] == 0
+    r1 = _post(client, "/api/machines/receipt", 2, overpay=True, **body)
+    r2 = _post(client, "/api/machines/receipt", 2, overpay=True, **body)
+    assert r1.status_code == 200 and r2.json() == r1.json(), (r1.text, r2.text)
+    receipts = _run(machines.list_receipts(deal["deal_id"]))
+    assert len(receipts) == 1 and receipts[0]["account_label"] == "на карту •••• 1234 (Фаридун М.)"
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute("SELECT COUNT(*) FROM machine_receipt_accounts")
+        assert cur.fetchone()[0] == 1

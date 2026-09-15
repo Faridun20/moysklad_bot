@@ -218,6 +218,15 @@ def _checks() -> list[Check]:
               ("id", "doc_id", "rate_source"), "источник курса"),
         Check("acc_day_closes_counted_chk", "acc_day_closes", "counted_cents >= 0",
               ("id", "account_id", "counted_cents"), "пересчитанная сумма ≥ 0"),
+        # ── Карты и счета «куда поступили» (services.pay_accounts) ──
+        # Номер карты целиком не хранится: в card_last4 — ровно 4 цифры или
+        # ничего; расчётный счёт — 20 цифр.
+        Check("acc_accounts_card_last4_chk", "acc_accounts",
+              "card_last4 IS NULL OR card_last4 ~ '^[0-9]{4}$'", ("id", "card_last4"),
+              "последние 4 цифры карты (полный номер не храним)"),
+        Check("acc_account_details_number_chk", "acc_account_details",
+              "account_number IS NULL OR account_number ~ '^[0-9]{20}$'",
+              ("account_id", "account_number"), "расчётный счёт — 20 цифр"),
     ]
 
 
@@ -282,6 +291,14 @@ FOREIGN_KEYS: list[ForeignKey] = [
     ForeignKey("acc_docs_order_fk", "acc_docs", "order_id", "orders"),
     ForeignKey("acc_docs_payment_fk", "acc_docs", "payment_id", "payments"),
     ForeignKey("acc_docs_deal_fk", "acc_docs", "deal_id", "machine_deals"),
+    # Куда поступили деньги (карта/счёт справочника). Записи справочника не
+    # удаляются — только архив; строки разбивки и поступления тоже не удаляются
+    # раньше своих ссылок (`machines._delete_receipt_locked` чистит ссылку первой).
+    ForeignKey("payment_part_accounts_part_fk", "payment_part_accounts", "part_id", "payment_parts"),
+    ForeignKey("payment_part_accounts_account_fk", "payment_part_accounts", "account_id", "acc_accounts"),
+    ForeignKey("machine_receipt_accounts_account_fk", "machine_receipt_accounts", "account_id",
+               "acc_accounts"),
+    ForeignKey("acc_account_details_account_fk", "acc_account_details", "account_id", "acc_accounts"),
 ]
 
 # UNIQUE-индексы из `_index_ddls`, под которые заранее ищутся дубли:
@@ -295,6 +312,9 @@ UNIQUE_KEYS: dict[str, tuple[str, tuple[str, ...], str]] = {
     "idx_return_items_return_item": ("return_items", ("return_id", "order_item_id"), "TRUE"),
     "idx_acc_day_closes_doc": ("acc_day_closes", ("doc_id",), "doc_id IS NOT NULL"),
     "idx_payment_parts_payment": ("payment_parts", ("payment_id",), "TRUE"),
+    "idx_acc_account_details_number": (
+        "acc_account_details", ("account_number",), "account_number IS NOT NULL"
+    ),
 }
 
 
