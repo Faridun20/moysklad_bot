@@ -43,9 +43,9 @@ def test_validate_unknown_status_is_rejected():
 
 def test_manager_can_only_submit_draft():
     assert can_transition(_order("draft"), "pending", "manager") is True
-    # Менеджер не апрувит и не отгружает
+    # Менеджер не апрувит. Отгружать — пока может: замещает кладовщика
+    # (services.roles.ROLE_ALSO_ACTS_AS, tests/test_roles_manager_acts_as.py).
     assert can_transition(_order("pending"), "approved", "manager") is False
-    assert can_transition(_order("approved"), "shipped", "manager") is False
 
 
 def test_boss_can_approve_and_reject_pending():

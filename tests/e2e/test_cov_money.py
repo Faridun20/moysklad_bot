@@ -176,7 +176,9 @@ def _add_manager2(e2e) -> None:
 @pytest.mark.parametrize(("who", "tabs", "active"), [
     ("boss", ["confirm", "debts", "ops", "report"], "confirm"),
     ("admin", ["confirm", "debts", "ops", "report"], "confirm"),
-    ("mgr", ["debts", "ops"], "debts"),
+    # «Подтвердить» у менеджера — пока он замещает кладовщика и бухгалтера
+    # (services.roles.ROLE_ALSO_ACTS_AS); при откате — ["debts", "ops"].
+    ("mgr", ["confirm", "debts", "ops"], "confirm"),
     ("keeper", [], None),
     ("book", [], None),
 ])
@@ -208,10 +210,10 @@ FORBIDDEN = {
         ("/api/money/summary", {"period": "month"}), ("/api/cash/history", {}),
         ("/api/money/forecast", {}), ("/api/money/discipline", {}),
         ("/api/payments/pending", {}), ("/api/orders/confirm_payment", {"order_id": "PAID"}),
-        ("/api/orders/reject_payment", {"order_id": "PAID"}), ("/api/deposits/pending", {}),
-        ("/api/deposits/confirm", {"deposit_id": "DEP"}),
-        ("/api/deposits/reject", {"deposit_id": "DEP", "reason": "не та сумма"}),
-        ("/api/returns/pending", {}), ("/api/returns/goods_received", {"return_id": 1}),
+        ("/api/orders/reject_payment", {"order_id": "PAID"}),
+        # Сдачи и приёмка возврата менеджеру пока открыты — он замещает бухгалтера
+        # и кладовщика (ROLE_ALSO_ACTS_AS, tests/e2e/test_manager_acts_as.py).
+        # Подтверждение возврата остаётся руководству.
         ("/api/returns/confirm", {"return_id": 1}),
     ],
     "keeper": [

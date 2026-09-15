@@ -281,7 +281,15 @@ def _section_count(summary: dict, key: str) -> int:
 def build_daily_ping(role: str, summary: dict) -> str | None:
     """Короткий текст пинга для роли. None — если для роли нечего показать
     (нет релевантных секций ИЛИ всё по нулям → не спамим)."""
+    from services.roles import effective_roles
+
+    # Совмещение ролей: менеджер пока замещает кладовщика и бухгалтера
+    # (services.roles.ROLE_ALSO_ACTS_AS) — берёт их секции, раз своих у него нет.
     keys = _PING_ROLE_SECTIONS.get(role)
+    if not keys:
+        keys = list(dict.fromkeys(
+            k for r in effective_roles(role) for k in _PING_ROLE_SECTIONS.get(r, [])
+        ))
     if not keys:
         return None
     lines: list[str] = []
@@ -293,7 +301,7 @@ def build_daily_ping(role: str, summary: dict) -> str | None:
             lines.append(f"  {_PING_SECTION_LABELS[k]}: {n}")
     if total == 0:
         return None
-    header, footer = _PING_HEADERS[role]
+    header, footer = _PING_HEADERS.get(role, ("📲 <b>Сводка</b>", "Детали в WebApp."))
     return f"{header}\n\nТребует внимания: <b>{total}</b>\n" + "\n".join(lines) + f"\n\n{footer}"
 
 

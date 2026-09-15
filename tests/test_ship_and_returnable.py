@@ -135,10 +135,12 @@ def test_api_ship_by_warehouse(client_env):
     assert asyncio.run(db.get_order(ids["order"]))["status"] == "shipped"
 
 
-def test_api_ship_forbidden_for_manager(client_env):
+def test_api_ship_forbidden_for_guest(client_env):
+    # Было «для менеджера»: пока он замещает кладовщика (ROLE_ALSO_ACTS_AS),
+    # отгрузка ему разрешена — отказ проверяем на госте.
     client, db, ids = client_env
     resp = client.post(
-        "/api/orders/ship", json={"initData": str(ids["mgr"]), "order_id": ids["order"]}
+        "/api/orders/ship", json={"initData": "999", "order_id": ids["order"]}
     )
     assert resp.status_code == 403
     assert asyncio.run(db.get_order(ids["order"]))["status"] == "approved"

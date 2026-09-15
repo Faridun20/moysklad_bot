@@ -244,7 +244,8 @@ def test_forbidden_sales_actions_are_refused_by_server(open_app, e2e):
             ("/api/requests/approve", {"req_id": pending["req_id"]}),
             ("/api/requests/reject", {"req_id": pending["req_id"]}),
             ("/api/requests/return_to_draft", {"req_id": pending["req_id"], "comment": "Исправьте"}),
-            ("/api/orders/ship", {"order_id": approved["order_id"]}),
+            # /api/orders/ship менеджеру пока открыт: он замещает кладовщика
+            # (ROLE_ALSO_ACTS_AS, tests/e2e/test_manager_acts_as.py).
             ("/api/orders/cancel", {"order_id": approved["order_id"], "reason": "Просто так"}),
             ("/api/orders/requests", {}),
             ("/api/orders/unfreeze", {"order_id": draft}),
@@ -735,8 +736,10 @@ def test_manager_drafts_filter_shows_returned_draft_with_comment(open_app, e2e):
     assert card.locator(".btn-edit-order").count() == 1 and card.locator(".btn-delete-draft").count() == 1
     _filter(mgr, "approved")
     assert _card_ids(mgr) == {approved}
-    # Менеджеру одобренный заказ не отгрузить и не отменить.
-    assert mgr.locator(".btn-ship-order, .btn-cancel-order").count() == 0
+    # Отменить одобренный менеджер не может. Отгрузить — пока может: замещает
+    # кладовщика (ROLE_ALSO_ACTS_AS).
+    assert mgr.locator(".btn-cancel-order").count() == 0
+    assert mgr.locator(f'.btn-ship-order[data-id="{approved}"]').count() == 1
 
 
 def test_order_cards_show_payment_state(open_app, e2e):

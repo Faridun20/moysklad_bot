@@ -156,13 +156,15 @@ def _authorize(
     # и allowed_roles=None (свои-данные эндпоинты): уволенный не должен дёргать
     # даже их. Через короткий деакт-кэш (TTL 30с, инвалидируется при
     # deactivate/reactivate) — иначе это был бы SELECT на КАЖДЫЙ /api/* запрос.
-    from services.roles import cached_is_deactivated
+    from services.roles import cached_is_deactivated, role_allowed
 
     if cached_is_deactivated(user["id"]):
         raise HTTPException(status_code=403, detail="Доступ деактивирован")
     if allowed_roles is not None:
         role = get_role(user["id"])
-        if role not in allowed_roles:
+        # role_allowed, а не `in`: менеджер временно замещает кладовщика и
+        # бухгалтера (services.roles.ROLE_ALSO_ACTS_AS) — одна точка на все ручки.
+        if not role_allowed(role, allowed_roles):
             raise HTTPException(status_code=403, detail="Нет доступа")
     if rate_limit_scope:
         if not rate_limit_acquire(rate_limit_scope, user["id"], rate_limit_max, rate_limit_window):
@@ -2752,6 +2754,20 @@ async def api_orders(request: Request):
         ]
     else:
         orders = await adb.get_user_orders(user["id"])
+        from services.roles import role_allowed
+
+        if role_allowed(role, ("warehouse_keeper",)):
+            # Совмещение ролей: менеджер отгружает за кладовщика, поэтому к своим
+            # заказам добавляем чужие одобренные/отгруженные — иначе кнопке
+            # «Отгрузить» не на чем появиться.
+            own_ids = {o["id"] for o in orders}
+            to_ship = [
+                o for o in await adb.get_all_orders()
+                if o.get("status") in ("approved", "shipped") and o["id"] not in own_ids
+            ]
+            orders = sorted(
+                [*orders, *to_ship], key=lambda o: o.get("created_at") or "", reverse=True
+            )
 
     from config import BASE_CURRENCY
 
@@ -5037,6 +5053,9 @@ async def api_returns_create(request: Request):
             status_code=409, detail="Возврат доступен только для отгруженных/оплаченных"
         )
     # H2: менеджер вправе вернуть только свой заказ; начальство/склад — любой.
+    # Сознательно `in`, а не role_allowed: совмещение ролей (менеджер замещает
+    # кладовщика) НЕ снимает H2 — возврат чужого заказа двигает чужой долг, и
+    # принимать товар за кладовщика для этого не нужно.
     privileged = get_role(user["id"]) in ("admin", "boss", "warehouse_keeper")
     if not privileged and order.get("user_id") != user["id"]:
         raise HTTPException(status_code=403, detail="Возврат только по своим заказам")

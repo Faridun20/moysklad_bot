@@ -13,6 +13,7 @@ allowed_roles в `_authorize` каждого /api/*. Другого источн
 """
 
 import time
+from collections.abc import Collection
 
 from config import ADMIN_IDS
 from services.database import (
@@ -22,7 +23,76 @@ from services.database import (
 
 # Re-export единого whitelist ролей (определён в services.database, чтобы не
 # было циклического импорта). Используется и в handlers/users для валидации.
-__all__ = ["VALID_ROLES"]
+__all__ = [
+    "ASSIGNABLE_ROLES",
+    "PAUSED_ROLES",
+    "ROLE_ALSO_ACTS_AS",
+    "VALID_ROLES",
+    "effective_roles",
+    "notify_recipients",
+    "role_allowed",
+]
+
+# ─── ВРЕМЕННОЕ совмещение ролей (решение владельца, сентябрь 2026) ───────────
+#
+# Кладовщика и бухгалтера в штате пока нет: всю операционку ведёт менеджер, а
+# руководитель проверяет его работу. Поэтому менеджер ДОПОЛНИТЕЛЬНО действует
+# как warehouse_keeper и bookkeeper: подтверждает сдачи наличных, отмечает
+# «товар по возврату получен», отгружает одобренные заказы.
+#
+# Совмещение живёт в ОДНОМ месте, а не в полусотне кортежей `allowed_roles`:
+# каждая проверка «роль ∈ разрешённых» идёт через `role_allowed` (`_authorize`
+# в webapp, `_has_role` здесь, граф переходов заказа), и откат — одна строка.
+# Оно только ДОБАВЛЯЕТ права ролей из правой части. То, что есть лишь у
+# admin/boss (себестоимость, прибыль, одобрение заявок, подтверждение возврата,
+# расходная накладная), не выдаётся: ни у кладовщика, ни у бухгалтера этого нет.
+#
+# Зеркало для фронта — `ROLE_ALSO_ACTS_AS` в webapp/static/helpers.js (сверяет
+# tests/test_roles_manager_acts_as.py). КАК ОТКАТИТЬ, когда появятся сотрудники:
+# очистить оба словаря и `PAUSED_ROLES` — роли и их проверки в коде живы.
+ROLE_ALSO_ACTS_AS: dict[str, tuple[str, ...]] = {
+    "manager": ("warehouse_keeper", "bookkeeper"),
+}
+
+# Роли, которые сейчас не НАЗНАЧАЮТСЯ (/addrole их не принимает): их права у
+# менеджера. Уже назначенные пользователи продолжают работать как раньше.
+PAUSED_ROLES: tuple[str, ...] = ("warehouse_keeper", "bookkeeper")
+ASSIGNABLE_ROLES: tuple[str, ...] = tuple(r for r in VALID_ROLES if r not in PAUSED_ROLES)
+
+
+def effective_roles(role: str) -> tuple[str, ...]:
+    """Роль плюс роли, которые она временно замещает (`ROLE_ALSO_ACTS_AS`)."""
+    return (role, *ROLE_ALSO_ACTS_AS.get(role, ()))
+
+
+def role_allowed(role: str, allowed: Collection[str]) -> bool:
+    """Пускает ли список `allowed` роль `role` с учётом совмещения.
+
+    Единственная точка сверки «роль ∈ разрешённых»: так совмещение нельзя
+    забыть в новой ручке и нельзя откатить наполовину.
+    """
+    return any(r in allowed for r in effective_roles(role))
+
+
+def notify_recipients(users: list[dict], roles: tuple[str, ...]) -> list[int]:
+    """user_id получателей карточки-решения, адресованной ролям `roles`.
+
+    Замещающий (менеджер) получает карточку, только если НИ ОДНОГО активного
+    носителя замещаемой роли нет: при живом кладовщике менеджерам незачем
+    дублировать его уведомления. Деактивированные не получают ничего — они
+    потеряли все права (#32), и кнопка у них всё равно ответит отказом.
+    """
+    active = [u for u in users if not u.get("deactivated_at")]
+    held = {u.get("role") for u in active}
+    out: list[int] = []
+    for u in active:
+        role = u.get("role") or ""
+        if role in roles or any(
+            r in roles and r not in held for r in ROLE_ALSO_ACTS_AS.get(role, ())
+        ):
+            out.append(u["user_id"])
+    return out
+
 
 # ─── Один кэш на роль и деактивацию ──────────────────────────────────────────
 #
@@ -94,7 +164,7 @@ def _has_role(user_id: int, *roles: str) -> bool:
     """
     if user_id in ADMIN_IDS:
         return True
-    return _cached_role(user_id) in roles
+    return role_allowed(_cached_role(user_id), roles)
 
 
 def is_guest(user_id: int) -> bool:
@@ -169,6 +239,11 @@ def can_confirm_shipment(user_id: int) -> bool:
 def can_create_return(user_id: int) -> bool:
     """Оформить возврат."""
     return _has_role(user_id, "admin", "boss", "warehouse_keeper", "manager")
+
+
+def can_mark_return_goods_received(user_id: int) -> bool:
+    """Отметить «товар по возврату получен» (кнопка ret_got / WebApp)."""
+    return _has_role(user_id, "admin", "boss", "warehouse_keeper")
 
 
 def can_confirm_return(user_id: int) -> bool:

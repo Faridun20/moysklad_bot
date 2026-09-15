@@ -52,10 +52,18 @@ async def cmd_addrole(message: Message):
     # Whitelist — единый источник из services.database (через roles).
     # Раньше тут была своя копия, рассинхрон с set_role давал silent-fail.
     role = parts[2].lower()
-    from services.roles import VALID_ROLES
+    from services.roles import ASSIGNABLE_ROLES, PAUSED_ROLES
 
-    if role not in VALID_ROLES:
-        return await message.answer(f"❌ Роль должна быть одной из: {', '.join(VALID_ROLES)}")
+    # Кладовщик и бухгалтер пока не назначаются: их права у менеджера
+    # (services.roles.ROLE_ALSO_ACTS_AS). Уже назначенные продолжают работать.
+    if role in PAUSED_ROLES:
+        return await message.answer(
+            f"❌ Роль {ROLE_NAMES.get(role, role)} сейчас не назначается — "
+            "её работу выполняет менеджер. Назначьте <code>manager</code>.",
+            parse_mode="HTML",
+        )
+    if role not in ASSIGNABLE_ROLES:
+        return await message.answer(f"❌ Роль должна быть одной из: {', '.join(ASSIGNABLE_ROLES)}")
 
     ok = await adb.set_role(target_id, "", "", role)
     if not ok:
@@ -120,7 +128,11 @@ async def show_users(message):
             f"{role_name}\n  {esc(name)}{esc(username)}\n  ID: <code>{u['user_id']}</code>{flag}\n"
         )
 
-    lines.append("\n<i>Роль:</i> <code>/addrole [ID] [admin/boss/manager/employee]</code>")
+    # Подсказка — из того же списка, что проверяет /addrole (была «employee»,
+    # которой нет среди ролей).
+    from services.roles import ASSIGNABLE_ROLES
+
+    lines.append(f"\n<i>Роль:</i> <code>/addrole [ID] [{'/'.join(ASSIGNABLE_ROLES)}]</code>")
     lines.append("<i>Доступ:</i> <code>/deactivate [ID]</code> · <code>/reactivate [ID]</code>")
     await message.answer("\n".join(lines), parse_mode="HTML")
 

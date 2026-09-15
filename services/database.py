@@ -3499,12 +3499,18 @@ async def get_manager_cash_deposits(manager_id: int, limit: int = 20) -> list[di
 
 
 def get_deposit_confirmers() -> list[int]:
-    """user_id ролей, которые подтверждают сдачи: admin/boss/bookkeeper."""
+    """user_id ролей, которые подтверждают сдачи: admin/boss/bookkeeper.
+
+    Пока бухгалтера нет, карточку получают и менеджеры — они замещают его
+    (`services.roles.ROLE_ALSO_ACTS_AS`). Импорт внутри: roles импортирует
+    database на уровне модуля."""
+    from services.roles import notify_recipients
+
     try:
         users = get_all_users()
     except Exception:
         return []
-    return [u["user_id"] for u in users if u["role"] in ("admin", "boss", "bookkeeper")]
+    return notify_recipients(users, ("admin", "boss", "bookkeeper"))
 
 
 async def get_pending_cash_deposits() -> list[dict]:
