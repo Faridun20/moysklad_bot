@@ -3332,54 +3332,23 @@ function orderDateLabel(key) {
   return formatDateRU(key);
 }
 
-async function renderOrders() {
-  const content = document.getElementById('content');
-  const gen = screenGen();
-  // Кэш заказов: переключение вкладок (Заказы↔Каталог↔Финансы) не должно
-  // каждый раз дёргать /api/orders. Мутации (delete/ship/cancel) ставят
-  // ordersData = null — это форсит свежую загрузку ниже.
-  if (!ordersData || Date.now() - ordersDataTs > ORDERS_TTL_MS) {
-    content.innerHTML = salesShellHtml() + loading('Загружаю заказы…');
-    wireSectionNav(content, 'sales', renderSalesScreen);
-    try {
-      ordersData = await api('/api/orders', {});
-      ordersDataTs = Date.now();
-    } catch (e) {
-      content.innerHTML = salesShellHtml() + errorBox(e.message);
-      wireSectionNav(content, 'sales', renderSalesScreen);
-      return;
-    }
-  }
-  // Пока грузились, человек ушёл (другой раздел или вкладка «Отчёт») —
-  // renderOrdersMain ищет #content заново и затёр бы чужой экран.
-  if (gen !== screenGen()) return;
-  renderOrdersMain();
-}
+// ─── Страницы списка заказов ─────────────────────────
+// /api/orders отдавал все заказы роли разом, с позициями: у руководства за год
+// это мегабайты на каждый вход во вкладку по мобильной сети. Теперь список
+// приходит страницами, а фильтры статуса и периода уходят на сервер — иначе
+// «Показать ещё» листал бы нефильтрованный список, и под фильтром на странице
+// оставалась бы пара заказов из пятидесяти.
+const ORDERS_PAGE_SIZE = 50;
 
-function renderOrdersMain() {
-  // Список заказов — корневой вид вкладки. Прячем нативную «Назад»
-  // на случай возврата из вложенного экрана (редактор, заявки).
-  hideBack();
-  const content = document.getElementById('content');
-  const { orders, role } = ordersData;
-  const isBoss = role === 'admin' || role === 'boss';
-  const canShip = isBoss || role === 'warehouse_keeper';
-  // «Новый заказ» — только менеджеру. Было `!isBoss`, то есть и кладовщику с
-  // бухгалтером, а /api/orders/create им отвечает 403 (can_create_orders:
-  // admin/boss/manager). Руководству кнопку не рисуем и раньше: заказы
-  // заводят менеджеры, руководство их разбирает.
-  const canCreate = role === 'manager';
-
-  // Боссу фильтр «черновики» бесполезен (это незавершённые заявки менеджеров) —
-  // заменяем на «отгружено». Менеджеру черновики нужны (свои незаконченные).
-  // Короткие подписи вместо одних иконок (UI-бриф п.5): часы/галочка/грузовик
-  // без слов приходилось расшифровывать. Ряд скроллится, если не влезает.
-  // «Отменены» — это оба исхода «продажа не состоялась»: заявку отклонили
-  // (rejected) или одобренный заказ отменили (cancelled). Фильтр искал только
-  // rejected, и отменённый боссом заказ не находился ни под одной кнопкой,
-  // кроме «Все». Какой именно исход — видно по бейджу статуса на карточке.
-  const CANCELLED_STATUSES = ['rejected', 'cancelled'];
-  const filters = isBoss
+// Фильтры статуса по роли. Боссу «черновики» бесполезны (это незавершённые
+// заявки менеджеров) — вместо них «отгружено»; менеджеру черновики нужны.
+// «Отменены» — оба исхода «продажа не состоялась»: заявку отклонили
+// (rejected) или одобренный заказ отменили (cancelled). Фильтр искал только
+// rejected, и отменённый боссом заказ не находился ни под одной кнопкой,
+// кроме «Все». Какой именно исход — видно по бейджу статуса на карточке.
+const CANCELLED_STATUSES = ['rejected', 'cancelled'];
+function orderFilters(isBoss) {
+  return isBoss
     ? [
         { id: 'all', label: 'Все', ic: '' },
         { id: 'pending', label: 'Ждут', ic: 'clock' },
@@ -3394,6 +3363,120 @@ function renderOrdersMain() {
         { id: 'approved', label: 'Одобрены', ic: 'check' },
         { id: 'rejected', label: 'Отменены', ic: 'close', statuses: CANCELLED_STATUSES },
       ];
+}
+
+// Период фильтра → даты YYYY-MM-DD. Считает ТЕЛЕФОН, а не сервер: «сегодня»
+// у человека на площадке, пояс сервера может быть другим. Та же арифметика,
+// что в orderInPeriod (тот остаётся проверкой уже загруженной страницы).
+function orderPeriodRange(period, now) {
+  const today = now || new Date();
+  if (period === 'custom') {
+    return { date_from: currentOrderFrom || '', date_to: currentOrderTo || '' };
+  }
+  if (period === 'today') return { date_from: _ymd(today), date_to: _ymd(today) };
+  if (period === '7d' || period === '30d') {
+    const cutoff = new Date(today);
+    cutoff.setDate(today.getDate() - ((period === '7d' ? 7 : 30) - 1));
+    return { date_from: _ymd(cutoff), date_to: '' };
+  }
+  return { date_from: '', date_to: '' };
+}
+
+// Запрос первой страницы под текущие фильтры. Роль берём из /api/me: набор
+// фильтров зависит от неё ещё до первого ответа списка.
+function ordersQuery() {
+  const isBoss = ['admin', 'boss'].includes(role());
+  const f = orderFilters(isBoss).find(x => x.id === currentOrderFilter);
+  const statuses = (currentOrderFilter === 'all' || !f) ? [] : (f.statuses || [f.id]);
+  return { statuses, ...orderPeriodRange(currentOrderPeriod) };
+}
+
+async function renderOrders() {
+  const content = document.getElementById('content');
+  const gen = screenGen();
+  const query = ordersQuery();
+  const key = JSON.stringify(query);
+  // Кэш заказов: переключение вкладок (Заказы↔Каталог↔Финансы) не должно
+  // каждый раз дёргать /api/orders. Мутации (delete/ship/cancel) ставят
+  // ordersData = null — это форсит свежую загрузку ниже. Смена фильтра —
+  // другой запрос: кэш под старым ключом не годится.
+  const stale = !ordersData || Date.now() - ordersDataTs > ORDERS_TTL_MS
+    || (ordersData.queryKey !== undefined && ordersData.queryKey !== key);
+  if (stale) {
+    if (ordersData) {
+      // Фильтры уже на экране — не прячем их за спиннером: переключатели
+      // остаются, список на время запроса — скелетон.
+      renderOrdersMain({ loading: true });
+    } else {
+      content.innerHTML = salesShellHtml() + loading('Загружаю заказы…');
+      wireSectionNav(content, 'sales', renderSalesScreen);
+    }
+    let page;
+    try {
+      page = await api('/api/orders', { ...query, limit: ORDERS_PAGE_SIZE, offset: 0 });
+    } catch (e) {
+      if (gen !== screenGen()) return;
+      const box = document.getElementById('content');
+      box.innerHTML = salesShellHtml() + errorBox(e.message);
+      wireSectionNav(box, 'sales', renderSalesScreen);
+      return;
+    }
+    // Пока ждали, человек нажал другой фильтр: этот ответ уже не про экран,
+    // его место займёт ответ на новый запрос.
+    if (JSON.stringify(ordersQuery()) !== key) return;
+    ordersData = { ...page, queryKey: key };
+    ordersDataTs = Date.now();
+  }
+  // Пока грузились, человек ушёл (другой раздел или вкладка «Отчёт») —
+  // renderOrdersMain ищет #content заново и затёр бы чужой экран.
+  if (gen !== screenGen()) return;
+  renderOrdersMain();
+}
+
+// «Показать ещё»: следующая страница под теми же фильтрами дописывается в
+// конец. Между страницами могли появиться новые заказы и сдвинуть смещение —
+// повторы отсекаем по id, чтобы карточка не задвоилась.
+async function loadMoreOrders(btn) {
+  if (!ordersData || !ordersData.has_more) return;
+  const key = ordersData.queryKey;
+  const gen = screenGen();
+  if (btn) { btn.disabled = true; btn.textContent = 'Загружаю…'; }
+  try {
+    const page = await api('/api/orders', {
+      ...ordersQuery(), limit: ORDERS_PAGE_SIZE, offset: ordersData.next_offset || ordersData.orders.length,
+    });
+    if (gen !== screenGen() || !ordersData || ordersData.queryKey !== key) return;
+    const seen = new Set(ordersData.orders.map(o => o.id));
+    ordersData = {
+      ...ordersData,
+      ...page,
+      orders: ordersData.orders.concat((page.orders || []).filter(o => !seen.has(o.id))),
+      queryKey: key,
+    };
+    renderOrdersMain();
+  } catch (e) {
+    toast(e.message, 'error');
+    if (btn) { btn.disabled = false; btn.textContent = 'Показать ещё'; }
+  }
+}
+
+function renderOrdersMain(opts = {}) {
+  // Список заказов — корневой вид вкладки. Прячем нативную «Назад»
+  // на случай возврата из вложенного экрана (редактор, заявки).
+  hideBack();
+  const content = document.getElementById('content');
+  const { orders, role } = ordersData;
+  const isBoss = role === 'admin' || role === 'boss';
+  const canShip = isBoss || role === 'warehouse_keeper';
+  // «Новый заказ» — только менеджеру. Было `!isBoss`, то есть и кладовщику с
+  // бухгалтером, а /api/orders/create им отвечает 403 (can_create_orders:
+  // admin/boss/manager). Руководству кнопку не рисуем и раньше: заказы
+  // заводят менеджеры, руководство их разбирает.
+  const canCreate = role === 'manager';
+
+  // Короткие подписи вместо одних иконок (UI-бриф п.5): часы/галочка/грузовик
+  // без слов приходилось расшифровывать. Ряд скроллится, если не влезает.
+  const filters = orderFilters(isBoss);
 
   // Единый язык навигации со всеми экранами: статус и период — сегменты
   // .seg / .seg-item по одной строке каждый, без заголовков «СТАТУС»/«ПЕРИОД»
@@ -3431,7 +3514,10 @@ function renderOrdersMain() {
     orderInPeriod(o.created_at, currentOrderPeriod)
   );
 
-  const list = filtered.length === 0
+  // Пока сервер отвечает на новый фильтр, старую страницу не фильтруем на
+  // месте: она собрана под ДРУГОЙ запрос, и под фильтром мелькало бы «Нет
+  // заказов», хотя они есть на сервере.
+  const list = opts.loading ? skeleton('list', 3) : filtered.length === 0
     ? emptyState({
         icon: 'list',
         title: 'Нет заказов',
@@ -3519,7 +3605,17 @@ function renderOrdersMain() {
   // Заявки на рассмотрении — обычная строка-ссылка с бейджем-счётчиком, и
   // только когда заявки есть (UI-бриф п.5): жёлтая плашка была единственным
   // жёлтым элементом приложения и читалась как предупреждение.
-  const pendingCount = isBoss ? orders.filter(o => o.status === 'pending').length : 0;
+  // Счётчик — с сервера по ВСЕМ заказам: на странице с фильтром «Отгружены»
+  // или без второй страницы локальный подсчёт врал бы. Старый ответ без
+  // страниц — считаем по тому, что есть.
+  const pendingCount = !isBoss ? 0
+    : (ordersData.pending_count != null ? ordersData.pending_count
+      : orders.filter(o => o.status === 'pending').length);
+  const moreLeft = ordersData.has_more
+    ? Math.max(0, (ordersData.total || 0) - orders.length) : 0;
+  const moreRow = ordersData.has_more && !opts.loading
+    ? `<button class="btn-secondary" id="orders-more">Показать ещё${moreLeft ? ` (${moreLeft})` : ''}</button>`
+    : '';
   const requestsRow = pendingCount ? `
     <div class="c-surface c-surface--list">
       <div class="c-row c-row--tap" id="show-requests" role="button" tabindex="0" data-status="pending">
@@ -3540,15 +3636,20 @@ function renderOrdersMain() {
     ${canCreate ? `<button class="btn-new-order" id="btn-new-order">${icon('plus')} Новый заказ</button>` : ''}
     ${requestsRow}
     <div class="orders-list">${list}</div>
+    ${moreRow}
   `;
   wireSectionNav(content, 'sales', renderSalesScreen);   // UI-BUG-04: шелл — часть шаблона, значит и проводка тоже
+  document.getElementById('orders-more')?.addEventListener('click', (ev) => {
+    haptic('light');
+    loadMoreOrders(ev.currentTarget);
+  });
 
   // Фильтры по статусу (сегмент).
   document.querySelectorAll('.seg-item[data-filter]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
       currentOrderFilter = btn.dataset.filter;
-      renderOrdersMain();
+      renderOrders();
     });
   });
 
@@ -3557,7 +3658,7 @@ function renderOrdersMain() {
     btn.addEventListener('click', () => {
       haptic('light');
       currentOrderPeriod = btn.dataset.operiod;
-      renderOrdersMain();
+      renderOrders();
     });
   });
 
@@ -3567,7 +3668,7 @@ function renderOrdersMain() {
       (from, to) => {
         currentOrderFrom = from;
         currentOrderTo = to;
-        renderOrdersMain();
+        renderOrders();
       });
   }
 

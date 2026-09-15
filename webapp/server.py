@@ -2731,6 +2731,91 @@ async def api_leads_funnel(request: Request):
 
 # ─── API: заказы ─────────────────────────────────────────────────────────────
 
+# Страница списка заказов. Без страниц /api/orders отдавал ВСЕ заказы с
+# позициями: у руководства за год это мегабайты JSON на каждый вход во вкладку
+# по мобильной сети. Фильтры статуса и периода применяются ДО нарезки, иначе
+# «Показать ещё» листал бы нефильтрованный список и на странице с фильтром
+# оказывалось бы два заказа из двадцати.
+_ORDERS_PAGE_MAX = 200
+_ORDERS_SCOPE_CAP = 5000
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _orders_page_params(data: dict) -> dict | None:
+    """Параметры страницы из тела запроса или None — старый режим «всё сразу».
+
+    Старый режим оставлен для вызовов без `limit` (бот, скрипты, тесты
+    нагрузки): их ответ не меняется. Даты — строки YYYY-MM-DD в поясе
+    клиента: «сегодня» считает телефон, у сервера пояс может быть другим.
+    """
+    raw_limit = data.get("limit")
+    if raw_limit is None:
+        return None
+    try:
+        limit = int(raw_limit)
+        offset = int(data.get("offset") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Некорректные limit/offset") from None
+    limit = max(1, min(limit, _ORDERS_PAGE_MAX))
+    offset = max(0, offset)
+    raw_statuses = data.get("statuses") or []
+    if not isinstance(raw_statuses, list):
+        raise HTTPException(status_code=400, detail="statuses — список статусов")
+    statuses = [str(x) for x in raw_statuses if x]
+    date_from = str(data.get("date_from") or "")
+    date_to = str(data.get("date_to") or "")
+    for d in (date_from, date_to):
+        if d and not _DATE_RE.match(d):
+            raise HTTPException(status_code=400, detail="Дата периода — в формате ГГГГ-ММ-ДД")
+    return {
+        "limit": limit,
+        "offset": offset,
+        "statuses": statuses,
+        "date_from": date_from,
+        "date_to": date_to,
+    }
+
+
+def _paginate_orders(
+    orders: list[dict],
+    *,
+    limit: int,
+    offset: int,
+    statuses: list[str],
+    date_from: str,
+    date_to: str,
+) -> tuple[list[dict], dict]:
+    """Отфильтровать (статус, период) и нарезать страницу.
+
+    `orders` уже отсортированы свежими вперёд (ORDER BY created_at DESC) —
+    порядок страниц держится на нём. `pending_count` считается по ВСЕМ
+    заказам роли, без фильтров: строка «Заявки на рассмотрении» у
+    руководства не должна пропадать, когда выбран фильтр «Отгружены» или
+    нужная заявка лежит на второй странице.
+    """
+    pending_count = sum(1 for o in orders if o.get("status") == "pending")
+    wanted = set(statuses)
+
+    def keep(o: dict) -> bool:
+        if wanted and o.get("status") not in wanted:
+            return False
+        day = str(o.get("created_at") or "")[:10]
+        if date_from and (not day or day < date_from):
+            return False
+        return not (date_to and (not day or day > date_to))
+
+    filtered = [o for o in orders if keep(o)]
+    chunk = filtered[offset : offset + limit]
+    next_offset = offset + len(chunk)
+    return chunk, {
+        "total": len(filtered),
+        "offset": offset,
+        "limit": limit,
+        "has_more": next_offset < len(filtered),
+        "next_offset": next_offset,
+        "pending_count": pending_count,
+    }
+
 
 @app.post("/api/orders")
 async def api_orders(request: Request):
@@ -2746,6 +2831,7 @@ async def api_orders(request: Request):
     from services import async_db as adb
 
     role = get_role(user["id"])
+    page = _orders_page_params(data)
 
     if role in ("admin", "boss"):
         orders = await adb.get_all_orders()
@@ -2758,12 +2844,21 @@ async def api_orders(request: Request):
         orders = [
             o for o in await adb.get_all_orders() if o.get("status") in ("approved", "shipped")
         ]
+    elif page is not None:
+        # Со страницами «Показать ещё» дойдёт до старых заказов, поэтому
+        # прежний потолок в 200 последних здесь не годится — иначе у менеджера
+        # с долгой историей список молча обрывался бы на двухсотом.
+        orders = await adb.get_user_orders(user["id"], limit=_ORDERS_SCOPE_CAP)
     else:
         orders = await adb.get_user_orders(user["id"])
 
     from config import BASE_CURRENCY
 
     is_boss = role in ("admin", "boss")
+
+    page_meta: dict = {}
+    if page is not None:
+        orders, page_meta = _paginate_orders(orders, **page)
 
     # Батч-загрузка позиций: один SQL вместо N (N+1 был на больших списках)
     items_by_order = await adb.get_order_items_by_ids([o["id"] for o in orders]) if orders else {}
@@ -2840,7 +2935,9 @@ async def api_orders(request: Request):
             entry["profit_partial"] = partial  # True = часть позиций без cost
         result.append(entry)
 
-    return JSONResponse({"orders": result, "role": role, "default_currency": BASE_CURRENCY})
+    return JSONResponse(
+        {"orders": result, "role": role, "default_currency": BASE_CURRENCY, **page_meta}
+    )
 
 
 @app.post("/api/orders/requests")

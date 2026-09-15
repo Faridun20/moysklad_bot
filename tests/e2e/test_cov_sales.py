@@ -41,11 +41,15 @@ def _card_ids(page) -> set[int]:
 def _filter(page, key: str) -> None:
     page.click(f'.seg-item[data-filter="{key}"]')
     page.wait_for_selector(f'.seg-item.active[data-filter="{key}"]')
+    # Фильтр уходит на сервер (страницы /api/orders) — ждём ответ, а не кадр
+    # со скелетоном.
+    settled(page)
 
 
 def _period(page, key: str) -> None:
     page.click(f'[data-operiod="{key}"]')
     page.wait_for_selector(f'.seg-item.active[data-operiod="{key}"]')
+    settled(page)
 
 
 def _digits(text: str) -> str:
@@ -710,6 +714,7 @@ def test_boss_status_and_period_filters(open_app, e2e):
     boss.click(".cal-apply")
     short = today.strftime("%d.%m")
     boss.wait_for_selector(f".seg-item--custom.active:has-text('{short}—{short}')")
+    settled(boss)
     assert _card_ids(boss) & known == {pending, rejected}
 
     # Сочетание, где пусто, — объяснение, а не голый экран.
