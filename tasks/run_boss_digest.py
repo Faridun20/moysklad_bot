@@ -68,18 +68,30 @@ async def main() -> int:
         boss_digest.mark_run(now_str)
         return 0
 
-    sent = {"rich": 0, "text": 0}
+    sent = {"rich": 0, "text": 0, "failed": 0}
     try:
         for boss in bosses:
             kind = await boss_digest.send_report(boss["user_id"], data)
             sent[kind] += 1
+        delivered = sent["rich"] + sent["text"]
         logger.info(
-            "boss_digest: отправлено %d (rich: %d, текстом: %d) — платежей %d, "
-            "сдач %d, возвратов %d, получено мелких %d",
-            sum(sent.values()), sent["rich"], sent["text"],
+            "boss_digest: доставлено %d из %d (rich: %d, текстом: %d, не ушло: %d) — "
+            "платежей %d, сдач %d, возвратов %d, получено мелких %d",
+            delivered, len(bosses), sent["rich"], sent["text"], sent["failed"],
             data["payments"]["count"], data["deposits"]["count"],
             data["returns"]["count"], data["received"]["count"],
         )
+        if delivered == 0:
+            # Rich и текстовый фолбэк не дошли НИ ОДНОМУ получателю (Telegram
+            # недоступен целиком) — не помечаем прогон отправленным, иначе
+            # день дайджеста теряется насовсем: is_due() промолчит до
+            # завтра, хотя фактически никто ничего не увидел.
+            logger.error(
+                "boss_digest: не доставлено ни одному из %d получателей — "
+                "прогон НЕ отмечен, повторим на следующем 15-минутном тике",
+                len(bosses),
+            )
+            return 1
         boss_digest.mark_run(now_str)
         return 0
     except Exception:

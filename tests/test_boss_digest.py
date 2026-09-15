@@ -269,6 +269,26 @@ def test_falls_back_to_text_when_rich_fails(isolated_db, monkeypatch):
     assert "Решения за день" in sent[0][1]
 
 
+def test_send_report_returns_failed_when_both_channels_fail(isolated_db, monkeypatch):
+    """Rich упал, а текстовый фолбэк `tg_send_message` тоже вернул False
+    (Telegram недоступен целиком) — send_report обязан сказать об этом
+    вызывающему, а не притвориться, что дайджест ушёл текстом."""
+    db = isolated_db
+    db.add_payment(10, "u", "Иван", 100.0, "USD", "c")
+    bot = _FakeBot(rich_error=RuntimeError("METHOD_NOT_AVAILABLE"))
+    bd = _patch_bot(monkeypatch, bot)
+
+    async def _send(chat_id, text, **kw):
+        return False
+
+    import services.notifier as notifier
+
+    monkeypatch.setattr(notifier, "tg_send_message", _send)
+
+    data = _run(bd.gather())
+    assert _run(bd.send_report(2, data)) == "failed"
+
+
 def test_fallback_never_logs_the_token(isolated_db, monkeypatch, caplog):
     import config
 
@@ -359,6 +379,38 @@ def test_cron_sends_once_and_is_idempotent_on_retry(isolated_db, monkeypatch):
     # Ретрай того же 15-минутного тика — дайджест уже отмечен сегодняшним.
     assert _run(task.main()) == 0
     assert len(bot.rich_calls) == 1
+
+
+def test_cron_does_not_mark_run_when_delivery_fails_everywhere(isolated_db, monkeypatch):
+    """День потерян, если дайджест «отправлен» отметкой, хотя ни один босс
+    его не получил (Rich упал, текстовый фолбэк тоже вернул False). rc=1,
+    last_run_at не тронут — следующий 15-минутный тик обязан попробовать
+    снова, а не молчать до завтра (is_due() всё ещё True)."""
+    from datetime import datetime
+
+    import tasks.run_boss_digest as task
+
+    db = isolated_db
+    db.set_role(1, "b", "Boss", "boss")
+    db.add_payment(10, "u", "Иван", 100.0, "USD", "c")
+    db.set_setting("boss_digest_time", "19:00")
+    monkeypatch.setattr("utils.helpers.local_now", lambda: datetime(2026, 9, 15, 19, 5))
+    bot = _FakeBot(rich_error=RuntimeError("METHOD_NOT_AVAILABLE"))
+    _patch_bot(monkeypatch, bot)
+
+    async def _send(chat_id, text, **kw):
+        return False
+
+    import services.notifier as notifier
+
+    monkeypatch.setattr(notifier, "tg_send_message", _send)
+
+    rc = _run(task.main())
+    assert rc == 1
+
+    from services import boss_digest as bd
+
+    assert bd.is_due() is True
 
 
 def test_cron_skips_when_nothing_to_report(isolated_db, monkeypatch):

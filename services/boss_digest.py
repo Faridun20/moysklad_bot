@@ -326,9 +326,13 @@ def build_text(data: dict) -> str:
 
 
 async def send_report(chat_id: int, data: dict) -> str:
-    """Отправить дайджест. Возвращает «rich» или «text» — что реально ушло.
+    """Отправить дайджест. Возвращает «rich»/«text» — что реально ушло, или
+    «failed» — ни один канал не доставил сообщение (Rich упал, а текстовый
+    фолбэк `tg_send_message` вернул False — Telegram недоступен целиком).
     Тот же фолбэк-контракт, что у `money_report.send_report`: Rich Message —
-    надстройка, при любой ошибке уходим на текст."""
+    надстройка, при любой ошибке уходим на текст. Вызывающий (`tasks.
+    run_boss_digest`) обязан отметить `mark_run` только при реальной
+    доставке — «failed» здесь не должно приводить к «дайджест дня ушёл»."""
     from webapp.server import get_notify_bot
 
     try:
@@ -349,5 +353,8 @@ async def send_report(chat_id: int, data: dict) -> str:
 
     from services.notifier import tg_send_message
 
-    await tg_send_message(chat_id, build_text(data), reply_markup=webapp_reply_markup())
+    ok = await tg_send_message(chat_id, build_text(data), reply_markup=webapp_reply_markup())
+    if not ok:
+        logger.error("boss_digest: текстовый фолбэк тоже не доставлен chat_id=%s", chat_id)
+        return "failed"
     return "text"
