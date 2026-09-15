@@ -300,6 +300,9 @@ ms_id_map              (UUID МойСклад → наш id; артефакт м
 payment_part_accounts  (строка разбивки оплаты «карта/на счёт» → карта/счёт acc_accounts)
 machine_receipt_accounts (поступление по рассрочке → карта/счёт acc_accounts)
 acc_account_details    (номер расчётного счёта, ИНН, МФО к acc_accounts)
+warehouse_archived     (склад в архиве — sidecar, а не колонка warehouses.archived; B8)
+stock_transfers        (история перемещений остатка между складами; B8)
+order_warehouse        (склад отгрузки заказа, если менеджер выбрал не дефолтный; B8)
 ```
 
 Карты и счета «куда поступили» — тот же справочник `acc_accounts`, что у

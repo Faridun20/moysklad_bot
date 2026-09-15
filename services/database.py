@@ -738,6 +738,40 @@ def _table_ddls() -> list[str]:
                 quantity     {qty_type} NOT NULL DEFAULT 0,
                 PRIMARY KEY (product_id, warehouse_id)
             )""",
+            # Склад в архиве — sidecar, а не колонка `warehouses.archived`:
+            # `warehouses` уже на проде (сидинг «Основной склад»), а
+            # инкрементальных миграций-ALTER в проекте нет (CLAUDE.md). Наличие
+            # строки = склад в архиве; архивный склад не предлагается в
+            # выборе (накладная, перемещение, заказ), но история по нему
+            # остаётся читаемой.
+            """CREATE TABLE IF NOT EXISTS warehouse_archived (
+                warehouse_id BIGINT PRIMARY KEY,
+                archived_at  TEXT NOT NULL,
+                archived_by  BIGINT
+            )""",
+            # Перемещение остатка между складами — одна транзакция:
+            # списание с одного, приход на другой, строка сюда. Остаток
+            # никогда не уходит в минус — тот же инвариант, что у накладных
+            # (`services.warehouse.transfer_stock`).
+            f"""CREATE TABLE IF NOT EXISTS stock_transfers (
+                id                {id_type},
+                product_id        BIGINT NOT NULL,
+                from_warehouse_id BIGINT NOT NULL,
+                to_warehouse_id   BIGINT NOT NULL,
+                quantity          {qty_type} NOT NULL,
+                comment           TEXT,
+                created_by        BIGINT,
+                created_at        TEXT NOT NULL
+            )""",
+            # С какого склада отгружать ЭТОТ заказ — sidecar, а не колонка
+            # `orders.warehouse_id`: `orders` уже на проде, и колонка в
+            # существующую таблицу просто не приехала бы без миграции-ALTER.
+            # Строки нет → отгрузка берёт `warehouse.default_warehouse_id()`,
+            # как и раньше, — однoскладской случай не меняется ни на бит.
+            """CREATE TABLE IF NOT EXISTS order_warehouse (
+                order_id     BIGINT PRIMARY KEY,
+                warehouse_id BIGINT NOT NULL
+            )""",
             # Накладная. Промежуточного draft нет — сразу confirmed, остатки
             # двигаются в той же транзакции, что и вставка строк.
             f"""CREATE TABLE IF NOT EXISTS invoices (

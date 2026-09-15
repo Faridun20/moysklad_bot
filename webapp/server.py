@@ -723,7 +723,14 @@ async def get_me(request: Request):
     user_id = user["id"]
     role = get_role(user_id)
     from config import BASE_CURRENCY
+    from services import warehouse as wh_service
     from services.database import get_setting
+
+    # B8: фронт спрашивает список складов (пикер в накладной/заказе) ТОЛЬКО
+    # когда их больше одного — иначе лишний поход в сеть на каждое открытие
+    # заказа/накладной, хотя выбирать не из чего. Раз в сессию, вместе с
+    # ролью: `/api/me` и так уходит при каждом старте WebApp.
+    multi_warehouse = await wh_service.active_warehouse_count() > 1
 
     return JSONResponse(
         {
@@ -752,6 +759,7 @@ async def get_me(request: Request):
             # «Настройках»). Фронт прячет по нему кнопки менеджера
             # (`deleteActionsVisible`); сервер решает сам (`_require_delete_right`).
             "delete_requires_boss": await _delete_requires_boss(),
+            "multi_warehouse": multi_warehouse,
         }
     )
 
@@ -1131,6 +1139,7 @@ async def api_stock(request: Request):
     отвечает ничего, и мягко деградировать тут не во что.
     """
     from services import async_db as adb
+    from services import warehouse as wh_service
     from services.warehouse import get_catalog, get_categories
 
     data = await request.json()
@@ -1142,7 +1151,18 @@ async def api_stock(request: Request):
     )
     role = get_role(user["id"])
 
-    rows, cats = await asyncio.gather(get_catalog(), get_categories())
+    rows, cats, active_warehouses = await asyncio.gather(
+        get_catalog(), get_categories(), wh_service.list_warehouses(include_archived=False)
+    )
+    # Разбивка по складам — ТОЛЬКО когда складов больше одного: пока склад
+    # один (сегодняшний случай), каталог выглядит byte-в-byte как раньше — ни
+    # одного нового поля в ответе, ни визуальной перемены на экране.
+    multi_warehouse = len(active_warehouses) > 1
+    breakdown = (
+        await wh_service.stock_breakdown([r["product_id"] for r in rows])
+        if multi_warehouse
+        else {}
+    )
 
     # PR C: подмешиваем цены руководства. sale_price — всем (менеджер видит
     # минимум и дефолт), cost_price — ТОЛЬКО boss/admin (себестоимость не
@@ -1178,9 +1198,16 @@ async def api_stock(request: Request):
             # Ручная `cost_price` остаётся рядом — у товара без партий она
             # по-прежнему единственный ответ.
             item["cost_batches"] = fifo[r["product_id"]]["unit_cost_cents"] / 100
+        if multi_warehouse:
+            item["by_warehouse"] = breakdown.get(r["product_id"], [])
         products.append(item)
 
-    return JSONResponse({"products": products, "categories": cats, "cost_currency": cost_cur})
+    return JSONResponse({
+        "products": products,
+        "categories": cats,
+        "cost_currency": cost_cur,
+        "multi_warehouse": multi_warehouse,
+    })
 
 
 # ─── API: аналитика продаж ───────────────────────────────────────────────────
@@ -8082,6 +8109,298 @@ async def api_wh_invoice_cancel(request: Request):
         "wh_invoice_cancel",
         f"Отменена накладная #{invoice_id}, остатки откачены",
     )
+    return JSONResponse(result)
+
+
+# ─── API: справочник складов (B8 — несколько складов) ────────────────────────
+#
+# Пока в компании ОДНА физическая точка, и это админ/boss-only экран на
+# будущее («Настройки → Склады»). Выбор конкретного активного склада (форма
+# накладной/заказа/перемещения) открыт и менеджеру — `/api/warehouses/active`.
+
+
+@app.post("/api/warehouses/list")
+async def api_warehouses_list(request: Request):
+    """Справочник складов с архивными — для экрана «Настройки → Склады»."""
+    from services import warehouse
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_warehouses_list",
+        rate_limit_max=60,
+    )
+    rows = await warehouse.list_warehouses(include_archived=True)
+    return JSONResponse({"warehouses": rows})
+
+
+@app.post("/api/warehouses/active")
+async def api_warehouses_active(request: Request):
+    """Активные склады — для пикера в форме накладной/заказа/перемещения.
+
+    Открыт и менеджеру: он проводит приход и перемещение, значит должен
+    видеть, между какими складами выбирать. `last_used_warehouse_id` — из
+    последней накладной этого человека, как `pay_accounts.last_used`.
+    """
+    from services import warehouse
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_warehouses_active",
+        rate_limit_max=120,
+    )
+    rows = await warehouse.list_warehouses(include_archived=False)
+    last_used = await warehouse.last_used_warehouse_id(user["id"])
+    return JSONResponse({"warehouses": rows, "last_used_warehouse_id": last_used})
+
+
+@app.post("/api/warehouses/create")
+async def api_warehouses_create(request: Request):
+    from services import async_db as adb
+    from services import warehouse
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_warehouses_create",
+        rate_limit_max=20,
+    )
+    name = str(data.get("name") or "")
+    try:
+        result = await warehouse.create_warehouse(name, created_by=user["id"])
+    except warehouse.WarehouseError as e:
+        raise HTTPException(status_code=400, detail=e.message)
+    if not result.get("existed"):
+        await adb.add_audit_log(
+            user["id"],
+            user.get("first_name", ""),
+            get_role(user["id"]),
+            "warehouse_create",
+            f"Склад #{result['warehouse_id']} «{result['name']}» заведён",
+        )
+    return JSONResponse(result)
+
+
+@app.post("/api/warehouses/rename")
+async def api_warehouses_rename(request: Request):
+    from services import async_db as adb
+    from services import warehouse
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_warehouses_rename",
+        rate_limit_max=20,
+    )
+    try:
+        warehouse_id = int(data.get("warehouse_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="warehouse_id обязателен")
+    name = str(data.get("name") or "")
+    try:
+        result = await warehouse.rename_warehouse(warehouse_id, name)
+    except warehouse.WarehouseError as e:
+        status = 404 if e.code == "not_found" else 400
+        raise HTTPException(status_code=status, detail=e.message)
+    await adb.add_audit_log(
+        user["id"],
+        user.get("first_name", ""),
+        get_role(user["id"]),
+        "warehouse_rename",
+        f"Склад #{warehouse_id} переименован в «{result['name']}»",
+    )
+    return JSONResponse(result)
+
+
+@app.post("/api/warehouses/archive")
+async def api_warehouses_archive(request: Request):
+    """В архив — только пустой склад (см. `warehouse.archive_warehouse`)."""
+    from services import async_db as adb
+    from services import warehouse
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_warehouses_archive",
+        rate_limit_max=20,
+    )
+    try:
+        warehouse_id = int(data.get("warehouse_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="warehouse_id обязателен")
+    try:
+        result = await warehouse.archive_warehouse(warehouse_id, archived_by=user["id"])
+    except warehouse.WarehouseError as e:
+        status = 404 if e.code == "not_found" else 409
+        raise HTTPException(status_code=status, detail=e.message)
+    if not result.get("already_archived"):
+        await adb.add_audit_log(
+            user["id"],
+            user.get("first_name", ""),
+            get_role(user["id"]),
+            "warehouse_archive",
+            f"Склад #{warehouse_id} отправлен в архив",
+        )
+    return JSONResponse(result)
+
+
+@app.post("/api/warehouses/unarchive")
+async def api_warehouses_unarchive(request: Request):
+    from services import async_db as adb
+    from services import warehouse
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_warehouses_unarchive",
+        rate_limit_max=20,
+    )
+    try:
+        warehouse_id = int(data.get("warehouse_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="warehouse_id обязателен")
+    result = await warehouse.unarchive_warehouse(warehouse_id)
+    if result.get("restored"):
+        await adb.add_audit_log(
+            user["id"],
+            user.get("first_name", ""),
+            get_role(user["id"]),
+            "warehouse_unarchive",
+            f"Склад #{warehouse_id} возвращён из архива",
+        )
+    return JSONResponse(result)
+
+
+# ─── API: перемещение остатка между складами ─────────────────────────────────
+
+
+@app.post("/api/stock/transfer")
+async def api_stock_transfer(request: Request):
+    """Переместить остаток между складами — атомарно, как приход/расход.
+
+    Роль — как у прихода: менеджер делает физическую работу склада, а не
+    только руководство. Идемпотентность — как у накладной: повторно
+    отправленная форма не переместит товар дважды.
+    """
+    from services import async_db as adb
+    from services import warehouse
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_stock_transfer",
+        rate_limit_max=30,
+    )
+    try:
+        product_id = int(data.get("product_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="product_id обязателен")
+    try:
+        from_warehouse_id = int(data.get("from_warehouse_id"))
+        to_warehouse_id = int(data.get("to_warehouse_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Укажите склад отправления и назначения")
+
+    idem = _Idem(adb, "stock_transfer", user["id"], data.get("idempotency_key"))
+    prev = await idem.claim()
+    if prev is not None:
+        return JSONResponse(prev)
+
+    try:
+        result = await warehouse.transfer_stock(
+            product_id=product_id,
+            quantity=data.get("quantity"),
+            from_warehouse_id=from_warehouse_id,
+            to_warehouse_id=to_warehouse_id,
+            comment=(data.get("comment") or None),
+            created_by=user["id"],
+        )
+    except Exception:
+        # Ключ освобождаем только на неожиданном сбое — отказ по правилу
+        # (нехватка остатка, архивный склад) сохраняется под ключом, как у
+        # накладной: ретрай той же формы получает тот же ответ.
+        await idem.release()
+        raise
+
+    if not result.get("ok"):
+        await idem.store(result)
+        return JSONResponse(result, status_code=409)
+
+    await adb.add_audit_log(
+        user["id"],
+        user.get("first_name", ""),
+        get_role(user["id"]),
+        "stock_transfer",
+        f"Перемещение #{result['transfer_id']}: товар #{result['product_id']} "
+        f"{result['quantity']:g} со склада #{result['from_warehouse_id']} "
+        f"на склад #{result['to_warehouse_id']}",
+    )
+    await idem.store(result)
+    return JSONResponse(result)
+
+
+@app.post("/api/stock/transfers")
+async def api_stock_transfers_list(request: Request):
+    """История перемещений, новые сверху — руководству (боссу и админу)."""
+    from services import warehouse
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_stock_transfers_list",
+        rate_limit_max=60,
+    )
+    try:
+        limit = min(int(data.get("limit") or 50), 200)
+        offset = max(int(data.get("offset") or 0), 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="limit/offset должны быть числами")
+    rows = await warehouse.list_stock_transfers(limit=limit, offset=offset)
+    return JSONResponse({"transfers": rows})
+
+
+# ─── API: склад отгрузки заказа (выбор менеджера при оформлении) ────────────
+
+
+@app.post("/api/orders/set_warehouse")
+async def api_orders_set_warehouse(request: Request):
+    """Выбрать склад, с которого отгружать заказ — только пока черновик.
+
+    Нужен, только если активных складов больше одного: фронт не рисует
+    пикер вовсе при одном складе, и ручка тогда просто не вызывается —
+    `order_warehouse` остаётся пустой, `ship_order` берёт склад по умолчанию.
+    """
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_orders_set_warehouse",
+    )
+
+    from services import async_db as adb
+    from services import warehouse
+
+    order = await adb.get_order(data.get("order_id"))
+    if not order or order["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Нет доступа")
+    _require_draft_order(order)
+    try:
+        warehouse_id = int(data.get("warehouse_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="warehouse_id обязателен")
+    try:
+        result = await warehouse.set_order_warehouse(order["id"], warehouse_id)
+    except warehouse.WarehouseError as e:
+        raise HTTPException(status_code=400, detail=e.message)
     return JSONResponse(result)
 
 

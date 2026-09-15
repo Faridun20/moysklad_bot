@@ -157,7 +157,11 @@ async def ship_order(order: dict, items: list[dict], *, user_id: int | None = No
         await _remember_failure(order_id, reason)
         return {"ok": False, "code": "no_positions", "reason": reason, "skipped": skipped}
 
-    warehouse_id = await warehouse.default_warehouse_id()
+    # Склад берём из выбора менеджера при создании заказа (`order_warehouse`),
+    # если он есть; иначе — как раньше, по умолчанию. В однoскладском случае
+    # строки в `order_warehouse` не бывает никогда, и ответ совпадает с
+    # `default_warehouse_id()` — поведение не меняется ни на бит.
+    warehouse_id = await warehouse.resolve_order_warehouse(order_id)
     # `agent_id` после перехода хранит id НАШЕГО контрагента (строкой — колонка
     # TEXT, см. backfill_local_identifiers). Нечисловое значение — legacy-uuid,
     # который backfill не сматчил: накладную всё равно проводим, просто без
