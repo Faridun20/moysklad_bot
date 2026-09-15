@@ -864,6 +864,21 @@ async def _insert_receipt_locked(
     return await _set_deal_closed_locked(txn, int(deal["id"]), closed=True)
 
 
+async def _receipt_room_locked(txn: Any, deal_id: int) -> int | None:
+    """Сколько ещё можно принять по рассрочке: план − взнос − уже получено.
+    None — графика нет (не рассрочка), сверять не с чем. Под `_lock_deal`."""
+    schedule = await get_schedule(deal_id, db=txn)
+    if not schedule:
+        return None
+    planned = sum(int(r["amount_cents"]) for r in schedule)
+    down = sum(int(r["amount_cents"]) for r in schedule if int(r["seq"] or 0) == 0)
+    received = int(await txn.fetchval(
+        "SELECT COALESCE(SUM(amount_cents), 0) FROM machine_payment_receipts WHERE deal_id = $1",
+        deal_id,
+    ) or 0)
+    return max(0, planned - down - received)
+
+
 async def _after_receipt_added(
     deal_id: int, amount_cents: int, currency: str, closed: dict | None, *,
     user_id: int, full_name: str, method: str | None = None,
@@ -882,7 +897,7 @@ async def _after_receipt_added(
 async def add_receipt(
     deal_id: int, amount_cents: int, *, user_id: int, full_name: str = "",
     note: str | None = None, received_at: str | None = None, method: str | None = None,
-    idem_key: str | None = None,
+    idem_key: str | None = None, allow_overpay: bool = False,
 ) -> dict:
     """Записать полученные деньги по рассрочке.
 
@@ -895,6 +910,11 @@ async def add_receipt(
     ретрай после обрыва связи получает готовый ответ, а не второе поступление.
     Аудит после коммита — best-effort: деньги уже записаны, и сбой журнала не
     должен превращать успех в 500 (ретрай тогда повторил бы запрос).
+
+    Сумма сверх остатка (план − взнос − уже получено) — отказ: опечатка на
+    лишний ноль закрывала сделку и «гасила» деньги, которых нет. Руководство
+    может записать переплату, но только явно (`allow_overpay=True`, ручка —
+    `overpay: true`); без флага ответ `needs_force` с остатком.
     """
     from services.database import idem_store_in
 
@@ -911,12 +931,32 @@ async def add_receipt(
     ok, err = await _validate_cents(amount_cents, "Сумма", head["currency"])
     if not ok:
         return {"ok": False, "error": err}
+    # Роль — ДО транзакции: get_role синхронный, на SQLite ждал бы нашу запись.
+    is_boss_role = (await asyncio.to_thread(get_role, user_id)) in ("admin", "boss")
+    overpaid_cents = 0
     async with adb_core.transaction() as txn:
         deal = await _lock_deal(txn, deal_id)
         if not deal:
             return {"ok": False, "error": "Сделка не найдена"}
         if deal["closed_at"]:
             return {"ok": False, "error": "Рассрочка уже закрыта", "current": "closed"}
+        left = await _receipt_room_locked(txn, deal_id)
+        if left is not None and amount_cents > left:
+            cur = str(deal["currency"] or "")
+            left_txt = f"{money.format_cents(left)} {cur}".strip()
+            if not is_boss_role:
+                return {
+                    "ok": False, "remaining_cents": left,
+                    "error": f"Сумма больше остатка по рассрочке: осталось получить {left_txt}. "
+                             "Переплату сверх графика записывает руководитель",
+                }
+            if not allow_overpay:
+                return {
+                    "ok": False, "needs_force": True, "remaining_cents": left,
+                    "error": f"Сумма больше остатка по рассрочке: осталось получить {left_txt}. "
+                             "Записать переплату можно только явным подтверждением",
+                }
+            overpaid_cents = amount_cents - left
         closed = await _insert_receipt_locked(
             txn, deal, amount_cents, user_id=user_id, note=note, received_at=received_at,
             method=method,
@@ -924,6 +964,12 @@ async def add_receipt(
         result = {"ok": True, "deal_closed": bool(closed)}
         await idem_store_in(txn, idem_key, result)
     try:
+        if overpaid_cents:
+            await _audit(
+                user_id, full_name, "machine_receipt_overpaid",
+                f"сделка #{deal_id} · переплата сверх графика "
+                f"{money.format_cents(overpaid_cents)} {deal['currency']} — подтверждено руководителем",
+            )
         return await _after_receipt_added(
             deal_id, amount_cents, str(deal["currency"]), closed,
             user_id=user_id, full_name=full_name, method=method,

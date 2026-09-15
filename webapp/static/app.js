@@ -1979,9 +1979,17 @@ function openReceiptForm(deal, refresh) {
     ],
     submitLabel: 'Записать',
     onSubmit: async (data, { showErr }) => {
-      const res = await apiResult('/api/machines/receipt', {
+      const body = {
         deal_id: deal.id, amount: data.amount, method: data.method, note: data.note, idempotency_key: key,
-      });
+      };
+      let res = await apiResult('/api/machines/receipt', body);
+      // 409 + needs_force: сумма больше остатка. Переплату сервер примет только
+      // от руководства и только явно — спрашиваем.
+      if (!res.ok && res.body && res.body.needs_force) {
+        const agreed = await confirmDialog(`${res.error}\n\nЗаписать ${data.amount} как переплату?`);
+        if (!agreed) return false;
+        res = await apiResult('/api/machines/receipt', { ...body, overpay: true });
+      }
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
       toast(res.body.deal_closed ? 'Рассрочка закрыта — всё получено' : 'Оплата записана');

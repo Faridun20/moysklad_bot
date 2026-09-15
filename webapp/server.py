@@ -4794,6 +4794,7 @@ async def api_machines_receipt(request: Request):
         res = await machines.add_receipt(
             deal_id, amount_cents, user_id=user["id"], full_name=_actor_name(user),
             note=_machine_text(data, "note", 200), method=method, idem_key=idem.key,
+            allow_overpay=bool(data.get("overpay")),
         )
     except Exception:
         await idem.release()

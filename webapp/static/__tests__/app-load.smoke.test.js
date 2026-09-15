@@ -1256,6 +1256,34 @@ describe('рассрочка: частичные поступления', () => 
     expect(call[1].idempotency_key).toBeTruthy();
   });
 
+  it('сумма больше остатка: руководитель подтверждает переплату явно', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
+      tg.showConfirm = (t, cb) => { window.__asked = t; cb(true); };
+      window.__writes = [];
+      api = async () => (${JSON.stringify(CARD())});
+      apiResult = async (p, b) => {
+        window.__writes.push([p, b]);
+        if (p === '/api/machines/receipt' && !b.overpay) {
+          return { ok: false, status: 409, error: 'Сумма больше остатка по рассрочке',
+                   body: { needs_force: true, detail: 'Сумма больше остатка по рассрочке' } };
+        }
+        return { ok: true, status: 200, body: { ok: true }, error: '' };
+      };
+      window.__ready = renderMachineCard(7);
+    `);
+    await window.__ready;
+    window.document.querySelector('[data-receipt-add="3"]').click();
+    window.document.querySelector('#ms-f-amount').value = '99999';
+    window.document.querySelector('#ms-submit').click();
+    for (let i = 0; i < 5; i++) await new Promise(r => setTimeout(r, 0));
+    const calls = window.__writes.filter(([p]) => p === '/api/machines/receipt');
+    expect(calls.length).toBe(2);
+    expect(calls[0][1].overpay).toBeUndefined();
+    expect(calls[1][1].overpay).toBe(true);
+    expect(calls[1][1].idempotency_key).toBe(calls[0][1].idempotency_key);
+  });
+
   it('у закрытой сделки оплату не вносят', async () => {
     const closed = CARD();
     closed.deals[0].closed_at = '2026-09-01';

@@ -683,3 +683,64 @@ def test_receipt_endpoint_failure_before_commit_frees_the_key(isolated_db, monke
     r = _post(client, "/api/machines/receipt", 1, **body)
     assert r.status_code == 200, r.text
     assert len(_run(machines.list_receipts(deal["deal_id"]))) == 1
+
+
+# ─── Переплата сверх остатка ─────────────────────────────────────────────────
+
+
+def test_manager_cannot_receive_more_than_left(isolated_db):
+    """Опечатка на лишний ноль закрывала сделку деньгами, которых нет."""
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    deal = _credit(_machine(), months=5)          # остаток 20 000
+    assert _run(machines.add_receipt(deal["deal_id"], 1_500_000, user_id=1))["ok"]
+    res = _run(machines.add_receipt(deal["deal_id"], 600_000, user_id=1))
+    assert res["ok"] is False and not res.get("needs_force")
+    assert "осталось получить" in res["error"] and "руководитель" in res["error"]
+    assert res["remaining_cents"] == 500_000
+    # Ровно остаток — законно и закрывает сделку.
+    assert _run(machines.add_receipt(deal["deal_id"], 500_000, user_id=1))["deal_closed"] is True
+    # Флаг переплаты менеджеру прав не даёт.
+    deal2 = _credit(_machine(vin="B-2"), months=5)
+    res = _run(machines.add_receipt(deal2["deal_id"], 2_000_001, user_id=1, allow_overpay=True))
+    assert res["ok"] is False
+    assert _run(machines.list_receipts(deal2["deal_id"])) == []
+
+
+def test_boss_overpays_only_explicitly(isolated_db):
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    deal = _credit(_machine(), months=5)
+    res = _run(machines.add_receipt(deal["deal_id"], 2_100_000, user_id=2))
+    assert res["ok"] is False and res["needs_force"] is True
+    assert _run(machines.list_receipts(deal["deal_id"])) == []
+    res = _run(machines.add_receipt(deal["deal_id"], 2_100_000, user_id=2, allow_overpay=True))
+    assert res["ok"] and res["deal_closed"] is True
+    from services import database
+
+    actions = [r["action"] for r in _run(database.get_audit_log(limit=50))]
+    assert "machine_receipt_overpaid" in actions
+
+
+def test_receipt_endpoint_overpay_codes(isolated_db, monkeypatch):
+    from services import machines
+
+    db = isolated_db
+    _setup(db)
+    deal = _credit(_machine(), months=5)
+    client = _client(monkeypatch)
+    body = dict(deal_id=deal["deal_id"], amount="25000", method="cash", idempotency_key="ov-1")
+    r = _post(client, "/api/machines/receipt", 1, **body)
+    assert r.status_code == 400 and "руководитель" in r.json()["detail"]
+    r = _post(client, "/api/machines/receipt", 1, overpay=True, **body)
+    assert r.status_code == 400
+    r = _post(client, "/api/machines/receipt", 2, **body)
+    assert r.status_code == 409 and r.json()["needs_force"] is True
+    # Ключ освобождён отказом — подтверждение идёт с тем же ключом.
+    r = _post(client, "/api/machines/receipt", 2, overpay=True, **body)
+    assert r.status_code == 200 and r.json()["deal_closed"] is True
+    assert len(_run(machines.list_receipts(deal["deal_id"]))) == 1
