@@ -837,6 +837,7 @@ async def _audit_deal_state(change: dict | None, deal_id: int, *, user_id: int, 
 async def _insert_receipt_locked(
     txn: Any, deal: dict, amount_cents: int, *, user_id: int,
     note: str | None, received_at: str | None, method: str | None = None,
+    account_id: int | None = None,
 ) -> dict | None:
     """Записать поступление ВНУТРИ транзакции под `_lock_deal`. Если график
     покрыт целиком — закрыть сделку той же транзакцией. → изменение состояния
@@ -858,6 +859,12 @@ async def _insert_receipt_locked(
             "INSERT INTO machine_receipt_methods (receipt_id, method, created_at) VALUES ($1, $2, $3)",
             int(receipt_id), method, stamp,
         )
+    if account_id is not None and method in ("card", "bank"):
+        # Куда пришли деньги (карта/счёт справочника) — той же транзакцией.
+        await txn.execute(
+            "INSERT INTO machine_receipt_accounts (receipt_id, account_id, created_at) VALUES ($1, $2, $3)",
+            int(receipt_id), int(account_id), stamp,
+        )
     covered = await _sync_schedule_state(int(deal["id"]), user_id=user_id, db=txn)
     if not covered:
         return None
@@ -866,14 +873,14 @@ async def _insert_receipt_locked(
 
 async def _after_receipt_added(
     deal_id: int, amount_cents: int, currency: str, closed: dict | None, *,
-    user_id: int, full_name: str, method: str | None = None,
+    user_id: int, full_name: str, method: str | None = None, account_label: str | None = None,
 ) -> dict:
     """Аудит — ПОСЛЕ коммита: его пишет синхронный слой, и на SQLite он ждал
     бы нашу же пишущую транзакцию. Само закрытие уже в транзакции поступления."""
     await _audit(
         user_id, full_name, "machine_receipt_added",
         f"сделка #{deal_id} · {money.format_cents(amount_cents)} {currency}"
-        + (f" · {RECEIPT_METHODS.get(method, method)}" if method else ""),
+        + (f" · {account_label or RECEIPT_METHODS.get(method, method)}" if method else ""),
     )
     await _audit_deal_state(closed, deal_id, user_id=user_id, full_name=full_name)
     return {"ok": True, "deal_closed": bool(closed)}
@@ -882,6 +889,7 @@ async def _after_receipt_added(
 async def add_receipt(
     deal_id: int, amount_cents: int, *, user_id: int, full_name: str = "",
     note: str | None = None, received_at: str | None = None, method: str | None = None,
+    account_id: int | None = None,
 ) -> dict:
     """Записать полученные деньги по рассрочке.
 
@@ -902,6 +910,9 @@ async def add_receipt(
     ok, err = await _validate_cents(amount_cents, "Сумма", head["currency"])
     if not ok:
         return {"ok": False, "error": err}
+    account = await _receipt_account(method, account_id)
+    if isinstance(account, str):
+        return {"ok": False, "error": account}
     async with adb_core.transaction() as txn:
         deal = await _lock_deal(txn, deal_id)
         if not deal:
@@ -910,12 +921,27 @@ async def add_receipt(
             return {"ok": False, "error": "Рассрочка уже закрыта", "current": "closed"}
         closed = await _insert_receipt_locked(
             txn, deal, amount_cents, user_id=user_id, note=note, received_at=received_at,
-            method=method,
+            method=method, account_id=account["id"] if account else None,
         )
     return await _after_receipt_added(
         deal_id, amount_cents, str(deal["currency"]), closed,
         user_id=user_id, full_name=full_name, method=method,
+        account_label=account["label"] if account else None,
     )
+
+
+async def _receipt_account(method: str | None, account_id: int | None) -> dict | str | None:
+    """Карта/счёт поступления: запись справочника того же вида и не в архиве
+    (`pay_accounts.check_for_method`). → запись, None (не указана) или текст отказа.
+    Обязательность решает ручка: кнопка «оплачен» без способа законна."""
+    if account_id is None or method not in ("card", "bank"):
+        return None
+    from services import pay_accounts
+
+    try:
+        return await pay_accounts.check_for_method(account_id, method)
+    except pay_accounts.AccountError as e:
+        return e.message[:1].upper() + e.message[1:]
 
 
 async def _delete_receipt_locked(
@@ -933,6 +959,7 @@ async def _delete_receipt_locked(
     deal_id = int(row["deal_id"])
     # Ребёнок до родителя: на Postgres FK энфорсится.
     await txn.execute("DELETE FROM machine_receipt_methods WHERE receipt_id = $1", receipt_id)
+    await txn.execute("DELETE FROM machine_receipt_accounts WHERE receipt_id = $1", receipt_id)
     await txn.execute("DELETE FROM machine_payment_receipts WHERE id = $1", receipt_id)
     covered = await _sync_schedule_state(deal_id, user_id=user_id, db=txn)
     reopened = None if covered else await _set_deal_closed_locked(txn, deal_id, closed=False)
@@ -969,13 +996,26 @@ async def delete_receipt(receipt_id: int, *, user_id: int, full_name: str = "") 
 
 
 async def list_receipts(deal_id: int) -> list[dict]:
+    from services import pay_accounts
+
     rows = await adb_core.fetch(
-        "SELECT r.*, rm.method FROM machine_payment_receipts r "
-        "LEFT JOIN machine_receipt_methods rm ON rm.receipt_id = r.id WHERE r.deal_id = $1 "
-        "ORDER BY r.received_at DESC, r.id DESC",
+        f"SELECT r.*, rm.method, {pay_accounts.ACCOUNT_COLUMNS_SQL} FROM machine_payment_receipts r "
+        "LEFT JOIN machine_receipt_methods rm ON rm.receipt_id = r.id "
+        "LEFT JOIN machine_receipt_accounts mra ON mra.receipt_id = r.id "
+        f"{pay_accounts.account_join_sql('mra')}"
+        "WHERE r.deal_id = $1 ORDER BY r.received_at DESC, r.id DESC",
         deal_id,
     )
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        row = dict(r)
+        account = pay_accounts.from_prefixed(row)
+        for key in [k for k in row if k.startswith("acc_")]:
+            row.pop(key)
+        row["account_id"] = account["id"] if account else None
+        row["account_label"] = pay_accounts.destination_label(row.get("method"), account)
+        out.append(row)
+    return out
 
 
 async def deal_progress(deal_id: int) -> dict:
@@ -1001,7 +1041,7 @@ async def deal_progress(deal_id: int) -> dict:
 
 async def pay_installment(
     payment_id: int, *, user_id: int, full_name: str = "", paid: bool = True,
-    method: str | None = None,
+    method: str | None = None, account_id: int | None = None,
 ) -> dict:
     """Отметить плановый платёж полученным целиком.
 
@@ -1018,6 +1058,10 @@ async def pay_installment(
     if not head:
         return {"ok": False, "error": "Платёж не найден"}
     deal_id = int(head["deal_id"])
+    method = method if method in RECEIPT_METHODS else None
+    account = await _receipt_account(method, account_id) if paid else None
+    if isinstance(account, str):
+        return {"ok": False, "error": account}
 
     async with adb_core.transaction() as txn:
         deal = await _lock_deal(txn, deal_id)
@@ -1035,7 +1079,7 @@ async def pay_installment(
                 return {"ok": False, "error": "Рассрочка уже закрыта", "current": "closed"}
             closed = await _insert_receipt_locked(
                 txn, deal, amount, user_id=user_id, note=f"платёж {row['seq']}", received_at=None,
-                method=method if method in RECEIPT_METHODS else None,
+                method=method, account_id=account["id"] if account else None,
             )
         else:
             if not row["paid_at"]:
@@ -1055,7 +1099,7 @@ async def pay_installment(
     if paid:
         return await _after_receipt_added(
             deal_id, amount, str(deal["currency"]), closed, user_id=user_id, full_name=full_name,
-            method=method if method in RECEIPT_METHODS else None,
+            method=method, account_label=account["label"] if account else None,
         )
     return await _after_receipt_deleted(
         deal_id, amount, reopened, user_id=user_id, full_name=full_name,

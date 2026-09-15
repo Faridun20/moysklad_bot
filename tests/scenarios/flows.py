@@ -232,12 +232,32 @@ def approve(w: World, uid: int, req_id: int, *, override: bool = False, expect: 
     return body
 
 
+def receiving_account(w: World, uid: int, kind: str, **fields: Any) -> int:
+    """Карта или счёт «куда поступили» (/api/pay_accounts/create) — заводит тот,
+    кто вносит оплату, как в форме. Та же запись второй раз не заводится
+    (сервер отдаёт `existed`), поэтому шаг можно звать перед каждой оплатой."""
+    data = ({"holder": "Фаридун М.", "card_last4": "1234", "bank": "Kapitalbank"} if kind == "card"
+            else {"holder": "ООО Farid Impeks", "account_number": "20208840900112236789", "bank": "Kapitalbank"})
+    res = w.call(uid, "/api/pay_accounts/create", kind=kind, idempotency_key=key(), **{**data, **fields})
+    return int(res["account"]["id"])
+
+
 def record_payment(w: World, uid: int, order_id: int, payments: dict[str, float], *,
-                   currency: str | None = None, expect: int = 200) -> dict:
+                   currency: str | None = None, accounts: dict[str, int] | None = None,
+                   expect: int = 200) -> dict:
     """«Как получены деньги» (payments-flow): {"cash": …, "card": …, "bank": …}
-    в валюте заказа → строки разбивки через /api/orders/payment."""
+    в валюте заказа → строки разбивки через /api/orders/payment. Карта и
+    перечисление — с записью справочника «куда поступили» (`accounts` или
+    тестовая карта/счёт, `receiving_account`)."""
     cur = currency or w.one("SELECT currency FROM orders WHERE id = ?", (order_id,))["currency"] or "USD"
-    parts = [{"method": m, "currency": cur, "amount": a} for m, a in payments.items() if a]
+    parts = []
+    for m, a in payments.items():
+        if not a:
+            continue
+        row: dict[str, Any] = {"method": m, "currency": cur, "amount": a}
+        if m in ("card", "bank"):
+            row["account_id"] = (accounts or {}).get(m) or receiving_account(w, uid, m)
+        parts.append(row)
     return w.call(uid, "/api/orders/payment", expect=expect, order_id=order_id, parts=parts,
                   idempotency_key=key())
 
@@ -392,9 +412,11 @@ def resubmit_machine_deal(w: World, uid: int, request_id: int, *, expect: int = 
 
 def machine_receipt(w: World, uid: int, deal_id: int, amount: float, *, expect: int = 200,
                     method: str = "cash") -> dict:
-    """Поступление по рассрочке — со способом, как разбивка оплаты заказа."""
+    """Поступление по рассрочке — со способом (и картой/счётом «куда»), как
+    разбивка оплаты заказа."""
+    extra = {"account_id": receiving_account(w, uid, method)} if method in ("card", "bank") else {}
     return w.call(uid, "/api/machines/receipt", expect=expect, deal_id=deal_id, amount=amount,
-                  method=method, idempotency_key=key())
+                  method=method, idempotency_key=key(), **extra)
 
 
 def unreserve_machine(w: World, uid: int, machine_id: int, *, expect: int = 200) -> dict:

@@ -150,6 +150,20 @@ def payment_breakdown_is_consistent(db) -> None:
         )
         assert r["pay_cur"] == (r["order_cur"] or base), f"строка разбивки #{r['id']}: платёж не в валюте заказа"
         assert int(r["amount_cents"]) > 0 and r["method"] in ("cash", "card", "bank"), r
+    # Карта и перечисление указывают, КУДА пришли деньги: запись справочника
+    # того же вида (руководитель сверяет банк по ней). У наличных ссылки нет.
+    accs = {int(r["part_id"]): r for r in _rows(
+        db,
+        "SELECT ppa.part_id, a.kind FROM payment_part_accounts ppa JOIN acc_accounts a ON a.id = ppa.account_id",
+    )}
+    for r in parts:
+        link = accs.get(int(r["id"]))
+        if r["method"] == "cash":
+            assert link is None, f"строка разбивки #{r['id']}: у наличных нет «куда поступили»"
+        else:
+            assert link is not None and link["kind"] == r["method"], (
+                f"строка разбивки #{r['id']} ({r['method']}): нет карты/счёта того же вида — {link}"
+            )
     links = _rows(
         db,
         "SELECT cdp.deposit_id, cdp.part_id, cdp.order_id, cdp.amount_cents, d.status, "

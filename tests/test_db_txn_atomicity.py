@@ -25,6 +25,7 @@ import importlib
 
 import pytest
 from fastapi.testclient import TestClient
+from tests.conftest import pay_account_id
 
 
 def _run(coro):
@@ -352,7 +353,7 @@ def api(isolated_db, monkeypatch):
 
 def test_rejected_mark_paid_releases_its_key(api):
     db, _server, client = api
-    body = {"initData": "200", "idempotency_key": "k-404", "parts": [{"method": "card", "currency": "USD", "amount": 10}]}
+    body = {"initData": "200", "idempotency_key": "k-404", "parts": [{"method": "card", "currency": "USD", "amount": 10, "account_id": pay_account_id("card")}]}
     r = client.post("/api/orders/mark_paid", json={**body, "order_id": 999_999})
     assert r.status_code == 404
     oid = _credit_order(db, owner=200)
@@ -370,7 +371,7 @@ def test_mark_paid_result_is_stored_with_the_payment(api, monkeypatch):
         raise RuntimeError("упали после коммита")
 
     monkeypatch.setattr(server, "_notify_bosses_payment_pending", crash)
-    body = {"initData": "200", "order_id": oid, "parts": [{"method": "card", "currency": "USD", "amount": 10}], "idempotency_key": "k-crash"}
+    body = {"initData": "200", "order_id": oid, "parts": [{"method": "card", "currency": "USD", "amount": 10, "account_id": pay_account_id("card")}], "idempotency_key": "k-crash"}
     assert client.post("/api/orders/mark_paid", json=body).status_code == 500
     r = client.post("/api/orders/mark_paid", json=body)
     assert r.status_code == 200, r.text
@@ -390,7 +391,7 @@ def test_abandoned_key_is_reclaimed_only_for_atomic_operations(api):
             (key, op, 200, old, "2999-01-01 00:00:00"),
         )
     r = client.post("/api/orders/mark_paid", json={
-        "initData": "200", "order_id": oid, "parts": [{"method": "card", "currency": "USD", "amount": 10}], "idempotency_key": "k-old",
+        "initData": "200", "order_id": oid, "parts": [{"method": "card", "currency": "USD", "amount": 10, "account_id": pay_account_id("card")}], "idempotency_key": "k-old",
     })
     assert r.status_code == 200, r.text
     # Не атомарная операция: пустой ключ мог скрывать проведённое — только 409.

@@ -13,6 +13,7 @@ import importlib
 
 import pytest
 from fastapi.testclient import TestClient
+from tests.conftest import pay_account_id
 
 
 @pytest.fixture
@@ -69,7 +70,7 @@ def test_mark_paid_distinct_keys_create_two(client_env):
     client, db, ids = client_env
     base = {
         "initData": str(ids["mgr"]), "order_id": ids["order"],
-        "parts": [{"method": "card", "currency": "USD", "amount": 50}],
+        "parts": [{"method": "card", "currency": "USD", "amount": 50, "account_id": pay_account_id("card")}],
     }
     client.post("/api/orders/mark_paid", json={**base, "idempotency_key": "A"})
     client.post("/api/orders/mark_paid", json={**base, "idempotency_key": "B"})

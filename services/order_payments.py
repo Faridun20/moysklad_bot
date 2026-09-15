@@ -22,6 +22,10 @@
   подтверждает их платежи той же транзакцией.
 * Статус строки не хранится, а выводится: платёж pending/confirmed/rejected +
   «в сдаче #N» для наличных (`part_state`).
+* Карта и перечисление указывают, КУДА пришли деньги — запись справочника
+  карт и счетов (`services.pay_accounts`, ссылка `payment_part_accounts`).
+  Новая запись без неё отвергается (`code=account_required`); старые строки
+  без ссылки законны и показываются как раньше.
 
 Правила суммы (`settle_parts`):
 * «оплата сразу» — сумма разбивки обязана совпасть с тем, что по заказу ещё
@@ -45,7 +49,7 @@ from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
-from services import adb_core, money
+from services import adb_core, money, pay_accounts
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +89,7 @@ class PartInput:
     currency: str
     amount_cents: int
     rate: Decimal | None = None
+    account_id: int | None = None    # карта/счёт, куда пришли деньги (не у наличных)
 
 
 @dataclass(frozen=True)
@@ -97,6 +102,7 @@ class PartCalc:
     rate_source: str              # same | cbu | manual
     cbu_rate: Decimal | None
     order_amount_cents: int
+    account_id: int | None = None
 
 
 # ─── Чистые функции (тесты — tests/test_order_payments.py) ───────────────────
@@ -128,9 +134,16 @@ def fmt_rate(q: Decimal | None) -> str | None:
     return _f(q)
 
 
-def parse_parts(raw: Any, allowed: tuple[str, ...] | None = None) -> list[PartInput]:
-    """Строки формы → проверенные `PartInput`. Бросает `PaymentError` с номером строки."""
+def parse_parts(raw: Any, allowed: tuple[str, ...] | None = None, *,
+                require_account: bool = True) -> list[PartInput]:
+    """Строки формы → проверенные `PartInput`. Бросает `PaymentError` с номером строки.
+
+    `require_account` — карта/перечисление обязаны указать, куда пришли деньги
+    (`account_id`). Выключает его только разовый перенос старых отметок
+    (`scripts/migrate_payment_breakdown`): чья была карта полгода назад, уже
+    никто не скажет, а выдумывать нельзя."""
     from services.accounting import parse_rate
+    from services.pay_accounts import required_text
 
     allowed = allowed or _allowed_currencies()
     if not isinstance(raw, list) or not raw:
@@ -157,7 +170,21 @@ def parse_parts(raw: Any, allowed: tuple[str, ...] | None = None) -> list[PartIn
             rate = parse_rate(raw_rate)
             if rate is None:
                 raise PaymentError(f"Строка {n}: курс — положительное число")
-        out.append(PartInput(method, currency, int(cents), rate))
+        account_id = None
+        if method in NONCASH_METHODS:
+            raw_acc = row.get("account_id")
+            if raw_acc is not None and raw_acc != "":
+                try:
+                    account_id = int(raw_acc)
+                except (TypeError, ValueError):
+                    account_id = 0
+                if account_id <= 0:
+                    raise PaymentError(f"Строка {n}: карта или счёт не найдены — выберите из списка",
+                                       code="account_invalid")
+            elif require_account:
+                raise PaymentError(f"Строка {n}: {required_text(method)}", code="account_required")
+        # У наличных «куда» нет: account_id у такой строки просто не читается.
+        out.append(PartInput(method, currency, int(cents), rate, account_id))
     return out
 
 
@@ -208,7 +235,7 @@ def compute_parts(inputs: list[PartInput], order_currency: str, base: str,
             if not ok:
                 raise PaymentError(f"Строка {n}: {err}")
             out.append(PartCalc(inp.method, inp.currency, inp.amount_cents, None, None,
-                                "same", None, inp.amount_cents))
+                                "same", None, inp.amount_cents, inp.account_id))
             continue
         cbu_q = cbu.get(rc)
         quote = inp.rate if inp.rate is not None else cbu_q
@@ -225,7 +252,7 @@ def compute_parts(inputs: list[PartInput], order_currency: str, base: str,
             inp.method, inp.currency, inp.amount_cents,
             quote if inp.currency.upper() == rc else None,
             quote if order_cur == rc else None,
-            source, cbu_q, order_cents,
+            source, cbu_q, order_cents, inp.account_id,
         ))
     return out
 
@@ -278,7 +305,16 @@ def settle_parts(calcs: list[PartCalc], due_cents: int, *, exact: bool, order_cu
     return out
 
 
-def part_label(method: str, amount_cents: int, currency: str) -> str:
+def part_label(method: str, amount_cents: int, currency: str, account: dict | None = None) -> str:
+    """«наличные 5 000 USD» / «на карту •••• 1234 (Фаридун М.) · 7 130 USD».
+
+    `account` — поля записи справочника (`pay_accounts.from_prefixed`/`view`);
+    без неё (старая строка) подпись прежняя — только способ."""
+    from services.pay_accounts import destination_label
+
+    dest = destination_label(method, account) if method in NONCASH_METHODS else None
+    if dest:
+        return f"{dest} · {fmt_cents(amount_cents, currency)}"
     return f"{METHODS.get(method, method)} {fmt_cents(amount_cents, currency)}"
 
 
@@ -310,8 +346,11 @@ async def parts_for_orders(order_ids: list[int], conn: Any = None) -> dict[int, 
     for start in range(0, len(ids), 5000):
         chunk = ids[start:start + 5000]
         rows.extend(await db.fetch(
-            "SELECT pp.*, p.status AS payment_status, p.confirmed_at AS payment_confirmed_at "
+            "SELECT pp.*, p.status AS payment_status, p.confirmed_at AS payment_confirmed_at, "
+            f"{pay_accounts.ACCOUNT_COLUMNS_SQL} "
             "FROM payment_parts pp JOIN payments p ON p.id = pp.payment_id "
+            "LEFT JOIN payment_part_accounts ppa ON ppa.part_id = pp.id "
+            f"{pay_accounts.account_join_sql('ppa')}"
             f"WHERE pp.order_id IN ({_ph(len(chunk))}) ORDER BY pp.created_at, pp.id",
             *chunk,
         ))
@@ -348,12 +387,17 @@ STATE_LABELS = {
 
 def part_view(r: dict, deposit: tuple[int, str] | None = None) -> dict:
     state = part_state(r["method"], r.get("payment_status") or "pending", deposit)
+    account = pay_accounts.from_prefixed(r) if r["method"] in NONCASH_METHODS else None
     return {
         "id": int(r["id"]),
         "payment_id": int(r["payment_id"]),
         "order_id": int(r["order_id"]),
         "method": r["method"],
         "method_label": METHODS.get(r["method"], r["method"]),
+        # Куда пришли деньги: подпись и сама запись (архивная — как была).
+        "account_id": account["id"] if account else None,
+        "account_label": pay_accounts.destination_label(r["method"], account),
+        "account": account,
         "currency": r["currency"],
         "amount_cents": int(r["amount_cents"]),
         "amount": float(money.from_cents(int(r["amount_cents"]))),
@@ -377,9 +421,17 @@ async def parts_by_payment(payment_ids: list[int], conn: Any = None) -> dict[int
     for start in range(0, len(ids), 5000):
         chunk = ids[start:start + 5000]
         for r in await db.fetch(
-            f"SELECT * FROM payment_parts WHERE payment_id IN ({_ph(len(chunk))})", *chunk
+            f"SELECT pp.*, {pay_accounts.ACCOUNT_COLUMNS_SQL} FROM payment_parts pp "
+            "LEFT JOIN payment_part_accounts ppa ON ppa.part_id = pp.id "
+            f"{pay_accounts.account_join_sql('ppa')}"
+            f"WHERE pp.payment_id IN ({_ph(len(chunk))})", *chunk
         ):
-            out[int(r["payment_id"])] = dict(r)
+            row = dict(r)
+            account = pay_accounts.from_prefixed(row) if row["method"] in NONCASH_METHODS else None
+            row["account"] = account
+            row["account_label"] = pay_accounts.destination_label(row["method"], account)
+            row["label"] = part_label(row["method"], int(row["amount_cents"]), row["currency"], account)
+            out[int(r["payment_id"])] = row
     return out
 
 
@@ -475,7 +527,8 @@ def _now() -> str:
 
 async def record_payment_parts(order_id: int, actor: Actor, raw_parts: Any, *,
                                idem_key: str | None = None,
-                               supersede_payment_ids: list[int] | None = None) -> dict:
+                               supersede_payment_ids: list[int] | None = None,
+                               require_account: bool = True) -> dict:
     """Записать, как получены деньги по заказу. Одна транзакция на всё.
 
     Возвращает {ok, order_id, payments: [...], parts: [...], total_cents,
@@ -485,11 +538,14 @@ async def record_payment_parts(order_id: int, actor: Actor, raw_parts: Any, *,
     (разовый `scripts/migrate_payment_breakdown`: старая отметка оплаты по
     заказу «в долг» раскладывается на строки). У «оплаты сразу» такие платежи
     заменяются всегда.
+
+    Карта/перечисление — с `account_id` (куда пришли деньги): запись справочника
+    того же вида и не в архиве. `require_account=False` — только разовый перенос.
     """
     from services.database import idem_store_in
     from services.debts import calc_claimable_cents, lock_orders
 
-    inputs = parse_parts(raw_parts)
+    inputs = parse_parts(raw_parts, require_account=require_account)
     head = await adb_core.fetchrow(
         "SELECT id, user_id, currency, payment_type FROM orders WHERE id = $1", int(order_id)
     )
@@ -503,6 +559,14 @@ async def record_payment_parts(order_id: int, actor: Actor, raw_parts: Any, *,
     order_cur = (head["currency"] or base).upper()
     cbu = await _cbu_for({i.currency for i in inputs} | {order_cur})
     calcs = compute_parts(inputs, order_cur, base, cbu)
+    accounts: dict[int, dict] = {}
+    for n, inp in enumerate(inputs, start=1):
+        if inp.account_id is None:
+            continue
+        try:
+            accounts[inp.account_id] = await pay_accounts.check_for_method(inp.account_id, inp.method, row=n)
+        except pay_accounts.AccountError as e:
+            raise PaymentError(e.message, status=e.status, code=e.code) from e
     now = _now()
     result: dict[str, Any] = {}
 
@@ -580,11 +644,19 @@ async def record_payment_parts(order_id: int, actor: Actor, raw_parts: Any, *,
                 fmt_rate(c.order_rate), c.rate_source, fmt_rate(c.cbu_rate), c.order_amount_cents,
                 actor.user_id, actor.name, now,
             )
+            if c.account_id is not None:
+                await txn.execute(
+                    "INSERT INTO payment_part_accounts (part_id, account_id, created_at) VALUES ($1, $2, $3)",
+                    part_id, c.account_id, now,
+                )
             payments_out.append(pid)
+            account = accounts.get(c.account_id) if c.account_id is not None else None
             parts_out.append({
                 "id": part_id, "payment_id": pid, "method": c.method, "currency": c.currency,
                 "amount_cents": c.amount_cents, "order_amount_cents": c.order_amount_cents,
                 "rate": fmt_rate(c.rate or c.order_rate), "rate_source": c.rate_source,
+                "account_id": c.account_id,
+                "account_label": account["label"] if account else None,
             })
         await txn.execute(
             "UPDATE orders SET paid_at = COALESCE(paid_at, $1), updated_at = $2 WHERE id = $3",
@@ -598,14 +670,17 @@ async def record_payment_parts(order_id: int, actor: Actor, raw_parts: Any, *,
         }
         await idem_store_in(txn, idem_key, result)
 
-    await _audit(actor, "order_payment_recorded", recorded_text(int(order_id), order_cur, calcs, superseded))
+    await _audit(actor, "order_payment_recorded",
+                 recorded_text(int(order_id), order_cur, calcs, superseded, accounts))
     return result
 
 
-def recorded_text(order_id: int, order_cur: str, calcs: list[PartCalc], superseded: list[int]) -> str:
+def recorded_text(order_id: int, order_cur: str, calcs: list[PartCalc], superseded: list[int],
+                  accounts: dict[int, dict] | None = None) -> str:
     bits = []
     for c in calcs:
-        t = part_label(c.method, c.amount_cents, c.currency)
+        account = (accounts or {}).get(c.account_id) if c.account_id is not None else None
+        t = part_label(c.method, c.amount_cents, c.currency, account)
         if c.rate_source != "same":
             t += f" по курсу {fmt_rate(c.rate or c.order_rate)} ({c.rate_source}) = {fmt_cents(c.order_amount_cents, order_cur)}"
         bits.append(t)

@@ -41,9 +41,24 @@ async def _record_or_error(oid, parts, uid=MGR):
     from services import order_payments
 
     try:
-        return await order_payments.record_payment_parts(oid, _actor(uid), parts)
+        return await order_payments.record_payment_parts(oid, _actor(uid), await _accounts(parts))
     except order_payments.PaymentError as e:
         return {"ok": False, "code": e.code}
+
+
+async def _accounts(parts):
+    """Карта/перечисление — с тестовой записью справочника (в своём цикле)."""
+    from services import pay_accounts
+    from tests.conftest import TEST_BANK, TEST_CARD
+
+    out = []
+    for p in parts:
+        if p["method"] in ("card", "bank") and not p.get("account_id"):
+            data = TEST_CARD if p["method"] == "card" else TEST_BANK
+            acc = await pay_accounts.create_account(pay_accounts.Actor(0, "Tests", "boss"), data)
+            p = {**p, "account_id": acc["account"]["id"]}
+        out.append(p)
+    return out
 
 
 def test_parallel_breakdowns_of_one_paid_order_claim_once(pg, monkeypatch):
@@ -114,9 +129,12 @@ def test_full_flow_paid_order_split_handover_confirm_on_postgres(pg):
     assert db.set_currency_rate("UZS", 1 / 12700, BOSS)[0]
     oid = _races._order(db, total=12130.0, status="approved", payment_type="paid")
     assert _run(db.mark_order_shipped(oid, BOSS, "Boss"))["code"] == "payment_required"
+    from tests.conftest import pay_account_id
+
     rec = _run(order_payments.record_payment_parts(oid, _actor(), [
         {"method": "cash", "currency": "USD", "amount": "5000"},
-        {"method": "card", "currency": "UZS", "amount": "90550000"},  # 7 129.92 → 7 130 копейками пересчёта
+        # 7 129.92 → 7 130 копейками пересчёта
+        {"method": "card", "currency": "UZS", "amount": "90550000", "account_id": pay_account_id("card")},
     ]))
     assert rec["total_cents"] == 1_213_000
     assert _run(db.mark_order_shipped(oid, BOSS, "Boss"))["ok"]
