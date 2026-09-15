@@ -5396,7 +5396,7 @@ async def api_returns_create(request: Request):
                     raise HTTPException(
                         status_code=400, detail=f"Позиция {iid} недоступна к возврату"
                     )
-                if any(prev == iid for prev, _, _ in ret_items):
+                if any(seen == iid for seen, _, _ in ret_items):
                     # Две строки на одну позицию проходят «не больше доступного»
                     # каждая по отдельности; в базе это ещё и нарушение UNIQUE
                     # (return_id, order_item_id) — отвечаем текстом, а не 500-й.
