@@ -139,8 +139,8 @@ def test_order_line_above_int4_does_not_overflow(pg_db):
 
 
 def test_fractional_quantity_total_on_postgres(pg_db):
-    """quantity — REAL: произведение на BIGINT уходит в double и округляется до
-    копейки без переполнения."""
+    """quantity — NUMERIC: произведение на BIGINT остаётся numeric и округляется
+    до копейки без переполнения."""
     from services.debts import calc_order_balances
 
     db = pg_db

@@ -199,7 +199,23 @@ async def _apply_stock_delta(txn, product_id: int, warehouse_id: int, delta: flo
 
     Обычный UPDATE на товаре, которого ещё нет в `stock`, молча затрагивает
     0 строк — приход нового товара терялся бы без единой ошибки.
+
+    Списание (delta < 0) — сначала UPDATE. Postgres проверяет CHECK у
+    ВСТАВЛЯЕМОЙ строки UPSERT'а до разрешения конфликта, и `quantity >= 0`
+    (`scripts/apply_constraints`) отверг бы любую расходную накладную: строка
+    (товар, склад, −2.5) не проходит проверку ещё до того, как превратится в
+    UPDATE существующего остатка. Строки нет — вставляем как раньше.
     """
+    if delta < 0:
+        updated = await txn.execute(
+            "UPDATE stock SET quantity = quantity + $3 "
+            "WHERE product_id = $1 AND warehouse_id = $2",
+            product_id,
+            warehouse_id,
+            delta,
+        )
+        if updated:
+            return
     await txn.execute(
         "INSERT INTO stock (product_id, warehouse_id, quantity) VALUES ($1, $2, $3) "
         "ON CONFLICT (product_id, warehouse_id) "

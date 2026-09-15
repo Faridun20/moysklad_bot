@@ -5349,6 +5349,15 @@ async def api_returns_create(request: Request):
                 raise HTTPException(
                     status_code=400, detail=f"Позиция {iid} недоступна к возврату"
                 )
+            if any(prev == iid for prev, _, _ in ret_items):
+                # Две строки на одну позицию проходят «не больше доступного»
+                # каждая по отдельности; в базе это ещё и нарушение UNIQUE
+                # (return_id, order_item_id) — отвечаем текстом, а не 500-й.
+                if full_key:
+                    await adb.idem_release(full_key)
+                raise HTTPException(
+                    status_code=400, detail=f"Позиция {iid} указана дважды"
+                )
             if not (math.isfinite(qty) and 0 < qty <= returnable[iid] + 1e-9):
                 if full_key:
                     await adb.idem_release(full_key)

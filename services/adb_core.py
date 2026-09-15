@@ -32,9 +32,29 @@ import os
 import re
 import tempfile
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from typing import Any
 
 _PARAM_RE = re.compile(r"\$(\d+)")
+
+
+def _pg_args(args: tuple) -> tuple:
+    """float-параметры → Decimal по КРАТЧАЙШЕЙ записи числа (`repr`).
+
+    asyncpg кладёт Python float в NUMERIC-колонку двоичным значением целиком:
+    2.3 уезжает как 2.29999999999999982236431605997495353221893310546875.
+    Количества склада и заказов ради того и переведены в NUMERIC, чтобы не
+    копить хвосты float, — а драйвер приносил их обратно на входе, и сумма
+    дробных отгрузок снова не сходилась с «возвращено полностью». psycopg2
+    (синхронный слой) пишет float литералом `2.3`, поэтому расходился только
+    асинхронный путь. Decimal принимают и NUMERIC, и REAL/DOUBLE-параметры
+    (через __float__), так что замена безопасна для любого типа параметра.
+    `type(a) is float`, а не isinstance: bool и прочие подклассы не трогаем.
+    """
+    if not any(type(a) is float for a in args):
+        return args
+    return tuple(Decimal(repr(a)) if type(a) is float else a for a in args)
+
 
 # asyncpg-пул (ленивая инициализация). Размеры — как у psycopg2-пула.
 # Пул привязан к event loop'у, на котором создан. Храним этот loop, чтобы
@@ -195,7 +215,7 @@ async def fetch(query: str, *args: Any) -> list[dict]:
     if _use_postgres():
         pool = await init_pool()
         async with pool.acquire() as conn:
-            rows = await conn.fetch(query, *args)
+            rows = await conn.fetch(query, *_pg_args(args))
         return [dict(r) for r in rows]
 
     import aiosqlite
@@ -214,7 +234,7 @@ async def fetchrow(query: str, *args: Any) -> dict | None:
     if _use_postgres():
         pool = await init_pool()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(query, *args)
+            row = await conn.fetchrow(query, *_pg_args(args))
         return dict(row) if row is not None else None
 
     import aiosqlite
@@ -233,7 +253,7 @@ async def fetchval(query: str, *args: Any) -> Any:
     if _use_postgres():
         pool = await init_pool()
         async with pool.acquire() as conn:
-            return await conn.fetchval(query, *args)
+            return await conn.fetchval(query, *_pg_args(args))
 
     import aiosqlite
 
@@ -251,7 +271,7 @@ async def execute(query: str, *args: Any) -> int:
     if _use_postgres():
         pool = await init_pool()
         async with pool.acquire() as conn:
-            status = await conn.execute(query, *args)
+            status = await conn.execute(query, *_pg_args(args))
         return _rowcount_from_status(status)
 
     import aiosqlite
@@ -313,17 +333,17 @@ class _PgTxn:
         self._c = conn
 
     async def fetch(self, q: str, *a: Any) -> list[dict]:
-        return [dict(r) for r in await self._c.fetch(q, *a)]
+        return [dict(r) for r in await self._c.fetch(q, *_pg_args(a))]
 
     async def fetchrow(self, q: str, *a: Any) -> dict | None:
-        r = await self._c.fetchrow(q, *a)
+        r = await self._c.fetchrow(q, *_pg_args(a))
         return dict(r) if r is not None else None
 
     async def fetchval(self, q: str, *a: Any) -> Any:
-        return await self._c.fetchval(q, *a)
+        return await self._c.fetchval(q, *_pg_args(a))
 
     async def execute(self, q: str, *a: Any) -> int:
-        return _rowcount_from_status(await self._c.execute(q, *a))
+        return _rowcount_from_status(await self._c.execute(q, *_pg_args(a)))
 
     async def executemany(self, q: str, rows: list[tuple]) -> int:
         """Батч-INSERT/UPDATE одним prepared-statement'ом (asyncpg.executemany).
@@ -331,7 +351,7 @@ class _PgTxn:
         statement. Возвращает число переданных строк."""
         if not rows:
             return 0
-        await self._c.executemany(q, rows)
+        await self._c.executemany(q, [_pg_args(tuple(r)) for r in rows])
         return len(rows)
 
 

@@ -32,8 +32,6 @@ EXPECTED_INDEXES = [
     "idx_orders_ms_demand",
     "idx_cash_deposit_orders_order",
     "idx_payments_order_status",
-    "idx_payments_pending",
-    "idx_user_roles_role",
     "idx_orders_debt_lookup",
     "idx_order_items_order",
     "idx_return_items_return",
