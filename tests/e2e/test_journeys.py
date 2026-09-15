@@ -10,7 +10,7 @@ invariants.py`): склад сходится с накладными, деньг
 
 from __future__ import annotations
 
-from tests.e2e.conftest import go, settled, tab
+from tests.e2e.conftest import go, pay_form, settled, tab
 from tests.scenarios import invariants
 
 
@@ -18,6 +18,7 @@ def _invariants(e2e) -> None:
     invariants.stock_never_negative(e2e.db)
     invariants.stock_matches_invoices(e2e.db)
     invariants.money_is_consistent(e2e.db)
+    invariants.payment_breakdown_is_consistent(e2e.db)
     invariants.orders_follow_their_status(e2e.db)
 
 
@@ -59,7 +60,7 @@ def _boss_approves(boss) -> None:
 
 def test_credit_day_from_order_to_closed_debt(open_app, e2e):
     """Менеджер продаёт в кредит → босс одобряет → кладовщик отгружает →
-    менеджер отмечает частичную оплату → босс подтверждает → менеджер сдаёт
+    менеджер вносит частичную оплату картой → босс подтверждает → менеджер сдаёт
     остаток наличными → босс подтверждает сдачу → долга нет."""
     ids = e2e.ids
     mgr = open_app(ids["mgr"])
@@ -79,10 +80,9 @@ def test_credit_day_from_order_to_closed_debt(open_app, e2e):
     mgr = open_app(ids["mgr"])
     go(mgr, "money")
     tab(mgr, "debts")
-    mgr.wait_for_selector(f'.btn-mark-paid[data-id="{oid}"]')
-    mgr.fill(f'.pay-amount-input[data-id="{oid}"]', "150")
-    mgr.click(f'.btn-mark-paid[data-id="{oid}"]')
-    mgr.wait_for_selector(".toast:has-text('ждёт подтверждения')")
+    mgr.wait_for_selector(f'.btn-pay-debt[data-id="{oid}"]')
+    pay_form(mgr, f'.btn-pay-debt[data-id="{oid}"]', [("card", "150")])
+    mgr.wait_for_selector(".toast:has-text('записана')")
 
     boss = open_app(ids["boss"])
     go(boss, "money")

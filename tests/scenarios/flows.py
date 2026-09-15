@@ -232,24 +232,36 @@ def approve(w: World, uid: int, req_id: int, *, override: bool = False, expect: 
     return body
 
 
+def record_payment(w: World, uid: int, order_id: int, payments: dict[str, float], *,
+                   currency: str | None = None, expect: int = 200) -> dict:
+    """«Как получены деньги» (payments-flow): {"cash": …, "card": …, "bank": …}
+    в валюте заказа → строки разбивки через /api/orders/payment."""
+    cur = currency or w.one("SELECT currency FROM orders WHERE id = ?", (order_id,))["currency"] or "USD"
+    parts = [{"method": m, "currency": cur, "amount": a} for m, a in payments.items() if a]
+    return w.call(uid, "/api/orders/payment", expect=expect, order_id=order_id, parts=parts,
+                  idempotency_key=key())
+
+
 def ship_order(w: World, uid: int, order_id: int, *, payments: dict[str, float] | None = None,
                expect: int = 200) -> dict:
     """«Отгружен» (approved → shipped).
 
     `payments` — разбивка оплаты по способам {"cash": …, "card": …, "bank": …}.
-    Сейчас ручка её не принимает и молча игнорирует; поток `payments-flow`
-    сделает её обязательной для оплаченного заказа — тогда она уйдёт в payload
-    здесь, и сценарии, которые её уже передают, заработают как есть.
+    Её вносит автор заказа (он получил деньги) ДО отгрузки; «оплату сразу» без
+    разбивки сервер не отгружает (409, code=payment_required).
     """
-    payload: dict[str, Any] = {"order_id": order_id, "idempotency_key": key()}
     if payments is not None:
-        payload["payments"] = payments
-    return w.call(uid, "/api/orders/ship", expect=expect, **payload)
+        owner = w.one("SELECT user_id FROM orders WHERE id = ?", (order_id,))["user_id"]
+        record_payment(w, owner, order_id, payments)
+    return w.call(uid, "/api/orders/ship", expect=expect, order_id=order_id, idempotency_key=key())
 
 
-def mark_paid(w: World, uid: int, order_id: int, amount: float | None = None, *, expect: int = 200) -> dict:
-    return w.call(uid, "/api/orders/mark_paid", expect=expect, order_id=order_id, amount=amount,
-                  idempotency_key=key())
+def mark_paid(w: World, uid: int, order_id: int, amount: float | None = None, *, method: str = "card",
+              expect: int = 200) -> dict:
+    """Оплата долга — тоже разбивкой (сумма без способа сервером не принимается)."""
+    if amount is None:
+        amount = w.call(uid, "/api/orders/payment_context", order_id=order_id)["due_cents"] / 100
+    return record_payment(w, uid, order_id, {method: amount}, expect=expect)
 
 
 def confirm_payments(w: World, uid: int, order_id: int, *, expect: int = 200) -> dict:

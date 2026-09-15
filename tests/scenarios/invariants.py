@@ -101,14 +101,90 @@ def money_is_consistent(db) -> None:
         )
         if o["status"] == "paid" or int(o["payment_confirmed"] or 0):
             assert o["remaining"] == 0, f"заказ #{oid} закрыт как оплаченный, а остаток {o['remaining']} коп."
-    for d in _rows(db, "SELECT d.id, d.amount_cents, COALESCE(SUM(cdo.amount_allocated_cents), 0) AS alloc "
-                       "FROM cash_deposits d LEFT JOIN cash_deposit_orders cdo ON cdo.deposit_id = d.id "
-                       "GROUP BY d.id, d.amount_cents"):
-        assert 0 <= int(d["alloc"]) <= int(d["amount_cents"]), (
+    # Распределено сдачей = прежнее распределение по долгам + наличные строки
+    # разбивки (обе части — в валюте сдачи: по долгам распределяется только
+    # сдача в базовой валюте на заказы в ней же).
+    for d in _rows(
+        db,
+        "SELECT d.id, d.amount_cents, "
+        "COALESCE((SELECT SUM(cdo.amount_allocated_cents) FROM cash_deposit_orders cdo "
+        "          WHERE cdo.deposit_id = d.id), 0) "
+        "+ COALESCE((SELECT SUM(cdp.amount_cents) FROM cash_deposit_parts cdp "
+        "            WHERE cdp.deposit_id = d.id), 0) AS alloc "
+        "FROM cash_deposits d",
+    ):
+        assert 0 <= int(d["alloc"]) <= max(int(d["amount_cents"]), 0), (
             f"сдача #{d['id']}: распределено {d['alloc']} из {d['amount_cents']} коп."
         )
     bad = _rows(db, "SELECT id, amount_cents FROM payments WHERE amount_cents <= 0")
     assert not bad, f"платежи с неположительной суммой: {bad}"
+
+
+def payment_breakdown_is_consistent(db) -> None:
+    """Разбивка «как получены деньги» (services.order_payments) сходится с деньгами.
+
+    * строка ↔ платёж один к одному: тот же заказ, сумма в валюте заказа равна
+      сумме платежа, валюта платежа — валюта заказа;
+    * сумма строки в своей валюте положительна, способ — из известных;
+    * сдача берёт наличную строку ЦЕЛИКОМ, в своей валюте, и одна строка не
+      лежит в двух живых сдачах сразу;
+    * у подтверждённой сдачи все её строки подтверждены, у отклонённой — нет
+      (подтверждённые наличные без живой сдачи бывают только через неё);
+    * наличный платёж подтверждён только сдачей.
+    """
+    from config import BASE_CURRENCY
+
+    base = (BASE_CURRENCY or "USD").upper()
+    parts = _rows(
+        db,
+        "SELECT pp.id, pp.payment_id, pp.order_id, pp.method, pp.currency, pp.amount_cents, "
+        "pp.order_amount_cents, p.order_id AS pay_order, p.amount_cents AS pay_cents, p.status, "
+        "UPPER(p.currency) AS pay_cur, UPPER(COALESCE(o.currency, '')) AS order_cur "
+        "FROM payment_parts pp JOIN payments p ON p.id = pp.payment_id JOIN orders o ON o.id = pp.order_id",
+    )
+    by_id = {int(r["id"]): r for r in parts}
+    for r in parts:
+        assert int(r["pay_order"]) == int(r["order_id"]), f"строка разбивки #{r['id']}: платёж другого заказа"
+        assert int(r["order_amount_cents"]) == int(r["pay_cents"]) > 0, (
+            f"строка разбивки #{r['id']}: {r['order_amount_cents']} ≠ платёж {r['pay_cents']} коп."
+        )
+        assert r["pay_cur"] == (r["order_cur"] or base), f"строка разбивки #{r['id']}: платёж не в валюте заказа"
+        assert int(r["amount_cents"]) > 0 and r["method"] in ("cash", "card", "bank"), r
+    links = _rows(
+        db,
+        "SELECT cdp.deposit_id, cdp.part_id, cdp.order_id, cdp.amount_cents, d.status, "
+        "COALESCE(UPPER(c.currency), ?) AS dep_cur FROM cash_deposit_parts cdp "
+        "JOIN cash_deposits d ON d.id = cdp.deposit_id "
+        "LEFT JOIN cash_deposit_currency c ON c.deposit_id = d.id",
+        (base,),
+    )
+    live: dict[int, int] = {}
+    for link in links:
+        part = by_id.get(int(link["part_id"]))
+        assert part is not None, f"сдача #{link['deposit_id']}: строка #{link['part_id']} не найдена"
+        assert part["method"] == "cash", f"сдача #{link['deposit_id']}: не наличная строка #{part['id']}"
+        assert int(link["order_id"]) == int(part["order_id"]), f"сдача #{link['deposit_id']}: заказ строки не тот"
+        assert int(link["amount_cents"]) == int(part["amount_cents"]), (
+            f"сдача #{link['deposit_id']}: строка #{part['id']} взята не целиком "
+            f"({link['amount_cents']} из {part['amount_cents']})"
+        )
+        assert link["dep_cur"] == str(part["currency"]).upper(), (
+            f"сдача #{link['deposit_id']} в {link['dep_cur']} закрывает наличные в {part['currency']}"
+        )
+        if link["status"] in ("pending", "confirmed"):
+            live[int(part["id"])] = live.get(int(part["id"]), 0) + 1
+        if link["status"] == "confirmed":
+            assert part["status"] == "confirmed", (
+                f"сдача #{link['deposit_id']} подтверждена, а платёж строки #{part['id']} — {part['status']}"
+            )
+    doubled = {pid: n for pid, n in live.items() if n > 1}
+    assert not doubled, f"наличные строки в нескольких живых сдачах: {doubled}"
+    confirmed_deposits = {
+        int(link["part_id"]) for link in links if link["status"] == "confirmed"
+    }
+    orphan = [r["id"] for r in parts if r["method"] == "cash" and r["status"] == "confirmed"
+              and int(r["id"]) not in confirmed_deposits]
+    assert not orphan, f"наличные подтверждены без сдачи: строки {orphan}"
 
 
 def orders_follow_their_status(db) -> None:
@@ -174,6 +250,7 @@ def check_all(w, *, error_records: list[logging.LogRecord] | None = None) -> Non
     stock_never_negative(w.db)
     stock_matches_invoices(w.db)
     money_is_consistent(w.db)
+    payment_breakdown_is_consistent(w.db)
     orders_follow_their_status(w.db)
     debts_api_matches_money(w)
     if w.wrote_something():

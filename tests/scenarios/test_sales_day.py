@@ -70,31 +70,36 @@ def test_credit_order_full_cycle_to_zero_debt(world):
     expect_audit(w.db, "shipment_request_sent", "order_shipped", "cash_deposit_confirmed")
 
 
-def test_paid_order_flow_auto_payment_then_confirmation(world):
-    """«Оплата сразу»: одобрение создаёт ожидающий платёж на всю сумму, босс
-    подтверждает — заказ закрыт, в «Долгах» его нет."""
+def test_paid_order_flow_breakdown_then_handover_and_card_confirmation(world):
+    """«Оплата сразу» 3 × 80: одобрение денег не заявляет; перед отгрузкой
+    менеджер вносит 140 наличными и 100 картой; руководитель подтверждает
+    карту, наличные закрывает сдача — заказ оплачен, в «Долгах» его нет."""
     w = world
     shop = _shop(w)
     order = _sell(w, shop, qty=3, price=80, payment_type="paid")
     oid = order["order_id"]
     f.approve(w, f.BOSS, order["req_id"])
-    pays = w.rows("SELECT amount_cents, status FROM payments WHERE order_id = ?", (oid,))
-    assert pays == [{"amount_cents": 24000, "status": "pending"}]
+    assert w.rows("SELECT 1 FROM payments WHERE order_id = ?", (oid,)) == [], "автоплатежа больше нет"
 
-    f.ship_order(w, f.KEEPER, oid, payments={"cash": 240})
-    f.confirm_payments(w, f.BOSS, oid)
+    f.ship_order(w, f.KEEPER, oid, payments={"cash": 140, "card": 100})
+    parts = w.rows("SELECT pp.method, pp.amount_cents, p.status FROM payment_parts pp "
+                   "JOIN payments p ON p.id = pp.payment_id WHERE pp.order_id = ? ORDER BY pp.id", (oid,))
+    assert parts == [{"method": "cash", "amount_cents": 14000, "status": "pending"},
+                     {"method": "card", "amount_cents": 10000, "status": "pending"}]
+    assert f.confirm_payments(w, f.BOSS, oid)["confirmed_count"] == 1, "кнопка подтверждает только карту"
+    assert f.debt_of(w, f.BOSS, oid)["remaining"] == 140
+
+    dep = f.hand_over_cash(w, f.MGR, 140)
+    assert w.rows("SELECT order_id, amount_cents FROM cash_deposit_parts WHERE deposit_id = ?",
+                  (dep["deposit_id"],)) == [{"order_id": oid, "amount_cents": 14000}]
+    assert f.confirm_deposit(w, f.BOSS, dep["deposit_id"])["closed_orders"] == [oid]
     row = w.one("SELECT status, paid_confirmed_at FROM orders WHERE id = ?", (oid,))
     assert row["paid_confirmed_at"], "оплата зафиксирована на заказе"
     assert f.debt_of(w, f.BOSS, oid) is None
     assert f.stock(w, shop["product"]) == 47
+    expect_audit(w.db, "order_payment_recorded", "cash_deposit_confirmed")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Известный пробел (поток payments-flow): оплаченный заказ отгружается без "
-    "разбивки оплаты по способам (наличные/карта/перечисление). Флипнется, когда "
-    "/api/orders/ship начнёт её требовать.",
-)
 def test_paid_order_cannot_be_shipped_without_payment_breakdown(world):
     w = world
     shop = _shop(w)
@@ -103,6 +108,10 @@ def test_paid_order_cannot_be_shipped_without_payment_breakdown(world):
     code = w.status(f.KEEPER, "/api/orders/ship", order_id=order["order_id"], idempotency_key=f.key())
     assert code in (400, 409), "отгрузка оплаченного заказа без способа оплаты должна отказать"
     assert f.order_status(w, order["order_id"]) == "approved"
+    # Не хватает — тоже отказ: «оплата сразу» вносится на всю сумму.
+    f.record_payment(w, f.MGR, order["order_id"], {"cash": 60}, expect=400)
+    f.ship_order(w, f.KEEPER, order["order_id"], payments={"cash": 60, "bank": 40})
+    assert f.order_status(w, order["order_id"]) == "shipped"
 
 
 def test_cancelled_order_returns_stock(world):
@@ -181,14 +190,6 @@ def test_cash_handover_is_allocated_fifo_across_orders(world):
     assert f.debt_of(w, f.MGR, newer["order_id"])["remaining"] == 100
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Известный баг (поток payments-flow): "
-    "сданные наличные по заказу «оплата сразу» ни к какому заказу не привязываются: "
-    "распределение идёт только по отгруженным, а автоплатёж одобрения уже заявил "
-    "всю сумму — сдача подтверждается «в никуда». Флипнется, когда распределение "
-    "сдачи починят.",
-)
 @pytest.mark.parametrize("shipped", [False, True], ids=["approved", "shipped"])
 def test_cash_handover_for_paid_order_settles_it(world, shipped):
     """Клиент заплатил наличными при заказе «оплата сразу», менеджер сдал их в
@@ -200,11 +201,15 @@ def test_cash_handover_for_paid_order_settles_it(world, shipped):
     f.approve(w, f.BOSS, order["req_id"])
     if shipped:
         f.ship_order(w, f.KEEPER, oid, payments={"cash": 300})
+    else:
+        # Деньги получены до отгрузки — внесены, товар ещё на складе.
+        f.record_payment(w, f.MGR, oid, {"cash": 300})
 
     dep = f.hand_over_cash(w, f.MGR, 300)
-    alloc = w.rows("SELECT order_id, amount_allocated_cents FROM cash_deposit_orders WHERE deposit_id = ?",
+    alloc = w.rows("SELECT order_id, amount_cents FROM cash_deposit_parts WHERE deposit_id = ?",
                    (dep["deposit_id"],))
-    assert alloc == [{"order_id": oid, "amount_allocated_cents": 30000}], "сдача не привязана к заказу"
+    assert alloc == [{"order_id": oid, "amount_cents": 30000}], "сдача не привязана к заказу"
+    assert w.rows("SELECT 1 FROM cash_deposit_orders WHERE deposit_id = ?", (dep["deposit_id"],)) == []
     f.confirm_deposit(w, f.BOSS, dep["deposit_id"])
     row = w.one("SELECT payment_confirmed, paid_confirmed_at FROM orders WHERE id = ?", (oid,))
     assert row["payment_confirmed"] or row["paid_confirmed_at"]
@@ -270,13 +275,6 @@ def test_full_return_of_unpaid_credit_clears_debt(world):
 # ─── Найдено сценариями: реальные дыры, закреплённые как ожидаемое поведение ──
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="БАГ (найден сценарием): отмена одобренного заказа «оплата сразу» оставляет "
-    "автоплатёж одобрения в статусе pending. В «Подтвердить» его не видно, но "
-    "/api/orders/confirm_payment по отменённому заказу его подтверждает — в «получено» "
-    "попадают деньги за отменённую продажу.",
-)
 def test_cancelling_paid_order_voids_its_pending_payment(world):
     w = world
     shop = _shop(w)
@@ -291,12 +289,6 @@ def test_cancelling_paid_order_voids_its_pending_payment(world):
     assert w.rows("SELECT 1 FROM payments WHERE order_id = ? AND status = 'confirmed'", (oid,)) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="БАГ (найден сценарием): если списание при одобрении не прошло (не хватило "
-    "остатка, order_shipment.failed_at), /api/orders/ship всё равно ставит «отгружен». "
-    "Товар уезжает, а остаток в учёте остаётся на полке; долг клиенту выставлен.",
-)
 def test_order_whose_write_off_failed_cannot_be_shipped(world):
     w = world
     shop = _shop(w, qty=10)
@@ -312,13 +304,6 @@ def test_order_whose_write_off_failed_cannot_be_shipped(world):
     assert f.order_status(w, second["order_id"]) == "approved"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="БАГ (найден сценарием): возврат «в счёт долга» по ПОЛНОСТЬЮ оплаченному заказу "
-    "принимается — долга нет, и сумма возврата (переплата клиента) исчезает: её нет ни "
-    "в долгах, ни в выдаче наличных. Ожидаемо: отказ (выбрать возврат наличными) или "
-    "учёт переплаты.",
-)
 def test_debt_reduction_return_on_fully_paid_order_is_refused(world):
     w = world
     shop = _shop(w, qty=10)

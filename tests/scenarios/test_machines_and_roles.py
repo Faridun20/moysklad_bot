@@ -85,9 +85,12 @@ _WORK_ENDPOINTS = [
 ]
 
 # Только руководство (менеджеру — 403, совмещение ролей этого не даёт).
+# `/api/orders/confirm_payment` и `reject_payment` здесь нет: карту/перечисление
+# сверяет бухгалтер, а менеджер пока бухгалтер (ROLE_ALSO_ACTS_AS,
+# services/order_payments.py) — см. test_manager_confirms_card_only_as_acting_bookkeeper.
 _BOSS_ONLY = [
     "/api/orders/requests", "/api/requests/approve", "/api/requests/reject", "/api/orders/cancel",
-    "/api/orders/confirm_payment", "/api/orders/reject_payment", "/api/returns/confirm",
+    "/api/returns/confirm",
     "/api/wh/invoices/cancel", "/api/machines/status", "/api/machines/deal", "/api/machines/receipt",
     "/api/containers/delete", "/api/credit/set",
 ]
@@ -115,6 +118,27 @@ def test_manager_is_refused_boss_actions(world):
                     idempotency_key=f.key(),
                     items=[{"product_id": pid, "quantity": 1, "price_cents": 100}]) == 403
     assert f.stock(w, pid) == 5
+
+
+def test_manager_confirms_card_only_as_acting_bookkeeper(world):
+    """Кладовщик и гость оплату по заказу не подтверждают; менеджер — да (он
+    пока бухгалтер), но наличные этой кнопкой не подтверждаются никем."""
+    w = world
+    pid = f.create_product(w, "Кабель")
+    f.incoming_invoice(w, f.MGR, [(pid, 10, None)])
+    cp = f.create_counterparty(w, f.MGR, "Клиент")
+    order = f.create_order(w, f.MGR, cp, "Клиент", [(pid, "Кабель", 2, 50)])
+    oid = order["order_id"]
+    f.approve(w, f.BOSS, order["req_id"])
+    f.ship_order(w, f.MGR, oid)
+    f.record_payment(w, f.MGR, oid, {"card": 60, "cash": 40})
+    for uid in (f.KEEPER, f.GUEST):
+        assert w.status(uid, "/api/orders/confirm_payment", order_id=oid, idempotency_key=f.key()) == 403
+    res = f.confirm_payments(w, f.MGR, oid)
+    assert res["confirmed_count"] == 1 and res["skipped_cash"] == 1
+    assert w.rows("SELECT p.status, pp.method FROM payments p JOIN payment_parts pp ON pp.payment_id = p.id "
+                  "ORDER BY pp.id") == [{"status": "confirmed", "method": "card"},
+                                         {"status": "pending", "method": "cash"}]
 
 
 def test_keeper_and_bookkeeper_stay_in_their_lane(world):

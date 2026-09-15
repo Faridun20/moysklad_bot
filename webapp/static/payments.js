@@ -96,12 +96,12 @@ async function payOpenForm({ orderId, ship = false, onDone }) {
     return `
       <div class="c-surface c-surface--pad pay-part" data-part="${i}">
         <div class="seg-row">${seg(PAY_METHODS, r.method, 'data-pay-method')}</div>
-        <div class="pay-row">
-          <input class="form-input pay-row-amount pay-part-amount" type="text" inputmode="decimal" autocomplete="off"
-                 placeholder="Сумма" aria-label="Сумма, строка ${i + 1}" value="${escapeHtml(r.amount)}">
+        <div class="seg-row">
           ${seg(ctx.currencies.map(c => [c, c]), r.currency, 'data-pay-cur')}
           ${rows.length > 1 ? `<button type="button" class="pay-toggle pay-part-del" aria-label="Убрать строку">${icon('trash')}</button>` : ''}
         </div>
+        <input class="form-input pay-part-amount" type="text" inputmode="decimal" autocomplete="off"
+               placeholder="Сумма, ${escapeHtml(r.currency)}" aria-label="Сумма, строка ${i + 1}" value="${escapeHtml(r.amount)}">
         ${rc ? `
           <label class="c-field">
             <span>Курс: ${escapeHtml(rc)} за 1 ${escapeHtml(base)}</span>

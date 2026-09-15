@@ -128,10 +128,13 @@ def _seed_layout(e2e, tmp_path: Path, *, accounting: bool = False) -> None:
     """Всё, что есть у обходчика, плюс то, на чём вёрстка ломалась на площадке.
 
     Длинные названия клиентов (пикер «Выбор клиента» и карточки), долг с
-    отмеченной оплатой («Ждёт: 12 130 USD / Останется»), крупная сумма в сумах,
-    много карточек — чтобы нижние доходили до панели.
+    внесённой разбивкой оплаты (наличные на руках + карта ждёт банка — длинные
+    строки состояния), «оплата сразу» без оплаты («Внесите оплату · …» на
+    карточке заказа), крупная сумма в сумах, много карточек — чтобы нижние
+    доходили до панели.
     """
-    from services.database import mark_order_paid, mark_order_shipped
+    from services.database import mark_order_shipped
+    from tests.e2e.conftest import pay_order
 
     seeded = _seed_rich(e2e, tmp_path)
     db = e2e.db
@@ -148,7 +151,11 @@ def _seed_layout(e2e, tmp_path: Path, *, accounting: bool = False) -> None:
     e2e.exec("UPDATE credit_limits SET limit_amount_cents = 99999999900")
     big = seed_order(e2e, qty=1, price=12130.0)
     assert e2e.run(mark_order_shipped(big["order_id"], e2e.ids["keeper"], "Keeper")).get("ok")
-    assert e2e.run(mark_order_paid(big["order_id"], e2e.ids["mgr"], "Manager", amount=12130.0))
+    # Разбивка: наличные остаются у менеджера (форма сдачи со списком заказов),
+    # карта ждёт подтверждения (карточки «Подтвердить» и «Долги»).
+    pay_order(e2e, big["order_id"], [("cash", 5000), ("card", 7130)])
+    # «Оплата сразу» одобрена, оплату не вносили — карточка «Внесите оплату».
+    seed_order(e2e, payment_type="paid", due_date=None, qty=3, price=4043.33, pay=None)
     uzs = seed_order(e2e, qty=1000, price=12130.0)
     e2e.exec("UPDATE orders SET currency = 'UZS' WHERE id = ?", (uzs["order_id"],))
     if accounting:
@@ -219,6 +226,21 @@ class Audit:
             p.keyboard.press("Escape")
             p.wait_for_timeout(50)
 
+    def payment_form(self, opener: str, name: str) -> None:
+        """Форма «Как получены деньги»: две строки, вторая — в сумах с курсом."""
+        p = self.page
+        if not p.locator(opener).count():
+            return
+        p.locator(opener).first.click()
+        p.wait_for_selector(".c-overlay .pay-part")
+        p.click(".c-overlay .pay-add-part")
+        p.locator(".c-overlay .pay-part").nth(1).locator('[data-pay-cur="UZS"]').click()
+        p.wait_for_selector(".c-overlay .pay-part-rate")
+        self.check(name, ".c-overlay")
+        while p.locator(".c-overlay").count():
+            p.keyboard.press("Escape")
+            p.wait_for_timeout(50)
+
     def order_editor(self, product_id: int) -> None:
         p = self.page
         go(p, "sales")
@@ -265,6 +287,31 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
     audit.check("money-debts-today")
     page.click('.seg-item[data-f="all"]')
     audit.idle()
+    if not accounting:
+        # Оплата долга — форма разбивки (при бухгалтерии её заменяет «Получил деньги»).
+        audit.payment_form("#content .btn-pay-debt", "debt-payment-form")
+        # «Оплата сразу» перед отгрузкой: карточка «Внесите оплату» и форма.
+        go(page, "sales")
+        tab(page, "orders")
+        audit.idle()
+        page.wait_for_selector("#content .btn-pay-order")
+        audit.check("sales-orders-needs-payment")
+        audit.payment_form("#content .btn-pay-order", "order-payment-form")
+        go(page, "money")
+        tab(page, "debts")
+        audit.idle()
+    if role == "mgr" and not accounting:
+        # «Сдать наличные»: на руках по заказам; переключение на сумы.
+        go(page, "money")
+        tab(page, "ops")
+        audit.idle()
+        page.wait_for_selector("#content .dep-order")
+        audit.check("money-ops-handover")
+        page.click('#content [data-dep-cur="UZS"]')
+        audit.check("money-ops-handover-uzs")
+        go(page, "money")
+        tab(page, "debts")
+        audit.idle()
     if page.locator("#content [data-buyer]").count():
         page.locator("#content [data-buyer]").first.click()
         audit.check("buyer-card")
