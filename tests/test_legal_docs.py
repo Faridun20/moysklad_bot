@@ -1,8 +1,8 @@
 """Юридические документы: пропись, график платежей, сборка контекста, PDF.
 
 Пропись и график проверяются подробно: это денежные поля подписываемого
-документа. Сам рендер — один smoke на каждый язык, он пропускается там, где
-нет LibreOffice (в CI его нет, в образе есть).
+документа. Сам рендер — по одному на каждый из трёх видов, он пропускается
+там, где нет LibreOffice (в CI его нет, в образе есть).
 """
 
 import os
@@ -76,19 +76,20 @@ def test_amount_in_words_rejects_unknown_language():
 
 
 def test_schedule_sums_exactly_to_total():
-    """Сумма графика обязана сойтись с суммой договора до копейки.
+    """Сумма графика обязана сойтись с суммой договора до сума.
 
-    25 000.00 / 6 не делится нацело: копейки от деления уходят в ПОСЛЕДНИЙ
+    25 000 000 / 6 не делится нацело: остаток от деления уходит в ПОСЛЕДНИЙ
     платёж. Клиент сложит колонку — она должна дать ровно сумму договора.
     """
-    rows = ld.build_schedule(2_500_000, 6, date(2026, 9, 12))
+    rows = ld.build_schedule(2_500_000_000, 6, date(2026, 9, 12))
     assert len(rows) == 6
-    total = sum(int(r["amount"].replace(" ", "").replace(".", "")) for r in rows)
-    assert total == 2_500_000
-    assert rows[-1]["balance"] == "0.00"
-    # Все платежи равны, кроме последнего — он добирает остаток.
-    assert rows[0]["amount"] == "4 166.66"
-    assert rows[-1]["amount"] == "4 166.70"
+    total = sum(int(r["amount"].replace(" ", "")) for r in rows)
+    assert total == 25_000_000
+    assert rows[-1]["balance"] == "0"
+    # Все платежи равны, кроме последнего — он добирает остаток. Тийинов нет.
+    assert rows[0]["amount"] == "4 166 666"
+    assert rows[-1]["amount"] == "4 166 670"
+    assert rows[0]["balance"] == "20 833 334"
 
 
 def test_schedule_dates_use_month_arithmetic():
@@ -98,14 +99,15 @@ def test_schedule_dates_use_month_arithmetic():
 
 
 def test_schedule_single_payment_is_whole_sum():
-    rows = ld.build_schedule(2_500_000, 1, date(2026, 9, 12))
+    rows = ld.build_schedule(2_500_000_000, 1, date(2026, 9, 12))
     assert len(rows) == 1
-    assert rows[0]["amount"] == "25 000.00"
-    assert rows[0]["balance"] == "0.00"
+    assert rows[0]["amount"] == "25 000 000"
+    assert rows[0]["balance"] == "0"
 
 
-@pytest.mark.parametrize("count,total", [(0, 1000), (-1, 1000), (2, 0), (2, -5)])
+@pytest.mark.parametrize("count,total", [(0, 1000), (-1, 1000), (2, 0), (2, -5), (2, 150)])
 def test_schedule_rejects_nonsense(count, total):
+    """В том числе тийины (150 копеек = 1,50 сума): сумы в расписке целые."""
     with pytest.raises(ld.DocumentError):
         ld.build_schedule(total, count, date(2026, 9, 12))
 
@@ -113,7 +115,7 @@ def test_schedule_rejects_nonsense(count, total):
 # ─── Контекст ─────────────────────────────────────────────────────────────────
 
 
-# Реквизиты, без которых расписка RU+UZ не собирается (см. _HANDWRITTEN_REQUIRED).
+# Реквизиты подписанта, без которых расписка не собирается (см. _REQUIRED_*).
 FULL_CREDITOR = {
     "name": "FARID IMPEKS LLC", "tin": "309876543", "address": "г. Ташкент, ул. Амира Темура, 107Б",
     "representative": "Масуджанов Фаридун", "position": "Директор", "position_uz": "Директор",
@@ -123,61 +125,62 @@ FULL_CREDITOR = {
 
 def _ctx(**over):
     base = dict(
-        doc_type="raspiska_ru", city="Ташкент",
-        debtor={"full_name": "Иванов Иван Иванович", "passport": "AA1234567"},
+        doc_type="raspiska_ru_uz", city="Ташкент",
         creditor=dict(FULL_CREDITOR),
-        product_name="Экскаватор JCB 3CX", total_cents=2_500_000, currency="USD",
-        start_date=date(2026, 9, 12), term_months=6,
-        payment_type="installment", installments_count=6,
-        penalty_rate="0,5", grace_days=5,
+        product_name="Экскаватор JCB 3CX", total_cents=2_500_000_000,
+        start_date=date(2026, 9, 12), term_months=6, installments_count=6,
+        debtor_full_name="Иванов Иван Иванович",
     )
     base.update(over)
     return ld.build_context(**base)
 
 
-def test_context_covers_every_template_placeholder():
-    """Ключи контекста обязаны покрывать плейсхолдеры шаблона.
+def test_all_document_types_are_the_handwritten_lawyer_form():
+    """Три вида одного бланка: RU+UZ, рус., ўзб. Старые ключи сохранены — на
+    них ссылаются записи generated_documents в проде."""
+    assert list(ld.TEMPLATES) == ["raspiska_ru_uz", "raspiska_ru", "tilxat_uz"]
+    assert set(ld.TEMPLATES) == ld.HANDWRITTEN_TYPES
+    assert ld.DOCUMENT_CURRENCY == "UZS"
 
-    Недостающий ключ docxtpl отрисует ПУСТОТОЙ — документ уйдёт клиенту с
-    дырой на месте паспорта или суммы, и ни одна проверка этого не заметит.
-    """
+
+def _template_text(doc_type) -> str:
     import re
     import zipfile
 
-    for doc_type in ld.TEMPLATES:
-        xml = zipfile.ZipFile(ld.template_path(doc_type)).read("word/document.xml").decode()
-        text = re.sub(r"<[^>]+>", "", xml)
-        placeholders = {
-            m for m in re.findall(r"\{\{\s*([\w.]+)\s*\}\}", text)
-            if not m.startswith("item.")
-        }
-        ctx = _ctx(doc_type=doc_type)
-        missing = placeholders - set(ctx)
-        assert not missing, f"{doc_type}: контекст не отдаёт {sorted(missing)}"
+    xml = zipfile.ZipFile(ld.template_path(doc_type)).read("word/document.xml").decode()
+    return re.sub(r"<[^>]+>", "", xml)
 
 
-def test_payment_clause_matches_document_language():
-    """Пункт о порядке оплаты — на языке документа.
+@pytest.mark.parametrize("doc_type", list(ld.TEMPLATES))
+def test_context_covers_every_template_placeholder(doc_type):
+    """Ключи контекста обязаны покрывать плейсхолдеры шаблона.
 
-    В русской расписке узбекская фраза выглядит как ошибка нотариуса;
-    поймать её может только человек, читающий текст, поэтому тест.
+    Недостающий ключ docxtpl отрисует ПУСТОТОЙ — документ уйдёт клиенту с
+    дырой на месте суммы или реквизитов, и ни одна проверка этого не заметит.
     """
-    ru = _ctx(doc_type="raspiska_ru")["payment_clause"]
-    uz = _ctx(doc_type="tilxat_uz")["payment_clause"]
-    assert "рассрочку" in ru
-    assert "тўлаш" in uz
-    assert ru != uz
+    import re
+
+    placeholders = {
+        m for m in re.findall(r"\{\{\s*([\w.]+)\s*\}\}", _template_text(doc_type))
+        if not m.startswith("item.")
+    }
+    assert placeholders, "в шаблоне нет ни одного плейсхолдера — собран не тот файл"
+    missing = placeholders - set(_ctx(doc_type=doc_type))
+    assert not missing, f"{doc_type}: контекст не отдаёт {sorted(missing)}"
 
 
-def test_amount_words_match_document_language():
-    assert _ctx(doc_type="raspiska_ru")["total_amount_words"] == "двадцать пять тысяч"
-    assert _ctx(doc_type="tilxat_uz")["total_amount_words"] == "йигирма беш минг"
+def test_amount_words_in_both_languages():
+    """Сумма печатается цифрами и прописью, пропись — на языке своей части."""
+    ctx = _ctx()
+    assert ctx["total_amount"] == "25 000 000"
+    assert ctx["total_amount_words_ru"] == "двадцать пять миллионов"
+    assert ctx["total_amount_words_uz"] == "йигирма беш миллион"
 
 
 def test_single_payment_gives_one_row():
-    ctx = _ctx(payment_type="single", installments_count=None)
+    ctx = _ctx(installments_count=1)
     assert len(ctx["schedule"]) == 1
-    assert "единовременным" in ctx["payment_clause"]
+    assert ctx["schedule"][0]["amount"] == "25 000 000"
 
 
 def test_installments_longer_than_term_rejected():
@@ -190,9 +193,9 @@ def test_installments_longer_than_term_rejected():
     "over,msg",
     [
         ({"doc_type": "нет-такого"}, "тип документа"),
-        ({"payment_type": "кредит"}, "тип оплаты"),
-        ({"payment_type": "installment", "installments_count": 1}, "двух платежей"),
+        ({"installments_count": 0}, "больше нуля"),
         ({"term_months": 0}, "не меньше месяца"),
+        ({"total_cents": 150}, "тийинов"),
     ],
 )
 def test_context_validation(over, msg):
@@ -204,42 +207,49 @@ def test_end_date_is_start_plus_term():
     assert _ctx(term_months=6)["end_date"] == "12.03.2027"
 
 
-# ─── Рендер ───────────────────────────────────────────────────────────────────
+def test_requires_signatory_requisites():
+    with pytest.raises(ld.DocumentError, match="Реквизитах компании.*ИНН.*должность подписанта"):
+        _ctx(creditor={"name": "X", "representative": "Петров"})
 
 
-@pytest.mark.skipif(not HAS_SOFFICE, reason="нет LibreOffice (в образе он есть)")
-@pytest.mark.parametrize("doc_type", ["raspiska_ru", "tilxat_uz"])
-def test_render_pdf(doc_type, tmp_path):
-    import asyncio
-
-    from pypdf import PdfReader
-
-    ctx = _ctx(doc_type=doc_type, witness_name="Петров П.П.")
-    pdf = asyncio.run(ld.render_pdf(doc_type, ctx, tmp_path))
-    assert pdf.is_file()
-    assert pdf.name.startswith(doc_type)
-
-    raw = "\n".join(p.extract_text() for p in PdfReader(str(pdf)).pages)
-    # Пробелы схлопываем: LibreOffice переносит строки по ширине страницы, и
-    # «Экскаватор JCB 3CX» может приехать разорванным. Проверяем содержание,
-    # а не вёрстку — иначе тест ломается от правки любого поля выше по тексту.
-    text = " ".join(raw.split())
-    assert "Иванов Иван Иванович" in text
-    assert "Экскаватор JCB 3CX" in text
-    # Ни один плейсхолдер не должен доехать до подписи.
-    assert "{{" not in text and "{%" not in text
-    # Условный абзац свидетеля отработал.
-    assert "Петров" in text
-    # График попал в таблицу целиком.
-    assert text.count("4 166.66") == 5
+@pytest.mark.parametrize(
+    "doc_type,needed,not_needed",
+    [
+        ("raspiska_ru", "position", "position_uz"),
+        ("tilxat_uz", "position_uz", "position"),
+    ],
+)
+def test_single_language_requires_only_its_own_position(doc_type, needed, not_needed):
+    """Русской расписке узбекская должность не нужна, тилхату — русская:
+    в документ они не печатаются."""
+    _ctx(doc_type=doc_type, creditor={**FULL_CREDITOR, not_needed: ""})
+    with pytest.raises(ld.DocumentError, match="должность подписанта"):
+        _ctx(doc_type=doc_type, creditor={**FULL_CREDITOR, needed: ""})
 
 
-@pytest.mark.skipif(not HAS_SOFFICE, reason="нет LibreOffice")
-def test_render_reports_missing_template():
-    import asyncio
+def test_basis_is_charter_or_power_of_attorney():
+    charter = _ctx()
+    assert (charter["creditor_basis_ru"], charter["creditor_basis_uz"]) == ("Устава", "Устав")
 
-    with pytest.raises(ld.DocumentError, match="Шаблон не найден"):
-        asyncio.run(ld.render_pdf("raspiska_ru", _ctx(), "/tmp", template_override="/nope.docx"))
+    poa = _ctx(creditor={**FULL_CREDITOR, "poa_number": "12", "poa_date": "01.02.2026"})
+    assert poa["creditor_basis_ru"] == "доверенности № 12 от 01.02.2026"
+    assert poa["creditor_basis_uz"] == "01.02.2026 йилдаги № 12 ишончнома"
+
+
+def test_genitive_signatory_falls_back_without_inventing_endings():
+    """Родительный падеж — из реквизитов как есть; нет его — должность и ФИО
+    без выдуманных окончаний."""
+    assert _ctx()["creditor_representative_gen"] == "директора Масуджанова Фаридуна"
+    plain = {k: v for k, v in FULL_CREDITOR.items() if k != "representative_gen"}
+    assert _ctx(creditor=plain)["creditor_representative_gen"] == "Директор Масуджанов Фаридун"
+
+
+def test_uzbek_city_falls_back_to_city():
+    assert _ctx()["city_uz"] == "Ташкент"
+    assert _ctx(creditor={**FULL_CREDITOR, "city_uz": "Тошкент"})["city_uz"] == "Тошкент"
+
+
+# ─── Шаблоны: три вида одного бланка юриста ───────────────────────────────────
 
 
 def _docx_paragraphs(path) -> list[str]:
@@ -253,146 +263,157 @@ def _docx_paragraphs(path) -> list[str]:
     return rows
 
 
-def test_committed_templates_match_the_generator(tmp_path):
-    """Шаблон в репозитории — результат прогона `scripts/build_legal_templates`.
+@pytest.mark.parametrize("doc_type", list(ld.TEMPLATES))
+def test_committed_templates_match_the_lawyer_source(doc_type, tmp_path):
+    """Шаблоны — результат `scripts/build_raspiska_ru_uz` над бланком юриста.
 
-    .docx двоичный: правку в нём не видно в диффе и не отревьюить. Исходник —
-    скрипт, а расхождение между ним и файлом означает, что кто-то поправил
-    шаблон в Word и следующий прогон скрипта эту правку молча затрёт.
-    """
-    from scripts import build_legal_templates as gen
-
-    for doc_type, builder in (("raspiska_ru", gen.build_ru), ("tilxat_uz", gen.build_uz)):
-        fresh = tmp_path / f"{doc_type}.docx"
-        builder().save(str(fresh))
-        assert _docx_paragraphs(fresh) == _docx_paragraphs(ld.template_path(doc_type)), (
-            f"{doc_type}: шаблон разошёлся со скриптом — "
-            "пересоберите `python -m scripts.build_legal_templates`"
-        )
-
-
-def test_template_keeps_the_look_of_the_sample():
-    """Вид расписки взят с образца руководства — проверяем его приметы.
-
-    Заголовок обычным начертанием (не капсом), город и дата ОДНОЙ строкой,
-    сумма — отдельным жирным абзацем, подпись — линейкой во всю ширину с
-    мелкой подписью под ней. Всё это легко потерять при следующей правке
-    текста, а заметно только на распечатанном документе.
-    """
-    from docx import Document
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.oxml.ns import qn
-
-    doc = Document(str(ld.template_path("raspiska_ru")))
-    pars = doc.paragraphs
-
-    assert pars[0].text == "Расписка"
-    assert pars[0].alignment == WD_ALIGN_PARAGRAPH.CENTER
-
-    # Город и дата — один абзац с табуляцией, а не два выключенных по краям.
-    assert pars[1].text == "г. {{ city }}\t{{ document_date }} г."
-
-    amount = next(p for p in pars if p.text.startswith("{{ total_amount }}"))
-    assert all(run.bold for run in amount.runs), "сумма должна быть жирной"
-
-    consent = next(p for p in pars if p.text.startswith("Содержание настоящей расписки"))
-    assert all(run.bold for run in consent.runs)
-
-    ruled = [p for p in pars if p._element.find(qn("w:pPr")) is not None
-             and p._element.find(qn("w:pPr")).find(qn("w:pBdr")) is not None]
-    assert len(ruled) == 3, "линейка под подпись: должник, кредитор, свидетель"
-    assert sum("(подпись, фамилия" in p.text for p in pars) == 3
-
-
-# ─── Расписка RU+UZ (бланк юриста, данные должника — от руки) ─────────────────
-
-
-def test_ru_uz_only_in_dollars():
-    """Текст бланка: «стоимость определена в долларах США». Сумовая расписка
-    с этим текстом противоречила бы сама себе."""
-    with pytest.raises(ld.DocumentError, match="долларах США"):
-        _ctx(doc_type="raspiska_ru_uz", currency="UZS")
-
-
-def test_ru_uz_requires_signatory_requisites():
-    with pytest.raises(ld.DocumentError, match="должность подписанта.*ИНН|ИНН.*должность"):
-        _ctx(doc_type="raspiska_ru_uz", creditor={"name": "X", "representative": "Петров"})
-
-
-def test_ru_uz_basis_is_charter_or_power_of_attorney():
-    charter = _ctx(doc_type="raspiska_ru_uz")
-    assert (charter["creditor_basis_ru"], charter["creditor_basis_uz"]) == ("Устава", "Устав")
-
-    poa = _ctx(doc_type="raspiska_ru_uz",
-               creditor={**FULL_CREDITOR, "poa_number": "12", "poa_date": "01.02.2026"})
-    assert poa["creditor_basis_ru"] == "доверенности № 12 от 01.02.2026"
-    assert poa["creditor_basis_uz"] == "01.02.2026 йилдаги № 12 ишончнома"
-
-
-def test_ru_uz_genitive_signatory_falls_back_without_inventing_endings():
-    """Родительный падеж — из реквизитов как есть; нет его — должность и ФИО
-    без выдуманных окончаний."""
-    assert _ctx(doc_type="raspiska_ru_uz")["creditor_representative_gen"] == "директора Масуджанова Фаридуна"
-    plain = {k: v for k, v in FULL_CREDITOR.items() if k != "representative_gen"}
-    assert _ctx(doc_type="raspiska_ru_uz", creditor=plain)["creditor_representative_gen"] == (
-        "Директор Масуджанов Фаридун"
-    )
-
-
-def test_ru_uz_uzbek_city_falls_back_to_city():
-    assert _ctx(doc_type="raspiska_ru_uz")["city_uz"] == "Ташкент"
-    assert _ctx(doc_type="raspiska_ru_uz", creditor={**FULL_CREDITOR, "city_uz": "Тошкент"})["city_uz"] == "Тошкент"
-
-
-def test_ru_uz_template_matches_the_lawyer_source(tmp_path):
-    """Шаблон — результат `scripts/build_raspiska_ru_uz` над бланком юриста.
-
-    Правка .docx руками разошлась бы со скриптом и молча пропала при
-    следующей сборке. Заодно: ни одной [скобки] бланка не осталось.
+    .docx двоичный: правку в нём не видно в диффе и не отревьюить, а правка
+    руками разошлась бы со скриптом и молча пропала при следующей сборке
+    (сравниваются тексты, не байты: zip несёт таймстемпы). Заодно: ни одной
+    [скобки] бланка не осталось.
     """
     from scripts import build_raspiska_ru_uz as gen
 
-    fresh = tmp_path / "raspiska_ru_uz.docx"
-    gen.build().save(str(fresh))
-    committed = _docx_paragraphs(ld.template_path("raspiska_ru_uz"))
+    assert set(gen.VARIANTS) == set(ld.TEMPLATES)
+    assert f"{doc_type}.docx" == ld.TEMPLATES[doc_type][0]
+    fresh = tmp_path / f"{doc_type}.docx"
+    gen.build(doc_type).save(str(fresh))
+    committed = _docx_paragraphs(ld.template_path(doc_type))
     assert _docx_paragraphs(fresh) == committed, (
-        "шаблон разошёлся со скриптом — пересоберите `python -m scripts.build_raspiska_ru_uz`"
+        f"{doc_type}: шаблон разошёлся со скриптом — пересоберите `python -m scripts.build_raspiska_ru_uz`"
     )
     assert not [t for t in committed if "[" in t]
 
 
-def test_ru_uz_keeps_handwritten_lines_and_layout():
-    """Данные должника и сумма остаются чертой «от руки»; город и дата — одной
-    строкой через табуляцию (в бланке пробелы, и дата уезжала на вторую строку);
-    заголовок графика не отрывается от таблицы."""
+def test_single_language_templates_hold_only_their_part():
+    """Одноязычный вид — ровно своя часть бланка: без текста другого языка и
+    без разрыва страницы (он дал бы пустую страницу в PDF)."""
     from docx import Document
+    from docx.oxml.ns import qn
+
+    both = _template_text("raspiska_ru_uz")
+    ru = _template_text("raspiska_ru").strip()
+    uz = _template_text("tilxat_uz").strip()
+    assert "РАСПИСКА" in both and "ТИЛХАТ" in both
+    assert ru.startswith("РАСПИСКА") and "ТИЛХАТ" not in ru and "Қарздор" not in ru
+    assert uz.startswith("ТИЛХАТ") and "РАСПИСКА" not in uz and "Должник" not in uz
+    for doc_type in ("raspiska_ru", "tilxat_uz"):
+        body = Document(str(ld.template_path(doc_type))).element.body
+        assert not [br for br in body.iter(qn("w:br")) if br.get(qn("w:type")) == "page"], doc_type
+    assert len(Document(str(ld.template_path("raspiska_ru_uz"))).tables) == 2
+    assert len(Document(str(ld.template_path("raspiska_ru"))).tables) == 1
+    assert len(Document(str(ld.template_path("tilxat_uz"))).tables) == 1
+
+
+def test_language_clause_is_edited_only_in_single_language_templates():
+    """Единственное отступление от текста юриста: в одноязычном документе нет
+    второго языка, на который ссылается пункт 8. В двуязычном — дословно."""
+    from scripts import build_raspiska_ru_uz as gen
+
+    both = " ".join(_docx_paragraphs(ld.template_path("raspiska_ru_uz")))
+    ru = _docx_paragraphs(ld.template_path("raspiska_ru"))
+    uz = _docx_paragraphs(ld.template_path("tilxat_uz"))
+    for lang, (old, new) in gen.LANGUAGE_CLAUSE.items():
+        assert old in both and new not in both, lang
+    assert "8. Настоящая расписка составлена в двух экземплярах, имеющих одинаковую юридическую силу." in ru
+    assert "8. Ушбу тилхат бир хил юридик кучга эга бўлган икки нусхада тузилди." in uz
+    assert not [t for t in ru + uz if "узбекском" in t or "ўзбек тил" in t]
+
+
+def test_template_keeps_handwritten_lines_and_layout():
+    """Личные данные Должника остаются чертой «от руки»; сумма печатается;
+    город и дата — одной строкой через табуляцию (в бланке пробелы, и дата
+    уезжала на вторую строку); заголовок графика не отрывается от таблицы;
+    строки графика не рвутся, cantSplit — первым в w:trPr."""
+    from docx import Document
+    from docx.oxml.ns import qn
 
     doc = Document(str(ld.template_path("raspiska_ru_uz")))
     texts = [p.text for p in doc.paragraphs]
-    assert sum(t.startswith("Сумма цифрами: ____") for t in texts) == 1
-    assert sum(t.startswith("Рақамда: ____") for t in texts) == 1
+    assert sum(t.startswith("Я, ____") for t in texts) == 1
+    assert sum(t.startswith("Мен, ____") for t in texts) == 1
+    assert sum("Паспорт (серия, номер): ____" in t for t in texts) == 1
     assert "г. {{ city }}\t«___» _______________ 20__ г." in texts
     assert "{{ city_uz }} ш.\t«___» _______________ 20__ й." in texts
-    headings = [p for p in doc.paragraphs if p.text in ("3. График платежей:", "3. Тўлов жадвали:")]
+    assert sum("общей стоимостью {{ total_amount }} ({{ total_amount_words_ru }}) сум" in t for t in texts) == 1
+    assert sum("умумий қиймати {{ total_amount }} ({{ total_amount_words_uz }}) сўм" in t for t in texts) == 1
+    headings = [p for p in doc.paragraphs if p.text in ("2. График платежей:", "2. Тўлов жадвали:")]
     assert len(headings) == 2 and all(p.paragraph_format.keep_with_next for p in headings)
+    for table in doc.tables:
+        cells = [[c.text for c in row.cells] for row in table.rows]
+        assert cells[1][0] == "{%tr for item in schedule %}" and cells[3][0] == "{%tr endfor %}"
+        assert cells[2] == ["{{ item.number }}", "{{ item.date }}", "{{ item.amount }}", "{{ item.balance }}"]
+        for row in table.rows:
+            assert row._tr.trPr[0].tag == qn("w:cantSplit")
+        assert table.rows[0]._tr.trPr.find(qn("w:tblHeader")) is not None
+
+
+# ─── Рендер ───────────────────────────────────────────────────────────────────
+
+
+# pypdf выносит «қ», «ҳ», «ғ» из шрифта LibreOffice в конец строки («умумий
+# иймати … қ»): глифы без ToUnicode. Сравниваем узбекский текст без этих букв —
+# и в PDF, и в ожидаемой фразе, — остальные буквы стоят на местах.
+_UZ_DETACHED = str.maketrans("", "", "қҳғҚҲҒ")
+
+
+def _pdf_text(pdf) -> tuple[str, list[str]]:
+    from pypdf import PdfReader
+
+    pages = [p.extract_text() for p in PdfReader(str(pdf)).pages]
+    # Пробелы схлопываем: LibreOffice переносит строки по ширине страницы, и
+    # «Экскаватор JCB 3CX» может приехать разорванным. Проверяем содержание,
+    # а не вёрстку — иначе тест ломается от правки любого поля выше по тексту.
+    return " ".join(" ".join(pages).translate(_UZ_DETACHED).split()), pages
 
 
 @pytest.mark.skipif(not HAS_SOFFICE, reason="нет LibreOffice (в образе он есть)")
-def test_render_ru_uz_pdf(tmp_path):
+@pytest.mark.parametrize("doc_type", list(ld.TEMPLATES))
+def test_render_pdf(doc_type, tmp_path):
     import asyncio
 
-    from pypdf import PdfReader
+    ctx = _ctx(doc_type=doc_type, creditor={**FULL_CREDITOR, "city_uz": "Тошкент"},
+               term_months=12, installments_count=12)
+    pdf = asyncio.run(ld.render_pdf(doc_type, ctx, tmp_path))
+    assert pdf.is_file() and pdf.name.startswith(doc_type)
+    text, pages = _pdf_text(pdf)
+    parts = ld.TEMPLATES[doc_type][1]
 
-    ctx = _ctx(doc_type="raspiska_ru_uz", creditor={**FULL_CREDITOR, "city_uz": "Тошкент"})
-    pdf = asyncio.run(ld.render_pdf("raspiska_ru_uz", ctx, tmp_path))
-    text = " ".join(" ".join(p.extract_text() for p in PdfReader(str(pdf)).pages).split())
+    # Ни один плейсхолдер и ни одна скобка бланка не доехали до подписи.
     assert "{{" not in text and "{%" not in text and "[" not in text
-    assert text.count("Экскаватор JCB 3CX") == 2, "товар — в русской и узбекской части"
-    assert "в лице директора Масуджанова Фаридуна, действующего на основании Устава" in text
-    # График из шести платежей — в обеих таблицах.
-    assert text.count("4 166.66 USD") == 10
     # ФИО должника в документ не печатается: его пишут от руки.
     assert "Иванов" not in text
+    assert text.count("Экскаватор JCB 3CX") == len(parts)
+    # График из 12 платежей: 11 равных и последний с остатком — в каждой части
+    # («2 083 337» дважды: остаток после 11-го платежа и сам 12-й платёж).
+    assert text.count("2 083 333") == 11 * len(parts)
+    assert text.count("2 083 337") == 2 * len(parts)
+    assert ("РАСПИСКА" in text) == ("ru" in parts)
+    assert ("ТИЛХАТ" in text) == ("uz" in parts)
+    if "ru" in parts:
+        assert "в лице директора Масуджанова Фаридуна, действующего на основании Устава" in text
+        assert "общей стоимостью 25 000 000 (двадцать пять миллионов) сум" in text
+    else:
+        assert "Должник" not in text and "долга" not in text
+    if "uz" in parts:
+        assert "умумий қиймати 25 000 000 (йигирма беш миллион) сўм".translate(_UZ_DETACHED) in text
+        assert "Тошкент ш." in text
+    else:
+        assert "арздор" not in text and "сўм" not in text
+    # Пустой страницы на месте отрезанного разрыва нет: на каждой — текст.
+    # (Число страниц зависит от длины графика: блоки подписей держатся
+    # вместе и при 12 платежах уходят на третью страницу — это не пустота.)
+    assert all(page.strip() for page in pages), f"{doc_type}: пустая страница"
+    first = " ".join(pages[0].split())
+    assert first.startswith("РАСПИСКА" if "ru" in parts else "ТИЛХАТ")
+
+
+@pytest.mark.skipif(not HAS_SOFFICE, reason="нет LibreOffice")
+def test_render_reports_missing_template():
+    import asyncio
+
+    with pytest.raises(ld.DocumentError, match="Шаблон не найден"):
+        asyncio.run(ld.render_pdf("raspiska_ru", _ctx(), "/tmp", template_override="/nope.docx"))
 
 
 # ─── Имя файла и ошибки LibreOffice (без бинаря: мок границы subprocess) ──────

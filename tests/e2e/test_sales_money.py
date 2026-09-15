@@ -436,6 +436,20 @@ def test_manager_deletes_own_draft(open_app, e2e):
 # ─── Документы: расписка из формы → PDF в Telegram → печать ──────────────────
 
 
+# Реквизиты подписанта печатаются в каждом виде расписки и обязательны.
+_SIGNATORY = {
+    "company_name": "ООО Ромашка", "company_tin": "123456789", "company_address": "Ташкент",
+    "company_representative": "Петров Пётр", "company_position": "Директор",
+    "company_position_uz": "Директор", "company_representative_gen": "директора Петрова Петра",
+    "company_city": "Ташкент", "company_city_uz": "Тошкент",
+}
+
+# Поля прежней формы, которых бланк юриста не печатает.
+_GONE_FIELDS = ("debtor_passport", "debtor_pinfl", "debtor_birth_date", "debtor_address", "debtor_phone",
+                "currency", "penalty_rate", "grace_days", "witness_name", "company_representative",
+                "payment_type")
+
+
 def test_manager_creates_raspiska_and_prints_it(open_app, e2e, monkeypatch, tmp_path):
     """Расписку раньше было негде составить: движок был, входа не было.
 
@@ -469,8 +483,8 @@ def test_manager_creates_raspiska_and_prints_it(open_app, e2e, monkeypatch, tmp_
     monkeypatch.setattr(documents, "render_pdf", fake_render)
     monkeypatch.setattr(printing, "is_available", lambda: True)
     monkeypatch.setattr(printing, "print_pdf_bytes", fake_print)
-    e2e.db.set_setting("company_name", "ООО Ромашка", e2e.ids["boss"])
-    e2e.db.set_setting("company_city", "Ташкент", e2e.ids["boss"])
+    for key, value in _SIGNATORY.items():
+        e2e.db.set_setting(key, value, e2e.ids["boss"])
 
     mgr = open_app(e2e.ids["mgr"])
     go(mgr, "sales")
@@ -486,7 +500,7 @@ def test_manager_creates_raspiska_and_prints_it(open_app, e2e, monkeypatch, tmp_
     )
     mgr.fill("#ms-f-debtor_full_name", "Иванов Иван Иванович")
     mgr.fill("#ms-f-product_name", "Экскаватор JCB 3CX")
-    mgr.fill("#ms-f-total_amount", "25000")
+    mgr.fill("#ms-f-total_amount", "25000000")
     mgr.fill("#ms-f-term_months", "6")
     # Переключателя «Порядок оплаты» больше нет: рассрочку задаёт само число
     # платежей. Два поля противоречили друг другу — менеджер вписывал шесть
@@ -502,7 +516,7 @@ def test_manager_creates_raspiska_and_prints_it(open_app, e2e, monkeypatch, tmp_
         "SELECT client_name, total_amount_cents, payment_type, installments_count "
         "FROM generated_documents"
     )
-    assert docs == [{"client_name": "Иванов Иван Иванович", "total_amount_cents": 2_500_000,
+    assert docs == [{"client_name": "Иванов Иван Иванович", "total_amount_cents": 2_500_000_000,
                      "payment_type": "installment", "installments_count": 6}]
     # PDF ушёл составителю с кнопкой «Распечатать» (prn:doc:<id>).
     assert [d["chat_id"] for d in e2e.bot.documents] == [e2e.ids["mgr"]]
@@ -515,7 +529,7 @@ def test_manager_creates_raspiska_and_prints_it(open_app, e2e, monkeypatch, tmp_
 
     # Ошибка формы остаётся В форме, а не закрывает её.
     mgr.click("#doc-new")
-    mgr.click('[data-opt="raspiska_ru"]')  # по умолчанию — RU+UZ, ей нужны полные реквизиты
+    mgr.click('[data-opt="raspiska_ru"]')
     mgr.fill("#ms-f-debtor_full_name", "Петров")
     mgr.fill("#ms-f-product_name", "Ковш")
     mgr.fill("#ms-f-total_amount", "100")
@@ -560,10 +574,10 @@ def test_invoice_list_has_no_print_button_without_cups(open_app, e2e, monkeypatc
     assert boss.locator("[data-wh-print]").count() == 0
 
 
-def test_ru_uz_receipt_form_hides_handwritten_fields(open_app, e2e, monkeypatch, tmp_path):
-    """Расписка RU+UZ: паспорт, адрес, пеню и валюту в неё не печатают —
-    Должник пишет данные от руки, условия зашиты в текст юриста. Форма их
-    прячет и возвращает при переключении на обычную расписку."""
+def test_receipt_form_offers_three_kinds_of_one_form(open_app, e2e, monkeypatch, tmp_path):
+    """Три вида одного бланка юриста — RU+UZ (по умолчанию), рус., ўзб. Поля
+    у них одинаковые и только те, что попадают в документ: паспорт, адрес и
+    телефон Должник пишет от руки, пеня — в тексте бланка, валюта — сумы."""
     # PDF собирает LibreOffice, которого в CI нет: тест про форму, а не про
     # вёрстку (её проверяет tests/test_legal_docs.py там, где soffice есть).
     from pathlib import Path
@@ -582,12 +596,7 @@ def test_ru_uz_receipt_form_hides_handwritten_fields(open_app, e2e, monkeypatch,
 
     monkeypatch.setattr(documents, "render_pdf", fake_render)
     monkeypatch.setenv("DOCUMENTS_DIR", str(tmp_path / "docs"))
-    for key, value in {
-        "company_name": "ООО Ромашка", "company_tin": "123456789", "company_address": "Ташкент",
-        "company_representative": "Петров Пётр", "company_position": "Директор",
-        "company_position_uz": "Директор", "company_representative_gen": "директора Петрова Петра",
-        "company_city": "Ташкент", "company_city_uz": "Тошкент",
-    }.items():
+    for key, value in _SIGNATORY.items():
         e2e.db.set_setting(key, value, e2e.ids["boss"])
 
     mgr = open_app(e2e.ids["mgr"])
@@ -595,27 +604,34 @@ def test_ru_uz_receipt_form_hides_handwritten_fields(open_app, e2e, monkeypatch,
     tab(mgr, "docs")
     mgr.click("#doc-new")
     mgr.wait_for_selector("#ms-f-doc_type", state="attached")  # скрытое поле сегмента
-    assert mgr.input_value("#ms-f-doc_type") == "raspiska_ru_uz", "новый формат — по умолчанию"
-    for key in ("debtor_passport", "debtor_address", "penalty_rate", "currency", "witness_name"):
-        assert not mgr.locator(f"#ms-f-{key}").is_visible(), f"{key} не печатается в RU+UZ"
-    assert mgr.locator("text=Должник впишет сам").is_visible()
+    assert mgr.input_value("#ms-f-doc_type") == "raspiska_ru_uz", "RU+UZ — по умолчанию"
+    assert mgr.locator("[data-opt]").evaluate_all("els => els.map(e => [e.dataset.opt, e.textContent])") == [
+        ["raspiska_ru_uz", "Расписка RU+UZ"], ["raspiska_ru", "Расписка (рус.)"], ["tilxat_uz", "Тилхат (ўзб.)"],
+    ]
+    fields = mgr.locator(".c-overlay [id^='ms-f-']").evaluate_all("els => els.map(e => e.id.slice(5))")
+    assert fields == ["doc_type", "debtor_full_name", "product_name", "total_amount", "start_date",
+                      "term_months", "installments_count", "city"]
+    assert not [k for k in _GONE_FIELDS if k in fields]
+    assert mgr.locator("text=В документ не печатается").is_visible()
+    assert mgr.locator("text=Сумма, сум").is_visible()
 
-    mgr.click('[data-opt="raspiska_ru"]')
-    assert mgr.locator("#ms-f-debtor_passport").is_visible()
-    mgr.click('[data-opt="raspiska_ru_uz"]')
-    assert not mgr.locator("#ms-f-debtor_passport").is_visible()
+    # Переключение вида ничего в форме не прячет и не показывает.
+    mgr.click('[data-opt="tilxat_uz"]')
+    mgr.wait_for_function("() => document.querySelector('#ms-f-doc_type').value === 'tilxat_uz'")
+    assert mgr.locator(".c-overlay [id^='ms-f-']").evaluate_all("els => els.map(e => e.id.slice(5))") == fields
+    assert all(mgr.locator(f"#ms-f-{k}").is_visible() for k in fields if k != "doc_type")
 
     mgr.fill("#ms-f-debtor_full_name", "Иванов Иван Иванович")
     mgr.fill("#ms-f-product_name", "Экскаватор JCB 3CX")
-    mgr.fill("#ms-f-total_amount", "24000")
+    mgr.fill("#ms-f-total_amount", "300000000")
     mgr.fill("#ms-f-term_months", "12")
     mgr.fill("#ms-f-installments_count", "12")
     mgr.click("#ms-submit")
     mgr.wait_for_selector(".toast:has-text('сформирован')")
 
     docs = e2e.rows(
-        "SELECT g.client_name, g.currency, g.installments_count, t.type FROM generated_documents g "
-        "JOIN document_templates t ON t.id = g.template_id"
+        "SELECT g.client_name, g.currency, g.total_amount_cents, g.installments_count, t.type "
+        "FROM generated_documents g JOIN document_templates t ON t.id = g.template_id"
     )
-    assert docs == [{"client_name": "Иванов Иван Иванович", "currency": "USD",
-                     "installments_count": 12, "type": "raspiska_ru_uz"}]
+    assert docs == [{"client_name": "Иванов Иван Иванович", "currency": "UZS",
+                     "total_amount_cents": 30_000_000_000, "installments_count": 12, "type": "tilxat_uz"}]

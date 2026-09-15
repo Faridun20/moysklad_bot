@@ -1667,7 +1667,7 @@ def seed_document_templates() -> int:
     inserted = 0
     with get_conn() as conn:
         cur = get_cursor(conn)
-        for doc_type, (filename, _lang) in TEMPLATES.items():
+        for doc_type, (filename, _parts) in TEMPLATES.items():
             cur.execute(
                 q("SELECT id FROM document_templates WHERE type = ?"), (doc_type,)
             )

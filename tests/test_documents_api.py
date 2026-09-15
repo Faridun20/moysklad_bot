@@ -45,6 +45,11 @@ def api(isolated_db, monkeypatch, tmp_path):
     db.set_role(ids["keeper"], "keeper", "Keeper", "warehouse_keeper")
 
     monkeypatch.setenv("DOCUMENTS_DIR", str(tmp_path / "docs"))
+    # Реквизиты подписанта печатаются в каждом виде расписки и обязательны.
+    # Название компании не ставим: его подставляет либо тест, либо запасное
+    # название проекта (test_creditor_falls_back_to_project_company_name).
+    for key, value in SIGNATORY.items():
+        db.set_setting(key, value, ids["boss"])
     monkeypatch.setattr(
         server, "verify_init_data",
         lambda s: {"id": int(s), "first_name": "U", "username": "u"} if str(s).isdigit() else None,
@@ -73,18 +78,30 @@ def api(isolated_db, monkeypatch, tmp_path):
     return TestClient(server.app), db, ids, bot
 
 
+SIGNATORY = {
+    "company_tin": "123456789", "company_address": "Ташкент, ул. Навои 1",
+    "company_representative": "Петров Пётр", "company_position": "Директор",
+    "company_position_uz": "Директор", "company_representative_gen": "директора Петрова Петра",
+    "company_city": "Ташкент", "company_city_uz": "Тошкент",
+}
+
 FORM = {
     "doc_type": "raspiska_ru",
     "debtor_full_name": "Иванов Иван Иванович",
-    "debtor_passport": "AA 1234567",
     "product_name": "Экскаватор JCB 3CX",
-    "total_amount": "25000",
-    "currency": "USD",
+    "total_amount": "25000000",
     "start_date": "2026-09-14",
     "term_months": "6",
-    "payment_type": "installment",
     "installments_count": "6",
     "city": "Ташкент",
+}
+
+# Поля прежней формы: бланк их не печатает, старый клиент ещё может прислать.
+LEGACY_FIELDS = {
+    "debtor_passport": "AA 1234567", "debtor_address": "Ташкент", "debtor_phone": "+998901112233",
+    "debtor_pinfl": "123", "debtor_birth_date": "1990-01-01", "currency": "USD",
+    "payment_type": "single", "penalty_rate": "0.5", "grace_days": "5", "witness_name": "Каримов",
+    "company_representative": "Посторонний", "company_name": "Чужое ООО",
 }
 
 
@@ -97,8 +114,11 @@ def test_types_and_company_requisites(api):
     r = _post(client, "/api/docs/types", ids["mgr"])
     assert r.status_code == 200, r.text
     body = r.json()
-    assert [t["key"] for t in body["types"]] == ["raspiska_ru_uz", "raspiska_ru", "tilxat_uz"]
-    assert body["handwritten_types"] == ["raspiska_ru_uz"]
+    assert body["types"] == [
+        {"key": "raspiska_ru_uz", "label": "Расписка RU+UZ"},
+        {"key": "raspiska_ru", "label": "Расписка (рус.)"},
+        {"key": "tilxat_uz", "label": "Тилхат (ўзб.)"},
+    ]
     assert body["can_edit_company"] is False
     assert "can_print" in body
 
@@ -130,8 +150,10 @@ def test_create_stores_record_and_sends_pdf(api):
         cur.execute(db.q("SELECT * FROM generated_documents WHERE id = ?"), (doc_id,))
         row = dict(cur.fetchone())
     assert row["client_name"] == "Иванов Иван Иванович"
-    assert row["total_amount_cents"] == 2_500_000 and row["currency"] == "USD"
+    # Сумма — в сумах, как в тексте бланка («… сум»).
+    assert row["total_amount_cents"] == 2_500_000_000 and row["currency"] == "UZS"
     assert row["payment_type"] == "installment" and row["installments_count"] == 6
+    assert row["passport_data"] == "", "паспорт Должник пишет от руки"
     assert row["created_by"] == ids["mgr"]
     assert Path(row["file_path"]).is_file()
     # В документ ушли реквизиты компании из настроек и график на 6 платежей.
@@ -140,7 +162,7 @@ def test_create_stores_record_and_sends_pdf(api):
 
     # PDF ушёл составителю.
     assert [d["chat_id"] for d in bot.documents] == [ids["mgr"]]
-    assert "Расписка" in bot.documents[0]["caption"] and "Иванов" in bot.documents[0]["caption"]
+    assert bot.documents[0]["caption"] == "📄 Расписка (рус.) — Иванов Иван Иванович · 25 000 000 UZS"
 
     r = _post(client, "/api/docs/list", ids["boss"])
     docs = r.json()["documents"]
@@ -198,35 +220,63 @@ def test_payment_type_follows_the_number_of_payments(api):
 
     Раньше рядом стояли «Порядок оплаты» и «Число платежей»: менеджер вписывал
     шесть платежей, оставлял «Разовый платёж» — и расписка молча выходила с
-    одной строкой на всю сумму и остатком 0 (жалоба с площадки).
+    одной строкой на всю сумму и остатком 0 (жалоба с площадки). Переключателя
+    больше нет, присланный старым клиентом `payment_type` ни на что не влияет.
     """
     from services import documents
 
     _client, _db, _ids, _bot = api
-    bare = {k: v for k, v in FORM.items() if k != "payment_type"}
 
-    # Ровно тот случай, на который жаловались: шесть платежей вписаны,
-    # переключатель остался на «Разовый платёж».
-    ctx, record = documents.form_to_context(dict(bare, payment_type="single", installments_count="6"))
+    ctx, record = documents.form_to_context(dict(FORM, payment_type="single", installments_count="6"))
     assert record["payment_type"] == "installment"
     assert record["installments_count"] == 6
     assert len(ctx["schedule"]) == 6
     # Остаток нулевой ТОЛЬКО у последнего платежа — иначе график бессмысленен.
-    assert ctx["schedule"][-1]["balance"].startswith("0")
-    assert not ctx["schedule"][0]["balance"].startswith("0")
+    assert ctx["schedule"][-1]["balance"] == "0"
+    assert ctx["schedule"][0]["balance"] != "0"
 
-    # Форма без переключателя вообще (новая) — тот же результат.
-    _ctx, rec = documents.form_to_context(dict(bare, installments_count="6"))
-    assert rec["payment_type"] == "installment"
-
-    # Один платёж и пустое поле — разовый, без графика.
+    # Один платёж и пустое поле — разовый; старый `installment` не мешает.
     for count in ("1", ""):
-        _ctx, rec = documents.form_to_context(dict(bare, installments_count=count))
+        _ctx, rec = documents.form_to_context(dict(FORM, payment_type="installment", installments_count=count))
         assert rec["payment_type"] == "single" and rec["installments_count"] is None
+        assert len(_ctx["schedule"]) == 1
 
-    # Явная рассрочка с одним платежом — противоречие, а не тихий разовый.
-    with pytest.raises(documents.DocumentError):
-        documents.form_to_context(dict(FORM, payment_type="installment", installments_count="1"))
+
+def test_legacy_form_fields_are_ignored(api):
+    """Поля прежней формы (паспорт, валюта, пеня, свидетель, подписант) бланк
+    не печатает: запрос с ними не падает, и в документ они не попадают."""
+    client, db, ids, _bot = api
+    r = _post(client, "/api/docs/create", ids["mgr"], **FORM, **LEGACY_FIELDS)
+    assert r.status_code == 200, r.text
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("SELECT * FROM generated_documents WHERE id = ?"), (r.json()["id"],))
+        row = dict(cur.fetchone())
+    assert (row["currency"], row["passport_data"], row["payment_type"]) == ("UZS", "", "installment")
+    content = Path(row["file_path"]).read_bytes().decode("utf-8")
+    for leaked in ("AA 1234567", "Каримов", "Посторонний", "Чужое ООО", "penalty", "witness", "passport"):
+        assert leaked not in content, leaked
+    assert "директора Петрова Петра" in content
+
+
+@pytest.mark.parametrize(
+    "amount,msg",
+    [("0", "больше нуля"), ("abc", "нужно число"), ("1500,50", "тийинов"), ("NaN", "нужно число"),
+     ("1e20", "слишком большая")],
+)
+def test_amount_in_sums_is_validated(api, amount, msg):
+    from services import documents
+
+    with pytest.raises(documents.DocumentError, match=msg):
+        documents.form_to_context(dict(FORM, total_amount=amount))
+
+
+def test_amount_accepts_spaces_between_thousands(api):
+    from services import documents
+
+    _ctx, record = documents.form_to_context(dict(FORM, total_amount="12 500 000"))
+    assert record["total_amount_cents"] == 1_250_000_000
+    assert _ctx["total_amount"] == "12 500 000"
 
 
 def test_send_and_print(api, monkeypatch):
@@ -379,17 +429,20 @@ def test_manager_sees_and_touches_only_own_documents(api, monkeypatch):
 
 @pytest.mark.skipif(not HAS_SOFFICE, reason="нет LibreOffice (в образе он есть)")
 def test_real_render_produces_pdf(isolated_db, tmp_path, monkeypatch):
-    """Настоящий LibreOffice: форма → PDF с текстом должника."""
+    """Настоящий LibreOffice: форма → PDF с реквизитами кредитора и суммой."""
     from pypdf import PdfReader
 
     from services import documents
 
     monkeypatch.setenv("DOCUMENTS_DIR", str(tmp_path))
     isolated_db.set_setting("company_name", "ООО Ромашка", 1)
+    for key, value in SIGNATORY.items():
+        isolated_db.set_setting(key, value, 1)
     res = asyncio.run(documents.create_document(FORM, created_by=100))
     assert res["ok"], res
     text = " ".join(" ".join(p.extract_text() for p in PdfReader(res["file"]).pages).split())
-    assert "Иванов Иван Иванович" in text and "ООО Ромашка" in text
+    assert "ООО Ромашка" in text and "25 000 000 (двадцать пять миллионов) сум" in text
+    assert "Иванов" not in text, "ФИО Должник вписывает от руки"
 
 
 def test_invoice_print_endpoint(api, monkeypatch):
@@ -421,35 +474,76 @@ def test_invoice_print_endpoint(api, monkeypatch):
     assert _post(client, "/api/wh/invoices/print", ids["keeper"], invoice_id=inv["invoice_id"]).status_code == 403
 
 
-def test_ru_uz_uses_signatory_from_requisites(api):
-    """Расписка RU+UZ берёт подписанта и основание из реквизитов; без них —
+@pytest.mark.parametrize("doc_type", ["raspiska_ru_uz", "raspiska_ru", "tilxat_uz"])
+def test_every_type_uses_signatory_from_requisites(api, doc_type):
+    """Все три вида берут подписанта и основание из реквизитов; без них —
     понятный отказ с перечнем того, что заполнить, а не документ с дырами."""
-    client, _db, ids, _bot = api
-    form = {**FORM, "doc_type": "raspiska_ru_uz"}
+    from services import documents
+
+    client, db, ids, _bot = api
+    form = {**FORM, "doc_type": doc_type}
+    for key in SIGNATORY:
+        db.set_setting(key, "", ids["boss"])
     _post(client, "/api/docs/company/set", ids["boss"], company={"company_name": "ООО Ромашка"})
     r = _post(client, "/api/docs/create", ids["mgr"], **form)
     assert r.status_code == 400
-    assert "Реквизитах компании" in r.json()["detail"] and "должность подписанта" in r.json()["detail"]
+    assert "Реквизитах компании" in r.json()["detail"] and "ИНН" in r.json()["detail"]
 
     _post(client, "/api/docs/company/set", ids["boss"], company={
-        "company_name": "ООО Ромашка", "company_tin": "123456789", "company_address": "Ташкент",
-        "company_representative": "Петров Пётр", "company_position": "Директор",
-        "company_position_uz": "Директор", "company_representative_gen": "директора Петрова Петра",
-        "company_poa_number": "7", "company_poa_date": "01.09.2026",
-        "company_city": "Ташкент", "company_city_uz": "Тошкент",
+        **SIGNATORY, "company_name": "ООО Ромашка", "company_poa_number": "7", "company_poa_date": "01.09.2026",
     })
     r = _post(client, "/api/docs/create", ids["mgr"], **form)
     assert r.status_code == 200, r.text
-    pdf = _bot.documents[-1]["document"] if _bot.documents and "document" in _bot.documents[-1] else None
-    from services import documents
-    import asyncio
     doc = asyncio.run(documents.get_document(r.json()["id"]))
+    assert doc["doc_type"] == doc_type
     data, _name = documents.read_pdf(doc)
     body = data.decode("utf-8", "replace")
     assert "директора Петрова Петра" in body
     assert "доверенности № 7 от 01.09.2026" in body
     assert "'city_uz': 'Тошкент'" in body
 
-    r = _post(client, "/api/docs/create", ids["mgr"], **{**form, "currency": "UZS"})
-    assert r.status_code == 400 and "долларах США" in r.json()["detail"]
-    del pdf
+
+def test_old_documents_stay_listed_sent_and_printed(api, monkeypatch, tmp_path):
+    """Документы, составленные по СТАРЫМ шаблонам (долларовые, с паспортом),
+    остались в generated_documents проды. Шаблон им не нужен: список, повторная
+    отправка и печать читают готовый PDF с диска."""
+    from services import documents, printing
+    from services.database import seed_document_templates
+
+    client, db, ids, bot = api
+    seed_document_templates()
+    pdf = tmp_path / "raspiska_ru_Старый_2026-01-10.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nold")
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        for doc_type in ("raspiska_ru", "tilxat_uz"):
+            cur.execute(db.q("SELECT id FROM document_templates WHERE type = ?"), (doc_type,))
+            tpl_id = cur.fetchone()["id"]
+            cur.execute(db.q(
+                "INSERT INTO generated_documents (template_id, client_name, passport_data, product_name, "
+                "total_amount_cents, currency, start_date, term_months, payment_type, installments_count, "
+                "file_path, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            ), (tpl_id, f"Старый {doc_type}", "AA1", "Кран", 2_500_050, "USD", "2026-01-10", 6,
+                "installment", 6, str(pdf), ids["mgr"], db.now_str()))
+        conn.commit()
+
+    docs = _post(client, "/api/docs/list", ids["mgr"]).json()["documents"]
+    assert [(d["type_label"], d["currency"], d["file_exists"]) for d in docs] == [
+        ("Тилхат (ўзб.)", "USD", True), ("Расписка (рус.)", "USD", True),
+    ]
+    bot.documents.clear()
+    assert _post(client, "/api/docs/send", ids["mgr"], doc_id=docs[0]["id"]).json()["ok"] is True
+    assert bot.documents[0]["caption"] == "📄 Тилхат (ўзб.) — Старый tilxat_uz · 25 000.50 USD"
+
+    printed: list[int] = []
+
+    async def fake_print(pdf_bytes, *, filename="", printer_name="", label=""):
+        printed.append(len(pdf_bytes))
+        return PrintResult(True, job="3")
+
+    monkeypatch.setattr(printing, "is_available", lambda: True)
+    monkeypatch.setattr(printing, "print_pdf_bytes", fake_print)
+    assert _post(client, "/api/docs/print", ids["mgr"], doc_id=docs[1]["id"]).json()["ok"] is True
+    assert printed == [len(b"%PDF-1.4\nold")]
+    assert documents.caption_for({"doc_type": "raspiska_ru", "client_name": "X",
+                                  "total_amount_cents": 2_500_000, "currency": "USD"}).endswith("25 000 USD")

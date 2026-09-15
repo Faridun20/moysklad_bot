@@ -7842,25 +7842,24 @@ function openCompanyForm(meta) {
 
 function openDocumentForm(meta) {
   const company = meta.company || {};
-  const defaults = meta.defaults || {};
   const today = new Date().toISOString().slice(0, 10);
   const types = (meta.types || []).map(t => [t.key, t.label]);
   const key = idemKey();
+  // Все три типа — один бланк юриста (обе части, только русская, только
+  // узбекская), и поля у них одинаковые. В форме только то, что реально
+  // попадает в документ: паспорт, адрес и телефон Должник пишет от руки, пеня
+  // и условия взыскания — в тексте бланка, валюта — сумы («… сум»).
   openMachineSheet({
     title: 'Новый документ',
     hint: 'Поля со звёздочкой обязательны. PDF придёт вам в Telegram.',
     fields: [
+      // Первый вариант сегмента — значение по умолчанию: расписка RU+UZ.
       { key: 'doc_type', label: 'Тип документа', type: 'select', options: types, required: true },
-      { key: 'debtor_full_name', label: 'Должник — ФИО', required: true },
-      { key: 'debtor_passport', label: 'Паспорт (серия, номер, кем выдан)' },
-      { key: 'debtor_pinfl', label: 'ПИНФЛ' },
-      { key: 'debtor_birth_date', label: 'Дата рождения', type: 'date' },
-      { key: 'debtor_address', label: 'Адрес' },
-      { key: 'debtor_phone', label: 'Телефон', type: 'tel' },
+      { key: 'debtor_full_name', label: 'Должник — ФИО', required: true,
+        hint: 'В документ не печатается — Должник впишет сам. Нужно для списка документов.' },
       { key: 'product_name', label: 'Что передаётся (товар, техника)', required: true },
-      { key: 'total_amount', label: `Сумма, ${defaults.currency || 'USD'}`, type: 'number', required: true },
-      { key: 'currency', label: 'Валюта', type: 'select', value: defaults.currency || 'USD',
-        options: [['USD', 'USD'], ['UZS', 'UZS']] },
+      { key: 'total_amount', label: 'Сумма, сум', type: 'number', required: true,
+        hint: 'Печатается цифрами и прописью' },
       { key: 'start_date', label: 'Дата начала', type: 'date', value: today, required: true },
       { key: 'term_months', label: 'Срок, месяцев', type: 'number', required: true },
       // ОДНО поле вместо двух: раньше рядом стояли «Порядок оплаты» и «Число
@@ -7869,12 +7868,7 @@ function openDocumentForm(meta) {
       // выходила с одной строкой графика и остатком 0.
       { key: 'installments_count', label: 'Число платежей', type: 'number', value: 1,
         hint: '1 — разовый платёж; 2 и больше — рассрочка, график построится сам' },
-      { key: 'penalty_rate', label: 'Пеня, % в день', value: defaults.penalty_rate || '0.1' },
-      { key: 'grace_days', label: 'Льготных дней', type: 'number', value: defaults.grace_days ?? 3 },
-      { key: 'witness_name', label: 'Свидетель (ФИО)', hint: 'Можно оставить пустым' },
       { key: 'city', label: 'Город', value: company.company_city || '', required: true },
-      { key: 'company_representative', label: 'Подписывает от компании',
-        value: company.company_representative || '', hint: 'По умолчанию — из реквизитов' },
     ],
     submitLabel: 'Сформировать PDF',
     onSubmit: async (data, { showErr }) => {
@@ -7888,47 +7882,6 @@ function openDocumentForm(meta) {
       return true;
     },
   });
-  wireHandwrittenDocFields(meta);
-}
-
-// Расписка RU+UZ: паспорт, адрес, телефон и сумму прописью Должник пишет от
-// руки, пеня и валюта зашиты в текст юриста. Поля, которые в такой документ
-// не попадут, прячем — иначе менеджер старательно заполняет их и ищет в PDF.
-const HANDWRITTEN_HIDDEN = ['debtor_passport', 'debtor_pinfl', 'debtor_birth_date', 'debtor_address',
-  'debtor_phone', 'currency', 'penalty_rate', 'grace_days', 'witness_name', 'company_representative'];
-function wireHandwrittenDocFields(meta) {
-  const ov = document.querySelector('.c-overlay');
-  const typeInput = ov && ov.querySelector('#ms-f-doc_type');
-  if (!typeInput) return;
-  const handwritten = new Set(meta.handwritten_types || []);
-  const nameField = ov.querySelector('#ms-f-debtor_full_name');
-  const nameHint = document.createElement('span');
-  nameHint.className = 'c-field-hint';
-  nameHint.textContent = 'В документ не печатается — Должник впишет сам. Нужно для списка документов.';
-  const sync = () => {
-    const on = handwritten.has(typeInput.value);
-    HANDWRITTEN_HIDDEN.forEach(k => {
-      const label = ov.querySelector(`#ms-f-${k}`)?.closest('.c-field');
-      if (label) label.style.display = on ? 'none' : '';
-    });
-    if (on) {
-      // Расписка RU+UZ — только в долларах: сервер другую валюту отклонит.
-      const cur = ov.querySelector('#ms-f-currency');
-      if (cur) {
-        cur.value = 'USD';
-        cur.closest('.seg-row')?.querySelectorAll('.seg-item[data-opt]').forEach(b => {
-          b.classList.toggle('active', b.dataset.opt === 'USD');
-          b.setAttribute('aria-pressed', String(b.dataset.opt === 'USD'));
-        });
-      }
-    }
-    if (nameField) {
-      if (on) nameField.after(nameHint); else nameHint.remove();
-    }
-  };
-  typeInput.closest('.seg-row')?.querySelectorAll('.seg-item[data-opt]').forEach(btn =>
-    btn.addEventListener('click', sync));
-  sync();
 }
 
 async function renderWhInvoiceNew() {

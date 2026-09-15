@@ -21,11 +21,12 @@ from __future__ import annotations
 import logging
 import os
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from services import adb_core, money
-from services.legal_docs import TEMPLATES, DocumentError, build_context, render_pdf
+from services.legal_docs import DOCUMENT_CURRENCY, TEMPLATES, DocumentError, build_context, render_pdf
 from services.database import now_str
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ COMPANY_FIELDS: tuple[tuple[str, str], ...] = (
     ("company_address", "Адрес"),
     ("company_representative", "Представитель (ФИО)"),
     ("company_city", "Город"),
-    # Для расписки RU+UZ: «в лице …, действующего на основании …».
+    # Подписант в расписке: «в лице …, действующего на основании …».
     ("company_position", "Должность подписанта (например: Директор)"),
     ("company_representative_gen", "Подписант в родительном падеже (директора Иванова Ивана Ивановича)"),
     ("company_position_uz", "Лавозими — должность по-узбекски (Директор)"),
@@ -51,10 +52,6 @@ COMPANY_FIELDS: tuple[tuple[str, str], ...] = (
     ("company_poa_date", "Дата доверенности (ДД.ММ.ГГГГ)"),
     ("company_city_uz", "Город по-узбекски (Тошкент)"),
 )
-
-DEFAULT_PENALTY_RATE = "0.1"
-DEFAULT_GRACE_DAYS = 3
-
 
 def documents_dir() -> Path:
     """Куда класть PDF. На проде — том /app/data (переживает рестарт)."""
@@ -117,43 +114,60 @@ def _parse_int(raw: Any, name: str, *, minimum: int = 0) -> int:
     return val
 
 
+def _parse_sum(raw: Any) -> int:
+    """Сумма в сумах из формы → копейки (так деньги хранятся везде в проекте).
+
+    Сумы — целые: «12 500 000» и «12500000» одно и то же, а тийины в
+    расписке превратили бы пропись в «… 50/100» и график — в дроби.
+    """
+    text = str(raw or "").replace("\u00a0", "").replace(" ", "").replace(",", ".")
+    try:
+        value = Decimal(text)
+    except (InvalidOperation, ValueError):
+        raise DocumentError("Сумма: нужно число")
+    if not value.is_finite():
+        raise DocumentError("Сумма: нужно число")
+    if value <= 0:
+        raise DocumentError("Сумма должна быть больше нуля")
+    if value != value.to_integral_value():
+        raise DocumentError("Сумма в сумах — целым числом, без тийинов")
+    cents = money.to_cents(value)
+    if cents > money.HARD_MAX_CENTS:
+        raise DocumentError("Сумма слишком большая — проверьте, не лишние ли нули")
+    return cents
+
+
 def form_to_context(data: dict[str, Any]) -> tuple[dict, dict]:
     """Тело формы → (контекст шаблона, поля для generated_documents).
 
-    Бросает DocumentError с текстом для человека. Реквизиты компании берутся из
-    настроек, но поля формы `company_*` их перекрывают — для документа, где
-    подписывает другой представитель.
+    Бросает DocumentError с текстом для человека. Поля формы — только те, что
+    попадают в документ или в список документов. Прежние поля (паспорт,
+    адрес, телефон должника, валюта, пеня, льготные дни, свидетель, порядок
+    оплаты, подписант из формы) бланк не печатает: старые клиенты API их ещё
+    присылают — они молча игнорируются, а не валят создание документа.
     """
     doc_type = _clean(data.get("doc_type"))
     if doc_type not in TEMPLATES:
         raise DocumentError("Выберите тип документа")
 
-    debtor = {
-        "full_name": _clean(data.get("debtor_full_name")),
-        "birth_date": _clean(data.get("debtor_birth_date"), 32),
-        "passport": _clean(data.get("debtor_passport"), 64),
-        "pinfl": _clean(data.get("debtor_pinfl"), 32),
-        "address": _clean(data.get("debtor_address"), 300),
-        "phone": _clean(data.get("debtor_phone"), 32),
-    }
-    if not debtor["full_name"]:
+    # ФИО в документ не печатается (Должник впишет сам), но без него документ
+    # в списке и в подписи к PDF в Telegram не опознать.
+    debtor_full_name = _clean(data.get("debtor_full_name"))
+    if not debtor_full_name:
         raise DocumentError("ФИО должника обязательно")
 
     company = company_requisites()
     creditor = {
-        "name": _clean(data.get("company_name")) or company["company_name"],
-        "tin": _clean(data.get("company_tin"), 32) or company["company_tin"],
-        "address": _clean(data.get("company_address"), 300) or company["company_address"],
-        "representative": _clean(data.get("company_representative")) or company["company_representative"],
+        "name": company["company_name"],
+        "tin": company["company_tin"],
+        "address": company["company_address"],
+        "representative": company["company_representative"],
+        "representative_gen": company["company_representative_gen"],
         "position": company["company_position"],
         "position_uz": company["company_position_uz"],
         "poa_number": company["company_poa_number"],
         "poa_date": company["company_poa_date"],
     }
-    # Родительный падеж пишется под конкретного человека: подписывает другой
-    # представитель — готовая форма из реквизитов про него врёт.
-    if creditor["representative"] == company["company_representative"]:
-        creditor["representative_gen"] = company["company_representative_gen"]
     if not creditor["name"]:
         # Формулировка важна: менеджеры читали это как «впишите компанию
         # КЛИЕНТА» и вставали в тупик, когда товар берёт физлицо. Компания
@@ -175,57 +189,36 @@ def form_to_context(data: dict[str, Any]) -> tuple[dict, dict]:
     if not product_name:
         raise DocumentError("Укажите, что передаётся (товар/техника)")
 
-    try:
-        amount = float(str(data.get("total_amount") or "").replace(",", ".").replace(" ", ""))
-    except ValueError:
-        raise DocumentError("Сумма: нужно число")
-    if amount <= 0:
-        raise DocumentError("Сумма должна быть больше нуля")
-    total_cents = money.to_cents(amount)
-    currency = _clean(data.get("currency"), 8).upper() or "USD"
-
+    total_cents = _parse_sum(data.get("total_amount"))
     start_date = _parse_date(data.get("start_date") or date.today().isoformat())
     term_months = _parse_int(data.get("term_months"), "Срок (месяцев)", minimum=1)
-    # Порядок оплаты ВЫВОДИТСЯ из числа платежей, а не спрашивается вторым
-    # полем. Два поля противоречили друг другу: менеджер вписывал 6 платежей,
-    # забывал переключить «Разовый платёж» — и расписка молча выходила с ОДНОЙ
-    # строкой графика на всю сумму и остатком 0. Молча получить не тот
-    # документ хуже, чем получить ошибку, поэтому источник истины один.
+    # Порядок оплаты ВЫВОДИТСЯ из числа платежей и больше ниоткуда. Было
+    # второе поле «Разовый / Рассрочка», и они противоречили друг другу:
+    # менеджер вписывал 6 платежей, забывал переключить — и расписка молча
+    # выходила с одной строкой графика на всю сумму. Присланный старым
+    # клиентом `payment_type` игнорируется.
     raw_count = str(data.get("installments_count") or "").strip()
-    installments_raw = _parse_int(raw_count, "Число платежей", minimum=1) if raw_count else 1
-    payment_type = _clean(data.get("payment_type"))
-    if installments_raw >= 2:
-        payment_type = "installment"
-    elif payment_type != "installment":
-        payment_type = "single"
-    if payment_type == "installment" and installments_raw < 2:
-        # Рассрочку заказали явно (старый вызов API), а платёж один — это
-        # противоречие в запросе, а не повод тихо выписать разовый платёж.
-        raise DocumentError("Для рассрочки нужно не меньше двух платежей")
-    installments = installments_raw if payment_type == "installment" else None
-    penalty_rate = _clean(data.get("penalty_rate"), 16) or DEFAULT_PENALTY_RATE
-    grace_days = _parse_int(data.get("grace_days") or DEFAULT_GRACE_DAYS, "Льготные дни")
-    witness_name = _clean(data.get("witness_name"))
+    count = _parse_int(raw_count, "Число платежей", minimum=1) if raw_count else 1
+    payment_type = "installment" if count >= 2 else "single"
 
     context = build_context(
-        doc_type=doc_type, city=city, debtor=debtor, creditor=creditor,
-        product_name=product_name, total_cents=total_cents, currency=currency,
-        start_date=start_date, term_months=term_months, payment_type=payment_type,
-        installments_count=installments, penalty_rate=penalty_rate,
-        grace_days=grace_days, witness_name=witness_name,
+        doc_type=doc_type, city=city, creditor=creditor, product_name=product_name,
+        total_cents=total_cents, start_date=start_date, term_months=term_months,
+        installments_count=count, debtor_full_name=debtor_full_name,
     )
     record = {
         "doc_type": doc_type,
         "counterparty_id": data.get("counterparty_id") or None,
-        "client_name": debtor["full_name"],
-        "passport_data": debtor["passport"],
+        "client_name": debtor_full_name,
+        # Паспорт Должник пишет от руки — в базу системе класть нечего.
+        "passport_data": "",
         "product_name": product_name,
         "total_amount_cents": total_cents,
-        "currency": currency,
+        "currency": DOCUMENT_CURRENCY,
         "start_date": start_date.isoformat(),
         "term_months": term_months,
         "payment_type": payment_type,
-        "installments_count": installments,
+        "installments_count": count if payment_type == "installment" else None,
     }
     return context, record
 
@@ -401,8 +394,8 @@ def read_pdf(doc: dict) -> tuple[bytes, str] | None:
 
 
 def caption_for(doc: dict) -> str:
-    amount = money.from_cents(int(doc.get("total_amount_cents") or 0))
-    return (
-        f"📄 {_label(doc)} — {doc.get('client_name') or ''} · "
-        f"{amount:,.2f} {doc.get('currency') or ''}".replace(",", " ")
-    )
+    cents = int(doc.get("total_amount_cents") or 0)
+    # Сумы целые — «12 500 000 UZS», без «.00»; у старых долларовых
+    # документов с центами дробная часть остаётся.
+    amount = money.format_cents(cents, decimals=0 if cents % 100 == 0 else 2, sep=" ")
+    return f"📄 {_label(doc)} — {doc.get('client_name') or ''} · {amount} {doc.get('currency') or ''}"

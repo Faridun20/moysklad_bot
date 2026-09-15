@@ -1139,7 +1139,7 @@ def test_boss_sets_company_requisites_then_creates_ru_uz_receipt(open_app, e2e, 
     assert boss.input_value("#ms-f-city") == "Самарканд", "город подставлен из реквизитов"
     boss.fill("#ms-f-debtor_full_name", "Каримов Алишер")
     boss.fill("#ms-f-product_name", "Погрузчик XCMG")
-    boss.fill("#ms-f-total_amount", "36000")
+    boss.fill("#ms-f-total_amount", "360000000")
     boss.fill("#ms-f-term_months", "12")
     boss.fill("#ms-f-installments_count", "12")
     boss.click("#ms-submit")
@@ -1150,13 +1150,14 @@ def test_boss_sets_company_requisites_then_creates_ru_uz_receipt(open_app, e2e, 
         "SELECT g.client_name, g.total_amount_cents, g.currency, g.payment_type, g.installments_count, "
         "g.created_by, t.type FROM generated_documents g JOIN document_templates t ON t.id = g.template_id"
     )
-    assert row == [{"client_name": "Каримов Алишер", "total_amount_cents": 3_600_000, "currency": "USD",
+    assert row == [{"client_name": "Каримов Алишер", "total_amount_cents": 36_000_000_000, "currency": "UZS",
                     "payment_type": "installment", "installments_count": 12,
                     "created_by": ids["boss"], "type": "raspiska_ru_uz"}]
     ctx = contexts[-1]
     assert (ctx["creditor_name"], ctx["city"], ctx["city_uz"]) == ("ООО Тест", "Самарканд", "Самарқанд")
     assert ctx["creditor_representative_gen"] == "директора Петрова Петра"
-    assert len(ctx["schedule"]) == 12 and ctx["schedule"][-1]["balance"] == "0.00"
+    assert len(ctx["schedule"]) == 12 and ctx["schedule"][-1]["balance"] == "0"
+    assert (ctx["total_amount"], ctx["schedule"][0]["amount"]) == ("360 000 000", "30 000 000")
     assert [d["chat_id"] for d in e2e.bot.documents] == [ids["boss"]]
     assert "Расписка RU+UZ · Каримов Алишер" in boss.locator('[data-doc] .card-row-title').first.inner_text()
 
@@ -1166,28 +1167,27 @@ def test_boss_sets_company_requisites_then_creates_ru_uz_receipt(open_app, e2e, 
     assert admin.locator("#doc-company").count() == 1
 
 
-def test_manager_creates_tilxat_in_uzs_single_payment(open_app, e2e, monkeypatch, tmp_path):
-    """Тилхат (ўзб.): у него, в отличие от RU+UZ, поля должника и валюта
-    видны; UZS и разовый платёж доезжают до документа и списка."""
+def test_manager_creates_tilxat_single_payment(open_app, e2e, monkeypatch, tmp_path):
+    """Тилхат (ўзб.) — тот же бланк, узбекская часть: те же поля формы, разовый
+    платёж (одна строка графика) и сумма в сумах доезжают до документа и списка.
+    Поля прежней формы в запросе сервер пропускает мимо, а не отказывает."""
     contexts = _fake_documents(monkeypatch, tmp_path)
     ids = e2e.ids
+    for key, value in _FULL_COMPANY.items():
+        e2e.db.set_setting(key, value, ids["boss"])
     mgr = open_app(ids["mgr"])
     _docs(mgr)
     mgr.click("#doc-new")
     mgr.wait_for_selector("#ms-f-doc_type", state="attached")
-    assert mgr.locator('[data-opt]').evaluate_all("els => els.map(e => e.dataset.opt)")[:3] == [
+    assert mgr.locator('.c-overlay [data-opt]').evaluate_all("els => els.map(e => e.dataset.opt)") == [
         "raspiska_ru_uz", "raspiska_ru", "tilxat_uz"]
 
     mgr.click('[data-opt="tilxat_uz"]')
     mgr.wait_for_function("() => document.querySelector('#ms-f-doc_type').value === 'tilxat_uz'")
-    assert mgr.locator("#ms-f-debtor_passport").is_visible()
-    mgr.click('[data-opt="UZS"]')
-    mgr.wait_for_function("() => document.querySelector('#ms-f-currency').value === 'UZS'")
+    assert mgr.locator("#ms-f-debtor_passport, #ms-f-currency, #ms-f-witness_name").count() == 0
     sheet = {
-        "debtor_full_name": "Тошматов Бахтиёр", "debtor_passport": "AA1234567",
-        "debtor_phone": "+998901112233", "product_name": "Бетономешалка",
-        "total_amount": "15000000", "term_months": "3", "installments_count": "1",
-        "penalty_rate": "0.2", "grace_days": "5", "witness_name": "Каримов Рустам", "city": "Ташкент",
+        "debtor_full_name": "Тошматов Бахтиёр", "product_name": "Бетономешалка",
+        "total_amount": "15000000", "term_months": "3", "installments_count": "1", "city": "Ташкент",
     }
     for key, value in sheet.items():
         mgr.fill(f"#ms-f-{key}", value)
@@ -1200,17 +1200,24 @@ def test_manager_creates_tilxat_in_uzs_single_payment(open_app, e2e, monkeypatch
         "g.payment_type, g.installments_count, t.type FROM generated_documents g "
         "JOIN document_templates t ON t.id = g.template_id"
     )
-    assert row == [{"client_name": "Тошматов Бахтиёр", "passport_data": "AA1234567",
+    assert row == [{"client_name": "Тошматов Бахтиёр", "passport_data": "",
                     "total_amount_cents": 1_500_000_000, "currency": "UZS", "term_months": 3,
                     "payment_type": "single", "installments_count": None, "type": "tilxat_uz"}]
     ctx = contexts[-1]
-    assert (ctx["penalty_rate"], ctx["grace_days"], ctx["witness_name"]) == ("0.2", 5, "Каримов Рустам")
-    assert ctx["debtor_phone"] == "+998901112233" and len(ctx["schedule"]) == 1
-    assert ctx["payment_clause"].startswith("Қарз бир марталик")
+    assert len(ctx["schedule"]) == 1 and ctx["schedule"][0]["amount"] == "15 000 000"
+    assert ctx["total_amount_words_uz"] == "ўн беш миллион" and ctx["city"] == "Ташкент"
 
     item = mgr.locator("[data-doc]").first.inner_text()
     assert "Тилхат (ўзб.)" in item and "разовый платёж" in item and "UZS" in item
     assert e2e.bot.documents and e2e.bot.documents[-1]["chat_id"] == ids["mgr"]
+
+    # Старый клиент прислал поля прежней формы — документ всё равно создан.
+    res = _api(mgr, "/api/docs/create", {
+        "doc_type": "raspiska_ru", **sheet, "debtor_passport": "AA1234567", "currency": "USD",
+        "penalty_rate": "0.2", "grace_days": "5", "witness_name": "Каримов Рустам", "payment_type": "installment",
+    })
+    assert res["body"]["ok"] is True, res
+    assert "penalty_rate" not in contexts[-1] and "witness_name" not in contexts[-1]
 
 
 def test_document_form_validation_and_cancel(open_app, e2e, monkeypatch, tmp_path):
@@ -1231,7 +1238,7 @@ def test_document_form_validation_and_cancel(open_app, e2e, monkeypatch, tmp_pat
     mgr.wait_for_selector("#ms-error:not([hidden])")
     assert "Заполните: Должник — ФИО" in mgr.locator("#ms-error").inner_text()
 
-    # RU+UZ без ИНН/адреса/должности в реквизитах — сервер называет, чего нет.
+    # Без ИНН/адреса/должности в реквизитах — сервер называет, чего нет.
     mgr.fill("#ms-f-debtor_full_name", "Иванов Иван")
     mgr.fill("#ms-f-product_name", "Ковш")
     mgr.fill("#ms-f-total_amount", "1000")

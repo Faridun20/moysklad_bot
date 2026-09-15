@@ -329,13 +329,14 @@ def test_confirm_cash_deposit_second_call_is_rejected(isolated_db):
 def test_legal_template_escapes_special_characters(tmp_path):
     from services import legal_docs as ld
 
+    # ФИО должника в бланк не печатается (пишется от руки) — спецсимволы
+    # проверяем на том, что печатается: название кредитора и товар.
     ctx = ld.build_context(
-        doc_type="raspiska_ru", city="Ташкент",
-        debtor={"full_name": "Иванов & Ко <x>", "passport": "AA<1>"},
-        creditor={"name": "ООО \"Рога\" & <Копыта>"},
-        product_name="<b>Труба</b>", total_cents=100_000, currency="USD",
-        start_date=date(2026, 1, 1), term_months=2, payment_type="single",
-        installments_count=None, penalty_rate="0.1%", grace_days=3,
+        doc_type="raspiska_ru", city="Ташкент & <Юнусабад>",
+        creditor={"name": "ООО \"Рога\" & <Копыта>", "tin": "1", "address": "a<b>",
+                  "representative": "Иванов & Ко <x>", "position": "Директор"},
+        product_name="<b>Труба</b>", total_cents=100_000,
+        start_date=date(2026, 1, 1), term_months=2, installments_count=1,
     )
     dst = tmp_path / "out.docx"
     ld.fill_template(ld.template_path("raspiska_ru"), ctx, dst)
@@ -344,7 +345,7 @@ def test_legal_template_escapes_special_characters(tmp_path):
         xml = z.read("word/document.xml").decode("utf-8")
     ET.fromstring(xml)  # валидный XML — LibreOffice его откроет
     assert "Иванов &amp; Ко &lt;x&gt;" in xml
-    assert "<x>" not in xml and "<b>Труба</b>" not in xml
+    assert "<x>" not in xml and "<b>Труба</b>" not in xml and "&lt;b&gt;Труба" in xml
 
 
 # ─── #4. Тёзки: под Postgres берётся advisory-lock по имени ─────────────────────

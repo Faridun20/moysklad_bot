@@ -2,8 +2,8 @@
 Генерация юридических документов: docxtpl → LibreOffice → PDF.
 
 Отдельный движок от накладных: накладная — простая таблица, которую проще
-собрать в HTML, а расписка требует точного формата (Times New Roman 12pt,
-узбекская кириллица, нумерация пунктов), и его надёжнее держать в Word-шаблоне.
+собрать в HTML, а расписка — бланк юриста (узбекская кириллица, нумерация
+пунктов, таблица графика), и его надёжнее держать в Word-шаблоне.
 
 Системные зависимости: `libreoffice-writer` (без него LibreOffice не умеет
 открывать .docx вообще) и `fonts-liberation` — см. Dockerfile.
@@ -34,40 +34,40 @@ CONVERT_TIMEOUT = 120
 # может указывать и на том /app/data — тогда используется он.
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates" / "legal"
 
-# Тип документа → (файл шаблона, язык). Язык нужен не только прописи: в
-# документ подставляется целое предложение о порядке оплаты, и по-русски
-# оно должно быть по-русски.
-TEMPLATES: dict[str, tuple[str, str]] = {
-    "raspiska_ru_uz": ("raspiska_ru_uz.docx", "ru"),
-    "raspiska_ru": ("raspiska_ru.docx", "ru"),
-    "tilxat_uz": ("tilxat_uz.docx", "uz"),
+# Тип документа → (файл шаблона, части бланка). Все три — один бланк юриста
+# (templates/legal/src, scripts/build_raspiska_ru_uz): обе части, только
+# русская или только узбекская. Ключи raspiska_ru и tilxat_uz — прежние: на
+# них ссылаются document_templates и generated_documents в проде, а старые
+# PDF по ним показываются и печатаются с диска, шаблон им не нужен.
+TEMPLATES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "raspiska_ru_uz": ("raspiska_ru_uz.docx", ("ru", "uz")),
+    "raspiska_ru": ("raspiska_ru.docx", ("ru",)),
+    "tilxat_uz": ("tilxat_uz.docx", ("uz",)),
 }
 
-# Двуязычная расписка юриста (templates/legal/src, scripts/build_raspiska_ru_uz):
-# данные должника и сумму Должник пишет ОТ РУКИ, система подставляет только
-# реквизиты кредитора, товар, сроки и график. Стоимость в ней зашита в
-# долларах США («подлежит уплате в сумах по курсу ЦБ»), пеня и условия
-# досрочного взыскания — тоже в тексте, полями формы не меняются.
-HANDWRITTEN_TYPES = frozenset({"raspiska_ru_uz"})
+# Типы, где личные данные должника (ФИО, паспорт, адрес, телефон) Должник
+# пишет ОТ РУКИ, а система подставляет реквизиты кредитора, товар, сумму,
+# сроки и график. Сейчас это все типы — бланк один.
+HANDWRITTEN_TYPES = frozenset(TEMPLATES)
 
-# Реквизиты, которые печатаются в двуязычной расписке. Пустое поле ушло бы в
-# документ дырой посреди фразы «в лице …, действующего на основании …».
-_HANDWRITTEN_REQUIRED = (
+# Валюта документа — из текста бланка: «общей стоимостью … сум», «… сўм».
+# Прежний пункт «стоимость определена в долларах США, уплата в сумах по
+# курсу ЦБ» юрист из финального бланка убрал, поэтому сумма вводится в сумах
+# и печатается как есть. Долларовая сумма под словом «сум» была бы долгом в
+# тысячи раз меньше настоящего.
+DOCUMENT_CURRENCY = "UZS"
+
+# Реквизиты, которые печатаются в документе. Пустое поле ушло бы в документ
+# дырой посреди фразы «в лице …, действующего на основании …». Должность —
+# на языке части: русской расписке узбекская должность не нужна, и наоборот.
+_REQUIRED_COMMON = (
     ("tin", "ИНН"),
     ("address", "адрес"),
     ("representative", "представитель (ФИО)"),
-    ("position", "должность подписанта"),
-    ("position_uz", "должность подписанта по-узбекски"),
 )
-
-# Пункт о порядке оплаты — на языке документа. В черновике эта строка была
-# зашита по-узбекски для обоих шаблонов, и русская расписка получала бы
-# узбекскую фразу в середине текста.
-_PAYMENT_CLAUSE = {
-    ("ru", "single"): "Долг погашается единовременным платежом в полном размере.",
-    ("ru", "installment"): "Долг погашается в рассрочку согласно графику платежей.",
-    ("uz", "single"): "Қарз бир марталик тўлов тартибида тўлиқ миқдорда тўланади.",
-    ("uz", "installment"): "Қарз бўлиб-бўлиб тўлаш тартибида тўланади.",
+_REQUIRED_BY_LANG = {
+    "ru": (("position", "должность подписанта"),),
+    "uz": (("position_uz", "должность подписанта по-узбекски"),),
 }
 
 
@@ -84,8 +84,8 @@ class PaymentRow:
 
 
 def _money(cents: int) -> str:
-    """Копейки → «25 000.00». Пробел как разделитель тысяч — как в документах."""
-    return money.format_cents(cents, decimals=2, sep=" ")
+    """Копейки → «25 000 000». Сумы — целые, пробел разделяет тысячи."""
+    return money.format_cents(cents, decimals=0, sep=" ")
 
 
 def _fmt_date(d: date) -> str:
@@ -95,16 +95,18 @@ def _fmt_date(d: date) -> str:
 def build_schedule(total_cents: int, installments_count: int, start_date: date) -> list[dict]:
     """График платежей. Последний платёж — остаток, чтобы сумма сошлась.
 
-    Делим в копейках, а не в Decimal-рублях: копейки от деления обязаны
-    достаться последнему платежу целиком, иначе сумма графика разойдётся с
-    суммой договора — а это первое, что пересчитает клиент.
+    Делим в ЦЕЛЫХ сумах: тийинов в расчётах нет, а дробный остаток от деления
+    обязан достаться последнему платежу целиком — иначе сумма графика
+    разойдётся с суммой договора, а это первое, что пересчитает клиент.
     """
     if installments_count < 1:
         raise DocumentError("Число платежей должно быть больше нуля")
     if total_cents <= 0:
         raise DocumentError("Сумма должна быть больше нуля")
+    if total_cents % 100:
+        raise DocumentError("Сумма в сумах — целым числом, без тийинов")
 
-    base = total_cents // installments_count
+    base = total_cents // 100 // installments_count * 100
     rows, paid = [], 0
     for n in range(1, installments_count + 1):
         amount = base if n < installments_count else total_cents - paid
@@ -132,83 +134,62 @@ def build_context(
     *,
     doc_type: str,
     city: str,
-    debtor: dict,
     creditor: dict,
     product_name: str,
     total_cents: int,
-    currency: str,
     start_date: date,
     term_months: int,
-    payment_type: str,
-    installments_count: int | None,
-    penalty_rate: str,
-    grace_days: int,
-    witness_name: str = "",
+    installments_count: int,
+    debtor_full_name: str = "",
 ) -> dict:
     """Контекст для шаблона. Ключи обязаны совпадать с плейсхолдерами docx:
-    отсутствующий ключ docxtpl отрисует пустотой, и документ уйдёт с дырой."""
+    отсутствующий ключ docxtpl отрисует пустотой, и документ уйдёт с дырой.
+
+    `debtor_full_name` в документ не печатается (Должник вписывает ФИО сам) —
+    он нужен имени PDF-файла и списку документов.
+    """
     if doc_type not in TEMPLATES:
         raise DocumentError(f"Неизвестный тип документа: {doc_type}")
-    if payment_type not in ("single", "installment"):
-        raise DocumentError(f"Неизвестный тип оплаты: {payment_type}")
     if term_months < 1:
         raise DocumentError("Срок должен быть не меньше месяца")
 
-    lang = TEMPLATES[doc_type][1]
-    if doc_type in HANDWRITTEN_TYPES:
-        if currency != "USD":
-            raise DocumentError("Расписка RU+UZ составляется только в долларах США")
-        missing = [label for key, label in _HANDWRITTEN_REQUIRED if not creditor.get(key)]
-        if missing:
-            raise DocumentError(
-                "Для расписки RU+UZ заполните в «Реквизитах компании»: " + ", ".join(missing)
-            )
-
-    if payment_type == "single":
-        count = 1
-    else:
-        if not installments_count or installments_count < 2:
-            raise DocumentError("Для рассрочки нужно не меньше двух платежей")
-        count = installments_count
+    langs = TEMPLATES[doc_type][1]
+    required = _REQUIRED_COMMON + tuple(f for lang in langs for f in _REQUIRED_BY_LANG[lang])
+    missing = [label for key, label in required if not creditor.get(key)]
+    if missing:
+        raise DocumentError(
+            "Для расписки заполните в «Реквизитах компании»: " + ", ".join(missing)
+        )
 
     end_date = start_date + relativedelta(months=term_months)
     # Последний платёж не должен выходить за срок договора: график, который
     # заканчивается после окончания расписки, противоречит сам себе.
-    last_payment = start_date + relativedelta(months=count)
+    last_payment = start_date + relativedelta(months=installments_count)
     if last_payment > end_date:
         raise DocumentError(
             f"Последний платёж ({_fmt_date(last_payment)}) позже срока "
             f"({_fmt_date(end_date)}): платежей больше, чем месяцев срока"
         )
+    schedule = build_schedule(total_cents, installments_count, start_date)
+    whole = money.from_cents(total_cents)
 
     return {
         "city": city,
-        "document_date": _fmt_date(date.today()),
-        "debtor_full_name": debtor["full_name"],
-        "debtor_birth_date": debtor.get("birth_date", ""),
-        "debtor_passport": debtor.get("passport", ""),
-        "debtor_pinfl": debtor.get("pinfl", ""),
-        "debtor_address": debtor.get("address", ""),
-        "debtor_phone": debtor.get("phone", ""),
+        "city_uz": creditor.get("city_uz") or city,
+        "debtor_full_name": debtor_full_name,
         "creditor_name": creditor["name"],
         "creditor_tin": creditor.get("tin", ""),
         "creditor_address": creditor.get("address", ""),
         "creditor_representative": creditor.get("representative", ""),
         **_signatory(creditor),
-        "city_uz": creditor.get("city_uz") or city,
         "product_name": product_name,
         "total_amount": _money(total_cents),
-        "total_amount_words": amount_in_words(money.from_cents(total_cents), lang),
-        "currency": currency,
+        # Пропись — на языке своей части: в двуязычном документе обе.
+        "total_amount_words_ru": amount_in_words(whole, "ru"),
+        "total_amount_words_uz": amount_in_words(whole, "uz"),
         "start_date": _fmt_date(start_date),
         "end_date": _fmt_date(end_date),
-        "payment_clause": _PAYMENT_CLAUSE[(lang, payment_type)],
-        "schedule": build_schedule(total_cents, count, start_date),
-        # Пеня вставляется как УСЛОВИЕ, а не посчитанное число: на момент
-        # подписания просрочки ещё нет, и сумма пени неизвестна.
-        "penalty_rate": penalty_rate,
-        "grace_days": grace_days,
-        "witness_name": witness_name,
+        "schedule": schedule,
     }
 
 
