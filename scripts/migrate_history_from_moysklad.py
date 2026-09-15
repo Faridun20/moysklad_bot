@@ -47,6 +47,24 @@
 съел бы номера у живой нумерации, и следующая накладная, выписанная людьми,
 получила бы номер из середины истории.
 
+**КЛЮЧ НАКЛАДНОЙ — UUID ДОКУМЕНТА МС, А НЕ ЕГО НОМЕР.** Номер (`name`) в МС
+не уникален: его правят руками, и две отгрузки с одним именем — законное
+состояние аккаунта. Когда ключом был номер, вторая отгрузка молча
+переписывала первую (DELETE строк + UPDATE шапки). Теперь ключ —
+`ms_id_map(entity_type='demand'|'supply')` с PRIMARY KEY по UUID, а номер
+только отображение: дубль имени получает суффикс `-2`, `-3`.
+
+**ВАЛЮТА — ISO-КОД, КУРС — ИЗ ДОКУМЕНТА.** `rate.currency` раскрывается
+`expand`, код берётся из `isoCode` (у МС `name` — «сум»/«руб», не ISO), а
+`fx_rate_to_base` — из `rate.value` документа, то есть курс ТОГО дня. Без
+этого сумовый документ записывался как долларовый, а пересчёт шёл по
+сегодняшнему курсу. Семантику курса, которую нельзя подтвердить справочником
+валют МС, скрипт не угадывает — останавливается с объяснением (`MigrationStop`).
+
+**ВРЕМЯ — МОСКОВСКОЕ.** API МС отдаёт моменты по Москве (UTC+3), бизнес-зона
+проекта — Ташкент (UTC+5). Вечерний документ после 22:00 по Москве в Ташкенте
+уже следующего дня, а 31-го числа — следующего месяца.
+
 **ЗАКАЗ ↔ ОТГРУЗКА: СВЯЗЬ ОДИН-К-ОДНОМУ, А В МС ОДИН-КО-МНОГИМ.**
 `order_shipment.order_id` — PRIMARY KEY, то есть у заказа ровно одна строка
 отгрузки. В МойСклад по одному заказу может быть несколько demand'ов
@@ -79,11 +97,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import bisect
 import logging
+import math
 import os
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -227,11 +249,255 @@ def _href_id(meta: dict | None) -> str:
     return href.rstrip("/").rsplit("/", 1)[-1].split("?")[0] if href else ""
 
 
+class MigrationStop(RuntimeError):
+    """Перенос остановлен до записи: без решения человека данные вышли бы неверными.
+
+    Не баг скрипта, а отказ писать то, что нельзя подтвердить (валюта, курс).
+    Тихо записанная неверная сумма выглядит достоверной и всплывает месяцами
+    позже в долгах и отчётах — остановка на предпросмотре дешевле.
+    """
+
+
+# Часовой пояс моментов в API МС: «указаны в часовом поясе MSK» (_general.md,
+# «Формат даты и времени»).
+MS_TZ = "Europe/Moscow"
+
+
+def _doc_rate(doc: dict) -> dict:
+    """Валюта и курс документа МС в сыром виде; разбор — `resolve_currencies`.
+
+    `rate.value` по документации МС «содержится в ответе, если значение курса
+    отлично от 1» — отсутствие поля значит 1, а не «неизвестно». `currency`
+    здесь пустая: ISO-код появится только после сверки со справочником валют.
+    """
+    rate = doc.get("rate") or {}
+    cur = rate.get("currency") or {}
+    value = rate.get("value")
+    return {
+        "currency": "",
+        "currency_ms_id": _href_id(cur) or str(cur.get("id") or ""),
+        "currency_iso": str(cur.get("isoCode") or "").upper(),
+        "rate_value": float(value) if value is not None else None,
+    }
+
+
+async def pull_currencies() -> list[dict]:
+    """Справочник валют МС. Один запрос, но без него курс документа не прочитать.
+
+    Нужен ради полей, которых в документе нет: `default` (какая валюта —
+    учётная, к ней и приведён `rate.value`) и `multiplicity`/`indirect`
+    (кратность и обратный курс меняют смысл числа).
+    """
+    rows = await fetch_paged("entity/currency", page=100)
+    out = []
+    for c in rows:
+        out.append(
+            {
+                "ms_id": str(c.get("id") or _href_id(c)),
+                "iso": str(c.get("isoCode") or "").upper(),
+                "name": c.get("name") or "",
+                "default": bool(c.get("default")),
+                "rate": float(c.get("rate") or 0),
+                "multiplicity": int(c.get("multiplicity") or 1),
+                "indirect": bool(c.get("indirect")),
+            }
+        )
+    logger.info("Валют в справочнике МС: %d", len(out))
+    return out
+
+
+# ─── Валюта и курс ────────────────────────────────────────────────────────────
+#
+# Семантика проекта: `fx_rate_to_base` — сколько единиц BASE_CURRENCY стоит
+# ОДНА единица валюты строки (UZS при базе USD ≈ 0.0000787). Семантика МС:
+# `rate.value` — курс валюты документа к УЧЁТНОЙ валюте аккаунта (у валюты с
+# `default=true`), в тех же единицах, что `rate` в справочнике валют. Учётная
+# валюта МС и BASE_CURRENCY проекта — не обязательно одно и то же, поэтому
+# перевод двухшаговый: документ → учётная (курс документа) → базовая.
+
+# Во сколько раз курс документа может отличаться от сегодняшнего курса в
+# справочнике, оставаясь правдоподобным. Сум за годы истории терял десятки
+# процентов и однажды вдвое, но не в 20 раз; а неверно прочитанный курс
+# (прямой вместо обратного, пропущенная кратность) промахивается на порядки.
+_RATE_SANITY_FACTOR = 20.0
+
+
+def _units_of_account(rate: float, multiplicity: int, indirect: bool) -> float | None:
+    """Сколько единиц учётной валюты стоит 1 единица данной — по полям МС.
+
+    Прямой курс: `multiplicity` единиц валюты = `rate` учётных. Обратный:
+    1 учётная = `rate` единиц валюты на `multiplicity`. Ноль и минус курсом
+    не бывают — это пустое поле, и считать по нему нельзя.
+    """
+    if rate <= 0 or multiplicity <= 0:
+        return None
+    return (multiplicity / rate) if indirect else (rate / multiplicity)
+
+
+def resolve_currencies(docs: list[dict], currencies: list[dict]) -> tuple[str, list[str]]:
+    """Проставить документам ISO-код валюты и курс к учётной валюте МС.
+
+    Возвращает (ISO учётной валюты, список проблем). Пишет в документ
+    `currency` (ISO) и `_acct_per_unit`. Идемпотентна: её зовут и отчёт
+    предпросмотра, и запись.
+
+    Не угадывает: валюта, которой нет в справочнике, курс, не согласующийся
+    со справочником на порядок, — это проблема в списке, а не «подставим 1».
+    """
+    if not currencies:
+        raise MigrationStop(
+            "Справочник валют МС пуст или не выгружен — без него не понять, в какой "
+            "валюте документы и к чему приведён их курс. Проверьте права токена на "
+            "entity/currency."
+        )
+    defaults = [c for c in currencies if c["default"]]
+    if len(defaults) != 1 or not defaults[0]["iso"]:
+        raise MigrationStop(
+            f"Учётная валюта МС не определена: валют с default=true — {len(defaults)}. "
+            "Курс документа приведён именно к ней, и без неё его не прочитать."
+        )
+    acct = defaults[0]
+    by_id = {c["ms_id"]: c for c in currencies if c["ms_id"]}
+    by_iso = {c["iso"]: c for c in currencies if c["iso"]}
+
+    problems: list[str] = []
+    for doc in docs:
+        label = f"{doc.get('_kind') or 'документ'} {doc.get('name') or doc.get('ms_id')}"
+        cur = by_id.get(doc.get("currency_ms_id") or "") or by_iso.get(
+            doc.get("currency_iso") or ""
+        )
+        if cur is None or not cur["iso"]:
+            problems.append(
+                f"{label}: валюта документа не найдена в справочнике МС "
+                f"(id {doc.get('currency_ms_id') or '—'}, "
+                f"isoCode {doc.get('currency_iso') or '—'})"
+            )
+            doc["currency"], doc["_acct_per_unit"] = "", None
+            continue
+        doc["currency"] = cur["iso"]
+        raw_value = doc.get("rate_value")
+        value = 1.0 if raw_value is None else float(raw_value)
+
+        if cur["ms_id"] == acct["ms_id"]:
+            # Документ в учётной валюте: курс обязан быть 1. Иное значит, что
+            # мы неверно понимаем, к чему МС приводит rate.value.
+            if math.isclose(value, 1.0, rel_tol=1e-9):
+                doc["_acct_per_unit"] = 1.0
+            else:
+                problems.append(
+                    f"{label}: документ в учётной валюте {cur['iso']}, а курс {value:g} ≠ 1"
+                )
+                doc["_acct_per_unit"] = None
+            continue
+
+        how = (
+            f"в справочнике {cur['rate']:g}, кратность {cur['multiplicity']}, "
+            f"обратный курс {'да' if cur['indirect'] else 'нет'}"
+        )
+        reference = _units_of_account(cur["rate"], cur["multiplicity"], cur["indirect"])
+        got = _units_of_account(value, cur["multiplicity"], cur["indirect"])
+        if reference is None or got is None:
+            problems.append(
+                f"{label}: курс {cur['iso']} не прочитать — в документе {value:g}, {how}"
+            )
+            doc["_acct_per_unit"] = None
+            continue
+        ratio = got / reference
+        if not (1 / _RATE_SANITY_FACTOR <= ratio <= _RATE_SANITY_FACTOR):
+            problems.append(
+                f"{label} от {str(doc.get('moment') or '')[:10]}: курс "
+                f"{cur['iso']}→{acct['iso']} в документе {value:g} расходится со "
+                f"справочником МС ({how}) в {max(ratio, 1 / ratio):.0f} раз — смысл "
+                "числа понят неверно или курс в документе ошибочный"
+            )
+            doc["_acct_per_unit"] = None
+            continue
+        doc["_acct_per_unit"] = got
+    return acct["iso"], problems
+
+
+async def _apply_base_rates(txn, docs: list[dict], acct_iso: str, base_cur: str) -> list[str]:
+    """Из курса к учётной валюте МС — `fx` в семантике проекта (к BASE_CURRENCY).
+
+    Если учётная валюта МС и есть базовая — курс документа уже ответ. Если нет
+    (аккаунт в сумах, база в долларах), недостающее звено «учётная → базовая»
+    на дату документа берётся из архива `currency_rate_daily` (тот же, по
+    которому `backfill_fx_rate_snapshots` чинит живые заказы). Нет курса на ту
+    дату — проблема в списке, а не сегодняшний курс молча.
+    """
+    archive: list[tuple[str, float]] = []
+    if acct_iso != base_cur:
+        archive = [
+            (str(r["rate_date"])[:10], float(r["rate_to_base"]))
+            for r in await txn.fetch(
+                "SELECT rate_date, rate_to_base FROM currency_rate_daily "
+                "WHERE currency_code = $1 ORDER BY rate_date",
+                acct_iso,
+            )
+        ]
+    days = [d for d, _ in archive]
+    missing_days: set[str] = set()
+    for doc in docs:
+        acct_per_unit = doc.get("_acct_per_unit")
+        if doc.get("currency") == base_cur and acct_per_unit is not None:
+            doc["fx"] = 1.0
+        elif acct_per_unit is None:
+            doc["fx"] = None  # причина уже в проблемах resolve_currencies
+        elif acct_iso == base_cur:
+            doc["fx"] = float(acct_per_unit)
+        else:
+            day = _ms_moment_to_local(doc.get("moment") or "")[:10]
+            i = bisect.bisect_right(days, day) - 1
+            if i < 0 or archive[i][1] <= 0:
+                doc["fx"] = None
+                missing_days.add(day)
+            else:
+                doc["fx"] = float(acct_per_unit) * archive[i][1]
+    if not missing_days:
+        return []
+    return [
+        f"учётная валюта МС {acct_iso} ≠ BASE_CURRENCY {base_cur}, а в архиве курсов "
+        f"(currency_rate_daily) нет курса {acct_iso} на {len(missing_days)} дат(ы) "
+        f"с {min(missing_days)} по {max(missing_days)}. Пополните архив "
+        "(python -m tasks.run_fx_sync --backfill-days N) и повторите предпросмотр."
+    ]
+
+
+def _ms_moment_to_local(moment: str) -> str:
+    """Момент МС (Москва) → строка бизнес-зоны проекта, без миллисекунд.
+
+    `2026-03-31 23:20:00.000` по Москве — это `2026-04-01 01:20:00` в Ташкенте:
+    другой день и другой месяц. Без сдвига вечерние продажи уезжали во
+    вчерашний день и прошлый месяц отчётов.
+
+    Зоны — через zoneinfo, а не константой «+2 ч»: смещение Москвы менялось
+    (2011–2014 было UTC+4), и старая история посчиталась бы неверно.
+    Формат результата — как у `now_str()`: сравнения дат в SQL лексические, и
+    хвост `.000` сортировался бы отдельно от остальных строк.
+    """
+    raw = (moment or "").replace("T", " ").split(".")[0].strip()
+    if not raw:
+        return ""
+    naive = None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            naive = datetime.strptime(raw, fmt)
+            break
+        except ValueError:
+            continue
+    if naive is None:
+        raise MigrationStop(f"Момент МС в неизвестном формате: {moment!r}")
+    from services.startup_checks import business_tz
+
+    local = naive.replace(tzinfo=ZoneInfo(MS_TZ)).astimezone(ZoneInfo(business_tz()))
+    return local.strftime("%Y-%m-%d %H:%M:%S")
+
+
 async def pull_orders() -> list[dict]:
     logger.info("Выгружаю заказы покупателей (вся история)…")
     rows = await fetch_paged(
         "entity/customerorder",
-        {"expand": "agent,state,positions.assortment", "order": "moment,asc"},
+        {"expand": "agent,state,rate.currency,positions.assortment", "order": "moment,asc"},
     )
     out = []
     for o in rows:
@@ -246,7 +512,8 @@ async def pull_orders() -> list[dict]:
                 "sum_minor": int(o.get("sum") or 0),
                 "payed_minor": int(o.get("payedSum") or 0),
                 "shipped_minor": int(o.get("shippedSum") or 0),
-                "currency": ((o.get("rate") or {}).get("currency") or {}).get("name") or "",
+                "_kind": "заказ",
+                **_doc_rate(o),
                 "description": o.get("description") or "",
                 "positions": await _positions_of("customerorder", o),
             }
@@ -259,7 +526,7 @@ async def pull_demands() -> list[dict]:
     logger.info("Выгружаю отгрузки (вся история)…")
     rows = await fetch_paged(
         "entity/demand",
-        {"expand": "agent,customerOrder,positions.assortment", "order": "moment,asc"},
+        {"expand": "agent,customerOrder,rate.currency,positions.assortment", "order": "moment,asc"},
     )
     out = []
     for d in rows:
@@ -272,7 +539,8 @@ async def pull_demands() -> list[dict]:
                 "agent_name": ((d.get("agent") or {}).get("name")) or "",
                 "order_ms_id": _href_id(d.get("customerOrder")),
                 "sum_minor": int(d.get("sum") or 0),
-                "currency": ((d.get("rate") or {}).get("currency") or {}).get("name") or "",
+                "_kind": "отгрузка",
+                **_doc_rate(d),
                 "positions": await _positions_of("demand", d),
             }
         )
@@ -283,7 +551,7 @@ async def pull_demands() -> list[dict]:
 async def pull_payments() -> list[dict]:
     logger.info("Выгружаю входящие платежи (вся история)…")
     rows = await fetch_paged(
-        "entity/paymentin", {"expand": "agent,operations", "order": "moment,asc"}
+        "entity/paymentin", {"expand": "agent,operations,rate.currency", "order": "moment,asc"}
     )
     out = []
     for p in rows:
@@ -304,7 +572,8 @@ async def pull_payments() -> list[dict]:
                 "agent_ms_id": _href_id(p.get("agent")),
                 "agent_name": ((p.get("agent") or {}).get("name")) or "",
                 "sum_minor": int(p.get("sum") or 0),
-                "currency": ((p.get("rate") or {}).get("currency") or {}).get("name") or "",
+                "_kind": "платёж",
+                **_doc_rate(p),
                 "purpose": p.get("paymentPurpose") or "",
                 "operations": op_ids,
             }
@@ -318,7 +587,7 @@ async def pull_supplies() -> list[dict]:
     logger.info("Выгружаю поступления (вся история)…")
     rows = await fetch_paged(
         "entity/supply",
-        {"expand": "agent,positions.assortment", "order": "moment,asc"},
+        {"expand": "agent,rate.currency,positions.assortment", "order": "moment,asc"},
     )
     out = []
     for sp in rows:
@@ -330,7 +599,8 @@ async def pull_supplies() -> list[dict]:
                 "agent_ms_id": _href_id(sp.get("agent")),
                 "agent_name": ((sp.get("agent") or {}).get("name")) or "",
                 "sum_minor": int(sp.get("sum") or 0),
-                "currency": ((sp.get("rate") or {}).get("currency") or {}).get("name") or "",
+                "_kind": "поступление",
+                **_doc_rate(sp),
                 "description": sp.get("description") or "",
                 "positions": await _positions_of("supply", sp),
             }
@@ -343,7 +613,7 @@ async def pull_payments_out() -> list[dict]:
     """Исходящие платежи — расчёты с поставщиками."""
     logger.info("Выгружаю исходящие платежи (вся история)…")
     rows = await fetch_paged(
-        "entity/paymentout", {"expand": "agent,operations", "order": "moment,asc"}
+        "entity/paymentout", {"expand": "agent,operations,rate.currency", "order": "moment,asc"}
     )
     out = []
     for p in rows:
@@ -361,7 +631,8 @@ async def pull_payments_out() -> list[dict]:
                 "agent_ms_id": _href_id(p.get("agent")),
                 "agent_name": ((p.get("agent") or {}).get("name")) or "",
                 "sum_minor": int(p.get("sum") or 0),
-                "currency": ((p.get("rate") or {}).get("currency") or {}).get("name") or "",
+                "_kind": "исходящий платёж",
+                **_doc_rate(p),
                 "purpose": p.get("paymentPurpose") or "",
                 "operations": op_ids,
             }
@@ -475,20 +746,8 @@ def _doc_total_cents(rows: list[dict]) -> int:
 # ─── Запись ───────────────────────────────────────────────────────────────────
 
 
-def _ms_moment_to_local(moment: str) -> str:
-    """`2026-03-14 09:20:00.000` → `2026-03-14 09:20:00`.
-
-    Формат `now_str()` в проекте — без миллисекунд, и сравнения дат в SQL
-    лексические: строка с хвостом `.000` сортировалась бы отдельно от всех
-    остальных.
-    """
-    return (moment or "").replace("T", " ").split(".")[0].strip()
-
-
 async def _base_currency() -> str:
-    from config import BASE_CURRENCY
-
-    return (BASE_CURRENCY or "USD").upper()
+    return _base_currency_sync()
 
 
 async def write_history(
@@ -498,6 +757,7 @@ async def write_history(
     supplies: list[dict] | None = None,
     payments_out: list[dict] | None = None,
     *,
+    currencies: list[dict],
     dry_run: bool,
 ) -> tuple[dict, Unmatched, list[str]]:
     """Перенести историю одной транзакцией. Частично применённой не бывает.
@@ -524,6 +784,10 @@ async def write_history(
     * **Контрагент при этом НЕ угадывается.** Платёж без контрагента или от
       контрагента, у которого нет ни одного заказа, остаётся несопоставленным
       и уходит в отчёт — привязать его не к чему.
+
+    Валюта и курс сверяются ДО первой записи: документ, чью валюту или курс
+    нельзя подтвердить, останавливает весь перенос (`MigrationStop`) — и
+    предпросмотр тоже, иначе отчёт показал бы суммы, которых не будет.
     """
     from services import adb_core
     from services.database import now_str
@@ -535,11 +799,21 @@ async def write_history(
     stats: dict[str, int] = defaultdict(int)
     problems: list[str] = []
 
+    all_docs = [*orders, *demands, *payments, *(supplies or []), *(payments_out or [])]
+    acct_iso, fx_problems = resolve_currencies(all_docs, currencies)
+
     class _Rollback(Exception):
         """Сигнал отката для --dry-run. Не ошибка."""
 
     try:
         async with adb_core.transaction() as txn:
+            fx_problems += await _apply_base_rates(txn, all_docs, acct_iso, base_cur)
+            if fx_problems:
+                raise MigrationStop(
+                    "Валюта или курс не подтверждены — в базу ничего не записано:\n"
+                    + "\n".join(f"  • {x}" for x in fx_problems[:30])
+                    + (f"\n  …и ещё {len(fx_problems) - 30}" if len(fx_problems) > 30 else "")
+                )
             product_map, cp_map = await load_maps(txn)
             stats["products_known"] = len(product_map)
             stats["counterparties_known"] = len(cp_map)
@@ -561,14 +835,14 @@ async def write_history(
                 rows = _position_rows(o["positions"], product_map, label, unmatched)
                 total_cents = _doc_total_cents(rows)
                 order_total_cents[o["ms_id"]] = total_cents
-                currency = (o["currency"] or base_cur).upper()
+                currency = o["currency"]
                 moment = _ms_moment_to_local(o["moment"])
 
                 order_id = await _upsert_order(
                     txn, o,
                     cp_id=cp_id, currency=currency, moment=moment,
                     fully_paid=False,  # состояние оплаты посчитаем после разнесения
-                    fx=(1.0 if currency == base_cur else None),
+                    fx=o["fx"],
                     now=now,
                 )
                 order_local[o["ms_id"]] = order_id
@@ -614,7 +888,7 @@ async def write_history(
                     invoice_id = await _write_invoice(
                         txn, d, rows,
                         counterparty_id=cp_map.get(d["agent_ms_id"]),
-                        order_id=order_id, base_cur=base_cur, now=now,
+                        order_id=order_id, base_cur=base_cur, now=now, stats=stats,
                     )
                     shipped_cents[ms_order_id] += sum(
                         mul_qty(r["price_cents"], r["quantity"]) for r in rows
@@ -638,13 +912,13 @@ async def write_history(
                     )
                 rows = _position_rows(d["positions"], product_map, label, unmatched)
                 total_cents = _doc_total_cents(rows)
-                currency = (d["currency"] or base_cur).upper()
+                currency = d["currency"]
                 moment = _ms_moment_to_local(d["moment"])
 
                 order_id = await _upsert_order_from_demand(
                     txn, d,
                     cp_id=cp_id, currency=currency, moment=moment,
-                    fx=(1.0 if currency == base_cur else None), now=now,
+                    fx=d["fx"], now=now,
                 )
                 demand_order[d["ms_id"]] = order_id
                 order_book.append(
@@ -659,7 +933,7 @@ async def write_history(
 
                 invoice_id = await _write_invoice(
                     txn, d, rows, counterparty_id=cp_id,
-                    order_id=order_id, base_cur=base_cur, now=now,
+                    order_id=order_id, base_cur=base_cur, now=now, stats=stats,
                 )
                 await _write_shipment(txn, order_id, invoice_id, d, now)
                 stats["demands"] += 1
@@ -709,7 +983,7 @@ async def write_history(
                     continue
                 queue = [
                     b for b in fifo_queue.get(int(cp_id), [])
-                    if b["currency"] == (p["currency"] or base_cur).upper()
+                    if b["currency"] == p["currency"]
                     and b["paid"] < b["total"]
                 ]
                 if not queue:
@@ -774,7 +1048,7 @@ async def write_history(
                 rows = _position_rows(sp["positions"], product_map, label, unmatched)
                 invoice_id = await _write_invoice(
                     txn, sp, rows, counterparty_id=cp_id, order_id=None,
-                    base_cur=base_cur, now=now, kind="incoming",
+                    base_cur=base_cur, now=now, kind="incoming", stats=stats,
                 )
                 supply_invoice[sp["ms_id"]] = invoice_id
                 doc_total = sum(mul_qty(r["price_cents"], r["quantity"]) for r in rows)
@@ -809,6 +1083,11 @@ async def write_history(
                 paid_out_cents[str(cp_id)] += p["sum_minor"]
                 stats["payments_out"] += 1
 
+            await _mark_suppliers(
+                txn, cp_map, sales=[*orders, *demands],
+                purchases=[*(supplies or []), *(payments_out or [])], stats=stats,
+            )
+
             problems = _check_consistency(
                 orders, order_total_cents, shipped_cents, order_local
             )
@@ -823,6 +1102,39 @@ async def write_history(
 
     stats["unmatched"] = unmatched.total()
     return dict(stats), unmatched, problems
+
+
+async def _mark_suppliers(
+    txn, cp_map: dict[str, int], *, sales: list[dict], purchases: list[dict], stats: dict
+) -> None:
+    """Проставить `type='supplier'` контрагентам, у которых в МС только закупки.
+
+    Справочник переносил всех как `customer`: в самой карточке МС признака
+    «поставщик» нет, он виден только по документам — а документы приезжают
+    здесь. Тип решает, в каком списке человек ищет контрагента, и поставщик
+    среди клиентов — это шум в выборе клиента для заказа.
+
+    Контрагент и с закупками, и с продажами остаётся `customer`: схема знает
+    только два типа (`CHECK (type IN ('supplier','customer'))`), а клиентская
+    сторона — долги, лимиты, заказы — у него важнее. Такие считаются отдельно
+    (`counterparties_both`), чтобы решение было видно в отчёте.
+
+    Меняем только `customer` → `supplier` у перенесённых (`legacy_ms_id`):
+    карточку, которую человек уже переключил сам, не трогаем.
+    """
+    sellers = {cp_map[d["agent_ms_id"]] for d in sales if d.get("agent_ms_id") in cp_map}
+    buyers_from = {
+        cp_map[d["agent_ms_id"]] for d in purchases if d.get("agent_ms_id") in cp_map
+    }
+    stats["counterparties_both"] = len(buyers_from & sellers)
+    for cp_id in sorted(buyers_from - sellers):
+        n = await txn.execute(
+            "UPDATE counterparties SET type = 'supplier' "
+            "WHERE id = $1 AND type = 'customer' AND legacy_ms_id IS NOT NULL",
+            int(cp_id),
+        )
+        stats["counterparties_to_supplier"] += int(n or 0)
+    stats["counterparties_supplier_only"] = len(buyers_from - sellers)
 
 
 async def _write_items(txn, order_id: int, rows: list[dict], now: str, stats: dict) -> None:
@@ -993,9 +1305,16 @@ async def _upsert_order_from_demand(
     return int(new_id)
 
 
+# Сущности МС в `ms_id_map` для исторических накладных. Этот же признак читает
+# `services/warehouse.py` (`historical_invoice_sql`, `HISTORY_MAP_ENTITIES`),
+# запрещая их отмену; совпадение стережёт тест.
+INVOICE_ENTITY = {"outgoing": "demand", "incoming": "supply"}
+
+
 async def _write_invoice(
     txn, d: dict, rows: list[dict], *, counterparty_id: int | None,
     order_id: int | None, base_cur: str, now: str, kind: str = "outgoing",
+    stats: dict | None = None,
 ) -> int:
     """Историческая накладная (расходная или приходная). ОСТАТОК НЕ ДВИГАЕТ.
 
@@ -1008,50 +1327,82 @@ async def _write_invoice(
     `invoice_counters` не трогаем: иначе перенос съел бы номера у живой
     нумерации, и следующая накладная, выписанная людьми, получила бы номер
     из середины истории.
+
+    **Ключ — UUID документа через `ms_id_map`, номер — только отображение.**
+    Имя документа в МС не уникально; пока ключом был номер, вторая отгрузка
+    с тем же именем стирала строки первой и переписывала её шапку. Дубль имени
+    получает суффикс (`MS-D-D001-2`), а исходное имя остаётся в комментарии.
+    Номер уже перенесённой накладной при повторном прогоне не меняется: его
+    могли успеть назвать клиенту.
     """
     from services.money import mul_qty
 
+    entity = INVOICE_ENTITY[kind]
     prefix = "MS-D" if kind == "outgoing" else "MS-S"
-    number = f"{prefix}-{d['name'] or d['ms_id'][:8]}"
+    base_number = f"{prefix}-{d['name'] or d['ms_id'][:8]}"
+    ms_label = f"{'отгрузка' if kind == 'outgoing' else 'поступление'} {d['name'] or d['ms_id']}"
     comment = (
-        f"Перенос из МойСклад · заказ #{order_id}"
+        f"Перенос из МойСклад · заказ #{order_id} · {ms_label}"
         if order_id
-        else "Перенос из МойСклад · поступление"
+        else f"Перенос из МойСклад · {ms_label}"
     )
-    existing = await txn.fetchval("SELECT id FROM invoices WHERE invoice_number = $1", number)
+    local_date = _ms_moment_to_local(d["moment"])
+    total = sum(mul_qty(r["price_cents"], r["quantity"]) for r in rows)
+
+    existing = await txn.fetchval(
+        "SELECT i.id FROM ms_id_map m JOIN invoices i ON i.id = m.local_id "
+        "WHERE m.entity_type = $1 AND m.ms_id = $2",
+        entity, d["ms_id"],
+    )
+    if existing is None:
+        # Накладная, записанная прежней версией скрипта (ключом был номер, в
+        # ms_id_map её нет). Подхватываем её, а не заводим вторую рядом, —
+        # иначе повторный прогон удвоил бы историю. Только ещё не занятую
+        # другим UUID: у второго документа с тем же именем своя накладная.
+        existing = await txn.fetchval(
+            "SELECT i.id FROM invoices i WHERE i.invoice_number = $1 AND i.created_by = 0 "
+            "AND NOT EXISTS (SELECT 1 FROM ms_id_map m "
+            "                WHERE m.entity_type = $2 AND m.local_id = i.id)",
+            base_number, entity,
+        )
+
     if existing is not None:
-        await txn.execute("DELETE FROM invoice_items WHERE invoice_id = $1", int(existing))
         invoice_id = int(existing)
+        await txn.execute("DELETE FROM invoice_items WHERE invoice_id = $1", invoice_id)
         await txn.execute(
             "UPDATE invoices SET counterparty_id = $1, invoice_date = $2, "
             "currency = $3, total_amount_cents = $4, comment = $5 WHERE id = $6",
-            counterparty_id,
-            _ms_moment_to_local(d["moment"])[:10],
-            (d["currency"] or base_cur).upper(),
-            sum(mul_qty(r["price_cents"], r["quantity"]) for r in rows),
-            comment,
-            invoice_id,
+            counterparty_id, local_date[:10], d["currency"], total, comment, invoice_id,
         )
     else:
         warehouse_id = await txn.fetchval("SELECT id FROM warehouses ORDER BY id LIMIT 1")
         if warehouse_id is None:
             raise RuntimeError("Нет ни одного склада — прогоните `python -m tasks.migrate`")
+        number, n = base_number, 1
+        while await txn.fetchval(
+            "SELECT id FROM invoices WHERE invoice_number = $1", number
+        ) is not None:
+            n += 1
+            number = f"{base_number}-{n}"
+        if n > 1 and stats is not None:
+            stats["invoice_numbers_suffixed"] += 1
         await txn.execute(
             "INSERT INTO invoices (type, counterparty_id, warehouse_id, invoice_number, "
             "invoice_date, status, currency, total_amount_cents, comment, created_by, created_at) "
             f"VALUES ('{kind}', $1, $2, $3, $4, 'confirmed', $5, $6, $7, 0, $8)",
-            counterparty_id,
-            int(warehouse_id),
-            number,
-            _ms_moment_to_local(d["moment"])[:10],
-            (d["currency"] or base_cur).upper(),
-            sum(mul_qty(r["price_cents"], r["quantity"]) for r in rows),
-            comment,
-            _ms_moment_to_local(d["moment"]) or now,
+            counterparty_id, int(warehouse_id), number, local_date[:10],
+            d["currency"], total, comment, local_date or now,
         )
         invoice_id = int(
             await txn.fetchval("SELECT id FROM invoices WHERE invoice_number = $1", number)
         )
+
+    await txn.execute(
+        "INSERT INTO ms_id_map (entity_type, ms_id, local_id, migrated_at) "
+        "VALUES ($1, $2, $3, $4) "
+        "ON CONFLICT (entity_type, ms_id) DO UPDATE SET local_id = EXCLUDED.local_id",
+        entity, d["ms_id"], invoice_id, now,
+    )
 
     for r in rows:
         if not r["product_id"]:
@@ -1084,8 +1435,10 @@ async def _upsert_payment(
     платежа — при повторном прогоне разнесение может лечь иначе.
     """
     moment = _ms_moment_to_local(p["moment"])
-    currency = (p["currency"] or base_cur).upper()
-    fx = 1.0 if currency == base_cur else None
+    # ISO и курс уже сверены resolve_currencies/_apply_base_rates: подставить
+    # здесь базовую валюту «по умолчанию» значило бы записать сумы долларами.
+    currency = p["currency"]
+    fx = p["fx"]
     amount = int(amount_cents if amount_cents is not None else p["sum_minor"])
     key = p["ms_id"] if part <= 1 else f"{p['ms_id']}#{part}"
 
@@ -1123,8 +1476,8 @@ async def _upsert_payment_out(
     уменьшил бы долг клиента на сумму, выплаченную поставщику.
     """
     moment = _ms_moment_to_local(p["moment"])
-    currency = (p["currency"] or base_cur).upper()
-    fx = 1.0 if currency == base_cur else None
+    currency = p["currency"]
+    fx = p["fx"]
     comment = (
         f"Перенос из МойСклад · {p['purpose']}" if p["purpose"] else "Перенос из МойСклад"
     )[:500]
@@ -1222,26 +1575,124 @@ def _money(minor: int) -> str:
     return f"{minor / 100:,.2f}".replace(",", " ")
 
 
+def _sums_by_currency(docs: list[dict]) -> str:
+    sums: dict[str, int] = defaultdict(int)
+    for d in docs:
+        sums[d.get("currency") or "?"] += int(d.get("sum_minor") or 0)
+    return " · ".join(f"{cur} {_money(v)}" for cur, v in sorted(sums.items())) or "—"
+
+
+def duplicate_names(docs: list[dict]) -> dict[str, int]:
+    """Имена документов, встречающиеся больше одного раза: {имя: сколько}.
+
+    Имя в МС не уникально, и каждая такая группа — это накладные, которые
+    получат номер с суффиксом. Показываем ДО записи, чтобы суффиксы не стали
+    сюрпризом для того, кто будет искать накладную по номеру из МС.
+    """
+    counts: dict[str, int] = defaultdict(int)
+    for d in docs:
+        counts[d.get("name") or d.get("ms_id") or ""] += 1
+    return {name: n for name, n in counts.items() if n > 1}
+
+
+def currency_breakdown(kinds: dict[str, list[dict]]) -> list[str]:
+    """Распределение документов и сумм по валютам — всего и помесячно.
+
+    Месяц — по ТАШКЕНТСКОМУ времени документа (после сдвига из Москвы): ровно
+    так он ляжет в отчёты проекта. Это главный экран предпросмотра: ошибку
+    валюты видно глазами как «в марте все продажи вдруг в долларах», а не
+    построчно.
+    """
+    lines = ["Распределение по валютам:"]
+    for kind, docs in kinds.items():
+        by_cur: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+        for d in docs:
+            acc = by_cur[d.get("currency") or "?"]
+            acc[0] += 1
+            acc[1] += int(d.get("sum_minor") or 0)
+        body = " · ".join(
+            f"{cur}: {n} на {_money(total)}" for cur, (n, total) in sorted(by_cur.items())
+        )
+        lines.append(f"  {kind:<18} {body or '—'}")
+
+    lines.append("Помесячно (месяц по Ташкенту):")
+    months: dict[str, dict[str, dict[str, list[int]]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(lambda: [0, 0]))
+    )
+    for kind, docs in kinds.items():
+        for d in docs:
+            month = _ms_moment_to_local(d.get("moment") or "")[:7] or "????-??"
+            acc = months[month][kind][d.get("currency") or "?"]
+            acc[0] += 1
+            acc[1] += int(d.get("sum_minor") or 0)
+    for month in sorted(months):
+        parts = []
+        for kind, by_cur in months[month].items():
+            body = ", ".join(
+                f"{cur} {n} на {_money(total)}" for cur, (n, total) in sorted(by_cur.items())
+            )
+            parts.append(f"{kind}: {body}")
+        lines.append(f"  {month}  " + " | ".join(parts))
+    return lines
+
+
+def print_preflight(
+    kinds: dict[str, list[dict]], currencies: list[dict], fx_problems: list[str]
+) -> None:
+    """То, что нужно увидеть ДО записи: валюты, помесячно, дубли имён."""
+    acct = next((c for c in currencies if c["default"]), None)
+    logger.info("")
+    logger.info("═══ ПРЕДВАРИТЕЛЬНАЯ СВЕРКА ═══")
+    logger.info(
+        "Учётная валюта МС: %s · BASE_CURRENCY проекта: %s · валюты в справочнике: %s",
+        (acct or {}).get("iso") or "не определена",
+        _base_currency_sync(),
+        ", ".join(sorted(c["iso"] or c["name"] for c in currencies)) or "—",
+    )
+    for line in currency_breakdown(kinds):
+        logger.info("%s", line)
+    for kind in ("отгрузки", "поступления"):
+        dups = duplicate_names(kinds.get(kind, []))
+        if dups:
+            extra = sum(n - 1 for n in dups.values())
+            sample = ", ".join(f"«{k}»×{v}" for k, v in sorted(dups.items())[:10])
+            logger.warning(
+                "Дубли имён — %s: %d имён, накладных с суффиксом будет %d: %s",
+                kind, len(dups), extra, sample,
+            )
+        else:
+            logger.info("Дублей имён — %s: нет", kind)
+    if fx_problems:
+        logger.error("ВАЛЮТА/КУРС НЕ ПОДТВЕРЖДЕНЫ — %d:", len(fx_problems))
+        for line in fx_problems[:30]:
+            logger.error("  • %s", line)
+
+
+def _base_currency_sync() -> str:
+    from config import BASE_CURRENCY
+
+    return (BASE_CURRENCY or "USD").upper()
+
+
 def print_report(
     orders: list[dict], demands: list[dict], payments: list[dict],
     supplies: list[dict], payments_out: list[dict],
     stats: dict, unmatched: Unmatched, problems: list[str], *, dry_run: bool,
 ) -> None:
     head = "ПРЕДПРОСМОТР (в базу НЕ записано)" if dry_run else "ПЕРЕНЕСЕНО"
-    ms_orders_sum = sum(int(o["sum_minor"]) for o in orders)
-    ms_demands_sum = sum(int(d["sum_minor"]) for d in demands)
-    ms_payments_sum = sum(int(p["sum_minor"]) for p in payments)
 
+    # Суммы — только в разрезе валют: «на 1 250 000.00» поверх сумов и
+    # долларов вместе — число, которое ничего не значит.
     logger.info("")
     logger.info("═══ %s ═══", head)
     logger.info("Из МойСклад выгружено:")
-    logger.info("  заказов покупателей : %5d  на %s", len(orders), _money(ms_orders_sum))
-    logger.info("  отгрузок            : %5d  на %s", len(demands), _money(ms_demands_sum))
-    logger.info("  входящих платежей   : %5d  на %s", len(payments), _money(ms_payments_sum))
+    logger.info("  заказов покупателей : %5d  на %s", len(orders), _sums_by_currency(orders))
+    logger.info("  отгрузок            : %5d  на %s", len(demands), _sums_by_currency(demands))
+    logger.info("  входящих платежей   : %5d  на %s", len(payments), _sums_by_currency(payments))
     logger.info("  поступлений (закупки): %4d  на %s",
-                len(supplies), _money(sum(int(x["sum_minor"]) for x in supplies)))
+                len(supplies), _sums_by_currency(supplies))
     logger.info("  исходящих платежей  : %5d  на %s",
-                len(payments_out), _money(sum(int(x["sum_minor"]) for x in payments_out)))
+                len(payments_out), _sums_by_currency(payments_out))
     logger.info("")
     logger.info("Записано в локальные таблицы:")
     logger.info("  orders              : %5d  (из заказов МС %d · из отгрузок %d)",
@@ -1266,6 +1717,12 @@ def print_report(
                 stats.get("supplies", 0), stats.get("supply_items", 0))
     logger.info("  supplier_payments   : %5d  (не привязано %d)",
                 stats.get("payments_out", 0), stats.get("payments_out_unlinked", 0))
+    logger.info("  контрагенты → supplier: %d  (только закупки; и продажи, и закупки — "
+                "остались customer: %d)",
+                stats.get("counterparties_to_supplier", 0), stats.get("counterparties_both", 0))
+    if stats.get("invoice_numbers_suffixed"):
+        logger.info("  ⚠ номеров накладных с суффиксом (дубли имён в МС): %d",
+                    stats["invoice_numbers_suffixed"])
     if stats.get("multi_demand_orders"):
         logger.info("")
         logger.info("  ⚠ заказов с НЕСКОЛЬКИМИ отгрузками: %d", stats["multi_demand_orders"])
@@ -1430,7 +1887,7 @@ async def explain_order(name: str) -> int:
     logger.info("")
     logger.info("═══ ЗАКАЗ %s ═══", target["name"] or target["ms_id"])
     logger.info("  контрагент : %s", target["agent_name"] or "—")
-    logger.info("  дата       : %s", target["moment"][:10])
+    logger.info("  дата       : %s (Ташкент)", _ms_moment_to_local(target["moment"])[:10])
     logger.info("  статус в МС: %s", target["state_name"] or "—")
     logger.info("  сумма документа в МС : %12s", _money(target["sum_minor"]))
     logger.info("  оплачено (payedSum)  : %12s", _money(target["payed_minor"]))
@@ -1449,7 +1906,7 @@ async def explain_order(name: str) -> int:
         logger.info("")
         logger.info(
             "  ── отгрузка %s от %s · сумма документа %s",
-            d["name"] or d["ms_id"], d["moment"][:10], _money(d["sum_minor"]),
+            d["name"] or d["ms_id"], _ms_moment_to_local(d["moment"])[:10], _money(d["sum_minor"]),
         )
         lines, dem_total = _lines(d["positions"])
         for ln in lines:
@@ -1491,11 +1948,29 @@ async def main(mode: str) -> int:
         payments = await pull_payments()
         supplies = await pull_supplies()
         payments_out = await pull_payments_out()
+        currencies = await pull_currencies()
 
-        stats, unmatched, problems = await write_history(
-            orders, demands, payments, supplies, payments_out,
-            dry_run=(mode == "dry-run"),
-        )
+        kinds = {
+            "заказы": orders, "отгрузки": demands, "платежи": payments,
+            "поступления": supplies, "исх. платежи": payments_out,
+        }
+        all_docs = [d for docs in kinds.values() for d in docs]
+        try:
+            _, fx_problems = resolve_currencies(all_docs, currencies)
+        except MigrationStop as e:
+            logger.error("%s", e)
+            return 1
+        print_preflight(kinds, currencies, fx_problems)
+
+        try:
+            stats, unmatched, problems = await write_history(
+                orders, demands, payments, supplies, payments_out,
+                currencies=currencies, dry_run=(mode == "dry-run"),
+            )
+        except MigrationStop as e:
+            logger.error("")
+            logger.error("ПЕРЕНОС ОСТАНОВЛЕН: %s", e)
+            return 1
         print_report(
             orders, demands, payments, supplies, payments_out,
             stats, unmatched, problems,

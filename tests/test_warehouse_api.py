@@ -564,3 +564,30 @@ async def _get_invoice(invoice_id):
     from services import warehouse
 
     return await warehouse.get_invoice(invoice_id)
+
+
+def test_return_receipt_invoice_cannot_be_cancelled_directly(api):
+    """Приход по возврату отменяется ВОЗВРАТОМ, не накладной: иначе товар ушёл
+    бы со склада, а возврат остался подтверждённым с деньгами клиенту."""
+    client, db, ids = api
+    inv = _incoming(client, ids["mgr"], qty=5).json()
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q("INSERT INTO return_receipt (return_id, order_id, invoice_id, created_at) "
+                 "VALUES (?, ?, ?, ?)"),
+            (42, 7, inv["invoice_id"], db.now_str()),
+        )
+        conn.commit()
+
+    r = client.post(
+        "/api/wh/invoices/cancel",
+        json={"initData": str(ids["boss"]), "invoice_id": inv["invoice_id"]},
+    )
+
+    assert r.status_code == 409
+    body = r.json()
+    assert body["code"] == "linked_return" and body["return_id"] == 42
+    assert "Отмените возврат" in body["reason"]
+    stock = client.post("/api/wh/stock", json={"initData": str(ids["mgr"])}).json()
+    assert {p["name"]: p["quantity"] for p in stock["products"]}["Болт М8"] == 5.0

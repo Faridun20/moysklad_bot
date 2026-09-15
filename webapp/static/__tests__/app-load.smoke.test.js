@@ -2232,6 +2232,28 @@ describe('склад: остатки в «Каталоге» и накладны
     expect(content.querySelector('[data-wh-cancel="5"]')).toBeNull();
     expect(content.textContent).toContain('PDF отправлен');
   });
+
+  it('у накладной из переноса МойСклад кнопки отмены нет даже у босса', async () => {
+    // Склад по исторической накладной не двигался — сервер отмену отвергнет
+    // (warehouse.historical_invoice_refusal), и кнопка была бы ложным обещанием.
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => ({ invoices: [
+        { id: 7, type: 'outgoing', invoice_number: 'MS-D-00042', invoice_date: '2025-03-11',
+          status: 'confirmed', currency: 'UZS', total_amount_cents: 1265000000,
+          telegram_sent: 0, counterparty_name: 'ООО Ромашка', historical: true },
+        { id: 8, type: 'outgoing', invoice_number: 'OUT-2026-0002', invoice_date: '2026-09-11',
+          status: 'confirmed', currency: 'USD', total_amount_cents: 1000,
+          telegram_sent: 0, counterparty_name: 'ООО Ромашка', historical: false },
+      ]});
+      window.__ready = renderWhInvoiceList();
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).toContain('MS-D-00042');
+    expect(content.querySelector('[data-wh-cancel="7"]')).toBeNull();
+    expect(content.querySelector('[data-wh-cancel="8"]')).not.toBeNull();
+  });
 });
 
 describe('склад: отказ сервера доходит до менеджера', () => {

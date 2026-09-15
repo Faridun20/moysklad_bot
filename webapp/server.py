@@ -6843,8 +6843,28 @@ async def api_wh_invoice_send(request: Request):
 
 
 async def _invoice_owner_refusal(invoice_id: int) -> dict | None:
-    """Отказ для накладной, привязанной к заказу/контейнеру; None — отменять можно."""
-    from services import adb_core
+    """Отказ для накладной, привязанной к заказу/контейнеру/возврату; None — можно."""
+    from services import adb_core, warehouse
+
+    # История МойСклад — первой: иначе первая отгрузка исторического заказа
+    # получила бы совет «отмените заказ», а заказ отменить тоже нельзя.
+    historical = await warehouse.historical_invoice_refusal(invoice_id)
+    if historical:
+        return {"ok": False, "code": "historical", "reason": historical, "detail": historical}
+    # Приход по возврату: отмена накладной забрала бы товар со склада, а
+    # возврат остался бы подтверждённым — с returned_qty и деньгами клиенту.
+    ret = await adb_core.fetchrow(
+        "SELECT return_id, order_id FROM return_receipt WHERE invoice_id = $1", invoice_id
+    )
+    if ret is not None:
+        reason = (
+            f"Эта накладная — приход товара по возврату #{ret['return_id']} "
+            f"(заказ #{ret['order_id']}). Отдельно от возврата её не отменить: товар "
+            "ушёл бы со склада, а деньги и возвращённое количество остались бы учтены. "
+            "Отмените возврат, а не накладную."
+        )
+        return {"ok": False, "code": "linked_return", "return_id": int(ret["return_id"]),
+                "order_id": int(ret["order_id"]), "reason": reason, "detail": reason}
 
     order_id = await adb_core.fetchval(
         "SELECT order_id FROM order_shipment WHERE invoice_id = $1", invoice_id
