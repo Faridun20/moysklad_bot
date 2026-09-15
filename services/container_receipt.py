@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 from services import adb_core, warehouse
 from services.database import USE_POSTGRES, now_str
@@ -42,37 +43,94 @@ logger = logging.getLogger(__name__)
 
 
 def normalize_name(raw: str | None) -> str:
-    """Название к сравнимому виду: регистр и лишние пробелы не должны мешать."""
-    return " ".join(str(raw or "").split()).casefold()
+    """Название к сравнимому виду: регистр, лишние пробелы и «ё» не должны мешать.
+
+    «Ёлочный кронштейн» и «елочный  кронштейн» — один товар: на телефоне «ё»
+    набирают долгим нажатием и чаще не набирают вовсе, а двойной пробел
+    приезжает из МойСклад. Не заметить такой дубль значит завести вторую
+    карточку и развести остаток по двум.
+    """
+    return " ".join(str(raw or "").split()).casefold().replace("ё", "е")
 
 
-async def _products_by_name(names: list[str]) -> dict[str, list[dict]]:
+# Сколько LIKE-шаблонов в одном запросе. Позиций в контейнере бывает сотни, а
+# у asyncpg предел параметров; пачка по сотне — один проход по каталогу на пачку.
+_NAME_CHUNK = 100
+
+
+def _name_pattern(norm: str) -> str:
+    """LIKE-шаблон, который заведомо ловит карточку с тем же нормализованным
+    именем: слова по порядку, между ними что угодно.
+
+    Пробелы в каталоге бывают двойными, по краям — лишними, и точного `=` по
+    выражению SQL не построить одинаково на двух базах (в SQLite нет regexp).
+    Шаблон шире, чем нужно, — окончательное сравнение делается в Python по
+    `normalize_name`, поэтому «похожее» за одинаковое не сойдёт.
+    """
+    return "%" + "%".join(norm.split()) + "%"
+
+
+async def _products_by_name(names: list[str], conn: Any = None) -> dict[str, list[dict]]:
     """Карточки номенклатуры под нормализованными именами. {norm: [rows]}.
 
-    Одним запросом на весь состав, а не по позиции: контейнер на полсотни
+    Одним запросом на пачку позиций, а не по позиции: контейнер на полсотни
     строк иначе дал бы полсотни обращений к БД внутри одной приёмки.
 
-    В `IN` кладём и «как ввели» (в нижнем регистре), и нормализованный
-    вариант: в каталоге, приехавшем из МойСклад, встречаются двойные пробелы
-    внутри названия, и по одному только нормализованному ключу такая карточка
-    не нашлась бы.
+    Сравнение — по `normalize_name` (регистр, пробелы, ё=е) с обеих сторон:
+    SQL отбирает кандидатов шаблоном (`_name_pattern` против `name_search_sql`),
+    Python оставляет только точные совпадения. `conn` — транзакция, если
+    проверка должна видеть её же незакоммиченные вставки.
     """
-    variants: set[str] = set()
-    for n in names:
-        variants.add(str(n or "").strip().lower())
-        variants.add(normalize_name(n))
-    variants.discard("")
-    if not variants:
+    keys = sorted({normalize_name(n) for n in names} - {""})
+    if not keys:
         return {}
-    ordered = sorted(variants)
-    placeholders = ", ".join(f"${i + 1}" for i in range(len(ordered)))
-    rows = await adb_core.fetch(
-        f"SELECT id, name, unit FROM products WHERE lower(name) IN ({placeholders})",
-        *ordered,
-    )
+    db = conn if conn is not None else adb_core
     out: dict[str, list[dict]] = {}
-    for r in rows:
-        out.setdefault(normalize_name(r["name"]), []).append(dict(r))
+    seen: set[int] = set()
+    for start in range(0, len(keys), _NAME_CHUNK):
+        chunk = keys[start:start + _NAME_CHUNK]
+        where = " OR ".join(
+            f"{adb_core.name_search_sql('name')} LIKE ${i + 1}" for i in range(len(chunk))
+        )
+        rows = await db.fetch(
+            f"SELECT id, name, unit FROM products WHERE {where} ORDER BY id",
+            *[_name_pattern(k) for k in chunk],
+        )
+        wanted = set(chunk)
+        for r in rows:
+            norm = normalize_name(r["name"])
+            if norm in wanted and int(r["id"]) not in seen:
+                seen.add(int(r["id"]))
+                out.setdefault(norm, []).append(dict(r))
+    return out
+
+
+async def same_name_products(name: str) -> list[dict]:
+    """Карточки каталога с тем же названием (регистр, пробелы и ё не в счёт).
+
+    Позицию «новым товаром» с таким именем заводить нельзя молча: это не новый
+    товар, а опечатка поиска, и приход разъехался бы по двум карточкам.
+    """
+    return (await _products_by_name([name])).get(normalize_name(name), [])
+
+
+async def catalog_matches(items: list[dict]) -> dict[int, list[dict]]:
+    """Для непривязанных позиций — карточки с тем же названием. {item_id: [rows]}.
+
+    Карточка контейнера показывает их сразу: человек видит, куда уйдёт приход
+    позиции, заведённой свободным текстом, и подтверждает это, а не узнаёт
+    после оприходования.
+    """
+    unlinked = [it for it in items if not it.get("product_id")]
+    by_name = await _products_by_name([str(it.get("name") or "") for it in unlinked])
+    out: dict[int, list[dict]] = {}
+    for it in unlinked:
+        found = by_name.get(normalize_name(it.get("name")), [])
+        if found:
+            out[int(it["id"])] = [
+                {"product_id": int(p["id"]), "name": p["name"], "unit": p.get("unit")}
+                for p in found[:5]
+            ]
     return out
 
 
@@ -143,6 +201,7 @@ async def create_product(name: str, *, unit: str = "шт") -> dict:
         }
 
     clean_unit = (str(unit or "шт").strip() or "шт")[:16]
+    key = normalize_name(clean)
     async with adb_core.transaction() as txn:
         # Второй такой же товар мог появиться, пока мы проверяли: карточку
         # заводят кнопкой, а кнопку можно нажать дважды. Перепроверяем внутри
@@ -157,11 +216,10 @@ async def create_product(name: str, *, unit: str = "шт") -> dict:
         if USE_POSTGRES:
             await txn.execute(
                 "SELECT pg_advisory_xact_lock(hashtext($1))",
-                f"product:name:{clean.lower()}",
+                f"product:name:{key}",
             )
-        dup = await txn.fetchrow(
-            "SELECT id, name FROM products WHERE lower(name) = $1", clean.lower()
-        )
+        same = (await _products_by_name([clean], conn=txn)).get(key) or []
+        dup = same[0] if same else None
         if dup:
             return {
                 "ok": True,
@@ -169,17 +227,102 @@ async def create_product(name: str, *, unit: str = "шт") -> dict:
                 "name": dup["name"],
                 "existed": True,
             }
-        await txn.execute(
-            "INSERT INTO products (name, unit, created_at) VALUES ($1, $2, $3)",
-            clean,
-            clean_unit,
-            now_str(),
-        )
-        product_id = await txn.fetchval(
-            "SELECT id FROM products WHERE lower(name) = $1 ORDER BY id DESC", clean.lower()
-        )
+        insert = "INSERT INTO products (name, unit, created_at) VALUES ($1, $2, $3)"
+        if USE_POSTGRES:
+            product_id = await txn.fetchval(insert + " RETURNING id", clean, clean_unit, now_str())
+        else:
+            await txn.execute(insert, clean, clean_unit, now_str())
+            product_id = await txn.fetchval("SELECT last_insert_rowid()")
     logger.info("Заведена карточка товара #%s «%s»", product_id, clean)
     return {"ok": True, "product_id": int(product_id), "name": clean, "existed": False}
+
+
+def parse_resolutions(raw: Any) -> dict[int, dict] | None:
+    """Решения по непривязанным позициям из тела запроса.
+
+    `{"<item_id>": {"product_id": N}}` — позиция это товар N из каталога;
+    `{"<item_id>": {"new": true}}` — завести карточку по названию позиции.
+    None — формат не тот (ручка отвечает 400, а не угадывает).
+    """
+    if raw in (None, {}):
+        return {}
+    if not isinstance(raw, dict):
+        return None
+    out: dict[int, dict] = {}
+    for key, choice in raw.items():
+        try:
+            item_id = int(key)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(choice, dict):
+            return None
+        if choice.get("new") is True and not choice.get("product_id"):
+            out[item_id] = {"new": True}
+            continue
+        try:
+            product_id = int(choice.get("product_id") or 0)
+        except (TypeError, ValueError):
+            return None
+        if product_id <= 0:
+            return None
+        out[item_id] = {"product_id": product_id}
+    return out
+
+
+async def resolve_items(container_id: int, resolutions: dict[int, dict]) -> dict:
+    """Применить выбор человека перед оприходованием: привязать позиции к
+    карточкам каталога или завести новые карточки по их названиям.
+
+    Это ТА САМАЯ «кнопка», ради которой автосоздания из приёмки нет: форма
+    оприходования показывает каждую непривязанную позицию и то, куда она
+    уйдёт, и человек подтверждает. «Новый товар» с именем, которое в каталоге
+    уже есть, дубля не заводит — `create_product` привязывает существующую
+    карточку (`existed`).
+
+    Всё проверяется ДО первой записи: позиция из чужого контейнера или
+    несуществующий товар отказывают целиком, а не на середине списка.
+    """
+    from services import containers
+
+    if not resolutions:
+        return {"ok": True, "linked": 0, "created": [], "existed": []}
+    # Окно правки — первым: иначе «новый товар» успел бы завести карточку, а
+    # привязка к ней получила бы отказ.
+    guard = await containers._require_open_window(container_id)
+    if guard:
+        return guard
+    items ={int(i["id"]): i for i in await containers.list_items(container_id)}
+    if set(resolutions) - set(items):
+        return {"ok": False, "error": "Позиция не из этого контейнера"}
+    wanted = sorted({c["product_id"] for c in resolutions.values() if c.get("product_id")})
+    if wanted:
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(wanted)))
+        known = {
+            int(r["id"])
+            for r in await adb_core.fetch(
+                f"SELECT id FROM products WHERE id IN ({placeholders})", *wanted
+            )
+        }
+        missing = [pid for pid in wanted if pid not in known]
+        if missing:
+            return {"ok": False, "error": f"Товар #{missing[0]} не найден"}
+
+    created: list[str] = []
+    existed: list[str] = []
+    for item_id in sorted(resolutions):
+        choice = resolutions[item_id]
+        item = items[item_id]
+        product_id = choice.get("product_id")
+        if choice.get("new"):
+            made = await create_product(str(item["name"]), unit=str(item.get("unit") or "шт"))
+            if not made.get("ok"):
+                return made
+            product_id = int(made["product_id"])
+            (existed if made.get("existed") else created).append(str(made.get("name")))
+        res = await containers.link_item(container_id, item_id, product_id=int(product_id or 0))
+        if not res.get("ok"):
+            return res
+    return {"ok": True, "linked": len(resolutions), "created": created, "existed": existed}
 
 
 async def get_link(container_id: int) -> dict:

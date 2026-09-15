@@ -84,7 +84,9 @@ NEXT_STATUSES: dict[str, tuple[str, ...]] = {
 # пути и «снять бронь» из брони ведут в один и тот же `in_stock`, но говорят о
 # разном. Держим здесь, чтобы бот и WebApp не расходились в формулировках.
 TRANSITION_LABELS: dict[tuple[str, str], str] = {
-    ("in_transit", "in_stock"): "🏗 На склад",
+    # «Прибыла», а не «На склад»: так это событие называют на площадке, и
+    # кнопку с другим словом не находят («у техники нет кнопки „Прибыла“»).
+    ("in_transit", "in_stock"): "✅ Прибыла",
     ("in_stock", "reserved"): "🔒 Забронировать",
     ("reserved", "in_stock"): "🏗 Снять бронь",
     ("sold", "archived"): "📦 В архив",
@@ -444,6 +446,49 @@ async def set_status(
         f"#{machine_id}: {current['status']} → {new_status}",
     )
     return {"ok": True, "from": current["status"], "to": new_status}
+
+
+async def mark_arrived(
+    machine_id: int,
+    *,
+    user_id: int,
+    full_name: str = "",
+    location: str | None = None,
+) -> dict:
+    """Машина прибыла: «В пути» → «На складе» и, если сказали, где она стоит.
+
+    Отдельно от `set_status`, потому что это РАБОТА ПРИЁМКИ, а не решение
+    руководства: машину встречает менеджер (он же сейчас кладовщик), и ждать
+    руководителя ради отметки «приехала» значит держать технику «в пути»
+    неделями. Бронь, архив, продажа по-прежнему идут через руководство.
+
+    Статус и локация пишутся ОДНИМ UPDATE с CAS по `in_transit`: два телефона,
+    отметившие прибытие разом, не получат два успеха, а машина, которую успели
+    продать или забронировать, не откатится в «На складе». Пустая локация
+    прежнюю не стирает — поле в форме необязательное.
+    """
+    loc = (location or "").strip()[:200] or None
+    stamp = now_str()
+    rows = await adb_core.execute(
+        "UPDATE machines SET status = 'in_stock', location = COALESCE($1, location), "
+        "updated_at = $2 WHERE id = $3 AND status = 'in_transit'",
+        loc, stamp, machine_id,
+    )
+    if not rows:
+        current = await adb_core.fetchrow("SELECT status FROM machines WHERE id = $1", machine_id)
+        if not current:
+            return {"ok": False, "error": "Машина не найдена"}
+        return {
+            "ok": False,
+            "error": "Машина уже не в пути — сейчас «"
+            f"{STATUS_LABELS.get(current['status'], current['status'])}»",
+            "current": current["status"],
+        }
+    details = f"#{machine_id}: in_transit → in_stock"
+    if loc:
+        details += f" · {loc}"
+    await _audit(user_id, full_name, "machine_arrived", details)
+    return {"ok": True, "from": "in_transit", "to": "in_stock", "location": loc}
 
 
 async def delete_machine(machine_id: int, *, user_id: int, full_name: str = "") -> dict:

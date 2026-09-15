@@ -385,6 +385,31 @@ def _service_flows(db, tag: str) -> None:
     second = _run(container_receipt.receive(box_id, user_id=BOSS))
     assert second.get("ok"), second
 
+    # Позиции свободным текстом, решённые перед оприходованием: одна — новый
+    # товар (карточка заводится), другая — тёзка существующей карточки с «ё» и
+    # двойным пробелом (дубль не заводится), обе уходят в приход.
+    free = _run(containers.create_container(number=f"FREE{tag}0001", created_by=BOSS))
+    free_id = free["container_id"]
+    new_item = _run(containers.add_item(free_id, name=f"Ёрш  трубный {tag}", expected_qty=2))["item_id"]
+    old_item = _run(containers.add_item(free_id, name=f"кабель {tag}", expected_qty=1))["item_id"]
+    assert _run(containers.mark_arrived(free_id, user_id=BOSS))["ok"]
+    assert _run(containers.set_arrived_quantities(
+        free_id, {new_item: 2, old_item: 1}, user_id=BOSS))["ok"]
+    resolved = _run(container_receipt.resolve_items(
+        free_id, {new_item: {"new": True}, old_item: {"new": True}}))
+    assert resolved["ok"] and len(resolved["created"]) == 1 and len(resolved["existed"]) == 1, resolved
+    got = _run(container_receipt.receive(free_id, user_id=BOSS))
+    assert got.get("ok") and got["matched"] == 2 and got["unmatched"] == [], got
+    assert _one(db, "SELECT COUNT(*) AS n FROM products WHERE replace(lower(name), 'ё', 'е') LIKE %s",
+                (f"%ерш%трубный {tag.lower()}%",))["n"] == 1
+
+    # Техника: прибытие менеджером (статус под CHECK, локация тем же UPDATE).
+    from services import machines
+
+    made = _run(machines.create_machine(vin=f"PGVIN{tag}", name="CAT 320D", created_by=BOSS))
+    arrived = _run(machines.mark_arrived(made["machine_id"], user_id=MGR, location="Сергели"))
+    assert arrived["ok"], arrived
+
 
 def test_constraints_hold_for_real_service_flows(pg_db):
     from scripts import apply_constraints
@@ -411,3 +436,38 @@ def test_constraints_hold_for_real_service_flows(pg_db):
 
     after = apply_constraints.run(dry_run=True)
     assert after.violations == {} and after.planned == [], (after.violations, after.planned)
+
+
+def test_catalog_picker_search_and_name_matching_on_postgres(pg_db):
+    """Шторка выбора товара и сверка имён на настоящем Postgres: ICU-сортировка
+    с LIMIT-параметром, подзапрос остатка, артикул с NULL, ё = е в шаблоне
+    сравнения имён (`_products_by_name`)."""
+    from services import container_receipt, containers, warehouse
+
+    bracket = _run(container_receipt.create_product("Ёлочный кронштейн", unit="компл"))["product_id"]
+    # Двойной пробел — как в каталоге, приехавшем из МойСклад (create_product его схлопывает).
+    _exec(pg_db, "UPDATE products SET name = %s WHERE id = %s", ("Ёлочный  кронштейн", bracket))
+    _run(container_receipt.create_product("Абразив"))
+    filt = _run(container_receipt.create_product("Фильтр масляный"))["product_id"]
+    _exec(pg_db, "UPDATE products SET sku = %s WHERE id = %s", ("320/04133", filt))
+    wid = _run(warehouse.default_warehouse_id())
+    assert _run(warehouse.create_invoice(
+        invoice_type="incoming", warehouse_id=wid,
+        items=[{"product_id": bracket, "quantity": 2.5, "price_cents": None}],
+    ))["ok"]
+
+    browse = _run(warehouse.search_products("", 2, browse=True))
+    assert [r["name"] for r in browse] == ["Абразив", "Ёлочный  кронштейн"]
+    assert browse[1]["quantity"] == 2.5 and isinstance(browse[1]["quantity"], float)
+    json.dumps(browse)
+    assert [r["product_id"] for r in _run(warehouse.search_products("04133", browse=True))] == [filt]
+    assert [r["product_id"] for r in _run(warehouse.search_products("елоч"))] == [bracket]
+
+    assert [p["id"] for p in _run(container_receipt.same_name_products("ЕЛОЧНЫЙ кронштейн"))] == [bracket]
+    again = _run(container_receipt.create_product("елочный кронштейн"))
+    assert again["existed"] and again["product_id"] == bracket
+
+    cid = _run(containers.create_container(number="PICK0000001", created_by=BOSS))["container_id"]
+    item = _run(containers.add_item(cid, name="ёлочный кронштейн", expected_qty=1))["item_id"]
+    matches = _run(container_receipt.catalog_matches(_run(containers.list_items(cid))))
+    assert [m["product_id"] for m in matches[item]] == [bracket]

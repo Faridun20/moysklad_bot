@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
+from typing import Any
 
 from services import adb_core, money
 from services import database as _db
@@ -681,18 +682,40 @@ async def _reserved_by_product() -> dict[int, float]:
     return {int(r["product_id"]): float(r["qty"] or 0) for r in rows}
 
 
-async def search_products(query: str, limit: int = 20) -> list[dict]:
-    """Поиск по номенклатуре. Кириллица — через `lower()` с обеих сторон, ё = е."""
+async def search_products(query: str, limit: int = 20, *, browse: bool = False) -> list[dict]:
+    """Поиск по номенклатуре: название или артикул, кириллица через `lower()` с
+    обеих сторон, ё = е. В строке — остаток (сумма по складам).
+
+    `browse` — выбор товара из списка (шторка позиции контейнера): пустой запрос
+    отдаёт первые `limit` товаров по алфавиту, а не пустоту, — список виден до
+    первой буквы. Без него пустой запрос — пустой ответ (подсказка под полем).
+    Остаток нужен выбирающему, чтобы сверить «тот ли это товар».
+    """
     text = (query or "").strip()
-    if not text:
+    if not text and not browse:
         return []
-    return await adb_core.fetch(
-        "SELECT id AS product_id, name, unit, category, sku FROM products "
-        f"WHERE {adb_core.name_search_sql('name')} LIKE $1 "
-        f"ORDER BY {adb_core.order_by_name('name')}, id LIMIT $2",
-        adb_core.name_search_param(text),
-        max(1, min(int(limit or 20), 100)),
+    args: list[Any] = []
+    where = ""
+    if text:
+        args.append(adb_core.name_search_param(text))
+        where = (
+            f"WHERE {adb_core.name_search_sql('p.name')} LIKE $1 "
+            f"OR {adb_core.name_search_sql('p.sku')} LIKE $1 "
+        )
+    args.append(max(1, min(int(limit or 20), 100)))
+    rows = await adb_core.fetch(
+        "SELECT p.id AS product_id, p.name, p.unit, p.category, p.sku, "
+        "       COALESCE(s.qty, 0) AS quantity "
+        "FROM products p "
+        "LEFT JOIN (SELECT product_id, SUM(quantity) AS qty FROM stock GROUP BY product_id) s "
+        "       ON s.product_id = p.id "
+        f"{where}"
+        f"ORDER BY {adb_core.order_by_name('p.name')}, p.id LIMIT ${len(args)}",
+        *args,
     )
+    for row in rows:
+        row["quantity"] = float(row.get("quantity") or 0)
+    return rows
 
 
 async def get_product(product_id: int | str | None) -> dict | None:

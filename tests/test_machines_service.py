@@ -392,7 +392,7 @@ def test_transition_options_carry_labels():
     from services import machines
 
     assert machines.next_statuses("in_transit") == ("in_stock",)
-    assert machines.next_status_options("in_transit")[0]["label"] == "🏗 На склад"
+    assert machines.next_status_options("in_transit")[0]["label"] == "✅ Прибыла"
     assert machines.next_status_options("reserved")[0]["label"] == "🏗 Снять бронь"
     assert machines.next_status_options("archived") == []
     assert machines.next_status_options(None) == []
