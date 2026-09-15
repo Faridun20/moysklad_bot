@@ -52,6 +52,9 @@ def env(isolated_db, monkeypatch):
     db.set_role(BOOK, "book", "Book", "bookkeeper")
     db.set_currency_rate("UZS", 1 / CBU_UZS, BOSS)
     db.set_currency_rate_daily("UZS", acc.today_str(), 1 / CBU_UZS, "cbu")
+    # Тесты — про бухгалтерский поток, не про notify_policy: суммы здесь
+    # малы (100 и т.п.) и ушли бы в вечерний дайджест, а не пушем.
+    db.set_setting("boss_instant_threshold_usd", 0)
 
     sent: list[tuple] = []
 

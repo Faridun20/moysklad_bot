@@ -206,6 +206,12 @@ services:
     command: ["python", "-m", "tasks.run_fx_sync"]
     restart: "no"
 
+  cron-boss-digest:
+    <<: *app
+    profiles: ["cron"]
+    command: ["python", "-m", "tasks.run_boss_digest"]
+    restart: "no"
+
 volumes:
   redisdata:
   appdata:
@@ -226,6 +232,12 @@ networks:
 #   0 11 * * *    /srv/docker/moysklad_bot/scripts/cron.sh cron-debts-notify
 #   30 11 * * *   /srv/docker/moysklad_bot/scripts/cron.sh cron-ops-monitor
 #   15 11 * * 1   /srv/docker/moysklad_bot/scripts/cron.sh cron-money-report
+#   */15 * * * *  /srv/docker/moysklad_bot/scripts/cron.sh cron-boss-digest
+#
+# cron-boss-digest гоняется каждые 15 минут НАРОЧНО (не раз в день): время
+# дайджеста — настройка app_settings.boss_digest_time (дефолт 19:00
+# Asia/Tashkent), а не расписание cron'а; сам таск решает, пора ли слать
+# (services/boss_digest.py::is_due), и шлёт не больше раза в день.
 #
 # Время в crontab — в зоне ХОСТА, а не в TZ из .env. Если они разные,
 # пересчитайте часы.

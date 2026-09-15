@@ -19,6 +19,7 @@ from aiogram.types import CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services import async_db as adb
+from services.notify_policy import RETURN, should_notify_now
 from services.roles import can_confirm_return, can_mark_return_goods_received, notify_recipients
 from utils.formatters import DIV
 from handlers._ui import (
@@ -88,10 +89,27 @@ async def _settle_stale_return(call: CallbackQuery, return_id: int) -> bool:
 
 
 async def _notify_confirmers(bot: Bot, return_id, order_id, total, refund):
+    """Карточка возврата — ДВА получателя с разной логикой отправки.
+
+    «Товар получен» — физическая приёмка (кладовщик, а без него менеджер-
+    заместитель, services.roles.ROLE_ALSO_ACTS_AS): не зависит от суммы,
+    товар везут и принимают вне зависимости от того, идёт ли боссу пуш.
+    Склад получает карточку ВСЕГДА.
+
+    «Подтвердить возврат» — денежное решение (admin/boss), режется порогом
+    `boss_instant_threshold_usd` (services.notify_policy): ниже порога боссу
+    карточка не идёт, возврат остаётся pending и попадает в вечерний
+    дайджест (services.boss_digest) — решение по-прежнему видно в WebApp.
+    """
     users = await adb.get_all_users()
-    # Пока кладовщика нет, приёмку возврата делает менеджер (совмещение ролей,
-    # services.roles.ROLE_ALSO_ACTS_AS) — без карточки он о возврате не узнает.
-    recipients = notify_recipients(users, ("admin", "boss", "warehouse_keeper"))
+    warehouse_recipients = notify_recipients(users, ("warehouse_keeper",))
+    recipients = list(warehouse_recipients)
+    # Сумма отображается в USD (см. _fmt ниже) — той же валюты держится порог.
+    if should_notify_now(RETURN, total, "USD"):
+        boss_recipients = notify_recipients(users, ("admin", "boss"))
+        recipients += [uid for uid in boss_recipients if uid not in recipients]
+    if not recipients:
+        return
     text = (
         f"{DIV}\n↩️ <b>Возврат #{return_id}</b> · заказ #{order_id}\n"
         f"💰 {_fmt(total)} USD · {_REFUND_LABELS.get(refund, refund)}"

@@ -59,6 +59,9 @@ def _client(db, monkeypatch, uid, role):
 
     importlib.reload(roles)
     db.set_role(uid, "u", "U", role)
+    # Тест проверяет идемпотентность отправки, а не порог notify_policy —
+    # нулевой порог держит поведение «пуш уходит всегда», как до дайджеста.
+    db.set_setting("boss_instant_threshold_usd", 0)
     monkeypatch.setattr(server, "verify_init_data", lambda s: {"id": int(s), "first_name": "U"})
 
     import services.notifier as notifier

@@ -216,6 +216,9 @@ def test_bot_return_card_goes_to_manager_and_he_marks_goods(isolated_db):
     roles.invalidate_all_roles()
     db.set_role(1, "b", "Boss", "boss")
     db.set_role(2, "m", "Manager", "manager")
+    # Тест — про совмещение ролей (кто получает карточку), не про
+    # notify_policy: возврат на $200 ниже дефолтного порога (5000 USD).
+    db.set_setting("boss_instant_threshold_usd", 0)
     ret_id = _shipped_order_with_return(db)
 
     bot = _Bot()
