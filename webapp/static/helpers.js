@@ -186,6 +186,81 @@
     return `<div class="seg-row${hint}"><div class="seg${scroll}">${items}</div></div>`;
   }
 
+  // ─── Нижняя панель + «Меню» (шторка разделов) ─────────────────────────────
+  //
+  // В панели — не больше NAV_BAR_MAX разделов и кнопка «Меню», если шторке
+  // есть что показать сверх панели: раздел, не влезший в панель, или вкладки
+  // (ряд из четырёх вкладок на телефоне уже не помещается, и найти четвёртую
+  // можно было только пролистав ряд). Пятый слот панели — «Меню»: Apple и
+  // Material сходятся на пяти пунктах как пределе нижней панели.
+  //
+  // Кнопка «Меню» стоит внизу, а не бургером в шапке: верхний левый угол —
+  // самое дальнее место от большого пальца, и в Telegram прямо над шапкой
+  // WebApp лежит «Закрыть» клиента — промах бургером закрывал бы приложение.
+  const NAV_BAR_MAX = 4;
+
+  // sections — navSections(role); tabsCount(key) — число вкладок раздела под
+  // роль. Возвращает { bar: [раздел…], menu: bool }. Роли, у которых шторка
+  // повторила бы панель один в один (кладовщик, бухгалтер: три раздела без
+  // вкладок), получают панель как раньше — без кнопки-дубля.
+  function navBarLayout(sections, tabsCount) {
+    sections = sections || [];
+    const count = (k) => (tabsCount ? Number(tabsCount(k)) || 0 : 0);
+    const nested = sections.some((s) => count(s.key) >= 2);
+    const menu = nested || sections.length > NAV_BAR_MAX + 1;
+    return { bar: menu ? sections.slice(0, NAV_BAR_MAX) : sections.slice(), menu };
+  }
+
+  // Содержимое шторки: разделы роли и их вкладки деревом «раздел → пункты».
+  // groups: [{ key, label, icon, tabs: [{ key, label, badge? }] }];
+  // current: { screen, tab } — где человек сейчас.
+  //
+  // Подсвечен ровно один пункт (aria-current="page"): вкладка, если у раздела
+  // есть подпункты, иначе сам раздел. Раздел, внутри которого человек, отмечен
+  // иконкой акцентного цвета — видно, «где я», даже когда список прокручен.
+  // Текущий пункт несёт галочку: состояние видно формой, а не только цветом
+  // (на солнце цвет теряется первым).
+  function navDrawerHtml(groups, current, opts) {
+    groups = groups || [];
+    current = current || {};
+    opts = opts || {};
+    const check = icon('check', 'nav-link-check');
+    const link = ({ cls, on, screen, tab, inner }) =>
+      `<button type="button" class="nav-link ${cls}${on ? ' is-current' : ''}"` +
+      `${on ? ' aria-current="page"' : ''} data-screen="${escapeHtml(screen)}"` +
+      `${tab ? ` data-tab="${escapeHtml(tab)}"` : ''}>${inner}${on ? check : ''}</button>`;
+    const group = (g) => {
+      const tabs = (g.tabs || []).length >= 2 ? g.tabs : [];
+      const here = g.key === current.screen;
+      const head = link({
+        cls: 'nav-link--section' + (here && tabs.length ? ' is-within' : ''),
+        on: here && !tabs.length,
+        screen: g.key,
+        inner: `${icon(g.icon)}<span class="nav-link-label">${escapeHtml(g.label)}</span>`,
+      });
+      const sub = tabs.map((t) => {
+        const badge = t.badge
+          ? `<span class="stock-badge badge-yellow">${escapeHtml(String(t.badge))}</span>` : '';
+        return '<li>' + link({
+          cls: 'nav-link--tab',
+          on: here && t.key === current.tab,
+          screen: g.key,
+          tab: t.key,
+          inner: `<span class="nav-link-label">${escapeHtml(t.label)}</span>${badge}`,
+        }) + '</li>';
+      }).join('');
+      return `<li class="nav-group">${head}${sub ? `<ul class="nav-sub">${sub}</ul>` : ''}</li>`;
+    };
+    const subtitle = opts.subtitle
+      ? `<div class="nav-drawer-sub">${escapeHtml(opts.subtitle)}</div>` : '';
+    return '<div class="nav-drawer-head">' +
+      `<div><div class="nav-drawer-title" id="nav-drawer-title">Меню</div>${subtitle}</div>` +
+      `<button type="button" class="nav-drawer-close" data-drawer-close aria-label="Закрыть меню">${icon('close')}</button>` +
+      '</div>' +
+      '<nav class="nav-drawer-body" aria-label="Разделы и вкладки">' +
+      `<ul class="nav-tree">${groups.map(group).join('')}</ul></nav>`;
+  }
+
   // Рендер блока «Итоги» раздела «Деньги» (данные /api/money/summary):
   // подтверждённые платежи по валютам + сдачи наличных. Чистая функция.
   function renderMoneyTotalsHtml(summary) {
@@ -676,6 +751,7 @@
     escapeHtml, idemKey, formatDateRU, icon, opsAmount, plural,
     parsePaymentItems, renderMoneyTotalsHtml, categoryTree, categoryMatches,
     NAV_SECTIONS, navSections, defaultSection, sectionNavHtml,
+    NAV_BAR_MAX, navBarLayout, navDrawerHtml,
     salesTabs, stockTabs, moneyTabs, clientsTabs,
     periodSegHtml, rangeLabel, formatMoney,
     emptyState, skeleton, errorBoxHtml,

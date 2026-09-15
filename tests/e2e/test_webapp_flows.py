@@ -10,11 +10,7 @@ from __future__ import annotations
 
 import time
 
-from tests.e2e.conftest import go, tab
-
-
-def _nav_screens(page) -> list[str]:
-    return page.eval_on_selector_all("#bottom-nav .nav-item", "els => els.map(e => e.dataset.screen)")
+from tests.e2e.conftest import go, nav_screens, tab
 
 
 # ─── Навигация по ролям ──────────────────────────────────────────────────────
@@ -23,10 +19,12 @@ def _nav_screens(page) -> list[str]:
 def test_nav_sections_follow_role(open_app, e2e):
     """Пять разделов у босса; у кладовщика нет «Склада» — ручки ему не отвечают."""
     boss = open_app(e2e.ids["boss"])
-    assert _nav_screens(boss) == ["today", "sales", "stock", "money", "clients"]
+    assert nav_screens(boss) == ["today", "sales", "stock", "money", "clients"]
+    # В панели четыре — пятый слот у «Меню» (шторка разделов и вкладок).
+    assert boss.locator("#bottom-nav .nav-item[data-screen]").count() == 4
 
     keeper = open_app(e2e.ids["keeper"])
-    screens = _nav_screens(keeper)
+    screens = nav_screens(keeper)
     assert "stock" not in screens
     assert {"today", "sales", "money"} <= set(screens)
 

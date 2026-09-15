@@ -165,10 +165,51 @@ def alerts(page: Page) -> list[str]:
 
 
 def go(page: Page, screen: str) -> None:
-    """Нажать раздел в нижней панели и дождаться его отрисовки."""
-    page.click(f'#bottom-nav .nav-item[data-screen="{screen}"]')
+    """Открыть раздел и дождаться его отрисовки.
+
+    Раздел в нижней панели — её кнопкой; раздел, не влезший в панель (пятый у
+    руководства и менеджера), — через «Меню» → шторку, как это делает человек.
+    Текущий раздел читаем из `#bottom-nav[data-current]`: у раздела из шторки
+    подсвечена «Меню», а не кнопка раздела.
+    """
+    item = page.locator(f'#bottom-nav .nav-item[data-screen="{screen}"]')
+    if item.count():
+        item.click()
+    else:
+        page.click('#bottom-nav .nav-item[data-action="menu"]')
+        page.click(f'#nav-drawer.is-open .nav-link--section[data-screen="{screen}"]')
     page.wait_for_function(
-        "(s) => document.querySelector('#bottom-nav .nav-item.active')?.dataset.screen === s", arg=screen
+        "(s) => document.getElementById('bottom-nav')?.dataset.current === s", arg=screen
+    )
+
+
+def current_screen(page: Page) -> str:
+    """Текущий раздел: `#bottom-nav[data-current]`.
+
+    По активной кнопке панели его уже не узнать: раздел из шторки «Меню»
+    подсвечивает саму «Меню», а кнопки раздела в панели нет.
+    """
+    return page.evaluate("() => document.getElementById('bottom-nav')?.dataset.current || ''")
+
+
+def nav_screens(page: Page) -> list[str]:
+    """Все разделы роли по порядку: кнопки панели и, если есть «Меню», разделы шторки.
+
+    Шторку открываем и закрываем кликом в странице — содержимое её рисуется
+    при открытии, до этого разделов вне панели в DOM нет.
+    """
+    return page.evaluate(
+        """() => {
+          const bar = [...document.querySelectorAll('#bottom-nav .nav-item[data-screen]')]
+            .map(e => e.dataset.screen);
+          const menu = document.querySelector('#bottom-nav [data-action="menu"]');
+          if (!menu) return bar;
+          menu.click();
+          const all = [...document.querySelectorAll('#nav-drawer .nav-link--section')]
+            .map(e => e.dataset.screen);
+          document.querySelector('#nav-drawer .nav-drawer-close').click();
+          return all;
+        }"""
     )
 
 

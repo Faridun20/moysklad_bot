@@ -55,6 +55,7 @@
       <symbol id="ic-snow" viewBox="0 0 24 24"><path d="M12 2v20"/><path d="M2 12h20"/><path d="m5 5 14 14"/><path d="m19 5-14 14"/></symbol>
       <symbol id="ic-trend-up" viewBox="0 0 24 24"><path d="M3 17 10 10l4 4 7-7"/><path d="M17 7h4v4"/></symbol>
       <symbol id="ic-trend-down" viewBox="0 0 24 24"><path d="M3 7 10 14l4-4 7 7"/><path d="M17 17h4v-4"/></symbol>
+      <symbol id="ic-menu" viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h10"/></symbol>
       <symbol id="ic-calendar" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="16" rx="2"/><path d="M3 9h18"/><path d="M8 3v3M16 3v3"/></symbol>
     </g>
   </defs>
@@ -84,6 +85,9 @@
     отчёт лежит вкладкой внутри того раздела, который он описывает.
     Кнопки рисует JS (buildNav в app.js) — их набор зависит от роли, а таб,
     который гарантированно ответит 403, показывать нельзя.
+    В панели не больше четырёх разделов; пятый слот — «Меню»: шторка справа
+    со всеми разделами роли и их вкладками (openNavDrawer). Узел шторки
+    создаёт JS рядом с .app — пока она открыта, .app получает inert.
   -->
   <nav class="bottom-nav" id="bottom-nav" aria-label="Разделы"></nav>
 

@@ -255,23 +255,253 @@ const SCREEN_TITLES = {
 // Нижняя панель строится из таблицы разделов: набор кнопок зависит от роли.
 // Раньше панель была статикой в разметке, и кладовщик видел «Главную», которая
 // отвечала 403 — дверь, которая не открывается.
+//
+// В панели — до четырёх разделов и «Меню» (navBarLayout в helpers.js): шторка
+// со всеми разделами роли и их вкладками. Вкладки внутри раздела остаются
+// рядом .seg — соседняя вкладка по-прежнему в одно касание, а шторка даёт
+// любую вкладку любого раздела в два касания, не листая ряд.
 function buildNav() {
   const nav = document.getElementById('bottom-nav');
   if (!nav) return;
-  const role = (currentUser && currentUser.role) || 'guest';
-  nav.innerHTML = navSections(role).map(s => `
+  const layout = navBarLayout(navSections(role()), (k) => navTabsFor(k).length);
+  const item = (s) => `
     <button class="nav-item" data-screen="${s.key}">
       <span class="nav-icon">${icon(s.icon)}</span>
       <span class="nav-label">${escapeHtml(s.label)}</span>
-    </button>`).join('');
-  nav.querySelectorAll('.nav-item').forEach(btn => {
+    </button>`;
+  // «Меню» — не data-screen: это не раздел, и списки разделов панели
+  // (e2e/_nav_screens, smoke) его не должны видеть.
+  const menu = layout.menu ? `
+    <button class="nav-item nav-item--menu" id="nav-menu-btn" data-action="menu"
+            aria-haspopup="dialog" aria-controls="nav-drawer" aria-expanded="false">
+      <span class="nav-icon">${icon('menu')}</span>
+      <span class="nav-label">Меню</span>
+    </button>` : '';
+  nav.innerHTML = layout.bar.map(item).join('') + menu;
+  nav.querySelectorAll('.nav-item[data-screen]').forEach(btn => {
     btn.addEventListener('click', () => showScreen(btn.dataset.screen));
   });
+  const menuBtn = nav.querySelector('[data-action="menu"]');
+  if (menuBtn) menuBtn.addEventListener('click', () => openNavDrawer());
+  syncNavActive(currentScreen);
+}
+
+// Вкладки раздела под роль; у «Сегодня» вкладок нет (sectionTabsFor для
+// неизвестного раздела отдаёт вкладки «Клиентов» — туда ходить нельзя).
+function navTabsFor(section) {
+  return ['sales', 'stock', 'money', 'clients'].includes(section) ? sectionTabsFor(section) : [];
+}
+
+// Подсветка панели. Раздел, которого в панели нет (ушёл в «Меню»), подсвечивает
+// саму «Меню» — иначе человек в «Клиентах» видит панель без активного пункта
+// и не понимает, где он. `data-current` на панели — адрес текущего раздела
+// для тестов: по активной кнопке его уже не узнать.
+function syncNavActive(screen) {
+  const nav = document.getElementById('bottom-nav');
+  if (!nav) return;
+  nav.dataset.current = screen || '';
+  let onBar = false;
+  nav.querySelectorAll('.nav-item[data-screen]').forEach(btn => {
+    const isActive = btn.dataset.screen === screen;
+    onBar = onBar || isActive;
+    btn.classList.toggle('active', isActive);
+    // aria-current — активный таб для скринридера (визуально это только цвет).
+    if (isActive) btn.setAttribute('aria-current', 'page');
+    else btn.removeAttribute('aria-current');
+  });
+  const menuBtn = nav.querySelector('[data-action="menu"]');
+  if (menuBtn) menuBtn.classList.toggle('active', !onBar && !!screen);
+}
+
+// ─── Шторка «Меню» ──────────────────────────────────
+//
+// Шторка справа — со стороны кнопки и большого пальца. Закрывается тапом по
+// фону, крестиком, свайпом вправо, Esc и системной «Назад» Telegram
+// (BackButton). Пока открыта: .app — inert (фокус и скринридер не уходят под
+// шторку), Tab ходит по кругу внутри, прокрутка страницы заперта, вертикальные
+// свайпы Telegram (сворачивание WebApp) выключены — иначе прокрутка длинного
+// списка вверх сворачивала бы приложение.
+//
+// Содержимое рисуется при каждом открытии: текущая вкладка меняется рядом
+// .seg без showScreen, и держать шторку в синхроне на каждом клике — лишняя
+// работа ради невидимого узла.
+let _navDrawer = null;   // состояние открытой шторки; null — закрыта
+
+function sectionTabOf(section) {
+  return { sales: salesTab, stock: stockTab, money: moneyTab, clients: clientsTab }[section] || '';
+}
+
+function ensureNavDrawer() {
+  let root = document.getElementById('nav-drawer');
+  if (root) return root;
+  root = document.createElement('div');
+  root.id = 'nav-drawer';
+  root.className = 'nav-drawer';
+  root.setAttribute('inert', '');
+  root.innerHTML = '<div class="nav-drawer-scrim" data-drawer-close></div>'
+    + '<div class="nav-drawer-panel" role="dialog" aria-modal="true" aria-labelledby="nav-drawer-title"></div>';
+  document.body.appendChild(root);
+
+  root.addEventListener('click', (e) => {
+    if (Date.now() < _drawerClickMuteUntil) { e.preventDefault(); return; }
+    if (e.target.closest('[data-drawer-close]')) { closeNavDrawer(); return; }
+    const link = e.target.closest('.nav-link[data-screen]');
+    if (link) navigateFromDrawer(link.dataset.screen, link.dataset.tab || '');
+  });
+  wireDrawerSwipe(root);
+  return root;
+}
+
+function openNavDrawer() {
+  if (_navDrawer) return;
+  const root = ensureNavDrawer();
+  const panel = root.querySelector('.nav-drawer-panel');
+  const groups = navSections(role()).map(s => ({
+    key: s.key, label: s.label, icon: s.icon, tabs: navTabsFor(s.key),
+  }));
+  panel.innerHTML = navDrawerHtml(groups,
+    { screen: currentScreen, tab: sectionTabOf(currentScreen) },
+    { subtitle: ROLE_NAMES[role()] || '' });
+  haptic('light');
+
+  _navDrawer = {
+    trigger: document.activeElement,
+    prevBack: _backHandler,
+    swipes: tg.isVerticalSwipesEnabled,
+  };
+  root.removeAttribute('inert');
+  const app = document.querySelector('.app');
+  if (app) app.setAttribute('inert', '');
+  document.body.classList.add('nav-drawer-open');
+  const menuBtn = document.getElementById('nav-menu-btn');
+  if (menuBtn) menuBtn.setAttribute('aria-expanded', 'true');
+  try { if (tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch (_e) {}
+
+  // Стартовое положение уже посчитано (узел создан закрытым), класс в
+  // следующем кадре — переход идёт от края, а не появляется сразу.
+  void panel.offsetWidth;
+  root.classList.add('is-open');
+
+  document.addEventListener('keydown', onNavDrawerKey, true);
+  showBack(() => closeNavDrawer());
+
+  // Фокус — на текущий пункт (скринридер сразу слышит «где я»), иначе на
+  // крестик. preventScroll: прокрутка во время выезда даёт рывок.
+  const current = panel.querySelector('.nav-link[aria-current]');
+  const target = current || panel.querySelector('.nav-drawer-close');
+  if (current) {
+    const body = panel.querySelector('.nav-drawer-body');
+    // offsetTop считается от панели (она positioned), а не от списка.
+    const top = body ? current.offsetTop - body.offsetTop : 0;
+    if (body && top + current.offsetHeight > body.clientHeight) {
+      body.scrollTop = top - body.clientHeight / 2;
+    }
+  }
+  try { target.focus({ preventScroll: true }); } catch (_e) { /* старый WebView */ }
+}
+
+// restoreBack: вернуть «Назад» того экрана, поверх которого открыли шторку.
+// При переходе в другой раздел не нужно — showScreen сам её снимает.
+function closeNavDrawer({ restoreBack = true } = {}) {
+  if (!_navDrawer) return;
+  const st = _navDrawer;
+  _navDrawer = null;
+  const root = document.getElementById('nav-drawer');
+  if (root) {
+    root.classList.remove('is-open', 'is-dragging');
+    root.style.removeProperty('--drawer-dx');
+    root.style.removeProperty('--drawer-p');
+    root.setAttribute('inert', '');
+  }
+  const app = document.querySelector('.app');
+  if (app) app.removeAttribute('inert');
+  document.body.classList.remove('nav-drawer-open');
+  document.removeEventListener('keydown', onNavDrawerKey, true);
+  const menuBtn = document.getElementById('nav-menu-btn');
+  if (menuBtn) menuBtn.setAttribute('aria-expanded', 'false');
+  try { if (st.swipes !== false && tg.enableVerticalSwipes) tg.enableVerticalSwipes(); } catch (_e) {}
+  if (restoreBack) {
+    if (st.prevBack) showBack(st.prevBack); else hideBack();
+  }
+  const back = st.trigger && st.trigger.isConnected ? st.trigger : menuBtn;
+  if (back && back.focus) { try { back.focus({ preventScroll: true }); } catch (_e) {} }
+}
+
+function onNavDrawerKey(e) {
+  const panel = document.querySelector('#nav-drawer .nav-drawer-panel');
+  if (!panel) return;
+  if (e.key === 'Escape') { e.preventDefault(); closeNavDrawer(); return; }
+  if (e.key !== 'Tab') return;
+  const f = panel.querySelectorAll('button');
+  if (!f.length) return;
+  const first = f[0], last = f[f.length - 1];
+  if (!panel.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+  else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+
+// Переход из шторки — в те же showScreen/setSectionTab, что панель и ряд
+// вкладок: другого пути к экранам нет, и рендеры не знают, откуда пришли.
+function navigateFromDrawer(screen, tab) {
+  haptic('light');
+  const st = _navDrawer;
+  const here = screen === currentScreen && (!tab || tab === sectionTabOf(screen));
+  // Уже здесь и не во вложенном экране (карточка долга, форма) — просто
+  // закрываем. Из вложенного экрана тот же пункт ведёт к списку раздела.
+  if (here && !(st && st.prevBack)) { closeNavDrawer(); return; }
+  closeNavDrawer({ restoreBack: false });
+  showScreen(screen, { tab });
+}
+
+// Свайп вправо закрывает. Жест горизонтальный — вертикальную прокрутку
+// списка отдаём браузеру (touch-action: pan-y в CSS), поэтому направление
+// фиксируем по первым 8px: ушло вбок — тянем шторку, ушло вверх-вниз —
+// жест не наш. Отпустили дальше трети ширины или быстрым движением —
+// закрываем, иначе шторка возвращается на место тем же переходом.
+let _drawerClickMuteUntil = 0;
+function wireDrawerSwipe(root) {
+  const panel = root.querySelector('.nav-drawer-panel');
+  let g = null;
+  panel.addEventListener('pointerdown', (e) => {
+    if (!_navDrawer || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    g = { id: e.pointerId, x: e.clientX, y: e.clientY, t: e.timeStamp, dx: 0, axis: null };
+  });
+  panel.addEventListener('pointermove', (e) => {
+    if (!g || e.pointerId !== g.id) return;
+    const dx = e.clientX - g.x;
+    const dy = e.clientY - g.y;
+    if (!g.axis) {
+      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+      g.axis = dx > 0 && Math.abs(dx) > Math.abs(dy) ? 'x' : 'y';
+      if (g.axis === 'y') { g = null; return; }
+      root.classList.add('is-dragging');
+      try { panel.setPointerCapture(e.pointerId); } catch (_e) {}
+    }
+    g.dx = Math.max(0, dx);
+    root.style.setProperty('--drawer-dx', `${g.dx}px`);
+    root.style.setProperty('--drawer-p', String(Math.min(1, g.dx / (panel.offsetWidth || 1))));
+  });
+  const end = (e) => {
+    if (!g || e.pointerId !== g.id) return;
+    const gesture = g;
+    g = null;
+    if (gesture.axis !== 'x') return;
+    // Отпущенный палец над пунктом даёт click — это был свайп, а не выбор.
+    _drawerClickMuteUntil = Date.now() + 350;
+    const speed = gesture.dx / Math.max(1, e.timeStamp - gesture.t);
+    const far = gesture.dx > (panel.offsetWidth || 1) / 3;
+    root.classList.remove('is-dragging');
+    root.style.removeProperty('--drawer-dx');
+    root.style.removeProperty('--drawer-p');
+    if (e.type === 'pointerup' && (far || speed > 0.5)) closeNavDrawer();
+  };
+  panel.addEventListener('pointerup', end);
+  panel.addEventListener('pointercancel', end);
 }
 
 
 
-async function showScreen(screen) {
+async function showScreen(screen, opts) {
   // Алиас может нести и вкладку: 'sales:report' — раздел «Продажи», вкладка
   // «Отчёт». Разбираем ДО всего остального, чтобы дальше работать с новым.
   const alias = LEGACY_SCREENS[screen];
@@ -280,6 +510,10 @@ async function showScreen(screen) {
     screen = target;
     if (tab) setSectionTab(target, tab);
   }
+  // Явная вкладка (шторка «Меню») — ПОСЛЕ алиаса: алиас несёт свою вкладку,
+  // и поставленная до него явная молча затиралась бы (так было со старым
+  // `stock` → 'stock:catalog', пока его не убрали из LEGACY_SCREENS).
+  if (opts && opts.tab) setSectionTab(screen, opts.tab);
   currentScreen = screen;
   // Поколение экрана. Рендер — асинхронный: «Сегодня» ждёт /api/home, список
   // заказов — /api/orders. Если человек ушёл в другой раздел раньше, чем
@@ -299,13 +533,10 @@ async function showScreen(screen) {
   // редактор заказа, пока есть несохранённый черновик).
   tg.disableClosingConfirmation && tg.disableClosingConfirmation();
 
-  document.querySelectorAll('.nav-item').forEach(btn => {
-    const isActive = btn.dataset.screen === screen;
-    btn.classList.toggle('active', isActive);
-    // aria-current — активный таб для скринридера (визуально это только цвет).
-    if (isActive) btn.setAttribute('aria-current', 'page');
-    else btn.removeAttribute('aria-current');
-  });
+  // Переход по ссылке «Сегодня», из поиска или по «Назад» при открытой
+  // шторке — шторка уходит вместе со старым экраном.
+  closeNavDrawer({ restoreBack: false });
+  syncNavActive(screen);
 
   setScreenContext(SCREEN_TITLES[screen]);
 
