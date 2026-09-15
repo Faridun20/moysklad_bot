@@ -23,6 +23,13 @@
 Идемпотентность: повторный --apply не плодит дубли. Совпадение ищется по
 legacy_ms_id; уже перенесённые строки обновляются, новые добавляются.
 
+**Повторный --apply ПОСЛЕ переключения запрещён.** Остаток пишется снимком из
+МС (`quantity = EXCLUDED.quantity`), а после переключения склад двигают живые
+накладные — снимок стёр бы их молча. Скрипт отказывается, если после первого
+переноса в базе уже есть живые накладные или заказы. Осознанный повтор —
+`--apply --i-know-live-data`: справочники обновятся, а остаток товаров, по
+которым были живые движения, НЕ перезаписывается.
+
 Код возврата: 0 — успех и сверка сошлась; 1 — ошибка или РАСХОЖДЕНИЕ.
 Ненулевой код обязан блокировать переключение: расхождение в остатках
 означает, что локальная база разойдётся с реальностью в первый же день,
@@ -214,8 +221,14 @@ async def _default_warehouse_id(txn) -> int:
     return int(wid)
 
 
-async def _upsert_entity(txn, table: str, ms_id: str, fields: dict, now: str) -> int:
+async def _upsert_entity(
+    txn, table: str, ms_id: str, fields: dict, now: str, *, insert_only: tuple[str, ...] = ()
+) -> int:
     """Вставить или обновить строку по legacy_ms_id. Возвращает локальный id.
+
+    `insert_only` — поля, которые пишутся только при создании. Тип контрагента
+    из МС не выводится (там всё «customer»), а уточняют его перенос истории и
+    человек в карточке; повторный прогон справочника не должен это стирать.
 
     Без ON CONFLICT: партиальный UNIQUE-индекс по legacy_ms_id есть, но
     поддержка `ON CONFLICT` по партиальному индексу требует повторять его
@@ -225,6 +238,7 @@ async def _upsert_entity(txn, table: str, ms_id: str, fields: dict, now: str) ->
     existing = await txn.fetchval(f"SELECT id FROM {table} WHERE legacy_ms_id = $1", ms_id)
     cols = list(fields)
     if existing is not None:
+        cols = [c for c in cols if c not in insert_only]
         assignments = ", ".join(f"{c} = ${i + 1}" for i, c in enumerate(cols))
         await txn.execute(
             f"UPDATE {table} SET {assignments} WHERE id = ${len(cols) + 1}",
@@ -245,15 +259,95 @@ async def _upsert_entity(txn, table: str, ms_id: str, fields: dict, now: str) ->
     return int(new_id)
 
 
+# Серии номеров, которыми пишет перенос истории (`migrate_history_from_moysklad`).
+# Живая нумерация — `IN-/OUT-ГГГГ-NNNN` из `warehouse._next_invoice_number`,
+# номер руками не вводится, поэтому префикс надёжно отделяет историю от жизни.
+_HISTORY_NUMBER_PATTERNS = ("MS-D-%", "MS-S-%")
+
+
+class LiveDataError(RuntimeError):
+    """После переноса в базе уже идёт живая работа — снимок остатков её сотрёт."""
+
+
+async def live_activity() -> dict:
+    """Что изменилось в базе ПОСЛЕ первого переноса справочников.
+
+    Граница — самый ранний `ms_id_map.migrated_at` у товаров/контрагентов:
+    `_write_map` его больше не сдвигает, поэтому повторный прогон не отодвигает
+    границу вперёд и не «прячет» уже случившиеся живые накладные.
+
+    Живое — накладные не из серии переноса истории и заказы с настоящим
+    автором (`user_id <> 0`; у исторических — 0). Возвращает счётчики и
+    `product_ms_ids` — товары МС, по которым были живые движения: их остаток
+    при осознанном повторе трогать нельзя.
+    """
+    from services import adb_core
+
+    since = await adb_core.fetchval(
+        "SELECT MIN(migrated_at) FROM ms_id_map WHERE entity_type IN ('product', 'counterparty')"
+    )
+    out: dict = {"since": since, "invoices": 0, "orders": 0, "product_ms_ids": set()}
+    if since is None:
+        return out
+    not_history = " AND ".join(f"i.invoice_number NOT LIKE '{p}'" for p in _HISTORY_NUMBER_PATTERNS)
+    out["invoices"] = int(
+        await adb_core.fetchval(
+            f"SELECT COUNT(*) FROM invoices i WHERE i.created_at > $1 AND {not_history}", since
+        )
+        or 0
+    )
+    out["orders"] = int(
+        await adb_core.fetchval(
+            "SELECT COUNT(*) FROM orders WHERE created_at > $1 AND user_id <> 0", since
+        )
+        or 0
+    )
+    rows = await adb_core.fetch(
+        "SELECT DISTINCT p.legacy_ms_id FROM invoice_items ii "
+        "JOIN invoices i ON i.id = ii.invoice_id "
+        "JOIN products p ON p.id = ii.product_id "
+        f"WHERE i.created_at > $1 AND {not_history} AND p.legacy_ms_id IS NOT NULL",
+        since,
+    )
+    out["product_ms_ids"] = {str(r["legacy_ms_id"]) for r in rows}
+    return out
+
+
+def live_data_refusal(live: dict) -> str | None:
+    """Текст отказа для оператора; None — живой работы нет, перенос безопасен."""
+    if not (live["invoices"] or live["orders"]):
+        return None
+    return (
+        f"После первого переноса ({live['since']}) в базе уже есть живая работа: "
+        f"накладных {live['invoices']}, заказов {live['orders']}. Повторный --apply "
+        "перезаписал бы остатки снимком из МойСклад и молча стёр бы эти движения. "
+        "Если повтор действительно нужен (например, догнать новые карточки товаров), "
+        "запустите с --i-know-live-data: справочники обновятся, а остаток товаров "
+        f"с живыми движениями ({len(live['product_ms_ids'])}) останется как есть."
+    )
+
+
 async def apply_migration(
-    products: list[dict], counterparties: list[dict], stock: dict[str, Decimal]
+    products: list[dict],
+    counterparties: list[dict],
+    stock: dict[str, Decimal],
+    *,
+    protect_ms_ids: set[str] | None = None,
 ) -> dict:
-    """Записать всё одной транзакцией. Частично применённой миграции не бывает."""
+    """Записать всё одной транзакцией. Частично применённой миграции не бывает.
+
+    `protect_ms_ids` — товары, чей остаток НЕ перезаписывается снимком МС:
+    по ним уже прошли живые накладные, и снимок откатил бы их.
+    """
     from services import adb_core
     from services.database import now_str
 
     now = now_str()
-    stats = {"products": 0, "counterparties": 0, "stock_rows": 0, "stock_skipped": 0}
+    protect = protect_ms_ids or set()
+    stats = {
+        "products": 0, "counterparties": 0, "stock_rows": 0, "stock_skipped": 0,
+        "stock_protected": 0,
+    }
 
     async with adb_core.transaction() as txn:
         warehouse_id = await _default_warehouse_id(txn)
@@ -282,6 +376,7 @@ async def apply_migration(
                 c["ms_id"],
                 {"name": c["name"], "phone": c["phone"], "type": c["type"]},
                 now,
+                insert_only=("type",),
             )
             await _write_map(txn, "counterparty", c["ms_id"], local_id, now)
             stats["counterparties"] += 1
@@ -296,6 +391,9 @@ async def apply_migration(
                 # бывает у архивных/удалённых позиций. Переносить некуда;
                 # считаем и показываем в отчёте, сверка это учтёт.
                 stats["stock_skipped"] += 1
+                continue
+            if ms_id in protect:
+                stats["stock_protected"] += 1
                 continue
             await txn.execute(
                 "INSERT INTO stock (product_id, warehouse_id, quantity) VALUES ($1, $2, $3) "
@@ -313,8 +411,10 @@ async def _write_map(txn, entity_type: str, ms_id: str, local_id: int, now: str)
     await txn.execute(
         "INSERT INTO ms_id_map (entity_type, ms_id, local_id, migrated_at) "
         "VALUES ($1, $2, $3, $4) "
-        "ON CONFLICT (entity_type, ms_id) DO UPDATE SET local_id = EXCLUDED.local_id, "
-        "migrated_at = EXCLUDED.migrated_at",
+        # migrated_at НЕ обновляем: это граница «до переноса / после», по
+        # которой live_activity отличает живые накладные. Сдвинь её повтор —
+        # и следующий повтор уже не увидел бы живую работу между ними.
+        "ON CONFLICT (entity_type, ms_id) DO UPDATE SET local_id = EXCLUDED.local_id",
         entity_type,
         ms_id,
         local_id,
@@ -326,9 +426,18 @@ async def _write_map(txn, entity_type: str, ms_id: str, local_id: int, now: str)
 
 
 async def verify(
-    products: list[dict], counterparties: list[dict], stock: dict[str, Decimal]
+    products: list[dict],
+    counterparties: list[dict],
+    stock: dict[str, Decimal],
+    *,
+    skip_ms_ids: set[str] | None = None,
 ) -> list[str]:
-    """Сверить локальную базу с выгрузкой. Пустой список — расхождений нет."""
+    """Сверить локальную базу с выгрузкой. Пустой список — расхождений нет.
+
+    `skip_ms_ids` — товары с живыми движениями: их остаток законно отличается
+    от снимка МС, и сверять его значит получить расхождение, которое нечем
+    и незачем чинить.
+    """
     from services import adb_core
 
     problems: list[str] = []
@@ -353,11 +462,16 @@ async def verify(
     # остатки «висячих» ms_id (товар удалён, остаток остался) переносить
     # некуда, и включать их в ожидаемую сумму значило бы гарантированно
     # получить расхождение, которое ничем не чинится.
-    migrated = {p["ms_id"] for p in products}
+    migrated = {p["ms_id"] for p in products} - (skip_ms_ids or set())
     expected_total = sum((stock.get(m, Decimal("0")) for m in migrated), Decimal("0"))
 
-    rows = await adb_core.fetch("SELECT quantity FROM stock")
-    local_total = sum((_dec(r["quantity"]) for r in rows), Decimal("0"))
+    rows = await adb_core.fetch(
+        "SELECT p.legacy_ms_id, s.quantity FROM stock s LEFT JOIN products p ON p.id = s.product_id"
+    )
+    local_total = sum(
+        (_dec(r["quantity"]) for r in rows if r["legacy_ms_id"] not in (skip_ms_ids or set())),
+        Decimal("0"),
+    )
 
     if abs(local_total - expected_total) > TOLERANCE:
         problems.append(
@@ -390,7 +504,7 @@ async def verify(
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 
-async def main(mode: str) -> int:
+async def main(mode: str, *, allow_live: bool = False) -> int:
     from services.database import init_db
 
     init_db()
@@ -413,20 +527,48 @@ async def main(mode: str) -> int:
                 len(orphan), ", ".join(orphan[:5]),
             )
 
+        live = await live_activity()
+        refusal = live_data_refusal(live)
+        protected: set[str] = set()
+
         if mode == "dry-run":
+            if refusal:
+                logger.warning("%s", refusal)
             logger.info("--dry-run: в базу ничего не записано.")
             return 0
 
         if mode == "apply":
-            stats = await apply_migration(products, counterparties, stock)
+            if refusal and not allow_live:
+                logger.error("ОТКАЗ: %s", refusal)
+                return 1
+            if refusal:
+                protected = set(live["product_ms_ids"])
+                logger.warning(
+                    "--i-know-live-data: остаток %d товаров с живыми движениями "
+                    "не перезаписывается и в сверке остатков не участвует",
+                    len(protected),
+                )
+            stats = await apply_migration(
+                products, counterparties, stock, protect_ms_ids=protected
+            )
             logger.info(
-                "Записано: товаров %d, контрагентов %d, строк остатка %d (пропущено %d)",
+                "Записано: товаров %d, контрагентов %d, строк остатка %d "
+                "(пропущено %d, защищено живыми движениями %d)",
                 stats["products"], stats["counterparties"],
-                stats["stock_rows"], stats["stock_skipped"],
+                stats["stock_rows"], stats["stock_skipped"], stats["stock_protected"],
+            )
+
+        if mode == "verify" and refusal:
+            # Сверка после переключения: остаток товаров с живыми движениями
+            # законно ушёл от снимка МС — это не расхождение переноса.
+            protected = set(live["product_ms_ids"])
+            logger.warning(
+                "После переноса была живая работа — остаток %d товаров с движениями "
+                "в сверке не участвует", len(protected),
             )
 
         logger.info("Сверка…")
-        problems = await verify(products, counterparties, stock)
+        problems = await verify(products, counterparties, stock, skip_ms_ids=protected)
         if problems:
             logger.error("СВЕРКА НЕ СОШЛАСЬ — переключаться НЕЛЬЗЯ:")
             for p in problems:
@@ -448,10 +590,19 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     g.add_argument("--dry-run", action="store_true", help="только выгрузка и отчёт")
     g.add_argument("--apply", action="store_true", help="выгрузка, запись и сверка")
     g.add_argument("--verify", action="store_true", help="только сверка локальной базы с МС")
-    return p.parse_args(argv)
+    p.add_argument(
+        "--i-know-live-data",
+        dest="i_know_live_data",
+        action="store_true",
+        help="разрешить --apply при живых накладных/заказах; их остаток не перезаписывается",
+    )
+    args = p.parse_args(argv)
+    if args.i_know_live_data and not args.apply:
+        p.error("--i-know-live-data имеет смысл только вместе с --apply")
+    return args
 
 
 if __name__ == "__main__":
     args = _parse_args(sys.argv[1:])
     mode = "dry-run" if args.dry_run else ("apply" if args.apply else "verify")
-    sys.exit(asyncio.run(main(mode)))
+    sys.exit(asyncio.run(main(mode, allow_live=args.i_know_live_data)))

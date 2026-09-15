@@ -226,3 +226,148 @@ def test_apply_without_warehouse_fails_loudly(isolated_db):
             await m.apply_migration(PRODUCTS, COUNTERPARTIES, STOCK)
 
     _run(go())
+
+
+# ─── Повторный --apply после переключения (P0-4) ─────────────────────────────
+
+
+def _live_outgoing_invoice(product_ms_id="uuid-p1", qty=4.0):
+    """Живая расходная накладная через warehouse — как после переключения."""
+    from services import adb_core, warehouse
+
+    async def go():
+        pid = await adb_core.fetchval(
+            "SELECT id FROM products WHERE legacy_ms_id = $1", product_ms_id
+        )
+        wid = await adb_core.fetchval("SELECT id FROM warehouses ORDER BY id LIMIT 1")
+        async with adb_core.transaction() as txn:
+            return await warehouse.create_invoice_in(
+                txn, invoice_type="outgoing", warehouse_id=int(wid),
+                items=[{"product_id": pid, "quantity": qty, "price_cents": 100}],
+                created_by=777,
+            )
+
+    return _run(go())
+
+
+def _age_migration(isolated_db):
+    """Сдвинуть момент первого переноса в прошлое: в тесте всё происходит в
+    одну секунду, а граница «до/после» сравнивается строго."""
+    with isolated_db.get_conn() as conn:
+        cur = isolated_db.get_cursor(conn)
+        cur.execute("UPDATE ms_id_map SET migrated_at = '2026-01-01 00:00:00'")
+        conn.commit()
+
+
+def test_no_live_data_right_after_first_migration(mig):
+    async def go():
+        await mig.apply_migration(PRODUCTS, COUNTERPARTIES, STOCK)
+        live = await mig.live_activity()
+        assert (live["invoices"], live["orders"]) == (0, 0)
+        assert mig.live_data_refusal(live) is None
+
+    _run(go())
+
+
+def test_rerun_apply_is_refused_when_live_invoices_exist(mig, isolated_db, monkeypatch):
+    """Живая накладная после переноса → повторный --apply отказывается и
+    остаток не трогает. Снимок МС (10.5) стёр бы списание 4 шт молча."""
+    from services import adb_core
+
+    _run(mig.apply_migration(PRODUCTS, COUNTERPARTIES, STOCK))
+    _age_migration(isolated_db)
+    _live_outgoing_invoice(qty=4.0)
+
+    async def fake_pull_products():
+        return PRODUCTS
+
+    async def fake_pull_counterparties():
+        return COUNTERPARTIES
+
+    async def fake_pull_stock():
+        return STOCK
+
+    monkeypatch.setattr(mig, "pull_products", fake_pull_products)
+    monkeypatch.setattr(mig, "pull_counterparties", fake_pull_counterparties)
+    monkeypatch.setattr(mig, "pull_stock", fake_pull_stock)
+
+    assert _run(mig.main("apply")) == 1
+
+    qty = _run(adb_core.fetchval(
+        "SELECT s.quantity FROM stock s JOIN products p ON p.id = s.product_id "
+        "WHERE p.legacy_ms_id = 'uuid-p1'"
+    ))
+    assert Decimal(str(qty)) == Decimal("6.5"), "живое списание 4 шт сохранено"
+
+
+def test_refusal_text_explains_and_names_the_override(mig, isolated_db):
+    _run(mig.apply_migration(PRODUCTS, COUNTERPARTIES, STOCK))
+    _age_migration(isolated_db)
+    _live_outgoing_invoice()
+
+    live = _run(mig.live_activity())
+    assert live["invoices"] == 1
+    assert live["product_ms_ids"] == {"uuid-p1"}
+    text = mig.live_data_refusal(live)
+    assert "накладных 1" in text and "--i-know-live-data" in text
+
+
+def test_override_updates_catalog_but_keeps_live_stock(mig, isolated_db, monkeypatch):
+    """--i-know-live-data: справочник догоняется, остаток товаров с живыми
+    движениями не перезаписывается, у остальных — снимок МС."""
+    from services import adb_core
+
+    _run(mig.apply_migration(PRODUCTS, COUNTERPARTIES, STOCK))
+    _age_migration(isolated_db)
+    _live_outgoing_invoice(product_ms_id="uuid-p1", qty=4.0)
+
+    new_stock = {"uuid-p1": Decimal("99"), "uuid-p2": Decimal("7")}
+    renamed = [dict(PRODUCTS[0], name="Болт М8 оцинк."), PRODUCTS[1]]
+    monkeypatch.setattr(mig, "pull_products", lambda: _async(renamed))
+    monkeypatch.setattr(mig, "pull_counterparties", lambda: _async(COUNTERPARTIES))
+    monkeypatch.setattr(mig, "pull_stock", lambda: _async(new_stock))
+
+    assert _run(mig.main("apply", allow_live=True)) == 0, "сверка без защищённых товаров сходится"
+
+    rows = {
+        r["legacy_ms_id"]: (r["name"], Decimal(str(r["quantity"])))
+        for r in _run(adb_core.fetch(
+            "SELECT p.legacy_ms_id, p.name, s.quantity FROM products p "
+            "JOIN stock s ON s.product_id = p.id"
+        ))
+    }
+    assert rows["uuid-p1"] == ("Болт М8 оцинк.", Decimal("6.5")), "живой остаток не стёрт"
+    assert rows["uuid-p2"] == ("Гайка М8", Decimal("7")), "остальные — снимок МС"
+
+
+def test_migrated_at_is_not_moved_by_rerun(mig, isolated_db):
+    """Граница «до/после переноса» не сдвигается повтором — иначе второй
+    повтор уже не увидел бы живую работу, случившуюся до первого."""
+    from services import adb_core
+
+    _run(mig.apply_migration(PRODUCTS, COUNTERPARTIES, STOCK))
+    _age_migration(isolated_db)
+    _run(mig.apply_migration(PRODUCTS, COUNTERPARTIES, STOCK))
+    assert _run(adb_core.fetchval("SELECT MAX(migrated_at) FROM ms_id_map")) \
+        == "2026-01-01 00:00:00"
+
+
+def test_rerun_does_not_reset_counterparty_type(mig):
+    """Тип контрагента уточняет перенос истории (supplier) или человек;
+    повтор справочника не возвращает всех в customer."""
+    from services import adb_core
+
+    _run(mig.apply_migration(PRODUCTS, COUNTERPARTIES, STOCK))
+    _run(adb_core.execute("UPDATE counterparties SET type = 'supplier'"))
+    _run(mig.apply_migration(PRODUCTS, COUNTERPARTIES, STOCK))
+    assert _run(adb_core.fetchval("SELECT type FROM counterparties")) == "supplier"
+
+
+def test_override_flag_requires_apply(mig):
+    with pytest.raises(SystemExit):
+        mig._parse_args(["--dry-run", "--i-know-live-data"])
+    assert mig._parse_args(["--apply", "--i-know-live-data"]).i_know_live_data is True
+
+
+async def _async(value):
+    return value
