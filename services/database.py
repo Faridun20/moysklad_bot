@@ -4094,7 +4094,6 @@ async def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_nam
     CAS статуса сдачи.
     """
     from services import order_payments
-    from services.debts import calc_order_balances, lock_orders
 
     dep_head = await adb_core.fetchrow("SELECT manager_id FROM cash_deposits WHERE id = $1", deposit_id)
     # Кто вправе подтвердить — сервисный рубеж (HTTP и кнопка dep_ok): менеджер
@@ -4111,6 +4110,23 @@ async def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_nam
     rates = {c: await asyncio.to_thread(get_currency_rate, c) for c in part_currencies if c}
 
     closed: list[int] = []
+    try:
+        return await _confirm_cash_deposit_txn(
+            deposit_id, confirmed_by, confirmed_name, rights, part_orders, rates, closed
+        )
+    except order_payments.PaymentError as e:
+        # Строка сдачи уже не ждёт (confirm_deposit_parts_locked) — транзакция
+        # откатилась целиком, сдача осталась pending.
+        return {"ok": False, "error": e.message, "code": e.code, "status": e.status}
+
+
+async def _confirm_cash_deposit_txn(
+    deposit_id: int, confirmed_by: int, confirmed_name: str, rights: dict,
+    part_orders: list[int], rates: dict, closed: list[int],
+) -> dict:
+    from services import order_payments
+    from services.debts import calc_order_balances, lock_orders
+
     async with adb_core.transaction() as txn:
         if USE_POSTGRES:
             await txn.execute(
@@ -6309,18 +6325,32 @@ async def _maybe_close_order_after_payment(
 async def reject_payment(
     payment_id: int, rejected_by: int | None = None, rejected_name: str = ""
 ) -> bool:
-    """asyncpg Stage 15 (#21): native async; get_payment/add_audit_log/get_role
-    (sync money-core) — мост через to_thread."""
+    """Отклонить ожидающий платёж. Замки: строка заказа (`lock_orders`) →
+    проверка живой сдачи → CAS платежа, одной транзакцией. Аудит — после коммита."""
     # Наличные, уже лежащие в сдаче, отклоняются вместе со сдачей — иначе
     # подтверждённая потом сдача несла бы деньги отклонённого платежа.
     from services import order_payments
+    from services.debts import lock_orders
 
-    if await order_payments.payment_in_active_deposit(payment_id):
+    head = await adb_core.fetchrow("SELECT order_id FROM payments WHERE id = $1", payment_id)
+    if head is None:
         return False
-    rc = await adb_core.execute(
-        "UPDATE payments SET status = 'rejected' WHERE id = $1 AND status = 'pending'",
-        payment_id,
-    )
+    # Проверка «наличные уже в сдаче» и CAS — ОДНОЙ транзакцией под замком
+    # заказа (общий с create_cash_deposit): иначе сдача, созданная между
+    # проверкой и UPDATE, уносила деньги отклонённого платежа.
+    async with adb_core.transaction() as txn:
+        order_id = head.get("order_id")
+        if order_id:
+            await lock_orders(txn, [int(order_id)])
+        actual = await txn.fetchval("SELECT order_id FROM payments WHERE id = $1", payment_id)
+        if actual and actual != order_id:
+            await lock_orders(txn, [int(actual)])
+        if await order_payments.payment_in_active_deposit(payment_id, conn=txn):
+            return False
+        rc = await txn.execute(
+            "UPDATE payments SET status = 'rejected' WHERE id = $1 AND status = 'pending'",
+            payment_id,
+        )
     updated = rc > 0
     if updated and rejected_by:
         payment = await get_payment(payment_id)

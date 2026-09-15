@@ -798,7 +798,13 @@ async def deposit_orders_view(deposit_ids: list[int], conn: Any = None) -> dict[
 
 
 async def confirm_deposit_parts_locked(txn: Any, deposit_id: int, rates: dict[str, float | None]) -> list[int]:
-    """Подтвердить платежи наличных строк сдачи. Под замком заказов → [order_id]."""
+    """Подтвердить платежи наличных строк сдачи. Под замком заказов → [order_id].
+
+    Платёж строки уже не ожидающий (отклонён/подтверждён мимо сдачи) — отказ
+    `PaymentError(409, code=deposit_part_not_pending)`: транзакция вызывающего
+    откатывается. Молча пропустить (rc=0) значило бы подтвердить сдачу с
+    деньгами отклонённого платежа.
+    """
     rows = await txn.fetch(
         "SELECT pp.payment_id, pp.order_id, p.currency FROM cash_deposit_parts cdp "
         "JOIN payment_parts pp ON pp.id = cdp.part_id JOIN payments p ON p.id = pp.payment_id "
@@ -812,8 +818,15 @@ async def confirm_deposit_parts_locked(txn: Any, deposit_id: int, rates: dict[st
             "UPDATE payments SET status = 'confirmed', confirmed_at = $1 WHERE id = $2 AND status = 'pending'",
             now, int(r["payment_id"]),
         )
+        if rc <= 0:
+            raise PaymentError(
+                f"В сдаче #{deposit_id} наличные по заказу #{r['order_id']} уже не ждут подтверждения "
+                f"(платёж #{r['payment_id']} отклонён или подтверждён отдельно) — отклоните сдачу, "
+                "и менеджер сдаст заново",
+                status=409, code="deposit_part_not_pending",
+            )
         rate = rates.get(str(r["currency"] or "").upper())
-        if rc > 0 and rate is not None:
+        if rate is not None:
             await txn.execute(
                 "UPDATE payments SET fx_rate_to_base = $1 WHERE id = $2 AND fx_rate_to_base IS NULL",
                 float(rate), int(r["payment_id"]),
