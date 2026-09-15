@@ -864,8 +864,9 @@ async def approve_shipment_request(
 
     # Уведомляем менеджера
     if bot is not None and req.get("user_id"):
-        from services.notify import notify_order_approved
+        from services.notify import approved_order_keyboard, notify_order_approved
 
+        payment_type = (order.get("payment_type") or "paid") if order and not order_moved else None
         try:
             await notify_order_approved(
                 bot,
@@ -874,6 +875,8 @@ async def approve_shipment_request(
                 boss_name,
                 now_str,
                 demand_line,
+                payment_type=payment_type,
+                reply_markup=approved_order_keyboard(payment_type) if payment_type else None,
             )
         except Exception:
             logger.exception("notify_order_approved failed for req #%s", req_id)

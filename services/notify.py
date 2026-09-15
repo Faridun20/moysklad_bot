@@ -63,6 +63,34 @@ async def notify_shipment_request(
             logger.warning("Не удалось уведомить %d о заявке #%d: %s", uid, req_id, e)
 
 
+def approved_order_keyboard(payment_type: str | None) -> Any:
+    """Кнопки под «Заявка одобрена» у менеджера — следующий шаг и его порядок.
+
+    «Оплата сразу» не отгружается, пока не внесена разбивка оплаты
+    (`database.mark_order_shipped` → `payment_required`). Поэтому шаги рисуются
+    по порядку: живая кнопка «Внести оплату» в WebApp и под ней НЕАКТИВНАЯ
+    (Bot API 10.3) «Отгрузка — после ввода оплаты» — видно, что отгрузка
+    заблокирована и чем. «В долг» отгружается сразу — одна кнопка в WebApp.
+    web_app-кнопку Telegram принимает только с https-URL; без него у «оплаты
+    сразу» остаётся одна неактивная подсказка, у «в долг» — ничего.
+    """
+    import config
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+
+    from utils.keyboards import disabled_button
+
+    url = config.WEBAPP_URL or ""
+    webapp = WebAppInfo(url=url) if url.startswith("https://") else None
+    rows = []
+    if (payment_type or "paid") == "paid":
+        if webapp:
+            rows.append([InlineKeyboardButton(text="💳 Внести оплату — в WebApp", web_app=webapp)])
+        rows.append([disabled_button("🚚 Отгрузка — после ввода оплаты")])
+    elif webapp:
+        rows.append([InlineKeyboardButton(text="🚚 Отгрузить — в WebApp", web_app=webapp)])
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
 async def notify_order_approved(
     bot: Bot,
     manager_user_id: int,
@@ -70,16 +98,30 @@ async def notify_order_approved(
     boss_name: str,
     now: str,
     demand_line: str,
+    *,
+    payment_type: str | None = None,
+    reply_markup: Any = None,
 ) -> None:
-    """Уведомить менеджера об одобрении заявки."""
+    """Уведомить менеджера об одобрении заявки.
+
+    `payment_type="paid"` — последняя строка говорит «сначала оплата», а не
+    «можно отгружать»: отгрузка «оплаты сразу» без разбивки получит отказ.
+    """
+    if (payment_type or "") == "paid":
+        tail = "Сначала внесите оплату, затем отгрузка."
+    else:
+        tail = "Можно приступать к отгрузке."
     text = (
         f"{DIV}\n"
         f"✅ <b>Заявка #{req_id} одобрена!</b>\n\n"
         f"👨‍💼 Одобрил: {esc(boss_name)}\n"
         f"🕐 {now}{demand_line}\n\n"
-        f"Можно приступать к отгрузке."
+        f"{tail}"
     )
-    await _send(bot, manager_user_id, text, disable_web_page_preview=True)
+    extra: dict[str, Any] = {"disable_web_page_preview": True}
+    if reply_markup is not None:
+        extra["reply_markup"] = reply_markup
+    await _send(bot, manager_user_id, text, **extra)
 
 
 async def notify_order_rejected(

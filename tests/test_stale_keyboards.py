@@ -112,6 +112,9 @@ class _FakeState:
     async def get_data(self):
         return dict(self._data)
 
+    async def get_state(self):
+        return getattr(self._state, "state", self._state)
+
 
 def _kb_callbacks(markup):
     return [b.callback_data for row in markup.inline_keyboard for b in row if b.callback_data]
@@ -287,7 +290,12 @@ def test_deposit_reject_flow_kills_card_buttons_and_stamps_result(isolated_db):
     state = _FakeState()
     call = _FakeCall(f"dep_no:{dep_id}", uid=2, bot=bot)
     asyncio.run(cb_deposit_reject(call, state))
-    assert call.message.markup is None  # кнопки карточки мертвы уже на входе
+    # Кнопки карточки мертвы уже на входе: вместо них неактивная подсказка
+    # (Bot API 10.3), колбэков не осталось.
+    assert _kb_callbacks(call.message.markup) == []
+    assert [b.text for row in call.message.markup.inline_keyboard for b in row] == [
+        "✍️ Ждём причину отклонения…"
+    ]
 
     asyncio.run(
         process_deposit_reject_reason(_FakeMessage(text="не сходится", uid=2, bot=bot), state, bot)
@@ -320,4 +328,7 @@ def test_cancel_flow_kills_abort_button_after_reason(isolated_db):
 
     asyncio.run(process_cancel_reason(_FakeMessage(text="клиент отказался", uid=2, bot=bot), state, bot))
     assert asyncio.run(db.get_order(oid))["status"] == "cancelled"
-    assert (55, 9, None) in bot.markup_edits  # клавиатуру промпта сняли
+    # Клавиатуру промпта сняли: «❌ Отмена» заменена неактивным исходом.
+    [(chat, msg_id, markup)] = [e for e in bot.markup_edits if e[:2] == (55, 9)]
+    assert _kb_callbacks(markup) == []
+    assert markup.inline_keyboard[0][0].text == "🚫 Заказ отменён"

@@ -21,7 +21,14 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from services import async_db as adb
 from services.roles import can_confirm_return, can_mark_return_goods_received, notify_recipients
 from utils.formatters import DIV
-from handlers._ui import replace_keyboard, webapp_keyboard
+from handlers._ui import (
+    disabled_button,
+    outcome_label,
+    replace_keyboard,
+    settle_card,
+    settle_markup,
+    webapp_keyboard,
+)
 from utils.helpers import esc
 
 logger = logging.getLogger(__name__)
@@ -40,19 +47,44 @@ def _fmt(x: float) -> str:
     return money.format_cents(money.to_cents(x or 0), decimals=2, sep=" ")
 
 
-def _confirm_keyboard(return_id: int, *, goods_received: bool = False):
+def _confirm_keyboard(
+    return_id: int, *, goods_received: bool = False, received_label: str | None = None
+):
     """Клавиатура карточки возврата.
 
     goods_received=True — приёмка уже отмечена, кнопку убираем: повторное
     нажатие ничего не меняет (T3.2), а «Подтвердить возврат» должна остаться,
-    иначе после T2.8 боссу нечем закрыть возврат.
+    иначе после T2.8 боссу нечем закрыть возврат. `received_label` — на месте
+    «Товар получен» неактивная кнопка с тем, кто и когда принял товар.
     """
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Подтвердить возврат", callback_data=f"ret_ok:{return_id}")
     if not goods_received:
         kb.button(text="📦 Товар получен", callback_data=f"ret_got:{return_id}")
+    elif received_label:
+        kb.add(disabled_button(received_label))
     kb.adjust(1)
     return kb.as_markup()
+
+
+def _return_callbacks(return_id: int) -> set[str]:
+    return {f"ret_ok:{return_id}", f"ret_got:{return_id}"}
+
+
+async def _settle_stale_return(call: CallbackQuery, return_id: int) -> bool:
+    """Возврат уже подтверждён (WebApp или другой руководитель) — гасим
+    кнопки карточки исходом. Возврат ещё ждёт — не трогаем."""
+    ret = await adb.get_return(return_id)
+    status = (ret or {}).get("status")
+    if not status or status == "pending":
+        return False
+    await settle_card(
+        call,
+        _return_callbacks(return_id),
+        "✅ Возврат уже подтверждён" if status == "confirmed" else "ℹ️ Возврат уже обработан",
+        tail=webapp_keyboard("🌐 Ещё возвраты — в WebApp"),
+    )
+    return True
 
 
 async def _notify_confirmers(bot: Bot, return_id, order_id, total, refund):
@@ -80,12 +112,23 @@ async def cb_return_goods_received(call: CallbackQuery):
     return_id = int(call.data.split(":")[1])
     res = await adb.mark_return_goods_received(return_id, call.from_user.id)
     if not res.get("ok"):
-        return await call.answer("⚠️ Уже обработано", show_alert=True)
+        await call.answer("⚠️ Уже обработано", show_alert=True)
+        if not await _settle_stale_return(call, return_id):
+            # Возврат ждёт, но приёмку уже отметили (на другой карточке или
+            # в WebApp) — погасить только «Товар получен».
+            await settle_card(call, {f"ret_got:{return_id}"}, "📦 Товар уже получен")
+        return
     await call.answer("📦 Отмечено: товар получен")
     # T3.2: помечаем результат в карточке и убираем отработавшую кнопку;
     # «Подтвердить возврат» оставляем — процесс продолжается.
     await replace_keyboard(
-        call, "📦 Товар получен", _confirm_keyboard(return_id, goods_received=True)
+        call,
+        "📦 Товар получен",
+        _confirm_keyboard(
+            return_id,
+            goods_received=True,
+            received_label=outcome_label("📦 Товар получен", call.from_user),
+        ),
     )
 
 
@@ -98,7 +141,9 @@ async def cb_return_confirm(call: CallbackQuery, bot: Bot):
 
     res = await adb.confirm_return(return_id, call.from_user.id, name)
     if not res.get("ok"):
-        return await call.answer(f"⚠️ {res.get('error', 'уже обработано')}", show_alert=True)
+        await call.answer(f"⚠️ {res.get('error', 'уже обработано')}", show_alert=True)
+        await _settle_stale_return(call, return_id)
+        return
 
     await call.answer("✅ Возврат подтверждён")
     # Round 6 (S1): html_text сохраняет HTML-entities. См. handlers/deposits.py.
@@ -115,5 +160,10 @@ async def cb_return_confirm(call: CallbackQuery, bot: Bot):
         + f"\n\n{DIV}\n✅ <b>Подтверждено</b> ({res['order_status']}) — {esc(name)}"
         + stock_line,
         parse_mode="HTML",
-        reply_markup=webapp_keyboard("🌐 Ещё возвраты — в WebApp"),
+        reply_markup=settle_markup(
+            getattr(call.message, "reply_markup", None),
+            _return_callbacks(return_id),
+            outcome_label("✅ Возврат подтверждён", call.from_user),
+            tail=webapp_keyboard("🌐 Ещё возвраты — в WebApp"),
+        ),
     )
