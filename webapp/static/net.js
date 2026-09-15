@@ -220,6 +220,7 @@
     '/api/machines/payment': ['admin', 'boss', 'manager'],
     '/api/machines/unreserve': ['admin', 'boss', 'manager'],
     '/api/settings/delete_requires_boss': ['admin', 'boss'],
+    '/api/settings/client_debt_reminders': ['admin', 'boss'],
     '/api/currency/rates/set': ['admin', 'boss'],
     '/api/prefs/set': ['admin', 'boss'],
   };

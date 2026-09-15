@@ -752,6 +752,11 @@ async def get_me(request: Request):
             # «Настройках»). Фронт прячет по нему кнопки менеджера
             # (`deleteActionsVisible`); сервер решает сам (`_require_delete_right`).
             "delete_requires_boss": await _delete_requires_boss(),
+            # B3: прямые напоминания о долге клиенту в Telegram — выкл. по
+            # умолчанию, переключает руководство в «Настройках».
+            "client_debt_reminders_enabled": bool(
+                await asyncio.to_thread(get_setting, "client_debt_reminders_enabled", False)
+            ),
         }
     )
 
@@ -842,6 +847,34 @@ async def api_settings_delete_requires_boss(request: Request):
             + ("(удаление — только руководитель)" if enabled else "(удалять может и менеджер)"),
         )
     return JSONResponse({"ok": True, "delete_requires_boss": enabled})
+
+
+@app.post("/api/settings/client_debt_reminders")
+async def api_settings_client_debt_reminders(request: Request):
+    """Руководство включает/выключает прямые напоминания о долге клиенту в
+    Telegram (B3, `services.client_debt_reminders`). Выкл. по умолчанию —
+    рассылка живому клиенту требует явного решения владельца. Аудит."""
+    from services import async_db as adb
+    from services.database import get_setting, set_setting
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_settings_client_debt_reminders", rate_limit_max=10,
+    )
+    if "enabled" not in data or not isinstance(data.get("enabled"), bool):
+        raise HTTPException(status_code=400, detail="enabled: true или false")
+    enabled = bool(data["enabled"])
+    before = bool(await asyncio.to_thread(get_setting, "client_debt_reminders_enabled", False))
+    await asyncio.to_thread(set_setting, "client_debt_reminders_enabled", enabled, user["id"])
+    if before != enabled:
+        await adb.add_audit_log(
+            user["id"], _actor_name(user), get_role(user["id"]), "setting_changed",
+            f"client_debt_reminders_enabled: {before} → {enabled} "
+            + ("(шлём напоминания о долге клиенту в Telegram)" if enabled
+               else "(клиентам о долге не пишем)"),
+        )
+    return JSONResponse({"ok": True, "client_debt_reminders_enabled": enabled})
 
 
 @app.post("/api/search")
@@ -1402,6 +1435,239 @@ async def api_analytics_export(request: Request):
         logger.exception("analytics export send_document failed")
         raise HTTPException(status_code=502, detail="Не удалось отправить файл в Telegram")
     return JSONResponse({"ok": True, "sent": True})
+
+
+async def _send_xlsx_to_chat(user_id: int, xlsx_bytes: bytes, filename: str, caption: str) -> None:
+    """Общий хвост всех Excel-экспортов (B6): файлом в Telegram, тем же приёмом,
+    что и `/api/analytics/export` — в WebApp нет ни одного места, отдающего
+    файл напрямую браузеру (см. `services/excel_export.py`)."""
+    from aiogram.types import BufferedInputFile
+
+    bot = await get_notify_bot()
+    try:
+        await bot.send_document(
+            chat_id=user_id,
+            document=BufferedInputFile(xlsx_bytes, filename=filename),
+            caption=caption,
+        )
+    except Exception:
+        logger.exception("excel export send_document failed (%s)", filename)
+        raise HTTPException(status_code=502, detail="Не удалось отправить файл в Telegram")
+
+
+# ─── API: Excel-выгрузки B6 (Каталог/Долги/Накладные/Клиенты) ────────────────
+#
+# Каждая — теми же ролями, что уже видят эти данные на экране: экспорт не
+# новый канал доступа, а другая проекция того же ответа (не расширяем допуск,
+# как и просит продуктовый аудит).
+
+
+@app.post("/api/stock/export")
+async def api_stock_export(request: Request):
+    """Excel: остаток склада (product/unit/category/stock) — как на экране
+    «Склад → Каталог». Роли — как у `/api/stock`."""
+    from services import warehouse
+    from services.excel_export import build_stock_xlsx
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=("admin", "boss", "manager"), rate_limit_scope="api_stock_export"
+    )
+    rows = await warehouse.get_stock(only_positive=bool(data.get("only_positive")))
+    xlsx_bytes = await asyncio.to_thread(build_stock_xlsx, rows)
+    await _send_xlsx_to_chat(user["id"], xlsx_bytes, "catalog.xlsx", "📦 Каталог · остаток склада")
+    return JSONResponse({"ok": True, "sent": True})
+
+
+@app.post("/api/debts/export")
+async def api_debts_export(request: Request):
+    """Excel: вся дебиторка со сроками (заказы в долг + рассрочки техники).
+
+    Роли и видимость — как у `/api/debts`: менеджер видит только свои заказы
+    (рассрочки техники — только руководство, `services.receivables.collect`
+    сам это соблюдает при `include_machines`)."""
+    from services import async_db as adb
+    from services import receivables
+    from services.excel_export import build_debts_xlsx
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=("admin", "boss", "manager"), rate_limit_scope="api_debts_export"
+    )
+    role = get_role(user["id"])
+    is_boss = role in ("admin", "boss")
+
+    items = await receivables.collect(
+        user_id=None if is_boss else user["id"], include_machines=is_boss
+    )
+    today = local_now().date()
+    all_users = await adb.get_all_users()
+    owners = {u["user_id"]: (u.get("full_name") or u.get("username") or "—") for u in all_users}
+    rows = [
+        {
+            "source": r.source,
+            "title": r.title,
+            "counterparty": r.counterparty,
+            "owner_name": owners.get(r.owner_id, "—") if r.owner_id else "Руководство",
+            "due_date": r.due_date,
+            "amount": float(money.from_cents(r.amount_cents)),
+            "currency": r.currency,
+            "bucket_label": receivables.AGING_LABELS[receivables.bucket_of(r.due_date, today)],
+        }
+        for r in items
+    ]
+    xlsx_bytes = await asyncio.to_thread(build_debts_xlsx, rows)
+    await _send_xlsx_to_chat(user["id"], xlsx_bytes, "debts.xlsx", "💳 Долги · дебиторка со сроками")
+    return JSONResponse({"ok": True, "sent": True})
+
+
+_INVOICE_TYPE_LABELS = {"incoming": "Приход", "outgoing": "Расход"}
+_INVOICE_STATUS_LABELS = {"confirmed": "Проведена", "cancelled": "Отменена"}
+
+
+@app.post("/api/wh/invoices/export")
+async def api_wh_invoices_export(request: Request):
+    """Excel: накладные за период. Роли — как у `/api/wh/invoices`.
+
+    `date_from`/`date_to` — YYYY-MM-DD, включительно с обеих сторон
+    (`invoice_date` — дата, не момент). Оба опциональны — без них выгружается
+    весь журнал."""
+    from services import warehouse
+    from services.excel_export import build_invoices_xlsx
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=("admin", "boss", "manager"), rate_limit_scope="api_wh_invoices_export"
+    )
+    date_from = (data.get("date_from") or "").strip()[:10] or None
+    date_to = (data.get("date_to") or "").strip()[:10] or None
+    inv_type = data.get("type") if data.get("type") in ("incoming", "outgoing") else None
+    rows = await warehouse.list_invoices_for_export(date_from, date_to, inv_type)
+    export_rows = [
+        {
+            "number": r["invoice_number"],
+            "date": str(r["invoice_date"])[:10],
+            "type_label": _INVOICE_TYPE_LABELS.get(r["type"], r["type"]),
+            "counterparty": r.get("counterparty_name"),
+            "amount": float(money.from_cents(int(r["total_amount_cents"] or 0))),
+            "currency": r["currency"],
+            "status_label": _INVOICE_STATUS_LABELS.get(r["status"], r["status"]),
+        }
+        for r in rows
+    ]
+    xlsx_bytes = await asyncio.to_thread(build_invoices_xlsx, export_rows)
+    await _send_xlsx_to_chat(user["id"], xlsx_bytes, "invoices.xlsx", "🧾 Накладные за период")
+    return JSONResponse({"ok": True, "sent": True})
+
+
+@app.post("/api/wh/counterparties/export")
+async def api_wh_counterparties_export(request: Request):
+    """Excel: контрагенты с оборотом и текущим долгом. Роли — как у
+    `/api/wh/counterparties`."""
+    from services import counterparties as cp_service
+    from services.excel_export import build_counterparties_xlsx
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_wh_counterparties_export",
+    )
+    rows = await cp_service.export_rows()
+    xlsx_bytes = await asyncio.to_thread(build_counterparties_xlsx, rows)
+    await _send_xlsx_to_chat(user["id"], xlsx_bytes, "clients.xlsx", "👥 Клиенты · обороты и долг")
+    return JSONResponse({"ok": True, "sent": True})
+
+
+# ─── API: массовый импорт каталога из Excel/CSV (B5) ─────────────────────────
+#
+# Экран «Склад → Каталог» открыт менеджеру (как и приёмка контейнера) —
+# импорт теми же ролями. Файл едет base64 в JSON (как фото техники):
+# `python-multipart` не в зависимостях, и `UploadFile`/`Form` без него роняют
+# приложение на старте (см. CLAUDE.md).
+
+_CATALOG_IMPORT_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _decode_upload(data: dict) -> tuple[str, bytes]:
+    filename = str(data.get("filename") or "").strip()
+    raw_b64 = data.get("content_base64") or ""
+    try:
+        content = base64.b64decode(raw_b64, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=400, detail="Файл повреждён")
+    if len(content) > _CATALOG_IMPORT_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="Файл слишком большой (лимит 5 МБ)")
+    if not content:
+        raise HTTPException(status_code=400, detail="Пустой файл")
+    return filename, content
+
+
+@app.post("/api/catalog_import/template")
+async def api_catalog_import_template(request: Request):
+    """Шаблон .xlsx для массового импорта каталога — файлом в Telegram."""
+    from services.catalog_import import build_template_xlsx
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_catalog_import_template",
+    )
+    xlsx_bytes = await asyncio.to_thread(build_template_xlsx)
+    await _send_xlsx_to_chat(
+        user["id"], xlsx_bytes, "catalog-template.xlsx", "📦 Шаблон для импорта каталога"
+    )
+    return JSONResponse({"ok": True, "sent": True})
+
+
+@app.post("/api/catalog_import/preview")
+async def api_catalog_import_preview(request: Request):
+    """Разобрать .xlsx/.csv и показать превью с ошибками ДО записи в БД."""
+    from services.catalog_import import CatalogImportError, parse_rows, preview_import
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_catalog_import_preview", rate_limit_max=20,
+    )
+    filename, content = _decode_upload(data)
+    try:
+        raw_rows = await asyncio.to_thread(parse_rows, filename, content)
+    except CatalogImportError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    preview = await preview_import(raw_rows)
+    return JSONResponse({"ok": True, **preview})
+
+
+@app.post("/api/catalog_import/commit")
+async def api_catalog_import_commit(request: Request):
+    """Провести импорт: новые товары + цена (для новых) + приход остатка ОДНОЙ
+    накладной с комментарием «импорт из Excel». Всё-или-ничего — см.
+    `services.catalog_import.commit_import`."""
+    from services import async_db as adb
+    from services.catalog_import import CatalogImportError, commit_import, parse_rows
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_catalog_import_commit", rate_limit_max=10,
+    )
+    filename, content = _decode_upload(data)
+    try:
+        raw_rows = await asyncio.to_thread(parse_rows, filename, content)
+    except CatalogImportError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    result = await commit_import(raw_rows, user_id=user["id"])
+    if not result.get("ok"):
+        return JSONResponse(result, status_code=400)
+
+    invoice = result.get("invoice") or {}
+    await adb.add_audit_log(
+        user["id"], _actor_name(user), get_role(user["id"]), "catalog_import",
+        f"файл «{filename}»: строк={result['rows']} новых={result['created']} "
+        f"слито={result['merged']} накладная={invoice.get('invoice_id') or '—'}",
+    )
+    return JSONResponse(result)
 
 
 def _resolve_analytics_period(data: dict, now):

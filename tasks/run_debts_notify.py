@@ -197,6 +197,22 @@ async def main() -> int:
             all_debts_for_managers = [
                 d for d in all_debts_full if not _has_pending(d["id"])
             ]
+            # B3: напоминание напрямую клиенту (telegram_id в справочнике
+            # контрагентов) — та же «просрочка», что и в сводках выше.
+            # Выключено по умолчанию (client_debt_reminders_enabled), не
+            # зависит от того, есть ли у долга pending-платёж.
+            overdue_for_clients = [
+                d for d in all_debts_full if (debt_due_date(d) or "9999") < today_str
+            ]
+            if overdue_for_clients:
+                from services.client_debt_reminders import send_overdue_client_reminders
+
+                client_sent = await send_overdue_client_reminders(
+                    overdue_for_clients, balances, today_str
+                )
+                if client_sent:
+                    logger.info("client_debt_reminders: отправлено %d клиентам", client_sent)
+                sent += client_sent
             by_manager: dict[int, list[dict]] = {}
             for d in all_debts_for_managers:
                 by_manager.setdefault(d["user_id"], []).append(d)
