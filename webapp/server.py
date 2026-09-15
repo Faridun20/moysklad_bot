@@ -993,6 +993,70 @@ async def api_settings_backup_status(request: Request):
     })
 
 
+@app.post("/api/audit_log")
+async def api_audit_log(request: Request):
+    """Журнал действий (C1) — read-only лента для руководства в WebApp.
+
+    Раньше `audit_log` смотрели только через бот-команду `/audit`, и только
+    admin (`services.roles.can_manage_users`) — нанятый руководитель без
+    ADMIN_IDS не видел вообще ничего. Ручка отдаёт ТЕ ЖЕ записи (никакого
+    сужения scope: `handlers/audit.py` тоже не фильтрует по типу действия),
+    просто пускает ещё и boss. Фильтры — диапазон дат и сотрудник; страница —
+    как у `/api/orders` (`database.get_orders_page`/`_page_meta`).
+    """
+    from services.database import get_all_users, get_audit_log_page
+    from utils.audit_labels import translate_action
+
+    data = await request.json()
+    _authorize(data, allowed_roles=("admin", "boss"), rate_limit_scope="api_audit_log")
+
+    try:
+        limit = max(1, min(int(data.get("limit") or 50), 200))
+        offset = max(0, int(data.get("offset") or 0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Некорректные limit/offset") from None
+    raw_user_id = data.get("user_id")
+    try:
+        user_id = int(raw_user_id) if raw_user_id else None
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="user_id — число") from None
+    date_from = str(data.get("date_from") or "")
+    date_to = str(data.get("date_to") or "")
+    for d in (date_from, date_to):
+        if d and not _DATE_RE.match(d):
+            raise HTTPException(status_code=400, detail="Дата — в формате ГГГГ-ММ-ДД")
+
+    rows, total = await get_audit_log_page(
+        limit=limit, offset=offset, user_id=user_id, date_from=date_from, date_to=date_to,
+    )
+    entries = [
+        {
+            "id": r["id"],
+            "created_at": (r.get("created_at") or "")[:16],
+            "user_id": r.get("user_id"),
+            "full_name": r.get("full_name") or "",
+            "role": r.get("role") or "",
+            "action": r.get("action") or "",
+            "action_label": translate_action(r.get("action")),
+            "details": r.get("details") or "",
+        }
+        for r in rows
+    ]
+    users = await asyncio.to_thread(get_all_users)
+    return JSONResponse({
+        "entries": entries,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + len(entries) < total,
+        # Для фильтра «по сотруднику» — как в al:by_user бота (handlers/audit.py).
+        "users": [
+            {"user_id": u["user_id"], "full_name": u.get("full_name") or u.get("username") or str(u["user_id"])}
+            for u in users
+        ],
+    })
+
+
 @app.post("/api/search")
 async def api_search(request: Request):
     """Глобальный поиск по заказам / платежам / контрагентам.
@@ -3508,6 +3572,45 @@ async def api_orders(request: Request):
             **page_meta,
         }
     )
+
+
+@app.post("/api/orders/timeline")
+async def api_order_timeline(request: Request):
+    """История заказа (C3): лента решений — кто одобрил/оплатил/отгрузил/сдал
+    наличные/оформил возврат и когда. Доступ — как у самой карточки заказа
+    в `/api/orders`: боссу/админу — любой заказ; менеджеру — свой (плюс чужие
+    approved/shipped, если он временно замещает кладовщика —
+    `ROLE_ALSO_ACTS_AS`); кладовщику — approved/shipped (это его список «к
+    отгрузке», см. `api_orders`, scope='to_ship'). Без этого пункт «История»
+    на чужой карточке «к отгрузке» отвечал 403 (нашёл обходчик
+    `test_cov_click_everything.py::test_click_everything[keeper]`)."""
+    from services import async_db as adb
+    from services.order_timeline import build_order_timeline
+    from services.roles import role_allowed
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=None, rate_limit_scope="api_order_timeline", rate_limit_max=120,
+    )
+    try:
+        order_id = int(data.get("order_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="order_id обязателен (число)") from None
+
+    order = await adb.get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    role = get_role(user["id"])
+    can_see = (
+        role_allowed(role, ("admin", "boss"))
+        or int(order["user_id"]) == int(user["id"])
+        or (role_allowed(role, ("warehouse_keeper",)) and order.get("status") in ("approved", "shipped"))
+    )
+    if not can_see:
+        raise HTTPException(status_code=403, detail="Доступен только свой заказ")
+
+    events = await build_order_timeline(order_id)
+    return JSONResponse({"order_id": order_id, "events": events})
 
 
 @app.post("/api/orders/requests")

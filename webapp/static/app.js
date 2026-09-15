@@ -4858,6 +4858,8 @@ function renderOrdersMain(opts = {}) {
           return `<div class="order-item-preview">• ${escapeHtml(it.name)} — ${it.quantity} ${escapeHtml(it.unit || 'шт')}${priceStr}</div>`;
         }).join('')}
         ${orderPhotosHtml(o, isBoss)}
+        <button type="button" class="order-timeline-toggle" data-timeline-toggle="${o.id}">${icon('clock')} История</button>
+        <div class="order-timeline" id="order-timeline-${o.id}" hidden></div>
         ${o.status === 'draft' && !isBoss ? `
           <div class="draft-actions">
             <button class="btn-edit-order" data-id="${o.id}">${icon('edit')} Редактировать</button>
@@ -5079,6 +5081,45 @@ function renderOrdersMain(opts = {}) {
 
   // Заявки для руководства — часть «Решений».
   document.getElementById('show-requests')?.addEventListener('click', () => showScreen('decisions'));
+
+  // История заказа (C3) — лениво, по нажатию: список заказов может быть
+  // длинным, и грузить ленту решений по КАЖДОЙ карточке заранее (N+1) незачем
+  // тому, кто её не откроет.
+  document.querySelectorAll('[data-timeline-toggle]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      haptic('light');
+      openOrderTimeline(parseInt(btn.dataset.timelineToggle, 10));
+    });
+  });
+}
+
+// Разворачивает/грузит вертикальную ленту событий заказа (submit → approve →
+// оплата → отгрузка → сдача/возврат → …) под его карточкой в списке.
+// /api/orders/timeline — тот же доступ, что и у самого заказа (см. описание
+// ручки в webapp/server.py): руководству — любой, менеджеру — только свой.
+async function openOrderTimeline(orderId) {
+  const box = document.getElementById(`order-timeline-${orderId}`);
+  if (!box) return;
+  if (!box.hidden) { box.hidden = true; return; }
+  box.hidden = false;
+  box.innerHTML = `<div class="loader">Загружаю…</div>`;
+  try {
+    const data = await api('/api/orders/timeline', { order_id: orderId });
+    const events = data.events || [];
+    box.innerHTML = events.length
+      ? `<div class="order-timeline-list">${events.map(ev => `
+          <div class="order-timeline-item">
+            <div class="order-timeline-dot"></div>
+            <div class="order-timeline-body">
+              <div class="order-timeline-text">${escapeHtml(ev.text)}</div>
+              <div class="order-timeline-meta">${escapeHtml(ev.ts || '')}${ev.actor ? ' · ' + escapeHtml(ev.actor) : ''}</div>
+            </div>
+          </div>`).join('')}</div>`
+      : `<div class="loader">Событий пока нет</div>`;
+  } catch (e) {
+    box.innerHTML = errorBoxHtml(e.message);
+  }
 }
 
 
@@ -6126,6 +6167,10 @@ async function renderSettingsScreen() {
         ? row('set-pay-accounts', 'card', 'Карты и счета', 'Куда клиенты платят картой и перечислением')
         : ''}
     </div>
+    <div class="section-label">Контроль</div>
+    <div class="c-surface c-surface--list">
+      ${row('set-audit-log', 'list', 'Журнал действий', 'Кто и когда что сделал — вся лента')}
+    </div>
     ${backupStatusHtml(backup)}
     <div class="section-label">Сотрудники</div>
     <div class="c-surface c-surface--list">
@@ -6151,6 +6196,10 @@ async function renderSettingsScreen() {
   box.querySelector('#set-pay-accounts')?.addEventListener('click', () => {
     haptic('light');
     payRenderAccountsScreen(() => showScreen('settings'));
+  });
+  box.querySelector('#set-audit-log')?.addEventListener('click', () => {
+    haptic('light');
+    renderAuditLogScreen(() => showScreen('settings'));
   });
 }
 // ─── Экран: Аналитика ───────────────────────────────

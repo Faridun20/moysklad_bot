@@ -6766,6 +6766,76 @@ async def get_audit_log(limit: int = 50, user_id: int | None = None) -> list[dic
     )
 
 
+async def get_audit_log_page(
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    user_id: int | None = None,
+    date_from: str = "",
+    date_to: str = "",
+) -> tuple[list[dict], int]:
+    """Страница аудит-лога (C1, WebApp): фильтры + LIMIT/OFFSET + total — в SQL,
+    как `get_orders_page`. Новее сверху. Даты — YYYY-MM-DD включительно (день
+    записи из `created_at`, диапазон по самой колонке — тот же приём, что и
+    в `get_orders_page`, ради индекса `idx_audit_log_created`).
+    """
+    where: list[str] = []
+    args: list = []
+    if user_id:
+        args.append(int(user_id))
+        where.append(f"user_id = ${len(args)}")
+    if date_from:
+        args.append(date_from[:10])
+        where.append(f"created_at >= ${len(args)}")
+    if date_to:
+        upper = (datetime.strptime(date_to[:10], "%Y-%m-%d") + timedelta(days=1)).strftime(
+            "%Y-%m-%d"
+        )
+        args.append(upper)
+        where.append(f"created_at < ${len(args)} AND created_at > ''")
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+
+    total = int(
+        await adb_core.fetchval(f"SELECT COUNT(*) FROM audit_log {where_sql}", *args) or 0
+    )
+    page_args = [*args, max(1, int(limit)), max(0, int(offset))]
+    rows = await adb_core.fetch(
+        f"SELECT * FROM audit_log {where_sql} "
+        f"ORDER BY created_at DESC, id DESC LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}",
+        *page_args,
+    )
+    return rows, total
+
+
+async def get_shipment_requests_for_order(order_id: int) -> list[dict]:
+    """Все заявки на отгрузку заказа (обычно одна, но доработка плодит
+    новые циклы pending→rework→pending) — для истории заказа (C3)."""
+    return await adb_core.fetch(
+        "SELECT * FROM shipment_requests WHERE order_id = $1 ORDER BY created_at ASC",
+        order_id,
+    )
+
+
+async def get_cash_deposits_for_order(order_id: int) -> list[dict]:
+    """Сдачи наличных, в которые попал этот заказ (`cash_deposit_orders`) —
+    для истории заказа (C3): «сдал наличные» / «сдача подтверждена»."""
+    rows = await adb_core.fetch(
+        "SELECT d.* FROM cash_deposits d "
+        "JOIN cash_deposit_orders cdo ON cdo.deposit_id = d.id "
+        "WHERE cdo.order_id = $1 ORDER BY d.created_at ASC",
+        order_id,
+    )
+    return _with_major(rows, ("amount", "amount_cents"))
+
+
+async def get_returns_for_order(order_id: int) -> list[dict]:
+    """Возвраты по заказу — для истории заказа (C3)."""
+    rows = await adb_core.fetch(
+        "SELECT * FROM returns WHERE order_id = $1 ORDER BY created_at ASC", order_id
+    )
+    return _with_major(rows, ("total_amount", "total_amount_cents"))
+
+
 # ─── Заказы ───────────────────────────────────────────────────────────────────
 
 

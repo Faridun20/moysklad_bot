@@ -340,6 +340,16 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
         page.wait_for_selector("#content [data-delete-switch]")
         assert page.locator("#content [data-work-switch]").count() == 1
         audit.check("settings-switches")
+    # «История» на карточке заказа (C3) — разворачиваем первую попавшуюся.
+    go(page, "sales")
+    tab(page, "orders")
+    audit.idle()
+    timeline_toggle = page.locator("#content [data-timeline-toggle]").first
+    if timeline_toggle.count():
+        oid = timeline_toggle.get_attribute("data-timeline-toggle")
+        timeline_toggle.click()
+        page.wait_for_selector(f"#order-timeline-{oid} .order-timeline-list")
+        audit.check("sales-orders-timeline")
     # Деньги → Долги с фильтром «К оплате сейчас».
     go(page, "money")
     tab(page, "debts")
@@ -445,6 +455,13 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
         audit.check("settings-pay-accounts")
         audit.overlay('#content [data-pay-account-add="bank"]', "settings-pay-account-new-bank")
         audit.overlay("#content [data-pay-account]", "settings-pay-account-edit")
+        # «Журнал действий» (C1): лента + фильтр по сотруднику раскрыт листом.
+        go(page, "settings")
+        audit.idle()
+        page.click("#set-audit-log")
+        page.wait_for_selector("#content .audit-row, #content .empty-state")
+        audit.check("settings-audit-log")
+        audit.overlay("#audit-user-btn", "settings-audit-log-user-picker")
         go(page, "clients")
         tab(page, "limits")
         audit.idle()
