@@ -135,6 +135,38 @@ def test_manager_cancels_invoice_until_boss_keeps_deletion(api):
     assert {p["name"]: p["quantity"] for p in stock["products"]}["Болт М8"] > 0
 
 
+def test_manager_cannot_cancel_outgoing_or_foreign_invoice_even_with_flag_off(api):
+    """Выключатель `delete_requires_boss` открывает менеджеру только СВОЙ приход.
+    Расход (его проводит руководство) и чужой приход — только admin/boss."""
+    client, _db, ids = api
+    assert _incoming(client, ids["boss"], qty=10).status_code == 200
+    out = _outgoing(client, ids["boss"], qty=3)
+    assert out.status_code == 200, out.text
+    foreign_in = _incoming(client, ids["admin"], qty=5).json()
+    own_in = _incoming(client, ids["mgr"], qty=2).json()
+
+    def cancel(uid, inv_id):
+        return client.post("/api/wh/invoices/cancel", json={"initData": str(uid), "invoice_id": inv_id})
+
+    r = cancel(ids["mgr"], out.json()["invoice_id"])
+    assert r.status_code == 403, r.text
+    assert "руководитель" in r.json()["detail"]
+    assert cancel(ids["mgr"], foreign_in["invoice_id"]).status_code == 403
+    stock = client.post("/api/wh/stock", json={"initData": str(ids["mgr"])}).json()
+    assert {p["name"]: p["quantity"] for p in stock["products"]}["Болт М8"] == 14.0
+
+    listed = client.post("/api/wh/invoices", json={"initData": str(ids["mgr"])}).json()["invoices"]
+    flags = {i["id"]: i["can_cancel"] for i in listed}
+    assert flags[out.json()["invoice_id"]] is False
+    assert flags[foreign_in["invoice_id"]] is False
+    assert flags[own_in["invoice_id"]] is True
+    boss_list = client.post("/api/wh/invoices", json={"initData": str(ids["boss"])}).json()["invoices"]
+    assert all(i["can_cancel"] for i in boss_list)
+
+    assert cancel(ids["mgr"], own_in["invoice_id"]).status_code == 200
+    assert cancel(ids["boss"], out.json()["invoice_id"]).status_code == 200
+
+
 def test_boss_can_cancel_invoice(api):
     client, _db, ids = api
     inv = _incoming(client, ids["mgr"]).json()

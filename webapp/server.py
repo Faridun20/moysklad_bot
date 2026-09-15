@@ -7414,7 +7414,10 @@ async def api_wh_invoices(request: Request):
     from services.costing import redact_invoice
 
     role = get_role(user["id"])
-    rows = [redact_invoice(r, role) for r in rows]
+    rows = [
+        {**redact_invoice(r, role), "can_cancel": _invoice_cancel_allowed(r, user["id"], role)}
+        for r in rows
+    ]
     from services import printing
 
     # Кнопка «Распечатать» рисуется, только если в контейнере есть клиент CUPS:
@@ -7792,6 +7795,17 @@ async def api_wh_invoice_send(request: Request):
     return JSONResponse({"ok": True, "sent": True})
 
 
+def _invoice_cancel_allowed(inv: dict, user_id: int, role: str) -> bool:
+    """Кто отменяет накладную: руководство — любую; менеджер — только свой приход
+    (и только пока выключен `delete_requires_boss`, это `_require_delete_right`)."""
+    if role in ("admin", "boss"):
+        return True
+    if inv.get("type") != "incoming":
+        return False
+    created_by = inv.get("created_by")
+    return created_by is not None and int(created_by) == int(user_id)
+
+
 async def _invoice_owner_refusal(invoice_id: int) -> dict | None:
     """Отказ для накладной, привязанной к заказу/контейнеру/возврату; None — можно."""
     from services import adb_core, warehouse
@@ -7861,11 +7875,23 @@ async def api_wh_invoice_cancel(request: Request):
         rate_limit_scope="api_wh_invoice_cancel",
         rate_limit_max=20,
     )
-    await _require_delete_right(get_role(user["id"]))
+    role = get_role(user["id"])
+    await _require_delete_right(role)
     try:
         invoice_id = int(data.get("invoice_id"))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="invoice_id обязателен")
+    # Выключатель `delete_requires_boss` открывает менеджеру отмену только
+    # СВОЕГО прихода. Расход проводит руководство — и отменяет тоже оно:
+    # иначе менеджер возвращал бы на склад товар, уехавший по чужому решению.
+    from services import adb_core
+
+    head = await adb_core.fetchrow("SELECT type, created_by FROM invoices WHERE id = $1", invoice_id)
+    if head is not None and not _invoice_cancel_allowed(head, user["id"], role):
+        raise HTTPException(
+            status_code=403,
+            detail="Отменить расходную или чужую накладную может только руководитель",
+        )
 
     # Накладная, которую провёл заказ или контейнер, отменяется ЧЕРЕЗ них.
     # Прямая отмена возвращала остаток, но заказ оставался «отгружен» с долгом

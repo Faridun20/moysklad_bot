@@ -622,7 +622,7 @@ async def list_invoices(
     # рисуем, она гарантированно ответила бы отказом.
     sql = (
         "SELECT i.id, i.type, i.invoice_number, i.invoice_date, i.status, i.currency, "
-        "       i.total_amount_cents, i.telegram_sent, i.created_at, "
+        "       i.total_amount_cents, i.telegram_sent, i.created_at, i.created_by, "
         f"      {historical_invoice_sql('i')} AS historical, "
         "       c.name AS counterparty_name "
         "FROM invoices i LEFT JOIN counterparties c ON c.id = i.counterparty_id"

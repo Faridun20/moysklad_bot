@@ -8869,7 +8869,8 @@ async function renderWhInvoiceList() {
     }
     // Накладная из переноса МойСклад (inv.historical) не отменяется: склад по
     // ней не двигался, и сервер гарантированно откажет — кнопку не рисуем.
-    if (canCancel && !cancelled && !inv.historical) {
+    // `can_cancel` — сервер: менеджеру только свой приход, расход — руководству.
+    if (canCancel && inv.can_cancel !== false && !cancelled && !inv.historical) {
       actions.push(`<button class="btn-secondary" data-wh-cancel="${inv.id}">${icon('ban')} Отменить</button>`);
     }
     return `

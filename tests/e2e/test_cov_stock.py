@@ -1487,11 +1487,13 @@ def test_manager_posts_incoming_but_cannot_cancel(open_app, e2e):
 
 
 def test_manager_cancels_invoice_while_deletion_is_open(open_app, e2e):
-    """Решение владельца: пока менеджер один, отменять накладные может и он."""
+    """Решение владельца: пока менеджер один, отменять накладные может и он —
+    СВОЙ приход (расход и чужой приход — руководству, `_invoice_cancel_allowed`)."""
+    inv = e2e.rows("SELECT id FROM invoices")[0]["id"]
+    e2e.exec("UPDATE invoices SET created_by = ? WHERE id = ?", (e2e.ids["mgr"], inv))
     mgr = open_app(e2e.ids["mgr"])
     go(mgr, "stock")
     tab(mgr, "invoices")
-    inv = e2e.rows("SELECT id FROM invoices")[0]["id"]
     mgr.wait_for_selector(f'[data-wh-cancel="{inv}"]')
     mgr.click(f'[data-wh-cancel="{inv}"]')
     mgr.wait_for_selector(".toast:has-text('Накладная отменена')")
