@@ -1396,6 +1396,8 @@ function renderStockList() {
         // PR C: цена продажи (минимум) — всем; себестоимость — только boss.
         const priceLines = [];
         if (p.sale_price != null) priceLines.push(`мин. ${p.sale_price}`);
+        // B7: «для постоянных» — подсказка, её видит и менеджер.
+        if (p.wholesale_price != null) priceLines.push(`пост. ${p.wholesale_price}`);
         // Себестоимость по партиям (учёт включён) важнее ручной: это средняя
         // по тому, что реально лежит на складе. Ручная — пока партий нет.
         if (isBoss && p.cost_batches != null) priceLines.push(`себест. ${p.cost_batches} (партии)`);
@@ -1488,6 +1490,11 @@ function openPriceEditor(product) {
         <input type="number" inputmode="decimal" id="pe-sale" value="${product.sale_price ?? ''}" placeholder="—">
       </label>
       <label class="price-field">
+        <span>Цена для постоянных клиентов</span>
+        <input type="number" inputmode="decimal" id="pe-wholesale" value="${product.wholesale_price ?? ''}" placeholder="—">
+      </label>
+      <div class="card-row-sub">Показывается менеджеру второй подсказкой в форме позиции — правилом «кому её давать» не становится.</div>
+      <label class="price-field">
         <span>Себестоимость</span>
         <input type="number" inputmode="decimal" id="pe-cost" value="${product.cost_price ?? ''}" placeholder="—">
       </label>
@@ -1562,12 +1569,14 @@ function openPriceEditor(product) {
     saveBtn.disabled = true;
     const saleRaw = document.getElementById('pe-sale').value.trim();
     const costRaw = document.getElementById('pe-cost').value.trim();
+    const wholeRaw = document.getElementById('pe-wholesale').value.trim();
     try {
       await api('/api/products/prices/set', {
         product_id: productId,
         product_name: product.name,
         sale_price: saleRaw === '' ? null : parseNum(saleRaw),
         cost_price: costRaw === '' ? null : parseNum(costRaw),
+        wholesale_price: wholeRaw === '' ? null : parseNum(wholeRaw),
       });
     } catch (e) {
       saveBtn.disabled = false;
@@ -1577,6 +1586,7 @@ function openPriceEditor(product) {
     // Обновляем локально, чтобы список сразу показал новые цены.
     product.sale_price = saleRaw === '' ? null : parseNum(saleRaw);
     product.cost_price = costRaw === '' ? null : parseNum(costRaw);
+    product.wholesale_price = wholeRaw === '' ? null : parseNum(wholeRaw);
     close();
     haptic('success');
     toast('Цена сохранена');
@@ -5415,6 +5425,7 @@ function openQuantityInput(name, unit, maxStock, productId) {
         <label class="form-label">Цена за ${unitHtml}</label>
         <input type="number" id="price-input" class="form-input"
           placeholder="0" inputmode="decimal" min="0" step="0.01">
+        <div id="price-hint"></div>
       </div>
 
       <div id="line-total" class="qty-stock qty-line-total">
@@ -5440,6 +5451,7 @@ function openQuantityInput(name, unit, maxStock, productId) {
       btn.classList.add('active');
       selectedCurrency = btn.dataset.cur;
       updateTotal();
+      renderPriceHints();   // подсказка чужой валюты префиллить не должна
     });
   });
 
@@ -5454,6 +5466,48 @@ function openQuantityInput(name, unit, maxStock, productId) {
   }
   qtyEl.addEventListener('input', updateTotal);
   priceEl.addEventListener('input', updateTotal);
+
+  // ─── Подсказки цены (B7/D4) ──────────────────────────────────
+  // «Прошлый раз этому клиенту» → «цена товара» → пусто; «для постоянных» —
+  // альтернатива в один тап. Грузим ПОСЛЕ отрисовки формы и молча: ввод
+  // количества не должен ждать сети, а без подсказки поле пустое — ровно
+  // как было до B7. Префилл ставим, только пока менеджер поля не касался:
+  // ответ приходит асинхронно и не имеет права затирать набранное.
+  let priceHint = null;
+  let priceTouched = false;
+  priceEl.addEventListener('input', () => { priceTouched = true; });
+
+  function renderPriceHints() {
+    const box = document.getElementById('price-hint');
+    if (!box) return;
+    box.innerHTML = priceHintHtml(priceHint, selectedCurrency);
+    box.querySelectorAll('[data-price-hint]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        haptic('light');
+        priceTouched = true;
+        priceEl.value = btn.dataset.price;
+        updateTotal();
+      });
+    });
+    if (priceTouched || priceEl.value !== '') return;
+    const prefill = pricePrefill(priceHint, selectedCurrency);
+    if (prefill != null) { priceEl.value = prefill; updateTotal(); }
+  }
+
+  (async () => {
+    const draftId = currentDraftOrder && currentDraftOrder.id;
+    if (!productId || !draftId) return;
+    const res = await apiResult('/api/orders/price_hint', {
+      order_id: draftId, product_id: productId,
+    });
+    // За время запроса могли уйти с экрана или сменить черновик — не пишем
+    // в чужой DOM (тот же ghost-контент, что и в onConfirm).
+    if (!res.ok) return;
+    if (!currentDraftOrder || currentDraftOrder.id !== draftId) return;
+    if (!document.getElementById('price-hint')) return;
+    priceHint = res.body;
+    renderPriceHints();
+  })();
 
   // ─── MainButton: «Добавить в заявку» ─────────────────────────
   // Нативная кнопка Telegram — всегда видна над виртуальной клавиатурой,

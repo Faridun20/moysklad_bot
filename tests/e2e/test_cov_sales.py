@@ -458,6 +458,58 @@ def test_quantity_dialog_validates_and_min_price_applies(open_app, e2e):
     assert mgr.locator(".editor-item-del").count() == 1
 
 
+def _new_order_for_romashka(mgr, e2e) -> None:
+    """Новый черновик на «Ромашку», открытый на форме количества и цены."""
+    _orders(mgr)
+    mgr.click("#btn-new-order")
+    mgr.wait_for_selector("#choose-agent")
+    mgr.click("#choose-agent")
+    mgr.wait_for_selector('.agent-row:has-text("Ромашка")')
+    mgr.click('.agent-row:has-text("Ромашка")')
+    mgr.wait_for_selector("#change-agent")
+    mgr.click("#btn-add-product")
+    mgr.wait_for_selector(f'.prod-row[data-product="{e2e.ids["product"]}"]')
+    mgr.click(f'.prod-row[data-product="{e2e.ids["product"]}"]')
+    mgr.wait_for_selector("#qty-input")
+
+
+def test_repeat_client_gets_last_price_prefilled(open_app, e2e):
+    """B7/D4: тот же клиент, тот же товар — во второй раз цена уже в поле.
+
+    Первый заказ вводят с нуля (истории нет, цена товара не задана — поле
+    пустое, как было до подсказок). Второй заказ тому же клиенту открывает
+    форму с прошлой ценой и подписью «Прошлый раз: 45 USD (…)»."""
+    mgr = open_app(e2e.ids["mgr"])
+
+    _new_order_for_romashka(mgr, e2e)
+    settled(mgr)
+    assert mgr.locator("#price-input").input_value() == "", "истории нет — поле пустое"
+    assert mgr.locator("#price-hint").text_content() == ""
+    mgr.fill("#qty-input", "2")
+    mgr.fill("#price-input", "45")
+    mgr.evaluate("window.__tgMainClick()")
+    mgr.wait_for_selector(".toast:has-text('Товар добавлен')")
+    mgr.click('[data-pay="credit"]')
+    mgr.wait_for_selector("#due-date-wrap:not(.hidden)")
+    mgr.fill("#due-date-input", "2030-01-15")
+    mgr.wait_for_selector("#btn-submit:not([disabled])")
+    mgr.click("#btn-submit")
+    _wait_alert(mgr, "отправлена")
+
+    _new_order_for_romashka(mgr, e2e)
+    mgr.wait_for_function("() => document.getElementById('price-input').value === '45'")
+    assert "Прошлый раз: 45 USD" in mgr.locator("#price-hint").text_content()
+    # Подсказка — дефолт, а не замок: цену правят руками, и сервер её берёт.
+    mgr.fill("#price-input", "60")
+    mgr.fill("#qty-input", "1")
+    mgr.evaluate("window.__tgMainClick()")
+    mgr.wait_for_selector(".toast:has-text('Товар добавлен')")
+    prices = e2e.rows(
+        "SELECT price_cents FROM order_items ORDER BY id DESC LIMIT 1"
+    )
+    assert prices == [{"price_cents": 6000}]
+
+
 def _seed_catalog(e2e, pipes: int = 55) -> None:
     """Кабель — в «Кабели», плюс `pipes` труб без остатка в «Трубы»."""
     e2e.exec("UPDATE products SET category = ? WHERE id = ?", ("Кабели", e2e.ids["product"]))
