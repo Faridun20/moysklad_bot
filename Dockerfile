@@ -13,7 +13,12 @@
 #   docker compose run --rm bot python -m tasks.migrate
 
 # Патч-версия зафиксирована так же, как в runtime.txt (его читает Railway).
-FROM python:3.11.9-slim-bookworm
+# Тег проверен на актуальность 2026-09-15 (`docker manifest inspect
+# python:3.11-slim-bookworm`): 3.11.16-slim-bookworm — тот же digest, что и
+# плавающий тег 3.11-slim-bookworm на эту дату, Debian 12.15 (bookworm),
+# OpenSSL 3.0.20. sha256 закреплён ниже — при следующем патче обновите оба.
+# digest: sha256:528257d48c1da0dcecc2e725d1ae34498d60c965f1241e39cd6a85a8859bdf84
+FROM python:3.11.16-slim-bookworm@sha256:528257d48c1da0dcecc2e725d1ae34498d60c965f1241e39cd6a85a8859bdf84
 
 # ─── Системные библиотеки ────────────────────────────────────────────────────
 # Каждая — с указанием, кто её требует: иначе через полгода не вспомнить,
@@ -72,11 +77,16 @@ ARG PG_CLIENT_VERSION=16
 # Ключ PGDG через ADD: в slim-образе нет ни curl, ни gnupg, а apt принимает
 # armored-ключ (.asc) в signed-by как есть.
 ADD https://www.postgresql.org/media/keys/ACCC4CF8.asc /usr/share/keyrings/pgdg.asc
+# apt-get upgrade -y — security-патчи Debian (openssl/libc6/libexpat1/...)
+# подтягиваются на КАЖДОЙ сборке, а не только со следующим патч-тегом базового
+# образа: сам базовый тег обновляем вручную (см. комментарий у FROM), а между
+# такими обновлениями bookworm успевает выпустить не один security-релиз.
 RUN set -eux; \
     chmod 644 /usr/share/keyrings/pgdg.asc; \
     echo "deb [signed-by=/usr/share/keyrings/pgdg.asc] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
         > /etc/apt/sources.list.d/pgdg.list; \
     apt-get update; \
+    apt-get upgrade -y; \
     apt-get install -y --no-install-recommends \
         libpango-1.0-0 \
         libpangoft2-1.0-0 \
@@ -107,6 +117,11 @@ ENV PYTHONUNBUFFERED=1 \
 RUN useradd --create-home --shell /usr/sbin/nologin app
 
 WORKDIR /app
+
+# pip/setuptools/wheel из базового образа несут собственные CVE
+# (CVE-2024-6345, CVE-2025-47273 и advisory по wheel) независимо от версии
+# Python — подтягиваем свежие до установки зависимостей проекта.
+RUN pip install --no-cache-dir -U pip setuptools wheel
 
 # Зависимости отдельным слоем: правка кода не пересобирает pip install.
 COPY requirements.txt ./
