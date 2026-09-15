@@ -196,13 +196,17 @@ def invalidate_deactivated(user_id: int) -> None:
 
 
 def _has_role(user_id: int, *roles: str) -> bool:
-    """Админ из ADMIN_IDS всегда True. Иначе — сверка с БД через кэш.
+    """Админ из ADMIN_IDS — True, если его не деактивировали. Иначе — сверка
+    с БД через кэш.
+
+    Деактивация (#32) снимает ВСЕ права, и у админа из env тоже: раньше
+    `/deactivate` на него ничего не делал — кнопки бота продолжали работать.
 
     Замечание: 'guest' никогда не входит в список разрешённых ролей
     (это нулевые права по дизайну) — _has_role вернёт False для гостей.
     """
     if user_id in ADMIN_IDS:
-        return True
+        return not cached_is_deactivated(user_id)
     return role_allowed(_cached_role(user_id), roles)
 
 
@@ -210,7 +214,7 @@ def is_guest(user_id: int) -> bool:
     """Пользователь без прав. Используется в /start чтобы показать
     «обратитесь к админу» вместо обычного welcome."""
     if user_id in ADMIN_IDS:
-        return False
+        return cached_is_deactivated(user_id)
     return _cached_role(user_id) == "guest"
 
 

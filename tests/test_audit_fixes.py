@@ -257,3 +257,30 @@ def test_deact_cache_invalidated_on_deactivate_same_process(isolated_db):
     # Реактивация так же мгновенно снимает блок.
     assert asyncio.run(db.reactivate_user(300, by=1)) is True
     assert roles.cached_is_deactivated(300) is False
+
+
+def test_deactivated_env_admin_loses_rights(isolated_db, monkeypatch):
+    """Админ из ADMIN_IDS после /deactivate — без прав, как любой другой
+    (раньше _has_role отвечал True по одному списку из env)."""
+    import services.roles as roles
+
+    db = isolated_db
+    monkeypatch.setattr(roles, "ADMIN_IDS", [7001])
+    db.set_role(7001, "env_admin", "Env Admin", "admin")
+    roles.invalidate_all_roles()
+    assert roles.is_admin(7001) and roles.can_confirm_payment(7001)
+    assert roles.is_guest(7001) is False
+
+    assert asyncio.run(db.deactivate_user(7001, by=1)) is True
+    roles.invalidate_all_roles()
+    assert roles.is_admin(7001) is False
+    assert roles.is_boss(7001) is False
+    assert roles.can_confirm_deposit(7001) is False
+    assert roles.is_guest(7001) is True
+
+    assert asyncio.run(db.reactivate_user(7001, by=1)) is True
+    roles.invalidate_all_roles()
+    assert roles.is_admin(7001) is True
+    # Админ из env без строки в user_roles по-прежнему админ.
+    monkeypatch.setattr(roles, "ADMIN_IDS", [7002])
+    assert roles.is_admin(7002) is True and roles.is_guest(7002) is False
