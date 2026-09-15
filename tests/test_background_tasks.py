@@ -52,3 +52,28 @@ def test_spawn_success_no_error_log(caplog):
     assert task.result() == 42
     assert not any("good" in r.getMessage() for r in caplog.records)  # успех не логируем
     assert task not in background.pending()
+
+
+def test_webapp_shutdown_waits_for_background_tasks(isolated_db):
+    """Остановка WebApp дожидается фоновых задач (PDF после одобрения).
+
+    Хук висел на `@app.on_event("shutdown")`; Starlette 1.0 события убрал, и
+    хук переехал в `lifespan`. Тест гоняет именно тот lifespan, который отдаст
+    uvicorn, — забудь передать `lifespan=` в FastAPI, и задача оборвётся.
+    """
+    import webapp.server as server
+    from utils import background
+
+    finished: list[str] = []
+
+    async def _run():
+        async def slow_pdf():
+            await asyncio.sleep(0.05)
+            finished.append("pdf")
+
+        async with server.app.router.lifespan_context(server.app):
+            background.spawn(slow_pdf(), "slow-pdf")
+        # Выход из lifespan — это и есть остановка процесса.
+        return list(finished)
+
+    assert asyncio.run(_run()) == ["pdf"]

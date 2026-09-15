@@ -232,7 +232,37 @@ if _dev_bypass_user() is not None:
         "отладка). НЕ для прода: при DATABASE_URL обход сам себя глушит."
     )
 
-app = FastAPI(title="Склад WebApp")
+
+async def _drain_background_tasks() -> None:
+    """Дождаться фоновых задач (печатная форма после одобрения) перед остановкой.
+
+    Рестарт при деплое не должен терять PDF, который уже обещан менеджеру;
+    ждём ограниченно — зависшая задача не имеет права держать процесс.
+    """
+    from utils.background import pending
+
+    left = pending()
+    if not left:
+        return
+    logger.info("Останавливаемся: ждём %d фоновых задач", len(left))
+    try:
+        await asyncio.wait_for(asyncio.gather(*left, return_exceptions=True), timeout=20)
+    except TimeoutError:
+        logger.warning("Фоновые задачи не завершились за 20 с — выходим без них")
+
+
+@asynccontextmanager
+async def _lifespan(_app):
+    """Жизненный цикл приложения: на остановке — дождаться фоновых задач.
+
+    Раньше это был `@app.on_event("shutdown")`; Starlette 1.0 убрал события,
+    а FastAPI держит их только как deprecated-обёртку — lifespan штатный путь.
+    """
+    yield
+    await _drain_background_tasks()
+
+
+app = FastAPI(title="Склад WebApp", lifespan=_lifespan)
 
 
 @app.exception_handler(Exception)
@@ -250,24 +280,6 @@ async def _unhandled_exception(request: Request, exc: Exception):
     )
     return JSONResponse({"detail": error_alerts.USER_MESSAGE}, status_code=500)
 
-
-@app.on_event("shutdown")
-async def _drain_background_tasks() -> None:
-    """Дождаться фоновых задач (печатная форма после одобрения) перед остановкой.
-
-    Рестарт при деплое не должен терять PDF, который уже обещан менеджеру;
-    ждём ограниченно — зависшая задача не имеет права держать процесс.
-    """
-    from utils.background import pending
-
-    left = pending()
-    if not left:
-        return
-    logger.info("Останавливаемся: ждём %d фоновых задач", len(left))
-    try:
-        await asyncio.wait_for(asyncio.gather(*left, return_exceptions=True), timeout=20)
-    except TimeoutError:
-        logger.warning("Фоновые задачи не завершились за 20 с — выходим без них")
 
 # Gzip: статика (app.js ~141KB, style.css ~59KB) и крупные JSON-ответы
 # (/api/orders, /api/stock, /api/analytics) отдавались несжатыми — заметно на
