@@ -147,11 +147,13 @@ def test_goods_received_marks_flag(rclient):
     assert row["goods_received"] == 1
 
 
-def test_goods_received_forbidden_for_manager(rclient):
+def test_goods_received_forbidden_for_guest(rclient):
+    # Было «для менеджера»: пока он замещает кладовщика (ROLE_ALSO_ACTS_AS),
+    # ручка ему отвечает — отказ проверяем на госте.
     client, db, ids, mk = rclient
     rid = mk("pending")
     r = client.post(
-        "/api/returns/goods_received", json={"initData": str(ids["mgr"]), "return_id": rid}
+        "/api/returns/goods_received", json={"initData": "999", "return_id": rid}
     )
     assert r.status_code == 403
 

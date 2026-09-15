@@ -19,7 +19,7 @@ from aiogram.types import CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services import async_db as adb
-from services.roles import can_confirm_return, is_warehouse_keeper
+from services.roles import can_confirm_return, can_mark_return_goods_received, notify_recipients
 from utils.formatters import DIV
 from handlers._ui import replace_keyboard, webapp_keyboard
 from utils.helpers import esc
@@ -57,7 +57,9 @@ def _confirm_keyboard(return_id: int, *, goods_received: bool = False):
 
 async def _notify_confirmers(bot: Bot, return_id, order_id, total, refund):
     users = await adb.get_all_users()
-    recipients = [u["user_id"] for u in users if u["role"] in ("admin", "boss", "warehouse_keeper")]
+    # Пока кладовщика нет, приёмку возврата делает менеджер (совмещение ролей,
+    # services.roles.ROLE_ALSO_ACTS_AS) — без карточки он о возврате не узнает.
+    recipients = notify_recipients(users, ("admin", "boss", "warehouse_keeper"))
     text = (
         f"{DIV}\n↩️ <b>Возврат #{return_id}</b> · заказ #{order_id}\n"
         f"💰 {_fmt(total)} USD · {_REFUND_LABELS.get(refund, refund)}"
@@ -73,7 +75,7 @@ async def _notify_confirmers(bot: Bot, return_id, order_id, total, refund):
 
 @router.callback_query(F.data.startswith("ret_got:"))
 async def cb_return_goods_received(call: CallbackQuery):
-    if not is_warehouse_keeper(call.from_user.id) and not can_confirm_return(call.from_user.id):
+    if not can_mark_return_goods_received(call.from_user.id):
         return await call.answer("⛔ Нет доступа", show_alert=True)
     return_id = int(call.data.split(":")[1])
     res = await adb.mark_return_goods_received(return_id, call.from_user.id)

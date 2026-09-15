@@ -82,7 +82,11 @@ def can_transition(order: dict, new_status: str, role: str) -> bool:
     if new_status not in TRANSITIONS.get(current, []):
         return False
     key = f"{current}→{new_status}"
-    return key in _ROLE_TRANSITIONS.get(role, set())
+    # Совмещение ролей (менеджер пока замещает кладовщика и бухгалтера) —
+    # рёбра замещаемых ролей добавляются к своим.
+    from services.roles import effective_roles
+
+    return any(key in _ROLE_TRANSITIONS.get(r, set()) for r in effective_roles(role))
 
 
 def validate_transition(order: dict, new_status: str) -> str | None:

@@ -119,13 +119,16 @@ async def gather(user_id: int, role: str) -> list[dict]:
             logger.warning("work_queue: счётчики руководителя не посчитаны", exc_info=True)
     else:
         # Бухгалтер подтверждает сдачи, кладовщик — возвраты. Показываем каждому
-        # ровно то, что он может закрыть.
+        # ровно то, что он может закрыть. role_allowed — потому что менеджер
+        # пока замещает обоих (services.roles.ROLE_ALSO_ACTS_AS).
+        from services.roles import role_allowed
+
         try:
             counts = await count_boss_attention()
-            if role == "bookkeeper":
+            if role_allowed(role, ("bookkeeper",)):
                 add("deposits", counts["deposits"], "Сдачи наличных",
                     "ждут вашего подтверждения", "warn", "money:confirm")
-            if role == "warehouse_keeper":
+            if role_allowed(role, ("warehouse_keeper",)):
                 add("returns", counts["returns"], "Возвраты на подтверждение",
                     "ждут вашего решения", "warn", "money:confirm")
         except Exception:

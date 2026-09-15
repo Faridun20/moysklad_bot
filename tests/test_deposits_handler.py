@@ -83,16 +83,22 @@ def test_cb_confirm_closes_order_and_notifies_manager(isolated_db):
     assert any(chat == 1 and "подтверждена" in text for chat, text, _ in bot.sent)
 
 
-def test_cb_confirm_denied_for_manager(isolated_db):
+def test_cb_confirm_denied_for_guest_allowed_for_manager(isolated_db):
+    """Гость не подтверждает. Менеджер — пока да: он замещает бухгалтера
+    (services.roles.ROLE_ALSO_ACTS_AS); до совмещения здесь был отказ ему."""
     db = isolated_db
     from handlers.deposits import cb_deposit_confirm
 
     _setup(db)
     res = asyncio.run(db.create_cash_deposit(1, 250.0))
     bot = _FakeBot()
-    call = _FakeCall(f"dep_ok:{res['deposit_id']}", uid=1, bot=bot)  # менеджер не вправе
+    call = _FakeCall(f"dep_ok:{res['deposit_id']}", uid=999, bot=bot)  # гость не вправе
     asyncio.run(cb_deposit_confirm(call, bot))
 
     assert any("доступа" in (a[0] or "").lower() for a in call.alerts)
     deps = asyncio.run(db.get_manager_cash_deposits(1))
     assert deps[0]["status"] == "pending"  # не подтверждено
+
+    call = _FakeCall(f"dep_ok:{res['deposit_id']}", uid=1, bot=bot)
+    asyncio.run(cb_deposit_confirm(call, bot))
+    assert asyncio.run(db.get_manager_cash_deposits(1))[0]["status"] == "confirmed"

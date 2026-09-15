@@ -142,16 +142,25 @@ async def set_commands_for_user(bot: Bot, chat_id: int, role: str) -> None:
     эти команды у клиента — после /start пользователь сразу увидит
     свой набор в автокомплите.
     """
-    if role == "admin":
-        commands = _COMMANDS_ADMIN
-    elif role == "boss":
-        commands = _COMMANDS_BOSS
-    elif role == "manager":
-        commands = _COMMANDS_MANAGER
-    elif role == "warehouse_keeper":
-        commands = _COMMANDS_WAREHOUSE
-    elif role == "bookkeeper":
-        commands = _COMMANDS_BOOKKEEPER
+    by_role = {
+        "admin": _COMMANDS_ADMIN,
+        "boss": _COMMANDS_BOSS,
+        "manager": _COMMANDS_MANAGER,
+        "warehouse_keeper": _COMMANDS_WAREHOUSE,
+        "bookkeeper": _COMMANDS_BOOKKEEPER,
+    }
+    if role in by_role:
+        # Совмещение ролей: менеджеру пока достаются и команды кладовщика
+        # (/ship) — services.roles.ROLE_ALSO_ACTS_AS. Дубли по имени команды
+        # выкидываем: Telegram отвергает список с повтором целиком.
+        from services.roles import effective_roles
+
+        commands, seen = [], set()
+        for r in effective_roles(role):
+            for c in by_role.get(r, []):
+                if c.command not in seen:
+                    seen.add(c.command)
+                    commands.append(c)
     else:
         commands = [BotCommand(command="start", description="🏠 Активировать аккаунт")]
     try:
@@ -182,7 +191,10 @@ def get_welcome_text(role: str, first_name: str = "") -> str:
     hints = {
         "admin": "Полный доступ. Управление пользователями и аудит — кнопками ниже.",
         "boss": "Заявки на одобрение и подтверждение платежей — приходят push'ами.",
-        "manager": "Создавайте заказы и отмечайте оплаты — всё в WebApp.",
+        "manager": (
+            "Создавайте заказы и отмечайте оплаты — всё в WebApp. "
+            "Отгрузка — /ship; сдачи и приёмку возвратов подтверждайте кнопкой в уведомлении."
+        ),
         "warehouse_keeper": "Отгрузка — /ship; приёмку возврата подтверждайте кнопкой в уведомлении.",
         "bookkeeper": "Сдачи налички подтверждайте кнопкой прямо в уведомлении.",
     }

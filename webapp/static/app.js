@@ -476,7 +476,7 @@ function sectionTabsFor(section) {
   if (section === 'money') {
     return moneyTabs({
       isBoss: boss,
-      isConfirmer: ['admin', 'boss', 'bookkeeper', 'warehouse_keeper'].includes(r),
+      isConfirmer: roleIn(r, ['admin', 'boss', 'bookkeeper', 'warehouse_keeper']),
       canSeeDebts: ['admin', 'boss', 'manager'].includes(r),
       // Касса — сдачи наличных, их создают менеджеры: /api/deposits/my и
       // /create кладовщику не отвечают, и вкладка у него возвращала 403.
@@ -3323,7 +3323,8 @@ function renderOrdersMain() {
   const content = document.getElementById('content');
   const { orders, role } = ordersData;
   const isBoss = role === 'admin' || role === 'boss';
-  const canShip = isBoss || role === 'warehouse_keeper';
+  // roleIn: менеджер пока отгружает за кладовщика (ROLE_ALSO_ACTS_AS).
+  const canShip = isBoss || roleIn(role, ['warehouse_keeper']);
   // «Новый заказ» — только менеджеру. Было `!isBoss`, то есть и кладовщику с
   // бухгалтером, а /api/orders/create им отвечает 403 (can_create_orders:
   // admin/boss/manager). Руководству кнопку не рисуем и раньше: заказы
@@ -5714,7 +5715,7 @@ async function renderMoneyScreen() {
   const content = document.getElementById('content');
   const r = role();
   const boss = isBossRole();
-  const isConfirmer = ['admin', 'boss', 'bookkeeper', 'warehouse_keeper'].includes(r);
+  const isConfirmer = roleIn(r, ['admin', 'boss', 'bookkeeper', 'warehouse_keeper']);
 
   // Миграция старых/внешних ключей вкладок на текущий набор.
   if (['payments', 'cashbox', 'my'].includes(moneyTab)) moneyTab = isConfirmer ? 'confirm' : 'ops';

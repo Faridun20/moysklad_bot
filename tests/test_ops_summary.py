@@ -105,8 +105,13 @@ def test_build_daily_ping_role_scoping():
     wh = build_daily_ping("warehouse_keeper", s)
     assert wh is not None and "Возвраты" in wh
     assert "Сдачи" not in wh and "Зависшие" not in wh
-    # manager сводку не получает вовсе
-    assert build_daily_ping("manager", s) is None
+    # manager своих секций не имеет, но пока замещает кладовщика и бухгалтера
+    # (services.roles.ROLE_ALSO_ACTS_AS) — получает их секции, не руководские.
+    mgr = build_daily_ping("manager", s)
+    assert mgr is not None and "Сдачи" in mgr and "Возвраты" in mgr
+    assert "Зависшие" not in mgr
+    # guest — ничего
+    assert build_daily_ping("guest", s) is None
 
 
 def test_build_ping_keyboard():

@@ -49,6 +49,20 @@
     return String(v).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
   }
 
+  // ВРЕМЕННОЕ совмещение ролей — зеркало services/roles.py (ROLE_ALSO_ACTS_AS;
+  // расхождение ловит tests/test_roles_manager_acts_as.py). Кладовщика и
+  // бухгалтера в штате пока нет, их работу делает менеджер, поэтому кнопки и
+  // вкладки этих ролей рисуются и ему — сервер пускает его в те же ручки.
+  // Откат — пустой объект здесь и в services/roles.py.
+  const ROLE_ALSO_ACTS_AS = { manager: ['warehouse_keeper', 'bookkeeper'] };
+
+  // Входит ли роль (с учётом совмещения) в список. Проверки «кладовщик/
+  // бухгалтер» во фронте идут через неё, а не через `includes(role)`.
+  function roleIn(role, roles) {
+    const all = [role].concat(ROLE_ALSO_ACTS_AS[role] || []);
+    return all.some((r) => (roles || []).indexOf(r) !== -1);
+  }
+
   // Парсинг строк мульти-валютной формы платежа в payload для /api/payments/send.
   // Чистая функция (тестируется): принимает [{amount, currency}] как ввёл юзер
   // (amount — строка/число), возвращает {items:[{amount:Number, currency}]} или
@@ -674,6 +688,7 @@
 
   return {
     escapeHtml, idemKey, formatDateRU, icon, opsAmount, plural,
+    ROLE_ALSO_ACTS_AS, roleIn,
     parsePaymentItems, renderMoneyTotalsHtml, categoryTree, categoryMatches,
     NAV_SECTIONS, navSections, defaultSection, sectionNavHtml,
     salesTabs, stockTabs, moneyTabs, clientsTabs,

@@ -85,12 +85,29 @@ def test_deposit_reject_requires_reason(client_env):
     assert resp.status_code == 400
 
 
-def test_deposit_confirm_forbidden_for_manager(client_env):
+def test_deposit_confirm_allowed_for_manager_acting_as_bookkeeper(client_env):
+    """Пока бухгалтера нет, сдачи подтверждает менеджер (services.roles.
+    ROLE_ALSO_ACTS_AS). Раньше здесь был 403 — при откате совмещения тест
+    возвращается к нему."""
+    client, db, ids, _ = client_env
+    dep = asyncio.run(db.create_cash_deposit(ids["mgr"], 250.0))
+    resp = client.post("/api/deposits/pending", json={"initData": str(ids["mgr"])})
+    assert resp.status_code == 200, resp.text
+    assert any(d["id"] == dep["deposit_id"] for d in resp.json()["deposits"])
+    resp = client.post(
+        "/api/deposits/confirm",
+        json={"initData": str(ids["mgr"]), "deposit_id": dep["deposit_id"]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert asyncio.run(db.get_order(ids["order"]))["status"] == "paid"
+
+
+def test_deposit_confirm_forbidden_for_guest(client_env):
     client, db, ids, _ = client_env
     dep = asyncio.run(db.create_cash_deposit(ids["mgr"], 250.0))
     resp = client.post(
         "/api/deposits/confirm",
-        json={"initData": str(ids["mgr"]), "deposit_id": dep["deposit_id"]},
+        json={"initData": "999", "deposit_id": dep["deposit_id"]},
     )
     assert resp.status_code == 403
 
@@ -169,6 +186,30 @@ def test_returns_pending_and_confirm(client_env):
     )
     assert resp.status_code == 200, resp.text
     assert asyncio.run(db.get_order(ids["order"]))["status"] == "returned"
+
+
+def test_manager_receives_return_goods_but_boss_confirms(client_env):
+    """Совмещение ролей: менеджер отмечает «товар получен» за кладовщика, но
+    подтверждение возврата (деньги/долг) остаётся руководству."""
+    client, db, ids, _ = client_env
+    items = asyncio.run(db.get_order_items(ids["order"]))
+    r = asyncio.run(
+        db.create_return(
+            ids["order"], "full", "брак", [(items[0]["id"], 1, 250.0)],
+            refund_method="no_refund", created_by=ids["mgr"],
+        )
+    )
+    mgr = str(ids["mgr"])
+    resp = client.post("/api/returns/pending", json={"initData": mgr})
+    assert resp.status_code == 200, resp.text
+    assert any(x["id"] == r["return_id"] for x in resp.json()["returns"])
+    resp = client.post(
+        "/api/returns/goods_received", json={"initData": mgr, "return_id": r["return_id"]}
+    )
+    assert resp.status_code == 200, resp.text
+    assert asyncio.run(db.get_return(r["return_id"]))["goods_received"]
+    resp = client.post("/api/returns/confirm", json={"initData": mgr, "return_id": r["return_id"]})
+    assert resp.status_code == 403
 
 
 def test_return_create_full(client_env):

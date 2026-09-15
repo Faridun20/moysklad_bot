@@ -26,6 +26,9 @@
 _Всего эндпоинтов: 126._
 
 
+> **Временное совмещение ролей** (`services/roles.py::ROLE_ALSO_ACTS_AS`): `manager` = + `warehouse_keeper`, `bookkeeper`. Кладовщика и бухгалтера в штате пока нет, их работу делает менеджер; списки ниже уже учитывают это. Роли `warehouse_keeper`/`bookkeeper` через `/addrole` не назначаются. `*` в таблице экранов — доступ через совмещение.
+
+
 ### Админ (`admin`) — 120 эндпоинтов
 
 <details><summary>Показать список</summary>
@@ -279,7 +282,7 @@ _Всего эндпоинтов: 126._
 </details>
 
 
-### Менеджер (`manager`) — 65 эндпоинтов
+### Менеджер (`manager`) — 72 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -299,8 +302,11 @@ _Всего эндпоинтов: 126._
 - `/api/containers/update`
 - `/api/currency/rates`
 - `/api/debts`
+- `/api/deposits/confirm`
 - `/api/deposits/create`
 - `/api/deposits/my`
+- `/api/deposits/pending`
+- `/api/deposits/reject`
 - `/api/docs/create`
 - `/api/docs/list`
 - `/api/docs/print`
@@ -330,12 +336,16 @@ _Всего эндпоинтов: 126._
 - `/api/orders/mark_paid`
 - `/api/orders/remove_item`
 - `/api/orders/set_agent`
+- `/api/orders/ship`
 - `/api/orders/submit`
 - `/api/payments/send`
+- `/api/payments/unlinked`
 - `/api/products/photo`
 - `/api/products/photos`
 - `/api/products/search`
 - `/api/returns/create`
+- `/api/returns/goods_received`
+- `/api/returns/pending`
 - `/api/returns/positions`
 - `/api/search`
 - `/api/stock`
@@ -352,7 +362,7 @@ _Всего эндпоинтов: 126._
 </details>
 
 
-### Кладовщик (`warehouse_keeper`) — 7 эндпоинтов
+### Кладовщик (сейчас не назначается) (`warehouse_keeper`) — 7 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -367,7 +377,7 @@ _Всего эндпоинтов: 126._
 </details>
 
 
-### Бухгалтер (`bookkeeper`) — 6 эндпоинтов
+### Бухгалтер (сейчас не назначается) (`bookkeeper`) — 6 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -406,14 +416,15 @@ _Всего эндпоинтов: 126._
 | Заявки на апрув | admin, boss | `/api/orders/requests` |
 | Редактор заказа | admin, boss, manager | `/api/orders/create` |
 | Каталог/Склад | admin, boss, manager, warehouse_keeper | `/api/stock` |
-| Финансы → Касса | admin, boss, bookkeeper | `/api/deposits/pending` |
+| Деньги → Подтвердить | admin, boss, bookkeeper, manager* | `/api/deposits/pending` |
 | Финансы → Долги | admin, boss, manager | `/api/debts` |
 | Финансы → Клиенты | admin, boss | `/api/clients/overview` |
 | Курсы валют | admin, boss (правка) | `/api/currency/rates` |
 | Аналитика | admin, boss, manager | `/api/analytics` |
 | Деньги (лента) | admin, boss | `/api/money/summary` |
 | Операционная сводка | admin, boss | `/api/ops-summary` |
-| Возвраты (приёмка) | admin, boss, warehouse_keeper | `/api/returns/pending` |
+| Возвраты (приёмка) | admin, boss, warehouse_keeper, manager* | `/api/returns/pending` |
+| Заказы → «Отгрузить» | admin, boss, warehouse_keeper, manager* | `/api/orders/ship` |
 | Заказы → Техника | admin, boss, manager | `/api/machines/list` |
 | Техника → карточка | admin, boss, manager | `/api/machines/card` |
 | Техника → сделки | admin, boss | `/api/machines/deal` |

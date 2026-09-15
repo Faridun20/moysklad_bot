@@ -11,20 +11,22 @@
 
 from __future__ import annotations
 
+import ast
 import collections
 import pathlib
 import re
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SERVER = ROOT / "webapp" / "server.py"
+ROLES = ROOT / "services" / "roles.py"
 OUT = ROOT / "UI_QA_ROLES.md"
 
 ROLE_TITLES = {
     "admin": "Админ",
     "boss": "Руководитель",
     "manager": "Менеджер",
-    "warehouse_keeper": "Кладовщик",
-    "bookkeeper": "Бухгалтер",
+    "warehouse_keeper": "Кладовщик (сейчас не назначается)",
+    "bookkeeper": "Бухгалтер (сейчас не назначается)",
 }
 
 ANY_ROLE = "любая активная роль"
@@ -38,14 +40,15 @@ SCREEN_MAP = [
     ("Заявки на апрув", "admin, boss", "/api/orders/requests"),
     ("Редактор заказа", "admin, boss, manager", "/api/orders/create"),
     ("Каталог/Склад", "admin, boss, manager, warehouse_keeper", "/api/stock"),
-    ("Финансы → Касса", "admin, boss, bookkeeper", "/api/deposits/pending"),
+    ("Деньги → Подтвердить", "admin, boss, bookkeeper, manager*", "/api/deposits/pending"),
     ("Финансы → Долги", "admin, boss, manager", "/api/debts"),
     ("Финансы → Клиенты", "admin, boss", "/api/clients/overview"),
     ("Курсы валют", "admin, boss (правка)", "/api/currency/rates"),
     ("Аналитика", "admin, boss, manager", "/api/analytics"),
     ("Деньги (лента)", "admin, boss", "/api/money/summary"),
     ("Операционная сводка", "admin, boss", "/api/ops-summary"),
-    ("Возвраты (приёмка)", "admin, boss, warehouse_keeper", "/api/returns/pending"),
+    ("Возвраты (приёмка)", "admin, boss, warehouse_keeper, manager*", "/api/returns/pending"),
+    ("Заказы → «Отгрузить»", "admin, boss, warehouse_keeper, manager*", "/api/orders/ship"),
     ("Заказы → Техника", "admin, boss, manager", "/api/machines/list"),
     ("Техника → карточка", "admin, boss, manager", "/api/machines/card"),
     ("Техника → сделки", "admin, boss", "/api/machines/deal"),
@@ -81,6 +84,16 @@ HEADER = """# QA-чеклист WebApp по ролям (UI-WP-33)
 """
 
 
+def parse_acts_as(src: str) -> dict[str, list[str]]:
+    """`ROLE_ALSO_ACTS_AS` из services/roles.py — через AST, без импорта модуля:
+    импорт тянет config и БД, а генератору нужен только литерал."""
+    for node in ast.parse(src).body:
+        target = getattr(node, "target", None) or (getattr(node, "targets", None) or [None])[0]
+        if isinstance(target, ast.Name) and target.id == "ROLE_ALSO_ACTS_AS" and node.value:
+            return {k: list(v) for k, v in ast.literal_eval(node.value).items()}
+    return {}
+
+
 def parse_routes(src: str) -> list[tuple[str, list[str]]]:
     """[(путь, роли)] в порядке объявления в server.py."""
     marks = [(m.start(), m.group(1)) for m in re.finditer(r'@app\.(?:get|post)\("([^"]+)"', src)]
@@ -105,13 +118,30 @@ def parse_routes(src: str) -> list[tuple[str, list[str]]]:
     return rows
 
 
-def render(rows: list[tuple[str, list[str]]]) -> str:
+def render(rows: list[tuple[str, list[str]]], acts_as: dict[str, list[str]] | None = None) -> str:
+    acts_as = acts_as or {}
     by_role: dict[str, list[str]] = collections.defaultdict(list)
     for path, roles in rows:
         for role in roles:
             by_role[role].append(path)
+        # Совмещение ролей: замещающий получает ручки замещаемых — ровно как
+        # `role_allowed` в `_authorize`. Иначе чеклист соврал бы менеджеру.
+        for role, extra in acts_as.items():
+            if role not in roles and any(r in roles for r in extra):
+                by_role[role].append(path)
 
     out = [HEADER, f"\n## Доступ по ролям\n\n_Всего эндпоинтов: {len(rows)}._\n"]
+    if acts_as:
+        pairs = "; ".join(
+            f"`{role}` = + " + ", ".join(f"`{r}`" for r in extra) for role, extra in acts_as.items()
+        )
+        out.append(
+            "\n> **Временное совмещение ролей** (`services/roles.py::ROLE_ALSO_ACTS_AS`): "
+            f"{pairs}. Кладовщика и бухгалтера в штате пока нет, их работу делает "
+            "менеджер; списки ниже уже учитывают это. Роли `warehouse_keeper`/"
+            "`bookkeeper` через `/addrole` не назначаются. `*` в таблице экранов — "
+            "доступ через совмещение.\n"
+        )
     for role, title in ROLE_TITLES.items():
         paths = sorted(by_role.get(role, []))
         out.append(f"\n### {title} (`{role}`) — {len(paths)} эндпоинтов\n")
@@ -141,7 +171,7 @@ def main() -> int:
     if not rows:
         print("не нашёл ни одного @app.get/post — формат server.py изменился?")
         return 1
-    OUT.write_text(render(rows), encoding="utf-8")
+    OUT.write_text(render(rows, parse_acts_as(ROLES.read_text(encoding="utf-8"))), encoding="utf-8")
     print(f"{OUT.name}: {len(rows)} эндпоинтов")
     return 0
 
