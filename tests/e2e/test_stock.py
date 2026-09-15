@@ -14,6 +14,17 @@ def _stock(e2e) -> float:
     return e2e.rows("SELECT quantity FROM stock WHERE product_id = ?", (e2e.ids["product"],))[0]["quantity"]
 
 
+def _add_position(page, product_id: int) -> None:
+    """«Добавить позицию» сразу открывает выбор товара — сама строка товар не
+    подставляет (первый из справочника легко было провести вместо нужного)."""
+    page.click("#wh-add")
+    page.wait_for_selector(f'.picker-list [data-pick="{product_id}"]')
+    page.click(f'.picker-list [data-pick="{product_id}"]')
+    page.click("#ms-submit")
+    page.wait_for_selector(".c-overlay", state="detached")
+    page.wait_for_selector('.wh-pos [data-f="quantity"]')
+
+
 # ─── Накладная руками: приход и отмена ───────────────────────────────────────
 
 
@@ -25,8 +36,7 @@ def test_boss_posts_incoming_invoice_and_cancels_it(open_app, e2e):
     boss.wait_for_selector('[data-whtype="incoming"]')
     boss.click('[data-whtype="incoming"]')
     boss.wait_for_selector('[data-whtype="incoming"].active')
-    boss.click("#wh-add")
-    boss.wait_for_selector('.wh-pos [data-f="quantity"]')
+    _add_position(boss, e2e.ids["product"])
     boss.fill('.wh-pos [data-f="quantity"]', "5")
     boss.fill("#wh-comment", "Довоз со склада поставщика")
     boss.click("#wh-save")
@@ -59,8 +69,7 @@ def test_incoming_invoice_form_rejects_zero_quantity(open_app, e2e):
     boss.click('[data-whtype="incoming"]')
     boss.wait_for_selector('[data-whtype="incoming"].active')
     assert boss.locator("#wh-save").is_disabled(), "без позиций сохранять нечего"
-    boss.click("#wh-add")
-    boss.wait_for_selector('.wh-pos [data-f="quantity"]')
+    _add_position(boss, e2e.ids["product"])
     assert boss.locator("#wh-save").is_enabled(), "приход с одной позицией ×1 — валиден"
     boss.fill('.wh-pos [data-f="quantity"]', "0")
     boss.locator('.wh-pos [data-f="quantity"]').dispatch_event("change")
@@ -155,11 +164,13 @@ def test_product_in_position_is_picked_from_a_searchable_list(open_app, e2e):
     tab(boss, "invoices")
     boss.click("#wh-new")
     boss.wait_for_selector("#wh-add")
+    # Лист выбора открывается сам, и пока товар не выбран, строка не
+    # притворяется заполненной первым товаром справочника.
     boss.click("#wh-add")
-    boss.wait_for_selector("[data-pick-product]")
-    assert boss.locator('.wh-pos select[data-f="product_id"]').count() == 0
-    boss.click("[data-pick-product]")
     boss.wait_for_selector(".picker-list [data-pick]")
+    assert boss.locator('.wh-pos select[data-f="product_id"]').count() == 0
+    assert "Выберите товар" in boss.locator("[data-pick-product]").inner_text()
+    assert boss.locator("#wh-save").is_disabled()
     name = boss.locator(".picker-list [data-pick] .card-row-title").first.inner_text().strip()
     boss.locator(".picker-list [data-pick]").first.click()
     boss.click("#ms-submit")
@@ -202,8 +213,7 @@ def test_outgoing_invoice_requires_counterparty_and_price(open_app, e2e):
     boss.wait_for_selector('[data-whtype="outgoing"]')
     boss.click('[data-whtype="outgoing"]')
     boss.wait_for_selector('[data-whtype="outgoing"].active')
-    boss.click("#wh-add")
-    boss.wait_for_selector('.wh-pos [data-f="price"]')
+    _add_position(boss, e2e.ids["product"])
     assert boss.locator("#wh-save").is_disabled(), "нет контрагента и цены"
     _pick_counterparty(boss)
     assert boss.locator("#wh-save").is_disabled(), "цена по-прежнему не задана"

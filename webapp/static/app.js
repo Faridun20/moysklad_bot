@@ -7189,6 +7189,23 @@ let whDraft = null;             // черновик формы (живёт ме�
 let whCounterparties = [];      // справочник, тянем один раз на сессию экрана
 let whStockCache = [];          // остатки для подстановки в позиции
 
+// Черновик накладной переживает закрытие приложения (formDrafts): накладную на
+// двадцать позиций набирают долго, а подпись Telegram живёт час — на 401 или
+// случайном свайпе всё набранное пропадало. Ключ идемпотентности едет вместе с
+// черновиком: если «Сохранить» ушло, а ответ потерялся, повтор после
+// переоткрытия не проведёт вторую накладную.
+const WH_DRAFT = 'wh-invoice';
+function saveWhDraft() {
+  if (whDraft) formDrafts().save(WH_DRAFT, whDraft);
+}
+function dropWhDraft() {
+  whDraft = null;
+  formDrafts().clear(WH_DRAFT);
+}
+function whDraftHasData(d) {
+  return !!(d && ((d.items && d.items.length) || d.counterparty_id || d.comment));
+}
+
 function whIsBoss() {
   return currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
 }
@@ -7223,8 +7240,11 @@ async function renderWhInvoiceList() {
   const rows = data.invoices || [];
 
   // Кнопка создания — над списком: это главное действие вкладки.
+  // Недописанная накладная (в том числе с прошлого открытия приложения) —
+  // кнопка говорит об этом прямо, иначе человек не узнает, что набранное цело.
+  const pending = whDraftHasData(whDraft || formDrafts().load(WH_DRAFT));
   const newBtn = `<div class="form-row">
-      <button class="btn-primary" id="wh-new">${icon('plus')} Новая накладная</button>
+      <button class="btn-primary" id="wh-new">${icon(pending ? 'edit' : 'plus')} ${pending ? 'Продолжить черновик накладной' : 'Новая накладная'}</button>
     </div>`;
   const wireNew = () => {
     const b = document.getElementById('wh-new');
@@ -7546,7 +7566,12 @@ function wireHandwrittenDocFields(meta) {
 
 async function renderWhInvoiceNew() {
   const content = document.getElementById('content');
-  if (!whDraft) whDraft = { type: 'outgoing', counterparty_id: '', items: [], comment: '' };
+  if (!whDraft) {
+    const saved = formDrafts().load(WH_DRAFT);
+    whDraft = (saved && Array.isArray(saved.items))
+      ? saved
+      : { type: 'outgoing', counterparty_id: '', items: [], comment: '' };
+  }
   // Форма — вложенный вид вкладки: «Назад» возвращает в список, черновик
   // при этом остаётся (whDraft живёт между перерисовками).
   showBack(() => { whView = 'list'; renderWhInvoicesTab(); });
@@ -7554,11 +7579,20 @@ async function renderWhInvoiceNew() {
   wireSectionNav(content, 'stock', renderStockScreen);
   const gen = screenGen();
 
-  // Справочники параллельно: без них форма бесполезна.
-  const [stock, cps] = await Promise.all([
-    api('/api/wh/stock', {}),
-    whCounterparties.length ? { counterparties: whCounterparties } : api('/api/wh/counterparties', {}),
-  ]);
+  // Справочники параллельно: без них форма бесполезна. Без сети — ошибка с
+  // «Повторить» (черновик при этом цел), а не вечная «Загружаю справочники…».
+  let stock, cps;
+  try {
+    [stock, cps] = await Promise.all([
+      api('/api/wh/stock', {}),
+      whCounterparties.length ? { counterparties: whCounterparties } : api('/api/wh/counterparties', {}),
+    ]);
+  } catch (e) {
+    if (gen !== screenGen()) return;
+    content.innerHTML = stockShellHtml() + errorBox(e.message);
+    wireSectionNav(content, 'stock', renderStockScreen);
+    return;
+  }
   whCounterparties = cps.counterparties || [];
   whStockCache = stock.products || [];
   const products = whStockCache;
@@ -7620,7 +7654,7 @@ async function renderWhInvoiceNew() {
 
   document.getElementById('wh-cancel-form').addEventListener('click', () => {
     haptic('light');
-    whDraft = null;
+    dropWhDraft();
     whView = 'list';
     renderWhInvoicesTab();
   });
@@ -7638,8 +7672,11 @@ async function renderWhInvoiceNew() {
     const have = p ? Number(p.quantity) : 0;
     const out = whDraft.type === 'outgoing';
     return {
+      // Товар не подставляется сам: строка без выбора — невалидна.
+      product: !p,
       qty: !(Number(it.quantity) > 0),
-      short: out && Number(it.quantity) > have,
+      // Без товара про остаток говорить нечего — там своя подсказка.
+      short: out && !!p && Number(it.quantity) > have,
       price: out && !(Number(it.price_cents) > 0),
       have,
     };
@@ -7649,7 +7686,7 @@ async function renderWhInvoiceNew() {
     if (whDraft.type === 'outgoing' && !whDraft.counterparty_id) return false;
     return whDraft.items.every(it => {
       const pr = itemProblems(it);
-      return !pr.qty && !pr.short && !pr.price;
+      return !pr.product && !pr.qty && !pr.short && !pr.price;
     });
   }
   function syncSave() {
@@ -7657,7 +7694,10 @@ async function renderWhInvoiceNew() {
     if (b) b.disabled = !formValid();
   }
 
-  function drawItems() {
+  // Итог и доступность «Сохранить» — отдельно от перерисовки строк: их
+  // пересчитываем на каждый введённый символ (событие input), а строки
+  // перерисовываем только на change — иначе поле теряло бы фокус посреди ввода.
+  function drawTotal() {
     const totalCents = whDraft.items.reduce(
       (acc, it) => acc + Math.round((Number(it.price_cents) || 0) * (Number(it.quantity) || 0)), 0);
     // Итог — карточка в общем стиле: «Итого» слева, сумма справа с валютой.
@@ -7666,6 +7706,11 @@ async function renderWhInvoiceNew() {
         `<span class="wh-total-sum">${whMoney(totalCents, baseCur())}</span></div>`
       : '';
     syncSave();
+    saveWhDraft();
+  }
+
+  function drawItems() {
+    drawTotal();
     if (!whDraft.items.length) {
       itemsEl.innerHTML = '<div class="editor-empty">Позиций нет — добавьте хотя бы одну.</div>';
       return;
@@ -7682,19 +7727,20 @@ async function renderWhInvoiceNew() {
       const priceBad = pr.price && it.price_cents != null && it.priceTouched;
       return `
       <div class="wh-pos" data-i="${i}">
-        <button type="button" class="btn-agent" data-pick-product="${i}" aria-label="Товар">
+        <button type="button" class="btn-agent${p ? '' : ' btn-agent--empty'}" data-pick-product="${i}" aria-label="Товар">
           ${escapeHtml(p ? p.name : 'Выберите товар')}
           ${p ? `<span class="wh-pos-have">${whQty(p.quantity)} ${escapeHtml(p.unit || '')}</span>` : ''}
         </button>
         <div class="wh-pos-row">
           <input class="form-input ${short || qtyBad ? 'wh-input-bad' : ''}" data-f="quantity"
-                 type="number" min="0" step="any" inputmode="decimal"
+                 type="text" inputmode="decimal" autocomplete="off"
                  value="${it.quantity}" placeholder="Кол-во" aria-label="Количество">
-          <input class="form-input ${priceBad ? 'wh-input-bad' : ''}" data-f="price" type="number" min="0" step="0.01"
-                 inputmode="decimal" value="${(Number(it.price_cents) || 0) / 100}"
+          <input class="form-input ${priceBad ? 'wh-input-bad' : ''}" data-f="price" type="text"
+                 inputmode="decimal" autocomplete="off" value="${(Number(it.price_cents) || 0) / 100}"
                  placeholder="Цена" aria-label="Цена за единицу">
           <button class="editor-item-del" data-del="${i}" aria-label="Удалить позицию">${icon('trash')}</button>
         </div>
+        ${pr.product ? `<div class="wh-pos-warn">Выберите товар</div>` : ''}
         ${short ? `<div class="wh-pos-warn">На складе только ${whQty(have)}</div>` : ''}
         ${qtyBad ? `<div class="wh-pos-warn">Количество должно быть больше нуля</div>` : ''}
         ${priceBad ? `<div class="wh-pos-warn">Для расхода укажите цену</div>` : ''}
@@ -7702,38 +7748,29 @@ async function renderWhInvoiceNew() {
     }).join('');
 
     itemsEl.querySelectorAll('[data-pick-product]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const i = Number(btn.dataset.pickProduct);
-        openListPicker({
-          title: 'Товар',
-          hint: 'Показан остаток на складе',
-          items: products.map(pp => ({
-            id: pp.product_id, name: pp.name,
-            sub: `${whQty(pp.quantity)} ${pp.unit || ''}`.trim(),
-          })),
-          selectedId: whDraft.items[i].product_id,
-          emptyText: 'Товары не найдены',
-          onPick: (item) => { whDraft.items[i].product_id = Number(item.id); drawItems(); },
-        });
-      });
+      btn.addEventListener('click', () => pickProduct(Number(btn.dataset.pickProduct)));
     });
 
     itemsEl.querySelectorAll('.wh-pos').forEach(el => {
       const i = Number(el.dataset.i);
       el.querySelectorAll('[data-f]').forEach(inp => {
-        inp.addEventListener('change', () => {
+        const apply = () => {
           const f = inp.dataset.f;
+          // «1 500» и «12,5» — как в остальных денежных полях (parseAmount);
+          // нечисловое — ноль, и строка подсветится как невалидная.
+          const v = parseAmount(inp.value);
           if (f === 'price') {
             // Цену вводят в деньгах, хранится и уходит на сервер в копейках.
-            whDraft.items[i].price_cents = Math.round((Number(inp.value) || 0) * 100);
+            whDraft.items[i].price_cents = Math.round((Number.isNaN(v) ? 0 : v) * 100);
             whDraft.items[i].priceTouched = true;
           } else if (f === 'quantity') {
-            whDraft.items[i].quantity = Number(inp.value) || 0;
-          } else {
-            whDraft.items[i].product_id = Number(inp.value);
+            whDraft.items[i].quantity = Number.isNaN(v) ? 0 : v;
           }
-          drawItems();
-        });
+        };
+        // input — итог и кнопка сразу, пока человек печатает; change (уход
+        // с поля) — перерисовка строк с подсказками под полями.
+        inp.addEventListener('input', () => { apply(); drawTotal(); });
+        inp.addEventListener('change', () => { apply(); drawItems(); });
       });
       const del = el.querySelector('[data-del]');
       if (del) del.addEventListener('click', () => {
@@ -7744,12 +7781,34 @@ async function renderWhInvoiceNew() {
     });
   }
 
+  // Товар выбирают только явно, листом с поиском. Раньше новая строка сразу
+  // получала ПЕРВЫЙ товар справочника, и его легко было провести вместо
+  // нужного: строка выглядела заполненной, «Сохранить» — активной.
+  function pickProduct(i) {
+    openListPicker({
+      title: 'Товар',
+      hint: 'Показан остаток на складе',
+      items: products.map(pp => ({
+        id: pp.product_id, name: pp.name,
+        sub: `${whQty(pp.quantity)} ${pp.unit || ''}`.trim(),
+      })),
+      selectedId: whDraft.items[i] ? whDraft.items[i].product_id : null,
+      emptyText: 'Товары не найдены',
+      onPick: (item) => {
+        if (!whDraft || !whDraft.items[i]) return;
+        whDraft.items[i].product_id = Number(item.id);
+        drawItems();
+      },
+    });
+  }
+
   drawItems();
 
   document.querySelectorAll('[data-whtype]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
       whDraft.type = btn.dataset.whtype;
+      saveWhDraft();
       renderWhInvoiceNew();
     });
   });
@@ -7758,6 +7817,7 @@ async function renderWhInvoiceNew() {
     const btn = document.getElementById('wh-cp');
     if (btn) { btn.textContent = item.name; btn.classList.remove('btn-agent--empty'); }
     syncSave();
+    saveWhDraft();
   };
   const openCpPicker = () => openListPicker({
     title: 'Контрагент',
@@ -7783,14 +7843,17 @@ async function renderWhInvoiceNew() {
   document.getElementById('wh-cp').addEventListener('click', openCpPicker);
   document.getElementById('wh-comment').addEventListener('input', e => {
     whDraft.comment = e.target.value;
+    saveWhDraft();
   });
   document.getElementById('wh-add').addEventListener('click', () => {
     haptic('light');
     // Цена у расхода обязательна, поэтому новая строка начинается БЕЗ цены и
     // держит кнопку неактивной, пока её не введут.
-    whDraft.items.push({ product_id: products[0].product_id, quantity: 1,
+    whDraft.items.push({ product_id: null, quantity: 1,
                          price_cents: whDraft.type === 'outgoing' ? 0 : null, priceTouched: false });
     drawItems();
+    // Строка без товара бесполезна — сразу открываем выбор.
+    pickProduct(whDraft.items.length - 1);
   });
 
   document.getElementById('wh-save').addEventListener('click', async () => {
@@ -7807,6 +7870,7 @@ async function renderWhInvoiceNew() {
     // отказа по существу — отказ сервер хранит под ключом, и исправленная
     // форма со старым ключом получила бы тот же отказ.
     if (!whDraft.idemKey) whDraft.idemKey = idemKey();
+    saveWhDraft();
     try {
       const r = await apiResult('/api/wh/invoices/create', {
         type: whDraft.type,
@@ -7820,12 +7884,12 @@ async function renderWhInvoiceNew() {
         // Повтор той же формы не проведёт вторую накладную и не пришлёт
         // клиенту второй экземпляр PDF.
         idempotency_key: whDraft.idemKey,
-      });
+      }, { timeoutMs: LONG_TIMEOUT_MS });
       if (!r.ok) {
         // Отказ по существу (нехватка остатка, 400 формы) ничего не записал —
         // следующая попытка с исправленной формой идёт новым ключом. «Запрос
         // уже обрабатывается» и обрыв связи ключ сохраняют.
-        if (r.status === 400 || (r.body && r.body.code)) whDraft.idemKey = null;
+        if (r.status === 400 || (r.body && r.body.code)) { whDraft.idemKey = null; saveWhDraft(); }
         // Сервер посчитал причину отказа и вернул её (нехватка остатка — с
         // разбором по позициям). Показываем ЕЁ, а не «ошибку сервера»:
         // менеджеру надо понять, что править в форме. Черновик остаётся.
@@ -7838,7 +7902,7 @@ async function renderWhInvoiceNew() {
       // Отдельным сообщением: неотправленный PDF — не ошибка проведения.
       // Накладная сохранена, остатки списаны, отправить можно позже кнопкой.
       if (res.pdf_warning) toast(res.pdf_warning, 'error', { duration: 6000 });
-      whDraft = null;
+      dropWhDraft();
       whView = 'list';
       renderWhInvoicesTab();
     } catch (e) {
