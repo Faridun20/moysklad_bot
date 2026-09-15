@@ -1146,7 +1146,7 @@ async def product_cost(product_id: int) -> dict:
     }
 
 
-async def order_profits() -> dict[int, dict]:
+async def order_profits(order_ids: list[int] | None = None) -> dict[int, dict]:
     """Прибыль отгруженных заказов по зафиксированной себестоимости.
 
     {order_id: {"profit": мажорные единицы В ВАЛЮТЕ ЗАКАЗА, "partial": bool}}.
@@ -1154,15 +1154,28 @@ async def order_profits() -> dict[int, dict]:
     заказа, и прибыль рядом в долларах при сделке в сумах читалась бы как
     опечатка. Себестоимость переводится обратно по тому же курсу продажи, по
     которому зафиксирована, — курс сегодняшнего дня прибыль не двигает.
-    Без `IN (...)`: фиксаций столько, сколько отгрузок после включения учёта.
+    `order_ids` — только эти заказы: страница списка заказов (до 200 строк)
+    не должна читать фиксации всей истории отгрузок. None — все.
     """
-    rows = await adb_core.fetch(
+    sql = (
         "SELECT os.order_id, s.quantity, s.cost_base_cents, s.sale_price_cents, "
         "       s.sale_rate_to_base "
         "FROM order_shipment os "
         "JOIN invoices i ON i.id = os.invoice_id AND i.status = 'confirmed' "
         "JOIN sale_costs s ON s.invoice_id = os.invoice_id"
     )
+    args: list[Any] = []
+    if order_ids is not None:
+        ids = sorted({int(o) for o in order_ids})
+        if not ids or len(ids) > 5000:
+            # Пусто — нечего считать; очень длинный список (ответ без limit) —
+            # дешевле прочитать всё, чем упереться в предел параметров.
+            if not ids:
+                return {}
+        else:
+            args = ids
+            sql += f" WHERE os.order_id IN ({', '.join(f'${i + 1}' for i in range(len(ids)))})"
+    rows = await adb_core.fetch(sql, *args)
     out: dict[int, dict] = {}
     for r in rows:
         oid = int(r["order_id"])

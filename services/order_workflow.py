@@ -563,42 +563,32 @@ async def cancel_order_full(
     """Отменить заказ и вернуть списанный товар на склад. Общий код для обоих
     входов — бота и `/api/orders/cancel` (T2.6).
 
-    Раньше откат делал только бот, а WebApp — нет, и отменённый оттуда заказ
-    оставлял в МойСклад живой customerorder с резервом товара НАВСЕГДА (§5.2.2).
-    Теперь откатывать нужно СВОЮ расходную накладную, и забыть про это стоило бы
-    ещё дороже: товар остался бы списанным по отменённому заказу.
+    Статус и возврат остатка — одна транзакция (`database.cancel_order`):
+    раньше отмена коммитилась первой, а накладная откатывалась «best-effort»
+    потом, и сбой между ними оставлял отменённый заказ со списанным навсегда
+    товаром. Отказ склада теперь отменяет и саму отмену — текстом оператору.
 
-    Возврат остатка — best-effort и намеренно ПОСЛЕ локальной отмены: ошибка
-    склада не должна откатывать то, что оператор уже подтвердил. Отмена
-    накладной идемпотентна (повторный вызов вернёт `already_cancelled`).
-
-    Возвращает результат `cancel_order` плюс `stock_reverse` — что вышло со
-    складом (для логов и текста оператору).
+    Возвращает `{ok, error, stock_reverse}` — что вышло со складом (для логов
+    и текста оператору).
     """
     from services import async_db as adb
     from services import order_shipment
 
-    # До смены статуса: отказ склада ПОСЛЕ отмены (см. ниже, best-effort)
-    # оставил бы заказ отменённым, а историческую отгрузку — проведённой.
+    # Историческая отгрузка (МойСклад) — отказ сразу, понятным текстом. Склад
+    # и сам откажет в отмене её накладной (warehouse.cancel_invoice_in, code
+    # «historical») и откатит всю отмену, но у заказа со 2-й и далее отгрузкой
+    # МС накладной в order_shipment нет — ловим по ms_demand_id здесь.
     historical = await order_shipment.historical_cancel_refusal(order_id)
     if historical:
         return {"ok": False, "error": historical, "code": "historical"}
 
     res = await adb.cancel_order(order_id, user_id, user_name, reason)
-    if not res.get("ok"):
-        return res
-
-    try:
-        rev = await order_shipment.cancel_shipment(order_id, user_id=user_id)
-    except Exception as e:  # noqa: BLE001 — отмена уже применена, склад догоним
-        logger.warning("Возврат остатка по заказу #%s не прошёл", order_id, exc_info=True)
-        rev = {"ok": False, "reason": type(e).__name__}
-    if not rev.get("ok"):
+    if not res.get("ok") and res.get("stock_reverse"):
         logger.warning(
-            "Заказ #%s отменён, но остаток не вернулся на склад: %s",
-            order_id, rev.get("reason"),
+            "Заказ #%s не отменён — склад отказал: %s",
+            order_id, res["stock_reverse"].get("reason"),
         )
-    return {**res, "stock_reverse": rev}
+    return res
 
 
 _STATUS_RU: dict[str, str] = {
@@ -721,7 +711,9 @@ async def approve_shipment_request(
     # Атомарный UPDATE ... WHERE status='pending' — защита от race condition,
     # когда два босса одновременно жмут «Одобрить». Только один из них
     # получит rowcount==1, остальные — False.
-    decision = await adb.approve_shipment_request(req_id, boss_user_id, boss_name)
+    decision = await adb.approve_shipment_request(
+        req_id, boss_user_id, boss_name, credit_override=bool(override and over_info)
+    )
     if not decision.applied:
         return {
             "ok": False,
@@ -736,9 +728,9 @@ async def approve_shipment_request(
         adb.get_order(req["order_id"]),
         adb.get_role(boss_user_id),
     )
-    # Одобрено с превышением лимита → фиксируем override + аудит.
+    # Одобрено с превышением лимита: отметку override поставило само одобрение
+    # (тем же UPDATE'ом заказа), здесь — только аудит.
     if override and over_info:
-        await adb.set_order_credit_override(req["order_id"], boss_user_id)
         await adb.add_audit_log(
             boss_user_id,
             boss_name,
@@ -884,47 +876,26 @@ async def approve_shipment_request(
 
     # Для paid-заказов автоматически создаём payment-pending,
     # чтобы босс одной кнопкой зафиксировал реальное получение денег.
+    # Проверка «денег по заказу ещё не заявляли» и вставка — под замком заказа
+    # в одной транзакции (create_approval_auto_payment): параллельная отметка
+    # оплаты менеджером больше не складывается с автоплатежом.
     if order and not order_moved and (order.get("payment_type") or "paid") == "paid":
-        # Сумма — в копейках, построчно через mul_qty: ровно так её считает
-        # закрытие заказа (get_order_payment_summary). Float-сумма дробных
-        # количеств расходилась с ней на копейку (2 × 1,5 × 0,33 = 0,99 против
-        # 1,00), платёж «на всю сумму» оставлял долг 0,01, и заказ не закрывался.
-        total_cents = money.add(
-            *(money.mul_qty(int(it.get("price_cents") or 0), it.get("quantity") or 0) for it in items)
-        )
-        if total_cents > 0:
-            total_major = money.from_cents(total_cents)
-            currency = order.get("currency") or "USD"
-            try:
-                existing = [
-                    p
-                    for p in await adb.get_payments_for_order(order["id"])
-                    if p["status"] in ("pending", "confirmed")
-                ]
-                if not existing:
-                    payment_id = await adb.add_payment(
-                        user_id=order["user_id"],
-                        username="",
-                        full_name=manager_name,
-                        amount=total_major,
-                        currency=currency,
-                        comment=f"Оплата по заказу #{order['id']} (отгрузка одобрена)",
-                        order_id=order["id"],
-                    )
-                    if bot is not None:
-                        from services.notify import notify_payment_confirmation_needed
+        try:
+            payment_id = await adb.create_approval_auto_payment(order["id"], manager_name)
+            if payment_id and bot is not None:
+                from services.notify import notify_payment_confirmation_needed
 
-                        await notify_payment_confirmation_needed(
-                            bot,
-                            order["id"],
-                            manager_name,
-                            payment_id,
-                        )
-            except Exception:
-                logger.exception(
-                    "Не удалось создать auto-payment для paid-заказа #%s",
+                await notify_payment_confirmation_needed(
+                    bot,
                     order["id"],
+                    manager_name,
+                    payment_id,
                 )
+        except Exception:
+            logger.exception(
+                "Не удалось создать auto-payment для paid-заказа #%s",
+                order["id"],
+            )
 
     return {
         "ok": True,
@@ -1010,9 +981,9 @@ async def return_order_to_draft(
     заказ возвращается в 'draft' с причиной и счётчиком; после reject_max_cycles
     заказ замораживается. Менеджер правит черновик и отправляет заново.
 
-    Порядок: сперва атомарный reject_order_to_draft (race-guard на orders), и
-    только при успехе помечаем заявку 'returned'. Если другой босс уже обработал
-    заказ — reject_order_to_draft вернёт ошибку, заявку не трогаем.
+    Заказ и заявка переводятся одной транзакцией в `reject_order_to_draft`
+    (FOR UPDATE заказа, CAS обоих статусов). Если другой босс уже обработал
+    заказ или заявку — не меняется ничего.
 
     Возвращает {ok, error, req_id, order_id, now, frozen, rejection_count}.
     """
@@ -1032,7 +1003,11 @@ async def return_order_to_draft(
         }
 
     order_id = req["order_id"]
-    res = await db.reject_order_to_draft(order_id, boss_user_id, boss_name, comment)
+    # Заказ → draft и заявка → returned — одной транзакцией (req_id передаём
+    # внутрь): иначе сбой между ними оставлял pending-заявку при черновике.
+    res = await db.reject_order_to_draft(
+        order_id, boss_user_id, boss_name, comment, req_id=req_id
+    )
     if not res.get("ok"):
         return {
             "ok": False,
@@ -1040,11 +1015,6 @@ async def return_order_to_draft(
             "req_id": req_id,
             "order_id": order_id,
         }
-
-    # Заказ уже в 'draft' — снимаем заявку с pending-очереди (статус заказа не трогаем).
-    await asyncio.to_thread(
-        db.mark_shipment_request_returned, req_id, boss_user_id, boss_name
-    )
 
     now_str = local_now().strftime("%d.%m.%Y %H:%M")
     frozen = bool(res.get("frozen"))

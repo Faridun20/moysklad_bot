@@ -13,6 +13,7 @@ import os
 import re
 import time
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -67,25 +68,54 @@ class _Idem:
     store), поднимаем 409: безопаснее отказать, чем рискнуть дублем денег.
 
     Без ключа от клиента все методы — no-op, поведение как раньше.
+
+    `atomic=True` — операция сама пишет результат в ключ своей транзакцией
+    (`database.idem_store_in`, ей передаётся `idem.key`). Тогда ключ без
+    результата старше `IDEM_RECLAIM_AFTER_S` значит «не закоммитилось», и ретрай
+    его переиспользует, а не получает 409 сутки.
     """
 
-    __slots__ = ("_adb", "_key", "_op", "_uid")
+    __slots__ = ("_adb", "_atomic", "_key", "_op", "_uid")
 
-    def __init__(self, adb, operation: str, user_id: int, raw_key):
+    def __init__(self, adb, operation: str, user_id: int, raw_key, *, atomic: bool = False):
         capped = _cap_idem_key(raw_key)
         self._adb = adb
         self._op = operation
         self._uid = user_id
+        self._atomic = atomic
         self._key = f"{operation}:{user_id}:{capped}" if capped else None
 
     @property
     def active(self) -> bool:
         return self._key is not None
 
+    @property
+    def key(self) -> str | None:
+        return self._key
+
+    @asynccontextmanager
+    async def released_on_reject(self):
+        """Отказ ручки (HTTPException) до операции освобождает ключ.
+
+        Проверки между claim и операцией (заказ не найден, чужой заказ, неверная
+        сумма) бросали 4xx, не освободив ключ: ретрай с тем же ключом после
+        исправления сутки получал «Запрос уже обрабатывается», хотя не было
+        сделано ничего."""
+        try:
+            yield
+        except HTTPException:
+            await self.release()
+            raise
+
     async def claim(self) -> dict | None:
         if not self._key:
             return None
-        prev = await self._adb.idem_claim(self._key, self._op, self._uid)
+        from services.database import IDEM_RECLAIM_AFTER_S
+
+        prev = await self._adb.idem_claim(
+            self._key, self._op, self._uid,
+            reclaim_after_s=IDEM_RECLAIM_AFTER_S if self._atomic else None,
+        )
         if prev is None:
             return None  # ключ наш
         if prev:
@@ -1097,7 +1127,7 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
     from datetime import datetime
 
     from services import async_db as adb
-    from services.warehouse import list_shipments, sales_stats
+    from services.warehouse import sales_stats, shipment_counts_by_day
 
     _empty_stats: dict = {
         "total": 0, "count": 0, "clients": 0, "top_products": [],
@@ -1113,21 +1143,21 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
             _state["ok"] = False
             return default
 
-    current, prev, shipments = await asyncio.gather(
+    # По дням — агрегатом (shipment_counts_by_day), а не по списку отгрузок:
+    # список обрезан тысячей строк, и в длинном периоде дни молча пустели.
+    current, prev, day_counts = await asyncio.gather(
         _safe_call(sales_stats(since, until), _empty_stats, "sales_stats"),
         _safe_call(sales_stats(prev_since, since), _empty_stats, "sales_stats(prev)"),
-        _safe_call(list_shipments(since, until), [], "list_shipments"),
+        _safe_call(shipment_counts_by_day(since, until), {}, "shipment_counts_by_day"),
     )
     stats_incomplete = not _state["ok"]
 
     days_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     by_day = [0] * 7
-    for s in shipments:
+    for day, n in day_counts.items():
         try:
-            moment = s.get("moment", "")[:10]
-            day_num = datetime.strptime(moment, "%Y-%m-%d").weekday()
-            by_day[day_num] += 1
-        except Exception:
+            by_day[datetime.strptime(day, "%Y-%m-%d").weekday()] += n
+        except ValueError:
             pass
 
     from config import BASE_CURRENCY
@@ -2853,7 +2883,6 @@ async def api_leads_funnel(request: Request):
 # «Показать ещё» листал бы нефильтрованный список и на странице с фильтром
 # оказывалось бы два заказа из двадцати.
 _ORDERS_PAGE_MAX = 200
-_ORDERS_SCOPE_CAP = 5000
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -2901,7 +2930,11 @@ def _paginate_orders(
     date_from: str,
     date_to: str,
 ) -> tuple[list[dict], dict]:
-    """Отфильтровать (статус, период) и нарезать страницу.
+    """Отфильтровать (статус, период) и нарезать страницу — в Python.
+
+    Ручка режет страницу в SQL (`database.get_orders_page`); эта функция —
+    эталон семантики фильтров и полей страницы, с которым SQL-вариант сверяет
+    `tests/test_orders_pagination.py`.
 
     `orders` уже отсортированы свежими вперёд (ORDER BY created_at DESC) —
     порядок страниц держится на нём. `pending_count` считается по ВСЕМ
@@ -2922,12 +2955,21 @@ def _paginate_orders(
 
     filtered = [o for o in orders if keep(o)]
     chunk = filtered[offset : offset + limit]
-    next_offset = offset + len(chunk)
-    return chunk, {
-        "total": len(filtered),
+    return chunk, _page_meta(
+        total=len(filtered), offset=offset, limit=limit, returned=len(chunk),
+        pending_count=pending_count,
+    )
+
+
+def _page_meta(*, total: int, offset: int, limit: int, returned: int, pending_count: int) -> dict:
+    """Поля страницы в ответе `/api/orders` — одна форма для SQL-страницы
+    (`database.get_orders_page`) и для эталонной нарезки `_paginate_orders`."""
+    next_offset = offset + returned
+    return {
+        "total": total,
         "offset": offset,
         "limit": limit,
-        "has_more": next_offset < len(filtered),
+        "has_more": next_offset < total,
         "next_offset": next_offset,
         "pending_count": pending_count,
     }
@@ -2949,7 +2991,34 @@ async def api_orders(request: Request):
     role = get_role(user["id"])
     page = _orders_page_params(data)
 
-    if role in ("admin", "boss"):
+    page_meta: dict = {}
+    if page is not None:
+        # Страница — целиком в SQL (фильтры, LIMIT/OFFSET, total, pending_count):
+        # раньше читались ВСЕ заказы роли и резались в Python, а позиции шли
+        # одним IN по всем id — на истории это предел asyncpg в 32 767
+        # параметров и мегабайты в памяти на каждый вход во вкладку.
+        if role in ("admin", "boss"):
+            scope = "all"
+        elif role == "warehouse_keeper":
+            scope = "to_ship"
+        else:
+            # Со страницами — только свои заказы, как и было (совмещение ролей
+            # добавляет чужие «к отгрузке» лишь в ответе без limit).
+            scope = "user"
+        orders, total, pending_count = await adb.get_orders_page(
+            scope=scope,
+            user_id=user["id"],
+            statuses=page["statuses"],
+            date_from=page["date_from"],
+            date_to=page["date_to"],
+            limit=page["limit"],
+            offset=page["offset"],
+        )
+        page_meta = _page_meta(
+            total=total, offset=page["offset"], limit=page["limit"],
+            returned=len(orders), pending_count=pending_count,
+        )
+    elif role in ("admin", "boss"):
         orders = await adb.get_all_orders()
     elif role == "warehouse_keeper":
         # Кладовщик заказов не создаёт — его список это то, что он отгружает:
@@ -2960,11 +3029,6 @@ async def api_orders(request: Request):
         orders = [
             o for o in await adb.get_all_orders() if o.get("status") in ("approved", "shipped")
         ]
-    elif page is not None:
-        # Со страницами «Показать ещё» дойдёт до старых заказов, поэтому
-        # прежний потолок в 200 последних здесь не годится — иначе у менеджера
-        # с долгой историей список молча обрывался бы на двухсотом.
-        orders = await adb.get_user_orders(user["id"], limit=_ORDERS_SCOPE_CAP)
     else:
         orders = await adb.get_user_orders(user["id"])
         from services.roles import role_allowed
@@ -2985,10 +3049,6 @@ async def api_orders(request: Request):
     from config import BASE_CURRENCY
 
     is_boss = role in ("admin", "boss")
-
-    page_meta: dict = {}
-    if page is not None:
-        orders, page_meta = _paginate_orders(orders, **page)
 
     # Батч-загрузка позиций: один SQL вместо N (N+1 был на больших списках)
     items_by_order = await adb.get_order_items_by_ids([o["id"] for o in orders]) if orders else {}
@@ -3016,7 +3076,7 @@ async def api_orders(request: Request):
         from services import costing
 
         if await costing.is_enabled():
-            shipped_profit = await costing.order_profits()
+            shipped_profit = await costing.order_profits([o["id"] for o in orders])
 
     result = []
     for o in orders:
@@ -5038,25 +5098,20 @@ async def api_deposits_create(request: Request):
     # двойной POST (ретрай клиента после рестарта webapp/мультиворкер) создаёт две
     # сдачи. idem_claim атомарно столбит ключ в общей БД (in-mem кэш не переживал
     # рестарт). Если ключ уже был — отдаём сохранённый результат, не повторяем.
-    idem_key = _cap_idem_key(data.get("idempotency_key"))
-    full_key = f"deposit_create:{user['id']}:{idem_key}" if idem_key else None
-    if full_key:
-        prev = await adb.idem_claim(full_key, "deposit_create", user["id"])
-        if prev is not None:
-            if prev.get("deposit_id"):
-                return JSONResponse(prev)
-            # Ключ занят, но результата нет (операция в полёте/упала до store) —
-            # безопаснее отказать, чем рискнуть дублем.
-            raise HTTPException(status_code=409, detail="Запрос уже обрабатывается")
+    # Ключ занят, но результата нет (операция в полёте) — 409: безопаснее
+    # отказать, чем рискнуть дублем. Результат пишет сама сдача в своей
+    # транзакции (atomic), поэтому брошенный ключ переиспользуется.
+    idem = _Idem(adb, "deposit_create", user["id"], data.get("idempotency_key"), atomic=True)
+    prev = await idem.claim()
+    if prev is not None:
+        return JSONResponse(prev)
     try:
-        res = await adb.create_cash_deposit(user["id"], amount)
+        res = await adb.create_cash_deposit(user["id"], amount, idem_key=idem.key)
     except Exception:
-        if full_key:
-            await adb.idem_release(full_key)  # упало до store — освободить ретраю
+        await idem.release()  # упало до коммита — освободить ретраю
         raise
     if not res.get("ok"):
-        if full_key:
-            await adb.idem_release(full_key)
+        await idem.release()
         raise HTTPException(status_code=400, detail=res.get("error", "не удалось создать сдачу"))
 
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
@@ -5071,8 +5126,7 @@ async def api_deposits_create(request: Request):
     except Exception:
         logger.warning("deposit create notify failed", exc_info=True)
     resp = {"ok": True, "deposit_id": res["deposit_id"]}
-    if full_key:
-        await adb.idem_store(full_key, resp)
+    await idem.store(resp)
     return JSONResponse(resp)
 
 
@@ -5276,97 +5330,87 @@ async def api_returns_create(request: Request):
         raise HTTPException(status_code=400, detail="Некорректный способ возврата денег")
 
     # R2: DB-уровневая идемпотентность (двойной POST создавал два возврата —
-    # двойной refund/занижение долга). idem_claim столбит ключ в общей БД.
-    idem_key = _cap_idem_key(data.get("idempotency_key"))
-    full_key = f"return_create:{user['id']}:{idem_key}" if idem_key else None
-    if full_key:
-        prev = await adb.idem_claim(full_key, "return_create", user["id"])
-        if prev is not None:
-            if prev.get("return_id"):
-                return JSONResponse(prev)
-            raise HTTPException(status_code=409, detail="Запрос уже обрабатывается")
+    # двойной refund/занижение долга). Ключ столбится в общей БД, результат
+    # пишет сам возврат в своей транзакции (atomic). Любой отказ проверок ниже
+    # освобождает ключ (released_on_reject) — раньше 404/403/409 оставляли его
+    # занятым на сутки.
+    idem = _Idem(adb, "return_create", user["id"], data.get("idempotency_key"), atomic=True)
+    prev = await idem.claim()
+    if prev is not None:
+        return JSONResponse(prev)
 
-    order = await adb.get_order(order_id)
-    if not order:
-        raise HTTPException(status_code=404, detail="Заказ не найден")
-    # Отгружен/оплачен/частично-возвращён ИЛИ оплачен по легаси (paid_confirmed_at).
-    if order.get("status") not in ("shipped", "paid", "partially_returned") and not order.get(
-        "paid_confirmed_at"
-    ):
-        raise HTTPException(
-            status_code=409, detail="Возврат доступен только для отгруженных/оплаченных"
-        )
-    # H2: менеджер вправе вернуть только свой заказ; начальство/склад — любой.
-    # Сознательно `in`, а не role_allowed: совмещение ролей (менеджер замещает
-    # кладовщика) НЕ снимает H2 — возврат чужого заказа двигает чужой долг, и
-    # принимать товар за кладовщика для этого не нужно.
-    privileged = get_role(user["id"]) in ("admin", "boss", "warehouse_keeper")
-    if not privileged and order.get("user_id") != user["id"]:
-        raise HTTPException(status_code=403, detail="Возврат только по своим заказам")
+    async with idem.released_on_reject():
+        order = await adb.get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="Заказ не найден")
+        # Отгружен/оплачен/частично-возвращён ИЛИ оплачен по легаси (paid_confirmed_at).
+        if order.get("status") not in ("shipped", "paid", "partially_returned") and not order.get(
+            "paid_confirmed_at"
+        ):
+            raise HTTPException(
+                status_code=409, detail="Возврат доступен только для отгруженных/оплаченных"
+            )
+        # H2: менеджер вправе вернуть только свой заказ; начальство/склад — любой.
+        # Сознательно `in`, а не role_allowed: совмещение ролей (менеджер замещает
+        # кладовщика) НЕ снимает H2 — возврат чужого заказа двигает чужой долг, и
+        # принимать товар за кладовщика для этого не нужно.
+        privileged = get_role(user["id"]) in ("admin", "boss", "warehouse_keeper")
+        if not privileged and order.get("user_id") != user["id"]:
+            raise HTTPException(status_code=403, detail="Возврат только по своим заказам")
 
-    # T3.1: частичный возврат. Раньше эндпоинт жёстко слал "full" и возвращал
-    # ВСЕ позиции целиком — частичный возврат существовал только в боте
-    # (§5.2.6). Теперь фронт может прислать items: [{item_id, quantity}].
-    #
-    # Доступное к возврату = quantity − returned_qty (как в боте): позиция,
-    # уже возвращённая прошлым возвратом, второй раз не отдаётся.
-    items = await adb.get_order_items(order_id)
-    avail_by_id = {
-        it["id"]: float(it.get("quantity", 0) or 0) - float(it.get("returned_qty", 0) or 0)
-        for it in items
-    }
-    price_by_id = {it["id"]: float(it.get("price", 0) or 0) for it in items}
-    returnable = {iid: a for iid, a in avail_by_id.items() if a > 0}
-    if not returnable:
-        if full_key:
-            await adb.idem_release(full_key)
-        raise HTTPException(status_code=409, detail="Нет позиций, доступных к возврату")
+        # T3.1: частичный возврат. Раньше эндпоинт жёстко слал "full" и возвращал
+        # ВСЕ позиции целиком — частичный возврат существовал только в боте
+        # (§5.2.6). Теперь фронт может прислать items: [{item_id, quantity}].
+        #
+        # Доступное к возврату = quantity − returned_qty (как в боте): позиция,
+        # уже возвращённая прошлым возвратом, второй раз не отдаётся.
+        items = await adb.get_order_items(order_id)
+        avail_by_id = {
+            it["id"]: float(it.get("quantity", 0) or 0) - float(it.get("returned_qty", 0) or 0)
+            for it in items
+        }
+        price_by_id = {it["id"]: float(it.get("price", 0) or 0) for it in items}
+        returnable = {iid: a for iid, a in avail_by_id.items() if a > 0}
+        if not returnable:
+            raise HTTPException(status_code=409, detail="Нет позиций, доступных к возврату")
 
-    raw_items = data.get("items")
-    if raw_items is None:
-        # Полный возврат — всё доступное (поведение по умолчанию, как было).
-        ret_items = [
-            (iid, avail, round(avail * price_by_id[iid], 2)) for iid, avail in returnable.items()
-        ]
-        return_type = "full"
-    else:
-        if not isinstance(raw_items, list) or not raw_items:
-            if full_key:
-                await adb.idem_release(full_key)
-            raise HTTPException(status_code=400, detail="Выберите хотя бы одну позицию")
-        ret_items = []
-        for row in raw_items:
-            try:
-                iid = int(str((row or {}).get("item_id")))
-                qty = float(str((row or {}).get("quantity")))
-            except (TypeError, ValueError, AttributeError):
-                if full_key:
-                    await adb.idem_release(full_key)
-                raise HTTPException(status_code=400, detail="Позиция: нужны item_id и quantity")
-            if iid not in returnable:
-                if full_key:
-                    await adb.idem_release(full_key)
-                raise HTTPException(
-                    status_code=400, detail=f"Позиция {iid} недоступна к возврату"
-                )
-            if not (math.isfinite(qty) and 0 < qty <= returnable[iid] + 1e-9):
-                if full_key:
-                    await adb.idem_release(full_key)
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Позиция {iid}: количество должно быть от 0 до "
-                        f"{returnable[iid]:g}"
-                    ),
-                )
-            qty = min(qty, returnable[iid])
-            ret_items.append((iid, qty, round(qty * price_by_id[iid], 2)))
-        # Выбраны все позиции в полном объёме — это фактически полный возврат
-        # (та же логика, что в боте: от типа зависит статус заказа).
-        is_full = len(ret_items) == len(returnable) and all(
-            abs(qty - returnable[iid]) < 1e-9 for iid, qty, _ in ret_items
-        )
-        return_type = "full" if is_full else "partial"
+        raw_items = data.get("items")
+        if raw_items is None:
+            # Полный возврат — всё доступное (поведение по умолчанию, как было).
+            ret_items = [
+                (iid, avail, round(avail * price_by_id[iid], 2)) for iid, avail in returnable.items()
+            ]
+            return_type = "full"
+        else:
+            if not isinstance(raw_items, list) or not raw_items:
+                raise HTTPException(status_code=400, detail="Выберите хотя бы одну позицию")
+            ret_items = []
+            for row in raw_items:
+                try:
+                    iid = int(str((row or {}).get("item_id")))
+                    qty = float(str((row or {}).get("quantity")))
+                except (TypeError, ValueError, AttributeError):
+                    raise HTTPException(status_code=400, detail="Позиция: нужны item_id и quantity")
+                if iid not in returnable:
+                    raise HTTPException(
+                        status_code=400, detail=f"Позиция {iid} недоступна к возврату"
+                    )
+                if not (math.isfinite(qty) and 0 < qty <= returnable[iid] + 1e-9):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Позиция {iid}: количество должно быть от 0 до "
+                            f"{returnable[iid]:g}"
+                        ),
+                    )
+                qty = min(qty, returnable[iid])
+                ret_items.append((iid, qty, round(qty * price_by_id[iid], 2)))
+            # Выбраны все позиции в полном объёме — это фактически полный возврат
+            # (та же логика, что в боте: от типа зависит статус заказа).
+            is_full = len(ret_items) == len(returnable) and all(
+                abs(qty - returnable[iid]) < 1e-9 for iid, qty, _ in ret_items
+            )
+            return_type = "full" if is_full else "partial"
 
     try:
         res = await adb.create_return(
@@ -5377,14 +5421,13 @@ async def api_returns_create(request: Request):
             refund_method=refund,
             created_by=user["id"],
             force=privileged,
+            idem_key=idem.key,
         )
     except Exception:
-        if full_key:
-            await adb.idem_release(full_key)  # упало до store — освободить ретраю
+        await idem.release()  # упало до коммита — освободить ретраю
         raise
     if not res.get("ok"):
-        if full_key:
-            await adb.idem_release(full_key)
+        await idem.release()
         raise HTTPException(status_code=409, detail=res.get("error", "не удалось"))
 
     # То же уведомление с кнопками, что и бот-команда /return.
@@ -5396,8 +5439,7 @@ async def api_returns_create(request: Request):
     except Exception:
         logger.warning("return create notify failed", exc_info=True)
     resp = {"ok": True, "return_id": res["return_id"], "total_amount": res["total_amount"]}
-    if full_key:
-        await adb.idem_store(full_key, resp)
+    await idem.store(resp)
     return JSONResponse(resp)
 
 
@@ -5587,8 +5629,14 @@ async def api_add_item(request: Request):
                     status_code=409,
                     detail=f"Валюта заказа — {current_currency}: все позиции в одной валюте",
                 )
-            await adb.update_order_currency(data["order_id"], requested_currency)
+            if not await adb.update_order_currency(
+                data["order_id"], requested_currency, require_draft=True
+            ):
+                _require_draft_order(None)
 
+    # Статус перепроверяется в транзакции записи (require_draft): проверка
+    # выше — ранний понятный ответ, решает эта. Иначе сабмит между ними
+    # получал позицию в уже отправленный заказ.
     item_id = await adb.add_order_item(
         order_id=data["order_id"],
         product_name=data["product_name"],
@@ -5598,7 +5646,10 @@ async def api_add_item(request: Request):
         price=price,
         note=data.get("note", ""),
         product_id=int(product_ref) if product_ref.isdigit() else None,
+        require_draft=True,
     )
+    if item_id is None:
+        _require_draft_order(None)
     return JSONResponse({"item_id": item_id})
 
 
@@ -5621,7 +5672,12 @@ async def api_remove_item(request: Request):
     if not order or order["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Нет доступа")
     _require_draft_order(order)
-    await adb.remove_order_item(data["item_id"])
+    # Статус — ещё раз в транзакции удаления (см. add_item).
+    if not await adb.remove_order_item(data["item_id"], require_draft=True):
+        # Позиция на месте — значит, заказ успели отправить; иначе её удалили.
+        if await adb.get_order_item(data["item_id"]):
+            _require_draft_order(None)
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
     return JSONResponse({"ok": True})
 
 
@@ -5644,7 +5700,10 @@ async def api_set_agent(request: Request):
 
     agent_id = (data.get("agent_id") or "").strip()[:64]
     agent_name = (data.get("agent_name") or "").strip()[:200]
-    await adb.update_order_agent(data["order_id"], agent_id, agent_name)
+    if not await adb.update_order_agent(
+        data["order_id"], agent_id, agent_name, require_draft=True
+    ):
+        _require_draft_order(None)
     return JSONResponse({"ok": True})
 
 
@@ -6009,46 +6068,49 @@ async def api_mark_paid(request: Request):
     # Idempotency: double-click по «Оплачено» частичной суммой мог создать две
     # строки платежа. Ключ — в общей БД (T2.5), поэтому защита переживает
     # рестарт и работает между воркерами.
-    idem = _Idem(adb, "mark_paid", user["id"], data.get("idempotency_key"))
+    idem = _Idem(adb, "mark_paid", user["id"], data.get("idempotency_key"), atomic=True)
     cached = await idem.claim()
     if cached is not None:
         return JSONResponse(cached)
 
-    order = await adb.get_order(order_id)
-    if not order:
-        raise HTTPException(status_code=404, detail="Заказ не найден")
+    async with idem.released_on_reject():
+        order = await adb.get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="Заказ не найден")
 
-    user_id = user["id"]
-    role = get_role(user_id)
-    is_owner = order["user_id"] == user_id
-    is_boss = role in ("admin", "boss")
-    if not (is_owner or is_boss):
-        raise HTTPException(status_code=403, detail="Нет доступа")
+        user_id = user["id"]
+        role = get_role(user_id)
+        is_owner = order["user_id"] == user_id
+        is_boss = role in ("admin", "boss")
+        if not (is_owner or is_boss):
+            raise HTTPException(status_code=403, detail="Нет доступа")
 
-    # «Оплата сразу» принимается тоже: отклонённый автоплатёж иначе не
-    # заявить повторно, и заказ висел бы неоплаченным без единой кнопки.
-    if order.get("payment_type") not in ("credit", "paid"):
-        raise HTTPException(status_code=400, detail="Это не кредитный заказ")
+        # «Оплата сразу» принимается тоже: отклонённый автоплатёж иначе не
+        # заявить повторно, и заказ висел бы неоплаченным без единой кнопки.
+        if order.get("payment_type") not in ("credit", "paid"):
+            raise HTTPException(status_code=400, detail="Это не кредитный заказ")
+
+        # amount: если передан и валиден — частичная оплата; иначе закроет остаток.
+        # Через общий валидатор (isfinite + потолок) — inf/nan/огромное не пройдут.
+        amount_raw = data.get("amount")
+        amount = None
+        if amount_raw is not None and amount_raw != "":
+            amount = _validate_payment_amount(amount_raw, order.get("currency"))
 
     full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user_id)
     )
     username = f"@{user['username']}" if user.get("username") else ""
 
-    # amount: если передан и валиден — частичная оплата; иначе закроет остаток.
-    # Через общий валидатор (isfinite + потолок) — inf/nan/огромное не пройдут.
-    amount_raw = data.get("amount")
-    amount = None
-    if amount_raw is not None and amount_raw != "":
-        amount = _validate_payment_amount(amount_raw, order.get("currency"))
-
     try:
+        # Результат ложится в ключ той же транзакцией, что и платёж.
         ok, payment_id = await adb.mark_order_paid(
             order_id,
             user_id,
             full_name,
             amount=amount,
             username=username,
+            idem_key=idem.key,
         )
     except Exception:
         await idem.release()  # упало до store — ретрай должен быть возможен

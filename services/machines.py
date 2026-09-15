@@ -723,35 +723,90 @@ async def _lock_deal(txn: Any, deal_id: int) -> dict | None:
     return await txn.fetchrow(sql, deal_id)
 
 
+async def _set_deal_closed_locked(txn: Any, deal_id: int, *, closed: bool) -> dict | None:
+    """Закрыть (или снова открыть) рассрочку ВНУТРИ транзакции под `_lock_deal`
+    вместе со статусом машины. None — сделка уже была в нужном состоянии;
+    иначе {machine_id, status_from} для аудита после коммита.
+
+    Закрытие шло ПОСЛЕ коммита поступления отдельным вызовом, и повтор не был
+    безопасен: (1) сбой между ними оставлял сделку с покрытым графиком
+    открытой навсегда — повторное поступление принималось сверх цены, а
+    закрыть её было нечем; (2) удаление поступления, успевшее между коммитом и
+    закрытием, «переоткрывало» ещё не закрытую сделку, после чего запоздавшее
+    закрытие закрывало рассрочку, по которой денег уже нет.
+    """
+    if closed:
+        rows = await txn.execute(
+            "UPDATE machine_deals SET closed_at = $1 WHERE id = $2 AND closed_at IS NULL",
+            now_str(), deal_id,
+        )
+        target, expected = "sold", "on_credit"
+    else:
+        rows = await txn.execute(
+            "UPDATE machine_deals SET closed_at = NULL WHERE id = $1 AND closed_at IS NOT NULL",
+            deal_id,
+        )
+        target, expected = "on_credit", "sold"
+    if not rows:
+        return None
+    deal = await txn.fetchrow("SELECT machine_id FROM machine_deals WHERE id = $1", deal_id)
+    if not deal:
+        return None
+    moved = await txn.execute(
+        "UPDATE machines SET status = $1, updated_at = $2 WHERE id = $3 AND status = $4",
+        target, now_str(), int(deal["machine_id"]), expected,
+    )
+    return {
+        "machine_id": int(deal["machine_id"]),
+        "status_from": expected if moved else None,
+        "status_to": target,
+    }
+
+
+async def _audit_deal_state(change: dict | None, deal_id: int, *, user_id: int, full_name: str) -> None:
+    """Аудит закрытия/переоткрытия, сделанного `_set_deal_closed_locked`."""
+    if not change:
+        return
+    if change["status_from"]:
+        await _audit(
+            user_id, full_name, "machine_status_changed",
+            f"#{change['machine_id']}: {change['status_from']} → {change['status_to']}",
+        )
+    action = "machine_deal_closed" if change["status_to"] == "sold" else "machine_deal_reopened"
+    await _audit(user_id, full_name, action, f"сделка #{deal_id}")
+
+
 async def _insert_receipt_locked(
     txn: Any, deal: dict, amount_cents: int, *, user_id: int,
     note: str | None, received_at: str | None,
-) -> bool:
-    """Записать поступление ВНУТРИ транзакции под `_lock_deal`. True — график
-    покрыт целиком (сделку пора закрыть)."""
+) -> dict | None:
+    """Записать поступление ВНУТРИ транзакции под `_lock_deal`. Если график
+    покрыт целиком — закрыть сделку той же транзакцией. → изменение состояния
+    сделки для аудита (None — сделка не закрылась)."""
     stamp = now_str()
     await txn.execute(
         "INSERT INTO machine_payment_receipts (deal_id, amount_cents, received_at, "
         "received_by, note, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
         deal["id"], amount_cents, received_at or stamp, user_id, note, stamp,
     )
-    return await _sync_schedule_state(int(deal["id"]), user_id=user_id, db=txn)
+    covered = await _sync_schedule_state(int(deal["id"]), user_id=user_id, db=txn)
+    if not covered:
+        return None
+    return await _set_deal_closed_locked(txn, int(deal["id"]), closed=True)
 
 
 async def _after_receipt_added(
-    deal_id: int, amount_cents: int, currency: str, closed: bool, *,
+    deal_id: int, amount_cents: int, currency: str, closed: dict | None, *,
     user_id: int, full_name: str,
 ) -> dict:
-    """Аудит и закрытие сделки — ПОСЛЕ коммита: аудит пишет синхронный слой,
-    и на SQLite он ждал бы нашу же пишущую транзакцию. `close_deal` — CAS по
-    `closed_at IS NULL`, повторный вызов безвреден."""
+    """Аудит — ПОСЛЕ коммита: его пишет синхронный слой, и на SQLite он ждал
+    бы нашу же пишущую транзакцию. Само закрытие уже в транзакции поступления."""
     await _audit(
         user_id, full_name, "machine_receipt_added",
         f"сделка #{deal_id} · {money.format_cents(amount_cents)} {currency}",
     )
-    if closed:
-        await close_deal(deal_id, user_id=user_id, full_name=full_name)
-    return {"ok": True, "deal_closed": closed}
+    await _audit_deal_state(closed, deal_id, user_id=user_id, full_name=full_name)
+    return {"ok": True, "deal_closed": bool(closed)}
 
 
 async def add_receipt(
@@ -790,32 +845,34 @@ async def add_receipt(
     )
 
 
-async def _delete_receipt_locked(txn: Any, receipt_id: int, *, user_id: int) -> tuple[int, int, bool]:
+async def _delete_receipt_locked(
+    txn: Any, receipt_id: int, *, user_id: int
+) -> tuple[int, int, dict | None]:
     """Удалить поступление внутри транзакции под `_lock_deal`.
-    → (deal_id, amount_cents, график всё ещё покрыт)."""
+    → (deal_id, amount_cents, изменение состояния сделки для аудита).
+
+    Сделку могли закрыть этим самым поступлением. Убрали деньги и график больше
+    не покрыт — рассрочка снова открыта ТОЙ ЖЕ транзакцией, иначе долг исчезает
+    из напоминаний и дебиторки, хотя платёж не получен."""
     row = await txn.fetchrow(
         "SELECT deal_id, amount_cents FROM machine_payment_receipts WHERE id = $1", receipt_id
     )
     deal_id = int(row["deal_id"])
     await txn.execute("DELETE FROM machine_payment_receipts WHERE id = $1", receipt_id)
     covered = await _sync_schedule_state(deal_id, user_id=user_id, db=txn)
-    return deal_id, int(row["amount_cents"]), covered
+    reopened = None if covered else await _set_deal_closed_locked(txn, deal_id, closed=False)
+    return deal_id, int(row["amount_cents"]), reopened
 
 
 async def _after_receipt_deleted(
-    deal_id: int, amount_cents: int, covered: bool, *, user_id: int, full_name: str,
+    deal_id: int, amount_cents: int, reopened: dict | None, *, user_id: int, full_name: str,
 ) -> dict:
     await _audit(
         user_id, full_name, "machine_receipt_deleted",
         f"сделка #{deal_id} · {money.format_cents(amount_cents)}",
     )
-    if not covered:
-        # Сделку могли закрыть этим самым поступлением. Убрали деньги — рассрочка
-        # снова открыта, иначе долг исчезает из напоминаний и дебиторки, хотя
-        # платёж не получен.
-        reopened = await _reopen_deal(deal_id, user_id=user_id, full_name=full_name)
-        return {"ok": True, "deal_reopened": reopened}
-    return {"ok": True, "deal_reopened": False}
+    await _audit_deal_state(reopened, deal_id, user_id=user_id, full_name=full_name)
+    return {"ok": True, "deal_reopened": bool(reopened)}
 
 
 async def delete_receipt(receipt_id: int, *, user_id: int, full_name: str = "") -> dict:
@@ -830,28 +887,10 @@ async def delete_receipt(receipt_id: int, *, user_id: int, full_name: str = "") 
         # Перечитываем под блокировкой: параллельный запрос мог удалить его первым.
         if not await txn.fetchrow("SELECT id FROM machine_payment_receipts WHERE id = $1", receipt_id):
             return {"ok": False, "error": "Поступление не найдено"}
-        deal_id, amount, covered = await _delete_receipt_locked(txn, receipt_id, user_id=user_id)
+        deal_id, amount, reopened = await _delete_receipt_locked(txn, receipt_id, user_id=user_id)
     return await _after_receipt_deleted(
-        deal_id, amount, covered, user_id=user_id, full_name=full_name,
+        deal_id, amount, reopened, user_id=user_id, full_name=full_name,
     )
-
-
-async def _reopen_deal(deal_id: int, *, user_id: int, full_name: str = "") -> bool:
-    """Снять закрытие с рассрочки и вернуть машину в «в рассрочку»."""
-    rows = await adb_core.execute(
-        "UPDATE machine_deals SET closed_at = NULL WHERE id = $1 AND closed_at IS NOT NULL",
-        deal_id,
-    )
-    if not rows:
-        return False
-    deal = await adb_core.fetchrow("SELECT machine_id FROM machine_deals WHERE id = $1", deal_id)
-    if deal:
-        await set_status(
-            int(deal["machine_id"]), "on_credit",
-            user_id=user_id, full_name=full_name, expected="sold",
-        )
-    await _audit(user_id, full_name, "machine_deal_reopened", f"сделка #{deal_id}")
-    return True
 
 
 async def list_receipts(deal_id: int) -> list[dict]:
@@ -933,14 +972,14 @@ async def pay_installment(
                     "ok": False,
                     "error": "Платёж покрыт поступлениями другого размера — удалите нужное вручную",
                 }
-            _, _, covered = await _delete_receipt_locked(txn, int(last["id"]), user_id=user_id)
+            _, _, reopened = await _delete_receipt_locked(txn, int(last["id"]), user_id=user_id)
 
     if paid:
         return await _after_receipt_added(
             deal_id, amount, str(deal["currency"]), closed, user_id=user_id, full_name=full_name,
         )
     return await _after_receipt_deleted(
-        deal_id, amount, covered, user_id=user_id, full_name=full_name,
+        deal_id, amount, reopened, user_id=user_id, full_name=full_name,
     )
 
 
