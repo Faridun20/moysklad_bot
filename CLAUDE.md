@@ -8,6 +8,8 @@ pip install -r requirements.txt -r requirements-dev.txt   # dev-зависимо
 pytest tests/                              # тесты (SQLite в /tmp, isolated_db fixture; env-дефолты в conftest)
 pytest tests/e2e -m e2e                    # E2E: Chromium против живого uvicorn (playwright из requirements-dev;
                                            # браузер: python -m playwright install chromium ИЛИ PW_CHROMIUM_PATH)
+TEST_PG_URL=postgresql://… pytest tests/scenarios   # сценарии «день склада» через HTTP на живом Postgres
+scripts/local_ci.sh .                      # ВСЯ CI в контейнерах (ruff/mypy/vitest/pytest+PG/E2E/perf), см. DEPLOY.md
 pytest tests/perf -m perf -s               # perf: N+1 по масштабированию, размер ответа, нагрузка на живой
                                            # сервер (гонки/идемпотентность/остаток), бенчмарки (pytest-benchmark)
 ruff check .                               # полный набор из pyproject.toml (E9,F,B,ASYNC,UP,SIM)
@@ -739,6 +741,16 @@ SHA одинаково, поэтому `webapp/server.py` больше не сч
 - `mypy` — **блокирующий** (модули вычищены до 0 ошибок, тип-регрессии валят CI);
 - `pytest` + coverage с «храповиком» `--cov-fail-under=55` (факт после T3.3 ~67%, буфер ~12%: срез бот-дублей убрал в основном непокрытый код).
 
+- `test` job поднимает service-контейнер `postgres:16-alpine` и ставит `TEST_PG_URL` — `*_postgres.py` и `tests/scenarios` там идут, а не пропускаются.
+
+**Локальная CI на сервере — гейт выката** (`scripts/local_ci.sh`, обёртка
+`/srv/docker/moysklad_bot_local_ci.sh`, подробно — DEPLOY.md). Всё то же плюс
+LibreOffice и боевой образ, шардами в одноразовых контейнерах (исходники и
+`/tmp` — на tmpfs: SQLite-тесты на overlayfs шли вчетверо дольше). Образ CI —
+`scripts/ci/Dockerfile.ci` поверх корневого `Dockerfile`, кэш по хэшу
+`Dockerfile`+`requirements*.txt`. Добавляешь системную зависимость тестам — в
+`Dockerfile.ci`, а не «поставлю руками на сервере».
+
 `TELEGRAM_TOKEN=0:fake` — заглушка для импорта config (в workflow и в `tests/conftest.py` через `os.environ.setdefault`). `MS_TOKEN` больше не нужен: его читает только `scripts/migrate_from_moysklad.py`, и то из окружения напрямую.
 
 ## Тесты (конвенция)
@@ -774,6 +786,23 @@ jsdom-смоуком (сервера нет): первый же прогон н�
 «отгружен» значит поймать вопрос «Отметить отгруженным?», жди эмодзи ответа;
 (4) сдача (`create_cash_deposit`) распределяется только по `shipped`, а
 одобрение оставляет заказ `approved` — «отгружен» ставит кладовщик отдельно.
+
+**Сценарии (`tests/scenarios/`, только `TEST_PG_URL`).** Цепочки шагов разных
+ролей через HTTP-ручки на живом Postgres: товар → приход, контейнер → остаток,
+заказ → одобрение → отгрузка → оплата → сдача → долги, отмена и возврат,
+техника → рассрочка, границы ролей. Сервер — `tests/liveserver.py`, клиент —
+httpx. Правила: (1) шаги — функции `tests/scenarios/flows.py`, сценарий payload
+сам не собирает: поменялся поток — правится одна функция; (2) состояние БД —
+синхронным слоем (`w.rows`), НЕ `run_async`: он с другого loop'а рвёт
+asyncpg-пул сервера посреди фоновых задач; (3) после сценария фикстура `world`
+проверяет инварианты (`invariants.py`, считают НЕЗАВИСИМО от `services.debts`):
+остаток ≥ 0 и = приходы − расходы по действующим накладным, заявлено по заказу
+≤ сумма − возвраты, «оплачен» только при нулевом остатке, по отменённому
+заказу нет живых платежей, отгруженное списано накладной, «Долги» = расчёт по
+строкам, аудит пишется, 5xx и ERROR в логах нет; (4) известный баг — тест на
+ПРАВИЛЬНОЕ поведение с `xfail(strict=True, reason=…)`: починили — xfail
+«проходит» и валит прогон, маркер снимается вместе с фиксом. Два браузерных
+дня с теми же инвариантами — `tests/e2e/test_journeys.py`.
 
 **Perf-слой (`tests/perf/`, маркер `perf`, отдельный job в CI).** Четыре
 инструмента, у каждого своя задача:

@@ -64,6 +64,31 @@ def test_version_falls_back_when_platform_is_silent(version_mod):
     assert mod.APP_VERSION and mod.APP_VERSION.strip()
 
 
+def test_timestamp_version_survives_module_reload(version_mod, monkeypatch):
+    """Без SHA и без .git версия — момент старта ПРОЦЕССА, а не импорта модуля.
+
+    Так идут тесты в локальной CI (исходники без .git, образ без build-arg):
+    перезагрузка `services.version` давала новый таймстамп, а
+    `webapp/server.py` держал старый — `/api/me` и `/healthz` отвечали не той
+    версией, что бот, хотя процесс один.
+    """
+    import subprocess
+
+    import services.version as mod
+
+    def no_git(*args, **kwargs):
+        raise FileNotFoundError("git")
+
+    # Патчим сам subprocess, а не `mod._git_sha`: reload заново определит функцию.
+    monkeypatch.setattr(subprocess, "check_output", no_git)
+    started = mod.STARTED_AT
+    monkeypatch.setattr("time.time", lambda: started + 3600)
+    first = version_mod()
+    second = version_mod()
+    assert first.STARTED_AT == second.STARTED_AT == started
+    assert first.APP_VERSION == second.APP_VERSION == str(int(started))
+
+
 def test_commit_subject_is_the_first_line_only(version_mod):
     """Заголовок коммита, а не всё тело: восемь знаков SHA человек с GitHub не
     сверит, а «Пикеры вместо нативных меню…» сверяется с первого взгляда."""

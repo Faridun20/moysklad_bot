@@ -221,6 +221,56 @@ Forgejo на сервере держит зеркало GitHub только дл
 10 минут). Пушить в Forgejo не нужно: у него нет доступа к Docker и хуков
 выката — старая схема «push в Forgejo → хук» убрана 14.09.2026.
 
+### Локальная CI — гейт перед выкатом
+
+GitHub Actions ловит не всё: у раннера нет Postgres (все `*_postgres.py` и
+сценарии `tests/scenarios` там пропускаются), нет LibreOffice (тест расписки
+с настоящим `soffice`), системные библиотеки не те, что в боевом образе, а
+API проверок без токена регулярно упирается в лимит — и выкат шёл «без CI».
+Поэтому новый коммит `main` сначала проверяется НА ЭТОМ СЕРВЕРЕ:
+
+- `scripts/local_ci.sh <каталог>` (в репозитории) гоняет в одноразовых
+  контейнерах: ruff (строгий + полный) и mypy; vitest (node:20); pytest
+  `-m "not e2e and not perf"` с одноразовым Postgres 16 (`TEST_PG_URL`),
+  шардами, с тем же порогом покрытия, что в GitHub CI; E2E в Chromium с
+  LibreOffice, шардами; perf — последним, в одиночку. Образ
+  `moysklad-bot-ci:<хэш>` собирается из `Dockerfile` коммита +
+  `scripts/ci/Dockerfile.ci` и пересобирается, только когда меняются
+  `Dockerfile`/`requirements*.txt`. Код выхода: 0 — зелёная, 1 — упали
+  проверки, 2 — сломалась сама CI. Контейнеры, сеть и тома подчищаются на
+  любом выходе (в том числе по Ctrl+C).
+- `/srv/docker/moysklad_bot_local_ci.sh` (вне репозитория, как и автодеплой)
+  берёт коммит из bare-клона, запускает скрипт ЭТОГО коммита (коммит старше
+  CI — копией из `/srv/docker/moysklad_bot_ci/fallback/`) и пишет итог по SHA:
+  `/srv/docker/moysklad_bot_ci/<sha>.status` (`running` / `green` / `red` /
+  `error`) и полный лог `<sha>.log`; журнал запусков — `runner.log` там же.
+- Автодеплой спрашивает `moysklad_bot_local_ci.sh gate <sha>` — ответ за
+  секунды: прогон (~5 минут на свежем образе; пересборка образа — ещё ~1,5 минуты) идёт отдельным процессом (закрыв унаследованный flock), и
+  тик cron не держит замок. `green` — выкат; `running` — ждать; `red` — не
+  выкатывать (SHA в `moysklad_bot_failed_sha`, владельцу в Telegram уходит
+  список упавших тестов — одноразовым контейнером `bot` с боевым `.env`,
+  получатели `ADMIN_IDS`); `error` (CI трижды не смогла отработать) — тоже не
+  выкатывать. Новый коммит отменяет незаконченный прогон предыдущего. GitHub
+  Actions остаются справочной строкой в журнале выката.
+
+Вручную:
+
+```bash
+/srv/docker/moysklad_bot_local_ci.sh run            # проверить текущий main (в терминале)
+/srv/docker/moysklad_bot_local_ci.sh run my-branch  # любую ветку с GitHub
+/srv/docker/moysklad_bot_local_ci.sh run <sha>      # коммит, уже лежащий в bare-клоне
+/srv/docker/moysklad_bot_local_ci.sh status         # последние прогоны
+/srv/docker/moysklad_bot_local_ci.sh notify-test    # канал уведомлений: число получателей, без отправки
+scripts/local_ci.sh .                               # рабочая копия как есть (итог не записывается)
+scripts/local_ci.sh --skip e2e,perf .               # быстрее: без браузера и perf
+scripts/local_ci.sh --jobs unit --unit-shards 8 .   # только pytest
+```
+
+Ручной `run` тоже пишет итог по SHA: зелёный прогон `main` автодеплой примет
+без повторной проверки. Выкатить без гейта (CI сломана, а выкат нужен):
+`bash /srv/docker/moysklad_bot_autodeploy.sh --force`. Красный коммит не
+перепроверяется каждые 2 минуты: следующая попытка — на новом коммите.
+
 ## Грабли, на которые легко наступить
 
 ### Polling и webhook несовместимы в двухсервисной топологии

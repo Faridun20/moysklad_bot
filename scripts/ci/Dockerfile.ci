@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+#
+# Образ локальной CI (scripts/local_ci.sh): боевой образ + dev-зависимости +
+# Chromium для Playwright. Собирается ПОВЕРХ образа из корневого Dockerfile
+# того же коммита (BASE_IMAGE), поэтому системные библиотеки — те же, что на
+# проде: LibreOffice (юр. документы — тест с настоящим soffice), pango для
+# WeasyPrint, tzdata, pg_dump. GitHub-раннер ничего из этого не ставит, и
+# часть тестов там молча пропускается.
+#
+# Код в образ НЕ кладётся: скрипт монтирует исходники коммита и копирует их
+# внутрь контейнера. Образ зависит только от Dockerfile и requirements*.txt —
+# по их хэшу он и кэшируется (тег moysklad-bot-ci:<хэш>).
+#
+# Тесты идут от root: браузер Playwright ставится в кэш root'а, а копия
+# исходников живёт внутри одноразового контейнера.
+ARG BASE_IMAGE=moysklad-bot-ci-base:latest
+FROM ${BASE_IMAGE}
+
+USER root
+
+COPY requirements-dev.txt /tmp/requirements-dev.txt
+# --with-deps ставит системные библиотеки Chromium (apt), без них браузер
+# не стартует на slim-образе.
+RUN pip install --no-cache-dir -q -r /tmp/requirements-dev.txt \
+    && python -m playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV TELEGRAM_TOKEN=0:fake-ci-token \
+    PYTHONDONTWRITEBYTECODE=1 \
+    GIT_COMMIT_SHA= \
+    GIT_COMMIT_MESSAGE= \
+    GIT_BRANCH=
+
+WORKDIR /work
+CMD ["bash"]

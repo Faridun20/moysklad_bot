@@ -42,7 +42,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Момент импорта = момент старта процесса: модуль тянется из bot.py и
 # webapp/server.py на их загрузке.
-STARTED_AT = time.time()
+#
+# `importlib.reload` исполняет модуль заново в ТОМ ЖЕ словаре — прежний момент
+# старта берём оттуда. Иначе без SHA (сборка без GIT_COMMIT_SHA, исходники без
+# .git) перезагрузка давала новую «версию»-таймстамп, и она расходилась с той,
+# что `webapp/server.py` взял на своём импорте: процесс тот же, а версии две.
+STARTED_AT: float = globals().get("STARTED_AT") or time.time()
 
 
 def _env(*names: str) -> str:
