@@ -266,6 +266,24 @@ def _checks() -> list[Check]:
         Check("daily_cash_counts_currency_chk", "daily_cash_counts",
               "currency ~ '^[A-Z]{3}$'", ("id", "currency"),
               "валюта — трёхбуквенный код в верхнем регистре"),
+        # ── Долги поставщикам (services.supplier_debts) ──
+        # Способ и источник курса — те же списки, что у разбивки оплаты: деньги
+        # ходят в обе стороны одними и теми же способами, и второй список
+        # разошёлся бы с первым на первой же правке.
+        Check("supplier_invoice_terms_type_chk", "supplier_invoice_terms",
+              "payment_type IN ('credit', 'paid')", ("invoice_id", "payment_type"),
+              "условия оплаты прихода"),
+        Check("supplier_payment_parts_method_chk", "supplier_payment_parts",
+              f"method IN {_in(sorted(METHODS))}", ("payment_id", "method"),
+              "способ выплаты поставщику"),
+        Check("supplier_payment_parts_rate_source_chk", "supplier_payment_parts",
+              f"rate_source IN {_in(list(RATE_SOURCES))}", ("payment_id", "rate_source"),
+              "источник курса выплаты"),
+        Check("supplier_payment_parts_amount_chk", "supplier_payment_parts",
+              "debt_amount_cents > 0", ("payment_id", "debt_amount_cents"),
+              "сумма погашения долга > 0"),
+        Check("supplier_payments_amount_chk", "supplier_payments", "amount_cents > 0",
+              ("id", "counterparty_id", "amount_cents"), "выплата поставщику > 0"),
     ]
 
 
@@ -354,6 +372,15 @@ FOREIGN_KEYS: list[ForeignKey] = [
     ForeignKey("stock_counts_warehouse_fk", "stock_counts", "warehouse_id", "warehouses"),
     ForeignKey("stock_count_lines_count_fk", "stock_count_lines", "count_id", "stock_counts"),
     ForeignKey("stock_count_lines_product_fk", "stock_count_lines", "product_id", "products"),
+    # Долги поставщикам: условия оплаты живут при накладной, «с чего заплатили» —
+    # при выплате. Ни то, ни другое не удаляется раньше своего родителя:
+    # накладную отменяют (статус), выплату не стирают вовсе.
+    ForeignKey("supplier_invoice_terms_invoice_fk", "supplier_invoice_terms", "invoice_id",
+               "invoices"),
+    ForeignKey("supplier_payment_parts_payment_fk", "supplier_payment_parts", "payment_id",
+               "supplier_payments"),
+    ForeignKey("supplier_payment_parts_account_fk", "supplier_payment_parts", "account_id",
+               "acc_accounts"),
 ]
 
 # UNIQUE-индексы из `_index_ddls`, под которые заранее ищутся дубли:

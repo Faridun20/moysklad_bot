@@ -2719,6 +2719,122 @@ describe('форма накладной: «Расход» показываетс
   });
 });
 
+describe('накладная прихода: условия оплаты поставщику', () => {
+  const driver = (role) => `
+    currentUser = { role: ${JSON.stringify(role)} };
+    whDraft = { type: 'incoming', counterparty_id: 4, items: [], comment: '' };
+    api = async (path) => (path === '/api/wh/stock'
+      ? { products: [{ product_id: 1, name: 'Насос', unit: 'шт', quantity: 5 }] }
+      : { counterparties: [{ id: 4, name: 'Shandong Machinery' }] });
+    window.__ready = renderWhInvoiceNew();
+  `;
+
+  it('руководителю — «В долг / Уже оплачено» и срок оплаты', async () => {
+    const window = boot(driver('boss'));
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('[data-whterms="credit"]')).not.toBeNull();
+    expect(content.querySelector('[data-whterms="paid"]')).not.toBeNull();
+    expect(content.querySelector('#wh-due-wrap').classList.contains('hidden')).toBe(false);
+
+    // «Уже оплачено» — срока у прихода нет по смыслу.
+    content.querySelector('[data-whterms="paid"]').click();
+    expect(content.querySelector('#wh-due-wrap').classList.contains('hidden')).toBe(true);
+  });
+
+  it('менеджеру блока нет: суммы прихода он не видит и оплату не отмечает', async () => {
+    const window = boot(driver('manager'));
+    await window.__ready;
+    expect(window.document.querySelector('#wh-terms')).toBeNull();
+  });
+});
+
+// ─── Деньги → Поставщикам: «мы должны» ───────────────────────────────────────
+
+describe('Деньги → Поставщикам', () => {
+  const evil = '<img src=x onerror="window.__pwned=1">';
+  const block = (total) => ({
+    by_currency: total ? [{ currency: 'USD', total }] : [],
+    base_total: total, partial: false, count: total ? 1 : 0,
+  });
+  const DATA = {
+    ok: true,
+    today: '2026-03-14',
+    base_currency: 'USD',
+    currencies: ['USD', 'UZS'],
+    total: block(9000),
+    aging: {
+      overdue: block(9000), d0_30: block(0), d31_60: block(0),
+      d61_90: block(0), d90_plus: block(0),
+    },
+    suppliers: [{ supplier_id: 3, supplier_name: evil, invoices: 1, oldest_due: '2026-01-01',
+                  days: 72, advance: [], ...block(9000) }],
+    debts: [{ invoice_id: 11, invoice_number: 'IN-11', invoice_date: '2026-01-01',
+              supplier_id: 3, supplier_name: evil, container_id: null, currency: 'USD',
+              total: 9000, paid: 0, remaining: 9000, remaining_cents: 900000,
+              due_date: '2026-01-01', payment_type: 'credit', days: 72, state: 'overdue' }],
+    unpriced: [{ invoice_id: 12, invoice_number: 'IN-12', invoice_date: '2026-02-02',
+                 supplier_id: 3, supplier_name: evil, container_id: 5 }],
+    advances: [{ currency: 'UZS', total: 1000 }],
+    payments: [{ id: 1, supplier_id: 3, invoice_id: null, amount: 500, currency: 'USD',
+                 debt_amount: 500, debt_currency: 'USD', method: 'bank',
+                 method_label: 'Перечисление', account_id: 2,
+                 account_label: 'со счёта ООО Farid (…6789)', rate: null, rate_source: 'same',
+                 comment: '', paid_at: '2026-03-01 10:00', created_by: 2,
+                 created_by_name: 'Boss', migrated: false }],
+    payments_total: 1,
+  };
+
+  const boss = () => boot(`
+    currentUser = { role: 'boss' };
+    window.__calls = [];
+    api = async (path, body) => { window.__calls.push([path, body]); return ${JSON.stringify(DATA)}; };
+    window.__ready = renderSupplierDebts(document.getElementById('content'));
+  `);
+
+  it('итог, поставщики, приходы и лента выплат — одним ответом сервера', async () => {
+    const window = boss();
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(window.__calls[0][0]).toBe('/api/suppliers/debts');
+    expect(window.__calls).toHaveLength(1);
+    expect(content.querySelector('.c-row[data-inv="11"]')).not.toBeNull();
+    expect(content.querySelector('.c-row[data-sup="3"]')).not.toBeNull();
+    // Приход без цены объявляется вслух: «долга нет» — неправильный ответ про
+    // товар, который уже стоит на складе.
+    expect(content.textContent).toContain('Приход без суммы');
+    // Выплата подписана «со счёта», а не «на счёт»: деньги ушли, а не пришли.
+    expect(content.textContent).toContain('со счёта');
+  });
+
+  it('имя поставщика — чужой ввод: разметкой не становится', async () => {
+    const window = boss();
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('img')).toBeNull();
+    expect(window.__pwned).toBeUndefined();
+    expect(content.textContent).toContain('<img src=x');
+  });
+
+  it('просроченный приход помечен статусом, а не одним цветом текста', async () => {
+    const window = boss();
+    await window.__ready;
+    expect(window.document.querySelector('.c-row[data-inv="11"]').dataset.status)
+      .toBe('overdue');
+  });
+
+  it('ошибка загрузки — сообщение с «Повторить», а не пустой экран', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss' };
+      api = async () => { throw new Error('Нет подключения к интернету'); };
+      window.__ready = renderSupplierDebts(document.getElementById('content'));
+    `);
+    await window.__ready;
+    expect(window.document.getElementById('content').textContent)
+      .toContain('Нет подключения');
+  });
+});
+
 // ─── Сверка вкладок с ролями ручек: вкладка не должна вести к 403 ───────────
 
 describe('вкладки под роль совпадают с тем, кому отвечают ручки', () => {

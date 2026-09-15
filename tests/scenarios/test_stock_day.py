@@ -137,3 +137,60 @@ def test_writeoff_and_inventory_count_day(world):
 
     expect_audit(w.db, "stock_writeoff")
     expect_audit(w.db, "stock_count_apply")
+def test_container_from_supplier_becomes_a_debt_and_is_paid(world):
+    """Контейнер от поставщика: приняли → долг перед ним → выплата → остаток.
+
+    Продолжение предыдущего сценария на закупочной стороне. Пока цена не
+    вписана, экран честно говорит «приход без суммы»; вписали — появился долг;
+    заплатили частью со счёта и частью сумами по курсу — долг уменьшился ровно
+    на пересчитанную сумму, и деньги легли в `supplier_payments`, а не в
+    платежи клиентов.
+    """
+    w = world
+    pump = f.create_product(w, "Гидронасос A10VSO", unit="шт")
+    supplier = f.create_counterparty(w, f.BOSS, "Shandong Machinery")
+
+    cid = f.create_container(w, f.MGR, "TCKU 765 432 1")
+    item = f.add_container_item(w, f.MGR, cid, "Гидронасос A10VSO", 10, product_id=pump)
+    f.container_supplier(w, f.MGR, cid, supplier, "Shandong Machinery")
+    f.container_arrived(w, f.MGR, cid)
+    assert f.receive_container(w, f.MGR, cid, {item: 10})["receipt"]["ok"]
+    assert f.stock(w, pump) == 10
+
+    # Цену ещё не вписали: «долга нет» — неправильный ответ про товар на складе.
+    before = f.supplier_debts(w, f.BOSS)
+    assert before["total"]["count"] == 0
+    assert [u["supplier_name"] for u in before["unpriced"]] == ["Shandong Machinery"]
+
+    # Руководство вписывает закупочную — приход получает сумму, долг появляется.
+    f.costing_enabled(w, f.BOSS, True)
+    f.container_prices(w, f.BOSS, cid, {item: 900})
+    debts = f.supplier_debts(w, f.BOSS)
+    assert debts["total"]["by_currency"] == [{"currency": "USD", "total": 9000.0}]
+    row = debts["debts"][0]
+    assert row["supplier_name"] == "Shandong Machinery" and row["remaining"] == 9000.0
+    invoice_id = row["invoice_id"]
+
+    # Срок оплаты и две выплаты: со счёта в долларах и наличными сумами.
+    f.supplier_terms(w, f.BOSS, invoice_id, "credit", "2030-03-01")
+    f.supplier_payment(w, f.BOSS, supplier, 5000, invoice_id=invoice_id, method="bank")
+    f.supplier_payment(w, f.BOSS, supplier, 12_700_000, invoice_id=invoice_id,
+                       method="cash", currency="UZS", rate="12700")
+    after = f.supplier_debts(w, f.BOSS)
+    assert after["debts"][0]["remaining"] == 3000.0, after["debts"][0]
+    assert after["debts"][0]["due_date"] == "2030-03-01"
+
+    # Больше остатка по накладной не примем — это опечатка, а не аванс.
+    f.supplier_payment(w, f.BOSS, supplier, 9999, invoice_id=invoice_id, expect=409)
+    # А выплата без привязки сверх долга законна: аванс поставщику — практика.
+    f.supplier_payment(w, f.BOSS, supplier, 4000)
+    final = f.supplier_debts(w, f.BOSS)
+    assert final["total"]["count"] == 0
+    assert final["advances"] == [{"currency": "USD", "total": 1000.0}]
+
+    # Деньги ушли поставщику, а не пришли от клиента.
+    assert w.rows("SELECT id FROM payments") == []
+    assert len(w.rows("SELECT id FROM supplier_payments")) == 3
+    # Менеджеру закупочная сторона закрыта: это себестоимость.
+    assert w.status(f.MGR, "/api/suppliers/debts") == 403
+    expect_audit(w.db, "supplier_terms_set", "supplier_payment_recorded")

@@ -535,6 +535,37 @@ def _service_flows(db, tag: str) -> None:
     assert _run(mdr.cancel(gone_req["request_id"], **mgr))["ok"]
     assert _run(machines.delete_machine(third["machine_id"], user_id=BOSS))["ok"]
 
+    # Долги поставщикам: приход от поставщика → срок оплаты → выплата со счёта
+    # и наличными сумами по курсу (FK на накладную, выплату и счёт; CHECK
+    # способа, источника курса и сумм).
+    from services import supplier_debts
+
+    sup_actor = order_payments.Actor(BOSS, "Boss", "boss")
+    sup_cp = _run(counterparties.create(f"Поставщик {tag}"))["counterparty_id"]
+    sup_inv = _run(warehouse.create_invoice(
+        invoice_type="incoming", warehouse_id=wid, counterparty_id=sup_cp,
+        items=[{"product_id": pid, "quantity": 4, "price_cents": 25_000}],
+    ))
+    assert sup_inv["ok"], sup_inv
+    assert _run(supplier_debts.set_terms(
+        sup_actor, sup_inv["invoice_id"], "credit", "2030-02-01"))["ok"]
+    assert _run(supplier_debts.record_payment(sup_actor, {
+        "supplier_id": sup_cp, "invoice_id": sup_inv["invoice_id"],
+        "parts": [{"method": "bank", "currency": "USD", "amount": "300",
+                   "account_id": bank_acc["id"]},
+                  # Курс СВОЙ — рядом с курсом ЦБ (12 700), но не равный ему:
+                  # совпавший с ЦБ пишется источником `cbu`, и строки `manual`
+                  # под CHECK источника курса в базе так и не появилось бы.
+                  {"method": "cash", "currency": "UZS", "amount": "1270000", "rate": "12600"}],
+    }))["ok"]
+    # Второй приход отмечается оплаченным сразу — в долги он не попадает.
+    paid_inv = _run(warehouse.create_invoice(
+        invoice_type="incoming", warehouse_id=wid, counterparty_id=sup_cp,
+        items=[{"product_id": pid, "quantity": 1, "price_cents": 1_000}],
+    ))
+    assert _run(supplier_debts.set_terms(sup_actor, paid_inv["invoice_id"], "paid"))["ok"]
+    assert _run(supplier_debts.overview())["total"]["count"] >= 1
+
 
 def test_constraints_hold_for_real_service_flows(pg_db):
     from scripts import apply_constraints
@@ -568,6 +599,11 @@ def test_constraints_hold_for_real_service_flows(pg_db):
         ("stock_writeoffs", "count_id IS NOT NULL"),
         ("stock_counts", "status = 'applied'"), ("stock_count_lines", "TRUE"),
         ("daily_cash_counts", "diff_cents = 0"), ("daily_cash_counts", "diff_cents <> 0"),
+        ("supplier_invoice_terms", "payment_type = 'credit'"),
+        ("supplier_invoice_terms", "payment_type = 'paid'"),
+        ("supplier_payments", "invoice_id IS NOT NULL"),
+        ("supplier_payment_parts", "account_id IS NOT NULL"),
+        ("supplier_payment_parts", "rate_source = 'manual'"),
     ):
         n = _one(db, f"SELECT COUNT(*) AS n FROM {table} WHERE {where}")["n"]
         assert n > 0, table

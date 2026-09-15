@@ -64,6 +64,8 @@ NEW_INDEXES = [
     # записи и склейка строк одного пересчёта в истории).
     "idx_daily_cash_counts_key",
     "idx_daily_cash_counts_user",
+    "idx_supplier_payments_invoice",
+    "idx_supplier_payment_parts_account",
 ]
 
 
@@ -399,6 +401,16 @@ def test_check_values_follow_the_code():
         assert f"'{kind}'" in checks["stock_writeoffs_kind_chk"]
     for status in inventory.COUNT_STATUSES:
         assert f"'{status}'" in checks["stock_counts_status_chk"]
+    # Выплата поставщику ходит теми же способами и с тем же источником курса,
+    # что и оплата заказа: второй список разошёлся бы с первым.
+    from services.supplier_debts import PAYMENT_TYPES
+
+    for method in METHODS:
+        assert f"'{method}'" in checks["supplier_payment_parts_method_chk"]
+    for source in RATE_SOURCES:
+        assert f"'{source}'" in checks["supplier_payment_parts_rate_source_chk"]
+    for ptype in PAYMENT_TYPES:
+        assert f"'{ptype}'" in checks["supplier_invoice_terms_type_chk"]
     names = [c.name for c in apply_constraints._checks()]
     names += [fk.name for fk in apply_constraints.FOREIGN_KEYS]
     assert len(names) == len(set(names))

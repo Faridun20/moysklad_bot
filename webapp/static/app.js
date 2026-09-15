@@ -8162,6 +8162,7 @@ async function renderMoneyScreen() {
 
   const body = document.getElementById('money-body');
   if (moneyTab === 'debts') await renderDebts(body);
+  else if (moneyTab === 'suppliers') await renderSupplierDebts(body);
   else if (moneyTab === 'report') await renderMoneyReport(body);
   // Сверка кассы (cash_reconcile.js): пересчёт наличных руками и его история.
   // От `accounting_enabled` не зависит — ожидаемое считает
@@ -9621,6 +9622,313 @@ async function renderDebts(container) {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Деньги → Поставщикам: «мы должны».
+//
+// Зеркало «Долгов». Долг — это приходная накладная с поставщиком, выплата —
+// строка `supplier_payments`; всё считает сервер (`services/supplier_debts.py`),
+// экран только рисует. Вкладка есть только у руководства: сумма прихода это
+// закупочная цена.
+// ═══════════════════════════════════════════════════════════════════════════
+
+let supplierDebtsData = null;   // последний ответ — им открываются формы
+
+async function renderSupplierDebts(container) {
+  container = container || document.getElementById('content');
+  container.innerHTML = loading('Загрузка расчётов с поставщиками…');
+  let data;
+  try {
+    data = await api('/api/suppliers/debts', {});
+  } catch (e) {
+    container.innerHTML = errorBox(e.message || String(e));
+    return;
+  }
+  supplierDebtsData = data;
+  const reload = () => renderSupplierDebts(container);
+  const debts = data.debts || [];
+  const suppliers = data.suppliers || [];
+  const advances = (data.advances || []).filter(a => a.total > 0);
+  const unpriced = data.unpriced || [];
+  const payments = data.payments || [];
+
+  let html = `<div class="c-actions"><button class="btn-primary" id="sup-pay">${icon('cash')} Записать выплату</button></div>`;
+
+  if (data.total && data.total.count) {
+    html += `<div class="section-label">Мы должны</div>
+      <div class="c-surface c-surface--list">
+        <div class="c-row">
+          <div class="card-row-info"><div class="card-row-title">Всего</div>
+            <div class="card-row-sub">${plural(data.total.count, ['приход', 'прихода', 'приходов'])}</div></div>
+          <div class="card-row-value"><b>${escapeHtml(moneyBlockLabel(data.total))}</b></div>
+        </div>
+      </div>`;
+    html += '<div class="section-label">По срокам</div>' + agingBarsHtml(data.aging);
+  }
+
+  if (advances.length) {
+    // Переплата поставщику — не ошибка, а обычная закупочная практика, и
+    // разговор с ним начинается именно с неё.
+    html += `<div class="section-label">Аванс у поставщиков</div>
+      <div class="c-surface c-surface--list">
+        <div class="c-row"><div class="card-row-info">
+          <div class="card-row-sub">Выплачено сверх поставленного</div></div>
+        <div class="card-row-value">${advances.map(a => escapeHtml(formatMoney(a.total, a.currency))).join(' · ')}</div>
+      </div></div>`;
+  }
+
+  if (suppliers.length) {
+    html += '<div class="section-label">Кому должны</div><div class="c-surface c-surface--list">';
+    html += suppliers.map(s => `
+      <div class="c-row c-row--tap" data-sup="${Number(s.supplier_id)}" role="button" tabindex="0">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(s.supplier_name)}</div>
+          <div class="card-row-sub">${s.invoices ? plural(s.invoices, ['приход', 'прихода', 'приходов']) : 'только аванс'}${
+            s.days != null && s.days > 0 ? ` · старейший ${plural(s.days, ['день', 'дня', 'дней'])}` : ''}</div>
+        </div>
+        <div class="card-row-value">${escapeHtml(moneyBlockLabel(s))}</div>
+      </div>`).join('');
+    html += '</div>';
+  }
+
+  if (debts.length) {
+    html += '<div class="section-label">По приходам</div><div class="c-surface c-surface--list">';
+    html += debts.map(d => `
+      <div class="c-row c-row--tap" data-inv="${Number(d.invoice_id)}" data-status="${escapeHtml(d.state)}"
+           role="button" tabindex="0">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(d.supplier_name)}</div>
+          <div class="card-row-sub">${escapeHtml(d.invoice_number)} · ${escapeHtml(formatDateRU(d.invoice_date))}${
+            d.container_id ? ' · контейнер' : ''}${
+            d.days != null && d.days > 0 ? ` · ${plural(d.days, ['день', 'дня', 'дней'])}` : ''}</div>
+        </div>
+        <div class="card-row-value">${escapeHtml(formatMoney(d.remaining, d.currency))}</div>
+      </div>`).join('');
+    html += '</div>';
+  }
+
+  if (unpriced.length) {
+    // «Долга нет» — неправильный ответ про товар, который уже стоит на складе:
+    // у прихода просто не заполнена закупочная цена.
+    html += '<div class="section-label">Приход без суммы</div><div class="c-surface c-surface--list">';
+    html += unpriced.map(u => `
+      <div class="c-row">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(u.supplier_name)}</div>
+          <div class="card-row-sub">${escapeHtml(u.invoice_number)} · ${escapeHtml(formatDateRU(u.invoice_date))}</div>
+        </div>
+        <div class="card-row-value"><span class="money-placeholder">нет цены</span></div>
+      </div>`).join('');
+    html += `</div><div class="debt-hint">Пока закупочная цена не вписана, долг считать не из чего —
+      впишите её в карточке контейнера («Закупка и себестоимость») или в накладной.</div>`;
+  }
+
+  if (payments.length) {
+    html += '<div class="section-label">Последние выплаты</div><div class="c-surface c-surface--list">';
+    html += payments.map(p => `
+      <div class="c-row">
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(p.account_label || p.method_label || 'выплата')}</div>
+          <div class="card-row-sub">${escapeHtml(p.paid_at)}${
+            p.created_by_name ? ` · ${escapeHtml(p.created_by_name)}` : (p.migrated ? ' · перенос из МойСклад' : '')}</div>
+        </div>
+        <div class="card-row-value">${escapeHtml(formatMoney(p.amount, p.currency))}</div>
+      </div>`).join('');
+    html += '</div>';
+  }
+
+  if (!debts.length && !unpriced.length && !payments.length && !advances.length) {
+    html += emptyState({
+      icon: 'card',
+      title: 'Долгов перед поставщиками нет',
+      hint: 'Приход с поставщиком и суммой становится долгом сам. Выплату по нему записывают кнопкой выше.',
+    });
+  }
+
+  container.innerHTML = html;
+
+  container.querySelector('#sup-pay').addEventListener('click', () => supplierPickAndPay(reload));
+  container.querySelectorAll('.c-row[data-sup]').forEach(row => {
+    supplierOnTap(row, () => {
+      const s = suppliers.find(x => String(x.supplier_id) === row.dataset.sup);
+      if (s) supplierOpenPaymentForm({ supplierId: s.supplier_id, supplierName: s.supplier_name }, reload);
+    });
+  });
+  container.querySelectorAll('.c-row[data-inv]').forEach(row => {
+    supplierOnTap(row, () => {
+      const d = debts.find(x => String(x.invoice_id) === row.dataset.inv);
+      if (d) supplierOpenInvoiceActions(d, reload);
+    });
+  });
+}
+
+// Строка списка кликается и с клавиатуры: у неё role="button", а значит Enter
+// и пробел обязаны работать так же, как касание.
+function supplierOnTap(el, fn) {
+  if (!el) return;
+  el.addEventListener('click', (ev) => { ev.preventDefault(); haptic('light'); fn(); });
+  el.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); fn(); }
+  });
+}
+
+// Выплата без привязки к приходу: сначала выбираем поставщика (тот же
+// справочник, что в накладной), потом форма.
+async function supplierPickAndPay(reload) {
+  let items = (supplierDebtsData && supplierDebtsData.suppliers || []).map(s => ({
+    id: s.supplier_id, name: s.supplier_name, sub: moneyBlockLabel(s),
+  }));
+  try {
+    const all = await api('/api/wh/counterparties', {});
+    for (const c of all.counterparties || []) {
+      if (!items.some(i => String(i.id) === String(c.id))) items.push({ id: c.id, name: c.name, sub: '' });
+    }
+  } catch (_e) {
+    // Справочник не пришёл — остаются те, кому мы уже должны. Это лучше, чем
+    // форма, которая не открывается вовсе.
+  }
+  openListPicker({
+    title: 'Кому платим',
+    hint: 'Поставщик из справочника контрагентов',
+    items,
+    emptyText: 'Контрагентов пока нет',
+    onPick: (item) => supplierOpenPaymentForm({ supplierId: item.id, supplierName: item.name }, reload),
+  });
+}
+
+// Что можно сделать с одним приходом: заплатить, поставить срок, отметить
+// оплаченным. Отдельный лист, а не три кнопки в строке: строк бывают десятки.
+function supplierOpenInvoiceActions(d, reload) {
+  const sheet = openMachineSheet({
+    title: `${d.supplier_name} · ${d.invoice_number}`,
+    hint: `Осталось ${formatMoney(d.remaining, d.currency)} из ${formatMoney(d.total, d.currency)}`,
+    fields: [
+      { key: 'due_date', label: 'Срок оплаты', type: 'date', value: d.due_date || '' },
+    ],
+    submitLabel: 'Сохранить срок',
+    onSubmit: async (data, { showErr }) => {
+      try {
+        await api('/api/suppliers/terms', {
+          invoice_id: d.invoice_id, payment_type: 'credit', due_date: data.due_date || null,
+        });
+      } catch (e) { showErr(e.message); return false; }
+      haptic('success');
+      toast('Срок сохранён');
+      reload();
+      return true;
+    },
+  });
+  const actions = sheet.sheet.querySelector('.c-actions');
+  const pay = document.createElement('button');
+  pay.type = 'button';
+  pay.className = 'btn-primary';
+  pay.innerHTML = `${icon('cash')} Записать выплату`;
+  actions.prepend(pay);
+  pay.addEventListener('click', () => {
+    sheet.close();
+    supplierOpenPaymentForm({
+      supplierId: d.supplier_id, supplierName: d.supplier_name,
+      invoiceId: d.invoice_id, invoiceNumber: d.invoice_number,
+      currency: d.currency, remaining: d.remaining,
+    }, reload);
+  });
+  const paid = document.createElement('button');
+  paid.type = 'button';
+  paid.className = 'btn-secondary';
+  paid.textContent = 'Отметить «уже оплачено»';
+  actions.appendChild(paid);
+  paid.addEventListener('click', async () => {
+    const ok = await confirmDialog(
+      'Убрать этот приход из долгов? Выплата при этом НЕ записывается — если деньги ушли с карты или со счёта, запишите их выплатой.');
+    if (!ok) return;
+    try {
+      await api('/api/suppliers/terms', { invoice_id: d.invoice_id, payment_type: 'paid' });
+    } catch (e) { tg.showAlert('❌ ' + e.message); return; }
+    sheet.close();
+    haptic('success');
+    toast('Приход отмечен оплаченным');
+    reload();
+  });
+}
+
+function supplierOpenPaymentForm(ctx, reload) {
+  const key = idemKey();
+  const debtCur = ctx.currency || (supplierDebtsData && supplierDebtsData.base_currency) || 'USD';
+  const curs = ((supplierDebtsData && supplierDebtsData.currencies) || [debtCur, 'UZS'])
+    .filter((c, i, a) => a.indexOf(c) === i);
+  const today = new Date().toISOString().slice(0, 10);
+  const sheet = openMachineSheet({
+    title: `Выплата · ${ctx.supplierName}`,
+    hint: ctx.invoiceNumber
+      ? `Приход ${ctx.invoiceNumber} · осталось ${formatMoney(ctx.remaining, debtCur)}`
+      : 'Без привязки к приходу: гасит долги от старых к новым, сверх долга — аванс',
+    fields: [
+      { key: 'amount', label: 'Сумма', type: 'number', required: true },
+      { key: 'currency', label: 'Валюта выплаты', type: 'select', value: debtCur,
+        options: curs.map(c => [c, c]) },
+      { key: 'method', label: 'Как заплатили', type: 'select', required: true,
+        options: [['cash', 'Наличными'], ['card', 'С карты'], ['bank', 'Со счёта']] },
+      // С какой карты/счёта ушли деньги — тот же справочник, что у поступлений.
+      { key: 'account_id', label: 'Откуда ушли деньги', type: 'hidden' },
+      { key: 'rate', label: `Курс (${debtCur} за 1 единицу — пусто значит курс ЦБ)`, type: 'hidden' },
+      { key: 'paid_at', label: 'Дата выплаты', type: 'date', value: today },
+      { key: 'note', label: 'Примечание', placeholder: 'номер счёта, договор' },
+    ],
+    submitLabel: 'Записать выплату',
+    onSubmit: async (data, { showErr }) => {
+      if (data.method !== 'cash' && !data.account_id) {
+        showErr(data.method === 'card'
+          ? 'Выберите, с какой карты ушли деньги'
+          : 'Выберите, с какого счёта ушли деньги');
+        return false;
+      }
+      const row = {
+        method: data.method,
+        currency: data.currency || debtCur,
+        amount: data.amount,
+        ...(data.method !== 'cash' && data.account_id ? { account_id: Number(data.account_id) } : {}),
+        ...(data.rate ? { rate: data.rate } : {}),
+      };
+      const res = await apiResult('/api/suppliers/payment', {
+        supplier_id: ctx.supplierId,
+        ...(ctx.invoiceId ? { invoice_id: ctx.invoiceId } : { currency: debtCur }),
+        parts: [row],
+        note: data.note,
+        paid_at: data.paid_at,
+        idempotency_key: key,
+      });
+      if (!res.ok) { showErr(res.error); return false; }
+      haptic('success');
+      toast('Выплата записана');
+      reload();
+      return true;
+    },
+  });
+  if (typeof payMountAccountField === 'function') {
+    payMountAccountField(sheet.sheet, { methodKey: 'method', key: 'account_id', currency: debtCur });
+  }
+  supplierMountRateField(sheet.sheet, { currencyKey: 'currency', key: 'rate', debtCurrency: debtCur });
+}
+
+// Курс нужен, только когда валюта выплаты не совпадает с валютой долга. Поле,
+// которое гарантированно не пригодится, хуже отсутствующего — прячем его как
+// «Откуда ушли деньги» у наличных.
+function supplierMountRateField(sheetEl, { currencyKey, key, debtCurrency }) {
+  const hidden = sheetEl.querySelector(`#ms-f-${key}`);
+  const cur = sheetEl.querySelector(`#ms-f-${currencyKey}`);
+  if (!hidden || !cur) return;
+  const field = hidden.closest('.c-field');
+  hidden.type = 'text';
+  hidden.setAttribute('inputmode', 'decimal');
+  const draw = () => {
+    const other = (cur.value || '') !== debtCurrency;
+    if (field) field.hidden = !other;
+    if (!other) hidden.value = '';
+  };
+  sheetEl.querySelectorAll('.seg-item[data-opt]').forEach(b => b.addEventListener('click', () => setTimeout(draw, 0)));
+  draw();
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Склад: остатки, накладные, быстрый ввод.
 //
 // Остатки показывает вкладка «Каталог» раздела «Склад» — это те же
@@ -10474,6 +10782,31 @@ async function renderWhInvoiceNew() {
   // `<select>`: в нём сотня строк «Имя · без Telegram» без поиска.
   const cpPicked = whCounterparties.find(c => String(c.id) === String(whDraft.counterparty_id));
   const whPicked = whWarehouses.find(w => String(w.id) === String(whDraft.warehouse_id));
+  // Приход от поставщика — это долг ПЕРЕД ним (`services/supplier_debts.py`), и
+  // спрашиваем о нём там же и теми же словами, что о долге клиента в заказе:
+  // «В долг / Уже оплачено» плюс срок. Блок — только у руководства и только у
+  // прихода: `/api/suppliers/terms` отвечает admin/boss, а менеджер, которому
+  // не показывают сумму прихода (себестоимость), не должен и отмечать её
+  // оплаченной. Без выбранного поставщика долг не к кому отнести — блок скрыт.
+  const canTerms = canOut && !isOut;
+  const termsType = whDraft.supplier_payment_type === 'paid' ? 'paid' : 'credit';
+  const termsHtml = canTerms ? `
+    <div id="wh-terms" class="${whDraft.counterparty_id ? '' : 'hidden'}">
+      <div class="section-label">Расчёты с поставщиком</div>
+      <div class="seg" role="radiogroup" aria-label="Условия оплаты поставщику">
+        ${[
+          { v: 'credit', label: 'В долг', ic: 'card' },
+          { v: 'paid', label: 'Уже оплачено', ic: 'cash' },
+        ].map(o => `<button type="button" class="seg-item ${termsType === o.v ? 'active' : ''}"
+             data-whterms="${o.v}" role="radio" aria-checked="${termsType === o.v}">${
+          icon(o.ic)} ${o.label}</button>`).join('')}
+      </div>
+      <div class="due-date-wrap ${termsType === 'credit' ? '' : 'hidden'}" id="wh-due-wrap">
+        <label class="due-date-label" for="wh-due">Срок оплаты поставщику:</label>
+        <input type="date" id="wh-due" class="due-date-input"
+               value="${escapeHtml(whDraft.supplier_due_date || '')}">
+      </div>
+    </div>` : '';
   content.innerHTML = `
     ${stockShellHtml()}
     ${typeSeg}
@@ -10492,6 +10825,7 @@ async function renderWhInvoiceNew() {
         ${cpPicked ? escapeHtml(cpPicked.name) : 'Выберите контрагента'}
       </button>
     </div>
+    ${termsHtml}
 
     <div class="form-row">
       <label class="form-label" for="wh-comment">Примечание</label>
@@ -10673,10 +11007,39 @@ async function renderWhInvoiceNew() {
       renderWhInvoiceNew();
     });
   });
+  // Условия оплаты поставщику: сегмент и срок. Срок спрашиваем только у «в
+  // долг» — у оплаченного прихода его нет по смыслу.
+  const termsEl = document.getElementById('wh-terms');
+  if (termsEl) {
+    const dueWrap = document.getElementById('wh-due-wrap');
+    termsEl.querySelectorAll('[data-whterms]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        haptic('light');
+        whDraft.supplier_payment_type = btn.dataset.whterms;
+        if (whDraft.supplier_payment_type === 'paid') whDraft.supplier_due_date = '';
+        termsEl.querySelectorAll('[data-whterms]').forEach(b => {
+          const on = b === btn;
+          b.classList.toggle('active', on);
+          b.setAttribute('aria-checked', String(on));
+        });
+        dueWrap.classList.toggle('hidden', whDraft.supplier_payment_type !== 'credit');
+        const due = document.getElementById('wh-due');
+        if (due && whDraft.supplier_payment_type === 'paid') due.value = '';
+        saveWhDraft();
+      });
+    });
+    document.getElementById('wh-due').addEventListener('change', e => {
+      whDraft.supplier_due_date = e.target.value || '';
+      saveWhDraft();
+    });
+  }
   const applyCp = (item) => {
     whDraft.counterparty_id = item.id;
     const btn = document.getElementById('wh-cp');
     if (btn) { btn.textContent = item.name; btn.classList.remove('btn-agent--empty'); }
+    // Долг перед поставщиком появляется вместе с поставщиком — до его выбора
+    // блок условий нечему относиться.
+    if (termsEl) termsEl.classList.remove('hidden');
     syncSave();
     saveWhDraft();
   };
@@ -10758,6 +11121,17 @@ async function renderWhInvoiceNew() {
           quantity: Number(it.quantity),
           price_cents: Number(it.price_cents) || null,
         })),
+        // Условия оплаты поставщику — только когда их ЗАДАЛИ: «в долг без
+        // срока» и есть значение по умолчанию (строки условий нет — значит в
+        // долг), и писать её на каждый приход значит завести запись, которая
+        // ничего не говорит, плюс строку в журнале. Роль и вид накладной
+        // сервер проверяет сам; отказ в условиях накладную не откатывает.
+        ...(canTerms && whDraft.counterparty_id
+            && (whDraft.supplier_payment_type === 'paid' || whDraft.supplier_due_date)
+          ? {
+            supplier_payment_type: whDraft.supplier_payment_type || 'credit',
+            supplier_due_date: whDraft.supplier_due_date || null,
+          } : {}),
         // Повтор той же формы не проведёт вторую накладную и не пришлёт
         // клиенту второй экземпляр PDF.
         idempotency_key: whDraft.idemKey,
@@ -10779,6 +11153,11 @@ async function renderWhInvoiceNew() {
       // Отдельным сообщением: неотправленный PDF — не ошибка проведения.
       // Накладная сохранена, остатки списаны, отправить можно позже кнопкой.
       if (res.pdf_warning) toast(res.pdf_warning, 'error', { duration: 6000 });
+      // Условия оплаты поставщику не записались — накладная всё равно
+      // проведена, и молчать об этом нельзя: приход просто останется «в долг».
+      if (res.supplier_terms_warning) {
+        toast(res.supplier_terms_warning, 'error', { duration: 6000 });
+      }
       dropWhDraft();
       whView = 'list';
       renderWhInvoicesTab();

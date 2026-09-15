@@ -46,6 +46,9 @@ SCREEN_MAP = [
     ("Каталог/Склад", "admin, boss, manager, warehouse_keeper", "/api/stock"),
     ("Деньги → Подтвердить", "admin, boss, bookkeeper, manager*", "/api/deposits/pending"),
     ("Финансы → Долги", "admin, boss, manager", "/api/debts"),
+    # «Поставщикам» — зеркало «Долгов»: там должны нам, здесь должны мы. Сумма
+    # прихода это закупочная цена, поэтому экран руководству, как себестоимость.
+    ("Деньги → Поставщикам («мы должны»)", "admin, boss", "/api/suppliers/debts"),
     ("Финансы → Клиенты", "admin, boss", "/api/clients/overview"),
     ("Курсы валют", "admin, boss (правка)", "/api/currency/rates"),
     ("Аналитика", "admin, boss, manager", "/api/analytics"),

@@ -170,6 +170,9 @@ _Всего эндпоинтов: 167._
 - `/api/search`
 - `/api/settings/delete_requires_boss`
 - `/api/stock`
+- `/api/suppliers/debts`
+- `/api/suppliers/payment`
+- `/api/suppliers/terms`
 - `/api/today`
 - `/api/users/deactivate`
 - `/api/wh/counterparties`
@@ -322,6 +325,9 @@ _Всего эндпоинтов: 167._
 - `/api/search`
 - `/api/settings/delete_requires_boss`
 - `/api/stock`
+- `/api/suppliers/debts`
+- `/api/suppliers/payment`
+- `/api/suppliers/terms`
 - `/api/today`
 - `/api/wh/counterparties`
 - `/api/wh/counterparties/create`
@@ -518,6 +524,7 @@ _Всего эндпоинтов: 167._
 | Каталог/Склад | admin, boss, manager, warehouse_keeper | `/api/stock` |
 | Деньги → Подтвердить | admin, boss, bookkeeper, manager* | `/api/deposits/pending` |
 | Финансы → Долги | admin, boss, manager | `/api/debts` |
+| Деньги → Поставщикам («мы должны») | admin, boss | `/api/suppliers/debts` |
 | Финансы → Клиенты | admin, boss | `/api/clients/overview` |
 | Курсы валют | admin, boss (правка) | `/api/currency/rates` |
 | Аналитика | admin, boss, manager | `/api/analytics` |

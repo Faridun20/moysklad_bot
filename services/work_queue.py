@@ -142,6 +142,17 @@ async def gather(user_id: int, role: str) -> list[dict]:
                 "бронь, продажа или рассрочка ждут одобрения", "warn", DECISIONS_SCREEN)
         except Exception:
             logger.warning("work_queue: заявки по технике не посчитаны", exc_info=True)
+        try:
+            # Долг ПЕРЕД поставщиком — такой же просроченный срок, как и долг
+            # клиента, и стоит рядом с ним по срочности. Только руководству:
+            # `/api/suppliers/debts` отвечает admin/boss (сумма прихода — это
+            # закупочная цена), и у остальных пункт вёл бы в 403.
+            from services.supplier_debts import overdue_now
+
+            add("supplier_debts", await overdue_now(), "Выплаты поставщикам просрочены",
+                "срок оплаты прихода уже прошёл", "crit", "money:suppliers")
+        except Exception:
+            logger.warning("work_queue: долги поставщикам не посчитаны", exc_info=True)
     else:
         # Бухгалтер подтверждает сдачи, кладовщик — возвраты. Показываем каждому
         # ровно то, что он может закрыть. role_allowed — потому что менеджер

@@ -7699,6 +7699,132 @@ async def _money_summary(adb, user_id: int | None) -> dict:
     return {"received": received, "pending": pending}
 
 
+# ─── API: долги ПОСТАВЩИКАМ (services/supplier_debts.py) ────────────────────
+# Зеркало «Долгов»: там нам должны клиенты, здесь должны мы. Права —
+# admin/boss, как у себестоимости: сумма приходной накладной и есть закупочная
+# цена, и открыть экран менеджеру значит показать ему наценку в обход
+# `costing.redact_invoice`.
+
+_SUPPLIER_SEE_ROLES = ("admin", "boss")
+_SUPPLIER_RECORD_ROLES = ("admin", "boss")
+
+
+def _has_supplier_rights(user_id: int) -> bool:
+    """Может ли человек записывать расчёты с поставщиками (условия и выплаты).
+
+    Нужна там, где права проверяются НЕ входом в ручку, — в форме накладной,
+    которая открыта и менеджеру. `role_allowed`, а не `in`: совмещение ролей
+    живёт в одном месте (`services.roles`).
+    """
+    from services.roles import role_allowed
+
+    return role_allowed(get_role(user_id), _SUPPLIER_RECORD_ROLES)
+
+
+def _supplier_actor(user: dict):
+    from services import order_payments
+
+    return order_payments.Actor(
+        user_id=int(user["id"]),
+        name=_actor_name(user) or user.get("username") or str(user["id"]),
+        role=get_role(user["id"]),
+        username=f"@{user['username']}" if user.get("username") else "",
+    )
+
+
+@app.post("/api/suppliers/debts")
+async def api_supplier_debts(request: Request):
+    """«Мы должны»: приход минус выплаты, по накладным и по поставщикам.
+
+    Один ответ на весь экран — итог, сроки, список долгов, авансы, приход без
+    цены и лента выплат. Второй запрос за тем же экраном не нужен.
+    """
+    from services import supplier_debts
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=_SUPPLIER_SEE_ROLES,
+        rate_limit_scope="api_supplier_debts",
+        rate_limit_max=30,
+        rate_limit_window=60.0,
+    )
+    raw = data.get("supplier_id")
+    try:
+        supplier_id = int(raw) if raw not in (None, "", 0, "0") else None
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="supplier_id должен быть числом")
+    return JSONResponse(await supplier_debts.overview(supplier_id))
+
+
+@app.post("/api/suppliers/payment")
+async def api_supplier_payment(request: Request):
+    """Выплата поставщику: {method, currency, amount, rate?, account_id?} строками.
+
+    Привязка к приходу необязательна — общая выплата гасит долги поставщика от
+    старых к новым, а сверх долга остаётся авансом (обычная практика в закупке).
+    Идемпотентно по `idempotency_key` (атомарно с записью).
+    """
+    from services import async_db as adb
+    from services import supplier_debts
+    from services.order_payments import PaymentError
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_SUPPLIER_RECORD_ROLES,
+        rate_limit_scope="api_supplier_payment",
+        rate_limit_max=20,
+        rate_limit_window=60.0,
+    )
+    if not data.get("parts"):
+        raise HTTPException(
+            status_code=400,
+            detail="Укажите, как заплатили: наличные, с карты или перечислением со счёта",
+        )
+    idem = _Idem(adb, "supplier_payment", user["id"], data.get("idempotency_key"), atomic=True)
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await supplier_debts.record_payment(
+            _supplier_actor(user), data, idem_key=idem.key
+        )
+    except PaymentError as e:
+        await idem.release()
+        return JSONResponse({"detail": e.message, "code": e.code}, status_code=e.status)
+    except Exception:
+        await idem.release()  # упало до коммита — ретрай должен быть возможен
+        raise
+    await idem.store(res)
+    return JSONResponse(res)
+
+
+@app.post("/api/suppliers/terms")
+async def api_supplier_terms(request: Request):
+    """Условия оплаты прихода: «в долг» + срок или «уже оплачено» (в долги не идёт)."""
+    from services import supplier_debts
+    from services.order_payments import PaymentError
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_SUPPLIER_RECORD_ROLES,
+        rate_limit_scope="api_supplier_terms",
+        rate_limit_max=30,
+        rate_limit_window=60.0,
+    )
+    try:
+        return JSONResponse(await supplier_debts.set_terms(
+            _supplier_actor(user),
+            data.get("invoice_id"),
+            str(data.get("payment_type") or "credit"),
+            data.get("due_date"),
+        ))
+    except PaymentError as e:
+        return JSONResponse({"detail": e.message, "code": e.code}, status_code=e.status)
+
+
 async def _record_order_payment(data: dict, user: dict, op: str) -> JSONResponse:
     """Общее тело `/api/orders/payment` и `/api/orders/mark_paid`: разбивка
     «как получены деньги» (services.order_payments). Авторизация — в ручках."""
@@ -8909,6 +9035,36 @@ async def api_wh_invoice_create(request: Request):
         f"Накладная {result['invoice_number']} ({inv_type}), "
         f"позиций {result['positions']}, сумма {result['total_amount_cents']} коп.",
     )
+
+    # Приход с поставщиком — это долг ПЕРЕД ним, если его тут же не оплатили
+    # (`services.supplier_debts`). Строки условий по умолчанию нет: её
+    # отсутствие и значит «в долг». Пишем только явный выбор из формы, и
+    # отказ в нём накладную не откатывает — она проведена, остаток на месте.
+    if (
+        inv_type == "incoming"
+        and counterparty_id
+        and (data.get("supplier_payment_type") or data.get("supplier_due_date"))
+        # Условия оплаты — та же зона, что сам экран долгов: менеджер, который
+        # не видит суммы прихода, не должен и отмечать её оплаченной. Сверка —
+        # через `role_allowed` (совмещение ролей), а не голым `in`: правило
+        # одно на весь проект, и исключений «здесь и так admin/boss» не делаем.
+        and _has_supplier_rights(user["id"])
+    ):
+        from services import supplier_debts
+        from services.order_payments import PaymentError
+
+        try:
+            terms = await supplier_debts.set_terms(
+                _supplier_actor(user),
+                result["invoice_id"],
+                str(data.get("supplier_payment_type") or "credit"),
+                data.get("supplier_due_date"),
+            )
+            result["supplier_terms"] = terms
+        except PaymentError as e:
+            logger.warning("Условия оплаты прихода %s не записаны: %s",
+                           result["invoice_number"], e.message)
+            result["supplier_terms_warning"] = e.message
 
     # PDF клиенту — только по расходу и только после успешного проведения.
     # Сбой доставки не откатывает накладную: она проведена, остатки списаны.

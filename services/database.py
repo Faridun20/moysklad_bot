@@ -1492,6 +1492,10 @@ def _table_ddls() -> list[str]:
     from services.cash_reconciliation_schema import tables as _cash_recon_tables
 
     tables.extend(_cash_recon_tables(id_type))
+    # «Долги поставщикам» (условия оплаты прихода, «с чего заплатили») — тоже leaf.
+    from services.supplier_debts_schema import tables as _supplier_debts_tables
+
+    tables.extend(_supplier_debts_tables(id_type))
 
     return tables
 
@@ -1775,6 +1779,9 @@ def _index_ddls() -> list[str]:
     from services.cash_reconciliation_schema import INDEXES as _cash_recon_indexes
 
     snapshot_indexes.extend(_cash_recon_indexes)
+    from services.supplier_debts_schema import INDEXES as _supplier_debts_indexes
+
+    snapshot_indexes.extend(_supplier_debts_indexes)
     return snapshot_indexes
 
 

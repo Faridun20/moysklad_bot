@@ -348,6 +348,23 @@ describe('вкладки разделов', () => {
       .toEqual(['debts', 'ops', 'reconcile']);
   });
 
+  it('«Поставщикам» — только руководству: сумма прихода это закупочная цена', () => {
+    // /api/suppliers/debts отвечает admin/boss; у менеджера вкладка вернула бы
+    // 403, а заодно показала бы ему себестоимость.
+    expect(keys(moneyTabs, { canSeeDebts: true, canSeeSuppliers: false })).toEqual(['debts']);
+    expect(keys(moneyTabs, { canSeeDebts: true, canSeeSuppliers: true }))
+      .toEqual(['debts', 'suppliers']);
+    expect(roleSectionTabs('money', 'manager', { work: true }).map(t => t.key))
+      .not.toContain('suppliers');
+    for (const r of ['boss', 'admin']) {
+      expect(roleSectionTabs('money', r, { work: true }).map(t => t.key))
+        .toEqual(['debts', 'suppliers', 'ops', 'report']);
+      // «Рабочие действия» выключены — контроль остаётся, работа уходит.
+      expect(roleSectionTabs('money', r, { work: false }).map(t => t.key))
+        .toEqual(['debts', 'suppliers', 'report']);
+    }
+  });
+
   it('Продажи: отчёт только тем, кому отвечает /api/analytics', () => {
     expect(keys(salesTabs, { canSeeReport: true })).toEqual(['orders', 'report']);
     expect(keys(salesTabs, { canSeeReport: false })).toEqual(['orders']);
