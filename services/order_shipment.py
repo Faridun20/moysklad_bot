@@ -250,6 +250,41 @@ async def ship_order(order: dict, items: list[dict], *, user_id: int | None = No
     }
 
 
+async def historical_cancel_refusal(order_id: int) -> str | None:
+    """Текст отказа в отмене заказа, чья отгрузка — история МойСклад; None — можно.
+
+    Отгрузку такого заказа склад не двигал: остаток приехал снимком, который
+    её уже учитывает (`scripts/migrate_history_from_moysklad.py`). Отмена
+    заказа откатывает накладную и вернула бы на склад товар, давно уехавший
+    к клиенту. Признаки — любой из:
+      * `ms_demand_id` — отгрузка проведена в МойСклад (так помечены и
+        заказы из переноса, и заказы эпохи интеграции; у заказа с несколькими
+        отгрузками МС вторая и далее в `order_shipment` не попадают вовсе —
+        ловить их можно только по этому полю);
+      * накладная отгрузки — историческая (`warehouse.historical_invoice_sql`).
+
+    Исторический заказ БЕЗ отгрузки (заказ покупателя МС, так и не отгруженный)
+    отменять можно: склад по нему не двигался ни там, ни здесь, а отмена —
+    единственный способ снять его из резерва доступного остатка.
+    """
+    row = await adb_core.fetchrow(
+        "SELECT o.ms_demand_id, "
+        f"  (SELECT {warehouse.historical_invoice_sql('i')} FROM invoices i "
+        "     WHERE i.id = s.invoice_id) AS historical_invoice "
+        "FROM orders o LEFT JOIN order_shipment s ON s.order_id = o.id WHERE o.id = $1",
+        int(order_id),
+    )
+    if row is None:
+        return None
+    if not (row["ms_demand_id"] or row["historical_invoice"]):
+        return None
+    return (
+        f"Заказ #{order_id} отгружен ещё в МойСклад и отменить его нельзя: остаток склада "
+        "приехал снимком, который эту отгрузку уже учитывает, и отмена вернула бы на склад "
+        "товар, давно уехавший к клиенту. Если клиент вернул товар — оформите возврат."
+    )
+
+
 async def cancel_shipment(order_id: int, *, user_id: int | None = None) -> dict:
     """Откатить отгрузку заказа: отменить накладную, вернуть остаток.
 

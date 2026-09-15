@@ -1306,7 +1306,8 @@ async def _upsert_order_from_demand(
 
 
 # Сущности МС в `ms_id_map` для исторических накладных. Этот же признак читает
-# `services/warehouse.py` (`is_historical_invoice`), запрещая их отмену.
+# `services/warehouse.py` (`historical_invoice_sql`, `HISTORY_MAP_ENTITIES`),
+# запрещая их отмену; совпадение стережёт тест.
 INVOICE_ENTITY = {"outgoing": "demand", "incoming": "supply"}
 
 

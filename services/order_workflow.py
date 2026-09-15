@@ -576,12 +576,17 @@ async def cancel_order_full(
     складом (для логов и текста оператору).
     """
     from services import async_db as adb
+    from services import order_shipment
+
+    # До смены статуса: отказ склада ПОСЛЕ отмены (см. ниже, best-effort)
+    # оставил бы заказ отменённым, а историческую отгрузку — проведённой.
+    historical = await order_shipment.historical_cancel_refusal(order_id)
+    if historical:
+        return {"ok": False, "error": historical, "code": "historical"}
 
     res = await adb.cancel_order(order_id, user_id, user_name, reason)
     if not res.get("ok"):
         return res
-
-    from services import order_shipment
 
     try:
         rev = await order_shipment.cancel_shipment(order_id, user_id=user_id)

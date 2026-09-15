@@ -391,6 +391,64 @@ async def create_invoice(
         return {"ok": False, "code": e.code, "reason": e.message, "details": e.details}
 
 
+# ─── Исторические накладные (перенос из МойСклад) ─────────────────────────────
+#
+# `scripts/migrate_history_from_moysklad.py` пишет накладные МИМО этого модуля:
+# остаток приехал снимком на сегодня и все исторические движения уже включает.
+# Значит, и отмена такой накладной обязана НЕ двигать склад — а отменить её,
+# ничего не двигая, бессмысленно. Поэтому отмена запрещена целиком: обратное
+# движение по документу, который склад не двигал, вернуло бы на склад товар,
+# давно уехавший к клиенту (или списало приход, давно проданный).
+#
+# Признак — два независимых следа переноса, любой из них:
+#   * номер из серии переноса `MS-D-*`/`MS-S-*`. Живая нумерация — только
+#     `IN-/OUT-ГГГГ-NNNN` из `_next_invoice_number`, номер руками не вводится,
+#     `invoice_number` UNIQUE — спутать нельзя. Этот след есть и у накладных,
+#     записанных ранней версией скрипта, которая ms_id_map не вела;
+#   * строка `ms_id_map(entity_type in demand/supply)` — ключ идемпотентности
+#     переноса, пишется той же транзакцией, что и накладная. Он переживёт,
+#     если номер когда-нибудь поправят руками.
+# `created_by = 0` признаком НЕ берём: колонка nullable, и «0 = система» —
+# соглашение, которое живой код может однажды повторить для своих накладных.
+HISTORY_NUMBER_PREFIXES = ("MS-D-", "MS-S-")
+HISTORY_MAP_ENTITIES = ("demand", "supply")
+
+
+def historical_invoice_sql(alias: str = "i") -> str:
+    """SQL-условие «накладная из переноса истории» — для списков и отказов."""
+    by_number = " OR ".join(
+        f"{alias}.invoice_number LIKE '{prefix}%'" for prefix in HISTORY_NUMBER_PREFIXES
+    )
+    entities = ", ".join(f"'{e}'" for e in HISTORY_MAP_ENTITIES)
+    return (
+        f"({by_number} OR EXISTS (SELECT 1 FROM ms_id_map hm "
+        f"WHERE hm.entity_type IN ({entities}) AND hm.local_id = {alias}.id))"
+    )
+
+
+async def historical_invoice_refusal(invoice_id: int, *, txn=None) -> str | None:
+    """Текст отказа в отмене исторической накладной; None — накладная живая."""
+    runner = txn if txn is not None else adb_core
+    row = await runner.fetchrow(
+        f"SELECT i.type, i.invoice_number, {historical_invoice_sql('i')} AS historical "
+        "FROM invoices i WHERE i.id = $1",
+        int(invoice_id),
+    )
+    if row is None or not row["historical"]:
+        return None
+    what = "отгрузку" if row["type"] == "outgoing" else "приход"
+    fix = (
+        "Если клиент вернул товар — оформите возврат по заказу."
+        if row["type"] == "outgoing"
+        else "Если остаток расходится с фактом — поправьте его новой накладной."
+    )
+    return (
+        f"Накладная {row['invoice_number']} перенесена из МойСклад и отменить её нельзя: "
+        f"остаток склада приехал снимком, который эту {what} уже учитывает, и отмена "
+        f"сдвинула бы склад на товар, которого перенос не двигал. {fix}"
+    )
+
+
 async def cancel_invoice_in(txn, invoice_id: int, cancelled_by: int | None = None) -> dict:
     """Отменить накладную ВНУТРИ уже открытой транзакции. Бросает `InvoiceError`."""
     if _db.USE_POSTGRES:
@@ -408,6 +466,11 @@ async def cancel_invoice_in(txn, invoice_id: int, cancelled_by: int | None = Non
     if inv["status"] == "cancelled":
         # Идемпотентно: повторная отмена не двигает остаток второй раз.
         raise InvoiceError("already_cancelled", "Накладная уже отменена")
+    # Здесь, а не только в ручке: отмену зовут и заказ (cancel_shipment), и
+    # контейнер, и приёмка — запрет в одном месте закрывает все пути сразу.
+    historical = await historical_invoice_refusal(invoice_id, txn=txn)
+    if historical:
+        raise InvoiceError("historical", historical)
 
     warehouse_id = int(inv["warehouse_id"])
     rows = await txn.fetch(
@@ -538,9 +601,12 @@ async def list_invoices(
     invoice_type: str | None = None, limit: int = 50, offset: int = 0
 ) -> list[dict]:
     """Список накладных, новые сверху."""
+    # `historical` — для фронта: кнопку «Отменить» у накладной из переноса не
+    # рисуем, она гарантированно ответила бы отказом.
     sql = (
         "SELECT i.id, i.type, i.invoice_number, i.invoice_date, i.status, i.currency, "
         "       i.total_amount_cents, i.telegram_sent, i.created_at, "
+        f"      {historical_invoice_sql('i')} AS historical, "
         "       c.name AS counterparty_name "
         "FROM invoices i LEFT JOIN counterparties c ON c.id = i.counterparty_id"
     )
@@ -550,7 +616,9 @@ async def list_invoices(
         sql += f" WHERE i.type = ${len(args)}"
     args.extend([limit, offset])
     sql += f" ORDER BY i.id DESC LIMIT ${len(args) - 1} OFFSET ${len(args)}"
-    return await adb_core.fetch(sql, *args)
+    rows = await adb_core.fetch(sql, *args)
+    # SQLite отдаёт условие числом 0/1, Postgres — bool; фронту нужен bool.
+    return [{**r, "historical": bool(r["historical"])} for r in rows]
 
 
 async def mark_telegram_sent(invoice_id: int) -> bool:

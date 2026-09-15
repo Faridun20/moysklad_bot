@@ -259,12 +259,6 @@ async def _upsert_entity(
     return int(new_id)
 
 
-# Серии номеров, которыми пишет перенос истории (`migrate_history_from_moysklad`).
-# Живая нумерация — `IN-/OUT-ГГГГ-NNNN` из `warehouse._next_invoice_number`,
-# номер руками не вводится, поэтому префикс надёжно отделяет историю от жизни.
-_HISTORY_NUMBER_PATTERNS = ("MS-D-%", "MS-S-%")
-
-
 class LiveDataError(RuntimeError):
     """После переноса в базе уже идёт живая работа — снимок остатков её сотрёт."""
 
@@ -276,12 +270,13 @@ async def live_activity() -> dict:
     `_write_map` его больше не сдвигает, поэтому повторный прогон не отодвигает
     границу вперёд и не «прячет» уже случившиеся живые накладные.
 
-    Живое — накладные не из серии переноса истории и заказы с настоящим
+    Живое — накладные не из переноса истории (`warehouse.historical_invoice_sql`) и заказы с настоящим
     автором (`user_id <> 0`; у исторических — 0). Возвращает счётчики и
     `product_ms_ids` — товары МС, по которым были живые движения: их остаток
     при осознанном повторе трогать нельзя.
     """
     from services import adb_core
+    from services.warehouse import historical_invoice_sql
 
     since = await adb_core.fetchval(
         "SELECT MIN(migrated_at) FROM ms_id_map WHERE entity_type IN ('product', 'counterparty')"
@@ -289,7 +284,9 @@ async def live_activity() -> dict:
     out: dict = {"since": since, "invoices": 0, "orders": 0, "product_ms_ids": set()}
     if since is None:
         return out
-    not_history = " AND ".join(f"i.invoice_number NOT LIKE '{p}'" for p in _HISTORY_NUMBER_PATTERNS)
+    # Признак истории — тот же, по которому warehouse запрещает её отмену: одно
+    # определение на проект, иначе два списка разойдутся при первой правке.
+    not_history = f"NOT {historical_invoice_sql('i')}"
     out["invoices"] = int(
         await adb_core.fetchval(
             f"SELECT COUNT(*) FROM invoices i WHERE i.created_at > $1 AND {not_history}", since

@@ -7647,7 +7647,9 @@ async function renderWhInvoiceList() {
     if (canPrint && !cancelled) {
       actions.push(`<button class="btn-secondary" data-wh-print="${inv.id}">${icon('list')} Распечатать</button>`);
     }
-    if (canCancel && !cancelled) {
+    // Накладная из переноса МойСклад (inv.historical) не отменяется: склад по
+    // ней не двигался, и сервер гарантированно откажет — кнопку не рисуем.
+    if (canCancel && !cancelled && !inv.historical) {
       actions.push(`<button class="btn-secondary" data-wh-cancel="${inv.id}">${icon('ban')} Отменить</button>`);
     }
     return `

@@ -1091,3 +1091,153 @@ def test_counterparty_with_only_purchases_becomes_supplier(seeded, ms_api):
     assert types == {CP_MS: "customer", "cp-supplier": "supplier"}
     assert stats["counterparties_to_supplier"] == 1
     assert stats["counterparties_both"] == 1, "Ромашка и продаёт, и покупает — остаётся клиентом"
+
+
+# ─── Историю нельзя отменить: склад по ней не двигался (P0-3) ────────────────
+
+
+@pytest.fixture
+def boss_api(seeded, monkeypatch):
+    """WebApp под боссом поверх перенесённой истории. Мокаем только initData."""
+    import importlib
+
+    from fastapi.testclient import TestClient
+
+    import services.rate_limit as rate_limit
+    import services.roles as roles
+    import webapp.server as server
+
+    importlib.reload(roles)
+    rate_limit.reset()
+    seeded.set_role(100, "boss_user", "Boss", "boss")
+    monkeypatch.setattr(
+        server, "verify_init_data",
+        lambda init_data: {"id": int(init_data), "first_name": "B", "username": "b"},
+    )
+    return TestClient(server.app)
+
+
+def _stock(db):
+    return _rows(db, "SELECT product_id, quantity FROM stock ORDER BY product_id")
+
+
+def test_history_map_entities_match_warehouse_guard():
+    """Перенос пишет ключи тех сущностей, по которым warehouse узнаёт историю."""
+    from services import warehouse
+
+    assert set(mig.INVOICE_ENTITY.values()) == set(warehouse.HISTORY_MAP_ENTITIES)
+
+
+def test_historical_invoices_cannot_be_cancelled(seeded, ms_api, boss_api):
+    """Ни первая, ни вторая отгрузка заказа, ни приход из МС не отменяются.
+
+    Вторая отгрузка в order_shipment не попадает, и прежняя защита «накладная
+    заказа — отменяйте заказ» её не ловила: отмена возвращала товар на склад.
+    """
+    ms_api["customerorder"] = [_order(sum_minor=600000,
+                                      positions=[_pos(P1_MS, "Труба", 6, 100000)])]
+    ms_api["demand"] = [
+        _demand(ms_id="dem-1", name="D001", positions=[_pos(P1_MS, "Труба", 2, 100000)]),
+        _demand(ms_id="dem-2", name="D002", positions=[_pos(P1_MS, "Труба", 4, 100000)]),
+    ]
+    ms_api["supply"] = [_supply()]
+    _run(ms_api)
+    before = _stock(seeded)
+
+    invoices = _rows(seeded, "SELECT id FROM invoices ORDER BY id")
+    assert len(invoices) == 3
+    for inv in invoices:
+        r = boss_api.post("/api/wh/invoices/cancel",
+                          json={"initData": "100", "invoice_id": inv["id"]})
+        assert r.status_code == 409, r.text
+        assert r.json()["code"] == "historical"
+        assert "перенесена из МойСклад" in r.json()["reason"]
+
+    assert _stock(seeded) == before
+    assert {r["status"] for r in _rows(seeded, "SELECT status FROM invoices")} == {"confirmed"}
+
+
+def test_historical_invoice_guard_is_in_warehouse_itself(seeded, ms_api):
+    """Запрет в `cancel_invoice_in`, а не только в ручке: отмену зовут и заказ,
+    и контейнер. И узнаётся история по ms_id_map, даже если номер поправили."""
+    from services import warehouse
+
+    ms_api["demand"] = [_demand(order_ms_id=None)]
+    _run(ms_api)
+    inv_id = _rows(seeded, "SELECT id FROM invoices")[0]["id"]
+    with seeded.get_conn() as conn:
+        cur = seeded.get_cursor(conn)
+        cur.execute(seeded.q("UPDATE invoices SET invoice_number = 'ПОПРАВЛЕН-1' WHERE id = ?"),
+                    (inv_id,))
+        conn.commit()
+    before = _stock(seeded)
+
+    res = asyncio.run(warehouse.cancel_invoice(inv_id, cancelled_by=100))
+
+    assert res["ok"] is False and res["code"] == "historical"
+    assert _stock(seeded) == before
+
+
+def test_historically_shipped_order_cannot_be_cancelled(seeded, ms_api, boss_api):
+    """Заказ, отгруженный в МС, не отменяется: отмена откатила бы накладную и
+    вернула товар, которого перенос не списывал. Статус подменяем на approved —
+    иначе до проверки не дойти (отмена разрешена только одобренным), а
+    нужно доказать, что стережёт именно запрет истории."""
+    ms_api["customerorder"] = [_order()]
+    ms_api["demand"] = [_demand()]
+    _run(ms_api)
+    order_id = _rows(seeded, "SELECT id FROM orders")[0]["id"]
+    with seeded.get_conn() as conn:
+        cur = seeded.get_cursor(conn)
+        cur.execute(seeded.q("UPDATE orders SET status = 'approved' WHERE id = ?"), (order_id,))
+        conn.commit()
+    before = _stock(seeded)
+
+    r = boss_api.post("/api/orders/cancel",
+                      json={"initData": "100", "order_id": order_id, "reason": "ошибка"})
+
+    assert r.status_code == 409
+    assert "отгружен ещё в МойСклад" in r.json()["detail"]
+    assert _rows(seeded, "SELECT status FROM orders")[0]["status"] == "approved"
+    assert _rows(seeded, "SELECT status FROM invoices")[0]["status"] == "confirmed"
+    assert _stock(seeded) == before
+
+
+def test_historical_order_never_shipped_can_still_be_cancelled(seeded, ms_api, boss_api):
+    """Заказ покупателя МС без отгрузки склад не двигал нигде; отмена — только
+    смена статуса и единственный способ снять его из резерва."""
+    ms_api["customerorder"] = [_order()]
+    _run(ms_api)
+    order_id = _rows(seeded, "SELECT id FROM orders")[0]["id"]
+    before = _stock(seeded)
+
+    r = boss_api.post("/api/orders/cancel",
+                      json={"initData": "100", "order_id": order_id, "reason": "не актуален"})
+
+    assert r.status_code == 200, r.text
+    assert _rows(seeded, "SELECT status FROM orders")[0]["status"] == "cancelled"
+    assert _stock(seeded) == before
+
+
+def test_invoice_list_flags_historical_for_the_ui(seeded, ms_api, boss_api):
+    """Фронт прячет «Отменить» по флагу `historical` — живые накладные без него."""
+    from services import adb_core, warehouse
+
+    ms_api["demand"] = [_demand(order_ms_id=None)]
+    _run(ms_api)
+
+    async def live_incoming():
+        pid = await adb_core.fetchval("SELECT id FROM products WHERE legacy_ms_id = $1", P2_MS)
+        wid = await adb_core.fetchval("SELECT id FROM warehouses ORDER BY id LIMIT 1")
+        return await warehouse.create_invoice(
+            invoice_type="incoming", warehouse_id=int(wid),
+            items=[{"product_id": pid, "quantity": 1, "price_cents": 100}], created_by=100,
+        )
+
+    live = asyncio.run(live_incoming())
+    assert live["ok"], live
+
+    r = boss_api.post("/api/wh/invoices", json={"initData": "100"})
+    assert r.status_code == 200
+    flags = {i["invoice_number"]: i["historical"] for i in r.json()["invoices"]}
+    assert flags == {"MS-D-D001": True, live["invoice_number"]: False}
