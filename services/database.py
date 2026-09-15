@@ -6180,11 +6180,41 @@ async def link_payment_to_order(
     # заказам, оба прошли проверки выше; UPDATE-WHERE-NULL выиграет только
     # один. WHERE id = ? обязательно дополняет, иначе при concurrent
     # link'е разных платежей к разным заказам мы случайно обновим не тот.
-    rc = await adb_core.execute(
-        "UPDATE payments SET order_id = $1 WHERE id = $2 AND order_id IS NULL",
-        order_id,
-        payment_id,
-    )
+    #
+    # Привязка меняет «заявлено по заказу» — поэтому под общим замком строк
+    # заказа (`debts.lock_orders`) и со сверкой `calc_claimable_cents` в той же
+    # транзакции: иначе платёж ложился поверх уже заявленных разбивкой/сдачей
+    # денег, и одни деньги засчитывались по заказу дважды.
+    from services.debts import calc_claimable_cents, lock_orders
+
+    refusal: str | None = None
+    async with adb_core.transaction() as txn:
+        await lock_orders(txn, [int(order_id)])
+        st = await txn.fetchval("SELECT status FROM orders WHERE id = $1", int(order_id))
+        fresh_pay = await txn.fetchrow(
+            "SELECT status, amount_cents, order_id FROM payments WHERE id = $1", payment_id
+        )
+        rc = 0
+        if st in ("cancelled", "rejected"):
+            refusal = f"Заказ #{order_id} отменён — деньги к нему не привязываются"
+        elif fresh_pay is not None and fresh_pay["order_id"] is None and fresh_pay["status"] in (
+            "pending", "confirmed"
+        ):
+            claimable = (await calc_claimable_cents([int(order_id)], conn=txn)).get(int(order_id), 0)
+            if int(fresh_pay["amount_cents"] or 0) > claimable:
+                refusal = (
+                    f"По заказу #{order_id} можно привязать не больше "
+                    f"{money.format_cents(claimable)} {ord_cur}: остальное уже оплачено "
+                    "или ждёт подтверждения"
+                )
+        if refusal is None:
+            rc = await txn.execute(
+                "UPDATE payments SET order_id = $1 WHERE id = $2 AND order_id IS NULL",
+                order_id,
+                payment_id,
+            )
+    if refusal is not None:
+        return {"ok": False, "error": refusal}
     if rc <= 0:
         # Кто-то между нашими read и UPDATE прилинковал другой заказ.
         # Перечитываем чтобы вернуть оператору актуальную картину.

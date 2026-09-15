@@ -93,6 +93,31 @@ def test_link_confirmed_payment_closes_order_if_total_reached(isolated_db, monke
     assert asyncio.run(db.get_order(oid)).get("paid_confirmed_at") is not None
 
 
+def test_link_refuses_more_than_claimable(isolated_db):
+    """Привязка — это «заявить деньги по заказу»: сверх того, что ещё можно
+    заявить (с учётом ожидающих платежей), — отказ, платёж остаётся свободным."""
+    db = isolated_db
+    oid = _setup_order(db, total=100.0)
+    db.add_payment(100, "@m", "M", 70.0, "USD", "уже заявлено", order_id=oid)
+    pid = db.add_payment(100, "@m", "M", 50.0, "USD", "x")
+    res = asyncio.run(db.link_payment_to_order(pid, oid, linked_by=99))
+    assert res["ok"] is False
+    assert "не больше 30" in res["error"]
+    assert asyncio.run(db.get_payment(pid))["order_id"] is None
+    ok_pid = db.add_payment(100, "@m", "M", 30.0, "USD", "ровно остаток")
+    assert asyncio.run(db.link_payment_to_order(ok_pid, oid, linked_by=99))["ok"] is True
+
+
+def test_link_refuses_cancelled_order(isolated_db):
+    db = isolated_db
+    oid = _setup_order(db, total=100.0)
+    db.update_order_status(oid, "cancelled")
+    pid = db.add_payment(100, "@m", "M", 50.0, "USD", "x")
+    res = asyncio.run(db.link_payment_to_order(pid, oid, linked_by=99))
+    assert res["ok"] is False and "отменён" in res["error"]
+    assert asyncio.run(db.get_payment(pid))["order_id"] is None
+
+
 def test_link_rejects_currency_mismatch(isolated_db):
     """WP-04: нельзя привязать платёж в чужой валюте к заказу — закрытие считает
     копейки в валюте заказа, кросс-валюта без конверсии ложно закрывала заказ."""
