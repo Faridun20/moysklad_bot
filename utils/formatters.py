@@ -3,6 +3,7 @@
 """
 
 from services.money import format_cents, mul_qty
+from utils.audit_labels import ACTION_EMOJI, translate_action
 from utils.helpers import (
     esc,
     format_date,
@@ -114,15 +115,8 @@ def format_payment_rejected(amount: float, currency: str, comment: str) -> str:
 
 
 def format_audit_entry(r: dict) -> str:
-    ACTION_EMOJI = {
-        "user_added": "🟢",
-        "user_removed": "🔴",
-        "role_changed": "🔄",
-        "payment_sent": "💵",
-        "payment_confirmed": "✅",
-        "payment_rejected": "❌",
-        "login": "👤",
-    }
+    # Словарь эмодзи/ярлыков — общий с WebApp (боссу, C1): utils.audit_labels.
+    # Раньше жил только здесь и знал 6 кодов из полусотни реальных.
     emoji = ACTION_EMOJI.get(r["action"], "▪️")
     dt = r["created_at"][:16]
     # ВАЖНО: full_name/role/details пишутся юзерами и попадают в БД.
@@ -130,5 +124,6 @@ def format_audit_entry(r: dict) -> str:
     # видит админ — потенциальная inject в Telegram-сообщение (например
     # кликабельный <a href="evil"> вид).
     role_str = f" [{esc(r['role'])}]" if r.get("role") else ""
+    action_str = f" · {esc(translate_action(r['action']))}"
     detail_str = f"\n    <i>{esc(r['details'])}</i>" if r.get("details") else ""
-    return f"{emoji} <code>{dt}</code>  <b>{esc(r['full_name'])}</b>{role_str}{detail_str}"
+    return f"{emoji} <code>{dt}</code>  <b>{esc(r['full_name'])}</b>{role_str}{action_str}{detail_str}"

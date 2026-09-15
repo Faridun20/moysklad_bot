@@ -1555,6 +1555,38 @@ body.nav-drawer-open { overflow: hidden; }
   padding: 4px 0;
 }
 
+/* ─── История заказа (C3) ────────────────────────────────────────────────────
+   Лента событий (submit → approve → оплата → отгрузка → сдача/возврат → …) —
+   разворачивается под карточкой заказа по нажатию «История». */
+.order-timeline-toggle {
+  display: flex; align-items: center; gap: 4px;
+  background: none; border: none; padding: 4px 0; margin-top: 4px;
+  font-size: var(--text-xs); color: var(--accent); cursor: pointer;
+}
+.order-timeline { margin-top: var(--sp-2); }
+.order-timeline-list {
+  background: var(--bg-soft);
+  border-radius: var(--radius-sm);
+  padding: var(--sp-2) var(--sp-3);
+}
+.order-timeline-item {
+  display: flex; gap: var(--sp-2); align-items: flex-start;
+  padding: 4px 0;
+}
+.order-timeline-item + .order-timeline-item { border-top: 0.5px solid var(--divider); }
+.order-timeline-dot {
+  flex: none; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent); margin-top: 4px;
+}
+.order-timeline-body { flex: 1; min-width: 0; }
+.order-timeline-text { font-size: var(--text-sm); color: var(--text); }
+.order-timeline-meta { font-size: var(--text-xs); color: var(--text-mute); margin-top: 4px; }
+
+/* ─── Журнал действий (C1, «Настройки») ──────────────────────────────────────
+   Записи аудит-лога — строка + мелкий текст с деталями (уже готовое русское
+   описание, пишется в audit_log в момент действия). */
+.audit-row-details { white-space: pre-wrap; word-break: break-word; }
+
 /* ─── Раскрытый состав (заказ, отгрузка) ─────────────────────────────────────
    Позиции печатались списком «• Товар: 16 шт × 360 USD = 5 760 USD» тем же
    мелким серым текстом, что и подзаголовок строки: состав не отличался от
