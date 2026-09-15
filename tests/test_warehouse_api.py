@@ -167,6 +167,29 @@ def test_manager_cannot_cancel_outgoing_or_foreign_invoice_even_with_flag_off(ap
     assert cancel(ids["boss"], out.json()["invoice_id"]).status_code == 200
 
 
+def test_manager_incoming_price_is_ignored_cost_stays_with_management(api):
+    """Цена прихода = себестоимость (`costing.COST_ROLES`): менеджер её не видит
+    и не задаёт — цена из формы отбрасывается, партия без цены. Руководство
+    цену пишет как раньше."""
+    client, db, ids = api
+    db.set_setting("accounting_enabled", True, ids["boss"])
+    r = _incoming(client, ids["mgr"], qty=5, price=1)
+    assert r.status_code == 200, r.text
+    mgr_inv = r.json()["invoice_id"]
+    b = _incoming(client, ids["boss"], qty=5, price=700)
+    assert b.status_code == 200, b.text
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(db.q("SELECT invoice_id, price_cents FROM invoice_items ORDER BY id"))
+        items = {row[0]: row[1] for row in cur.fetchall()}
+        cur.execute(db.q("SELECT invoice_id, unit_price_cents FROM cost_batches ORDER BY id"))
+        batches = {row[0]: row[1] for row in cur.fetchall()}
+    assert items[mgr_inv] is None
+    assert items[b.json()["invoice_id"]] == 700
+    assert batches[mgr_inv] is None
+    assert batches[b.json()["invoice_id"]] == 700
+
+
 def test_boss_can_cancel_invoice(api):
     client, _db, ids = api
     inv = _incoming(client, ids["mgr"]).json()

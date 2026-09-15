@@ -9252,7 +9252,9 @@ async function renderWhInvoiceNew() {
     const totalCents = whDraft.items.reduce(
       (acc, it) => acc + Math.round((Number(it.price_cents) || 0) * (Number(it.quantity) || 0)), 0);
     // Итог — карточка в общем стиле: «Итого» слева, сумма справа с валютой.
-    totalEl.innerHTML = whDraft.items.length
+    // Цена прихода — себестоимость: не руководству её не спрашиваем и не
+    // показываем (сервер цену от них всё равно не примет).
+    totalEl.innerHTML = whDraft.items.length && canOut
       ? `<div class="wh-total"><span class="wh-total-label">Итого</span>` +
         `<span class="wh-total-sum">${whMoney(totalCents, baseCur())}</span></div>`
       : '';
@@ -9286,9 +9288,9 @@ async function renderWhInvoiceNew() {
           <input class="form-input ${short || qtyBad ? 'wh-input-bad' : ''}" data-f="quantity"
                  type="text" inputmode="decimal" autocomplete="off"
                  value="${it.quantity}" placeholder="Кол-во" aria-label="Количество">
-          <input class="form-input ${priceBad ? 'wh-input-bad' : ''}" data-f="price" type="text"
+          ${canOut ? `<input class="form-input ${priceBad ? 'wh-input-bad' : ''}" data-f="price" type="text"
                  inputmode="decimal" autocomplete="off" value="${(Number(it.price_cents) || 0) / 100}"
-                 placeholder="Цена" aria-label="Цена за единицу">
+                 placeholder="Цена" aria-label="Цена за единицу">` : ''}
           <button class="editor-item-del" data-del="${i}" aria-label="Удалить позицию">${icon('trash')}</button>
         </div>
         ${pr.product ? `<div class="wh-pos-warn">Выберите товар</div>` : ''}

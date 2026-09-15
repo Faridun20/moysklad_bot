@@ -7693,6 +7693,16 @@ async def api_wh_invoice_create(request: Request):
     if inv_type == "outgoing" and not counterparty_id:
         raise HTTPException(status_code=400, detail="Для расхода нужен контрагент")
 
+    # Цена прихода = закупочная = себестоимость (`costing.COST_ROLES`). Кто её
+    # не видит, тот её и не задаёт: иначе менеджер вписал бы цену партии, и
+    # прибыль руководства считалась бы от неё.
+    from services.costing import COST_ROLES
+
+    if inv_type == "incoming" and get_role(user["id"]) not in COST_ROLES:
+        raw_items = [
+            {**it, "price_cents": None} if isinstance(it, dict) else it for it in raw_items
+        ]
+
     idem = _Idem(adb, "wh_invoice_create", user["id"], data.get("idempotency_key"))
     prev = await idem.claim()
     if prev is not None:
