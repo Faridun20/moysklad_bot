@@ -844,6 +844,41 @@ async def api_settings_delete_requires_boss(request: Request):
     return JSONResponse({"ok": True, "delete_requires_boss": enabled})
 
 
+# «Резервные копии» (B10) — read-only, admin/boss. Единственный бэкап-путь,
+# видимый из БД приложения: `tasks/run_backup.py` (дамп → gzip → приватный
+# TG-канал), обёрнутый общим cron-раннером (`tasks/_cron_runner.py`), который
+# пишет в `cron_runs` под `task_name='backup'`. Хост-скрипт
+# `/srv/backups/pg-backup.sh` (`pg_dumpall` на локальный диск сервера) крутится
+# в системном cron ОС МИМО этого раннера и в `cron_runs` ничего не пишет —
+# его результат в БД приложения не виден вовсе, и панель ниже про него
+# ничего не знает (см. CLAUDE.md/отчёт агента про это ограничение).
+BACKUP_CRON_TASK = "backup"
+
+
+@app.post("/api/settings/backup_status")
+async def api_settings_backup_status(request: Request):
+    """Последний запуск бэкапа в Telegram (task_name='backup' в `cron_runs`)."""
+    from services.database import get_last_cron_runs
+
+    data = await request.json()
+    _authorize(
+        data, allowed_roles=("admin", "boss"),
+        rate_limit_scope="api_settings_backup_status", rate_limit_max=30,
+    )
+    runs = await get_last_cron_runs()
+    row = next((r for r in runs if r.get("task_name") == BACKUP_CRON_TASK), None)
+    if not row:
+        return JSONResponse({"ok": True, "found": False})
+    return JSONResponse({
+        "ok": True,
+        "found": True,
+        "status": row.get("status"),
+        "started_at": row.get("started_at"),
+        "finished_at": row.get("finished_at"),
+        "error_message": row.get("error_message") or "",
+    })
+
+
 @app.post("/api/search")
 async def api_search(request: Request):
     """Глобальный поиск по заказам / платежам / контрагентам.
@@ -3204,6 +3239,14 @@ async def api_orders(request: Request):
     # Батч-загрузка позиций: один SQL вместо N (N+1 был на больших списках)
     items_by_order = await adb.get_order_items_by_ids([o["id"] for o in orders]) if orders else {}
 
+    # Фото к заказу (B9) — тем же батчем, что и позиции: список открывают
+    # чаще, чем карточку одного заказа, и N+1 на нём был бы заметен.
+    from services import order_photos
+
+    photos_by_order = (
+        await order_photos.photos_by_orders([o["id"] for o in orders]) if orders else {}
+    )
+
     # PR C: прибыль по заказу — ТОЛЬКО boss/admin. Себестоимость из
     # product_prices (батч по всем товарам позиций). profit = Σ (price−cost)×qty.
     # Если у позиции cost неизвестна — заказ помечается profit_partial=True
@@ -3278,6 +3321,13 @@ async def api_orders(request: Request):
             "payment_gap": float(money.from_cents(gaps.get(o["id"], 0))),
             "needs_payment": gaps.get(o["id"], 0) > 0,
             "is_mine": o["user_id"] == user["id"],
+            "photos": [
+                {
+                    **_order_photo_public(p),
+                    "can_delete": order_photos.can_delete(p, user_id=user["id"], role=role),
+                }
+                for p in photos_by_order.get(o["id"], [])
+            ],
             "items": [
                 {
                     # id позиции — им редактор удаляет строку (`/api/orders/remove_item`).
@@ -3311,7 +3361,11 @@ async def api_orders(request: Request):
         result.append(entry)
 
     return JSONResponse(
-        {"orders": result, "role": role, "default_currency": BASE_CURRENCY, **page_meta}
+        {
+            "orders": result, "role": role, "default_currency": BASE_CURRENCY,
+            "photos_enabled": _machine_photos_chat_id() is not None,
+            **page_meta,
+        }
     )
 
 
@@ -7425,6 +7479,166 @@ async def api_delete_draft(request: Request):
             detail="Нельзя удалить (не свой / уже не черновик / не существует)",
         )
     return JSONResponse({"ok": True})
+
+
+# ─── API: фото к заказу (B9) ─────────────────────────────────────────────────
+# Подписанная расписка, накладная, акт передачи и т.п. — прикладывает менеджер
+# (свой заказ) или руководство (любой). Хранилище то же приватное фото-канало,
+# что у техники и товаров (`_machine_photos_chat_id`, переменная
+# `PHOTOS_TG_CHAT_ID`) — заводить третий канал под десяток снимков в месяц
+# незачем. Видимость — как у самого заказа: менеджер видит свои, руководство —
+# все (симметрично `/api/orders`, где список уже скоупится ролью).
+
+_ORDER_PHOTO_ROLES = ("admin", "boss", "manager")
+
+
+def _order_visible(order: dict | None, user_id: int, role: str) -> bool:
+    if not order:
+        return False
+    if role in ("admin", "boss"):
+        return True
+    return int(order.get("user_id") or 0) == int(user_id)
+
+
+def _order_photo_public(row: dict) -> dict:
+    return {
+        "id": int(row["id"]),
+        "caption": row.get("caption") or "",
+        "uploaded_at": row.get("uploaded_at") or "",
+        "uploaded_by": int(row["uploaded_by"]),
+    }
+
+
+@app.post("/api/orders/photos")
+async def api_orders_photos(request: Request):
+    """Список фото заказа. `tg_file_id` наружу не отдаём — файловый URL
+    Telegram содержит токен бота, клиенту нужен только `photo_id`."""
+    from services import async_db as adb
+    from services import order_photos
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=None, rate_limit_scope="api_orders_photos",
+    )
+    order_id = _machine_id_arg(data, "order_id")
+    role = get_role(user["id"])
+    order = await adb.get_order(order_id)
+    if not _order_visible(order, user["id"], role):
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    photos = await order_photos.list_photos(order_id)
+    return JSONResponse({
+        "ok": True,
+        "photos": [
+            {
+                **_order_photo_public(p),
+                "can_delete": order_photos.can_delete(p, user_id=user["id"], role=role),
+            }
+            for p in photos
+        ],
+        "can_upload": _machine_photos_chat_id() is not None,
+    })
+
+
+@app.post("/api/orders/photo")
+async def api_orders_photo(request: Request):
+    """Отдать фото заказа байтами — прямую ссылку Telegram отдавать нельзя, в
+    ней токен бота."""
+    from services import async_db as adb
+    from services import order_photos
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=None, rate_limit_scope="api_orders_photo", rate_limit_max=120,
+    )
+    order_id = _machine_id_arg(data, "order_id")
+    photo_id = _machine_id_arg(data, "photo_id")
+    role = get_role(user["id"])
+    order = await adb.get_order(order_id)
+    if not _order_visible(order, user["id"], role):
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    photos = await order_photos.list_photos(order_id)
+    photo = next((p for p in photos if int(p["id"]) == photo_id), None)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Фото не найдено")
+    blob = await _photo_bytes(str(photo["tg_file_id"]), str(photo["file_unique_id"]))
+    if blob is None:
+        raise HTTPException(status_code=404, detail="Фото недоступно")
+    return Response(
+        blob, media_type=_photo_media_type(blob) or "image/jpeg",
+        headers={"Cache-Control": "private, max-age=600", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.post("/api/orders/photo_upload")
+async def api_orders_photo_upload(request: Request):
+    """Загрузить фото к заказу из WebApp. base64 в JSON — как у техники и
+    товаров: `python-multipart` в зависимостях нет."""
+    from services import async_db as adb
+    from services import order_photos
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_ORDER_PHOTO_ROLES, rate_limit_scope="api_orders_photo_upload",
+        # Пачкой грузят по одному запросу на снимок: расписка на несколько
+        # страниц — это одно действие, а не подозрительная активность.
+        rate_limit_max=60,
+    )
+    order_id = _machine_id_arg(data, "order_id")
+    role = get_role(user["id"])
+    order = await adb.get_order(order_id)
+    if not _order_visible(order, user["id"], role):
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    chat_id = _machine_photos_chat_id()
+    if chat_id is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Загрузка фото не настроена: нет PHOTOS_TG_CHAT_ID. Пришлите фото боту.",
+        )
+    blob = _decode_photo(data.get("data_url"))
+    caption = (str(data.get("caption") or "")).strip()[:200]
+
+    try:
+        from aiogram.types import BufferedInputFile
+
+        bot = await get_notify_bot()
+        sent = await bot.send_photo(
+            chat_id,
+            BufferedInputFile(blob, filename=f"order-{order_id}.jpg"),
+            caption=f"Заказ #{order_id} {caption}".strip()[:1024],
+        )
+    except Exception as e:
+        logger.warning("Фото заказа #%s не загружено: %s", order_id, redact_token(repr(e)))
+        raise HTTPException(status_code=502, detail="Telegram не принял фото, попробуйте ещё раз")
+
+    best = max(sent.photo or [], key=lambda p: (p.width or 0) * (p.height or 0), default=None)
+    if best is None:
+        raise HTTPException(status_code=502, detail="Telegram не вернул файл")
+    res = await order_photos.add_photo(
+        order_id, tg_file_id=best.file_id, file_unique_id=best.file_unique_id,
+        uploaded_by=user["id"], caption=caption or None,
+    )
+    return _machine_response(res)
+
+
+@app.post("/api/orders/photo_delete")
+async def api_orders_photo_delete(request: Request):
+    """Открепить фото заказа. Автор — в течение `order_photos.DELETE_WINDOW_HOURS`
+    после загрузки, руководство — всегда."""
+    from services import async_db as adb
+    from services import order_photos
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_ORDER_PHOTO_ROLES, rate_limit_scope="api_orders_photo_delete",
+    )
+    order_id = _machine_id_arg(data, "order_id")
+    photo_id = _machine_id_arg(data, "photo_id")
+    role = get_role(user["id"])
+    order = await adb.get_order(order_id)
+    if not _order_visible(order, user["id"], role):
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    res = await order_photos.delete_photo(order_id, photo_id, user_id=user["id"], role=role)
+    return _machine_response(res)
 
 
 # ─── API: локальный складской учёт ───────────────────────────────────────────

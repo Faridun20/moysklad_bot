@@ -74,18 +74,72 @@ def free_port() -> int:
         return int(s.getsockname()[1])
 
 
+class _FakePhotoSize:
+    """Одна «лесенка» фото из ответа send_photo — как у настоящего Bot API."""
+
+    def __init__(self, file_id, unique, width, height):
+        self.file_id = file_id
+        self.file_unique_id = unique
+        self.width = width
+        self.height = height
+
+
+class _FakeSentPhotoMessage:
+    def __init__(self, sizes):
+        self.photo = sizes
+
+
+class _FakeTgFile:
+    def __init__(self, path, size):
+        self.file_path = path
+        self.file_size = size
+
+
 class FakeBot:
-    """Граница с Telegram: всё исходящее — в память."""
+    """Граница с Telegram: всё исходящее — в память.
+
+    `send_photo`/`get_file`/`download_file` — нужны e2e-сценариям загрузки
+    фото (техника/товары/заказы, B9): загрузка кладёт снимок сюда же, откуда
+    прокси-ручка (`/api/*/photo`) его и «скачивает» обратно — без реального
+    Bot API.
+    """
 
     def __init__(self) -> None:
         self.messages: list[dict] = []
         self.documents: list[dict] = []
+        self.photos: list[dict] = []          # {chat_id, caption}, по одному на send_photo
+        self._file_blobs: dict[str, bytes] = {}   # file_id (small/big) -> исходные байты
 
     async def send_message(self, chat_id, text, **kw):
         self.messages.append({"chat_id": chat_id, "text": text, **kw})
 
     async def send_document(self, chat_id, document, **kw):
         self.documents.append({"chat_id": chat_id, **kw})
+
+    async def send_photo(self, chat_id, photo, caption=None, **kw):
+        idx = len(self.photos)
+        blob = getattr(photo, "data", None) or b""
+        self.photos.append({"chat_id": chat_id, "caption": caption})
+        # Настоящий Bot API отдаёт «лесенку» превью; прокси/add_photo берут
+        # самый крупный размер (см. `machines.add_photo`/`server.py`).
+        small_id, big_id = f"e2e-small-{idx}", f"e2e-big-{idx}"
+        self._file_blobs[small_id] = blob
+        self._file_blobs[big_id] = blob
+        sizes = [
+            _FakePhotoSize(small_id, f"e2e-uniq-{idx}-s", 90, 60),
+            _FakePhotoSize(big_id, f"e2e-uniq-{idx}", 1600, 1200),
+        ]
+        return _FakeSentPhotoMessage(sizes)
+
+    async def get_file(self, file_id):
+        blob = self._file_blobs.get(file_id, b"")
+        return _FakeTgFile(f"photos/{file_id}.jpg", size=len(blob))
+
+    async def download_file(self, path):
+        import io
+
+        file_id = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        return io.BytesIO(self._file_blobs.get(file_id, b""))
 
 
 class LiveServer:

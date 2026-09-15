@@ -335,6 +335,15 @@ def _service_flows(db, tag: str) -> None:
     assert ok, pay_id
     assert _run(db.confirm_payment(pay_id, BOSS, "Boss"))
 
+    # Фото к заказу (B9): расписка/накладная — FK на orders (order_photos_order_fk),
+    # UNIQUE (order_id, file_unique_id) не даёт задвоить пересланный снимок.
+    from services import order_photos
+
+    photo = _run(order_photos.add_photo(
+        oid, tg_file_id=f"tg-{tag}", file_unique_id=f"uniq-{tag}", uploaded_by=MGR,
+    ))
+    assert photo["ok"], photo
+
     # Сдача наличных по этому заказу.
     dep = _run(db.create_cash_deposit(MGR, 50.0))
     if dep.get("ok"):
@@ -514,12 +523,46 @@ def test_constraints_hold_for_real_service_flows(pg_db):
         ("machine_deal_requests", "status = 'rejected'"),
         ("payment_part_accounts", "TRUE"), ("machine_receipt_accounts", "TRUE"),
         ("acc_account_details", "account_number IS NOT NULL"),
+        ("order_photos", "TRUE"),
     ):
         n = _one(db, f"SELECT COUNT(*) AS n FROM {table} WHERE {where}")["n"]
         assert n > 0, table
 
     after = apply_constraints.run(dry_run=True)
     assert after.violations == {} and after.planned == [], (after.violations, after.planned)
+
+
+def test_order_photos_constraints_on_postgres(pg_db):
+    """B9: FK на orders (order_photos_order_fk) и UNIQUE (order_id,
+    file_unique_id) — ограничения именно НА БАЗЕ, а не только в сервисе
+    (`services.order_photos.add_photo` сам не задваивает, но это Python-код;
+    здесь проверяем, что и голый SQL мимо сервиса не пройдёт)."""
+    import psycopg2
+
+    from scripts import apply_constraints
+
+    db = pg_db
+    rep = apply_constraints.run(dry_run=False)
+    assert rep.failed == [], rep.failed
+    assert _constraint(db, "order_photos_order_fk") is True
+
+    oid = db.create_order(MGR, "Manager", "")
+    _exec(db, "INSERT INTO order_photos (order_id, tg_file_id, file_unique_id, uploaded_by, "
+              "uploaded_at) VALUES (%s, 'tg-1', 'uniq-1', %s, %s)",
+          (oid, MGR, "2026-01-01 00:00:00"))
+
+    # Сирота — FK отказывает.
+    with pytest.raises(psycopg2.errors.ForeignKeyViolation):
+        _exec(db, "INSERT INTO order_photos (order_id, tg_file_id, file_unique_id, uploaded_by, "
+                  "uploaded_at) VALUES (999999, 'tg-2', 'uniq-2', %s, %s)",
+              (MGR, "2026-01-01 00:00:00"))
+
+    # Тот же снимок того же заказа второй раз — UNIQUE отказывает (сервис ловит
+    # это раньше SELECT'ом, но ограничение обязано держать и мимо сервиса).
+    with pytest.raises(psycopg2.errors.UniqueViolation):
+        _exec(db, "INSERT INTO order_photos (order_id, tg_file_id, file_unique_id, uploaded_by, "
+                  "uploaded_at) VALUES (%s, 'tg-3', 'uniq-1', %s, %s)",
+              (oid, MGR, "2026-01-01 00:00:00"))
 
 
 def test_catalog_picker_search_and_name_matching_on_postgres(pg_db):

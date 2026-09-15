@@ -3480,10 +3480,14 @@ function revokePhotoUrls() {
   _photoUrls = [];
 }
 
-// Лента фото — общая для техники и товаров: механизм один (файл в Telegram,
-// у нас идентификаторы), и различаются только ручка и её тело.
+// Лента фото — общая для техники, товаров и заказов: механизм один (файл в
+// Telegram, у нас идентификаторы), и различаются только ручка и её тело.
+// `canDelete` — либо один флаг на всю ленту (техника/товары: решает роль),
+// либо функция(photo)=>bool — когда право зависит от самой фотографии
+// (заказы: автор в течение окна ИЛИ руководство, разное у разных снимков).
 function photoStripHtml(photos, { addId, canUpload, canDelete, alt }) {
   const rows = photos || [];
+  const canDeleteFor = typeof canDelete === 'function' ? canDelete : () => !!canDelete;
   const upload = canUpload
     ? `<button class="btn-secondary" id="${addId}">${icon('plus')} Добавить фото</button>`
     : '';
@@ -3499,7 +3503,7 @@ function photoStripHtml(photos, { addId, canUpload, canDelete, alt }) {
     `<div class="machine-photo-wrap">` +
     `<button class="machine-photo" data-photo="${p.id}" aria-label="${escapeHtml(p.caption || alt)}">` +
     `<img alt="${escapeHtml(p.caption || '')}" loading="lazy"></button>` +
-    (canDelete
+    (canDeleteFor(p)
       ? `<button class="photo-del" data-photo-del="${p.id}" ` +
         `aria-label="Убрать фото">${icon('close')}</button>`
       : '') +
@@ -3666,6 +3670,35 @@ function pickPhotos(endpoint, body, onDone) {
 function pickMachinePhoto(machineId) {
   pickPhotos('/api/machines/photo_upload', { machine_id: machineId },
     () => renderMachineCard(machineId));
+}
+
+// ─── Фото к заказу (B9) — расписка, накладная, акт передачи ────────────────
+// Тот же приём, что у техники: та же лента, та же ручка загрузки/удаления,
+// свой endpoint. Видимость и право удаления сервер уже посчитал в `o.photos`
+// (`can_delete` на каждом снимке) — фронт их просто показывает.
+
+function orderPhotosHtml(o, isBoss) {
+  const canUpload = !!(ordersData && ordersData.photos_enabled) && (isBoss || o.is_mine);
+  return photoStripHtml(o.photos, {
+    addId: `order-photo-add-${o.id}`,
+    canUpload,
+    canDelete: (p) => !!p.can_delete,
+    alt: 'Фото к заказу',
+  });
+}
+
+async function loadOrderPhotos(orderId, root) {
+  await loadPhotos(root, '/api/orders/photo', (photoId) => ({
+    order_id: orderId, photo_id: photoId,
+  }));
+  wirePhotoDelete(root, '/api/orders/photo_delete',
+    (photoId) => ({ order_id: orderId, photo_id: photoId }),
+    () => { ordersData = null; renderOrders(); });
+}
+
+function pickOrderPhoto(orderId) {
+  pickPhotos('/api/orders/photo_upload', { order_id: orderId },
+    () => { ordersData = null; renderOrders(); });
 }
 
 async function renderMachineCard(machineId) {
@@ -4773,6 +4806,7 @@ function renderOrdersMain(opts = {}) {
             : '';
           return `<div class="order-item-preview">• ${escapeHtml(it.name)} — ${it.quantity} ${escapeHtml(it.unit || 'шт')}${priceStr}</div>`;
         }).join('')}
+        ${orderPhotosHtml(o, isBoss)}
         ${o.status === 'draft' && !isBoss ? `
           <div class="draft-actions">
             <button class="btn-edit-order" data-id="${o.id}">${icon('edit')} Редактировать</button>
@@ -4832,6 +4866,9 @@ function renderOrdersMain(opts = {}) {
       </div>
     </div>` : '';
 
+  // Прошлые снимки лент заказов больше не на экране — их blob-URL'ы держат
+  // память WebView (как у карточки техники).
+  revokePhotoUrls();
   content.innerHTML = `
     ${salesShellHtml()}
     <div class="seg-row scroll-hint"><div class="seg seg--scroll">${statusSeg}</div></div>
@@ -4847,6 +4884,20 @@ function renderOrdersMain(opts = {}) {
     haptic('light');
     loadMoreOrders(ev.currentTarget);
   });
+
+  // Фото к заказу: лента лежит внутри каждой карточки — грузим байты и
+  // навешиваем «Добавить»/«Убрать» по каждой карточке отдельно.
+  if (!opts.loading) {
+    content.querySelectorAll('.order-card[data-id]').forEach(card => {
+      const id = parseInt(card.dataset.id, 10);
+      loadOrderPhotos(id, card);
+      document.getElementById(`order-photo-add-${id}`)?.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        haptic('light');
+        pickOrderPhoto(id);
+      });
+    });
+  }
 
   // Фильтры по статусу (сегмент).
   document.querySelectorAll('.seg-item[data-filter]').forEach(btn => {
@@ -5886,6 +5937,42 @@ async function renderDecisionsScreen() {
   });
 }
 
+// «Резервные копии» (B10, экран «Настройки», только руководству): последний
+// запуск `tasks/run_backup.py` (дамп БД → приватный TG-канал) из `cron_runs`
+// (task_name='backup'). Хост-скрипт `/srv/backups/pg-backup.sh` крутится в
+// cron ОС мимо приложения и в `cron_runs` не пишет — его сюда честно нечем
+// показать, поэтому панель — только про TG-бэкап.
+function backupStatusHtml(backup) {
+  if (!backup || !backup.ok) return '';
+  if (!backup.found) {
+    return `<div class="section-label">Резервные копии</div>
+      <div class="c-surface c-surface--list">
+        <div class="c-row">
+          <div class="card-row-icon">${icon('alert')}</div>
+          <div class="card-row-info">
+            <div class="card-row-title">Ещё не запускался</div>
+            <div class="card-row-sub">Ночной бэкап в Telegram (tasks/run_backup) пока не отчитался</div>
+          </div>
+        </div>
+      </div>`;
+  }
+  const ok = backup.status === 'ok';
+  const when = (backup.finished_at || backup.started_at || '').slice(0, 16).replace('T', ' ');
+  const sub = ok
+    ? `${when} · успешно`
+    : `${when} · ошибка${backup.error_message ? ': ' + backup.error_message : ''}`;
+  return `<div class="section-label">Резервные копии</div>
+    <div class="c-surface c-surface--list">
+      <div class="c-row">
+        <div class="card-row-icon">${icon(ok ? 'check' : 'alert')}</div>
+        <div class="card-row-info">
+          <div class="card-row-title">Бэкап в Telegram · ${ok ? 'успешно' : 'ошибка'}</div>
+          <div class="card-row-sub">${escapeHtml(sub)}</div>
+        </div>
+      </div>
+    </div>`;
+}
+
 // ─── Экран: Настройки (руководитель) ────────────────────────────────────────
 // Реквизиты компании, курсы валют, выключатели «Рабочие действия» (личный вид)
 // и «Удаление — только руководитель» (настройка компании). Раньше
@@ -5901,6 +5988,16 @@ async function renderSettingsScreen() {
     meta = await api('/api/docs/types', {});
   } catch (_e) {
     meta = null;   // реквизиты недоступны — остальные настройки всё равно нужны
+  }
+  // «Резервные копии» (B10) — только руководству, ручка сама проверяет роль,
+  // но лишний запрос менеджеру ни к чему.
+  let backup = null;
+  if (isBossRole()) {
+    try {
+      backup = await api('/api/settings/backup_status', {});
+    } catch (_e) {
+      backup = null;   // недоступно — секцию просто не показываем
+    }
   }
   if (gen !== screenGen()) return;
   const box = document.getElementById('content');
@@ -5932,6 +6029,7 @@ async function renderSettingsScreen() {
         ? row('set-pay-accounts', 'card', 'Карты и счета', 'Куда клиенты платят картой и перечислением')
         : ''}
     </div>
+    ${backupStatusHtml(backup)}
     <div class="section-label">Сотрудники</div>
     <div class="c-surface c-surface--list">
       <div class="c-row">

@@ -507,6 +507,21 @@ def _table_ddls() -> list[str]:
                 created_at       TEXT NOT NULL,
                 approved_at      TEXT
             )""",
+            # Фото к заказу (B9): подписанная расписка, накладная, акт передачи —
+            # тот же приём, что у фото техники/товаров (`services/order_photos.py`).
+            # FK на orders — только на проде (`scripts/apply_constraints`, как у
+            # всех денежных/складских таблиц); удаление черновика чистит эту
+            # таблицу явно (`database.delete_order`).
+            f"""CREATE TABLE IF NOT EXISTS order_photos (
+                id             {id_type},
+                order_id       BIGINT NOT NULL,
+                tg_file_id     TEXT NOT NULL,
+                file_unique_id TEXT NOT NULL,
+                caption        TEXT,
+                uploaded_by    BIGINT NOT NULL,
+                uploaded_at    TEXT,
+                UNIQUE (order_id, file_unique_id)
+            )""",
             # Round 6 RACE-4: idempotency-guard для ops_monitor cron.
             # PRIMARY KEY (run_date) + INSERT-if-absent через `claim_ops_monitor_run`
             # — параллельный/повторный запуск за тот же день делает noop.
@@ -6016,6 +6031,7 @@ async def delete_order(order_id: int, requested_by: int) -> bool:
         # Postgres DELETE по order_items отвергнется живым FK.
         await txn.execute("DELETE FROM order_item_products WHERE order_id = $1", order_id)
         await txn.execute("DELETE FROM order_items WHERE order_id = $1", order_id)
+        await txn.execute("DELETE FROM order_photos WHERE order_id = $1", order_id)
         # Условие статуса повторено в самом DELETE — последний рубеж.
         deleted = (
             await txn.execute(
