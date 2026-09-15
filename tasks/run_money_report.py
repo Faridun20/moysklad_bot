@@ -26,12 +26,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("money_report")
 
-from services.database import get_all_users, init_db  # noqa: E402
+from services.database import get_all_users, ensure_schema  # noqa: E402
 from services.notifier import close_tg_session  # noqa: E402
 
 
 async def main() -> int:
-    init_db()
+    ensure_schema()
 
     from services import money_report
 

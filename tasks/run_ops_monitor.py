@@ -27,7 +27,7 @@ from config import WEBAPP_URL
 from services.database import (
     claim_ops_monitor_run,
     get_all_users,
-    init_db,
+    ensure_schema,
 )
 from services.notifier import close_tg_session, tg_send_message
 from services.ops_summary import gather_ops_summary
@@ -319,7 +319,7 @@ def build_ping_keyboard(webapp_url: str | None) -> dict | None:
 
 
 async def main() -> int:
-    init_db()
+    ensure_schema()
 
     # Round 6 RACE-4: idempotency-guard. Railway Cron при сетевом hiccup'е
     # может ретраить запуск, или ручной запуск пересечётся с плановым —

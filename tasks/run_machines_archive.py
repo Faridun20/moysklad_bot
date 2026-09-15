@@ -24,12 +24,12 @@ import sys
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("machines_archive")
 
-from services.database import get_setting, init_db  # noqa: E402
+from services.database import get_setting, ensure_schema  # noqa: E402
 from services.machines import archive_sold_machines  # noqa: E402
 
 
 def main() -> int:
-    init_db()
+    ensure_schema()
     try:
         days = int(get_setting("machines_archive_days", 90))
     except (TypeError, ValueError):

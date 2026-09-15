@@ -37,12 +37,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("boss_digest")
 
-from services.database import get_all_users, init_db  # noqa: E402
+from services.database import get_all_users, ensure_schema  # noqa: E402
 from services.notifier import close_tg_session  # noqa: E402
 
 
 async def main() -> int:
-    init_db()
+    ensure_schema()
 
     from services import boss_digest
     from utils.helpers import local_now
