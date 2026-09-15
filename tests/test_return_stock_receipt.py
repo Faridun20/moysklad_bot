@@ -216,3 +216,33 @@ def test_moysklad_era_order_is_received(env):
 
     assert res["ok"], res
     assert _stock(db, pids["Кабель"]) == 13
+
+
+def test_return_goes_back_at_the_cost_it_left_with(env):
+    """Учёт себестоимости включён: возврат приходуется по той себестоимости,
+    что зафиксировала отгрузка, а не «без себестоимости» — иначе следующая
+    продажа возвращённого товара выпала бы из прибыли."""
+    from services import container_receipt, warehouse
+
+    db, _ = env
+    db.set_setting("accounting_enabled", True)
+    wid = _run(warehouse.default_warehouse_id())
+    pid = _run(container_receipt.create_product("Фильтр"))["product_id"]
+    res = _run(warehouse.create_invoice(
+        invoice_type="incoming", warehouse_id=wid,
+        items=[{"product_id": pid, "quantity": 10, "price_cents": 300}],
+    ))
+    assert res["ok"], res
+    oid, items = _shipped_order(db, {"Фильтр": pid}, [("Фильтр", 4)])
+    rid = _return(db, oid, [(items["Фильтр"], 2)])
+    assert _run(db.confirm_return(rid, 100, "Boss"))["ok"]
+
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            "SELECT b.unit_price_cents, b.currency, b.quantity FROM cost_batches b "
+            "JOIN invoices i ON i.id = b.invoice_id WHERE i.comment LIKE 'Возврат%'"
+        )
+        rows = [tuple(r) for r in cur.fetchall()]
+    assert rows == [(300, "USD", 2.0)]
+    assert _stock(db, pid) == 8

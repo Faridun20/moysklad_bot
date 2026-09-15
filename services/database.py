@@ -1210,11 +1210,11 @@ def _table_ddls() -> list[str]:
                 created_at     TEXT
             )""",
         ]
-        # Бухгалтерия (счета, журнал денег) — схема в leaf-модуле: сервис
-        # импортирует database, и объявление здесь дало бы цикл импортов.
-        from services.accounting_schema import tables as _accounting_tables
+    # Бухгалтерия (счета, журнал денег) — схема в leaf-модуле: сервис
+    # импортирует database, и объявление здесь дало бы цикл импортов.
+    from services.accounting_schema import tables as _accounting_tables
 
-        tables.extend(_accounting_tables(id_type))
+    tables.extend(_accounting_tables(id_type))
 
     return tables
 
@@ -3978,13 +3978,35 @@ async def _plan_return_stock(return_id: int, order_id: int) -> dict:
         return_id,
     )
     positions, unmatched = await order_shipment._resolve_products(rows)
+    # Цену продажи в приход НЕ пишем: цена в приходной накладной читается как
+    # закупочная, и цена продажи исказила бы себестоимость. Но если учёт
+    # себестоимости включён, отгрузка уже зафиксировала, почём товар ушёл
+    # (sale_costs, в базовой валюте) — возвращаем его по ТОЙ ЖЕ себестоимости,
+    # иначе возвращённая партия ляжет «без себестоимости» и следующая продажа
+    # выпадет из прибыли. Хоть одна строка отгрузки без себестоимости — цену
+    # не угадываем. Учёт выключен — sale_costs пуст, поведение прежнее.
+    unit_cost: dict[int, int] = {}
+    ship_invoice_id = order.get("ship_invoice_id") if order else None
+    if ship_invoice_id:
+        for r in await adb_core.fetch(
+            "SELECT product_id, SUM(quantity) AS qty, SUM(cost_base_cents) AS cost, "
+            "COUNT(*) AS n, COUNT(cost_base_cents) AS n_cost "
+            "FROM sale_costs WHERE invoice_id = $1 GROUP BY product_id",
+            int(ship_invoice_id),
+        ):
+            qty = float(r["qty"] or 0)
+            if qty > 0 and r["n"] == r["n_cost"]:
+                unit_cost[int(r["product_id"])] = round(int(r["cost"]) / qty)
     for p in positions:
-        # Цену в приход НЕ пишем: возвращённый товар не закупка, а цена в
-        # приходной накладной читается как закупочная — цена продажи исказила
-        # бы себестоимость. Деньги возврата живут в returns/cash_deposits.
-        p["price_cents"] = None
+        p["price_cents"] = unit_cost.get(int(p["product_id"]))
     reason = None if positions else "ни одна позиция возврата не сопоставлена с номенклатурой"
-    return {"positions": positions, "unmatched": unmatched, "skipped_reason": reason}
+    return {
+        "positions": positions,
+        "unmatched": unmatched,
+        "skipped_reason": reason,
+        # Себестоимость — в базовой валюте: приход по ней оформляется в базовой.
+        "priced_in_base": any(p["price_cents"] is not None for p in positions),
+    }
 
 
 async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str = "") -> dict:
@@ -4135,7 +4157,11 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
                         warehouse_id=int(stock_warehouse_id or 1),
                         items=stock_plan["positions"],
                         counterparty_id=counterparty_id,
-                        currency=str(order_head.get("currency") or BASE_CURRENCY or "USD"),
+                        currency=(
+                            str(BASE_CURRENCY or "USD")
+                            if stock_plan.get("priced_in_base")
+                            else str(order_head.get("currency") or BASE_CURRENCY or "USD")
+                        ),
                         comment=f"Возврат по заказу #{order_id} (возврат #{return_id})",
                         created_by=confirmed_by,
                     )

@@ -116,6 +116,11 @@ async def is_enabled(conn: Any = None) -> bool:
 
 async def set_enabled(value: bool, user_id: int | None) -> None:
     await asyncio.to_thread(_db.set_setting, SWITCH_KEY, bool(value), user_id)
+    # Один выключатель на весь учёт: включили из «Отчёта» — бухгалтерии денег
+    # тоже нужна дата старта (иначе остатки счетов не с чего считать). Не
+    # затираем уже заданную на экране «Касса».
+    if value and not await asyncio.to_thread(_db.get_setting, "accounting_start_date", None):
+        await asyncio.to_thread(_db.set_setting, "accounting_start_date", _today(), user_id)
 
 
 # ─── Числа ────────────────────────────────────────────────────────────────────
