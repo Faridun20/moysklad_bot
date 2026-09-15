@@ -802,13 +802,21 @@ def format_card(req: dict, *, no_boss: bool = False) -> str:
 
 
 async def notify_decision_card(request_id: int) -> None:
-    """Карточка решения — сразу (это решение, а не сводка). Best-effort."""
+    """Карточка решения — сразу (это решение, а не сводка). Best-effort.
+
+    Решение «пушить сейчас или копить» — как у всех боссовских пушей — за
+    `notify_policy.should_notify_now(MACHINE_DEAL_APPROVAL)`: сейчас оно всегда
+    «сразу» (одобрение блокирует продажу), но правило живёт в одном месте.
+    """
+    from services import notify_policy
     from services.notifier import tg_send_message
     from utils.keyboards import machine_request_keyboard
 
     try:
         req = await get_request(request_id)
         if not req or req["status"] != "pending":
+            return
+        if not notify_policy.should_notify_now(notify_policy.MACHINE_DEAL_APPROVAL):
             return
         users = await asyncio.to_thread(_active_users)
         recipients = _recipients(users)

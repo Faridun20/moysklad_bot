@@ -1006,7 +1006,7 @@ describe('navBarLayout / navDrawerHtml (шторка «Меню»)', () => {
 describe('руководитель: «Рабочие действия» (решение владельца)', () => {
   const {
     roleSectionTabs, workActionsOn, deleteActionsOn, resolveScreen, navBarLayout,
-    navDrawerHtml, workSwitchHtml, isBossLike,
+    navDrawerHtml, workSwitchHtml, deleteSwitchHtml, isBossLike,
   } = helpers;
   const tabs = (section, role, work) => roleSectionTabs(section, role, { work }).map(t => t.key);
   const SECTIONS = ['sales', 'stock', 'money', 'clients'];
@@ -1106,5 +1106,15 @@ describe('руководитель: «Рабочие действия» (реш�
     // Без opts.workSwitch (менеджер) выключателя нет.
     expect(navDrawerHtml(groups, { screen: 'today' }, {})).not.toContain('data-work-switch');
     expect(workSwitchHtml(true, 'c-row" onclick="x')).not.toContain('" onclick');
+  });
+
+  it('deleteSwitchHtml: положение словами и бегунком, класс не ломает разметку', () => {
+    const off = deleteSwitchHtml(false, 'c-row');
+    expect(off).toContain('role="switch" aria-checked="false"');
+    expect(off).toContain('data-delete-switch');
+    expect(off).not.toContain('data-work-switch');
+    expect(off).toContain('может и менеджер');
+    expect(deleteSwitchHtml(true)).toContain('только руководитель');
+    expect(deleteSwitchHtml(true, 'c-row" onclick="x')).not.toContain('" onclick');
   });
 });

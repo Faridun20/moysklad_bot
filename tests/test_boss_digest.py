@@ -294,16 +294,24 @@ def test_fallback_never_logs_the_token(isolated_db, monkeypatch, caplog):
 # ─── Кнопка WebApp ───────────────────────────────────────────────────────────
 
 
-def test_webapp_button_targets_decisions_screen_with_fallback(monkeypatch):
+def test_webapp_button_opens_decisions_by_canonical_deep_link(monkeypatch):
+    """Кнопка дайджеста — тот же deep link, что у остальных уведомлений
+    (`utils.keyboards.webapp_screen_url`, `?startapp=decisions`), а не свой
+    `?screen=…&fallback_screen=…`, которого фронт не читает."""
+    from urllib.parse import parse_qs, urlsplit
+
     import config
 
     from services import boss_digest as bd
+    from utils.keyboards import DECISIONS_SCREEN, webapp_screen_url
 
-    monkeypatch.setattr(config, "WEBAPP_URL", "https://app.example.com")
+    monkeypatch.setattr(config, "WEBAPP_URL", "https://app.example.com/?v=3")
     markup = bd.webapp_reply_markup()
     url = markup["inline_keyboard"][0][0]["web_app"]["url"]
-    assert "screen=decisions" in url
-    assert "fallback_screen=money" in url  # money%3Aconfirm, URL-encoded
+    assert url == webapp_screen_url(DECISIONS_SCREEN)
+    query = parse_qs(urlsplit(url).query)
+    assert query == {"v": ["3"], "startapp": ["decisions"]}
+    assert "fallback_screen" not in url
 
 
 def test_webapp_button_absent_without_https(monkeypatch):

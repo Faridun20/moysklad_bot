@@ -40,39 +40,24 @@ from __future__ import annotations
 
 import logging
 
+from utils.keyboards import DECISIONS_SCREEN, webapp_screen_url
+
 logger = logging.getLogger(__name__)
 
 _ITEM_CAP = 8
 
 WEBAPP_BUTTON_TEXT = "🗂 Открыть решения"
 
-# Экран, который добавляет параллельный агент (boss-ui): единая витрина
-# боссовских решений. Пока он не выкачен (или у зрителя старый клиент,
-# который вообще не читает query-параметры) — открывается WEBAPP_URL как
-# есть, и это безопасный no-op, а НЕ поломка: кнопка всё равно ведёт в
-# WebApp. `fallback_screen` — на тот случай, если фронт умеет читать
-# `screen`, но алиас `decisions` ещё не знает: money:confirm — тот же
-# «Деньги → Подтвердить», что уже показывает pending платежи/сдачи/возвраты.
-DECISIONS_SCREEN = "decisions"
-FALLBACK_SCREEN = "money:confirm"
+# Кнопка ведёт прямо в «Решения» руководителя — тем же каноническим deep link,
+# что и остальные уведомления (`utils.keyboards.webapp_screen_url`:
+# `?startapp=decisions`, фронт читает его в `launchScreen`). Свой сборщик адреса
+# здесь разошёлся бы с фронтом при первой правке.
 
 
 def _webapp_url() -> str | None:
-    """https-адрес WebApp с deep-link на экран решений, либо None.
-
-    web_app-кнопку Telegram принимает только с https-URL (см. `money_report.
-    _webapp_url` — тот же приём, продублирован: модули не должны знать друг о
-    друге ради косметики кнопки).
-    """
-    import config
-    from urllib.parse import urlencode
-
-    url = config.WEBAPP_URL or ""
-    if not url.startswith("https://"):
-        return None
-    query = urlencode({"screen": DECISIONS_SCREEN, "fallback_screen": FALLBACK_SCREEN})
-    sep = "&" if "?" in url else "?"
-    return f"{url}{sep}{query}"
+    """https-адрес WebApp с deep link на «Решения», либо None (WEBAPP_URL не
+    https — такую web_app-кнопку Bot API отвергает вместе с сообщением)."""
+    return webapp_screen_url(DECISIONS_SCREEN)
 
 
 def webapp_reply_markup() -> dict | None:

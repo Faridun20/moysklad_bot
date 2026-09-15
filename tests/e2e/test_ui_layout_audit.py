@@ -167,6 +167,21 @@ def _seed_layout(e2e, tmp_path: Path, *, accounting: bool = False) -> None:
     seed_order(e2e, payment_type="paid", due_date=None, qty=3, price=4043.33, pay=None)
     uzs = seed_order(e2e, qty=1000, price=12130.0)
     e2e.exec("UPDATE orders SET currency = 'UZS' WHERE id = ?", (uzs["order_id"],))
+    # Рассрочка менеджера ждёт одобрения: группа «Сделки по технике» в «Решениях»
+    # (длинные условия: цена против прайса, скидка, график), «Ждёт одобрения» в
+    # «Технике» и карточка заявки в карточке машины.
+    from services import machine_deal_requests as mdr
+    from services import machines
+
+    m = e2e.run(machines.create_machine(
+        vin="LAYOUT-MDR", name="Hitachi ZX200-5G с гидромолотом и ковшом 1,2 м³",
+        created_by=e2e.ids["boss"], status="in_stock", price_cents=2_500_000))
+    req = e2e.run(mdr.submit(
+        m["machine_id"], kind="credit", actor_id=e2e.ids["mgr"], actor_name="Manager",
+        actor_role="manager", price_cents=2_400_000, buyer_name="ООО «Самарканд Инвест Групп»",
+        buyer_phone="+998901112233", buyer_passport="AA1234567", buyer_note="Самовывоз со склада",
+        down_payment_cents=400_000, months=12, notify=False))
+    assert req.get("ok") and req.get("pending"), req
     if accounting:
         from tests.e2e.test_accounting import _seed_accounting
 
@@ -294,6 +309,16 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
     audit = Audit(page, f"{role}-{theme}-{width}{'-acc' if accounting else ''}{'-work' if role == 'boss' and work else ''}")
 
     audit.sections()
+    if role == "boss":
+        # «Решения»: сделка по технике — своей группой с кнопками решения;
+        # «Настройки»: «Удаление — только руководитель» рядом с «Рабочими действиями».
+        go(page, "decisions")
+        page.wait_for_selector('#content [data-decision-group="machine_deals"] [data-mreq-approve]')
+        audit.check("decisions-machine-deal")
+        go(page, "settings")
+        page.wait_for_selector("#content [data-delete-switch]")
+        assert page.locator("#content [data-work-switch]").count() == 1
+        audit.check("settings-switches")
     # Деньги → Долги с фильтром «К оплате сейчас».
     go(page, "money")
     tab(page, "debts")

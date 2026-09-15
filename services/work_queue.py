@@ -52,6 +52,17 @@ async def _unchecked_containers() -> int:
     return int(value or 0)
 
 
+async def _pending_machine_deals() -> int:
+    """Заявки на сделки по технике, ждущие решения (`machine_deal_requests`).
+
+    Только `pending`: «на доработке» ждёт менеджера, а не руководителя.
+    """
+    value = await adb_core.fetchval(
+        "SELECT COUNT(*) FROM machine_deal_requests WHERE status = 'pending'"
+    )
+    return int(value or 0)
+
+
 async def _overdue_debts(user_id: int | None) -> int:
     """Долги, у которых срок УЖЕ прошёл.
 
@@ -126,6 +137,11 @@ async def gather(user_id: int, role: str) -> list[dict]:
                 "товар вернулся, решение за вами", "warn", DECISIONS_SCREEN)
         except Exception:
             logger.warning("work_queue: счётчики руководителя не посчитаны", exc_info=True)
+        try:
+            add("machine_deals", await _pending_machine_deals(), "Сделки по технике",
+                "бронь, продажа или рассрочка ждут одобрения", "warn", DECISIONS_SCREEN)
+        except Exception:
+            logger.warning("work_queue: заявки по технике не посчитаны", exc_info=True)
     else:
         # Бухгалтер подтверждает сдачи, кладовщик — возвраты. Показываем каждому
         # ровно то, что он может закрыть. role_allowed — потому что менеджер

@@ -720,3 +720,55 @@ def test_bot_manager_cannot_decide_when_boss_exists(isolated_db, sent):
     # Заявка ещё ждёт — кнопки на карточке не трогаем.
     assert [b.callback_data for b in _buttons(call.message.reply_markup)] == [
         f"mdr_ok:{rid}", f"mdr_no:{rid}", f"mdr_rw:{rid}"]
+
+
+# ─── Связки: «Решения», очередь «Сегодня», политика уведомлений ─────────────
+
+
+def test_pending_deal_is_in_boss_today_queue_pointing_to_decisions(isolated_db, monkeypatch, sent):
+    """Заявка на сделку по технике — пункт очереди «Сегодня» руководителя с
+    адресом `decisions`: по пунктам с этим адресом фронт считает общий бейдж
+    «Решений». Доработка ждёт менеджера — из очереди руководителя уходит."""
+    from services import work_queue
+
+    db = isolated_db
+    _setup(db)
+    client = _client(monkeypatch)
+    rid = _deal(client, MGR, _machine()).json()["request_id"]
+    _deal(client, MGR, _machine(vin="JCB-002"), kind="sale")
+
+    boss = {i["key"]: i for i in _run(work_queue.gather(BOSS, "boss"))}
+    assert boss["machine_deals"]["count"] == 2
+    assert boss["machine_deals"]["screen"] == work_queue.DECISIONS_SCREEN == "decisions"
+    mgr = {i["key"] for i in _run(work_queue.gather(MGR, "manager"))}
+    assert "machine_deals" not in mgr
+
+    assert _decide(client, BOSS, "rework", rid, reason="паспорт").status_code == 200
+    boss = {i["key"]: i for i in _run(work_queue.gather(BOSS, "boss"))}
+    assert boss["machine_deals"]["count"] == 1
+
+
+def test_decision_card_goes_through_notify_policy(isolated_db, monkeypatch, sent):
+    """Карточка решения спрашивает `notify_policy.should_notify_now(
+    MACHINE_DEAL_APPROVAL)` — единая точка правила «сразу или в дайджест»."""
+    from services import notify_policy
+
+    db = isolated_db
+    _setup(db)
+    client = _client(monkeypatch)
+    asked: list[str] = []
+    real = notify_policy.should_notify_now
+
+    def spy(kind, *a, **kw):
+        asked.append(kind)
+        return real(kind, *a, **kw)
+
+    monkeypatch.setattr(notify_policy, "should_notify_now", spy)
+    _deal(client, MGR, _machine())
+    assert asked == [notify_policy.MACHINE_DEAL_APPROVAL]
+    assert [chat for chat, _t, _m in sent] == [BOSS], "одобрение — всегда сразу"
+
+    monkeypatch.setattr(notify_policy, "should_notify_now", lambda kind, *a, **kw: False)
+    sent.clear()
+    _deal(client, MGR, _machine(vin="JCB-002"), kind="sale")
+    assert sent == []

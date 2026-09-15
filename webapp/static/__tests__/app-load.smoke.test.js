@@ -3592,7 +3592,7 @@ describe('экран «Решения»', () => {
   it('новый вид решения подключается провайдером без правки экрана', async () => {
     const window = bootDecisions(`
       registerDecisionGroup({
-        key: 'machine_deals', title: 'Сделки по технике', icon: 'truck',
+        key: 'demo', title: 'Новый вид', icon: 'truck',
         load: async () => [{ id: 1 }, { id: 2 }],
         html: (items) => items.map(i => '<div class="md" data-md="' + i.id + '">x</div>').join(''),
         wire: (root, items, ctx) => { window.__wired = root.querySelectorAll('.md').length; },
@@ -3600,9 +3600,49 @@ describe('экран «Решения»', () => {
     `);
     await window.__ready;
     const groups = Array.from(window.document.querySelectorAll('[data-decision-group]')).map(g => g.dataset.decisionGroup);
-    expect(groups).toEqual(['requests', 'machine_deals', 'payments', 'deposits', 'returns']);
+    expect(groups).toEqual(['requests', 'demo', 'payments', 'deposits', 'returns']);
     expect(window.__wired).toBe(2);
     expect(window.document.querySelector('[data-decisions-badge]').textContent).toBe('6');
+  });
+
+  it('сделки по технике — группой в «Решениях»: условия, кнопки решения, общий бейдж', async () => {
+    const window = bootDecisions(`
+      window.__lists['/api/machines/deals/pending'] = {
+        ok: true, can_decide: true, decide_hint: null, viewer_id: 2, my_rework: [],
+        requests: [{
+          id: 31, machine_id: 7, machine_name: 'Hitachi ZX200', kind: 'credit', kind_label: 'Рассрочка',
+          status: 'pending', status_label: '⏳ Ждёт одобрения', price_cents: 2400000,
+          list_price_cents: 2500000, discount_pct: 4, currency: 'USD',
+          buyer_name: '<b>Азиз</b>', buyer_passport: 'AA1234567', created_by: 1, creator_name: 'Manager',
+          schedule_preview: { down_payment_cents: 0, months: 6, monthly_cents: 400000,
+                              first_due: '2026-10-15', last_due: '2027-03-15' },
+        }],
+      };
+      window.__writes = [];
+      apiResult = async (p, body) => { window.__writes.push([p, body]); return { ok: true, status: 200, body: { ok: true }, error: '' }; };
+    `);
+    await window.__ready;
+    const doc = window.document;
+    const groups = Array.from(doc.querySelectorAll('[data-decision-group]')).map(g => g.dataset.decisionGroup);
+    expect(groups).toEqual(['requests', 'machine_deals', 'payments', 'deposits', 'returns']);
+    const box = doc.querySelector('[data-decision-group="machine_deals"]');
+    expect(box.textContent).toContain('Сделки по технике (1)');
+    expect(box.textContent).toContain('Hitachi ZX200');
+    expect(box.textContent).toContain('скидка 4%');
+    expect(box.textContent).toContain('AA1234567');
+    expect(box.querySelector('b')).toBeNull();                       // ввод менеджера экранирован
+    expect(box.querySelector('[data-mreq-rework="31"]')).not.toBeNull();
+    expect(box.querySelector('[data-mreq-reject="31"]')).not.toBeNull();
+    expect(doc.querySelector('[data-decisions-badge]').textContent).toBe('5');
+    window.__calls.length = 0;
+    box.querySelector('[data-mreq-approve="31"]').click();
+    await tick(); await tick(); await tick();
+    expect(window.__writes[0][0]).toBe('/api/machines/deals/approve');
+    expect(window.__writes[0][1]).toMatchObject({ request_id: 31 });
+    expect(window.__writes[0][1].idempotency_key).toBeTruthy();
+    // После решения перечитываются «Решения», а не «Склад».
+    expect(window.__calls.map(c => c[0])).toContain('/api/machines/deals/pending');
+    expect(window.__calls.map(c => c[0])).not.toContain('/api/machines/list');
   });
 
   it('сбой одной группы — ошибка в её секции, остальные на месте', async () => {
@@ -3688,6 +3728,58 @@ describe('выключатель «Рабочие действия» и «Нас
     expect(c.querySelector('#set-company').textContent).toContain('Импекс');
     expect(c.querySelector('#set-rates')).not.toBeNull();
     expect(c.textContent).toContain('Сотрудники и роли');
+    // Удаление — выключателем рядом с «Рабочими действиями»; поля нет — выключено.
+    expect(c.querySelector('[data-delete-switch]').getAttribute('aria-checked')).toBe('false');
+  });
+
+  it('«Настройки»: «Удаление — только руководитель» — запрос на сервер, флаг в currentUser', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss', delete_requires_boss: false };
+      window.__me = () => currentUser;
+      buildNav();
+      window.__calls = [];
+      api = async (p, body) => {
+        window.__calls.push([p, body]);
+        if (p === '/api/settings/delete_requires_boss') return { ok: true, delete_requires_boss: body.enabled };
+        return {};
+      };
+      window.__toasts = [];
+      toast = (m) => window.__toasts.push(m);
+      window.__ready = showScreen('settings');
+    `);
+    await window.__ready;
+    const doc = window.document;
+    const sw = doc.querySelector('#content [data-delete-switch]');
+    expect(sw.textContent).toContain('Удаление — только руководитель');
+    sw.click();
+    await tick(); await tick(); await tick();
+    expect(window.__calls).toContainEqual(['/api/settings/delete_requires_boss', { enabled: true }]);
+    expect(window.__me().delete_requires_boss).toBe(true);
+    expect(doc.querySelector('#content [data-delete-switch]').getAttribute('aria-checked')).toBe('true');
+    expect(window.__toasts).toContain('Удаление — только руководитель');
+    // Руководителю удаление видно всегда, менеджеру — уже нет.
+    expect(window.eval('deleteActionsVisible()')).toBe(true);
+    expect(window.eval('deleteActionsOn')('manager', window.__me())).toBe(false);
+  });
+
+  it('«Настройки»: отказ сервера возвращает выключатель удаления на место', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss', delete_requires_boss: true };
+      window.__me = () => currentUser;
+      buildNav();
+      api = async (p) => { if (p === '/api/settings/delete_requires_boss') throw new Error('Нет связи'); return {}; };
+      window.__toasts = [];
+      toast = (m) => window.__toasts.push(m);
+      window.__ready = showScreen('settings');
+    `);
+    await window.__ready;
+    const doc = window.document;
+    expect(doc.querySelector('#content [data-delete-switch]').getAttribute('aria-checked')).toBe('true');
+    doc.querySelector('#content [data-delete-switch]').click();
+    await tick(); await tick();
+    expect(doc.querySelector('#content [data-delete-switch]').getAttribute('aria-checked')).toBe('true');
+    expect(window.__me().delete_requires_boss).toBe(true);
+    expect(window.__toasts).toContain('Нет связи');
   });
 
   it('deep link: ?startapp=decisions открывает «Решения», чужой адрес — нет', () => {

@@ -3935,7 +3935,8 @@ async def api_machines_list(request: Request):
             "counts": counts,
             "status": status or "all",
             "pending_requests": pending_total,
-            "delete_requires_boss": await _delete_requires_boss(),
+            # Флаг `delete_requires_boss` фронт берёт из /api/me (один источник);
+            # здесь — уже посчитанное право роли.
             "can_delete": await _can_delete(role),
             "can_manage": role in _MACHINE_BOSS,
             "can_see_cost": machines.can_see_cost(role),

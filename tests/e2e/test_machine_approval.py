@@ -1,13 +1,17 @@
 """E2E: сделки по технике через одобрение руководителя.
 
 1. Менеджер оформляет рассрочку в WebApp → машина «ждёт одобрения», сделки и
-   графика нет, руководителю ушла карточка → руководитель одобряет в «Складе →
-   Техника» → машина «В рассрочку», график действует.
+   графика нет, руководителю ушла карточка → руководитель видит заявку в
+   «Решениях» (бейдж, пункт «Сегодня») и одобряет там → машина «В рассрочку»,
+   график действует.
 2. Продажа → «На доработку» с причиной → менеджер правит цену и отправляет
    снова → руководитель отклоняет → машина в прежнем статусе, заявки нет.
 3. Руководителя в системе нет: менеджер видит кнопки решения с пометкой и
    одобряет бронь сам.
-4. Выключатель «удаление — только руководитель».
+4. Выключатель «Удаление — только руководитель» в «Настройках».
+
+Руководитель здесь — в виде по умолчанию (без «Рабочих действий»): решения и
+удаление ему видны всегда, оформление сделок и денег — нет.
 
 Снимки экрана (390px) — в MACHINE_SHOTS_DIR, если он задан.
 """
@@ -39,7 +43,8 @@ def _open_machine(page, mid: int) -> None:
     tab(page, "machines")
     page.wait_for_selector(f'[data-machine="{mid}"]')
     page.click(f'[data-machine="{mid}"]')
-    page.wait_for_selector('[data-mact="hours"]')
+    # Не по кнопке: у руководителя без «Рабочих действий» карточка — просмотр.
+    page.wait_for_selector("#content .card-row-sub:text-is('VIN')")
 
 
 def _no_toast(page) -> None:
@@ -79,14 +84,22 @@ def test_manager_installment_is_approved_by_boss_in_webapp(open_app, e2e):
     assert f"mdr_ok:{req[0]['id']}" in str(card[0].get("reply_markup"))
 
     boss = open_app(e2e.ids["boss"])
-    go(boss, "stock")
-    tab(boss, "machines")
-    boss.wait_for_selector("#machine-decisions [data-mreq-approve]")
-    text = boss.inner_text("#machine-decisions")
-    assert "AA1234567" in text and "скидка 4%" in text and "6 месяцев" in text
-    _shot(boss, "03-boss-decisions-list")
-    boss.click("#machine-decisions [data-mreq-approve]")
+    # «Сегодня»: заявка — пункт очереди, ведущий в «Решения», и она же в бейдже.
+    boss.wait_for_selector("#content :text('Сделки по технике')")
+    badge = boss.locator('#bottom-nav .nav-item[data-screen="decisions"] [data-decisions-badge]')
+    boss.wait_for_function(
+        "() => document.querySelector('#bottom-nav [data-decisions-badge]')?.textContent === '1'")
+    assert badge.inner_text() == "1"
+    go(boss, "decisions")
+    group = '[data-decision-group="machine_deals"]'
+    boss.wait_for_selector(f"{group} [data-mreq-approve]")
+    text = boss.locator(group).text_content()  # подписи секций — капсом через CSS
+    assert "Hitachi ZX200" in text and "AA1234567" in text and "скидка 4%" in text and "6 месяцев" in text
+    _no_toast(boss)
+    _shot(boss, "03-boss-decisions-screen")
+    boss.click(f"{group} [data-mreq-approve]")
     boss.wait_for_selector(".toast:has-text('Рассрочка одобрена')")
+    boss.wait_for_selector(group, state="detached")
 
     assert e2e.rows("SELECT status FROM machines WHERE id = ?", (mid,))[0]["status"] == "on_credit"
     sched = e2e.rows("SELECT seq, amount_cents FROM machine_deal_payments ORDER BY seq")
@@ -96,9 +109,9 @@ def test_manager_installment_is_approved_by_boss_in_webapp(open_app, e2e):
         {"status": "approved", "approval_mode": "boss", "decided_by": e2e.ids["boss"]}]
     assert any(p["uid"] == e2e.ids["mgr"] and "одобрена" in p["text"] for p in e2e.pushes)
 
-    boss.click(f'[data-machine="{mid}"]')
+    _open_machine(boss, mid)
     boss.wait_for_selector("#content:has-text('Платёж 6')")
-    assert boss.locator("[data-receipt-add]").count() == 1, "график живой — оплату можно внести"
+    assert boss.locator("[data-receipt-add]").count() == 0, "без «Рабочих действий» — просмотр"
     _no_toast(boss)
     _shot(boss, "04-boss-card-schedule-active")
 
@@ -169,8 +182,10 @@ def test_sale_rework_resubmit_then_reject_keeps_machine(open_app, e2e):
     boss.fill("#ms-f-reason", "Клиент ушёл к конкурентам")
     boss.click("#ms-submit")
     boss.wait_for_selector(".toast:has-text('отклонена')")
-    boss.wait_for_selector('[data-mact="sale"]')
+    # Заявки нет — удаление (контроль) снова доступно; оформлять сделку — работа.
+    boss.wait_for_selector('[data-mact="delete"]')
     assert boss.locator("[data-mreq]").count() == 0
+    assert boss.locator('[data-mact="sale"]').count() == 0
     assert e2e.rows("SELECT status FROM machines WHERE id = ?", (mid,))[0]["status"] == "in_stock"
     assert e2e.rows("SELECT status FROM machine_deal_requests")[0]["status"] == "rejected"
     assert e2e.rows("SELECT COUNT(*) AS n FROM machine_deals")[0]["n"] == 0
@@ -213,18 +228,30 @@ def test_without_boss_manager_approves_booking_with_explicit_note(open_app, e2e)
 
 def test_boss_toggles_delete_setting_and_manager_loses_delete(open_app, e2e):
     mid = _machine(e2e, "DEL-1", "Volvo EC210", status="in_stock")
+    mgr = open_app(e2e.ids["mgr"])
+    _open_machine(mgr, mid)
+    assert mgr.locator('[data-mact="delete"]').count() == 1, "по умолчанию удаляет и менеджер"
+
     boss = open_app(e2e.ids["boss"])
     go(boss, "stock")
     tab(boss, "machines")
-    boss.wait_for_selector("#delete-setting-toggle")
-    boss.click("#delete-setting-toggle")
+    boss.wait_for_selector(f'[data-machine="{mid}"]')
+    assert boss.locator("[data-delete-switch]").count() == 0, "выключатель — в «Настройках», не в «Технике»"
+    go(boss, "settings")
+    switch = "#content [data-delete-switch]"
+    boss.wait_for_selector(f'{switch}[aria-checked="false"]')
+    assert boss.locator("#content [data-work-switch]").count() == 1, "рядом с «Рабочими действиями»"
+    boss.click(switch)
     boss.wait_for_selector(".toast:has-text('только руководитель')")
-    boss.wait_for_selector("#content:has-text('Удаляет только руководитель')")
-    _shot(boss, "10-boss-delete-setting")
+    boss.wait_for_selector(f'{switch}[aria-checked="true"]')
+    _no_toast(boss)
+    _shot(boss, "10-boss-settings-delete-switch")
     assert e2e.rows("SELECT value FROM app_settings WHERE key = 'delete_requires_boss'") == [{"value": "true"}]
+    assert any(a["action"] == "setting_changed" for a in e2e.rows("SELECT action FROM audit_log"))
 
-    mgr = open_app(e2e.ids["mgr"])
+    mgr.reload()
+    mgr.wait_for_selector("#bottom-nav .nav-item", state="attached")
     _open_machine(mgr, mid)
     assert mgr.locator('[data-mact="delete"]').count() == 0
-    boss.click(f'[data-machine="{mid}"]')
+    _open_machine(boss, mid)
     boss.wait_for_selector('[data-mact="delete"]')

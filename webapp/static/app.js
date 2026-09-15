@@ -2277,9 +2277,11 @@ function wireMachineRequestActions(root, requests, refresh) {
 }
 
 // Группа решений «Сделки по технике» — самостоятельный рендер в контейнер.
-// Экран «Решения» руководителя подключает её сам (см. DECISION_GROUPS в
-// ветке boss-ui): renderMachineDealDecisions(container, { onChange }) →
-// Promise<число заявок на одобрении>. Пустой список — пустой контейнер.
+// Экран «Решения» руководителя подключает те же карточки своей группой
+// (`registerDecisionGroup({ key: 'machine_deals' })` у DECISION_GROUPS), а этот
+// рендер — список над техникой на «Складе»: renderMachineDealDecisions(
+// container, { onChange }) → Promise<число заявок на одобрении>. Пустой список
+// — пустой контейнер.
 async function renderMachineDealDecisions(container, opts = {}) {
   if (!container) return 0;
   const refresh = () => {
@@ -5784,6 +5786,27 @@ function registerDecisionGroup(group, before) {
   if (pos === -1) DECISION_GROUPS.push(group); else DECISION_GROUPS.splice(pos, 0, group);
 }
 
+// Сделки по технике (services/machine_deal_requests.py): бронь, продажа и
+// рассрочка менеджера ждут одобрения руководителя. Карточки и проводка — те же,
+// что в карточке машины (`machineRequestCardHtml`/`wireMachineRequestActions`).
+// Флаги решения (`can_decide`, подпись «руководителя нет») приходят в ответе
+// списка — кладём их в ctx группы, html берёт оттуда. В бейдж идут только
+// заявки `pending`: «на доработке» ждёт менеджера, а не руководителя.
+registerDecisionGroup({
+  key: 'machine_deals', title: 'Сделки по технике', icon: 'truck',
+  path: '/api/machines/deals/pending', listClass: 'machine-decisions',
+  load: async (ctx) => {
+    const data = await api('/api/machines/deals/pending', {});
+    ctx.machineDeals = {
+      canDecide: !!data.can_decide, decideHint: data.decide_hint, viewerId: data.viewer_id,
+      showMachine: true,
+    };
+    return data.requests || [];
+  },
+  html: (items, ctx) => items.map(r => machineRequestCardHtml(r, ctx.machineDeals || { showMachine: true })).join(''),
+  wire: (root, items, ctx) => wireMachineRequestActions(root, items, ctx.refresh),
+}, 'payments');
+
 async function loadDecisionGroup(g, ctx) {
   if (typeof g.load === 'function') return (await g.load(ctx)) || [];
   const res = await api(g.path, {});
@@ -5828,7 +5851,7 @@ async function renderDecisionsScreen() {
   box.innerHTML = sections || emptyState({
     icon: 'check',
     title: 'Решений не ждёт',
-    hint: 'Заявки, оплаты картой, сдачи наличных и возвраты появятся здесь, как только их оформят.',
+    hint: 'Заявки на отгрузку, сделки по технике, оплаты картой, сдачи наличных и возвраты появятся здесь, как только их оформят.',
   });
   box.querySelectorAll('[data-decisions-retry]').forEach(b =>
     b.addEventListener('click', () => renderDecisionsScreen()));
@@ -5841,7 +5864,8 @@ async function renderDecisionsScreen() {
 }
 
 // ─── Экран: Настройки (руководитель) ────────────────────────────────────────
-// Реквизиты компании, курсы валют, выключатель «Рабочие действия». Раньше
+// Реквизиты компании, курсы валют, выключатели «Рабочие действия» (личный вид)
+// и «Удаление — только руководитель» (настройка компании). Раньше
 // реквизиты жили кнопкой во вкладке «Документы», курсы — строкой в «Лимитах»:
 // руководитель без «Рабочих действий» до них бы не дошёл.
 async function renderSettingsScreen() {
