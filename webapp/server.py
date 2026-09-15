@@ -498,6 +498,72 @@ app.add_middleware(_AuthCacheWarmMiddleware)
 app.add_middleware(_BodySizeLimitMiddleware, max_bytes=MAX_BODY_BYTES)
 
 
+# ─── Заголовки безопасности ────────────────────────────────────────────────
+#
+# X-Content-Type-Options/Referrer-Policy — стандартная гигиена. CSP собран под
+# конкретный фронт (index.html + webapp/static/*.js), а не скопирован из
+# шаблона:
+#   * script-src — telegram-web-app.js грузится с telegram.org (единственный
+#     внешний хост, index.html), свои скрипты — 'self'; инлайн-<script> в
+#     проекте нет, unsafe-inline не нужен;
+#   * style-src 'unsafe-inline' — JS-шаблоны (helpers.js/app.js) вставляют
+#     `style="…"` в innerHTML (не статичная разметка, но те же правила CSP);
+#   * img-src data:/blob: — превью фото (canvas.toDataURL перед base64-
+#     загрузкой) и просмотр фото техники (URL.createObjectURL — файл идёт
+#     через нашу ручку, <img src> с прямой ссылкой Telegram содержал бы токен
+#     бота, см. app.js);
+#   * frame-ancestors — Telegram-клиенты (web.telegram.org и поддомены)
+#     встраивают WebApp в iframe: классический X-Frame-Options: DENY сломал
+#     бы вход целиком, а frame-ancestors — его CSP-замена с точечным списком
+#     разрешённых хостов вместо «вообще никому».
+_CSP = (
+    b"default-src 'self'; "
+    b"script-src 'self' https://telegram.org; "
+    b"style-src 'self' 'unsafe-inline'; "
+    b"img-src 'self' data: blob:; "
+    b"font-src 'self'; "
+    b"connect-src 'self'; "
+    b"base-uri 'self'; "
+    b"form-action 'self'; "
+    b"frame-ancestors https://web.telegram.org https://*.telegram.org"
+)
+
+_SECURITY_HEADERS = (
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"strict-origin-when-cross-origin"),
+    (b"content-security-policy", _CSP),
+)
+
+
+class _SecurityHeadersMiddleware:
+    """Добавляет заголовки безопасности к КАЖДОМУ HTTP-ответу WebApp.
+
+    Пишем как чистый ASGI (не BaseHTTPMiddleware): только оборачиваем
+    `send`, ничего не читаем и не буферизуем — не мешает стримингу/gzip и не
+    завязано на особенности `call_next` (см. `_BodySizeLimitMiddleware`
+    рядом). НЕ добавляет X-Frame-Options — см. докстринг CSP выше.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers") or [])
+                headers.extend(_SECURITY_HEADERS)
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
+app.add_middleware(_SecurityHeadersMiddleware)
+
+
 # Версионированный ассет (`?v=<SHA>` из index.html) неизменен по построению:
 # новая сборка — новый URL. Его можно хранить год и не перепроверять
 # (`immutable` снимает даже revalidate при pull-to-refresh). Прежний
@@ -6883,9 +6949,20 @@ async def _record_order_payment(data: dict, user: dict, op: str) -> JSONResponse
 
     # Карта и перечисление — карточка подтверждающим с кнопками pay_ok/pay_no:
     # их сверяют с банком. Наличные подтверждаются сдачей — кнопок под ними нет.
+    # Фоном (utils.background.spawn), а не await: несколько admin/boss
+    # получателей — несколько последовательных вызовов Bot API на
+    # критическом пути ответа менеджеру, деградация/недоступность Telegram
+    # держала бы «оплата принята» неоправданно долго. Платёж уже
+    # закоммичен — уведомление ПОСЛЕ ответа ничего не теряет (как печатная
+    # форма после одобрения, см. CLAUDE.md).
+    from utils.background import spawn
+
     for part in res["parts"]:
         if part["method"] in order_payments.NONCASH_METHODS:
-            await _notify_bosses_payment_pending(order_id, full_name, part["payment_id"])
+            spawn(
+                _notify_bosses_payment_pending(order_id, full_name, part["payment_id"]),
+                name="boss-payment-pending-notify",
+            )
     await idem.store(res)
     return JSONResponse(res)
 
