@@ -1158,11 +1158,15 @@ def test_credit_is_closed_early_by_button(open_app, e2e):
     _open_machine(boss, mid)
     boss.click(f'[data-deal-close="{deal}"]')
     boss.wait_for_selector(".toast:has-text('Рассрочка закрыта')")
-    boss.wait_for_function("() => !document.querySelector('[data-deal-close]')")
+    # Ждём перерисованную карточку, а не просто исчезновение кнопки: между
+    # ними #content на миг пуст, и на медленном CI проверка текста ловила пустоту.
+    boss.wait_for_function(
+        "() => !document.querySelector('[data-deal-close]')"
+        " && (document.querySelector('#content')?.innerText || '').includes('Закрыта')"
+    )
     assert e2e.rows("SELECT closed_at FROM machine_deals WHERE id = ?", (deal,))[0]["closed_at"]
     assert e2e.rows("SELECT status FROM machines WHERE id = ?", (mid,))[0]["status"] == "sold"
     assert any("Закрыть рассрочку" in a for a in alerts(boss))
-    assert "Закрыта" in boss.inner_text("#content")
 
 
 def test_machine_photo_upload_and_delete(open_app, e2e, monkeypatch):

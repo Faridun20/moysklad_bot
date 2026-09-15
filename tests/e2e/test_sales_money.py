@@ -560,10 +560,28 @@ def test_invoice_list_has_no_print_button_without_cups(open_app, e2e, monkeypatc
     assert boss.locator("[data-wh-print]").count() == 0
 
 
-def test_ru_uz_receipt_form_hides_handwritten_fields(open_app, e2e):
+def test_ru_uz_receipt_form_hides_handwritten_fields(open_app, e2e, monkeypatch, tmp_path):
     """Расписка RU+UZ: паспорт, адрес, пеню и валюту в неё не печатают —
     Должник пишет данные от руки, условия зашиты в текст юриста. Форма их
     прячет и возвращает при переключении на обычную расписку."""
+    # PDF собирает LibreOffice, которого в CI нет: тест про форму, а не про
+    # вёрстку (её проверяет tests/test_legal_docs.py там, где soffice есть).
+    from pathlib import Path
+
+    from services import documents
+
+    def _write(doc_type, context, out_dir):
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        path = out / f"{doc_type}.pdf"
+        path.write_bytes(b"%PDF-1.4\n")
+        return path
+
+    async def fake_render(doc_type, context, out_dir, template_override=None):
+        return await asyncio.to_thread(_write, doc_type, context, out_dir)
+
+    monkeypatch.setattr(documents, "render_pdf", fake_render)
+    monkeypatch.setenv("DOCUMENTS_DIR", str(tmp_path / "docs"))
     for key, value in {
         "company_name": "ООО Ромашка", "company_tin": "123456789", "company_address": "Ташкент",
         "company_representative": "Петров Пётр", "company_position": "Директор",
