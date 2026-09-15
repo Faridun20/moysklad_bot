@@ -1208,7 +1208,7 @@ async def period_report(since: Any, until: Any = None) -> dict:
     показывается отдельно: прибыль «без половины товара» не должна выглядеть
     полной.
     """
-    from services.warehouse import _upper_bound
+    from services.warehouse import _upper_bound, not_writeoff_sql
 
     enabled = await is_enabled()
     args: list[Any] = [_day(since)]
@@ -1224,7 +1224,13 @@ async def period_report(since: Any, until: Any = None) -> dict:
         "LEFT JOIN counterparties c ON c.id = i.counterparty_id "
         "LEFT JOIN cost_batches b ON b.id = s.batch_id "
         "LEFT JOIN order_shipment os ON os.invoice_id = s.invoice_id "
-        "WHERE i.type = 'outgoing' AND i.status = 'confirmed' AND i.invoice_date >= $1"
+        # Списание фиксирует себестоимость тем же хуком, что и продажа (товара
+        # физически нет — партия израсходована), но выручки у него нет и быть
+        # не может. В отчёте о прибыли оно выглядело бы убыточной сделкой на
+        # всю себестоимость; потеря от списания видна в самой ленте списаний
+        # (`stock_writeoffs.cost_cents`).
+        f"WHERE i.type = 'outgoing' AND i.status = 'confirmed' AND {not_writeoff_sql('i')} "
+        "AND i.invoice_date >= $1"
     )
     if until is not None:
         day, exclusive = _upper_bound(until)

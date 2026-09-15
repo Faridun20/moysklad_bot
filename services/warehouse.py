@@ -448,6 +448,23 @@ HISTORY_NUMBER_PREFIXES = ("MS-D-", "MS-S-")
 HISTORY_MAP_ENTITIES = ("demand", "supply")
 
 
+def writeoff_invoice_sql(alias: str = "i") -> str:
+    """SQL-условие «накладная — это списание/излишек» (`services/inventory.py`).
+
+    Одно определение на всех: аналитика продаж его вычитает, список накладных
+    помечает такую строку, отмена — отсылает к ленте списаний. Признак —
+    запись-владелец в `stock_writeoffs`, а не номер или комментарий: номер
+    берётся из общей серии (документ склада один), а комментарий человек правит.
+    """
+    return (
+        f"EXISTS (SELECT 1 FROM stock_writeoffs sw WHERE sw.invoice_id = {alias}.id)"
+    )
+
+
+def not_writeoff_sql(alias: str = "i") -> str:
+    return f"NOT {writeoff_invoice_sql(alias)}"
+
+
 def historical_invoice_sql(alias: str = "i") -> str:
     """SQL-условие «накладная из переноса истории» — для списков и отказов."""
     by_number = " OR ".join(
@@ -641,6 +658,7 @@ async def list_invoices(
         "SELECT i.id, i.type, i.invoice_number, i.invoice_date, i.status, i.currency, "
         "       i.total_amount_cents, i.telegram_sent, i.created_at, i.created_by, "
         f"      {historical_invoice_sql('i')} AS historical, "
+        f"      {writeoff_invoice_sql('i')} AS writeoff, "
         "       c.name AS counterparty_name "
         "FROM invoices i LEFT JOIN counterparties c ON c.id = i.counterparty_id"
     )
@@ -652,7 +670,9 @@ async def list_invoices(
     sql += f" ORDER BY i.id DESC LIMIT ${len(args) - 1} OFFSET ${len(args)}"
     rows = await adb_core.fetch(sql, *args)
     # SQLite отдаёт условие числом 0/1, Postgres — bool; фронту нужен bool.
-    return [{**r, "historical": bool(r["historical"])} for r in rows]
+    return [
+        {**r, "historical": bool(r["historical"]), "writeoff": bool(r["writeoff"])} for r in rows
+    ]
 
 
 async def mark_telegram_sent(invoice_id: int) -> bool:
@@ -861,10 +881,19 @@ def _upper_bound(value) -> tuple[str, bool]:
 
 def _shipments_where(since, until, args: list) -> str:
     """WHERE расходных накладных за период — одно определение на список,
-    итоги и топы. Границы: `since` включающая, верхняя — `_upper_bound`."""
+    итоги и топы. Границы: `since` включающая, верхняя — `_upper_bound`.
+
+    Списание — тоже расходная накладная (`services/inventory.py`), но НЕ
+    продажа: её позиции уходят с ценой 0. Без исключения отчёт продаж получил
+    бы отгрузки на нулевую сумму — число отгрузок и клиентов росло бы, средний
+    чек падал, а «топ товаров» считал бы разбитое проданным.
+    """
     args.append("outgoing")
     args.append(_day(since))
-    sql = f"i.type = ${len(args) - 1} AND i.status = 'confirmed' AND i.invoice_date >= ${len(args)}"
+    sql = (
+        f"i.type = ${len(args) - 1} AND i.status = 'confirmed' "
+        f"AND {not_writeoff_sql('i')} AND i.invoice_date >= ${len(args)}"
+    )
     if until is not None:
         day, exclusive = _upper_bound(until)
         args.append(day)

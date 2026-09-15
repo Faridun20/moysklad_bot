@@ -3909,3 +3909,99 @@ describe('скидка к прайсу на экранах', () => {
     expect(done.textContent).toContain('прайс 100 USD · скидка 30%');
   });
 });
+
+describe('«Склад» → «Накладные» → «Списания»', () => {
+  // Списание живёт вторым уровнем внутри вкладки: пятой вкладки у раздела быть
+  // не может (их потолок — четыре), а отдельный раздел ради него — перебор.
+  const JOURNAL = {
+    writeoffs: [{
+      id: 3, kind: 'writeoff', reason: 'бой', count_id: null, cost_cents: 12300,
+      created_by: 200, author_name: '<b>Мен</b>', created_at: '2026-09-16 10:00:00',
+      cancelled_at: null, invoice_id: 9, invoice_number: 'OUT-2026-0009',
+      invoice_date: '2026-09-16', photo_file_id: null,
+      items: [{ product_id: 1, name: 'Кабель', unit: 'м', quantity: 2 }],
+    }],
+    quick_reasons: ['бой', 'порча'],
+    void_window_hours: 24,
+  };
+  const boot9 = (role = 'manager', counts = { counts: [], open: null }, journal = JOURNAL) => boot(`
+    currentUser = { role: '${role}', prefs: { work_actions: true }, base_currency: 'USD' };
+    window.__calls = [];
+    api = async (path, body) => {
+      window.__calls.push([path, body]);
+      if (path === '/api/stock/writeoffs') return ${JSON.stringify(journal)};
+      if (path === '/api/stock/counts') return ${JSON.stringify(counts)};
+      return { ok: true };
+    };
+    stockTab = 'invoices';
+    whSub = 'writeoffs';
+    // Объявление let на верхнем уровне eval не становится свойством window —
+    // состояние отдаём геттером, как и в других драйверах этого файла.
+    window.__woCanPhoto = () => woCanPhoto;
+    window.__ready = renderStockScreen();
+  `);
+
+  it('журнал рисуется, вкладки и переключатель на месте (UI-BUG-04)', async () => {
+    const window = boot9();
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('[data-sect="invoices"]')).not.toBeNull();
+    expect(content.querySelector('[data-whsub="writeoffs"]').classList.contains('active')).toBe(true);
+    expect(content.textContent).toContain('бой');
+    expect(content.textContent).toContain('Кабель');
+    // Имя автора — чужой ввод: в innerHTML только через escapeHtml.
+    expect(content.innerHTML).not.toContain('<b>Мен</b>');
+  });
+
+  it('себестоимость потери — только руководству', async () => {
+    const mgr = boot9('manager');
+    await mgr.__ready;
+    expect(mgr.document.getElementById('content').textContent).not.toContain('123,00');
+    const boss = boot9('boss');
+    await boss.__ready;
+    expect(boss.document.getElementById('content').textContent).toContain('123,00 USD');
+  });
+
+  it('открытый пересчёт предлагают продолжить, а не начать второй', async () => {
+    const window = boot9('manager', { counts: [], open: { count_id: 5, status: 'open' } });
+    await window.__ready;
+    expect(window.document.getElementById('wo-count').textContent).toContain('Продолжить');
+  });
+
+  it('вкладка и переключатель остаются, когда экран показывает ошибку сети', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager', prefs: { work_actions: true } };
+      api = async () => { throw new Error('Нет подключения к интернету'); };
+      stockTab = 'invoices';
+      whSub = 'writeoffs';
+      window.__ready = renderStockScreen();
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.querySelector('[data-whsub="invoices"]')).not.toBeNull();
+    expect(content.textContent).toContain('Нет подключения');
+  });
+
+  it('снимок — плитка, которая тянется нашей ручкой, а не ссылкой Telegram', async () => {
+    const withPhoto = {
+      ...JOURNAL,
+      can_photo: true,
+      writeoffs: [{ ...JOURNAL.writeoffs[0], photo_file_id: 'AgAC-file-id' }],
+    };
+    const window = boot9('manager', { counts: [], open: null }, withPhoto);
+    await window.__ready;
+    const tile = window.document.querySelector('.machine-photo[data-photo="3"]');
+    // Плитка скоупится НОМЕРОМ ЗАПИСИ: сырой file_id наружу не выходит вовсе.
+    expect(tile).not.toBeNull();
+    expect(window.document.getElementById('content').innerHTML).not.toContain('AgAC-file-id');
+    // Кнопка загрузки появляется только там, где снимку есть куда лечь.
+    expect(window.__woCanPhoto()).toBe(true);
+  });
+
+  it('без канала-хранилища кнопки «Добавить фото» нет', async () => {
+    const window = boot9('manager', { counts: [], open: null },
+                         { ...JOURNAL, can_photo: false });
+    await window.__ready;
+    expect(window.__woCanPhoto()).toBe(false);
+  });
+});

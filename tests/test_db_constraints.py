@@ -389,6 +389,12 @@ def test_check_values_follow_the_code():
         assert f"'{method}'" in checks["machine_receipt_methods_method_chk"]
     for mode in mdr.APPROVAL_MODES:
         assert f"'{mode}'" in checks["machine_deal_requests_mode_chk"]
+    from services import inventory
+
+    for kind in inventory.KINDS:
+        assert f"'{kind}'" in checks["stock_writeoffs_kind_chk"]
+    for status in inventory.COUNT_STATUSES:
+        assert f"'{status}'" in checks["stock_counts_status_chk"]
     names = [c.name for c in apply_constraints._checks()]
     names += [fk.name for fk in apply_constraints.FOREIGN_KEYS]
     assert len(names) == len(set(names))
