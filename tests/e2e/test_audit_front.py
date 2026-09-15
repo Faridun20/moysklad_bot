@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from tests.e2e.conftest import go, seed_order, settled, tab
+from tests.e2e.conftest import go, seed_order, settled, tab, pay_form
 
 
 def _add_position(page, product_id: int) -> None:
@@ -88,16 +88,18 @@ def test_partial_payment_with_comma_reaches_db_in_cents(open_app, e2e):
     mgr = open_app(e2e.ids["mgr"])
     go(mgr, "money")
     tab(mgr, "debts")
-    field = f'.pay-amount-input[data-id="{oid}"]'
-    mgr.wait_for_selector(field)
-    mgr.fill(field, "150,5")
-    mgr.click(f'.btn-mark-paid[data-id="{oid}"]')
-    mgr.wait_for_selector(".toast:has-text('ждёт подтверждения')")
-    confirm = [a for a in mgr.evaluate("window.__tgAlerts") if a.startswith("confirm:")][-1]
-    assert "150,50 USD" in confirm.replace(" ", " ").replace(" ", " ")
+    btn = f'.btn-pay-debt[data-id="{oid}"]'
+    mgr.wait_for_selector(btn)
+    pay_form(mgr, btn, [("cash", "150,5")])
+    mgr.wait_for_selector(".toast:has-text('записана')")
+    toast = mgr.locator(".toast").last.text_content().replace("\u00a0", " ").replace("\u202f", " ")
+    assert "150,50 USD" in toast
     assert e2e.rows("SELECT amount_cents, currency FROM payments WHERE order_id = ?", (oid,)) == [
         {"amount_cents": 15050, "currency": "USD"},
     ], "частичная оплата не превратилась в «весь остаток»"
+    assert e2e.rows("SELECT method, amount_cents FROM payment_parts WHERE order_id = ?", (oid,)) == [
+        {"method": "cash", "amount_cents": 15050},
+    ]
 
 
 def test_orders_show_more_loads_next_page_from_server(open_app, e2e):

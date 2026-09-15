@@ -355,16 +355,28 @@ shipment_request: status=pending
 order: status=pending
 push → все boss/admin
    │
-   ├─ [boss] одобрил
+   ├─ [boss] одобрил (видит цены, сумму и тип оплаты)
    │     shipment_request: status=approved
-   │     order: status=approved
+   │     order: status=approved («к отгрузке»), платежей не создаётся
    │     order_shipment.ship_order → расходная накладная, остаток списан
+   │     │
+   │     ├─ «оплата сразу»: менеджер вносит разбивку (наличные/карта/
+   │     │   перечисление, USD/UZS, курс) на ВСЮ сумму → payments + payment_parts
+   │     │   → только тогда «Отгрузить» (сервер: code=payment_required)
+   │     └─ «в долг»: «Отгрузить» сразу; поступления — той же разбивкой
+   │     order: status=shipped
+   │     наличные → «Сдать наличные» (cash_deposit_parts, FIFO) → подтверждение
+   │     сдачи подтверждает их платежи; карта/счёт → «Подтвердить» руководителя
    │
    └─ [boss] отклонил
          shipment_request: status=rejected
          order: status=rejected
          (конец — заказ можно пересоздать)
 ```
+
+Подробности разбивки, сдачи по строкам и правил — CLAUDE.md, раздел «Оплата
+заказа — разбивка „как получены деньги“». Схема ниже (5.2) — историческая
+(`paid_at`/`paid_confirmed_at` остались производными отметками).
 
 ### 5.2 Оплата по credit-заказу (двухступенчатая)
 

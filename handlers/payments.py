@@ -16,7 +16,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from services.roles import can_manage_payments, _has_role
+from services.roles import _has_role, can_confirm_payment
 
 
 def _can_send_payment(user_id: int) -> bool:
@@ -65,7 +65,9 @@ def _parse_payment_input(text: str) -> tuple[float | None, str | None, str]:
 
 
 def is_admin(user_id: int) -> bool:
-    return can_manage_payments(user_id)
+    """Кто решает по платежу под push-карточкой: руководитель или бухгалтер
+    (менеджер — совмещением ролей, пока бухгалтера нет), как в WebApp."""
+    return can_confirm_payment(user_id)
 
 
 # ─── Клавиатуры ──────────────────────────────────────────────────────────────
@@ -256,9 +258,17 @@ async def confirm_pay(call: CallbackQuery, bot: Bot):
         return await call.answer("❌ Платёж не найден", show_alert=True)
     if payment["status"] != "pending":
         return await call.answer("⚠️ Уже обработан", show_alert=True)
+    from services import order_payments
+
+    if await order_payments.payment_method(payment_id) == "cash":
+        # Наличные у менеджера подтверждаются сдачей в кассу — не этой кнопкой.
+        return await call.answer(
+            "Это наличные: они подтверждаются сдачей в кассу (WebApp → Деньги)", show_alert=True
+        )
 
     admin_name = call.from_user.full_name or str(call.from_user.id)
-    await adb.confirm_payment(payment_id, call.from_user.id, admin_name)
+    if not await adb.confirm_payment(payment_id, call.from_user.id, admin_name):
+        return await call.answer("⚠️ Уже обработан", show_alert=True)
 
     await call.answer("✅ Принято")
     now = local_now().strftime("%d.%m.%Y %H:%M")
@@ -288,7 +298,10 @@ async def reject_pay(call: CallbackQuery, bot: Bot):
         return await call.answer("⚠️ Уже обработан", show_alert=True)
 
     admin_name = call.from_user.full_name or str(call.from_user.id)
-    await adb.reject_payment(payment_id, call.from_user.id, admin_name)
+    if not await adb.reject_payment(payment_id, call.from_user.id, admin_name):
+        return await call.answer(
+            "⚠️ Уже обработан или наличные уже в сдаче — отклоните сдачу", show_alert=True
+        )
 
     await call.answer("❌ Отклонено")
     now = local_now().strftime("%d.%m.%Y %H:%M")

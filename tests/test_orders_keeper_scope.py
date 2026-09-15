@@ -84,6 +84,8 @@ def test_manager_acting_as_keeper_also_sees_others_orders_to_ship(env, isolated_
         oid = db.create_order(201, "Manager2", "")
         db.add_order_item(oid, "Товар", "", 1, "шт", 10.0)
         db.update_order_status(oid, status)
+        # «В долг»: отгрузка «оплаты сразу» ждёт разбивку оплаты, здесь проверяем права.
+        asyncio.run(db.set_order_payment(oid, "credit", "2099-12-31"))
         return oid
 
     other_draft, other_pending = other("draft"), other("pending")

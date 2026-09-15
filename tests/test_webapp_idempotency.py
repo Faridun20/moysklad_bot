@@ -51,7 +51,7 @@ def test_mark_paid_idempotent_double_click(client_env):
     body = {
         "initData": str(ids["mgr"]),
         "order_id": ids["order"],
-        "amount": 100,
+        "parts": [{"method": "cash", "currency": "USD", "amount": 100}],
         "idempotency_key": "K1",
     }
     r1 = client.post("/api/orders/mark_paid", json=body)
@@ -67,11 +67,24 @@ def test_mark_paid_idempotent_double_click(client_env):
 
 def test_mark_paid_distinct_keys_create_two(client_env):
     client, db, ids = client_env
-    base = {"initData": str(ids["mgr"]), "order_id": ids["order"], "amount": 50}
+    base = {
+        "initData": str(ids["mgr"]), "order_id": ids["order"],
+        "parts": [{"method": "card", "currency": "USD", "amount": 50}],
+    }
     client.post("/api/orders/mark_paid", json={**base, "idempotency_key": "A"})
     client.post("/api/orders/mark_paid", json={**base, "idempotency_key": "B"})
     # Разные ключи = разные намерения → два платежа.
     assert len(asyncio.run(db.get_payments_for_order(ids["order"]))) == 2
+
+
+def test_mark_paid_without_method_is_refused(client_env):
+    """Сумма без способа больше не принимается — ни платежа, ни занятого ключа."""
+    client, db, ids = client_env
+    body = {"initData": str(ids["mgr"]), "order_id": ids["order"], "amount": 100, "idempotency_key": "N1"}
+    r = client.post("/api/orders/mark_paid", json=body)
+    assert r.status_code == 400
+    assert "как получены деньги" in r.json()["detail"]
+    assert asyncio.run(db.get_payments_for_order(ids["order"])) == []
 
 
 # ─── PR A (Tier 1.1): идемпотентность остальных write-endpoint'ов ──────────────
@@ -106,6 +119,9 @@ def _approved_order(db, mgr):
     db.update_order_agent(oid, "A-1", "Client X")
     db.add_order_item(oid, "Хлеб", "", 2, "шт", 50.0)
     db.update_order_status(oid, "approved")
+    # Отгрузку «оплаты сразу» держит разбивка оплаты — идемпотентность отгрузки
+    # проверяем на заказе в долг, где денег до отгрузки не нужно.
+    asyncio.run(db.set_order_payment(oid, "credit", "2099-12-31"))
     return oid
 
 

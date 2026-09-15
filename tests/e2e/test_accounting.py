@@ -77,7 +77,7 @@ def test_accounting_flow_receipt_two_currencies_then_close_day(open_app, e2e):
     go(mgr, "money")
     tab(mgr, "debts")
     mgr.wait_for_selector(f'.acc-pay[data-acc-order="{oid}"]')
-    assert mgr.locator(".btn-mark-paid").count() == 0, "старая кнопка заменена"
+    assert mgr.locator(".btn-pay-debt").count() == 0, "кнопка разбивки заменена «Получил деньги»"
     mgr.click(f'.acc-pay[data-acc-order="{oid}"]')
     sheet = _sheet(mgr)
     sheet.locator(".acc-line").first.wait_for()
@@ -167,13 +167,13 @@ def test_accounting_flow_receipt_two_currencies_then_close_day(open_app, e2e):
 
 
 def test_accounting_off_keeps_old_screens(open_app, e2e):
-    """Выключатель выключен: «Отметить» в долгах, старая «Касса», кнопка
-    включения — только руководителю."""
+    """Выключатель выключен: «Внести оплату» (разбивка) в долгах, старая «Касса»,
+    кнопка включения — только руководителю."""
     oid = seed_order(e2e)["order_id"]
     mgr = open_app(e2e.ids["mgr"])
     go(mgr, "money")
     tab(mgr, "debts")
-    mgr.wait_for_selector(f'.btn-mark-paid[data-id="{oid}"]')
+    mgr.wait_for_selector(f'.btn-pay-debt[data-id="{oid}"]')
     assert mgr.locator(".acc-pay").count() == 0
     tab(mgr, "ops")
     mgr.wait_for_selector("#dep-amount")

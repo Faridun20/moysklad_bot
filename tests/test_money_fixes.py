@@ -329,7 +329,8 @@ def test_uzs_order_mark_paid_above_old_ceiling(isolated_db, monkeypatch):
     oid = _order(db, total=1_500_000_000.0, currency="UZS")  # техника ≈ $120 000
     client = _client(db, monkeypatch, 1)
     r = client.post("/api/orders/mark_paid",
-                    json={"initData": "1", "order_id": oid, "amount": 600_000_000})
+                    json={"initData": "1", "order_id": oid,
+                          "parts": [{"method": "bank", "currency": "UZS", "amount": 600_000_000}]})
     assert r.status_code == 200, r.text
     assert _rows(db, "SELECT amount_cents FROM payments") == [{"amount_cents": 60_000_000_000}]
 
@@ -423,7 +424,10 @@ def test_paid_order_with_rejected_auto_payment_is_a_debt(isolated_db, monkeypatc
 
     # Менеджер заявляет оплату заново — кнопка на карточке долга работает.
     mgr = _client(db, monkeypatch, 1)
-    r = mgr.post("/api/orders/mark_paid", json={"initData": "1", "order_id": oid})
+    r = mgr.post("/api/orders/mark_paid", json={
+        "initData": "1", "order_id": oid,
+        "parts": [{"method": "card", "currency": "USD", "amount": 250}],
+    })
     assert r.status_code == 200, r.text
     new_pid = r.json()["payment_id"]
     assert _run(db.confirm_payment(new_pid, 2, "Boss"))

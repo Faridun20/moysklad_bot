@@ -163,23 +163,6 @@ def test_parallel_deposit_and_mark_paid_do_not_claim_the_same_money(pg, monkeypa
     assert bool(deposit["allocations"]) != bool(paid_ok)
 
 
-def test_parallel_auto_payment_and_mark_paid_claim_once(pg, monkeypatch):
-    db = pg
-    oid = _order(db, total=250.0, status="approved", payment_type="paid")
-    barrier = _barrier_on_claimable(monkeypatch)
-
-    async def both():
-        return await asyncio.gather(
-            db.create_approval_auto_payment(oid, "Manager"),
-            db.mark_order_paid(oid, MGR, "Manager", amount=None),
-        )
-
-    _run(both())
-    assert barrier.max_inside == 1
-    assert _run(_claimed_cents(db, oid)) == 25_000
-    assert len(_run(db.get_payments_for_order(oid))) == 1
-
-
 def test_parallel_deposits_of_one_manager_still_do_not_overlap(pg, monkeypatch):
     """Advisory-lock по менеджеру снят — две его сдачи сериализует тот же замок строк."""
     db = pg

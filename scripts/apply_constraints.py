@@ -103,6 +103,7 @@ def _checks() -> list[Check]:
     (`accounting.DOC_KINDS`, `ACCOUNT_KINDS`). Правка там без правки здесь
     ловится тестом (`test_check_values_follow_the_code`)."""
     from services.accounting import ACCOUNT_KINDS, DOC_KINDS
+    from services.order_payments import METHODS, RATE_SOURCES
     from services.order_workflow import TRANSITIONS
 
     order_statuses = sorted(TRANSITIONS)
@@ -143,6 +144,18 @@ def _checks() -> list[Check]:
         # отрицательной подтверждённой сдачей (confirm_return), это законно.
         Check("cash_deposits_status_chk", "cash_deposits",
               "status IN ('pending', 'confirmed', 'rejected')", ("id", "status"), "статус сдачи"),
+        # Разбивка «как получены деньги» (services.order_payments): способ и
+        # источник курса — из кода; суммы строки и в валюте заказа > 0 (платёж
+        # под строкой тоже > 0, payments_amount_chk).
+        Check("payment_parts_method_chk", "payment_parts", f"method IN {_in(sorted(METHODS))}",
+              ("id", "payment_id", "method"), "способ оплаты"),
+        Check("payment_parts_rate_source_chk", "payment_parts",
+              f"rate_source IN {_in(list(RATE_SOURCES))}", ("id", "rate_source"), "источник курса"),
+        Check("payment_parts_amount_chk", "payment_parts",
+              "amount_cents > 0 AND order_amount_cents > 0",
+              ("id", "order_id", "amount_cents", "order_amount_cents"), "суммы строки разбивки > 0"),
+        Check("cash_deposit_parts_amount_chk", "cash_deposit_parts", "amount_cents > 0",
+              ("deposit_id", "part_id", "amount_cents"), "наличные строки сдачи > 0"),
         Check("shipment_requests_status_chk", "shipment_requests",
               "status IN ('pending', 'approved', 'rejected', 'returned')",
               ("id", "order_id", "status"), "статус заявки на отгрузку"),
@@ -206,6 +219,13 @@ FOREIGN_KEYS: list[ForeignKey] = [
     ForeignKey("return_items_order_item_fk", "return_items", "order_item_id", "order_items"),
     ForeignKey("cash_deposit_orders_deposit_fk", "cash_deposit_orders", "deposit_id", "cash_deposits"),
     ForeignKey("cash_deposit_orders_order_fk", "cash_deposit_orders", "order_id", "orders"),
+    ForeignKey("payment_parts_payment_fk", "payment_parts", "payment_id", "payments"),
+    ForeignKey("payment_parts_order_fk", "payment_parts", "order_id", "orders"),
+    ForeignKey("cash_deposit_parts_deposit_fk", "cash_deposit_parts", "deposit_id", "cash_deposits"),
+    ForeignKey("cash_deposit_parts_part_fk", "cash_deposit_parts", "part_id", "payment_parts"),
+    ForeignKey("cash_deposit_parts_order_fk", "cash_deposit_parts", "order_id", "orders"),
+    ForeignKey("cash_deposit_currency_deposit_fk", "cash_deposit_currency", "deposit_id",
+               "cash_deposits"),
     ForeignKey("order_shipment_order_fk", "order_shipment", "order_id", "orders"),
     ForeignKey("order_shipment_invoice_fk", "order_shipment", "invoice_id", "invoices"),
     ForeignKey("return_receipt_return_fk", "return_receipt", "return_id", "returns"),
@@ -252,6 +272,7 @@ UNIQUE_KEYS: dict[str, tuple[str, tuple[str, ...], str]] = {
     ),
     "idx_return_items_return_item": ("return_items", ("return_id", "order_item_id"), "TRUE"),
     "idx_acc_day_closes_doc": ("acc_day_closes", ("doc_id",), "doc_id IS NOT NULL"),
+    "idx_payment_parts_payment": ("payment_parts", ("payment_id",), "TRUE"),
 }
 
 

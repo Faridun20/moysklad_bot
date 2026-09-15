@@ -340,6 +340,36 @@ def _service_flows(db, tag: str) -> None:
     if dep.get("ok"):
         assert _run(db.confirm_cash_deposit(dep["deposit_id"], BOSS, "Boss"))["ok"]
 
+    # «Оплата сразу»: разбивка (наличные USD + карта сумами по курсу) до отгрузки,
+    # автоплатёж старого образца заменяется, сдача по наличным, отклонение и
+    # повторная сдача — пишут payment_parts / cash_deposit_parts / _currency.
+    from services import order_payments
+
+    paid = db.create_order(MGR, "Manager", "")
+    db.update_order_agent(paid, str(cp), f"Клиент {tag}")
+    db.add_order_item(paid, f"Кабель {tag}", "", 2, "м", 100.0, product_id=pid)
+    sub3 = _run(submit_order(paid, MGR, "Manager", payment_type="paid"))
+    assert sub3.get("ok"), sub3
+    assert _run(approve_shipment_request(sub3["req_id"], BOSS, "Boss", None, pdf_delivery="inline"))["ok"]
+    assert _run(db.mark_order_shipped(paid, BOSS, "Boss"))["code"] == "payment_required"
+    db.add_payment(MGR, "", "Manager", 200.0, "USD", "Оплата по заказу (отгрузка одобрена)", order_id=paid)
+    mgr_actor = order_payments.Actor(MGR, "Manager", "manager")
+    rec = _run(order_payments.record_payment_parts(paid, mgr_actor, [
+        {"method": "cash", "currency": "USD", "amount": "120"},
+        {"method": "card", "currency": "UZS", "amount": "1016000", "rate": "12700"},
+    ]))
+    assert rec["superseded"] and rec["total_cents"] == 20_000, rec
+    assert _run(db.mark_order_shipped(paid, BOSS, "Boss"))["ok"]
+    card_pid = next(p["payment_id"] for p in rec["parts"] if p["method"] == "card")
+    assert _run(db.confirm_payment(card_pid, BOSS, "Boss"))
+    dep1 = _run(db.create_cash_deposit(MGR, 50.0))
+    assert dep1["ok"] and dep1["parts"], dep1
+    assert _run(db.reject_cash_deposit(dep1["deposit_id"], BOSS, "Boss", "пересчитать"))["ok"]
+    dep2 = _run(db.create_cash_deposit(MGR, 120.0, currency="USD"))
+    assert dep2["ok"] and dep2["parts"], dep2
+    assert _run(db.confirm_cash_deposit(dep2["deposit_id"], BOSS, "Boss"))["ok"]
+    assert _run(db.get_order(paid))["paid_confirmed_at"]
+
     # Возврат с выдачей денег (отрицательная сдача) и приходом на склад.
     ret = _run(db.create_return(oid, "partial", "брак", [(iid, 1.2, 0)], "cash", MGR))
     assert ret["ok"], ret
@@ -429,7 +459,8 @@ def test_constraints_hold_for_real_service_flows(pg_db):
         ("return_receipt", "invoice_id IS NOT NULL"), ("cash_deposit_orders", "TRUE"),
         ("cash_deposits", "amount_cents < 0"), ("acc_day_closes", "TRUE"),
         ("container_receipt", "invoice_id IS NOT NULL"), ("sale_costs", "TRUE"),
-        ("cost_batches", "TRUE"),
+        ("cost_batches", "TRUE"), ("payment_parts", "split_from IS NOT NULL"),
+        ("cash_deposit_parts", "TRUE"), ("cash_deposit_currency", "TRUE"),
     ):
         n = _one(db, f"SELECT COUNT(*) AS n FROM {table} WHERE {where}")["n"]
         assert n > 0, table

@@ -116,23 +116,25 @@ def test_confirm_with_no_pending_sends_nothing(pay_env):
     assert sent == []
 
 
-def test_manager_cannot_confirm_payment(pay_env, monkeypatch):
+def test_manager_confirms_payment_only_as_acting_bookkeeper(pay_env, monkeypatch):
+    """Подтверждать карту/перечисление — руководитель или бухгалтер. Менеджер
+    получает это совмещением ролей (бухгалтера нет), гость и кладовщик — нет."""
     client, db, ids, sent = pay_env
     import webapp.server as server
 
-    monkeypatch.setattr(
-        server,
-        "verify_init_data",
-        lambda init_data: {"id": ids["mgr"], "first_name": "Manager"},
-    )
-    resp = client.post(
-        "/api/orders/confirm_payment",
-        json={"initData": "x", "order_id": ids["order"]},
-    )
-    assert resp.status_code == 403
-    # Платежи остались pending
+    db.set_role(300, "wh", "Keeper", "warehouse_keeper")
+    for uid in (300, 999):
+        monkeypatch.setattr(server, "verify_init_data", lambda init_data, uid=uid: {"id": uid, "first_name": "X"})
+        resp = client.post("/api/orders/confirm_payment", json={"initData": "x", "order_id": ids["order"]})
+        assert resp.status_code == 403
     statuses = [p["status"] for p in asyncio.run(db.get_payments_for_order(ids["order"]))]
     assert statuses == ["pending", "pending"]
+
+    monkeypatch.setattr(server, "verify_init_data", lambda init_data: {"id": ids["mgr"], "first_name": "Manager"})
+    resp = client.post("/api/orders/confirm_payment", json={"initData": "x", "order_id": ids["order"]})
+    assert resp.status_code == 200, resp.text
+    # Менеджер подтвердил СВОИ платежи — ответ это называет, а не молчит.
+    assert resp.json()["self_note"]
 
 
 # ─── /api/payments/pending — surface для подтверждения paid-заказов ─────────
@@ -202,17 +204,15 @@ def test_pending_lists_paid_order_for_boss(paid_env):
     assert item["agent_name"] == "Client X"
 
 
-def test_pending_forbidden_for_manager(paid_env, monkeypatch):
+def test_pending_forbidden_for_guest_and_keeper(paid_env, monkeypatch):
     client, db, ids = paid_env
     import webapp.server as server
 
-    monkeypatch.setattr(
-        server,
-        "verify_init_data",
-        lambda init_data: {"id": ids["mgr"], "first_name": "Manager"},
-    )
-    resp = client.post("/api/payments/pending", json={"initData": "x"})
-    assert resp.status_code == 403
+    db.set_role(300, "wh", "Keeper", "warehouse_keeper")
+    for uid in (300, 999):
+        monkeypatch.setattr(server, "verify_init_data", lambda init_data, uid=uid: {"id": uid, "first_name": "X"})
+        resp = client.post("/api/payments/pending", json={"initData": "x"})
+        assert resp.status_code == 403
 
 
 def test_pending_clears_after_confirm(paid_env):

@@ -20,9 +20,22 @@ def test_mark_order_shipped(isolated_db):
     oid = db.create_order(1, "M", "")
     db.add_order_item(oid, "T", "", 1, "шт", 100.0)
     db.update_order_status(oid, "approved")
+    asyncio.run(db.set_order_payment(oid, "credit", "2099-12-31"))
     res = asyncio.run(db.mark_order_shipped(oid, 2, "Boss"))
     assert res["ok"] is True
     assert asyncio.run(db.get_order(oid))["status"] == "shipped"
+
+
+def test_paid_order_is_not_shipped_without_payment_breakdown(isolated_db):
+    """«Оплата сразу» без разбивки оплаты не отгружается — отказ сервером."""
+    db = isolated_db
+    oid = db.create_order(1, "M", "")
+    db.add_order_item(oid, "T", "", 1, "шт", 100.0)
+    db.update_order_status(oid, "approved")
+    res = asyncio.run(db.mark_order_shipped(oid, 2, "Boss"))
+    assert res["ok"] is False and res["code"] == "payment_required"
+    assert res["gap_cents"] == 10_000
+    assert asyncio.run(db.get_order(oid))["status"] == "approved"
 
 
 def test_mark_order_shipped_only_from_approved(isolated_db):
@@ -111,6 +124,7 @@ def client_env(isolated_db, monkeypatch):
     oid = db.create_order(mgr, "Mgr", "")
     db.add_order_item(oid, "T", "", 1, "шт", 100.0)
     db.update_order_status(oid, "approved")
+    asyncio.run(db.set_order_payment(oid, "credit", "2099-12-31"))
 
     fake_bot = _FakeBot()
 

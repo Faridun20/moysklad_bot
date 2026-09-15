@@ -238,6 +238,12 @@ def can_manage_payments(user_id: int) -> bool:
     return _has_role(user_id, "admin", "boss")
 
 
+def can_confirm_payment(user_id: int) -> bool:
+    """Подтвердить/отклонить платёж по заказу (карта, перечисление): руководитель
+    или бухгалтер — они сверяют банк. Менеджер — через совмещение ролей."""
+    return _has_role(user_id, "admin", "boss", "bookkeeper")
+
+
 def can_manage_users(user_id: int) -> bool:
     """Только полный админ."""
     return _has_role(user_id, "admin")

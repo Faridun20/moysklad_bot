@@ -1251,6 +1251,10 @@ def _table_ddls() -> list[str]:
     from services.accounting_schema import tables as _accounting_tables
 
     tables.extend(_accounting_tables(id_type))
+    # «Как получены деньги» (разбивка оплаты, валюта и строки сдачи) — тоже leaf.
+    from services.order_payments_schema import tables as _order_payments_tables
+
+    tables.extend(_order_payments_tables(id_type))
 
     return tables
 
@@ -1496,6 +1500,9 @@ def _index_ddls() -> list[str]:
     from services.accounting_schema import INDEXES as _accounting_indexes
 
     snapshot_indexes.extend(_accounting_indexes)
+    from services.order_payments_schema import INDEXES as _order_payments_indexes
+
+    snapshot_indexes.extend(_order_payments_indexes)
     return snapshot_indexes
 
 
@@ -2813,14 +2820,69 @@ async def mark_order_shipped(order_id: int, shipped_by: int, shipped_name: str) 
     if order.get("status") != "approved":
         return {"ok": False, "error": "Отгрузить можно только одобренный заказ"}
 
-    updated = (
-        await adb_core.execute(
-            "UPDATE orders SET status = 'shipped', shipped_at = $1, shipped_by = $2, "
-            "updated_at = $3 WHERE id = $4 AND status = 'approved'",
-            now_str(), shipped_by, now_str(), order_id,
+    from services import order_payments, order_shipment
+    from services.debts import lock_orders
+
+    if (order.get("payment_type") or "paid") == "paid":
+        # Ранний отказ ДО повторного списания: без оплаты склад не трогаем.
+        early_gap = (await order_payments.payment_gap_cents([order_id])).get(order_id, 0)
+        if early_gap > 0:
+            cur = (order.get("currency") or "").upper()
+            return {
+                "ok": False, "code": "payment_required", "gap_cents": early_gap,
+                "error": (
+                    f"Заказ #{order_id} «оплата сразу»: сначала введите, как клиент "
+                    f"заплатил (наличные, карта, перечисление). Не внесено: "
+                    f"{order_payments.fmt_cents(early_gap, cur)}"
+                ),
+            }
+    # Списание при одобрении не прошло (не хватило остатка, позиции без карточек —
+    # order_shipment.failed_at): «отгружен» поставил бы товар в дорогу, а остаток
+    # остался бы на полке. Пробуем списать ещё раз (остаток могли довезти) и без
+    # накладной не отгружаем. Заказы без строки order_shipment (эпоха МойСклад,
+    # ручные статусы) — как раньше.
+    shipment = await order_shipment.get_shipment(order_id)
+    if shipment is not None and not shipment.get("invoice_id"):
+        retry = await order_shipment.ship_order(order, await get_order_items(order_id), user_id=shipped_by)
+        if not retry.get("ok"):
+            return {
+                "ok": False,
+                "code": "stock_not_written_off",
+                "error": (
+                    f"Склад по заказу #{order_id} не списан: {retry.get('reason') or 'ошибка склада'}. "
+                    "Отгрузить нельзя — товар уехал бы, а остаток остался на полке. Оформите "
+                    "приход недостающего или поправьте позиции и нажмите «Отгрузить» ещё раз."
+                ),
+            }
+
+    async with adb_core.transaction() as txn:
+        # «Оплата сразу» не уезжает, пока не введено, как получены деньги
+        # (требование владельца: «до отгрузки, чтобы потом не возникало
+        # вопросов»). Проверка — под замком заказа, тем же, что у записи
+        # разбивки: отклонённая между проверкой и отгрузкой оплата не проскочит.
+        await lock_orders(txn, [order_id])
+        if (order.get("payment_type") or "paid") == "paid":
+            gap = (await order_payments.payment_gap_cents([order_id], conn=txn)).get(order_id, 0)
+            if gap > 0:
+                cur = (order.get("currency") or "").upper()
+                return {
+                    "ok": False,
+                    "code": "payment_required",
+                    "gap_cents": gap,
+                    "error": (
+                        f"Заказ #{order_id} «оплата сразу»: сначала введите, как клиент "
+                        f"заплатил (наличные, карта, перечисление). Не внесено: "
+                        f"{order_payments.fmt_cents(gap, cur)}"
+                    ),
+                }
+        updated = (
+            await txn.execute(
+                "UPDATE orders SET status = 'shipped', shipped_at = $1, shipped_by = $2, "
+                "updated_at = $3 WHERE id = $4 AND status = 'approved'",
+                now_str(), shipped_by, now_str(), order_id,
+            )
+            > 0
         )
-        > 0
-    )
     if not updated:
         return {"ok": False, "error": "Заказ уже обработан"}
 
@@ -2871,6 +2933,34 @@ async def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, re
                 "ok": False,
                 "error": "Отмена доступна только для approved (shipped → через возврат)",
             }
+        # Оплата, внесённая разбивкой до отгрузки. Ожидающая — отклоняется
+        # вместе с отменой (деньги вернули клиенту). Подтверждённая или уже
+        # сданная в кассу — отказ: молча отменить заказ с принятыми деньгами
+        # значит потерять их след.
+        from services import order_payments
+
+        parts = (await order_payments.parts_for_orders([order_id], conn=txn)).get(order_id, [])
+        confirmed_c = int(await txn.fetchval(
+            "SELECT COALESCE(SUM(amount_cents), 0) FROM payments WHERE order_id = $1 "
+            "AND status = 'confirmed'", order_id,
+        ) or 0)
+        in_deposit = [p for p in parts if p["state"] == "in_deposit"]
+        if confirmed_c > 0 or in_deposit:
+            cur = (await txn.fetchval("SELECT currency FROM orders WHERE id = $1", order_id)) or ""
+            what = (
+                f"подтверждена оплата {order_payments.fmt_cents(confirmed_c, cur)}"
+                if confirmed_c else "наличные уже сданы в кассу (сдача ждёт подтверждения)"
+            )
+            return {
+                "ok": False,
+                "code": "money_received",
+                "error": (
+                    f"По заказу #{order_id} {what} — отмена потеряла бы эти деньги. "
+                    + ("Отклоните сдачу, потом отменяйте заказ."
+                       if not confirmed_c else
+                       "Отгрузите заказ и оформите возврат «Наличными» — деньги выдадут из кассы с записью.")
+                ),
+            }
         # Сначала склад: его отказ случается ДО первой записи, и тогда
         # транзакция не пишет ничего — заказ остаётся одобренным.
         rev = await order_shipment.cancel_shipment_locked(txn, order_id, user_id=cancelled_by)
@@ -2891,6 +2981,17 @@ async def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, re
         )
         if not updated:  # под замком недостижимо; страховка на SQLite-ручные правки
             raise RuntimeError(f"cancel_order: заказ #{order_id} ушёл из approved под замком")
+        # Все ожидающие платежи отменённого заказа снимаются вместе с ним: и
+        # строки разбивки, и старый автоплатёж одобрения без способа. Иначе
+        # «Подтвердить» по отменённому заказу засчитывал деньги за продажу,
+        # которой нет (сценарий test_cancelling_paid_order_voids_its_pending_payment).
+        voided = await txn.fetch(
+            "SELECT id FROM payments WHERE order_id = $1 AND status = 'pending'", order_id
+        )
+        await txn.execute(
+            "UPDATE payments SET status = 'rejected' WHERE order_id = $1 AND status = 'pending'",
+            order_id,
+        )
 
     await asyncio.to_thread(
         add_audit_log,
@@ -2898,7 +2999,8 @@ async def cancel_order(order_id: int, cancelled_by: int, cancelled_name: str, re
         cancelled_name,
         await asyncio.to_thread(get_role, cancelled_by),
         "order_cancelled",
-        f"Заказ #{order_id} отменён: {reason[:200]}",
+        f"Заказ #{order_id} отменён: {reason[:200]}"
+        + (f"; сняты ожидающие платежи #{', #'.join(str(r['id']) for r in voided)}" if voided else ""),
     )
     if rev.get("invoice_id"):
         logger.info("Заказ #%s отменён, отгрузка откачена, остаток возвращён", order_id)
@@ -3730,59 +3832,92 @@ async def create_cash_deposit(
     amount: float,
     allocations: list[tuple] | None = None,
     idem_key: str | None = None,
+    *,
+    currency: str | None = None,
+    order_ids: list[int] | None = None,
 ) -> dict:
     """Создать сдачу (status=pending) + распределение по заказам.
 
     `idem_key` — результат пишется в ключ идемпотентности той же транзакцией.
 
-    allocations: список (order_id, amount) для ручного режима; если None —
-    авто-FIFO по открытым заказам менеджера. Возвращает {ok, deposit_id,
-    allocations}.
+    Куда идут деньги (авто, `allocations is None`):
+      1. **Наличные строки разбивки на руках** у этого менеджера в валюте сдачи
+         (`order_payments.cash_on_hand`), старые первыми. Это и есть «деньги
+         по неподтверждённым заказам»: менеджер записал «клиент отдал 5 000
+         наличными», и сдача 5 000 закрывает именно их. Строка берётся целиком;
+         денег меньше — строка делится. Привязка — `cash_deposit_parts`.
+      2. Остаток сдачи в БАЗОВОЙ валюте — прежний FIFO по долгам без разбивки
+         (`get_manager_open_orders_for_deposit`, `cash_deposit_orders`): старые
+         заказы, по которым деньги ещё никак не заявлены.
+      3. Что не легло никуда — `unallocated_cents` (сдача всё равно создаётся:
+         наличные в кассу бывают и не по заказам; экран это показывает).
+    `order_ids` — ручной выбор: распределять только по этим заказам.
 
-    Конкурентность: `get_manager_open_orders_for_deposit` читает остатки вне
-    транзакции, поэтому под транзакцией строки заказов-кандидатов берутся
-    `FOR UPDATE` (services.debts.lock_orders — тот же замок, что у отметки
-    оплаты и «Получил деньги») и остаток перечитывается. Раньше здесь был
-    advisory-lock по менеджеру: две сдачи одного менеджера он сериализовал, а
-    сдачу и параллельную отметку оплаты того же заказа — нет.
+    Почему прод-сдачи были «Заказы: —»: автоплатёж одобрения «оплата сразу»
+    заявлял ВСЮ сумму заказа ожидающим платежом, и FIFO по долгам видел остаток
+    0 — распределять было не на что. Разбивка этот автоплатёж заменяет, а
+    наличная её часть стала целью сдачи.
 
-    INSERT-id: RETURNING (pg) / last_insert_rowid() (sqlite).
-    validate_amount_in_currency для базовой валюты в БД не ходит.
+    allocations: список (order_id, amount) для ручного режима по долгам —
+    прежний контракт, без разбивки.
+
+    Валюта сдачи — `cash_deposit_currency` (у `cash_deposits` колонки нет);
+    без строки сдача в базовой валюте.
+
+    Замок — строки заказов (services.debts.lock_orders), общий с отметкой
+    оплаты, разбивкой и «Получил деньги».
     """
-    # Сдача — в базовой валюте (у cash_deposits нет колонки валюты).
-    ok, err = validate_amount_in_currency(amount, None)
+    from services import order_payments
+
+    from config import ALLOWED_CURRENCIES, BASE_CURRENCY
+
+    base_cur = (BASE_CURRENCY or "USD").upper()
+    dep_cur = (currency or base_cur).upper()
+
+    if dep_cur not in {c.upper() for c in ALLOWED_CURRENCIES}:
+        return {"ok": False, "error": f"Валюта {dep_cur} не поддерживается"}
+    ok, err = validate_amount_in_currency(amount, dep_cur)
     if not ok:
         return {"ok": False, "error": err}
 
     is_manual = allocations is not None
     allocs: list[tuple] = list(allocations) if allocations is not None else []
 
-    # T2.11: FIFO-расчёт — ДО захвата коннекта под транзакцию.
-    # Раньше он шёл внутри `async with transaction()`, а
-    # get_manager_open_orders_for_deposit делала 4 запроса на каждый заказ,
-    # и каждый брал СВОЙ коннект из того же пула. При PG_POOL_MAX=10
-    # одновременных сдачах все коннекты держали транзакции, а внутренние
-    # запросы ждали свободного — asyncpg.Pool.acquire() без таймаута ждёт
-    # вечно, процесс вставал до рестарта (§2.13).
+    # T2.11: FIFO-расчёт — ДО захвата коннекта под транзакцию (внутренние
+    # запросы с отдельных коннектов пула при PG_POOL_MAX одновременных сдачах
+    # вешали процесс, §2.13). Под транзакцией — только перепроверка.
     candidates: list[dict] = []
+    part_rows: list[dict] = []
     if not is_manual:
-        candidates = await get_manager_open_orders_for_deposit(manager_id)
+        part_rows = await order_payments.cash_on_hand(manager_id, dep_cur)
+        if dep_cur == base_cur:
+            candidates = await get_manager_open_orders_for_deposit(manager_id)
+        if order_ids:
+            wanted = {int(o) for o in order_ids}
+            part_rows = [r for r in part_rows if int(r["order_id"]) in wanted]
+            candidates = [o for o in candidates if int(o["id"]) in wanted]
 
     from services.debts import lock_orders
 
+    amount_cents = money.to_cents(amount)
+    parts_taken: list[dict] = []
+    left_cents = amount_cents
     async with adb_core.transaction() as txn:
-        # Замок — строки заказов (services.debts.lock_orders), а НЕ advisory по
-        # менеджеру, как было: отметка оплаты и «Получил деньги» берут строку
-        # заказа, и разные замки друг друга не ждали — параллельные сдача и
-        # «оплачено» по одному заказу обе проходили проверку остатка.
-        target_ids = [o["id"] for o in candidates] if not is_manual else [a[0] for a in allocs]
+        target_ids = (
+            [o["id"] for o in candidates] + [int(r["order_id"]) for r in part_rows]
+            if not is_manual else [a[0] for a in allocs]
+        )
         await lock_orders(txn, target_ids)
-        # Перепроверка ПОД ЗАМКОМ: между расчётом и этим моментом другой вызов
-        # мог заявить часть остатка. Читаем тем же коннектом (conn=txn) — новых
-        # захватов из пула не делаем.
-        fresh = await deposit_remaining_cents_for_orders(target_ids, conn=txn)
         if not is_manual:
-            left_cents = money.to_cents(amount)
+            # Сначала наличные строки разбивки (перечитываются под замком).
+            parts_taken, left_cents = await order_payments.allocate_deposit_to_parts_locked(
+                txn, manager_id, dep_cur, amount_cents,
+                sorted({int(r["order_id"]) for r in part_rows}) if part_rows else [],
+            ) if part_rows else ([], amount_cents)
+            # Остаток — прежний FIFO по долгам без разбивки. Перепроверка ПОД
+            # ЗАМКОМ тем же коннектом (conn=txn): между расчётом и этим
+            # моментом другой вызов мог заявить часть остатка.
+            fresh = await deposit_remaining_cents_for_orders([o["id"] for o in candidates], conn=txn)
             for o in candidates:
                 if left_cents <= 0:
                     break
@@ -3792,20 +3927,21 @@ async def create_cash_deposit(
                     allocs.append((o["id"], float(money.from_cents(take_cents))))
                     left_cents -= take_cents
         else:
+            fresh = await deposit_remaining_cents_for_orders(target_ids, conn=txn)
             # Ручное распределение проверяется той же формулой: иначе оно было
             # третьим путём заявить уже заявленные деньги.
-            wanted: dict[int, int] = {}
+            wanted_c: dict[int, int] = {}
             for order_id, alloc in allocs:
-                wanted[int(order_id)] = wanted.get(int(order_id), 0) + money.to_cents(alloc)
-            for order_id, cents in wanted.items():
+                wanted_c[int(order_id)] = wanted_c.get(int(order_id), 0) + money.to_cents(alloc)
+            for order_id, cents in wanted_c.items():
                 if cents > fresh.get(order_id, 0):
                     return {
                         "ok": False,
                         "error": f"По заказу #{order_id} столько заявить нельзя: "
                         f"доступно {money.format_cents(fresh.get(order_id, 0), decimals=2)}",
                     }
+            left_cents = amount_cents - sum(wanted_c.values())
 
-        amount_cents = money.to_cents(amount)
         if USE_POSTGRES:
             deposit_id = await txn.fetchval(
                 "INSERT INTO cash_deposits (manager_id, amount_cents, deposited_at, status, created_at) "
@@ -3819,6 +3955,16 @@ async def create_cash_deposit(
                 manager_id, amount_cents, now_str(), now_str(),
             )
             deposit_id = await txn.fetchval("SELECT last_insert_rowid()")
+        await txn.execute(
+            "INSERT INTO cash_deposit_currency (deposit_id, currency) VALUES ($1, $2)",
+            deposit_id, dep_cur,
+        )
+        for p in parts_taken:
+            await txn.execute(
+                "INSERT INTO cash_deposit_parts (deposit_id, part_id, order_id, amount_cents) "
+                "VALUES ($1, $2, $3, $4)",
+                deposit_id, p["part_id"], p["order_id"], p["amount_cents"],
+            )
         for order_id, alloc in allocs:
             await txn.execute(
                 "INSERT INTO cash_deposit_orders (deposit_id, order_id, amount_allocated_cents, is_manual) "
@@ -3826,30 +3972,47 @@ async def create_cash_deposit(
                 deposit_id, order_id, money.to_cents(alloc), 1 if is_manual else 0,
             )
         await idem_store_in(txn, idem_key, {"ok": True, "deposit_id": deposit_id})
-    return {"ok": True, "deposit_id": deposit_id, "allocations": allocs}
+    return {
+        "ok": True,
+        "deposit_id": deposit_id,
+        "currency": dep_cur,
+        "allocations": allocs,
+        "parts": parts_taken,
+        "unallocated_cents": max(0, left_cents),
+    }
 
 
 async def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_name: str = "") -> dict:
     """Подтвердить сдачу и закрыть покрытые ею заказы — ОДНОЙ транзакцией.
 
-    Возвращает {ok, closed_orders}.
+    Возвращает {ok, closed_orders, self_confirmed}.
 
     Раньше статус сдачи коммитился первым, а заказы закрывались потом, каждый
     своей транзакцией. Падение между ними оставляло сдачу `confirmed` с
-    незакрытыми заказами — и без пути повтора: `status = 'pending'` уже нет,
-    второй вызов отвечал «уже обработана». Теперь либо всё, либо ничего.
+    незакрытыми заказами — и без пути повтора. Теперь либо всё, либо ничего.
 
-    Покрытие считает `services.debts.calc_order_balances(conn=txn)` — тем же
-    правилом, что и `_maybe_close_order_after_payment`: подтверждённые платежи
-    плюс подтверждённые сдачи против суммы за вычетом возвратов. Внутри той же
-    транзакции она видит только что подтверждённую сдачу.
+    Что подтверждается вместе со сдачей:
+      * наличные строки разбивки (`cash_deposit_parts`) — их ожидающие платежи
+        становятся confirmed; заказ закрывается штатным
+        `_close_order_if_covered_locked` (как подтверждение платежа);
+      * прежнее распределение по долгам (`cash_deposit_orders`) — покрытый
+        заказ получает `payment_confirmed`/`paid`, как раньше.
 
-    Замки: advisory-lock по сдаче сериализует два одновременных подтверждения
-    одной и той же; FOR UPDATE на заказах — в порядке id, как и остатки в
-    warehouse: две сдачи по одним заказам в разном порядке иначе получают
-    взаимный deadlock. Guard `payment_confirmed = 0` — последний рубеж.
+    Покрытие считает `services.debts.calc_order_balances(conn=txn)` — внутри
+    той же транзакции она видит только что подтверждённые платежи и сдачу.
+
+    Замки: advisory по сдаче (два одновременных подтверждения одной), затем
+    строки заказов по возрастанию id (`lock_orders` — «заказ → платёж»), затем
+    CAS статуса сдачи.
     """
-    from services.debts import calc_order_balances
+    from services import order_payments
+    from services.debts import calc_order_balances, lock_orders
+
+    part_orders, part_currencies = await order_payments.deposit_part_orders(deposit_id)
+    # Курс для снимка fx_rate_to_base — ДО транзакции (sync-чтение на SQLite
+    # ждало бы нашу же пишущую транзакцию), как в confirm_payment.
+    rates = {c: await asyncio.to_thread(get_currency_rate, c) for c in part_currencies if c}
+    dep_head = await adb_core.fetchrow("SELECT manager_id FROM cash_deposits WHERE id = $1", deposit_id)
 
     closed: list[int] = []
     async with adb_core.transaction() as txn:
@@ -3857,6 +4020,12 @@ async def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_nam
             await txn.execute(
                 "SELECT pg_advisory_xact_lock(hashtext($1))", f"cash_deposit:confirm:{deposit_id}"
             )
+        legacy_rows = await txn.fetch(
+            "SELECT order_id FROM cash_deposit_orders WHERE deposit_id = $1", deposit_id
+        )
+        legacy_ids = sorted({int(r["order_id"]) for r in legacy_rows})
+        order_ids = sorted(set(legacy_ids) | set(part_orders))
+        await lock_orders(txn, order_ids)
         rc = await txn.execute(
             "UPDATE cash_deposits SET status = 'confirmed', confirmed_by = $1, confirmed_at = $2 "
             "WHERE id = $3 AND status = 'pending'",
@@ -3865,18 +4034,19 @@ async def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_nam
         if rc <= 0:
             return {"ok": False, "error": "Сдача уже обработана"}
 
-        rows = await txn.fetch(
-            "SELECT order_id FROM cash_deposit_orders WHERE deposit_id = $1", deposit_id
-        )
-        order_ids = sorted({int(r["order_id"]) for r in rows})
-        if USE_POSTGRES:
-            for oid in order_ids:
-                await txn.fetchrow("SELECT payment_confirmed FROM orders WHERE id = $1 FOR UPDATE", oid)
+        paid_by_parts = await order_payments.confirm_deposit_parts_locked(txn, deposit_id, rates)
+        for oid in paid_by_parts:
+            # Строки разбивки — это платежи: заказ закрывается ровно как при
+            # подтверждении платежа (paid_confirmed_at), какой бы из путей —
+            # сдача или кнопка «Подтвердить» по карте — ни оказался последним.
+            done, _cents = await _close_order_if_covered_locked(txn, oid, confirmed_by, confirmed_name)
+            if done:
+                closed.append(oid)
 
-        balances = await calc_order_balances(order_ids, conn=txn)
-        for oid in order_ids:
+        balances = await calc_order_balances(legacy_ids, conn=txn)
+        for oid in legacy_ids:
             bal = balances.get(oid)
-            if bal is None:
+            if bal is None or oid in closed:
                 continue
             # net <= 0 (полный возврат) — это не «оплачено», статус ведёт
             # confirm_return.
@@ -3891,15 +4061,21 @@ async def confirm_cash_deposit(deposit_id: int, confirmed_by: int, confirmed_nam
             if rc > 0:
                 closed.append(oid)
 
+    role = await asyncio.to_thread(get_role, confirmed_by)
+    note = order_payments.self_confirm_note(
+        confirmed_by, dep_head["manager_id"] if dep_head else None, role
+    )
     await asyncio.to_thread(
         add_audit_log,
         confirmed_by,
         confirmed_name,
-        await asyncio.to_thread(get_role, confirmed_by),
+        role,
         "cash_deposit_confirmed",
-        f"Сдача #{deposit_id} подтверждена; закрыты заказы: {closed or '—'}",
+        f"Сдача #{deposit_id} подтверждена; наличные по заказам: "
+        f"{', '.join('#' + str(o) for o in part_orders) or '—'}; закрыты заказы: {closed or '—'}"
+        + (f" ({note})" if note else ""),
     )
-    return {"ok": True, "closed_orders": closed}
+    return {"ok": True, "closed_orders": sorted(closed), "self_confirmed": bool(note)}
 
 
 async def reject_cash_deposit(
@@ -4026,6 +4202,8 @@ async def get_overdue_undeposited_orders(days: int = 2) -> list[dict]:
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     return await adb_core.fetch(
         "SELECT * FROM orders WHERE status = 'shipped' AND payment_confirmed = 0 "
+        # Закрытый платежами (разбивка/карта) заказ сдавать уже нечего.
+        "AND paid_confirmed_at IS NULL "
         "AND COALESCE(shipped_at, created_at) < $1 "
         "ORDER BY user_id, created_at",
         cutoff,
@@ -4135,6 +4313,9 @@ async def create_return(
         )
         if int(cnt or 0) > 0:
             return {"ok": False, "error": "По заказу уже есть возврат на рассмотрении"}
+        refusal = await _debt_reduction_refusal(txn, order_id, refund_method, total_cents)
+        if refusal:
+            return {"ok": False, "error": refusal, "code": "no_debt_to_reduce"}
 
         if USE_POSTGRES:
             return_id = await txn.fetchval(
@@ -4161,6 +4342,41 @@ async def create_return(
             txn, idem_key, {"ok": True, "return_id": return_id, "total_amount": total_amount}
         )
     return {"ok": True, "return_id": return_id, "total_amount": total_amount}
+
+
+async def _debt_reduction_refusal(txn, order_id: int, refund_method: str | None,
+                                  amount_cents: int) -> str | None:
+    """Возврат «в счёт долга» больше долга — отказ текстом, иначе None.
+
+    Возврат «в счёт долга» уменьшает остаток к оплате. Если клиент уже заплатил
+    (долга нет или он меньше суммы возврата), вычитать не из чего: сумма
+    возврата — его переплата, и она молча исчезала бы — ни в долгах, ни в
+    выдаче из кассы. Долг = то, что по заказу ещё можно заявить
+    (`calc_claimable_cents`): ожидающие оплаты и сдачи считаются уже
+    заплаченными — после их подтверждения переплата была бы та же. Замок
+    заказа берётся здесь же (`lock_orders`), как у всех «заявлено по заказу».
+    """
+    if refund_method != "debt_reduction":
+        return None
+    from services.debts import calc_claimable_cents, lock_orders
+
+    await lock_orders(txn, [order_id])
+    debt = (await calc_claimable_cents([order_id], conn=txn)).get(order_id, 0)
+    if amount_cents <= debt:
+        return None
+    from services.order_payments import fmt_cents
+
+    cur = (await txn.fetchval("SELECT currency FROM orders WHERE id = $1", order_id)) or ""
+    head = (
+        "Долга по заказу нет — клиент уже заплатил"
+        if debt <= 0
+        else f"Долг по заказу {fmt_cents(debt, cur)} меньше возврата"
+    )
+    return (
+        f"{head}: вернуть {fmt_cents(amount_cents, cur)} «в счёт долга» "
+        "нельзя — переплата клиента пропала бы. Выберите «Наличными» (деньги выдадут из "
+        "кассы) или «Без возврата»."
+    )
 
 
 async def mark_return_goods_received(return_id: int, by: int) -> dict:
@@ -4336,6 +4552,14 @@ async def confirm_return(return_id: int, confirmed_by: int, confirmed_name: str 
             # тот же, что у отметки оплаты и сдачи (services.debts.lock_orders):
             # иначе параллельная отметка оплаты считала остаток ещё без возврата.
             await lock_orders(txn, [order_id])
+            # Между оформлением и подтверждением клиент мог доплатить: «в счёт
+            # долга» сверх долга не подтверждаем по той же причине, что и не
+            # оформляем (_debt_reduction_refusal).
+            refusal = await _debt_reduction_refusal(
+                txn, order_id, ret.get("refund_method"), int(ret.get("total_amount_cents") or 0)
+            )
+            if refusal:
+                raise _TxnAbort(refusal)
             # T2.8: подтвердить возврат можно только если товар ПРИНЯТ.
             # goods_received писался (mark_return_goods_received), но никогда не
             # проверялся: босс подтверждал возврат → returned_qty рос, заказ
@@ -4952,71 +5176,6 @@ def add_payment(
             payment_id = cur.lastrowid
         conn.commit()
     return payment_id
-
-
-async def create_approval_auto_payment(order_id: int, full_name: str) -> int | None:
-    """Автоплатёж «оплата сразу» после одобрения: pending на сумму заказа.
-
-    Возвращает id платежа или None, если создавать нечего (заказ не «оплата
-    сразу», уже не одобрен, закрыт, по нему уже есть заявленные деньги).
-
-    Проверка и вставка — одной транзакцией ПОД ЗАМКОМ заказа
-    (services.debts.lock_orders). Раньше одобрение проверяло «платежей нет»
-    чтением без замка и вставляло отдельным коммитом: параллельная отметка
-    оплаты менеджером (или «Получил деньги») проходила ту же проверку, и по
-    заказу оказывалось заявлено две суммы заказа. Повторный вызов безвреден:
-    второй раз он видит уже созданный платёж. Сумма не больше того, что по
-    заказу ещё можно заявить (`calc_claimable_cents`).
-    """
-    from config import BASE_CURRENCY
-
-    from services.debts import calc_claimable_cents, lock_orders
-
-    async with adb_core.transaction() as txn:
-        await lock_orders(txn, [order_id])
-        row = await txn.fetchrow(
-            "SELECT user_id, currency, payment_type, status, paid_confirmed_at "
-            "FROM orders WHERE id = $1",
-            order_id,
-        )
-        if (
-            not row
-            or (row["payment_type"] or "paid") != "paid"
-            or row["status"] not in ("approved", "shipped", "partially_returned")
-            or row["paid_confirmed_at"] is not None
-        ):
-            return None
-        if await txn.fetchval(
-            "SELECT 1 FROM payments WHERE order_id = $1 AND status IN ('pending', 'confirmed') LIMIT 1",
-            order_id,
-        ):
-            return None
-        items = await txn.fetch(
-            "SELECT quantity, price_cents FROM order_items WHERE order_id = $1", order_id
-        )
-        # Сумма — в копейках, построчно через mul_qty: ровно так её считает
-        # закрытие заказа. Float-сумма дробных количеств расходилась на копейку
-        # (2 × 1,5 × 0,33 = 0,99 против 1,00), и заказ не закрывался.
-        total_cents = money.add(
-            *(money.mul_qty(int(it["price_cents"] or 0), it["quantity"] or 0) for it in items)
-        )
-        claimable = (await calc_claimable_cents([order_id], conn=txn)).get(order_id, 0)
-        amount_cents = min(total_cents, claimable)
-        if amount_cents <= 0:
-            return None
-        values = (
-            row["user_id"], "", full_name, amount_cents, row["currency"] or BASE_CURRENCY,
-            f"Оплата по заказу #{order_id} (отгрузка одобрена)", now_str(), order_id,
-        )
-        sql = (
-            "INSERT INTO payments (user_id, username, full_name, amount_cents, currency, "
-            "comment, status, created_at, order_id) "
-            "VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)"
-        )
-        if USE_POSTGRES:
-            return int(await txn.fetchval(sql + " RETURNING id", *values))
-        await txn.execute(sql, *values)
-        return int(await txn.fetchval("SELECT last_insert_rowid()"))
 
 
 async def get_payments_for_order(order_id: int) -> list[dict]:
@@ -5642,8 +5801,13 @@ async def count_boss_attention() -> dict[str, int]:
         "WHERE o.payment_type = 'paid' "
         "AND o.status IN ('approved', 'shipped') "
         "AND (o.ms_deleted_at IS NULL) "
+        # Ждёт решения только то, что подтверждающий может проверить: карта,
+        # перечисление или старый платёж без способа. Наличные на руках у
+        # менеджера подтверждаются сдачей в кассу — кнопки под ними нет.
         "AND EXISTS (SELECT 1 FROM payments p "
-        "            WHERE p.order_id = o.id AND p.status = 'pending')"
+        "            WHERE p.order_id = o.id AND p.status = 'pending' "
+        "            AND NOT EXISTS (SELECT 1 FROM payment_parts pp "
+        "                            WHERE pp.payment_id = p.id AND pp.method = 'cash'))"
     )
     # Зеркалит get_open_debts — фильтр один (_OPEN_DEBT_FILTER).
     debts = await adb_core.fetchval(f"SELECT COUNT(*) FROM orders WHERE {_OPEN_DEBT_FILTER}")
@@ -5741,6 +5905,13 @@ async def confirm_payment(
     )
     if head is None:
         return False
+    # Наличная строка разбивки подтверждается ТОЛЬКО сдачей в кассу
+    # (confirm_cash_deposit): «деньги у менеджера на руках» ещё не в кассе, и
+    # кнопка «Принять» под ними закрыла бы заказ, а наличные так и не дошли бы.
+    from services import order_payments
+
+    if await order_payments.payment_method(payment_id) == "cash":
+        return False
     # Курс — ДО транзакции: get_currency_rate синхронный (кэш + чтение БД), и
     # внутри пишущей транзакции SQLite он ждал бы её же.
     rate = None
@@ -5753,6 +5924,12 @@ async def confirm_payment(
         order_id = head.get("order_id")
         if order_id:
             await lock_orders(txn, [int(order_id)])
+            # Деньги по отменённой/отклонённой продаже не засчитываются: платёж
+            # такого заказа — ошибка, а не поступление (cancel_order их снимает;
+            # здесь — рубеж для старых строк и гонки «отменить против подтвердить»).
+            st = await txn.fetchval("SELECT status FROM orders WHERE id = $1", int(order_id))
+            if st in ("cancelled", "rejected", "draft"):
+                return False
         rc = await txn.execute(
             "UPDATE payments SET status = 'confirmed', confirmed_at = $1 "
             "WHERE id = $2 AND status = 'pending'",
@@ -5998,6 +6175,12 @@ async def reject_payment(
 ) -> bool:
     """asyncpg Stage 15 (#21): native async; get_payment/add_audit_log/get_role
     (sync money-core) — мост через to_thread."""
+    # Наличные, уже лежащие в сдаче, отклоняются вместе со сдачей — иначе
+    # подтверждённая потом сдача несла бы деньги отклонённого платежа.
+    from services import order_payments
+
+    if await order_payments.payment_in_active_deposit(payment_id):
+        return False
     rc = await adb_core.execute(
         "UPDATE payments SET status = 'rejected' WHERE id = $1 AND status = 'pending'",
         payment_id,
@@ -6117,8 +6300,13 @@ async def get_cash_history(
 
     base_cur = (BASE_CURRENCY or "USD").upper()
 
+    from services import order_payments
+
+    parts = await order_payments.parts_by_payment([int(p["id"]) for p in pays])
+    dep_curs = await order_payments.deposit_currency([int(d["id"]) for d in deps])
     rows: list[dict] = []
     for p in pays:
+        part = parts.get(int(p["id"]))
         rows.append({
             "kind": "payment", "id": p["id"],
             "amount": float(money.from_cents(int(p["amount_cents"] or 0))),
@@ -6126,13 +6314,18 @@ async def get_cash_history(
             "who": names.get(p["user_id"], str(p["user_id"])),
             "order_id": p.get("order_id"), "note": p.get("comment") or "",
             "created_at": (p.get("created_at") or "")[:16],
+            # Как получены деньги (строка разбивки): способ и сумма в валюте,
+            # которую отдал клиент. Нет — старый платёж без способа.
+            "method": part["method"] if part else None,
+            "method_label": order_payments.METHODS.get(part["method"]) if part else None,
+            "part_amount": float(money.from_cents(int(part["amount_cents"]))) if part else None,
+            "part_currency": part["currency"] if part else None,
         })
     for d in deps:
-        # Сдачи наличных хранятся в базовой валюте (нет поля currency).
         rows.append({
             "kind": "deposit", "id": d["id"],
             "amount": float(money.from_cents(int(d["amount_cents"] or 0))),
-            "currency": base_cur, "status": d["status"],
+            "currency": dep_curs.get(int(d["id"]), base_cur), "status": d["status"],
             "who": names.get(d["manager_id"], str(d["manager_id"])),
             "order_id": None, "note": d.get("reject_reason") or "",
             "created_at": (d.get("created_at") or "")[:16],
@@ -6173,7 +6366,11 @@ async def get_money_totals(since: str | None = None, until: str | None = None) -
         "SELECT p.currency AS currency, COUNT(*) AS cnt, "
         "COALESCE(SUM(p.amount_cents), 0) AS total_cents "
         f"FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
-        f"WHERE p.status = 'confirmed' AND {_LIVE_ORDER_PAYMENT_FILTER}"
+        f"WHERE p.status = 'confirmed' AND {_LIVE_ORDER_PAYMENT_FILTER} "
+        # Наличная строка разбивки подтверждается сдачей, и её деньги уже
+        # лежат в итоге сдач (в валюте, в которой их сдали). Посчитать ещё и
+        # платёж значило бы получить одни наличные дважды.
+        "AND NOT EXISTS (SELECT 1 FROM payment_parts pp WHERE pp.payment_id = p.id AND pp.method = 'cash')"
     )
     # Форма условия — `status = 'confirmed' AND COALESCE(confirmed_at,
     # created_at) >= / <=` — совпадает с частичным индексом
@@ -6214,27 +6411,45 @@ async def get_money_totals(since: str | None = None, until: str | None = None) -
             "total_cents": cents,
         })
 
+    # Сдачи — по валюте сдачи (`cash_deposit_currency`, нет строки — базовая):
+    # сумы, сданные в кассу, не становятся долларами.
+    from config import BASE_CURRENCY
+
     dep_sql = (
-        "SELECT COUNT(*) AS cnt, "
-        "COALESCE(SUM(amount_cents), 0) AS total_cents "
-        "FROM cash_deposits WHERE status = 'confirmed'"
+        "SELECT COALESCE(UPPER(c.currency), $1) AS currency, COUNT(*) AS cnt, "
+        "COALESCE(SUM(d.amount_cents), 0) AS total_cents "
+        "FROM cash_deposits d LEFT JOIN cash_deposit_currency c ON c.deposit_id = d.id "
+        "WHERE d.status = 'confirmed'"
     )
-    dep_params: list = []
+    dep_params: list = [(BASE_CURRENCY or "USD").upper()]
     if since:
         dep_params.append(since)
-        dep_sql += f" AND COALESCE(confirmed_at, created_at) >= ${len(dep_params)}"
+        dep_sql += f" AND COALESCE(d.confirmed_at, d.created_at) >= ${len(dep_params)}"
     if until:
         dep_params.append(until)
-        dep_sql += f" AND COALESCE(confirmed_at, created_at) <= ${len(dep_params)}"
-    dep_row = await adb_core.fetchrow(dep_sql, *dep_params)
+        dep_sql += f" AND COALESCE(d.confirmed_at, d.created_at) <= ${len(dep_params)}"
+    dep_sql += " GROUP BY COALESCE(UPPER(c.currency), $1)"
+    dep_rows = await adb_core.fetch(dep_sql, *dep_params)
+    dep_by_cur = [
+        {"currency": r["currency"], "total_cents": int(r["total_cents"] or 0), "count": int(r["cnt"] or 0)}
+        for r in dep_rows
+    ]
+    base_dep = next((d for d in dep_by_cur if d["currency"] == dep_params[0]), None)
+    dep_row = {
+        "total_cents": base_dep["total_cents"] if base_dep else 0,
+        "cnt": sum(d["count"] for d in dep_by_cur),
+    }
 
     return {
         "payments": sorted(by_currency.values(), key=lambda p: p["total_cents"], reverse=True),
         # Те же деньги, разложенные по снимку курса — для итога в базовой валюте.
         "payments_by_rate": by_rate,
         "deposits": {
-            "total_cents": int((dep_row or {}).get("total_cents") or 0),
-            "count": int((dep_row or {}).get("cnt") or 0),
+            # total_cents — сдачи в базовой валюте (прежний контракт экрана);
+            # все валюты — в by_currency.
+            "total_cents": int(dep_row["total_cents"] or 0),
+            "count": int(dep_row["cnt"] or 0),
+            "by_currency": dep_by_cur,
         },
     }
 
