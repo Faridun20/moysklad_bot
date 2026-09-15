@@ -61,9 +61,12 @@ def test_payment_below_threshold_shows_in_digest(isolated_db):
     assert "Иван" in data["payments"]["lines"][0]
 
 
-def test_payment_at_or_above_threshold_is_excluded(isolated_db):
+def test_payment_at_or_above_threshold_is_marked_not_dropped(isolated_db):
     """Крупный платёж уже ушёл немедленным пушем (notify_policy) — дайджест
-    его не дублирует, но считает в «сколько всего ждёт»."""
+    его не дублирует свежим пунктом, но и не выбрасывает молча: финдинг #6
+    (аудит) — событие может провалиться между мгновенной карточкой и
+    дайджестом, если порог/курс сменился ПОСЛЕ создания. Показываем ВСЁ
+    ждущее, крупное — с пометкой «уже приходило»."""
     from services import boss_digest as bd
 
     db = isolated_db
@@ -71,9 +74,29 @@ def test_payment_at_or_above_threshold_is_excluded(isolated_db):
     db.add_payment(10, "u", "Крупный", 9000.0, "USD", "c")
 
     data = _run(bd.gather())
-    assert data["payments"]["count"] == 1
-    assert "Крупный" not in " ".join(data["payments"]["lines"])
+    assert data["payments"]["count"] == 2
+    small_line = next(line for line in data["payments"]["lines"] if "Мелкий" in line)
+    big_line = next(line for line in data["payments"]["lines"] if "Крупный" in line)
+    assert "уже приходило" not in small_line
+    assert "уже приходило" in big_line
     assert data["payments"]["waiting_total"] == 2
+
+
+def test_threshold_change_after_creation_does_not_drop_pending_payment(isolated_db):
+    """Финдинг #6 сценарий: платёж создан ниже старого порога (остался
+    pending, мгновенная карточка не уходила), владелец ПОНИЗИЛ порог до
+    дайджеста — раньше платёж перефильтровывался ТЕКУЩИМ порогом, «выглядел»
+    уже отправленным и пропадал из дайджеста НАСОВСЕМ (ни карточкой, ни
+    сводкой). Теперь он всё равно виден — с пометкой «уже приходило»."""
+    from services import boss_digest as bd
+
+    db = isolated_db
+    db.add_payment(10, "u", "Иван", 100.0, "USD", "c")  # порог 5000 по умолчанию — pending
+    db.set_setting("boss_instant_threshold_usd", 10.0)  # понизили уже ПОСЛЕ создания
+
+    data = _run(bd.gather())
+    assert data["payments"]["count"] == 1
+    assert "Иван" in data["payments"]["lines"][0]
 
 
 def test_pending_cash_deposit_below_threshold_shows_in_digest(isolated_db):

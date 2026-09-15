@@ -181,52 +181,68 @@ async def gather() -> dict:
             if not policy.should_notify_now(kind, r.get(amount_key), cur_of(r))
         ]
 
-    payments_digest = _digest_only(payments_all, policy.PAYMENT, _payment_currency)
-    deposits_digest = _digest_only(deposits_all, policy.CASH_DEPOSIT, _deposit_currency)
-    returns_digest = _digest_only(
-        returns_all, policy.RETURN, _return_currency, amount_key="total_amount"
-    )
+    def _marked(rows: list[dict], kind: str, cur_of, amount_key: str = "amount") -> list[tuple]:
+        """Не фильтруем «ниже порога», а ПОМЕЧАЕМ (финдинг #6, аудит).
+
+        Раньше дайджест держал только то, для чего ТЕКУЩИЙ (на момент
+        прогона) порог/курс говорит «ниже» — остальное считалось «уже ушло
+        мгновенной карточкой» и молча выбрасывалось. Но решение «слать
+        сразу» принимается ОДИН раз, в момент события, по порогу/курсу ТОГО
+        момента. Владелец может поменять `boss_instant_threshold_usd` (или
+        курс валюты) ПОСЛЕ того, как событие осталось pending ниже старого
+        порога, но ДО прогона дайджеста — событие тогда не уходило карточкой
+        (порог был выше на момент создания) и пере-фильтровкой по новому
+        порогу выпадало из дайджеста тоже: пропадало насовсем, не карточкой,
+        не сводкой. Простое и надёжное правило — показывать ВСЁ ждущее,
+        помечая «уже приходило» то, что СЕЙЧАС выглядит выше порога (в
+        обычном случае это и есть уже отправленное; ложная метка — не
+        потеря, просто лишнее «уже видели» в сообщении)."""
+        return [
+            (r, policy.should_notify_now(kind, r.get(amount_key), cur_of(r)))
+            for r in rows
+        ]
+
+    payments_marked = _marked(payments_all, policy.PAYMENT, _payment_currency)
+    deposits_marked = _marked(deposits_all, policy.CASH_DEPOSIT, _deposit_currency)
+    returns_marked = _marked(returns_all, policy.RETURN, _return_currency, amount_key="total_amount")
     received_digest = _digest_only(confirmed_recent, policy.PAYMENT, _payment_currency)
 
-    def _payment_line(p: dict) -> str:
+    def _payment_line(p: dict, already: bool = False) -> str:
         part = parts.get(int(p["id"]))
         method = order_payments.METHODS.get(part["method"], "—") if part else "без способа"
         order = f" · заказ #{p['order_id']}" if p.get("order_id") else ""
+        tail = " · уже приходило" if already else ""
         return (
             f"{p.get('full_name') or p.get('user_id')} — "
-            f"{p['amount']:,.0f} {_payment_currency(p)} ({method}){order}"
+            f"{p['amount']:,.0f} {_payment_currency(p)} ({method}){order}{tail}"
         ).replace(",", " ")
 
-    def _deposit_line(d: dict) -> str:
-        return f"#{d['id']} — {d['amount']:,.0f} {_deposit_currency(d)}".replace(",", " ")
+    def _deposit_line(d: dict, already: bool = False) -> str:
+        tail = " · уже приходило" if already else ""
+        return f"#{d['id']} — {d['amount']:,.0f} {_deposit_currency(d)}{tail}".replace(",", " ")
 
-    def _return_line(r: dict) -> str:
+    def _return_line(r: dict, already: bool = False) -> str:
+        tail = " · уже приходило" if already else ""
         return (
             f"#{r['id']} · заказ #{r['order_id']} — {r['total_amount']:,.0f} "
-            f"{_return_currency(r)}"
+            f"{_return_currency(r)}{tail}"
         ).replace(",", " ")
+
+    def _block(marked: list[tuple], line_fn) -> dict:
+        n = len(marked)
+        return {
+            "count": n,
+            "waiting_total": n,
+            "lines": [line_fn(row, already) for row, already in marked[:_ITEM_CAP]],
+            "rest": max(0, n - _ITEM_CAP),
+        }
 
     return {
         "since": since,
         "until": now.strftime("%Y-%m-%d %H:%M"),
-        "payments": {
-            "count": len(payments_digest),
-            "waiting_total": len(payments_all),
-            "lines": [_payment_line(p) for p in payments_digest[:_ITEM_CAP]],
-            "rest": max(0, len(payments_digest) - _ITEM_CAP),
-        },
-        "deposits": {
-            "count": len(deposits_digest),
-            "waiting_total": len(deposits_all),
-            "lines": [_deposit_line(d) for d in deposits_digest[:_ITEM_CAP]],
-            "rest": max(0, len(deposits_digest) - _ITEM_CAP),
-        },
-        "returns": {
-            "count": len(returns_digest),
-            "waiting_total": len(returns_all),
-            "lines": [_return_line(r) for r in returns_digest[:_ITEM_CAP]],
-            "rest": max(0, len(returns_digest) - _ITEM_CAP),
-        },
+        "payments": _block(payments_marked, _payment_line),
+        "deposits": _block(deposits_marked, _deposit_line),
+        "returns": _block(returns_marked, _return_line),
         "received": {
             "count": len(received_digest),
             "by_currency": _sum_by_currency(received_digest),
