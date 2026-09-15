@@ -1122,6 +1122,10 @@ def test_deal_form_validation_keeps_machine_unsold(open_app, e2e):
 
     sheet_fill(boss, {"months": "6", "down_payment": "20000"})
     boss.click("#ms-submit")
+    # Договор рассрочки без паспорта не составить — форма требует его до запроса.
+    boss.wait_for_selector("#ms-error:has-text('Заполните: Паспорт')")
+    sheet_fill(boss, {"buyer_passport": "AA7654321"})
+    boss.click("#ms-submit")
     boss.wait_for_selector("#ms-error:has-text('Взнос не может покрывать всю цену')")
     sheet_fill(boss, {"months": "121", "down_payment": "1000"})
     boss.click("#ms-submit")
