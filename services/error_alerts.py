@@ -112,3 +112,41 @@ async def report_exception(
         except Exception:  # noqa: BLE001 — алерт не имеет права ронять обработку ошибки
             logger.warning("Не удалось отправить алерт об ошибке админу %s", admin_id)
     return delivered
+
+
+async def report_problem(title: str, lines: list[str], *, key: str) -> bool:
+    """Проблема БЕЗ исключения (расхождение схемы, не та часовая зона) —
+    ERROR в лог и (с тем же дросселем по `key`) сообщение админам.
+
+    Отдельно от `report_exception`: там отпечаток строится по трассе, а у
+    проверки на старте трассы нет — есть только вывод. Не бросает никогда:
+    проверка, уронившая старт из-за неотправленного алерта, хуже самой проблемы.
+    """
+    logger.error("%s: %s", title, "; ".join(lines))
+    try:
+        send, swallowed = _should_send(f"problem|{key}", time.monotonic())
+        if not send:
+            return False
+        admins = _admin_ids()
+        if not admins:
+            return False
+        body = [f"⚠️ <b>{esc(title)}</b>"]
+        body += [f"• {esc(redact_token(line))[:400]}" for line in lines[:15]]
+        if len(lines) > 15:
+            body.append(f"… и ещё {len(lines) - 15}")
+        if swallowed:
+            body.append(f"Повторялось ещё {swallowed} раз за {ALERT_INTERVAL_SEC // 60} мин")
+        text = "\n".join(body)
+
+        from services import notifier
+
+        delivered = False
+        for admin_id in admins:
+            try:
+                delivered = bool(await notifier.tg_send_message(admin_id, text)) or delivered
+            except Exception:  # noqa: BLE001 — алерт best-effort
+                logger.warning("Не удалось отправить алерт «%s» админу %s", title, admin_id)
+        return delivered
+    except Exception:  # noqa: BLE001 — см. докстринг
+        logger.exception("Алерт «%s» не отправлен", title)
+        return False

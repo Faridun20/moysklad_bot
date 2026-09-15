@@ -327,6 +327,22 @@ async def _startup_selfcheck():
         )
 
 
+async def _startup_environment_checks() -> None:
+    """Схема БД против определений и часовой пояс процесса против бизнес-зоны.
+
+    Обе проблемы не роняют работу сразу, а тихо портят данные — поэтому
+    громкий лог + алерт админам в момент выката, но старт продолжается
+    (`services.startup_checks`). Сама проверка не бросает; try здесь — на
+    случай поломки импорта, чтобы страховка не стала причиной падения.
+    """
+    try:
+        from services.startup_checks import run_startup_checks
+
+        await run_startup_checks(process=f"BOT_MODE={BOT_MODE}")
+    except Exception:
+        logger.exception("Проверки окружения при старте не выполнились")
+
+
 async def _run_webapp_only():
     """Режим BOT_MODE=webapp: поднимаем только FastAPI.
 
@@ -337,6 +353,7 @@ async def _run_webapp_only():
     (полезно, если парный BOT_MODE=bot процесс делает polling)."""
     await _startup_selfcheck()
     init_db()
+    await _startup_environment_checks()
     from webapp import server as webapp_server
 
     bot = None
@@ -387,6 +404,7 @@ async def main():
 
     await _startup_selfcheck()
     init_db()
+    await _startup_environment_checks()
 
     bot = Bot(token=TELEGRAM_TOKEN)
     dp = Dispatcher(storage=_build_fsm_storage())

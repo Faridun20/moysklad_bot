@@ -333,18 +333,20 @@ def _seed_currency_rates():
             logger.debug("seed currency_rates skipped (likely table not yet created)")
 
 
-def _create_tables():
-    """Только CREATE TABLE IF NOT EXISTS. Idempotent, безопасен
-    при concurrent старте."""
-    with get_conn() as conn:
-        cur = get_cursor(conn)
-        id_type = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
-        # Количества складского учёта: на Postgres NUMERIC (точная десятичная
-        # арифметика — остаток не накапливает дрейф при дробных отгрузках),
-        # на SQLite REAL (NUMERIC там всё равно сводится к REAL-аффинности).
-        qty_type = "NUMERIC" if USE_POSTGRES else "REAL"
+def _table_ddls() -> list[str]:
+    """Определения всех таблиц — ОДИН источник и для `_create_tables`, и для
+    сверки схемы при старте (`services.schema_check`): ожидаемые колонки
+    берутся отсюда же, иначе список для сверки разъехался бы с определением."""
+    id_type = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    # Количества складского учёта: на Postgres NUMERIC (точная десятичная
+    # арифметика — остаток не накапливает дрейф при дробных отгрузках),
+    # на SQLite REAL (NUMERIC там всё равно сводится к REAL-аффинности).
+    qty_type = "NUMERIC" if USE_POSTGRES else "REAL"
 
-        tables = [
+    # Элементы списка оставлены с прежним отступом (внутри скобок он не
+    # значим): определения таблиц правят параллельные ветки, и сдвиг всего
+    # списка превратил бы каждую их правку в конфликт слияния.
+    tables = [
             # deactivated_at/_by — «увольнение»: get_role отдаёт guest, пока стоит.
             """CREATE TABLE IF NOT EXISTS user_roles (
                 user_id              BIGINT PRIMARY KEY,
@@ -1142,8 +1144,16 @@ def _create_tables():
             )""",
         ]
 
+    return tables
+
+
+def _create_tables():
+    """Только CREATE TABLE IF NOT EXISTS. Idempotent, безопасен
+    при concurrent старте."""
+    with get_conn() as conn:
+        cur = get_cursor(conn)
         # Создаём каждую таблицу в отдельной транзакции
-        for sql in tables:
+        for sql in _table_ddls():
             try:
                 cur.execute(sql)
                 conn.commit()
