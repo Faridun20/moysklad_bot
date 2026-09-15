@@ -251,7 +251,7 @@ def test_bookkeeper_confirms_deposit_but_has_no_cashbox(open_app, e2e):
     # Бухгалтер не подтверждает оплаты по заказам — только сдачи и возвраты.
     assert book.locator(".pay-confirm").count() == 0
     book.click(".dep-confirm")
-    book.wait_for_function("() => window.__tgAlerts.some(a => a.includes('Сдача подтверждена'))")
+    book.wait_for_selector(".toast:has-text('Сдача подтверждена')")
     assert e2e.rows("SELECT status, confirmed_by FROM cash_deposits")[0] == {
         "status": "confirmed", "confirmed_by": e2e.ids["book"],
     }
@@ -271,10 +271,11 @@ def test_warehouse_keeper_confirms_goods_received_only(open_app, e2e):
     go(keeper, "money")  # единственная вкладка — «Подтвердить», переключателя нет
     keeper.wait_for_selector(".ret-goods")
     keeper.click(".ret-goods")
-    keeper.wait_for_function("() => window.__tgAlerts.some(a => a.includes('принят'))")
+    keeper.wait_for_selector(".toast:has-text('принят')")
     assert e2e.rows("SELECT goods_received, status FROM returns")[0] == {"goods_received": 1, "status": "pending"}
     # Подтвердить возврат кладовщик не может: ручка отвечает только руководству.
-    keeper.wait_for_selector(".ret-confirm:not([disabled])")
-    keeper.click(".ret-confirm")
-    keeper.wait_for_function("() => window.__tgAlerts.some(a => a.startsWith('❌'))")
+    # Кнопку, которая гарантированно ответит 403, не рисуем — вместо неё
+    # подпись, кто подтверждает.
+    keeper.wait_for_selector(".debt-card[data-ret] .debt-meta:has-text('подтверждает руководитель')")
+    assert keeper.locator(".ret-confirm").count() == 0
     assert e2e.rows("SELECT status FROM returns")[0]["status"] == "pending"

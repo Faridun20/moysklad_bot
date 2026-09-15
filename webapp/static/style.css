@@ -2016,6 +2016,13 @@ body.nav-drawer-open { overflow: hidden; }
 .pay-input-row .btn-mark-paid {
   flex-shrink: 0; width: auto; padding: 8px 16px;
 }
+/* «Весь остаток» — отдельная явная кнопка под полем суммы. Раньше полный
+   остаток закрывало ПУСТОЕ поле, и нераспознанная «1 500» молча становилась
+   полной оплатой. Контур — потому что фон кнопки совпадает с фоном карточки. */
+.btn-mark-paid-all {
+  margin-top: 8px; padding: 8px 16px;
+  border: 1px solid var(--divider);
+}
 .debt-breakdown {
   display: flex; flex-wrap: wrap; gap: 8px;
   font-size: 13px; color: var(--text-mute);

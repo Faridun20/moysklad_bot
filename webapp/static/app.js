@@ -68,11 +68,12 @@ document.addEventListener('keydown', (e) => {
 // Данные всё равно проверяются подписью + auth_date на сервере.
 const _SESSION_KEY = 'tg_init_data';
 let _initData = tg.initData || '';
-if (_initData) {
-  sessionStorage.setItem(_SESSION_KEY, _initData);
-} else {
-  _initData = sessionStorage.getItem(_SESSION_KEY) || '';
-}
+// sessionStorage бывает запрещён (приватный режим, политика WebView) —
+// тогда живём без кэша, а не падаем белым экраном на первой строке.
+try {
+  if (_initData) sessionStorage.setItem(_SESSION_KEY, _initData);
+  else _initData = sessionStorage.getItem(_SESSION_KEY) || '';
+} catch (_e) { /* без кэша initData */ }
 
 // Telegram Desktop передаёт initData через postMessage из родительского
 // фрейма — асинхронно, уже ПОСЛЕ того как скрипт спарсился. Повторно
@@ -81,9 +82,76 @@ function _refreshInitData() {
   const live = tg.initData || '';
   if (live && live !== _initData) {
     _initData = live;
-    sessionStorage.setItem(_SESSION_KEY, live);
+    try { sessionStorage.setItem(_SESSION_KEY, live); } catch (_e) { /* без кэша */ }
   }
   return _initData;
+}
+
+// ─── Сеть ───────────────────────────────────────────
+// Все запросы идут через один слой (net.js): таймаут, «нет связи» и истёкшая
+// сессия разбираются там, а не в каждом экране. `fetch` берём при вызове, а не
+// при создании — так его может подменить тест, а в браузере это тот же глобал.
+// Слой создаётся при первом запросе, а не при загрузке скрипта: app.js без
+// net.js (старый кэш index.html, тестовый стенд) не должен падать белым
+// экраном на верхнем уровне — запрос в async-функции уйдёт в её catch.
+// Ручки, которые собирают PDF, печатают или шлют файл в Telegram, законно
+// отвечают дольше обычного срока.
+const LONG_TIMEOUT_MS = 60000;
+let _netInst = null;
+function _net() {
+  if (!_netInst) {
+    _netInst = createNet({
+      fetch: (path, init) => fetch(path, init),
+      getInitData: () => _initData,
+      onSessionExpired: () => showSessionExpired(),
+    });
+  }
+  return _netInst;
+}
+
+// Экран «Сессия истекла». initData подписан на час (webapp/auth.py), дальше
+// любая ручка отвечает 401. Раньше человек видел английское «Invalid Telegram
+// data» в тосте и жал «Повторить» — бесполезно: подпись обновляет только
+// переоткрытие приложения. Слой — поверх всего (а не в #content): запросы,
+// которые ещё в пути, дорисовали бы свои экраны поверх сообщения. Набранные
+// формы к этому моменту уже лежат в черновиках (formDrafts) и вернутся после
+// переоткрытия.
+let _sessionExpiredShown = false;
+function showSessionExpired() {
+  // До входа (/api/me) экран рисует сам init() — в #content, там гонок нет.
+  if (_sessionExpiredShown || !currentUser) return;
+  _sessionExpiredShown = true;
+  try { clearMainButton(); } catch (_e) { /* до инициализации кнопки */ }
+  // Подтверждение закрытия (черновик заказа) здесь только мешает: закрыть —
+  // ровно то, что человеку нужно сделать.
+  try { tg.disableClosingConfirmation && tg.disableClosingConfirmation(); } catch (_e) { /* старый клиент */ }
+  const canClose = typeof tg.close === 'function';
+  const ov = document.createElement('div');
+  ov.className = 'c-overlay session-expired';
+  ov.setAttribute('role', 'alertdialog');
+  ov.setAttribute('aria-modal', 'true');
+  ov.innerHTML = `
+    <div class="error-card">
+      <div class="error-icon">${icon('lock')}</div>
+      <div class="error-title">Сессия истекла</div>
+      <div class="error-body">Закройте приложение и откройте его снова из бота. Набранные формы сохранятся.</div>
+      <button class="btn-primary" id="session-close">${canClose ? 'Закрыть приложение' : 'Обновить'}</button>
+    </div>`;
+  document.body.appendChild(ov);
+  ov.querySelector('#session-close').addEventListener('click', () => {
+    if (canClose) { try { tg.close(); return; } catch (_e) { /* вне Telegram */ } }
+    location.reload();
+  });
+}
+
+// Черновики форм текущего пользователя (см. draftStore в net.js). Ключ —
+// id пользователя из Telegram: он известен ещё до /api/me.
+function formDrafts() {
+  let storage = null;
+  try { storage = window.localStorage; } catch (_e) { /* хранилище запрещено */ }
+  const uid = (currentUser && currentUser.user_id)
+    || (tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) || '';
+  return draftStore(storage, String(uid));
 }
 
 // Состояние приложения
@@ -137,37 +205,50 @@ async function init() {
       _refreshInitData();
     }
 
-    const response = await fetch('/api/me', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData: _initData }),
-    });
+    const me = await _net().request('/api/me', {});
 
-    if (response.status === 401) {
-      const isEmpty = !_initData;
-      document.getElementById('content').innerHTML = `
-        <div class="error-card">
-          <div class="error-icon">${icon('lock')}</div>
-          <div class="error-title">Нет доступа</div>
-          <div class="error-body">${isEmpty
-            ? 'Откройте приложение через кнопку <b>«Открыть»</b> в боте — не через браузер.'
-            : 'Ошибка авторизации. Попробуйте закрыть и открыть снова.'
-          }</div>
-          <button class="btn-primary" onclick="location.reload()">Повторить</button>
-        </div>`;
+    if (me.status === 401) {
+      // Пустой initData — приложение открыли не из бота (ссылкой в браузере):
+      // переоткрытие тут не поможет, нужна кнопка в боте. Непустой, но
+      // отвергнутый — чаще всего устаревшая подпись (страницу перезагрузили,
+      // и initData взялся из кэша сессии): «Повторить» её не обновит, нужно
+      // закрыть и открыть приложение.
+      const content = document.getElementById('content');
+      if (!_initData) {
+        content.innerHTML = `
+          <div class="error-card">
+            <div class="error-icon">${icon('lock')}</div>
+            <div class="error-title">Нет доступа</div>
+            <div class="error-body">Откройте приложение через кнопку <b>«Открыть»</b> в боте — не через браузер.</div>
+            <button class="btn-primary" onclick="location.reload()">Повторить</button>
+          </div>`;
+      } else {
+        const canClose = typeof tg.close === 'function';
+        content.innerHTML = `
+          <div class="error-card">
+            <div class="error-icon">${icon('lock')}</div>
+            <div class="error-title">Сессия истекла</div>
+            <div class="error-body">Вход через Telegram не подтверждён. Закройте приложение и откройте его снова из бота.</div>
+            <button class="btn-primary" id="session-close">${canClose ? 'Закрыть приложение' : 'Обновить'}</button>
+          </div>`;
+        content.querySelector('#session-close').addEventListener('click', () => {
+          if (canClose) { try { tg.close(); return; } catch (_e) { /* вне Telegram */ } }
+          location.reload();
+        });
+      }
       return;
     }
     // 403 — подпись верна, но доступ отключён (деактивированный сотрудник).
     // Это не «нет связи» и не повод жать «Повторить»: говорим прямо.
-    if (response.status === 403) {
+    if (me.status === 403) {
       renderNoAccess('Доступ отключён. Если это ошибка — обратитесь к администратору.');
       return;
     }
-    if (!response.ok) {
-      throw new Error(`Ошибка сервера (${response.status})`);
+    if (!me.ok) {
+      throw netError(me);
     }
 
-    currentUser = await response.json();
+    currentUser = me.body;
     renderHeader();
     if (currentUser.role === 'guest') {
       renderNoAccess();
@@ -836,30 +917,30 @@ async function renderHome() {
   // Очередь доступна всем рабочим ролям, сводка выручки — только тем, кому
   // отвечает /api/home. Кладовщик и бухгалтер получают экран из одной очереди,
   // а не отказ вместо всего раздела.
-  const canSeeHome = ['admin', 'boss', 'manager'].includes(role());
-  const queuePromise = api('/api/today', {}).catch(() => ({ queue: [] }));
+  const canSeeHome = canCall('/api/home', role());
+  // Очередь у руководства — надстройка над сводкой: её сбой не уносит экран.
+  // У кладовщика и бухгалтера очередь и есть весь экран — там сбой показываем
+  // ошибкой (ниже), иначе без сети он читался бы как «дел нет».
+  const queuePromise = api('/api/today', {}).then(
+    d => d, e => (canSeeHome ? { queue: [] } : { error: e }));
 
   let data = null;
   if (canSeeHome) {
     try {
-      const r = await fetch('/api/home', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ initData: _initData }),
-      });
-      if (!r.ok) {
-        const err = await r.json().catch(() => ({}));
-        throw new Error(err.detail || `HTTP ${r.status}`);
-      }
-      data = await r.json();
+      data = await api('/api/home', {});
     } catch (e) {
       content.innerHTML = errorBox(e.message);
       return;
     }
   }
-  const queue = (await queuePromise).queue || [];
+  const queueRes = await queuePromise;
+  const queue = queueRes.queue || [];
 
   if (!data) {
+    if (queueRes.error) {
+      content.innerHTML = errorBox(queueRes.error.message);
+      return;
+    }
     // Роль без сводки: экран — это очередь и ничего больше. Приветствие
     // одно — в шапке (renderHeader), отдельным заголовком не дублируем.
     content.innerHTML = workQueueHtml(queue);
@@ -1008,16 +1089,7 @@ async function renderStock() {
   // вкладки (категория, поиск, «Показать ещё») — они в сеть не ходят и не
   // мигают загрузкой.
   try {
-    const r = await fetch('/api/stock', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData: _initData }),
-    });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      throw new Error(err.detail || 'Ошибка загрузки склада');
-    }
-    stockData = await r.json();
+    stockData = await api('/api/stock', {});
   } catch (e) {
     content.innerHTML = stockShellHtml() + errorBox(e.message);
     wireSectionNav(content, 'stock', renderStockScreen);
@@ -2602,13 +2674,12 @@ function wirePhotoDelete(root, endpoint, bodyFor, onDone) {
 async function loadPhotos(root, endpoint, bodyFor) {
   for (const btn of (root || document).querySelectorAll('.machine-photo[data-photo]')) {
     try {
-      const r = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ initData: _initData, ...bodyFor(Number(btn.dataset.photo)) }),
-      });
-      if (!r.ok) throw new Error('нет фото');
-      const url = URL.createObjectURL(await r.blob());
+      // raw: байты картинки, а не JSON. Срок длиннее обычного — снимок
+      // тянется из Telegram через нашу ручку.
+      const res = await _net().request(endpoint, bodyFor(Number(btn.dataset.photo)),
+                                     { raw: true, timeoutMs: LONG_TIMEOUT_MS });
+      if (!res.ok) throw new Error('нет фото');
+      const url = URL.createObjectURL(await res.response.blob());
       _photoUrls.push(url);
       const img = btn.querySelector('img');
       if (img) img.src = url;
@@ -2698,12 +2769,13 @@ function pickPhotos(endpoint, body, onDone) {
         failed.push(`${files[i].name}: ${e.message}`);
         continue;
       }
-      let res = await apiResult(endpoint, { ...body, data_url: dataUrl });
+      // Снимок до мегабайта по мобильной сети — 20 секунд на него мало.
+      let res = await apiResult(endpoint, { ...body, data_url: dataUrl }, { timeoutMs: 90000 });
       if (!res.ok) {
         // Одна повторная попытка: на длинной пачке Telegram притормаживает
         // отправку, и это проходит само за секунду-другую.
         await new Promise(r => setTimeout(r, 1500));
-        res = await apiResult(endpoint, { ...body, data_url: dataUrl });
+        res = await apiResult(endpoint, { ...body, data_url: dataUrl }, { timeoutMs: 90000 });
       }
       if (!res.ok) failed.push(`${files[i].name}: ${res.error}`);
       else if (res.body.duplicate) duplicates += 1;
@@ -3265,28 +3337,13 @@ const STATUS_NAME = {
   cancelled: 'Отменён',
 };
 
-async function api(path, body) {
-  let r;
-  try {
-    r = await fetch(path, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData: _initData, ...body }),
-    });
-  } catch {
-    // fetch отклоняется только при сетевом сбое (нет интернета, CORS, abort) —
-    // не при HTTP-ошибке. Помечаем, чтобы errorBox показал «нет связи».
-    const err = new Error('Нет подключения к интернету');
-    err.network = true;
-    throw err;
-  }
-  if (!r.ok) {
-    // Тело ошибки может быть не-JSON (502/HTML от прокси) — не падаем на парсе.
-    let detail = `Ошибка сервера (${r.status})`;
-    try { detail = (await r.json()).detail || detail; } catch { /* не-JSON */ }
-    throw new Error(detail);
-  }
-  return r.json();
+// Запрос с разбором ошибок в исключение. Таймаут, «нет связи» и истёкшая
+// сессия — в сетевом слое (net.js); здесь только форма результата.
+// `opts.timeoutMs` — для заведомо долгих ручек (выгрузка Excel, фото).
+async function api(path, body, opts) {
+  const res = await _net().request(path, body, opts);
+  if (!res.ok) throw netError(res);
+  return res.body;
 }
 
 // Тот же запрос, но с полным телом ответа вместо исключения.
@@ -3296,25 +3353,8 @@ async function api(path, body) {
 // `current` (машину уже перевели в другой статус) — по ним форма предлагает
 // действие, а не просто печатает текст. Отдельная функция, а не перепись
 // `api()`: у полусотни её вызовов поведение «бросай на ошибке» правильное.
-async function apiResult(path, body) {
-  let r;
-  try {
-    r = await fetch(path, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData: _initData, ...body }),
-    });
-  } catch {
-    return { ok: false, status: 0, body: {}, error: 'Нет подключения к интернету' };
-  }
-  let data = {};
-  try { data = await r.json(); } catch { /* не-JSON: 502/HTML от прокси */ }
-  return {
-    ok: r.ok,
-    status: r.status,
-    body: data,
-    error: data.detail || `Ошибка сервера (${r.status})`,
-  };
+async function apiResult(path, body, opts) {
+  return _net().request(path, body, opts);
 }
 
 // Ключ идемпотентности для денежных действий: защищает от double-submit
@@ -3543,55 +3583,23 @@ function orderDateLabel(key) {
   return formatDateRU(key);
 }
 
-async function renderOrders() {
-  const content = document.getElementById('content');
-  const gen = screenGen();
-  // Кэш заказов: переключение вкладок (Заказы↔Каталог↔Финансы) не должно
-  // каждый раз дёргать /api/orders. Мутации (delete/ship/cancel) ставят
-  // ordersData = null — это форсит свежую загрузку ниже.
-  if (!ordersData || Date.now() - ordersDataTs > ORDERS_TTL_MS) {
-    content.innerHTML = salesShellHtml() + loading('Загружаю заказы…');
-    wireSectionNav(content, 'sales', renderSalesScreen);
-    try {
-      ordersData = await api('/api/orders', {});
-      ordersDataTs = Date.now();
-    } catch (e) {
-      content.innerHTML = salesShellHtml() + errorBox(e.message);
-      wireSectionNav(content, 'sales', renderSalesScreen);
-      return;
-    }
-  }
-  // Пока грузились, человек ушёл (другой раздел или вкладка «Отчёт») —
-  // renderOrdersMain ищет #content заново и затёр бы чужой экран.
-  if (gen !== screenGen()) return;
-  renderOrdersMain();
-}
+// ─── Страницы списка заказов ─────────────────────────
+// /api/orders отдавал все заказы роли разом, с позициями: у руководства за год
+// это мегабайты на каждый вход во вкладку по мобильной сети. Теперь список
+// приходит страницами, а фильтры статуса и периода уходят на сервер — иначе
+// «Показать ещё» листал бы нефильтрованный список, и под фильтром на странице
+// оставалась бы пара заказов из пятидесяти.
+const ORDERS_PAGE_SIZE = 50;
 
-function renderOrdersMain() {
-  // Список заказов — корневой вид вкладки. Прячем нативную «Назад»
-  // на случай возврата из вложенного экрана (редактор, заявки).
-  hideBack();
-  const content = document.getElementById('content');
-  const { orders, role } = ordersData;
-  const isBoss = role === 'admin' || role === 'boss';
-  // roleIn: менеджер пока отгружает за кладовщика (ROLE_ALSO_ACTS_AS).
-  const canShip = isBoss || roleIn(role, ['warehouse_keeper']);
-  // «Новый заказ» — только менеджеру. Было `!isBoss`, то есть и кладовщику с
-  // бухгалтером, а /api/orders/create им отвечает 403 (can_create_orders:
-  // admin/boss/manager). Руководству кнопку не рисуем и раньше: заказы
-  // заводят менеджеры, руководство их разбирает.
-  const canCreate = role === 'manager';
-
-  // Боссу фильтр «черновики» бесполезен (это незавершённые заявки менеджеров) —
-  // заменяем на «отгружено». Менеджеру черновики нужны (свои незаконченные).
-  // Короткие подписи вместо одних иконок (UI-бриф п.5): часы/галочка/грузовик
-  // без слов приходилось расшифровывать. Ряд скроллится, если не влезает.
-  // «Отменены» — это оба исхода «продажа не состоялась»: заявку отклонили
-  // (rejected) или одобренный заказ отменили (cancelled). Фильтр искал только
-  // rejected, и отменённый боссом заказ не находился ни под одной кнопкой,
-  // кроме «Все». Какой именно исход — видно по бейджу статуса на карточке.
-  const CANCELLED_STATUSES = ['rejected', 'cancelled'];
-  const filters = isBoss
+// Фильтры статуса по роли. Боссу «черновики» бесполезны (это незавершённые
+// заявки менеджеров) — вместо них «отгружено»; менеджеру черновики нужны.
+// «Отменены» — оба исхода «продажа не состоялась»: заявку отклонили
+// (rejected) или одобренный заказ отменили (cancelled). Фильтр искал только
+// rejected, и отменённый боссом заказ не находился ни под одной кнопкой,
+// кроме «Все». Какой именно исход — видно по бейджу статуса на карточке.
+const CANCELLED_STATUSES = ['rejected', 'cancelled'];
+function orderFilters(isBoss) {
+  return isBoss
     ? [
         { id: 'all', label: 'Все', ic: '' },
         { id: 'pending', label: 'Ждут', ic: 'clock' },
@@ -3606,6 +3614,121 @@ function renderOrdersMain() {
         { id: 'approved', label: 'Одобрены', ic: 'check' },
         { id: 'rejected', label: 'Отменены', ic: 'close', statuses: CANCELLED_STATUSES },
       ];
+}
+
+// Период фильтра → даты YYYY-MM-DD. Считает ТЕЛЕФОН, а не сервер: «сегодня»
+// у человека на площадке, пояс сервера может быть другим. Та же арифметика,
+// что в orderInPeriod (тот остаётся проверкой уже загруженной страницы).
+function orderPeriodRange(period, now) {
+  const today = now || new Date();
+  if (period === 'custom') {
+    return { date_from: currentOrderFrom || '', date_to: currentOrderTo || '' };
+  }
+  if (period === 'today') return { date_from: _ymd(today), date_to: _ymd(today) };
+  if (period === '7d' || period === '30d') {
+    const cutoff = new Date(today);
+    cutoff.setDate(today.getDate() - ((period === '7d' ? 7 : 30) - 1));
+    return { date_from: _ymd(cutoff), date_to: '' };
+  }
+  return { date_from: '', date_to: '' };
+}
+
+// Запрос первой страницы под текущие фильтры. Роль берём из /api/me: набор
+// фильтров зависит от неё ещё до первого ответа списка.
+function ordersQuery() {
+  const isBoss = ['admin', 'boss'].includes(role());
+  const f = orderFilters(isBoss).find(x => x.id === currentOrderFilter);
+  const statuses = (currentOrderFilter === 'all' || !f) ? [] : (f.statuses || [f.id]);
+  return { statuses, ...orderPeriodRange(currentOrderPeriod) };
+}
+
+async function renderOrders() {
+  const content = document.getElementById('content');
+  const gen = screenGen();
+  const query = ordersQuery();
+  const key = JSON.stringify(query);
+  // Кэш заказов: переключение вкладок (Заказы↔Каталог↔Финансы) не должно
+  // каждый раз дёргать /api/orders. Мутации (delete/ship/cancel) ставят
+  // ordersData = null — это форсит свежую загрузку ниже. Смена фильтра —
+  // другой запрос: кэш под старым ключом не годится.
+  const stale = !ordersData || Date.now() - ordersDataTs > ORDERS_TTL_MS
+    || (ordersData.queryKey !== undefined && ordersData.queryKey !== key);
+  if (stale) {
+    if (ordersData) {
+      // Фильтры уже на экране — не прячем их за спиннером: переключатели
+      // остаются, список на время запроса — скелетон.
+      renderOrdersMain({ loading: true });
+    } else {
+      content.innerHTML = salesShellHtml() + loading('Загружаю заказы…');
+      wireSectionNav(content, 'sales', renderSalesScreen);
+    }
+    let page;
+    try {
+      page = await api('/api/orders', { ...query, limit: ORDERS_PAGE_SIZE, offset: 0 });
+    } catch (e) {
+      if (gen !== screenGen()) return;
+      const box = document.getElementById('content');
+      box.innerHTML = salesShellHtml() + errorBox(e.message);
+      wireSectionNav(box, 'sales', renderSalesScreen);
+      return;
+    }
+    // Пока ждали, человек нажал другой фильтр: этот ответ уже не про экран,
+    // его место займёт ответ на новый запрос.
+    if (JSON.stringify(ordersQuery()) !== key) return;
+    ordersData = { ...page, queryKey: key };
+    ordersDataTs = Date.now();
+  }
+  // Пока грузились, человек ушёл (другой раздел или вкладка «Отчёт») —
+  // renderOrdersMain ищет #content заново и затёр бы чужой экран.
+  if (gen !== screenGen()) return;
+  renderOrdersMain();
+}
+
+// «Показать ещё»: следующая страница под теми же фильтрами дописывается в
+// конец. Между страницами могли появиться новые заказы и сдвинуть смещение —
+// повторы отсекаем по id, чтобы карточка не задвоилась.
+async function loadMoreOrders(btn) {
+  if (!ordersData || !ordersData.has_more) return;
+  const key = ordersData.queryKey;
+  const gen = screenGen();
+  if (btn) { btn.disabled = true; btn.textContent = 'Загружаю…'; }
+  try {
+    const page = await api('/api/orders', {
+      ...ordersQuery(), limit: ORDERS_PAGE_SIZE, offset: ordersData.next_offset || ordersData.orders.length,
+    });
+    if (gen !== screenGen() || !ordersData || ordersData.queryKey !== key) return;
+    const seen = new Set(ordersData.orders.map(o => o.id));
+    ordersData = {
+      ...ordersData,
+      ...page,
+      orders: ordersData.orders.concat((page.orders || []).filter(o => !seen.has(o.id))),
+      queryKey: key,
+    };
+    renderOrdersMain();
+  } catch (e) {
+    toast(e.message, 'error');
+    if (btn) { btn.disabled = false; btn.textContent = 'Показать ещё'; }
+  }
+}
+
+function renderOrdersMain(opts = {}) {
+  // Список заказов — корневой вид вкладки. Прячем нативную «Назад»
+  // на случай возврата из вложенного экрана (редактор, заявки).
+  hideBack();
+  const content = document.getElementById('content');
+  const { orders, role } = ordersData;
+  const isBoss = role === 'admin' || role === 'boss';
+  // roleIn: менеджер пока отгружает за кладовщика (ROLE_ALSO_ACTS_AS).
+  const canShip = isBoss || roleIn(role, ['warehouse_keeper']);
+  // «Новый заказ» — только менеджеру. Было `!isBoss`, то есть и кладовщику с
+  // бухгалтером, а /api/orders/create им отвечает 403 (can_create_orders:
+  // admin/boss/manager). Руководству кнопку не рисуем и раньше: заказы
+  // заводят менеджеры, руководство их разбирает.
+  const canCreate = role === 'manager';
+
+  // Короткие подписи вместо одних иконок (UI-бриф п.5): часы/галочка/грузовик
+  // без слов приходилось расшифровывать. Ряд скроллится, если не влезает.
+  const filters = orderFilters(isBoss);
 
   // Единый язык навигации со всеми экранами: статус и период — сегменты
   // .seg / .seg-item по одной строке каждый, без заголовков «СТАТУС»/«ПЕРИОД»
@@ -3643,7 +3766,10 @@ function renderOrdersMain() {
     orderInPeriod(o.created_at, currentOrderPeriod)
   );
 
-  const list = filtered.length === 0
+  // Пока сервер отвечает на новый фильтр, старую страницу не фильтруем на
+  // месте: она собрана под ДРУГОЙ запрос, и под фильтром мелькало бы «Нет
+  // заказов», хотя они есть на сервере.
+  const list = opts.loading ? skeleton('list', 3) : filtered.length === 0
     ? emptyState({
         icon: 'list',
         title: 'Нет заказов',
@@ -3731,7 +3857,17 @@ function renderOrdersMain() {
   // Заявки на рассмотрении — обычная строка-ссылка с бейджем-счётчиком, и
   // только когда заявки есть (UI-бриф п.5): жёлтая плашка была единственным
   // жёлтым элементом приложения и читалась как предупреждение.
-  const pendingCount = isBoss ? orders.filter(o => o.status === 'pending').length : 0;
+  // Счётчик — с сервера по ВСЕМ заказам: на странице с фильтром «Отгружены»
+  // или без второй страницы локальный подсчёт врал бы. Старый ответ без
+  // страниц — считаем по тому, что есть.
+  const pendingCount = !isBoss ? 0
+    : (ordersData.pending_count != null ? ordersData.pending_count
+      : orders.filter(o => o.status === 'pending').length);
+  const moreLeft = ordersData.has_more
+    ? Math.max(0, (ordersData.total || 0) - orders.length) : 0;
+  const moreRow = ordersData.has_more && !opts.loading
+    ? `<button class="btn-secondary" id="orders-more">Показать ещё${moreLeft ? ` (${moreLeft})` : ''}</button>`
+    : '';
   const requestsRow = pendingCount ? `
     <div class="c-surface c-surface--list">
       <div class="c-row c-row--tap" id="show-requests" role="button" tabindex="0" data-status="pending">
@@ -3752,15 +3888,20 @@ function renderOrdersMain() {
     ${canCreate ? `<button class="btn-new-order" id="btn-new-order">${icon('plus')} Новый заказ</button>` : ''}
     ${requestsRow}
     <div class="orders-list">${list}</div>
+    ${moreRow}
   `;
   wireSectionNav(content, 'sales', renderSalesScreen);   // UI-BUG-04: шелл — часть шаблона, значит и проводка тоже
+  document.getElementById('orders-more')?.addEventListener('click', (ev) => {
+    haptic('light');
+    loadMoreOrders(ev.currentTarget);
+  });
 
   // Фильтры по статусу (сегмент).
   document.querySelectorAll('.seg-item[data-filter]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
       currentOrderFilter = btn.dataset.filter;
-      renderOrdersMain();
+      renderOrders();
     });
   });
 
@@ -3769,7 +3910,7 @@ function renderOrdersMain() {
     btn.addEventListener('click', () => {
       haptic('light');
       currentOrderPeriod = btn.dataset.operiod;
-      renderOrdersMain();
+      renderOrders();
     });
   });
 
@@ -3779,7 +3920,7 @@ function renderOrdersMain() {
       (from, to) => {
         currentOrderFrom = from;
         currentOrderTo = to;
-        renderOrdersMain();
+        renderOrders();
       });
   }
 
@@ -4701,18 +4842,9 @@ async function renderSalesReport() {
   const gen = screenGen();
   try {
     const body = custom
-      ? { initData: _initData, since: analyticsSince, until: _nextDay(analyticsUntil) }
-      : { initData: _initData, period: analyticsPeriod };
-    const response = await fetch('/api/analytics', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) {
-      const err = await response.json();
-      throw new Error(err.detail || 'Ошибка');
-    }
-    const data = await response.json();
+      ? { since: analyticsSince, until: _nextDay(analyticsUntil) }
+      : { period: analyticsPeriod };
+    const data = await api('/api/analytics', body);
     analyticsCache[cacheKey] = { ts: Date.now(), data };
     lastAnalyticsData = data;
     // renderAnalyticsContent ищет #content заново — не пишем в чужой экран.
@@ -4910,7 +5042,7 @@ function renderAnalyticsContent(data) {
         const exportBody = (analyticsPeriod === 'custom' && analyticsSince && analyticsUntil)
           ? { since: analyticsSince, until: _nextDay(analyticsUntil) }
           : { period: analyticsPeriod };
-        await api('/api/analytics/export', exportBody);
+        await api('/api/analytics/export', exportBody, { timeoutMs: 90000 });
         exportBtn.innerHTML = `${icon('check')} Отправлено в чат`;
         tg.showAlert && tg.showAlert('Excel-файл отправлен в чат с ботом');
       } catch (e) {
@@ -4956,11 +5088,17 @@ async function renderMoneyReport(container) {
     : { period: analyticsPeriod };
   let summary = null;
   let history = [];
+  let historyError = null;
   try {
     summary = await api('/api/money/summary', periodBody);
     // Лента — за ТОТ ЖЕ период, что и итог (WP-11), иначе под заголовком периода
-    // висели движения за всё время.
-    history = (await api('/api/cash/history', periodBody).catch(() => ({ history: [] }))).history || [];
+    // висели движения за всё время. Её сбой не уносит итоги, но и не
+    // притворяется «Движений пока нет» — это была бы ложь про кассу.
+    try {
+      history = (await api('/api/cash/history', periodBody)).history || [];
+    } catch (e) {
+      historyError = e;
+    }
   } catch (e) {
     content.innerHTML = reportHeaderHtml() + errorBox(e.message);
     wireReportHeader(content, () => renderMoneyReport(content));
@@ -4976,13 +5114,17 @@ async function renderMoneyReport(container) {
     renderMoneyTotalsHtml(summary) +
     '<div id="money-insights">' + skeleton('list', 3) + '</div>' +
     '<div class="section-label">Движение денег</div>' +
-    cashHistoryHtml(history);
+    (historyError
+      ? errorBoxHtml(historyError.message, { retryAttr: 'data-history-retry="1"' })
+      : cashHistoryHtml(history));
   wireReportHeader(content, () => renderMoneyReport(content));
+  content.querySelector('[data-history-retry]')?.addEventListener('click', () => renderMoneyReport(content));
 
   const box = content.querySelector('#money-insights');
   if (!box) return;
   try {
     box.innerHTML = await moneyInsightsHtml();
+    box.querySelector('[data-insights-retry]')?.addEventListener('click', () => renderMoneyReport(content));
   } catch {
     // Разделы аналитики — надстройка: их сбой не должен уносить поступления,
     // которые уже на экране.
@@ -5020,11 +5162,18 @@ function receivableTotalsHtml(totals) {
 // платежи». Каждый грузится своей ручкой и деградирует молча: сбой прогноза не
 // должен уносить экран поступлений.
 async function moneyInsightsHtml() {
+  let failed = null;
+  const soft = (p) => p.catch((e) => { failed = e; return null; });
   const [rec, fc, disc] = await Promise.all([
-    api('/api/money/receivables', {}).catch(() => null),
-    api('/api/money/forecast', { months: 6 }).catch(() => null),
-    api('/api/money/discipline', {}).catch(() => null),
+    soft(api('/api/money/receivables', {})),
+    soft(api('/api/money/forecast', { months: 6 })),
+    soft(api('/api/money/discipline', {})),
   ]);
+  // Все три ручки упали — это не «данных нет», а нет связи/сбой: скажем прямо
+  // и дадим повторить. Один упавший раздел по-прежнему просто не рисуется.
+  if (failed && !rec && !fc && !disc) {
+    return errorBoxHtml(failed.message, { retryAttr: 'data-insights-retry="1"' });
+  }
   let html = '';
   if (rec) {
     html += receivableTotalsHtml(rec.totals);
@@ -5996,26 +6145,16 @@ async function renderMoneyScreen() {
   }
 
   // Бейдж ожидающих подтверждений — освежаем АСИНХРОННО, чтобы зависший запрос
-  // не блокировал появление вкладок. Обновляем счётчик на месте.
-  if (isConfirmer) {
-    const cnt = (p, k) => api(p, {}).then(res => (res[k] || []).length).catch(() => 0);
-    const parts = [cnt('/api/deposits/pending', 'deposits'), cnt('/api/returns/pending', 'returns')];
-    if (boss) parts.push(cnt('/api/payments/pending', 'pending'));
-    Promise.all(parts).then(arr => {
-      const n = arr.reduce((a, b) => a + b, 0);
-      financePendCache = n;
-      if (currentScreen !== 'money') return;
-      const pill = content.querySelector('.seg-item[data-sect="confirm"]');
-      if (!pill) return;
-      const old = pill.querySelector('.stock-badge');
-      if (old) old.remove();
-      if (n) {
-        const b = document.createElement('span');
-        b.className = 'stock-badge badge-yellow';
-        b.textContent = n;
-        pill.appendChild(b);
-      }
-    });
+  // не блокировал появление вкладок. На самой вкладке «Подтвердить» отдельного
+  // подсчёта нет: тело грузит те же списки, и счётчик берётся из них
+  // (renderCashbox → setConfirmBadge) — раньше каждый вход в «Деньги» тянул
+  // одни и те же три списка дважды.
+  if (isConfirmer && moneyTab !== 'confirm') {
+    const lists = pendingListsFor(r);
+    Promise.all(lists.map(l => api(l.path, {}).then(res => (res[l.key] || []).length)))
+      .then(arr => setConfirmBadge(content, arr.reduce((a, b) => a + b, 0)))
+      // Сбой счётчика — не повод рисовать «0»: остаётся последнее известное.
+      .catch(() => {});
   }
 
   const body = document.getElementById('money-body');
@@ -6027,6 +6166,33 @@ async function renderMoneyScreen() {
   else {
     await renderCashbox(body, moneyTab);  // confirm | ops
     if (moneyTab === 'ops' && typeof accMountToggle === 'function') accMountToggle(body);
+  }
+}
+
+// Списки «ждут подтверждения», которые роль реально может получить. Кладовщику
+// /api/deposits/pending отвечает 403, бухгалтеру — /api/returns/pending; раньше
+// оба запроса уходили всем подтверждающим, отказ глотался и выглядел как
+// «записей нет».
+function pendingListsFor(r) {
+  return [
+    { path: '/api/payments/pending', key: 'pending' },
+    { path: '/api/deposits/pending', key: 'deposits' },
+    { path: '/api/returns/pending', key: 'returns' },
+  ].filter(l => canCall(l.path, r));
+}
+
+function setConfirmBadge(root, n) {
+  financePendCache = n;
+  if (currentScreen !== 'money') return;
+  const pill = (root || document).querySelector('.seg-item[data-sect="confirm"]');
+  if (!pill) return;
+  const old = pill.querySelector('.stock-badge');
+  if (old) old.remove();
+  if (n) {
+    const b = document.createElement('span');
+    b.className = 'stock-badge badge-yellow';
+    b.textContent = n;
+    pill.appendChild(b);
   }
 }
 
@@ -6046,23 +6212,34 @@ async function renderCashbox(container, section) {
   const canDeposit = role === 'manager';
   const isBoss = role === 'admin' || role === 'boss';
 
-  // Тянем ТОЛЬКО то, что нужно активной секции (раньше грузилось всё сразу).
+  // Тянем ТОЛЬКО то, что нужно активной секции и что роль может получить.
+  // Сбой загрузки — ошибка с «Повторить», а НЕ пустой список: без сети экран
+  // говорил «Нет записей на подтверждении», и бухгалтер уходил, не подтвердив
+  // сдачу, которая его ждала.
   let deposits = [];
   let returns = [];
   let myDeposits = [];
   let payPending = [];   // paid-заказы с pending-оплатой (подтверждает босс)
-  const _grab = (path, key) => api(path, {}).then(r => r[key] || []).catch(() => []);
+  const _grab = (path, key) => api(path, {}).then(r => r[key] || []);
   const tasks = [];
   if (section === 'confirm') {
-    tasks.push(_grab('/api/deposits/pending', 'deposits').then(v => { deposits = v; }));
-    tasks.push(_grab('/api/returns/pending', 'returns').then(v => { returns = v; }));
-    if (isBoss) tasks.push(_grab('/api/payments/pending', 'pending').then(v => { payPending = v; }));
+    const want = new Set(pendingListsFor(role).map(l => l.path));
+    if (want.has('/api/deposits/pending')) tasks.push(_grab('/api/deposits/pending', 'deposits').then(v => { deposits = v; }));
+    if (want.has('/api/returns/pending')) tasks.push(_grab('/api/returns/pending', 'returns').then(v => { returns = v; }));
+    if (want.has('/api/payments/pending')) tasks.push(_grab('/api/payments/pending', 'pending').then(v => { payPending = v; }));
   }
   // «Мои сдачи» — секция внутри «Платежи и сдачи» (ops) для тех, кто сдаёт.
   if (section === 'ops' && canDeposit) {
     tasks.push(_grab('/api/deposits/my', 'deposits').then(v => { myDeposits = v; }));
   }
-  await Promise.all(tasks);
+  try {
+    await Promise.all(tasks);
+  } catch (e) {
+    container.innerHTML = errorBoxHtml(e.message, { retryAttr: 'data-cash-retry="1"' });
+    container.querySelector('[data-cash-retry]')?.addEventListener('click', () => renderCashbox(container, section));
+    return;
+  }
+  if (section === 'confirm') setConfirmBadge(null, deposits.length + returns.length + payPending.length);
 
   const depCards = deposits.map(d => {
     const orders = (d.orders || [])
@@ -6086,6 +6263,11 @@ async function renderCashbox(container, section) {
     `;
   }).join('');
 
+  // Приёмку товара отмечает склад, а деньги по возврату подтверждает только
+  // руководство (/api/returns/confirm — admin/boss). Кладовщику кнопка
+  // «Подтвердить возврат» раньше рисовалась и отвечала 403.
+  const canConfirmReturn = canCall('/api/returns/confirm', role);
+  const canMarkGoods = canCall('/api/returns/goods_received', role);
   const retCards = returns.map(r => `
       <div class="debt-card" data-ret="${r.id}">
         <div class="debt-card-top">
@@ -6098,12 +6280,12 @@ async function renderCashbox(container, section) {
         <div class="debt-actions">
           ${r.goods_received
             ? `<span class="debt-meta">${icon('check')} Товар принят</span>`
-            : `<button class="btn-reject-pay ret-goods">${icon('box')} Товар получен</button>`}
-          <button class="btn-confirm-pay ret-confirm" ${r.goods_received ? '' : 'disabled'}>
+            : canMarkGoods ? `<button class="btn-reject-pay ret-goods">${icon('box')} Товар получен</button>` : ''}
+          ${canConfirmReturn ? `<button class="btn-confirm-pay ret-confirm" ${r.goods_received ? '' : 'disabled'}>
             ${icon('check')} Подтвердить возврат
-          </button>
+          </button>` : `<span class="debt-meta">Деньги подтверждает руководитель</span>`}
         </div>
-        ${r.goods_received ? '' : `
+        ${r.goods_received || !canConfirmReturn ? '' : `
           <div class="debt-card-mid">
             <span class="debt-meta">Сначала отметьте приёмку товара — иначе деньги
             уйдут из кассы за непривезённый товар.</span>
@@ -6152,7 +6334,7 @@ async function renderCashbox(container, section) {
       <div class="card">
         <div class="form-row">
           <label class="form-label" for="dep-amount">Сумма (${baseCur()})</label>
-          <input type="number" id="dep-amount" class="form-input" placeholder="500" inputmode="decimal">
+          <input type="text" id="dep-amount" class="form-input" placeholder="500" inputmode="decimal" autocomplete="off">
         </div>
         <button id="dep-create" class="btn-primary">${icon('cash')} Сдать в кассу</button>
         <div class="debt-hint">Распределится по вашим открытым заказам автоматически.</div>
@@ -6178,7 +6360,7 @@ async function renderCashbox(container, section) {
   // уведомление боссу с кнопкой на каждый). Строки добавляются динамически.
   const payRowHtml = (cur) => `
       <div class="form-row pay-row">
-        <input type="number" class="form-input pay-row-amount" placeholder="1500" inputmode="decimal">
+        <input type="text" class="form-input pay-row-amount" placeholder="1 500" inputmode="decimal" autocomplete="off">
         <div class="seg pay-row-cur" data-cur="${cur || 'USD'}">
           ${['USD', 'UZS'].map(c =>
             `<button type="button" class="seg-item ${c === (cur || 'USD') ? 'active' : ''}" data-cur-opt="${c}" aria-pressed="${c === (cur || 'USD')}">${c}</button>`
@@ -6186,7 +6368,9 @@ async function renderCashbox(container, section) {
         </div>
         <button class="cur-btn pay-row-del" title="Убрать строку">${icon('close')}</button>
       </div>`;
-  const payFormBlock = !isBoss ? `
+  // Ручка отвечает admin/manager: бухгалтеру и кладовщику форма отправляла бы
+  // в 403. Руководству форма не нужна — оно подтверждает.
+  const payFormBlock = (!isBoss && canCall('/api/payments/send', role)) ? `
       <div class="section-label">Новый платёж (не связан с заказом)</div>
       <div class="card">
         <div id="pay-rows">${payRowHtml('USD')}</div>
@@ -6201,7 +6385,7 @@ async function renderCashbox(container, section) {
   ` : '';
 
   // Блок оформления возврата (менеджер/кладовщик/босс).
-  const canReturn = ['admin', 'boss', 'warehouse_keeper', 'manager'].includes(role);
+  const canReturn = canCall('/api/returns/create', role);
   const returnBlock = canReturn ? `
       <div class="section-label">Оформить возврат</div>
       <div class="c-surface c-surface--pad">
@@ -6240,6 +6424,52 @@ async function renderCashbox(container, section) {
                       hint: 'Сдачи, платежи и возвраты появятся здесь, как только их оформят.' });
   }
   container.innerHTML = bodyHtml;
+
+  // Черновики форм «Кассы» (платёж, сдача, возврат) — см. formDrafts. Час
+  // жизни подписи Telegram истекал посреди заполнения, и после переоткрытия
+  // сумма, валюты и комментарий пропадали. Пишем на каждый ввод, стираем часть
+  // черновика после успешной отправки этой формы.
+  const CASH_DRAFT = 'cash-forms';
+  const cashDrafts = formDrafts();
+  const collectCash = () => {
+    const d = {};
+    const rows = container.querySelectorAll('.pay-row');
+    if (rows.length) {
+      d.pay = {
+        rows: Array.from(rows).map(r => ({
+          amount: r.querySelector('.pay-row-amount').value,
+          currency: r.querySelector('.pay-row-cur').dataset.cur,
+        })),
+        comment: container.querySelector('#pay-comment')?.value || '',
+      };
+    }
+    const dep = container.querySelector('#dep-amount');
+    if (dep) d.dep = { amount: dep.value };
+    const retOrder = container.querySelector('#ret-order');
+    if (retOrder) {
+      d.ret = {
+        order: retOrder.value,
+        reason: container.querySelector('#ret-reason')?.value || '',
+        refund: selectedRefund,
+      };
+    }
+    return d;
+  };
+  const cashFilled = (d) => !!(
+    (d.pay && (d.pay.comment || d.pay.rows.some(r => String(r.amount).trim())))
+    || (d.dep && String(d.dep.amount).trim())
+    || (d.ret && (d.ret.order || d.ret.reason)));
+  const saveCash = () => {
+    if (section !== 'ops') return;
+    const d = collectCash();
+    if (cashFilled(d)) cashDrafts.save(CASH_DRAFT, d); else cashDrafts.clear(CASH_DRAFT);
+  };
+  // Отправленная форма уходит из черновика, остальные остаются.
+  const forgetCash = (part) => {
+    const d = cashDrafts.load(CASH_DRAFT) || {};
+    delete d[part];
+    if (cashFilled(d)) cashDrafts.save(CASH_DRAFT, d); else cashDrafts.clear(CASH_DRAFT);
+  };
 
   // Оформление возврата.
   let selectedRefund = 'debt_reduction';
@@ -6319,8 +6549,13 @@ async function renderCashbox(container, section) {
       const payload = { order_id: orderId, reason, refund_method: selectedRefund, idempotency_key: idemKey() };
       if (items) payload.items = items;
       api('/api/returns/create', payload)
-        .then(r => { tg.showAlert(`✅ Возврат #${r.return_id} отправлен на подтверждение`); renderMoneyScreen(); })
-        .catch(e => { tg.showAlert('❌ ' + e.message); retBtn.disabled = false; });
+        .then(r => {
+          forgetCash('ret');
+          haptic('success');
+          toast(`Возврат #${r.return_id} отправлен на подтверждение`);
+          renderMoneyScreen();
+        })
+        .catch(e => { toast(e.message, 'error'); retBtn.disabled = false; });
     });
   }
 
@@ -6382,7 +6617,11 @@ async function renderCashbox(container, section) {
       try {
         await api('/api/payments/send', { items: parsed.items, comment, idempotency_key: payKey });
         payKey = idemKey();
+        forgetCash('pay');
         tg.HapticFeedback?.notificationOccurred('success');
+        // Раньше форма молча перерисовывалась пустой — было непонятно, ушёл
+        // платёж или пропал.
+        toast(`Платёж отправлен на подтверждение: ${parsed.items.map(it => formatMoney(it.amount, it.currency)).join(' + ')}`);
         renderMoneyScreen();
       } catch (e) {
         status.textContent = '❌ ' + e.message; status.className = 'pay-status pay-error';
@@ -6397,13 +6636,19 @@ async function renderCashbox(container, section) {
   if (createBtn) {
     createBtn.addEventListener('click', () => {
       const raw = container.querySelector('#dep-amount').value;
-      const amount = parseFloat(String(raw).replace(',', '.').replace(/\s/g, ''));
-      if (isNaN(amount) || amount <= 0) { tg.showAlert('❌ Введите положительную сумму'); return; }
+      const amount = parseAmount(raw);
+      if (!(amount > 0)) { tg.showAlert('❌ Введите положительную сумму — например 1 500 или 12,50'); return; }
       haptic('light');
       createBtn.disabled = true;
       api('/api/deposits/create', { amount, idempotency_key: depKey })
-        .then(r => { depKey = idemKey(); tg.showAlert(`✅ Сдача #${r.deposit_id} отправлена на подтверждение`); renderMoneyScreen(); })
-        .catch(e => { tg.showAlert('❌ ' + e.message); createBtn.disabled = false; });
+        .then(r => {
+          depKey = idemKey();
+          forgetCash('dep');
+          haptic('success');
+          toast(`Сдача #${r.deposit_id} на ${formatMoney(amount, baseCur())} отправлена на подтверждение`);
+          renderMoneyScreen();
+        })
+        .catch(e => { toast(e.message, 'error'); createBtn.disabled = false; });
     });
   }
 
@@ -6416,8 +6661,8 @@ async function renderCashbox(container, section) {
       b.disabled = true;  // защита от двойного тапа (сервер идемпотентен, UX — нет)
       haptic('light');
       api('/api/deposits/confirm', { deposit_id: Number(id), idempotency_key: idemKey() })
-        .then(() => { tg.showAlert('✅ Сдача подтверждена'); renderMoneyScreen(); })
-        .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
+        .then(() => { haptic('success'); toast('Сдача подтверждена'); renderMoneyScreen(); })
+        .catch(e => { b.disabled = false; toast(e.message, 'error'); });
     });
     const box = card.querySelector('.dep-reject-box');
     card.querySelector('.dep-reject').addEventListener('click', () => { box.hidden = !box.hidden; });
@@ -6428,8 +6673,8 @@ async function renderCashbox(container, section) {
       if (b.disabled) return;
       b.disabled = true;
       api('/api/deposits/reject', { deposit_id: Number(id), reason })
-        .then(() => { tg.showAlert('❌ Сдача отклонена'); renderMoneyScreen(); })
-        .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
+        .then(() => { toast('Сдача отклонена', 'info'); renderMoneyScreen(); })
+        .catch(e => { b.disabled = false; toast(e.message, 'error'); });
     });
   });
 
@@ -6446,17 +6691,17 @@ async function renderCashbox(container, section) {
         return_id: Number(card.dataset.ret),
         idempotency_key: idemKey(),
       })
-        .then(() => { tg.showAlert('📦 Товар отмечен как принятый'); renderMoneyScreen(); })
-        .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
+        .then(() => { haptic('success'); toast('Товар отмечен как принятый'); renderMoneyScreen(); })
+        .catch(e => { b.disabled = false; toast(e.message, 'error'); });
     });
-    card.querySelector('.ret-confirm').addEventListener('click', (ev) => {
+    card.querySelector('.ret-confirm')?.addEventListener('click', (ev) => {
       const b = ev.currentTarget;
       if (b.disabled) return;
       b.disabled = true;  // защита от двойного тапа
       haptic('light');
       api('/api/returns/confirm', { return_id: Number(card.dataset.ret), idempotency_key: idemKey() })
-        .then(() => { tg.showAlert('✅ Возврат подтверждён'); renderMoneyScreen(); })
-        .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
+        .then(() => { haptic('success'); toast('Возврат подтверждён'); renderMoneyScreen(); })
+        .catch(e => { b.disabled = false; toast(e.message, 'error'); });
     });
   });
 
@@ -6470,8 +6715,10 @@ async function renderCashbox(container, section) {
         try {
           await api('/api/orders/confirm_payment', { order_id: id, idempotency_key: idemKey() });
           tg.HapticFeedback?.notificationOccurred('success');
+          // Карточка просто исчезала из списка — без слова, прошло ли.
+          toast(`Оплата по заказу #${id} подтверждена`);
           renderMoneyScreen();
-        } catch (e) { tg.showAlert('❌ ' + e.message); btn.disabled = false; }
+        } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
       });
     });
   });
@@ -6484,11 +6731,41 @@ async function renderCashbox(container, section) {
         try {
           await api('/api/orders/reject_payment', { order_id: id, idempotency_key: idemKey() });
           tg.HapticFeedback?.notificationOccurred('warning');
+          toast(`Оплата по заказу #${id} отклонена`, 'info');
           renderMoneyScreen();
-        } catch (e) { tg.showAlert('❌ ' + e.message); btn.disabled = false; }
+        } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
       });
     });
   });
+
+  // Черновик — восстанавливаем через те же кнопки, что нажимает человек
+  // («Ещё валюта», валюта строки, способ возврата): проводка остаётся одна.
+  if (section === 'ops') {
+    const saved = cashDrafts.load(CASH_DRAFT);
+    if (saved) {
+      if (saved.pay && container.querySelector('#pay-rows')) {
+        const rows = (saved.pay.rows || []).slice(0, 10);
+        for (let i = 1; i < rows.length; i++) container.querySelector('#pay-add-row')?.click();
+        container.querySelectorAll('.pay-row').forEach((row, i) => {
+          if (!rows[i]) return;
+          row.querySelector('.pay-row-amount').value = rows[i].amount || '';
+          row.querySelector(`[data-cur-opt="${rows[i].currency}"]`)?.click();
+        });
+        const comment = container.querySelector('#pay-comment');
+        if (comment) comment.value = saved.pay.comment || '';
+      }
+      const dep = container.querySelector('#dep-amount');
+      if (saved.dep && dep) dep.value = saved.dep.amount || '';
+      if (saved.ret && container.querySelector('#ret-order')) {
+        container.querySelector('#ret-order').value = saved.ret.order || '';
+        container.querySelector('#ret-reason').value = saved.ret.reason || '';
+        container.querySelector(`[data-refund="${saved.ret.refund}"]`)?.click();
+      }
+    }
+    // Делегированно на контейнер: строки платежа добавляются на лету.
+    container.addEventListener('input', saveCash);
+    container.addEventListener('click', saveCash);
+  }
 }
 
 // Список «Клиенты» (boss/admin): контрагенты с МС-балансом + локальным долгом/
@@ -7108,11 +7385,14 @@ async function renderDebts(container) {
             </div>
             ${d.is_mine || isBoss ? `
               <div class="pay-input-row">
-                <input type="number" class="pay-amount-input" data-id="${d.id}"
+                <input type="text" class="pay-amount-input" data-id="${d.id}"
                        placeholder="Сумма · ост. ${fmt(d.remaining)} ${escapeHtml(d.currency || '')}"
-                       min="0" step="0.01" inputmode="decimal">
-                <button class="btn-mark-paid" data-id="${d.id}">${icon('check')} Отметить</button>
+                       inputmode="decimal" autocomplete="off">
+                <button class="btn-mark-paid" data-id="${d.id}"
+                        data-remaining="${Number(d.remaining) || 0}" data-cur="${escapeHtml(d.currency || '')}">${icon('check')} Отметить</button>
               </div>
+              <button class="btn-secondary btn-mark-paid-all" data-id="${d.id}"
+                      data-remaining="${Number(d.remaining) || 0}" data-cur="${escapeHtml(d.currency || '')}">Весь остаток · ${fmt(d.remaining)} ${escapeHtml(d.currency || '')}</button>
             ` : ''}
           </div>
         `;
@@ -7161,38 +7441,56 @@ async function renderDebts(container) {
       });
     });
 
-    // Mark-paid (менеджер отмечает оплату; amount опционален —
-    // если пусто, закрывает остаток целиком)
+    // Отметка оплаты долга. Поле было type=number: «1 500» и «1,5» браузер
+    // считал невалидными и отдавал пустую строку, а пустая сумма означала
+    // «закрыть весь остаток» — частичная оплата молча превращалась в полную.
+    // Теперь поле текстовое (parseNum понимает пробелы и запятую), пустое или
+    // нечисловое — ошибка, а «весь остаток» — отдельная явная кнопка.
+    // В подтверждении — сумма И валюта: у долгов их несколько.
+    const markPaid = (btn, amount) => {
+      const id = parseInt(btn.dataset.id, 10);
+      const cur = btn.dataset.cur || '';
+      const remaining = Number(btn.dataset.remaining) || 0;
+      const msg = amount === null
+        ? `Отметить оплату всего остатка — ${formatMoney(remaining, cur)}?\nРуководитель должен будет подтвердить.`
+        : `Отметить получение ${formatMoney(amount, cur)}?\nРуководитель должен будет подтвердить.`;
+      tg.showConfirm(msg, async ok => {
+        if (!ok) return;
+        btn.disabled = true;
+        try {
+          const payload = { order_id: id, idempotency_key: idemKey() };
+          if (amount !== null) payload.amount = amount;
+          await api('/api/orders/mark_paid', payload);
+          tg.HapticFeedback?.notificationOccurred('success');
+          toast(`Оплата ${formatMoney(amount === null ? remaining : amount, cur)} отмечена, ждёт подтверждения`);
+          await renderDebts(container);
+        } catch (e) {
+          tg.HapticFeedback?.notificationOccurred('error');
+          toast(e.message, 'error');
+          btn.disabled = false;
+        }
+      });
+    };
     container.querySelectorAll('.btn-mark-paid').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const id = parseInt(btn.dataset.id);
-        const input = container.querySelector(`.pay-amount-input[data-id="${id}"]`);
-        const amountRaw = input?.value.trim();
-        const amount = amountRaw ? parseFloat(amountRaw) : null;
-        if (amount !== null && (!(amount > 0))) {
-          tg.showAlert('Сумма должна быть больше нуля или пустой (по умолч. весь остаток)');
+      btn.addEventListener('click', () => {
+        const input = container.querySelector(`.pay-amount-input[data-id="${btn.dataset.id}"]`);
+        const raw = (input && input.value || '').trim();
+        const amount = parseAmount(raw);
+        if (!raw) {
+          toast('Введите сумму или нажмите «Весь остаток»', 'error');
+          input && input.focus();
           return;
         }
-        const msg = amount === null
-          ? 'Отметить полную оплату остатка?\nБосс должен будет подтвердить.'
-          : `Отметить получение ${amount}?\nБосс должен будет подтвердить.`;
-        tg.showConfirm(msg, async ok => {
-          if (!ok) return;
-          btn.disabled = true;
-          try {
-            const payload = { order_id: id, idempotency_key: idemKey() };
-            if (amount !== null) payload.amount = amount;
-            await api('/api/orders/mark_paid', payload);
-            tg.HapticFeedback?.notificationOccurred('success');
-            toast('Оплата отмечена, ждёт подтверждения');
-            await renderDebts(container);
-          } catch (e) {
-            tg.HapticFeedback?.notificationOccurred('error');
-            tg.showAlert('❌ ' + e.message);
-            btn.disabled = false;
-          }
-        });
+        if (!(amount > 0)) {
+          toast('Сумма должна быть больше нуля — например 1 500 или 12,50', 'error');
+          input && input.focus();
+          return;
+        }
+        markPaid(btn, amount);
       });
+    });
+    container.querySelectorAll('.btn-mark-paid-all').forEach(btn => {
+      btn.addEventListener('click', () => markPaid(btn, null));
     });
 
     // Confirm-payment (босс подтверждает все pending по заказу)
@@ -7257,6 +7555,23 @@ let whDraft = null;             // черновик формы (живёт ме�
 let whCounterparties = [];      // справочник, тянем один раз на сессию экрана
 let whStockCache = [];          // остатки для подстановки в позиции
 
+// Черновик накладной переживает закрытие приложения (formDrafts): накладную на
+// двадцать позиций набирают долго, а подпись Telegram живёт час — на 401 или
+// случайном свайпе всё набранное пропадало. Ключ идемпотентности едет вместе с
+// черновиком: если «Сохранить» ушло, а ответ потерялся, повтор после
+// переоткрытия не проведёт вторую накладную.
+const WH_DRAFT = 'wh-invoice';
+function saveWhDraft() {
+  if (whDraft) formDrafts().save(WH_DRAFT, whDraft);
+}
+function dropWhDraft() {
+  whDraft = null;
+  formDrafts().clear(WH_DRAFT);
+}
+function whDraftHasData(d) {
+  return !!(d && ((d.items && d.items.length) || d.counterparty_id || d.comment));
+}
+
 function whIsBoss() {
   return currentUser && (currentUser.role === 'admin' || currentUser.role === 'boss');
 }
@@ -7291,8 +7606,11 @@ async function renderWhInvoiceList() {
   const rows = data.invoices || [];
 
   // Кнопка создания — над списком: это главное действие вкладки.
+  // Недописанная накладная (в том числе с прошлого открытия приложения) —
+  // кнопка говорит об этом прямо, иначе человек не узнает, что набранное цело.
+  const pending = whDraftHasData(whDraft || formDrafts().load(WH_DRAFT));
   const newBtn = `<div class="form-row">
-      <button class="btn-primary" id="wh-new">${icon('plus')} Новая накладная</button>
+      <button class="btn-primary" id="wh-new">${icon(pending ? 'edit' : 'plus')} ${pending ? 'Продолжить черновик накладной' : 'Новая накладная'}</button>
     </div>`;
   const wireNew = () => {
     const b = document.getElementById('wh-new');
@@ -7367,7 +7685,7 @@ async function renderWhInvoiceList() {
         // переотправка (клиент потерял файл, сменился телефон).
         const r = await apiResult('/api/wh/invoices/send', {
           invoice_id: Number(btn.dataset.whSend), force: true,
-        });
+        }, { timeoutMs: LONG_TIMEOUT_MS });
         if (!r.ok) {
           toast(r.body.reason || r.error, 'error');
           btn.disabled = false;
@@ -7422,7 +7740,8 @@ async function renderWhInvoiceList() {
 async function printViaCups(path, body, btn) {
   haptic('light');
   if (btn) btn.disabled = true;
-  const r = await apiResult(path, body);
+  // Печать ждёт ответа CUPS, а PDF иногда собирается заново — дольше обычного.
+  const r = await apiResult(path, body, { timeoutMs: LONG_TIMEOUT_MS });
   if (btn) btn.disabled = false;
   if (!r.ok) { toast(r.error, 'error'); return; }
   if (r.body.ok) toast(r.body.message || 'Отправлено на печать');
@@ -7559,7 +7878,7 @@ function openDocumentForm(meta) {
     ],
     submitLabel: 'Сформировать PDF',
     onSubmit: async (data, { showErr }) => {
-      const res = await apiResult('/api/docs/create', { ...data, idempotency_key: key });
+      const res = await apiResult('/api/docs/create', { ...data, idempotency_key: key }, { timeoutMs: LONG_TIMEOUT_MS });
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
       toast(res.body.sent ? 'Документ сформирован и отправлен вам в Telegram'
@@ -7614,7 +7933,12 @@ function wireHandwrittenDocFields(meta) {
 
 async function renderWhInvoiceNew() {
   const content = document.getElementById('content');
-  if (!whDraft) whDraft = { type: 'outgoing', counterparty_id: '', items: [], comment: '' };
+  if (!whDraft) {
+    const saved = formDrafts().load(WH_DRAFT);
+    whDraft = (saved && Array.isArray(saved.items))
+      ? saved
+      : { type: 'outgoing', counterparty_id: '', items: [], comment: '' };
+  }
   // Форма — вложенный вид вкладки: «Назад» возвращает в список, черновик
   // при этом остаётся (whDraft живёт между перерисовками).
   showBack(() => { whView = 'list'; renderWhInvoicesTab(); });
@@ -7622,11 +7946,20 @@ async function renderWhInvoiceNew() {
   wireSectionNav(content, 'stock', renderStockScreen);
   const gen = screenGen();
 
-  // Справочники параллельно: без них форма бесполезна.
-  const [stock, cps] = await Promise.all([
-    api('/api/wh/stock', {}),
-    whCounterparties.length ? { counterparties: whCounterparties } : api('/api/wh/counterparties', {}),
-  ]);
+  // Справочники параллельно: без них форма бесполезна. Без сети — ошибка с
+  // «Повторить» (черновик при этом цел), а не вечная «Загружаю справочники…».
+  let stock, cps;
+  try {
+    [stock, cps] = await Promise.all([
+      api('/api/wh/stock', {}),
+      whCounterparties.length ? { counterparties: whCounterparties } : api('/api/wh/counterparties', {}),
+    ]);
+  } catch (e) {
+    if (gen !== screenGen()) return;
+    content.innerHTML = stockShellHtml() + errorBox(e.message);
+    wireSectionNav(content, 'stock', renderStockScreen);
+    return;
+  }
   whCounterparties = cps.counterparties || [];
   whStockCache = stock.products || [];
   const products = whStockCache;
@@ -7688,7 +8021,7 @@ async function renderWhInvoiceNew() {
 
   document.getElementById('wh-cancel-form').addEventListener('click', () => {
     haptic('light');
-    whDraft = null;
+    dropWhDraft();
     whView = 'list';
     renderWhInvoicesTab();
   });
@@ -7706,8 +8039,11 @@ async function renderWhInvoiceNew() {
     const have = p ? Number(p.quantity) : 0;
     const out = whDraft.type === 'outgoing';
     return {
+      // Товар не подставляется сам: строка без выбора — невалидна.
+      product: !p,
       qty: !(Number(it.quantity) > 0),
-      short: out && Number(it.quantity) > have,
+      // Без товара про остаток говорить нечего — там своя подсказка.
+      short: out && !!p && Number(it.quantity) > have,
       price: out && !(Number(it.price_cents) > 0),
       have,
     };
@@ -7717,7 +8053,7 @@ async function renderWhInvoiceNew() {
     if (whDraft.type === 'outgoing' && !whDraft.counterparty_id) return false;
     return whDraft.items.every(it => {
       const pr = itemProblems(it);
-      return !pr.qty && !pr.short && !pr.price;
+      return !pr.product && !pr.qty && !pr.short && !pr.price;
     });
   }
   function syncSave() {
@@ -7725,7 +8061,10 @@ async function renderWhInvoiceNew() {
     if (b) b.disabled = !formValid();
   }
 
-  function drawItems() {
+  // Итог и доступность «Сохранить» — отдельно от перерисовки строк: их
+  // пересчитываем на каждый введённый символ (событие input), а строки
+  // перерисовываем только на change — иначе поле теряло бы фокус посреди ввода.
+  function drawTotal() {
     const totalCents = whDraft.items.reduce(
       (acc, it) => acc + Math.round((Number(it.price_cents) || 0) * (Number(it.quantity) || 0)), 0);
     // Итог — карточка в общем стиле: «Итого» слева, сумма справа с валютой.
@@ -7734,6 +8073,11 @@ async function renderWhInvoiceNew() {
         `<span class="wh-total-sum">${whMoney(totalCents, baseCur())}</span></div>`
       : '';
     syncSave();
+    saveWhDraft();
+  }
+
+  function drawItems() {
+    drawTotal();
     if (!whDraft.items.length) {
       itemsEl.innerHTML = '<div class="editor-empty">Позиций нет — добавьте хотя бы одну.</div>';
       return;
@@ -7750,19 +8094,20 @@ async function renderWhInvoiceNew() {
       const priceBad = pr.price && it.price_cents != null && it.priceTouched;
       return `
       <div class="wh-pos" data-i="${i}">
-        <button type="button" class="btn-agent" data-pick-product="${i}" aria-label="Товар">
+        <button type="button" class="btn-agent${p ? '' : ' btn-agent--empty'}" data-pick-product="${i}" aria-label="Товар">
           ${escapeHtml(p ? p.name : 'Выберите товар')}
           ${p ? `<span class="wh-pos-have">${whQty(p.quantity)} ${escapeHtml(p.unit || '')}</span>` : ''}
         </button>
         <div class="wh-pos-row">
           <input class="form-input ${short || qtyBad ? 'wh-input-bad' : ''}" data-f="quantity"
-                 type="number" min="0" step="any" inputmode="decimal"
+                 type="text" inputmode="decimal" autocomplete="off"
                  value="${it.quantity}" placeholder="Кол-во" aria-label="Количество">
-          <input class="form-input ${priceBad ? 'wh-input-bad' : ''}" data-f="price" type="number" min="0" step="0.01"
-                 inputmode="decimal" value="${(Number(it.price_cents) || 0) / 100}"
+          <input class="form-input ${priceBad ? 'wh-input-bad' : ''}" data-f="price" type="text"
+                 inputmode="decimal" autocomplete="off" value="${(Number(it.price_cents) || 0) / 100}"
                  placeholder="Цена" aria-label="Цена за единицу">
           <button class="editor-item-del" data-del="${i}" aria-label="Удалить позицию">${icon('trash')}</button>
         </div>
+        ${pr.product ? `<div class="wh-pos-warn">Выберите товар</div>` : ''}
         ${short ? `<div class="wh-pos-warn">На складе только ${whQty(have)}</div>` : ''}
         ${qtyBad ? `<div class="wh-pos-warn">Количество должно быть больше нуля</div>` : ''}
         ${priceBad ? `<div class="wh-pos-warn">Для расхода укажите цену</div>` : ''}
@@ -7770,38 +8115,29 @@ async function renderWhInvoiceNew() {
     }).join('');
 
     itemsEl.querySelectorAll('[data-pick-product]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const i = Number(btn.dataset.pickProduct);
-        openListPicker({
-          title: 'Товар',
-          hint: 'Показан остаток на складе',
-          items: products.map(pp => ({
-            id: pp.product_id, name: pp.name,
-            sub: `${whQty(pp.quantity)} ${pp.unit || ''}`.trim(),
-          })),
-          selectedId: whDraft.items[i].product_id,
-          emptyText: 'Товары не найдены',
-          onPick: (item) => { whDraft.items[i].product_id = Number(item.id); drawItems(); },
-        });
-      });
+      btn.addEventListener('click', () => pickProduct(Number(btn.dataset.pickProduct)));
     });
 
     itemsEl.querySelectorAll('.wh-pos').forEach(el => {
       const i = Number(el.dataset.i);
       el.querySelectorAll('[data-f]').forEach(inp => {
-        inp.addEventListener('change', () => {
+        const apply = () => {
           const f = inp.dataset.f;
+          // «1 500» и «12,5» — как в остальных денежных полях (parseAmount);
+          // нечисловое — ноль, и строка подсветится как невалидная.
+          const v = parseAmount(inp.value);
           if (f === 'price') {
             // Цену вводят в деньгах, хранится и уходит на сервер в копейках.
-            whDraft.items[i].price_cents = Math.round((Number(inp.value) || 0) * 100);
+            whDraft.items[i].price_cents = Math.round((Number.isNaN(v) ? 0 : v) * 100);
             whDraft.items[i].priceTouched = true;
           } else if (f === 'quantity') {
-            whDraft.items[i].quantity = Number(inp.value) || 0;
-          } else {
-            whDraft.items[i].product_id = Number(inp.value);
+            whDraft.items[i].quantity = Number.isNaN(v) ? 0 : v;
           }
-          drawItems();
-        });
+        };
+        // input — итог и кнопка сразу, пока человек печатает; change (уход
+        // с поля) — перерисовка строк с подсказками под полями.
+        inp.addEventListener('input', () => { apply(); drawTotal(); });
+        inp.addEventListener('change', () => { apply(); drawItems(); });
       });
       const del = el.querySelector('[data-del]');
       if (del) del.addEventListener('click', () => {
@@ -7812,12 +8148,34 @@ async function renderWhInvoiceNew() {
     });
   }
 
+  // Товар выбирают только явно, листом с поиском. Раньше новая строка сразу
+  // получала ПЕРВЫЙ товар справочника, и его легко было провести вместо
+  // нужного: строка выглядела заполненной, «Сохранить» — активной.
+  function pickProduct(i) {
+    openListPicker({
+      title: 'Товар',
+      hint: 'Показан остаток на складе',
+      items: products.map(pp => ({
+        id: pp.product_id, name: pp.name,
+        sub: `${whQty(pp.quantity)} ${pp.unit || ''}`.trim(),
+      })),
+      selectedId: whDraft.items[i] ? whDraft.items[i].product_id : null,
+      emptyText: 'Товары не найдены',
+      onPick: (item) => {
+        if (!whDraft || !whDraft.items[i]) return;
+        whDraft.items[i].product_id = Number(item.id);
+        drawItems();
+      },
+    });
+  }
+
   drawItems();
 
   document.querySelectorAll('[data-whtype]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('light');
       whDraft.type = btn.dataset.whtype;
+      saveWhDraft();
       renderWhInvoiceNew();
     });
   });
@@ -7826,6 +8184,7 @@ async function renderWhInvoiceNew() {
     const btn = document.getElementById('wh-cp');
     if (btn) { btn.textContent = item.name; btn.classList.remove('btn-agent--empty'); }
     syncSave();
+    saveWhDraft();
   };
   const openCpPicker = () => openListPicker({
     title: 'Контрагент',
@@ -7851,14 +8210,17 @@ async function renderWhInvoiceNew() {
   document.getElementById('wh-cp').addEventListener('click', openCpPicker);
   document.getElementById('wh-comment').addEventListener('input', e => {
     whDraft.comment = e.target.value;
+    saveWhDraft();
   });
   document.getElementById('wh-add').addEventListener('click', () => {
     haptic('light');
     // Цена у расхода обязательна, поэтому новая строка начинается БЕЗ цены и
     // держит кнопку неактивной, пока её не введут.
-    whDraft.items.push({ product_id: products[0].product_id, quantity: 1,
+    whDraft.items.push({ product_id: null, quantity: 1,
                          price_cents: whDraft.type === 'outgoing' ? 0 : null, priceTouched: false });
     drawItems();
+    // Строка без товара бесполезна — сразу открываем выбор.
+    pickProduct(whDraft.items.length - 1);
   });
 
   document.getElementById('wh-save').addEventListener('click', async () => {
@@ -7875,6 +8237,7 @@ async function renderWhInvoiceNew() {
     // отказа по существу — отказ сервер хранит под ключом, и исправленная
     // форма со старым ключом получила бы тот же отказ.
     if (!whDraft.idemKey) whDraft.idemKey = idemKey();
+    saveWhDraft();
     try {
       const r = await apiResult('/api/wh/invoices/create', {
         type: whDraft.type,
@@ -7888,12 +8251,12 @@ async function renderWhInvoiceNew() {
         // Повтор той же формы не проведёт вторую накладную и не пришлёт
         // клиенту второй экземпляр PDF.
         idempotency_key: whDraft.idemKey,
-      });
+      }, { timeoutMs: LONG_TIMEOUT_MS });
       if (!r.ok) {
         // Отказ по существу (нехватка остатка, 400 формы) ничего не записал —
         // следующая попытка с исправленной формой идёт новым ключом. «Запрос
         // уже обрабатывается» и обрыв связи ключ сохраняют.
-        if (r.status === 400 || (r.body && r.body.code)) whDraft.idemKey = null;
+        if (r.status === 400 || (r.body && r.body.code)) { whDraft.idemKey = null; saveWhDraft(); }
         // Сервер посчитал причину отказа и вернул её (нехватка остатка — с
         // разбором по позициям). Показываем ЕЁ, а не «ошибку сервера»:
         // менеджеру надо понять, что править в форме. Черновик остаётся.
@@ -7906,7 +8269,7 @@ async function renderWhInvoiceNew() {
       // Отдельным сообщением: неотправленный PDF — не ошибка проведения.
       // Накладная сохранена, остатки списаны, отправить можно позже кнопкой.
       if (res.pdf_warning) toast(res.pdf_warning, 'error', { duration: 6000 });
-      whDraft = null;
+      dropWhDraft();
       whView = 'list';
       renderWhInvoicesTab();
     } catch (e) {

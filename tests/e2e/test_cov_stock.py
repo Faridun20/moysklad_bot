@@ -550,8 +550,7 @@ def test_catalog_shows_fresh_stock_after_invoice(open_app, e2e):
     boss.wait_for_selector('[data-whtype="incoming"]')
     boss.click('[data-whtype="incoming"]')
     boss.wait_for_selector('[data-whtype="incoming"].active')
-    boss.click("#wh-add")
-    boss.wait_for_selector('.wh-pos [data-f="quantity"]')
+    _add_position(boss, e2e.ids["product"])
     boss.fill('.wh-pos [data-f="quantity"]', "5")
     boss.locator('.wh-pos [data-f="quantity"]').dispatch_event("change")
     boss.click("#wh-save")
@@ -1193,11 +1192,22 @@ def test_machine_photo_upload_and_delete(open_app, e2e, monkeypatch):
 # ─── Накладные ───────────────────────────────────────────────────────────────
 
 
-def _new_outgoing(page, qty: str, price: str) -> None:
+def _add_position(page, product_id: int) -> None:
+    """«Добавить позицию» сразу открывает выбор товара: сама строка товар не
+    подставляет (раньше вставал первый из справочника, и его проводили вместо
+    нужного), а без товара «Сохранить» неактивна."""
+    page.click("#wh-add")
+    page.wait_for_selector(f'.picker-list [data-pick="{product_id}"]')
+    page.click(f'.picker-list [data-pick="{product_id}"]')
+    page.click("#ms-submit")
+    page.wait_for_selector(".c-overlay", state="detached")
+    page.wait_for_selector('.wh-pos [data-f="quantity"]')
+
+
+def _new_outgoing(page, qty: str, price: str, product_id: int) -> None:
     page.click("#wh-new")
     page.wait_for_selector('[data-whtype="outgoing"].active')
-    page.click("#wh-add")
-    page.wait_for_selector('.wh-pos [data-f="quantity"]')
+    _add_position(page, product_id)
     page.fill('.wh-pos [data-f="quantity"]', qty)
     page.locator('.wh-pos [data-f="quantity"]').dispatch_event("change")
     page.fill('.wh-pos [data-f="price"]', price)
@@ -1215,7 +1225,7 @@ def test_outgoing_invoice_moves_stock_and_sends_pdf_to_client(open_app, e2e):
     boss = open_app(e2e.ids["boss"])
     go(boss, "stock")
     tab(boss, "invoices")
-    _new_outgoing(boss, "3", "15")
+    _new_outgoing(boss, "3", "15", e2e.ids["product"])
     boss.wait_for_function("() => !document.querySelector('#wh-save').disabled")
     boss.fill("#wh-comment", "Отгрузка на объект")
     boss.click("#wh-save")
@@ -1239,7 +1249,7 @@ def test_outgoing_without_client_telegram_warns_and_is_sent_later(open_app, e2e)
     boss = open_app(e2e.ids["boss"])
     go(boss, "stock")
     tab(boss, "invoices")
-    _new_outgoing(boss, "2", "10")
+    _new_outgoing(boss, "2", "10", e2e.ids["product"])
     boss.click("#wh-save")
     boss.wait_for_selector(".toast--error:has-text('не привязан Telegram')")
     boss.wait_for_selector(".order-pay--wait")
@@ -1266,17 +1276,29 @@ def test_invoice_form_short_stock_position_delete_and_cancel(open_app, e2e):
     boss = open_app(e2e.ids["boss"])
     go(boss, "stock")
     tab(boss, "invoices")
-    _new_outgoing(boss, "25", "10")
+    _new_outgoing(boss, "25", "10", e2e.ids["product"])
     boss.wait_for_selector(".wh-pos-warn:has-text('На складе только 20')")
     assert boss.locator("#wh-save").is_disabled()
 
+    # Новая строка товар сама не подставляет: выбор закрыли — строка пустая,
+    # с подсказкой, и сохранить её нельзя.
     boss.click("#wh-add")
+    boss.wait_for_selector(".picker-list [data-pick]")
+    boss.click("#ms-cancel")
+    boss.wait_for_selector(".c-overlay", state="detached")
     boss.wait_for_function("() => document.querySelectorAll('.wh-pos').length === 2")
+    assert boss.locator('.wh-pos[data-i="1"] .wh-pos-warn:has-text("Выберите товар")').count() == 1
     boss.click('[data-del="0"]')
     boss.wait_for_function("() => document.querySelectorAll('.wh-pos').length === 1")
     assert boss.locator(".wh-pos-warn:has-text('На складе')").count() == 0, "удалена именно строка с нехваткой"
-    # Оставшаяся строка — свежая, без цены: расход без цены не сохранить.
+    # Оставшаяся строка — свежая, без товара и цены: такой расход не сохранить.
     assert boss.locator("#wh-save").is_disabled()
+    boss.click("[data-pick-product]")
+    boss.wait_for_selector(f'.picker-list [data-pick="{e2e.ids["product"]}"]')
+    boss.click(f'.picker-list [data-pick="{e2e.ids["product"]}"]')
+    boss.click("#ms-submit")
+    boss.wait_for_selector(".c-overlay", state="detached")
+    assert boss.locator("#wh-save").is_disabled(), "расход без цены не сохранить"
 
     # Смена типа не теряет позиции: у прихода цена не нужна.
     boss.click('[data-whtype="incoming"]')
@@ -1302,9 +1324,8 @@ def test_incoming_with_picked_product_and_boss_cancel_refused_when_stock_left(op
     boss.wait_for_selector('[data-whtype="incoming"]')
     boss.click('[data-whtype="incoming"]')
     boss.wait_for_selector('[data-whtype="incoming"].active')
+    # Выбор товара открывается сам — строка без товара бесполезна.
     boss.click("#wh-add")
-    boss.wait_for_selector("[data-pick-product]")
-    boss.click("[data-pick-product]")
     boss.wait_for_selector(".picker-list [data-pick]")
     boss.fill("#ms-f-search", "болт")
     boss.wait_for_function("() => document.querySelectorAll('.picker-list [data-pick]').length === 1")
@@ -1390,8 +1411,7 @@ def test_manager_posts_incoming_but_cannot_cancel(open_app, e2e):
 
     mgr.click("#wh-new")
     mgr.wait_for_selector("#wh-add")
-    mgr.click("#wh-add")
-    mgr.wait_for_selector('.wh-pos [data-f="quantity"]')
+    _add_position(mgr, e2e.ids["product"])
     mgr.fill('.wh-pos [data-f="quantity"]', "4")
     mgr.locator('.wh-pos [data-f="quantity"]').dispatch_event("change")
     mgr.click("#wh-save")

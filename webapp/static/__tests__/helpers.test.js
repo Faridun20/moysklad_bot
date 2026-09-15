@@ -8,7 +8,7 @@ import helpers from '../helpers.js';
 
 const {
   escapeHtml, idemKey, formatDateRU, icon, opsAmount, plural, categoryTree, categoryMatches,
-  parsePaymentItems, renderMoneyTotalsHtml, periodSegHtml, rangeLabel,
+  parseAmount, parsePaymentItems, renderMoneyTotalsHtml, periodSegHtml, rangeLabel,
   navSections, defaultSection, sectionNavHtml, salesTabs, stockTabs, moneyTabs, clientsTabs,
   formatMoney, emptyState, skeleton, errorBoxHtml,
   machineStatusLabel, machineSubtitle, machineStatusSegHtml,
@@ -209,6 +209,23 @@ describe('opsAmount', () => {
   it('null/undefined → "0"', () => {
     expect(opsAmount(null)).toBe('0');
     expect(opsAmount(undefined)).toBe('0');
+  });
+});
+
+describe('parseAmount — сумма, как её вводят на телефоне', () => {
+  it('понимает пробелы-разряды и десятичную запятую', () => {
+    expect(parseAmount('1 500')).toBe(1500);
+    expect(parseAmount('1,5')).toBe(1.5);
+    expect(parseAmount('1 500,50')).toBe(1500.5);
+    expect(parseAmount('1\u00a0500')).toBe(1500);   // неразрывный пробел из буфера
+    expect(parseAmount(' 12.25 ')).toBe(12.25);
+    expect(parseAmount(40)).toBe(40);
+  });
+
+  it('мусор — NaN, а не «первые цифры»: «12abc» не превращается в 12', () => {
+    for (const bad of ['', '   ', 'abc', '12abc', '-5', '1,2,3', '1.2.3', null, undefined]) {
+      expect(Number.isNaN(parseAmount(bad))).toBe(true);
+    }
   });
 });
 
@@ -430,8 +447,25 @@ describe('formatMoney (UI-WP-05)', () => {
     expect(norm(formatMoney(1234567, 'USD'))).toBe('1 234 567 USD');
   });
 
-  it('округляет: копейки в списках только шумят', () => {
-    expect(norm(formatMoney(1234.56))).toBe('1 235');
+  it('показывает копейки, когда они есть: 12.50 USD — не «13 USD»', () => {
+    expect(norm(formatMoney(12.5, 'USD'))).toBe('12,50 USD');
+    expect(norm(formatMoney(1234.56))).toBe('1 234,56');
+  });
+
+  it('целая сумма — без хвоста «,00»', () => {
+    expect(norm(formatMoney(1500, 'USD'))).toBe('1 500 USD');
+    // Шум плавающей точки не превращается в копейки.
+    expect(norm(formatMoney(1500.0000001, 'USD'))).toBe('1 500 USD');
+    expect(norm(formatMoney(0.1 + 0.2))).toBe('0,30');
+  });
+
+  it('сумы — всегда целые (тийины не считают)', () => {
+    expect(norm(formatMoney(1234567.4, 'UZS'))).toBe('1 234 567 UZS');
+    expect(norm(formatMoney(99.5, 'uzs'))).toBe('100 uzs');
+  });
+
+  it('отрицательная сумма с копейками', () => {
+    expect(norm(formatMoney(-12.5, 'USD'))).toBe('-12,50 USD');
   });
 
   it('без валюты отдаёт только число — вызывающий клеит сам', () => {

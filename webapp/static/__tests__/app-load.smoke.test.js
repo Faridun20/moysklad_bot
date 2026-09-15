@@ -51,8 +51,9 @@ describe('загрузка фронта (helpers.js + app.js)', () => {
   it('грузятся без исключения и определяют глобальные хелперы', () => {
     const window = makeWindow();
 
-    // Порядок как в index.html: helpers.js ПЕРЕД app.js.
+    // Порядок как в index.html: helpers.js, net.js, затем app.js.
     expect(() => window.eval(read('helpers.js'))).not.toThrow();
+    expect(() => window.eval(read('net.js'))).not.toThrow();
     expect(() => window.eval(read('app.js'))).not.toThrow();
 
     expect(typeof window.escapeHtml).toBe('function');
@@ -64,6 +65,9 @@ describe('загрузка фронта (helpers.js + app.js)', () => {
 
   it('app.js без helpers.js НЕ имеет escapeHtml (доказывает зависимость порядка)', () => {
     const window = makeWindow();
+    // net.js грузим: без него init() сразу уходит в catch и рисует ошибку
+    // через icon() из helpers.js — тест проверял бы не то.
+    window.eval(read('net.js'));
     expect(() => window.eval(read('app.js'))).not.toThrow();
     // escapeHtml вынесён в helpers.js — без него глобал не определён.
     expect(window.escapeHtml).toBeUndefined();
@@ -75,6 +79,7 @@ describe('загрузка фронта (helpers.js + app.js)', () => {
 function boot(driver = '') {
   const window = makeWindow();
   window.eval(read('helpers.js'));
+  window.eval(read('net.js'));
   window.eval(`${read('app.js')}\n${driver}`);
   return window;
 }
@@ -141,7 +146,11 @@ describe('«Склад» → вкладка «Техника»', () => {
     const window = boot(`
       currentUser = { role: 'bookkeeper' };
       window.__calls = [];
-      api = async (p) => { window.__calls.push(p); return { ok: true, orders: [], role: 'bookkeeper' }; };
+      // /api/stock тоже идёт через api() (прямой fetch в обход таймаута убран).
+      api = async (p) => {
+        window.__calls.push(p);
+        return p === '/api/stock' ? { products: [], categories: [] } : { ok: true, orders: [], role: 'bookkeeper' };
+      };
       window.fetch = (p) => { window.__calls.push(p); return Promise.reject(new Error('нет сети')); };
       stockTab = 'machines';
       window.__ready = renderStockScreen();
@@ -1367,6 +1376,7 @@ describe('высота окна', () => {
     window.Telegram.WebApp.viewportStableHeight = 640;
     window.Telegram.WebApp.viewportHeight = 700;
     window.eval(read('helpers.js'));
+    window.eval(read('net.js'));
     window.eval(read('app.js'));
     expect(window.document.documentElement.style.getPropertyValue('--tg-viewport'))
       .toBe('640px');
@@ -1377,6 +1387,7 @@ describe('высота окна', () => {
     delete window.Telegram.WebApp.viewportStableHeight;
     delete window.Telegram.WebApp.viewportHeight;
     window.eval(read('helpers.js'));
+    window.eval(read('net.js'));
     window.eval(read('app.js'));
     expect(window.document.documentElement.style.getPropertyValue('--tg-viewport'))
       .toBe('');
@@ -1390,6 +1401,7 @@ describe('высота окна', () => {
     window.Telegram.WebApp.viewportStableHeight = 500;
     window.Telegram.WebApp.onEvent = (name, fn) => { handlers[name] = fn; };
     window.eval(read('helpers.js'));
+    window.eval(read('net.js'));
     window.eval(read('app.js'));
     expect(typeof handlers.viewportChanged).toBe('function');
 
@@ -2469,6 +2481,7 @@ describe('вход: 403 от /api/me', () => {
     const window = makeWindow();
     window.fetch = async () => ({ ok: false, status: 403, json: async () => ({ detail: 'deactivated' }) });
     window.eval(read('helpers.js'));
+    window.eval(read('net.js'));
     window.eval(read('app.js'));
     await new Promise(r => setTimeout(r, 0));
     const text = window.document.getElementById('content').textContent;

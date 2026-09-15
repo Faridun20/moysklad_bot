@@ -922,4 +922,26 @@ Chromium/WebView на медленный путь композитинга, и s
 строка, иначе элемент останется бесцветным при формально «объявленном» статусе.
 Права по ролям для ручного QA: `python scripts/gen_role_matrix.py` → `UI_QA_ROLES.md`.
 
+**Сеть фронта — один слой (`webapp/static/net.js`, подключён между helpers.js и
+app.js).** `api()`/`apiResult()` — тонкие обёртки над `createNet().request`:
+срок 20 с (AbortController + гонка со сроком; PDF/печать/выгрузка/фото
+передают `timeoutMs`), обрыв и срок — «Нет связи — проверьте интернет и
+повторите» (`errorBoxHtml` рисует его как «Нет подключения»), 401 — экран
+«Сессия истекла» поверх всего (`showSessionExpired`, кнопка `tg.close`).
+Прямых `fetch` в app.js нет (сторож — `audit-front.test.js`); картинки —
+`_net().request(..., { raw: true })`. **Ошибка загрузки — не пустой список**:
+не глуши `api(...).catch(() => [])` там, где пустота что-то значит («нет
+записей на подтверждении»), — рисуй `errorBoxHtml` с «Повторить». **Роли
+кнопок и запросов** — `canCall(path, role)` по таблице `API_ROLES` (зеркало
+`allowed_roles` сервера; `net.test.js` сверяет её с server.py, поменял права
+ручки — поправь строку таблицы). **Черновики форм** (накладная, формы
+«Кассы») — `formDrafts()` → localStorage под id пользователя, с try/catch и
+сроком 3 дня: подпись Telegram живёт час, и набранное не должно пропадать на
+401. Суммы из полей ввода — `parseAmount` («1 500», «12,5»; мусор — NaN),
+поле суммы — `type="text" inputmode="decimal"`: `type=number` отдаёт пустую
+строку на «1 500». `formatMoney` показывает копейки, когда они есть (UZS —
+всегда целым). `/api/orders` с `limit` отдаёт страницу (`statuses`,
+`date_from`/`date_to` применяются ДО нарезки; `pending_count` — по всем
+заказам роли); без `limit` — прежний ответ целиком.
+
 **Фронт (Vitest):** чистые хелперы `webapp/static/helpers.js` + jsdom-смоук загрузки `app.js` — в `webapp/static/__tests__/`. Гоняет CI (`npm test`). Локально Node нет → `scripts/setup-node.ps1` ставит portable Node в `.tools/node` (gitignore, ~35MB zip с nodejs.org, без admin), `scripts/test-js.ps1` делает `npm install` (1×) + `vitest run`. Скрипты — UTF-8 **с BOM** (иначе PowerShell 5.1 читает их как ANSI и кириллица в Write-Host превращается в кракозябры).

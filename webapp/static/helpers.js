@@ -63,6 +63,16 @@
     return all.some((r) => (roles || []).indexOf(r) !== -1);
   }
 
+  // Сумма, как её вводят на телефоне: «1 500», «1,5», «1 500,50» (пробел —
+  // и неразрывный из буфера обмена — разделяет разряды, запятая — дробную
+  // часть). Строго: «12abc» — это не 12, а ошибка ввода, иначе опечатка молча
+  // уезжает деньгами. Возвращает число или NaN.
+  function parseAmount(raw) {
+    const t = String(raw == null ? '' : raw).replace(/[\s\u00a0\u202f]/g, '').replace(',', '.');
+    if (!/^\d+(\.\d+)?$/.test(t)) return NaN;
+    return Number(t);
+  }
+
   // Парсинг строк мульти-валютной формы платежа в payload для /api/payments/send.
   // Чистая функция (тестируется): принимает [{amount, currency}] как ввёл юзер
   // (amount — строка/число), возвращает {items:[{amount:Number, currency}]} или
@@ -70,7 +80,7 @@
   function parsePaymentItems(rows) {
     const items = [];
     for (const r of rows || []) {
-      const amt = parseFloat(String((r && r.amount) || '').replace(',', '.').replace(/\s/g, ''));
+      const amt = parseAmount(r && r.amount);
       if (!isFinite(amt) || amt <= 0) {
         return { error: 'Введите положительную сумму во всех строках' };
       }
@@ -380,7 +390,9 @@
   function errorBoxHtml(msg, opts) {
     const o = opts || {};
     const offline = (typeof navigator !== 'undefined' && navigator.onLine === false)
-      || msg === 'Нет подключения к интернету';
+      || msg === 'Нет подключения к интернету'
+      // Текст сетевого слоя (net.js NET_ERROR_TEXT): нет ответа или истёк срок.
+      || msg === 'Нет связи — проверьте интернет и повторите';
     const title = offline ? 'Нет подключения' : 'Не удалось загрузить';
     const body = offline ? 'Проверьте интернет и попробуйте снова.' : escapeHtml(String(msg || ''));
     const retry = o.retry === false ? '' :
@@ -394,13 +406,25 @@
 
   // Единый формат суммы (UI-WP-05). `Math.round(n).toLocaleString('ru-RU')`
   // был скопирован в четырнадцать локальных `fmt` по app.js — и уже разъезжался:
-  // где-то округляли, где-то нет, где-то валюту клеили без пробела. Копейки в
-  // UI не показываем осознанно: суммы сделок — тысячи, дробная часть только
-  // шумит; точные значения живут в БД.
+  // где-то округляли, где-то нет, где-то валюту клеили без пробела.
+  //
+  // Копейки показываем, когда они ЕСТЬ. Раньше формат округлял всегда, и
+  // платёж 12.50 USD на экране был «13 USD»: остаток долга не сходился с
+  // квитанцией, а сумма в подтверждении отличалась от введённой. Целые суммы
+  // (почти все сделки) остаются без «,00» — хвост нулей в списках только
+  // шумит. Сумы в копейках (тийинах) не считают вовсе, поэтому UZS — всегда
+  // целым, даже если курс пересчёта дал дробь.
+  const WHOLE_CURRENCIES = { UZS: true };
   function formatMoney(n, currency) {
     const num = Number(n);
     if (!isFinite(num)) return '—';
-    const text = Math.round(num).toLocaleString('ru-RU');
+    // Через целые копейки: 0.1 + 0.2 не должно печататься как «0,30000000004»,
+    // а 1234.004 — как «1 234,00».
+    const cents = Math.round(num * 100);
+    const whole = cents % 100 === 0 || WHOLE_CURRENCIES[String(currency || '').toUpperCase()];
+    const text = whole
+      ? Math.round(cents / 100).toLocaleString('ru-RU')
+      : (cents / 100).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     return currency ? `${text} ${currency}` : text;
   }
 
@@ -764,7 +788,7 @@
   return {
     escapeHtml, idemKey, formatDateRU, icon, opsAmount, plural,
     ROLE_ALSO_ACTS_AS, roleIn,
-    parsePaymentItems, renderMoneyTotalsHtml, categoryTree, categoryMatches,
+    parseAmount, parsePaymentItems, renderMoneyTotalsHtml, categoryTree, categoryMatches,
     NAV_SECTIONS, navSections, defaultSection, sectionNavHtml,
     NAV_BAR_MAX, navBarLayout, navDrawerHtml,
     salesTabs, stockTabs, moneyTabs, clientsTabs,

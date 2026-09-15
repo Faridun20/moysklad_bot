@@ -202,7 +202,7 @@ def test_cash_deposit_is_confirmed_and_closes_debt_fifo(open_app, e2e):
     mgr.wait_for_selector("#dep-amount")
     mgr.fill("#dep-amount", "80")
     mgr.click("#dep-create")
-    mgr.wait_for_function("() => window.__tgAlerts.some(a => a.includes('Сдача #'))")
+    mgr.wait_for_selector(".toast:has-text('Сдача #')")
     dep = e2e.rows("SELECT id, status, amount_cents FROM cash_deposits")[0]
     assert dep["status"] == "pending" and dep["amount_cents"] == 8000
     # Своя сдача видна менеджеру в «Мои сдачи».
@@ -213,7 +213,7 @@ def test_cash_deposit_is_confirmed_and_closes_debt_fifo(open_app, e2e):
     tab(boss, "confirm")
     boss.wait_for_selector(f'.debt-card[data-dep="{dep["id"]}"] .dep-confirm')
     boss.click(f'.debt-card[data-dep="{dep["id"]}"] .dep-confirm')
-    boss.wait_for_function("() => window.__tgAlerts.some(a => a.includes('Сдача подтверждена'))")
+    boss.wait_for_selector(".toast:has-text('Сдача подтверждена')")
 
     assert e2e.rows("SELECT status FROM cash_deposits")[0]["status"] == "confirmed"
     alloc = e2e.rows("SELECT order_id, amount_allocated_cents FROM cash_deposit_orders")
@@ -276,7 +276,7 @@ def test_return_flow_needs_goods_received_before_confirm(open_app, e2e):
     mgr.fill("#ret-order", str(oid))
     mgr.fill("#ret-reason", "Брак партии")
     mgr.click("#ret-create")  # позиции не подгружали → полный возврат
-    mgr.wait_for_function("() => window.__tgAlerts.some(a => a.includes('Возврат #'))")
+    mgr.wait_for_selector(".toast:has-text('Возврат #')")
     ret = e2e.rows("SELECT id, status, goods_received, return_type FROM returns")[0]
     assert ret["status"] == "pending" and not ret["goods_received"] and ret["return_type"] == "full"
 
@@ -289,10 +289,10 @@ def test_return_flow_needs_goods_received_before_confirm(open_app, e2e):
     # за товар, которого физически нет, нельзя.
     assert boss.locator(f"{card} .ret-confirm").is_disabled()
     boss.click(f"{card} .ret-goods")
-    boss.wait_for_function("() => window.__tgAlerts.some(a => a.includes('принят'))")
+    boss.wait_for_selector(".toast:has-text('принят')")
     boss.wait_for_selector(f"{card} .ret-confirm:not([disabled])")
     boss.click(f"{card} .ret-confirm")
-    boss.wait_for_function("() => window.__tgAlerts.some(a => a.includes('Возврат подтверждён'))")
+    boss.wait_for_selector(".toast:has-text('Возврат подтверждён')")
 
     ret = e2e.rows("SELECT status, goods_received FROM returns")[0]
     assert ret["status"] == "confirmed" and ret["goods_received"]

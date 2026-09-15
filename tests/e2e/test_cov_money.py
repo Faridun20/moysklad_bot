@@ -47,7 +47,13 @@ def _idle(page) -> None:
 
 
 def _alert(page, text: str) -> None:
-    page.wait_for_function("(t) => window.__tgAlerts.some(a => a.includes(t))", arg=text)
+    """Ответ приложения: диалог Telegram (ошибка формы) или тост (успех и отказ
+    сервера ушли в неблокирующие тосты — модалка прерывала работу)."""
+    page.wait_for_function(
+        "(t) => window.__tgAlerts.some(a => a.includes(t))"
+        " || [...document.querySelectorAll('.toast-msg')].some(e => e.textContent.includes(t))",
+        arg=text,
+    )
 
 
 def _api(page, path: str, body: dict | None = None) -> dict:
@@ -391,7 +397,7 @@ def test_deposit_reject_needs_reason_notifies_manager_and_frees_orders(open_app,
 
     boss.fill(f"{card} .dep-reason", "Не хватает 20 долларов")
     boss.click(f"{card} .dep-reject-send")
-    _alert(boss, "❌ Сдача отклонена")
+    _alert(boss, "Сдача отклонена")
     boss.wait_for_selector(card, state="detached")
     assert e2e.rows("SELECT status, reject_reason, confirmed_by FROM cash_deposits") == [
         {"status": "rejected", "reject_reason": "Не хватает 20 долларов", "confirmed_by": e2e.ids["boss"]},
@@ -435,7 +441,8 @@ def test_deposit_validation_rejects_non_positive_amounts(open_app, e2e):
     assert e2e.rows("SELECT amount_cents, status FROM cash_deposits") == [{"amount_cents": 8055, "status": "pending"}]
     assert e2e.rows("SELECT COUNT(*) AS n FROM cash_deposit_orders")[0]["n"] == 0
     _idle(mgr)
-    assert _norm("— 81 USD") in _norm(_text(mgr, ".stock-row .stock-name"))
+    # Копейки не округляются: 80.55 — это не «81 USD».
+    assert _norm("— 80,55 USD") in _norm(_text(mgr, ".stock-row .stock-name"))
 
 
 # ─── Сдача наличных: FIFO по двум заказам → подтверждение → касса в отчёте ───
@@ -637,7 +644,9 @@ def test_return_refused_for_unshipped_and_foreign_order(open_app, e2e):
     mgr2.click("#ret-create")
     _alert(mgr2, "Возврат только по своим заказам")
     mgr2.click("#ret-load")
-    mgr2.wait_for_function("() => window.__tgAlerts.filter(a => a.includes('только по своим')).length >= 2")
+    # Отказ «Оформить» ушёл в тост (_alert выше его поймал), отказ «Выбрать
+    # позиции» — по-прежнему диалог.
+    mgr2.wait_for_function("() => window.__tgAlerts.some(a => a.includes('только по своим'))")
     assert e2e.rows("SELECT COUNT(*) AS n FROM returns")[0]["n"] == 0
 
 
@@ -662,7 +671,11 @@ def test_cash_refund_for_uzs_order_without_rate_is_not_booked_as_usd(open_app, e
     _alert(boss, "Товар отмечен как принятый")
     boss.wait_for_selector(".ret-confirm:not([disabled])")
     boss.click(".ret-confirm")
-    boss.wait_for_function("() => window.__tgAlerts.some(a => a.includes('Возврат подтверждён') || a.startsWith('❌'))")
+    boss.wait_for_function(
+        "() => window.__tgAlerts.some(a => a.includes('Возврат подтверждён') || a.startsWith('❌'))"
+        " || [...document.querySelectorAll('.toast')].some(t => /Возврат подтверждён/.test(t.textContent)"
+        " || t.classList.contains('toast--error'))"
+    )
     cash = e2e.rows("SELECT amount_cents FROM cash_deposits")
     assert cash != [{"amount_cents": -125_000_000}], "касса «выдала» 1 250 000 USD"
 
@@ -720,7 +733,8 @@ def test_mark_paid_rejects_non_positive_and_clamps_to_remaining(open_app, e2e):
     mgr.fill(field, "999")
     mgr.click(f'.btn-mark-paid[data-id="{oid}"]')
     mgr.wait_for_selector(".toast:has-text('ждёт подтверждения')")
-    assert any("Отметить получение 999?" in a for a in mgr.evaluate("window.__tgAlerts"))
+    # В подтверждении — сумма И валюта: у долгов их несколько.
+    assert any("Отметить получение 999 USD?" in a for a in mgr.evaluate("window.__tgAlerts"))
     assert e2e.rows("SELECT amount_cents, currency, status FROM payments") == [
         {"amount_cents": 20000, "currency": "USD", "status": "pending"},
     ], "переплата срезается до остатка"
@@ -828,7 +842,7 @@ def test_debt_reduction_return_shrinks_debt_and_full_remaining_payment(open_app,
     assert (debt["confirmed"], debt["remaining"]) == (120.0, 80.0)
 
     _money(mgr, "debts")
-    mgr.click(f'.btn-mark-paid[data-id="{oid}"]')  # пусто — весь остаток
+    mgr.click(f'.btn-mark-paid-all[data-id="{oid}"]')  # явная кнопка «Весь остаток»
     mgr.wait_for_selector(".toast:has-text('ждёт подтверждения')")
     assert e2e.rows("SELECT amount_cents FROM payments WHERE status = 'pending'") == [{"amount_cents": 8000}]
     _redraw_debts(boss)
@@ -1164,11 +1178,11 @@ def test_end_to_end_credit_order_payments_shrink_debt_and_match_report(open_app,
     boss.wait_for_selector(".debt-awaiting", state="detached")
     _idle(boss)
 
-    # 4) Пустая сумма — «весь остаток»: ровно 80, не больше.
+    # 4) «Весь остаток» — отдельной кнопкой: ровно 80, не больше.
     _redraw_debts(mgr)
-    mgr.click(f'.btn-mark-paid[data-id="{oid}"]')
+    mgr.click(f'.btn-mark-paid-all[data-id="{oid}"]')
     mgr.wait_for_function("() => document.querySelector('.debt-awaiting')")
-    assert any(a.startswith("confirm:Отметить полную оплату остатка?") for a in mgr.evaluate("window.__tgAlerts"))
+    assert any(a.startswith("confirm:Отметить оплату всего остатка — 80 USD?") for a in mgr.evaluate("window.__tgAlerts"))
     assert e2e.rows("SELECT amount_cents FROM payments ORDER BY id DESC LIMIT 1")[0]["amount_cents"] == 8000
     _redraw_debts(boss)
     boss.click(f'.debt-awaiting .btn-confirm-pay[data-id="{oid}"]')
@@ -1208,7 +1222,7 @@ def test_mark_full_remaining_after_partial_deposit_charges_only_rest(open_app, e
     _money(mgr, "debts")
     field = f'.pay-amount-input[data-id="{oid}"]'
     assert "40USD" in _norm(mgr.get_attribute(field, "placeholder")), "экран честно показывает остаток 40"
-    mgr.click(f'.btn-mark-paid[data-id="{oid}"]')  # пусто → «полная оплата остатка»
+    mgr.click(f'.btn-mark-paid-all[data-id="{oid}"]')  # «Весь остаток»
     mgr.wait_for_selector(".toast:has-text('ждёт подтверждения')")
     assert e2e.rows("SELECT amount_cents FROM payments WHERE order_id = ?", (oid,)) == [{"amount_cents": 4000}]
 

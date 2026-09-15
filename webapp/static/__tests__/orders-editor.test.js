@@ -33,6 +33,7 @@ function boot(driver = '') {
   };
   window.fetch = () => new Promise(() => {});
   window.eval(read('helpers.js'));
+  window.eval(read('net.js'));
   window.eval(`${read('app.js')}\n${driver}`);
   return window;
 }
