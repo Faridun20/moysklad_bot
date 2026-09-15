@@ -1,5 +1,7 @@
 """
-Excel-экспорт аналитики (PR D). Чистая функция → bytes, без сети/БД.
+Excel-экспорт (PR D + продуктовый аудит B6). Чистые функции → bytes, без
+сети/БД — данные готовит вызывающая ручка (`webapp/server.py`), здесь только
+раскладка по листам и защита от формул (`_text`).
 
 build_analytics_xlsx(data) собирает .xlsx из dict'а аналитики (тот же
 формат что отдаёт /api/analytics для boss). Листы:
@@ -8,8 +10,16 @@ build_analytics_xlsx(data) собирает .xlsx из dict'а аналитик�
   • Менеджеры — топ менеджеров
   • Товары   — топ товаров + прибыль (где известна себестоимость)
 
-Доставка — файлом в Telegram (см. /api/analytics/export). openpyxl
-backward-compatible с Excel/Google Sheets/LibreOffice.
+B6 добавляет четыре узкие выгрузки — по одной на экран, из которого их
+вызвали (Склад → Каталог, Деньги → Долги, Склад → Накладные, Клиенты):
+  • build_stock_xlsx           — остаток склада
+  • build_debts_xlsx           — дебиторка со сроками (services.receivables)
+  • build_invoices_xlsx        — накладные за период
+  • build_counterparties_xlsx  — контрагенты: обороты и текущий долг
+
+Доставка — файлом в Telegram (тот же приём, что у `/api/analytics/export`:
+`bot.send_document`, в WebApp нет ни одного места, отдающего файл напрямую
+браузеру). openpyxl backward-compatible с Excel/Google Sheets/LibreOffice.
 """
 
 from __future__ import annotations
@@ -129,3 +139,125 @@ def build_analytics_xlsx(data: dict[str, Any]) -> bytes:
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def _single_sheet(title: str, headers: list[str], rows: list[list[Any]]) -> bytes:
+    """Один лист «заголовок + строки», как у всех B6-выгрузок ниже."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = title
+    ws.append(headers)
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    for row in rows:
+        ws.append(row)
+    _autosize(ws)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def build_stock_xlsx(rows: list[dict[str, Any]]) -> bytes:
+    """Остаток склада: товар, единица, категория, остаток.
+
+    `rows` — из `services.warehouse.get_stock()` (product/unit/category/
+    quantity); строится под экран «Склад → Каталог» — теми же данными, что
+    видны на экране, никакой себестоимости или резерва здесь нет.
+    """
+    data = [
+        [
+            _text(r.get("name")),
+            _text(r.get("unit") or "шт"),
+            _text(r.get("category")),
+            round(float(r.get("quantity", 0) or 0), 3),
+        ]
+        for r in rows
+    ]
+    return _single_sheet("Каталог", ["Товар", "Единица", "Категория", "Остаток"], data)
+
+
+def build_debts_xlsx(rows: list[dict[str, Any]]) -> bytes:
+    """Дебиторка со сроками — заказы в долг и рассрочки техники одним списком.
+
+    `rows` — уже приведены к плоскому виду вызывающей стороной (обычно из
+    `services.receivables.collect()` + `bucket_of()` на каждую строку):
+    source/title/counterparty/owner_name/due_date/amount/currency/bucket_label.
+    """
+    data = [
+        [
+            "Заказ" if r.get("source") == "order" else "Техника",
+            _text(r.get("title")),
+            _text(r.get("counterparty")),
+            _text(r.get("owner_name")),
+            _text(r.get("due_date")) if r.get("due_date") else "—",
+            round(float(r.get("amount", 0) or 0), 2),
+            _text(r.get("currency")),
+            _text(r.get("bucket_label")),
+        ]
+        for r in rows
+    ]
+    return _single_sheet(
+        "Долги",
+        ["Источник", "№", "Контрагент", "Менеджер", "Срок оплаты", "Долг", "Валюта", "Просрочка"],
+        data,
+    )
+
+
+def build_invoices_xlsx(rows: list[dict[str, Any]]) -> bytes:
+    """Накладные за период — списком, без построчного состава.
+
+    `rows` — из `services.warehouse.list_invoices`-подобной выборки за
+    диапазон дат: number/date/type_label/counterparty/amount/currency/
+    status_label.
+    """
+    data = [
+        [
+            _text(r.get("number")),
+            _text(r.get("date")),
+            _text(r.get("type_label")),
+            _text(r.get("counterparty")),
+            round(float(r.get("amount", 0) or 0), 2),
+            _text(r.get("currency")),
+            _text(r.get("status_label")),
+        ]
+        for r in rows
+    ]
+    return _single_sheet(
+        "Накладные",
+        ["Номер", "Дата", "Тип", "Контрагент", "Сумма", "Валюта", "Статус"],
+        data,
+    )
+
+
+def build_counterparties_xlsx(rows: list[dict[str, Any]]) -> bytes:
+    """Контрагенты: обороты и текущий долг.
+
+    `rows` — по контрагенту: name/phone/orders_count/purchases (список
+    {currency,total}) /debts (список {currency,total}). Суммы по нескольким
+    валютам не складываются — каждая валюта своей строкой в колонках
+    «Покупки»/«Долг», через «; ».
+    """
+
+    def _money_list(items) -> str:
+        parts = [f"{float(x.get('total', 0) or 0):,.2f} {x.get('currency')}".replace(",", " ")
+                 for x in (items or [])]
+        return "; ".join(parts) if parts else "—"
+
+    data = [
+        [
+            _text(r.get("name")),
+            _text(r.get("phone")),
+            r.get("orders_count", 0),
+            _money_list(r.get("purchases")),
+            _money_list(r.get("debts")),
+        ]
+        for r in rows
+    ]
+    return _single_sheet(
+        "Клиенты",
+        ["Клиент", "Телефон", "Заказов", "Сумма покупок", "Текущий долг"],
+        data,
+    )

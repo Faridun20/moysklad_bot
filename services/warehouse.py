@@ -1057,6 +1057,41 @@ async def list_invoices(
     ]
 
 
+async def list_invoices_for_export(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    invoice_type: str | None = None,
+) -> list[dict]:
+    """Накладные за период — для Excel-выгрузки (B6, «Склад → Накладные»).
+
+    `invoice_date` — ДАТА (не момент), поэтому границы включительные с обеих
+    сторон: полуинтервал с обрезкой до дня здесь ни к чему (в отличие от
+    `_upper_bound`, который нужен там, где сравнивают с МОМЕНТОМ). Отменённые
+    накладные попадают в выгрузку тоже — статус виден отдельной колонкой,
+    прятать историю от того, кто и так видит её на экране, незачем.
+    """
+    sql = (
+        "SELECT i.id, i.type, i.invoice_number, i.invoice_date, i.status, i.currency, "
+        "       i.total_amount_cents, c.name AS counterparty_name "
+        "FROM invoices i LEFT JOIN counterparties c ON c.id = i.counterparty_id"
+    )
+    where: list[str] = []
+    args: list = []
+    if date_from:
+        args.append(date_from)
+        where.append(f"i.invoice_date >= ${len(args)}")
+    if date_to:
+        args.append(date_to)
+        where.append(f"i.invoice_date <= ${len(args)}")
+    if invoice_type:
+        args.append(invoice_type)
+        where.append(f"i.type = ${len(args)}")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY i.invoice_date ASC, i.id ASC"
+    return await adb_core.fetch(sql, *args)
+
+
 async def mark_telegram_sent(invoice_id: int) -> bool:
     """Отметить, что PDF накладной ушёл клиенту."""
     n = await adb_core.execute(

@@ -419,6 +419,22 @@
       '</button>';
   }
 
+  // Выключатель «Напоминания о долге клиенту» (экран «Настройки», B3):
+  // `app_settings.client_debt_reminders_enabled`, ручка
+  // /api/settings/client_debt_reminders. По умолчанию ВЫКЛ — рассылка живому
+  // клиенту в Telegram требует явного решения владельца.
+  function debtReminderSwitchHtml(on, extraClass) {
+    const hint = on
+      ? 'Включено: клиенту с привязанным Telegram шлём напоминание о просрочке'
+      : 'Выключено: о долге напоминаем только себе (менеджеру и руководству)';
+    const cls = extraClass ? ` ${String(extraClass).replace(/[^a-z0-9 _-]/g, '')}` : '';
+    return `<button type="button" class="work-switch${cls}" role="switch" aria-checked="${on ? 'true' : 'false'}" data-debt-reminder-switch>` +
+      `<span class="work-switch-text"><span class="work-switch-title">Напоминания о долге клиенту</span>` +
+      `<span class="work-switch-hint">${escapeHtml(hint)}</span></span>` +
+      '<span class="work-switch-track" aria-hidden="true"><span class="work-switch-thumb"></span></span>' +
+      '</button>';
+  }
+
   // Рендер блока «Итоги» раздела «Деньги» (данные /api/money/summary):
   // подтверждённые платежи по валютам + сдачи наличных. Чистая функция.
   function renderMoneyTotalsHtml(summary) {
@@ -1270,6 +1286,7 @@
     NAV_BAR_MAX, navBarLayout, navDrawerHtml,
     salesTabs, stockTabs, moneyTabs, clientsTabs,
     BOSS_NAV_ORDER, isBossLike, workActionsOn, deleteActionsOn, roleSectionTabs, resolveScreen, workSwitchHtml, deleteSwitchHtml,
+    debtReminderSwitchHtml,
     periodSegHtml, rangeLabel, formatMoney,
     emptyState, skeleton, errorBoxHtml,
     machineStatusLabel, machineSubtitle, machineStatusSegHtml,

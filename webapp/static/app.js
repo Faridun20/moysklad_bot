@@ -771,6 +771,177 @@ async function toggleDeleteRequiresBoss() {
   }
 }
 
+// «Напоминания о долге клиенту» (экран «Настройки», B3): прямое сообщение в
+// Telegram клиенту с привязанным аккаунтом по просроченному долгу. Выкл. по
+// умолчанию — `/api/settings/client_debt_reminders`, аудит `setting_changed`.
+let _debtReminderSwitchBusy = false;
+async function toggleDebtReminders() {
+  if (_debtReminderSwitchBusy || !isBossRole()) return;
+  const next = !(currentUser && currentUser.client_debt_reminders_enabled);
+  _debtReminderSwitchBusy = true;
+  haptic('light');
+  const marks = () => document.querySelectorAll('[data-debt-reminder-switch]');
+  marks().forEach(el => el.setAttribute('aria-checked', String(next)));
+  try {
+    const res = await api('/api/settings/client_debt_reminders', { enabled: next });
+    if (currentUser) currentUser.client_debt_reminders_enabled = !!(res && res.client_debt_reminders_enabled);
+    toast(next ? 'Клиентам шлём напоминания о долге' : 'Клиентам о долге не пишем', 'info');
+    if (currentScreen === 'settings') showScreen('settings');
+  } catch (e) {
+    marks().forEach(el => el.setAttribute('aria-checked', String(!next)));
+    toast(e.message, 'error');
+  } finally {
+    _debtReminderSwitchBusy = false;
+  }
+}
+
+// ─── Excel-выгрузки (B6) ────────────────────────────────────────────────────
+// Тот же приём, что у «Выгрузить Excel» в отчёте продаж (renderSalesReport):
+// файл уходит ботом в чат, а не скачивается браузером — в WebApp нет ни
+// одного места, которое отдаёт файл напрямую браузеру.
+async function exportExcel(btn, path, body) {
+  if (!btn || btn.disabled) return;
+  haptic('light');
+  const original = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = `${icon('clock')} Готовлю…`;
+  try {
+    await api(path, body || {}, { timeoutMs: 90000 });
+    toast('Excel-файл отправлен в чат с ботом', 'info');
+  } catch (e) {
+    tg.showAlert ? tg.showAlert(e.message) : alert(e.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = original;
+  }
+}
+function exportBtnHtml(id, label) {
+  return `<button type="button" class="btn-secondary" id="${escapeHtml(id)}">${icon('chart')} ${escapeHtml(label || 'Excel')}</button>`;
+}
+
+// ─── Импорт каталога из Excel/CSV (B5) ─────────────────────────────────────
+// Файл едет base64 в JSON (как фото техники — python-multipart не в
+// зависимостях). Поток: выбор файла → превью с ошибками → подтверждение.
+function _fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const s = String(reader.result || '');
+      resolve(s.slice(s.indexOf(',') + 1));
+    };
+    reader.onerror = () => reject(new Error('Не удалось прочитать файл'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function openCatalogImportPicker(onDone) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.xlsx,.csv';
+  input.style.display = 'none';
+  document.body.appendChild(input);
+  input.addEventListener('change', async () => {
+    const file = input.files && input.files[0];
+    input.remove();
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) {
+      tg.showAlert ? tg.showAlert('Файл слишком большой (лимит 5 МБ)') : alert('Файл слишком большой (лимит 5 МБ)');
+      return;
+    }
+    let content_base64;
+    try {
+      content_base64 = await _fileToBase64(file);
+    } catch (e) {
+      tg.showAlert ? tg.showAlert(e.message) : alert(e.message);
+      return;
+    }
+    openCatalogImportPreview(file.name, content_base64, onDone);
+  });
+  input.click();
+}
+
+function openCatalogImportPreview(filename, content_base64, onDone) {
+  haptic('light');
+  const prevBack = _backHandler;
+  const ov = document.createElement('div');
+  ov.className = 'c-overlay';
+  ov.innerHTML = `
+    <div class="c-sheet" role="dialog" aria-modal="true" aria-labelledby="ci-title">
+      <div class="c-sheet-title" id="ci-title">Импорт каталога — превью</div>
+      <div id="ci-body">${skeleton('list', 3)}</div>
+      <div class="c-error" id="ci-error" hidden></div>
+      <div class="c-actions c-actions--stack">
+        <button class="btn-primary" id="ci-submit" disabled>Подтвердить импорт</button>
+        <button class="btn-secondary" id="ci-cancel">Отмена</button>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+  const releasePage = mountPageSheet(ov);
+  const close = () => {
+    ov.remove();
+    releasePage();
+    if (prevBack) showBack(prevBack); else hideBack();
+  };
+  showBack(close);
+  ov.querySelector('#ci-cancel').addEventListener('click', close);
+
+  const body = ov.querySelector('#ci-body');
+  const errEl = ov.querySelector('#ci-error');
+  const submitBtn = ov.querySelector('#ci-submit');
+  const showErr = (msg) => { errEl.textContent = msg || ''; errEl.hidden = !msg; };
+
+  (async () => {
+    let data;
+    try {
+      data = await api('/api/catalog_import/preview', { filename, content_base64 });
+    } catch (e) {
+      body.innerHTML = errorBox(e.message);
+      return;
+    }
+    const rows = data.rows || [];
+    const statusLabel = (s) => s === 'new' ? 'новый товар' : s === 'merge' ? 'объединится' : 'ошибка';
+    body.innerHTML = `
+      <div class="c-field-hint">
+        Строк: ${rows.length} · новых: ${data.new || 0} · объединится: ${data.merge || 0}
+        ${data.errors ? ` · ошибок: <b>${data.errors}</b>` : ''}
+      </div>
+      <div class="c-surface c-surface--list">
+        ${rows.slice(0, 200).map(r => `
+          <div class="c-row" data-status="${r.status === 'error' ? 'overdue' : (r.status === 'new' ? 'confirmed' : 'upcoming')}">
+            <div class="card-row-info">
+              <div class="card-row-title">${escapeHtml(r.name || ('строка ' + r.line))}</div>
+              <div class="card-row-sub">${r.error ? escapeHtml(r.error) : `${escapeHtml(statusLabel(r.status))}${r.merge_with ? ' · ' + escapeHtml(r.merge_with) : ''} · ${formatMoney(r.stock || 0)} ${escapeHtml(r.unit || 'шт')}`}</div>
+            </div>
+          </div>`).join('')}
+      </div>
+      ${rows.length > 200 ? `<div class="c-field-hint">Показаны первые 200 строк из ${rows.length}</div>` : ''}
+    `;
+    if (data.errors) {
+      showErr('В файле есть ошибки — исправьте файл и загрузите заново.');
+    } else if (!rows.length) {
+      showErr('Файл пуст.');
+    } else {
+      submitBtn.disabled = false;
+    }
+  })();
+
+  submitBtn.addEventListener('click', async () => {
+    if (submitBtn.disabled) return;
+    submitBtn.disabled = true;
+    submitBtn.innerHTML = `${icon('clock')} Провожу…`;
+    try {
+      const res = await api('/api/catalog_import/commit', { filename, content_base64 }, { timeoutMs: 60000 });
+      close();
+      toast(`Импорт готов: новых ${res.created}, объединено ${res.merged}`, 'info');
+      if (typeof onDone === 'function') onDone();
+    } catch (e) {
+      submitBtn.disabled = false;
+      submitBtn.innerHTML = 'Подтвердить импорт';
+      showErr(e.message);
+    }
+  });
+}
+
 // Общий бейдж «Решений» — в панели и шторке. Считают экран «Решения» (по
 // своим спискам) и «Сегодня» (по пунктам очереди с адресом `decisions`).
 let decisionsCount = 0;
@@ -1690,6 +1861,11 @@ function renderStockContent() {
     <div class="form-row">
       <input id="stock-search" class="form-input" placeholder="Поиск товара…" value="${escapeHtml(stockSearch)}">
     </div>
+    <div class="c-actions c-actions--wrap">
+      <button type="button" class="btn-secondary" id="stock-import-tpl">${icon('list')} Шаблон</button>
+      <button type="button" class="btn-secondary" id="stock-import">${icon('box')} Импорт из Excel</button>
+      ${exportBtnHtml('stock-export', 'Экспорт')}
+    </div>
     ${filterRow}
     <div class="section-label">Категории</div>
     <div class="cat-row scroll-hint">${catBtns}</div>
@@ -1701,6 +1877,18 @@ function renderStockContent() {
   `;
   wireSectionNav(content, 'stock', renderStockScreen);   // UI-BUG-04
   renderStockList();
+
+  // B6 — Excel-выгрузка остатка. B5 — шаблон и массовый импорт (роли те же,
+  // что у самого экрана: admin/boss/manager).
+  document.getElementById('stock-export')?.addEventListener('click', (ev) => {
+    exportExcel(ev.currentTarget, '/api/stock/export', {});
+  });
+  document.getElementById('stock-import-tpl')?.addEventListener('click', (ev) => {
+    exportExcel(ev.currentTarget, '/api/catalog_import/template', {});
+  });
+  document.getElementById('stock-import')?.addEventListener('click', () => {
+    openCatalogImportPicker(() => renderStockContent());
+  });
 
   // Boss: делегированный клик по строке товара → редактор цены. Вешаем ОДИН
   // раз на контейнер (строки пересоздаются в renderStockList — индивидуальные
@@ -6312,6 +6500,8 @@ async function renderSettingsScreen() {
     <div class="c-surface c-surface--list">${workSwitchHtml(workActionsVisible(), 'c-row')}</div>
     <div class="section-label">Права</div>
     <div class="c-surface c-surface--list">${deleteSwitchHtml(!!(currentUser && currentUser.delete_requires_boss), 'c-row')}</div>
+    <div class="section-label">Клиенты</div>
+    <div class="c-surface c-surface--list">${debtReminderSwitchHtml(!!(currentUser && currentUser.client_debt_reminders_enabled), 'c-row')}</div>
     <div class="section-label">Компания</div>
     <div class="c-surface c-surface--list">
       ${meta && meta.can_edit_company ? row('set-company', 'building', 'Реквизиты компании', companySub) : ''}
@@ -6343,6 +6533,7 @@ async function renderSettingsScreen() {
     ${versionFooterHtml()}`;
   box.querySelector('[data-work-switch]')?.addEventListener('click', (ev) => toggleWorkActions(ev.currentTarget));
   box.querySelector('[data-delete-switch]')?.addEventListener('click', () => toggleDeleteRequiresBoss());
+  box.querySelector('[data-debt-reminder-switch]')?.addEventListener('click', () => toggleDebtReminders());
   box.querySelector('#set-company')?.addEventListener('click', () => {
     haptic('light');
     openCompanyForm(meta, () => showScreen('settings'));
@@ -8728,13 +8919,18 @@ async function renderCreditLimits(container) {
         icon: 'user', title: 'Пока нет клиентов',
         hint: 'Контрагенты появятся после первого заказа или когда их заведут в справочнике.',
       });
-  container.innerHTML = ratesEntry + list;
+  const exportRow = `<div class="c-actions">${exportBtnHtml('clients-export', 'Экспорт в Excel')}</div>`;
+  container.innerHTML = ratesEntry + exportRow + list;
   container.querySelector('#open-rates')?.addEventListener('click', () => {
     haptic('light');
     renderCurrencyRates();
   });
   container.querySelectorAll('[data-agent]').forEach(card => {
     card.addEventListener('click', () => { haptic('light'); renderAgentDetail(card.dataset.agent); });
+  });
+  // B6 — контрагенты с оборотом и текущим долгом.
+  container.querySelector('#clients-export')?.addEventListener('click', (ev) => {
+    exportExcel(ev.currentTarget, '/api/wh/counterparties/export', {});
   });
 }
 
@@ -9148,6 +9344,7 @@ async function renderDebts(container) {
           <button class="seg-item ${debtsFilter === 'today' ? 'active' : ''}" data-f="today" aria-pressed="${debtsFilter === 'today'}">К оплате сейчас</button>
         </div>
       </div>
+      <div class="c-actions">${exportBtnHtml('debts-export', 'Экспорт в Excel')}</div>
     `;
 
     // «Нам должны» с разбивкой по источникам. Деньги лежат в двух учётах —
@@ -9347,6 +9544,12 @@ async function renderDebts(container) {
       });
     });
 
+    // B6 — экспорт дебиторки (заказы в долг +, у руководства, рассрочки
+    // техники) в Excel. Роли и видимость — те же, что у самого экрана.
+    container.querySelector('#debts-export')?.addEventListener('click', (ev) => {
+      exportExcel(ev.currentTarget, '/api/debts/export', {});
+    });
+
     container.querySelectorAll('[data-buyer]').forEach(row => {
       row.addEventListener('click', () => {
         haptic('light');
@@ -9523,10 +9726,15 @@ async function renderWhInvoiceList() {
   const pending = whDraftHasData(whDraft || formDrafts().load(WH_DRAFT));
   const newBtn = `<div class="form-row">
       <button class="btn-primary" id="wh-new">${icon(pending ? 'edit' : 'plus')} ${pending ? 'Продолжить черновик накладной' : 'Новая накладная'}</button>
-    </div>`;
+    </div>
+    <div class="c-actions c-actions--wrap">${exportBtnHtml('wh-invoices-export', 'Экспорт в Excel')}</div>`;
   const wireNew = () => {
     const b = document.getElementById('wh-new');
     if (b) b.addEventListener('click', () => { haptic('light'); whView = 'new'; renderWhInvoicesTab(); });
+    // B6 — весь журнал накладных без диапазона дат (весь список экрана).
+    document.getElementById('wh-invoices-export')?.addEventListener('click', (ev) => {
+      exportExcel(ev.currentTarget, '/api/wh/invoices/export', {});
+    });
   };
 
   if (!rows.length) {
