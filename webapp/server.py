@@ -1127,7 +1127,7 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
     from datetime import datetime
 
     from services import async_db as adb
-    from services.warehouse import list_shipments, sales_stats
+    from services.warehouse import sales_stats, shipment_counts_by_day
 
     _empty_stats: dict = {
         "total": 0, "count": 0, "clients": 0, "top_products": [],
@@ -1143,21 +1143,21 @@ async def _company_analytics_payload(since, until, prev_since, label: str) -> di
             _state["ok"] = False
             return default
 
-    current, prev, shipments = await asyncio.gather(
+    # По дням — агрегатом (shipment_counts_by_day), а не по списку отгрузок:
+    # список обрезан тысячей строк, и в длинном периоде дни молча пустели.
+    current, prev, day_counts = await asyncio.gather(
         _safe_call(sales_stats(since, until), _empty_stats, "sales_stats"),
         _safe_call(sales_stats(prev_since, since), _empty_stats, "sales_stats(prev)"),
-        _safe_call(list_shipments(since, until), [], "list_shipments"),
+        _safe_call(shipment_counts_by_day(since, until), {}, "shipment_counts_by_day"),
     )
     stats_incomplete = not _state["ok"]
 
     days_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     by_day = [0] * 7
-    for s in shipments:
+    for day, n in day_counts.items():
         try:
-            moment = s.get("moment", "")[:10]
-            day_num = datetime.strptime(moment, "%Y-%m-%d").weekday()
-            by_day[day_num] += 1
-        except Exception:
+            by_day[datetime.strptime(day, "%Y-%m-%d").weekday()] += n
+        except ValueError:
             pass
 
     from config import BASE_CURRENCY
@@ -2883,7 +2883,6 @@ async def api_leads_funnel(request: Request):
 # «Показать ещё» листал бы нефильтрованный список и на странице с фильтром
 # оказывалось бы два заказа из двадцати.
 _ORDERS_PAGE_MAX = 200
-_ORDERS_SCOPE_CAP = 5000
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -2931,7 +2930,11 @@ def _paginate_orders(
     date_from: str,
     date_to: str,
 ) -> tuple[list[dict], dict]:
-    """Отфильтровать (статус, период) и нарезать страницу.
+    """Отфильтровать (статус, период) и нарезать страницу — в Python.
+
+    Ручка режет страницу в SQL (`database.get_orders_page`); эта функция —
+    эталон семантики фильтров и полей страницы, с которым SQL-вариант сверяет
+    `tests/test_orders_pagination.py`.
 
     `orders` уже отсортированы свежими вперёд (ORDER BY created_at DESC) —
     порядок страниц держится на нём. `pending_count` считается по ВСЕМ
@@ -2952,12 +2955,21 @@ def _paginate_orders(
 
     filtered = [o for o in orders if keep(o)]
     chunk = filtered[offset : offset + limit]
-    next_offset = offset + len(chunk)
-    return chunk, {
-        "total": len(filtered),
+    return chunk, _page_meta(
+        total=len(filtered), offset=offset, limit=limit, returned=len(chunk),
+        pending_count=pending_count,
+    )
+
+
+def _page_meta(*, total: int, offset: int, limit: int, returned: int, pending_count: int) -> dict:
+    """Поля страницы в ответе `/api/orders` — одна форма для SQL-страницы
+    (`database.get_orders_page`) и для эталонной нарезки `_paginate_orders`."""
+    next_offset = offset + returned
+    return {
+        "total": total,
         "offset": offset,
         "limit": limit,
-        "has_more": next_offset < len(filtered),
+        "has_more": next_offset < total,
         "next_offset": next_offset,
         "pending_count": pending_count,
     }
@@ -2979,7 +2991,34 @@ async def api_orders(request: Request):
     role = get_role(user["id"])
     page = _orders_page_params(data)
 
-    if role in ("admin", "boss"):
+    page_meta: dict = {}
+    if page is not None:
+        # Страница — целиком в SQL (фильтры, LIMIT/OFFSET, total, pending_count):
+        # раньше читались ВСЕ заказы роли и резались в Python, а позиции шли
+        # одним IN по всем id — на истории это предел asyncpg в 32 767
+        # параметров и мегабайты в памяти на каждый вход во вкладку.
+        if role in ("admin", "boss"):
+            scope = "all"
+        elif role == "warehouse_keeper":
+            scope = "to_ship"
+        else:
+            # Со страницами — только свои заказы, как и было (совмещение ролей
+            # добавляет чужие «к отгрузке» лишь в ответе без limit).
+            scope = "user"
+        orders, total, pending_count = await adb.get_orders_page(
+            scope=scope,
+            user_id=user["id"],
+            statuses=page["statuses"],
+            date_from=page["date_from"],
+            date_to=page["date_to"],
+            limit=page["limit"],
+            offset=page["offset"],
+        )
+        page_meta = _page_meta(
+            total=total, offset=page["offset"], limit=page["limit"],
+            returned=len(orders), pending_count=pending_count,
+        )
+    elif role in ("admin", "boss"):
         orders = await adb.get_all_orders()
     elif role == "warehouse_keeper":
         # Кладовщик заказов не создаёт — его список это то, что он отгружает:
@@ -2990,11 +3029,6 @@ async def api_orders(request: Request):
         orders = [
             o for o in await adb.get_all_orders() if o.get("status") in ("approved", "shipped")
         ]
-    elif page is not None:
-        # Со страницами «Показать ещё» дойдёт до старых заказов, поэтому
-        # прежний потолок в 200 последних здесь не годится — иначе у менеджера
-        # с долгой историей список молча обрывался бы на двухсотом.
-        orders = await adb.get_user_orders(user["id"], limit=_ORDERS_SCOPE_CAP)
     else:
         orders = await adb.get_user_orders(user["id"])
         from services.roles import role_allowed
@@ -3015,10 +3049,6 @@ async def api_orders(request: Request):
     from config import BASE_CURRENCY
 
     is_boss = role in ("admin", "boss")
-
-    page_meta: dict = {}
-    if page is not None:
-        orders, page_meta = _paginate_orders(orders, **page)
 
     # Батч-загрузка позиций: один SQL вместо N (N+1 был на больших списках)
     items_by_order = await adb.get_order_items_by_ids([o["id"] for o in orders]) if orders else {}
@@ -3046,7 +3076,7 @@ async def api_orders(request: Request):
         from services import costing
 
         if await costing.is_enabled():
-            shipped_profit = await costing.order_profits()
+            shipped_profit = await costing.order_profits([o["id"] for o in orders])
 
     result = []
     for o in orders:

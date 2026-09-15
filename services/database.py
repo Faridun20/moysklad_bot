@@ -4899,25 +4899,48 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
     На менеджера: orders_count (создано), approved/shipped, revenue (по статусам
     shipped/paid/partially_returned/returned), debt (остаток по неоплаченным
     shipped/partially_returned), returns_count. Имя/роль — из user_roles."""
+    # Запросы — диапазоном по orders.created_at и JOIN'ами к нему, а не
+    # `SELECT *` + три `IN (все id периода)`. Главная босса зовёт это на каждое
+    # открытие: полные строки заказов и списки id на тысячи параметров за
+    # «год» упирались в память и в предел asyncpg (32 767 параметров), а
+    # условие `created_at >= $1 AND created_at <= $2` ложится на индекс
+    # orders(created_at, id). Нужные колонки — явно.
+    period = "o.created_at >= $1 AND o.created_at <= $2 AND (o.ms_deleted_at IS NULL)"
     orders = await adb_core.fetch(
-        "SELECT * FROM orders WHERE created_at >= $1 AND created_at <= $2 "
-        "AND (ms_deleted_at IS NULL)",
+        "SELECT o.id, o.user_id, o.full_name, o.status, o.currency, o.fx_rate_to_base, "
+        f"o.payment_confirmed FROM orders o WHERE {period}",
         since_iso, until_iso,
     )
     if not orders:
         return []
-    order_ids = [o["id"] for o in orders]
-    items_by_order = await get_order_items_by_ids(order_ids)
-    payments_by_order = await get_payments_for_orders(order_ids)
-
-    placeholders = ", ".join(f"${i + 1}" for i in range(len(order_ids)))
-    ret_rows = await adb_core.fetch(
-        f"SELECT order_id, COUNT(*) AS c FROM returns "
-        f"WHERE order_id IN ({placeholders}) AND status = 'confirmed' "
-        f"GROUP BY order_id",
-        *order_ids,
-    )
-    returns_by_order = {r["order_id"]: int(r["c"]) for r in ret_rows}
+    items_by_order: dict[int, list[dict]] = {}
+    for it in await adb_core.fetch(
+        "SELECT oi.order_id, oi.quantity, oi.price_cents FROM order_items oi "
+        f"JOIN orders o ON o.id = oi.order_id WHERE {period}",
+        since_iso, until_iso,
+    ):
+        items_by_order.setdefault(int(it["order_id"]), []).append(it)
+    # Подтверждённые платежи — суммой на заказ; учитываются только у долговых
+    # статусов, поэтому фильтр статуса заказа — сразу в SQL.
+    confirmed_by_order = {
+        int(r["order_id"]): int(r["c"] or 0)
+        for r in await adb_core.fetch(
+            "SELECT p.order_id, COALESCE(SUM(p.amount_cents), 0) AS c FROM payments p "
+            f"JOIN orders o ON o.id = p.order_id WHERE {period} "
+            "AND o.status IN ('shipped', 'partially_returned') AND p.status = 'confirmed' "
+            "GROUP BY p.order_id",
+            since_iso, until_iso,
+        )
+    }
+    returns_by_order = {
+        int(r["order_id"]): int(r["c"])
+        for r in await adb_core.fetch(
+            "SELECT r.order_id, COUNT(*) AS c FROM returns r "
+            f"JOIN orders o ON o.id = r.order_id WHERE {period} AND r.status = 'confirmed' "
+            "GROUP BY r.order_id",
+            since_iso, until_iso,
+        )
+    }
 
     revenue_statuses = {"shipped", "paid", "partially_returned", "returned"}
     debt_statuses = {"shipped", "partially_returned"}
@@ -4990,12 +5013,7 @@ async def get_manager_performance(since_iso: str, until_iso: str) -> list[dict]:
             m["revenue_cents_cur"][ocur] = m["revenue_cents_cur"].get(ocur, 0) + total_cents
             _accum_base(float(money.from_cents(total_cents)), "revenue")
         if status in debt_statuses and not o.get("payment_confirmed"):
-            confirmed = sum(
-                _amount_cents(p)
-                for p in payments_by_order.get(o["id"], [])
-                if p["status"] == "confirmed"
-            )
-            net = max(0, total_cents - confirmed)
+            net = max(0, total_cents - confirmed_by_order.get(int(o["id"]), 0))
             m["debt_cents"] += net
             m["debt_cents_cur"][ocur] = m["debt_cents_cur"].get(ocur, 0) + net
             if net > 0:
@@ -5861,17 +5879,36 @@ async def get_cash_history(
     # итога «Деньги» (get_money_totals), поэтому лента обязана с ним совпадать
     # (иначе платёж «принят» в ленте, но не в сумме — противоречие). standalone-
     # платежи (order_id IS NULL) показываем.
-    pay_params: list = []
-    pay_clause = _period("p.confirmed_at", "p.created_at", pay_params)
-    pay_params.append(limit)
-    pays = await adb_core.fetch(
+    # С периодом — два запроса по статусу. Подтверждённые фильтруются
+    # выражением COALESCE(confirmed_at, created_at) при status = 'confirmed' —
+    # ровно форма частичного индекса payments(COALESCE(confirmed_at,
+    # created_at)) WHERE status = 'confirmed', и за давний период не
+    # просматривается вся свежая история. Остальных статусов мало, их берёт
+    # обратный проход по idx_payments_created. Итог тот же, что у одного
+    # запроса: обе части режутся тем же LIMIT и сливаются по дате ниже.
+    pay_select = (
         "SELECT p.id, p.user_id, p.amount_cents, p.currency, p.status, p.comment, "
         "p.order_id, p.created_at "
         f"FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
-        f"WHERE {_LIVE_ORDER_PAYMENT_FILTER}{pay_clause} "
-        f"ORDER BY p.created_at DESC LIMIT ${len(pay_params)}",
-        *pay_params,
+        f"WHERE {_LIVE_ORDER_PAYMENT_FILTER}"
     )
+    if since or until:
+        pays = []
+        for status_sql in ("p.status = 'confirmed'", "(p.status IS NULL OR p.status <> 'confirmed')"):
+            pay_params: list = []
+            pay_clause = _period("p.confirmed_at", "p.created_at", pay_params)
+            pay_params.append(limit)
+            pays.extend(
+                await adb_core.fetch(
+                    f"{pay_select} AND {status_sql}{pay_clause} "
+                    f"ORDER BY p.created_at DESC LIMIT ${len(pay_params)}",
+                    *pay_params,
+                )
+            )
+    else:
+        pays = await adb_core.fetch(
+            f"{pay_select} ORDER BY p.created_at DESC LIMIT $1", limit
+        )
     dep_params: list = []
     dep_clause = _period("confirmed_at", "created_at", dep_params)
     dep_params.append(limit)
@@ -5963,6 +6000,12 @@ async def get_money_totals(since: str | None = None, until: str | None = None) -
         f"FROM payments p {_LIVE_ORDER_PAYMENT_JOIN.format(p='p')} "
         f"WHERE p.status = 'confirmed' AND {_LIVE_ORDER_PAYMENT_FILTER}"
     )
+    # Форма условия — `status = 'confirmed' AND COALESCE(confirmed_at,
+    # created_at) >= / <=` — совпадает с частичным индексом
+    # payments(COALESCE(confirmed_at, created_at)) WHERE status = 'confirmed'.
+    # Переписав выражение иначе (другой порядок аргументов COALESCE, DATE(...)
+    # поверх), индекс перестанет подходить, и экран «Деньги» снова пойдёт
+    # полным проходом по платежам.
     pay_params: list = []
     if since:
         pay_params.append(since)
@@ -6163,6 +6206,88 @@ async def get_all_orders(status: str | None = None) -> list[dict]:
         query += f" AND status = ${len(params)}"
     query += " ORDER BY created_at DESC"
     return await adb_core.fetch(query, *params)
+
+
+# Области списка заказов по роли — одно определение на страницу и на счётчики.
+ORDER_SCOPES = ("all", "to_ship", "user")
+
+
+async def get_orders_page(
+    *,
+    scope: str,
+    user_id: int | None = None,
+    statuses: list[str] | None = None,
+    date_from: str = "",
+    date_to: str = "",
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict], int, int]:
+    """Страница списка заказов: фильтры, LIMIT/OFFSET и подсчёты — в SQL.
+
+    → (заказы страницы свежими вперёд, total по фильтрам, pending_count по всей
+    области роли без фильтров).
+
+    Раньше `/api/orders` читал ВСЕ заказы роли (`SELECT * FROM orders` без
+    LIMIT), фильтровал и резал страницу в Python, а позиции грузил по
+    `IN (все id)`. На истории это упирается в память и в предел asyncpg — 32 767
+    параметров на запрос — и ручка падает целиком. Здесь в память попадает одна
+    страница.
+
+    `scope`: "all" — руководство; "to_ship" — кладовщик (одобренные и
+    отгруженные); "user" — свои заказы `user_id`. Даты — YYYY-MM-DD
+    включительно, как в `webapp.server._paginate_orders`: день заказа — первые
+    10 знаков `created_at`, условие записано диапазоном по самой колонке, чтобы
+    работал индекс `orders(created_at, id)`. Порядок `created_at DESC, id DESC`
+    — тот же индекс в обратную сторону и стабильные страницы при равных
+    отметках времени.
+    """
+    if scope not in ORDER_SCOPES:
+        raise ValueError(f"неизвестная область заказов: {scope!r}")
+    base_where = ["(ms_deleted_at IS NULL)"]
+    base_args: list = []
+    if scope == "to_ship":
+        base_where.append("status IN ('approved', 'shipped')")
+    elif scope == "user":
+        base_args.append(int(user_id or 0))
+        base_where.append(f"user_id = ${len(base_args)}")
+
+    where = list(base_where)
+    args = list(base_args)
+    wanted = [str(x) for x in dict.fromkeys(statuses or []) if x]
+    if wanted:
+        ph = []
+        for st in wanted:
+            args.append(st)
+            ph.append(f"${len(args)}")
+        where.append(f"status IN ({', '.join(ph)})")
+    if date_from:
+        args.append(date_from[:10])
+        where.append(f"created_at >= ${len(args)}")
+    if date_to:
+        # «По этот день включительно» = строго раньше начала следующего дня.
+        upper = (datetime.strptime(date_to[:10], "%Y-%m-%d") + timedelta(days=1)).strftime(
+            "%Y-%m-%d"
+        )
+        args.append(upper)
+        # created_at > '' — пустая отметка не попадает в период, как в Python-фильтре.
+        where.append(f"created_at < ${len(args)} AND created_at > ''")
+    where_sql = " AND ".join(where)
+
+    total = int(await adb_core.fetchval(f"SELECT COUNT(*) FROM orders WHERE {where_sql}", *args) or 0)
+    pending = int(
+        await adb_core.fetchval(
+            f"SELECT COUNT(*) FROM orders WHERE {' AND '.join(base_where)} AND status = 'pending'",
+            *base_args,
+        )
+        or 0
+    )
+    page_args = [*args, max(1, int(limit)), max(0, int(offset))]
+    rows = await adb_core.fetch(
+        f"SELECT * FROM orders WHERE {where_sql} "
+        f"ORDER BY created_at DESC, id DESC LIMIT ${len(page_args) - 1} OFFSET ${len(page_args)}",
+        *page_args,
+    )
+    return rows, total, pending
 
 
 def _like_escape(s: str) -> str:
@@ -6802,6 +6927,10 @@ def add_order_item(
     return item_id
 
 
+# Размер пачки для `IN (...)`: заметно ниже предела asyncpg (32 767
+# параметров на запрос) и предела SQLite (32 766 с версии 3.32).
+_IN_CHUNK = 5000
+
 _ORDER_ITEMS_SELECT = (
     "SELECT oi.*, op.product_id AS product_id FROM order_items oi "
     "LEFT JOIN order_item_products op ON op.item_id = oi.id"
@@ -6823,11 +6952,18 @@ async def get_order_items_by_ids(order_ids: list[int]) -> dict[int, list[dict]]:
     if not order_ids:
         return {}
     unique_ids = list(set(order_ids))
-    placeholders = ", ".join(f"${i + 1}" for i in range(len(unique_ids)))
-    rows = await adb_core.fetch(
-        f"{_ORDER_ITEMS_SELECT} WHERE oi.order_id IN ({placeholders})",
-        *unique_ids,
-    )
+    rows: list[dict] = []
+    # Пачками: у asyncpg предел — 32 767 параметров на запрос, и «все заказы»
+    # руководства за несколько лет в один IN не помещаются.
+    for start in range(0, len(unique_ids), _IN_CHUNK):
+        chunk = unique_ids[start : start + _IN_CHUNK]
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(chunk)))
+        rows.extend(
+            await adb_core.fetch(
+                f"{_ORDER_ITEMS_SELECT} WHERE oi.order_id IN ({placeholders})",
+                *chunk,
+            )
+        )
     grouped: dict[int, list[dict]] = {}
     for r in rows:
         grouped.setdefault(r["order_id"], []).append(

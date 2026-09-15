@@ -221,13 +221,14 @@ def test_switching_tab_during_orders_load_keeps_report(open_app, e2e, monkeypatc
 
     from services import async_db, database
 
-    orig = database.get_all_orders
+    # Список заказов страницами читает get_orders_page (SQL-страница).
+    orig = database.get_orders_page
 
     async def slow(*a, **kw):
         await asyncio.sleep(1.5)
         return await orig(*a, **kw)
 
-    monkeypatch.setattr(async_db, "get_all_orders", slow, raising=False)
+    monkeypatch.setattr(async_db, "get_orders_page", slow, raising=False)
 
     boss = open_app(e2e.ids["boss"])
     go(boss, "sales")

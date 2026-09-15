@@ -727,26 +727,35 @@ def _upper_bound(value) -> tuple[str, bool]:
     return day, midnight
 
 
-async def list_shipments(since, until=None, limit: int = 1000) -> list[dict]:
-    """Расходные накладные за период, новые сверху.
-
-    Границы как в прежней аналитике: `since` включающая, `until`
-    исключающая — полуинтервал [since, until).
-    """
-    args: list = ["outgoing", _day(since)]
-    sql = (
-        "SELECT i.id, i.invoice_number, i.invoice_date, i.currency, i.total_amount_cents, "
-        "       i.created_at, i.counterparty_id, c.name AS counterparty_name "
-        "FROM invoices i LEFT JOIN counterparties c ON c.id = i.counterparty_id "
-        "WHERE i.type = $1 AND i.status = 'confirmed' AND i.invoice_date >= $2"
-    )
+def _shipments_where(since, until, args: list) -> str:
+    """WHERE расходных накладных за период — одно определение на список,
+    итоги и топы. Границы: `since` включающая, верхняя — `_upper_bound`."""
+    args.append("outgoing")
+    args.append(_day(since))
+    sql = f"i.type = ${len(args) - 1} AND i.status = 'confirmed' AND i.invoice_date >= ${len(args)}"
     if until is not None:
         day, exclusive = _upper_bound(until)
         args.append(day)
         sql += f" AND i.invoice_date {'<' if exclusive else '<='} ${len(args)}"
+    return sql
+
+
+async def list_shipments(since, until=None, limit: int = 1000) -> list[dict]:
+    """Расходные накладные за период, новые сверху — СПИСОК для показа.
+
+    Для итогов не годится: он обрезан `limit`. Итоги и топы считает
+    `sales_stats` агрегатами в SQL, разбивку по дням — `shipment_counts_by_day`.
+    """
+    args: list = []
+    where = _shipments_where(since, until, args)
     args.append(max(1, min(int(limit or 1000), 5000)))
-    sql += f" ORDER BY i.invoice_date DESC, i.id DESC LIMIT ${len(args)}"
-    rows = await adb_core.fetch(sql, *args)
+    rows = await adb_core.fetch(
+        "SELECT i.id, i.invoice_number, i.invoice_date, i.currency, i.total_amount_cents, "
+        "       i.created_at, i.counterparty_id, c.name AS counterparty_name "
+        "FROM invoices i LEFT JOIN counterparties c ON c.id = i.counterparty_id "
+        f"WHERE {where} ORDER BY i.invoice_date DESC, i.id DESC LIMIT ${len(args)}",
+        *args,
+    )
     # `moment` — имя, на которое опирается разбор по дням недели в аналитике.
     for r in rows:
         r["moment"] = r["invoice_date"]
@@ -754,8 +763,54 @@ async def list_shipments(since, until=None, limit: int = 1000) -> list[dict]:
     return rows
 
 
+async def shipment_counts_by_day(since, until=None) -> dict[str, int]:
+    """Число отгрузок по дням периода {YYYY-MM-DD: n} — агрегатом, без лимита.
+
+    Разбивка «по дням недели» в аналитике считалась по `list_shipments`, а он
+    обрезан тысячей строк: в длинном периоде ранние дни молча пропадали."""
+    args: list = []
+    where = _shipments_where(since, until, args)
+    rows = await adb_core.fetch(
+        f"SELECT i.invoice_date AS day, COUNT(*) AS n FROM invoices i WHERE {where} "
+        "GROUP BY i.invoice_date",
+        *args,
+    )
+    return {str(r["day"])[:10]: int(r["n"] or 0) for r in rows}
+
+
+_TOP_LIMIT = 20
+
+
+def _base_equivalent_order(rates: dict[str, float | None], sum_sql: str, args: list) -> str:
+    """ORDER BY для топа «по эквиваленту в базовой валюте», пригодный для LIMIT.
+
+    Курсы — параметрами в CASE по валюте. Строки без курса не выбрасываем
+    (продажа существует и без курса) — они идут после пересчитанных, по сумме.
+    """
+    known = [(cur, float(rate)) for cur, rate in sorted(rates.items()) if rate and rate > 0]
+    if known:
+        whens = []
+        for cur, rate in known:
+            args.append(cur)
+            args.append(rate)
+            whens.append(f"WHEN ${len(args) - 1} THEN CAST(${len(args)} AS DOUBLE PRECISION)")
+        rate_sql = f"(CASE UPPER(i.currency) {' '.join(whens)} END)"
+    else:
+        rate_sql = "CAST(NULL AS DOUBLE PRECISION)"
+    amount = f"CAST({sum_sql} AS DOUBLE PRECISION)"
+    return (
+        f"CASE WHEN {rate_sql} IS NULL THEN 1 ELSE 0 END, "
+        f"COALESCE({amount} * {rate_sql}, {amount}) DESC"
+    )
+
+
 async def sales_stats(since, until=None) -> dict:
     """Выручка, число отгрузок, клиентов, топ товаров и клиентов за период.
+
+    Итоги — агрегатами в SQL по ВСЕМ отгрузкам периода, топы — `ORDER BY …
+    LIMIT` в SQL. Раньше всё считалось в Python по `list_shipments`, а тот
+    обрезан тысячей строк: за период с большим числом отгрузок выручка, число
+    отгрузок, клиенты и топы молча занижались, и ничего об этом не говорило.
 
     Валюты НЕ складываем молча (правило слоя дебиторки, CLAUDE.md). Отчёт
     продаж складывал USD и UZS в одно число: 1 000 USD + 12 500 000 UZS
@@ -764,18 +819,27 @@ async def sales_stats(since, until=None) -> dict:
 
     * `by_currency` — {валюта: копейки}, по отгрузкам как есть;
     * `base_total` — итог в копейках БАЗОВОЙ валюты по текущему курсу, только
-      то, что пересчитать удалось; `base_count` — сколько отгрузок в него
-      вошло (для среднего чека); `missing` — {валюта: копейки} без курса,
-      `base_partial` — часть выручки в итог не вошла. Снимка курса у
-      накладной нет, поэтому курс текущий — как в «Долгах»;
+      то, что пересчитать удалось (пересчёт — один раз на валюту по её сумме);
+      `base_count` — сколько отгрузок в него вошло (для среднего чека);
+      `missing` — {валюта: копейки} без курса, `base_partial` — часть выручки в
+      итог не вошла. Снимка курса у накладной нет, поэтому курс текущий — как в
+      «Долгах»;
     * топ товаров и клиентов — раздельно по валютам (`currency` в строке), а
       порядок — по эквиваленту в базовой валюте;
     * `total` — прежняя сумма копеек всех валют, оставлена для совместимости;
       показывать её человеку нельзя.
     """
     base = _base_currency()
-    shipments = await list_shipments(since, until)
-    if not shipments:
+    args: list = []
+    where = _shipments_where(since, until, args)
+    cur_rows = await adb_core.fetch(
+        "SELECT UPPER(i.currency) AS currency, COUNT(*) AS cnt, "
+        "       COALESCE(SUM(i.total_amount_cents), 0) AS cents "
+        f"FROM invoices i WHERE {where} GROUP BY UPPER(i.currency)",
+        *args,
+    )
+    count = sum(int(r["cnt"] or 0) for r in cur_rows)
+    if not count:
         return {
             "total": 0,
             "count": 0,
@@ -790,77 +854,96 @@ async def sales_stats(since, until=None) -> dict:
             "missing": {},
         }
 
+    by_currency: dict[str, int] = {}
+    counts: dict[str, int] = {}
+    for r in cur_rows:
+        cur = (r["currency"] or base).upper()
+        by_currency[cur] = by_currency.get(cur, 0) + int(r["cents"] or 0)
+        counts[cur] = counts.get(cur, 0) + int(r["cnt"] or 0)
+
     # Курс — синхронное чтение с кэшем; один раз на валюту и в потоке, чтобы
     # промах кэша не держал event loop.
     rates: dict[str, float | None] = {}
-    for cur in {(s.get("currency") or base).upper() for s in shipments}:
+    for cur in by_currency:
         rates[cur] = await asyncio.to_thread(_db.current_rate_to_base, cur)
 
-    def _rate(cur: str) -> float | None:
-        return rates.get(cur)
-
-    total = sum(int(s["total_amount_cents"] or 0) for s in shipments)
-    by_currency: dict[str, int] = {}
-    by_client: dict[tuple[str, str], dict] = {}
     base_total = 0
     base_count = 0
     missing: dict[str, int] = {}
-    for s in shipments:
-        cur = (s.get("currency") or base).upper()
-        cents = int(s["total_amount_cents"] or 0)
-        by_currency[cur] = by_currency.get(cur, 0) + cents
-        rate = _rate(cur)
+    for cur, cents in by_currency.items():
+        rate = rates.get(cur)
         if rate is None or rate <= 0:
-            missing[cur] = missing.get(cur, 0) + cents
+            missing[cur] = cents
         else:
             base_total += money.convert_cents(cents, rate)
-            base_count += 1
-        cname = s.get("counterparty_name") or "—"
-        c = by_client.setdefault((cname, cur), {"sum": 0, "count": 0, "currency": cur})
-        c["sum"] += cents
-        c["count"] += 1
-    clients = len({s.get("counterparty_id") for s in shipments if s.get("counterparty_id")})
-    currency_by_invoice = {int(s["id"]): (s.get("currency") or base).upper() for s in shipments}
+            base_count += counts[cur]
 
-    ids = [int(s["id"]) for s in shipments]
-    placeholders = ", ".join(f"${i + 1}" for i in range(len(ids)))
-    positions = await adb_core.fetch(
-        f"SELECT ii.invoice_id, ii.product_id, p.name, ii.quantity, ii.price_cents "
-        f"FROM invoice_items ii JOIN products p ON p.id = ii.product_id "
-        f"WHERE ii.invoice_id IN ({placeholders})",
-        *ids,
-    )
-    product_sums: dict[tuple[str, str], dict] = {}
-    for pos in positions:
-        name = pos["name"] or "—"
-        cur = currency_by_invoice.get(int(pos["invoice_id"]), base)
-        d = product_sums.setdefault(
-            (name, cur), {"sum": 0, "qty": 0.0, "product_id": None, "currency": cur}
+    # Клиенты — отдельным запросом: один и тот же покупатель в двух валютах —
+    # всё равно один клиент, сумма COUNT(DISTINCT) по группам его удвоила бы.
+    clients = int(
+        await adb_core.fetchval(
+            f"SELECT COUNT(DISTINCT i.counterparty_id) FROM invoices i WHERE {where}", *args
         )
-        d["sum"] += money.mul_qty(int(pos["price_cents"] or 0), float(pos["quantity"] or 0))
-        d["qty"] += float(pos["quantity"] or 0)
-        d["product_id"] = int(pos["product_id"])
-
-    def _order_key(d: dict) -> tuple[bool, int]:
-        # По эквиваленту в базовой валюте; строки без курса — в конец, но не
-        # выбрасываем: продажа существует и без курса.
-        rate = _rate(d["currency"])
-        if rate is None or rate <= 0:
-            return (True, -d["sum"])
-        return (False, -money.convert_cents(d["sum"], rate))
-
-    top_products = sorted(
-        ((name, d) for (name, _cur), d in product_sums.items()), key=lambda kv: _order_key(kv[1])
+        or 0
     )
-    top_clients = sorted(
-        ((name, d) for (name, _cur), d in by_client.items()), key=lambda kv: _order_key(kv[1])
+
+    client_args = list(args)
+    client_order = _base_equivalent_order(rates, "SUM(i.total_amount_cents)", client_args)
+    client_args.append(_TOP_LIMIT)
+    client_rows = await adb_core.fetch(
+        "SELECT COALESCE(c.name, '—') AS name, UPPER(i.currency) AS currency, "
+        "       COALESCE(SUM(i.total_amount_cents), 0) AS sum_cents, COUNT(*) AS cnt "
+        "FROM invoices i LEFT JOIN counterparties c ON c.id = i.counterparty_id "
+        f"WHERE {where} GROUP BY COALESCE(c.name, '—'), UPPER(i.currency) "
+        f"ORDER BY {client_order}, COALESCE(c.name, '—') LIMIT ${len(client_args)}",
+        *client_args,
     )
+
+    line_sum = "SUM(CAST(round(ii.quantity * ii.price_cents) AS BIGINT))"
+    prod_args = list(args)
+    prod_order = _base_equivalent_order(rates, f"COALESCE({line_sum}, 0)", prod_args)
+    prod_args.append(_TOP_LIMIT)
+    prod_rows = await adb_core.fetch(
+        "SELECT p.name AS name, UPPER(i.currency) AS currency, "
+        f"       COALESCE({line_sum}, 0) AS sum_cents, "
+        "       COALESCE(SUM(ii.quantity), 0) AS qty, MAX(ii.product_id) AS product_id "
+        "FROM invoice_items ii "
+        "JOIN invoices i ON i.id = ii.invoice_id "
+        "JOIN products p ON p.id = ii.product_id "
+        f"WHERE {where} GROUP BY p.name, UPPER(i.currency) "
+        f"ORDER BY {prod_order}, p.name LIMIT ${len(prod_args)}",
+        *prod_args,
+    )
+
+    top_products = [
+        (
+            r["name"] or "—",
+            {
+                "sum": int(r["sum_cents"] or 0),
+                "qty": float(r["qty"] or 0),
+                "product_id": int(r["product_id"]) if r["product_id"] is not None else None,
+                "currency": (r["currency"] or base).upper(),
+            },
+        )
+        for r in prod_rows
+    ]
+    top_clients = [
+        (
+            r["name"] or "—",
+            {
+                "sum": int(r["sum_cents"] or 0),
+                "count": int(r["cnt"] or 0),
+                "currency": (r["currency"] or base).upper(),
+            },
+        )
+        for r in client_rows
+    ]
     return {
-        "total": total,
-        "count": len(shipments),
+        "total": sum(by_currency.values()),
+        "count": count,
         "clients": clients,
-        "top_products": top_products[:20],
-        "top_clients": top_clients[:20],
+        "top_products": top_products,
+        "top_clients": top_clients,
         "by_currency": by_currency,
         "base_currency": base,
         "base_total": base_total,
