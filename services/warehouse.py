@@ -277,9 +277,20 @@ async def create_invoice_in(
             {"product_ids": missing},
         )
 
-    wh = await txn.fetchval("SELECT id FROM warehouses WHERE id = $1", warehouse_id)
-    if wh is None:
+    wh_row = await txn.fetchrow(
+        "SELECT w.id, (wa.warehouse_id IS NOT NULL) AS archived FROM warehouses w "
+        "LEFT JOIN warehouse_archived wa ON wa.warehouse_id = w.id WHERE w.id = $1",
+        warehouse_id,
+    )
+    if wh_row is None:
         raise InvoiceError("unknown_warehouse", f"Склад #{warehouse_id} не найден")
+    # Архивный склад не предлагается в форме (`list_warehouses(include_archived=
+    # False)`), но проверяем и здесь — прямой вызов ручки с чужим id не должен
+    # тихо провести накладную на склад, который уже считается пустым и закрытым.
+    # Пока архивных складов нет вовсе (сегодняшний случай), это условие никогда
+    # не срабатывает — поведение при одном складе не меняется.
+    if bool(wh_row["archived"]):
+        raise InvoiceError("archived_warehouse", f"Склад #{warehouse_id} в архиве")
 
     if counterparty_id is not None:
         cp = await txn.fetchval("SELECT id FROM counterparties WHERE id = $1", counterparty_id)
@@ -596,13 +607,384 @@ async def cancel_invoice(invoice_id: int, cancelled_by: int | None = None) -> di
 async def default_warehouse_id() -> int:
     """Склад по умолчанию — тот, что засеял `seed_warehouses`.
 
-    Берём минимальный id, а не константу 1: на проде склад могли завести
-    руками раньше сидинга, и захардкоженная единица указывала бы в пустоту —
-    накладная отвергалась бы «склад не найден» на ровном месте.
+    Берём минимальный id СРЕДИ АКТИВНЫХ, а не константу 1: на проде склад
+    могли завести руками раньше сидинга, и захардкоженная единица указывала
+    бы в пустоту — накладная отвергалась бы «склад не найден» на ровном
+    месте. Архивный склад в кандидаты не попадает: он не предлагается ни в
+    одной форме, и молчаливое списание туда/оттуда удивило бы кладовщика.
     """
+    wid = await adb_core.fetchval(
+        "SELECT MIN(w.id) FROM warehouses w "
+        "LEFT JOIN warehouse_archived wa ON wa.warehouse_id = w.id "
+        "WHERE wa.warehouse_id IS NULL"
+    )
+    if wid is not None:
+        return int(wid)
+    # Все склады в архиве (или их нет) — деградируем к минимальному id вообще,
+    # чтобы не отвечать «склад не найден» там, где раньше отвечали.
     wid = await adb_core.fetchval("SELECT MIN(id) FROM warehouses")
     return int(wid) if wid is not None else 1
 
+
+# ─── Справочник складов (B8 — несколько складов) ───────────────────────────
+#
+# Пока в компании ОДНА физическая точка, и `seed_warehouses` заводит её одну
+# («Основной склад»). Экран управления складами — на будущее: список/
+# добавление/переименование/архив, admin/boss-only. Инвариант: пока склад
+# один — поведение системы byte-в-byte как до этого раздела (все выборки
+# `default_warehouse_id()`/`list_warehouses(include_archived=False)` с одним
+# складом отдают ровно его).
+
+
+class WarehouseError(Exception):
+    """Операция со справочником складов/перемещением отклонена.
+
+    `code` — машиночитаемая причина для WebApp, `message` — текст менеджеру.
+    """
+
+    def __init__(self, code: str, message: str, details: dict | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details or {}
+
+
+_WAREHOUSE_NAME_MAX = 200
+
+
+def _clean_warehouse_name(raw: str | None) -> str:
+    text = " ".join(str(raw or "").split())
+    if not text:
+        raise WarehouseError("bad_name", "Укажите название склада")
+    if len(text) > _WAREHOUSE_NAME_MAX:
+        raise WarehouseError("bad_name", "Слишком длинное название склада")
+    return text
+
+
+async def list_warehouses(include_archived: bool = True) -> list[dict]:
+    """Справочник складов. `include_archived=False` — только для выбора
+    (накладная, перемещение, заказ): архивный склад в форме не нужен."""
+    sql = (
+        "SELECT w.id, w.name, (wa.warehouse_id IS NOT NULL) AS archived "
+        "FROM warehouses w LEFT JOIN warehouse_archived wa ON wa.warehouse_id = w.id"
+    )
+    if not include_archived:
+        sql += " WHERE wa.warehouse_id IS NULL"
+    sql += f" ORDER BY {adb_core.order_by_name('w.name')}, w.id"
+    rows = await adb_core.fetch(sql)
+    return [{"id": int(r["id"]), "name": r["name"], "archived": bool(r["archived"])} for r in rows]
+
+
+async def active_warehouse_count() -> int:
+    """Сколько складов НЕ в архиве — им управляют экраны выбора («показывать
+    ли пикер», «показывать ли разбивку по складам в каталоге»)."""
+    n = await adb_core.fetchval(
+        "SELECT COUNT(*) FROM warehouses w "
+        "LEFT JOIN warehouse_archived wa ON wa.warehouse_id = w.id "
+        "WHERE wa.warehouse_id IS NULL"
+    )
+    return int(n or 0)
+
+
+async def create_warehouse(name: str, *, created_by: int | None = None) -> dict:
+    """Завести склад. Тёзку (без учёта регистра/пробелов) не заводим —
+    проверка ВНУТРИ транзакции, кнопку можно нажать дважды."""
+    clean = _clean_warehouse_name(name)
+    async with adb_core.transaction() as txn:
+        existing = await txn.fetchrow(
+            "SELECT id, name FROM warehouses WHERE lower(name) = lower($1)", clean
+        )
+        if existing is not None:
+            return {"ok": True, "warehouse_id": int(existing["id"]), "name": existing["name"], "existed": True}
+        await txn.execute("INSERT INTO warehouses (name) VALUES ($1)", clean)
+        wid = await txn.fetchval("SELECT id FROM warehouses WHERE lower(name) = lower($1)", clean)
+    logger.info("Склад #%s «%s» заведён (created_by=%s)", wid, clean, created_by)
+    return {"ok": True, "warehouse_id": int(wid), "name": clean, "existed": False}
+
+
+async def rename_warehouse(warehouse_id: int, name: str) -> dict:
+    clean = _clean_warehouse_name(name)
+    async with adb_core.transaction() as txn:
+        row = await txn.fetchrow("SELECT id FROM warehouses WHERE id = $1", int(warehouse_id))
+        if row is None:
+            raise WarehouseError("not_found", f"Склад #{warehouse_id} не найден")
+        dupe = await txn.fetchrow(
+            "SELECT id FROM warehouses WHERE lower(name) = lower($1) AND id <> $2",
+            clean, int(warehouse_id),
+        )
+        if dupe is not None:
+            raise WarehouseError("duplicate_name", f"Склад «{clean}» уже есть")
+        await txn.execute("UPDATE warehouses SET name = $1 WHERE id = $2", clean, int(warehouse_id))
+    return {"ok": True, "warehouse_id": int(warehouse_id), "name": clean}
+
+
+async def archive_warehouse(warehouse_id: int, *, archived_by: int | None = None) -> dict:
+    """В архив можно только пустой склад (остаток 0 по всем товарам) — иначе
+    товар «пропадает» из выбора при живом остатке."""
+    wid = int(warehouse_id)
+    async with adb_core.transaction() as txn:
+        row = await txn.fetchrow("SELECT id FROM warehouses WHERE id = $1", wid)
+        if row is None:
+            raise WarehouseError("not_found", f"Склад #{wid} не найден")
+        already = await txn.fetchval(
+            "SELECT warehouse_id FROM warehouse_archived WHERE warehouse_id = $1", wid
+        )
+        if already is not None:
+            return {"ok": True, "warehouse_id": wid, "already_archived": True}
+        nonzero = await txn.fetchval(
+            "SELECT COUNT(*) FROM stock WHERE warehouse_id = $1 AND quantity <> 0", wid
+        )
+        if int(nonzero or 0):
+            raise WarehouseError(
+                "nonzero_stock",
+                "На складе есть остаток — сначала переместите товар на другой склад",
+            )
+        remaining = await active_warehouse_count()
+        if remaining <= 1:
+            raise WarehouseError(
+                "last_active_warehouse",
+                "Нельзя архивировать последний активный склад",
+            )
+        await txn.execute(
+            "INSERT INTO warehouse_archived (warehouse_id, archived_at, archived_by) "
+            "VALUES ($1, $2, $3)",
+            wid, _db.now_str(), archived_by,
+        )
+    logger.info("Склад #%s отправлен в архив (archived_by=%s)", wid, archived_by)
+    return {"ok": True, "warehouse_id": wid, "already_archived": False}
+
+
+async def unarchive_warehouse(warehouse_id: int) -> dict:
+    n = await adb_core.execute(
+        "DELETE FROM warehouse_archived WHERE warehouse_id = $1", int(warehouse_id)
+    )
+    return {"ok": True, "warehouse_id": int(warehouse_id), "restored": bool(n)}
+
+
+async def last_used_warehouse_id(user_id: int) -> int | None:
+    """Склад, который человек указывал последним в своих накладных — предлагаем
+    его по умолчанию в форме, как `pay_accounts.last_used`. None — ещё ничего
+    не проводил (форма отдаёт единственный/первый активный склад)."""
+    wid = await adb_core.fetchval(
+        "SELECT warehouse_id FROM invoices WHERE created_by = $1 "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        int(user_id),
+    )
+    return int(wid) if wid is not None else None
+
+
+async def get_order_warehouse(order_id: int) -> int | None:
+    """Склад, с которого отгружать ЭТОТ заказ, если менеджер его выбрал.
+    None — обычный случай (нет строки), отгрузка берёт склад по умолчанию."""
+    wid = await adb_core.fetchval(
+        "SELECT warehouse_id FROM order_warehouse WHERE order_id = $1", int(order_id)
+    )
+    return int(wid) if wid is not None else None
+
+
+async def set_order_warehouse(order_id: int, warehouse_id: int) -> dict:
+    """Запомнить выбор склада для черновика заказа. UPSERT — форма может
+    вызываться повторно (передумал менеджер)."""
+    wid = int(warehouse_id)
+    row = await adb_core.fetchrow(
+        "SELECT id FROM warehouses w LEFT JOIN warehouse_archived wa "
+        "ON wa.warehouse_id = w.id WHERE w.id = $1 AND wa.warehouse_id IS NULL",
+        wid,
+    )
+    if row is None:
+        raise WarehouseError("unknown_warehouse", f"Склад #{wid} не найден или в архиве")
+    if _db.USE_POSTGRES:
+        await adb_core.execute(
+            "INSERT INTO order_warehouse (order_id, warehouse_id) VALUES ($1, $2) "
+            "ON CONFLICT (order_id) DO UPDATE SET warehouse_id = EXCLUDED.warehouse_id",
+            int(order_id), wid,
+        )
+    else:
+        updated = await adb_core.execute(
+            "UPDATE order_warehouse SET warehouse_id = $1 WHERE order_id = $2", wid, int(order_id)
+        )
+        if not updated:
+            await adb_core.execute(
+                "INSERT INTO order_warehouse (order_id, warehouse_id) VALUES ($1, $2)",
+                int(order_id), wid,
+            )
+    return {"ok": True, "order_id": int(order_id), "warehouse_id": wid}
+
+
+async def resolve_order_warehouse(order_id: int) -> int:
+    """Склад отгрузки заказа: выбор менеджера, если есть, иначе — по
+    умолчанию. Единственная точка, которую зовёт `order_shipment.ship_order` —
+    в однoскладском случае строки в `order_warehouse` нет никогда, и ответ
+    всегда `default_warehouse_id()`, как до этого раздела."""
+    chosen = await get_order_warehouse(order_id)
+    if chosen is not None:
+        return chosen
+    return await default_warehouse_id()
+
+
+# ─── Перемещение остатка между складами ─────────────────────────────────────
+
+
+async def transfer_stock(
+    *,
+    product_id: int,
+    quantity: float,
+    from_warehouse_id: int,
+    to_warehouse_id: int,
+    comment: str | None = None,
+    created_by: int | None = None,
+) -> dict:
+    """Переместить остаток товара между складами — одна транзакция.
+
+    Списывает с одного склада, приходует на другой, пишет строку в
+    `stock_transfers` для истории. Остаток никогда не уходит в минус: как и
+    у накладных, нехватка откатывает всё перемещение целиком. Возвращает
+    `{"ok": True, "transfer_id", ...}` либо `{"ok": False, "code", "reason"}`.
+    """
+    try:
+        pid = int(product_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "code": "bad_product_id", "reason": "Некорректный товар"}
+    try:
+        qty = float(quantity)
+    except (TypeError, ValueError):
+        return {"ok": False, "code": "bad_quantity", "reason": "Некорректное количество"}
+    if qty <= 0:
+        return {"ok": False, "code": "bad_quantity", "reason": "Количество должно быть больше нуля"}
+    from_wh = int(from_warehouse_id)
+    to_wh = int(to_warehouse_id)
+    if from_wh == to_wh:
+        return {
+            "ok": False,
+            "code": "same_warehouse",
+            "reason": "Склад отправления и назначения совпадают",
+        }
+
+    try:
+        async with adb_core.transaction() as txn:
+            wh_rows = await txn.fetch(
+                "SELECT w.id, (wa.warehouse_id IS NOT NULL) AS archived "
+                "FROM warehouses w LEFT JOIN warehouse_archived wa ON wa.warehouse_id = w.id "
+                "WHERE w.id IN ($1, $2)",
+                from_wh, to_wh,
+            )
+            found = {int(r["id"]): bool(r["archived"]) for r in wh_rows}
+            missing = [w for w in (from_wh, to_wh) if w not in found]
+            if missing:
+                raise WarehouseError(
+                    "unknown_warehouse", f"Склад не найден: {', '.join(map(str, missing))}"
+                )
+            archived = [w for w in (from_wh, to_wh) if found.get(w)]
+            if archived:
+                raise WarehouseError(
+                    "archived_warehouse",
+                    f"Склад в архиве: {', '.join(map(str, archived))}",
+                )
+            product = await txn.fetchval("SELECT id FROM products WHERE id = $1", pid)
+            if product is None:
+                raise WarehouseError("unknown_product", f"Товар #{pid} не найден")
+
+            # Блокируем обе строки остатка в детерминированном порядке (по
+            # warehouse_id) — как позиции накладной сортируются по product_id:
+            # без него встречное перемещение того же товара [A→B] и [B→A]
+            # берёт строки в обратном порядке и ловит deadlock на Postgres.
+            locked_qty: dict[int, float] = {}
+            for wh in sorted((from_wh, to_wh)):
+                sql = "SELECT quantity FROM stock WHERE product_id = $1 AND warehouse_id = $2"
+                if _db.USE_POSTGRES:
+                    sql += " FOR UPDATE"
+                val = await txn.fetchval(sql, pid, wh)
+                locked_qty[wh] = float(val or 0)
+            have_from = locked_qty[from_wh]
+            if have_from < qty:
+                raise WarehouseError(
+                    "insufficient_stock",
+                    f"На складе не хватает остатка: нужно {qty:g}, есть {have_from:g}",
+                    {"have": have_from, "need": qty},
+                )
+
+            await _apply_stock_delta(txn, pid, from_wh, -qty)
+            await _apply_stock_delta(txn, pid, to_wh, qty)
+
+            created = _db.now_str()
+            await txn.execute(
+                "INSERT INTO stock_transfers (product_id, from_warehouse_id, to_warehouse_id, "
+                "quantity, comment, created_by, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                pid, from_wh, to_wh, qty, comment, created_by, created,
+            )
+            # RETURNING обходим тем же приёмом, что и накладные: SQLite до
+            # 3.35 его не знает, а строка уже под нашей транзакцией — второй
+            # SELECT безопасен. MAX(id) — счётчик перемещений один на всю
+            # таблицу, гонки внутри своей же открытой транзакции нет.
+            transfer_id = await txn.fetchval(
+                "SELECT MAX(id) FROM stock_transfers WHERE product_id = $1 "
+                "AND from_warehouse_id = $2 AND to_warehouse_id = $3 AND created_at = $4",
+                pid, from_wh, to_wh, created,
+            )
+    except WarehouseError as e:
+        logger.info("Перемещение не проведено (%s): %s", e.code, e.message)
+        return {"ok": False, "code": e.code, "reason": e.message, "details": e.details}
+
+    logger.info(
+        "Перемещение #%s: товар #%s, %s → %s, %.4g",
+        transfer_id, pid, from_wh, to_wh, qty,
+    )
+    return {
+        "ok": True,
+        "transfer_id": int(transfer_id) if transfer_id is not None else None,
+        "product_id": pid,
+        "from_warehouse_id": from_wh,
+        "to_warehouse_id": to_wh,
+        "quantity": qty,
+    }
+
+
+async def list_stock_transfers(limit: int = 50, offset: int = 0) -> list[dict]:
+    """История перемещений, новые сверху — для экрана босса."""
+    cap = max(1, min(int(limit or 50), 500))
+    return await adb_core.fetch(
+        "SELECT t.id, t.product_id, p.name AS product_name, p.unit, "
+        "       t.from_warehouse_id, wf.name AS from_warehouse_name, "
+        "       t.to_warehouse_id, wt.name AS to_warehouse_name, "
+        "       t.quantity, t.comment, t.created_by, t.created_at "
+        "FROM stock_transfers t "
+        "JOIN products p ON p.id = t.product_id "
+        "JOIN warehouses wf ON wf.id = t.from_warehouse_id "
+        "JOIN warehouses wt ON wt.id = t.to_warehouse_id "
+        "ORDER BY t.id DESC LIMIT $1 OFFSET $2",
+        cap, offset,
+    )
+
+
+async def stock_breakdown(product_ids: list[int] | None = None) -> dict[int, list[dict]]:
+    """Остаток по складам для каталога: {product_id: [{warehouse_id, name, quantity}]}.
+
+    Зовётся ТОЛЬКО когда активных складов больше одного (см. `api_stock`) —
+    при одном складе разбивка не нужна: сумма и так равна остатку на нём."""
+    args: list = []
+    where = ""
+    if product_ids:
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(product_ids)))
+        where = f"WHERE s.product_id IN ({placeholders})"
+        args = list(product_ids)
+    rows = await adb_core.fetch(
+        "SELECT s.product_id, s.warehouse_id, w.name AS warehouse_name, s.quantity "
+        "FROM stock s JOIN warehouses w ON w.id = s.warehouse_id "
+        f"{where} "
+        f"ORDER BY s.product_id, {adb_core.order_by_name('w.name')}",
+        *args,
+    )
+    out: dict[int, list[dict]] = {}
+    for r in rows:
+        pid = int(r["product_id"])
+        out.setdefault(pid, []).append(
+            {
+                "warehouse_id": int(r["warehouse_id"]),
+                "warehouse_name": r["warehouse_name"],
+                "quantity": float(r["quantity"] or 0),
+            }
+        )
+    return out
 
 
 async def get_stock(warehouse_id: int | None = None, only_positive: bool = False) -> list[dict]:

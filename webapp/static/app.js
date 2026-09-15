@@ -1453,6 +1453,17 @@ function renderStockList() {
         else if (isBoss && p.cost_price != null) priceLines.push(`себест. ${p.cost_price}`);
         const priceHtml = priceLines.length
           ? `<div class="stock-price">${escapeHtml(priceLines.join(' · '))}</div>` : '';
+        // B8: разбивка по складам — ТОЛЬКО когда складов больше одного
+        // (`stockData.multi_warehouse`, `by_warehouse` приходит только тогда).
+        // Пока склад один — эта строка не рисуется вовсе, каталог не меняется.
+        const whBreakdown = stockData.multi_warehouse && Array.isArray(p.by_warehouse)
+          ? p.by_warehouse.filter(w => w.quantity > 0)
+          : null;
+        const whHtml = whBreakdown && whBreakdown.length
+          ? `<div class="stock-folder stock-by-warehouse">${
+              whBreakdown.map(w => `${escapeHtml(w.warehouse_name)}: ${whQty(w.quantity)}`).join(' · ')
+            }</div>`
+          : '';
         // Boss может тапнуть товар → редактор цен.
         // В режиме «залежалось» строка — метка чекбокса для поста в канал,
         // а не переход в редактор цены.
@@ -1469,6 +1480,7 @@ function renderStockList() {
             <div class="stock-name">${escapeHtml(p.name)}</div>
             <div class="stock-folder">${escapeHtml(p.folder_name || '—')} · ${escapeHtml(p.unit || 'шт')}${
               p.reserve > 0 ? ` · в резерве ${whQty(p.reserve)}` : ''}</div>
+            ${whHtml}
             ${priceHtml}
           </div>
           ${_stockBadge(p.available != null ? p.available : p.stock)}${editHint}
@@ -5201,7 +5213,33 @@ async function openOrderEditor(orderId) {
     items: [],
     agent_id: null,
     agent_name: null,
+    warehouse_id: null,
+    warehouse_name: null,
   };
+
+  // B8: склад отгрузки — спрашиваем, только если `/api/me` уже сказал, что
+  // активных складов больше одного (`currentUser.multi_warehouse`). Пока
+  // склад один (сегодняшний случай) — НИ ОДНОГО лишнего похода в сеть, экран
+  // заказа ведёт себя ровно как раньше. Кэш — на сессию (`whWarehouses`,
+  // общий с формой накладной).
+  if (currentUser && currentUser.multi_warehouse) {
+    try {
+      const whList = whWarehouses ? { warehouses: whWarehouses, last_used_warehouse_id: null }
+        : await api('/api/warehouses/active', {});
+      whWarehouses = whList.warehouses || [];
+      if (whWarehouses.length > 1) {
+        // Черновик мог уже иметь выбор склада с прошлого открытия (сервер
+        // хранит его в `order_warehouse` — источник правды для самой
+        // отгрузки); здесь лишь дефолт для НОВОГО выбора.
+        currentDraftOrder.warehouse_id = whList.last_used_warehouse_id || whWarehouses[0].id;
+        const picked = whWarehouses.find(w => w.id === currentDraftOrder.warehouse_id);
+        currentDraftOrder.warehouse_name = picked ? picked.name : null;
+      }
+    } catch (_e) {
+      // Складов не узнали — не блокируем заказ: как и раньше, отгрузка
+      // возьмёт склад по умолчанию на сервере.
+    }
+  }
 
   // Черновик с несохранёнными позициями — просим подтверждение, если юзер
   // свайпает WebApp закрытым (снимается в showScreen и после отправки заказа).
@@ -5270,6 +5308,13 @@ function renderOrderEditor() {
       <div class="editor-title">Заказ #${order.id}</div>
     </div>
 
+    ${whWarehouses && whWarehouses.length > 1 ? `
+    <div class="section-label">Склад отгрузки</div>
+    <div class="agent-selector" id="warehouse-selector">
+      <div class="agent-selected">${icon('box')} ${escapeHtml(order.warehouse_name || 'Выберите склад')}
+        <button id="change-warehouse">Изменить</button></div>
+    </div>` : ''}
+
     <div class="section-label">Клиент</div>
     <div class="agent-selector" id="agent-selector">
       ${order.agent_name
@@ -5320,6 +5365,30 @@ function renderOrderEditor() {
   // Выбор клиента
   document.getElementById('choose-agent')?.addEventListener('click', openAgentSearch);
   document.getElementById('change-agent')?.addEventListener('click', openAgentSearch);
+
+  // B8: выбор склада отгрузки — только когда активных складов больше одного.
+  document.getElementById('change-warehouse')?.addEventListener('click', () => {
+    haptic('light');
+    openListPicker({
+      title: 'Склад отгрузки',
+      items: whWarehouses.map(w => ({ id: w.id, name: w.name })),
+      selectedId: currentDraftOrder.warehouse_id,
+      onPick: async (item) => {
+        try {
+          await api('/api/orders/set_warehouse', {
+            order_id: currentDraftOrder.id, warehouse_id: item.id,
+          });
+        } catch (e) {
+          tg.showAlert ? tg.showAlert('Склад не сохранён: ' + e.message) : alert(e.message);
+          return;
+        }
+        if (!currentDraftOrder) return;
+        currentDraftOrder.warehouse_id = Number(item.id);
+        currentDraftOrder.warehouse_name = item.name;
+        renderOrderEditor();
+      },
+    });
+  });
 
   // Добавить товар
   document.getElementById('btn-add-product').addEventListener('click', openProductPicker);
@@ -6251,6 +6320,11 @@ async function renderSettingsScreen() {
         ? row('set-pay-accounts', 'card', 'Карты и счета', 'Куда клиенты платят картой и перечислением')
         : ''}
     </div>
+    ${isBossRole() ? `
+    <div class="section-label">Склад</div>
+    <div class="c-surface c-surface--list">
+      ${row('set-warehouses', 'box', 'Склады', 'Список складов, перемещение остатка между ними')}
+    </div>` : ''}
     <div class="section-label">Контроль</div>
     <div class="c-surface c-surface--list">
       ${row('set-audit-log', 'list', 'Журнал действий', 'Кто и когда что сделал — вся лента')}
@@ -6285,6 +6359,225 @@ async function renderSettingsScreen() {
     haptic('light');
     renderAuditLogScreen(() => showScreen('settings'));
   });
+  box.querySelector('#set-warehouses')?.addEventListener('click', () => {
+    haptic('light');
+    renderWarehousesScreen();
+  });
+}
+
+// ─── Экран: Склады (B8 — несколько складов, admin/boss-only) ───────────────
+//
+// Пока в компании один физический склад, экран остаётся коротким списком из
+// одной строки — управлять тут особо нечем. На будущее (появится вторая
+// точка): список/добавление/переименование/архив и атомарное перемещение
+// остатка между складами с историей. Ничего здесь не меняет поведение
+// каталога/накладных/заказов при одном складе — они читают тот же список
+// через `warehouse.list_warehouses(include_archived=False)` и при длине 1
+// ведут себя как до этого раздела.
+
+function openWarehouseNameForm({ title, submitLabel, prefill, onSubmit }) {
+  return openMachineSheet({
+    title,
+    fields: [{
+      key: 'name', label: 'Название склада', required: true, value: prefill || '',
+      placeholder: 'Склад в Бекабаде',
+    }],
+    submitLabel: submitLabel || 'Сохранить',
+    onSubmit: async (data, { showErr }) => {
+      const res = await onSubmit(data.name);
+      if (!res.ok) { showErr(res.error); return false; }
+      return true;
+    },
+  });
+}
+
+function openWarehouseActions(w) {
+  const actions = [{ id: 'rename', name: 'Переименовать' }];
+  actions.push(w.archived ? { id: 'unarchive', name: 'Вернуть из архива' }
+                           : { id: 'archive', name: 'Отправить в архив' });
+  openListPicker({
+    title: w.name,
+    items: actions,
+    emptyText: '',
+    onPick: async (item) => {
+      if (item.id === 'rename') {
+        openWarehouseNameForm({
+          title: 'Переименовать склад', submitLabel: 'Сохранить', prefill: w.name,
+          onSubmit: async (name) => {
+            const res = await apiResult('/api/warehouses/rename', { warehouse_id: w.id, name });
+            if (!res.ok) return { ok: false, error: res.error };
+            haptic('success');
+            toast('Склад переименован');
+            renderWarehousesScreen();
+            return { ok: true };
+          },
+        });
+        return;
+      }
+      const endpoint = item.id === 'archive' ? '/api/warehouses/archive' : '/api/warehouses/unarchive';
+      const res = await apiResult(endpoint, { warehouse_id: w.id });
+      if (!res.ok) { toast(res.error, 'error'); return; }
+      haptic('success');
+      toast(item.id === 'archive' ? 'Склад отправлен в архив' : 'Склад возвращён из архива');
+      renderWarehousesScreen();
+    },
+  });
+}
+
+async function renderWarehousesScreen() {
+  const content = document.getElementById('content');
+  setScreenContext('Склады');
+  showBack(() => showScreen('settings'));
+  content.innerHTML = skeleton('list', 3);
+
+  let data;
+  try {
+    data = await api('/api/warehouses/list', {});
+  } catch (e) {
+    content.innerHTML = errorBox(e.message);
+    return;
+  }
+  const rows = data.warehouses || [];
+  const activeCount = rows.filter(w => !w.archived).length;
+
+  const rowHtml = (w) => `
+    <div class="c-row c-row--tap" data-wh-id="${w.id}" role="button" tabindex="0">
+      <div class="card-row-info">
+        <div class="card-row-title">${escapeHtml(w.name)}</div>
+        <div class="card-row-sub">${w.archived ? 'В архиве' : 'Активен'}</div>
+      </div>
+      ${icon('edit')}
+    </div>`;
+
+  content.innerHTML = `
+    <div class="section-label">Склады</div>
+    <div class="c-surface c-surface--list">${rows.map(rowHtml).join('')}</div>
+    <div class="form-row">
+      <button class="btn-secondary" id="wh-add-warehouse">${icon('plus')} Добавить склад</button>
+    </div>
+    ${activeCount > 1 ? `
+    <div class="section-label">Перемещение остатка</div>
+    <div class="c-surface c-surface--list">
+      <div class="c-row c-row--tap" id="wh-transfer-open" role="button" tabindex="0">
+        <div class="card-row-icon">${icon('truck')}</div>
+        <div class="card-row-info">
+          <div class="card-row-title">Переместить товар</div>
+          <div class="card-row-sub">Между складами, атомарно — остаток не уйдёт в минус</div>
+        </div>
+      </div>
+      <div class="c-row c-row--tap" id="wh-transfers-history" role="button" tabindex="0">
+        <div class="card-row-icon">${icon('list')}</div>
+        <div class="card-row-info">
+          <div class="card-row-title">История перемещений</div>
+        </div>
+      </div>
+    </div>` : ''}
+  `;
+
+  content.querySelectorAll('[data-wh-id]').forEach(rowEl => {
+    rowEl.addEventListener('click', () => {
+      const w = rows.find(r => String(r.id) === rowEl.dataset.whId);
+      if (w) openWarehouseActions(w);
+    });
+  });
+  document.getElementById('wh-add-warehouse').addEventListener('click', () => {
+    haptic('light');
+    openWarehouseNameForm({
+      title: 'Новый склад',
+      submitLabel: 'Добавить',
+      onSubmit: async (name) => {
+        const res = await apiResult('/api/warehouses/create', { name });
+        if (!res.ok) return { ok: false, error: res.error };
+        haptic('success');
+        toast(res.body.existed ? 'Такой склад уже есть — выбран он' : 'Склад добавлен');
+        renderWarehousesScreen();
+        return { ok: true };
+      },
+    });
+  });
+  document.getElementById('wh-transfer-open')?.addEventListener('click', () => {
+    haptic('light');
+    openStockTransferForm(rows.filter(w => !w.archived));
+  });
+  document.getElementById('wh-transfers-history')?.addEventListener('click', () => {
+    haptic('light');
+    renderStockTransfersHistory();
+  });
+}
+
+function openStockTransferForm(activeWarehouses) {
+  if (activeWarehouses.length < 2) {
+    toast('Нужно хотя бы два активных склада', 'error');
+    return;
+  }
+  openCatalogPicker({
+    title: 'Товар для перемещения',
+    hint: 'Остаток по складу сервер проверит при сохранении',
+    onPick: (item, { close }) => {
+      close();
+      openTransferQuantityForm(item, activeWarehouses);
+    },
+  });
+}
+
+function openTransferQuantityForm(product, warehouses) {
+  const options = warehouses.map(w => [String(w.id), w.name]);
+  const toOptions = options.length > 1 ? [options[1], options[0], ...options.slice(2)] : options;
+  return openMachineSheet({
+    title: `Переместить: ${product.name}`,
+    hint: `Сейчас на всех складах: ${whQty(product.quantity)} ${product.unit || ''}`.trim(),
+    fields: [
+      { key: 'from', label: 'Откуда', type: 'select', options },
+      { key: 'to', label: 'Куда', type: 'select', options: toOptions },
+      { key: 'quantity', label: 'Количество', type: 'number', required: true, placeholder: '0' },
+      { key: 'comment', label: 'Комментарий', placeholder: 'необязательно' },
+    ],
+    submitLabel: 'Переместить',
+    onSubmit: async (data, { showErr }) => {
+      const qty = parseAmount(data.quantity);
+      if (!(qty > 0)) { showErr('Количество должно быть больше нуля'); return false; }
+      if (data.from === data.to) { showErr('Склад отправления и назначения совпадают'); return false; }
+      const res = await apiResult('/api/stock/transfer', {
+        product_id: product.product_id,
+        quantity: qty,
+        from_warehouse_id: Number(data.from),
+        to_warehouse_id: Number(data.to),
+        comment: data.comment || null,
+        idempotency_key: idemKey(),
+      });
+      if (!res.ok) { showErr((res.body && res.body.reason) || res.error); return false; }
+      haptic('success');
+      toast('Товар перемещён');
+      return true;
+    },
+  });
+}
+
+async function renderStockTransfersHistory() {
+  const content = document.getElementById('content');
+  setScreenContext('История перемещений');
+  showBack(() => renderWarehousesScreen());
+  content.innerHTML = skeleton('list', 4);
+  let data;
+  try {
+    data = await api('/api/stock/transfers', { limit: 100 });
+  } catch (e) {
+    content.innerHTML = errorBox(e.message);
+    return;
+  }
+  const rows = data.transfers || [];
+  content.innerHTML = rows.length
+    ? `<div class="c-surface c-surface--list">${rows.map(t => `
+        <div class="c-row">
+          <div class="card-row-info">
+            <div class="card-row-title">${escapeHtml(t.product_name)}</div>
+            <div class="card-row-sub">${escapeHtml(t.from_warehouse_name)} → ${escapeHtml(t.to_warehouse_name)}
+              · ${whQty(t.quantity)} ${escapeHtml(t.unit || '')}</div>
+          </div>
+          <div class="card-row-value">${escapeHtml(String(t.created_at || '').slice(0, 16))}</div>
+        </div>
+      `).join('')}</div>`
+    : emptyState({ icon: 'list', title: 'Перемещений ещё не было' });
 }
 // ─── Экран: Аналитика ───────────────────────────────
 
@@ -9137,6 +9430,7 @@ let woCountId = null;           // открытый пересчёт, котор
 let whDraft = null;             // черновик формы (живёт между перерисовками вкладки)
 let whCounterparties = [];      // справочник, тянем один раз на сессию экрана
 let whStockCache = [];          // остатки для подстановки в позиции
+let whWarehouses = null;        // активные склады (B8), тянем один раз на сессию экрана
 
 // Черновик накладной переживает закрытие приложения (formDrafts): накладную на
 // двадцать позиций набирают долго, а подпись Telegram живёт час — на 401 или
@@ -9910,11 +10204,18 @@ async function renderWhInvoiceNew() {
 
   // Справочники параллельно: без них форма бесполезна. Без сети — ошибка с
   // «Повторить» (черновик при этом цел), а не вечная «Загружаю справочники…».
-  let stock, cps;
+  // Склады спрашиваем ТОЛЬКО когда `/api/me` уже сказал, что их больше
+  // одного (`currentUser.multi_warehouse`) — иначе лишний поход в сеть на
+  // каждое открытие формы, хотя выбирать не из чего.
+  const needWarehouses = currentUser && currentUser.multi_warehouse;
+  let stock, cps, whList;
   try {
-    [stock, cps] = await Promise.all([
+    [stock, cps, whList] = await Promise.all([
       api('/api/wh/stock', {}),
       whCounterparties.length ? { counterparties: whCounterparties } : api('/api/wh/counterparties', {}),
+      !needWarehouses ? { warehouses: whWarehouses || [] }
+        : whWarehouses ? { warehouses: whWarehouses, last_used_warehouse_id: null }
+        : api('/api/warehouses/active', {}),
     ]);
   } catch (e) {
     if (gen !== screenGen()) return;
@@ -9924,9 +10225,17 @@ async function renderWhInvoiceNew() {
   }
   whCounterparties = cps.counterparties || [];
   whStockCache = stock.products || [];
+  whWarehouses = whList.warehouses || [];
   const products = whStockCache;
   const byId = new Map(products.map(p => [p.product_id, p]));
   if (gen !== screenGen()) return;
+
+  // Пикер склада — ТОЛЬКО когда активных складов больше одного: сегодня их
+  // один, и форма выглядит byte-в-byte как раньше — ни одного нового поля.
+  const showWarehousePicker = whWarehouses.length > 1;
+  if (showWarehousePicker && !whDraft.warehouse_id) {
+    whDraft.warehouse_id = whList.last_used_warehouse_id || whWarehouses[0].id;
+  }
 
   if (!products.length) {
     content.innerHTML = stockShellHtml() + emptyState({
@@ -9952,9 +10261,18 @@ async function renderWhInvoiceNew() {
   // Контрагента выбирают листом с поиском (openListPicker), а не нативным
   // `<select>`: в нём сотня строк «Имя · без Telegram» без поиска.
   const cpPicked = whCounterparties.find(c => String(c.id) === String(whDraft.counterparty_id));
+  const whPicked = whWarehouses.find(w => String(w.id) === String(whDraft.warehouse_id));
   content.innerHTML = `
     ${stockShellHtml()}
     ${typeSeg}
+
+    ${showWarehousePicker ? `
+    <div class="form-row">
+      <label class="form-label" for="wh-warehouse">Склад</label>
+      <button type="button" id="wh-warehouse" class="btn-agent${whPicked ? '' : ' btn-agent--empty'}">
+        ${whPicked ? escapeHtml(whPicked.name) : 'Выберите склад'}
+      </button>
+    </div>` : ''}
 
     <div class="form-row">
       <label class="form-label" for="wh-cp">Контрагент${isOut ? ' *' : ''}</label>
@@ -10172,6 +10490,19 @@ async function renderWhInvoiceNew() {
     onPick: applyCp,
   });
   document.getElementById('wh-cp').addEventListener('click', openCpPicker);
+  if (showWarehousePicker) {
+    document.getElementById('wh-warehouse').addEventListener('click', () => openListPicker({
+      title: 'Склад',
+      items: whWarehouses.map(w => ({ id: w.id, name: w.name })),
+      selectedId: whDraft.warehouse_id,
+      emptyText: 'Склады не найдены',
+      onPick: (item) => {
+        whDraft.warehouse_id = Number(item.id);
+        saveWhDraft();
+        renderWhInvoiceNew();
+      },
+    }));
+  }
   document.getElementById('wh-comment').addEventListener('input', e => {
     whDraft.comment = e.target.value;
     saveWhDraft();
@@ -10206,6 +10537,9 @@ async function renderWhInvoiceNew() {
       const r = await apiResult('/api/wh/invoices/create', {
         type: whDraft.type,
         counterparty_id: whDraft.counterparty_id || null,
+        // Не шлём вовсе, если пикер не показывали (один склад) — сервер
+        // берёт склад по умолчанию, как и до этого раздела.
+        warehouse_id: showWarehousePicker ? (whDraft.warehouse_id || null) : null,
         comment: whDraft.comment || null,
         items: whDraft.items.map(it => ({
           product_id: Number(it.product_id),

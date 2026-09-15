@@ -527,6 +527,46 @@ Y» (`remaining_after_pending` = остаток − ждущее; `overpending` 
   каркас (шелл + переключатель) входит в КАЖДУЮ ветку через `whFrame`
   (UI-BUG-04). Товар начинают с ВЫБОРА (`openCatalogPicker`).
 
+**Несколько складов (B8, `services/warehouse.py` + `/api/warehouses/*`,
+`/api/stock/transfer{,s}`).** Схема (`warehouses`/`stock(warehouse_id)`) была
+готова с начала, но сидинг заводит один склад — компания пока физически в
+одной точке. Раздел добавляет управление и перемещение, НЕ трогая
+однoскладской случай ни на бит:
+- **Архив — sidecar `warehouse_archived`**, а не колонка `warehouses.archived`
+  (инкрементальных ALTER в проекте нет). Строка есть → склад не предлагается
+  в форме (`list_warehouses(include_archived=False)`), но остаётся в истории.
+  Архивировать можно только пустой склад (`quantity <> 0` по нему — отказ
+  `nonzero_stock`) и не последний активный (`last_active_warehouse`) — иначе
+  накладную провести стало бы некуда.
+- **`default_warehouse_id()`** теперь берёт MIN(id) СРЕДИ АКТИВНЫХ (деградирует
+  к MIN(id) вообще, если архивны все) — старое поведение с одним складом не
+  меняется, потому что архивных складов там нет вовсе.
+- **Перемещение (`transfer_stock`)** — одна транзакция, тот же инвариант, что у
+  накладных: обе строки `stock` блокируются в порядке `sorted(warehouse_id)`
+  (без него встречные [A→B]/[B→A] ловят deadlock на Postgres), нехватка
+  остатка откатывает всё перемещение, история — `stock_transfers`
+  (sidecar, FK/CHECK `quantity > 0` и `from ≠ to` — `scripts/apply_constraints`).
+- **Каталог**: `/api/stock` отдаёт `by_warehouse` и корневой `multi_warehouse`
+  ТОЛЬКО когда активных складов больше одного (`webapp.server.api_stock`); при
+  одном складе форма ответа не получает ни одного нового поля — байт-в-байт
+  как раньше. Фронт то же самое: строка `.stock-by-warehouse` рисуется, только
+  если `stockData.multi_warehouse`.
+- **Заказ**: склад отгрузки — sidecar `order_warehouse` (PK `order_id`),
+  `order_shipment.ship_order` берёт его через
+  `warehouse.resolve_order_warehouse()` (выбор менеджера, если есть, иначе
+  `default_warehouse_id()`). Пикер в редакторе заказа и в форме накладной
+  показывается, только если `/api/me` вернул `multi_warehouse: true`
+  (`active_warehouse_count() > 1`) — иначе ни одного похода в
+  `/api/warehouses/active` и ни одной лишней кнопки.
+- **Права**: справочник складов (`/api/warehouses/{list,create,rename,archive,
+  unarchive}`) — admin/boss-only, «Настройки → Склады». Выбор активного склада
+  и перемещение (`/api/warehouses/active`, `/api/stock/transfer{,s}` кроме
+  истории) — и менеджеру: он физически двигает товар и создаёт накладные так
+  же, как приход. История перемещений — руководству.
+- Тесты: `tests/test_multi_warehouse.py` (в т.ч. `test_single_warehouse_*` —
+  явно держит инвариант «один склад → поведение не меняется»),
+  `webapp/static/__tests__/multi-warehouse.test.js`.
+
 **Печать на офисный принтер (`services/printing.py` + `handlers/printing.py`).**
 CUPS стоит на хосте, в контейнере только КЛИЕНТ (`cups-client`: `lp`,
 `lpstat`), адрес — в `CUPS_SERVER`. Что помнить:
