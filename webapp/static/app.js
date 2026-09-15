@@ -6876,11 +6876,14 @@ async function renderDebts(container) {
             </div>
             ${d.is_mine || isBoss ? `
               <div class="pay-input-row">
-                <input type="number" class="pay-amount-input" data-id="${d.id}"
+                <input type="text" class="pay-amount-input" data-id="${d.id}"
                        placeholder="Сумма · ост. ${fmt(d.remaining)} ${escapeHtml(d.currency || '')}"
-                       min="0" step="0.01" inputmode="decimal">
-                <button class="btn-mark-paid" data-id="${d.id}">${icon('check')} Отметить</button>
+                       inputmode="decimal" autocomplete="off">
+                <button class="btn-mark-paid" data-id="${d.id}"
+                        data-remaining="${Number(d.remaining) || 0}" data-cur="${escapeHtml(d.currency || '')}">${icon('check')} Отметить</button>
               </div>
+              <button class="btn-secondary btn-mark-paid-all" data-id="${d.id}"
+                      data-remaining="${Number(d.remaining) || 0}" data-cur="${escapeHtml(d.currency || '')}">Весь остаток · ${fmt(d.remaining)} ${escapeHtml(d.currency || '')}</button>
             ` : ''}
           </div>
         `;
@@ -6927,38 +6930,56 @@ async function renderDebts(container) {
       });
     });
 
-    // Mark-paid (менеджер отмечает оплату; amount опционален —
-    // если пусто, закрывает остаток целиком)
+    // Отметка оплаты долга. Поле было type=number: «1 500» и «1,5» браузер
+    // считал невалидными и отдавал пустую строку, а пустая сумма означала
+    // «закрыть весь остаток» — частичная оплата молча превращалась в полную.
+    // Теперь поле текстовое (parseNum понимает пробелы и запятую), пустое или
+    // нечисловое — ошибка, а «весь остаток» — отдельная явная кнопка.
+    // В подтверждении — сумма И валюта: у долгов их несколько.
+    const markPaid = (btn, amount) => {
+      const id = parseInt(btn.dataset.id, 10);
+      const cur = btn.dataset.cur || '';
+      const remaining = Number(btn.dataset.remaining) || 0;
+      const msg = amount === null
+        ? `Отметить оплату всего остатка — ${formatMoney(remaining, cur)}?\nРуководитель должен будет подтвердить.`
+        : `Отметить получение ${formatMoney(amount, cur)}?\nРуководитель должен будет подтвердить.`;
+      tg.showConfirm(msg, async ok => {
+        if (!ok) return;
+        btn.disabled = true;
+        try {
+          const payload = { order_id: id, idempotency_key: idemKey() };
+          if (amount !== null) payload.amount = amount;
+          await api('/api/orders/mark_paid', payload);
+          tg.HapticFeedback?.notificationOccurred('success');
+          toast(`Оплата ${formatMoney(amount === null ? remaining : amount, cur)} отмечена, ждёт подтверждения`);
+          await renderDebts(container);
+        } catch (e) {
+          tg.HapticFeedback?.notificationOccurred('error');
+          toast(e.message, 'error');
+          btn.disabled = false;
+        }
+      });
+    };
     container.querySelectorAll('.btn-mark-paid').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const id = parseInt(btn.dataset.id);
-        const input = container.querySelector(`.pay-amount-input[data-id="${id}"]`);
-        const amountRaw = input?.value.trim();
-        const amount = amountRaw ? parseFloat(amountRaw) : null;
-        if (amount !== null && (!(amount > 0))) {
-          tg.showAlert('Сумма должна быть больше нуля или пустой (по умолч. весь остаток)');
+      btn.addEventListener('click', () => {
+        const input = container.querySelector(`.pay-amount-input[data-id="${btn.dataset.id}"]`);
+        const raw = (input && input.value || '').trim();
+        const amount = parseAmount(raw);
+        if (!raw) {
+          toast('Введите сумму или нажмите «Весь остаток»', 'error');
+          input && input.focus();
           return;
         }
-        const msg = amount === null
-          ? 'Отметить полную оплату остатка?\nБосс должен будет подтвердить.'
-          : `Отметить получение ${amount}?\nБосс должен будет подтвердить.`;
-        tg.showConfirm(msg, async ok => {
-          if (!ok) return;
-          btn.disabled = true;
-          try {
-            const payload = { order_id: id, idempotency_key: idemKey() };
-            if (amount !== null) payload.amount = amount;
-            await api('/api/orders/mark_paid', payload);
-            tg.HapticFeedback?.notificationOccurred('success');
-            toast('Оплата отмечена, ждёт подтверждения');
-            await renderDebts(container);
-          } catch (e) {
-            tg.HapticFeedback?.notificationOccurred('error');
-            tg.showAlert('❌ ' + e.message);
-            btn.disabled = false;
-          }
-        });
+        if (!(amount > 0)) {
+          toast('Сумма должна быть больше нуля — например 1 500 или 12,50', 'error');
+          input && input.focus();
+          return;
+        }
+        markPaid(btn, amount);
       });
+    });
+    container.querySelectorAll('.btn-mark-paid-all').forEach(btn => {
+      btn.addEventListener('click', () => markPaid(btn, null));
     });
 
     // Confirm-payment (босс подтверждает все pending по заказу)
