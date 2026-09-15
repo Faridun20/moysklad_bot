@@ -215,6 +215,33 @@ def test_navigating_away_during_load_does_not_bring_old_screen_back(open_app, e2
     assert boss.evaluate("document.querySelector('#bottom-nav .nav-item.active')?.dataset.screen") == "money"
 
 
+def test_search_opened_during_home_load_is_not_overwritten(open_app, e2e, monkeypatch):
+    """Открыл поиск, пока «Сегодня» ещё грузится, — поиск остаётся.
+
+    Поиск рисовался в тот же #content, не сменив поколение экрана: догрузившаяся
+    главная затирала поле и результаты (флаки test_cov_today_clients под нагрузкой).
+    """
+    import asyncio
+
+    from services import async_db, database
+
+    orig = database.get_user_orders
+
+    async def slow(*a, **kw):
+        await asyncio.sleep(1.5)
+        return await orig(*a, **kw)
+
+    monkeypatch.setattr(async_db, "get_user_orders", slow, raising=False)
+
+    boss = open_app(e2e.ids["boss"])  # «Сегодня» ещё в полёте
+    boss.click("#search-btn")
+    boss.fill("#search-input", "zzqq")
+    boss.wait_for_selector("#search-results .empty-hint:has-text('Ничего не найдено')")
+    boss.wait_for_timeout(2500)  # даём старому рендеру шанс «вернуться»
+    assert boss.locator("#search-input").count() == 1
+    assert boss.locator("#content .hero, #content .greeting").count() == 0
+
+
 def test_switching_tab_during_orders_load_keeps_report(open_app, e2e, monkeypatch):
     """Список заказов ещё грузится, а человек уже открыл «Отчёт» — отчёт остаётся."""
     import asyncio

@@ -3844,6 +3844,11 @@ let _searchTimer = null;
 function openSearch() {
   haptic('light');
   showBack(() => showScreen(currentScreen));
+  // Как в showScreen: рендер экрана, ещё ждущий ответа (например, «Сегодня»
+  // сразу после открытия), не должен дописать себя поверх поиска.
+  bumpScreenGen();
+  const stale = document.getElementById('content');
+  if (stale) stale.replaceWith(stale.cloneNode(false));
   const content = document.getElementById('content');
   content.innerHTML = `
     <div class="search-wrap">

@@ -93,12 +93,15 @@ def test_fresh_schema_has_no_drift(isolated_db):
     assert check_schema() == []
 
 
-def test_missing_table_and_column_are_reported(isolated_db, sent, caplog):
+def test_missing_table_and_column_are_reported(isolated_db, sent, caplog, monkeypatch):
     """База отстала: таблицу снесли, а старая таблица без новой колонки —
     ровно то, что оставляет CREATE TABLE IF NOT EXISTS на существующей базе."""
     import logging
 
     from services import startup_checks
+
+    # Часовой пояс раннера (на GitHub — UTC) даёт второй, посторонний алерт.
+    monkeypatch.setattr(startup_checks, "check_timezone", lambda *a, **k: [])
 
     db = isolated_db
     with db.get_conn() as conn:
