@@ -686,30 +686,30 @@ async function renderHome() {
   // Очередь доступна всем рабочим ролям, сводка выручки — только тем, кому
   // отвечает /api/home. Кладовщик и бухгалтер получают экран из одной очереди,
   // а не отказ вместо всего раздела.
-  const canSeeHome = ['admin', 'boss', 'manager'].includes(role());
-  const queuePromise = api('/api/today', {}).catch(() => ({ queue: [] }));
+  const canSeeHome = canCall('/api/home', role());
+  // Очередь у руководства — надстройка над сводкой: её сбой не уносит экран.
+  // У кладовщика и бухгалтера очередь и есть весь экран — там сбой показываем
+  // ошибкой (ниже), иначе без сети он читался бы как «дел нет».
+  const queuePromise = api('/api/today', {}).then(
+    d => d, e => (canSeeHome ? { queue: [] } : { error: e }));
 
   let data = null;
   if (canSeeHome) {
     try {
-      const r = await fetch('/api/home', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ initData: _initData }),
-      });
-      if (!r.ok) {
-        const err = await r.json().catch(() => ({}));
-        throw new Error(err.detail || `HTTP ${r.status}`);
-      }
-      data = await r.json();
+      data = await api('/api/home', {});
     } catch (e) {
       content.innerHTML = errorBox(e.message);
       return;
     }
   }
-  const queue = (await queuePromise).queue || [];
+  const queueRes = await queuePromise;
+  const queue = queueRes.queue || [];
 
   if (!data) {
+    if (queueRes.error) {
+      content.innerHTML = errorBox(queueRes.error.message);
+      return;
+    }
     // Роль без сводки: экран — это очередь и ничего больше. Приветствие
     // одно — в шапке (renderHeader), отдельным заголовком не дублируем.
     content.innerHTML = workQueueHtml(queue);
@@ -4730,11 +4730,17 @@ async function renderMoneyReport(container) {
     : { period: analyticsPeriod };
   let summary = null;
   let history = [];
+  let historyError = null;
   try {
     summary = await api('/api/money/summary', periodBody);
     // Лента — за ТОТ ЖЕ период, что и итог (WP-11), иначе под заголовком периода
-    // висели движения за всё время.
-    history = (await api('/api/cash/history', periodBody).catch(() => ({ history: [] }))).history || [];
+    // висели движения за всё время. Её сбой не уносит итоги, но и не
+    // притворяется «Движений пока нет» — это была бы ложь про кассу.
+    try {
+      history = (await api('/api/cash/history', periodBody)).history || [];
+    } catch (e) {
+      historyError = e;
+    }
   } catch (e) {
     content.innerHTML = reportHeaderHtml() + errorBox(e.message);
     wireReportHeader(content, () => renderMoneyReport(content));
@@ -4750,13 +4756,17 @@ async function renderMoneyReport(container) {
     renderMoneyTotalsHtml(summary) +
     '<div id="money-insights">' + skeleton('list', 3) + '</div>' +
     '<div class="section-label">Движение денег</div>' +
-    cashHistoryHtml(history);
+    (historyError
+      ? errorBoxHtml(historyError.message, { retryAttr: 'data-history-retry="1"' })
+      : cashHistoryHtml(history));
   wireReportHeader(content, () => renderMoneyReport(content));
+  content.querySelector('[data-history-retry]')?.addEventListener('click', () => renderMoneyReport(content));
 
   const box = content.querySelector('#money-insights');
   if (!box) return;
   try {
     box.innerHTML = await moneyInsightsHtml();
+    box.querySelector('[data-insights-retry]')?.addEventListener('click', () => renderMoneyReport(content));
   } catch {
     // Разделы аналитики — надстройка: их сбой не должен уносить поступления,
     // которые уже на экране.
@@ -4794,11 +4804,18 @@ function receivableTotalsHtml(totals) {
 // платежи». Каждый грузится своей ручкой и деградирует молча: сбой прогноза не
 // должен уносить экран поступлений.
 async function moneyInsightsHtml() {
+  let failed = null;
+  const soft = (p) => p.catch((e) => { failed = e; return null; });
   const [rec, fc, disc] = await Promise.all([
-    api('/api/money/receivables', {}).catch(() => null),
-    api('/api/money/forecast', { months: 6 }).catch(() => null),
-    api('/api/money/discipline', {}).catch(() => null),
+    soft(api('/api/money/receivables', {})),
+    soft(api('/api/money/forecast', { months: 6 })),
+    soft(api('/api/money/discipline', {})),
   ]);
+  // Все три ручки упали — это не «данных нет», а нет связи/сбой: скажем прямо
+  // и дадим повторить. Один упавший раздел по-прежнему просто не рисуется.
+  if (failed && !rec && !fc && !disc) {
+    return errorBoxHtml(failed.message, { retryAttr: 'data-insights-retry="1"' });
+  }
   let html = '';
   if (rec) {
     html += receivableTotalsHtml(rec.totals);
@@ -5770,32 +5787,49 @@ async function renderMoneyScreen() {
   }
 
   // Бейдж ожидающих подтверждений — освежаем АСИНХРОННО, чтобы зависший запрос
-  // не блокировал появление вкладок. Обновляем счётчик на месте.
-  if (isConfirmer) {
-    const cnt = (p, k) => api(p, {}).then(res => (res[k] || []).length).catch(() => 0);
-    const parts = [cnt('/api/deposits/pending', 'deposits'), cnt('/api/returns/pending', 'returns')];
-    if (boss) parts.push(cnt('/api/payments/pending', 'pending'));
-    Promise.all(parts).then(arr => {
-      const n = arr.reduce((a, b) => a + b, 0);
-      financePendCache = n;
-      if (currentScreen !== 'money') return;
-      const pill = content.querySelector('.seg-item[data-sect="confirm"]');
-      if (!pill) return;
-      const old = pill.querySelector('.stock-badge');
-      if (old) old.remove();
-      if (n) {
-        const b = document.createElement('span');
-        b.className = 'stock-badge badge-yellow';
-        b.textContent = n;
-        pill.appendChild(b);
-      }
-    });
+  // не блокировал появление вкладок. На самой вкладке «Подтвердить» отдельного
+  // подсчёта нет: тело грузит те же списки, и счётчик берётся из них
+  // (renderCashbox → setConfirmBadge) — раньше каждый вход в «Деньги» тянул
+  // одни и те же три списка дважды.
+  if (isConfirmer && moneyTab !== 'confirm') {
+    const lists = pendingListsFor(r);
+    Promise.all(lists.map(l => api(l.path, {}).then(res => (res[l.key] || []).length)))
+      .then(arr => setConfirmBadge(content, arr.reduce((a, b) => a + b, 0)))
+      // Сбой счётчика — не повод рисовать «0»: остаётся последнее известное.
+      .catch(() => {});
   }
 
   const body = document.getElementById('money-body');
   if (moneyTab === 'debts') await renderDebts(body);
   else if (moneyTab === 'report') await renderMoneyReport(body);
   else await renderCashbox(body, moneyTab);  // confirm | ops
+}
+
+// Списки «ждут подтверждения», которые роль реально может получить. Кладовщику
+// /api/deposits/pending отвечает 403, бухгалтеру — /api/returns/pending; раньше
+// оба запроса уходили всем подтверждающим, отказ глотался и выглядел как
+// «записей нет».
+function pendingListsFor(r) {
+  return [
+    { path: '/api/payments/pending', key: 'pending' },
+    { path: '/api/deposits/pending', key: 'deposits' },
+    { path: '/api/returns/pending', key: 'returns' },
+  ].filter(l => canCall(l.path, r));
+}
+
+function setConfirmBadge(root, n) {
+  financePendCache = n;
+  if (currentScreen !== 'money') return;
+  const pill = (root || document).querySelector('.seg-item[data-sect="confirm"]');
+  if (!pill) return;
+  const old = pill.querySelector('.stock-badge');
+  if (old) old.remove();
+  if (n) {
+    const b = document.createElement('span');
+    b.className = 'stock-badge badge-yellow';
+    b.textContent = n;
+    pill.appendChild(b);
+  }
 }
 
 async function renderCashbox(container, section) {
@@ -5814,23 +5848,34 @@ async function renderCashbox(container, section) {
   const canDeposit = role === 'manager';
   const isBoss = role === 'admin' || role === 'boss';
 
-  // Тянем ТОЛЬКО то, что нужно активной секции (раньше грузилось всё сразу).
+  // Тянем ТОЛЬКО то, что нужно активной секции и что роль может получить.
+  // Сбой загрузки — ошибка с «Повторить», а НЕ пустой список: без сети экран
+  // говорил «Нет записей на подтверждении», и бухгалтер уходил, не подтвердив
+  // сдачу, которая его ждала.
   let deposits = [];
   let returns = [];
   let myDeposits = [];
   let payPending = [];   // paid-заказы с pending-оплатой (подтверждает босс)
-  const _grab = (path, key) => api(path, {}).then(r => r[key] || []).catch(() => []);
+  const _grab = (path, key) => api(path, {}).then(r => r[key] || []);
   const tasks = [];
   if (section === 'confirm') {
-    tasks.push(_grab('/api/deposits/pending', 'deposits').then(v => { deposits = v; }));
-    tasks.push(_grab('/api/returns/pending', 'returns').then(v => { returns = v; }));
-    if (isBoss) tasks.push(_grab('/api/payments/pending', 'pending').then(v => { payPending = v; }));
+    const want = new Set(pendingListsFor(role).map(l => l.path));
+    if (want.has('/api/deposits/pending')) tasks.push(_grab('/api/deposits/pending', 'deposits').then(v => { deposits = v; }));
+    if (want.has('/api/returns/pending')) tasks.push(_grab('/api/returns/pending', 'returns').then(v => { returns = v; }));
+    if (want.has('/api/payments/pending')) tasks.push(_grab('/api/payments/pending', 'pending').then(v => { payPending = v; }));
   }
   // «Мои сдачи» — секция внутри «Платежи и сдачи» (ops) для тех, кто сдаёт.
   if (section === 'ops' && canDeposit) {
     tasks.push(_grab('/api/deposits/my', 'deposits').then(v => { myDeposits = v; }));
   }
-  await Promise.all(tasks);
+  try {
+    await Promise.all(tasks);
+  } catch (e) {
+    container.innerHTML = errorBoxHtml(e.message, { retryAttr: 'data-cash-retry="1"' });
+    container.querySelector('[data-cash-retry]')?.addEventListener('click', () => renderCashbox(container, section));
+    return;
+  }
+  if (section === 'confirm') setConfirmBadge(null, deposits.length + returns.length + payPending.length);
 
   const depCards = deposits.map(d => {
     const orders = (d.orders || [])
@@ -5854,6 +5899,11 @@ async function renderCashbox(container, section) {
     `;
   }).join('');
 
+  // Приёмку товара отмечает склад, а деньги по возврату подтверждает только
+  // руководство (/api/returns/confirm — admin/boss). Кладовщику кнопка
+  // «Подтвердить возврат» раньше рисовалась и отвечала 403.
+  const canConfirmReturn = canCall('/api/returns/confirm', role);
+  const canMarkGoods = canCall('/api/returns/goods_received', role);
   const retCards = returns.map(r => `
       <div class="debt-card" data-ret="${r.id}">
         <div class="debt-card-top">
@@ -5866,12 +5916,12 @@ async function renderCashbox(container, section) {
         <div class="debt-actions">
           ${r.goods_received
             ? `<span class="debt-meta">${icon('check')} Товар принят</span>`
-            : `<button class="btn-reject-pay ret-goods">${icon('box')} Товар получен</button>`}
-          <button class="btn-confirm-pay ret-confirm" ${r.goods_received ? '' : 'disabled'}>
+            : canMarkGoods ? `<button class="btn-reject-pay ret-goods">${icon('box')} Товар получен</button>` : ''}
+          ${canConfirmReturn ? `<button class="btn-confirm-pay ret-confirm" ${r.goods_received ? '' : 'disabled'}>
             ${icon('check')} Подтвердить возврат
-          </button>
+          </button>` : `<span class="debt-meta">Деньги подтверждает руководитель</span>`}
         </div>
-        ${r.goods_received ? '' : `
+        ${r.goods_received || !canConfirmReturn ? '' : `
           <div class="debt-card-mid">
             <span class="debt-meta">Сначала отметьте приёмку товара — иначе деньги
             уйдут из кассы за непривезённый товар.</span>
@@ -5920,7 +5970,7 @@ async function renderCashbox(container, section) {
       <div class="card">
         <div class="form-row">
           <label class="form-label" for="dep-amount">Сумма (${baseCur()})</label>
-          <input type="number" id="dep-amount" class="form-input" placeholder="500" inputmode="decimal">
+          <input type="text" id="dep-amount" class="form-input" placeholder="500" inputmode="decimal" autocomplete="off">
         </div>
         <button id="dep-create" class="btn-primary">${icon('cash')} Сдать в кассу</button>
         <div class="debt-hint">Распределится по вашим открытым заказам автоматически.</div>
@@ -5946,7 +5996,7 @@ async function renderCashbox(container, section) {
   // уведомление боссу с кнопкой на каждый). Строки добавляются динамически.
   const payRowHtml = (cur) => `
       <div class="form-row pay-row">
-        <input type="number" class="form-input pay-row-amount" placeholder="1500" inputmode="decimal">
+        <input type="text" class="form-input pay-row-amount" placeholder="1 500" inputmode="decimal" autocomplete="off">
         <div class="seg pay-row-cur" data-cur="${cur || 'USD'}">
           ${['USD', 'UZS'].map(c =>
             `<button type="button" class="seg-item ${c === (cur || 'USD') ? 'active' : ''}" data-cur-opt="${c}" aria-pressed="${c === (cur || 'USD')}">${c}</button>`
@@ -5954,7 +6004,9 @@ async function renderCashbox(container, section) {
         </div>
         <button class="cur-btn pay-row-del" title="Убрать строку">${icon('close')}</button>
       </div>`;
-  const payFormBlock = !isBoss ? `
+  // Ручка отвечает admin/manager: бухгалтеру и кладовщику форма отправляла бы
+  // в 403. Руководству форма не нужна — оно подтверждает.
+  const payFormBlock = (!isBoss && canCall('/api/payments/send', role)) ? `
       <div class="section-label">Новый платёж (не связан с заказом)</div>
       <div class="card">
         <div id="pay-rows">${payRowHtml('USD')}</div>
@@ -5969,7 +6021,7 @@ async function renderCashbox(container, section) {
   ` : '';
 
   // Блок оформления возврата (менеджер/кладовщик/босс).
-  const canReturn = ['admin', 'boss', 'warehouse_keeper', 'manager'].includes(role);
+  const canReturn = canCall('/api/returns/create', role);
   const returnBlock = canReturn ? `
       <div class="section-label">Оформить возврат</div>
       <div class="c-surface c-surface--pad">
@@ -6008,6 +6060,52 @@ async function renderCashbox(container, section) {
                       hint: 'Сдачи, платежи и возвраты появятся здесь, как только их оформят.' });
   }
   container.innerHTML = bodyHtml;
+
+  // Черновики форм «Кассы» (платёж, сдача, возврат) — см. formDrafts. Час
+  // жизни подписи Telegram истекал посреди заполнения, и после переоткрытия
+  // сумма, валюты и комментарий пропадали. Пишем на каждый ввод, стираем часть
+  // черновика после успешной отправки этой формы.
+  const CASH_DRAFT = 'cash-forms';
+  const cashDrafts = formDrafts();
+  const collectCash = () => {
+    const d = {};
+    const rows = container.querySelectorAll('.pay-row');
+    if (rows.length) {
+      d.pay = {
+        rows: Array.from(rows).map(r => ({
+          amount: r.querySelector('.pay-row-amount').value,
+          currency: r.querySelector('.pay-row-cur').dataset.cur,
+        })),
+        comment: container.querySelector('#pay-comment')?.value || '',
+      };
+    }
+    const dep = container.querySelector('#dep-amount');
+    if (dep) d.dep = { amount: dep.value };
+    const retOrder = container.querySelector('#ret-order');
+    if (retOrder) {
+      d.ret = {
+        order: retOrder.value,
+        reason: container.querySelector('#ret-reason')?.value || '',
+        refund: selectedRefund,
+      };
+    }
+    return d;
+  };
+  const cashFilled = (d) => !!(
+    (d.pay && (d.pay.comment || d.pay.rows.some(r => String(r.amount).trim())))
+    || (d.dep && String(d.dep.amount).trim())
+    || (d.ret && (d.ret.order || d.ret.reason)));
+  const saveCash = () => {
+    if (section !== 'ops') return;
+    const d = collectCash();
+    if (cashFilled(d)) cashDrafts.save(CASH_DRAFT, d); else cashDrafts.clear(CASH_DRAFT);
+  };
+  // Отправленная форма уходит из черновика, остальные остаются.
+  const forgetCash = (part) => {
+    const d = cashDrafts.load(CASH_DRAFT) || {};
+    delete d[part];
+    if (cashFilled(d)) cashDrafts.save(CASH_DRAFT, d); else cashDrafts.clear(CASH_DRAFT);
+  };
 
   // Оформление возврата.
   let selectedRefund = 'debt_reduction';
@@ -6087,8 +6185,13 @@ async function renderCashbox(container, section) {
       const payload = { order_id: orderId, reason, refund_method: selectedRefund, idempotency_key: idemKey() };
       if (items) payload.items = items;
       api('/api/returns/create', payload)
-        .then(r => { tg.showAlert(`✅ Возврат #${r.return_id} отправлен на подтверждение`); renderMoneyScreen(); })
-        .catch(e => { tg.showAlert('❌ ' + e.message); retBtn.disabled = false; });
+        .then(r => {
+          forgetCash('ret');
+          haptic('success');
+          toast(`Возврат #${r.return_id} отправлен на подтверждение`);
+          renderMoneyScreen();
+        })
+        .catch(e => { toast(e.message, 'error'); retBtn.disabled = false; });
     });
   }
 
@@ -6150,7 +6253,11 @@ async function renderCashbox(container, section) {
       try {
         await api('/api/payments/send', { items: parsed.items, comment, idempotency_key: payKey });
         payKey = idemKey();
+        forgetCash('pay');
         tg.HapticFeedback?.notificationOccurred('success');
+        // Раньше форма молча перерисовывалась пустой — было непонятно, ушёл
+        // платёж или пропал.
+        toast(`Платёж отправлен на подтверждение: ${parsed.items.map(it => formatMoney(it.amount, it.currency)).join(' + ')}`);
         renderMoneyScreen();
       } catch (e) {
         status.textContent = '❌ ' + e.message; status.className = 'pay-status pay-error';
@@ -6165,13 +6272,19 @@ async function renderCashbox(container, section) {
   if (createBtn) {
     createBtn.addEventListener('click', () => {
       const raw = container.querySelector('#dep-amount').value;
-      const amount = parseFloat(String(raw).replace(',', '.').replace(/\s/g, ''));
-      if (isNaN(amount) || amount <= 0) { tg.showAlert('❌ Введите положительную сумму'); return; }
+      const amount = parseAmount(raw);
+      if (!(amount > 0)) { tg.showAlert('❌ Введите положительную сумму — например 1 500 или 12,50'); return; }
       haptic('light');
       createBtn.disabled = true;
       api('/api/deposits/create', { amount, idempotency_key: depKey })
-        .then(r => { depKey = idemKey(); tg.showAlert(`✅ Сдача #${r.deposit_id} отправлена на подтверждение`); renderMoneyScreen(); })
-        .catch(e => { tg.showAlert('❌ ' + e.message); createBtn.disabled = false; });
+        .then(r => {
+          depKey = idemKey();
+          forgetCash('dep');
+          haptic('success');
+          toast(`Сдача #${r.deposit_id} на ${formatMoney(amount, baseCur())} отправлена на подтверждение`);
+          renderMoneyScreen();
+        })
+        .catch(e => { toast(e.message, 'error'); createBtn.disabled = false; });
     });
   }
 
@@ -6184,8 +6297,8 @@ async function renderCashbox(container, section) {
       b.disabled = true;  // защита от двойного тапа (сервер идемпотентен, UX — нет)
       haptic('light');
       api('/api/deposits/confirm', { deposit_id: Number(id), idempotency_key: idemKey() })
-        .then(() => { tg.showAlert('✅ Сдача подтверждена'); renderMoneyScreen(); })
-        .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
+        .then(() => { haptic('success'); toast('Сдача подтверждена'); renderMoneyScreen(); })
+        .catch(e => { b.disabled = false; toast(e.message, 'error'); });
     });
     const box = card.querySelector('.dep-reject-box');
     card.querySelector('.dep-reject').addEventListener('click', () => { box.hidden = !box.hidden; });
@@ -6196,8 +6309,8 @@ async function renderCashbox(container, section) {
       if (b.disabled) return;
       b.disabled = true;
       api('/api/deposits/reject', { deposit_id: Number(id), reason })
-        .then(() => { tg.showAlert('❌ Сдача отклонена'); renderMoneyScreen(); })
-        .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
+        .then(() => { toast('Сдача отклонена', 'info'); renderMoneyScreen(); })
+        .catch(e => { b.disabled = false; toast(e.message, 'error'); });
     });
   });
 
@@ -6214,17 +6327,17 @@ async function renderCashbox(container, section) {
         return_id: Number(card.dataset.ret),
         idempotency_key: idemKey(),
       })
-        .then(() => { tg.showAlert('📦 Товар отмечен как принятый'); renderMoneyScreen(); })
-        .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
+        .then(() => { haptic('success'); toast('Товар отмечен как принятый'); renderMoneyScreen(); })
+        .catch(e => { b.disabled = false; toast(e.message, 'error'); });
     });
-    card.querySelector('.ret-confirm').addEventListener('click', (ev) => {
+    card.querySelector('.ret-confirm')?.addEventListener('click', (ev) => {
       const b = ev.currentTarget;
       if (b.disabled) return;
       b.disabled = true;  // защита от двойного тапа
       haptic('light');
       api('/api/returns/confirm', { return_id: Number(card.dataset.ret), idempotency_key: idemKey() })
-        .then(() => { tg.showAlert('✅ Возврат подтверждён'); renderMoneyScreen(); })
-        .catch(e => { b.disabled = false; tg.showAlert('❌ ' + e.message); });
+        .then(() => { haptic('success'); toast('Возврат подтверждён'); renderMoneyScreen(); })
+        .catch(e => { b.disabled = false; toast(e.message, 'error'); });
     });
   });
 
@@ -6238,8 +6351,10 @@ async function renderCashbox(container, section) {
         try {
           await api('/api/orders/confirm_payment', { order_id: id, idempotency_key: idemKey() });
           tg.HapticFeedback?.notificationOccurred('success');
+          // Карточка просто исчезала из списка — без слова, прошло ли.
+          toast(`Оплата по заказу #${id} подтверждена`);
           renderMoneyScreen();
-        } catch (e) { tg.showAlert('❌ ' + e.message); btn.disabled = false; }
+        } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
       });
     });
   });
@@ -6252,11 +6367,41 @@ async function renderCashbox(container, section) {
         try {
           await api('/api/orders/reject_payment', { order_id: id, idempotency_key: idemKey() });
           tg.HapticFeedback?.notificationOccurred('warning');
+          toast(`Оплата по заказу #${id} отклонена`, 'info');
           renderMoneyScreen();
-        } catch (e) { tg.showAlert('❌ ' + e.message); btn.disabled = false; }
+        } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
       });
     });
   });
+
+  // Черновик — восстанавливаем через те же кнопки, что нажимает человек
+  // («Ещё валюта», валюта строки, способ возврата): проводка остаётся одна.
+  if (section === 'ops') {
+    const saved = cashDrafts.load(CASH_DRAFT);
+    if (saved) {
+      if (saved.pay && container.querySelector('#pay-rows')) {
+        const rows = (saved.pay.rows || []).slice(0, 10);
+        for (let i = 1; i < rows.length; i++) container.querySelector('#pay-add-row')?.click();
+        container.querySelectorAll('.pay-row').forEach((row, i) => {
+          if (!rows[i]) return;
+          row.querySelector('.pay-row-amount').value = rows[i].amount || '';
+          row.querySelector(`[data-cur-opt="${rows[i].currency}"]`)?.click();
+        });
+        const comment = container.querySelector('#pay-comment');
+        if (comment) comment.value = saved.pay.comment || '';
+      }
+      const dep = container.querySelector('#dep-amount');
+      if (saved.dep && dep) dep.value = saved.dep.amount || '';
+      if (saved.ret && container.querySelector('#ret-order')) {
+        container.querySelector('#ret-order').value = saved.ret.order || '';
+        container.querySelector('#ret-reason').value = saved.ret.reason || '';
+        container.querySelector(`[data-refund="${saved.ret.refund}"]`)?.click();
+      }
+    }
+    // Делегированно на контейнер: строки платежа добавляются на лету.
+    container.addEventListener('input', saveCash);
+    container.addEventListener('click', saveCash);
+  }
 }
 
 // Список «Клиенты» (boss/admin): контрагенты с МС-балансом + локальным долгом/
