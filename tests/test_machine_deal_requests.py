@@ -772,3 +772,38 @@ def test_decision_card_goes_through_notify_policy(isolated_db, monkeypatch, sent
     sent.clear()
     _deal(client, MGR, _machine(vin="JCB-002"), kind="sale")
     assert sent == []
+
+
+def test_manager_does_not_see_colleague_buyer_contacts(isolated_db, monkeypatch, sent):
+    """Телефон и комментарий о покупателе в чужой заявке — не менеджеру, который
+    её не решает. Свою заявку автор видит целиком, руководство — всё."""
+    db = isolated_db
+    _setup(db)
+    mid = _machine()
+    client = _client(monkeypatch)
+    rid = _deal(client, MGR, mid, buyer_note="звонить после 18").json()["request_id"]
+
+    other = _post(client, "/api/machines/deals/pending", MGR2).json()
+    req = [r for r in other["requests"] if r["id"] == rid][0]
+    assert "buyer_phone" not in req and "buyer_note" not in req and "buyer_passport" not in req
+    mine = _post(client, "/api/machines/deals/pending", MGR).json()
+    req = [r for r in mine["requests"] if r["id"] == rid][0]
+    assert req["buyer_phone"] == "+998901112233" and req["buyer_note"] == "звонить после 18"
+    boss = _post(client, "/api/machines/deals/pending", BOSS).json()
+    req = [r for r in boss["requests"] if r["id"] == rid][0]
+    assert req["buyer_phone"] and req["buyer_passport"]
+    # Карточка машины — та же резка.
+    card = _post(client, "/api/machines/card", MGR2, machine_id=mid).json()
+    assert card["request"]["id"] == rid
+    assert "buyer_phone" not in (card.get("request") or {})
+
+
+def test_manager_deciding_without_boss_sees_contacts(isolated_db, monkeypatch, sent):
+    db = isolated_db
+    _setup(db, boss=False)
+    mid = _machine()
+    client = _client(monkeypatch)
+    rid = _deal(client, MGR, mid).json()["request_id"]
+    view = _post(client, "/api/machines/deals/pending", MGR2).json()
+    req = [r for r in view["requests"] if r["id"] == rid][0]
+    assert view["can_decide"] is True and req["buyer_phone"] == "+998901112233"

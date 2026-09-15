@@ -3986,9 +3986,12 @@ async def api_machines_card(request: Request):
     # новых заявок и ручных переходов у машины нет — решение должно состояться.
     active = (await mdr.active_by_machine([machine_id])).get(machine_id)
     request_view = None
-    if active:
-        request_view = mdr.visible_request(await mdr.get_request(int(active["id"])), role)
     rights = await mdr.decision_rights(user["id"], role)
+    if active:
+        request_view = mdr.visible_request(
+            await mdr.get_request(int(active["id"])), role,
+            viewer_id=user["id"], can_decide=rights["can_decide"],
+        )
     can_request = [] if active else mdr.allowed_kinds(machine.get("status"))
     # Деньги по рассрочке вносит менеджер (решение владельца); стирает —
     # руководство, менеджер только без руководителя (`_machine_money_undo_mode`).
@@ -4516,8 +4519,11 @@ async def api_machines_deals_pending(request: Request):
     rework = await mdr.list_requests(statuses=("rework",), created_by=user["id"])
     return JSONResponse({
         "ok": True,
-        "requests": [mdr.visible_request(r, role) for r in pending],
-        "my_rework": [mdr.visible_request(r, role) for r in rework],
+        "requests": [
+            mdr.visible_request(r, role, viewer_id=user["id"], can_decide=rights["can_decide"])
+            for r in pending
+        ],
+        "my_rework": [mdr.visible_request(r, role, viewer_id=user["id"]) for r in rework],
         "can_decide": rights["can_decide"],
         "decide_hint": rights["hint"],
         "approvers_exist": rights["exist"],

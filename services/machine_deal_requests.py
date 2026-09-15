@@ -127,15 +127,25 @@ def _recipients(users: list[dict]) -> list[int]:
 # ─── Чтение ──────────────────────────────────────────────────────────────────
 
 
-def visible_request(row: dict | None, role: str | None) -> dict | None:
+def visible_request(row: dict | None, role: str | None, *, viewer_id: int | None = None,
+                    can_decide: bool = False) -> dict | None:
     """Заявка без паспорта покупателя для всех, кроме руководства (как
-    `machines.visible_deal`). Сам факт, что паспорт вписан, — виден."""
+    `machines.visible_deal`). Сам факт, что паспорт вписан, — виден.
+
+    Телефон и комментарий о покупателе в ЧУЖОЙ заявке менеджеру не отдаются
+    (`viewer_id` — кто смотрит): это контакт клиента коллеги, а решать заявку
+    он не может. Исключение — менеджер, который решает сам (`can_decide`:
+    руководителя в системе нет) — ему нужны все условия."""
     if row is None:
         return None
     data = dict(row)
     data["has_passport"] = bool(data.get("buyer_passport"))
     if role not in APPROVER_ROLES:
         data.pop("buyer_passport", None)
+        own = viewer_id is not None and int(data.get("created_by") or 0) == int(viewer_id)
+        if viewer_id is not None and not own and not can_decide:
+            data.pop("buyer_phone", None)
+            data.pop("buyer_note", None)
     data["kind_label"] = KIND_LABELS.get(data.get("kind") or "", data.get("kind"))
     data["status_label"] = STATUS_LABELS.get(data.get("status") or "", data.get("status"))
     data.update(terms(data))
