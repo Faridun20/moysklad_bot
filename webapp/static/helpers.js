@@ -291,7 +291,9 @@
   function errorBoxHtml(msg, opts) {
     const o = opts || {};
     const offline = (typeof navigator !== 'undefined' && navigator.onLine === false)
-      || msg === 'Нет подключения к интернету';
+      || msg === 'Нет подключения к интернету'
+      // Текст сетевого слоя (net.js NET_ERROR_TEXT): нет ответа или истёк срок.
+      || msg === 'Нет связи — проверьте интернет и повторите';
     const title = offline ? 'Нет подключения' : 'Не удалось загрузить';
     const body = offline ? 'Проверьте интернет и попробуйте снова.' : escapeHtml(String(msg || ''));
     const retry = o.retry === false ? '' :

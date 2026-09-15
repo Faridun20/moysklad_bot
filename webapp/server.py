@@ -129,6 +129,9 @@ def _dev_bypass_user() -> dict | None:
     return {"id": uid, "first_name": "Dev", "username": "dev"}
 
 
+SESSION_EXPIRED_DETAIL = "Сессия истекла — закройте и откройте приложение заново"
+
+
 def _authorize(
     data: dict,
     allowed_roles: tuple[str, ...] | None = ("admin", "boss", "manager"),
@@ -150,7 +153,12 @@ def _authorize(
     """
     user = _dev_bypass_user() or verify_init_data(data.get("initData", ""))
     if not user:
-        raise HTTPException(status_code=401, detail="Invalid Telegram data")
+        # Подпись initData живёт час (webapp/auth.py MAX_INIT_DATA_AGE): чаще
+        # всего 401 — это не подделка, а приложение, открытое с утра. Текст
+        # видит человек, поэтому по-русски и с действием: подпись обновляет
+        # только переоткрытие, «Повторить» не поможет. Фронт по коду 401
+        # показывает свой экран «Сессия истекла».
+        raise HTTPException(status_code=401, detail=SESSION_EXPIRED_DETAIL)
     # R1: деактивацию проверяем отдельно от роли — кэш ролей per-process с TTL,
     # деактивация из бот-процесса иначе не видна webapp до истечения TTL. Касается
     # и allowed_roles=None (свои-данные эндпоинты): уволенный не должен дёргать

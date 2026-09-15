@@ -68,11 +68,12 @@ document.addEventListener('keydown', (e) => {
 // Данные всё равно проверяются подписью + auth_date на сервере.
 const _SESSION_KEY = 'tg_init_data';
 let _initData = tg.initData || '';
-if (_initData) {
-  sessionStorage.setItem(_SESSION_KEY, _initData);
-} else {
-  _initData = sessionStorage.getItem(_SESSION_KEY) || '';
-}
+// sessionStorage бывает запрещён (приватный режим, политика WebView) —
+// тогда живём без кэша, а не падаем белым экраном на первой строке.
+try {
+  if (_initData) sessionStorage.setItem(_SESSION_KEY, _initData);
+  else _initData = sessionStorage.getItem(_SESSION_KEY) || '';
+} catch (_e) { /* без кэша initData */ }
 
 // Telegram Desktop передаёт initData через postMessage из родительского
 // фрейма — асинхронно, уже ПОСЛЕ того как скрипт спарсился. Повторно
@@ -81,9 +82,76 @@ function _refreshInitData() {
   const live = tg.initData || '';
   if (live && live !== _initData) {
     _initData = live;
-    sessionStorage.setItem(_SESSION_KEY, live);
+    try { sessionStorage.setItem(_SESSION_KEY, live); } catch (_e) { /* без кэша */ }
   }
   return _initData;
+}
+
+// ─── Сеть ───────────────────────────────────────────
+// Все запросы идут через один слой (net.js): таймаут, «нет связи» и истёкшая
+// сессия разбираются там, а не в каждом экране. `fetch` берём при вызове, а не
+// при создании — так его может подменить тест, а в браузере это тот же глобал.
+// Слой создаётся при первом запросе, а не при загрузке скрипта: app.js без
+// net.js (старый кэш index.html, тестовый стенд) не должен падать белым
+// экраном на верхнем уровне — запрос в async-функции уйдёт в её catch.
+// Ручки, которые собирают PDF, печатают или шлют файл в Telegram, законно
+// отвечают дольше обычного срока.
+const LONG_TIMEOUT_MS = 60000;
+let _netInst = null;
+function _net() {
+  if (!_netInst) {
+    _netInst = createNet({
+      fetch: (path, init) => fetch(path, init),
+      getInitData: () => _initData,
+      onSessionExpired: () => showSessionExpired(),
+    });
+  }
+  return _netInst;
+}
+
+// Экран «Сессия истекла». initData подписан на час (webapp/auth.py), дальше
+// любая ручка отвечает 401. Раньше человек видел английское «Invalid Telegram
+// data» в тосте и жал «Повторить» — бесполезно: подпись обновляет только
+// переоткрытие приложения. Слой — поверх всего (а не в #content): запросы,
+// которые ещё в пути, дорисовали бы свои экраны поверх сообщения. Набранные
+// формы к этому моменту уже лежат в черновиках (formDrafts) и вернутся после
+// переоткрытия.
+let _sessionExpiredShown = false;
+function showSessionExpired() {
+  // До входа (/api/me) экран рисует сам init() — в #content, там гонок нет.
+  if (_sessionExpiredShown || !currentUser) return;
+  _sessionExpiredShown = true;
+  try { clearMainButton(); } catch (_e) { /* до инициализации кнопки */ }
+  // Подтверждение закрытия (черновик заказа) здесь только мешает: закрыть —
+  // ровно то, что человеку нужно сделать.
+  try { tg.disableClosingConfirmation && tg.disableClosingConfirmation(); } catch (_e) { /* старый клиент */ }
+  const canClose = typeof tg.close === 'function';
+  const ov = document.createElement('div');
+  ov.className = 'c-overlay session-expired';
+  ov.setAttribute('role', 'alertdialog');
+  ov.setAttribute('aria-modal', 'true');
+  ov.innerHTML = `
+    <div class="error-card">
+      <div class="error-icon">${icon('lock')}</div>
+      <div class="error-title">Сессия истекла</div>
+      <div class="error-body">Закройте приложение и откройте его снова из бота. Набранные формы сохранятся.</div>
+      <button class="btn-primary" id="session-close">${canClose ? 'Закрыть приложение' : 'Обновить'}</button>
+    </div>`;
+  document.body.appendChild(ov);
+  ov.querySelector('#session-close').addEventListener('click', () => {
+    if (canClose) { try { tg.close(); return; } catch (_e) { /* вне Telegram */ } }
+    location.reload();
+  });
+}
+
+// Черновики форм текущего пользователя (см. draftStore в net.js). Ключ —
+// id пользователя из Telegram: он известен ещё до /api/me.
+function formDrafts() {
+  let storage = null;
+  try { storage = window.localStorage; } catch (_e) { /* хранилище запрещено */ }
+  const uid = (currentUser && currentUser.user_id)
+    || (tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) || '';
+  return draftStore(storage, String(uid));
 }
 
 // Состояние приложения
@@ -137,37 +205,50 @@ async function init() {
       _refreshInitData();
     }
 
-    const response = await fetch('/api/me', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData: _initData }),
-    });
+    const me = await _net().request('/api/me', {});
 
-    if (response.status === 401) {
-      const isEmpty = !_initData;
-      document.getElementById('content').innerHTML = `
-        <div class="error-card">
-          <div class="error-icon">${icon('lock')}</div>
-          <div class="error-title">Нет доступа</div>
-          <div class="error-body">${isEmpty
-            ? 'Откройте приложение через кнопку <b>«Открыть»</b> в боте — не через браузер.'
-            : 'Ошибка авторизации. Попробуйте закрыть и открыть снова.'
-          }</div>
-          <button class="btn-primary" onclick="location.reload()">Повторить</button>
-        </div>`;
+    if (me.status === 401) {
+      // Пустой initData — приложение открыли не из бота (ссылкой в браузере):
+      // переоткрытие тут не поможет, нужна кнопка в боте. Непустой, но
+      // отвергнутый — чаще всего устаревшая подпись (страницу перезагрузили,
+      // и initData взялся из кэша сессии): «Повторить» её не обновит, нужно
+      // закрыть и открыть приложение.
+      const content = document.getElementById('content');
+      if (!_initData) {
+        content.innerHTML = `
+          <div class="error-card">
+            <div class="error-icon">${icon('lock')}</div>
+            <div class="error-title">Нет доступа</div>
+            <div class="error-body">Откройте приложение через кнопку <b>«Открыть»</b> в боте — не через браузер.</div>
+            <button class="btn-primary" onclick="location.reload()">Повторить</button>
+          </div>`;
+      } else {
+        const canClose = typeof tg.close === 'function';
+        content.innerHTML = `
+          <div class="error-card">
+            <div class="error-icon">${icon('lock')}</div>
+            <div class="error-title">Сессия истекла</div>
+            <div class="error-body">Вход через Telegram не подтверждён. Закройте приложение и откройте его снова из бота.</div>
+            <button class="btn-primary" id="session-close">${canClose ? 'Закрыть приложение' : 'Обновить'}</button>
+          </div>`;
+        content.querySelector('#session-close').addEventListener('click', () => {
+          if (canClose) { try { tg.close(); return; } catch (_e) { /* вне Telegram */ } }
+          location.reload();
+        });
+      }
       return;
     }
     // 403 — подпись верна, но доступ отключён (деактивированный сотрудник).
     // Это не «нет связи» и не повод жать «Повторить»: говорим прямо.
-    if (response.status === 403) {
+    if (me.status === 403) {
       renderNoAccess('Доступ отключён. Если это ошибка — обратитесь к администратору.');
       return;
     }
-    if (!response.ok) {
-      throw new Error(`Ошибка сервера (${response.status})`);
+    if (!me.ok) {
+      throw netError(me);
     }
 
-    currentUser = await response.json();
+    currentUser = me.body;
     renderHeader();
     if (currentUser.role === 'guest') {
       renderNoAccess();
@@ -777,16 +858,7 @@ async function renderStock() {
   // вкладки (категория, поиск, «Показать ещё») — они в сеть не ходят и не
   // мигают загрузкой.
   try {
-    const r = await fetch('/api/stock', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData: _initData }),
-    });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      throw new Error(err.detail || 'Ошибка загрузки склада');
-    }
-    stockData = await r.json();
+    stockData = await api('/api/stock', {});
   } catch (e) {
     content.innerHTML = stockShellHtml() + errorBox(e.message);
     wireSectionNav(content, 'stock', renderStockScreen);
@@ -2351,13 +2423,12 @@ function wirePhotoDelete(root, endpoint, bodyFor, onDone) {
 async function loadPhotos(root, endpoint, bodyFor) {
   for (const btn of (root || document).querySelectorAll('.machine-photo[data-photo]')) {
     try {
-      const r = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ initData: _initData, ...bodyFor(Number(btn.dataset.photo)) }),
-      });
-      if (!r.ok) throw new Error('нет фото');
-      const url = URL.createObjectURL(await r.blob());
+      // raw: байты картинки, а не JSON. Срок длиннее обычного — снимок
+      // тянется из Telegram через нашу ручку.
+      const res = await _net().request(endpoint, bodyFor(Number(btn.dataset.photo)),
+                                     { raw: true, timeoutMs: LONG_TIMEOUT_MS });
+      if (!res.ok) throw new Error('нет фото');
+      const url = URL.createObjectURL(await res.response.blob());
       _photoUrls.push(url);
       const img = btn.querySelector('img');
       if (img) img.src = url;
@@ -2447,12 +2518,13 @@ function pickPhotos(endpoint, body, onDone) {
         failed.push(`${files[i].name}: ${e.message}`);
         continue;
       }
-      let res = await apiResult(endpoint, { ...body, data_url: dataUrl });
+      // Снимок до мегабайта по мобильной сети — 20 секунд на него мало.
+      let res = await apiResult(endpoint, { ...body, data_url: dataUrl }, { timeoutMs: 90000 });
       if (!res.ok) {
         // Одна повторная попытка: на длинной пачке Telegram притормаживает
         // отправку, и это проходит само за секунду-другую.
         await new Promise(r => setTimeout(r, 1500));
-        res = await apiResult(endpoint, { ...body, data_url: dataUrl });
+        res = await apiResult(endpoint, { ...body, data_url: dataUrl }, { timeoutMs: 90000 });
       }
       if (!res.ok) failed.push(`${files[i].name}: ${res.error}`);
       else if (res.body.duplicate) duplicates += 1;
@@ -3014,28 +3086,13 @@ const STATUS_NAME = {
   cancelled: 'Отменён',
 };
 
-async function api(path, body) {
-  let r;
-  try {
-    r = await fetch(path, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData: _initData, ...body }),
-    });
-  } catch {
-    // fetch отклоняется только при сетевом сбое (нет интернета, CORS, abort) —
-    // не при HTTP-ошибке. Помечаем, чтобы errorBox показал «нет связи».
-    const err = new Error('Нет подключения к интернету');
-    err.network = true;
-    throw err;
-  }
-  if (!r.ok) {
-    // Тело ошибки может быть не-JSON (502/HTML от прокси) — не падаем на парсе.
-    let detail = `Ошибка сервера (${r.status})`;
-    try { detail = (await r.json()).detail || detail; } catch { /* не-JSON */ }
-    throw new Error(detail);
-  }
-  return r.json();
+// Запрос с разбором ошибок в исключение. Таймаут, «нет связи» и истёкшая
+// сессия — в сетевом слое (net.js); здесь только форма результата.
+// `opts.timeoutMs` — для заведомо долгих ручек (выгрузка Excel, фото).
+async function api(path, body, opts) {
+  const res = await _net().request(path, body, opts);
+  if (!res.ok) throw netError(res);
+  return res.body;
 }
 
 // Тот же запрос, но с полным телом ответа вместо исключения.
@@ -3045,25 +3102,8 @@ async function api(path, body) {
 // `current` (машину уже перевели в другой статус) — по ним форма предлагает
 // действие, а не просто печатает текст. Отдельная функция, а не перепись
 // `api()`: у полусотни её вызовов поведение «бросай на ошибке» правильное.
-async function apiResult(path, body) {
-  let r;
-  try {
-    r = await fetch(path, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData: _initData, ...body }),
-    });
-  } catch {
-    return { ok: false, status: 0, body: {}, error: 'Нет подключения к интернету' };
-  }
-  let data = {};
-  try { data = await r.json(); } catch { /* не-JSON: 502/HTML от прокси */ }
-  return {
-    ok: r.ok,
-    status: r.status,
-    body: data,
-    error: data.detail || `Ошибка сервера (${r.status})`,
-  };
+async function apiResult(path, body, opts) {
+  return _net().request(path, body, opts);
 }
 
 // Ключ идемпотентности для денежных действий: защищает от double-submit
@@ -4449,18 +4489,9 @@ async function renderSalesReport() {
   const gen = screenGen();
   try {
     const body = custom
-      ? { initData: _initData, since: analyticsSince, until: _nextDay(analyticsUntil) }
-      : { initData: _initData, period: analyticsPeriod };
-    const response = await fetch('/api/analytics', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) {
-      const err = await response.json();
-      throw new Error(err.detail || 'Ошибка');
-    }
-    const data = await response.json();
+      ? { since: analyticsSince, until: _nextDay(analyticsUntil) }
+      : { period: analyticsPeriod };
+    const data = await api('/api/analytics', body);
     analyticsCache[cacheKey] = { ts: Date.now(), data };
     lastAnalyticsData = data;
     // renderAnalyticsContent ищет #content заново — не пишем в чужой экран.
@@ -4657,7 +4688,7 @@ function renderAnalyticsContent(data) {
         const exportBody = (analyticsPeriod === 'custom' && analyticsSince && analyticsUntil)
           ? { since: analyticsSince, until: _nextDay(analyticsUntil) }
           : { period: analyticsPeriod };
-        await api('/api/analytics/export', exportBody);
+        await api('/api/analytics/export', exportBody, { timeoutMs: 90000 });
         exportBtn.innerHTML = `${icon('check')} Отправлено в чат`;
         tg.showAlert && tg.showAlert('Excel-файл отправлен в чат с ботом');
       } catch (e) {
@@ -7101,7 +7132,7 @@ async function renderWhInvoiceList() {
         // переотправка (клиент потерял файл, сменился телефон).
         const r = await apiResult('/api/wh/invoices/send', {
           invoice_id: Number(btn.dataset.whSend), force: true,
-        });
+        }, { timeoutMs: LONG_TIMEOUT_MS });
         if (!r.ok) {
           toast(r.body.reason || r.error, 'error');
           btn.disabled = false;
@@ -7156,7 +7187,8 @@ async function renderWhInvoiceList() {
 async function printViaCups(path, body, btn) {
   haptic('light');
   if (btn) btn.disabled = true;
-  const r = await apiResult(path, body);
+  // Печать ждёт ответа CUPS, а PDF иногда собирается заново — дольше обычного.
+  const r = await apiResult(path, body, { timeoutMs: LONG_TIMEOUT_MS });
   if (btn) btn.disabled = false;
   if (!r.ok) { toast(r.error, 'error'); return; }
   if (r.body.ok) toast(r.body.message || 'Отправлено на печать');
@@ -7293,7 +7325,7 @@ function openDocumentForm(meta) {
     ],
     submitLabel: 'Сформировать PDF',
     onSubmit: async (data, { showErr }) => {
-      const res = await apiResult('/api/docs/create', { ...data, idempotency_key: key });
+      const res = await apiResult('/api/docs/create', { ...data, idempotency_key: key }, { timeoutMs: LONG_TIMEOUT_MS });
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
       toast(res.body.sent ? 'Документ сформирован и отправлен вам в Telegram'
