@@ -151,7 +151,12 @@ def test_switch_on_shows_worker_actions_and_survives_reopen(open_app, e2e):
     # Сервер запомнил и записал в аудит.
     from services import user_prefs
 
-    assert user_prefs.get_prefs(e2e.ids["boss"]) == {"work_actions": True}
+    prefs = user_prefs.get_prefs(e2e.ids["boss"])
+    assert prefs["work_actions"] is True
+    # «Сегодня» до переключения показывала подсказку D2 (work_actions было
+    # выключено) — счётчик её показов рос независимо, `work_actions` его не
+    # трогает и в аудит счётчик не попадает (см. test_user_prefs.py).
+    assert prefs["work_actions_hint_shown"] >= 1
     assert e2e.rows("SELECT action, details FROM audit_log WHERE action = 'pref_set'") == [
         {"action": "pref_set", "details": "work_actions=on"},
     ]
@@ -179,7 +184,7 @@ def test_switch_on_shows_worker_actions_and_survives_reopen(open_app, e2e):
     again.wait_for_function(
         "() => ![...document.querySelectorAll('#content .seg-item[data-sect]')].some(e => e.dataset.sect === 'ops')"
     )
-    assert user_prefs.get_prefs(e2e.ids["boss"]) == {"work_actions": False}
+    assert user_prefs.get_prefs(e2e.ids["boss"])["work_actions"] is False
 
 
 # ─── «Решения» ──────────────────────────────────────────────────────────────

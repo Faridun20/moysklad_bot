@@ -487,6 +487,73 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
     assert not audit.issues, "Вёрстка:\n" + "\n".join(audit.issues)
 
 
+# ─── D3 (продуктовый аудит): бейдж счётчика не режет подпись вкладки ─────────
+
+_TAB_BADGE_CHECK_JS = """
+() => {
+  const out = [];
+  let sawBadge = false;
+  for (const el of document.querySelectorAll('#content .seg-item[data-sect]')) {
+    if (el.scrollWidth > el.clientWidth + 1) {
+      out.push(`clipped: ${el.dataset.sect} (${el.scrollWidth} > ${el.clientWidth})`);
+    }
+    const badge = el.querySelector('.stock-badge');
+    if (badge) {
+      sawBadge = true;
+      const b = badge.getBoundingClientRect();
+      const t = el.getBoundingClientRect();
+      if (b.left < t.left - 1 || b.right > t.right + 1) {
+        out.push(`badge-overflow: ${el.dataset.sect}`);
+      }
+    }
+  }
+  return { out, sawBadge };
+}
+"""
+
+
+@pytest.mark.parametrize("width", [360, 390], ids=["360", "390"])
+def test_confirm_badge_does_not_clip_tab_label(phone, e2e, tmp_path, no_rate_limit, width):
+    """Регресс со снимков площадки (payments-shots/05,07,09): сегмент «Деньги →
+    Подтвердить N» с бейджем счётчика читался «одтвердить» — `.seg-item` со
+    старым `min-width: 0` делил ряд на равные трети и резал подпись с обеих
+    сторон, пока бейдж стоял рядом. Фикс — `.seg-item { min-width:
+    max-content }` (style.css, комментарий там же прямо ссылается на этот
+    баг) — сделан отдельным UI-визуальным проходом ДО этой задачи.
+
+    `test_no_overlaps_on_any_screen` в этом же файле ловит то же самое как
+    часть общего геометрического аудита (проходит все экраны и роли), но не
+    называет конкретно эту вкладку и не требует, чтобы бейдж реально был
+    показан. Здесь — узкая, целевая регресс-проверка именно по описанию бага:
+    на 360/390px, с РЕАЛЬНО показанным бейджем счётчика («Подтвердить N»), у
+    КАЖДОГО ряда вкладок «Деньги»/«Продажи»/«Склад»/«Клиенты» подпись активной
+    (и любой другой видимой) вкладки не обрезана, и бейдж не вылезает за
+    рамку вкладки (не наезжает на подпись/соседей).
+    """
+    _seed_layout(e2e, tmp_path)  # заводит платёж картой, ждущий подтверждения
+    page = phone(e2e.ids["mgr"], theme="dark", width=width, height=800)
+
+    saw_badge = False
+    issues: list[str] = []
+    for screen in ("money", "sales", "stock", "clients"):
+        go(page, screen)
+        settled(page)
+        tabs = page.eval_on_selector_all(
+            "#content .seg-item[data-sect]", "els => els.map(e => e.dataset.sect)"
+        )
+        for key in tabs:
+            tab(page, key)
+            # Бейдж «Подтвердить» дописывается в DOM асинхронно (см. setConfirmBadge
+            # в app.js) — короткая пауза, чтобы застать его на месте.
+            page.wait_for_timeout(150)
+            res = page.evaluate(_TAB_BADGE_CHECK_JS)
+            issues += [f"{screen}/{key}: {i}" for i in res["out"]]
+            saw_badge = saw_badge or res["sawBadge"]
+
+    assert not issues, "Вкладки:\n" + "\n".join(issues)
+    assert saw_badge, "бейдж счётчика ни разу не показался — проверка не была бы полезной без него"
+
+
 # ─── Клавиатура ──────────────────────────────────────────────────────────────
 
 

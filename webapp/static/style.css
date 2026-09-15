@@ -460,6 +460,41 @@ body {
 }
 .section-label:first-child { margin-top: var(--sp-2); }
 
+/* Подсказка на «Сегодня» (D2 продуктового аудита): «Работаете один? Включите
+   «Рабочие действия»…» — не модалка, строка над очередью дел. Тап по строке
+   ведёт в «Настройки», отдельная кнопка — «Понятно» (просто убирает её с
+   экрана; счётчик показов пишет user_prefs, см. workActionsHintVisible). */
+.tip-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius);
+  background: var(--info-bg);
+  cursor: pointer;
+}
+.tip-banner-text {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-sm);
+  color: var(--info);
+}
+.tip-banner-dismiss {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 var(--sp-3);
+  border: none;
+  background: none;
+  color: var(--info);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+
 /* ─── Hero balance (Home) ─────────────────────────────────────── */
 .hero {
   background: var(--accent);

@@ -699,6 +699,53 @@ async function toggleWorkActions(btn) {
   }
 }
 
+// ─── Подсказка о «Рабочих действиях» на «Сегодня» (D2 продуктового аудита) ───
+// Руководитель работает один (менеджера нет/заболел), выключатель выключен —
+// кнопок заказа/отгрузки не видно, и непонятно, куда они делись. Подсказка —
+// не модалка, просто строка на «Сегодня» с «Понятно». Показываем НЕСКОЛЬКО
+// раз (легко пропустить один раз не глядя), но не бесконечно — счётчик показов
+// в user_prefs, максимум ниже.
+const WORK_ACTIONS_HINT_MAX_SHOWS = 3;
+
+function workActionsHintShownCount() {
+  return (currentUser && currentUser.prefs && currentUser.prefs.work_actions_hint_shown) || 0;
+}
+
+function workActionsHintVisible() {
+  return isBossRole() && !workActionsVisible()
+    && workActionsHintShownCount() < WORK_ACTIONS_HINT_MAX_SHOWS;
+}
+
+function workActionsHintHtml() {
+  return `
+    <div class="tip-banner" id="work-actions-hint" role="button" tabindex="0">
+      <div class="tip-banner-text">Работаете один? Включите «Рабочие действия» в Настройках, чтобы видеть кнопки заказа.</div>
+      <button class="tip-banner-dismiss" id="work-actions-hint-dismiss" aria-label="Понятно">Понятно</button>
+    </div>
+  `;
+}
+
+// Считается «показанной» с момента отрисовки (не с закрытия) — намеренно
+// грубо, как разрешает продуктовый аудит: не сессия/день, а простой счётчик
+// показов, который просто останавливается на максимуме.
+function markWorkActionsHintShown() {
+  const next = workActionsHintShownCount() + 1;
+  api('/api/prefs/set', { key: 'work_actions_hint_shown', value: next })
+    .then(res => { if (currentUser) currentUser.prefs = res.prefs || currentUser.prefs; })
+    .catch(() => {});
+}
+
+function wireWorkActionsHint() {
+  const el = document.getElementById('work-actions-hint');
+  if (!el) return;
+  markWorkActionsHintShown();
+  el.addEventListener('click', () => { showScreen('settings'); });
+  document.getElementById('work-actions-hint-dismiss')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    el.remove();
+  });
+}
+
 // «Удаление — только руководитель» (экран «Настройки»): общая настройка
 // компании, а не личный вид — `/api/settings/delete_requires_boss`, аудит
 // `setting_changed`. Текущее значение едет в `/api/me` (`currentUser`), по нему
@@ -1276,13 +1323,17 @@ async function renderHome() {
   // отдаёт /api/ops-summary для дневного пинга из бота.
   const bossHome = () => leaderboardHtml() + myOrdersHtml();
   const managerHome = () => myOrdersHtml();
+  // D2 продуктового аудита: «работаете один?» — только руководителю, только
+  // пока «Рабочие действия» выключены, и не бесконечно (см. workActionsHintVisible).
+  const workHint = workActionsHintVisible() ? workActionsHintHtml() : '';
 
   content.innerHTML =
-    hero + '<div id="home-fx"></div>' + workQueueHtml(queue) + linkWarning
+    hero + '<div id="home-fx"></div>' + workHint + workQueueHtml(queue) + linkWarning
     + (isBoss ? bossHome() : managerHome())
     + versionFooterHtml();
 
   wireWorkQueue(content);
+  wireWorkActionsHint();
   fillHomeFx(document.getElementById('home-fx'));
 
   // Клик по строке недавнего заказа → Заказы
@@ -5017,6 +5068,7 @@ async function openOrderEditor(orderId) {
       // чужой позиции (403, ошибка глоталась). С экрана позиция уходила, а в
       // заявку боссу — нет.
       currentDraftOrder.items = existing.items.map(it => ({ ...it, item_id: it.id }));
+      currentDraftOrder.agent_id = existing.agent_id || null;
       currentDraftOrder.agent_name = existing.agent_name;
       // Валюта фиксируется первой позицией. Список отдаёт базовую валюту и
       // пустому черновику, поэтому переносим её, только если позиции есть:
@@ -5257,6 +5309,30 @@ async function loadAgents(search) {
 
 let orderStockCache = null;
 
+// D1 (продуктовый аудит): подсказка порядка в «Выборе товара». Заказ идёт
+// конкретному клиенту, у которого уже есть история покупок — его товары
+// сверху (по давности последней покупки); иначе (нет клиента / первый заказ)
+// — собственные частые товары МЕНЕДЖЕРА за последние ~30 дней. Список — ТОЛЬКО
+// порядок/секция: полный алфавитный каталог остаётся ниже целиком, поиск
+// (`search`) её отключает — сортировка по частоте имеет смысл только в
+// дефолтном, ничем не отфильтрованном виде.
+function _pickerSections(filtered, hints, { search, selectedCat }) {
+  if (search || selectedCat !== 'all' || !hints || !hints.product_ids || !hints.product_ids.length) {
+    return { ordered: filtered, hintCount: 0, label: '' };
+  }
+  const rank = new Map(hints.product_ids.map((id, i) => [String(id), i]));
+  const hinted = [];
+  const rest = [];
+  filtered.forEach(p => {
+    if (rank.has(String(p.product_id))) hinted.push(p); else rest.push(p);
+  });
+  if (!hinted.length) return { ordered: filtered, hintCount: 0, label: '' };
+  hinted.sort((a, b) => rank.get(String(a.product_id)) - rank.get(String(b.product_id)));
+  // `rest` — срез уже алфавитного `filtered` (каталог отдаётся отсортированным
+  // с сервера), порядок остальных товаров не трогаем.
+  return { ordered: [...hinted, ...rest], hintCount: hinted.length, label: hints.label || '' };
+}
+
 async function openProductPicker() {
   const content = document.getElementById('content');
   content.innerHTML = `
@@ -5283,6 +5359,16 @@ async function openProductPicker() {
     }
   }
 
+  // Подсказка порядка — необязательная: сбой запроса не должен блокировать
+  // сам выбор товара, просто список останется чисто алфавитным, как раньше.
+  let pickerHints = { kind: 'none', label: '', product_ids: [] };
+  try {
+    const agentId = currentDraftOrder && currentDraftOrder.agent_id;
+    pickerHints = await api('/api/products/picker_hints', agentId ? { agent_id: agentId } : {});
+  } catch (e) {
+    // тихо остаёмся без подсказки
+  }
+
   let selectedCat = 'all';
   let prodLimit = 50;   // сколько товаров показываем («Показать ещё» +50)
   const { products, categories } = orderStockCache;
@@ -5296,32 +5382,43 @@ async function openProductPicker() {
       filtered = filtered.filter(p => p.name.toLowerCase().includes(search));
     }
 
+    const { ordered, hintCount, label } = _pickerSections(
+      filtered, pickerHints, { search, selectedCat }
+    );
+
     const list = document.getElementById('prod-list');
     if (!list) return;
-    const moreBtn = filtered.length > prodLimit
-      ? `<button class="btn-secondary u-mt-2" id="prod-more">Показать ещё (${filtered.length - prodLimit})</button>`
+    const moreBtn = ordered.length > prodLimit
+      ? `<button class="btn-secondary u-mt-2" id="prod-more">Показать ещё (${ordered.length - prodLimit})</button>`
       : '';
-    list.innerHTML = filtered.length === 0
+    const rowHtml = (p) => {
+      // Показываем ДОСТУПНОЕ (остаток минус резерв под одобренные заказы):
+      // обещать со склада то, что уже обещано другому, — верный способ
+      // отгрузить дважды.
+      const avail = p.available != null ? p.available : p.stock;
+      return `
+        <div class="c-row prod-row" role="button" tabindex="0"
+             data-name="${escapeHtml(p.name)}"
+             data-unit="${escapeHtml(p.unit)}"
+             data-stock="${avail}"
+             data-product="${p.product_id}">
+          <div class="prod-info">
+            <div class="prod-name">${escapeHtml(p.name)}</div>
+            ${p.folder_name ? `<div class="prod-folder">${escapeHtml(p.folder_name)}</div>` : ''}
+          </div>
+          ${whStockBadge(avail)}
+        </div>
+      `;
+    };
+    let rows = '';
+    if (hintCount > 0) rows += `<div class="section-label">${escapeHtml(label)}</div>`;
+    ordered.slice(0, prodLimit).forEach((p, idx) => {
+      if (hintCount > 0 && idx === hintCount) rows += `<div class="section-label">Все товары</div>`;
+      rows += rowHtml(p);
+    });
+    list.innerHTML = ordered.length === 0
       ? '<div class="loader">Товары не найдены</div>'
-      : filtered.slice(0, prodLimit).map(p => {
-          // Показываем ДОСТУПНОЕ (остаток минус резерв под одобренные заказы):
-          // обещать со склада то, что уже обещано другому, — верный способ
-          // отгрузить дважды.
-          const avail = p.available != null ? p.available : p.stock;
-          return `
-            <div class="c-row prod-row" role="button" tabindex="0"
-                 data-name="${escapeHtml(p.name)}"
-                 data-unit="${escapeHtml(p.unit)}"
-                 data-stock="${avail}"
-                 data-product="${p.product_id}">
-              <div class="prod-info">
-                <div class="prod-name">${escapeHtml(p.name)}</div>
-                ${p.folder_name ? `<div class="prod-folder">${escapeHtml(p.folder_name)}</div>` : ''}
-              </div>
-              ${whStockBadge(avail)}
-            </div>
-          `;
-        }).join('') + moreBtn;
+      : rows + moreBtn;
 
     document.querySelectorAll('.prod-row').forEach(row => {
       row.addEventListener('click', () => {

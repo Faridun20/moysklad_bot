@@ -760,10 +760,15 @@ async def get_me(request: Request):
 async def api_prefs_set(request: Request):
     """Личная настройка интерфейса (services/user_prefs): {key, value}.
 
-    Сейчас одна — `work_actions`, выключатель «Рабочие действия» в «Меню»
-    руководителя. Меняет только ВИД (какие кнопки рисовать), права ручек не
-    трогает. Каждое переключение — в аудит: «кто и когда включил себе работу
-    менеджера» — вопрос, который задают после разбора.
+    `work_actions` — выключатель «Рабочие действия» в «Меню» руководителя
+    (bool). `work_actions_hint_shown` — счётчик показов подсказки о нём на
+    «Сегодня» (D2 продуктового аудита): фронт шлёт новое значение каждый раз,
+    когда подсказку реально нарисовал. Тип значения по умолчанию в
+    `user_prefs.PREFS` решает, что здесь считается валидным value. Меняет
+    только ВИД (какие кнопки/подсказки рисовать), права ручек не трогает.
+    Переключение `work_actions` — в аудит: «кто и когда включил себе работу
+    менеджера» — вопрос, который задают после разбора; счётчик подсказки в
+    аудит не идёт — это не решение, а телеметрия показа.
     """
     from services import async_db as adb
 
@@ -775,13 +780,26 @@ async def api_prefs_set(request: Request):
     role = get_role(user["id"])
     if key not in user_prefs.PREFS or not user_prefs.applies_to(key, role):
         raise HTTPException(status_code=400, detail="Неизвестная настройка")
+    default = user_prefs.PREFS[key][0]
     value = data.get("value")
-    if not isinstance(value, bool):
-        raise HTTPException(status_code=400, detail="value: true или false")
+    audit = None
+    if isinstance(default, bool):
+        if not isinstance(value, bool):
+            raise HTTPException(status_code=400, detail="value: true или false")
+        audit = "on" if value else "off"
+    elif isinstance(default, int):
+        # bool — подкласс int в Python: явная проверка, иначе True/False
+        # молча прошли бы сюда как 1/0.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise HTTPException(status_code=400, detail="value: число")
+        value = max(0, min(int(value), 1000))  # разумный потолок, не «свалка»
+    else:  # pragma: no cover — новый тип default в PREFS без ветки валидации
+        raise HTTPException(status_code=400, detail="Неизвестная настройка")
     prefs = await asyncio.to_thread(user_prefs.set_pref, user["id"], key, value)
-    await adb.add_audit_log(
-        user["id"], _actor_name(user), role, "pref_set", f"{key}={'on' if value else 'off'}"
-    )
+    if audit is not None:
+        await adb.add_audit_log(
+            user["id"], _actor_name(user), role, "pref_set", f"{key}={audit}"
+        )
     return JSONResponse({"ok": True, "prefs": prefs})
 
 
@@ -1181,6 +1199,32 @@ async def api_stock(request: Request):
         products.append(item)
 
     return JSONResponse({"products": products, "categories": cats, "cost_currency": cost_cur})
+
+
+@app.post("/api/products/picker_hints")
+async def api_products_picker_hints(request: Request):
+    """Подсказка «что предложить первым» в шапке «Выбор товара» (D1 продуктового
+    аудита, `openProductPicker` в app.js).
+
+    `agent_id` задан и у клиента есть история — его товары по давности
+    последней покупки («Недавно у этого клиента»). Иначе (заказ ещё без
+    клиента, или клиент первый раз) — собственные частые товары МЕНЕДЖЕРА за
+    последние ~30 дней («Часто заказываемое»). Только порядок: полный
+    алфавитный каталог фронт по-прежнему получает из `/api/stock` и не
+    прячет — здесь лишь список id для сортировки/секции сверху.
+    """
+    from services.warehouse import picker_hints
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_products_picker_hints",
+        rate_limit_max=120,
+    )
+    agent_id = (data.get("agent_id") or "").strip()[:64]
+    hints = await picker_hints(user_id=user["id"], agent_id=agent_id or None)
+    return JSONResponse(hints)
 
 
 # ─── API: аналитика продаж ───────────────────────────────────────────────────
@@ -3253,6 +3297,7 @@ async def api_orders(request: Request):
             "id": o["id"],
             "status": o["status"],
             "full_name": o["full_name"],
+            "agent_id": o.get("agent_id") or None,
             "agent_name": o.get("agent_name", ""),
             "comment": o.get("comment", ""),
             "currency": o.get("currency") or BASE_CURRENCY,

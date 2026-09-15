@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from services import adb_core, money
@@ -1133,4 +1133,76 @@ async def counterparty_purchases(counterparty_id, limit: int = 20) -> dict:
         ],
         "total_cents": sum(int(r["total_amount_cents"] or 0) for r in rows),
         "count": len(rows),
+    }
+
+
+# ─── Подсказка «что предложить» в «Выбор товара» (D1 продуктового аудита) ────
+
+# Сколько product_id отдаём подсказкой — экран всё равно рисует не более
+# ~50 строк за раз («Показать ещё»), большего просто не покажут.
+_PICKER_HINT_LIMIT = 30
+# Окно «часто заказываемое» у менеджера — сознательно грубо (последний месяц),
+# как и разрешает продуктовый аудит: не отчёт, а намёк порядка в списке.
+_PICKER_HINT_WINDOW_DAYS = 30
+
+# Заказ без реального намерения купить (отклонён/отменён) в подсказку не
+# попадает — иначе «часто заказываемое» подсовывало бы то, что уже
+# отбраковали.
+_PICKER_HINT_EXCLUDED_STATUSES = ("cancelled", "rejected")
+
+
+async def picker_hints(user_id: int, agent_id: str | None) -> dict:
+    """Порядок подсказки для `openProductPicker`: → {kind, label, product_ids}.
+
+    `kind`:
+      - `client_recent` — у контрагента `agent_id` есть свои позиции заказов
+        (`order_item_products`), `product_ids` — по давности ПОСЛЕДНЕЙ
+        покупки, новые сверху;
+      - `manager_frequent` — нет `agent_id` ИЛИ у клиента ещё нет истории
+        (первый заказ): собственные позиции менеджера `user_id` за последние
+        `_PICKER_HINT_WINDOW_DAYS` дней, по частоте (при равной — тоже по
+        давности);
+      - `none` — истории нет вовсе (новый менеджер/новый клиент без заказов).
+
+    Список НЕ ограничивает выбор — фронт им только переставляет/секционирует
+    ПОЛНЫЙ алфавитный каталог, поэтому здесь достаточно id без имён/остатков.
+    """
+    if agent_id:
+        try:
+            aid = str(int(str(agent_id).strip()))
+        except (TypeError, ValueError):
+            aid = None
+        if aid:
+            args: list = [aid, *_PICKER_HINT_EXCLUDED_STATUSES, _PICKER_HINT_LIMIT]
+            placeholders = ", ".join(f"${i + 2}" for i in range(len(_PICKER_HINT_EXCLUDED_STATUSES)))
+            rows = await adb_core.fetch(
+                "SELECT op.product_id AS product_id, MAX(op.created_at) AS last_at "
+                "FROM order_item_products op JOIN orders o ON o.id = op.order_id "
+                f"WHERE o.agent_id = $1 AND o.status NOT IN ({placeholders}) "
+                f"GROUP BY op.product_id ORDER BY last_at DESC LIMIT ${len(args)}",
+                *args,
+            )
+            if rows:
+                return {
+                    "kind": "client_recent",
+                    "label": "Недавно у этого клиента",
+                    "product_ids": [int(r["product_id"]) for r in rows],
+                }
+
+    cutoff = (datetime.now() - timedelta(days=_PICKER_HINT_WINDOW_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    args = [int(user_id), cutoff, *_PICKER_HINT_EXCLUDED_STATUSES, _PICKER_HINT_LIMIT]
+    placeholders = ", ".join(f"${i + 3}" for i in range(len(_PICKER_HINT_EXCLUDED_STATUSES)))
+    rows = await adb_core.fetch(
+        "SELECT op.product_id AS product_id, COUNT(*) AS cnt, MAX(op.created_at) AS last_at "
+        "FROM order_item_products op JOIN orders o ON o.id = op.order_id "
+        f"WHERE o.user_id = $1 AND o.created_at >= $2 AND o.status NOT IN ({placeholders}) "
+        f"GROUP BY op.product_id ORDER BY cnt DESC, last_at DESC LIMIT ${len(args)}",
+        *args,
+    )
+    if not rows:
+        return {"kind": "none", "label": "", "product_ids": []}
+    return {
+        "kind": "manager_frequent",
+        "label": "Часто заказываемое",
+        "product_ids": [int(r["product_id"]) for r in rows],
     }
