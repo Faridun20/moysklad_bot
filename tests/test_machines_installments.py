@@ -386,7 +386,7 @@ def test_deal_endpoint_builds_the_schedule(isolated_db, monkeypatch):
 
     r = _post(client, "/api/machines/deal", 2, machine_id=mid, kind="credit",
               price="25 000", down_payment="5 000", months=5,
-              buyer_name="Иванов", idempotency_key="c1")
+              buyer_name="Иванов", buyer_passport="AA1234567", idempotency_key="c1")
     assert r.status_code == 200, r.text
     assert r.json()["payments"] == 5
     rows = _run(machines.get_schedule(r.json()["deal_id"]))

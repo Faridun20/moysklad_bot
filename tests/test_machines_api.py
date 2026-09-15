@@ -474,13 +474,39 @@ def test_machine_with_a_deal_is_not_deletable(isolated_db, monkeypatch):
     assert _run(machines.get_machine(mid, role="boss")) is not None
 
 
-def test_delete_is_boss_only(isolated_db, monkeypatch):
+def test_delete_follows_delete_requires_boss(isolated_db, monkeypatch):
+    """Решение владельца: пока менеджер один, удаляет и он; флаг руководителя
+    `delete_requires_boss` оставляет удаление руководству. Кладовщику — никогда."""
     db = isolated_db
     _setup(db)
-    mid = _machine("A-1")
+    client = _client(monkeypatch)
+    first, second, third = _machine("A-1"), _machine("A-2"), _machine("A-3")
 
-    assert _post(_client(monkeypatch), "/api/machines/delete", 1,
-                 machine_id=mid).status_code == 403
+    assert _post(client, "/api/machines/delete", 4, machine_id=first).status_code == 403
+    assert _post(client, "/api/machines/delete", 1, machine_id=first).status_code == 200
+
+    assert _post(client, "/api/settings/delete_requires_boss", 1, enabled=True).status_code == 403
+    r = _post(client, "/api/settings/delete_requires_boss", 2, enabled=True)
+    assert r.status_code == 200 and r.json()["delete_requires_boss"] is True
+    assert _post(client, "/api/me", 1).json()["delete_requires_boss"] is True
+    denied = _post(client, "/api/machines/delete", 1, machine_id=second)
+    assert denied.status_code == 403 and "руководитель" in denied.json()["detail"]
+    assert _post(client, "/api/machines/delete", 2, machine_id=second).status_code == 200
+
+    assert _post(client, "/api/settings/delete_requires_boss", 2, enabled=False).status_code == 200
+    assert _post(client, "/api/me", 1).json()["delete_requires_boss"] is False
+    assert _post(client, "/api/machines/delete", 1, machine_id=third).status_code == 200
+    audit = _run(db.get_audit_log(limit=50))
+    changes = [a["details"] for a in audit if a.get("action") == "setting_changed"]
+    assert len(changes) == 2 and any("True → False" in d for d in changes), changes
+
+
+def test_delete_setting_default_is_off_and_validated(isolated_db, monkeypatch):
+    db = isolated_db
+    _setup(db)
+    client = _client(monkeypatch)
+    assert _post(client, "/api/me", 1).json()["delete_requires_boss"] is False
+    assert _post(client, "/api/settings/delete_requires_boss", 2, enabled="yes").status_code == 400
 
 
 def test_delete_missing_machine_is_404(isolated_db, monkeypatch):
@@ -657,7 +683,7 @@ def test_closing_a_closed_deal_is_409(isolated_db, monkeypatch):
     mid = _machine("A-1")
     client = _client(monkeypatch)
     created = _post(client, "/api/machines/deal", 2, machine_id=mid, kind="credit",
-                    price="1000", buyer_name="A", months=3,
+                    price="1000", buyer_name="A", months=3, buyer_passport="AA1",
                     idempotency_key="c1")
     deal_id = created.json()["deal_id"]
     assert _post(client, "/api/machines/deal_close", 2, deal_id=deal_id).status_code == 200
@@ -666,14 +692,20 @@ def test_closing_a_closed_deal_is_409(isolated_db, monkeypatch):
     assert r.status_code == 409
 
 
-def test_deals_are_boss_only(isolated_db, monkeypatch):
+def test_manager_deal_is_a_request_and_money_screens_stay_boss_only(isolated_db, monkeypatch):
+    """Менеджер оформляет сделку — это заявка на одобрение, а не продажа;
+    список рассрочек и закрытие остаются руководству."""
     db = isolated_db
     _setup(db)
     mid = _machine("A-1")
     client = _client(monkeypatch)
 
-    assert _post(client, "/api/machines/deal", 1, machine_id=mid, kind="sale",
-                 price="1000", buyer_name="A", idempotency_key="k").status_code == 403
+    r = _post(client, "/api/machines/deal", 1, machine_id=mid, kind="sale",
+              price="1000", buyer_name="A", idempotency_key="k")
+    assert r.status_code == 200, r.text
+    assert r.json()["pending"] is True and r.json()["deal_id"] is None
+    assert _post(client, "/api/machines/deal", 4, machine_id=mid, kind="sale",
+                 price="1000", buyer_name="A", idempotency_key="k4").status_code == 403
     assert _post(client, "/api/machines/deals_open", 1).status_code == 403
     assert _post(client, "/api/machines/deal_close", 1, deal_id=1).status_code == 403
 
@@ -822,7 +854,7 @@ def test_installment_without_down_payment_accepts_zero(isolated_db, monkeypatch)
         mid = _machine(f"Z-{i}")
         r = _post(client, "/api/machines/deal", 2, machine_id=mid, kind="credit",
                   price="12 000", down_payment=zero, months=4, buyer_name="Азиз",
-                  idempotency_key=f"zero-{i}")
+                  buyer_passport="AA1234567", idempotency_key=f"zero-{i}")
         assert r.status_code == 200, (zero, r.text)
         deal = _run(machines.list_deals(mid, role="boss"))[0]
         progress = _run(machines.deal_progress(int(deal["id"])))
@@ -834,7 +866,7 @@ def test_installment_without_down_payment_accepts_zero(isolated_db, monkeypatch)
         mid = _machine(f"B-{bad}")
         r = _post(client, "/api/machines/deal", 2, machine_id=mid, kind="credit",
                   price="12 000", down_payment=bad, months=4, buyer_name="Азиз",
-                  idempotency_key=f"bad-{bad}")
+                  buyer_passport="AA1234567", idempotency_key=f"bad-{bad}")
         assert r.status_code == 400, (bad, r.text)
     # Цена ноль по-прежнему отказ.
     r = _post(client, "/api/machines/deal", 2, machine_id=_machine("P-0"), kind="sale",

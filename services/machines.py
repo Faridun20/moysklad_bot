@@ -508,6 +508,15 @@ async def delete_machine(machine_id: int, *, user_id: int, full_name: str = "") 
         if int(deals or 0):
             # Сделка — денежный факт; удаление машины стёрло бы историю продажи.
             return {"ok": False, "error": "По машине есть сделки — используйте архив"}
+        active = await active_request_locked(txn, machine_id)
+        if active:
+            # Заявку ждёт руководитель: удалить машину из-под решения значит
+            # оставить ему карточку, по которой нечего одобрять.
+            return pending_refusal(active)
+        # Решённые заявки без сделки (отклонённые, отозванные, бронь) — история
+        # решений, а не денежный факт; уходят вместе с карточкой, в аудите они
+        # остаются.
+        await txn.execute("DELETE FROM machine_deal_requests WHERE machine_id = $1", machine_id)
         await txn.execute("DELETE FROM machine_photos WHERE machine_id = $1", machine_id)
         await txn.execute("DELETE FROM machine_hours WHERE machine_id = $1", machine_id)
         await txn.execute("DELETE FROM machines WHERE id = $1", machine_id)
@@ -1060,6 +1069,158 @@ async def mark_installment_notified(payment_id: int) -> bool:
     ))
 
 
+async def active_request_locked(txn: Any, machine_id: int) -> dict | None:
+    """Живая заявка на сделку по машине (ждёт решения или на доработке).
+
+    Читается в той же транзакции, что и запись, после `lock_machine`: заявка,
+    созданная параллельно, иначе проскочила бы между проверкой и записью.
+    """
+    return await txn.fetchrow(
+        "SELECT id, kind, status, created_by FROM machine_deal_requests "
+        "WHERE machine_id = $1 AND status IN ('pending', 'rework') ORDER BY id LIMIT 1",
+        machine_id,
+    )
+
+
+async def lock_machine(txn: Any, machine_id: int) -> dict | None:
+    """Строка машины под блокировкой до конца транзакции.
+
+    Все, кто решает судьбу машины (заявка на сделку, её одобрение, прямая
+    сделка руководства), берут её первой: иначе проверка «живой заявки нет» и
+    запись новой расходились бы между двумя запросами. На SQLite пишущая
+    транзакция одна (`BEGIN IMMEDIATE`)."""
+    sql = "SELECT id, status, price_cents, currency, name, vin FROM machines WHERE id = $1"
+    if USE_POSTGRES:
+        sql += " FOR UPDATE"
+    return await txn.fetchrow(sql, machine_id)
+
+
+def pending_refusal(active: dict) -> dict:
+    """Отказ «по машине уже ждёт решения заявка» — один текст на все пути."""
+    return {
+        "ok": False,
+        "error": f"По машине уже есть заявка #{active['id']} на одобрении — "
+        "дождитесь решения руководителя",
+        "current": "pending_request",
+        "request_id": int(active["id"]),
+    }
+
+
+async def prepare_deal(
+    *, kind: str, price_cents: int, buyer_name: str, currency: str,
+    down_payment_cents: int = 0, months: int = 0,
+) -> str:
+    """Проверки сделки ДО транзакции (курс читает синхронный слой). Пустая
+    строка — всё в порядке."""
+    if kind not in DEAL_KINDS:
+        return f"Тип сделки: {' / '.join(DEAL_KINDS)}"
+    ok, err = await _validate_cents(price_cents, "Цена", currency)
+    if not ok:
+        return err
+    if not price_cents:
+        return "Цена сделки обязательна"
+    if not (buyer_name or "").strip():
+        return "Покупатель обязателен"
+    if kind == "credit":
+        err = validate_installment(price_cents, down_payment_cents, months)
+        if err:
+            return err
+    return ""
+
+
+async def insert_deal_locked(
+    txn: Any,
+    machine: dict,
+    *,
+    kind: str,
+    price_cents: int,
+    buyer_name: str,
+    created_by: int,
+    currency: str = "USD",
+    buyer_phone: str | None = None,
+    buyer_passport: str | None = None,
+    buyer_note: str | None = None,
+    order_id: int | None = None,
+    agent_ms_id: str | None = None,
+    down_payment_cents: int = 0,
+    months: int = 0,
+) -> dict:
+    """Сделка + статус машины + график ВНУТРИ транзакции под `lock_machine`.
+
+    → {ok, deal_id, status, due_date, payments} или {ok: False, error}. Отказ
+    по статусу — до записи, поэтому вызывающему достаточно не коммитить свои
+    строки (одобрение заявки выходит из транзакции без изменений).
+
+    Статус машины меняется CAS'ом: два одновременных «продал» не создадут две
+    сделки на одну машину. График рассрочки строится от ДНЯ ЗАПИСИ — для
+    заявки менеджера это день одобрения: график начинает жить с решения
+    руководителя, а не с того дня, когда форму заполнили.
+    """
+    schedule: list[dict] = []
+    due_date: str | None = None
+    if kind == "credit":
+        schedule = build_schedule(price_cents, down_payment_cents, months, local_now().date())
+        due_date = schedule[-1]["due_date"]
+
+    new_status = "sold" if kind == "sale" else "on_credit"
+    stamp = now_str()
+    machine_id = int(machine["id"])
+    moved = await txn.execute(
+        "UPDATE machines SET status = $1, updated_at = $2 "
+        "WHERE id = $3 AND status IN ($4, $5, $6)",
+        new_status, stamp, machine_id, *_SELLABLE,
+    )
+    if not moved:
+        label = STATUS_LABELS.get(machine["status"], machine["status"])
+        return {"ok": False, "error": f"Машина в статусе «{label}» — сделка невозможна"}
+    placeholders = ", ".join(f"${i + 1}" for i in range(13))
+    sql = (
+        "INSERT INTO machine_deals (machine_id, kind, price_cents, currency, buyer_name, "
+        "buyer_phone, buyer_passport, buyer_note, order_id, agent_ms_id, sold_at, "
+        f"due_date, created_by) VALUES ({placeholders})"
+    )
+    values = (
+        machine_id, kind, price_cents, (currency or "USD").upper(), buyer_name.strip(),
+        buyer_phone, buyer_passport, buyer_note, order_id, agent_ms_id, stamp,
+        due_date, created_by,
+    )
+    if USE_POSTGRES:
+        deal_id = await txn.fetchval(sql + " RETURNING id", *values)
+    else:
+        await txn.execute(sql, *values)
+        deal_id = await txn.fetchval("SELECT last_insert_rowid()")
+    # График — той же транзакцией: сделка без графика это рассрочка, о
+    # сроках которой никто не узнает.
+    for row in schedule:
+        await txn.execute(
+            "INSERT INTO machine_deal_payments (deal_id, seq, due_date, amount_cents, "
+            "paid_at, paid_by, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            deal_id, row["seq"], row["due_date"], row["amount_cents"],
+            # Взнос уже получен — помечаем оплаченным сразу, иначе он
+            # попадёт в напоминания о просрочке в тот же день.
+            stamp if row["prepaid"] else None,
+            created_by if row["prepaid"] else None,
+            stamp,
+        )
+    return {
+        "ok": True,
+        "deal_id": int(deal_id),
+        "status": new_status,
+        "status_from": machine["status"],
+        "due_date": due_date,
+        "payments": len([r for r in schedule if not r["prepaid"]]),
+    }
+
+
+def deal_audit_details(machine_id: int, kind: str, price_cents: int, currency: str,
+                       buyer_name: str, down_payment_cents: int, months: int) -> str:
+    return (
+        f"#{machine_id} · {kind} · {money.format_cents(price_cents)} {currency} · {buyer_name}"
+        + (f" · взнос {money.format_cents(down_payment_cents)}, {months} мес."
+           if kind == "credit" else "")
+    )
+
+
 async def create_deal(
     machine_id: int,
     *,
@@ -1077,93 +1238,48 @@ async def create_deal(
     down_payment_cents: int = 0,
     months: int = 0,
 ) -> dict:
-    """Оформить продажу или рассрочку.
+    """Оформить продажу или рассрочку сразу, без заявки.
 
-    Статус машины меняем тем же CAS'ом в одной транзакции со вставкой сделки:
-    иначе два одновременных «продал» создали бы две сделки на одну машину, и
-    обе выглядели бы успешными.
+    Прямой путь сервиса (руководство через `machine_deal_requests.submit`
+    приходит сюда же, но уже с записью заявки). Живая заявка менеджера на ту же
+    машину блокирует и его: решение по ней должно состояться, а не быть
+    перебитым второй сделкой.
 
     Рассрочке нужны первоначальный взнос и срок в месяцах — график строится сам
     (`build_schedule`) и пишется той же транзакцией. Дату последнего платежа
     (`due_date` сделки) считаем, а не спрашиваем: введённая руками, она рано
     или поздно разошлась бы с графиком.
     """
-    if kind not in DEAL_KINDS:
-        return {"ok": False, "error": f"Тип сделки: {' / '.join(DEAL_KINDS)}"}
-    ok, err = await _validate_cents(price_cents, "Цена", currency)
-    if not ok:
+    err = await prepare_deal(
+        kind=kind, price_cents=price_cents, buyer_name=buyer_name, currency=currency,
+        down_payment_cents=down_payment_cents, months=months,
+    )
+    if err:
         return {"ok": False, "error": err}
-    if not price_cents:
-        return {"ok": False, "error": "Цена сделки обязательна"}
-    if not (buyer_name or "").strip():
-        return {"ok": False, "error": "Покупатель обязателен"}
 
-    schedule: list[dict] = []
-    due_date: str | None = None
-    if kind == "credit":
-        err = validate_installment(price_cents, down_payment_cents, months)
-        if err:
-            return {"ok": False, "error": err}
-        schedule = build_schedule(price_cents, down_payment_cents, months, local_now().date())
-        due_date = schedule[-1]["due_date"]
-
-    new_status = "sold" if kind == "sale" else "on_credit"
-    stamp = now_str()
-    placeholders = ", ".join(f"${i + 1}" for i in range(13))
     async with adb_core.transaction() as txn:
-        machine = await txn.fetchrow("SELECT status FROM machines WHERE id = $1", machine_id)
+        machine = await lock_machine(txn, machine_id)
         if not machine:
             return {"ok": False, "error": "Машина не найдена"}
-        moved = await txn.execute(
-            "UPDATE machines SET status = $1, updated_at = $2 "
-            "WHERE id = $3 AND status IN ($4, $5, $6)",
-            new_status, stamp, machine_id, *_SELLABLE,
+        active = await active_request_locked(txn, machine_id)
+        if active:
+            return pending_refusal(active)
+        res = await insert_deal_locked(
+            txn, machine, kind=kind, price_cents=price_cents, buyer_name=buyer_name,
+            created_by=created_by, currency=currency, buyer_phone=buyer_phone,
+            buyer_passport=buyer_passport, buyer_note=buyer_note, order_id=order_id,
+            agent_ms_id=agent_ms_id, down_payment_cents=down_payment_cents, months=months,
         )
-        if not moved:
-            label = STATUS_LABELS.get(machine["status"], machine["status"])
-            return {"ok": False, "error": f"Машина в статусе «{label}» — сделка невозможна"}
-        sql = (
-            "INSERT INTO machine_deals (machine_id, kind, price_cents, currency, buyer_name, "
-            "buyer_phone, buyer_passport, buyer_note, order_id, agent_ms_id, sold_at, "
-            f"due_date, created_by) VALUES ({placeholders})"
-        )
-        values = (
-            machine_id, kind, price_cents, (currency or "USD").upper(), buyer_name.strip(),
-            buyer_phone, buyer_passport, buyer_note, order_id, agent_ms_id, stamp,
-            due_date, created_by,
-        )
-        if USE_POSTGRES:
-            deal_id = await txn.fetchval(sql + " RETURNING id", *values)
-        else:
-            await txn.execute(sql, *values)
-            deal_id = await txn.fetchval("SELECT last_insert_rowid()")
-        # График — той же транзакцией: сделка без графика это рассрочка, о
-        # сроках которой никто не узнает.
-        for row in schedule:
-            await txn.execute(
-                "INSERT INTO machine_deal_payments (deal_id, seq, due_date, amount_cents, "
-                "paid_at, paid_by, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                deal_id, row["seq"], row["due_date"], row["amount_cents"],
-                # Взнос уже получен — помечаем оплаченным сразу, иначе он
-                # попадёт в напоминания о просрочке в тот же день.
-                stamp if row["prepaid"] else None,
-                created_by if row["prepaid"] else None,
-                stamp,
-            )
+        if not res["ok"]:
+            return res
 
     await _audit(
         created_by, creator_name, "machine_deal_created",
-        f"#{machine_id} · {kind} · {money.format_cents(price_cents)} {currency} · {buyer_name}"
-        + (f" · взнос {money.format_cents(down_payment_cents)}, {months} мес."
-           if kind == "credit" else ""),
+        deal_audit_details(machine_id, kind, price_cents, currency, buyer_name,
+                           down_payment_cents, months),
     )
-    return {
-        "ok": True,
-        "deal_id": int(deal_id),
-        "status": new_status,
-        "due_date": due_date,
-        "payments": len([r for r in schedule if not r["prepaid"]]),
-    }
+    res.pop("status_from", None)
+    return res
 
 
 async def close_deal(deal_id: int, *, user_id: int, full_name: str = "") -> dict:

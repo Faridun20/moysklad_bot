@@ -111,15 +111,28 @@ def test_guest_cannot_create_invoice(api):
     assert _incoming(client, ids["guest"]).status_code == 403
 
 
-def test_manager_cannot_cancel_invoice(api):
-    """Отмена — только босс/админ: она двигает остатки назад и правит историю."""
+def test_manager_cancels_invoice_until_boss_keeps_deletion(api):
+    """Решение владельца: пока менеджер один, отменять накладные может и он.
+    Руководитель включил `delete_requires_boss` — менеджеру 403, остаток цел."""
     client, _db, ids = api
-    inv = _incoming(client, ids["mgr"]).json()
+    first = _incoming(client, ids["mgr"]).json()
     r = client.post(
         "/api/wh/invoices/cancel",
-        json={"initData": str(ids["mgr"]), "invoice_id": inv["invoice_id"]},
+        json={"initData": str(ids["mgr"]), "invoice_id": first["invoice_id"]},
+    )
+    assert r.status_code == 200, r.text
+
+    second = _incoming(client, ids["mgr"]).json()
+    on = client.post("/api/settings/delete_requires_boss",
+                     json={"initData": str(ids["boss"]), "enabled": True})
+    assert on.status_code == 200, on.text
+    r = client.post(
+        "/api/wh/invoices/cancel",
+        json={"initData": str(ids["mgr"]), "invoice_id": second["invoice_id"]},
     )
     assert r.status_code == 403
+    stock = client.post("/api/wh/stock", json={"initData": str(ids["mgr"])}).json()
+    assert {p["name"]: p["quantity"] for p in stock["products"]}["Болт М8"] > 0
 
 
 def test_boss_can_cancel_invoice(api):

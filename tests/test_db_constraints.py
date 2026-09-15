@@ -376,6 +376,14 @@ def test_check_values_follow_the_code():
         assert f"'{method}'" in checks["payment_parts_method_chk"]
     for source in RATE_SOURCES:
         assert f"'{source}'" in checks["payment_parts_rate_source_chk"]
+    from services import machine_deal_requests as mdr
+
+    for kind in mdr.KINDS:
+        assert f"'{kind}'" in checks["machine_deal_requests_kind_chk"]
+    for status in mdr.STATUSES:
+        assert f"'{status}'" in checks["machine_deal_requests_status_chk"]
+    for mode in mdr.APPROVAL_MODES:
+        assert f"'{mode}'" in checks["machine_deal_requests_mode_chk"]
     names = [c.name for c in apply_constraints._checks()]
     names += [fk.name for fk in apply_constraints.FOREIGN_KEYS]
     assert len(names) == len(set(names))

@@ -27,15 +27,29 @@ import logging
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import WEBAPP_URL
-from handlers._ui import finish_card, webapp_keyboard
+from handlers._ui import (
+    drop_keyboard,
+    finish_card,
+    finish_message,
+    outcome_label,
+    prompt_keyboard,
+    set_message_markup,
+    settle_card,
+    settle_markup,
+    webapp_keyboard,
+)
+from services import machine_deal_requests as mdr
 from services import machines, money
 from services.roles import cached_role, can_create_orders, is_boss
 from utils.formatters import DIV
 from utils.helpers import esc
+from utils.keyboards import machine_request_callbacks, machine_request_keyboard
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -237,9 +251,24 @@ async def cmd_open_credits(message: Message, bot: Bot):
     if not is_boss(message.from_user.id):
         return await message.answer("⛔ Нет доступа.")
     deals = await machines.get_open_credit_deals(role=cached_role(message.from_user.id))
+    pending = await mdr.list_requests(statuses=("pending",))
+    if not deals and not pending:
+        return await message.answer("✅ Открытых рассрочек и заявок по технике нет.")
+    lines = [f"{DIV}"]
+    if pending:
+        # Заявки на одобрении — счётчиком и списком: решают их кнопками на
+        # карточке-уведомлении или в WebApp, дублировать карточки здесь незачем.
+        lines += [f"⏳ <b>На одобрении: {len(pending)}</b>", ""]
+        for r in pending:
+            lines.append(
+                f"• #{r['id']} · {esc(mdr.KIND_LABELS.get(r['kind'], r['kind']))} · "
+                f"{esc(r.get('machine_name') or '—')} · {esc(r.get('buyer_name') or '—')}"
+            )
+        lines.append("")
     if not deals:
-        return await message.answer("✅ Открытых рассрочек по технике нет.")
-    lines = [f"{DIV}", "💳 <b>Рассрочки по технике:</b>", ""]
+        lines.append("<i>Решить заявки — в WebApp: «Склад → Техника».</i>")
+        return await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=webapp_keyboard())
+    lines += ["💳 <b>Рассрочки по технике:</b>", ""]
     for d in deals:
         lines.append(
             f"• #{d['id']} · {esc(d['name'])} ({esc(d['vin'])})\n"
@@ -251,3 +280,175 @@ async def cmd_open_credits(message: Message, bot: Bot):
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=webapp_keyboard())
 
 
+
+
+# ─── Заявки на сделки: решение руководителя по карточке ──────────────────────
+# Карточку шлёт `services.machine_deal_requests.notify_decision_card` (из
+# процесса WebApp). Правила решения — там же: руководитель решает всегда,
+# менеджер — только пока руководителя в системе нет. Бот и WebApp зовут одни и
+# те же функции сервиса.
+
+
+class MachineRework(StatesGroup):
+    waiting_for_reason = State()  # руководитель пишет, что доработать
+
+
+_REQUEST_SETTLED = {
+    "approved": "✅ Заявка уже одобрена",
+    "rejected": "❌ Заявка уже отклонена",
+    "rework": "↩️ Заявка уже на доработке",
+    "cancelled": "✖️ Заявка отозвана",
+}
+
+
+def _request_id(call: CallbackQuery) -> int | None:
+    try:
+        return int((call.data or "").split(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
+async def _settle_stale_machine_request(call: CallbackQuery, request_id: int) -> bool:
+    """Заявка уже не ждёт решения (решили в WebApp или вторым руководителем) —
+    погасить кнопки карточки исходом. Ждёт — кнопки не трогаем."""
+    req = await mdr.get_request(request_id)
+    if req and req.get("status") == "pending":
+        return False
+    label = _REQUEST_SETTLED.get((req or {}).get("status") or "", "ℹ️ Заявка уже решена")
+    await settle_card(
+        call, machine_request_callbacks(request_id), label,
+        tail=webapp_keyboard("🌐 Техника — в WebApp"),
+    )
+    return True
+
+
+def _actor(call_or_message) -> tuple[int, str, str]:
+    user = call_or_message.from_user
+    return user.id, (user.full_name or str(user.id)), cached_role(user.id)
+
+
+async def _decide(call: CallbackQuery, op: str) -> None:
+    if not can_create_orders(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    request_id = _request_id(call)
+    if request_id is None:
+        return await call.answer("Некорректный запрос", show_alert=True)
+    uid, name, role = _actor(call)
+    fn = mdr.approve if op == "approve" else mdr.reject
+    res = await fn(request_id, actor_id=uid, actor_name=name, actor_role=role)
+    if not res.get("ok"):
+        await call.answer(f"⚠️ {res.get('error')}", show_alert=True)
+        await _settle_stale_machine_request(call, request_id)
+        return
+    if op == "approve":
+        verb = "✅ Одобрено"
+        note = "✅ <b>Одобрено</b>" + (" — руководителя нет, решили вы" if res.get("self_approved") else "")
+    else:
+        verb, note = "❌ Отклонено", "❌ <b>Отклонено</b> — машина в прежнем статусе"
+    await call.answer(verb)
+    base = getattr(call.message, "html_text", None) or getattr(call.message, "text", "") or ""
+    markup = settle_markup(
+        getattr(call.message, "reply_markup", None), machine_request_callbacks(request_id),
+        outcome_label(verb, call.from_user), tail=webapp_keyboard("🌐 Техника — в WebApp"),
+    )
+    try:
+        await call.message.edit_text(
+            f"{base}\n\n{DIV}\n{note} — {esc(name)}", parse_mode="HTML", reply_markup=markup
+        )
+    except Exception:
+        logger.debug("mdr: карточка не отредактирована", exc_info=True)
+        try:
+            await call.message.edit_reply_markup(reply_markup=markup)
+        except Exception:
+            logger.debug("mdr: клавиатуру заменить не удалось", exc_info=True)
+
+
+@router.callback_query(F.data.startswith("mdr_ok:"))
+async def cb_machine_request_approve(call: CallbackQuery):
+    await _decide(call, "approve")
+
+
+@router.callback_query(F.data.startswith("mdr_no:"))
+async def cb_machine_request_reject(call: CallbackQuery):
+    await _decide(call, "reject")
+
+
+@router.callback_query(F.data.startswith("mdr_rw:"))
+async def cb_machine_request_rework(call: CallbackQuery, state: FSMContext):
+    """«На доработку» — причину спрашиваем одним сообщением (force_reply)."""
+    if not can_create_orders(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    request_id = _request_id(call)
+    if request_id is None:
+        return await call.answer("Некорректный запрос", show_alert=True)
+    # Устаревшая карточка: не заводим ввод причины, который кончится отказом.
+    if await _settle_stale_machine_request(call, request_id):
+        return await call.answer("⚠️ Заявка уже обработана", show_alert=True)
+    uid, _name, role = _actor(call)
+    rights = await mdr.decision_rights(uid, role)
+    if not rights["can_decide"]:
+        return await call.answer("⛔ Решение по заявке принимает руководитель", show_alert=True)
+    await state.set_state(MachineRework.waiting_for_reason)
+    await state.update_data(
+        mdr_id=request_id, msg_chat=call.message.chat.id, msg_id=call.message.message_id
+    )
+    await call.answer()
+    await drop_keyboard(call, status="✍️ Ждём причину доработки…")
+    prompt = await call.message.answer(
+        "✍️ Что доработать в заявке? Одним сообщением — менеджер увидит причину:",
+        reply_markup=prompt_keyboard(
+            InlineKeyboardButton(text="✖️ Не возвращать", callback_data="mdr_rw_abort")
+        ),
+    )
+    if prompt is not None:
+        await state.update_data(prompt_chat=prompt.chat.id, prompt_id=prompt.message_id)
+
+
+@router.callback_query(F.data == "mdr_rw_abort")
+async def cb_machine_request_rework_abort(call: CallbackQuery, state: FSMContext, bot: Bot):
+    """Нажали «На доработку» по ошибке: вернуть карточке кнопки, если ждёт."""
+    data = await state.get_data()
+    request_id = data.get("mdr_id")
+    if await state.get_state() != MachineRework.waiting_for_reason.state or not request_id:
+        await call.answer("Уже неактуально")
+        await set_message_markup(bot, call.message.chat.id, call.message.message_id, None)
+        return
+    await state.clear()
+    await call.answer("Возврат отменён")
+    req = await mdr.get_request(int(request_id))
+    if req and req.get("status") == "pending":
+        await set_message_markup(
+            bot, data.get("msg_chat"), data.get("msg_id"), machine_request_keyboard(int(request_id))
+        )
+    try:
+        await call.message.edit_text(
+            f"↩️ Возврат заявки #{int(request_id)} на доработку отменён — кнопки решения снова на карточке."
+        )
+    except Exception:
+        logger.debug("mdr_rw_abort: вопрос не отредактирован", exc_info=True)
+
+
+@router.message(MachineRework.waiting_for_reason)
+async def process_machine_request_rework(message: Message, state: FSMContext, bot: Bot):
+    if not can_create_orders(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Нет доступа — действие отменено.")
+    reason = (message.text or "").strip()[:500]
+    if len(reason) < 3:
+        return await message.answer("❌ Причина слишком короткая. Повторите.")
+    data = await state.get_data()
+    await state.clear()
+    request_id = int(data.get("mdr_id") or 0)
+    uid, name, role = _actor(message)
+    res = await mdr.return_for_rework(
+        request_id, actor_id=uid, actor_name=name, actor_role=role, reason=reason
+    )
+    await set_message_markup(bot, data.get("prompt_chat"), data.get("prompt_id"), None)
+    if not res.get("ok"):
+        return await message.answer(f"⚠️ {esc(res.get('error') or '')}", parse_mode="HTML")
+    note = f"↩️ Заявка #{request_id} возвращена на доработку: {esc(reason)}"
+    if not await finish_message(
+        bot, data.get("msg_chat"), data.get("msg_id"), note,
+        outcome=outcome_label("↩️ На доработку", message.from_user),
+    ):
+        await message.answer(note, parse_mode="HTML")

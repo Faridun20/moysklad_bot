@@ -31,12 +31,27 @@ def test_machine_in_transit_to_closed_installment(world):
     f.machine_arrived(w, f.BOSS, mid)
     assert f.machine_card(w, f.BOSS, mid)["machine"]["status"] == "in_stock"
 
-    f.machine_deal(w, f.MGR, mid, kind="credit", price=12000, buyer="Иванов И.И.",
-                   down_payment=2000, months=4, expect=403)
-    deal = f.machine_deal(w, f.BOSS, mid, kind="credit", price=12000, buyer="Иванов И.И.",
-                          down_payment=2000, months=4)
-    assert deal["status"] == "on_credit" and deal["payments"] == 4
+    # Рассрочку оформляет менеджер — это заявка: машина пока «на складе»,
+    # графика и сделки нет, вторую заявку на машину не принять.
+    req = f.machine_deal(w, f.MGR, mid, kind="credit", price=12000, buyer="Иванов И.И.",
+                         down_payment=2000, months=4)
+    assert req["pending"] and req["deal_id"] is None
+    card = f.machine_card(w, f.MGR, mid)
+    assert card["machine"]["status"] == "in_stock" and card["request"]["status"] == "pending"
+    assert card["deals"] == [] and card["can_request"] == []
+    assert not card["can_decide"], "при живом руководителе менеджер своё не одобряет"
+    f.approve_machine_deal(w, f.MGR, req["request_id"], expect=403)
+    f.machine_deal(w, f.BOSS, mid, kind="sale", price=13000, buyer="Другой", expect=409)
+    assert w.rows("SELECT COUNT(*) AS n FROM machine_deals")[0]["n"] == 0
+
+    pending = f.machine_requests(w, f.BOSS)["requests"]
+    assert [r["id"] for r in pending] == [req["request_id"]]
+    assert pending[0]["buyer_passport"] == "AA1234567" and pending[0]["schedule_preview"]["months"] == 4
+    assert pending[0]["discount_pct"] == 4.0  # 12 000 против прайса 12 500
+    deal = f.approve_machine_deal(w, f.BOSS, req["request_id"])
+    assert deal["status"] == "on_credit" and deal["payments"] == 4 and deal["approval_mode"] == "boss"
     deal_id = deal["deal_id"]
+    f.approve_machine_deal(w, f.BOSS, req["request_id"], expect=409)
 
     boss_card = f.machine_card(w, f.BOSS, mid)
     d = boss_card["deals"][0]
@@ -56,6 +71,42 @@ def test_machine_in_transit_to_closed_installment(world):
     assert card["deals"][0]["closed_at"], "последнее поступление закрывает сделку"
     f.machine_receipt(w, f.BOSS, deal_id, 100, expect=409)
     expect_audit(w.db, "machine_deal_created")
+    expect_audit(w.db, "machine_deal_approved")
+
+
+def test_manager_sale_rework_resubmit_and_reject_restores_nothing(world):
+    """Продажа менеджера → на доработку (скидка велика) → правка цены → одобрение
+    → «Продана». Бронь другой машины → отклонение: статус «На складе» как был."""
+    w = world
+    mid = f.create_machine(w, f.BOSS, "Погрузчик SDLG 956", "sdlg-956-01", price=40000,
+                           status="in_stock")
+    req = f.machine_deal(w, f.MGR, mid, kind="sale", price=30000, buyer="ООО Карьер")
+    f.rework_machine_deal(w, f.BOSS, req["request_id"], "скидка 25% — много, максимум 10%")
+    card = f.machine_card(w, f.MGR, mid)
+    assert card["request"]["status"] == "rework" and card["machine"]["status"] == "in_stock"
+    assert "максимум 10%" in card["request"]["decision_note"]
+    # Чужой менеджер доработать не может; одобрить заявку на доработке нельзя.
+    f.resubmit_machine_deal(w, f.MGR2, req["request_id"], price=36000, expect=403)
+    f.approve_machine_deal(w, f.BOSS, req["request_id"], expect=409)
+    f.resubmit_machine_deal(w, f.MGR, req["request_id"], price=36000)
+    sold = f.approve_machine_deal(w, f.BOSS, req["request_id"])
+    assert sold["status"] == "sold"
+    assert w.rows("SELECT price_cents, created_by FROM machine_deals WHERE machine_id = ?",
+                  (mid,)) == [{"price_cents": 3_600_000, "created_by": f.MGR}]
+
+    other = f.create_machine(w, f.BOSS, "Каток XCMG XS143", "xcmg-xs143", price=20000,
+                             status="in_stock")
+    booking = f.machine_deal(w, f.MGR, other, kind="reserve", price=None, buyer="ИП Каримов")
+    assert f.machine_card(w, f.BOSS, other)["request"]["kind"] == "reserve"
+    f.reject_machine_deal(w, f.BOSS, booking["request_id"], "клиент не подтвердил")
+    card = f.machine_card(w, f.MGR, other)
+    assert card["machine"]["status"] == "in_stock" and card["request"] is None
+    assert "reserve" in card["can_request"]
+    again = f.machine_deal(w, f.MGR, other, kind="reserve", price=None, buyer="ИП Каримов",
+                           approve_by=f.BOSS)
+    assert again["status"] == "reserved"
+    expect_audit(w.db, "machine_deal_rejected")
+    expect_audit(w.db, "machine_deal_returned")
 
 
 def test_machine_cash_sale_and_no_double_sale(world):
@@ -91,7 +142,7 @@ _WORK_ENDPOINTS = [
 _BOSS_ONLY = [
     "/api/orders/requests", "/api/requests/approve", "/api/requests/reject", "/api/orders/cancel",
     "/api/returns/confirm",
-    "/api/wh/invoices/cancel", "/api/machines/status", "/api/machines/deal", "/api/machines/receipt",
+    "/api/machines/status", "/api/machines/receipt", "/api/settings/delete_requires_boss",
     "/api/containers/delete", "/api/credit/set",
 ]
 
