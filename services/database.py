@@ -1468,7 +1468,7 @@ def backfill_container_receipts() -> dict:
     Идемпотентно: строки, которые уже есть, не трогаем.
     """
     stamp = now_str()
-    stats = {"items": 0, "containers": 0}
+    stats = {"items": 0, "containers": 0, "errors": 0}
     with get_conn() as conn:
         cur = get_cursor(conn)
         try:
@@ -1506,7 +1506,7 @@ def backfill_container_receipts() -> dict:
         except Exception as e:
             conn.rollback()
             logger.warning("Backfill приёмки контейнеров: %s", e)
-            return {"items": 0, "containers": 0}
+            return {"items": 0, "containers": 0, "errors": 1}
     if stats["items"] or stats["containers"]:
         logger.info(
             "Backfill приёмки контейнеров: позиций %d, контейнеров %d",
@@ -1536,6 +1536,7 @@ def backfill_local_identifiers() -> dict:
     `legacy_ms_id = <значение>` больше не попадает.
     """
     stats: dict[str, int] = {}
+    errors = 0
     # (метка, SQL). Каждый шаг — своей транзакцией: упавший не должен уносить
     # остальные, а частично переписанные ссылки чинятся повторным прогоном.
     steps = [
@@ -1599,6 +1600,7 @@ def backfill_local_identifiers() -> dict:
                 conn.rollback()
                 logger.warning("Backfill ссылок (%s): %s", label, e)
                 stats[label] = 0
+                errors += 1
 
         # Позиции заказов: в `product_href` лежит ССЫЛКА, id из неё надо
         # выкусить — в SQL это делается по-разному на двух движках, поэтому
@@ -1614,6 +1616,7 @@ def backfill_local_identifiers() -> dict:
         except Exception as e:
             logger.warning("Backfill позиций заказов (чтение): %s", e)
             pending = []
+            errors += 1
 
         linked = 0
         if pending:
@@ -1646,11 +1649,13 @@ def backfill_local_identifiers() -> dict:
                 except Exception as e:
                     conn.rollback()
                     logger.warning("Backfill позиции заказа #%s: %s", row["id"], e)
+                    errors += 1
             conn.commit()
         stats["order_items"] = linked
 
     if any(stats.values()):
         logger.info("Backfill локальных id: %s", stats)
+    stats["errors"] = errors
     return stats
 
 
@@ -1687,25 +1692,11 @@ def seed_document_templates() -> int:
     return inserted
 
 
-def run_backfills():
-    """Одноразовые data-миграции + сидинг настроек. Идемпотентны.
-
-    1. Закрыть legacy-долги (paid_at стоит, payments записей нет —
-       значит это до partial-payments эпохи): paid_confirmed_at = paid_at.
-    2. seed_app_settings — дефолты «магических чисел».
-
-    Recovery-backfill (сброс paid_confirmed_at по сравнению SUM(amount)
-    с SUM(quantity*price)) удалён в T1.3: он лечил данные, испорченные
-    старым backfill-багом, и читал REAL-колонки денег, которых больше нет.
-    Заполнение *_cents из REAL удалено там же — источник исчез, деньги
-    пишутся в копейках с самого начала.
-
-    Запускается из `tasks/migrate.py`. НЕ из init_db — этот код пишет
-    данные, не должен бежать при каждом старте сервиса.
-    """
+def backfill_legacy_paid_confirmed() -> dict:
+    """Закрыть legacy-долги (paid_at стоит, платежей нет — эпоха до частичных
+    оплат): paid_confirmed_at = paid_at. РАЗОВАЯ миграция, см. run_backfills."""
     with get_conn() as conn:
         cur = get_cursor(conn)
-        # ── Backfill legacy ──────────────────────────────────────────
         try:
             cur.execute(
                 "UPDATE orders "
@@ -1717,24 +1708,94 @@ def run_backfills():
                 "    SELECT 1 FROM payments WHERE order_id = orders.id"
                 "  )"
             )
-            rows = cur.rowcount
+            rows = max(cur.rowcount, 0)
             conn.commit()
-            if rows > 0:
-                logger.info("Backfill legacy: %d закрытых долгов автоподтверждены", rows)
         except Exception as e:
             conn.rollback()
             logger.warning("Backfill paid_confirmed: %s", e)
+            return {"orders": 0, "errors": 1}
+    if rows > 0:
+        logger.info("Backfill legacy: %d закрытых долгов автоподтверждены", rows)
+    return {"orders": rows, "errors": 0}
 
-    # ── Сидинг app_settings (идемпотентно) ───────────────────────────
+
+# Разовые data-миграции: (имя, функция). Каждая выполняется ОДИН раз на базу —
+# отметка `backfill_done:<имя>` в app_settings. Раньше `run_backfills` гонял их
+# на КАЖДОМ `docker compose up` (tasks.migrate перед стартом сервисов), и на
+# живых деньгах это была скрытая мутация при каждом деплое: legacy-UPDATE
+# закрывал долг любому заказу, у которого стоит paid_at и нет строк payments
+# (так выглядит, например, заказ, перенесённый из истории МС без платежа), а
+# переписывание идентификаторов срабатывало на любой новой строке со старым
+# UUID. Сидинг справочников (настройки, склад, шаблоны) остаётся ежедневным: он
+# только вставляет отсутствующее и ничего не меняет.
+ONE_TIME_BACKFILLS: tuple[tuple[str, Any], ...] = (
+    ("legacy_paid_confirmed", lambda: backfill_legacy_paid_confirmed()),
+    ("container_receipts", lambda: backfill_container_receipts()),
+    ("local_identifiers", lambda: backfill_local_identifiers()),
+)
+
+
+def _backfill_flag(name: str) -> str:
+    return f"backfill_done:{name}"
+
+
+def _backfill_done_at(name: str) -> str | None:
+    """Когда разовый backfill отработал (None — ещё не выполнялся). Мимо TTL-кэша
+    настроек: решение «гонять или нет» должно видеть базу, а не память."""
+    import json as _json
+
+    with get_conn() as conn:
+        cur = get_cursor(conn)
+        cur.execute(q("SELECT value FROM app_settings WHERE key = ?"), (_backfill_flag(name),))
+        row = cur.fetchone()
+    if not row:
+        return None
+    raw = row["value"] if hasattr(row, "keys") else row[0]
+    try:
+        return str(_json.loads(raw))
+    except (TypeError, ValueError):
+        return str(raw)
+
+
+def run_backfills(rerun: tuple[str, ...] | list[str] = ()) -> dict:
+    """Сидинг настроек/справочников + разовые data-миграции.
+
+    Сидинг (`seed_app_settings`, `seed_warehouses`, `seed_document_templates`)
+    идемпотентен и безвреден — выполняется каждый раз.
+
+    Разовые миграции (`ONE_TIME_BACKFILLS`) выполняются, только пока у базы нет
+    отметки `backfill_done:<имя>` в app_settings; отметка ставится, если шаг
+    прошёл без ошибок. Повторить осознанно (например, после повторного переноса
+    справочников из МойСклад) — `rerun=("local_identifiers",)` или «all»; из
+    консоли: `python -m tasks.migrate --rerun-backfill local_identifiers`.
+
+    Recovery-backfill (сброс paid_confirmed_at по сравнению SUM(amount)
+    с SUM(quantity*price)) удалён в T1.3: он лечил данные, испорченные
+    старым backfill-багом, и читал REAL-колонки денег, которых больше нет.
+
+    Запускается из `tasks/migrate.py`. НЕ из init_db. Возвращает
+    {имя: "skipped" | статистика шага} — для лога и тестов.
+    """
+    # ── Сидинг (идемпотентно, только вставка отсутствующего) ─────────
     seed_app_settings()
-    # ── Склад по умолчанию для локального учёта (идемпотентно) ───────
     seed_warehouses()
-    # ── Шаблоны юридических документов (идемпотентно) ────────────────
     seed_document_templates()
-    # ── Приёмка контейнеров: MS-связки → локальные (идемпотентно) ────
-    backfill_container_receipts()
-    # ── UUID МойСклад → наши id в старых строках (идемпотентно) ───────
-    backfill_local_identifiers()
+
+    forced = set(rerun or ())
+    report: dict = {}
+    for name, step in ONE_TIME_BACKFILLS:
+        done_at = _backfill_done_at(name)
+        if done_at and name not in forced and "all" not in forced:
+            logger.info("Backfill %s уже выполнен (%s) — пропускаем", name, done_at)
+            report[name] = "skipped"
+            continue
+        stats = step() or {}
+        report[name] = stats
+        if int(stats.get("errors") or 0) == 0:
+            set_setting(_backfill_flag(name), now_str())
+        else:
+            logger.warning("Backfill %s прошёл с ошибками — повторится при следующем запуске", name)
+    return report
 
 
 # ─── Настройки приложения (app_settings) ──────────────────────────────────────
