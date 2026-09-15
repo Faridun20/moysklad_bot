@@ -23,13 +23,13 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 126._
+_Всего эндпоинтов: 132._
 
 
 > **Временное совмещение ролей** (`services/roles.py::ROLE_ALSO_ACTS_AS`): `manager` = + `warehouse_keeper`, `bookkeeper`. Кладовщика и бухгалтера в штате пока нет, их работу делает менеджер; списки ниже уже учитывают это. Роли `warehouse_keeper`/`bookkeeper` через `/addrole` не назначаются. `*` в таблице экранов — доступ через совмещение.
 
 
-### Админ (`admin`) — 120 эндпоинтов
+### Админ (`admin`) — 126 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -57,6 +57,12 @@ _Всего эндпоинтов: 126._
 - `/api/containers/supplier`
 - `/api/containers/supply`
 - `/api/containers/update`
+- `/api/costing/container`
+- `/api/costing/container/save`
+- `/api/costing/product`
+- `/api/costing/report`
+- `/api/costing/settings`
+- `/api/costing/settings/set`
 - `/api/credit/overview`
 - `/api/credit/set`
 - `/api/currency/rates`
@@ -157,7 +163,7 @@ _Всего эндпоинтов: 126._
 </details>
 
 
-### Руководитель (`boss`) — 117 эндпоинтов
+### Руководитель (`boss`) — 123 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -185,6 +191,12 @@ _Всего эндпоинтов: 126._
 - `/api/containers/supplier`
 - `/api/containers/supply`
 - `/api/containers/update`
+- `/api/costing/container`
+- `/api/costing/container/save`
+- `/api/costing/product`
+- `/api/costing/report`
+- `/api/costing/settings`
+- `/api/costing/settings/set`
 - `/api/credit/overview`
 - `/api/credit/set`
 - `/api/currency/rates`

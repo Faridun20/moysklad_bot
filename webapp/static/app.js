@@ -1090,7 +1090,10 @@ function renderStockList() {
         // PR C: цена продажи (минимум) — всем; себестоимость — только boss.
         const priceLines = [];
         if (p.sale_price != null) priceLines.push(`мин. ${p.sale_price}`);
-        if (isBoss && p.cost_price != null) priceLines.push(`себест. ${p.cost_price}`);
+        // Себестоимость по партиям (учёт включён) важнее ручной: это средняя
+        // по тому, что реально лежит на складе. Ручная — пока партий нет.
+        if (isBoss && p.cost_batches != null) priceLines.push(`себест. ${p.cost_batches} (партии)`);
+        else if (isBoss && p.cost_price != null) priceLines.push(`себест. ${p.cost_price}`);
         const priceHtml = priceLines.length
           ? `<div class="stock-price">${escapeHtml(priceLines.join(' · '))}</div>` : '';
         // Boss может тапнуть товар → редактор цен.
@@ -1182,6 +1185,7 @@ function openPriceEditor(product) {
         <span>Себестоимость</span>
         <input type="number" inputmode="decimal" id="pe-cost" value="${product.cost_price ?? ''}" placeholder="—">
       </label>
+      <div id="pe-cost-history"></div>
       <div id="pe-photos"></div>
       <div class="c-actions c-actions--wrap">
         <button class="btn-secondary" id="pe-photo-add">${icon('plus')} Фото</button>
@@ -1213,6 +1217,9 @@ function openPriceEditor(product) {
       (photoId) => ({ product_id: productId, photo_id: photoId }), reloadPhotos);
   };
   reloadPhotos();
+  if (window.mountProductCostHistory) {
+    window.mountProductCostHistory(ov.querySelector('#pe-cost-history'), productId);
+  }
 
   ov.querySelector('#pe-photo-add').addEventListener('click', () =>
     pickPhotos('/api/products/photo_upload', { product_id: productId }, reloadPhotos));
@@ -2398,9 +2405,14 @@ async function renderContainerCard(containerId) {
       ${canEdit && card.can_manage ? `<button class="btn-secondary btn-danger" id="cont-del">${icon('trash')} Удалить</button>` : ''}
     </div>
     ${supplyBlock}
+    <div id="costing-host"></div>
     <div class="section-label">Состав</div>
     ${containerItemsHtml(card.items || [], arrived, canManage)}
   `;
+  // Цены закупки и маржа контейнера — руководству (costing.js).
+  if (isMachineBoss() && window.mountContainerCosting) {
+    window.mountContainerCosting(containerId, content.querySelector('#costing-host'));
+  }
 
   content.querySelector('#cont-edit')?.addEventListener('click', () =>
     openContainerEditForm(containerId, c));
@@ -4868,6 +4880,7 @@ function renderAnalyticsContent(data) {
     ${reportHeaderHtml()}
     ${msWarn}
     ${statsBlock}
+    ${data.scope === 'company' ? '<div id="costing-report"></div>' : ''}
 
     <div class="section-label">Активность по дням</div>
     <div class="c-surface c-surface--pad">${daysBars}</div>
@@ -4909,6 +4922,10 @@ function renderAnalyticsContent(data) {
 
   wireSectionNav(content, 'sales', renderSalesScreen);
   wireReportHeader(content, renderSalesReport);
+  // Прибыль по партиям и курсовая разница — отдельной ручкой (costing.js).
+  if (data.scope === 'company' && window.mountSalesCosting) {
+    window.mountSalesCosting(content.querySelector('#costing-report'));
+  }
 }
 
 // «Деньги → Отчёт» (быв. «Аналитика → Деньги»): итоги поступлений за период,
@@ -7314,7 +7331,8 @@ async function renderWhInvoiceList() {
         </div>
         <div class="order-meta">
           <span>${icon('calendar')} ${formatDateRU(inv.invoice_date)}</span>
-          <span class="order-total">${icon('cash')} ${whMoney(inv.total_amount_cents, inv.currency)}</span>
+          ${inv.total_amount_cents == null ? '' /* цены прихода скрыты не руководству */
+            : `<span class="order-total">${icon('cash')} ${whMoney(inv.total_amount_cents, inv.currency)}</span>`}
         </div>
         ${sent ? `<div class="order-pay-row">${sent}</div>` : ''}
         ${actions.length ? `<div class="wh-actions">${actions.join('')}</div>` : ''}

@@ -56,6 +56,9 @@ STATUS_LABELS = {
 CHILD_TABLES = (
     "container_item_links",
     "container_item_products",
+    # Цены закупки (services/costing.py) ссылаются на позицию — раньше неё.
+    "container_item_costs",
+    "container_costing",
     "container_items",
     "container_supply",
     "container_receipt",
@@ -440,6 +443,11 @@ async def delete_item(container_id: int, item_id: int) -> dict:
         )
         await txn.execute(
             "DELETE FROM container_item_links WHERE item_id = $1 AND container_id = $2",
+            item_id, container_id,
+        )
+        # Цена закупки тоже ссылается на позицию (services/costing.py).
+        await txn.execute(
+            "DELETE FROM container_item_costs WHERE item_id = $1 AND container_id = $2",
             item_id, container_id,
         )
         rows = await txn.execute(

@@ -19,6 +19,9 @@ import re
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SERVER = ROOT / "webapp" / "server.py"
 ROLES = ROOT / "services" / "roles.py"
+# Роутеры, подключённые в server.py отдельными файлами (чтобы параллельные
+# ветки не правили одну середину server.py). Роли у них в том же формате.
+ROUTERS = [ROOT / "webapp" / "costing_api.py"]
 OUT = ROOT / "UI_QA_ROLES.md"
 
 ROLE_TITLES = {
@@ -96,7 +99,10 @@ def parse_acts_as(src: str) -> dict[str, list[str]]:
 
 def parse_routes(src: str) -> list[tuple[str, list[str]]]:
     """[(путь, роли)] в порядке объявления в server.py."""
-    marks = [(m.start(), m.group(1)) for m in re.finditer(r'@app\.(?:get|post)\("([^"]+)"', src)]
+    marks = [
+        (m.start(), m.group(1))
+        for m in re.finditer(r'@(?:app|router)\.(?:get|post)\("([^"]+)"', src)
+    ]
     consts = {
         m.group(1): sorted(re.findall(r'"([a-z_]+)"', m.group(2)))
         for m in _CONST_RE.finditer(src)
@@ -168,6 +174,9 @@ def render(rows: list[tuple[str, list[str]]], acts_as: dict[str, list[str]] | No
 
 def main() -> int:
     rows = parse_routes(SERVER.read_text(encoding="utf-8"))
+    for extra in ROUTERS:
+        if extra.exists():
+            rows += parse_routes(extra.read_text(encoding="utf-8"))
     if not rows:
         print("не нашёл ни одного @app.get/post — формат server.py изменился?")
         return 1
