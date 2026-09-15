@@ -59,13 +59,15 @@ def test_machine_in_transit_to_closed_installment(world):
     assert "buyer_passport" not in f.machine_card(w, f.MGR, mid)["deals"][0]
 
     # Клиент платит не «платёж №N», а деньги: 3 000 закрывает один и часть второго.
-    f.machine_receipt(w, f.BOSS, deal_id, 3000)
+    # Вносит их менеджер — рассрочку ведёт он; способ пишется, как у заказа.
+    f.machine_receipt(w, f.MGR, deal_id, 3000, method="card")
+    assert f.machine_card(w, f.MGR, mid)["deals"][0]["receipts"][0]["method"] == "card"
     d = f.machine_card(w, f.BOSS, mid)["deals"][0]
     assert d["progress"]["left_cents"] == 700_000
     assert sum(1 for p in d["payments"] if p.get("paid_at")) == 2  # взнос + первый
     assert f.machine_card(w, f.BOSS, mid)["machine"]["status"] == "on_credit"
 
-    f.machine_receipt(w, f.BOSS, deal_id, 7000)
+    f.machine_receipt(w, f.MGR, deal_id, 7000)
     card = f.machine_card(w, f.BOSS, mid)
     assert card["machine"]["status"] == "sold"
     assert card["deals"][0]["closed_at"], "последнее поступление закрывает сделку"
@@ -105,6 +107,10 @@ def test_manager_sale_rework_resubmit_and_reject_restores_nothing(world):
     again = f.machine_deal(w, f.MGR, other, kind="reserve", price=None, buyer="ИП Каримов",
                            approve_by=f.BOSS)
     assert again["status"] == "reserved"
+    # Клиент передумал: свою бронь менеджер снимает сам, чужую — нет.
+    f.unreserve_machine(w, f.MGR2, other, expect=403)
+    assert f.unreserve_machine(w, f.MGR, other)["mode"] == "own"
+    assert f.machine_card(w, f.MGR, other)["machine"]["status"] == "in_stock"
     expect_audit(w.db, "machine_deal_rejected")
     expect_audit(w.db, "machine_deal_returned")
 
@@ -142,7 +148,7 @@ _WORK_ENDPOINTS = [
 _BOSS_ONLY = [
     "/api/orders/requests", "/api/requests/approve", "/api/requests/reject", "/api/orders/cancel",
     "/api/returns/confirm",
-    "/api/machines/status", "/api/machines/receipt", "/api/settings/delete_requires_boss",
+    "/api/machines/status", "/api/machines/receipt_delete", "/api/settings/delete_requires_boss",
     "/api/containers/delete", "/api/credit/set",
 ]
 

@@ -390,6 +390,13 @@ def resubmit_machine_deal(w: World, uid: int, request_id: int, *, expect: int = 
                   idempotency_key=key(), **fields)
 
 
-def machine_receipt(w: World, uid: int, deal_id: int, amount: float, *, expect: int = 200) -> dict:
+def machine_receipt(w: World, uid: int, deal_id: int, amount: float, *, expect: int = 200,
+                    method: str = "cash") -> dict:
+    """Поступление по рассрочке — со способом, как разбивка оплаты заказа."""
     return w.call(uid, "/api/machines/receipt", expect=expect, deal_id=deal_id, amount=amount,
+                  method=method, idempotency_key=key())
+
+
+def unreserve_machine(w: World, uid: int, machine_id: int, *, expect: int = 200) -> dict:
+    return w.call(uid, "/api/machines/unreserve", expect=expect, machine_id=machine_id,
                   idempotency_key=key())

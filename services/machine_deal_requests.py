@@ -46,7 +46,10 @@ from utils.helpers import esc, local_now
 logger = logging.getLogger(__name__)
 
 KINDS = ("reserve", "sale", "credit")
-STATUSES = ("pending", "rework", "approved", "rejected", "cancelled")
+# released — одобренная бронь, которую потом сняли (машина снова на складе):
+# без отметки старая бронь менеджера давала бы ему право снять чужую, более
+# позднюю бронь той же машины.
+STATUSES = ("pending", "rework", "approved", "rejected", "cancelled", "released")
 ACTIVE_STATUSES = ("pending", "rework")
 # boss — решил руководитель; auto — руководитель оформил сам, одобрено сразу;
 # no_boss — руководителя в системе нет, решил менеджер.
@@ -62,6 +65,7 @@ STATUS_LABELS = {
     "approved": "✅ Одобрена",
     "rejected": "❌ Отклонена",
     "cancelled": "✖️ Отозвана",
+    "released": "🔓 Бронь снята",
 }
 
 # Из каких статусов машины какая заявка законна. Бронь — только со склада
@@ -655,6 +659,88 @@ async def resubmit(
     if notify:
         await notify_decision_card(request_id)
     return {"ok": True, "request_id": request_id, "request_status": "pending", "pending": True}
+
+
+# ─── Снять бронь ─────────────────────────────────────────────────────────────
+
+
+async def release_bookings_locked(txn: Any, machine_id: int) -> int:
+    """Одобренные брони машины → `released`. Зовётся тем же, кто снимает бронь."""
+    return await txn.execute(
+        "UPDATE machine_deal_requests SET status = 'released', updated_at = $1 "
+        "WHERE machine_id = $2 AND kind = 'reserve' AND status = 'approved'",
+        now_str(), machine_id,
+    )
+
+
+async def unreserve(machine_id: int, *, actor_id: int, actor_name: str = "",
+                    actor_role: str) -> dict:
+    """Снять бронь: «Забронирована» → «На складе».
+
+    Решение владельца: продажи и брони техники — работа менеджера. Поэтому
+    менеджер снимает бронь, которую оформил сам (клиент передумал), а любую —
+    только пока руководителя в системе нет (`no_boss`, пометка в аудите).
+    Прочие ручные переходы статуса остаются руководству (`/api/machines/status`).
+    """
+    rights = await decision_rights(actor_id, actor_role)
+    async with adb_core.transaction() as txn:
+        machine = await machines.lock_machine(txn, machine_id)
+        if not machine:
+            return {"ok": False, "error": "Машина не найдена"}
+        if machine["status"] != "reserved":
+            label = machines.STATUS_LABELS.get(machine["status"], machine["status"])
+            return {"ok": False, "error": f"Машина не в брони — сейчас «{label}»",
+                    "current": machine["status"]}
+        active = await machines.active_request_locked(txn, machine_id)
+        if active:
+            return machines.pending_refusal(active)
+        booking = await txn.fetchrow(
+            "SELECT id, created_by FROM machine_deal_requests WHERE machine_id = $1 "
+            "AND kind = 'reserve' AND status = 'approved' ORDER BY id DESC LIMIT 1",
+            machine_id,
+        )
+        own = bool(booking) and int(booking["created_by"]) == int(actor_id)
+        if rights["viewer_is_holder"]:
+            mode = "boss"
+        elif actor_role == "manager" and own:
+            mode = "own"
+        elif actor_role == "manager" and not rights["exist"]:
+            mode = "no_boss"
+        else:
+            return {"ok": False, "forbidden": True,
+                    "error": "Снять чужую бронь может руководитель"}
+        await txn.execute(
+            "UPDATE machines SET status = 'in_stock', updated_at = $1 "
+            "WHERE id = $2 AND status = 'reserved'",
+            now_str(), machine_id,
+        )
+        await release_bookings_locked(txn, machine_id)
+    note = {"boss": "", "own": " · свою бронь",
+            "no_boss": " · снял менеджер — руководителя в системе нет"}[mode]
+    await _audit(actor_id, actor_name, "machine_unreserved",
+                 f"#{machine_id} {machine.get('name') or ''}{note}")
+    await _audit(actor_id, actor_name, "machine_status_changed",
+                 f"#{machine_id}: reserved → in_stock")
+    return {"ok": True, "from": "reserved", "to": "in_stock", "mode": mode,
+            "booking_request_id": int(booking["id"]) if booking else None}
+
+
+async def can_unreserve(machine: dict, *, viewer_id: int, role: str, rights: dict) -> bool:
+    """Рисовать ли кнопку «Снять бронь» (та же логика, что `unreserve`, без записи)."""
+    if machine.get("status") != "reserved":
+        return False
+    if rights["viewer_is_holder"]:
+        return True
+    if role != "manager":
+        return False
+    if not rights["exist"]:
+        return True
+    booking = await adb_core.fetchrow(
+        "SELECT created_by FROM machine_deal_requests WHERE machine_id = $1 "
+        "AND kind = 'reserve' AND status = 'approved' ORDER BY id DESC LIMIT 1",
+        int(machine["id"]),
+    )
+    return bool(booking) and int(booking["created_by"]) == int(viewer_id)
 
 
 # ─── Уведомления ─────────────────────────────────────────────────────────────

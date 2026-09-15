@@ -216,6 +216,9 @@
     '/api/machines/deal': ['admin', 'boss', 'manager'],
     '/api/machines/deals/pending': ['admin', 'boss', 'manager'],
     '/api/machines/deals/approve': ['admin', 'boss', 'manager'],
+    '/api/machines/receipt': ['admin', 'boss', 'manager'],
+    '/api/machines/payment': ['admin', 'boss', 'manager'],
+    '/api/machines/unreserve': ['admin', 'boss', 'manager'],
     '/api/settings/delete_requires_boss': ['admin', 'boss'],
     '/api/currency/rates/set': ['admin', 'boss'],
   };

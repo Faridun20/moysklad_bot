@@ -59,7 +59,8 @@ DOC_KINDS = ("opening", "receipt", "expense", "transfer", "exchange", "reconcile
 # закрываем ей дверь заранее.
 ROLES_RECORD = ("admin", "boss", "manager", "bookkeeper")
 # Справочник счетов, выключатель, отмена чужих документов, сторно
-# подтверждённого платежа, поступления по рассрочке (как у `/api/machines/*`).
+# подтверждённого платежа. Поступления по рассрочке записывает и менеджер
+# (решение владельца: продажи и рассрочки техники — его работа).
 ROLES_MANAGE = ("admin", "boss")
 # Кто видит ВСЕ документы журнала. Менеджер видит свои: «менеджер вносит свои
 # расходы, руководитель видит все» (требование владельца).
@@ -863,8 +864,6 @@ async def record_receipt(actor: Actor, data: dict) -> dict:
         target_cur = (head["currency"] or base_currency()).upper()
         counterparty = head["agent_name"] or None
     else:
-        if actor.role not in ROLES_MANAGE:
-            raise AccountingError("Оплату по рассрочке записывает руководитель", status=403)
         head = await adb_core.fetchrow(
             "SELECT id, currency, buyer_name, kind FROM machine_deals WHERE id = $1", deal_id
         )
@@ -1037,7 +1036,8 @@ async def receipt_targets(actor: Actor) -> dict:
             "due_date": o.get("due_date"),
         })
     deals = []
-    if actor.role in ROLES_MANAGE:
+    # Рассрочки — всем, кто записывает деньги: их ведёт менеджер.
+    if actor.role in ROLES_RECORD:
         from services.receivables import machine_debt_rows
 
         for d in await machine_debt_rows(today_str()):

@@ -3940,6 +3940,11 @@ async def api_machines_card(request: Request):
         request_view = mdr.visible_request(await mdr.get_request(int(active["id"])), role)
     rights = await mdr.decision_rights(user["id"], role)
     can_request = [] if active else mdr.allowed_kinds(machine.get("status"))
+    # Деньги по рассрочке вносит менеджер (решение владельца); стирает —
+    # руководство, менеджер только без руководителя (`_machine_money_undo_mode`).
+    for deal in deals:
+        deal["can_record"] = True
+        deal["can_undo"] = bool(rights["can_decide"])
     return JSONResponse(
         {
             "ok": True,
@@ -3959,6 +3964,8 @@ async def api_machines_card(request: Request):
             "approvers_exist": rights["exist"],
             "viewer_id": user["id"],
             "can_delete": await _can_delete(role),
+            "can_unreserve": (not active) and await mdr.can_unreserve(
+                machine, viewer_id=user["id"], role=role, rights=rights),
             # «Прибыла» — работа приёмки, её делает и менеджер (ручка
             # /api/machines/arrive), в отличие от остальных переходов графа.
             "can_arrive": machine.get("status") == "in_transit",
@@ -4270,7 +4277,42 @@ async def api_machines_status(request: Request):
     res = await machines.set_status(
         machine_id, target, user_id=user["id"], full_name=_actor_name(user), expected=expected
     )
+    if res.get("ok") and expected == "reserved":
+        # Бронь снята руководителем — одобренная бронь менеджера больше не его.
+        from services import machine_deal_requests as mdr
+
+        async with adb_core.transaction() as txn:
+            await mdr.release_bookings_locked(txn, machine_id)
     return _machine_response(res)
+
+
+@app.post("/api/machines/unreserve")
+async def api_machines_unreserve(request: Request):
+    """Снять бронь. Менеджеру — свою бронь (или любую, пока руководителя в
+    системе нет); остальные ручные переходы — `/api/machines/status`, руководству."""
+    from services import async_db as adb
+    from services import machine_deal_requests as mdr
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=_MACHINE_ROLES, rate_limit_scope="api_machines_unreserve"
+    )
+    machine_id = _machine_id_arg(data)
+    idem = _Idem(adb, "machine_unreserve", user["id"], data.get("idempotency_key"))
+    cached = await idem.claim()
+    if cached is not None:
+        return JSONResponse(cached)
+    try:
+        res = await mdr.unreserve(machine_id, actor_id=user["id"], actor_name=_actor_name(user),
+                                  actor_role=get_role(user["id"]))
+    except Exception:
+        await idem.release()
+        raise
+    if not res.get("ok"):
+        await idem.release()
+        return _machine_request_response(res)
+    await idem.store(res)
+    return JSONResponse(res)
 
 
 @app.post("/api/machines/arrive")
@@ -4597,10 +4639,14 @@ async def api_machines_payment(request: Request):
 
     data = await request.json()
     user = _authorize(
-        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_payment"
+        data, allowed_roles=_MACHINE_ROLES, rate_limit_scope="api_machines_payment"
     )
     payment_id = _machine_id_arg(data, "payment_id")
     paid = data.get("paid", True)
+    method = _machine_receipt_method(data, required=False)
+    # Снять отметку = удалить поступление: как удаление денег — руководству,
+    # менеджеру только пока руководителя в системе нет.
+    undo_mode = None if paid else await _machine_money_undo_mode(user["id"])
     # Двойной тап «оплачен» с тем же ключом отдаёт результат первого, а не
     # второе поступление. Сервис дополнительно сериализует записи по сделке.
     idem = _Idem(adb, "machine_payment", user["id"], data.get("idempotency_key"))
@@ -4609,7 +4655,8 @@ async def api_machines_payment(request: Request):
         return JSONResponse(cached)
     try:
         res = await machines.pay_installment(
-            payment_id, user_id=user["id"], full_name=_actor_name(user), paid=bool(paid)
+            payment_id, user_id=user["id"], full_name=_actor_name(user), paid=bool(paid),
+            method=method,
         )
     except Exception:
         await idem.release()
@@ -4617,8 +4664,49 @@ async def api_machines_payment(request: Request):
     if not res.get("ok"):
         await idem.release()
         return _machine_response(res)
+    if undo_mode == "no_boss":
+        await _audit_no_boss_undo(user, f"снята отметка платежа графика #{payment_id}")
     await idem.store(res)
     return _machine_response(res)
+
+
+def _machine_receipt_method(data: dict, *, required: bool) -> str | None:
+    """Способ получения денег по рассрочке — как у разбивки оплаты заказа
+    (наличные / карта / перечисление). Форма «Внести оплату» его требует."""
+    from services import machines
+
+    raw = (data.get("method") or "").strip()
+    if not raw:
+        if required:
+            raise HTTPException(status_code=400, detail="Укажите способ: наличные, карта или перечисление")
+        return None
+    if raw not in machines.RECEIPT_METHODS:
+        raise HTTPException(status_code=400, detail="Способ оплаты: наличные, карта или перечисление")
+    return raw
+
+
+async def _machine_money_undo_mode(user_id: int) -> str:
+    """Удалить поступление по рассрочке (или снять отметку «оплачен»).
+
+    Вносит деньги менеджер — его работа (решение владельца), а стирает их
+    руководство; менеджер — только пока руководителя в системе нет, с пометкой
+    в аудите (как подтверждение денег, `_money_confirmers`). → 'boss' | 'no_boss'.
+    """
+    from services import machine_deal_requests as mdr
+
+    rights = await mdr.decision_rights(user_id, get_role(user_id))
+    if not rights["can_decide"]:
+        raise HTTPException(status_code=403, detail="Удалить поступление может руководитель")
+    return "boss" if rights["viewer_is_holder"] else "no_boss"
+
+
+async def _audit_no_boss_undo(user: dict, what: str) -> None:
+    from services import async_db as adb
+
+    await adb.add_audit_log(
+        user["id"], _actor_name(user), get_role(user["id"]), "machine_receipt_deleted",
+        f"{what} · менеджером — руководителя в системе нет",
+    )
 
 
 @app.post("/api/machines/receipt")
@@ -4634,12 +4722,13 @@ async def api_machines_receipt(request: Request):
 
     data = await request.json()
     user = _authorize(
-        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_receipt"
+        data, allowed_roles=_MACHINE_ROLES, rate_limit_scope="api_machines_receipt"
     )
     deal_id = _machine_id_arg(data, "deal_id")
     amount_cents = _machine_money(data.get("amount"), "Сумма")
     if not amount_cents:
         raise HTTPException(status_code=400, detail="Сумма обязательна")
+    method = _machine_receipt_method(data, required=True)
     if not data.get("idempotency_key"):
         raise HTTPException(status_code=400, detail="idempotency_key обязателен")
 
@@ -4650,7 +4739,7 @@ async def api_machines_receipt(request: Request):
     try:
         res = await machines.add_receipt(
             deal_id, amount_cents, user_id=user["id"], full_name=_actor_name(user),
-            note=_machine_text(data, "note", 200),
+            note=_machine_text(data, "note", 200), method=method,
         )
     except Exception:
         await idem.release()
@@ -4673,12 +4762,15 @@ async def api_machines_receipt_delete(request: Request):
 
     data = await request.json()
     user = _authorize(
-        data, allowed_roles=_MACHINE_BOSS, rate_limit_scope="api_machines_receipt_delete"
+        data, allowed_roles=_MACHINE_ROLES, rate_limit_scope="api_machines_receipt_delete"
     )
+    mode = await _machine_money_undo_mode(user["id"])
     receipt_id = _machine_id_arg(data, "receipt_id")
     res = await machines.delete_receipt(
         receipt_id, user_id=user["id"], full_name=_actor_name(user)
     )
+    if res.get("ok") and mode == "no_boss":
+        await _audit_no_boss_undo(user, f"поступление #{receipt_id}")
     return _machine_response(res)
 
 

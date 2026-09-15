@@ -418,7 +418,9 @@ def test_bad_term_is_400(isolated_db, monkeypatch):
     assert "месяц" in r.json()["detail"]
 
 
-def test_payment_endpoint_is_boss_only(isolated_db, monkeypatch):
+def test_payment_endpoint_marks_by_manager_and_undo_is_boss(isolated_db, monkeypatch):
+    """Рассрочку ведёт менеджер: отметить платёж он может, снять отметку (это
+    удаление денег) — руководитель."""
     from services import machines
 
     db = isolated_db
@@ -428,10 +430,11 @@ def test_payment_endpoint_is_boss_only(isolated_db, monkeypatch):
     pid = [r for r in _run(machines.get_schedule(deal["deal_id"])) if r["seq"] == 1][0]["id"]
     client = _client(monkeypatch)
 
-    assert _post(client, "/api/machines/payment", 1, payment_id=pid).status_code == 403
-    assert _post(client, "/api/machines/payment", 2, payment_id=pid).status_code == 200
+    assert _post(client, "/api/machines/payment", 1, payment_id=pid).status_code == 200
     # Повтор — 409: состояние на сервере уже другое, карточку надо перечитать.
     assert _post(client, "/api/machines/payment", 2, payment_id=pid).status_code == 409
+    assert _post(client, "/api/machines/payment", 1, payment_id=pid, paid=False).status_code == 403
+    assert _post(client, "/api/machines/payment", 2, payment_id=pid, paid=False).status_code == 200
 
 
 # ─── Частичные поступления ────────────────────────────────────────────────────

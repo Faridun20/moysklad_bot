@@ -241,8 +241,8 @@ def test_manager_is_refused_boss_only_stock_actions(open_app, e2e):
                                                 "price_cents": 100}]}),
         ("/api/machines/status", {"machine_id": mid, "status": "reserved", "expected": "in_stock"}),
         ("/api/machines/update", {"machine_id": mid, "fields": {"name": "Взлом"}}),
-        ("/api/machines/payment", {"payment_id": pay, "paid": True}),
-        ("/api/machines/receipt", {"deal_id": deal, "amount": "10", "idempotency_key": "k2"}),
+        ("/api/machines/payment", {"payment_id": pay, "paid": False}),
+        ("/api/machines/receipt_delete", {"receipt_id": 1}),
         ("/api/machines/deal_close", {"deal_id": deal}),
         ("/api/containers/delete", {"container_id": cid}),
         ("/api/channel/stale", {}),
@@ -987,7 +987,11 @@ def test_manager_creates_machine_without_cost_and_sees_schedule_read_only(open_a
 
     mgr.click(f'[data-machine="{mid}"]')
     mgr.wait_for_selector("#content:has-text('Платёж 3')")
-    for sel in ("[data-payment]", "[data-receipt-add]", "[data-deal-close]", "[data-receipt-del]",
+    # Деньги по рассрочке вносит менеджер (решение владельца); закрыть досрочно,
+    # снять отметку и удалить поступление — руководитель.
+    assert mgr.locator('[data-payment][data-paid="0"]').count() == 3
+    assert mgr.locator("[data-receipt-add]").count() == 1
+    for sel in ('[data-payment][data-paid="1"]', "[data-deal-close]", "[data-receipt-del]",
                 "#machine-photo-add", "[data-photo-del]"):
         assert mgr.locator(sel).count() == 0, sel
     assert "AA7654321" not in mgr.inner_text("#content")

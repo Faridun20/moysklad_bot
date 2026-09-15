@@ -195,6 +195,9 @@ def _checks() -> list[Check]:
               "(price_cents IS NULL OR price_cents > 0) AND down_payment_cents >= 0 "
               "AND months >= 0", ("id", "price_cents", "down_payment_cents", "months"),
               "цена > 0, взнос и срок ≥ 0"),
+        Check("machine_receipt_methods_method_chk", "machine_receipt_methods",
+              f"method IN {_in(sorted(METHODS))}", ("receipt_id", "method"),
+              "способ поступления по рассрочке"),
         Check("machine_deal_requests_deal_chk", "machine_deal_requests",
               "status <> 'approved' OR kind = 'reserve' OR deal_id IS NOT NULL",
               ("id", "kind", "status", "deal_id"),

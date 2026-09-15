@@ -382,6 +382,11 @@ def test_check_values_follow_the_code():
         assert f"'{kind}'" in checks["machine_deal_requests_kind_chk"]
     for status in mdr.STATUSES:
         assert f"'{status}'" in checks["machine_deal_requests_status_chk"]
+    from services.machines import RECEIPT_METHODS
+
+    assert set(RECEIPT_METHODS) == set(METHODS), "способы рассрочки = способы оплаты заказа"
+    for method in METHODS:
+        assert f"'{method}'" in checks["machine_receipt_methods_method_chk"]
     for mode in mdr.APPROVAL_MODES:
         assert f"'{mode}'" in checks["machine_deal_requests_mode_chk"]
     names = [c.name for c in apply_constraints._checks()]

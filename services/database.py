@@ -988,6 +988,16 @@ def _table_ddls() -> list[str]:
                 approval_mode      TEXT,
                 deal_id            INTEGER REFERENCES machine_deals(id)
             )""",
+            # Способ, которым получено поступление по рассрочке (наличные /
+            # карта / перечисление — те же слова, что у разбивки оплаты заказа,
+            # `order_payments.METHODS`). Sidecar, а не колонка: таблица
+            # поступлений уже на проде. Нет строки — способ не указан (старые
+            # поступления, кнопка «оплачен» без формы, бухгалтерия — там счёт).
+            """CREATE TABLE IF NOT EXISTS machine_receipt_methods (
+                receipt_id INTEGER PRIMARY KEY REFERENCES machine_payment_receipts(id),
+                method     TEXT NOT NULL,
+                created_at TEXT
+            )""",
             # История публикаций в канал. Нужна, чтобы один и тот же контейнер
             # не ушёл в канал дважды — второй раз обычно потому, что первый
             # забыли.

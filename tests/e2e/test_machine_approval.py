@@ -102,6 +102,26 @@ def test_manager_installment_is_approved_by_boss_in_webapp(open_app, e2e):
     _no_toast(boss)
     _shot(boss, "04-boss-card-schedule-active")
 
+    # Деньги по рассрочке вносит менеджер — со способом, как оплату заказа.
+    mgr.reload()
+    mgr.wait_for_selector("#bottom-nav .nav-item", state="attached")
+    _open_machine(mgr, mid)
+    mgr.wait_for_selector("[data-receipt-add]")
+    mgr.click("[data-receipt-add]")
+    mgr.wait_for_selector("#ms-f-amount")
+    mgr.fill("#ms-f-amount", "6000")
+    mgr.click('.seg-item[data-opt="card"]')
+    _shot(mgr, "11-manager-receipt-method")
+    mgr.click("#ms-submit")
+    mgr.wait_for_selector(".toast:has-text('Оплата записана')")
+    mgr.wait_for_selector("#content:has-text('на карту')")
+    assert e2e.rows("SELECT r.amount_cents, m.method, r.received_by FROM machine_payment_receipts r "
+                    "JOIN machine_receipt_methods m ON m.receipt_id = r.id") == [
+        {"amount_cents": 600_000, "method": "card", "received_by": e2e.ids["mgr"]}]
+    assert mgr.locator("[data-receipt-del]").count() == 0, "стирает деньги руководитель"
+    _no_toast(mgr)
+    _shot(mgr, "12-manager-receipts")
+
 
 def test_sale_rework_resubmit_then_reject_keeps_machine(open_app, e2e):
     mid = _machine(e2e, "APPR-2", "JCB 3CX", status="in_stock", price_cents=4_000_000)
@@ -179,6 +199,16 @@ def test_without_boss_manager_approves_booking_with_explicit_note(open_app, e2e)
     mgr.wait_for_selector(".toast:has-text('руководителя нет')")
     assert e2e.rows("SELECT status FROM machines WHERE id = ?", (mid,))[0]["status"] == "reserved"
     assert e2e.rows("SELECT approval_mode FROM machine_deal_requests") == [{"approval_mode": "no_boss"}]
+
+    # Клиент передумал — менеджер снимает свою бронь сам.
+    mgr.wait_for_selector('[data-mact="unreserve"]')
+    _no_toast(mgr)
+    _shot(mgr, "13-manager-unreserve")
+    mgr.click('[data-mact="unreserve"]')
+    mgr.wait_for_selector(".toast:has-text('Бронь снята')")
+    mgr.wait_for_selector('[data-mact="reserve"]')
+    assert e2e.rows("SELECT status FROM machines WHERE id = ?", (mid,))[0]["status"] == "in_stock"
+    assert e2e.rows("SELECT status FROM machine_deal_requests") == [{"status": "released"}]
 
 
 def test_boss_toggles_delete_setting_and_manager_loses_delete(open_app, e2e):

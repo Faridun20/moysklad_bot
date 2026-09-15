@@ -113,6 +113,10 @@ def next_status_options(status: str | None) -> list[dict]:
 
 DEAL_KINDS = ("sale", "credit")
 
+# Способ получения денег по рассрочке — те же ключи, что у разбивки оплаты
+# заказа (`services.order_payments.METHODS`; равенство стережёт тест).
+RECEIPT_METHODS = {"cash": "наличные", "card": "на карту", "bank": "перечислением"}
+
 # Себестоимость — только для руководства.
 _BOSS_ONLY_FIELDS = ("cost_cents",)
 
@@ -832,17 +836,28 @@ async def _audit_deal_state(change: dict | None, deal_id: int, *, user_id: int, 
 
 async def _insert_receipt_locked(
     txn: Any, deal: dict, amount_cents: int, *, user_id: int,
-    note: str | None, received_at: str | None,
+    note: str | None, received_at: str | None, method: str | None = None,
 ) -> dict | None:
     """Записать поступление ВНУТРИ транзакции под `_lock_deal`. Если график
     покрыт целиком — закрыть сделку той же транзакцией. → изменение состояния
-    сделки для аудита (None — сделка не закрылась)."""
+    сделки для аудита (None — сделка не закрылась). `method` — способ
+    получения (`RECEIPT_METHODS`), пишется той же транзакцией."""
     stamp = now_str()
-    await txn.execute(
+    sql = (
         "INSERT INTO machine_payment_receipts (deal_id, amount_cents, received_at, "
-        "received_by, note, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
-        deal["id"], amount_cents, received_at or stamp, user_id, note, stamp,
+        "received_by, note, created_at) VALUES ($1, $2, $3, $4, $5, $6)"
     )
+    args = (deal["id"], amount_cents, received_at or stamp, user_id, note, stamp)
+    if USE_POSTGRES:
+        receipt_id = await txn.fetchval(sql + " RETURNING id", *args)
+    else:
+        await txn.execute(sql, *args)
+        receipt_id = await txn.fetchval("SELECT last_insert_rowid()")
+    if method:
+        await txn.execute(
+            "INSERT INTO machine_receipt_methods (receipt_id, method, created_at) VALUES ($1, $2, $3)",
+            int(receipt_id), method, stamp,
+        )
     covered = await _sync_schedule_state(int(deal["id"]), user_id=user_id, db=txn)
     if not covered:
         return None
@@ -851,13 +866,14 @@ async def _insert_receipt_locked(
 
 async def _after_receipt_added(
     deal_id: int, amount_cents: int, currency: str, closed: dict | None, *,
-    user_id: int, full_name: str,
+    user_id: int, full_name: str, method: str | None = None,
 ) -> dict:
     """Аудит — ПОСЛЕ коммита: его пишет синхронный слой, и на SQLite он ждал
     бы нашу же пишущую транзакцию. Само закрытие уже в транзакции поступления."""
     await _audit(
         user_id, full_name, "machine_receipt_added",
-        f"сделка #{deal_id} · {money.format_cents(amount_cents)} {currency}",
+        f"сделка #{deal_id} · {money.format_cents(amount_cents)} {currency}"
+        + (f" · {RECEIPT_METHODS.get(method, method)}" if method else ""),
     )
     await _audit_deal_state(closed, deal_id, user_id=user_id, full_name=full_name)
     return {"ok": True, "deal_closed": bool(closed)}
@@ -865,7 +881,7 @@ async def _after_receipt_added(
 
 async def add_receipt(
     deal_id: int, amount_cents: int, *, user_id: int, full_name: str = "",
-    note: str | None = None, received_at: str | None = None,
+    note: str | None = None, received_at: str | None = None, method: str | None = None,
 ) -> dict:
     """Записать полученные деньги по рассрочке.
 
@@ -875,6 +891,8 @@ async def add_receipt(
     """
     if not isinstance(amount_cents, int) or amount_cents <= 0:
         return {"ok": False, "error": "Сумма должна быть больше нуля"}
+    if method is not None and method not in RECEIPT_METHODS:
+        return {"ok": False, "error": "Способ оплаты: наличные, карта или перечисление"}
     # Потолок суммы зависит от валюты сделки (эквивалент базовой), а курс
     # читается синхронным слоем — поэтому проверка ДО пишущей транзакции: на
     # SQLite синхронное чтение ждало бы нашу же транзакцию.
@@ -892,10 +910,11 @@ async def add_receipt(
             return {"ok": False, "error": "Рассрочка уже закрыта", "current": "closed"}
         closed = await _insert_receipt_locked(
             txn, deal, amount_cents, user_id=user_id, note=note, received_at=received_at,
+            method=method,
         )
     return await _after_receipt_added(
         deal_id, amount_cents, str(deal["currency"]), closed,
-        user_id=user_id, full_name=full_name,
+        user_id=user_id, full_name=full_name, method=method,
     )
 
 
@@ -912,6 +931,8 @@ async def _delete_receipt_locked(
         "SELECT deal_id, amount_cents FROM machine_payment_receipts WHERE id = $1", receipt_id
     )
     deal_id = int(row["deal_id"])
+    # Ребёнок до родителя: на Postgres FK энфорсится.
+    await txn.execute("DELETE FROM machine_receipt_methods WHERE receipt_id = $1", receipt_id)
     await txn.execute("DELETE FROM machine_payment_receipts WHERE id = $1", receipt_id)
     covered = await _sync_schedule_state(deal_id, user_id=user_id, db=txn)
     reopened = None if covered else await _set_deal_closed_locked(txn, deal_id, closed=False)
@@ -949,8 +970,9 @@ async def delete_receipt(receipt_id: int, *, user_id: int, full_name: str = "") 
 
 async def list_receipts(deal_id: int) -> list[dict]:
     rows = await adb_core.fetch(
-        "SELECT * FROM machine_payment_receipts WHERE deal_id = $1 "
-        "ORDER BY received_at DESC, id DESC",
+        "SELECT r.*, rm.method FROM machine_payment_receipts r "
+        "LEFT JOIN machine_receipt_methods rm ON rm.receipt_id = r.id WHERE r.deal_id = $1 "
+        "ORDER BY r.received_at DESC, r.id DESC",
         deal_id,
     )
     return [dict(r) for r in rows]
@@ -978,7 +1000,8 @@ async def deal_progress(deal_id: int) -> dict:
 
 
 async def pay_installment(
-    payment_id: int, *, user_id: int, full_name: str = "", paid: bool = True
+    payment_id: int, *, user_id: int, full_name: str = "", paid: bool = True,
+    method: str | None = None,
 ) -> dict:
     """Отметить плановый платёж полученным целиком.
 
@@ -1012,6 +1035,7 @@ async def pay_installment(
                 return {"ok": False, "error": "Рассрочка уже закрыта", "current": "closed"}
             closed = await _insert_receipt_locked(
                 txn, deal, amount, user_id=user_id, note=f"платёж {row['seq']}", received_at=None,
+                method=method if method in RECEIPT_METHODS else None,
             )
         else:
             if not row["paid_at"]:
@@ -1031,6 +1055,7 @@ async def pay_installment(
     if paid:
         return await _after_receipt_added(
             deal_id, amount, str(deal["currency"]), closed, user_id=user_id, full_name=full_name,
+            method=method if method in RECEIPT_METHODS else None,
         )
     return await _after_receipt_deleted(
         deal_id, amount, reopened, user_id=user_id, full_name=full_name,

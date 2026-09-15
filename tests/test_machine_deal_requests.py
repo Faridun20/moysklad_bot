@@ -166,7 +166,7 @@ def test_manager_installment_waits_for_boss_then_schedule_lives(isolated_db, mon
 
     # График живой: поступление гасит первый платёж.
     pay = _post(client, "/api/machines/receipt", BOSS, deal_id=deal["id"], amount="5000",
-                idempotency_key="r1")
+                method="cash", idempotency_key="r1")
     assert pay.status_code == 200, pay.text
     progress = _run(machines.deal_progress(int(deal["id"])))
     assert progress["left_cents"] == 1_500_000
@@ -396,6 +396,138 @@ def test_deleting_machine_takes_finished_requests_along(isolated_db, monkeypatch
     assert _decide(client, BOSS, "reject", rid).status_code == 200
     assert _run(machines.delete_machine(mid, user_id=BOSS))["ok"]
     assert _rows(db, "SELECT COUNT(*) AS n FROM machine_deal_requests")[0]["n"] == 0
+
+
+# ─── Деньги по рассрочке и снятие брони — работа менеджера ───────────────────
+
+
+def _approved_credit(client, db):
+    mid = _machine()
+    rid = _deal(client, MGR, mid).json()["request_id"]
+    assert _decide(client, BOSS, "approve", rid).status_code == 200
+    deal_id = _rows(db, "SELECT id FROM machine_deals")[0]["id"]
+    return mid, int(deal_id)
+
+
+def test_manager_records_installment_money_with_method(isolated_db, monkeypatch, sent):
+    db = isolated_db
+    _setup(db)
+    client = _client(monkeypatch)
+    mid, deal_id = _approved_credit(client, db)
+
+    no_method = _post(client, "/api/machines/receipt", MGR, deal_id=deal_id, amount="5000",
+                      idempotency_key="r0")
+    assert no_method.status_code == 400 and "способ" in no_method.json()["detail"].lower()
+    assert _post(client, "/api/machines/receipt", MGR, deal_id=deal_id, amount="5000",
+                 method="barter", idempotency_key="r00").status_code == 400
+    assert _post(client, "/api/machines/receipt", KEEPER, deal_id=deal_id, amount="5000",
+                 method="cash", idempotency_key="rk").status_code == 403
+
+    ok = _post(client, "/api/machines/receipt", MGR, deal_id=deal_id, amount="5000",
+               method="card", idempotency_key="r1")
+    assert ok.status_code == 200, ok.text
+    card = _post(client, "/api/machines/card", MGR, machine_id=mid).json()
+    deal = card["deals"][0]
+    assert deal["can_record"] is True and deal["can_undo"] is False
+    assert [r["method"] for r in deal["receipts"]] == ["card"]
+    assert deal["progress"]["left_cents"] == 1_500_000
+
+    # Плановый платёж «оплачен» кнопкой — тоже менеджер; способ необязателен.
+    second = [p for p in deal["payments"] if p["seq"] == 2][0]
+    paid = _post(client, "/api/machines/payment", MGR, payment_id=second["id"], paid=True,
+                 method="cash", idempotency_key="p1")
+    assert paid.status_code == 200, paid.text
+    audit = [a["details"] for a in _run(db.get_audit_log(limit=50)) if a["action"] == "machine_receipt_added"]
+    assert any("на карту" in d for d in audit) and any("наличные" in d for d in audit)
+
+    # Стереть деньги при живом руководителе менеджер не может — ни удалением, ни снятием отметки.
+    receipt_id = deal["receipts"][0]["id"]
+    assert _post(client, "/api/machines/receipt_delete", MGR, receipt_id=receipt_id).status_code == 403
+    assert _post(client, "/api/machines/payment", MGR, payment_id=second["id"], paid=False,
+                 idempotency_key="p2").status_code == 403
+    assert _post(client, "/api/machines/receipt_delete", BOSS, receipt_id=receipt_id).status_code == 200
+    assert _rows(db, "SELECT COUNT(*) AS n FROM machine_receipt_methods WHERE receipt_id = ?",
+                 (receipt_id,))[0]["n"] == 0
+
+
+def test_without_boss_manager_deletes_receipt_with_note(isolated_db, monkeypatch, sent):
+    from services import machines
+
+    db = isolated_db
+    _setup(db, boss=False)
+    client = _client(monkeypatch)
+    mid = _machine()
+    rid = _deal(client, MGR, mid).json()["request_id"]
+    assert _decide(client, MGR, "approve", rid).status_code == 200
+    deal_id = int(_rows(db, "SELECT id FROM machine_deals")[0]["id"])
+    assert _run(machines.add_receipt(deal_id, 100_000, user_id=MGR, method="bank"))["ok"]
+    receipt_id = _rows(db, "SELECT id FROM machine_payment_receipts")[0]["id"]
+    card = _post(client, "/api/machines/card", MGR, machine_id=mid).json()
+    assert card["deals"][0]["can_undo"] is True
+    assert _post(client, "/api/machines/receipt_delete", MGR, receipt_id=receipt_id).status_code == 200
+    notes = [a["details"] for a in _run(db.get_audit_log(limit=50)) if a["action"] == "machine_receipt_deleted"]
+    assert any("руководителя в системе нет" in n for n in notes)
+
+
+def test_manager_unbooks_own_booking_only(isolated_db, monkeypatch, sent):
+    db = isolated_db
+    _setup(db)
+    client = _client(monkeypatch)
+    mine, other = _machine("B-1"), _machine("B-2")
+    rid = _deal(client, MGR, mine, kind="reserve", price="", buyer_passport="").json()["request_id"]
+    assert _decide(client, BOSS, "approve", rid).status_code == 200
+    assert _post(client, "/api/machines/status", BOSS, machine_id=other, status="reserved",
+                 expected="in_stock").status_code == 200
+
+    assert _post(client, "/api/machines/card", MGR, machine_id=mine).json()["can_unreserve"] is True
+    assert _post(client, "/api/machines/card", MGR, machine_id=other).json()["can_unreserve"] is False
+    assert _post(client, "/api/machines/card", MGR2, machine_id=mine).json()["can_unreserve"] is False
+    assert _post(client, "/api/machines/unreserve", MGR, machine_id=other).status_code == 403
+    assert _post(client, "/api/machines/unreserve", MGR2, machine_id=mine).status_code == 403
+    assert _post(client, "/api/machines/unreserve", KEEPER, machine_id=mine).status_code == 403
+    # Прочие ручные переходы — по-прежнему руководству.
+    assert _post(client, "/api/machines/status", MGR, machine_id=mine, status="in_stock",
+                 expected="reserved").status_code == 403
+
+    r = _post(client, "/api/machines/unreserve", MGR, machine_id=mine, idempotency_key="u1")
+    assert r.status_code == 200 and r.json()["mode"] == "own", r.text
+    assert _rows(db, "SELECT status FROM machines WHERE id = ?", (mine,)) == [{"status": "in_stock"}]
+    assert _rows(db, "SELECT status FROM machine_deal_requests WHERE id = ?", (rid,)) == [{"status": "released"}]
+    assert _post(client, "/api/machines/unreserve", MGR, machine_id=mine).status_code == 409
+
+    # Бронь снята, руководитель забронировал снова сам — старая бронь менеджера
+    # права не даёт.
+    assert _post(client, "/api/machines/status", BOSS, machine_id=mine, status="reserved",
+                 expected="in_stock").status_code == 200
+    assert _post(client, "/api/machines/unreserve", MGR, machine_id=mine).status_code == 403
+    assert _post(client, "/api/machines/unreserve", BOSS, machine_id=mine).status_code == 200
+
+
+def test_boss_unbooking_releases_manager_booking(isolated_db, monkeypatch, sent):
+    db = isolated_db
+    _setup(db)
+    client = _client(monkeypatch)
+    mid = _machine()
+    rid = _deal(client, MGR, mid, kind="reserve", price="", buyer_passport="").json()["request_id"]
+    assert _decide(client, BOSS, "approve", rid).status_code == 200
+    assert _post(client, "/api/machines/status", BOSS, machine_id=mid, status="in_stock",
+                 expected="reserved").status_code == 200
+    assert _rows(db, "SELECT status FROM machine_deal_requests") == [{"status": "released"}]
+
+
+def test_without_boss_manager_unbooks_any_booking(isolated_db, monkeypatch, sent):
+    from services import machines
+
+    db = isolated_db
+    _setup(db, boss=False)
+    client = _client(monkeypatch)
+    mid = _machine(status="reserved")
+    assert _post(client, "/api/machines/card", MGR2, machine_id=mid).json()["can_unreserve"] is True
+    r = _post(client, "/api/machines/unreserve", MGR2, machine_id=mid)
+    assert r.status_code == 200 and r.json()["mode"] == "no_boss"
+    assert _run(machines.get_machine(mid))["status"] == "in_stock"
+    notes = [a["details"] for a in _run(db.get_audit_log(limit=50)) if a["action"] == "machine_unreserved"]
+    assert notes and "руководителя в системе нет" in notes[0]
 
 
 # ─── Бот: карточка решения ────────────────────────────────────────────────────

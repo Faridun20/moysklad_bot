@@ -1735,7 +1735,11 @@ function machineScheduleHtml(deal, today) {
   const cur = deal.currency || 'USD';
   const paidCents = rows.filter(p => p.paid_at).reduce((s, p) => s + Number(p.amount_cents || 0), 0);
   const totalCents = rows.reduce((s, p) => s + Number(p.amount_cents || 0), 0);
-  const boss = isMachineBoss();
+  // Вносит деньги по рассрочке менеджер (решение владельца), стирает —
+  // руководство (или менеджер, пока руководителя нет). Права приходят в сделке
+  // (`can_record`/`can_undo`); у экранов без них — прежнее «только руководству».
+  const canRecord = deal.can_record != null ? !!deal.can_record : isMachineBoss();
+  const canUndo = deal.can_undo != null ? !!deal.can_undo : isMachineBoss();
 
   const items = rows.map(p => {
     const due = String(p.due_date || '').slice(0, 10);
@@ -1756,7 +1760,7 @@ function machineScheduleHtml(deal, today) {
         ? `внесено ${formatMoney(covered / 100, cur)} из ${formatMoney(amount / 100, cur)} · до ${escapeHtml(due)}`
         : `до ${escapeHtml(due)}`;
     // Взнос переключать нечем: он получен в момент сделки.
-    const toggle = boss && p.seq > 0
+    const toggle = p.seq > 0 && (p.paid_at ? canUndo : canRecord && !deal.closed_at)
       ? `<button class="pay-toggle" data-payment="${p.id}" data-paid="${p.paid_at ? '1' : '0'}"
                  aria-label="${p.paid_at ? 'Снять отметку' : 'Отметить полученным'}">${icon(p.paid_at ? 'close' : 'check')}</button>`
       : '';
@@ -1779,7 +1783,7 @@ function machineScheduleHtml(deal, today) {
     : rows.reduce((s, p) => s + Number(p.covered_cents || 0), 0);
   const total = prog.planned_cents != null ? Number(prog.planned_cents) : totalCents;
   const left = Math.max(0, total - paid);
-  const addBtn = boss && !deal.closed_at
+  const addBtn = canRecord && !deal.closed_at
     ? `<div class="c-actions"><button class="btn-secondary" data-receipt-add="${deal.id}">${icon('cash')} Внести оплату</button></div>`
     : '';
   return `
@@ -1798,16 +1802,18 @@ function machineReceiptsHtml(deal) {
   const rows = deal.receipts || [];
   if (!rows.length) return '';
   const cur = deal.currency || 'USD';
-  const boss = isMachineBoss();
+  const canUndo = deal.can_undo != null ? !!deal.can_undo : isMachineBoss();
+  const methods = { cash: 'наличные', card: 'на карту', bank: 'перечислением' };
   return `<div class="section-label">Поступления · ${rows.length}</div>
     <div class="c-surface c-surface--list">${rows.map(r => `
       <div class="c-row">
         <div class="card-row-info">
           <div class="card-row-title">${formatMoney(Number(r.amount_cents || 0) / 100, cur)}</div>
           <div class="card-row-sub">${escapeHtml(String(r.received_at || '').slice(0, 16))}${
+            r.method ? ' · ' + escapeHtml(methods[r.method] || r.method) : ''}${
             r.note ? ' · ' + escapeHtml(r.note) : ''}</div>
         </div>
-        ${boss ? `<button class="pay-toggle" data-receipt-del="${r.id}"
+        ${canUndo ? `<button class="pay-toggle" data-receipt-del="${r.id}"
                     aria-label="Удалить поступление">${icon('trash')}</button>` : ''}
       </div>`).join('')}</div>`;
 }
@@ -1827,12 +1833,16 @@ function openReceiptForm(deal, refresh) {
     hint: 'Сумма любая — поступления гасят график по порядку',
     fields: [
       { key: 'amount', label: `Сумма, ${deal.currency || 'USD'}`, type: 'number', required: true },
+      // Как получены деньги — те же способы, что у оплаты заказа: потом по
+      // нему сверяют кассу и банк.
+      { key: 'method', label: 'Как получены', type: 'select', required: true,
+        options: [['cash', 'Наличные'], ['card', 'На карту'], ['bank', 'Перечисление']] },
       { key: 'note', label: 'Комментарий' },
     ],
     submitLabel: 'Записать',
     onSubmit: async (data, { showErr }) => {
       const res = await apiResult('/api/machines/receipt', {
-        deal_id: deal.id, amount: data.amount, note: data.note, idempotency_key: key,
+        deal_id: deal.id, amount: data.amount, method: data.method, note: data.note, idempotency_key: key,
       });
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
@@ -1934,6 +1944,11 @@ function machineActionsHtml(m, card) {
   // Бронь, продажа и рассрочка — заявки (`/api/machines/deal`): у менеджера
   // они уходят руководителю на одобрение, у руководства проводятся сразу.
   // Руководству бронь без покупателя остаётся переходом «Забронировать».
+  // «Снять бронь» менеджеру — свою бронь (или любую, пока руководителя нет).
+  // Руководству тот же переход рисует граф (`next_statuses`).
+  if (card.can_unreserve && !card.can_manage) {
+    buttons.push(`<button class="btn-secondary" data-mact="unreserve">${icon('lock')} Снять бронь</button>`);
+  }
   if (kinds.includes('reserve') && !card.can_manage) {
     buttons.push(`<button class="btn-secondary" data-mact="reserve">${icon('lock')} Бронь</button>`);
   }
@@ -2187,6 +2202,19 @@ function canDeleteRecords() {
   const r = role();
   if (r === 'admin' || r === 'boss') return true;
   return r === 'manager' && !(currentUser && currentUser.delete_requires_boss);
+}
+
+async function unreserveMachine(machine) {
+  if (!await confirmDialog(`Снять бронь с «${machine.name || machine.vin}»? Машина вернётся на склад.`)) return;
+  const res = await apiResult('/api/machines/unreserve', { machine_id: machine.id, idempotency_key: idemKey() });
+  if (!res.ok) {
+    tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
+    renderMachineCard(machine.id);
+    return;
+  }
+  haptic('success');
+  toast(res.body && res.body.mode === 'no_boss' ? 'Бронь снята · руководителя нет — записано в журнал' : 'Бронь снята');
+  renderMachineCard(machine.id);
 }
 
 async function deleteMachine(machine) {
@@ -3545,6 +3573,7 @@ async function renderMachineCard(machineId) {
       else if (act === 'arrive') openMachineArriveForm(m);
       else if (act === 'edit') openMachineForm(m);
       else if (act === 'delete') deleteMachine(m);
+      else if (act === 'unreserve') unreserveMachine(m);
       else openDealForm(m, act);
     });
   });
