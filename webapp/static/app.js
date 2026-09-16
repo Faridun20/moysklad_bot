@@ -10268,7 +10268,7 @@ async function renderWhInvoiceList() {
   });
 }
 
-// ─── Списания и инвентаризация (второй уровень вкладки «Накладные») ─────────
+// ─── Списания и пересчёт склада (второй уровень вкладки «Движения») ────────
 //
 // Два действия и одна лента. Действие начинается с ВЫБОРА товара из каталога
 // (`openCatalogPicker`), а не с ввода названия: то же правило, что у позиции
@@ -10410,7 +10410,7 @@ async function renderWriteoffsList() {
   const actions = `<div class="c-actions c-actions--wrap">
       <button class="btn-primary" id="wo-new">${icon('ban')} Списать товар</button>
       <button class="btn-secondary" id="wo-count">${icon('list')} ${
-        open ? 'Продолжить пересчёт' : 'Инвентаризация'}</button>
+        open ? 'Продолжить пересчёт' : 'Пересчитать склад'}</button>
     </div>`;
 
   const rows = data.writeoffs || [];
@@ -10473,7 +10473,7 @@ async function renderWriteoffsList() {
     haptic('light');
     if (open) { woCountId = open.count_id; woView = 'count'; return renderWriteoffsView(); }
     openMachineSheet({
-      title: 'Инвентаризация',
+      title: 'Пересчёт склада',
       hint: 'Вводите ПОСЧИТАННОЕ количество по каждому товару. Разницу с остатком '
         + 'система посчитает сама и покажет списком перед проведением.',
       fields: [{ key: 'note', label: 'Заметка', type: 'text', placeholder: 'например: склад №1, ряд А' }],
