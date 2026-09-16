@@ -1567,6 +1567,13 @@ LibreOffice и боевой образ, шардами в одноразовых
 `scripts/ci/Dockerfile.ci` поверх корневого `Dockerfile`, кэш по хэшу
 `Dockerfile`+`requirements*.txt`. Добавляешь системную зависимость тестам — в
 `Dockerfile.ci`, а не «поставлю руками на сервере».
+Шард, который напечатал итог pytest, но не завершился за
+`LOCAL_CI_EXIT_GRACE_SEC` (120 с), CI гасит SIGABRT (стеки всех потоков в логе)
+и помечает `ЗАВИСАНИЕ`. Типичная причина — живой не-daemon поток: так висели
+потоки aiosqlite у фоновых задач, снятых на открытии соединения. Поэтому
+aiosqlite-соединение в коде — только через `adb_core._sqlite_conn`, а тест,
+который зовёт отгрузку/одобрение с ботом через `asyncio.run`, дожидается
+`utils.background.pending()` своего loop'а (как `liveserver.run_async`).
 
 `TELEGRAM_TOKEN=0:fake` — заглушка для импорта config (в workflow и в `tests/conftest.py` через `os.environ.setdefault`). `MS_TOKEN` больше не нужен: его читает только `scripts/migrate_from_moysklad.py`, и то из окружения напрямую.
 

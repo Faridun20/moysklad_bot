@@ -253,6 +253,39 @@ async def _register_sqlite_functions(conn) -> None:
     )
 
 
+@asynccontextmanager
+async def _sqlite_conn():
+    """Открытое aiosqlite-соединение, чей поток гарантированно гаснет.
+
+    У aiosqlite 0.20 каждое соединение — отдельный НЕ-daemon поток, который
+    ждёт в очереди следующую команду, пока его не остановят. `connect()` гасит
+    поток только на `Exception`, а `CancelledError` — `BaseException`: задачу
+    сняли на середине открытия (фоновое уведомление или печатная форма, когда
+    `asyncio.run` в тесте или портал TestClient закрывает loop), и поток
+    остаётся ждать вечно. Интерпретатор на выходе ждёт такие потоки
+    (`threading._shutdown`) — pytest печатал «N passed» и не завершался: шард
+    локальной CI висел до таймаута. Поэтому: при любом прерывании открытия
+    поток останавливаем сами, а сам поток — daemon, чтобы соединение, которое
+    кто-то всё же не закрыл, не держало выход процесса.
+    """
+    import aiosqlite
+
+    conn = aiosqlite.connect(_db_path(), timeout=_SQLITE_TIMEOUT)
+    conn.daemon = True
+    try:
+        await conn  # старт потока + открытие; `__aenter__` делает то же самое
+    except BaseException:
+        conn._stop_running()  # как делает сам aiosqlite на Exception
+        raise
+    try:
+        await _register_sqlite_functions(conn)
+        conn.row_factory = aiosqlite.Row
+        yield conn
+    finally:
+        # close() останавливает поток в finally — даже если его самого снимут.
+        await conn.close()
+
+
 async def fetch(query: str, *args: Any) -> list[dict]:
     """SELECT → список dict'ов (возможно пустой)."""
     if _use_postgres():
@@ -261,14 +294,9 @@ async def fetch(query: str, *args: Any) -> list[dict]:
             rows = await conn.fetch(query, *_pg_args(args))
         return [dict(r) for r in rows]
 
-    import aiosqlite
-
     sql, params = _to_sqlite(query, args)
-    async with aiosqlite.connect(_db_path(), timeout=_SQLITE_TIMEOUT) as conn:
-        await _register_sqlite_functions(conn)
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute(sql, params) as cur:
-            rows = await cur.fetchall()
+    async with _sqlite_conn() as conn, conn.execute(sql, params) as cur:
+        rows = await cur.fetchall()
     return [dict(r) for r in rows]
 
 
@@ -280,14 +308,9 @@ async def fetchrow(query: str, *args: Any) -> dict | None:
             row = await conn.fetchrow(query, *_pg_args(args))
         return dict(row) if row is not None else None
 
-    import aiosqlite
-
     sql, params = _to_sqlite(query, args)
-    async with aiosqlite.connect(_db_path(), timeout=_SQLITE_TIMEOUT) as conn:
-        await _register_sqlite_functions(conn)
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute(sql, params) as cur:
-            row = await cur.fetchone()
+    async with _sqlite_conn() as conn, conn.execute(sql, params) as cur:
+        row = await cur.fetchone()
     return dict(row) if row is not None else None
 
 
@@ -298,13 +321,9 @@ async def fetchval(query: str, *args: Any) -> Any:
         async with pool.acquire() as conn:
             return await conn.fetchval(query, *_pg_args(args))
 
-    import aiosqlite
-
     sql, params = _to_sqlite(query, args)
-    async with aiosqlite.connect(_db_path(), timeout=_SQLITE_TIMEOUT) as conn:
-        await _register_sqlite_functions(conn)
-        async with conn.execute(sql, params) as cur:
-            row = await cur.fetchone()
+    async with _sqlite_conn() as conn, conn.execute(sql, params) as cur:
+        row = await cur.fetchone()
     return row[0] if row else None
 
 
@@ -317,10 +336,8 @@ async def execute(query: str, *args: Any) -> int:
             status = await conn.execute(query, *_pg_args(args))
         return _rowcount_from_status(status)
 
-    import aiosqlite
-
     sql, params = _to_sqlite(query, args)
-    async with aiosqlite.connect(_db_path(), timeout=_SQLITE_TIMEOUT) as conn:
+    async with _sqlite_conn() as conn:
         cur = await conn.execute(sql, params)
         await conn.commit()
         return cur.rowcount
@@ -344,11 +361,6 @@ async def transaction():
             yield _PgTxn(conn)
         return
 
-    import aiosqlite
-
-    conn = await aiosqlite.connect(_db_path(), timeout=_SQLITE_TIMEOUT)
-    await _register_sqlite_functions(conn)
-    conn.row_factory = aiosqlite.Row
     # BEGIN IMMEDIATE, а не отложенная транзакция по умолчанию. Транзакция
     # здесь почти всегда «прочитать остаток → записать»: с DEFERRED чтение
     # берёт SHARED, запись просит RESERVED, и при втором таком же соседе SQLite
@@ -358,15 +370,16 @@ async def transaction():
     # этого держит FOR UPDATE, на SQLite его нет. IMMEDIATE берёт пишущую
     # блокировку на входе: писатели выстраиваются в очередь, как на проде.
     # Нашли нагрузочные тесты (tests/perf/test_load.py).
-    await conn.execute("BEGIN IMMEDIATE")
-    try:
-        yield _SqliteTxn(conn)
-        await conn.commit()
-    except BaseException:
-        await conn.rollback()
-        raise
-    finally:
-        await conn.close()
+    # Соединение — через `_sqlite_conn`: снятая на BEGIN (ждёт чужую пишущую
+    # блокировку до timeout) задача раньше оставляла поток aiosqlite жить.
+    async with _sqlite_conn() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield _SqliteTxn(conn)
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
 
 
 class _PgTxn:

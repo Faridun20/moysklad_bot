@@ -206,6 +206,38 @@ collect_shards() {
 
 JOB_ORDER=()
 
+# Сторож выхода pytest (определяется внутри контейнера перед командой шарда).
+# pytest напечатал итог («N passed in …»), а процесс не завершается —
+# интерпретатор ждёт не-daemon поток (так висели шарды из-за потоков
+# aiosqlite, см. adb_core._sqlite_conn). Без сторожа шард молча ждал общий
+# таймаут задачи. Теперь: через EXIT_GRACE_SEC после итога — SIGABRT
+# (PYTHONFAULTHANDLER печатает стеки ВСЕХ потоков — видно, кто держит), затем
+# SIGKILL, и шард красный с понятной причиной. kill здесь — builtin bash.
+EXIT_GRACE_SEC="${LOCAL_CI_EXIT_GRACE_SEC:-120}"
+PYTEST_GUARD='pytest_guarded() {
+    local out=/tmp/pytest.out since="" rc
+    : > "$out"
+    PYTHONFAULTHANDLER=1 pytest "$@" > "$out" 2>&1 &
+    local pid=$!
+    tail -n +1 -f --pid="$pid" "$out" &
+    local tailpid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ -z "$since" ] && tail -n 3 "$out" | grep -qE "^(=+ )?([0-9]+ [a-z]+(, [0-9]+ [a-z]+)*|no tests ran) in [0-9.]+s( \(.*\))?( =+)?$"; then
+            since=$SECONDS
+        fi
+        if [ -n "$since" ] && [ $((SECONDS - since)) -ge '"$EXIT_GRACE_SEC"' ]; then
+            kill -ABRT "$pid" 2>/dev/null; sleep 5; kill -KILL "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null; wait "$tailpid" 2>/dev/null
+            echo "ЗАВИСАНИЕ: pytest напечатал итог, но не завершился за '"$EXIT_GRACE_SEC"' с — стеки потоков выше"
+            return 1
+        fi
+        sleep 2
+    done
+    wait "$pid"; rc=$?
+    wait "$tailpid" 2>/dev/null
+    return $rc
+}'
+
 # ─── lint ────────────────────────────────────────────────────────────────────
 lint_job() {
     ctr lint 2 -- '
@@ -244,7 +276,7 @@ unit_shard_job() {  # unit_shard_job <i>: тесты из $WORK/shards/unit<i>.t
     ctr "unit$i" 3 -v "$COV_VOL:/cov" -v "$WORK/shards:/shards:ro" \
         -e "TEST_PG_URL=postgresql://postgres:ci@$PG:5432/postgres" \
         -e "COVERAGE_FILE=/cov/.coverage.unit$i" -- \
-        "mapfile -t T < /shards/unit$i.txt && pytest -m 'not e2e and not perf' -q --tb=short -p no:cacheprovider --cov --cov-report= \
+        "$PYTEST_GUARD && mapfile -t T < /shards/unit$i.txt && pytest_guarded -m 'not e2e and not perf' -q --tb=short -p no:cacheprovider --cov --cov-report= \
          --durations=10 \"\${T[@]}\""
 }
 
@@ -258,8 +290,8 @@ coverage_job() {
 e2e_shard_job() {  # e2e_shard_job <i>: тесты из $WORK/shards/e2e<i>.txt
     local i="$1"
     ctr "e2e$i" 2 -v "$WORK/shards:/shards:ro" -e E2E_REQUIRED=1 -- \
-        "mapfile -t T < /shards/e2e$i.txt && \
-         pytest -m e2e -q --tb=short -p no:cacheprovider --durations=10 \"\${T[@]}\""
+        "$PYTEST_GUARD && mapfile -t T < /shards/e2e$i.txt && \
+         pytest_guarded -m e2e -q --tb=short -p no:cacheprovider --durations=10 \"\${T[@]}\""
 }
 
 perf_job() {
@@ -317,7 +349,7 @@ SUMMARY="$WORK/summary.txt"
     printf '%-10s %-6s %6s  %s\n' "задача" "итог" "сек" "последняя строка"
     for name in "${JOB_ORDER[@]}"; do
         read -r rc secs < "$WORK/$name.rc" 2>/dev/null || { rc=255; secs=0; }
-        last="$(grep -E 'passed|failed|error|Found|All checks|Test Files|TOTAL|ТАЙМАУТ|Success' "$WORK/$name.log" 2>/dev/null \
+        last="$(grep -E 'passed|failed|error|Found|All checks|Test Files|TOTAL|ТАЙМАУТ|ЗАВИСАНИЕ|Success' "$WORK/$name.log" 2>/dev/null \
             | tail -n 1 | cut -c1-110)"
         if [ "$rc" = 0 ]; then st="OK"; else st="FAIL"; FAILED+=("$name"); fi
         printf '%-10s %-6s %6s  %s\n' "$name" "$st" "$secs" "$last"

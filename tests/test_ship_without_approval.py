@@ -115,10 +115,20 @@ def _ship(oid, uid=MGR, name="Manager", bot=None, **kw):
     from services.order_workflow import ship_order_now
 
     async def go():
+        from utils.background import pending
+
         res = await ship_order_now(oid, uid, name, bot, **kw)
         task = res.get("notify_task")
         if task is not None:
             await task
+        # Кроме уведомления, одобрение внутри отгрузки фоном шлёт печатную
+        # форму (`pdf_task` в результат ship_order_now не попадает). Не
+        # дождаться — `asyncio.run` снимет её на полпути, и результат теста
+        # зависит от того, где именно её сняли.
+        loop = asyncio.get_running_loop()
+        left = [t for t in pending() if t.get_loop() is loop]
+        if left:
+            await asyncio.gather(*left, return_exceptions=True)
         return res
 
     return _run(go())

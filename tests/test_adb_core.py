@@ -166,6 +166,57 @@ def test_transaction_commit_and_rollback(sqlite_env):
     asyncio.run(scenario())
 
 
+def _sqlite_threads() -> set:
+    import threading
+
+    import aiosqlite
+
+    return {t for t in threading.enumerate() if isinstance(t, aiosqlite.Connection)}
+
+
+@pytest.mark.parametrize("op", ["fetchval", "transaction"])
+def test_cancel_while_connecting_stops_sqlite_thread(sqlite_env, op):
+    """Задачу сняли на открытии соединения — поток aiosqlite не остаётся жить.
+
+    Так снимаются фоновые задачи (уведомление, печатная форма), когда
+    `asyncio.run` теста или портал TestClient закрывает loop. aiosqlite 0.20
+    гасит поток только на `Exception`, а отмена — `BaseException`: поток (не
+    daemon) ждал команд вечно, и pytest после «N passed» не завершался — шард
+    локальной CI висел до таймаута.
+    """
+
+    async def in_txn():
+        async with adb_core.transaction() as tx:
+            return await tx.fetchval("SELECT 1")
+
+    before = _sqlite_threads()
+
+    async def scenario():
+        task = asyncio.create_task(adb_core.fetchval("SELECT 1") if op == "fetchval" else in_txn())
+        await asyncio.sleep(0)  # задача дошла до ожидания открытия соединения
+        assert _sqlite_threads() - before, "поток соединения уже должен стартовать"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # loop ещё жив: поток успевает открыть соединение и вернуться ждать
+        # команд — ровно так поток и оставался висеть. (Закройся loop раньше,
+        # поток упал бы на call_soon_threadsafe сам.)
+        await asyncio.sleep(0.3)
+
+    asyncio.run(scenario())
+    leaked = _sqlite_threads() - before
+    try:
+        for t in leaked:
+            t.join(timeout=5)
+        assert [t for t in leaked if t.is_alive()] == []
+        # и даже незакрытое соединение не держит выход процесса
+        assert all(t.daemon for t in leaked)
+    finally:
+        for t in leaked:  # упавший тест не должен вешать выход процесса
+            if t.is_alive():
+                t._stop_running()
+
+
 def test_pool_sets_statement_and_lock_timeouts(monkeypatch):
     """Пул asyncpg без таймаутов: один зависший запрос или ожидание чужого
     FOR UPDATE держало соединение вечно, и пул кончался. Таймауты едут в
