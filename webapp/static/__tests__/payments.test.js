@@ -131,6 +131,15 @@ describe('подпись ожидающей оплаты в «Долгах»', (
       .toBe('на карту 7 130 USD — ждёт проверки банка');
   });
 
+  it('кнопка «Подтвердить» считает только безнал — наличные закрывает сдача', () => {
+    // Прод-баг 16.09: заказ целиком наличными показывал «Подтвердить 0 USD».
+    expect(H.payConfirmable({ pending: 400, confirmable: 0, cash_pending: 400 })).toBe(0);
+    expect(H.payConfirmable({ pending: 12130, confirmable: 7130, cash_pending: 5000 })).toBe(7130);
+    // Старый ответ без поля — как раньше, по всей ждущей сумме.
+    expect(H.payConfirmable({ pending: 100 })).toBe(100);
+    expect(H.payConfirmable({})).toBe(0);
+  });
+
   it('сдача показывает заказы с валютой: «#27 — 5 000 USD»', () => {
     expect(norm(H.payDepositOrdersText([{ order_id: 27, amount_allocated: 5000, currency: 'USD' }]))).toBe('#27 — 5 000 USD');
     expect(H.payDepositOrdersText([])).toBe('—');

@@ -542,6 +542,53 @@ def test_api_deposit_double_submit_and_card_shows_orders(db, client):
     assert pending[0]["is_own"] is True and pending[0]["currency"] == "USD"
 
 
+def test_cash_only_order_is_not_offered_for_button_confirmation(db, client):
+    """Прод-баг 16.09: заказ, оплаченный ЦЕЛИКОМ наличными, висел в «Деньги →
+    Подтвердить» карточкой «Подтвердить 0 USD».
+
+    Подтверждать там было нечего (наличные закрывает сдача в кассу), а нажатие
+    засчитало бы деньги мимо сдачи: платёж ушёл бы в confirmed, и сама сдача
+    после этого уже не подтвердилась бы (confirm_deposit_parts_locked требует
+    pending у платежей своих строк) — деньги повисли бы между двумя экранами.
+    """
+    oid = _order(db, status="shipped")
+    _record(oid, [_cash(12130)])
+    _post(client, MGR, "/api/deposits/create", amount=12130, currency="USD", idempotency_key="dep-cash")
+
+    # 1) Карточки на экране «Подтвердить» нет вовсе — сдача показана отдельно.
+    body = _post(client, BOSS, "/api/payments/pending").json()
+    assert [r for r in body["pending"] if r["order_id"] == oid] == []
+
+    # 2) Даже прямой вызов ручки (устаревшая карточка в открытом WebApp) наличные
+    #    не трогает: платёж остаётся pending и ждёт подтверждения сдачи.
+    r = _post(client, BOSS, "/api/orders/confirm_payment", order_id=oid, idempotency_key="cnf-cash")
+    assert r.status_code == 200
+    assert (r.json()["confirmed_count"], r.json()["skipped_cash"]) == (0, 1)
+    assert [p["status"] for p in _rows(db, "SELECT status FROM payments WHERE order_id = ?", (oid,))] == ["pending"]
+
+    # 3) Сдачу после этого по-прежнему можно подтвердить — она и закрывает заказ.
+    dep = _rows(db, "SELECT id FROM cash_deposits ORDER BY id DESC LIMIT 1")[0]["id"]
+    ok = _post(client, BOSS, "/api/deposits/confirm", deposit_id=dep, idempotency_key="dep-ok")
+    assert ok.status_code == 200, ok.text
+    assert [p["status"] for p in _rows(db, "SELECT status FROM payments WHERE order_id = ?", (oid,))] == ["confirmed"]
+
+
+def test_mixed_order_confirms_only_the_card_part(db, client):
+    """Смешанная оплата: кнопка подтверждает безнал, наличные ждут сдачи."""
+    oid = _order(db, status="shipped")
+    _record(oid, [_cash(5000), _card(7130)])
+
+    row = next(r for r in _post(client, BOSS, "/api/payments/pending").json()["pending"]
+               if r["order_id"] == oid)
+    assert (row["confirmable"], row["cash_pending"]) == (7130.0, 5000.0)
+
+    r = _post(client, BOSS, "/api/orders/confirm_payment", order_id=oid, idempotency_key="cnf-mix")
+    assert (r.json()["confirmed_count"], r.json()["skipped_cash"]) == (1, 1)
+    got = sorted((p["status"], p["amount_cents"]) for p in
+                 _rows(db, "SELECT status, amount_cents FROM payments WHERE order_id = ?", (oid,)))
+    assert got == [("confirmed", 713_000), ("pending", 500_000)]
+
+
 def test_api_debts_wording_numbers_in_every_state(db, client):
     # 1) Вся оплата ждёт: после подтверждения долг 0 (прод-случай «Ждёт 12к / Осталось 0»).
     full = _order(db, status="shipped")

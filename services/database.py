@@ -7587,12 +7587,21 @@ async def confirm_all_pending_payments_for_order(
     confirmed_by: int,
     confirmed_by_name: str,
 ) -> int:
-    """Босс одной кнопкой подтверждает ВСЕ pending платежи по заказу.
+    """Босс одной кнопкой подтверждает pending платежи по заказу — КРОМЕ наличных.
 
     Удобно: при частичных оплатах у заказа могут висеть несколько
     pending payments (менеджер отмечал по очереди). Босс не хочет
     кликать каждый отдельно — этот хелпер закрывает их пачкой.
     Возвращает кол-во подтверждённых.
+
+    **Наличные пропускаются.** У них свой путь: менеджер сдаёт деньги в кассу,
+    и подтверждение сдачи (`confirm_cash_deposit`) подтверждает их платежи
+    одной транзакцией. Подтвердить их ещё и этой кнопкой значило бы засчитать
+    деньги, которых в кассе может не быть, а сдачу потом уже не подтвердить
+    (`confirm_deposit_parts_locked` отказывает, если платёж строки не pending) —
+    деньги повисали бы между двумя экранами. Ручка `/api/orders/confirm_payment`
+    считает то же самое для уведомлений (`skipped_cash`), но решает здесь:
+    фильтр на границе с БД, а не в одном из вызывающих.
 
     Если после серии confirm'ов сумма confirmed достигла order.total —
     заказ автоматически закроется через _maybe_close_order_after_payment.
@@ -7604,6 +7613,10 @@ async def confirm_all_pending_payments_for_order(
 
     payments = await get_payments_for_order(order_id)
     pending = [p for p in payments if p["status"] == "pending"]
+    methods = await order_payments.parts_by_payment([int(p["id"]) for p in pending])
+    pending = [
+        p for p in pending if (methods.get(int(p["id"])) or {}).get("method") != "cash"
+    ]
     # Права — по всей пачке ДО первого подтверждения: иначе отказ на середине
     # оставил бы заказ подтверждённым наполовину.
     if pending:

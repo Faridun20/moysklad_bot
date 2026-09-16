@@ -8851,7 +8851,7 @@ function paymentCardsHtml(payPending, ctx) {
       <div class="debt-card debt-awaiting" data-pay="${d.order_id}">
         <div class="debt-card-top">
           <div class="debt-agent">${icon('building')} ${escapeHtml(d.agent_name || '—')}</div>
-          <div class="debt-amount">${fmt(d.confirmable != null ? d.confirmable : d.pending)} ${escapeHtml(d.currency || 'USD')}</div>
+          <div class="debt-amount">${fmt(payConfirmable(d))} ${escapeHtml(d.currency || 'USD')}</div>
         </div>
         <div class="debt-card-mid">
           <span class="debt-meta">Заказ #${d.order_id} · из ${fmt(d.total)} ${escapeHtml(d.currency || 'USD')} · ${escapeHtml(d.full_name || '')}</span>
@@ -8861,10 +8861,12 @@ function paymentCardsHtml(payPending, ctx) {
             .map(p => `<span>• ${escapeHtml(payPartLine(p))}</span>`).join('')}</div>` : `
           <div class="debt-hint">Способ оплаты не указан (запись до разбивки)</div>`}
         ${d.recorded_by_me && !isBoss && !confirmersExist ? `<div class="debt-hint">Оплату вносили вы: руководителя и бухгалтера в системе нет, поэтому подтверждаете вы — это попадёт в журнал.</div>` : ''}
+        ${payConfirmable(d) > 0 ? `
         <div class="debt-actions">
-          <button class="btn-confirm-pay pay-confirm" data-id="${d.order_id}">${icon('check')} Подтвердить ${fmt(d.confirmable != null ? d.confirmable : d.pending)} ${escapeHtml(d.currency || 'USD')}</button>
+          <button class="btn-confirm-pay pay-confirm" data-id="${d.order_id}">${icon('check')} Подтвердить ${fmt(payConfirmable(d))} ${escapeHtml(d.currency || 'USD')}</button>
           <button class="btn-reject-pay pay-reject" data-id="${d.order_id}">${icon('close')} Отклонить</button>
-        </div>
+        </div>` : `
+        <div class="debt-hint">Наличные подтверждаются сдачей в кассу — карточка сдачи ниже. Этой кнопкой их засчитывать нельзя.</div>`}
       </div>
   `).join('');
 }

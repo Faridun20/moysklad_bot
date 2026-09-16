@@ -2343,6 +2343,11 @@ async def api_payments_pending(request: Request):
             float(p["amount"]) for p in payments
             if p["status"] == "pending" and int(p["id"]) not in cash_pending_ids
         )
+        # Подтверждать нечего: вся сумма — наличные, их закрывает сдача в кассу
+        # (своя карточка ниже на том же экране). Карточка с «Подтвердить 0 USD»
+        # не просто бесполезна — она предлагала засчитать деньги мимо сдачи.
+        if confirmable <= 0:
+            continue
         result.append(
             {
                 "order_id": o["id"],

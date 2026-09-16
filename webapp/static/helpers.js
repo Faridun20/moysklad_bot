@@ -1042,6 +1042,15 @@
     return `${what} — ${PAY_STATE_LABEL[p.state] || p.state}`;
   }
 
+  // Сколько по заказу подтверждает кнопка «Подтвердить» на экране «Деньги →
+  // Подтвердить»: только безнал. Наличные закрывает сдача в кассу, и сервер их
+  // из этой суммы уже вычел (`confirmable`). Фолбэк на `pending` — для старых
+  // ответов без поля; тогда нуля не бывает и кнопка ведёт себя как раньше.
+  function payConfirmable(d) {
+    const n = Number((d || {}).confirmable != null ? d.confirmable : (d || {}).pending);
+    return Number.isFinite(n) ? n : 0;
+  }
+
   // ─── Куда поступили: карты и счета (services/pay_accounts.py) ────────────
   const PAY_ACCOUNT_KIND = {
     card: { title: 'На какую карту', add: 'Новая карта', empty: 'Карт пока нет — добавьте новую',
@@ -1488,7 +1497,7 @@
     leadFunnelHtml, firstTouchHtml, replySpeedHtml, durationLabel, postEffectLabel,
     whMoney, whQty, whStockBadge,
     PAY_METHODS, PAY_METHOD_LABEL, PAY_STATE_LABEL, payCents, payRate, payRateCurrency, payConvert,
-    payMoney, payPreview, payPartLine, payAwaitingText, payHandoverHtml, payHandoverOrdersHtml,
+    payMoney, payPreview, payPartLine, payConfirmable, payAwaitingText, payHandoverHtml, payHandoverOrdersHtml,
     PAY_ACCOUNT_KIND, payAccountItems, payDefaultAccountId, payAccountPrefill, payAccountFormError,
     payAccountFieldHtml, payMissingAccount, payAccountsManagerHtml,
     payHandoverPicked, payDepositOrdersText,
