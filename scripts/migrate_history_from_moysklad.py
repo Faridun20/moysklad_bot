@@ -364,8 +364,14 @@ async def pull_currencies() -> list[dict]:
     (кратность и обратный курс меняют смысл числа).
     """
     rows = await fetch_paged("entity/currency", page=100)
+    # Архивные валюты без фильтра не приходят, а старые документы на них ссылаются.
+    rows += await fetch_paged("entity/currency", {"filter": "archived=true"}, page=100)
+    seen: set[str] = set()
     out = []
     for c in rows:
+        if str(c.get("id") or _href_id(c)) in seen:
+            continue
+        seen.add(str(c.get("id") or _href_id(c)))
         out.append(
             {
                 "ms_id": str(c.get("id") or _href_id(c)),

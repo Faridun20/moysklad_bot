@@ -198,9 +198,14 @@ async def pull_currency_isos() -> dict[str, str]:
     """{uuid валюты МС: ISO-код}. В цене товара валюта — только ссылка.
 
     `name` у валюты МС — «сум»/«доллар», не ISO; код лежит в `isoCode`.
+    Архивные валюты тоже: `entity/currency` без фильтра их не отдаёт, а цены
+    товаров на них ссылаются (прод 16.09: 20 товаров с ценой в архивном USD
+    приехали бы без цены).
     """
     out: dict[str, str] = {}
-    for c in await _fetch_all("entity/currency"):
+    active = await _fetch_all("entity/currency")
+    archived = await _fetch_all("entity/currency", {"filter": "archived=true"})
+    for c in [*active, *archived]:
         ms_id = _meta_id(c)
         iso = str(c.get("isoCode") or "").upper()
         if ms_id and iso:

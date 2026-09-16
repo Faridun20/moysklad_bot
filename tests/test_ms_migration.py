@@ -602,7 +602,9 @@ def test_pull_products_parses_ms_json_with_prices(mig, monkeypatch, caplog):
                    "name": "доллар", "isoCode": "USD"}]
 
     async def fake_fetch_all(path, params=None):
-        return {"entity/product": raw, "entity/currency": currencies}[path]
+        if path == "entity/currency":
+            return [] if params else currencies
+        return {"entity/product": raw}[path]
 
     monkeypatch.setattr(mig, "_fetch_all", fake_fetch_all)
     caplog.set_level("INFO")
@@ -626,3 +628,23 @@ def test_main_dry_run_prints_categories_and_writes_nothing(mig, monkeypatch, cap
     assert "ОТРИЦАТЕЛЬНЫЙ ОСТАТОК" in text and "дублей артикула: 1" in text
     assert "цены: не перенесено" in text
     assert _run(adb_core.fetchval("SELECT COUNT(*) FROM products")) == 0
+
+
+def test_price_in_archived_currency_is_kept(mig, monkeypatch):
+    """Прод 16.09: цена товара в архивном USD — entity/currency без фильтра его
+    не отдаёт, и 20 товаров приехали бы без цены."""
+    base = "https://api.moysklad.ru/api/remap/1.2/entity"
+    raw = [{"meta": {"href": f"{base}/product/uuid-p1"}, "id": "uuid-p1", "name": "Zic 68",
+            "salePrices": [_money(4400, USD_ID, "Цена продажи")]}]
+    archived = [{"meta": {"href": f"{base}/currency/{USD_ID}"}, "id": USD_ID,
+                 "name": "доллар", "isoCode": "USD", "archived": True}]
+
+    async def fake_fetch_all(path, params=None):
+        if path == "entity/currency":
+            return archived if (params or {}).get("filter") == "archived=true" else []
+        return {"entity/product": raw}[path]
+
+    monkeypatch.setattr(mig, "_fetch_all", fake_fetch_all)
+    products = _run(mig.pull_products())
+    assert products[0]["price"]["currency"] == "USD"
+    assert products[0]["price"]["sale_price_cents"] == 4400
