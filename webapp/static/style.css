@@ -2396,6 +2396,30 @@ body.nav-drawer-open { overflow: hidden; }
   opacity: 0.5;
   margin-left: 8px;
 }
+/* ─── Подсказки цены в форме позиции заказа (B7/D4) ────────────────────────
+   Ряд под полем цены: «Прошлый раз: 45 USD (12.09)», «Цена: 50 USD»,
+   «Постоянным: 44 USD». Подходящие по валюте — кнопки (тап подставляет),
+   чужая валюта — тот же вид, но приглушённый и без нажатия. */
+.price-hints {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+.price-hint {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--accent);
+  background: var(--info-bg);
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: var(--sp-2) var(--sp-3);
+  min-height: 32px;
+}
+.price-hint--other {
+  color: var(--text-mute);
+  background: var(--neutral-bg);
+}
 /* ─── Формы поверх экрана: страницей, как форма накладной ────────────────
    Раньше .c-overlay был окном по центру с затемнением (max-width 360px,
    max-height 82vh). На телефоне клавиатура поднималась и закрывала само окно:

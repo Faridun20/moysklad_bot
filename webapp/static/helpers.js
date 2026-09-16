@@ -1402,7 +1402,77 @@
       </div>`).join('')}</div>`;
   }
 
+  // ─── Подсказки цены в форме позиции заказа (B7/D4) ────────────────────────
+  // Вход — ответ `/api/orders/price_hint` ({last, default, wholesale}) и
+  // валюта, выбранная в форме. Выход — подсказки в порядке приоритета;
+  // первая подходящая по валюте становится префиллом.
+  //
+  // Порядок: «прошлый раз этому клиенту» → «цена товара» → пусто.
+  // «Для постоянных» в префилле НЕ участвует — это альтернатива в один тап:
+  // правил, кто постоянный, в проекте нет, и выдумывать их в v1 незачем.
+  //
+  // Валюта важнее подсказки: цена в UZS, подставленная в долларовый заказ,
+  // это не подсказка, а ошибка на два порядка. Подсказка с чужой валютой
+  // остаётся ВИДНОЙ (знать полезно), но не префиллит и не ставится тапом.
+  const PRICE_HINT_LABELS = {
+    last: 'Прошлый раз',
+    default: 'Цена',
+    wholesale: 'Постоянным',
+  };
+
+  function priceSuggestions(hint, currency) {
+    const cur = String(currency || '').toUpperCase();
+    const out = [];
+    for (const source of ['last', 'default', 'wholesale']) {
+      const s = hint && hint[source];
+      if (!s || s.price == null || !(Number(s.price) > 0)) continue;
+      const own = String(s.currency || '').toUpperCase();
+      // Цена без валюты трактуется как «в валюте формы»: в `product_prices`
+      // валюта появилась позже самих цен, у старых строк её нет.
+      const matches = !own || !cur || own === cur;
+      out.push({
+        source,
+        price: Number(s.price),
+        currency: own || cur || '',
+        date: s.date || '',
+        matches,
+        label: PRICE_HINT_LABELS[source],
+      });
+    }
+    return out;
+  }
+
+  // Что подставить в поле цены. Нечего — null, и поле остаётся пустым,
+  // ровно как до B7.
+  function pricePrefill(hint, currency) {
+    const s = priceSuggestions(hint, currency)
+      .find(x => x.matches && x.source !== 'wholesale');
+    return s ? s.price : null;
+  }
+
+  // Подпись подсказки: «Прошлый раз: 45 USD (12.09)».
+  function priceHintText(s) {
+    if (!s) return '';
+    const num = Number(s.price).toLocaleString('ru-RU', { maximumFractionDigits: 2 });
+    const cur = s.currency ? ` ${s.currency}` : '';
+    const date = s.date ? ` (${s.date})` : '';
+    return `${s.label}: ${num}${cur}${date}`;
+  }
+
+  // Ряд подсказок под полем цены. Подходящие по валюте — кнопки (тап
+  // подставляет), чужая валюта — просто текст.
+  function priceHintHtml(hint, currency) {
+    const list = priceSuggestions(hint, currency);
+    if (!list.length) return '';
+    return `<div class="price-hints">${list.map(s => (s.matches
+      ? `<button type="button" class="price-hint" data-price-hint="${s.source}"
+           data-price="${s.price}">${escapeHtml(priceHintText(s))}</button>`
+      : `<span class="price-hint price-hint--other">${escapeHtml(priceHintText(s))}</span>`
+    )).join('')}</div>`;
+  }
+
   return {
+    priceSuggestions, pricePrefill, priceHintText, priceHintHtml,
     escapeHtml, idemKey, formatDateRU, icon, opsAmount, plural,
     ROLE_ALSO_ACTS_AS, roleIn,
     parseAmount, parsePaymentItems, renderMoneyTotalsHtml, categoryTree, categoryMatches,

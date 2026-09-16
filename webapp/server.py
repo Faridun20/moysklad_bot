@@ -1515,6 +1515,10 @@ async def api_stock(request: Request):
             "folder_id": r["category"],
             "folder_name": r["category"],
             "sale_price": (pp.get("sale_price") if pp else None),
+            # B7: «цена для постоянных клиентов» — подсказка менеджеру в форме
+            # позиции, поэтому отдаётся всем, кто видит каталог (в отличие от
+            # себестоимости ниже).
+            "wholesale_price": (pp.get("wholesale_price") if pp else None),
         }
         if is_boss and pp:
             item["cost_price"] = pp.get("cost_price")
@@ -4549,12 +4553,14 @@ async def api_products_prices(request: Request):
 
 @app.post("/api/products/prices/set")
 async def api_products_prices_set(request: Request):
-    """Установить цену продажи (минимум) и/или себестоимость товара.
+    """Установить цену продажи (минимум), себестоимость и цену для
+    постоянных клиентов.
 
     Только admin/boss. Payload:
       {"initData": "...", "product_id": N, "product_name": "...",
-       "sale_price": 150.0, "cost_price": 100.0, "currency": "USD"}
-    sale_price/cost_price опциональны (null = не задавать/сбросить).
+       "sale_price": 150.0, "cost_price": 100.0,
+       "wholesale_price": 140.0, "currency": "USD"}
+    Все три цены опциональны (null = не задавать/сбросить).
     """
     from services import async_db as adb
 
@@ -4576,10 +4582,11 @@ async def api_products_prices_set(request: Request):
 
     sale_price = _opt_price("sale_price")
     cost_price = _opt_price("cost_price")
+    wholesale_price = _opt_price("wholesale_price")
     currency = (data.get("currency") or "").strip()
 
     ok, err = await adb.set_product_price(
-        ms_id, product_name, sale_price, cost_price, currency, user["id"]
+        ms_id, product_name, sale_price, cost_price, currency, user["id"], wholesale_price
     )
     if not ok:
         raise HTTPException(status_code=400, detail=err)
@@ -4589,7 +4596,8 @@ async def api_products_prices_set(request: Request):
         ((user.get("first_name") or "") + " " + (user.get("last_name") or "")).strip(),
         get_role(user["id"]),
         "product_price_set",
-        f"{ms_id} ({product_name}): sale={sale_price} cost={cost_price}",
+        f"{ms_id} ({product_name}): sale={sale_price} cost={cost_price} "
+        f"wholesale={wholesale_price}",
     )
     return JSONResponse({"ok": True, "product_id": ms_id})
 
@@ -7180,6 +7188,72 @@ async def api_orders_cancel(request: Request):
     return JSONResponse({"ok": True, "order_id": order_id})
 
 
+def _hint_date(created_at: str | None) -> str:
+    """`YYYY-MM-DD HH:MM:SS` → `DD.MM` для подписи подсказки. Год не пишем:
+    подсказка живёт рядом с полем ввода, и «12.09» читается с одного взгляда."""
+    raw = (created_at or "").strip()[:10]
+    parts = raw.split("-")
+    if len(parts) != 3:
+        return ""
+    return f"{parts[2]}.{parts[1]}"
+
+
+@app.post("/api/orders/price_hint")
+async def api_price_hint(request: Request):
+    """Подсказки цены для позиции заказа (B7/D4).
+
+    Отдаёт ТРИ необязательных числа, ничего не решая за менеджера:
+      • `last` — по какой цене этот контрагент уже покупал этот товар
+        (последняя по времени, `database.get_last_price_for_agent_product`);
+      • `default` — `product_prices.sale_price`, она же минимум;
+      • `wholesale` — `product_prices.wholesale_price` («для постоянных»).
+    Приоритет префилла выбирает фронт (`priceSuggestions` в helpers.js):
+    last → default → пусто; wholesale — альтернатива в один тап.
+
+    Только читает. Контрагент берётся из ЗАКАЗА (и заказ обязан быть своим,
+    как в add_item) — иначе ручка отвечала бы «сколько платит вот этот
+    клиент» на любой переданный agent_id.
+    """
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_orders_price_hint",
+        rate_limit_max=120,
+    )
+
+    from services import async_db as adb
+
+    product_ref = _product_ref(data, required=True)
+    order_id = _optional_id(data, "order_id")
+    if order_id is None:
+        raise HTTPException(status_code=400, detail="Не указан заказ")
+    order = await adb.get_order(order_id)
+    if not order or order["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Нет доступа")
+
+    out: dict = {"ok": True, "last": None, "default": None, "wholesale": None}
+
+    agent_id = (order.get("agent_id") or "").strip()
+    if agent_id and product_ref.isdigit():
+        last = await adb.get_last_price_for_agent_product(agent_id, int(product_ref))
+        if last:
+            out["last"] = {
+                "price": last["price"],
+                "currency": last["currency"],
+                "date": _hint_date(last["created_at"]),
+            }
+
+    pp = await adb.get_product_price(product_ref)
+    if pp:
+        currency = (pp.get("currency") or "").upper() or None
+        if pp.get("sale_price") is not None:
+            out["default"] = {"price": pp["sale_price"], "currency": currency}
+        if pp.get("wholesale_price") is not None:
+            out["wholesale"] = {"price": pp["wholesale_price"], "currency": currency}
+    return JSONResponse(out)
+
+
 @app.post("/api/orders/add_item")
 async def api_add_item(request: Request):
     data = await request.json()
@@ -7212,19 +7286,28 @@ async def api_add_item(request: Request):
     # PR C: минимальная цена продажи, заданная руководством. По карточке
     # товара → product_prices.sale_price. Если задана:
     #   • price не передан/0 → префилл sale_price (дефолт)
-    #   • price < sale_price → 400 (нельзя продать ниже минимума)
+    #   • price < минимума → 400 (нельзя продать ниже минимума)
+    #
+    # B7: «цена для постоянных клиентов» (`wholesale_price`) обычно НИЖЕ
+    # обычной, и жёсткий минимум по sale_price отвергал бы собственную
+    # подсказку формы. Поэтому пол — меньшая из двух заданных цен; дефолт
+    # префилла остаётся прежним (sale_price), чтобы старое поведение не
+    # поехало.
     product_ref = _product_ref(data)
     if product_ref:
         pp = await adb.get_product_price(product_ref)
         sale_min = pp.get("sale_price") if pp else None
-        if sale_min is not None:
-            if price <= 0:
-                price = float(sale_min)  # префилл дефолтом
-            elif price < float(sale_min):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Цена ниже минимальной ({sale_min:g})",
-                )
+        wholesale = pp.get("wholesale_price") if pp else None
+        floor = sale_min
+        if floor is not None and wholesale is not None:
+            floor = min(float(floor), float(wholesale))
+        if sale_min is not None and price <= 0:
+            price = float(sale_min)  # префилл дефолтом
+        elif floor is not None and price > 0 and price < float(floor):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Цена ниже минимальной ({floor:g})",
+            )
 
     # Все позиции одного ордера — в одной валюте. Пустой заказ валюту берёт
     # из позиции (и может сменить, если позиции удалили). Заказ с позициями

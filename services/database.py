@@ -732,6 +732,13 @@ def _table_ddls() -> list[str]:
             #   в заказ менеджер может поднять, но не опустить ниже.
             # cost_price — себестоимость: видна ТОЛЬКО boss/admin, нужна
             #   для расчёта прибыли. Может быть NULL (не задана).
+            # wholesale_price — «цена для постоянных клиентов» (B7): вторая
+            #   ПОДСКАЗКА в форме позиции, а не второй тариф. Правил, кто
+            #   «постоянный», в проекте нет и заводить их в v1 незачем —
+            #   менеджер выбирает подсказку сам. Колонка (а не sidecar):
+            #   это та же цена того же товара, таблица-двойник ради одного
+            #   поля хуже; существующую базу догоняет
+            #   `scripts/apply_legacy_columns --apply`.
             # Источник истины — руководство: задаётся через
             #   /api/products/prices/set.
             # `ms_id` — исторически UUID МойСклад, после перехода там лежит id
@@ -743,6 +750,7 @@ def _table_ddls() -> list[str]:
                 product_name  TEXT,
                 sale_price_cents BIGINT,
                 cost_price_cents BIGINT,
+                wholesale_price_cents BIGINT,
                 currency      TEXT,
                 updated_by    BIGINT,
                 updated_at    TEXT
@@ -3986,20 +3994,30 @@ def set_product_price(
     cost_price: float | None,
     currency: str | None,
     updated_by: int,
+    wholesale_price: float | None = None,
 ) -> tuple[bool, str | None]:
     """UPSERT цены товара. Возвращает (ok, error_msg).
 
-    sale_price и cost_price — опциональны (None = не задано), но если
-    заданы — валидируются через `validate_amount_in_currency` (>0, конечные,
-    потолок в эквиваленте базовой валюты).
+    sale_price, cost_price и wholesale_price — опциональны (None = не
+    задано), но если заданы — валидируются через
+    `validate_amount_in_currency` (>0, конечные, потолок в эквиваленте
+    базовой валюты).
     currency дефолтится в BASE_CURRENCY.
+
+    Запись ЗАМЕЩАЮЩАЯ (UPSERT всей строки): форма цен присылает все поля
+    сразу, и «не передал = стереть» здесь честнее, чем частичное слияние,
+    в котором сбросить цену нечем.
     """
     from config import BASE_CURRENCY
 
     ms_id = (ms_id or "").strip()
     if not ms_id:
         return False, "ms_id обязателен"
-    for label, val in (("sale_price", sale_price), ("cost_price", cost_price)):
+    for label, val in (
+        ("sale_price", sale_price),
+        ("cost_price", cost_price),
+        ("wholesale_price", wholesale_price),
+    ):
         if val is not None:
             ok, err = validate_amount_in_currency(val, currency)
             if not ok:
@@ -4007,32 +4025,42 @@ def set_product_price(
     cur_code = (currency or BASE_CURRENCY or "USD").upper()
     sale_c = money.to_cents(sale_price) if sale_price is not None else None
     cost_c = money.to_cents(cost_price) if cost_price is not None else None
+    whole_c = money.to_cents(wholesale_price) if wholesale_price is not None else None
     with get_conn() as conn:
         cur = get_cursor(conn)
         if USE_POSTGRES:
             cur.execute(
                 q(
                     "INSERT INTO product_prices "
-                    "(ms_id, product_name, sale_price_cents, cost_price_cents, currency, updated_by, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "(ms_id, product_name, sale_price_cents, cost_price_cents, "
+                    "wholesale_price_cents, currency, updated_by, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT (ms_id) DO UPDATE SET "
                     "product_name = EXCLUDED.product_name, "
                     "sale_price_cents = EXCLUDED.sale_price_cents, "
                     "cost_price_cents = EXCLUDED.cost_price_cents, "
+                    "wholesale_price_cents = EXCLUDED.wholesale_price_cents, "
                     "currency = EXCLUDED.currency, "
                     "updated_by = EXCLUDED.updated_by, "
                     "updated_at = EXCLUDED.updated_at"
                 ),
-                (ms_id, product_name or "", sale_c, cost_c, cur_code, updated_by, now_str()),
+                (
+                    ms_id, product_name or "", sale_c, cost_c, whole_c,
+                    cur_code, updated_by, now_str(),
+                ),
             )
         else:
             cur.execute(
                 q(
                     "INSERT OR REPLACE INTO product_prices "
-                    "(ms_id, product_name, sale_price_cents, cost_price_cents, currency, updated_by, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)"
+                    "(ms_id, product_name, sale_price_cents, cost_price_cents, "
+                    "wholesale_price_cents, currency, updated_by, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                 ),
-                (ms_id, product_name or "", sale_c, cost_c, cur_code, updated_by, now_str()),
+                (
+                    ms_id, product_name or "", sale_c, cost_c, whole_c,
+                    cur_code, updated_by, now_str(),
+                ),
             )
         conn.commit()
     with _product_price_lock:
@@ -4071,7 +4099,11 @@ def _price_row_major(row: dict | None) -> dict:
     if not row:
         return {}
     d = dict(row)
-    for major, cents in (("sale_price", "sale_price_cents"), ("cost_price", "cost_price_cents")):
+    for major, cents in (
+        ("sale_price", "sale_price_cents"),
+        ("cost_price", "cost_price_cents"),
+        ("wholesale_price", "wholesale_price_cents"),
+    ):
         c = d.get(cents)
         d[major] = float(money.from_cents(int(c))) if c is not None else None
     return d
@@ -4097,7 +4129,8 @@ def get_product_price(ms_id: str) -> dict | None:
             cur.execute(
                 q(
                     "SELECT ms_id, product_name, sale_price_cents, cost_price_cents, "
-                    "currency, updated_at FROM product_prices WHERE ms_id = ?"
+                    "wholesale_price_cents, currency, updated_at "
+                    "FROM product_prices WHERE ms_id = ?"
                 ),
                 (ms_id,),
             )
@@ -4122,7 +4155,8 @@ async def get_product_prices_by_ids(ms_ids: list[str]) -> dict[str, dict]:
         return {}
     placeholders = ", ".join(f"${i + 1}" for i in range(len(ids)))
     rows = await adb_core.fetch(
-        "SELECT ms_id, product_name, sale_price_cents, cost_price_cents, currency "
+        "SELECT ms_id, product_name, sale_price_cents, cost_price_cents, "
+        "wholesale_price_cents, currency "
         f"FROM product_prices WHERE ms_id IN ({placeholders})",
         *ids,
     )
@@ -4134,10 +4168,76 @@ async def get_product_prices_by_ids(ms_ids: list[str]) -> dict[str, dict]:
 async def get_all_product_prices() -> list[dict]:
     """Все заданные цены. Для admin-UI экрана «Цены». asyncpg Stage 9 (#21)."""
     rows = await adb_core.fetch(
-        "SELECT ms_id, product_name, sale_price_cents, cost_price_cents, currency, updated_at "
+        "SELECT ms_id, product_name, sale_price_cents, cost_price_cents, "
+        "wholesale_price_cents, currency, updated_at "
         "FROM product_prices ORDER BY product_name"
     )
     return [_price_row_major(r) for r in rows]
+
+
+# Статусы, в которых цена УЖЕ названа клиенту и годится в подсказку (B7).
+# Черновик не годится: его ещё правят, и своя же недонабранная строка
+# подсказывала бы сама себе. Отклонённое и отменённое не состоялось.
+LAST_PRICE_STATUSES = (
+    "pending",
+    "approved",
+    "shipped",
+    "paid",
+    "partially_returned",
+    "returned",
+)
+
+
+async def get_last_price_for_agent_product(agent_id: str, product_id: int) -> dict | None:
+    """Последняя цена, по которой ЭТОМУ контрагенту продавали ЭТОТ товар.
+
+    Нужна одной подсказке в форме позиции заказа («Прошлый раз: 45 USD
+    (12.09)») — на расчёты не влияет и никуда, кроме UI-дефолта, не едет.
+
+    Товар опознаём по `order_item_products` (связь позиции с карточкой
+    номенклатуры; `order_items.product_href` — legacy-строка и товар не
+    идентифицирует). Контрагент — `orders.agent_id`, там наш id строкой.
+
+    Индексов не добавляем: выборка упирается либо в
+    `idx_order_item_products_product`, либо в `idx_orders_agent_id` — оба
+    уже есть, остальное берётся по первичным ключам.
+
+    Возвращает {price_cents, price, currency, order_id, created_at} или
+    None, если истории нет.
+    """
+    agent = (agent_id or "").strip()
+    if not agent:
+        return None
+    try:
+        pid = int(product_id)
+    except (TypeError, ValueError):
+        return None
+    placeholders = ", ".join(f"${i + 3}" for i in range(len(LAST_PRICE_STATUSES)))
+    row = await adb_core.fetchrow(
+        "SELECT oi.price_cents AS price_cents, o.currency AS currency, "
+        "       o.created_at AS created_at, o.id AS order_id "
+        "FROM order_item_products oip "
+        "JOIN order_items oi ON oi.id = oip.item_id "
+        "JOIN orders o ON o.id = oip.order_id "
+        "WHERE o.agent_id = $1 AND oip.product_id = $2 "
+        f"  AND o.status IN ({placeholders}) "
+        "  AND oi.price_cents > 0 "
+        "ORDER BY o.created_at DESC, o.id DESC "
+        "LIMIT 1",
+        agent,
+        pid,
+        *LAST_PRICE_STATUSES,
+    )
+    if not row:
+        return None
+    cents = int(row["price_cents"])
+    return {
+        "price_cents": cents,
+        "price": float(money.from_cents(cents)),
+        "currency": (row["currency"] or "").upper() or None,
+        "order_id": row["order_id"],
+        "created_at": row["created_at"],
+    }
 
 
 def _invalidate_product_price_cache() -> None:

@@ -670,6 +670,7 @@ T3.3: бот срезан до того, чего нет в WebApp. Экраны
 | `/api/orders/requests` | POST | заявки на одобрение (только boss) |
 | `/api/orders/create` | POST | создать draft-заказ |
 | `/api/orders/add_item` | POST | добавить позицию |
+| `/api/orders/price_hint` | POST | подсказки цены позиции: прошлая цена этого клиента, цена товара, «для постоянных» |
 | `/api/orders/remove_item` | POST | удалить позицию |
 | `/api/orders/set_agent` | POST | выбрать клиента |
 | `/api/orders/submit` | POST | отправить на одобрение (тут принимаются payment_type + due_date) |
