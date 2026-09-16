@@ -57,6 +57,14 @@ async def gather_ops_summary() -> dict:
     low_stock_threshold = float(get_setting("low_stock_threshold", 5))
 
     stale = await get_stale_pending_orders(hours=stale_hours)
+    # «Заявки ждут решения» — только те, по которым руководитель действительно
+    # нужен (скидка выше порога, долг сверх лимита). Заявку без этого менеджер
+    # отгружает сам, решение по ней не ждут.
+    from services.order_workflow import requests_needing_decision
+
+    if stale:
+        deciding = {int(r["order_id"]) for r in await requests_needing_decision()}
+        stale = [o for o in stale if int(o["id"]) in deciding]
     deposits = await get_pending_cash_deposits()
     returns = await get_pending_returns()
     overdue = await get_overdue_undeposited_orders(days=cash_days)

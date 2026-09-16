@@ -290,6 +290,27 @@ def test_stale_request_card_is_settled_not_left_alive(db):
     assert db.get_shipment_request(req_id)["status"] == "approved"
 
 
+def test_old_approve_button_on_request_shipped_by_manager_answers_clearly(db):
+    """Одобрение отгрузки больше не обязательно: менеджер отгрузил заказ сам, а
+    у руководителя в чате осталась старая карточка «Новая заявка» с кнопками.
+    Нажатие «Одобрить» — понятный алерт и неактивный исход, а не ошибка."""
+    from handlers.orders import cb_approve_request, request_approve_keyboard
+    from services.order_workflow import approve_shipment_request
+
+    _, req_id = _pending_request(db)
+    # Так заявку проводит «Отгрузить» (`ship_order_now`): одобряет сам автор.
+    assert _run(approve_shipment_request(req_id, MGR, "Manager", None, without_approval=True,
+                                         notify_manager=False))["ok"]
+
+    bot = _Bot()
+    call = _Call(f"req_ok:{req_id}", message=_Message(markup=request_approve_keyboard(req_id), bot=bot))
+    _run(cb_approve_request(call, bot))
+
+    assert call.alerts and call.alerts[0][1].get("show_alert")
+    assert _disabled_texts(call.message.reply_markup) == ["🚚 Менеджер отгрузил сам"]
+    assert not any(cb.startswith("req_") for cb in _callbacks(call.message.reply_markup))
+
+
 def test_return_to_draft_prompt_force_reply_and_abort_restores_card(db):
     from handlers.orders import (
         ReturnToDraft,

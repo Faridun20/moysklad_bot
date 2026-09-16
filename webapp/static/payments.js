@@ -7,10 +7,13 @@
 // escapeHtml, formatMoney). Точки входа из app.js — через
 // `typeof payX === 'function'`.
 //
-// Поток (требование владельца): заказ «оплата сразу» одобрен → менеджер ПЕРЕД
-// отгрузкой вносит строки «способ · валюта · сумма (· курс)», итог обязан
-// совпасть с суммой к оплате → только тогда «Отгрузить». Наличные остаются у
-// менеджера до сдачи в кассу, карта и перечисление ждут проверки банка.
+// Поток (требование владельца): заказ «оплата сразу» менеджер ПЕРЕД отгрузкой
+// вносит строками «способ · валюта · сумма (· курс)», итог обязан совпасть с
+// суммой к оплате → только тогда отгрузка. Одобрение отгрузки не обязательно:
+// у черновика и заявки без решения (`ctx.with_shipment`) оплата и отгрузка
+// уходят ОДНИМ запросом `/api/orders/ship` с `parts` — сервер записывает деньги
+// только вместе с оформлением отгрузки. Наличные остаются у менеджера до сдачи в
+// кассу, карта и перечисление ждут проверки банка.
 //
 // Карта и перечисление указывают, КУДА пришли деньги: карта (последние 4 цифры
 // и владелец) или расчётный счёт (фирма и номер) из справочника «Карты и счета»
@@ -21,7 +24,8 @@
 // ─── Форма «Как получены деньги» ───────────────────────────────────────────
 
 // ship — после записи сразу отгрузить (кнопка «Внести оплату и отгрузить»).
-async function payOpenForm({ orderId, ship = false, onDone }) {
+// terms — условия оплаты черновика из редактора ({payment_type, due_date}).
+async function payOpenForm({ orderId, ship = false, terms = null, onDone }) {
   let ctx;
   try {
     ctx = await api('/api/orders/payment_context', { order_id: orderId });
@@ -29,9 +33,9 @@ async function payOpenForm({ orderId, ship = false, onDone }) {
     toast(e.message, 'error');
     return;
   }
-  if (!ctx.open) { toast('Оплату вносят по одобренному, ещё не оплаченному заказу', 'error'); return; }
+  if (!ctx.open) { toast('Оплату вносят по заказу, который ещё не отгружен или не оплачен полностью', 'error'); return; }
   if (!(ctx.due_cents > 0)) {
-    if (ship) return payShip(orderId, onDone);
+    if (ship) return payShip(orderId, onDone, terms);
     toast('По заказу нечего вносить: всё оплачено или ждёт подтверждения', 'info');
     return;
   }
@@ -64,6 +68,19 @@ async function payOpenForm({ orderId, ship = false, onDone }) {
         if (r.method !== 'cash' && r.account_id) out.account_id = Number(r.account_id);
         return out;
       });
+      if (ship && ctx.with_shipment) {
+        // Черновик или заявка без решения: оплата и отгрузка — одним запросом,
+        // сервер запишет деньги только вместе с оформлением отгрузки.
+        const shipped = await apiResult('/api/orders/ship', {
+          order_id: ctx.order_id, parts, idempotency_key: key, ...(terms || {}),
+        });
+        if (!shipped.ok) { showErr(shipped.error); return false; }
+        haptic('success');
+        sheet.close();
+        tg.showAlert(`Заказ #${ctx.order_id} отгружен`);
+        if (onDone) await onDone();
+        return false;
+      }
       const res = await apiResult('/api/orders/payment', { order_id: ctx.order_id, parts, idempotency_key: key });
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
@@ -169,8 +186,8 @@ async function payOpenForm({ orderId, ship = false, onDone }) {
   draw();
 }
 
-async function payShip(orderId, onDone) {
-  const res = await apiResult('/api/orders/ship', { order_id: orderId, idempotency_key: idemKey() });
+async function payShip(orderId, onDone, terms) {
+  const res = await apiResult('/api/orders/ship', { order_id: orderId, idempotency_key: idemKey(), ...(terms || {}) });
   if (res.ok) {
     haptic('success');
     tg.showAlert(`Заказ #${orderId} отгружен`);

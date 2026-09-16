@@ -199,7 +199,7 @@
     '/api/returns/goods_received': ['admin', 'boss', 'warehouse_keeper'],
     '/api/returns/create': ['admin', 'boss', 'warehouse_keeper', 'manager'],
     '/api/orders/create': ['admin', 'boss', 'manager'],
-    '/api/orders/ship': ['admin', 'boss', 'warehouse_keeper'],
+    '/api/orders/ship': ['admin', 'boss', 'manager', 'warehouse_keeper'],
     '/api/orders/cancel': ['admin', 'boss'],
     '/api/orders/delete_draft': ['admin', 'boss', 'manager'],
     '/api/orders/requests': ['admin', 'boss'],

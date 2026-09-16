@@ -104,11 +104,20 @@ def env(isolated_db, monkeypatch):
     return TestClient(server.app), order
 
 
-def test_boss_pages_through_filtered_orders(env):
+def test_boss_pages_through_filtered_orders(env, monkeypatch):
+    from services import order_workflow
+
     client, order = env
     approved = [order("approved", day=f"2026-09-{d:02d}") for d in range(1, 6)]
-    order("pending", day="2026-09-03")
+    pending = order("pending", day="2026-09-03")
     order("shipped", day="2026-09-04")
+
+    # Счётчик «Заявки на рассмотрении» у руководителя — заявки, которые ждут
+    # его решения (скидка/лимит), а не все pending: одобрение не обязательно.
+    async def needing():
+        return [{"id": 1, "order_id": pending, "reasons": [{"code": "discount", "text": "скидка"}]}]
+
+    monkeypatch.setattr(order_workflow, "requests_needing_decision", needing)
 
     body = {"initData": "100", "limit": 2, "statuses": ["approved"]}
     r1 = client.post("/api/orders", json={**body, "offset": 0}).json()

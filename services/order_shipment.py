@@ -117,6 +117,77 @@ async def _resolve_products(items: list[dict]) -> tuple[list[dict], list[str]]:
     return positions, skipped
 
 
+def _fmt_qty(value: float) -> str:
+    return f"{float(value):g}"
+
+
+async def preflight(order_id: int, items: list[dict]) -> dict:
+    """Проверить ДО оформления отгрузки, что заказ спишется со склада целиком.
+
+    Раньше этот рубеж стоял после одобрения руководителя: списание не прошло —
+    заказ всё равно одобрен и висит в «нужна доделка». Когда менеджер отгружает
+    сам, отказ лучше получить, пока заказ ещё черновик и его можно поправить.
+    Остаток читается без замка — это ранний понятный ответ; решает, как и
+    прежде, `ship_order` под замком склада (между проверкой и списанием товар
+    могли забрать — тогда отгрузка откажет `stock_not_written_off`).
+
+    `{ok: True}` либо `{ok: False, code, reason}`; коды — `no_items`,
+    `unlinked_positions`, `insufficient_stock` и отказы формы накладной
+    (`warehouse._normalize_items`: один товар дважды с разной ценой и т.п.).
+    """
+    positions, skipped = await _resolve_products(items)
+    if skipped:
+        names = ", ".join(f"«{n}»" for n in skipped[:5])
+        more = f" и ещё {len(skipped) - 5}" if len(skipped) > 5 else ""
+        return {
+            "ok": False,
+            "code": "unlinked_positions",
+            "reason": (
+                f"Позиции не связаны с товаром из каталога: {names}{more}. Удалите их и "
+                "добавьте товар из каталога — иначе склад их не спишет"
+            ),
+        }
+    if not positions:
+        return {"ok": False, "code": "no_items", "reason": "В заказе нет товаров — добавьте товар из каталога"}
+    try:
+        merged = warehouse._normalize_items(positions, "outgoing")
+    except warehouse.InvoiceError as e:
+        return {"ok": False, "code": e.code, "reason": e.message}
+
+    need = {int(p["product_id"]): float(p["quantity"]) for p in merged}
+    warehouse_id = await warehouse.resolve_order_warehouse(int(order_id))
+    ids = sorted(need)
+    placeholders = ", ".join(f"${i + 2}" for i in range(len(ids)))
+    rows = await adb_core.fetch(
+        f"SELECT product_id, quantity FROM stock WHERE warehouse_id = $1 AND product_id IN ({placeholders})",
+        warehouse_id, *ids,
+    )
+    have = {int(r["product_id"]): float(r["quantity"] or 0) for r in rows}
+    short = [pid for pid in ids if have.get(pid, 0.0) < need[pid]]
+    if not short:
+        return {"ok": True}
+    name_rows = await adb_core.fetch(
+        "SELECT id, name FROM products WHERE id IN ("
+        + ", ".join(f"${i + 1}" for i in range(len(short))) + ")",
+        *short,
+    )
+    product_names = {int(r["id"]): str(r["name"]) for r in name_rows}
+    bits = [
+        f"«{product_names.get(pid, f'товар #{pid}')}»: нужно {_fmt_qty(need[pid])}, "
+        f"на складе {_fmt_qty(have.get(pid, 0.0))}"
+        for pid in short[:5]
+    ]
+    more = f" и ещё {len(short) - 5}" if len(short) > 5 else ""
+    return {
+        "ok": False,
+        "code": "insufficient_stock",
+        "reason": (
+            f"Не хватает товара на складе — {'; '.join(bits)}{more}. "
+            "Оформите приход или уменьшите количество в заказе"
+        ),
+    }
+
+
 async def _remember_failure(order_id: int, error: str) -> None:
     stamp = now_str()
     updated = await adb_core.execute(

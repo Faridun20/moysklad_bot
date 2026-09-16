@@ -8206,8 +8206,24 @@ def _decide_shipment_request(
 
 
 def approve_shipment_request(
-    req_id: int, approved_by: int, approved_name: str, *, credit_override: bool = False
+    req_id: int, approved_by: int, approved_name: str, *, credit_override: bool = False,
+    without_approval: bool = False,
 ) -> ShipmentDecision:
+    """`without_approval` — заявку проводит не руководитель, а сама отгрузка
+    (`order_workflow.ship_order_now`: одобрение отгрузки больше не обязательно).
+    Переход тот же, меняется только запись в журнале — одобрения там не было."""
+    if without_approval:
+        action = "shipment_auto_approved"
+        text = (
+            f"Заявка #{req_id}: отгрузка оформлена без одобрения руководителя "
+            "(заказ #{req[order_id]} от {req[full_name]})"
+        )
+    else:
+        action = "shipment_approved"
+        text = (
+            f"Заявка #{req_id} одобрена "
+            "(заказ #{req[order_id]} от {req[full_name]})"
+        )
     return _decide_shipment_request(
         req_id,
         approved_by,
@@ -8215,11 +8231,8 @@ def approve_shipment_request(
         credit_override_by=approved_by if credit_override else None,
         req_status="approved",
         order_status="approved",
-        audit_action="shipment_approved",
-        audit_text=(
-            f"Заявка #{req_id} одобрена "
-            "(заказ #{req[order_id]} от {req[full_name]})"
-        ),
+        audit_action=action,
+        audit_text=text,
     )
 
 

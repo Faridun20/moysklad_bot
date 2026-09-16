@@ -242,6 +242,53 @@ def test_cancel_crash_after_stock_reversal_rolls_back_on_postgres(pg, monkeypatc
     assert stock() == 10
 
 
+# ─── 5. «Отгрузить» без одобрения: двойное нажатие ───────────────────────────
+
+
+def test_parallel_ship_without_approval_writes_off_and_takes_money_once(pg):
+    """Два одновременных «Внести оплату и отгрузить» по черновику на Postgres:
+    одна заявка, одна накладная, остаток списан один раз, оплата записана один
+    раз, заказ отгружен."""
+    from services import container_receipt, warehouse
+    from services.order_workflow import ship_order_now
+
+    db = pg
+    db.set_role(200, "mgr2", "Manager", "manager")
+    _exec(db, "INSERT INTO counterparties (name, type, phone, created_at) VALUES (?, ?, ?, ?)",
+          ("Клиент", "customer", "", db.now_str()))
+    pid = _run(container_receipt.create_product("Кабель"))["product_id"]
+    wid = _run(warehouse.default_warehouse_id())
+    _run(warehouse.create_invoice(invoice_type="incoming", warehouse_id=wid,
+                                  items=[{"product_id": pid, "quantity": 10, "price_cents": None}]))
+    oid = db.create_order(200, "Manager", "")
+    db.update_order_agent(oid, "1", "Клиент")
+    db.add_order_item(oid, "Кабель", "", 2, "шт", 5.0, product_id=pid)
+    cash = [{"method": "cash", "currency": "USD", "amount": "10"}]
+
+    async def both():
+        return await asyncio.gather(*(
+            ship_order_now(oid, 200, "Manager", None, actor_role="manager", payment_type="paid", parts=cash)
+            for _ in range(2)
+        ))
+
+    results = _run(both())
+    assert any(r["ok"] for r in results), results
+
+    def one(sql):
+        with db.get_conn() as conn:
+            cur = db.get_cursor(conn)
+            cur.execute(sql, (oid,) if "%s" in sql else ())
+            return cur.fetchone()
+
+    assert _run(db.get_order(oid))["status"] == "shipped"
+    assert float(one(f"SELECT SUM(quantity) AS q FROM stock WHERE product_id = {int(pid)}")["q"]) == 8
+    assert int(one("SELECT COUNT(*) AS c FROM shipment_requests WHERE order_id = %s")["c"]) == 1
+    assert int(one("SELECT COUNT(*) AS c FROM invoices WHERE type = 'outgoing'")["c"]) == 1
+    paid = one("SELECT COALESCE(SUM(amount_cents), 0) AS c FROM payments WHERE order_id = %s "
+               "AND status IN ('pending', 'confirmed')")
+    assert int(paid["c"]) == 1000
+
+
 # ─── 6. Закрыть день: два пересчёта одной кассы ──────────────────────────────
 
 

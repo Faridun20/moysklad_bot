@@ -5,9 +5,9 @@
 накладную на отгрузку создать, чтобы показать клиенту — вот, вот такая. И
 такой возможности не существует. Сначала отгрузить, потом появляется
 накладная». Здесь проверяется обратный, правильный порядок: собрал заказ →
-показал счёт → и только потом заявка и отгрузка.
+показал счёт → и только потом отгрузка (одобрение не обязательно).
 
-Счёт при этом НИЧЕГО не двигает: между «собрал» и «отправил заявку» остаток
+Счёт при этом НИЧЕГО не двигает: между «собрал» и «отгрузил» остаток
 склада обязан остаться прежним, а накладных не появиться. Юнит-сторож того же
 инварианта — `tests/test_sales_invoice.py`.
 """
@@ -35,7 +35,7 @@ def _open_details(page) -> None:
         toggle.click()
 
 
-def test_manager_shows_the_invoice_before_the_request_and_then_ships(open_app, e2e):
+def test_manager_shows_the_invoice_before_shipping_and_then_ships(open_app, e2e):
     pytest.importorskip("weasyprint", reason="нет weasyprint/системных pango")
     ids = e2e.ids
     stock_before = _stock(e2e)
@@ -97,27 +97,24 @@ def test_manager_shows_the_invoice_before_the_request_and_then_ships(open_app, e
     printed = e2e.rows("SELECT action FROM audit_log WHERE action = 'sales_invoice_sent'")
     assert len(printed) == 1, "у руководителя есть история: счёт клиенту показывали"
 
-    # А теперь — как раньше: заявка, одобрение, списание остатка.
+    # А теперь — отгрузка: менеджер сам, «Внести оплату и отгрузить» (без
+    # одобрения руководителя), остаток списан.
     go(mgr, "sales")
     mgr.locator(".btn-edit-order").first.click()
     mgr.wait_for_selector("#btn-submit:not([disabled])")
     mgr.click("#btn-submit")
-    mgr.wait_for_function("() => window.__tgAlerts.some(a => a.includes('отправлена'))")
+    mgr.wait_for_selector(".c-overlay .pay-part")
+    mgr.click(".c-overlay #ms-submit")
+    mgr.wait_for_function("() => window.__tgAlerts.some(a => a.includes('отгружен'))")
 
-    boss = open_app(ids["boss"])
-    go(boss, "sales")
-    boss.click("#show-requests")
-    boss.wait_for_selector(".btn-approve")
-    boss.click(".btn-approve")
-    boss.wait_for_function("() => window.__tgAlerts.some(a => a.includes('одобрена'))")
-
-    assert e2e.rows("SELECT status FROM orders WHERE id = ?", (order_id,))[0]["status"] == "approved"
+    assert e2e.rows("SELECT status FROM orders WHERE id = ?", (order_id,))[0]["status"] == "shipped"
     assert e2e.rows("SELECT invoice_id FROM order_shipment WHERE order_id = ?", (order_id,))[0]["invoice_id"]
     assert _stock(e2e) == stock_before - 2, "остаток списала отгрузка, а не счёт"
 
     # После отгрузки счёт остаётся — это просто копия того же документа.
     go(mgr, "sales")
     tab(mgr, "orders")
+    settled(mgr)
     # «Счёт на оплату» — в подробной сводке карточки.
     _open_details(mgr)
     mgr.wait_for_selector(".btn-sales-invoice")

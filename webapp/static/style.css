@@ -1596,6 +1596,9 @@ body.nav-drawer-open { overflow: hidden; }
 .order-pay--ok     { background: var(--success-bg); color: var(--success); }
 .order-pay--wait   { background: var(--info-bg);    color: var(--info); }
 .order-pay--bad    { background: var(--danger-bg);  color: var(--danger); }
+/* Длинная строка состояния («Ждёт решения руководителя: скидка 50% при пороге
+   15%», причина доработки) переносится внутри карточки, а не уезжает за край. */
+.order-pay--note   { white-space: normal; max-width: 100%; }
 
 /* Кредит-контекст клиента в заявке (босс решает об апруве не уходя в Лимиты). */
 .credit-ctx {

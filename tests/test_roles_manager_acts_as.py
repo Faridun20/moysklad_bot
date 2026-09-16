@@ -73,7 +73,8 @@ def test_manager_gains_exactly_keeper_and_bookkeeper_endpoints():
         # менеджер пока бухгалтер — экран и журнал помечают «подтвердил сам».
         "/api/orders/confirm_payment",
         "/api/orders/reject_payment",
-        "/api/orders/ship",
+        # «/api/orders/ship» здесь больше нет: одобрение отгрузки не обязательно,
+        # и менеджер отгружает свой заказ по собственному праву (`allowed_roles`).
         "/api/payments/pending",
         "/api/payments/unlinked",
         "/api/returns/goods_received",

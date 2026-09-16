@@ -336,9 +336,25 @@ def pay_form(page: Page, open_selector: str, rows: list[tuple], *, submit: bool 
         page.click(".c-overlay #ms-submit")
 
 
+def require_decision(e2e: E2E, price: float = 100.0) -> None:
+    """Заявки на кабель ждут решения руководителя: прайс вдвое выше цены
+    заказа — скидка 50% выше порога (15%).
+
+    Одобрение отгрузки не обязательно (`order_workflow.ship_order_now`): в
+    «Решениях», очереди «Сегодня» и счётчике «Заявки на рассмотрении» числятся
+    только заявки со скидкой выше порога или долгом сверх лимита. Сценарии
+    экрана решений заводят заявку именно такой. Прайс — ещё и минимальная цена
+    в редакторе (`/api/orders/add_item`): после этого вызова позицию дешевле
+    через браузер не добавить."""
+    ok, err = e2e.db.set_product_price(
+        str(e2e.ids["product"]), "Кабель ВВГ 3x2.5", price * 2, None, "USD", e2e.ids["boss"]
+    )
+    assert ok, err
+
+
 def seed_order(e2e: E2E, *, payment_type: str = "credit", due_date: str | None = "2030-01-15",
                qty: float = 2, price: float = 100.0, approve: bool = True,
-               pay: str | None = "card") -> dict:
+               pay: str | None = "card", needs_decision: bool = False) -> dict:
     """Заказ менеджера на «Ромашку» через сервисы (не через браузер).
 
     Нужен сценариям, которые начинаются ПОСЛЕ продажи: оплата, сдача, возврат,
@@ -346,11 +362,16 @@ def seed_order(e2e: E2E, *, payment_type: str = "credit", due_date: str | None =
     из них — оплачивать полминуты браузера за то, что и так проверено.
     «Оплата сразу» после одобрения получает разбивку `pay` на всю сумму (как
     сделал бы менеджер перед отгрузкой); `pay=None` — без неё (форма в тесте).
+    `needs_decision` — заявка со скидкой выше порога (`require_decision`): она
+    ждёт руководителя в «Решениях»; без неё заявку отгружает сам менеджер.
+    Одобрение (`approve`) такой заявки идёт с подтверждением скидки.
     Возвращает {order_id, req_id, counterparty_id}.
     """
     from services.order_workflow import approve_shipment_request, submit_order
 
     db, ids = e2e.db, e2e.ids
+    if needs_decision:
+        require_decision(e2e, price)
     cp = e2e.rows("SELECT id FROM counterparties ORDER BY id LIMIT 1")[0]["id"]
     oid = db.create_order(ids["mgr"], "Manager", "")
     db.update_order_agent(oid, str(cp), "ООО Ромашка")
@@ -358,7 +379,9 @@ def seed_order(e2e: E2E, *, payment_type: str = "credit", due_date: str | None =
     res = e2e.run(submit_order(oid, ids["mgr"], "Manager", payment_type=payment_type, due_date=due_date))
     assert res.get("ok"), res
     if approve:
-        ap = e2e.run(approve_shipment_request(res["req_id"], ids["boss"], "Boss", e2e.bot))
+        # С подтверждением скидки: прайс выше цены мог поставить и другой
+        # `seed_order(needs_decision=True)` того же сценария.
+        ap = e2e.run(approve_shipment_request(res["req_id"], ids["boss"], "Boss", e2e.bot, discount_ack=True))
         assert ap.get("ok"), ap
         if payment_type == "paid" and pay:
             pay_order(e2e, oid, [(pay, qty * price)])

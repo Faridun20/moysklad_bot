@@ -384,6 +384,108 @@ describe('форма перед отгрузкой «оплаты сразу»',
   });
 });
 
+describe('отгрузка без одобрения: черновик и заявка без решения', () => {
+  const CTX = {
+    order_id: 27, agent_name: 'Ромашка', status: 'draft', payment_type: 'paid', currency: 'USD',
+    total_cents: 1213000, due_cents: 1213000, exact: true, base_currency: 'USD', currencies: ['USD', 'UZS'],
+    cbu: { UZS: '12700' }, parts: [], open: true, with_shipment: true,
+    pay_accounts: { accounts: [], last_used: {}, can_add: true },
+  };
+
+  it('«Внести оплату и отгрузить» у черновика: форма → ОДИН запрос /api/orders/ship с разбивкой и условиями', async () => {
+    const w = boot(`
+      currentUser = { role: 'manager', user_id: 42 };
+      window.__calls = [];
+      api = async (p) => (${JSON.stringify(CTX)});
+      apiResult = async (p, b) => { window.__calls.push([p, b]); return { ok: true, status: 200, body: { ok: true, status: 'shipped' } }; };
+      window.__done = 0;
+      window.__ready = payOpenForm({ orderId: 27, ship: true, terms: { payment_type: 'paid', due_date: null },
+        onDone: () => { window.__done += 1; } });
+    `);
+    await w.__ready;
+    const doc = w.document;
+    expect(norm(doc.querySelector('.c-overlay').textContent)).toContain('Оплата перед отгрузкой');
+    expect(doc.querySelector('#ms-submit').disabled).toBe(false);   // сумма предзаполнена
+    doc.querySelector('#ms-submit').click();
+    await flush(); await flush(); await flush();
+    // Записи оплаты отдельным запросом нет: сервер пишет деньги вместе с отгрузкой.
+    expect(w.__calls.map(c => c[0])).toEqual(['/api/orders/ship']);
+    const [, body] = w.__calls[0];
+    expect(body).toMatchObject({ order_id: 27, payment_type: 'paid', due_date: null,
+      parts: [{ method: 'cash', currency: 'USD', amount: '12130' }] });
+    expect(body.idempotency_key).toBeTruthy();
+    expect(w.__alerts.some(a => a.includes('Заказ #27 отгружен'))).toBe(true);
+    expect(w.__done).toBe(1);
+  });
+
+  it('отказ сервера (решение руководителя) остаётся в форме текстом', async () => {
+    const w = boot(`
+      currentUser = { role: 'manager', user_id: 42 };
+      api = async (p) => (${JSON.stringify(CTX)});
+      apiResult = async () => ({ ok: false, status: 409,
+        body: { code: 'decision_required', detail: 'Нужно решение руководителя: скидка 20% при пороге 15%' },
+        error: 'Нужно решение руководителя: скидка 20% при пороге 15%' });
+      window.__ready = payOpenForm({ orderId: 27, ship: true, terms: { payment_type: 'paid', due_date: null } });
+    `);
+    await w.__ready;
+    const doc = w.document;
+    doc.querySelector('#ms-submit').click();
+    await flush(); await flush();
+    expect(norm(doc.querySelector('#ms-error').textContent)).toContain('скидка 20% при пороге 15%');
+    expect(w.__alerts.some(a => a.includes('отгружен'))).toBe(false);
+  });
+
+  it('кнопка редактора: «в долг» отгружается сразу, «оплата сразу» открывает форму, скидка — предлагает заявку', async () => {
+    const w = boot(`
+      currentUser = { role: 'manager', user_id: 42 };
+      window.__calls = [];
+      window.__answers = [];
+      renderOrders = async () => { window.__listed = (window.__listed || 0) + 1; };
+      api = async (p, b) => { window.__calls.push([p, b]); return p === '/api/orders/submit' ? { req_id: 9 } : ${JSON.stringify(CTX)}; };
+      apiResult = async (p, b) => { window.__calls.push([p, b]); return window.__answers.shift(); };
+      window.__setDraft = (d) => { currentDraftOrder = d; renderOrderEditor(); };
+      window.__draft = () => currentDraftOrder;
+    `);
+    const doc = w.document;
+    // В долг: один запрос, условия уходят с ним, черновик закрыт.
+    w.__setDraft({ id: 5, items: [{ name: 'Кабель', quantity: 2, price: 5, item_id: 1 }], agent_name: 'Ромашка',
+      payment_type: 'credit', due_date: '2099-12-31' });
+    expect(norm(doc.querySelector('#btn-submit').textContent)).toContain('Отгрузить');
+    w.__answers.push({ ok: true, status: 200, body: { ok: true } });
+    await w.shipDraftOrder();
+    expect(w.__calls[0][0]).toBe('/api/orders/ship');
+    expect(w.__calls[0][1]).toMatchObject({ order_id: 5, payment_type: 'credit', due_date: '2099-12-31' });
+    expect(w.__alerts).toContain('Заказ #5 отгружен');
+    expect(w.__draft()).toBeNull();
+
+    // Оплата сразу: подпись кнопки, отказ payment_required → форма оплаты.
+    w.__calls.length = 0;
+    w.__setDraft({ id: 6, items: [{ name: 'Кабель', quantity: 2, price: 5, item_id: 1 }], agent_name: 'Ромашка',
+      payment_type: 'paid' });
+    expect(norm(doc.querySelector('#btn-submit').textContent)).toContain('Внести оплату и отгрузить');
+    doc.querySelector('[data-pay="credit"]').click();
+    expect(norm(doc.querySelector('#btn-submit').textContent)).not.toContain('Внести оплату');
+    doc.querySelector('[data-pay="paid"]').click();
+    w.__answers.push({ ok: false, status: 409, body: { code: 'payment_required' }, error: 'сначала оплата' });
+    await w.shipDraftOrder();
+    await flush(); await flush();
+    expect(norm(doc.querySelector('.c-overlay').textContent)).toContain('Оплата перед отгрузкой');
+    expect(w.__draft().id).toBe(6);   // черновик не тронут
+
+    // Скидка выше порога: подтверждение → заявка руководителю.
+    w.__calls.length = 0;
+    w.__setDraft({ id: 7, items: [{ name: 'Кабель', quantity: 2, price: 5, item_id: 1 }], agent_name: 'Ромашка',
+      payment_type: 'credit', due_date: '2099-12-31' });
+    w.__answers.push({ ok: false, status: 409, body: { code: 'decision_required' },
+      error: 'Нужно решение руководителя: скидка 20% при пороге 15%' });
+    await w.shipDraftOrder();
+    await flush(); await flush();
+    expect(w.__alerts.some(a => a.startsWith('confirm:Нужно решение руководителя') && a.includes('Отправить заявку'))).toBe(true);
+    expect(w.__calls.map(c => c[0])).toEqual(['/api/orders/ship', '/api/orders/submit']);
+    expect(w.__alerts.some(a => a.includes('Заявка #9 отправлена руководителю'))).toBe(true);
+  });
+});
+
 describe('«Касса»: сдача наличных по заказам', () => {
   const ON_HAND = {
     ok: true, base_currency: 'USD', currencies: ['USD', 'UZS'],

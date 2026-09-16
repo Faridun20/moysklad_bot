@@ -1,9 +1,9 @@
 """E2E: «как получены деньги» — поток владельца от заявки до нулевого долга.
 
-1. «Оплата сразу» 12 130 USD: руководитель одобряет (видит цену и тип оплаты)
-   → менеджер перед отгрузкой вносит 5 000 наличными + 7 130 картой → отгрузка
-   → сдача 5 000 ложится на заказ («Заказы: #N») → руководитель подтверждает
-   сдачу и карту → долг 0.
+1. «Оплата сразу» 12 130 USD: менеджер сам, без одобрения руководителя, жмёт в
+   черновике «Внести оплату и отгрузить» → вносит 5 000 наличными + 7 130
+   картой → отгрузка (руководителю — уведомление) → сдача 5 000 ложится на
+   заказ («Заказы: #N») → руководитель подтверждает сдачу и карту → долг 0.
 2. «В долг»: отгрузка без денег → оплата перечислением + наличными сумами по
    курсу → карта подтверждена, наличные ждут сдачи → сдача в UZS закрывает.
 3. Руководителя нет (как на проде): карточка долга говорит однозначно, кто и
@@ -52,41 +52,45 @@ def _toast(page, text: str) -> None:
 
 def test_paid_order_split_payment_handover_and_confirmation_close_the_debt(open_app, e2e):
     ids = e2e.ids
-    seeded = seed_order(e2e, payment_type="paid", due_date=None, qty=1, price=12130.0, approve=False)
-    oid = seeded["order_id"]
-
-    # ── Руководитель: цена, сумма и тип оплаты прямо в заявке → одобрить.
+    db = e2e.db
+    cp = e2e.rows("SELECT id FROM counterparties ORDER BY id LIMIT 1")[0]["id"]
+    oid = db.create_order(ids["mgr"], "Manager", "")
+    db.update_order_agent(oid, str(cp), "ООО Ромашка")
+    db.add_order_item(oid, "Кабель ВВГ 3x2.5", "", 1, "м", 12130.0, product_id=ids["product"])
     boss = open_app(ids["boss"])
-    go(boss, "sales")
-    boss.click("#show-requests")
-    boss.wait_for_selector(".btn-approve")
-    card = _norm(boss.locator(".order-card").first.inner_text())
-    assert "Оплата сразу" in card and "× 12 130 USD = 12 130 USD" in card, card
-    _shot(boss, "01-boss-request-prices")
-    boss.click(".btn-approve")
-    boss.wait_for_function("() => window.__tgAlerts.some(a => a.includes('одобрена'))")
-    assert e2e.rows("SELECT COUNT(*) AS n FROM payments")[0]["n"] == 0, "одобрение деньги не заявляет"
 
-    # ── Менеджер: без оплаты не отгрузить — ни кнопкой, ни ручкой.
+    # ── Менеджер: черновик «оплата сразу» без оплаты не отгрузить — ни кнопкой,
+    # ни ручкой; одобрения руководителя ждать не нужно.
     mgr = open_app(ids["mgr"])
     go(mgr, "sales")
-    pay_btn = f'.btn-pay-order[data-id="{oid}"]'
-    mgr.wait_for_selector(pay_btn)
-    assert "Внести оплату и отгрузить" in mgr.locator(pay_btn).inner_text()
-    assert "Внесите оплату · 12 130 USD" in _norm(mgr.locator(f'.order-card[data-id="{oid}"]').inner_text())
-    assert mgr.locator(f'.btn-ship-order[data-id="{oid}"]').count() == 0
-    refused = _api(mgr, "/api/orders/ship", {"order_id": oid})
+    mgr.wait_for_selector(f'.btn-edit-order[data-id="{oid}"]')
+    _shot(mgr, "01-draft-card-before-shipping")
+    mgr.click(f'.btn-edit-order[data-id="{oid}"]')
+    mgr.wait_for_selector("#btn-submit:not([disabled])")
+    assert "Внести оплату и отгрузить" in mgr.locator("#btn-submit").inner_text()
+    refused = _api(mgr, "/api/orders/ship", {"order_id": oid, "payment_type": "paid"})
     assert refused["status"] == 409 and refused["body"]["code"] == "payment_required"
-    _shot(mgr, "02-order-card-needs-payment")
+    assert e2e.rows("SELECT status FROM orders WHERE id = ?", (oid,))[0]["status"] == "draft"
+    assert e2e.rows("SELECT COUNT(*) AS n FROM payments")[0]["n"] == 0
+    _shot(mgr, "02-editor-ship-button")
 
     # ── Разбивка: 5 000 наличными + 7 130 на карту → «Записать и отгрузить».
-    pay_form(mgr, pay_btn, [("cash", "5000"), ("card", "7130")], submit=False)
+    pay_form(mgr, "#btn-submit", [("cash", "5000"), ("card", "7130")], submit=False)
     assert "Сумма сходится" in mgr.locator(".c-overlay .pay-total").inner_text()
     assert mgr.locator(".c-overlay #ms-submit").is_enabled()
     _shot(mgr, "03-payment-form-split")
     mgr.click(".c-overlay #ms-submit")
     mgr.wait_for_function("(id) => window.__tgAlerts.some(a => a.includes('Заказ #' + id + ' отгружен'))", arg=str(oid))
     assert e2e.rows("SELECT status FROM orders WHERE id = ?", (oid,))[0]["status"] == "shipped"
+    assert e2e.rows("SELECT quantity FROM stock WHERE product_id = ?", (ids["product"],))[0]["quantity"] == 19
+    # Руководителю — уведомление об отгрузке: позиции, итог, как оплачено; без кнопок.
+    e2e.wait_for(lambda: any(
+        m["chat_id"] == ids["boss"] and f"Заказ #{oid} отгружен" in m["text"] for m in e2e.bot.messages
+    ))
+    note = next(m for m in e2e.bot.messages if m["chat_id"] == ids["boss"] and f"Заказ #{oid} отгружен" in m["text"])
+    assert "Кабель ВВГ 3x2.5 — 1 м × 12 130 USD = 12 130 USD" in note["text"]
+    assert "Оплата сразу: наличные 5 000 USD; на карту •••• 1234 (Фаридун М.) · 7 130 USD" in note["text"]
+    assert not note.get("reply_markup")
     assert e2e.rows("SELECT method, currency, amount_cents FROM payment_parts ORDER BY id") == [
         {"method": "cash", "currency": "USD", "amount_cents": 500_000},
         {"method": "card", "currency": "USD", "amount_cents": 713_000},
@@ -94,6 +98,7 @@ def test_paid_order_split_payment_handover_and_confirmation_close_the_debt(open_
     # Разбивка оплаты — в подробной сводке карточки (по умолчанию свёрнута).
     mgr.click(f'.order-card[data-id="{oid}"] [data-details-toggle]')
     mgr.wait_for_selector(f'.order-card[data-id="{oid}"] .order-parts')
+    _shot(mgr, "03b-order-card-after-shipping")
     parts = _norm(mgr.locator(f'.order-card[data-id="{oid}"] .order-parts').inner_text())
     assert "наличные 5 000 USD — у менеджера, ждут сдачи в кассу" in parts
     assert "на карту •••• 1234 (Фаридун М.) · 7 130 USD — ждёт проверки банка" in parts

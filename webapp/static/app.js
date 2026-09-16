@@ -4901,7 +4901,7 @@ function orderDateLabel(key) {
 const ORDERS_PAGE_SIZE = 50;
 
 // Фильтры статуса по роли. Боссу «черновики» бесполезны (это незавершённые
-// заявки менеджеров) — вместо них «отгружено»; менеджеру черновики нужны.
+// заказы менеджеров); менеджеру нужны и черновики, и «отгружено».
 // «Отменены» — оба исхода «продажа не состоялась»: заявку отклонили
 // (rejected) или одобренный заказ отменили (cancelled). Фильтр искал только
 // rejected, и отменённый боссом заказ не находился ни под одной кнопкой,
@@ -4921,6 +4921,9 @@ function orderFilters(isBoss) {
         { id: 'draft', label: 'Черновики', ic: 'edit' },
         { id: 'pending', label: 'Ждут', ic: 'clock' },
         { id: 'approved', label: 'Одобрены', ic: 'check' },
+        // Менеджер отгружает сам (одобрение не обязательно) — свои отгрузки
+        // ему нужны не меньше, чем руководству.
+        { id: 'shipped', label: 'Отгружены', ic: 'truck' },
         { id: 'rejected', label: 'Отменены', ic: 'close', statuses: CANCELLED_STATUSES },
       ];
 }
@@ -5128,11 +5131,14 @@ function renderOrdersMain(opts = {}) {
           if (o.frozen) bits.push(`<span class="order-pay order-pay--bad">${icon('snow')} Заморожен</span>`);
           // Скидка выше порога: менеджеру — чем занята заявка, в том же ряду
           // состояний, что «Внесите оплату» (services/order_discounts.py).
-          const dnote = o.discount_note || discountPendingNote(o.discount);
-          if (o.status === 'pending' && dnote)
-            bits.push(`<span class="order-pay order-pay--wait">${icon('alert')} ${escapeHtml(dnote)}</span>`);
+          // Заявка без решения (старая, «на одобрение») — её отгружают сами.
+          const dnote = o.decision_note || o.discount_note || discountPendingNote(o.discount);
+          if (o.status === 'pending' && o.needs_decision !== false && dnote)
+            bits.push(`<span class="order-pay order-pay--wait order-pay--note">${icon('alert')} ${escapeHtml(dnote)}</span>`);
+          else if (o.status === 'pending' && o.needs_decision === false)
+            bits.push(`<span class="order-pay order-pay--ok">${icon('check')} Одобрение не нужно — можно отгружать</span>`);
           if (o.status === 'draft' && o.rejection_comment)
-            bits.push(`<span class="order-pay order-pay--bad">${icon('return')} ${escapeHtml(o.rejection_comment)}</span>`);
+            bits.push(`<span class="order-pay order-pay--bad order-pay--note">${icon('return')} ${escapeHtml(o.rejection_comment)}</span>`);
           return bits.length ? `<div class="order-pay-row">${bits.join('')}</div>` : '';
         })()}
         ${(() => {
@@ -5180,12 +5186,19 @@ function renderOrdersMain(opts = {}) {
             <button class="btn-delete-draft" data-id="${o.id}">${icon('trash')} Удалить</button>
           </div>
         ` : ''}
-        ${o.status === 'approved' && o.needs_payment && (canShip || o.is_mine) ? `
+        ${o.status === 'pending' && o.needs_decision === false && (o.is_mine || (isBoss && workActionsVisible())) ? `
           <div class="draft-actions">
-            <button class="btn-confirm-pay btn-pay-order" data-id="${o.id}" data-ship="${canShip ? '1' : ''}">${icon('cash')} ${canShip ? 'Внести оплату и отгрузить' : 'Внести оплату'}</button>
+            ${o.payment_type === 'credit'
+              ? `<button class="btn-confirm-pay btn-ship-order" data-id="${o.id}">${icon('truck')} Отгрузить</button>`
+              : `<button class="btn-confirm-pay btn-pay-order" data-id="${o.id}" data-ship="1">${icon('cash')} Внести оплату и отгрузить</button>`}
           </div>
         ` : ''}
-        ${o.status === 'approved' && canShip && !o.needs_payment ? `
+        ${o.status === 'approved' && o.needs_payment && (canShip || o.is_mine) ? `
+          <div class="draft-actions">
+            <button class="btn-confirm-pay btn-pay-order" data-id="${o.id}" data-ship="1">${icon('cash')} Внести оплату и отгрузить</button>
+          </div>
+        ` : ''}
+        ${o.status === 'approved' && (canShip || o.is_mine) && !o.needs_payment ? `
           <div class="draft-actions">
             <button class="btn-confirm-pay btn-ship-order" data-id="${o.id}">${icon('truck')} Отгрузить</button>
           </div>
@@ -5745,7 +5758,7 @@ function renderOrderEditor() {
     <div class="editor-footer">
       <button class="btn-submit-order" id="btn-submit"
         ${order.items.length === 0 || !order.agent_name ? 'disabled' : ''}>
-        ${icon('check')} Отправить на одобрение
+        ${icon('truck')} <span id="btn-submit-label">${draftShipLabel(currentDraftOrder.payment_type)}</span>
       </button>
       ${order.items.length === 0 || !order.agent_name
         ? '<div class="editor-hint">Добавьте товары и выберите клиента</div>'
@@ -5833,6 +5846,9 @@ function renderOrderEditor() {
       });
       document.getElementById('due-date-wrap')
         .classList.toggle('hidden', value !== 'credit');
+      // «Оплата сразу» отгружается вместе с оплатой — кнопка говорит об этом.
+      const label = document.getElementById('btn-submit-label');
+      if (label) label.textContent = draftShipLabel(value);
       haptic();
     });
   });
@@ -5840,8 +5856,9 @@ function renderOrderEditor() {
     currentDraftOrder.due_date = e.target.value;
   });
 
-  // Отправить заявку
-  document.getElementById('btn-submit').addEventListener('click', submitOrder);
+  // Отгрузить. Одобрение не обязательно: руководителю уходит только заказ,
+  // по которому нужно его решение (скидка выше порога, долг сверх лимита).
+  document.getElementById('btn-submit').addEventListener('click', shipDraftOrder);
 }
 
 
@@ -6287,6 +6304,68 @@ function openQuantityInput(name, unit, maxStock, productId) {
   }
 }
 
+// Подпись главной кнопки черновика: «оплату сразу» отгружают вместе с оплатой.
+function draftShipLabel(paymentType) {
+  return (paymentType || 'paid') === 'credit' ? 'Отгрузить' : 'Внести оплату и отгрузить';
+}
+
+// Черновик ушёл из редактора (отгружен или стал заявкой): снимаем подтверждение
+// закрытия и возвращаемся в список.
+async function leaveShippedDraft() {
+  ordersData = null;
+  currentDraftOrder = null;
+  tg.disableClosingConfirmation && tg.disableClosingConfirmation();
+  await renderOrders();
+}
+
+// «Отгрузить» / «Внести оплату и отгрузить» из черновика. Одобрение отгрузки не
+// обязательно (решение владельца): сервер сам оформляет заявку, списывает склад
+// и отгружает (`order_workflow.ship_order_now`). Отказы с кодом:
+//   payment_required  — «оплата сразу»: открываем форму, отгрузка — вместе с ней;
+//   decision_required — скидка выше порога или долг сверх лимита: без
+//                       руководителя нельзя, предлагаем отправить заявку.
+// Черновик при этих отказах не меняется.
+async function shipDraftOrder() {
+  const draft = currentDraftOrder;
+  if (!draft) return;
+  const btn = document.getElementById('btn-submit');
+  const paymentType = draft.payment_type || 'paid';
+  const dueDate = draft.due_date || '';
+  if (paymentType === 'credit' && !dueDate) {
+    tg.showAlert('Заказ в долг — укажите, до какого числа клиент рассчитается');
+    return;
+  }
+  const terms = { payment_type: paymentType, due_date: paymentType === 'credit' ? dueDate : null };
+  // Ключ живёт с черновиком (как у заявки): повтор после обрыва связи не
+  // отгрузит второй раз, а отказ сервер не запоминает.
+  if (!draft.shipKey) draft.shipKey = idemKey();
+  if (btn) btn.disabled = true;
+  const res = await apiResult('/api/orders/ship', { order_id: draft.id, ...terms, idempotency_key: draft.shipKey });
+  if (res.ok) {
+    tg.HapticFeedback?.notificationOccurred('success');
+    tg.showAlert(`Заказ #${draft.id} отгружен`);
+    await leaveShippedDraft();
+    return;
+  }
+  if (btn) btn.disabled = false;
+  const code = res.body && res.body.code;
+  if (code === 'payment_required' && typeof payOpenForm === 'function') {
+    payOpenForm({ orderId: draft.id, ship: true, terms, onDone: leaveShippedDraft });
+    return;
+  }
+  tg.HapticFeedback?.notificationOccurred('error');
+  if (code === 'decision_required') {
+    tg.showConfirm(`${res.error}\n\nОтправить заявку на отгрузку руководителю?`, ok => {
+      if (ok) submitOrder();
+    });
+    return;
+  }
+  tg.showAlert('' + res.error);
+}
+
+// Заявка на отгрузку руководителю — только когда без его решения заказ не
+// отгрузить (скидка выше порога, долг сверх лимита): `shipDraftOrder` предлагает
+// её после отказа `decision_required`.
 async function submitOrder() {
   const btn = document.getElementById('btn-submit');
   const paymentType = currentDraftOrder.payment_type || 'paid';
@@ -6317,11 +6396,8 @@ async function submitOrder() {
     const dnote = result.discount_note || discountPendingNote(result.discount);
     tg.showAlert(`Заявка #${result.req_id} отправлена руководителю`
       + (dnote ? `\n⚠️ ${dnote}` : ''));
-    ordersData = null;
-    currentDraftOrder = null;
     // Черновик отправлен — снимаем подтверждение закрытия.
-    tg.disableClosingConfirmation && tg.disableClosingConfirmation();
-    await renderOrders();
+    await leaveShippedDraft();
   } catch (e) {
     tg.HapticFeedback?.notificationOccurred('error');
     tg.showAlert('' + e.message);
@@ -10563,9 +10639,10 @@ async function renderWhInvoiceList() {
   // приложения) — кнопка говорит об этом прямо, иначе человек не узнает, что
   // набранное цело.
   //
-  // Расход проводит только руководство (заявка → одобрение → накладная), и
-  // кнопки «Оформить отгрузку» у менеджера нет: она гарантированно ответила
-  // бы 403.
+  // Отгрузку клиенту менеджер оформляет из заказа («Отгрузить»: заявка,
+  // накладная, оплата — `order_workflow.ship_order_now`); ручная расходная
+  // накладная — только руководству, и кнопки «Оформить отгрузку» у менеджера
+  // нет: она гарантированно ответила бы 403.
   const pending = whDraftHasData(whDraft || formDrafts().load(WH_DRAFT));
   const canCreate = out ? whIsBoss() : true;
   const newLabel = pending
@@ -10607,7 +10684,7 @@ async function renderWhInvoiceList() {
       icon: out ? 'truck' : 'box',
       title: out ? 'Отгрузок пока не было' : 'Приходов пока не было',
       hint: out
-        ? 'Отгрузка клиенту идёт через заявку и одобрение руководителя'
+        ? 'Отгрузка клиенту оформляется из заказа: Продажи → заказ → «Отгрузить»'
         : 'Оформите первый приход — или примите контейнер',
     }) + exportRow);
     wireNew();

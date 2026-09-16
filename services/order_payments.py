@@ -1,7 +1,7 @@
 """
 «Как получены деньги» по заказу: разбивка оплаты по способам и валютам.
 
-Требование владельца: заказ «оплата сразу» после одобрения НЕ уезжает, пока
+Требование владельца: заказ «оплата сразу» НЕ уезжает, пока
 менеджер не ввёл, как клиент отдал деньги — наличными, на карту, перечислением
 на счёт, частями и в разных валютах. Долговой заказ отгружается без денег, но
 каждое поступление по нему тоже вводится разбивкой. «Чтобы потом не возникало
@@ -29,9 +29,8 @@
 
 Правила суммы (`settle_parts`):
 * «оплата сразу» — сумма разбивки обязана совпасть с тем, что по заказу ещё
-  причитается; меньше — отказ с текстом: условия «оплата сразу» одобрил
-  руководитель, и молча превратить недостачу в долг значит переписать его
-  решение (такой заказ возвращают на доработку и оформляют «в долг»);
+  причитается; меньше — отказ с текстом: молча превратить недостачу в долг
+  значит переписать условия заказа (такой заказ оформляют «в долг»);
 * «в долг» — любая часть, но не больше остатка;
 * пересчёт валют округляет каждую строку до цента, поэтому при строке в другой
   валюте допускается расхождение до 1 единицы базовой валюты, и оно
@@ -296,7 +295,7 @@ def settle_parts(calcs: list[PartCalc], due_cents: int, *, exact: bool, order_cu
         raise PaymentError(
             f"Не хватает {fmt_cents(due_cents - total, cur)}: заказ «оплата сразу» — сумма "
             f"должна совпасть с суммой к оплате ({fmt_cents(due_cents, cur)}). Если клиент часть "
-            "остался должен, это уже заказ «в долг» — его оформляют через доработку заявки",
+            "остался должен, это уже заказ «в долг»",
             code="short")
     target = due_cents if (exact or total > due_cents) else total
     diff = target - total
@@ -534,26 +533,10 @@ def _now() -> str:
     return now_str()
 
 
-async def record_payment_parts(order_id: int, actor: Actor, raw_parts: Any, *,
-                               idem_key: str | None = None,
-                               supersede_payment_ids: list[int] | None = None,
-                               require_account: bool = True) -> dict:
-    """Записать, как получены деньги по заказу. Одна транзакция на всё.
-
-    Возвращает {ok, order_id, payments: [...], parts: [...], total_cents,
-    currency, superseded: [payment_id], gap_cents}. Ошибки — `PaymentError`.
-
-    `supersede_payment_ids` — явная замена ожидающих платежей без способа
-    (разовый `scripts/migrate_payment_breakdown`: старая отметка оплаты по
-    заказу «в долг» раскладывается на строки). У «оплаты сразу» такие платежи
-    заменяются всегда.
-
-    Карта/перечисление — с `account_id` (куда пришли деньги): запись справочника
-    того же вида и не в архиве. `require_account=False` — только разовый перенос.
-    """
-    from services.database import idem_store_in
-    from services.debts import calc_claimable_cents, lock_orders
-
+async def _prepare_parts(order_id: int, actor: Actor, raw_parts: Any, *,
+                         require_account: bool = True) -> tuple[str, str, list[PartCalc], dict[int, dict]]:
+    """Разбор формы, права, пересчёт валют и карты/счета — всё, что проверяется
+    ДО транзакции записи. → (валюта заказа, базовая, строки, карты/счета)."""
     inputs = parse_parts(raw_parts, require_account=require_account)
     head = await adb_core.fetchrow(
         "SELECT id, user_id, currency, payment_type FROM orders WHERE id = $1", int(order_id)
@@ -576,6 +559,46 @@ async def record_payment_parts(order_id: int, actor: Actor, raw_parts: Any, *,
             accounts[inp.account_id] = await pay_accounts.check_for_method(inp.account_id, inp.method, row=n)
         except pay_accounts.AccountError as e:
             raise PaymentError(e.message, status=e.status, code=e.code) from e
+    return order_cur, base, calcs, accounts
+
+
+async def check_payment_parts(order_id: int, actor: Actor, raw_parts: Any, due_cents: int) -> None:
+    """Проверить разбивку «оплаты сразу» БЕЗ записи. Бросает `PaymentError`.
+
+    Для отгрузки черновика без одобрения (`order_workflow.ship_order_now`):
+    деньги по заказу записываются только после того, как он оформлен к
+    отгрузке, а узнать «сумма не сходится» или «выберите карту» надо до этого —
+    иначе заказ уже ушёл бы из черновика, а оплата так и не записалась.
+    Правила те же, что у `record_payment_parts`: сумма строк ровно равна
+    `due_cents`.
+    """
+    order_cur, base, calcs, _accounts = await _prepare_parts(order_id, actor, raw_parts)
+    settle_parts(calcs, int(due_cents), exact=True, order_currency=order_cur, base=base)
+
+
+async def record_payment_parts(order_id: int, actor: Actor, raw_parts: Any, *,
+                               idem_key: str | None = None,
+                               supersede_payment_ids: list[int] | None = None,
+                               require_account: bool = True) -> dict:
+    """Записать, как получены деньги по заказу. Одна транзакция на всё.
+
+    Возвращает {ok, order_id, payments: [...], parts: [...], total_cents,
+    currency, superseded: [payment_id], gap_cents}. Ошибки — `PaymentError`.
+
+    `supersede_payment_ids` — явная замена ожидающих платежей без способа
+    (разовый `scripts/migrate_payment_breakdown`: старая отметка оплаты по
+    заказу «в долг» раскладывается на строки). У «оплаты сразу» такие платежи
+    заменяются всегда.
+
+    Карта/перечисление — с `account_id` (куда пришли деньги): запись справочника
+    того же вида и не в архиве. `require_account=False` — только разовый перенос.
+    """
+    from services.database import idem_store_in
+    from services.debts import calc_claimable_cents, lock_orders
+
+    order_cur, base, calcs, accounts = await _prepare_parts(
+        order_id, actor, raw_parts, require_account=require_account
+    )
     now = _now()
     result: dict[str, Any] = {}
 

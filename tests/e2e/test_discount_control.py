@@ -3,7 +3,9 @@
 Сценарий: у товара есть прайс, заказ ушёл со скидкой 30% (порог 15%) →
 менеджер видит на своей карточке, чем занята заявка → руководитель видит в
 «Решениях» строку со скидкой и пометку порога → одобряет, подтвердив скидку
-отдельным вопросом → заказ одобрен, решение в журнале.
+отдельным вопросом → заказ одобрен, решение в журнале. Скидка ниже порога
+решения не требует: одобрение отгрузки не обязательно, заявку отгружает сам
+менеджер, и в «Решениях» её нет.
 
 Заказ заводится СЕРВИСОМ (`seed_order`), а не через редактор: ручка
 `/api/orders/add_item` держит прайс жёстким минимумом и позицию дешевле него
@@ -39,7 +41,13 @@ def test_boss_sees_flagged_discount_in_decisions_and_approves(open_app, e2e):
     # Строки товаров со скидкой — в подробной сводке карточки.
     mgr.click(f'.order-card[data-id="{seeded["order_id"]}"] [data-details-toggle]')
     mgr_text = mgr.inner_text("#content")
-    assert "Ждёт одобрения из-за скидки 30%" in mgr_text
+    assert "Ждёт решения руководителя: скидка 30% при пороге 15%" in mgr_text
+    card = mgr.locator(f'.order-card[data-id="{seeded["order_id"]}"]')
+    assert card.locator(".btn-ship-order, .btn-pay-order").count() == 0, "до решения не отгрузить"
+    # Строки с прайсом — в «Подробнее».
+    card.locator("[data-details-toggle]").click()
+    card.locator(".order-details:not([hidden])").wait_for()
+    mgr_text = mgr.inner_text("#content")
     assert "прайс 100 USD · скидка 30%" in mgr_text, mgr_text
 
     # Руководитель: скидка видна строкой и помечена порогом.
@@ -70,24 +78,29 @@ def test_boss_sees_flagged_discount_in_decisions_and_approves(open_app, e2e):
     )[0]["n"] == 1
 
 
-def test_discount_below_threshold_needs_no_second_tap(open_app, e2e):
-    """Скидка 4% при пороге 15%: видна, но вопроса про скидку нет."""
+def test_discount_below_threshold_needs_no_decision_manager_ships(open_app, e2e):
+    """Скидка 4% при пороге 15%: руководитель не нужен — в «Решениях» заявки
+    нет, менеджер отгружает сам («Внести оплату и отгрузить»)."""
     _set_price(e2e, 100.0)
     seeded = seed_order(e2e, payment_type="paid", qty=1, price=96.0, approve=False, pay=None)
+    oid = seeded["order_id"]
 
     boss = open_app(e2e.ids["boss"])
     go(boss, "decisions")
-    boss.wait_for_selector(".btn-approve")
     settled(boss)
-    card = boss.locator(f'.order-card[data-request="{seeded["req_id"]}"]')
-    assert "скидка 4%" in card.inner_text()
-    assert "нужно явное решение" not in card.inner_text()
+    assert boss.locator(f'.order-card[data-request="{seeded["req_id"]}"]').count() == 0
 
-    card.locator(".btn-approve").click()
-    boss.wait_for_function("() => window.__tgAlerts.some(a => a.includes('Заявка одобрена'))")
+    mgr = open_app(e2e.ids["mgr"])
+    go(mgr, "sales")
+    card = mgr.locator(f'.order-card[data-id="{oid}"]')
+    card.wait_for()
+    settled(mgr)
+    assert "Одобрение не нужно — можно отгружать" in card.inner_text()
+    card.locator(".btn-pay-order").click()
+    mgr.wait_for_selector(".c-overlay .pay-part")
+    mgr.click(".c-overlay #ms-submit")
+    mgr.wait_for_function(f"() => window.__tgAlerts.some(a => a.includes('Заказ #{oid} отгружен'))")
+    assert e2e.rows("SELECT status FROM orders WHERE id = ?", (oid,))[0]["status"] == "shipped"
     assert not boss.evaluate(
         "() => window.__tgAlerts.some(a => a.startsWith('confirm:') && a.includes('скидк'))"
     )
-    assert e2e.rows(
-        "SELECT status FROM orders WHERE id = ?", (seeded["order_id"],)
-    )[0]["status"] == "approved"

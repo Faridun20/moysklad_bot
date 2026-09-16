@@ -32,7 +32,11 @@ def _stock(e2e) -> float:
     return float(e2e.rows("SELECT quantity FROM stock WHERE product_id = ?", (e2e.ids["product"],))[0]["quantity"])
 
 
-def _manager_builds_credit_order(e2e, mgr, qty: str, price: str) -> int:
+def _manager_builds_credit_order(e2e, mgr, qty: str, price: str, *, expect: str = "отгружен") -> int:
+    """Менеджер собирает заказ «в долг» и жмёт «Отгрузить». Одобрение не
+    обязательно — заказ отгружается сразу (`expect="отгружен"`); при долге
+    сверх лимита «Отгрузить» отказывает, и менеджер соглашается отправить
+    заявку (`expect="отправлена"`, заглушка подтверждения отвечает «да»)."""
     go(mgr, "sales")
     mgr.click("#btn-new-order")
     mgr.wait_for_selector("#choose-agent")
@@ -52,7 +56,7 @@ def _manager_builds_credit_order(e2e, mgr, qty: str, price: str) -> int:
     mgr.fill("#due-date-input", "2030-01-15")
     mgr.wait_for_selector("#btn-submit:not([disabled])")
     mgr.click("#btn-submit")
-    mgr.wait_for_function("() => window.__tgAlerts.some(a => a.includes('отправлена'))")
+    mgr.wait_for_function("(n) => window.__tgAlerts.some(a => a.includes(n))", arg=expect)
     return int(e2e.rows("SELECT order_id FROM shipment_requests ORDER BY id DESC LIMIT 1")[0]["order_id"])
 
 
@@ -65,23 +69,18 @@ def _boss_approves(boss) -> None:
 
 
 def test_credit_day_from_order_to_closed_debt(open_app, e2e):
-    """Менеджер продаёт в кредит → босс одобряет → кладовщик отгружает →
-    менеджер вносит частичную оплату картой → босс подтверждает → менеджер сдаёт
-    остаток наличными → босс подтверждает сдачу → долга нет."""
+    """Менеджер продаёт в кредит и сам отгружает (одобрение не нужно, боссу —
+    уведомление) → вносит частичную оплату картой → босс подтверждает →
+    менеджер сдаёт остаток наличными → босс подтверждает сдачу → долга нет."""
     ids = e2e.ids
     mgr = open_app(ids["mgr"])
     oid = _manager_builds_credit_order(e2e, mgr, "2", "100")
-
-    boss = open_app(ids["boss"])
-    _boss_approves(boss)
     assert _stock(e2e) == 18
-
-    keeper = open_app(ids["keeper"])
-    go(keeper, "sales")
-    keeper.wait_for_selector(f'.btn-ship-order[data-id="{oid}"]')
-    keeper.click(f'.btn-ship-order[data-id="{oid}"]')
-    keeper.wait_for_function("() => window.__tgAlerts.some(a => /Заказ #\\d+ отгружен/.test(a))")
     assert e2e.rows("SELECT status FROM orders WHERE id = ?", (oid,))[0]["status"] == "shipped"
+    e2e.wait_for(lambda: any(
+        m["chat_id"] == ids["boss"] and f"Заказ #{oid} отгружен" in m["text"] and "В долг до" in m["text"]
+        for m in e2e.bot.messages
+    ))
 
     mgr = open_app(ids["mgr"])
     go(mgr, "money")
@@ -120,9 +119,16 @@ def test_credit_day_from_order_to_closed_debt(open_app, e2e):
 
 
 def test_boss_cancels_approved_order_and_stock_comes_back(open_app, e2e):
+    """Одобренный, но не отгруженный заказ бывает теперь после решения
+    руководителя: долг сверх лимита → заявка → «Одобрить с превышением»."""
+    from services.database import set_credit_limit
+
     ids = e2e.ids
+    cp = e2e.rows("SELECT id FROM counterparties")[0]["id"]
+    e2e.run(set_credit_limit(str(cp), "ООО Ромашка", 100.0, set_by=ids["boss"]))
     mgr = open_app(ids["mgr"])
-    oid = _manager_builds_credit_order(e2e, mgr, "5", "40")
+    oid = _manager_builds_credit_order(e2e, mgr, "5", "40", expect="отправлена")
+    assert _stock(e2e) == 20, "заявка склад не трогает"
     boss = open_app(ids["boss"])
     _boss_approves(boss)
     assert _stock(e2e) == 15

@@ -1365,7 +1365,9 @@ async def api_home(request: Request):
     }
 
     if is_boss:
-        pending = await adb.get_pending_requests()
+        from services.order_workflow import requests_needing_decision
+
+        pending = await requests_needing_decision()
         result["pending_requests"] = len(pending)
 
         # Дашборд «Требует внимания» (фронт уже рендерит data.attention): счётчики
@@ -3911,12 +3913,32 @@ async def api_orders(request: Request):
     ]
     gaps = await order_payments.payment_gap_cents(gap_ids) if gap_ids else {}
 
+    # Заявки без решения: одобрение отгрузки не обязательно, и «Отгрузить» на
+    # такой заявке есть, если руководитель по ней не нужен (скидка ниже порога,
+    # долг в лимите). Долги клиентов — батчем, как в «Решениях».
+    from services.order_workflow import decision_reasons_from, decision_text, orders_credit_context
+
+    pending_totals = {
+        o["id"]: sum(
+            float(it.get("quantity", 0)) * float(it.get("price", 0) or 0)
+            for it in items_by_order.get(o["id"], [])
+        )
+        for o in orders
+        if o.get("status") == "pending" and not o.get("credit_limit_override")
+    }
+    pending_credit = await orders_credit_context(
+        [(o, pending_totals[o["id"]]) for o in orders if o["id"] in pending_totals]
+    ) if pending_totals else {}
+
     result = []
     for o in orders:
         items = items_by_order.get(o["id"], [])
         total = sum(float(it.get("quantity", 0)) * float(it.get("price", 0) or 0) for it in items)
         discount = order_discounts.summarize(
             items, prices, o.get("currency"), threshold=discount_threshold
+        )
+        reasons = (
+            decision_reasons_from(discount, pending_credit.get(o["id"])) if o["status"] == "pending" else []
         )
         discount_lines = discount["lines"]
         entry = {
@@ -3962,6 +3984,12 @@ async def api_orders(request: Request):
             "discount_note": (
                 order_discounts.pending_note(discount) if o["status"] == "pending" else ""
             ),
+            # Заявка ждёт руководителя (скидка выше порога / долг сверх лимита).
+            # False у `pending` — старая заявка «на одобрение»: её отгружают сами.
+            "needs_decision": bool(reasons),
+            "decision_note": (
+                f"Ждёт решения руководителя: {decision_text(reasons)}" if reasons else ""
+            ),
             "items": [
                 {
                     # id позиции — им редактор удаляет строку (`/api/orders/remove_item`).
@@ -3994,6 +4022,13 @@ async def api_orders(request: Request):
             entry["profit"] = round(profit, 2)
             entry["profit_partial"] = partial  # True = часть позиций без cost
         result.append(entry)
+
+    if is_boss and page_meta:
+        # «Заявки на рассмотрении» — только те, что ждут решения: заявку без
+        # скидки и превышения лимита менеджер отгружает сам.
+        from services.order_workflow import requests_needing_decision
+
+        page_meta["pending_count"] = len(await requests_needing_decision())
 
     return JSONResponse(
         {
@@ -4253,7 +4288,12 @@ async def api_pending_requests(request: Request):
     from config import BASE_CURRENCY
     from services import async_db as adb
 
-    requests = await adb.get_pending_requests()
+    # Только заявки, которые ждут руководителя (скидка выше порога, долг сверх
+    # лимита): одобрение отгрузки больше не обязательно, остальные заявки
+    # отгружает сам менеджер (`order_workflow.requests_needing_decision`).
+    from services.order_workflow import requests_needing_decision
+
+    requests = await requests_needing_decision()
     # Батч-загрузка заказов и позиций — один SQL на каждое вместо 2N.
     order_ids = [r["order_id"] for r in requests]
     orders_by_id = await adb.get_orders_by_ids(order_ids) if order_ids else {}
@@ -4314,6 +4354,7 @@ async def api_pending_requests(request: Request):
         ctx = credit_ctx.get(r["order_id"])
         if ctx:
             entry["credit"] = ctx
+        entry["reasons"] = r.get("reasons") or []
         result.append(entry)
 
     return JSONResponse({"requests": result})
@@ -7436,14 +7477,23 @@ async def api_create_order(request: Request):
 
 @app.post("/api/orders/ship")
 async def api_orders_ship(request: Request):
-    """Босс/админ/кладовщик отмечает заказ отгруженным (approved → shipped).
-    Альтернатива МС-вебхуку. Уведомляем создателя заказа."""
+    """«Отгрузить»: из черновика, из заявки без решения или одобренный заказ.
+
+    Одобрение отгрузки больше не обязательно (решение владельца): вся цепочка —
+    заявка, накладная, оплата, отгрузка — в `order_workflow.ship_order_now`, тот
+    же код зовёт бот `/ship`. Здесь — HTTP: коды ответов и уведомления о
+    карте/перечислении. Черновику форма присылает `payment_type`/`due_date`, а
+    «оплате сразу» — разбивку `parts`. Отказ отдаётся JSON с `code`: фронт по
+    `payment_required` открывает форму оплаты, по `decision_required` —
+    предлагает отправить заявку руководителю.
+    """
     from services import async_db as adb
+    from services.order_workflow import ship_order_now
 
     data = await request.json()
     user = _authorize(
         data,
-        allowed_roles=("admin", "boss", "warehouse_keeper"),
+        allowed_roles=("admin", "boss", "manager", "warehouse_keeper"),
         rate_limit_scope="api_orders_ship",
     )
     try:
@@ -7451,7 +7501,6 @@ async def api_orders_ship(request: Request):
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Не выбран заказ — обновите список")
 
-    order = await adb.get_order(order_id)
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
     )
@@ -7459,30 +7508,44 @@ async def api_orders_ship(request: Request):
     cached = await idem.claim()
     if cached is not None:
         return JSONResponse(cached)
+    bot = await get_notify_bot()
     try:
-        res = await adb.mark_order_shipped(order_id, user["id"], name)
+        res = await ship_order_now(
+            order_id, user["id"], name, bot,
+            actor_role=get_role(user["id"]),
+            actor_username=f"@{user['username']}" if user.get("username") else "",
+            payment_type=data.get("payment_type"),
+            due_date=data.get("due_date"),
+            parts=data.get("parts") or None,
+        )
     except Exception:
         await idem.release()
         raise
     if not res.get("ok"):
         await idem.release()
-        if res.get("code") == "payment_required":
-            # Отдельный код: фронт по нему открывает форму «как получены деньги»,
-            # а не показывает голую ошибку.
-            return JSONResponse(
-                {"detail": res["error"], "code": res["code"], "gap_cents": res.get("gap_cents")},
-                status_code=409,
-            )
-        raise HTTPException(status_code=409, detail=res.get("error", "Не удалось отметить отгрузку — обновите экран и повторите"))
+        body = {"detail": res.get("error") or "Не удалось отметить отгрузку — обновите экран и повторите",
+                "code": res.get("code")}
+        for key in ("gap_cents", "reasons", "order_status"):
+            if res.get(key) is not None:
+                body[key] = res[key]
+        if res.get("discount") is not None:
+            body["discount"] = _discount_view(res["discount"])
+        return JSONResponse(body, status_code=int(res.get("http_status") or 409))
 
-    creator = order.get("user_id") if order else None
-    if creator and creator != user["id"]:
-        bot = await get_notify_bot()
-        try:
-            await bot.send_message(creator, f"🚚 Ваш заказ #{order_id} отгружен.")
-        except Exception:
-            logger.warning("order ship notify failed", exc_info=True)
-    resp = {"ok": True, "order_id": order_id}
+    # Карта и перечисление из разбивки — карточка подтверждающим, как у
+    # `/api/orders/payment` (фоном: отгрузка уже закоммичена).
+    payment = res.get("payment") or {}
+    if payment:
+        from services import order_payments
+        from utils.background import spawn
+
+        for part in payment.get("parts") or []:
+            if part["method"] in order_payments.NONCASH_METHODS:
+                spawn(
+                    _notify_bosses_payment_pending(order_id, name, part["payment_id"]),
+                    name="boss-payment-pending-notify",
+                )
+    resp = {"ok": True, "order_id": order_id, "status": "shipped"}
     await idem.store(resp)
     return JSONResponse(resp)
 
@@ -8473,6 +8536,13 @@ async def api_order_payment_context(request: Request):
 
     base = (BASE_CURRENCY or "USD").upper()
     ptype = order.get("payment_type") or "paid"
+    # Черновик и заявка без решения отгружаются вместе с оплатой
+    # (`order_workflow.ship_order_now`): форма открывается ДО оформления.
+    # У черновика её открывают только при «оплате сразу», выбранной в
+    # редакторе, — сохранённый тип оплаты мог остаться от прошлой доработки.
+    before_shipment = order.get("status") in ("draft", "pending")
+    if order.get("status") == "draft":
+        ptype = "paid"
     currency = (order.get("currency") or base).upper()
     if ptype == "paid":
         due = (await order_payments.payment_gap_cents([order_id])).get(order_id, 0)
@@ -8501,8 +8571,10 @@ async def api_order_payment_context(request: Request):
         "cbu": {c: fmt_rate(q) for c, q in quotes.items()},
         "methods": [[k, v] for k, v in order_payments.METHODS.items()],
         "parts": parts,
-        "open": order.get("status") in ("approved", "shipped", "partially_returned")
+        "open": order.get("status") in ("draft", "pending", "approved", "shipped", "partially_returned")
         and not order.get("paid_confirmed_at"),
+        # Запись оплаты идёт вместе с отгрузкой, одним запросом `/api/orders/ship`.
+        "with_shipment": before_shipment,
     })
 
 

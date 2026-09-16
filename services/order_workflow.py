@@ -8,9 +8,12 @@ Order state machine — единый источник правил перехо�
   - validate_transition() — синхронная проверка допустимости (без DB)
   - can_transition() — проверка прав роли на конкретный переход
   - approve_shipment_request() / reject_shipment_request() — полный
-    жизненный цикл апрува/реджекта одной заявки (DB + МойСклад +
+    жизненный цикл апрува/реджекта одной заявки (DB + накладная +
     уведомления + PDF). Вызывается и из bot handler'а, и из webapp
     endpoint — единственная точка истины.
+  - ship_order_now() — «Отгрузить» без одобрения: те же шаги (заявка,
+    одобрение, накладная, оплата, отгрузка) одной операцией менеджера;
+    руководитель нужен только при скидке выше порога или долге сверх лимита.
 """
 
 from __future__ import annotations
@@ -649,6 +652,8 @@ async def approve_shipment_request(
     *,
     discount_ack: bool = False,
     pdf_delivery: str = "background",
+    without_approval: bool = False,
+    notify_manager: bool = True,
 ) -> dict:
     """Полный апрув заявки: DB, склад, уведомления, PDF, авто-payment.
 
@@ -663,14 +668,19 @@ async def approve_shipment_request(
         discount_ack  — одобрить, несмотря на скидку выше порога
                         (`app_settings.order_discount_requires_approval_pct`,
                         services/order_discounts.py). Как и `override`, это
-                        ЯВНОЕ второе нажатие одобряющего, а не новый статус:
-                        нового «нельзя отгрузить» скидка не создаёт —
-                        заказ и так проходит одобрение.
+                        ЯВНОЕ второе нажатие одобряющего, а не новый статус.
         pdf_delivery  — "background": печатная форма собирается и
                         рассылается фоновой задачей ПОСЛЕ ответа (в
                         результате — `pdf_task`, его можно дождаться);
                         "inline": как раньше, внутри вызова. Отгрузка и
                         одобрение от режима не зависят.
+        without_approval — заявку проводит сама отгрузка
+                        (`ship_order_now`), а не решение руководителя: в журнал
+                        пишется «оформлена без одобрения».
+        notify_manager — слать ли менеджеру «Заявка одобрена» и боссу
+                        отдельное «склад не списан». `ship_order_now` отгружает
+                        в том же действии и отвечает человеку сам — сообщение
+                        «одобрено, внесите оплату» пришло бы уже после отгрузки.
 
     Возвращает dict:
         {
@@ -759,7 +769,8 @@ async def approve_shipment_request(
     # когда два босса одновременно жмут «Одобрить». Только один из них
     # получит rowcount==1, остальные — False.
     decision = await adb.approve_shipment_request(
-        req_id, boss_user_id, boss_name, credit_override=bool(override and over_info)
+        req_id, boss_user_id, boss_name, credit_override=bool(override and over_info),
+        without_approval=without_approval,
     )
     if not decision.applied:
         return {
@@ -887,7 +898,7 @@ async def approve_shipment_request(
                 "order_shipment_failed",
                 f"Заявка #{req_id}: {reason[:200]}",
             )
-            if bot is not None:
+            if bot is not None and notify_manager:
                 try:
                     await bot.send_message(
                         boss_user_id,
@@ -921,14 +932,17 @@ async def approve_shipment_request(
     # сказав, как клиент заплатил. Теперь заказ ждёт в «одобрен — к отгрузке»,
     # пока менеджер не введёт разбивку (services.order_payments), и только
     # после неё отгрузка (`mark_order_shipped`) проходит.
-    if order and not order_moved and (order.get("payment_type") or "paid") == "paid":
+    if (
+        notify_manager and order and not order_moved
+        and (order.get("payment_type") or "paid") == "paid"
+    ):
         demand_line += (
             "\n💳 <b>Оплата сразу:</b> перед отгрузкой внесите в WebApp, как клиент "
             "заплатил — наличные, карта или перечисление (Продажи → заказ → «Внести оплату»)."
         )
 
     # Уведомляем менеджера
-    if bot is not None and req.get("user_id"):
+    if bot is not None and notify_manager and req.get("user_id"):
         from services.notify import approved_order_keyboard, notify_order_approved
 
         payment_type = (order.get("payment_type") or "paid") if order and not order_moved else None
@@ -1102,3 +1116,318 @@ async def return_order_to_draft(
         "frozen": frozen,
         "rejection_count": rejection_count,
     }
+
+
+# ─── Отгрузка без одобрения ─────────────────────────────────────────────────
+#
+# Решение владельца (сентябрь 2026): «Одобрение отгрузки не нужно. Сам менеджер
+# отмечает, что отгрузил товар, боссу приходит уведомление». На решение
+# руководителя заказ уходит, только если без него нельзя: скидка к прайсу выше
+# порога (`services/order_discounts.py`) и долг клиента сверх кредитного лимита
+# (энфорс лимита — тот же `needs_override`, что и раньше при одобрении).
+#
+# Путь выбран такой: «Отгрузить» проводит ТЕ ЖЕ шаги, что раньше делали два
+# человека, — `submit_order` (CAS draft→pending, заявка), `approve_shipment_request`
+# (CAS pending→approved, расходная накладная под замком отгрузки, идемпотентно
+# по `order_shipment.order_id`), `order_payments.record_payment_parts` (под
+# `lock_orders`) и `database.mark_order_shipped` (CAS approved→shipped, проверка
+# оплаты). Нового ребра графа статусов нет, схема и CHECK'и прода не меняются, а
+# всё, что опирается на `approved` (резерв, «нужна доделка», отмена с возвратом
+# остатка, долги, сдачи, себестоимость по партиям), работает как было. Каждый
+# шаг — своя транзакция, поэтому операция ВОЗОБНОВЛЯЕМА: прервалась на середине
+# — заказ остался в `pending`/`approved`, и повторное «Отгрузить» продолжит с
+# того шага, на котором встало. Всё, что может отказать по вине формы (клиент,
+# позиции, остаток, сумма оплаты, решение руководителя), проверяется ДО первого
+# перехода: отказ оставляет черновик черновиком.
+
+DECISION_REQUIRED = "decision_required"
+
+
+def _fmt_base(amount: float) -> str:
+    from config import BASE_CURRENCY
+
+    return f"{money.format_cents(money.to_cents(amount or 0), decimals=0, sep=' ')} {BASE_CURRENCY}"
+
+
+def decision_reasons_from(discount: dict | None, credit: dict | None) -> list[dict]:
+    """Причины, по которым заказ не отгрузить без руководителя. [] — не нужно."""
+    reasons: list[dict] = []
+    if discount and discount.get("flagged"):
+        worst = discount.get("max_pct")
+        thr = discount.get("threshold_pct")
+        reasons.append({
+            "code": "discount",
+            "text": (
+                f"скидка {float(worst):g}% при пороге {float(thr):g}%"
+                if worst is not None and thr is not None else "скидка выше порога"
+            ),
+        })
+    if credit and credit.get("over_limit"):
+        reasons.append({
+            "code": "credit_limit",
+            "text": (
+                f"долг клиента станет {_fmt_base(credit['effective_debt'])} "
+                f"при лимите {_fmt_base(credit['limit'])}"
+            ),
+        })
+    return reasons
+
+
+def decision_text(reasons: list[dict]) -> str:
+    """«скидка 20% при пороге 15%; долг клиента станет …» — одной строкой."""
+    return "; ".join(r["text"] for r in reasons)
+
+
+def _order_total(items: list[dict]) -> float:
+    return sum(float(it.get("quantity", 0) or 0) * float(it.get("price", 0) or 0) for it in items)
+
+
+async def decision_reasons(order: dict, items: list[dict]) -> tuple[list[dict], dict]:
+    """Нужно ли решение руководителя по заказу. → (причины, сводка скидки).
+
+    `order` — с теми условиями оплаты, с которыми его отгружают (у черновика
+    они приходят из формы). Лимит долга не проверяется у заказа, уже
+    одобренного сверх лимита (`credit_limit_override`) — как в
+    `approve_shipment_request`.
+    """
+    from services import order_discounts
+
+    discount = await order_discounts.order_discount(items, order.get("currency"))
+    credit = None
+    if not order.get("credit_limit_override"):
+        credit = await order_credit_context(order, _order_total(items))
+    return decision_reasons_from(discount, credit), discount
+
+
+async def requests_needing_decision() -> list[dict]:
+    """Заявки `pending`, которые действительно ждут руководителя (скидка выше
+    порога или долг сверх лимита), — с полем `reasons`.
+
+    Остальные заявки — это заказы, отправленные «на одобрение» до того, как
+    оно стало необязательным: их отгружает сам менеджер, и в «Решениях»,
+    очереди дел и ежедневном пинге руководителю они не числятся. Батчем: заказы,
+    позиции, прайсы и долги — по запросу на весь список.
+    """
+    from services import async_db as adb
+    from services import order_discounts
+
+    requests = await adb.get_pending_requests()
+    if not requests:
+        return []
+    order_ids = sorted({int(r["order_id"]) for r in requests})
+    orders = await adb.get_orders_by_ids(order_ids)
+    items_by = await adb.get_order_items_by_ids(order_ids)
+    prices = await order_discounts.load_reference_prices(*items_by.values())
+    threshold = await order_discounts.current_threshold_pct()
+    credit = await orders_credit_context([
+        (orders[oid], _order_total(items_by.get(oid, [])))
+        for oid in order_ids
+        if oid in orders and not orders[oid].get("credit_limit_override")
+    ])
+    out: list[dict] = []
+    for r in requests:
+        oid = int(r["order_id"])
+        order = orders.get(oid)
+        if order is None:
+            continue
+        discount = order_discounts.summarize(
+            items_by.get(oid, []), prices, order.get("currency"), threshold=threshold
+        )
+        reasons = decision_reasons_from(discount, credit.get(oid))
+        if reasons:
+            out.append({**r, "reasons": reasons})
+    return out
+
+
+def _actor_payment(actor_id: int, actor_name: str, role: str, username: str):
+    from services import order_payments
+
+    return order_payments.Actor(
+        user_id=int(actor_id), name=actor_name, role=role or "", username=username or "",
+    )
+
+
+async def ship_order_now(
+    order_id: int,
+    actor_id: int,
+    actor_name: str,
+    bot: Any,
+    *,
+    actor_role: str | None = None,
+    actor_username: str = "",
+    payment_type: str | None = None,
+    due_date: str | None = None,
+    parts: Any = None,
+) -> dict:
+    """«Отгрузить» — из черновика, из заявки без решения или одобренного заказа.
+
+    Черновик и `pending` отгружает автор заказа (`pending` — ещё руководитель),
+    одобренный — как раньше: кладовщик (менеджер его замещает), руководитель,
+    автор. `payment_type`/`due_date` — условия оплаты из формы черновика (без
+    них берутся сохранённые у заказа). `parts` — разбивка «как клиент заплатил»
+    для «оплаты сразу»: без неё такой заказ не отгружается, и ответ
+    `payment_required` ничего не меняет в черновике.
+
+    Возвращает `{ok: True, order_id, status: "shipped", payment, notify_task}`
+    либо `{ok: False, code, error, http_status, ...}`. Коды отказа:
+    `not_found`, `forbidden`, `bad_terms`, `frozen`, `no_client`, `no_items`,
+    `status`, `busy`, `decision_required` (+ `reasons`, `discount`),
+    `payment_required` (+ `gap_cents`), отказы склада (`insufficient_stock`,
+    `unlinked_positions`, `stock_not_written_off`) и формы оплаты
+    (`order_payments.PaymentError.code`).
+    """
+    from services import async_db as adb
+    from services import order_payments
+    from services.roles import role_allowed
+
+    def fail(code: str, error: str, status: int = 409, **extra: Any) -> dict:
+        return {"ok": False, "code": code, "error": error, "http_status": status,
+                "order_id": order_id, **extra}
+
+    order = await adb.get_order(order_id)
+    if not order:
+        return fail("not_found", "Заказ не найден — обновите список", 404)
+    role = actor_role if actor_role is not None else await adb.get_role(actor_id)
+    boss = role_allowed(role, ("admin", "boss"))
+    author = int(order.get("user_id") or 0) == int(actor_id)
+    status = order.get("status") or ""
+
+    if status in ("draft", "pending"):
+        if status == "draft" and not author:
+            return fail("forbidden", "Отгрузить черновик может только менеджер, который его собрал", 403)
+        if status == "pending" and not (author or boss):
+            return fail("forbidden", "Отгрузить этот заказ может его менеджер или руководитель", 403)
+        moved = await _approve_for_shipment(
+            order, actor_id, actor_name, bot, boss=boss, role=role, username=actor_username,
+            payment_type=payment_type, due_date=due_date, parts=parts, fail=fail,
+        )
+        if moved is not None:
+            return moved
+    elif status == "approved":
+        if not (author or boss or role_allowed(role, ("warehouse_keeper",))):
+            return fail("forbidden", "Отметить отгрузку может кладовщик, руководитель или менеджер заказа", 403)
+    else:
+        human = _STATUS_RU.get(status, status)
+        return fail("status", f"Заказ #{order_id} уже «{human}» — отгружать нечего. Обновите список")
+
+    order = await adb.get_order(order_id) or order
+    payment: dict | None = None
+    if (order.get("payment_type") or "paid") == "paid":
+        gap = (await order_payments.payment_gap_cents([order_id])).get(order_id, 0)
+        if gap > 0 and parts:
+            try:
+                payment = await order_payments.record_payment_parts(
+                    order_id, _actor_payment(actor_id, actor_name, role, actor_username), parts,
+                )
+            except order_payments.PaymentError as e:
+                # Двойное нажатие: оплату уже записал первый запрос — отгружаем.
+                gap = (await order_payments.payment_gap_cents([order_id])).get(order_id, 0)
+                if gap > 0:
+                    return fail(e.code or "payment", e.message, e.status)
+    res = await adb.mark_order_shipped(order_id, actor_id, actor_name)
+    if not res.get("ok"):
+        extra = {"gap_cents": res["gap_cents"]} if res.get("gap_cents") is not None else {}
+        return fail(res.get("code") or "status", res.get("error") or "Заказ уже обработан — обновите список",
+                    payment_recorded=payment is not None, **extra)
+
+    notify_task = None
+    if bot is not None:
+        from services.notify import notify_order_shipped
+        from utils.background import spawn
+
+        notify_task = spawn(
+            notify_order_shipped(bot, order_id, actor_id, actor_name),
+            name=f"order-shipped-notify-{order_id}",
+        )
+    return {"ok": True, "order_id": order_id, "status": "shipped", "payment": payment,
+            "already_in_ms": bool(res.get("already_in_ms")), "notify_task": notify_task}
+
+
+async def _approve_for_shipment(
+    order: dict, actor_id: int, actor_name: str, bot: Any, *, boss: bool, role: str,
+    username: str, payment_type: str | None, due_date: str | None, parts: Any, fail: Any,
+) -> dict | None:
+    """Черновик или заявка → `approved` с проведённой накладной. None — готово,
+    иначе словарь отказа (заказ при отказе проверок не меняется)."""
+    from services import async_db as adb
+    from services import order_payments, order_shipment
+
+    order_id = int(order["id"])
+    status = order["status"]
+    if status == "draft":
+        if payment_type is None:
+            payment_type, due_date = order.get("payment_type"), order.get("due_date")
+        ptype, due, err = validate_payment_terms(payment_type, due_date)
+        if err:
+            return fail("bad_terms", err, 400)
+        if order.get("frozen"):
+            return fail("frozen", "Заказ заморожен после серии отклонений — обратитесь к администратору")
+        if not (order.get("agent_name") or "").strip():
+            return fail("no_client", "Выберите клиента", 400)
+    else:
+        ptype, due = (order.get("payment_type") or "paid"), order.get("due_date")
+
+    items = await adb.get_order_items(order_id)
+    if not items:
+        return fail("no_items", "Добавьте товары", 400)
+
+    reasons, discount = await decision_reasons({**order, "payment_type": ptype, "due_date": due}, items)
+    if reasons:
+        text = decision_text(reasons)
+        if status == "draft":
+            msg = (f"Нужно решение руководителя: {text}. Без одобрения этот заказ не отгрузить — "
+                   "отправьте заявку на отгрузку")
+        elif boss:
+            msg = f"Заказ #{order_id} ждёт вашего решения: {text}. Решите его в «Решениях»"
+        else:
+            msg = f"Заказ #{order_id} ждёт решения руководителя: {text}. Отгрузить можно после одобрения"
+        return fail(DECISION_REQUIRED, msg, reasons=reasons, discount=discount, order_status=status)
+
+    pre = await order_shipment.preflight(order_id, items)
+    if not pre.get("ok"):
+        return fail(pre.get("code") or "stock", pre.get("reason") or "Склад не спишет этот заказ")
+
+    if ptype == "paid":
+        due_cents = (await order_payments.payment_gap_cents([order_id])).get(order_id, 0)
+        if due_cents > 0:
+            if not parts:
+                cur = (order.get("currency") or "").upper()
+                return fail(
+                    "payment_required",
+                    f"Заказ #{order_id} «оплата сразу»: сначала введите, как клиент заплатил "
+                    f"(наличные, карта, перечисление). Не внесено: {order_payments.fmt_cents(due_cents, cur)}",
+                    gap_cents=due_cents,
+                )
+            try:
+                await order_payments.check_payment_parts(
+                    order_id, _actor_payment(actor_id, actor_name, role, username), parts, due_cents,
+                )
+            except order_payments.PaymentError as e:
+                return fail(e.code or "payment", e.message, e.status)
+
+    busy = f"Заказ #{order_id} уже оформляется — обновите список через пару секунд"
+    if status == "draft":
+        sub = await submit_order(order_id, actor_id, actor_name, payment_type=ptype, due_date=due)
+        if not sub.get("ok"):
+            if sub.get("status"):
+                return fail("busy", busy)
+            return fail("submit", sub.get("error") or "Заказ не отправлен — обновите экран и повторите", 400)
+        req_id = int(sub["req_id"])
+    else:
+        pending = [r for r in await adb.get_shipment_requests_for_order(order_id) if r.get("status") == "pending"]
+        if not pending:
+            return fail("busy", busy)
+        req_id = int(pending[-1]["id"])
+
+    appr = await approve_shipment_request(
+        req_id, actor_id, actor_name, bot,
+        without_approval=not boss, notify_manager=False,
+    )
+    if not appr.get("ok"):
+        if appr.get("needs_override") or appr.get("needs_discount_ack"):
+            # Условия поменялись между проверкой и одобрением (прайс, лимит).
+            return fail(DECISION_REQUIRED,
+                        f"Заказ #{order_id} ждёт решения руководителя — условия изменились. "
+                        "Отгрузить можно после одобрения")
+        return fail("busy", busy)
+    return None
