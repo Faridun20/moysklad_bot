@@ -127,7 +127,7 @@ def test_cron_health_block_shows_stale_with_error():
     assert block is not None
     assert "ops_monitor" in block
     assert "30.5" in block
-    assert "failed" in block
+    assert "сбой" in block
     assert "connection refused" in block
 
 

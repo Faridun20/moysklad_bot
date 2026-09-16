@@ -79,7 +79,7 @@ def test_confirm_return_denied_for_manager(isolated_db):
     )
     call = _FakeCall(f"ret_ok:{r['return_id']}", uid=1)  # менеджер не вправе
     asyncio.run(cb_return_confirm(call, _FakeBot()))
-    assert any("доступа" in (a[0] or "").lower() for a in call.alerts)
+    assert any("руководител" in (a[0] or "").lower() for a in call.alerts)
     assert asyncio.run(db.get_order(oid))["status"] == "shipped"  # не подтверждён
 
 

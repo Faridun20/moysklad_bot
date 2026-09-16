@@ -219,7 +219,7 @@ def test_list_failed_catches_approval_that_never_reached_warehouse(env):
 
     rows = {r["order_id"]: r for r in _run(order_shipment.list_failed())}
     assert set(rows) == {stuck, failed}
-    assert "прервался" in rows[stuck]["error"] and rows[stuck]["agent_name"] == "Клиент"
+    assert "прервалась" in rows[stuck]["error"] and rows[stuck]["agent_name"] == "Клиент"
     assert rows[failed]["error"] == "не хватило"
 
 

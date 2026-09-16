@@ -67,12 +67,12 @@ def test_mismatch_is_flagged_with_note_and_visible_to_boss(open_app, e2e):
     mgr = open_app(e2e.ids["mgr"])
     _open_reconcile(mgr)
     _fill(mgr, "USD", "150")
-    assert _diff_text(mgr, "USD") == "недостача 50 USD"
+    assert _diff_text(mgr, "USD") == "не хватает 50 USD"
     assert "recon-warn" in mgr.get_attribute('[data-recon-diff="USD"]', "class")
     mgr.fill("#recon-note", "забыл занести оплату вчера")
     mgr.click("#recon-submit")
     mgr.wait_for_function("() => document.querySelectorAll('.toast').length > 0")
-    assert "недостача" in toast_text(mgr)
+    assert "не хватает" in toast_text(mgr)
 
     row = e2e.rows("SELECT diff_cents, note FROM daily_cash_counts")[0]
     assert row["diff_cents"] == -5000
@@ -84,12 +84,12 @@ def test_mismatch_is_flagged_with_note_and_visible_to_boss(open_app, e2e):
     boss = open_app(e2e.ids["boss"])
     _open_reconcile(boss)
     text = " ".join(boss.text_content("#recon-history").split())
-    assert "недостача 50 USD" in text
+    assert "не хватает 50 USD" in text
     assert "забыл занести оплату вчера" in text
     boss.click('[data-recon-filter="diff"]')
     boss.wait_for_selector('[data-recon-filter="diff"].active')
     boss.wait_for_selector("#recon-history")
-    assert "недостача 50 USD" in " ".join(boss.text_content("#recon-history").split())
+    assert "не хватает 50 USD" in " ".join(boss.text_content("#recon-history").split())
 
 
 def test_cash_absent_from_system_shows_up_as_surplus(open_app, e2e):
@@ -98,7 +98,7 @@ def test_cash_absent_from_system_shows_up_as_surplus(open_app, e2e):
     mgr = open_app(e2e.ids["mgr"])
     _open_reconcile(mgr)
     _fill(mgr, "USD", "300")
-    assert _diff_text(mgr, "USD") == "излишек 300 USD"
+    assert _diff_text(mgr, "USD") == "лишние 300 USD"
     mgr.click("#recon-submit")
     mgr.wait_for_function("() => document.querySelectorAll('.toast').length > 0")
     assert e2e.rows("SELECT system_cents, diff_cents FROM daily_cash_counts") == [

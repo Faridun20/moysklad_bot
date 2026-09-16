@@ -38,8 +38,16 @@ router = Router()
 _REFUND_LABELS = {
     "cash": "💵 Наличными",
     "debt_reduction": "📉 В счёт долга",
-    "no_refund": "🚫 Без возврата денег",
+    "no_refund": "🚫 Деньги не возвращаем",
 }
+
+
+def _order_status_ru(status: str | None) -> str:
+    """Статус заказа по-русски: на экране английских кодов быть не должно
+    (CLAUDE.md, «Словарь интерфейса»). Словарь один — handlers.orders."""
+    from handlers.orders import STATUS_NAME
+
+    return STATUS_NAME.get(status or "", status or "—")
 
 
 def _fmt(x: float) -> str:
@@ -82,7 +90,7 @@ async def _settle_stale_return(call: CallbackQuery, return_id: int) -> bool:
     await settle_card(
         call,
         _return_callbacks(return_id),
-        "✅ Возврат уже подтверждён" if status == "confirmed" else "ℹ️ Возврат уже обработан",
+        "✅ Возврат уже подтверждён" if status == "confirmed" else "ℹ️ По возврату уже решили",
         tail=webapp_keyboard("🌐 Ещё возвраты — в WebApp"),
     )
     return True
@@ -132,11 +140,13 @@ async def _notify_confirmers(bot: Bot, return_id, order_id, total, refund):
 @router.callback_query(F.data.startswith("ret_got:"))
 async def cb_return_goods_received(call: CallbackQuery):
     if not can_mark_return_goods_received(call.from_user.id):
-        return await call.answer("⛔ Нет доступа", show_alert=True)
+        return await call.answer(
+            "⛔ Приёмку возвращённого товара отмечает кладовщик", show_alert=True
+        )
     return_id = int(call.data.split(":")[1])
     res = await adb.mark_return_goods_received(return_id, call.from_user.id)
     if not res.get("ok"):
-        await call.answer("⚠️ Уже обработано", show_alert=True)
+        await call.answer("⚠️ По возврату уже решили", show_alert=True)
         if not await _settle_stale_return(call, return_id):
             # Возврат ждёт, но приёмку уже отметили (на другой карточке или
             # в WebApp) — погасить только «Товар получен».
@@ -159,13 +169,15 @@ async def cb_return_goods_received(call: CallbackQuery):
 @router.callback_query(F.data.startswith("ret_ok:"))
 async def cb_return_confirm(call: CallbackQuery, bot: Bot):
     if not can_confirm_return(call.from_user.id):
-        return await call.answer("⛔ Нет доступа", show_alert=True)
+        return await call.answer(
+            "⛔ Возврат подтверждает руководитель", show_alert=True
+        )
     return_id = int(call.data.split(":")[1])
     name = call.from_user.full_name or str(call.from_user.id)
 
     res = await adb.confirm_return(return_id, call.from_user.id, name)
     if not res.get("ok"):
-        await call.answer(f"⚠️ {res.get('error', 'уже обработано')}", show_alert=True)
+        await call.answer(f"⚠️ {res.get('error', 'по возврату уже решили')}", show_alert=True)
         await _settle_stale_return(call, return_id)
         return
 
@@ -175,13 +187,14 @@ async def cb_return_confirm(call: CallbackQuery, bot: Bot):
     # Куда делся товар — видно сразу: без строки о накладной кладовщик не
     # знает, вернулся ли остаток, и идёт проверять склад руками.
     stock_line = (
-        f"\n📦 Оприходовано накладной {esc(str(res['invoice_number']))}"
+        f"\n📦 Товар принят на склад, приход № {esc(str(res['invoice_number']))}"
         if res.get("invoice_number")
-        else f"\n⚠️ На склад не оприходовано: {esc(str(res.get('stock_skipped') or '—'))}"
+        else f"\n⚠️ Товар на склад НЕ принят: {esc(str(res.get('stock_skipped') or '—'))}"
     )
     await call.message.edit_text(
         original
-        + f"\n\n{DIV}\n✅ <b>Подтверждено</b> ({res['order_status']}) — {esc(name)}"
+        + f"\n\n{DIV}\n✅ <b>Возврат подтверждён</b> "
+        + f"(заказ: {esc(_order_status_ru(res['order_status']))}) — {esc(name)}"
         + stock_line,
         parse_mode="HTML",
         reply_markup=settle_markup(

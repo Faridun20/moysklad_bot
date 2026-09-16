@@ -491,15 +491,15 @@ async def _load_incoming_invoice(invoice_id: int, conn: Any = None) -> dict:
         int(invoice_id),
     )
     if row is None:
-        raise PaymentError("Накладная не найдена", status=404)
+        raise PaymentError("Приход не найден — обновите список", status=404)
     inv = dict(row)
     if inv["type"] != "incoming":
-        raise PaymentError("Долг поставщику считается только по приходной накладной", status=409)
+        raise PaymentError("Долг поставщику считается только по приходу", status=409)
     if inv["status"] != "confirmed":
-        raise PaymentError("Накладная отменена — долга по ней нет", status=409, code="cancelled")
+        raise PaymentError("Приход отменён — долга по нему нет", status=409, code="cancelled")
     if inv.get("counterparty_id") is None:
         raise PaymentError(
-            "У прихода не указан поставщик — укажите его в накладной, иначе долг не к кому "
+            "У прихода не указан поставщик — укажите его в приходе, иначе долг не к кому "
             "отнести", status=409, code="no_supplier",
         )
     return inv
@@ -518,7 +518,7 @@ async def set_terms(actor: Actor, invoice_id: Any, payment_type: str,
     try:
         inv_id = int(invoice_id)
     except (TypeError, ValueError) as e:
-        raise PaymentError("invoice_id обязателен") from e
+        raise PaymentError("Не выбран приход — обновите список") from e
     due = parse_due_date(due_date) if payment_type == "credit" else None
     inv = await _load_incoming_invoice(inv_id)
     now = _now()
@@ -583,7 +583,7 @@ async def _supplier_name(supplier_id: int, conn: Any = None) -> str:
     db = conn if conn is not None else adb_core
     name = await db.fetchval("SELECT name FROM counterparties WHERE id = $1", int(supplier_id))
     if name is None:
-        raise PaymentError(f"Поставщик #{supplier_id} не найден", status=404)
+        raise PaymentError(f"Поставщик #{supplier_id} не найден — выберите его в справочнике", status=404)
     return str(name)
 
 
@@ -636,10 +636,10 @@ async def record_payment(actor: Actor, data: dict, *, idem_key: str | None = Non
         try:
             invoice_id = int(raw_invoice)
         except (TypeError, ValueError) as e:
-            raise PaymentError("invoice_id должен быть числом") from e
+            raise PaymentError("Выберите приход из списка") from e
         invoice = await _load_incoming_invoice(invoice_id)
         if int(invoice["counterparty_id"]) != supplier_id:
-            raise PaymentError("Накладная выписана на другого поставщика", status=409)
+            raise PaymentError("Этот приход оформлен на другого поставщика", status=409)
         terms = await adb_core.fetchrow(
             "SELECT payment_type FROM supplier_invoice_terms WHERE invoice_id = $1", invoice_id
         )
@@ -685,7 +685,7 @@ async def record_payment(actor: Actor, data: dict, *, idem_key: str | None = Non
                 int(invoice["id"]),
             )
             if fresh is None or fresh["status"] != "confirmed":
-                raise PaymentError("Накладная отменена — долга по ней нет", status=409,
+                raise PaymentError("Приход отменён — долга по нему нет", status=409,
                                    code="cancelled")
             total = int(fresh["total_amount_cents"] or 0)
             if total <= 0:
@@ -701,7 +701,7 @@ async def record_payment(actor: Actor, data: dict, *, idem_key: str | None = Non
                     f"Больше, чем осталось по приходу: к оплате "
                     f"{order_payments.fmt_cents(rest, debt_currency)}, введено "
                     f"{order_payments.fmt_cents(total_debt_cents, debt_currency)}. Аванс "
-                    "поставщику вносят выплатой без привязки к накладной",
+                    "поставщику вносят выплатой без привязки к приходу",
                     status=409, code="over",
                 )
 

@@ -48,8 +48,8 @@ REFUSED_STATUSES = ("cancelled", "rejected")
 REASON_TEXT = {
     "no_order": "Заказ не найден",
     "no_agent": "Сначала выберите клиента — без него счёт выписать некому",
-    "no_items": "В заказе нет позиций — счёт выставлять не на что",
-    "bad_status": "По отменённому заказу счёт не выписывают",
+    "no_items": "В заказе нет позиций — счёт выписывать не на что",
+    "bad_status": "По отменённому или отклонённому заказу счёт не выписывают",
 }
 
 
@@ -58,7 +58,7 @@ class SalesInvoiceError(Exception):
 
     def __init__(self, code: str):
         self.code = code
-        self.message = REASON_TEXT.get(code, "Счёт не удалось собрать")
+        self.message = REASON_TEXT.get(code, "Не удалось собрать счёт")
         super().__init__(self.message)
 
 

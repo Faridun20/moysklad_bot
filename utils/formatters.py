@@ -16,6 +16,22 @@ DIV = "<code>━━━━━━━━━━━━━━━━━━━━</code>
 DIV2 = "<code>────────────────────</code>"
 
 
+def plural_positions(n: int) -> str:
+    """«1 позиция» / «3 позиции» / «7 позиций» — счётчик в хвосте списка.
+
+    Раньше везде стояло «позиций», и на одной скрытой строке выходило
+    «…ещё 1 позиций».
+    """
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        word = "позиция"
+    elif n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        word = "позиции"
+    else:
+        word = "позиций"
+    return f"{n} {word}"
+
+
 # ─── Отгрузка ─────────────────────────────────────────────────────────────────
 
 
@@ -41,7 +57,7 @@ def format_shipment(invoice: dict) -> str:
         f"<b>💰 Итого: {sum_str} {currency}</b>",
     ]
     if invoice.get("status") == "cancelled":
-        lines.append("<b>🚫 Накладная отменена</b>")
+        lines.append("<b>🚫 Отгрузка отменена</b>")
 
     if positions:
         lines.append("")
@@ -59,7 +75,7 @@ def format_shipment(invoice: dict) -> str:
                 f"  <code>{qty:g} {uom}</code>  ·  {price_str}  →  <b>{total_pos}</b>"
             )
         if len(positions) > 15:
-            lines.append(f"\n<i>…ещё {len(positions) - 15} позиций</i>")
+            lines.append(f"\n<i>…ещё {plural_positions(len(positions) - 15)}</i>")
     else:
         lines.append(f"\n{DIV2}\n<i>Позиций нет</i>")
 
@@ -92,7 +108,7 @@ def format_payment_notify(
 def format_payment_confirmed(amount: float, currency: str, comment: str) -> str:
     return (
         f"{DIV}\n"
-        f"✅ <b>Платёж принят!</b>\n"
+        f"✅ <b>Платёж принят</b>\n"
         f"\n"
         f"<b>💰 Сумма:</b> {amount:,.0f} {esc(currency)}\n"
         f"<b>📝 Комментарий:</b> {esc(comment)}"
@@ -107,7 +123,7 @@ def format_payment_rejected(amount: float, currency: str, comment: str) -> str:
         f"<b>💰 Сумма:</b> {amount:,.0f} {esc(currency)}\n"
         f"<b>📝 Комментарий:</b> {esc(comment)}\n"
         f"\n"
-        f"<i>Свяжитесь с руководителем</i>"
+        f"<i>Спросите у руководителя, что исправить, и отправьте платёж заново</i>"
     )
 
 

@@ -33,7 +33,7 @@ async def add_photo(
     uploaded_by: int, caption: str | None = None,
 ) -> dict:
     if not tg_file_id or not file_unique_id:
-        return {"ok": False, "error": "Нужны tg_file_id и file_unique_id"}
+        return {"ok": False, "error": "Фото не загрузилось — попробуйте ещё раз"}
     if not await adb_core.fetchrow("SELECT id FROM orders WHERE id = $1", order_id):
         return {"ok": False, "error": "Заказ не найден"}
     existing = await adb_core.fetchrow(

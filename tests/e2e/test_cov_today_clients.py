@@ -126,7 +126,7 @@ def _wait_alert(page, needle: str) -> None:
 
 def _open_home(page) -> None:
     """«Сегодня» дорисован: очередь дел на месте (у всех ролей)."""
-    page.wait_for_selector("#content .section-label:has-text('Требует вас')")
+    page.wait_for_selector("#content .section-label:has-text('Что нужно сделать')")
     settled(page)
 
 
@@ -183,7 +183,7 @@ def test_boss_hero_counts_company_shipments_and_leaderboard(open_app, e2e):
     assert _text(boss, ".hero-value").startswith("200")
     assert _text(boss, ".hero-delta") == "1 отгрузка · 1 клиент"
     # Лидерборд — только руководству; свой заказ у босса нет → «Мои заказы» нет.
-    boss.wait_for_selector(".section-label:has-text('Топ сотрудники')")
+    boss.wait_for_selector(".section-label:has-text('Кто больше отгрузил')")
     assert "Manager" in boss.inner_text("#content")
     assert boss.locator(".section-label:has-text('Мои заказы')").count() == 0
 
@@ -195,15 +195,15 @@ def test_manager_hero_is_personal_and_recent_order_opens_sales(open_app, e2e):
     mgr.wait_for_selector("#content .hero")
     assert mgr.inner_text(".hero-label") == "Моя выручка сегодня"
     assert _text(mgr, ".hero-value").startswith("200")
-    assert mgr.locator(".section-label:has-text('Топ сотрудники')").count() == 0
+    assert mgr.locator(".section-label:has-text('Кто больше отгрузил')").count() == 0
     # Свод «Мои заказы»: одобрен один, черновиков и ожидающих нет.
     stats = mgr.eval_on_selector_all(
         ".stat", "els => els.map(e => [e.querySelector('.stat-label').textContent.trim(),"
                  " e.querySelector('.stat-value').textContent.trim()])"
     )
-    assert dict(stats) == {"Черновики": "0", "Ожидают": "0", "Одобрено": "1"}
+    assert dict(stats) == {"Черновики": "0", "Ждут": "0", "Одобрены": "1"}
     row = mgr.locator(f'[data-order-id="{oid}"]')
-    assert "Ромашка" in row.inner_text() and "Одобрено" in row.inner_text()
+    assert "Ромашка" in row.inner_text() and "Одобрен" in row.inner_text()
     row.click()
     _wait_screen(mgr, "sales")
     mgr.wait_for_selector(f'.order-card[data-id="{oid}"]')
@@ -235,7 +235,7 @@ def test_queue_is_sorted_by_urgency(open_app, e2e):
     assert order == ["money:debts", "decisions", "stock:containers"], order
     counts = boss.eval_on_selector_all("[data-queue] .queue-count", "els => els.map(e => +e.textContent)")
     assert counts == [1, 1, 1]
-    assert "требует вас · 3" in _text(boss).lower()  # подписи разделов — капсом (CSS)
+    assert "что нужно сделать · 3" in _text(boss).lower()  # подписи разделов — капсом (CSS)
     assert "Контейнеры не сверены" in boss.inner_text('[data-queue="stock:containers"]')
 
 
@@ -363,13 +363,13 @@ def test_boss_saves_inverted_rate_and_zero_is_rejected(open_app, e2e):
 
     boss.fill(".rate-input", "0")
     boss.click('.rate-save[data-code="UZS"]')
-    _wait_alert(boss, "Курс должен быть положительным числом")
+    _wait_alert(boss, "Курс — положительное число")
     rate = e2e.rows("SELECT rate_to_base FROM currency_rates WHERE currency_code = 'UZS'")[0]["rate_to_base"]
     assert rate == pytest.approx(1 / 12000)
 
     boss.fill(".rate-input", "12500")
     boss.click('.rate-save[data-code="UZS"]')
-    _wait_alert(boss, "✅ Курс UZS обновлён")
+    _wait_alert(boss, "Курс UZS обновлён")
     rate = e2e.rows("SELECT rate_to_base, updated_by FROM currency_rates WHERE currency_code = 'UZS'")[0]
     assert rate["rate_to_base"] == pytest.approx(1 / 12500)
     assert rate["updated_by"] == e2e.ids["boss"]
@@ -481,7 +481,7 @@ def test_clients_tabs_follow_role(open_app, e2e):
         go(page, "clients")
         page.wait_for_selector('.seg-item[data-sect="buyers"]')
         assert _sect_tabs(page) == ["buyers", "limits"], who
-        assert page.inner_text("#greeting") == "Клиенты · Покупатели", who
+        assert page.inner_text("#greeting") == "Клиенты · Список", who
         settled(page)
         # Справочник не пуст (фикстура заводит «ООО Ромашка»), но заказов нет:
         # клиент в списке есть, и строка честно говорит, что покупок не было.
@@ -494,12 +494,12 @@ def test_clients_tabs_follow_role(open_app, e2e):
         go(page, "leads")
         page.wait_for_selector('.seg-item[data-sect="funnel"]')
         assert _sect_tabs(page) == ["funnel", "list", "channel"], who
-        assert page.inner_text("#greeting") == "Обращения · Воронка", who
+        assert page.inner_text("#greeting") == "Обращения · Сводка", who
         settled(page)
         assert "Обращений пока нет" in page.inner_text("#leads-body"), who
         tab(page, "list")
         page.wait_for_selector("#call-new")
-        assert page.inner_text("#greeting") == "Обращения · Лиды"
+        assert page.inner_text("#greeting") == "Обращения · Список"
         tab(page, "channel")
         page.wait_for_selector("#leads-body :text('В канал ещё ничего не уходило')")
         assert "Канал не настроен" in page.inner_text("#leads-body")
@@ -550,7 +550,7 @@ def test_funnel_shows_first_touch_speed_awaiting_and_managers(open_app, e2e):
 
     boss = open_app(e2e.ids["boss"])
     go(boss, "leads")
-    boss.wait_for_selector(".section-label:has-text('Воронка обращений')")
+    boss.wait_for_selector(".section-label:has-text('От обращения до покупки')")
     text = _text(boss, "#leads-body").lower()  # подписи разделов — капсом (CSS)
     assert "клиент написал сам" in text and "написали мы первыми" in text
     assert "скорость ответа" in text and "обычно отвечаем за" in text
@@ -564,7 +564,7 @@ def test_funnel_shows_first_touch_speed_awaiting_and_managers(open_app, e2e):
     assert "ждёт ответа" in boss.inner_text("#content")
     _back(boss)
     _wait_screen(boss, "leads", "funnel")
-    boss.wait_for_selector(".section-label:has-text('Воронка обращений')")
+    boss.wait_for_selector(".section-label:has-text('От обращения до покупки')")
 
 
 # ─── «Клиенты» → «Лиды» ──────────────────────────────────────────────────────
@@ -750,25 +750,25 @@ def test_link_existing_counterparty_found_by_phone(open_app, e2e):
     mgr = open_app(e2e.ids["mgr"])
     _open_lead_card(mgr, lead_id)
     assert "— не привязан" in mgr.inner_text("#content")
-    assert mgr.inner_text("#lead-agent").strip() == "Привязать контрагента"
+    assert mgr.inner_text("#lead-agent").strip() == "Привязать к клиенту"
     mgr.click("#lead-agent")
     mgr.wait_for_selector(".c-overlay .loader:has-text('можно завести нового')")
     mgr.click("#ms-submit")
-    mgr.wait_for_selector("#ms-error:not([hidden]):has-text('Выберите контрагента из списка')")
+    mgr.wait_for_selector("#ms-error:not([hidden]):has-text('Выберите клиента из списка')")
 
     mgr.fill("#ms-f-search", "90 123")  # клиента помнят по номеру
     mgr.wait_for_selector(".c-overlay [data-agent]")
     mgr.click(".c-overlay [data-agent]:has-text('ООО Ромашка')")
     mgr.wait_for_selector(".c-overlay [data-agent].picked")
     mgr.click("#ms-submit")
-    mgr.wait_for_selector(".toast:has-text('Контрагент привязан')")
+    mgr.wait_for_selector(".toast:has-text('Обращение привязано к клиенту')")
     cp = e2e.rows("SELECT id FROM counterparties")[0]["id"]
     assert e2e.rows("SELECT agent_ms_id FROM leads")[0]["agent_ms_id"] == str(cp)
     assert e2e.rows("SELECT COUNT(*) AS n FROM counterparties")[0]["n"] == 1
 
-    mgr.wait_for_function("() => /Сменить контрагента/.test(document.querySelector('#lead-agent')?.textContent)")
+    mgr.wait_for_function("() => /Сменить клиента/.test(document.querySelector('#lead-agent')?.textContent)")
     card = mgr.inner_text("#content")
-    assert "ООО Ромашка" in card and "+998901234567" in card and "Привязан контрагент" in card
+    assert "ООО Ромашка" in card and "+998901234567" in card and "Привязан к клиенту в справочнике" in card
 
 
 def test_create_new_counterparty_from_lead_and_empty_name_error(open_app, e2e):
@@ -779,9 +779,9 @@ def test_create_new_counterparty_from_lead_and_empty_name_error(open_app, e2e):
     mgr.click("#lead-agent")
     mgr.wait_for_selector("#ms-f-search")
     mgr.fill("#ms-f-search", "ИП Бахтиёр Савдо")
-    mgr.click('.c-overlay button:has-text("Завести нового контрагента")')  # confirm → «да»
-    mgr.wait_for_selector(".toast:has-text('Контрагент заведён')")
-    assert any("Завести контрагента «ИП Бахтиёр Савдо»" in a for a in alerts(mgr))
+    mgr.click('.c-overlay button:has-text("Завести нового клиента")')  # confirm → «да»
+    mgr.wait_for_selector(".toast:has-text('Клиент заведён')")
+    assert any("Завести клиента «ИП Бахтиёр Савдо»" in a for a in alerts(mgr))
     cp = e2e.rows("SELECT id, name, telegram_id, type FROM counterparties WHERE name = ?", ("ИП Бахтиёр Савдо",))
     assert cp and cp[0]["telegram_id"] == 690_001 and cp[0]["type"] == "customer"
     assert e2e.rows("SELECT agent_ms_id FROM leads WHERE id = ?", (lead_id,))[0]["agent_ms_id"] == str(cp[0]["id"])
@@ -794,8 +794,8 @@ def test_create_new_counterparty_from_lead_and_empty_name_error(open_app, e2e):
     mgr.click(f'[data-lead="{nameless}"]')
     mgr.click("#lead-agent")
     mgr.wait_for_selector(".c-overlay [data-agent]")  # пустой поиск — весь справочник
-    mgr.click('.c-overlay button:has-text("Завести нового контрагента")')
-    mgr.wait_for_selector("#ms-error:not([hidden]):has-text('Впишите название контрагента')")
+    mgr.click('.c-overlay button:has-text("Завести нового клиента")')
+    mgr.wait_for_selector("#ms-error:not([hidden]):has-text('Впишите название или имя клиента')")
     assert e2e.rows("SELECT COUNT(*) AS n FROM counterparties")[0]["n"] == 2
     assert e2e.rows("SELECT agent_ms_id FROM leads WHERE id = ?", (nameless,))[0]["agent_ms_id"] is None
 
@@ -888,7 +888,7 @@ def test_agent_card_expands_orders_shipments_and_limit_edit_guards(open_app, e2e
     # Три вопроса владельца: сколько купил, когда отгружали, сколько отдал.
     assert "сколько купил" in low and "купил за всё время" in low
     assert "отгрузок" in low and "когда отгружали" in low
-    assert "заказы в боте · 2" in low
+    assert "заказы · 2" in low
     assert "как платил · 1" in low and "Платёж · 200 USD" in text and "ожидает" in text
 
     # Состав заказа уже в ответе — раскрывается и сворачивается без запроса.
@@ -920,7 +920,7 @@ def test_agent_card_expands_orders_shipments_and_limit_edit_guards(open_app, e2e
     boss.click("#cl-edit")
     boss.fill("#cl-input", "-5")
     boss.click("#cl-save")
-    _wait_alert(boss, "Лимит должен быть неотрицательным числом")
+    _wait_alert(boss, "Лимит — число от нуля и больше")
     assert e2e.rows("SELECT COUNT(*) AS n FROM credit_limits")[0]["n"] == 0
     boss.fill("#cl-input", "250")
     boss.click("#cl-save")

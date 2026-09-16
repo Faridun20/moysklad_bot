@@ -46,8 +46,8 @@ class DepositReject(StatesGroup):
 
 def _confirm_keyboard(deposit_id: int):
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Подтвердить", callback_data=f"dep_ok:{deposit_id}")
-    kb.button(text="❌ Отклонить", callback_data=f"dep_no:{deposit_id}")
+    kb.button(text="✅ Подтвердить сдачу", callback_data=f"dep_ok:{deposit_id}")
+    kb.button(text="❌ Отклонить сдачу", callback_data=f"dep_no:{deposit_id}")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -57,8 +57,8 @@ def _deposit_callbacks(deposit_id: int) -> set[str]:
 
 
 _DEPOSIT_SETTLED = {
-    "confirmed": "✅ Сдача уже подтверждена",
-    "rejected": "❌ Сдача уже отклонена",
+    "confirmed": "✅ Сдача в кассу уже подтверждена",
+    "rejected": "❌ Сдача в кассу уже отклонена",
 }
 
 
@@ -72,7 +72,7 @@ async def _settle_stale_deposit(call: CallbackQuery, deposit_id: int) -> bool:
     await settle_card(
         call,
         _deposit_callbacks(deposit_id),
-        _DEPOSIT_SETTLED.get(status, "ℹ️ Сдача уже обработана"),
+        _DEPOSIT_SETTLED.get(status, "ℹ️ По этой сдаче уже решили"),
         tail=webapp_keyboard("🌐 Ещё сдачи — в WebApp"),
     )
     return True
@@ -136,11 +136,11 @@ async def _notify_confirmers(
             + (" (наличные по разбивке)" if a.get("kind") == "cash_part" else " (в счёт долга)")
             for a in view
         )
-        or "  <i>не распределена: наличных по заказам на руках нет</i>"
+        or "  <i>ни к одному заказу не привязана: наличных по заказам на руках нет</i>"
     )
     text = (
         f"{DIV}\n"
-        f"💵 <b>Сдача наличных #{deposit_id}</b>\n\n"
+        f"💵 <b>Сдача в кассу #{deposit_id}</b>\n\n"
         f"👨‍💼 Менеджер: <b>{esc(manager_name)}</b>\n"
         f"💰 Сумма: <b>{_fmt_amount(amount)} {esc(cur)}</b>\n"
         f"📦 Заказы:\n{orders_line}"
@@ -157,18 +157,22 @@ async def _notify_confirmers(
 @router.callback_query(F.data.startswith("dep_ok:"))
 async def cb_deposit_confirm(call: CallbackQuery, bot: Bot):
     if not can_confirm_deposit(call.from_user.id):
-        return await call.answer("⛔ Нет доступа", show_alert=True)
+        return await call.answer(
+            "⛔ Сдачу в кассу подтверждает бухгалтер или руководитель", show_alert=True
+        )
     deposit_id = int(call.data.split(":")[1])
     name = call.from_user.full_name or str(call.from_user.id)
 
     dep = await adb.get_cash_deposit(deposit_id)
     res = await adb.confirm_cash_deposit(deposit_id, call.from_user.id, name)
     if not res.get("ok"):
-        await call.answer(f"⚠️ {res.get('error', 'уже обработано')}", show_alert=True)
+        await call.answer(
+            f"⚠️ {res.get('error', 'по этой сдаче уже решили')}", show_alert=True
+        )
         await _settle_stale_deposit(call, deposit_id)
         return
 
-    await call.answer("✅ Подтверждено")
+    await call.answer("✅ Сдача в кассу подтверждена")
     # Round 6 (S1): html_text сохраняет HTML-entities из оригинала; .text
     # отдаёт Telegram-decoded строку, на которой повторный parse_mode="HTML"
     # ломается если в оригинале был `<` или `>` (например, esc(<Имя>) в
@@ -176,20 +180,20 @@ async def cb_deposit_confirm(call: CallbackQuery, bot: Bot):
     # с тестовыми моками без свойства html_text.
     original = getattr(call.message, "html_text", None) or call.message.text or ""
     await call.message.edit_text(
-        original + f"\n\n{DIV}\n✅ <b>Подтверждено</b> — {esc(name)}",
+        original + f"\n\n{DIV}\n✅ <b>Сдача в кассу подтверждена</b> — {esc(name)}",
         parse_mode="HTML",
         reply_markup=settle_markup(
             getattr(call.message, "reply_markup", None),
             _deposit_callbacks(deposit_id),
-            outcome_label("✅ Подтверждено", call.from_user),
+            outcome_label("✅ Сдача подтверждена", call.from_user),
             tail=webapp_keyboard("🌐 Ещё сдачи — в WebApp"),
         ),
     )
     if res.get("self_confirmed") and res.get("self_note"):
         # Текст пометки — из фактического наличия подтверждающих (confirm_rights).
         await call.message.answer(
-            f"ℹ️ Вы подтвердили собственную сдачу: {esc(res['self_note'])}. "
-            "Это отмечено в журнале действий."
+            f"ℹ️ Вы подтвердили собственную сдачу в кассу: {esc(res['self_note'])}. "
+            "Это записано в журнал действий."
         )
     if dep and dep.get("manager_id"):
         closed = res.get("closed_orders") or []
@@ -197,7 +201,7 @@ async def cb_deposit_confirm(call: CallbackQuery, bot: Bot):
         try:
             await bot.send_message(
                 dep["manager_id"],
-                f"✅ Ваша сдача #{deposit_id} подтверждена.{extra}",
+                f"✅ Ваша сдача в кассу #{deposit_id} подтверждена.{extra}",
             )
         except Exception:
             pass
@@ -206,12 +210,14 @@ async def cb_deposit_confirm(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith("dep_no:"))
 async def cb_deposit_reject(call: CallbackQuery, state: FSMContext):
     if not can_confirm_deposit(call.from_user.id):
-        return await call.answer("⛔ Нет доступа", show_alert=True)
+        return await call.answer(
+            "⛔ Решение по сдаче в кассу принимает бухгалтер или руководитель", show_alert=True
+        )
     deposit_id = int(call.data.split(":")[1])
     # Устаревшая карточка: сдачу уже решили — не просим причину, которую
     # потом некуда применить.
     if await _settle_stale_deposit(call, deposit_id):
-        return await call.answer("⚠️ Сдача уже обработана", show_alert=True)
+        return await call.answer("⚠️ По этой сдаче уже решили", show_alert=True)
     await state.set_state(DepositReject.waiting_for_reason)
     await state.update_data(
         deposit_id=deposit_id, msg_chat=call.message.chat.id, msg_id=call.message.message_id
@@ -221,7 +227,7 @@ async def cb_deposit_reject(call: CallbackQuery, state: FSMContext):
     # ту же сдачу можно подтвердить параллельно с отклонением.
     await drop_keyboard(call, status="✍️ Ждём причину отклонения…")
     prompt = await call.message.answer(
-        "✍️ Укажите причину отклонения сдачи (одним сообщением):",
+        "✍️ Напишите одним сообщением, почему отклоняете сдачу в кассу:",
         reply_markup=prompt_keyboard(
             InlineKeyboardButton(text="✖️ Не отклонять", callback_data="dep_no_abort")
         ),
@@ -238,11 +244,13 @@ async def cb_deposit_reject_abort(call: CallbackQuery, state: FSMContext, bot: B
     следующее сообщение стало бы причиной отклонения чужих денег.
     """
     if not can_confirm_deposit(call.from_user.id):
-        return await call.answer("⛔ Нет доступа", show_alert=True)
+        return await call.answer(
+            "⛔ Решение по сдаче в кассу принимает бухгалтер или руководитель", show_alert=True
+        )
     data = await state.get_data()
     deposit_id = data.get("deposit_id")
     if await state.get_state() != DepositReject.waiting_for_reason.state or not deposit_id:
-        await call.answer("Уже неактуально")
+        await call.answer("Это уже не актуально")
         await set_message_markup(bot, call.message.chat.id, call.message.message_id, None)
         return
     await state.clear()
@@ -254,7 +262,8 @@ async def cb_deposit_reject_abort(call: CallbackQuery, state: FSMContext, bot: B
         )
     try:
         await call.message.edit_text(
-            f"↩️ Отклонение сдачи #{int(deposit_id)} отменено — кнопки снова на карточке."
+            f"↩️ Отклонение сдачи в кассу #{int(deposit_id)} отменено — "
+            "кнопки решения снова на карточке."
         )
     except Exception:
         logger.debug("dep_no_abort: вопрос не отредактирован", exc_info=True)
@@ -267,11 +276,15 @@ async def process_deposit_reject_reason(message: Message, state: FSMContext, bot
     # этого юзер успевает выполнить reject уже не будучи confirmer'ом.
     if not can_confirm_deposit(message.from_user.id):
         await state.clear()
-        return await message.answer("⛔ Нет доступа — действие отменено.")
+        return await message.answer(
+            "⛔ Решать по сдачам в кассу вы больше не можете — отклонение отменено."
+        )
     # Round 6 (L_R8): жёсткий cap на reason — DB-колонка TEXT, шлётся в Telegram.
     reason = (message.text or "").strip()[:500]
     if len(reason) < 3:
-        return await message.answer("❌ Причина слишком короткая. Повторите.")
+        return await message.answer(
+            "❌ Причина слишком короткая — напишите хотя бы несколько слов."
+        )
     data = await state.get_data()
     await state.clear()
     deposit_id = data.get("deposit_id")
@@ -280,23 +293,23 @@ async def process_deposit_reject_reason(message: Message, state: FSMContext, bot
     dep = await adb.get_cash_deposit(deposit_id)
     res = await adb.reject_cash_deposit(deposit_id, message.from_user.id, name, reason)
     if not res.get("ok"):
-        return await message.answer(f"⚠️ {res.get('error', 'уже обработано')}")
+        return await message.answer(f"⚠️ {res.get('error', 'по этой сдаче уже решили')}")
 
     # T3.2: пометку вешаем на саму карточку сдачи (кнопки с неё сняты ещё на
     # входе в FSM) — иначе карточка навсегда остаётся «на подтверждении», а
     # решение теряется отдельной строкой ниже в чате.
-    note = f"❌ Сдача #{deposit_id} отклонена"
+    note = f"❌ Сдача в кассу #{deposit_id} отклонена"
     await set_message_markup(bot, data.get("prompt_chat"), data.get("prompt_id"), None)
     if not await finish_message(
         bot, data.get("msg_chat"), data.get("msg_id"), note,
-        outcome=outcome_label("❌ Отклонено", message.from_user),
+        outcome=outcome_label("❌ Сдача отклонена", message.from_user),
     ):
         await message.answer(f"{note}.")
     if dep and dep.get("manager_id"):
         try:
             await bot.send_message(
                 dep["manager_id"],
-                f"❌ Ваша сдача #{deposit_id} отклонена.\nПричина: {esc(reason)}",
+                f"❌ Ваша сдача в кассу #{deposit_id} отклонена.\nПричина: {esc(reason)}",
                 parse_mode="HTML",
             )
         except Exception:

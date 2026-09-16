@@ -79,15 +79,15 @@ async def _document_pdf(doc_id: int, user_id: int) -> tuple[bytes, str, str] | N
 async def cb_print(call: CallbackQuery):
     """«🖨 Распечатать» под документом."""
     if not can_view_stock(call.from_user.id):
-        return await call.answer("Нет доступа", show_alert=True)
+        return await call.answer("Печать доступна складу и руководству", show_alert=True)
 
     parsed = printing.parse_callback(call.data or "")
     if parsed is None:
-        return await call.answer("Кнопка устарела", show_alert=True)
+        return await call.answer("Кнопка устарела — откройте документ заново", show_alert=True)
     kind, ref = parsed
     if kind not in ("inv", "doc"):
         logger.warning("Печать: неизвестный тип документа %r", kind)
-        return await call.answer("Неизвестный тип документа", show_alert=True)
+        return await call.answer("Такой документ бот напечатать не умеет", show_alert=True)
 
     # Отвечаем СРАЗУ: сборка PDF и разговор с CUPS занимают секунды, а Telegram
     # держит «часики» на кнопке лишь до первого answer — без него клиент
@@ -98,11 +98,16 @@ async def cb_print(call: CallbackQuery):
         doc = await (_invoice_pdf(ref, call.from_user.id) if kind == "inv" else _document_pdf(ref, call.from_user.id))
     except Exception:
         logger.exception("Печать: не удалось собрать PDF (%s #%s)", kind, ref)
-        return await _report(call, "❌ Не удалось собрать документ для печати")
+        return await _report(
+            call, "❌ Документ для печати не собрался. Попробуйте ещё раз через минуту."
+        )
 
     if doc is None:
         return await _report(
-            call, "❌ Накладная не найдена" if kind == "inv" else "❌ Файл документа не найден — сформируйте заново"
+            call,
+            "❌ Накладная не найдена — возможно, движение по складу отменили"
+            if kind == "inv"
+            else "❌ Файл документа не найден — сформируйте документ заново",
         )
 
     pdf_bytes, filename, label = doc
@@ -121,7 +126,7 @@ async def cb_print(call: CallbackQuery):
         return await _report(call, f"🖨 {esc(result.message)}")
     # Причина — текстом: «Ошибка» отправляет менеджера искать админа, а
     # «принтер не принимает задания» он решит сам, подойдя к принтеру.
-    return await _report(call, f"❌ Ошибка печати: {esc(result.error)}")
+    return await _report(call, f"❌ Напечатать не вышло: {esc(result.error)}")
 
 
 async def _report(call: CallbackQuery, text: str) -> None:
@@ -157,8 +162,8 @@ async def cmd_printer(message: Message, bot: Bot):
             lines.append(f"<code>{esc(status.text)}</code>")
         if status.state == "error":
             lines.append("")
-            lines.append("Очередь остановлена: проверьте бумагу, тонер и питание.")
+            lines.append("Очередь печати остановлена: проверьте бумагу, тонер и питание.")
     else:
-        lines.append("🔴 Не удалось получить статус")
+        lines.append("🔴 Принтер не отвечает — проверьте, включён ли он и есть ли сеть")
         lines.append(f"<code>{esc(status.text)}</code>")
     await message.answer("\n".join(lines), parse_mode="HTML")

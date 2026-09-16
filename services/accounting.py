@@ -578,9 +578,9 @@ def _account_arg(raw: Any, label: str = "Счёт") -> int:
 async def _active_account(account_id: int, label: str = "Счёт") -> dict:
     acc = (await _load_accounts([account_id])).get(account_id)
     if not acc:
-        raise AccountingError(f"{label}: счёт не найден", status=404)
+        raise AccountingError(f"{label}: счёт не найден — выберите из списка", status=404)
     if acc.get("archived_at"):
-        raise AccountingError(f"{label}: «{acc['name']}» в архиве")
+        raise AccountingError(f"{label}: «{acc['name']}» убран в архив — выберите другой счёт")
     return acc
 
 
@@ -594,13 +594,13 @@ async def save_account(actor: Actor, data: dict) -> dict:
     account_id = data.get("account_id") or data.get("id")
     name = _text(data.get("name"), 80)
     if not name:
-        raise AccountingError("Название счёта обязательно")
+        raise AccountingError("Укажите название счёта")
     kind = str(data.get("kind") or "").strip()
     if kind not in ACCOUNT_KINDS:
-        raise AccountingError("Тип счёта: касса, банковский счёт или карта")
+        raise AccountingError("Выберите тип счёта: касса, банковский счёт или карта")
     currency = str(data.get("currency") or "").strip().upper()
     if currency not in await known_currencies():
-        raise AccountingError("Валюта счёта не поддерживается")
+        raise AccountingError("Валюта счёта не поддерживается — выберите другую")
     last4 = "".join(ch for ch in str(data.get("card_last4") or "") if ch.isdigit())
     if last4 and len(last4) != 4:
         raise AccountingError("Последние цифры карты — ровно 4")
@@ -631,7 +631,7 @@ async def save_account(actor: Actor, data: dict) -> dict:
             account_id = _account_arg(account_id)
             cur_row = await txn.fetchrow("SELECT * FROM acc_accounts WHERE id = $1", account_id)
             if not cur_row:
-                raise AccountingError("Счёт не найден", status=404)
+                raise AccountingError("Счёт не найден — обновите список", status=404)
             if (cur_row["currency"] or "").upper() != currency:
                 used = await txn.fetchval(
                     "SELECT COUNT(*) FROM acc_entries WHERE account_id = $1", account_id
@@ -704,7 +704,7 @@ async def set_archived(actor: Actor, account_id: Any, archived: bool) -> dict:
         _now_str() if archived else None, _now_str(), account_id,
     )
     if rc <= 0:
-        raise AccountingError("Счёт не найден", status=404)
+        raise AccountingError("Счёт не найден — обновите список", status=404)
     await _audit(
         actor, "accounting_account_archived",
         f"счёт #{account_id} {'в архив' if archived else 'из архива'}",
@@ -809,9 +809,9 @@ def _order_guard(order: dict | None) -> None:
     # Те же условия, что у `mark_order_paid`: оплату принимаем по активному
     # заказу в долг/«оплата сразу», ещё не закрытому.
     if not order:
-        raise AccountingError("Заказ не найден", status=404)
+        raise AccountingError("Заказ не найден — обновите список", status=404)
     if order["payment_type"] not in ("credit", "paid"):
-        raise AccountingError("По этому заказу оплату не принимают")
+        raise AccountingError("По этому заказу оплату не принимают — он оплачен при отгрузке")
     if order["paid_confirmed_at"] is not None:
         raise AccountingError("Заказ уже полностью оплачен")
     if order["status"] not in _ORDER_OPEN_STATUSES:
@@ -851,7 +851,7 @@ def _parse_lines(raw_lines: Any) -> list[tuple[int, int]]:
     out = []
     for n, line in enumerate(raw_lines, start=1):
         if not isinstance(line, dict):
-            raise AccountingError(f"Строка {n}: неверный формат")
+            raise AccountingError(f"Строка {n}: заполните счёт и сумму")
         account_id = _account_arg(line.get("account_id"), f"Строка {n}")
         cents = parse_cents(line.get("amount"))
         if cents is None:
@@ -888,7 +888,7 @@ async def record_receipt(actor: Actor, data: dict) -> dict:
     """
     await require_enabled()
     if actor.role not in ROLES_RECORD:
-        raise AccountingError("Нет доступа", status=403)
+        raise AccountingError("У вас нет доступа к этому действию", status=403)
     key = _request_key(actor, "receipt", data.get("idempotency_key"))
     prev = await _find_by_key(key)
     if prev is not None:
@@ -896,8 +896,8 @@ async def record_receipt(actor: Actor, data: dict) -> dict:
 
     if bool(data.get("order_id")) == bool(data.get("deal_id")):
         raise AccountingError("Укажите основание: заказ или рассрочку")
-    order_id = _id_arg(data.get("order_id"), "Заказ не найден") if data.get("order_id") else 0
-    deal_id = _id_arg(data.get("deal_id"), "Сделка не найдена") if data.get("deal_id") else 0
+    order_id = _id_arg(data.get("order_id"), "Заказ не найден — обновите список") if data.get("order_id") else 0
+    deal_id = _id_arg(data.get("deal_id"), "Сделка не найдена — обновите список") if data.get("deal_id") else 0
     lines = _parse_lines(data.get("lines"))
     accounts = await _load_accounts([a for a, _ in lines])
     for n, (acc_id, _) in enumerate(lines, start=1):
@@ -914,7 +914,7 @@ async def record_receipt(actor: Actor, data: dict) -> dict:
             "SELECT id, user_id, currency, agent_name FROM orders WHERE id = $1", order_id
         )
         if not head:
-            raise AccountingError("Заказ не найден", status=404)
+            raise AccountingError("Заказ не найден — обновите список", status=404)
         if int(head["user_id"]) != actor.user_id and actor.role not in ROLES_SEE_ALL:
             raise AccountingError("Оплату по чужому заказу записывает руководитель", status=403)
         target_cur = (head["currency"] or base_currency()).upper()
@@ -924,7 +924,7 @@ async def record_receipt(actor: Actor, data: dict) -> dict:
             "SELECT id, currency, buyer_name, kind FROM machine_deals WHERE id = $1", deal_id
         )
         if not head:
-            raise AccountingError("Сделка не найдена", status=404)
+            raise AccountingError("Сделка не найдена — обновите список", status=404)
         if head["kind"] != "credit":
             raise AccountingError("Поступления записываются только по рассрочке")
         target_cur = (head["currency"] or base_currency()).upper()
@@ -982,7 +982,7 @@ async def record_receipt(actor: Actor, data: dict) -> dict:
 
                 deal = await machines._lock_deal(txn, deal_id)
                 if not deal:
-                    raise AccountingError("Сделка не найдена", status=404)
+                    raise AccountingError("Сделка не найдена — обновите список", status=404)
                 if deal["closed_at"]:
                     raise AccountingError("Рассрочка уже закрыта")
                 rest = await _deal_remaining_cents(txn, deal_id)
@@ -1116,7 +1116,7 @@ async def record_expense(actor: Actor, data: dict) -> dict:
     категории у владельца нет, и без текста расход через месяц не объяснить."""
     await require_enabled()
     if actor.role not in ROLES_RECORD:
-        raise AccountingError("Нет доступа", status=403)
+        raise AccountingError("У вас нет доступа к этому действию", status=403)
     key = _request_key(actor, "expense", data.get("idempotency_key"))
     prev = await _find_by_key(key)
     if prev is not None:
@@ -1166,7 +1166,7 @@ async def record_transfer(actor: Actor, data: dict) -> dict:
     отчёт о прибыли, а не остаток счёта."""
     await require_enabled()
     if actor.role not in ROLES_RECORD:
-        raise AccountingError("Нет доступа", status=403)
+        raise AccountingError("У вас нет доступа к этому действию", status=403)
     key = _request_key(actor, "transfer", data.get("idempotency_key"))
     prev = await _find_by_key(key)
     if prev is not None:
@@ -1174,7 +1174,7 @@ async def record_transfer(actor: Actor, data: dict) -> dict:
     from_id = _account_arg(data.get("from_account_id"), "Откуда")
     to_id = _account_arg(data.get("to_account_id"), "Куда")
     if from_id == to_id:
-        raise AccountingError("Счета «откуда» и «куда» совпадают")
+        raise AccountingError("Счёт «откуда» и счёт «куда» — один и тот же: выберите разные")
     src = await _active_account(from_id, "Откуда")
     dst = await _active_account(to_id, "Куда")
     out_cents = parse_cents(data.get("amount"))
@@ -1196,7 +1196,7 @@ async def record_transfer(actor: Actor, data: dict) -> dict:
         kind = "exchange"
         parsed_in = parse_cents(data.get("amount_in"))
         if parsed_in is None:
-            raise AccountingError(f"Обмен: сколько получили в {dst_cur}")
+            raise AccountingError(f"Укажите, сколько получили в {dst_cur}")
         in_cents = parsed_in
         cbu = await resolve_rates({src_cur, dst_cur}, None, doc_date)
         _check_ceiling(out_cents, src_cur, cbu)
@@ -1208,7 +1208,7 @@ async def record_transfer(actor: Actor, data: dict) -> dict:
         else:
             base_cents = to_base_cents(out_cents, src_cur, cbu[src_cur].quote)
         if base_cents <= 0:
-            raise AccountingError("Сумма обмена слишком мала")
+            raise AccountingError("Сумма обмена слишком мала — увеличьте её")
 
         def actual(cur: str, cents: int) -> RateInfo:
             if cur == base:
@@ -1251,7 +1251,7 @@ async def close_day(actor: Actor, data: dict) -> dict:
     ежедневный вопрос владельца «что там, сколько»."""
     await require_enabled()
     if actor.role not in ROLES_RECORD:
-        raise AccountingError("Нет доступа", status=403)
+        raise AccountingError("У вас нет доступа к этому действию", status=403)
     key = _request_key(actor, "close_day", data.get("idempotency_key"))
     prev = await _find_by_key(key)
     if prev is not None:
@@ -1392,7 +1392,7 @@ async def journal(actor: Actor, filters: dict) -> dict:
             raise AccountingError("Дата должна быть в формате ГГГГ-ММ-ДД") from e
         where.append(f"d.doc_date <= {p(until)}")
     if filters.get("order_id"):
-        where.append(f"d.order_id = {p(_id_arg(filters['order_id'], 'Заказ не найден'))}")
+        where.append(f"d.order_id = {p(_id_arg(filters['order_id'], 'Заказ не найден — обновите список'))}")
     try:
         limit = max(1, min(int(filters.get("limit") or 100), 300))
     except (TypeError, ValueError):
@@ -1467,7 +1467,7 @@ def _doc_view_sync(d: dict, entries: list[dict], actor: Actor, today: str) -> di
 
 async def get_doc(actor: Actor, doc_id: Any) -> dict:
     await require_enabled()
-    doc_id = _id_arg(doc_id, "Документ не найден")
+    doc_id = _id_arg(doc_id, "Документ не найден — обновите список")
     row = await adb_core.fetchrow(
         "SELECT d.*, p.status AS payment_status, r.id AS receipt_alive FROM acc_docs d "
         "LEFT JOIN payments p ON p.id = d.payment_id "
@@ -1475,9 +1475,9 @@ async def get_doc(actor: Actor, doc_id: Any) -> dict:
         doc_id,
     )
     if not row:
-        raise AccountingError("Документ не найден", status=404)
+        raise AccountingError("Документ не найден — обновите список", status=404)
     if actor.role not in ROLES_SEE_ALL and int(row["created_by"]) != actor.user_id:
-        raise AccountingError("Документ не найден", status=404)
+        raise AccountingError("Документ не найден — обновите список", status=404)
     entries = (await _entries_for([doc_id])).get(doc_id, [])
     view = _doc_view_sync(row, entries, actor, today_str())
     if row["kind"] == "reconcile":
@@ -1542,18 +1542,18 @@ async def _reverse_confirmed_payment(actor: Actor, payment_id: int, order_id: in
 async def void_doc(actor: Actor, data: dict) -> dict:
     await require_enabled()
     if actor.role not in ROLES_RECORD:
-        raise AccountingError("Нет доступа", status=403)
+        raise AccountingError("У вас нет доступа к этому действию", status=403)
     reason = _text(data.get("reason"), 300)
     if len(reason) < 3:
         raise AccountingError("Напишите причину отмены")
-    doc_id = _id_arg(data.get("doc_id"), "Документ не найден")
+    doc_id = _id_arg(data.get("doc_id"), "Документ не найден — обновите список")
     d = await adb_core.fetchrow(
         "SELECT d.*, p.status AS payment_status FROM acc_docs d "
         "LEFT JOIN payments p ON p.id = d.payment_id WHERE d.id = $1",
         doc_id,
     )
     if not d:
-        raise AccountingError("Документ не найден", status=404)
+        raise AccountingError("Документ не найден — обновите список", status=404)
     if d["status"] == "void":
         return {"ok": True, "doc_id": doc_id, "already": True}
     denied = _can_void(actor, d, today_str())
@@ -1580,7 +1580,7 @@ async def void_doc(actor: Actor, data: dict) -> dict:
                 int(d["machine_receipt_id"]), user_id=actor.user_id, full_name=actor.name
             )
             if not res.get("ok"):
-                raise AccountingError(res.get("error") or "Поступление по рассрочке не удалено")
+                raise AccountingError(res.get("error") or "Поступление по рассрочке не удалено — обновите экран и повторите")
     rc = await adb_core.execute(
         "UPDATE acc_docs SET status = 'void', void_reason = $1, voided_by = $2, voided_by_name = $3, "
         "voided_at = $4 WHERE id = $5 AND status = 'posted'",

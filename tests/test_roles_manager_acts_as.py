@@ -231,7 +231,7 @@ def test_bot_return_card_goes_to_manager_and_he_marks_goods(isolated_db):
     # Подтверждает возврат по-прежнему только руководство.
     conf = _Call(f"ret_ok:{ret_id}", uid=2)
     _run(cb_return_confirm(conf, _Bot()))
-    assert any("доступа" in a.lower() for a in conf.alerts)
+    assert any("руководител" in a.lower() for a in conf.alerts)
 
 
 # ─── Бот: назначение ролей и команды ─────────────────────────────────────────

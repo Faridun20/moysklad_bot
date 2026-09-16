@@ -314,7 +314,7 @@ def test_publish_without_channel_is_503(isolated_db, monkeypatch):
 
     r = _post(client, "/api/channel/publish", 2, kind="arrival", text="что-то")
     assert r.status_code == 503
-    assert "CHANNEL_ID" in r.json()["detail"]
+    assert "Канал компании не настроен" in r.json()["detail"]
 
 
 def test_publish_rejects_empty_text(isolated_db, monkeypatch):

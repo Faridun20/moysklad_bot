@@ -102,9 +102,9 @@ async def create_container(
 ) -> dict:
     number_norm = normalize_number(number)
     if not number_norm:
-        return {"ok": False, "error": "Номер контейнера обязателен"}
+        return {"ok": False, "error": "Укажите номер контейнера"}
     if await adb_core.fetchrow("SELECT id FROM containers WHERE number = $1", number_norm):
-        return {"ok": False, "error": f"Контейнер {number_norm} уже заведён"}
+        return {"ok": False, "error": f"Контейнер {number_norm} уже заведён — откройте его в списке"}
 
     stamp = now_str()
     sql = (
@@ -186,9 +186,9 @@ async def update_container(
     allowed = {"eta_date", "notes"}
     unknown = set(fields) - allowed
     if unknown:
-        return {"ok": False, "error": f"Нельзя менять поля: {', '.join(sorted(unknown))}"}
+        return {"ok": False, "error": "Эти поля изменить нельзя — обновите приложение"}
     if not fields:
-        return {"ok": False, "error": "Нечего менять"}
+        return {"ok": False, "error": "Вы ничего не изменили"}
     keys = sorted(fields)
     assignments = ", ".join(f"{k} = ${i + 1}" for i, k in enumerate(keys))
     params = [fields[k] for k in keys] + [now_str(), container_id]
@@ -198,7 +198,7 @@ async def update_container(
         *params,
     )
     if not rows:
-        return {"ok": False, "error": "Контейнер не найден"}
+        return {"ok": False, "error": "Контейнер не найден — обновите список"}
     await _audit(user_id, full_name, "container_updated", f"#{container_id}: {', '.join(keys)}")
     return {"ok": True}
 
@@ -245,13 +245,13 @@ async def _require_open_window(container_id: int) -> dict | None:
         "SELECT status, arrived_at FROM containers WHERE id = $1", container_id
     )
     if not row:
-        return {"ok": False, "error": "Контейнер не найден"}
+        return {"ok": False, "error": "Контейнер не найден — обновите список"}
     window = edit_window(dict(row))
     if window["open"]:
         return None
     return {
         "ok": False,
-        "error": f"Приёмка закрыта — правки принимались {EDIT_WINDOW_HOURS} ч после прибытия",
+        "error": f"Приёмка закрыта: поправить состав можно было {EDIT_WINDOW_HOURS} ч после прибытия — дальше правит руководитель",
         "window_closed": True,
     }
 
@@ -286,12 +286,12 @@ async def delete_container(container_id: int, *, user_id: int, full_name: str = 
                 "SELECT number, status, arrived_at FROM containers WHERE id = $1", container_id
             )
             if not row:
-                return {"ok": False, "error": "Контейнер не найден"}
+                return {"ok": False, "error": "Контейнер не найден — обновите список"}
             window = edit_window(dict(row))
             if not window["open"]:
                 return {
                     "ok": False,
-                    "error": f"Приёмка закрыта — правки принимались {EDIT_WINDOW_HOURS} ч после прибытия",
+                    "error": f"Приёмка закрыта: поправить состав можно было {EDIT_WINDOW_HOURS} ч после прибытия — дальше правит руководитель",
                 }
             # Оприходованный контейнер уносит с собой свою приходную накладную.
             # Иначе строка container_receipt исчезала, а накладная оставалась
@@ -317,15 +317,15 @@ async def delete_container(container_id: int, *, user_id: int, full_name: str = 
         logger.info("Удаление контейнера #%s отклонено (%s): %s", container_id, e.code, e.message)
         if e.code == "insufficient_stock":
             error = (
-                "Нельзя удалить: товар из этого контейнера уже отгружен, и отмена его "
-                "прихода увела бы остаток в минус. Сначала отмените расходные накладные."
+                "Удалить нельзя: товар из этого контейнера уже отгружен, и отмена его "
+                "прихода увела бы остаток в минус. Сначала отмените отгрузки."
             )
         else:
-            error = f"Нельзя удалить: не удалось отменить приход контейнера — {e.message}"
+            error = f"Удалить нельзя: не получилось отменить приход контейнера — {e.message}"
         return {"ok": False, "code": e.code, "error": error, "details": e.details}
     details = f"#{container_id} · {row['number']}"
     if cancelled_invoice:
-        details += f" · приход (накладная #{cancelled_invoice}) отменён"
+        details += f" · приход #{cancelled_invoice} отменён"
     await _audit(user_id, full_name, "container_deleted", details)
     return {"ok": True, "invoice_cancelled": cancelled_invoice}
 
@@ -352,9 +352,9 @@ async def add_item(
     """
     clean = (name or "").strip()[:_NAME_MAX]
     if not clean:
-        return {"ok": False, "error": "Название позиции обязательно"}
+        return {"ok": False, "error": "Укажите название позиции"}
     if expected_qty < 0 or (arrived_qty is not None and arrived_qty < 0):
-        return {"ok": False, "error": "Количество не может быть отрицательным"}
+        return {"ok": False, "error": "Количество не может быть меньше нуля — введите 0 или больше"}
     guard = await _require_open_window(container_id)
     if guard:
         return guard
@@ -376,7 +376,7 @@ async def add_item(
             # приходом в никуда.
             known = await txn.fetchval("SELECT id FROM products WHERE id = $1", link_id)
             if known is None:
-                return {"ok": False, "error": f"Товар #{link_id} не найден"}
+                return {"ok": False, "error": f"Товар #{link_id} не найден в каталоге — выберите его заново"}
         if USE_POSTGRES:
             item_id = await txn.fetchval(sql + " RETURNING id", *values)
         else:
@@ -412,13 +412,13 @@ async def link_item(container_id: int, item_id: int, *, product_id: int) -> dict
         item_id, container_id,
     )
     if not row:
-        return {"ok": False, "error": "Позиция не найдена"}
+        return {"ok": False, "error": "Позиция не найдена — обновите список"}
 
     stamp = now_str()
     async with adb_core.transaction() as txn:
         known = await txn.fetchval("SELECT id FROM products WHERE id = $1", clean_id)
         if known is None:
-            return {"ok": False, "error": f"Товар #{clean_id} не найден"}
+            return {"ok": False, "error": f"Товар #{clean_id} не найден в каталоге — выберите его заново"}
         # DELETE+INSERT вместо UPSERT: синтаксис ON CONFLICT у Postgres и SQLite
         # совпадает не во всех версиях, а строка здесь ровно одна.
         await txn.execute("DELETE FROM container_item_products WHERE item_id = $1", item_id)
@@ -454,7 +454,7 @@ async def delete_item(container_id: int, item_id: int) -> dict:
             "DELETE FROM container_items WHERE id = $1 AND container_id = $2",
             item_id, container_id,
         )
-    return {"ok": bool(rows)} if rows else {"ok": False, "error": "Позиция не найдена"}
+    return {"ok": bool(rows)} if rows else {"ok": False, "error": "Позиция не найдена — обновите список"}
 
 
 async def list_items(container_id: int) -> list[dict]:
@@ -557,7 +557,7 @@ async def set_arrived_quantities(
     знает, что сверка устояла.
     """
     if not quantities:
-        return {"ok": False, "error": "Нечего сохранять"}
+        return {"ok": False, "error": "Нечего сохранять — впишите прибывшие количества"}
     guard = await _require_open_window(container_id)
     if guard:
         return guard
@@ -565,14 +565,14 @@ async def set_arrived_quantities(
     unknown = set(quantities) - known
     if unknown:
         # Позиция из другого контейнера — это подстановка чужого id, а не опечатка.
-        return {"ok": False, "error": "Позиция не из этого контейнера"}
+        return {"ok": False, "error": "Эта позиция не из этого контейнера — обновите экран"}
 
     stamp = now_str()
     async with adb_core.transaction() as txn:
         for item_id, raw in quantities.items():
             value = _qty(raw)
             if value is not None and value < 0:
-                return {"ok": False, "error": "Количество не может быть отрицательным"}
+                return {"ok": False, "error": "Количество не может быть меньше нуля — введите 0 или больше"}
             await txn.execute(
                 "UPDATE container_items SET arrived_qty = $1 WHERE id = $2 AND container_id = $3",
                 value, int(item_id), container_id,
@@ -607,7 +607,7 @@ async def mark_arrived(container_id: int, *, user_id: int, full_name: str = "") 
     if not rows:
         current = await adb_core.fetchrow("SELECT status FROM containers WHERE id = $1", container_id)
         if not current:
-            return {"ok": False, "error": "Контейнер не найден"}
+            return {"ok": False, "error": "Контейнер не найден — обновите список"}
         return {"ok": False, "error": "Контейнер уже отмечен прибывшим",
                 "current": current["status"]}
     await _audit(user_id, full_name, "container_arrived", f"#{container_id}")

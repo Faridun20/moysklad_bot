@@ -249,9 +249,9 @@ async def _validate(
 ) -> str:
     """Проверки полей заявки ДО транзакции (курс читает синхронный слой)."""
     if kind not in KINDS:
-        return f"Тип заявки: {' / '.join(KINDS)}"
+        return "Выберите тип сделки: бронь, продажа или рассрочка"
     if not (buyer_name or "").strip():
-        return "Покупатель обязателен"
+        return "Укажите покупателя"
     if kind == "reserve":
         cur_err = machines.currency_error(currency)
         if cur_err:
@@ -267,7 +267,7 @@ async def _validate(
         return err
     if kind == "credit" and not (buyer_passport or "").strip():
         # Договор рассрочки без паспорта не составить.
-        return "Паспорт покупателя обязателен для рассрочки"
+        return "Для рассрочки укажите паспорт покупателя"
     return ""
 
 
@@ -377,7 +377,7 @@ async def submit(
         async with adb_core.transaction() as txn:
             machine = await machines.lock_machine(txn, machine_id)
             if not machine:
-                return {"ok": False, "error": "Машина не найдена"}
+                return {"ok": False, "error": "Машина не найдена — обновите список"}
             active = await machines.active_request_locked(txn, machine_id)
             if active:
                 return machines.pending_refusal(active)
@@ -494,12 +494,12 @@ async def approve(request_id: int, *, actor_id: int, actor_name: str = "",
             head = await txn.fetchrow(
                 "SELECT machine_id FROM machine_deal_requests WHERE id = $1", request_id)
             if not head:
-                return {"ok": False, "error": "Заявка не найдена"}
+                return {"ok": False, "error": "Заявка не найдена — обновите список"}
             # Порядок замков — «машина → заявка», как у `submit`.
             machine = await machines.lock_machine(txn, int(head["machine_id"]))
             req = await _lock_request(txn, request_id)
             if not req or not machine:
-                return {"ok": False, "error": "Заявка не найдена"}
+                return {"ok": False, "error": "Заявка не найдена — обновите список"}
             if req["status"] != "pending":
                 return _stale(req)
             applied = await _apply_locked(txn, req, machine)
@@ -530,7 +530,7 @@ async def _decide_without_apply(
     async with adb_core.transaction() as txn:
         req = await _lock_request(txn, request_id)
         if not req:
-            return {"ok": False, "error": "Заявка не найдена"}
+            return {"ok": False, "error": "Заявка не найдена — обновите список"}
         if req["status"] not in from_statuses:
             return _stale(req)
         placeholders = ", ".join(f"${i + 6}" for i in range(len(from_statuses)))
@@ -587,7 +587,7 @@ async def cancel(request_id: int, *, actor_id: int, actor_name: str = "",
     """Отозвать свою заявку (клиент передумал). Руководство — любую живую."""
     req = await get_request(request_id)
     if not req:
-        return {"ok": False, "error": "Заявка не найдена"}
+        return {"ok": False, "error": "Заявка не найдена — обновите список"}
     if int(req["created_by"]) != int(actor_id) and actor_role not in APPROVER_ROLES:
         return {"ok": False, "forbidden": True, "error": "Отозвать можно только свою заявку"}
     res = await _decide_without_apply(
@@ -621,9 +621,9 @@ async def resubmit(
     """
     req = await get_request(request_id)
     if not req:
-        return {"ok": False, "error": "Заявка не найдена"}
+        return {"ok": False, "error": "Заявка не найдена — обновите список"}
     if int(req["created_by"]) != int(actor_id):
-        return {"ok": False, "forbidden": True, "error": "Доработать может только автор заявки"}
+        return {"ok": False, "forbidden": True, "error": "Доработать заявку может только тот, кто её создал"}
     if req["status"] != "rework":
         return _stale(req)
     kind = req["kind"]
@@ -650,7 +650,7 @@ async def resubmit(
         machine = await machines.lock_machine(txn, int(req["machine_id"]))
         locked = await _lock_request(txn, request_id)
         if not locked or not machine:
-            return {"ok": False, "error": "Заявка не найдена"}
+            return {"ok": False, "error": "Заявка не найдена — обновите список"}
         if locked["status"] != "rework":
             return _stale(locked)
         refusal = _status_refusal(kind, machine)
@@ -699,10 +699,10 @@ async def unreserve(machine_id: int, *, actor_id: int, actor_name: str = "",
     async with adb_core.transaction() as txn:
         machine = await machines.lock_machine(txn, machine_id)
         if not machine:
-            return {"ok": False, "error": "Машина не найдена"}
+            return {"ok": False, "error": "Машина не найдена — обновите список"}
         if machine["status"] != "reserved":
             label = machines.STATUS_LABELS.get(machine["status"], machine["status"])
-            return {"ok": False, "error": f"Машина не в брони — сейчас «{label}»",
+            return {"ok": False, "error": f"Машина не забронирована — сейчас «{label}»",
                     "current": machine["status"]}
         active = await machines.active_request_locked(txn, machine_id)
         if active:

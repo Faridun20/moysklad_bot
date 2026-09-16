@@ -87,11 +87,11 @@ def _normalize_items(items: list[dict], invoice_type: str) -> list[dict]:
     и уводит остаток в −2. Складываем количества до проверки.
     """
     if not items:
-        raise InvoiceError("empty_invoice", "В накладной нет позиций")
+        raise InvoiceError("empty_invoice", "В документе нет ни одной позиции — добавьте товар")
     if len(items) > MAX_POSITIONS:
         raise InvoiceError(
             "too_many_positions",
-            f"В накладной больше {MAX_POSITIONS} позиций — разбейте на несколько",
+            f"В одном документе не больше {MAX_POSITIONS} позиций — разбейте на несколько",
         )
 
     merged: dict[int, dict] = {}
@@ -99,14 +99,14 @@ def _normalize_items(items: list[dict], invoice_type: str) -> list[dict]:
         try:
             product_id = int(raw.get("product_id") or 0)
         except (TypeError, ValueError):
-            raise InvoiceError("bad_product_id", f"Некорректный товар: {raw.get('product_id')!r}")
+            raise InvoiceError("bad_product_id", "В позиции выбран неизвестный товар — выберите его из каталога")
         if product_id <= 0:
-            raise InvoiceError("bad_product_id", "В позиции не указан товар")
+            raise InvoiceError("bad_product_id", "В позиции не выбран товар — выберите его из каталога")
 
         try:
             quantity = float(raw.get("quantity") or 0)
         except (TypeError, ValueError):
-            raise InvoiceError("bad_quantity", f"Некорректное количество: {raw.get('quantity')!r}")
+            raise InvoiceError("bad_quantity", "Количество должно быть числом больше нуля")
         if quantity <= 0:
             raise InvoiceError(
                 "bad_quantity", f"Количество должно быть больше нуля (товар #{product_id})"
@@ -119,15 +119,15 @@ def _normalize_items(items: list[dict], invoice_type: str) -> list[dict]:
             # закупочную цену не всегда вводят.
             if invoice_type == "outgoing":
                 raise InvoiceError(
-                    "price_required", f"Для расхода нужна цена (товар #{product_id})"
+                    "price_required", f"Укажите цену — без неё отгрузку не оформить (товар #{product_id})"
                 )
         else:
             try:
                 price_cents = int(price_cents)
             except (TypeError, ValueError):
-                raise InvoiceError("bad_price", f"Некорректная цена: {raw.get('price_cents')!r}")
+                raise InvoiceError("bad_price", f"Цена должна быть числом (товар #{product_id})")
             if price_cents < 0:
-                raise InvoiceError("bad_price", f"Цена не может быть отрицательной (#{product_id})")
+                raise InvoiceError("bad_price", f"Цена не может быть отрицательной (товар #{product_id})")
 
         if product_id in merged:
             prev = merged[product_id]
@@ -137,7 +137,7 @@ def _normalize_items(items: list[dict], invoice_type: str) -> list[dict]:
             if prev["price_cents"] != price_cents:
                 raise InvoiceError(
                     "duplicate_price_conflict",
-                    f"Товар #{product_id} указан дважды с разными ценами",
+                    f"Товар #{product_id} добавлен дважды с разными ценами — оставьте одну строку",
                 )
         else:
             merged[product_id] = {
@@ -252,7 +252,7 @@ async def create_invoice_in(
     всё, что успела записать до него.
     """
     if invoice_type not in INVOICE_TYPES:
-        raise InvoiceError("bad_type", f"Неизвестный тип: {invoice_type}")
+        raise InvoiceError("bad_type", "Неизвестный вид движения — выберите приход или отгрузку")
 
     positions = _normalize_items(items, invoice_type)
     date_str = invoice_date or _today()
@@ -273,7 +273,8 @@ async def create_invoice_in(
     if missing:
         raise InvoiceError(
             "unknown_product",
-            f"Товары не найдены: {', '.join(map(str, missing))}",
+            f"Товары не найдены в каталоге: {', '.join('#' + str(m) for m in missing)} — "
+            "обновите каталог и выберите их заново",
             {"product_ids": missing},
         )
 
@@ -283,19 +284,19 @@ async def create_invoice_in(
         warehouse_id,
     )
     if wh_row is None:
-        raise InvoiceError("unknown_warehouse", f"Склад #{warehouse_id} не найден")
+        raise InvoiceError("unknown_warehouse", f"Склад #{warehouse_id} не найден — выберите склад из списка")
     # Архивный склад не предлагается в форме (`list_warehouses(include_archived=
     # False)`), но проверяем и здесь — прямой вызов ручки с чужим id не должен
     # тихо провести накладную на склад, который уже считается пустым и закрытым.
     # Пока архивных складов нет вовсе (сегодняшний случай), это условие никогда
     # не срабатывает — поведение при одном складе не меняется.
     if bool(wh_row["archived"]):
-        raise InvoiceError("archived_warehouse", f"Склад #{warehouse_id} в архиве")
+        raise InvoiceError("archived_warehouse", f"Склад #{warehouse_id} убран в архив — выберите действующий склад")
 
     if counterparty_id is not None:
         cp = await txn.fetchval("SELECT id FROM counterparties WHERE id = $1", counterparty_id)
         if cp is None:
-            raise InvoiceError("unknown_counterparty", f"Контрагент #{counterparty_id} не найден")
+            raise InvoiceError("unknown_counterparty", f"Клиент или поставщик #{counterparty_id} не найден — выберите его в справочнике «Клиенты и поставщики»")
 
     # 2) Блокируем остатки и проверяем достаточность — до записи.
     current = await _lock_stock(txn, product_ids, warehouse_id)
@@ -311,10 +312,12 @@ async def create_invoice_in(
         ]
         if short:
             names = ", ".join(
-                f"#{s['product_id']} (нужно {s['need']:g}, есть {s['have']:g})" for s in short
+                f"товар #{s['product_id']}: нужно {s['need']:g}, на складе {s['have']:g}" for s in short
             )
             raise InvoiceError(
-                "insufficient_stock", f"Не хватает остатка: {names}", {"positions": short}
+                "insufficient_stock",
+                f"Не хватает товара на складе — {names}. Уменьшите количество или оформите приход",
+                {"positions": short},
             )
 
     # 3) Номер и шапка.
@@ -502,10 +505,10 @@ async def historical_invoice_refusal(invoice_id: int, *, txn=None) -> str | None
     fix = (
         "Если клиент вернул товар — оформите возврат по заказу."
         if row["type"] == "outgoing"
-        else "Если остаток расходится с фактом — поправьте его новой накладной."
+        else "Если остаток расходится с фактом — поправьте его новым приходом или списанием."
     )
     return (
-        f"Накладная {row['invoice_number']} перенесена из МойСклад и отменить её нельзя: "
+        f"Движение {row['invoice_number']} перенесено из МойСклад, и отменить его нельзя: "
         f"остаток склада приехал снимком, который эту {what} уже учитывает, и отмена "
         f"сдвинула бы склад на товар, которого перенос не двигал. {fix}"
     )
@@ -524,10 +527,10 @@ async def cancel_invoice_in(txn, invoice_id: int, cancelled_by: int | None = Non
             invoice_id,
         )
     if inv is None:
-        raise InvoiceError("not_found", f"Накладная #{invoice_id} не найдена")
+        raise InvoiceError("not_found", f"Документ #{invoice_id} не найден — обновите список")
     if inv["status"] == "cancelled":
         # Идемпотентно: повторная отмена не двигает остаток второй раз.
-        raise InvoiceError("already_cancelled", "Накладная уже отменена")
+        raise InvoiceError("already_cancelled", "Этот документ уже отменён")
     # Здесь, а не только в ручке: отмену зовут и заказ (cancel_shipment), и
     # контейнер, и приёмка — запрет в одном месте закрывает все пути сразу.
     historical = await historical_invoice_refusal(invoice_id, txn=txn)
@@ -540,7 +543,7 @@ async def cancel_invoice_in(txn, invoice_id: int, cancelled_by: int | None = Non
         invoice_id,
     )
     if not rows:
-        raise InvoiceError("empty_invoice", "В накладной нет позиций — нечего откатывать")
+        raise InvoiceError("empty_invoice", "В документе нет позиций — отменять нечего")
 
     # Откат меняет знак исходного движения.
     sign = -1.0 if inv["type"] == "incoming" else 1.0
@@ -559,13 +562,13 @@ async def cancel_invoice_in(txn, invoice_id: int, cancelled_by: int | None = Non
         ]
         if short:
             names = ", ".join(
-                f"#{s['product_id']} (нужно вернуть {s['need']:g}, есть {s['have']:g})"
+                f"товар #{s['product_id']}: нужно вернуть {s['need']:g}, на складе {s['have']:g}"
                 for s in short
             )
             raise InvoiceError(
                 "insufficient_stock",
-                f"Отмена увела бы остаток в минус: {names}. "
-                f"Товар уже отгружен — сначала отмените расходные накладные.",
+                f"Отменить нельзя: остаток ушёл бы в минус — {names}. "
+                f"Товар уже отгружен — сначала отмените отгрузки.",
                 {"positions": short},
             )
 
@@ -657,7 +660,7 @@ def _clean_warehouse_name(raw: str | None) -> str:
     if not text:
         raise WarehouseError("bad_name", "Укажите название склада")
     if len(text) > _WAREHOUSE_NAME_MAX:
-        raise WarehouseError("bad_name", "Слишком длинное название склада")
+        raise WarehouseError("bad_name", "Название склада слишком длинное — сократите его")
     return text
 
 
@@ -707,13 +710,13 @@ async def rename_warehouse(warehouse_id: int, name: str) -> dict:
     async with adb_core.transaction() as txn:
         row = await txn.fetchrow("SELECT id FROM warehouses WHERE id = $1", int(warehouse_id))
         if row is None:
-            raise WarehouseError("not_found", f"Склад #{warehouse_id} не найден")
+            raise WarehouseError("not_found", f"Склад #{warehouse_id} не найден — обновите список")
         dupe = await txn.fetchrow(
             "SELECT id FROM warehouses WHERE lower(name) = lower($1) AND id <> $2",
             clean, int(warehouse_id),
         )
         if dupe is not None:
-            raise WarehouseError("duplicate_name", f"Склад «{clean}» уже есть")
+            raise WarehouseError("duplicate_name", f"Склад «{clean}» уже заведён — выберите его или назовите новый иначе")
         await txn.execute("UPDATE warehouses SET name = $1 WHERE id = $2", clean, int(warehouse_id))
     return {"ok": True, "warehouse_id": int(warehouse_id), "name": clean}
 
@@ -725,7 +728,7 @@ async def archive_warehouse(warehouse_id: int, *, archived_by: int | None = None
     async with adb_core.transaction() as txn:
         row = await txn.fetchrow("SELECT id FROM warehouses WHERE id = $1", wid)
         if row is None:
-            raise WarehouseError("not_found", f"Склад #{wid} не найден")
+            raise WarehouseError("not_found", f"Склад #{wid} не найден — обновите список")
         already = await txn.fetchval(
             "SELECT warehouse_id FROM warehouse_archived WHERE warehouse_id = $1", wid
         )
@@ -743,7 +746,7 @@ async def archive_warehouse(warehouse_id: int, *, archived_by: int | None = None
         if remaining <= 1:
             raise WarehouseError(
                 "last_active_warehouse",
-                "Нельзя архивировать последний активный склад",
+                "Это последний действующий склад — его нельзя убрать в архив",
             )
         await txn.execute(
             "INSERT INTO warehouse_archived (warehouse_id, archived_at, archived_by) "
@@ -792,7 +795,7 @@ async def set_order_warehouse(order_id: int, warehouse_id: int) -> dict:
         wid,
     )
     if row is None:
-        raise WarehouseError("unknown_warehouse", f"Склад #{wid} не найден или в архиве")
+        raise WarehouseError("unknown_warehouse", f"Склад #{wid} не найден или убран в архив — выберите другой")
     if _db.USE_POSTGRES:
         await adb_core.execute(
             "INSERT INTO order_warehouse (order_id, warehouse_id) VALUES ($1, $2) "
@@ -844,11 +847,11 @@ async def transfer_stock(
     try:
         pid = int(product_id)
     except (TypeError, ValueError):
-        return {"ok": False, "code": "bad_product_id", "reason": "Некорректный товар"}
+        return {"ok": False, "code": "bad_product_id", "reason": "Не выбран товар"}
     try:
         qty = float(quantity)
     except (TypeError, ValueError):
-        return {"ok": False, "code": "bad_quantity", "reason": "Некорректное количество"}
+        return {"ok": False, "code": "bad_quantity", "reason": "Количество должно быть числом больше нуля"}
     if qty <= 0:
         return {"ok": False, "code": "bad_quantity", "reason": "Количество должно быть больше нуля"}
     from_wh = int(from_warehouse_id)
@@ -857,7 +860,7 @@ async def transfer_stock(
         return {
             "ok": False,
             "code": "same_warehouse",
-            "reason": "Склад отправления и назначения совпадают",
+            "reason": "Склад отправления и назначения — один и тот же: выберите разные",
         }
 
     try:
@@ -872,17 +875,18 @@ async def transfer_stock(
             missing = [w for w in (from_wh, to_wh) if w not in found]
             if missing:
                 raise WarehouseError(
-                    "unknown_warehouse", f"Склад не найден: {', '.join(map(str, missing))}"
+                    "unknown_warehouse",
+                    f"Склад не найден: {', '.join('#' + str(m) for m in missing)} — обновите список",
                 )
             archived = [w for w in (from_wh, to_wh) if found.get(w)]
             if archived:
                 raise WarehouseError(
                     "archived_warehouse",
-                    f"Склад в архиве: {', '.join(map(str, archived))}",
+                    f"Склад убран в архив: {', '.join('#' + str(a) for a in archived)} — выберите действующий",
                 )
             product = await txn.fetchval("SELECT id FROM products WHERE id = $1", pid)
             if product is None:
-                raise WarehouseError("unknown_product", f"Товар #{pid} не найден")
+                raise WarehouseError("unknown_product", f"Товар #{pid} не найден в каталоге — выберите его заново")
 
             # Блокируем обе строки остатка в детерминированном порядке (по
             # warehouse_id) — как позиции накладной сортируются по product_id:
@@ -899,7 +903,7 @@ async def transfer_stock(
             if have_from < qty:
                 raise WarehouseError(
                     "insufficient_stock",
-                    f"На складе не хватает остатка: нужно {qty:g}, есть {have_from:g}",
+                    f"На складе не хватает товара: нужно {qty:g}, есть {have_from:g} — уменьшите количество или оформите приход",
                     {"have": have_from, "need": qty},
                 )
 

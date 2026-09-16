@@ -34,7 +34,7 @@ def test_link_rejects_missing_args(isolated_db):
     db = isolated_db
     res = asyncio.run(db.link_payment_to_order(0, 1, linked_by=99))
     assert res["ok"] is False
-    assert "обязательны" in res["error"]
+    assert "Выберите платёж и заказ" in res["error"]
 
 
 def test_link_rejects_missing_payment(isolated_db):

@@ -295,7 +295,7 @@ def test_start_still_greets_manager(isolated_db, monkeypatch):
     asyncio.run(start.cmd_start(msg, _State()))
 
     assert len(msg.answers) == 1  # приветствие одним сообщением, без досылки сводки
-    assert "Привет" in msg.answers[0][0]
+    assert "Здравствуйте" in msg.answers[0][0]
     assert calls["commands"] == 1
 
 

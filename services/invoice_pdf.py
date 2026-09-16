@@ -32,6 +32,22 @@ _TYPE_TITLE = {
     "outgoing": "РАСХОДНАЯ НАКЛАДНАЯ",
 }
 
+# Жалоба владельца: «многие пункты написаны одинаково». Одно и то же слово
+# «Контрагент» стояло и над тем, кто у нас покупает, и над тем, у кого покупаем
+# мы. В накладной сторона называется по существу: отгружаем — клиенту,
+# приходуем — от поставщика (словарь интерфейса в CLAUDE.md).
+_PARTY_LABEL = {
+    "incoming": "Поставщик",
+    "outgoing": "Клиент",
+}
+
+# Кто ставит подпись — тоже зависит от направления: по расходной товар
+# отгружают и получают, по приходной передают и принимают.
+_SIGN_LABELS = {
+    "incoming": ("Передал — подпись", "Принял — подпись"),
+    "outgoing": ("Отгрузил — подпись", "Получил — подпись"),
+}
+
 # Кэш data-URI логотипа: файл на диске не меняется в течение жизни процесса,
 # а перечитывать и перекодировать его на каждую накладную незачем.
 _logo_cache: tuple[str, str | None] | None = None
@@ -59,12 +75,18 @@ def _logo_data_uri() -> str | None:
 
 
 def _fmt_qty(value) -> str:
-    """Количество без хвостовых нулей: 3, а не 3.0; 2.5 остаётся 2.5."""
+    """Количество по-русски и без хвостовых нулей: 3, а не 3.0; 2,5 — с запятой.
+
+    Через `:g` было два изъяна: дробная часть печаталась по-английски («2.5»)
+    рядом с русскими суммами, а количество от миллиона уходило в
+    экспоненциальный вид («1e+06») — в накладной это нечитаемо.
+    """
     try:
         f = float(value)
     except (TypeError, ValueError):
         return str(value)
-    return f"{f:g}"
+    text = f"{f:.3f}".rstrip("0").rstrip(".")
+    return (text or "0").replace(".", ",")
 
 
 _CSS = """
@@ -109,7 +131,10 @@ def build_invoice_html(invoice: dict, logo_data_uri: str | None = None) -> str:
     """
     items = invoice.get("items") or []
     currency = esc(invoice.get("currency") or "USD")
-    title = _TYPE_TITLE.get(invoice.get("type"), "НАКЛАДНАЯ")
+    inv_type = invoice.get("type")
+    title = _TYPE_TITLE.get(inv_type, "НАКЛАДНАЯ")
+    party_label = _PARTY_LABEL.get(inv_type, "Клиент или поставщик")
+    sign_from, sign_to = _SIGN_LABELS.get(inv_type, ("Отпустил — подпись", "Получил — подпись"))
 
     rows = []
     for i, it in enumerate(items, 1):
@@ -152,7 +177,7 @@ def build_invoice_html(invoice: dict, logo_data_uri: str | None = None) -> str:
   </div>
 </div>
 <div class="parties">
-  <div><span class="label">Контрагент:</span> {counterparty}</div>
+  <div><span class="label">{party_label}:</span> {counterparty}</div>
   <div><span class="label">Склад:</span> {warehouse}</div>
   <div><span class="label">Валюта:</span> {currency}</div>
 </div>
@@ -170,8 +195,8 @@ def build_invoice_html(invoice: dict, logo_data_uri: str | None = None) -> str:
 {cancelled_html}
 {comment_html}
 <div class="sign">
-  <div>Отпустил — подпись</div>
-  <div>Получил — подпись</div>
+  <div>{sign_from}</div>
+  <div>{sign_to}</div>
 </div>
 </body></html>"""
 
@@ -233,7 +258,7 @@ def build_sales_invoice_html(doc: dict, logo_data_uri: str | None = None) -> str
 <div class="head">
   <div>{logo_html}<div class="company">{company_name}</div>{req_html}</div>
   <div>
-    <h1>СЧЁТ</h1>
+    <h1>СЧЁТ НА ОПЛАТУ</h1>
     <div class="meta">№ {esc(doc.get('number'))}<br>
     от {esc(doc.get('date'))}</div>
   </div>
@@ -257,11 +282,11 @@ def build_sales_invoice_html(doc: dict, logo_data_uri: str | None = None) -> str
 <div class="words">Всего к оплате: {total} {currency}
   ({esc(doc.get('total_words') or '')})</div>
 {comment_html}
-<div class="note">Счёт не является документом отгрузки: товар передаётся по
-расходной накладной после отгрузки.</div>
+<div class="note">Счёт не заменяет документ отгрузки: товар передаётся
+по расходной накладной.</div>
 <div class="sign">
-  <div>Выписал — подпись</div>
-  <div>Получил — подпись</div>
+  <div>Счёт выписал — подпись</div>
+  <div>Клиент — подпись</div>
 </div>
 </body></html>"""
 

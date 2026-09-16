@@ -104,7 +104,7 @@ def test_paid_order_split_payment_handover_and_confirmation_close_the_debt(open_
     assert mgr.input_value("#dep-amount") == "5000"
     _shot(mgr, "05-handover-form")
     mgr.click("#dep-create")
-    _toast(mgr, "Сдача #")
+    _toast(mgr, "Сдача в кассу №")
     dep = e2e.rows("SELECT id FROM cash_deposits")[0]["id"]
     assert e2e.rows("SELECT order_id, amount_cents FROM cash_deposit_parts") == [
         {"order_id": oid, "amount_cents": 500_000},
@@ -120,7 +120,7 @@ def test_paid_order_split_payment_handover_and_confirmation_close_the_debt(open_
     assert "Подтвердить 7 130 USD" in _norm(pay_card.locator(".pay-confirm").inner_text())
     _shot(boss, "06-boss-confirm-tab")
     boss.click(f"{dep_card} .dep-confirm")
-    _toast(boss, "Сдача подтверждена")
+    _toast(boss, "Сдача в кассу подтверждена")
     boss.wait_for_selector(f'.pay-confirm[data-id="{oid}"]')
     boss.click(f'.pay-confirm[data-id="{oid}"]')
     _toast(boss, f"Оплата по заказу #{oid} подтверждена")
@@ -142,7 +142,7 @@ def test_debt_order_ships_without_money_and_is_paid_by_breakdown(open_app, e2e):
     ship = f'.btn-ship-order[data-id="{oid}"]'
     mgr.wait_for_selector(ship)
     mgr.click(ship)
-    mgr.wait_for_function("() => window.__tgAlerts.some(a => a.startsWith('🚚'))")
+    mgr.wait_for_function("() => window.__tgAlerts.some(a => /Заказ #\\d+ отгружен/.test(a))")
     assert e2e.rows("SELECT status FROM orders WHERE id = ?", (oid,))[0]["status"] == "shipped"
 
     go(mgr, "money")
@@ -188,7 +188,7 @@ def test_debt_order_ships_without_money_and_is_paid_by_breakdown(open_app, e2e):
     mgr.wait_for_selector(f'.dep-order[data-order="{oid}"]')
     assert mgr.input_value("#dep-amount") == "1270000"
     mgr.click("#dep-create")
-    _toast(mgr, "Сдача #")
+    _toast(mgr, "Сдача в кассу №")
     dep = e2e.rows("SELECT d.id, c.currency FROM cash_deposits d JOIN cash_deposit_currency c ON c.deposit_id = d.id")
     assert [r["currency"] for r in dep] == ["UZS"]
     open_confirmations(boss)
@@ -196,7 +196,7 @@ def test_debt_order_ships_without_money_and_is_paid_by_breakdown(open_app, e2e):
     boss.wait_for_selector(dep_card)
     assert f"#{oid} — 1 270 000 UZS" in _norm(boss.locator(dep_card).inner_text())
     boss.click(f"{dep_card} .dep-confirm")
-    _toast(boss, "Сдача подтверждена")
+    _toast(boss, "Сдача в кассу подтверждена")
     assert e2e.rows("SELECT paid_confirmed_at FROM orders WHERE id = ?", (oid,))[0]["paid_confirmed_at"]
 
 

@@ -38,7 +38,7 @@ def log_keyboard():
 @router.message(Command("log"))
 async def cmd_log(message: Message):
     if not can_manage_users(message.from_user.id):
-        return await message.answer("⛔ Нет доступа.")
+        return await message.answer("⛔ Журнал действий открыт администратору.")
     # Сразу показываем последние 20; фильтры — чипами под списком.
     records = await adb.get_audit_log(limit=20)
     await send_log(message, records, "последние 20")
@@ -47,7 +47,7 @@ async def cmd_log(message: Message):
 @router.callback_query(F.data.startswith("log:"))
 async def cb_log(call: CallbackQuery):
     if not can_manage_users(call.from_user.id):
-        return await call.answer("⛔ Нет доступа", show_alert=True)
+        return await call.answer("⛔ Журнал действий открыт администратору", show_alert=True)
     await call.answer()
 
     mode = call.data.split(":")[1]
@@ -55,7 +55,7 @@ async def cb_log(call: CallbackQuery):
     if mode == "user":
         users = await adb.get_all_users()
         if not users:
-            return await call.message.answer("👥 Пользователей нет.")
+            return await call.message.answer("👥 Сотрудников нет.")
         kb = InlineKeyboardBuilder()
         for u in users[:20]:
             name = u["full_name"] or u["username"] or str(u["user_id"])
@@ -83,7 +83,7 @@ async def cb_log(call: CallbackQuery):
 @router.callback_query(F.data.startswith("logu:"))
 async def cb_log_user(call: CallbackQuery):
     if not can_manage_users(call.from_user.id):
-        return await call.answer("⛔ Нет доступа", show_alert=True)
+        return await call.answer("⛔ Журнал действий открыт администратору", show_alert=True)
     await call.answer()
 
     user_id = int(call.data.split(":")[1])
@@ -97,13 +97,13 @@ async def cb_log_user(call: CallbackQuery):
 async def send_log(message, records: list[dict], label: str):
     if not records:
         return await message.answer(
-            f"{DIV}\n📋 <b>Лог · {label}</b>\n\n<i>Нет записей</i>",
+            f"{DIV}\n📋 <b>Журнал действий · {label}</b>\n\n<i>Записей нет</i>",
             parse_mode="HTML",
         )
 
     lines = [
         DIV,
-        f"📋 <b>Лог действий · {label}</b>",
+        f"📋 <b>Журнал действий · {label}</b>",
         f"<code>Записей: {len(records)}</code>",
         "",
     ]

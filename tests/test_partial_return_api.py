@@ -278,7 +278,7 @@ def test_foreign_item_id_is_rejected(env):
         },
     )
     assert r.status_code == 400
-    assert "недоступна" in r.json()["detail"]
+    assert "вернуть нельзя" in r.json()["detail"]
 
 
 def test_empty_items_list_is_rejected(env):

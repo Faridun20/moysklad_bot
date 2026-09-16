@@ -150,7 +150,7 @@ def test_result_message_names_the_exact_discrepancy():
         == "Записан пересчёт, расхождений нет"
     text = result_message([{"currency": "USD", "counted_cents": 40000,
                             "system_cents": 50000, "diff_cents": -10000}])
-    assert "недостача" in text and "100" in text and "USD" in text
+    assert "не хватает" in text and "100" in text and "USD" in text
 
 
 # ─── Запись ──────────────────────────────────────────────────────────────────

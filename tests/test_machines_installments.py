@@ -97,7 +97,7 @@ def test_installment_conditions_are_validated():
     assert "от 1 до" in machines.validate_installment(100_000, 0, 999)
     # Взнос во всю цену — это продажа, а не рассрочка: график был бы пустым.
     assert "продажа" in machines.validate_installment(100_000, 100_000, 5)
-    assert "отрицательным" in machines.validate_installment(100_000, -1, 5)
+    assert "меньше нуля" in machines.validate_installment(100_000, -1, 5)
 
 
 # ─── Сделка с графиком ────────────────────────────────────────────────────────

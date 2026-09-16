@@ -49,8 +49,18 @@ def test_html_contains_header_and_totals():
     assert "РАСХОДНАЯ НАКЛАДНАЯ" in html
     assert "OUT-2026-0001" in html
     assert "ООО Ромашка" in html
-    assert "750.00" in html  # итог
-    assert "250.00" in html  # цена за единицу
+    # Числа — по-русски: пробел разделяет тысячи, запятая — копейки.
+    assert "750,00" in html  # итог
+    assert "250,00" in html  # цена за единицу
+
+
+def test_html_names_the_party_by_direction():
+    """«Контрагент» одинаково называл того, кто покупает, и того, у кого
+    покупаем мы. В накладной сторона называется по существу."""
+    out = invoice_pdf.build_invoice_html(_invoice())
+    assert "Клиент:" in out and "Контрагент" not in out
+    incoming = invoice_pdf.build_invoice_html(_invoice(type="incoming"))
+    assert "Поставщик:" in incoming and "Контрагент" not in incoming
 
 
 def test_html_escapes_user_content():
@@ -96,7 +106,7 @@ def test_html_line_total_uses_decimal_rounding():
             ],
         )
     )
-    assert "99.99" in html
+    assert "99,99" in html
 
 
 def test_html_quantity_has_no_trailing_zeros():
@@ -110,7 +120,7 @@ def test_html_quantity_has_no_trailing_zeros():
             ]
         )
     )
-    assert "2.5" in frac
+    assert "2,5" in frac
 
 
 def test_html_marks_cancelled_invoice():

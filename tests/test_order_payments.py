@@ -177,7 +177,7 @@ def test_settle_exact_for_paid_absorbs_rounding_only_when_converted():
     same = compute_parts(parse_parts([_cash(5000), _card("7129.99")]), "USD", "USD", cbu)
     with pytest.raises(PaymentError) as e:
         settle_parts(same, due, exact=True, order_currency="USD", base="USD")
-    assert e.value.code == "short" and "Не хватает 0.01 USD" in e.value.message
+    assert e.value.code == "short" and "Не хватает 0,01 USD" in e.value.message
 
     with pytest.raises(PaymentError) as e:
         settle_parts(compute_parts(parse_parts([_cash(12131)]), "USD", "USD", cbu), due,

@@ -74,7 +74,7 @@ async def cmd_version(message: Message):
     # Руководству, а не только админу: «выкатилось ли моё исправление» —
     # вопрос того, кто его просил, и адресовать его больше некому.
     if not is_boss(message.from_user.id):
-        return await message.answer("⛔ Нет доступа.")
+        return await message.answer("⛔ Версию программы смотрит руководство.")
 
     mine = app_version.info().as_dict()
     theirs, why = await _webapp_health()

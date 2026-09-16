@@ -110,15 +110,31 @@ def test_convert_cents(cents, rate, out):
 # ─── format_cents ────────────────────────────────────────────────────────────
 
 
-def test_format_cents_default():
-    assert money.format_cents(150000) == "1,500"
+def test_format_cents_default_is_russian():
+    # Умолчание — вид, который владелец читает в документах: «1 092,00».
+    assert money.format_cents(150000) == "1 500"
+    assert money.format_cents(109200, decimals=2) == "1 092,00"
     assert money.format_cents(0) == "0"
 
 
-def test_format_cents_decimals_and_sep():
-    assert money.format_cents(150050, decimals=2, sep=" ") == "1 500.50"
-    assert money.format_cents(150000, decimals=2, sep=" ", trim=True) == "1 500"
-    assert money.format_cents(150050, decimals=2, trim=True) == "1,500.5"
+def test_format_cents_decimals_and_separators():
+    assert money.format_cents(150050, decimals=2) == "1 500,50"
+    assert money.format_cents(150000, decimals=2, trim=True) == "1 500"
+    assert money.format_cents(150050, decimals=2, trim=True) == "1 500,5"
+    # Разделители переопределяются явно — английский вид всё ещё доступен.
+    assert money.format_cents(150050, decimals=2, sep=",", dec_sep=".") == "1,500.50"
+
+
+def test_format_cents_does_not_swap_group_and_decimal_separators():
+    """Замена «,»→« » и «.»→«,» по одной строке перепутала бы разделители."""
+    assert money.format_cents(123456789, decimals=2) == "1 234 567,89"
+    assert money.format_cents(100000000, decimals=2) == "1 000 000,00"
+
+
+def test_format_cents_result_parses_back():
+    """parse_amount принимает собственный вывод форматтера — без потерь."""
+    for cents in (100, 4999, 150050, 123456789):
+        assert money.parse_amount(money.format_cents(cents, decimals=2)) == cents
 
 
 def test_format_cents_no_grouping():
@@ -129,7 +145,7 @@ def test_format_cents_no_grouping():
 def test_format_price_is_format_cents_alias(cents):
     # legacy format_price теперь делегирует money.format_cents — проверяем,
     # что вывод совпадает с прямым вызовом канонического форматтера.
-    assert format_price(cents) == money.format_cents(cents, decimals=0, sep=",")
+    assert format_price(cents) == money.format_cents(cents, decimals=0)
 
 
 # ─── validate_cents ──────────────────────────────────────────────────────────

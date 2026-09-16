@@ -7368,7 +7368,7 @@ async function moneyInsightsHtml() {
     }
   }
   if (fc) {
-    html += '<div class="section-label">Ожидаемые поступления</div>' + forecastRowsHtml(fc.months);
+    html += '<div class="section-label">Ждём поступлений</div>' + forecastRowsHtml(fc.months);
   }
   if (disc && disc.expected_count) {
     const share = disc.on_time_share == null ? '—' : `${Math.round(disc.on_time_share * 100)}%`;
@@ -9863,7 +9863,7 @@ async function renderDebts(container) {
             ${d.is_mine || (isBoss && workActionsVisible()) ? `
               <div class="pay-input-row">
                 <input type="hidden" class="pay-amount-input" data-id="${d.id}">
-                <button class="btn-primary btn-pay-debt" data-id="${d.id}">${icon('cash')} Внести оплату</button>
+                <button class="btn-primary btn-pay-debt" data-id="${d.id}">${icon('cash')} Внести оплату · осталось ${fmt(d.remaining)} ${escapeHtml(d.currency || '')}</button>
               </div>
             ` : ''}
           </div>

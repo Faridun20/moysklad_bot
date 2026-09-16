@@ -84,8 +84,9 @@ class PaymentRow:
 
 
 def _money(cents: int) -> str:
-    """Копейки → «25 000 000». Сумы — целые, пробел разделяет тысячи."""
-    return money.format_cents(cents, decimals=0, sep=" ")
+    """Копейки → «25 000 000». Сумы — целые, пробел разделяет тысячи
+    (это умолчание `money.format_cents`)."""
+    return money.format_cents(cents, decimals=0)
 
 
 def _fmt_date(d: date) -> str:

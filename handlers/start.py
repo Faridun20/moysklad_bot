@@ -69,13 +69,13 @@ def get_keyboard_for_role(role: str):
     # Менеджер: быстрая отправка платежа в кассу (не привязанного к заказу) —
     # три касания в чате против захода в WebApp.
     if role == "manager":
-        kb.button(text="💵 Отправить платёж", callback_data="pay_start")
+        kb.button(text="💵 Отправить платёж в кассу", callback_data="pay_start")
         rows += [1]
 
     # Админский ряд — управление пользователями и аудит.
     if role == "admin":
-        kb.button(text="👥 Пользователи", callback_data="users_list")
-        kb.button(text="📋 Аудит", callback_data="al:today")
+        kb.button(text="👥 Сотрудники", callback_data="users_list")
+        kb.button(text="📋 Журнал действий", callback_data="al:today")
         rows += [2]
 
     if not rows:
@@ -103,15 +103,15 @@ def get_keyboard_for_role(role: str):
 # больше нет. Набравшему по памяти отвечает `cmd_retired` подсказкой.
 _COMMANDS_MANAGER = [
     BotCommand(command="start", description="🏠 Главное меню"),
-    BotCommand(command="pay", description="💵 Отправить платёж"),
-    BotCommand(command="find", description="🔍 Поиск (заказ/платёж/клиент)"),
+    BotCommand(command="pay", description="💵 Отправить платёж в кассу"),
+    BotCommand(command="find", description="🔍 Найти заказ, платёж или клиента"),
     # Техника: раздел в WebApp, в боте — быстрый взгляд и моточасы с площадки,
     # где открыть WebApp дольше, чем набрать два числа.
-    BotCommand(command="machines", description="🚜 Машины"),
-    BotCommand(command="hours", description="⏱ Моточасы: /hours 12 15200"),
+    BotCommand(command="machines", description="🚜 Техника"),
+    BotCommand(command="hours", description="⏱ Внести моточасы: /hours 12 15200"),
     # Печать доступна тем же ролям, что получают печатную форму
     # (can_view_stock: admin/boss/manager) — значит и в автокомплите у них.
-    BotCommand(command="printer", description="🖨 Статус принтера"),
+    BotCommand(command="printer", description="🖨 Проверить принтер"),
 ]
 # Руководитель смотрит, решает и контролирует — рабочие команды менеджера
 # (/pay, /hours, /printer) и склада (/ship, /shipments) в его автокомплите не
@@ -119,17 +119,17 @@ _COMMANDS_MANAGER = [
 # а не права, — в экстренном случае набранная по памяти команда сработает.
 _COMMANDS_BOSS = [
     BotCommand(command="start", description="🏠 Главное меню"),
-    BotCommand(command="find", description="🔍 Поиск (заказ/платёж/клиент)"),
+    BotCommand(command="find", description="🔍 Найти заказ, платёж или клиента"),
     BotCommand(command="machine_deals", description="💳 Рассрочки по технике"),
     BotCommand(command="cancel", description="🚫 Отменить заказ"),
 ]
 _COMMANDS_ADMIN = _COMMANDS_BOSS + [
     # «Выкатилось ли» — вопрос того, кто сопровождает прод.
-    BotCommand(command="version", description="📦 Версия на проде"),
-    BotCommand(command="users", description="👥 Пользователи"),
-    BotCommand(command="addrole", description="🔧 Сменить роль"),
-    BotCommand(command="deactivate", description="🚫 Деактивировать пользователя"),
-    BotCommand(command="audit", description="📋 Аудит лог"),
+    BotCommand(command="version", description="📦 Версия программы на сервере"),
+    BotCommand(command="users", description="👥 Сотрудники и роли"),
+    BotCommand(command="addrole", description="🔧 Сменить роль сотруднику"),
+    BotCommand(command="deactivate", description="🚫 Закрыть доступ сотруднику"),
+    BotCommand(command="audit", description="📋 Журнал действий"),
     BotCommand(command="frozen", description="🧊 Замороженные заказы"),
 ]
 _COMMANDS_WAREHOUSE = [
@@ -167,7 +167,7 @@ async def set_commands_for_user(bot: Bot, chat_id: int, role: str) -> None:
                     seen.add(c.command)
                     commands.append(c)
     else:
-        commands = [BotCommand(command="start", description="🏠 Активировать аккаунт")]
+        commands = [BotCommand(command="start", description="🏠 Начать")]
     try:
         await bot.set_my_commands(
             commands=commands,
@@ -193,30 +193,30 @@ def get_welcome_text(role: str, first_name: str = "") -> str:
     if role == "guest":
         return (
             f"👋 Здравствуйте{name_part}!\n\n"
-            "Ваш аккаунт ещё не активирован — обратитесь к администратору.\n\n"
-            "<i>Когда активируют — снова напишите /start</i>"
+            "Доступ к боту вам ещё не открыли — попросите об этом администратора.\n\n"
+            "<i>Когда доступ откроют, снова напишите /start</i>"
         )
 
     hints = {
-        "admin": "Полный доступ. Управление пользователями и аудит — кнопками ниже.",
+        "admin": "Полный доступ. Сотрудники и журнал действий — кнопками ниже.",
         "boss": (
-            "Заявки на одобрение и подтверждение платежей — приходят push'ами; "
+            "Заявки на одобрение и платежи на подтверждение приходят уведомлениями; "
             "всё, что ждёт решения, собрано в WebApp → «Решения»."
         ),
         "manager": (
-            "Создавайте заказы и вносите оплату (наличные / карта / счёт) — всё в WebApp; "
-            "«оплату сразу» без внесённой оплаты не отгрузить. "
-            "Отгрузка — /ship; сдачи и приёмку возвратов подтверждайте кнопкой в уведомлении."
+            "Оформляйте заказы и вносите оплату (наличные, карта, счёт) — всё в WebApp; "
+            "заказ с оплатой сразу не отгрузить, пока оплата не внесена. "
+            "Отгрузка — /ship; сдачи в кассу и приёмку возвратов подтверждайте кнопкой в уведомлении."
         ),
         "warehouse_keeper": "Отгрузка — /ship; приёмку возврата подтверждайте кнопкой в уведомлении.",
-        "bookkeeper": "Сдачи налички подтверждайте кнопкой прямо в уведомлении.",
+        "bookkeeper": "Сдачи в кассу подтверждайте кнопкой прямо в уведомлении.",
     }
     hint = hints.get(role, "")
 
     return (
-        f"👋 Привет{name_part}!\n"
+        f"👋 Здравствуйте{name_part}!\n"
         f"{role_name}\n\n"
-        f"🌐 <b>Жмите «Открыть» слева от поля ввода</b> — там всё:\n"
+        f"🌐 <b>Нажмите «Открыть» слева от поля ввода</b> — там вся работа:\n"
         f"каталог, заказы, аналитика, долги, платежи.\n\n"
         f"<i>{hint}</i>"
     )
@@ -268,9 +268,9 @@ async def cmd_start(message: Message, state: FSMContext):
     if role == "guest":
         return await message.answer(
             f"👋 Здравствуйте!\n\n"
-            f"Ваш аккаунт ещё не активирован для работы с этим ботом.\n"
-            f"Передайте свой ID администратору: <code>{user.id}</code>\n\n"
-            f"После активации напишите /start ещё раз.",
+            f"Доступ к этому боту вам ещё не открыли.\n"
+            f"Передайте свой номер администратору: <code>{user.id}</code>\n\n"
+            f"Когда доступ откроют, напишите /start ещё раз.",
             parse_mode="HTML",
             # Снимаем reply-кнопку, чтобы гость не видел «🌐 Открыть»
             # которая всё равно вернёт 403 (нет роли).
@@ -306,11 +306,14 @@ async def cmd_find(message: Message):
 
     role = get_role(message.from_user.id)
     if role == "guest":
-        return await message.answer("⛔ Нет доступа.")
+        return await message.answer(
+            "⛔ Поиск вам недоступен: доступ к боту ещё не открыли. Напишите администратору."
+        )
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2 or not parts[1].strip():
         return await message.answer(
-            "🔍 Формат: <code>/find текст</code>\nНапример: <code>/find Иванов</code>",
+            "🔍 Напишите, что искать: <code>/find текст</code>\n"
+            "Например: <code>/find Иванов</code>",
             parse_mode="HTML",
         )
     query = parts[1].strip()[:100]
@@ -366,7 +369,9 @@ async def cb_menu(call: CallbackQuery, state: FSMContext):
     role = get_role(user.id)
     await call.answer()
     if role == "guest":
-        return await call.message.answer("⛔ Ваш аккаунт ещё не активирован. Напишите /start.")
+        return await call.message.answer(
+            "⛔ Доступ к боту вам ещё не открыли. Попросите администратора и напишите /start."
+        )
     # Welcome + единое меню одним сообщением.
     await call.message.answer(
         get_welcome_text(role, user.first_name or ""),
@@ -380,29 +385,33 @@ async def cb_menu(call: CallbackQuery, state: FSMContext):
 
 # Команда → куда идти в WebApp. Набравший старую команду по памяти должен
 # понять, что бот не сломался, а операция переехала.
+# Пути ниже — РАЗДЕЛ → ВКЛАДКА, ровно как они подписаны в WebApp
+# (`helpers.js`: salesTabs/stockTabs/moneyTabs/clientsTabs). Разделы
+# «Финансы» и «Аналитика» переименованы давно, а подсказки бота продолжали
+# слать человека туда, чего на экране нет.
 _RETIRED_COMMANDS = {
-    "neworder": "Заказы → «➕ Новый заказ»",
-    "myorders": "Заказы",
-    "orders": "Заявки",
-    "stock": "Каталог",
-    "categories": "Каталог",
-    "debts": "Финансы → Долги",
-    "deposit": "Финансы → Касса → «Сдать наличные»",
-    "my_deposits": "Финансы → Касса",
-    "deposits": "Финансы → Касса → «Сдачи на подтверждении»",
-    "return": "Заказы → заказ → «Оформить возврат»",
-    "returns": "Финансы → Касса → «Возвраты»",
-    "limit": "Финансы → Клиенты → клиент → «Кредитный лимит»",
-    "rates": "Финансы → Клиенты → «Курсы валют»",
-    "prices": "Каталог → товар → «Цена»",
-    "analytics": "Аналитика",
-    "cashbox": "Финансы → Касса",
-    "reports": "Аналитика",
-    "payreport": "Финансы → История платежей",
+    "neworder": "Продажи → Заказы → «Новый заказ»",
+    "myorders": "Продажи → Заказы",
+    "orders": "Решения",
+    "stock": "Склад → Каталог",
+    "categories": "Склад → Каталог",
+    "debts": "Деньги → Долги",
+    "deposit": "Деньги → Касса → «Сдать в кассу»",
+    "my_deposits": "Деньги → Касса",
+    "deposits": "Деньги → Подтвердить",
+    "return": "Продажи → Заказы → заказ → «Оформить возврат»",
+    "returns": "Деньги → Подтвердить",
+    "limit": "Клиенты → Лимиты",
+    "rates": "Настройки → «Курсы валют»",
+    "prices": "Склад → Каталог → товар → «Цена»",
+    "analytics": "Продажи → Отчёт",
+    "cashbox": "Деньги → Касса",
+    "reports": "Продажи → Отчёт",
+    "payreport": "Деньги → Касса",
     # Техника: карточка, фото и сделки переехали в WebApp.
-    "newmachine": "Заказы → Техника → «Завести машину»",
-    "sell": "Заказы → Техника → машина → «Продажа»",
-    "credit": "Заказы → Техника → машина → «Рассрочка»",
+    "newmachine": "Склад → Техника → «Завести машину»",
+    "sell": "Склад → Техника → машина → «Продажа»",
+    "credit": "Склад → Техника → машина → «Рассрочка»",
 }
 
 
@@ -418,9 +427,9 @@ _REMOVED_COMMANDS = ("syncms", "msstaff", "refresh", "snapshot", "sync_payments"
 async def cmd_removed(message: Message):
     """Ответ на команду, удалённую вместе с интеграцией МойСклад."""
     await message.answer(
-        "🗄 Эта команда убрана: учёт ведётся полностью у нас, "
+        "🗄 Эту команду убрали: учёт ведётся полностью у нас, "
         "синхронизировать с МойСклад больше нечего.\n\n"
-        "<i>Остатки, накладные и справочники — в WebApp.</i>",
+        "<i>Остатки, движения склада и справочники — в WebApp.</i>",
         parse_mode="HTML",
         reply_markup=webapp_keyboard(),
     )
@@ -439,7 +448,7 @@ async def cmd_retired(message: Message):
     where_line = f"\n📍 Экран: <b>{where}</b>" if where else ""
     await message.answer(
         f"🌐 Эта операция теперь в WebApp.{where_line}\n\n"
-        f"<i>Открыть: кнопка ниже или «Открыть» слева от поля ввода.</i>",
+        f"<i>Откройте кнопкой ниже или «Открыть» слева от поля ввода.</i>",
         parse_mode="HTML",
         reply_markup=webapp_keyboard(),
     )

@@ -780,13 +780,13 @@ async def save_container_costing(
     from services import container_receipt, containers
 
     if not await is_enabled():
-        return {"ok": False, "error": "Учёт себестоимости выключен"}
+        return {"ok": False, "error": "Учёт себестоимости выключен — включает руководитель"}
     container = await containers.get_container(container_id)
     if not container:
-        return {"ok": False, "error": "Контейнер не найден"}
+        return {"ok": False, "error": "Контейнер не найден — обновите список"}
     cur = (currency or "").strip().upper()
     if cur not in PURCHASE_CURRENCIES:
-        return {"ok": False, "error": f"Валюта закупки: {', '.join(PURCHASE_CURRENCIES)}"}
+        return {"ok": False, "error": f"Выберите валюту закупки: {' или '.join(PURCHASE_CURRENCIES)}"}
     per_usd = _dec(uzs_per_usd)
     if per_usd is None or per_usd <= 0:
         return {"ok": False, "error": "Укажите курс: сколько сум за 1 USD на дату прибытия"}
@@ -807,9 +807,9 @@ async def save_container_costing(
         try:
             item_id = int(raw_id)
         except (TypeError, ValueError):
-            return {"ok": False, "error": "Позиция не из этого контейнера"}
+            return {"ok": False, "error": "Эта позиция не из этого контейнера — обновите экран"}
         if item_id not in known_ids:
-            return {"ok": False, "error": "Позиция не из этого контейнера"}
+            return {"ok": False, "error": "Эта позиция не из этого контейнера — обновите экран"}
         if raw_price is None or str(raw_price).strip() == "":
             parsed[item_id] = None
             continue
@@ -1030,7 +1030,7 @@ async def container_card(container_id: int) -> dict:
 
     container = await containers.get_container(container_id)
     if not container:
-        return {"ok": False, "error": "Контейнер не найден"}
+        return {"ok": False, "error": "Контейнер не найден — обновите список"}
     enabled = await is_enabled()
     if not enabled:
         return {"ok": True, "enabled": False}

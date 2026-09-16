@@ -201,7 +201,7 @@ async def _validate_cents(
     if value is None:
         return True, ""
     if not isinstance(value, int):
-        return False, f"{label}: сумма должна быть в копейках (целое число)"
+        return False, f"{label}: введите сумму числом, например 25000"
     # Курс — синхронное чтение (кэш 5 мин), поэтому в поток, как get_role.
     rate = await asyncio.to_thread(current_rate_to_base, currency)
     ok, err = money.validate_cents(value, rate)
@@ -233,11 +233,11 @@ async def create_machine(
     """Завести машину. Возвращает {ok, machine_id} либо {ok: False, error}."""
     vin_norm = normalize_vin(vin)
     if not vin_norm:
-        return {"ok": False, "error": "VIN обязателен"}
+        return {"ok": False, "error": "Укажите VIN"}
     if not (name or "").strip():
-        return {"ok": False, "error": "Название обязательно"}
+        return {"ok": False, "error": "Укажите название машины"}
     if status not in STATUSES:
-        return {"ok": False, "error": f"Неизвестный статус: {status}"}
+        return {"ok": False, "error": "Такого статуса нет — обновите приложение"}
     cur_err = currency_error(currency)
     if cur_err:
         return {"ok": False, "error": cur_err}
@@ -246,13 +246,13 @@ async def create_machine(
         if not ok:
             return {"ok": False, "error": err}
     if hours is not None and hours < 0:
-        return {"ok": False, "error": "Моточасы не могут быть отрицательными"}
+        return {"ok": False, "error": "Моточасы не могут быть меньше нуля"}
 
     if await adb_core.fetchrow("SELECT id FROM machines WHERE vin = $1", vin_norm):
         # Явная проверка ДО вставки — иначе пользователь получит текст
         # UNIQUE-нарушения драйвера вместо человеческой подсказки. Гонку всё
         # равно ловит UNIQUE в схеме, поэтому исключение ниже не глушим.
-        return {"ok": False, "error": f"Машина с VIN {vin_norm} уже заведена"}
+        return {"ok": False, "error": f"Машина с VIN {vin_norm} уже заведена — откройте её карточку"}
 
     stamp = now_str()
     columns = (
@@ -380,9 +380,9 @@ async def update_machine_fields(
     }
     unknown = set(fields) - allowed
     if unknown:
-        return {"ok": False, "error": f"Нельзя менять поля: {', '.join(sorted(unknown))}"}
+        return {"ok": False, "error": "Эти поля изменить нельзя — обновите приложение"}
     if not fields:
-        return {"ok": False, "error": "Нечего менять"}
+        return {"ok": False, "error": "Вы ничего не изменили"}
     if "currency" in fields:
         cur_err = currency_error(fields["currency"])
         if cur_err:
@@ -410,7 +410,7 @@ async def update_machine_fields(
         *params,
     )
     if not rows:
-        return {"ok": False, "error": "Машина не найдена"}
+        return {"ok": False, "error": "Машина не найдена — обновите список"}
     await _audit(
         user_id, full_name, "machine_updated", f"#{machine_id}: {', '.join(keys)}"
     )
@@ -431,10 +431,10 @@ async def change_vin(
     """
     vin_norm = normalize_vin(new_vin)
     if not vin_norm:
-        return {"ok": False, "error": "VIN обязателен"}
+        return {"ok": False, "error": "Укажите VIN"}
     current = await adb_core.fetchrow("SELECT vin FROM machines WHERE id = $1", machine_id)
     if not current:
-        return {"ok": False, "error": "Машина не найдена"}
+        return {"ok": False, "error": "Машина не найдена — обновите список"}
     if current["vin"] == vin_norm:
         # Не ошибка: пользователь открыл форму и сохранил, ничего не изменив.
         return {"ok": True, "vin": vin_norm, "changed": False}
@@ -442,7 +442,7 @@ async def change_vin(
         "SELECT id FROM machines WHERE vin = $1 AND id <> $2", vin_norm, machine_id
     )
     if clash:
-        return {"ok": False, "error": f"Машина с VIN {vin_norm} уже заведена"}
+        return {"ok": False, "error": f"Машина с VIN {vin_norm} уже заведена — откройте её карточку"}
     await adb_core.execute(
         "UPDATE machines SET vin = $1, updated_at = $2 WHERE id = $3",
         vin_norm, now_str(), machine_id,
@@ -469,10 +469,10 @@ async def set_status(
     пользователь, и безусловный UPDATE затёр бы его решение.
     """
     if new_status not in STATUSES:
-        return {"ok": False, "error": f"Неизвестный статус: {new_status}"}
+        return {"ok": False, "error": "Такого статуса нет — обновите приложение"}
     current = await adb_core.fetchrow("SELECT status FROM machines WHERE id = $1", machine_id)
     if not current:
-        return {"ok": False, "error": "Машина не найдена"}
+        return {"ok": False, "error": "Машина не найдена — обновите список"}
     expected_tuple = (
         (expected,) if isinstance(expected, str) else tuple(expected or (current["status"],))
     )
@@ -524,7 +524,7 @@ async def mark_arrived(
     if not rows:
         current = await adb_core.fetchrow("SELECT status FROM machines WHERE id = $1", machine_id)
         if not current:
-            return {"ok": False, "error": "Машина не найдена"}
+            return {"ok": False, "error": "Машина не найдена — обновите список"}
         return {
             "ok": False,
             "error": "Машина уже не в пути — сейчас «"
@@ -548,13 +548,13 @@ async def delete_machine(machine_id: int, *, user_id: int, full_name: str = "") 
     async with adb_core.transaction() as txn:
         machine = await txn.fetchrow("SELECT vin FROM machines WHERE id = $1", machine_id)
         if not machine:
-            return {"ok": False, "error": "Машина не найдена"}
+            return {"ok": False, "error": "Машина не найдена — обновите список"}
         deals = await txn.fetchval(
             "SELECT COUNT(*) FROM machine_deals WHERE machine_id = $1", machine_id
         )
         if int(deals or 0):
             # Сделка — денежный факт; удаление машины стёрло бы историю продажи.
-            return {"ok": False, "error": "По машине есть сделки — используйте архив"}
+            return {"ok": False, "error": "По машине есть сделки — удалить нельзя, уберите её в архив"}
         active = await active_request_locked(txn, machine_id)
         if active:
             # Заявку ждёт руководитель: удалить машину из-под решения значит
@@ -592,15 +592,15 @@ async def add_hours(
     замены счётчика; такой факт уходит в аудит отдельной пометкой.
     """
     if not isinstance(hours, int) or hours < 0:
-        return {"ok": False, "error": "Моточасы — целое неотрицательное число"}
+        return {"ok": False, "error": "Моточасы — целое число не меньше нуля"}
     machine = await adb_core.fetchrow("SELECT hours FROM machines WHERE id = $1", machine_id)
     if not machine:
-        return {"ok": False, "error": "Машина не найдена"}
+        return {"ok": False, "error": "Машина не найдена — обновите список"}
     previous = machine["hours"]
     if previous is not None and hours < int(previous) and not force:
         return {
             "ok": False,
-            "error": f"Показание меньше предыдущего ({previous}). Опечатка?",
+            "error": f"Моточасы меньше предыдущего показания ({previous}) — проверьте цифру. Если счётчик заменили, подтвердите замену",
             "previous": int(previous),
             "needs_force": True,
         }
@@ -649,9 +649,9 @@ async def add_photo(
     снимка (UNIQUE в схеме).
     """
     if not tg_file_id or not file_unique_id:
-        return {"ok": False, "error": "Нужны tg_file_id и file_unique_id"}
+        return {"ok": False, "error": "Фото не загрузилось — попробуйте ещё раз"}
     if not await adb_core.fetchrow("SELECT id FROM machines WHERE id = $1", machine_id):
-        return {"ok": False, "error": "Машина не найдена"}
+        return {"ok": False, "error": "Машина не найдена — обновите список"}
     existing = await adb_core.fetchrow(
         "SELECT id FROM machine_photos WHERE machine_id = $1 AND file_unique_id = $2",
         machine_id, file_unique_id,
@@ -731,7 +731,7 @@ def validate_installment(price_cents: int, down_payment_cents: int, months: int)
     if not isinstance(months, int) or months < 1 or months > _MAX_MONTHS:
         return f"Срок рассрочки — от 1 до {_MAX_MONTHS} месяцев"
     if down_payment_cents < 0:
-        return "Первоначальный взнос не может быть отрицательным"
+        return "Первоначальный взнос не может быть меньше нуля"
     if down_payment_cents >= price_cents:
         # Взнос во всю цену — это продажа, а не рассрочка: график был бы пустым.
         return "Взнос не может покрывать всю цену — это продажа"
@@ -972,13 +972,13 @@ async def add_receipt(
     if not isinstance(amount_cents, int) or amount_cents <= 0:
         return {"ok": False, "error": "Сумма должна быть больше нуля"}
     if method is not None and method not in RECEIPT_METHODS:
-        return {"ok": False, "error": "Способ оплаты: наличные, карта или перечисление"}
+        return {"ok": False, "error": "Выберите способ оплаты: наличные, карта или перечисление"}
     # Потолок суммы зависит от валюты сделки (эквивалент базовой), а курс
     # читается синхронным слоем — поэтому проверка ДО пишущей транзакции: на
     # SQLite синхронное чтение ждало бы нашу же транзакцию.
     head = await adb_core.fetchrow("SELECT currency FROM machine_deals WHERE id = $1", deal_id)
     if not head:
-        return {"ok": False, "error": "Сделка не найдена"}
+        return {"ok": False, "error": "Сделка не найдена — обновите список"}
     ok, err = await _validate_cents(amount_cents, "Сумма", head["currency"])
     if not ok:
         return {"ok": False, "error": err}
@@ -991,7 +991,7 @@ async def add_receipt(
     async with adb_core.transaction() as txn:
         deal = await _lock_deal(txn, deal_id)
         if not deal:
-            return {"ok": False, "error": "Сделка не найдена"}
+            return {"ok": False, "error": "Сделка не найдена — обновите список"}
         if deal["closed_at"]:
             return {"ok": False, "error": "Рассрочка уже закрыта", "current": "closed"}
         left = await _receipt_room_locked(txn, deal_id)
@@ -1087,12 +1087,12 @@ async def delete_receipt(receipt_id: int, *, user_id: int, full_name: str = "") 
         "SELECT deal_id FROM machine_payment_receipts WHERE id = $1", receipt_id
     )
     if not row:
-        return {"ok": False, "error": "Поступление не найдено"}
+        return {"ok": False, "error": "Поступление не найдено — обновите список"}
     async with adb_core.transaction() as txn:
         await _lock_deal(txn, int(row["deal_id"]))
         # Перечитываем под блокировкой: параллельный запрос мог удалить его первым.
         if not await txn.fetchrow("SELECT id FROM machine_payment_receipts WHERE id = $1", receipt_id):
-            return {"ok": False, "error": "Поступление не найдено"}
+            return {"ok": False, "error": "Поступление не найдено — обновите список"}
         deal_id, amount, reopened = await _delete_receipt_locked(txn, receipt_id, user_id=user_id)
     return await _after_receipt_deleted(
         deal_id, amount, reopened, user_id=user_id, full_name=full_name,
@@ -1160,7 +1160,7 @@ async def pay_installment(
         "SELECT deal_id FROM machine_deal_payments WHERE id = $1", payment_id
     )
     if not head:
-        return {"ok": False, "error": "Платёж не найден"}
+        return {"ok": False, "error": "Платёж не найден — обновите список"}
     deal_id = int(head["deal_id"])
     method = method if method in RECEIPT_METHODS else None
     account = await _receipt_account(method, account_id) if paid else None
@@ -1171,7 +1171,7 @@ async def pay_installment(
         deal = await _lock_deal(txn, deal_id)
         row = await txn.fetchrow("SELECT * FROM machine_deal_payments WHERE id = $1", payment_id)
         if not deal or not row:
-            return {"ok": False, "error": "Платёж не найден"}
+            return {"ok": False, "error": "Платёж не найден — обновите список"}
         if int(row["seq"]) == 0:
             return {"ok": False, "error": "Первоначальный взнос уже получен"}
         amount = int(row["amount_cents"])
@@ -1187,7 +1187,7 @@ async def pay_installment(
             )
         else:
             if not row["paid_at"]:
-                return {"ok": False, "error": "Платёж и так не отмечен", "current": "unpaid"}
+                return {"ok": False, "error": "Платёж и так не отмечен оплаченным", "current": "unpaid"}
             last = await txn.fetchrow(
                 "SELECT id FROM machine_payment_receipts WHERE deal_id = $1 AND amount_cents = $2 "
                 "ORDER BY received_at DESC, id DESC LIMIT 1",
@@ -1286,7 +1286,7 @@ async def prepare_deal(
     """Проверки сделки ДО транзакции (курс читает синхронный слой). Пустая
     строка — всё в порядке."""
     if kind not in DEAL_KINDS:
-        return f"Тип сделки: {' / '.join(DEAL_KINDS)}"
+        return "Выберите тип сделки: бронь, продажа или рассрочка"
     cur_err = currency_error(currency)
     if cur_err:
         return cur_err
@@ -1294,9 +1294,9 @@ async def prepare_deal(
     if not ok:
         return err
     if not price_cents:
-        return "Цена сделки обязательна"
+        return "Укажите цену сделки"
     if not (buyer_name or "").strip():
-        return "Покупатель обязателен"
+        return "Укажите покупателя"
     if kind == "credit":
         err = validate_installment(price_cents, down_payment_cents, months)
         if err:
@@ -1436,7 +1436,7 @@ async def create_deal(
     async with adb_core.transaction() as txn:
         machine = await lock_machine(txn, machine_id)
         if not machine:
-            return {"ok": False, "error": "Машина не найдена"}
+            return {"ok": False, "error": "Машина не найдена — обновите список"}
         active = await active_request_locked(txn, machine_id)
         if active:
             return pending_refusal(active)
@@ -1465,7 +1465,7 @@ async def close_deal(deal_id: int, *, user_id: int, full_name: str = "") -> dict
         now_str(), deal_id,
     )
     if not rows:
-        return {"ok": False, "error": "Сделка не найдена или уже закрыта"}
+        return {"ok": False, "error": "Сделка не найдена или уже закрыта — обновите список"}
     deal = await adb_core.fetchrow("SELECT machine_id FROM machine_deals WHERE id = $1", deal_id)
     if deal:
         await set_status(

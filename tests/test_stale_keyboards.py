@@ -303,7 +303,7 @@ def test_deposit_reject_flow_kills_card_buttons_and_stamps_result(isolated_db):
     assert asyncio.run(db.get_cash_deposit(dep_id))["status"] == "rejected"
     # Пометка — ответом на карточку (чат/message_id взяты из state).
     stamps = [t for chat, t, kw in bot.sent if kw.get("reply_to_message_id") == 9 and chat == 55]
-    assert stamps and f"Сдача #{dep_id} отклонена" in stamps[0]
+    assert stamps and f"Сдача в кассу #{dep_id} отклонена" in stamps[0]
 
 
 def test_cancel_flow_kills_abort_button_after_reason(isolated_db):

@@ -31,11 +31,11 @@ def format_audit_log(records: list[dict], label: str) -> list[str]:
     chunk_messages в utils.helpers — единая реализация склейки
     (раньше дублировалась в handlers/log.py:send_log)."""
     if not records:
-        return [f"📋 Нет действий за {label}."]
+        return [f"📋 За {label} действий не было."]
 
     header = (
         f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-        f"📋 <b>Аудит лог · {label}</b>\n"
+        f"📋 <b>Журнал действий · {label}</b>\n"
         f"<code>Записей: {len(records)}</code>\n"
     )
     lines = [header] + [format_audit_entry(r) for r in records]
@@ -52,7 +52,7 @@ def audit_keyboard():
     kb.button(text="📅 Сегодня", callback_data="al:today")
     kb.button(text="📅 Неделя", callback_data="al:week")
     kb.button(text="📅 Месяц", callback_data="al:month")
-    kb.button(text="📋 Всё время", callback_data="al:all")
+    kb.button(text="📋 За всё время", callback_data="al:all")
     kb.button(text="👤 По сотруднику", callback_data="al:by_user")
     kb.button(text="🏠 Меню", callback_data="menu")
     kb.adjust(2, 2, 1, 1)
@@ -78,7 +78,7 @@ async def _render_audit_period(target: Message, period: str):
 @router.message(Command("audit"))
 async def cmd_audit(message: Message):
     if not can_manage_users(message.from_user.id):
-        return await message.answer("⛔ Нет доступа.")
+        return await message.answer("⛔ Журнал действий открыт администратору.")
     # Сразу показываем сегодняшний лог; период переключается чипами под ним.
     await _render_audit_period(message, "today")
 
@@ -89,7 +89,7 @@ async def cmd_audit(message: Message):
 @router.callback_query(F.data.startswith("al:"))
 async def cb_audit(call: CallbackQuery):
     if not can_manage_users(call.from_user.id):
-        return await call.answer("⛔ Нет доступа", show_alert=True)
+        return await call.answer("⛔ Журнал действий открыт администратору", show_alert=True)
     await call.answer()
 
     period = call.data.split(":")[1]
@@ -98,7 +98,7 @@ async def cb_audit(call: CallbackQuery):
         # Показать список пользователей для выбора
         users = await adb.get_all_users()
         if not users:
-            return await call.message.answer("👥 Пользователей нет.")
+            return await call.message.answer("👥 Сотрудников нет.")
         kb = InlineKeyboardBuilder()
         for u in users[:20]:
             name = u["full_name"] or u["username"] or str(u["user_id"])
@@ -114,7 +114,7 @@ async def cb_audit(call: CallbackQuery):
 @router.callback_query(F.data.startswith("alu:"))
 async def cb_audit_user(call: CallbackQuery):
     if not can_manage_users(call.from_user.id):
-        return await call.answer("⛔ Нет доступа", show_alert=True)
+        return await call.answer("⛔ Журнал действий открыт администратору", show_alert=True)
     await call.answer()
 
     user_id = int(call.data.split(":")[1])
@@ -130,7 +130,7 @@ async def cb_audit_user(call: CallbackQuery):
         await call.message.answer(msg, parse_mode="HTML")
 
     kb = InlineKeyboardBuilder()
-    kb.button(text="📋 К списку", callback_data="al:by_user")
+    kb.button(text="👥 К списку сотрудников", callback_data="al:by_user")
     kb.button(text="🏠 Меню", callback_data="menu")
     kb.adjust(1)
-    await call.message.answer("Выберите действие:", reply_markup=kb.as_markup())
+    await call.message.answer("Что дальше?", reply_markup=kb.as_markup())

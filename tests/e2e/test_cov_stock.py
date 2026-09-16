@@ -298,7 +298,7 @@ def test_admin_has_boss_controls_in_stock(open_app, e2e):
     inv = e2e.rows("SELECT id FROM invoices")[0]["id"]
     admin.wait_for_selector(f'[data-wh-cancel="{inv}"]')
     admin.click(f'[data-wh-cancel="{inv}"]')
-    admin.wait_for_selector(".toast:has-text('Накладная отменена')")
+    admin.wait_for_selector(".toast:has-text('Приход отменён')")
     assert e2e.rows("SELECT status FROM invoices WHERE id = ?", (inv,))[0]["status"] == "cancelled"
     assert _stock(e2e) == 0
 
@@ -465,7 +465,7 @@ def test_product_photo_without_storage_reports_failure_honestly(open_app, e2e, m
     _upload_via_picker(boss, "#pe-photo-add")
     # Одна повторная попытка через 1,5 с — ждём итоговый тост, а не таймер.
     boss.wait_for_selector(".toast--error:has-text('не прошли: 1')")
-    boss.wait_for_function("() => window.__tgAlerts.some(a => a.includes('PHOTOS_TG_CHAT_ID'))")
+    boss.wait_for_function("() => window.__tgAlerts.some(a => a.includes('Загрузка фото не настроена'))")
     assert e2e.rows("SELECT COUNT(*) AS n FROM product_photos")[0]["n"] == 0
 
 
@@ -521,7 +521,7 @@ def test_post_preview_warns_that_channel_is_not_configured(open_app, e2e, monkey
     # Причина должна быть видна сразу на предпросмотре, до нажатия: блок
     # «Канал не настроен: нет CHANNEL_ID» вставляется в шторку черновика,
     # которая тут же закрывается, и пропадает вместе с ней.
-    assert "нет CHANNEL_ID" in boss.inner_text(".c-overlay")
+    assert "не указан, куда публиковать" in boss.inner_text(".c-overlay")
 
 
 def test_stale_post_needs_selection_and_publishes_names_only(open_app, e2e, monkeypatch):
@@ -569,7 +569,7 @@ def test_catalog_shows_fresh_stock_after_invoice(open_app, e2e):
     boss.fill('.wh-pos [data-f="quantity"]', "5")
     boss.locator('.wh-pos [data-f="quantity"]').dispatch_event("change")
     boss.click("#wh-save")
-    boss.wait_for_selector(".toast:has-text('проведена')")
+    boss.wait_for_selector(".toast:has-text('оформлен')")
     assert _stock(e2e) == 25
 
     tab(boss, "catalog")
@@ -659,7 +659,7 @@ def test_container_supplier_becomes_receipt_invoice_counterparty(open_app, e2e):
     boss.click("#cont-supplier")
     boss.wait_for_selector(f'[data-supplier="{cp}"]')
     boss.click("#ms-submit")
-    boss.wait_for_selector("#ms-error:has-text('Выберите контрагента')")
+    boss.wait_for_selector("#ms-error:has-text('Выберите поставщика')")
     boss.click(f'[data-supplier="{cp}"]')
     boss.click("#ms-submit")
     boss.wait_for_selector(".toast:has-text('Поставщик сохранён')")
@@ -671,12 +671,12 @@ def test_container_supplier_becomes_receipt_invoice_counterparty(open_app, e2e):
     boss.fill(f'.qty-input[data-item="{item}"]', "6")
     boss.click("#cont-save")
     boss.wait_for_selector(".toast:has-text('Сверка сохранена')")
-    boss.wait_for_selector("#content:has-text('Приходная накладная проведена')")
+    boss.wait_for_selector("#content:has-text('Товар принят на склад')")
     assert _stock(e2e) == 26
     inv = e2e.rows("SELECT i.type, i.counterparty_id, i.comment FROM invoices i "
                    "JOIN container_receipt r ON r.invoice_id = i.id WHERE r.container_id = ?", (cid,))
     assert inv == [{"type": "incoming", "counterparty_id": cp, "comment": "Контейнер SUPP0000001"}]
-    assert "Переоприходовать" in boss.inner_text("#cont-supply")
+    assert "Принять заново" in boss.inner_text("#cont-supply")
 
 
 def test_container_new_product_is_confirmed_at_receipt_and_legacy_unmatched_is_linked(open_app, e2e):
@@ -745,7 +745,7 @@ def test_container_new_product_is_confirmed_at_receipt_and_legacy_unmatched_is_l
     ]
     boss.wait_for_selector("#cont-supply")
     boss.click("#cont-supply")
-    boss.wait_for_selector(".toast:has-text('Оприходовано: 1 позиция')")
+    boss.wait_for_selector(".toast:has-text('Принято на склад: 1 позиция')")
     assert _stock(e2e, belt_pid) == 2
     assert _stock(e2e) == 30, "переоприходование не трогало чужой контейнер"
 
@@ -951,7 +951,7 @@ def test_machine_hours_increase_and_manager_cannot_roll_back(open_app, e2e):
     mgr.wait_for_selector("#ms-error:has-text('Заполните')")
     mgr.fill("#ms-f-hours", "1400")
     mgr.click("#ms-submit")
-    mgr.wait_for_selector("#ms-error:has-text('Откат подтверждает руководитель')")
+    mgr.wait_for_selector("#ms-error:has-text('Уменьшить показание может только руководитель')")
     assert not any("счётчик" in a for a in alerts(mgr)), "менеджеру подтверждение не предлагается"
     assert e2e.rows("SELECT hours FROM machines WHERE id = ?", (mid,))[0]["hours"] == 1500
 
@@ -1034,7 +1034,7 @@ def test_machine_status_reserve_unreserve_and_list_filter(open_app, e2e):
     # карточка перечитывается, а не пишет поверх.
     e2e.exec("UPDATE machines SET status = 'reserved' WHERE id = ?", (mid,))
     boss.click('[data-mstatus-to="reserved"]')
-    boss.wait_for_function("() => window.__tgAlerts.some(a => a.includes('Переход') || a.includes('Статус уже'))")
+    boss.wait_for_function("() => window.__tgAlerts.some(a => a.includes('перевести нельзя') || a.includes('Статус уже'))")
     boss.wait_for_selector('[data-mstatus-to="in_stock"]')
     assert e2e.rows("SELECT status FROM machines WHERE id = ?", (other,))[0]["status"] == "in_transit"
 
@@ -1291,7 +1291,7 @@ def test_outgoing_invoice_moves_stock_and_sends_pdf_to_client(open_app, e2e):
     boss.wait_for_function("() => !document.querySelector('#wh-save').disabled")
     boss.fill("#wh-comment", "Отгрузка на объект")
     boss.click("#wh-save")
-    boss.wait_for_selector(".toast:has-text('проведена')")
+    boss.wait_for_selector(".toast:has-text('оформлен')")
     boss.wait_for_selector(".order-pay--ok")
 
     assert _stock(e2e) == 17
@@ -1399,7 +1399,7 @@ def test_incoming_with_picked_product_and_boss_cancel_refused_when_stock_left(op
     boss.fill('.wh-pos [data-f="price"]', "0.5")
     boss.locator('.wh-pos [data-f="price"]').dispatch_event("change")
     boss.click("#wh-save")
-    boss.wait_for_selector(".toast:has-text('проведена')")
+    boss.wait_for_selector(".toast:has-text('оформлен')")
     boss.wait_for_selector("#wh-new")
     inv = e2e.rows("SELECT id FROM invoices ORDER BY id DESC LIMIT 1")[0]["id"]
     assert e2e.rows("SELECT product_id, quantity, price_cents FROM invoice_items WHERE invoice_id = ?", (inv,)) == [
@@ -1436,7 +1436,7 @@ def test_counterparty_from_picker_reuses_namesake_and_keeps_supplier_type(open_a
     boss.click(".picker-add")
     boss.wait_for_selector("#ms-f-name")
     boss.click("#ms-submit")
-    boss.wait_for_selector(".toast:has-text('Такой контрагент уже был')")
+    boss.wait_for_selector(".toast:has-text('Такой уже есть в справочнике')")
     _no_overlay(boss)
     assert e2e.rows("SELECT COUNT(*) AS n FROM counterparties")[0]["n"] == 1, "тёзку не завели"
     assert "ООО Ромашка" in boss.inner_text("#wh-cp")
@@ -1450,7 +1450,7 @@ def test_counterparty_from_picker_reuses_namesake_and_keeps_supplier_type(open_a
     boss.fill("#ms-f-name", "Шанхай Трейдинг")
     boss.click('.c-overlay [data-opt="supplier"]')
     boss.click("#ms-submit")
-    boss.wait_for_selector(".toast:has-text('Контрагент заведён')")
+    boss.wait_for_selector(".toast:has-text('Добавили в справочник')")
     _no_overlay(boss)
     assert e2e.rows("SELECT type, phone FROM counterparties WHERE name = 'Шанхай Трейдинг'") == [
         {"type": "supplier", "phone": None}
@@ -1489,7 +1489,7 @@ def test_manager_posts_incoming_but_cannot_cancel(open_app, e2e):
     mgr.fill('.wh-pos [data-f="quantity"]', "4")
     mgr.locator('.wh-pos [data-f="quantity"]').dispatch_event("change")
     mgr.click("#wh-save")
-    mgr.wait_for_selector(".toast:has-text('проведена')")
+    mgr.wait_for_selector(".toast:has-text('оформлен')")
     mgr.wait_for_selector("#wh-new")
     inv = e2e.rows("SELECT type, created_by FROM invoices ORDER BY id DESC LIMIT 1")[0]
     assert inv == {"type": "incoming", "created_by": e2e.ids["mgr"]}
@@ -1507,7 +1507,7 @@ def test_manager_cancels_invoice_while_deletion_is_open(open_app, e2e):
     tab(mgr, "invoices")
     mgr.wait_for_selector(f'[data-wh-cancel="{inv}"]')
     mgr.click(f'[data-wh-cancel="{inv}"]')
-    mgr.wait_for_selector(".toast:has-text('Накладная отменена')")
+    mgr.wait_for_selector(".toast:has-text('Приход отменён')")
     assert e2e.rows("SELECT status FROM invoices WHERE id = ?", (inv,))[0]["status"] == "cancelled"
 
 

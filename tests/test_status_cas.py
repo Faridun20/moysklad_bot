@@ -158,7 +158,7 @@ def test_happy_path_still_works(isolated_db):
     [
         ("order_moved", "rejected", "отклонён"),
         ("order_moved", "shipped", "отгружен"),
-        ("request_taken", None, "обработана"),
+        ("request_taken", None, "решил кто-то другой"),
     ],
 )
 def test_decision_error_message_explains_cause(reason, order_status, expect):

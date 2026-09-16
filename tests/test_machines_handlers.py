@@ -194,7 +194,7 @@ def test_hours_explains_the_format(isolated_db):
     for text in (f"/hours {mid}", "/hours много 100", f"/hours {mid} много"):
         msg = _FakeMessage(text=text, uid=1)
         asyncio.run(cmd_hours(msg))
-        assert "Формат" in _texts(msg), text
+        assert "/hours 12 15200" in _texts(msg), text
 
 
 def test_hours_denied_for_guest(isolated_db):
@@ -205,7 +205,7 @@ def test_hours_denied_for_guest(isolated_db):
     mid = _machine()
     msg = _FakeMessage(text=f"/hours {mid} 100", uid=99)  # роли нет
     asyncio.run(cmd_hours(msg))
-    assert "доступа" in _texts(msg).lower()
+    assert _texts(msg).startswith("⛔")
 
 
 def test_hours_rollback_offers_force_to_boss_only(isolated_db):
@@ -267,7 +267,7 @@ def test_open_credits_denied_for_manager(isolated_db):
     _setup(db)
     msg = _FakeMessage(text="/machine_deals", uid=1)
     asyncio.run(cmd_open_credits(msg, bot=None))
-    assert "доступа" in _texts(msg).lower()
+    assert _texts(msg).startswith("⛔")
 
 
 def test_open_credits_hides_passport(isolated_db):

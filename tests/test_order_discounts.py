@@ -511,5 +511,5 @@ def test_bot_discount_button_is_boss_only(env):
 
     call = _FakeCall(f"req_dsc:{req_id}", ids["mgr"], bot)
     asyncio.run(cb_approve_request_discount(call, bot))
-    assert call.alerts and call.alerts[0][0] == "Нет доступа"
+    assert call.alerts and call.alerts[0][0] == "Решение по заявке принимает руководитель"
     assert _order(ids["order"])["status"] == "pending"

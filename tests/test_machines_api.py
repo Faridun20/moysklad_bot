@@ -110,7 +110,7 @@ def test_unknown_status_filter_is_rejected(isolated_db, monkeypatch):
 
     r = _post(_client(monkeypatch), "/api/machines/list", 2, status="in_stok")
     assert r.status_code == 400
-    assert "in_stok" in r.json()["detail"]
+    assert "Такого статуса нет" in r.json()["detail"]
 
 
 def test_manager_sees_list_without_cost(isolated_db, monkeypatch):
@@ -542,7 +542,7 @@ def test_hours_rollback_asks_for_confirmation(isolated_db, monkeypatch):
     body = r.json()
     assert body["needs_force"] is True
     assert body["previous"] == 15000
-    assert "Опечатка" in body["detail"]
+    assert "проверьте цифру" in body["detail"]
 
 
 def test_only_boss_may_force_hours_rollback(isolated_db, monkeypatch):
@@ -578,7 +578,7 @@ def test_status_change_follows_the_graph(isolated_db, monkeypatch):
     bad = _post(client, "/api/machines/status", 2, machine_id=mid,
                 status="sold", expected="in_stock")
     assert bad.status_code == 400
-    assert "не предусмотрен" in bad.json()["detail"]
+    assert "перевести нельзя" in bad.json()["detail"]
 
 
 def test_status_change_detects_stale_card(isolated_db, monkeypatch):
@@ -619,7 +619,7 @@ def test_deal_requires_idempotency_key(isolated_db, monkeypatch):
     r = _post(_client(monkeypatch), "/api/machines/deal", 2, machine_id=mid,
               kind="sale", price="25 000", buyer_name="Иванов")
     assert r.status_code == 400
-    assert "idempotency_key" in r.json()["detail"]
+    assert "Форма отправлена не полностью" in r.json()["detail"]
 
 
 def test_repeated_deal_key_returns_the_same_deal(isolated_db, monkeypatch):

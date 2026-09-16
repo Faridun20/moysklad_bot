@@ -120,4 +120,4 @@ def test_forged_currency_is_refused(isolated_db):
     call = _Call("pay_cur:BTC", _Message())
     asyncio.run(process_currency(call, state, _Bot()))
     assert _payments(db) == []
-    assert call.alerts == ["Неизвестная валюта"]
+    assert call.alerts == ["Такой валюты нет в списке — выберите кнопкой"]

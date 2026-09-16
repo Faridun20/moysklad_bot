@@ -120,7 +120,7 @@ def test_empty_buckets_stay_out_of_the_table(isolated_db):
     table = next(b for b in blocks if b.type == "table")
     labels = [row[0].text for row in table.cells[1:]]
     assert labels  # хоть одна корзина есть
-    assert "Просрочено >90 дней" not in labels  # график только что создан
+    assert "Просрочено больше 90 дней" not in labels  # график только что создан
 
 
 def test_text_fallback_escapes_names(isolated_db):

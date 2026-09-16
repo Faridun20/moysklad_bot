@@ -120,12 +120,12 @@ async def notify_order_approved(
     «можно отгружать»: отгрузка «оплаты сразу» без разбивки получит отказ.
     """
     if (payment_type or "") == "paid":
-        tail = "Сначала внесите оплату, затем отгрузка."
+        tail = "Сначала внесите оплату, потом отгружайте."
     else:
-        tail = "Можно приступать к отгрузке."
+        tail = "Можно отгружать."
     text = (
         f"{DIV}\n"
-        f"✅ <b>Заявка #{req_id} одобрена!</b>\n\n"
+        f"✅ <b>Заявка #{req_id} одобрена</b>\n\n"
         f"👨‍💼 Одобрил: {esc(boss_name)}\n"
         f"🕐 {now}{demand_line}\n\n"
         f"{tail}"
@@ -149,7 +149,7 @@ async def notify_order_rejected(
         f"❌ <b>Заявка #{req_id} отклонена</b>\n\n"
         f"👨‍💼 Отклонил: {esc(boss_name)}\n"
         f"🕐 {now}\n\n"
-        f"Свяжитесь с руководителем для уточнения."
+        f"Спросите у руководителя, что не так, и отправьте заявку заново."
     )
     await _send(bot, manager_user_id, text)
 
@@ -171,12 +171,12 @@ async def notify_order_returned(
     """
     if frozen:
         tail = (
-            f"\n\n🧊 <b>Заказ заморожен</b> после {rejection_count} отклонений — "
-            f"переотправка заблокирована.\nОбратитесь к администратору для разморозки."
+            f"\n\n🧊 <b>Заказ заморожен</b>: заявку отклоняли {rejection_count} раз(а), "
+            f"отправить заново нельзя.\nПопросите администратора разморозить заказ."
         )
     else:
         tail = (
-            f"\n\nОтредактируйте заказ и отправьте заново "
+            f"\n\nПоправьте заказ и отправьте заявку заново "
             f"(попытка {rejection_count})."
         )
     text = (
@@ -280,33 +280,33 @@ async def notify_payment_confirmation_needed(
 
     lines = [
         f"{DIV}",
-        "💳 <b>Требуется подтверждение оплаты</b>",
+        "💳 <b>Подтвердите оплату</b>",
         "",
         f"Заказ #{order_id}",
         f"👨‍💼 Менеджер: <b>{esc(manager_name)}</b>",
-        f"🏢 Клиент: <b>{agent}</b>",
+        f"👤 Клиент: <b>{agent}</b>",
         f"💵 Сумма платежа: <b>{_fmt_amount(amount)} {esc(currency)}</b>",
-        f"📦 По заказу всего: <b>{_fmt_amount(summary['total'])} {esc(currency)}</b>",
+        f"📦 Всего по заказу: <b>{_fmt_amount(summary['total'])} {esc(currency)}</b>",
     ]
     if summary.get("total_base") is not None and currency != summary.get("base_currency"):
         lines.append(
             f"   ≈ <b>{_fmt_amount(summary['total_base'])} {esc(summary['base_currency'])}</b>"
         )
     if confirmed_before > 0:
-        lines.append(f"✅ Уже оплачено ранее: <b>{_fmt_amount(confirmed_before)} {esc(currency)}</b>")
+        lines.append(f"✅ Оплачено раньше: <b>{_fmt_amount(confirmed_before)} {esc(currency)}</b>")
     if remaining_after <= 0:
         lines.append("🎉 Этот платёж <b>закрывает долг полностью</b>")
     else:
         lines.append(
-            f"📎 Останется к получению: <b>{_fmt_amount(remaining_after)} {esc(currency)}</b>"
+            f"📎 Останется долга: <b>{_fmt_amount(remaining_after)} {esc(currency)}</b>"
         )
-    lines.append(f"📅 Срок: {esc(_to_ru(due))}")
+    lines.append(f"📅 Срок оплаты: {esc(_to_ru(due))}")
     lines.append("")
-    lines.append("Подтвердите, что эта сумма реально пришла в кассу.")
+    lines.append("Подтвердите, что эти деньги действительно пришли.")
 
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Принять", callback_data=f"pay_ok:{payment_id}")
-    kb.button(text="❌ Отклонить", callback_data=f"pay_no:{payment_id}")
+    kb.button(text="✅ Принять платёж", callback_data=f"pay_ok:{payment_id}")
+    kb.button(text="❌ Отклонить платёж", callback_data=f"pay_no:{payment_id}")
     kb.adjust(2)
     await _broadcast(
         bot, "\n".join(lines), get_notify_recipients(), reply_markup=kb.as_markup()

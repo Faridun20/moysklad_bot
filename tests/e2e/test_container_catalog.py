@@ -120,8 +120,8 @@ def test_manager_fills_container_from_catalog_and_receives_without_duplicates(op
     assert _stock(e2e, bracket) == 4
     assert _stock(e2e, ids["product"]) == 25
     assert _stock(e2e, cyl[0]["id"]) == 2
-    mgr.wait_for_selector("#cont-supply:has-text('Переоприходовать')")
-    assert "Приходная накладная проведена" in mgr.inner_text("#content")
+    mgr.wait_for_selector("#cont-supply:has-text('Принять заново')")
+    assert "Товар принят на склад" in mgr.inner_text("#content")
 
 
 def test_manager_marks_machine_in_transit_arrived(open_app, e2e):

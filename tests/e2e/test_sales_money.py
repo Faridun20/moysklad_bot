@@ -188,7 +188,7 @@ def test_keeper_marks_approved_order_shipped(open_app, e2e):
     go(keeper, "sales")
     keeper.wait_for_selector(f'.btn-ship-order[data-id="{oid}"]')
     keeper.click(f'.btn-ship-order[data-id="{oid}"]')  # showConfirm → «да»
-    keeper.wait_for_function("() => window.__tgAlerts.some(a => a.startsWith('🚚'))")
+    keeper.wait_for_function("() => window.__tgAlerts.some(a => /Заказ #\\d+ отгружен/.test(a))")
     assert e2e.rows("SELECT status FROM orders WHERE id = ?", (oid,))[0]["status"] == "shipped"
 
 
@@ -206,17 +206,17 @@ def test_cash_deposit_is_confirmed_and_closes_debt_fifo(open_app, e2e):
     mgr.wait_for_selector("#dep-amount")
     mgr.fill("#dep-amount", "80")
     mgr.click("#dep-create")
-    mgr.wait_for_selector(".toast:has-text('Сдача #')")
+    mgr.wait_for_selector(".toast:has-text('Сдача в кассу №')")
     dep = e2e.rows("SELECT id, status, amount_cents FROM cash_deposits")[0]
     assert dep["status"] == "pending" and dep["amount_cents"] == 8000
-    # Своя сдача видна менеджеру в «Мои сдачи».
+    # Своя сдача видна менеджеру в «Мои сдачи в кассу».
     mgr.wait_for_selector(f".stock-row:has-text('#{dep['id']}')")
 
     boss = open_app(e2e.ids["boss"])
     open_confirmations(boss)
     boss.wait_for_selector(f'.debt-card[data-dep="{dep["id"]}"] .dep-confirm')
     boss.click(f'.debt-card[data-dep="{dep["id"]}"] .dep-confirm')
-    boss.wait_for_selector(".toast:has-text('Сдача подтверждена')")
+    boss.wait_for_selector(".toast:has-text('Сдача в кассу подтверждена')")
 
     assert e2e.rows("SELECT status FROM cash_deposits")[0]["status"] == "confirmed"
     alloc = e2e.rows("SELECT order_id, amount_allocated_cents FROM cash_deposit_orders")
@@ -257,7 +257,7 @@ def test_manual_payment_currency_is_picked_by_a_segment(open_app, e2e):
             break
         time.sleep(0.2)
     status = mgr.locator("#pay-status")
-    assert status.count() == 0 or "❌" not in status.inner_text(), status.inner_text()
+    assert status.count() == 0 or "pay-error" not in (status.get_attribute("class") or ""), status.inner_text()
     assert rows == [{"amount_cents": 25000000, "currency": "UZS",
                      "comment": "Аренда за май"}]
 

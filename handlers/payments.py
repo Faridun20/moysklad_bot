@@ -92,10 +92,10 @@ def currency_keyboard():
 
 _PAY_PROMPT = (
     f"{DIV}\n"
-    f"💵 <b>Отправка платежа</b>\n\n"
-    f"Напишите одним сообщением: <b>сумма валюта комментарий</b>\n"
+    f"💵 <b>Платёж в кассу</b>\n\n"
+    f"Напишите одним сообщением: <b>сумма валюта за что</b>\n"
     f"<code>1500 USD за аренду</code>\n\n"
-    f"<i>Если не укажете валюту — спрошу кнопками. Комментарий можно опустить.</i>"
+    f"<i>Валюту можно не писать — тогда предложу кнопками. «За что» тоже не обязательно.</i>"
 )
 
 
@@ -109,8 +109,8 @@ def _pay_cancel_keyboard():
 
 def confirm_keyboard(payment_id: int):
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Принять", callback_data=f"pay_ok:{payment_id}")
-    kb.button(text="❌ Отклонить", callback_data=f"pay_no:{payment_id}")
+    kb.button(text="✅ Принять платёж", callback_data=f"pay_ok:{payment_id}")
+    kb.button(text="❌ Отклонить платёж", callback_data=f"pay_no:{payment_id}")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -155,7 +155,7 @@ def _cash_markup(markup, payment_id: int):
     rows = []
     for row in markup.inline_keyboard:
         rows.append([
-            disabled_button("💵 Принять — через сдачу в кассу")
+            disabled_button("💵 Наличные принимают сдачей в кассу")
             if b.callback_data == f"pay_ok:{payment_id}" else b
             for b in row
         ])
@@ -168,7 +168,7 @@ def _cash_markup(markup, payment_id: int):
 @router.message(Command("pay"))
 async def cmd_pay(message: Message, state: FSMContext):
     if not _can_send_payment(message.from_user.id):
-        return await message.answer("⛔ Платежи отправляют только менеджеры.")
+        return await message.answer("⛔ Платёж в кассу отправляет менеджер — у вас другая роль.")
     await state.clear()
     await state.set_state(PaymentState.waiting_for_input)
     prompt = await message.answer(_PAY_PROMPT, parse_mode="HTML", reply_markup=_pay_cancel_keyboard())
@@ -178,7 +178,9 @@ async def cmd_pay(message: Message, state: FSMContext):
 @router.callback_query(F.data == "pay_start")
 async def cb_pay_start(call: CallbackQuery, state: FSMContext):
     if not _can_send_payment(call.from_user.id):
-        return await call.answer("⛔ Платежи отправляют только менеджеры", show_alert=True)
+        return await call.answer(
+            "⛔ Платёж в кассу отправляет менеджер — у вас другая роль", show_alert=True
+        )
     await call.answer()
     await state.clear()
     await state.set_state(PaymentState.waiting_for_input)
@@ -210,7 +212,7 @@ async def process_input(message: Message, state: FSMContext, bot: Bot):
     amount, currency, comment = _parse_payment_input(message.text)
     if amount is None:
         return await message.answer(
-            "❌ Не понял сумму. Начните с числа, например:\n"
+            "❌ Не разобрал сумму. Начните сообщение с числа, например:\n"
             "<code>1500 USD за аренду</code>",
             parse_mode="HTML",
         )
@@ -218,7 +220,7 @@ async def process_input(message: Message, state: FSMContext, bot: Bot):
         await state.update_data(amount=amount, comment=comment)
         await state.set_state(PaymentState.waiting_for_currency)
         return await message.answer(
-            f"✅ Сумма: <b>{amount:,.0f}</b>\n\nВыберите валюту:",
+            f"✅ Сумма: <b>{amount:,.0f}</b>\n\nТеперь выберите валюту:",
             parse_mode="HTML",
             reply_markup=currency_keyboard(),
         )
@@ -233,7 +235,7 @@ async def process_currency(call: CallbackQuery, state: FSMContext, bot: Bot):
     currency = call.data.split(":")[1]
     if currency not in CURRENCIES:
         # callback_data подделывается клиентом — валюту берём только из списка.
-        return await call.answer("Неизвестная валюта", show_alert=True)
+        return await call.answer("Такой валюты нет в списке — выберите кнопкой", show_alert=True)
 
     # Двойной тап по валюте: aiogram обрабатывает апдейты параллельно, и оба
     # колбэка проходили фильтр состояния раньше, чем первый успевал его
@@ -248,7 +250,9 @@ async def process_currency(call: CallbackQuery, state: FSMContext, bot: Bot):
     await state.clear()
     if "amount" not in data:
         await adb.idem_release(key)
-        return await call.answer("Ввод устарел — начните заново: /pay", show_alert=True)
+        return await call.answer(
+            "Сумма уже не сохранилась — начните заново: /pay", show_alert=True
+        )
     await call.answer()
     try:
         await call.message.edit_text(
@@ -278,7 +282,7 @@ async def pay_cancel(call: CallbackQuery, state: FSMContext):
     ):
         # Кнопка со старого вопроса: платёж уже отправлен или ввод сброшен.
         # «Отправка отменена» здесь было бы неправдой.
-        await call.answer("Уже неактуально")
+        await call.answer("Это уже не актуально")
         try:
             await call.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -315,10 +319,10 @@ async def _finalize_payment(target: Message, user, bot: Bot, amount, currency, c
     comment_line = f"<b>📝 Комментарий:</b> {_esc(comment)}\n" if comment else ""
     await target.answer(
         f"{DIV}\n"
-        f"✅ <b>Платёж отправлен!</b>\n\n"
+        f"✅ <b>Платёж отправлен</b>\n\n"
         f"<b>💰 Сумма:</b> {amount:,.0f} {currency}\n"
         f"{comment_line}\n"
-        f"<i>⏳ Ожидайте подтверждения</i>",
+        f"<i>⏳ Ждите подтверждения руководителя</i>",
         parse_mode="HTML",
     )
 
@@ -359,22 +363,24 @@ def _decided_label(verb: str, message, payment: dict) -> str:
 @router.callback_query(F.data.startswith("pay_ok:"))
 async def confirm_pay(call: CallbackQuery, bot: Bot):
     if not is_admin(call.from_user.id):
-        return await call.answer("⛔ Нет доступа", show_alert=True)
+        return await call.answer(
+            "⛔ Решение по платежу принимает руководитель или бухгалтер", show_alert=True
+        )
 
     payment_id = int(call.data.split(":")[1])
     payment = await adb.get_payment(payment_id)
 
     if not payment:
-        return await call.answer("❌ Платёж не найден", show_alert=True)
+        return await call.answer("❌ Платежа с таким номером нет", show_alert=True)
     if payment["status"] != "pending":
-        await call.answer("⚠️ Уже обработан", show_alert=True)
+        await call.answer("⚠️ По этому платежу уже решили", show_alert=True)
         return await _settle_stale_payment(call, payment_id, payment)
     from services import order_payments
 
     if await order_payments.payment_method(payment_id) == "cash":
         # Наличные у менеджера подтверждаются сдачей в кассу — не этой кнопкой.
         await call.answer(
-            "Это наличные: они подтверждаются сдачей в кассу (WebApp → Деньги)", show_alert=True
+            "Это наличные: их подтверждают сдачей в кассу (WebApp → Деньги)", show_alert=True
         )
         msg = getattr(call, "message", None)
         markup = _cash_markup(getattr(msg, "reply_markup", None), payment_id)
@@ -393,19 +399,19 @@ async def confirm_pay(call: CallbackQuery, bot: Bot):
         # кнопки карточки не трогаем.
         return await call.answer(f"⛔ {e.message}"[:200], show_alert=True)
     if not confirmed:
-        await call.answer("⚠️ Уже обработан", show_alert=True)
+        await call.answer("⚠️ По этому платежу уже решили", show_alert=True)
         return await _settle_stale_payment(call, payment_id, await adb.get_payment(payment_id))
 
-    await call.answer("✅ Принято")
+    await call.answer("✅ Платёж принят")
     now = local_now().strftime("%d.%m.%Y %H:%M")
     base = getattr(call.message, "html_text", None) or call.message.text or ""
     await call.message.edit_text(
-        base + f"\n\n{DIV}\n✅ <b>Принято</b>  <code>{now}</code>  — {_esc(admin_name)}",
+        base + f"\n\n{DIV}\n✅ <b>Платёж принят</b>  <code>{now}</code>  — {_esc(admin_name)}",
         parse_mode="HTML",
         reply_markup=settle_markup(
             getattr(call.message, "reply_markup", None),
             _payment_callbacks(payment_id),
-            outcome_label(_decided_label("✅ Принято", call.message, payment), call.from_user),
+            outcome_label(_decided_label("✅ Принят", call.message, payment), call.from_user),
             tail=webapp_keyboard("🌐 Долги — в WebApp"),
         ),
     )
@@ -418,34 +424,37 @@ async def confirm_pay(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith("pay_no:"))
 async def reject_pay(call: CallbackQuery, bot: Bot):
     if not is_admin(call.from_user.id):
-        return await call.answer("⛔ Нет доступа", show_alert=True)
+        return await call.answer(
+            "⛔ Решение по платежу принимает руководитель или бухгалтер", show_alert=True
+        )
 
     payment_id = int(call.data.split(":")[1])
     payment = await adb.get_payment(payment_id)
 
     if not payment:
-        return await call.answer("❌ Платёж не найден", show_alert=True)
+        return await call.answer("❌ Платежа с таким номером нет", show_alert=True)
     if payment["status"] != "pending":
-        await call.answer("⚠️ Уже обработан", show_alert=True)
+        await call.answer("⚠️ По этому платежу уже решили", show_alert=True)
         return await _settle_stale_payment(call, payment_id, payment)
 
     admin_name = call.from_user.full_name or str(call.from_user.id)
     if not await adb.reject_payment(payment_id, call.from_user.id, admin_name):
         await call.answer(
-            "⚠️ Уже обработан или наличные уже в сдаче — отклоните сдачу", show_alert=True
+            "⚠️ По платежу уже решили, либо наличные ушли в сдачу — тогда отклоните сдачу",
+            show_alert=True,
         )
         return await _settle_stale_payment(call, payment_id, await adb.get_payment(payment_id))
 
-    await call.answer("❌ Отклонено")
+    await call.answer("❌ Платёж отклонён")
     now = local_now().strftime("%d.%m.%Y %H:%M")
     base = getattr(call.message, "html_text", None) or call.message.text or ""
     await call.message.edit_text(
-        base + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{now}</code>  — {_esc(admin_name)}",
+        base + f"\n\n{DIV}\n❌ <b>Платёж отклонён</b>  <code>{now}</code>  — {_esc(admin_name)}",
         parse_mode="HTML",
         reply_markup=settle_markup(
             getattr(call.message, "reply_markup", None),
             _payment_callbacks(payment_id),
-            outcome_label(_decided_label("❌ Отклонено", call.message, payment), call.from_user),
+            outcome_label(_decided_label("❌ Отклонён", call.message, payment), call.from_user),
             tail=webapp_keyboard("🌐 Долги — в WebApp"),
         ),
     )

@@ -154,7 +154,7 @@ def parse_parts(raw: Any, allowed: tuple[str, ...] | None = None, *,
     out: list[PartInput] = []
     for n, row in enumerate(raw, start=1):
         if not isinstance(row, dict):
-            raise PaymentError(f"Строка {n}: неверный формат")
+            raise PaymentError(f"Строка {n}: заполните способ и сумму")
         method = str(row.get("method") or "").strip().lower()
         if method not in METHODS:
             raise PaymentError(f"Строка {n}: выберите способ — наличные, карта или перечисление")
@@ -170,7 +170,7 @@ def parse_parts(raw: Any, allowed: tuple[str, ...] | None = None, *,
         if raw_rate not in (None, ""):
             rate = parse_rate(raw_rate)
             if rate is None:
-                raise PaymentError(f"Строка {n}: курс — положительное число")
+                raise PaymentError(f"Строка {n}: курс — число больше нуля")
         account_id = None
         if method in NONCASH_METHODS:
             raw_acc = row.get("account_id")
@@ -196,7 +196,7 @@ def rate_currency(part_cur: str, order_cur: str, base: str) -> str | None:
         return None
     if p != base and o != base:
         # USD/UZS — пара всегда с базовой; третья валюта потребовала бы двух курсов.
-        raise PaymentError(f"Пересчёт {p} → {o} без базовой валюты не поддерживается")
+        raise PaymentError(f"Пересчёт из {p} в {o} не настроен — укажите курс вручную")
     return p if p != base else o
 
 
@@ -211,7 +211,7 @@ def convert_to_order(amount_cents: int, part_cur: str, order_cur: str, base: str
     if p == o:
         return int(amount_cents)
     if quote is None or quote <= 0:
-        raise PaymentError("Нет курса для пересчёта")
+        raise PaymentError("Нет курса для пересчёта — укажите курс вручную")
     if o == base:  # сумы → доллары
         return _q(Decimal(int(amount_cents)) / quote)
     return _q(Decimal(int(amount_cents)) * quote)  # доллары → сумы
@@ -559,7 +559,7 @@ async def record_payment_parts(order_id: int, actor: Actor, raw_parts: Any, *,
         "SELECT id, user_id, currency, payment_type FROM orders WHERE id = $1", int(order_id)
     )
     if not head:
-        raise PaymentError("Заказ не найден", status=404)
+        raise PaymentError("Заказ не найден — обновите список", status=404)
     from services.roles import role_allowed
 
     if int(head["user_id"]) != actor.user_id and not role_allowed(actor.role, ROLES_RECORD_ANY):
@@ -586,7 +586,7 @@ async def record_payment_parts(order_id: int, actor: Actor, raw_parts: Any, *,
             "FROM orders WHERE id = $1", int(order_id),
         )
         if order is None:
-            raise PaymentError("Заказ не найден", status=404)
+            raise PaymentError("Заказ не найден — обновите список", status=404)
         ptype = (order["payment_type"] or "paid")
         if order["paid_confirmed_at"] is not None:
             raise PaymentError("Заказ уже полностью оплачен", status=409, code="closed")
@@ -602,7 +602,7 @@ async def record_payment_parts(order_id: int, actor: Actor, raw_parts: Any, *,
             if row is None or int(row["order_id"] or 0) != int(order_id):
                 raise PaymentError(f"Платёж #{pid} не относится к заказу #{order_id}", status=409)
             if row["status"] != "pending" or int(row["parts"] or 0):
-                raise PaymentError(f"Платёж #{pid} уже не ожидающий или уже разложен", status=409)
+                raise PaymentError(f"Платёж #{pid} уже подтверждён или отклонён — обновите экран", status=409)
             await txn.execute(
                 "UPDATE payments SET status = 'rejected' WHERE id = $1 AND status = 'pending'", int(pid)
             )
@@ -935,15 +935,16 @@ async def attach_deposit_to_parts(deposit_id: int, *, dry_run: bool = True) -> d
 
     dep = await adb_core.fetchrow("SELECT * FROM cash_deposits WHERE id = $1", int(deposit_id))
     if dep is None:
-        return {"ok": False, "error": f"Сдача #{deposit_id} не найдена"}
+        return {"ok": False, "error": f"Сдача #{deposit_id} не найдена — обновите список"}
     if dep["status"] not in ("pending", "confirmed") or int(dep["amount_cents"]) <= 0:
-        return {"ok": False, "error": f"Сдача #{deposit_id}: статус {dep['status']}, сумма {dep['amount_cents']} — не распределяется"}
+        return {"ok": False, "error": f"Сдачу #{deposit_id} не разнести по заказам: "
+                "она ещё не подтверждена или её сумма нулевая"}
     has_alloc = await adb_core.fetchval(
         "SELECT (SELECT COUNT(*) FROM cash_deposit_orders WHERE deposit_id = $1) + "
         "(SELECT COUNT(*) FROM cash_deposit_parts WHERE deposit_id = $1)", int(deposit_id),
     )
     if int(has_alloc or 0):
-        return {"ok": False, "error": f"Сдача #{deposit_id} уже распределена — не трогаю"}
+        return {"ok": False, "error": f"Сдача #{deposit_id} уже разнесена по заказам"}
     currency = (await deposit_currency([int(deposit_id)]))[int(deposit_id)]
     rows = await cash_on_hand(int(dep["manager_id"]), currency)
     if dry_run:

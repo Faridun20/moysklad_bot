@@ -180,7 +180,7 @@ def test_accounts_opening_balance_and_rules(env):
     assert r.status_code == 403
     with pytest.raises(e.acc.AccountingError, match="4"):
         account(e, "Visa", "card", "USD", card_last4="12")
-    with pytest.raises(e.acc.AccountingError, match="Тип"):
+    with pytest.raises(e.acc.AccountingError, match="тип счёта"):
         account(e, "Сейф", "safe", "USD")
 
     # Правка начального остатка: старый документ отменяется с причиной, новый проводится.
@@ -203,7 +203,7 @@ def test_accounts_opening_balance_and_rules(env):
     # Архивный счёт не виден в «Деньги сейчас» и не принимает операции.
     _run(e.acc.set_archived(actor(e.acc, BOSS), card, True))
     assert "Humo Али" not in balances(e)
-    with pytest.raises(e.acc.AccountingError, match="архиве"):
+    with pytest.raises(e.acc.AccountingError, match="архив"):
         _run(e.acc.record_expense(actor(e.acc, MGR), {
             "account_id": card, "amount": "1000", "note": "такси", "idempotency_key": "x"}))
 
@@ -438,7 +438,7 @@ def test_transfer_and_exchange(env):
     t = _run(e.acc.record_transfer(actor(e.acc, MGR), {
         "from_account_id": mgr_cash, "to_account_id": office, "amount": "600", "idempotency_key": "t1"}))
     assert t["kind"] == "transfer"
-    with pytest.raises(e.acc.AccountingError, match="совпадают"):
+    with pytest.raises(e.acc.AccountingError, match="один и тот же"):
         _run(e.acc.record_transfer(actor(e.acc, MGR), {
             "from_account_id": office, "to_account_id": office, "amount": "1", "idempotency_key": "t2"}))
     # Обмен 100 USD → 1 275 000 сум по факту.

@@ -91,7 +91,7 @@ function auditLogPaint() {
         <div class="card-row-icon">${icon('list')}</div>
         <div class="card-row-info">
           <div class="card-row-title">${escapeHtml(e.action_label)}</div>
-          <div class="card-row-sub">${escapeHtml(e.full_name || '—')}${e.role ? ' · ' + escapeHtml(e.role) : ''} · ${escapeHtml(e.created_at)}</div>
+          <div class="card-row-sub">${escapeHtml(e.full_name || '—')}${e.role ? ' · ' + escapeHtml((typeof ROLE_NAMES !== 'undefined' && ROLE_NAMES[e.role]) || e.role) : ''} · ${escapeHtml(e.created_at)}</div>
           ${e.details ? `<div class="card-row-sub audit-row-details">${escapeHtml(e.details)}</div>` : ''}
         </div>
       </div>`).join('')

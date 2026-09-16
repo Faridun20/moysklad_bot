@@ -124,9 +124,9 @@ def _parse_sum(raw: Any) -> int:
     try:
         value = Decimal(text)
     except (InvalidOperation, ValueError):
-        raise DocumentError("Сумма: нужно число")
+        raise DocumentError("Сумма: введите число")
     if not value.is_finite():
-        raise DocumentError("Сумма: нужно число")
+        raise DocumentError("Сумма: введите число")
     if value <= 0:
         raise DocumentError("Сумма должна быть больше нуля")
     if value != value.to_integral_value():
@@ -154,7 +154,7 @@ def form_to_context(data: dict[str, Any]) -> tuple[dict, dict]:
     # в списке и в подписи к PDF в Telegram не опознать.
     debtor_full_name = _clean(data.get("debtor_full_name"))
     if not debtor_full_name:
-        raise DocumentError("ФИО должника обязательно")
+        raise DocumentError("Укажите ФИО должника")
 
     company = company_requisites()
     creditor = {
@@ -257,7 +257,7 @@ async def send_to_chat(bot: Any, doc: dict, chat_id: int) -> dict:
     import asyncio
 
     if bot is None:
-        return {"sent": False, "reason": "Бот недоступен"}
+        return {"sent": False, "reason": "Бот сейчас недоступен — попробуйте позже"}
     found = await asyncio.to_thread(read_pdf, doc)
     if found is None:
         return {"sent": False, "reason": "Файл документа не найден — сформируйте заново"}
@@ -273,7 +273,7 @@ async def send_to_chat(bot: Any, doc: dict, chat_id: int) -> dict:
         )
     except Exception:
         logger.exception("Документ #%s не отправлен в чат %s", doc.get("id"), chat_id)
-        return {"sent": False, "reason": "Не удалось отправить в Telegram"}
+        return {"sent": False, "reason": "Не удалось отправить в Telegram — попробуйте ещё раз"}
     return {"sent": True, "reason": None}
 
 
@@ -293,7 +293,7 @@ async def create_document(data: dict[str, Any], *, created_by: int) -> dict:
         return {"ok": False, "error": str(e)}
     except Exception:
         logger.exception("Документ не собран (неожиданная ошибка)")
-        return {"ok": False, "error": "Не удалось собрать документ"}
+        return {"ok": False, "error": "Не удалось собрать документ — проверьте поля формы и повторите"}
 
     cp_id = None
     try:

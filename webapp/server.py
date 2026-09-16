@@ -121,7 +121,7 @@ class _Idem:
             return None  # ключ наш
         if prev:
             return prev  # готовый результат прошлой попытки
-        raise HTTPException(status_code=409, detail="Запрос уже обрабатывается")
+        raise HTTPException(status_code=409, detail="Этот запрос уже обрабатывается — подождите пару секунд")
 
     async def store(self, result: dict) -> None:
         if self._key:
@@ -205,13 +205,13 @@ def _authorize(
     from services.roles import cached_is_deactivated, role_allowed
 
     if cached_is_deactivated(user["id"]):
-        raise HTTPException(status_code=403, detail="Доступ деактивирован")
+        raise HTTPException(status_code=403, detail="Ваш доступ отключён — обратитесь к руководителю")
     if allowed_roles is not None:
         role = get_role(user["id"])
         # role_allowed, а не `in`: менеджер временно замещает кладовщика и
         # бухгалтера (services.roles.ROLE_ALSO_ACTS_AS) — одна точка на все ручки.
         if not role_allowed(role, allowed_roles):
-            raise HTTPException(status_code=403, detail="Нет доступа")
+            raise HTTPException(status_code=403, detail="У вас нет доступа к этому действию")
     if rate_limit_scope:
         if not rate_limit_acquire(rate_limit_scope, user["id"], rate_limit_max, rate_limit_window):
             raise HTTPException(
@@ -272,7 +272,7 @@ async def _lifespan(_app):
 app = FastAPI(title="Склад WebApp", lifespan=_lifespan)
 
 
-_BAD_JSON_DETAIL = "Некорректный JSON"
+_BAD_JSON_DETAIL = "Запрос не распознан — обновите приложение и повторите"
 
 
 @app.exception_handler(Exception)
@@ -315,7 +315,7 @@ app.add_middleware(GZipMiddleware, minimum_size=500)
 # JSON: до 5 МБ байтов (`_PHOTO_MAX_BYTES`) → ~6,7 МБ base64 + поля; фронт при
 # этом ещё и ужимает снимок (`shrinkImage`). 8 МБ оставляют запас.
 MAX_BODY_BYTES = 8 * 1024 * 1024
-_BODY_TOO_LARGE = "Слишком большой запрос"
+_BODY_TOO_LARGE = "Слишком большой запрос — уменьшите файл или число строк"
 
 
 class _BodyTooLarge(Exception):
@@ -888,22 +888,22 @@ async def api_prefs_set(request: Request):
     key = str(data.get("key") or "").strip()
     role = get_role(user["id"])
     if key not in user_prefs.PREFS or not user_prefs.applies_to(key, role):
-        raise HTTPException(status_code=400, detail="Неизвестная настройка")
+        raise HTTPException(status_code=400, detail="Такой настройки нет — обновите приложение")
     default = user_prefs.PREFS[key][0]
     value = data.get("value")
     audit = None
     if isinstance(default, bool):
         if not isinstance(value, bool):
-            raise HTTPException(status_code=400, detail="value: true или false")
+            raise HTTPException(status_code=400, detail="Эта настройка только включается или выключается")
         audit = "on" if value else "off"
     elif isinstance(default, int):
         # bool — подкласс int в Python: явная проверка, иначе True/False
         # молча прошли бы сюда как 1/0.
         if isinstance(value, bool) or not isinstance(value, int):
-            raise HTTPException(status_code=400, detail="value: число")
+            raise HTTPException(status_code=400, detail="Значение настройки — целое число")
         value = max(0, min(int(value), 1000))  # разумный потолок, не «свалка»
     else:  # pragma: no cover — новый тип default в PREFS без ветки валидации
-        raise HTTPException(status_code=400, detail="Неизвестная настройка")
+        raise HTTPException(status_code=400, detail="Такой настройки нет — обновите приложение")
     prefs = await asyncio.to_thread(user_prefs.set_pref, user["id"], key, value)
     if audit is not None:
         await adb.add_audit_log(
@@ -942,7 +942,7 @@ async def _require_delete_right(role: str) -> None:
     if role != "manager" or await _delete_requires_boss():
         raise HTTPException(
             status_code=403,
-            detail="Удалять может только руководитель — так настроено в WebApp",
+            detail="Удалять может только руководитель — так настроено в приложении",
         )
 
 
@@ -958,7 +958,7 @@ async def api_settings_delete_requires_boss(request: Request):
         rate_limit_scope="api_settings_delete_requires_boss", rate_limit_max=10,
     )
     if "enabled" not in data or not isinstance(data.get("enabled"), bool):
-        raise HTTPException(status_code=400, detail="enabled: true или false")
+        raise HTTPException(status_code=400, detail="Эту настройку можно только включить или выключить")
     enabled = bool(data["enabled"])
     before = await _delete_requires_boss()
     await asyncio.to_thread(set_setting, "delete_requires_boss", enabled, user["id"])
@@ -1027,17 +1027,17 @@ async def api_audit_log(request: Request):
         limit = max(1, min(int(data.get("limit") or 50), 200))
         offset = max(0, int(data.get("offset") or 0))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Некорректные limit/offset") from None
+        raise HTTPException(status_code=400, detail="Не получилось открыть эту страницу списка — обновите экран") from None
     raw_user_id = data.get("user_id")
     try:
         user_id = int(raw_user_id) if raw_user_id else None
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="user_id — число") from None
+        raise HTTPException(status_code=400, detail="Выберите сотрудника из списка") from None
     date_from = str(data.get("date_from") or "")
     date_to = str(data.get("date_to") or "")
     for d in (date_from, date_to):
         if d and not _DATE_RE.match(d):
-            raise HTTPException(status_code=400, detail="Дата — в формате ГГГГ-ММ-ДД")
+            raise HTTPException(status_code=400, detail="Дата — в формате ГГГГ-ММ-ДД, например 2026-09-16")
 
     rows, total = await get_audit_log_page(
         limit=limit, offset=offset, user_id=user_id, date_from=date_from, date_to=date_to,
@@ -1084,7 +1084,7 @@ async def api_settings_client_debt_reminders(request: Request):
         rate_limit_scope="api_settings_client_debt_reminders", rate_limit_max=10,
     )
     if "enabled" not in data or not isinstance(data.get("enabled"), bool):
-        raise HTTPException(status_code=400, detail="enabled: true или false")
+        raise HTTPException(status_code=400, detail="Эту настройку можно только включить или выключить")
     enabled = bool(data["enabled"])
     before = bool(await asyncio.to_thread(get_setting, "client_debt_reminders_enabled", False))
     await asyncio.to_thread(set_setting, "client_debt_reminders_enabled", enabled, user["id"])
@@ -1782,7 +1782,7 @@ async def api_analytics_export(request: Request):
         )
     except Exception:
         logger.exception("analytics export send_document failed")
-        raise HTTPException(status_code=502, detail="Не удалось отправить файл в Telegram")
+        raise HTTPException(status_code=502, detail="Не удалось отправить файл в Telegram — попробуйте ещё раз")
     return JSONResponse({"ok": True, "sent": True})
 
 
@@ -1801,7 +1801,7 @@ async def _send_xlsx_to_chat(user_id: int, xlsx_bytes: bytes, filename: str, cap
         )
     except Exception:
         logger.exception("excel export send_document failed (%s)", filename)
-        raise HTTPException(status_code=502, detail="Не удалось отправить файл в Telegram")
+        raise HTTPException(status_code=502, detail="Не удалось отправить файл в Telegram — попробуйте ещё раз")
 
 
 # ─── API: Excel-выгрузки B6 (Каталог/Долги/Накладные/Клиенты) ────────────────
@@ -1866,12 +1866,12 @@ async def api_debts_export(request: Request):
         for r in items
     ]
     xlsx_bytes = await asyncio.to_thread(build_debts_xlsx, rows)
-    await _send_xlsx_to_chat(user["id"], xlsx_bytes, "debts.xlsx", "💳 Долги · дебиторка со сроками")
+    await _send_xlsx_to_chat(user["id"], xlsx_bytes, "debts.xlsx", "💳 Долги · кто и сколько должен по срокам")
     return JSONResponse({"ok": True, "sent": True})
 
 
-_INVOICE_TYPE_LABELS = {"incoming": "Приход", "outgoing": "Расход"}
-_INVOICE_STATUS_LABELS = {"confirmed": "Проведена", "cancelled": "Отменена"}
+_INVOICE_TYPE_LABELS = {"incoming": "Приход", "outgoing": "Отгрузка"}
+_INVOICE_STATUS_LABELS = {"confirmed": "Оформлено", "cancelled": "Отменено"}
 
 
 @app.post("/api/wh/invoices/export")
@@ -1905,7 +1905,7 @@ async def api_wh_invoices_export(request: Request):
         for r in rows
     ]
     xlsx_bytes = await asyncio.to_thread(build_invoices_xlsx, export_rows)
-    await _send_xlsx_to_chat(user["id"], xlsx_bytes, "invoices.xlsx", "🧾 Накладные за период")
+    await _send_xlsx_to_chat(user["id"], xlsx_bytes, "invoices.xlsx", "🧾 Движения склада за период")
     return JSONResponse({"ok": True, "sent": True})
 
 
@@ -1943,11 +1943,11 @@ def _decode_upload(data: dict) -> tuple[str, bytes]:
     try:
         content = base64.b64decode(raw_b64, validate=True)
     except (binascii.Error, ValueError):
-        raise HTTPException(status_code=400, detail="Файл повреждён")
+        raise HTTPException(status_code=400, detail="Файл не читается — сохраните его заново и попробуйте ещё раз")
     if len(content) > _CATALOG_IMPORT_MAX_BYTES:
         raise HTTPException(status_code=400, detail="Файл слишком большой (лимит 5 МБ)")
     if not content:
-        raise HTTPException(status_code=400, detail="Пустой файл")
+        raise HTTPException(status_code=400, detail="Файл пустой — добавьте строки и загрузите снова")
     return filename, content
 
 
@@ -2035,12 +2035,12 @@ def _resolve_analytics_period(data: dict, now):
             since = datetime.strptime(since_raw[:10], "%Y-%m-%d")
             until = datetime.strptime(until_raw[:10], "%Y-%m-%d")
         except ValueError:
-            raise HTTPException(status_code=400, detail="Даты в формате YYYY-MM-DD")
+            raise HTTPException(status_code=400, detail="Даты — в формате ГГГГ-ММ-ДД, например 2026-09-16")
         if until <= since:
-            raise HTTPException(status_code=400, detail="until должен быть позже since")
+            raise HTTPException(status_code=400, detail="Конец периода должен быть позже начала")
         span = until - since
         if span > timedelta(days=366):
-            raise HTTPException(status_code=400, detail="Диапазон не больше года")
+            raise HTTPException(status_code=400, detail="Период — не больше года: выберите даты поближе друг к другу")
         # until с фронта — ЭКСКЛЮЗИВНАЯ граница (next-day-полночь), поэтому в метке
         # показываем ВЫБРАННЫЙ конец = until − 1 день (WP-20), иначе пользователь
         # видел день, который не выбирал (и сверка с МС «по N-е» расходилась).
@@ -2422,7 +2422,7 @@ async def api_payments_link(request: Request):
         payment_id = int(data.get("payment_id"))
         order_id = int(data.get("order_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="payment_id и order_id обязательны (числа)")
+        raise HTTPException(status_code=400, detail="Выберите платёж и заказ, к которому его привязать")
     res = await adb.link_payment_to_order(
         payment_id,
         order_id,
@@ -2432,7 +2432,7 @@ async def api_payments_link(request: Request):
     if not res.get("ok"):
         # 409 Conflict для race-кейса (платёж уже привязан); 400 для
         # валидационных (платежа/заказа нет).
-        err = res.get("error", "Не удалось привязать")
+        err = res.get("error", "Не удалось привязать платёж к заказу — обновите список и повторите")
         status = 409 if "уже" in err or "Параллельная" in err else 400
         raise HTTPException(status_code=status, detail=err)
     return JSONResponse(res)
@@ -2464,10 +2464,10 @@ def _validate_payment_amount(raw, currency: str | None = None) -> float:
     try:
         amount = float(raw)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Неверная сумма")
+        raise HTTPException(status_code=400, detail="Введите сумму числом, например 25000")
     ok, err = validate_amount_in_currency(amount, currency)
     if not ok:
-        detail = err if err and "лимит" in err else "Неверная сумма"
+        detail = err if err and "лимит" in err else "Сумма должна быть больше нуля — проверьте, что ввели"
         raise HTTPException(status_code=400, detail=detail)
     return amount
 
@@ -2480,9 +2480,9 @@ def _validate_quantity(raw) -> float:
     try:
         qty = float(raw)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Неверное количество")
+        raise HTTPException(status_code=400, detail="Количество должно быть числом больше нуля")
     if not (math.isfinite(qty) and 0 < qty < 1_000_000):
-        raise HTTPException(status_code=400, detail="Неверное количество")
+        raise HTTPException(status_code=400, detail="Количество должно быть числом больше нуля")
     return qty
 
 
@@ -2510,7 +2510,7 @@ def _require_draft_order(order) -> None:
     (бот-путь и /api/orders/delete уже гейтят по draft)."""
     if (order or {}).get("status") != "draft":
         raise HTTPException(
-            status_code=409, detail="Заказ уже отправлен — редактирование недоступно"
+            status_code=409, detail="Заказ уже отправлен на одобрение — чтобы поправить состав, попросите вернуть его на доработку"
         )
 
 
@@ -2560,16 +2560,16 @@ async def _send_payments_batch(user: dict, items: list, comment_raw: str, idem_k
     from services import async_db as adb
 
     if len(items) > 20:
-        raise HTTPException(status_code=400, detail="Слишком много строк (макс 20)")
+        raise HTTPException(status_code=400, detail="Не больше 20 строк за раз — отправьте платежи несколькими частями")
     comment = (comment_raw or "").strip()[:1000]
     if not comment:
-        raise HTTPException(status_code=400, detail="Укажите комментарий")
+        raise HTTPException(status_code=400, detail="Напишите, за что платёж")
 
     parsed: list[tuple[float, str]] = []
     for it in items:
         currency = (it or {}).get("currency", "USD")
         if currency not in ALLOWED_CURRENCIES:
-            raise HTTPException(status_code=400, detail="Неверная валюта")
+            raise HTTPException(status_code=400, detail="Такая валюта не поддерживается — выберите другую")
         # Валюта — ДО суммы: потолок суммы задан в эквиваленте базовой валюты.
         amount = _validate_payment_amount((it or {}).get("amount", 0), currency)
         parsed.append((amount, currency))
@@ -2584,7 +2584,7 @@ async def _send_payments_batch(user: dict, items: list, comment_raw: str, idem_k
         if prev is not None:
             if prev.get("payment_ids"):
                 return JSONResponse(prev)
-            raise HTTPException(status_code=409, detail="Запрос уже обрабатывается")
+            raise HTTPException(status_code=409, detail="Этот запрос уже обрабатывается — подождите пару секунд")
 
     role = get_role(user_id)
     created: list[tuple[int, float, str]] = []
@@ -2656,7 +2656,7 @@ async def api_payments_send(request: Request):
 
     currency = data.get("currency", "USD")
     if currency not in ALLOWED_CURRENCIES:
-        raise HTTPException(status_code=400, detail="Неверная валюта")
+        raise HTTPException(status_code=400, detail="Такая валюта не поддерживается — выберите другую")
 
     # Round 6 (S3): isnan/isinf + верхний лимит — float('1e308') проходит
     # `> 0`, отравляет FIFO-математику в БД, отдаёт `nan USD` боссу в UI.
@@ -2668,7 +2668,7 @@ async def api_payments_send(request: Request):
     # шаблона уведомления.
     comment = (data.get("comment", "") or "").strip()[:1000]
     if not comment:
-        raise HTTPException(status_code=400, detail="Укажите комментарий")
+        raise HTTPException(status_code=400, detail="Напишите, за что платёж")
 
     user_id = user["id"]
     full_name = (
@@ -2688,7 +2688,7 @@ async def api_payments_send(request: Request):
         if prev is not None:
             if prev.get("payment_ids"):
                 return JSONResponse(prev)
-            raise HTTPException(status_code=409, detail="Запрос уже обрабатывается")
+            raise HTTPException(status_code=409, detail="Этот запрос уже обрабатывается — подождите пару секунд")
 
     # Сохраняем в БД (через async-обёртку — не блокируем event loop)
     try:
@@ -2896,7 +2896,7 @@ async def api_money_forecast(request: Request):
         # и подменять его дефолтом значит молча ответить не на тот вопрос.
         months = 6 if raw_months is None or raw_months == "" else int(raw_months)
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="months: не число")
+        raise HTTPException(status_code=400, detail="Число месяцев — целое число")
     months = max(1, min(months, 12))
     items = await receivables.collect()
     return JSONResponse({"ok": True, "months": receivables.forecast(items, months=months)})
@@ -2943,10 +2943,10 @@ async def api_machines_buyer(request: Request):
     )
     buyer = (data.get("buyer") or "").strip()[:200]
     if not buyer:
-        raise HTTPException(status_code=400, detail="buyer обязателен")
+        raise HTTPException(status_code=400, detail="Выберите покупателя")
     card = await receivables.buyer_card(buyer)
     if not card:
-        raise HTTPException(status_code=404, detail="Покупатель не найден")
+        raise HTTPException(status_code=404, detail="Покупатель не найден — обновите список")
     return JSONResponse({"ok": True, **card})
 
 
@@ -3022,11 +3022,11 @@ async def api_products_photo(request: Request):
     photos = await product_photos.list_photos(product_ref)
     photo = next((p for p in photos if int(p["id"]) == photo_id), None)
     if not photo:
-        raise HTTPException(status_code=404, detail="Фото не найдено")
+        raise HTTPException(status_code=404, detail="Фото не найдено — обновите экран")
 
     blob = await _photo_bytes(str(photo["tg_file_id"]), str(photo["file_unique_id"]))
     if blob is None:
-        raise HTTPException(status_code=404, detail="Фото недоступно")
+        raise HTTPException(status_code=404, detail="Фото не открылось — попробуйте ещё раз")
     return Response(
         blob, media_type=_photo_media_type(blob) or "image/jpeg",
         headers={"Cache-Control": "private, max-age=600", "X-Content-Type-Options": "nosniff"},
@@ -3073,7 +3073,7 @@ async def api_products_photo_delete(request: Request):
     product_ref = _product_ref(data, required=True)
     photo_id = _machine_id_arg(data, "photo_id")
     if not product_ref:
-        raise HTTPException(status_code=400, detail="Не указан товар")
+        raise HTTPException(status_code=400, detail="Выберите товар")
     return _machine_response(await product_photos.delete_photo(product_ref, photo_id))
 
 
@@ -3095,7 +3095,7 @@ async def api_products_photo_upload(request: Request):
     if chat_id is None:
         raise HTTPException(
             status_code=503,
-            detail="Загрузка фото не настроена: нет PHOTOS_TG_CHAT_ID",
+            detail="Загрузка фото не настроена — пришлите фото боту, а администратора попросите её включить",
         )
     blob = _decode_photo(data.get("data_url"))
 
@@ -3109,11 +3109,11 @@ async def api_products_photo_upload(request: Request):
         )
     except Exception as e:
         logger.warning("Фото товара не загружено: %s", redact_token(repr(e)))
-        raise HTTPException(status_code=502, detail="Telegram не принял фото")
+        raise HTTPException(status_code=502, detail="Telegram не принял фото — попробуйте ещё раз или пришлите его боту")
 
     best = max(sent.photo or [], key=lambda p: (p.width or 0) * (p.height or 0), default=None)
     if best is None:
-        raise HTTPException(status_code=502, detail="Telegram не вернул файл")
+        raise HTTPException(status_code=502, detail="Telegram не вернул файл — загрузите фото ещё раз")
     res = await product_photos.add_photo(
         product_ref, tg_file_id=best.file_id, file_unique_id=best.file_unique_id,
         uploaded_by=user["id"], caption=(data.get("caption") or "")[:200] or None,
@@ -3125,18 +3125,18 @@ def _decode_photo(raw_url) -> bytes:
     """data-URL → байты, с теми же проверками, что у фото техники."""
     raw = str(raw_url or "")
     if not raw.startswith("data:image/") or "," not in raw:
-        raise HTTPException(status_code=400, detail="Ожидается изображение")
+        raise HTTPException(status_code=400, detail="Это не фото — выберите изображение JPEG или PNG")
     payload = raw.split(",", 1)[1]
     if len(payload) > _PHOTO_MAX_BYTES * 4 // 3 + 1024:
-        raise HTTPException(status_code=413, detail="Фото больше 5 МБ")
+        raise HTTPException(status_code=413, detail="Фото больше 5 МБ — снимите его поменьше")
     try:
         blob = base64.b64decode(payload, validate=True)
     except (ValueError, binascii.Error):
-        raise HTTPException(status_code=400, detail="Повреждённое изображение")
+        raise HTTPException(status_code=400, detail="Фото не открылось — снимите его заново")
     if len(blob) > _PHOTO_MAX_BYTES:
-        raise HTTPException(status_code=413, detail="Фото больше 5 МБ")
+        raise HTTPException(status_code=413, detail="Фото больше 5 МБ — снимите его поменьше")
     if _photo_media_type(blob) is None:
-        raise HTTPException(status_code=400, detail="Поддерживаются JPEG и PNG")
+        raise HTTPException(status_code=400, detail="Подходят только фото JPEG и PNG")
     return blob
 
 
@@ -3153,7 +3153,7 @@ async def api_channel_draft(request: Request):
     _authorize(data, allowed_roles=_CHANNEL_ROLES, rate_limit_scope="api_channel_draft")
     kind = (data.get("kind") or "").strip()
     if kind not in channel.POST_KINDS:
-        raise HTTPException(status_code=400, detail=f"Тип поста: {', '.join(channel.POST_KINDS)}")
+        raise HTTPException(status_code=400, detail="Выберите, что публикуем: витрину, прибытие или залежавшееся")
 
     username = (data.get("manager_username") or "").strip()[:64] or None
     note = (data.get("note") or "").strip()[:500] or None
@@ -3165,7 +3165,7 @@ async def api_channel_draft(request: Request):
         ref = str(container_id)
         names = await channel.arrival_names(container_id)
         if not names:
-            raise HTTPException(status_code=409, detail="В контейнере нет прибывших позиций")
+            raise HTTPException(status_code=409, detail="В контейнере ещё нет прибывших товаров — отметьте, что приехало, и повторите")
         text = channel.build_arrival(names, note=note, manager_username=username)
     elif kind == "showcase":
         from services import product_photos, warehouse
@@ -3173,7 +3173,7 @@ async def api_channel_draft(request: Request):
         product_ref = _product_ref(data, required=True)
         product = await warehouse.get_product(product_ref)
         if not product:
-            raise HTTPException(status_code=404, detail="Товар не найден в каталоге")
+            raise HTTPException(status_code=404, detail="Товар не найден в каталоге — выберите его заново")
         ref = product_ref
         prices = await _price_label(product_ref)
         text = channel.build_showcase(
@@ -3228,13 +3228,13 @@ async def api_channel_publish(request: Request):
     )
     chat_id = _channel_id()
     if chat_id is None:
-        raise HTTPException(status_code=503, detail="Канал не настроен: нет CHANNEL_ID")
+        raise HTTPException(status_code=503, detail="Канал компании не настроен — попросите администратора указать его")
     kind = (data.get("kind") or "").strip()
     if kind not in channel.POST_KINDS:
-        raise HTTPException(status_code=400, detail="Неизвестный тип поста")
+        raise HTTPException(status_code=400, detail="Такого вида поста нет — обновите приложение")
     text = (data.get("text") or "").strip()
     if not text:
-        raise HTTPException(status_code=400, detail="Пустой пост публиковать нечего")
+        raise HTTPException(status_code=400, detail="Пост пустой — добавьте текст или товары")
     ref = (data.get("ref") or "").strip()[:64] or None
 
     photo_blob = None
@@ -3262,7 +3262,7 @@ async def api_channel_publish(request: Request):
             sent = await bot.send_message(chat_id, text[:4096], parse_mode="HTML")
     except Exception as e:
         logger.warning("Пост в канал не ушёл: %s", redact_token(repr(e)))
-        raise HTTPException(status_code=502, detail="Telegram не принял пост")
+        raise HTTPException(status_code=502, detail="Telegram не принял пост — попробуйте ещё раз")
 
     post_id = await channel.save_post(
         kind=kind, ref=ref, message_id=getattr(sent, "message_id", None),
@@ -3333,12 +3333,12 @@ async def api_leads_list(request: Request):
     is_boss = role in ("admin", "boss")
     status = (data.get("status") or "").strip() or None
     if status and status not in leads.STATUSES:
-        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+        raise HTTPException(status_code=400, detail="Такого статуса нет — обновите приложение")
     # Исход и состояние разговора — разные вопросы («купил ли» и «на ком ход»),
     # поэтому это два независимых отбора, а не один общий список значений.
     state = (data.get("state") or "").strip() or None
     if state and state not in leads.STATE_FILTERS:
-        raise HTTPException(status_code=400, detail=f"Неизвестное состояние: {state}")
+        raise HTTPException(status_code=400, detail="Такого фильтра нет — обновите приложение")
 
     rows = await leads.list_leads(
         manager_id=None if is_boss else user["id"], status=status, state=state,
@@ -3373,9 +3373,9 @@ async def api_leads_card(request: Request):
     lead_id = _machine_id_arg(data, "lead_id")
     lead = await leads.get_lead(lead_id)
     if not lead:
-        raise HTTPException(status_code=404, detail="Лид не найден")
+        raise HTTPException(status_code=404, detail="Обращение не найдено — обновите список")
     if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
-        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+        raise HTTPException(status_code=403, detail="Это обращение ведёт другой менеджер")
     from services import lead_calls
 
     return JSONResponse({
@@ -3399,9 +3399,9 @@ async def api_leads_status(request: Request):
     lead_id = _machine_id_arg(data, "lead_id")
     lead = await leads.get_lead(lead_id)
     if not lead:
-        raise HTTPException(status_code=404, detail="Лид не найден")
+        raise HTTPException(status_code=404, detail="Обращение не найдено — обновите список")
     if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
-        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+        raise HTTPException(status_code=403, detail="Это обращение ведёт другой менеджер")
     res = await leads.set_status(
         lead_id, (data.get("status") or "").strip(),
         user_id=user["id"], full_name=_actor_name(user),
@@ -3450,9 +3450,9 @@ async def api_leads_create_agent(request: Request):
     lead_id = _machine_id_arg(data, "lead_id")
     lead = await leads.get_lead(lead_id)
     if not lead:
-        raise HTTPException(status_code=404, detail="Лид не найден")
+        raise HTTPException(status_code=404, detail="Обращение не найдено — обновите список")
     if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
-        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+        raise HTTPException(status_code=403, detail="Это обращение ведёт другой менеджер")
 
     name = _machine_text(data, "name", 255) or lead.get("display_name") or lead.get("username")
     created = await cp_service.create(
@@ -3482,9 +3482,9 @@ async def _require_own_lead(lead_id: int, user: dict) -> dict:
 
     lead = await leads.get_lead(lead_id)
     if not lead:
-        raise HTTPException(status_code=404, detail="Лид не найден")
+        raise HTTPException(status_code=404, detail="Обращение не найдено — обновите список")
     if not _is_lead_boss(user) and lead.get("manager_id") != user["id"]:
-        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+        raise HTTPException(status_code=403, detail="Это обращение ведёт другой менеджер")
     return lead
 
 
@@ -3495,9 +3495,9 @@ async def _require_own_call(call_id: int, user: dict) -> dict:
 
     call = await lead_calls.get_call(call_id)
     if not call:
-        raise HTTPException(status_code=404, detail="Звонок не найден")
+        raise HTTPException(status_code=404, detail="Звонок не найден — обновите список")
     if not _is_lead_boss(user) and call.get("manager_id") != user["id"]:
-        raise HTTPException(status_code=403, detail="Это не ваш звонок")
+        raise HTTPException(status_code=403, detail="Этот звонок записал другой менеджер")
     return call
 
 
@@ -3608,9 +3608,9 @@ async def api_leads_link(request: Request):
     # не всплыла; закрываем прежде, чем кнопка появится.
     lead = await leads.get_lead(lead_id)
     if not lead:
-        raise HTTPException(status_code=404, detail="Лид не найден")
+        raise HTTPException(status_code=404, detail="Обращение не найдено — обновите список")
     if get_role(user["id"]) not in ("admin", "boss") and lead.get("manager_id") != user["id"]:
-        raise HTTPException(status_code=403, detail="Это не ваш клиент")
+        raise HTTPException(status_code=403, detail="Это обращение ведёт другой менеджер")
     counterparty_id = (data.get("counterparty_id") or "").strip()[:64] or None
     res = await leads.link_agent(
         lead_id, counterparty_id, user_id=user["id"], full_name=_actor_name(user)
@@ -3671,12 +3671,12 @@ def _orders_page_params(data: dict) -> dict | None:
         limit = int(raw_limit)
         offset = int(data.get("offset") or 0)
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Некорректные limit/offset") from None
+        raise HTTPException(status_code=400, detail="Не получилось открыть эту страницу списка — обновите экран") from None
     limit = max(1, min(limit, _ORDERS_PAGE_MAX))
     offset = max(0, offset)
     raw_statuses = data.get("statuses") or []
     if not isinstance(raw_statuses, list):
-        raise HTTPException(status_code=400, detail="statuses — список статусов")
+        raise HTTPException(status_code=400, detail="Не получилось применить фильтр по статусу — обновите экран")
     statuses = [str(x) for x in raw_statuses if x]
     date_from = str(data.get("date_from") or "")
     date_to = str(data.get("date_to") or "")
@@ -4028,14 +4028,14 @@ async def _sales_invoice_doc(data: Any, user: dict) -> dict:
     try:
         order_id = int(data.get("order_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="order_id обязателен (число)") from None
+        raise HTTPException(status_code=400, detail="Не выбран заказ — откройте его заново") from None
 
     order = await adb.get_order(order_id)
     if not order:
-        raise HTTPException(status_code=404, detail="Заказ не найден")
+        raise HTTPException(status_code=404, detail="Заказ не найден — обновите список")
     role = get_role(user["id"])
     if not (role_allowed(role, ("admin", "boss")) or int(order["user_id"]) == int(user["id"])):
-        raise HTTPException(status_code=403, detail="Доступен только свой заказ")
+        raise HTTPException(status_code=403, detail="Открыть можно только свой заказ")
 
     try:
         return await build_sales_invoice(order_id)
@@ -4086,14 +4086,14 @@ async def api_order_sales_invoice_print(request: Request):
     )
     doc = await _sales_invoice_doc(data, user)
     if not printing.is_available():
-        return JSONResponse({"ok": False, "error": "Печать не настроена на этом сервере"})
+        return JSONResponse({"ok": False, "error": "Печать не настроена — попросите администратора подключить принтер"})
     try:
         # WeasyPrint синхронный и тяжёлый — в поток, иначе на время рендера
         # встаёт весь event loop.
         pdf = await asyncio.to_thread(render_sales_invoice_pdf, doc)
     except Exception:
         logger.exception("Печать: не собран счёт по заказу #%s", doc["order_id"])
-        return JSONResponse({"ok": False, "error": "Не удалось собрать PDF счёта"})
+        return JSONResponse({"ok": False, "error": "Не удалось собрать счёт — попробуйте ещё раз, а если не выйдет, сообщите администратору"})
     result = await printing.print_pdf_bytes(
         pdf,
         filename=sales_invoice_filename(doc),
@@ -4134,11 +4134,11 @@ async def api_order_sales_invoice_send(request: Request):
         pdf = await asyncio.to_thread(render_sales_invoice_pdf, doc)
     except Exception:
         logger.exception("Счёт по заказу #%s не собран", doc["order_id"])
-        return JSONResponse({"ok": False, "error": "Не удалось собрать PDF счёта"}, status_code=409)
+        return JSONResponse({"ok": False, "error": "Не удалось собрать счёт — попробуйте ещё раз, а если не выйдет, сообщите администратору"}, status_code=409)
 
     bot = await get_notify_bot()
     if bot is None:
-        return JSONResponse({"ok": False, "error": "Telegram недоступен"}, status_code=409)
+        return JSONResponse({"ok": False, "error": "Telegram сейчас недоступен — попробуйте через минуту"}, status_code=409)
     try:
         from aiogram.types import BufferedInputFile
 
@@ -4150,7 +4150,7 @@ async def api_order_sales_invoice_send(request: Request):
     except Exception:
         logger.exception("Счёт по заказу #%s не отправлен", doc["order_id"])
         return JSONResponse(
-            {"ok": False, "error": "Не удалось отправить PDF в Telegram"}, status_code=409
+            {"ok": False, "error": "Не удалось отправить счёт в Telegram — попробуйте ещё раз"}, status_code=409
         )
 
     await adb.add_audit_log(
@@ -4181,11 +4181,11 @@ async def api_order_timeline(request: Request):
     try:
         order_id = int(data.get("order_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="order_id обязателен (число)") from None
+        raise HTTPException(status_code=400, detail="Не выбран заказ — откройте его заново") from None
 
     order = await adb.get_order(order_id)
     if not order:
-        raise HTTPException(status_code=404, detail="Заказ не найден")
+        raise HTTPException(status_code=404, detail="Заказ не найден — обновите список")
     role = get_role(user["id"])
     can_see = (
         role_allowed(role, ("admin", "boss"))
@@ -4193,7 +4193,7 @@ async def api_order_timeline(request: Request):
         or (role_allowed(role, ("warehouse_keeper",)) and order.get("status") in ("approved", "shipped"))
     )
     if not can_see:
-        raise HTTPException(status_code=403, detail="Доступен только свой заказ")
+        raise HTTPException(status_code=403, detail="Открыть можно только свой заказ")
 
     events = await build_order_timeline(order_id)
     return JSONResponse({"order_id": order_id, "events": events})
@@ -4301,7 +4301,7 @@ async def api_approve_request(request: Request):
     try:
         req_id = int(data.get("req_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="req_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбрана заявка — обновите список")
 
     boss_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
@@ -4373,7 +4373,7 @@ async def api_reject_request(request: Request):
     try:
         req_id = int(data.get("req_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="req_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбрана заявка — обновите список")
 
     boss_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
@@ -4401,10 +4401,10 @@ async def api_return_to_draft(request: Request):
     try:
         req_id = int(data.get("req_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="req_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбрана заявка — обновите список")
     comment = (data.get("comment") or "").strip()[:500]
     if len(comment) < 3:
-        raise HTTPException(status_code=400, detail="Укажите причину (минимум 3 символа)")
+        raise HTTPException(status_code=400, detail="Напишите, что доработать — хотя бы несколько слов")
 
     boss_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
@@ -4439,7 +4439,7 @@ async def api_unfreeze_order(request: Request):
     try:
         order_id = int(data.get("order_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="order_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран заказ — обновите список")
 
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
@@ -4489,14 +4489,14 @@ async def api_credit_set(request: Request):
     agent_id = (data.get("agent_id") or "").strip()[:64]
     agent_name = (data.get("agent_name") or "").strip()[:200]
     if not agent_id:
-        raise HTTPException(status_code=400, detail="agent_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран клиент")
     # Лимит — только контрагенту, на которого реально был заказ (а не любому из
     # справочника МС). UI и так показывает лишь overview-контрагентов, но
     # страхуем API: иначе можно создать лимит-сироту, которого нет в overview.
     if not await adb.agent_has_order(agent_id):
         raise HTTPException(
             status_code=400,
-            detail="Лимит можно задать только контрагенту, на которого есть заказ",
+            detail="Лимит задаётся клиенту, по которому уже есть заказ",
         )
     # Round 6 (S3): isnan/isinf + верхний лимит. inf лимит делает любой долг
     # «свободным», ломает overview.
@@ -4507,7 +4507,7 @@ async def api_credit_set(request: Request):
         if not (math.isfinite(limit_amount) and 0 <= limit_amount < 10_000_000):
             raise ValueError
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="limit_amount должен быть числом 0..10M")
+        raise HTTPException(status_code=400, detail="Лимит — число от 0 до 10 000 000")
 
     await adb.set_credit_limit(
         agent_id, agent_name, limit_amount, set_by=user["id"], notes="WebApp"
@@ -4601,7 +4601,7 @@ async def api_clients_detail(request: Request):
     )
     agent_id = (data.get("agent_id") or "").strip()[:64]
     if not agent_id:
-        raise HTTPException(status_code=400, detail="agent_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран клиент")
 
     cp = await cp_service.get(agent_id)
     debt = await adb.get_agent_current_debt(agent_id)
@@ -4677,7 +4677,7 @@ async def api_clients_shipment(request: Request):
     invoice_id = _machine_id_arg(data, "invoice_id")
     invoice = await warehouse.get_invoice(invoice_id)
     if not invoice or invoice.get("type") != "outgoing":
-        raise HTTPException(status_code=404, detail="Накладная не найдена")
+        raise HTTPException(status_code=404, detail="Отгрузка не найдена — обновите список")
 
     positions = []
     # Итог копим в цикле, а не пересобираем генератором из уже готовых строк:
@@ -4752,7 +4752,7 @@ async def api_currency_rates_set(request: Request):
     rate = data.get("rate_to_base")
     if isinstance(rate, bool):
         # JSON true/false — float(True) == 1.0 прошёл бы как «курс 1».
-        raise HTTPException(status_code=400, detail="Курс должен быть числом")
+        raise HTTPException(status_code=400, detail="Курс — число, например 12500")
     # Ручная правка: границы пары + метка 'manual' в дневном архиве, чтобы
     # ночной синк с ЦБ не перезаписал её в тот же день.
     ok, err = await adb.set_currency_rate_manual(code, rate, user["id"])
@@ -4802,7 +4802,9 @@ async def api_products_prices_set(request: Request):
         try:
             return float(v)
         except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail=f"{key}: не число")
+            raise HTTPException(
+                status_code=400, detail=f"{_field_num(key)}: введите число, например 25000"
+            )
 
     sale_price = _opt_price("sale_price")
     cost_price = _opt_price("cost_price")
@@ -4855,7 +4857,7 @@ def _machine_response(res: dict) -> JSONResponse:
     """
     if res.get("ok"):
         return JSONResponse(res)
-    error = str(res.get("error") or "Не удалось выполнить операцию")
+    error = str(res.get("error") or "Не получилось — обновите экран и попробуйте снова")
     if "не найден" in error.lower():
         code = 404
     elif res.get("needs_force") or "current" in res or "сделка невозможна" in error:
@@ -4898,7 +4900,7 @@ async def api_machines_list(request: Request):
     if status and status not in machines.STATUSES:
         # Не пустой список: «машины пропали» выглядит как потеря данных, а это
         # опечатка в фильтре.
-        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+        raise HTTPException(status_code=400, detail="Такого статуса нет — обновите приложение")
 
     rows = await machines.list_machines(role=role, status=status)
     counts = await machines.count_by_status()
@@ -4941,13 +4943,13 @@ async def api_machines_card(request: Request):
     try:
         machine_id = int(data.get("machine_id") or 0)
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="machine_id: не число")
+        raise HTTPException(status_code=400, detail="Выберите машину — обновите экран и повторите")
     if machine_id <= 0:
-        raise HTTPException(status_code=400, detail="machine_id обязателен")
+        raise HTTPException(status_code=400, detail="Выберите машину")
 
     machine = await machines.get_machine(machine_id, role=role)
     if not machine:
-        raise HTTPException(status_code=404, detail="Машина не найдена")
+        raise HTTPException(status_code=404, detail="Машина не найдена — обновите список")
 
     photos = await machines.list_photos(machine_id)
     hours = await machines.get_hours_history(machine_id)
@@ -5013,13 +5015,53 @@ async def api_machines_card(request: Request):
     )
 
 
+# Русские названия полей формы — чтобы в ошибку человеку не уезжал ключ из
+# запроса («machine_id: не число»). Ключи остаются как есть, меняется текст.
+_FIELD_ACC = {
+    "machine_id": "машину",
+    "photo_id": "фото",
+    "container_id": "контейнер",
+    "lead_id": "обращение",
+    "call_id": "звонок",
+    "invoice_id": "документ",
+    "request_id": "заявку",
+    "deal_id": "сделку",
+    "payment_id": "платёж",
+    "receipt_id": "поступление",
+    "item_id": "позицию",
+    "order_id": "заказ",
+    "product_id": "товар",
+    "supplier_id": "поставщика",
+}
+_FIELD_NUM = {
+    "expected_qty": "Заявленное количество",
+    "arrived_qty": "Прибывшее количество",
+    "quantity": "Количество",
+    "sale_price": "Цена продажи",
+    "cost_price": "Себестоимость",
+    "wholesale_price": "Цена для постоянных клиентов",
+}
+
+
+def _field_acc(key: str) -> str:
+    """Название поля в винительном падеже: «выберите машину», «выберите товар»."""
+    return _FIELD_ACC.get(key, "нужную запись")
+
+
+def _field_num(key: str) -> str:
+    """Название числового поля формы с большой буквы."""
+    return _FIELD_NUM.get(key, "Значение")
+
+
 def _machine_id_arg(data: dict, key: str = "machine_id") -> int:
     try:
         value = int(data.get(key) or 0)
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail=f"{key}: не число")
+        raise HTTPException(
+            status_code=400, detail=f"Выберите {_field_acc(key)} — обновите экран и повторите"
+        )
     if value <= 0:
-        raise HTTPException(status_code=400, detail=f"{key} обязателен")
+        raise HTTPException(status_code=400, detail=f"Выберите {_field_acc(key)}")
     return value
 
 
@@ -5035,7 +5077,7 @@ def _product_ref(data: dict, required: bool = False) -> str:
     raw = data.get("product_id")
     value = "" if raw is None else str(raw).strip()[:64]
     if required and not value:
-        raise HTTPException(status_code=400, detail="Не указан товар")
+        raise HTTPException(status_code=400, detail="Выберите товар")
     return value
 
 
@@ -5052,9 +5094,11 @@ def _optional_id(data: dict, key: str) -> int | None:
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail=f"{key}: не число")
+        raise HTTPException(
+            status_code=400, detail=f"Выберите {_field_acc(key)} — обновите экран и повторите"
+        )
     if value <= 0:
-        raise HTTPException(status_code=400, detail=f"{key}: должен быть положительным")
+        raise HTTPException(status_code=400, detail=f"Выберите {_field_acc(key)}")
     return value
 
 
@@ -5080,7 +5124,7 @@ def _machine_money(raw, label: str, *, allow_zero: bool = False) -> int | None:
         except (ArithmeticError, ValueError):
             pass
     if cents is None:
-        raise HTTPException(status_code=400, detail=f"{label}: не число или не больше нуля")
+        raise HTTPException(status_code=400, detail=f"{label}: введите число больше нуля, например 25000")
     return cents
 
 
@@ -5114,7 +5158,7 @@ async def api_machines_create(request: Request):
     role = get_role(user["id"])
     status = (data.get("status") or "in_transit").strip()
     if status not in machines.STATUSES:
-        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+        raise HTTPException(status_code=400, detail="Такого статуса нет — обновите приложение")
 
     year = data.get("year")
     hours = data.get("hours")
@@ -5122,7 +5166,7 @@ async def api_machines_create(request: Request):
         year = int(year) if str(year or "").strip() else None
         hours = int(hours) if str(hours or "").strip() else None
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Год и моточасы — целые числа")
+        raise HTTPException(status_code=400, detail="Год и моточасы — целые числа, например 2019 и 1200")
 
     payload = {
         "vin": (data.get("vin") or "").strip()[:64],
@@ -5178,7 +5222,7 @@ async def api_machines_update(request: Request):
     machine_id = _machine_id_arg(data)
     raw = data.get("fields")
     if not isinstance(raw, dict) or not raw:
-        raise HTTPException(status_code=400, detail="Нечего менять")
+        raise HTTPException(status_code=400, detail="Вы ничего не изменили")
 
     # VIN правится отдельной функцией сервиса: у него нормализация и проверка
     # уникальности, которых нет у остальных полей. Делаем это ДО прочих правок —
@@ -5207,7 +5251,7 @@ async def api_machines_update(request: Request):
             try:
                 fields["year"] = int(value) if str(value or "").strip() else None
             except (TypeError, ValueError):
-                raise HTTPException(status_code=400, detail="Год — целое число")
+                raise HTTPException(status_code=400, detail="Год — целое число, например 2019")
         else:
             fields[key] = (str(value).strip()[:1000] or None) if value is not None else None
     res = await machines.update_machine_fields(
@@ -5257,12 +5301,12 @@ async def api_machines_hours(request: Request):
     try:
         hours = int(data.get("hours"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Моточасы — целое число")
+        raise HTTPException(status_code=400, detail="Моточасы — целое число, например 1200")
 
     force = bool(data.get("force"))
     if force and role not in _MACHINE_BOSS:
         raise HTTPException(
-            status_code=403, detail="Откат показания подтверждает руководитель"
+            status_code=403, detail="Моточасы меньше предыдущего показания — такое показание подтверждает руководитель"
         )
     res = await machines.add_hours(
         machine_id, hours, user_id=user["id"], full_name=_actor_name(user), force=force
@@ -5292,14 +5336,15 @@ async def api_machines_status(request: Request):
     target = (data.get("status") or "").strip()
     expected = (data.get("expected") or "").strip()
     if target not in machines.STATUSES:
-        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {target}")
+        raise HTTPException(status_code=400, detail="Такого статуса нет — обновите приложение")
     if not expected:
-        raise HTTPException(status_code=400, detail="expected обязателен")
+        raise HTTPException(status_code=400, detail="Обновите карточку машины — её статус мог измениться")
     if target not in machines.next_statuses(expected):
         raise HTTPException(
             status_code=400,
-            detail=f"Переход «{machines.STATUS_LABELS.get(expected, expected)}» → "
-            f"«{machines.STATUS_LABELS.get(target, target)}» не предусмотрен",
+            detail=f"Из «{machines.STATUS_LABELS.get(expected, expected)}» в "
+            f"«{machines.STATUS_LABELS.get(target, target)}» машину перевести нельзя — "
+            "обновите карточку и посмотрите, что доступно",
         )
     from services import adb_core
 
@@ -5413,15 +5458,15 @@ async def api_machines_deal(request: Request):
     machine_id = _machine_id_arg(data, "machine_id")
     kind = (data.get("kind") or "").strip()
     if kind not in mdr.KINDS:
-        raise HTTPException(status_code=400, detail=f"Тип сделки: {' / '.join(mdr.KINDS)}")
+        raise HTTPException(status_code=400, detail="Выберите тип сделки: бронь, продажа или рассрочка")
     price_cents = _machine_money(data.get("price"), "Цена")
     if kind != "reserve" and not price_cents:
-        raise HTTPException(status_code=400, detail="Цена сделки обязательна")
+        raise HTTPException(status_code=400, detail="Укажите цену сделки")
     buyer_name = (data.get("buyer_name") or "").strip()[:200]
     if not buyer_name:
-        raise HTTPException(status_code=400, detail="Покупатель обязателен")
+        raise HTTPException(status_code=400, detail="Укажите покупателя")
     if not data.get("idempotency_key"):
-        raise HTTPException(status_code=400, detail="idempotency_key обязателен")
+        raise HTTPException(status_code=400, detail="Форма отправлена не полностью — обновите приложение и повторите")
     down_payment_cents, months = _machine_installment_args(data, kind)
 
     idem = _Idem(adb, "machine_deal", user["id"], data.get("idempotency_key"))
@@ -5466,7 +5511,7 @@ def _machine_installment_args(data: dict, kind: str) -> tuple[int, int]:
         try:
             months = int(data.get("months") or 0)
         except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="Срок рассрочки — целое число месяцев")
+            raise HTTPException(status_code=400, detail="Срок рассрочки — целое число месяцев, например 12")
     return down_payment_cents, months
 
 
@@ -5722,7 +5767,7 @@ def _machine_receipt_method(data: dict, *, required: bool) -> str | None:
             raise HTTPException(status_code=400, detail="Укажите способ: наличные, карта или перечисление")
         return None
     if raw not in machines.RECEIPT_METHODS:
-        raise HTTPException(status_code=400, detail="Способ оплаты: наличные, карта или перечисление")
+        raise HTTPException(status_code=400, detail="Выберите способ оплаты: наличные, карта или перечисление")
     return raw
 
 
@@ -5787,11 +5832,11 @@ async def api_machines_receipt(request: Request):
     deal_id = _machine_id_arg(data, "deal_id")
     amount_cents = _machine_money(data.get("amount"), "Сумма")
     if not amount_cents:
-        raise HTTPException(status_code=400, detail="Сумма обязательна")
+        raise HTTPException(status_code=400, detail="Укажите сумму")
     method = _machine_receipt_method(data, required=True)
     account_id = await _machine_receipt_account(data, method)
     if not data.get("idempotency_key"):
-        raise HTTPException(status_code=400, detail="idempotency_key обязателен")
+        raise HTTPException(status_code=400, detail="Форма отправлена не полностью — обновите приложение и повторите")
 
     # atomic: результат пишет само поступление своей транзакцией
     # (`idem_store_in`). Ключ без результата значит «не закоммитилось» и
@@ -5958,7 +6003,7 @@ async def api_machines_photo(request: Request):
     photos = await machines.list_photos(machine_id)
     photo = next((p for p in photos if int(p["id"]) == photo_id), None)
     if not photo:
-        raise HTTPException(status_code=404, detail="Фото не найдено")
+        raise HTTPException(status_code=404, detail="Фото не найдено — обновите экран")
 
     headers = {
         "Cache-Control": "private, max-age=600",
@@ -5972,7 +6017,7 @@ async def api_machines_photo(request: Request):
         bot = await get_notify_bot()
         meta = await bot.get_file(str(photo["tg_file_id"]))
         if (meta.file_size or 0) > _PHOTO_MAX_BYTES:
-            raise HTTPException(status_code=413, detail="Фото слишком большое")
+            raise HTTPException(status_code=413, detail="Фото слишком большое — снимите его заново")
         buf = await bot.download_file(meta.file_path)
         blob = buf.read() if hasattr(buf, "read") else bytes(buf)
     except HTTPException:
@@ -5986,7 +6031,7 @@ async def api_machines_photo(request: Request):
             "Не удалось отдать фото #%s машины #%s: %s",
             photo_id, machine_id, redact_token(repr(e)),
         )
-        raise HTTPException(status_code=404, detail="Фото недоступно")
+        raise HTTPException(status_code=404, detail="Фото не открылось — попробуйте ещё раз")
 
     _photo_cache_put(str(photo["file_unique_id"]), blob)
     return Response(blob, media_type=_photo_media_type(blob) or "image/jpeg", headers=headers)
@@ -6021,32 +6066,32 @@ async def api_machines_photo_upload(request: Request):
     if chat_id is None:
         raise HTTPException(
             status_code=503,
-            detail="Загрузка фото не настроена: нет MACHINE_PHOTOS_TG_CHAT_ID. "
-                   "Пришлите фото боту.",
+            detail="Загрузка фото не настроена — пришлите фото боту, "
+                   "а администратора попросите её включить",
         )
 
     raw = str(data.get("data_url") or "")
     if not raw.startswith("data:image/"):
-        raise HTTPException(status_code=400, detail="Ожидается изображение")
+        raise HTTPException(status_code=400, detail="Это не фото — выберите изображение JPEG или PNG")
     if "," not in raw:
-        raise HTTPException(status_code=400, detail="Повреждённое изображение")
+        raise HTTPException(status_code=400, detail="Фото не открылось — снимите его заново")
     # Оценка размера ДО декодирования: base64 длиннее оригинала на треть, и
     # декодировать 40 МБ мусора, чтобы потом его отвергнуть, незачем.
     payload = raw.split(",", 1)[1]
     if len(payload) > _PHOTO_MAX_BYTES * 4 // 3 + 1024:
-        raise HTTPException(status_code=413, detail="Фото больше 5 МБ")
+        raise HTTPException(status_code=413, detail="Фото больше 5 МБ — снимите его поменьше")
     try:
         blob = base64.b64decode(payload, validate=True)
     except (ValueError, binascii.Error):
-        raise HTTPException(status_code=400, detail="Повреждённое изображение")
+        raise HTTPException(status_code=400, detail="Фото не открылось — снимите его заново")
     if len(blob) > _PHOTO_MAX_BYTES:
-        raise HTTPException(status_code=413, detail="Фото больше 5 МБ")
+        raise HTTPException(status_code=413, detail="Фото больше 5 МБ — снимите его поменьше")
     if _photo_media_type(blob) is None:
-        raise HTTPException(status_code=400, detail="Поддерживаются JPEG и PNG")
+        raise HTTPException(status_code=400, detail="Подходят только фото JPEG и PNG")
 
     machine = await machines.get_machine(machine_id, role=get_role(user["id"]))
     if not machine:
-        raise HTTPException(status_code=404, detail="Машина не найдена")
+        raise HTTPException(status_code=404, detail="Машина не найдена — обновите список")
 
     caption = (str(data.get("caption") or "")).strip()[:200]
     try:
@@ -6060,13 +6105,13 @@ async def api_machines_photo_upload(request: Request):
         )
     except Exception as e:
         logger.warning("Не удалось загрузить фото машины #%s: %s", machine_id, redact_token(repr(e)))
-        raise HTTPException(status_code=502, detail="Telegram не принял фото, попробуйте ещё раз")
+        raise HTTPException(status_code=502, detail="Telegram не принял фото — попробуйте ещё раз")
 
     # Берём самый крупный размер: Telegram отдаёт лесенку превью, и первый
     # элемент — миниатюра ~90px, из которой карточку не рассмотреть.
     best = max(sent.photo or [], key=lambda p: (p.width or 0) * (p.height or 0), default=None)
     if best is None:
-        raise HTTPException(status_code=502, detail="Telegram не вернул файл")
+        raise HTTPException(status_code=502, detail="Telegram не вернул файл — загрузите фото ещё раз")
     res = await machines.add_photo(
         machine_id,
         tg_file_id=best.file_id,
@@ -6094,10 +6139,10 @@ async def api_machines_photo_delete(request: Request):
     photo_id = _machine_id_arg(data, "photo_id")
     photos = await machines.list_photos(machine_id)
     if not any(int(p["id"]) == photo_id for p in photos):
-        raise HTTPException(status_code=404, detail="Фото не найдено")
+        raise HTTPException(status_code=404, detail="Фото не найдено — обновите экран")
     res = await machines.delete_photo(photo_id)
     if not res.get("ok"):
-        raise HTTPException(status_code=404, detail="Фото не найдено")
+        raise HTTPException(status_code=404, detail="Фото не найдено — обновите экран")
     return JSONResponse({"ok": True, "photo_id": photo_id})
 
 
@@ -6119,7 +6164,7 @@ async def api_containers_list(request: Request):
     )
     status = (data.get("status") or "").strip() or None
     if status and status not in containers.STATUSES:
-        raise HTTPException(status_code=400, detail=f"Неизвестный статус: {status}")
+        raise HTTPException(status_code=400, detail="Такого статуса нет — обновите приложение")
     search = (data.get("search") or "").strip()[:64] or None
 
     # Сводку и окно правки считает сервис одним проходом — раньше здесь был
@@ -6151,7 +6196,7 @@ async def api_containers_card(request: Request):
     container_id = _machine_id_arg(data, "container_id")
     container = await containers.get_container(container_id)
     if not container:
-        raise HTTPException(status_code=404, detail="Контейнер не найден")
+        raise HTTPException(status_code=404, detail="Контейнер не найден — обновите список")
 
     from services import container_receipt
 
@@ -6221,7 +6266,7 @@ async def api_containers_update(request: Request):
     container_id = _machine_id_arg(data, "container_id")
     raw = data.get("fields")
     if not isinstance(raw, dict) or not raw:
-        raise HTTPException(status_code=400, detail="Нечего менять")
+        raise HTTPException(status_code=400, detail="Вы ничего не изменили")
     fields = {
         k: (str(v).strip()[:1000] or None) if v is not None else None for k, v in raw.items()
     }
@@ -6256,7 +6301,9 @@ async def api_containers_item_add(request: Request):
         try:
             return float(str(value).replace(",", "."))
         except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail=f"{key}: не число")
+            raise HTTPException(
+                status_code=400, detail=f"{_field_num(key)}: введите число, например 10"
+            )
 
     if product_id is None and name:
         # «Новый товар» с именем, которое в каталоге уже есть (регистр, пробелы
@@ -6338,7 +6385,7 @@ async def api_containers_item_create_product(request: Request):
         (i for i in await containers.list_items(container_id) if int(i["id"]) == item_id), None
     )
     if not item:
-        raise HTTPException(status_code=404, detail="Позиция не найдена")
+        raise HTTPException(status_code=404, detail="Позиция не найдена — обновите список")
 
     created = await container_receipt.create_product(
         str(item["name"]), unit=str(item.get("unit") or "шт")
@@ -6385,13 +6432,13 @@ async def api_containers_check(request: Request):
     container_id = _machine_id_arg(data, "container_id")
     raw = data.get("quantities")
     if not isinstance(raw, dict) or not raw:
-        raise HTTPException(status_code=400, detail="Нечего сохранять")
+        raise HTTPException(status_code=400, detail="Нечего сохранять — впишите прибывшие количества")
     quantities: dict[int, object] = {}
     for key, value in raw.items():
         try:
             quantities[int(key)] = value
         except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="item_id: не число")
+            raise HTTPException(status_code=400, detail="Не получилось сохранить строку — обновите экран и повторите")
     from services import container_receipt
 
     resolutions = _container_resolutions(data)
@@ -6428,11 +6475,11 @@ async def api_containers_check(request: Request):
             {item_id: before.get(item_id) for item_id in quantities},
             user_id=user["id"], full_name=_actor_name(user), audit=False,
         )
-        reason = str(receipt.get("error") or "приход не проведён")
+        reason = str(receipt.get("error") or "приход не оформлен")
         if receipt.get("code") == "insufficient_stock":
             reason = ("товар из прежнего прихода уже отгружен, и отмена прихода увела бы "
                       f"остаток в минус ({reason})")
-        detail = f"Сверка не сохранена: {reason}. Количества оставлены прежними."
+        detail = f"Приёмка не сохранена: {reason}. Количества оставлены прежними — поправьте и повторите."
         return JSONResponse(
             {"ok": False, "reverted": True, "receipt": receipt, "detail": detail},
             status_code=409,
@@ -6454,7 +6501,7 @@ def _container_resolutions(data: dict) -> dict[int, dict]:
     if parsed is None:
         raise HTTPException(
             status_code=400,
-            detail="resolve: {item_id: {product_id: N} | {new: true}}",
+            detail="Не получилось связать позиции с товарами — обновите экран и повторите",
         )
     return parsed
 
@@ -6571,12 +6618,12 @@ async def api_users_deactivate(request: Request):
     try:
         target_uid = int(data.get("user_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="user_id обязателен (число)")
+        raise HTTPException(status_code=400, detail="Не выбран сотрудник")
     action = (data.get("action") or "deactivate").strip().lower()
     if action not in ("deactivate", "reactivate"):
-        raise HTTPException(status_code=400, detail="action: deactivate|reactivate")
+        raise HTTPException(status_code=400, detail="Сотрудника можно только отключить или вернуть")
     if action == "deactivate" and target_uid == user["id"]:
-        raise HTTPException(status_code=400, detail="Нельзя деактивировать самого себя")
+        raise HTTPException(status_code=400, detail="Себя отключить нельзя — попросите другого руководителя")
 
     if action == "deactivate":
         ok = await adb.deactivate_user(target_uid, user["id"])
@@ -6586,7 +6633,7 @@ async def api_users_deactivate(request: Request):
 
     invalidate_role(target_uid)
     if not ok:
-        raise HTTPException(status_code=409, detail="Нечего менять (состояние уже такое)")
+        raise HTTPException(status_code=409, detail="Ничего не изменилось — сотрудник уже в этом состоянии")
 
     actor_name = ((user.get("first_name") or "") + " " + (user.get("last_name") or "")).strip()
     await adb.add_audit_log(
@@ -6682,7 +6729,7 @@ async def api_deposits_confirm(request: Request):
     try:
         deposit_id = int(data.get("deposit_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="deposit_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбрана сдача — обновите список")
 
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
@@ -6735,11 +6782,11 @@ async def api_deposits_reject(request: Request):
     try:
         deposit_id = int(data.get("deposit_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="deposit_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбрана сдача — обновите список")
     # Round 6 (S2): cap 500 — DB column TEXT, шлётся в Telegram (4096 лимит).
     reason = (data.get("reason") or "").strip()[:500]
     if len(reason) < 3:
-        raise HTTPException(status_code=400, detail="Причина обязательна")
+        raise HTTPException(status_code=400, detail="Напишите причину отказа")
 
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
@@ -6793,7 +6840,7 @@ async def api_deposits_create(request: Request):
         try:
             order_ids = [int(x) for x in raw_ids][:200]
         except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="order_ids — список номеров заказов")
+            raise HTTPException(status_code=400, detail="Не получилось выбрать заказы — обновите экран и повторите")
     raw_amount = data.get("amount")
     try:
         amount = float(raw_amount)
@@ -6803,7 +6850,7 @@ async def api_deposits_create(request: Request):
     if not ok:
         raise HTTPException(
             status_code=400,
-            detail=err if err and "лимит" in err else "Сумма должна быть положительным числом",
+            detail=err if err and "лимит" in err else "Сумма должна быть больше нуля",
         )
 
     # R2: DB-уровневая идемпотентность. create_cash_deposit не защищён claim'ом —
@@ -6826,7 +6873,7 @@ async def api_deposits_create(request: Request):
         raise
     if not res.get("ok"):
         await idem.release()
-        raise HTTPException(status_code=400, detail=res.get("error", "не удалось создать сдачу"))
+        raise HTTPException(status_code=400, detail=res.get("error", "Не удалось записать сдачу — обновите экран и повторите"))
 
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
@@ -7009,7 +7056,7 @@ async def api_returns_confirm(request: Request):
     try:
         return_id = int(data.get("return_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="return_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран возврат — обновите список")
 
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
@@ -7054,7 +7101,7 @@ async def api_returns_goods_received(request: Request):
     try:
         return_id = int(data.get("return_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="return_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран возврат — обновите список")
     idem = _Idem(adb, "return_goods", user["id"], data.get("idempotency_key"))
     cached = await idem.claim()
     if cached is not None:
@@ -7095,20 +7142,20 @@ async def api_returns_positions(request: Request):
     try:
         order_id = int(data.get("order_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="order_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран заказ — обновите список")
 
     order = await adb.get_order(order_id)
     if not order:
-        raise HTTPException(status_code=404, detail="Заказ не найден")
+        raise HTTPException(status_code=404, detail="Заказ не найден — обновите список")
     if order.get("status") not in ("shipped", "paid", "partially_returned") and not order.get(
         "paid_confirmed_at"
     ):
         raise HTTPException(
-            status_code=409, detail="Возврат доступен только для отгруженных/оплаченных"
+            status_code=409, detail="Возврат оформляют по отгруженному или оплаченному заказу"
         )
     privileged = get_role(user["id"]) in ("admin", "boss", "warehouse_keeper")
     if not privileged and order.get("user_id") != user["id"]:
-        raise HTTPException(status_code=403, detail="Возврат только по своим заказам")
+        raise HTTPException(status_code=403, detail="Возврат можно оформить только по своему заказу")
 
     from config import BASE_CURRENCY
 
@@ -7152,14 +7199,14 @@ async def api_returns_create(request: Request):
     try:
         order_id = int(data.get("order_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="order_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран заказ — обновите список")
     # Round 6 (S2): cap 500 — DB-колонка TEXT, идёт в дальнейшие уведомления.
     reason = (data.get("reason") or "").strip()[:500]
     if len(reason) < 3:
         raise HTTPException(status_code=400, detail="Опишите причину возврата")
     refund = data.get("refund_method")
     if refund not in ("cash", "debt_reduction", "no_refund"):
-        raise HTTPException(status_code=400, detail="Некорректный способ возврата денег")
+        raise HTTPException(status_code=400, detail="Выберите, как возвращаем деньги клиенту")
 
     # R2: DB-уровневая идемпотентность (двойной POST создавал два возврата —
     # двойной refund/занижение долга). Ключ столбится в общей БД, результат
@@ -7174,13 +7221,13 @@ async def api_returns_create(request: Request):
     async with idem.released_on_reject():
         order = await adb.get_order(order_id)
         if not order:
-            raise HTTPException(status_code=404, detail="Заказ не найден")
+            raise HTTPException(status_code=404, detail="Заказ не найден — обновите список")
         # Отгружен/оплачен/частично-возвращён ИЛИ оплачен по легаси (paid_confirmed_at).
         if order.get("status") not in ("shipped", "paid", "partially_returned") and not order.get(
             "paid_confirmed_at"
         ):
             raise HTTPException(
-                status_code=409, detail="Возврат доступен только для отгруженных/оплаченных"
+                status_code=409, detail="Возврат оформляют по отгруженному или оплаченному заказу"
             )
         # H2: менеджер вправе вернуть только свой заказ; начальство/склад — любой.
         # Сознательно `in`, а не role_allowed: совмещение ролей (менеджер замещает
@@ -7188,7 +7235,7 @@ async def api_returns_create(request: Request):
         # принимать товар за кладовщика для этого не нужно.
         privileged = get_role(user["id"]) in ("admin", "boss", "warehouse_keeper")
         if not privileged and order.get("user_id") != user["id"]:
-            raise HTTPException(status_code=403, detail="Возврат только по своим заказам")
+            raise HTTPException(status_code=403, detail="Возврат можно оформить только по своему заказу")
 
         # T3.1: частичный возврат. Раньше эндпоинт жёстко слал "full" и возвращал
         # ВСЕ позиции целиком — частичный возврат существовал только в боте
@@ -7222,22 +7269,22 @@ async def api_returns_create(request: Request):
                     iid = int(str((row or {}).get("item_id")))
                     qty = float(str((row or {}).get("quantity")))
                 except (TypeError, ValueError, AttributeError):
-                    raise HTTPException(status_code=400, detail="Позиция: нужны item_id и quantity")
+                    raise HTTPException(status_code=400, detail="У строки возврата нет товара или количества — обновите экран")
                 if iid not in returnable:
                     raise HTTPException(
-                        status_code=400, detail=f"Позиция {iid} недоступна к возврату"
+                        status_code=400, detail=f"Позицию #{iid} вернуть нельзя — её уже вернули или она не отгружалась"
                     )
                 if any(seen == iid for seen, _, _ in ret_items):
                     # Две строки на одну позицию проходят «не больше доступного»
                     # каждая по отдельности; в базе это ещё и нарушение UNIQUE
                     # (return_id, order_item_id) — отвечаем текстом, а не 500-й.
-                    raise HTTPException(status_code=400, detail=f"Позиция {iid} указана дважды")
+                    raise HTTPException(status_code=400, detail=f"Позиция #{iid} выбрана дважды — оставьте одну строку")
                 if not (math.isfinite(qty) and 0 < qty <= returnable[iid] + 1e-9):
                     raise HTTPException(
                         status_code=400,
                         detail=(
-                            f"Позиция {iid}: количество должно быть от 0 до "
-                            f"{returnable[iid]:g}"
+                            f"По позиции #{iid} можно вернуть не больше "
+                            f"{returnable[iid]:g} — уменьшите количество"
                         ),
                     )
                 qty = min(qty, returnable[iid])
@@ -7265,7 +7312,7 @@ async def api_returns_create(request: Request):
         raise
     if not res.get("ok"):
         await idem.release()
-        raise HTTPException(status_code=409, detail=res.get("error", "не удалось"))
+        raise HTTPException(status_code=409, detail=res.get("error", "Не удалось оформить возврат — обновите экран и повторите"))
 
     # То же уведомление с кнопками, что и бот-команда /return.
     from handlers.returns import _notify_confirmers
@@ -7323,7 +7370,7 @@ async def api_orders_ship(request: Request):
     try:
         order_id = int(data.get("order_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="order_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран заказ — обновите список")
 
     order = await adb.get_order(order_id)
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
@@ -7347,7 +7394,7 @@ async def api_orders_ship(request: Request):
                 {"detail": res["error"], "code": res["code"], "gap_cents": res.get("gap_cents")},
                 status_code=409,
             )
-        raise HTTPException(status_code=409, detail=res.get("error", "не удалось отгрузить"))
+        raise HTTPException(status_code=409, detail=res.get("error", "Не удалось отметить отгрузку — обновите экран и повторите"))
 
     creator = order.get("user_id") if order else None
     if creator and creator != user["id"]:
@@ -7376,7 +7423,7 @@ async def api_orders_cancel(request: Request):
     try:
         order_id = int(data.get("order_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="order_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран заказ — обновите список")
     # Round 6 (S2): cap 500 — DB-колонка TEXT, шлётся в Telegram.
     reason = (data.get("reason") or "").strip()[:500]
     if len(reason) < 3:
@@ -7394,7 +7441,7 @@ async def api_orders_cancel(request: Request):
 
     res = await cancel_order_full(order_id, user["id"], name, reason)
     if not res.get("ok"):
-        raise HTTPException(status_code=409, detail=res.get("error", "не удалось отменить"))
+        raise HTTPException(status_code=409, detail=res.get("error", "Не удалось отменить заказ — обновите экран и повторите"))
 
     creator = order.get("user_id") if order else None
     if creator and creator != user["id"]:
@@ -7451,10 +7498,10 @@ async def api_price_hint(request: Request):
     product_ref = _product_ref(data, required=True)
     order_id = _optional_id(data, "order_id")
     if order_id is None:
-        raise HTTPException(status_code=400, detail="Не указан заказ")
+        raise HTTPException(status_code=400, detail="Не выбран заказ")
     order = await adb.get_order(order_id)
     if not order or order["user_id"] != user["id"]:
-        raise HTTPException(status_code=403, detail="Нет доступа")
+        raise HTTPException(status_code=403, detail="У вас нет доступа к этому действию")
 
     out: dict = {"ok": True, "last": None, "default": None, "wholesale": None}
 
@@ -7495,7 +7542,7 @@ async def api_add_item(request: Request):
 
     order = await adb.get_order(data["order_id"])
     if not order or order["user_id"] != user["id"]:
-        raise HTTPException(status_code=403, detail="Нет доступа")
+        raise HTTPException(status_code=403, detail="У вас нет доступа к этому действию")
     _require_draft_order(order)
 
     quantity = _validate_quantity(data.get("quantity"))
@@ -7505,7 +7552,7 @@ async def api_add_item(request: Request):
         if price < 0:
             raise ValueError
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Неверная цена")
+        raise HTTPException(status_code=400, detail="Цена — число не меньше нуля")
 
     # PR C: минимальная цена продажи, заданная руководством. По карточке
     # товара → product_prices.sale_price. Если задана:
@@ -7530,7 +7577,7 @@ async def api_add_item(request: Request):
         elif floor is not None and price > 0 and price < float(floor):
             raise HTTPException(
                 status_code=400,
-                detail=f"Цена ниже минимальной ({floor:g})",
+                detail=f"Цена ниже минимальной: не меньше {floor:g}. Поставьте больше или попросите руководителя изменить минимум",
             )
 
     # Все позиции одного ордера — в одной валюте. Пустой заказ валюту берёт
@@ -7546,7 +7593,7 @@ async def api_add_item(request: Request):
             if current_currency and await adb.get_order_items(data["order_id"]):
                 raise HTTPException(
                     status_code=409,
-                    detail=f"Валюта заказа — {current_currency}: все позиции в одной валюте",
+                    detail=f"В заказе уже {current_currency} — все позиции одного заказа в одной валюте",
                 )
             if not await adb.update_order_currency(
                 data["order_id"], requested_currency, require_draft=True
@@ -7586,17 +7633,17 @@ async def api_remove_item(request: Request):
 
     item = await adb.get_order_item(data["item_id"])
     if not item:
-        raise HTTPException(status_code=404, detail="Позиция не найдена")
+        raise HTTPException(status_code=404, detail="Позиция не найдена — обновите список")
     order = await adb.get_order(item["order_id"])
     if not order or order["user_id"] != user["id"]:
-        raise HTTPException(status_code=403, detail="Нет доступа")
+        raise HTTPException(status_code=403, detail="У вас нет доступа к этому действию")
     _require_draft_order(order)
     # Статус — ещё раз в транзакции удаления (см. add_item).
     if not await adb.remove_order_item(data["item_id"], require_draft=True):
         # Позиция на месте — значит, заказ успели отправить; иначе её удалили.
         if await adb.get_order_item(data["item_id"]):
             _require_draft_order(None)
-        raise HTTPException(status_code=404, detail="Позиция не найдена")
+        raise HTTPException(status_code=404, detail="Позиция не найдена — обновите список")
     return JSONResponse({"ok": True})
 
 
@@ -7614,7 +7661,7 @@ async def api_set_agent(request: Request):
 
     order = await adb.get_order(data["order_id"])
     if not order or order["user_id"] != user["id"]:
-        raise HTTPException(status_code=403, detail="Нет доступа")
+        raise HTTPException(status_code=403, detail="У вас нет доступа к этому действию")
     _require_draft_order(order)
 
     agent_id = (data.get("agent_id") or "").strip()[:64]
@@ -7645,7 +7692,7 @@ async def api_submit_order(request: Request):
     order_id = data["order_id"]
     order = await adb.get_order(order_id)
     if not order or order["user_id"] != user["id"]:
-        raise HTTPException(status_code=403, detail="Нет доступа")
+        raise HTTPException(status_code=403, detail="У вас нет доступа к этому действию")
 
     full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get(
         "username", str(user["id"])
@@ -7667,7 +7714,7 @@ async def api_submit_order(request: Request):
     )
     if not res.get("ok"):
         # 409 — состояние заказа (уже отправлен / заморожен), 400 — данные.
-        detail = res.get("error") or "Не удалось отправить заявку"
+        detail = res.get("error") or "Не удалось отправить заявку — обновите экран и повторите"
         conflict = res.get("status") is not None or "уже отправлен" in detail or "заморожен" in detail
         raise HTTPException(status_code=409 if conflict else 400, detail=detail)
 
@@ -8060,7 +8107,7 @@ async def api_supplier_debts(request: Request):
     try:
         supplier_id = int(raw) if raw not in (None, "", 0, "0") else None
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="supplier_id должен быть числом")
+        raise HTTPException(status_code=400, detail="Выберите поставщика из списка")
     return JSONResponse(await supplier_debts.overview(supplier_id))
 
 
@@ -8141,16 +8188,16 @@ async def _record_order_payment(data: dict, user: dict, op: str) -> JSONResponse
     try:
         order_id = int(data.get("order_id") or "")
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="order_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран заказ — обновите список")
     # Чужой заказ — 403 раньше разбора формы: посторонний не должен узнавать,
     # чего не хватает в запросе к заказу, который ему не принадлежит.
     head = await adb.get_order(order_id)
     if not head:
-        raise HTTPException(status_code=404, detail="Заказ не найден")
+        raise HTTPException(status_code=404, detail="Заказ не найден — обновите список")
     from services.roles import role_allowed
 
     if head["user_id"] != user["id"] and not role_allowed(get_role(user["id"]), order_payments.ROLES_RECORD_ANY):
-        raise HTTPException(status_code=403, detail="Нет доступа")
+        raise HTTPException(status_code=403, detail="У вас нет доступа к этому действию")
     if not data.get("parts"):
         # Сумма без способа больше не принимается: ради этого разбивка и
         # заведена («чтобы потом не возникало вопросов»).
@@ -8336,10 +8383,10 @@ async def api_order_payment_context(request: Request):
     try:
         order_id = int(data.get("order_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="order_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран заказ — обновите список")
     order = await adb.get_order(order_id)
     if not order:
-        raise HTTPException(status_code=404, detail="Заказ не найден")
+        raise HTTPException(status_code=404, detail="Заказ не найден — обновите список")
     role = get_role(user["id"])
     if order["user_id"] != user["id"] and not role_allowed(role, order_payments.ROLES_RECORD_ANY):
         raise HTTPException(status_code=403, detail="Оплату по чужому заказу вносит руководитель")
@@ -8540,7 +8587,7 @@ async def api_confirm_payment(request: Request):
     try:
         order_id = int(data.get("order_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="order_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран заказ — обновите список")
 
     # Idempotency: ключ в общей БД (T2.5) — двойной клик «Подтвердить» не
     # подтвердит платежи дважды даже после рестарта или в другом воркере.
@@ -8630,7 +8677,7 @@ async def api_reject_payment(request: Request):
     try:
         order_id = int(data.get("order_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="order_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран заказ — обновите список")
 
     # Idempotency: double-click reject не должен слать менеджеру два
     # уведомления об отклонении (сам UPDATE атомарен и второй раз даёт n=0).
@@ -8705,13 +8752,13 @@ async def api_delete_draft(request: Request):
     try:
         order_id = int(data.get("order_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="order_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран заказ — обновите список")
 
     ok = await adb.delete_order(order_id, user["id"])
     if not ok:
         raise HTTPException(
             status_code=403,
-            detail="Нельзя удалить (не свой / уже не черновик / не существует)",
+            detail="Удалить можно только свой черновик — этот заказ уже отправлен или удалён",
         )
     return JSONResponse({"ok": True})
 
@@ -8759,7 +8806,7 @@ async def api_orders_photos(request: Request):
     role = get_role(user["id"])
     order = await adb.get_order(order_id)
     if not _order_visible(order, user["id"], role):
-        raise HTTPException(status_code=404, detail="Заказ не найден")
+        raise HTTPException(status_code=404, detail="Заказ не найден — обновите список")
     photos = await order_photos.list_photos(order_id)
     return JSONResponse({
         "ok": True,
@@ -8790,14 +8837,14 @@ async def api_orders_photo(request: Request):
     role = get_role(user["id"])
     order = await adb.get_order(order_id)
     if not _order_visible(order, user["id"], role):
-        raise HTTPException(status_code=404, detail="Заказ не найден")
+        raise HTTPException(status_code=404, detail="Заказ не найден — обновите список")
     photos = await order_photos.list_photos(order_id)
     photo = next((p for p in photos if int(p["id"]) == photo_id), None)
     if not photo:
-        raise HTTPException(status_code=404, detail="Фото не найдено")
+        raise HTTPException(status_code=404, detail="Фото не найдено — обновите экран")
     blob = await _photo_bytes(str(photo["tg_file_id"]), str(photo["file_unique_id"]))
     if blob is None:
-        raise HTTPException(status_code=404, detail="Фото недоступно")
+        raise HTTPException(status_code=404, detail="Фото не открылось — попробуйте ещё раз")
     return Response(
         blob, media_type=_photo_media_type(blob) or "image/jpeg",
         headers={"Cache-Control": "private, max-age=600", "X-Content-Type-Options": "nosniff"},
@@ -8822,12 +8869,12 @@ async def api_orders_photo_upload(request: Request):
     role = get_role(user["id"])
     order = await adb.get_order(order_id)
     if not _order_visible(order, user["id"], role):
-        raise HTTPException(status_code=404, detail="Заказ не найден")
+        raise HTTPException(status_code=404, detail="Заказ не найден — обновите список")
     chat_id = _machine_photos_chat_id()
     if chat_id is None:
         raise HTTPException(
             status_code=503,
-            detail="Загрузка фото не настроена: нет PHOTOS_TG_CHAT_ID. Пришлите фото боту.",
+            detail="Загрузка фото не настроена — пришлите фото боту, а администратора попросите её включить",
         )
     blob = _decode_photo(data.get("data_url"))
     caption = (str(data.get("caption") or "")).strip()[:200]
@@ -8843,11 +8890,11 @@ async def api_orders_photo_upload(request: Request):
         )
     except Exception as e:
         logger.warning("Фото заказа #%s не загружено: %s", order_id, redact_token(repr(e)))
-        raise HTTPException(status_code=502, detail="Telegram не принял фото, попробуйте ещё раз")
+        raise HTTPException(status_code=502, detail="Telegram не принял фото — попробуйте ещё раз")
 
     best = max(sent.photo or [], key=lambda p: (p.width or 0) * (p.height or 0), default=None)
     if best is None:
-        raise HTTPException(status_code=502, detail="Telegram не вернул файл")
+        raise HTTPException(status_code=502, detail="Telegram не вернул файл — загрузите фото ещё раз")
     res = await order_photos.add_photo(
         order_id, tg_file_id=best.file_id, file_unique_id=best.file_unique_id,
         uploaded_by=user["id"], caption=caption or None,
@@ -8871,7 +8918,7 @@ async def api_orders_photo_delete(request: Request):
     role = get_role(user["id"])
     order = await adb.get_order(order_id)
     if not _order_visible(order, user["id"], role):
-        raise HTTPException(status_code=404, detail="Заказ не найден")
+        raise HTTPException(status_code=404, detail="Заказ не найден — обновите список")
     res = await order_photos.delete_photo(order_id, photo_id, user_id=user["id"], role=role)
     return _machine_response(res)
 
@@ -8980,7 +9027,7 @@ async def api_wh_counterparties_create(request: Request):
         cp_type=cp_type,
     )
     if not created.get("ok"):
-        raise HTTPException(status_code=400, detail=created.get("error", "Не удалось завести"))
+        raise HTTPException(status_code=400, detail=created.get("error", "Не удалось завести клиента — проверьте название и повторите"))
     if not created["existed"]:
         await adb.add_audit_log(
             user["id"], _actor_name(user), get_role(user["id"]),
@@ -9004,12 +9051,12 @@ async def api_wh_invoices(request: Request):
     )
     inv_type = data.get("type")
     if inv_type not in (None, "", "incoming", "outgoing"):
-        raise HTTPException(status_code=400, detail="Неизвестный тип накладной")
+        raise HTTPException(status_code=400, detail="Такого вида движения нет — выберите приход или отгрузку")
     try:
         limit = min(int(data.get("limit") or 50), 200)
         offset = max(int(data.get("offset") or 0), 0)
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="limit/offset должны быть числами")
+        raise HTTPException(status_code=400, detail="Не получилось открыть эту страницу списка — обновите экран")
 
     rows = await warehouse.list_invoices(
         invoice_type=inv_type or None, limit=limit, offset=offset
@@ -9046,22 +9093,22 @@ async def api_wh_invoice_print(request: Request):
     try:
         invoice_id = int(data.get("invoice_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="invoice_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран документ — обновите список")
     inv = await warehouse.get_invoice(invoice_id)
     if inv is None:
-        raise HTTPException(status_code=404, detail="Накладная не найдена")
+        raise HTTPException(status_code=404, detail="Документ не найден — обновите список")
     from services.costing import redact_invoice
 
     # Печать — тот же вывод наружу: закупочные цены прихода не руководству
     # не печатаем.
     inv = redact_invoice(inv, get_role(user["id"]))
     if not printing.is_available():
-        return JSONResponse({"ok": False, "error": "Печать не настроена на этом сервере"})
+        return JSONResponse({"ok": False, "error": "Печать не настроена — попросите администратора подключить принтер"})
     try:
         pdf = await asyncio.to_thread(render_invoice_pdf, inv)
     except Exception:
         logger.exception("Печать: не собран PDF накладной #%s", invoice_id)
-        return JSONResponse({"ok": False, "error": "Не удалось собрать PDF накладной"})
+        return JSONResponse({"ok": False, "error": "Не удалось собрать печатную форму — попробуйте ещё раз"})
     result = await printing.print_pdf_bytes(
         pdf, filename=invoice_filename(inv),
         label=f"Накладная {inv.get('invoice_number') or invoice_id} · {_actor_name(user)}",
@@ -9107,7 +9154,7 @@ async def api_docs_company_set(request: Request):
     )
     values = data.get("company")
     if not isinstance(values, dict):
-        raise HTTPException(status_code=400, detail="company: ожидается объект")
+        raise HTTPException(status_code=400, detail="Реквизиты не сохранены — обновите экран и повторите")
     saved = await asyncio.to_thread(documents.save_company_requisites, values, user["id"])
     from services import async_db as adb
 
@@ -9130,7 +9177,7 @@ async def api_docs_create(request: Request):
     )
     res = await documents.create_document(data, created_by=user["id"])
     if not res.get("ok"):
-        raise HTTPException(status_code=400, detail=res.get("error", "Не удалось собрать документ"))
+        raise HTTPException(status_code=400, detail=res.get("error", "Не удалось собрать документ — проверьте поля формы и повторите"))
     from services import async_db as adb
 
     await adb.add_audit_log(
@@ -9166,7 +9213,7 @@ async def _doc_for_user(data: dict, user: dict) -> dict:
 
     doc = await documents.get_document(_doc_id_arg(data))
     if doc is None or not documents.can_access(doc, user["id"], get_role(user["id"])):
-        raise HTTPException(status_code=404, detail="Документ не найден")
+        raise HTTPException(status_code=404, detail="Документ не найден — обновите список")
     return doc
 
 
@@ -9174,9 +9221,9 @@ def _doc_id_arg(data: dict) -> int:
     try:
         value = int(data.get("doc_id") or 0)
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="doc_id: не число")
+        raise HTTPException(status_code=400, detail="Не выбран документ — обновите список")
     if value <= 0:
-        raise HTTPException(status_code=400, detail="doc_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран документ — обновите список")
     return value
 
 
@@ -9203,7 +9250,7 @@ async def api_docs_print(request: Request):
     user = _authorize(data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_print", rate_limit_max=30)
     doc = await _doc_for_user(data, user)
     if not printing.is_available():
-        return JSONResponse({"ok": False, "error": "Печать не настроена на этом сервере"})
+        return JSONResponse({"ok": False, "error": "Печать не настроена — попросите администратора подключить принтер"})
     found = await asyncio.to_thread(documents.read_pdf, doc)
     if found is None:
         return JSONResponse({"ok": False, "error": "Файл документа не найден — сформируйте заново"})
@@ -9224,11 +9271,11 @@ async def api_wh_invoice_get(request: Request):
     try:
         invoice_id = int(data.get("invoice_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="invoice_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран документ — обновите список")
 
     inv = await warehouse.get_invoice(invoice_id)
     if inv is None:
-        raise HTTPException(status_code=404, detail="Накладная не найдена")
+        raise HTTPException(status_code=404, detail="Документ не найден — обновите список")
     from services.costing import redact_invoice
 
     return JSONResponse({"invoice": redact_invoice(inv, get_role(user["id"]))})
@@ -9256,7 +9303,7 @@ async def api_wh_invoice_create(request: Request):
 
     inv_type = data.get("type")
     if inv_type not in ("incoming", "outgoing"):
-        raise HTTPException(status_code=400, detail="type: incoming или outgoing")
+        raise HTTPException(status_code=400, detail="Выберите вид движения: приход или отгрузка")
     # Расход — только руководство. Отгрузка клиенту идёт через заявку и
     # одобрение (кредит-лимит, override, аудит); прямая расходная накладная
     # менеджером обходила бы весь этот контур: товар уезжал бы без заказа,
@@ -9265,8 +9312,8 @@ async def api_wh_invoice_create(request: Request):
     if inv_type == "outgoing" and get_role(user["id"]) not in ("admin", "boss"):
         raise HTTPException(
             status_code=403,
-            detail="Расходную накладную проводит руководство — отгрузка клиенту идёт "
-            "через заявку на отгрузку и её одобрение",
+            detail="Отгрузку оформляет руководство: товар уезжает клиенту "
+            "по заявке на отгрузку и её одобрению",
         )
 
     invoice_date = str(data.get("invoice_date") or "").strip() or None
@@ -9276,7 +9323,7 @@ async def api_wh_invoice_create(request: Request):
         try:
             _dt.strptime(invoice_date, "%Y-%m-%d")
         except ValueError:
-            raise HTTPException(status_code=400, detail="invoice_date: ожидается YYYY-MM-DD")
+            raise HTTPException(status_code=400, detail="Дата документа — в формате ГГГГ-ММ-ДД, например 2026-09-16")
     raw_wh = data.get("warehouse_id")
     try:
         # Склад по умолчанию — из справочника, а не «1»: на базе, где первый
@@ -9284,7 +9331,7 @@ async def api_wh_invoice_create(request: Request):
         # накладную «склад не найден».
         warehouse_id = int(raw_wh) if raw_wh else await warehouse.default_warehouse_id()
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="warehouse_id должен быть числом")
+        raise HTTPException(status_code=400, detail="Выберите склад из списка")
 
     raw_items = data.get("items")
     if not isinstance(raw_items, list) or not raw_items:
@@ -9292,7 +9339,7 @@ async def api_wh_invoice_create(request: Request):
 
     counterparty_id = data.get("counterparty_id")
     if inv_type == "outgoing" and not counterparty_id:
-        raise HTTPException(status_code=400, detail="Для расхода нужен контрагент")
+        raise HTTPException(status_code=400, detail="Выберите клиента — без него отгрузку не оформить")
     currency_err = warehouse.invoice_currency_error(data.get("currency") or BASE_CURRENCY)
     if currency_err:
         raise HTTPException(status_code=400, detail=currency_err)
@@ -9393,7 +9440,7 @@ async def api_wh_invoice_create(request: Request):
             delivery = {"sent": False, "reason": "send_failed"}
         result["pdf_sent"] = delivery["sent"]
         if not delivery["sent"]:
-            result["pdf_warning"] = REASON_TEXT.get(delivery["reason"], "PDF не отправлен")
+            result["pdf_warning"] = REASON_TEXT.get(delivery["reason"], "Документ клиенту не отправлен")
 
     await idem.store(result)
     return JSONResponse(result)
@@ -9420,11 +9467,11 @@ async def api_wh_invoice_send(request: Request):
     try:
         invoice_id = int(data.get("invoice_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="invoice_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран документ — обновите список")
 
     invoice = await warehouse.get_invoice(invoice_id)
     if invoice is None:
-        raise HTTPException(status_code=404, detail="Накладная не найдена")
+        raise HTTPException(status_code=404, detail="Документ не найден — обновите список")
 
     bot = await get_notify_bot()
     delivery = await deliver_invoice_pdf(invoice, bot, force=bool(data.get("force")))
@@ -9433,7 +9480,7 @@ async def api_wh_invoice_send(request: Request):
             {
                 "ok": False,
                 "code": delivery["reason"],
-                "reason": REASON_TEXT.get(delivery["reason"], "PDF не отправлен"),
+                "reason": REASON_TEXT.get(delivery["reason"], "Документ клиенту не отправлен"),
             },
             status_code=409,
         )
@@ -9470,10 +9517,10 @@ async def _invoice_owner_refusal(invoice_id: int) -> dict | None:
         "SELECT id, kind FROM stock_writeoffs WHERE invoice_id = $1", invoice_id
     )
     if wo is not None:
-        what = "списание" if wo["kind"] == "writeoff" else "оприходование излишка"
+        what = "списание" if wo["kind"] == "writeoff" else "приход излишка"
         reason = (
-            f"Эта накладная — {what} #{wo['id']}. Отмените его в «Склад → Списания»: "
-            "там сторно снимет и запись, и движение товара разом."
+            f"Это движение — {what} #{wo['id']}. Отмените его в разделе «Склад → "
+            "Списания»: там отмена уберёт и запись, и движение товара разом."
         )
         return {"ok": False, "code": "linked_writeoff", "writeoff_id": int(wo["id"]),
                 "reason": reason, "detail": reason}
@@ -9484,10 +9531,10 @@ async def _invoice_owner_refusal(invoice_id: int) -> dict | None:
     )
     if ret is not None:
         reason = (
-            f"Эта накладная — приход товара по возврату #{ret['return_id']} "
-            f"(заказ #{ret['order_id']}). Отдельно от возврата её не отменить: товар "
+            f"Это движение — приход товара по возврату #{ret['return_id']} "
+            f"(заказ #{ret['order_id']}). Отдельно от возврата его не отменить: товар "
             "ушёл бы со склада, а деньги и возвращённое количество остались бы учтены. "
-            "Отмените возврат, а не накладную."
+            "Отмените возврат, а не приход."
         )
         return {"ok": False, "code": "linked_return", "return_id": int(ret["return_id"]),
                 "order_id": int(ret["order_id"]), "reason": reason, "detail": reason}
@@ -9497,7 +9544,7 @@ async def _invoice_owner_refusal(invoice_id: int) -> dict | None:
     )
     if order_id is not None:
         reason = (
-            f"Эта накладная — отгрузка заказа #{order_id}. Отмените заказ: "
+            f"Это движение — отгрузка заказа #{order_id}. Отмените заказ: "
             "отмена заказа сама вернёт товар на склад и закроет долг."
         )
         return {"ok": False, "code": "linked_order", "order_id": int(order_id),
@@ -9510,8 +9557,8 @@ async def _invoice_owner_refusal(invoice_id: int) -> dict | None:
     if container is not None:
         label = container.get("number") or f"#{container['container_id']}"
         reason = (
-            f"Эта накладная — приход контейнера {label}. Отмените контейнер "
-            "(удалите его или переоприходуйте), а не накладную."
+            f"Это движение — приход контейнера {label}. Отмените контейнер "
+            "(удалите его или примите заново), а не приход."
         )
         return {"ok": False, "code": "linked_container",
                 "container_id": int(container["container_id"]),
@@ -9542,7 +9589,7 @@ async def api_wh_invoice_cancel(request: Request):
     try:
         invoice_id = int(data.get("invoice_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="invoice_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран документ — обновите список")
     # Выключатель `delete_requires_boss` открывает менеджеру отмену только
     # СВОЕГО прихода. Расход проводит руководство — и отменяет тоже оно:
     # иначе менеджер возвращал бы на склад товар, уехавший по чужому решению.
@@ -9552,7 +9599,7 @@ async def api_wh_invoice_cancel(request: Request):
     if head is not None and not _invoice_cancel_allowed(head, user["id"], role):
         raise HTTPException(
             status_code=403,
-            detail="Отменить расходную или чужую накладную может только руководитель",
+            detail="Отменить отгрузку или чужой приход может только руководитель",
         )
 
     # Накладная, которую провёл заказ или контейнер, отменяется ЧЕРЕЗ них.
@@ -9615,7 +9662,7 @@ async def api_stock_writeoffs(request: Request):
         limit = min(int(data.get("limit") or 50), 200)
         offset = max(int(data.get("offset") or 0), 0)
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="limit/offset должны быть числами")
+        raise HTTPException(status_code=400, detail="Не получилось открыть эту страницу списка — обновите экран")
     count_id = data.get("count_id")
     rows = await inventory.list_writeoffs(
         limit=limit, offset=offset, count_id=int(count_id) if count_id else None
@@ -9659,7 +9706,7 @@ async def api_stock_writeoff_photo(request: Request):
     if chat_id is None:
         raise HTTPException(
             status_code=503,
-            detail="Загрузка фото не настроена: нет PHOTOS_TG_CHAT_ID",
+            detail="Загрузка фото не настроена — пришлите фото боту, а администратора попросите её включить",
         )
     blob = _decode_photo(data.get("data_url"))
     try:
@@ -9671,10 +9718,10 @@ async def api_stock_writeoff_photo(request: Request):
         )
     except Exception as e:
         logger.warning("Фото списания не загружено: %s", redact_token(repr(e)))
-        raise HTTPException(status_code=502, detail="Telegram не принял фото")
+        raise HTTPException(status_code=502, detail="Telegram не принял фото — попробуйте ещё раз или пришлите его боту")
     best = max(sent.photo or [], key=lambda p: (p.width or 0) * (p.height or 0), default=None)
     if best is None:
-        raise HTTPException(status_code=502, detail="Telegram не вернул файл")
+        raise HTTPException(status_code=502, detail="Telegram не вернул файл — загрузите фото ещё раз")
     return JSONResponse({"ok": True, "photo_file_id": best.file_id})
 
 
@@ -9698,16 +9745,16 @@ async def api_stock_writeoff_photo_view(request: Request):
     try:
         writeoff_id = int(data.get("writeoff_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="writeoff_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбрано списание — обновите список")
     row = await adb_core.fetchrow(
         "SELECT photo_file_id FROM stock_writeoffs WHERE id = $1", writeoff_id
     )
     if row is None or not row["photo_file_id"]:
-        raise HTTPException(status_code=404, detail="Фото не найдено")
+        raise HTTPException(status_code=404, detail="Фото не найдено — обновите экран")
     file_id = str(row["photo_file_id"])
     blob = await _photo_bytes(file_id, f"writeoff:{file_id}")
     if blob is None:
-        raise HTTPException(status_code=404, detail="Фото недоступно")
+        raise HTTPException(status_code=404, detail="Фото не открылось — попробуйте ещё раз")
     return Response(
         blob, media_type=_photo_media_type(blob) or "image/jpeg",
         headers={"Cache-Control": "private, max-age=600", "X-Content-Type-Options": "nosniff"},
@@ -9742,7 +9789,7 @@ async def api_stock_writeoff_create(request: Request):
     try:
         warehouse_id = int(raw_wh) if raw_wh else None
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="warehouse_id должен быть числом")
+        raise HTTPException(status_code=400, detail="Выберите склад из списка")
 
     idem = _Idem(adb, "stock_writeoff_create", user["id"], data.get("idempotency_key"))
     prev = await idem.claim()
@@ -9807,7 +9854,7 @@ async def api_stock_writeoff_void(request: Request):
     try:
         writeoff_id = int(data.get("writeoff_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="writeoff_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбрано списание — обновите список")
 
     result = await inventory.void_writeoff(
         writeoff_id, user_id=user["id"], is_boss=role in ("admin", "boss")
@@ -9854,7 +9901,7 @@ async def api_stock_count_start(request: Request):
     try:
         warehouse_id = int(raw_wh) if raw_wh else None
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="warehouse_id должен быть числом")
+        raise HTTPException(status_code=400, detail="Выберите склад из списка")
     result = await inventory.start_count(
         warehouse_id=warehouse_id, note=data.get("note"), started_by=user["id"]
     )
@@ -9880,10 +9927,10 @@ async def api_stock_count_card(request: Request):
     try:
         count_id = int(data.get("count_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="count_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран пересчёт — обновите список")
     card = await inventory.count_card(count_id)
     if card is None:
-        raise HTTPException(status_code=404, detail="Пересчёт не найден")
+        raise HTTPException(status_code=404, detail="Пересчёт не найден — обновите список")
     return JSONResponse(card)
 
 
@@ -9900,7 +9947,7 @@ async def api_stock_count_line(request: Request):
     try:
         count_id = int(data.get("count_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="count_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран пересчёт — обновите список")
     try:
         return JSONResponse(
             await inventory.set_count_line(
@@ -9925,7 +9972,7 @@ async def api_stock_count_line_remove(request: Request):
         count_id = int(data.get("count_id"))
         product_id = int(data.get("product_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="count_id и product_id обязательны")
+        raise HTTPException(status_code=400, detail="Не выбраны пересчёт и товар — обновите экран")
     try:
         return JSONResponse(await inventory.remove_count_line(count_id, product_id))
     except inventory.InventoryError as e:
@@ -9947,7 +9994,7 @@ async def api_stock_count_confirm(request: Request):
     try:
         count_id = int(data.get("count_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="count_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран пересчёт — обновите список")
 
     # atomic: результат пишется ТОЙ ЖЕ транзакцией, что и накладные
     # (`inventory.apply_count` → `database.idem_store_in`), поэтому ключ без
@@ -9994,7 +10041,7 @@ async def api_stock_count_cancel(request: Request):
     try:
         count_id = int(data.get("count_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="count_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран пересчёт — обновите список")
     try:
         result = await inventory.cancel_count(count_id, user_id=user["id"])
     except inventory.InventoryError as e:
@@ -10094,7 +10141,7 @@ async def api_warehouses_rename(request: Request):
     try:
         warehouse_id = int(data.get("warehouse_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="warehouse_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран склад")
     name = str(data.get("name") or "")
     try:
         result = await warehouse.rename_warehouse(warehouse_id, name)
@@ -10127,7 +10174,7 @@ async def api_warehouses_archive(request: Request):
     try:
         warehouse_id = int(data.get("warehouse_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="warehouse_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран склад")
     try:
         result = await warehouse.archive_warehouse(warehouse_id, archived_by=user["id"])
     except warehouse.WarehouseError as e:
@@ -10159,7 +10206,7 @@ async def api_warehouses_unarchive(request: Request):
     try:
         warehouse_id = int(data.get("warehouse_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="warehouse_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран склад")
     result = await warehouse.unarchive_warehouse(warehouse_id)
     if result.get("restored"):
         await adb.add_audit_log(
@@ -10196,7 +10243,7 @@ async def api_stock_transfer(request: Request):
     try:
         product_id = int(data.get("product_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="product_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран товар")
     try:
         from_warehouse_id = int(data.get("from_warehouse_id"))
         to_warehouse_id = int(data.get("to_warehouse_id"))
@@ -10257,7 +10304,7 @@ async def api_stock_transfers_list(request: Request):
         limit = min(int(data.get("limit") or 50), 200)
         offset = max(int(data.get("offset") or 0), 0)
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="limit/offset должны быть числами")
+        raise HTTPException(status_code=400, detail="Не получилось открыть эту страницу списка — обновите экран")
     rows = await warehouse.list_stock_transfers(limit=limit, offset=offset)
     return JSONResponse({"transfers": rows})
 
@@ -10285,12 +10332,12 @@ async def api_orders_set_warehouse(request: Request):
 
     order = await adb.get_order(data.get("order_id"))
     if not order or order["user_id"] != user["id"]:
-        raise HTTPException(status_code=403, detail="Нет доступа")
+        raise HTTPException(status_code=403, detail="У вас нет доступа к этому действию")
     _require_draft_order(order)
     try:
         warehouse_id = int(data.get("warehouse_id"))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="warehouse_id обязателен")
+        raise HTTPException(status_code=400, detail="Не выбран склад")
     try:
         result = await warehouse.set_order_warehouse(order["id"], warehouse_id)
     except warehouse.WarehouseError as e:

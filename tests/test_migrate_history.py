@@ -1151,7 +1151,7 @@ def test_historical_invoices_cannot_be_cancelled(seeded, ms_api, boss_api):
                           json={"initData": "100", "invoice_id": inv["id"]})
         assert r.status_code == 409, r.text
         assert r.json()["code"] == "historical"
-        assert "перенесена из МойСклад" in r.json()["reason"]
+        assert "перенесено из МойСклад" in r.json()["reason"]
 
     assert _stock(seeded) == before
     assert {r["status"] for r in _rows(seeded, "SELECT status FROM invoices")} == {"confirmed"}

@@ -80,7 +80,7 @@ def test_credit_day_from_order_to_closed_debt(open_app, e2e):
     go(keeper, "sales")
     keeper.wait_for_selector(f'.btn-ship-order[data-id="{oid}"]')
     keeper.click(f'.btn-ship-order[data-id="{oid}"]')
-    keeper.wait_for_function("() => window.__tgAlerts.some(a => a.startsWith('🚚'))")
+    keeper.wait_for_function("() => window.__tgAlerts.some(a => /Заказ #\\d+ отгружен/.test(a))")
     assert e2e.rows("SELECT status FROM orders WHERE id = ?", (oid,))[0]["status"] == "shipped"
 
     mgr = open_app(ids["mgr"])
@@ -102,13 +102,13 @@ def test_credit_day_from_order_to_closed_debt(open_app, e2e):
     mgr.wait_for_selector("#dep-amount")
     mgr.fill("#dep-amount", "50")
     mgr.click("#dep-create")
-    mgr.wait_for_selector(".toast:has-text('Сдача #')")
+    mgr.wait_for_selector(".toast:has-text('Сдача в кассу №')")
     dep = e2e.rows("SELECT id FROM cash_deposits")[0]["id"]
 
     open_confirmations(boss)
     boss.wait_for_selector(f'.debt-card[data-dep="{dep}"] .dep-confirm')
     boss.click(f'.debt-card[data-dep="{dep}"] .dep-confirm')
-    boss.wait_for_selector(".toast:has-text('Сдача подтверждена')")
+    boss.wait_for_selector(".toast:has-text('Сдача в кассу подтверждена')")
 
     order = e2e.rows("SELECT status, payment_confirmed FROM orders WHERE id = ?", (oid,))[0]
     assert order == {"status": "paid", "payment_confirmed": 1}
@@ -133,7 +133,7 @@ def test_boss_cancels_approved_order_and_stock_comes_back(open_app, e2e):
     boss.click(f'.btn-cancel-order[data-id="{oid}"]')
     boss.fill(f'.cancel-box[data-id="{oid}"] .cancel-reason', "Клиент передумал")
     boss.click(f'.cancel-send[data-id="{oid}"]')
-    boss.wait_for_function("() => window.__tgAlerts.some(a => a.startsWith('🚫'))")
+    boss.wait_for_function("() => window.__tgAlerts.some(a => /Заказ #\\d+ отменён/.test(a))")
 
     assert e2e.rows("SELECT status FROM orders WHERE id = ?", (oid,))[0]["status"] == "cancelled"
     assert _stock(e2e) == 20

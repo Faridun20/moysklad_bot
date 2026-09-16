@@ -3510,17 +3510,17 @@ def _validate_amount(amount: float | None) -> tuple[bool, str | None]:
     import math
 
     if amount is None:
-        return False, "Сумма не задана"
+        return False, "Укажите сумму"
     try:
         amount = float(amount)
     except (TypeError, ValueError):
-        return False, "Сумма должна быть числом"
+        return False, "Введите сумму числом, например 25000"
     if math.isnan(amount) or math.isinf(amount):
-        return False, "Сумма должна быть числом"
+        return False, "Введите сумму числом, например 25000"
     if amount <= 0:
-        return False, "Сумма должна быть > 0"
+        return False, "Сумма должна быть больше нуля"
     if amount > _AMOUNT_MAX:
-        return False, f"Сумма превышает лимит ({_AMOUNT_MAX:.0f})"
+        return False, f"Сумма больше допустимого лимита ({_AMOUNT_MAX:.0f}) — проверьте, не лишние ли нули"
     return True, None
 
 
@@ -3552,19 +3552,19 @@ def validate_amount_in_currency(
     import math
 
     if amount is None:
-        return False, "Сумма не задана"
+        return False, "Укажите сумму"
     try:
         value = float(amount)
     except (TypeError, ValueError):
-        return False, "Сумма должна быть числом"
+        return False, "Введите сумму числом, например 25000"
     if math.isnan(value) or math.isinf(value):
-        return False, "Сумма должна быть числом"
+        return False, "Введите сумму числом, например 25000"
     if value <= 0:
-        return False, "Сумма должна быть > 0"
+        return False, "Сумма должна быть больше нуля"
     try:
         cents = money.to_cents(amount)
     except (ArithmeticError, ValueError):
-        return False, "Сумма должна быть числом"
+        return False, "Введите сумму числом, например 25000"
     ok, err = money.validate_cents(cents, current_rate_to_base(currency))
     return ok, (err or None)
 
@@ -4750,7 +4750,7 @@ async def create_return(
     if not order:
         return {"ok": False, "error": "Заказ не найден"}
     if not _is_returnable(order):
-        return {"ok": False, "error": "Возврат доступен только для отгруженных/оплаченных"}
+        return {"ok": False, "error": "Возврат оформляют по отгруженному или оплаченному заказу"}
     if not items:
         return {"ok": False, "error": "Не указаны позиции возврата"}
 
@@ -4919,7 +4919,7 @@ async def _plan_return_stock(return_id: int, order_id: int) -> dict:
         return {
             "positions": [],
             "unmatched": [],
-            "skipped_reason": "по заказу не было расходной накладной — остаток не списывался",
+            "skipped_reason": "по заказу не было отгрузки — товар со склада не списывался",
         }
     rows = await adb_core.fetch(
         "SELECT ri.qty AS quantity, oi.product_name, op.product_id "
@@ -4950,7 +4950,7 @@ async def _plan_return_stock(return_id: int, order_id: int) -> dict:
                 unit_cost[int(r["product_id"])] = round(int(r["cost"]) / qty)
     for p in positions:
         p["price_cents"] = unit_cost.get(int(p["product_id"]))
-    reason = None if positions else "ни одна позиция возврата не сопоставлена с номенклатурой"
+    reason = None if positions else "ни одна позиция возврата не связана с товаром из каталога"
     return {
         "positions": positions,
         "unmatched": unmatched,
@@ -6505,7 +6505,7 @@ async def link_payment_to_order(
     UPDATE-WHERE-NULL — adb_core.execute; _maybe_close теперь async (await).
     """
     if not payment_id or not order_id:
-        return {"ok": False, "error": "payment_id и order_id обязательны"}
+        return {"ok": False, "error": "Выберите платёж и заказ, к которому его привязать"}
 
     payment = await get_payment(payment_id)
     if not payment:

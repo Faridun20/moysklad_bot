@@ -96,7 +96,10 @@ def validate_transition(order: dict, new_status: str) -> str | None:
     """
     current = order.get("status", "")
     if new_status not in TRANSITIONS.get(current, []):
-        return f"Переход {current!r}→{new_status!r} недопустим"
+        return (
+            f"Заказ «{_STATUS_RU.get(current, current)}» нельзя перевести "
+            f"в «{_STATUS_RU.get(new_status, new_status)}»"
+        )
     return None
 
 
@@ -617,7 +620,7 @@ def _decision_error(decision, order_id) -> str:
             f"Заказ #{order_id} уже в статусе «{human}» — решение по заявке "
             f"больше не применимо. Откройте заказ и посмотрите актуальное состояние."
         )
-    return "Заявка уже обработана другим пользователем"
+    return "Эту заявку уже решил кто-то другой — обновите список"
 
 
 async def approve_shipment_request(
@@ -669,7 +672,7 @@ async def approve_shipment_request(
 
     req = await adb.get_shipment_request(req_id)
     if not req:
-        return {"ok": False, "error": "Заявка не найдена", "req_id": req_id, "order_id": None}
+        return {"ok": False, "error": "Заявка не найдена — обновите список", "req_id": req_id, "order_id": None}
     if req["status"] != "pending":
         return {
             "ok": False,
@@ -818,10 +821,10 @@ async def approve_shipment_request(
                     boss_name,
                     boss_role,
                     "order_shipped",
-                    f"Заявка #{req_id} → накладная {invoice_number} (#{invoice_id})",
+                    f"Заявка #{req_id} → отгрузка {invoice_number} (#{invoice_id})",
                 )
                 demand_line = (
-                    f"\n📦 Накладная {esc(str(invoice_number))} проведена, остатки списаны"
+                    f"\n📦 Отгрузка {esc(str(invoice_number))} оформлена, товар списан со склада"
                 )
                 if pdf_delivery == "inline":
                     pdf_to_send = await _build_invoice_pdf(invoice_id, order["id"])
@@ -956,7 +959,7 @@ async def reject_shipment_request(
 
     req = await adb.get_shipment_request(req_id)
     if not req:
-        return {"ok": False, "error": "Заявка не найдена", "req_id": req_id, "order_id": None}
+        return {"ok": False, "error": "Заявка не найдена — обновите список", "req_id": req_id, "order_id": None}
     if req["status"] != "pending":
         return {
             "ok": False,
@@ -1024,7 +1027,7 @@ async def return_order_to_draft(
 
     req = await adb.get_shipment_request(req_id)
     if not req:
-        return {"ok": False, "error": "Заявка не найдена", "req_id": req_id, "order_id": None}
+        return {"ok": False, "error": "Заявка не найдена — обновите список", "req_id": req_id, "order_id": None}
     if req["status"] != "pending":
         return {
             "ok": False,

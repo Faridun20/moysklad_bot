@@ -188,8 +188,8 @@ def machine_request_keyboard(request_id: int) -> InlineKeyboardMarkup:
     """
     rid = int(request_id)
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Одобрить", callback_data=f"mdr_ok:{rid}")
-    kb.button(text="❌ Отклонить", callback_data=f"mdr_no:{rid}")
+    kb.button(text="✅ Одобрить заявку", callback_data=f"mdr_ok:{rid}")
+    kb.button(text="❌ Отклонить заявку", callback_data=f"mdr_no:{rid}")
     kb.button(text="✏️ На доработку", callback_data=f"mdr_rw:{rid}")
     kb.adjust(2, 1)
     return kb.as_markup()

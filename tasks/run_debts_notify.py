@@ -91,7 +91,7 @@ def _format_message(
             f"({due_human}{owner_part})"
         )
 
-    parts = ["💳 <b>Напоминание о долгах</b>\n"]
+    parts = ["💳 <b>Напоминание о долгах клиентов</b>\n"]
     if overdue:
         parts.append(f"⚠️ <b>Просрочено ({len(overdue)}):</b>")
         parts.extend(_row(d) for d in overdue[:20])
@@ -105,8 +105,7 @@ def _format_message(
         if len(today) > 20:
             parts.append(f"  …и ещё {len(today) - 20}")
     parts.append(
-        "\n<i>Откройте WebApp → «Долги», чтобы отметить оплаченные, "
-        "или используйте команду /debts в чате.</i>"
+        "\n<i>Оплаченные отмечайте в WebApp → «Деньги» → «Долги».</i>"
     )
     return "\n".join(parts)
 
@@ -142,7 +141,7 @@ async def _notify_machine_installments(bosses: list[dict], today_str: str) -> in
     if overdue:
         parts.insert(1, f"⚠️ <b>Просрочено: {len(overdue)}</b>\n")
     parts.append(
-        "\n<i>Откройте WebApp → «Заказы» → «Техника», чтобы отметить полученные.</i>"
+        "\n<i>Полученные платежи отмечайте в WebApp → «Склад» → «Техника».</i>"
     )
     text = "\n".join(parts)
 
@@ -238,8 +237,8 @@ async def main() -> int:
             awaiting_count = sum(1 for d in all_debts_full if _has_pending(d["id"]))
             if awaiting_count:
                 boss_text += (
-                    f"\n\n⏳ <b>Требуют подтверждения: {awaiting_count}</b>"
-                    f"\nОткройте WebApp → «Финансы» → «Долги» или /debts в чате."
+                    f"\n\n⏳ <b>Ждут вашего подтверждения: {awaiting_count}</b>"
+                    f"\nПодтвердите их в WebApp → «Деньги» → «Долги»."
                 )
             for boss in bosses:
                 await tg_send_message(boss["user_id"], boss_text)

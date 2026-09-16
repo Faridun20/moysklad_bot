@@ -170,7 +170,7 @@ async def match_items(items: list[dict]) -> tuple[list[dict], list[dict]]:
                     "name": name,
                     "quantity": qty,
                     "reason": (
-                        "не найден в номенклатуре" if not candidates else "несколько совпадений"
+                        "нет такого товара в каталоге" if not candidates else "подходит сразу несколько товаров"
                     ),
                 }
             )
@@ -189,7 +189,7 @@ async def create_product(name: str, *, unit: str = "шт") -> dict:
     """
     clean = " ".join(str(name or "").split())[:255]
     if not clean:
-        return {"ok": False, "error": "Название товара обязательно"}
+        return {"ok": False, "error": "Укажите название товара"}
 
     existing = (await _products_by_name([clean])).get(normalize_name(clean)) or []
     if existing:
@@ -293,7 +293,7 @@ async def resolve_items(container_id: int, resolutions: dict[int, dict]) -> dict
         return guard
     items ={int(i["id"]): i for i in await containers.list_items(container_id)}
     if set(resolutions) - set(items):
-        return {"ok": False, "error": "Позиция не из этого контейнера"}
+        return {"ok": False, "error": "Эта позиция не из этого контейнера — обновите экран"}
     wanted = sorted({c["product_id"] for c in resolutions.values() if c.get("product_id")})
     if wanted:
         placeholders = ", ".join(f"${i + 1}" for i in range(len(wanted)))
@@ -305,7 +305,7 @@ async def resolve_items(container_id: int, resolutions: dict[int, dict]) -> dict
         }
         missing = [pid for pid in wanted if pid not in known]
         if missing:
-            return {"ok": False, "error": f"Товар #{missing[0]} не найден"}
+            return {"ok": False, "error": f"Товар #{missing[0]} не найден в каталоге — выберите его заново"}
 
     created: list[str] = []
     existed: list[str] = []
@@ -357,7 +357,7 @@ async def set_supplier(container_id: int, *, supplier_id: int | None, name: str 
             "SELECT id FROM counterparties WHERE id = $1", int(supplier_id)
         )
         if exists is None:
-            return {"ok": False, "error": f"Контрагент #{supplier_id} не найден"}
+            return {"ok": False, "error": f"Поставщик #{supplier_id} не найден — выберите его в справочнике «Клиенты и поставщики»"}
 
     stamp = now_str()
     existing = await adb_core.fetchval(
@@ -418,16 +418,16 @@ async def receive(container_id: int, *, user_id: int | None = None) -> dict:
 
     container = await containers.get_container(container_id)
     if not container:
-        return {"ok": False, "error": "Контейнер не найден"}
+        return {"ok": False, "error": "Контейнер не найден — обновите список"}
     if container.get("status") != "arrived":
-        return {"ok": False, "error": "Оприходовать можно только прибывший контейнер"}
+        return {"ok": False, "error": "Принять на склад можно только прибывший контейнер — сначала отметьте, что он приехал"}
 
     link = await get_link(container_id)
     if link.get("legacy"):
         return {
             "ok": False,
-            "error": "Контейнер оприходован ещё в МойСклад — его остаток перенесён "
-            "миграцией. Повторный приход прибавил бы товар второй раз.",
+            "error": "Этот контейнер приняли на склад ещё в МойСклад, его остаток "
+            "перенесён к нам. Повторный приход прибавил бы товар второй раз.",
             "legacy": True,
         }
 
@@ -436,7 +436,8 @@ async def receive(container_id: int, *, user_id: int | None = None) -> dict:
     if not matched:
         return {
             "ok": False,
-            "error": "Нечего оприходовать: ни одна позиция не найдена в номенклатуре",
+            "error": "Принимать нечего: ни один товар контейнера не найден в каталоге — "
+            "свяжите позиции с товарами и повторите",
             "unmatched": unmatched,
         }
 
@@ -468,8 +469,8 @@ async def receive(container_id: int, *, user_id: int | None = None) -> dict:
             if fresh and fresh.get("received_at") and not existing_invoice:
                 return {
                     "ok": False,
-                    "error": "Контейнер оприходован ещё в МойСклад — его остаток перенесён "
-                    "миграцией. Повторный приход прибавил бы товар второй раз.",
+                    "error": "Этот контейнер приняли на склад ещё в МойСклад, его остаток "
+                    "перенесён к нам. Повторный приход прибавил бы товар второй раз.",
                     "legacy": True,
                 }
             if existing_invoice:

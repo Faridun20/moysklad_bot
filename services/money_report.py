@@ -154,7 +154,7 @@ def build_blocks(data: dict) -> list:
         blocks.append(InputRichBlockParagraph(text=" · ".join(by_source)))
 
     rows = [[cell("Срок", header=True), cell("Сумма", header=True, right=True),
-             cell("Док.", header=True, right=True)]]
+             cell("Долгов", header=True, right=True)]]
     for b in data["aging"]["buckets"]:
         # Пустую корзину в таблицу не кладём: в чате её строка занимает место
         # ровно столько же, сколько содержательная, а смысла не несёт.
@@ -180,7 +180,7 @@ def build_blocks(data: dict) -> list:
     disc = data["discipline"]
     if disc["expected_count"]:
         blocks.append(InputRichBlockDivider())
-        blocks.append(InputRichBlockSectionHeading(text="Поступают ли платежи", size=2))
+        blocks.append(InputRichBlockSectionHeading(text="Платят ли вовремя", size=2))
         share = "—" if disc["on_time_share"] is None else f"{round(disc['on_time_share'] * 100)}%"
         blocks.append(InputRichBlockParagraph(
             text=f"Собрано {_fmt(disc['collected'])} из {_fmt(disc['expected'])}"
@@ -200,7 +200,7 @@ def build_blocks(data: dict) -> list:
     forecast_rows = [m for m in data["forecast"] if m["count"]]
     if forecast_rows:
         blocks.append(InputRichBlockDivider())
-        blocks.append(InputRichBlockSectionHeading(text="Ожидаемые поступления", size=2))
+        blocks.append(InputRichBlockSectionHeading(text="Ждём поступлений", size=2))
         blocks.append(InputRichBlockList(items=[
             InputRichBlockListItem(blocks=[InputRichBlockParagraph(
                 text=f"{m['month']} — {_fmt(m)}"
@@ -288,7 +288,7 @@ def build_text(data: dict) -> str:
     forecast_rows = [m for m in data["forecast"] if m["count"]]
     if forecast_rows:
         lines.append("")
-        lines.append("<b>Ожидаемые поступления</b>")
+        lines.append("<b>Ждём поступлений</b>")
         for m in forecast_rows:
             lines.append(f"  {esc(m['month'])} — {esc(_fmt(m))}")
 

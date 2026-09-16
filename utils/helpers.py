@@ -60,7 +60,10 @@ def user_safe_error(e: Exception, context: str = "") -> str:
     import logging
 
     logging.getLogger(__name__).exception("user-visible error (%s): %s", context, e)
-    return "❌ Произошла внутренняя ошибка. Попробуйте позже или обратитесь к админу."
+    return (
+        "❌ Не получилось выполнить действие: сбой в программе. "
+        "Повторите через минуту, а если повторится — напишите администратору."
+    )
 
 
 def safe_get(obj, *path, default=None):
@@ -113,10 +116,11 @@ def format_price(raw: float) -> str:
     """Конвертировать копейки МойСклад в читаемую цену.
 
     Тонкий алиас services.money.format_cents — единый форматтер денег,
-    чтобы конвенция отображения не расходилась по модулям."""
+    чтобы конвенция отображения не расходилась по модулям. Разделители —
+    умолчание форматтера, то есть русские: «1 092»."""
     from services.money import format_cents
 
-    return format_cents(int(round(raw)), decimals=0, sep=",")
+    return format_cents(int(round(raw)), decimals=0)
 
 
 def trend_arrow(current: float, previous: float) -> str:

@@ -196,7 +196,7 @@ def _run(coro):
 def test_version_is_closed_to_managers(cmd):
     msg = _Msg(200)
     _run(cmd.cmd_version(msg))
-    assert "Нет доступа" in msg.answers[0]
+    assert "Версию программы смотрит руководство" in msg.answers[0]
 
 
 def test_matching_versions_say_so_plainly(cmd, monkeypatch):

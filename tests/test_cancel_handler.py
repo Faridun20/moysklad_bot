@@ -98,7 +98,7 @@ def test_cancel_blocked_for_shipped(isolated_db):
     oid = _setup(db, "shipped")
     msg = _FakeMessage(text=f"/cancel {oid}", uid=2)
     asyncio.run(cmd_cancel(msg, _FakeState()))
-    assert any("approved" in t for t, _ in msg.answers)
+    assert any("одобренный" in t for t, _ in msg.answers)
     assert asyncio.run(db.get_order(oid))["status"] == "shipped"
 
 
@@ -109,5 +109,5 @@ def test_cancel_denied_for_manager(isolated_db):
     oid = _setup(db, "approved")
     msg = _FakeMessage(text=f"/cancel {oid}", uid=1)  # менеджер
     asyncio.run(cmd_cancel(msg, _FakeState()))
-    assert any("босс" in t.lower() for t, _ in msg.answers)
+    assert any("руководител" in t.lower() for t, _ in msg.answers)
     assert asyncio.run(db.get_order(oid))["status"] == "approved"

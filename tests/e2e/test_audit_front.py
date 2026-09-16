@@ -62,7 +62,7 @@ def test_session_expiry_shows_screen_and_invoice_draft_survives_reopen(open_app,
     assert boss.input_value('.wh-pos [data-f="quantity"]') == "7"
     assert boss.input_value("#wh-comment") == "Довоз после обеда"
     boss.click("#wh-save")
-    boss.wait_for_selector(".toast:has-text('проведена')")
+    boss.wait_for_selector(".toast:has-text('оформлен')")
     rows = e2e.rows("SELECT comment FROM invoices WHERE comment = ?", ("Довоз после обеда",))
     assert len(rows) == 1, "ровно одна накладная — повтор не задвоил"
     assert e2e.rows("SELECT COUNT(*) AS n FROM invoices")[0]["n"] == before + 1

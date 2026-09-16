@@ -223,7 +223,7 @@ async def gather() -> dict:
         (порог был выше на момент создания) и пере-фильтровкой по новому
         порогу выпадало из дайджеста тоже: пропадало насовсем, не карточкой,
         не сводкой. Простое и надёжное правило — показывать ВСЁ ждущее,
-        помечая «уже приходило» то, что СЕЙЧАС выглядит выше порога (в
+        помечая «уже показывали» то, что СЕЙЧАС выглядит выше порога (в
         обычном случае это и есть уже отправленное; ложная метка — не
         потеря, просто лишнее «уже видели» в сообщении)."""
         return [
@@ -241,20 +241,20 @@ async def gather() -> dict:
         # Карта/счёт — «на карту •••• 1234 (Фаридун М.)»: руководитель сверяет
         # банк по этой строке, способ без получателя ему ничего не говорит.
         method = (part.get("account_label") or order_payments.METHODS.get(part["method"], "—")) \
-            if part else "без способа"
+            if part else "способ не указан"
         order = f" · заказ #{p['order_id']}" if p.get("order_id") else ""
-        tail = " · уже приходило" if already else ""
+        tail = " · уже показывали" if already else ""
         return (
             f"{p.get('full_name') or p.get('user_id')} — "
             f"{p['amount']:,.0f} {_payment_currency(p)} ({method}){order}{tail}"
         ).replace(",", " ")
 
     def _deposit_line(d: dict, already: bool = False) -> str:
-        tail = " · уже приходило" if already else ""
+        tail = " · уже показывали" if already else ""
         return f"#{d['id']} — {d['amount']:,.0f} {_deposit_currency(d)}{tail}".replace(",", " ")
 
     def _return_line(r: dict, already: bool = False) -> str:
-        tail = " · уже приходило" if already else ""
+        tail = " · уже показывали" if already else ""
         return (
             f"#{r['id']} · заказ #{r['order_id']} — {r['total_amount']:,.0f} "
             f"{_return_currency(r)}{tail}"
@@ -354,7 +354,7 @@ def _received_line(data: dict) -> str | None:
     if not block["count"]:
         return None
     total = " · ".join(f"{t['total']:,.0f} {t['currency']}".replace(",", " ") for t in block["by_currency"])
-    return f"Получено (мелкие): {block['count']} на {total}"
+    return f"Получено мелкими суммами: {block['count']} на {total}"
 
 
 def build_blocks(data: dict) -> list:
@@ -388,7 +388,7 @@ def build_blocks(data: dict) -> list:
             blocks.append(InputRichBlockParagraph(text=f"…и ещё {block['rest']}"))
 
     _section("💳 Платежи на подтверждение", data["payments"])
-    _section("💵 Сдачи наличных", data["deposits"])
+    _section("💵 Сдачи в кассу", data["deposits"])
     _section("↩️ Возвраты", data["returns"])
 
     recon = data.get("cash_counts") or {}
@@ -436,7 +436,7 @@ def build_text(data: dict) -> str:
         lines.append("")
 
     _section("💳 Платежи на подтверждение", data["payments"])
-    _section("💵 Сдачи наличных", data["deposits"])
+    _section("💵 Сдачи в кассу", data["deposits"])
     _section("↩️ Возвраты", data["returns"])
 
     recon = data.get("cash_counts") or {}
@@ -453,7 +453,7 @@ def build_text(data: dict) -> str:
         lines.append(esc(received))
         lines.append("")
 
-    lines.append("<i>Подробнее и решения — в WebApp.</i>")
+    lines.append("<i>Подробнее и кнопки решений — в WebApp.</i>")
     return "\n".join(lines)
 
 

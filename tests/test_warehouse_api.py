@@ -578,7 +578,7 @@ def test_manager_cannot_create_outgoing_invoice(api):
     _incoming(client, ids["boss"], qty=10)
     r = _outgoing(client, ids["mgr"], qty=1)
     assert r.status_code == 403
-    assert "через заявку" in r.json()["detail"]
+    assert "по заявке" in r.json()["detail"]
     # Остаток не тронут.
     stock = client.post("/api/wh/stock", json={"initData": str(ids["mgr"])}).json()
     assert stock["products"][0]["quantity"] == 10
@@ -598,7 +598,7 @@ def test_bad_invoice_date_is_400_not_500(api):
     client, _db, ids = api
     r = _incoming(client, ids["mgr"], invoice_date="вчера")
     assert r.status_code == 400
-    assert "YYYY-MM-DD" in r.json()["detail"]
+    assert "ГГГГ-ММ-ДД" in r.json()["detail"]
 
 
 def test_invoice_date_accepted_when_iso(api):

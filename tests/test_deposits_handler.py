@@ -95,7 +95,7 @@ def test_cb_confirm_denied_for_guest_allowed_for_manager(isolated_db):
     call = _FakeCall(f"dep_ok:{res['deposit_id']}", uid=999, bot=bot)  # гость не вправе
     asyncio.run(cb_deposit_confirm(call, bot))
 
-    assert any("доступа" in (a[0] or "").lower() for a in call.alerts)
+    assert any("подтверждает" in (a[0] or "").lower() for a in call.alerts)
     deps = asyncio.run(db.get_manager_cash_deposits(1))
     assert deps[0]["status"] == "pending"  # не подтверждено
 

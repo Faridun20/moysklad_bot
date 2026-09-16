@@ -26,7 +26,7 @@ def test_oversized_body_with_content_length_is_413(client):
     body = b'{"initData": "x", "pad": "' + b"a" * (server.MAX_BODY_BYTES + 10) + b'"}'
     r = client.post("/api/orders/add_item", content=body, headers={"Content-Type": "application/json"})
     assert r.status_code == 413
-    assert r.json()["detail"] == "Слишком большой запрос"
+    assert r.json()["detail"].startswith("Слишком большой запрос")
 
 
 def test_oversized_chunked_body_without_length_is_413(client):

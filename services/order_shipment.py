@@ -153,7 +153,7 @@ async def ship_order(order: dict, items: list[dict], *, user_id: int | None = No
 
     positions, skipped = await _resolve_products(items)
     if not positions:
-        reason = "Ни одна позиция заказа не сопоставлена с номенклатурой"
+        reason = "Ни одна позиция заказа не связана с товаром из каталога — свяжите их и повторите"
         await _remember_failure(order_id, reason)
         return {"ok": False, "code": "no_positions", "reason": reason, "skipped": skipped}
 
@@ -185,7 +185,13 @@ async def ship_order(order: dict, items: list[dict], *, user_id: int | None = No
             # списался бы по уже отменённому заказу — навсегда.
             status = await _lock_order_for_shipment(txn, order_id)
             if status not in _SHIPPABLE_STATUSES:
-                human = "не найден" if status is None else f"в статусе «{status}»"
+                from services.order_workflow import _STATUS_RU
+
+                human = (
+                    "не найден"
+                    if status is None
+                    else f"уже «{_STATUS_RU.get(status, status)}»"
+                )
                 return {
                     "ok": False,
                     "code": "order_moved",
@@ -283,7 +289,7 @@ async def historical_cancel_refusal(order_id: int) -> str | None:
     if not (row["ms_demand_id"] or row["historical_invoice"]):
         return None
     return (
-        f"Заказ #{order_id} отгружен ещё в МойСклад и отменить его нельзя: остаток склада "
+        f"Заказ #{order_id} отгружен ещё в МойСклад, и отменить его нельзя: остаток склада "
         "приехал снимком, который эту отгрузку уже учитывает, и отмена вернула бы на склад "
         "товар, давно уехавший к клиенту. Если клиент вернул товар — оформите возврат."
     )
@@ -382,7 +388,7 @@ async def list_failed(limit: int = 50) -> list[dict]:
         cap,
     )
     for r in stuck:
-        r["error"] = "Одобрен, но накладная не проводилась (процесс прервался)"
+        r["error"] = "Заказ одобрен, но отгрузка не оформлена — работа прервалась. Отметьте отгрузку заново"
     rows = list(failed) + list(stuck)
     rows.sort(key=lambda r: str(r.get("failed_at") or ""), reverse=True)
     return rows[:cap]

@@ -56,7 +56,7 @@ async def cmd_shipments(message: Message, bot: Bot):
 @router.callback_query(F.data.startswith("sh:"))
 async def cb_shipments_period(call: CallbackQuery, bot: Bot):
     if not is_allowed(call.from_user.id):
-        return await call.answer("Нет доступа", show_alert=True)
+        return await call.answer("Отгрузки смотрит склад и руководство", show_alert=True)
     await call.answer()
 
     period = call.data.split(":")[1]
@@ -88,13 +88,13 @@ async def cb_shipments_period(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith("shp:"))
 async def cb_shipments_page(call: CallbackQuery, bot: Bot):
     if not is_allowed(call.from_user.id):
-        return await call.answer("Нет доступа", show_alert=True)
+        return await call.answer("Отгрузки смотрит склад и руководство", show_alert=True)
     await call.answer()
     page = int(call.data.split(":")[1])
     cached = shipments_cache.get(call.message.chat.id)
     if not cached:
         return await call.message.answer(
-            "❌ Данные устарели. Выберите период заново.",
+            "❌ Список уже не в памяти бота. Выберите период заново кнопкой ниже.",
             reply_markup=shipments_back_keyboard(),
         )
     await show_shipments(

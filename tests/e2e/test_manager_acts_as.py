@@ -40,7 +40,7 @@ def test_manager_confirms_deposit_and_sees_it_in_today(open_app, e2e):
     assert mgr.locator(".pay-confirm").count() == 0
     mgr.click(".dep-confirm")
     # Итог действия — тостом (аудит фронта заменил блокирующие алерты).
-    mgr.wait_for_selector(".toast:has-text('Сдача подтверждена')")
+    mgr.wait_for_selector(".toast:has-text('Сдача в кассу подтверждена')")
     assert e2e.rows("SELECT status, confirmed_by FROM cash_deposits")[0] == {
         "status": "confirmed", "confirmed_by": e2e.ids["mgr"],
     }
@@ -89,7 +89,7 @@ def test_manager_ships_approved_order(open_app, e2e):
     go(mgr, "sales")
     mgr.wait_for_selector(f'.btn-ship-order[data-id="{oid}"]')
     mgr.click(f'.btn-ship-order[data-id="{oid}"]')  # showConfirm → «да»
-    mgr.wait_for_function("() => window.__tgAlerts.some(a => a.startsWith('🚚'))")
+    mgr.wait_for_function("() => window.__tgAlerts.some(a => /Заказ #\\d+ отгружен/.test(a))")
     assert e2e.rows("SELECT status, shipped_by FROM orders WHERE id = ?", (oid,))[0] == {
         "status": "shipped", "shipped_by": e2e.ids["mgr"],
     }

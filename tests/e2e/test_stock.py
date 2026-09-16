@@ -46,7 +46,7 @@ def test_boss_posts_incoming_invoice_and_cancels_it(open_app, e2e):
     boss.fill('.wh-pos [data-f="quantity"]', "5")
     boss.fill("#wh-comment", "Довоз со склада поставщика")
     boss.click("#wh-save")
-    boss.wait_for_selector(".toast:has-text('проведена')")
+    boss.wait_for_selector(".toast:has-text('оформлен')")
     boss.wait_for_selector("#wh-new")  # вернулись в список
 
     assert _stock(e2e) == 25
@@ -327,7 +327,7 @@ def test_container_lifecycle_moves_stock_once(open_app, e2e):
     assert "2" in boss.locator("#content").inner_text()
 
     boss.click("#cont-supply")
-    boss.wait_for_selector(".toast:has-text('Оприходовано')")
+    boss.wait_for_selector(".toast:has-text('Принято на склад')")
     assert _stock(e2e) == 28, "20 + 8 фактически прибывших"
     receipt = e2e.rows("SELECT invoice_id FROM container_receipt")[0]
     assert receipt["invoice_id"]
@@ -338,7 +338,7 @@ def test_container_lifecycle_moves_stock_once(open_app, e2e):
     # отменяется, новая проводится.
     boss.wait_for_function("() => !document.querySelector('.toast')")
     boss.click("#cont-supply")
-    boss.wait_for_selector(".toast:has-text('Оприходовано')")
+    boss.wait_for_selector(".toast:has-text('Принято на склад')")
     assert _stock(e2e) == 28
     assert e2e.rows("SELECT COUNT(*) AS n FROM invoices WHERE cancelled_at IS NULL")[0]["n"] == 2  # сид + одна живая
 
@@ -528,7 +528,7 @@ def test_manager_writes_off_two_units_with_a_reason(open_app, e2e):
     mgr.click('.c-overlay .seg-item[data-opt="разбили"]')
     mgr.fill("#ms-f-note", "уронили при разгрузке")
     mgr.click("#ms-submit")
-    mgr.wait_for_selector(".toast:has-text('Списано')")
+    mgr.wait_for_selector(".toast:has-text('Товар списан со склада')")
 
     assert _stock(e2e) == 18, "остаток уменьшился ровно на списанное"
     row = e2e.rows("SELECT kind, reason, created_by FROM stock_writeoffs ORDER BY id DESC")[0]
@@ -553,7 +553,7 @@ def test_writeoff_over_stock_is_refused_inside_the_form(open_app, e2e):
     mgr.wait_for_selector("#ms-f-quantity")
     mgr.fill("#ms-f-quantity", "999")
     mgr.click("#ms-submit")
-    mgr.wait_for_selector("#ms-error:has-text('Не хватает остатка')")
+    mgr.wait_for_selector("#ms-error:has-text('Не хватает товара на складе')")
     assert _stock(e2e) == 20
     assert mgr.locator("#ms-f-quantity").input_value() == "999", "набранное осталось в форме"
 
@@ -589,10 +589,10 @@ def test_manager_runs_a_count_and_applies_deltas(open_app, e2e):
 
     # Сводка расхождений видна ДО проведения — «применить вслепую» тут нет.
     text = mgr.locator("#content").inner_text()
-    assert "недостача 1" in text and "излишек 1" in text and "сходится 1" in text
+    assert "не хватает 1" in text and "лишних 1" in text and "сходится 1" in text
 
     mgr.click("#wo-apply")
-    mgr.wait_for_selector(".toast:has-text('проведён')")
+    mgr.wait_for_selector(".toast:has-text('Пересчёт применён')")
 
     def qty(pid):
         return e2e.rows("SELECT quantity FROM stock WHERE product_id = ?", (pid,))[0]["quantity"]

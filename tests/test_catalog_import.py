@@ -64,7 +64,7 @@ def test_broken_xlsx_raises_catalog_import_error():
 
 def test_validate_rows_missing_name_is_error():
     rows = ci.validate_rows([["", "шт", "", "", ""]])
-    assert rows[0].error == "Название обязательно"
+    assert rows[0].error == "Укажите название товара"
 
 
 def test_validate_rows_bad_price_is_error():

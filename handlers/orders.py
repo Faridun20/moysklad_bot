@@ -32,6 +32,7 @@ from handlers._ui import (
     settle_markup,
     webapp_keyboard,
 )
+from utils.formatters import plural_positions  # noqa: E402 — склонение «позиция»
 from utils.helpers import esc as _esc  # noqa: E402
 
 
@@ -69,14 +70,24 @@ STATUS_EMOJI = {
     "approved": "✅",
     "rejected": "❌",
     "shipped": "🚚",
+    "paid": "💰",
+    "cancelled": "🚫",
+    "partially_returned": "↩️",
+    "returned": "↩️",
 }
 
+# Согласование по роду — по слову «заказ» (CLAUDE.md, «Словарь интерфейса»):
+# в одном списке нельзя мешать «Отгружено» и «Отменён».
 STATUS_NAME = {
     "draft": "Черновик",
-    "pending": "На рассмотрении",
-    "approved": "Одобрено",
-    "rejected": "Отклонено",
-    "shipped": "Отгружено",
+    "pending": "Ждёт одобрения",
+    "approved": "Одобрен",
+    "rejected": "Отклонён",
+    "shipped": "Отгружен",
+    "paid": "Оплачен",
+    "cancelled": "Отменён",
+    "partially_returned": "Возвращён частично",
+    "returned": "Возвращён",
 }
 
 
@@ -136,8 +147,8 @@ def format_order(order: dict, items: list[dict], summary: dict | None = None) ->
         rc = int(order.get("rejection_count") or 0)
         if order.get("frozen"):
             returned_str = (
-                f"\n🧊 <b>Заморожен</b> (отклонений: {rc}) — "
-                f"переотправка заблокирована, нужна разморозка админом"
+                f"\n🧊 <b>Заморожен</b> — заявку отклоняли {rc} раз(а), "
+                f"отправить заново нельзя: попросите администратора разморозить заказ"
                 f"\n↩️ Причина: <i>{_esc(order['rejection_comment'])}</i>"
             )
         else:
@@ -172,7 +183,7 @@ def format_order(order: dict, items: list[dict], summary: dict | None = None) ->
                 price_str = f"     <code>{_fmt_num(qty)} {unit}</code>"
             lines.append(f"  {i + 1}. <b>{_esc(item['product_name'])}</b>\n{price_str}{note_str}")
         if total_items > 10:
-            lines.append(f"  <i>...и ещё {total_items - 10} позиций</i>")
+            lines.append(f"  <i>…и ещё {plural_positions(total_items - 10)}</i>")
 
         grand_total = sum(_line_total(it) for it in items)
         if grand_total > 0:
@@ -224,7 +235,7 @@ def format_request_notify(
     items_text = "\n".join(lines)
     grand_total = sum(_line_total(it) for it in items)
     if len(items) > 10:
-        items_text += f"\n  ...и ещё {len(items) - 10} поз."
+        items_text += f"\n  …и ещё {plural_positions(len(items) - 10)}"
 
     agent_str = (
         f"\n👤 Клиент: <b>{_esc(order['agent_name'])}</b>" if order.get("agent_name") else ""
@@ -276,11 +287,11 @@ async def build_credit_context(order: dict, items: list[dict]) -> str:
     if not ctx:
         return ""
     flag = (
-        "🔴 <b>ПРЕВЫШЕНИЕ ЛИМИТА</b>" if ctx["over_limit"] else "🟢 в пределах лимита"
+        "🔴 <b>Лимит долга превышен</b>" if ctx["over_limit"] else "🟢 В пределах лимита"
     )
     return (
-        f"\n\n📊 <b>Кредит клиента</b> ({_BASE_CURRENCY}):"
-        f"\n   долг с учётом заявки: <b>{_fmt_num(ctx['effective_debt'])}</b>"
+        f"\n\n📊 <b>Долг клиента</b> ({_BASE_CURRENCY}):"
+        f"\n   долг с учётом этой заявки: <b>{_fmt_num(ctx['effective_debt'])}</b>"
         f" / лимит {_fmt_num(ctx['limit'])}"
         f"\n   {flag}"
     )
@@ -288,8 +299,8 @@ async def build_credit_context(order: dict, items: list[dict]) -> str:
 
 def request_approve_keyboard(req_id: int):
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Одобрить", callback_data=f"req_ok:{req_id}")
-    kb.button(text="❌ Отклонить", callback_data=f"req_no:{req_id}")
+    kb.button(text="✅ Одобрить заявку", callback_data=f"req_ok:{req_id}")
+    kb.button(text="❌ Отклонить заявку", callback_data=f"req_no:{req_id}")
     kb.button(text="✏️ На доработку", callback_data=f"req_draft:{req_id}")
     kb.adjust(2, 1)
     return kb.as_markup()
@@ -339,18 +350,22 @@ async def cb_view_order(call: CallbackQuery):
     try:
         order_id = int(call.data.split(":")[1])
     except (IndexError, ValueError):
-        return await call.message.answer("❌ Некорректный запрос.")
+        return await call.message.answer(
+            "❌ Кнопка устарела: номер заказа в ней не читается. Откройте заказ заново."
+        )
 
     order = await adb.get_order(order_id)
     if not order:
-        return await call.message.answer("❌ Заказ не найден.")
+        return await call.message.answer("❌ Заказа с таким номером нет — возможно, его удалили.")
 
     # Защита от информации utечки: видеть заказ может только владелец
     # или босс/админ. Раньше любой Telegram-юзер с угадаенным ID видел
     # содержимое заявок чужой компании.
     is_owner = order["user_id"] == call.from_user.id
     if not is_owner and not is_boss(call.from_user.id):
-        return await call.message.answer("⛔ Нет доступа к этому заказу.")
+        return await call.message.answer(
+            "⛔ Этот заказ вам не показать: его видят автор и руководитель."
+        )
 
     items = await adb.get_order_items(order_id)
     # Для не-черновиков подтягиваем сводку оплаты, чтобы карточка показала
@@ -399,9 +414,9 @@ async def _approve_flow(
         if result.get("needs_override"):
             over = result["over"]
             kb = InlineKeyboardBuilder()
-            kb.button(text="✅ Одобрить с превышением", callback_data=f"req_ovr:{req_id}")
+            kb.button(text="✅ Одобрить сверх лимита", callback_data=f"req_ovr:{req_id}")
             kb.adjust(1)
-            await call.answer("⚠️ Превышение лимита", show_alert=True)
+            await call.answer("⚠️ Лимит долга клиента превышен", show_alert=True)
             # T3.2: снимаем кнопки заявки. Решение теперь принимается ТОЛЬКО
             # через «Одобрить с превышением» в следующем сообщении — иначе
             # босс мог обойти явное подтверждение, повторно нажав «Одобрить»
@@ -409,14 +424,14 @@ async def _approve_flow(
             # решение.
             await finish_card(
                 call,
-                "⚠️ Превышение лимита — нужно подтверждение",
-                outcome="⚠️ Превышение лимита — решение ниже ⬇️",
+                "⚠️ Лимит долга превышен — нужно ваше подтверждение",
+                outcome="⚠️ Лимит долга превышен — решение ниже ⬇️",
             )
             return await call.message.answer(
-                f"⚠️ <b>Превышение кредитного лимита</b>\n"
-                f"Текущий долг: <b>{_fmt_num(over['current_debt'])}</b>\n"
+                f"⚠️ <b>Лимит долга клиента превышен</b>\n"
+                f"Клиент должен сейчас: <b>{_fmt_num(over['current_debt'])}</b>\n"
                 f"Лимит: <b>{_fmt_num(over['limit'])}</b>\n"
-                f"После заказа: <b>{_fmt_num(over['projected'])}</b>\n\n"
+                f"Будет должен после заказа: <b>{_fmt_num(over['projected'])}</b>\n\n"
                 f"Одобрить всё равно?",
                 parse_mode="HTML",
                 reply_markup=kb.as_markup(),
@@ -450,18 +465,18 @@ async def _approve_flow(
 
     await call.answer("✅ Заявка одобрена")
     if discount_ack:
-        suffix = " (со скидкой выше порога)"
-        verb = "✅ Одобрено со скидкой"
+        suffix = " со скидкой выше порога"
+        verb = "✅ Одобрена со скидкой"
     elif override:
-        suffix = " (с превышением лимита)"
-        verb = "✅ Одобрено с превышением"
+        suffix = " сверх лимита долга"
+        verb = "✅ Одобрена сверх лимита"
     else:
         suffix = ""
-        verb = "✅ Одобрено"
+        verb = "✅ Одобрена"
     base = getattr(call.message, "html_text", None) or call.message.text or ""
     await call.message.edit_text(
         base
-        + f"\n\n{DIV}\n✅ <b>Одобрено{suffix}</b>  <code>{result['now']}</code>  — {_esc(boss_name)}",
+        + f"\n\n{DIV}\n✅ <b>Заявка одобрена{suffix}</b>  <code>{result['now']}</code>  — {_esc(boss_name)}",
         parse_mode="HTML",
         reply_markup=settle_markup(
             getattr(call.message, "reply_markup", None),
@@ -475,7 +490,7 @@ async def _approve_flow(
 @router.callback_query(F.data.startswith("req_ok:"))
 async def cb_approve_request(call: CallbackQuery, bot: Bot):
     if not is_boss(call.from_user.id):
-        return await call.answer("Нет доступа", show_alert=True)
+        return await call.answer("Решение по заявке принимает руководитель", show_alert=True)
     req_id = int(call.data.split(":")[1])
     await _approve_flow(call, bot, req_id, override=False)
 
@@ -483,7 +498,7 @@ async def cb_approve_request(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith("req_ovr:"))
 async def cb_approve_request_override(call: CallbackQuery, bot: Bot):
     if not is_boss(call.from_user.id):
-        return await call.answer("Нет доступа", show_alert=True)
+        return await call.answer("Решение по заявке принимает руководитель", show_alert=True)
     req_id = int(call.data.split(":")[1])
     await _approve_flow(call, bot, req_id, override=True)
 
@@ -492,7 +507,7 @@ async def cb_approve_request_override(call: CallbackQuery, bot: Bot):
 async def cb_approve_request_discount(call: CallbackQuery, bot: Bot):
     """«Одобрить со скидкой» — явное решение по заявке со скидкой выше порога."""
     if not is_boss(call.from_user.id):
-        return await call.answer("Нет доступа", show_alert=True)
+        return await call.answer("Решение по заявке принимает руководитель", show_alert=True)
     req_id = int(call.data.split(":")[1])
     await _approve_flow(call, bot, req_id, override=True, discount_ack=True)
 
@@ -500,7 +515,7 @@ async def cb_approve_request_discount(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith("req_no:"))
 async def cb_reject_request(call: CallbackQuery, bot: Bot):
     if not is_boss(call.from_user.id):
-        return await call.answer("Нет доступа", show_alert=True)
+        return await call.answer("Решение по заявке принимает руководитель", show_alert=True)
 
     req_id = int(call.data.split(":")[1])
     boss_name = call.from_user.full_name or str(call.from_user.id)
@@ -518,12 +533,12 @@ async def cb_reject_request(call: CallbackQuery, bot: Bot):
     base = getattr(call.message, "html_text", None) or call.message.text or ""
     await call.message.edit_text(
         base
-        + f"\n\n{DIV}\n❌ <b>Отклонено</b>  <code>{result['now']}</code>  — {_esc(boss_name)}",
+        + f"\n\n{DIV}\n❌ <b>Заявка отклонена</b>  <code>{result['now']}</code>  — {_esc(boss_name)}",
         parse_mode="HTML",
         reply_markup=settle_markup(
             getattr(call.message, "reply_markup", None),
             _request_callbacks(req_id),
-            outcome_label("❌ Отклонено", call.from_user),
+            outcome_label("❌ Отклонена", call.from_user),
             tail=webapp_keyboard("🌐 Ещё заявки — в WebApp"),
         ),
     )
@@ -533,13 +548,13 @@ async def cb_reject_request(call: CallbackQuery, bot: Bot):
 async def cb_return_to_draft(call: CallbackQuery, state: FSMContext):
     """Босс возвращает заявку на доработку — спрашиваем причину одним сообщением."""
     if not is_boss(call.from_user.id):
-        return await call.answer("Нет доступа", show_alert=True)
+        return await call.answer("Решение по заявке принимает руководитель", show_alert=True)
     req_id = int(call.data.split(":")[1])
     # Устаревшая карточка (заявку уже решили в WebApp): не заводим ввод
     # причины, который закончится «заявка уже обработана» после набора текста.
     req = await adb.get_shipment_request(req_id)
     if req and req.get("status") != "pending":
-        await call.answer("⚠️ Заявка уже обработана", show_alert=True)
+        await call.answer("⚠️ По этой заявке уже решили", show_alert=True)
         await _settle_stale_request(call, req_id)
         return
     await state.set_state(ReturnToDraft.waiting_for_reason)
@@ -551,7 +566,7 @@ async def cb_return_to_draft(call: CallbackQuery, state: FSMContext):
     # можно одобрить, пока босс печатает, что доработать.
     await drop_keyboard(call, status="✍️ Ждём причину доработки…")
     prompt = await call.message.answer(
-        "✍️ Укажите, что нужно доработать (одним сообщением) — менеджер увидит причину:",
+        "✍️ Напишите одним сообщением, что нужно доработать, — менеджер увидит причину:",
         reply_markup=prompt_keyboard(
             InlineKeyboardButton(text="✖️ Не возвращать", callback_data="req_draft_abort")
         ),
@@ -571,16 +586,16 @@ async def cb_return_to_draft_abort(call: CallbackQuery, state: FSMContext, bot: 
     возвращаются кнопки решения — если заявка всё ещё ждёт.
     """
     if not is_boss(call.from_user.id):
-        return await call.answer("Нет доступа", show_alert=True)
+        return await call.answer("Решение по заявке принимает руководитель", show_alert=True)
     data = await state.get_data()
     req_id = data.get("req_id")
     if await state.get_state() != ReturnToDraft.waiting_for_reason.state or not req_id:
         # Вопрос устарел: причину уже приняли или ввод сбросили.
-        await call.answer("Уже неактуально")
+        await call.answer("Это уже не актуально")
         await set_message_markup(bot, call.message.chat.id, call.message.message_id, None)
         return
     await state.clear()
-    await call.answer("Возврат отменён")
+    await call.answer("Возврат на доработку отменён")
     req = await adb.get_shipment_request(int(req_id))
     if req and req.get("status") == "pending":
         await set_message_markup(
@@ -600,10 +615,14 @@ async def process_return_to_draft_reason(message: Message, state: FSMContext, bo
     # и сообщением) — как в handlers/deposits.py.
     if not is_boss(message.from_user.id):
         await state.clear()
-        return await message.answer("⛔ Нет доступа — действие отменено.")
+        return await message.answer(
+            "⛔ Решать по заявкам может только руководитель — возврат на доработку отменён."
+        )
     reason = (message.text or "").strip()[:500]
     if len(reason) < 3:
-        return await message.answer("❌ Причина слишком короткая. Повторите.")
+        return await message.answer(
+            "❌ Причина слишком короткая — напишите хотя бы несколько слов."
+        )
     data = await state.get_data()
     await state.clear()
     req_id = data.get("req_id")
@@ -615,7 +634,7 @@ async def process_return_to_draft_reason(message: Message, state: FSMContext, bo
     if not result["ok"]:
         return await message.answer(f"⚠️ {result['error']}")
 
-    frozen_tail = "  🧊 <b>ЗАМОРОЖЕН</b>" if result.get("frozen") else ""
+    frozen_tail = "  🧊 <b>Заказ заморожен</b>" if result.get("frozen") else ""
     note = (
         f"↩️ Заявка #{req_id} возвращена на доработку"
         f" (попытка {result.get('rejection_count')}).{frozen_tail}"
@@ -637,7 +656,7 @@ async def process_return_to_draft_reason(message: Message, state: FSMContext, bo
 async def cmd_frozen(message: Message):
     """Список замороженных заказов с кнопкой разморозки (только admin)."""
     if not is_admin(message.from_user.id):
-        return await message.answer("⛔ Команда только для администратора.")
+        return await message.answer("⛔ Замороженные заказы видит только администратор.")
     orders = await adb.get_frozen_orders()
     if not orders:
         return await message.answer("🧊 Замороженных заказов нет.")
@@ -646,7 +665,8 @@ async def cmd_frozen(message: Message):
     for o in orders[:20]:
         agent = _esc(o.get("agent_name") or "—")
         lines.append(
-            f"• <b>#{o['id']}</b> · {agent} · отклонений: {int(o.get('rejection_count') or 0)}"
+            f"• <b>#{o['id']}</b> · {agent} · заявку отклоняли: "
+            f"{int(o.get('rejection_count') or 0)} раз(а)"
         )
         kb.button(text=f"🔓 Разморозить #{o['id']}", callback_data=f"unfreeze:{o['id']}")
     kb.adjust(1)
@@ -656,7 +676,7 @@ async def cmd_frozen(message: Message):
 @router.callback_query(F.data.startswith("unfreeze:"))
 async def cb_unfreeze_order(call: CallbackQuery, bot: Bot):
     if not is_admin(call.from_user.id):
-        return await call.answer("⛔ Нет доступа", show_alert=True)
+        return await call.answer("⛔ Разморозить заказ может только администратор", show_alert=True)
     order_id = int(call.data.split(":")[1])
     name = call.from_user.full_name or str(call.from_user.id)
     result = await adb.unfreeze_order(order_id, call.from_user.id, name)
@@ -682,8 +702,8 @@ async def cb_unfreeze_order(call: CallbackQuery, bot: Bot):
         try:
             await bot.send_message(
                 order["user_id"],
-                f"🔓 Заказ #{order_id} разморожен администратором — "
-                f"можно отредактировать и отправить заново.",
+                f"🔓 Заказ #{order_id} разморозил администратор — "
+                f"поправьте его и отправьте заявку заново.",
             )
         except Exception:
             pass

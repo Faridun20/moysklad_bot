@@ -351,7 +351,7 @@ def test_save_rejects_bad_input(isolated_db):
         base = {"currency": "USD", "uzs_per_usd": "12500", "prices": {item: "1"}, "user_id": BOSS}
         return _run(costing.save_container_costing(cid, **{**base, **kw}))
 
-    assert "Валюта" in save(currency="EUR")["error"]
+    assert "валюту закупки" in save(currency="EUR")["error"]
     assert "курс" in save(uzs_per_usd="")["error"]
     assert "CNY" in save(currency="CNY")["error"]
     assert "не из этого" in save(prices={foreign: "1"})["error"]

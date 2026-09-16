@@ -25,11 +25,14 @@ router = Router()
 @router.message(Command("ship"))
 async def cmd_ship(message: Message, bot: Bot):
     if not can_confirm_shipment(message.from_user.id):
-        return await message.answer("⛔ Отмечать отгрузку может босс/кладовщик/админ.")
+        return await message.answer(
+            "⛔ Отметить отгрузку может кладовщик, руководитель или администратор."
+        )
     parts = (message.text or "").strip().split()
     if len(parts) != 2 or not parts[1].isdigit():
         return await message.answer(
-            "🚚 Формат: <code>/ship НОМЕР_ЗАКАЗА</code>\nНапример: <code>/ship 142</code>",
+            "🚚 Напишите номер заказа: <code>/ship НОМЕР</code>\n"
+            "Например: <code>/ship 142</code>",
             parse_mode="HTML",
         )
     order_id = int(parts[1])
@@ -47,7 +50,7 @@ async def cmd_ship(message: Message, bot: Bot):
             # Порядок шагов виден кнопками: живая «Внести оплату» и под ней
             # неактивная (Bot API 10.3) отгрузка с причиной — как в
             # уведомлении об одобрении (services.notify.approved_order_keyboard).
-            pay = webapp_keyboard("💳 Внести оплату в WebApp")
+            pay = webapp_keyboard("💳 Внести оплату — в WebApp")
             rows = [
                 *(pay.inline_keyboard if pay else []),
                 [disabled_button("🚚 Отгрузка — после ввода оплаты")],
@@ -55,9 +58,11 @@ async def cmd_ship(message: Message, bot: Bot):
             return await message.answer(
                 f"⚠️ {res['error']}", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
             )
-        return await message.answer(f"⚠️ {res.get('error', 'не удалось отгрузить')}")
+        return await message.answer(
+            f"⚠️ {res.get('error', 'заказ не отгрузился — обновите экран и попробуйте снова')}"
+        )
 
-    await message.answer(f"🚚 Заказ #{order_id} отмечен <b>отгруженным</b>.", parse_mode="HTML")
+    await message.answer(f"🚚 Заказ #{order_id} <b>отгружен</b>.", parse_mode="HTML")
     creator = order.get("user_id") if order else None
     if creator and creator != message.from_user.id:
         try:

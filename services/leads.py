@@ -421,12 +421,12 @@ async def set_status(
     вовсе, а потерять сам факт отказа хуже, чем отказ без причины.
     """
     if status not in STATUSES:
-        return {"ok": False, "error": f"Статус: {' / '.join(STATUSES)}"}
+        return {"ok": False, "error": "Выберите статус: в работе, купил или не купил"}
     if reason and reason not in LOST_REASONS:
-        return {"ok": False, "error": f"Причина: {' / '.join(LOST_REASONS)}"}
+        return {"ok": False, "error": "Выберите причину из списка"}
     row = await adb_core.fetchrow("SELECT status FROM leads WHERE id = $1", lead_id)
     if not row:
-        return {"ok": False, "error": "Лид не найден"}
+        return {"ok": False, "error": "Обращение не найдено — обновите список"}
     same = row["status"] == status
     if same and not reason:
         return {"ok": True, "changed": False}
@@ -498,7 +498,7 @@ async def link_agent(
     Telegram-аккаунт, а в заказах — контрагент, и других общих полей у них нет.
     """
     if not await adb_core.fetchrow("SELECT id FROM leads WHERE id = $1", lead_id):
-        return {"ok": False, "error": "Лид не найден"}
+        return {"ok": False, "error": "Обращение не найдено — обновите список"}
     await adb_core.execute(
         "UPDATE leads SET agent_ms_id = $1, updated_at = $2 WHERE id = $3",
         (agent_ms_id or None), now_str(), lead_id,

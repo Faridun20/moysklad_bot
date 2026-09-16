@@ -152,11 +152,11 @@ def test_html_carries_positions_total_and_requisites(db):
 
     doc = _run(build_sales_invoice(_order(db)))
     html = invoice_pdf.build_sales_invoice_html(doc)
-    assert "СЧЁТ" in html
+    assert "СЧЁТ НА ОПЛАТУ" in html
     assert "FARID IMPEKS LLC" in html and "301234567" in html
     assert "ООО Ромашка" in html and "+998 90 123-45-67" in html
     assert "Болт М8" in html and "Гайка М8" in html
-    assert "1,001.00" in html          # итог цифрами
+    assert "1 001,00" in html          # итог цифрами, по-русски
     assert "одна тысяча один" in html  # он же прописью
     assert "Самовывоз со склада" in html
 

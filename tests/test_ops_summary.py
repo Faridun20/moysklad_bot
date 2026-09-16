@@ -87,7 +87,7 @@ def test_build_daily_ping_boss_lists_nonzero():
     assert txt is not None
     assert "Требует внимания" in txt
     assert "5" in txt  # 2 + 3
-    assert "Зависшие заявки" in txt and "Сдачи" in txt
+    assert "Заявки ждут решения" in txt and "Сдачи в кассу" in txt
     assert "Возвраты" not in txt  # 0 — не показываем
 
 

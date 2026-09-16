@@ -77,7 +77,10 @@ def build_pending_deposits_block(deposits: list[dict]) -> str | None:
     if not deposits:
         return None
     total_cents = sum(int(d.get("amount_cents") or 0) for d in deposits)
-    lines = [f"💵 <b>Сдачи на подтверждении: {len(deposits)}</b> (на {_fmt_cents(total_cents)} {_base_cur()})"]
+    lines = [
+        f"💵 <b>Сдачи в кассу ждут подтверждения: {len(deposits)}</b> "
+        f"(на {_fmt_cents(total_cents)} {_base_cur()})"
+    ]
     for d in deposits[:15]:
         lines.append(f"  • сдача #{d['id']} — {_fmt_cents(d.get('amount_cents'))} {_base_cur()}")
     if len(deposits) > 15:
@@ -88,7 +91,7 @@ def build_pending_deposits_block(deposits: list[dict]) -> str | None:
 def build_pending_returns_block(returns: list[dict]) -> str | None:
     if not returns:
         return None
-    lines = [f"↩️ <b>Возвраты на подтверждении: {len(returns)}</b>"]
+    lines = [f"↩️ <b>Возвраты ждут подтверждения: {len(returns)}</b>"]
     for r in returns[:15]:
         amt = _fmt_cents(r.get("total_amount_cents"))
         lines.append(f"  • возврат #{r['id']} · заказ #{r.get('order_id', '?')} — {amt} {_base_cur()}")
@@ -100,7 +103,7 @@ def build_pending_returns_block(returns: list[dict]) -> str | None:
 def build_overdue_undeposited_block(orders: list[dict], days: int) -> str | None:
     if not orders:
         return None
-    lines = [f"🚨 <b>Отгружено, деньги не сданы (>{days}д): {len(orders)}</b>"]
+    lines = [f"🚨 <b>Отгружено, деньги не сданы в кассу (>{days}д): {len(orders)}</b>"]
     for o in orders[:15]:
         agent = _esc(o.get("agent_name") or "—")
         owner = _esc(o.get("full_name") or "—")
@@ -182,6 +185,17 @@ async def collect_dead_stock(days: int) -> list[dict]:
     return diff_dead_stock(in_stock, sold_names)
 
 
+# Итог прогона ночной задачи по-русски: английских кодов на экране быть не
+# должно (CLAUDE.md, «Словарь интерфейса»). Ключи — значения cron_runs.status.
+_CRON_STATUS_RU: dict[str, str] = {
+    "success": "успех",
+    "failed": "сбой",
+    "error": "сбой",
+    "running": "ещё идёт",
+    "?": "неизвестно",
+}
+
+
 def build_cron_health_block(stale_crons: list[dict]) -> str | None:
     """Алерт о cron'ах, которые не отчитались success'ом дольше порога.
 
@@ -191,19 +205,20 @@ def build_cron_health_block(stale_crons: list[dict]) -> str | None:
     """
     if not stale_crons:
         return None
-    lines = [f"🛑 <b>Cron: не отчитались ({len(stale_crons)})</b>"]
+    lines = [f"🛑 <b>Ночные задачи не отчитались ({len(stale_crons)})</b>"]
     for c in stale_crons:
         task = _esc(c["task_name"])
         thr = c.get("threshold_hours", 0)
         if c.get("last_success_at") is None:
-            lines.append(f"  • <code>{task}</code> · ни разу не запускался (порог {thr}ч)")
+            lines.append(f"  • <code>{task}</code> · ни разу не запускалась (порог {thr}ч)")
             continue
         ago = c.get("hours_ago") or 0
         status = c.get("last_status") or "?"
         err = _esc(str(c.get("last_error") or "")[:120])
-        suffix = f" · err: {err}" if err else ""
+        suffix = f" · ошибка: {err}" if err else ""
         lines.append(
-            f"  • <code>{task}</code> · {ago}ч назад · status={status} (порог {thr}ч){suffix}"
+            f"  • <code>{task}</code> · {ago}ч назад · итог: {_CRON_STATUS_RU.get(status, status)} "
+            f"(порог {thr}ч){suffix}"
         )
     return "\n".join(lines)
 
@@ -217,7 +232,7 @@ def build_shipment_failed_block(rows: list[dict]) -> str | None:
     """
     if not rows:
         return None
-    lines = [f"📦 <b>Остаток не списан (нужна доделка): {len(rows)}</b>"]
+    lines = [f"📦 <b>Товар не списан со склада (нужна доделка): {len(rows)}</b>"]
     for r in rows[:10]:
         agent = _esc(r.get("agent_name") or "—")
         err = _esc(str(r.get("error") or "")[:120])
@@ -256,20 +271,20 @@ _PING_ROLE_SECTIONS: dict[str, list[str]] = {
 }
 
 _PING_SECTION_LABELS: dict[str, str] = {
-    "stale_orders": "⏳ Зависшие заявки",
-    "overdue_undeposited": "🚨 Деньги не сданы",
-    "deposits": "💵 Сдачи на подтверждении",
-    "returns": "↩️ Возвраты на подтверждении",
-    "low_stock": "📉 Низкий остаток",
-    "stale_crons": "🛑 Cron не отчитались",
-    "shipment_failed": "📦 Остаток не списан",
+    "stale_orders": "⏳ Заявки ждут решения",
+    "overdue_undeposited": "🚨 Деньги не сданы в кассу",
+    "deposits": "💵 Сдачи в кассу ждут подтверждения",
+    "returns": "↩️ Возвраты ждут подтверждения",
+    "low_stock": "📉 Мало на складе",
+    "stale_crons": "🛑 Ночные задачи не отчитались",
+    "shipment_failed": "📦 Товар не списан со склада",
 }
 
 _PING_HEADERS: dict[str, tuple[str, str]] = {
-    "admin": ("📲 <b>Операционная сводка</b>", "Детали, отчёты и аналитика — в WebApp."),
-    "boss": ("📲 <b>Операционная сводка</b>", "Детали, отчёты и аналитика — в WebApp."),
-    "bookkeeper": ("📲 <b>Сводка: финансы</b>", "Подтвердите в WebApp."),
-    "warehouse_keeper": ("📲 <b>Сводка: склад</b>", "Детали в WebApp."),
+    "admin": ("📲 <b>Сводка за день</b>", "Подробности, отчёты и аналитика — в WebApp."),
+    "boss": ("📲 <b>Сводка за день</b>", "Подробности, отчёты и аналитика — в WebApp."),
+    "bookkeeper": ("📲 <b>Сводка за день: деньги</b>", "Подтвердите в WebApp."),
+    "warehouse_keeper": ("📲 <b>Сводка за день: склад</b>", "Подробности — в WebApp."),
 }
 
 
@@ -301,7 +316,7 @@ def build_daily_ping(role: str, summary: dict) -> str | None:
             lines.append(f"  {_PING_SECTION_LABELS[k]}: {n}")
     if total == 0:
         return None
-    header, footer = _PING_HEADERS.get(role, ("📲 <b>Сводка</b>", "Детали в WebApp."))
+    header, footer = _PING_HEADERS.get(role, ("📲 <b>Сводка за день</b>", "Подробности — в WebApp."))
     return f"{header}\n\nТребует внимания: <b>{total}</b>\n" + "\n".join(lines) + f"\n\n{footer}"
 
 

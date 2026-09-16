@@ -49,7 +49,7 @@ def test_build_debts_xlsx_columns_and_source_label():
         },
     ]
     header, data = _read(xe.build_debts_xlsx(rows))
-    assert header == ("Источник", "№", "Контрагент", "Менеджер", "Срок оплаты", "Долг", "Валюта", "Просрочка")
+    assert header == ("Источник", "№", "Клиент", "Менеджер", "Срок оплаты", "Долг", "Валюта", "Просрочка")
     assert data[0][0] == "Заказ"
     assert data[1][0] == "Техника"
     assert data[1][4] == "—"  # без срока
@@ -64,7 +64,7 @@ def test_build_invoices_xlsx_columns():
         },
     ]
     header, data = _read(xe.build_invoices_xlsx(rows))
-    assert header == ("Номер", "Дата", "Тип", "Контрагент", "Сумма", "Валюта", "Статус")
+    assert header == ("Номер", "Дата", "Вид", "Клиент или поставщик", "Сумма", "Валюта", "Статус")
     assert data[0][0] == "IN-1"
     assert data[0][2] == "Приход"
 

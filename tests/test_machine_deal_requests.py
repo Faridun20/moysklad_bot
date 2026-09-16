@@ -366,7 +366,7 @@ def test_credit_requires_passport_and_valid_terms(isolated_db, monkeypatch, sent
     mid = _machine()
     client = _client(monkeypatch)
     no_passport = _deal(client, MGR, mid, buyer_passport="")
-    assert no_passport.status_code == 400 and "Паспорт" in no_passport.json()["detail"]
+    assert no_passport.status_code == 400 and "паспорт" in no_passport.json()["detail"]
     full_down = _deal(client, MGR, mid, down_payment="24 000")
     assert full_down.status_code == 400
     zero_down = _deal(client, MGR, mid, down_payment="0")
@@ -653,8 +653,8 @@ def test_bot_approve_turns_buttons_into_disabled_outcome(isolated_db, sent):
     buttons = _buttons(call.message.reply_markup)
     assert not any(b.callback_data and b.callback_data.startswith("mdr_") for b in buttons)
     outcome = [b for b in buttons if b.disabled is not None]
-    assert outcome and outcome[0].text.startswith("✅ Одобрено · Фаридун")
-    assert "Одобрено" in call.message.edited
+    assert outcome and outcome[0].text.startswith("✅ Одобрена · Фаридун")
+    assert "Заявка одобрена" in call.message.edited
     assert _rows(db, "SELECT status FROM machines WHERE id = ?", (mid,)) == [{"status": "sold"}]
 
 

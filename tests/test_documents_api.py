@@ -261,7 +261,7 @@ def test_legacy_form_fields_are_ignored(api):
 
 @pytest.mark.parametrize(
     "amount,msg",
-    [("0", "больше нуля"), ("abc", "нужно число"), ("1500,50", "тийинов"), ("NaN", "нужно число"),
+    [("0", "больше нуля"), ("abc", "введите число"), ("1500,50", "тийинов"), ("NaN", "введите число"),
      ("1e20", "слишком большая")],
 )
 def test_amount_in_sums_is_validated(api, amount, msg):
@@ -533,7 +533,7 @@ def test_old_documents_stay_listed_sent_and_printed(api, monkeypatch, tmp_path):
     ]
     bot.documents.clear()
     assert _post(client, "/api/docs/send", ids["mgr"], doc_id=docs[0]["id"]).json()["ok"] is True
-    assert bot.documents[0]["caption"] == "📄 Тилхат (ўзб.) — Старый tilxat_uz · 25 000.50 USD"
+    assert bot.documents[0]["caption"] == "📄 Тилхат (ўзб.) — Старый tilxat_uz · 25 000,50 USD"
 
     printed: list[int] = []
 

@@ -378,7 +378,7 @@ def test_print_failure_shows_the_reason_not_just_error(isolated_db, monkeypatch)
 
     text = " ".join(call.message.replies)
     assert "Очередь остановлена" in text
-    assert "Ошибка печати" in text
+    assert "Напечатать не вышло" in text
 
 
 def test_button_is_refused_for_roles_without_stock_access(isolated_db, monkeypatch):
@@ -398,7 +398,7 @@ def test_button_is_refused_for_roles_without_stock_access(isolated_db, monkeypat
     _run(h.cb_print(call))
 
     assert printed == [], "печать не должна запускаться без права"
-    assert call.alerts and "Нет доступа" in call.alerts[0][0]
+    assert call.alerts and "Печать доступна складу и руководству" in call.alerts[0][0]
 
 
 def test_unknown_invoice_says_so(isolated_db, monkeypatch):

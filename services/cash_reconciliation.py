@@ -93,7 +93,7 @@ def parse_counts(raw: Any, allowed_currencies: list[str] | tuple[str, ...]) -> d
     for row in items:
         cur = str(row.get("currency") or "").upper()
         if cur not in allowed:
-            raise CashCountError(f"Валюта {cur or '—'} не в ходу")
+            raise CashCountError(f"Валюта {cur or '—'} не используется — выберите другую")
         amount = row.get("amount")
         if amount is None or str(amount).strip() == "":
             continue
@@ -107,7 +107,7 @@ def parse_counts(raw: Any, allowed_currencies: list[str] | tuple[str, ...]) -> d
             else:
                 raise CashCountError(f"{cur}: сумма должна быть числом не меньше нуля")
         if cur in out:
-            raise CashCountError(f"Валюта {cur} указана дважды")
+            raise CashCountError(f"Валюта {cur} указана дважды — оставьте одну строку")
         out[cur] = int(cents)
     if not out:
         raise CashCountError("Введите пересчитанную сумму хотя бы по одной валюте")
@@ -164,8 +164,10 @@ def result_message(lines: list[dict]) -> str:
     parts = []
     for ln in mismatched:
         diff = int(ln["diff_cents"])
-        sign = "излишек" if diff > 0 else "недостача"
-        parts.append(f"{sign} {money.format_cents(abs(diff), sep=' ')} {ln['currency']}")
+        # Те же слова, что у подписи расхождения в форме (helpers.reconDiffLabel):
+        # человек видит «не хватает 50 USD» под полем и то же самое в итоге.
+        sign = "лишние" if diff > 0 else "не хватает"
+        parts.append(f"{sign} {money.format_cents(abs(diff))} {ln['currency']}")
     return "Записано с расхождением: " + " · ".join(parts)
 
 

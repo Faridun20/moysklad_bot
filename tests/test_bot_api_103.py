@@ -232,10 +232,10 @@ def test_approve_turns_card_buttons_into_disabled_outcome(db):
 
     markup = call.message.reply_markup
     assert db.get_shipment_request(req_id)["status"] == "approved"
-    assert _disabled_texts(markup)[0].startswith("✅ Одобрено · Фаридун ")
+    assert _disabled_texts(markup)[0].startswith("✅ Одобрена · Фаридун ")
     assert not any(cb.startswith("req_") for cb in _callbacks(markup))
     assert any(b.web_app for b in _buttons(markup))  # «что дальше» — WebApp
-    assert "Одобрено" in call.message.edited  # пометка текстом осталась
+    assert "Заявка одобрена" in call.message.edited  # пометка текстом осталась
 
 
 def test_manager_is_told_shipping_waits_for_payment_on_paid_order(db):
@@ -322,7 +322,7 @@ def test_return_to_draft_prompt_force_reply_and_abort_restores_card(db):
     edits = len(bot.markup_edits)
     again = _Call("req_draft_abort", message=prompt, bot=bot)
     _run(cb_return_to_draft_abort(again, state, bot))
-    assert again.alerts[0][0] == "Уже неактуально"
+    assert again.alerts[0][0] == "Это уже не актуально"
     assert bot.markup_edits[edits:] == [(55, 77, None)]
 
 
@@ -383,7 +383,7 @@ def test_payment_batch_card_settles_only_decided_payment(db):
     assert _run(db.get_payment(p1))["status"] == "confirmed"
     assert _callbacks(markup) == [f"pay_ok:{p2}", f"pay_no:{p2}"]
     [label] = _disabled_texts(markup)
-    assert label.startswith("✅ Принято 100 USD · Фаридун ")  # в пачке — с суммой
+    assert label.startswith("✅ Принят 100 USD · Фаридун ")  # в пачке — с суммой
 
 
 def test_stale_payment_card_is_settled(db):
@@ -421,7 +421,7 @@ def test_cash_payment_accept_button_becomes_disabled_with_reason(db):
     call = _Call(f"pay_ok:{pid}", message=_Message(markup=confirm_keyboard(pid), bot=bot))
     _run(confirm_pay(call, bot))
     assert _run(db.get_payment(pid))["status"] == "pending"
-    assert _disabled_texts(call.message.reply_markup) == ["💵 Принять — через сдачу в кассу"]
+    assert _disabled_texts(call.message.reply_markup) == ["💵 Наличные принимают сдачей в кассу"]
     assert _callbacks(call.message.reply_markup) == [f"pay_no:{pid}"]  # отклонить можно
 
 
@@ -441,7 +441,7 @@ def test_pay_prompt_cancel_button_settles_after_payment_and_stale_cancel_is_hone
 
     stale = _Call("pay_cancel", uid=MGR, message=_Message("вопрос", uid=MGR, bot=bot))
     _run(pay_cancel(stale, state))
-    assert stale.alerts[0][0] == "Уже неактуально"
+    assert stale.alerts[0][0] == "Это уже не актуально"
     assert stale.message.edited is None  # «отправка отменена» не пишем
 
 
@@ -463,13 +463,13 @@ def test_deposit_confirm_outcome_and_stale_card(db):
     bot = _Bot()
     call = _Call(f"dep_ok:{dep_id}", message=_Message(markup=_confirm_keyboard(dep_id), bot=bot))
     _run(cb_deposit_confirm(call, bot))
-    assert _disabled_texts(call.message.reply_markup)[0].startswith("✅ Подтверждено · Фаридун ")
+    assert _disabled_texts(call.message.reply_markup)[0].startswith("✅ Сдача подтверждена · Фаридун ")
     assert _callbacks(call.message.reply_markup) == ["menu"]
 
     # Вторая копия карточки (у другого подтверждающего) — уже решено.
     other = _Call(f"dep_ok:{dep_id}", message=_Message(markup=_confirm_keyboard(dep_id), bot=bot))
     _run(cb_deposit_confirm(other, bot))
-    assert _disabled_texts(other.message.reply_markup) == ["✅ Сдача уже подтверждена"]
+    assert _disabled_texts(other.message.reply_markup) == ["✅ Сдача в кассу уже подтверждена"]
 
 
 def test_deposit_reject_abort_restores_card(db):
@@ -556,7 +556,7 @@ def test_stale_cancel_abort_does_not_claim_abort(db):
 
     call = _Call("cancel_abort", message=_Message("вопрос"))
     _run(cb_cancel_abort(call, _state()))
-    assert call.alerts[0][0] == "Уже неактуально"
+    assert call.alerts[0][0] == "Это уже не актуально"
     assert call.message.edited is None
 
 
@@ -673,5 +673,5 @@ def test_ship_command_refusal_shows_blocked_step_disabled(db):
     assert text.startswith("⚠️")
     markup = kwargs["reply_markup"]
     assert _disabled_texts(markup) == ["🚚 Отгрузка — после ввода оплаты"]
-    assert [b.text for b in _buttons(markup) if b.web_app] == ["💳 Внести оплату в WebApp"]
+    assert [b.text for b in _buttons(markup) if b.web_app] == ["💳 Внести оплату — в WebApp"]
     assert _run(db.get_order(oid))["status"] == "approved"

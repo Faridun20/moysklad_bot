@@ -66,7 +66,7 @@ def test_payment_at_or_above_threshold_is_marked_not_dropped(isolated_db):
     его не дублирует свежим пунктом, но и не выбрасывает молча: финдинг #6
     (аудит) — событие может провалиться между мгновенной карточкой и
     дайджестом, если порог/курс сменился ПОСЛЕ создания. Показываем ВСЁ
-    ждущее, крупное — с пометкой «уже приходило»."""
+    ждущее, крупное — с пометкой «уже показывали»."""
     from services import boss_digest as bd
 
     db = isolated_db
@@ -77,8 +77,8 @@ def test_payment_at_or_above_threshold_is_marked_not_dropped(isolated_db):
     assert data["payments"]["count"] == 2
     small_line = next(line for line in data["payments"]["lines"] if "Мелкий" in line)
     big_line = next(line for line in data["payments"]["lines"] if "Крупный" in line)
-    assert "уже приходило" not in small_line
-    assert "уже приходило" in big_line
+    assert "уже показывали" not in small_line
+    assert "уже показывали" in big_line
     assert data["payments"]["waiting_total"] == 2
 
 
@@ -87,7 +87,7 @@ def test_threshold_change_after_creation_does_not_drop_pending_payment(isolated_
     pending, мгновенная карточка не уходила), владелец ПОНИЗИЛ порог до
     дайджеста — раньше платёж перефильтровывался ТЕКУЩИМ порогом, «выглядел»
     уже отправленным и пропадал из дайджеста НАСОВСЕМ (ни карточкой, ни
-    сводкой). Теперь он всё равно виден — с пометкой «уже приходило»."""
+    сводкой). Теперь он всё равно виден — с пометкой «уже показывали»."""
     from services import boss_digest as bd
 
     db = isolated_db

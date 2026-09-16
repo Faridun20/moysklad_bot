@@ -33,8 +33,8 @@ def test_credit_context_over_limit(isolated_db):
     order = asyncio.run(db.get_order(oid))
     items = asyncio.run(db.get_order_items(oid))
     ctx = asyncio.run(build_credit_context(order, items))
-    assert "Кредит клиента" in ctx
-    assert "ПРЕВЫШЕНИЕ" in ctx
+    assert "Долг клиента" in ctx
+    assert "Лимит долга превышен" in ctx
 
 
 def test_credit_context_under_limit(isolated_db):
@@ -45,7 +45,7 @@ def test_credit_context_under_limit(isolated_db):
     order = asyncio.run(db.get_order(oid))
     items = asyncio.run(db.get_order_items(oid))
     ctx = asyncio.run(build_credit_context(order, items))
-    assert "в пределах лимита" in ctx
+    assert "В пределах лимита" in ctx
 
 
 def test_credit_context_empty_for_paid(isolated_db):

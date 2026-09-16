@@ -162,7 +162,7 @@ def validate(kind: str, data: dict, *, allowed_currencies: list[str], default_cu
         if by_number and by_number in allowed_currencies:
             currency = by_number
     if currency not in allowed_currencies:
-        raise AccountError(f"Валюта {currency} не поддерживается", code="currency")
+        raise AccountError(f"Валюта {currency} не поддерживается — выберите другую", code="currency")
     fields["currency"] = currency
     fields["name"] = display_name(fields)
     return fields
@@ -493,10 +493,10 @@ async def update_account(actor: Actor, account_id: Any, data: dict, *, mode: str
     try:
         acc_id = int(account_id)
     except (TypeError, ValueError) as e:
-        raise AccountError("Карта или счёт не найдены", status=404) from e
+        raise AccountError("Карта или счёт не найдены — обновите список", status=404) from e
     current = await get_account(acc_id)
     if current is None or current["kind"] not in KINDS:
-        raise AccountError("Карта или счёт не найдены", status=404)
+        raise AccountError("Карта или счёт не найдены — обновите список", status=404)
     allowed, _base = _currencies()
     merged = {**{k: current.get(k) for k in ("holder", "bank", "note", "card_last4", "account_number",
                                              "company_tin", "mfo", "currency")}, **(data or {})}
@@ -548,10 +548,10 @@ async def set_archived(actor: Actor, account_id: Any, archived: bool, *, mode: s
     try:
         acc_id = int(account_id)
     except (TypeError, ValueError) as e:
-        raise AccountError("Карта или счёт не найдены", status=404) from e
+        raise AccountError("Карта или счёт не найдены — обновите список", status=404) from e
     current = await get_account(acc_id)
     if current is None or current["kind"] not in KINDS:
-        raise AccountError("Карта или счёт не найдены", status=404)
+        raise AccountError("Карта или счёт не найдены — обновите список", status=404)
     if current["archived"] == bool(archived):
         return {"ok": True, "account": current, "changed": False}
     now = _now()

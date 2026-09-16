@@ -107,7 +107,7 @@ def _card_keyboard(machine_id: int):
     Bot API принимает только с https-URL, иначе отвергает сообщение целиком.
     """
     kb = InlineKeyboardBuilder()
-    kb.button(text="🚜 Все машины", callback_data="mach_list")
+    kb.button(text="🚜 Вся техника", callback_data="mach_list")
     if WEBAPP_URL and WEBAPP_URL.startswith("https://"):
         from aiogram.types import WebAppInfo
 
@@ -124,7 +124,7 @@ async def _send_list(target: Message, user_id: int) -> None:
     rows = await machines.list_machines(role=role)
     if not rows:
         return await target.answer(
-            "🚜 Машин пока нет.\n\nЗавести — в WebApp: «Заказы → Техника».",
+            "🚜 Техники пока нет.\n\nЗавести — в WebApp: «Склад → Техника».",
             parse_mode="HTML",
         )
     kb = InlineKeyboardBuilder()
@@ -133,21 +133,21 @@ async def _send_list(target: Message, user_id: int) -> None:
         kb.button(text=f"{status} {m['name']} · {m['vin']}"[:60], callback_data=f"mach:{m['id']}")
     kb.adjust(1)
     await target.answer(
-        f"🚜 <b>Машины ({len(rows)}):</b>", parse_mode="HTML", reply_markup=kb.as_markup()
+        f"🚜 <b>Техника ({len(rows)}):</b>", parse_mode="HTML", reply_markup=kb.as_markup()
     )
 
 
 @router.message(Command("machines"))
 async def cmd_machines(message: Message):
     if not can_create_orders(message.from_user.id):
-        return await message.answer("⛔ Нет доступа.")
+        return await message.answer("⛔ Технику смотрит менеджер и выше.")
     await _send_list(message, message.from_user.id)
 
 
 @router.callback_query(F.data == "mach_list")
 async def cb_machines_list(call: CallbackQuery):
     if not can_create_orders(call.from_user.id):
-        return await call.answer("Нет доступа", show_alert=True)
+        return await call.answer("Технику смотрит менеджер и выше", show_alert=True)
     await call.answer()
     await _send_list(call.message, call.from_user.id)
 
@@ -156,7 +156,7 @@ async def _show_card(target: Message, machine_id: int, user_id: int) -> None:
     role = cached_role(user_id)
     machine = await machines.get_machine(machine_id, role=role)
     if not machine:
-        return await target.answer("❌ Машина не найдена.")
+        return await target.answer("❌ Машины с таким номером нет — откройте список: /machines")
     photos = await machines.list_photos(machine_id)
     await target.answer(
         format_machine(machine, photos=len(photos)),
@@ -168,7 +168,7 @@ async def _show_card(target: Message, machine_id: int, user_id: int) -> None:
 @router.callback_query(F.data.startswith("mach:"))
 async def cb_machine_card(call: CallbackQuery):
     if not can_create_orders(call.from_user.id):
-        return await call.answer("Нет доступа", show_alert=True)
+        return await call.answer("Технику смотрит менеджер и выше", show_alert=True)
     await call.answer()
     await _show_card(call.message, int(call.data.split(":")[1]), call.from_user.id)
 
@@ -188,12 +188,12 @@ async def cmd_hours(message: Message):
     показание меньше предыдущего почти всегда опечатка.
     """
     if not can_create_orders(message.from_user.id):
-        return await message.answer("⛔ Нет доступа.")
+        return await message.answer("⛔ Вносить моточасы может менеджер и выше.")
     parts = (message.text or "").split()
     if len(parts) < 3 or not parts[1].isdigit() or not parts[2].replace(" ", "").isdigit():
         return await message.answer(
-            "⏱ Формат: <code>/hours 12 15200</code>\n"
-            "Номер машины — из <code>/machines</code>.",
+            "⏱ Напишите номер машины и показание счётчика: <code>/hours 12 15200</code>\n"
+            "Номер машины возьмите в списке: <code>/machines</code>.",
             parse_mode="HTML",
         )
     machine_id, hours = int(parts[1]), int(parts[2])
@@ -212,7 +212,7 @@ async def cmd_hours(message: Message):
             kb.adjust(1)
             return await message.answer(
                 f"⚠️ {esc(res['error'])}\n\n"
-                f"Если счётчик меняли — подтвердите, запись уйдёт в аудит.",
+                f"Если счётчик меняли — подтвердите, запись попадёт в журнал действий.",
                 parse_mode="HTML",
                 reply_markup=kb.as_markup(),
             )
@@ -225,7 +225,9 @@ async def cmd_hours(message: Message):
 async def cb_force_hours(call: CallbackQuery):
     """Подтверждение отката моточасов (замена счётчика) — только босс."""
     if not is_boss(call.from_user.id):
-        return await call.answer("⛔ Только руководитель", show_alert=True)
+        return await call.answer(
+            "⛔ Замену счётчика подтверждает только руководитель", show_alert=True
+        )
     _, machine_id, hours = call.data.split(":")
     res = await machines.add_hours(
         int(machine_id), int(hours),
@@ -235,8 +237,8 @@ async def cb_force_hours(call: CallbackQuery):
     )
     if not res["ok"]:
         return await call.answer(f"⚠️ {res['error']}", show_alert=True)
-    await call.answer("✅ Записано")
-    await finish_card(call, f"⏱ Моточасы: {hours} (замена счётчика)")
+    await call.answer("✅ Моточасы записаны")
+    await finish_card(call, f"⏱ Моточасы: {hours} (счётчик заменён)")
 
 
 # ─── Рассрочки ───────────────────────────────────────────────────────────────
@@ -249,7 +251,7 @@ async def cmd_open_credits(message: Message, bot: Bot):
     Закрывают рассрочку в WebApp: там видно сумму, срок и всю карточку машины.
     """
     if not is_boss(message.from_user.id):
-        return await message.answer("⛔ Нет доступа.")
+        return await message.answer("⛔ Рассрочки по технике смотрит руководитель.")
     deals = await machines.get_open_credit_deals(role=cached_role(message.from_user.id))
     pending = await mdr.list_requests(statuses=("pending",))
     if not deals and not pending:
@@ -258,7 +260,7 @@ async def cmd_open_credits(message: Message, bot: Bot):
     if pending:
         # Заявки на одобрении — счётчиком и списком: решают их кнопками на
         # карточке-уведомлении или в WebApp, дублировать карточки здесь незачем.
-        lines += [f"⏳ <b>На одобрении: {len(pending)}</b>", ""]
+        lines += [f"⏳ <b>Ждут одобрения: {len(pending)}</b>", ""]
         for r in pending:
             lines.append(
                 f"• #{r['id']} · {esc(mdr.KIND_LABELS.get(r['kind'], r['kind']))} · "
@@ -276,7 +278,7 @@ async def cmd_open_credits(message: Message, bot: Bot):
             f"{esc(d['buyer_name'])} · до {esc(str(d.get('due_date') or '—'))}"
         )
     lines.append("")
-    lines.append("<i>Закрыть рассрочку — в WebApp: «Заказы → Техника».</i>")
+    lines.append("<i>Закрыть рассрочку — в WebApp: «Склад → Техника».</i>")
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=webapp_keyboard())
 
 
@@ -297,7 +299,7 @@ _REQUEST_SETTLED = {
     "approved": "✅ Заявка уже одобрена",
     "rejected": "❌ Заявка уже отклонена",
     "rework": "↩️ Заявка уже на доработке",
-    "cancelled": "✖️ Заявка отозвана",
+    "cancelled": "✖️ Заявку отозвали",
 }
 
 
@@ -329,10 +331,10 @@ def _actor(call_or_message) -> tuple[int, str, str]:
 
 async def _decide(call: CallbackQuery, op: str) -> None:
     if not can_create_orders(call.from_user.id):
-        return await call.answer("Нет доступа", show_alert=True)
+        return await call.answer("Решать по заявкам может менеджер и выше", show_alert=True)
     request_id = _request_id(call)
     if request_id is None:
-        return await call.answer("Некорректный запрос", show_alert=True)
+        return await call.answer("Кнопка устарела: номер заявки не читается", show_alert=True)
     uid, name, role = _actor(call)
     fn = mdr.approve if op == "approve" else mdr.reject
     res = await fn(request_id, actor_id=uid, actor_name=name, actor_role=role)
@@ -341,10 +343,13 @@ async def _decide(call: CallbackQuery, op: str) -> None:
         await _settle_stale_machine_request(call, request_id)
         return
     if op == "approve":
-        verb = "✅ Одобрено"
-        note = "✅ <b>Одобрено</b>" + (" — руководителя нет, решили вы" if res.get("self_approved") else "")
+        verb = "✅ Одобрена"
+        note = "✅ <b>Заявка одобрена</b>" + (
+            " — руководителя в системе нет, решили вы" if res.get("self_approved") else ""
+        )
     else:
-        verb, note = "❌ Отклонено", "❌ <b>Отклонено</b> — машина в прежнем статусе"
+        verb = "❌ Отклонена"
+        note = "❌ <b>Заявка отклонена</b> — статус машины не изменился"
     await call.answer(verb)
     base = getattr(call.message, "html_text", None) or getattr(call.message, "text", "") or ""
     markup = settle_markup(
@@ -377,13 +382,13 @@ async def cb_machine_request_reject(call: CallbackQuery):
 async def cb_machine_request_rework(call: CallbackQuery, state: FSMContext):
     """«На доработку» — причину спрашиваем одним сообщением (force_reply)."""
     if not can_create_orders(call.from_user.id):
-        return await call.answer("Нет доступа", show_alert=True)
+        return await call.answer("Решать по заявкам может менеджер и выше", show_alert=True)
     request_id = _request_id(call)
     if request_id is None:
-        return await call.answer("Некорректный запрос", show_alert=True)
+        return await call.answer("Кнопка устарела: номер заявки не читается", show_alert=True)
     # Устаревшая карточка: не заводим ввод причины, который кончится отказом.
     if await _settle_stale_machine_request(call, request_id):
-        return await call.answer("⚠️ Заявка уже обработана", show_alert=True)
+        return await call.answer("⚠️ По этой заявке уже решили", show_alert=True)
     uid, _name, role = _actor(call)
     rights = await mdr.decision_rights(uid, role)
     if not rights["can_decide"]:
@@ -395,7 +400,7 @@ async def cb_machine_request_rework(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await drop_keyboard(call, status="✍️ Ждём причину доработки…")
     prompt = await call.message.answer(
-        "✍️ Что доработать в заявке? Одним сообщением — менеджер увидит причину:",
+        "✍️ Напишите одним сообщением, что доработать в заявке, — менеджер увидит причину:",
         reply_markup=prompt_keyboard(
             InlineKeyboardButton(text="✖️ Не возвращать", callback_data="mdr_rw_abort")
         ),
@@ -410,11 +415,11 @@ async def cb_machine_request_rework_abort(call: CallbackQuery, state: FSMContext
     data = await state.get_data()
     request_id = data.get("mdr_id")
     if await state.get_state() != MachineRework.waiting_for_reason.state or not request_id:
-        await call.answer("Уже неактуально")
+        await call.answer("Это уже не актуально")
         await set_message_markup(bot, call.message.chat.id, call.message.message_id, None)
         return
     await state.clear()
-    await call.answer("Возврат отменён")
+    await call.answer("Возврат на доработку отменён")
     req = await mdr.get_request(int(request_id))
     if req and req.get("status") == "pending":
         await set_message_markup(
@@ -432,10 +437,14 @@ async def cb_machine_request_rework_abort(call: CallbackQuery, state: FSMContext
 async def process_machine_request_rework(message: Message, state: FSMContext, bot: Bot):
     if not can_create_orders(message.from_user.id):
         await state.clear()
-        return await message.answer("⛔ Нет доступа — действие отменено.")
+        return await message.answer(
+            "⛔ Решать по заявкам вы больше не можете — возврат на доработку отменён."
+        )
     reason = (message.text or "").strip()[:500]
     if len(reason) < 3:
-        return await message.answer("❌ Причина слишком короткая. Повторите.")
+        return await message.answer(
+            "❌ Причина слишком короткая — напишите хотя бы несколько слов."
+        )
     data = await state.get_data()
     await state.clear()
     request_id = int(data.get("mdr_id") or 0)

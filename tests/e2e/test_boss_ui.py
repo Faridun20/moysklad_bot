@@ -237,7 +237,7 @@ def test_decisions_lists_every_kind_and_each_decision_works(open_app, e2e):
     ret = boss.locator(f'.debt-card[data-ret="{seeded["return_id"]}"]')
     assert ret.locator(".ret-goods").count() == 0          # приёмка — работа склада
     ret.locator(".ret-confirm").click()
-    boss.wait_for_selector("text=Решений не ждёт")
+    boss.wait_for_selector("text=Ничего не ждёт решения")
     assert e2e.rows("SELECT status FROM returns WHERE id = ?", (seeded["return_id"],))[0]["status"] == "confirmed"
     boss.wait_for_function("() => document.querySelector('#bottom-nav [data-decisions-badge]')?.hidden === true")
     assert "Возврат подтверждён" in toast_text(boss)

@@ -44,27 +44,29 @@ class CancelFlow(StatesGroup):
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     if not _can_cancel(message.from_user.id):
-        return await message.answer("⛔ Отменять заказы может босс/админ.")
+        return await message.answer("⛔ Отменить заказ может руководитель или администратор.")
     parts = (message.text or "").strip().split()
     if len(parts) != 2 or not parts[1].isdigit():
         return await message.answer(
-            "🚫 Формат: <code>/cancel НОМЕР_ЗАКАЗА</code>\nНапример: <code>/cancel 142</code>",
+            "🚫 Напишите номер заказа: <code>/cancel НОМЕР</code>\n"
+            "Например: <code>/cancel 142</code>",
             parse_mode="HTML",
         )
     order_id = int(parts[1])
     order = await adb.get_order(order_id)
     if not order:
-        return await message.answer("❌ Заказ не найден.")
+        return await message.answer("❌ Заказа с таким номером нет — проверьте номер.")
     if order.get("status") != "approved":
         return await message.answer(
-            "⚠️ Отмена доступна только для одобренных (approved) заказов.\n"
-            "Отгруженные оформляйте через возврат: <code>/return</code>.",
+            "⚠️ Отменить можно только одобренный заказ.\n"
+            "Отгруженный оформляйте возвратом — в WebApp: заказ → «Оформить возврат».",
             parse_mode="HTML",
         )
     await state.clear()
     await state.set_state(CancelFlow.waiting_reason)
     prompt = await message.answer(
-        f"{DIV}\n🚫 <b>Отмена заказа #{order_id}</b>\n\nУкажите причину отмены (одним сообщением):",
+        f"{DIV}\n🚫 <b>Отмена заказа #{order_id}</b>\n\n"
+        "Напишите одним сообщением, почему отменяете:",
         parse_mode="HTML",
         reply_markup=_abort_keyboard(),
     )
@@ -81,7 +83,7 @@ async def cb_cancel_abort(call: CallbackQuery, state: FSMContext):
     if await state.get_state() != CancelFlow.waiting_reason.state:
         # Кнопка со старого вопроса (заказ уже отменён или ввод сброшен):
         # «отмена прервана» было бы неправдой.
-        await call.answer("Уже неактуально")
+        await call.answer("Это уже не актуально")
         try:
             await call.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -100,11 +102,15 @@ async def process_cancel_reason(message: Message, state: FSMContext, bot: Bot):
     # Round 6 (L_R1): повторный role-check после FSM-перехода.
     if not _can_cancel(message.from_user.id):
         await state.clear()
-        return await message.answer("⛔ Нет доступа — отмена сброшена.")
+        return await message.answer(
+            "⛔ Отменять заказы вы больше не можете — отмена прервана."
+        )
     # Round 6 (L_R8): жёсткий cap на reason.
     reason = (message.text or "").strip()[:500]
     if len(reason) < 3:
-        return await message.answer("❌ Причина слишком короткая. Повторите.")
+        return await message.answer(
+            "❌ Причина слишком короткая — напишите хотя бы несколько слов."
+        )
     data = await state.get_data()
     await state.clear()
     order_id = data.get("order_id")
@@ -118,7 +124,9 @@ async def process_cancel_reason(message: Message, state: FSMContext, bot: Bot):
 
     res = await cancel_order_full(order_id, message.from_user.id, name, reason)
     if not res.get("ok"):
-        return await message.answer(f"⚠️ {res.get('error', 'не удалось отменить')}")
+        return await message.answer(
+            f"⚠️ {res.get('error', 'заказ не отменился — обновите экран и попробуйте снова')}"
+        )
 
     note = f"🚫 Заказ #{order_id} отменён.\nПричина: {esc(reason)}"
     if not await finish_message(
@@ -131,7 +139,7 @@ async def process_cancel_reason(message: Message, state: FSMContext, bot: Bot):
         try:
             await bot.send_message(
                 creator,
-                f"🚫 Ваш заказ #{order_id} отменён боссом.\nПричина: {esc(reason)}",
+                f"🚫 Ваш заказ #{order_id} отменил руководитель.\nПричина: {esc(reason)}",
                 parse_mode="HTML",
             )
         except Exception as e:

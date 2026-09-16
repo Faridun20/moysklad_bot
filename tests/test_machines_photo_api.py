@@ -194,7 +194,7 @@ def test_stale_file_id_is_404_not_500(isolated_db, monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         r = _post(client, "/api/machines/photo", 2, machine_id=mid, photo_id=pid)
     assert r.status_code == 404
-    assert "недоступно" in r.json()["detail"]
+    assert "не открылось" in r.json()["detail"]
 
 
 def test_token_never_reaches_logs(isolated_db, monkeypatch, caplog):

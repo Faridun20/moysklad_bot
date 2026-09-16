@@ -94,7 +94,7 @@ def test_manual_deposit_allocation_cannot_exceed_claimable(isolated_db):
     assert _run(db.mark_order_paid(oid, 1, "Manager", amount=60.0))[0]
 
     res = _run(db.create_cash_deposit(1, 50.0, allocations=[(oid, 50.0)]))
-    assert res["ok"] is False and "40.00" in res["error"]
+    assert res["ok"] is False and "40,00" in res["error"]
     assert _run(db.get_manager_cash_deposits(1)) == []
 
     assert _run(db.create_cash_deposit(1, 40.0, allocations=[(oid, 40.0)]))["ok"]

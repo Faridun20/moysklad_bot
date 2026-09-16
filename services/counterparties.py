@@ -98,9 +98,9 @@ async def create(
     """
     clean = normalize_name(name)
     if not clean:
-        return {"ok": False, "error": "Название контрагента обязательно"}
+        return {"ok": False, "error": "Укажите название клиента или поставщика"}
     if cp_type not in ("customer", "supplier"):
-        return {"ok": False, "error": f"Неизвестный тип контрагента: {cp_type}"}
+        return {"ok": False, "error": "Выберите, кто это: клиент или поставщик"}
 
     async with adb_core.transaction() as txn:
         # Проверка тёзки внутри транзакции: карточку заводят кнопкой, а кнопку

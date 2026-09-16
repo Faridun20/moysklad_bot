@@ -94,7 +94,7 @@ def _parse_xlsx(content: bytes) -> list[list[Any]]:
     try:
         wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
     except Exception as e:
-        raise CatalogImportError(f"Не удалось прочитать .xlsx: {e}") from e
+        raise CatalogImportError("Не удалось прочитать файл Excel — сохраните его заново и попробуйте ещё раз") from e
     ws = wb.worksheets[0]
     return [list(row) for row in ws.iter_rows(values_only=True)]
 
@@ -103,7 +103,7 @@ def _parse_csv(content: bytes) -> list[list[Any]]:
     try:
         text = content.decode("utf-8-sig")
     except UnicodeDecodeError as e:
-        raise CatalogImportError(f"Файл не в UTF-8: {e}") from e
+        raise CatalogImportError("Файл в непонятной кодировке — сохраните его как CSV в UTF-8 или как .xlsx") from e
     first_line = text.splitlines()[0] if text.splitlines() else ""
     # Excel в RU-локали сохраняет CSV с «;» — выбираем разделитель по первой
     # строке, иначе «Название;Единица;…» превращается в одну колонку.
@@ -149,7 +149,7 @@ def validate_rows(raw_rows: list[list[Any]]) -> list[ImportRow]:
         name = " ".join(str(name_raw or "").split())[:255]
         row = ImportRow(line=i, name=name)
         if not name:
-            row.error = "Название обязательно"
+            row.error = "Укажите название товара"
             out.append(row)
             continue
 
@@ -173,7 +173,7 @@ def validate_rows(raw_rows: list[list[Any]]) -> list[ImportRow]:
         if stock_raw not in (None, ""):
             parsed_stock = _parse_qty(stock_raw)
             if parsed_stock is None or parsed_stock < 0:
-                row.error = f"Остаток «{stock_raw}» — должен быть неотрицательным числом"
+                row.error = f"Остаток «{stock_raw}» — введите число не меньше нуля"
                 out.append(row)
                 continue
             row.stock = parsed_stock
@@ -296,7 +296,7 @@ async def commit_import(
         }
     valid = [r for r in rows if r.name]
     if not valid:
-        return {"ok": False, "error": "Файл пуст", "errors": []}
+        return {"ok": False, "error": "Файл пустой — добавьте строки и загрузите снова", "errors": []}
 
     cur_code = (currency or BASE_CURRENCY or "USD").upper()
     wh_id = warehouse_id if warehouse_id is not None else await warehouse.default_warehouse_id()

@@ -116,9 +116,9 @@ def _qty(raw: Any, *, field: str = "количество") -> float:
     try:
         value = float(raw)
     except (TypeError, ValueError):
-        raise InventoryError("bad_quantity", f"Некорректное {field}: {raw!r}")
+        raise InventoryError("bad_quantity", f"Введите {field} числом, например 2 или 1,5")
     if value != value or value in (float("inf"), float("-inf")):
-        raise InventoryError("bad_quantity", f"Некорректное {field}: {raw!r}")
+        raise InventoryError("bad_quantity", f"Введите {field} числом, например 2 или 1,5")
     return value
 
 
@@ -167,7 +167,7 @@ async def create_writeoff_in(
     вызывающий не должен иметь возможности закоммитить «не ок» словарём.
     """
     if kind not in KINDS:
-        raise InventoryError("bad_kind", f"Неизвестный вид: {kind}")
+        raise InventoryError("bad_kind", "Неизвестный вид записи — обновите приложение")
     text = clean_reason(reason)
     positions = [
         {
@@ -275,23 +275,23 @@ async def void_writeoff(writeoff_id: int, *, user_id: int, is_boss: bool) -> dic
             int(writeoff_id),
         )
         if row is None:
-            return {"ok": False, "code": "not_found", "reason": "Запись не найдена"}
+            return {"ok": False, "code": "not_found", "reason": "Списание не найдено — обновите список"}
         if row["cancelled_at"]:
-            return {"ok": False, "code": "already_cancelled", "reason": "Запись уже сторнирована"}
+            return {"ok": False, "code": "already_cancelled", "reason": "Это списание уже отменено"}
         if not is_boss:
             if row["created_by"] is None or int(row["created_by"]) != int(user_id):
                 return {
                     "ok": False,
                     "code": "not_owner",
-                    "reason": "Сторнировать чужое списание может только руководитель",
+                    "reason": "Отменить чужое списание может только руководитель",
                 }
             if str(row["created_at"] or "") < _stale_cutoff():
                 return {
                     "ok": False,
                     "code": "window_closed",
                     "reason": (
-                        f"Сторнировать списание можно в течение {VOID_WINDOW_HOURS} часов. "
-                        "Позже — через руководителя."
+                        f"Отменить своё списание можно в течение {VOID_WINDOW_HOURS} часов после записи. "
+                        "Позже это делает руководитель."
                     ),
                 }
         try:
@@ -432,11 +432,11 @@ async def _open_count(txn, count_id: int) -> dict:
         int(count_id),
     )
     if row is None:
-        raise InventoryError("not_found", "Пересчёт не найден")
+        raise InventoryError("not_found", "Пересчёт не найден — обновите список")
     if row["status"] != "open":
         raise InventoryError(
             "count_closed",
-            "Пересчёт уже проведён или отменён — откройте новый",
+            "Этот пересчёт уже оформлен или отменён — откройте новый",
         )
     return row
 
@@ -449,17 +449,17 @@ async def set_count_line(count_id: int, product_id: int, counted_qty: Any) -> di
     """
     qty = _qty(counted_qty, field="посчитанное количество")
     if qty < 0:
-        raise InventoryError("bad_quantity", "Посчитанное количество не бывает отрицательным")
+        raise InventoryError("bad_quantity", "Посчитанное количество не может быть меньше нуля — введите 0 или больше")
     try:
         pid = int(product_id)
     except (TypeError, ValueError):
-        raise InventoryError("bad_product_id", "Не выбран товар")
+        raise InventoryError("bad_product_id", "Выберите товар")
 
     async with adb_core.transaction() as txn:
         head = await _open_count(txn, count_id)
         product = await txn.fetchrow("SELECT id, name, unit FROM products WHERE id = $1", pid)
         if product is None:
-            raise InventoryError("unknown_product", f"Товар #{pid} не найден")
+            raise InventoryError("unknown_product", f"Товар #{pid} не найден в каталоге — выберите его заново")
         total = await txn.fetchval(
             "SELECT COUNT(*) FROM stock_count_lines WHERE count_id = $1", int(count_id)
         )
@@ -651,7 +651,7 @@ async def apply_count(
             wid,
         )
         if not rows:
-            raise InventoryError("empty_count", "В пересчёте нет ни одной позиции")
+            raise InventoryError("empty_count", "В пересчёте нет ни одной позиции — впишите посчитанное количество хотя бы по одному товару")
 
         short: list[dict] = []
         surplus: list[dict] = []
@@ -700,7 +700,7 @@ async def apply_count(
             int(count_id),
         )
         if not closed:
-            raise InventoryError("count_closed", "Пересчёт уже проведён")
+            raise InventoryError("count_closed", "Этот пересчёт уже оформлен")
         await _db.idem_store_in(txn, idem_key, result)
     logger.info(
         "Пересчёт #%s проведён: списано позиций %d, оприходовано %d",

@@ -53,26 +53,36 @@ def format_cents(
     cents: int,
     *,
     decimals: int = 0,
-    sep: str = ",",
+    sep: str = " ",
+    dec_sep: str = ",",
     grouping: bool = True,
     trim: bool = False,
 ) -> str:
-    """Копейки → строка для дисплея.
+    """Копейки → строка для дисплея. По умолчанию — РУССКИЙ вид: «1 092,00».
 
     decimals — знаков после запятой; grouping — разделять тысячи;
-    sep — символ разделителя тысяч (',' как в Python по умолчанию,
-    ' ' для русского стиля); trim — срезать хвостовые нули дробной части.
+    sep — разделитель тысяч (по умолчанию неразрывный пробел не берём:
+    обычный пробел переживает Telegram, PDF и docx одинаково);
+    dec_sep — разделитель дробной части (','); trim — срезать хвостовые
+    нули дробной части («1 500,50» → «1 500,5», «1 500,00» → «1 500»).
+
+    Английский вид получается явно: `sep=",", dec_sep="."`.
+
+    Порядок важен: Python форматирует как «1,092.00», и слепая замена
+    ',' → ' ' с '.' → ',' по одной строке перепутала бы разделители.
+    Поэтому строка сначала разбирается на целую и дробную часть, и каждая
+    склеивается своим разделителем.
 
     Округление — стандартное для Python-формата (half-even), чтобы
     совпадать с историческим format_price (f"{x/100:,.0f}")."""
     major = from_cents(cents)
     spec = ("," if grouping else "") + f".{decimals}f"
-    s = format(major, spec)
-    if grouping and sep != ",":
-        s = s.replace(",", sep)
-    if trim and decimals > 0:
-        s = s.rstrip("0").rstrip(".")
-    return s
+    whole, _, frac = format(major, spec).partition(".")
+    if grouping:
+        whole = whole.replace(",", sep)
+    if trim:
+        frac = frac.rstrip("0")
+    return whole + (dec_sep + frac if frac else "")
 
 
 def parse_amount(text: str | None) -> int | None:

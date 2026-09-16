@@ -38,10 +38,10 @@ from utils.helpers import local_now
 AGING_BUCKETS = ("overdue_90", "overdue_60", "overdue_30", "overdue_1", "not_due")
 
 AGING_LABELS = {
-    "overdue_90": "Просрочено >90 дней",
-    "overdue_60": "Просрочено 60—90",
-    "overdue_30": "Просрочено 30—60",
-    "overdue_1": "Просрочено до 30",
+    "overdue_90": "Просрочено больше 90 дней",
+    "overdue_60": "Просрочено на 60–90 дней",
+    "overdue_30": "Просрочено на 30–60 дней",
+    "overdue_1": "Просрочено меньше 30 дней",
     "not_due": "Срок не наступил",
 }
 

@@ -66,8 +66,8 @@ def test_lead_gets_counterparty_created_by_button(open_app, e2e):
     mgr.click(f'[data-lead="{lead_id}"]')
     mgr.click("#lead-agent")
     mgr.wait_for_selector("#ms-f-search")
-    mgr.click('.c-overlay button:has-text("Завести нового контрагента")')  # confirmDialog → «да»
-    mgr.wait_for_selector(".toast:has-text('уже был')")
+    mgr.click('.c-overlay button:has-text("Завести нового клиента")')  # confirmDialog → «да»
+    mgr.wait_for_selector(".toast:has-text('уже есть')")
     assert e2e.rows("SELECT COUNT(*) AS n FROM counterparties")[0]["n"] == 1, "тёзку не завели"
     cp = e2e.rows("SELECT id FROM counterparties")[0]["id"]
     assert e2e.rows("SELECT agent_ms_id FROM leads WHERE id = ?", (lead_id,))[0]["agent_ms_id"] == str(cp)
@@ -255,7 +255,7 @@ def test_bookkeeper_confirms_deposit_but_has_no_cashbox(open_app, e2e):
     # Бухгалтер не подтверждает оплаты по заказам — только сдачи и возвраты.
     assert book.locator(".pay-confirm").count() == 0
     book.click(".dep-confirm")
-    book.wait_for_selector(".toast:has-text('Сдача подтверждена')")
+    book.wait_for_selector(".toast:has-text('Сдача в кассу подтверждена')")
     assert e2e.rows("SELECT status, confirmed_by FROM cash_deposits")[0] == {
         "status": "confirmed", "confirmed_by": e2e.ids["book"],
     }

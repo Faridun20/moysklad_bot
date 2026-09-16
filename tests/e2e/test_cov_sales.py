@@ -386,7 +386,7 @@ def test_manager_builds_uzs_credit_order_step_by_step(open_app, e2e):
     mgr.click('[data-pay="credit"]')
     mgr.wait_for_selector("#due-date-wrap:not(.hidden)")
     mgr.click("#btn-submit")
-    _wait_alert(mgr, "Укажите дату возврата")
+    _wait_alert(mgr, "до какого числа клиент рассчитается")
     assert e2e.rows("SELECT COUNT(*) AS n FROM shipment_requests")[0]["n"] == 0
     # Передумал: «Оплачено сразу» прячет дату, «В долг» — снова показывает.
     mgr.click('[data-pay="paid"]')
@@ -624,7 +624,7 @@ def test_reopened_draft_item_removal_reaches_server(open_app, e2e):
     # строка остаётся: экран не должен расходиться с заявкой молча.
     e2e.exec("DELETE FROM order_items WHERE order_id = ?", (oid,))
     mgr.click('.editor-item-del[data-idx="0"]')
-    _wait_alert(mgr, "Позиция не удалена")
+    _wait_alert(mgr, "Позицию не удалось убрать")
     assert mgr.locator(".editor-item-del").count() == 1
     e2e.db.add_order_item(oid, "Кабель ВВГ 3x2.5", "", 3, "м", 100.0, product_id=e2e.ids["product"])
 
@@ -681,7 +681,7 @@ def test_reopened_draft_keeps_payment_type(open_app, e2e):
     assert mgr.locator('.seg-item.active[data-pay="credit"]').count() == 1
     assert mgr.input_value("#due-date-input") == "2030-01-15"
     mgr.click("#btn-submit")
-    mgr.wait_for_function("() => window.__tgAlerts.some(a => a.includes('отправлена') || a.startsWith('⚠️'))")
+    mgr.wait_for_function("() => window.__tgAlerts.some(a => a.includes('отправлена') || a.includes('до какого числа'))")
     o = _order(e2e, seeded["order_id"])
     assert (o["payment_type"], o["due_date"]) == ("credit", "2030-01-15")
 
@@ -858,7 +858,7 @@ def test_boss_request_credit_context_and_cancel_dialogs(open_app, e2e):
 
     boss.click(".btn-approve")
     _wait_alert(boss, "Заявка одобрена")
-    boss.wait_for_selector(".empty-state-title:has-text('Решений не ждёт')")
+    boss.wait_for_selector(".empty-state-title:has-text('Ничего не ждёт решения')")
     o = _order(e2e, first["order_id"])
     assert o["status"] == "approved" and not o["credit_limit_override"]
     assert _stock(e2e) == 18
@@ -871,7 +871,7 @@ def test_boss_request_credit_context_and_cancel_dialogs(open_app, e2e):
     boss2.wait_for_selector(".credit-ctx--bad:has-text('превышение')")
     _confirm_answers_no(boss2)
     boss2.click(".btn-approve")
-    _wait_alert(boss2, "confirm-no:Кредитный лимит превышен")
+    _wait_alert(boss2, "confirm-no:Лимит долга превышен")
     boss2.wait_for_selector(".btn-approve:not([disabled])")
     assert e2e.rows("SELECT status FROM shipment_requests WHERE id = ?", (second["req_id"],))[0]["status"] == "pending"
     assert _order(e2e, second["order_id"])["status"] == "pending"
@@ -895,13 +895,13 @@ def test_return_to_draft_freezes_order_until_admin_unfreezes(open_app, e2e):
     boss.wait_for_selector(".draft-box:not([hidden])")
     boss.fill(".draft-box .draft-comment", "ок")
     boss.click(".draft-send")
-    _wait_alert(boss, "минимум 3 символа")
+    _wait_alert(boss, "менеджер увидит этот текст")
     assert _order(e2e, oid)["status"] == "pending"
 
     boss.fill(".draft-box .draft-comment", "Цена ниже прайса")
     boss.click(".draft-send")
     _wait_alert(boss, "возвращена на доработку")
-    boss.wait_for_selector(".empty-state-title:has-text('Решений не ждёт')")
+    boss.wait_for_selector(".empty-state-title:has-text('Ничего не ждёт решения')")
     o = _order(e2e, oid)
     assert (o["status"], o["frozen"], o["rejection_count"]) == ("draft", 1, 1)
     assert e2e.rows("SELECT status FROM shipment_requests WHERE id = ?", (seeded["req_id"],))[0]["status"] == "returned"
@@ -952,7 +952,7 @@ def test_boss_cancels_approved_order_and_stock_returns(open_app, e2e):
     boss.wait_for_selector(f"{box}:not([hidden])")
 
     boss.click(f"{box} .cancel-send")
-    _wait_alert(boss, "Укажите причину")
+    _wait_alert(boss, "Впишите причину отмены")
     assert _order(e2e, oid)["status"] == "approved"
 
     boss.fill(f"{box} .cancel-reason", "Клиент передумал")
@@ -994,7 +994,7 @@ def test_cancelled_order_is_listed_under_cancelled_filter(open_app, e2e):
         assert live not in _card_ids(page), role
         badges = {page.locator(f'.order-card[data-id="{i}"] .order-status').text_content().strip()
                   for i in (oid, rej["order_id"])}
-        assert badges == {"Отменён", "Отклонено"}, (role, badges)
+        assert badges == {"Отменён", "Отклонён"}, (role, badges)
 
 
 def test_boss_ships_order_notifies_manager_and_cancel_is_closed(open_app, e2e):
@@ -1012,7 +1012,7 @@ def test_boss_ships_order_notifies_manager_and_cancel_is_closed(open_app, e2e):
     _confirm_answers_yes(boss)
 
     boss.click(f'.btn-ship-order[data-id="{oid}"]')
-    _wait_alert(boss, f"🚚 Заказ #{oid} отгружен")
+    _wait_alert(boss, f"Заказ #{oid} отгружен")
     boss.wait_for_selector(f'.order-card[data-id="{oid}"][data-status="shipped"]')
     o = _order(e2e, oid)
     assert (o["status"], o["shipped_by"]) == ("shipped", ids["boss"]) and o["shipped_at"]
@@ -1047,8 +1047,8 @@ def test_keeper_sees_only_approved_and_ship_race_reports_error(open_app, e2e):
 
     assert e2e.run(mark_order_shipped(oid, ids["boss"], "Boss"))["ok"]
     keeper.click(f'.btn-ship-order[data-id="{oid}"]')
-    _wait_alert(keeper, "❌ Отгрузить можно только одобренный")
-    assert not any(a.startswith("🚚") for a in keeper.evaluate("window.__tgAlerts"))
+    _wait_alert(keeper, "Отгрузить можно только одобренный")
+    assert not any(a.endswith("отгружен") for a in keeper.evaluate("window.__tgAlerts"))
     keeper.wait_for_selector(f'.btn-ship-order[data-id="{oid}"]:not([disabled])')
     assert _order(e2e, oid)["shipped_by"] == ids["boss"]
 
