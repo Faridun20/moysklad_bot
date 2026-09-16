@@ -295,7 +295,8 @@ def _checks() -> list[Check]:
 #     оставляет документ без основания (он выпадает из остатков сам);
 #   * cost_batches.container_id — денормализованная подсказка, удаление
 #     контейнера (`containers.CHILD_TABLES`) о партиях не знает;
-#   * payments.user_id и прочие telegram-id — перенос истории пишет user_id = 0.
+#   * payments.user_id и прочие telegram-id — перенос истории по умолчанию пишет
+#     user_id = 0 («Перенос из МойСклад»), которого в user_roles нет.
 FOREIGN_KEYS: list[ForeignKey] = [
     # Заказы и деньги
     ForeignKey("order_items_order_fk", "order_items", "order_id", "orders"),

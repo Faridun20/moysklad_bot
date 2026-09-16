@@ -10,10 +10,17 @@
     entity/customerorder → orders + order_items + order_item_products
     entity/demand        → invoices + invoice_items + order_shipment
     entity/paymentin     → payments (payments.order_id — привязка к заказу)
+    entity/cashin        → payments (приходный кассовый ордер — те же деньги клиента)
+    entity/supply        → invoices (приход) [+ supplier_invoice_terms в режиме settled]
+    entity/paymentout    → supplier_payments (только поставщикам)
+    entity/cashout       → supplier_payments (расходный ордер — только поставщикам)
+Только читает для отчёта: entity/salesreturn, entity/purchasereturn,
+report/counterparty (сверка балансов).
 
 Использование:
     python -m scripts.migrate_history_from_moysklad --dry-run   # выгрузка + отчёт
-    python -m scripts.migrate_history_from_moysklad --apply     # выгрузка + запись + сверка
+    python -m scripts.migrate_history_from_moysklad --apply --supplier-history ledger|settled \
+        [--orders-owner-map "<сотрудник МС>=<telegram id>" ...] [--orders-owner-default <telegram id>]
 
 Код возврата: 0 — успех; 1 — ошибка или сверка не сошлась.
 
@@ -87,10 +94,76 @@ FSM не отображаются однозначно. Поэтому: есть
 — это плановая ОТГРУЗКА, другое), а подставить туда дату документа значит
 объявить просроченным всё подряд.
 
-**`user_id = 0`** у исторических заказов: в МС нет нашего Telegram-id, а
-приписать их живому менеджеру значит испортить его статистику продаж.
-Ноль честно означает «заказ приехал миграцией». Руководство видит такие
-заказы через `get_all_orders`, в «свои» они не попадают ни к кому.
+**ЧЬИ ЗАКАЗЫ — ПО АВТОРУ ДОКУМЕНТА В МС.** У каждого документа МС есть
+`owner` — сотрудник МС, который его оформил. Telegram-id в МС нет, поэтому
+соответствие задаёт человек: `--orders-owner-map "<сотрудник МС>=<telegram
+id>"` (ключ — логин `uid`, id или ФИО из таблицы сотрудников, которую печатает
+предпросмотр) и `--orders-owner-default <telegram id>` для остальных авторов и
+документов без автора. Без обоих — `user_id = 0` «Перенос из МойСклад»: такие
+заказы видит только руководство (менеджер видит в «Заказах» и «Долгах» только
+свои). Заказ получает автора заказа МС (продажа по отгрузке — автора
+отгрузки), платёж — автора платёжного документа; `user_id`/`full_name`/
+`username` — из `user_roles`, и цель обязана быть активным admin/boss/manager,
+иначе остановка до записи. Долг клиента в «Долгах» менеджера — это заказ с его
+`user_id`, то есть долг видит тот, на кого записан заказ. Сотрудники МС
+выгружаются из `entity/employee`: по голому UUID из `owner.meta.href` человек
+себя не узнает. `--orders-owner` — прежнее имя `--orders-owner-default`.
+
+═══════════════════════════════════════════════════════════════════════════
+ПЕРЕНОС НА ЧИСТУЮ БАЗУ С ТЕКУЩЕЙ СХЕМОЙ (сентябрь 2026)
+═══════════════════════════════════════════════════════════════════════════
+
+Скрипт писался до разбивки оплаты, долгов поставщикам и CHECK/FK прода
+(`scripts/apply_constraints`). Что добавлено, чтобы перенос не ронял
+транзакцию и не выдумывал долги:
+
+**КАССОВЫЕ ОРДЕРА.** Наличные в МС — отдельные документы `cashin`/`cashout`,
+не `paymentin`/`paymentout`. Без них каждая продажа за наличные осталась бы
+долгом клиента, а каждый приход, оплаченный из кассы, — долгом поставщику.
+Разбираются они так же (основание, FIFO), ключ — UUID документа в тех же
+`ms_paymentin_id`/`ms_paymentout_id` (UUID МС уникальны между сущностями).
+Разбивки оплаты (`payment_parts`) у исторических платежей нет и не нужно:
+они `confirmed`, а долг, закрытие заказа и «объяснённые» деньги отгрузки
+(`order_payments.payment_gap_cents`) считают подтверждённый платёж без строки
+разбивки полноценным — это штатный путь для денег до разбивки.
+
+**ИСХОДЯЩИЕ ДЕНЬГИ НЕ ПОСТАВЩИКУ НЕ ПЕРЕНОСЯТСЯ.** Аренда, зарплата, налоги
+тоже `paymentout`/`cashout`. Поставщик — тот, у кого в истории есть поступление
+(или платёж ссылается на поступление); остальное уходит в отчёт со статьёй
+расходов. Иначе «Поставщикам» показал бы «аванс» арендодателю.
+
+**НУЛЕВЫЕ СТРОКИ — МИМО, С ОТЧЁТОМ.** На проде CHECK `quantity > 0` у позиций и
+`amount_cents > 0` у платежей: одна нулевая строка уронила бы весь перенос.
+Позиция с количеством 0 и документ денег на 0 не пишутся и видны в отчёте.
+Заказ на ноль закрывается, а не висит долгом на 0.
+
+**ДОЛГ ЗАКАЗА — ПО ОТГРУЖЕННОМУ.** Баланс контрагента в МС считается по
+отгрузкам. У заказа с отгрузками позиции пишутся из ОТГРУЗОК; недоотгрузка —
+сведения в отчёте, а не долг за товар, которого клиент не получал. Заказ без
+единой отгрузки остаётся «к отгрузке» (резервирует товар и числится в долгах)
+и перечисляется в отчёте поимённо — отменить неактуальный можно в WebApp.
+
+**РАСЧЁТЫ С ПОСТАВЩИКАМИ — РЕЖИМ ВЫБИРАЕТ ЧЕЛОВЕК (`--supplier-history`).**
+Приход без условий оплаты — долг (`services/supplier_debts`), и все
+исторические поступления стали бы долгами, просроченными со дня прихода, если
+выплаты в МС вели не полностью. Отличить настоящий долг от неведённой выплаты по
+документам нельзя, поэтому `--apply` требует явного режима:
+  * `ledger` — как в документах МС: приходы — долги, выплаты их гасят (по
+    основанию, иначе FIFO), переплата — аванс;
+  * `settled` — история закрыта: каждый перенесённый приход получает условие
+    «уже оплачено» (автор 0, «Перенос из МойСклад»), а выплаты в ленту НЕ
+    пишутся. Писать их нельзя: при закрытых приходах общие выплаты легли бы
+    «авансом» (`supplier_debts._allocate` пропускает оплаченные приходы).
+    Настоящий текущий долг руководитель вернёт условием «в долг» у прихода.
+Предпросмотр показывает, что увидит «Поставщикам» и «Долги» после переноса —
+посчитанное штатным кодом экранов в той же транзакции.
+
+**СВЕРКА С БАЛАНСАМИ МС (информационная).** `report/counterparty` — баланс
+контрагента по данным самого МС. Сравниваются контрагенты с документами только
+в учётной валюте; знак баланса определяется большинством совпадений. Возвраты
+(`salesreturn`/`purchasereturn`) не переносятся, но перечисляются по
+контрагентам — обычно ими и объясняется расхождение. Код выхода сверка не
+меняет: решение по списку — за человеком.
 """
 
 from __future__ import annotations
@@ -104,7 +177,9 @@ import os
 import sys
 import time
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -509,6 +584,7 @@ async def pull_orders() -> list[dict]:
                 "agent_ms_id": _href_id(o.get("agent")),
                 "agent_name": ((o.get("agent") or {}).get("name")) or "",
                 "state_name": ((o.get("state") or {}).get("name")) or "",
+                "owner_ms_id": _href_id(o.get("owner")),
                 "sum_minor": int(o.get("sum") or 0),
                 "payed_minor": int(o.get("payedSum") or 0),
                 "shipped_minor": int(o.get("shippedSum") or 0),
@@ -538,6 +614,7 @@ async def pull_demands() -> list[dict]:
                 "agent_ms_id": _href_id(d.get("agent")),
                 "agent_name": ((d.get("agent") or {}).get("name")) or "",
                 "order_ms_id": _href_id(d.get("customerOrder")),
+                "owner_ms_id": _href_id(d.get("owner")),
                 "sum_minor": int(d.get("sum") or 0),
                 "_kind": "отгрузка",
                 **_doc_rate(d),
@@ -548,37 +625,58 @@ async def pull_demands() -> list[dict]:
     return out
 
 
+# Денежные документы МС: банк и касса — РАЗНЫЕ сущности. `paymentin`/`paymentout`
+# — входящий/исходящий платёж (безнал), `cashin`/`cashout` — приходный/расходный
+# кассовый ордер (наличные). Перенос только банковских оставлял бы каждую
+# продажу, оплаченную наличными, долгом клиента, а каждый приход, оплаченный из
+# кассы, — долгом поставщику. Разбираются они одинаково (агент, сумма, курс,
+# `operations`), поэтому едут одним списком с пометкой `doc_type`.
+INCOMING_MONEY = {"paymentin": "платёж", "cashin": "приходный ордер"}
+OUTGOING_MONEY = {"paymentout": "исходящий платёж", "cashout": "расходный ордер"}
+
+
+def _money_doc(p: dict, doc_type: str, kind: str) -> dict:
+    op_ids: list[tuple[str, str]] = []
+    # operations — массив ссылок на документы-основания (заказ и/или
+    # отгрузка, у исходящих — поступление). Собираем ВСЕ: какой из них наш,
+    # решает сопоставление ниже.
+    for op in p.get("operations") or []:
+        meta = op.get("meta") or {}
+        oid = _href_id(op)
+        if oid:
+            op_ids.append((meta.get("type") or "", oid))
+    return {
+        "ms_id": p["id"],
+        "doc_type": doc_type,
+        "name": p.get("name") or "",
+        "moment": p.get("moment") or "",
+        "agent_ms_id": _href_id(p.get("agent")),
+        "agent_name": ((p.get("agent") or {}).get("name")) or "",
+        "owner_ms_id": _href_id(p.get("owner")),
+        "sum_minor": int(p.get("sum") or 0),
+        "_kind": kind,
+        **_doc_rate(p),
+        "purpose": p.get("paymentPurpose") or "",
+        "expense_item": ((p.get("expenseItem") or {}).get("name")) or "",
+        "operations": op_ids,
+    }
+
+
 async def pull_payments() -> list[dict]:
-    logger.info("Выгружаю входящие платежи (вся история)…")
-    rows = await fetch_paged(
-        "entity/paymentin", {"expand": "agent,operations,rate.currency", "order": "moment,asc"}
-    )
+    """Входящие деньги: платежи (`paymentin`) И приходные ордера (`cashin`)."""
     out = []
-    for p in rows:
-        ops = p.get("operations") or []
-        # operations — массив ссылок на документы-основания (заказ и/или
-        # отгрузка). Собираем ВСЕ: какой из них наш, решает сопоставление ниже.
-        op_ids: list[tuple[str, str]] = []
-        for op in ops:
-            meta = op.get("meta") or {}
-            oid = _href_id(op)
-            if oid:
-                op_ids.append((meta.get("type") or "", oid))
-        out.append(
-            {
-                "ms_id": p["id"],
-                "name": p.get("name") or "",
-                "moment": p.get("moment") or "",
-                "agent_ms_id": _href_id(p.get("agent")),
-                "agent_name": ((p.get("agent") or {}).get("name")) or "",
-                "sum_minor": int(p.get("sum") or 0),
-                "_kind": "платёж",
-                **_doc_rate(p),
-                "purpose": p.get("paymentPurpose") or "",
-                "operations": op_ids,
-            }
+    for doc_type, kind in INCOMING_MONEY.items():
+        logger.info("Выгружаю %s (вся история)…", doc_type)
+        rows = await fetch_paged(
+            f"entity/{doc_type}", {"expand": "agent,operations,rate.currency", "order": "moment,asc"}
         )
-    logger.info("Платежей: %d", len(out))
+        out.extend(_money_doc(p, doc_type, kind) for p in rows)
+    out.sort(key=lambda x: x["moment"])
+    logger.info(
+        "Входящих денег: %d (платежей %d, приходных ордеров %d)", len(out),
+        sum(1 for p in out if p["doc_type"] == "paymentin"),
+        sum(1 for p in out if p["doc_type"] == "cashin"),
+    )
     return out
 
 
@@ -598,6 +696,7 @@ async def pull_supplies() -> list[dict]:
                 "moment": sp.get("moment") or "",
                 "agent_ms_id": _href_id(sp.get("agent")),
                 "agent_name": ((sp.get("agent") or {}).get("name")) or "",
+                "owner_ms_id": _href_id(sp.get("owner")),
                 "sum_minor": int(sp.get("sum") or 0),
                 "_kind": "поступление",
                 **_doc_rate(sp),
@@ -610,34 +709,106 @@ async def pull_supplies() -> list[dict]:
 
 
 async def pull_payments_out() -> list[dict]:
-    """Исходящие платежи — расчёты с поставщиками."""
-    logger.info("Выгружаю исходящие платежи (вся история)…")
-    rows = await fetch_paged(
-        "entity/paymentout", {"expand": "agent,operations,rate.currency", "order": "moment,asc"}
-    )
+    """Исходящие деньги: платежи (`paymentout`) И расходные ордера (`cashout`).
+
+    `expenseItem` раскрываем ради отчёта: «Аренда»/«Зарплата» объясняет, почему
+    платёж не поставщику и в «Поставщикам» не попал.
+    """
     out = []
-    for p in rows:
-        op_ids: list[tuple[str, str]] = []
-        for op in p.get("operations") or []:
-            meta = op.get("meta") or {}
-            oid = _href_id(op)
-            if oid:
-                op_ids.append((meta.get("type") or "", oid))
-        out.append(
-            {
-                "ms_id": p["id"],
-                "name": p.get("name") or "",
-                "moment": p.get("moment") or "",
-                "agent_ms_id": _href_id(p.get("agent")),
-                "agent_name": ((p.get("agent") or {}).get("name")) or "",
-                "sum_minor": int(p.get("sum") or 0),
-                "_kind": "исходящий платёж",
-                **_doc_rate(p),
-                "purpose": p.get("paymentPurpose") or "",
-                "operations": op_ids,
-            }
+    for doc_type, kind in OUTGOING_MONEY.items():
+        logger.info("Выгружаю %s (вся история)…", doc_type)
+        rows = await fetch_paged(
+            f"entity/{doc_type}",
+            {"expand": "agent,operations,rate.currency,expenseItem", "order": "moment,asc"},
         )
-    logger.info("Исходящих платежей: %d", len(out))
+        out.extend(_money_doc(p, doc_type, kind) for p in rows)
+    out.sort(key=lambda x: x["moment"])
+    logger.info(
+        "Исходящих денег: %d (платежей %d, расходных ордеров %d)", len(out),
+        sum(1 for p in out if p["doc_type"] == "paymentout"),
+        sum(1 for p in out if p["doc_type"] == "cashout"),
+    )
+    return out
+
+
+async def pull_returns() -> list[dict]:
+    """Возвраты покупателей и поставщикам — ТОЛЬКО шапки, для отчёта.
+
+    В локальную схему они не переносятся (возврат у нас привязан к строкам
+    заказа и проходит подтверждение), но баланс контрагента в МС их учитывает.
+    Без этого списка расхождение баланса по такому контрагенту выглядело бы
+    ошибкой переноса, а не известным пробелом.
+    """
+    out = []
+    for doc_type, kind in (("salesreturn", "возврат покупателя"),
+                           ("purchasereturn", "возврат поставщику")):
+        rows = await fetch_paged(f"entity/{doc_type}", {"expand": "agent", "order": "moment,asc"})
+        for r in rows:
+            out.append({
+                "ms_id": r.get("id") or "",
+                "doc_type": doc_type,
+                "_kind": kind,
+                "name": r.get("name") or "",
+                "moment": r.get("moment") or "",
+                "agent_ms_id": _href_id(r.get("agent")),
+                "agent_name": ((r.get("agent") or {}).get("name")) or "",
+                "sum_minor": int(r.get("sum") or 0),
+            })
+    logger.info("Возвратов в МС (не переносятся): %d", len(out))
+    return out
+
+
+async def pull_counterparty_balances() -> list[dict] | None:
+    """Баланс контрагентов по данным самого МС (`report/counterparty`).
+
+    None — отчёт не получен (нет прав, сбой): сверка балансов тогда просто не
+    выполняется, перенос это не останавливает. `balance` — в минорных единицах
+    учётной валюты МС.
+    """
+    try:
+        rows = await fetch_paged("report/counterparty", page=100)
+    except Exception as e:  # noqa: BLE001 — сверка информационная
+        logger.warning("Отчёт report/counterparty не получен (%s) — сверка балансов пропущена", e)
+        return None
+    out = []
+    for r in rows:
+        cp = r.get("counterparty") or {}
+        ms_id = str(cp.get("id") or _href_id(cp))
+        if not ms_id:
+            continue
+        out.append({"ms_id": ms_id, "name": cp.get("name") or "",
+                    "balance": int(round(float(r.get("balance") or 0)))})
+    logger.info("Балансов контрагентов из МС: %d", len(out))
+    return out
+
+
+async def pull_employees() -> list[dict] | None:
+    """Сотрудники МС (`entity/employee`) — кто есть кто среди авторов документов.
+
+    У документа автор — только ссылка `owner.meta.href` с UUID; по нему человек
+    себя в таблице не узнает, а ключ карты `--orders-owner-map` удобнее давать
+    логином или ФИО. None — справочник не получен (нет прав на сотрудников,
+    сбой): таблица покажет голые id, и ключом карты годится только id.
+    """
+    try:
+        rows = await fetch_paged("entity/employee")
+    except Exception as e:  # noqa: BLE001 — без ФИО перенос возможен, ключ — id
+        logger.warning("Сотрудники МС (entity/employee) не получены (%s) — в таблице будут только id", e)
+        return None
+    out = []
+    for e in rows:
+        ms_id = str(e.get("id") or _href_id(e))
+        if not ms_id:
+            continue
+        out.append({
+            "ms_id": ms_id,
+            "uid": str(e.get("uid") or ""),
+            "full_name": str(e.get("fullName") or e.get("name") or ""),
+            "short_fio": str(e.get("shortFio") or ""),
+            "name": str(e.get("name") or ""),
+            "archived": bool(e.get("archived")),
+        })
+    logger.info("Сотрудников МС: %d", len(out))
     return out
 
 
@@ -682,17 +853,32 @@ class Unmatched:
 
     def __init__(self) -> None:
         self.buckets: dict[str, list[str]] = defaultdict(list)
+        # Сведения, а не пробелы переноса: заказ без отгрузки, частичная
+        # отгрузка, закрытые режимом `settled` выплаты, возвраты МС. Разбирать
+        # их не обязательно, но знать о них до переключения — да. В `total()`
+        # не входят: «не сопоставлено 0» должно оставаться честным.
+        self.info: dict[str, list[str]] = defaultdict(list)
+        # Что покажет приложение сразу после переноса («Поставщикам», «Долги»)
+        # и сверка с балансами МС — готовые строки отчёта.
+        self.preview: list[str] = []
+        self.balance: list[str] = []
+        # На кого записаны заказы и платежи (`_summarize_owners`).
+        self.owners: list[str] = []
 
     def add(self, kind: str, what: str) -> None:
         self.buckets[kind].append(what)
 
+    def note(self, kind: str, what: str) -> None:
+        self.info[kind].append(what)
+
     def total(self) -> int:
         return sum(len(v) for v in self.buckets.values())
 
-    def report(self, show: int = 10) -> list[str]:
+    def report(self, show: int = 10, *, info: bool = False) -> list[str]:
         lines = []
-        for kind in sorted(self.buckets):
-            items = self.buckets[kind]
+        source = self.info if info else self.buckets
+        for kind in sorted(source):
+            items = source[kind]
             lines.append(f"  {kind}: {len(items)}")
             for item in items[:show]:
                 lines.append(f"      • {item}")
@@ -720,6 +906,16 @@ def _position_rows(
         name = assortment.get("name") or "—"
         qty = float(pos.get("quantity") or 0)
         price_minor = int(pos.get("price") or 0)
+        if qty <= 0:
+            # CHECK `quantity > 0` у позиций заказа и накладной (прод,
+            # scripts/apply_constraints): такая строка уронила бы ВСЮ
+            # транзакцию переноса. В сумму она не входит (0 × цена), поэтому
+            # пропуск ничего не искажает, но молча не проходит.
+            unmatched.add(
+                "позиция с нулевым количеством — не перенесена",
+                f"{doc_label}: «{name}» × {qty:g}",
+            )
+            continue
         product_id = product_map.get(ms_id)
         if not product_id:
             unmatched.add("позиция без карточки товара", f"{doc_label}: «{name}» ({ms_id or '—'})")
@@ -750,6 +946,10 @@ async def _base_currency() -> str:
     return _base_currency_sync()
 
 
+SUPPLIER_HISTORY_MODES = ("ledger", "settled")
+MIGRATION_AUTHOR = "Перенос из МойСклад"
+
+
 async def write_history(
     orders: list[dict],
     demands: list[dict],
@@ -759,6 +959,12 @@ async def write_history(
     *,
     currencies: list[dict],
     dry_run: bool,
+    supplier_history: str = "ledger",
+    balances: list[dict] | None = None,
+    returns: list[dict] | None = None,
+    orders_owner: int | None = None,
+    owner_map: list[tuple[str, int]] | None = None,
+    employees: list[dict] | None = None,
 ) -> tuple[dict, Unmatched, list[str]]:
     """Перенести историю одной транзакцией. Частично применённой не бывает.
 
@@ -784,14 +990,30 @@ async def write_history(
     * **Контрагент при этом НЕ угадывается.** Платёж без контрагента или от
       контрагента, у которого нет ни одного заказа, остаётся несопоставленным
       и уходит в отчёт — привязать его не к чему.
+    * **Долг заказа с отгрузками — по ОТГРУЖЕННОМУ.** Позиции такого заказа
+      пишутся из его отгрузок, а не из самого заказа: баланс контрагента в МС
+      считается по отгрузкам, и недоотгруженный остаток заказа иначе стал бы
+      долгом клиента за товар, которого он не получал.
 
     Валюта и курс сверяются ДО первой записи: документ, чью валюту или курс
     нельзя подтвердить, останавливает весь перенос (`MigrationStop`) — и
     предпросмотр тоже, иначе отчёт показал бы суммы, которых не будет.
+
+    `supplier_history` — что делать с расчётами с поставщиками (см. докстринг
+    модуля): `ledger` — приходы долги, выплаты их гасят; `settled` — все
+    перенесённые приходы помечаются оплаченными, выплаты в ленту не пишутся.
+
+    `owner_map` (ключ сотрудника МС → Telegram-id), `orders_owner` (кому всё
+    остальное) и `employees` (справочник МС) решают, на кого пишутся заказы и
+    платежи (см. «ЧЬИ ЗАКАЗЫ» в докстринге модуля). Неразобранный ключ или
+    неактивная цель — `MigrationStop` до первой записи.
     """
     from services import adb_core
     from services.database import now_str
     from services.money import mul_qty
+
+    if supplier_history not in SUPPLIER_HISTORY_MODES:
+        raise ValueError(f"supplier_history: {supplier_history!r} не из {SUPPLIER_HISTORY_MODES}")
 
     now = now_str()
     base_cur = await _base_currency()
@@ -800,6 +1022,7 @@ async def write_history(
     problems: list[str] = []
 
     all_docs = [*orders, *demands, *payments, *(supplies or []), *(payments_out or [])]
+    plan = resolve_owner_map(owner_map, employees, all_docs, default=orders_owner)
     acct_iso, fx_problems = resolve_currencies(all_docs, currencies)
 
     class _Rollback(Exception):
@@ -815,8 +1038,37 @@ async def write_history(
                     + (f"\n  …и ещё {len(fx_problems) - 30}" if len(fx_problems) > 30 else "")
                 )
             product_map, cp_map = await load_maps(txn)
+            owners = await _resolve_owners(txn, plan)
+            stats["orders_owner"] = plan.default
+
+            def owner_of(doc: dict) -> Owner:
+                return owners[plan.target(doc.get("owner_ms_id"))]
             stats["products_known"] = len(product_map)
             stats["counterparties_known"] = len(cp_map)
+
+            # ── Отгрузки: разложить по заказам ДО записи заказов ─────
+            # Позиции заказа с отгрузками берутся из отгрузок, поэтому группа
+            # нужна уже при записи самого заказа.
+            order_ms_ids = {o["ms_id"] for o in orders}
+            demands_by_order: dict[str, list[dict]] = defaultdict(list)
+            standalone: list[dict] = []
+            demand_rows: dict[str, list[dict]] = {}
+            for d in demands:
+                label = f"отгрузка {d['name'] or d['ms_id']}"
+                if d["order_ms_id"] and d["order_ms_id"] in order_ms_ids:
+                    demands_by_order[d["order_ms_id"]].append(d)
+                    demand_rows[d["ms_id"]] = _position_rows(
+                        d["positions"], product_map, label, unmatched
+                    )
+                elif d["order_ms_id"]:
+                    unmatched.add(
+                        "отгрузка: заказ-основание не перенесён",
+                        f"{label} → заказ {d['order_ms_id']}",
+                    )
+                else:
+                    standalone.append(d)
+            for group in demands_by_order.values():
+                group.sort(key=lambda x: x["moment"])
 
             # ── Заказы покупателей ───────────────────────────────────
             order_local: dict[str, int] = {}
@@ -832,9 +1084,18 @@ async def write_history(
                         "заказ: контрагента нет в справочнике",
                         f"{label} — «{o['agent_name'] or '—'}» ({o['agent_ms_id'] or 'без agent'})",
                     )
-                rows = _position_rows(o["positions"], product_map, label, unmatched)
+                group = demands_by_order.get(o["ms_id"], [])
+                # Позиции самого заказа нужны для сверки «отгружено ≤ заказано».
+                # У заказа с отгрузками они не пишутся — и о «позиции без
+                # карточки» за них скажет строка отгрузки, а не второй раз заказ.
+                order_rows = _position_rows(
+                    o["positions"], product_map, label, unmatched if not group else Unmatched()
+                )
+                order_total_cents[o["ms_id"]] = _doc_total_cents(order_rows)
+                rows = (
+                    [r for d in group for r in demand_rows[d["ms_id"]]] if group else order_rows
+                )
                 total_cents = _doc_total_cents(rows)
-                order_total_cents[o["ms_id"]] = total_cents
                 currency = o["currency"]
                 moment = _ms_moment_to_local(o["moment"])
 
@@ -843,7 +1104,7 @@ async def write_history(
                     cp_id=cp_id, currency=currency, moment=moment,
                     fully_paid=False,  # состояние оплаты посчитаем после разнесения
                     fx=o["fx"],
-                    now=now,
+                    now=now, owner=owner_of(o),
                 )
                 order_local[o["ms_id"]] = order_id
                 order_book.append(
@@ -855,36 +1116,29 @@ async def write_history(
                 )
                 stats["orders"] += 1
                 await _write_items(txn, order_id, rows, now, stats)
-
-            # ── Отгрузки ─────────────────────────────────────────────
-            # Отгрузка с заказом идёт к своему заказу; без заказа — становится
-            # заказом сама.
-            demands_by_order: dict[str, list[dict]] = defaultdict(list)
-            standalone: list[dict] = []
-            for d in demands:
-                label = f"отгрузка {d['name'] or d['ms_id']}"
-                if d["order_ms_id"] and d["order_ms_id"] in order_local:
-                    demands_by_order[d["order_ms_id"]].append(d)
-                elif d["order_ms_id"]:
-                    unmatched.add(
-                        "отгрузка: заказ-основание не перенесён",
-                        f"{label} → заказ {d['order_ms_id']}",
+                if not group:
+                    stats["orders_unshipped"] += 1
+                    unmatched.note(
+                        "заказ МС без отгрузки — перенесён «к отгрузке»: резервирует товар и "
+                        "числится в долгах; если не актуален — отменить в WebApp",
+                        f"{label} (#{order_id}) от {moment[:10]} — «{o['agent_name'] or '—'}», "
+                        f"статус МС «{o['state_name'] or '—'}», сумма "
+                        f"{_money(o['sum_minor'])} {currency}, оплачено в МС "
+                        f"{_money(o['payed_minor'])}",
                     )
-                else:
-                    standalone.append(d)
 
+            # ── Отгрузки по заказам ──────────────────────────────────
             shipped_cents: dict[str, int] = defaultdict(int)
+            demand_sum_minor: dict[str, int] = defaultdict(int)
             demand_order: dict[str, int] = {}  # ms_id отгрузки → локальный заказ
 
             for ms_order_id, group in demands_by_order.items():
-                group.sort(key=lambda x: x["moment"])
                 if len(group) > 1:
                     stats["multi_demand_orders"] += 1
                 order_id = order_local[ms_order_id]
                 first_invoice_id = None
                 for d in group:
-                    label = f"отгрузка {d['name'] or d['ms_id']}"
-                    rows = _position_rows(d["positions"], product_map, label, unmatched)
+                    rows = demand_rows[d["ms_id"]]
                     invoice_id = await _write_invoice(
                         txn, d, rows,
                         counterparty_id=cp_map.get(d["agent_ms_id"]),
@@ -893,12 +1147,23 @@ async def write_history(
                     shipped_cents[ms_order_id] += sum(
                         mul_qty(r["price_cents"], r["quantity"]) for r in rows
                     )
+                    demand_sum_minor[ms_order_id] += int(d.get("sum_minor") or 0)
                     demand_order[d["ms_id"]] = order_id
                     stats["demands"] += 1
                     stats["demand_items"] += len(rows)
                     if first_invoice_id is None:
                         first_invoice_id = invoice_id
                 await _write_shipment(txn, order_id, first_invoice_id, group[0], now)
+                ordered = order_total_cents.get(ms_order_id, 0)
+                shipped = shipped_cents[ms_order_id]
+                if shipped < ordered:
+                    stats["orders_partially_shipped"] += 1
+                    o = next(x for x in orders if x["ms_id"] == ms_order_id)
+                    unmatched.note(
+                        "заказ отгружен частично — долг считается по отгруженному, как в МС",
+                        f"заказ {o['name'] or ms_order_id} (#{order_id}): заказано "
+                        f"{_money(ordered)}, отгружено {_money(shipped)} {o['currency']}",
+                    )
 
             # ── Отгрузка как самостоятельная продажа ─────────────────
             for d in standalone:
@@ -918,7 +1183,7 @@ async def write_history(
                 order_id = await _upsert_order_from_demand(
                     txn, d,
                     cp_id=cp_id, currency=currency, moment=moment,
-                    fx=d["fx"], now=now,
+                    fx=d["fx"], now=now, owner=owner_of(d),
                 )
                 demand_order[d["ms_id"]] = order_id
                 order_book.append(
@@ -941,9 +1206,25 @@ async def write_history(
 
             by_local_id = {b["order_id"]: b for b in order_book}
 
-            # ── Платежи с документом-основанием ──────────────────────
+            # ── Входящие деньги: нулевые — мимо ──────────────────────
+            # CHECK `payments_amount_chk amount_cents > 0`: нулевой документ
+            # (черновик, обнулённый платёж) уронил бы всю транзакцию.
+            live_payments: list[dict] = []
             for p in payments:
-                label = f"платёж {p['name'] or p['ms_id']} от {p['moment'][:10]}"
+                if int(p["sum_minor"]) > 0:
+                    live_payments.append(p)
+                    stats["payments_in_" + p.get("doc_type", "paymentin")] += 1
+                    continue
+                unmatched.add(
+                    "входящий документ с нулевой суммой — не перенесён",
+                    f"{p['_kind']} {p['name'] or p['ms_id']} от {p['moment'][:10]} — "
+                    f"«{p['agent_name'] or '—'}»",
+                )
+                stats["payments_zero"] += 1
+                await _delete_migrated_payment(txn, p["ms_id"])
+
+            # ── Платежи с документом-основанием ──────────────────────
+            for p in live_payments:
                 target_order = None
                 for op_type, op_id in p["operations"]:
                     if op_type == "customerorder" and op_id in order_local:
@@ -955,8 +1236,10 @@ async def write_history(
                 if target_order is None:
                     p["_needs_fifo"] = True
                     continue
+                p["_needs_fifo"] = False
                 await _upsert_payment(
-                    txn, p, order_id=target_order, base_cur=base_cur, now=now
+                    txn, p, order_id=target_order, base_cur=base_cur, now=now,
+                    owner=owner_of(p),
                 )
                 if target_order in by_local_id:
                     by_local_id[target_order]["paid"] += p["sum_minor"]
@@ -968,10 +1251,10 @@ async def write_history(
                 if b["cp_id"]:
                     fifo_queue[int(b["cp_id"])].append(b)
 
-            for p in sorted(payments, key=lambda x: x["moment"]):
+            for p in sorted(live_payments, key=lambda x: x["moment"]):
                 if not p.get("_needs_fifo"):
                     continue
-                label = f"платёж {p['name'] or p['ms_id']} от {p['moment'][:10]}"
+                label = f"{p['_kind']} {p['name'] or p['ms_id']} от {p['moment'][:10]}"
                 cp_id = cp_map.get(p["agent_ms_id"])
                 if not cp_id:
                     unmatched.add(
@@ -980,6 +1263,7 @@ async def write_history(
                         f"сумма {p['sum_minor'] / 100:.2f}",
                     )
                     stats["payments_unlinked"] += 1
+                    await _delete_migrated_payment(txn, p["ms_id"])
                     continue
                 queue = [
                     b for b in fifo_queue.get(int(cp_id), [])
@@ -993,6 +1277,7 @@ async def write_history(
                         f"сумма {p['sum_minor'] / 100:.2f}",
                     )
                     stats["payments_unlinked"] += 1
+                    await _delete_migrated_payment(txn, p["ms_id"])
                     continue
 
                 left = int(p["sum_minor"])
@@ -1007,7 +1292,7 @@ async def write_history(
                     part += 1
                     await _upsert_payment(
                         txn, p, order_id=b["order_id"], base_cur=base_cur, now=now,
-                        amount_cents=take, part=part, fifo=True,
+                        amount_cents=take, part=part, fifo=True, owner=owner_of(p),
                     )
                     b["paid"] += take
                     left -= take
@@ -1025,8 +1310,11 @@ async def write_history(
                     stats["payments_overflow_cents"] += left
 
             # ── Состояние оплаты по каждому заказу ───────────────────
+            # `paid >= total` без условия «total > 0»: заказ на ноль (все
+            # позиции нулевые или без цены) никому ничего не должен, и открытым
+            # долгом на 0 он висел бы в «Долгах» бессрочно.
             for b in order_book:
-                closed = b["total"] > 0 and b["paid"] >= b["total"]
+                closed = b["paid"] >= b["total"]
                 await _set_order_payment_state(
                     txn, b["order_id"], closed=closed, moment=b["moment"], now=now
                 )
@@ -1058,10 +1346,30 @@ async def write_history(
                 stats["supplies"] += 1
                 stats["supply_items"] += len(rows)
 
+            await _apply_supplier_terms(
+                txn, list(supply_invoice.values()), mode=supplier_history, now=now, stats=stats
+            )
+
             # ── Платежи поставщикам ──────────────────────────────────
+            # Поставщик — тот, у кого в истории есть поступление, или платёж,
+            # ссылающийся на поступление. Остальные исходящие деньги (аренда,
+            # зарплата, налоги) в «Поставщикам» не идут: у получателя нет ни
+            # одного прихода, и вся сумма легла бы строкой «аванс арендодателю».
+            supplier_agents = {sp["agent_ms_id"] for sp in supplies or [] if sp["agent_ms_id"]}
             paid_out_cents: dict[str, int] = defaultdict(int)
+            supplier_payments_docs: list[dict] = []
+            settled_sums: dict[str, int] = defaultdict(int)
             for p in payments_out or []:
-                label = f"исходящий платёж {p['name'] or p['ms_id']} от {p['moment'][:10]}"
+                label = f"{p['_kind']} {p['name'] or p['ms_id']} от {p['moment'][:10]}"
+                stats["payments_out_" + p.get("doc_type", "paymentout")] += 1
+                if int(p["sum_minor"]) <= 0:
+                    unmatched.add(
+                        "исходящий документ с нулевой суммой — не перенесён",
+                        f"{label} — «{p['agent_name'] or '—'}»",
+                    )
+                    stats["payments_out_zero"] += 1
+                    await _delete_migrated_payment_out(txn, p["ms_id"])
+                    continue
                 cp_id = cp_map.get(p["agent_ms_id"])
                 if not cp_id:
                     unmatched.add(
@@ -1070,6 +1378,24 @@ async def write_history(
                         f"сумма {p['sum_minor'] / 100:.2f}",
                     )
                     stats["payments_out_unlinked"] += 1
+                    await _delete_migrated_payment_out(txn, p["ms_id"])
+                    continue
+                to_supply = any(op_type == "supply" for op_type, _ in p["operations"])
+                if not to_supply and p["agent_ms_id"] not in supplier_agents:
+                    item = f", статья «{p['expense_item']}»" if p.get("expense_item") else ""
+                    unmatched.add(
+                        "исходящий платёж не поставщику — не перенесён",
+                        f"{label} — «{p['agent_name'] or '—'}», "
+                        f"сумма {_money(p['sum_minor'])} {p['currency']}{item}",
+                    )
+                    stats["payments_out_not_supplier"] += 1
+                    await _delete_migrated_payment_out(txn, p["ms_id"])
+                    continue
+                supplier_payments_docs.append(p)
+                paid_out_cents[str(cp_id)] += p["sum_minor"]
+                if supplier_history == "settled":
+                    settled_sums[p["currency"] or "?"] += int(p["sum_minor"])
+                    stats["payments_out_settled"] += 1
                     continue
                 invoice_id = None
                 for op_type, op_id in p["operations"]:
@@ -1080,20 +1406,46 @@ async def write_history(
                     txn, p, counterparty_id=cp_id, invoice_id=invoice_id,
                     base_cur=base_cur, now=now,
                 )
-                paid_out_cents[str(cp_id)] += p["sum_minor"]
                 stats["payments_out"] += 1
+
+            if supplier_history == "settled":
+                # Выплаты прежнего прогона в режиме ledger — вон: иначе они
+                # легли бы «авансом» против закрытых приходов.
+                await txn.execute(
+                    "DELETE FROM supplier_payments WHERE ms_paymentout_id IS NOT NULL "
+                    "AND NOT EXISTS (SELECT 1 FROM supplier_payment_parts spp "
+                    "                WHERE spp.payment_id = supplier_payments.id)"
+                )
+                if stats["payments_out_settled"]:
+                    unmatched.note(
+                        "режим settled: выплаты поставщикам закрыты вместе с приходами, "
+                        "в ленту выплат не перенесены",
+                        f"{stats['payments_out_settled']} документов на "
+                        + " · ".join(f"{c} {_money(v)}" for c, v in sorted(settled_sums.items())),
+                    )
 
             await _mark_suppliers(
                 txn, cp_map, sales=[*orders, *demands],
-                purchases=[*(supplies or []), *(payments_out or [])], stats=stats,
+                purchases=[*(supplies or []), *supplier_payments_docs], stats=stats,
             )
 
             problems = _check_consistency(
-                orders, order_total_cents, shipped_cents, order_local
+                orders, order_total_cents, shipped_cents, order_local,
+                demand_sum_minor=demand_sum_minor,
             )
             problems += _check_supplier_consistency(supplies or [], supply_total_cents)
             stats["supplier_debt_agents"] = len(
                 {a for a in supplied_cents if supplied_cents[a] > paid_out_cents.get(a, 0)}
+            )
+
+            _note_returns(returns or [], unmatched, stats)
+            await _summarize_owners(txn, owners, unmatched, stats)
+            await _preview_app_state(txn, supplier_history, unmatched, stats)
+            await _reconcile_balances(
+                txn, balances, acct_iso=acct_iso, cp_map=cp_map,
+                sales_docs=[*orders, *demands], payments_in=live_payments,
+                supplies=supplies or [], supply_total_cents=supply_total_cents,
+                supplier_payments=supplier_payments_docs, unmatched=unmatched, stats=stats,
             )
             if dry_run:
                 raise _Rollback
@@ -1102,6 +1454,268 @@ async def write_history(
 
     stats["unmatched"] = unmatched.total()
     return dict(stats), unmatched, problems
+
+
+async def _delete_migrated_payment(txn, ms_id: str) -> None:
+    """Убрать строки платежа, записанные прежним прогоном, если теперь он не пишется.
+
+    Повторный прогон обязан приводить базу к тому, что сказал бы первый: платёж,
+    который на этот раз ушёл в отчёт (нулевой, без заказа), не должен остаться
+    в долгах от предыдущего прогона.
+    """
+    await txn.execute(
+        "DELETE FROM payments WHERE (ms_paymentin_id = $1 OR ms_paymentin_id LIKE $2) "
+        "AND NOT EXISTS (SELECT 1 FROM payment_parts pp WHERE pp.payment_id = payments.id)",
+        ms_id, f"{ms_id}#%",
+    )
+
+
+async def _delete_migrated_payment_out(txn, ms_id: str) -> None:
+    await txn.execute(
+        "DELETE FROM supplier_payments WHERE ms_paymentout_id = $1 "
+        "AND NOT EXISTS (SELECT 1 FROM supplier_payment_parts spp "
+        "                WHERE spp.payment_id = supplier_payments.id)",
+        ms_id,
+    )
+
+
+async def _apply_supplier_terms(
+    txn, invoice_ids: list[int], *, mode: str, now: str, stats: dict
+) -> None:
+    """Условия оплаты перенесённых приходов по режиму `supplier_history`.
+
+    `settled`: строка `supplier_invoice_terms` «уже оплачено» у каждого
+    перенесённого прихода. Строку, которую завёл ЧЕЛОВЕК (другой автор), не
+    трогаем: его решение важнее соглашения переноса.
+    `ledger`: строки, которые записал прежний прогон в режиме settled
+    (автор 0 + «Перенос из МойСклад»), удаляем — иначе смена режима на повторе
+    ничего бы не меняла.
+    """
+    if mode == "ledger":
+        await txn.execute(
+            "DELETE FROM supplier_invoice_terms WHERE created_by = 0 AND created_by_name = $1",
+            MIGRATION_AUTHOR,
+        )
+        return
+    for inv_id in invoice_ids:
+        row = await txn.fetchrow(
+            "SELECT created_by, created_by_name FROM supplier_invoice_terms WHERE invoice_id = $1",
+            int(inv_id),
+        )
+        if row is None:
+            await txn.execute(
+                "INSERT INTO supplier_invoice_terms (invoice_id, payment_type, created_by, "
+                "created_by_name, created_at, updated_at) VALUES ($1, 'paid', 0, $2, $3, $3)",
+                int(inv_id), MIGRATION_AUTHOR, now,
+            )
+            stats["supplies_settled"] += 1
+        elif int(row["created_by"] or 0) == 0 and row["created_by_name"] == MIGRATION_AUTHOR:
+            await txn.execute(
+                "UPDATE supplier_invoice_terms SET payment_type = 'paid', due_date = NULL, "
+                "updated_at = $1 WHERE invoice_id = $2",
+                now, int(inv_id),
+            )
+            stats["supplies_settled"] += 1
+        else:
+            stats["supplies_terms_kept"] += 1
+
+
+def _note_returns(returns: list[dict], unmatched: Unmatched, stats: dict) -> None:
+    """Возвраты МС по контрагентам — в сведения отчёта (они не переносятся)."""
+    by_agent: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+    for r in returns:
+        acc = by_agent[(r.get("agent_name") or "—", r["_kind"])]
+        acc[0] += 1
+        acc[1] += int(r.get("sum_minor") or 0)
+    stats["ms_returns"] = len(returns)
+    for (agent, kind), (n, total) in sorted(by_agent.items()):
+        unmatched.note(
+            "возвраты в МС не перенесены — долг по контрагенту может быть завышен/занижен",
+            f"«{agent}»: {kind} — {n} на {_money(total)}",
+        )
+
+
+async def _summarize_owners(
+    txn, owners: dict[int, Owner], unmatched: Unmatched, stats: dict
+) -> None:
+    """На кого записаны перенесённые заказы и платежи — посчитано по базе.
+
+    «Долги» менеджера — открытые заказы с его `user_id` (`get_open_debts`), тем
+    же фильтром считается колонка «видит в Долгах»: сверять карту надо с тем,
+    что сотрудник увидит, а не с тем, что скрипт собирался записать.
+    """
+    from services.database import _OPEN_DEBT_FILTER
+
+    orders = {
+        int(r["user_id"]): (int(r["n"]), int(r["debts"] or 0))
+        for r in await txn.fetch(
+            "SELECT user_id, COUNT(*) AS n, "
+            f"SUM(CASE WHEN {_OPEN_DEBT_FILTER} THEN 1 ELSE 0 END) AS debts FROM orders "
+            "WHERE ms_customerorder_id IS NOT NULL OR ms_demand_id IS NOT NULL GROUP BY user_id"
+        )
+    }
+    payments = {
+        int(r["user_id"]): int(r["n"])
+        for r in await txn.fetch(
+            "SELECT user_id, COUNT(*) AS n FROM payments WHERE ms_paymentin_id IS NOT NULL "
+            "GROUP BY user_id"
+        )
+    }
+    stats["orders_owners"] = len(orders)
+    lines = unmatched.owners
+    for uid in sorted({*orders, *payments}):
+        member = owners.get(uid)
+        if member is None:
+            who = f"{uid} (записан прежним прогоном)"
+        else:
+            who = f"{uid} «{member.full_name}»" + (f" ({member.role})" if member.role else "")
+        n, debts = orders.get(uid, (0, 0))
+        lines.append(
+            f"{who}: заказов {n}, из них открытых долгов (видит в «Долгах») {debts}; "
+            f"строк платежей {payments.get(uid, 0)}"
+        )
+
+
+async def _preview_app_state(txn, mode: str, unmatched: Unmatched, stats: dict) -> None:
+    """Что покажет приложение сразу после переноса — той же транзакцией.
+
+    Считается штатным кодом экранов (`supplier_debts.ledger`, `debts`), а не
+    формулой скрипта: вопрос «не завалит ли „Поставщикам“ выдуманными долгами»
+    должен получить ответ ДО записи, и ответ ровно тот, что увидит руководитель.
+    """
+    from services import supplier_debts
+    from services.database import _OPEN_DEBT_FILTER
+    from services.debts import calc_order_balances
+    from utils.helpers import local_now
+
+    today = local_now().date().isoformat()
+    led = await supplier_debts.ledger(conn=txn)
+    open_debts = [d for d in led.debts if d.remaining_cents > 0]
+    by_cur: dict[str, int] = defaultdict(int)
+    for d in open_debts:
+        by_cur[d.currency] += d.remaining_cents
+    stats["supplier_debts_open"] = len(open_debts)
+    stats["supplier_debts_overdue"] = supplier_debts.overdue_count(led, today)
+    stats["supplier_advances"] = len(led.advances)
+    lines = unmatched.preview
+    lines.append(
+        f"«Поставщикам» (режим {mode}): долгов {len(open_debts)} на "
+        + (" · ".join(f"{c} {_money(v)}" for c, v in sorted(by_cur.items())) or "0")
+        + f", из них просрочено {stats['supplier_debts_overdue']}; авансов {len(led.advances)}"
+    )
+    for (sup_id, cur), cents in sorted(led.advances.items()):
+        lines.append(f"    аванс «{led.suppliers.get(sup_id, sup_id)}»: {cur} {_money(cents)}")
+    if mode == "ledger":
+        lines.append("    (в режиме settled было бы: долгов 0, авансов 0 — история закрыта)")
+
+    ids = [int(r["id"]) for r in await txn.fetch(f"SELECT id FROM orders WHERE {_OPEN_DEBT_FILTER}")]
+    remaining: dict[str, int] = defaultdict(int)
+    for start in range(0, len(ids), 1000):
+        balances = await calc_order_balances(ids[start:start + 1000], conn=txn)
+        for bal in balances.values():
+            remaining[bal.currency] += bal.remaining_cents
+    stats["client_debts_open"] = len(ids)
+    lines.append(
+        f"«Долги» клиентов: открытых заказов {len(ids)} на "
+        + (" · ".join(f"{c} {_money(v)}" for c, v in sorted(remaining.items())) or "0")
+    )
+
+
+BALANCE_TOLERANCE_MINOR = 100
+
+
+async def _reconcile_balances(
+    txn, balances: list[dict] | None, *, acct_iso: str, cp_map: dict[str, int],
+    sales_docs: list[dict], payments_in: list[dict], supplies: list[dict],
+    supply_total_cents: dict[str, int], supplier_payments: list[dict],
+    unmatched: Unmatched, stats: dict,
+) -> None:
+    """Сверка с балансом контрагента в самом МС (`report/counterparty`).
+
+    Информационная: код выхода не меняет. Сравниваются только контрагенты, у
+    которых ВСЕ перенесённые документы в учётной валюте МС (баланс МС — в ней,
+    а пересчитывать по курсу значит сравнивать курсы, а не долги). Сторона
+    клиента — из базы (`calc_order_balances`, БЕЗ зажима нулём: переплата тоже
+    баланс), сторона поставщика — из документов, НЕЗАВИСИМО от режима
+    `supplier_history` (сверяется полнота переноса, а не политика).
+
+    Знак баланса в МС документацией не зафиксирован однозначно, поэтому
+    сравнение идёт по модулю, а знак выбирается большинством совпадений.
+    Расхождение обычно объясняется возвратами (не переносятся), переплатой,
+    которой не на что лечь, или заказом без отгрузки — всё это есть в отчёте.
+    """
+    if balances is None:
+        stats["balance_checked"] = 0
+        unmatched.balance.append("Сверка с балансами МС не выполнена: отчёт report/counterparty не получен.")
+        return
+    from services.debts import calc_order_balances
+
+    ms_by_id = {b["ms_id"]: b for b in balances}
+    currencies: dict[str, set[str]] = defaultdict(set)
+    names: dict[str, str] = {}
+    for d in [*sales_docs, *payments_in, *supplies, *supplier_payments]:
+        a = d.get("agent_ms_id")
+        if a in cp_map:
+            currencies[a].add(d.get("currency") or "?")
+            names.setdefault(a, d.get("agent_name") or a)
+    supplier_side: dict[str, int] = defaultdict(int)
+    for sp in supplies:
+        if sp.get("agent_ms_id") in cp_map:
+            supplier_side[sp["agent_ms_id"]] += supply_total_cents.get(sp["ms_id"], 0)
+    for p in supplier_payments:
+        supplier_side[p["agent_ms_id"]] -= int(p["sum_minor"])
+
+    local_to_ms = {str(v): k for k, v in cp_map.items()}
+    customer_side: dict[str, int] = defaultdict(int)
+    rows = await txn.fetch(
+        "SELECT id, agent_id FROM orders WHERE agent_id IS NOT NULL "
+        "AND (ms_customerorder_id IS NOT NULL OR ms_demand_id IS NOT NULL)"
+    )
+    agent_of = {int(r["id"]): str(r["agent_id"]) for r in rows}
+    ids = list(agent_of)
+    for start in range(0, len(ids), 1000):
+        for oid, bal in (await calc_order_balances(ids[start:start + 1000], conn=txn)).items():
+            ms_id = local_to_ms.get(agent_of[oid])
+            if ms_id:
+                customer_side[ms_id] += (
+                    bal.total_cents - bal.confirmed_cents - bal.deposits_cents - bal.returns_cents
+                )
+
+    compared: list[tuple[str, int, int]] = []
+    skipped = 0
+    for ms_id, curs in currencies.items():
+        if curs != {acct_iso}:
+            skipped += 1
+            continue
+        ours = supplier_side.get(ms_id, 0) - customer_side.get(ms_id, 0)  # «мы должны им»
+        theirs = int((ms_by_id.get(ms_id) or {}).get("balance") or 0)
+        compared.append((ms_id, ours, theirs))
+
+    def _matches(sign: int) -> int:
+        return sum(1 for _, o, t in compared if abs(o - sign * t) <= BALANCE_TOLERANCE_MINOR)
+
+    sign = 1 if _matches(1) >= _matches(-1) else -1
+    mismatches = [
+        (ms_id, o, sign * t) for ms_id, o, t in compared
+        if abs(o - sign * t) > BALANCE_TOLERANCE_MINOR
+    ]
+    stats["balance_checked"] = len(compared)
+    stats["balance_not_compared"] = skipped
+    stats["balance_mismatches"] = len(mismatches)
+    out = unmatched.balance
+    out.append(
+        f"Сверка с балансами МС ({acct_iso}): сравнено {len(compared)}, расхождений "
+        f"{len(mismatches)}, не сравнивалось (документы в нескольких валютах) {skipped}. "
+        f"Знак баланса МС: {'как есть' if sign == 1 else 'обратный'} "
+        "(«+» — мы должны контрагенту)."
+    )
+    for ms_id, o, t in sorted(mismatches, key=lambda x: names.get(x[0], ""))[:50]:
+        out.append(
+            f"    «{names.get(ms_id, ms_id)}»: по переносу {_money(o)}, в МС {_money(t)} "
+            f"(разница {_money(o - t)})"
+        )
+    if len(mismatches) > 50:
+        out.append(f"    …и ещё {len(mismatches) - 50}")
 
 
 async def _mark_suppliers(
@@ -1204,9 +1818,276 @@ async def _set_order_payment_state(
         )
 
 
+# ─── Чьи заказы и платежи: сотрудники МС → сотрудники бота ─────────────────────
+#
+# Автор документа МС (`owner`) — сотрудник МС; в боте сотрудник — Telegram-id из
+# `user_roles`. Соответствие задаёт человек (`--orders-owner-map`), потому что
+# связи между ними нигде нет (`user_roles.moysklad_employee_id` прежней
+# интеграции пуст). Порядок: предпросмотр печатает таблицу авторов → человек
+# находит в ней себя → подставляет ключ в карту.
+
+LOGIN_ROLES = ("admin", "boss", "manager")
+NO_OWNER_LABEL = "(без автора)"
+# Виды документов в таблице авторов: (ключ, заголовок колонки). Поступления и
+# выплаты поставщикам автора в нашей базе не хранят — колонки только помогают
+# узнать сотрудника по его работе.
+OWNER_TABLE_KINDS: tuple[tuple[str, str], ...] = (
+    ("customerorder", "заказ"), ("demand", "отгр"), ("paymentin", "плат"), ("cashin", "ПКО"),
+    ("supply", "пост"), ("paymentout", "исх"), ("cashout", "РКО"),
+)
+
+
+class Owner(NamedTuple):
+    """Сотрудник бота, на которого пишутся заказ или платёж."""
+
+    user_id: int
+    full_name: str
+    username: str = ""
+    role: str = ""
+
+
+MIGRATION_OWNER = Owner(0, MIGRATION_AUTHOR)
+
+
+@dataclass
+class OwnerPlan:
+    """Кому что: сотрудник МС → Telegram-id, остальные → `default` (0 — никому)."""
+
+    by_employee: dict[str, int] = field(default_factory=dict)
+    default: int = 0
+    # Telegram-id → как он задан в командной строке (для текста остановки).
+    sources: dict[int, list[str]] = field(default_factory=dict)
+
+    def target(self, owner_ms_id: str | None) -> int:
+        return self.by_employee.get(owner_ms_id or "", self.default)
+
+
+def parse_owner_map_item(raw: str) -> tuple[str, int]:
+    """`"<сотрудник МС>=<telegram id>"` → (ключ, id). Разделитель — последний `=`."""
+    key, sep, tg = str(raw).rpartition("=")
+    key, tg = key.strip(), tg.strip()
+    if not sep or not key or not tg.isdigit() or int(tg) <= 0:
+        raise argparse.ArgumentTypeError(
+            f"{raw!r}: нужно «<сотрудник МС>=<telegram id>», например "
+            "\"farid@impeks=941599419\" (ключ — uid, id или ФИО из таблицы сотрудников)"
+        )
+    return key, int(tg)
+
+
+def _norm_key(value: str) -> str:
+    return " ".join(str(value).replace("ё", "е").replace("Ё", "Е").split()).casefold()
+
+
+def _employee_keys(e: dict) -> set[str]:
+    """Чем можно назвать сотрудника МС в карте: id, логин (целиком и до «@»), ФИО."""
+    uid = e.get("uid") or ""
+    keys = {e.get("ms_id"), uid, uid.split("@", 1)[0] if "@" in uid else "",
+            e.get("full_name"), e.get("short_fio"), e.get("name")}
+    return {_norm_key(k) for k in keys if k}
+
+
+def _employee_label(e: dict) -> str:
+    bits = [e.get("full_name") or e.get("name") or "", e.get("uid") or "", e.get("ms_id") or ""]
+    return " · ".join(b for b in bits if b) or "?"
+
+
+def _known_employees(employees: list[dict] | None, docs: list[dict]) -> dict[str, dict]:
+    """Сотрудники из справочника МС плюс авторы документов, которых в нём нет
+    (справочник не получен или сотрудник удалён) — последних знаем только по id."""
+    known = {e["ms_id"]: e for e in employees or []}
+    for d in docs:
+        oid = d.get("owner_ms_id") or ""
+        if oid and oid not in known:
+            known[oid] = {"ms_id": oid, "uid": "", "full_name": "", "short_fio": "", "name": "",
+                          "archived": False, "_not_in_directory": True}
+    return known
+
+
+def resolve_owner_map(
+    owner_map: list[tuple[str, int]] | None, employees: list[dict] | None, docs: list[dict],
+    *, default: int | None = None,
+) -> OwnerPlan:
+    """Карта из командной строки → `OwnerPlan`. Ничего не угадывает.
+
+    Ключ, который не нашёл сотрудника, нашёл двух, или один сотрудник на два
+    разных Telegram-id — остановка до записи: опечатка в ключе молча отдала бы
+    заказы владельца «по умолчанию», и это выглядело бы как верный перенос.
+    """
+    known = _known_employees(employees, docs)
+    plan = OwnerPlan(default=int(default or 0))
+    if plan.default:
+        plan.sources.setdefault(plan.default, []).append(f"--orders-owner-default {plan.default}")
+    errors: list[str] = []
+    for key, tg in owner_map or []:
+        nk = _norm_key(key)
+        hits = [e for e in known.values() if nk in _employee_keys(e)]
+        if not hits:
+            errors.append(f"«{key}»: нет такого сотрудника МС (ключ — id, uid или ФИО из таблицы)")
+            continue
+        if len(hits) > 1:
+            errors.append(
+                f"«{key}»: подходит нескольким сотрудникам МС — "
+                + "; ".join(_employee_label(e) for e in hits) + " — укажите uid или id"
+            )
+            continue
+        eid = hits[0]["ms_id"]
+        if eid in plan.by_employee and plan.by_employee[eid] != int(tg):
+            errors.append(
+                f"«{key}»: сотрудник {_employee_label(hits[0])} уже назначен на "
+                f"{plan.by_employee[eid]}, а здесь на {tg}"
+            )
+            continue
+        plan.by_employee[eid] = int(tg)
+        plan.sources.setdefault(int(tg), []).append(f"--orders-owner-map «{key}»={tg}")
+    if errors:
+        raise MigrationStop(
+            "--orders-owner-map не разобран — в базу ничего не записано:\n"
+            + "\n".join(f"  • {x}" for x in errors)
+        )
+    return plan
+
+
+async def _staff_member(db, user_id: int) -> tuple[Owner | None, str]:
+    """(сотрудник, пусто) — годится; (None, причина) — нет. `db` — транзакция или adb_core."""
+    row = await db.fetchrow(
+        "SELECT role, username, full_name, deactivated_at FROM user_roles WHERE user_id = $1",
+        int(user_id),
+    )
+    if row is None:
+        return None, "нет в user_roles"
+    if row["deactivated_at"]:
+        return None, f"{row['role']}, деактивирован"
+    if row["role"] not in LOGIN_ROLES:
+        return None, f"роль {row['role']} — заказы и долги не видит"
+    name = str(row["full_name"] or "").strip() or f"Сотрудник {user_id}"
+    return Owner(int(user_id), name, str(row["username"] or ""), str(row["role"])), ""
+
+
+async def _resolve_owners(db, plan: OwnerPlan) -> dict[int, Owner]:
+    """Все цели плана — активные admin/boss/manager. Иначе `MigrationStop` со всеми причинами."""
+    owners: dict[int, Owner] = {0: MIGRATION_OWNER}
+    errors: list[str] = []
+    for tg in sorted({*plan.by_employee.values(), plan.default} - {0}):
+        member, why = await _staff_member(db, tg)
+        if member is None:
+            how = ", ".join(plan.sources.get(tg) or [str(tg)])
+            errors.append(f"{how}: {why}")
+            continue
+        owners[tg] = member
+    if errors:
+        raise MigrationStop(
+            "нет активного сотрудника admin/boss/manager с таким Telegram id — заказы и "
+            "платежи некому приписать, в базу ничего не записано:\n"
+            + "\n".join(f"  • {x}" for x in errors)
+        )
+    return owners
+
+
+def _docs_by_kind(
+    orders: list[dict], demands: list[dict], payments: list[dict],
+    supplies: list[dict], payments_out: list[dict],
+) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {"customerorder": orders, "demand": demands, "supply": supplies}
+    for docs, kinds in ((payments, INCOMING_MONEY), (payments_out, OUTGOING_MONEY)):
+        for doc_type in kinds:
+            out[doc_type] = [d for d in docs if d.get("doc_type") == doc_type]
+    return out
+
+
+def owner_table_lines(
+    employees: list[dict] | None, docs_by_kind: dict[str, list[dict]], plan: OwnerPlan | None,
+    staff: dict[int, tuple[Owner | None, str]],
+) -> list[str]:
+    """Таблица «сотрудник МС → сколько документов → на кого уйдут».
+
+    Печатается ДО записи, в том числе когда карта не задана или не разобралась:
+    ради неё и делается первый предпросмотр дня переноса.
+    """
+    all_docs = [d for docs in docs_by_kind.values() for d in docs]
+    known = _known_employees(employees, all_docs)
+    counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for kind, docs in docs_by_kind.items():
+        for d in docs:
+            counts[d.get("owner_ms_id") or ""][kind] += 1
+
+    def target(eid: str) -> str:
+        if plan is None:
+            return "? (карта не разобрана)"
+        tg = plan.target(eid)
+        how = "по карте" if eid and eid in plan.by_employee else "по умолчанию"
+        if tg == 0:
+            return f"0 «{MIGRATION_AUTHOR}» — только руководству ({how})"
+        member, why = staff.get(tg, (None, "не проверен"))
+        if member is None:
+            return f"{tg} ✗ {why} — перенос остановится"
+        return f"{tg} «{member.full_name}» ({member.role}) — {how}"
+
+    head = f"  {'id сотрудника МС':<36}  {'uid (логин)':<24}  {'ФИО':<28}"
+    head += "".join(f"{title:>6}" for _, title in OWNER_TABLE_KINDS) + "  → на кого"
+    lines = [
+        "Ключ для --orders-owner-map \"<ключ>=<telegram id>\": uid, id или ФИО (регистр не важен).",
+        "На автора пишутся заказы (заказ МС или продажа по отгрузке) и входящие деньги;",
+        "поступления и выплаты поставщикам автора в базе не хранят — колонки для опознания.",
+        head,
+    ]
+    rows: list[tuple[str, dict | None]] = list(known.items())
+    if counts.get(""):
+        rows.append(("", None))
+    rows.sort(key=lambda r: (-sum(counts.get(r[0], {}).values()), _employee_label(r[1] or {})))
+    for eid, e in rows:
+        c = counts.get(eid, {})
+        if e is None:
+            ident, uid, fio = NO_OWNER_LABEL, "", ""
+        else:
+            ident, uid = eid, e.get("uid") or ""
+            fio = e.get("full_name") or e.get("name") or (
+                "(нет в справочнике сотрудников)" if e.get("_not_in_directory") else ""
+            )
+            if e.get("archived"):
+                fio = f"{fio} [архив]"
+        line = f"  {ident:<36}  {uid[:24]:<24}  {fio[:28]:<28}"
+        line += "".join(f"{c.get(kind, 0):>6}" for kind, _ in OWNER_TABLE_KINDS)
+        lines.append(f"{line}  → {target(eid)}")
+    return lines
+
+
+async def print_owner_table(
+    employees: list[dict] | None, docs_by_kind: dict[str, list[dict]],
+    owner_map: list[tuple[str, int]] | None, default: int | None,
+) -> OwnerPlan | None:
+    """Напечатать таблицу авторов; вернуть план или None, если карта не разобралась."""
+    from services import adb_core
+
+    all_docs = [d for docs in docs_by_kind.values() for d in docs]
+    error = ""
+    try:
+        plan: OwnerPlan | None = resolve_owner_map(owner_map, employees, all_docs, default=default)
+    except MigrationStop as e:
+        plan, error = None, str(e)
+    staff: dict[int, tuple[Owner | None, str]] = {}
+    if plan is not None:
+        for tg in {*plan.by_employee.values(), plan.default} - {0}:
+            staff[tg] = await _staff_member(adb_core, tg)
+    logger.info("")
+    logger.info("═══ СОТРУДНИКИ МОЙСКЛАД — АВТОРЫ ДОКУМЕНТОВ ═══")
+    for line in owner_table_lines(employees, docs_by_kind, plan, staff):
+        logger.info("%s", line)
+    for tg, (member, _) in sorted(staff.items()):
+        if member is not None and member.full_name == f"Сотрудник {tg}":
+            logger.warning(
+                "У %s нет имени в user_roles — в заказах и платежах будет «%s». Чтобы было "
+                "имя: сотрудник пишет боту /start, затем перенос запускается заново.",
+                tg, member.full_name,
+            )
+    if error:
+        logger.error("%s", error)
+    return plan
+
+
 async def _upsert_order(
     txn, o: dict, *, cp_id: int | None, currency: str, moment: str,
     fully_paid: bool, fx: float | None, now: str,
+    owner: Owner = MIGRATION_OWNER,
 ) -> int:
     """Заказ по `ms_customerorder_id`. Повторный прогон обновляет, не дублирует.
 
@@ -1222,8 +2103,8 @@ async def _upsert_order(
     comment_bits = [b for b in (o.get("description") or "", o["state_name"]) if b]
     comment = " · ".join(["Перенос из МойСклад", *comment_bits])[:1000]
     fields = {
-        "user_id": 0,
-        "full_name": "Перенос из МойСклад",
+        "user_id": owner[0],
+        "full_name": owner[1],
         "status": "approved",
         "comment": comment,
         "agent_id": str(cp_id) if cp_id else None,
@@ -1256,6 +2137,7 @@ async def _upsert_order(
 async def _upsert_order_from_demand(
     txn, d: dict, *, cp_id: int | None, currency: str, moment: str,
     fx: float | None, now: str,
+    owner: Owner = MIGRATION_OWNER,
 ) -> int:
     """Отгрузка без заказа-основания → заказ. Идемпотентность по `ms_demand_id`.
 
@@ -1273,8 +2155,8 @@ async def _upsert_order_from_demand(
     )
     comment = f"Перенос из МойСклад · продажа по отгрузке {d['name'] or d['ms_id']}"[:1000]
     fields = {
-        "user_id": 0,
-        "full_name": "Перенос из МойСклад",
+        "user_id": owner[0],
+        "full_name": owner[1],
         "status": "shipped",
         "comment": comment,
         "agent_id": str(cp_id) if cp_id else None,
@@ -1421,6 +2303,7 @@ async def _write_invoice(
 async def _upsert_payment(
     txn, p: dict, *, order_id: int, base_cur: str, now: str,
     amount_cents: int | None = None, part: int = 0, fifo: bool = False,
+    owner: Owner = MIGRATION_OWNER,
 ) -> None:
     """Платёж по `ms_paymentin_id` (партиальный UNIQUE — идемпотентность в схеме).
 
@@ -1443,6 +2326,8 @@ async def _upsert_payment(
     key = p["ms_id"] if part <= 1 else f"{p['ms_id']}#{part}"
 
     note = p["purpose"] or ""
+    if p.get("doc_type") == "cashin":
+        note = f"приходный ордер{' · ' + note if note else ''}"
     if fifo:
         note = (
             f"разнесён по FIFO (в МС основания не было){' · ' + note if note else ''}"
@@ -1460,7 +2345,8 @@ async def _upsert_payment(
     await txn.execute(
         "INSERT INTO payments (user_id, username, full_name, amount_cents, currency, "
         "comment, status, order_id, ms_paymentin_id, fx_rate_to_base, created_at, confirmed_at) "
-        "VALUES (0, '', 'Перенос из МойСклад', $1, $2, $3, 'confirmed', $4, $5, $6, $7, $8)",
+        "VALUES ($1, $2, $3, $4, $5, $6, 'confirmed', $7, $8, $9, $10, $11)",
+        owner.user_id, owner.username, owner.full_name,
         amount, currency, comment, order_id, key, fx, moment or now, moment,
     )
 
@@ -1478,9 +2364,10 @@ async def _upsert_payment_out(
     moment = _ms_moment_to_local(p["moment"])
     currency = p["currency"]
     fx = p["fx"]
-    comment = (
-        f"Перенос из МойСклад · {p['purpose']}" if p["purpose"] else "Перенос из МойСклад"
-    )[:500]
+    bits = [b for b in (
+        "расходный ордер" if p.get("doc_type") == "cashout" else "", p["purpose"] or ""
+    ) if b]
+    comment = " · ".join(["Перенос из МойСклад", *bits])[:500]
     existing = await txn.fetchval(
         "SELECT id FROM supplier_payments WHERE ms_paymentout_id = $1", p["ms_id"]
     )
@@ -1538,6 +2425,8 @@ def _check_consistency(
     order_total_cents: dict[str, int],
     shipped_cents: dict[str, int],
     order_local: dict[str, int],
+    *,
+    demand_sum_minor: dict[str, int] | None = None,
 ) -> list[str]:
     """Логические проверки поверх перенесённого.
 
@@ -1564,6 +2453,15 @@ def _check_consistency(
             problems.append(
                 f"{label}: сумма позиций {total / 100:.2f} расходится с суммой "
                 f"документа в МС {ms_sum / 100:.2f}"
+            )
+        # Долг заказа с отгрузками считается по позициям ОТГРУЗОК — значит и
+        # полноту их состава сверяем с суммами отгрузок в МС: обрезанный
+        # `positions` занизил бы долг молча.
+        dem_sum = (demand_sum_minor or {}).get(ms_id, 0)
+        if ms_id in shipped_cents and dem_sum and abs(dem_sum - shipped) > 1:
+            problems.append(
+                f"{label}: сумма позиций отгрузок {shipped / 100:.2f} расходится с "
+                f"суммой отгрузок в МС {dem_sum / 100:.2f}"
             )
     return problems
 
@@ -1688,11 +2586,16 @@ def print_report(
     logger.info("Из МойСклад выгружено:")
     logger.info("  заказов покупателей : %5d  на %s", len(orders), _sums_by_currency(orders))
     logger.info("  отгрузок            : %5d  на %s", len(demands), _sums_by_currency(demands))
-    logger.info("  входящих платежей   : %5d  на %s", len(payments), _sums_by_currency(payments))
+    for title, docs, kinds in (
+        ("входящих денег    ", payments, INCOMING_MONEY),
+        ("исходящих денег   ", payments_out, OUTGOING_MONEY),
+    ):
+        logger.info("  %s  : %5d  на %s", title, len(docs), _sums_by_currency(docs))
+        for doc_type, kind in kinds.items():
+            part = [d for d in docs if d.get("doc_type", doc_type) == doc_type]
+            logger.info("      %-19s: %5d  на %s", kind, len(part), _sums_by_currency(part))
     logger.info("  поступлений (закупки): %4d  на %s",
                 len(supplies), _sums_by_currency(supplies))
-    logger.info("  исходящих платежей  : %5d  на %s",
-                len(payments_out), _sums_by_currency(payments_out))
     logger.info("")
     logger.info("Записано в локальные таблицы:")
     logger.info("  orders              : %5d  (из заказов МС %d · из отгрузок %d)",
@@ -1700,6 +2603,7 @@ def print_report(
                 stats.get("orders", 0), stats.get("orders_from_demand", 0))
     logger.info("      из них оплачено : %5d  · в долг %d",
                 stats.get("orders_paid", 0), stats.get("orders_credit", 0))
+    logger.info("      записаны на     : см. «ЧЬИ ЗАКАЗЫ И ПЛАТЕЖИ» ниже")
     logger.info("  order_items         : %5d  (с карточкой товара %d)",
                 stats.get("order_items", 0), stats.get("order_items_linked", 0))
     logger.info("  invoices (отгрузки) : %5d  (позиций %d)",
@@ -1715,8 +2619,13 @@ def print_report(
                     _money(stats["payments_overflow_cents"]))
     logger.info("  invoices (приход)   : %5d  (позиций %d)",
                 stats.get("supplies", 0), stats.get("supply_items", 0))
-    logger.info("  supplier_payments   : %5d  (не привязано %d)",
-                stats.get("payments_out", 0), stats.get("payments_out_unlinked", 0))
+    logger.info("  supplier_payments   : %5d  (не привязано %d, не поставщику %d, "
+                "закрыто режимом settled %d)",
+                stats.get("payments_out", 0), stats.get("payments_out_unlinked", 0),
+                stats.get("payments_out_not_supplier", 0), stats.get("payments_out_settled", 0))
+    logger.info("  приходы «уже оплачено» (settled): %d", stats.get("supplies_settled", 0))
+    logger.info("  заказов МС без отгрузки: %d · отгружено частично: %d",
+                stats.get("orders_unshipped", 0), stats.get("orders_partially_shipped", 0))
     logger.info("  контрагенты → supplier: %d  (только закупки; и продажи, и закупки — "
                 "остались customer: %d)",
                 stats.get("counterparties_to_supplier", 0), stats.get("counterparties_both", 0))
@@ -1734,6 +2643,33 @@ def print_report(
         logger.warning("НЕ СОПОСТАВЛЕНО — %d (разбирать руками, НЕ угадано):", unmatched.total())
         for line in unmatched.report():
             logger.warning("%s", line)
+
+    if unmatched.info:
+        logger.info("")
+        logger.info("СВЕДЕНИЯ (не ошибки переноса, но знать до переключения):")
+        for line in unmatched.report(info=True):
+            logger.info("%s", line)
+
+    if unmatched.owners:
+        logger.info("")
+        logger.info("═══ ЧЬИ ЗАКАЗЫ И ПЛАТЕЖИ (посчитано по записи в транзакции переноса) ═══")
+        for line in unmatched.owners:
+            logger.info("  %s", line)
+        if any(line.startswith("0 ") for line in unmatched.owners):
+            logger.info("  (user_id 0 видит только руководство; менеджеру — через "
+                        "--orders-owner-map / --orders-owner-default)")
+
+    if unmatched.preview:
+        logger.info("")
+        logger.info("═══ ЧТО ПОКАЖЕТ ПРИЛОЖЕНИЕ ПОСЛЕ ПЕРЕНОСА ═══")
+        for line in unmatched.preview:
+            logger.info("  %s", line)
+
+    if unmatched.balance:
+        logger.info("")
+        logger.info("═══ СВЕРКА С БАЛАНСАМИ КОНТРАГЕНТОВ В МС (информационная) ═══")
+        for line in unmatched.balance:
+            (logger.warning if stats.get("balance_mismatches") else logger.info)("  %s", line)
 
     if problems:
         logger.info("")
@@ -1795,60 +2731,57 @@ async def show_debtors() -> None:
 
 
 async def show_supplier_balance() -> None:
-    """Расчёты с поставщиками: приход минус выплаты, по контрагентам.
+    """Расчёты с поставщиками ТАК, КАК ИХ ПОКАЖЕТ ЭКРАН «Поставщикам».
 
-    Долг ПЕРЕД поставщиком и аванс ЕМУ ЖЕ — это одно и то же число с разным
-    знаком, и показывать надо оба: «мы должны» и «мы переплатили» одинаково
+    Считает штатный `services.supplier_debts.ledger`, а не «приход минус
+    выплаты» своим SQL: в режиме `settled` приходы закрыты условием «уже
+    оплачено», и прежний подсчёт печатал «мы должны» по каждому поставщику —
+    отчёт спорил бы с приложением ровно в ту минуту, когда их сверяют.
+    Долг и аванс показываются оба: «мы должны» и «мы переплатили» одинаково
     важны при разговоре с поставщиком.
     """
-    from services import adb_core
+    from services import supplier_debts
 
-    rows = await adb_core.fetch(
-        "SELECT c.id, c.name, "
-        "  (SELECT COALESCE(SUM(total_amount_cents), 0) FROM invoices "
-        "     WHERE counterparty_id = c.id AND type = 'incoming' "
-        "       AND status = 'confirmed') AS supplied_cents, "
-        "  (SELECT COALESCE(SUM(amount_cents), 0) FROM supplier_payments "
-        "     WHERE counterparty_id = c.id) AS paid_cents "
-        "FROM counterparties c ORDER BY c.name"
-    )
-    interesting = [
-        r for r in rows
-        if int(r["supplied_cents"] or 0) or int(r["paid_cents"] or 0)
-    ]
+    led = await supplier_debts.ledger()
+    debts: dict[tuple[str, str], int] = defaultdict(int)
+    for d in led.debts:
+        if d.remaining_cents > 0:
+            debts[(d.supplier_name, d.currency)] += d.remaining_cents
+    advances = {
+        (led.suppliers.get(sup_id, str(sup_id)), cur): cents
+        for (sup_id, cur), cents in led.advances.items()
+    }
     logger.info("")
-    logger.info("═══ РАСЧЁТЫ С ПОСТАВЩИКАМИ ═══")
-    if not interesting:
-        logger.info("  (пусто)")
+    logger.info("═══ РАСЧЁТЫ С ПОСТАВЩИКАМИ (как на экране «Поставщикам») ═══")
+    if not debts and not advances:
+        logger.info("  долгов и авансов нет")
         return
-    for r in interesting:
-        supplied = int(r["supplied_cents"] or 0)
-        paid = int(r["paid_cents"] or 0)
-        diff = supplied - paid
-        verdict = "мы должны" if diff > 0 else ("аванс у поставщика" if diff < 0 else "закрыто")
-        logger.info(
-            "  %-32s приход %12s  выплачено %12s  →  %s %s",
-            str(r["name"])[:32], _money(supplied), _money(paid), verdict, _money(abs(diff)),
-        )
+    for (name, cur), cents in sorted(debts.items()):
+        logger.info("  %-32s мы должны          %14s %s", name[:32], _money(cents), cur)
+    for (name, cur), cents in sorted(advances.items()):
+        logger.info("  %-32s аванс у поставщика %14s %s", name[:32], _money(cents), cur)
 
 
 async def show_totals() -> None:
-    """Сводка по типам оплаты. Суммы — из позиций, не из несуществующей колонки."""
+    """Сводка по типам оплаты — в разрезе ВАЛЮТ: сумма сумов и долларов вместе
+    ничего не значит. Суммы — из позиций, не из несуществующей колонки."""
     from services import adb_core
     from services.debts import SUM_ORDER_TOTAL_CENTS
 
     rows = await adb_core.fetch(
-        "SELECT o.payment_type, COUNT(*) AS cnt, "
+        "SELECT o.payment_type, o.currency, COUNT(*) AS cnt, "
         f"  COALESCE(SUM((SELECT {SUM_ORDER_TOTAL_CENTS} FROM order_items "
         "     WHERE order_id = o.id)), 0) AS total_cents "
-        "FROM orders o GROUP BY o.payment_type ORDER BY o.payment_type"
+        "FROM orders o GROUP BY o.payment_type, o.currency "
+        "ORDER BY o.payment_type, o.currency"
     )
     logger.info("")
     logger.info("═══ ЗАКАЗЫ ПО ТИПУ ОПЛАТЫ ═══")
     for r in rows:
         logger.info(
-            "  %-8s заказов %5d  на сумму %s",
-            r["payment_type"], int(r["cnt"]), _money(int(r["total_cents"] or 0)),
+            "  %-8s %-4s заказов %5d  на сумму %s",
+            r["payment_type"], r["currency"] or "—", int(r["cnt"]),
+            _money(int(r["total_cents"] or 0)),
         )
 
 
@@ -1935,7 +2868,12 @@ async def explain_order(name: str) -> int:
     return 0
 
 
-async def main(mode: str) -> int:
+async def main(
+    mode: str, *, supplier_history: str = "ledger", orders_owner: int | None = None,
+    owner_map: list[tuple[str, int]] | None = None,
+) -> int:
+    """`orders_owner` — Telegram-id «по умолчанию» (`--orders-owner-default`),
+    `owner_map` — пары (ключ сотрудника МС, Telegram-id) из `--orders-owner-map`."""
     if mode.startswith("explain:"):
         try:
             return await explain_order(mode.split(":", 1)[1])
@@ -1949,6 +2887,9 @@ async def main(mode: str) -> int:
         supplies = await pull_supplies()
         payments_out = await pull_payments_out()
         currencies = await pull_currencies()
+        returns = await pull_returns()
+        balances = await pull_counterparty_balances()
+        employees = await pull_employees()
 
         kinds = {
             "заказы": orders, "отгрузки": demands, "платежи": payments,
@@ -1961,11 +2902,20 @@ async def main(mode: str) -> int:
             logger.error("%s", e)
             return 1
         print_preflight(kinds, currencies, fx_problems)
+        plan = await print_owner_table(
+            employees, _docs_by_kind(orders, demands, payments, supplies, payments_out),
+            owner_map, orders_owner,
+        )
+        if plan is None:
+            logger.error("ПЕРЕНОС ОСТАНОВЛЕН: исправьте --orders-owner-map по таблице выше")
+            return 1
 
         try:
             stats, unmatched, problems = await write_history(
                 orders, demands, payments, supplies, payments_out,
                 currencies=currencies, dry_run=(mode == "dry-run"),
+                supplier_history=supplier_history, balances=balances, returns=returns,
+                orders_owner=orders_owner, owner_map=owner_map, employees=employees,
             )
         except MigrationStop as e:
             logger.error("")
@@ -1979,7 +2929,11 @@ async def main(mode: str) -> int:
 
         if mode == "dry-run":
             logger.info("")
-            logger.info("Это предпросмотр. Для записи: --apply")
+            logger.info(
+                "Это предпросмотр. Для записи: --apply --supplier-history ledger|settled "
+                "[--orders-owner-map \"<сотрудник МС>=<telegram id>\"] "
+                "[--orders-owner-default <telegram id>]"
+            )
             return 1 if problems else 0
 
         await show_totals()
@@ -2009,7 +2963,53 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="ЗАКАЗ",
         help="показать позиции заказа и всех его отгрузок (только чтение)",
     )
-    return p.parse_args(argv)
+    p.add_argument(
+        "--supplier-history",
+        choices=SUPPLIER_HISTORY_MODES,
+        default=None,
+        help="расчёты с поставщиками: ledger — приходы МС долги, выплаты их гасят; "
+             "settled — история закрыта, приходы «уже оплачено», выплаты не переносятся. "
+             "Обязателен с --apply (решение по предпросмотру)",
+    )
+    p.add_argument(
+        "--orders-owner-map",
+        action="append",
+        type=parse_owner_map_item,
+        default=[],
+        metavar="СОТРУДНИК_МС=TELEGRAM_ID",
+        help="документы этого сотрудника МС (ключ — uid, id или ФИО из таблицы сотрудников "
+             "в --dry-run) записать на сотрудника бота; можно несколько раз",
+    )
+    p.add_argument(
+        "--orders-owner-default",
+        type=int,
+        metavar="TELEGRAM_ID",
+        help="на кого записать документы остальных авторов и без автора; без флага — "
+             "user_id 0 «Перенос из МойСклад» (видит только руководство)",
+    )
+    p.add_argument(
+        "--orders-owner",
+        type=int,
+        metavar="TELEGRAM_ID",
+        help="устарело: то же, что --orders-owner-default",
+    )
+    args = p.parse_args(argv)
+    if args.orders_owner is not None and args.orders_owner_default is not None:
+        p.error("--orders-owner — прежнее имя --orders-owner-default: укажите что-то одно")
+    if args.orders_owner_default is None:
+        args.orders_owner_default = args.orders_owner
+    if args.orders_owner_default is not None and args.orders_owner_default <= 0:
+        p.error("--orders-owner-default: нужен Telegram id > 0")
+    if args.explain and (args.orders_owner_map or args.orders_owner_default):
+        p.error("--orders-owner-map/--orders-owner-default не имеют смысла с --explain")
+    if args.apply and not args.supplier_history:
+        p.error(
+            "--apply требует --supplier-history ledger|settled: посмотрите блок "
+            "«Поставщикам» в --dry-run и выберите осознанно"
+        )
+    if args.explain and args.supplier_history:
+        p.error("--supplier-history не имеет смысла с --explain")
+    return args
 
 
 if __name__ == "__main__":
@@ -2018,4 +3018,7 @@ if __name__ == "__main__":
         _mode = f"explain:{args.explain}"
     else:
         _mode = "dry-run" if args.dry_run else "apply"
-    sys.exit(asyncio.run(main(_mode)))
+    sys.exit(asyncio.run(main(
+        _mode, supplier_history=args.supplier_history or "ledger",
+        orders_owner=args.orders_owner_default, owner_map=args.orders_owner_map,
+    )))

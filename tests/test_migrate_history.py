@@ -155,7 +155,12 @@ def ms_api(monkeypatch):
     state = {
         "customerorder": [], "demand": [], "paymentin": [],
         "supply": [], "paymentout": [], "extra": {},
+        # Кассовые ордера и возвраты — отдельные сущности МС (см. докстринг
+        # скрипта); по умолчанию их нет, тесты подкладывают сами.
+        "cashin": [], "cashout": [], "salesreturn": [], "purchasereturn": [],
         "currency": [USD_CUR, UZS_CUR],
+        # Сотрудники МС (entity/employee) — авторы документов (`owner`).
+        "employee": [],
     }
 
     async def fake_ms_get(path, params=None):
@@ -203,17 +208,22 @@ def seeded(isolated_db):
     return db
 
 
-def _run(ms_api, *, dry_run=False):
+def _run(ms_api, *, dry_run=False, supplier_history="ledger", balances=None, returns=None,
+         orders_owner=None, owner_map=None):
     orders = asyncio.run(mig.pull_orders())
     demands = asyncio.run(mig.pull_demands())
     payments = asyncio.run(mig.pull_payments())
     supplies = asyncio.run(mig.pull_supplies())
     payments_out = asyncio.run(mig.pull_payments_out())
     currencies = asyncio.run(mig.pull_currencies())
+    if returns is None:
+        returns = asyncio.run(mig.pull_returns())
     return asyncio.run(
         mig.write_history(
             orders, demands, payments, supplies, payments_out,
-            currencies=currencies, dry_run=dry_run,
+            currencies=currencies, dry_run=dry_run, supplier_history=supplier_history,
+            balances=balances, returns=returns, orders_owner=orders_owner,
+            owner_map=owner_map, employees=asyncio.run(mig.pull_employees()),
         )
     )
 
@@ -1241,3 +1251,598 @@ def test_invoice_list_flags_historical_for_the_ui(seeded, ms_api, boss_api):
     assert r.status_code == 200
     flags = {i["invoice_number"]: i["historical"] for i in r.json()["invoices"]}
     assert flags == {"MS-D-D001": True, live["invoice_number"]: False}
+
+
+# ─── Подготовка к переносу на чистую базу (сентябрь 2026) ───────────────────
+#
+# Скрипт писался до разбивки оплаты, долгов поставщикам и CHECK-ограничений.
+# Ниже — то, что без правок дало бы выдуманные долги/авансы или уронило бы
+# транзакцию на проде.
+
+
+def _cashin(ms_id="cin-1", sum_minor=300000, op=None, agent=CP_MS):
+    doc = _paymentin(ms_id=ms_id, sum_minor=sum_minor, op=op)
+    doc["name"] = "ПКО-1"
+    doc["agent"] = {"meta": {"href": f"https://x/entity/counterparty/{agent}"}, "name": "ООО Ромашка"}
+    return doc
+
+
+def _cashout(ms_id="cout-1", sum_minor=200000, agent=CP_MS, op=("supply", "sup-1"),
+             expense_item=None):
+    doc = _paymentout(ms_id=ms_id, sum_minor=sum_minor, agent=agent, op=op)
+    doc["name"] = "РКО-1"
+    if expense_item:
+        doc["expenseItem"] = {"name": expense_item}
+    return doc
+
+
+def _returns_doc(ms_id="sr-1", sum_minor=50000, agent=CP_MS, name="ООО Ромашка"):
+    return {"id": ms_id, "name": "R1", "moment": "2026-03-20 10:00:00.000", "sum": sum_minor,
+            "agent": {"meta": {"href": f"https://x/entity/counterparty/{agent}"}, "name": name}}
+
+
+def _add_counterparty(db, name, ms_id):
+    with db.get_conn() as conn:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            db.q("INSERT INTO counterparties (name, type, legacy_ms_id, created_at) "
+                 "VALUES (?, 'customer', ?, ?)"),
+            (name, ms_id, db.now_str()),
+        )
+        conn.commit()
+
+
+def test_cashin_pays_a_sale_like_a_payment(seeded, ms_api):
+    """Приходный кассовый ордер — те же деньги клиента, что и платёж. Без него
+    продажа, оплаченная наличными, осталась бы долгом клиента."""
+    ms_api["demand"] = [_demand(ms_id="dem-x", name="D9", order_ms_id=None)]
+    ms_api["cashin"] = [_cashin(op=None)]
+
+    stats, unmatched, problems = _run(ms_api)
+
+    assert problems == [] and unmatched.total() == 0
+    assert stats["payments_in_cashin"] == 1 and stats["payments_fifo"] == 1
+    pay = _rows(seeded, "SELECT * FROM payments")[0]
+    assert (pay["ms_paymentin_id"], pay["amount_cents"], pay["status"]) == ("cin-1", 300000,
+                                                                          "confirmed")
+    assert "приходный ордер" in pay["comment"]
+    order = _rows(seeded, "SELECT payment_type, paid_confirmed_at FROM orders")[0]
+    assert order["payment_type"] == "paid" and order["paid_confirmed_at"]
+    assert stats["client_debts_open"] == 0
+
+
+def test_cashout_to_supplier_goes_to_supplier_payments(seeded, ms_api):
+    ms_api["supply"] = [_supply()]
+    ms_api["cashout"] = [_cashout()]
+
+    stats, _, _ = _run(ms_api)
+
+    assert stats["payments_out"] == 1 and stats["payments_out_cashout"] == 1
+    sp = _rows(seeded, "SELECT * FROM supplier_payments")[0]
+    assert sp["ms_paymentout_id"] == "cout-1" and "расходный ордер" in sp["comment"]
+    assert _rows(seeded, "SELECT * FROM payments") == []
+    assert stats["supplier_debts_open"] == 0 and stats["supplier_advances"] == 0
+
+
+def test_outgoing_money_to_non_supplier_is_not_a_supplier_payment(seeded, ms_api):
+    """Аренда/зарплата — не выплата поставщику: у получателя нет ни одного
+    прихода, и вся сумма легла бы в «Поставщикам» строкой «аванс»."""
+    _add_counterparty(seeded, "Арендодатель", "cp-rent")
+    ms_api["paymentout"] = [_paymentout(ms_id="po-rent", agent="cp-rent", op=None)]
+    ms_api["cashout"] = [_cashout(ms_id="co-rent", agent="cp-rent", op=None,
+                                  expense_item="Аренда")]
+
+    stats, unmatched, _ = _run(ms_api)
+
+    assert stats["payments_out_not_supplier"] == 2
+    assert _rows(seeded, "SELECT * FROM supplier_payments") == []
+    bucket = unmatched.buckets["исходящий платёж не поставщику — не перенесён"]
+    assert len(bucket) == 2 and any("Аренда" in x for x in bucket)
+    assert stats["supplier_advances"] == 0
+    types = {r["legacy_ms_id"]: r["type"]
+             for r in _rows(seeded, "SELECT legacy_ms_id, type FROM counterparties")}
+    assert types["cp-rent"] == "customer", "арендодатель не становится поставщиком"
+
+
+def test_zero_quantity_positions_are_skipped_and_reported(seeded, ms_api):
+    """CHECK `quantity > 0` на проде: нулевая строка уронила бы весь перенос."""
+    ms_api["demand"] = [_demand(order_ms_id=None, positions=[
+        _pos(P1_MS, "Труба", 3, 100000), _pos(P2_MS, "Уголок", 0, 5000),
+    ])]
+
+    stats, unmatched, problems = _run(ms_api)
+
+    assert problems == []
+    assert len(_rows(seeded, "SELECT * FROM order_items")) == 1
+    assert len(_rows(seeded, "SELECT * FROM invoice_items")) == 1
+    assert "позиция с нулевым количеством — не перенесена" in unmatched.buckets
+
+
+def test_zero_sum_money_documents_are_skipped_and_reported(seeded, ms_api):
+    ms_api["demand"] = [_demand(order_ms_id=None)]
+    ms_api["paymentin"] = [_paymentin(sum_minor=0, op=None)]
+    ms_api["supply"] = [_supply()]
+    ms_api["paymentout"] = [_paymentout(sum_minor=0)]
+
+    stats, unmatched, _ = _run(ms_api)
+
+    assert _rows(seeded, "SELECT * FROM payments") == []
+    assert _rows(seeded, "SELECT * FROM supplier_payments") == []
+    assert stats["payments_zero"] == 1 and stats["payments_out_zero"] == 1
+    assert "входящий документ с нулевой суммой — не перенесён" in unmatched.buckets
+    assert "исходящий документ с нулевой суммой — не перенесён" in unmatched.buckets
+
+
+def test_zero_total_order_is_not_an_open_debt(seeded, ms_api):
+    ms_api["demand"] = [_demand(order_ms_id=None, sum_minor=0,
+                                positions=[_pos(P1_MS, "Труба", 1, 0)])]
+
+    stats, _, _ = _run(ms_api)
+
+    order = _rows(seeded, "SELECT payment_type, paid_confirmed_at FROM orders")[0]
+    assert order["payment_type"] == "paid" and order["paid_confirmed_at"]
+    assert stats["client_debts_open"] == 0
+
+
+def test_partially_shipped_order_owes_only_what_was_shipped(seeded, ms_api):
+    """Баланс в МС — по отгрузкам. Заказали 6, отгрузили и оплатили 2:
+    клиент ничего не должен, а по позициям заказа вышел бы долг за 4 трубы."""
+    ms_api["customerorder"] = [_order(sum_minor=600000, positions=[_pos(P1_MS, "Труба", 6, 100000)])]
+    ms_api["demand"] = [_demand(sum_minor=200000, positions=[_pos(P1_MS, "Труба", 2, 100000)])]
+    ms_api["paymentin"] = [_paymentin(sum_minor=200000)]
+
+    stats, unmatched, problems = _run(ms_api)
+
+    assert problems == [], "недоотгрузка — сведения, а не расхождение"
+    assert stats["orders_partially_shipped"] == 1
+    assert [r["quantity"] for r in _rows(seeded, "SELECT quantity FROM order_items")] == [2]
+    order = _rows(seeded, "SELECT status, payment_type, paid_confirmed_at FROM orders")[0]
+    assert order["status"] == "shipped" and order["payment_type"] == "paid"
+    assert order["paid_confirmed_at"]
+    assert any("отгружен частично" in k for k in unmatched.info)
+    assert stats["client_debts_open"] == 0
+
+
+def test_demand_positions_must_match_demand_sums(seeded, ms_api):
+    ms_api["customerorder"] = [_order()]
+    ms_api["demand"] = [_demand(sum_minor=999999)]
+
+    _, _, problems = _run(ms_api)
+
+    assert any("суммой отгрузок в МС" in p for p in problems)
+
+
+def test_unshipped_ms_order_is_kept_to_ship_and_noted(seeded, ms_api):
+    ms_api["customerorder"] = [_order()]
+
+    stats, unmatched, _ = _run(ms_api)
+
+    assert stats["orders_unshipped"] == 1
+    assert _rows(seeded, "SELECT status FROM orders")[0]["status"] == "approved"
+    notes = [x for k, v in unmatched.info.items() if "без отгрузки" in k for x in v]
+    assert len(notes) == 1 and "Согласован" in notes[0]
+    assert stats["client_debts_open"] == 1, "виден и в предпросмотре «Долгов»"
+
+
+def test_settled_mode_closes_supplier_history(seeded, ms_api):
+    """`settled`: приходы «уже оплачено», выплаты не пишутся — иначе общие
+    выплаты при закрытых приходах легли бы «авансом» (supplier_debts._allocate)."""
+    ms_api["supply"] = [_supply(), _supply(ms_id="sup-2", name="S2")]
+    ms_api["paymentout"] = [_paymentout(op=None, sum_minor=150000)]
+
+    stats, unmatched, _ = _run(ms_api, supplier_history="settled")
+
+    terms = _rows(seeded, "SELECT payment_type, created_by, created_by_name "
+                          "FROM supplier_invoice_terms")
+    assert len(terms) == 2
+    assert {(t["payment_type"], t["created_by"], t["created_by_name"]) for t in terms} == {
+        ("paid", 0, "Перенос из МойСклад")}
+    assert _rows(seeded, "SELECT * FROM supplier_payments") == []
+    assert stats["payments_out_settled"] == 1 and stats["supplies_settled"] == 2
+    assert (stats["supplier_debts_open"], stats["supplier_advances"],
+            stats["supplier_debts_overdue"]) == (0, 0, 0)
+    assert any("settled" in k for k in unmatched.info)
+
+
+def test_ledger_mode_previews_debts_and_advances(seeded, ms_api):
+    _add_counterparty(seeded, "Завод", "cp-supplier")
+    ms_api["supply"] = [_supply(), _supply(ms_id="sup-2", name="S2", agent="cp-supplier")]
+    ms_api["paymentout"] = [_paymentout(sum_minor=900000, op=None)]
+
+    stats, unmatched, _ = _run(ms_api)
+
+    # Ромашка: приход 2 000 и выплата 9 000 → аванс 7 000; Завод: приход 2 000
+    # без выплаты → долг, просроченный со дня прихода.
+    assert stats["supplier_debts_open"] == 1
+    assert stats["supplier_debts_overdue"] == 1
+    assert stats["supplier_advances"] == 1
+    assert any("аванс" in line and "7 000.00" in line for line in unmatched.preview)
+
+
+def test_switching_supplier_history_mode_on_rerun(seeded, ms_api):
+    ms_api["supply"] = [_supply()]
+    ms_api["paymentout"] = [_paymentout()]
+
+    def state():
+        return (len(_rows(seeded, "SELECT * FROM supplier_payments")),
+                len(_rows(seeded, "SELECT * FROM supplier_invoice_terms")))
+
+    _run(ms_api)
+    assert state() == (1, 0)
+    _run(ms_api, supplier_history="settled")
+    assert state() == (0, 1)
+    _run(ms_api, supplier_history="settled")
+    assert state() == (0, 1)
+    _run(ms_api)
+    assert state() == (1, 0)
+
+
+def test_settled_mode_keeps_terms_set_by_a_person(seeded, ms_api):
+    ms_api["supply"] = [_supply()]
+    _run(ms_api)
+    inv_id = _rows(seeded, "SELECT id FROM invoices")[0]["id"]
+    with seeded.get_conn() as conn:
+        cur = seeded.get_cursor(conn)
+        cur.execute(
+            seeded.q("INSERT INTO supplier_invoice_terms (invoice_id, payment_type, due_date, "
+                     "created_by, created_by_name, created_at) "
+                     "VALUES (?, 'credit', '2030-01-01', 100, 'Boss', ?)"),
+            (inv_id, seeded.now_str()),
+        )
+        conn.commit()
+
+    stats, _, _ = _run(ms_api, supplier_history="settled")
+
+    assert stats["supplies_terms_kept"] == 1
+    assert _rows(seeded, "SELECT payment_type FROM supplier_invoice_terms")[0][
+        "payment_type"] == "credit"
+    _run(ms_api)  # ledger не удаляет чужую строку
+    assert len(_rows(seeded, "SELECT * FROM supplier_invoice_terms")) == 1
+
+
+def test_unknown_supplier_history_mode_is_refused(seeded, ms_api):
+    with pytest.raises(ValueError):
+        _run(ms_api, supplier_history="maybe")
+
+
+def test_balance_reconciliation_picks_sign_and_lists_mismatches(seeded, ms_api):
+    _add_counterparty(seeded, "Бета", "cp-beta")
+    beta = _demand(ms_id="dem-b", name="DB", order_ms_id=None, sum_minor=100000,
+                   positions=[_pos(P1_MS, "Труба", 1, 100000)])
+    beta["agent"] = {"meta": {"href": "https://x/entity/counterparty/cp-beta"}, "name": "Бета"}
+    ms_api["demand"] = [_demand(order_ms_id=None), beta]
+    # Знак МС здесь «клиент должен — минус»: у нас «мы должны» положительно,
+    # то есть клиент-должник отрицателен — совпадает как есть.
+    balances = [{"ms_id": CP_MS, "name": "ООО Ромашка", "balance": -300000},
+                {"ms_id": "cp-beta", "name": "Бета", "balance": -50000}]
+
+    stats, unmatched, _ = _run(ms_api, balances=balances)
+
+    assert (stats["balance_checked"], stats["balance_mismatches"]) == (2, 1)
+    assert "как есть" in unmatched.balance[0]
+    assert any("«Бета»" in line for line in unmatched.balance[1:])
+
+    inverted = [dict(b, balance=-b["balance"]) for b in balances]
+    stats, unmatched, _ = _run(ms_api, balances=inverted)
+    assert stats["balance_mismatches"] == 1 and "обратный" in unmatched.balance[0]
+
+
+def test_balance_reconciliation_skips_multi_currency_and_missing_report(seeded, ms_api):
+    ms_api["demand"] = [_demand(order_ms_id=None), _uzs_sale()]
+
+    stats, unmatched, _ = _run(ms_api, balances=[])
+    assert stats["balance_not_compared"] == 1 and stats["balance_checked"] == 0
+
+    stats, unmatched, _ = _run(ms_api, balances=None)
+    assert stats["balance_checked"] == 0 and "не выполнена" in unmatched.balance[0]
+
+
+def test_ms_returns_are_noted_not_migrated(seeded, ms_api):
+    ms_api["demand"] = [_demand(order_ms_id=None)]
+    ms_api["salesreturn"] = [_returns_doc()]
+
+    stats, unmatched, _ = _run(ms_api)
+
+    assert stats["ms_returns"] == 1
+    notes = [x for k, v in unmatched.info.items() if "возвраты" in k for x in v]
+    assert notes and "возврат покупателя" in notes[0] and "500.00" in notes[0]
+    assert _rows(seeded, "SELECT * FROM returns") == []
+
+
+def test_apply_requires_explicit_supplier_history():
+    with pytest.raises(SystemExit):
+        mig._parse_args(["--apply"])
+    assert mig._parse_args(["--apply", "--supplier-history", "settled"]).supplier_history == "settled"
+    assert mig._parse_args(["--dry-run"]).supplier_history is None
+    with pytest.raises(SystemExit):
+        mig._parse_args(["--apply", "--supplier-history", "maybe"])
+
+
+def test_dry_run_reports_app_preview_and_balance_check(seeded, ms_api, caplog):
+    import logging
+
+    ms_api["demand"] = [_demand(order_ms_id=None)]
+    ms_api["extra"]["report/counterparty"] = [
+        {"counterparty": {"meta": {"href": f"https://x/entity/counterparty/{CP_MS}"},
+                          "name": "ООО Ромашка"}, "balance": -300000},
+    ]
+    with caplog.at_level(logging.INFO, logger="ms_history"):
+        rc = asyncio.run(mig.main("dry-run"))
+
+    assert rc == 0
+    assert "ЧТО ПОКАЖЕТ ПРИЛОЖЕНИЕ" in caplog.text
+    assert "сравнено 1, расхождений 0" in caplog.text
+    assert _rows(seeded, "SELECT * FROM orders") == []
+
+
+# ─── Чьи заказы: сотрудники МС → сотрудники бота ─────────────────────────────
+
+OWNER_TG, BOSS_TG = 941599419, 273791555
+EMP_OWNER, EMP_OTHER = "emp-farid", "emp-anvar"
+
+
+def _employee(ms_id, uid, full_name, short_fio, *, archived=False):
+    """Сотрудник так, как его отдаёт entity/employee."""
+    return {
+        "meta": {"href": f"{_MS}/entity/employee/{ms_id}", "type": "employee"},
+        "id": ms_id, "uid": uid, "name": short_fio, "fullName": full_name,
+        "shortFio": short_fio, "archived": archived,
+    }
+
+
+def _by(doc, emp):
+    """Автор документа МС — ссылка на сотрудника, без expand."""
+    doc["owner"] = {"meta": {"href": f"{_MS}/entity/employee/{emp}", "type": "employee"}}
+    return doc
+
+
+@pytest.fixture
+def two_authors(seeded, ms_api):
+    """Два сотрудника МС и два сотрудника бота: владелец (manager) и босс без имени
+    в user_roles — ровно как на проде 16.09."""
+    import services.database as db
+
+    db.set_role(OWNER_TG, "flext9m", "Фаридун", "manager")
+    db.set_role(BOSS_TG, "", "", "boss")
+    ms_api["employee"] = [
+        _employee(EMP_OWNER, "farid@impeks", "Масуджанов Фаридун", "Масуджанов Ф."),
+        _employee(EMP_OTHER, "anvar@impeks", "Анваров Анвар", "Анваров А."),
+    ]
+    # Заказ МС владельца (отгрузил другой), продажа по отгрузке другого,
+    # платёж другого по заказу владельца и платёж владельца по продаже другого.
+    ms_api["customerorder"] = [_by(_order(sum_minor=300000), EMP_OWNER)]
+    ms_api["demand"] = [
+        _by(_demand(), EMP_OTHER),
+        _by(_demand(ms_id="dem-2", name="D002", order_ms_id=None), EMP_OTHER),
+    ]
+    ms_api["paymentin"] = [
+        _by(_paymentin(sum_minor=100000), EMP_OTHER),
+        _by(_paymentin(ms_id="pay-2", sum_minor=50000, op=("demand", "dem-2")), EMP_OWNER),
+    ]
+    return seeded
+
+
+def test_without_owner_flags_history_belongs_to_nobody(two_authors, ms_api):
+    stats, _, problems = _run(ms_api)
+    assert problems == [] and stats["orders_owner"] == 0
+    assert {r["user_id"] for r in _rows(two_authors, "SELECT user_id FROM orders")} == {0}
+    assert {(r["user_id"], r["full_name"]) for r in _rows(two_authors, "SELECT * FROM payments")} == {
+        (0, "Перенос из МойСклад")
+    }
+
+
+def test_owner_map_splits_orders_payments_and_debts_between_two_ms_employees(two_authors, ms_api):
+    """Заказ — на автора заказа МС, продажа по отгрузке — на автора отгрузки,
+    платёж — на автора платежа; имя и username — из user_roles. «Долги»
+    менеджера — ровно заказы, записанные на него."""
+    import services.database as db
+
+    stats, unmatched, problems = _run(
+        ms_api, owner_map=[("farid@impeks", OWNER_TG), ("anvar@impeks", BOSS_TG)],
+    )
+    assert problems == []
+    orders = {r["ms_customerorder_id"] or r["ms_demand_id"]: (r["user_id"], r["full_name"])
+              for r in _rows(two_authors, "SELECT * FROM orders")}
+    assert orders == {"ord-1": (OWNER_TG, "Фаридун"), "dem-2": (BOSS_TG, f"Сотрудник {BOSS_TG}")}
+    pays = {r["ms_paymentin_id"]: (r["user_id"], r["username"], r["full_name"])
+            for r in _rows(two_authors, "SELECT * FROM payments")}
+    assert pays == {"pay-1": (BOSS_TG, "", f"Сотрудник {BOSS_TG}"),
+                    "pay-2": (OWNER_TG, "flext9m", "Фаридун")}
+
+    mine = asyncio.run(db.get_open_debts(user_id=OWNER_TG))
+    assert [d["ms_customerorder_id"] for d in mine] == ["ord-1"]
+    boss = asyncio.run(db.get_open_debts(user_id=BOSS_TG))
+    assert [d["ms_demand_id"] for d in boss] == ["dem-2"]
+
+    assert stats["orders_owners"] == 2
+    summary = "\n".join(unmatched.owners)
+    assert f"{OWNER_TG} «Фаридун» (manager): заказов 1, из них открытых долгов (видит в «Долгах») 1" in summary
+    assert f"{BOSS_TG} «Сотрудник {BOSS_TG}» (boss): заказов 1" in summary
+
+    # Ключ — ФИО (регистр, пробелы, ё) или id: тот же результат; повтор идемпотентен.
+    _run(ms_api, owner_map=[("  МАСУДЖАНОВ   фаридун ", OWNER_TG), (EMP_OTHER, BOSS_TG)])
+    again = {r["ms_customerorder_id"] or r["ms_demand_id"]: r["user_id"]
+             for r in _rows(two_authors, "SELECT * FROM orders")}
+    assert again == {"ord-1": OWNER_TG, "dem-2": BOSS_TG}
+    assert len(_rows(two_authors, "SELECT id FROM payments")) == 2
+
+
+def test_unmapped_or_missing_author_goes_to_default(two_authors, ms_api):
+    """Автор не в карте, автор, которого нет в справочнике сотрудников, и
+    документ без автора — всё на `--orders-owner-default`."""
+    ms_api["demand"].append(_by(_demand(ms_id="dem-3", name="D003", order_ms_id=None), "emp-fired"))
+    ms_api["demand"].append(_demand(ms_id="dem-4", name="D004", order_ms_id=None))  # без owner
+
+    _, _, problems = _run(ms_api, owner_map=[("farid", OWNER_TG)], orders_owner=BOSS_TG)
+    assert problems == []
+    orders = {r["ms_customerorder_id"] or r["ms_demand_id"]: r["user_id"]
+              for r in _rows(two_authors, "SELECT * FROM orders")}
+    assert orders == {"ord-1": OWNER_TG, "dem-2": BOSS_TG, "dem-3": BOSS_TG, "dem-4": BOSS_TG}
+
+    # Без default — не в карте значит «Перенос из МойСклад» (user_id 0).
+    _run(ms_api, owner_map=[("farid@impeks", OWNER_TG)])
+    orders = {r["ms_customerorder_id"] or r["ms_demand_id"]: r["user_id"]
+              for r in _rows(two_authors, "SELECT * FROM orders")}
+    assert orders == {"ord-1": OWNER_TG, "dem-2": 0, "dem-3": 0, "dem-4": 0}
+
+
+@pytest.mark.parametrize("owner_map, match", [
+    ([("nobody@impeks", OWNER_TG)], "nobody@impeks.*нет такого сотрудника"),
+    ([("impeks", OWNER_TG)], "нет такого сотрудника"),  # хвост логина — не ключ
+    ([("farid@impeks", OWNER_TG), (EMP_OWNER, BOSS_TG)], "уже назначен"),
+])
+def test_bad_owner_map_key_stops_before_write(two_authors, ms_api, owner_map, match):
+    with pytest.raises(mig.MigrationStop, match=match):
+        _run(ms_api, owner_map=owner_map, orders_owner=BOSS_TG)
+    assert _rows(two_authors, "SELECT id FROM orders") == []
+
+
+def test_ambiguous_owner_map_key_stops(two_authors, ms_api):
+    ms_api["employee"].append(_employee("emp-farid-2", "farid2@impeks", "Другой", "Масуджанов Ф."))
+    with pytest.raises(mig.MigrationStop, match="нескольким сотрудникам"):
+        _run(ms_api, owner_map=[("Масуджанов Ф.", OWNER_TG)])
+    assert _rows(two_authors, "SELECT id FROM orders") == []
+
+
+def test_owner_targets_must_be_active_staff_before_any_write(two_authors, ms_api):
+    import services.database as db
+
+    with pytest.raises(mig.MigrationStop, match="orders-owner-map «farid@impeks»=777: нет в user_roles"):
+        _run(ms_api, owner_map=[("farid@impeks", 777)], orders_owner=BOSS_TG)
+    db.set_role(778, "g", "Гость", "guest")
+    with pytest.raises(mig.MigrationStop, match="orders-owner-default 778: роль guest"):
+        _run(ms_api, owner_map=[("farid@impeks", OWNER_TG)], orders_owner=778)
+    asyncio.run(db.deactivate_user(OWNER_TG, by=BOSS_TG))
+    with pytest.raises(mig.MigrationStop, match="941599419: manager, деактивирован"):
+        _run(ms_api, owner_map=[("farid@impeks", OWNER_TG)], orders_owner=BOSS_TG)
+    with pytest.raises(mig.MigrationStop, match="orders-owner-default 941599419: manager, деактивирован"):
+        _run(ms_api, orders_owner=OWNER_TG)  # прежний --orders-owner — те же проверки
+    assert _rows(two_authors, "SELECT id FROM orders") == [], "остановка — до записи"
+    assert _rows(two_authors, "SELECT id FROM payments") == []
+
+
+def test_dry_run_prints_ms_employee_table_with_targets(two_authors, ms_api, caplog):
+    import logging
+
+    ms_api["demand"].append(_demand(ms_id="dem-4", name="D004", order_ms_id=None))  # без owner
+    with caplog.at_level(logging.INFO, logger="ms_history"):
+        rc = asyncio.run(mig.main("dry-run", owner_map=[("farid@impeks", OWNER_TG)],
+                                  orders_owner=BOSS_TG))
+    assert rc == 0
+    lines = caplog.text.splitlines()
+    head = lines.index(next(x for x in lines if "СОТРУДНИКИ МОЙСКЛАД" in x))
+    table = "\n".join(lines[head:head + 9])
+    farid = next(x for x in lines[head:] if EMP_OWNER in x)
+    anvar = next(x for x in lines[head:] if EMP_OTHER in x)
+    nobody = next(x for x in lines[head:] if "(без автора)" in x)
+    assert "farid@impeks" in farid and "Масуджанов Фаридун" in farid
+    # колонки: заказ отгр плат ПКО пост исх РКО
+    assert farid.split("→")[0].split()[-7:] == ["1", "0", "1", "0", "0", "0", "0"]
+    assert anvar.split("→")[0].split()[-7:] == ["0", "2", "1", "0", "0", "0", "0"]
+    assert nobody.split("→")[0].split()[-7:] == ["0", "1", "0", "0", "0", "0", "0"]
+    assert f"→ {OWNER_TG} «Фаридун» (manager) — по карте" in farid
+    assert f"→ {BOSS_TG} «Сотрудник {BOSS_TG}» (boss) — по умолчанию" in anvar
+    assert "заказ  отгр  плат   ПКО  пост   исх   РКО  → на кого" in table
+    assert f"У {BOSS_TG} нет имени в user_roles" in caplog.text
+    assert "ЧЬИ ЗАКАЗЫ И ПЛАТЕЖИ" in caplog.text
+    assert _rows(two_authors, "SELECT * FROM orders") == []
+
+
+def test_dry_run_without_map_shows_table_and_bad_map_stops_after_it(two_authors, ms_api, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="ms_history"):
+        assert asyncio.run(mig.main("dry-run")) == 0
+    anvar = next(x for x in caplog.text.splitlines() if EMP_OTHER in x and "→" in x)
+    assert "→ 0 «Перенос из МойСклад» — только руководству (по умолчанию)" in anvar
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="ms_history"):
+        rc = asyncio.run(mig.main("dry-run", owner_map=[("farid@impek", OWNER_TG)]))
+    assert rc == 1
+    text = caplog.text
+    assert "СОТРУДНИКИ МОЙСКЛАД" in text and "farid@impeks" in text
+    assert "«farid@impek»: нет такого сотрудника МС" in text
+    assert "ПЕРЕНОС ОСТАНОВЛЕН" in text
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="ms_history"):
+        rc = asyncio.run(mig.main("dry-run", owner_map=[("farid@impeks", 777)]))
+    assert rc == 1
+    assert "777 ✗ нет в user_roles — перенос остановится" in caplog.text
+    assert "ПЕРЕНОС ОСТАНОВЛЕН" in caplog.text
+
+
+def test_employee_directory_unavailable_still_maps_by_id(two_authors, ms_api, monkeypatch):
+    """Нет прав на entity/employee — перенос не падает, ключом годится id автора."""
+    real = mig.ms_get
+
+    async def no_employees(path, params=None):
+        if path == "entity/employee":
+            raise RuntimeError("403")
+        return await real(path, params)
+
+    monkeypatch.setattr(mig, "ms_get", no_employees)
+    assert asyncio.run(mig.pull_employees()) is None
+    _, _, problems = _run(ms_api, owner_map=[(EMP_OWNER, OWNER_TG)], orders_owner=BOSS_TG)
+    assert problems == []
+    orders = {r["ms_customerorder_id"] or r["ms_demand_id"]: r["user_id"]
+              for r in _rows(two_authors, "SELECT * FROM orders")}
+    assert orders == {"ord-1": OWNER_TG, "dem-2": BOSS_TG}
+    with pytest.raises(mig.MigrationStop, match="нет такого сотрудника"):
+        _run(ms_api, owner_map=[("farid@impeks", OWNER_TG)])
+
+
+def test_orders_owner_cli_flags():
+    args = mig._parse_args([
+        "--apply", "--supplier-history", "ledger",
+        "--orders-owner-map", "farid@impeks=941599419",
+        "--orders-owner-map", "Масуджанов Фаридун = 941599419",
+        "--orders-owner-default", "273791555",
+    ])
+    assert args.orders_owner_map == [("farid@impeks", 941599419), ("Масуджанов Фаридун", 941599419)]
+    assert args.orders_owner_default == 273791555
+    legacy = mig._parse_args(["--apply", "--supplier-history", "settled", "--orders-owner", "941599419"])
+    assert legacy.orders_owner_default == 941599419 and legacy.orders_owner_map == []
+    plain = mig._parse_args(["--dry-run"])
+    assert plain.orders_owner_default is None and plain.orders_owner_map == []
+    for bad in (["--dry-run", "--orders-owner-map", "farid@impeks"],
+                ["--dry-run", "--orders-owner-map", "farid=abc"],
+                ["--dry-run", "--orders-owner-map", "=941599419"],
+                ["--dry-run", "--orders-owner", "1", "--orders-owner-default", "2"],
+                ["--explain", "00001", "--orders-owner-default", "2"]):
+        with pytest.raises(SystemExit):
+            mig._parse_args(bad)
+
+
+# ─── Платежи без разбивки ────────────────────────────────────────────────────
+
+
+def test_migrated_payments_need_no_breakdown(seeded, ms_api):
+    """Исторический платёж пишется БЕЗ строки `payment_parts` — и это штатно:
+    он `confirmed`, а подтверждённый платёж объясняет деньги заказа и без
+    разбивки. Иначе каждая перенесённая продажа висела бы «не оплачено способом»
+    (к отгрузке не допускается), а `migrate_payment_breakdown` требовал бы
+    вручную разложить сотни чужих платежей."""
+    import scripts.migrate_payment_breakdown as mpb
+    from services import order_payments
+
+    ms_api["customerorder"] = [_order(sum_minor=300000)]
+    ms_api["demand"] = [_demand(), _demand(ms_id="dem-2", name="D002", order_ms_id=None)]
+    ms_api["paymentin"] = [
+        _paymentin(sum_minor=300000),
+        _paymentin(ms_id="pay-2", sum_minor=100000, op=("demand", "dem-2")),
+    ]
+    _, _, problems = _run(ms_api)
+    assert problems == []
+
+    assert _rows(seeded, "SELECT * FROM payment_parts") == []
+    assert {r["status"] for r in _rows(seeded, "SELECT status FROM payments")} == {"confirmed"}
+    orders = {r["ms_customerorder_id"] or r["ms_demand_id"]: r["id"]
+              for r in _rows(seeded, "SELECT id, ms_demand_id, ms_customerorder_id FROM orders")}
+    gaps = asyncio.run(order_payments.payment_gap_cents(list(orders.values())))
+    assert gaps[orders["ord-1"]] == 0, "оплаченный заказ объяснён платежом без разбивки"
+    assert gaps[orders["dem-2"]] == 200000, "частичная оплата — остаток долга, не весь заказ"
+
+    rep = asyncio.run(mpb.report())
+    assert rep["unexplained_payments"] == [] and rep["paid_orders_blocked"] == {}

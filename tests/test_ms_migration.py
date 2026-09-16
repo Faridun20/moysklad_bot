@@ -269,6 +269,36 @@ def test_no_live_data_right_after_first_migration(mig):
     _run(go())
 
 
+def test_history_orders_assigned_to_an_employee_are_not_live_work(mig, isolated_db):
+    """`migrate_history_from_moysklad --orders-owner` пишет исторические заказы
+    на сотрудника (user_id ≠ 0). Живой работой они от этого не становятся —
+    признак истории ключ документа МС, а не автор."""
+    db = isolated_db
+
+    async def go():
+        await mig.apply_migration(PRODUCTS, COUNTERPARTIES, STOCK)
+        stamp = "2999-01-01 00:00:00"
+        with db.get_conn() as conn:
+            cur = db.get_cursor(conn)
+            cur.execute(
+                db.q("INSERT INTO orders (user_id, status, ms_demand_id, created_at, updated_at) "
+                     "VALUES (941599419, 'shipped', 'dem-1', ?, ?)"), (stamp, stamp),
+            )
+            conn.commit()
+        assert (await mig.live_activity())["orders"] == 0
+        with db.get_conn() as conn:
+            cur = db.get_cursor(conn)
+            cur.execute(
+                db.q("INSERT INTO orders (user_id, status, created_at, updated_at) "
+                     "VALUES (941599419, 'draft', ?, ?)"),
+                (stamp, stamp),
+            )
+            conn.commit()
+        assert (await mig.live_activity())["orders"] == 1
+
+    _run(go())
+
+
 def test_rerun_apply_is_refused_when_live_invoices_exist(mig, isolated_db, monkeypatch):
     """Живая накладная после переноса → повторный --apply отказывается и
     остаток не трогает. Снимок МС (10.5) стёр бы списание 4 шт молча."""
@@ -371,3 +401,228 @@ def test_override_flag_requires_apply(mig):
 
 async def _async(value):
     return value
+
+
+# ─── Отрицательный остаток, дубли артикула, цены (перенос на чистую базу) ─────
+#
+# Прошлый боевой перенос привёз 32 отрицательных остатка (МС разрешает продавать
+# в минус) — из-за них не ставится `stock_quantity_chk`. Артикул в МС не
+# уникален, а у нас UNIQUE: один дубль ронял бы весь перенос. Цены владелец
+# хочет перенести вместе со справочником.
+
+USD_ID, UZS_ID, EUR_ID = "cur-usd", "cur-uzs", "cur-eur"
+ISO = {USD_ID: "USD", UZS_ID: "UZS", EUR_ID: "EUR"}
+
+
+def _money(value, cur_id, type_name=None):
+    d = {"value": value,
+         "currency": {"meta": {"href": f"https://api.moysklad.ru/api/remap/1.2/entity/currency/{cur_id}"}}}
+    if type_name is not None:
+        d["priceType"] = {"name": type_name}
+    return d
+
+
+def _raw_product(name="Болт", sale=None, buy=None):
+    return {"id": "p", "name": name, "salePrices": sale or [], "buyPrice": buy}
+
+
+def test_negative_ms_stock_is_written_as_zero_and_reported(mig):
+    from services import adb_core
+
+    stock = {"uuid-p1": Decimal("-5"), "uuid-p2": Decimal("3")}
+    stats = _run(mig.apply_migration(PRODUCTS, COUNTERPARTIES, stock))
+    assert stats["stock_negative_clamped"] == 1
+    assert stats["stock_negative_total"] == Decimal("5")
+    lines = next(v for k, v in stats["issues"].items() if "отрицательный" in k)
+    assert lines == ["«Болт М8»: в МС -5 → записано 0"]
+    qty = _run(adb_core.fetchval(
+        "SELECT s.quantity FROM stock s JOIN products p ON p.id = s.product_id "
+        "WHERE p.legacy_ms_id = 'uuid-p1'"))
+    assert Decimal(str(qty)) == 0
+    assert _run(adb_core.fetchval("SELECT COUNT(*) FROM stock WHERE quantity < 0")) == 0
+    # Сверка сравнивает с тем, что обязан был записать перенос, — с нулём.
+    assert _run(mig.verify(PRODUCTS, COUNTERPARTIES, stock)) == []
+    assert mig.negative_stock(PRODUCTS, stock) == [("Болт М8", Decimal("-5"))]
+
+
+def test_verify_still_catches_drift_on_clamped_row(mig):
+    from services import adb_core
+
+    stock = {"uuid-p1": Decimal("-5"), "uuid-p2": Decimal("3")}
+    _run(mig.apply_migration(PRODUCTS, COUNTERPARTIES, stock))
+    _run(adb_core.execute("UPDATE stock SET quantity = -5"))
+    assert _run(mig.verify(PRODUCTS, COUNTERPARTIES, stock)) != []
+
+
+def test_duplicate_sku_goes_to_first_product_only(mig):
+    from services import adb_core
+
+    products = [dict(PRODUCTS[0], sku="X1"), dict(PRODUCTS[1], sku="X1")]
+    stats = _run(mig.apply_migration(products, COUNTERPARTIES, STOCK))
+    assert stats["sku_duplicates"] == 1
+    assert any("артикул X1" in line for lines in stats["issues"].values() for line in lines)
+    rows = _run(adb_core.fetch("SELECT legacy_ms_id, sku FROM products ORDER BY id"))
+    assert [(r["legacy_ms_id"], r["sku"]) for r in rows] == [("uuid-p1", "X1"), ("uuid-p2", None)]
+
+    # Повтор: первый товар сохраняет артикул, дубль не «перехватывает» его.
+    again = _run(mig.apply_migration(products, COUNTERPARTIES, STOCK))
+    assert again["sku_duplicates"] == 1
+    rows = _run(adb_core.fetch("SELECT legacy_ms_id, sku FROM products ORDER BY id"))
+    assert [(r["legacy_ms_id"], r["sku"]) for r in rows] == [("uuid-p1", "X1"), ("uuid-p2", None)]
+
+
+def test_sku_taken_by_live_card_is_a_duplicate(mig, isolated_db):
+    from services import adb_core
+
+    _run(adb_core.execute(
+        "INSERT INTO products (name, unit, sku, created_at) VALUES ('Живой', 'шт', 'B8', '2026-01-01')"))
+    stats = _run(mig.apply_migration(PRODUCTS, COUNTERPARTIES, STOCK))
+    assert stats["sku_duplicates"] == 1
+    assert _run(adb_core.fetchval("SELECT sku FROM products WHERE legacy_ms_id = 'uuid-p1'")) is None
+
+
+def test_sku_swap_between_products_on_rerun(mig):
+    """В МС артикулы двух товаров поменяли местами — UNIQUE не падает на обмене."""
+    from services import adb_core
+
+    _run(mig.apply_migration(PRODUCTS, COUNTERPARTIES, STOCK))
+    swapped = [dict(PRODUCTS[0], sku="G8"), dict(PRODUCTS[1], sku="B8")]
+    stats = _run(mig.apply_migration(swapped, COUNTERPARTIES, STOCK))
+    assert stats["sku_duplicates"] == 0
+    rows = _run(adb_core.fetch("SELECT legacy_ms_id, sku FROM products ORDER BY id"))
+    assert [(r["legacy_ms_id"], r["sku"]) for r in rows] == [("uuid-p1", "G8"), ("uuid-p2", "B8")]
+
+
+def test_extract_price_rules():
+    sale = [_money(1250000, USD_ID, "Цена продажи"), _money(1100000, USD_ID, "Оптовая цена")]
+    price, issues = mig_module().extract_price(
+        _raw_product(sale=sale, buy=_money(900000, USD_ID)), ISO)
+    assert issues == []
+    assert price == {"sale_price_cents": 1250000, "wholesale_price_cents": 1100000,
+                     "cost_price_cents": 900000, "currency": "USD"}
+
+    # Закупочная и оптовая в другой валюте — не переносятся, с замечанием.
+    sale2 = [_money(1250000, USD_ID), _money(9_000_000_00, UZS_ID, "опт")]
+    price, issues = mig_module().extract_price(
+        _raw_product(sale=sale2, buy=_money(100_000_000, UZS_ID)), ISO)
+    assert price == {"sale_price_cents": 1250000, "wholesale_price_cents": None,
+                     "cost_price_cents": None, "currency": "USD"}
+    assert len(issues) == 2
+
+    # Валюта не из разрешённых — цены нет вовсе.
+    price, issues = mig_module().extract_price(_raw_product(sale=[_money(500, EUR_ID)]), ISO)
+    assert price is None and "EUR" in issues[0]
+
+    # Ничего нет — строки нет; только закупочная — строка в её валюте.
+    assert mig_module().extract_price(_raw_product(sale=[_money(0, USD_ID)]), ISO) == (None, [])
+    price, _ = mig_module().extract_price(_raw_product(buy=_money(700, UZS_ID)), ISO)
+    assert price == {"sale_price_cents": None, "wholesale_price_cents": None,
+                     "cost_price_cents": 700, "currency": "UZS"}
+
+    # Валюта, которой нет в словаре, — не угадываем.
+    price, issues = mig_module().extract_price(_raw_product(sale=[_money(5, "cur-x")]), ISO)
+    assert price is None and "не найдена" in issues[0]
+
+
+def mig_module():
+    import scripts.migrate_from_moysklad as m
+
+    return m
+
+
+PRICE = {"sale_price_cents": 1250000, "wholesale_price_cents": None,
+         "cost_price_cents": 900000, "currency": "USD"}
+
+
+def _priced():
+    return [dict(PRODUCTS[0], price=dict(PRICE), price_issues=[]),
+            dict(PRODUCTS[1], price=None, price_issues=["«Гайка М8»: валюта EUR"])]
+
+
+def test_prices_are_written_by_our_product_id_and_read_by_the_app(mig):
+    from services import adb_core, database
+
+    stats = _run(mig.apply_migration(_priced(), COUNTERPARTIES, STOCK))
+    assert (stats["prices"], stats["prices_skipped"]) == (1, 1)
+    pid = _run(adb_core.fetchval("SELECT id FROM products WHERE legacy_ms_id = 'uuid-p1'"))
+    got = _run(database.get_product_prices_by_ids([str(pid)]))[str(pid)]
+    assert got["sale_price_cents"] == 1250000 and got["currency"] == "USD"
+    assert got["cost_price_cents"] == 900000
+    assert _run(mig.verify(_priced(), COUNTERPARTIES, STOCK)) == []
+
+    # Повтор обновляет цену, а не плодит строки.
+    changed = _priced()
+    changed[0]["price"]["sale_price_cents"] = 1300000
+    _run(mig.apply_migration(changed, COUNTERPARTIES, STOCK))
+    assert _run(adb_core.fetchval("SELECT COUNT(*) FROM product_prices")) == 1
+    assert _run(adb_core.fetchval("SELECT sale_price_cents FROM product_prices")) == 1300000
+
+
+def test_manual_price_edit_survives_rerun(mig):
+    from services import adb_core
+
+    _run(mig.apply_migration(_priced(), COUNTERPARTIES, STOCK))
+    _run(adb_core.execute("UPDATE product_prices SET sale_price_cents = 1, updated_by = 42"))
+    stats = _run(mig.apply_migration(_priced(), COUNTERPARTIES, STOCK))
+    assert stats["prices_kept_manual"] == 1
+    assert _run(adb_core.fetchval("SELECT sale_price_cents FROM product_prices")) == 1
+
+
+def test_verify_catches_lost_prices(mig):
+    from services import adb_core
+
+    _run(mig.apply_migration(_priced(), COUNTERPARTIES, STOCK))
+    _run(adb_core.execute("DELETE FROM product_prices"))
+    problems = _run(mig.verify(_priced(), COUNTERPARTIES, STOCK))
+    assert any("цены продажи" in p for p in problems)
+
+
+def test_dry_run_reports_through_real_write_path_and_writes_nothing(mig):
+    from services import adb_core
+
+    products = [dict(p, sku="S") for p in _priced()]
+    stock = {"uuid-p1": Decimal("-2"), "uuid-p2": Decimal("1")}
+    stats = _run(mig.apply_migration(products, COUNTERPARTIES, stock, dry_run=True))
+    assert stats["verify_problems"] == []
+    assert (stats["stock_negative_clamped"], stats["sku_duplicates"], stats["prices"]) == (1, 1, 1)
+    for table in ("products", "counterparties", "stock", "product_prices", "ms_id_map"):
+        assert _run(adb_core.fetchval(f"SELECT COUNT(*) FROM {table}")) == 0, table
+
+
+def test_pull_products_parses_ms_json_with_prices(mig, monkeypatch, caplog):
+    base = "https://api.moysklad.ru/api/remap/1.2/entity"
+    raw = [{
+        "meta": {"href": f"{base}/product/uuid-p1"}, "id": "uuid-p1", "name": " Болт М8 ",
+        "pathName": "Крепёж", "code": "B8", "article": "A-1", "uom": {"name": "шт"},
+        "salePrices": [_money(1250000, USD_ID, "Цена продажи"),
+                       _money(1000000, USD_ID, "Оптовая цена")],
+        "buyPrice": _money(800000, USD_ID),
+    }]
+    currencies = [{"meta": {"href": f"{base}/currency/{USD_ID}"}, "id": USD_ID,
+                   "name": "доллар", "isoCode": "USD"}]
+
+    async def fake_fetch_all(path, params=None):
+        return {"entity/product": raw, "entity/currency": currencies}[path]
+
+    monkeypatch.setattr(mig, "_fetch_all", fake_fetch_all)
+    caplog.set_level("INFO")
+    products = _run(mig.pull_products())
+    assert products[0]["name"] == "Болт М8" and products[0]["sku"] == "B8"
+    assert products[0]["price"] == {"sale_price_cents": 1250000, "wholesale_price_cents": 1000000,
+                                    "cost_price_cents": 800000, "currency": "USD"}
+    assert "Оптовая цена" in caplog.text
+
+
+def test_main_dry_run_prints_categories_and_writes_nothing(mig, monkeypatch, caplog):
+    from services import adb_core
+
+    products = [dict(p, sku="S") for p in _priced()]
+    monkeypatch.setattr(mig, "pull_products", lambda: _async(products))
+    monkeypatch.setattr(mig, "pull_counterparties", lambda: _async(COUNTERPARTIES))
+    monkeypatch.setattr(mig, "pull_stock", lambda: _async({"uuid-p1": Decimal("-2")}))
+    caplog.set_level("INFO")
+    assert _run(mig.main("dry-run")) == 0
+    text = caplog.text
+    assert "ОТРИЦАТЕЛЬНЫЙ ОСТАТОК" in text and "дублей артикула: 1" in text
+    assert "цены: не перенесено" in text
+    assert _run(adb_core.fetchval("SELECT COUNT(*) FROM products")) == 0
