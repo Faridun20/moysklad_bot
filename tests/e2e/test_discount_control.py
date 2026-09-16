@@ -36,6 +36,8 @@ def test_boss_sees_flagged_discount_in_decisions_and_approves(open_app, e2e):
     go(mgr, "sales")
     mgr.wait_for_selector(f'.order-card[data-id="{seeded["order_id"]}"]')
     settled(mgr)
+    # Строки товаров со скидкой — в подробной сводке карточки.
+    mgr.click(f'.order-card[data-id="{seeded["order_id"]}"] [data-details-toggle]')
     mgr_text = mgr.inner_text("#content")
     assert "Ждёт одобрения из-за скидки 30%" in mgr_text
     assert "прайс 100 USD · скидка 30%" in mgr_text, mgr_text

@@ -26,6 +26,15 @@ def _stock(e2e) -> float:
     return float(rows[0]["quantity"]) if rows else 0.0
 
 
+def _open_details(page) -> None:
+    """«Счёт на оплату» — в подробной сводке карточки; раскрыть, если свёрнута.
+    Раскрытие переживает перерисовку списка, поэтому повторный клик закрыл бы её."""
+    toggle = page.locator("#content [data-details-toggle]").first
+    toggle.wait_for()
+    if toggle.get_attribute("aria-expanded") != "true":
+        toggle.click()
+
+
 def test_manager_shows_the_invoice_before_the_request_and_then_ships(open_app, e2e):
     pytest.importorskip("weasyprint", reason="нет weasyprint/системных pango")
     ids = e2e.ids
@@ -57,7 +66,7 @@ def test_manager_shows_the_invoice_before_the_request_and_then_ships(open_app, e
     go(mgr, "sales")
     tab(mgr, "orders")
     # «Счёт на оплату» — в подробной сводке карточки.
-    mgr.click("#content [data-details-toggle]")
+    _open_details(mgr)
     mgr.wait_for_selector(".btn-sales-invoice")
     order_id = e2e.rows("SELECT id FROM orders ORDER BY id DESC LIMIT 1")[0]["id"]
     assert e2e.rows("SELECT status FROM orders WHERE id = ?", (order_id,))[0]["status"] == "draft"
@@ -110,7 +119,7 @@ def test_manager_shows_the_invoice_before_the_request_and_then_ships(open_app, e
     go(mgr, "sales")
     tab(mgr, "orders")
     # «Счёт на оплату» — в подробной сводке карточки.
-    mgr.click("#content [data-details-toggle]")
+    _open_details(mgr)
     mgr.wait_for_selector(".btn-sales-invoice")
 
 
