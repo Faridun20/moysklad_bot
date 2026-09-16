@@ -423,8 +423,9 @@ const LEGACY_SCREENS = {
   cashbox: 'money:ops',
   limits: 'clients:limits',
   leads: 'clients:funnel',
-  // «Накладные» стали вкладкой «Склада» (UI-бриф п.4); старый адрес экрана
-  // ведёт туда же.
+  // «Накладные» стали вкладкой «Склада» (UI-бриф п.4) и с тех пор называются
+  // «Движения»; КЛЮЧ вкладки остался `invoices` — на нём висят этот алиас,
+  // адреса очереди дел и закладки. Старый адрес экрана ведёт туда же.
   whinvoices: 'stock:invoices',
   // Заявки руководителя — часть «Решений» (resolveScreen в helpers.js уводит
   // сюда и `money:confirm`). Остальным ролям тот же адрес ведёт в их прежнее
@@ -6701,22 +6702,8 @@ async function renderWarehousesScreen() {
       <button class="btn-secondary" id="wh-add-warehouse">${icon('plus')} Добавить склад</button>
     </div>
     ${activeCount > 1 ? `
-    <div class="section-label">Перемещение остатка</div>
-    <div class="c-surface c-surface--list">
-      <div class="c-row c-row--tap" id="wh-transfer-open" role="button" tabindex="0">
-        <div class="card-row-icon">${icon('truck')}</div>
-        <div class="card-row-info">
-          <div class="card-row-title">Переместить товар</div>
-          <div class="card-row-sub">Между складами, атомарно — остаток не уйдёт в минус</div>
-        </div>
-      </div>
-      <div class="c-row c-row--tap" id="wh-transfers-history" role="button" tabindex="0">
-        <div class="card-row-icon">${icon('list')}</div>
-        <div class="card-row-info">
-          <div class="card-row-title">История перемещений</div>
-        </div>
-      </div>
-    </div>` : ''}
+    <div class="c-field-hint">Переместить остаток между складами и посмотреть
+      историю — «Склад → Движения → Перемещения».</div>` : ''}
   `;
 
   content.querySelectorAll('[data-wh-id]').forEach(rowEl => {
@@ -6740,17 +6727,9 @@ async function renderWarehousesScreen() {
       },
     });
   });
-  document.getElementById('wh-transfer-open')?.addEventListener('click', () => {
-    haptic('light');
-    openStockTransferForm(rows.filter(w => !w.archived));
-  });
-  document.getElementById('wh-transfers-history')?.addEventListener('click', () => {
-    haptic('light');
-    renderStockTransfersHistory();
-  });
 }
 
-function openStockTransferForm(activeWarehouses) {
+function openStockTransferForm(activeWarehouses, onDone) {
   if (activeWarehouses.length < 2) {
     toast('Нужно хотя бы два активных склада', 'error');
     return;
@@ -6760,12 +6739,12 @@ function openStockTransferForm(activeWarehouses) {
     hint: 'Остаток по складу сервер проверит при сохранении',
     onPick: (item, { close }) => {
       close();
-      openTransferQuantityForm(item, activeWarehouses);
+      openTransferQuantityForm(item, activeWarehouses, onDone);
     },
   });
 }
 
-function openTransferQuantityForm(product, warehouses) {
+function openTransferQuantityForm(product, warehouses, onDone) {
   const options = warehouses.map(w => [String(w.id), w.name]);
   const toOptions = options.length > 1 ? [options[1], options[0], ...options.slice(2)] : options;
   return openMachineSheet({
@@ -6793,37 +6772,72 @@ function openTransferQuantityForm(product, warehouses) {
       if (!res.ok) { showErr((res.body && res.body.reason) || res.error); return false; }
       haptic('success');
       toast('Товар перемещён');
+      // Лента перемещений обязана показать только что сделанное: без
+      // перерисовки экран остаётся тем, каким был до движения товара.
+      if (typeof onDone === 'function') onDone();
       return true;
     },
   });
 }
 
-async function renderStockTransfersHistory() {
+// «Склад → Движения → Перемещения»: действие и лента в одном месте.
+// Раньше и то и другое лежало в «Настройках → Склады» — то есть перемещение
+// товара, которое делает менеджер, пряталось в разделе руководства, а рядом с
+// остальными движениями склада его не было вовсе.
+//
+// Переместить может и менеджер (`/api/stock/transfer` — admin/boss/manager:
+// товар физически двигает он), а ИСТОРИЯ — руководству (`/api/stock/transfers`
+// — admin/boss). Поэтому лента рисуется по `canCall`: список, который
+// гарантированно ответит 403, не запрашиваем вовсе.
+async function renderStockTransfersTab() {
   const content = document.getElementById('content');
-  setScreenContext('История перемещений');
-  showBack(() => renderWarehousesScreen());
-  content.innerHTML = skeleton('list', 4);
-  let data;
+  hideBack();
+  whFrame(content, skeleton('list', 4));
+  const gen = screenGen();
+  const canSeeHistory = canCall('/api/stock/transfers', role());
+
+  let warehouses = whWarehouses;
+  let rows = null;
   try {
-    data = await api('/api/stock/transfers', { limit: 100 });
+    const [whList, hist] = await Promise.all([
+      warehouses ? { warehouses } : api('/api/warehouses/active', {}),
+      canSeeHistory ? api('/api/stock/transfers', { limit: 100 }) : { transfers: null },
+    ]);
+    warehouses = whWarehouses = whList.warehouses || [];
+    rows = hist.transfers;
   } catch (e) {
-    content.innerHTML = errorBox(e.message);
+    whFrame(content, errorBox(e.message || String(e)));
     return;
   }
-  const rows = data.transfers || [];
-  content.innerHTML = rows.length
-    ? `<div class="c-surface c-surface--list">${rows.map(t => `
-        <div class="c-row">
-          <div class="card-row-info">
-            <div class="card-row-title">${escapeHtml(t.product_name)}</div>
-            <div class="card-row-sub">${escapeHtml(t.from_warehouse_name)} → ${escapeHtml(t.to_warehouse_name)}
-              · ${whQty(t.quantity)} ${escapeHtml(t.unit || '')}</div>
+  if (gen !== screenGen()) return;
+
+  const active = warehouses.filter(w => !w.archived);
+  const moveBtn = `<div class="form-row">
+      <button class="btn-primary" id="wh-transfer-open">${icon('truck')} Переместить товар</button>
+    </div>`;
+  const list = rows == null
+    ? ''
+    : (rows.length
+      ? `<div class="section-label">История</div><div class="c-surface c-surface--list">${rows.map(t => `
+          <div class="c-row">
+            <div class="card-row-info">
+              <div class="card-row-title">${escapeHtml(t.product_name)}</div>
+              <div class="card-row-sub">перемещение · ${escapeHtml(t.from_warehouse_name)} →
+                ${escapeHtml(t.to_warehouse_name)} · ${whQty(t.quantity)} ${escapeHtml(t.unit || '')}</div>
+            </div>
+            <div class="card-row-value">${escapeHtml(String(t.created_at || '').slice(0, 16))}</div>
           </div>
-          <div class="card-row-value">${escapeHtml(String(t.created_at || '').slice(0, 16))}</div>
-        </div>
-      `).join('')}</div>`
-    : emptyState({ icon: 'list', title: 'Перемещений ещё не было' });
+        `).join('')}</div>`
+      : emptyState({ icon: 'truck', title: 'Перемещений ещё не было',
+                     hint: 'Товар между складами двигают этой кнопкой' }));
+
+  whFrame(content, moveBtn + list);
+  document.getElementById('wh-transfer-open')?.addEventListener('click', () => {
+    haptic('light');
+    openStockTransferForm(active, renderStockTransfersTab);
+  });
 }
+
 // ─── Экран: Аналитика ───────────────────────────────
 
 let analyticsCache = {};  // cacheKey -> { ts, data }
@@ -8180,7 +8194,7 @@ let debtsSub = 'clients';  // 'clients' | 'suppliers' — второй уров�
 // четыре (`helpers.test.js`), а вопрос один и тот же («кто кому должен»),
 // просто с двух сторон: разносить его по двум местам значило бы требовать
 // помнить, в каком именно лежит нужная половина. Приём тот же, что у
-// «Склад → Накладные → Списания» (`whSubHtml`), но ряд живёт В ШЕЛЛЕ раздела,
+// «Склад → Движения → Списания» (`whSubHtml`), но ряд живёт В ШЕЛЛЕ раздела,
 // рядом с `sectionNavHtml`, а не внутри `#money-body`: тело перерисовывают
 // сами экраны, и переключатель оттуда унесло бы первым же ре-рендером
 // (UI-BUG-04).
@@ -10035,10 +10049,12 @@ function supplierMountRateField(sheetEl, { currencyKey, key, debtCurrency }) {
 // которая открывается кнопкой внутри списка.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Внутреннее состояние вкладки «Накладные»: список или форма создания.
+// Внутреннее состояние вкладки «Движения»: список или форма создания.
 // Вкладками раздела они не являются — создание это действие, а не раздел.
 let whView = 'list';            // 'list' | 'new'
-let whSub = 'invoices';         // 'invoices' | 'writeoffs' — второй уровень вкладки
+// Второй уровень вкладки «Движения»: чем именно двигали остаток.
+// 'incoming' | 'outgoing' | 'writeoffs' | 'transfers'.
+let whSub = 'incoming';
 let woView = 'list';            // 'list' | 'count' — лента списаний или карточка пересчёта
 let woCountId = null;           // открытый пересчёт, который сейчас ведём
 let whDraft = null;             // черновик формы (живёт между перерисовками вкладки)
@@ -10069,28 +10085,39 @@ function whIsBoss() {
 
 // whMoney / whQty / whStockBadge — в helpers.js (глобалы). Юнит-тестируются.
 
-// ─── Вкладка «Накладные» (раздел «Склад») ─────────────────────────────────
+// ─── Вкладка «Движения» (раздел «Склад») ──────────────────────────────────
 // Список — корневой вид вкладки, форма создания — вложенный (с «Назад»).
 // Шелл раздела входит в КАЖДЫЙ innerHTML ветки (UI-BUG-04).
 
 async function renderWhInvoicesTab() {
   if (whView === 'new') return renderWhInvoiceNew();
   if (whSub === 'writeoffs') return renderWriteoffsView();
+  if (whSub === 'transfers') return renderStockTransfersTab();
   return renderWhInvoiceList();
 }
 
-// Второй уровень внутри вкладки: документы прихода-расхода и документы
-// «товара нет». Пятой вкладкой раздела это быть не может (их потолок — четыре,
-// `helpers.test.js`), а отдельного раздела списание не заслуживает: смотрят
-// его там же, где накладные. Фильтр-ряд `.seg` внутри вкладки — тот же приём,
-// что у фильтра долгов.
+// Второй уровень внутри вкладки — ВИДЫ ДВИЖЕНИЯ обычными словами: «Приход ·
+// Отгрузки · Списания · Перемещения». Раньше здесь стояло «Накладные ·
+// Списания» внутри вкладки «Накладные»: одно слово на двух уровнях, и человек
+// не понимал, где он (жалоба владельца). Пятой вкладкой раздела это быть не
+// может — их потолок четыре (`helpers.test.js`), — а ряд `.seg` внутри вкладки
+// тот же приём, что у фильтра долгов.
+//
+// «Перемещения» рисуются только там, где складов больше одного
+// (`currentUser.multi_warehouse`): при одном складе перемещать некуда, и
+// переключатель выглядит ровно как до раздела «Несколько складов» (B8).
 function whSubHtml() {
   const item = (key, label) =>
     `<button class="seg-item ${whSub === key ? 'active' : ''}" data-whsub="${key}" ` +
     `aria-pressed="${whSub === key}">${label}</button>`;
-  return `<div class="seg-row"><div class="seg">`
-    + item('invoices', 'Накладные') + item('writeoffs', 'Списания')
-    + `</div></div>`;
+  const items = item('incoming', 'Приход') + item('outgoing', 'Отгрузки')
+    + item('writeoffs', 'Списания')
+    + (currentUser && currentUser.multi_warehouse ? item('transfers', 'Перемещения') : '');
+  // Четыре пункта на 360dp в ряд не влезают — ряд листается, край затеняется
+  // (`.seg--scroll` + `.scroll-hint`), как у фильтра статусов заказов.
+  const many = currentUser && currentUser.multi_warehouse;
+  return `<div class="seg-row${many ? ' scroll-hint' : ''}">`
+    + `<div class="seg${many ? ' seg--scroll' : ''}">${items}</div></div>`;
 }
 
 function whShellHtml() { return stockShellHtml() + whSubHtml(); }
@@ -10102,6 +10129,7 @@ function wireWhSub(root) {
       whSub = btn.dataset.whsub;
       whView = 'list';
       woView = 'list';
+      woCountId = null;
       renderWhInvoicesTab();
     });
   });
@@ -10117,31 +10145,68 @@ function whFrame(content, html) {
 
 async function renderWhInvoiceList() {
   const content = document.getElementById('content');
+  const out = whSub === 'outgoing';
   hideBack();
   whFrame(content, skeleton('list', 5));
   const gen = screenGen();
 
   let data;
   try {
-    data = await api('/api/wh/invoices', { limit: 100 });
+    // Каждый вид движения — свой список: «приход» и «отгрузки» в одной ленте
+    // человек и путал. Тип фильтрует СЕРВЕР (`/api/wh/invoices`, параметр
+    // type), а не фронт: страница на 100 строк иначе состояла бы наполовину
+    // из чужих документов.
+    data = await api('/api/wh/invoices', { limit: 100, type: out ? 'outgoing' : 'incoming' });
   } catch (e) {
     whFrame(content, errorBox(e.message || String(e)));
     return;
   }
   if (gen !== screenGen()) return;
-  const rows = data.invoices || [];
+  // Списание и излишек — тоже накладные склада, но живут они в «Списаниях»,
+  // где у них есть причина, автор и сторно. В «Приходе» и «Отгрузках» они
+  // были бы вторым показом одного факта.
+  const rows = (data.invoices || []).filter(inv => !inv.writeoff);
 
-  // Кнопка создания — над списком: это главное действие вкладки.
-  // Недописанная накладная (в том числе с прошлого открытия приложения) —
-  // кнопка говорит об этом прямо, иначе человек не узнает, что набранное цело.
+  // Кнопка создания — над списком: это главное действие ленты. Называет она
+  // то, что создаёт («Оформить приход» / «Оформить отгрузку»), а не «новую
+  // накладную»: слово «накладная» ничего не говорит о том, в какую сторону
+  // поедет товар. Недописанный документ (в том числе с прошлого открытия
+  // приложения) — кнопка говорит об этом прямо, иначе человек не узнает, что
+  // набранное цело.
+  //
+  // Расход проводит только руководство (заявка → одобрение → накладная), и
+  // кнопки «Оформить отгрузку» у менеджера нет: она гарантированно ответила
+  // бы 403.
   const pending = whDraftHasData(whDraft || formDrafts().load(WH_DRAFT));
-  const newBtn = `<div class="form-row">
-      <button class="btn-primary" id="wh-new">${icon(pending ? 'edit' : 'plus')} ${pending ? 'Продолжить черновик накладной' : 'Новая накладная'}</button>
-    </div>
-    <div class="c-actions c-actions--wrap">${exportBtnHtml('wh-invoices-export', 'Экспорт в Excel')}</div>`;
+  const canCreate = out ? whIsBoss() : true;
+  const newLabel = pending
+    ? 'Продолжить черновик'
+    : (out ? 'Оформить отгрузку' : 'Оформить приход');
+  const newBtn = canCreate ? `<div class="form-row">
+      <button class="btn-primary" id="wh-new">${icon(pending ? 'edit' : 'plus')} ${newLabel}</button>
+    </div>` : '';
+  // Выгрузка — не соседка кнопки «Оформить…»: это разные вещи, и рядом они
+  // читались как пара («создать» / «выгрузить создаваемое»). Её место — под
+  // лентой, которую она и выгружает.
+  const exportRow = `<div class="c-actions c-actions--wrap">${
+    exportBtnHtml('wh-invoices-export', 'Экспорт в Excel')}</div>`;
   const wireNew = () => {
     const b = document.getElementById('wh-new');
-    if (b) b.addEventListener('click', () => { haptic('light'); whView = 'new'; renderWhInvoicesTab(); });
+    if (b) {
+      b.addEventListener('click', () => {
+        haptic('light');
+        // Вид документа берётся из ленты, в которой нажали: в «Приходе» —
+        // приход, в «Отгрузках» — расход. Недописанный черновик свой вид
+        // помнит сам — его не перебиваем.
+        if (!pending) {
+          whDraft = whDraft || { counterparty_id: '', items: [], comment: '' };
+          whDraft.type = out ? 'outgoing' : 'incoming';
+          saveWhDraft();
+        }
+        whView = 'new';
+        renderWhInvoicesTab();
+      });
+    }
     // B6 — весь журнал накладных без диапазона дат (весь список экрана).
     document.getElementById('wh-invoices-export')?.addEventListener('click', (ev) => {
       exportExcel(ev.currentTarget, '/api/wh/invoices/export', {});
@@ -10150,9 +10215,12 @@ async function renderWhInvoiceList() {
 
   if (!rows.length) {
     whFrame(content, newBtn + emptyState({
-      icon: 'list', title: 'Накладных пока нет',
-      hint: 'Оформите первую — приход или расход',
-    }));
+      icon: out ? 'truck' : 'box',
+      title: out ? 'Отгрузок пока не было' : 'Приходов пока не было',
+      hint: out
+        ? 'Отгрузка клиенту идёт через заявку и одобрение руководителя'
+        : 'Оформите первый приход — или примите контейнер',
+    }) + exportRow);
     wireNew();
     return;
   }
@@ -10164,17 +10232,14 @@ async function renderWhInvoiceList() {
   whFrame(content, newBtn + rows.map(inv => {
     const cancelled = inv.status === 'cancelled';
     const isOut = inv.type === 'outgoing';
-    // Статус отправки — только у расхода: приход клиенту не отсылается.
-    const sent = isOut && !inv.writeoff
+    // Статус отправки — только у отгрузки: приход клиенту не отсылается.
+    const sent = isOut
       ? (inv.telegram_sent
           ? `<span class="order-pay order-pay--ok">${icon('check')} PDF отправлен</span>`
           : `<span class="order-pay order-pay--wait">PDF не отправлен</span>`)
       : '';
-    // Списание — тоже накладная, но клиенту её не шлют и «расходом» не зовут:
-    // строка помечена явно, а сторнируют её в «Списаниях» (там причина и окно).
-    const isWriteoff = !!inv.writeoff;
     const actions = [];
-    if (isOut && !cancelled && !isWriteoff) {
+    if (isOut && !cancelled) {
       actions.push(`<button class="btn-secondary" data-wh-send="${inv.id}">${icon('phone')} Отправить PDF</button>`);
     }
     // Печать — по кнопке и только там, где есть принтер (can_print с сервера):
@@ -10185,7 +10250,7 @@ async function renderWhInvoiceList() {
     // Накладная из переноса МойСклад (inv.historical) не отменяется: склад по
     // ней не двигался, и сервер гарантированно откажет — кнопку не рисуем.
     // `can_cancel` — сервер: менеджеру только свой приход, расход — руководству.
-    if (canCancel && inv.can_cancel !== false && !cancelled && !inv.historical && !isWriteoff) {
+    if (canCancel && inv.can_cancel !== false && !cancelled && !inv.historical) {
       actions.push(`<button class="btn-secondary" data-wh-cancel="${inv.id}">${icon('ban')} Отменить</button>`);
     }
     return `
@@ -10197,8 +10262,11 @@ async function renderWhInvoiceList() {
             </div>
             <div class="order-sub">${escapeHtml(inv.counterparty_name || 'Без контрагента')}</div>
           </div>
-          <span class="order-status" data-status="${cancelled ? 'rejected' : (isWriteoff ? 'pending' : 'approved')}">
-            ${cancelled ? 'отменена' : (isWriteoff ? (isOut ? 'списание' : 'излишек') : (isOut ? 'расход' : 'приход'))}
+          <!-- Строка называет себя словом, а не только кодом документа:
+               «OUT-2026-0007» без подписи читается одинаково у отгрузки,
+               списания и перемещения. -->
+          <span class="order-status" data-status="${cancelled ? 'rejected' : 'approved'}">
+            ${cancelled ? 'отменена' : (isOut ? 'отгрузка' : 'приход')}
           </span>
         </div>
         <div class="order-meta">
@@ -10209,7 +10277,7 @@ async function renderWhInvoiceList() {
         ${sent ? `<div class="order-pay-row">${sent}</div>` : ''}
         ${actions.length ? `<div class="wh-actions">${actions.join('')}</div>` : ''}
       </div>`;
-  }).join(''));
+  }).join('') + exportRow);
   wireNew();
 
   content.querySelectorAll('[data-wh-send]').forEach(btn => {
@@ -10654,7 +10722,7 @@ async function renderCountCard() {
   });
 }
 
-// ─── Форма новой накладной (внутри вкладки «Накладные») ─────────────────────────────────────────
+// ─── Форма накладной прихода/отгрузки (внутри вкладки «Движения») ───────────
 
 // ─── Печать через CUPS: одна кнопка, один ответ ──────────────────────────────
 // `ok` от сервера значит «задание принято очередью», не «бумага вышла» — так и
@@ -11207,6 +11275,7 @@ async function renderWhInvoiceNew() {
     // форма со старым ключом получила бы тот же отказ.
     if (!whDraft.idemKey) whDraft.idemKey = idemKey();
     saveWhDraft();
+    const savedType = whDraft.type;
     try {
       const r = await apiResult('/api/wh/invoices/create', {
         type: whDraft.type,
@@ -11257,6 +11326,9 @@ async function renderWhInvoiceNew() {
       if (res.supplier_terms_warning) {
         toast(res.supplier_terms_warning, 'error', { duration: 6000 });
       }
+      // Проведённый документ должен лежать в той ленте, которая его и
+      // называет: провели приход — открываем «Приход», расход — «Отгрузки».
+      whSub = savedType === 'outgoing' ? 'outgoing' : 'incoming';
       dropWhDraft();
       whView = 'list';
       renderWhInvoicesTab();

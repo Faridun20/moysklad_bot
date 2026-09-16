@@ -223,6 +223,11 @@
     '/api/stock/writeoffs/create': ['admin', 'boss', 'manager'],
     '/api/stock/writeoffs/void': ['admin', 'boss', 'manager'],
     '/api/stock/counts/confirm': ['admin', 'boss', 'manager'],
+    // Перемещение между складами делает и менеджер (товар двигает он), а
+    // ИСТОРИЮ смотрит руководство — «Склад → Движения → Перемещения» рисует
+    // ленту по этой строке.
+    '/api/stock/transfer': ['admin', 'boss', 'manager'],
+    '/api/stock/transfers': ['admin', 'boss'],
     '/api/machines/delete': ['admin', 'boss', 'manager'],
     '/api/machines/deal': ['admin', 'boss', 'manager'],
     '/api/machines/deals/pending': ['admin', 'boss', 'manager'],

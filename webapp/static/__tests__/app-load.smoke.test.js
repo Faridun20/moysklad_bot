@@ -4028,7 +4028,7 @@ describe('скидка к прайсу на экранах', () => {
   });
 });
 
-describe('«Склад» → «Накладные» → «Списания»', () => {
+describe('«Склад» → «Движения» → «Списания»', () => {
   // Списание живёт вторым уровнем внутри вкладки: пятой вкладки у раздела быть
   // не может (их потолок — четыре), а отдельный раздел ради него — перебор.
   const JOURNAL = {
@@ -4096,7 +4096,7 @@ describe('«Склад» → «Накладные» → «Списания»', (
     `);
     await window.__ready;
     const content = window.document.getElementById('content');
-    expect(content.querySelector('[data-whsub="invoices"]')).not.toBeNull();
+    expect(content.querySelector('[data-whsub="incoming"]')).not.toBeNull();
     expect(content.textContent).toContain('Нет подключения');
   });
 

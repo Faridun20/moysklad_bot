@@ -429,6 +429,17 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
     if page.locator('.seg-item[data-sect="invoices"]').count():
         tab(page, "invoices")
         audit.idle()
+        # «Движения» — четыре вида одним переключателем: приход, отгрузки,
+        # списания, перемещения. Каждый вид меряем отдельно: у них разные
+        # шапки-кнопки, и ряд из четырёх пунктов на 360dp уже листается.
+        audit.check("stock-moves-incoming")
+        page.click('[data-whsub="outgoing"]')
+        page.wait_for_selector("#content .order-card, #content .empty-state")
+        audit.check("stock-moves-outgoing")
+        if page.locator('[data-whsub="transfers"]').count():
+            page.click('[data-whsub="transfers"]')
+            page.wait_for_selector("#wh-transfer-open")
+            audit.check("stock-moves-transfers")
         # Списания и пересчёт — второй уровень той же вкладки: журнал, выбор
         # товара, форма причины и карточка пересчёта. Раньше формы накладной:
         # она остаётся открытым видом вкладки (черновик не теряем), и вернуться
@@ -451,7 +462,7 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
         page.click(".c-overlay #ms-submit")
         page.wait_for_selector("#wo-line-add")
         audit.check("stock-count")
-        page.click('[data-whsub="invoices"]')
+        page.click('[data-whsub="incoming"]')
         page.wait_for_selector("#wh-new")
         page.click("#wh-new")
         audit.check("invoice-form")

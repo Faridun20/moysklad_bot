@@ -1016,7 +1016,7 @@ describe('navBarLayout / navDrawerHtml (шторка «Меню»)', () => {
     const groups = [
       { key: 'today', label: 'Сегодня', icon: 'home', tabs: [] },
       { key: 'stock', label: 'Склад', icon: 'box',
-        tabs: [{ key: 'catalog', label: 'Каталог' }, { key: 'invoices', label: 'Накладные' }] },
+        tabs: [{ key: 'catalog', label: 'Каталог' }, { key: 'invoices', label: 'Движения' }] },
       { key: 'sales', label: 'Продажи', icon: 'cart', tabs: [{ key: 'orders', label: 'Заказы' }] },
     ];
     const html = navDrawerHtml(groups, { screen: 'stock', tab: 'invoices' }, { subtitle: 'Менеджер' });

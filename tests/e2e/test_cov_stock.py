@@ -1262,6 +1262,11 @@ def _add_position(page, product_id: int) -> None:
 
 
 def _new_outgoing(page, qty: str, price: str, product_id: int) -> None:
+    # «Отгрузки» — своя лента второго уровня вкладки «Движения», и кнопка в ней
+    # называет, что создаёт («Оформить отгрузку»): вид документа берётся из
+    # ленты, а не из последнего выбора формы.
+    page.click('[data-whsub="outgoing"]')
+    page.wait_for_selector("#wh-new")
     page.click("#wh-new")
     page.wait_for_selector('[data-whtype="outgoing"].active')
     _add_position(page, product_id)
@@ -1469,9 +1474,15 @@ def test_manager_posts_incoming_but_cannot_cancel(open_app, e2e):
     mgr = open_app(e2e.ids["mgr"])
     go(mgr, "stock")
     tab(mgr, "invoices")
+    # Отгрузки — своя лента: проводит их только руководство, и кнопки
+    # «Оформить отгрузку» у менеджера в ней нет.
+    mgr.click('[data-whsub="outgoing"]')
     mgr.wait_for_selector("[data-wh-send]")
     assert mgr.locator("[data-wh-cancel]").count() == 0
+    assert mgr.locator("#wh-new").count() == 0
 
+    mgr.click('[data-whsub="incoming"]')
+    mgr.wait_for_selector("#wh-new")
     mgr.click("#wh-new")
     mgr.wait_for_selector("#wh-add")
     _add_position(mgr, e2e.ids["product"])

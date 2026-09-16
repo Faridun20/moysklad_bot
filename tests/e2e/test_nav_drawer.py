@@ -59,7 +59,7 @@ def test_manager_opens_menu_and_goes_to_stock_invoices(open_app, e2e):
     # Текущий раздел («Сегодня», без вкладок) подсвечен сам.
     assert mgr.get_attribute('#nav-drawer [aria-current="page"]', "data-screen") == "today"
 
-    # Вкладки по роли: менеджеру «Накладные» есть, «Воронки» и «Лимитов» нет
+    # Вкладки по роли: менеджеру «Движения» есть, «Воронки» и «Лимитов» нет
     # (ручки ответят 403 — дверь, которая не открывается, не рисуется).
     drawer = mgr.locator("#nav-drawer")
     assert drawer.locator('[data-screen="stock"][data-tab="invoices"]').count() == 1
@@ -74,7 +74,7 @@ def test_manager_opens_menu_and_goes_to_stock_invoices(open_app, e2e):
     assert mgr.evaluate("() => document.getElementById('bottom-nav').dataset.current") == "stock"
     assert mgr.get_attribute("#bottom-nav .nav-item.active", "data-screen") == "stock"
     assert menu.get_attribute("aria-expanded") == "false"
-    assert "Накладные" in mgr.inner_text("#greeting")
+    assert "Движения" in mgr.inner_text("#greeting")
     # Раздел — корневой экран: «Назад» после перехода спрятана.
     assert mgr.evaluate("() => window.Telegram.WebApp.BackButton.isVisible") is False
 
