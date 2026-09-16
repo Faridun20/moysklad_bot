@@ -56,7 +56,8 @@ def _seed_pending_everything(e2e) -> dict:
         mark_return_goods_received,
     )
 
-    request = seed_order(e2e, approve=False, qty=1, price=120.0)              # заявка ждёт
+    # Заявка ждёт решения: скидка выше порога (без неё менеджер отгружает сам).
+    request = seed_order(e2e, approve=False, qty=1, price=120.0, needs_decision=True)
     paid = seed_order(e2e, payment_type="paid", due_date=None, price=50.0)     # карта ждёт
     seed_order(e2e, qty=1, price=30.0)
     dep = e2e.run(create_cash_deposit(e2e.ids["mgr"], 30.0))                   # сдача ждёт
@@ -244,7 +245,7 @@ def test_decisions_lists_every_kind_and_each_decision_works(open_app, e2e):
 
 
 def test_deep_link_opens_decisions(open_app, e2e):
-    seed_order(e2e, approve=False)
+    seed_order(e2e, approve=False, needs_decision=True)
     boss = open_app(e2e.ids["boss"])
     boss.goto(e2e.base_url + "/?startapp=decisions")
     boss.wait_for_function("() => document.getElementById('bottom-nav')?.dataset.current === 'decisions'")

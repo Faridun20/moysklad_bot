@@ -291,10 +291,13 @@ def test_boss_decisions_lead_to_one_decisions_screen(isolated_db, monkeypatch):
         return {"payments": 2, "deposits": 1, "returns": 3}
 
     async def pending():
-        return [{"id": 1}, {"id": 2}]
+        return [{"id": 1, "reasons": [{"code": "discount"}]}, {"id": 2, "reasons": [{"code": "discount"}]}]
+
+    from services import order_workflow
 
     monkeypatch.setattr(db, "count_boss_attention", counts)
-    monkeypatch.setattr(db, "get_pending_requests", pending)
+    # Заявки в очереди руководителя — только те, что ждут решения.
+    monkeypatch.setattr(order_workflow, "requests_needing_decision", pending)
 
     boss = {i["key"]: i for i in _run(work_queue.gather(2, "boss"))}
     for key in ("requests", "payments", "deposits", "returns"):

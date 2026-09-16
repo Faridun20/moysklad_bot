@@ -45,23 +45,37 @@ def test_gather_ops_summary_quiet_db(isolated_db):
     assert summary["stale_crons"]["count"] == 0
 
 
-def test_gather_ops_summary_counts_stale_order(isolated_db):
-    """Зависшая pending-заявка старше порога попадает в stale_orders + total."""
+def test_gather_ops_summary_counts_stale_order(isolated_db, monkeypatch):
+    """Зависшая pending-заявка старше порога попадает в stale_orders + total —
+    если она ждёт решения руководителя. Заявку без решения (скидка ниже порога,
+    долг в лимите) менеджер отгружает сам: «ждёт решения» она не числится."""
+    from services import order_workflow
+
     db = isolated_db
     db.set_role(1, "m", "M", "manager")
-    oid = db.create_order(1, "M", "")
-    db.update_order_agent(oid, "A", "Client")
-    db.update_order_status(oid, "pending")
-    with db.get_conn() as conn:
-        cur = db.get_cursor(conn)
-        cur.execute(
-            db.q("UPDATE orders SET created_at=?, submitted_at=NULL WHERE id=?"),
-            ("2000-01-01 00:00:00", oid),
-        )
-        conn.commit()
+    oids = []
+    for _ in range(2):
+        oid = db.create_order(1, "M", "")
+        db.update_order_agent(oid, "A", "Client")
+        db.update_order_status(oid, "pending")
+        with db.get_conn() as conn:
+            cur = db.get_cursor(conn)
+            cur.execute(
+                db.q("UPDATE orders SET created_at=?, submitted_at=NULL WHERE id=?"),
+                ("2000-01-01 00:00:00", oid),
+            )
+            conn.commit()
+        oids.append(oid)
+    deciding, plain = oids
+
+    async def needing():
+        return [{"order_id": deciding, "reasons": [{"code": "discount", "text": "скидка"}]}]
+
+    monkeypatch.setattr(order_workflow, "requests_needing_decision", needing)
     summary = asyncio.run(gather_ops_summary())
     assert summary["stale_orders"]["count"] == 1
-    assert summary["stale_orders"]["items"][0]["id"] == oid
+    assert summary["stale_orders"]["items"][0]["id"] == deciding
+    assert plain not in [i["id"] for i in summary["stale_orders"]["items"]]
     assert summary["total"] >= 1
 
 

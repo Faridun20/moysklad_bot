@@ -183,7 +183,7 @@ def test_sales_tabs_and_controls_follow_role(open_app, e2e):
     черновики. Кладовщик и бухгалтер: только «Заказы» — отчёт и документы им
     отвечают 403, и вкладок нет.
     """
-    seed_order(e2e, payment_type="paid", due_date=None, approve=False)
+    seed_order(e2e, payment_type="paid", due_date=None, approve=False, needs_decision=True)
     ids = e2e.ids
     for role in ("boss", "admin"):
         page = open_app(ids[role])
@@ -191,13 +191,14 @@ def test_sales_tabs_and_controls_follow_role(open_app, e2e):
         assert _sect_tabs(page) == ["orders", "report", "docs"], role
         assert _filters(page) == ["all", "pending", "approved", "shipped", "rejected"], role
         assert page.locator("#btn-new-order").count() == 0, role
-        # Счётчик заявок на строке-ссылке совпадает с числом ожидающих.
+        # Счётчик заявок на строке-ссылке — заявки, которые ждут решения
+        # (скидка выше порога): одобрение отгрузки не обязательно.
         assert page.locator("#show-requests .queue-count").inner_text().strip() == "1", role
 
     mgr = open_app(ids["mgr"])
     _orders(mgr)
     assert _sect_tabs(mgr) == ["orders", "report", "docs"]
-    assert _filters(mgr) == ["all", "draft", "pending", "approved", "rejected"]
+    assert _filters(mgr) == ["all", "draft", "pending", "approved", "shipped", "rejected"]
     assert mgr.locator("#btn-new-order").count() == 1
     assert mgr.locator("#show-requests").count() == 0, "заявки разбирает только руководство"
     # Имя менеджера на карточке — только у руководства; своему — незачем.
@@ -252,8 +253,8 @@ def test_forbidden_sales_actions_are_refused_by_server(open_app, e2e):
             ("/api/requests/approve", {"req_id": pending["req_id"]}),
             ("/api/requests/reject", {"req_id": pending["req_id"]}),
             ("/api/requests/return_to_draft", {"req_id": pending["req_id"], "comment": "Исправьте"}),
-            # /api/orders/ship менеджеру пока открыт: он замещает кладовщика
-            # (ROLE_ALSO_ACTS_AS, tests/e2e/test_manager_acts_as.py).
+            # /api/orders/ship менеджеру открыт: одобрение отгрузки не
+            # обязательно, он отгружает сам.
             ("/api/orders/cancel", {"order_id": approved["order_id"], "reason": "Просто так"}),
             ("/api/orders/requests", {}),
             ("/api/orders/unfreeze", {"order_id": draft}),
@@ -305,6 +306,9 @@ def test_manager_builds_uzs_credit_order_step_by_step(open_app, e2e):
         ("ИП Васильев Сергей", "customer", "+998907654321", e2e.db.now_str()),
     )
     cp2 = e2e.rows("SELECT id FROM counterparties WHERE name = ?", ("ИП Васильев Сергей",))[0]["id"]
+    # Курс сума: без него долг в UZS считается «как есть» (300 000 «долларов») и
+    # пробивает кредитный лимит — такой заказ ушёл бы руководителю на решение.
+    assert e2e.db.set_currency_rate("UZS", 1 / 12700, ids["boss"])[0]
 
     mgr = open_app(ids["mgr"])
     _orders(mgr)
@@ -392,22 +396,26 @@ def test_manager_builds_uzs_credit_order_step_by_step(open_app, e2e):
     mgr.click('[data-pay="credit"]')
     mgr.wait_for_selector("#due-date-wrap:not(.hidden)")
     mgr.fill("#due-date-input", "2030-01-15")
+    assert "Отгрузить" in mgr.locator("#btn-submit").inner_text()
     mgr.click("#btn-submit")
-    _wait_alert(mgr, "отправлена")
+    _wait_alert(mgr, f"Заказ #{oid} отгружен")
 
-    req = e2e.rows("SELECT id, status, order_id FROM shipment_requests")
-    assert len(req) == 1 and req[0]["status"] == "pending" and req[0]["order_id"] == oid
+    # Одобрение не нужно: заявка проведена самим менеджером, заказ отгружен.
+    req = e2e.rows("SELECT id, status, order_id, approved_by FROM shipment_requests")
+    assert len(req) == 1 and req[0]["status"] == "approved" and req[0]["order_id"] == oid
+    assert req[0]["approved_by"] == ids["mgr"]
     o = _order(e2e, oid)
-    assert (o["status"], o["payment_type"], o["due_date"], o["currency"]) == ("pending", "credit", "2030-01-15", "UZS")
-    # Руководству ушла заявка с кнопками одобрения именно этой заявки.
-    push = [p for p in e2e.pushes if f"req_ok:{req[0]['id']}" in str(p.get("reply_markup"))]
-    assert push and push[0]["uid"] == ids["boss"]
+    assert (o["status"], o["payment_type"], o["due_date"], o["currency"]) == ("shipped", "credit", "2030-01-15", "UZS")
+    assert not [p for p in e2e.pushes if "req_ok:" in str(p.get("reply_markup"))], "кнопок одобрения нет"
+    e2e.wait_for(lambda: any(
+        m["chat_id"] == ids["boss"] and f"Заказ #{oid} отгружен" in m["text"] for m in e2e.bot.messages
+    ))
 
     # Вернулись в список: карточка показывает статус, долг, валюту.
     card = mgr.locator(f'.order-card[data-id="{oid}"]')
     card.wait_for()
     text = card.inner_text()
-    assert card.get_attribute("data-status") == "pending"
+    assert card.get_attribute("data-status") == "shipped"
     assert "В долг до 15.01.2030" in text and "UZS" in text
     assert _digits(card.locator(".order-total").inner_text()) == "300000"
 
@@ -492,7 +500,7 @@ def test_repeat_client_gets_last_price_prefilled(open_app, e2e):
     mgr.fill("#due-date-input", "2030-01-15")
     mgr.wait_for_selector("#btn-submit:not([disabled])")
     mgr.click("#btn-submit")
-    _wait_alert(mgr, "отправлена")
+    _wait_alert(mgr, "отгружен")
 
     _new_order_for_romashka(mgr, e2e)
     mgr.wait_for_function("() => document.getElementById('price-input').value === '45'")
@@ -626,10 +634,16 @@ def test_reopened_draft_item_removal_reaches_server(open_app, e2e):
     assert mgr.locator(".editor-item-del").count() == 1
     e2e.db.add_order_item(oid, "Кабель ВВГ 3x2.5", "", 3, "м", 100.0, product_id=e2e.ids["product"])
 
+    # «Оплата сразу»: «Внести оплату и отгрузить» открывает форму, сумма —
+    # по тому, что осталось на экране (3 м × 100).
     mgr.click("#btn-submit")
-    _wait_alert(mgr, "отправлена")
+    mgr.wait_for_selector(".c-overlay .pay-part")
+    assert mgr.locator(".c-overlay .pay-part-amount").input_value() == "300"
+    mgr.click(".c-overlay #ms-submit")
+    _wait_alert(mgr, f"Заказ #{oid} отгружен")
     items = e2e.rows("SELECT quantity FROM order_items WHERE order_id = ?", (oid,))
-    assert items == [{"quantity": 3}], "в заявке ровно то, что осталось на экране"
+    assert items == [{"quantity": 3}], "отгружено ровно то, что осталось на экране"
+    assert _order(e2e, oid)["status"] == "shipped"
 
 
 def test_reopened_draft_keeps_currency_locked(open_app, e2e):
@@ -679,9 +693,9 @@ def test_reopened_draft_keeps_payment_type(open_app, e2e):
     assert mgr.locator('.seg-item.active[data-pay="credit"]').count() == 1
     assert mgr.input_value("#due-date-input") == "2030-01-15"
     mgr.click("#btn-submit")
-    mgr.wait_for_function("() => window.__tgAlerts.some(a => a.includes('отправлена') || a.includes('до какого числа'))")
+    mgr.wait_for_function("() => window.__tgAlerts.some(a => a.includes('отгружен') || a.includes('до какого числа'))")
     o = _order(e2e, seeded["order_id"])
-    assert (o["payment_type"], o["due_date"]) == ("credit", "2030-01-15")
+    assert (o["status"], o["payment_type"], o["due_date"]) == ("shipped", "credit", "2030-01-15")
 
 
 # ─── Удаление черновика: «Отмена» и каскад ───────────────────────────────────
@@ -837,13 +851,14 @@ def test_boss_request_credit_context_and_cancel_dialogs(open_app, e2e):
     ids = e2e.ids
     cp = _cp(e2e)
     e2e.run(set_credit_limit(str(cp), "ООО Ромашка", 1000.0, set_by=ids["boss"]))
-    first = seed_order(e2e, approve=False)  # 200 в пределах 1000
+    # 200 в пределах 1000; в «Решениях» заявка — из-за скидки выше порога.
+    first = seed_order(e2e, approve=False, needs_decision=True)
 
     boss = open_app(ids["boss"])
     _orders(boss)
     boss.click("#show-requests")
     boss.wait_for_selector(".btn-approve")
-    ctx = boss.locator(".credit-ctx")
+    ctx = boss.locator(".credit-ctx:has-text('Долг клиента')")
     assert "credit-ctx--ok" in ctx.get_attribute("class") and "в пределах" in ctx.inner_text()
     assert "1000" in _digits(ctx.inner_text())
 
@@ -882,7 +897,7 @@ def test_return_to_draft_freezes_order_until_admin_unfreezes(open_app, e2e):
     видит «Заморожен», переотправка отказывает, пока админ не разморозит."""
     ids = e2e.ids
     e2e.db.set_setting("reject_max_cycles", 1, ids["boss"])
-    seeded = seed_order(e2e, payment_type="paid", due_date=None, approve=False)
+    seeded = seed_order(e2e, payment_type="paid", due_date=None, approve=False, needs_decision=True)
     oid = seeded["order_id"]
 
     boss = open_app(ids["boss"])
@@ -922,8 +937,11 @@ def test_return_to_draft_freezes_order_until_admin_unfreezes(open_app, e2e):
     o = _order(e2e, oid)
     assert (o["frozen"], o["rejection_count"]) == (0, 0)
 
+    # Скидка выше порога: «Внести оплату и отгрузить» отказывает и предлагает
+    # заявку руководителю (заглушка подтверждения отвечает «да»).
     mgr.wait_for_selector("#btn-submit:not([disabled])")
     mgr.click("#btn-submit")
+    _wait_alert(mgr, "confirm:Нужно решение руководителя")
     _wait_alert(mgr, "отправлена")
     assert _order(e2e, oid)["status"] == "pending"
     assert e2e.rows("SELECT COUNT(*) AS n FROM shipment_requests WHERE status = 'pending'")[0]["n"] == 1
@@ -1014,7 +1032,10 @@ def test_boss_ships_order_notifies_manager_and_cancel_is_closed(open_app, e2e):
     boss.wait_for_selector(f'.order-card[data-id="{oid}"][data-status="shipped"]')
     o = _order(e2e, oid)
     assert (o["status"], o["shipped_by"]) == ("shipped", ids["boss"]) and o["shipped_at"]
-    assert any(m["chat_id"] == ids["mgr"] and m["text"] == f"🚚 Ваш заказ #{oid} отгружен." for m in e2e.bot.messages)
+    # Автору — «ваш заказ отгружен» (фоном, после ответа), руководителю себе — нет.
+    e2e.wait_for(lambda: any(
+        m["chat_id"] == ids["mgr"] and m["text"].startswith(f"🚚 Ваш заказ #{oid} отгружен") for m in e2e.bot.messages
+    ))
     card = boss.locator(f'.order-card[data-id="{oid}"]')
     assert card.locator(".btn-ship-order, .btn-cancel-order").count() == 0
     _filter(boss, "shipped")
@@ -1045,7 +1066,7 @@ def test_keeper_sees_only_approved_and_ship_race_reports_error(open_app, e2e):
 
     assert e2e.run(mark_order_shipped(oid, ids["boss"], "Boss"))["ok"]
     keeper.click(f'.btn-ship-order[data-id="{oid}"]')
-    _wait_alert(keeper, "Отгрузить можно только одобренный")
+    _wait_alert(keeper, "уже «отгружен»")
     assert not any(a.endswith("отгружен") for a in keeper.evaluate("window.__tgAlerts"))
     keeper.wait_for_selector(f'.btn-ship-order[data-id="{oid}"]:not([disabled])')
     assert _order(e2e, oid)["shipped_by"] == ids["boss"]

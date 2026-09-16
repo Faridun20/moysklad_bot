@@ -1596,6 +1596,9 @@ body.nav-drawer-open { overflow: hidden; }
 .order-pay--ok     { background: var(--success-bg); color: var(--success); }
 .order-pay--wait   { background: var(--info-bg);    color: var(--info); }
 .order-pay--bad    { background: var(--danger-bg);  color: var(--danger); }
+/* Длинная строка состояния («Ждёт решения руководителя: скидка 50% при пороге
+   15%», причина доработки) переносится внутри карточки, а не уезжает за край. */
+.order-pay--note   { white-space: normal; max-width: 100%; }
 
 /* Кредит-контекст клиента в заявке (босс решает об апруве не уходя в Лимиты). */
 .credit-ctx {
@@ -2317,7 +2320,7 @@ body.nav-drawer-open { overflow: hidden; }
    сверху (скриншот владельца). Текст переносится внутри своей колонки, иконка
    держится у первой строки. */
 .debt-breakdown > span.pay-part-row { flex-wrap: nowrap; align-items: flex-start; }
-.pay-part-row .ic { margin-top: 2px; }
+.pay-part-row .ic { transform: translateY(2px); }
 .pay-part-row .pay-part-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .debt-breakdown b {
   color: var(--text); margin-left: auto; white-space: nowrap;

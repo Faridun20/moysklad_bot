@@ -186,6 +186,19 @@ class LiveServer:
             time.sleep(0.05)
         return matches
 
+    def wait_for(self, predicate, timeout: float = 5.0) -> None:
+        """Дождаться условия `predicate() -> bool` (фоновые уведомления бота:
+        «Заказ отгружен» уходит ПОСЛЕ ответа браузеру, `utils.background.spawn`).
+        Не дождались — AssertionError, а не молча дальше."""
+        import time
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.05)
+        assert predicate(), "условие не выполнилось за отведённое время"
+
 
 ROLE_IDS = {"admin": 1, "boss": 100, "mgr": 200, "keeper": 400, "book": 500}
 

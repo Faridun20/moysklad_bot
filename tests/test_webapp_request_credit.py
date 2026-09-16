@@ -31,6 +31,19 @@ def _setup(db, monkeypatch, payment_type, total):
     return TestClient(server.app), boss, req_id
 
 
+def _listed_as_decision(monkeypatch):
+    """«Решения» показывают только заявки, которые ждут руководителя (скидка
+    выше порога / долг сверх лимита). Здесь проверяется кредит-блок карточки —
+    заявку в списке держим подменой причины."""
+    from services import async_db as adb
+    from services import order_workflow
+
+    async def all_pending():
+        return [{**r, "reasons": [{"code": "discount", "text": "скидка"}]} for r in await adb.get_pending_requests()]
+
+    monkeypatch.setattr(order_workflow, "requests_needing_decision", all_pending)
+
+
 def _get_req(client, boss, req_id):
     body = client.post("/api/orders/requests", json={"initData": str(boss)}).json()
     return next(r for r in body["requests"] if r["id"] == req_id)
@@ -88,6 +101,10 @@ def test_order_credit_context_draft_adds_total(isolated_db):
 def test_request_credit_under_limit(isolated_db, monkeypatch):
     db = isolated_db
     client, boss, req_id = _setup(db, monkeypatch, "credit", 500.0)
+    # Без скидки и превышения решение руководителя не нужно — в «Решениях» её нет.
+    body = client.post("/api/orders/requests", json={"initData": str(boss)}).json()
+    assert body["requests"] == []
+    _listed_as_decision(monkeypatch)
     req = _get_req(client, boss, req_id)
     assert req["credit"]["over_limit"] is False
 
@@ -95,6 +112,7 @@ def test_request_credit_under_limit(isolated_db, monkeypatch):
 def test_paid_request_has_no_credit_block(isolated_db, monkeypatch):
     db = isolated_db
     client, boss, req_id = _setup(db, monkeypatch, "paid", 9000.0)
+    _listed_as_decision(monkeypatch)
     req = _get_req(client, boss, req_id)
     assert req["payment_type"] == "paid"
     assert "credit" not in req  # для paid кредит-контекст не нужен

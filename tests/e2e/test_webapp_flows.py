@@ -1,7 +1,7 @@
 """E2E первой волны: WebApp в настоящем Chromium против живого сервера и БД.
 
-Сценарии выбраны по цене ошибки: денежный контур (заказ → заявка → одобрение
-→ списание), и то, что только что чинили по аудиту — экранирование в экране
+Сценарии выбраны по цене ошибки: денежный контур (заказ → отгрузка без
+одобрения → списание), и то, что только что чинили по аудиту — экранирование в экране
 босса и вкладки, которые вели к 403. jsdom-smoke это тоже покрывает, но с
 заглушкой `api()`; здесь ответы приходят от настоящего сервера.
 """
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 
-from tests.e2e.conftest import go, nav_screens, tab
+from tests.e2e.conftest import go, nav_screens, require_decision, settled, tab
 
 import pytest
 
@@ -43,16 +43,17 @@ def test_guest_sees_no_access_screen(open_app, e2e):
     assert "доступ" in page.locator("#content").inner_text().lower()
 
 
-# ─── Денежный контур: заказ → заявка → одобрение → списание ──────────────────
+# ─── Денежный контур: заказ → отгрузка без одобрения → списание ─────────────
 
 
-def test_manager_order_to_boss_approval_moves_stock(open_app, e2e):
-    """Полный путь продажи через два браузера и одну базу.
+def test_manager_ships_order_without_approval_moves_stock(open_app, e2e):
+    """Полный путь продажи: одобрение отгрузки не обязательно.
 
-    Менеджер собирает заказ в редакторе (клиент, товар, количество, цена) и
-    отправляет заявку; босс видит её в «Заявках» и одобряет. Проверяем не
-    экран, а последствия в БД: заявка approved, у заказа есть накладная,
-    остаток на складе уменьшился ровно на количество из заявки.
+    Менеджер собирает заказ в редакторе (клиент, товар, количество, цена),
+    выбирает «В долг» и сам жмёт «Отгрузить». Проверяем не экран, а
+    последствия в БД: заказ отгружен, накладная одна, остаток уменьшился ровно
+    на количество; руководителю ушло уведомление со всеми позициями и без
+    кнопок одобрения; печатная форма накладной пришла менеджеру фоном.
     """
     ids = e2e.ids
     mgr = open_app(ids["mgr"])
@@ -76,40 +77,42 @@ def test_manager_order_to_boss_approval_moves_stock(open_app, e2e):
     mgr.fill("#price-input", "100")
     mgr.evaluate("window.__tgMainClick()")
     mgr.wait_for_selector("#btn-submit:not([disabled])")
+    mgr.click('[data-pay="credit"]')
+    mgr.wait_for_selector("#due-date-wrap:not(.hidden)")
+    mgr.fill("#due-date-input", "2030-01-15")
+    assert mgr.locator("#btn-submit").inner_text().strip().endswith("Отгрузить")
     mgr.click("#btn-submit")
-    mgr.wait_for_function("() => window.__tgAlerts.some(a => a.includes('отправлена'))")
+    mgr.wait_for_function("() => window.__tgAlerts.some(a => /Заказ #\\d+ отгружен/.test(a))")
 
-    reqs = e2e.rows("SELECT id, status, order_id FROM shipment_requests")
-    assert len(reqs) == 1 and reqs[0]["status"] == "pending"
+    reqs = e2e.rows("SELECT id, status, order_id, approved_by FROM shipment_requests")
+    assert len(reqs) == 1 and reqs[0]["status"] == "approved" and reqs[0]["approved_by"] == ids["mgr"]
     order_id = reqs[0]["order_id"]
-    assert e2e.rows("SELECT status FROM orders WHERE id = ?", (order_id,))[0]["status"] == "pending"
-    # Пуш руководству о новой заявке ушёл (граница перехвачена).
-    assert any("заявка" in p["text"].lower() for p in e2e.pushes)
-
-    boss = open_app(ids["boss"])
-    go(boss, "sales")
-    boss.click("#show-requests")
-    boss.wait_for_selector(".btn-approve")
-    card = boss.locator(".order-card").first
-    assert "Ромашка" in card.inner_text()
-    assert "Кабель" in card.inner_text()
-    boss.click(".btn-approve")
-    boss.wait_for_function("() => window.__tgAlerts.some(a => a.includes('одобрена'))")
-
-    assert e2e.rows("SELECT status FROM shipment_requests")[0]["status"] == "approved"
-    assert e2e.rows("SELECT status FROM orders WHERE id = ?", (order_id,))[0]["status"] == "approved"
+    assert e2e.rows("SELECT status FROM orders WHERE id = ?", (order_id,))[0]["status"] == "shipped"
     ship = e2e.rows("SELECT invoice_id, failed_at FROM order_shipment WHERE order_id = ?", (order_id,))
     assert ship and ship[0]["invoice_id"] and ship[0]["failed_at"] is None
     inv = e2e.rows("SELECT type, total_amount_cents FROM invoices WHERE id = ?", (ship[0]["invoice_id"],))[0]
     assert inv["type"] == "outgoing" and inv["total_amount_cents"] == 20000
     stock = e2e.rows("SELECT quantity FROM stock WHERE product_id = ?", (ids["product"],))[0]["quantity"]
-    assert stock == 18, "20 на приходе минус 2 в заявке"
-    # Печатная форма приходит СЛЕДОМ, фоновой задачей: ответ боссу её не ждёт.
-    boss.wait_for_function("() => true")
+    assert stock == 18, "20 на приходе минус 2 в заказе"
+    # Заявки «на одобрение» руководителю не было — только уведомление об отгрузке.
+    assert not [p for p in e2e.pushes if "req_ok:" in str(p.get("reply_markup"))]
+    e2e.wait_for(lambda: any(
+        m["chat_id"] == ids["boss"] and f"Заказ #{order_id} отгружен" in m["text"] for m in e2e.bot.messages
+    ))
+    note = next(m for m in e2e.bot.messages if m["chat_id"] == ids["boss"] and "отгружен" in m["text"])
+    assert "Кабель" in note["text"] and "2 шт × 100 USD = 200 USD" in note["text"], note["text"]
+    assert "В долг до <b>15.01.2030</b>" in note["text"] and not note.get("reply_markup")
+
+    # У руководителя нечего решать: заявок на рассмотрении нет.
+    boss = open_app(ids["boss"])
+    go(boss, "sales")
+    settled(boss)
+    assert boss.locator("#show-requests").count() == 0
+    # Печатная форма приходит СЛЕДОМ, фоновой задачей — менеджеру, отгрузившему заказ.
     deadline = time.monotonic() + 15
-    while time.monotonic() < deadline and len(e2e.bot.documents) < 2:
+    while time.monotonic() < deadline and not e2e.bot.documents:
         time.sleep(0.2)
-    assert sorted(d["chat_id"] for d in e2e.bot.documents) == sorted([ids["mgr"], ids["boss"]])
+    assert [d["chat_id"] for d in e2e.bot.documents] == [ids["mgr"]]
 
 
 # ─── Аудит п.1 через настоящий браузер ───────────────────────────────────────
@@ -126,6 +129,7 @@ def test_xss_in_request_does_not_run_in_boss_session(open_app, e2e):
     ids = e2e.ids
     db = e2e.db
     payload = '<img src=x onerror="window.__pwned=1">'
+    require_decision(e2e, 10.0)  # заявка ждёт руководителя — иначе её нет в «Заявках»
     oid = db.create_order(ids["mgr"], "Mgr", "")
     cp = e2e.rows("SELECT id FROM counterparties")[0]["id"]
     db.update_order_agent(oid, str(cp), "ООО " + payload)

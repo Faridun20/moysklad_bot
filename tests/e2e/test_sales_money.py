@@ -1,6 +1,6 @@
 """E2E, вторая волна: продажи и деньги.
 
-Всё, что после «заявка одобрена»: превышение лимита, отказ и доработка,
+Всё, что после продажи: превышение лимита (заявка руководителю), отказ и доработка,
 отметка оплаты и её подтверждение, сдача наличных, возврат, экран долгов,
 очередь «Сегодня», отчёты. Продажа как таковая уже покрыта первой волной —
 здесь она заводится через сервисы (`seed_order`), чтобы каждый сценарий
@@ -25,7 +25,8 @@ pytestmark = pytest.mark.usefixtures("boss_work_actions")
 
 
 def test_over_limit_request_is_approved_only_with_override(open_app, e2e):
-    """Заказ в долг больше лимита: босс видит цифры и подтверждает превышение.
+    """Заказ в долг больше лимита: менеджер сам не отгрузит — «Отгрузить»
+    отказывает и предлагает заявку; босс видит цифры и подтверждает превышение.
 
     Сервер на такую заявку отвечает не ошибкой, а `needs_override` — это
     просьба подтвердить. Фронт обязан ПОКАЗАТЬ превышение и повторить запрос
@@ -53,8 +54,14 @@ def test_over_limit_request_is_approved_only_with_override(open_app, e2e):
     mgr.wait_for_selector("#due-date-wrap:not(.hidden)")
     mgr.fill("#due-date-input", "2030-01-15")
     mgr.click("#btn-submit")
+    # Долг сверх лимита — без руководителя не отгрузить: вопрос «Отправить
+    # заявку?» (заглушка отвечает «да») и заявка.
+    mgr.wait_for_function(
+        "() => window.__tgAlerts.some(a => a.startsWith('confirm:') && a.includes('долг клиента станет'))"
+    )
     mgr.wait_for_function("() => window.__tgAlerts.some(a => a.includes('отправлена'))")
     order_id = e2e.rows("SELECT order_id FROM shipment_requests")[0]["order_id"]
+    assert e2e.rows("SELECT quantity FROM stock WHERE product_id = ?", (ids["product"],))[0]["quantity"] == 20
 
     boss = open_app(ids["boss"])
     go(boss, "sales")
@@ -79,7 +86,7 @@ def test_over_limit_request_is_approved_only_with_override(open_app, e2e):
 
 
 def test_boss_rejects_request(open_app, e2e):
-    seeded = seed_order(e2e, payment_type="paid", due_date=None, approve=False)
+    seeded = seed_order(e2e, payment_type="paid", due_date=None, approve=False, needs_decision=True)
     boss = open_app(e2e.ids["boss"])
     go(boss, "sales")
     boss.click("#show-requests")
@@ -96,7 +103,7 @@ def test_boss_rejects_request(open_app, e2e):
 
 def test_boss_returns_request_to_manager_with_comment(open_app, e2e):
     """«На доработку»: заявка возвращается менеджеру в черновик с комментарием."""
-    seeded = seed_order(e2e, payment_type="paid", due_date=None, approve=False)
+    seeded = seed_order(e2e, payment_type="paid", due_date=None, approve=False, needs_decision=True)
     boss = open_app(e2e.ids["boss"])
     go(boss, "sales")
     boss.click("#show-requests")
@@ -335,7 +342,9 @@ def test_debts_screen_shows_overdue_credit_order(open_app, e2e):
 
 
 def test_today_queue_leads_boss_to_pending_requests(open_app, e2e):
-    seed_order(e2e, payment_type="paid", due_date=None, approve=False)
+    # В очереди — заявка, которая ждёт решения (скидка выше порога); без неё
+    # заявку отгружает сам менеджер.
+    seed_order(e2e, payment_type="paid", due_date=None, approve=False, needs_decision=True)
     boss = open_app(e2e.ids["boss"])
     go(boss, "today")
     # Заявки руководителя — часть «Решений».
@@ -348,7 +357,7 @@ def test_today_queue_leads_boss_to_pending_requests(open_app, e2e):
 
 def test_manager_today_queue_has_no_boss_items(open_app, e2e):
     """Заявки ждут решения босса — менеджеру этот пункт не показывают."""
-    seed_order(e2e, payment_type="paid", due_date=None, approve=False)
+    seed_order(e2e, payment_type="paid", due_date=None, approve=False, needs_decision=True)
     mgr = open_app(e2e.ids["mgr"])
     go(mgr, "today")
     settled(mgr)

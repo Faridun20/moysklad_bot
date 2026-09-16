@@ -98,12 +98,30 @@ async def build_order_timeline(order_id: int) -> list[dict]:
         events.append({"ts": _dt(ts), "actor": actor or "", "action": action, "text": text})
 
     add(order.get("created_at"), order.get("full_name"), "order_created", "Заказ создан")
-    add(
-        order.get("submitted_at"), order.get("full_name"), "order_submitted",
-        "Отправлен на рассмотрение",
-    )
+
+    def without_approval(req: dict) -> bool:
+        # Одобрение отгрузки не обязательно: «Отгрузить» проводит заявку тем же
+        # переходом, и в `approved_by` стоит сам автор. Никто ничего не
+        # рассматривал — «подана/отправлена/одобрена» в ленте были бы неправдой.
+        return (
+            req.get("status") == "approved"
+            and bool(req.get("approved_by"))
+            and req.get("approved_by") == req.get("user_id")
+        )
+
+    if not (requests and without_approval(requests[-1])):
+        add(
+            order.get("submitted_at"), order.get("full_name"), "order_submitted",
+            "Отправлен на рассмотрение",
+        )
 
     for req in requests:
+        if without_approval(req):
+            add(
+                req.get("approved_at"), req.get("approved_by_name"), "shipment_auto_approved",
+                "Отгрузка оформлена без одобрения руководителя",
+            )
+            continue
         add(
             req.get("created_at"), req.get("full_name"), "shipment_requested",
             f"Заявка на отгрузку №{req['id']} подана",

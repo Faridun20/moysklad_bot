@@ -98,7 +98,8 @@ async def gather(user_id: int, role: str) -> list[dict]:
     Каждый пункт: `{key, count, title, hint, severity, screen}`. `screen` — уже
     готовый адрес для `showScreen`, включая вкладку (`money:debts`).
     """
-    from services.database import count_boss_attention, get_pending_requests
+    from services.database import count_boss_attention
+    from services.order_workflow import requests_needing_decision
 
     boss = role in _BOSS
     # Менеджер видит свои долги и своих клиентов; руководство — все.
@@ -122,13 +123,16 @@ async def gather(user_id: int, role: str) -> list[dict]:
     if boss:
         try:
             counts = await count_boss_attention()
-            pending = await get_pending_requests()
+            # Одобрение отгрузки не обязательно: в очереди — только заявки со
+            # скидкой выше порога или долгом сверх лимита. Остальные менеджер
+            # отгружает сам (`order_workflow.requests_needing_decision`).
+            pending = await requests_needing_decision()
             # Всё, что ждёт решения руководителя, — в одном экране «Решения»
             # (`DECISIONS_SCREEN`): там общий бейдж, и считает его фронт по
             # пунктам с этим адресом — новый вид решения, добавленный сюда с тем
             # же `screen`, попадёт в бейдж сам.
             add("requests", len(pending), "Заявки ждут решения",
-                "отгрузка не поедет, пока не одобрите", "warn", DECISIONS_SCREEN)
+                "скидка выше порога или долг сверх лимита", "warn", DECISIONS_SCREEN)
             add("payments", counts["payments"], "Платежи на подтверждение",
                 "менеджер отметил оплату", "warn", DECISIONS_SCREEN)
             add("deposits", counts["deposits"], "Сдачи наличных",

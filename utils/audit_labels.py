@@ -27,6 +27,7 @@ ACTION_EMOJI: dict[str, str] = {
     "payment_rejected": "❌",
     "login": "👤",
     "order_shipped": "🚚",
+    "shipment_auto_approved": "🚚",
     "order_cancelled": "🚫",
     "order_fully_paid": "✅",
     "credit_override": "⚠️",
@@ -65,6 +66,7 @@ ACTION_LABELS: dict[str, str] = {
     "order_fully_paid": "Заказ полностью оплачен",
     "shipment_returned": "Заявка возвращена на доработку",
     "shipment_request_sent": "Заявка на отгрузку подана",
+    "shipment_auto_approved": "Отгрузка оформлена без одобрения руководителя",
     # ─ платежи/долги/сдачи ─
     "payment_sent": "Платёж внесён",
     "payment_confirmed": "Платёж подтверждён",

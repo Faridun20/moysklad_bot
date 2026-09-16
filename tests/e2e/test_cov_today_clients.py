@@ -226,7 +226,7 @@ def test_queue_is_sorted_by_urgency(open_app, e2e):
     """Просроченный долг (crit) выше заявки (warn), несверенный контейнер (info) — последним."""
     overdue = seed_order(e2e)
     e2e.exec("UPDATE orders SET due_date = ? WHERE id = ?", ("2020-01-01", overdue["order_id"]))
-    seed_order(e2e, payment_type="paid", due_date=None, approve=False)  # заявка ждёт
+    seed_order(e2e, payment_type="paid", due_date=None, approve=False, needs_decision=True)  # заявка ждёт решения
     _arrived_unchecked_container(e2e)
 
     boss = open_app(e2e.ids["boss"])

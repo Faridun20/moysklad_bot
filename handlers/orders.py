@@ -338,6 +338,10 @@ async def _settle_stale_request(call: CallbackQuery, req_id: int) -> bool:
     if not req or req.get("status") == "pending":
         return False
     label = _REQUEST_SETTLED.get(req.get("status") or "", "ℹ️ Заявка уже решена")
+    if req.get("status") == "approved" and req.get("approved_by") and req.get("approved_by") == req.get("user_id"):
+        # Одобрение отгрузки больше не обязательно: менеджер отгрузил заказ сам,
+        # а карточка с кнопками осталась с тех пор, когда решение ждали.
+        label = "🚚 Менеджер отгрузил сам"
     await settle_card(
         call, _request_callbacks(req_id), label, tail=webapp_keyboard("🌐 Заявки — в WebApp")
     )

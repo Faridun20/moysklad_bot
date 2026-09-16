@@ -189,6 +189,142 @@ async def notify_order_returned(
     await _send(bot, manager_user_id, text)
 
 
+# ─── Отгрузка ─────────────────────────────────────────────────────────────────
+
+# Предел длины карточки: у Telegram 4096 символов на сообщение, запас — на
+# HTML-теги и хвост. Позиции, не влезшие в него, сворачиваются в «…и ещё N».
+_SHIPPED_TEXT_LIMIT = 3800
+
+
+def _ru_date(iso: str | None) -> str:
+    if not iso or len(str(iso)) < 10:
+        return str(iso or "—")
+    y, m, d = str(iso)[:10].split("-")
+    return f"{d}.{m}.{y}"
+
+
+def format_order_shipped(
+    order: dict,
+    items: list[dict],
+    *,
+    shipped_by: str,
+    when: str,
+    parts: list[dict] | None = None,
+    approved_by: str | None = None,
+) -> str:
+    """Карточка руководителю «Заказ #N отгружен» — без кнопок решения.
+
+    Все позиции с количеством и суммой, итог, как оплачено (строки разбивки)
+    или «в долг до …». Пользовательский ввод — через `esc`.
+    """
+    from config import BASE_CURRENCY
+    from services import money
+    from services.order_payments import fmt_cents, part_label
+    from utils.formatters import plural_positions
+
+    cur = (order.get("currency") or BASE_CURRENCY or "").upper()
+    head = [
+        DIV,
+        f"🚚 <b>Заказ #{int(order['id'])} отгружен</b>",
+        "",
+        f"👤 Клиент: <b>{esc(order.get('agent_name') or '—')}</b>",
+        f"👨‍💼 Отгрузил: <b>{esc(shipped_by)}</b>",
+    ]
+    if approved_by:
+        head.append(f"✅ Заявку одобрил: {esc(approved_by)}")
+    head += [f"🕐 {esc(when)}", "", f"<b>📦 Товары ({len(items)}):</b>"]
+
+    total_cents = 0
+    item_lines: list[str] = []
+    for it in items:
+        qty = float(it.get("quantity") or 0)
+        price_cents = int(it.get("price_cents") or money.to_cents(it.get("price") or 0))
+        line_cents = money.mul_qty(price_cents, qty)
+        total_cents += line_cents
+        unit = esc(it.get("unit") or "шт")
+        name = esc(it.get("product_name") or it.get("name") or "—")
+        qty_txt = f"{qty:g}"
+        if price_cents > 0:
+            item_lines.append(
+                f"  • {name} — {qty_txt} {unit} × {fmt_cents(price_cents, cur)} = {fmt_cents(line_cents, cur)}"
+            )
+        else:
+            item_lines.append(f"  • {name} — {qty_txt} {unit}")
+
+    tail = ["", f"<b>💰 Итого: {fmt_cents(total_cents, cur)}</b>"]
+    live = [p for p in (parts or []) if p.get("state") != "rejected"]
+    labels = "; ".join(
+        esc(part_label(p["method"], int(p["amount_cents"]), p["currency"], p.get("account")))
+        for p in live
+    )
+    if (order.get("payment_type") or "paid") == "credit":
+        tail.append(f"💳 В долг до <b>{esc(_ru_date(order.get('due_date')))}</b>")
+        if labels:
+            tail.append(f"💵 Уже внесено: {labels}")
+    elif labels:
+        tail.append(f"💵 Оплата сразу: {labels}")
+    else:
+        tail.append("💵 Оплата сразу")
+
+    shown = list(item_lines)
+    while shown and len("\n".join(head + shown + tail)) > _SHIPPED_TEXT_LIMIT:
+        shown.pop()
+    if len(shown) < len(item_lines):
+        shown.append(f"  <i>…и ещё {plural_positions(len(item_lines) - len(shown))}</i>")
+    return "\n".join(head + shown + tail)
+
+
+async def notify_order_shipped(bot: Bot, order_id: int, shipped_by_id: int, shipped_by_name: str) -> list[int]:
+    """Разослать «Заказ отгружен» руководителям (admin/boss) и автору заказа.
+
+    Зовётся фоном ПОСЛЕ коммита отгрузки (`order_workflow.ship_order_now`):
+    отгрузка уже состоялась, и сбой Telegram её не откатывает. Себе не шлём —
+    отгрузивший и так видит результат на экране. Возвращает, кому отправлено.
+    """
+    import asyncio
+
+    from services import async_db as adb
+    from services import order_payments
+    from services.notify_policy import ORDER_SHIPPED
+    from utils.helpers import local_now
+
+    order = await adb.get_order(order_id)
+    if not order:
+        return []
+    items = await adb.get_order_items(order_id)
+    parts = (await order_payments.parts_for_orders([order_id])).get(order_id, [])
+    approved_by = None
+    for req in await adb.get_shipment_requests_for_order(order_id):
+        if req.get("status") == "approved" and req.get("approved_by") and req.get("approved_by") != req.get("user_id"):
+            approved_by = req.get("approved_by_name") or None
+    text = format_order_shipped(
+        order, items, shipped_by=shipped_by_name, when=local_now().strftime("%d.%m.%Y %H:%M"),
+        parts=parts, approved_by=approved_by if approved_by != shipped_by_name else None,
+    )
+    sent: list[int] = []
+    recipients: list[int] = []
+    if should_notify_now(ORDER_SHIPPED):
+        recipients = [int(u) for u in await asyncio.to_thread(get_notify_recipients)]
+    for uid in dict.fromkeys(recipients):
+        if uid == int(shipped_by_id):
+            continue
+        try:
+            await bot.send_message(uid, text, parse_mode="HTML", disable_web_page_preview=True)
+            sent.append(uid)
+        except Exception as e:
+            logger.warning("Не удалось уведомить %s об отгрузке заказа #%s: %s", uid, order_id, e)
+    creator = int(order.get("user_id") or 0)
+    if creator and creator != int(shipped_by_id) and creator not in sent:
+        try:
+            await bot.send_message(
+                creator, f"🚚 Ваш заказ #{order_id} отгружен ({esc(shipped_by_name)}).", parse_mode="HTML"
+            )
+            sent.append(creator)
+        except Exception as e:
+            logger.warning("Не удалось сообщить автору заказа #%s об отгрузке: %s", order_id, e)
+    return sent
+
+
 # ─── Платежи ──────────────────────────────────────────────────────────────────
 
 

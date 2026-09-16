@@ -8,7 +8,9 @@
 которым стало легко пропустить действительно важное. Новое правило:
 
 * **Сразу** — решения, которые блокируют работу менеджера (заявка на
-  отгрузку ждёт одобрения — `ORDER_REQUEST`), одобрения сделок по технике
+  отгрузку ждёт решения из-за скидки или лимита долга — `ORDER_REQUEST`),
+  отгруженный заказ (`ORDER_SHIPPED`: одобрение отгрузки не обязательно, и это
+  уведомление — то, как руководитель видит продажи), одобрения сделок по технике
   (`MACHINE_DEAL_APPROVAL` — путь machine-approval, см. докстринг ниже) и
   ЛЮБОЕ денежное событие (платёж, сдача наличных, возврат) на сумму ≥
   `app_settings.boss_instant_threshold_usd` (курс — ТЕКУЩИЙ из
@@ -50,12 +52,16 @@ logger = logging.getLogger(__name__)
 # Первые два блокируют работу — порог к ним не применяется.
 ORDER_REQUEST = "order_request"
 MACHINE_DEAL_APPROVAL = "machine_deal_approval"
+# Заказ отгружен. Одобрение отгрузки больше не обязательно (решение владельца,
+# сентябрь 2026): менеджер отгружает сам, а руководитель узнаёт об этом
+# уведомлением — оно и есть его контроль, поэтому порогом не режется.
+ORDER_SHIPPED = "order_shipped"
 # Денежные события — режутся порогом `boss_instant_threshold_usd`.
 PAYMENT = "payment"
 CASH_DEPOSIT = "cash_deposit"
 RETURN = "return"
 
-_ALWAYS_IMMEDIATE = frozenset({ORDER_REQUEST, MACHINE_DEAL_APPROVAL})
+_ALWAYS_IMMEDIATE = frozenset({ORDER_REQUEST, MACHINE_DEAL_APPROVAL, ORDER_SHIPPED})
 _MONEY_KINDS = frozenset({PAYMENT, CASH_DEPOSIT, RETURN})
 
 DEFAULT_THRESHOLD_USD = 5000.0
