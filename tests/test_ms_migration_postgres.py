@@ -139,3 +139,109 @@ def test_reference_rerun_refused_on_postgres(pg_db):
     qty = asyncio.run(adb_core.fetchval("SELECT quantity FROM stock"))
     assert Decimal(str(qty)) == Decimal("7")
     assert asyncio.run(m.verify(products, [], stock, skip_ms_ids={"uuid-p1"})) == []
+
+
+# ─── Перенос на базу со ВСЕМИ ограничениями прода ────────────────────────────
+
+
+def _full_history(ms_api):
+    """История, в которой есть всё, что до правок роняло транзакцию на CHECK или
+    давало выдуманные долги: нулевая позиция, нулевой платёж, приходный ордер по
+    FIFO, расходный ордер поставщику, аренда, частичная отгрузка, заказ без
+    отгрузки, приход с общей выплатой."""
+    ms_api["customerorder"] = [
+        hist._order(ms_id="ord-part", name="P1", sum_minor=600000,
+                    positions=[hist._pos(hist.P1_MS, "Труба", 6, 100000)]),
+        hist._order(ms_id="ord-open", name="O1", sum_minor=100000,
+                    positions=[hist._pos(hist.P2_MS, "Уголок", 1, 100000)]),
+    ]
+    ms_api["demand"] = [
+        hist._demand(ms_id="dem-part", name="D1", order_ms_id="ord-part", sum_minor=200000,
+                     positions=[hist._pos(hist.P1_MS, "Труба", 2, 100000),
+                                hist._pos(hist.P2_MS, "Уголок", 0, 5000)]),
+        hist._demand(ms_id="dem-sale", name="D2", order_ms_id=None, sum_minor=300000),
+    ]
+    ms_api["paymentin"] = [
+        hist._paymentin(ms_id="pay-part", sum_minor=200000, op=("customerorder", "ord-part")),
+        hist._paymentin(ms_id="pay-zero", sum_minor=0, op=None),
+    ]
+    ms_api["cashin"] = [hist._cashin(ms_id="cin-sale", sum_minor=300000, op=None)]
+    ms_api["supply"] = [hist._supply(agent="cp-supplier")]
+    ms_api["paymentout"] = [
+        hist._paymentout(ms_id="po-general", sum_minor=50000, agent="cp-supplier", op=None),
+        hist._paymentout(ms_id="po-rent", sum_minor=70000, agent="cp-rent", op=None),
+    ]
+    ms_api["cashout"] = [hist._cashout(ms_id="cout-sup", sum_minor=100000, agent="cp-supplier")]
+
+
+@pytest.fixture
+def pg_constrained(pg_seeded):
+    from scripts import apply_constraints
+
+    report = apply_constraints.run(dry_run=False)
+    assert report.failed == [] and report.violations == {} and report.not_valid == []
+    hist._add_counterparty(pg_seeded, "Арендодатель", "cp-rent")
+    return pg_seeded
+
+
+def _assert_constraints_still_clean():
+    from scripts import apply_constraints
+    from services import startup_checks
+
+    again = apply_constraints.run(dry_run=True)
+    assert again.failed == [] and again.violations == {} and again.not_valid == []
+    assert startup_checks.check_schema() == []
+
+
+def _queue_keys():
+    from services import work_queue
+
+    # pg_db заводит user 2 руководителем.
+    return {item["key"] for item in asyncio.run(work_queue.gather(2, "boss"))}
+
+
+def test_history_import_under_all_constraints_settled(pg_constrained, ms_api):
+    from services import supplier_debts
+
+    db = pg_constrained
+    _full_history(ms_api)
+
+    stats, unmatched, problems = hist._run(ms_api, supplier_history="settled")
+    hist._run(ms_api, supplier_history="settled")  # повтор на ограничениях тоже чист
+
+    assert problems == []
+    assert stats["orders_partially_shipped"] == 1 and stats["orders_unshipped"] == 1
+    assert stats["payments_zero"] == 1 and stats["payments_out_not_supplier"] == 1
+    assert stats["payments_out_settled"] == 2 and stats["supplies_settled"] == 1
+    assert "позиция с нулевым количеством — не перенесена" in unmatched.buckets
+    _assert_constraints_still_clean()
+
+    led = asyncio.run(supplier_debts.ledger())
+    assert [d for d in led.debts if d.remaining_cents > 0] == [] and led.advances == {}
+    assert hist._rows(db, "SELECT * FROM supplier_payments") == []
+    keys = _queue_keys()
+    assert not keys & {"supplier_debts", "payments", "deposits"}, keys
+    # Долги клиентов: только заказ без отгрузки (о нём есть сведения в отчёте).
+    assert stats["client_debts_open"] == 1
+    assert "overdue_debts" not in keys, "у перенесённого долга нет выдуманного срока"
+
+
+def test_history_import_under_all_constraints_ledger(pg_constrained, ms_api):
+    from services import supplier_debts
+
+    _full_history(ms_api)
+
+    stats, _, problems = hist._run(ms_api)
+
+    assert problems == []
+    _assert_constraints_still_clean()
+    # Приход 2 000 USD − выплаты 500 (общая) − 1 000 (ордер к приходу) = 500 долга,
+    # просроченного со дня прихода; аренда авансом не стала.
+    led = asyncio.run(supplier_debts.ledger())
+    open_debts = [d for d in led.debts if d.remaining_cents > 0]
+    assert [d.remaining_cents for d in open_debts] == [50000]
+    assert led.advances == {}
+    assert (stats["supplier_debts_open"], stats["supplier_debts_overdue"],
+            stats["supplier_advances"]) == (1, 1, 0)
+    assert "supplier_debts" in _queue_keys()
+    assert stats["payments_out"] == 2
