@@ -257,6 +257,7 @@ async def main() -> int:
     except Exception:
         logger.exception("debts_notify: ошибка")
         return 1
+    finally:
         await close_tg_session()
 
 
