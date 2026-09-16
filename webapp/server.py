@@ -3916,7 +3916,7 @@ async def api_orders(request: Request):
     # Заявки без решения: одобрение отгрузки не обязательно, и «Отгрузить» на
     # такой заявке есть, если руководитель по ней не нужен (скидка ниже порога,
     # долг в лимите). Долги клиентов — батчем, как в «Решениях».
-    from services.order_workflow import _reasons_from, decision_text, orders_credit_context
+    from services.order_workflow import decision_reasons_from, decision_text, orders_credit_context
 
     pending_totals = {
         o["id"]: sum(
@@ -3938,7 +3938,7 @@ async def api_orders(request: Request):
             items, prices, o.get("currency"), threshold=discount_threshold
         )
         reasons = (
-            _reasons_from(discount, pending_credit.get(o["id"])) if o["status"] == "pending" else []
+            decision_reasons_from(discount, pending_credit.get(o["id"])) if o["status"] == "pending" else []
         )
         discount_lines = discount["lines"]
         entry = {
@@ -8537,11 +8537,11 @@ async def api_order_payment_context(request: Request):
     base = (BASE_CURRENCY or "USD").upper()
     ptype = order.get("payment_type") or "paid"
     # Черновик и заявка без решения отгружаются вместе с оплатой
-    # (`order_workflow.ship_order_now`): форма открывается ДО оформления, и
-    # вносят её только при «оплате сразу» — условия выбраны в форме черновика,
-    # сохранённый тип оплаты у черновика мог остаться от прошлой доработки.
+    # (`order_workflow.ship_order_now`): форма открывается ДО оформления.
+    # У черновика её открывают только при «оплате сразу», выбранной в
+    # редакторе, — сохранённый тип оплаты мог остаться от прошлой доработки.
     before_shipment = order.get("status") in ("draft", "pending")
-    if before_shipment:
+    if order.get("status") == "draft":
         ptype = "paid"
     currency = (order.get("currency") or base).upper()
     if ptype == "paid":

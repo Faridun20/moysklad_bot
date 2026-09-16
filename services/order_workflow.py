@@ -1149,7 +1149,7 @@ def _fmt_base(amount: float) -> str:
     return f"{money.format_cents(money.to_cents(amount or 0), decimals=0, sep=' ')} {BASE_CURRENCY}"
 
 
-def _reasons_from(discount: dict | None, credit: dict | None) -> list[dict]:
+def decision_reasons_from(discount: dict | None, credit: dict | None) -> list[dict]:
     """Причины, по которым заказ не отгрузить без руководителя. [] — не нужно."""
     reasons: list[dict] = []
     if discount and discount.get("flagged"):
@@ -1196,7 +1196,7 @@ async def decision_reasons(order: dict, items: list[dict]) -> tuple[list[dict], 
     credit = None
     if not order.get("credit_limit_override"):
         credit = await order_credit_context(order, _order_total(items))
-    return _reasons_from(discount, credit), discount
+    return decision_reasons_from(discount, credit), discount
 
 
 async def requests_needing_decision() -> list[dict]:
@@ -1233,7 +1233,7 @@ async def requests_needing_decision() -> list[dict]:
         discount = order_discounts.summarize(
             items_by.get(oid, []), prices, order.get("currency"), threshold=threshold
         )
-        reasons = _reasons_from(discount, credit.get(oid))
+        reasons = decision_reasons_from(discount, credit.get(oid))
         if reasons:
             out.append({**r, "reasons": reasons})
     return out
