@@ -107,8 +107,17 @@ class PrintResult:
 CALLBACK_PREFIX = "prn:"
 
 
-def invoice_callback(invoice_id: int) -> str:
-    return f"{CALLBACK_PREFIX}inv:{invoice_id}"
+# Языки печатной формы накладной (`invoice_pdf.DOC_LANGS`). Дублируются
+# строкой, а не импортом: модуль печати не тянет за собой рендер.
+_INVOICE_LANGS = ("ru_uz", "ru", "uz")
+
+
+def invoice_callback(invoice_id: int, lang: str | None = None) -> str:
+    """`prn:inv:42` или `prn:inv:42:uz` — с языком товарной накладной.
+    Без языка (старые кнопки в чатах) печатается язык, выбранный человеком
+    последним (`user_prefs.doc_lang`)."""
+    tail = f":{lang}" if lang in _INVOICE_LANGS else ""
+    return f"{CALLBACK_PREFIX}inv:{invoice_id}{tail}"
 
 
 def document_callback(doc_id: int) -> str:
@@ -124,6 +133,9 @@ def parse_callback(data: str) -> tuple[str, int] | None:
     if len(parts) != 2:
         return None
     kind, raw = parts
+    raw, _, lang = raw.partition(":")
+    if lang and lang not in _INVOICE_LANGS:
+        return None
     try:
         ref = int(raw)
     except ValueError:
@@ -131,6 +143,14 @@ def parse_callback(data: str) -> tuple[str, int] | None:
     if ref <= 0:
         return None
     return kind, ref
+
+
+def callback_lang(data: str) -> str | None:
+    """Язык из `prn:inv:42:uz` → `uz`; нет или чужой — None."""
+    if parse_callback(data) is None:
+        return None
+    lang = data[len(CALLBACK_PREFIX):].split(":")[2:3]
+    return lang[0] if lang and lang[0] in _INVOICE_LANGS else None
 
 
 def is_available() -> bool:

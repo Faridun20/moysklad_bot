@@ -300,7 +300,8 @@ def test_manager_ui_is_unchanged(open_app, e2e):
     # «Клиенты» — пятой кнопкой панели (решение владельца: список покупателей
     # в одно касание); «Обращения» — в шторке.
     assert _bar(mgr) == ["today", "sales", "stock", "money", "clients"]
-    assert nav_screens(mgr) == ["today", "sales", "stock", "money", "clients", "leads"]
+    # «Настройки» — в шторке, ради «Реквизитов компании» (владелец — менеджер).
+    assert nav_screens(mgr) == ["today", "sales", "stock", "money", "clients", "leads", "settings"]
     _open_menu(mgr)
     assert mgr.locator("#nav-drawer [data-work-switch]").count() == 0
     assert _drawer_tabs(mgr, "money") == ["confirm", "debts", "ops", "reconcile"]

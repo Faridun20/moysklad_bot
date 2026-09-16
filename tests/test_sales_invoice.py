@@ -56,7 +56,17 @@ def db(isolated_db):
     isolated_db.set_setting("company_name", "FARID IMPEKS LLC", BOSS)
     isolated_db.set_setting("company_tin", "301234567", BOSS)
     isolated_db.set_setting("company_address", "Ташкент, ул. Складская, 1", BOSS)
+    for key, value in BANK.items():
+        isolated_db.set_setting(key, value, BOSS)
     return isolated_db
+
+
+# Без банковских реквизитов счёт на оплату не выписывается (его нечем оплатить).
+BANK = {
+    "company_bank_account": "20208000900123456001",
+    "company_bank_name": "АКБ «Капиталбанк»",
+    "company_bank_mfo": "01088",
+}
 
 
 # ─── Сборка ───────────────────────────────────────────────────────────────────
@@ -80,8 +90,10 @@ def test_invoice_is_built_before_any_request_or_shipment(db):
     assert [ln["product_name"] for ln in doc["lines"]] == ["Болт М8", "Гайка М8"]
     # 3 × 250.00 + 2 × 125.50 = 1001.00
     assert doc["total_cents"] == 100100
-    assert doc["total_words"] == "одна тысяча один"
+    assert doc["total_words"] == "одна тысяча один доллар США"
     assert doc["company"]["company_tin"] == "301234567"
+    assert doc["valid_days"] == 3, "срок действия счёта по умолчанию — 3 банковских дня"
+    assert doc["requisites_missing"] == ""
 
 
 def test_number_and_date_do_not_change_between_two_prints(db):
@@ -147,18 +159,87 @@ def test_cancelled_order_gets_no_invoice(db):
 
 
 def test_html_carries_positions_total_and_requisites(db):
+    """Бланк владельца: поставщик с банковскими реквизитами, покупатель,
+    таблица, «Без НДС», итог прописью в валюте заказа, срок действия, подписи
+    и оговорка про ЭСФ."""
     from services import invoice_pdf
     from services.sales_invoice import build_sales_invoice
 
     doc = _run(build_sales_invoice(_order(db)))
-    html = invoice_pdf.build_sales_invoice_html(doc)
-    assert "СЧЁТ НА ОПЛАТУ" in html
-    assert "FARID IMPEKS LLC" in html and "301234567" in html
-    assert "ООО Ромашка" in html and "+998 90 123-45-67" in html
+    html = invoice_pdf.build_sales_invoice_html(doc, lang="ru")
+    assert "Счёт на оплату" in html
+    assert f"№ {doc['number']} от «" in html
+    assert "Поставщик" in html and "Покупатель" in html
+    assert "FARID IMPEKS LLC" in html and "ИНН: 301234567" in html
+    assert "Р/с: 20208000900123456001" in html and "МФО: 01088" in html
+    assert "ООО Ромашка" in html and "Тел.: +998 90 123-45-67" in html
+    # ИНН/ПИНФЛ и адрес покупателя не заполнены — черта для записи от руки.
+    assert "ИНН / ПИНФЛ: <span class=\"blank" in html
     assert "Болт М8" in html and "Гайка М8" in html
-    assert "1 001,00" in html          # итог цифрами, по-русски
-    assert "одна тысяча один" in html  # он же прописью
-    assert "Самовывоз со склада" in html
+    assert "Цена за ед. (USD)" in html and "Сумма (USD)" in html
+    assert "Без НДС" in html and "НДС (12%)" not in html
+    assert "Всего к оплате: </b>" not in html  # подпись и значение — разными стилями
+    assert "1 001,00 (одна тысяча один) доллар США." in html
+    assert "в течение 3 банковских дней с даты выставления" in html
+    assert "Руководитель:" in html and "Гл. бухгалтер:" in html and "М.П." in html
+    assert "не заменяет электронный счёт-фактуру (ЭСФ)" in html
+    # Комментарий заказа — внутренняя пометка, в бланк счёта не печатается.
+    assert "Самовывоз со склада" not in html
+
+
+def test_uzs_order_is_printed_in_sums_in_both_languages(db):
+    """Сумовый заказ — в сумах, целыми, пропись и узбекская страница — по бланку."""
+    from services import invoice_pdf
+    from services.sales_invoice import build_sales_invoice
+
+    oid = db.create_order(MGR, "Менеджер Иван", "")
+    db.update_order_agent(oid, "1", "ООО Ромашка")
+    db.update_order_currency(oid, "UZS")
+    db.add_order_item(oid, "Болт М8", "", 1092, "шт", 1000.0)
+    doc = _run(build_sales_invoice(oid))
+    assert doc["currency"] == "UZS" and doc["total_words"] == "один миллион девяносто две тысячи сум"
+    html = invoice_pdf.build_sales_invoice_html(doc, lang="ru_uz")
+    assert html.count('<section class="doc">') == 2
+    assert "Цена за ед. (сум)" in html and "Нархи (сўм)" in html
+    assert "Всего к оплате:" in html and "1 092 000 (один миллион девяносто две тысячи) сум." in html
+    assert "Тўлашга жами:" in html and "1 092 000 (бир миллион тўқсон икки минг) сўм." in html
+    assert "Етказиб берувчи" in html and "Харидор" in html and "ҚҚСсиз" in html
+    assert "3 банк куни давомида тўлов учун амал қилади" in html
+    assert "(ЭҲФ)ни алмаштирмайди" in html
+    only_uz = invoice_pdf.build_sales_invoice_html(doc, lang="uz")
+    assert "Счёт на оплату" not in only_uz and "Тўлов учун ҳисоб" in only_uz
+
+
+def test_validity_days_and_buyer_requisites_come_from_settings(db):
+    from services import invoice_pdf, requisites
+    from services.sales_invoice import build_sales_invoice
+
+    db.set_setting("invoice_valid_days", 5, BOSS)
+    _run(requisites.set_counterparty_requisites(1, tin="30123456789012", address="Самарканд, Регистан 1"))
+    doc = _run(build_sales_invoice(_order(db)))
+    assert doc["valid_days"] == 5
+    assert (doc["client_tin"], doc["client_address"]) == ("30123456789012", "Самарканд, Регистан 1")
+    html = invoice_pdf.build_sales_invoice_html(doc, lang="ru")
+    assert "в течение 5 банковских дней" in html
+    assert "ИНН / ПИНФЛ: 30123456789012" in html and "Адрес: Самарканд, Регистан 1" in html
+
+
+def test_missing_bank_requisites_are_named_not_a_generic_error(db):
+    """Счёт без расчётного счёта оплатить нельзя: отказ называет, ЧТО и ГДЕ
+    заполнить. Предпросмотр листа при этом собирается и несёт тот же текст."""
+    from services.sales_invoice import SalesInvoiceError, build_sales_invoice
+
+    db.set_setting("company_bank_mfo", "", BOSS)
+    db.set_setting("company_tin", "", BOSS)
+    oid = _order(db)
+    with pytest.raises(SalesInvoiceError) as e:
+        _run(build_sales_invoice(oid))
+    assert e.value.code == "no_requisites"
+    assert e.value.message == (
+        "Заполните ИНН и МФО в Настройки → Реквизиты компании — без этого не выписать счёт на оплату"
+    )
+    preview = _run(build_sales_invoice(oid, check_requisites=False))
+    assert preview["requisites_missing"] == e.value.message
 
 
 def test_html_escapes_product_and_client_names(db):
@@ -172,17 +253,28 @@ def test_html_escapes_product_and_client_names(db):
     db.add_order_item(oid, "Уголок 50<60", "", 1, "шт", 10.0)
     html = invoice_pdf.build_sales_invoice_html(_run(build_sales_invoice(oid)))
     assert "Уголок 50<60" not in html
+    assert "Уголок 50&lt;60" in html
     assert "&lt;b&gt;ООО&lt;/b&gt;" in html
 
 
-def test_render_produces_a_real_pdf(db):
+@pytest.mark.parametrize("lang,pages", [("ru_uz", 2), ("ru", 1), ("uz", 1)])
+def test_render_produces_a_real_pdf(db, lang, pages):
+    import io
+
+    from pypdf import PdfReader
+
     from services import invoice_pdf
     from services.sales_invoice import build_sales_invoice
 
     pytest.importorskip("weasyprint", reason="нет weasyprint/системных pango")
-    pdf = invoice_pdf.render_sales_invoice_pdf(_run(build_sales_invoice(_order(db))))
+    doc = {**_run(build_sales_invoice(_order(db))), "lang": lang}
+    pdf = invoice_pdf.render_sales_invoice_pdf(doc)
     assert pdf[:5] == b"%PDF-"
-    assert len(pdf) > 1000
+    reader = PdfReader(io.BytesIO(pdf))
+    assert len(reader.pages) == pages
+    text = " ".join(" ".join(p.extract_text().split()) for p in reader.pages)
+    assert "Без НДС" in text if lang != "uz" else "Без НДС" not in text
+    assert "1 001,00" in text
 
 
 def test_filename_is_safe_for_any_filesystem(db):
@@ -310,7 +402,7 @@ def test_print_sends_the_document_to_the_queue_and_writes_audit(api, monkeypatch
     assert body["ok"] is True and "Отправлено на печать" in body["message"]
     assert calls and calls[0][0] == "lp"
     # Имя задания называет документ: у принтера иначе не понять, чья бумага.
-    assert f"Счёт № {oid}" in " ".join(calls[0])
+    assert f"Счёт на оплату № {oid}" in " ".join(calls[0])
 
     rows = _run(db.get_audit_log(limit=10))
     printed = [r for r in rows if r["action"] == "sales_invoice_printed"]
@@ -339,9 +431,49 @@ def test_send_delivers_pdf_to_the_person_who_asked(api):
     assert r.status_code == 200 and r.json()["ok"] is True
     # Именно составителю: счёт обсуждают, и пересылает его человек сам.
     assert [d["chat_id"] for d in bot.docs] == [MGR]
-    assert f"Счёт № {oid}" in bot.docs[0]["caption"]
+    assert f"Счёт на оплату № {oid}" in bot.docs[0]["caption"]
     rows = _run(db.get_audit_log(limit=10))
     assert [r["action"] for r in rows if r["action"] == "sales_invoice_sent"] == ["sales_invoice_sent"]
+
+
+def test_language_is_chosen_at_print_and_remembered(api, monkeypatch):
+    """Язык — выбор при печати/отправке (рус + узб / рус / узб). Выбранный
+    запоминается человеку, и лист в следующий раз предлагает его первым."""
+    pytest.importorskip("weasyprint", reason="нет weasyprint/системных pango")
+    from services import invoice_pdf
+
+    client, db, bot = api
+    oid = _order(db)
+    seen: list[str] = []
+    real = invoice_pdf.render_sales_invoice_pdf
+    monkeypatch.setattr(invoice_pdf, "render_sales_invoice_pdf", lambda d: seen.append(d["lang"]) or real(d))
+
+    body = _call(client, "/api/orders/invoice", MGR, order_id=oid).json()
+    assert body["doc_lang"] == "ru_uz"
+    assert [lg["key"] for lg in body["langs"]] == ["ru_uz", "ru", "uz"]
+    assert _call(client, "/api/orders/invoice/send", MGR, order_id=oid, lang="uz").json()["ok"] is True
+    assert seen == ["uz"]
+    assert _call(client, "/api/orders/invoice", MGR, order_id=oid).json()["doc_lang"] == "uz"
+    # Без языка — последний выбранный; мусор — отказ, а не «какой-нибудь» язык.
+    assert _call(client, "/api/orders/invoice/send", MGR, order_id=oid).json()["ok"] is True
+    assert seen == ["uz", "uz"]
+    assert _call(client, "/api/orders/invoice/send", MGR, order_id=oid, lang="en").status_code == 400
+
+
+def test_print_and_send_refuse_without_bank_requisites_but_the_sheet_opens(api):
+    client, db, bot = api
+    db.set_setting("company_bank_account", "", BOSS)
+    oid = _order(db)
+    sheet = _call(client, "/api/orders/invoice", MGR, order_id=oid)
+    assert sheet.status_code == 200
+    assert sheet.json()["invoice"]["requisites_missing"].startswith("Заполните расчётный счёт в Настройки")
+    for path in ("/api/orders/invoice/print", "/api/orders/invoice/send"):
+        r = _call(client, path, MGR, order_id=oid)
+        assert r.status_code == 400
+        assert r.json()["detail"] == (
+            "Заполните расчётный счёт в Настройки → Реквизиты компании — без этого не выписать счёт на оплату"
+        )
+    assert bot.docs == []
 
 
 def test_invoice_for_an_order_without_client_is_refused_with_text(api):

@@ -778,7 +778,10 @@ psycopg2 + threadpool + кэш ролей закрывает реальные п
 | Добавить экран в WebApp | `webapp/static/index.html` (nav button), `webapp/static/app.js` (`case '...':` + `render*()`), `webapp/static/style.css` |
 | Добавить команду в боте | новый файл в `handlers/`, зарегистрировать в `bot.py:register_routers` |
 | Изменить печать документов | `services/printing.py` (CUPS) + `handlers/printing.py` (кнопка и `/printer`) |
-| Изменить счёт клиенту (документ до отгрузки) | `services/sales_invoice.py` (сбор) + `services/invoice_pdf.py` (`build_sales_invoice_html`) |
+| Изменить счёт на оплату (документ до отгрузки) | `services/sales_invoice.py` (сбор) + `services/invoice_pdf.py` (`build_sales_invoice_html`) |
+| Изменить товарную накладную (печать отгрузки) | `services/waybill.py` (реквизиты, клиент, основание) + `services/invoice_pdf.py` (`build_invoice_html`) |
+| Изменить реквизиты компании / клиента | `services/requisites.py` (поля, группы, что обязательно) + форма `openCompanyForm` в app.js |
+| Изменить текст расписки | `templates/legal/src/raspiska_ru_uz_source.docx` (Word) → `python -m scripts.build_raspiska_ru_uz` |
 | Изменить движение остатка | `services/warehouse.py` (накладные), `services/order_shipment.py` (отгрузка заказа), `services/container_receipt.py` (приёмка) |
 | Изменить дневной пинг / операционную сводку | `tasks/run_ops_monitor.py` (пинг) + `services/ops_summary.py` (сбор) + `webapp/server.py:/api/ops-summary` |
 | Найти ошибку в проде | Railway Logs у нужного сервиса. Долгие SQL логируются как `SQL slow ...` через `SQL_SLOW_MS` (default 200мс) |

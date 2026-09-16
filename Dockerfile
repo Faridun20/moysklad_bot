@@ -36,6 +36,11 @@ FROM python:3.11.16-slim-bookworm@sha256:528257d48c1da0dcecc2e725d1ae34498d60c96
 #       Шрифт шаблона накладной (font-family: "DejaVu Sans"). Без него
 #       WeasyPrint подставит что найдёт, и кириллица уедет в квадраты.
 #
+#   fonts-dejavu-extra
+#       Курсив DejaVu Sans (Oblique). В core его нет, а бланки владельца
+#       (счёт на оплату, товарная накладная) печатают строки таблицы, подписи
+#       и оговорку про ЭСФ/ЭТТН курсивом — без пакета они выходили прямыми.
+#
 #   fonts-liberation
 #       Метрически совместим с Times New Roman — требование юридических
 #       документов. Проверено: покрывает узбекскую кириллицу (ў, қ, ғ, ҳ)
@@ -91,6 +96,7 @@ RUN set -eux; \
         libpango-1.0-0 \
         libpangoft2-1.0-0 \
         fonts-dejavu-core \
+        fonts-dejavu-extra \
         fonts-liberation \
         "postgresql-client-${PG_CLIENT_VERSION}" \
         cups-client \

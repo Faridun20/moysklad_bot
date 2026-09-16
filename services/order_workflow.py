@@ -117,21 +117,31 @@ def _items_key(item: dict) -> str:
     return str(item.get("product_href") or item.get("product_name") or "")
 
 
-def _print_keyboard(invoice_id: int | None):
-    """Кнопка «Распечатать» под печатной формой. `None` — печать недоступна.
+def _print_keyboard(invoice_id: int | None, lang: str | None = None):
+    """Кнопки «Распечатать» под печатной формой. `None` — печать недоступна.
 
     Кнопки нет, если в контейнере не стоит клиент CUPS: обещать действие,
     которое гарантированно ответит отказом, хуже, чем не предлагать его.
+    Язык товарной накладной выбирают здесь же: первая кнопка — язык, который
+    человек выбирал последним (одно касание), ниже — два других.
     """
     from services import printing
+    from services.invoice_pdf import DOC_LANG_LABELS, DOC_LANGS, normalize_lang
 
     if not invoice_id or not printing.is_available():
         return None
     from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+    first = normalize_lang(lang) or DOC_LANGS[0]
     kb = InlineKeyboardBuilder()
-    kb.button(text="🖨 Распечатать", callback_data=printing.invoice_callback(int(invoice_id)))
-    kb.adjust(1)
+    kb.button(
+        text=f"🖨 Распечатать · {DOC_LANG_LABELS[first]}",
+        callback_data=printing.invoice_callback(int(invoice_id), first),
+    )
+    for other in DOC_LANGS:
+        if other != first:
+            kb.button(text=f"🖨 {DOC_LANG_LABELS[other]}", callback_data=printing.invoice_callback(int(invoice_id), other))
+    kb.adjust(1, 2)
     return kb.as_markup()
 
 
@@ -146,18 +156,23 @@ async def deliver_shipment_pdf(
     сразу, PDF догоняет следом. Никогда не бросает: отказ PDF — не откат
     одобрения. Возвращает {built, sent_to} для логов и тестов.
     """
-    pdf = await _build_invoice_pdf(invoice_id, order_id)
+    # Язык — тот, что менеджер выбирал последним: накладную клиенту несёт он.
+    from services import user_prefs
+
+    lang = await asyncio.to_thread(user_prefs.doc_lang, manager_id or boss_id)
+    pdf = await _build_invoice_pdf(invoice_id, order_id, lang)
     if not pdf or bot is None:
         return {"built": bool(pdf), "sent_to": []}
     sent_to = await _send_shipment_pdf(
-        bot, pdf, invoice_id=invoice_id, req_id=req_id, manager_id=manager_id, boss_id=boss_id
+        bot, pdf, invoice_id=invoice_id, req_id=req_id, manager_id=manager_id, boss_id=boss_id,
+        lang=lang,
     )
     return {"built": True, "sent_to": sent_to}
 
 
 async def _send_shipment_pdf(
     bot: Any, pdf: tuple[bytes, str], *, invoice_id: int, req_id: int,
-    manager_id: int | None, boss_id: int,
+    manager_id: int | None, boss_id: int, lang: str | None = None,
 ) -> list[int]:
     """Разослать собранный PDF менеджеру и боссу. Не бросает."""
     sent_to: list[int] = []
@@ -170,7 +185,7 @@ async def _send_shipment_pdf(
         # уходит на проверку перед отправкой клиенту, и печатать их все
         # значит переводить бумагу. Формат callback_data — в services.printing,
         # чтобы producer и хендлер не разъехались.
-        markup = _print_keyboard(invoice_id)
+        markup = _print_keyboard(invoice_id, lang)
         recipients = [r for r in (manager_id, boss_id) if r]
         if boss_id == manager_id:
             recipients = [boss_id]
@@ -190,7 +205,9 @@ async def _send_shipment_pdf(
     return sent_to
 
 
-async def _build_invoice_pdf(invoice_id: int | None, order_id: int) -> tuple[bytes, str] | None:
+async def _build_invoice_pdf(
+    invoice_id: int | None, order_id: int, lang: str | None = None,
+) -> tuple[bytes, str] | None:
     """Печатная форма накладной: (bytes, имя файла) или None.
 
     Best-effort: заказ уже одобрен и склад списан, и отсутствие PDF не повод
@@ -200,14 +217,14 @@ async def _build_invoice_pdf(invoice_id: int | None, order_id: int) -> tuple[byt
     if not invoice_id:
         return None
     try:
-        from services import warehouse
-        from services.invoice_pdf import invoice_filename, render_invoice_pdf
+        from services import warehouse, waybill
 
         invoice = await warehouse.get_invoice(int(invoice_id))
         if not invoice:
             return None
-        pdf = await asyncio.to_thread(render_invoice_pdf, invoice)
-        return pdf, invoice_filename(invoice)
+        # Товарная накладная по бланку: реквизиты, клиент, «Основание: Счёт на
+        # оплату № {заказ}» — `waybill.render` (рендер в потоке).
+        return await waybill.render(invoice, lang)
     except Exception:
         logger.exception("PDF накладной по заказу #%s не собран", order_id)
         return None
@@ -827,7 +844,12 @@ async def approve_shipment_request(
                     f"\n📦 Отгрузка {esc(str(invoice_number))} оформлена, товар списан со склада"
                 )
                 if pdf_delivery == "inline":
-                    pdf_to_send = await _build_invoice_pdf(invoice_id, order["id"])
+                    from services import user_prefs
+
+                    inline_lang = await asyncio.to_thread(
+                        user_prefs.doc_lang, req.get("user_id") or boss_user_id
+                    )
+                    pdf_to_send = await _build_invoice_pdf(invoice_id, order["id"], inline_lang)
                     if pdf_to_send:
                         demand_line += " — печатная форма ниже 👇"
                 elif bot is not None and invoice_id:

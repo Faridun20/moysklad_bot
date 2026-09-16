@@ -33,10 +33,13 @@ def test_boss_opens_audit_log_and_filters_by_date(open_app, e2e):
 
 
 def test_manager_has_no_audit_log_entry_point(open_app, e2e):
-    """У менеджера нет ни «Настроек», ни доступа к ручке — сторож на UI-слое:
-    сервер уже проверен юнитами (tests/test_audit_log_api.py)."""
+    """У менеджера «Настройки» — только «Реквизиты компании»: журнала там нет —
+    сторож на UI-слое; сервер уже проверен юнитами (tests/test_audit_log_api.py)."""
     page = open_app(e2e.ids["mgr"])
     assert page.locator('#bottom-nav .nav-item[data-screen="settings"]').count() == 0
+    go(page, "settings")
+    page.wait_for_selector("#set-company")
+    assert page.locator("#set-audit-log").count() == 0
 
 
 def test_order_card_shows_timeline_after_actions(open_app, e2e):
@@ -47,6 +50,7 @@ def test_order_card_shows_timeline_after_actions(open_app, e2e):
     tab(page, "orders")
     settled(page)
     card = page.locator(f'.order-card[data-id="{order["order_id"]}"]')
+    card.locator("[data-details-toggle]").click()
     card.locator("[data-timeline-toggle]").click()
     box = page.locator(f'#order-timeline-{order["order_id"]}')
     box.wait_for(state="visible")

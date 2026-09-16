@@ -1,5 +1,5 @@
 """
-«Счёт» — документ, который менеджер показывает клиенту ДО отгрузки.
+«Счёт на оплату» — документ, который менеджер показывает клиенту ДО отгрузки.
 
 Зачем он есть (жалоба владельца): печатная форма в проекте появлялась только
 ПОСЛЕ отгрузки — расходной накладной из `services/order_shipment.py`. То есть
@@ -38,7 +38,7 @@
 from __future__ import annotations
 
 from services import money
-from services.numerals import amount_in_words
+from services.numerals import amount_in_words, money_phrase
 
 # Статусы, в которых счёт не выписывается. Отменённый и отклонённый заказ —
 # это не «предложение клиенту», а закрытая история; печатать по нему бумагу с
@@ -50,15 +50,18 @@ REASON_TEXT = {
     "no_agent": "Сначала выберите клиента — без него счёт выписать некому",
     "no_items": "В заказе нет позиций — счёт выписывать не на что",
     "bad_status": "По отменённому или отклонённому заказу счёт не выписывают",
+    # Текст отказа «не хватает реквизитов» называет поля поимённо и приходит
+    # из `requisites.RequisitesMissing` (см. `SalesInvoiceError.message`).
+    "no_requisites": "Заполните реквизиты в Настройки → Реквизиты компании",
 }
 
 
 class SalesInvoiceError(Exception):
     """Счёт не собрать. `code` — ключ REASON_TEXT, `message` — текст человеку."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, message: str | None = None):
         self.code = code
-        self.message = REASON_TEXT.get(code, "Не удалось собрать счёт")
+        self.message = message or REASON_TEXT.get(code, "Не удалось собрать счёт")
         super().__init__(self.message)
 
 
@@ -95,11 +98,19 @@ def build_lines(items: list[dict]) -> list[dict]:
     return lines
 
 
+def _words_ru(total: int, currency: str) -> str:
+    value = money.from_cents(total)
+    try:
+        return money_phrase(value, "ru", currency)
+    except ValueError:
+        return amount_in_words(value, "ru")
+
+
 def total_cents(lines: list[dict]) -> int:
     return money.add(*[int(ln["amount_cents"]) for ln in lines]) if lines else 0
 
 
-async def build_sales_invoice(order_id: int) -> dict:
+async def build_sales_invoice(order_id: int, *, check_requisites: bool = True) -> dict:
     """Собрать данные счёта по заказу. ТОЛЬКО чтение — ничего не меняет.
 
     Ни остаток, ни долг, ни статус заказа функция не трогает: счёт — бумага
@@ -110,7 +121,7 @@ async def build_sales_invoice(order_id: int) -> dict:
 
     from services import async_db as adb
     from services import counterparties as cp_service
-    from services.documents import company_requisites
+    from services import requisites
 
     order = await adb.get_order(int(order_id))
     if not order:
@@ -128,7 +139,14 @@ async def build_sales_invoice(order_id: int) -> dict:
     agent = await cp_service.get(order.get("agent_id"))
     # Реквизиты лежат в `app_settings` и читаются синхронно — в поток, как это
     # делает форма расписки (`webapp.server.api_docs_types`).
-    company = await asyncio.to_thread(company_requisites)
+    company = await asyncio.to_thread(requisites.company_requisites)
+    # Счёт без банковских реквизитов оплатить нельзя — отказ называет, ЧЕГО
+    # не хватает и где это заполнить, а не «не удалось собрать».
+    missing = requisites.missing_for(company, "sales_invoice")
+    if missing and check_requisites:
+        raise SalesInvoiceError("no_requisites", requisites.missing_message(missing, "sales_invoice"))
+    # ИНН/ПИНФЛ и адрес покупателя — sidecar; пусто — черта для записи от руки.
+    buyer = await requisites.counterparty_requisites((agent or {}).get("id"))
 
     total = total_cents(lines)
     currency = order.get("currency") or "USD"
@@ -137,24 +155,34 @@ async def build_sales_invoice(order_id: int) -> dict:
         # Номер счёта = номер заказа (см. докстринг модуля).
         "number": str(order_id),
         "date": _date_ru(order.get("created_at")),
+        "date_iso": str(order.get("created_at") or "")[:10],
         "currency": currency,
         "company": company,
+        "valid_days": requisites.invoice_valid_days(company),
         "client_name": order.get("agent_name") or (agent or {}).get("name") or "—",
         "client_phone": (agent or {}).get("phone") or "",
+        "client_tin": buyer["tin"],
+        "client_address": buyer["address"],
+        # Предпросмотр листа собирается и без реквизитов — лист говорит, чего
+        # не хватает; печать и отправка без них отвечают отказом (выше).
+        "requisites_missing": requisites.missing_message(missing, "sales_invoice") if missing else "",
         "manager_name": order.get("full_name") or "",
         "comment": order.get("comment") or "",
         "lines": lines,
         "total_cents": total,
         # Прописью — своя реализация (services/numerals.py): num2words сознательно
-        # не используется, см. докстринг того модуля.
-        "total_words": amount_in_words(money.from_cents(total), "ru"),
+        # не используется, см. докстринг того модуля. В валюте заказа: «одна
+        # тысяча один доллар США» — лист в WebApp показывает то же, что бумага.
+        "total_words": _words_ru(total, currency),
     }
 
 
 def audit_details(doc: dict, action: str) -> str:
     """Строка для `audit_log`: по какому заказу и на какую сумму бумага."""
     total = money.format_cents(int(doc.get("total_cents") or 0), decimals=2)
+    lang = doc.get("lang")
+    lang_note = f" · язык: {lang}" if lang else ""
     return (
-        f"{action}: счёт № {doc.get('number')} по заказу #{doc.get('order_id')} · "
-        f"{doc.get('client_name')} · {total} {doc.get('currency')}"
+        f"{action}: счёт на оплату № {doc.get('number')} по заказу #{doc.get('order_id')} · "
+        f"{doc.get('client_name')} · {total} {doc.get('currency')}{lang_note}"
     )

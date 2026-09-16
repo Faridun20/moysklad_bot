@@ -115,11 +115,10 @@ def test_schedule_rejects_nonsense(count, total):
 # ─── Контекст ─────────────────────────────────────────────────────────────────
 
 
-# Реквизиты подписанта, без которых расписка не собирается (см. _REQUIRED_*).
+# Реквизиты кредитора, которые печатает расписка: название, ИНН, адрес.
+# Подписанта кредитора (должность, «в лице …») в бланке больше нет.
 FULL_CREDITOR = {
     "name": "FARID IMPEKS LLC", "tin": "309876543", "address": "г. Ташкент, ул. Амира Темура, 107Б",
-    "representative": "Масуджанов Фаридун", "position": "Директор", "position_uz": "Директор",
-    "representative_gen": "директора Масуджанова Фаридуна",
 }
 
 
@@ -207,41 +206,27 @@ def test_end_date_is_start_plus_term():
     assert _ctx(term_months=6)["end_date"] == "12.03.2027"
 
 
-def test_requires_signatory_requisites():
-    with pytest.raises(ld.DocumentError, match="Реквизитах компании.*ИНН.*должность подписанта"):
-        _ctx(creditor={"name": "X", "representative": "Петров"})
+def test_requires_only_tin_and_address_and_says_where_to_fill_them():
+    """Без ИНН и адреса кредитора первая фраза расписки ушла бы с дырой — отказ
+    называет поля поимённо и место, где их заполнить."""
+    with pytest.raises(ld.DocumentError) as e:
+        _ctx(creditor={"name": "X"})
+    assert str(e.value) == (
+        "Заполните ИНН и юридический адрес в Настройки → Реквизиты компании — "
+        "без этого не выписать расписку"
+    )
+    with pytest.raises(ld.DocumentError, match="^Заполните ИНН в Настройки → Реквизиты компании"):
+        _ctx(creditor={"name": "X", "address": "Ташкент"})
 
 
-@pytest.mark.parametrize(
-    "doc_type,needed,not_needed",
-    [
-        ("raspiska_ru", "position", "position_uz"),
-        ("tilxat_uz", "position_uz", "position"),
-    ],
-)
-def test_single_language_requires_only_its_own_position(doc_type, needed, not_needed):
-    """Русской расписке узбекская должность не нужна, тилхату — русская:
-    в документ они не печатаются."""
-    _ctx(doc_type=doc_type, creditor={**FULL_CREDITOR, not_needed: ""})
-    with pytest.raises(ld.DocumentError, match="должность подписанта"):
-        _ctx(doc_type=doc_type, creditor={**FULL_CREDITOR, needed: ""})
-
-
-def test_basis_is_charter_or_power_of_attorney():
-    charter = _ctx()
-    assert (charter["creditor_basis_ru"], charter["creditor_basis_uz"]) == ("Устава", "Устав")
-
-    poa = _ctx(creditor={**FULL_CREDITOR, "poa_number": "12", "poa_date": "01.02.2026"})
-    assert poa["creditor_basis_ru"] == "доверенности № 12 от 01.02.2026"
-    assert poa["creditor_basis_uz"] == "01.02.2026 йилдаги № 12 ишончнома"
-
-
-def test_genitive_signatory_falls_back_without_inventing_endings():
-    """Родительный падеж — из реквизитов как есть; нет его — должность и ФИО
-    без выдуманных окончаний."""
-    assert _ctx()["creditor_representative_gen"] == "директора Масуджанова Фаридуна"
-    plain = {k: v for k, v in FULL_CREDITOR.items() if k != "representative_gen"}
-    assert _ctx(creditor=plain)["creditor_representative_gen"] == "Директор Масуджанов Фаридун"
+@pytest.mark.parametrize("doc_type", list(ld.TEMPLATES))
+def test_creditor_signatory_is_never_asked(doc_type):
+    """Жалоба владельца: расписку пишет физлицо, а форма требовала «должность
+    подписанта». Ни один вид не спрашивает должность, представителя, основание
+    или доверенность — и не кладёт их в контекст."""
+    ctx = _ctx(doc_type=doc_type, creditor=dict(FULL_CREDITOR))
+    assert not [k for k in ctx if "position" in k or "representative" in k or "basis" in k or "poa" in k]
+    assert {key for key, _setting in ld._REQUIRED} == {"tin", "address"}
 
 
 def test_uzbek_city_falls_back_to_city():
@@ -283,6 +268,52 @@ def test_committed_templates_match_the_lawyer_source(doc_type, tmp_path):
         f"{doc_type}: шаблон разошёлся со скриптом — пересоберите `python -m scripts.build_raspiska_ru_uz`"
     )
     assert not [t for t in committed if "[" in t]
+
+
+# Что убрано из бланка юриста (решение владельца 2026-09) — ровно это и ничего
+# больше. Фрагменты — в виде старых шаблонов (с переменными docxtpl).
+_REMOVED_FRAGMENTS = (
+    ", в лице {{ creditor_representative_gen }}, действующего на основании {{ creditor_basis_ru }},",
+    " номидан {{ creditor_position_uz }} {{ creditor_representative }}, {{ creditor_basis_uz }} асосида иш юритувчи",
+)
+_REMOVED_LINES = (
+    "В лице: ______________________ / {{ creditor_representative }} /",
+    "(подпись)",
+    "Должность: {{ creditor_position }}, действует на основании {{ creditor_basis_ru }}",
+    "М.П.",
+    "Номидан: ______________________ / {{ creditor_representative }} /",
+    "(имзо)",
+    "Лавозими: {{ creditor_position_uz }}, {{ creditor_basis_uz }} асосида иш юритади",
+    "М.Ў. (муҳр ўрни)",
+)
+
+
+@pytest.mark.parametrize("doc_type", list(ld.TEMPLATES))
+def test_lawyer_text_is_unchanged_except_the_creditor_signatory(doc_type):
+    """Весь остальной текст юриста — байт в байт прежний.
+
+    Эталон — абзацы шаблонов до правки (`tests/data/raspiska_text_before_2026_09.json`).
+    Из него вычитаются ТОЛЬКО фраза «в лице …, действующего на основании …» (узб.
+    «номидан … асосида иш юритувчи») и строки подписанта кредитора; всё прочее —
+    пени, статьи ГК, график, подписи должника и свидетеля — обязано совпасть.
+    """
+    import json
+    from pathlib import Path
+
+    before = json.loads(
+        (Path(__file__).parent / "data" / "raspiska_text_before_2026_09.json").read_text("utf-8")
+    )[doc_type]
+    expected = []
+    for text in before:
+        if text in _REMOVED_LINES:
+            continue
+        for fragment in _REMOVED_FRAGMENTS:
+            text = text.replace(fragment, "")
+        expected.append(text)
+    assert _docx_paragraphs(ld.template_path(doc_type)) == expected
+    removed = [t for t in before if t in _REMOVED_LINES or any(f in t for f in _REMOVED_FRAGMENTS)]
+    parts = ld.TEMPLATES[doc_type][1]
+    assert len(removed) == 5 * len(parts), "убрано больше или меньше, чем решено"
 
 
 def test_single_language_templates_hold_only_their_part():
@@ -390,8 +421,12 @@ def test_render_pdf(doc_type, tmp_path):
     assert text.count("2 083 337") == 2 * len(parts)
     assert ("РАСПИСКА" in text) == ("ru" in parts)
     assert ("ТИЛХАТ" in text) == ("uz" in parts)
+    # Подписанта кредитора нет ни в одной части: расписку пишет должник.
+    for gone in ("в лице", "действующего на основании", "Должность", "М.П.", "номидан", "Лавозими", "М.Ў."):
+        assert gone not in text, gone
     if "ru" in parts:
-        assert "в лице директора Масуджанова Фаридуна, действующего на основании Устава" in text
+        assert "(далее — «Кредитор») следующий товар: Экскаватор JCB 3CX" in text
+        assert "Кредитор: FARID IMPEKS LLC" in text
         assert "общей стоимостью 25 000 000 (двадцать пять миллионов) сум" in text
     else:
         assert "Должник" not in text and "долга" not in text

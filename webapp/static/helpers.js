@@ -131,8 +131,10 @@
       roles: ['admin', 'boss', 'manager'] },
     // Реквизиты компании, курсы, выключатель «Рабочие действия». Только в
     // «Меню»: в панель не попадает (последний в порядке руководителя).
+    // Менеджеру — ради «Реквизитов компании»: владелец работает менеджером и не
+    // мог их найти («Настройки» у него — только эта строка, см. app.js).
     { key: 'settings', label: 'Настройки', icon: 'settings',
-      roles: ['admin', 'boss'] },
+      roles: ['admin', 'boss', 'manager'] },
   ];
 
   // Руководитель смотрит, решает и контролирует (решение владельца), поэтому
@@ -327,7 +329,7 @@
     if (boss && (screen === 'requests' || (screen === 'money' && tab === 'confirm'))) {
       return { screen: 'decisions', tab: '' };
     }
-    if (!boss && (screen === 'decisions' || screen === 'settings')) {
+    if (!boss && (screen === 'decisions' || (screen === 'settings' && role !== 'manager'))) {
       return { screen: 'money', tab: 'confirm' };
     }
     return { screen, tab: tab || '' };
@@ -1091,6 +1093,19 @@
     return Number.isFinite(n) ? n : 0;
   }
 
+  // Краткая сводка «что в заказе» одной строкой: «Zic 15w-40, Kixx 15w-40 и ещё 1».
+  // `total` — сколько позиций в заказе на самом деле (items_count с сервера):
+  // превью позиций может прийти неполным, и «2 товара из 3» без «ещё 1»
+  // выглядело расхождением (жалоба владельца: отгружено 3, показано 2).
+  function orderItemsBrief(items, total, shown = 2) {
+    const list = (items || []).filter(it => it && it.name);
+    const count = Math.max(Number(total) || 0, list.length);
+    if (!count) return '';
+    const names = list.slice(0, shown).map(it => String(it.name));
+    const rest = count - names.length;
+    return rest > 0 ? `${names.join(', ')} и ещё ${rest}` : names.join(', ');
+  }
+
   // ─── Раздел «Клиенты»: список покупателей (/api/clients/list) ─────────────
   //
   // «Сколько отдано, когда была проведена отгрузка, на какую общую сумму он
@@ -1398,7 +1413,7 @@
     return `Ждёт одобрения из-за скидки ${Number(d.max_pct)}% (порог ${Number(d.threshold_pct)}%) — решение принимает руководитель.`;
   }
 
-  // ─── «Счёт» клиенту (services/sales_invoice.py) ──────────────────────────
+  // ─── «Счёт на оплату» клиенту (services/sales_invoice.py) ────────────────
   //
   // Бумага, которую менеджер показывает клиенту ДО отгрузки: «вот, вот такая
   // получается». Раньше печатная форма появлялась только ПОСЛЕ отгрузки, и
@@ -1621,7 +1636,7 @@
     leadFunnelHtml, firstTouchHtml, replySpeedHtml, durationLabel, postEffectLabel,
     whMoney, whQty, whStockBadge,
     PAY_METHODS, PAY_METHOD_LABEL, PAY_STATE_LABEL, payCents, payRate, payRateCurrency, payConvert,
-    payMoney, payPreview, payPartLine, payConfirmable, payAwaitingText, payHandoverHtml, payHandoverOrdersHtml,
+    payMoney, payPreview, payPartLine, payConfirmable, orderItemsBrief, payAwaitingText, payHandoverHtml, payHandoverOrdersHtml,
     PAY_ACCOUNT_KIND, payAccountItems, payDefaultAccountId, payAccountPrefill, payAccountFormError,
     payAccountFieldHtml, payMissingAccount, payAccountsManagerHtml,
     payHandoverPicked, payDepositOrdersText,

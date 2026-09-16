@@ -263,6 +263,13 @@ def test_status_without_cups_client(monkeypatch):
 
 def test_callback_roundtrip():
     assert printing.parse_callback(printing.invoice_callback(42)) == ("inv", 42)
+    # Язык товарной накладной едет в кнопке; старые кнопки без него — тоже валидны.
+    data = printing.invoice_callback(42, "uz")
+    assert data == "prn:inv:42:uz"
+    assert printing.parse_callback(data) == ("inv", 42)
+    assert printing.callback_lang(data) == "uz"
+    assert printing.callback_lang(printing.invoice_callback(42)) is None
+    assert printing.parse_callback("prn:inv:42:en") is None
 
 
 @pytest.mark.parametrize(
@@ -274,7 +281,7 @@ def test_broken_callback_is_rejected(data):
 
 def test_callback_fits_telegram_limit():
     """64 байта — жёсткий предел Telegram на callback_data."""
-    assert len(printing.invoice_callback(10**9).encode()) <= 64
+    assert len(printing.invoice_callback(10**9, "ru_uz").encode()) <= 64
 
 
 # ─── Кнопка «Распечатать» ────────────────────────────────────────────────────
@@ -447,8 +454,15 @@ def test_button_absent_when_cups_client_is_missing(monkeypatch):
     markup = order_workflow._print_keyboard(5)
     assert markup is not None
     buttons = [b for row in markup.inline_keyboard for b in row]
-    assert buttons[0].callback_data == printing.invoice_callback(5)
-    assert "Распечатать" in buttons[0].text
+    # Первая кнопка — язык по умолчанию (рус + узб), ниже — два других.
+    assert buttons[0].callback_data == printing.invoice_callback(5, "ru_uz")
+    assert "Распечатать" in buttons[0].text and "Рус + Узб" in buttons[0].text
+    assert [b.callback_data for b in buttons[1:]] == [
+        printing.invoice_callback(5, "ru"), printing.invoice_callback(5, "uz"),
+    ]
+    # Запомненный язык — первой кнопкой: одно касание.
+    uz_first = [b for row in order_workflow._print_keyboard(5, "uz").inline_keyboard for b in row]
+    assert uz_first[0].callback_data == printing.invoice_callback(5, "uz") and "Узб" in uz_first[0].text
 
 
 def test_no_keyboard_without_an_invoice(monkeypatch):

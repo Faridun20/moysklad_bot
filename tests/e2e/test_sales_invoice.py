@@ -26,10 +26,24 @@ def _stock(e2e) -> float:
     return float(rows[0]["quantity"]) if rows else 0.0
 
 
+def _open_details(page) -> None:
+    """«Счёт на оплату» — в подробной сводке карточки; раскрыть, если свёрнута.
+    Раскрытие переживает перерисовку списка, поэтому повторный клик закрыл бы её."""
+    toggle = page.locator("#content [data-details-toggle]").first
+    toggle.wait_for()
+    if toggle.get_attribute("aria-expanded") != "true":
+        toggle.click()
+
+
 def test_manager_shows_the_invoice_before_the_request_and_then_ships(open_app, e2e):
     pytest.importorskip("weasyprint", reason="нет weasyprint/системных pango")
     ids = e2e.ids
     stock_before = _stock(e2e)
+    # Счёт на оплату без банковских реквизитов не выписывается.
+    for key, value in {"company_tin": "301234567", "company_address": "Ташкент",
+                       "company_bank_account": "20208000900123456001",
+                       "company_bank_name": "Капиталбанк", "company_bank_mfo": "01088"}.items():
+        e2e.db.set_setting(key, value, ids["boss"])
 
     mgr = open_app(ids["mgr"])
     go(mgr, "sales")
@@ -51,6 +65,8 @@ def test_manager_shows_the_invoice_before_the_request_and_then_ships(open_app, e
     # Заявку ещё НЕ отправляли — возвращаемся в список и печатаем счёт.
     go(mgr, "sales")
     tab(mgr, "orders")
+    # «Счёт на оплату» — в подробной сводке карточки.
+    _open_details(mgr)
     mgr.wait_for_selector(".btn-sales-invoice")
     order_id = e2e.rows("SELECT id FROM orders ORDER BY id DESC LIMIT 1")[0]["id"]
     assert e2e.rows("SELECT status FROM orders WHERE id = ?", (order_id,))[0]["status"] == "draft"
@@ -58,12 +74,16 @@ def test_manager_shows_the_invoice_before_the_request_and_then_ships(open_app, e
     mgr.click(".btn-sales-invoice")
     mgr.wait_for_selector(".c-overlay .c-sheet-title")
     sheet = mgr.locator(".c-overlay").last
-    assert f"Счёт № {order_id}" in sheet.inner_text()
+    assert f"Счёт на оплату № {order_id}" in sheet.inner_text()
+    # Язык бумаги — сегментом; выбираем «Рус», сервер его запомнит.
+    sheet.locator('.doc-lang [data-lang="ru"]').click()
     assert "Кабель" in sheet.inner_text()
     assert "200,00 USD" in sheet.inner_text()
 
     mgr.click(".c-overlay #ms-submit")
-    mgr.wait_for_selector(".toast:has-text('Счёт отправлен')")
+    mgr.wait_for_selector(".toast:has-text('Счёт на оплату отправлен')")
+    assert e2e.rows("SELECT value FROM user_prefs WHERE user_id = ? AND pref_key = 'doc_lang'",
+                    (ids["mgr"],))[0]["value"] == '"ru"'
     settled(mgr)
 
     # Файл ушёл тому, кто нажал: счёт обсуждают, пересылает его человек сам.
@@ -98,4 +118,54 @@ def test_manager_shows_the_invoice_before_the_request_and_then_ships(open_app, e
     # После отгрузки счёт остаётся — это просто копия того же документа.
     go(mgr, "sales")
     tab(mgr, "orders")
+    # «Счёт на оплату» — в подробной сводке карточки.
+    _open_details(mgr)
     mgr.wait_for_selector(".btn-sales-invoice")
+
+
+def test_client_requisites_and_waybill_language_reach_the_paper(open_app, e2e, monkeypatch):
+    """ИНН/ПИНФЛ и адрес клиента вписывают в его карточке; «Отгрузки» дают
+    выбрать язык товарной накладной, и печать уходит на этом языке с
+    «Основание: Счёт на оплату № …» — отгрузка шла по заказу."""
+    from services import invoice_pdf, printing
+    from services.printing import PrintResult
+    from tests.e2e.conftest import seed_order
+
+    seeded = seed_order(e2e, qty=1, price=40.0)
+    cp = seeded["counterparty_id"]
+    rendered: list[dict] = []
+    monkeypatch.setattr(invoice_pdf, "render_invoice_pdf", lambda inv: rendered.append(inv) or b"%PDF-1.4")
+    monkeypatch.setattr(printing, "is_available", lambda: True)
+
+    async def fake_print(pdf_bytes, *, filename="", printer_name="", label=""):
+        return PrintResult(True, job="Canon-2")
+
+    monkeypatch.setattr(printing, "print_pdf_bytes", fake_print)
+
+    mgr = open_app(e2e.ids["mgr"])
+    settled(mgr)
+    mgr.evaluate("(id) => renderAgentDetail(String(id))", cp)
+    mgr.wait_for_selector("#cl-req-edit")
+    mgr.click("#cl-req-edit")
+    mgr.fill(".c-overlay #ms-f-tin", "30123456789012")
+    mgr.fill(".c-overlay #ms-f-address", "Самарканд, ул. Регистан, 1")
+    mgr.click(".c-overlay #ms-submit")
+    mgr.wait_for_selector(".toast:has-text('Реквизиты клиента сохранены')")
+    mgr.wait_for_selector("#cl-requisites:has-text('30123456789012')")
+    assert e2e.rows("SELECT tin, address FROM counterparty_requisites WHERE counterparty_id = ?", (cp,)) == [
+        {"tin": "30123456789012", "address": "Самарканд, ул. Регистан, 1"}
+    ]
+
+    go(mgr, "stock")
+    tab(mgr, "invoices")
+    mgr.click('[data-whsub="outgoing"]')
+    mgr.wait_for_selector(".doc-lang [data-lang='uz']")
+    mgr.click(".doc-lang [data-lang='uz']")
+    mgr.locator("[data-wh-print]").first.click()
+    mgr.wait_for_selector(".toast:has-text('задание Canon-2')")
+    # Фоновая печатная форма одобрения тоже рендерится этой функцией — берём
+    # именно печать из «Отгрузок».
+    printed = [inv for inv in rendered if inv["doc_lang"] == "uz"]
+    assert len(printed) == 1
+    assert printed[0]["basis"]["order_id"] == seeded["order_id"]
+    assert printed[0]["buyer"]["address"] == "Самарканд, ул. Регистан, 1"

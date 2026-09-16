@@ -13,7 +13,6 @@ Telegram лежит, weasyprint не собрался) обязана дегра
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from services import warehouse
@@ -31,14 +30,15 @@ REASON_TEXT = {
 }
 
 
-async def deliver_invoice_pdf(invoice: dict, bot, *, force: bool = False) -> dict:
+async def deliver_invoice_pdf(invoice: dict, bot, *, force: bool = False, lang: str | None = None) -> dict:
     """Собрать PDF и отправить клиенту. Не бросает исключений никогда.
 
     Возвращает {"sent": bool, "reason": str|None}. reason — ключ из
     REASON_TEXT; вызывающий показывает его менеджеру как предупреждение.
 
     force=True — повторная отправка по кнопке «Отправить ещё раз»: снимает
-    защиту от дубля (telegram_sent).
+    защиту от дубля (telegram_sent). lang — язык товарной накладной
+    (`ru_uz`/`ru`/`uz`); не передан — рус + узб.
     """
     invoice_id = invoice.get("id")
 
@@ -58,13 +58,12 @@ async def deliver_invoice_pdf(invoice: dict, bot, *, force: bool = False) -> dic
     if bot is None:
         return {"sent": False, "reason": "send_failed"}
 
-    from services.invoice_pdf import invoice_filename, render_invoice_pdf
+    from services import waybill
 
     try:
-        # WeasyPrint синхронный и тяжёлый (сотни миллисекунд CPU): в потоке,
-        # иначе на время рендера встаёт весь event loop — и чужие запросы.
-        pdf_bytes = await asyncio.to_thread(render_invoice_pdf, invoice)
-        filename = invoice_filename(invoice)
+        # WeasyPrint синхронный и тяжёлый (сотни миллисекунд CPU): `waybill.render`
+        # рендерит в потоке, иначе на время сборки встаёт весь event loop.
+        pdf_bytes, filename = await waybill.render(invoice, lang)
     except Exception:
         logger.exception("Не удалось собрать PDF накладной #%s", invoice_id)
         return {"sent": False, "reason": "render_failed"}
@@ -76,7 +75,7 @@ async def deliver_invoice_pdf(invoice: dict, bot, *, force: bool = False) -> dic
         await bot.send_document(
             chat_id=int(chat_id),
             document=document,
-            caption=f"Накладная № {invoice.get('invoice_number')}",
+            caption=f"Товарная накладная № {invoice.get('invoice_number')}",
         )
     except Exception:
         logger.exception(

@@ -46,21 +46,86 @@ def _invoice(**over):
 
 def test_html_contains_header_and_totals():
     html = invoice_pdf.build_invoice_html(_invoice())
-    assert "РАСХОДНАЯ НАКЛАДНАЯ" in html
+    assert "Товарная накладная" in html and "Товар накладноси" in html  # по умолчанию рус + узб
     assert "OUT-2026-0001" in html
+    assert "«11» сентября 2026 г." in html
     assert "ООО Ромашка" in html
     # Числа — по-русски: пробел разделяет тысячи, запятая — копейки.
     assert "750,00" in html  # итог
     assert "250,00" in html  # цена за единицу
+    assert "Всего отпущено на сумму:" in html and "Жами топширилди:" in html
+    assert "Цена за ед. (USD)" in html and "Нархи (USD)" in html
+    assert "(семьсот пятьдесят) долларов США." in html
+    assert "(етти юз эллик) АҚШ доллари." in html
 
 
 def test_html_names_the_party_by_direction():
     """«Контрагент» одинаково называл того, кто покупает, и того, у кого
-    покупаем мы. В накладной сторона называется по существу."""
-    out = invoice_pdf.build_invoice_html(_invoice())
-    assert "Клиент:" in out and "Контрагент" not in out
-    incoming = invoice_pdf.build_invoice_html(_invoice(type="incoming"))
-    assert "Поставщик:" in incoming and "Контрагент" not in incoming
+    покупаем мы. В накладной сторона называется по существу: расход —
+    грузоотправитель и грузополучатель (бланк владельца), приход — поставщик
+    и склад, без слов отгрузки, которые в приходе читались бы наоборот."""
+    out = invoice_pdf.build_invoice_html(_invoice(doc_lang="ru"))
+    assert "Грузоотправитель" in out and "Грузополучатель" in out and "Контрагент" not in out
+    incoming = invoice_pdf.build_invoice_html(_invoice(type="incoming", doc_lang="ru_uz"))
+    assert "Поставщик" in incoming and "Контрагент" not in incoming
+    assert "Грузо" not in incoming and "Юк " not in incoming, "приход — внутренний, только по-русски"
+    assert "Приходная накладная" in incoming
+
+
+def _outgoing_full(**over):
+    base = dict(
+        doc_lang="ru_uz",
+        currency="UZS", total_amount_cents=109_200_000,
+        items=[{"product_name": "Болт М8", "sku": "", "unit": "шт", "quantity": 1092, "price_cents": 100_000}],
+        company={"company_name": "ООО «FARID IMPEKS»", "company_address": "Ташкент, ул. Амира Темура, 107Б",
+                 "company_phone": "+998 71 200-00-00", "company_director": "Масуджанов Фаридун"},
+        buyer={"address": "Самарканд, ул. Регистан, 1", "phone": "+998 90 123-45-67"},
+        basis={"order_id": 31, "date": "2026-09-16 10:00:00"},
+    )
+    base.update(over)
+    return _invoice(**base)
+
+
+def test_waybill_prints_basis_only_for_an_order():
+    """«Основание: Счёт на оплату № {заказ} от {даты заказа}» — у накладной,
+    выписанной отгрузкой заказа. Накладная со склада без заказа основания не
+    печатает (строки нет вовсе, а не «Счёт № ___»)."""
+    html = invoice_pdf.build_invoice_html(_outgoing_full())
+    assert "Основание: Счёт на оплату № 31 от «16» сентября 2026 г." in html
+    assert "Асос: Тўлов учун ҳисоб № 31 «16» сентябрь 2026 йилги" in html
+    standalone = invoice_pdf.build_invoice_html(_outgoing_full(basis=None))
+    assert "Основание" not in standalone and "Асос:" not in standalone
+
+
+def test_waybill_sender_receiver_words_and_signatures():
+    html = invoice_pdf.build_invoice_html(_outgoing_full())
+    # Грузоотправитель — наша компания, грузополучатель — клиент.
+    assert "ООО «FARID IMPEKS»" in html and "Ташкент, ул. Амира Темура, 107Б" in html
+    assert "Самарканд, ул. Регистан, 1" in html and "+998 90 123-45-67" in html
+    # Сумы — целыми, валюта сумовая, пропись на языке страницы.
+    assert "1 092 000 (один миллион девяносто две тысячи) сум." in html
+    assert "1 092 000 (бир миллион тўқсон икки минг) сўм." in html
+    assert "Цена за ед. (сум)" in html and "Нархи (сўм)" in html
+    # «Отпуск разрешил» — руководитель, если отдельного не задали.
+    assert "Отпуск разрешил:" in html and "Масуджанов Фаридун" in html
+    assert "Отпустил:" in html and "Груз получил:" in html
+    assert "Юк беришга рухсат берди:" in html and "Юкни қабул қилди:" in html
+    assert "электронную товарно-транспортную накладную (ЭТТН)" in html
+    assert "электрон товар-транспорт накладнойси (ЭТТН)ни алмаштирмайди" in html
+
+
+@pytest.mark.parametrize("lang,ru,uz", [("ru_uz", True, True), ("ru", True, False), ("uz", False, True)])
+def test_waybill_language_choice(lang, ru, uz):
+    html = invoice_pdf.build_invoice_html(_outgoing_full(doc_lang=lang))
+    assert ("Товарная накладная" in html) is ru
+    assert ("Товар накладноси" in html) is uz
+    assert html.count('<section class="doc">') == int(ru) + int(uz)
+
+
+def test_waybill_empty_requisites_print_a_line_for_handwriting():
+    """Накладная не блокируется пустым реквизитом: вместо него — черта."""
+    html = invoice_pdf.build_invoice_html(_invoice(doc_lang="ru", company={}, buyer={}))
+    assert "Адрес:" in html and 'class="blank blank--wide"' in html
 
 
 def test_html_escapes_user_content():
@@ -125,6 +190,7 @@ def test_html_quantity_has_no_trailing_zeros():
 
 def test_html_marks_cancelled_invoice():
     assert "ОТМЕНЕНА" in invoice_pdf.build_invoice_html(_invoice(status="cancelled"))
+    assert "БЕКОР ҚИЛИНГАН" in invoice_pdf.build_invoice_html(_invoice(status="cancelled", doc_lang="uz"))
     assert "ОТМЕНЕНА" not in invoice_pdf.build_invoice_html(_invoice())
 
 
@@ -171,6 +237,25 @@ def test_render_produces_pdf():
     pdf = invoice_pdf.render_invoice_pdf(_invoice())
     assert pdf[:5] == b"%PDF-"
     assert len(pdf) > 1000
+
+
+@pytest.mark.parametrize("lang,pages", [("ru_uz", 2), ("ru", 1), ("uz", 1)])
+def test_render_waybill_pages_per_language(lang, pages):
+    """Рус + узб — две страницы одного PDF; один язык — одна. Текст страниц
+    читается из самого PDF, а не из HTML."""
+    pytest.importorskip("weasyprint", reason="нет weasyprint/системных pango")
+    import io
+
+    from pypdf import PdfReader
+
+    pdf = invoice_pdf.render_invoice_pdf(_outgoing_full(doc_lang=lang))
+    reader = PdfReader(io.BytesIO(pdf))
+    assert len(reader.pages) == pages
+    text = " ".join(" ".join(p.extract_text().split()) for p in reader.pages)
+    assert "OUT-2026-0001" in text
+    if lang != "uz":
+        assert "Основание: Счёт на оплату № 31" in text
+        assert "один миллион девяносто две тысячи" in text
 
 
 # ─── Доставка ─────────────────────────────────────────────────────────────────

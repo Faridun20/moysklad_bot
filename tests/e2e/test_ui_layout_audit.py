@@ -347,13 +347,21 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
     timeline_toggle = page.locator("#content [data-timeline-toggle]").first
     if timeline_toggle.count():
         oid = timeline_toggle.get_attribute("data-timeline-toggle")
+        page.click(f'#content [data-details-toggle="{oid}"]')
+        page.wait_for_selector(f"#order-details-{oid}")
+        audit.check("sales-orders-details")
         timeline_toggle.click()
         page.wait_for_selector(f"#order-timeline-{oid} .order-timeline-list")
         audit.check("sales-orders-timeline")
     # «Счёт» — лист с предпросмотром документа клиенту (позиции, итог, пропись).
     # Мерить его обязательно: длинное название товара и сумма прописью — самые
     # длинные строки, какие вообще бывают в шторке.
-    audit.overlay("#content .btn-sales-invoice", "sales-invoice-sheet")
+    invoice_btn = page.locator("#content .btn-sales-invoice").first
+    if invoice_btn.count():
+        inv_oid = invoice_btn.get_attribute("data-id")
+        if page.locator(f"#order-details-{inv_oid}").is_hidden():
+            page.click(f'#content [data-details-toggle="{inv_oid}"]')
+    audit.overlay("#content .order-details:not([hidden]) .btn-sales-invoice", "sales-invoice-sheet")
     # Деньги → Долги с фильтром «К оплате сейчас».
     go(page, "money")
     tab(page, "debts")

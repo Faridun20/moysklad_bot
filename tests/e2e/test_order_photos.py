@@ -35,6 +35,7 @@ def test_manager_uploads_photo_visible_on_own_order_card(open_app, e2e, monkeypa
 
     card = page.locator(f'.order-card[data-id="{oid}"]')
     card.wait_for()
+    card.locator("[data-details-toggle]").click()
     add_btn = card.locator(f"#order-photo-add-{oid}")
     add_btn.wait_for()
 

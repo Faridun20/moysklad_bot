@@ -45,7 +45,7 @@ def api(isolated_db, monkeypatch, tmp_path):
     db.set_role(ids["keeper"], "keeper", "Keeper", "warehouse_keeper")
 
     monkeypatch.setenv("DOCUMENTS_DIR", str(tmp_path / "docs"))
-    # Реквизиты подписанта печатаются в каждом виде расписки и обязательны.
+    # ИНН и адрес кредитора печатаются в каждом виде расписки и обязательны.
     # Название компании не ставим: его подставляет либо тест, либо запасное
     # название проекта (test_creditor_falls_back_to_project_company_name).
     for key, value in SIGNATORY.items():
@@ -80,8 +80,6 @@ def api(isolated_db, monkeypatch, tmp_path):
 
 SIGNATORY = {
     "company_tin": "123456789", "company_address": "Ташкент, ул. Навои 1",
-    "company_representative": "Петров Пётр", "company_position": "Директор",
-    "company_position_uz": "Директор", "company_representative_gen": "директора Петрова Петра",
     "company_city": "Ташкент", "company_city_uz": "Тошкент",
 }
 
@@ -119,15 +117,23 @@ def test_types_and_company_requisites(api):
         {"key": "raspiska_ru", "label": "Расписка (рус.)"},
         {"key": "tilxat_uz", "label": "Тилхат (ўзб.)"},
     ]
+    # Руководитель в системе есть — менеджер реквизиты не правит.
     assert body["can_edit_company"] is False
+    assert "Меняет руководитель" in body["company_edit_hint"]
     assert "can_print" in body
+    # Форма по группам, у каждого поля — пример заполнения.
+    groups = [g["title"] for g in body["company_form"]]
+    assert groups == ["Компания", "Банк", "Подписи", "Счёт на оплату", "Расписка"]
+    fields = {f["key"]: f for g in body["company_form"] for f in g["fields"]}
+    assert all(f["placeholder"] for f in fields.values())
+    assert "company_position" not in fields and "company_representative" not in fields
 
-    # Реквизиты задаёт руководство; менеджеру — 403.
+    # Реквизиты задаёт руководство; менеджеру при живом руководителе — 403.
     r = _post(client, "/api/docs/company/set", ids["mgr"], company={"company_name": "X"})
     assert r.status_code == 403
+    assert "руководитель" in r.json()["detail"]
     r = _post(client, "/api/docs/company/set", ids["boss"], company={
         "company_name": "ООО Ромашка", "company_tin": "123456789", "company_city": "Ташкент",
-        "company_representative": "Петров П.П.",
     })
     assert r.status_code == 200, r.text
     assert r.json()["company"]["company_name"] == "ООО Ромашка"
@@ -256,7 +262,7 @@ def test_legacy_form_fields_are_ignored(api):
     content = Path(row["file_path"]).read_bytes().decode("utf-8")
     for leaked in ("AA 1234567", "Каримов", "Посторонний", "Чужое ООО", "penalty", "witness", "passport"):
         assert leaked not in content, leaked
-    assert "директора Петрова Петра" in content
+    assert "Ташкент, ул. Навои 1" in content
 
 
 @pytest.mark.parametrize(
@@ -475,22 +481,25 @@ def test_invoice_print_endpoint(api, monkeypatch):
 
 
 @pytest.mark.parametrize("doc_type", ["raspiska_ru_uz", "raspiska_ru", "tilxat_uz"])
-def test_every_type_uses_signatory_from_requisites(api, doc_type):
-    """Все три вида берут подписанта и основание из реквизитов; без них —
-    понятный отказ с перечнем того, что заполнить, а не документ с дырами."""
+def test_every_type_needs_only_tin_and_address_not_a_signatory(api, doc_type):
+    """Жалоба владельца: «зачем должность, если расписку пишет физлицо».
+    Ни один вид не спрашивает должность и представителя; без ИНН и адреса —
+    отказ, который называет, ЧТО и ГДЕ заполнить."""
     from services import documents
 
     client, db, ids, _bot = api
     form = {**FORM, "doc_type": doc_type}
-    for key in SIGNATORY:
+    for key in ("company_tin", "company_address"):
         db.set_setting(key, "", ids["boss"])
     _post(client, "/api/docs/company/set", ids["boss"], company={"company_name": "ООО Ромашка"})
     r = _post(client, "/api/docs/create", ids["mgr"], **form)
     assert r.status_code == 400
-    assert "Реквизитах компании" in r.json()["detail"] and "ИНН" in r.json()["detail"]
+    assert r.json()["detail"] == (
+        "Заполните ИНН и юридический адрес в Настройки → Реквизиты компании — без этого не выписать расписку"
+    )
 
     _post(client, "/api/docs/company/set", ids["boss"], company={
-        **SIGNATORY, "company_name": "ООО Ромашка", "company_poa_number": "7", "company_poa_date": "01.09.2026",
+        "company_name": "ООО Ромашка", "company_tin": "123456789", "company_address": "Ташкент, ул. Навои 1",
     })
     r = _post(client, "/api/docs/create", ids["mgr"], **form)
     assert r.status_code == 200, r.text
@@ -498,8 +507,8 @@ def test_every_type_uses_signatory_from_requisites(api, doc_type):
     assert doc["doc_type"] == doc_type
     data, _name = documents.read_pdf(doc)
     body = data.decode("utf-8", "replace")
-    assert "директора Петрова Петра" in body
-    assert "доверенности № 7 от 01.09.2026" in body
+    assert "'creditor_tin': '123456789'" in body
+    assert "position" not in body and "representative" not in body and "basis" not in body
     assert "'city_uz': 'Тошкент'" in body
 
 

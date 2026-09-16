@@ -1303,7 +1303,7 @@ def test_outgoing_invoice_moves_stock_and_sends_pdf_to_client(open_app, e2e):
     assert e2e.rows("SELECT product_id, quantity, price_cents FROM invoice_items WHERE invoice_id = ?",
                     (inv["id"],)) == [{"product_id": e2e.ids["product"], "quantity": 3, "price_cents": 1500}]
     assert [d["chat_id"] for d in e2e.bot.documents] == [777001], "PDF ушёл клиенту"
-    assert "Накладная" in e2e.bot.documents[0].get("caption", "")
+    assert "Товарная накладная" in e2e.bot.documents[0].get("caption", "")
     assert boss.locator(f'[data-wh-send="{inv["id"]}"]').count() == 1
 
 

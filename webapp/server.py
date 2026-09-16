@@ -902,6 +902,9 @@ async def api_prefs_set(request: Request):
         if isinstance(value, bool) or not isinstance(value, int):
             raise HTTPException(status_code=400, detail="Значение настройки — целое число")
         value = max(0, min(int(value), 1000))  # разумный потолок, не «свалка»
+    elif key in user_prefs.CHOICES:
+        if value not in user_prefs.CHOICES[key]:
+            raise HTTPException(status_code=400, detail="Такого значения у настройки нет — обновите приложение")
     else:  # pragma: no cover — новый тип default в PREFS без ветки валидации
         raise HTTPException(status_code=400, detail="Такой настройки нет — обновите приложение")
     prefs = await asyncio.to_thread(user_prefs.set_pref, user["id"], key, value)
@@ -4015,7 +4018,32 @@ async def api_orders(request: Request):
 _SALES_INVOICE_ROLES = ("admin", "boss", "manager")
 
 
-async def _sales_invoice_doc(data: Any, user: dict) -> dict:
+def _doc_lang_arg(data: Any) -> str | None:
+    """Язык печатной формы из тела запроса: `ru_uz`/`ru`/`uz`; не прислан — None.
+    Мусор — 400: молча напечатать «не тот» язык хуже отказа."""
+    from services.invoice_pdf import normalize_lang
+
+    raw = data.get("lang") if isinstance(data, dict) else None
+    if raw in (None, ""):
+        return None
+    lang = normalize_lang(raw)
+    if lang is None:
+        raise HTTPException(status_code=400, detail="Выберите язык документа: рус + узб, рус или узб")
+    return lang
+
+
+async def _resolve_doc_lang(data: Any, user: dict) -> str:
+    """Язык из запроса (и запомнить его человеку) или последний выбранный."""
+    from services import user_prefs
+
+    lang = _doc_lang_arg(data)
+    if lang:
+        await asyncio.to_thread(user_prefs.remember_doc_lang, user["id"], lang)
+        return lang
+    return await asyncio.to_thread(user_prefs.doc_lang, user["id"])
+
+
+async def _sales_invoice_doc(data: Any, user: dict, *, check_requisites: bool = True) -> dict:
     """Проверить доступ к заказу и собрать счёт. Отказы — HTTP с текстом.
 
     Доступ — как у карточки заказа: руководству любой, менеджеру свой. Счёт
@@ -4038,7 +4066,7 @@ async def _sales_invoice_doc(data: Any, user: dict) -> dict:
         raise HTTPException(status_code=403, detail="Открыть можно только свой заказ")
 
     try:
-        return await build_sales_invoice(order_id)
+        return await build_sales_invoice(order_id, check_requisites=check_requisites)
     except SalesInvoiceError as e:
         # «Нет клиента» / «нет позиций» — это ответ человеку, а не сбой: он
         # дособирает заказ и нажимает снова.
@@ -4047,12 +4075,15 @@ async def _sales_invoice_doc(data: Any, user: dict) -> dict:
 
 @app.post("/api/orders/invoice")
 async def api_order_sales_invoice(request: Request):
-    """Данные счёта по заказу: номер, дата, клиент, позиции, итог прописью.
+    """Данные счёта на оплату по заказу: номер, дата, клиент, позиции, итог прописью.
 
-    ТОЛЬКО чтение. Экран показывает это листом «Счёт № N от ДД.ММ.ГГГГ» с
-    кнопками «Распечатать» и «Отправить PDF».
+    ТОЛЬКО чтение. Экран показывает это листом «Счёт на оплату № N от
+    ДД.ММ.ГГГГ» с выбором языка и кнопками «Распечатать» и «Отправить PDF».
+    Лист собирается и без реквизитов компании — тогда `requisites_missing`
+    говорит, чего не хватает, а печать и отправка отвечают отказом.
     """
-    from services import printing
+    from services import printing, user_prefs
+    from services.invoice_pdf import DOC_LANG_LABELS
 
     data = await request.json()
     user = _authorize(
@@ -4061,15 +4092,22 @@ async def api_order_sales_invoice(request: Request):
         rate_limit_scope="api_order_sales_invoice",
         rate_limit_max=60,
     )
-    doc = await _sales_invoice_doc(data, user)
+    doc = await _sales_invoice_doc(data, user, check_requisites=False)
+    rights = await _company_edit_rights(user["id"])
     # Кнопка «Распечатать» рисуется, только если в контейнере есть клиент CUPS:
     # кнопка, которая гарантированно ответит отказом, хуже отсутствующей.
-    return JSONResponse({"invoice": doc, "can_print": printing.is_available()})
+    return JSONResponse({
+        "invoice": doc,
+        "can_print": printing.is_available(),
+        "doc_lang": await asyncio.to_thread(user_prefs.doc_lang, user["id"]),
+        "langs": [{"key": k, "label": v} for k, v in DOC_LANG_LABELS.items()],
+        "can_edit_company": rights["can_edit"],
+    })
 
 
 @app.post("/api/orders/invoice/print")
 async def api_order_sales_invoice_print(request: Request):
-    """Напечатать счёт на офисном принтере. ok = задание принято очередью."""
+    """Напечатать счёт на оплату на офисном принтере. ok = задание принято очередью."""
     import asyncio
 
     from services import async_db as adb
@@ -4085,6 +4123,7 @@ async def api_order_sales_invoice_print(request: Request):
         rate_limit_max=30,
     )
     doc = await _sales_invoice_doc(data, user)
+    doc["lang"] = await _resolve_doc_lang(data, user)
     if not printing.is_available():
         return JSONResponse({"ok": False, "error": "Печать не настроена — попросите администратора подключить принтер"})
     try:
@@ -4093,11 +4132,11 @@ async def api_order_sales_invoice_print(request: Request):
         pdf = await asyncio.to_thread(render_sales_invoice_pdf, doc)
     except Exception:
         logger.exception("Печать: не собран счёт по заказу #%s", doc["order_id"])
-        return JSONResponse({"ok": False, "error": "Не удалось собрать счёт — попробуйте ещё раз, а если не выйдет, сообщите администратору"})
+        return JSONResponse({"ok": False, "error": "Не удалось собрать счёт на оплату — попробуйте ещё раз, а если не выйдет, сообщите администратору"})
     result = await printing.print_pdf_bytes(
         pdf,
         filename=sales_invoice_filename(doc),
-        label=f"Счёт № {doc['number']} · {_actor_name(user)}",
+        label=f"Счёт на оплату № {doc['number']} · {_actor_name(user)}",
     )
     if result.ok:
         await adb.add_audit_log(
@@ -4130,11 +4169,12 @@ async def api_order_sales_invoice_send(request: Request):
         rate_limit_max=20,
     )
     doc = await _sales_invoice_doc(data, user)
+    doc["lang"] = await _resolve_doc_lang(data, user)
     try:
         pdf = await asyncio.to_thread(render_sales_invoice_pdf, doc)
     except Exception:
         logger.exception("Счёт по заказу #%s не собран", doc["order_id"])
-        return JSONResponse({"ok": False, "error": "Не удалось собрать счёт — попробуйте ещё раз, а если не выйдет, сообщите администратору"}, status_code=409)
+        return JSONResponse({"ok": False, "error": "Не удалось собрать счёт на оплату — попробуйте ещё раз, а если не выйдет, сообщите администратору"}, status_code=409)
 
     bot = await get_notify_bot()
     if bot is None:
@@ -4145,12 +4185,12 @@ async def api_order_sales_invoice_send(request: Request):
         await bot.send_document(
             chat_id=int(user["id"]),
             document=BufferedInputFile(pdf, filename=sales_invoice_filename(doc)),
-            caption=f"Счёт № {doc['number']} от {doc['date']} — заказ #{doc['order_id']}",
+            caption=f"Счёт на оплату № {doc['number']} от {doc['date']} — заказ #{doc['order_id']}",
         )
     except Exception:
         logger.exception("Счёт по заказу #%s не отправлен", doc["order_id"])
         return JSONResponse(
-            {"ok": False, "error": "Не удалось отправить счёт в Telegram — попробуйте ещё раз"}, status_code=409
+            {"ok": False, "error": "Не удалось отправить счёт на оплату в Telegram — попробуйте ещё раз"}, status_code=409
         )
 
     await adb.add_audit_log(
@@ -4604,6 +4644,9 @@ async def api_clients_detail(request: Request):
         raise HTTPException(status_code=400, detail="Не выбран клиент")
 
     cp = await cp_service.get(agent_id)
+    from services import requisites
+
+    cp_requisites = await requisites.counterparty_requisites((cp or {}).get("id"))
     debt = await adb.get_agent_current_debt(agent_id)
     limit = await adb.get_credit_limit(agent_id)
     orders = await adb.get_orders_by_agent(agent_id)
@@ -4642,6 +4685,9 @@ async def api_clients_detail(request: Request):
             "agent_id": agent_id,
             "name": (cp or {}).get("name") or "",
             "phone": (cp or {}).get("phone") or "",
+            # Реквизиты для счёта на оплату и накладной (sidecar); у контрагента
+            # из МойСклад с uuid-id карточки нет — редактировать нечего.
+            "requisites": {**cp_requisites, "editable": bool(cp)},
             "debt": debt,
             "limit": limit,
             "free": round(limit - debt, 2),
@@ -4654,6 +4700,39 @@ async def api_clients_detail(request: Request):
             "base_currency": (BASE_CURRENCY or "USD").upper(),
         }
     )
+
+
+@app.post("/api/clients/requisites/set")
+async def api_clients_requisites_set(request: Request):
+    """ИНН/ПИНФЛ, адрес и телефон клиента — для счёта на оплату и накладной.
+
+    Те же роли, что у карточки клиента: реквизиты вписывает тот, кто выписывает
+    клиенту бумагу. Пустое поле законно — документ напечатает черту.
+    """
+    from services import async_db as adb
+    from services import requisites
+
+    data = await request.json()
+    user = _authorize(
+        data, allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_clients_requisites_set", rate_limit_max=30,
+    )
+    try:
+        cp_id = int(str(data.get("agent_id") or data.get("counterparty_id") or "").strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Не выбран клиент — откройте карточку заново") from None
+    try:
+        saved = await requisites.set_counterparty_requisites(
+            cp_id, tin=data.get("tin"), address=data.get("address"),
+            phone=data.get("phone") if "phone" in data else None, by=user["id"],
+        )
+    except requisites.RequisitesInvalid as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    await adb.add_audit_log(
+        user["id"], _actor_name(user), get_role(user["id"]), "counterparty_requisites",
+        f"#{cp_id}: ИНН/ПИНФЛ={saved['tin'] or '—'}, адрес={saved['address'][:120] or '—'}",
+    )
+    return JSONResponse({"ok": True, "requisites": saved})
 
 
 @app.post("/api/clients/shipment")
@@ -9021,6 +9100,12 @@ async def api_wh_counterparties_create(request: Request):
         rate_limit_max=30,
     )
     cp_type = (data.get("type") or "customer").strip()
+    from services import requisites
+
+    try:
+        requisites.clean_tin(data.get("tin"))
+    except requisites.RequisitesInvalid as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
     created = await cp_service.create(
         (data.get("name") or "").strip()[:255],
         phone=(data.get("phone") or "").strip()[:64] or None,
@@ -9028,6 +9113,13 @@ async def api_wh_counterparties_create(request: Request):
     )
     if not created.get("ok"):
         raise HTTPException(status_code=400, detail=created.get("error", "Не удалось завести клиента — проверьте название и повторите"))
+    # ИНН/ПИНФЛ и адрес — необязательные поля формы (для счёта на оплату).
+    # Уже заведённому тёзке их не перетираем: кнопку могли нажать повторно.
+    tin, address = data.get("tin"), data.get("address")
+    if not created["existed"] and (str(tin or "").strip() or str(address or "").strip()):
+        await requisites.set_counterparty_requisites(
+            created["counterparty_id"], tin=tin, address=address, by=user["id"],
+        )
     if not created["existed"]:
         await adb.add_audit_log(
             user["id"], _actor_name(user), get_role(user["id"]),
@@ -9074,16 +9166,25 @@ async def api_wh_invoices(request: Request):
 
     # Кнопка «Распечатать» рисуется, только если в контейнере есть клиент CUPS:
     # кнопка, которая гарантированно ответит отказом, хуже отсутствующей.
-    return JSONResponse({"invoices": rows, "can_print": printing.is_available()})
+    from services import user_prefs
+    from services.invoice_pdf import DOC_LANG_LABELS
+
+    return JSONResponse({
+        "invoices": rows, "can_print": printing.is_available(),
+        # Язык товарной накладной — выбор над списком отгрузок, помнится.
+        "doc_lang": await asyncio.to_thread(user_prefs.doc_lang, user["id"]),
+        "langs": [{"key": k, "label": v} for k, v in DOC_LANG_LABELS.items()],
+    })
 
 
 @app.post("/api/wh/invoices/print")
 async def api_wh_invoice_print(request: Request):
-    """Напечатать накладную на офисный принтер (CUPS). ok = принято очередью."""
-    import asyncio
+    """Напечатать накладную на офисный принтер (CUPS). ok = принято очередью.
 
-    from services import printing, warehouse
-    from services.invoice_pdf import invoice_filename, render_invoice_pdf
+    Расход — товарная накладная на выбранном языке (`lang`, запоминается);
+    приход — внутренняя приходная накладная."""
+    from services import printing, warehouse, waybill
+    from services.invoice_pdf import invoice_filename
 
     data = await request.json()
     user = _authorize(
@@ -9102,16 +9203,18 @@ async def api_wh_invoice_print(request: Request):
     # Печать — тот же вывод наружу: закупочные цены прихода не руководству
     # не печатаем.
     inv = redact_invoice(inv, get_role(user["id"]))
+    lang = await _resolve_doc_lang(data, user)
     if not printing.is_available():
         return JSONResponse({"ok": False, "error": "Печать не настроена — попросите администратора подключить принтер"})
     try:
-        pdf = await asyncio.to_thread(render_invoice_pdf, inv)
+        pdf, _name = await waybill.render(inv, lang)
     except Exception:
         logger.exception("Печать: не собран PDF накладной #%s", invoice_id)
         return JSONResponse({"ok": False, "error": "Не удалось собрать печатную форму — попробуйте ещё раз"})
+    title = "Товарная накладная" if inv.get("type") == "outgoing" else "Приходная накладная"
     result = await printing.print_pdf_bytes(
         pdf, filename=invoice_filename(inv),
-        label=f"Накладная {inv.get('invoice_number') or invoice_id} · {_actor_name(user)}",
+        label=f"{title} {inv.get('invoice_number') or invoice_id} · {_actor_name(user)}",
     )
     return JSONResponse({"ok": result.ok, "message": result.message, "error": result.error})
 
@@ -9123,6 +9226,52 @@ async def api_wh_invoice_print(request: Request):
 _DOC_ROLES = ("admin", "boss", "manager")
 
 
+async def _company_edit_rights(user_id: int) -> dict:
+    """Кто правит «Реквизиты компании»: руководство — всегда; менеджер — пока
+    активного руководителя в системе нет (правило `no_boss`, зеркало
+    `machine_deal_requests.decision_rights`). Владелец работает менеджером, и
+    раньше реквизиты были ему недоступны вовсе — найти их было негде."""
+    from services import machine_deal_requests as mdr
+
+    role = get_role(user_id)
+    if role not in _DOC_ROLES:
+        return {"can_edit": False, "mode": None, "hint": None}
+    rights = await mdr.decision_rights(user_id, role)
+    can = bool(rights["can_decide"])
+    mode = ("boss" if rights["viewer_is_holder"] else "no_boss") if can else None
+    hint = None if can else "Меняет руководитель: " + (", ".join(rights["names"]) or "руководитель")
+    return {"can_edit": can, "mode": mode, "hint": hint}
+
+
+def _company_payload(company: dict) -> dict:
+    from services import requisites
+
+    missing: list[str] = []
+    for doc in ("sales_invoice", "raspiska"):
+        for f in requisites.missing_for(company, doc):
+            if f.short not in missing:
+                missing.append(f.short)
+    return {
+        "company": company,
+        # Чего не хватает хоть одному документу — строка «Настроек» говорит это
+        # сразу, не дожидаясь отказа при печати.
+        "company_missing": missing,
+        # Плоский список (ключ, подпись) — прежний формат; `company_form` —
+        # форма по группам с примерами заполнения.
+        "company_fields": [{"key": f.key, "label": f.label} for f in requisites.COMPANY_FIELDS],
+        "company_form": [
+            {
+                "key": key, "title": title,
+                "fields": [
+                    {"key": f.key, "label": f.label, "placeholder": f.placeholder, "hint": f.hint}
+                    for f in requisites.COMPANY_FIELDS if f.group == key
+                ],
+            }
+            for key, title in requisites.GROUPS
+        ],
+    }
+
+
 @app.post("/api/docs/types")
 async def api_docs_types(request: Request):
     """Справочник для формы: типы документов, реквизиты компании, что доступно."""
@@ -9130,39 +9279,54 @@ async def api_docs_types(request: Request):
 
     data = await request.json()
     user = _authorize(data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_types")
-    role = get_role(user["id"])
     company = await asyncio.to_thread(documents.company_requisites)
+    rights = await _company_edit_rights(user["id"])
     return JSONResponse({
         # Все типы — один бланк юриста (обе части, рус., ўзб.), поля формы у
         # них одинаковые, поэтому различий между типами форма не получает.
         "types": [{"key": k, "label": v} for k, v in documents.DOC_TYPES.items()],
-        "company": company,
-        "company_fields": [{"key": k, "label": v} for k, v in documents.COMPANY_FIELDS],
-        "can_edit_company": role in ("admin", "boss"),
+        **_company_payload(company),
+        "can_edit_company": rights["can_edit"],
+        "company_edit_hint": rights["hint"],
         "can_print": printing.is_available(),
     })
 
 
 @app.post("/api/docs/company/set")
 async def api_docs_company_set(request: Request):
-    """Реквизиты компании (кредитор в расписке) — задаёт руководство один раз."""
-    from services import documents
+    """«Настройки → Реквизиты компании»: счёт на оплату, накладная, расписка.
+
+    Руководство — всегда; менеджер — пока руководителя в системе нет (аудит
+    помечает это). Иначе 403: реквизиты компании — не личная настройка.
+    """
+    from services import documents, requisites
 
     data = await request.json()
     user = _authorize(
-        data, allowed_roles=("admin", "boss"), rate_limit_scope="api_docs_company_set"
+        data, allowed_roles=_DOC_ROLES, rate_limit_scope="api_docs_company_set"
     )
+    rights = await _company_edit_rights(user["id"])
+    if not rights["can_edit"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Реквизиты компании меняет руководитель — попросите его в Настройки → Реквизиты компании",
+        )
     values = data.get("company")
     if not isinstance(values, dict):
         raise HTTPException(status_code=400, detail="Реквизиты не сохранены — обновите экран и повторите")
-    saved = await asyncio.to_thread(documents.save_company_requisites, values, user["id"])
+    try:
+        saved = await asyncio.to_thread(documents.save_company_requisites, values, user["id"])
+    except requisites.RequisitesInvalid as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
     from services import async_db as adb
 
+    note = " · менеджером — руководителя в системе нет" if rights["mode"] == "no_boss" else ""
     await adb.add_audit_log(
         user["id"], _actor_name(user), get_role(user["id"]),
-        "company_requisites", ", ".join(f"{k}={v}" for k, v in saved.items())[:500],
+        "company_requisites", (", ".join(f"{k}={v}" for k, v in saved.items())[:460] + note),
     )
-    return JSONResponse({"ok": True, "company": await asyncio.to_thread(documents.company_requisites)})
+    company = await asyncio.to_thread(documents.company_requisites)
+    return JSONResponse({"ok": True, **_company_payload(company)})
 
 
 @app.post("/api/docs/create")
@@ -9473,8 +9637,9 @@ async def api_wh_invoice_send(request: Request):
     if invoice is None:
         raise HTTPException(status_code=404, detail="Документ не найден — обновите список")
 
+    lang = await _resolve_doc_lang(data, user)
     bot = await get_notify_bot()
-    delivery = await deliver_invoice_pdf(invoice, bot, force=bool(data.get("force")))
+    delivery = await deliver_invoice_pdf(invoice, bot, force=bool(data.get("force")), lang=lang)
     if not delivery["sent"]:
         return JSONResponse(
             {

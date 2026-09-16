@@ -336,8 +336,7 @@ def test_legal_template_escapes_special_characters(tmp_path):
     # проверяем на том, что печатается: название кредитора и товар.
     ctx = ld.build_context(
         doc_type="raspiska_ru", city="Ташкент & <Юнусабад>",
-        creditor={"name": "ООО \"Рога\" & <Копыта>", "tin": "1", "address": "a<b>",
-                  "representative": "Иванов & Ко <x>", "position": "Директор"},
+        creditor={"name": "ООО \"Рога\" & <Копыта>", "tin": "1", "address": "Иванов & Ко <x>"},
         product_name="<b>Труба</b>", total_cents=100_000,
         start_date=date(2026, 1, 1), term_months=2, installments_count=1,
     )

@@ -57,18 +57,13 @@ HANDWRITTEN_TYPES = frozenset(TEMPLATES)
 # тысячи раз меньше настоящего.
 DOCUMENT_CURRENCY = "UZS"
 
-# Реквизиты, которые печатаются в документе. Пустое поле ушло бы в документ
-# дырой посреди фразы «в лице …, действующего на основании …». Должность —
-# на языке части: русской расписке узбекская должность не нужна, и наоборот.
-_REQUIRED_COMMON = (
-    ("tin", "ИНН"),
-    ("address", "адрес"),
-    ("representative", "представитель (ФИО)"),
-)
-_REQUIRED_BY_LANG = {
-    "ru": (("position", "должность подписанта"),),
-    "uz": (("position_uz", "должность подписанта по-узбекски"),),
-}
+# Реквизиты кредитора, без которых расписка не собирается: ИНН и юридический
+# адрес печатаются в первом абзаце («… (ИНН: …, юридический адрес: …)»), и
+# пустое поле ушло бы в документ дырой посреди фразы. Подписанта кредитора
+# (должность, «в лице … на основании …») в бланке больше НЕТ: расписка —
+# односторонний документ должника-физлица (решение владельца, см.
+# scripts/build_raspiska_ru_uz). Ключи — реквизиты `services/requisites.py`.
+_REQUIRED = (("tin", "company_tin"), ("address", "company_address"))
 
 
 class DocumentError(Exception):
@@ -154,13 +149,11 @@ def build_context(
     if term_months < 1:
         raise DocumentError("Срок должен быть не меньше месяца")
 
-    langs = TEMPLATES[doc_type][1]
-    required = _REQUIRED_COMMON + tuple(f for lang in langs for f in _REQUIRED_BY_LANG[lang])
-    missing = [label for key, label in required if not creditor.get(key)]
+    from services import requisites
+
+    missing = [requisites.FIELDS_BY_KEY[setting] for key, setting in _REQUIRED if not creditor.get(key)]
     if missing:
-        raise DocumentError(
-            "Для расписки заполните в «Реквизитах компании»: " + ", ".join(missing)
-        )
+        raise DocumentError(requisites.missing_message(missing, "raspiska"))
 
     end_date = start_date + relativedelta(months=term_months)
     # Последний платёж не должен выходить за срок договора: график, который
@@ -181,8 +174,6 @@ def build_context(
         "creditor_name": creditor["name"],
         "creditor_tin": creditor.get("tin", ""),
         "creditor_address": creditor.get("address", ""),
-        "creditor_representative": creditor.get("representative", ""),
-        **_signatory(creditor),
         "product_name": product_name,
         "total_amount": _money(total_cents),
         # Пропись — на языке своей части: в двуязычном документе обе.
@@ -191,37 +182,6 @@ def build_context(
         "start_date": _fmt_date(start_date),
         "end_date": _fmt_date(end_date),
         "schedule": schedule,
-    }
-
-
-def _signatory(creditor: dict) -> dict:
-    """Подписант кредитора для фраз «в лице …» и «на основании …».
-
-    «В лице» требует родительного падежа («директора Иванова И. И.»), а
-    склонять ФИО программно — значит однажды просклонять неправильно. Поэтому
-    форма берётся из реквизитов как есть; не заполнена — должность и ФИО в
-    именительном: грамматически хуже, но без выдуманных окончаний.
-    Основание — доверенность, если указан её номер, иначе Устав.
-    """
-    position = creditor.get("position", "")
-    representative = creditor.get("representative", "")
-    poa_number = creditor.get("poa_number", "")
-    poa_date = creditor.get("poa_date", "")
-    if poa_number:
-        date_ru = f" от {poa_date}" if poa_date else ""
-        date_uz = f"{poa_date} йилдаги " if poa_date else ""
-        basis_ru = f"доверенности № {poa_number}{date_ru}"
-        basis_uz = f"{date_uz}№ {poa_number} ишончнома"
-    else:
-        basis_ru, basis_uz = "Устава", "Устав"
-    return {
-        "creditor_position": position,
-        "creditor_position_uz": creditor.get("position_uz", ""),
-        "creditor_representative_gen": (
-            creditor.get("representative_gen") or f"{position} {representative}".strip()
-        ),
-        "creditor_basis_ru": basis_ru,
-        "creditor_basis_uz": basis_uz,
     }
 
 

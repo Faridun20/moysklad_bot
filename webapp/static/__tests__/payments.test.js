@@ -140,6 +140,16 @@ describe('подпись ожидающей оплаты в «Долгах»', (
     expect(H.payConfirmable({})).toBe(0);
   });
 
+  it('краткая сводка товаров не прячет остаток: «… и ещё N»', () => {
+    // Прод 16.09: карточка с «3 товара» показывала две строки без пометки.
+    const items = [{ name: 'Цемент' }, { name: 'Кирпич' }, { name: 'Песок' }];
+    expect(H.orderItemsBrief(items, 3)).toBe('Цемент, Кирпич и ещё 1');
+    expect(H.orderItemsBrief(items.slice(0, 2), 2)).toBe('Цемент, Кирпич');
+    // Сервер прислал превью меньше, чем позиций всего, — счёт по items_count.
+    expect(H.orderItemsBrief(items.slice(0, 1), 4)).toBe('Цемент и ещё 3');
+    expect(H.orderItemsBrief([], 0)).toBe('');
+  });
+
   it('сдача показывает заказы с валютой: «#27 — 5 000 USD»', () => {
     expect(norm(H.payDepositOrdersText([{ order_id: 27, amount_allocated: 5000, currency: 'USD' }]))).toBe('#27 — 5 000 USD');
     expect(H.payDepositOrdersText([])).toBe('—');

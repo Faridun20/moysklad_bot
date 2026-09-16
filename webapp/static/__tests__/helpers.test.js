@@ -438,9 +438,12 @@ describe('разделы нижней панели', () => {
     }
   });
 
-  it('менеджер: «Клиенты» в панели, «Обращения» — за ними', () => {
+  it('менеджер: «Клиенты» в панели, «Обращения» — за ними, «Настройки» — ради реквизитов', () => {
+    // Владелец работает менеджером и не мог найти «Реквизиты компании»:
+    // «Настройки» у менеджера есть (в шторке), внутри — только реквизиты.
     expect(navSections('manager').map(s => s.key))
-      .toEqual(['today', 'sales', 'stock', 'money', 'clients', 'leads']);
+      .toEqual(['today', 'sales', 'stock', 'money', 'clients', 'leads', 'settings']);
+    expect(navSections('warehouse_keeper').map(s => s.key)).not.toContain('settings');
   });
 
   it('кладовщик и бухгалтер не видят склад, клиентов и обращения', () => {
@@ -1146,6 +1149,7 @@ describe('руководитель: «Рабочие действия» (реш�
     expect(resolveScreen('manager', 'money', 'confirm')).toEqual({ screen: 'money', tab: 'confirm' });
     expect(resolveScreen('manager', 'decisions', '')).toEqual({ screen: 'money', tab: 'confirm' });
     expect(resolveScreen('bookkeeper', 'settings', '')).toEqual({ screen: 'money', tab: 'confirm' });
+    expect(resolveScreen('manager', 'settings', '')).toEqual({ screen: 'settings', tab: '' });
   });
 
   it('шторка: бейдж «Решений» и выключатель с состоянием словами', () => {
