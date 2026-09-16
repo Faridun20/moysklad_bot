@@ -1295,16 +1295,17 @@ def test_document_form_validation_and_cancel(open_app, e2e, monkeypatch, tmp_pat
     mgr.wait_for_selector("#ms-error:not([hidden])")
     assert "Заполните: Должник — ФИО" in mgr.locator("#ms-error").inner_text()
 
-    # Без ИНН/адреса/должности в реквизитах — сервер называет, чего нет.
+    # Без ИНН/адреса в реквизитах — сервер называет, чего нет и где заполнить.
+    # Должность подписанта не спрашивается: расписку пишет должник.
     mgr.fill("#ms-f-debtor_full_name", "Иванов Иван")
     mgr.fill("#ms-f-product_name", "Ковш")
     mgr.fill("#ms-f-total_amount", "1000")
     mgr.fill("#ms-f-term_months", "2")
     mgr.fill("#ms-f-city", "Ташкент")
     mgr.click("#ms-submit")
-    mgr.wait_for_selector("#ms-error:has-text('Реквизитах компании')")
+    mgr.wait_for_selector("#ms-error:has-text('Реквизиты компании')")
     err = mgr.locator("#ms-error").inner_text()
-    assert "ИНН" in err and "должность подписанта" in err
+    assert "ИНН" in err and "Настройки → Реквизиты компании" in err and "должность" not in err
     assert mgr.locator("#ms-f-debtor_full_name").input_value() == "Иванов Иван"
 
     # Сумма ноль — отказ сервера, форма та же.

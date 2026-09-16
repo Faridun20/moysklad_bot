@@ -149,8 +149,7 @@ def test_client_requisites_and_waybill_language_reach_the_paper(open_app, e2e, m
     mgr.wait_for_selector(".doc-lang [data-lang='uz']")
     mgr.click(".doc-lang [data-lang='uz']")
     mgr.locator("[data-wh-print]").first.click()
-    mgr.wait_for_selector(".toast")
-    settled(mgr)
+    mgr.wait_for_selector(".toast:has-text('задание Canon-2')")
     # Фоновая печатная форма одобрения тоже рендерится этой функцией — берём
     # именно печать из «Отгрузок».
     printed = [inv for inv in rendered if inv["doc_lang"] == "uz"]

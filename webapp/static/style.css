@@ -2561,6 +2561,8 @@ body.page-sheet-open { overflow: hidden; }
   font-size: var(--text-sm);
 }
 .c-error[hidden] { display: none; }
+/* Лист «Счёт на оплату»: «не хватает реквизитов» под итогом — не впритык. */
+.wh-total + .c-error { margin-top: var(--sp-3); }
 .c-actions,
 .price-actions {
   display: flex;

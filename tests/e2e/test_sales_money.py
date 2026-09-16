@@ -571,7 +571,7 @@ def test_boss_prints_invoice_from_list(open_app, e2e, monkeypatch):
     boss.wait_for_selector("[data-wh-print]")  # сид-приход на 20 шт.
     boss.click("[data-wh-print]")
     boss.wait_for_selector(".toast:has-text('задание 12')")
-    assert printed and "Накладная" in printed[0]
+    assert printed and "накладная" in printed[0].lower()
 
 
 def test_invoice_list_has_no_print_button_without_cups(open_app, e2e, monkeypatch):
