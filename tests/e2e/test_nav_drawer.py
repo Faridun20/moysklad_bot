@@ -47,7 +47,7 @@ def _wait_offscreen(page) -> None:
 def test_manager_opens_menu_and_goes_to_stock_invoices(open_app, e2e):
     mgr = open_app(e2e.ids["mgr"])
     settled(mgr)
-    assert mgr.locator("#bottom-nav .nav-item[data-screen]").count() == 4
+    assert mgr.locator("#bottom-nav .nav-item[data-screen]").count() == 5
 
     _open_menu(mgr)
     menu = mgr.locator('#bottom-nav [data-action="menu"]')
@@ -88,16 +88,17 @@ def test_manager_opens_menu_and_goes_to_stock_invoices(open_app, e2e):
 def test_boss_reaches_section_outside_the_bar(open_app, e2e):
     boss = open_app(e2e.ids["boss"])
     _open_menu(boss)
-    # Руководство: семь разделов, в панели — «Сегодня · Решения · Деньги · Продажи».
-    assert boss.locator("#nav-drawer .nav-link--section").count() == 7
-    boss.click('#nav-drawer .nav-link[data-screen="clients"][data-tab="limits"]')
-    boss.wait_for_selector('.seg-item.active[data-sect="limits"]')
-    # «Клиентов» в панели нет — подсвечена «Меню», чтобы было видно, где ты.
+    # Руководство: восемь разделов, в панели — «Сегодня · Решения · Деньги ·
+    # Продажи · Клиенты»; склад, обращения и настройки — в шторке.
+    assert boss.locator("#nav-drawer .nav-link--section").count() == 8
+    boss.click('#nav-drawer .nav-link[data-screen="stock"][data-tab="containers"]')
+    boss.wait_for_selector('.seg-item.active[data-sect="containers"]')
+    # «Склада» в панели нет — подсвечена «Меню», чтобы было видно, где ты.
     assert boss.locator('#bottom-nav [data-action="menu"].active').count() == 1
     assert boss.locator("#bottom-nav .nav-item[data-screen].active").count() == 0
     # Ряд вкладок раздела на месте и работает как раньше.
-    boss.click('.seg-item[data-sect="funnel"]')
-    boss.wait_for_selector('.seg-item.active[data-sect="funnel"]')
+    boss.click('.seg-item[data-sect="catalog"]')
+    boss.wait_for_selector('.seg-item.active[data-sect="catalog"]')
 
 
 def test_drawer_closes_by_scrim_escape_back_and_swipe(open_app, e2e):

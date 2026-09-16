@@ -374,7 +374,13 @@ def test_manager_writes_off_and_it_lands_in_the_journal(api):
     assert _stock(db, 1) == 8
     lst = client.post("/api/stock/writeoffs", json={"initData": str(ids["mgr"])}).json()
     assert lst["writeoffs"][0]["reason"] == "бой"
-    assert "разбили" in lst["quick_reasons"], "быстрые причины — обычными словами"
+    # Быстрые причины — подсказка, а не справочник: своя причина сохраняется
+    # как есть и в список подсказок не попадает (inventory.QUICK_REASONS
+    # переписали обычными словами — «разбили» вместо «бой»).
+    from services import inventory
+
+    assert lst["quick_reasons"] == list(inventory.QUICK_REASONS)
+    assert "разбили" in lst["quick_reasons"]
 
 
 def test_guest_cannot_write_off(api):

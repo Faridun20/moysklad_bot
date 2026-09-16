@@ -2858,8 +2858,18 @@ async def get_agent_money_history(agent_id: str, limit: int = 50) -> list[dict[s
 
     base_cur = (BASE_CURRENCY or "USD").upper()
 
+    # Способ («наличные / на карту / перечислением») и куда пришли деньги —
+    # из строки разбивки, ровно как в общей ленте `get_cash_history`. Владелец
+    # спрашивает «сколько отдано» вместе с «как отдано»: платёж без способа в
+    # карточке клиента отвечал только на половину вопроса, хотя разбивка уже
+    # лежит в `payment_parts`.
+    from services import order_payments
+
+    parts = await order_payments.parts_by_payment([int(p["id"]) for p in pays])
+
     rows: list[dict[str, Any]] = []
     for p in pays:
+        part = parts.get(int(p["id"]))
         rows.append({
             "kind": "payment", "id": p["id"],
             "amount": float(money.from_cents(int(p["amount_cents"] or 0))),
@@ -2867,6 +2877,11 @@ async def get_agent_money_history(agent_id: str, limit: int = 50) -> list[dict[s
             "who": names.get(p["user_id"], str(p["user_id"])),
             "order_id": p.get("order_id"), "note": p.get("comment") or "",
             "created_at": (p.get("created_at") or "")[:16],
+            "method": part["method"] if part else None,
+            "method_label": order_payments.METHODS.get(part["method"]) if part else None,
+            "account_label": part.get("account_label") if part else None,
+            "part_amount": float(money.from_cents(int(part["amount_cents"]))) if part else None,
+            "part_currency": part["currency"] if part else None,
         })
     for d in deps:
         rows.append({

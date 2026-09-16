@@ -117,7 +117,7 @@ def _back(page) -> None:
 
 
 def _lead_ids(page) -> set[int]:
-    return set(page.eval_on_selector_all("#clients-body [data-lead]", "els => els.map(e => +e.dataset.lead)"))
+    return set(page.eval_on_selector_all("#leads-body [data-lead]", "els => els.map(e => +e.dataset.lead)"))
 
 
 def _wait_alert(page, needle: str) -> None:
@@ -131,11 +131,11 @@ def _open_home(page) -> None:
 
 
 def _open_lead_card(page, lead_id: int) -> None:
-    go(page, "clients")
+    go(page, "leads")
     if page.locator('.seg-item[data-sect="list"]').count():
         tab(page, "list")
-    page.wait_for_selector(f'#clients-body [data-lead="{lead_id}"]')
-    page.click(f'#clients-body [data-lead="{lead_id}"]')
+    page.wait_for_selector(f'#leads-body [data-lead="{lead_id}"]')
+    page.click(f'#leads-body [data-lead="{lead_id}"]')
     page.wait_for_selector("#lead-agent")
 
 
@@ -306,19 +306,20 @@ def test_queue_awaiting_clients_boss_to_funnel_manager_to_own_leads(open_app, e2
     _lead(e2e, 610_003, "Свежий")  # в воронку «этой недели» кто-то должен попасть
 
     boss = open_app(e2e.ids["boss"])
-    row = boss.locator('[data-queue="clients:funnel"]')
+    row = boss.locator('[data-queue="leads:funnel"]')
     row.wait_for()
     assert row.locator(".queue-count").inner_text() == "2"
     row.click()
-    _wait_screen(boss, "clients", "funnel")
+    _wait_screen(boss, "leads", "funnel")
     boss.wait_for_selector(".section-label:has-text('Ждут ответа · 2')")
 
     mgr = open_app(e2e.ids["mgr"])
-    row = mgr.locator('[data-queue="clients:funnel"]')
+    # Менеджеру счётчик ведёт в «Лиды»: воронка отвечает ему 403.
+    row = mgr.locator('[data-queue="leads:list"]')
     row.wait_for()
     assert row.locator(".queue-count").inner_text() == "1"
     row.click()
-    _wait_screen(mgr, "clients")
+    _wait_screen(mgr, "leads")
     mgr.wait_for_selector("#call-new")
     settled(mgr)
     # Вкладку «Воронка» (403 для менеджера) подменили «Лидами», чужой лид не виден.
@@ -383,7 +384,7 @@ def test_boss_saves_inverted_rate_and_zero_is_rejected(open_app, e2e):
 # ─── «Сегодня»: поиск в шапке ────────────────────────────────────────────────
 
 
-def test_boss_search_agent_opens_card_and_back_leads_to_limits(open_app, e2e):
+def test_boss_search_agent_opens_card_and_back_leads_to_client_list(open_app, e2e):
     seed_order(e2e)
     boss = open_app(e2e.ids["boss"])
     boss.click("#search-btn")
@@ -393,8 +394,9 @@ def test_boss_search_agent_opens_card_and_back_leads_to_limits(open_app, e2e):
     boss.wait_for_selector(".editor-title:has-text('ООО Ромашка')")
     assert "+998901234567" in boss.inner_text(".agent-phone")
     _back(boss)
-    _wait_screen(boss, "clients", "limits")
-    boss.wait_for_selector("#open-rates")
+    # «Назад» из карточки, открытой не из «Лимитов», ведёт в список клиентов.
+    _wait_screen(boss, "clients", "buyers")
+    boss.wait_for_selector("#buyers-search")
 
 
 def test_search_hints_and_order_payment_items_navigate(open_app, e2e):
@@ -473,35 +475,53 @@ def test_keeper_search_button_is_not_a_dead_end(open_app, e2e):
 
 
 def test_clients_tabs_follow_role(open_app, e2e):
+    """«Клиенты» — покупатели; «Обращения» — воронка, лиды и канал."""
     for who in ("boss", "admin"):
         page = open_app(e2e.ids[who])
         go(page, "clients")
-        page.wait_for_selector('.seg-item[data-sect="funnel"]')
-        assert _sect_tabs(page) == ["funnel", "list", "limits", "channel"], who
-        assert page.inner_text("#greeting") == "Клиенты · Воронка", who
+        page.wait_for_selector('.seg-item[data-sect="buyers"]')
+        assert _sect_tabs(page) == ["buyers", "limits"], who
+        assert page.inner_text("#greeting") == "Клиенты · Покупатели", who
         settled(page)
-        assert "Обращений пока нет" in page.inner_text("#clients-body"), who
-        tab(page, "list")
-        page.wait_for_selector("#call-new")
-        assert page.inner_text("#greeting") == "Клиенты · Лиды"
+        # Справочник не пуст (фикстура заводит «ООО Ромашка»), но заказов нет:
+        # клиент в списке есть, и строка честно говорит, что покупок не было.
+        assert "ООО Ромашка" in page.inner_text("#clients-body"), who
+        assert "покупок не было" in page.inner_text("#clients-body"), who
         tab(page, "limits")
         page.wait_for_selector("#clients-body :text('Пока нет клиентов')")
+        assert "Нет доступа" not in page.inner_text("#content"), who
+
+        go(page, "leads")
+        page.wait_for_selector('.seg-item[data-sect="funnel"]')
+        assert _sect_tabs(page) == ["funnel", "list", "channel"], who
+        assert page.inner_text("#greeting") == "Обращения · Воронка", who
+        settled(page)
+        assert "Обращений пока нет" in page.inner_text("#leads-body"), who
+        tab(page, "list")
+        page.wait_for_selector("#call-new")
+        assert page.inner_text("#greeting") == "Обращения · Лиды"
         tab(page, "channel")
-        page.wait_for_selector("#clients-body :text('В канал ещё ничего не уходило')")
-        assert "Канал не настроен" in page.inner_text("#clients-body")
+        page.wait_for_selector("#leads-body :text('В канал ещё ничего не уходило')")
+        assert "Канал не настроен" in page.inner_text("#leads-body")
         assert "Нет доступа" not in page.inner_text("#content"), who
 
     mgr = open_app(e2e.ids["mgr"])
     go(mgr, "clients")
-    mgr.wait_for_selector("#call-new")
+    mgr.wait_for_selector("#buyers-search")
     settled(mgr)
-    # Одна вкладка — переключатель не рисуется, воронки/лимитов/канала нет.
+    # Одна вкладка — переключатель не рисуется, лимитов нет.
     assert mgr.locator(".seg-item[data-sect]").count() == 0
     assert mgr.inner_text("#greeting") == "Клиенты"
     assert mgr.locator("#open-rates").count() == 0
-    # Старый адрес «Лимиты» (из бота/закладок) у менеджера ведёт в «Лиды», а не в 403.
-    mgr.evaluate("showScreen('limits')")
+    go(mgr, "leads")
     mgr.wait_for_selector("#call-new")
+    settled(mgr)
+    assert mgr.locator(".seg-item[data-sect]").count() == 0
+    assert mgr.inner_text("#greeting") == "Обращения"
+    # Старый адрес «Лимиты» (из бота/закладок) у менеджера ведёт в список
+    # клиентов, а не в 403.
+    mgr.evaluate("showScreen('limits')")
+    mgr.wait_for_selector("#buyers-search")
     settled(mgr)
     assert "Нет доступа" not in mgr.inner_text("#content")
     assert mgr.locator("#open-rates, [data-sect='limits']").count() == 0
@@ -509,6 +529,7 @@ def test_clients_tabs_follow_role(open_app, e2e):
     for who in ("keeper", "book"):
         page = open_app(e2e.ids[who])
         assert "clients" not in _nav(page), who
+        assert "leads" not in _nav(page), who
 
 
 # ─── «Клиенты» → «Воронка» ───────────────────────────────────────────────────
@@ -528,9 +549,9 @@ def test_funnel_shows_first_touch_speed_awaiting_and_managers(open_app, e2e):
     waiting = _lead(e2e, 620_004, "Висит Давно", inbound_at=_stamp(hours=13))
 
     boss = open_app(e2e.ids["boss"])
-    go(boss, "clients")
+    go(boss, "leads")
     boss.wait_for_selector(".section-label:has-text('Воронка обращений')")
-    text = _text(boss, "#clients-body").lower()  # подписи разделов — капсом (CSS)
+    text = _text(boss, "#leads-body").lower()  # подписи разделов — капсом (CSS)
     assert "клиент написал сам" in text and "написали мы первыми" in text
     assert "скорость ответа" in text and "обычно отвечаем за" in text
     assert "по менеджерам" in text and "manager2" in text
@@ -538,11 +559,11 @@ def test_funnel_shows_first_touch_speed_awaiting_and_managers(open_app, e2e):
     row2 = boss.locator(".c-row:has(.card-row-title:text-is('Manager2'))")
     assert row2.locator(".card-row-value").inner_text() == "100%"
     boss.wait_for_selector(".section-label:has-text('Ждут ответа · 1')")
-    boss.click(f'#clients-body [data-lead="{waiting}"]')
+    boss.click(f'#leads-body [data-lead="{waiting}"]')
     boss.wait_for_selector(".editor-title:has-text('Висит Давно')")
     assert "ждёт ответа" in boss.inner_text("#content")
     _back(boss)
-    _wait_screen(boss, "clients", "funnel")
+    _wait_screen(boss, "leads", "funnel")
     boss.wait_for_selector(".section-label:has-text('Воронка обращений')")
 
 
@@ -559,7 +580,7 @@ def test_leads_list_filters_by_outcome_and_state(open_app, e2e):
     _set_lead_status(e2e, lost, "lost")
 
     boss = open_app(e2e.ids["boss"])
-    go(boss, "clients")
+    go(boss, "leads")
     tab(boss, "list")
     boss.wait_for_selector('[data-lfilter="all"].active')
     assert _lead_ids(boss) == {fresh, waiting, silent, won, lost}
@@ -580,7 +601,7 @@ def test_leads_list_filters_by_outcome_and_state(open_app, e2e):
     assert pick("data-lstate", "silent") == {silent}
     # Два отбора складываются: «купил» и «замолчал» одновременно — никого.
     assert pick("data-lfilter", "won") == set()
-    assert "По этому отбору никого" in boss.inner_text("#clients-body")
+    assert "По этому отбору никого" in boss.inner_text("#leads-body")
     assert pick("data-lstate", "") == {won}
 
 
@@ -590,12 +611,12 @@ def test_manager_lead_list_is_scoped_to_own_leads(open_app, e2e):
     other = _lead(e2e, 640_002, "Чужой Клиент", manager=MGR2)
 
     mgr = open_app(e2e.ids["mgr"])
-    go(mgr, "clients")
+    go(mgr, "leads")
     mgr.wait_for_selector(f'[data-lead="{mine}"]')
     assert _lead_ids(mgr) == {mine}
 
     boss = open_app(e2e.ids["boss"])
-    go(boss, "clients")
+    go(boss, "leads")
     tab(boss, "list")
     boss.wait_for_selector(f'[data-lead="{other}"]')
     assert _lead_ids(boss) == {mine, other}
@@ -608,11 +629,11 @@ def test_unlinked_call_is_deleted(open_app, e2e):
     drop = e2e.run(lead_calls.add_call(manager_id=e2e.ids["mgr"], display_name="Ошибся", phone="902220000"))
 
     mgr = open_app(e2e.ids["mgr"])
-    go(mgr, "clients")
+    go(mgr, "leads")
     mgr.wait_for_selector(".section-label:has-text('Звонили, но не пишут · 2')")
     mgr.click(f'[data-call-del="{drop["call_id"]}"]')
     mgr.wait_for_selector(".section-label:has-text('Звонили, но не пишут · 1')")
-    assert "Ошибся" not in mgr.inner_text("#clients-body")
+    assert "Ошибся" not in mgr.inner_text("#leads-body")
     assert [r["id"] for r in e2e.rows("SELECT id FROM lead_calls")] == [keep["call_id"]]
 
 
@@ -625,9 +646,9 @@ def test_unlinked_call_is_linked_to_lead(open_app, e2e):
                                        phone="+998 90 555-44-33", interest="Инвертор"))
 
     mgr = open_app(e2e.ids["mgr"])
-    go(mgr, "clients")
+    go(mgr, "leads")
     mgr.wait_for_selector(f'[data-call-link="{call["call_id"]}"]')
-    assert "Инвертор" in mgr.inner_text("#clients-body")
+    assert "Инвертор" in mgr.inner_text("#leads-body")
     mgr.click(f'[data-call-link="{call["call_id"]}"]')
     mgr.wait_for_selector(".c-overlay .c-sheet-title:has-text('Чей это звонок')")
     assert mgr.input_value("#ms-f-search") == "Азиз"
@@ -768,7 +789,7 @@ def test_create_new_counterparty_from_lead_and_empty_name_error(open_app, e2e):
 
     # Безымянный собеседник и пустое поле: завести «ничто» нельзя.
     _back(mgr)
-    _wait_screen(mgr, "clients")
+    _wait_screen(mgr, "leads")
     mgr.wait_for_selector(f'[data-lead="{nameless}"]')
     mgr.click(f'[data-lead="{nameless}"]')
     mgr.click("#lead-agent")
@@ -787,13 +808,13 @@ def test_back_from_lead_card_opened_from_list_returns_to_list(open_app, e2e):
     """
     lead_id = _lead(e2e, 695_001, "Из списка")
     boss = open_app(e2e.ids["boss"])
-    go(boss, "clients")
+    go(boss, "leads")
     tab(boss, "list")
     boss.wait_for_selector(f'[data-lead="{lead_id}"]')
     boss.click(f'[data-lead="{lead_id}"]')
     boss.wait_for_selector("#lead-agent")
     _back(boss)
-    _wait_screen(boss, "clients")
+    _wait_screen(boss, "leads")
     boss.wait_for_selector(".seg-item.active[data-sect]")
     assert boss.evaluate("document.querySelector('.seg-item.active[data-sect]').dataset.sect") == "list"
 
@@ -861,11 +882,14 @@ def test_agent_card_expands_orders_shipments_and_limit_edit_guards(open_app, e2e
     text = _text(boss)
     assert "+998901234567" in text
     # Неподтверждённая оплата долг не гасит; лимит по умолчанию — из настроек.
-    assert "Долг по заказам бота: 400 USD · лимит 2 000 · свободно 1 600" in text
     low = text.lower()  # подписи разделов — капсом (CSS)
-    assert "покупки · 2 отгрузки · 400 usd" in low
+    assert "должен сейчас" in low and "400 USD" in text
+    assert "лимит" in low and "2 000 USD" in text and "1 600 USD" in text
+    # Три вопроса владельца: сколько купил, когда отгружали, сколько отдал.
+    assert "сколько купил" in low and "купил за всё время" in low
+    assert "отгрузок" in low and "когда отгружали" in low
     assert "заказы в боте · 2" in low
-    assert "платежи · 1" in low and "Платёж · 200 USD" in text and "ожидает" in text
+    assert "как платил · 1" in low and "Платёж · 200 USD" in text and "ожидает" in text
 
     # Состав заказа уже в ответе — раскрывается и сворачивается без запроса.
     row = boss.locator(f'[data-order-open="{credit["order_id"]}"]')
@@ -905,7 +929,8 @@ def test_agent_card_expands_orders_shipments_and_limit_edit_guards(open_app, e2e
         {"limit_amount_cents": 25000, "set_by": e2e.ids["boss"]}
     ]
     boss.wait_for_function(
-        "() => /лимит 250 · свободно .?150/.test(document.querySelector('#content').textContent)"
+        "() => /250 USD/.test(document.querySelector('#content').textContent)"
+        " && /150 USD/.test(document.querySelector('#content').textContent)"
     )
 
     _back(boss)
@@ -923,10 +948,10 @@ def test_channel_history_shows_post_and_effect(open_app, e2e):
     _lead(e2e, 700_001, "Пришёл после поста")  # first_seen ≥ posted_at
 
     boss = open_app(e2e.ids["boss"])
-    go(boss, "clients")
+    go(boss, "leads")
     tab(boss, "channel")
-    boss.wait_for_selector("#clients-body .card-row-title:has-text('Товар')")
-    text = _text(boss, "#clients-body")
+    boss.wait_for_selector("#leads-body .card-row-title:has-text('Товар')")
+    text = _text(boss, "#leads-body")
     assert "🛒 Товар" in text and "Кабель ВВГ 3x2.5" in text
     assert "за 24 ч после поста — 1 обращение · обычно 0/день" in text
     assert "Канал не настроен" in text, "без CHANNEL_ID публикация выключена — и это сказано"

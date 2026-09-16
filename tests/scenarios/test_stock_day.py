@@ -129,9 +129,11 @@ def test_writeoff_and_inventory_count_day(world):
 
     from_count = [x for x in f.writeoffs(w, f.BOSS) if x["count_id"] == cid]
     assert {x["kind"] for x in from_count} == {"writeoff", "surplus"}
-    from services import inventory
+    # Причина строк пересчёта — одна на обе стороны, обычными словами
+    # (`inventory.COUNT_REASON`): владелец читает журнал сам.
+    from services.inventory import COUNT_REASON
 
-    assert all(x["reason"] == inventory.COUNT_REASON for x in from_count)
+    assert all(x["reason"] == COUNT_REASON for x in from_count)
 
     # 4. Списание — не продажа: в отчёте продаж его нет.
     report = w.call(f.BOSS, "/api/analytics", period="year")

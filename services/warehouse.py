@@ -1531,22 +1531,105 @@ async def sales_stats(since, until=None) -> dict:
     }
 
 
+# Сколько всего купил — считается по ВСЕМ подтверждённым расходным накладным
+# клиента, а не по той горсти, что показана в карточке. Раньше `total_cents`
+# был суммой последних `limit` отгрузок и складывал разные валюты в одно
+# число: владелец спрашивал «на какую общую сумму он покупал», а видел итог
+# двадцати последних накладных в чужой валюте. Теперь итог — отдельная
+# агрегация с GROUP BY currency (складывать USD и UZS нельзя) плюс перевод в
+# базовую для сортировки списка.
+_PURCHASE_TOTALS_SQL = (
+    "SELECT i.currency AS currency, SUM(i.total_amount_cents) AS sum_cents, "
+    "COUNT(*) AS cnt, MAX(i.invoice_date) AS last_date "
+    "FROM invoices i WHERE i.counterparty_id = $1 AND i.type = 'outgoing' "
+    f"AND i.status = 'confirmed' AND {not_writeoff_sql('i')} "
+    "GROUP BY i.currency"
+)
+
+# «За период» в карточке — последние 12 месяцев. Год, а не месяц: продают
+# технику и партии товара, и за месяц у половины клиентов было бы «0».
+PURCHASES_PERIOD_DAYS = 365
+
+
+def purchases_base_total(by_currency: list[dict]) -> tuple[int, bool]:
+    """Итог покупок в БАЗОВОЙ валюте (копейки) + признак «посчитано не всё».
+
+    Валюта без заданного курса в итог не попадает (`convert_to_base` отдаёт
+    None намеренно) — про это и говорит второй элемент: показать «1 200 USD»
+    вместо «1 200 USD + сколько-то сумов» честнее, чем умножить на 1.0.
+    """
+    total = 0
+    partial = False
+    for row in by_currency:
+        major = float(money.from_cents(int(row["amount_cents"] or 0)))
+        conv = _db.convert_to_base(major, row["currency"])
+        if conv is None:
+            partial = True
+            continue
+        total += money.to_cents(conv)
+    return int(total), partial
+
+
 async def counterparty_purchases(counterparty_id, limit: int = 20) -> dict:
-    """Покупки контрагента: топ товаров и последние отгрузки. Для карточки клиента."""
+    """Покупки контрагента для карточки клиента.
+
+    Отвечает на три вопроса владельца разом: сколько всего купил
+    (`total_by_currency` за всё время + `period_by_currency` за последние
+    `PURCHASES_PERIOD_DAYS` дней), когда отгружали (`recent` с номером, датой,
+    валютой и суммой; `last_date` — последняя) и что берёт (`top_products`).
+    """
+    empty = {
+        "top_products": [], "recent": [], "count": 0, "last_date": None,
+        "total_by_currency": [], "period_by_currency": [],
+        "total_base_cents": 0, "total_base_partial": False,
+        "period_days": PURCHASES_PERIOD_DAYS,
+    }
     try:
         cid = int(counterparty_id)
     except (TypeError, ValueError):
-        return {"top_products": [], "recent": [], "total_cents": 0, "count": 0}
+        return empty
+
+    totals = await adb_core.fetch(_PURCHASE_TOTALS_SQL, cid)
+    if not totals:
+        return empty
+    base = _base_currency()
+    by_currency = sorted(
+        (
+            {"currency": (t["currency"] or base).upper(), "amount_cents": int(t["sum_cents"] or 0)}
+            for t in totals
+        ),
+        key=lambda d: d["amount_cents"],
+        reverse=True,
+    )
+    count = sum(int(t["cnt"] or 0) for t in totals)
+    last_date = max((t["last_date"] or "") for t in totals) or None
+    base_total, base_partial = purchases_base_total(by_currency)
+
+    since = (datetime.now() - timedelta(days=PURCHASES_PERIOD_DAYS)).strftime("%Y-%m-%d")
+    period = await adb_core.fetch(
+        "SELECT i.currency AS currency, SUM(i.total_amount_cents) AS sum_cents, COUNT(*) AS cnt "
+        "FROM invoices i WHERE i.counterparty_id = $1 AND i.type = 'outgoing' "
+        f"AND i.status = 'confirmed' AND {not_writeoff_sql('i')} AND i.invoice_date >= $2 "
+        "GROUP BY i.currency",
+        cid, since,
+    )
+    period_by_currency = sorted(
+        (
+            {"currency": (p["currency"] or base).upper(), "amount_cents": int(p["sum_cents"] or 0)}
+            for p in period
+        ),
+        key=lambda d: d["amount_cents"],
+        reverse=True,
+    )
 
     rows = await adb_core.fetch(
-        "SELECT id, invoice_number, invoice_date, currency, total_amount_cents "
-        "FROM invoices WHERE counterparty_id = $1 AND type = 'outgoing' "
-        "AND status = 'confirmed' ORDER BY invoice_date DESC, id DESC LIMIT $2",
+        "SELECT i.id, i.invoice_number, i.invoice_date, i.currency, i.total_amount_cents "
+        "FROM invoices i WHERE i.counterparty_id = $1 AND i.type = 'outgoing' "
+        f"AND i.status = 'confirmed' AND {not_writeoff_sql('i')} "
+        "ORDER BY i.invoice_date DESC, i.id DESC LIMIT $2",
         cid,
         max(1, min(int(limit or 20), 200)),
     )
-    if not rows:
-        return {"top_products": [], "recent": [], "total_cents": 0, "count": 0}
 
     ids = [int(r["id"]) for r in rows]
     placeholders = ", ".join(f"${i + 1}" for i in range(len(ids)))
@@ -1555,7 +1638,7 @@ async def counterparty_purchases(counterparty_id, limit: int = 20) -> dict:
         f"FROM invoice_items ii JOIN products p ON p.id = ii.product_id "
         f"WHERE ii.invoice_id IN ({placeholders})",
         *ids,
-    )
+    ) if ids else []
     agg: dict[str, dict] = {}
     for pos in positions:
         name = pos["name"] or "—"
@@ -1572,13 +1655,18 @@ async def counterparty_purchases(counterparty_id, limit: int = 20) -> dict:
                 "id": int(r["id"]),
                 "number": r["invoice_number"],
                 "date": r["invoice_date"],
-                "currency": r["currency"],
+                "currency": (r["currency"] or base).upper(),
                 "sum_cents": int(r["total_amount_cents"] or 0),
             }
-            for r in rows[:10]
+            for r in rows
         ],
-        "total_cents": sum(int(r["total_amount_cents"] or 0) for r in rows),
-        "count": len(rows),
+        "count": count,
+        "last_date": last_date,
+        "total_by_currency": by_currency,
+        "period_by_currency": period_by_currency,
+        "total_base_cents": base_total,
+        "total_base_partial": base_partial,
+        "period_days": PURCHASES_PERIOD_DAYS,
     }
 
 

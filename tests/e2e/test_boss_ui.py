@@ -79,9 +79,10 @@ def test_boss_sees_exactly_the_new_bar_drawer_and_no_worker_buttons(open_app, e2
     seeded = seed_order(e2e, qty=1, price=40.0)            # одобрен, «Отгрузить» у склада
     boss = open_app(e2e.ids["boss"])
     settled(boss)
-    assert _bar(boss) == ["today", "decisions", "money", "sales"]
+    assert _bar(boss) == ["today", "decisions", "money", "sales", "clients"]
     assert boss.locator('#bottom-nav [data-action="menu"]').count() == 1
-    assert nav_screens(boss) == ["today", "decisions", "money", "sales", "stock", "clients", "settings"]
+    assert nav_screens(boss) == ["today", "decisions", "money", "sales", "clients",
+                                 "stock", "leads", "settings"]
     _shot(boss, "boss-today")
 
     _open_menu(boss)
@@ -90,7 +91,9 @@ def test_boss_sees_exactly_the_new_bar_drawer_and_no_worker_buttons(open_app, e2
     assert _drawer_tabs(boss, "money") == ["debts", "reconcile", "report"]
     assert _drawer_tabs(boss, "sales") == ["orders", "report"]
     assert _drawer_tabs(boss, "stock") == ["catalog", "containers", "machines"]
-    assert _drawer_tabs(boss, "clients") == ["funnel", "limits"]
+    assert _drawer_tabs(boss, "clients") == ["buyers", "limits"]
+    # «Обращения» без «Рабочих действий» — одна «Воронка», подпунктов нет.
+    assert _drawer_tabs(boss, "leads") == []
     switch = boss.locator("#nav-drawer [data-work-switch]")
     assert switch.get_attribute("aria-checked") == "false"
     boss.wait_for_timeout(350)
@@ -125,7 +128,7 @@ def test_boss_sees_exactly_the_new_bar_drawer_and_no_worker_buttons(open_app, e2
 
     go(boss, "clients")
     settled(boss)
-    assert _seg_tabs(boss) == ["funnel", "limits"]
+    assert _seg_tabs(boss) == ["buyers", "limits"]
 
     go(boss, "settings")
     settled(boss)
@@ -146,7 +149,8 @@ def test_switch_on_shows_worker_actions_and_survives_reopen(open_app, e2e):
     # Вкладки в шторке сразу поменялись.
     boss.wait_for_selector('#nav-drawer .nav-link--tab[data-screen="stock"][data-tab="invoices"]')
     assert _drawer_tabs(boss, "money") == ["debts", "ops", "reconcile", "report"]
-    assert _drawer_tabs(boss, "clients") == ["funnel", "list", "limits", "channel"]
+    assert _drawer_tabs(boss, "clients") == ["buyers", "limits"]
+    assert _drawer_tabs(boss, "leads") == ["funnel", "list", "channel"]
     assert _drawer_tabs(boss, "sales") == ["orders", "report", "docs"]
     boss.wait_for_timeout(350)
     _shot(boss, "boss-drawer-work-on")
@@ -293,8 +297,10 @@ def test_manager_ui_is_unchanged(open_app, e2e):
     seeded = seed_order(e2e, qty=1, price=40.0)
     mgr = open_app(e2e.ids["mgr"])
     settled(mgr)
-    assert _bar(mgr) == ["today", "sales", "stock", "money"]
-    assert nav_screens(mgr) == ["today", "sales", "stock", "money", "clients"]
+    # «Клиенты» — пятой кнопкой панели (решение владельца: список покупателей
+    # в одно касание); «Обращения» — в шторке.
+    assert _bar(mgr) == ["today", "sales", "stock", "money", "clients"]
+    assert nav_screens(mgr) == ["today", "sales", "stock", "money", "clients", "leads"]
     _open_menu(mgr)
     assert mgr.locator("#nav-drawer [data-work-switch]").count() == 0
     assert _drawer_tabs(mgr, "money") == ["confirm", "debts", "ops", "reconcile"]

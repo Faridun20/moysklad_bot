@@ -523,6 +523,8 @@ def test_manager_writes_off_two_units_with_a_reason(open_app, e2e):
     _pick_product(mgr, e2e.ids["product"])
     mgr.wait_for_selector("#ms-f-quantity")
     mgr.fill("#ms-f-quantity", "2")
+    # Быстрые причины переписаны обычными словами («разбили» вместо «боя»):
+    # владелец читает эту ленту сам и спросил, что такое «бой».
     mgr.click('.c-overlay .seg-item[data-opt="разбили"]')
     mgr.fill("#ms-f-note", "уронили при разгрузке")
     mgr.click("#ms-submit")
@@ -599,7 +601,7 @@ def test_manager_runs_a_count_and_applies_deltas(open_app, e2e):
     kinds = {r["kind"]: r for r in e2e.rows(
         "SELECT kind, reason, count_id FROM stock_writeoffs WHERE count_id IS NOT NULL")}
     assert set(kinds) == {"writeoff", "surplus"}
-    from services import inventory
+    from services.inventory import COUNT_REASON
 
-    assert all(r["reason"] == inventory.COUNT_REASON for r in kinds.values())
+    assert all(r["reason"] == COUNT_REASON for r in kinds.values())
     assert e2e.rows("SELECT status FROM stock_counts ORDER BY id DESC")[0]["status"] == "applied"

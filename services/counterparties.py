@@ -254,3 +254,152 @@ async def get_telegram_ids(counterparty_ids: list[int]) -> dict[int, int]:
         *ids,
     )
     return {int(r["id"]): int(r["telegram_id"]) for r in rows}
+
+
+# ─── Список покупателей («Клиенты» в WebApp) ─────────────────────────────────
+#
+# Жалоба владельца: «Я нигде не нашёл, где можно посмотреть клиентов. Сколько
+# отдано, когда была проведена отгрузка, на какую общую сумму он покупал». Все
+# три цифры в базе были — но добраться до них можно было только через лупу,
+# зная имя наизусть: раздел «Клиенты» был про ЛИДОВ (воронка, обращения), а
+# списка ПОКУПАТЕЛЕЙ не было нигде.
+#
+# Поэтому здесь — одна строка на покупателя: сколько купил за всё время
+# (по валютам, складывать USD и UZS нельзя), сколько должен сейчас и когда
+# отгружали в последний раз.
+#
+# Ни одного запроса на клиента: справочник, покупки и долги считаются тремя
+# групповыми выборками (`get_credit_overview` внутри себя — ещё несколько), а
+# склейка идёт в Python. N+1 здесь означал бы сотни запросов на открытие
+# первого же экрана раздела.
+
+# Потолок скана справочника. Считаем ПОСЛЕ агрегации (сортировка по долгу и
+# дате отгрузки, а не по имени), поэтому взять «первые N по алфавиту» нельзя —
+# берём всех и режем уже отсортированных. Тысячи строк по три колонки дешевле
+# одного лишнего round-trip, но неограниченного скана в коде быть не должно.
+_BUYERS_SCAN_MAX = 5000
+
+
+def _buyers_sort_key_name(row: dict) -> str:
+    return str(row.get("name") or "").casefold()
+
+
+async def buyers_list(query: str | None = None, limit: int = 100) -> dict:
+    """Покупатели с итогами: `{clients, total, shown, base_currency}`.
+
+    `query` — имя или телефон (та же пара условий, что в `search`).
+    Порядок: сначала должники (кто больше должен — выше), за ними остальные по
+    дате последней отгрузки. Это ответ на «с кем разбираться»: список, ровный
+    по алфавиту, заставлял бы искать должника глазами, а он и есть причина, по
+    которой карточку открывают.
+
+    Контрагент без отгрузок и без долга из списка НЕ выпадает — он просто в
+    конце. Справочник и есть список клиентов, и «его тут нет» читалось бы как
+    «его не завели».
+    """
+    from services.database import convert_to_base, get_credit_overview
+
+    limit = max(1, min(int(limit or 100), 500))
+    text = (query or "").strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    name_like = adb_core.name_search_sql("name")
+    args: list = []
+    cond = ""
+    if text and len(digits) >= 4:
+        args += [f"%{digits}%", adb_core.name_search_param(text)]
+        cond = f" AND ({_PHONE_DIGITS} LIKE $1 OR {name_like} LIKE $2)"
+    elif text:
+        args.append(adb_core.name_search_param(text))
+        cond = f" AND {name_like} LIKE $1"
+    args.append(_BUYERS_SCAN_MAX)
+    # Тип берём НЕ фильтром SQL: поставщик, которому однажды продали, — тоже
+    # покупатель, и отсутствие его в поиске читалось бы как «его не завели».
+    # Строка остаётся, если это `customer` ИЛИ на него есть заказы (проверка
+    # ниже, когда известен overview).
+    cp_rows = await adb_core.fetch(
+        f"SELECT id, name, phone, type FROM counterparties WHERE 1 = 1{cond} "
+        f"ORDER BY id LIMIT ${len(args)}",
+        *args,
+    )
+
+    # Покупки — один GROUP BY по всем расходным накладным (списания не в счёт:
+    # это не продажа). Валюты не складываем.
+    from services.warehouse import not_writeoff_sql
+
+    buys = await adb_core.fetch(
+        "SELECT i.counterparty_id AS cid, i.currency AS currency, "
+        "SUM(i.total_amount_cents) AS sum_cents, COUNT(*) AS cnt, "
+        "MAX(i.invoice_date) AS last_date "
+        "FROM invoices i WHERE i.type = 'outgoing' AND i.status = 'confirmed' "
+        f"AND i.counterparty_id IS NOT NULL AND {not_writeoff_sql('i')} "
+        "GROUP BY i.counterparty_id, i.currency"
+    )
+    bought: dict[str, dict] = {}
+    for b in buys:
+        cid = str(b["cid"])
+        d = bought.setdefault(cid, {"by_currency": {}, "count": 0, "last": ""})
+        cur = (b["currency"] or "").upper() or "USD"
+        d["by_currency"][cur] = d["by_currency"].get(cur, 0) + int(b["sum_cents"] or 0)
+        d["count"] += int(b["cnt"] or 0)
+        d["last"] = max(d["last"], str(b["last_date"] or ""))
+
+    # Долг — та же батч-формула, что у `/api/debts` и карточки клиента
+    # (`get_agent_current_debt`): второго ответа на «сколько должен» быть не
+    # должно, иначе список и карточка разойдутся на копейку и доверия не будет.
+    overview = {str(r["agent_id"]): r for r in await get_credit_overview()}
+
+    from config import BASE_CURRENCY
+
+    base_cur = (BASE_CURRENCY or "USD").upper()
+
+    def _row(agent_id: str, name: str, phone: str) -> dict:
+        buy = bought.get(agent_id) or {"by_currency": {}, "count": 0, "last": ""}
+        ov = overview.get(agent_id) or {}
+        by_cur = [
+            {"currency": c, "amount_cents": v}
+            for c, v in sorted(buy["by_currency"].items(), key=lambda kv: kv[1], reverse=True)
+        ]
+        base_total = 0.0
+        for item in by_cur:
+            conv = convert_to_base(float(money.from_cents(item["amount_cents"])), item["currency"])
+            if conv is not None:
+                base_total += conv
+        return {
+            "agent_id": agent_id,
+            "name": name,
+            "phone": phone or "",
+            "bought_by_currency": by_cur,
+            "bought_base": round(base_total, 2),
+            "shipments": buy["count"],
+            "last_shipment": buy["last"] or None,
+            "debt": float(ov.get("debt") or 0.0),
+            "debt_by_currency": ov.get("debt_by_currency") or [],
+            "limit": float(ov.get("limit") or 0.0),
+            "over_limit": bool(ov.get("over_limit")),
+        }
+
+    out = [
+        _row(str(c["id"]), c["name"] or "—", c.get("phone") or "")
+        for c in cp_rows
+        if (c.get("type") or "customer") == "customer" or str(c["id"]) in overview
+    ]
+    # Агент с заказами, которого нет в справочнике как `customer` (старый
+    # uuid МойСклад, контрагент с типом supplier, которому всё же продали):
+    # имя берём из заказа. Пропустить его значило бы спрятать живой долг.
+    known = {r["agent_id"] for r in out}
+    if not text:
+        for aid, ov in overview.items():
+            if aid not in known:
+                out.append(_row(aid, str(ov.get("agent_name") or aid), ""))
+
+    # Стабильные сортировки от младшего ключа к старшему: имя → дата отгрузки →
+    # долг. Так «сначала должники» не ломает порядок внутри групп.
+    out.sort(key=_buyers_sort_key_name)
+    out.sort(key=lambda r: str(r["last_shipment"] or ""), reverse=True)
+    out.sort(key=lambda r: (0 if r["debt"] > 0 else 1, -r["debt"]))
+    return {
+        "clients": out[:limit],
+        "total": len(out),
+        "shown": min(len(out), limit),
+        "base_currency": base_cur,
+    }

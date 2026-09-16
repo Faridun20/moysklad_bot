@@ -524,7 +524,37 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
             page.locator("#content [data-agent]").first.click()
             audit.check("limit-edit")
 
+    # «Клиенты» — список ПОКУПАТЕЛЕЙ (длинные имена из засева) и карточка
+    # клиента: три блока итогов, отгрузки с номерами и лента платежей. Это и
+    # есть то, ради чего раздел заводился, — меряем обязательно.
     go(page, "clients")
+    audit.idle()
+    # Обход выше побывал на «Лимитах» — вкладка раздела запоминается.
+    if page.locator('.seg-item[data-sect="buyers"]').count():
+        tab(page, "buyers")
+        audit.idle()
+    page.wait_for_selector("#buyers-search")
+    audit.check("clients-list")
+    page.fill("#buyers-search", "Самарканд")
+    page.wait_for_timeout(500)
+    audit.idle()
+    audit.check("clients-list-search")
+    page.fill("#buyers-search", "")
+    page.wait_for_timeout(500)
+    audit.idle()
+    if page.locator("#content [data-client]").count():
+        page.locator("#content [data-client]").first.click()
+        page.wait_for_selector("#content .editor-title")
+        audit.check("client-card")
+        # Отгрузка раскрывается в состав — второй экран той же карточки.
+        ship = page.locator("#content [data-shipment]").first
+        if ship.count():
+            ship.click()
+            page.wait_for_selector("#content .items-row, #content .order-item")
+            audit.check("client-card-shipment")
+
+    # «Обращения»: лиды и карточка лида.
+    go(page, "leads")
     audit.idle()
     if page.locator('.seg-item[data-sect="list"]').count():
         tab(page, "list")
@@ -551,6 +581,59 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
 
     assert audit.screens >= 20, f"обход прошёл подозрительно мало экранов: {audit.screens}"
     assert not audit.issues, "Вёрстка:\n" + "\n".join(audit.issues)
+
+
+# ─── Нижняя панель из шести кнопок: подписи не режутся ──────────────────────
+
+_NAV_LABELS_CHECK_JS = """
+() => {
+  const out = [];
+  const items = [...document.querySelectorAll('#bottom-nav .nav-item')];
+  const nav = document.getElementById('bottom-nav').getBoundingClientRect();
+  let prev = null;
+  for (const el of items) {
+    const label = el.querySelector('.nav-label');
+    const key = el.dataset.screen || el.dataset.action || '?';
+    // Подпись под многоточием: у .nav-label стоит text-overflow: ellipsis,
+    // и «Клиенты» превратились бы в «Клие…» молча.
+    if (label && label.scrollWidth > label.clientWidth + 1) {
+      out.push(`clipped: ${key} «${label.textContent}» (${label.scrollWidth} > ${label.clientWidth})`);
+    }
+    const r = el.getBoundingClientRect();
+    if (r.left < nav.left - 1 || r.right > nav.right + 1) out.push(`overflow: ${key}`);
+    // Ряд не переносится на вторую строку: у всех кнопок один верх.
+    if (prev && Math.abs(prev.top - r.top) > 1) out.push(`wrapped: ${key}`);
+    // Зона тапа не меньше 44px (правило дизайн-системы).
+    if (r.height < 43) out.push(`too-short: ${key} (${Math.round(r.height)}px)`);
+    prev = r;
+  }
+  return { out, count: items.length,
+           keys: items.map(e => e.dataset.screen || e.dataset.action) };
+}
+"""
+
+
+@pytest.mark.parametrize("width", [360, 390, 412], ids=["360", "390", "412"])
+@pytest.mark.parametrize("role", ["mgr", "boss"])
+def test_bottom_nav_labels_are_not_clipped(phone, e2e, no_rate_limit, role, width):
+    """Шесть кнопок в панели — «Клиенты» одним касанием (решение владельца).
+
+    До этой задачи в панели было четыре раздела и «Меню»; «Клиенты» уезжали в
+    шторку, и списка покупателей человек не находил вовсе. Пятый раздел в ряду
+    стоит денег: на 360px каждой кнопке достаётся ~53px, а подпись «Клиенты»
+    при 10px и `text-overflow: ellipsis` обрезалась бы МОЛЧА — «Клие…»
+    читается как сбой, а не как раздел. Поэтому меряем сам ряд: подписи целые,
+    ряд не переносится, кнопки в рамке панели и не ниже 44px.
+    """
+    page = phone(e2e.ids[role], theme="dark", width=width, height=800)
+    page.wait_for_selector("#bottom-nav .nav-item")
+    res = page.evaluate(_NAV_LABELS_CHECK_JS)
+    expected = (["today", "sales", "stock", "money", "clients", "menu"] if role == "mgr"
+                else ["today", "decisions", "money", "sales", "clients", "menu"])
+    assert res["keys"] == expected
+    assert res["count"] == 6
+    assert not res["out"], f"Нижняя панель ({role}, {width}px):\n" + "\n".join(res["out"])
+    _shot(page, f"nav-{role}-{width}")
 
 
 # ─── D3 (продуктовый аудит): бейдж счётчика не режет подпись вкладки ─────────
@@ -592,7 +675,7 @@ def test_confirm_badge_does_not_clip_tab_label(phone, e2e, tmp_path, no_rate_lim
     называет конкретно эту вкладку и не требует, чтобы бейдж реально был
     показан. Здесь — узкая, целевая регресс-проверка именно по описанию бага:
     на 360/390px, с РЕАЛЬНО показанным бейджем счётчика («Подтвердить N»), у
-    КАЖДОГО ряда вкладок «Деньги»/«Продажи»/«Склад»/«Клиенты» подпись активной
+    КАЖДОГО ряда вкладок «Деньги»/«Продажи»/«Склад»/«Клиенты»/«Обращения» подпись активной
     (и любой другой видимой) вкладки не обрезана, и бейдж не вылезает за
     рамку вкладки (не наезжает на подпись/соседей).
     """
@@ -601,7 +684,7 @@ def test_confirm_badge_does_not_clip_tab_label(phone, e2e, tmp_path, no_rate_lim
 
     saw_badge = False
     issues: list[str] = []
-    for screen in ("money", "sales", "stock", "clients"):
+    for screen in ("money", "sales", "stock", "clients", "leads"):
         go(page, screen)
         settled(page)
         tabs = page.eval_on_selector_all(

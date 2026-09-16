@@ -91,7 +91,13 @@ def test_clients_detail_boss(isolated_db, monkeypatch):
     assert body["phone"] == "+7"
     assert len(body["orders"]) == 1 and body["orders"][0]["total_cents"] == 20000
     assert body["purchases"]["top_products"][0]["name"] == "Товар"
-    assert body["purchases"]["total_cents"] == 50000
+    # «Сколько всего купил» — по ВСЕМ накладным и раздельно по валютам: раньше
+    # здесь стояла сумма последних двадцати, сложенная через валюты.
+    assert body["purchases"]["total_by_currency"] == [{"currency": "USD", "amount_cents": 50000}]
+    assert body["purchases"]["total_base_cents"] == 50000
+    assert body["purchases"]["count"] == 1
+    assert body["purchases"]["last_date"]
+    assert body["purchases"]["recent"][0]["number"]
 
 
 def test_clients_detail_allowed_for_manager(isolated_db, monkeypatch):

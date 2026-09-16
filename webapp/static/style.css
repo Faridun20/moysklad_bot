@@ -2214,6 +2214,37 @@ body.nav-drawer-open { overflow: hidden; }
    была без правила и печаталась основным кеглем, наравне с суммой. */
 .debt-meta { font-size: var(--text-sm); color: var(--text-mute); }
 
+/* ─── Раздел «Клиенты»: список покупателей и итоги карточки ─────────────────
+   Строка списка — «имя / долг · дата отгрузки / сколько купил справа»: три
+   ответа на три вопроса владельца, не открывая карточку. Сумма справа
+   переносится по словам (в карточке их бывает две — «12 500 USD · 3 400 000
+   UZS»), поэтому `white-space` базового .card-row-value здесь снимаем: иначе
+   мультивалютная строка уезжала за край. */
+.c-row[data-client] .card-row-value {
+  white-space: normal;
+  font-size: var(--text-sm);
+  max-width: 45%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+.client-debt { color: var(--danger); font-weight: 600; }
+.client-debt.is-clear { color: var(--text-mute); font-weight: 400; }
+
+/* Итоги карточки клиента: «подпись — значение» в две колонки, значение
+   прижато вправо и переносится (мультивалютный итог длиннее подписи). */
+.client-totals { display: flex; flex-direction: column; gap: var(--sp-2); }
+.client-total {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  font-size: var(--text-sm);
+  color: var(--text-mute);
+}
+.client-total b { color: var(--text); text-align: right; font-size: 15px; }
+
 /* ─── Partial-оплата (input + кнопка в ряд) ────────────────────── */
 .pay-input-row {
   display: flex; gap: 8px; align-items: stretch; margin-top: 8px;
