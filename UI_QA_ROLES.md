@@ -25,13 +25,13 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 207._
+_Всего эндпоинтов: 208._
 
 
 > **Временное совмещение ролей** (`services/roles.py::ROLE_ALSO_ACTS_AS`): `manager` = + `warehouse_keeper`, `bookkeeper`. Кладовщика и бухгалтера в штате пока нет, их работу делает менеджер; списки ниже уже учитывают это. Роли `warehouse_keeper`/`bookkeeper` через `/addrole` не назначаются. `*` в таблице экранов — доступ через совмещение.
 
 
-### Админ (`admin`) — 183 эндпоинтов
+### Админ (`admin`) — 184 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -143,6 +143,7 @@ _Всего эндпоинтов: 207._
 - `/api/orders/payment_context`
 - `/api/orders/photo_delete`
 - `/api/orders/photo_upload`
+- `/api/orders/price_hint`
 - `/api/orders/reject_payment`
 - `/api/orders/remove_item`
 - `/api/orders/requests`
@@ -222,7 +223,7 @@ _Всего эндпоинтов: 207._
 </details>
 
 
-### Руководитель (`boss`) — 180 эндпоинтов
+### Руководитель (`boss`) — 181 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -334,6 +335,7 @@ _Всего эндпоинтов: 207._
 - `/api/orders/payment_context`
 - `/api/orders/photo_delete`
 - `/api/orders/photo_upload`
+- `/api/orders/price_hint`
 - `/api/orders/reject_payment`
 - `/api/orders/remove_item`
 - `/api/orders/requests`
@@ -410,7 +412,7 @@ _Всего эндпоинтов: 207._
 </details>
 
 
-### Менеджер (`manager`) — 126 эндпоинтов
+### Менеджер (`manager`) — 127 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -490,6 +492,7 @@ _Всего эндпоинтов: 207._
 - `/api/orders/payment_context`
 - `/api/orders/photo_delete`
 - `/api/orders/photo_upload`
+- `/api/orders/price_hint`
 - `/api/orders/reject_payment`
 - `/api/orders/remove_item`
 - `/api/orders/set_agent`
