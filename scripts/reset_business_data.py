@@ -15,6 +15,7 @@ Postgres (на SQLite сбрасывать нечего — там тестов�
     python -m scripts.reset_business_data --apply \\
         --i-understand-this-deletes-everything \\
         --backup /backups/all_2026-09-20_07-00.sql.gz       # свежий бэкап обязателен
+        [--restart-ids]                                     # id с 1 — см. «СЧЁТЧИКИ»
 
 Что делает --apply (ОДНОЙ транзакцией — упало что угодно, не удалено ничего):
     1. Проверки ДО транзакции: флаг-подтверждение; бэкап существует, не пустой,
@@ -111,6 +112,10 @@ Postgres (на SQLite сбрасывать нечего — там тестов�
   одобрило бы НОВУЮ заявку с тем же номером. С продолжением нумерации старая
   кнопка честно отвечает «не найдено». Цена — номер первого нового заказа не
   «#1», а продолжение (косметика).
+* `--restart-ids` — ОСОЗНАННО начать id стираемых таблиц с 1 (`setval(…, 1,
+  false)` в той же транзакции). Только если старых карточек с кнопками в чатах
+  нет или их не жалко: план dry-run перечисляет последовательности и где они
+  сейчас, чтобы решение принималось по цифрам, а не наугад.
 
 Код возврата: 0 — dry-run прошёл / сброс выполнен; 1 — отказ проверки или
 ошибка (при --apply в базе ничего не изменилось); 2 — не Postgres.
@@ -288,6 +293,8 @@ class Plan:
     bad_links: list[str] = field(default_factory=list)      # сохраняемая → стираемая
     users: list[dict] = field(default_factory=list)
     other_sessions: list[dict] = field(default_factory=list)
+    # id-последовательность стираемой таблицы → (таблица, последнее выданное значение)
+    sequences: dict[str, tuple[str, int | None]] = field(default_factory=dict)
 
     @property
     def total_rows(self) -> int:
@@ -322,6 +329,30 @@ def _foreign_keys(cur) -> list[tuple[str, str, str]]:
             "WHERE c.contype = 'f' AND n.nspname = current_schema()",
         )
     ]
+
+
+def _sequences(cur, tables: set[str]) -> dict[str, tuple[str, int | None]]:
+    """SERIAL/IDENTITY-последовательности, принадлежащие стираемым таблицам.
+
+    Владение — из `pg_depend` (auto/internal зависимость колонки), а не из
+    имени `<таблица>_id_seq`: переименование или IDENTITY имя не сохраняют.
+    """
+    rows = _rows(
+        cur,
+        "SELECT s.relname AS seq, t.relname AS tbl, ps.last_value "
+        "FROM pg_class s "
+        "JOIN pg_namespace n ON n.oid = s.relnamespace AND n.nspname = current_schema() "
+        "JOIN pg_depend d ON d.objid = s.oid AND d.classid = 'pg_class'::regclass "
+        "     AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i') "
+        "JOIN pg_class t ON t.oid = d.refobjid "
+        "LEFT JOIN pg_sequences ps ON ps.schemaname = n.nspname AND ps.sequencename = s.relname "
+        "WHERE s.relkind = 'S' ORDER BY s.relname",
+    )
+    return {
+        r["seq"]: (r["tbl"], None if r["last_value"] is None else int(r["last_value"]))
+        for r in rows
+        if r["tbl"] in tables
+    }
 
 
 def delete_order(tables: set[str], fks: list[tuple[str, str, str]]) -> list[str]:
@@ -402,6 +433,7 @@ def build_plan(cur) -> Plan:
         bad_links=bad_links,
         users=users,
         other_sessions=sessions,
+        sequences=_sequences(cur, wipe),
     )
 
 
@@ -494,8 +526,12 @@ def refusals(plan: Plan, *, ignore_sessions: bool = False) -> list[str]:
 # ─── Выполнение ───────────────────────────────────────────────────────────────
 
 
-def apply_reset(conn, *, backup_note: str, ignore_sessions: bool = False) -> dict:
+def apply_reset(
+    conn, *, backup_note: str, ignore_sessions: bool = False, restart_ids: bool = False
+) -> dict:
     """Стереть бизнес-данные ОДНОЙ транзакцией. Возвращает {таблица: удалено}.
+
+    `restart_ids` — id стираемых таблиц начнутся с 1 (см. «СЧЁТЧИКИ» в шапке).
 
     План пересчитывается внутри транзакции после блокировок: счётчики dry-run
     могли устареть, а удаляется ровно то, что видно под замком.
@@ -524,6 +560,10 @@ def apply_reset(conn, *, backup_note: str, ignore_sessions: bool = False) -> dic
                 f"DELETE FROM {SETTINGS_TABLE} WHERE key = ANY(%s)", (plan.settings_delete,)
             )
             deleted[SETTINGS_TABLE] = max(int(cur.rowcount or 0), 0)
+        if restart_ids:
+            # setval, а не ALTER SEQUENCE: транзакционно откатывается вместе с DELETE.
+            for seq in plan.sequences:
+                cur.execute("SELECT setval(quote_ident(%s)::regclass, 1, false)", (seq,))
 
         leftovers = {t: n for t in plan.delete_order if (n := _count(cur, t))}
         if leftovers:
@@ -548,6 +588,7 @@ def apply_reset(conn, *, backup_note: str, ignore_sessions: bool = False) -> dic
                 "tables": {t: n for t, n in deleted.items() if n},
                 "kept": plan.keep_counts,
                 "settings_kept": plan.settings_keep,
+                "ids_restarted": restart_ids,
             },
             ensure_ascii=False,
         )
@@ -599,6 +640,13 @@ def print_plan(plan: Plan) -> None:
             "  %s  %s  %s%s", u["user_id"], u.get("role"), u.get("full_name") or "—",
             "  (деактивирован)" if u.get("deactivated_at") else "",
         )
+    moved = {s: v for s, v in plan.sequences.items() if v[1] is not None}
+    logger.info(
+        "══ id-последовательности стираемых таблиц: %d (выдавали id: %d) ══",
+        len(plan.sequences), len(moved),
+    )
+    for table, last in moved.values():
+        logger.info("  %-*s последний id %s", width, table, last)
     if plan.missing:
         logger.info("Нет в этой базе (пропускаются): %s", ", ".join(plan.missing))
     logger.info(
@@ -617,6 +665,9 @@ def main(argv: list[str]) -> int:
     p.add_argument("--backup", help="путь к свежему бэкапу (pg_dumpall .sql.gz), обязателен для --apply")
     p.add_argument("--backup-max-age-hours", type=float, default=DEFAULT_BACKUP_MAX_AGE_HOURS,
                    help=f"насколько свежим должен быть бэкап (по умолчанию {DEFAULT_BACKUP_MAX_AGE_HOURS:g} ч)")
+    p.add_argument("--restart-ids", action="store_true",
+                   help="начать id стираемых таблиц с 1 (по умолчанию нумерация продолжается: "
+                        "id сидят в кнопках уже отправленных Telegram-карточек)")
     p.add_argument("--ignore-active-connections", action="store_true",
                    help="не отказывать, если к базе подключены другие клиенты (только для репетиции)")
     args = p.parse_args(argv)
@@ -653,6 +704,12 @@ def main(argv: list[str]) -> int:
         return 1
 
     print_plan(plan)
+    logger.info(
+        "id после сброса: %s",
+        "НАЧНУТСЯ С 1 (--restart-ids) — кнопки старых карточек в чатах укажут на НОВЫЕ записи"
+        if args.restart_ids
+        else "продолжат нумерацию (старые кнопки ответят «не найдено»); с 1 — --restart-ids",
+    )
     problems = refusals(plan, ignore_sessions=args.ignore_active_connections)
 
     if not args.apply:
@@ -678,7 +735,8 @@ def main(argv: list[str]) -> int:
     try:
         with db.get_conn() as conn:
             deleted = apply_reset(
-                conn, backup_note=backup_note, ignore_sessions=args.ignore_active_connections
+                conn, backup_note=backup_note, ignore_sessions=args.ignore_active_connections,
+                restart_ids=args.restart_ids,
             )
     except ResetRefused as e:
         logger.error("ОТКАЗ (база не менялась): %s", e)

@@ -268,6 +268,32 @@ def test_reset_on_prod_like_db_keeps_employees_and_wipes_business(pg_db):
 
 
 @needs_pg
+def test_restart_ids_is_opt_in_and_starts_wiped_tables_from_one(pg_db, caplog):
+    """По умолчанию id продолжаются (см. тест выше); `--restart-ids` начинает
+    стираемые таблицы с 1 в той же транзакции. Сотрудники и их данные не
+    трогаются, план dry-run показывает, где последовательности сейчас."""
+    db = pg_db
+    _prod_like(db)
+    _drop_async_pool()
+    with db.get_conn() as conn:
+        plan = rbd.build_plan(db.get_cursor(conn))
+        conn.rollback()
+    tables = {t for t, _ in plan.sequences.values()}
+    assert {"orders", "payments", "invoices", "audit_log"} <= tables
+    assert not tables & (set(rbd.KEEP) | {rbd.SETTINGS_TABLE}), "чужие последовательности не трогаем"
+    assert plan.sequences["orders_id_seq"][1] >= 1
+    caplog.set_level("INFO", logger="reset_business_data")
+    rbd.print_plan(plan)
+    assert "id-последовательности стираемых таблиц" in caplog.text
+
+    with db.get_conn() as conn:
+        rbd.apply_reset(conn, backup_note="test", ignore_sessions=True, restart_ids=True)
+    assert db.create_order(MGR, "Manager", "") == 1
+    # Запись о сбросе встала в audit_log ДО нового id — она и есть первая строка.
+    assert _count(db, "audit_log", f"id = 1 AND action = '{rbd.AUDIT_ACTION}'") == 1
+
+
+@needs_pg
 def test_failure_mid_delete_rolls_back_everything(pg_db):
     db = pg_db
     _prod_like(db)
