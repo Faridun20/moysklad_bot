@@ -1494,7 +1494,7 @@ describe('шесть разделов: пять в панели и «Меню»'
     const drawer = Array.from(
       window.document.querySelectorAll('#nav-drawer .nav-link--section'),
     ).map(b => b.dataset.screen);
-    expect(drawer).toEqual(['today', 'sales', 'stock', 'money', 'clients', 'leads']);
+    expect(drawer).toEqual(['today', 'sales', 'stock', 'money', 'clients', 'leads', 'settings']);
     // Выключатель «Рабочие действия» менеджеру не рисуется.
     expect(window.document.querySelector('#nav-drawer [data-work-switch]')).toBeNull();
   });
@@ -3902,6 +3902,63 @@ describe('выключатель «Рабочие действия» и «Нас
     expect(c.querySelector('[data-delete-switch]').getAttribute('aria-checked')).toBe('false');
   });
 
+  it('«Настройки» менеджера — только «Реквизиты компании», форма по группам с примерами', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      buildNav();
+      window.__calls = [];
+      const meta = {
+        company: { company_name: 'Импекс', company_tin: '' }, can_edit_company: true,
+        company_missing: ['ИНН', 'МФО'],
+        company_form: [
+          { key: 'company', title: 'Компания', fields: [
+            { key: 'company_name', label: 'Полное наименование', placeholder: 'ООО «FARID IMPEKS»', hint: '' },
+            { key: 'company_tin', label: 'ИНН', placeholder: '301234567', hint: '9 цифр' }] },
+          { key: 'bank', title: 'Банк', fields: [
+            { key: 'company_bank_mfo', label: 'МФО банка', placeholder: '01088', hint: '5 цифр' }] },
+        ],
+      };
+      api = async (p) => (p === '/api/docs/types' ? meta : {});
+      apiResult = async (p, body) => { window.__calls.push([p, body]); return { ok: true, status: 200, body: { ok: true } }; };
+      window.__ready = showScreen('settings');
+    `);
+    await window.__ready;
+    const c = window.document.getElementById('content');
+    expect(c.querySelector('[data-work-switch]')).toBeNull();
+    expect(c.querySelector('[data-delete-switch]')).toBeNull();
+    expect(c.querySelector('#set-rates')).toBeNull();
+    expect(c.querySelector('#set-company').textContent).toContain('не заполнено: ИНН, МФО');
+    c.querySelector('#set-company').click();
+    const sheet = window.document.querySelector('.c-overlay');
+    const labels = Array.from(sheet.querySelectorAll('.section-label')).map(e => e.textContent);
+    expect(labels).toEqual(['Компания', 'Банк']);
+    expect(sheet.querySelector('#ms-f-company_tin').getAttribute('placeholder')).toBe('301234567');
+    sheet.querySelector('#ms-f-company_tin').value = '301234567';
+    sheet.querySelector('#ms-submit').click();
+    await tick(); await tick();
+    expect(window.__calls[0][0]).toBe('/api/docs/company/set');
+    expect(window.__calls[0][1].company).toEqual(
+      { company_name: 'Импекс', company_tin: '301234567', company_bank_mfo: '' });
+  });
+
+  it('«Реквизиты компании» при живом руководителе — только посмотреть', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      const meta = {
+        company: { company_name: 'Импекс' }, can_edit_company: false,
+        company_edit_hint: 'Меняет руководитель: Пётр', company_missing: [],
+        company_form: [{ key: 'company', title: 'Компания', fields: [
+          { key: 'company_name', label: 'Полное наименование', placeholder: 'ООО', hint: '' }] }],
+      };
+      window.__ready = Promise.resolve(openCompanyForm(meta));
+    `);
+    await window.__ready;
+    const sheet = window.document.querySelector('.c-overlay');
+    expect(sheet.querySelector('#ms-submit')).toBeNull();
+    expect(sheet.querySelector('#ms-f-company_name').hasAttribute('readonly')).toBe(true);
+    expect(sheet.textContent).toContain('Меняет руководитель: Пётр');
+  });
+
   it('«Настройки»: «Удаление — только руководитель» — запрос на сервер, флаг в currentUser', async () => {
     const window = boot(`
       currentUser = { role: 'boss', delete_requires_boss: false };
@@ -4419,7 +4476,7 @@ describe('карточка заказа: кнопка «Счёт»', () => {
     await window.__ready;
     const sheet = window.document.querySelector('.c-overlay');
     const text = sheet.textContent;
-    expect(text).toContain('Счёт № 31 от 16.09.2026');
+    expect(text).toContain('Счёт на оплату № 31 от 16.09.2026');
     expect(text).toContain('ООО Ромашка');
     expect(text).toContain('Болт М8');
     expect(text).toContain('одна тысяча один');
@@ -4432,7 +4489,40 @@ describe('карточка заказа: кнопка «Счёт»', () => {
     expect(window.__calls.map(c => c[0])).toEqual([
       '/api/orders/invoice', '/api/orders/invoice/print',
     ]);
-    expect(window.__calls[1][1]).toEqual({ order_id: 31 });
+    // Язык не пришёл с сервера — по умолчанию рус + узб.
+    expect(window.__calls[1][1]).toEqual({ order_id: 31, lang: 'ru_uz' });
+  });
+
+  it('язык выбирается сегментом, запомненный стоит первым выбором; нехватку реквизитов лист называет', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      window.__calls = [];
+      apiResult = async (path, body) => {
+        window.__calls.push([path, body]);
+        if (path === '/api/orders/invoice') return { ok: true, status: 200, error: '', body: {
+          can_print: true, doc_lang: 'ru', can_edit_company: true,
+          langs: [{ key: 'ru_uz', label: 'Рус + Узб' }, { key: 'ru', label: 'Рус' }, { key: 'uz', label: 'Узб' }],
+          invoice: {
+            order_id: 31, number: '31', date: '16.09.2026', currency: 'UZS', client_name: 'Азиз',
+            total_cents: 100000, total_words: 'одна тысяча сум', lines: [],
+            requisites_missing: 'Заполните МФО в Настройки → Реквизиты компании — без этого не выписать счёт на оплату',
+          },
+        } };
+        return { ok: true, status: 200, error: '', body: { ok: true, message: 'Отправлено на печать' } };
+      };
+      window.__ready = openSalesInvoiceSheet(31);
+    `);
+    await window.__ready;
+    const sheet = window.document.querySelector('.c-overlay');
+    const active = () => sheet.querySelector('.doc-lang .seg-item.active').dataset.lang;
+    expect(active()).toBe('ru');
+    expect(sheet.querySelector('#si-missing').textContent).toContain('Заполните МФО в Настройки → Реквизиты компании');
+    expect(sheet.querySelector('#si-requisites')).not.toBeNull();
+    sheet.querySelector('.doc-lang [data-lang="uz"]').click();
+    expect(active()).toBe('uz');
+    sheet.querySelector('#si-print').click();
+    await tick();
+    expect(window.__calls[1]).toEqual(['/api/orders/invoice/print', { order_id: 31, lang: 'uz' }]);
   });
 
   it('без принтера кнопки печати нет вовсе — только «Отправить PDF»', async () => {

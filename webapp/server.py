@@ -9246,8 +9246,16 @@ async def _company_edit_rights(user_id: int) -> dict:
 def _company_payload(company: dict) -> dict:
     from services import requisites
 
+    missing: list[str] = []
+    for doc in ("sales_invoice", "raspiska"):
+        for f in requisites.missing_for(company, doc):
+            if f.short not in missing:
+                missing.append(f.short)
     return {
         "company": company,
+        # Чего не хватает хоть одному документу — строка «Настроек» говорит это
+        # сразу, не дожидаясь отказа при печати.
+        "company_missing": missing,
         # Плоский список (ключ, подпись) — прежний формат; `company_form` —
         # форма по группам с примерами заполнения.
         "company_fields": [{"key": f.key, "label": f.label} for f in requisites.COMPANY_FIELDS],

@@ -3370,6 +3370,11 @@ function openCounterpartyForm(prefill, onDone) {
         hint: 'Необязательно, но по нему потом ищут' },
       { key: 'type', label: 'Кто это', type: 'select', value: 'customer',
         options: [['customer', 'Клиент'], ['supplier', 'Поставщик']] },
+      // Для счёта на оплату и товарной накладной; пусто — в бумаге черта.
+      { key: 'tin', label: 'ИНН / ПИНФЛ', placeholder: '301234567', inputmode: 'numeric',
+        hint: 'Необязательно. ИНН — 9 цифр, ПИНФЛ — 14. Печатается в счёте на оплату' },
+      { key: 'address', label: 'Адрес', placeholder: 'г. Самарканд, ул. Регистан, 1',
+        hint: 'Необязательно. Печатается в счёте и накладной' },
     ],
     submitLabel: 'Завести',
     onSubmit: async (data, { showErr }) => {
@@ -4099,15 +4104,20 @@ function mountPageSheet(ov) {
 // сделка, подтверждение): поведение оболочки — Esc, ловушка Tab, аппаратная
 // «назад», возврат фокуса — писать четыре раза значит забыть его в одном месте.
 // Образец — openPriceEditor, но там оно вшито в конкретную форму.
-function openMachineSheet({ title, fields, submitLabel, hint, onSubmit }) {
+function openMachineSheet({ title, fields, submitLabel, hint, onSubmit, readOnly }) {
   haptic('light');
   const trigger = document.activeElement;
   const prevBack = _backHandler;
   const ov = document.createElement('div');
   ov.className = 'c-overlay';
+  // `type: 'section'` — подзаголовок группы полей (форма реквизитов: Компания /
+  // Банк / Подписи …); в данные формы не попадает.
+  const isInput = (f) => f.type !== 'section';
   const fieldHtml = (f) => {
+    if (!isInput(f)) return `<div class="section-label">${escapeHtml(f.label)}</div>`;
     const id = `ms-f-${f.key}`;
-    const common = `id="${id}" name="${escapeHtml(f.key)}"`;
+    // readOnly — посмотреть без права изменить (реквизиты при живом руководителе).
+    const common = `id="${id}" name="${escapeHtml(f.key)}"${readOnly ? ' readonly' : ''}`;
     // У сегмента, в отличие от нативного `<select>`, «ничего не выбрано» —
     // законное состояние разметки: кнопки просто не подсвечены. Поле при этом
     // уходит пустым, и обязательный выбор отвечает «Заполните: …», хотя
@@ -4145,8 +4155,8 @@ function openMachineSheet({ title, fields, submitLabel, hint, onSubmit }) {
       ${(fields || []).map(fieldHtml).join('')}
       <div class="c-error" id="ms-error" hidden></div>
       <div class="c-actions c-actions--stack">
-        <button class="btn-primary" id="ms-submit">${escapeHtml(submitLabel || 'Сохранить')}</button>
-        <button class="btn-secondary" id="ms-cancel">Отмена</button>
+        ${readOnly ? '' : `<button class="btn-primary" id="ms-submit">${escapeHtml(submitLabel || 'Сохранить')}</button>`}
+        <button class="btn-secondary" id="ms-cancel">${readOnly ? 'Закрыть' : 'Отмена'}</button>
       </div>
     </div>`;
   document.body.appendChild(ov);
@@ -4200,17 +4210,17 @@ function openMachineSheet({ title, fields, submitLabel, hint, onSubmit }) {
   };
   const values = () => {
     const out = {};
-    for (const f of fields || []) {
+    for (const f of (fields || []).filter(isInput)) {
       const el = ov.querySelector(`#ms-f-${f.key}`);
       out[f.key] = el ? el.value.trim() : '';
     }
     return out;
   };
   const submitBtn = ov.querySelector('#ms-submit');
-  submitBtn.addEventListener('click', async () => {
+  submitBtn?.addEventListener('click', async () => {
     if (submitBtn.disabled) return;
     const data = values();
-    const missing = (fields || []).find(f => f.required && !data[f.key]);
+    const missing = (fields || []).filter(isInput).find(f => f.required && !data[f.key]);
     if (missing) { showErr(`Заполните: ${missing.label}`); return; }
     submitBtn.disabled = true;
     showErr('');
@@ -5143,7 +5153,7 @@ function renderOrdersMain(opts = {}) {
         <div class="order-timeline" id="order-timeline-${o.id}" hidden></div>
         ${salesInvoiceAvailable(o, { role, work: workActionsVisible() }) ? `
           <div class="draft-actions">
-            <button class="btn-secondary btn-sales-invoice" data-id="${o.id}">${icon('list')} Счёт</button>
+            <button class="btn-secondary btn-sales-invoice" data-id="${o.id}">${icon('list')} Счёт на оплату</button>
           </div>
         ` : ''}
         ${o.status === 'draft' && !isBoss ? `
@@ -5321,7 +5331,7 @@ function renderOrdersMain(opts = {}) {
     });
   });
 
-  // «Счёт» — бумага клиенту ДО отгрузки. Ничего не двигает: ни остатка, ни
+  // «Счёт на оплату» — бумага клиенту ДО отгрузки. Ничего не двигает: ни остатка, ни
   // долга, ни статуса заказа (services/sales_invoice.py).
   document.querySelectorAll('.btn-sales-invoice').forEach(btn => {
     btn.addEventListener('click', (e) => {
@@ -5419,7 +5429,7 @@ async function openOrderTimeline(orderId) {
 }
 
 
-// ─── «Счёт» клиенту (services/sales_invoice.py) ─────────────────────────────
+// ─── «Счёт на оплату» клиенту (services/sales_invoice.py) ───────────────────
 //
 // Документ, которого раньше не было: печатная форма появлялась только ПОСЛЕ
 // отгрузки, и клиенту нечего было показать, пока товар не уехал. Счёт — это
@@ -5430,7 +5440,42 @@ async function openOrderTimeline(orderId) {
 //
 // Лист сначала показывает, ЧТО напечатается (номер, дата, клиент, позиции,
 // итог прописью), и только потом даёт кнопки: печать без предпросмотра — это
-// бумага наугад.
+// бумага наугад. Язык бумаги — сегментом над кнопками (рус + узб / рус / узб);
+// выбранный запоминает сервер при печати/отправке, и в следующий раз лист
+// открывается на нём. Не хватает реквизитов компании — лист говорит, каких, и
+// ведёт в «Настройки → Реквизиты компании».
+
+// Сегмент языка документа. Значение — в `data-doc-lang` обёртки: его читают
+// кнопки печати и отправки, отдельного состояния нет.
+function docLangSegHtml(langs, current) {
+  const list = (langs && langs.length) ? langs
+    : [{ key: 'ru_uz', label: 'Рус + Узб' }, { key: 'ru', label: 'Рус' }, { key: 'uz', label: 'Узб' }];
+  const cur = list.some(l => l.key === current) ? current : list[0].key;
+  return `<div class="doc-lang" data-doc-lang="${escapeHtml(cur)}">
+    <div class="section-label">Язык документа</div>
+    <div class="seg-row"><div class="seg" role="radiogroup" aria-label="Язык документа">${list.map(l =>
+      `<button type="button" class="seg-item ${l.key === cur ? 'active' : ''}" data-lang="${escapeHtml(l.key)}"`
+      + ` role="radio" aria-checked="${l.key === cur}">${escapeHtml(l.label)}</button>`).join('')}</div></div>
+  </div>`;
+}
+
+function wireDocLangSeg(root) {
+  const box = root.querySelector('.doc-lang');
+  if (!box) return () => undefined;
+  box.querySelectorAll('.seg-item[data-lang]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      haptic('light');
+      box.dataset.docLang = btn.dataset.lang;
+      box.querySelectorAll('.seg-item[data-lang]').forEach(b => {
+        const on = b === btn;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-checked', String(on));
+      });
+    });
+  });
+  return () => box.dataset.docLang;
+}
+
 async function openSalesInvoiceSheet(orderId, trigger) {
   if (trigger) trigger.disabled = true;
   const res = await apiResult('/api/orders/invoice', { order_id: orderId });
@@ -5443,27 +5488,29 @@ async function openSalesInvoiceSheet(orderId, trigger) {
   }
   const doc = res.body.invoice || {};
   const canPrint = !!res.body.can_print;
+  const missing = doc.requisites_missing || '';
   const cur = escapeHtml(doc.currency || '');
   const lines = (doc.lines || []).map(ln =>
     `<div class="order-item-preview">• ${escapeHtml(ln.product_name)} — ${whQty(ln.quantity)} `
     + `${escapeHtml(ln.unit || '')} × ${whMoney(ln.price_cents, '')} = `
     + `<b>${whMoney(ln.amount_cents, '')} ${cur}</b></div>`
   ).join('');
+  let langOf = () => undefined;
 
   const sheet = openMachineSheet({
-    title: `Счёт № ${doc.number} от ${doc.date}`,
+    title: `Счёт на оплату № ${doc.number} от ${doc.date}`,
     hint: `${doc.client_name || ''}${doc.client_phone ? ' · ' + doc.client_phone : ''}`.trim(),
     fields: [],
     submitLabel: 'Отправить PDF',
     onSubmit: async (_data, ctx) => {
-      const r = await apiResult('/api/orders/invoice/send', { order_id: orderId },
+      const r = await apiResult('/api/orders/invoice/send', { order_id: orderId, lang: langOf() },
                                 { timeoutMs: LONG_TIMEOUT_MS });
       if (!r.ok || !r.body.ok) {
         ctx.showErr((r.body && r.body.error) || r.error);
         return false;
       }
       haptic('success');
-      toast('Счёт отправлен вам в Telegram — перешлите его клиенту');
+      toast('Счёт на оплату отправлен вам в Telegram — перешлите его клиенту');
       return true;
     },
   });
@@ -5476,13 +5523,26 @@ async function openSalesInvoiceSheet(orderId, trigger) {
     <div class="wh-total">Итого: ${whMoney(doc.total_cents, doc.currency || '')}
       <div class="c-field-hint">${escapeHtml(doc.total_words || '')}</div>
     </div>
+    ${missing ? `<div class="c-error" id="si-missing">${escapeHtml(missing)}</div>
+      <div class="c-actions"><button type="button" class="btn-secondary" id="si-requisites">${icon('building')} Реквизиты компании</button></div>` : ''}
+    ${docLangSegHtml(res.body.langs, res.body.doc_lang)}
     ${canPrint ? `<div class="c-actions"><button type="button" class="btn-secondary" id="si-print">${icon('list')} Распечатать</button></div>` : ''}
     <div class="c-field-hint">Счёт ничего не списывает и не меняет долг — это документ для клиента.</div>`;
   sheet.sheet.querySelector('#ms-error').before(box);
+  langOf = wireDocLangSeg(box);
   // Печати нет на сервере — кнопки нет вовсе (правило `printing.is_available`):
   // кнопка, которая гарантированно ответит отказом, хуже отсутствующей.
   box.querySelector('#si-print')?.addEventListener('click', (ev) => {
-    printViaCups('/api/orders/invoice/print', { order_id: orderId }, ev.currentTarget);
+    printViaCups('/api/orders/invoice/print', { order_id: orderId, lang: langOf() }, ev.currentTarget);
+  });
+  box.querySelector('#si-requisites')?.addEventListener('click', async () => {
+    sheet.close();
+    try {
+      const meta = await api('/api/docs/types', {});
+      openCompanyForm(meta, () => openSalesInvoiceSheet(orderId));
+    } catch (e) {
+      toast(e.message, 'error');
+    }
   });
 }
 
@@ -5569,7 +5629,7 @@ async function openOrderEditor(orderId) {
   // (заводит черновик, ставит клиента, добавляет позиции), а человек
   // возвращается в него не только кнопкой «Назад» (она кэш сбрасывает сама),
   // но и кнопкой раздела в панели — и видел заказ таким, каким тот был ДО
-  // правки: без позиций, без клиента, а значит и без кнопки «Счёт».
+  // правки: без позиций, без клиента, а значит и без кнопки «Счёт на оплату».
   ordersData = null;
 
   renderOrderEditor();
@@ -6640,10 +6700,7 @@ async function renderSettingsScreen() {
   }
   if (gen !== screenGen()) return;
   const box = document.getElementById('content');
-  const company = (meta && meta.company) || {};
-  const companySub = company.company_name
-    ? `${company.company_name}${company.company_city ? ' · ' + company.company_city : ''}`
-    : 'Не заполнены — нужны для расписок';
+  const companySub = companyRowSub(meta);
   const row = (id, ic, title, sub) => `
       <div class="c-row c-row--tap" id="${id}" role="button" tabindex="0">
         <div class="card-row-icon">${icon(ic)}</div>
@@ -6652,6 +6709,24 @@ async function renderSettingsScreen() {
           <div class="card-row-sub">${escapeHtml(sub)}</div>
         </div>
       </div>`;
+  // Менеджеру «Настройки» — только «Реквизиты компании»: владелец работает
+  // менеджером и не мог их найти. Править — пока руководителя в системе нет
+  // (сервер: `_company_edit_rights`), иначе — посмотреть.
+  if (!isBossRole()) {
+    box.innerHTML = `
+      <div class="section-label">Компания</div>
+      <div class="c-surface c-surface--list">
+        ${meta ? row('set-company', 'building', 'Реквизиты компании', companySub) : ''}
+      </div>
+      ${meta ? '' : errorBoxHtml('Реквизиты не загрузились — обновите экран')}
+      ${meta && !meta.can_edit_company && meta.company_edit_hint
+        ? `<div class="c-field-hint">${escapeHtml(meta.company_edit_hint)}</div>` : ''}`;
+    box.querySelector('#set-company')?.addEventListener('click', () => {
+      haptic('light');
+      openCompanyForm(meta, () => showScreen('settings'));
+    });
+    return;
+  }
   const staffSub = role() === 'admin'
     ? 'Роли и доступ — в боте: /users, /addrole, /deactivate'
     : 'Роли назначает администратор (в боте: /users, /addrole)';
@@ -6664,7 +6739,7 @@ async function renderSettingsScreen() {
     <div class="c-surface c-surface--list">${debtReminderSwitchHtml(!!(currentUser && currentUser.client_debt_reminders_enabled), 'c-row')}</div>
     <div class="section-label">Компания</div>
     <div class="c-surface c-surface--list">
-      ${meta && meta.can_edit_company ? row('set-company', 'building', 'Реквизиты компании', companySub) : ''}
+      ${meta ? row('set-company', 'building', 'Реквизиты компании', companySub) : ''}
       ${row('set-rates', 'cash', 'Курсы валют', 'Курс к базовой валюте — для сводок и оплат')}
       ${typeof payRenderAccountsScreen === 'function'
         ? row('set-pay-accounts', 'card', 'Наши карты и счета', 'Куда клиенты платят картой и перечислением')
@@ -9566,6 +9641,20 @@ async function renderAgentDetail(agentId, opts) {
         </div>
       </div>` : '';
 
+  // Реквизиты клиента для счёта на оплату и товарной накладной: ИНН/ПИНФЛ,
+  // адрес, телефон. Пустое печатается чертой — бумагу дописывают от руки, —
+  // поэтому блок подсказывает, где это заполнить, а не требует.
+  const req = d.requisites || {};
+  const reqBlock = req.editable ? `
+    <div class="section-label">Реквизиты для документов</div>
+    <div class="c-surface c-surface--pad client-totals" id="cl-requisites">
+      <div class="client-total"><span>ИНН / ПИНФЛ</span><b>${escapeHtml(req.tin || '—')}</b></div>
+      <div class="client-total"><span>Адрес</span><b>${escapeHtml(req.address || '—')}</b></div>
+      <div class="client-total"><span>Телефон</span><b>${escapeHtml(d.phone || '—')}</b></div>
+      <div class="c-field-hint">Печатаются в счёте на оплату и товарной накладной. Пусто — в бумаге черта, впишут от руки.</div>
+      <div class="debt-actions"><button class="btn-secondary" id="cl-req-edit">${icon('edit')} Изменить реквизиты</button></div>
+    </div>` : '';
+
   content.innerHTML = `
     <div class="editor-header"><div class="editor-title">${icon('building')} ${escapeHtml(d.name || '—')}</div></div>
     ${d.phone ? `<div class="debt-meta agent-phone">${icon('phone')} ${escapeHtml(d.phone)}</div>` : ''}
@@ -9579,10 +9668,33 @@ async function renderAgentDetail(agentId, opts) {
       ${d.over_limit ? '<div class="stock-badge" data-status="out">лимит превышен</div>' : ''}
       ${limitBlock}
     </div>
+    ${reqBlock}
     ${purBlock}
     ${historyBlock}
     ${ordersBlock}
   `;
+
+  content.querySelector('#cl-req-edit')?.addEventListener('click', () => {
+    openMachineSheet({
+      title: 'Реквизиты клиента',
+      hint: `${d.name || ''} — для счёта на оплату и товарной накладной`,
+      fields: [
+        { key: 'tin', label: 'ИНН / ПИНФЛ', value: req.tin || '', placeholder: '301234567',
+          inputmode: 'numeric', hint: 'ИНН — 9 цифр, ПИНФЛ — 14. Физлицу — ПИНФЛ из паспорта' },
+        { key: 'address', label: 'Адрес', value: req.address || '', placeholder: 'г. Самарканд, ул. Регистан, 1' },
+        { key: 'phone', label: 'Телефон', value: d.phone || '', placeholder: '+998 90 123-45-67' },
+      ],
+      submitLabel: 'Сохранить',
+      onSubmit: async (data, { showErr }) => {
+        const r = await apiResult('/api/clients/requisites/set', { agent_id: d.agent_id, ...data });
+        if (!r.ok) { showErr(r.error); return false; }
+        haptic('success');
+        toast('Реквизиты клиента сохранены');
+        renderAgentDetail(agentId, { back: backTab });
+        return true;
+      },
+    });
+  });
 
   // Раскрытие состава заказа. Данные уже в DOM — только показываем/прячем.
   content.querySelectorAll('[data-order-open]').forEach(row => {
@@ -10473,7 +10585,11 @@ async function renderWhInvoiceList() {
   // его пустит и `delete_requires_boss` выключена (сервер: `_require_delete_right`).
   const canCancel = canCall('/api/wh/invoices/cancel', role()) && deleteActionsVisible();
   const canPrint = !!data.can_print;
-  whFrame(content, newBtn + rows.map(inv => {
+  // Язык товарной накладной — один выбор над списком отгрузок (рус + узб /
+  // рус / узб): «Распечатать» и «Отправить PDF» берут его, сервер запоминает.
+  // У прихода выбора нет — приходная накладная внутренняя, только по-русски.
+  const langSeg = out ? docLangSegHtml(data.langs, data.doc_lang) : '';
+  whFrame(content, newBtn + langSeg + rows.map(inv => {
     const cancelled = inv.status === 'cancelled';
     const isOut = inv.type === 'outgoing';
     // Статус отправки — только у отгрузки: приход клиенту не отсылается.
@@ -10523,6 +10639,7 @@ async function renderWhInvoiceList() {
       </div>`;
   }).join('') + exportRow);
   wireNew();
+  const whLang = wireDocLangSeg(content);
 
   content.querySelectorAll('[data-wh-send]').forEach(btn => {
     btn.addEventListener('click', async () => {
@@ -10532,7 +10649,7 @@ async function renderWhInvoiceList() {
         // force: кнопка видна и для уже отправленных — это осознанная
         // переотправка (клиент потерял файл, сменился телефон).
         const r = await apiResult('/api/wh/invoices/send', {
-          invoice_id: Number(btn.dataset.whSend), force: true,
+          invoice_id: Number(btn.dataset.whSend), force: true, lang: whLang(),
         }, { timeoutMs: LONG_TIMEOUT_MS });
         if (!r.ok) {
           toast(r.body.reason || r.error, 'error');
@@ -10550,7 +10667,7 @@ async function renderWhInvoiceList() {
 
   content.querySelectorAll('[data-wh-print]').forEach(btn => {
     btn.addEventListener('click', () => printViaCups('/api/wh/invoices/print',
-      { invoice_id: Number(btn.dataset.whPrint) }, btn));
+      { invoice_id: Number(btn.dataset.whPrint), lang: whLang() }, btn));
   });
 
   content.querySelectorAll('[data-wh-cancel]').forEach(btn => {
@@ -11015,13 +11132,12 @@ async function renderDocsTab() {
   const canPrint = !!list.can_print;
 
   const company = meta.company || {};
-  const companyLine = company.company_name
-    ? `${escapeHtml(company.company_name)}${company.company_city ? ' · ' + escapeHtml(company.company_city) : ''}`
-    : 'Реквизиты компании не заполнены';
+  const companyLine = `${escapeHtml(company.company_name || '')}${company.company_city ? ' · ' + escapeHtml(company.company_city) : ''}`
+    + ' · реквизиты — Настройки → Реквизиты компании';
   const head = `
     <div class="c-actions">
       <button class="btn-primary" id="doc-new">${icon('plus')} Новый документ</button>
-      ${meta.can_edit_company ? `<button class="btn-secondary" id="doc-company">${icon('building')} Реквизиты</button>` : ''}
+      <button class="btn-secondary" id="doc-company">${icon('building')} Реквизиты компании</button>
     </div>
     <div class="c-field-hint" id="doc-company-line">${companyLine}</div>`;
 
@@ -11062,12 +11178,43 @@ async function renderDocsTab() {
   });
 }
 
+// Подпись строки «Реквизиты компании»: название и чего не хватает документам —
+// «Настройки» говорят это сразу, а не отказом при печати счёта.
+function companyRowSub(meta) {
+  if (!meta) return 'Для счёта на оплату, накладной и расписки';
+  const company = meta.company || {};
+  const missing = meta.company_missing || [];
+  const name = company.company_name || '';
+  if (!missing.length) return `${name}${company.company_tin ? ' · ИНН ' + company.company_tin : ''}`;
+  return `${name ? name + ' · ' : ''}не заполнено: ${missing.join(', ')}`;
+}
+
+// «Настройки → Реквизиты компании»: одна форма по группам (Компания / Банк /
+// Подписи / Счёт на оплату / Расписка), у каждого поля — пример заполнения.
+// Руководство правит всегда, менеджер — пока руководителя в системе нет;
+// иначе форма открывается только для просмотра.
 function openCompanyForm(meta, onDone) {
   const company = meta.company || {};
+  const canEdit = !!meta.can_edit_company;
+  const groups = meta.company_form || [{ title: '', fields: meta.company_fields || [] }];
+  const fields = [];
+  for (const g of groups) {
+    if (g.title) fields.push({ type: 'section', key: `grp-${g.key}`, label: g.title });
+    for (const f of g.fields || []) {
+      fields.push({
+        key: f.key, label: f.label, value: company[f.key] || '',
+        placeholder: f.placeholder || '', hint: f.hint || '',
+        inputmode: f.key === 'invoice_valid_days' ? 'numeric' : '',
+      });
+    }
+  }
   openMachineSheet({
     title: 'Реквизиты компании',
-    hint: 'Кредитор в расписке. Заполняется один раз, форма документа подставит их сама.',
-    fields: (meta.company_fields || []).map(f => ({ key: f.key, label: f.label, value: company[f.key] || '' })),
+    hint: canEdit
+      ? 'Печатаются в счёте на оплату, товарной накладной и расписке. Заполняются один раз.'
+      : (meta.company_edit_hint || 'Меняет руководитель') + ' — здесь можно только посмотреть.',
+    fields,
+    readOnly: !canEdit,
     submitLabel: 'Сохранить',
     onSubmit: async (data, { showErr }) => {
       const res = await apiResult('/api/docs/company/set', { company: data });

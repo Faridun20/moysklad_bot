@@ -160,9 +160,7 @@ def _fake_documents(monkeypatch, tmp_path) -> list[dict]:
 
 _FULL_COMPANY = {
     "company_name": "ООО Тест", "company_tin": "305123456", "company_address": "Самарканд, ул. Регистан 1",
-    "company_representative": "Петров Пётр", "company_city": "Самарканд",
-    "company_position": "Директор", "company_position_uz": "Директор",
-    "company_representative_gen": "директора Петрова Петра", "company_city_uz": "Самарқанд",
+    "company_city": "Самарканд", "company_city_uz": "Самарқанд",
 }
 
 
@@ -1172,7 +1170,7 @@ def _docs(page) -> None:
 
 def test_boss_sets_company_requisites_then_creates_ru_uz_receipt(open_app, e2e, monkeypatch, tmp_path):
     """«Реквизиты» сохраняются в настройки и подставляются в расписку RU+UZ:
-    кредитор, город (и его узбекское название), подписант в родительном падеже."""
+    кредитор, город (и его узбекское название). Подписанта кредитора нет."""
     contexts = _fake_documents(monkeypatch, tmp_path)
     ids = e2e.ids
     boss = open_app(ids["boss"])
@@ -1187,6 +1185,7 @@ def test_boss_sets_company_requisites_then_creates_ru_uz_receipt(open_app, e2e, 
     boss.click("#ms-submit")
     boss.wait_for_selector(".toast:has-text('Реквизиты сохранены')")
     boss.wait_for_selector("#doc-company-line:has-text('ООО Тест · Самарканд')")
+    assert "Настройки → Реквизиты компании" in boss.inner_text("#doc-company-line")
     assert boss.locator(".c-overlay").count() == 0
     for key, value in _FULL_COMPANY.items():
         assert e2e.db.get_setting(key, "") == value, key
@@ -1213,7 +1212,7 @@ def test_boss_sets_company_requisites_then_creates_ru_uz_receipt(open_app, e2e, 
                     "created_by": ids["boss"], "type": "raspiska_ru_uz"}]
     ctx = contexts[-1]
     assert (ctx["creditor_name"], ctx["city"], ctx["city_uz"]) == ("ООО Тест", "Самарканд", "Самарқанд")
-    assert ctx["creditor_representative_gen"] == "директора Петрова Петра"
+    assert not [k for k in ctx if "representative" in k or "position" in k or "basis" in k]
     assert len(ctx["schedule"]) == 12 and ctx["schedule"][-1]["balance"] == "0"
     assert (ctx["total_amount"], ctx["schedule"][0]["amount"]) == ("360 000 000", "30 000 000")
     assert [d["chat_id"] for d in e2e.bot.documents] == [ids["boss"]]

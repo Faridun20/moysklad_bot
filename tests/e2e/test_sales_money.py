@@ -442,11 +442,9 @@ def test_manager_deletes_own_draft(open_app, e2e):
 # ─── Документы: расписка из формы → PDF в Telegram → печать ──────────────────
 
 
-# Реквизиты подписанта печатаются в каждом виде расписки и обязательны.
+# Реквизиты кредитора, которые печатает расписка (подписанта в бланке нет).
 _SIGNATORY = {
     "company_name": "ООО Ромашка", "company_tin": "123456789", "company_address": "Ташкент",
-    "company_representative": "Петров Пётр", "company_position": "Директор",
-    "company_position_uz": "Директор", "company_representative_gen": "директора Петрова Петра",
     "company_city": "Ташкент", "company_city_uz": "Тошкент",
 }
 
@@ -496,8 +494,15 @@ def test_manager_creates_raspiska_and_prints_it(open_app, e2e, monkeypatch, tmp_
     go(mgr, "sales")
     tab(mgr, "docs")
     mgr.wait_for_selector("#doc-new")
-    assert mgr.locator("#doc-company").count() == 0, "реквизиты правит только руководство"
+    # Реквизиты менеджер видит, но при живом руководителе — только посмотреть.
+    mgr.click("#doc-company")
+    mgr.wait_for_selector(".c-overlay #ms-f-company_tin")
+    assert mgr.locator(".c-overlay #ms-submit").count() == 0, "реквизиты правит руководство"
+    assert "Меняет руководитель" in mgr.locator(".c-overlay").last.inner_text()
+    mgr.click(".c-overlay #ms-cancel")
     mgr.click("#doc-new")
+    # Подписанта кредитора форма не спрашивает — расписку пишет должник.
+    assert mgr.locator("#ms-f-company_position, #ms-f-company_representative").count() == 0
     # Тип документа — сегмент, а не нативный `<select>`: значение держит
     # скрытое поле, которое читает общий сбор формы.
     mgr.click('[data-opt="raspiska_ru"]')

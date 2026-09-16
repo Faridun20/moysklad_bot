@@ -131,8 +131,10 @@
       roles: ['admin', 'boss', 'manager'] },
     // Реквизиты компании, курсы, выключатель «Рабочие действия». Только в
     // «Меню»: в панель не попадает (последний в порядке руководителя).
+    // Менеджеру — ради «Реквизитов компании»: владелец работает менеджером и не
+    // мог их найти («Настройки» у него — только эта строка, см. app.js).
     { key: 'settings', label: 'Настройки', icon: 'settings',
-      roles: ['admin', 'boss'] },
+      roles: ['admin', 'boss', 'manager'] },
   ];
 
   // Руководитель смотрит, решает и контролирует (решение владельца), поэтому
@@ -327,7 +329,7 @@
     if (boss && (screen === 'requests' || (screen === 'money' && tab === 'confirm'))) {
       return { screen: 'decisions', tab: '' };
     }
-    if (!boss && (screen === 'decisions' || screen === 'settings')) {
+    if (!boss && (screen === 'decisions' || (screen === 'settings' && role !== 'manager'))) {
       return { screen: 'money', tab: 'confirm' };
     }
     return { screen, tab: tab || '' };
@@ -1398,7 +1400,7 @@
     return `Ждёт одобрения из-за скидки ${Number(d.max_pct)}% (порог ${Number(d.threshold_pct)}%) — решение принимает руководитель.`;
   }
 
-  // ─── «Счёт» клиенту (services/sales_invoice.py) ──────────────────────────
+  // ─── «Счёт на оплату» клиенту (services/sales_invoice.py) ────────────────
   //
   // Бумага, которую менеджер показывает клиенту ДО отгрузки: «вот, вот такая
   // получается». Раньше печатная форма появлялась только ПОСЛЕ отгрузки, и
