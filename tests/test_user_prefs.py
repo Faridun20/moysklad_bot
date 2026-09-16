@@ -42,7 +42,7 @@ def test_me_carries_prefs_with_defaults_off(env):
     client, _db, ids = env
     for who in ("boss", "admin", "mgr"):
         me = _post(client, "/api/me", ids[who]).json()
-        assert me["prefs"] == {"work_actions": False, "work_actions_hint_shown": 0}, who
+        assert me["prefs"] == {"work_actions": False, "work_actions_hint_shown": 0, "doc_lang": "ru_uz"}, who
         # Настройки удаления нет — значит «менеджеру можно» (по умолчанию выкл.).
         assert me["delete_requires_boss"] is False
 
@@ -105,10 +105,25 @@ def test_service_rejects_unknown_key(isolated_db):
 
     with pytest.raises(ValueError):
         user_prefs.set_pref(1, "anything", True)
-    assert user_prefs.get_prefs(1) == {"work_actions": False, "work_actions_hint_shown": 0}
+    assert user_prefs.get_prefs(1) == {"work_actions": False, "work_actions_hint_shown": 0, "doc_lang": "ru_uz"}
     assert user_prefs.set_pref(1, "work_actions", 1) == {
-        "work_actions": True, "work_actions_hint_shown": 0,
+        "work_actions": True, "work_actions_hint_shown": 0, "doc_lang": "ru_uz",
     }
+
+
+def test_doc_lang_is_remembered_only_from_the_list(isolated_db):
+    """Язык печатных форм — последний выбор человека (любой рабочей роли),
+    только `ru_uz`/`ru`/`uz`; мусор не записывается и печать не роняет."""
+    from services import user_prefs
+
+    assert user_prefs.doc_lang(7) == "ru_uz"
+    user_prefs.remember_doc_lang(7, "uz")
+    assert user_prefs.doc_lang(7) == "uz"
+    user_prefs.remember_doc_lang(7, "en")
+    assert user_prefs.doc_lang(7) == "uz"
+    with pytest.raises(ValueError):
+        user_prefs.set_pref(7, "doc_lang", "en")
+    assert user_prefs.applies_to("doc_lang", "manager")
 
 
 def test_work_actions_hint_shown_counter(env):

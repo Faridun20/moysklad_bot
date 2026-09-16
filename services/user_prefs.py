@@ -18,6 +18,12 @@
 (`workActionsHintVisible` в app.js) перестаёт её рисовать при достижении
 предела показов.
 
+Третья — `doc_lang`: язык печатных форм (счёт на оплату, товарная накладная)
+— `ru_uz` / `ru` / `uz`. Выбирают его при печати или отправке, и следующая
+печать предлагает тот же язык одним касанием. Пишут её сами ручки печати
+(`remember_doc_lang`), а не выключатель в «Настройках»: это не решение, а
+последний выбор. Нужна всем, кто печатает, — не только руководству.
+
 Хранится на сервере, а не в localStorage: Telegram WebView хранилище теряет, и
 выключатель (или счётчик показов), который сам собой гаснет, хуже
 отсутствующего.
@@ -35,9 +41,15 @@ logger = logging.getLogger(__name__)
 # Тип значения по умолчанию решает, как его валидирует `/api/prefs/set`
 # (webapp/server.py): bool — переключатель, int — счётчик (0..HINT_MAX_SHOWS
 # у `work_actions_hint_shown`, дальше фронт просто перестаёт слать инкременты).
-PREFS: dict[str, tuple[bool | int, tuple[str, ...]]] = {
+PREFS: dict[str, tuple[bool | int | str, tuple[str, ...]]] = {
     "work_actions": (False, ("admin", "boss")),
     "work_actions_hint_shown": (0, ("admin", "boss")),
+    "doc_lang": ("ru_uz", ("admin", "boss", "manager", "warehouse_keeper", "bookkeeper")),
+}
+
+# Строковые настройки — только из списка: таблица не свалка.
+CHOICES: dict[str, tuple[str, ...]] = {
+    "doc_lang": ("ru_uz", "ru", "uz"),
 }
 
 
@@ -88,6 +100,10 @@ def set_pref(user_id: int, key: str, value) -> dict:
         value = bool(value)
     elif isinstance(default, int):
         value = int(value)
+    elif key in CHOICES:
+        value = str(value)
+        if value not in CHOICES[key]:
+            raise ValueError(f"недопустимое значение {key}: {value!r}")
     with db.get_conn() as conn:
         cur = db.get_cursor(conn)
         cur.execute(
@@ -100,3 +116,23 @@ def set_pref(user_id: int, key: str, value) -> dict:
         )
         conn.commit()
     return get_prefs(user_id)
+
+
+def doc_lang(user_id: int | None) -> str:
+    """Последний выбранный язык печатных форм; нет — «рус + узб»."""
+    if not user_id:
+        return str(PREFS["doc_lang"][0])
+    value = get_prefs(int(user_id)).get("doc_lang")
+    return value if value in CHOICES["doc_lang"] else str(PREFS["doc_lang"][0])
+
+
+def remember_doc_lang(user_id: int | None, lang: str | None) -> None:
+    """Запомнить язык, если он отличается от сохранённого. Не бросает:
+    сбой записи предпочтения не повод отказать в печати."""
+    if not user_id or lang not in CHOICES["doc_lang"]:
+        return
+    try:
+        if doc_lang(user_id) != lang:
+            set_pref(int(user_id), "doc_lang", lang)
+    except Exception:
+        logger.warning("user_prefs: язык документов не запомнен для %s", user_id, exc_info=True)

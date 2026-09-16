@@ -789,6 +789,17 @@ def _table_ddls() -> list[str]:
                 legacy_ms_id TEXT,
                 created_at   TEXT NOT NULL
             )""",
+            # Реквизиты покупателя для счёта на оплату и товарной накладной
+            # (`services/requisites.py`): ИНН/ПИНФЛ и адрес. Sidecar, а не
+            # колонки: `counterparties` уже на проде. Нет строки — не заполнено,
+            # документ печатает черту для записи от руки.
+            """CREATE TABLE IF NOT EXISTS counterparty_requisites (
+                counterparty_id BIGINT PRIMARY KEY,
+                tin             TEXT,
+                address         TEXT,
+                updated_by      BIGINT,
+                updated_at      TEXT NOT NULL
+            )""",
             f"""CREATE TABLE IF NOT EXISTS products (
                 id           {id_type},
                 name         TEXT NOT NULL,
@@ -2267,6 +2278,23 @@ _DEFAULT_SETTINGS: dict[str, tuple] = {
         15,
         "Скидка от прайса ≥ X% — пометка в заявке и явное одобрение (0 — выкл.)",
     ),
+    # Реквизиты компании для счёта на оплату, товарной накладной и расписки
+    # (services/requisites.py, форма «Настройки → Реквизиты компании»).
+    # Сидинг вставляет только отсутствующие ключи — заполненное не трогает.
+    "company_name": ("", "Полное наименование компании"),
+    "company_tin": ("", "ИНН компании"),
+    "company_oked": ("", "ОКЭД компании"),
+    "company_address": ("", "Юридический адрес компании"),
+    "company_phone": ("", "Телефон компании"),
+    "company_bank_account": ("", "Расчётный счёт"),
+    "company_bank_name": ("", "Банк"),
+    "company_bank_mfo": ("", "МФО банка"),
+    "company_director": ("", "Руководитель — Ф.И.О. (подпись в счёте)"),
+    "company_chief_accountant": ("", "Главный бухгалтер — Ф.И.О. (подпись в счёте)"),
+    "company_release_by": ("", "Отпуск разрешил — должность, Ф.И.О. (накладная)"),
+    "company_city": ("", "Город, где составляется расписка"),
+    "company_city_uz": ("", "Город по-узбекски (тилхат)"),
+    "invoice_valid_days": (3, "Счёт на оплату действителен N банковских дней"),
 }
 
 

@@ -52,6 +52,7 @@ ACTION_LABELS: dict[str, str] = {
     "pref_set": "Личная настройка изменена",
     "setting_changed": "Настройка изменена",
     "company_requisites": "Реквизиты компании изменены",
+    "counterparty_requisites": "Реквизиты клиента изменены",
     # ─ заказы/отгрузка ─
     "credit_override": "Заказ одобрен сверх лимита долга",
     "order_shipped": "Заказ отгружен",
@@ -124,6 +125,8 @@ ACTION_LABELS: dict[str, str] = {
     "pay_account_archived": "Наша карта или счёт отправлены в архив",
     # ─ документы ─
     "document_created": "Документ составлен",
+    "sales_invoice_printed": "Счёт на оплату распечатан",
+    "sales_invoice_sent": "Счёт на оплату отправлен в Telegram",
     # ─ синтетические коды истории заказа (C3, services.order_timeline —
     # не пишутся в audit_log, только для ярлыка события на ленте) ─
     "order_created": "Заказ создан",

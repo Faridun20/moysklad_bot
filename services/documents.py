@@ -25,7 +25,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from services import adb_core, money
+from services import adb_core, money, requisites
 from services.legal_docs import DOCUMENT_CURRENCY, TEMPLATES, DocumentError, build_context, render_pdf
 from services.database import now_str
 
@@ -37,21 +37,11 @@ DOC_TYPES: dict[str, str] = {
     "tilxat_uz": "Тилхат (ўзб.)",
 }
 
-# Ключи реквизитов компании в app_settings и подписи для формы.
-COMPANY_FIELDS: tuple[tuple[str, str], ...] = (
-    ("company_name", "Название компании"),
-    ("company_tin", "ИНН"),
-    ("company_address", "Адрес"),
-    ("company_representative", "Представитель (ФИО)"),
-    ("company_city", "Город"),
-    # Подписант в расписке: «в лице …, действующего на основании …».
-    ("company_position", "Должность подписанта (например: Директор)"),
-    ("company_representative_gen", "Подписант в родительном падеже (директора Иванова Ивана Ивановича)"),
-    ("company_position_uz", "Лавозими — должность по-узбекски (Директор)"),
-    ("company_poa_number", "Доверенность № (пусто — действует на основании Устава)"),
-    ("company_poa_date", "Дата доверенности (ДД.ММ.ГГГГ)"),
-    ("company_city_uz", "Город по-узбекски (Тошкент)"),
-)
+# Реквизиты компании — `services/requisites.py` (одна форма «Настройки →
+# Реквизиты компании» для счёта, накладной и расписки). Пары (ключ, подпись)
+# оставлены под прежним именем: на них опираются старые вызовы и тесты.
+COMPANY_FIELDS: tuple[tuple[str, str], ...] = tuple((f.key, f.label) for f in requisites.COMPANY_FIELDS)
+
 
 def documents_dir() -> Path:
     """Куда класть PDF. На проде — том /app/data (переживает рестарт)."""
@@ -65,32 +55,12 @@ def documents_dir() -> Path:
 
 
 def company_requisites() -> dict[str, str]:
-    """Реквизиты кредитора из настроек. Пустые строки — не заполнено."""
-    from services.database import get_setting
-
-    out = {}
-    for key, _label in COMPANY_FIELDS:
-        val = get_setting(key, "")
-        out[key] = str(val or "")
-    if not out["company_name"]:
-        # Тот же источник, что у накладной: название компании — одно на проект,
-        # и требовать вписать его заново только ради расписки незачем.
-        from services.invoice_pdf import COMPANY_NAME
-
-        out["company_name"] = COMPANY_NAME
-    return out
+    """Реквизиты компании из настроек (см. `requisites.company_requisites`)."""
+    return requisites.company_requisites()
 
 
-def save_company_requisites(values: dict[str, Any], by: int) -> dict[str, str]:
-    from services.database import set_setting
-
-    saved = {}
-    for key, _label in COMPANY_FIELDS:
-        if key in values:
-            clean = str(values.get(key) or "").strip()[:200]
-            set_setting(key, clean, by)
-            saved[key] = clean
-    return saved
+def save_company_requisites(values: dict[str, Any], by: int) -> dict[str, Any]:
+    return requisites.save_company_requisites(values, by)
 
 
 def _clean(value: Any, limit: int = 200) -> str:
@@ -157,24 +127,20 @@ def form_to_context(data: dict[str, Any]) -> tuple[dict, dict]:
         raise DocumentError("Укажите ФИО должника")
 
     company = company_requisites()
+    # Кредитор опознаётся названием, ИНН и адресом. Подписанта (должность,
+    # «в лице …») расписка не печатает: её пишет и подписывает должник.
     creditor = {
         "name": company["company_name"],
         "tin": company["company_tin"],
         "address": company["company_address"],
-        "representative": company["company_representative"],
-        "representative_gen": company["company_representative_gen"],
-        "position": company["company_position"],
-        "position_uz": company["company_position_uz"],
-        "poa_number": company["company_poa_number"],
-        "poa_date": company["company_poa_date"],
     }
     if not creditor["name"]:
         # Формулировка важна: менеджеры читали это как «впишите компанию
         # КЛИЕНТА» и вставали в тупик, когда товар берёт физлицо. Компания
         # тут наша, а должником может быть кто угодно — ему компания не нужна.
         raise DocumentError(
-            "Не заполнены реквизиты вашей компании (кредитора) — "
-            "откройте «Реквизиты компании». К должнику это не относится: "
+            "Не заполнено название вашей компании (кредитора) — "
+            f"откройте {requisites.WHERE}. К должнику это не относится: "
             "им может быть и физлицо без компании."
         )
     city = _clean(data.get("city"), 80) or company["company_city"]

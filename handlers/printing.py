@@ -32,13 +32,17 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
-async def _invoice_pdf(invoice_id: int, user_id: int | None = None) -> tuple[bytes, str, str] | None:
-    """Накладная → (pdf, имя файла, подпись для очереди). `None` — не нашли."""
+async def _invoice_pdf(
+    invoice_id: int, user_id: int | None = None, lang: str | None = None,
+) -> tuple[bytes, str, str] | None:
+    """Накладная → (pdf, имя файла, подпись для очереди). `None` — не нашли.
+
+    Язык — из кнопки (`prn:inv:42:uz`); старая кнопка без языка печатает тот,
+    что человек выбирал последним (`user_prefs.doc_lang`)."""
     import asyncio
 
-    from services import warehouse
+    from services import user_prefs, warehouse, waybill
     from services.costing import redact_invoice
-    from services.invoice_pdf import invoice_filename, render_invoice_pdf
     from services.roles import cached_role
 
     invoice = await warehouse.get_invoice(invoice_id)
@@ -47,11 +51,14 @@ async def _invoice_pdf(invoice_id: int, user_id: int | None = None) -> tuple[byt
     # callback_data подделывается клиентом: закупочные цены прихода печатаем
     # только руководству — как и в WebApp (services.costing.redact_invoice).
     invoice = redact_invoice(invoice, cached_role(user_id) if user_id is not None else None)
-    # WeasyPrint синхронный и небыстрый — уводим с event loop, как это делает
-    # order_workflow._build_invoice_pdf.
-    pdf = await asyncio.to_thread(render_invoice_pdf, invoice)
+    if lang:
+        await asyncio.to_thread(user_prefs.remember_doc_lang, user_id, lang)
+    else:
+        lang = await asyncio.to_thread(user_prefs.doc_lang, user_id)
+    # WeasyPrint синхронный и небыстрый — `waybill.render` уводит его в поток.
+    pdf, filename = await waybill.render(invoice, lang)
     number = str(invoice.get("invoice_number") or invoice_id)
-    return pdf, invoice_filename(invoice), f"Накладная {number}"
+    return pdf, filename, f"Накладная {number}"
 
 
 async def _document_pdf(doc_id: int, user_id: int) -> tuple[bytes, str, str] | None:
@@ -95,7 +102,10 @@ async def cb_print(call: CallbackQuery):
     await call.answer("Отправляю на печать…")
 
     try:
-        doc = await (_invoice_pdf(ref, call.from_user.id) if kind == "inv" else _document_pdf(ref, call.from_user.id))
+        doc = await (
+            _invoice_pdf(ref, call.from_user.id, printing.callback_lang(call.data or ""))
+            if kind == "inv" else _document_pdf(ref, call.from_user.id)
+        )
     except Exception:
         logger.exception("Печать: не удалось собрать PDF (%s #%s)", kind, ref)
         return await _report(

@@ -9,8 +9,13 @@
     падает, и сборка образа вместе с ней. При этом ни один модуль num2words
     docopt не импортирует, то есть зависимость ещё и лишняя.
 
-Склонение валюты не требуется: шаблоны печатают «25 000,00 (двадцать пять
-тысяч) USD» — в скобках идёт голое числительное, код валюты снаружи.
+Расписка печатает голое числительное в скобках («25 000 000 (двадцать пять
+миллионов) сум» — слово валюты стоит в бланке). Счёт на оплату и товарная
+накладная печатаются в валюте ЗАКАЗА, поэтому слово валюты согласуется с
+числом здесь же (`currency_noun`, `money_in_words`): «1 доллар США», «2 доллара
+США», «5 долларов США»; сум по-русски в документах не склоняется («1 сум»,
+«5 сум»), по-узбекски существительное после числительного всегда в
+единственном числе («беш АҚШ доллари»).
 """
 
 from __future__ import annotations
@@ -173,3 +178,72 @@ def amount_in_words(value: Decimal, lang: str) -> str:
     cents = int((value - whole) * 100)
     words = fn(whole)
     return f"{words} {cents:02d}/100" if cents else words
+
+
+# ─── Валюта прописью (счёт на оплату, товарная накладная) ────────────────────
+
+# Код валюты → (формы существительного по-русски, по-узбекски,
+# формы разменной единицы по-русски, по-узбекски). Сум — целыми: тийинов в
+# расчётах нет (см. services/money), поэтому разменной единицы у него нет.
+_CURRENCY_WORDS: dict[str, dict] = {
+    "USD": {
+        "ru": ("доллар США", "доллара США", "долларов США"),
+        "uz": "АҚШ доллари",
+        "minor_ru": ("цент", "цента", "центов"),
+        "minor_uz": "цент",
+    },
+    "UZS": {
+        "ru": ("сум", "сум", "сум"),
+        "uz": "сўм",
+        "minor_ru": None,
+        "minor_uz": None,
+    },
+}
+
+
+def currency_noun(value: int, lang: str, currency: str) -> str:
+    """Слово валюты, согласованное с целым числом: 1 доллар США, 2 доллара США."""
+    spec = _CURRENCY_WORDS.get((currency or "").upper())
+    if spec is None:
+        raise ValueError(f"нет слов для валюты {currency!r}")
+    if lang == "ru":
+        return _ru_plural(int(value), spec["ru"])
+    if lang == "uz":
+        return spec["uz"]
+    raise ValueError(f"нет прописи для языка {lang!r}")
+
+
+def money_in_words(value: Decimal, lang: str, currency: str) -> tuple[str, str]:
+    """(числительное, хвост с валютой) для строки «Всего к оплате».
+
+    Документ печатает «1 092 000 (один миллион девяносто две тысячи) сум.» —
+    как в бланке владельца: числительное в скобках, валюта после. Хвост несёт
+    согласованное слово валюты и центы, если они есть:
+    «400,50 (четыреста) долларов США 50 центов.»
+    """
+    if value < 0:
+        raise ValueError("сумма не может быть отрицательной")
+    fn = _LANGS.get(lang)
+    if fn is None:
+        raise ValueError(f"нет прописи для языка {lang!r}")
+    code = (currency or "").upper()
+    spec = _CURRENCY_WORDS.get(code)
+    if spec is None:
+        raise ValueError(f"нет слов для валюты {currency!r}")
+    whole = int(value)
+    cents = int((value - whole) * 100)
+    tail = currency_noun(whole, lang, code)
+    minor = spec["minor_ru"] if lang == "ru" else spec["minor_uz"]
+    if cents and minor:
+        word = _ru_plural(cents, minor) if lang == "ru" else minor
+        tail = f"{tail} {cents:02d} {word}"
+    elif cents:
+        # Валюта без разменной единицы, а дробь пришла — дробью, как в расписке.
+        tail = f"{tail} {cents:02d}/100"
+    return fn(whole), tail
+
+
+def money_phrase(value: Decimal, lang: str, currency: str) -> str:
+    """Сумма прописью одной фразой: «четыреста долларов США», «бир сўм»."""
+    words, tail = money_in_words(value, lang, currency)
+    return f"{words} {tail}"
