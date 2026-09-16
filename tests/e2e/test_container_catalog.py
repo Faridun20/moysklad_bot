@@ -151,7 +151,12 @@ def test_manager_marks_machine_in_transit_arrived(open_app, e2e):
     mgr.click("#ms-submit")
     mgr.wait_for_selector(".toast:has-text('Машина на складе')")
     _no_overlay(mgr)
-    mgr.wait_for_function("() => !document.querySelector('[data-mact=\"arrive\"]')")
+    # Карточка перерисовывается: пока #content пуст, «Прибыла» тоже нет —
+    # ждём уже новую карточку, а не просто исчезновение кнопки.
+    mgr.wait_for_function(
+        "() => !document.querySelector('[data-mact=\"arrive\"]')"
+        " && document.querySelector('#content').innerText.includes('Ташкент, Сергели')"
+    )
     assert "На складе" in mgr.inner_text("#content")
     assert "Ташкент, Сергели" in mgr.inner_text("#content")
 
