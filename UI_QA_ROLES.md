@@ -8,7 +8,7 @@
 ## Как проверять
 
 Под каждой ролью пройти все её разделы (Сегодня → Продажи → Склад → Деньги →
-Клиенты; у руководства ещё Решения и Настройки, а работа менеджера — за
+Клиенты, Обращения; у руководства ещё Решения и Настройки, а работа менеджера — за
 выключателем «Рабочие действия» в «Меню», проверить в обоих положениях; набор
 зависит от роли) и убедиться, что:
 
@@ -25,13 +25,13 @@
 
 ## Доступ по ролям
 
-_Всего эндпоинтов: 208._
+_Всего эндпоинтов: 209._
 
 
 > **Временное совмещение ролей** (`services/roles.py::ROLE_ALSO_ACTS_AS`): `manager` = + `warehouse_keeper`, `bookkeeper`. Кладовщика и бухгалтера в штате пока нет, их работу делает менеджер; списки ниже уже учитывают это. Роли `warehouse_keeper`/`bookkeeper` через `/addrole` не назначаются. `*` в таблице экранов — доступ через совмещение.
 
 
-### Админ (`admin`) — 184 эндпоинтов
+### Админ (`admin`) — 185 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -51,6 +51,7 @@ _Всего эндпоинтов: 208._
 - `/api/channel/publish`
 - `/api/channel/stale`
 - `/api/clients/detail`
+- `/api/clients/list`
 - `/api/clients/overview`
 - `/api/clients/shipment`
 - `/api/containers/arrive`
@@ -223,7 +224,7 @@ _Всего эндпоинтов: 208._
 </details>
 
 
-### Руководитель (`boss`) — 181 эндпоинтов
+### Руководитель (`boss`) — 182 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -243,6 +244,7 @@ _Всего эндпоинтов: 208._
 - `/api/channel/publish`
 - `/api/channel/stale`
 - `/api/clients/detail`
+- `/api/clients/list`
 - `/api/clients/overview`
 - `/api/clients/shipment`
 - `/api/containers/arrive`
@@ -412,7 +414,7 @@ _Всего эндпоинтов: 208._
 </details>
 
 
-### Менеджер (`manager`) — 127 эндпоинтов
+### Менеджер (`manager`) — 128 эндпоинтов
 
 <details><summary>Показать список</summary>
 
@@ -425,6 +427,7 @@ _Всего эндпоинтов: 208._
 - `/api/catalog_import/preview`
 - `/api/catalog_import/template`
 - `/api/clients/detail`
+- `/api/clients/list`
 - `/api/clients/shipment`
 - `/api/containers/arrive`
 - `/api/containers/card`
@@ -626,7 +629,8 @@ _Всего эндпоинтов: 208._
 | Деньги → Подтвердить | admin, boss, bookkeeper, manager* | `/api/deposits/pending` |
 | Финансы → Долги | admin, boss, manager | `/api/debts` |
 | Деньги → Поставщикам («мы должны») | admin, boss | `/api/suppliers/debts` |
-| Финансы → Клиенты | admin, boss | `/api/clients/overview` |
+| Клиенты (список покупателей) | admin, boss, manager | `/api/clients/list` |
+| Клиенты → Лимиты | admin, boss | `/api/clients/overview` |
 | Курсы валют | admin, boss (правка) | `/api/currency/rates` |
 | Аналитика | admin, boss, manager | `/api/analytics` |
 | Деньги (лента) | admin, boss | `/api/money/summary` |

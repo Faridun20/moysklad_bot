@@ -523,7 +523,9 @@ def test_manager_writes_off_two_units_with_a_reason(open_app, e2e):
     _pick_product(mgr, e2e.ids["product"])
     mgr.wait_for_selector("#ms-f-quantity")
     mgr.fill("#ms-f-quantity", "2")
-    mgr.click('.c-overlay .seg-item[data-opt="бой"]')
+    # Быстрые причины переписаны обычными словами («разбили» вместо «боя»):
+    # владелец читает эту ленту сам и спросил, что такое «бой».
+    mgr.click('.c-overlay .seg-item[data-opt="разбили"]')
     mgr.fill("#ms-f-note", "уронили при разгрузке")
     mgr.click("#ms-submit")
     mgr.wait_for_selector(".toast:has-text('Списано')")
@@ -531,7 +533,7 @@ def test_manager_writes_off_two_units_with_a_reason(open_app, e2e):
     assert _stock(e2e) == 18, "остаток уменьшился ровно на списанное"
     row = e2e.rows("SELECT kind, reason, created_by FROM stock_writeoffs ORDER BY id DESC")[0]
     assert row["kind"] == "writeoff" and row["created_by"] == e2e.ids["mgr"]
-    assert "бой" in row["reason"] and "разгрузке" in row["reason"]
+    assert "разбили" in row["reason"] and "разгрузке" in row["reason"]
     # Причина видна в журнале — ради неё всё и затевалось.
     mgr.wait_for_selector("#content:has-text('уронили при разгрузке')")
     # Движение прошло обычной расходной накладной, но продажей не стало.
@@ -599,5 +601,7 @@ def test_manager_runs_a_count_and_applies_deltas(open_app, e2e):
     kinds = {r["kind"]: r for r in e2e.rows(
         "SELECT kind, reason, count_id FROM stock_writeoffs WHERE count_id IS NOT NULL")}
     assert set(kinds) == {"writeoff", "surplus"}
-    assert all(r["reason"] == "инвентаризация" for r in kinds.values())
+    from services.inventory import COUNT_REASON
+
+    assert all(r["reason"] == COUNT_REASON for r in kinds.values())
     assert e2e.rows("SELECT status FROM stock_counts ORDER BY id DESC")[0]["status"] == "applied"

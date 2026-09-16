@@ -422,7 +422,13 @@ const LEGACY_SCREENS = {
   payments: 'money:ops',
   cashbox: 'money:ops',
   limits: 'clients:limits',
-  leads: 'clients:funnel',
+  // `leads` здесь НЕТ, хотя старый экран «Лиды» был вкладкой «Клиентов»: имя
+  // совпало с новым РАЗДЕЛОМ «Обращения» (key `leads`), и алиас
+  // 'leads:list' срабатывал бы на КАЖДЫЙ showScreen('leads') — тап по разделу
+  // в шторке уносил бы руководителя из «Воронки» в «Лиды», а вкладка,
+  // выбранная перед переходом, затиралась. Тот же капкан, что с `stock`
+  // (комментарий выше). Старая ссылка `?startapp=leads` теперь открывает сам
+  // раздел на вкладке по умолчанию — это и есть то, куда она вела.
   // «Накладные» стали вкладкой «Склада» (UI-бриф п.4); старый адрес экрана
   // ведёт туда же.
   whinvoices: 'stock:invoices',
@@ -460,7 +466,7 @@ function launchScreen() {
 
 const SCREEN_TITLES = {
   today: null, sales: 'Продажи', stock: 'Склад', money: 'Деньги',
-  clients: 'Клиенты', decisions: 'Решения', settings: 'Настройки',
+  clients: 'Клиенты', leads: 'Обращения', decisions: 'Решения', settings: 'Настройки',
 };
 
 // Нижняя панель строится из таблицы разделов: набор кнопок зависит от роли.
@@ -502,7 +508,8 @@ function buildNav() {
 // Вкладки раздела под роль; у «Сегодня» вкладок нет (sectionTabsFor для
 // неизвестного раздела отдаёт вкладки «Клиентов» — туда ходить нельзя).
 function navTabsFor(section) {
-  return ['sales', 'stock', 'money', 'clients'].includes(section) ? sectionTabsFor(section) : [];
+  return ['sales', 'stock', 'money', 'clients', 'leads'].includes(section)
+    ? sectionTabsFor(section) : [];
 }
 
 // Подсветка панели. Раздел, которого в панели нет (ушёл в «Меню»), подсвечивает
@@ -541,7 +548,8 @@ function syncNavActive(screen) {
 let _navDrawer = null;   // состояние открытой шторки; null — закрыта
 
 function sectionTabOf(section) {
-  return { sales: salesTab, stock: stockTab, money: moneyTab, clients: clientsTab }[section] || '';
+  return { sales: salesTab, stock: stockTab, money: moneyTab, clients: clientsTab,
+           leads: leadsTab }[section] || '';
 }
 
 // Содержимое шторки: разделы роли, вкладки, бейдж «Решений» и — у
@@ -1096,6 +1104,9 @@ async function showScreen(screen, opts) {
       case 'clients':
         await renderClientsScreen();
         break;
+      case 'leads':
+        await renderLeadsScreen();
+        break;
       case 'decisions':
         await renderDecisionsScreen();
         break;
@@ -1120,7 +1131,8 @@ async function showScreen(screen, opts) {
 let salesTab = 'orders';     // orders | report
 let stockTab = 'catalog';    // catalog | containers | machines | invoices
 let moneyTab = 'confirm';    // confirm | debts | ops | report
-let clientsTab = 'funnel';   // funnel | limits | channel
+let clientsTab = 'buyers';   // buyers | limits — ПОКУПАТЕЛИ, не лиды
+let leadsTab = 'funnel';     // funnel | list | channel — работа ДО продажи
 
 // Поколение экрана — см. showScreen. Смена вкладки внутри раздела тоже
 // «новый экран»: список заказов, догрузившийся после перехода на «Отчёт»,
@@ -1215,10 +1227,12 @@ function setSectionTab(section, tab) {
   else if (section === 'stock') stockTab = tab;
   else if (section === 'money') moneyTab = tab;
   else if (section === 'clients') clientsTab = tab;
+  else if (section === 'leads') leadsTab = tab;
   noteView(`screen:${section}:${tab}`);
 }
 function sectionTabOf(section) {
-  return { sales: salesTab, stock: stockTab, money: moneyTab, clients: clientsTab }[section] || '';
+  return { sales: salesTab, stock: stockTab, money: moneyTab, clients: clientsTab,
+           leads: leadsTab }[section] || '';
 }
 
 function role() { return (currentUser && currentUser.role) || 'guest'; }
@@ -4709,7 +4723,7 @@ async function runSearch(query) {
   if (data.leads && data.leads.length) {
     parts.push(`<div class="search-group-title">${icon('user')} Лиды</div>`);
     parts.push(data.leads.map(l => `
-      <div class="search-item" role="button" tabindex="0" onclick="showScreen('clients', {tab: 'list'})">
+      <div class="search-item" role="button" tabindex="0" onclick="showScreen('leads', {tab: 'list'})">
         ${escapeHtml(l.display_name || l.username || '—')}${l.username && l.display_name ? ' · @' + escapeHtml(l.username) : ''}
         <span class="search-meta">${escapeHtml(machineStatusLabel(l.status, data.lead_status_labels))}</span>
       </div>`).join(''));
@@ -7274,11 +7288,17 @@ async function moneyInsightsHtml() {
   return html;
 }
 
-// ─── Раздел «Клиенты» ──────────────────────────────────────────────────────
+// ─── Раздел «Клиенты» — ПОКУПАТЕЛИ ─────────────────────────────────────────
 //
-// Воронка обращений жила строчками внизу отчёта о деньгах — там её было не
-// найти, не зная заранее. Переписка с клиентом не деньги, и у неё должен быть
-// свой раздел: воронка, кто ждёт ответа, кредитные лимиты и посты в канал.
+// «Я нигде не нашёл, где можно посмотреть клиентов. Сколько отдано, когда была
+// проведена отгрузка, на какую общую сумму он покупал. Где эти все данные?» —
+// владелец. Данные были: /api/clients/detail отдаёт и заказы, и отгрузки, и
+// платежи. Не было СПИСКА: раздел с именем «Клиенты» вёл в воронку ОБРАЩЕНИЙ
+// (Воронка · Лиды · Лимиты · Канал), а к карточке покупателя можно было
+// попасть только лупой, зная имя наизусть.
+//
+// Теперь «Клиенты» — список покупателей первым же экраном, в одно касание из
+// нижней панели; лиды, воронка и канал живут в разделе «Обращения» («Меню»).
 
 async function renderClientsScreen() {
   const content = document.getElementById('content');
@@ -7289,9 +7309,102 @@ async function renderClientsScreen() {
 
   const body = document.getElementById('clients-body');
   if (clientsTab === 'limits') await renderCreditLimits(body);
-  else if (clientsTab === 'channel') await renderChannelHistory(body);
-  else if (clientsTab === 'list') await renderLeadsList(body);
+  else await renderBuyers(body);
+}
+
+// ─── Раздел «Обращения» ────────────────────────────────────────────────────
+//
+// Воронка обращений жила строчками внизу отчёта о деньгах — там её было не
+// найти, не зная заранее. Переписка с тем, кто ещё ничего не купил, — это не
+// деньги и не покупатель, и у неё свой раздел: воронка, кто ждёт ответа,
+// посты в канал.
+
+async function renderLeadsScreen() {
+  const content = document.getElementById('content');
+  const shell = sectionShell('leads', leadsTab);
+  leadsTab = shell.active;
+  content.innerHTML = shell.html + '<div id="leads-body">' + skeleton('list', 3) + '</div>';
+  wireSectionNav(content, 'leads', renderLeadsScreen);
+
+  const body = document.getElementById('leads-body');
+  if (leadsTab === 'channel') await renderChannelHistory(body);
+  else if (leadsTab === 'list') await renderLeadsList(body);
   else await renderLeadsFunnel(body);
+}
+
+// Список покупателей: кто сколько купил за всё время, сколько должен сейчас и
+// когда отгружали в последний раз. Порядок считает сервер (сначала должники,
+// дальше — по дате отгрузки): «с кем разбираться» — это и есть порядок строк,
+// а ровный алфавит заставлял бы искать должника глазами.
+//
+// Поиск — на сервере (имя или телефон), а не по загруженной сотне: клиента
+// чаще помнят по номеру, и найтись он должен, даже если в первую сотню не
+// попал. Запрос уходит с задержкой 300 мс — ввод не должен ждать сети.
+let buyersQuery = '';
+let _buyersTimer = null;
+
+async function renderBuyers(container) {
+  const box = container || document.getElementById('content');
+  box.innerHTML = `
+    <div class="search-wrap"><input type="search" id="buyers-search" class="search-input"
+         placeholder="Имя или телефон…" value="${escapeHtml(buyersQuery)}"
+         autocomplete="off"></div>
+    <div id="buyers-list">${skeleton('list', 4)}</div>`;
+  const input = box.querySelector('#buyers-search');
+  if (input) {
+    input.addEventListener('input', () => {
+      clearTimeout(_buyersTimer);
+      _buyersTimer = setTimeout(() => {
+        if (input.value.trim() === buyersQuery) return;
+        buyersQuery = input.value.trim();
+        // Перерисовываем ТОЛЬКО список: перерисовка всего экрана отняла бы у
+        // поля фокус, и клавиатура закрывалась бы на каждой букве.
+        renderBuyersList();
+      }, 300);
+    });
+  }
+  await renderBuyersList();
+}
+
+// Тело списка (без поля поиска) — им же перерисовывается выдача по вводу.
+// Поколение экрана (screenGen) и снимок запроса: человек успевает уйти в
+// другой раздел или дописать букву раньше, чем придёт ответ (см. showScreen).
+async function renderBuyersList() {
+  const gen = screenGen();
+  const q = buyersQuery;
+  const list0 = document.getElementById('buyers-list');
+  if (list0 && !list0.querySelector('.sk-card')) list0.innerHTML = skeleton('list', 3);
+  let data;
+  try {
+    data = await api('/api/clients/list', { q, limit: 100 });
+  } catch (e) {
+    if (gen !== screenGen() || q !== buyersQuery) return;
+    const box = document.getElementById('buyers-list');
+    if (box) box.innerHTML = errorBox(e.message);
+    return;
+  }
+  if (gen !== screenGen() || q !== buyersQuery) return;
+  const list = document.getElementById('buyers-list');
+  if (!list) return;
+  const clients = data.clients || [];
+  if (!clients.length) {
+    list.innerHTML = emptyState(q
+      ? { icon: 'user', title: 'Никого не нашли', hint: 'Проверьте имя или номер телефона' }
+      : { icon: 'user', title: 'Клиентов пока нет',
+          hint: 'Клиент появится здесь, как только его заведут в заказе или накладной' });
+    return;
+  }
+  // «Показаны N из M» — честно про потолок выдачи: список обрезан сотней, и
+  // без строки человек решил бы, что остальных в базе нет.
+  const more = data.total > clients.length
+    ? `<div class="c-field-hint">Показаны ${clients.length} из ${data.total} — уточните поиск</div>` : '';
+  list.innerHTML = `<div class="c-surface c-surface--list">${clientRowsHtml(clients)}</div>${more}`;
+  list.querySelectorAll('[data-client]').forEach(row => {
+    row.addEventListener('click', () => {
+      haptic('light');
+      renderAgentDetail(row.dataset.client);
+    });
+  });
 }
 
 // Два независимых отбора: исход сделки и состояние разговора. Это разные
@@ -8108,12 +8221,19 @@ function cashHistoryHtml(history) {
     const m = KIND_META[h.kind] || { ic: 'cash', label: h.kind };
     const ord = h.order_id ? ` · заказ #${h.order_id}` : '';
     const time = String(h.created_at || '').slice(11, 16);
+    // Способ («наличные» / «на карту •••• 1234») — ПЕРВЫМ в подстрочнике, а не
+    // хвостом заголовка: в заголовке он на 360px обрезался многоточием
+    // («Платёж · 5 000 US…»), а «сколько отдал» без «как отдал» отвечает на
+    // половину вопроса. Подстрочник переносится по словам и влезает целиком.
+    const how = h.method_label
+      ? `${escapeHtml(h.account_label || h.method_label)}${h.part_currency && h.part_currency !== h.currency ? ` ${formatMoney(h.part_amount, escapeHtml(h.part_currency))}` : ''} · `
+      : '';
     return `
       <div class="c-row">
         <div class="card-row-icon">${icon(m.ic)}</div>
         <div class="card-row-info">
-          <div class="card-row-title">${m.label} · ${fmt(h.amount)} ${escapeHtml(h.currency || baseCur())}${h.method_label ? ` · ${escapeHtml(h.account_label || h.method_label)}${h.part_currency && h.part_currency !== h.currency ? ` ${formatMoney(h.part_amount, escapeHtml(h.part_currency))}` : ''}` : ''}</div>
-          <div class="card-row-sub">${escapeHtml(h.who || '')}${time ? ' · ' + escapeHtml(time) : ''}${ord}</div>
+          <div class="card-row-title">${m.label} · ${fmt(h.amount)} ${escapeHtml(h.currency || baseCur())}</div>
+          <div class="card-row-sub">${how}${escapeHtml(h.who || '')}${time ? ' · ' + escapeHtml(time) : ''}${ord}</div>
         </div>
         ${histStatus(h.status)}
       </div>`;
@@ -9030,7 +9150,10 @@ async function renderCreditLimits(container) {
     renderCurrencyRates();
   });
   container.querySelectorAll('[data-agent]').forEach(card => {
-    card.addEventListener('click', () => { haptic('light'); renderAgentDetail(card.dataset.agent); });
+    card.addEventListener('click', () => {
+      haptic('light');
+      renderAgentDetail(card.dataset.agent, { back: 'limits' });
+    });
   });
   // B6 — контрагенты с оборотом и текущим долгом.
   container.querySelector('#clients-export')?.addEventListener('click', (ev) => {
@@ -9235,13 +9358,19 @@ function shipmentItemsHtml(res) {
   return itemsBoxHtml(res.positions, res.currency, { empty: 'В отгрузке нет позиций' });
 }
 
-// Карточка контрагента: МС-баланс + локальный долг/лимит (правится) + покупки из
-// МС (топ-товары/последние отгрузки, каждая раскрывается в состав) + заказы в
-// боте. Открывается из «Клиентов» и из поиска. boss/admin (detail так гейтит).
-async function renderAgentDetail(agentId) {
+// Карточка клиента. Отвечает на три вопроса владельца подряд, сверху вниз:
+// СКОЛЬКО КУПИЛ (за всё время и за год, по валютам), СКОЛЬКО ОТДАЛ и сколько
+// должен сейчас, КОГДА ОТГРУЖАЛИ (накладные с номером, датой и суммой,
+// каждая раскрывается в состав). Ниже — заказы в боте и лента денег.
+// Открывается тапом по строке списка «Клиенты» и из поиска. admin/boss/manager
+// (`/api/clients/detail` гейтит так же); правка лимита — только руководству.
+async function renderAgentDetail(agentId, opts) {
   const content = document.getElementById('content');
   content.innerHTML = loading('Загрузка клиента…');
-  showBack(() => { clientsTab = 'limits'; showScreen('clients'); });
+  // «Назад» ведёт туда, откуда пришли: из «Лимитов» — в «Лимиты», отовсюду
+  // ещё — в список покупателей.
+  const backTab = (opts && opts.back) || 'buyers';
+  showBack(() => { clientsTab = backTab; showScreen('clients'); });
   let d;
   try {
     d = await api('/api/clients/detail', { agent_id: agentId });
@@ -9253,25 +9382,39 @@ async function renderAgentDetail(agentId) {
   const fmtCents = c => opsAmount((Number(c) || 0) / 100);
   const baseC = d.base_currency || baseCur();
 
-  // Покупки — расходные накладные склада.
+  // Покупки — расходные накладные склада. Итог считает сервер по ВСЕМ
+  // накладным и раздельно по валютам: раньше здесь стояла сумма последних
+  // двадцати, сложенная через валюты и подписанная базовой, — ответ на
+  // «на какую общую сумму он покупал» был просто неверным.
   const pur = d.purchases || {};
+  const boughtAll = sumsLabel(pur.total_by_currency, '');
+  const boughtYear = sumsLabel(pur.period_by_currency, '');
   const topRows = (pur.top_products || []).map(p =>
     `<div class="c-row"><div class="card-row-info"><div class="card-row-title">${escapeHtml(p.name)}</div>` +
     `<div class="card-row-sub">${fmt(p.qty)} шт. · ${fmtCents(p.sum_cents)} ${escapeHtml(baseC)}</div></div></div>`
   ).join('');
-  // Отгрузка раскрывается в состав. Позиции тянем по первому тапу, а не сразу
-  // все десять: чаще всего их никто не откроет.
+  // Отгрузка — номер, дата и сумма В СВОЕЙ валюте; раскрывается в состав.
+  // Позиции тянем по первому тапу, а не сразу все десять: чаще всего их никто
+  // не откроет.
   const recentRows = (pur.recent || []).map(r =>
     `<div class="c-row${r.id ? ' c-row--tap' : ''}"${r.id ? ` data-shipment="${escapeHtml(r.id)}" role="button" tabindex="0" aria-expanded="false"` : ''}>` +
-    `<div class="card-row-info"><div class="card-row-title">${fmtCents(r.sum_cents)} ${escapeHtml(baseC)}</div>` +
-    `<div class="card-row-sub">${escapeHtml(r.date || '')}</div></div>${r.id ? icon('list') : ''}</div>` +
+    `<div class="card-row-info"><div class="card-row-title">${escapeHtml(formatDateRU(r.date))}${r.number ? ' · ' + escapeHtml(r.number) : ''}</div>` +
+    `<div class="card-row-sub">${fmtCents(r.sum_cents)} ${escapeHtml(r.currency || baseC)}</div></div>${r.id ? icon('list') : ''}</div>` +
     (r.id ? `<div class="order-items" id="shipment-${escapeHtml(r.id)}" hidden></div>` : '')
   ).join('');
+  const boughtCard = `
+    <div class="c-surface c-surface--pad client-totals">
+      <div class="client-total"><span>Купил за всё время</span><b>${boughtAll || '0'}</b></div>
+      ${boughtYear ? `<div class="client-total"><span>За последние 12 месяцев</span><b>${boughtYear}</b></div>` : ''}
+      <div class="client-total"><span>Отгрузок</span><b>${pur.count || 0}</b></div>
+      ${pur.last_date ? `<div class="client-total"><span>Последняя отгрузка</span><b>${escapeHtml(formatDateRU(pur.last_date))}</b></div>` : ''}
+      ${pur.total_base_partial ? '<div class="c-field-hint">Курс задан не для всех валют — итог в базовой валюте неполный</div>' : ''}
+    </div>`;
   const purBlock = pur.count
-    ? `<div class="section-label">Покупки · ${plural(pur.count, ['отгрузка', 'отгрузки', 'отгрузок'])} · ${fmtCents(pur.total_cents)} ${escapeHtml(baseC)}</div>`
-      + (topRows ? `<div class="c-surface c-surface--list">${topRows}</div>` : '')
-      + (recentRows ? `<div class="section-label">Последние отгрузки</div><div class="c-surface c-surface--list">${recentRows}</div>` : '')
-    : '<div class="section-label">Покупки</div><div class="loader">Отгрузок ещё не было</div>';
+    ? '<div class="section-label">Сколько купил</div>' + boughtCard
+      + (topRows ? `<div class="section-label">Что берёт</div><div class="c-surface c-surface--list">${topRows}</div>` : '')
+      + (recentRows ? `<div class="section-label">Когда отгружали</div><div class="c-surface c-surface--list">${recentRows}</div>` : '')
+    : '<div class="section-label">Сколько купил</div><div class="loader">Отгрузок ещё не было</div>';
 
   // Заказы в боте. Строка раскрывается в состав заказа: позиции приходят в том
   // же ответе (их всё равно грузят ради суммы), поэтому раскрытие ничего не
@@ -9283,7 +9426,7 @@ async function renderAgentDetail(agentId) {
     `<div class="c-row c-row--tap" data-order-open="${o.id}" data-status="${escapeHtml(o.status || '')}" role="button" tabindex="0" aria-expanded="false">` +
     `<div class="card-row-info">` +
     `<div class="card-row-title">#${o.id} · ${fmtCents(o.total_cents)} ${escapeHtml(o.currency || baseC)}</div>` +
-    `<div class="card-row-sub">${escapeHtml(o.status || '')} · ${escapeHtml((o.created_at || '').slice(0, 16))} · ${plural((o.items || []).length, ['позиция', 'позиции', 'позиций'])}</div>` +
+    `<div class="card-row-sub">${escapeHtml(STATUS_NAME[o.status] || o.status || '')} · ${escapeHtml((o.created_at || '').slice(0, 16))} · ${plural((o.items || []).length, ['позиция', 'позиции', 'позиций'])}</div>` +
     `</div>${icon('list')}</div>` +
     `<div class="order-items" id="agent-order-${o.id}" hidden>${orderItemsHtml(o)}</div>`
   ).join('');
@@ -9293,10 +9436,13 @@ async function renderAgentDetail(agentId) {
 
   // Платежи клиента: та же лента, что на экране «Деньги» (cashHistoryHtml) —
   // платежи, сдачи в части его заказов и возвраты, сгруппированные по дням.
+  // У каждой строки платежа теперь виден СПОСОБ («наличные / на карту ••••
+  // 1234 / перечислением»): «сколько отдано» без «как отдано» отвечало ровно
+  // на половину вопроса, хотя разбивка лежит в payment_parts с самого начала.
   const history = d.money_history || [];
   const historyBlock = history.length
-    ? `<div class="section-label">Платежи · ${history.length}</div>${cashHistoryHtml(history)}`
-    : `<div class="section-label">Платежи</div><div class="loader">Движений денег не было</div>`;
+    ? `<div class="section-label">Как платил · ${history.length}</div>${cashHistoryHtml(history)}`
+    : `<div class="section-label">Как платил</div><div class="loader">Движений денег не было</div>`;
 
   // Лимит правится только у контрагента с заказами (эндпоинт credit/set это гейтит)
   // и только начальством — менеджеру карточка открыта на чтение (A3), запись
@@ -9316,14 +9462,19 @@ async function renderAgentDetail(agentId) {
   content.innerHTML = `
     <div class="editor-header"><div class="editor-title">${icon('building')} ${escapeHtml(d.name || '—')}</div></div>
     ${d.phone ? `<div class="debt-meta agent-phone">${icon('phone')} ${escapeHtml(d.phone)}</div>` : ''}
-    <div class="section-label">Взаиморасчёты</div>
-    <div class="c-surface c-surface--pad">
-      <div class="debt-meta">Долг по заказам бота: <b>${fmt(d.debt)} ${escapeHtml(baseC)}</b> · лимит ${fmt(d.limit)} · свободно ${fmt(d.free)}</div>
+    <div class="section-label">Сколько отдал и сколько должен</div>
+    <div class="c-surface c-surface--pad client-totals">
+      <div class="client-total"><span>Отдал всего</span><b>${sumsLabel(d.paid_by_currency, '0')}</b></div>
+      ${(d.returned_by_currency || []).length ? `<div class="client-total"><span>Возвращено ему</span><b>${sumsLabel(d.returned_by_currency)}</b></div>` : ''}
+      <div class="client-total"><span>Должен сейчас</span><b>${fmt(d.debt)} ${escapeHtml(baseC)}</b></div>
+      <div class="client-total"><span>Лимит</span><b>${fmt(d.limit)} ${escapeHtml(baseC)}</b></div>
+      <div class="client-total"><span>Свободно</span><b>${fmt(d.free)} ${escapeHtml(baseC)}</b></div>
+      ${d.over_limit ? '<div class="stock-badge" data-status="out">лимит превышен</div>' : ''}
       ${limitBlock}
     </div>
     ${purBlock}
-    ${ordersBlock}
     ${historyBlock}
+    ${ordersBlock}
   `;
 
   // Раскрытие состава заказа. Данные уже в DOM — только показываем/прячем.
@@ -9374,7 +9525,7 @@ async function renderAgentDetail(agentId) {
       try {
         await api('/api/credit/set', { agent_id: d.agent_id, agent_name: d.name, limit_amount: amount });
         toast(`Лимит обновлён: ${fmt(amount)} ${baseC}`);
-        renderAgentDetail(agentId);
+        renderAgentDetail(agentId, { back: backTab });
       } catch (e) { btn.disabled = false; tg.showAlert('❌ ' + e.message); }
     });
   }

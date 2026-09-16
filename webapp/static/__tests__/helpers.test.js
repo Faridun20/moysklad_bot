@@ -10,6 +10,7 @@ const {
   escapeHtml, idemKey, formatDateRU, icon, opsAmount, plural, categoryTree, categoryMatches,
   parseAmount, parsePaymentItems, renderMoneyTotalsHtml, periodSegHtml, rangeLabel,
   navSections, defaultSection, sectionNavHtml, salesTabs, stockTabs, moneyTabs, clientsTabs,
+  leadsTabs,
   roleSectionTabs,
   formatMoney, emptyState, skeleton, errorBoxHtml,
   machineStatusLabel, machineSubtitle, machineStatusSegHtml,
@@ -392,11 +393,20 @@ describe('вкладки разделов', () => {
     expect(keys(stockTabs, { canSeeGoods: true, isBoss: true })).not.toContain('stale');
   });
 
-  it('Клиенты: лиды всем, воронка, лимиты и канал — руководству', () => {
-    expect(keys(clientsTabs, { isBoss: true })).toEqual(['funnel', 'list', 'limits', 'channel']);
+  it('Клиенты — ПОКУПАТЕЛИ: список всем, лимиты руководству', () => {
+    // Раздел с именем «Клиенты» вёл в воронку ОБРАЩЕНИЙ, и списка покупателей
+    // не было нигде («Я нигде не нашёл, где можно посмотреть клиентов» —
+    // владелец). Теперь первая вкладка — список; у менеджера она одна, и ряд
+    // .seg ему не рисуется (/api/clients/overview отвечает admin/boss).
+    expect(keys(clientsTabs, { isBoss: true })).toEqual(['buyers', 'limits']);
+    expect(keys(clientsTabs, { isBoss: false })).toEqual(['buyers']);
+  });
+
+  it('Обращения: лиды всем, воронка и канал — руководству', () => {
+    expect(keys(leadsTabs, { isBoss: true })).toEqual(['funnel', 'list', 'channel']);
     // /api/leads/funnel отвечает только admin/boss — у менеджера «Воронка»
     // была вкладкой с гарантированным 403 (регресс сверки вкладок с ручками).
-    expect(keys(clientsTabs, { isBoss: false })).toEqual(['list']);
+    expect(keys(leadsTabs, { isBoss: false })).toEqual(['list']);
   });
 
   it('ни одна РОЛЬ не получает больше 4 вкладок в разделе', () => {
@@ -406,7 +416,7 @@ describe('вкладки разделов', () => {
     // подтверждает в «Решениях»), и придуманный худший случай заставлял бы
     // вырезать вкладку, которой ни у кого на экране нет.
     for (const role of ['admin', 'boss', 'manager', 'warehouse_keeper', 'bookkeeper']) {
-      for (const section of ['money', 'sales', 'stock', 'clients']) {
+      for (const section of ['money', 'sales', 'stock', 'clients', 'leads']) {
         for (const work of [true, false]) {
           const tabs = roleSectionTabs(section, role, { work });
           expect(tabs.length, `${role}/${section}/work=${work}`).toBeLessThanOrEqual(4);
@@ -417,21 +427,23 @@ describe('вкладки разделов', () => {
 });
 
 describe('разделы нижней панели', () => {
-  it('руководитель: сначала «смотреть и решать», склад и клиенты — дальше', () => {
+  it('руководитель: сначала «смотреть и решать», склад и обращения — дальше', () => {
     // Решение владельца: панель руководителя — «Сегодня · Решения · Деньги ·
-    // Продажи · Меню»; навBarLayout берёт первые четыре.
+    // Продажи · Клиенты · Меню»; navBarLayout берёт первые пять. «Клиенты»
+    // поднялись выше склада: вопрос «сколько он купил и сколько должен»
+    // задают чаще, чем открывают остатки.
     for (const r of ['boss', 'admin']) {
       expect(navSections(r).map(s => s.key))
-        .toEqual(['today', 'decisions', 'money', 'sales', 'stock', 'clients', 'settings']);
+        .toEqual(['today', 'decisions', 'money', 'sales', 'clients', 'stock', 'leads', 'settings']);
     }
   });
 
-  it('менеджер: порядок и состав разделов не менялись', () => {
+  it('менеджер: «Клиенты» в панели, «Обращения» — за ними', () => {
     expect(navSections('manager').map(s => s.key))
-      .toEqual(['today', 'sales', 'stock', 'money', 'clients']);
+      .toEqual(['today', 'sales', 'stock', 'money', 'clients', 'leads']);
   });
 
-  it('кладовщик и бухгалтер не видят склад и клиентов', () => {
+  it('кладовщик и бухгалтер не видят склад, клиентов и обращения', () => {
     // Роли режем по матрице ручек: раздел, где всё ответит 403, — дверь,
     // которая не открывается. «Сегодня» им доступна — очередь считает
     // /api/today, а не /api/home.
@@ -997,18 +1009,18 @@ describe('navBarLayout / navDrawerHtml (шторка «Меню»)', () => {
   const { navBarLayout, navDrawerHtml, NAV_BAR_MAX } = helpers;
   const S = (keys) => keys.map((key) => ({ key, label: key, icon: 'box' }));
 
-  it('пять разделов с вкладками — четыре в панели и «Меню»', () => {
-    const l = navBarLayout(S(['a', 'b', 'c', 'd', 'e']), (k) => (k === 'c' ? 4 : 1));
-    expect(NAV_BAR_MAX).toBe(4);
+  it('шесть разделов с вкладками — пять в панели и «Меню»', () => {
+    const l = navBarLayout(S(['a', 'b', 'c', 'd', 'e', 'f']), (k) => (k === 'c' ? 4 : 1));
+    expect(NAV_BAR_MAX).toBe(5);
     expect(l.menu).toBe(true);
-    expect(l.bar.map((s) => s.key)).toEqual(['a', 'b', 'c', 'd']);
+    expect(l.bar.map((s) => s.key)).toEqual(['a', 'b', 'c', 'd', 'e']);
   });
 
   it('шторка, повторяющая панель, не нужна', () => {
     const l = navBarLayout(S(['a', 'b', 'c']), () => 1);
     expect(l).toEqual({ bar: S(['a', 'b', 'c']), menu: false });
-    // Разделов больше пяти — «Меню» даже без вкладок: панель не резиновая.
-    expect(navBarLayout(S(['a', 'b', 'c', 'd', 'e', 'f']), () => 0).bar.length).toBe(4);
+    // Разделов больше шести — «Меню» даже без вкладок: панель не резиновая.
+    expect(navBarLayout(S(['a', 'b', 'c', 'd', 'e', 'f', 'g']), () => 0).bar.length).toBe(5);
     expect(navBarLayout(S(['a', 'b']), (k) => (k === 'b' ? 2 : 0)).bar.length).toBe(2);
   });
 
@@ -1044,7 +1056,7 @@ describe('руководитель: «Рабочие действия» (реш�
     navDrawerHtml, workSwitchHtml, deleteSwitchHtml, isBossLike,
   } = helpers;
   const tabs = (section, role, work) => roleSectionTabs(section, role, { work }).map(t => t.key);
-  const SECTIONS = ['sales', 'stock', 'money', 'clients'];
+  const SECTIONS = ['sales', 'stock', 'money', 'clients', 'leads'];
 
   it('выключатель — только у руководства, по умолчанию выключен', () => {
     expect(workActionsOn('boss', undefined)).toBe(false);
@@ -1067,7 +1079,9 @@ describe('руководитель: «Рабочие действия» (реш�
       // «Сверка кассы» остаётся и без «Рабочих действий»: для руководителя
       // это контроль, а не работа склада (см. moneyTabs).
       expect(tabs('money', r, false)).toEqual(['debts', 'reconcile', 'report']);
-      expect(tabs('clients', r, false)).toEqual(['funnel', 'limits']);
+      expect(tabs('clients', r, false)).toEqual(['buyers', 'limits']);
+      // Лиды и канал — работа менеджера; воронка (контроль) остаётся.
+      expect(tabs('leads', r, false)).toEqual(['funnel']);
     }
   });
 
@@ -1075,7 +1089,8 @@ describe('руководитель: «Рабочие действия» (реш�
     expect(tabs('sales', 'boss', true)).toEqual(['orders', 'report', 'docs']);
     expect(tabs('stock', 'boss', true)).toEqual(['catalog', 'containers', 'machines', 'invoices']);
     expect(tabs('money', 'boss', true)).toEqual(['debts', 'ops', 'reconcile', 'report']);
-    expect(tabs('clients', 'boss', true)).toEqual(['funnel', 'list', 'limits', 'channel']);
+    expect(tabs('clients', 'boss', true)).toEqual(['buyers', 'limits']);
+    expect(tabs('leads', 'boss', true)).toEqual(['funnel', 'list', 'channel']);
   });
 
   it('менеджер и склад: вкладки те же при любом значении выключателя', () => {
@@ -1084,10 +1099,13 @@ describe('руководитель: «Рабочие действия» (реш�
         sales: ['orders', 'report', 'docs'],
         stock: ['catalog', 'containers', 'machines', 'invoices'],
         money: ['confirm', 'debts', 'ops', 'reconcile'],
-        clients: ['list'],
+        clients: ['buyers'],
+        leads: ['list'],
       },
-      warehouse_keeper: { sales: ['orders'], stock: ['catalog'], money: ['confirm'], clients: ['list'] },
-      bookkeeper: { sales: ['orders'], stock: ['catalog'], money: ['confirm'], clients: ['list'] },
+      warehouse_keeper: { sales: ['orders'], stock: ['catalog'], money: ['confirm'],
+                          clients: ['buyers'], leads: ['list'] },
+      bookkeeper: { sales: ['orders'], stock: ['catalog'], money: ['confirm'],
+                    clients: ['buyers'], leads: ['list'] },
     };
     for (const [r, bySection] of Object.entries(expected)) {
       for (const sec of SECTIONS) {
@@ -1097,17 +1115,19 @@ describe('руководитель: «Рабочие действия» (реш�
     }
   });
 
-  it('панель руководителя: Сегодня · Решения · Деньги · Продажи · Меню', () => {
+  it('панель руководителя: Сегодня · Решения · Деньги · Продажи · Клиенты · Меню', () => {
     for (const work of [false, true]) {
       const layout = navBarLayout(helpers.navSections('boss'),
         (k) => roleSectionTabs(k, 'boss', { work }).length);
-      expect(layout.bar.map(s => s.key)).toEqual(['today', 'decisions', 'money', 'sales']);
+      expect(layout.bar.map(s => s.key))
+        .toEqual(['today', 'decisions', 'money', 'sales', 'clients']);
       expect(layout.menu).toBe(true);
     }
-    // Менеджер — как было.
+    // Менеджер: «Клиенты» — пятой кнопкой, «Обращения» — в шторке.
     const mgr = navBarLayout(helpers.navSections('manager'),
       (k) => roleSectionTabs(k, 'manager', {}).length);
-    expect(mgr.bar.map(s => s.key)).toEqual(['today', 'sales', 'stock', 'money']);
+    expect(mgr.bar.map(s => s.key)).toEqual(['today', 'sales', 'stock', 'money', 'clients']);
+    expect(mgr.menu).toBe(true);
   });
 
   it('удаление: руководству всегда, менеджеру — пока не требуется руководитель', () => {
@@ -1206,5 +1226,75 @@ describe('скидка к прайсу (C2/C5)', () => {
       .toBe('Ждёт одобрения из-за скидки 30% (порог 15%) — решение принимает руководитель.');
     expect(discountPendingNote({ flagged: false, max_pct: 4, threshold_pct: 15 })).toBe('');
     expect(discountPendingNote(null)).toBe('');
+  });
+});
+
+// ─── Раздел «Клиенты»: строки списка покупателей ────────────────────────────
+//
+// «Сколько отдано, когда была проведена отгрузка, на какую общую сумму он
+// покупал. Где эти все данные?» — владелец. Строка списка отвечает на все три
+// вопроса, не открывая карточку, поэтому её и проверяем отдельно.
+describe('список покупателей (clientRowsHtml / sumsLabel)', () => {
+  const { lastShipmentLabel } = helpers;
+  // toLocaleString('ru-RU') разделяет разряды НЕРАЗРЫВНЫМ пробелом — в тесте
+  // сравниваем с обычным, иначе строки различаются невидимо.
+  const nb = (s) => String(s).replace(/[\u00a0\u202f]/g, ' ');
+  const sumsLabel = (...a) => nb(helpers.sumsLabel(...a));
+  const clientRowsHtml = (...a) => nb(helpers.clientRowsHtml(...a));
+
+  it('суммы по валютам не складываются в одно число', () => {
+    expect(sumsLabel([{ currency: 'USD', amount: 12500 }])).toBe('12 500 USD');
+    expect(sumsLabel([
+      { currency: 'USD', amount: 12500 }, { currency: 'UZS', amount: 3400000 },
+    ])).toBe('12 500 USD · 3 400 000 UZS');
+    // Копейки с сервера (amount_cents) — тот же формат.
+    expect(sumsLabel([{ currency: 'USD', amount_cents: 125050 }])).toBe('1 250,50 USD');
+  });
+
+  it('пустое и нулевое — «0», а не пустая строка (если не попросили иначе)', () => {
+    expect(sumsLabel([])).toBe('0');
+    expect(sumsLabel(null)).toBe('0');
+    expect(sumsLabel([{ currency: 'USD', amount: 0 }])).toBe('0');
+    expect(sumsLabel([], '')).toBe('');
+  });
+
+  it('дата последней отгрузки — по-русски, а не прочерком', () => {
+    expect(lastShipmentLabel('2026-09-01')).toBe('отгрузка 01.09.2026');
+    // Прочерк читался бы как сбой — пишем словами.
+    expect(lastShipmentLabel(null)).toBe('отгрузок не было');
+  });
+
+  it('строка: имя, долг, дата отгрузки и сколько купил всего', () => {
+    const html = clientRowsHtml([{
+      agent_id: '7', name: 'ООО Ромашка', phone: '+998901234567',
+      bought_by_currency: [{ currency: 'USD', amount_cents: 1250000 }],
+      debt_by_currency: [{ currency: 'USD', amount: 380 }],
+      last_shipment: '2026-09-01', over_limit: false,
+    }]);
+    expect(html).toContain('data-client="7"');
+    expect(html).toContain('ООО Ромашка');
+    expect(html).toContain('должен 380 USD');
+    expect(html).toContain('отгрузка 01.09.2026');
+    expect(html).toContain('купил 12 500 USD');
+    expect(html).not.toContain('лимит превышен');
+  });
+
+  it('без долга — «долга нет», с превышением — бейдж общей статус-системы', () => {
+    const row = (extra) => clientRowsHtml([{
+      agent_id: '1', name: 'X', bought_by_currency: [], debt_by_currency: [],
+      last_shipment: null, ...extra,
+    }]);
+    expect(row({})).toContain('долга нет');
+    expect(row({})).toContain('покупок не было');
+    expect(row({ over_limit: true })).toContain('data-status="out"');
+  });
+
+  it('имя из базы не ломает разметку', () => {
+    const html = clientRowsHtml([{
+      agent_id: '<x>', name: '<img src=x onerror=1>', bought_by_currency: [],
+      debt_by_currency: [], last_shipment: null,
+    }]);
+    expect(html).not.toContain('<img');
+    expect(html).not.toContain('data-client="<x>"');
   });
 });

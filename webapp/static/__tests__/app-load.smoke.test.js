@@ -1479,32 +1479,34 @@ describe('техника: «Прибыла»', () => {
   });
 });
 
-describe('пять разделов вместо четырёх', () => {
+describe('шесть разделов: пять в панели и «Меню»', () => {
   const nav = (window) => Array.from(
     window.document.querySelectorAll('#bottom-nav .nav-item[data-screen]')
   ).map(b => b.dataset.screen);
 
-  it('нижняя панель строится под роль: четыре раздела и «Меню» со всеми остальными', () => {
-    // Пятый раздел ушёл из панели в шторку — пятый слот занимает «Меню»
-    // (см. navBarLayout): вкладки и будущие разделы растут там, а не в ряду.
+  it('панель менеджера: «Клиенты» — пятой кнопкой, обращения — в «Меню»', () => {
+    // Решение владельца: список покупателей открывается ОДНИМ касанием
+    // («Я нигде не нашёл, где можно посмотреть клиентов»). Шестой слот — «Меню»
+    // (см. navBarLayout), лиды и воронка живут разделом «Обращения» в шторке.
     const window = boot("currentUser = { role: 'manager' }; buildNav(); openNavDrawer();");
-    expect(nav(window)).toEqual(['today', 'sales', 'stock', 'money']);
+    expect(nav(window)).toEqual(['today', 'sales', 'stock', 'money', 'clients']);
     expect(window.document.querySelector('#bottom-nav [data-action="menu"]')).not.toBeNull();
     const drawer = Array.from(
       window.document.querySelectorAll('#nav-drawer .nav-link--section'),
     ).map(b => b.dataset.screen);
-    expect(drawer).toEqual(['today', 'sales', 'stock', 'money', 'clients']);
+    expect(drawer).toEqual(['today', 'sales', 'stock', 'money', 'clients', 'leads']);
     // Выключатель «Рабочие действия» менеджеру не рисуется.
     expect(window.document.querySelector('#nav-drawer [data-work-switch]')).toBeNull();
   });
 
-  it('руководитель: «Сегодня · Решения · Деньги · Продажи · Меню», остальное — в шторке', () => {
+  it('руководитель: «Сегодня · Решения · Деньги · Продажи · Клиенты · Меню»', () => {
     const window = boot("currentUser = { role: 'boss' }; buildNav(); openNavDrawer();");
-    expect(nav(window)).toEqual(['today', 'decisions', 'money', 'sales']);
+    expect(nav(window)).toEqual(['today', 'decisions', 'money', 'sales', 'clients']);
     const drawer = Array.from(
       window.document.querySelectorAll('#nav-drawer .nav-link--section'),
     ).map(b => b.dataset.screen);
-    expect(drawer).toEqual(['today', 'decisions', 'money', 'sales', 'stock', 'clients', 'settings']);
+    expect(drawer).toEqual(
+      ['today', 'decisions', 'money', 'sales', 'clients', 'stock', 'leads', 'settings']);
     const tabsOf = (sec) => Array.from(
       window.document.querySelectorAll(`#nav-drawer .nav-link--tab[data-screen="${sec}"]`),
     ).map(b => b.dataset.tab);
@@ -1513,15 +1515,17 @@ describe('пять разделов вместо четырёх', () => {
     expect(tabsOf('money')).toEqual(['debts', 'reconcile', 'report']);
     expect(tabsOf('sales')).toEqual(['orders', 'report']);
     expect(tabsOf('stock')).toEqual(['catalog', 'containers', 'machines']);
-    expect(tabsOf('clients')).toEqual(['funnel', 'limits']);
+    expect(tabsOf('clients')).toEqual(['buyers', 'limits']);
+    // «Обращения» без «Рабочих действий» — одна «Воронка», подпунктов нет.
+    expect(tabsOf('leads')).toEqual([]);
     const sw = window.document.querySelector('#nav-drawer [data-work-switch]');
     expect(sw).not.toBeNull();
     expect(sw.getAttribute('aria-checked')).toBe('false');
   });
 
   it('кладовщику не рисуют дверь, которая не открывается', () => {
-    // «Склад» и «Клиенты» ответят ему 403 по всем вкладкам. Вкладок у его
-    // разделов по одной — шторка повторила бы панель, «Меню» нет.
+    // «Склад», «Клиенты» и «Обращения» ответят ему 403 по всем вкладкам.
+    // Вкладок у его разделов по одной — шторка повторила бы панель, «Меню» нет.
     const window = boot("currentUser = { role: 'warehouse_keeper' }; buildNav();");
     expect(nav(window)).toEqual(['today', 'sales', 'money']);
     expect(window.document.querySelector('#bottom-nav [data-action="menu"]')).toBeNull();
@@ -1547,10 +1551,10 @@ describe('пять разделов вместо четырёх', () => {
       buildNav();
       renderHome = async () => {}; renderSalesScreen = async () => {};
       renderStockScreen = async () => {}; renderMoneyScreen = async () => {};
-      renderClientsScreen = async () => {};
-      window.__go = async (s) => { await showScreen(s); return [currentScreen, salesTab, stockTab, moneyTab, clientsTab]; };
+      renderClientsScreen = async () => {}; renderLeadsScreen = async () => {};
+      window.__go = async (s) => { await showScreen(s); return [currentScreen, salesTab, stockTab, moneyTab, clientsTab, leadsTab]; };
     `);
-    expect(await window.__go('home')).toEqual(['today', 'orders', 'catalog', 'confirm', 'funnel']);
+    expect(await window.__go('home')).toEqual(['today', 'orders', 'catalog', 'confirm', 'buyers', 'funnel']);
     expect((await window.__go('analytics')).slice(0, 2)).toEqual(['sales', 'report']);
     expect((await window.__go('stock'))[0]).toBe('stock');
     expect((await window.__go('stock'))[2]).toBe('catalog');
@@ -1561,6 +1565,14 @@ describe('пять разделов вместо четырёх', () => {
     expect((await window.__go('debts')).slice(0, 1)).toEqual(['money']);
     expect((await window.__go('debts'))[3]).toBe('debts');
     expect((await window.__go('limits'))[4]).toBe('limits');
+    // «Лиды» уехали из «Клиентов» в РАЗДЕЛ «Обращения» (key `leads`): старый
+    // адрес совпал с именем раздела, поэтому алиаса для него нет — иначе он
+    // затирал бы вкладку на каждом переходе в раздел (как было со `stock`).
+    expect((await window.__go('leads')).slice(0, 1)).toEqual(['leads']);
+    expect((await window.__go('leads'))[5]).toBe('funnel');
+    // Вкладка, выбранная до перехода, переживает тап по разделу.
+    window.eval("setSectionTab('leads', 'list')");
+    expect((await window.__go('leads'))[5]).toBe('list');
   });
 
   it('старый адрес «Накладные» ведёт во вкладку «Склада», таб подсвечен', async () => {
@@ -1578,7 +1590,7 @@ describe('пять разделов вместо четырёх', () => {
     expect(window.document.querySelector('.seg-item[data-sect="invoices"].active')).not.toBeNull();
   });
 
-  it('воронка обращений живёт в «Клиентах», а не в отчёте о деньгах', async () => {
+  it('воронка обращений живёт в «Обращениях», а не в отчёте о деньгах', async () => {
     const FUNNEL = {
       ok: true,
       funnel: { contacted: 64, replied: 51, won: 19, awaiting_reply: 4 },
@@ -1586,11 +1598,11 @@ describe('пять разделов вместо четырёх', () => {
       by_manager: [],
     };
     const window = boot(`
-      currentUser = { role: 'boss' };
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
       window.__calls = [];
       api = async (path) => { window.__calls.push(path); return ${JSON.stringify(FUNNEL)}; };
-      clientsTab = 'funnel';
-      window.__ready = renderClientsScreen();
+      leadsTab = 'funnel';
+      window.__ready = renderLeadsScreen();
     `);
     await window.__ready;
     const content = window.document.getElementById('content');
@@ -1598,15 +1610,15 @@ describe('пять разделов вместо четырёх', () => {
     expect(content.textContent).toContain('Воронка обращений');
     expect(content.textContent).toContain('Азиз Р.');
     // И переключатель раздела на месте (UI-BUG-04).
-    expect(content.querySelector('[data-sect="limits"]')).not.toBeNull();
+    expect(content.querySelector('[data-sect="list"]')).not.toBeNull();
   });
 
   it('пустая воронка объясняет, что дело в подключении, а не в клиентах', async () => {
     const window = boot(`
       currentUser = { role: 'boss' };
       api = async () => ({ ok: true, funnel: { contacted: 0 }, awaiting: [], by_manager: [] });
-      clientsTab = 'funnel';
-      window.__ready = renderClientsScreen();
+      leadsTab = 'funnel';
+      window.__ready = renderLeadsScreen();
     `);
     await window.__ready;
     const text = window.document.getElementById('content').textContent;
@@ -1755,8 +1767,8 @@ describe('звонки и причина отказа', () => {
     const window = boot(`
       currentUser = { role: 'boss', prefs: { work_actions: true } };
       api = async () => (${JSON.stringify(LIST)});
-      clientsTab = 'list';
-      window.__ready = renderClientsScreen();
+      leadsTab = 'list';
+      window.__ready = renderLeadsScreen();
     `);
     await window.__ready;
     const content = window.document.getElementById('content');
@@ -2838,12 +2850,17 @@ describe('Деньги → Поставщикам', () => {
 // ─── Сверка вкладок с ролями ручек: вкладка не должна вести к 403 ───────────
 
 describe('вкладки под роль совпадают с тем, кому отвечают ручки', () => {
-  it('менеджер в «Клиентах» открывает «Лиды», а не воронку с 403', () => {
+  it('менеджер в «Клиентах» видит покупателей без ряда вкладок', () => {
+    // «Лимиты» отвечают только руководству (/api/clients/overview), поэтому у
+    // менеджера вкладка одна — и ряда .seg над списком нет вовсе.
     const window = boot(`
       currentUser = { role: 'manager' };
       window.__tabs = sectionTabsFor('clients').map(t => t.key);
+      window.__leads = sectionTabsFor('leads').map(t => t.key);
     `);
-    expect(window.__tabs).toEqual(['list']);
+    expect(window.__tabs).toEqual(['buyers']);
+    // «Воронка» отвечает 403 менеджеру — в «Обращениях» у него только «Лиды».
+    expect(window.__leads).toEqual(['list']);
   });
 
   it('у кладовщика в «Деньгах» нет «Кассы» — /api/deposits/my ему не отвечает', () => {
@@ -3295,9 +3312,9 @@ describe('шторка «Меню»', () => {
   it('раздел, которого нет в панели, подсвечивает «Меню»', async () => {
     const { window, doc } = bootDrawer('boss');
     window.openNavDrawer();
-    doc.querySelector('#nav-drawer .nav-link--section[data-screen="clients"]').click();
+    doc.querySelector('#nav-drawer .nav-link--section[data-screen="stock"]').click();
     await tick();
-    expect(window.__state().screen).toBe('clients');
+    expect(window.__state().screen).toBe('stock');
     expect(doc.getElementById('nav-menu-btn').classList.contains('active')).toBe(true);
     expect(doc.querySelector('#bottom-nav .nav-item[data-screen].active')).toBeNull();
     // У менеджера нет «Воронки» — в шторке её тоже нет (403 не рисуем).
@@ -3663,8 +3680,8 @@ describe('руководитель без «Рабочих действий»', 
     const window = boot(`
       currentUser = { role: 'boss' };
       api = async () => (${JSON.stringify(FUNNEL)});
-      clientsTab = 'funnel';
-      window.__ready = renderClientsScreen();
+      leadsTab = 'funnel';
+      window.__ready = renderLeadsScreen();
     `);
     await window.__ready;
     const c = window.document.getElementById('content');
@@ -4184,5 +4201,165 @@ describe('«Деньги → Долги» → «Поставщикам»', () =>
     await window.__ready;
     expect(window.__sub()).toBe('suppliers');
     expect(window.document.querySelector('.seg-item.active[data-sect]').dataset.sect).toBe('debts');
+  });
+});
+
+// ─── Раздел «Клиенты»: список покупателей и карточка ────────────────────────
+//
+// «Я нигде не нашёл, где можно посмотреть клиентов. Сколько отдано, когда была
+// проведена отгрузка, на какую общую сумму он покупал. Где эти все данные?» —
+// владелец. Здесь проверяем, что ответ на каждый из трёх вопросов реально
+// оказывается на экране, а не только в ответе ручки.
+describe('«Клиенты» — список покупателей', () => {
+  const tick = () => new Promise(r => setTimeout(r, 0));
+  const LIST = {
+    ok: true, base_currency: 'USD', total: 2, shown: 2,
+    clients: [
+      { agent_id: '7', name: 'ООО Ромашка', phone: '+998901234567',
+        bought_by_currency: [{ currency: 'USD', amount_cents: 1250000 }],
+        bought_base: 12500, shipments: 4, last_shipment: '2026-09-01',
+        debt: 380, debt_by_currency: [{ currency: 'USD', amount: 380 }],
+        limit: 2000, over_limit: false },
+      { agent_id: '9', name: 'Азиз Рахимов', phone: '',
+        bought_by_currency: [], bought_base: 0, shipments: 0, last_shipment: null,
+        debt: 0, debt_by_currency: [], limit: 2000, over_limit: false },
+    ],
+  };
+
+  const bootList = (data = LIST) => boot(`
+    currentUser = { role: 'manager' };
+    buildNav();
+    window.__calls = [];
+    api = async (p, body) => { window.__calls.push([p, body]); return ${JSON.stringify(data)}; };
+    window.__ready = renderClientsScreen();
+  `);
+
+  it('раздел открывается сразу списком покупателей, без ряда вкладок', async () => {
+    const window = bootList();
+    await window.__ready;
+    await tick();
+    const content = window.document.getElementById('content');
+    expect(window.__calls[0][0]).toBe('/api/clients/list');
+    // У менеджера вкладка одна — переключателя нет (sectionNavHtml < 2).
+    expect(content.querySelector('.seg-item[data-sect]')).toBeNull();
+    expect(content.textContent.replace(/[\u00a0\u202f]/g, ' ')).toContain('купил 12 500 USD');
+    expect(content.textContent).toContain('ООО Ромашка');
+    expect(content.textContent).toContain('должен 380 USD');
+    expect(content.textContent).toContain('отгрузка 01.09.2026');
+    expect(content.textContent).toContain('долга нет');
+  });
+
+  it('поиск уходит на сервер: ищут и по имени, и по телефону', async () => {
+    const window = bootList();
+    await window.__ready;
+    await tick();
+    const input = window.document.getElementById('buyers-search');
+    expect(input).not.toBeNull();
+    input.value = '901234567';
+    input.dispatchEvent(new window.Event('input'));
+    await new Promise(r => setTimeout(r, 350));
+    await tick();
+    const last = window.__calls[window.__calls.length - 1];
+    expect(last[0]).toBe('/api/clients/list');
+    expect(last[1].q).toBe('901234567');
+  });
+
+  it('тап по строке открывает карточку клиента', async () => {
+    const window = bootList();
+    await window.__ready;
+    await tick();
+    window.renderAgentDetail = (id) => { window.__opened = id; };
+    window.document.querySelector('[data-client="7"]').click();
+    expect(window.__opened).toBe('7');
+  });
+
+  it('пустой справочник объясняет, откуда берутся клиенты', async () => {
+    const window = bootList({ ok: true, clients: [], total: 0, base_currency: 'USD' });
+    await window.__ready;
+    await tick();
+    expect(window.document.getElementById('content').textContent)
+      .toContain('Клиентов пока нет');
+  });
+});
+
+describe('карточка клиента отвечает на три вопроса владельца', () => {
+  const tick = () => new Promise(r => setTimeout(r, 0));
+  const DETAIL = {
+    ok: true, agent_id: '7', name: 'ООО Ромашка', phone: '+998901234567',
+    debt: 380, limit: 2000, free: 1620, over_limit: false, base_currency: 'USD',
+    paid_by_currency: [{ currency: 'USD', amount: 11800 }],
+    returned_by_currency: [],
+    purchases: {
+      count: 4, last_date: '2026-09-01',
+      total_by_currency: [{ currency: 'USD', amount_cents: 1250000 }],
+      period_by_currency: [{ currency: 'USD', amount_cents: 400000 }],
+      total_base_cents: 1250000, total_base_partial: false, period_days: 365,
+      top_products: [{ name: 'Кабель ВВГ', qty: 120, sum_cents: 900000 }],
+      recent: [
+        { id: 31, number: 'OUT-2026-0031', date: '2026-09-01', currency: 'USD', sum_cents: 400000 },
+        { id: 22, number: 'OUT-2026-0022', date: '2026-05-14', currency: 'USD', sum_cents: 850000 },
+      ],
+    },
+    orders: [{ id: 5, status: 'shipped', currency: 'USD', created_at: '2026-09-01 10:00',
+               total_cents: 400000, items: [] }],
+    money_history: [{ kind: 'payment', id: 1, amount: 4000, currency: 'USD', status: 'confirmed',
+                      who: 'Менеджер', order_id: 5, note: '', created_at: '2026-09-01 12:00',
+                      method: 'cash', method_label: 'Наличные', account_label: null,
+                      part_amount: 4000, part_currency: 'USD' }],
+  };
+
+  const bootCard = (data = DETAIL) => boot(`
+    currentUser = { role: 'manager' };
+    buildNav();
+    api = async () => (${JSON.stringify(data)});
+    window.__ready = renderAgentDetail('7');
+  `);
+
+  it('сколько купил — за всё время и за период, по валютам', async () => {
+    const window = bootCard();
+    await window.__ready;
+    await tick();
+    const text = window.document.getElementById('content').textContent
+      .replace(/[  ]/g, ' ');
+    expect(text).toContain('Сколько купил');
+    expect(text).toContain('Купил за всё время');
+    expect(text).toContain('12 500 USD');
+    expect(text).toContain('За последние 12 месяцев');
+    expect(text).toContain('4 000 USD');
+  });
+
+  it('когда отгружали — дата, номер накладной и сумма', async () => {
+    const window = bootCard();
+    await window.__ready;
+    await tick();
+    const content = window.document.getElementById('content');
+    const text = content.textContent.replace(/[  ]/g, ' ');
+    expect(text).toContain('Когда отгружали');
+    expect(text).toContain('01.09.2026');
+    expect(text).toContain('OUT-2026-0031');
+    // Каждая отгрузка раскрывается в состав — строка кликабельна.
+    expect(content.querySelector('[data-shipment="31"]')).not.toBeNull();
+  });
+
+  it('сколько отдано и сколько должен — с долгом, лимитом и способом оплаты', async () => {
+    const window = bootCard();
+    await window.__ready;
+    await tick();
+    const text = window.document.getElementById('content').textContent
+      .replace(/[  ]/g, ' ');
+    expect(text).toContain('Отдал всего');
+    expect(text).toContain('11 800 USD');
+    expect(text).toContain('Должен сейчас');
+    expect(text).toContain('380 USD');
+    expect(text).toContain('Лимит');
+    // Способ оплаты — из разбивки payment_parts, а не «просто платёж».
+    expect(text).toContain('Наличные');
+  });
+
+  it('менеджеру не рисуют правку лимита — ручка ответит 403', async () => {
+    const window = bootCard();
+    await window.__ready;
+    await tick();
+    expect(window.document.getElementById('cl-edit')).toBeNull();
   });
 });

@@ -116,7 +116,18 @@
       roles: ['admin', 'boss', 'manager'] },
     { key: 'money',   label: 'Деньги',   icon: 'wallet',
       roles: ['admin', 'boss', 'manager', 'warehouse_keeper', 'bookkeeper'] },
+    // «Клиенты» — ПОКУПАТЕЛИ: кто сколько купил, сколько должен, когда
+    // отгружали. Раздел с этим именем раньше вёл в воронку ОБРАЩЕНИЙ, и
+    // списка покупателей не было нигде («Я нигде не нашёл, где можно
+    // посмотреть клиентов» — владелец). Лиды, воронка и канал уехали в
+    // собственный раздел «Обращения» — это работа ДО продажи.
     { key: 'clients', label: 'Клиенты',  icon: 'user',
+      roles: ['admin', 'boss', 'manager'] },
+    // Обращения: воронка, кто написал и ждёт ответа, посты в канал. В нижнюю
+    // панель не попадает (последний рабочий раздел в порядке обеих ролей) —
+    // открывается из «Меню». Переписка с тем, кто ещё ничего не купил, —
+    // не то, к чему тянутся по десять раз на дню.
+    { key: 'leads',   label: 'Обращения', icon: 'phone',
       roles: ['admin', 'boss', 'manager'] },
     // Реквизиты компании, курсы, выключатель «Рабочие действия». Только в
     // «Меню»: в панель не попадает (последний в порядке руководителя).
@@ -125,11 +136,12 @@
   ];
 
   // Руководитель смотрит, решает и контролирует (решение владельца), поэтому
-  // его панель — «Сегодня · Решения · Деньги · Продажи · Меню», а склад,
-  // клиенты и настройки — через «Меню». Порядок остальных ролей — порядок
-  // таблицы: их интерфейс не менялся.
+  // его панель — «Сегодня · Решения · Деньги · Продажи · Клиенты · Меню», а
+  // склад, обращения и настройки — через «Меню». «Клиенты» стоят в панели у
+  // обеих ролей: вопрос «сколько он у нас купил и сколько должен» задают чаще,
+  // чем открывают склад. Порядок остальных ролей — порядок таблицы.
   const BOSS_ROLES = ['admin', 'boss'];
-  const BOSS_NAV_ORDER = ['today', 'decisions', 'money', 'sales', 'stock', 'clients', 'settings'];
+  const BOSS_NAV_ORDER = ['today', 'decisions', 'money', 'sales', 'clients', 'stock', 'leads', 'settings'];
 
   function isBossLike(role) {
     return BOSS_ROLES.indexOf(role) !== -1;
@@ -228,29 +240,42 @@
     return tabs;
   }
 
-  // Клиенты: всё про отношения с покупателем. Воронка переехала сюда из отчёта
-  // о деньгах — переписка с клиентом не деньги.
+  // Клиенты — ПОКУПАТЕЛИ: список «кто сколько купил, сколько должен, когда
+  // отгружали» и карточка каждого. У менеджера вкладок нет вовсе — раздел
+  // открывается сразу списком, в одно касание из панели (жалоба владельца:
+  // данные есть, а места, где на них смотрят, нет).
+  //
+  // «Лимиты» остались здесь, а не уехали в «Обращения»: кредитный лимит — про
+  // ПОКУПАТЕЛЯ, а не про того, кто написал в бота. Отвечает на них
+  // /api/clients/overview (admin/boss), поэтому у менеджера этой вкладки нет,
+  // и ряд .seg ему не рисуется вовсе.
   function clientsTabs(f) {
     f = f || {};
+    // Подпись «Покупатели», а не «Клиенты»: шапка показывает «раздел · вкладка»,
+    // и «Клиенты · Клиенты» выглядит как сбой.
+    const tabs = [{ key: 'buyers', label: 'Покупатели' }];
+    if (f.isBoss) tabs.push({ key: 'limits', label: 'Лимиты' });
+    return tabs;
+  }
+
+  // Обращения: воронка, лиды и канал — работа ДО продажи. Раньше это и был
+  // раздел «Клиенты», из-за чего покупателя в нём было не найти.
+  function leadsTabs(f) {
+    f = f || {};
     // Список лидов — не роскошь: до него исход сделки можно было поставить
-    // только тому, кто прямо сейчас висит без ответа. Клиент, которому ответили
-    // и который потом замолчал, не находился вовсе.
+    // только тому, кто прямо сейчас висит без ответа. Клиент, которому
+    // ответили и который потом замолчал, не находился вовсе.
     //
     // «Воронка» — только руководству: /api/leads/funnel отвечает admin/boss,
     // и у менеджера это была вкладка, которая гарантированно возвращала 403.
-    // Первой она стояла потому, что раздел рисовали под босса; менеджер
-    // открывал «Клиенты» и видел ошибку вместо своих лидов.
     //
     // `work: false` — руководитель без «Рабочих действий»: лиды и звонки,
-    // канал — работа менеджера; воронка и лимиты — контроль, остаются.
+    // канал — работа менеджера; воронка — контроль, остаётся.
     const work = f.work !== false;
     const tabs = [];
     if (f.isBoss) tabs.push({ key: 'funnel', label: 'Воронка' });
     if (!f.isBoss || work) tabs.push({ key: 'list', label: 'Лиды' });
-    if (f.isBoss) {
-      tabs.push({ key: 'limits', label: 'Лимиты' });
-      if (work) tabs.push({ key: 'channel', label: 'Канал' });
-    }
+    if (f.isBoss && work) tabs.push({ key: 'channel', label: 'Канал' });
     return tabs;
   }
 
@@ -281,7 +306,8 @@
         canReconcile: working,
       });
     }
-    if (section === 'clients') return clientsTabs({ isBoss: boss, work });
+    if (section === 'clients') return clientsTabs({ isBoss: boss });
+    if (section === 'leads') return leadsTabs({ isBoss: boss, work });
     return [];
   }
 
@@ -326,13 +352,20 @@
   // В панели — не больше NAV_BAR_MAX разделов и кнопка «Меню», если шторке
   // есть что показать сверх панели: раздел, не влезший в панель, или вкладки
   // (ряд из четырёх вкладок на телефоне уже не помещается, и найти четвёртую
-  // можно было только пролистав ряд). Пятый слот панели — «Меню»: Apple и
-  // Material сходятся на пяти пунктах как пределе нижней панели.
+  // можно было только пролистав ряд). Шестой слот панели — «Меню».
+  //
+  // Было четыре, стало ПЯТЬ: «Клиенты» должны открываться одним касанием
+  // (решение владельца — список покупателей, до которого он не мог
+  // добраться). Панель — CSS-grid с равными колонками, шесть кнопок на 360px
+  // дают по ~53px: иконка 23px и подпись 10px помещаются, и ни одна не
+  // режется многоточием (сторож — tests/e2e/test_ui_layout_audit.py,
+  // test_bottom_nav_labels_are_not_clipped). Седьмой кнопки не будет:
+  // подпись «Клиенты» на 360px упирается в край уже сейчас.
   //
   // Кнопка «Меню» стоит внизу, а не бургером в шапке: верхний левый угол —
   // самое дальнее место от большого пальца, и в Telegram прямо над шапкой
   // WebApp лежит «Закрыть» клиента — промах бургером закрывал бы приложение.
-  const NAV_BAR_MAX = 4;
+  const NAV_BAR_MAX = 5;
 
   // sections — navSections(role); tabsCount(key) — число вкладок раздела под
   // роль. Возвращает { bar: [раздел…], menu: bool }. Роли, у которых шторка
@@ -1051,6 +1084,61 @@
     return Number.isFinite(n) ? n : 0;
   }
 
+  // ─── Раздел «Клиенты»: список покупателей (/api/clients/list) ─────────────
+  //
+  // «Сколько отдано, когда была проведена отгрузка, на какую общую сумму он
+  // покупал. Где эти все данные?» — владелец. Данные лежали в
+  // /api/clients/detail, но попасть туда можно было только через лупу. Строка
+  // списка отвечает на все три вопроса, не открывая карточку.
+
+  // Суммы по валютам одной строкой: «12 500 USD · 3 400 000 UZS». Складывать
+  // валюты нельзя (курс не у всех задан), а показывать одну и умалчивать про
+  // вторую — врать. Пустой список — `empty` (по умолчанию «0»).
+  function sumsLabel(items, empty) {
+    const list = (items || [])
+      .map((x) => ({
+        currency: x.currency,
+        amount: x.amount_cents != null ? Number(x.amount_cents) / 100 : Number(x.amount),
+      }))
+      .filter((x) => isFinite(x.amount) && x.amount > 0);
+    if (!list.length) return empty === undefined ? '0' : empty;
+    return list.map((x) => formatMoney(x.amount, x.currency)).join(' · ');
+  }
+
+  // Когда отгружали в последний раз. Даты нет — так и пишем: «отгрузок не
+  // было» на строке клиента понятнее прочерка, который читается как сбой.
+  function lastShipmentLabel(date) {
+    return date ? `отгрузка ${formatDateRU(date)}` : 'отгрузок не было';
+  }
+
+  // Строки списка покупателей. Каждая: имя и телефон, «купил всего» и, второй
+  // строкой, долг и дата последней отгрузки. Долг — первым: это единственная
+  // цифра, ради которой список открывают срочно.
+  function clientRowsHtml(clients) {
+    return (clients || []).map((c) => {
+      // sumsLabel уже экранирован (formatMoney экранирует код валюты, число
+      // рисует сам) — второй escapeHtml превратил бы «&» в «&amp;amp;».
+      const debt = sumsLabel(c.debt_by_currency, '');
+      // Долг — справа и подписью: голое число читалось бы как «купил столько».
+      const debtPart = debt
+        ? `<span class="client-debt">должен ${debt}</span>`
+        : '<span class="client-debt is-clear">долга нет</span>';
+      const over = c.over_limit
+        ? '<span class="stock-badge" data-status="out">лимит превышен</span>' : '';
+      const bought = sumsLabel(c.bought_by_currency, '');
+      const boughtPart = bought ? `купил ${bought}` : 'покупок не было';
+      return `
+      <div class="c-row c-row--tap" data-client="${escapeHtml(c.agent_id)}" role="button" tabindex="0">
+        <div class="card-row-icon">${icon('building')}</div>
+        <div class="card-row-info">
+          <div class="card-row-title">${escapeHtml(c.name || '—')}</div>
+          <div class="card-row-sub">${boughtPart} · ${escapeHtml(lastShipmentLabel(c.last_shipment))}</div>
+        </div>
+        <div class="card-row-value">${debtPart}${over}</div>
+      </div>`;
+    }).join('');
+  }
+
   // ─── Куда поступили: карты и счета (services/pay_accounts.py) ────────────
   const PAY_ACCOUNT_KIND = {
     card: { title: 'На какую карту', add: 'Новая карта', empty: 'Карт пока нет — добавьте новую',
@@ -1487,7 +1575,8 @@
     parseAmount, parsePaymentItems, renderMoneyTotalsHtml, categoryTree, categoryMatches,
     NAV_SECTIONS, navSections, defaultSection, sectionNavHtml,
     NAV_BAR_MAX, navBarLayout, navDrawerHtml,
-    salesTabs, stockTabs, moneyTabs, clientsTabs,
+    salesTabs, stockTabs, moneyTabs, clientsTabs, leadsTabs,
+    sumsLabel, lastShipmentLabel, clientRowsHtml,
     BOSS_NAV_ORDER, isBossLike, workActionsOn, deleteActionsOn, roleSectionTabs, resolveScreen, workSwitchHtml, deleteSwitchHtml,
     debtReminderSwitchHtml,
     periodSegHtml, rangeLabel, formatMoney,

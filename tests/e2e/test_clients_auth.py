@@ -32,7 +32,7 @@ def _seed_lead(e2e, *, tg_user_id: int = 555_001, name: str = "Азиз Р.") ->
 def test_manager_marks_lead_won(open_app, e2e):
     lead_id = _seed_lead(e2e)
     mgr = open_app(e2e.ids["mgr"])
-    go(mgr, "clients")
+    go(mgr, "leads")
     mgr.wait_for_selector(f'[data-lead="{lead_id}"]')
     row = mgr.locator(f'[data-lead="{lead_id}"]')
     assert "Азиз" in row.inner_text()
@@ -47,7 +47,7 @@ def test_manager_marks_lead_won(open_app, e2e):
 def test_lead_lost_reason_is_optional(open_app, e2e):
     lead_id = _seed_lead(e2e)
     mgr = open_app(e2e.ids["mgr"])
-    go(mgr, "clients")
+    go(mgr, "leads")
     mgr.click(f'[data-lead="{lead_id}"]')
     mgr.click('[data-lead-status="lost"]')
     mgr.wait_for_selector(".c-overlay [data-reason]")
@@ -62,7 +62,7 @@ def test_lead_gets_counterparty_created_by_button(open_app, e2e):
     """Контрагента заводит ЧЕЛОВЕК кнопкой, тёзка — привязывается, а не дублируется."""
     lead_id = _seed_lead(e2e, name="ООО Ромашка")  # тёзка существующего контрагента
     mgr = open_app(e2e.ids["mgr"])
-    go(mgr, "clients")
+    go(mgr, "leads")
     mgr.click(f'[data-lead="{lead_id}"]')
     mgr.click("#lead-agent")
     mgr.wait_for_selector("#ms-f-search")
@@ -77,7 +77,7 @@ def test_lead_gets_counterparty_created_by_button(open_app, e2e):
 
 def test_call_is_recorded_without_lead(open_app, e2e):
     mgr = open_app(e2e.ids["mgr"])
-    go(mgr, "clients")
+    go(mgr, "leads")
     mgr.wait_for_selector("#call-new")
     mgr.click("#call-new")
     sheet_fill(mgr, {"display_name": "Бахтиёр", "phone": "+998 (90) 111-22-33",
@@ -96,7 +96,7 @@ def test_call_is_recorded_without_lead(open_app, e2e):
 def test_boss_funnel_counts_seeded_lead(open_app, e2e):
     _seed_lead(e2e)
     boss = open_app(e2e.ids["boss"])
-    go(boss, "clients")
+    go(boss, "leads")
     tab(boss, "funnel")
     settled(boss)
     text = boss.locator("#content").inner_text()
@@ -152,14 +152,14 @@ def test_boss_updates_currency_rate(open_app, e2e):
 
 def test_channel_history_renders_and_manager_has_no_tab(open_app, e2e):
     boss = open_app(e2e.ids["boss"])
-    go(boss, "clients")
+    go(boss, "leads")
     tab(boss, "channel")
     settled(boss)
     text = boss.locator("#content").inner_text()
     assert "Ошибка" not in text and "Нет доступа" not in text
 
     mgr = open_app(e2e.ids["mgr"])
-    go(mgr, "clients")
+    go(mgr, "leads")
     assert mgr.locator('.seg-item[data-sect="channel"]').count() == 0
 
 

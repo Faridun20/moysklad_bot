@@ -25,9 +25,10 @@ pytestmark = pytest.mark.usefixtures("boss_work_actions")
 def test_nav_sections_follow_role(open_app, e2e):
     """У руководства — «Решения» и «Настройки»; у кладовщика нет «Склада» — ручки ему не отвечают."""
     boss = open_app(e2e.ids["boss"])
-    assert nav_screens(boss) == ["today", "decisions", "money", "sales", "stock", "clients", "settings"]
-    # В панели четыре — пятый слот у «Меню» (шторка разделов и вкладок).
-    assert boss.locator("#bottom-nav .nav-item[data-screen]").count() == 4
+    assert nav_screens(boss) == ["today", "decisions", "money", "sales", "clients",
+                                 "stock", "leads", "settings"]
+    # В панели пять разделов — шестой слот у «Меню» (шторка разделов и вкладок).
+    assert boss.locator("#bottom-nav .nav-item[data-screen]").count() == 5
 
     keeper = open_app(e2e.ids["keeper"])
     screens = nav_screens(keeper)
@@ -146,10 +147,22 @@ def test_xss_in_request_does_not_run_in_boss_session(open_app, e2e):
 # ─── Вкладки не ведут к 403 ──────────────────────────────────────────────────
 
 
-def test_manager_clients_section_opens_leads_without_error(open_app, e2e):
+def test_manager_clients_section_opens_buyers_without_error(open_app, e2e):
+    """«Клиенты» у менеджера — список покупателей, без вкладок и без 403."""
     mgr = open_app(e2e.ids["mgr"])
     go(mgr, "clients")
-    mgr.wait_for_function("() => !document.querySelector('#clients-body .sk-card')")
+    mgr.wait_for_selector("#buyers-search")
+    mgr.wait_for_function("() => !document.querySelector('#buyers-list .sk-card')")
+    body = mgr.locator("#content").inner_text()
+    assert "Нет доступа" not in body and "Ошибка" not in body
+    # «Лимиты» отвечают только руководству — вкладки у менеджера нет вовсе.
+    assert mgr.locator('[data-sect="limits"]').count() == 0
+
+
+def test_manager_leads_section_opens_without_error(open_app, e2e):
+    mgr = open_app(e2e.ids["mgr"])
+    go(mgr, "leads")
+    mgr.wait_for_function("() => !document.querySelector('#leads-body .sk-card')")
     body = mgr.locator("#content").inner_text()
     assert "Нет доступа" not in body and "Ошибка" not in body
     assert mgr.locator('[data-sect="funnel"]').count() == 0

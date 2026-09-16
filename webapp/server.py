@@ -4380,6 +4380,42 @@ async def api_clients_overview(request: Request):
     )
 
 
+@app.post("/api/clients/list")
+async def api_clients_list(request: Request):
+    """Список ПОКУПАТЕЛЕЙ: сколько купил за всё время, сколько должен сейчас,
+    когда отгружали в последний раз.
+
+    Жалоба владельца: «Я нигде не нашёл, где можно посмотреть клиентов.
+    Сколько отдано, когда была проведена отгрузка, на какую общую сумму он
+    покупал». Данные были — не было списка: раздел «Клиенты» вёл в воронку
+    ОБРАЩЕНИЙ, а к карточке покупателя можно было попасть только через лупу,
+    зная имя наизусть.
+
+    Роли — те же, что у `/api/clients/detail` (A3): менеджер видит своих
+    клиентов, заказы и долги и так, список лишь собирает это в одно место.
+    Себестоимости и прибыли здесь нет — они остаются у admin/boss.
+    """
+    from services import counterparties as cp_service
+
+    data = await request.json()
+    _authorize(
+        data,
+        allowed_roles=("admin", "boss", "manager"),
+        rate_limit_scope="api_clients_list",
+        # Поиск по списку шлёт запрос на каждую паузу в наборе (debounce 300 мс),
+        # и лимит карточки (30/мин) резал бы его на длинном имени.
+        rate_limit_max=90,
+        rate_limit_window=60.0,
+    )
+    query = (data.get("q") or "").strip()[:64]
+    try:
+        limit = int(data.get("limit") or 100)
+    except (TypeError, ValueError):
+        limit = 100
+    res = await cp_service.buyers_list(query, limit=limit)
+    return JSONResponse({"ok": True, **res})
+
+
 @app.post("/api/clients/detail")
 async def api_clients_detail(request: Request):
     """Карточка контрагента: имя/телефон + долг/лимит + заказы в боте +
@@ -4419,6 +4455,28 @@ async def api_clients_detail(request: Request):
     purchases = await warehouse.counterparty_purchases(agent_id)
     from config import BASE_CURRENCY
 
+    # «Сколько отдано» — по валютам, из той же ленты, что рисуется ниже
+    # (второго запроса не нужно). Отклонённое не считаем: это не деньги.
+    # Наличные у менеджера, ещё не сданные в кассу, клиент уже отдал —
+    # поэтому берём и pending: вопрос владельца «сколько отдал КЛИЕНТ», а не
+    # «сколько дошло до кассы» (это видно статусом каждой строки).
+    paid: dict[str, float] = {}
+    returned: dict[str, float] = {}
+    for row in money_history:
+        if row.get("status") == "rejected":
+            continue
+        cur = (row.get("currency") or BASE_CURRENCY or "USD").upper()
+        if row.get("kind") == "payment":
+            paid[cur] = paid.get(cur, 0.0) + float(row.get("amount") or 0.0)
+        elif row.get("kind") == "return":
+            returned[cur] = returned.get(cur, 0.0) + float(row.get("amount") or 0.0)
+
+    def by_cur(totals: dict[str, float]) -> list[dict[str, Any]]:
+        return [
+            {"currency": c, "amount": round(v, 2)}
+            for c, v in sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
+        ]
+
     return JSONResponse(
         {
             "ok": True,
@@ -4431,6 +4489,8 @@ async def api_clients_detail(request: Request):
             "over_limit": debt > limit,
             "orders": orders,
             "money_history": money_history,
+            "paid_by_currency": by_cur(paid),
+            "returned_by_currency": by_cur(returned),
             "purchases": purchases,
             "base_currency": (BASE_CURRENCY or "USD").upper(),
         }

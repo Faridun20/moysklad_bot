@@ -172,9 +172,14 @@ async def gather(user_id: int, role: str) -> list[dict]:
 
     if role in _WITH_MANAGER:
         try:
+            # Раздел «Клиенты» теперь про ПОКУПАТЕЛЕЙ (список и карточки), а
+            # лиды и воронка живут своим разделом «Обращения». Адрес — под
+            # роль: руководителю «Воронка» (там и стоит «Ждут ответа · N»),
+            # менеджеру — «Лиды»; `/api/leads/funnel` ему отвечает 403, и
+            # счётчик привёл бы его в пустую вкладку.
             add("awaiting_reply", await _awaiting_reply(scope_uid),
                 "Клиенты ждут ответа", "написали и не получили ответа", "warn",
-                "clients:funnel")
+                "leads:funnel" if role in ("admin", "boss") else "leads:list")
         except Exception:
             logger.warning("work_queue: ожидающие ответа не посчитаны", exc_info=True)
         try:

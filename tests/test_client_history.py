@@ -298,3 +298,49 @@ def test_detail_forbidden_for_warehouse_keeper(isolated_db, monkeypatch):
     client = _client(db, monkeypatch, 4, role="warehouse_keeper")
     r = client.post("/api/clients/detail", json={"initData": "4", "agent_id": "AG-1"})
     assert r.status_code == 403
+
+
+# ─── «Сколько отдано и как» (жалоба владельца) ───────────────────────────────
+
+
+def test_history_says_how_the_client_paid(isolated_db):
+    """У платежа виден СПОСОБ — наличные/карта/перечисление.
+
+    «Сколько отдано» без «как отдано» отвечало ровно на половину вопроса,
+    хотя разбивка лежит в `payment_parts` с первого дня (services.order_payments).
+    """
+    from tests.conftest import with_pay_accounts
+
+    db = isolated_db
+    _setup(db)
+    oid = _order(db, "AG-P", items=((1, 300.0),))
+    from services import order_payments
+
+    actor = order_payments.Actor(user_id=1, name="Manager", role="manager")
+    rows = with_pay_accounts(
+        [{"method": "cash", "amount": "100", "currency": "USD"},
+         {"method": "card", "amount": "200", "currency": "USD"}],
+        run=_run,
+    )
+    res = _run(order_payments.record_payment_parts(oid, actor, rows))
+    assert res.get("ok"), res
+
+    history = _run(db.get_agent_money_history("AG-P"))
+    methods = sorted(h["method"] for h in history if h["kind"] == "payment")
+    assert methods == ["card", "cash"]
+    labels = [h["method_label"] for h in history if h["kind"] == "payment"]
+    assert all(labels)
+
+
+def test_detail_sums_up_what_the_client_handed_over(isolated_db, monkeypatch):
+    """`paid_by_currency` — «Отдал всего» в карточке. Считается по валютам и
+    включает наличные, ещё не сданные в кассу: клиент их уже отдал."""
+    db = isolated_db
+    _setup(db)
+    oid = _order(db, "AG-1", items=((2, 100.0),))
+    db.add_payment(1, "u", "Manager", 120.0, "USD", "часть", order_id=oid)
+
+    client = _client(db, monkeypatch, 2)
+    body = client.post("/api/clients/detail", json={"initData": "2", "agent_id": "AG-1"}).json()
+    assert body["paid_by_currency"] == [{"currency": "USD", "amount": 120.0}]
+    assert body["returned_by_currency"] == []
