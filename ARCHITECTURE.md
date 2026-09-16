@@ -380,6 +380,10 @@ close_date)` — нет: пересчёт кассы дважды за день 
    ▼
 order: status=draft, agent, items, payment_type, due_date?
    │
+   ├─ «Счёт» (services/sales_invoice.py) — бумага клиенту ДО отгрузки:
+   │     PDF тем же движком, что накладная; печать CUPS / файл в Telegram.
+   │     Остаток, долг и статус заказа НЕ трогает, пишет только audit_log.
+   │
    │ нажал «🚀 Отправить заявку»
    ▼
 shipment_request: status=pending
@@ -702,6 +706,7 @@ T3.3: бот срезан до того, чего нет в WebApp. Экраны
 | `/api/pay_accounts` | POST | карты и счета «куда поступили» + последний выбор человека (`include_archived` — руководству) |
 | `/api/pay_accounts/{create,update,archive}` | POST | завести (менеджер и руководство; тёзка → `existed`), править и архив (руководство; менеджер — без руководителя) |
 | `/api/audit_log` | POST | журнал действий, read-only, admin/boss (`database.get_audit_log_page` — фильтры дата/сотрудник + пагинация, «Настройки → Журнал действий») |
+| `/api/orders/invoice` | POST | «Счёт» клиенту по заказу (номер = номер заказа, позиции, итог прописью); `/api/orders/invoice/{print,send}` — печать CUPS и PDF составителю в Telegram. Ничего не двигает (`services/sales_invoice.py`) |
 | `/api/orders/timeline` | POST | история заказа: заявка/оплата/отгрузка/сдача/возврат/отмена одной лентой (`services/order_timeline.py`); доступ — как у карточки заказа (руководству — любой, менеджеру — свой) |
 | `/tg/{secret}` | POST | вебхук от Telegram (только если включён режим) |
 
@@ -773,6 +778,7 @@ psycopg2 + threadpool + кэш ролей закрывает реальные п
 | Добавить экран в WebApp | `webapp/static/index.html` (nav button), `webapp/static/app.js` (`case '...':` + `render*()`), `webapp/static/style.css` |
 | Добавить команду в боте | новый файл в `handlers/`, зарегистрировать в `bot.py:register_routers` |
 | Изменить печать документов | `services/printing.py` (CUPS) + `handlers/printing.py` (кнопка и `/printer`) |
+| Изменить счёт клиенту (документ до отгрузки) | `services/sales_invoice.py` (сбор) + `services/invoice_pdf.py` (`build_sales_invoice_html`) |
 | Изменить движение остатка | `services/warehouse.py` (накладные), `services/order_shipment.py` (отгрузка заказа), `services/container_receipt.py` (приёмка) |
 | Изменить дневной пинг / операционную сводку | `tasks/run_ops_monitor.py` (пинг) + `services/ops_summary.py` (сбор) + `webapp/server.py:/api/ops-summary` |
 | Найти ошибку в проде | Railway Logs у нужного сервиса. Долгие SQL логируются как `SQL slow ...` через `SQL_SLOW_MS` (default 200мс) |

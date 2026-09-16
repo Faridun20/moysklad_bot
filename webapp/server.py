@@ -4001,6 +4001,165 @@ async def api_orders(request: Request):
     )
 
 
+# ─── «Счёт» — документ клиенту ДО отгрузки ───────────────────────────────────
+#
+# Жалоба владельца: печатная форма появлялась только ПОСЛЕ отгрузки, то есть
+# разговор с клиентом шёл задом наперёд — сначала отдай товар, потом покажи
+# бумагу. Счёт закрывает дыру: собрал заказ → распечатал/отправил счёт →
+# клиент согласился → заявка на отгрузку.
+#
+# Счёт НИЧЕГО НЕ ДВИГАЕТ: ни остатка, ни долга, ни статуса заказа (см.
+# `services/sales_invoice.py`). Три ручки — данные, печать, отправка; пишут они
+# только в `audit_log`, чтобы у руководителя была история «кому уже показывали
+# бумагу».
+_SALES_INVOICE_ROLES = ("admin", "boss", "manager")
+
+
+async def _sales_invoice_doc(data: Any, user: dict) -> dict:
+    """Проверить доступ к заказу и собрать счёт. Отказы — HTTP с текстом.
+
+    Доступ — как у карточки заказа: руководству любой, менеджеру свой. Счёт
+    несёт цены и клиента, и чужой заказ по чужому номеру он бы и выдал.
+    """
+    from services import async_db as adb
+    from services.roles import role_allowed
+    from services.sales_invoice import SalesInvoiceError, build_sales_invoice
+
+    try:
+        order_id = int(data.get("order_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="order_id обязателен (число)") from None
+
+    order = await adb.get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    role = get_role(user["id"])
+    if not (role_allowed(role, ("admin", "boss")) or int(order["user_id"]) == int(user["id"])):
+        raise HTTPException(status_code=403, detail="Доступен только свой заказ")
+
+    try:
+        return await build_sales_invoice(order_id)
+    except SalesInvoiceError as e:
+        # «Нет клиента» / «нет позиций» — это ответ человеку, а не сбой: он
+        # дособирает заказ и нажимает снова.
+        raise HTTPException(status_code=400, detail=e.message) from None
+
+
+@app.post("/api/orders/invoice")
+async def api_order_sales_invoice(request: Request):
+    """Данные счёта по заказу: номер, дата, клиент, позиции, итог прописью.
+
+    ТОЛЬКО чтение. Экран показывает это листом «Счёт № N от ДД.ММ.ГГГГ» с
+    кнопками «Распечатать» и «Отправить PDF».
+    """
+    from services import printing
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_SALES_INVOICE_ROLES,
+        rate_limit_scope="api_order_sales_invoice",
+        rate_limit_max=60,
+    )
+    doc = await _sales_invoice_doc(data, user)
+    # Кнопка «Распечатать» рисуется, только если в контейнере есть клиент CUPS:
+    # кнопка, которая гарантированно ответит отказом, хуже отсутствующей.
+    return JSONResponse({"invoice": doc, "can_print": printing.is_available()})
+
+
+@app.post("/api/orders/invoice/print")
+async def api_order_sales_invoice_print(request: Request):
+    """Напечатать счёт на офисном принтере. ok = задание принято очередью."""
+    import asyncio
+
+    from services import async_db as adb
+    from services import printing
+    from services.invoice_pdf import render_sales_invoice_pdf, sales_invoice_filename
+    from services.sales_invoice import audit_details
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_SALES_INVOICE_ROLES,
+        rate_limit_scope="api_order_sales_invoice_print",
+        rate_limit_max=30,
+    )
+    doc = await _sales_invoice_doc(data, user)
+    if not printing.is_available():
+        return JSONResponse({"ok": False, "error": "Печать не настроена на этом сервере"})
+    try:
+        # WeasyPrint синхронный и тяжёлый — в поток, иначе на время рендера
+        # встаёт весь event loop.
+        pdf = await asyncio.to_thread(render_sales_invoice_pdf, doc)
+    except Exception:
+        logger.exception("Печать: не собран счёт по заказу #%s", doc["order_id"])
+        return JSONResponse({"ok": False, "error": "Не удалось собрать PDF счёта"})
+    result = await printing.print_pdf_bytes(
+        pdf,
+        filename=sales_invoice_filename(doc),
+        label=f"Счёт № {doc['number']} · {_actor_name(user)}",
+    )
+    if result.ok:
+        await adb.add_audit_log(
+            user["id"], _actor_name(user), get_role(user["id"]),
+            "sales_invoice_printed", audit_details(doc, "печать"),
+        )
+    return JSONResponse({"ok": result.ok, "message": result.message, "error": result.error})
+
+
+@app.post("/api/orders/invoice/send")
+async def api_order_sales_invoice_send(request: Request):
+    """Прислать PDF счёта в Telegram тому, кто нажал кнопку.
+
+    Именно составителю, а не клиенту напрямую: счёт показывают и обсуждают —
+    менеджер пересылает файл сам, когда договорился. Отправка «сразу клиенту»
+    требовала бы привязанного Telegram у контрагента (у большинства его нет) и
+    отправляла бы цены раньше, чем менеджер их проверил.
+    """
+    import asyncio
+
+    from services import async_db as adb
+    from services.invoice_pdf import render_sales_invoice_pdf, sales_invoice_filename
+    from services.sales_invoice import audit_details
+
+    data = await request.json()
+    user = _authorize(
+        data,
+        allowed_roles=_SALES_INVOICE_ROLES,
+        rate_limit_scope="api_order_sales_invoice_send",
+        rate_limit_max=20,
+    )
+    doc = await _sales_invoice_doc(data, user)
+    try:
+        pdf = await asyncio.to_thread(render_sales_invoice_pdf, doc)
+    except Exception:
+        logger.exception("Счёт по заказу #%s не собран", doc["order_id"])
+        return JSONResponse({"ok": False, "error": "Не удалось собрать PDF счёта"}, status_code=409)
+
+    bot = await get_notify_bot()
+    if bot is None:
+        return JSONResponse({"ok": False, "error": "Telegram недоступен"}, status_code=409)
+    try:
+        from aiogram.types import BufferedInputFile
+
+        await bot.send_document(
+            chat_id=int(user["id"]),
+            document=BufferedInputFile(pdf, filename=sales_invoice_filename(doc)),
+            caption=f"Счёт № {doc['number']} от {doc['date']} — заказ #{doc['order_id']}",
+        )
+    except Exception:
+        logger.exception("Счёт по заказу #%s не отправлен", doc["order_id"])
+        return JSONResponse(
+            {"ok": False, "error": "Не удалось отправить PDF в Telegram"}, status_code=409
+        )
+
+    await adb.add_audit_log(
+        user["id"], _actor_name(user), get_role(user["id"]),
+        "sales_invoice_sent", audit_details(doc, "отправка"),
+    )
+    return JSONResponse({"ok": True, "sent": True})
+
+
 @app.post("/api/orders/timeline")
 async def api_order_timeline(request: Request):
     """История заказа (C3): лента решений — кто одобрил/оплатил/отгрузил/сдал

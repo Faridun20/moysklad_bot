@@ -4186,3 +4186,232 @@ describe('«Деньги → Долги» → «Поставщикам»', () =>
     expect(window.document.querySelector('.seg-item.active[data-sect]').dataset.sect).toBe('debts');
   });
 });
+
+// ─── «Счёт» клиенту ДО отгрузки (services/sales_invoice.py) ─────────────────
+//
+// Жалоба владельца: печатная форма появлялась только ПОСЛЕ отгрузки, и
+// показать клиенту было нечего. Счёт — бумага: ничего не списывает и не
+// меняет долг, поэтому и подтверждения у него нет.
+describe('карточка заказа: кнопка «Счёт»', () => {
+  const tick = () => new Promise(r => setTimeout(r, 0));
+  const ORDER = (over = {}) => ({
+    id: 31, status: 'draft', agent_id: '7', agent_name: 'ООО Ромашка',
+    full_name: 'Менеджер', items_count: 2, created_at: '2026-09-16 10:00',
+    total: 1001, currency: 'USD', payment_type: 'paid', is_mine: true, items: [], ...over,
+  });
+  const cardFor = (role, orders, prefs = { work_actions: true }) => boot(`
+    currentUser = { role: '${role}', prefs: ${JSON.stringify(prefs)} };
+    ordersData = { orders: ${JSON.stringify(orders)}, role: '${role}' };
+    renderOrdersMain();
+  `).document.getElementById('content');
+
+  it('менеджеру есть уже на черновике — до заявки и до отгрузки', () => {
+    const content = cardFor('manager', [ORDER()]);
+    expect(content.querySelector('.btn-sales-invoice')).not.toBeNull();
+  });
+
+  it('пустому заказу и заказу без клиента кнопки нет', () => {
+    expect(cardFor('manager', [ORDER({ items_count: 0 })])
+      .querySelector('.btn-sales-invoice')).toBeNull();
+    expect(cardFor('manager', [ORDER({ agent_id: null })])
+      .querySelector('.btn-sales-invoice')).toBeNull();
+  });
+
+  it('руководителю — за «Рабочими действиями», как «Отгрузить»', () => {
+    expect(cardFor('boss', [ORDER({ is_mine: false })], { work_actions: true })
+      .querySelector('.btn-sales-invoice')).not.toBeNull();
+    expect(cardFor('boss', [ORDER({ is_mine: false })], { work_actions: false })
+      .querySelector('.btn-sales-invoice')).toBeNull();
+  });
+
+  it('лист показывает, ЧТО напечатается, и печатает только с принтером', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      window.__calls = [];
+      apiResult = async (path, body) => {
+        window.__calls.push([path, body]);
+        if (path === '/api/orders/invoice') return { ok: true, status: 200, error: '', body: {
+          can_print: true,
+          invoice: {
+            order_id: 31, number: '31', date: '16.09.2026', currency: 'USD',
+            client_name: 'ООО Ромашка', client_phone: '+998 90 123-45-67',
+            total_cents: 100100, total_words: 'одна тысяча один',
+            lines: [{ product_name: 'Болт М8', quantity: 3, unit: 'шт',
+                      price_cents: 25000, amount_cents: 75000 }],
+          },
+        } };
+        return { ok: true, status: 200, error: '', body: { ok: true, message: 'Отправлено на печать' } };
+      };
+      window.__ready = openSalesInvoiceSheet(31);
+    `);
+    await window.__ready;
+    const sheet = window.document.querySelector('.c-overlay');
+    const text = sheet.textContent;
+    expect(text).toContain('Счёт № 31 от 16.09.2026');
+    expect(text).toContain('ООО Ромашка');
+    expect(text).toContain('Болт М8');
+    expect(text).toContain('одна тысяча один');
+    // Счёт — бумага: лист говорит это прямо, чтобы его не путали с отгрузкой.
+    expect(text).toContain('не списывает');
+
+    sheet.querySelector('#si-print').click();
+    await tick();
+    await tick();
+    expect(window.__calls.map(c => c[0])).toEqual([
+      '/api/orders/invoice', '/api/orders/invoice/print',
+    ]);
+    expect(window.__calls[1][1]).toEqual({ order_id: 31 });
+  });
+
+  it('без принтера кнопки печати нет вовсе — только «Отправить PDF»', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      apiResult = async () => ({ ok: true, status: 200, error: '', body: {
+        can_print: false,
+        invoice: { order_id: 31, number: '31', date: '16.09.2026', currency: 'USD',
+                   client_name: 'ООО Ромашка', total_cents: 0, total_words: 'ноль', lines: [] },
+      } });
+      window.__ready = openSalesInvoiceSheet(31);
+    `);
+    await window.__ready;
+    const sheet = window.document.querySelector('.c-overlay');
+    expect(sheet.querySelector('#si-print')).toBeNull();
+    expect(sheet.querySelector('#ms-submit').textContent).toContain('Отправить PDF');
+  });
+
+  it('незаконченный заказ отвечает текстом, а не пустым листом', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      window.__toasts = [];
+      toast = (msg, kind) => { window.__toasts.push([msg, kind]); return { dismiss() {} }; };
+      apiResult = async () => ({ ok: false, status: 400, body: {},
+                                 error: 'Сначала выберите клиента — без него счёт выписать некому' });
+      window.__ready = openSalesInvoiceSheet(31);
+    `);
+    await window.__ready;
+    expect(window.document.querySelector('.c-overlay')).toBeNull();
+    expect(window.__toasts[0][0]).toContain('выберите клиента');
+  });
+});
+
+// ─── «Склад → Движения»: приход · отгрузки · списания · перемещения ─────────
+describe('«Склад» → «Движения»: четыре вида одним переключателем', () => {
+  it('вкладка называется «Движения», ключ адреса остался прежним', () => {
+    const window = boot("currentUser = { role: 'boss', prefs: { work_actions: true } };");
+    const html = window.stockShellHtml();
+    expect(html).toContain('data-sect="invoices"');
+    expect(html).toContain('Движения');
+    expect(html).not.toContain('>Накладные<');
+  });
+
+  it('при одном складе видов три — перемещать некуда', () => {
+    const window = boot("currentUser = { role: 'manager' };");
+    const html = window.whSubHtml();
+    expect(html).toContain('data-whsub="incoming"');
+    expect(html).toContain('data-whsub="outgoing"');
+    expect(html).toContain('data-whsub="writeoffs"');
+    expect(html).not.toContain('data-whsub="transfers"');
+  });
+
+  it('складов больше одного — появляются «Перемещения»', () => {
+    const window = boot("currentUser = { role: 'manager', multi_warehouse: true };");
+    expect(window.whSubHtml()).toContain('data-whsub="transfers"');
+  });
+
+  it('«Приход»: кнопка называет, что создаёт, и строки зовут себя приходом', async () => {
+    const window = boot(`
+      currentUser = { role: 'manager' };
+      window.__calls = [];
+      api = async (path, body) => {
+        window.__calls.push([path, body]);
+        return { can_print: false, invoices: [
+          { id: 5, type: 'incoming', invoice_number: 'IN-2026-0001', invoice_date: '2026-09-11',
+            status: 'confirmed', currency: 'USD', total_amount_cents: 1000,
+            counterparty_name: 'ООО Поставщик' },
+        ]};
+      };
+      whSub = 'incoming';
+      window.__ready = renderWhInvoiceList();
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(window.__calls[0][1].type).toBe('incoming');
+    expect(content.querySelector('#wh-new').textContent).toContain('Оформить приход');
+    expect(content.textContent).toContain('приход');
+    expect(content.textContent).toContain('IN-2026-0001');
+  });
+
+  it('«Отгрузки»: свой список, своя кнопка, менеджеру её не рисуют', async () => {
+    const list = (role) => boot(`
+      currentUser = { role: '${role}', prefs: { work_actions: true } };
+      window.__calls = [];
+      api = async (path, body) => {
+        window.__calls.push([path, body]);
+        return { can_print: false, invoices: [
+          { id: 6, type: 'outgoing', invoice_number: 'OUT-2026-0002', invoice_date: '2026-09-12',
+            status: 'confirmed', currency: 'USD', total_amount_cents: 2000, telegram_sent: 1,
+            counterparty_name: 'ООО Ромашка' },
+        ]};
+      };
+      whSub = 'outgoing';
+      window.__ready = renderWhInvoiceList();
+    `);
+    const boss = list('boss');
+    await boss.__ready;
+    expect(boss.__calls[0][1].type).toBe('outgoing');
+    const content = boss.document.getElementById('content');
+    expect(content.querySelector('#wh-new').textContent).toContain('Оформить отгрузку');
+    expect(content.textContent).toContain('отгрузка');
+    // Расход проводит только руководство — менеджеру кнопки нет.
+    const mgr = list('manager');
+    await mgr.__ready;
+    expect(mgr.document.getElementById('content').querySelector('#wh-new')).toBeNull();
+  });
+
+  it('списания и излишки в «Приход» и «Отгрузки» не попадают — они в «Списаниях»', async () => {
+    const window = boot(`
+      currentUser = { role: 'boss', prefs: { work_actions: true } };
+      api = async () => ({ can_print: false, invoices: [
+        { id: 7, type: 'outgoing', invoice_number: 'OUT-2026-0003', invoice_date: '2026-09-12',
+          status: 'confirmed', currency: 'USD', total_amount_cents: 0, writeoff: true,
+          counterparty_name: null },
+      ]});
+      whSub = 'outgoing';
+      window.__ready = renderWhInvoiceList();
+    `);
+    await window.__ready;
+    const content = window.document.getElementById('content');
+    expect(content.textContent).not.toContain('OUT-2026-0003');
+    expect(content.textContent).toContain('Отгрузок пока не было');
+  });
+
+  it('«Перемещения»: кнопка есть у всех, история — только руководству', async () => {
+    const tab = (role) => boot(`
+      currentUser = { role: '${role}', prefs: { work_actions: true }, multi_warehouse: true };
+      window.__calls = [];
+      whWarehouses = null;
+      api = async (path, body) => {
+        window.__calls.push(path);
+        if (path === '/api/warehouses/active') return { warehouses: [
+          { id: 1, name: 'Основной' }, { id: 2, name: 'Бекабад' }] };
+        return { transfers: [{ product_name: 'Болт М8', from_warehouse_name: 'Основной',
+                               to_warehouse_name: 'Бекабад', quantity: 4, unit: 'шт',
+                               created_at: '2026-09-15 12:00' }] };
+      };
+      whSub = 'transfers';
+      window.__ready = renderStockTransfersTab();
+    `);
+    const boss = tab('boss');
+    await boss.__ready;
+    const bossContent = boss.document.getElementById('content');
+    expect(bossContent.querySelector('#wh-transfer-open')).not.toBeNull();
+    expect(bossContent.textContent).toContain('перемещение');
+    expect(bossContent.textContent).toContain('Основной');
+
+    // `/api/stock/transfers` отвечает admin/boss — менеджеру ленту не просим.
+    const mgr = tab('manager');
+    await mgr.__ready;
+    expect(mgr.document.getElementById('content').querySelector('#wh-transfer-open')).not.toBeNull();
+    expect(mgr.__calls).not.toContain('/api/stock/transfers');
+  });
+});

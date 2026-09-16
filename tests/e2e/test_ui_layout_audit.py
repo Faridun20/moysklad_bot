@@ -350,6 +350,10 @@ def test_no_overlaps_on_any_screen(phone, e2e, tmp_path, no_rate_limit, role, th
         timeline_toggle.click()
         page.wait_for_selector(f"#order-timeline-{oid} .order-timeline-list")
         audit.check("sales-orders-timeline")
+    # «Счёт» — лист с предпросмотром документа клиенту (позиции, итог, пропись).
+    # Мерить его обязательно: длинное название товара и сумма прописью — самые
+    # длинные строки, какие вообще бывают в шторке.
+    audit.overlay("#content .btn-sales-invoice", "sales-invoice-sheet")
     # Деньги → Долги с фильтром «К оплате сейчас».
     go(page, "money")
     tab(page, "debts")

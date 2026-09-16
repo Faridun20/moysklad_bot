@@ -1310,6 +1310,34 @@
     return `Ждёт одобрения из-за скидки ${Number(d.max_pct)}% (порог ${Number(d.threshold_pct)}%) — решение принимает руководитель.`;
   }
 
+  // ─── «Счёт» клиенту (services/sales_invoice.py) ──────────────────────────
+  //
+  // Бумага, которую менеджер показывает клиенту ДО отгрузки: «вот, вот такая
+  // получается». Раньше печатная форма появлялась только ПОСЛЕ отгрузки, и
+  // разговор шёл задом наперёд — сначала отдай товар, потом покажи документ.
+  //
+  // Кнопка живёт с момента, когда по заказу ЕСТЬ ЧТО показать: выбран клиент и
+  // заведена хотя бы одна позиция. Ждать заявки или отгрузки нельзя — ровно до
+  // них счёт и нужен; после отгрузки он остаётся (это просто копия счёта).
+  // Отменённый и отклонённый заказ счёта не получают: бумага с ценами на то,
+  // чего не будет, — хуже её отсутствия (сервер отвечает тем же отказом).
+  //
+  // Роли: выписывает тот, кто ведёт продажу (`/api/orders/invoice`) и только
+  // по своему заказу; у руководителя это работа менеджера — за выключателем
+  // «Рабочие действия», как «Отгрузить» и «Внести оплату».
+  const SALES_INVOICE_DEAD_STATUSES = ['cancelled', 'rejected'];
+
+  function salesInvoiceAvailable(order, opts) {
+    const o = order || {};
+    const f = opts || {};
+    if (!roleIn(f.role, ['admin', 'boss', 'manager'])) return false;
+    if (!o.agent_id) return false;
+    if (!(Number(o.items_count) > 0)) return false;
+    if (SALES_INVOICE_DEAD_STATUSES.indexOf(o.status) !== -1) return false;
+    if (isBossLike(f.role)) return f.work !== false;
+    return !!o.is_mine;
+  }
+
   // ─── Сверка кассы (services/cash_reconciliation.py) ──────────────────────
   //
   // Пересчёт наличных руками против того, что система считает «на руках».
@@ -1510,6 +1538,7 @@
     payHandoverPicked, payDepositOrdersText,
     discountPctLabel, discountLineSuffix, discountSummaryText, discountBlockHtml,
     discountPendingNote,
+    salesInvoiceAvailable,
     reconLines, reconPreview, reconDiffLabel, reconDiffClass, reconGroupHistory, reconHistoryHtml,
   };
 });

@@ -91,6 +91,11 @@ tfoot td { font-weight: bold; border-top: 2px solid #111; }
         font-size: 9pt; color: #333; }
 .sign div { width: 45%; border-top: 1px solid #777; padding-top: 3px; }
 .comment { margin-top: 8px; font-size: 9pt; color: #444; }
+/* Счёт: реквизиты компании мелкой строкой под названием, итог прописью —
+   отдельным абзацем под таблицей (в накладной их нет). */
+.req { font-size: 8.5pt; color: #444; margin-top: 2px; }
+.words { margin-top: 8px; font-size: 10pt; }
+.note { margin-top: 10px; font-size: 8.5pt; color: #666; }
 """
 
 
@@ -169,6 +174,111 @@ def build_invoice_html(invoice: dict, logo_data_uri: str | None = None) -> str:
   <div>Получил — подпись</div>
 </div>
 </body></html>"""
+
+
+def build_sales_invoice_html(doc: dict, logo_data_uri: str | None = None) -> str:
+    """HTML «Счёта» — документа клиенту ДО отгрузки (`services/sales_invoice.py`).
+
+    Вёрстка, шрифты и стили — те же, что у накладной (`_CSS` выше): второй
+    печатный движок и второй набор стилей разошлись бы на первой же правке, а
+    клиент получал бы от одной компании две разные по виду бумаги. Отличия
+    ровно три и они по существу: реквизиты компании в шапке, телефон клиента и
+    итог прописью — счёт человек несёт в банк и в бухгалтерию, накладную нет.
+
+    Счёт НИЧЕГО не двигает: ни остатка, ни долга. Это печатная форма.
+    Любая строка из БД — через esc(): товар «Уголок 50<60» иначе ломает
+    разметку документа.
+    """
+    lines = doc.get("lines") or []
+    currency = esc(doc.get("currency") or "USD")
+    company = doc.get("company") or {}
+
+    rows = []
+    for i, ln in enumerate(lines, 1):
+        rows.append(
+            "<tr>"
+            f'<td class="idx">{i}</td>'
+            f"<td>{esc(ln.get('product_name'))}</td>"
+            f"<td>{esc(ln.get('unit') or '')}</td>"
+            f'<td class="num">{_fmt_qty(ln.get("quantity"))}</td>'
+            f'<td class="num">{money.format_cents(int(ln.get("price_cents") or 0), decimals=2)}</td>'
+            f'<td class="num">{money.format_cents(int(ln.get("amount_cents") or 0), decimals=2)}</td>'
+            "</tr>"
+        )
+
+    total = money.format_cents(int(doc.get("total_cents") or 0), decimals=2)
+    logo_html = (
+        f'<img class="logo" src="{logo_data_uri}" alt="">' if logo_data_uri else ""
+    )
+    # Реквизиты необязательны: незаполненное поле просто не печатается — иначе
+    # счёт нельзя было бы выписать, пока руководство не дозаполнит «Настройки».
+    req = " · ".join(
+        esc(str(company.get(key) or "").strip())
+        for key in ("company_tin", "company_address")
+        if str(company.get(key) or "").strip()
+    )
+    req_html = f'<div class="req">{req}</div>' if req else ""
+    phone = str(doc.get("client_phone") or "").strip()
+    phone_html = (
+        f'<div><span class="label">Телефон:</span> {esc(phone)}</div>' if phone else ""
+    )
+    comment = str(doc.get("comment") or "").strip()
+    comment_html = (
+        f'<div class="comment">Примечание: {esc(comment)}</div>' if comment else ""
+    )
+    company_name = esc(str(company.get("company_name") or COMPANY_NAME))
+
+    return f"""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8"><style>{_CSS}</style></head><body>
+<div class="head">
+  <div>{logo_html}<div class="company">{company_name}</div>{req_html}</div>
+  <div>
+    <h1>СЧЁТ</h1>
+    <div class="meta">№ {esc(doc.get('number'))}<br>
+    от {esc(doc.get('date'))}</div>
+  </div>
+</div>
+<div class="parties">
+  <div><span class="label">Клиент:</span> {esc(doc.get('client_name') or '—')}</div>
+  {phone_html}
+  <div><span class="label">Валюта:</span> {currency}</div>
+</div>
+<table>
+  <thead><tr>
+    <th class="idx">№</th><th>Наименование</th><th>Ед.</th>
+    <th class="num">Кол-во</th><th class="num">Цена</th><th class="num">Сумма</th>
+  </tr></thead>
+  <tbody>{''.join(rows)}</tbody>
+  <tfoot><tr>
+    <td colspan="5" class="num">Итого, {currency}</td>
+    <td class="num">{total}</td>
+  </tr></tfoot>
+</table>
+<div class="words">Всего к оплате: {total} {currency}
+  ({esc(doc.get('total_words') or '')})</div>
+{comment_html}
+<div class="note">Счёт не является документом отгрузки: товар передаётся по
+расходной накладной после отгрузки.</div>
+<div class="sign">
+  <div>Выписал — подпись</div>
+  <div>Получил — подпись</div>
+</div>
+</body></html>"""
+
+
+def render_sales_invoice_pdf(doc: dict) -> bytes:
+    """HTML счёта → PDF. Тот же weasyprint, что у накладной (импорт ленивый)."""
+    from weasyprint import HTML
+
+    html = build_sales_invoice_html(doc, _logo_data_uri())
+    return HTML(string=html).write_pdf()
+
+
+def sales_invoice_filename(doc: dict) -> str:
+    """Имя файла счёта: `schet-31.pdf` — номер счёта = номер заказа."""
+    number = str(doc.get("number") or doc.get("order_id") or "")
+    safe = "".join(ch for ch in number if ch.isalnum() or ch in "-_")
+    return f"schet-{safe or 'order'}.pdf"
 
 
 def render_invoice_pdf(invoice: dict) -> bytes:

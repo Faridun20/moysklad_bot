@@ -203,6 +203,11 @@
     '/api/orders/cancel': ['admin', 'boss'],
     '/api/orders/delete_draft': ['admin', 'boss', 'manager'],
     '/api/orders/requests': ['admin', 'boss'],
+    // «Счёт» клиенту ДО отгрузки: выписывает его тот, кто ведёт продажу.
+    // Кладовщику и бухгалтеру ручки не отвечают — это не их документ.
+    '/api/orders/invoice': ['admin', 'boss', 'manager'],
+    '/api/orders/invoice/print': ['admin', 'boss', 'manager'],
+    '/api/orders/invoice/send': ['admin', 'boss', 'manager'],
     '/api/orders/mark_paid': ['admin', 'boss', 'manager'],
     '/api/orders/payment': ['admin', 'boss', 'manager'],
     '/api/orders/payment_context': ['admin', 'boss', 'manager'],

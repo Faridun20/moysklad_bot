@@ -1208,3 +1208,45 @@ describe('скидка к прайсу (C2/C5)', () => {
     expect(discountPendingNote(null)).toBe('');
   });
 });
+
+describe('«Счёт» клиенту — когда кнопка есть на карточке заказа', () => {
+  const { salesInvoiceAvailable } = helpers;
+  const draft = {
+    id: 31, status: 'draft', agent_id: '7', items_count: 2, is_mine: true,
+  };
+
+  it('менеджеру — как только выбран клиент и заведена позиция, ДО заявки', () => {
+    // Ради этого счёт и делался: показать бумагу нужно до отгрузки, а не после.
+    expect(salesInvoiceAvailable(draft, { role: 'manager' })).toBe(true);
+    for (const status of ['pending', 'approved', 'shipped']) {
+      expect(salesInvoiceAvailable({ ...draft, status }, { role: 'manager' })).toBe(true);
+    }
+  });
+
+  it('пустому заказу и заказу без клиента счёт выписывать не на что', () => {
+    expect(salesInvoiceAvailable({ ...draft, items_count: 0 }, { role: 'manager' })).toBe(false);
+    expect(salesInvoiceAvailable({ ...draft, agent_id: null }, { role: 'manager' })).toBe(false);
+  });
+
+  it('по отменённому и отклонённому заказу бумаги нет', () => {
+    expect(salesInvoiceAvailable({ ...draft, status: 'cancelled' }, { role: 'manager' })).toBe(false);
+    expect(salesInvoiceAvailable({ ...draft, status: 'rejected' }, { role: 'manager' })).toBe(false);
+  });
+
+  it('чужой заказ менеджеру счёта не даёт — сервер ответит тем же', () => {
+    expect(salesInvoiceAvailable({ ...draft, is_mine: false }, { role: 'manager' })).toBe(false);
+  });
+
+  it('руководителю — за «Рабочими действиями», как «Отгрузить» и «Внести оплату»', () => {
+    expect(salesInvoiceAvailable(draft, { role: 'boss', work: true })).toBe(true);
+    expect(salesInvoiceAvailable(draft, { role: 'boss', work: false })).toBe(false);
+    // Чужой заказ руководителю доступен — у него это контроль, а не своя продажа.
+    expect(salesInvoiceAvailable({ ...draft, is_mine: false }, { role: 'boss', work: true })).toBe(true);
+  });
+
+  it('кладовщик, бухгалтер и гость счёт не выписывают', () => {
+    for (const role of ['warehouse_keeper', 'bookkeeper', 'guest']) {
+      expect(salesInvoiceAvailable(draft, { role })).toBe(false);
+    }
+  });
+});

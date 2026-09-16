@@ -5127,6 +5127,11 @@ function renderOrdersMain(opts = {}) {
         ${orderPhotosHtml(o, isBoss)}
         <button type="button" class="order-timeline-toggle" data-timeline-toggle="${o.id}">${icon('clock')} История</button>
         <div class="order-timeline" id="order-timeline-${o.id}" hidden></div>
+        ${salesInvoiceAvailable(o, { role, work: workActionsVisible() }) ? `
+          <div class="draft-actions">
+            <button class="btn-secondary btn-sales-invoice" data-id="${o.id}">${icon('list')} Счёт</button>
+          </div>
+        ` : ''}
         ${o.status === 'draft' && !isBoss ? `
           <div class="draft-actions">
             <button class="btn-edit-order" data-id="${o.id}">${icon('edit')} Редактировать</button>
@@ -5302,6 +5307,16 @@ function renderOrdersMain(opts = {}) {
     });
   });
 
+  // «Счёт» — бумага клиенту ДО отгрузки. Ничего не двигает: ни остатка, ни
+  // долга, ни статуса заказа (services/sales_invoice.py).
+  document.querySelectorAll('.btn-sales-invoice').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      haptic('light');
+      openSalesInvoiceSheet(parseInt(btn.dataset.id, 10), btn);
+    });
+  });
+
   // «Внести оплату» / «Внести оплату и отгрузить» по «оплате сразу».
   document.querySelectorAll('.btn-pay-order').forEach(btn => {
     btn.addEventListener('click', (e) => {
@@ -5390,6 +5405,74 @@ async function openOrderTimeline(orderId) {
 }
 
 
+// ─── «Счёт» клиенту (services/sales_invoice.py) ─────────────────────────────
+//
+// Документ, которого раньше не было: печатная форма появлялась только ПОСЛЕ
+// отгрузки, и клиенту нечего было показать, пока товар не уехал. Счёт — это
+// БУМАГА: остаток, долг, статус заказа и отчёты он не трогает (сервер собирает
+// его одним чтением). Поэтому и подтверждения у него нет — печатать и слать
+// можно сколько угодно раз, номер и дата остаются теми же (номер счёта = номер
+// заказа).
+//
+// Лист сначала показывает, ЧТО напечатается (номер, дата, клиент, позиции,
+// итог прописью), и только потом даёт кнопки: печать без предпросмотра — это
+// бумага наугад.
+async function openSalesInvoiceSheet(orderId, trigger) {
+  if (trigger) trigger.disabled = true;
+  const res = await apiResult('/api/orders/invoice', { order_id: orderId });
+  if (trigger) trigger.disabled = false;
+  if (!res.ok) {
+    // «Сначала выберите клиента» / «в заказе нет позиций» — это ответ, а не
+    // сбой: человек дособирает заказ и нажимает снова.
+    toast(res.error, 'error', { duration: 6000 });
+    return;
+  }
+  const doc = res.body.invoice || {};
+  const canPrint = !!res.body.can_print;
+  const cur = escapeHtml(doc.currency || '');
+  const lines = (doc.lines || []).map(ln =>
+    `<div class="order-item-preview">• ${escapeHtml(ln.product_name)} — ${whQty(ln.quantity)} `
+    + `${escapeHtml(ln.unit || '')} × ${whMoney(ln.price_cents, '')} = `
+    + `<b>${whMoney(ln.amount_cents, '')} ${cur}</b></div>`
+  ).join('');
+
+  const sheet = openMachineSheet({
+    title: `Счёт № ${doc.number} от ${doc.date}`,
+    hint: `${doc.client_name || ''}${doc.client_phone ? ' · ' + doc.client_phone : ''}`.trim(),
+    fields: [],
+    submitLabel: 'Отправить PDF',
+    onSubmit: async (_data, ctx) => {
+      const r = await apiResult('/api/orders/invoice/send', { order_id: orderId },
+                                { timeoutMs: LONG_TIMEOUT_MS });
+      if (!r.ok || !r.body.ok) {
+        ctx.showErr((r.body && r.body.error) || r.error);
+        return false;
+      }
+      haptic('success');
+      toast('Счёт отправлен вам в Telegram — перешлите его клиенту');
+      return true;
+    },
+  });
+
+  // Предпросмотр и «Распечатать» дописываем в СВОЮ шторку (sheet.sheet), а не
+  // в первую .c-overlay документа — тот же приём, что у формы списания.
+  const box = document.createElement('div');
+  box.innerHTML = `
+    <div class="order-parts">${lines}</div>
+    <div class="wh-total">Итого: ${whMoney(doc.total_cents, doc.currency || '')}
+      <div class="c-field-hint">${escapeHtml(doc.total_words || '')}</div>
+    </div>
+    ${canPrint ? `<div class="c-actions"><button type="button" class="btn-secondary" id="si-print">${icon('list')} Распечатать</button></div>` : ''}
+    <div class="c-field-hint">Счёт ничего не списывает и не меняет долг — это документ для клиента.</div>`;
+  sheet.sheet.querySelector('#ms-error').before(box);
+  // Печати нет на сервере — кнопки нет вовсе (правило `printing.is_available`):
+  // кнопка, которая гарантированно ответит отказом, хуже отсутствующей.
+  box.querySelector('#si-print')?.addEventListener('click', (ev) => {
+    printViaCups('/api/orders/invoice/print', { order_id: orderId }, ev.currentTarget);
+  });
+}
+
+
 // ─── Редактор заказа ────────────────────────────────
 
 async function openOrderEditor(orderId) {
@@ -5466,6 +5549,14 @@ async function openOrderEditor(orderId) {
       currentDraftOrder.due_date = existing.due_date || null;
     }
   }
+
+  // Кэш списка (ORDERS_TTL_MS — минута) сбрасываем ЗДЕСЬ, после того как из
+  // него забрали позиции открываемого черновика: редактор список МЕНЯЕТ
+  // (заводит черновик, ставит клиента, добавляет позиции), а человек
+  // возвращается в него не только кнопкой «Назад» (она кэш сбрасывает сама),
+  // но и кнопкой раздела в панели — и видел заказ таким, каким тот был ДО
+  // правки: без позиций, без клиента, а значит и без кнопки «Счёт».
+  ordersData = null;
 
   renderOrderEditor();
 }
