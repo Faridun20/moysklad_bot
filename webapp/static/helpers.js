@@ -260,7 +260,7 @@
     f = f || {};
     // Подпись «Покупатели», а не «Клиенты»: шапка показывает «раздел · вкладка»,
     // и «Клиенты · Клиенты» выглядит как сбой.
-    const tabs = [{ key: 'buyers', label: 'Покупатели' }];
+    const tabs = [{ key: 'buyers', label: 'Список' }];
     if (f.isBoss) tabs.push({ key: 'limits', label: 'Лимиты' });
     return tabs;
   }
@@ -280,8 +280,8 @@
     // канал — работа менеджера; воронка — контроль, остаётся.
     const work = f.work !== false;
     const tabs = [];
-    if (f.isBoss) tabs.push({ key: 'funnel', label: 'Воронка' });
-    if (!f.isBoss || work) tabs.push({ key: 'list', label: 'Лиды' });
+    if (f.isBoss) tabs.push({ key: 'funnel', label: 'Сводка' });
+    if (!f.isBoss || work) tabs.push({ key: 'list', label: 'Список' });
     if (f.isBoss && work) tabs.push({ key: 'channel', label: 'Канал' });
     return tabs;
   }
@@ -448,7 +448,7 @@
   // теряется первым). Одна разметка на шторку и экран «Настройки».
   function workSwitchHtml(on, extraClass) {
     const hint = on
-      ? 'Включено: видны кнопки менеджера — накладные, отгрузка, касса, лиды'
+      ? 'Включено: видны кнопки менеджера — приход, отгрузка, касса, обращения'
       : 'Выключено: только решения и контроль. Включите, если менеджера нет';
     const cls = extraClass ? ` ${String(extraClass).replace(/[^a-z0-9 _-]/g, '')}` : '';
     return `<button type="button" class="work-switch${cls}" role="switch" aria-checked="${on ? 'true' : 'false'}" data-work-switch>` +
@@ -465,8 +465,8 @@
   // «Рабочих действий», — чтобы две настройки рядом читались одинаково.
   function deleteSwitchHtml(on, extraClass) {
     const hint = on
-      ? 'Включено: удаляет технику и товары, отменяет накладные только руководитель'
-      : 'Выключено: удалять и отменять накладные может и менеджер';
+      ? 'Включено: удалять технику и товары и отменять движения склада может только руководитель'
+      : 'Выключено: удалять и отменять движения склада может и менеджер';
     const cls = extraClass ? ` ${String(extraClass).replace(/[^a-z0-9 _-]/g, '')}` : '';
     return `<button type="button" class="work-switch${cls}" role="switch" aria-checked="${on ? 'true' : 'false'}" data-delete-switch>` +
       `<span class="work-switch-text"><span class="work-switch-title">Удаление — только руководитель</span>` +
@@ -537,7 +537,7 @@
         plural(p.count, ['платёж', 'платежа', 'платежей'])))
       .join('');
     const depRow = row(
-      `Наличные (сдачи) · ${fmtC(dep.total_cents)} ${baseCurrency}`,
+      `Сдано в кассу наличными · ${fmtC(dep.total_cents)} ${baseCurrency}`,
       plural(dep.count || 0, ['сдача', 'сдачи', 'сдач'])
     );
     return `${head}<div class="stock-list">${rows}${depRow}</div>`;
@@ -841,7 +841,7 @@
             <span class="aging-sum">${escapeHtml(moneyBlockLabel(b))}</span>
           </div>
           <div class="aging-track"><div class="aging-bar" data-status="${state}" style="width:${pct}%"></div></div>
-          <div class="aging-count">${plural(b.count, ['документ', 'документа', 'документов'])}</div>
+          <div class="aging-count">${plural(b.count, ['долг', 'долга', 'долгов'])}</div>
         </div>`;
     }).join('')}</div>`;
   }
@@ -993,7 +993,7 @@
   }
 
   // ─── «Как получены деньги» (payments.js, services/order_payments.py) ───
-  const PAY_METHODS = [['cash', 'Наличные'], ['card', 'Карта'], ['bank', 'На счёт']];
+  const PAY_METHODS = [['cash', 'Наличные'], ['card', 'Карта'], ['bank', 'Перечисление']];
   const PAY_METHOD_LABEL = { cash: 'наличные', card: 'на карту', bank: 'перечислением' };
 
   // ─── Чистые хелперы (тесты — __tests__/payments.test.js) ───────────────────
@@ -1481,7 +1481,7 @@
   function reconDiffLabel(diff, cur) {
     const n = Number(diff) || 0;
     if (n === 0) return 'сходится';
-    return (n > 0 ? 'излишек ' : 'недостача ') + payMoney(Math.abs(n), cur);
+    return (n > 0 ? 'лишние ' : 'не хватает ') + payMoney(Math.abs(n), cur);
   }
 
   // Класс строки: сошлось — зелёная, разошлось — тревожная.
@@ -1520,7 +1520,7 @@
     const o = opts || {};
     const groups = reconGroupHistory(items);
     if (!groups.length) {
-      return `<div class="debt-hint">${escapeHtml(o.emptyText || 'Пересчётов пока нет.')}</div>`;
+      return `<div class="debt-hint">${escapeHtml(o.emptyText || 'Сверок пока нет.')}</div>`;
     }
     return `<div class="c-surface c-surface--list">${groups.map(g => `
       <div class="c-row recon-row ${g.matched ? 'recon-ok' : 'recon-warn'}">

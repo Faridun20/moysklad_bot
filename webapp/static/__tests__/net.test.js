@@ -103,12 +103,12 @@ describe('createNet().request', () => {
     expect(res).toMatchObject({ ok: false, status: 409, error: 'Уже переведена', body: { needs_force: true } });
   });
 
-  it('не-JSON от прокси: 502 — «Ошибка сервера (502)», 200 без JSON — тоже сбой', async () => {
+  it('не-JSON от прокси: 502 — «Сервер не ответил (код 502)», 200 без JSON — тоже сбой', async () => {
     const bad = (status) => ({ ok: status < 300, status, json: async () => { throw new SyntaxError('<html>'); } });
     let n = createNet({ fetch: async () => bad(502) });
-    expect((await n.request('/api/x', {})).error).toBe('Ошибка сервера (502)');
+    expect((await n.request('/api/x', {})).error).toBe('Сервер не ответил (код 502) — повторите через минуту');
     n = createNet({ fetch: async () => bad(200) });
-    expect(await n.request('/api/x', {})).toMatchObject({ ok: false, error: 'Ошибка сервера (200)' });
+    expect(await n.request('/api/x', {})).toMatchObject({ ok: false, error: 'Сервер прислал непонятный ответ (код 200) — повторите через минуту' });
   });
 
   it('raw отдаёт сам ответ — для картинок (blob)', async () => {

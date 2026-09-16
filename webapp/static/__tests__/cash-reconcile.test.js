@@ -87,7 +87,7 @@ describe('разница считается по каждой валюте от�
     const by = Object.fromEntries(lines.map((l) => [l.currency, l]));
     expect(by.USD.diff_cents).toBe(-10000);
     expect(by.UZS.diff_cents).toBe(10000000);
-    expect(norm(H.reconDiffLabel(by.USD.diff_cents, 'USD'))).toBe('недостача 100 USD');
+    expect(norm(H.reconDiffLabel(by.USD.diff_cents, 'USD'))).toBe('не хватает 100 USD');
     expect(H.reconDiffLabel(0, 'USD')).toBe('сходится');
     expect(H.reconDiffClass(0)).toBe('recon-ok');
     expect(H.reconDiffClass(-1)).toBe('recon-warn');
@@ -129,7 +129,7 @@ describe('история: строки одного пересчёта — од�
     expect(html).toContain('recon-warn');
     expect(html).toContain('recon-ok');
     expect(html).toContain('15.09.2026');
-    expect(norm(html)).toContain('недостача 100 USD');
+    expect(norm(html)).toContain('не хватает 100 USD');
     expect(html).toContain('забыл занести оплату');
   });
 
@@ -162,7 +162,7 @@ describe('экран сверки', () => {
       window.__posted.push([p, body]);
       return { ok: true, status: 200, body: {
         ok: true, date: '2026-09-15', matched: false,
-        message: 'Записано с расхождением: недостача 100 USD',
+        message: 'Записано с расхождением: не хватает 100 USD',
         lines: [{ currency: 'USD', counted_cents: 40000, system_cents: 50000, diff_cents: -10000 }],
       } };
     };
@@ -179,7 +179,7 @@ describe('экран сверки', () => {
     usd.value = '400';
     usd.dispatchEvent(new w.Event('input'));
     const diff = box.querySelector('[data-recon-diff="USD"]');
-    expect(norm(diff.textContent)).toBe('недостача 100 USD');
+    expect(norm(diff.textContent)).toBe('не хватает 100 USD');
     expect(diff.className).toContain('recon-warn');
     // Сошлось — зелёная подпись, и это тоже разрешённая к записи сверка.
     usd.value = '500';
@@ -212,7 +212,7 @@ describe('экран сверки', () => {
     expect(body.note).toBe('забыл занести оплату вчера');
     expect(body.idempotency_key).toBeTruthy();
     // Расхождение унести с экрана обязаны: тревожный тост с точной суммой.
-    expect(w.__toasts.at(-1)).toEqual(['Записано с расхождением: недостача 100 USD', 'error']);
+    expect(w.__toasts.at(-1)).toEqual(['Записано с расхождением: не хватает 100 USD', 'error']);
   });
 
   it('менеджеру — своя история без фильтра «только расхождения»', async () => {
@@ -221,6 +221,6 @@ describe('экран сверки', () => {
     await w.reconRenderTab(box);
     await flush();
     expect(box.querySelector('[data-recon-filter]')).toBeNull();
-    expect(norm(box.textContent)).toContain('Мои пересчёты');
+    expect(norm(box.textContent)).toContain('Мои сверки');
   });
 });

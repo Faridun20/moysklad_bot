@@ -270,7 +270,7 @@ describe('renderMoneyTotalsHtml', () => {
     });
     expect(html).toContain('USD · 12 345');
     expect(html).toContain('3 платежа');
-    expect(html).toContain('Наличные (сдачи) · 500 USD');
+    expect(html).toContain('Сдано в кассу наличными · 500 USD');
     expect(html).toContain('2 сдачи');
   });
   it('экранирует валюту', () => {
@@ -800,9 +800,9 @@ describe('деньги: бары дебиторки', () => {
     expect(html).not.toContain('<img');
   });
 
-  it('склонение по числу документов', () => {
-    expect(agingBarsHtml({ buckets: [bucket('a', 'A', 10, 1)] })).toContain('1 документ');
-    expect(agingBarsHtml({ buckets: [bucket('a', 'A', 10, 5)] })).toContain('5 документов');
+  it('склонение по числу долгов', () => {
+    expect(agingBarsHtml({ buckets: [bucket('a', 'A', 10, 1)] })).toContain('1 долг');
+    expect(agingBarsHtml({ buckets: [bucket('a', 'A', 10, 5)] })).toContain('5 долгов');
   });
 });
 

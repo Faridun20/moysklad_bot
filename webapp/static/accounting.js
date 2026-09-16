@@ -30,7 +30,7 @@ const ACC_KIND_STATUS = {
   reconcile: 'draft', opening: 'draft',
 };
 const ACC_STATE_LABEL = {
-  void: 'отменена', payment_pending: 'ждёт подтверждения', payment_rejected: 'платёж отклонён',
+  void: 'отменено', payment_pending: 'ждёт подтверждения', payment_rejected: 'платёж отклонён',
   receipt_deleted: 'поступление удалено',
 };
 
@@ -194,7 +194,7 @@ function accToggleCardHtml() {
     <div class="c-surface c-surface--list">
       <div class="c-row">
         <div class="card-row-info">
-          <div class="card-row-title">Счета, расходы, закрытие дня</div>
+          <div class="card-row-title">Где лежат деньги, расходы, закрытие дня</div>
           <div class="card-row-sub">Выключено. Включите, когда перенесёте историю склада.</div>
         </div>
       </div>
@@ -210,7 +210,7 @@ function accMountToggle(container) {
   box.querySelector('#acc-enable').addEventListener('click', () => {
     openMachineSheet({
       title: 'Включить бухгалтерию',
-      hint: 'Появятся счета и касса, «Получил деньги» в долгах, расходы и закрытие дня. Выключить можно в справочнике счетов.',
+      hint: 'Появятся счета и касса, «Получил деньги» в долгах, расходы и закрытие дня. Выключить можно в списке счетов и касс.',
       fields: [{ key: 'start_date', label: 'С какой даты ведём', type: 'date', required: true,
                  value: accToday || new Date().toISOString().slice(0, 10),
                  hint: 'Начальные остатки счетов ставятся на эту дату' }],
@@ -306,7 +306,7 @@ async function accRenderNow(container, gen) {
       <span class="wh-total-label">Всего ≈</span>
       <span class="wh-total-sum">${escapeHtml(accMoney(data.total_base_cents, data.base_currency))}${partial}</span>
     </div>
-    <div class="section-label">Счета · остаток сейчас</div>
+    <div class="section-label">Где лежат деньги · остаток сейчас</div>
     <div class="c-surface c-surface--list">${accounts.map(a => {
       const moves = [];
       if (a.today_in_cents) moves.push('+' + accMoney(a.today_in_cents));
@@ -325,7 +325,7 @@ async function accRenderNow(container, gen) {
       </div>`;
     }).join('')}</div>`;
   if (manage) {
-    html += `<button class="btn-secondary" id="acc-open-accounts">${icon('list')} Справочник счетов</button>`;
+    html += `<button class="btn-secondary" id="acc-open-accounts">${icon('list')} Список счетов и касс</button>`;
   }
   container.innerHTML = html;
   accWireViewSeg(container);
@@ -412,7 +412,7 @@ async function accOpenReceipt({ orderId, dealId, refresh }) {
     return;
   }
   if (!accounts.length) {
-    toast(accCanManage() ? 'Сначала заведите счета в справочнике' : 'Счетов нет — их заводит руководитель', 'error');
+    toast(accCanManage() ? 'Сначала заведите счёт или кассу — деньги должны куда-то лечь' : 'Счетов нет — их заводит руководитель', 'error');
     return;
   }
   const toTarget = (t) => t.order_id
@@ -636,7 +636,7 @@ function accOpenTransfer(accounts, refresh) {
     ],
     submitLabel: 'Записать перевод',
     onSubmit: async (data, { showErr }) => {
-      if (data.from_account_id === data.to_account_id) { showErr('Счета «откуда» и «куда» совпадают'); return false; }
+      if (data.from_account_id === data.to_account_id) { showErr('Выберите разные счета: деньги нельзя перевести на тот же счёт'); return false; }
       const res = await apiResult('/api/acc/transfer', { ...data, idempotency_key: key });
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
@@ -736,7 +736,7 @@ async function accRenderJournal(container, gen) {
     `<button class="seg-item ${active === k ? 'active' : ''}" ${attr}="${k}" aria-pressed="${active === k}">${l}</button>`).join('')}</div></div>`;
   const acc = accounts.find(a => String(a.id) === String(accJournal.accountId));
   let html = head
-    + seg('data-acc-kind', [['', 'Все'], ['receipt', 'Приход'], ['expense', 'Расход'], ['transfer', 'Переводы'], ['reconcile', 'Сверки']], accJournal.kind)
+    + seg('data-acc-kind', [['', 'Все'], ['receipt', 'Приходы'], ['expense', 'Расходы'], ['transfer', 'Переводы'], ['reconcile', 'Сверки']], accJournal.kind)
     + seg('data-acc-period', [['today', 'Сегодня'], ['week', 'Неделя'], ['month', 'Месяц'], ['all', 'Всё']], accJournal.period)
     + `<div class="c-surface c-surface--list"><div class="c-row c-row--tap" id="acc-filter-account" role="button" tabindex="0">
          <div class="card-row-info"><div class="card-row-sub">Счёт</div>
@@ -865,7 +865,7 @@ async function accRenderAccounts(container, gen) {
   const accounts = data.accounts || [];
   const back = () => { accView = 'now'; renderAccTab(container); };
   let html = head + `
-    <div class="section-label">Справочник счетов</div>`;
+    <div class="section-label">Список счетов и касс</div>`;
   html += accounts.length
     ? '<div class="c-surface c-surface--list">' + accounts.map(a => `
       <div class="c-row c-row--tap" data-acc-edit="${a.id}" role="button" tabindex="0"${a.archived ? ' data-status="archived"' : ''}>

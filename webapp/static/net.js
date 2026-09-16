@@ -82,7 +82,7 @@
           return { ok: false, status: 401, body: {}, error: SESSION_EXPIRED_TEXT, sessionExpired: true };
         }
         if (o.raw) {
-          return { ok: !!r.ok, status: r.status, body: {}, error: r.ok ? '' : `Ошибка сервера (${r.status})`, response: r };
+          return { ok: !!r.ok, status: r.status, body: {}, error: r.ok ? '' : `Сервер не ответил (код ${r.status}) — повторите через минуту`, response: r };
         }
         let data = {};
         try {
@@ -90,7 +90,7 @@
         } catch (_e) {
           if (timedOut) return offline();
           // Не-JSON (502/HTML от прокси) — для успеха это сбой формата.
-          if (r.ok) return { ok: false, status: r.status, body: {}, error: `Ошибка сервера (${r.status})` };
+          if (r.ok) return { ok: false, status: r.status, body: {}, error: `Сервер прислал непонятный ответ (код ${r.status}) — повторите через минуту` };
         }
         return {
           ok: !!r.ok,
@@ -99,7 +99,7 @@
           // Текст есть и у ответа 200: ручки печати и отправки отвечают
           // 200 с {ok:false}, и вызывающий показывает `error`, если в теле
           // своего текста нет — пустой тост хуже общего.
-          error: detailText(data.detail) || `Ошибка сервера (${r.status})`,
+          error: detailText(data.detail) || `Сервер не ответил (код ${r.status}) — повторите через минуту`,
         };
       } finally {
         clearTimeout(timer);
@@ -124,7 +124,7 @@
   // показывают e.message. Флаги остаются на объекте ошибки: errorBox по ним
   // отличает «нет связи» от отказа сервера.
   function netError(res) {
-    const err = new Error(res.error || 'Ошибка');
+    const err = new Error(res.error || 'Не удалось выполнить — повторите через минуту');
     err.status = res.status;
     if (res.network) err.network = true;
     if (res.timeout) err.timeout = true;

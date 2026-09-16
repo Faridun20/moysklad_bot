@@ -173,9 +173,9 @@ async function payShip(orderId, onDone) {
   const res = await apiResult('/api/orders/ship', { order_id: orderId, idempotency_key: idemKey() });
   if (res.ok) {
     haptic('success');
-    tg.showAlert(`🚚 Заказ #${orderId} отгружен`);
+    tg.showAlert(`Заказ #${orderId} отгружен`);
   } else {
-    tg.showAlert('❌ ' + res.error);
+    tg.showAlert('' + res.error);
   }
   if (onDone) onDone();
 }
@@ -185,14 +185,14 @@ async function payShipOrOpenForm(orderId, onDone) {
   const res = await apiResult('/api/orders/ship', { order_id: orderId, idempotency_key: idemKey() });
   if (res.ok) {
     haptic('success');
-    tg.showAlert(`🚚 Заказ #${orderId} отгружен`);
+    tg.showAlert(`Заказ #${orderId} отгружен`);
     if (onDone) onDone();
     return;
   }
   if (res.body && res.body.code === 'payment_required') {
     return payOpenForm({ orderId, ship: true, onDone });
   }
-  tg.showAlert('❌ ' + res.error);
+  tg.showAlert('' + res.error);
 }
 
 // ─── Куда поступили: карты и счета ─────────────────────────────────────────
@@ -376,7 +376,7 @@ function payWireAccountsManager(root, data, { redraw, toggleArchived }) {
 // «Настройки → Карты и счета» (руководство): список, новая запись, правка, архив.
 async function payRenderAccountsScreen(onBack) {
   const gen = screenGen();
-  setScreenContext('Карты и счета');
+  setScreenContext('Наши карты и счета');
   showBack(onBack || (() => showScreen('settings')));
   document.getElementById('content').innerHTML = skeleton('list', 3);
   let showArchived = false;
@@ -420,7 +420,7 @@ async function payOpenAccountsManager({ onClose }) {
   payAccountsRemember(data);
   let showArchived = false;
   const sheet = openMachineSheet({
-    title: 'Карты и счета', hint: data.manage_hint || '', fields: [], submitLabel: 'Готово',
+    title: 'Наши карты и счета', hint: data.manage_hint || '', fields: [], submitLabel: 'Готово',
     onSubmit: async () => { if (onClose) setTimeout(onClose, 0); return true; },
   });
   const block = document.createElement('div');

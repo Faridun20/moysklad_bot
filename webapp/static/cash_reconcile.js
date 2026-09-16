@@ -56,9 +56,9 @@ function reconFormHtml() {
   const curs = (reconCtx && reconCtx.currencies) || [];
   const done = reconCtx && reconCtx.done_today;
   return `
-    <div class="section-label">${icon('cash')} Сверка кассы за ${escapeHtml(formatDateRU(reconCtx.date))}</div>
+    <div class="section-label">${icon('cash')} Сверка наличных за ${escapeHtml(formatDateRU(reconCtx.date))}</div>
     <div class="c-surface c-surface--pad recon-form">
-      <div class="debt-hint">Пересчитайте наличные, которые физически у вас на руках, и введите, сколько получилось. Записывается и когда всё сходится.</div>
+      <div class="debt-hint">Пересчитайте наличные, которые сейчас у вас на руках, и впишите, сколько получилось. Записываем и когда всё сходится.</div>
       ${curs.map(c => `
         <div class="recon-cur" data-recon-cur="${escapeHtml(c)}">
           <label class="c-field">
@@ -75,7 +75,7 @@ function reconFormHtml() {
                placeholder="Забыл занести оплату вчера" maxlength="500">
         <span class="c-field-hint">Пояснение для руководителя. Платёж оно не создаёт — расхождение остаётся расхождением.</span>
       </label>
-      <button id="recon-submit" class="btn-primary" disabled>${icon('check')} Записать пересчёт</button>
+      <button id="recon-submit" class="btn-primary" disabled>${icon('check')} Записать сверку</button>
       <div class="debt-hint recon-status">${done ? 'Сегодня сверку уже записывали — можно пересчитать ещё раз.' : 'Сверку за сегодня ещё не записывали.'}</div>
     </div>`;
 }
@@ -83,7 +83,7 @@ function reconFormHtml() {
 function reconDraw(container, history) {
   const canSeeAll = !!(reconCtx && reconCtx.can_see_all);
   container.innerHTML = reconFormHtml() + `
-    <div class="section-label">${icon('list')} ${canSeeAll ? 'Пересчёты' : 'Мои пересчёты'}</div>
+    <div class="section-label">${icon('list')} ${canSeeAll ? 'Сверки' : 'Мои сверки'}</div>
     ${canSeeAll ? `
       <div class="seg-row"><div class="seg recon-filter">
         <button type="button" class="seg-item ${reconHistoryOnlyDiff ? '' : 'active'}" data-recon-filter="" aria-pressed="${!reconHistoryOnlyDiff}">Все</button>
@@ -91,8 +91,8 @@ function reconDraw(container, history) {
       </div></div>` : ''}
     <div id="recon-history">${reconHistoryHtml((history || {}).items, {
       showWho: canSeeAll,
-      emptyText: reconHistoryOnlyDiff ? 'Расхождений нет — все пересчёты сошлись.'
-        : (canSeeAll ? 'Пересчётов пока нет.' : 'Вы ещё не записывали пересчёты.'),
+      emptyText: reconHistoryOnlyDiff ? 'Расхождений нет — все сверки сошлись.'
+        : (canSeeAll ? 'Сверок пока нет.' : 'Вы ещё не записывали сверки.'),
     })}</div>`;
   reconWire(container);
 }
@@ -129,7 +129,7 @@ function reconUpdate(container) {
     if (!l) { box.textContent = ''; box.className = 'recon-diff'; return; }
     if (l.invalid) {
       box.className = 'recon-diff recon-warn';
-      box.textContent = 'Сумма должна быть числом не меньше нуля';
+      box.textContent = 'Впишите сумму числом — например 1 500 или 12,50';
       return;
     }
     box.className = 'recon-diff ' + reconDiffClass(l.diff_cents);
@@ -144,8 +144,8 @@ async function reconSubmit(container, btn) {
   const lines = reconLines(reconInput, (reconCtx && reconCtx.system) || []);
   const pv = reconPreview(lines);
   if (!pv.valid) {
-    toast(pv.invalid ? 'Сумма должна быть числом не меньше нуля'
-      : 'Введите пересчитанную сумму хотя бы по одной валюте', 'error');
+    toast(pv.invalid ? 'Впишите сумму числом — например 1 500 или 12,50'
+      : 'Впишите пересчитанную сумму хотя бы по одной валюте', 'error');
     return;
   }
   const counts = lines.map(l => ({ currency: l.currency, amount: String(l.counted_cents / 100) }));

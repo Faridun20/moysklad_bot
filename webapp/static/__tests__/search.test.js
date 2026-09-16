@@ -84,7 +84,7 @@ describe('глобальный поиск: рендер результатов',
     await window.__ready;
     const html = window.document.getElementById('search-results').innerHTML;
     // Заказ approved → «Одобрено» (STATUS_NAME), не голое 'approved'.
-    expect(html).toContain('Одобрено');
+    expect(html).toContain('Одобрен');
     expect(html).not.toMatch(/>\s*approved\s*</);
     // Платёж pending → человеческая подпись, не сырой код.
     expect(html).toContain('Ожидает подтверждения');
@@ -109,7 +109,7 @@ describe('глобальный поиск: рендер результатов',
     expect(html).toContain('JCB123456');
     expect(html).toContain('На складе'); // machine_status_labels.in_stock
 
-    expect(html).toContain('Лиды');
+    expect(html).toContain('Обращения');
     expect(html).toContain('Азиз');
     expect(html).toContain('🆕 В работе'); // lead_status_labels.new
   });

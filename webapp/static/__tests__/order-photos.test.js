@@ -120,7 +120,7 @@ describe('backupStatusHtml — «Настройки → Резервные ко�
   it('ни разу не запускался', () => {
     const window = boot();
     const html = window.backupStatusHtml({ ok: true, found: false });
-    expect(html).toContain('Ещё не запускался');
+    expect(html).toContain('Копию ещё не делали');
   });
 
   it('последний запуск успешен', () => {

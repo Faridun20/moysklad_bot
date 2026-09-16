@@ -1316,7 +1316,7 @@ function workQueueHtml(queue) {
     // Компактной строкой, а не полноэкранным emptyState: тот занимает треть
     // экрана телефона, и «дел нет» выглядело как «экран не загрузился».
     // Полноэкранная пустота уместна там, где она И ЕСТЬ весь экран.
-    return `<div class="section-label">Требует вас</div>`
+    return `<div class="section-label">Что нужно сделать</div>`
       + `<div class="c-surface c-surface--list"><div class="c-row queue-empty">`
       + `<div class="card-row-icon">${icon('check')}</div>`
       + `<div class="card-row-info"><div class="card-row-title">Всё разобрано</div>`
@@ -1335,7 +1335,7 @@ function workQueueHtml(queue) {
       </div>
       ${icon('clock')}
     </div>`).join('');
-  return `<div class="section-label">Требует вас · ${total}</div>`
+  return `<div class="section-label">Что нужно сделать · ${total}</div>`
     + `<div class="c-surface c-surface--list">${rows}</div>`;
 }
 
@@ -1452,7 +1452,7 @@ async function renderHome() {
     const top = data.top_employees || [];
     if (!top.length) return '';
     return `
-      <div class="section-label">Топ сотрудники · неделя</div>
+      <div class="section-label">Кто больше отгрузил · неделя</div>
       <div class="c-surface c-surface--list">
         ${top.map((e, i) => `
           <div class="c-row">
@@ -1479,11 +1479,11 @@ async function renderHome() {
         </div>
         <div class="stat">
           <div class="stat-value ${mo.pending > 0 ? 'stat-value-amber' : ''}">${mo.pending}</div>
-          <div class="stat-label">${icon('clock')} Ожидают</div>
+          <div class="stat-label">${icon('clock')} Ждут</div>
         </div>
         <div class="stat">
           <div class="stat-value ${mo.approved > 0 ? 'stat-value-green' : ''}">${mo.approved}</div>
-          <div class="stat-label">${icon('check')} Одобрено</div>
+          <div class="stat-label">${icon('check')} Одобрены</div>
         </div>
       </div>
     `;
@@ -1887,9 +1887,9 @@ function renderStockContent() {
       <input id="stock-search" class="form-input" placeholder="Поиск товара…" value="${escapeHtml(stockSearch)}">
     </div>
     <div class="c-actions c-actions--wrap">
-      <button type="button" class="btn-secondary" id="stock-import-tpl">${icon('list')} Шаблон</button>
+      <button type="button" class="btn-secondary" id="stock-import-tpl">${icon('list')} Шаблон Excel</button>
       <button type="button" class="btn-secondary" id="stock-import">${icon('box')} Импорт из Excel</button>
-      ${exportBtnHtml('stock-export', 'Экспорт')}
+      ${exportBtnHtml('stock-export', 'Экспорт в Excel')}
     </div>
     ${filterRow}
     <div class="section-label">Категории</div>
@@ -2426,7 +2426,7 @@ function machineRequestTermsRows(req) {
     if (req.discount_pct != null && Number(req.discount_pct) > 0) price += ` · скидка ${req.discount_pct}%`;
     rows.push(['Цена', price]);
   }
-  rows.push(['Покупатель', [req.buyer_name, req.buyer_phone].filter(Boolean).join(' · ') || '—']);
+  rows.push(['Клиент', [req.buyer_name, req.buyer_phone].filter(Boolean).join(' · ') || '—']);
   if (req.buyer_passport) rows.push(['Паспорт', req.buyer_passport]);
   else if (req.kind === 'credit') rows.push(['Паспорт', req.has_passport ? 'вписан · виден руководству' : '—']);
   const sch = req.schedule_preview;
@@ -3008,7 +3008,7 @@ function openContainerItemQtyForm(containerId, arrived, { product = null, name =
        { key: 'unit', label: 'Единица', value: 'шт' }];
   const sheet = openMachineSheet({
     title,
-    hint: product ? '' : 'Товара нет в каталоге: карточку заведёте при оприходовании. '
+    hint: product ? '' : 'Товара нет в каталоге: карточку заведёте, когда будете принимать товар на склад. '
       + 'Если он есть под другим названием — выберите его из подсказок под полем.',
     fields,
     submitLabel: 'Добавить',
@@ -3142,10 +3142,10 @@ function openReceiptReview({ items, qtyOf, submitLabel, onConfirm }) {
   }
   const sheet = openMachineSheet({
     title: 'Товары без карточки',
-    hint: `${plural(items.length, ['позиция не связана', 'позиции не связаны', 'позиций не связаны'])} `
+    hint: `${plural(items.length, ['позиция не связана', 'позиции не связаны', 'позиций не связано'])} `
       + 'с каталогом. Укажите, что это, — иначе они не попадут на склад.',
     fields: [],
-    submitLabel: submitLabel || 'Оприходовать',
+    submitLabel: submitLabel || 'Принять на склад',
     onSubmit: async (_data, ctx) => {
       const missing = items.filter(it => !choice.get(String(it.id)));
       if (missing.length) {
@@ -3361,22 +3361,22 @@ function openListPicker({ title, hint, items, selectedId, emptyText, onPick, add
 // вернёт уже заведённого (`existed`), а не второго такого же.
 function openCounterpartyForm(prefill, onDone) {
   return openMachineSheet({
-    title: 'Новый контрагент',
-    hint: 'Попадёт в общий справочник — его сразу видно и в заказах, и в накладных',
+    title: 'Новый клиент или поставщик',
+    hint: 'Попадёт в общий справочник — его сразу видно и в заказах, и в движениях склада',
     fields: [
       { key: 'name', label: 'Название', required: true, value: prefill || '',
         placeholder: 'ООО «Бахор Савдо» или Азиз' },
       { key: 'phone', label: 'Телефон', placeholder: '+998 90 123-45-67',
         hint: 'Необязательно, но по нему потом ищут' },
       { key: 'type', label: 'Кто это', type: 'select', value: 'customer',
-        options: [['customer', 'Покупатель'], ['supplier', 'Поставщик']] },
+        options: [['customer', 'Клиент'], ['supplier', 'Поставщик']] },
     ],
     submitLabel: 'Завести',
     onSubmit: async (data, { showErr }) => {
       const res = await apiResult('/api/wh/counterparties/create', data);
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
-      toast(res.body.existed ? 'Такой контрагент уже был — выбран он' : 'Контрагент заведён');
+      toast(res.body.existed ? 'Такой уже есть в справочнике — выбрали его' : 'Добавили в справочник');
       onDone({ id: res.body.counterparty_id, name: res.body.name });
       return true;
     },
@@ -3391,7 +3391,7 @@ function openSupplierPicker(containerId) {
     fields: [{ key: 'search', label: 'Поиск по названию', placeholder: 'ООО …' }],
     submitLabel: 'Сохранить',
     onSubmit: async (_data, { showErr }) => {
-      if (!picked) { showErr('Выберите контрагента из списка'); return false; }
+      if (!picked) { showErr('Выберите поставщика из списка'); return false; }
       const res = await apiResult('/api/containers/supplier', {
         container_id: containerId,
         supplier_id: picked.id,
@@ -3423,7 +3423,7 @@ function openSupplierPicker(containerId) {
                data-name="${escapeHtml(a.name || '')}" role="button" tabindex="0">
             <div class="card-row-info"><div class="card-row-title">${escapeHtml(a.name || '')}</div></div>
           </div>`).join('')
-        : '<div class="loader">Контрагенты не найдены</div>';
+        : '<div class="loader">Никого не нашли — проверьте название</div>';
       list.querySelectorAll('[data-supplier]').forEach(row => {
         row.addEventListener('click', () => {
           haptic('light');
@@ -3480,7 +3480,7 @@ async function renderContainerCard(containerId) {
   // Итог сверки — крупно и сверху: ради него раздел и существует.
   const verdict = !arrived ? ''
     : d.mismatch
-      ? `<div class="c-error">Расхождений: ${d.mismatch} (недостача ${d.short}, лишнее ${d.extra})</div>`
+      ? `<div class="c-error">Расхождений: ${d.mismatch} (не хватает ${d.short}, лишних ${d.extra})</div>`
       : d.unchecked
         ? `<div class="items-total schedule-total"><span>Не сверено позиций</span><b>${d.unchecked}</b></div>`
         : `<div class="items-total schedule-total"><span>Состав сошёлся</span><b>${plural(d.total, ['позиция', 'позиции', 'позиций'])}</b></div>`;
@@ -3493,15 +3493,15 @@ async function renderContainerCard(containerId) {
     const unmatched = receipt.unmatched || [];
     const received = Boolean(receipt.invoice_id) || receipt.legacy;
     const receivedSub = receipt.legacy
-      ? 'Оприходован до перехода на свой склад — остаток перенесён миграцией'
+      ? 'Принят на склад до перехода на свой учёт — остаток перенесли вместе с базой'
       : (receipt.received_at
           ? escapeHtml(String(receipt.received_at).slice(0, 16))
-          : 'Закупочные цены впишете в накладной, когда будет удобно');
+          : 'Закупочные цены впишете в приходе, когда будет удобно');
     supplyBlock = `<div class="section-label">Приход на склад</div>
       <div class="c-surface c-surface--list">
         <div class="c-row" data-status="${received ? 'approved' : 'pending'}">
           <div class="card-row-info">
-            <div class="card-row-title">${received ? 'Приходная накладная проведена' : 'Ещё не оприходовано'}</div>
+            <div class="card-row-title">${received ? 'Товар принят на склад' : 'Товар ещё не принят на склад'}</div>
             <div class="card-row-sub">${receivedSub}</div>
           </div>
         </div>
@@ -3539,7 +3539,7 @@ async function renderContainerCard(containerId) {
       ${canEdit ? `<button class="btn-secondary" id="cont-item-add">${icon('plus')} ${arrived ? 'Лишняя позиция' : 'Позиция'}</button>` : ''}
       ${canEdit && arrived ? '<button class="btn-primary" id="cont-save">Сохранить сверку</button>' : ''}
       ${canEdit && !arrived ? '<button class="btn-primary" id="cont-arrive">Отметить прибытие</button>' : ''}
-      ${arrived && work && !receipt.legacy ? `<button class="btn-secondary" id="cont-supply">${icon('box')} ${receipt.invoice_id ? 'Переоприходовать' : 'Оприходовать'}</button>` : ''}
+      ${arrived && work && !receipt.legacy ? `<button class="btn-secondary" id="cont-supply">${icon('box')} ${receipt.invoice_id ? 'Принять заново' : 'Принять на склад'}</button>` : ''}
       ${arrived && work && card.can_manage ? `<button class="btn-secondary" id="cont-post">${icon('cart')} Пост в канал</button>` : ''}
       ${win.open && ('can_delete' in card ? card.can_delete : card.can_manage) && deleteActionsVisible() ? `<button class="btn-secondary btn-danger" id="cont-del">${icon('trash')} Удалить</button>` : ''}
     </div>
@@ -3569,7 +3569,7 @@ async function renderContainerCard(containerId) {
   const suppliedText = (body) => {
     const created = ((body.resolved || {}).created || []).length;
     return [
-      `Оприходовано: ${plural(body.matched, ['позиция', 'позиции', 'позиций'])}`,
+      `Принято на склад: ${plural(body.matched, ['позиция', 'позиции', 'позиций'])}`,
       body.invoice_number || '',
       created ? `новых товаров в каталоге: ${created}` : '',
     ].filter(Boolean).join(' · ');
@@ -3598,7 +3598,7 @@ async function renderContainerCard(containerId) {
       openReceiptReview({
         items: pending,
         qtyOf: it => it.arrived_qty,
-        submitLabel: receipt.invoice_id ? 'Переоприходовать' : 'Оприходовать',
+        submitLabel: receipt.invoice_id ? 'Принять заново' : 'Принять на склад',
         onConfirm: async (resolve, { showErr }) => {
           const res = await supply(resolve, key);
           if (!res.ok) { showErr(res.error); return false; }
@@ -3624,7 +3624,7 @@ async function renderContainerCard(containerId) {
     openContainerItemForm(containerId, arrived));
 
   content.querySelector('#cont-arrive')?.addEventListener('click', async () => {
-    if (!await confirmDialog('Контейнер прибыл? После этого можно проставить фактические количества.')) return;
+    if (!await confirmDialog('Контейнер прибыл? После этого можно вписать, сколько чего приехало на самом деле.')) return;
     const res = await apiResult('/api/containers/arrive', { container_id: containerId });
     if (!res.ok) {
       tg.showAlert ? tg.showAlert(res.error) : alert(res.error);
@@ -3664,7 +3664,7 @@ async function renderContainerCard(containerId) {
     const toastSaved = (body) => {
       const r = body.receipt || {};
       if (r.ok === false && !r.legacy) {
-        toast(`Сверка сохранена, на склад не пошло: ${r.error || 'приход не проведён'}`, 'error',
+        toast(`Сверка сохранена, но на склад товар не пошёл: ${r.error || 'приход не оформлен'}`, 'error',
               { duration: 6000 });
         return;
       }
@@ -4284,7 +4284,7 @@ function openHoursForm(machine) {
       // (1500 вместо 15000), поэтому спрашиваем — но подтвердить замену
       // счётчика сервер разрешит только руководителю.
       if (!res.ok && res.body.needs_force) {
-        if (!isMachineBoss()) { showErr(res.error + ' Откат подтверждает руководитель.'); return false; }
+        if (!isMachineBoss()) { showErr(res.error + ' Уменьшить показание может только руководитель.'); return false; }
         const agreed = await confirmDialog(
           `${res.error}\n\nЗаписать ${data.hours} м/ч как замену счётчика?`
         );
@@ -4334,7 +4334,7 @@ function openDealForm(machine, kind, opts = {}) {
         { key: 'months', label: 'Срок, месяцев', type: 'number', required: true,
           value: req ? String(req.months || '') : '' },
       ] : []),
-      { key: 'buyer_name', label: 'Покупатель', required: true, value: req ? req.buyer_name : '' },
+      { key: 'buyer_name', label: 'Клиент', required: true, value: req ? req.buyer_name : '' },
       { key: 'buyer_phone', label: 'Телефон', type: 'tel', value: req ? req.buyer_phone || '' : '' },
       ...(reserve ? [] : [{
         key: 'buyer_passport', label: 'Паспорт', required: credit && !(req && req.has_passport),
@@ -4571,13 +4571,13 @@ const STATUS_ICON = {
 
 const STATUS_NAME = {
   draft:    'Черновик',
-  pending:  'На рассмотрении',
-  approved: 'Одобрено',
-  rejected: 'Отклонено',
-  shipped:  'Отгружено',
-  paid:     'Оплачено',
-  partially_returned: 'Частичный возврат',
-  returned: 'Возврат',
+  pending:  'Ждёт одобрения',
+  approved: 'Одобрен',
+  rejected: 'Отклонён',
+  shipped:  'Отгружен',
+  paid:     'Оплачен',
+  partially_returned: 'Возвращён частично',
+  returned: 'Возвращён',
   cancelled: 'Отменён',
 };
 
@@ -4722,7 +4722,7 @@ async function runSearch(query) {
       </div>`).join(''));
   }
   if (data.leads && data.leads.length) {
-    parts.push(`<div class="search-group-title">${icon('user')} Лиды</div>`);
+    parts.push(`<div class="search-group-title">${icon('user')} Обращения</div>`);
     parts.push(data.leads.map(l => `
       <div class="search-item" role="button" tabindex="0" onclick="showScreen('leads', {tab: 'list'})">
         ${escapeHtml(l.display_name || l.username || '—')}${l.username && l.display_name ? ' · @' + escapeHtml(l.username) : ''}
@@ -5073,7 +5073,7 @@ function renderOrdersMain(opts = {}) {
         title: 'Нет заказов',
         hint: (currentOrderFilter !== 'all' || currentOrderPeriod !== 'all')
           ? 'Нет заказов по выбранным фильтрам'
-          : canCreate ? 'Нажмите «+ Новый заказ» чтобы начать' : 'Менеджеры ещё не создавали заказов',
+          : canCreate ? 'Нажмите «+ Новый заказ», чтобы начать' : 'Менеджеры ещё не создавали заказов',
       })
     : (() => {
         // Группируем по дате (created_at='YYYY-MM-DD HH:MM') и выводим клиента
@@ -5289,7 +5289,7 @@ function renderOrdersMain(opts = {}) {
           await renderOrders();
         } catch (e) {
           tg.HapticFeedback?.notificationOccurred('error');
-          tg.showAlert('❌ ' + e.message);
+          tg.showAlert('' + e.message);
           btn.disabled = false;
         }
       });
@@ -5312,9 +5312,9 @@ function renderOrdersMain(opts = {}) {
         } else {
           try {
             await api('/api/orders/ship', { order_id: id, idempotency_key: idemKey() });
-            tg.showAlert(`🚚 Заказ #${id} отгружен`);
+            tg.showAlert(`Заказ #${id} отгружен`);
             refresh();
-          } catch (err) { tg.showAlert('❌ ' + err.message); }
+          } catch (err) { tg.showAlert('' + err.message); }
         }
         btn.disabled = false;
       });
@@ -5359,17 +5359,17 @@ function renderOrdersMain(opts = {}) {
       const id = parseInt(btn.dataset.id);
       const box = document.querySelector(`.cancel-box[data-id="${btn.dataset.id}"]`);
       const reason = box.querySelector('.cancel-reason').value.trim();
-      if (reason.length < 3) { tg.showAlert('❌ Укажите причину'); return; }
+      if (reason.length < 3) { tg.showAlert('Впишите причину отмены — она попадёт в журнал'); return; }
       btn.disabled = true;
       try {
         await api('/api/orders/cancel', { order_id: id, reason });
         tg.HapticFeedback?.notificationOccurred('success');
-        tg.showAlert(`🚫 Заказ #${id} отменён`);
+        tg.showAlert(`Заказ #${id} отменён`);
         ordersData = null;
         await renderOrders();
       } catch (err) {
         tg.HapticFeedback?.notificationOccurred('error');
-        tg.showAlert('❌ ' + err.message);
+        tg.showAlert('' + err.message);
         btn.disabled = false;
       }
     });
@@ -5652,7 +5652,7 @@ function renderOrderEditor() {
     <div class="editor-footer">
       <button class="btn-submit-order" id="btn-submit"
         ${order.items.length === 0 || !order.agent_name ? 'disabled' : ''}>
-        ${icon('check')} Отправить заявку
+        ${icon('check')} Отправить на одобрение
       </button>
       ${order.items.length === 0 || !order.agent_name
         ? '<div class="editor-hint">Добавьте товары и выберите клиента</div>'
@@ -5707,7 +5707,7 @@ function renderOrderEditor() {
       const item = draft && draft.items[idx];
       if (!item) return;
       if (item.item_id == null) {
-        tg.showAlert('❌ Позиция не найдена на сервере — откройте заказ заново');
+        tg.showAlert('Такой позиции в заказе уже нет. Закройте и откройте заказ заново — список обновится.');
         return;
       }
       btn.disabled = true;
@@ -5715,7 +5715,7 @@ function renderOrderEditor() {
         await api('/api/orders/remove_item', { item_id: item.item_id });
       } catch (e) {
         tg.HapticFeedback?.notificationOccurred('error');
-        tg.showAlert('❌ Позиция не удалена: ' + e.message);
+        tg.showAlert('Позицию не удалось убрать: ' + e.message);
         btn.disabled = false;
         return;
       }
@@ -5811,7 +5811,7 @@ async function loadAgents(search) {
           });
         } catch (e) {
           tg.HapticFeedback?.notificationOccurred('error');
-          tg.showAlert('❌ Клиент не выбран: ' + e.message);
+          tg.showAlert('Клиента не удалось сохранить в заказе: ' + e.message);
           return;
         }
         if (!currentDraftOrder) return;
@@ -6164,16 +6164,16 @@ function openQuantityInput(name, unit, maxStock, productId) {
       tg.HapticFeedback?.notificationOccurred('success');
       tg.MainButton?.hideProgress?.();
       clearMainButton();
-      toast('Товар добавлен в заявку');
+      toast('Товар добавлен в заказ');
       renderOrderEditor();
     } catch (e) {
       tg.MainButton?.hideProgress?.();
-      tg.showAlert('❌ ' + e.message);
+      tg.showAlert('' + e.message);
     }
   }
 
   if (tg.MainButton) {
-    tg.MainButton.setText('✅ Добавить в заявку');
+    tg.MainButton.setText('Добавить в заказ');
     tg.MainButton.show();
     // Запоминаем хендлер, чтобы clearMainButton() мог его снять при
     // уходе с экрана (см. showScreen / qty-back).
@@ -6187,7 +6187,7 @@ function openQuantityInput(name, unit, maxStock, productId) {
       const btn = document.createElement('button');
       btn.className = 'btn-primary';
       btn.id = 'qty-confirm-fallback';
-      btn.innerHTML = `${icon('check')} Добавить в заявку`;
+      btn.innerHTML = `${icon('check')} Добавить в заказ`;
       btn.addEventListener('click', onConfirm);
       totalEl2.parentNode.appendChild(btn);
     }
@@ -6202,7 +6202,7 @@ async function submitOrder() {
   // Frontend-валидация: для credit обязательна дата возврата.
   // Бекенд тоже проверяет, но здесь короче UX-фидбек.
   if (paymentType === 'credit' && !dueDate) {
-    tg.showAlert('⚠️ Укажите дату возврата долга');
+    tg.showAlert('Заказ в долг — укажите, до какого числа клиент рассчитается');
     return;
   }
 
@@ -6222,7 +6222,7 @@ async function submitOrder() {
     // Скидка выше порога — говорим об этом сразу: заявка не «зависла», её
     // держит решение руководителя (services/order_discounts.py).
     const dnote = result.discount_note || discountPendingNote(result.discount);
-    tg.showAlert(`✅ Заявка #${result.req_id} отправлена руководителю!`
+    tg.showAlert(`Заявка #${result.req_id} отправлена руководителю`
       + (dnote ? `\n⚠️ ${dnote}` : ''));
     ordersData = null;
     currentDraftOrder = null;
@@ -6231,7 +6231,7 @@ async function submitOrder() {
     await renderOrders();
   } catch (e) {
     tg.HapticFeedback?.notificationOccurred('error');
-    tg.showAlert('❌ ' + e.message);
+    tg.showAlert('' + e.message);
     if (btn) btn.disabled = false;
   }
 }
@@ -6300,7 +6300,7 @@ function requestCardsHtml(requests) {
         })()}
         ${r.credit ? `
           <div class="credit-ctx ${r.credit.over_limit ? 'credit-ctx--bad' : 'credit-ctx--ok'}">
-            ${icon('chart')} Кредит клиента: долг с учётом заявки <b>${fmt(r.credit.effective_debt)}</b>
+            ${icon('chart')} Долг клиента с учётом заявки <b>${fmt(r.credit.effective_debt)}</b>
             / лимит <b>${fmt(r.credit.limit)}</b>
             ${r.credit.over_limit ? `${icon('alert')} превышение` : `${icon('check')} в пределах`}
           </div>` : ''}
@@ -6369,7 +6369,7 @@ async function returnRequestToDraft(reqId, refresh = renderPendingRequests) {
   const box = document.querySelector(`.draft-box[data-req="${reqId}"]`);
   const comment = (box?.querySelector('.draft-comment')?.value || '').trim();
   if (comment.length < 3) {
-    tg.showAlert('❌ Опишите, что исправить (минимум 3 символа)');
+    tg.showAlert('Напишите, что исправить — менеджер увидит этот текст');
     return;
   }
   document.querySelectorAll('.btn-approve, .btn-reject, .btn-draft, .draft-send')
@@ -6380,9 +6380,9 @@ async function returnRequestToDraft(reqId, refresh = renderPendingRequests) {
       comment,
       idempotency_key: idemKey(),
     });
-    tg.showAlert('✏️ Заявка возвращена на доработку');
+    tg.showAlert('Заявка возвращена на доработку');
   } catch (e) {
-    tg.showAlert(`❌ ${e.message}`);
+    tg.showAlert(`${e.message}`);
   }
   await refresh();
 }
@@ -6408,7 +6408,7 @@ async function handleRequest(reqId, action, refresh = renderPendingRequests) {
     if (action === 'approve' && res && res.needs_override) {
       const over = res.over || {};
       const cur = baseCur();
-      const msg = 'Кредитный лимит превышен.\n' +
+      const msg = 'Лимит долга превышен.\n' +
         `Лимит: ${formatMoney(over.limit || 0)} ${cur}\n` +
         `Долг с этим заказом: ${formatMoney(over.projected || 0)} ${cur}\n\n` +
         'Одобрить с превышением?';
@@ -6436,9 +6436,9 @@ async function handleRequest(reqId, action, refresh = renderPendingRequests) {
       });
     }
     if (res && res.ok === false) throw new Error(res.error || res.detail || 'Не удалось выполнить');
-    tg.showAlert(action === 'approve' ? '✅ Заявка одобрена' : '❌ Заявка отклонена');
+    tg.showAlert(action === 'approve' ? 'Заявка одобрена' : 'Заявка отклонена');
   } catch (e) {
-    tg.showAlert(`❌ ${e.message}`);
+    tg.showAlert(`${e.message}`);
   }
   await refresh();
 }
@@ -6476,7 +6476,7 @@ const DECISION_GROUPS = [
     wire: (root, _items, ctx) => wireConfirmCards(root, ctx.refresh),
   },
   {
-    key: 'deposits', title: 'Сдачи наличных', icon: 'cash',
+    key: 'deposits', title: 'Сдачи в кассу', icon: 'cash',
     path: '/api/deposits/pending', listKey: 'deposits',
     html: (items, ctx) => depositCardsHtml(items, ctx),
     wire: (root, _items, ctx) => wireConfirmCards(root, ctx.refresh),
@@ -6563,8 +6563,8 @@ async function renderDecisionsScreen() {
 
   box.innerHTML = sections || emptyState({
     icon: 'check',
-    title: 'Решений не ждёт',
-    hint: 'Заявки на отгрузку, сделки по технике, оплаты картой, сдачи наличных и возвраты появятся здесь, как только их оформят.',
+    title: 'Ничего не ждёт решения',
+    hint: 'Заявки на отгрузку, сделки по технике, оплаты картой, сдачи в кассу и возвраты появятся здесь, как только их оформят.',
   });
   box.querySelectorAll('[data-decisions-retry]').forEach(b =>
     b.addEventListener('click', () => renderDecisionsScreen()));
@@ -6589,8 +6589,8 @@ function backupStatusHtml(backup) {
         <div class="c-row">
           <div class="card-row-icon">${icon('alert')}</div>
           <div class="card-row-info">
-            <div class="card-row-title">Ещё не запускался</div>
-            <div class="card-row-sub">Ночной бэкап в Telegram (tasks/run_backup) пока не отчитался</div>
+            <div class="card-row-title">Копию ещё не делали</div>
+            <div class="card-row-sub">Ночная копия базы в Telegram ещё ни разу не создавалась</div>
           </div>
         </div>
       </div>`;
@@ -6605,7 +6605,7 @@ function backupStatusHtml(backup) {
       <div class="c-row">
         <div class="card-row-icon">${icon(ok ? 'check' : 'alert')}</div>
         <div class="card-row-info">
-          <div class="card-row-title">Бэкап в Telegram · ${ok ? 'успешно' : 'ошибка'}</div>
+          <div class="card-row-title">Копия базы в Telegram · ${ok ? 'сделана' : 'не сделана'}</div>
           <div class="card-row-sub">${escapeHtml(sub)}</div>
         </div>
       </div>
@@ -6667,7 +6667,7 @@ async function renderSettingsScreen() {
       ${meta && meta.can_edit_company ? row('set-company', 'building', 'Реквизиты компании', companySub) : ''}
       ${row('set-rates', 'cash', 'Курсы валют', 'Курс к базовой валюте — для сводок и оплат')}
       ${typeof payRenderAccountsScreen === 'function'
-        ? row('set-pay-accounts', 'card', 'Карты и счета', 'Куда клиенты платят картой и перечислением')
+        ? row('set-pay-accounts', 'card', 'Наши карты и счета', 'Куда клиенты платят картой и перечислением')
         : ''}
     </div>
     ${isBossRole() ? `
@@ -7063,7 +7063,7 @@ function renderAnalyticsContent(data) {
             <span class="top-medal rank-chip">${i + 1}</span>
             <div class="top-info">
               <div class="top-name">${escapeHtml(p.name)}</div>
-              <div class="top-sub">${fmt(p.qty)} шт. · ${formatMoney(p.sum, unit)}${profitStr}</div>
+              <div class="top-sub">${fmt(p.qty)} шт · ${formatMoney(p.sum, unit)}${profitStr}</div>
             </div>
           </div>
         `;
@@ -7093,7 +7093,9 @@ function renderAnalyticsContent(data) {
       <span class="top-medal rank-chip">${i + 1}</span>
       <div class="top-info">
         <div class="top-name">${escapeHtml(m.name)}</div>
-        <div class="top-sub">${rev} · ${plural(m.count, ['отгрузка', 'отгрузки', 'отгрузок'])}${m.orders != null ? ` · ${plural(m.orders, ['заказ', 'заказа', 'заказов'])}` : ''}${debt ? ` · долг ${debt}` : ''}</div>
+        <div class="top-sub">${[rev, plural(m.count, ['отгрузка', 'отгрузки', 'отгрузок']),
+          m.orders != null ? plural(m.orders, ['заказ', 'заказа', 'заказов']) : '',
+          debt ? `долг ${debt}` : ''].filter(Boolean).join(' · ')}</div>
       </div>
     </div>`;
   }).join('');
@@ -7103,7 +7105,7 @@ function renderAnalyticsContent(data) {
     ? `<div class="section-label">Топ менеджеров</div><div class="c-surface c-surface--pad">${managerItems}</div>` : '';
   // Кнопка Excel — только company-scope (boss/admin).
   const exportBlock = data.scope === 'company'
-    ? `<button class="btn-primary u-mt-3" id="analytics-export">${icon('chart')} Выгрузить Excel</button>` : '';
+    ? `<button class="btn-primary u-mt-3" id="analytics-export">${icon('chart')} Экспорт в Excel</button>` : '';
 
   const msWarn = data.stats_incomplete
     ? `<div class="warn-card">${icon('alert', 'warn-ic')} Часть показателей не посчиталась — суммы могут быть занижены. Попробуйте обновить экран.</div>`
@@ -7221,7 +7223,7 @@ function renderAnalyticsContent(data) {
         tg.showAlert && tg.showAlert('Excel-файл отправлен в чат с ботом');
       } catch (e) {
         exportBtn.disabled = false;
-        exportBtn.innerHTML = `${icon('chart')} Выгрузить Excel`;
+        exportBtn.innerHTML = `${icon('chart')} Экспорт в Excel`;
         tg.showAlert ? tg.showAlert(e.message) : alert(e.message);
       }
     });
@@ -7287,7 +7289,7 @@ async function renderMoneyReport(container) {
     `<div class="section-label">Поступления · ${escapeHtml(label)}</div>` +
     renderMoneyTotalsHtml(summary) +
     '<div id="money-insights">' + skeleton('list', 3) + '</div>' +
-    '<div class="section-label">Движение денег</div>' +
+    '<div class="section-label">Приход и расход денег</div>' +
     (historyError
       ? errorBoxHtml(historyError.message, { retryAttr: 'data-history-retry="1"' })
       : cashHistoryHtml(history));
@@ -7351,7 +7353,7 @@ async function moneyInsightsHtml() {
   let html = '';
   if (rec) {
     html += receivableTotalsHtml(rec.totals);
-    html += '<div class="section-label">Дебиторка по срокам</div>' + agingBarsHtml(rec.aging);
+    html += '<div class="section-label">Долги по срокам</div>' + agingBarsHtml(rec.aging);
     const top = (rec.by_counterparty || []).filter(r => r.count);
     if (top.length) {
       html += '<div class="section-label">Кто должен больше всех</div>';
@@ -7496,7 +7498,7 @@ async function renderBuyersList() {
     list.innerHTML = emptyState(q
       ? { icon: 'user', title: 'Никого не нашли', hint: 'Проверьте имя или номер телефона' }
       : { icon: 'user', title: 'Клиентов пока нет',
-          hint: 'Клиент появится здесь, как только его заведут в заказе или накладной' });
+          hint: 'Клиент появится здесь, как только его заведут в заказе или в движении склада' });
     return;
   }
   // «Показаны N из M» — честно про потолок выдачи: список обрезан сотней, и
@@ -7669,14 +7671,14 @@ async function renderLeadsFunnel(container) {
     box.innerHTML = emptyState({
       icon: 'user',
       title: 'Обращений пока нет',
-      hint: 'Воронка наполняется из личных переписок менеджеров. Нужен Telegram '
+      hint: 'Сводка наполняется из личных переписок менеджеров. Нужен Telegram '
           + 'Premium и подключение бота в настройках Telegram для бизнеса — '
           + 'с правом читать сообщения.',
     });
     return;
   }
 
-  let html = '<div class="section-label">Воронка обращений</div>' + leadFunnelHtml(f);
+  let html = '<div class="section-label">От обращения до покупки</div>' + leadFunnelHtml(f);
   // Кто заговорил первым. Лид заводит любое первое сообщение, включая наше
   // собственное после звонка, — без этого разреза «обратились» врёт тем сильнее,
   // чем активнее работают по телефону.
@@ -7734,7 +7736,7 @@ async function renderChannelHistory(container) {
   const posts = data.posts || [];
   const labels = data.kind_labels || {};
   const warn = data.can_publish ? '' :
-    '<div class="c-error">Канал не настроен: нет CHANNEL_ID. Черновики собираются, публикация выключена.</div>';
+    '<div class="c-error">Канал не настроен: не указан, куда публиковать. Черновики собираются, публикация выключена.</div>';
   if (!posts.length) {
     box.innerHTML = warn + emptyState({
       icon: 'cart',
@@ -7791,7 +7793,7 @@ function showChannelPreview(kind, params, draft) {
     ? `<div class="c-error">Это уже публиковали ${escapeHtml(String(draft.already_posted.posted_at || '').slice(0, 16))}</div>`
     : '';
   const blocked = draft.can_publish ? '' :
-    '<div class="c-error">Канал не настроен: нет CHANNEL_ID</div>';
+    '<div class="c-error">Канал не настроен: не указан, куда публиковать</div>';
   const preview = openMachineSheet({
     title: 'Предпросмотр',
     fields: [{ key: 'text', label: 'Текст поста', type: 'textarea', value: draft.text }],
@@ -7848,7 +7850,7 @@ async function renderLeadCard(leadId) {
     ['Первый ответ', String(l.first_reply_at || '').slice(0, 16) || 'не отвечали'],
     // Контрагент — единственный источник телефона: Telegram номер собеседника
     // не отдаёт, поэтому он берётся из карточки контрагента, а не из переписки.
-    ['Контрагент', (l.agent && l.agent.name) || (l.agent_ms_id ? 'привязан' : '— не привязан')],
+    ['Клиент в справочнике', (l.agent && l.agent.name) || (l.agent_ms_id ? 'привязан' : '— не привязан')],
     ...(l.agent && l.agent.phone ? [['Телефон', l.agent.phone]] : []),
   ];
   const flags = [
@@ -7860,7 +7862,7 @@ async function renderLeadCard(leadId) {
   const EVENTS = {
     inbound: 'Клиент написал', outbound: 'Менеджер ответил',
     reengaged: 'Вернулся после паузы', won: 'Отмечен как купивший',
-    lost: 'Отмечен как не купивший', linked: 'Привязан контрагент',
+    lost: 'Отмечен как не купивший', linked: 'Привязан к клиенту в справочнике',
     call: 'Звонок', call_linked: 'Звонок привязан к переписке',
   };
 
@@ -7901,7 +7903,7 @@ async function renderLeadCard(leadId) {
       <button class="btn-secondary" data-lead-status="new">Вернуть в работу</button>
       <button class="btn-secondary" id="lead-call">${icon('phone')} Записать звонок</button>
       <button class="btn-secondary" id="lead-agent">${icon('building')} ${
-        l.agent_ms_id ? 'Сменить контрагента' : 'Привязать контрагента'}</button>
+        l.agent_ms_id ? 'Сменить клиента' : 'Привязать к клиенту'}</button>
     </div>
     ${callsBlock}
     <div class="section-label">События</div>
@@ -8034,18 +8036,18 @@ function openAgentPicker(leadId, lead) {
   const name = lead.display_name || lead.username || '';
 
   const sheet = openMachineSheet({
-    title: 'Контрагент клиента',
+    title: 'Клиент в справочнике',
     hint: 'Ищите по названию или по номеру телефона',
     fields: [{ key: 'search', label: 'Поиск по справочнику', value: name }],
     submitLabel: 'Привязать',
     onSubmit: async (_data, { showErr }) => {
-      if (!picked) { showErr('Выберите контрагента из списка'); return false; }
+      if (!picked) { showErr('Выберите клиента из списка'); return false; }
       const res = await apiResult('/api/leads/link', {
         lead_id: leadId, counterparty_id: picked.id,
       });
       if (!res.ok) { showErr(res.error); return false; }
       haptic('success');
-      toast('Контрагент привязан');
+      toast('Обращение привязано к клиенту');
       renderLeadCard(leadId);
       return true;
     },
@@ -8106,13 +8108,13 @@ function openAgentPicker(leadId, lead) {
   const create = document.createElement('button');
   create.className = 'btn-secondary';
   create.type = 'button';
-  create.textContent = 'Завести нового контрагента';
+  create.textContent = 'Завести нового клиента';
   list.after(create);
   create.addEventListener('click', async () => {
     if (create.disabled) return;
     const title = input.value.trim() || name;
-    if (!title) { sheet.showErr('Впишите название контрагента'); return; }
-    if (!await confirmDialog(`Завести контрагента «${title}»?`)) return;
+    if (!title) { sheet.showErr('Впишите название или имя клиента'); return; }
+    if (!await confirmDialog(`Завести клиента «${title}»?`)) return;
     create.disabled = true;
     const res = await apiResult('/api/leads/create_agent', {
       lead_id: leadId, name: title,
@@ -8120,7 +8122,7 @@ function openAgentPicker(leadId, lead) {
     create.disabled = false;
     if (!res.ok) { sheet.showErr(res.error); return; }
     haptic('success');
-    toast(res.body.existed ? 'Такой контрагент уже был — привязали' : 'Контрагент заведён');
+    toast(res.body.existed ? 'Такой клиент уже есть — привязали к нему' : 'Клиент заведён');
     sheet.close();
     renderLeadCard(leadId);
   });
@@ -8145,7 +8147,7 @@ function openLostReasonSheet(leadId, reasons) {
 
   const sheet = openMachineSheet({
     title: 'Почему не купил',
-    hint: 'Две причины окупают весь список: «нет в наличии» — это про закупку, «дорого» — про цену',
+    hint: 'Причина подскажет, что менять: «нет в наличии» — это про закупку, «дорого» — про цену',
     fields: [{ key: 'note', label: 'Уточнение', type: 'textarea' }],
     submitLabel: 'Сохранить',
     onSubmit: async (data, { showErr }) => {
@@ -8256,7 +8258,7 @@ async function renderBuyerCard(buyer) {
   const content = document.getElementById('content');
   const back = () => { moneyTab = 'debts'; showScreen('money'); };
   content.innerHTML = skeleton('label') + skeleton('list', 4);
-  setScreenContext('Покупатель техники');
+  setScreenContext('Клиент по технике');
   showBack(back);
 
   let card;
@@ -8309,7 +8311,7 @@ async function toggleMachinePaymentFromBuyer(buyer, paymentId, wasPaid, btn) {
 
 // Лента движения денег (платежи + сдачи + возвраты) — общий рендер для «Денег».
 function cashHistoryHtml(history) {
-  if (!history || !history.length) return '<div class="loader">Движений пока нет</div>';
+  if (!history || !history.length) return '<div class="loader">Денег пока не приходило и не уходило</div>';
   const KIND_META = {
     payment: { ic: 'cash', label: 'Платёж' },
     deposit: { ic: 'cashbox', label: 'Сдача' },
@@ -8588,7 +8590,7 @@ async function renderCashbox(container, section) {
     ? `<div class="section-label section-awaiting">${icon('clock')} Оплаты на подтверждении (${payPending.length})</div><div class="debts-list">${payCards}</div>`
     : '';
   const depBlock = deposits.length
-    ? `<div class="section-label">${icon('cash')} Сдачи на подтверждении (${deposits.length})</div><div class="debts-list">${depCards}</div>`
+    ? `<div class="section-label">${icon('cash')} Сдачи в кассу на подтверждении (${deposits.length})</div><div class="debts-list">${depCards}</div>`
     : '';
   const retBlock = returns.length
     ? `<div class="section-label">${icon('return')} Возвраты на подтверждении (${returns.length})</div><div class="debts-list">${retCards}</div>`
@@ -8615,7 +8617,7 @@ async function renderCashbox(container, section) {
       </div>
     `).join('');
     myBlock = myDeposits.length
-      ? `<div class="section-label">Мои сдачи</div><div class="stock-list">${rows}</div>`
+      ? `<div class="section-label">Мои сдачи в кассу</div><div class="stock-list">${rows}</div>`
       : '';
   }
 
@@ -8660,7 +8662,7 @@ async function renderCashbox(container, section) {
         </div>
         <div class="form-row">
           <label class="form-label">Причина</label>
-          <input type="text" id="ret-reason" class="form-input" placeholder="Брак партии">
+          <input type="text" id="ret-reason" class="form-input" placeholder="например: привезли брак">
         </div>
         <div class="form-row">
           <label class="form-label">Возврат денег</label>
@@ -8682,11 +8684,11 @@ async function renderCashbox(container, section) {
   if (section === 'ops') {
     bodyHtml = (createBlock + payFormBlock + returnBlock + myBlock)
       || emptyState({ icon: 'cashbox', title: 'Нет доступных операций',
-                      hint: 'Сдачи и платежи оформляют менеджеры по своим заказам.' });
+                      hint: 'Сдачи в кассу и платежи оформляют менеджеры по своим заказам.' });
   } else {
     bodyHtml = (payBlock + depBlock + retBlock)
       || emptyState({ icon: 'check', title: 'Нет записей на подтверждении',
-                      hint: 'Сдачи, платежи и возвраты появятся здесь, как только их оформят.' });
+                      hint: 'Сдачи в кассу, платежи и возвраты появятся здесь, как только их оформят.' });
   }
   container.innerHTML = bodyHtml;
 
@@ -8758,7 +8760,7 @@ async function renderCashbox(container, section) {
   if (retLoad && retBox) {
     retLoad.addEventListener('click', async () => {
       const orderId = parseInt(container.querySelector('#ret-order').value, 10);
-      if (!orderId) { tg.showAlert('❌ Сначала укажите номер заказа'); return; }
+      if (!orderId) { tg.showAlert('Впишите номер заказа — по нему подтянутся позиции'); return; }
       haptic('light');
       retLoad.disabled = true;
       try {
@@ -8766,7 +8768,7 @@ async function renderCashbox(container, section) {
         const pos = d.positions || [];
         if (!pos.length) {
           retBox.hidden = true;
-          tg.showAlert('⚠️ Нет позиций, доступных к возврату');
+          tg.showAlert('По этому заказу возвращать нечего: всё уже вернули или заказ не отгружали');
           return;
         }
         retBox.innerHTML = `
@@ -8780,7 +8782,7 @@ async function renderCashbox(container, section) {
           <div class="debt-meta">Обнулите количество, чтобы не возвращать позицию.</div>`;
         retBox.hidden = false;
       } catch (e) {
-        tg.showAlert('❌ ' + e.message);
+        tg.showAlert('' + e.message);
       } finally {
         retLoad.disabled = false;
       }
@@ -8792,8 +8794,8 @@ async function renderCashbox(container, section) {
     retBtn.addEventListener('click', () => {
       const orderId = parseInt(container.querySelector('#ret-order').value, 10);
       const reason = container.querySelector('#ret-reason').value.trim();
-      if (!orderId) { tg.showAlert('❌ Укажите номер заказа'); return; }
-      if (reason.length < 3) { tg.showAlert('❌ Опишите причину'); return; }
+      if (!orderId) { tg.showAlert('Впишите номер заказа, по которому оформляем возврат'); return; }
+      if (reason.length < 3) { tg.showAlert('Опишите причину возврата — хотя бы несколькими словами'); return; }
 
       // Позиции не подгружали → полный возврат (прежнее поведение).
       // Подгрузили → шлём выбранные; сервер сам решит full/partial.
@@ -8806,7 +8808,7 @@ async function renderCashbox(container, section) {
             items.push({ item_id: Number(row.dataset.item), quantity: qty });
           }
         });
-        if (!items.length) { tg.showAlert('❌ Укажите количество хотя бы по одной позиции'); return; }
+        if (!items.length) { tg.showAlert('Впишите количество хотя бы по одному товару'); return; }
       }
 
       haptic('light');
@@ -8875,10 +8877,10 @@ async function renderCashbox(container, section) {
         currency: r.querySelector('.pay-row-cur').dataset.cur,
       }));
       const parsed = parsePaymentItems(rawRows);
-      if (parsed.error) { status.textContent = '❌ ' + parsed.error; status.className = 'pay-status pay-error'; return; }
-      if (!comment) { status.textContent = '❌ Укажите комментарий'; status.className = 'pay-status pay-error'; return; }
+      if (parsed.error) { status.textContent = '' + parsed.error; status.className = 'pay-status pay-error'; return; }
+      if (!comment) { status.textContent = 'Напишите, за что платёж'; status.className = 'pay-status pay-error'; return; }
       paySubmit.disabled = true;
-      status.textContent = '⏳ Отправка…'; status.className = 'pay-status';
+      status.textContent = 'Отправка…'; status.className = 'pay-status';
       try {
         await api('/api/payments/send', { items: parsed.items, comment, idempotency_key: payKey });
         payKey = idemKey();
@@ -8889,7 +8891,7 @@ async function renderCashbox(container, section) {
         toast(`Платёж отправлен на подтверждение: ${parsed.items.map(it => formatMoney(it.amount, it.currency)).join(' + ')}`);
         renderMoneyScreen();
       } catch (e) {
-        status.textContent = '❌ ' + e.message; status.className = 'pay-status pay-error';
+        status.textContent = '' + e.message; status.className = 'pay-status pay-error';
         paySubmit.disabled = false;
       }
     });
@@ -8936,7 +8938,7 @@ async function renderCashbox(container, section) {
     createBtn.addEventListener('click', () => {
       const raw = container.querySelector('#dep-amount').value;
       const amount = parseAmount(raw);
-      if (!(amount > 0)) { tg.showAlert('❌ Введите положительную сумму — например 1 500 или 12,50'); return; }
+      if (!(amount > 0)) { tg.showAlert('Введите положительную сумму — например 1 500 или 12,50'); return; }
       const cur = (handover && handover.dataset.cur) || baseCur();
       const body = { amount, currency: cur, idempotency_key: depKey };
       const picked = handover ? payHandoverPicked(handover) : null;
@@ -8950,7 +8952,7 @@ async function renderCashbox(container, section) {
           haptic('success');
           const where = (r.orders || []).length ? ` · заказы: ${payDepositOrdersText(r.orders)}` : '';
           const rest = Number(r.unallocated) > 0 ? ` · не распределено ${formatMoney(r.unallocated, cur)}` : '';
-          toast(`Сдача #${r.deposit_id} на ${formatMoney(amount, cur)} отправлена на подтверждение${where}${rest}`);
+          toast(`Сдача в кассу №${r.deposit_id} на ${formatMoney(amount, cur)} отправлена на подтверждение${where}${rest}`);
           renderMoneyScreen();
         })
         .catch(e => { toast(e.message, 'error'); createBtn.disabled = false; });
@@ -9007,7 +9009,7 @@ function depositCardsHtml(deposits, ctx) {
     return `
       <div class="debt-card" data-dep="${d.id}">
         <div class="debt-card-top">
-          <div class="debt-agent">${icon('cash')} Сдача #${d.id}</div>
+          <div class="debt-agent">${icon('cash')} Сдача в кассу №${d.id}</div>
           <div class="debt-amount">${fmt(d.amount)} ${escapeHtml(dcur)}</div>
         </div>
         <div class="debt-card-mid"><span class="debt-meta">Заказы: ${escapeHtml(orders)}${d.manager_name ? ' · ' + escapeHtml(d.manager_name) : ''}</span></div>
@@ -9021,7 +9023,7 @@ function depositCardsHtml(deposits, ctx) {
         </div>
         <div class="limit-edit dep-reject-box" hidden>
           <input type="text" class="form-input dep-reason" placeholder="Причина отклонения">
-          <button class="btn-reject-pay dep-reject-send">Отклонить сдачу</button>
+          <button class="btn-reject-pay dep-reject-send">Отклонить сдачу в кассу</button>
         </div>
       </div>
     `;
@@ -9084,7 +9086,7 @@ function paymentCardsHtml(payPending, ctx) {
         ${(d.parts || []).filter(p => p.state !== 'rejected').length ? `
           <div class="debt-breakdown">${d.parts.filter(p => p.state !== 'rejected')
             .map(p => `<span>• ${escapeHtml(payPartLine(p))}</span>`).join('')}</div>` : `
-          <div class="debt-hint">Способ оплаты не указан (запись до разбивки)</div>`}
+          <div class="debt-hint">Способ оплаты не указан — запись сделана до того, как его стали спрашивать</div>`}
         ${d.recorded_by_me && !isBoss && !confirmersExist ? `<div class="debt-hint">Оплату вносили вы: руководителя и бухгалтера в системе нет, поэтому подтверждаете вы — это попадёт в журнал.</div>` : ''}
         ${payConfirmable(d) > 0 ? `
         <div class="debt-actions">
@@ -9109,7 +9111,7 @@ function wireConfirmCards(container, refresh) {
         .then((r) => {
           haptic('success');
           const closed = (r && r.closed_orders || []).map(o => '#' + o).join(', ');
-          toast(`Сдача подтверждена${closed ? ' · закрыты заказы ' + closed : ''}${r && r.self_confirmed ? ' · ' + (r.self_note || 'подтверждено вами') : ''}`);
+          toast(`Сдача в кассу подтверждена${closed ? ' · закрыты заказы ' + closed : ''}${r && r.self_confirmed ? ' · ' + (r.self_note || 'подтверждено вами') : ''}`);
           refresh();
         })
         .catch(e => { b.disabled = false; toast(e.message, 'error'); });
@@ -9119,11 +9121,11 @@ function wireConfirmCards(container, refresh) {
     card.querySelector('.dep-reject-send').addEventListener('click', (ev) => {
       const b = ev.currentTarget;
       const reason = card.querySelector('.dep-reason').value.trim();
-      if (reason.length < 3) { tg.showAlert('❌ Укажите причину'); return; }
+      if (reason.length < 3) { tg.showAlert('Впишите, почему отклоняете — менеджер увидит эту причину'); return; }
       if (b.disabled) return;
       b.disabled = true;
       api('/api/deposits/reject', { deposit_id: Number(id), reason })
-        .then(() => { toast('Сдача отклонена', 'info'); refresh(); })
+        .then(() => { toast('Сдача в кассу отклонена', 'info'); refresh(); })
         .catch(e => { b.disabled = false; toast(e.message, 'error'); });
     });
   });
@@ -9246,7 +9248,7 @@ async function renderCreditLimits(container) {
     ? `<div class="section-label">Клиенты (${clients.length})</div><div class="c-surface c-surface--list">${cards}</div>`
     : emptyState({
         icon: 'user', title: 'Пока нет клиентов',
-        hint: 'Контрагенты появятся после первого заказа или когда их заведут в справочнике.',
+        hint: 'Клиенты появятся после первого заказа или когда их заведут в справочнике.',
       });
   const exportRow = `<div class="c-actions">${exportBtnHtml('clients-export', 'Экспорт в Excel')}</div>`;
   container.innerHTML = ratesEntry + exportRow + list;
@@ -9393,7 +9395,7 @@ async function renderCurrencyRates(onBack) {
       const input = row.querySelector('.rate-input');
       const entered = parseFloat(String(input.value).replace(',', '.'));
       if (!isFinite(entered) || entered <= 0) {
-        tg.showAlert('❌ Курс должен быть положительным числом');
+        tg.showAlert('Курс — положительное число, например 12650');
         return;
       }
       // Поле показывает перевёрнутый курс («сум за 1 USD») — в базу уходит
@@ -9407,11 +9409,11 @@ async function renderCurrencyRates(onBack) {
           currency_code: b.dataset.code,
           rate_to_base: rate,
         });
-        tg.showAlert(`✅ Курс ${b.dataset.code} обновлён`);
+        tg.showAlert(`Курс ${b.dataset.code} обновлён`);
         await renderCurrencyRates(onBack);
       } catch (e) {
         b.disabled = false;
-        tg.showAlert('❌ ' + e.message);
+        tg.showAlert('' + e.message);
       }
     });
   });
@@ -9496,7 +9498,7 @@ async function renderAgentDetail(agentId, opts) {
   const boughtYear = sumsLabel(pur.period_by_currency, '');
   const topRows = (pur.top_products || []).map(p =>
     `<div class="c-row"><div class="card-row-info"><div class="card-row-title">${escapeHtml(p.name)}</div>` +
-    `<div class="card-row-sub">${fmt(p.qty)} шт. · ${fmtCents(p.sum_cents)} ${escapeHtml(baseC)}</div></div></div>`
+    `<div class="card-row-sub">${fmt(p.qty)} шт · ${fmtCents(p.sum_cents)} ${escapeHtml(baseC)}</div></div></div>`
   ).join('');
   // Отгрузка — номер, дата и сумма В СВОЕЙ валюте; раскрывается в состав.
   // Позиции тянем по первому тапу, а не сразу все десять: чаще всего их никто
@@ -9536,8 +9538,8 @@ async function renderAgentDetail(agentId, opts) {
     `<div class="order-items" id="agent-order-${o.id}" hidden>${orderItemsHtml(o)}</div>`
   ).join('');
   const ordersBlock = orders.length
-    ? `<div class="section-label">Заказы в боте · ${orders.length}</div><div class="c-surface c-surface--list">${ordersRows}</div>`
-    : '<div class="section-label">Заказы в боте</div><div class="loader">Заказов нет</div>';
+    ? `<div class="section-label">Заказы · ${orders.length}</div><div class="c-surface c-surface--list">${ordersRows}</div>`
+    : '<div class="section-label">Заказы</div><div class="loader">Заказов нет</div>';
 
   // Платежи клиента: та же лента, что на экране «Деньги» (cashHistoryHtml) —
   // платежи, сдачи в части его заказов и возвраты, сгруппированные по дням.
@@ -9547,7 +9549,7 @@ async function renderAgentDetail(agentId, opts) {
   const history = d.money_history || [];
   const historyBlock = history.length
     ? `<div class="section-label">Как платил · ${history.length}</div>${cashHistoryHtml(history)}`
-    : `<div class="section-label">Как платил</div><div class="loader">Движений денег не было</div>`;
+    : `<div class="section-label">Как платил</div><div class="loader">Платежей ещё не было</div>`;
 
   // Лимит правится только у контрагента с заказами (эндпоинт credit/set это гейтит)
   // и только начальством — менеджеру карточка открыта на чтение (A3), запись
@@ -9625,13 +9627,13 @@ async function renderAgentDetail(agentId, opts) {
       const btn = ev.currentTarget;
       if (btn.disabled) return;
       const amount = parseNum(content.querySelector('#cl-input').value);
-      if (isNaN(amount) || amount < 0) { tg.showAlert('❌ Лимит должен быть неотрицательным числом.'); return; }
+      if (isNaN(amount) || amount < 0) { tg.showAlert('Лимит — число от нуля и больше. Ноль значит «в долг не отпускаем».'); return; }
       btn.disabled = true;
       try {
         await api('/api/credit/set', { agent_id: d.agent_id, agent_name: d.name, limit_amount: amount });
         toast(`Лимит обновлён: ${fmt(amount)} ${baseC}`);
         renderAgentDetail(agentId, { back: backTab });
-      } catch (e) { btn.disabled = false; tg.showAlert('❌ ' + e.message); }
+      } catch (e) { btn.disabled = false; tg.showAlert('' + e.message); }
     });
   }
 }
@@ -9728,7 +9730,7 @@ async function renderDebts(container) {
           </div>
           <div class="money-block money-pending ${pendingItems.length === 0 ? 'money-empty' : ''}">
             <div class="money-label">${icon('clock')} Ждёт подтверждения</div>
-            <div class="money-value">${pendingRows || '<span class="money-placeholder">пусто</span>'}</div>
+            <div class="money-value">${pendingRows || '<span class="money-placeholder">пока пусто</span>'}</div>
           </div>
         </div>
       `;
@@ -9861,7 +9863,7 @@ async function renderDebts(container) {
             ${d.is_mine || (isBoss && workActionsVisible()) ? `
               <div class="pay-input-row">
                 <input type="hidden" class="pay-amount-input" data-id="${d.id}">
-                <button class="btn-primary btn-pay-debt" data-id="${d.id}">${icon('cash')} Внести оплату · ост. ${fmt(d.remaining)} ${escapeHtml(d.currency || '')}</button>
+                <button class="btn-primary btn-pay-debt" data-id="${d.id}">${icon('cash')} Внести оплату</button>
               </div>
             ` : ''}
           </div>
@@ -9942,7 +9944,7 @@ async function renderDebts(container) {
             await renderDebts(container);
           } catch (e) {
             tg.HapticFeedback?.notificationOccurred('error');
-            tg.showAlert('❌ ' + e.message);
+            tg.showAlert('' + e.message);
             btn.disabled = false;
           }
         });
@@ -9962,7 +9964,7 @@ async function renderDebts(container) {
             await renderDebts(container);
           } catch (e) {
             tg.HapticFeedback?.notificationOccurred('error');
-            tg.showAlert('❌ ' + e.message);
+            tg.showAlert('' + e.message);
             btn.disabled = false;
           }
         });
@@ -10073,7 +10075,7 @@ async function renderSupplierDebts(container) {
         <div class="card-row-value"><span class="money-placeholder">нет цены</span></div>
       </div>`).join('');
     html += `</div><div class="debt-hint">Пока закупочная цена не вписана, долг считать не из чего —
-      впишите её в карточке контейнера («Закупка и себестоимость») или в накладной.</div>`;
+      впишите её в карточке контейнера («Закупка и себестоимость») или в самом приходе.</div>`;
   }
 
   if (payments.length) {
@@ -10142,9 +10144,9 @@ async function supplierPickAndPay(reload) {
   }
   openListPicker({
     title: 'Кому платим',
-    hint: 'Поставщик из справочника контрагентов',
+    hint: 'Поставщик из общего справочника',
     items,
-    emptyText: 'Контрагентов пока нет',
+    emptyText: 'Поставщиков пока нет',
     onPick: (item) => supplierOpenPaymentForm({ supplierId: item.id, supplierName: item.name }, reload),
   });
 }
@@ -10196,7 +10198,7 @@ function supplierOpenInvoiceActions(d, reload) {
     if (!ok) return;
     try {
       await api('/api/suppliers/terms', { invoice_id: d.invoice_id, payment_type: 'paid' });
-    } catch (e) { tg.showAlert('❌ ' + e.message); return; }
+    } catch (e) { tg.showAlert('' + e.message); return; }
     sheet.close();
     haptic('success');
     toast('Приход отмечен оплаченным');
@@ -10502,13 +10504,13 @@ async function renderWhInvoiceList() {
             <div class="order-title">
               ${icon(isOut ? 'truck' : 'box')} ${escapeHtml(inv.invoice_number)}
             </div>
-            <div class="order-sub">${escapeHtml(inv.counterparty_name || 'Без контрагента')}</div>
+            <div class="order-sub">${escapeHtml(inv.counterparty_name || (isOut ? 'Клиент не указан' : 'Поставщик не указан'))}</div>
           </div>
           <!-- Строка называет себя словом, а не только кодом документа:
                «OUT-2026-0007» без подписи читается одинаково у отгрузки,
                списания и перемещения. -->
           <span class="order-status" data-status="${cancelled ? 'rejected' : 'approved'}">
-            ${cancelled ? 'отменена' : (isOut ? 'отгрузка' : 'приход')}
+            ${cancelled ? 'отменено' : (isOut ? 'отгрузка' : 'приход')}
           </span>
         </div>
         <div class="order-meta">
@@ -10554,7 +10556,8 @@ async function renderWhInvoiceList() {
   content.querySelectorAll('[data-wh-cancel]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('warning');
-      tg.showConfirm('Отменить накладную? Остатки вернутся в исходное состояние.', async ok => {
+      tg.showConfirm(out ? 'Отменить эту отгрузку? Товар вернётся на склад.'
+                         : 'Отменить этот приход? Товар снимется с остатка.', async ok => {
         if (!ok) return;
         btn.disabled = true;
         try {
@@ -10567,7 +10570,7 @@ async function renderWhInvoiceList() {
             btn.disabled = false;
             return;
           }
-          toast('Накладная отменена');
+          toast(out ? 'Отгрузка отменена' : 'Приход отменён');
           renderWhInvoiceList();
         } catch (e) {
           toast(e.message || 'Не удалось отменить', 'error');
@@ -10584,10 +10587,15 @@ async function renderWhInvoiceList() {
 // (`openCatalogPicker`), а не с ввода названия: то же правило, что у позиции
 // контейнера — вписанное руками имя превращало опечатку в новую карточку.
 
-let woQuickReasons = ['бой', 'порча', 'недостача', 'пересортица'];
+// Зеркало `services.inventory.QUICK_REASONS` — фолбэк до ответа
+// `/api/stock/writeoffs/list`. Форму списания открывают и из «Каталога», где
+// лента ещё не грузилась, и владелец видел здесь старый складской жаргон
+// («бой», «пересортица»), которого в сервере давно нет.
+let woQuickReasons = ['разбили', 'испортился', 'не хватает на складе',
+                      'привезли не тот товар', 'истёк срок годности'];
 let woCanPhoto = false;         // снимку есть куда лечь (PHOTOS_TG_CHAT_ID)
 
-function woKindLabel(kind) { return kind === 'surplus' ? 'излишек' : 'списание'; }
+function woKindLabel(kind) { return kind === 'surplus' ? 'нашли лишнее' : 'списание'; }
 
 // Форма причины. Быстрые причины — сегментом, «Другое» открывает своё поле:
 // список закрытым быть не должен (с площадки приходит то, чего в нём нет),
@@ -10598,7 +10606,7 @@ function woKindLabel(kind) { return kind === 'surplus' ? 'излишек' : 'с�
 // мегабайты base64 в теле списания, либо заводить снимку свою запись раньше,
 // чем появилась запись о списании.
 function openWriteoffSheet(product, onDone) {
-  const options = woQuickReasons.map(r => [r, r]).concat([['other', 'Другое']]);
+  const options = woQuickReasons.map(r => [r, r]).concat([['other', 'Другая причина']]);
   let photoFileId = null;
   const sheet = openMachineSheet({
     title: `Списать: ${product.name}`,
@@ -10608,16 +10616,16 @@ function openWriteoffSheet(product, onDone) {
       { key: 'quantity', label: 'Сколько списать', type: 'number', required: true,
         placeholder: '0' },
       { key: 'reason', label: 'Причина', type: 'select', options },
-      { key: 'note', label: 'Своя причина / комментарий', type: 'text',
+      { key: 'note', label: 'Своя причина или уточнение', type: 'text',
         placeholder: 'например: упало при разгрузке' },
     ],
     submitLabel: 'Списать',
     onSubmit: async (data, ctx) => {
       const qty = parseAmount(data.quantity);
-      if (!(qty > 0)) { ctx.showErr('Количество должно быть больше нуля'); return false; }
+      if (!(qty > 0)) { ctx.showErr('Впишите, сколько списываем — больше нуля'); return false; }
       const picked = data.reason === 'other' ? '' : data.reason;
       const reason = [picked, (data.note || '').trim()].filter(Boolean).join(' — ');
-      if (!reason) { ctx.showErr('Опишите причину — без неё списание не проводим'); return false; }
+      if (!reason) { ctx.showErr('Опишите причину — без неё списание не оформляем'); return false; }
       const r = await apiResult('/api/stock/writeoffs/create', {
         product_id: product.product_id, quantity: qty, reason,
         photo_file_id: photoFileId, idempotency_key: idemKey(),
@@ -10628,7 +10636,7 @@ function openWriteoffSheet(product, onDone) {
         ctx.showErr((r.body && (r.body.reason || r.body.detail)) || r.error);
         return false;
       }
-      toast('Списано');
+      toast('Товар списан со склада');
       ctx.close();
       await onDone();
       return false;
@@ -10728,7 +10736,7 @@ async function renderWriteoffsList() {
   const list = !rows.length
     ? emptyState({
         icon: 'check', title: 'Списаний нет',
-        hint: 'Здесь будет всё, что ушло со склада не продажей: бой, порча, недостача.',
+        hint: 'Здесь будет всё, что ушло со склада не продажей: разбили, испортился, не хватает.',
       })
     : rows.map(w => {
         const items = (w.items || []).map(it =>
@@ -10756,7 +10764,7 @@ async function renderWriteoffsList() {
               w.count_id ? ` · пересчёт #${w.count_id}` : ''}</div>
           </div>
           <span class="order-status" data-status="${cancelled ? 'rejected' : (w.kind === 'surplus' ? 'approved' : 'pending')}">
-            ${cancelled ? 'сторно' : woKindLabel(w.kind)}
+            ${cancelled ? 'отменено' : woKindLabel(w.kind)}
           </span>
         </div>
         ${items}
@@ -10767,7 +10775,7 @@ async function renderWriteoffsList() {
           ${cost}
         </div>
         ${canVoid && !cancelled
-          ? `<div class="wh-actions"><button class="btn-secondary" data-wo-void="${w.id}">${icon('ban')} Сторно</button></div>`
+          ? `<div class="wh-actions"><button class="btn-secondary" data-wo-void="${w.id}">${icon('ban')} Отменить</button></div>`
           : ''}
       </div>`;
       }).join('');
@@ -10785,7 +10793,7 @@ async function renderWriteoffsList() {
     openMachineSheet({
       title: 'Пересчёт склада',
       hint: 'Вводите ПОСЧИТАННОЕ количество по каждому товару. Разницу с остатком '
-        + 'система посчитает сама и покажет списком перед проведением.',
+        + 'система посчитает сама и покажет списком, прежде чем менять остатки.',
       fields: [{ key: 'note', label: 'Заметка', type: 'text', placeholder: 'например: склад №1, ряд А' }],
       submitLabel: 'Начать',
       onSubmit: async (d, ctx) => {
@@ -10802,7 +10810,7 @@ async function renderWriteoffsList() {
   content.querySelectorAll('[data-wo-void]').forEach(btn => {
     btn.addEventListener('click', () => {
       haptic('warning');
-      tg.showConfirm('Сторнировать списание? Товар вернётся на остаток.', async ok => {
+      tg.showConfirm('Отменить списание? Товар вернётся на остаток.', async ok => {
         if (!ok) return;
         btn.disabled = true;
         const r = await apiResult('/api/stock/writeoffs/void', {
@@ -10813,7 +10821,7 @@ async function renderWriteoffsList() {
           btn.disabled = false;
           return;
         }
-        toast('Сторнировано');
+        toast('Списание отменено');
         renderWriteoffsList();
       });
     });
@@ -10861,12 +10869,12 @@ async function renderCountCard() {
       <div class="card-row-title">Пересчёт #${card.count_id}${card.note ? ' · ' + escapeHtml(card.note) : ''}</div>
       <div class="card-row-sub">${escapeHtml(card.started_by_name || '')} · ${escapeHtml(card.started_at || '')}</div>
       <div class="card-row-sub">${plural(s.lines || 0, ['позиция', 'позиции', 'позиций'])}: `
-    + `недостача ${s.short || 0}, излишек ${s.surplus || 0}, сходится ${s.match || 0}</div>
+    + `не хватает ${s.short || 0}, лишних ${s.surplus || 0}, сходится ${s.match || 0}</div>
     </div>`;
 
   const actions = `<div class="c-actions c-actions--wrap">
       <button class="btn-primary" id="wo-line-add">${icon('plus')} Добавить товар</button>
-      ${(card.lines || []).length ? `<button class="btn-primary" id="wo-apply">${icon('check')} Провести</button>` : ''}
+      ${(card.lines || []).length ? `<button class="btn-primary" id="wo-apply">${icon('check')} Применить пересчёт</button>` : ''}
       <button class="btn-secondary" id="wo-count-cancel">${icon('ban')} Отменить пересчёт</button>
     </div>`;
 
@@ -10884,7 +10892,7 @@ async function renderCountCard() {
       submitLabel: 'Записать',
       onSubmit: async (d, ctx) => {
         const qty = parseAmount(d.counted);
-        if (!(qty >= 0)) { ctx.showErr('Введите количество (0 — если товара нет)'); return false; }
+        if (!(qty >= 0)) { ctx.showErr('Впишите, сколько товара на полке. Нет ни одного — впишите 0'); return false; }
         const r = await apiResult('/api/stock/counts/line', {
           count_id: woCountId, product_id: product.product_id, counted_qty: qty,
         });
@@ -10930,8 +10938,8 @@ async function renderCountCard() {
   if (applyBtn) {
     applyBtn.addEventListener('click', () => {
       haptic('warning');
-      const text = `Провести пересчёт? Списать ${whQty(s.short_qty || 0)}, `
-        + `оприходовать ${whQty(s.surplus_qty || 0)}. Остатки изменятся сразу.`;
+      const text = `Применить пересчёт? Спишем ${whQty(s.short_qty || 0)}, `
+        + `добавим ${whQty(s.surplus_qty || 0)}. Остатки изменятся сразу.`;
       tg.showConfirm(text, async ok => {
         if (!ok) return;
         applyBtn.disabled = true;
@@ -10943,7 +10951,7 @@ async function renderCountCard() {
           applyBtn.disabled = false;
           return;
         }
-        toast('Пересчёт проведён');
+        toast('Пересчёт применён — остатки обновлены');
         woView = 'list';
         woCountId = null;
         renderWriteoffsView();
@@ -11022,7 +11030,7 @@ async function renderDocsTab() {
       <div class="card-row-info">
         <div class="card-row-title">${escapeHtml(d.type_label)} · ${escapeHtml(d.client_name || '')}</div>
         <div class="card-row-sub">${escapeHtml(d.product_name || '')} · ${formatMoney((d.total_amount_cents || 0) / 100)} ${escapeHtml(d.currency || '')}
-          · ${d.payment_type === 'installment' ? `рассрочка ${d.installments_count} пл.` : 'разовый платёж'} · ${formatDateRU(d.start_date)}</div>
+          · ${d.payment_type === 'installment' ? `рассрочка · ${plural(d.installments_count, ['платёж', 'платежа', 'платежей'])}` : 'разовый платёж'} · ${formatDateRU(d.start_date)}</div>
         <div class="c-actions c-actions--wrap">
           ${d.file_exists ? `<button class="btn-secondary" data-doc-send="${d.id}">${icon('phone')} В Telegram</button>` : '<span class="c-field-hint">файл не найден — сформируйте заново</span>'}
           ${d.file_exists && canPrint ? `<button class="btn-secondary" data-doc-print="${d.id}">${icon('list')} Распечатать</button>` : ''}
@@ -11088,7 +11096,7 @@ function openDocumentForm(meta) {
       // Первый вариант сегмента — значение по умолчанию: расписка RU+UZ.
       { key: 'doc_type', label: 'Тип документа', type: 'select', options: types, required: true },
       { key: 'debtor_full_name', label: 'Должник — ФИО', required: true,
-        hint: 'В документ не печатается — Должник впишет сам. Нужно для списка документов.' },
+        hint: 'В документ не печатается — должник впишет сам. Нужно, чтобы вы нашли документ в списке.' },
       { key: 'product_name', label: 'Что передаётся (товар, техника)', required: true },
       { key: 'total_amount', label: 'Сумма, сум', type: 'number', required: true,
         hint: 'Печатается цифрами и прописью' },
@@ -11168,8 +11176,8 @@ async function renderWhInvoiceNew() {
 
   if (!products.length) {
     content.innerHTML = stockShellHtml() + emptyState({
-      icon: 'box', title: 'Нет номенклатуры',
-      hint: 'Заведите товар в каталоге или перенесите справочник скриптом миграции',
+      icon: 'box', title: 'Каталог пуст',
+      hint: 'Заведите товар в «Склад → Каталог» — без товаров движение не оформить',
     });
     wireSectionNav(content, 'stock', renderStockScreen);
     return;
@@ -11184,7 +11192,7 @@ async function renderWhInvoiceNew() {
   const typeSeg = canOut ? `
     <div class="seg-row"><div class="seg">
       <button class="seg-item ${!isOut ? 'active' : ''}" data-whtype="incoming">${icon('box')} Приход</button>
-      <button class="seg-item ${isOut ? 'active' : ''}" data-whtype="outgoing">${icon('truck')} Расход</button>
+      <button class="seg-item ${isOut ? 'active' : ''}" data-whtype="outgoing">${icon('truck')} Отгрузка</button>
     </div></div>` : `
     <div class="section-label">${icon('box')} Приход на склад</div>`;
   // Контрагента выбирают листом с поиском (openListPicker), а не нативным
@@ -11229,9 +11237,9 @@ async function renderWhInvoiceNew() {
     </div>` : ''}
 
     <div class="form-row">
-      <label class="form-label" for="wh-cp">Контрагент${isOut ? ' *' : ''}</label>
+      <label class="form-label" for="wh-cp">${isOut ? 'Клиент *' : 'Поставщик'}</label>
       <button type="button" id="wh-cp" class="btn-agent${cpPicked ? '' : ' btn-agent--empty'}">
-        ${cpPicked ? escapeHtml(cpPicked.name) : 'Выберите контрагента'}
+        ${cpPicked ? escapeHtml(cpPicked.name) : (isOut ? 'Выберите клиента' : 'Выберите поставщика')}
       </button>
     </div>
     ${termsHtml}
@@ -11249,7 +11257,7 @@ async function renderWhInvoiceNew() {
     </div>
     <div id="wh-total"></div>
     <div class="c-actions c-actions--stack">
-      <button class="btn-primary" id="wh-save" disabled>Сохранить накладную</button>
+      <button class="btn-primary" id="wh-save" disabled>${isOut ? 'Оформить отгрузку' : 'Оформить приход'}</button>
       <button class="btn-secondary" id="wh-cancel-form">Отмена</button>
     </div>`;
   wireSectionNav(content, 'stock', renderStockScreen);
@@ -11347,7 +11355,7 @@ async function renderWhInvoiceNew() {
         ${pr.product ? `<div class="wh-pos-warn">Выберите товар</div>` : ''}
         ${short ? `<div class="wh-pos-warn">На складе только ${whQty(have)}</div>` : ''}
         ${qtyBad ? `<div class="wh-pos-warn">Количество должно быть больше нуля</div>` : ''}
-        ${priceBad ? `<div class="wh-pos-warn">Для расхода укажите цену</div>` : ''}
+        ${priceBad ? `<div class="wh-pos-warn">Для отгрузки укажите цену</div>` : ''}
       </div>`;
     }).join('');
 
@@ -11453,15 +11461,16 @@ async function renderWhInvoiceNew() {
     saveWhDraft();
   };
   const openCpPicker = () => openListPicker({
-    title: 'Контрагент',
-    hint: isOut ? 'Для расхода обязателен — на него выписывается накладная' : 'Необязательно',
+    title: isOut ? 'Клиент' : 'Поставщик',
+    hint: isOut ? 'Обязателен: на него выписывается расходная накладная'
+      : 'Необязательно — но без него потом не вспомнить, от кого пришёл товар',
     items: whCounterparties.map(c => ({
       id: c.id, name: c.name,
       sub: c.telegram_id ? '' : 'без Telegram — PDF не отправить',
     })),
     selectedId: whDraft.counterparty_id,
-    emptyText: 'Контрагенты не найдены',
-    addLabel: 'Новый контрагент',
+    emptyText: isOut ? 'Клиенты не найдены' : 'Поставщики не найдены',
+    addLabel: isOut ? 'Новый клиент' : 'Новый поставщик',
     onAdd: (typed) => openCounterpartyForm(typed, (created) => {
       // Справочник тянется один раз на сессию экрана — дописываем заведённого
       // в него, иначе следующий выбор его не покажет до перезагрузки.
@@ -11559,7 +11568,8 @@ async function renderWhInvoiceNew() {
         return;
       }
       const res = r.body;
-      toast(`Накладная ${res.invoice_number} проведена`);
+      toast(savedType === 'outgoing' ? `Отгрузка ${res.invoice_number} оформлена`
+                                     : `Приход ${res.invoice_number} оформлен`);
       // Отдельным сообщением: неотправленный PDF — не ошибка проведения.
       // Накладная сохранена, остатки списаны, отправить можно позже кнопкой.
       if (res.pdf_warning) toast(res.pdf_warning, 'error', { duration: 6000 });

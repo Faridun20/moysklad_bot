@@ -934,7 +934,7 @@ describe('контейнеры', () => {
     window.document.querySelector('#cont-save').click();
     await new Promise(r => setTimeout(r, 0));
     const toasts = Array.from(window.document.querySelectorAll('.toast')).map(t => t.textContent).join(' | ');
-    expect(toasts).toContain('на склад не пошло: Нечего оприходовать');
+    expect(toasts).toContain('на склад товар не пошёл: Нечего оприходовать');
   });
 
   it('позиции без карточки: сверка сначала спрашивает, что это за товар', async () => {
@@ -1607,7 +1607,7 @@ describe('шесть разделов: пять в панели и «Меню»'
     await window.__ready;
     const content = window.document.getElementById('content');
     expect(window.__calls).toContain('/api/leads/funnel');
-    expect(content.textContent).toContain('Воронка обращений');
+    expect(content.textContent).toContain('От обращения до покупки');
     expect(content.textContent).toContain('Азиз Р.');
     // И переключатель раздела на месте (UI-BUG-04).
     expect(content.querySelector('[data-sect="list"]')).not.toBeNull();
@@ -1649,7 +1649,7 @@ describe('«Сегодня» — очередь дел', () => {
     expect(rows[0].dataset.status).toBe('overdue');
     expect(rows[1].dataset.status).toBe('pending');
     expect(rows[2].dataset.status).toBe('draft');
-    expect(box.textContent).toContain('Требует вас · 9');
+    expect(box.textContent).toContain('Что нужно сделать · 9');
   });
 
   it('пустая очередь — это ответ, а не пустое место', () => {
@@ -2948,7 +2948,7 @@ describe('одобрение заявки при превышении креди
   it('показывает цифры лимита и повторяет запрос с override тем же ключом', async () => {
     const window = boot(driver(true));
     await window.__done;
-    expect(window.__confirmMsg).toContain('лимит');
+    expect(window.__confirmMsg).toContain('Лимит долга превышен');
     expect(window.__confirmMsg).toContain('100');
     expect(window.__confirmMsg).toContain('300');
     expect(window.__calls.length).toBe(2);
@@ -3748,14 +3748,14 @@ describe('экран «Решения»', () => {
     expect(paths).toContain('/api/orders/requests');   // перерисовка «Решений», не «Денег»
   });
 
-  it('пусто — «Решений не ждёт», бейдж гаснет', async () => {
+  it('пусто — «Ничего не ждёт решения», бейдж гаснет', async () => {
     const window = bootDecisions(`
       window.__lists = { '/api/orders/requests': { requests: [] }, '/api/payments/pending': { pending: [] },
         '/api/deposits/pending': { deposits: [] }, '/api/returns/pending': { returns: [] } };
       setDecisionsBadge(5);
     `);
     await window.__ready;
-    expect(window.document.getElementById('content').textContent).toContain('Решений не ждёт');
+    expect(window.document.getElementById('content').textContent).toContain('Ничего не ждёт решения');
     expect(window.document.querySelector('[data-decisions-badge]').hidden).toBe(true);
   });
 
