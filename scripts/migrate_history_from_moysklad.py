@@ -2072,6 +2072,13 @@ async def print_owner_table(
     logger.info("═══ СОТРУДНИКИ МОЙСКЛАД — АВТОРЫ ДОКУМЕНТОВ ═══")
     for line in owner_table_lines(employees, docs_by_kind, plan, staff):
         logger.info("%s", line)
+    for tg, (member, _) in sorted(staff.items()):
+        if member is not None and member.full_name == f"Сотрудник {tg}":
+            logger.warning(
+                "У %s нет имени в user_roles — в заказах и платежах будет «%s». Чтобы было "
+                "имя: сотрудник пишет боту /start, затем перенос запускается заново.",
+                tg, member.full_name,
+            )
     if error:
         logger.error("%s", error)
     return plan

@@ -1743,6 +1743,7 @@ def test_dry_run_prints_ms_employee_table_with_targets(two_authors, ms_api, capl
     assert f"→ {OWNER_TG} «Фаридун» (manager) — по карте" in farid
     assert f"→ {BOSS_TG} «Сотрудник {BOSS_TG}» (boss) — по умолчанию" in anvar
     assert "заказ  отгр  плат   ПКО  пост   исх   РКО  → на кого" in table
+    assert f"У {BOSS_TG} нет имени в user_roles" in caplog.text
     assert "ЧЬИ ЗАКАЗЫ И ПЛАТЕЖИ" in caplog.text
     assert _rows(two_authors, "SELECT * FROM orders") == []
 
