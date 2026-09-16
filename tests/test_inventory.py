@@ -374,7 +374,7 @@ def test_manager_writes_off_and_it_lands_in_the_journal(api):
     assert _stock(db, 1) == 8
     lst = client.post("/api/stock/writeoffs", json={"initData": str(ids["mgr"])}).json()
     assert lst["writeoffs"][0]["reason"] == "бой"
-    assert "бой" in lst["quick_reasons"]
+    assert "разбили" in lst["quick_reasons"], "быстрые причины — обычными словами"
 
 
 def test_guest_cannot_write_off(api):
