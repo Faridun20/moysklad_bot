@@ -269,6 +269,36 @@ def test_no_live_data_right_after_first_migration(mig):
     _run(go())
 
 
+def test_history_orders_assigned_to_an_employee_are_not_live_work(mig, isolated_db):
+    """`migrate_history_from_moysklad --orders-owner` пишет исторические заказы
+    на сотрудника (user_id ≠ 0). Живой работой они от этого не становятся —
+    признак истории ключ документа МС, а не автор."""
+    db = isolated_db
+
+    async def go():
+        await mig.apply_migration(PRODUCTS, COUNTERPARTIES, STOCK)
+        stamp = "2999-01-01 00:00:00"
+        with db.get_conn() as conn:
+            cur = db.get_cursor(conn)
+            cur.execute(
+                db.q("INSERT INTO orders (user_id, status, ms_demand_id, created_at, updated_at) "
+                     "VALUES (941599419, 'shipped', 'dem-1', ?, ?)"), (stamp, stamp),
+            )
+            conn.commit()
+        assert (await mig.live_activity())["orders"] == 0
+        with db.get_conn() as conn:
+            cur = db.get_cursor(conn)
+            cur.execute(
+                db.q("INSERT INTO orders (user_id, status, created_at, updated_at) "
+                     "VALUES (941599419, 'draft', ?, ?)"),
+                (stamp, stamp),
+            )
+            conn.commit()
+        assert (await mig.live_activity())["orders"] == 1
+
+    _run(go())
+
+
 def test_rerun_apply_is_refused_when_live_invoices_exist(mig, isolated_db, monkeypatch):
     """Живая накладная после переноса → повторный --apply отказывается и
     остаток не трогает. Снимок МС (10.5) стёр бы списание 4 шт молча."""

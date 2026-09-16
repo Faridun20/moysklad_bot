@@ -495,7 +495,8 @@ async def live_activity() -> dict:
     границу вперёд и не «прячет» уже случившиеся живые накладные.
 
     Живое — накладные не из переноса истории (`warehouse.historical_invoice_sql`) и заказы с настоящим
-    автором (`user_id <> 0`; у исторических — 0). Возвращает счётчики и
+    автором (`user_id <> 0` и без ключа документа МС — перенесённый заказ может
+    быть записан на сотрудника `--orders-owner`). Возвращает счётчики и
     `product_ms_ids` — товары МС, по которым были живые движения: их остаток
     при осознанном повторе трогать нельзя.
     """
@@ -519,7 +520,10 @@ async def live_activity() -> dict:
     )
     out["orders"] = int(
         await adb_core.fetchval(
-            "SELECT COUNT(*) FROM orders WHERE created_at > $1 AND user_id <> 0", since
+            # Заказ из переноса истории живым не считается, даже если записан на
+            # сотрудника (`--orders-owner`): признак истории — ключ документа МС.
+            "SELECT COUNT(*) FROM orders WHERE created_at > $1 AND user_id <> 0 "
+            "AND ms_customerorder_id IS NULL AND ms_demand_id IS NULL", since
         )
         or 0
     )
@@ -916,7 +920,7 @@ async def main(mode: str, *, allow_live: bool = False) -> int:
                 logger.error("  • %s", p)
             return 1
 
-        logger.info("✓ Сверка сошлась: расхождений нет. Можно переходить к шагу 3 (тестовые накладные).")
+        logger.info("✓ Сверка сошлась: расхождений нет. Дальше — перенос истории (migrate_history_from_moysklad --dry-run).")
         return 0
     except Exception:
         logger.exception("Миграция упала — база могла остаться в прежнем состоянии (транзакция откатывается)")

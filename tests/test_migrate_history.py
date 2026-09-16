@@ -206,7 +206,8 @@ def seeded(isolated_db):
     return db
 
 
-def _run(ms_api, *, dry_run=False, supplier_history="ledger", balances=None, returns=None):
+def _run(ms_api, *, dry_run=False, supplier_history="ledger", balances=None, returns=None,
+         orders_owner=None):
     orders = asyncio.run(mig.pull_orders())
     demands = asyncio.run(mig.pull_demands())
     payments = asyncio.run(mig.pull_payments())
@@ -219,7 +220,7 @@ def _run(ms_api, *, dry_run=False, supplier_history="ledger", balances=None, ret
         mig.write_history(
             orders, demands, payments, supplies, payments_out,
             currencies=currencies, dry_run=dry_run, supplier_history=supplier_history,
-            balances=balances, returns=returns,
+            balances=balances, returns=returns, orders_owner=orders_owner,
         )
     )
 
@@ -1569,3 +1570,87 @@ def test_dry_run_reports_app_preview_and_balance_check(seeded, ms_api, caplog):
     assert "ЧТО ПОКАЖЕТ ПРИЛОЖЕНИЕ" in caplog.text
     assert "сравнено 1, расхождений 0" in caplog.text
     assert _rows(seeded, "SELECT * FROM orders") == []
+
+
+# ─── Чьи заказы: --orders-owner ──────────────────────────────────────────────
+
+
+def test_orders_default_to_nobody_and_can_be_assigned_to_the_sole_manager(seeded, ms_api):
+    """Менеджер видит только свои заказы и долги. Владелец, который ведёт
+    компанию один с ролью manager, историю с user_id 0 не увидел бы вовсе —
+    поэтому `--orders-owner` записывает заказы на него, а платежи остаются
+    «Перенос из МойСклад» (деньги вносил не он)."""
+    import services.database as db
+
+    db.set_role(941599419, "owner", "Фаридун", "manager")
+    ms_api["customerorder"] = [_order(sum_minor=300000)]
+    ms_api["demand"] = [_demand(), _demand(ms_id="dem-2", name="D002", order_ms_id=None)]
+    ms_api["paymentin"] = [_paymentin(sum_minor=100000)]
+
+    stats, _, _ = _run(ms_api)
+    assert stats["orders_owner"] == 0
+    assert {r["user_id"] for r in _rows(seeded, "SELECT user_id FROM orders")} == {0}
+
+    stats, _, problems = _run(ms_api, orders_owner=941599419)
+    assert problems == [] and stats["orders_owner"] == 941599419
+    owners = _rows(seeded, "SELECT user_id, full_name FROM orders")
+    assert len(owners) == 2
+    assert {(r["user_id"], r["full_name"]) for r in owners} == {(941599419, "Фаридун")}
+    assert {r["full_name"] for r in _rows(seeded, "SELECT full_name FROM payments")} == {
+        "Перенос из МойСклад"
+    }
+
+    # Ровно то, что увидит «Долги» менеджера: оба заказа не оплачены полностью.
+    debts = asyncio.run(db.get_open_debts(user_id=941599419))
+    assert sorted(d["ms_demand_id"] for d in debts) == ["dem-1", "dem-2"]
+
+
+def test_orders_owner_must_be_an_active_employee(seeded, ms_api):
+    import services.database as db
+
+    ms_api["customerorder"] = [_order()]
+    with pytest.raises(mig.MigrationStop, match="orders-owner 777"):
+        _run(ms_api, orders_owner=777)
+    db.set_role(778, "g", "Гость", "guest")
+    with pytest.raises(mig.MigrationStop, match="orders-owner 778"):
+        _run(ms_api, orders_owner=778)
+    assert _rows(seeded, "SELECT id FROM orders") == [], "остановка — до записи"
+
+
+def test_orders_owner_cli_flag():
+    args = mig._parse_args(["--apply", "--supplier-history", "settled", "--orders-owner", "941599419"])
+    assert args.orders_owner == 941599419
+    assert mig._parse_args(["--dry-run"]).orders_owner is None
+
+
+# ─── Платежи без разбивки ────────────────────────────────────────────────────
+
+
+def test_migrated_payments_need_no_breakdown(seeded, ms_api):
+    """Исторический платёж пишется БЕЗ строки `payment_parts` — и это штатно:
+    он `confirmed`, а подтверждённый платёж объясняет деньги заказа и без
+    разбивки. Иначе каждая перенесённая продажа висела бы «не оплачено способом»
+    (к отгрузке не допускается), а `migrate_payment_breakdown` требовал бы
+    вручную разложить сотни чужих платежей."""
+    import scripts.migrate_payment_breakdown as mpb
+    from services import order_payments
+
+    ms_api["customerorder"] = [_order(sum_minor=300000)]
+    ms_api["demand"] = [_demand(), _demand(ms_id="dem-2", name="D002", order_ms_id=None)]
+    ms_api["paymentin"] = [
+        _paymentin(sum_minor=300000),
+        _paymentin(ms_id="pay-2", sum_minor=100000, op=("demand", "dem-2")),
+    ]
+    _, _, problems = _run(ms_api)
+    assert problems == []
+
+    assert _rows(seeded, "SELECT * FROM payment_parts") == []
+    assert {r["status"] for r in _rows(seeded, "SELECT status FROM payments")} == {"confirmed"}
+    orders = {r["ms_customerorder_id"] or r["ms_demand_id"]: r["id"]
+              for r in _rows(seeded, "SELECT id, ms_demand_id, ms_customerorder_id FROM orders")}
+    gaps = asyncio.run(order_payments.payment_gap_cents(list(orders.values())))
+    assert gaps[orders["ord-1"]] == 0, "оплаченный заказ объяснён платежом без разбивки"
+    assert gaps[orders["dem-2"]] == 200000, "частичная оплата — остаток долга, не весь заказ"
+
+    rep = asyncio.run(mpb.report())
+    assert rep["unexplained_payments"] == [] and rep["paid_orders_blocked"] == {}

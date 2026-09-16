@@ -96,7 +96,10 @@ FSM не отображаются однозначно. Поэтому: есть
 **`user_id = 0`** у исторических заказов: в МС нет нашего Telegram-id, а
 приписать их живому менеджеру значит испортить его статистику продаж.
 Ноль честно означает «заказ приехал миграцией». Руководство видит такие
-заказы через `get_all_orders`, в «свои» они не попадают ни к кому.
+заказы через `get_all_orders`, в «свои» они не попадают ни к кому. Если
+компанию ведёт один сотрудник с ролью manager, ему история с нулём не видна
+вовсе (ни в «Заказах», ни в «Долгах») — тогда `--orders-owner <telegram id>`
+записывает заказы на него (платежи остаются за «Перенос из МойСклад»).
 
 ═══════════════════════════════════════════════════════════════════════════
 ПЕРЕНОС НА ЧИСТУЮ БАЗУ С ТЕКУЩЕЙ СХЕМОЙ (сентябрь 2026)
@@ -913,6 +916,7 @@ async def write_history(
     supplier_history: str = "ledger",
     balances: list[dict] | None = None,
     returns: list[dict] | None = None,
+    orders_owner: int | None = None,
 ) -> tuple[dict, Unmatched, list[str]]:
     """Перенести историю одной транзакцией. Частично применённой не бывает.
 
@@ -980,6 +984,8 @@ async def write_history(
                     + (f"\n  …и ещё {len(fx_problems) - 30}" if len(fx_problems) > 30 else "")
                 )
             product_map, cp_map = await load_maps(txn)
+            owner = await _orders_owner(txn, orders_owner)
+            stats["orders_owner"] = owner[0]
             stats["products_known"] = len(product_map)
             stats["counterparties_known"] = len(cp_map)
 
@@ -1041,7 +1047,7 @@ async def write_history(
                     cp_id=cp_id, currency=currency, moment=moment,
                     fully_paid=False,  # состояние оплаты посчитаем после разнесения
                     fx=o["fx"],
-                    now=now,
+                    now=now, owner=owner,
                 )
                 order_local[o["ms_id"]] = order_id
                 order_book.append(
@@ -1120,7 +1126,7 @@ async def write_history(
                 order_id = await _upsert_order_from_demand(
                     txn, d,
                     cp_id=cp_id, currency=currency, moment=moment,
-                    fx=d["fx"], now=now,
+                    fx=d["fx"], now=now, owner=owner,
                 )
                 demand_order[d["ms_id"]] = order_id
                 order_book.append(
@@ -1562,7 +1568,7 @@ async def _reconcile_balances(
     local_to_ms = {str(v): k for k, v in cp_map.items()}
     customer_side: dict[str, int] = defaultdict(int)
     rows = await txn.fetch(
-        "SELECT id, agent_id FROM orders WHERE user_id = 0 AND agent_id IS NOT NULL "
+        "SELECT id, agent_id FROM orders WHERE agent_id IS NOT NULL "
         "AND (ms_customerorder_id IS NOT NULL OR ms_demand_id IS NOT NULL)"
     )
     agent_of = {int(r["id"]): str(r["agent_id"]) for r in rows}
@@ -1712,9 +1718,36 @@ async def _set_order_payment_state(
         )
 
 
+async def _orders_owner(txn, user_id: int | None) -> tuple[int, str]:
+    """Чьими считать перенесённые заказы: (user_id, имя для `orders.full_name`).
+
+    По умолчанию — 0 («Перенос из МойСклад»): приписать историю живому
+    менеджеру значит испортить его статистику продаж. НО менеджер видит в
+    «Заказах» и «Долгах» только заказы со своим `user_id` (руководство — все),
+    и если компанию ведёт один человек с ролью manager, история с нулём ему
+    невидима целиком: долги клиентов не собрать. Для такого случая —
+    `--orders-owner <telegram id>`: сотрудник обязан быть в `user_roles`,
+    активен и с ролью, которая видит заказы; иначе остановка ДО записи.
+    Платежи остаются за «Перенос из МойСклад»: деньги вносил не он.
+    """
+    if not user_id:
+        return 0, "Перенос из МойСклад"
+    row = await txn.fetchrow(
+        "SELECT role, full_name, deactivated_at FROM user_roles WHERE user_id = $1",
+        int(user_id),
+    )
+    if row is None or row["deactivated_at"] or row["role"] not in ("admin", "boss", "manager"):
+        raise MigrationStop(
+            f"--orders-owner {user_id}: нет активного сотрудника admin/boss/manager с таким "
+            "Telegram id в user_roles — заказы некому приписать"
+        )
+    return int(user_id), str(row["full_name"] or f"Сотрудник {user_id}")
+
+
 async def _upsert_order(
     txn, o: dict, *, cp_id: int | None, currency: str, moment: str,
     fully_paid: bool, fx: float | None, now: str,
+    owner: tuple[int, str] = (0, "Перенос из МойСклад"),
 ) -> int:
     """Заказ по `ms_customerorder_id`. Повторный прогон обновляет, не дублирует.
 
@@ -1730,8 +1763,8 @@ async def _upsert_order(
     comment_bits = [b for b in (o.get("description") or "", o["state_name"]) if b]
     comment = " · ".join(["Перенос из МойСклад", *comment_bits])[:1000]
     fields = {
-        "user_id": 0,
-        "full_name": "Перенос из МойСклад",
+        "user_id": owner[0],
+        "full_name": owner[1],
         "status": "approved",
         "comment": comment,
         "agent_id": str(cp_id) if cp_id else None,
@@ -1764,6 +1797,7 @@ async def _upsert_order(
 async def _upsert_order_from_demand(
     txn, d: dict, *, cp_id: int | None, currency: str, moment: str,
     fx: float | None, now: str,
+    owner: tuple[int, str] = (0, "Перенос из МойСклад"),
 ) -> int:
     """Отгрузка без заказа-основания → заказ. Идемпотентность по `ms_demand_id`.
 
@@ -1781,8 +1815,8 @@ async def _upsert_order_from_demand(
     )
     comment = f"Перенос из МойСклад · продажа по отгрузке {d['name'] or d['ms_id']}"[:1000]
     fields = {
-        "user_id": 0,
-        "full_name": "Перенос из МойСклад",
+        "user_id": owner[0],
+        "full_name": owner[1],
         "status": "shipped",
         "comment": comment,
         "agent_id": str(cp_id) if cp_id else None,
@@ -2227,6 +2261,11 @@ def print_report(
                 stats.get("orders", 0), stats.get("orders_from_demand", 0))
     logger.info("      из них оплачено : %5d  · в долг %d",
                 stats.get("orders_paid", 0), stats.get("orders_credit", 0))
+    logger.info(
+        "      записаны на     : %s",
+        f"сотрудника {stats['orders_owner']} (--orders-owner)" if stats.get("orders_owner")
+        else "user_id 0 — менеджеру не видны, только руководству (см. --orders-owner)",
+    )
     logger.info("  order_items         : %5d  (с карточкой товара %d)",
                 stats.get("order_items", 0), stats.get("order_items_linked", 0))
     logger.info("  invoices (отгрузки) : %5d  (позиций %d)",
@@ -2345,60 +2384,57 @@ async def show_debtors() -> None:
 
 
 async def show_supplier_balance() -> None:
-    """Расчёты с поставщиками: приход минус выплаты, по контрагентам.
+    """Расчёты с поставщиками ТАК, КАК ИХ ПОКАЖЕТ ЭКРАН «Поставщикам».
 
-    Долг ПЕРЕД поставщиком и аванс ЕМУ ЖЕ — это одно и то же число с разным
-    знаком, и показывать надо оба: «мы должны» и «мы переплатили» одинаково
+    Считает штатный `services.supplier_debts.ledger`, а не «приход минус
+    выплаты» своим SQL: в режиме `settled` приходы закрыты условием «уже
+    оплачено», и прежний подсчёт печатал «мы должны» по каждому поставщику —
+    отчёт спорил бы с приложением ровно в ту минуту, когда их сверяют.
+    Долг и аванс показываются оба: «мы должны» и «мы переплатили» одинаково
     важны при разговоре с поставщиком.
     """
-    from services import adb_core
+    from services import supplier_debts
 
-    rows = await adb_core.fetch(
-        "SELECT c.id, c.name, "
-        "  (SELECT COALESCE(SUM(total_amount_cents), 0) FROM invoices "
-        "     WHERE counterparty_id = c.id AND type = 'incoming' "
-        "       AND status = 'confirmed') AS supplied_cents, "
-        "  (SELECT COALESCE(SUM(amount_cents), 0) FROM supplier_payments "
-        "     WHERE counterparty_id = c.id) AS paid_cents "
-        "FROM counterparties c ORDER BY c.name"
-    )
-    interesting = [
-        r for r in rows
-        if int(r["supplied_cents"] or 0) or int(r["paid_cents"] or 0)
-    ]
+    led = await supplier_debts.ledger()
+    debts: dict[tuple[str, str], int] = defaultdict(int)
+    for d in led.debts:
+        if d.remaining_cents > 0:
+            debts[(d.supplier_name, d.currency)] += d.remaining_cents
+    advances = {
+        (led.suppliers.get(sup_id, str(sup_id)), cur): cents
+        for (sup_id, cur), cents in led.advances.items()
+    }
     logger.info("")
-    logger.info("═══ РАСЧЁТЫ С ПОСТАВЩИКАМИ ═══")
-    if not interesting:
-        logger.info("  (пусто)")
+    logger.info("═══ РАСЧЁТЫ С ПОСТАВЩИКАМИ (как на экране «Поставщикам») ═══")
+    if not debts and not advances:
+        logger.info("  долгов и авансов нет")
         return
-    for r in interesting:
-        supplied = int(r["supplied_cents"] or 0)
-        paid = int(r["paid_cents"] or 0)
-        diff = supplied - paid
-        verdict = "мы должны" if diff > 0 else ("аванс у поставщика" if diff < 0 else "закрыто")
-        logger.info(
-            "  %-32s приход %12s  выплачено %12s  →  %s %s",
-            str(r["name"])[:32], _money(supplied), _money(paid), verdict, _money(abs(diff)),
-        )
+    for (name, cur), cents in sorted(debts.items()):
+        logger.info("  %-32s мы должны          %14s %s", name[:32], _money(cents), cur)
+    for (name, cur), cents in sorted(advances.items()):
+        logger.info("  %-32s аванс у поставщика %14s %s", name[:32], _money(cents), cur)
 
 
 async def show_totals() -> None:
-    """Сводка по типам оплаты. Суммы — из позиций, не из несуществующей колонки."""
+    """Сводка по типам оплаты — в разрезе ВАЛЮТ: сумма сумов и долларов вместе
+    ничего не значит. Суммы — из позиций, не из несуществующей колонки."""
     from services import adb_core
     from services.debts import SUM_ORDER_TOTAL_CENTS
 
     rows = await adb_core.fetch(
-        "SELECT o.payment_type, COUNT(*) AS cnt, "
+        "SELECT o.payment_type, o.currency, COUNT(*) AS cnt, "
         f"  COALESCE(SUM((SELECT {SUM_ORDER_TOTAL_CENTS} FROM order_items "
         "     WHERE order_id = o.id)), 0) AS total_cents "
-        "FROM orders o GROUP BY o.payment_type ORDER BY o.payment_type"
+        "FROM orders o GROUP BY o.payment_type, o.currency "
+        "ORDER BY o.payment_type, o.currency"
     )
     logger.info("")
     logger.info("═══ ЗАКАЗЫ ПО ТИПУ ОПЛАТЫ ═══")
     for r in rows:
         logger.info(
-            "  %-8s заказов %5d  на сумму %s",
-            r["payment_type"], int(r["cnt"]), _money(int(r["total_cents"] or 0)),
+            "  %-8s %-4s заказов %5d  на сумму %s",
+            r["payment_type"], r["currency"] or "—", int(r["cnt"]),
+            _money(int(r["total_cents"] or 0)),
         )
 
 
@@ -2485,7 +2521,9 @@ async def explain_order(name: str) -> int:
     return 0
 
 
-async def main(mode: str, *, supplier_history: str = "ledger") -> int:
+async def main(
+    mode: str, *, supplier_history: str = "ledger", orders_owner: int | None = None
+) -> int:
     if mode.startswith("explain:"):
         try:
             return await explain_order(mode.split(":", 1)[1])
@@ -2519,6 +2557,7 @@ async def main(mode: str, *, supplier_history: str = "ledger") -> int:
                 orders, demands, payments, supplies, payments_out,
                 currencies=currencies, dry_run=(mode == "dry-run"),
                 supplier_history=supplier_history, balances=balances, returns=returns,
+                orders_owner=orders_owner,
             )
         except MigrationStop as e:
             logger.error("")
@@ -2572,6 +2611,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
              "settled — история закрыта, приходы «уже оплачено», выплаты не переносятся. "
              "Обязателен с --apply (решение по предпросмотру)",
     )
+    p.add_argument(
+        "--orders-owner",
+        type=int,
+        metavar="TELEGRAM_ID",
+        help="записать перенесённые заказы на этого сотрудника (менеджер видит только "
+             "свои заказы и долги); по умолчанию — user_id 0",
+    )
     args = p.parse_args(argv)
     if args.apply and not args.supplier_history:
         p.error(
@@ -2589,4 +2635,6 @@ if __name__ == "__main__":
         _mode = f"explain:{args.explain}"
     else:
         _mode = "dry-run" if args.dry_run else "apply"
-    sys.exit(asyncio.run(main(_mode, supplier_history=args.supplier_history or "ledger")))
+    sys.exit(asyncio.run(main(
+        _mode, supplier_history=args.supplier_history or "ledger", orders_owner=args.orders_owner,
+    )))
